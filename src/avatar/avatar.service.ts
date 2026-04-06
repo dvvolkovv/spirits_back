@@ -9,13 +9,19 @@ export class AvatarService {
 
   constructor(private readonly pg: PgService) {
     if (process.env.AWS_ACCESS_KEY_ID) {
-      this.s3 = new S3Client({
+      const config: any = {
         region: process.env.AWS_REGION || 'us-east-1',
         credentials: {
           accessKeyId: process.env.AWS_ACCESS_KEY_ID,
           secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
         },
-      });
+      };
+      // MinIO / custom S3-compatible endpoint
+      if (process.env.AWS_ENDPOINT) {
+        config.endpoint = process.env.AWS_ENDPOINT;
+        config.forcePathStyle = process.env.AWS_FORCE_PATH_STYLE === 'true';
+      }
+      this.s3 = new S3Client(config);
     }
   }
 
