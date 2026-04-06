@@ -67,7 +67,7 @@ export class ChatService {
     const chunks: string[] = [];
     let inputTokens = 0;
     let outputTokens = 0;
-    const model = agent.model || 'openai/gpt-4o-mini';
+    const model = 'openai/gpt-4o-mini';
 
     try {
       const response = await axios.post(
@@ -129,7 +129,7 @@ export class ChatService {
     setImmediate(async () => {
       try {
         await this.saveChatHistory(userId, String(assistantId), message, fullText);
-        await this.addTokenTask(userId, inputTokens, outputTokens, model);
+        await this.addTokenTask(userId, inputTokens, outputTokens, String(agent.id));
       } catch (e) {
         this.logger.error(`Post-chat save error: ${e.message}`);
       }
@@ -164,11 +164,13 @@ export class ChatService {
     }
   }
 
-  private async addTokenTask(userId: string, inputTokens: number, outputTokens: number, modelId: string) {
+  private async addTokenTask(userId: string, inputTokens: number, outputTokens: number, agentId?: string) {
+    const executionId = Math.floor(Math.random() * 2000000000);
+    const agentIdNum = agentId && /^\d+$/.test(agentId) ? parseInt(agentId, 10) : null;
     await this.pg.query(
-      `INSERT INTO token_consumption_tasks (user_id, tokens, status, input_tokens, output_tokens, model_id, created_at)
-       VALUES ($1, 0, 'pending', $2, $3, $4, now())`,
-      [userId, inputTokens, outputTokens, modelId],
+      `INSERT INTO token_consumption_tasks (execution_id, user_id, status, agent_id, input_tokens, output_tokens, tokens_to_consume)
+       VALUES ($1, $2, 'pending', $3, $4, $5, 0)`,
+      [executionId, userId, agentIdNum, inputTokens, outputTokens],
     );
   }
 
