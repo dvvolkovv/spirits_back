@@ -35,11 +35,11 @@ export class AuthService {
     // Create user if not exists
     if (userRes.rows.length === 0) {
       await this.pg.query(
-        `INSERT INTO user_id (primary_phone, state) VALUES ($1, 'active') ON CONFLICT (primary_phone) DO NOTHING`,
-        [phone],
+        `INSERT INTO user_id (primary_phone, state, internal_id) VALUES ($1, 'active', $2) ON CONFLICT (internal_id) DO NOTHING`,
+        [phone, phone],
       );
       await this.pg.query(
-        `INSERT INTO ai_profiles_consolidated (user_id, tokens, isadmin) VALUES ($1, 0, false) ON CONFLICT (user_id) DO NOTHING`,
+        `INSERT INTO ai_profiles_consolidated (user_id, tokens, isadmin) VALUES ($1, 0, false) ON CONFLICT DO NOTHING`,
         [phone],
       );
     }
@@ -90,7 +90,7 @@ export class AuthService {
 
     // Ensure profile exists
     await this.pg.query(
-      `INSERT INTO ai_profiles_consolidated (user_id, tokens, isadmin) VALUES ($1, 0, false) ON CONFLICT (user_id) DO NOTHING`,
+      `INSERT INTO ai_profiles_consolidated (user_id, tokens, isadmin) VALUES ($1, 0, false) ON CONFLICT DO NOTHING`,
       [phone],
     );
 
