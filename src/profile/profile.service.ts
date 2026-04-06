@@ -78,6 +78,6 @@ export class ProfileService {
       'SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1',
       [userId],
     );
-    return res.rows[0]?.tokens ?? 0;
+    return Number(res.rows[0]?.tokens ?? 0);
   }
 }

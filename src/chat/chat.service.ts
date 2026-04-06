@@ -1,6 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
-import { v4 as uuidv4 } from 'uuid';
 import axios from 'axios';
 import { Response } from 'express';
 
@@ -19,25 +18,28 @@ export class ChatService {
     res: Response,
   ): Promise<void> {
     // Get agent
-    const agentRes = await this.pg.query(
-      'SELECT * FROM agents WHERE id = $1 OR name = $1 LIMIT 1',
-      [assistantId],
-    );
+    const isNumeric = /^\d+$/.test(assistantId);
+    const agentRes = isNumeric
+      ? await this.pg.query('SELECT * FROM agents WHERE id = $1 LIMIT 1', [parseInt(assistantId, 10)])
+      : await this.pg.query('SELECT * FROM agents WHERE name = $1 LIMIT 1', [assistantId]);
     const agent = agentRes.rows[0];
     if (!agent) {
       res.status(404).json({ error: 'Agent not found' });
       return;
     }
 
-    // Get chat history
+    // Get chat history (individual rows: session_id, sender_type, content)
+    const chatSessionId = `${userId}_${assistantId}`;
     const histRes = await this.pg.query(
-      `SELECT messages FROM custom_chat_history
-       WHERE user_id = $1 AND agent_id = $2
-       ORDER BY updated_at DESC LIMIT 1`,
-      [userId, String(assistantId)],
+      `SELECT sender_type, content FROM custom_chat_history
+       WHERE session_id = $1
+       ORDER BY created_at DESC LIMIT 10`,
+      [chatSessionId],
     );
-    const existingMessages: any[] = histRes.rows[0]?.messages || [];
-    const recentHistory = existingMessages.slice(-10); // last 10 messages as context
+    const recentHistory = histRes.rows.reverse().map(r => ({
+      type: r.sender_type === 'human' ? 'user' : 'assistant',
+      content: r.content,
+    }));
 
     // Build system prompt with profile context
     let systemPrompt = agent.system_prompt || '';
@@ -55,6 +57,7 @@ export class ChatService {
     llmMessages.push({ role: 'user', content: message });
 
     // Set streaming headers
+    res.status(200);
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Transfer-Encoding', 'chunked');
     res.setHeader('Cache-Control', 'no-cache');
@@ -137,31 +140,22 @@ export class ChatService {
   }
 
   private async saveChatHistory(userId: string, agentId: string, userMsg: string, assistantMsg: string) {
-    const now = new Date().toISOString();
-    const newMessages = [
-      { id: uuidv4(), type: 'user', content: userMsg, timestamp: now },
-      { id: uuidv4(), type: 'assistant', content: assistantMsg, timestamp: now },
-    ];
+    const sessionId = `${userId}_${agentId}`;
+    const agentNum = /^\d+$/.test(agentId) ? parseInt(agentId, 10) : null;
 
-    const existing = await this.pg.query(
-      'SELECT id, messages FROM custom_chat_history WHERE user_id = $1 AND agent_id = $2 ORDER BY updated_at DESC LIMIT 1',
-      [userId, agentId],
+    // Insert user message
+    await this.pg.query(
+      `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
+       VALUES ($1, 'human', $2, $3, 'text')`,
+      [sessionId, agentNum, userMsg],
     );
 
-    if (existing.rows.length > 0) {
-      const msgs = existing.rows[0].messages || [];
-      const updated = [...msgs, ...newMessages].slice(-50); // keep last 50 messages
-      await this.pg.query(
-        'UPDATE custom_chat_history SET messages = $1::jsonb, updated_at = now() WHERE id = $2',
-        [JSON.stringify(updated), existing.rows[0].id],
-      );
-    } else {
-      await this.pg.query(
-        `INSERT INTO custom_chat_history (user_id, agent_id, session_id, messages, created_at, updated_at)
-         VALUES ($1, $2, $3, $4::jsonb, now(), now())`,
-        [userId, agentId, `${userId}_${agentId}`, JSON.stringify(newMessages)],
-      );
-    }
+    // Insert assistant message
+    await this.pg.query(
+      `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
+       VALUES ($1, 'ai', $2, $3, 'text')`,
+      [sessionId, agentNum, assistantMsg],
+    );
   }
 
   private async addTokenTask(userId: string, inputTokens: number, outputTokens: number, agentId?: string) {
@@ -175,22 +169,27 @@ export class ChatService {
   }
 
   async getChatHistory(userId: string, assistantId: string): Promise<{ messages: any[] }> {
+    const sessionId = `${userId}_${assistantId}`;
     const res = await this.pg.query(
-      `SELECT messages FROM custom_chat_history
-       WHERE user_id = $1 AND agent_id = $2
-       ORDER BY updated_at DESC LIMIT 1`,
-      [userId, String(assistantId)],
+      `SELECT id, sender_type, content, created_at FROM custom_chat_history
+       WHERE session_id = $1
+       ORDER BY created_at DESC LIMIT 6`,
+      [sessionId],
     );
-    if (!res.rows.length) return { messages: [] };
-    const messages = res.rows[0].messages || [];
-    // Return last 6 messages (matching n8n behavior)
-    return { messages: messages.slice(-6) };
+    const messages = res.rows.reverse().map(r => ({
+      id: String(r.id),
+      type: r.sender_type === 'human' ? 'user' : 'assistant',
+      content: r.content,
+      timestamp: r.created_at,
+    }));
+    return { messages };
   }
 
   async deleteChatHistory(userId: string, assistantId: string) {
+    const sessionId = `${userId}_${assistantId}`;
     await this.pg.query(
-      'DELETE FROM custom_chat_history WHERE user_id = $1 AND agent_id = $2',
-      [userId, String(assistantId)],
+      'DELETE FROM custom_chat_history WHERE session_id = $1',
+      [sessionId],
     );
     return { success: true };
   }

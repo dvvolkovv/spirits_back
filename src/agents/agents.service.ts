@@ -7,14 +7,14 @@ export class AgentsService {
 
   async getAgentDetails(): Promise<any[]> {
     const res = await this.pg.query(
-      'SELECT id, name, system_prompt, avatar_url, description, model FROM agents ORDER BY id',
+      'SELECT id, name, system_prompt, description FROM agents ORDER BY id',
     );
     return res.rows;
   }
 
   async getAgents(): Promise<any[]> {
     const res = await this.pg.query(
-      'SELECT id, name, avatar_url, description FROM agents ORDER BY id',
+      'SELECT id, name, description FROM agents ORDER BY id',
     );
     return res.rows;
   }
@@ -44,17 +44,15 @@ export class AgentsService {
   }
 
   async upsertAgent(data: any) {
-    const { name, system_prompt, avatar_url, description, model } = data;
+    const { name, system_prompt, description } = data;
     const res = await this.pg.query(
-      `INSERT INTO agents (name, system_prompt, avatar_url, description, model)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO agents (name, system_prompt, description)
+       VALUES ($1, $2, $3)
        ON CONFLICT (name) DO UPDATE SET
          system_prompt = EXCLUDED.system_prompt,
-         avatar_url = EXCLUDED.avatar_url,
-         description = EXCLUDED.description,
-         model = EXCLUDED.model
+         description = EXCLUDED.description
        RETURNING *`,
-      [name, system_prompt, avatar_url, description, model],
+      [name, system_prompt, description],
     );
     return res.rows[0];
   }

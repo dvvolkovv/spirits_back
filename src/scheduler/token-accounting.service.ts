@@ -15,7 +15,7 @@ export class TokenAccountingService {
     this.isRunning = true;
     try {
       const tasks = await this.pg.query(
-        `SELECT id, user_id, input_tokens, output_tokens, model_id
+        `SELECT id, user_id, input_tokens, output_tokens, tokens_to_consume, agent_id
          FROM token_consumption_tasks
          WHERE status = 'pending'
          LIMIT 50`,
@@ -23,22 +23,28 @@ export class TokenAccountingService {
 
       for (const task of tasks.rows) {
         try {
-          // Get pricing for model
-          const pricing = await this.pg.query(
-            `SELECT input_price, output_price FROM llm_pricing WHERE model_id = $1 LIMIT 1`,
-            [task.model_id],
-          );
+          let tokensToDeduct = Number(task.tokens_to_consume) || 0;
 
-          let tokensToDeduct = 0;
-          if (pricing.rows.length > 0) {
-            const { input_price, output_price } = pricing.rows[0];
-            // price is per 1M tokens
-            tokensToDeduct = Math.ceil(
-              (task.input_tokens * Number(input_price) + task.output_tokens * Number(output_price)) / 1,
-            );
-          } else {
-            // Fallback: 1 token per output token
-            tokensToDeduct = task.output_tokens || 1;
+          // If tokens_to_consume not set, calculate from input/output tokens
+          if (tokensToDeduct === 0) {
+            const agentId = task.agent_id;
+            if (agentId) {
+              const pricing = await this.pg.query(
+                `SELECT input_price, output_price FROM llm_pricing WHERE agent_id = $1 LIMIT 1`,
+                [agentId],
+              ).catch(() => ({ rows: [] }));
+
+              if (pricing.rows.length > 0) {
+                const { input_price, output_price } = pricing.rows[0];
+                tokensToDeduct = Math.ceil(
+                  task.input_tokens * Number(input_price) + task.output_tokens * Number(output_price),
+                );
+              }
+            }
+            // Fallback: 1 token per total token
+            if (tokensToDeduct === 0) {
+              tokensToDeduct = (task.input_tokens || 0) + (task.output_tokens || 0) || 1;
+            }
           }
 
           // Try stored procedure first, fallback to direct update
@@ -54,14 +60,16 @@ export class TokenAccountingService {
           }
 
           await this.pg.query(
-            `UPDATE token_consumption_tasks SET status = 'done', tokens = $1 WHERE id = $2`,
+            `UPDATE token_consumption_tasks
+             SET status = 'done', tokens_to_consume = $1, completed_at = now(), updated_at = now()
+             WHERE id = $2`,
             [tokensToDeduct, task.id],
           );
         } catch (e) {
           this.logger.error(`Task ${task.id} failed: ${e.message}`);
           await this.pg.query(
-            `UPDATE token_consumption_tasks SET status = 'error' WHERE id = $1`,
-            [task.id],
+            `UPDATE token_consumption_tasks SET status = 'error', error_message = $1, updated_at = now() WHERE id = $2`,
+            [e.message, task.id],
           );
         }
       }
