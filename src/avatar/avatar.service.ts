@@ -58,10 +58,7 @@ export class AvatarService {
   }
 
   async getAgentAvatar(agentId: string): Promise<string | null> {
-    const res = await this.pg.query(
-      'SELECT avatar_url FROM agents WHERE id = $1 LIMIT 1',
-      [agentId],
-    );
-    return res.rows[0]?.avatar_url || null;
+    // agents table has no avatar_url column
+    return null;
   }
 }

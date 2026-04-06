@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Param, Req, Res, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Put, Param, Req, Res, UseGuards } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { AvatarService } from './avatar.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
@@ -35,6 +35,12 @@ export class AvatarController {
         }
       });
     });
+  }
+
+  @Put('avatar')
+  @UseGuards(JwtGuard)
+  async uploadAvatarPut(@CurrentUser() user: any, @Req() req: Request, @Res() res: Response) {
+    return this.uploadAvatar(user, req, res);
   }
 
   @Get('0cdacf32-7bfd-4888-b24f-3a6af3b5f99e/agent/avatar/:agentId')

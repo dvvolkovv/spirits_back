@@ -13,6 +13,7 @@ import { AvatarModule } from './avatar/avatar.module';
 import { Neo4jModule } from './neo4j/neo4j.module';
 import { SchedulerModule } from './scheduler/scheduler.module';
 import { MiscModule } from './misc/misc.module';
+import { AdminModule } from './admin/admin.module';
 
 @Module({
   imports: [
@@ -30,6 +31,7 @@ import { MiscModule } from './misc/misc.module';
     Neo4jModule,
     SchedulerModule,
     MiscModule,
+    AdminModule,
   ],
 })
 export class AppModule {}

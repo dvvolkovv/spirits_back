@@ -51,9 +51,9 @@ export class ProfileService {
   }
 
   async deleteProfile(userId: string) {
-    await this.pg.query('DELETE FROM custom_chat_history WHERE user_id = $1', [userId]);
+    await this.pg.query('DELETE FROM custom_chat_history WHERE session_id LIKE $1', [`${userId}_%`]);
     await this.pg.query('DELETE FROM ai_profiles_consolidated WHERE user_id = $1', [userId]);
-    await this.pg.query('DELETE FROM user_id WHERE primary_phone = $1', [userId]);
+    await this.pg.query('DELETE FROM user_id WHERE primary_phone = $1 OR internal_id = $1', [userId]);
     return { success: true };
   }
 

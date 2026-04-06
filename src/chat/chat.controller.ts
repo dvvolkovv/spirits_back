@@ -32,7 +32,10 @@ export class ChatController {
       return res.status(200).send('');
     }
 
-    const { message, assistantId, sessionId } = req.body || {};
+    const body = req.body || {};
+    const message = body.message || body.chatInput;
+    const assistantId = body.assistantId || body.assistant;
+    const sessionId = body.sessionId;
     if (!message || !assistantId) {
       return res.status(400).json({ error: 'Missing message or assistantId' });
     }

@@ -15,12 +15,14 @@ export class PaymentsService {
     if (!shopId || !secretKey) throw new Error('YooKassa not configured');
 
     const idempotenceKey = uuidv4();
+    const returnUrl = process.env.RETURN_URL || 'http://82.202.197.230/payment/success';
     const resp = await axios.post(
-      'https://api.yookassa.ru/v2/payments',
+      'https://api.yookassa.ru/v3/payments',
       {
         amount: { value: amount.toFixed(2), currency: 'RUB' },
-        confirmation: { type: 'redirect', return_url: 'https://my.linkeon.io/payment/success' },
+        confirmation: { type: 'redirect', return_url: returnUrl },
         description: `Токены: ${pkg}`,
+        capture: true,
         metadata: { userId, package: pkg },
       },
       {
@@ -29,15 +31,18 @@ export class PaymentsService {
       },
     );
 
+    const tokensForPkg = this.tokensForPackage(pkg, amount);
+    const confirmUrl = resp.data.confirmation?.confirmation_url || '';
+
     await this.pg.query(
-      `INSERT INTO payments (payment_id, status, amount, user_phone, package, created_at)
-       VALUES ($1, 'pending', $2, $3, $4, now())`,
-      [resp.data.id, amount, userId, pkg],
+      `INSERT INTO payments (payment_id, user_id, package_id, amount, tokens, status, payment_url)
+       VALUES ($1, $2, $3, $4, $5, 'pending', $6)`,
+      [resp.data.id, userId, pkg, amount, tokensForPkg, confirmUrl],
     );
 
     return {
       payment_id: resp.data.id,
-      confirmation_url: resp.data.confirmation.confirmation_url,
+      confirmation_url: confirmUrl,
     };
   }
 
@@ -45,7 +50,7 @@ export class PaymentsService {
     const shopId = process.env.YOOKASSA_SHOP_ID;
     const secretKey = process.env.YOOKASSA_SECRET_KEY;
 
-    const resp = await axios.get(`https://api.yookassa.ru/v2/payments/${paymentId}`, {
+    const resp = await axios.get(`https://api.yookassa.ru/v3/payments/${paymentId}`, {
       auth: { username: shopId, password: secretKey },
     });
 
@@ -63,15 +68,14 @@ export class PaymentsService {
     );
     if (existing.rows[0]?.status === 'succeeded') return; // already processed
 
-    // Token packages: simple mapping
     const paymentRow = await this.pg.query(
-      'SELECT amount, package FROM payments WHERE payment_id = $1',
+      'SELECT tokens, user_id FROM payments WHERE payment_id = $1',
       [paymentId],
     );
-    const tokensToAdd = this.tokensForPackage(paymentRow.rows[0]?.package, paymentRow.rows[0]?.amount);
+    const tokensToAdd = Number(paymentRow.rows[0]?.tokens || 0);
 
     await this.pg.query(
-      'UPDATE payments SET status = $1, updated_at = now() WHERE payment_id = $2',
+      'UPDATE payments SET status = $1, completed_at = now(), updated_at = now() WHERE payment_id = $2',
       ['succeeded', paymentId],
     );
     await this.pg.query(
@@ -101,14 +105,28 @@ export class PaymentsService {
   }
 
   async redeemCoupon(userId: string, code: string) {
-    // Look up coupon — table may vary
     const res = await this.pg.query(
-      `SELECT * FROM referral_leaders WHERE slug = $1 AND is_active = true LIMIT 1`,
+      'SELECT * FROM coupons WHERE code = $1 AND is_active = true LIMIT 1',
       [code],
     );
     if (!res.rows.length) return { success: false, error: 'Invalid coupon' };
 
-    const tokens = 50000; // default coupon value
+    // Check if already redeemed
+    const redeemed = await this.pg.query(
+      'SELECT id FROM coupon_redemptions WHERE coupon_id = $1 AND user_id = $2',
+      [res.rows[0].id, userId],
+    );
+    if (redeemed.rows.length > 0) return { success: false, error: 'Coupon already redeemed' };
+
+    const tokens = Number(res.rows[0].token_amount);
+    await this.pg.query(
+      'INSERT INTO coupon_redemptions (coupon_id, user_id, tokens_granted) VALUES ($1, $2, $3)',
+      [res.rows[0].id, userId, tokens],
+    );
+    await this.pg.query(
+      'UPDATE coupons SET usage_count = usage_count + 1 WHERE id = $1',
+      [res.rows[0].id],
+    );
     await this.pg.query(
       'UPDATE ai_profiles_consolidated SET tokens = tokens + $1, updated_at = now() WHERE user_id = $2',
       [tokens, userId],

@@ -61,14 +61,14 @@ export class TokenAccountingService {
 
           await this.pg.query(
             `UPDATE token_consumption_tasks
-             SET status = 'done', tokens_to_consume = $1, completed_at = now(), updated_at = now()
+             SET status = 'completed', tokens_to_consume = $1, completed_at = now(), updated_at = now()
              WHERE id = $2`,
             [tokensToDeduct, task.id],
           );
         } catch (e) {
           this.logger.error(`Task ${task.id} failed: ${e.message}`);
           await this.pg.query(
-            `UPDATE token_consumption_tasks SET status = 'error', error_message = $1, updated_at = now() WHERE id = $2`,
+            `UPDATE token_consumption_tasks SET status = 'failed', error_message = $1, updated_at = now() WHERE id = $2`,
             [e.message, task.id],
           );
         }
