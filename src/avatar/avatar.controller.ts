@@ -15,7 +15,7 @@ export class AvatarController {
   @UseGuards(JwtGuard)
   async getAvatar(@CurrentUser() user: any, @Res() res: Response) {
     const avatar = await this.avatarService.getAvatar(user.phone);
-    if (!avatar) return res.status(404).json({ error: 'No avatar' });
+    if (!avatar) return res.status(204).end();
 
     // If local file, serve it directly as binary
     if (avatar.url.startsWith('/static/')) {

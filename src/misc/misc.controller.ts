@@ -36,7 +36,12 @@ export class MiscController {
   @Post('imagegen')
   @UseGuards(JwtGuard)
   async imageGen(@CurrentUser() user: any, @Req() req: Request, @Res() res: Response) {
-    return res.status(200).json({ url: '' });
+    try {
+      const result = await this.miscService.generateImage(user.phone, req.body);
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(500).json({ error: err.message || 'Image generation failed' });
+    }
   }
 
   private extractUser(req: Request): string | null {

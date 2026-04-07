@@ -99,6 +99,99 @@ ${profiles.map(p => `Профиль ${p.phone}:\n${formatProfile(p.data)}`).join
     await this.streamLLM(systemPrompt, 'Проанализируй совместимость этих людей', res);
   }
 
+  async generateImage(userId: string, body: any): Promise<any> {
+    const { prompt, model, size, quality } = body;
+    if (!prompt) throw new Error('Missing prompt');
+
+    const selectedModel = model || 'google/gemini-3-pro-image-preview';
+    const tokenCost = quality === 'hd' ? 10000 : 5000;
+
+    // Check token balance
+    const balanceRes = await this.pg.query(
+      'SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1',
+      [userId],
+    );
+    const currentTokens = Number(balanceRes.rows[0]?.tokens || 0);
+    if (currentTokens < tokenCost) {
+      throw new Error('Недостаточно токенов');
+    }
+
+    try {
+      const response = await axios.post(
+        'https://openrouter.ai/api/v1/chat/completions',
+        {
+          model: selectedModel,
+          messages: [
+            {
+              role: 'user',
+              content: prompt,
+            },
+          ],
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'https://my.linkeon.io',
+          },
+          timeout: 120000,
+        },
+      );
+
+      const choice = response.data?.choices?.[0];
+      const content = choice?.message?.content;
+      const images: { url: string; revisedPrompt?: string }[] = [];
+
+      // Extract image URLs from response
+      // OpenRouter image models return markdown images or direct URLs
+      if (typeof content === 'string') {
+        // Match markdown image syntax: ![...](url)
+        const mdImageRegex = /!\[([^\]]*)\]\(([^)]+)\)/g;
+        let match;
+        while ((match = mdImageRegex.exec(content)) !== null) {
+          images.push({ url: match[2], revisedPrompt: match[1] || undefined });
+        }
+        // If no markdown images found, check if content itself is a URL
+        if (images.length === 0 && content.match(/^https?:\/\/.+/)) {
+          images.push({ url: content.trim() });
+        }
+      }
+
+      // Handle multimodal responses with inline_data
+      if (Array.isArray(choice?.message?.content)) {
+        for (const part of choice.message.content) {
+          if (part.type === 'image_url' && part.image_url?.url) {
+            images.push({ url: part.image_url.url });
+          }
+          if (part.type === 'text' && part.text) {
+            const mdImageRegex = /!\[([^\]]*)\]\(([^)]+)\)/g;
+            let match;
+            while ((match = mdImageRegex.exec(part.text)) !== null) {
+              images.push({ url: match[2], revisedPrompt: match[1] || undefined });
+            }
+          }
+        }
+      }
+
+      if (images.length === 0) {
+        throw new Error('Модель не вернула изображений. Попробуйте другую модель или уточните промпт.');
+      }
+
+      // Deduct tokens
+      await this.pg.query(
+        'UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2',
+        [tokenCost, userId],
+      );
+
+      return { images, tokensSpent: tokenCost };
+    } catch (e) {
+      if (e.response?.data) {
+        this.logger.error(`Image gen API error: ${JSON.stringify(e.response.data)}`);
+      }
+      throw new Error(e.message || 'Image generation failed');
+    }
+  }
+
   private async searchProfiles(query: string, excludePhone: string): Promise<any[]> {
     try {
       const session = (this.neo4j as any).getSession();

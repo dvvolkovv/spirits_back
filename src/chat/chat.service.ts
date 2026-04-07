@@ -41,8 +41,20 @@ export class ChatService {
       content: r.content,
     }));
 
-    // Build system prompt with profile context
-    let systemPrompt = agent.system_prompt || '';
+    // Build system prompt with platform context + profile
+    const allAgents = await this.pg.query('SELECT name, description FROM agents ORDER BY id');
+    const agentsList = allAgents.rows.map(a => `${a.name} — ${a.description}`).join(', ');
+
+    const platformContext = `О КОНТЕКСТЕ И ПЛАТФОРМЕ
+Ты работаешь в приложении Linkeon — платформе для поиска единомышленников на основе глубокого анализа ценностей, убеждений и жизненных намерений. Linkeon помогает людям находить по-настоящему близких по духу людей для дружбы, партнерства, совместных проектов или создания сообществ.
+Ключевые разделы приложения:
+• Чат с ассистентами — где ты сейчас находишься вместе с другими ИИ-ассистентами (${agentsList}). Если не можешь помочь, предложи переключиться на другого ассистента в левом верхнем углу интерфейса.
+• Поиск людей — поиск единомышленников по намерениям и ценностям
+• Совместимость — проверка людей на совместимость по ценностям и намерениям
+• Мой профиль — где хранятся ценности, знания о человеке, намерения, желания, интересы, убеждения, навыки
+При первом приветствии сообщи, кто ты и что есть другие ассистенты, что клиент может переключиться на них в левом верхнем углу интерфейса. Используй только текст без таблиц.`;
+
+    let systemPrompt = `${platformContext}\n\n${agent.system_prompt || ''}`;
     if (profileText && profileText.trim()) {
       systemPrompt = `${systemPrompt}\n\n--- Профиль пользователя ---\n${profileText}`;
     }

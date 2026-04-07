@@ -39,7 +39,7 @@ export class AuthService {
         [phone, phone],
       );
       await this.pg.query(
-        `INSERT INTO ai_profiles_consolidated (user_id, tokens, isadmin) VALUES ($1, 0, false) ON CONFLICT DO NOTHING`,
+        `INSERT INTO ai_profiles_consolidated (user_id, tokens, isadmin) VALUES ($1, 25000, false) ON CONFLICT DO NOTHING`,
         [phone],
       );
     }
@@ -90,7 +90,7 @@ export class AuthService {
 
     // Ensure profile exists
     await this.pg.query(
-      `INSERT INTO ai_profiles_consolidated (user_id, tokens, isadmin) VALUES ($1, 0, false) ON CONFLICT DO NOTHING`,
+      `INSERT INTO ai_profiles_consolidated (user_id, tokens, isadmin) VALUES ($1, 25000, false) ON CONFLICT DO NOTHING`,
       [phone],
     );
 
