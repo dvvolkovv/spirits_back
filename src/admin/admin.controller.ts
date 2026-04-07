@@ -58,7 +58,7 @@ export class AdminController {
         return res.status(200).json(toggled);
       }
       case 'mark_paid': {
-        const paid = await this.adminService.markPaid(data.id);
+        const paid = await this.adminService.markPaid(data.commission_id || data.id);
         return res.status(200).json(paid);
       }
       case 'mark_all_paid': {

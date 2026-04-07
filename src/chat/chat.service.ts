@@ -193,7 +193,29 @@ export class ChatService {
       }
     }
 
-    const fullText = chunks.join('');
+    let fullText = chunks.join('');
+
+    // Post-process: replace <get_metaphor_card> and fake image URLs with real S3 cards
+    if (fullText.includes('get_metaphor_card') || fullText.includes('images.linkeon.io')) {
+      try {
+        const cardUrl = await this.getRandomMetaphorCard();
+        if (cardUrl) {
+          // Replace tool call tags
+          fullText = fullText.replace(/<\/?get_metaphor_card>/g, '');
+          // Replace fake image URLs
+          fullText = fullText.replace(/!\[([^\]]*)\]\(https?:\/\/images\.linkeon\.io[^)]*\)/g, `![Метафорическая карта](${cardUrl})`);
+          // If no markdown image was inserted, add one
+          if (!fullText.includes('![')) {
+            fullText = `![Метафорическая карта](${cardUrl})\n\n${fullText.trim()}`;
+          }
+          // Send the card as additional content
+          res.write(JSON.stringify({ type: 'item', content: `\n\n![Метафорическая карта](${cardUrl})\n\n` }) + '\n');
+        }
+      } catch (e) {
+        this.logger.error(`Metaphor card error: ${e.message}`);
+      }
+    }
+
     res.write(JSON.stringify({ type: 'end', content: fullText }) + '\n');
     res.end();
 
@@ -206,6 +228,23 @@ export class ChatService {
         this.logger.error(`Post-chat save error: ${e.message}`);
       }
     });
+  }
+
+  private async getRandomMetaphorCard(): Promise<string | null> {
+    const { S3Client, ListObjectsV2Command, GetObjectCommand } = require('@aws-sdk/client-s3');
+    const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+    const s3 = new S3Client({
+      region: process.env.AWS_REGION || 'ru-central1',
+      endpoint: process.env.AWS_ENDPOINT || 'https://storage.yandexcloud.net',
+      credentials: { accessKeyId: process.env.AWS_ACCESS_KEY_ID || '', secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '' },
+      forcePathStyle: true,
+    });
+    const bucket = process.env.AWS_S3_BUCKET || 'linkeon.io';
+    const res = await s3.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: 'images/', MaxKeys: 100 }));
+    const keys = (res.Contents || []).map(o => o.Key).filter(k => k.match(/\.(png|jpg|jpeg)$/i));
+    if (!keys.length) return null;
+    const randomKey = keys[Math.floor(Math.random() * keys.length)];
+    return getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: randomKey }), { expiresIn: 7 * 24 * 3600 });
   }
 
   private async generateImageForChat(userId: string, prompt: string): Promise<{ url: string; text: string } | null> {
