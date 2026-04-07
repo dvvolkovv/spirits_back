@@ -44,7 +44,19 @@ export class AgentsService {
   }
 
   async upsertAgent(data: any) {
+    const agentId = data['agent-id'] || data.id;
     const { name, system_prompt, description } = data;
+
+    // If we have an ID, update by ID
+    if (agentId) {
+      const res = await this.pg.query(
+        `UPDATE agents SET system_prompt = $1, description = $2 WHERE id = $3 RETURNING *`,
+        [system_prompt, description, agentId],
+      );
+      if (res.rows.length) return res.rows[0];
+    }
+
+    // Otherwise insert/upsert by name
     const res = await this.pg.query(
       `INSERT INTO agents (name, system_prompt, description)
        VALUES ($1, $2, $3)

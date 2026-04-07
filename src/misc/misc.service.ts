@@ -45,12 +45,9 @@ ${matches.map((m, i) => `${i + 1}. Телефон: ${m.phone}, Ценности:
     const userMessage = `Запрос поиска: "${query}"`;
 
     // Stream response
-    res.write(JSON.stringify({ type: 'begin' }) + '\n');
-
     if (matches.length === 0) {
       const noResults = 'К сожалению, по вашему запросу не найдено подходящих людей. Попробуйте изменить запрос или расширить критерии поиска.\n\nsearch_result:[]';
       res.write(JSON.stringify({ type: 'item', content: noResults }) + '\n');
-      res.write(JSON.stringify({ type: 'end', content: noResults }) + '\n');
       res.end();
       return;
     }
@@ -92,12 +89,9 @@ ${profiles.map(p => `Профиль ${p.phone}:\n${formatProfile(p.data)}`).join
 
 Используй markdown форматирование.`;
 
-    res.write(JSON.stringify({ type: 'begin' }) + '\n');
-
     if (!myProfile && profiles.length === 0) {
       const msg = 'Не удалось найти профили для анализа. Убедитесь, что указанные номера зарегистрированы в системе.';
       res.write(JSON.stringify({ type: 'item', content: msg }) + '\n');
-      res.write(JSON.stringify({ type: 'end', content: msg }) + '\n');
       res.end();
       return;
     }
@@ -197,8 +191,6 @@ ${profiles.map(p => `Профиль ${p.phone}:\n${formatProfile(p.data)}`).join
       res.write(JSON.stringify({ type: 'item', content: errMsg }) + '\n');
     }
 
-    const fullText = chunks.join('');
-    res.write(JSON.stringify({ type: 'end', content: fullText }) + '\n');
     res.end();
   }
 }
