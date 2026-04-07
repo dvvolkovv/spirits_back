@@ -1,0 +1,18 @@
+{
+  "name": "my-linkeon-tests",
+  "version": "1.0.0",
+  "description": "Automated tests for my.linkeon.io — API, DB, n8n workflows",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node runner.js",
+    "test:api": "node runner.js --suite api",
+    "test:db": "node runner.js --suite db",
+    "test:workflows": "node runner.js --suite workflows",
+    "test:e2e": "node runner.js --suite e2e"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "pg": "^8.11.0",
+    "form-data": "^4.0.0"
+  }
+}

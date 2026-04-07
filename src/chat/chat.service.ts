@@ -198,7 +198,7 @@ export class ChatService {
     // Post-process: replace <get_metaphor_card> and fake image URLs with real S3 cards
     if (fullText.includes('get_metaphor_card') || fullText.includes('images.linkeon.io')) {
       try {
-        const cardUrl = await this.getRandomMetaphorCard();
+        const cardUrl = await this.getRandomMetaphorCard(userId);
         if (cardUrl) {
           // Replace tool call tags
           fullText = fullText.replace(/<\/?get_metaphor_card>/g, '');
@@ -230,21 +230,46 @@ export class ChatService {
     });
   }
 
-  private async getRandomMetaphorCard(): Promise<string | null> {
-    const { S3Client, ListObjectsV2Command, GetObjectCommand } = require('@aws-sdk/client-s3');
-    const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
-    const s3 = new S3Client({
-      region: process.env.AWS_REGION || 'ru-central1',
-      endpoint: process.env.AWS_ENDPOINT || 'https://storage.yandexcloud.net',
-      credentials: { accessKeyId: process.env.AWS_ACCESS_KEY_ID || '', secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '' },
-      forcePathStyle: true,
-    });
-    const bucket = process.env.AWS_S3_BUCKET || 'linkeon.io';
-    const res = await s3.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: 'images/', MaxKeys: 100 }));
-    const keys = (res.Contents || []).map(o => o.Key).filter(k => k.match(/\.(png|jpg|jpeg)$/i));
-    if (!keys.length) return null;
-    const randomKey = keys[Math.floor(Math.random() * keys.length)];
-    return getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: randomKey }), { expiresIn: 7 * 24 * 3600 });
+  private async getRandomMetaphorCard(userId: string): Promise<string | null> {
+    // Ensure active session exists
+    const sessionRes = await this.pg.query(
+      `SELECT id, cards_shown FROM game_sessions WHERE user_id = $1 AND session_state = 'active' ORDER BY started_at DESC LIMIT 1`,
+      [userId],
+    );
+    let cardsShown: number[] = [];
+    if (sessionRes.rows.length === 0) {
+      await this.pg.query(
+        `INSERT INTO game_sessions (user_id, session_type, session_state, cards_shown, started_at, last_activity) VALUES ($1, 'metaphor', 'active', '[]'::jsonb, now(), now())`,
+        [userId],
+      );
+    } else {
+      cardsShown = (sessionRes.rows[0].cards_shown || []).map(Number);
+    }
+
+    // Pick random card not yet shown
+    const cardRes = await this.pg.query(
+      `SELECT id, image_url FROM metaphor_cards WHERE id != ALL($1::int[]) ORDER BY RANDOM() LIMIT 1`,
+      [cardsShown],
+    );
+    if (!cardRes.rows.length) {
+      // All cards shown — reset session
+      await this.pg.query(
+        `UPDATE game_sessions SET cards_shown = '[]'::jsonb, last_activity = now() WHERE user_id = $1 AND session_state = 'active'`,
+        [userId],
+      );
+      const resetRes = await this.pg.query(`SELECT id, image_url FROM metaphor_cards ORDER BY RANDOM() LIMIT 1`);
+      if (!resetRes.rows.length) return null;
+      return resetRes.rows[0].image_url;
+    }
+
+    const card = cardRes.rows[0];
+    // Update session
+    await this.pg.query(
+      `UPDATE game_sessions SET cards_shown = cards_shown || $1::jsonb, last_activity = now() WHERE user_id = $2 AND session_state = 'active'`,
+      [JSON.stringify([card.id]), userId],
+    );
+
+    return card.image_url;
   }
 
   private async generateImageForChat(userId: string, prompt: string): Promise<{ url: string; text: string } | null> {
