@@ -16,7 +16,16 @@ export class AvatarController {
   async getAvatar(@CurrentUser() user: any, @Res() res: Response) {
     const avatar = await this.avatarService.getAvatar(user.phone);
     if (!avatar) return res.status(404).json({ error: 'No avatar' });
-    return res.status(200).json(avatar);
+
+    // If local file, serve it directly as binary
+    if (avatar.url.startsWith('/static/')) {
+      const path = require('path');
+      const filePath = path.join(process.cwd(), 'public', avatar.url.replace('/static/', ''));
+      return res.sendFile(filePath);
+    }
+
+    // If remote URL, redirect
+    return res.redirect(avatar.url);
   }
 
   @Post('avatar')

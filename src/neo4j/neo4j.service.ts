@@ -111,6 +111,43 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  async getProfileEntities(userId: string): Promise<any> {
+    const session = this.getSession();
+    if (!session) return null;
+    try {
+      const result = await session.run(
+        `MATCH (p:Profile {phone: $phone})
+         RETURN
+           COALESCE(p.name, '') AS name,
+           COALESCE(p.family_name, '') AS family_name,
+           [(p)-[:HAS_VALUE]->(n:Value) | n.name] AS values,
+           [(p)-[:HAS_BELIEF]->(n:Belief) | n.name] AS beliefs,
+           [(p)-[:HAS_DESIRE]->(n:Desire) | n.name] AS desires,
+           [(p)-[:HAS_INTENT]->(n:Intent) | n.name] AS intents,
+           [(p)-[:HAS_INTEREST]->(n:Interest) | n.name] AS interests,
+           [(p)-[:HAS_SKILL]->(n:Skill) | n.name] AS skills`,
+        { phone: userId },
+      );
+      if (!result.records.length) return null;
+      const rec = result.records[0];
+      return {
+        name: rec.get('name') || undefined,
+        family_name: rec.get('family_name') || undefined,
+        values: rec.get('values').filter(Boolean),
+        beliefs: rec.get('beliefs').filter(Boolean),
+        desires: rec.get('desires').filter(Boolean),
+        intents: rec.get('intents').filter(Boolean),
+        interests: rec.get('interests').filter(Boolean),
+        skills: rec.get('skills').filter(Boolean),
+      };
+    } catch (e) {
+      this.logger.error(`getProfileEntities error: ${e.message}`);
+      return null;
+    } finally {
+      await session.close();
+    }
+  }
+
   async updateProfileEntities(userId: string, entityType: string, values: string[]): Promise<void> {
     const session = this.getSession();
     if (!session) return;
