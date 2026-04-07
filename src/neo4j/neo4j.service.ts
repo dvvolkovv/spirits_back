@@ -66,24 +66,19 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     const session = this.getSession();
     if (!session) return '';
     try {
+      // Use subqueries to avoid Cartesian product explosion
       const result = await session.run(
         `MATCH (p:Profile {phone: $phone})
-         OPTIONAL MATCH (p)-[ri:HAS_INTEREST]->(i:Interest)
-         OPTIONAL MATCH (p)-[rd:HAS_DESIRE]->(d:Desire)
-         OPTIONAL MATCH (p)-[rb:HAS_BELIEF]->(b:Belief)
-         OPTIONAL MATCH (p)-[rit:HAS_INTENT]->(it:Intent)
-         OPTIONAL MATCH (p)-[rv:HAS_VALUE]->(v:Value)
-         OPTIONAL MATCH (p)-[rs:HAS_SKILL]->(s:Skill)
          RETURN
            p.phone AS phone,
            COALESCE(p.name, '') AS name,
            COALESCE(p.family_name, '') AS family_name,
-           collect(DISTINCT {name: i.name, confidence: ri.confidence}) AS interests,
-           collect(DISTINCT {name: d.name, confidence: rd.confidence}) AS desires,
-           collect(DISTINCT {name: b.name, confidence: rb.confidence}) AS beliefs,
-           collect(DISTINCT {name: it.name, confidence: rit.confidence}) AS intents,
-           collect(DISTINCT {name: v.name, confidence: rv.confidence}) AS values,
-           collect(DISTINCT {name: s.name, confidence: rs.confidence}) AS skills`,
+           [(p)-[r:HAS_INTEREST]->(n:Interest) | {name: n.name, confidence: r.confidence}] AS interests,
+           [(p)-[r:HAS_DESIRE]->(n:Desire) | {name: n.name, confidence: r.confidence}] AS desires,
+           [(p)-[r:HAS_BELIEF]->(n:Belief) | {name: n.name, confidence: r.confidence}] AS beliefs,
+           [(p)-[r:HAS_INTENT]->(n:Intent) | {name: n.name, confidence: r.confidence}] AS intents,
+           [(p)-[r:HAS_VALUE]->(n:Value) | {name: n.name, confidence: r.confidence}] AS values,
+           [(p)-[r:HAS_SKILL]->(n:Skill) | {name: n.name, confidence: r.confidence}] AS skills`,
         { phone: userId },
       );
 
@@ -92,6 +87,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
 
       const fmt = (items: any[]) => items
         .filter(x => x.name)
+        .slice(0, 20) // limit to top 20 per category
         .map(x => `${x.name}(confidence:${Math.round(Number(x.confidence) || 5)})`)
         .join(', ');
 
