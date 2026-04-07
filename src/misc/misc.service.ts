@@ -226,22 +226,80 @@ ${profiles.map(p => `Профиль ${p.phone}:\n${formatProfile(p.data)}`).join
       const session = (this.neo4j as any).getSession();
       if (!session) return [];
 
-      // Simple keyword search: match profiles that have values/interests/skills matching the query
-      const result = await session.run(
-        `MATCH (p:Profile)
-         WHERE p.phone <> $exclude
-         WITH p,
-           [(p)-[:HAS_VALUE]->(v:Value) | v.name] AS values,
-           [(p)-[:HAS_INTEREST]->(i:Interest) | i.name] AS interests,
-           [(p)-[:HAS_SKILL]->(s:Skill) | s.name] AS skills,
-           [(p)-[:HAS_DESIRE]->(d:Desire) | d.name] AS desires,
-           [(p)-[:HAS_INTENT]->(it:Intent) | it.name] AS intents
-         WHERE size(values) + size(interests) + size(skills) > 0
-         RETURN p.phone AS phone, COALESCE(p.name, '') AS name,
-                values, interests, skills, desires, intents
-         LIMIT 10`,
-        { exclude: excludePhone },
-      );
+      // Get searcher's profile for graph matching
+      const myProfile = await this.neo4j.getProfileEntities(excludePhone).catch(() => null);
+      const myValues = (myProfile?.values || []).slice(0, 20);
+      const myInterests = (myProfile?.interests || []).slice(0, 20);
+      const mySkills = (myProfile?.skills || []).slice(0, 20);
+
+      // Try vector search first
+      const queryEmbedding = await this.neo4j.getQueryEmbedding(query);
+      let vectorCandidates: string[] = [];
+
+      if (queryEmbedding) {
+        try {
+          const vectorResult = await session.run(
+            `CALL db.index.vector.queryNodes('profileEmbeddingIndex', 20, $embedding)
+             YIELD node, score
+             WHERE node.phone <> $exclude
+             RETURN node.phone AS phone, score
+             ORDER BY score DESC`,
+            { embedding: queryEmbedding, exclude: excludePhone },
+          );
+          vectorCandidates = vectorResult.records.map(r => r.get('phone'));
+        } catch (e) {
+          this.logger.warn(`Vector search failed, falling back to graph: ${e.message}`);
+        }
+      }
+
+      // Hybrid: graph search with optional vector boost
+      const cypher = vectorCandidates.length > 0
+        ? `MATCH (p:Profile)
+           WHERE p.phone IN $candidates
+           WITH p,
+             [(p)-[:HAS_VALUE]->(v:Value) | v.name] AS values,
+             [(p)-[:HAS_INTEREST]->(i:Interest) | i.name] AS interests,
+             [(p)-[:HAS_SKILL]->(s:Skill) | s.name] AS skills,
+             [(p)-[:HAS_DESIRE]->(d:Desire) | d.name] AS desires,
+             [(p)-[:HAS_INTENT]->(it:Intent) | it.name] AS intents
+           WHERE size(values) + size(interests) + size(skills) > 0
+           WITH p, values, interests, skills, desires, intents,
+             size([v IN values WHERE v IN $myValues]) AS sharedValues,
+             size([i IN interests WHERE i IN $myInterests]) AS sharedInterests,
+             size([s IN skills WHERE s IN $mySkills]) AS sharedSkills
+           WITH p, values, interests, skills, desires, intents,
+             sharedValues, sharedInterests, sharedSkills,
+             (sharedValues * 3 + sharedInterests * 2 + sharedSkills) AS score
+           ORDER BY score DESC
+           RETURN p.phone AS phone, COALESCE(p.name, '') AS name,
+                  values, interests, skills, desires, intents
+           LIMIT 10`
+        : `MATCH (p:Profile)
+           WHERE p.phone <> $exclude
+           WITH p,
+             [(p)-[:HAS_VALUE]->(v:Value) | v.name] AS values,
+             [(p)-[:HAS_INTEREST]->(i:Interest) | i.name] AS interests,
+             [(p)-[:HAS_SKILL]->(s:Skill) | s.name] AS skills,
+             [(p)-[:HAS_DESIRE]->(d:Desire) | d.name] AS desires,
+             [(p)-[:HAS_INTENT]->(it:Intent) | it.name] AS intents
+           WHERE size(values) + size(interests) + size(skills) > 0
+           WITH p, values, interests, skills, desires, intents,
+             size([v IN values WHERE v IN $myValues]) AS sharedValues,
+             size([i IN interests WHERE i IN $myInterests]) AS sharedInterests,
+             size([s IN skills WHERE s IN $mySkills]) AS sharedSkills
+           WITH p, values, interests, skills, desires, intents,
+             sharedValues, sharedInterests, sharedSkills,
+             (sharedValues * 3 + sharedInterests * 2 + sharedSkills) AS score
+           ORDER BY score DESC
+           RETURN p.phone AS phone, COALESCE(p.name, '') AS name,
+                  values, interests, skills, desires, intents
+           LIMIT 10`;
+
+      const result = await session.run(cypher, {
+        candidates: vectorCandidates,
+        exclude: excludePhone,
+        myValues, myInterests, mySkills,
+      });
 
       await session.close();
       return result.records.map(r => ({
@@ -260,59 +318,30 @@ ${profiles.map(p => `Профиль ${p.phone}:\n${formatProfile(p.data)}`).join
   }
 
   private async streamLLM(systemPrompt: string, userMessage: string, res: Response): Promise<void> {
-    const chunks: string[] = [];
     try {
-      const response = await axios.post(
-        'https://openrouter.ai/api/v1/chat/completions',
-        {
-          model: 'openai/gpt-4o-mini',
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userMessage },
-          ],
-          stream: true,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-            'Content-Type': 'application/json',
-            'HTTP-Referer': 'https://my.linkeon.io',
-          },
-          responseType: 'stream',
-          timeout: 120000,
-        },
-      );
-
-      await new Promise<void>((resolve, reject) => {
-        let buffer = '';
-        response.data.on('data', (chunk: Buffer) => {
-          buffer += chunk.toString();
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed === 'data: [DONE]') continue;
-            if (!trimmed.startsWith('data: ')) continue;
-            try {
-              const json = JSON.parse(trimmed.substring(6));
-              const content = json.choices?.[0]?.delta?.content;
-              if (content) {
-                chunks.push(content);
-                res.write(JSON.stringify({ type: 'item', content }) + '\n');
-              }
-            } catch {}
-          }
+      const anthropicKey = process.env.ANTHROPIC_API_KEY;
+      if (anthropicKey) {
+        const Anthropic = require('@anthropic-ai/sdk');
+        const client = new Anthropic({ apiKey: anthropicKey });
+        const msg = await client.messages.create({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 4096,
+          system: systemPrompt,
+          messages: [{ role: 'user', content: userMessage }],
         });
-        response.data.on('end', () => resolve());
-        response.data.on('error', (err: Error) => reject(err));
-      });
+        let content = msg.content?.[0]?.text || '';
+        // Strip markdown code blocks around search_result JSON
+        content = content.replace(/search_result:\s*```(?:json)?\s*\n?/g, 'search_result:');
+        content = content.replace(/\n?```\s*$/g, '');
+        content = content.replace(/```\s*"?\s*\}/g, '"}');
+        res.write(JSON.stringify({ type: 'item', content }) + '\n');
+      } else {
+        res.write(JSON.stringify({ type: 'item', content: 'LLM не настроен.' }) + '\n');
+      }
     } catch (e) {
-      this.logger.error(`LLM stream error: ${e.message}`);
-      const errMsg = 'Ошибка при обработке запроса.';
-      chunks.push(errMsg);
-      res.write(JSON.stringify({ type: 'item', content: errMsg }) + '\n');
+      this.logger.error(`LLM error: ${e.message}`);
+      res.write(JSON.stringify({ type: 'item', content: 'Ошибка при обработке запроса.' }) + '\n');
     }
-
     res.end();
   }
 }

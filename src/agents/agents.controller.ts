@@ -31,7 +31,7 @@ export class AgentsController {
   @Post('agent')
   @UseGuards(JwtGuard)
   async upsertAgent(@CurrentUser() user: any, @Body() body: any, @Res() res: Response) {
-    const result = await this.agentsService.upsertAgent(body);
-    return res.status(200).json(result);
+    await this.agentsService.upsertAgent(body);
+    return res.status(200).json({ success: 'agent updated' });
   }
 }

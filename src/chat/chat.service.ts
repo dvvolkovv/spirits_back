@@ -1,5 +1,6 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
+import { Neo4jService } from '../neo4j/neo4j.service';
 import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import { Response } from 'express';
@@ -9,7 +10,7 @@ export class ChatService {
   private readonly logger = new Logger(ChatService.name);
   private anthropic: Anthropic | null = null;
 
-  constructor(private readonly pg: PgService) {
+  constructor(private readonly pg: PgService, @Optional() private readonly neo4j: Neo4jService) {
     if (process.env.ANTHROPIC_API_KEY) {
       this.anthropic = new Anthropic({
         apiKey: process.env.ANTHROPIC_API_KEY,
@@ -122,7 +123,7 @@ export class ChatService {
       }
     }
 
-    // Regular text chat — stream LLM response
+    // Regular text chat — collect full response then send cleaned
     res.write(JSON.stringify({ type: 'begin' }) + '\n');
 
     const chunks: string[] = [];
@@ -137,16 +138,12 @@ export class ChatService {
           system: systemPrompt,
           messages: llmMessages,
         });
-        stream.on('text', (text) => {
-          chunks.push(text);
-          res.write(JSON.stringify({ type: 'item', content: text }) + '\n');
-        });
+        stream.on('text', (text) => chunks.push(text));
         const finalMessage = await stream.finalMessage();
         inputTokens = finalMessage.usage?.input_tokens || 0;
         outputTokens = finalMessage.usage?.output_tokens || 0;
       } catch (e) {
         this.logger.error(`Anthropic stream error: ${e.message}`);
-        res.write(JSON.stringify({ type: 'item', content: 'Ошибка соединения с ассистентом.' }) + '\n');
         chunks.push('Ошибка соединения с ассистентом.');
       }
     } else {
@@ -178,7 +175,7 @@ export class ChatService {
               try {
                 const json = JSON.parse(trimmed.substring(6));
                 const content = json.choices?.[0]?.delta?.content;
-                if (content) { chunks.push(content); res.write(JSON.stringify({ type: 'item', content }) + '\n'); }
+                if (content) chunks.push(content);
                 if (json.usage) { inputTokens = json.usage.prompt_tokens || 0; outputTokens = json.usage.completion_tokens || 0; }
               } catch {}
             }
@@ -188,46 +185,62 @@ export class ChatService {
         });
       } catch (e) {
         this.logger.error(`OpenRouter stream error: ${e.message}`);
-        res.write(JSON.stringify({ type: 'item', content: 'Ошибка соединения с ассистентом.' }) + '\n');
         chunks.push('Ошибка соединения с ассистентом.');
       }
     }
+    // Clean and post-process the full response
+    const rawFull = chunks.join('');
+    let fullText = this.stripToolTags(rawFull);
 
-    let fullText = chunks.join('');
-
-    // Post-process: replace <get_metaphor_card> and fake image URLs with real S3 cards
-    if (fullText.includes('get_metaphor_card') || fullText.includes('images.linkeon.io')) {
+    // If Маша tried to show a metaphor card, fetch a real one
+    // Detect metaphor card: tool tags, fake URLs, or Маша talking about showing a card
+    const cardPattern = /(?:get_metaphor_card|images\.linkeon\.io|вот.*карт|первая карта|следующая карта|покажу.*карт|новая карта|вытяни.*карт|твоя карта|image_url)/i;
+    if (cardPattern.test(rawFull)) {
       try {
         const cardUrl = await this.getRandomMetaphorCard(userId);
         if (cardUrl) {
-          // Replace tool call tags
-          fullText = fullText.replace(/<\/?get_metaphor_card>/g, '');
-          // Replace fake image URLs
-          fullText = fullText.replace(/!\[([^\]]*)\]\(https?:\/\/images\.linkeon\.io[^)]*\)/g, `![Метафорическая карта](${cardUrl})`);
-          // If no markdown image was inserted, add one
-          if (!fullText.includes('![')) {
-            fullText = `![Метафорическая карта](${cardUrl})\n\n${fullText.trim()}`;
-          }
-          // Send the card as additional content
-          res.write(JSON.stringify({ type: 'item', content: `\n\n![Метафорическая карта](${cardUrl})\n\n` }) + '\n');
+          fullText = `${fullText.trim()}\n\n![Метафорическая карта](${cardUrl})`;
         }
       } catch (e) {
         this.logger.error(`Metaphor card error: ${e.message}`);
       }
     }
 
+    res.write(JSON.stringify({ type: 'item', content: fullText }) + '\n');
     res.write(JSON.stringify({ type: 'end', content: fullText }) + '\n');
     res.end();
 
-    // Async: save to DB after response sent
+    // Async: save to DB and consolidate profile after response sent
     setImmediate(async () => {
       try {
         await this.saveChatHistory(userId, String(assistantId), message, fullText);
         await this.addTokenTask(userId, inputTokens, outputTokens, String(agent.id));
+        // Extract profile entities from conversation
+        if (this.neo4j) {
+          await this.neo4j.consolidateFromChat(userId, message, fullText);
+        }
       } catch (e) {
         this.logger.error(`Post-chat save error: ${e.message}`);
       }
     });
+  }
+
+  private stripToolTags(text: string): string {
+    return text
+      .replace(/<\/?function_calls>/g, '')
+      .replace(/<\/?get_metaphor_card>/g, '')
+      .replace(/<\/?get_profile>/g, '')
+      .replace(/<\/?tool_call>/g, '')
+      .replace(/<\/?tool_result>/g, '')
+      .replace(/<\/?invoke>/g, '')
+      .replace(/<\/?antml:[^>]*>/g, '')
+      .replace(/\[?\s*\{\s*"tool_name"\s*:\s*"[^"]*"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\}\s*\]?/g, '')
+      // Remove fake/empty/placeholder markdown images
+      .replace(/!\[[^\]]*\]\(\{?image_url\}?\)/g, '')
+      .replace(/!\[[^\]]*\]\(https?:\/\/images\.linkeon\.io[^)]*\)/g, '')
+      .replace(/!\[\]\([^)]*\)/g, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
   }
 
   private async getRandomMetaphorCard(userId: string): Promise<string | null> {
@@ -348,21 +361,23 @@ export class ChatService {
     );
   }
 
-  async getChatHistory(userId: string, assistantId: string): Promise<{ messages: any[] }> {
+  async getChatHistory(userId: string, assistantId: string, limit = 30, offset = 0): Promise<{ messages: any[]; hasMore: boolean }> {
     const sessionId = `${userId}_${assistantId}`;
     const res = await this.pg.query(
       `SELECT id, sender_type, content, created_at FROM custom_chat_history
        WHERE session_id = $1
-       ORDER BY created_at DESC LIMIT 6`,
-      [sessionId],
+       ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+      [sessionId, limit + 1, offset],
     );
-    const messages = res.rows.reverse().map(r => ({
+    const hasMore = res.rows.length > limit;
+    const rows = hasMore ? res.rows.slice(0, limit) : res.rows;
+    const messages = rows.reverse().map(r => ({
       id: String(r.id),
       type: r.sender_type === 'human' ? 'user' : 'assistant',
       content: r.content,
       timestamp: r.created_at,
     }));
-    return { messages };
+    return { messages, hasMore };
   }
 
   async deleteChatHistory(userId: string, assistantId: string) {

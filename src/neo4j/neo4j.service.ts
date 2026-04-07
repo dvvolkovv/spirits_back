@@ -161,11 +161,11 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
          DELETE r`,
         { phone: userId, values },
       );
-      // Create new relationships
+      // Create new relationships (MERGE profile first)
       for (const valueName of values) {
         if (!valueName?.trim()) continue;
         await session.run(
-          `MATCH (p:Profile {phone: $phone})
+          `MERGE (p:Profile {phone: $phone})
            MERGE (v:${type} {name: $name})
            MERGE (p)-[r:${rel}]->(v)
            ON CREATE SET r.created_at = datetime(), r.confidence = 5
@@ -200,31 +200,121 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
 Пользователь: ${userMessage}
 Ассистент: ${assistantResponse}`;
 
-      const resp = await axios.post(
-        'https://openrouter.ai/api/v1/chat/completions',
-        {
-          model: process.env.CONSOLIDATION_MODEL || 'openai/gpt-4o-mini',
+      let content: string | null = null;
+      const anthropicKey = process.env.ANTHROPIC_API_KEY;
+      if (anthropicKey) {
+        const Anthropic = require('@anthropic-ai/sdk');
+        const client = new Anthropic({ apiKey: anthropicKey });
+        const msg = await client.messages.create({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 1024,
           messages: [{ role: 'user', content: prompt }],
-          response_format: { type: 'json_object' },
-        },
-        {
-          headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-          timeout: 30000,
-        },
-      );
-
-      const content = resp.data.choices?.[0]?.message?.content;
+        });
+        content = msg.content?.[0]?.text || null;
+      } else if (apiKey) {
+        const resp = await axios.post(
+          'https://openrouter.ai/api/v1/chat/completions',
+          {
+            model: process.env.CONSOLIDATION_MODEL || 'openai/gpt-4o-mini',
+            messages: [{ role: 'user', content: prompt }],
+            response_format: { type: 'json_object' },
+          },
+          {
+            headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+            timeout: 30000,
+          },
+        );
+        content = resp.data.choices?.[0]?.message?.content;
+      }
       if (!content) return;
 
-      const extracted = JSON.parse(content);
+      // Strip markdown code blocks if present
+      let jsonStr = content.trim();
+      if (jsonStr.startsWith('```')) {
+        jsonStr = jsonStr.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
+      }
+      const extracted = JSON.parse(jsonStr);
       const entityTypes = ['interests', 'values', 'desires', 'beliefs', 'intents', 'skills'];
       for (const type of entityTypes) {
         if (Array.isArray(extracted[type]) && extracted[type].length > 0) {
           await this.updateProfileEntities(userId, type.slice(0, -1), extracted[type]); // remove 's'
         }
       }
+      // Update embedding every 5th consolidation (save on API costs)
+      const session2 = this.getSession();
+      if (session2) {
+        try {
+          const res = await session2.run(
+            'MATCH (p:Profile {phone: $phone}) RETURN p.consolidation_count as cnt, p.embeddingUpdatedAt as emb',
+            { phone: userId },
+          );
+          const cnt = (res.records[0]?.get('cnt')?.toNumber?.() || res.records[0]?.get('cnt') || 0) + 1;
+          await session2.run(
+            'MERGE (p:Profile {phone: $phone}) SET p.consolidation_count = $cnt',
+            { phone: userId, cnt },
+          );
+          // Update embedding every 5 consolidations or if never set
+          const hasEmbedding = res.records[0]?.get('emb');
+          if (!hasEmbedding || cnt % 5 === 0) {
+            await this.updateProfileEmbedding(userId);
+          }
+        } finally {
+          await session2.close();
+        }
+      }
     } catch (e) {
       this.logger.error(`consolidateFromChat error: ${e.message}`);
+    }
+  }
+
+  async updateProfileEmbedding(userId: string): Promise<void> {
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (!openaiKey || !this.driver) return;
+
+    try {
+      // Build text description from profile entities
+      const desc = await this.getProfileDescription(userId);
+      if (!desc || desc.length < 20) return;
+
+      // Get embedding from OpenAI
+      const resp = await axios.post(
+        'https://api.openai.com/v1/embeddings',
+        { model: 'text-embedding-3-large', input: desc, dimensions: 256 },
+        { headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' }, timeout: 15000 },
+      );
+      const embedding = resp.data?.data?.[0]?.embedding;
+      if (!embedding || !Array.isArray(embedding)) return;
+
+      // Store embedding in Neo4j
+      const session = this.getSession();
+      if (!session) return;
+      try {
+        await session.run(
+          'MERGE (p:Profile {phone: $phone}) SET p.embedding = $embedding, p.embeddingUpdatedAt = datetime()',
+          { phone: userId, embedding },
+        );
+        this.logger.log(`Embedding updated for ${userId} (${embedding.length} dims)`);
+      } finally {
+        await session.close();
+      }
+    } catch (e) {
+      this.logger.error(`updateProfileEmbedding error: ${e.message}`);
+    }
+  }
+
+  async getQueryEmbedding(query: string): Promise<number[] | null> {
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (!openaiKey) return null;
+    try {
+      const resp = await axios.post(
+        'https://api.openai.com/v1/embeddings',
+        { model: 'text-embedding-3-large', input: query, dimensions: 256 },
+        { headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' }, timeout: 15000 },
+      );
+      return resp.data?.data?.[0]?.embedding || null;
+    } catch (e) {
+      this.logger.error(`getQueryEmbedding error: ${e.message}`);
+      return null;
     }
   }
 }

@@ -60,8 +60,8 @@ export class ChatController {
 
   @Get('chat/history')
   @UseGuards(JwtGuard)
-  async getHistory(@CurrentUser() user: any, @Query('assistantId') assistantId: string, @Res() res: Response) {
-    const history = await this.chatService.getChatHistory(user.phone, assistantId);
+  async getHistory(@CurrentUser() user: any, @Query('assistantId') assistantId: string, @Query('limit') limit: string, @Query('offset') offset: string, @Res() res: Response) {
+    const history = await this.chatService.getChatHistory(user.phone, assistantId, parseInt(limit) || 30, parseInt(offset) || 0);
     return res.status(200).json(history);
   }
 
