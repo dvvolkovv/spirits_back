@@ -26,13 +26,22 @@ export class AvatarService {
   }
 
   async getAvatar(userId: string): Promise<{ url: string } | null> {
+    // Check profile_data first
     const res = await this.pg.query(
       'SELECT profile_data FROM ai_profiles_consolidated WHERE user_id = $1',
       [userId],
     );
     const avatarUrl = res.rows[0]?.profile_data?.avatar_url;
-    if (!avatarUrl) return null;
-    return { url: avatarUrl };
+    if (avatarUrl) return { url: avatarUrl };
+
+    // Check local file
+    const path = require('path');
+    const fs = require('fs');
+    const localPath = path.join(process.cwd(), 'public', 'avatars', `${userId}.jpg`);
+    if (fs.existsSync(localPath)) {
+      return { url: `/static/avatars/${userId}.jpg` };
+    }
+    return null;
   }
 
   async uploadAvatar(userId: string, buffer: Buffer, mimetype: string): Promise<{ url: string }> {
@@ -58,7 +67,12 @@ export class AvatarService {
   }
 
   async getAgentAvatar(agentId: string): Promise<string | null> {
-    // agents table has no avatar_url column
+    const path = require('path');
+    const fs = require('fs');
+    const localPath = path.join(process.cwd(), 'public', 'agent-avatars', `${agentId}.jpg`);
+    if (fs.existsSync(localPath)) {
+      return `/static/agent-avatars/${agentId}.jpg`;
+    }
     return null;
   }
 }
