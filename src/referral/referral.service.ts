@@ -52,7 +52,7 @@ export class ReferralService {
     }));
 
     return {
-      referral_link: `http://82.202.197.230/?ref=${l.slug}`,
+      referral_link: `https://b.linkeon.io/?ref=${l.slug}`,
       leader: {
         name: l.name,
         slug: l.slug,

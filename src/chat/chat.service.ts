@@ -1,13 +1,21 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
+import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import { Response } from 'express';
 
 @Injectable()
 export class ChatService {
   private readonly logger = new Logger(ChatService.name);
+  private anthropic: Anthropic | null = null;
 
-  constructor(private readonly pg: PgService) {}
+  constructor(private readonly pg: PgService) {
+    if (process.env.ANTHROPIC_API_KEY) {
+      this.anthropic = new Anthropic({
+        apiKey: process.env.ANTHROPIC_API_KEY,
+      });
+    }
+  }
 
   async streamChat(
     userId: string,
@@ -59,10 +67,8 @@ export class ChatService {
       systemPrompt = `${systemPrompt}\n\n--- Профиль пользователя ---\n${profileText}`;
     }
 
-    // Build messages array for LLM
-    const llmMessages: any[] = [
-      { role: 'system', content: systemPrompt },
-    ];
+    // Build messages array
+    const llmMessages: { role: 'user' | 'assistant'; content: string }[] = [];
     for (const msg of recentHistory) {
       llmMessages.push({ role: msg.type === 'user' ? 'user' : 'assistant', content: msg.content });
     }
@@ -82,58 +88,87 @@ export class ChatService {
     const chunks: string[] = [];
     let inputTokens = 0;
     let outputTokens = 0;
-    const model = 'openai/gpt-4o-mini';
 
-    try {
-      const response = await axios.post(
-        'https://openrouter.ai/api/v1/chat/completions',
-        {
-          model,
+    if (this.anthropic) {
+      // Use Anthropic SDK directly
+      try {
+        const stream = this.anthropic.messages.stream({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 4096,
+          system: systemPrompt,
           messages: llmMessages,
-          stream: true,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-            'Content-Type': 'application/json',
-            'HTTP-Referer': 'https://my.linkeon.io',
-          },
-          responseType: 'stream',
-          timeout: 120000,
-        },
-      );
-
-      await new Promise<void>((resolve, reject) => {
-        let buffer = '';
-        response.data.on('data', (chunk: Buffer) => {
-          buffer += chunk.toString();
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed === 'data: [DONE]') continue;
-            if (!trimmed.startsWith('data: ')) continue;
-            try {
-              const json = JSON.parse(trimmed.substring(6));
-              const content = json.choices?.[0]?.delta?.content;
-              if (content) {
-                chunks.push(content);
-                res.write(JSON.stringify({ type: 'item', content }) + '\n');
-              }
-              if (json.usage) {
-                inputTokens = json.usage.prompt_tokens || 0;
-                outputTokens = json.usage.completion_tokens || 0;
-              }
-            } catch {}
-          }
         });
-        response.data.on('end', () => resolve());
-        response.data.on('error', (err: Error) => reject(err));
-      });
-    } catch (e) {
-      this.logger.error(`OpenRouter stream error: ${e.message}`);
-      res.write(JSON.stringify({ type: 'item', content: 'Ошибка соединения с ассистентом.' }) + '\n');
-      chunks.push('Ошибка соединения с ассистентом.');
+
+        stream.on('text', (text) => {
+          chunks.push(text);
+          res.write(JSON.stringify({ type: 'item', content: text }) + '\n');
+        });
+
+        const finalMessage = await stream.finalMessage();
+        inputTokens = finalMessage.usage?.input_tokens || 0;
+        outputTokens = finalMessage.usage?.output_tokens || 0;
+      } catch (e) {
+        this.logger.error(`Anthropic stream error: ${e.message}`);
+        res.write(JSON.stringify({ type: 'item', content: 'Ошибка соединения с ассистентом.' }) + '\n');
+        chunks.push('Ошибка соединения с ассистентом.');
+      }
+    } else {
+      // Fallback: OpenRouter with Claude Haiku
+      try {
+        const orMessages = [
+          { role: 'system', content: systemPrompt },
+          ...llmMessages,
+        ];
+        const response = await axios.post(
+          'https://openrouter.ai/api/v1/chat/completions',
+          {
+            model: 'anthropic/claude-haiku-4-5-20251001',
+            messages: orMessages,
+            stream: true,
+          },
+          {
+            headers: {
+              Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+              'Content-Type': 'application/json',
+              'HTTP-Referer': 'https://my.linkeon.io',
+            },
+            responseType: 'stream',
+            timeout: 120000,
+          },
+        );
+
+        await new Promise<void>((resolve, reject) => {
+          let buffer = '';
+          response.data.on('data', (chunk: Buffer) => {
+            buffer += chunk.toString();
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed || trimmed === 'data: [DONE]') continue;
+              if (!trimmed.startsWith('data: ')) continue;
+              try {
+                const json = JSON.parse(trimmed.substring(6));
+                const content = json.choices?.[0]?.delta?.content;
+                if (content) {
+                  chunks.push(content);
+                  res.write(JSON.stringify({ type: 'item', content }) + '\n');
+                }
+                if (json.usage) {
+                  inputTokens = json.usage.prompt_tokens || 0;
+                  outputTokens = json.usage.completion_tokens || 0;
+                }
+              } catch {}
+            }
+          });
+          response.data.on('end', () => resolve());
+          response.data.on('error', (err: Error) => reject(err));
+        });
+      } catch (e) {
+        this.logger.error(`OpenRouter stream error: ${e.message}`);
+        res.write(JSON.stringify({ type: 'item', content: 'Ошибка соединения с ассистентом.' }) + '\n');
+        chunks.push('Ошибка соединения с ассистентом.');
+      }
     }
 
     const fullText = chunks.join('');

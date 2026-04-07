@@ -15,7 +15,7 @@ export class PaymentsService {
     if (!shopId || !secretKey) throw new Error('YooKassa not configured');
 
     const idempotenceKey = uuidv4();
-    const returnUrl = process.env.RETURN_URL || 'http://82.202.197.230/payment/success';
+    const returnUrl = process.env.RETURN_URL || 'https://b.linkeon.io/payment/success';
     const resp = await axios.post(
       'https://api.yookassa.ru/v3/payments',
       {
