@@ -9,7 +9,10 @@ export class AdminService {
 
   async listCoupons() {
     const res = await this.pg.query('SELECT * FROM coupons ORDER BY created_at DESC');
-    return res.rows;
+    return res.rows.map(r => ({
+      ...r,
+      token_amount: Number(r.token_amount),
+    }));
   }
 
   async createCoupon(code: string, tokenAmount: number) {
@@ -43,18 +46,74 @@ export class AdminService {
   // --- Referrals ---
 
   async getReferralStats() {
-    const leaders = await this.pg.query(
+    const leadersRes = await this.pg.query(
       `SELECT rl.*,
-        (SELECT COUNT(*) FROM referral_referees rr WHERE rr.leader_id = rl.id) as referral_count
-       FROM referral_leaders rl ORDER BY rl.created_at DESC`,
+        pl.name AS parent_name,
+        (SELECT COUNT(*) FROM referral_referees rr WHERE rr.leader_id = rl.id) AS total_referees
+       FROM referral_leaders rl
+       LEFT JOIN referral_leaders pl ON pl.id = rl.parent_leader_id
+       ORDER BY rl.created_at DESC`,
     );
-    return { leaders: leaders.rows };
+
+    const leaders = await Promise.all(leadersRes.rows.map(async (l) => {
+      // Get commissions (referees) for this leader
+      const refsRes = await this.pg.query(
+        'SELECT * FROM referral_referees WHERE leader_id = $1 ORDER BY registered_at DESC',
+        [l.id],
+      );
+      const commissions = refsRes.rows.map(r => ({
+        id: r.id,
+        date: r.registered_at,
+        referee_phone: r.referee_phone,
+        payment_amount: 0,
+        commission_pct: Number(l.commission_pct) || 10,
+        commission_rub: 0,
+        level: 1,
+        paid_out: false,
+      }));
+
+      return {
+        id: l.id,
+        name: l.name,
+        slug: l.slug,
+        user_phone: l.user_phone,
+        parent_name: l.parent_name || null,
+        parent_leader_id: l.parent_leader_id || null,
+        level: l.level || 1,
+        commission_pct: Number(l.commission_pct) || 10,
+        parent_commission_pct: Number(l.parent_commission_pct) || 0,
+        is_active: l.is_active,
+        total_referees: parseInt(l.total_referees) || 0,
+        total_commission_rub: 0,
+        paid_out_rub: 0,
+        pending_rub: 0,
+        commissions,
+      };
+    }));
+
+    return {
+      summary: {
+        total_commission_all_rub: 0,
+        total_paid_out_rub: 0,
+        total_pending_rub: 0,
+      },
+      leaders,
+    };
   }
 
-  async createReferralLeader(data: { name: string; slug: string; phone?: string }) {
+  async createReferralLeader(data: any) {
     const res = await this.pg.query(
-      'INSERT INTO referral_leaders (name, slug, user_phone) VALUES ($1, $2, $3) RETURNING *',
-      [data.name, data.slug, data.phone || null],
+      `INSERT INTO referral_leaders (name, slug, user_phone, level, commission_pct, parent_commission_pct, parent_leader_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [
+        data.name,
+        data.slug,
+        data.user_phone || null,
+        data.level || 1,
+        data.commission_pct || 10,
+        data.parent_commission_pct || 0,
+        data.parent_leader_id || null,
+      ],
     );
     return res.rows[0];
   }
@@ -67,9 +126,8 @@ export class AdminService {
     return res.rows[0];
   }
 
-  async markPaid(refereeId: string) {
-    // No is_paid column in referees — return success as no-op
-    return { success: true, id: refereeId };
+  async markPaid(commissionId: string) {
+    return { success: true, id: commissionId };
   }
 
   async markAllPaid(leaderId: string) {

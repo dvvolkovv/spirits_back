@@ -3,18 +3,23 @@ import { Request, Response } from 'express';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { JwtService } from '../common/services/jwt.service';
+import { MiscService } from './misc.service';
 
 @Controller('')
 export class MiscController {
-  constructor(private readonly jwtSvc: JwtService) {}
+  constructor(
+    private readonly jwtSvc: JwtService,
+    private readonly miscService: MiscService,
+  ) {}
 
-  // Auth checked inside — return empty if no valid token (matching n8n behavior)
   @Post('search-mate')
   async searchMate(@Req() req: Request, @Res() res: Response) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     const userId = this.extractUser(req);
     if (!userId) return res.status(200).send('');
-    return res.status(200).json({ results: [] });
+    const { query } = req.body || {};
+    if (!query) return res.status(400).json({ error: 'Missing query' });
+    await this.miscService.searchMate(userId, query, res);
   }
 
   @Post('analyze-compatibility')
@@ -22,7 +27,10 @@ export class MiscController {
     res.setHeader('Access-Control-Allow-Origin', '*');
     const userId = this.extractUser(req);
     if (!userId) return res.status(200).send('');
-    return res.status(200).json({ score: 0, analysis: '' });
+    const { users, phones } = req.body || {};
+    const targets = users || phones || [];
+    if (!targets.length) return res.status(400).json({ error: 'Missing users' });
+    await this.miscService.analyzeCompatibility(userId, targets, res);
   }
 
   @Post('imagegen')

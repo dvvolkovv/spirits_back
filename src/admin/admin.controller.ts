@@ -16,7 +16,7 @@ export class AdminController {
     switch (action) {
       case 'list': {
         const coupons = await this.adminService.listCoupons();
-        return res.status(200).json({ coupons });
+        return res.status(200).json(coupons);
       }
       case 'create': {
         const coupon = await this.adminService.createCoupon(data.code, data.token_amount || 60000);
