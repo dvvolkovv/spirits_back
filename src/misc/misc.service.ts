@@ -1,17 +1,48 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { PgService } from '../common/services/pg.service';
+import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import axios from 'axios';
 import { Response } from 'express';
 
 @Injectable()
 export class MiscService {
   private readonly logger = new Logger(MiscService.name);
+  private s3: S3Client;
+  private readonly s3Bucket = process.env.AWS_S3_BUCKET || 'linkeon.io';
 
   constructor(
     private readonly neo4j: Neo4jService,
     private readonly pg: PgService,
-  ) {}
+  ) {
+    this.s3 = new S3Client({
+      region: process.env.AWS_REGION || 'ru-central1',
+      endpoint: process.env.AWS_ENDPOINT || 'https://storage.yandexcloud.net',
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
+      },
+      forcePathStyle: true,
+    });
+  }
+
+  private async uploadToS3(buffer: Buffer, ext: string): Promise<string> {
+    const filename = `images/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const contentType = ext === 'png' ? 'image/png' : 'image/jpeg';
+    await this.s3.send(new PutObjectCommand({
+      Bucket: this.s3Bucket,
+      Key: filename,
+      Body: buffer,
+      ContentType: contentType,
+    }));
+    // Return presigned URL valid for 7 days
+    const url = await getSignedUrl(this.s3, new GetObjectCommand({
+      Bucket: this.s3Bucket,
+      Key: filename,
+    }), { expiresIn: 7 * 24 * 3600 });
+    return url;
+  }
 
   async searchMate(userId: string, query: string, res: Response): Promise<void> {
     res.status(200);
@@ -100,10 +131,10 @@ ${profiles.map(p => `Профиль ${p.phone}:\n${formatProfile(p.data)}`).join
   }
 
   async generateImage(userId: string, body: any): Promise<any> {
-    const { prompt, model, size, quality } = body;
+    const { prompt, quality } = body;
     if (!prompt) throw new Error('Missing prompt');
 
-    const selectedModel = model || 'google/gemini-3-pro-image-preview';
+    const selectedModel = 'google/gemini-2.5-flash-image';
     const tokenCost = quality === 'hd' ? 10000 : 5000;
 
     // Check token balance
@@ -121,60 +152,58 @@ ${profiles.map(p => `Профиль ${p.phone}:\n${formatProfile(p.data)}`).join
         'https://openrouter.ai/api/v1/chat/completions',
         {
           model: selectedModel,
-          messages: [
-            {
-              role: 'user',
-              content: prompt,
-            },
-          ],
+          messages: [{ role: 'user', content: prompt }],
         },
         {
           headers: {
             Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
             'Content-Type': 'application/json',
-            'HTTP-Referer': 'https://my.linkeon.io',
+            'HTTP-Referer': 'https://b.linkeon.io',
           },
           timeout: 120000,
+          maxContentLength: 50 * 1024 * 1024,
+          maxBodyLength: 50 * 1024 * 1024,
         },
       );
 
       const choice = response.data?.choices?.[0];
-      const content = choice?.message?.content;
+      const message = choice?.message;
       const images: { url: string; revisedPrompt?: string }[] = [];
 
-      // Extract image URLs from response
-      // OpenRouter image models return markdown images or direct URLs
-      if (typeof content === 'string') {
-        // Match markdown image syntax: ![...](url)
-        const mdImageRegex = /!\[([^\]]*)\]\(([^)]+)\)/g;
-        let match;
-        while ((match = mdImageRegex.exec(content)) !== null) {
-          images.push({ url: match[2], revisedPrompt: match[1] || undefined });
-        }
-        // If no markdown images found, check if content itself is a URL
-        if (images.length === 0 && content.match(/^https?:\/\/.+/)) {
-          images.push({ url: content.trim() });
+      // OpenRouter returns images in message.images array as base64
+      if (Array.isArray(message?.images)) {
+        const fs = require('fs');
+        const path = require('path');
+        const publicDir = path.join(process.cwd(), 'public', 'generated');
+        if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
+
+        for (const img of message.images) {
+          const dataUrl = img?.image_url?.url || '';
+          if (dataUrl.startsWith('data:image/')) {
+            const match = dataUrl.match(/^data:image\/(\w+);base64,(.+)$/);
+            if (match) {
+              const ext = match[1] === 'jpeg' ? 'jpg' : match[1];
+              const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+              fs.writeFileSync(path.join(publicDir, filename), Buffer.from(match[2], 'base64'));
+              images.push({ url: `/static/generated/${filename}` });
+            }
+          } else if (dataUrl.startsWith('http')) {
+            images.push({ url: dataUrl });
+          }
         }
       }
 
-      // Handle multimodal responses with inline_data
-      if (Array.isArray(choice?.message?.content)) {
-        for (const part of choice.message.content) {
-          if (part.type === 'image_url' && part.image_url?.url) {
-            images.push({ url: part.image_url.url });
-          }
-          if (part.type === 'text' && part.text) {
-            const mdImageRegex = /!\[([^\]]*)\]\(([^)]+)\)/g;
-            let match;
-            while ((match = mdImageRegex.exec(part.text)) !== null) {
-              images.push({ url: match[2], revisedPrompt: match[1] || undefined });
-            }
-          }
+      // Fallback: check content for markdown images
+      if (images.length === 0 && typeof message?.content === 'string') {
+        const mdRegex = /!\[([^\]]*)\]\(([^)]+)\)/g;
+        let m;
+        while ((m = mdRegex.exec(message.content)) !== null) {
+          images.push({ url: m[2], revisedPrompt: m[1] || undefined });
         }
       }
 
       if (images.length === 0) {
-        throw new Error('Модель не вернула изображений. Попробуйте другую модель или уточните промпт.');
+        throw new Error('Модель не вернула изображений. Попробуйте другой промпт.');
       }
 
       // Deduct tokens
@@ -186,7 +215,7 @@ ${profiles.map(p => `Профиль ${p.phone}:\n${formatProfile(p.data)}`).join
       return { images, tokensSpent: tokenCost };
     } catch (e) {
       if (e.response?.data) {
-        this.logger.error(`Image gen API error: ${JSON.stringify(e.response.data)}`);
+        this.logger.error(`Image gen API error: ${JSON.stringify(e.response.data).slice(0, 500)}`);
       }
       throw new Error(e.message || 'Image generation failed');
     }

@@ -53,14 +53,22 @@ export class ChatService {
     const allAgents = await this.pg.query('SELECT name, description FROM agents ORDER BY id');
     const agentsList = allAgents.rows.map(a => `${a.name} — ${a.description}`).join(', ');
 
-    const platformContext = `О КОНТЕКСТЕ И ПЛАТФОРМЕ
+    const otherAgents = allAgents.rows
+      .filter(a => a.name !== agent.name)
+      .map(a => `${a.name} — ${a.description}`)
+      .join(', ');
+
+    const platformContext = `ТЫ — ${agent.name}, ${agent.description || 'ассистент'}. Всегда представляйся именно этим именем.
+
+О КОНТЕКСТЕ И ПЛАТФОРМЕ
 Ты работаешь в приложении Linkeon — платформе для поиска единомышленников на основе глубокого анализа ценностей, убеждений и жизненных намерений. Linkeon помогает людям находить по-настоящему близких по духу людей для дружбы, партнерства, совместных проектов или создания сообществ.
 Ключевые разделы приложения:
-• Чат с ассистентами — где ты сейчас находишься вместе с другими ИИ-ассистентами (${agentsList}). Если не можешь помочь, предложи переключиться на другого ассистента в левом верхнем углу интерфейса.
+• Чат с ассистентами — где ты сейчас находишься. Другие ассистенты на платформе: ${otherAgents}. Если не можешь помочь, предложи переключиться на другого ассистента в левом верхнем углу интерфейса.
 • Поиск людей — поиск единомышленников по намерениям и ценностям
 • Совместимость — проверка людей на совместимость по ценностям и намерениям
 • Мой профиль — где хранятся ценности, знания о человеке, намерения, желания, интересы, убеждения, навыки
-При первом приветствии сообщи, кто ты и что есть другие ассистенты, что клиент может переключиться на них в левом верхнем углу интерфейса. Используй только текст без таблиц.`;
+При первом приветствии сообщи, кто ты и что есть другие ассистенты, что клиент может переключиться на них в левом верхнем углу интерфейса. Используй только текст без таблиц.
+Ты умеешь генерировать изображения — если пользователь попросит, скажи что уже генерируешь.`;
 
     let systemPrompt = `${platformContext}\n\n${agent.system_prompt || ''}`;
     if (profileText && profileText.trim()) {
@@ -82,7 +90,39 @@ export class ChatService {
     res.setHeader('X-Accel-Buffering', 'no');
     res.setHeader('Access-Control-Allow-Origin', '*');
 
-    // Write begin marker
+    // Detect image generation request before calling LLM
+    const imageKeywords = /(?:создай|нарисуй|сгенерируй|нарисуй|генерация|generate|draw|create)\s+(?:мне\s+)?(?:картинк|изображен|рисунок|фото|image|picture|illustration)/i;
+    const drawKeywords = /^(?:нарисуй|draw)\s+/i;
+    if (imageKeywords.test(message) || drawKeywords.test(message)) {
+      res.write(JSON.stringify({ type: 'begin', metadata: { nodeName: 'Image Echo Agent' } }) + '\n');
+      try {
+        const imageResult = await this.generateImageForChat(userId, message);
+        if (imageResult) {
+          const fullText = `![Сгенерированное изображение](${imageResult.url})`;
+          res.write(JSON.stringify({ type: 'item', content: fullText }) + '\n');
+          res.write(JSON.stringify({ type: 'end', content: fullText }) + '\n');
+          res.end();
+          setImmediate(async () => {
+            try {
+              await this.saveChatHistory(userId, String(assistantId), message, fullText);
+            } catch (e) { this.logger.error(`Post-chat save error: ${e.message}`); }
+          });
+          return;
+        }
+      } catch (e) {
+        this.logger.error(`Image gen error: ${e.message}`);
+        const errText = 'Не удалось сгенерировать изображение. Попробуйте ещё раз.';
+        res.write(JSON.stringify({ type: 'item', content: errText }) + '\n');
+        res.write(JSON.stringify({ type: 'end', content: errText }) + '\n');
+        res.end();
+        setImmediate(async () => {
+          try { await this.saveChatHistory(userId, String(assistantId), message, errText); } catch {}
+        });
+        return;
+      }
+    }
+
+    // Regular text chat — stream LLM response
     res.write(JSON.stringify({ type: 'begin' }) + '\n');
 
     const chunks: string[] = [];
@@ -90,7 +130,6 @@ export class ChatService {
     let outputTokens = 0;
 
     if (this.anthropic) {
-      // Use Anthropic SDK directly
       try {
         const stream = this.anthropic.messages.stream({
           model: 'claude-haiku-4-5-20251001',
@@ -98,12 +137,10 @@ export class ChatService {
           system: systemPrompt,
           messages: llmMessages,
         });
-
         stream.on('text', (text) => {
           chunks.push(text);
           res.write(JSON.stringify({ type: 'item', content: text }) + '\n');
         });
-
         const finalMessage = await stream.finalMessage();
         inputTokens = finalMessage.usage?.input_tokens || 0;
         outputTokens = finalMessage.usage?.output_tokens || 0;
@@ -113,30 +150,21 @@ export class ChatService {
         chunks.push('Ошибка соединения с ассистентом.');
       }
     } else {
-      // Fallback: OpenRouter with Claude Haiku
       try {
-        const orMessages = [
-          { role: 'system', content: systemPrompt },
-          ...llmMessages,
-        ];
+        const orMessages = [{ role: 'system', content: systemPrompt }, ...llmMessages];
         const response = await axios.post(
           'https://openrouter.ai/api/v1/chat/completions',
-          {
-            model: 'anthropic/claude-haiku-4-5-20251001',
-            messages: orMessages,
-            stream: true,
-          },
+          { model: 'anthropic/claude-haiku-4.5', messages: orMessages, stream: true },
           {
             headers: {
               Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
               'Content-Type': 'application/json',
-              'HTTP-Referer': 'https://my.linkeon.io',
+              'HTTP-Referer': 'https://b.linkeon.io',
             },
             responseType: 'stream',
             timeout: 120000,
           },
         );
-
         await new Promise<void>((resolve, reject) => {
           let buffer = '';
           response.data.on('data', (chunk: Buffer) => {
@@ -150,14 +178,8 @@ export class ChatService {
               try {
                 const json = JSON.parse(trimmed.substring(6));
                 const content = json.choices?.[0]?.delta?.content;
-                if (content) {
-                  chunks.push(content);
-                  res.write(JSON.stringify({ type: 'item', content }) + '\n');
-                }
-                if (json.usage) {
-                  inputTokens = json.usage.prompt_tokens || 0;
-                  outputTokens = json.usage.completion_tokens || 0;
-                }
+                if (content) { chunks.push(content); res.write(JSON.stringify({ type: 'item', content }) + '\n'); }
+                if (json.usage) { inputTokens = json.usage.prompt_tokens || 0; outputTokens = json.usage.completion_tokens || 0; }
               } catch {}
             }
           });
@@ -184,6 +206,53 @@ export class ChatService {
         this.logger.error(`Post-chat save error: ${e.message}`);
       }
     });
+  }
+
+  private async generateImageForChat(userId: string, prompt: string): Promise<{ url: string; text: string } | null> {
+    const fs = require('fs');
+    const path = require('path');
+
+    const response = await axios.post(
+      'https://openrouter.ai/api/v1/chat/completions',
+      {
+        model: 'google/gemini-2.5-flash-image',
+        messages: [{ role: 'user', content: prompt }],
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://b.linkeon.io',
+        },
+        timeout: 120000,
+        maxContentLength: 50 * 1024 * 1024,
+        maxBodyLength: 50 * 1024 * 1024,
+      },
+    );
+
+    const message = response.data?.choices?.[0]?.message;
+    const text = typeof message?.content === 'string' ? message.content : '';
+
+    if (Array.isArray(message?.images)) {
+      const publicDir = path.join(process.cwd(), 'public', 'generated');
+      if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
+
+      for (const img of message.images) {
+        const dataUrl = img?.image_url?.url || '';
+        if (dataUrl.startsWith('data:image/')) {
+          const match = dataUrl.match(/^data:image\/(\w+);base64,(.+)$/);
+          if (match) {
+            const ext = match[1] === 'jpeg' ? 'jpg' : match[1];
+            const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+            fs.writeFileSync(path.join(publicDir, filename), Buffer.from(match[2], 'base64'));
+
+            await this.pg.query('UPDATE ai_profiles_consolidated SET tokens = tokens - 5000, updated_at = now() WHERE user_id = $1', [userId]);
+            return { url: `/static/generated/${filename}`, text };
+          }
+        }
+      }
+    }
+    return null;
   }
 
   private async saveChatHistory(userId: string, agentId: string, userMsg: string, assistantMsg: string) {

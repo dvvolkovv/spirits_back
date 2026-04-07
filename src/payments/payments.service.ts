@@ -1,5 +1,6 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
+import { ReferralService } from '../referral/referral.service';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -7,7 +8,10 @@ import { v4 as uuidv4 } from 'uuid';
 export class PaymentsService {
   private readonly logger = new Logger(PaymentsService.name);
 
-  constructor(private readonly pg: PgService) {}
+  constructor(
+    private readonly pg: PgService,
+    @Optional() private readonly referralService: ReferralService,
+  ) {}
 
   async createPayment(userId: string, amount: number, pkg: string) {
     const shopId = process.env.YOOKASSA_SHOP_ID;
@@ -69,7 +73,7 @@ export class PaymentsService {
     if (existing.rows[0]?.status === 'succeeded') return; // already processed
 
     const paymentRow = await this.pg.query(
-      'SELECT tokens, user_id FROM payments WHERE payment_id = $1',
+      'SELECT tokens, user_id, amount FROM payments WHERE payment_id = $1',
       [paymentId],
     );
     const tokensToAdd = Number(paymentRow.rows[0]?.tokens || 0);
@@ -82,6 +86,18 @@ export class PaymentsService {
       'UPDATE ai_profiles_consolidated SET tokens = tokens + $1, updated_at = now() WHERE user_id = $2',
       [tokensToAdd, userId],
     );
+
+    // Process referral commission
+    if (this.referralService) {
+      const amount = Number(paymentRow.rows[0]?.amount || 0);
+      if (amount > 0) {
+        try {
+          await this.referralService.processPaymentCommission(userId, paymentId, amount);
+        } catch (e) {
+          this.logger.error(`Referral commission error: ${e.message}`);
+        }
+      }
+    }
   }
 
   private tokensForPackage(pkg: string, amount: number): number {

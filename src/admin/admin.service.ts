@@ -56,21 +56,23 @@ export class AdminService {
     );
 
     const leaders = await Promise.all(leadersRes.rows.map(async (l) => {
-      // Get commissions (referees) for this leader
-      const refsRes = await this.pg.query(
-        'SELECT * FROM referral_referees WHERE leader_id = $1 ORDER BY registered_at DESC',
+      const commissionsRes = await this.pg.query(
+        'SELECT * FROM referral_commissions WHERE leader_id = $1 ORDER BY created_at DESC',
         [l.id],
       );
-      const commissions = refsRes.rows.map(r => ({
-        id: r.id,
-        date: r.registered_at,
-        referee_phone: r.referee_phone,
-        payment_amount: 0,
-        commission_pct: Number(l.commission_pct) || 10,
-        commission_rub: 0,
-        level: 1,
-        paid_out: false,
+      const commissions = commissionsRes.rows.map(c => ({
+        id: c.id,
+        date: c.created_at,
+        referee_phone: c.referee_phone,
+        payment_amount: Number(c.payment_amount_rub) || 0,
+        commission_pct: Number(c.commission_pct) || 0,
+        commission_rub: Number(c.commission_rub) || 0,
+        level: c.commission_level || 1,
+        paid_out: c.paid_out || false,
       }));
+
+      const totalCommission = commissions.reduce((s, c) => s + c.commission_rub, 0);
+      const paidOut = commissions.filter(c => c.paid_out).reduce((s, c) => s + c.commission_rub, 0);
 
       return {
         id: l.id,
@@ -84,18 +86,19 @@ export class AdminService {
         parent_commission_pct: Number(l.parent_commission_pct) || 0,
         is_active: l.is_active,
         total_referees: parseInt(l.total_referees) || 0,
-        total_commission_rub: 0,
-        paid_out_rub: 0,
-        pending_rub: 0,
+        total_commission_rub: totalCommission,
+        paid_out_rub: paidOut,
+        pending_rub: totalCommission - paidOut,
         commissions,
       };
     }));
 
+    const allCommissions = leaders.flatMap(l => l.commissions);
     return {
       summary: {
-        total_commission_all_rub: 0,
-        total_paid_out_rub: 0,
-        total_pending_rub: 0,
+        total_commission_all_rub: allCommissions.reduce((s, c) => s + c.commission_rub, 0),
+        total_paid_out_rub: allCommissions.filter(c => c.paid_out).reduce((s, c) => s + c.commission_rub, 0),
+        total_pending_rub: allCommissions.filter(c => !c.paid_out).reduce((s, c) => s + c.commission_rub, 0),
       },
       leaders,
     };
@@ -127,10 +130,18 @@ export class AdminService {
   }
 
   async markPaid(commissionId: string) {
-    return { success: true, id: commissionId };
+    await this.pg.query(
+      'UPDATE referral_commissions SET paid_out = true WHERE id = $1',
+      [commissionId],
+    );
+    return { success: true };
   }
 
   async markAllPaid(leaderId: string) {
+    await this.pg.query(
+      'UPDATE referral_commissions SET paid_out = true WHERE leader_id = $1 AND paid_out = false',
+      [leaderId],
+    );
     return { success: true };
   }
 }
