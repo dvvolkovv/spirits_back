@@ -1,6 +1,7 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
+import { KlingService } from '../misc/kling.service';
 import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import { Response } from 'express';
@@ -10,7 +11,7 @@ export class ChatService {
   private readonly logger = new Logger(ChatService.name);
   private anthropic: Anthropic | null = null;
 
-  constructor(private readonly pg: PgService, @Optional() private readonly neo4j: Neo4jService) {
+  constructor(private readonly pg: PgService, @Optional() private readonly neo4j: Neo4jService, @Optional() private readonly kling: KlingService) {
     if (process.env.ANTHROPIC_API_KEY) {
       this.anthropic = new Anthropic({
         apiKey: process.env.ANTHROPIC_API_KEY,
@@ -194,8 +195,11 @@ export class ChatService {
 
     // If Маша tried to show a metaphor card, fetch a real one
     // Detect metaphor card: tool tags, fake URLs, or Маша talking about showing a card
-    const cardPattern = /(?:get_metaphor_card|images\.linkeon\.io|вот.*карт|первая карта|следующая карта|покажу.*карт|новая карта|вытяни.*карт|твоя карта|image_url)/i;
-    if (cardPattern.test(rawFull)) {
+    const cardPattern = /(?:get_metaphor_card|images\.linkeon\.io|image_url|вот.*карт|первая карта|следующая карта|покажу.*карт|новая карта|вытяни.*карт|твоя карта|вот она|карту для тебя|достаю карту|тяну карту|открываю карту|Что ты видишь на этой карте|Какие чувства.*вызывает)/i;
+    const isМаша = agent.name === 'Маша';
+    const cardMatch = cardPattern.test(rawFull) || (isМаша && /карт/i.test(rawFull));
+    this.logger.log(`Card check: agent=${agent.name}, isМаша=${isМаша}, match=${cardMatch}, rawLen=${rawFull.length}`);
+    if (cardMatch) {
       try {
         const cardUrl = await this.getRandomMetaphorCard(userId);
         if (cardUrl) {
@@ -286,50 +290,12 @@ export class ChatService {
   }
 
   private async generateImageForChat(userId: string, prompt: string): Promise<{ url: string; text: string } | null> {
-    const fs = require('fs');
-    const path = require('path');
+    if (!this.kling) return null;
+    const result = await this.kling.generateImage(prompt);
+    if (!result) return null;
 
-    const response = await axios.post(
-      'https://openrouter.ai/api/v1/chat/completions',
-      {
-        model: 'google/gemini-2.5-flash-image',
-        messages: [{ role: 'user', content: prompt }],
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          'Content-Type': 'application/json',
-          'HTTP-Referer': 'https://b.linkeon.io',
-        },
-        timeout: 120000,
-        maxContentLength: 50 * 1024 * 1024,
-        maxBodyLength: 50 * 1024 * 1024,
-      },
-    );
-
-    const message = response.data?.choices?.[0]?.message;
-    const text = typeof message?.content === 'string' ? message.content : '';
-
-    if (Array.isArray(message?.images)) {
-      const publicDir = path.join(process.cwd(), 'public', 'generated');
-      if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
-
-      for (const img of message.images) {
-        const dataUrl = img?.image_url?.url || '';
-        if (dataUrl.startsWith('data:image/')) {
-          const match = dataUrl.match(/^data:image\/(\w+);base64,(.+)$/);
-          if (match) {
-            const ext = match[1] === 'jpeg' ? 'jpg' : match[1];
-            const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-            fs.writeFileSync(path.join(publicDir, filename), Buffer.from(match[2], 'base64'));
-
-            await this.pg.query('UPDATE ai_profiles_consolidated SET tokens = tokens - 5000, updated_at = now() WHERE user_id = $1', [userId]);
-            return { url: `/static/generated/${filename}`, text };
-          }
-        }
-      }
-    }
-    return null;
+    await this.pg.query('UPDATE ai_profiles_consolidated SET tokens = tokens - 5000, updated_at = now() WHERE user_id = $1', [userId]);
+    return { url: result.url, text: '' };
   }
 
   private async saveChatHistory(userId: string, agentId: string, userMsg: string, assistantMsg: string) {

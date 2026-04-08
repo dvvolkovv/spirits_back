@@ -75,7 +75,43 @@ export class ChatController {
   @Post('scan-document')
   @UseGuards(JwtGuard)
   async scanDocument(@CurrentUser() user: any, @Body() body: any, @Res() res: Response) {
-    // Anthropic call — stub for now
-    return res.status(200).json({ result: 'scan not implemented' });
+    const anthropicKey = process.env.ANTHROPIC_API_KEY;
+    if (!anthropicKey) return res.status(500).json({ error: 'LLM not configured' });
+
+    const { content, filename } = body;
+    if (!content) return res.status(400).json({ error: 'Missing content' });
+
+    try {
+      const Anthropic = require('@anthropic-ai/sdk');
+      const client = new Anthropic({ apiKey: anthropicKey });
+      const msg = await client.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 4096,
+        messages: [{
+          role: 'user',
+          content: `Проанализируй следующий документ и извлеки профиль пользователя в JSON формате:
+{
+  "name": "Имя",
+  "family_name": "Фамилия",
+  "profile": ["ключевые факты"],
+  "values": ["ценности"],
+  "skills": ["навыки"],
+  "beliefs": ["убеждения"],
+  "desires": ["желания"],
+  "interests": ["интересы"],
+  "search": ["что ищет"]
+}
+
+Документ (${filename || 'document'}):
+${content}`
+        }],
+      });
+      let text = msg.content?.[0]?.text || '';
+      if (text.startsWith('```')) text = text.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
+      const parsed = JSON.parse(text);
+      return res.status(200).json(parsed);
+    } catch (e) {
+      return res.status(500).json({ error: e.message || 'Document parsing failed' });
+    }
   }
 }

@@ -19,12 +19,14 @@ export class PaymentsService {
     if (!shopId || !secretKey) throw new Error('YooKassa not configured');
 
     const idempotenceKey = uuidv4();
-    const returnUrl = process.env.RETURN_URL || 'https://b.linkeon.io/payment/success';
+    const baseReturnUrl = process.env.RETURN_URL || 'https://b.linkeon.io/payment/success';
+    // First create payment, then use real payment_id in return URL
+    // YooKassa allows return_url with user_id; payment_id stored in localStorage on frontend
     const resp = await axios.post(
       'https://api.yookassa.ru/v3/payments',
       {
         amount: { value: amount.toFixed(2), currency: 'RUB' },
-        confirmation: { type: 'redirect', return_url: returnUrl },
+        confirmation: { type: 'redirect', return_url: `${baseReturnUrl}?user_id=${encodeURIComponent(userId)}` },
         description: `Токены: ${pkg}`,
         capture: true,
         metadata: { userId, package: pkg },
@@ -62,7 +64,12 @@ export class PaymentsService {
       await this.processSucceededPayment(paymentId, resp.data.metadata?.userId || userId);
     }
 
-    return { status: resp.data.status };
+    // Get tokens from DB
+    const payRow = await this.pg.query('SELECT tokens, status FROM payments WHERE payment_id = $1', [paymentId]);
+    const tokens = Number(payRow.rows[0]?.tokens || 0);
+    const dbStatus = payRow.rows[0]?.status || 'unknown';
+
+    return { status: resp.data.status, yoo_status: resp.data.status, db_status: dbStatus, tokens };
   }
 
   async processSucceededPayment(paymentId: string, userId: string) {
@@ -100,11 +107,22 @@ export class PaymentsService {
     }
   }
 
+  async getLatestPayment(userId: string): Promise<any | null> {
+    const res = await this.pg.query(
+      'SELECT payment_id, status FROM payments WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1',
+      [userId],
+    );
+    return res.rows[0] || null;
+  }
+
   private tokensForPackage(pkg: string, amount: number): number {
     const map: Record<string, number> = {
-      basic: 100000,
-      standard: 500000,
-      premium: 2000000,
+      basic: 50000,
+      starter: 50000,
+      standard: 200000,
+      extended: 200000,
+      premium: 1000000,
+      professional: 1000000,
     };
     return map[pkg] || Math.floor((amount || 0) * 1000);
   }

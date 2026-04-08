@@ -31,6 +31,19 @@ export class AvatarController {
   @Post('avatar')
   @UseGuards(JwtGuard)
   async uploadAvatar(@CurrentUser() user: any, @Req() req: Request, @Res() res: Response) {
+    const contentType = req.headers['content-type'] || '';
+
+    // If raw binary (not multipart) — body is already Buffer from body-parser raw
+    if (contentType.startsWith('image/') && Buffer.isBuffer(req.body) && req.body.length > 0) {
+      try {
+        const result = await this.avatarService.uploadAvatar(user.phone, req.body, contentType);
+        return res.status(200).json(result);
+      } catch (e) {
+        return res.status(500).json({ error: e.message });
+      }
+    }
+
+    // Otherwise use multer for multipart/form-data
     return new Promise((resolve) => {
       this.upload.single('file')(req as any, res as any, async (err) => {
         if (err) return res.status(400).json({ error: err.message });

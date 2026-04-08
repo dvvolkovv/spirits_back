@@ -118,7 +118,7 @@ ${profiles.map(p => `Профиль ${p.phone}:\n${formatProfile(p.data)}`).join
 3. Различия и потенциальные точки роста
 4. Рекомендации по взаимодействию
 
-Используй markdown форматирование.`;
+Используй markdown форматирование. НЕ используй таблицы — только списки, заголовки и текст.`;
 
     if (!myProfile && profiles.length === 0) {
       const msg = 'Не удалось найти профили для анализа. Убедитесь, что указанные номера зарегистрированы в системе.';
@@ -128,6 +128,15 @@ ${profiles.map(p => `Профиль ${p.phone}:\n${formatProfile(p.data)}`).join
     }
 
     await this.streamLLM(systemPrompt, 'Проанализируй совместимость этих людей', res);
+  }
+
+  async checkTokenBalance(userId: string, required: number): Promise<{ ok: boolean }> {
+    const res = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1', [userId]);
+    return { ok: Number(res.rows[0]?.tokens || 0) >= required };
+  }
+
+  async deductTokens(userId: string, amount: number): Promise<void> {
+    await this.pg.query('UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2', [amount, userId]);
   }
 
   async generateImage(userId: string, body: any): Promise<any> {
@@ -323,18 +332,26 @@ ${profiles.map(p => `Профиль ${p.phone}:\n${formatProfile(p.data)}`).join
       if (anthropicKey) {
         const Anthropic = require('@anthropic-ai/sdk');
         const client = new Anthropic({ apiKey: anthropicKey });
-        const msg = await client.messages.create({
+        const stream = client.messages.stream({
           model: 'claude-haiku-4-5-20251001',
           max_tokens: 4096,
           system: systemPrompt,
           messages: [{ role: 'user', content: userMessage }],
         });
-        let content = msg.content?.[0]?.text || '';
-        // Strip markdown code blocks around search_result JSON
-        content = content.replace(/search_result:\s*```(?:json)?\s*\n?/g, 'search_result:');
-        content = content.replace(/\n?```\s*$/g, '');
-        content = content.replace(/```\s*"?\s*\}/g, '"}');
-        res.write(JSON.stringify({ type: 'item', content }) + '\n');
+        const chunks: string[] = [];
+        stream.on('text', (text: string) => {
+          chunks.push(text);
+          res.write(JSON.stringify({ type: 'item', content: text }) + '\n');
+        });
+        await stream.finalMessage();
+        // Post-process: strip code blocks from search_result JSON
+        const full = chunks.join('');
+        if (full.includes('search_result:') && full.includes('```')) {
+          let cleaned = full.replace(/search_result:\s*```(?:json)?\s*\n?/g, 'search_result:');
+          cleaned = cleaned.replace(/\n?```\s*$/g, '');
+          // Re-send cleaned version as final item
+          res.write(JSON.stringify({ type: 'replace', content: cleaned }) + '\n');
+        }
       } else {
         res.write(JSON.stringify({ type: 'item', content: 'LLM не настроен.' }) + '\n');
       }
