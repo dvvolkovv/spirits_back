@@ -52,6 +52,27 @@ export class ChatService {
       content: r.content,
     }));
 
+    // Check token balance (skip for first greeting)
+    const isGreetingMsg = recentHistory.length === 0 && /привет|расскажи про себя|hello|hi$/i.test(message.trim());
+    if (!isGreetingMsg) {
+      const balRes = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1', [userId]);
+      const balance = balRes.rows[0]?.tokens || 0;
+      if (balance <= 0) {
+        res.status(200);
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Transfer-Encoding', 'chunked');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        const noTokensMsg = '⚠️ **Недостаточно токенов**\n\nВаш баланс исчерпан. Пополните баланс, чтобы продолжить общение с ассистентами.\n\n👉 [Пополнить баланс](/chat?view=tokens)';
+        res.write(JSON.stringify({ type: 'begin' }) + '\n');
+        res.write(JSON.stringify({ type: 'item', content: noTokensMsg }) + '\n');
+        res.write(JSON.stringify({ type: 'end', content: noTokensMsg, usage: { input: 0, output: 0, total: 0 } }) + '\n');
+        res.end();
+        return;
+      }
+    }
+
     // Universal Agent — route to Claude Code for agent "Роман"
     if (agent.name === 'Роман') {
       return this.streamUniversalAgent(userId, message, String(assistantId), String(agent.id), recentHistory, res);
@@ -202,7 +223,7 @@ export class ChatService {
             headers: {
               Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
               'Content-Type': 'application/json',
-              'HTTP-Referer': 'https://b.linkeon.io',
+              'HTTP-Referer': 'https://my.linkeon.io',
             },
             responseType: 'stream',
             timeout: 120000,
@@ -325,10 +346,10 @@ You have full access to an Ubuntu server with:
 
 FILE OUTPUT RULES (CRITICAL):
 - When creating files for the user to download, ALWAYS save them to: /home/dvolkov/spirits_back/public/agent-files/
-- The download URL is: https://b.linkeon.io/static/agent-files/FILENAME
+- The download URL is: /static/agent-files/FILENAME (relative path, no domain!)
 - Use unique filenames to avoid collisions (add timestamp or random suffix if needed)
-- Format download links as markdown: [Скачать filename](https://b.linkeon.io/static/agent-files/FILENAME)
-- NEVER invent fake URLs like files.linkeon.io or any other non-existent domains
+- Format download links as markdown: [Скачать filename](/static/agent-files/FILENAME)
+- NEVER use absolute URLs with domain names for file links — always use relative paths starting with /static/
 
 GENERAL RULES:
 1. Do whatever the user asks. Be resourceful.

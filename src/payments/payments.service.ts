@@ -19,7 +19,7 @@ export class PaymentsService {
     if (!shopId || !secretKey) throw new Error('YooKassa not configured');
 
     const idempotenceKey = uuidv4();
-    const baseReturnUrl = process.env.RETURN_URL || 'https://b.linkeon.io/payment/success';
+    const baseReturnUrl = process.env.RETURN_URL || 'https://my.linkeon.io/payment/success';
     // First create payment, then use real payment_id in return URL
     // YooKassa allows return_url with user_id; payment_id stored in localStorage on frontend
     const resp = await axios.post(

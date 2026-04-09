@@ -81,7 +81,7 @@ export class ReferralService {
     }));
 
     return {
-      referral_link: `https://b.linkeon.io/?ref=${l.slug}`,
+      referral_link: `https://my.linkeon.io/?ref=${l.slug}`,
       leader: {
         name: l.name,
         slug: l.slug,

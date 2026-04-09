@@ -130,6 +130,25 @@ ${profiles.map(p => `Профиль ${p.phone}:\n${formatProfile(p.data)}`).join
     await this.streamLLM(systemPrompt, 'Проанализируй совместимость этих людей', res);
   }
 
+  async saveGeneratedImage(userId: string, prompt: string, url: string, tokens: number): Promise<void> {
+    await this.pg.query(
+      'INSERT INTO generated_images (user_id, prompt, image_url, tokens_spent) VALUES ($1, $2, $3, $4)',
+      [userId, prompt, url, tokens],
+    );
+  }
+
+  async getImageHistory(userId: string): Promise<any[]> {
+    const res = await this.pg.query(
+      'SELECT id, prompt, image_url, tokens_spent, created_at FROM generated_images WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
+      [userId],
+    );
+    return res.rows;
+  }
+
+  async deleteGeneratedImage(userId: string, imageId: number): Promise<void> {
+    await this.pg.query('DELETE FROM generated_images WHERE id = $1 AND user_id = $2', [imageId, userId]);
+  }
+
   async checkTokenBalance(userId: string, required: number): Promise<{ ok: boolean }> {
     const res = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1', [userId]);
     return { ok: Number(res.rows[0]?.tokens || 0) >= required };
@@ -167,7 +186,7 @@ ${profiles.map(p => `Профиль ${p.phone}:\n${formatProfile(p.data)}`).join
           headers: {
             Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
             'Content-Type': 'application/json',
-            'HTTP-Referer': 'https://b.linkeon.io',
+            'HTTP-Referer': 'https://my.linkeon.io',
           },
           timeout: 120000,
           maxContentLength: 50 * 1024 * 1024,
