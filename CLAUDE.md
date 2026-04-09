@@ -8,7 +8,7 @@
 | | Test | Prod |
 |--|------|------|
 | URL | https://b.linkeon.io | https://my.linkeon.io |
-| Сервер | `ssh -p 60322 dvolkov@82.202.197.230` | n8n на Railway (migrating) |
+| Сервер | `ssh dvolkov@212.113.106.202` | n8n на Railway (migrating) |
 | БД | PostgreSQL local (`linkeon`) | Railway PostgreSQL |
 | Neo4j | Docker local (bolt://localhost:7687) | Railway Neo4j |
 | PM2 | `linkeon-api` (port 3001) | — |

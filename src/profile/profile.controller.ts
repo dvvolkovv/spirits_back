@@ -18,7 +18,7 @@ export class ProfileController {
     const profile = await this.profileService.getProfile(user.phone);
     if (!profile) return res.status(404).json({ error: 'Profile not found' });
 
-    // Enrich with Neo4j data
+    // Entities (values, beliefs, etc.) live in Neo4j only
     if (this.neo4j && profile[0]?.profileJson) {
       try {
         const neo4jData = await this.neo4j.getProfileEntities(user.phone);
@@ -35,6 +35,20 @@ export class ProfileController {
   @UseGuards(JwtGuard)
   async updateProfile(@CurrentUser() user: any, @Body() body: any, @Res() res: Response) {
     const result = await this.profileService.updateProfile(user.phone, body);
+
+    // Entities live in Neo4j only — full replace
+    if (this.neo4j) {
+      const entityFields: Record<string, string> = {
+        values: 'value', beliefs: 'belief', desires: 'desire',
+        intents: 'intent', intentions: 'intent', interests: 'interest', skills: 'skill',
+      };
+      for (const [field, type] of Object.entries(entityFields)) {
+        if (Array.isArray(body[field])) {
+          await this.neo4j.replaceEntities(user.phone, type, body[field]);
+        }
+      }
+    }
+
     return res.status(200).json(result);
   }
 

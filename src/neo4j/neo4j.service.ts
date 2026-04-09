@@ -154,14 +154,6 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     const type = entityType.charAt(0).toUpperCase() + entityType.slice(1).toLowerCase();
     const rel = `HAS_${type.toUpperCase()}`;
     try {
-      // Delete old relationships not in new values
-      await session.run(
-        `MATCH (p:Profile {phone: $phone})-[r:${rel}]->(v:${type})
-         WHERE NOT v.name IN $values
-         DELETE r`,
-        { phone: userId, values },
-      );
-      // Create new relationships (MERGE profile first)
       for (const valueName of values) {
         if (!valueName?.trim()) continue;
         await session.run(
@@ -175,6 +167,40 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
       }
     } catch (e) {
       this.logger.error(`updateProfileEntities error: ${e.message}`);
+    } finally {
+      await session.close();
+    }
+  }
+
+  /** Replace all entities of a type: delete old relationships, create new ones */
+  async replaceEntities(userId: string, entityType: string, values: string[]): Promise<void> {
+    const session = this.getSession();
+    if (!session) return;
+    const type = entityType.charAt(0).toUpperCase() + entityType.slice(1).toLowerCase();
+    const rel = `HAS_${type.toUpperCase()}`;
+    try {
+      // Delete relationships not in the new list
+      await session.run(
+        `MATCH (p:Profile {phone: $phone})-[r:${rel}]->(n:${type})
+         WHERE NOT n.name IN $values
+         DELETE r`,
+        { phone: userId, values },
+      );
+      // Create new relationships
+      for (const name of values) {
+        if (!name?.trim()) continue;
+        await session.run(
+          `MERGE (p:Profile {phone: $phone})
+           MERGE (v:${type} {name: $name})
+           MERGE (p)-[r:${rel}]->(v)
+           ON CREATE SET r.created_at = datetime(), r.confidence = 5
+           ON MATCH SET r.updated_at = datetime()`,
+          { phone: userId, name },
+        );
+      }
+      this.logger.log(`replaceEntities: ${type} for ${userId} → ${values.length} items`);
+    } catch (e) {
+      this.logger.error(`replaceEntities error: ${e.message}`);
     } finally {
       await session.close();
     }

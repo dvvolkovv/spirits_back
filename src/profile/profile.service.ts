@@ -29,24 +29,19 @@ export class ProfileService {
   }
 
   async updateProfile(userId: string, data: Record<string, any>) {
-    const { family_name, values, desires, intents, beliefs, interests, skills, ...rest } = data;
-    const patch: Record<string, any> = {};
-    if (family_name !== undefined) patch.family_name = family_name;
-    if (values !== undefined) patch.values = values;
-    if (desires !== undefined) patch.desires = desires;
-    if (intents !== undefined) patch.intents = intents;
-    if (beliefs !== undefined) patch.beliefs = beliefs;
-    if (interests !== undefined) patch.interests = interests;
-    if (skills !== undefined) patch.skills = skills;
-    Object.assign(patch, rest);
+    // Entities (values, beliefs, etc.) are stored in Neo4j only — strip them here
+    const { values, desires, intents, intentions, beliefs, interests, skills, ...rest } = data;
+    const patch: Record<string, any> = { ...rest };
 
-    await this.pg.query(
-      `UPDATE ai_profiles_consolidated
-       SET profile_data = COALESCE(profile_data, '{}'::jsonb) || $1::jsonb,
-           updated_at = now()
-       WHERE user_id = $2`,
-      [JSON.stringify(patch), userId],
-    );
+    if (Object.keys(patch).length > 0) {
+      await this.pg.query(
+        `UPDATE ai_profiles_consolidated
+         SET profile_data = COALESCE(profile_data, '{}'::jsonb) || $1::jsonb,
+             updated_at = now()
+         WHERE user_id = $2`,
+        [JSON.stringify(patch), userId],
+      );
+    }
     return { success: true };
   }
 
