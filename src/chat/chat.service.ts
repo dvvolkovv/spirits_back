@@ -5,6 +5,7 @@ import { KlingService } from '../misc/kling.service';
 import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import { Response } from 'express';
+import { spawn } from 'child_process';
 
 @Injectable()
 export class ChatService {
@@ -51,8 +52,13 @@ export class ChatService {
       content: r.content,
     }));
 
+    // Universal Agent — route to Claude Code for agent "Роман"
+    if (agent.name === 'Роман') {
+      return this.streamUniversalAgent(userId, message, String(assistantId), String(agent.id), recentHistory, res);
+    }
+
     // Build system prompt with platform context + profile
-    const allAgents = await this.pg.query('SELECT name, description FROM agents ORDER BY id');
+    const allAgents = await this.pg.query('SELECT name, description, category, system_prompt FROM agents ORDER BY id');
     const agentsList = allAgents.rows.map(a => `${a.name} — ${a.description}`).join(', ');
 
     const otherAgents = allAgents.rows
@@ -73,6 +79,7 @@ export class ChatService {
 Ты умеешь генерировать изображения — если пользователь попросит, скажи что уже генерируешь.`;
 
     let systemPrompt = `${platformContext}\n\n${agent.system_prompt || ''}`;
+
     if (profileText && profileText.trim()) {
       systemPrompt = `${systemPrompt}\n\n--- Профиль пользователя ---\n${profileText}`;
     }
@@ -91,6 +98,37 @@ export class ChatService {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('X-Accel-Buffering', 'no');
     res.setHeader('Access-Control-Allow-Origin', '*');
+
+    // Detect initial greeting — use DeepSeek (free, no token deduction)
+    const isGreeting = recentHistory.length === 0 && /привет|расскажи про себя|hello|hi$/i.test(message.trim());
+    if (isGreeting && process.env.DEEPSEEK_API_KEY) {
+      res.write(JSON.stringify({ type: 'begin' }) + '\n');
+      try {
+        const dsResp = await axios.post('https://api.deepseek.com/chat/completions', {
+          model: 'deepseek-chat',
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: message },
+          ],
+          max_tokens: 2048,
+        }, {
+          headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`, 'Content-Type': 'application/json' },
+          timeout: 30000,
+        });
+        const greetText = this.stripToolTags(dsResp.data?.choices?.[0]?.message?.content || 'Привет! Чем могу помочь?');
+        res.write(JSON.stringify({ type: 'item', content: greetText }) + '\n');
+        res.write(JSON.stringify({ type: 'end', content: greetText, usage: { input: 0, output: 0, total: 0 } }) + '\n');
+        res.end();
+        setImmediate(async () => {
+          try { await this.saveChatHistory(userId, String(assistantId), message, greetText); } catch {}
+          // No token deduction for greeting
+        });
+        return;
+      } catch (e) {
+        this.logger.error(`DeepSeek greeting error: ${e.message}`);
+        // Fall through to Anthropic
+      }
+    }
 
     // Detect image generation request before calling LLM
     const imageKeywords = /(?:создай|нарисуй|сгенерируй|нарисуй|генерация|generate|draw|create)\s+(?:мне\s+)?(?:картинк|изображен|рисунок|фото|image|picture|illustration)/i;
@@ -124,7 +162,9 @@ export class ChatService {
       }
     }
 
-    // Regular text chat — collect full response then send cleaned
+    // Regular text chat — stream to client (buffer for Маша to filter tool tags)
+    const isМаша = agent.name === 'Маша';
+    const needsBuffering = isМаша; // Маша needs post-processing for card detection
     res.write(JSON.stringify({ type: 'begin' }) + '\n');
 
     const chunks: string[] = [];
@@ -139,7 +179,12 @@ export class ChatService {
           system: systemPrompt,
           messages: llmMessages,
         });
-        stream.on('text', (text) => chunks.push(text));
+        stream.on('text', (text) => {
+          chunks.push(text);
+          if (!needsBuffering) {
+            res.write(JSON.stringify({ type: 'item', content: text }) + '\n');
+          }
+        });
         const finalMessage = await stream.finalMessage();
         inputTokens = finalMessage.usage?.input_tokens || 0;
         outputTokens = finalMessage.usage?.output_tokens || 0;
@@ -176,7 +221,12 @@ export class ChatService {
               try {
                 const json = JSON.parse(trimmed.substring(6));
                 const content = json.choices?.[0]?.delta?.content;
-                if (content) chunks.push(content);
+                if (content) {
+                  chunks.push(content);
+                  if (!needsBuffering) {
+                    res.write(JSON.stringify({ type: 'item', content }) + '\n');
+                  }
+                }
                 if (json.usage) { inputTokens = json.usage.prompt_tokens || 0; outputTokens = json.usage.completion_tokens || 0; }
               } catch {}
             }
@@ -196,7 +246,6 @@ export class ChatService {
     // If Маша tried to show a metaphor card, fetch a real one
     // Detect metaphor card: tool tags, fake URLs, or Маша talking about showing a card
     const cardPattern = /(?:get_metaphor_card|images\.linkeon\.io|image_url|вот.*карт|первая карта|следующая карта|покажу.*карт|новая карта|вытяни.*карт|твоя карта|вот она|карту для тебя|достаю карту|тяну карту|открываю карту|Что ты видишь на этой карте|Какие чувства.*вызывает)/i;
-    const isМаша = agent.name === 'Маша';
     const cardMatch = cardPattern.test(rawFull) || (isМаша && /карт/i.test(rawFull));
     this.logger.log(`Card check: agent=${agent.name}, isМаша=${isМаша}, match=${cardMatch}, rawLen=${rawFull.length}`);
     if (cardMatch) {
@@ -211,14 +260,18 @@ export class ChatService {
     }
 
     const tokensUsed = inputTokens + outputTokens;
-    res.write(JSON.stringify({ type: 'item', content: fullText }) + '\n');
+    // For buffered (Маша) — send cleaned text; for streamed — already sent chunk by chunk
+    if (needsBuffering) {
+      res.write(JSON.stringify({ type: 'item', content: fullText }) + '\n');
+    }
     res.write(JSON.stringify({ type: 'end', content: fullText, usage: { input: inputTokens, output: outputTokens, total: tokensUsed } }) + '\n');
     res.end();
 
     // Async: save to DB and consolidate profile after response sent
     setImmediate(async () => {
       try {
-        await this.saveChatHistory(userId, String(assistantId), message, fullText);
+        const tokensUsed = inputTokens + outputTokens;
+        await this.saveChatHistory(userId, String(assistantId), message, fullText, tokensUsed);
         await this.addTokenTask(userId, inputTokens, outputTokens, String(agent.id));
         // Extract profile entities from conversation
         if (this.neo4j) {
@@ -227,6 +280,179 @@ export class ChatService {
       } catch (e) {
         this.logger.error(`Post-chat save error: ${e.message}`);
       }
+    });
+  }
+
+  private async streamUniversalAgent(
+    userId: string,
+    message: string,
+    assistantId: string,
+    agentId: string,
+    recentHistory: { type: string; content: string }[],
+    res: Response,
+  ): Promise<void> {
+    const chatSessionId = `${userId}_${assistantId}`;
+
+    // Build context from recent history
+    let contextPrefix = '';
+    if (recentHistory.length > 0) {
+      const historyLines = recentHistory
+        .slice(-6)
+        .map(m => `${m.type === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
+        .join('\n');
+      contextPrefix = `Recent conversation context:\n${historyLines}\n\n`;
+    }
+
+    const prompt = contextPrefix + message;
+
+    // Set streaming headers (same format as regular chat)
+    res.status(200);
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    res.write(JSON.stringify({ type: 'begin' }) + '\n');
+
+    const AGENT_SYSTEM_PROMPT = `You are Роман, a universal AI agent on the LINKEON.IO platform.
+You can do ANYTHING the user asks: process files, write code, search the web, create documents, analyze data, and more.
+
+You have full access to an Ubuntu server with:
+- ffmpeg, ImageMagick, LibreOffice, Inkscape, poppler-utils
+- Python 3 venv: source /home/dvolkov/agent-env/bin/activate (rembg, Pillow, python-pptx, python-docx, reportlab, cairosvg)
+- sudo access, can install anything
+
+FILE OUTPUT RULES (CRITICAL):
+- When creating files for the user to download, ALWAYS save them to: /home/dvolkov/spirits_back/public/agent-files/
+- The download URL is: https://b.linkeon.io/static/agent-files/FILENAME
+- Use unique filenames to avoid collisions (add timestamp or random suffix if needed)
+- Format download links as markdown: [Скачать filename](https://b.linkeon.io/static/agent-files/FILENAME)
+- NEVER invent fake URLs like files.linkeon.io or any other non-existent domains
+
+GENERAL RULES:
+1. Do whatever the user asks. Be resourceful.
+2. If a tool is missing — install it.
+3. Verify output files are valid.
+4. If something fails, try a different approach.
+5. Be concise but helpful. Respond in Russian by default, match the user's language.
+6. NEVER use telegram, ToolSearch, or any MCP/plugin tools.
+7. NEVER output markdown tables (|---|) — they render poorly in the chat UI. Use bullet lists or plain text instead.`;
+
+    const args = [
+      '-p', prompt,
+      '--output-format', 'stream-json',
+      '--verbose',
+      '--include-partial-messages',
+      '--max-turns', '100',
+      '--allowedTools', 'Bash(*),Read(*),Write(*),Edit(*),Glob(*),Grep(*),WebSearch(*),WebFetch(*)',
+      '--system-prompt', AGENT_SYSTEM_PROMPT,
+    ];
+
+    return new Promise<void>((resolve) => {
+      const child = spawn('claude', args, {
+        cwd: '/tmp',
+        env: {
+          ...process.env,
+          PATH: (process.env.PATH || '') + ':/home/dvolkov/agent-env/bin',
+        },
+      });
+
+      let buf = '';
+      const chunks: string[] = [];
+      let inputTokens = 0;
+      let outputTokens = 0;
+
+      child.stdout.on('data', (chunk) => {
+        buf += chunk.toString();
+        const parts = buf.split('\n');
+        buf = parts.pop() || '';
+
+        for (const line of parts) {
+          if (!line.trim()) continue;
+          try {
+            const ev = JSON.parse(line);
+
+            if (ev.type === 'stream_event' && ev.event) {
+              const se = ev.event;
+              if (se.type === 'content_block_delta' && se.delta?.type === 'text_delta' && se.delta.text) {
+                chunks.push(se.delta.text);
+                res.write(JSON.stringify({ type: 'item', content: se.delta.text }) + '\n');
+              }
+            } else if (ev.type === 'assistant' && ev.message) {
+              for (const block of (ev.message.content || [])) {
+                if (block.type === 'text' && block.text && chunks.length === 0) {
+                  // Fallback: full text if no deltas were sent
+                  chunks.push(block.text);
+                  res.write(JSON.stringify({ type: 'item', content: block.text }) + '\n');
+                }
+              }
+            } else if (ev.type === 'result') {
+              if (ev.usage) {
+                inputTokens = ev.usage.input_tokens || 0;
+                outputTokens = ev.usage.output_tokens || 0;
+              }
+              // If no chunks were sent, use result text
+              if (chunks.length === 0 && ev.result) {
+                chunks.push(ev.result);
+                res.write(JSON.stringify({ type: 'item', content: ev.result }) + '\n');
+              }
+            }
+          } catch {}
+        }
+      });
+
+      child.stderr.on('data', () => {});
+
+      child.on('close', () => {
+        // Process remaining buffer
+        if (buf.trim()) {
+          try {
+            const ev = JSON.parse(buf);
+            if (ev.type === 'result') {
+              if (ev.usage) {
+                inputTokens = ev.usage.input_tokens || 0;
+                outputTokens = ev.usage.output_tokens || 0;
+              }
+              if (chunks.length === 0 && ev.result) {
+                chunks.push(ev.result);
+                res.write(JSON.stringify({ type: 'item', content: ev.result }) + '\n');
+              }
+            }
+          } catch {}
+        }
+
+        const fullText = chunks.join('');
+        const tokensUsed = inputTokens + outputTokens;
+
+        res.write(JSON.stringify({
+          type: 'end',
+          content: fullText,
+          usage: { input: inputTokens, output: outputTokens, total: tokensUsed },
+        }) + '\n');
+        res.end();
+
+        // Async: save history and charge tokens
+        setImmediate(async () => {
+          try {
+            await this.saveChatHistory(userId, assistantId, message, fullText, tokensUsed);
+            await this.addTokenTask(userId, inputTokens, outputTokens, agentId);
+          } catch (e) {
+            this.logger.error(`Universal agent post-chat error: ${e.message}`);
+          }
+        });
+
+        resolve();
+      });
+
+      child.on('error', (err) => {
+        this.logger.error(`Universal agent spawn error: ${err.message}`);
+        const errText = 'Ошибка запуска агента. Попробуйте ещё раз.';
+        res.write(JSON.stringify({ type: 'item', content: errText }) + '\n');
+        res.write(JSON.stringify({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } }) + '\n');
+        res.end();
+        resolve();
+      });
     });
   }
 
@@ -299,7 +525,7 @@ export class ChatService {
     return { url: result.url, text: '' };
   }
 
-  private async saveChatHistory(userId: string, agentId: string, userMsg: string, assistantMsg: string) {
+  private async saveChatHistory(userId: string, agentId: string, userMsg: string, assistantMsg: string, tokensUsed = 0) {
     const sessionId = `${userId}_${agentId}`;
     const agentNum = /^\d+$/.test(agentId) ? parseInt(agentId, 10) : null;
 
@@ -310,11 +536,11 @@ export class ChatService {
       [sessionId, agentNum, userMsg],
     );
 
-    // Insert assistant message
+    // Insert assistant message with tokens_used
     await this.pg.query(
-      `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
-       VALUES ($1, 'ai', $2, $3, 'text')`,
-      [sessionId, agentNum, assistantMsg],
+      `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
+       VALUES ($1, 'ai', $2, $3, 'text', $4)`,
+      [sessionId, agentNum, assistantMsg, tokensUsed],
     );
   }
 
@@ -331,7 +557,7 @@ export class ChatService {
   async getChatHistory(userId: string, assistantId: string, limit = 30, offset = 0): Promise<{ messages: any[]; hasMore: boolean }> {
     const sessionId = `${userId}_${assistantId}`;
     const res = await this.pg.query(
-      `SELECT id, sender_type, content, created_at FROM custom_chat_history
+      `SELECT id, sender_type, content, created_at, tokens_used FROM custom_chat_history
        WHERE session_id = $1
        ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
       [sessionId, limit + 1, offset],
@@ -343,6 +569,7 @@ export class ChatService {
       type: r.sender_type === 'human' ? 'user' : 'assistant',
       content: r.content,
       timestamp: r.created_at,
+      tokensUsed: r.tokens_used || 0,
     }));
     return { messages, hasMore };
   }

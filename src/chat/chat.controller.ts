@@ -5,6 +5,8 @@ import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { JwtService } from '../common/services/jwt.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
+import * as fs from 'fs';
+import * as path from 'path';
 
 @Controller('')
 export class ChatController {
@@ -58,6 +60,64 @@ export class ChatController {
     );
   }
 
+  @Post('agent/upload-and-chat')
+  async uploadAndChat(@Req() req: Request, @Res() res: Response) {
+    const authHeader = req.headers['authorization'];
+    let userId: string | null = null;
+    if (authHeader?.startsWith('Bearer ')) {
+      try {
+        const payload = this.jwtSvc.verify(authHeader.substring(7));
+        if (payload.type === 'access') userId = payload.phone;
+      } catch {}
+    }
+    if (!userId) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      return res.status(200).send('');
+    }
+
+    const multer = require('multer');
+    const uploadDir = '/tmp/agent-uploads';
+    fs.mkdirSync(uploadDir, { recursive: true });
+    const storage = multer.diskStorage({
+      destination: uploadDir,
+      filename: (_req: any, file: any, cb: any) => {
+        const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+        cb(null, `${Date.now()}_${safeName}`);
+      },
+    });
+    const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024 } });
+
+    await new Promise<void>((resolve, reject) => {
+      upload.single('file')(req as any, res as any, (err: any) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    const file = (req as any).file;
+    const body = (req as any).body || {};
+    const message = body.message || body.task || '';
+    const assistantId = body.assistantId || 'Роман';
+
+    if (!file) return res.status(400).json({ error: 'No file uploaded' });
+
+    let profileText = '';
+    if (this.neo4j) {
+      try { profileText = await this.neo4j.getProfileDescription(userId); } catch {}
+    }
+
+    const filePrompt = `User uploaded file: ${file.path} (original name: ${file.originalname}, ${file.size} bytes, type: ${file.mimetype})\n\nTask: ${message || 'Проанализируй этот файл'}`;
+
+    await this.chatService.streamChat(
+      userId,
+      filePrompt,
+      String(assistantId),
+      `${userId}_${assistantId}`,
+      profileText,
+      res,
+    );
+  }
+
   @Get('chat/history')
   @UseGuards(JwtGuard)
   async getHistory(@CurrentUser() user: any, @Query('assistantId') assistantId: string, @Query('limit') limit: string, @Query('offset') offset: string, @Res() res: Response) {
@@ -74,14 +134,28 @@ export class ChatController {
 
   @Post('scan-document')
   @UseGuards(JwtGuard)
-  async scanDocument(@CurrentUser() user: any, @Body() body: any, @Res() res: Response) {
+  async scanDocument(@CurrentUser() user: any, @Req() req: Request, @Res() res: Response) {
     const anthropicKey = process.env.ANTHROPIC_API_KEY;
     if (!anthropicKey) return res.status(500).json({ error: 'LLM not configured' });
 
-    const { content, filename } = body;
-    if (!content) return res.status(400).json({ error: 'Missing content' });
-
     try {
+      // Handle multipart file upload via multer
+      const multer = require('multer');
+      const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+      await new Promise<void>((resolve, reject) => {
+        upload.single('file')(req as any, res as any, (err: any) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+
+      const file = (req as any).file;
+      if (!file) return res.status(400).json({ error: 'No file uploaded' });
+
+      const base64 = file.buffer.toString('base64');
+      const mediaType = file.mimetype || 'application/pdf';
+      const filename = file.originalname || 'document.pdf';
+
       const Anthropic = require('@anthropic-ai/sdk');
       const client = new Anthropic({ apiKey: anthropicKey });
       const msg = await client.messages.create({
@@ -89,28 +163,29 @@ export class ChatController {
         max_tokens: 4096,
         messages: [{
           role: 'user',
-          content: `Проанализируй следующий документ и извлеки профиль пользователя в JSON формате:
-{
-  "name": "Имя",
-  "family_name": "Фамилия",
-  "profile": ["ключевые факты"],
-  "values": ["ценности"],
-  "skills": ["навыки"],
-  "beliefs": ["убеждения"],
-  "desires": ["желания"],
-  "interests": ["интересы"],
-  "search": ["что ищет"]
-}
-
-Документ (${filename || 'document'}):
-${content}`
+          content: [
+            {
+              type: 'document',
+              source: { type: 'base64', media_type: mediaType, data: base64 },
+            },
+            {
+              type: 'text',
+              text: `Проанализируй этот документ (${filename}) и извлеки профиль пользователя. Верни ТОЛЬКО JSON:
+{"name":"Имя","family_name":"Фамилия","profile":["факты"],"values":["ценности"],"skills":["навыки"],"beliefs":["убеждения"],"desires":["желания"],"interests":["интересы"],"search":["что ищет"]}`,
+            },
+          ],
         }],
       });
+
       let text = msg.content?.[0]?.text || '';
-      if (text.startsWith('```')) text = text.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
-      const parsed = JSON.parse(text);
-      return res.status(200).json(parsed);
+      if (text.includes('```')) text = text.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
+      // Find JSON in response
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) return res.status(200).json({ output: { profile: [text] } });
+      const parsed = JSON.parse(jsonMatch[0]);
+      return res.status(200).json({ output: parsed });
     } catch (e) {
+      console.error('scan-document error:', e);
       return res.status(500).json({ error: e.message || 'Document parsing failed' });
     }
   }
