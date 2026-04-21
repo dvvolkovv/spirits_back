@@ -13,6 +13,7 @@ import { AvatarModule } from './avatar/avatar.module';
 import { Neo4jModule } from './neo4j/neo4j.module';
 import { SchedulerModule } from './scheduler/scheduler.module';
 import { MiscModule } from './misc/misc.module';
+import { VideoModule } from './video/video.module';
 import { AdminModule } from './admin/admin.module';
 
 @Module({
@@ -31,6 +32,7 @@ import { AdminModule } from './admin/admin.module';
     Neo4jModule,
     SchedulerModule,
     MiscModule,
+    VideoModule,
     AdminModule,
   ],
 })

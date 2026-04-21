@@ -8,7 +8,9 @@
     "test:api": "node runner.js --suite api",
     "test:db": "node runner.js --suite db",
     "test:workflows": "node runner.js --suite workflows",
-    "test:e2e": "node runner.js --suite e2e"
+    "test:e2e": "node runner.js --suite e2e",
+    "test:video": "bash video.e2e.sh",
+    "test:chat-tools": "bash chat-tools.e2e.sh"
   },
   "dependencies": {
     "axios": "^1.6.0",
