@@ -1,7 +1,7 @@
 // src/video/video.service.ts
 import {
   Injectable, Logger, BadRequestException, ForbiddenException,
-  NotFoundException, ConflictException,
+  NotFoundException, ConflictException, OnModuleInit, OnModuleDestroy,
 } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { KlingService } from '../misc/kling.service';
@@ -18,7 +18,7 @@ export class InsufficientTokensError extends Error {
 }
 
 @Injectable()
-export class VideoService {
+export class VideoService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(VideoService.name);
   private readonly MAX_CONCURRENT_PER_USER = 3;
 
@@ -236,5 +236,104 @@ export class VideoService {
   // Stub — real S3 deletion wired up in a later task (Task 7).
   private async deleteS3Objects(_jobId: string): Promise<void> {
     /* intentional stub */
+  }
+
+  // ================= POLLER =================
+  private pollTimer: NodeJS.Timeout | null = null;
+  private readonly POLL_INTERVAL_MS = 5000;
+  private readonly JOB_TIMEOUT_MINUTES = 15;
+
+  onModuleInit() {
+    this.pollTimer = setInterval(
+      () => this.tick().catch((e) => this.logger.error(`tick error: ${e.message}`)),
+      this.POLL_INTERVAL_MS,
+    );
+    this.logger.log('VideoService poller started (tick=5s)');
+  }
+
+  onModuleDestroy() {
+    if (this.pollTimer) clearInterval(this.pollTimer);
+  }
+
+  private async tick() {
+    await this.expireStaleJobs();
+    const res = await this.pg.query(
+      `SELECT * FROM video_jobs WHERE status='processing' ORDER BY updated_at ASC LIMIT 20`,
+    );
+    const jobs = res.rows as VideoJobRow[];
+    await Promise.all(
+      jobs.map((job) =>
+        this.pollJob(job).catch((e) => this.logger.error(`pollJob ${job.id} error: ${e.message}`)),
+      ),
+    );
+  }
+
+  private async expireStaleJobs() {
+    const stale = await this.pg.query(
+      `SELECT id, user_id, tokens_spent
+       FROM video_jobs
+       WHERE status='processing'
+         AND created_at < now() - ($1 || ' minutes')::interval
+       FOR UPDATE SKIP LOCKED`,
+      [String(this.JOB_TIMEOUT_MINUTES)],
+    );
+    for (const row of stale.rows as Array<{ id: string; user_id: string; tokens_spent: number }>) {
+      await this.failAndRefund(row.id, row.user_id, Number(row.tokens_spent), 'timeout (15 min)');
+    }
+  }
+
+  private async pollJob(job: VideoJobRow) {
+    if (!job.kling_task_id) return;
+    const res = await this.kling.getVideoTaskStatus(job.kling_task_id, job.mode);
+    if (res.status === 'succeed' && res.videoUrl) {
+      const s3VideoUrl = await this.rehostToS3(job.id, res.videoUrl);
+      const s3ThumbUrl = await this.extractAndUploadThumbnail(job.id, s3VideoUrl);
+      await this.pg.query(
+        `UPDATE video_jobs
+            SET status='ready',
+                video_url=$1,
+                thumbnail_url=$2,
+                kling_task_id = COALESCE($3, kling_task_id),
+                updated_at=now()
+          WHERE id=$4`,
+        [s3VideoUrl, s3ThumbUrl, res.videoId ?? null, job.id],
+      );
+      this.logger.log(`Video job ${job.id} ready: ${s3VideoUrl}`);
+    } else if (res.status === 'failed') {
+      await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), res.error ?? 'failed');
+    }
+    // 'submitted' / 'processing' — no-op until next tick
+  }
+
+  private async failAndRefund(jobId: string, userId: string, tokens: number, reason: string) {
+    const client = await this.pg.getClient();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE ai_profiles_consolidated SET tokens = tokens + $1 WHERE user_id = $2`,
+        [tokens, userId],
+      );
+      await client.query(
+        `UPDATE video_jobs SET status='failed', error_message=$1, updated_at=now() WHERE id=$2`,
+        [String(reason).slice(0, 500), jobId],
+      );
+      await client.query('COMMIT');
+    } catch (e: any) {
+      try { await client.query('ROLLBACK'); } catch {}
+      this.logger.error(`failAndRefund txn error: ${e.message}`);
+    } finally {
+      client.release();
+    }
+    this.logger.warn(`Video job ${jobId} failed, refunded ${tokens} tokens: ${reason}`);
+  }
+
+  // ================= REHOST STUBS =================
+  // Real implementation in Task 7. These stubs return the input URL unchanged so the poller
+  // still marks jobs 'ready' during development.
+  private async rehostToS3(_jobId: string, klingUrl: string): Promise<string> {
+    return klingUrl;
+  }
+  private async extractAndUploadThumbnail(_jobId: string, _videoUrl: string): Promise<string | null> {
+    return null;
   }
 }
