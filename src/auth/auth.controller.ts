@@ -59,8 +59,48 @@ export class AuthController {
     if (process.env.DEBUG_SMS_CODES !== 'true') {
       return res.status(404).json({ error: 'Not found' });
     }
+    if (!this.isTestPhone(phone)) {
+      return res.status(403).json({ error: 'Phone not in whitelist' });
+    }
     const code = await this.authService.getDebugCode(phone);
     if (!code) return res.status(404).json({ error: 'No code' });
     return res.status(200).json({ code });
+  }
+
+  /**
+   * Debug: изменить баланс тестового пользователя (только для E2E-тестов).
+   */
+  @Post('debug/add-tokens/:phone/:amount')
+  async debugAddTokens(
+    @Param('phone') phone: string,
+    @Param('amount') amount: string,
+    @Res() res: Response,
+  ) {
+    if (process.env.DEBUG_SMS_CODES !== 'true') {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    if (!this.isTestPhone(phone)) {
+      return res.status(403).json({ error: 'Phone not in whitelist' });
+    }
+    const delta = parseInt(amount, 10);
+    if (Number.isNaN(delta)) {
+      return res.status(400).json({ error: 'Invalid amount' });
+    }
+    try {
+      const result = await this.authService.debugAddTokens(phone, delta);
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(500).json({ error: err.message || 'Internal error' });
+    }
+  }
+
+  /**
+   * Whitelist тестовых телефонов для всех debug-эндпоинтов.
+   * Фиксированный список + pattern для динамических referral-аккаунтов.
+   */
+  private isTestPhone(phone: string): boolean {
+    const FIXED = ['70000000000', '79030169187'];
+    if (FIXED.includes(phone)) return true;
+    return /^790300\d{5}$/.test(phone);
   }
 }

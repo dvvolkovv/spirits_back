@@ -104,6 +104,33 @@ export class AuthService {
     return this.redis.get(`sc-${phone}`);
   }
 
+  /**
+   * Debug: изменить баланс токенов тестового пользователя (+/-).
+   * Используется ТОЛЬКО Playwright-тестами; гейт по DEBUG_SMS_CODES в контроллере.
+   */
+  async debugAddTokens(phone: string, delta: number): Promise<{
+    phone: string;
+    balance_before: number;
+    balance_after: number;
+  }> {
+    const before = await this.pg.query(
+      'SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1',
+      [phone],
+    );
+    if (before.rows.length === 0) {
+      throw new Error(`user not found: ${phone}`);
+    }
+    const balanceBefore = Number(before.rows[0].tokens || 0);
+
+    await this.pg.query(
+      'UPDATE ai_profiles_consolidated SET tokens = tokens + $1, updated_at = now() WHERE user_id = $2',
+      [delta, phone],
+    );
+
+    const balanceAfter = balanceBefore + delta;
+    return { phone, balance_before: balanceBefore, balance_after: balanceAfter };
+  }
+
   async refreshTokens(refreshToken: string): Promise<{ 'access-token': string; 'refresh-token': string } | null> {
     try {
       const payload = this.jwtSvc.verify(refreshToken);
