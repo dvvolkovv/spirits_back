@@ -3,15 +3,14 @@
 ## Обзор
 Платформа для поиска единомышленников. NestJS бэкенд + React фронтенд.
 
-## Окружения
+## Окружение (единая среда)
 
-| | Test | Prod |
-|--|------|------|
-| URL | https://b.linkeon.io | https://my.linkeon.io |
-| Сервер | `ssh dvolkov@212.113.106.202` | n8n на Railway (migrating) |
-| БД | PostgreSQL local (`linkeon`) | Railway PostgreSQL |
-| Neo4j | Docker local (bolt://localhost:7687) | Railway Neo4j |
-| PM2 | `linkeon-api` (port 3001) | — |
+- **URL:** https://my.linkeon.io
+- **Сервер:** `ssh -p 60322 dvolkov@82.202.197.230`
+- **БД:** PostgreSQL local (`linkeon`)
+- **Neo4j:** Docker local (`bolt://localhost:7687`)
+- **PM2:** `linkeon-api` (port 3001)
+- Staging (`b.linkeon.io`) упразднён — всё гоняется на prod. Для безопасного тестирования использовать test-аккаунты ниже и `DEBUG_SMS_CODES=true`.
 
 ## Репозитории
 
