@@ -3,6 +3,7 @@ import {
   Injectable, Logger, BadRequestException, ForbiddenException,
   NotFoundException, ConflictException, OnModuleInit, OnModuleDestroy,
 } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import { KlingService } from '../misc/kling.service';
 import {
@@ -390,6 +391,18 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       ACL: 'public-read',
     }));
     return this.s3PublicUrl(key);
+  }
+
+  @Cron(CronExpression.EVERY_DAY_AT_4AM)
+  async cleanupOldFailedJobs() {
+    const res = await this.pg.query(
+      `DELETE FROM video_jobs
+       WHERE status='failed' AND created_at < now() - interval '30 days'
+       RETURNING id`,
+    );
+    if (res.rowCount && res.rowCount > 0) {
+      this.logger.log(`Cleanup: deleted ${res.rowCount} failed video jobs`);
+    }
   }
 
   private async extractAndUploadThumbnail(jobId: string, videoUrl: string): Promise<string | null> {
