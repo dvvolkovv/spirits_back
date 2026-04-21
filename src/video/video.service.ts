@@ -9,6 +9,13 @@ import {
   CreateVideoJobDto, VideoJobRow, computeTokenCost,
   VideoMode, VideoModel, VideoQuality,
 } from './video.dto';
+import { S3Client, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
+import axios from 'axios';
+import { spawn } from 'child_process';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 
 export class InsufficientTokensError extends Error {
   status = 402;
@@ -21,6 +28,20 @@ export class InsufficientTokensError extends Error {
 export class VideoService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(VideoService.name);
   private readonly MAX_CONCURRENT_PER_USER = 3;
+
+  private s3 = new S3Client({
+    region: process.env.AWS_REGION ?? 'us-east-1',
+    credentials: {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID ?? '',
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? '',
+    },
+  });
+  private readonly s3Bucket = process.env.AWS_S3_BUCKET || 'linkeon.io';
+  private readonly s3Region = process.env.AWS_REGION ?? 'us-east-1';
+
+  private s3PublicUrl(key: string): string {
+    return `https://${this.s3Bucket}.s3.${this.s3Region}.amazonaws.com/${key}`;
+  }
 
   constructor(
     private readonly pg: PgService,
@@ -233,9 +254,11 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     await this.pg.query(`DELETE FROM video_jobs WHERE id=$1`, [jobId]);
   }
 
-  // Stub — real S3 deletion wired up in a later task (Task 7).
-  private async deleteS3Objects(_jobId: string): Promise<void> {
-    /* intentional stub */
+  private async deleteS3Objects(jobId: string): Promise<void> {
+    await Promise.allSettled([
+      this.s3.send(new DeleteObjectCommand({ Bucket: this.s3Bucket, Key: `videos/${jobId}.mp4` })),
+      this.s3.send(new DeleteObjectCommand({ Bucket: this.s3Bucket, Key: `videos/${jobId}.jpg` })),
+    ]);
   }
 
   // ================= POLLER =================
@@ -327,13 +350,44 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     this.logger.warn(`Video job ${jobId} failed, refunded ${tokens} tokens: ${reason}`);
   }
 
-  // ================= REHOST STUBS =================
-  // Real implementation in Task 7. These stubs return the input URL unchanged so the poller
-  // still marks jobs 'ready' during development.
-  private async rehostToS3(_jobId: string, klingUrl: string): Promise<string> {
-    return klingUrl;
+  private async rehostToS3(jobId: string, klingUrl: string): Promise<string> {
+    const resp = await axios.get(klingUrl, { responseType: 'stream', timeout: 120000 });
+    const key = `videos/${jobId}.mp4`;
+    await new Upload({
+      client: this.s3,
+      params: {
+        Bucket: this.s3Bucket,
+        Key: key,
+        Body: resp.data,
+        ContentType: 'video/mp4',
+        ACL: 'public-read',
+      },
+    }).done();
+    return this.s3PublicUrl(key);
   }
-  private async extractAndUploadThumbnail(_jobId: string, _videoUrl: string): Promise<string | null> {
-    return null;
+
+  private async extractAndUploadThumbnail(jobId: string, videoUrl: string): Promise<string | null> {
+    const tmpPath = path.join(os.tmpdir(), `thumb_${jobId}.jpg`);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const ff = spawn('ffmpeg', ['-y', '-i', videoUrl, '-ss', '0', '-vframes', '1', '-q:v', '2', tmpPath]);
+        let stderr = '';
+        ff.stderr.on('data', (d) => { stderr += d.toString(); });
+        ff.on('close', (code) => code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}: ${stderr.slice(-400)}`)));
+        ff.on('error', reject);
+      });
+      const buf = fs.readFileSync(tmpPath);
+      const key = `videos/${jobId}.jpg`;
+      await this.s3.send(new PutObjectCommand({
+        Bucket: this.s3Bucket, Key: key, Body: buf,
+        ContentType: 'image/jpeg', ACL: 'public-read',
+      }));
+      return this.s3PublicUrl(key);
+    } catch (e: any) {
+      this.logger.warn(`thumbnail extract failed for ${jobId}: ${e.message}`);
+      return null;
+    } finally {
+      try { fs.unlinkSync(tmpPath); } catch {}
+    }
   }
 }
