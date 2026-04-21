@@ -366,6 +366,32 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     return this.s3PublicUrl(key);
   }
 
+  async uploadUserAsset(
+    userId: string,
+    kind: 'image' | 'audio',
+    buffer: Buffer,
+    mimeType: string,
+    origName: string,
+  ): Promise<string> {
+    const allowed = kind === 'image' ? /^image\//.test(mimeType) : /^audio\//.test(mimeType);
+    if (!allowed) throw new BadRequestException(`bad mime type for ${kind}: ${mimeType}`);
+    const maxBytes = kind === 'image' ? 10 * 1024 * 1024 : 20 * 1024 * 1024;
+    if (buffer.byteLength > maxBytes) {
+      throw new BadRequestException(`file too large (max ${maxBytes / 1024 / 1024} MB)`);
+    }
+    const extMatch = origName.match(/\.([a-z0-9]{2,5})$/i);
+    const ext = extMatch ? extMatch[1].toLowerCase() : kind === 'image' ? 'jpg' : 'mp3';
+    const key = `video-uploads/${userId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    await this.s3.send(new PutObjectCommand({
+      Bucket: this.s3Bucket,
+      Key: key,
+      Body: buffer,
+      ContentType: mimeType,
+      ACL: 'public-read',
+    }));
+    return this.s3PublicUrl(key);
+  }
+
   private async extractAndUploadThumbnail(jobId: string, videoUrl: string): Promise<string | null> {
     const tmpPath = path.join(os.tmpdir(), `thumb_${jobId}.jpg`);
     try {

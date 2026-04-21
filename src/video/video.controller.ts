@@ -1,8 +1,9 @@
 // src/video/video.controller.ts
 import {
   Controller, Post, Get, Delete, Body, Param, Query, Req, Res,
-  UseGuards,
+  UseGuards, UseInterceptors, UploadedFile,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { Request, Response } from 'express';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
@@ -63,5 +64,39 @@ export class VideoController {
   async deleteJob(@CurrentUser() user: any, @Param('id') id: string) {
     await this.video.deleteJob(user.phone, id);
     return { ok: true };
+  }
+
+  @Post('upload-image')
+  @UseGuards(JwtGuard)
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 10 * 1024 * 1024 } }))
+  async uploadImage(
+    @CurrentUser() user: any,
+    @UploadedFile() file: Express.Multer.File,
+  ) {
+    const url = await this.video.uploadUserAsset(
+      user.phone,
+      'image',
+      file.buffer,
+      file.mimetype,
+      file.originalname,
+    );
+    return { url };
+  }
+
+  @Post('upload-audio')
+  @UseGuards(JwtGuard)
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 20 * 1024 * 1024 } }))
+  async uploadAudio(
+    @CurrentUser() user: any,
+    @UploadedFile() file: Express.Multer.File,
+  ) {
+    const url = await this.video.uploadUserAsset(
+      user.phone,
+      'audio',
+      file.buffer,
+      file.mimetype,
+      file.originalname,
+    );
+    return { url };
   }
 }
