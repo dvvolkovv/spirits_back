@@ -187,4 +187,54 @@ export class VideoService {
       throw new BadRequestException(`Kling rejected the request: ${e.message}`);
     }
   }
+
+  async getJob(userId: string, jobId: string): Promise<VideoJobRow> {
+    const res = await this.pg.query(
+      `SELECT * FROM video_jobs WHERE id=$1`,
+      [jobId],
+    );
+    const row = res.rows[0] as VideoJobRow | undefined;
+    if (!row) throw new NotFoundException('job not found');
+    if (row.user_id !== userId) throw new ForbiddenException('not your job');
+    return row;
+  }
+
+  async listJobs(
+    userId: string,
+    opts: { status?: string; limit?: number } = {},
+  ): Promise<VideoJobRow[]> {
+    const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
+    const params: any[] = [userId];
+    let where = `user_id=$1`;
+    if (opts.status) {
+      params.push(opts.status);
+      where += ` AND status=$${params.length}`;
+    }
+    params.push(limit);
+    const res = await this.pg.query(
+      `SELECT * FROM video_jobs WHERE ${where} ORDER BY created_at DESC LIMIT $${params.length}`,
+      params,
+    );
+    return res.rows as VideoJobRow[];
+  }
+
+  async deleteJob(userId: string, jobId: string): Promise<void> {
+    const row = await this.getJob(userId, jobId); // ownership enforced here
+    if (row.status === 'processing' || row.status === 'pending') {
+      throw new ConflictException('cannot delete active job — wait for completion');
+    }
+    if (row.video_url || row.thumbnail_url) {
+      try {
+        await this.deleteS3Objects(row.id);
+      } catch (e: any) {
+        this.logger.warn(`S3 cleanup failed for ${row.id}: ${e.message}`);
+      }
+    }
+    await this.pg.query(`DELETE FROM video_jobs WHERE id=$1`, [jobId]);
+  }
+
+  // Stub — real S3 deletion wired up in a later task (Task 7).
+  private async deleteS3Objects(_jobId: string): Promise<void> {
+    /* intentional stub */
+  }
 }
