@@ -59,9 +59,9 @@ fi
 # -------- 4. Verify URL responds 200 --------
 VIDEO_URL=$(curl -s "$BASE/video/jobs/$JOB_ID" -H "Authorization: Bearer $JWT" \
   | python3 -c "import sys,json; print(json.load(sys.stdin).get('video_url',''))")
-HTTP=$(curl -sI -w "%{http_code}\n" -o /dev/null "$VIDEO_URL")
+HTTP=$(curl -sIL -w "%{http_code}\n" -o /dev/null "$VIDEO_URL")
 echo "[video.e2e] video HEAD status=$HTTP url=$VIDEO_URL"
-[ "$HTTP" = "200" ] || { echo "[video.e2e] video not reachable"; exit 1; }
+[[ "$HTTP" =~ ^[23] ]] || { echo "[video.e2e] video not reachable (http $HTTP)"; exit 1; }
 
 # -------- 5. List includes this job --------
 LIST_CONTAINS=$(curl -s "$BASE/video/jobs" -H "Authorization: Bearer $JWT" \

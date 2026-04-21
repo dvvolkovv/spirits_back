@@ -31,17 +31,23 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   private readonly MAX_CONCURRENT_PER_USER = 3;
 
   private s3 = new S3Client({
-    region: process.env.AWS_REGION ?? 'us-east-1',
+    region: process.env.AWS_REGION ?? 'ru-central1',
+    endpoint: process.env.AWS_ENDPOINT ?? 'https://storage.yandexcloud.net',
+    forcePathStyle: process.env.AWS_FORCE_PATH_STYLE === 'true',
     credentials: {
       accessKeyId: process.env.AWS_ACCESS_KEY_ID ?? '',
       secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? '',
     },
   });
   private readonly s3Bucket = process.env.AWS_S3_BUCKET || 'linkeon.io';
-  private readonly s3Region = process.env.AWS_REGION ?? 'us-east-1';
 
   private s3PublicUrl(key: string): string {
-    return `https://${this.s3Bucket}.s3.${this.s3Region}.amazonaws.com/${key}`;
+    const endpoint = (process.env.AWS_ENDPOINT ?? 'https://storage.yandexcloud.net').replace(/\/$/, '');
+    if (process.env.AWS_FORCE_PATH_STYLE === 'true') {
+      return `${endpoint}/${this.s3Bucket}/${key}`;
+    }
+    const host = endpoint.replace(/^https?:\/\//, '');
+    return `https://${this.s3Bucket}.${host}/${key}`;
   }
 
   constructor(
@@ -310,8 +316,16 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     if (!job.kling_task_id) return;
     const res = await this.kling.getVideoTaskStatus(job.kling_task_id, job.mode);
     if (res.status === 'succeed' && res.videoUrl) {
-      const s3VideoUrl = await this.rehostToS3(job.id, res.videoUrl);
-      const s3ThumbUrl = await this.extractAndUploadThumbnail(job.id, s3VideoUrl);
+      let finalVideoUrl = res.videoUrl;
+      let thumbUrl: string | null = null;
+      try {
+        finalVideoUrl = await this.rehostToS3(job.id, res.videoUrl);
+        thumbUrl = await this.extractAndUploadThumbnail(job.id, finalVideoUrl);
+      } catch (s3err: any) {
+        this.logger.warn(`Video job ${job.id}: S3 rehost failed (${s3err.message}), using Kling CDN URL directly`);
+        finalVideoUrl = res.videoUrl;
+        thumbUrl = null;
+      }
       await this.pg.query(
         `UPDATE video_jobs
             SET status='ready',
@@ -320,9 +334,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
                 kling_task_id = COALESCE($3, kling_task_id),
                 updated_at=now()
           WHERE id=$4`,
-        [s3VideoUrl, s3ThumbUrl, res.videoId ?? null, job.id],
+        [finalVideoUrl, thumbUrl, res.videoId ?? null, job.id],
       );
-      this.logger.log(`Video job ${job.id} ready: ${s3VideoUrl}`);
+      this.logger.log(`Video job ${job.id} ready: ${finalVideoUrl}`);
     } else if (res.status === 'failed') {
       await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), res.error ?? 'failed');
     }
@@ -361,7 +375,6 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         Key: key,
         Body: resp.data,
         ContentType: 'video/mp4',
-        ACL: 'public-read',
       },
     }).done();
     return this.s3PublicUrl(key);
@@ -388,7 +401,6 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       Key: key,
       Body: buffer,
       ContentType: mimeType,
-      ACL: 'public-read',
     }));
     return this.s3PublicUrl(key);
   }
