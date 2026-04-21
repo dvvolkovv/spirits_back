@@ -2,6 +2,7 @@ import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { KlingService } from '../misc/kling.service';
+import { ChatToolsService, CHAT_TOOLS } from './chat-tools';
 import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import { Response } from 'express';
@@ -12,7 +13,12 @@ export class ChatService {
   private readonly logger = new Logger(ChatService.name);
   private anthropic: Anthropic | null = null;
 
-  constructor(private readonly pg: PgService, @Optional() private readonly neo4j: Neo4jService, @Optional() private readonly kling: KlingService) {
+  constructor(
+    private readonly pg: PgService,
+    @Optional() private readonly neo4j: Neo4jService,
+    @Optional() private readonly kling: KlingService,
+    private readonly tools: ChatToolsService,
+  ) {
     if (process.env.ANTHROPIC_API_KEY) {
       this.anthropic = new Anthropic({
         apiKey: process.env.ANTHROPIC_API_KEY,
@@ -151,38 +157,6 @@ export class ChatService {
       }
     }
 
-    // Detect image generation request before calling LLM
-    const imageKeywords = /(?:создай|нарисуй|сгенерируй|нарисуй|генерация|generate|draw|create)\s+(?:мне\s+)?(?:картинк|изображен|рисунок|фото|image|picture|illustration)/i;
-    const drawKeywords = /^(?:нарисуй|draw)\s+/i;
-    if (imageKeywords.test(message) || drawKeywords.test(message)) {
-      res.write(JSON.stringify({ type: 'begin', metadata: { nodeName: 'Image Echo Agent' } }) + '\n');
-      try {
-        const imageResult = await this.generateImageForChat(userId, message);
-        if (imageResult) {
-          const fullText = `![Сгенерированное изображение](${imageResult.url})`;
-          res.write(JSON.stringify({ type: 'item', content: fullText }) + '\n');
-          res.write(JSON.stringify({ type: 'end', content: fullText }) + '\n');
-          res.end();
-          setImmediate(async () => {
-            try {
-              await this.saveChatHistory(userId, String(assistantId), message, fullText);
-            } catch (e) { this.logger.error(`Post-chat save error: ${e.message}`); }
-          });
-          return;
-        }
-      } catch (e) {
-        this.logger.error(`Image gen error: ${e.message}`);
-        const errText = 'Не удалось сгенерировать изображение. Попробуйте ещё раз.';
-        res.write(JSON.stringify({ type: 'item', content: errText }) + '\n');
-        res.write(JSON.stringify({ type: 'end', content: errText }) + '\n');
-        res.end();
-        setImmediate(async () => {
-          try { await this.saveChatHistory(userId, String(assistantId), message, errText); } catch {}
-        });
-        return;
-      }
-    }
-
     // Regular text chat — stream to client (buffer for Маша to filter tool tags)
     const isМаша = agent.name === 'Маша';
     const needsBuffering = isМаша; // Маша needs post-processing for card detection
@@ -194,21 +168,83 @@ export class ChatService {
 
     if (this.anthropic) {
       try {
-        const stream = this.anthropic.messages.stream({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 4096,
-          system: systemPrompt,
-          messages: llmMessages,
-        });
-        stream.on('text', (text) => {
-          chunks.push(text);
-          if (!needsBuffering) {
-            res.write(JSON.stringify({ type: 'item', content: text }) + '\n');
+        const MAX_ITERATIONS = 5;
+        // Anthropic messages accept strings OR content blocks. We start with llmMessages
+        // (role+content string pairs) and extend it across iterations when tools are called.
+        const messagesForLLM: any[] = [...llmMessages];
+
+        for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
+          const stream = this.anthropic.messages.stream({
+            model: 'claude-haiku-4-5-20251001',
+            max_tokens: 4096,
+            system: systemPrompt,
+            tools: CHAT_TOOLS as any,
+            messages: messagesForLLM,
+          });
+
+          // Stream only text chunks; ignore tool-use content blocks for the typewriter effect.
+          // We'll decide what to do after finalMessage() arrives.
+          stream.on('text', (text) => {
+            chunks.push(text);
+            if (!needsBuffering) {
+              res.write(JSON.stringify({ type: 'item', content: text }) + '\n');
+            }
+          });
+
+          const finalMessage = await stream.finalMessage();
+          inputTokens += finalMessage.usage?.input_tokens || 0;
+          outputTokens += finalMessage.usage?.output_tokens || 0;
+
+          if (finalMessage.stop_reason !== 'tool_use') {
+            // Plain completion — nothing more to do
+            break;
           }
-        });
-        const finalMessage = await stream.finalMessage();
-        inputTokens = finalMessage.usage?.input_tokens || 0;
-        outputTokens = finalMessage.usage?.output_tokens || 0;
+
+          // Find all tool_use blocks in this turn (usually one)
+          const toolUseBlocks = (finalMessage.content as any[]).filter((b) => b?.type === 'tool_use');
+          if (toolUseBlocks.length === 0) break;
+
+          // Push the full assistant turn (text + tool_use blocks) into the conversation
+          messagesForLLM.push({ role: 'assistant', content: finalMessage.content });
+
+          const toolResults: any[] = [];
+          for (const tu of toolUseBlocks) {
+            // Announce tool start to the client
+            res.write(JSON.stringify({
+              type: 'tool_start',
+              tool: tu.name,
+              input: tu.input,
+            }) + '\n');
+
+            const result = await this.tools.executeTool(userId, tu.name, tu.input);
+
+            // Announce tool result to the client — frontend uses this to render inline video/image cards
+            res.write(JSON.stringify({
+              type: 'tool_result',
+              tool: tu.name,
+              result,
+            }) + '\n');
+
+            // For image tool: inject markdown image into chunks so it ends up in saved history + final text
+            if (result.ok && result.kind === 'image') {
+              const md = `\n\n![Сгенерированное изображение](${result.imageUrl})`;
+              chunks.push(md);
+              if (!needsBuffering) {
+                res.write(JSON.stringify({ type: 'item', content: md }) + '\n');
+              }
+            }
+
+            toolResults.push({
+              type: 'tool_result',
+              tool_use_id: tu.id,
+              content: JSON.stringify(result),
+            });
+          }
+
+          // Feed the results back to the LLM so it can respond with natural-language follow-up
+          messagesForLLM.push({ role: 'user', content: toolResults });
+          // loop continues — next iteration gets the LLM's reply
+        }
       } catch (e) {
         this.logger.error(`Anthropic stream error: ${e.message}`);
         chunks.push('Ошибка соединения с ассистентом.');
