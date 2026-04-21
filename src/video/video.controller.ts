@@ -9,19 +9,25 @@ import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { VideoService, InsufficientTokensError } from './video.service';
 import { CreateVideoJobDto } from './video.dto';
+import { IpRateLimiter } from '../common/guards/ip-rate-limit';
 
 @Controller('video')
 export class VideoController {
-  constructor(private readonly video: VideoService) {}
+  constructor(
+    private readonly video: VideoService,
+    private readonly limiter: IpRateLimiter,
+  ) {}
 
   @Post('jobs')
   @UseGuards(JwtGuard)
   async createJob(
     @CurrentUser() user: any,
+    @Req() req: Request,
     @Res() res: Response,
     @Body() dto: CreateVideoJobDto,
   ) {
     try {
+      await this.limiter.check(req.ip || 'unknown', 'video-create', 20, 60);
       const result = await this.video.createJob(user.phone, dto);
       return res.json(result);
     } catch (e: any) {
@@ -71,8 +77,10 @@ export class VideoController {
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 10 * 1024 * 1024 } }))
   async uploadImage(
     @CurrentUser() user: any,
+    @Req() req: Request,
     @UploadedFile() file: Express.Multer.File,
   ) {
+    await this.limiter.check(req.ip || 'unknown', 'video-upload', 60, 60);
     const url = await this.video.uploadUserAsset(
       user.phone,
       'image',
@@ -88,8 +96,10 @@ export class VideoController {
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 20 * 1024 * 1024 } }))
   async uploadAudio(
     @CurrentUser() user: any,
+    @Req() req: Request,
     @UploadedFile() file: Express.Multer.File,
   ) {
+    await this.limiter.check(req.ip || 'unknown', 'video-upload', 60, 60);
     const url = await this.video.uploadUserAsset(
       user.phone,
       'audio',
