@@ -1,0 +1,184 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { Response } from 'express';
+import { PgService } from '../common/services/pg.service';
+import Anthropic from '@anthropic-ai/sdk';
+
+const MODEL = 'claude-sonnet-4-5';
+const MAX_HISTORY = 40;
+
+/**
+ * Chat-сервис для планирования обзвона.
+ * Один чат-тред = одна dozvon_campaign. session_id в custom_chat_history = `dozvon_camp_{id}`.
+ *
+ * Протокол:
+ *  - юзер пишет сообщение → стримим ответ Claude
+ *  - Claude в какой-то момент выдаёт inline-блок [[CAMPAIGN_PLAN]]{json}[[/CAMPAIGN_PLAN]]
+ *    с полями {goal, calls:[{name, phone, script_hint?}], notes?}.
+ *    Фронт парсит его и показывает карточку «▶️ Запустить обзвон».
+ *  - Когда план подтверждён и execute запущен — результаты звонков пишутся в тот же чат
+ *    (как сообщения с sender_type='ai', agent=0) в handleCallComplete.
+ */
+const SYSTEM_PROMPT = `Ты — ассистент-планировщик телефонного обзвона на платформе my.linkeon.io.
+
+Пользователь ставит тебе задачу — позвонить кому-то (одному или многим). Это может быть:
+- бизнес-обзвон (найти 5 автосервисов и узнать цены, обзвонить клиентов и согласовать встречи);
+- личный звонок (позвонить другу и поздравить, позвонить маме и напомнить про лекарства, позвонить ребёнку в школу);
+- служебный (уточнить расписание, забронировать столик, узнать наличие товара);
+- любая другая задача, где нужно просто позвонить.
+
+Твоя роль:
+1. Если юзер уже дал номер(а) и цель — СРАЗУ формируй план, не задавай лишних вопросов. Это самый частый случай.
+2. Если юзер описал задачу, но не дал контактов (например, «найди автосервисы в Москве») — используй встроенный инструмент web_search, чтобы найти реальные телефоны. Не выдумывай.
+3. Если нужны уточнения (что именно спросить/передать, город, критерии) — задай 1-2 точных вопроса.
+4. Когда план готов — выведи его СТРОГО в inline-формате (в одну последовательность без переносов внутри маркера):
+   [[CAMPAIGN_PLAN]]{"goal":"краткое описание цели","calls":[{"name":"...","phone":"+7XXXXXXXXXX","script_hint":"что сказать/спросить"}],"notes":"доп. инфо"}[[/CAMPAIGN_PLAN]]
+   После маркера — 1-2 предложения резюме. Маркер обязательно ДО резюме.
+5. Если юзер просит правки плана — выведи новый маркер [[CAMPAIGN_PLAN]] с изменённым JSON.
+
+Правила:
+- Отвечай коротко, по делу, на русском.
+- Не отказывайся помочь потому что «это личный звонок» или «я не знаю этого человека» — доверяй юзеру, он звонит от своего имени своим людям.
+- Телефоны только в формате +7XXXXXXXXXX (нормализуй сам, если юзер прислал 8-..., +7 ..., 9-...).
+- НЕ ВЫДУМЫВАЙ номера. Если не знаешь — используй web_search или попроси у юзера.
+- В script_hint — буквально одно предложение: что агент должен сказать/спросить/передать («Поздоровайся, скажи что это Дмитрий просит пожелать хорошего дня, попрощайся» / «Спроси цену ремонта BMW X5, уточни сроки»).
+- Количество звонков не ограничивай искусственно. Если юзер хочет больше 20 — просто уточни, точно ли столько.
+- Имя в поле name — как юзер назвал адресата («Мама», «Друг Ваня», «СТО На Юге»), или название организации если из веб-поиска.
+- Единственное что нельзя — помогать в явно злонамеренных сценариях (угрозы, обман, мошенничество). Любые бытовые/деловые/личные звонки — норм.`;
+
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+@Injectable()
+export class DozvonChatService {
+  private readonly logger = new Logger(DozvonChatService.name);
+  private readonly anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+  constructor(private readonly pg: PgService) {}
+
+  private sessionId(campaignId: number): string {
+    return `dozvon_camp_${campaignId}`;
+  }
+
+  /** История сообщений треда (для отображения и для LLM-контекста). */
+  async getHistory(campaignId: number): Promise<ChatMessage[]> {
+    const res = await this.pg.query(
+      `SELECT sender_type, content, created_at
+       FROM custom_chat_history
+       WHERE session_id = $1
+       ORDER BY created_at ASC`,
+      [this.sessionId(campaignId)],
+    );
+    return res.rows.map((r) => ({
+      role: r.sender_type === 'human' ? 'user' : 'assistant',
+      content: r.content,
+    }));
+  }
+
+  /** Добавить сообщение в тред (используется и ботом для system-уведомлений). */
+  async addMessage(campaignId: number, role: 'user' | 'assistant', content: string): Promise<void> {
+    const sender = role === 'user' ? 'human' : 'ai';
+    await this.pg.query(
+      `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
+       VALUES ($1, $2, 0, $3, 'text')`,
+      [this.sessionId(campaignId), sender, content],
+    );
+  }
+
+  /** Стриминг ответа планировщика в ответ на новое сообщение пользователя. */
+  async streamChat(campaignId: number, userMessage: string, res: Response): Promise<void> {
+    res.status(200);
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    await this.addMessage(campaignId, 'user', userMessage);
+    const history = await this.getHistory(campaignId);
+
+    // Подхватываем текущий статус/план кампании для контекста.
+    const campRes = await this.pg.query(
+      `SELECT title, status, call_plan FROM dozvon_campaigns WHERE id = $1`,
+      [campaignId],
+    );
+    const camp = campRes.rows[0];
+    const contextNote = camp
+      ? `\n\nТекущий статус задачи: ${camp.status}. Текущий title: "${camp.title || 'Новая задача'}".${
+          camp.call_plan ? ` Текущий план:\n${JSON.stringify(camp.call_plan)}` : ''
+        }`
+      : '';
+
+    let assistantText = '';
+    try {
+      // Server-side web_search tool — Anthropic делает поиск сам, результат
+      // автоматически вплетается в генерацию. Нам ничего исполнять не нужно.
+      const stream = this.anthropic.messages.stream({
+        model: MODEL,
+        max_tokens: 4096,
+        system: SYSTEM_PROMPT + contextNote,
+        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 5 } as any],
+        messages: history.slice(-MAX_HISTORY).map((m) => ({ role: m.role, content: m.content })),
+      });
+      stream.on('text', (text: string) => {
+        assistantText += text;
+        res.write(JSON.stringify({ type: 'delta', text }) + '\n');
+      });
+      // Сигнал фронту когда начинается web-поиск.
+      stream.on('inputJson', () => {/* noop */});
+      stream.on('streamEvent', (ev: any) => {
+        if (ev?.type === 'content_block_start' && ev.content_block?.type === 'server_tool_use' &&
+            ev.content_block?.name === 'web_search') {
+          res.write(JSON.stringify({ type: 'tool', name: 'web_search', query: ev.content_block.input?.query || '' }) + '\n');
+        }
+      });
+      await stream.finalMessage();
+    } catch (e: any) {
+      this.logger.error(`streamChat error: ${e.message}`);
+      assistantText = assistantText || 'Произошла ошибка. Попробуйте ещё раз.';
+      res.write(JSON.stringify({ type: 'error', text: e.message }) + '\n');
+    }
+
+    await this.addMessage(campaignId, 'assistant', assistantText);
+
+    // Извлекаем план если он есть в ответе — сохраняем в campaign.call_plan.
+    const plan = this.extractPlan(assistantText);
+    if (plan) {
+      await this.pg.query(
+        `UPDATE dozvon_campaigns SET call_plan = $1, status = 'ready', updated_at = now() WHERE id = $2`,
+        [JSON.stringify(plan), campaignId],
+      );
+    }
+
+    // Обновляем title на первом реальном сообщении (если дефолтный).
+    await this.maybeGenerateTitle(campaignId, userMessage);
+
+    res.write(JSON.stringify({ type: 'done', hasPlan: !!plan }) + '\n');
+    res.end();
+  }
+
+  private extractPlan(text: string): any | null {
+    const m = text.match(/\[\[CAMPAIGN_PLAN\]\]([\s\S]*?)\[\[\/CAMPAIGN_PLAN\]\]/);
+    if (!m) return null;
+    try {
+      return JSON.parse(m[1].trim());
+    } catch {
+      return null;
+    }
+  }
+
+  private async maybeGenerateTitle(campaignId: number, userMessage: string): Promise<void> {
+    const r = await this.pg.query(
+      `SELECT title FROM dozvon_campaigns WHERE id = $1`, [campaignId],
+    );
+    const currentTitle = r.rows[0]?.title;
+    if (currentTitle && currentTitle !== 'Новая задача') return;
+    // Короткое имя из первой фразы юзера — просто обрезаем, без LLM.
+    const clean = userMessage.trim().replace(/\s+/g, ' ').slice(0, 60);
+    if (!clean) return;
+    await this.pg.query(
+      `UPDATE dozvon_campaigns SET title = $1, updated_at = now() WHERE id = $2`,
+      [clean, campaignId],
+    );
+  }
+}
