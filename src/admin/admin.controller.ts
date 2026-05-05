@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Res, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Body, Query, Res, UseGuards } from '@nestjs/common';
 import { Response } from 'express';
 import { AdminService } from './admin.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
@@ -41,6 +41,88 @@ export class AdminController {
   @UseGuards(JwtGuard)
   async referralStats(@Res() res: Response) {
     const stats = await this.adminService.getReferralStats();
+    return res.status(200).json(stats);
+  }
+
+  // --- Payments ---
+
+  @Get('admin/payments')
+  @UseGuards(JwtGuard)
+  async listPayments(
+    @Query('status') status: string | undefined,
+    @Query('limit') limit: string | undefined,
+    @Res() res: Response,
+  ) {
+    const items = await this.adminService.listPayments({
+      status,
+      limit: limit ? parseInt(limit, 10) || undefined : undefined,
+    });
+    return res.status(200).json(items);
+  }
+
+  @Get('admin/payments/stats')
+  @UseGuards(JwtGuard)
+  async paymentsStats(@Query('days') days: string | undefined, @Res() res: Response) {
+    const stats = await this.adminService.getPaymentsStats({
+      days: days ? parseInt(days, 10) || undefined : undefined,
+    });
+    return res.status(200).json(stats);
+  }
+
+  // --- Tokens ---
+
+  @Get('admin/users/tokens')
+  @UseGuards(JwtGuard)
+  async usersTokens(
+    @Query('limit') limit: string | undefined,
+    @Query('sort') sort: string | undefined,
+    @Query('hours') hours: string | undefined,
+    @Res() res: Response,
+  ) {
+    const data = await this.adminService.getUsersTokensList({
+      limit: limit ? parseInt(limit, 10) || undefined : undefined,
+      sortBy: sort === 'spent_period' ? 'spent_period' : 'balance',
+      hours: hours ? parseInt(hours, 10) || undefined : undefined,
+    });
+    return res.status(200).json(data);
+  }
+
+  @Get('admin/tokens/stats')
+  @UseGuards(JwtGuard)
+  async tokensStats(
+    @Query('bucket') bucket: string | undefined,
+    @Query('days') days: string | undefined,
+    @Res() res: Response,
+  ) {
+    const stats = await this.adminService.getTokensSpendStats({
+      bucket: bucket === 'hour' ? 'hour' : 'day',
+      days: days ? parseInt(days, 10) || undefined : undefined,
+    });
+    return res.status(200).json(stats);
+  }
+
+  @Get('admin/users/active')
+  @UseGuards(JwtGuard)
+  async usersActive(
+    @Query('days') days: string | undefined,
+    @Query('bucket') bucket: string | undefined,
+    @Res() res: Response,
+  ) {
+    const stats = await this.adminService.getActiveUsersStats({
+      days: days ? parseInt(days, 10) || undefined : undefined,
+      bucket: bucket === 'week' ? 'week' : 'day',
+    });
+    return res.status(200).json(stats);
+  }
+
+  // --- Usage stats ---
+
+  @Get('admin/usage/assistants')
+  @UseGuards(JwtGuard)
+  async assistantsUsage(@Query('days') days: string | undefined, @Res() res: Response) {
+    const stats = await this.adminService.getAssistantsUsageStats({
+      days: days ? parseInt(days, 10) || undefined : undefined,
+    });
     return res.status(200).json(stats);
   }
 
