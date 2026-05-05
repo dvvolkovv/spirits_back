@@ -6,7 +6,6 @@ import { CurrentUser } from '../common/decorators/user.decorator';
 import { JwtService } from '../common/services/jwt.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import * as fs from 'fs';
-import * as path from 'path';
 
 @Controller('')
 export class ChatController {
@@ -76,16 +75,7 @@ export class ChatController {
     }
 
     const multer = require('multer');
-    const uploadDir = '/tmp/agent-uploads';
-    fs.mkdirSync(uploadDir, { recursive: true });
-    const storage = multer.diskStorage({
-      destination: uploadDir,
-      filename: (_req: any, file: any, cb: any) => {
-        const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
-        cb(null, `${Date.now()}_${safeName}`);
-      },
-    });
-    const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024 } });
+    const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
 
     await new Promise<void>((resolve, reject) => {
       upload.single('file')(req as any, res as any, (err: any) => {
@@ -106,16 +96,90 @@ export class ChatController {
       try { profileText = await this.neo4j.getProfileDescription(userId); } catch {}
     }
 
-    const filePrompt = `User uploaded file: ${file.path} (original name: ${file.originalname}, ${file.size} bytes, type: ${file.mimetype})\n\nTask: ${message || 'Проанализируй этот файл'}`;
+    // Build message with profile context
+    let fullMessage = '';
+    if (profileText && profileText.trim()) {
+      fullMessage += `User profile:\n${profileText}\n\n`;
+    }
+    fullMessage += message || 'Проанализируй этот файл';
 
-    await this.chatService.streamChat(
-      userId,
-      filePrompt,
-      String(assistantId),
-      `${userId}_${assistantId}`,
-      profileText,
-      res,
-    );
+    const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
+
+    // Proxy file + message to remote agent server
+    const FormData = require('form-data');
+    const axios = require('axios');
+    const fd = new FormData();
+    fd.append('files', file.buffer, { filename: file.originalname, contentType: file.mimetype });
+    fd.append('message', fullMessage);
+    fd.append('sessionId', `${userId}_${assistantId}`);
+
+    // Set streaming headers
+    res.status(200);
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    res.write(JSON.stringify({ type: 'begin' }) + '\n');
+
+    try {
+      const agentRes = await axios.default.post(`${AGENT_URL}/chat`, fd, {
+        headers: fd.getHeaders(),
+        responseType: 'stream',
+        timeout: 600000,
+      });
+
+      const chunks: string[] = [];
+
+      await new Promise<void>((resolve, reject) => {
+        let buffer = '';
+        agentRes.data.on('data', (chunk: Buffer) => {
+          buffer += chunk.toString();
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            try {
+              const ev = JSON.parse(line.slice(6));
+              if (ev.type === 'delta' || ev.type === 'text') {
+                chunks.push(ev.text);
+                res.write(JSON.stringify({ type: 'item', content: ev.text }) + '\n');
+              } else if (ev.type === 'result' && ev.text && chunks.length === 0) {
+                chunks.push(ev.text);
+                res.write(JSON.stringify({ type: 'item', content: ev.text }) + '\n');
+              } else if (ev.type === 'done' && ev.outputFiles?.length > 0) {
+                const fileLinks = ev.outputFiles
+                  .map((f: any) => `[Скачать ${f.name}](${AGENT_URL}${f.url})`)
+                  .join('\n');
+                if (fileLinks) {
+                  chunks.push('\n\n' + fileLinks);
+                  res.write(JSON.stringify({ type: 'item', content: '\n\n' + fileLinks }) + '\n');
+                }
+              }
+            } catch {}
+          }
+        });
+        agentRes.data.on('end', () => resolve());
+        agentRes.data.on('error', (err: Error) => reject(err));
+      });
+
+      const fullText = chunks.join('');
+      res.write(JSON.stringify({ type: 'end', content: fullText, usage: { input: 0, output: fullText.length, total: fullText.length } }) + '\n');
+      res.end();
+
+      // Save history
+      setImmediate(async () => {
+        try {
+          await this.chatService.saveChatHistoryPublic(userId, assistantId, `📎 ${file.originalname}\n${message}`, fullText, fullText.length);
+        } catch {}
+      });
+    } catch (err) {
+      const errText = 'Ошибка обработки файла. Попробуйте ещё раз.';
+      res.write(JSON.stringify({ type: 'item', content: errText }) + '\n');
+      res.write(JSON.stringify({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } }) + '\n');
+      res.end();
+    }
   }
 
   @Get('chat/history')

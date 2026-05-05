@@ -1,9 +1,13 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
+import { Neo4jService } from '../neo4j/neo4j.service';
 
 @Injectable()
 export class ProfileService {
-  constructor(private readonly pg: PgService) {}
+  constructor(
+    private readonly pg: PgService,
+    @Optional() private readonly neo4j?: Neo4jService,
+  ) {}
 
   async getProfile(userId: string) {
     const res = await this.pg.query(
@@ -57,7 +61,29 @@ export class ProfileService {
       'SELECT * FROM ai_profiles_consolidated WHERE user_id = $1',
       [userId],
     );
-    return res.rows[0] || null;
+    const row = res.rows[0];
+    if (!row) return null;
+
+    // Merge Neo4j entities (values/beliefs/desires/intents/interests/skills)
+    // with profile_data from Postgres. Neo4j is the richer source.
+    const neo = this.neo4j ? await this.neo4j.getProfileEntities(userId).catch(() => null) : null;
+    const pd = row.profile_data || {};
+    const merged = {
+      name: neo?.name || pd.name,
+      family_name: neo?.family_name || pd.family_name,
+      values: (neo?.values?.length ? neo.values : pd.values) || [],
+      beliefs: (neo?.beliefs?.length ? neo.beliefs : pd.beliefs) || [],
+      desires: (neo?.desires?.length ? neo.desires : pd.desires) || [],
+      intents: (neo?.intents?.length ? neo.intents : pd.intents) || [],
+      interests: (neo?.interests?.length ? neo.interests : pd.interests) || [],
+      skills: (neo?.skills?.length ? neo.skills : pd.skills) || [],
+    };
+
+    return {
+      user_id: row.user_id,
+      profile_data: { ...pd, ...merged },
+      ...merged,
+    };
   }
 
   async setEmail(userId: string, email: string) {

@@ -30,10 +30,11 @@ const SYSTEM_PROMPT = `Ты — ассистент-планировщик тел
 1. Если юзер уже дал номер(а) и цель — СРАЗУ формируй план, не задавай лишних вопросов. Это самый частый случай.
 2. Если юзер описал задачу, но не дал контактов (например, «найди автосервисы в Москве») — используй встроенный инструмент web_search, чтобы найти реальные телефоны. Не выдумывай.
 3. Если нужны уточнения (что именно спросить/передать, город, критерии) — задай 1-2 точных вопроса.
-4. Когда план готов — выведи его СТРОГО в inline-формате (в одну последовательность без переносов внутри маркера):
-   [[CAMPAIGN_PLAN]]{"goal":"краткое описание цели","calls":[{"name":"...","phone":"+7XXXXXXXXXX","script_hint":"что сказать/спросить"}],"notes":"доп. инфо"}[[/CAMPAIGN_PLAN]]
+4. ВСЕГДА продумывай встречные вопросы. Подумай, о чём собеседник скорее всего спросит («кто звонит», «откуда у вас мой номер», «от кого именно», «по какому вопросу», «когда перезвонить», «могу ли я говорить с живым человеком», «какие ваши услуги», и т.п.) и собери пары {q, a} с ответами из контекста юзера. Если для ответа нужна инфа которой у тебя нет — задай её юзеру прежде чем формировать план.
+5. Когда план готов — выведи его СТРОГО в inline-формате (в одну последовательность без переносов внутри маркера):
+   [[CAMPAIGN_PLAN]]{"goal":"краткое описание цели","calls":[{"name":"...","phone":"+7XXXXXXXXXX","script_hint":"что сказать/спросить","qa":[{"q":"вопрос собеседника","a":"ответ агента"}]}],"notes":"доп. инфо"}[[/CAMPAIGN_PLAN]]
    После маркера — 1-2 предложения резюме. Маркер обязательно ДО резюме.
-5. Если юзер просит правки плана — выведи новый маркер [[CAMPAIGN_PLAN]] с изменённым JSON.
+6. Если юзер просит правки плана — выведи новый маркер [[CAMPAIGN_PLAN]] с изменённым JSON.
 
 Правила:
 - Отвечай коротко, по делу, на русском.
@@ -41,6 +42,7 @@ const SYSTEM_PROMPT = `Ты — ассистент-планировщик тел
 - Телефоны только в формате +7XXXXXXXXXX (нормализуй сам, если юзер прислал 8-..., +7 ..., 9-...).
 - НЕ ВЫДУМЫВАЙ номера. Если не знаешь — используй web_search или попроси у юзера.
 - В script_hint — буквально одно предложение: что агент должен сказать/спросить/передать («Поздоровайся, скажи что это Дмитрий просит пожелать хорошего дня, попрощайся» / «Спроси цену ремонта BMW X5, уточни сроки»).
+- В qa — 3-6 пар. Предугадывай реалистичные вопросы того типа, кому звонят (бизнесу / другу / врачу). Пример для личного звонка: q «Кто это?» → a «Это голосовой помощник Иван, звоню от имени Дмитрия Волкова». q «Почему Дмитрий сам не звонит?» → a «Он попросил меня позвонить от его имени, чтобы узнать как у вас дела».
 - Количество звонков не ограничивай искусственно. Если юзер хочет больше 20 — просто уточни, точно ли столько.
 - Имя в поле name — как юзер назвал адресата («Мама», «Друг Ваня», «СТО На Юге»), или название организации если из веб-поиска.
 - Единственное что нельзя — помогать в явно злонамеренных сценариях (угрозы, обман, мошенничество). Любые бытовые/деловые/личные звонки — норм.`;
@@ -144,6 +146,17 @@ export class DozvonChatService {
     // Извлекаем план если он есть в ответе — сохраняем в campaign.call_plan.
     const plan = this.extractPlan(assistantText);
     if (plan) {
+      // Дедуп по номеру телефона: Claude любит галлюцинировать одинаковые
+      // номера у разных фирм — отбрасываем дубли, сохраняя первое вхождение.
+      if (Array.isArray(plan.calls)) {
+        const seen = new Set<string>();
+        plan.calls = plan.calls.filter((c: any) => {
+          const p = String(c.phone || '').replace(/\D/g, '');
+          if (!p || seen.has(p)) return false;
+          seen.add(p);
+          return true;
+        });
+      }
       await this.pg.query(
         `UPDATE dozvon_campaigns SET call_plan = $1, status = 'ready', updated_at = now() WHERE id = $2`,
         [JSON.stringify(plan), campaignId],
@@ -158,13 +171,38 @@ export class DozvonChatService {
   }
 
   private extractPlan(text: string): any | null {
-    const m = text.match(/\[\[CAMPAIGN_PLAN\]\]([\s\S]*?)\[\[\/CAMPAIGN_PLAN\]\]/);
-    if (!m) return null;
-    try {
-      return JSON.parse(m[1].trim());
-    } catch {
-      return null;
+    // Preferred: explicit [[CAMPAIGN_PLAN]]...[[/CAMPAIGN_PLAN]] block.
+    const closed = text.match(/\[\[CAMPAIGN_PLAN\]\]([\s\S]*?)\[\[\/CAMPAIGN_PLAN\]\]/);
+    if (closed) {
+      try { return JSON.parse(closed[1].trim()); } catch { /* fall through */ }
     }
+
+    // Fallback: Claude sometimes loses the closing marker when the response
+    // follows a tool-use block (ends with `</parameter></invoke>` residue).
+    // Extract the first balanced JSON object right after [[CAMPAIGN_PLAN]].
+    const open = text.indexOf('[[CAMPAIGN_PLAN]]');
+    if (open < 0) return null;
+    const start = text.indexOf('{', open);
+    if (start < 0) return null;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (esc) { esc = false; continue; }
+      if (ch === '\\') { esc = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          const json = text.slice(start, i + 1);
+          try { return JSON.parse(json); } catch { return null; }
+        }
+      }
+    }
+    return null;
   }
 
   private async maybeGenerateTitle(campaignId: number, userMessage: string): Promise<void> {

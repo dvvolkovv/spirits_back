@@ -6,6 +6,6 @@ import { KlingService } from './kling.service';
 @Module({
   controllers: [MiscController],
   providers: [MiscService, KlingService],
-  exports: [KlingService],
+  exports: [KlingService, MiscService],
 })
 export class MiscModule {}

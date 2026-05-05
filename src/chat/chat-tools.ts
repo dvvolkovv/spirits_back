@@ -1,6 +1,7 @@
 // src/chat/chat-tools.ts
 import { Injectable, Logger } from '@nestjs/common';
 import { KlingService } from '../misc/kling.service';
+import { MiscService } from '../misc/misc.service';
 import { PgService } from '../common/services/pg.service';
 import { VideoService, InsufficientTokensError } from '../video/video.service';
 import { CreateVideoJobDto } from '../video/video.dto';
@@ -9,14 +10,60 @@ export const CHAT_TOOLS = [
   {
     name: 'generate_image',
     description:
-      'Generate a single image from a text prompt. Use whenever the user asks for an image, picture, or illustration (Russian "нарисуй", "сгенерируй картинку", "изображение").',
+      'Generate a single image from a text prompt using Google Imagen 4.0 Ultra (primary) with Nano Banana 2 / Nano Banana Pro (Gemini 3.1 Flash Image / Gemini 3 Pro Image) as fallback. Use whenever the user asks for an image, picture, or illustration (Russian "нарисуй", "сгенерируй картинку", "изображение"). Cost: 5000 tokens (std → Nano Banana 2) or 10000 tokens (hd → Nano Banana Pro, 4K, лучше рендерит текст/кириллицу).',
     input_schema: {
       type: 'object',
       properties: {
         prompt: { type: 'string' },
-        aspect_ratio: { type: 'string', enum: ['1:1', '16:9', '9:16'], default: '1:1' },
+        quality: { type: 'string', enum: ['std', 'hd'], default: 'std' },
       },
       required: ['prompt'],
+    },
+  },
+  {
+    name: 'edit_image',
+    description:
+      'Edit / modify an existing image using Nano Banana 2 (std) or Nano Banana Pro (hd, 4K). Use when the user wants to change, fix, or iterate on a previously generated image — "сделай небо закатным", "убери фон", "добавь шапку", "сделай его рыжим", "замени надпись на X". Pass sourceImageUrl from the previous generate_image / edit_image tool result (imageUrl field). Cost: 5000 tokens (std) or 10000 tokens (hd).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'What to change in the image (in the user\'s language).' },
+        sourceImageUrl: { type: 'string', description: 'URL of the image to edit. Must be either /static/generated/... (previously generated on this platform) or an absolute https:// URL.' },
+        quality: { type: 'string', enum: ['std', 'hd'], default: 'std' },
+      },
+      required: ['prompt', 'sourceImageUrl'],
+    },
+  },
+  {
+    name: 'compose_image',
+    description:
+      'Combine 2-3 source images into one new image using Nano Banana 2 (std) or Nano Banana Pro (hd, 4K). Use when the user wants to merge, combine, or compose multiple images — "возьми моё фото и посади меня на этот трон", "соедини товар с этим фоном", "объедини эти две картинки". Pass 2-3 URLs in sourceImageUrls (order matters — first is usually the primary subject). Cost: 5000 tokens (std) or 10000 tokens (hd).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'Describe how to combine the images (in the user\'s language). Be specific about which element from which image goes where.' },
+        sourceImageUrls: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 2,
+          maxItems: 3,
+          description: 'Array of 2-3 image URLs. Can be /static/generated/... from previous tool results, or absolute https:// URLs.',
+        },
+        quality: { type: 'string', enum: ['std', 'hd'], default: 'std' },
+      },
+      required: ['prompt', 'sourceImageUrls'],
+    },
+  },
+  {
+    name: 'upscale_image',
+    description:
+      'Enhance image quality using Nano Banana Pro — sharpens details, reduces noise, preserves content identically. Use when the user asks "улучши качество", "сделай чётче", "убери шум", "enhance". Note: pixel resolution stays the same; detail fidelity is what improves. Cost: 10000 tokens.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        sourceImageUrl: { type: 'string', description: 'URL of the image to upscale. /static/generated/... or absolute https://.' },
+      },
+      required: ['sourceImageUrl'],
     },
   },
   {
@@ -50,14 +97,13 @@ export type ToolResult =
   | { ok: true; kind: 'video'; jobId: string; status: string; tokensSpent: number }
   | { ok: false; error: string; [k: string]: any };
 
-const IMAGE_TOKEN_COST = 5000;
-
 @Injectable()
 export class ChatToolsService {
   private readonly logger = new Logger(ChatToolsService.name);
 
   constructor(
     private readonly kling: KlingService,
+    private readonly misc: MiscService,
     private readonly pg: PgService,
     private readonly video: VideoService,
   ) {}
@@ -67,26 +113,98 @@ export class ChatToolsService {
       if (name === 'generate_image') {
         const prompt = String(input?.prompt ?? '').slice(0, 2000);
         if (!prompt) return { ok: false, error: 'empty prompt' };
-        const aspectRatio = typeof input?.aspect_ratio === 'string' ? input.aspect_ratio : '1:1';
+        const quality = input?.quality === 'hd' ? 'hd' : 'std';
 
-        // Balance check before the expensive call
-        const balRes = await this.pg.query(
-          'SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1',
-          [userId],
-        );
-        const balance = Number((balRes.rows[0] as any)?.tokens ?? 0);
-        if (balance < IMAGE_TOKEN_COST) {
-          return { ok: false, error: 'insufficient_tokens', balance, required: IMAGE_TOKEN_COST };
+        // Delegate to MiscService.generateImage — it runs Imagen 4.0 Ultra (primary) with
+        // Nano Banana 2 (std) / Nano Banana Pro (hd) as fallback, handles balance/deduction
+        // and history. Throws on insufficient funds or model failure.
+        try {
+          const result = await this.misc.generateImage(userId, { prompt, quality });
+          const imageUrl = result?.images?.[0]?.url;
+          if (!imageUrl) return { ok: false, error: 'image generation failed' };
+          return { ok: true, kind: 'image', imageUrl, tokensSpent: Number(result.tokensSpent || 0) };
+        } catch (e: any) {
+          if (/недостаточно|insufficient/i.test(e?.message || '')) {
+            const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
+            return {
+              ok: false, error: 'insufficient_tokens',
+              balance: Number(bal.rows[0]?.tokens || 0),
+              required: quality === 'hd' ? 10000 : 5000,
+            };
+          }
+          return { ok: false, error: e?.message || 'image generation failed' };
         }
+      }
 
-        const result = await this.kling.generateImage(prompt, aspectRatio);
-        if (!result) return { ok: false, error: 'image generation failed' };
+      if (name === 'edit_image') {
+        const prompt = String(input?.prompt ?? '').slice(0, 2000);
+        const sourceImageUrl = String(input?.sourceImageUrl ?? '').trim();
+        if (!prompt) return { ok: false, error: 'empty prompt' };
+        if (!sourceImageUrl) return { ok: false, error: 'sourceImageUrl required' };
+        const quality = input?.quality === 'hd' ? 'hd' : 'std';
 
-        await this.pg.query(
-          'UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2',
-          [IMAGE_TOKEN_COST, userId],
-        );
-        return { ok: true, kind: 'image', imageUrl: result.url, tokensSpent: IMAGE_TOKEN_COST };
+        try {
+          const result = await this.misc.editImage(userId, { prompt, sourceImageUrl, quality });
+          const imageUrl = result?.images?.[0]?.url;
+          if (!imageUrl) return { ok: false, error: 'image edit failed' };
+          return { ok: true, kind: 'image', imageUrl, tokensSpent: Number(result.tokensSpent || 0) };
+        } catch (e: any) {
+          if (/недостаточно|insufficient/i.test(e?.message || '')) {
+            const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
+            return {
+              ok: false, error: 'insufficient_tokens',
+              balance: Number(bal.rows[0]?.tokens || 0),
+              required: quality === 'hd' ? 10000 : 5000,
+            };
+          }
+          return { ok: false, error: e?.message || 'image edit failed' };
+        }
+      }
+
+      if (name === 'compose_image') {
+        const prompt = String(input?.prompt ?? '').slice(0, 2000);
+        const sourceImageUrls = Array.isArray(input?.sourceImageUrls)
+          ? input.sourceImageUrls.map((u: any) => String(u || '').trim()).filter(Boolean)
+          : [];
+        if (!prompt) return { ok: false, error: 'empty prompt' };
+        if (sourceImageUrls.length < 2) return { ok: false, error: 'compose_image requires at least 2 sourceImageUrls' };
+        if (sourceImageUrls.length > 3) return { ok: false, error: 'compose_image supports at most 3 sourceImageUrls' };
+        const quality = input?.quality === 'hd' ? 'hd' : 'std';
+
+        try {
+          const result = await this.misc.composeImage(userId, { prompt, sourceImageUrls, quality });
+          const imageUrl = result?.images?.[0]?.url;
+          if (!imageUrl) return { ok: false, error: 'image compose failed' };
+          return { ok: true, kind: 'image', imageUrl, tokensSpent: Number(result.tokensSpent || 0) };
+        } catch (e: any) {
+          if (/недостаточно|insufficient/i.test(e?.message || '')) {
+            const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
+            return {
+              ok: false, error: 'insufficient_tokens',
+              balance: Number(bal.rows[0]?.tokens || 0),
+              required: quality === 'hd' ? 10000 : 5000,
+            };
+          }
+          return { ok: false, error: e?.message || 'image compose failed' };
+        }
+      }
+
+      if (name === 'upscale_image') {
+        const sourceImageUrl = String(input?.sourceImageUrl ?? '').trim();
+        if (!sourceImageUrl) return { ok: false, error: 'sourceImageUrl required' };
+
+        try {
+          const result = await this.misc.upscaleImage(userId, { sourceImageUrl });
+          const imageUrl = result?.images?.[0]?.url;
+          if (!imageUrl) return { ok: false, error: 'upscale failed' };
+          return { ok: true, kind: 'image', imageUrl, tokensSpent: Number(result.tokensSpent || 0) };
+        } catch (e: any) {
+          if (/недостаточно|insufficient/i.test(e?.message || '')) {
+            const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
+            return { ok: false, error: 'insufficient_tokens', balance: Number(bal.rows[0]?.tokens || 0), required: 10000 };
+          }
+          return { ok: false, error: e?.message || 'upscale failed' };
+        }
       }
 
       if (name === 'generate_video') {

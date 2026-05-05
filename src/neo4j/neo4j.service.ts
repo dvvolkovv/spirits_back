@@ -115,30 +115,57 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     const session = this.getSession();
     if (!session) return null;
     try {
+      const richExpr = (rel: string, label: string) =>
+        `[(p)-[:${rel}]->(n:${label}) | {name: n.name, gloss: coalesce(n.gloss, ''), aliases: coalesce(n.aliases, [n.name]), support: coalesce(n.support, 1)}]`;
+
       const result = await session.run(
         `MATCH (p:Profile {phone: $phone})
          RETURN
            COALESCE(p.name, '') AS name,
            COALESCE(p.family_name, '') AS family_name,
-           [(p)-[:HAS_VALUE]->(n:Value) | n.name] AS values,
-           [(p)-[:HAS_BELIEF]->(n:Belief) | n.name] AS beliefs,
-           [(p)-[:HAS_DESIRE]->(n:Desire) | n.name] AS desires,
-           [(p)-[:HAS_INTENT]->(n:Intent) | n.name] AS intents,
-           [(p)-[:HAS_INTEREST]->(n:Interest) | n.name] AS interests,
-           [(p)-[:HAS_SKILL]->(n:Skill) | n.name] AS skills`,
+           ${richExpr('HAS_VALUE', 'Value')} AS valuesRich,
+           ${richExpr('HAS_BELIEF', 'Belief')} AS beliefsRich,
+           ${richExpr('HAS_DESIRE', 'Desire')} AS desiresRich,
+           ${richExpr('HAS_INTENT', 'Intent')} AS intentsRich,
+           ${richExpr('HAS_INTEREST', 'Interest')} AS interestsRich,
+           ${richExpr('HAS_SKILL', 'Skill')} AS skillsRich`,
         { phone: userId },
       );
       if (!result.records.length) return null;
       const rec = result.records[0];
+      const toRich = (arr: any[]) =>
+        (arr || [])
+          .filter((x) => x?.name)
+          .map((x) => ({
+            name: x.name,
+            gloss: x.gloss || '',
+            aliases: Array.isArray(x.aliases) ? x.aliases : [x.name],
+            support: typeof x.support === 'number' ? x.support : (x.support?.toNumber?.() ?? 1),
+          }))
+          .sort((a, b) => b.support - a.support); // «жирные» группы выше
+      const vRich = toRich(rec.get('valuesRich'));
+      const bRich = toRich(rec.get('beliefsRich'));
+      const dRich = toRich(rec.get('desiresRich'));
+      const intRich = toRich(rec.get('intentsRich'));
+      const iRich = toRich(rec.get('interestsRich'));
+      const sRich = toRich(rec.get('skillsRich'));
       return {
         name: rec.get('name') || undefined,
         family_name: rec.get('family_name') || undefined,
-        values: rec.get('values').filter(Boolean),
-        beliefs: rec.get('beliefs').filter(Boolean),
-        desires: rec.get('desires').filter(Boolean),
-        intents: rec.get('intents').filter(Boolean),
-        interests: rec.get('interests').filter(Boolean),
-        skills: rec.get('skills').filter(Boolean),
+        // Плоские string-массивы для обратной совместимости со старым фронтом.
+        values: vRich.map((x) => x.name),
+        beliefs: bRich.map((x) => x.name),
+        desires: dRich.map((x) => x.name),
+        intents: intRich.map((x) => x.name),
+        interests: iRich.map((x) => x.name),
+        skills: sRich.map((x) => x.name),
+        // Rich-формат с gloss/aliases/support — для нового UI (tooltip/expandable card).
+        valuesRich: vRich,
+        beliefsRich: bRich,
+        desiresRich: dRich,
+        intentsRich: intRich,
+        interestsRich: iRich,
+        skillsRich: sRich,
       };
     } catch (e) {
       this.logger.error(`getProfileEntities error: ${e.message}`);
@@ -155,14 +182,26 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     const rel = `HAS_${type.toUpperCase()}`;
     try {
       for (const valueName of values) {
-        if (!valueName?.trim()) continue;
+        const name = valueName?.trim();
+        if (!name) continue;
+        const canonicalKey = name.toLowerCase();
         await session.run(
           `MERGE (p:Profile {phone: $phone})
-           MERGE (v:${type} {name: $name})
+           MERGE (v:${type} {canonical_key: $canonicalKey})
+             ON CREATE SET v.name = $name,
+                           v.aliases = [$name],
+                           v.gloss = '',
+                           v.evidence = [],
+                           v.support = 1
+             ON MATCH  SET v.support = coalesce(v.support, 1) + 1,
+                           v.aliases = CASE
+                             WHEN $name IN coalesce(v.aliases, []) THEN v.aliases
+                             ELSE coalesce(v.aliases, []) + [$name]
+                           END
            MERGE (p)-[r:${rel}]->(v)
-           ON CREATE SET r.created_at = datetime(), r.confidence = 5
-           ON MATCH SET r.updated_at = datetime()`,
-          { phone: userId, name: valueName },
+             ON CREATE SET r.created_at = datetime(), r.confidence = 5
+             ON MATCH  SET r.updated_at = datetime()`,
+          { phone: userId, name, canonicalKey },
         );
       }
     } catch (e) {
@@ -179,23 +218,35 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     const type = entityType.charAt(0).toUpperCase() + entityType.slice(1).toLowerCase();
     const rel = `HAS_${type.toUpperCase()}`;
     try {
-      // Delete relationships not in the new list
+      const keys = values.map((v) => v?.trim().toLowerCase()).filter(Boolean);
+      // Удаляем связь, только если её canonical_key не пришёл в новом списке.
+      // Сам узел не трогаем — другие профили могут быть с ним связаны.
       await session.run(
         `MATCH (p:Profile {phone: $phone})-[r:${rel}]->(n:${type})
-         WHERE NOT n.name IN $values
+         WHERE NOT coalesce(n.canonical_key, toLower(trim(n.name))) IN $keys
          DELETE r`,
-        { phone: userId, values },
+        { phone: userId, keys },
       );
-      // Create new relationships
-      for (const name of values) {
-        if (!name?.trim()) continue;
+      for (const raw of values) {
+        const name = raw?.trim();
+        if (!name) continue;
+        const canonicalKey = name.toLowerCase();
         await session.run(
           `MERGE (p:Profile {phone: $phone})
-           MERGE (v:${type} {name: $name})
+           MERGE (v:${type} {canonical_key: $canonicalKey})
+             ON CREATE SET v.name = $name,
+                           v.aliases = [$name],
+                           v.gloss = '',
+                           v.evidence = [],
+                           v.support = 1
+             ON MATCH  SET v.aliases = CASE
+                             WHEN $name IN coalesce(v.aliases, []) THEN v.aliases
+                             ELSE coalesce(v.aliases, []) + [$name]
+                           END
            MERGE (p)-[r:${rel}]->(v)
-           ON CREATE SET r.created_at = datetime(), r.confidence = 5
-           ON MATCH SET r.updated_at = datetime()`,
-          { phone: userId, name },
+             ON CREATE SET r.created_at = datetime(), r.confidence = 5
+             ON MATCH  SET r.updated_at = datetime()`,
+          { phone: userId, name, canonicalKey },
         );
       }
       this.logger.log(`replaceEntities: ${type} for ${userId} → ${values.length} items`);

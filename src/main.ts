@@ -6,10 +6,8 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bodyParser: false });
 
   const bodyParser = require('body-parser');
-  // Raw body for avatar uploads (image/*)
-  app.use(bodyParser.raw({ type: 'image/*', limit: '10mb' }));
-  // JSON for everything else
-  app.use(bodyParser.json({ limit: '50mb' }));
+  app.use(bodyParser.raw({ type: ['image/*'], limit: '10mb' }));
+  app.use(bodyParser.json({ limit: '50mb', type: ['application/json', 'text/*'] }));
   app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
   app.setGlobalPrefix('webhook');

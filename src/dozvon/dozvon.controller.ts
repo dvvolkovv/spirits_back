@@ -65,4 +65,11 @@ export class DozvonController {
   execute(@CurrentUser() user: any, @Param('id', ParseIntPipe) id: number) {
     return this.dozvon.executeCampaign(user.phone, id);
   }
+
+  // ─── PRICING ────────────────────────────────────────────────────
+
+  @Get('pricing')
+  pricing() {
+    return this.dozvon.getPricing();
+  }
 }

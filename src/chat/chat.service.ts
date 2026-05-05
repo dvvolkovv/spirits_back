@@ -6,7 +6,7 @@ import { ChatToolsService, CHAT_TOOLS } from './chat-tools';
 import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import { Response } from 'express';
-import { spawn } from 'child_process';
+// Agent server at r.linkeon.io (remote Claude Code)
 
 @Injectable()
 export class ChatService {
@@ -79,9 +79,14 @@ export class ChatService {
       }
     }
 
-    // Universal Agent — route to Claude Code for agent "Роман"
+    // Universal Agent — route to Claude Code for agent "Роман".
+    // Exception: если пользователь явно просит картинку/видео, пропускаем Романа по обычной
+    // Anthropic+CHAT_TOOLS ветке, чтобы результат попал в галереи /image-gen и /video и
+    // корректно списался по единой токенномике (Kling). Для остальных задач — воркер.
     if (agent.name === 'Роман') {
-      return this.streamUniversalAgent(userId, message, String(assistantId), String(agent.id), recentHistory, res);
+      if (!this.detectMediaIntent(message)) {
+        return this.streamUniversalAgent(userId, message, String(assistantId), String(agent.id), recentHistory, profileText, res, agent.name, agent.description || '');
+      }
     }
 
     // Build system prompt with platform context + profile
@@ -102,14 +107,21 @@ export class ChatService {
 • Нетворкинг — поиск партнёров и проверка совместимости по ценностям
 • Генерация изображений — создание визуалов для бизнеса
 • Мой профиль — ценности, навыки, интересы, намерения пользователя
-При первом приветствии кратко представься и упомяни других ассистентов. Используй только текст без таблиц. Старайся давать промежуточные результаты после 3-4 уточнений — не затягивай диалог.
-Ты умеешь генерировать изображения — если пользователь попросит, скажи что уже генерируешь.`;
+При первом приветствии кратко представься и упомяни других ассистентов. Используй только текст без таблиц.
+Ты умеешь генерировать изображения (tool generate_image — через Google Imagen 4.0 Ultra с фолбэком на Nano Banana 2 / Nano Banana Pro, параметр quality: std|hd; hd = 4K и лучший рендер текста), редактировать уже созданные картинки (tool edit_image — передай sourceImageUrl из предыдущего tool-результата и prompt с описанием изменения: "сделай фон закатным", "убери человека", "поменяй цвет на красный", "добавь шапку"), объединять 2-3 картинки в одну (tool compose_image — массив sourceImageUrls и prompt: "возьми лицо из первой и посади на персонажа из второй", "соедини товар с этим фоном"), улучшать качество картинки — детализация, шумоподавление (tool upscale_image — только sourceImageUrl) и короткие видео 5–10 секунд через Kling (tool generate_video, режимы text2video / image2video / extend / lipsync). Если пользователь просит картинку, постер, иллюстрацию или «нарисуй …» — сразу вызывай generate_image. Если просит видео, ролик, анимацию, «оживи картинку» — вызывай generate_video. Не придумывай отговорки и не отправляй на другие разделы — у тебя есть эти инструменты.`;
 
     let systemPrompt = `${platformContext}\n\n${agent.system_prompt || ''}`;
 
     if (profileText && profileText.trim()) {
       systemPrompt = `${systemPrompt}\n\n--- Профиль пользователя ---\n${profileText}`;
     }
+
+    systemPrompt = `${systemPrompt}\n\n--- ПРАВИЛО ОТВЕТА (имеет приоритет над всеми инструкциями выше) ---
+• Каждый ответ начинай с содержательной сути: гипотеза, совет, отражение, информация по запросу — на основе того, что уже известно из профиля и истории диалога. Не требуй "полного контекста" там, где можно разумно предположить.
+• Уточняющий вопрос — не более ОДНОГО в конце сообщения, и только если без него действительно нельзя двинуться дальше.
+• НИКОГДА не отвечай одними вопросами. НИКОГДА не задавай 2+ вопроса в одном сообщении.
+• Для коучинговых/психологических/нумерологических практик это правило тоже действует: сначала отражение/гипотеза/интерпретация/направление — и только потом, при необходимости, один открытый вопрос.
+• Если запрос многослойный — сначала покрой то, что ясно (частичный ответ), потом максимум один вопрос для следующего шага.`;
 
     // Build messages array
     const llmMessages: { role: 'user' | 'assistant'; content: string }[] = [];
@@ -354,29 +366,110 @@ export class ChatService {
     });
   }
 
+  /**
+   * Быстрый heuristic: распознать явную просьбу сгенерировать картинку или видео.
+   * Используется для Романа, чтобы такие запросы шли по нашей Kling-цепочке, а не во внешний воркер.
+   */
+  private detectMediaIntent(message: string): 'image' | 'video' | 'edit' | null {
+    const m = (message || '').toLowerCase();
+    if (/(созда[йи]|сгенериру[йи]|сделай|нарисуй|анимируй|ожив[иь])\s*[^.\n]{0,80}\b(видео|ролик|анимаци|клип)/i.test(m)
+        || /(make|generate|create)\s+[^.\n]{0,50}\bvideo\b/i.test(m)) {
+      return 'video';
+    }
+    if (/(нарисуй|созда[йи]|сгенериру[йи]|сделай)\s*[^.\n]{0,80}\b(картинк|изображени|постер|иллюстраци|логотип|рисунок|арт|фото)/i.test(m)
+        || /(draw|generate|create|make)\s+[^.\n]{0,50}\b(image|picture|illustration|poster)\b/i.test(m)) {
+      return 'image';
+    }
+    // Edit intent — only trigger when referring to existing image (фон/цвет/надпись etc.)
+    if (/(поменяй|замени|измени|убери|добавь|отредактируй|перекрась|дорисуй)\s+[^.\n]{0,60}\b(фон|цвет|небо|текст|надпись|лицо|стиль|шапк|очки|одежд|персонаж|объект|картинк|изображен|фото)/i.test(m)
+        || /сделай\s+[^.\n]{0,40}\b(темнее|светлее|ярче|контрастн|чёрно-бел|чернобел|красн|син|зелён|жёлт|закатн|вечерн)/i.test(m)) {
+      return 'edit';
+    }
+    // Compose intent
+    if (/(объедини|соедини|совмести|скомбинируй|скомпону[йи])\s+[^.\n]{0,60}\b(картин|изображен|фото)/i.test(m)
+        || /(возьми|помести|вставь)\s+[^.\n]{0,80}\b(из\s+(перв|втор|трет)|с\s+(перв|втор)|фото|картин)/i.test(m)) {
+      return 'edit';
+    }
+    return null;
+  }
+
+  private extractYouTubeIds(text: string): string[] {
+    const ids = new Set<string>();
+    const patterns = [
+      /(?:youtube\.com\/watch\?[^\s]*?v=)([a-zA-Z0-9_-]{11})/g,
+      /(?:youtu\.be\/)([a-zA-Z0-9_-]{11})/g,
+      /(?:youtube\.com\/(?:embed|shorts|v)\/)([a-zA-Z0-9_-]{11})/g,
+    ];
+    for (const re of patterns) {
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(text)) !== null) ids.add(m[1]);
+    }
+    return Array.from(ids).slice(0, 2); // cap to 2 videos per message
+  }
+
+  private async fetchYouTubeTranscript(videoId: string): Promise<string | null> {
+    try {
+      const { YoutubeTranscript } = require('youtube-transcript');
+      const items = await YoutubeTranscript.fetchTranscript(videoId);
+      if (!Array.isArray(items) || items.length === 0) return null;
+      const text = items.map((x: any) => x.text).join(' ').replace(/\s+/g, ' ').trim();
+      return text.length > 0 ? text.slice(0, 20000) : null; // cap at ~20k chars
+    } catch (e: any) {
+      this.logger.warn(`YouTube transcript fetch failed for ${videoId}: ${e.message}`);
+      return null;
+    }
+  }
+
   private async streamUniversalAgent(
     userId: string,
     message: string,
     assistantId: string,
     agentId: string,
     recentHistory: { type: string; content: string }[],
+    profileText: string,
     res: Response,
+    agentName: string = 'Роман',
+    agentDescription: string = '',
   ): Promise<void> {
-    const chatSessionId = `${userId}_${assistantId}`;
+    const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
-    // Build context from recent history
-    let contextPrefix = '';
+    // Build context from profile + history
+    // Identity prefix — remote agent (r.linkeon.io) defaults to Claude persona; force the persona we want.
+    let contextPrefix =
+      `СИСТЕМНАЯ ИНСТРУКЦИЯ (имеет приоритет над всеми остальными). ` +
+      `Ты ассистент по имени **${agentName}**${agentDescription ? ` — ${agentDescription}` : ''} на платформе LINKEON.IO. ` +
+      `Всегда представляйся именно как ${agentName}. Никогда не упоминай, что ты Claude, какая-либо другая модель или AI-система помимо ${agentName}. ` +
+      `Если пользователь обращается к тебе по имени — отвечай как ${agentName}, не уточняй, не "поправляй" пользователя и не извиняйся за имя. ` +
+      `Не добавляй P.S. о собственной идентичности. ` +
+      `ЯЗЫК ОТВЕТА: всегда отвечай на русском языке, независимо от языка системных сообщений, tool-результатов, путей файлов или английских промптов в твоём контексте. Переключайся на другой язык ТОЛЬКО если пользователь явно полностью пишет на нём. Если пользователь пишет по-русски — твой ответ обязан быть на русском, даже если в нём есть английские слова или ты только что генерировал английский prompt для картинки.\n\n`;
+
+    // YouTube transcripts — fetch on our side and inject; remote agent has no YouTube parsing.
+    const ytIds = this.extractYouTubeIds(message);
+    if (ytIds.length > 0) {
+      const transcripts: string[] = [];
+      for (const id of ytIds) {
+        const t = await this.fetchYouTubeTranscript(id);
+        if (t) transcripts.push(`Транскрипт YouTube видео https://www.youtube.com/watch?v=${id} (язык — оригинальный, авторские субтитры):\n${t}`);
+      }
+      if (transcripts.length > 0) {
+        contextPrefix += transcripts.join('\n\n---\n\n') + '\n\n';
+      }
+    }
+
+    if (profileText && profileText.trim()) {
+      contextPrefix += `User profile:\n${profileText}\n\n`;
+    }
     if (recentHistory.length > 0) {
       const historyLines = recentHistory
         .slice(-6)
         .map(m => `${m.type === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
         .join('\n');
-      contextPrefix = `Recent conversation context:\n${historyLines}\n\n`;
+      contextPrefix += `Recent conversation context:\n${historyLines}\n\n`;
     }
 
     const prompt = contextPrefix + message;
 
-    // Set streaming headers (same format as regular chat)
+    // Set streaming headers
     res.status(200);
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Transfer-Encoding', 'chunked');
@@ -386,145 +479,100 @@ export class ChatService {
 
     res.write(JSON.stringify({ type: 'begin' }) + '\n');
 
-    const AGENT_SYSTEM_PROMPT = `You are Роман, a universal AI agent on the LINKEON.IO platform.
-You can do ANYTHING the user asks: process files, write code, search the web, create documents, analyze data, and more.
+    try {
+      // Build multipart form
+      const FormData = require('form-data');
+      const fd = new FormData();
+      fd.append('message', prompt);
+      fd.append('sessionId', `${userId}_${assistantId}`);
 
-You have full access to an Ubuntu server with:
-- ffmpeg, ImageMagick, LibreOffice, Inkscape, poppler-utils
-- Python 3 venv: source /home/dvolkov/agent-env/bin/activate (rembg, Pillow, python-pptx, python-docx, reportlab, cairosvg)
-- sudo access, can install anything
-
-FILE OUTPUT RULES (CRITICAL):
-- When creating files for the user to download, ALWAYS save them to: /home/dvolkov/spirits_back/public/agent-files/
-- The download URL is: /static/agent-files/FILENAME (relative path, no domain!)
-- Use unique filenames to avoid collisions (add timestamp or random suffix if needed)
-- Format download links as markdown: [Скачать filename](/static/agent-files/FILENAME)
-- NEVER use absolute URLs with domain names for file links — always use relative paths starting with /static/
-
-GENERAL RULES:
-1. Do whatever the user asks. Be resourceful.
-2. If a tool is missing — install it.
-3. Verify output files are valid.
-4. If something fails, try a different approach.
-5. Be concise but helpful. Respond in Russian by default, match the user's language.
-6. NEVER use telegram, ToolSearch, or any MCP/plugin tools.
-7. NEVER output markdown tables (|---|) — they render poorly in the chat UI. Use bullet lists or plain text instead.`;
-
-    const args = [
-      '-p', prompt,
-      '--output-format', 'stream-json',
-      '--verbose',
-      '--include-partial-messages',
-      '--max-turns', '100',
-      '--allowedTools', 'Bash(*),Read(*),Write(*),Edit(*),Glob(*),Grep(*),WebSearch(*),WebFetch(*)',
-      '--system-prompt', AGENT_SYSTEM_PROMPT,
-    ];
-
-    return new Promise<void>((resolve) => {
-      const child = spawn('claude', args, {
-        cwd: '/tmp',
-        env: {
-          ...process.env,
-          PATH: (process.env.PATH || '') + ':/home/dvolkov/agent-env/bin',
-        },
+      const agentRes = await axios.post(`${AGENT_URL}/chat`, fd, {
+        headers: fd.getHeaders(),
+        responseType: 'stream',
+        timeout: 600000, // 10 min
       });
 
-      let buf = '';
       const chunks: string[] = [];
       let inputTokens = 0;
       let outputTokens = 0;
 
-      child.stdout.on('data', (chunk) => {
-        buf += chunk.toString();
-        const parts = buf.split('\n');
-        buf = parts.pop() || '';
+      await new Promise<void>((resolve, reject) => {
+        let buffer = '';
+        agentRes.data.on('data', (chunk: Buffer) => {
+          buffer += chunk.toString();
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
 
-        for (const line of parts) {
-          if (!line.trim()) continue;
-          try {
-            const ev = JSON.parse(line);
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            try {
+              const ev = JSON.parse(line.slice(6));
 
-            if (ev.type === 'stream_event' && ev.event) {
-              const se = ev.event;
-              if (se.type === 'content_block_delta' && se.delta?.type === 'text_delta' && se.delta.text) {
-                chunks.push(se.delta.text);
-                res.write(JSON.stringify({ type: 'item', content: se.delta.text }) + '\n');
-              }
-            } else if (ev.type === 'assistant' && ev.message) {
-              for (const block of (ev.message.content || [])) {
-                if (block.type === 'text' && block.text && chunks.length === 0) {
-                  // Fallback: full text if no deltas were sent
-                  chunks.push(block.text);
-                  res.write(JSON.stringify({ type: 'item', content: block.text }) + '\n');
+              if (ev.type === 'delta' || ev.type === 'text') {
+                chunks.push(ev.text);
+                res.write(JSON.stringify({ type: 'item', content: ev.text }) + '\n');
+              } else if (ev.type === 'result' && ev.text) {
+                if (chunks.length === 0) {
+                  chunks.push(ev.text);
+                  res.write(JSON.stringify({ type: 'item', content: ev.text }) + '\n');
+                }
+              } else if (ev.type === 'done') {
+                // Collect output files info if any
+                if (ev.outputFiles && ev.outputFiles.length > 0) {
+                  const fileLinks = ev.outputFiles
+                    .map((f: any) => `[Скачать ${f.name}](${AGENT_URL}${f.url})`)
+                    .join('\n');
+                  if (fileLinks && !chunks.join('').includes(AGENT_URL)) {
+                    chunks.push('\n\n' + fileLinks);
+                    res.write(JSON.stringify({ type: 'item', content: '\n\n' + fileLinks }) + '\n');
+                  }
                 }
               }
-            } else if (ev.type === 'result') {
-              if (ev.usage) {
-                inputTokens = ev.usage.input_tokens || 0;
-                outputTokens = ev.usage.output_tokens || 0;
-              }
-              // If no chunks were sent, use result text
-              if (chunks.length === 0 && ev.result) {
-                chunks.push(ev.result);
-                res.write(JSON.stringify({ type: 'item', content: ev.result }) + '\n');
-              }
-            }
-          } catch {}
-        }
-      });
-
-      child.stderr.on('data', () => {});
-
-      child.on('close', () => {
-        // Process remaining buffer
-        if (buf.trim()) {
-          try {
-            const ev = JSON.parse(buf);
-            if (ev.type === 'result') {
-              if (ev.usage) {
-                inputTokens = ev.usage.input_tokens || 0;
-                outputTokens = ev.usage.output_tokens || 0;
-              }
-              if (chunks.length === 0 && ev.result) {
-                chunks.push(ev.result);
-                res.write(JSON.stringify({ type: 'item', content: ev.result }) + '\n');
-              }
-            }
-          } catch {}
-        }
-
-        const fullText = chunks.join('');
-        const tokensUsed = inputTokens + outputTokens;
-
-        res.write(JSON.stringify({
-          type: 'end',
-          content: fullText,
-          usage: { input: inputTokens, output: outputTokens, total: tokensUsed },
-        }) + '\n');
-        res.end();
-
-        // Async: save history and charge tokens
-        setImmediate(async () => {
-          try {
-            await this.saveChatHistory(userId, assistantId, message, fullText, tokensUsed);
-            await this.addTokenTask(userId, inputTokens, outputTokens, agentId);
-          } catch (e) {
-            this.logger.error(`Universal agent post-chat error: ${e.message}`);
+            } catch {}
           }
         });
-
-        resolve();
+        agentRes.data.on('end', () => resolve());
+        agentRes.data.on('error', (err: Error) => reject(err));
       });
 
-      child.on('error', (err) => {
-        this.logger.error(`Universal agent spawn error: ${err.message}`);
-        const errText = 'Ошибка запуска агента. Попробуйте ещё раз.';
-        res.write(JSON.stringify({ type: 'item', content: errText }) + '\n');
-        res.write(JSON.stringify({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } }) + '\n');
-        res.end();
-        resolve();
+      const fullText = chunks.join('');
+      let tokensUsed = fullText.length; // approximate
+
+      // Detect image generation — charge extra 5000 tokens
+      const imageGenKeywords = /(?:создай|нарисуй|сгенерируй|generate|draw|create)\s+(?:мне\s+)?(?:картинк|изображен|рисунок|фото|image|picture|illustration|иконк|лого|баннер|постер)/i;
+      const wasImageGen = imageGenKeywords.test(message) && /\.(png|jpg|jpeg|webp|gif)/i.test(fullText);
+      if (wasImageGen) {
+        tokensUsed += 5000;
+        // Direct balance deduction for image generation
+        await this.pg.query('UPDATE ai_profiles_consolidated SET tokens = tokens - 5000, updated_at = now() WHERE user_id = $1', [userId]);
+      }
+
+      res.write(JSON.stringify({
+        type: 'end',
+        content: fullText,
+        usage: { input: 0, output: tokensUsed, total: tokensUsed },
+      }) + '\n');
+      res.end();
+
+      // Async: save history and charge tokens
+      setImmediate(async () => {
+        try {
+          await this.saveChatHistory(userId, assistantId, message, fullText, tokensUsed);
+          await this.addTokenTask(userId, 0, tokensUsed, agentId);
+          if (this.neo4j) {
+            await this.neo4j.consolidateFromChat(userId, message, fullText);
+          }
+        } catch (e) {
+          this.logger.error(`Universal agent post-chat error: ${e.message}`);
+        }
       });
-    });
+    } catch (err) {
+      this.logger.error(`Universal agent proxy error: ${err.message}`);
+      const errText = 'Ошибка запуска агента. Попробуйте ещё раз.';
+      res.write(JSON.stringify({ type: 'item', content: errText }) + '\n');
+      res.write(JSON.stringify({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } }) + '\n');
+      res.end();
+    }
   }
 
   private stripToolTags(text: string): string {
@@ -588,12 +636,39 @@ GENERAL RULES:
   }
 
   private async generateImageForChat(userId: string, prompt: string): Promise<{ url: string; text: string } | null> {
-    if (!this.kling) return null;
-    const result = await this.kling.generateImage(prompt);
-    if (!result) return null;
+    const apiKey = process.env.GOOGLE_AI_API_KEY;
+    if (!apiKey) return null;
 
-    await this.pg.query('UPDATE ai_profiles_consolidated SET tokens = tokens - 5000, updated_at = now() WHERE user_id = $1', [userId]);
-    return { url: result.url, text: '' };
+    try {
+      const model = 'imagen-4.0-generate-001';
+      const resp = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:predict?key=${apiKey}`,
+        { instances: [{ prompt }], parameters: { sampleCount: 1, aspectRatio: '1:1' } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 120000 },
+      );
+
+      const pred = resp.data?.predictions?.[0];
+      if (!pred?.bytesBase64Encoded) return null;
+
+      const fs = require('fs');
+      const path = require('path');
+      const publicDir = path.join(process.cwd(), 'public', 'generated');
+      if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
+
+      const ext = (pred.mimeType || '').includes('jpeg') ? 'jpg' : 'png';
+      const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+      fs.writeFileSync(path.join(publicDir, filename), Buffer.from(pred.bytesBase64Encoded, 'base64'));
+
+      await this.pg.query('UPDATE ai_profiles_consolidated SET tokens = tokens - 5000, updated_at = now() WHERE user_id = $1', [userId]);
+      return { url: `/static/generated/${filename}`, text: '' };
+    } catch (e) {
+      this.logger.error(`Image gen error: ${e.response?.data ? JSON.stringify(e.response.data).slice(0, 300) : e.message}`);
+      return null;
+    }
+  }
+
+  async saveChatHistoryPublic(userId: string, agentId: string, userMsg: string, assistantMsg: string, tokensUsed = 0) {
+    return this.saveChatHistory(userId, agentId, userMsg, assistantMsg, tokensUsed);
   }
 
   private async saveChatHistory(userId: string, agentId: string, userMsg: string, assistantMsg: string, tokensUsed = 0) {

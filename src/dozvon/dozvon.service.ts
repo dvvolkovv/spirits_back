@@ -104,9 +104,25 @@ export class DozvonService {
       [id],
     );
 
+    // Pre-check баланса: минимум нужно setup+1мин на каждый звонок, иначе блокируем.
+    const pricing = await this.getPricing();
+    const minCostPerCall = pricing.setup_fee + pricing.per_minute_fee;
+    const minTotal = minCostPerCall * plan.length;
+    const balance = await this.getBalance(userId);
+    if (balance < minTotal) {
+      await this.pg.query(
+        `UPDATE dozvon_campaigns SET status = $1, updated_at = now() WHERE id = $2`,
+        ['planning', id], // возвращаем в planning
+      );
+      throw new BadRequestException(
+        `Недостаточно токенов: нужно минимум ${minTotal.toLocaleString('ru')}, на счёте ${balance.toLocaleString('ru')}. Пополните баланс.`,
+      );
+    }
+
     // Системное сообщение в чат кампании — «обзвон начат».
     await this.appendChatMessage(id, 'ai',
-      `▶️ Запускаю обзвон по плану: ${plan.length} ${plan.length === 1 ? 'звонок' : 'звонков'}.`);
+      `▶️ Запускаю обзвон по плану: ${plan.length} ${plan.length === 1 ? 'звонок' : 'звонков'}. ` +
+      `Тариф: ${pricing.setup_fee} + ${pricing.per_minute_fee}/мин.`);
 
     // Insert pending calls from plan
     for (const c of plan) {
@@ -137,6 +153,35 @@ export class DozvonService {
   }
 
   // ─── CALL COMPLETE CALLBACK ───────────────────────────────────────
+
+  // ─── PRICING / TOKENS ────────────────────────────────────────────
+
+  async getPricing(): Promise<{ setup_fee: number; per_minute_fee: number }> {
+    const r = await this.pg.query(
+      `SELECT setup_fee, per_minute_fee FROM dozvon_pricing ORDER BY id LIMIT 1`,
+    );
+    const row = r.rows[0] || {};
+    return {
+      setup_fee: Number(row.setup_fee ?? 2000),
+      per_minute_fee: Number(row.per_minute_fee ?? 3000),
+    };
+  }
+
+  private priceForCall(
+    pricing: { setup_fee: number; per_minute_fee: number },
+    durationSec: number,
+  ): number {
+    const minutes = Math.max(1, Math.ceil((durationSec || 0) / 60));
+    return pricing.setup_fee + minutes * pricing.per_minute_fee;
+  }
+
+  private async getBalance(userId: string): Promise<number> {
+    const r = await this.pg.query(
+      `SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1`,
+      [userId],
+    );
+    return Number(r.rows[0]?.tokens ?? 0);
+  }
 
   /** Добавить сообщение в чат кампании (используется из handleCallComplete / executeCampaign). */
   private async appendChatMessage(
@@ -183,7 +228,35 @@ export class DozvonService {
     };
     const emoji = emojiByStatus[payload.status] || 'ℹ️';
     const title = contact_name || phone || 'Звонок';
+    // Post-debit: списываем токены по факту длительности. Только для состоявшихся звонков.
+    let tokensSpent = 0;
+    if (['done', 'busy', 'no_answer'].includes(payload.status)) {
+      // `busy`/`no_answer` — только setup (звонок был инициирован), без минут.
+      const pricing = await this.getPricing();
+      tokensSpent = payload.status === 'done'
+        ? this.priceForCall(pricing, payload.duration_sec || 0)
+        : pricing.setup_fee;
+
+      // Узнаём user_id кампании для списания.
+      const ownerRes = await this.pg.query(
+        `SELECT user_id FROM dozvon_campaigns WHERE id = $1`,
+        [payload.campaign_id],
+      );
+      const ownerPhone = ownerRes.rows[0]?.user_id;
+      if (ownerPhone && tokensSpent > 0) {
+        await this.pg.query(
+          `UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2`,
+          [tokensSpent, ownerPhone],
+        );
+        await this.pg.query(
+          `UPDATE dozvon_calls SET tokens_spent = $1 WHERE id = $2`,
+          [tokensSpent, payload.call_id],
+        );
+      }
+    }
+
     const lines = [`${emoji} ${title} — ${payload.status}${payload.duration_sec ? `, ${payload.duration_sec}с` : ''}`];
+    if (tokensSpent > 0) lines.push(`💰 Списано ${tokensSpent.toLocaleString('ru')} токенов`);
     if (payload.summary) lines.push('', `**Резюме:** ${payload.summary}`);
     if (payload.transcript) lines.push('', '**Диалог:**', payload.transcript);
     if (payload.recording_url) lines.push('', `🎧 [Запись](${payload.recording_url})`);
@@ -221,11 +294,11 @@ export class DozvonService {
     const agent_name = 'Иван';
     const planGoal = campaign.call_plan?.goal || campaign.task_text || '';
     const defaultPrompt = planGoal
-      ? `Тебя зовут ${agent_name}, ты — ассистент, совершающий телефонный звонок по поручению пользователя. ` +
+      ? `Ты — голосовой помощник ${agent_name}, совершающий телефонный звонок по поручению пользователя. ` +
         `Цель звонка: ${planGoal}. ` +
-        `Общайся вежливо и естественно, на русском. Представься именем "${agent_name}", коротко озвучь цель, ` +
-        `задай нужные вопросы, дождись ответов и попрощайся. Не говори что ты AI или робот, просто ассистент.`
-      : `Тебя зовут ${agent_name}, ты — ассистент. Представься именем "${agent_name}", озвучь цель звонка и попрощайся.`;
+        `Общайся вежливо и естественно, на русском. Представляйся фразой «Здравствуйте, это голосовой помощник ${agent_name}», коротко озвучь цель, ` +
+        `задай нужные вопросы, дождись ответов и попрощайся.`
+      : `Ты — голосовой помощник ${agent_name}. Представься фразой «Здравствуйте, это голосовой помощник ${agent_name}», озвучь цель звонка и попрощайся.`;
     const voice_id = 'default';
     const system_prompt = campaign.system_prompt || defaultPrompt;
 
@@ -247,11 +320,17 @@ export class DozvonService {
         await this.appendChatMessage(campaignId, 'ai',
           `📞 Звоню ${call.contact_name || call.phone}…`);
 
-        // Дополняем system_prompt конкретной подсказкой для текущего звонка.
-        const hint = (campaign.call_plan?.calls || []).find(
+        // Дополняем system_prompt конкретной подсказкой + QA для текущего звонка.
+        const planCall = (campaign.call_plan?.calls || []).find(
           (c: any) => c.phone === call.phone,
-        )?.script_hint;
-        const callPrompt = hint ? `${system_prompt}\n\nФокус этого звонка: ${hint}` : system_prompt;
+        );
+        const hint = planCall?.script_hint;
+        const qaList: Array<{ q: string; a: string }> = Array.isArray(planCall?.qa) ? planCall.qa : [];
+        const qaBlock = qaList.length
+          ? '\n\nЗаготовленные ответы на типичные встречные вопросы (отвечай примерно так, можно переформулировать):\n' +
+            qaList.map((qa, i) => `${i + 1}. Q: ${qa.q}\n   A: ${qa.a}`).join('\n')
+          : '';
+        const callPrompt = (hint ? `${system_prompt}\n\nФокус этого звонка: ${hint}` : system_prompt) + qaBlock;
 
         const agentToken = await this.sip.createAgentToken(roomName, `agent-${call.id}`);
 

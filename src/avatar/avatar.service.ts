@@ -45,17 +45,16 @@ export class AvatarService {
   }
 
   async uploadAvatar(userId: string, buffer: Buffer, mimetype: string): Promise<{ url: string }> {
-    if (!this.s3 || !process.env.AWS_S3_BUCKET) {
-      throw new Error('S3 not configured');
-    }
-    const key = `avatars/${userId}.jpg`;
-    await this.s3.send(new PutObjectCommand({
-      Bucket: process.env.AWS_S3_BUCKET,
-      Key: key,
-      Body: buffer,
-      ContentType: mimetype,
-    }));
-    const url = `https://${process.env.AWS_S3_BUCKET}.s3.${process.env.AWS_REGION || 'us-east-1'}.amazonaws.com/${key}`;
+    const path = require('path');
+    const fs = require('fs');
+
+    // Save locally
+    const dir = path.join(process.cwd(), 'public', 'avatars');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const filename = `${userId}.jpg`;
+    fs.writeFileSync(path.join(dir, filename), buffer);
+    const url = `/static/avatars/${filename}`;
+
     await this.pg.query(
       `UPDATE ai_profiles_consolidated
        SET profile_data = COALESCE(profile_data, '{}'::jsonb) || $1::jsonb,

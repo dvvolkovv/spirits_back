@@ -1,13 +1,40 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
+import { Neo4jService } from '../neo4j/neo4j.service';
 
 @Injectable()
 export class TokenAccountingService {
   private readonly logger = new Logger(TokenAccountingService.name);
   private isRunning = false;
 
-  constructor(private readonly pg: PgService) {}
+  constructor(
+    private readonly pg: PgService,
+    @Optional() private readonly neo4j: Neo4jService,
+  ) {}
+
+  // Clean up desires older than 30 days — runs daily at 3:00 AM
+  @Cron('0 3 * * *')
+  async cleanupOldDesires() {
+    if (!this.neo4j) return;
+    try {
+      const session = (this.neo4j as any).getSession();
+      if (!session) return;
+      const result = await session.run(
+        `MATCH (p:Profile)-[r:HAS_DESIRE]->(d:Desire)
+         WHERE r.created_at < datetime() - duration('P30D')
+         DELETE r
+         RETURN count(r) as deleted`,
+      );
+      const deleted = result.records[0]?.get('deleted')?.toNumber() || 0;
+      if (deleted > 0) {
+        this.logger.log(`Cleaned up ${deleted} desires older than 30 days`);
+      }
+      await session.close();
+    } catch (e) {
+      this.logger.error(`cleanupOldDesires error: ${e.message}`);
+    }
+  }
 
   @Cron('*/5 * * * * *') // every 5 seconds
   async processTokenTasks() {
