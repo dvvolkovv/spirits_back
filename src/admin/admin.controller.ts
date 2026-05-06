@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Query, Res, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Body, Param, Query, Res, UseGuards } from '@nestjs/common';
 import { Response } from 'express';
 import { AdminService } from './admin.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
@@ -99,6 +99,19 @@ export class AdminController {
       days: days ? parseInt(days, 10) || undefined : undefined,
     });
     return res.status(200).json(stats);
+  }
+
+  @Get('admin/users/:phone/activity')
+  @UseGuards(JwtGuard)
+  async userActivity(
+    @Param('phone') phone: string,
+    @Query('days') days: string | undefined,
+    @Res() res: Response,
+  ) {
+    const data = await this.adminService.getUserActivity(phone, {
+      days: days ? parseInt(days, 10) || undefined : undefined,
+    });
+    return res.status(200).json(data);
   }
 
   @Get('admin/users/active')

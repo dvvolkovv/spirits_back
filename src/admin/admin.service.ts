@@ -480,6 +480,313 @@ export class AdminService {
     };
   }
 
+  // --- Per-user activity drill-down ---
+
+  async getUserActivity(phone: string, opts: { days?: number } = {}) {
+    const days = Math.min(Math.max(opts.days ?? 30, 1), 365);
+
+    // 1) Base profile + totals from payments + last_active + referral leader.
+    const userRes = await this.pg.query(
+      `SELECT
+         a.user_id AS phone,
+         a.created_at AS registered_at,
+         COALESCE(a.tokens, 0)::bigint AS balance,
+         a.email,
+         a.isadmin,
+         a.preferred_agent,
+         a.profile_data,
+         pay.paid_count::int AS paid_count,
+         COALESCE(pay.paid_rub, 0)::numeric AS paid_rub,
+         rl.name AS referral_leader_name,
+         spent_total.spent::bigint AS spent_total,
+         spent_period.spent::bigint AS spent_period,
+         spent_period.last_active AS last_active
+       FROM ai_profiles_consolidated a
+       LEFT JOIN (
+         SELECT user_id, ABS(SUM(amount)) AS spent
+         FROM token_transactions
+         WHERE transaction_type = 'consumed' AND user_id = $1
+         GROUP BY user_id
+       ) spent_total ON spent_total.user_id = a.user_id
+       LEFT JOIN (
+         SELECT user_id, ABS(SUM(amount)) AS spent, MAX(created_at) AS last_active
+         FROM token_transactions
+         WHERE transaction_type = 'consumed' AND user_id = $1
+           AND created_at >= now() - make_interval(days => $2)
+         GROUP BY user_id
+       ) spent_period ON spent_period.user_id = a.user_id
+       LEFT JOIN (
+         SELECT user_id, COUNT(*) AS paid_count, SUM(amount) AS paid_rub
+         FROM payments
+         WHERE status = 'succeeded' AND user_id = $1
+         GROUP BY user_id
+       ) pay ON pay.user_id = a.user_id
+       LEFT JOIN referral_referees rr ON rr.referee_phone = a.user_id
+       LEFT JOIN referral_leaders rl ON rl.id = rr.leader_id
+       WHERE a.user_id = $1
+       LIMIT 1`,
+      [phone, days],
+    );
+
+    if (userRes.rows.length === 0) {
+      return {
+        user: null,
+        totals: {
+          spent_total: 0, spent_period: 0,
+          queries_total: 0, queries_period: 0,
+          images_count: 0, videos_count: 0, calls_count: 0,
+        },
+        series: [],
+        byAssistant: [],
+        transactions: [],
+        recentMessages: [],
+      };
+    }
+
+    const u = userRes.rows[0];
+
+    // 2) Queries totals (token_consumption_tasks for completed agent runs;
+    //    falls back to message count from custom_chat_history).
+    let queriesTotal = 0;
+    let queriesPeriod = 0;
+    try {
+      const r = await this.pg.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE status = 'completed' AND agent_id IS NOT NULL)::int AS total,
+           COUNT(*) FILTER (
+             WHERE status = 'completed' AND agent_id IS NOT NULL
+               AND created_at >= now() - make_interval(days => $2)
+           )::int AS period
+         FROM token_consumption_tasks
+         WHERE user_id = $1`,
+        [phone, days],
+      );
+      queriesTotal = Number(r.rows[0]?.total) || 0;
+      queriesPeriod = Number(r.rows[0]?.period) || 0;
+    } catch { /* table missing → 0 */ }
+
+    // 3) Images / videos / calls counts (graceful 0 if tables absent).
+    let imagesCount = 0;
+    try {
+      const r = await this.pg.query(
+        `SELECT COUNT(*)::int AS c FROM generated_images WHERE user_id = $1`, [phone]);
+      imagesCount = Number(r.rows[0]?.c) || 0;
+    } catch {}
+
+    let videosCount = 0;
+    try {
+      const r = await this.pg.query(
+        `SELECT COUNT(*)::int AS c FROM video_jobs WHERE user_id = $1`, [phone]);
+      videosCount = Number(r.rows[0]?.c) || 0;
+    } catch {}
+
+    let callsCount = 0;
+    try {
+      const r = await this.pg.query(
+        `SELECT COUNT(*)::int AS c
+         FROM dozvon_calls dc
+         JOIN dozvon_campaigns dcm ON dcm.id = dc.campaign_id
+         WHERE dcm.user_id = $1`, [phone]);
+      callsCount = Number(r.rows[0]?.c) || 0;
+    } catch {}
+
+    // 4) Daily series (tokens spent + queries via custom_chat_history human messages).
+    let series: Array<{ day: string; tokens_spent: number; queries: number }> = [];
+    try {
+      const r = await this.pg.query(
+        `WITH d AS (
+           SELECT generate_series(
+             date_trunc('day', now() - make_interval(days => $2 - 1)),
+             date_trunc('day', now()),
+             interval '1 day'
+           )::date AS day
+         )
+         SELECT
+           to_char(d.day, 'YYYY-MM-DD') AS day,
+           COALESCE(spent.tokens, 0)::bigint AS tokens_spent,
+           COALESCE(qs.queries, 0)::int AS queries
+         FROM d
+         LEFT JOIN (
+           SELECT date_trunc('day', created_at)::date AS day,
+                  ABS(SUM(amount)) AS tokens
+           FROM token_transactions
+           WHERE user_id = $1 AND transaction_type='consumed'
+             AND created_at >= now() - make_interval(days => $2)
+           GROUP BY 1
+         ) spent ON spent.day = d.day
+         LEFT JOIN (
+           SELECT date_trunc('day', created_at)::date AS day, COUNT(*) AS queries
+           FROM custom_chat_history
+           WHERE session_id LIKE $1 || '\\_%' ESCAPE '\\'
+             AND sender_type = 'human'
+             AND created_at >= now() - make_interval(days => $2)
+           GROUP BY 1
+         ) qs ON qs.day = d.day
+         ORDER BY d.day ASC`,
+        [phone, days],
+      );
+      series = r.rows.map(row => ({
+        day: row.day,
+        tokens_spent: Number(row.tokens_spent) || 0,
+        queries: Number(row.queries) || 0,
+      }));
+    } catch {
+      series = [];
+    }
+
+    // 5) By-assistant: queries (token_consumption_tasks completed) + tokens (sum of tokens_to_consume).
+    //    LEFT JOIN agents to get name; HAVING queries > 0 keeps it tight.
+    let byAssistant: Array<{ id: number; name: string; queries: number; tokens: number; last_used: string | null }> = [];
+    try {
+      const r = await this.pg.query(
+        `SELECT
+           a.id,
+           COALESCE(a.name, 'Agent ' || a.id::text) AS name,
+           COUNT(t.*)::int AS queries,
+           COALESCE(SUM(t.tokens_to_consume), 0)::bigint AS tokens,
+           MAX(t.created_at) AS last_used
+         FROM token_consumption_tasks t
+         JOIN agents a ON a.id = t.agent_id
+         WHERE t.user_id = $1
+           AND t.status = 'completed'
+           AND t.agent_id IS NOT NULL
+         GROUP BY a.id, a.name
+         ORDER BY queries DESC, tokens DESC, a.id ASC
+         LIMIT 100`,
+        [phone],
+      );
+      byAssistant = r.rows.map(row => ({
+        id: Number(row.id),
+        name: row.name,
+        queries: Number(row.queries) || 0,
+        tokens: Number(row.tokens) || 0,
+        last_used: row.last_used,
+      }));
+    } catch {
+      byAssistant = [];
+    }
+
+    // 6) Recent transactions (last 20).
+    let transactions: Array<{ id: string; created_at: string; amount: number; transaction_type: string; reason: string }> = [];
+    try {
+      const r = await this.pg.query(
+        `SELECT id, created_at, amount, transaction_type::text AS transaction_type,
+                COALESCE(description, '') AS reason
+         FROM token_transactions
+         WHERE user_id = $1
+         ORDER BY created_at DESC
+         LIMIT 20`,
+        [phone],
+      );
+      transactions = r.rows.map(row => ({
+        id: row.id,
+        created_at: row.created_at,
+        amount: Number(row.amount) || 0,
+        transaction_type: row.transaction_type,
+        reason: row.reason || '',
+      }));
+    } catch {
+      transactions = [];
+    }
+
+    // 7) Recent messages (last 10 from custom_chat_history; agent name via JOIN).
+    let recentMessages: Array<{
+      id: string; created_at: string; agent_id: number | null;
+      agent_name: string | null; role: string; preview: string;
+    }> = [];
+    try {
+      const r = await this.pg.query(
+        `SELECT
+           c.id::text AS id,
+           c.created_at,
+           c.agent AS agent_id,
+           a.name AS agent_name,
+           c.sender_type AS role,
+           SUBSTRING(c.content, 1, 80) AS preview
+         FROM custom_chat_history c
+         LEFT JOIN agents a ON a.id = c.agent
+         WHERE c.session_id LIKE $1 || '\\_%' ESCAPE '\\'
+         ORDER BY c.created_at DESC
+         LIMIT 10`,
+        [phone],
+      );
+      recentMessages = r.rows.map(row => ({
+        id: row.id,
+        created_at: row.created_at,
+        agent_id: row.agent_id !== null ? Number(row.agent_id) : null,
+        agent_name: row.agent_name || null,
+        role: row.role,
+        preview: row.preview || '',
+      }));
+    } catch {
+      recentMessages = [];
+    }
+
+    // 8) Recent payments (last 20).
+    let payments: Array<{
+      id: string;
+      payment_id: string;
+      package_id: string | null;
+      amount_rub: number;
+      tokens: number;
+      status: string;
+      created_at: string;
+      completed_at: string | null;
+    }> = [];
+    try {
+      const r = await this.pg.query(
+        `SELECT id, payment_id, package_id, amount, tokens, status::text AS status,
+                created_at, completed_at
+         FROM payments
+         WHERE user_id = $1
+         ORDER BY created_at DESC
+         LIMIT 20`,
+        [phone],
+      );
+      payments = r.rows.map(row => ({
+        id: row.id,
+        payment_id: row.payment_id,
+        package_id: row.package_id || null,
+        amount_rub: Number(row.amount) || 0,
+        tokens: Number(row.tokens) || 0,
+        status: row.status,
+        created_at: row.created_at,
+        completed_at: row.completed_at,
+      }));
+    } catch {
+      payments = [];
+    }
+
+    return {
+      user: {
+        phone: u.phone,
+        registered_at: u.registered_at,
+        balance: Number(u.balance) || 0,
+        email: u.email || null,
+        isadmin: !!u.isadmin,
+        preferred_agent: u.preferred_agent || null,
+        paid_count: Number(u.paid_count) || 0,
+        paid_rub: Number(u.paid_rub) || 0,
+        referral_leader_name: u.referral_leader_name || null,
+        last_active: u.last_active || null,
+      },
+      totals: {
+        spent_total: Number(u.spent_total) || 0,
+        spent_period: Number(u.spent_period) || 0,
+        queries_total: queriesTotal,
+        queries_period: queriesPeriod,
+        images_count: imagesCount,
+        videos_count: videosCount,
+        calls_count: callsCount,
+      },
+      series,
+      byAssistant,
+      transactions,
+      recentMessages,
+      payments,
+    };
+  }
+
   async getPaymentsStats(opts: { days?: number } = {}) {
     const days = Math.min(Math.max(opts.days ?? 30, 1), 365);
 
