@@ -479,6 +479,20 @@ export class ChatService {
 
     res.write(JSON.stringify({ type: 'begin' }) + '\n');
 
+    // Heartbeat: send a no-op ping every 25s while r.linkeon.io is silent (long tool-runs)
+    // to prevent nginx idle-timeout (proxy_read_timeout) from killing the connection.
+    let lastDataAt = Date.now();
+    const heartbeat = setInterval(() => {
+      if (Date.now() - lastDataAt > 20000) {
+        try {
+          // Frontend ChatInterface ignores unknown types — safely no-op on client.
+          res.write(JSON.stringify({ type: 'ping' }) + '\n');
+        } catch {
+          // res closed — nothing to do
+        }
+      }
+    }, 25000);
+
     try {
       // Build multipart form
       const FormData = require('form-data');
@@ -499,6 +513,7 @@ export class ChatService {
       await new Promise<void>((resolve, reject) => {
         let buffer = '';
         agentRes.data.on('data', (chunk: Buffer) => {
+          lastDataAt = Date.now();
           buffer += chunk.toString();
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
@@ -572,6 +587,8 @@ export class ChatService {
       res.write(JSON.stringify({ type: 'item', content: errText }) + '\n');
       res.write(JSON.stringify({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } }) + '\n');
       res.end();
+    } finally {
+      clearInterval(heartbeat);
     }
   }
 
