@@ -19,6 +19,7 @@ import { DozvonModule } from './dozvon/dozvon.module';
 import { PeerModule } from './peer/peer.module';
 import { SupportModule } from './support/support.module';
 import { ContactsModule } from './contacts/contacts.module';
+import { McpModule } from './mcp/mcp.module';
 
 @Module({
   imports: [
@@ -42,6 +43,7 @@ import { ContactsModule } from './contacts/contacts.module';
     PeerModule,
     SupportModule,
     ContactsModule,
+    McpModule,
   ],
 })
 export class AppModule {}

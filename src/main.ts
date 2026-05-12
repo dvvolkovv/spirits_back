@@ -1,6 +1,6 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
-import { ValidationPipe } from '@nestjs/common';
+import { RequestMethod, ValidationPipe } from '@nestjs/common';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bodyParser: false });
@@ -10,7 +10,11 @@ async function bootstrap() {
   app.use(bodyParser.json({ limit: '50mb', type: ['application/json', 'text/*'] }));
   app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
-  app.setGlobalPrefix('webhook');
+  // /webhook is the global prefix for backwards-compat with n8n routes,
+  // but /mcp is mounted at the root for the MCP bridge to file-agent.
+  app.setGlobalPrefix('webhook', {
+    exclude: [{ path: 'mcp', method: RequestMethod.ALL }],
+  });
 
   app.enableCors({
     origin: '*',

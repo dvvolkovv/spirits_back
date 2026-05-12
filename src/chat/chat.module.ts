@@ -10,5 +10,6 @@ import { VideoModule } from '../video/video.module';
   imports: [MiscModule, CommonModule, VideoModule],
   controllers: [ChatController],
   providers: [ChatService, ChatToolsService],
+  exports: [ChatToolsService],
 })
 export class ChatModule {}
