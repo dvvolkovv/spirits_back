@@ -552,6 +552,12 @@ export class ChatService {
         agentRes.data.on('error', (err: Error) => reject(err));
       });
 
+      // Strip any [VIDEO_JOB:<uuid>] markers Roman may have hallucinated.
+      // We re-inject only verified jobs from DB query below.
+      for (let i = 0; i < chunks.length; i++) {
+        chunks[i] = chunks[i].replace(/\s*\[VIDEO_JOB:[0-9a-f-]{36}\]\s*/gi, '');
+      }
+
       // Detect video jobs created during this stream by querying recent jobs.
       // Roman's MCP-bridge tool calls don't surface structural tool_result events,
       // so we tag the stream with [VIDEO_JOB:<uuid>] markers for the frontend to
