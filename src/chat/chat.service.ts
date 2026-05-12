@@ -493,6 +493,8 @@ export class ChatService {
       }
     }, 25000);
 
+    const streamStartTime = Date.now();
+
     try {
       // Build multipart form
       const FormData = require('form-data');
@@ -549,6 +551,28 @@ export class ChatService {
         agentRes.data.on('end', () => resolve());
         agentRes.data.on('error', (err: Error) => reject(err));
       });
+
+      // Detect video jobs created during this stream by querying recent jobs.
+      // Roman's MCP-bridge tool calls don't surface structural tool_result events,
+      // so we tag the stream with [VIDEO_JOB:<uuid>] markers for the frontend to
+      // attach inline players. Border = streamStartTime, scoped to this user.
+      try {
+        const startTimeIso = new Date(streamStartTime).toISOString();
+        const jobsRes = await this.pg.query(
+          `SELECT id FROM video_jobs
+           WHERE user_id = $1 AND created_at >= $2::timestamptz
+           ORDER BY created_at ASC`,
+          [userId, startTimeIso],
+        );
+        if (jobsRes.rows.length > 0) {
+          const markers = jobsRes.rows.map((r: any) => `[VIDEO_JOB:${r.id}]`).join('\n');
+          const tail = '\n\n' + markers;
+          chunks.push(tail);
+          res.write(JSON.stringify({ type: 'item', content: tail }) + '\n');
+        }
+      } catch (e: any) {
+        this.logger.warn(`video marker injection failed: ${e.message}`);
+      }
 
       const fullText = chunks.join('');
       let tokensUsed = fullText.length; // approximate

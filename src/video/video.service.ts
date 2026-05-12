@@ -107,6 +107,17 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     // --- cost ---
     const cost = computeTokenCost(mode, model, quality, duration);
 
+    // --- normalize image URL to absolute (Kling rejects relative paths) ---
+    let imgUrlAbsolute: string | null = null;
+    if (mode === 'image2video' && dto.sourceImageUrl) {
+      let imgUrl = dto.sourceImageUrl;
+      if (imgUrl.startsWith('/')) {
+        const base = (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '');
+        imgUrl = base + imgUrl;
+      }
+      imgUrlAbsolute = imgUrl;
+    }
+
     // --- transactional deduction + insert ---
     const client = await this.pg.getClient();
     let jobId: string;
@@ -137,7 +148,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         [
           userId, mode, model, quality, duration,
           dto.prompt ?? null, dto.negativePrompt ?? null, dto.cfgScale ?? null,
-          dto.sourceImageUrl ?? null, dto.sourceVideoId ?? null,
+          imgUrlAbsolute ?? dto.sourceImageUrl ?? null, dto.sourceVideoId ?? null,
           dto.cameraType ?? null,
           dto.cameraConfig ? JSON.stringify(dto.cameraConfig) : null,
           dto.audioUrl ?? null,
@@ -168,7 +179,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         }));
       } else if (mode === 'image2video') {
         ({ taskId } = await this.kling.createImage2VideoTask({
-          model, imageUrl: dto.sourceImageUrl!, prompt: dto.prompt,
+          model, imageUrl: imgUrlAbsolute!, prompt: dto.prompt,
           negativePrompt: dto.negativePrompt, cfgScale: dto.cfgScale,
           mode: quality, duration, cameraControl,
         }));
