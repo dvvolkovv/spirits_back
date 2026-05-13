@@ -503,6 +503,7 @@ export class ChatService {
     }, 25000);
 
     const streamStartTime = Date.now();
+    const chunks: string[] = []; // hoisted so catch block can access partial response
 
     try {
       // Build multipart form
@@ -516,8 +517,6 @@ export class ChatService {
         responseType: 'stream',
         timeout: 600000, // 10 min
       });
-
-      const chunks: string[] = [];
       let inputTokens = 0;
       let outputTokens = 0;
 
@@ -635,10 +634,24 @@ export class ChatService {
       });
     } catch (err) {
       this.logger.error(`Universal agent proxy error: ${err.message}`);
-      const errText = 'Ошибка запуска агента. Попробуйте ещё раз.';
-      res.write(JSON.stringify({ type: 'item', content: errText }) + '\n');
-      res.write(JSON.stringify({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } }) + '\n');
-      res.end();
+      // Defensive: preserve user message + any partial response so user sees
+      // it on history reload even when frontend disconnected / aborted.
+      const partial = chunks.join('').trim();
+      const fallbackAi = partial || '[ответ прерван — попробуйте ещё раз]';
+      setImmediate(async () => {
+        try {
+          await this.saveChatHistory(userId, assistantId, message, fallbackAi, partial.length);
+        } catch (e: any) {
+          this.logger.warn(`partial saveChatHistory failed: ${e.message}`);
+        }
+      });
+      // Try to write error to response; ignore if already closed.
+      try {
+        const errText = 'Ошибка запуска агента. Попробуйте ещё раз.';
+        res.write(JSON.stringify({ type: 'item', content: errText }) + '\n');
+        res.write(JSON.stringify({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } }) + '\n');
+        res.end();
+      } catch {}
     } finally {
       clearInterval(heartbeat);
     }
