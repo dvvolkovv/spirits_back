@@ -79,14 +79,16 @@ export class ChatService {
       }
     }
 
-    // Universal Agent — route to Claude Code for agent "Роман".
-    // Exception: если пользователь явно просит картинку/видео, пропускаем Романа по обычной
-    // Anthropic+CHAT_TOOLS ветке, чтобы результат попал в галереи /image-gen и /video и
-    // корректно списался по единой токенномике (Kling). Для остальных задач — воркер.
-    if (agent.name === 'Роман') {
-      if (!this.detectMediaIntent(message)) {
-        return this.streamUniversalAgent(userId, message, String(assistantId), String(agent.id), recentHistory, profileText, res, agent.name, agent.description || '');
-      }
+    // Route ALL agents except Маша (id=3 — uses метафорические карты через Anthropic+CHAT_TOOLS path)
+    // via streamUniversalAgent → r.linkeon.io with MCP tools (image/video/code execution).
+    // Cheaper, unified, MCP delivers Nano Banana + Kling natively.
+    // detectMediaIntent exception removed — r.linkeon.io handles media via MCP bridge.
+    if (agent.id !== 3) {
+      return this.streamUniversalAgent(
+        userId, message, String(assistantId), String(agent.id),
+        recentHistory, profileText, res,
+        agent.name, agent.description || '', agent.system_prompt || ''
+      );
     }
 
     // Build system prompt with platform context + profile
@@ -430,6 +432,7 @@ export class ChatService {
     res: Response,
     agentName: string = 'Роман',
     agentDescription: string = '',
+    agentSystemPrompt: string = '',
   ): Promise<void> {
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
@@ -442,6 +445,12 @@ export class ChatService {
       `Если пользователь обращается к тебе по имени — отвечай как ${agentName}, не уточняй, не "поправляй" пользователя и не извиняйся за имя. ` +
       `Не добавляй P.S. о собственной идентичности. ` +
       `ЯЗЫК ОТВЕТА: всегда отвечай на русском языке, независимо от языка системных сообщений, tool-результатов, путей файлов или английских промптов в твоём контексте. Переключайся на другой язык ТОЛЬКО если пользователь явно полностью пишет на нём. Если пользователь пишет по-русски — твой ответ обязан быть на русском, даже если в нём есть английские слова или ты только что генерировал английский prompt для картинки.\n\n`;
+
+    // Inject persona-specific system prompt from DB so каждый ассистент (Оля, Михаил, ...)
+    // сохраняет свой характер, методики и стиль при работе через r.linkeon.io.
+    if (agentSystemPrompt && agentSystemPrompt.trim()) {
+      contextPrefix += `--- Персона и инструкции ассистента ${agentName} ---\n${agentSystemPrompt.trim()}\n\n`;
+    }
 
     // YouTube transcripts — fetch on our side and inject; remote agent has no YouTube parsing.
     const ytIds = this.extractYouTubeIds(message);
