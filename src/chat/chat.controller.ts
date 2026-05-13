@@ -56,6 +56,7 @@ export class ChatController {
       sessionId || `${userId}_${assistantId}`,
       profileText,
       res,
+      req,
     );
   }
 

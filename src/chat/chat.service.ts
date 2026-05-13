@@ -5,7 +5,7 @@ import { KlingService } from '../misc/kling.service';
 import { ChatToolsService, CHAT_TOOLS } from './chat-tools';
 import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
-import { Response } from 'express';
+import { Request, Response } from 'express';
 // Agent server at r.linkeon.io (remote Claude Code)
 
 @Injectable()
@@ -33,6 +33,7 @@ export class ChatService {
     sessionId: string,
     profileText: string,
     res: Response,
+    req?: Request,
   ): Promise<void> {
     // Get agent
     const isNumeric = /^\d+$/.test(assistantId);
@@ -87,7 +88,8 @@ export class ChatService {
       return this.streamUniversalAgent(
         userId, message, String(assistantId), String(agent.id),
         recentHistory, profileText, res,
-        agent.name, agent.description || '', agent.system_prompt || ''
+        agent.name, agent.description || '', agent.system_prompt || '',
+        req,
       );
     }
 
@@ -433,8 +435,28 @@ export class ChatService {
     agentName: string = 'Роман',
     agentDescription: string = '',
     agentSystemPrompt: string = '',
+    req?: Request,
   ): Promise<void> {
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
+
+    // Client disconnect tracking — backend keeps reading r.linkeon.io even if frontend bails.
+    let clientDisconnected = false;
+    if (req) {
+      req.on('close', () => {
+        clientDisconnected = true;
+        this.logger.log(`client disconnected for session ${userId}_${assistantId}, but continuing stream`);
+      });
+    }
+
+    // Safe res.write — drops writes after client disconnect, never throws upward.
+    const safeWrite = (payload: any) => {
+      if (clientDisconnected) return;
+      try {
+        res.write(JSON.stringify(payload) + '\n');
+      } catch {
+        clientDisconnected = true;
+      }
+    };
 
     // Build context from profile + history
     // Identity prefix — remote agent (r.linkeon.io) defaults to Claude persona; force the persona we want.
@@ -486,24 +508,41 @@ export class ChatService {
     res.setHeader('X-Accel-Buffering', 'no');
     res.setHeader('Access-Control-Allow-Origin', '*');
 
-    res.write(JSON.stringify({ type: 'begin' }) + '\n');
+    safeWrite({ type: 'begin' });
 
     // Heartbeat: send a no-op ping every 25s while r.linkeon.io is silent (long tool-runs)
     // to prevent nginx idle-timeout (proxy_read_timeout) from killing the connection.
     let lastDataAt = Date.now();
     const heartbeat = setInterval(() => {
       if (Date.now() - lastDataAt > 20000) {
-        try {
-          // Frontend ChatInterface ignores unknown types — safely no-op on client.
-          res.write(JSON.stringify({ type: 'ping' }) + '\n');
-        } catch {
-          // res closed — nothing to do
-        }
+        // Frontend ChatInterface ignores unknown types — safely no-op on client.
+        safeWrite({ type: 'ping' });
       }
     }, 25000);
 
     const streamStartTime = Date.now();
     const chunks: string[] = []; // hoisted so catch block can access partial response
+
+    // Single persistence point — dedupe via `saved` flag so success and error paths
+    // both call but only one actually writes.
+    let saved = false;
+    const persistResponse = async (final: boolean) => {
+      if (saved) return;
+      saved = true;
+      const fullText = chunks.join('').trim();
+      const aiText = fullText || (final ? '[ответ прерван — попробуйте ещё раз]' : '[ответ обрабатывается]');
+      try {
+        await this.saveChatHistory(userId, assistantId, message, aiText, fullText.length);
+        if (fullText.length > 0) {
+          await this.addTokenTask(userId, 0, fullText.length, agentId);
+          if (this.neo4j) {
+            try { await this.neo4j.consolidateFromChat(userId, message, fullText); } catch {}
+          }
+        }
+      } catch (e: any) {
+        this.logger.warn(`persistResponse failed: ${e.message}`);
+      }
+    };
 
     try {
       // Build multipart form
@@ -523,37 +562,41 @@ export class ChatService {
       await new Promise<void>((resolve, reject) => {
         let buffer = '';
         agentRes.data.on('data', (chunk: Buffer) => {
-          lastDataAt = Date.now();
-          buffer += chunk.toString();
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
+          try {
+            lastDataAt = Date.now();
+            buffer += chunk.toString();
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
 
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue;
-            try {
-              const ev = JSON.parse(line.slice(6));
+            for (const line of lines) {
+              if (!line.startsWith('data: ')) continue;
+              try {
+                const ev = JSON.parse(line.slice(6));
 
-              if (ev.type === 'delta' || ev.type === 'text') {
-                chunks.push(ev.text);
-                res.write(JSON.stringify({ type: 'item', content: ev.text }) + '\n');
-              } else if (ev.type === 'result' && ev.text) {
-                if (chunks.length === 0) {
+                if (ev.type === 'delta' || ev.type === 'text') {
                   chunks.push(ev.text);
-                  res.write(JSON.stringify({ type: 'item', content: ev.text }) + '\n');
-                }
-              } else if (ev.type === 'done') {
-                // Collect output files info if any
-                if (ev.outputFiles && ev.outputFiles.length > 0) {
-                  const fileLinks = ev.outputFiles
-                    .map((f: any) => `[Скачать ${f.name}](${AGENT_URL}${f.url})`)
-                    .join('\n');
-                  if (fileLinks && !chunks.join('').includes(AGENT_URL)) {
-                    chunks.push('\n\n' + fileLinks);
-                    res.write(JSON.stringify({ type: 'item', content: '\n\n' + fileLinks }) + '\n');
+                  safeWrite({ type: 'item', content: ev.text });
+                } else if (ev.type === 'result' && ev.text) {
+                  if (chunks.length === 0) {
+                    chunks.push(ev.text);
+                    safeWrite({ type: 'item', content: ev.text });
+                  }
+                } else if (ev.type === 'done') {
+                  // Collect output files info if any
+                  if (ev.outputFiles && ev.outputFiles.length > 0) {
+                    const fileLinks = ev.outputFiles
+                      .map((f: any) => `[Скачать ${f.name}](${AGENT_URL}${f.url})`)
+                      .join('\n');
+                    if (fileLinks && !chunks.join('').includes(AGENT_URL)) {
+                      chunks.push('\n\n' + fileLinks);
+                      safeWrite({ type: 'item', content: '\n\n' + fileLinks });
+                    }
                   }
                 }
-              }
-            } catch {}
+              } catch {}
+            }
+          } catch (e: any) {
+            this.logger.warn(`data handler error (non-fatal): ${e.message}`);
           }
         });
         agentRes.data.on('end', () => resolve());
@@ -582,7 +625,7 @@ export class ChatService {
           const markers = jobsRes.rows.map((r: any) => `[VIDEO_JOB:${r.id}]`).join('\n');
           const tail = '\n\n' + markers;
           chunks.push(tail);
-          res.write(JSON.stringify({ type: 'item', content: tail }) + '\n');
+          safeWrite({ type: 'item', content: tail });
         }
       } catch (e: any) {
         this.logger.warn(`video marker injection failed: ${e.message}`);
@@ -613,45 +656,28 @@ export class ChatService {
 
       const displayedTotal = tokensUsed + toolSpent;
 
-      res.write(JSON.stringify({
+      safeWrite({
         type: 'end',
         content: fullText,
         usage: { input: 0, output: displayedTotal, total: displayedTotal },
-      }) + '\n');
-      res.end();
-
-      // Async: save history and charge tokens
-      setImmediate(async () => {
-        try {
-          await this.saveChatHistory(userId, assistantId, message, fullText, tokensUsed);
-          await this.addTokenTask(userId, 0, tokensUsed, agentId);
-          if (this.neo4j) {
-            await this.neo4j.consolidateFromChat(userId, message, fullText);
-          }
-        } catch (e) {
-          this.logger.error(`Universal agent post-chat error: ${e.message}`);
-        }
       });
+      if (!clientDisconnected) {
+        try { res.end(); } catch {}
+      }
+
+      // Async persist — dedup via `saved` flag with the catch-path persist.
+      setImmediate(() => { void persistResponse(true); });
     } catch (err) {
       this.logger.error(`Universal agent proxy error: ${err.message}`);
-      // Defensive: preserve user message + any partial response so user sees
-      // it on history reload even when frontend disconnected / aborted.
-      const partial = chunks.join('').trim();
-      const fallbackAi = partial || '[ответ прерван — попробуйте ещё раз]';
-      setImmediate(async () => {
-        try {
-          await this.saveChatHistory(userId, assistantId, message, fallbackAi, partial.length);
-        } catch (e: any) {
-          this.logger.warn(`partial saveChatHistory failed: ${e.message}`);
-        }
-      });
-      // Try to write error to response; ignore if already closed.
-      try {
-        const errText = 'Ошибка запуска агента. Попробуйте ещё раз.';
-        res.write(JSON.stringify({ type: 'item', content: errText }) + '\n');
-        res.write(JSON.stringify({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } }) + '\n');
-        res.end();
-      } catch {}
+      // Try to write error to response; safeWrite is a no-op if client gone.
+      const errText = 'Ошибка запуска агента. Попробуйте ещё раз.';
+      safeWrite({ type: 'item', content: errText });
+      safeWrite({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } });
+      if (!clientDisconnected) {
+        try { res.end(); } catch {}
+      }
+      // Async persist — preserves user message + partial response.
+      setImmediate(() => { void persistResponse(true); });
     } finally {
       clearInterval(heartbeat);
     }
