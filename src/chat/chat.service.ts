@@ -581,21 +581,30 @@ export class ChatService {
       }
 
       const fullText = chunks.join('');
-      let tokensUsed = fullText.length; // approximate
+      const tokensUsed = fullText.length; // approximate text cost
 
-      // Detect image generation — charge extra 5000 tokens
-      const imageGenKeywords = /(?:создай|нарисуй|сгенерируй|generate|draw|create)\s+(?:мне\s+)?(?:картинк|изображен|рисунок|фото|image|picture|illustration|иконк|лого|баннер|постер)/i;
-      const wasImageGen = imageGenKeywords.test(message) && /\.(png|jpg|jpeg|webp|gif)/i.test(fullText);
-      if (wasImageGen) {
-        tokensUsed += 5000;
-        // Direct balance deduction for image generation
-        await this.pg.query('UPDATE ai_profiles_consolidated SET tokens = tokens - 5000, updated_at = now() WHERE user_id = $1', [userId]);
+      // Sum up tool-charged tokens (image, video, etc.) during this stream.
+      // MCP-tools (MiscService.generateImage, VideoService) charge directly into
+      // token_transactions; here we just aggregate them for the displayed usage.
+      let toolSpent = 0;
+      try {
+        const r = await this.pg.query(
+          `SELECT COALESCE(ABS(SUM(amount)), 0)::bigint AS spent
+           FROM token_transactions
+           WHERE user_id = $1 AND transaction_type = 'consumed' AND created_at >= $2::timestamptz`,
+          [userId, new Date(streamStartTime).toISOString()],
+        );
+        toolSpent = Number(r.rows[0]?.spent ?? 0);
+      } catch (e: any) {
+        this.logger.warn(`tool spend query failed: ${e.message}`);
       }
+
+      const displayedTotal = tokensUsed + toolSpent;
 
       res.write(JSON.stringify({
         type: 'end',
         content: fullText,
-        usage: { input: 0, output: tokensUsed, total: tokensUsed },
+        usage: { input: 0, output: displayedTotal, total: displayedTotal },
       }) + '\n');
       res.end();
 
