@@ -584,15 +584,19 @@ export class ChatService {
       const tokensUsed = fullText.length; // approximate text cost
 
       // Sum up tool-charged tokens (image, video, etc.) during this stream.
-      // MCP-tools (MiscService.generateImage, VideoService) charge directly into
-      // token_transactions; here we just aggregate them for the displayed usage.
+      // MCP-tools (MiscService.generateImage, VideoService.createJob) deduct
+      // directly from ai_profiles_consolidated and write rows into
+      // generated_images / video_jobs with tokens_spent. Aggregate from there.
       let toolSpent = 0;
       try {
+        const startIso = new Date(streamStartTime).toISOString();
         const r = await this.pg.query(
-          `SELECT COALESCE(ABS(SUM(amount)), 0)::bigint AS spent
-           FROM token_transactions
-           WHERE user_id = $1 AND transaction_type = 'consumed' AND created_at >= $2::timestamptz`,
-          [userId, new Date(streamStartTime).toISOString()],
+          `SELECT
+             COALESCE((SELECT SUM(tokens_spent) FROM generated_images WHERE user_id = $1 AND created_at >= $2::timestamptz), 0)::bigint
+             +
+             COALESCE((SELECT SUM(tokens_spent) FROM video_jobs WHERE user_id = $1 AND created_at >= $2::timestamptz), 0)::bigint
+             AS spent`,
+          [userId, startIso],
         );
         toolSpent = Number(r.rows[0]?.spent ?? 0);
       } catch (e: any) {
