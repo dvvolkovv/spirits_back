@@ -530,7 +530,18 @@ export class ChatService {
       if (saved) return;
       saved = true;
       const fullText = chunks.join('').trim();
-      const aiText = fullText || (final ? '[ответ прерван — попробуйте ещё раз]' : '[ответ обрабатывается]');
+      if (final && fullText.length === 0) {
+        this.logger.warn(
+          `empty stream for session ${userId}_${assistantId} — r.linkeon.io completed without delta events ` +
+          `(clientDisconnected=${clientDisconnected})`,
+        );
+      }
+      // If we have actual content — save it.
+      // If empty on final: don't pollute history with a stub AI row; save user message + a brief retry-hint.
+      // (Frontend will reload history; user can simply resend.)
+      const aiText = fullText
+        || (final ? '_Ответ не пришёл. Попробуйте отправить сообщение ещё раз._' : '');
+      if (!aiText) return; // skip empty intermediate persists
       try {
         await this.saveChatHistory(userId, assistantId, message, aiText, fullText.length);
         if (fullText.length > 0) {
