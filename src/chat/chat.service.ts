@@ -362,7 +362,7 @@ export class ChatService {
         await this.addTokenTask(userId, inputTokens, outputTokens, String(agent.id));
         // Extract profile entities from conversation
         if (this.neo4j) {
-          await this.neo4j.consolidateFromChat(userId, message, fullText);
+          await this.neo4j.consolidateFromChat(userId, String(assistantId), message, fullText);
         }
       } catch (e) {
         this.logger.error(`Post-chat save error: ${e.message}`);
@@ -547,7 +547,7 @@ export class ChatService {
         if (fullText.length > 0) {
           await this.addTokenTask(userId, 0, fullText.length, agentId);
           if (this.neo4j) {
-            try { await this.neo4j.consolidateFromChat(userId, message, fullText); } catch {}
+            try { await this.neo4j.consolidateFromChat(userId, assistantId, message, fullText); } catch {}
           }
         }
       } catch (e: any) {
@@ -788,6 +788,16 @@ export class ChatService {
 
   async saveChatHistoryPublic(userId: string, agentId: string, userMsg: string, assistantMsg: string, tokensUsed = 0) {
     return this.saveChatHistory(userId, agentId, userMsg, assistantMsg, tokensUsed);
+  }
+
+  /** Public wrapper для chat.controller — после upload-and-chat обогащаем профиль. */
+  async consolidateAfterChatPublic(userId: string, agentId: string, userMessage: string, assistantResponse: string): Promise<void> {
+    if (!this.neo4j) return;
+    try {
+      await this.neo4j.consolidateFromChat(userId, agentId, userMessage, assistantResponse);
+    } catch (e: any) {
+      this.logger.warn(`consolidateAfterChatPublic failed: ${e?.message}`);
+    }
   }
 
   private async saveChatHistory(userId: string, agentId: string, userMsg: string, assistantMsg: string, tokensUsed = 0) {

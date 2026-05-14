@@ -124,6 +124,15 @@ export class ChatController {
 
     res.write(JSON.stringify({ type: 'begin' }) + '\n');
 
+    const chunks: string[] = [];
+    let upstreamError: Error | null = null;
+
+    // Если клиент дисконнектился (переключил ассистента), всё равно дочитываем
+    // r.linkeon.io до конца и сохраняем ответ в БД — иначе результат теряется.
+    const safeWrite = (payload: any) => {
+      try { res.write(JSON.stringify(payload) + '\n'); } catch {}
+    };
+
     try {
       const agentRes = await axios.default.post(`${AGENT_URL}/chat`, fd, {
         headers: fd.getHeaders(),
@@ -131,9 +140,7 @@ export class ChatController {
         timeout: 600000,
       });
 
-      const chunks: string[] = [];
-
-      await new Promise<void>((resolve, reject) => {
+      await new Promise<void>((resolve) => {
         let buffer = '';
         agentRes.data.on('data', (chunk: Buffer) => {
           buffer += chunk.toString();
@@ -145,41 +152,66 @@ export class ChatController {
               const ev = JSON.parse(line.slice(6));
               if (ev.type === 'delta' || ev.type === 'text') {
                 chunks.push(ev.text);
-                res.write(JSON.stringify({ type: 'item', content: ev.text }) + '\n');
+                safeWrite({ type: 'item', content: ev.text });
               } else if (ev.type === 'result' && ev.text && chunks.length === 0) {
                 chunks.push(ev.text);
-                res.write(JSON.stringify({ type: 'item', content: ev.text }) + '\n');
+                safeWrite({ type: 'item', content: ev.text });
               } else if (ev.type === 'done' && ev.outputFiles?.length > 0) {
                 const fileLinks = ev.outputFiles
                   .map((f: any) => `[Скачать ${f.name}](${AGENT_URL}${f.url})`)
                   .join('\n');
                 if (fileLinks) {
                   chunks.push('\n\n' + fileLinks);
-                  res.write(JSON.stringify({ type: 'item', content: '\n\n' + fileLinks }) + '\n');
+                  safeWrite({ type: 'item', content: '\n\n' + fileLinks });
                 }
               }
             } catch {}
           }
         });
         agentRes.data.on('end', () => resolve());
-        agentRes.data.on('error', (err: Error) => reject(err));
+        agentRes.data.on('error', (err: Error) => { upstreamError = err; resolve(); });
       });
-
+    } catch (err: any) {
+      upstreamError = err;
+    } finally {
       const fullText = chunks.join('');
-      res.write(JSON.stringify({ type: 'end', content: fullText, usage: { input: 0, output: fullText.length, total: fullText.length } }) + '\n');
-      res.end();
 
-      // Save history
-      setImmediate(async () => {
-        try {
-          await this.chatService.saveChatHistoryPublic(userId, assistantId, `📎 ${file.originalname}\n${message}`, fullText, fullText.length);
-        } catch {}
-      });
-    } catch (err) {
-      const errText = 'Ошибка обработки файла. Попробуйте ещё раз.';
-      res.write(JSON.stringify({ type: 'item', content: errText }) + '\n');
-      res.write(JSON.stringify({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } }) + '\n');
-      res.end();
+      if (fullText.length > 0) {
+        safeWrite({ type: 'end', content: fullText, usage: { input: 0, output: fullText.length, total: fullText.length } });
+      } else if (upstreamError) {
+        const errText = 'Ошибка обработки файла. Попробуйте ещё раз.';
+        safeWrite({ type: 'item', content: errText });
+        safeWrite({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } });
+      }
+      try { res.end(); } catch {}
+
+      // Save history — гарантированно, даже если клиент дисконнектился
+      // на любом этапе. Запускаем после res.end чтобы не блокировать ответ.
+      if (fullText.length > 0) {
+        const userMsgForHistory = `📎 ${file.originalname}\n${message}`;
+        setImmediate(async () => {
+          try {
+            await this.chatService.saveChatHistoryPublic(
+              userId,
+              assistantId,
+              userMsgForHistory,
+              fullText,
+              fullText.length,
+            );
+            // Обогащаем профиль (Neo4j) на основе явных самораскрытий/согласий пользователя.
+            // Файловые загрузки раньше не вызывали consolidate — теперь учитываются.
+            await this.chatService.consolidateAfterChatPublic(
+              userId,
+              assistantId,
+              userMsgForHistory,
+              fullText,
+            );
+          } catch (e: any) {
+            // eslint-disable-next-line no-console
+            console.warn(`[upload-and-chat] persist failed for ${userId}_${assistantId}: ${e?.message}`);
+          }
+        });
+      }
     }
   }
 

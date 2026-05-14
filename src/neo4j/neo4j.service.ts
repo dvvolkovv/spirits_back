@@ -1,11 +1,14 @@
-import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, OnModuleDestroy, Optional } from '@nestjs/common';
 import neo4j, { Driver, Session } from 'neo4j-driver';
 import axios from 'axios';
+import { PgService } from '../common/services/pg.service';
 
 @Injectable()
 export class Neo4jService implements OnModuleInit, OnModuleDestroy {
   private driver: Driver | null = null;
   private readonly logger = new Logger(Neo4jService.name);
+
+  constructor(@Optional() private readonly pg?: PgService) {}
 
   onModuleInit() {
     const uri = process.env.NEO4J_URI;
@@ -257,28 +260,123 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  async consolidateFromChat(userId: string, userMessage: string, assistantResponse: string): Promise<void> {
+  /**
+   * Достаёт предыдущую (пред-предпоследнюю в текущем порядке) реплику ассистента
+   * из истории чата. Нужна для распознавания согласия пользователя: «да, точно»
+   * без контекста бессмысленно — нужно знать с чем согласился.
+   *
+   * На момент вызова в DB уже лежат свежие human + ai сообщения (current turn),
+   * поэтому используем OFFSET 1, чтобы пропустить только что сохранённый ai-row.
+   */
+  private async fetchPrevAssistantMessage(userId: string, agentId: string): Promise<string> {
+    if (!this.pg) return '';
+    try {
+      const sessionId = `${userId}_${agentId}`;
+      const res = await this.pg.query(
+        `SELECT content FROM custom_chat_history
+         WHERE session_id = $1 AND sender_type = 'ai'
+         ORDER BY created_at DESC LIMIT 1 OFFSET 1`,
+        [sessionId],
+      );
+      return res.rows[0]?.content || '';
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Толерантный парсер JSON: вырезает первый сбалансированный {...} блок
+   * из ответа модели. Терпит обёртку в ```json ```, ведущую/хвостовую прозу,
+   * лишние пробелы. Возвращает null если структуры найти не удалось.
+   */
+  private extractJsonObject(text: string): any | null {
+    if (!text) return null;
+    let s = text.trim();
+    // Strip ```json ... ``` or ``` ... ```
+    if (s.startsWith('```')) {
+      s = s.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '').trim();
+    }
+    // Optimistic direct parse
+    try { return JSON.parse(s); } catch {}
+    // Find first balanced {...} substring (respects strings + escapes)
+    const start = s.indexOf('{');
+    if (start === -1) return null;
+    let depth = 0, inStr = false, esc = false;
+    for (let i = start; i < s.length; i++) {
+      const c = s[i];
+      if (esc) { esc = false; continue; }
+      if (c === '\\') { if (inStr) esc = true; continue; }
+      if (c === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (c === '{') depth++;
+      else if (c === '}') {
+        depth--;
+        if (depth === 0) {
+          try { return JSON.parse(s.slice(start, i + 1)); } catch { return null; }
+        }
+      }
+    }
+    return null;
+  }
+
+  async consolidateFromChat(
+    userId: string,
+    agentId: string,
+    userMessage: string,
+    assistantResponse: string,
+  ): Promise<void> {
     const apiKey = process.env.OPENROUTER_API_KEY;
-    if (!apiKey || !this.driver) return;
+    const anthropicKey = process.env.ANTHROPIC_API_KEY;
+    if ((!apiKey && !anthropicKey) || !this.driver) return;
 
     try {
-      const prompt = `Из следующего диалога извлеки психологический профиль пользователя.
-Верни ТОЛЬКО JSON в формате:
-{
-  "interests": ["..."],
-  "values": ["..."],
-  "desires": ["..."],
-  "beliefs": ["..."],
-  "intents": ["..."],
-  "skills": ["..."]
-}
-Если нечего добавить в категорию — пустой массив. Только реальные факты из диалога.
+      // Получаем предыдущую реплику ассистента — нужна чтобы понять, с чем
+      // именно соглашается пользователь, если в его текущей реплике есть «да/точно/верно».
+      const prevAssistant = await this.fetchPrevAssistantMessage(userId, agentId);
 
-Пользователь: ${userMessage}
-Ассистент: ${assistantResponse}`;
+      const prompt = `Извлеки психологический профиль ТОЛЬКО на основе того, что ЯВНО говорит сам пользователь о себе.
+
+ЖЁСТКИЕ ПРАВИЛА:
+1. Источник извлечения — ИСКЛЮЧИТЕЛЬНО реплика пользователя. Из реплик ассистента извлекать ЗАПРЕЩЕНО, даже если ассистент описывает пользователя или предполагает что-то о нём.
+2. Извлекай только если:
+   (а) пользователь прямо говорит о себе («я ценю…», «я верю что…», «меня интересует…», «я работаю…», «я хочу…», «я умею…», «я не люблю…»), ИЛИ
+   (б) пользователь явно соглашается с конкретным утверждением, которое сказал ассистент в предыдущей реплике («да, точно», «верно», «правильно», «именно так», «согласен», «это про меня», «в точку»). В этом случае посмотри предыдущую реплику ассистента и извлеки именно ту сущность, с которой пользователь согласился.
+3. НЕ извлекай если:
+   - пользователь только задаёт вопросы или просит что-то посчитать/объяснить
+   - реплика нейтральная, без самораскрытия и без явного согласия
+   - пользователь выражает сомнение, частичное согласие или возражение («возможно», «не совсем», «не уверен», «нет», «не согласен»)
+   - ассистент сделал предположение, а пользователь его не подтвердил
+4. Лучше пропустить, чем приписать пользователю то, чего он явно не утверждал.
+
+Категории:
+- interests — темы/области, к которым пользователь сам проявил интерес о себе
+- values — то что пользователь явно назвал ценным для себя
+- desires — желания/цели, о которых пользователь явно сказал
+- beliefs — убеждения о мире/себе, которые пользователь явно высказал
+- intents — намерения сделать что-то конкретное в ближайшее время, явно высказанные пользователем
+- skills — навыки/умения, которые пользователь явно у себя признал
+
+Предыдущая реплика ассистента (нужна ТОЛЬКО для понимания согласий пользователя; извлекать из неё ЗАПРЕЩЕНО):
+"""
+${prevAssistant ? prevAssistant.slice(0, 3000) : '(пусто — начало диалога)'}
+"""
+
+Реплика пользователя (это основной и единственный источник для извлечения):
+"""
+${userMessage.slice(0, 3000)}
+"""
+
+Текущая реплика ассистента (только контекст; извлекать из неё ЗАПРЕЩЕНО):
+"""
+${assistantResponse.slice(0, 1500)}
+"""
+
+Верни валидный JSON и НИЧЕГО кроме него:
+{"interests":[],"values":[],"desires":[],"beliefs":[],"intents":[],"skills":[]}
+
+Если пользователь не сказал и явно не согласился ни с чем — верни все массивы пустыми.`;
 
       let content: string | null = null;
-      const anthropicKey = process.env.ANTHROPIC_API_KEY;
       if (anthropicKey) {
         const Anthropic = require('@anthropic-ai/sdk');
         const client = new Anthropic({ apiKey: anthropicKey });
@@ -305,12 +403,11 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
       }
       if (!content) return;
 
-      // Strip markdown code blocks if present
-      let jsonStr = content.trim();
-      if (jsonStr.startsWith('```')) {
-        jsonStr = jsonStr.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
+      const extracted = this.extractJsonObject(content);
+      if (!extracted) {
+        this.logger.warn(`consolidateFromChat: failed to parse JSON for ${userId}_${agentId}; raw[0..200]=${content.slice(0, 200)}`);
+        return;
       }
-      const extracted = JSON.parse(jsonStr);
       const entityTypes = ['interests', 'values', 'desires', 'beliefs', 'intents', 'skills'];
       for (const type of entityTypes) {
         if (Array.isArray(extracted[type]) && extracted[type].length > 0) {
