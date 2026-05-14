@@ -69,7 +69,10 @@ export class AuthService {
       await axios.get(url, {
         params: {
           number: phone,
-          text: `Код ${code} для входа в linkeon.io`,
+          // WebOTP-маркер в последней строке — Chrome Android и Safari iOS17+
+          // автоматически подставят код в форму через navigator.credentials.get.
+          // Формат строгий: `@<hostname> #<code>` — origin без протокола.
+          text: `Код ${code} для входа в linkeon.io\n@my.linkeon.io #${code}`,
           sign: 'SMSAero',
         },
         headers: { Authorization: `Basic ${auth}` },
