@@ -5,4 +5,5 @@ module.exports = {
   ...require('./pricing.integration.test'),
   ...require('./billing.integration.test'),
   ...require('./campaigns.integration.test'),
+  ...require('./queues.integration.test'),
 };
