@@ -26,7 +26,7 @@ export const config = {
   },
 
   tts: {
-    yandexApiKey: process.env.YANDEX_TTS_API_KEY || '',
+    yandexApiKey: process.env.YANDEX_SPEECHKIT_API_KEY || '',
     yandexFolderId: process.env.YANDEX_TTS_FOLDER_ID || '',
     elevenlabsApiKey: process.env.ELEVENLABS_API_KEY || '',
     elevenlabsVoices: {
