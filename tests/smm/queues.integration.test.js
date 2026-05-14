@@ -2,10 +2,10 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '..', '.env') });
 
 const { RenderQueueService } = require(
-  path.join(__dirname, '..', '..', 'dist', 'src', 'smm', 'render', 'render-queue.service'),
+  path.join(__dirname, '..', '..', 'dist', 'smm', 'render', 'render-queue.service'),
 );
 const { PublishQueueService } = require(
-  path.join(__dirname, '..', '..', 'dist', 'src', 'smm', 'publication', 'publish-queue.service'),
+  path.join(__dirname, '..', '..', 'dist', 'smm', 'publication', 'publish-queue.service'),
 );
 
 async function withSvc(Cls, fn) {

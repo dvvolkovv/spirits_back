@@ -3,7 +3,7 @@ require('dotenv').config({ path: path.join(__dirname, '..', '..', '.env') });
 
 const { Pool } = require('pg');
 const { SmmPricingService } = require(
-  path.join(__dirname, '..', '..', 'dist', 'src', 'smm', 'billing', 'smm-pricing.service'),
+  path.join(__dirname, '..', '..', 'dist', 'smm', 'billing', 'smm-pricing.service'),
 );
 
 // Mock PgService shape — only `query` is used

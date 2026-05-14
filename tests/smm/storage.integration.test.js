@@ -9,7 +9,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '..', '.env') });
 
 const { StorageService } = require(
-  path.join(__dirname, '..', '..', 'dist', 'src', 'common', 'services', 'storage.service'),
+  path.join(__dirname, '..', '..', 'dist', 'common', 'services', 'storage.service'),
 );
 
 const storage = new StorageService();

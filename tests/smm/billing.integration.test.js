@@ -4,13 +4,13 @@ require('dotenv').config({ path: path.join(__dirname, '..', '..', '.env') });
 
 const { Pool } = require('pg');
 const { SmmBillingService } = require(
-  path.join(__dirname, '..', '..', 'dist', 'src', 'smm', 'billing', 'smm-billing.service'),
+  path.join(__dirname, '..', '..', 'dist', 'smm', 'billing', 'smm-billing.service'),
 );
 const { SmmPricingService } = require(
-  path.join(__dirname, '..', '..', 'dist', 'src', 'smm', 'billing', 'smm-pricing.service'),
+  path.join(__dirname, '..', '..', 'dist', 'smm', 'billing', 'smm-pricing.service'),
 );
 const { InsufficientTokensError } = require(
-  path.join(__dirname, '..', '..', 'dist', 'src', 'smm', 'billing', 'insufficient-tokens.error'),
+  path.join(__dirname, '..', '..', 'dist', 'smm', 'billing', 'insufficient-tokens.error'),
 );
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });

@@ -13,7 +13,7 @@ const {
   encryptCredentials,
   decryptCredentials,
   TamperDetectedError,
-} = require(path.join(__dirname, '..', '..', 'dist', 'src', 'smm', 'social-accounts', 'credentials.crypto'));
+} = require(path.join(__dirname, '..', '..', 'dist', 'smm', 'social-accounts', 'credentials.crypto'));
 
 module.exports = {
   'crypto: round-trip plain object': () => {
