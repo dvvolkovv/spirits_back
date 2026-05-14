@@ -27,12 +27,14 @@ export class ProfileCompactionService {
   private readonly CATEGORIES = ['values', 'beliefs', 'desires', 'intents', 'interests', 'skills'] as const;
   // Сущности с support >= этого порога не валидируем через chat history —
   // считаем что многократное появление само по себе доказательство.
-  private readonly TRUSTED_SUPPORT = 5;
-  // Глубокая LLM-валидация: для support < этого порога substring-find недостаточно,
-  // дополнительно спрашиваем LLM «утверждал ли это пользователь?» по реальным
-  // human-сообщениям. Это ловит «бхайрава везде и всегда» где пользователь
-  // упомянул слово в названии текста, а не как убеждение.
-  private readonly STRICT_VALIDATE_SUPPORT = 3;
+  // Поднято до 20 потому что support 5-15 на практике мог набиваться
+  // от ассистентских повторений (старый промпт извлекал из обеих сторон).
+  // Кейсы: «кришна и личностный бог» 7x (юзер упомянул имя один раз),
+  // «дети и духовные каналы» 4x (юзер вообще не говорил, только substring
+  // на "духовн"/"канал"). LLM-валидация на ~$0.0005 за entity — дёшево
+  // прогнать всё что ниже 20x.
+  private readonly TRUSTED_SUPPORT = 20;
+  private readonly STRICT_VALIDATE_SUPPORT = 20;
   // Stale prune: support<2 + не обновлялось дольше 30 дней.
   private readonly STALE_DAYS = 30;
   // Семантический merge запускать только если категория крупная.
