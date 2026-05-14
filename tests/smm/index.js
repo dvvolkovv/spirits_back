@@ -6,4 +6,6 @@ module.exports = {
   ...require('./billing.integration.test'),
   ...require('./campaigns.integration.test'),
   ...require('./queues.integration.test'),
+  ...require('./render-callback.integration.test'),
+  ...require('./scenario-fetch.integration.test'),
 };

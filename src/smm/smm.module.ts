@@ -6,9 +6,11 @@ import { SmmPricingService } from './billing/smm-pricing.service';
 import { SocialAccountService } from './social-accounts/social-account.service';
 import { RenderQueueService } from './render/render-queue.service';
 import { PublishQueueService } from './publication/publish-queue.service';
+import { RenderCallbackController } from './render/render-callback.controller';
+import { ScenarioFetchController } from './render/scenario-fetch.controller';
 
 @Module({
-  controllers: [SmmController],
+  controllers: [SmmController, RenderCallbackController, ScenarioFetchController],
   providers: [
     SmmBillingService,
     SmmPricingService,
