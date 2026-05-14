@@ -1,24 +1,32 @@
 // worker/src/index.ts
 import { config } from './config';
 import { logger } from './logger';
+import { startRenderWorker } from './consumer';
+import { startCleanupCron } from './render/cleanup-cron';
 
 async function main(): Promise<void> {
   logger.info({ apiUrl: config.apiUrl, redisUrl: config.redisUrl }, 'linkeon-smm-worker starting');
-  // Consumer registration is added in Task 13. For now just verify config loads.
-  logger.info('Worker ready (consumer not yet attached — see Task 13)');
+  const worker = startRenderWorker();
+  const cleanupTimer = startCleanupCron();
+
+  // Graceful shutdown
+  const shutdown = async (signal: string) => {
+    logger.info({ signal }, 'shutdown signal received');
+    clearInterval(cleanupTimer);
+    try {
+      await worker.close();
+    } catch (e: any) {
+      logger.warn({ err: e.message }, 'worker close error');
+    }
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+
+  logger.info('linkeon-smm-worker ready, consuming smm-render queue');
 }
 
 main().catch((err) => {
-  logger.fatal({ err: err.message }, 'fatal worker startup error');
+  logger.fatal({ err: err.message, stack: err.stack }, 'fatal worker startup error');
   process.exit(1);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  logger.info('SIGTERM received, shutting down');
-  process.exit(0);
-});
-process.on('SIGINT', () => {
-  logger.info('SIGINT received, shutting down');
-  process.exit(0);
 });
