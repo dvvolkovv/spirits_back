@@ -39,4 +39,20 @@ export class ScenarioFetchController {
 
     return { video, scenario };
   }
+
+  @Get('music-tracks')
+  async listMusicTracks(): Promise<Array<{
+    id: string; title: string; mood: string; durationSec: number; publicUrl: string;
+  }>> {
+    const r = await this.pg.query(`SELECT * FROM smm_music_track ORDER BY mood, id`);
+    const base = (process.env.MINIO_PUBLIC_URL || '').replace(/\/$/, '');
+    const bucket = process.env.MINIO_BUCKET_MUSIC || 'linkeon-smm-music';
+    return r.rows.map((row: any) => ({
+      id: row.id,
+      title: row.title,
+      mood: row.mood,
+      durationSec: row.duration_sec,
+      publicUrl: `${base}/${bucket}/${row.storage_key}`,
+    }));
+  }
 }

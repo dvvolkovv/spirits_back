@@ -8,7 +8,8 @@
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main",
     "migrate": "ts-node scripts/migrate.ts",
-    "migrate:dry": "ts-node scripts/migrate.ts --dry"
+    "migrate:dry": "ts-node scripts/migrate.ts --dry",
+    "seed-music": "ts-node scripts/seed-music.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.82.0",

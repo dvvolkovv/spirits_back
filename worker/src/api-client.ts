@@ -81,6 +81,20 @@ export class ApiClient {
     }
     logger.info({ videoId: input.videoId, status: input.status }, 'callback delivered');
   }
+
+  async listMusicTracks(): Promise<Array<{
+    id: string;
+    title: string;
+    mood: 'dramatic' | 'inspiring' | 'calm' | 'uplifting' | 'tense' | 'neutral';
+    durationSec: number;
+    publicUrl: string;
+  }>> {
+    const r = await this.http.get('/webhook/smm/internal/music-tracks');
+    if (r.status !== 200) {
+      throw new Error(`listMusicTracks: ${r.status} ${JSON.stringify(r.data).slice(0, 200)}`);
+    }
+    return r.data;
+  }
 }
 
 export const apiClient = new ApiClient();
