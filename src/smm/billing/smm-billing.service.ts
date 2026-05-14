@@ -47,7 +47,10 @@ export class SmmBillingService {
       if (balRes.rows.length === 0) {
         throw new Error(`User ${input.userId} not found in ai_profiles_consolidated`);
       }
-      const balance: number = balRes.rows[0].tokens;
+      // node-pg returns bigint columns as strings. Coerce explicitly so the
+      // `number` type annotation matches runtime and so the value flowing into
+      // InsufficientTokensError is usable for arithmetic / JSON serialization.
+      const balance: number = Number(balRes.rows[0].tokens);
       if (balance < cost) {
         await client.query('ROLLBACK');
         throw new InsufficientTokensError(balance, cost);
@@ -83,17 +86,24 @@ export class SmmBillingService {
   /**
    * Возврат — только если был charge для этого video_id и ещё не было refund.
    * Идемпотентен: повторный вызов не возвращает деньги повторно.
+   *
+   * Defense-in-depth: partial UNIQUE index uq_smm_ledger_refund_per_video
+   * guarantees at-most-one refund per video at the DB level. The INSERT comes
+   * before the UPDATE so that a unique-violation rolls back with no balance
+   * change. SELECT FOR UPDATE on the charge row prevents concurrent racers
+   * from reading stale data during the same transaction.
    */
   async refund(input: RefundInput): Promise<void> {
     const client = await this.pg.getClient();
     try {
       await client.query('BEGIN');
 
-      // Find the original charge for this video
+      // Find the original charge for this video; FOR UPDATE prevents concurrent
+      // racers from reading the same charge row simultaneously.
       const chargeRes = await client.query(
         `SELECT user_id, amount FROM smm_billing_ledger
           WHERE video_id = $1 AND op = 'charge'
-          ORDER BY created_at LIMIT 1`,
+          ORDER BY created_at LIMIT 1 FOR UPDATE`,
         [input.videoId],
       );
       if (chargeRes.rows.length === 0) {
@@ -103,30 +113,31 @@ export class SmmBillingService {
       }
       const { user_id: userId, amount } = chargeRes.rows[0];
 
-      // Check if refund already exists
-      const refundRes = await client.query(
-        `SELECT 1 FROM smm_billing_ledger
-          WHERE video_id = $1 AND op = 'refund' LIMIT 1`,
-        [input.videoId],
-      );
-      if (refundRes.rows.length > 0) {
-        await client.query('ROLLBACK');
-        this.logger.warn(`refund: already refunded video ${input.videoId}, no-op`);
-        return;
+      // Insert refund row FIRST — partial unique index catches concurrent racers
+      // before any balance change occurs.
+      try {
+        await client.query(
+          `INSERT INTO smm_billing_ledger
+              (user_id, video_id, amount, op, reason)
+           VALUES ($1, $2, $3, 'refund', $4)`,
+          [userId, input.videoId, -amount, input.reason],
+        );
+      } catch (err: any) {
+        // 23505 = unique_violation — concurrent refund won the race; we're a no-op now.
+        if (err?.code === '23505') {
+          await client.query('ROLLBACK');
+          this.logger.warn(`refund: already refunded video ${input.videoId}, no-op`);
+          return;
+        }
+        throw err;
       }
 
-      // Apply refund
+      // Then update balance — guaranteed exactly once thanks to the unique index above.
       await client.query(
         `UPDATE ai_profiles_consolidated
             SET tokens = tokens + $1, updated_at = now()
           WHERE user_id = $2`,
         [amount, userId],
-      );
-      await client.query(
-        `INSERT INTO smm_billing_ledger
-            (user_id, video_id, amount, op, reason)
-         VALUES ($1, $2, $3, 'refund', $4)`,
-        [userId, input.videoId, -amount, input.reason],
       );
 
       await client.query('COMMIT');

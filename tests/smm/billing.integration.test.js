@@ -150,6 +150,13 @@ module.exports = {
       if (ledger.rows.length !== 2) throw new Error(`Expected 2 ledger rows, got ${ledger.rows.length}`);
       if (ledger.rows[1].op !== 'refund') throw new Error('Expected second row op=refund');
       if (ledger.rows[1].amount !== -15000) throw new Error(`Expected refund amount -15000`);
+      const sumRes = await pool.query(
+        `SELECT COALESCE(SUM(amount), 0)::int AS s FROM smm_billing_ledger WHERE video_id = $1`,
+        [videoId],
+      );
+      if (sumRes.rows[0].s !== 0) {
+        throw new Error(`Ledger sum non-zero after refund: ${sumRes.rows[0].s}`);
+      }
     } finally {
       await cleanup(campaignId);
     }
@@ -171,6 +178,54 @@ module.exports = {
         [videoId],
       );
       if (ledger.rows[0].n !== 2) throw new Error(`Expected exactly 2 ledger rows`);
+    } finally {
+      await cleanup(campaignId);
+    }
+  },
+
+  'billing: charge throws plain Error (not InsufficientTokensError) when user is unknown': async () => {
+    await ensureFixture();
+    const { campaignId, videoId } = await createScenarioAndVideo();
+    try {
+      const { billing } = await buildServices();
+      let thrown = null;
+      try {
+        await billing.charge({ userId: 'nonexistent_user_999', videoId, tier: 'economy' });
+      } catch (e) {
+        thrown = e;
+      }
+      if (!thrown) throw new Error('Expected an error on unknown user');
+      if (thrown instanceof InsufficientTokensError) {
+        throw new Error('Should be plain Error, not InsufficientTokensError');
+      }
+      if (!thrown.message.includes('not found')) {
+        throw new Error(`Expected message about not found, got: ${thrown.message}`);
+      }
+    } finally {
+      await cleanup(campaignId);
+    }
+  },
+
+  'billing: refund is a no-op when there was no charge': async () => {
+    await ensureFixture();
+    await setBalance(50000);
+    const before = await getBalance();
+    const { campaignId, videoId } = await createScenarioAndVideo();
+    try {
+      const { billing } = await buildServices();
+      // refund without prior charge — should silently succeed
+      await billing.refund({ videoId, reason: 'spurious' });
+      const after = await getBalance();
+      if (after !== before) {
+        throw new Error(`Balance changed: ${before} → ${after}`);
+      }
+      const ledger = await pool.query(
+        `SELECT count(*)::int as n FROM smm_billing_ledger WHERE video_id = $1`,
+        [videoId],
+      );
+      if (ledger.rows[0].n !== 0) {
+        throw new Error(`Expected 0 ledger rows, got ${ledger.rows[0].n}`);
+      }
     } finally {
       await cleanup(campaignId);
     }
