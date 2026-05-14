@@ -10,11 +10,19 @@
     "test:workflows": "node runner.js --suite workflows",
     "test:e2e": "node runner.js --suite e2e",
     "test:video": "bash video.e2e.sh",
-    "test:chat-tools": "bash chat-tools.e2e.sh"
+    "test:chat-tools": "bash chat-tools.e2e.sh",
+    "smoke": "node smoke/smoke.js",
+    "smoke:unit": "jest unit/ --silent",
+    "smoke:browser": "playwright test playwright/",
+    "smoke:all": "npm run smoke:unit && npm run smoke && npm run smoke:browser"
   },
   "dependencies": {
     "axios": "^1.6.0",
     "pg": "^8.11.0",
     "form-data": "^4.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0",
+    "jest": "^29.7.0"
   }
 }
