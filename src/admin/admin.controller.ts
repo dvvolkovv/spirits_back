@@ -1,11 +1,15 @@
-import { Controller, Get, Post, Body, Param, Query, Res, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Body, Param, Query, Res, UseGuards, Optional } from '@nestjs/common';
 import { Response } from 'express';
 import { AdminService } from './admin.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
+import { ProfileCompactionService } from '../scheduler/profile-compaction.service';
 
 @Controller('')
 export class AdminController {
-  constructor(private readonly adminService: AdminService) {}
+  constructor(
+    private readonly adminService: AdminService,
+    @Optional() private readonly compaction?: ProfileCompactionService,
+  ) {}
 
   // --- Coupons (action-based POST) ---
 
@@ -112,6 +116,20 @@ export class AdminController {
       days: days ? parseInt(days, 10) || undefined : undefined,
     });
     return res.status(200).json(data);
+  }
+
+  @Post('admin/profile/compact')
+  @UseGuards(JwtGuard)
+  async profileCompact(@Body() body: any, @Res() res: Response) {
+    if (!this.compaction) return res.status(503).json({ error: 'compaction not configured' });
+    const userId = String(body?.userId || '').trim();
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    try {
+      const stats = await this.compaction.compactUser(userId);
+      return res.status(200).json(stats);
+    } catch (e: any) {
+      return res.status(500).json({ error: e?.message || 'compact failed' });
+    }
   }
 
   @Get('admin/users/active')

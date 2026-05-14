@@ -260,6 +260,133 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  // ───────────────────────────────────────────────────────────────────────
+  // Helpers for ProfileCompactionService
+  // ───────────────────────────────────────────────────────────────────────
+
+  /**
+   * Список сущностей одной категории с метаданными для компакции:
+   * canonical_key, name, aliases, support, age, last_update.
+   */
+  async listEntitiesForCompaction(
+    userId: string,
+    entityType: string,
+  ): Promise<Array<{ canonicalKey: string; name: string; aliases: string[]; support: number; createdAt: string | null; updatedAt: string | null }>> {
+    const session = this.getSession();
+    if (!session) return [];
+    const type = entityType.charAt(0).toUpperCase() + entityType.slice(1).toLowerCase();
+    const rel = `HAS_${type.toUpperCase()}`;
+    try {
+      const res = await session.run(
+        `MATCH (p:Profile {phone: $phone})-[r:${rel}]->(n:${type})
+         RETURN
+           coalesce(n.canonical_key, toLower(trim(n.name))) AS canonicalKey,
+           n.name AS name,
+           coalesce(n.aliases, [n.name]) AS aliases,
+           coalesce(n.support, 1) AS support,
+           toString(r.created_at) AS createdAt,
+           toString(coalesce(r.updated_at, r.created_at)) AS updatedAt`,
+        { phone: userId },
+      );
+      return res.records.map((r) => ({
+        canonicalKey: r.get('canonicalKey') || '',
+        name: r.get('name') || '',
+        aliases: r.get('aliases') || [],
+        support: (r.get('support')?.toNumber?.() ?? r.get('support') ?? 1) as number,
+        createdAt: r.get('createdAt') || null,
+        updatedAt: r.get('updatedAt') || null,
+      })).filter(x => x.name);
+    } finally {
+      await session.close();
+    }
+  }
+
+  /**
+   * Удаляет связь Profile→Entity по canonical_key. Сам узел Entity не трогаем —
+   * другие профили могут быть с ним связаны.
+   */
+  async dropEntityRelation(userId: string, entityType: string, canonicalKey: string): Promise<void> {
+    const session = this.getSession();
+    if (!session) return;
+    const type = entityType.charAt(0).toUpperCase() + entityType.slice(1).toLowerCase();
+    const rel = `HAS_${type.toUpperCase()}`;
+    try {
+      await session.run(
+        `MATCH (p:Profile {phone: $phone})-[r:${rel}]->(n:${type})
+         WHERE coalesce(n.canonical_key, toLower(trim(n.name))) = $key
+         DELETE r`,
+        { phone: userId, key: canonicalKey },
+      );
+    } finally {
+      await session.close();
+    }
+  }
+
+  /**
+   * Семантический merge: заменить группу сущностей одной канонической.
+   * Все aliases сливаются, support суммируется, исходные связи удаляются.
+   *
+   * @param fromKeys canonical_keys которые надо слить (включая canonical если он
+   *                 в группе)
+   * @param canonical имя итоговой сущности
+   */
+  async mergeEntitiesInProfile(
+    userId: string,
+    entityType: string,
+    fromKeys: string[],
+    canonical: string,
+  ): Promise<void> {
+    if (!fromKeys.length || !canonical?.trim()) return;
+    const session = this.getSession();
+    if (!session) return;
+    const type = entityType.charAt(0).toUpperCase() + entityType.slice(1).toLowerCase();
+    const rel = `HAS_${type.toUpperCase()}`;
+    const canonicalName = canonical.trim();
+    const canonicalKey = canonicalName.toLowerCase();
+    try {
+      // 1) Соберём суммарный support и объединённые aliases по всем исходникам.
+      const aggRes = await session.run(
+        `MATCH (p:Profile {phone: $phone})-[:${rel}]->(n:${type})
+         WHERE coalesce(n.canonical_key, toLower(trim(n.name))) IN $keys
+         RETURN
+           sum(coalesce(n.support, 1)) AS totalSupport,
+           reduce(acc = [], n IN collect(n) | acc + coalesce(n.aliases, [n.name])) AS allAliases,
+           collect(coalesce(n.gloss, '')) AS glosses`,
+        { phone: userId, keys: fromKeys },
+      );
+      const totalSupport = (aggRes.records[0]?.get('totalSupport')?.toNumber?.() ?? aggRes.records[0]?.get('totalSupport') ?? 1) as number;
+      const aliasesRaw = (aggRes.records[0]?.get('allAliases') || []) as string[];
+      const dedupAliases = Array.from(new Set([canonicalName, ...aliasesRaw].filter(Boolean)));
+      const glosses = (aggRes.records[0]?.get('glosses') || []) as string[];
+      const bestGloss = glosses.filter(g => g && g.length > 0).sort((a, b) => b.length - a.length)[0] || '';
+
+      // 2) Снимем все старые связи и узлы.
+      await session.run(
+        `MATCH (p:Profile {phone: $phone})-[r:${rel}]->(n:${type})
+         WHERE coalesce(n.canonical_key, toLower(trim(n.name))) IN $keys
+         DELETE r`,
+        { phone: userId, keys: fromKeys },
+      );
+
+      // 3) Создадим/обновим каноническую сущность и связь.
+      await session.run(
+        `MERGE (p:Profile {phone: $phone})
+         MERGE (v:${type} {canonical_key: $canonicalKey})
+           ON CREATE SET v.name = $canonical, v.aliases = $aliases, v.gloss = $gloss, v.support = $support
+           ON MATCH  SET v.name = $canonical,
+                          v.aliases = $aliases,
+                          v.gloss = CASE WHEN coalesce(v.gloss, '') = '' THEN $gloss ELSE v.gloss END,
+                          v.support = coalesce(v.support, 0) + $support
+         MERGE (p)-[r:${rel}]->(v)
+           ON CREATE SET r.created_at = datetime(), r.confidence = 5
+           ON MATCH  SET r.updated_at = datetime()`,
+        { phone: userId, canonical: canonicalName, canonicalKey, aliases: dedupAliases, gloss: bestGloss, support: totalSupport },
+      );
+    } finally {
+      await session.close();
+    }
+  }
+
   /**
    * Достаёт предыдущую (пред-предпоследнюю в текущем порядке) реплику ассистента
    * из истории чата. Нужна для распознавания согласия пользователя: «да, точно»
