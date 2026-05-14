@@ -28,6 +28,11 @@ export class ProfileCompactionService {
   // Сущности с support >= этого порога не валидируем через chat history —
   // считаем что многократное появление само по себе доказательство.
   private readonly TRUSTED_SUPPORT = 5;
+  // Глубокая LLM-валидация: для support < этого порога substring-find недостаточно,
+  // дополнительно спрашиваем LLM «утверждал ли это пользователь?» по реальным
+  // human-сообщениям. Это ловит «бхайрава везде и всегда» где пользователь
+  // упомянул слово в названии текста, а не как убеждение.
+  private readonly STRICT_VALIDATE_SUPPORT = 3;
   // Stale prune: support<2 + не обновлялось дольше 30 дней.
   private readonly STALE_DAYS = 30;
   // Семантический merge запускать только если категория крупная.
@@ -79,14 +84,30 @@ export class ProfileCompactionService {
       if (entities.length === 0) { stats.perCategory[cat] = c; continue; }
 
       // ── 1) Source-validation ───────────────────────────────────────────
-      // Для каждой сущности с support < TRUSTED_SUPPORT — ищем подтверждение
-      // в собственных human-репликах юзера. Не нашли → drop.
+      // Сущности с support < TRUSTED_SUPPORT проходят два слоя:
+      // (a) substring-поиск любого ключевого слова имени/алиаса в HUMAN-сообщениях.
+      //     Это быстрый отсев совсем безосновательных entries (как «пересчёт
+      //     данных и корректировка», которой явно нет в репликах юзера).
+      // (b) для support < STRICT_VALIDATE_SUPPORT — дополнительный LLM-проход:
+      //     спрашиваем модель, действительно ли юзер УТВЕРЖДАЕТ этот концепт
+      //     по найденным фрагментам. Это ловит случаи, когда слово попало в
+      //     human-реплику в нерелевантном контексте (например название текста
+      //     «Виджняна-Бхайрава-Тантра» не доказывает убеждение «бхайрава
+      //     везде и всегда»).
       const suspect = entities.filter(e => e.support < this.TRUSTED_SUPPORT);
       for (const e of suspect) {
-        const ok = await this.hasUserEvidence(userId, e.name, e.aliases);
-        if (!ok) {
+        const matches = await this.findUserMatches(userId, e.name, e.aliases);
+        if (matches.length === 0) {
           await this.neo4j.dropEntityRelation(userId, this.singular(cat), e.canonicalKey);
           c.dropped_noSource++;
+          continue;
+        }
+        if (e.support < this.STRICT_VALIDATE_SUPPORT) {
+          const verdict = await this.llmValidateEntity(cat, e.name, matches);
+          if (verdict === false) {
+            await this.neo4j.dropEntityRelation(userId, this.singular(cat), e.canonicalKey);
+            c.dropped_llmReject = (c.dropped_llmReject || 0) + 1;
+          }
         }
       }
 
@@ -132,45 +153,110 @@ export class ProfileCompactionService {
   }
 
   /**
-   * Источник-валидация: ищем в HUMAN-сообщениях юзера упоминание имени или
-   * любого alias. Используем PG full-text-free ILIKE по 2-3 наиболее
-   * информативным «токенам» (длиной > 4 символов).
+   * Возвращает до N human-сообщений юзера, в которых встречается имя или
+   * любой alias сущности. Используется как substring-pre-filter + источник
+   * фрагментов для последующего LLM-validation.
    */
-  private async hasUserEvidence(userId: string, name: string, aliases: string[]): Promise<boolean> {
+  private async findUserMatches(userId: string, name: string, aliases: string[]): Promise<string[]> {
     const candidates = [name, ...(aliases || [])]
       .map(s => (s || '').trim())
       .filter(s => s.length >= 4);
-    if (candidates.length === 0) return true; // нечего искать — лучше оставить
+    if (candidates.length === 0) return ['__skip_validation__']; // нечего искать
 
-    // Берём ВСЕ кандидаты как substring-OR (canonical + aliases). Имена и
-    // алиасы в нашей базе короткие (1-4 слова), так что substring-match
-    // достаточно точный. Длинный канонический «X и Y» бьём ещё и на
-    // отдельные значимые слова для большего recall.
     const terms = new Set<string>();
     for (const c of candidates) {
       terms.add(c.toLowerCase());
-      // Разбиваем на слова длиной >=5 (отбрасываем «и», «как», «для»)
       for (const w of c.toLowerCase().split(/[\s,.;:()«»"'\-–—]+/)) {
         if (w.length >= 5) terms.add(w);
       }
     }
-    const termList = Array.from(terms).slice(0, 30); // ограничим запрос
+    const termList = Array.from(terms).slice(0, 30);
 
     const sessionLike = `${userId}_%`;
     const placeholders = termList.map((_, i) => `content ILIKE $${i + 2}`).join(' OR ');
     const params = [sessionLike, ...termList.map(t => `%${t}%`)];
     try {
       const res = await this.pg.query(
-        `SELECT 1 FROM custom_chat_history
+        `SELECT content FROM custom_chat_history
            WHERE session_id LIKE $1 AND sender_type = 'human'
              AND (${placeholders})
-           LIMIT 1`,
+           ORDER BY created_at DESC
+           LIMIT 8`,
         params,
       );
-      return res.rows.length > 0;
+      return res.rows.map(r => String(r.content || ''));
     } catch (e: any) {
-      this.logger.warn(`hasUserEvidence query failed: ${e?.message}`);
-      return true; // на ошибке — лучше оставить, чем удалить
+      this.logger.warn(`findUserMatches query failed: ${e?.message}`);
+      return ['__skip_validation__']; // на ошибке — не дропаем
+    }
+  }
+
+  /**
+   * LLM-проверка: «утверждает ли юзер этот концепт» в реальных human-репликах.
+   * Возвращает true (keep), false (drop), null (неоднозначно — keep).
+   * Цена ≈ 1 Haiku call ≈ 500 input tokens ≈ $0.0005 за entity.
+   */
+  private async llmValidateEntity(category: string, entityName: string, userMessages: string[]): Promise<boolean | null> {
+    // Спец-маркер из findUserMatches: validation пропускаем.
+    if (userMessages.length === 1 && userMessages[0] === '__skip_validation__') return null;
+    if (userMessages.length === 0) return false;
+
+    const anthropicKey = process.env.ANTHROPIC_API_KEY;
+    const orKey = process.env.OPENROUTER_API_KEY;
+    if (!anthropicKey && !orKey) return null; // нет ключей — keep
+
+    const samples = userMessages
+      .map((m, i) => `[${i + 1}] ${m.slice(0, 400)}`)
+      .join('\n\n');
+
+    const prompt = `Ты валидируешь профиль пользователя. Категория: "${category}".
+
+Кандидат: "${entityName}"
+
+Это фрагменты из РЕПЛИК ПОЛЬЗОВАТЕЛЯ (только его, не ассистента) где встречается слово/тема:
+
+${samples}
+
+Вопрос: пользователь действительно УТВЕРЖДАЕТ или ЯВНО ПРИЗНАЁТ концепт "${entityName}" применимо к самому себе (как своё ${category === 'values' ? 'ценность' : category === 'beliefs' ? 'убеждение' : category === 'desires' ? 'желание' : category === 'intents' ? 'намерение' : category === 'interests' ? 'интерес' : 'навык'})?
+
+Правила решения:
+- YES — если пользователь явно сказал об этом про себя («я верю», «я ценю», «мне важно», «хочу», «умею»), или явно согласился с такой формулировкой.
+- NO — если пользователь только упомянул слово/тему в нерелевантном контексте (например в названии текста, как описание чужой ситуации, как вопрос, или из любопытства), не присвоив себе.
+- NO — если все упоминания нейтральные/информационные (спросил, узнал, поделился цитатой).
+
+Ответь ОДНИМ словом: YES или NO. Без объяснений.`;
+
+    try {
+      let content: string | null = null;
+      if (anthropicKey) {
+        const Anthropic = require('@anthropic-ai/sdk');
+        const client = new Anthropic({ apiKey: anthropicKey });
+        const msg = await client.messages.create({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 10,
+          messages: [{ role: 'user', content: prompt }],
+        });
+        content = msg.content?.[0]?.text || null;
+      } else if (orKey) {
+        const resp = await axios.post(
+          'https://openrouter.ai/api/v1/chat/completions',
+          {
+            model: process.env.CONSOLIDATION_MODEL || 'openai/gpt-4o-mini',
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 10,
+          },
+          { headers: { Authorization: `Bearer ${orKey}` }, timeout: 30000 },
+        );
+        content = resp.data.choices?.[0]?.message?.content;
+      }
+      if (!content) return null;
+      const verdict = content.trim().toUpperCase();
+      if (verdict.startsWith('NO')) return false;
+      if (verdict.startsWith('YES')) return true;
+      return null;
+    } catch (e: any) {
+      this.logger.warn(`llmValidateEntity failed for "${entityName}": ${e?.message}`);
+      return null;
     }
   }
 
