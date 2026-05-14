@@ -20,6 +20,7 @@ import { PeerModule } from './peer/peer.module';
 import { SupportModule } from './support/support.module';
 import { ContactsModule } from './contacts/contacts.module';
 import { McpModule } from './mcp/mcp.module';
+import { SmmModule } from './smm/smm.module';
 
 @Module({
   imports: [
@@ -44,6 +45,7 @@ import { McpModule } from './mcp/mcp.module';
     SupportModule,
     ContactsModule,
     McpModule,
+    SmmModule,
   ],
 })
 export class AppModule {}

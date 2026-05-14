@@ -4,4 +4,5 @@ module.exports = {
   ...require('./storage.integration.test'),
   ...require('./pricing.integration.test'),
   ...require('./billing.integration.test'),
+  ...require('./campaigns.integration.test'),
 };
