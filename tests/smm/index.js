@@ -2,4 +2,5 @@
 module.exports = {
   ...require('./crypto.unit.test'),
   ...require('./storage.integration.test'),
+  ...require('./pricing.integration.test'),
 };
