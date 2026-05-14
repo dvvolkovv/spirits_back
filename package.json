@@ -6,7 +6,9 @@
     "build": "nest build",
     "start": "node dist/main",
     "start:dev": "nest start --watch",
-    "start:prod": "node dist/main"
+    "start:prod": "node dist/main",
+    "migrate": "ts-node scripts/migrate.ts",
+    "migrate:dry": "ts-node scripts/migrate.ts --dry"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.82.0",
