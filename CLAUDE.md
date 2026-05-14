@@ -28,20 +28,30 @@
 - **Payments:** YooKassa
 - **Storage:** Локальные файлы (avatars, images) через Nginx /static/
 
-## Деплой бэкенда
+## Деплой (унифицированный)
+
+**Используй `scripts/deploy.sh`** — он сам делает: build фронта → rsync → sync бэка → npm build → pm2 restart → health-wait → smoke. Выходит non-zero при любом сбое. Это рекомендуемый путь после **каждого** изменения, т.к. smoke автоматически прогоняется.
+
 ```bash
+bash ~/Downloads/spirits_back/scripts/deploy.sh
+```
+
+Env-переменные: `BASE_URL`, `TEST_PHONE`, `PROD_HOST`, `SKIP_SMOKE=1` (только деплой), `SMOKE_ONLY=1` (без деплоя, только smoke против текущего прода).
+
+### Ручные команды (если deploy.sh не подходит)
+```bash
+# Бэк
 cd ~/Downloads/spirits_back
 rsync -az src/ dvolkov@212.113.106.202:~/spirits_back/src/
 ssh dvolkov@212.113.106.202 "cd ~/spirits_back && npm run build && pm2 restart linkeon-api"
-```
 
-## Деплой фронтенда
-```bash
+# Фронт
 cd ~/Downloads/spirits_front
 echo "VITE_BACKEND_URL=https://my.linkeon.io" > .env
 pnpm build
 rsync -az --delete dist/ dvolkov@212.113.106.202:/home/dvolkov/spirits_front/
 ```
+После ручного деплоя **ОБЯЗАТЕЛЬНО** прогнать smoke вручную: `bash ~/Downloads/spirits_back/tests/smoke/run.sh`.
 
 ## Тестовые аккаунты
 | | Телефон | Роль |
@@ -53,61 +63,66 @@ DEBUG_SMS_CODES=true — код можно получить через `GET /web
 
 ## 🧪 ОБЯЗАТЕЛЬНЫЕ ТЕСТЫ
 
-### 1. API smoke-тесты (32 теста)
-Проверяет все эндпоинты: auth, profile, agents, chat, tokens, payments, referral, admin, search, compatibility, imagegen.
-```bash
-cd ~/Downloads/spirits_back/tests && npm install && node runner.js --suite api
-```
-- 32/32 должны быть зелёными.
+### Smoke-пайплайн (после **каждого** деплоя)
 
-### 2. E2E тесты с авторизацией (18 тестов)
-Полный цикл: SMS OTP → JWT → профиль → агенты → стриминг чат → история → смена агента → email → аватар → реферал.
+Три слоя × ~1.5 мин, 24 проверки. Запускается автоматически через `scripts/deploy.sh` (шаг 6), либо отдельно:
+
+```bash
+bash ~/Downloads/spirits_back/tests/smoke/run.sh         # все три слоя
+bash ~/Downloads/spirits_back/tests/smoke/run.sh unit    # 12 unit-тестов (Jest)
+bash ~/Downloads/spirits_back/tests/smoke/run.sh api     # 9 API+DB (Node)
+bash ~/Downloads/spirits_back/tests/smoke/run.sh browser # 3 Playwright
+```
+
+**Слой 1 — Jest unit** ([tests/unit/extractJsonObject.test.js](tests/unit/extractJsonObject.test.js))
+Пинит толерантный JSON-парсер для `Neo4jService.consolidateFromChat` — 12 кейсов: markdown-fences, прозa до/после, вложенные `{}`, эскейпы, регрессия на «position 105».
+
+**Слой 2 — API + DB smoke** ([tests/smoke/smoke.js](tests/smoke/smoke.js))
+9 критических путей против `https://my.linkeon.io`:
+1. `/webhook/agents` отдаёт 14 ассистентов, Райя на месте
+2. SMS-send + debug-OTP + check-code → JWT (доказывает что `DEBUG_SMS_CODES=true`)
+3. `/webhook/profile` и `/webhook/user/tokens/` с JWT
+4. `/webhook/soulmate/chat` стримит ответ (покрывает `streamUniversalAgent` → r.linkeon.io)
+5. `custom_chat_history` получил свежие строки (покрывает `saveChatHistory` в `setImmediate`) — DB-чек через SSH+psql
+6. Аватар Райи отдаётся (image/jpeg)
+
+**Слой 3 — Playwright** ([tests/playwright/smoke.spec.js](tests/playwright/smoke.spec.js))
+3 сценария в headless Chromium:
+1. Логин через debug-OTP → `/chat` → сайдбар с ассистентами рендерится
+2. Chat-interface работает с pre-selected ассистентом
+3. **Per-tab independence** (регрессия на cross-tab leak): два browser-context'а держат разные `sessionStorage.selected_assistant` без перетеканий
+
+### Глубокое покрытие (запускается выборочно при больших изменениях)
+
+#### API-suite (32 теста)
+Все эндпоинты: auth, profile, agents, chat, tokens, payments, referral, admin, search, compatibility, imagegen.
+```bash
+cd ~/Downloads/spirits_back/tests && node runner.js --suite api
+```
+
+#### E2E с авторизацией (18 тестов)
+SMS OTP → JWT → профиль → агенты → стриминг → история → смена агента → email → аватар → реферал.
 ```bash
 cd ~/Downloads/spirits_back/tests && node runner.js --suite e2e
 ```
-- 18/18 должны быть зелёными.
-- Использует debug endpoint для получения SMS кода.
 
-### 3. Реферальная система E2E (20 сценариев)
-Запускается на сервере (нужен доступ к PostgreSQL).
+#### Реферальная система E2E (20 сценариев, на сервере)
 ```bash
 scp ~/Downloads/spirits_back/tests/referral.e2e.sh dvolkov@212.113.106.202:/tmp/
 ssh dvolkov@212.113.106.202 "bash /tmp/referral.e2e.sh"
 ```
-Проверяет:
-- Создание лидеров L1/L2
-- Регистрация рефералов по slug
-- Защита от повторной регистрации
-- Регистрация по несуществующему/деактивированному slug
-- Начисление комиссий при оплате (L1 direct + L2 upstream)
-- Множественные оплаты
-- Статистика лидера (direct/upstream breakdown)
-- Admin: mark_paid одна комиссия
-- Admin: mark_all_paid все комиссии лидера
-- Admin: toggle active/inactive
-- Не-лидер получает isLeader=false
-- Admin summary (total/paid/pending)
-- Cleanup тестовых данных
+Покрывает: создание L1/L2 лидеров, slug-регистрацию, повторную регистрацию, деактивацию, комиссии (direct+upstream), множественные оплаты, статистику, admin mark_paid / mark_all_paid / toggle, summary, cleanup.
 
-### 4. Все тесты разом
+#### Video / chat-tools E2E
 ```bash
-cd ~/Downloads/spirits_back/tests && npm install && node runner.js
+bash ~/Downloads/spirits_back/tests/video.e2e.sh
+bash ~/Downloads/spirits_back/tests/chat-tools.e2e.sh
 ```
-Запускает api (32) + e2e (18) = 50 тестов.
 
-### 5. Проверка через браузер (Playwright)
+#### Все «глубокие» разом
 ```bash
-cd /tmp/pw_test && node final_test.js
+cd ~/Downloads/spirits_back/tests && node runner.js  # api (32) + e2e (18) = 50
 ```
-Скриншоты сохраняются в `/tmp/screenshots/`. Проверяет 8 вкладок:
-- /chat — выбор ассистента, стриминг чат
-- /profile — данные, аватар, ценности из Neo4j
-- /search — поиск людей
-- /compatibility — анализ совместимости
-- /tokens — пакеты токенов, YooKassa
-- /referral — партнёрская программа (для лидеров)
-- /admin — ассистенты, купоны, рефералы (для isadmin=true)
-- /image-gen — генерация изображений
 
 ## API Endpoints
 
