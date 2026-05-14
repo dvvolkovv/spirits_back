@@ -14,6 +14,7 @@ const suites = {
   api: require('./api.test'),
   db: require('./db.test'),
   e2e: require('./e2e.test'),
+  smm: require('./smm'),
 };
 
 let passed = 0;
