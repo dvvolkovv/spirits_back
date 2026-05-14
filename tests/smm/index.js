@@ -8,4 +8,5 @@ module.exports = {
   ...require('./queues.integration.test'),
   ...require('./render-callback.integration.test'),
   ...require('./scenario-fetch.integration.test'),
+  ...require('./subtitle-chunker.unit.test'),
 };
