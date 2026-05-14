@@ -63,8 +63,12 @@ async function applyMigration(filename: string, fullPath: string): Promise<void>
     await client.query('COMMIT');
     console.log(`✓ applied ${filename}`);
   } catch (err) {
-    await client.query('ROLLBACK');
-    throw new Error(`Failed to apply ${filename}: ${(err as Error).message}`);
+    try { await client.query('ROLLBACK'); } catch { /* connection likely dead */ }
+    const pgErr = err as { code?: string; position?: string; detail?: string; hint?: string; message: string };
+    console.error(`PG error in ${filename}: code=${pgErr.code ?? 'n/a'} position=${pgErr.position ?? 'n/a'} detail=${pgErr.detail ?? 'n/a'} hint=${pgErr.hint ?? 'n/a'}`);
+    const wrappedErr = new Error(`Failed to apply ${filename}: ${pgErr.message}`);
+    (wrappedErr as any).cause = err;
+    throw wrappedErr;
   } finally {
     client.release();
   }
@@ -75,34 +79,41 @@ async function main(): Promise<void> {
     console.error('DATABASE_URL is not set');
     process.exit(1);
   }
-  await ensureMigrationsTable();
-  const all = discoverMigrations();
-  const applied = await appliedSet();
-  const pending = all.filter((m) => !applied.has(m.filename));
+  // Serialize concurrent migrate runs (Flyway-style advisory lock).
+  // 8675309 is an arbitrary constant; must match across all runs.
+  await pool.query('SELECT pg_advisory_lock(8675309)');
+  try {
+    await ensureMigrationsTable();
+    const all = discoverMigrations();
+    const applied = await appliedSet();
+    const pending = all.filter((m) => !applied.has(m.filename));
 
-  if (pending.length === 0) {
-    console.log('No pending migrations');
-    return;
+    if (pending.length === 0) {
+      console.log('No pending migrations');
+      return;
+    }
+
+    console.log(`Pending migrations (${pending.length}):`);
+    for (const m of pending) console.log(`  - ${m.filename}`);
+
+    if (dryRun) {
+      console.log('(dry run, not applying)');
+      return;
+    }
+
+    for (const m of pending) {
+      await applyMigration(m.filename, m.fullPath);
+    }
+    console.log(`Applied ${pending.length} migration(s)`);
+  } finally {
+    await pool.query('SELECT pg_advisory_unlock(8675309)');
   }
-
-  console.log(`Pending migrations (${pending.length}):`);
-  for (const m of pending) console.log(`  - ${m.filename}`);
-
-  if (dryRun) {
-    console.log('(dry run, not applying)');
-    return;
-  }
-
-  for (const m of pending) {
-    await applyMigration(m.filename, m.fullPath);
-  }
-  console.log(`Applied ${pending.length} migration(s)`);
 }
 
 main()
   .then(() => pool.end())
-  .catch((err) => {
+  .catch(async (err) => {
     console.error(err);
-    pool.end();
+    await pool.end().catch(() => {});
     process.exit(1);
   });
