@@ -9,4 +9,5 @@ module.exports = {
   ...require('./render-callback.integration.test'),
   ...require('./scenario-fetch.integration.test'),
   ...require('./subtitle-chunker.unit.test'),
+  ...require('./render-e2e.integration.test'),
 };
