@@ -11,4 +11,5 @@ module.exports = {
   ...require('./subtitle-chunker.unit.test'),
   ...require('./render-e2e.integration.test'),
   ...require('./scenario-generation.integration.test'),
+  ...require('./approval.integration.test'),
 };
