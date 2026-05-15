@@ -16,9 +16,11 @@ import { ApprovalService } from './producer/approval.service';
 import { SmmProducerToolsService } from './producer/smm-producer-tools.service';
 import { ScenariosController } from './scenarios/scenarios.controller';
 import { VideosController } from './videos/videos.controller';
+import { PublicationContextController } from './publication/publication-context.controller';
+import { PublicationCallbackController } from './publication/publication-callback.controller';
 
 @Module({
-  controllers: [SmmController, RenderCallbackController, ScenarioFetchController, ScenariosController, VideosController],
+  controllers: [SmmController, RenderCallbackController, ScenarioFetchController, ScenariosController, VideosController, PublicationContextController, PublicationCallbackController],
   providers: [
     SmmBillingService,
     SmmPricingService,
