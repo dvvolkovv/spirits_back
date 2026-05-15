@@ -6,6 +6,7 @@ import { SmmPricingService } from './billing/smm-pricing.service';
 import { SocialAccountService } from './social-accounts/social-account.service';
 import { RenderQueueService } from './render/render-queue.service';
 import { PublishQueueService } from './publication/publish-queue.service';
+import { PublicationService } from './publication/publication.service';
 import { RenderCallbackController } from './render/render-callback.controller';
 import { ScenarioFetchController } from './render/scenario-fetch.controller';
 import { MusicService } from './music/music.service';
@@ -24,6 +25,7 @@ import { VideosController } from './videos/videos.controller';
     SocialAccountService,
     RenderQueueService,
     PublishQueueService,
+    PublicationService,
     MusicService,
     ScenarioService,
     TrendsService,
@@ -36,6 +38,7 @@ import { VideosController } from './videos/videos.controller';
     SocialAccountService,
     RenderQueueService,
     PublishQueueService,
+    PublicationService,
     MusicService,
     ScenarioService,
     TrendsService,
