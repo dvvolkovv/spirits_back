@@ -13,9 +13,11 @@ import { ScenarioService } from './producer/scenario.service';
 import { TrendsService } from './producer/trends.service';
 import { ApprovalService } from './producer/approval.service';
 import { SmmProducerToolsService } from './producer/smm-producer-tools.service';
+import { ScenariosController } from './scenarios/scenarios.controller';
+import { VideosController } from './videos/videos.controller';
 
 @Module({
-  controllers: [SmmController, RenderCallbackController, ScenarioFetchController],
+  controllers: [SmmController, RenderCallbackController, ScenarioFetchController, ScenariosController, VideosController],
   providers: [
     SmmBillingService,
     SmmPricingService,
