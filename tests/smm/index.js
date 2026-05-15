@@ -12,4 +12,5 @@ module.exports = {
   ...require('./render-e2e.integration.test'),
   ...require('./scenario-generation.integration.test'),
   ...require('./approval.integration.test'),
+  ...require('./producer-tools.integration.test'),
 };

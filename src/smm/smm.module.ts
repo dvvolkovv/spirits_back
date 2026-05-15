@@ -12,6 +12,7 @@ import { MusicService } from './music/music.service';
 import { ScenarioService } from './producer/scenario.service';
 import { TrendsService } from './producer/trends.service';
 import { ApprovalService } from './producer/approval.service';
+import { SmmProducerToolsService } from './producer/smm-producer-tools.service';
 
 @Module({
   controllers: [SmmController, RenderCallbackController, ScenarioFetchController],
@@ -25,6 +26,7 @@ import { ApprovalService } from './producer/approval.service';
     ScenarioService,
     TrendsService,
     ApprovalService,
+    SmmProducerToolsService,
   ],
   exports: [
     SmmBillingService,
@@ -36,6 +38,7 @@ import { ApprovalService } from './producer/approval.service';
     ScenarioService,
     TrendsService,
     ApprovalService,
+    SmmProducerToolsService,
   ],
 })
 export class SmmModule {}
