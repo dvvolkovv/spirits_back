@@ -11,6 +11,12 @@ import { Request, Response } from 'express';
 @Injectable()
 export class ChatService {
   private readonly logger = new Logger(ChatService.name);
+  // Множитель цены за текст для агентов, идущих через SDK-путь
+  // (streamUniversalAgent → r.linkeon.io). Применяется только для текстовых
+  // токенов; MCP-инструменты (картинки, видео) списываются их сервисами
+  // независимо и НЕ умножаются здесь. Не касается Маши (id=3, локальный
+  // Anthropic-путь через streamChat).
+  private readonly SDK_TEXT_MULTIPLIER = 2;
   private anthropic: Anthropic | null = null;
 
   constructor(
@@ -542,10 +548,11 @@ export class ChatService {
       const aiText = fullText
         || (final ? '_Ответ не пришёл. Попробуйте отправить сообщение ещё раз._' : '');
       if (!aiText) return; // skip empty intermediate persists
+      const textCost = fullText.length * this.SDK_TEXT_MULTIPLIER;
       try {
-        await this.saveChatHistory(userId, assistantId, message, aiText, fullText.length);
+        await this.saveChatHistory(userId, assistantId, message, aiText, textCost);
         if (fullText.length > 0) {
-          await this.addTokenTask(userId, 0, fullText.length, agentId);
+          await this.addTokenTask(userId, 0, textCost, agentId);
           if (this.neo4j) {
             try { await this.neo4j.consolidateFromChat(userId, assistantId, message, fullText); } catch {}
           }
@@ -643,7 +650,9 @@ export class ChatService {
       }
 
       const fullText = chunks.join('');
-      const tokensUsed = fullText.length; // approximate text cost
+      // Text cost: длина ответа × SDK-множитель. Картинки/видео списываются
+      // их MCP-сервисами отдельно (см. toolSpent ниже).
+      const tokensUsed = fullText.length * this.SDK_TEXT_MULTIPLIER;
 
       // Sum up tool-charged tokens (image, video, etc.) during this stream.
       // MCP-tools (MiscService.generateImage, VideoService.createJob) deduct
