@@ -18,6 +18,8 @@ import { ScenariosController } from './scenarios/scenarios.controller';
 import { VideosController } from './videos/videos.controller';
 import { PublicationContextController } from './publication/publication-context.controller';
 import { PublicationCallbackController } from './publication/publication-callback.controller';
+import { OAuthStateService } from './oauth/oauth-state.service';
+import { VkOAuthService } from './oauth/vk-oauth.service';
 
 @Module({
   controllers: [SmmController, RenderCallbackController, ScenarioFetchController, ScenariosController, VideosController, PublicationContextController, PublicationCallbackController],
@@ -33,6 +35,8 @@ import { PublicationCallbackController } from './publication/publication-callbac
     TrendsService,
     ApprovalService,
     SmmProducerToolsService,
+    OAuthStateService,
+    VkOAuthService,
   ],
   exports: [
     SmmBillingService,
@@ -46,6 +50,8 @@ import { PublicationCallbackController } from './publication/publication-callbac
     TrendsService,
     ApprovalService,
     SmmProducerToolsService,
+    OAuthStateService,
+    VkOAuthService,
   ],
 })
 export class SmmModule {}

@@ -19,6 +19,7 @@
     "bullmq": "^5.0.0",
     "dotenv": "^16.6.1",
     "ffmpeg-static": "^5.2.0",
+    "form-data": "^4.0.5",
     "ioredis": "^5.3.0",
     "pino": "^9.0.0",
     "pino-pretty": "^11.0.0"
