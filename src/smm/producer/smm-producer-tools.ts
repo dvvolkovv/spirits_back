@@ -1,0 +1,100 @@
+// src/smm/producer/smm-producer-tools.ts
+export const SMM_PRODUCER_TOOLS = [
+  {
+    name: 'generate_scenarios',
+    description:
+      'Generate N scenarios for short SMM videos. The mode controls the source: ' +
+      "'topic' — user gave an explicit theme (passed in `topic` arg); " +
+      "'trends' — fetch what's hot in Russian social media and pick from there; " +
+      "'auto' — let Claude pick freely from psy/lawyer/coach domains. " +
+      'Creates a campaign + N pending_review scenarios in DB. Returns the campaignId and an array of scenario IDs and titles.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        mode: { type: 'string', enum: ['auto', 'topic', 'trends'] },
+        count: { type: 'integer', minimum: 1, maximum: 10, default: 3 },
+        topic: { type: 'string', description: 'Only for mode=topic. The user-specified theme in Russian.' },
+      },
+      required: ['mode', 'count'],
+    },
+  },
+  {
+    name: 'regenerate_scenario',
+    description:
+      'Re-prompt Claude to rewrite a single scenario based on user feedback. ' +
+      "Use when the user says 'переделай первый', 'второй слишком длинный', etc. " +
+      'Replaces dialog, title, mood in the existing smm_scenario row (keeps the same id). Returns the updated scenario id.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        scenario_id: { type: 'string', description: 'UUID of the scenario to regenerate.' },
+        feedback: { type: 'string', description: "User's feedback in Russian, e.g. 'короче, эмоциональнее'." },
+      },
+      required: ['scenario_id', 'feedback'],
+    },
+  },
+  {
+    name: 'approve_scenarios',
+    description:
+      "Approve one or more pending_review scenarios. For each: charges tokens (15000 economy / 50000 premium) and enqueues a render job. " +
+      'If the user has insufficient tokens for some, those are returned in failed[] with reason="insufficient_tokens"; ' +
+      'approved scenarios still start rendering. Returns { approved: [{ scenarioId, videoId, jobId }], failed: [{ scenarioId, reason }] }.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        scenario_ids: { type: 'array', items: { type: 'string' }, description: 'UUIDs of scenarios to approve.' },
+      },
+      required: ['scenario_ids'],
+    },
+  },
+  {
+    name: 'reject_scenario',
+    description:
+      "Mark a single pending_review scenario as rejected. No billing impact (nothing was charged yet). Returns ok=true.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        scenario_id: { type: 'string' },
+      },
+      required: ['scenario_id'],
+    },
+  },
+  {
+    name: 'approve_video',
+    description:
+      "Mark a rendered video (status='ready') as approved by the admin. " +
+      'Returns ok=true. The next step is publication (Phase 2 — not yet wired into tools).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        video_id: { type: 'string' },
+      },
+      required: ['video_id'],
+    },
+  },
+  {
+    name: 'reject_video',
+    description:
+      "Mark a rendered video as rejected. Optional reason. No automatic refund — the admin already saw the result.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        video_id: { type: 'string' },
+        reason: { type: 'string' },
+      },
+      required: ['video_id'],
+    },
+  },
+  {
+    name: 'list_scenarios',
+    description:
+      "Show the latest scenarios for a campaign (or all latest if no campaign id) with their statuses. " +
+      'Used when the user asks "что там с моим заказом?" or "покажи мои сценарии".',
+    input_schema: {
+      type: 'object',
+      properties: {
+        campaign_id: { type: 'string', description: 'Optional. Filter by campaign.' },
+      },
+    },
+  },
+];

@@ -5,9 +5,10 @@ import { ChatToolsService } from './chat-tools';
 import { MiscModule } from '../misc/misc.module';
 import { CommonModule } from '../common/common.module';
 import { VideoModule } from '../video/video.module';
+import { SmmModule } from '../smm/smm.module';
 
 @Module({
-  imports: [MiscModule, CommonModule, VideoModule],
+  imports: [MiscModule, CommonModule, VideoModule, SmmModule],
   controllers: [ChatController],
   providers: [ChatService, ChatToolsService],
   exports: [ChatToolsService],

@@ -9,9 +9,15 @@ import { PublishQueueService } from './publication/publish-queue.service';
 import { RenderCallbackController } from './render/render-callback.controller';
 import { ScenarioFetchController } from './render/scenario-fetch.controller';
 import { MusicService } from './music/music.service';
+import { ScenarioService } from './producer/scenario.service';
+import { TrendsService } from './producer/trends.service';
+import { ApprovalService } from './producer/approval.service';
+import { SmmProducerToolsService } from './producer/smm-producer-tools.service';
+import { ScenariosController } from './scenarios/scenarios.controller';
+import { VideosController } from './videos/videos.controller';
 
 @Module({
-  controllers: [SmmController, RenderCallbackController, ScenarioFetchController],
+  controllers: [SmmController, RenderCallbackController, ScenarioFetchController, ScenariosController, VideosController],
   providers: [
     SmmBillingService,
     SmmPricingService,
@@ -19,6 +25,10 @@ import { MusicService } from './music/music.service';
     RenderQueueService,
     PublishQueueService,
     MusicService,
+    ScenarioService,
+    TrendsService,
+    ApprovalService,
+    SmmProducerToolsService,
   ],
   exports: [
     SmmBillingService,
@@ -27,6 +37,10 @@ import { MusicService } from './music/music.service';
     RenderQueueService,
     PublishQueueService,
     MusicService,
+    ScenarioService,
+    TrendsService,
+    ApprovalService,
+    SmmProducerToolsService,
   ],
 })
 export class SmmModule {}

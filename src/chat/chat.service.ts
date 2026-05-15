@@ -3,6 +3,9 @@ import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { KlingService } from '../misc/kling.service';
 import { ChatToolsService, CHAT_TOOLS } from './chat-tools';
+import { SmmProducerToolsService } from '../smm/producer/smm-producer-tools.service';
+import { SMM_PRODUCER_SYSTEM_PROMPT } from '../smm/producer/smm-producer.prompt';
+import { SMM_PRODUCER_TOOLS } from '../smm/producer/smm-producer-tools';
 import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import { Request, Response } from 'express';
@@ -24,6 +27,7 @@ export class ChatService {
     @Optional() private readonly neo4j: Neo4jService,
     @Optional() private readonly kling: KlingService,
     private readonly tools: ChatToolsService,
+    private readonly smmProducerTools: SmmProducerToolsService,
   ) {
     if (process.env.ANTHROPIC_API_KEY) {
       this.anthropic = new Anthropic({
@@ -84,6 +88,24 @@ export class ChatService {
         res.end();
         return;
       }
+    }
+
+    // Route SMM-Producer agent to its dedicated Anthropic tool-calling path
+    if (agent?.name === 'smm_producer') {
+      // Set streaming headers before delegating
+      res.status(200);
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Transfer-Encoding', 'chunked');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.write(JSON.stringify({ type: 'begin' }) + '\n');
+      const llmMessages: any[] = [];
+      for (const msg of recentHistory) {
+        llmMessages.push({ role: msg.type === 'user' ? 'user' : 'assistant', content: msg.content });
+      }
+      llmMessages.push({ role: 'user', content: message });
+      return this.streamSmmProducer(userId, agent, llmMessages, res);
     }
 
     // Route ALL agents except Маша (id=3 — uses метафорические карты через Anthropic+CHAT_TOOLS path)
@@ -922,5 +944,80 @@ export class ChatService {
       messages.push(...toolResultMsgs);
     }
     return { inputTokens, outputTokens };
+  }
+
+  private async streamSmmProducer(
+    userId: string,
+    agent: any,
+    llmMessages: any[],
+    res: any,
+  ): Promise<void> {
+    if (!this.anthropic) {
+      res.write(JSON.stringify({ type: 'error', message: 'Anthropic not configured' }) + '\n');
+      res.end();
+      return;
+    }
+
+    const messages: any[] = [...llmMessages];
+    const ctx = { userId };
+    let safetyTurns = 6;
+
+    while (safetyTurns-- > 0) {
+      let stopReason: string | null = null;
+      let finalMessage: any = null;
+
+      try {
+        const stream = this.anthropic.messages.stream({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 2000,
+          system: SMM_PRODUCER_SYSTEM_PROMPT,
+          tools: SMM_PRODUCER_TOOLS as any,
+          messages,
+        });
+        stream.on('text', (chunk: string) => {
+          res.write(JSON.stringify({ type: 'item', content: chunk }) + '\n');
+        });
+        finalMessage = await stream.finalMessage();
+        stopReason = finalMessage.stop_reason;
+      } catch (e: any) {
+        this.logger.error(`SMM-Producer stream error: ${e.message}`);
+        res.write(JSON.stringify({ type: 'error', message: e.message }) + '\n');
+        res.end();
+        return;
+      }
+
+      if (stopReason !== 'tool_use') {
+        // Final text response — exit the loop
+        break;
+      }
+
+      // Process tool_use blocks
+      const toolUseBlocks = (finalMessage.content as any[]).filter((b) => b?.type === 'tool_use');
+      messages.push({ role: 'assistant', content: finalMessage.content });
+
+      const toolResults: any[] = [];
+      for (const block of toolUseBlocks) {
+        const toolName = block.name;
+        const toolInput = block.input;
+        this.logger.log(`SMM-Producer tool call: ${toolName} ${JSON.stringify(toolInput).slice(0, 100)}`);
+        const result = await this.smmProducerTools.handle(toolName, toolInput, ctx);
+
+        // Emit a structured event for the frontend
+        res.write(JSON.stringify({
+          type: 'tool_result',
+          tool: toolName,
+          result,
+        }) + '\n');
+
+        toolResults.push({
+          type: 'tool_result',
+          tool_use_id: block.id,
+          content: JSON.stringify(result),
+        });
+      }
+      messages.push({ role: 'user', content: toolResults });
+    }
+
+    res.end();
   }
 }
