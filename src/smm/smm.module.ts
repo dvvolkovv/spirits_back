@@ -20,6 +20,7 @@ import { PublicationContextController } from './publication/publication-context.
 import { PublicationCallbackController } from './publication/publication-callback.controller';
 import { OAuthStateService } from './oauth/oauth-state.service';
 import { VkOAuthService } from './oauth/vk-oauth.service';
+import { YouTubeOAuthService } from './oauth/youtube-oauth.service';
 
 @Module({
   controllers: [SmmController, RenderCallbackController, ScenarioFetchController, ScenariosController, VideosController, PublicationContextController, PublicationCallbackController],
@@ -37,6 +38,7 @@ import { VkOAuthService } from './oauth/vk-oauth.service';
     SmmProducerToolsService,
     OAuthStateService,
     VkOAuthService,
+    YouTubeOAuthService,
   ],
   exports: [
     SmmBillingService,
@@ -52,6 +54,7 @@ import { VkOAuthService } from './oauth/vk-oauth.service';
     SmmProducerToolsService,
     OAuthStateService,
     VkOAuthService,
+    YouTubeOAuthService,
   ],
 })
 export class SmmModule {}
