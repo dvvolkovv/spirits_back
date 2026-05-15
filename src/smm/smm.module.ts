@@ -21,6 +21,7 @@ import { PublicationCallbackController } from './publication/publication-callbac
 import { OAuthStateService } from './oauth/oauth-state.service';
 import { VkOAuthService } from './oauth/vk-oauth.service';
 import { YouTubeOAuthService } from './oauth/youtube-oauth.service';
+import { TikTokOAuthService } from './oauth/tiktok-oauth.service';
 
 @Module({
   controllers: [SmmController, RenderCallbackController, ScenarioFetchController, ScenariosController, VideosController, PublicationContextController, PublicationCallbackController],
@@ -39,6 +40,7 @@ import { YouTubeOAuthService } from './oauth/youtube-oauth.service';
     OAuthStateService,
     VkOAuthService,
     YouTubeOAuthService,
+    TikTokOAuthService,
   ],
   exports: [
     SmmBillingService,
@@ -55,6 +57,7 @@ import { YouTubeOAuthService } from './oauth/youtube-oauth.service';
     OAuthStateService,
     VkOAuthService,
     YouTubeOAuthService,
+    TikTokOAuthService,
   ],
 })
 export class SmmModule {}
