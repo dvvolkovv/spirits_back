@@ -10,6 +10,7 @@ import { RenderCallbackController } from './render/render-callback.controller';
 import { ScenarioFetchController } from './render/scenario-fetch.controller';
 import { MusicService } from './music/music.service';
 import { ScenarioService } from './producer/scenario.service';
+import { TrendsService } from './producer/trends.service';
 
 @Module({
   controllers: [SmmController, RenderCallbackController, ScenarioFetchController],
@@ -21,6 +22,7 @@ import { ScenarioService } from './producer/scenario.service';
     PublishQueueService,
     MusicService,
     ScenarioService,
+    TrendsService,
   ],
   exports: [
     SmmBillingService,
@@ -30,6 +32,7 @@ import { ScenarioService } from './producer/scenario.service';
     PublishQueueService,
     MusicService,
     ScenarioService,
+    TrendsService,
   ],
 })
 export class SmmModule {}
