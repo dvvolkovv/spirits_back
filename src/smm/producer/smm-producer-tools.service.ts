@@ -4,6 +4,13 @@ import { PgService } from '../../common/services/pg.service';
 import { ScenarioService, SourceMode } from './scenario.service';
 import { TrendsService } from './trends.service';
 import { ApprovalService } from './approval.service';
+import { PublicationService } from '../publication/publication.service';
+import { OAuthStateService, Platform as OAuthPlatform } from '../oauth/oauth-state.service';
+import { VkOAuthService } from '../oauth/vk-oauth.service';
+import { YouTubeOAuthService } from '../oauth/youtube-oauth.service';
+import { TikTokOAuthService } from '../oauth/tiktok-oauth.service';
+import { MetaOAuthService } from '../oauth/meta-oauth.service';
+import { parseScheduleTime } from '../publication/time-parser';
 
 export interface ToolContext {
   userId: string;
@@ -20,6 +27,12 @@ export class SmmProducerToolsService {
     private readonly scenario: ScenarioService,
     private readonly trends: TrendsService,
     private readonly approval: ApprovalService,
+    private readonly publication: PublicationService,
+    private readonly oauthState: OAuthStateService,
+    private readonly vk: VkOAuthService,
+    private readonly yt: YouTubeOAuthService,
+    private readonly tt: TikTokOAuthService,
+    private readonly meta: MetaOAuthService,
   ) {}
 
   async handle(toolName: string, input: any, ctx: ToolContext): Promise<any> {
@@ -32,6 +45,10 @@ export class SmmProducerToolsService {
         case 'approve_video':       return await this.approveVideo(input);
         case 'reject_video':        return await this.rejectVideo(input);
         case 'list_scenarios':      return await this.listScenarios(input, ctx);
+        case 'connect_social':       return await this.connectSocial(input, ctx);
+        case 'schedule_publication': return await this.schedulePublication(input, ctx);
+        case 'cancel_publication':   return await this.cancelPublication(input);
+        case 'list_publications':    return await this.listPublications(input, ctx);
         default:
           return { error: `unknown tool: ${toolName}` };
       }
@@ -116,5 +133,77 @@ export class SmmProducerToolsService {
          WHERE c.user_id = $1 ORDER BY s.created_at DESC LIMIT 20`;
     const r = await this.pg.query(query, [input.campaign_id ?? ctx.userId]);
     return { scenarios: r.rows };
+  }
+
+  private async connectSocial(input: { platform: string }, ctx: ToolContext): Promise<{
+    platform: string;
+    method: 'oauth' | 'manual';
+    authorizeUrl?: string;
+    instructions?: string;
+  }> {
+    if (input.platform === 'telegram') {
+      return {
+        platform: 'telegram',
+        method: 'manual',
+        instructions:
+          'Создай бота через @BotFather, добавь его как администратора в свой канал, ' +
+          'затем напиши боту первое сообщение чтобы получить chat_id (или используй @username канала). ' +
+          'Затем отправь POST на /webhook/smm/social-accounts/telegram с { botToken, chatId, displayName? }.',
+      };
+    }
+    if (!['vk', 'youtube', 'tiktok', 'instagram'].includes(input.platform)) {
+      throw new Error(`unsupported platform: ${input.platform}`);
+    }
+    const stateToken = await this.oauthState.create(ctx.userId, input.platform as OAuthPlatform);
+    let authorizeUrl: string;
+    switch (input.platform) {
+      case 'vk':        authorizeUrl = this.vk.buildAuthorizeUrl(stateToken); break;
+      case 'youtube':   authorizeUrl = this.yt.buildAuthorizeUrl(stateToken); break;
+      case 'tiktok':    authorizeUrl = this.tt.buildAuthorizeUrl(stateToken); break;
+      case 'instagram': authorizeUrl = this.meta.buildAuthorizeUrl(stateToken); break;
+      default: throw new Error(`unsupported`);
+    }
+    return { platform: input.platform, method: 'oauth', authorizeUrl };
+  }
+
+  private async schedulePublication(
+    input: { video_id: string; platforms: string[]; scheduled_time?: string; caption?: string },
+    ctx: ToolContext,
+  ) {
+    const scheduledAt = parseScheduleTime(input.scheduled_time ?? null);
+    const result = await this.publication.schedulePublications({
+      userId: ctx.userId,
+      videoId: input.video_id,
+      platforms: input.platforms as any[],
+      scheduledAt,
+      caption: input.caption,
+    });
+    return result;
+  }
+
+  private async cancelPublication(input: { publication_id: string }): Promise<{ ok: true }> {
+    await this.publication.cancel(input.publication_id);
+    return { ok: true };
+  }
+
+  private async listPublications(
+    input: { status?: string; video_id?: string },
+    ctx: ToolContext,
+  ) {
+    const rows = await this.publication.listForUser(ctx.userId, {
+      status: input.status,
+      videoId: input.video_id,
+    });
+    return {
+      publications: rows.map((p) => ({
+        id: p.id,
+        videoId: p.videoId,
+        platform: p.platform,
+        status: p.status,
+        scheduledAt: p.scheduledAt,
+        publishedAt: p.publishedAt,
+        externalUrl: p.externalUrl,
+      })),
+    };
   }
 }

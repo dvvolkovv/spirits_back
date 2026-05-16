@@ -46,6 +46,36 @@ export interface RenderCallbackInput {
   errorMessage?: string;
 }
 
+export interface SmmPublicationContext {
+  publication: {
+    id: string;
+    videoId: string;
+    platform: 'telegram' | 'vk' | 'youtube' | 'tiktok' | 'instagram';
+    scheduledAt: string | null;
+    status: string;
+    caption: string | null;
+  };
+  video: {
+    id: string;
+    mp4Url: string | null;
+    durationSec: number | null;
+  };
+  account: {
+    id: string;
+    platform: string;
+    displayName: string;
+    credentials: Record<string, unknown>;
+  };
+}
+
+export interface PublicationCallbackInput {
+  publicationId: string;
+  status: 'published' | 'failed';
+  externalUrl?: string;
+  externalPostId?: string;
+  errorMessage?: string;
+}
+
 export class ApiClient {
   private http: AxiosInstance;
 
@@ -80,6 +110,19 @@ export class ApiClient {
       throw new Error(`sendCallback ${input.videoId}: ${r.status} ${JSON.stringify(r.data)}`);
     }
     logger.info({ videoId: input.videoId, status: input.status }, 'callback delivered');
+  }
+
+  async getPublicationContext(publicationId: string): Promise<SmmPublicationContext> {
+    const r = await this.http.get(`/webhook/smm/internal/publication-context/${publicationId}`);
+    if (r.status !== 200) throw new Error(`getPublicationContext ${publicationId}: ${r.status} ${JSON.stringify(r.data)}`);
+    return r.data;
+  }
+
+  async sendPublicationCallback(input: PublicationCallbackInput): Promise<void> {
+    const r = await this.http.post(`/webhook/smm/internal/publication-callback`, input);
+    if (r.status >= 300) {
+      throw new Error(`sendPublicationCallback ${input.publicationId}: ${r.status} ${JSON.stringify(r.data)}`);
+    }
   }
 
   async listMusicTracks(): Promise<Array<{

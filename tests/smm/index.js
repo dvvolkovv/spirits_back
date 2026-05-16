@@ -13,4 +13,5 @@ module.exports = {
   ...require('./scenario-generation.integration.test'),
   ...require('./approval.integration.test'),
   ...require('./producer-tools.integration.test'),
+  ...require('./time-parser.unit.test'),
 };
