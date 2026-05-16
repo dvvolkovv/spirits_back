@@ -23,9 +23,11 @@ import { VkOAuthService } from './oauth/vk-oauth.service';
 import { YouTubeOAuthService } from './oauth/youtube-oauth.service';
 import { TikTokOAuthService } from './oauth/tiktok-oauth.service';
 import { MetaOAuthService } from './oauth/meta-oauth.service';
+import { OAuthController } from './oauth/oauth.controller';
+import { SocialAccountController } from './social-accounts/social-account.controller';
 
 @Module({
-  controllers: [SmmController, RenderCallbackController, ScenarioFetchController, ScenariosController, VideosController, PublicationContextController, PublicationCallbackController],
+  controllers: [SmmController, RenderCallbackController, ScenarioFetchController, ScenariosController, VideosController, PublicationContextController, PublicationCallbackController, OAuthController, SocialAccountController],
   providers: [
     SmmBillingService,
     SmmPricingService,
