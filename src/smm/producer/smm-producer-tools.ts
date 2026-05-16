@@ -97,4 +97,66 @@ export const SMM_PRODUCER_TOOLS = [
       },
     },
   },
+  // === Plan 4 tools ===
+  {
+    name: 'connect_social',
+    description:
+      "Returns a link the user opens in a browser to authorize Linkeon to publish on a social platform. " +
+      "For Telegram, returns instructions for the manual setup flow (POST a bot_token + chat_id via REST). " +
+      "For VK/YouTube/TikTok/Instagram, returns an OAuth authorize URL.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        platform: { type: 'string', enum: ['telegram', 'vk', 'youtube', 'tiktok', 'instagram'] },
+      },
+      required: ['platform'],
+    },
+  },
+  {
+    name: 'schedule_publication',
+    description:
+      "Schedule a video to publish to one or more social platforms. The video must be in 'approved' or 'ready' status. " +
+      "scheduled_time accepts: ISO timestamp ('2026-05-16T18:00:00+03:00'), Russian phrases ('завтра в 18', 'через час', 'сейчас'), or null/empty for immediate. " +
+      "platforms: any subset of ['telegram', 'vk', 'youtube', 'tiktok', 'instagram']. Per-platform results in scheduled[] / failed[].",
+    input_schema: {
+      type: 'object',
+      properties: {
+        video_id: { type: 'string', description: 'UUID of the approved video.' },
+        platforms: {
+          type: 'array',
+          items: { type: 'string', enum: ['telegram', 'vk', 'youtube', 'tiktok', 'instagram'] },
+          description: 'Which platforms to post on.',
+        },
+        scheduled_time: { type: 'string', description: 'When to publish. ISO or Russian phrase. Null/empty = now.' },
+        caption: { type: 'string', description: 'Optional caption text (Russian).' },
+      },
+      required: ['video_id', 'platforms'],
+    },
+  },
+  {
+    name: 'cancel_publication',
+    description:
+      "Cancel a scheduled publication that hasn't started yet (status='scheduled'). " +
+      "Publications in 'publishing'/'published'/'failed' status cannot be cancelled.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        publication_id: { type: 'string' },
+      },
+      required: ['publication_id'],
+    },
+  },
+  {
+    name: 'list_publications',
+    description:
+      "List the user's recent publications (last 50), optionally filtered by status or videoId. " +
+      "Use when the user asks 'что в расписании?', 'когда выйдет ролик?', or 'покажи опубликованные'.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', enum: ['scheduled', 'publishing', 'published', 'failed', 'cancelled'] },
+        video_id: { type: 'string' },
+      },
+    },
+  },
 ];
