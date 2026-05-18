@@ -93,16 +93,26 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
     if (stockVideoUrls.length !== stockPrompts.length) {
       const fresh: string[] = [];
       for (let i = 0; i < stockPrompts.length; i++) {
+        // Try Pexels first (instant, free). Falls into catch on missing API key.
+        let pexelsUrl: string | null = null;
         try {
           const match = await searchStockVideo({ query: stockPrompts[i].prompt });
           if (match) {
             const localPath = await downloadStockVideo(match.downloadUrl, tmp.root, `stock-${i}`);
-            const url = await uploadVideoToMinio(localPath, `videos/${input.videoId}/stock-${i}`);
-            fresh.push(url);
-            continue;
+            pexelsUrl = await uploadVideoToMinio(localPath, `videos/${input.videoId}/stock-${i}`);
           }
-          // Pexels miss — try Kling text2video as fallback (+3-4 min wait per missed clip)
-          logger.warn({ prompt: stockPrompts[i].prompt }, 'no stock-video match, trying Kling fallback');
+        } catch (err: any) {
+          logger.warn({ prompt: stockPrompts[i].prompt, err: err.message }, 'Pexels failed, will try Kling');
+        }
+
+        if (pexelsUrl) {
+          fresh.push(pexelsUrl);
+          continue;
+        }
+
+        // Pexels miss or error — try Kling text2video as fallback (+3-5 min wait per clip).
+        logger.warn({ prompt: stockPrompts[i].prompt }, 'no Pexels match, trying Kling text2video fallback');
+        try {
           const klingUrl = await klingText2Video(stockPrompts[i].prompt);
           if (klingUrl) {
             const localPath = await downloadStockVideo(klingUrl, tmp.root, `stock-${i}`);
@@ -110,11 +120,11 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
             fresh.push(url);
             logger.info({ prompt: stockPrompts[i].prompt }, 'Kling fallback succeeded');
           } else {
-            logger.warn({ prompt: stockPrompts[i].prompt }, 'Kling fallback also failed, skipping clip');
+            logger.warn({ prompt: stockPrompts[i].prompt }, 'Kling fallback also failed (no creds or timeout), skipping clip');
             fresh.push('');
           }
         } catch (err: any) {
-          logger.warn({ prompt: stockPrompts[i].prompt, err: err.message }, 'stock-video step failed, skipping');
+          logger.warn({ prompt: stockPrompts[i].prompt, err: err.message }, 'Kling fallback exception, skipping');
           fresh.push('');
         }
       }
