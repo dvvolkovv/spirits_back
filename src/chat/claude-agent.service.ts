@@ -40,6 +40,21 @@ export class ClaudeAgentService {
     const cwd = path.join(SESSION_ROOT, ctx.userId);
     await fs.promises.mkdir(cwd, { recursive: true });
 
+    // Pre-flight balance check (defense-in-depth — chat.service.ts also checks).
+    const balRes = await this.pg.query(
+      `SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1`,
+      [ctx.userId],
+    );
+    const balance = Number(balRes.rows[0]?.tokens ?? 0);
+    if (balance <= 0) {
+      res.write(JSON.stringify({
+        type: 'error',
+        message: '⚠️ Недостаточно токенов для SMM-продюсера. Пополни баланс через /chat?view=tokens.',
+      }) + '\n');
+      res.end();
+      return;
+    }
+
     // Resume previous session if we have one
     const resumeId = await this.loadSessionId(ctx.userId);
 
@@ -104,9 +119,24 @@ export class ClaudeAgentService {
       }
     }
 
-    // Token accounting hook — placeholder until Task 5
+    // Token billing: convert SDK total_cost_usd to Linkeon tokens.
+    // Placeholder rate: $1 = 100k tokens (~$200/mo Claude Max → 20M tokens/mo budget).
     if (totalCostUsd > 0) {
-      this.logger.log(`SMM agent cost for user ${ctx.userId}: $${totalCostUsd.toFixed(4)}`);
+      const tokensToDeduct = Math.ceil(totalCostUsd * 100_000);
+      try {
+        await this.pg.query(
+          `UPDATE ai_profiles_consolidated
+              SET tokens = GREATEST(0, tokens - $1),
+                  updated_at = now()
+            WHERE user_id = $2`,
+          [tokensToDeduct, ctx.userId],
+        );
+        this.logger.log(
+          `SMM agent billing: user=${ctx.userId} cost=$${totalCostUsd.toFixed(4)} deducted=${tokensToDeduct}`,
+        );
+      } catch (e: any) {
+        this.logger.error(`Failed to deduct SMM tokens for ${ctx.userId}: ${e.message}`);
+      }
     }
 
     res.end();
