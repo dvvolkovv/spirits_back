@@ -132,11 +132,13 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
       await persist(input.videoId, state);
     }
 
-    // STEP 3: Music
-    const track = ctx.scenario.musicTrackId
-      ? null  // explicit track id reserved for future; for MVP we always pick by mood
-      : await pickTrackByMood(ctx.scenario.mood as Mood, 60);
-    const musicUrl = track ? track.publicUrl : null;
+    // STEP 3: Music — temporarily disabled.
+    // Library currently contains only placeholder sine-wave tones (one synthetic
+    // file uploaded to all 6 mood keys during Plan 2 seed). Sounds like a beep.
+    // Re-enable when real licensed music tracks are uploaded to MinIO at the same
+    // storage_keys (calm.mp3, dramatic.mp3, etc) and smm_music_track.license != 'placeholder'.
+    const musicUrl: string | null = null;
+    void pickTrackByMood;  // keep import alive for when music is re-enabled
 
     // STEP 4: Build Remotion props
     // Re-time dialog using measured TTS durations so words don't get cropped.
