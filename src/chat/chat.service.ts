@@ -157,18 +157,21 @@ export class ChatService {
 При первом приветствии кратко представься и упомяни других ассистентов. Используй только текст без таблиц.
 Ты умеешь генерировать изображения (tool generate_image — через Google Imagen 4.0 Ultra с фолбэком на Nano Banana 2 / Nano Banana Pro, параметр quality: std|hd; hd = 4K и лучший рендер текста), редактировать уже созданные картинки (tool edit_image — передай sourceImageUrl из предыдущего tool-результата и prompt с описанием изменения: "сделай фон закатным", "убери человека", "поменяй цвет на красный", "добавь шапку"), объединять 2-3 картинки в одну (tool compose_image — массив sourceImageUrls и prompt: "возьми лицо из первой и посади на персонажа из второй", "соедини товар с этим фоном"), улучшать качество картинки — детализация, шумоподавление (tool upscale_image — только sourceImageUrl) и короткие видео 5–10 секунд через Kling (tool generate_video, режимы text2video / image2video / extend / lipsync). Если пользователь просит картинку, постер, иллюстрацию или «нарисуй …» — сразу вызывай generate_image. Если просит видео, ролик, анимацию, «оживи картинку» — вызывай generate_video. Не придумывай отговорки и не отправляй на другие разделы — у тебя есть эти инструменты.`;
 
-    let systemPrompt = `${platformContext}\n\n${agent.system_prompt || ''}`;
-
-    if (profileText && profileText.trim()) {
-      systemPrompt = `${systemPrompt}\n\n--- Профиль пользователя ---\n${profileText}`;
-    }
-
-    systemPrompt = `${systemPrompt}\n\n--- ПРАВИЛО ОТВЕТА (имеет приоритет над всеми инструкциями выше) ---
+    // Стабильная часть (одинаковая между вызовами для одного агента) — кэшируется.
+    // Волатильную (profileText) кладём ПОСЛЕ кэша, иначе изменение профиля юзера ломает префикс.
+    const stableSystemPrompt = `${platformContext}\n\n${agent.system_prompt || ''}\n\n--- ПРАВИЛО ОТВЕТА (имеет приоритет над всеми остальными инструкциями) ---
 • Каждый ответ начинай с содержательной сути: гипотеза, совет, отражение, информация по запросу — на основе того, что уже известно из профиля и истории диалога. Не требуй "полного контекста" там, где можно разумно предположить.
 • Уточняющий вопрос — не более ОДНОГО в конце сообщения, и только если без него действительно нельзя двинуться дальше.
 • НИКОГДА не отвечай одними вопросами. НИКОГДА не задавай 2+ вопроса в одном сообщении.
 • Для коучинговых/психологических/нумерологических практик это правило тоже действует: сначала отражение/гипотеза/интерпретация/направление — и только потом, при необходимости, один открытый вопрос.
 • Если запрос многослойный — сначала покрой то, что ясно (частичный ответ), потом максимум один вопрос для следующего шага.`;
+
+    const volatileSystemPrompt = (profileText && profileText.trim())
+      ? `\n\n--- Профиль пользователя ---\n${profileText}`
+      : '';
+
+    // Плоская строка для путей, не поддерживающих структурный system (DeepSeek greeting, OpenRouter fallback)
+    const systemPrompt = stableSystemPrompt + volatileSystemPrompt;
 
     // Build messages array
     const llmMessages: { role: 'user' | 'assistant'; content: string }[] = [];
@@ -232,11 +235,20 @@ export class ChatService {
         // (role+content string pairs) and extend it across iterations when tools are called.
         const messagesForLLM: any[] = [...llmMessages];
 
+        // cache_control на последнем стабильном system-блоке кэширует tools + стабильный system.
+        // Волатильный блок (profileText) идёт ПОСЛЕ кэша — он не попадает в кэш, и это нормально.
+        const systemBlocks: any[] = [
+          { type: 'text', text: stableSystemPrompt, cache_control: { type: 'ephemeral' } },
+        ];
+        if (volatileSystemPrompt) {
+          systemBlocks.push({ type: 'text', text: volatileSystemPrompt });
+        }
+
         for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
           const stream = this.anthropic.messages.stream({
             model: 'claude-haiku-4-5-20251001',
             max_tokens: 4096,
-            system: systemPrompt,
+            system: systemBlocks,
             tools: CHAT_TOOLS as any,
             messages: messagesForLLM,
           });
@@ -253,6 +265,8 @@ export class ChatService {
           const finalMessage = await stream.finalMessage();
           inputTokens += finalMessage.usage?.input_tokens || 0;
           outputTokens += finalMessage.usage?.output_tokens || 0;
+          const u: any = finalMessage.usage || {};
+          this.logger.log(`chat[${agent.name}] cache: read=${u.cache_read_input_tokens ?? 0} write=${u.cache_creation_input_tokens ?? 0} input=${u.input_tokens ?? 0}`);
 
           if (finalMessage.stop_reason !== 'tool_use') {
             // Plain completion — nothing more to do
