@@ -66,15 +66,15 @@ export class AuthService {
     try {
       const url = `https://gate.smsaero.ru/v2/sms/send`;
       const auth = Buffer.from(`${login}:${apiKey}`).toString('base64');
-      // ⚠️ SMS Aero возвращает 400 на тексты с символами @ и # или с \n
-      // (выяснили эмпирически: WebOTP-маркер `\n@my.linkeon.io #code` ломал
-      // отправку начиная с 2026-05-14). Возвращаем однострочный текст. Если
-      // позже захочется WebOTP-автозаполнения — нужно перейти на другой
-      // SMS-провайдер или использовать SMS Aero «Viber+SMS» канал.
+      // WebOTP-маркер в последней строке — Chrome Android и Safari iOS17+
+      // подставят код в форму через navigator.credentials.get. Формат строгий:
+      // `@<hostname> #<code>` (origin без протокола). Проверено что SMS Aero
+      // принимает `\n@#` через axios params (URL-кодируется как %0A%40%23) —
+      // см. test от 2026-05-15. Прошлые 400-errors были не из-за формата.
       const resp = await axios.get(url, {
         params: {
           number: phone,
-          text: `Код ${code} для входа в linkeon.io`,
+          text: `Код ${code} для входа в linkeon.io\n@my.linkeon.io #${code}`,
           sign: 'SMSAero',
         },
         headers: { Authorization: `Basic ${auth}` },
@@ -82,7 +82,9 @@ export class AuthService {
         validateStatus: () => true,
       });
       if (resp.status >= 400) {
-        this.logger.error(`SMS Aero ${resp.status}: ${JSON.stringify(resp.data).slice(0, 300)}`);
+        // validateStatus + body capture — раньше ошибка ловилась как голое
+        // «status code 400» без тела, что мешало диагностике.
+        this.logger.error(`SMS Aero ${resp.status} for ${phone}: ${JSON.stringify(resp.data).slice(0, 300)}`);
       } else {
         this.logger.log(`SMS sent to ${phone}`);
       }
