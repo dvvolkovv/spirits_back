@@ -106,12 +106,12 @@ export class ChatService {
       await this.pg.query(
         `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
          VALUES ($1, 'human', $2, $3, 'text')`,
-        [chatSessionId, agent.name, message],
+        [chatSessionId, agent.id, message],
       );
 
       const ctx = { userId };
       try {
-        await this.claudeAgent.streamSmmProducer(ctx, message, chatSessionId, agent.name, res);
+        await this.claudeAgent.streamSmmProducer(ctx, message, chatSessionId, agent.id, res);
       } catch (err: any) {
         this.logger.error(`SMM streaming failed: ${err.message}`);
         // Best-effort error event; res may already be ended.

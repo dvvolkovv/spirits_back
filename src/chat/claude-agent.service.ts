@@ -40,7 +40,7 @@ export class ClaudeAgentService {
     ctx: ToolContext,
     userMessage: string,
     chatSessionId: string,
-    agentName: string,
+    agentId: number,
     res: Response,
   ): Promise<void> {
     const cwd = path.join(SESSION_ROOT, ctx.userId);
@@ -118,7 +118,7 @@ export class ClaudeAgentService {
         await this.pg.query(
           `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
            VALUES ($1, 'ai', $2, $3, 'text')`,
-          [chatSessionId, agentName, assistantText],
+          [chatSessionId, agentId, assistantText],
         );
       } catch (e: any) {
         this.logger.warn(`Failed to persist SMM assistant response: ${e.message}`);
