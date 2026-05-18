@@ -161,9 +161,10 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
 
     // Dynamic video duration: stop ~5 sec after the last dialog turn (5 sec for CTA).
     // No more dead silence padding to a hardcoded 60 sec.
+    // IMPORTANT: read from RETIMED dialog (with actual TTS durations), not original Claude estimates.
     const maxDialogEnd = Math.max(
       0,
-      ...ctx.scenario.dialog.map((t) => t.tEnd),
+      ...dialog.map((t) => t.tEnd),
     );
     const CTA_DURATION = 5;
     const totalDurationSec = Math.min(
