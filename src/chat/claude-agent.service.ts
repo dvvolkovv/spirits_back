@@ -8,7 +8,7 @@ import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
 import { SmmProducerToolsService, ToolContext } from '../smm/producer/smm-producer-tools.service';
 import { SMM_PRODUCER_SYSTEM_PROMPT } from '../smm/producer/smm-producer.prompt';
-import { translateSdkEvent } from './claude-agent.event-translator';
+import { SdkEventTranslator } from './claude-agent.event-translator';
 
 const SESSION_ROOT = '/tmp/linkeon-smm-sessions';
 
@@ -44,6 +44,7 @@ export class ClaudeAgentService {
     const mcpServer = this.buildMcpServer(ctx);
     let newSessionId: string | undefined;
     let totalCostUsd = 0;
+    const translator = new SdkEventTranslator();
 
     try {
       for await (const event of query({
@@ -68,12 +69,9 @@ export class ClaudeAgentService {
           totalCostUsd = (event as any).total_cost_usd ?? 0;
         }
 
-        const ndjson = translateSdkEvent(event);
-        if (ndjson) {
-          const events = Array.isArray(ndjson) ? ndjson : [ndjson];
-          for (const e of events) {
-            res.write(JSON.stringify(e) + '\n');
-          }
+        const events = translator.translate(event);
+        for (const e of events) {
+          res.write(JSON.stringify(e) + '\n');
         }
       }
     } catch (err: any) {
