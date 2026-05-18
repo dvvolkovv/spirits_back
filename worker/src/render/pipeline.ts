@@ -120,13 +120,25 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
       voiceUrl: state.voicesSynthesized![i],
     }));
 
-    const totalDurationSec = 60;
-    const ctaStartsAt = totalDurationSec - 5;
+    // Dynamic video duration: stop ~5 sec after the last dialog turn (5 sec for CTA).
+    // No more dead silence padding to a hardcoded 60 sec.
+    const maxDialogEnd = Math.max(
+      0,
+      ...ctx.scenario.dialog.map((t) => t.tEnd),
+    );
+    const CTA_DURATION = 5;
+    const totalDurationSec = Math.min(
+      60,
+      Math.max(30, Math.ceil(maxDialogEnd) + CTA_DURATION),
+    );
+    const ctaStartsAt = totalDurationSec - CTA_DURATION;
 
     // Each b-roll fills the visual until the next b-roll starts, or until
     // CTA (last 5s) for the final one. Prevents blank gradient gaps between
-    // dialog turns when b-roll is hardcoded short.
-    const brollsSorted = [...ctx.scenario.brollPrompts].sort((a, b) => a.atSec - b.atSec);
+    // dialog turns. B-rolls scheduled after totalDurationSec are skipped.
+    const brollsSorted = [...ctx.scenario.brollPrompts]
+      .filter((b) => b.atSec < ctaStartsAt)
+      .sort((a, b) => a.atSec - b.atSec);
     const broll = brollsSorted
       .map((b, i) => {
         const isAi = b.type === 'ai_image';
