@@ -10,7 +10,11 @@ import { SmmProducerToolsService, ToolContext } from '../smm/producer/smm-produc
 import { SMM_PRODUCER_SYSTEM_PROMPT } from '../smm/producer/smm-producer.prompt';
 import { SdkEventTranslator } from './claude-agent.event-translator';
 
-const SESSION_ROOT = '/tmp/linkeon-smm-sessions';
+// Persistent path so session resume survives reboots (tmpfs /tmp clears on reboot).
+const SESSION_ROOT = path.join(
+  process.env.HOME ?? '/home/dvolkov',
+  '.linkeon-smm-sessions',
+);
 
 // Claude Code built-ins to disable — SMM Producer должен использовать только наши MCP tools.
 const DISALLOWED_BUILTINS = [
@@ -18,6 +22,8 @@ const DISALLOWED_BUILTINS = [
   'Task', 'EnterPlanMode', 'ExitPlanMode', 'NotebookEdit', 'AskUserQuestion',
   'EnterWorktree', 'ExitWorktree', 'CronCreate', 'CronDelete', 'CronList',
   'Monitor', 'PushNotification', 'RemoteTrigger', 'Skill', 'TodoWrite', 'ScheduleWakeup',
+  'ToolSearch', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'TaskOutput', 'TaskStop',
+  'ShareOnboardingGuide',
 ];
 
 
