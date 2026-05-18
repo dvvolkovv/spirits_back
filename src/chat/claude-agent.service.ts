@@ -99,6 +99,12 @@ export class ClaudeAgentService {
           if (e.type === 'item' && typeof (e as any).content === 'string') {
             assistantText += (e as any).content;
           }
+          // Inject Linkeon-token deduction into the end event so frontend
+          // shows "X токенов" suffix on the assistant message bubble.
+          if (e.type === 'end' && totalCostUsd > 0) {
+            const linkeonTokens = Math.ceil(totalCostUsd * 100_000);
+            (e as any).usage = { total: linkeonTokens, costUsd: totalCostUsd };
+          }
           res.write(JSON.stringify(e) + '\n');
         }
       }
@@ -112,13 +118,15 @@ export class ClaudeAgentService {
       await this.saveSessionId(ctx.userId, newSessionId);
     }
 
-    // Persist assistant response to chat history
+    // Persist assistant response to chat history (with Linkeon-token count
+    // so history reload shows the same "X токенов" suffix).
     if (assistantText.trim()) {
+      const tokensUsed = totalCostUsd > 0 ? Math.ceil(totalCostUsd * 100_000) : 0;
       try {
         await this.pg.query(
-          `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
-           VALUES ($1, 'ai', $2, $3, 'text')`,
-          [chatSessionId, agentId, assistantText],
+          `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
+           VALUES ($1, 'ai', $2, $3, 'text', $4)`,
+          [chatSessionId, agentId, assistantText, tokensUsed],
         );
       } catch (e: any) {
         this.logger.warn(`Failed to persist SMM assistant response: ${e.message}`);
