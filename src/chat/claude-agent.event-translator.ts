@@ -12,10 +12,10 @@
 
 export type NDJsonEvent =
   | { type: 'begin' }
-  | { type: 'text'; text: string }
+  | { type: 'item'; content: string }
   | { type: 'tool_start'; tool: string; input: any }
   | { type: 'tool_result'; tool: string; result: any }
-  | { type: 'done'; usage?: any }
+  | { type: 'end'; usage?: any }
   | { type: 'error'; message: string };
 
 const MCP_PREFIX_RE = /^mcp__[^_]+__/;
@@ -43,7 +43,7 @@ export class SdkEventTranslator {
       if (inner?.type === 'content_block_delta') {
         const delta = inner.delta;
         if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
-          return [{ type: 'text', text: delta.text }];
+          return [{ type: 'item', content: delta.text }];
         }
       }
       return [];
@@ -103,9 +103,9 @@ export class SdkEventTranslator {
       return out;
     }
 
-    // 5. result → done
+    // 5. result → end
     if (t === 'result') {
-      return [{ type: 'done', usage: event.usage }];
+      return [{ type: 'end', usage: event.usage }];
     }
 
     return [];
