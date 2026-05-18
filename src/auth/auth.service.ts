@@ -66,19 +66,26 @@ export class AuthService {
     try {
       const url = `https://gate.smsaero.ru/v2/sms/send`;
       const auth = Buffer.from(`${login}:${apiKey}`).toString('base64');
-      await axios.get(url, {
+      // ⚠️ SMS Aero возвращает 400 на тексты с символами @ и # или с \n
+      // (выяснили эмпирически: WebOTP-маркер `\n@my.linkeon.io #code` ломал
+      // отправку начиная с 2026-05-14). Возвращаем однострочный текст. Если
+      // позже захочется WebOTP-автозаполнения — нужно перейти на другой
+      // SMS-провайдер или использовать SMS Aero «Viber+SMS» канал.
+      const resp = await axios.get(url, {
         params: {
           number: phone,
-          // WebOTP-маркер в последней строке — Chrome Android и Safari iOS17+
-          // автоматически подставят код в форму через navigator.credentials.get.
-          // Формат строгий: `@<hostname> #<code>` — origin без протокола.
-          text: `Код ${code} для входа в linkeon.io\n@my.linkeon.io #${code}`,
+          text: `Код ${code} для входа в linkeon.io`,
           sign: 'SMSAero',
         },
         headers: { Authorization: `Basic ${auth}` },
         timeout: 10000,
+        validateStatus: () => true,
       });
-      this.logger.log(`SMS sent to ${phone}`);
+      if (resp.status >= 400) {
+        this.logger.error(`SMS Aero ${resp.status}: ${JSON.stringify(resp.data).slice(0, 300)}`);
+      } else {
+        this.logger.log(`SMS sent to ${phone}`);
+      }
     } catch (e) {
       this.logger.error(`SMS send failed: ${e.message}`);
     }
