@@ -1,6 +1,7 @@
 // src/smm/oauth/oauth.controller.ts
 import {
   Controller, Get, Logger, Param, Query, Req, Res, UseGuards, BadRequestException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { JwtGuard } from '../../common/guards/jwt.guard';
@@ -43,14 +44,26 @@ export class OAuthController {
       throw new BadRequestException(`unsupported platform: ${platform}`);
     }
     await this.limiter.check(req.user.phone, 'smm_oauth_start', 5, 3600);
+    const platformLabels: Record<string, string> = {
+      vk: 'VK', youtube: 'YouTube', tiktok: 'TikTok', instagram: 'Instagram',
+    };
     const stateToken = await this.state.create(req.user.phone, platform as Platform, redirect);
     let authorizeUrl: string;
-    switch (platform) {
-      case 'vk':        authorizeUrl = this.vk.buildAuthorizeUrl(stateToken); break;
-      case 'youtube':   authorizeUrl = this.yt.buildAuthorizeUrl(stateToken); break;
-      case 'tiktok':    authorizeUrl = this.tt.buildAuthorizeUrl(stateToken); break;
-      case 'instagram': authorizeUrl = this.meta.buildAuthorizeUrl(stateToken); break;
-      default: throw new BadRequestException(`unsupported platform: ${platform}`);
+    try {
+      switch (platform) {
+        case 'vk':        authorizeUrl = this.vk.buildAuthorizeUrl(stateToken); break;
+        case 'youtube':   authorizeUrl = this.yt.buildAuthorizeUrl(stateToken); break;
+        case 'tiktok':    authorizeUrl = this.tt.buildAuthorizeUrl(stateToken); break;
+        case 'instagram': authorizeUrl = this.meta.buildAuthorizeUrl(stateToken); break;
+        default: throw new BadRequestException(`unsupported platform: ${platform}`);
+      }
+    } catch (e: any) {
+      if (e?.message?.includes('not configured')) {
+        throw new ServiceUnavailableException(
+          `${platformLabels[platform] ?? platform} пока не подключён — обратись к администратору`,
+        );
+      }
+      throw e;
     }
     return { authorizeUrl };
   }
