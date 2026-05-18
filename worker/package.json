@@ -22,10 +22,12 @@
     "form-data": "^4.0.5",
     "googleapis": "^171.4.0",
     "ioredis": "^5.3.0",
+    "jsonwebtoken": "^9.0.3",
     "pino": "^9.0.0",
     "pino-pretty": "^11.0.0"
   },
   "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^20.0.0",
     "ts-node": "^10.9.1",
     "typescript": "^5.0.0"

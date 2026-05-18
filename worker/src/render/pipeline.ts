@@ -7,6 +7,7 @@ import { apiClient } from '../api-client';
 import { logger } from '../logger';
 import { synthesize, writeSynthResultToFile } from '../tts';
 import { probeDurationSec } from '../postprocess/ffmpeg';
+import { klingText2Video } from '../media/kling';
 import { chunkSubtitles } from '../tts/subtitle-chunker';
 import { generateImage, writeImageToFile } from '../media/image-gen';
 import { searchStockVideo, downloadStockVideo } from '../media/stock-video';
@@ -94,16 +95,25 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
       for (let i = 0; i < stockPrompts.length; i++) {
         try {
           const match = await searchStockVideo({ query: stockPrompts[i].prompt });
-          if (!match) {
-            logger.warn({ prompt: stockPrompts[i].prompt }, 'no stock-video match, skipping');
-            fresh.push('');
+          if (match) {
+            const localPath = await downloadStockVideo(match.downloadUrl, tmp.root, `stock-${i}`);
+            const url = await uploadVideoToMinio(localPath, `videos/${input.videoId}/stock-${i}`);
+            fresh.push(url);
             continue;
           }
-          const localPath = await downloadStockVideo(match.downloadUrl, tmp.root, `stock-${i}`);
-          const url = await uploadVideoToMinio(localPath, `videos/${input.videoId}/stock-${i}`);
-          fresh.push(url);
+          // Pexels miss — try Kling text2video as fallback (+3-4 min wait per missed clip)
+          logger.warn({ prompt: stockPrompts[i].prompt }, 'no stock-video match, trying Kling fallback');
+          const klingUrl = await klingText2Video(stockPrompts[i].prompt);
+          if (klingUrl) {
+            const localPath = await downloadStockVideo(klingUrl, tmp.root, `stock-${i}`);
+            const url = await uploadVideoToMinio(localPath, `videos/${input.videoId}/stock-${i}`);
+            fresh.push(url);
+            logger.info({ prompt: stockPrompts[i].prompt }, 'Kling fallback succeeded');
+          } else {
+            logger.warn({ prompt: stockPrompts[i].prompt }, 'Kling fallback also failed, skipping clip');
+            fresh.push('');
+          }
         } catch (err: any) {
-          // Pexels missing API key etc. — gracefully degrade by skipping this clip
           logger.warn({ prompt: stockPrompts[i].prompt, err: err.message }, 'stock-video step failed, skipping');
           fresh.push('');
         }
