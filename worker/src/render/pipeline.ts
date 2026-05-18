@@ -120,15 +120,24 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
       voiceUrl: state.voicesSynthesized![i],
     }));
 
-    const broll = ctx.scenario.brollPrompts
+    const totalDurationSec = 60;
+    const ctaStartsAt = totalDurationSec - 5;
+
+    // Each b-roll fills the visual until the next b-roll starts, or until
+    // CTA (last 5s) for the final one. Prevents blank gradient gaps between
+    // dialog turns when b-roll is hardcoded short.
+    const brollsSorted = [...ctx.scenario.brollPrompts].sort((a, b) => a.atSec - b.atSec);
+    const broll = brollsSorted
       .map((b, i) => {
         const isAi = b.type === 'ai_image';
         const mediaUrl = isAi
           ? state.imagesGenerated![aiImagePrompts.findIndex((x) => x === b)]
           : state.stockVideosDownloaded![stockPrompts.findIndex((x) => x === b)];
+        const nextAt = i + 1 < brollsSorted.length ? brollsSorted[i + 1].atSec : ctaStartsAt;
+        const durationSec = Math.max(3, nextAt - b.atSec);
         return {
           atSec: b.atSec,
-          durationSec: 3,
+          durationSec,
           mediaUrl: mediaUrl || '',
           type: (isAi ? 'image' : 'video') as 'image' | 'video',
         };
@@ -136,8 +145,6 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
       .filter((b) => b.mediaUrl);
 
     const subtitles = dialog.flatMap((d) => chunkSubtitles(d.text, d.tStart, d.tEnd));
-
-    const totalDurationSec = 60;
     const remotionProps = {
       title: ctx.scenario.title,
       assistantRole: ctx.scenario.assistantRole,
