@@ -4,16 +4,19 @@ import {
   Req, UseGuards, UsePipes, ValidationPipe, BadRequestException,
 } from '@nestjs/common';
 import { JwtGuard } from '../../common/guards/jwt.guard';
-import { AdminGuard } from '../../common/guards/admin.guard';
 import { SocialAccountService } from './social-account.service';
 import { CreateTelegramAccountDto } from './social-account.dto';
+import { IpRateLimiter } from '../../common/guards/ip-rate-limit';
 import axios from 'axios';
 
 @Controller('smm/social-accounts')
-@UseGuards(JwtGuard, AdminGuard)
+@UseGuards(JwtGuard)
 @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
 export class SocialAccountController {
-  constructor(private readonly accounts: SocialAccountService) {}
+  constructor(
+    private readonly accounts: SocialAccountService,
+    private readonly limiter: IpRateLimiter,
+  ) {}
 
   @Get()
   async list(@Req() req: any) {
@@ -30,6 +33,7 @@ export class SocialAccountController {
 
   @Post('telegram')
   async createTelegram(@Req() req: any, @Body() dto: CreateTelegramAccountDto) {
+    await this.limiter.check(req.user.phone, 'smm_social_create', 10, 3600);
     // Validate bot token by calling Telegram getMe
     let displayName = dto.displayName;
     try {

@@ -4,13 +4,13 @@ import {
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { JwtGuard } from '../../common/guards/jwt.guard';
-import { AdminGuard } from '../../common/guards/admin.guard';
 import { OAuthStateService, Platform } from './oauth-state.service';
 import { VkOAuthService } from './vk-oauth.service';
 import { YouTubeOAuthService } from './youtube-oauth.service';
 import { TikTokOAuthService } from './tiktok-oauth.service';
 import { MetaOAuthService } from './meta-oauth.service';
 import { SocialAccountService } from '../social-accounts/social-account.service';
+import { IpRateLimiter } from '../../common/guards/ip-rate-limit';
 
 @Controller('smm/oauth')
 export class OAuthController {
@@ -23,15 +23,17 @@ export class OAuthController {
     private readonly tt: TikTokOAuthService,
     private readonly meta: MetaOAuthService,
     private readonly accounts: SocialAccountService,
+    private readonly limiter: IpRateLimiter,
   ) {}
 
   /**
-   * Admin-only entrypoint. Returns a redirect URL the frontend opens.
+   * Entrypoint for authenticated users to start OAuth flow.
+   * Returns a redirect URL the frontend opens.
    * Could also redirect directly via 302, but returning the URL lets the
    * frontend control whether to open in a new tab.
    */
   @Get(':platform/start')
-  @UseGuards(JwtGuard, AdminGuard)
+  @UseGuards(JwtGuard)
   async start(
     @Req() req: any,
     @Param('platform') platform: string,
@@ -40,6 +42,7 @@ export class OAuthController {
     if (!['vk', 'youtube', 'tiktok', 'instagram'].includes(platform)) {
       throw new BadRequestException(`unsupported platform: ${platform}`);
     }
+    await this.limiter.check(req.user.phone, 'smm_oauth_start', 5, 3600);
     const stateToken = await this.state.create(req.user.phone, platform as Platform, redirect);
     let authorizeUrl: string;
     switch (platform) {
@@ -66,15 +69,15 @@ export class OAuthController {
   ): Promise<void> {
     if (error) {
       this.logger.warn(`OAuth ${platform} callback error: ${error}`);
-      res.redirect(`/?smm_oauth_error=${encodeURIComponent(error)}`);
+      res.redirect(`/chat?smm_oauth_error=${encodeURIComponent(error)}`);
       return;
     }
     if (!code || !stateToken) {
-      res.redirect(`/?smm_oauth_error=missing_params`);
+      res.redirect(`/chat?smm_oauth_error=missing_params`);
       return;
     }
     if (!['vk', 'youtube', 'tiktok', 'instagram'].includes(platform)) {
-      res.redirect(`/?smm_oauth_error=bad_platform`);
+      res.redirect(`/chat?smm_oauth_error=bad_platform`);
       return;
     }
     let userId: string;
@@ -84,7 +87,7 @@ export class OAuthController {
       userId = consumed.userId;
       userRedirect = consumed.redirectUrl;
     } catch (e: any) {
-      res.redirect(`/?smm_oauth_error=invalid_state`);
+      res.redirect(`/chat?smm_oauth_error=invalid_state`);
       return;
     }
 
@@ -140,11 +143,13 @@ export class OAuthController {
         expiresAt: null,
       });
 
-      const dest = userRedirect ?? `/?smm_oauth_success=${platform}`;
+      const successBase = userRedirect ?? '/chat';
+      const sep = successBase.includes('?') ? '&' : '?';
+      const dest = `${successBase}${sep}smm_oauth_success=${platform}`;
       res.redirect(dest);
     } catch (e: any) {
       this.logger.error(`OAuth ${platform} exchange failed: ${e.message}`);
-      res.redirect(`/?smm_oauth_error=${encodeURIComponent(e.message.slice(0, 80))}`);
+      res.redirect(`/chat?smm_oauth_error=${encodeURIComponent(e.message.slice(0, 80))}`);
     }
   }
 }
