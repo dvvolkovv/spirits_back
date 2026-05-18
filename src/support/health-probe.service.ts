@@ -116,27 +116,42 @@ export class HealthProbeService implements OnModuleInit {
   }
 
   private async probeAnthropic(): Promise<ProbeResult> {
-    const key = process.env.ANTHROPIC_API_KEY;
-    if (!key) {
-      return { service: 'anthropic', status: 'unknown', latencyMs: null, lastError: 'no API key' };
-    }
+    const claudeBin = process.env.CLAUDE_BIN ?? '/usr/bin/claude';
     const t0 = Date.now();
-    try {
-      const res = await axios.get('https://api.anthropic.com/v1/models?limit=1', {
-        headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' },
-        timeout: 6000,
+    return new Promise<ProbeResult>((resolve) => {
+      const { spawn } = require('child_process');
+      const proc = spawn(claudeBin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let out = '';
+      let err = '';
+      proc.stdout.on('data', (b: Buffer) => { out += b.toString(); });
+      proc.stderr.on('data', (b: Buffer) => { err += b.toString(); });
+      proc.on('close', (code: number) => {
+        const lat = Date.now() - t0;
+        if (code === 0) {
+          resolve({
+            service: 'anthropic',
+            status: 'healthy',
+            latencyMs: lat,
+            lastError: null,
+          });
+        } else {
+          resolve({
+            service: 'anthropic',
+            status: 'down',
+            latencyMs: lat,
+            lastError: `claude --version exit ${code}: ${err.slice(0, 100) || out.slice(0, 100)}`,
+          });
+        }
       });
-      const ok = res.status >= 200 && res.status < 300;
-      const lat = Date.now() - t0;
-      return {
-        service: 'anthropic',
-        status: ok ? (lat > 3000 ? 'degraded' : 'healthy') : 'degraded',
-        latencyMs: lat,
-        lastError: ok ? null : `status ${res.status}`,
-      };
-    } catch (e: any) {
-      return { service: 'anthropic', status: 'down', latencyMs: null, lastError: e.message };
-    }
+      proc.on('error', (e: Error) => {
+        resolve({
+          service: 'anthropic',
+          status: 'down',
+          latencyMs: Date.now() - t0,
+          lastError: e.message,
+        });
+      });
+    });
   }
 
   private async probeOpenRouter(): Promise<ProbeResult> {

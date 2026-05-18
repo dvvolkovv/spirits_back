@@ -1,7 +1,7 @@
 // src/smm/producer/scenario.service.ts
 import { Injectable, Logger } from '@nestjs/common';
-import Anthropic from '@anthropic-ai/sdk';
 import { PgService } from '../../common/services/pg.service';
+import { ClaudeCliService } from '../../common/services/claude-cli.service';
 import {
   SmmScenario,
   rowToScenario,
@@ -64,30 +64,21 @@ const SYSTEM_PROMPT = `Ты — креативный сценарист коро
 @Injectable()
 export class ScenarioService {
   private readonly logger = new Logger(ScenarioService.name);
-  private anthropic: Anthropic | null = null;
 
-  constructor(private readonly pg: PgService) {
-    if (process.env.ANTHROPIC_API_KEY) {
-      this.anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    }
-  }
+  constructor(
+    private readonly pg: PgService,
+    private readonly claudeCli: ClaudeCliService,
+  ) {}
 
   async generate(input: GenerateInput): Promise<string[]> {
-    if (!this.anthropic) throw new Error('ANTHROPIC_API_KEY not configured');
-
     const userMsg = this.buildUserMsg(input);
     this.logger.log(`Generating ${input.count} scenarios, mode=${input.mode}, topic="${input.topic ?? ''}"`);
 
-    const resp = await this.anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 4000,
+    const text = (await this.claudeCli.text(userMsg, {
       system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: userMsg }],
-    });
-
-    const textBlock = (resp.content as any[]).find((b) => b.type === 'text');
-    if (!textBlock) throw new Error('Claude returned no text block');
-    const text = (textBlock.text as string).trim();
+      model: 'claude-haiku-4-5',
+    })).trim();
+    if (!text) throw new Error('Claude returned empty text');
     const json = this.extractJson(text);
     const arr: ClaudeScenarioJson[] = JSON.parse(json);
     if (!Array.isArray(arr)) throw new Error('Claude returned non-array JSON');
@@ -126,7 +117,6 @@ export class ScenarioService {
   }
 
   async regenerate(scenarioId: string, feedback: string): Promise<void> {
-    if (!this.anthropic) throw new Error('ANTHROPIC_API_KEY not configured');
     const existing = await this.pg.query(
       `SELECT s.*, c.topic, c.source_mode FROM smm_scenario s
         JOIN smm_campaign c ON c.id = s.campaign_id
@@ -146,15 +136,12 @@ ${JSON.stringify({
 
 Сохрани общую тематику (${row.topic ?? 'auto'}), но переработай согласно фидбеку. Верни ОДИН JSON-объект (не массив) в том же формате.`;
 
-    const resp = await this.anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 4000,
+    const text = (await this.claudeCli.text(userMsg, {
       system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: userMsg }],
-    });
-    const textBlock = (resp.content as any[]).find((b) => b.type === 'text');
-    if (!textBlock) throw new Error('Claude returned no text block on regen');
-    const json = this.extractJson((textBlock.text as string).trim());
+      model: 'claude-haiku-4-5',
+    })).trim();
+    if (!text) throw new Error('Claude returned empty text on regen');
+    const json = this.extractJson(text);
     const s: ClaudeScenarioJson = JSON.parse(json);
 
     const dialog: SmmDialogTurn[] = s.dialog.map((t) => ({

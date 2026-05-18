@@ -3,6 +3,7 @@ import { Cron } from '@nestjs/schedule';
 import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
+import { ClaudeCliService } from '../common/services/claude-cli.service';
 
 /**
  * Автоматическая компакция профиля в Neo4j.
@@ -43,6 +44,7 @@ export class ProfileCompactionService {
   constructor(
     private readonly pg: PgService,
     @Optional() private readonly neo4j?: Neo4jService,
+    private readonly claudeCli?: ClaudeCliService,
   ) {}
 
   /** Ежедневный cron 04:00 UTC. */
@@ -203,9 +205,7 @@ export class ProfileCompactionService {
     if (userMessages.length === 1 && userMessages[0] === '__skip_validation__') return null;
     if (userMessages.length === 0) return false;
 
-    const anthropicKey = process.env.ANTHROPIC_API_KEY;
     const orKey = process.env.OPENROUTER_API_KEY;
-    if (!anthropicKey && !orKey) return null; // нет ключей — keep
 
     const samples = userMessages
       .map((m, i) => `[${i + 1}] ${m.slice(0, 400)}`)
@@ -230,16 +230,16 @@ ${samples}
 
     try {
       let content: string | null = null;
-      if (anthropicKey) {
-        const Anthropic = require('@anthropic-ai/sdk');
-        const client = new Anthropic({ apiKey: anthropicKey });
-        const msg = await client.messages.create({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 10,
-          messages: [{ role: 'user', content: prompt }],
-        });
-        content = msg.content?.[0]?.text || null;
-      } else if (orKey) {
+      // Try Claude via OAuth first
+      try {
+        content = await this.claudeCli?.text(prompt, { model: 'claude-haiku-4-5' }) ?? null;
+      } catch (e: any) {
+        this.logger.warn(`claude CLI failed in llmValidateEntity: ${e.message}`);
+        content = null;
+      }
+
+      // Fallback to OpenRouter if claude CLI failed
+      if (!content && orKey) {
         const resp = await axios.post(
           'https://openrouter.ai/api/v1/chat/completions',
           {
@@ -271,9 +271,7 @@ ${samples}
     category: string,
     entities: Array<{ canonicalKey: string; name: string; aliases: string[]; support: number }>,
   ): Promise<Array<{ canonical: string; merge_from: string[] }>> {
-    const anthropicKey = process.env.ANTHROPIC_API_KEY;
     const orKey = process.env.OPENROUTER_API_KEY;
-    if (!anthropicKey && !orKey) return [];
 
     const listing = entities
       .map((e, i) => `${i + 1}. "${e.name}" (key=${e.canonicalKey}, support=${e.support})`)
@@ -298,16 +296,16 @@ ${listing}
 
     let content: string | null = null;
     try {
-      if (anthropicKey) {
-        const Anthropic = require('@anthropic-ai/sdk');
-        const client = new Anthropic({ apiKey: anthropicKey });
-        const msg = await client.messages.create({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 4096,
-          messages: [{ role: 'user', content: prompt }],
-        });
-        content = msg.content?.[0]?.text || null;
-      } else if (orKey) {
+      // Try Claude via OAuth first
+      try {
+        content = await this.claudeCli?.text(prompt, { model: 'claude-haiku-4-5' }) ?? null;
+      } catch (e: any) {
+        this.logger.warn(`claude CLI failed in llmGroupSynonyms: ${e.message}`);
+        content = null;
+      }
+
+      // Fallback to OpenRouter if claude CLI failed
+      if (!content && orKey) {
         const resp = await axios.post(
           'https://openrouter.ai/api/v1/chat/completions',
           {

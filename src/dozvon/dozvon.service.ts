@@ -4,13 +4,11 @@ import { RedisService } from '../common/services/redis.service';
 import { SipService } from './sip.service';
 import { VoiceAgentService } from './voice-agent.service';
 import { RecorderService } from './recorder.service';
-import Anthropic from '@anthropic-ai/sdk';
-import axios from 'axios';
+import { ClaudeCliService } from '../common/services/claude-cli.service';
 
 @Injectable()
 export class DozvonService {
   private readonly logger = new Logger(DozvonService.name);
-  private readonly anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
   constructor(
     private readonly pg: PgService,
@@ -18,6 +16,7 @@ export class DozvonService {
     private readonly sip: SipService,
     private readonly agent: VoiceAgentService,
     private readonly recorder: RecorderService,
+    private readonly claudeCli: ClaudeCliService,
   ) {}
 
   // ─── CAMPAIGNS ───────────────────────────────────────────────────
@@ -413,16 +412,8 @@ export class DozvonService {
       `- ${c.contact_name || c.phone}: ${c.status} — ${c.summary || 'нет данных'}`,
     ).join('\n');
 
-    const msg = await this.anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 512,
-      messages: [{
-        role: 'user',
-        content: `Составь краткое резюме результатов звонков:\n${lines}\n\nВерни JSON: {"text":"...", "success_count":N, "failed_count":N}`,
-      }],
-    });
-
-    const text = (msg.content[0] as any).text;
+    const prompt = `Составь краткое резюме результатов звонков:\n${lines}\n\nВерни JSON: {"text":"...", "success_count":N, "failed_count":N}`;
+    const text = await this.claudeCli.text(prompt, { model: 'claude-haiku-4-5' });
     try {
       const match = text.match(/\{[\s\S]*\}/);
       return match ? JSON.parse(match[0]) : { text };

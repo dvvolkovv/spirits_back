@@ -2,13 +2,17 @@ import { Injectable, Logger, OnModuleInit, OnModuleDestroy, Optional } from '@ne
 import neo4j, { Driver, Session } from 'neo4j-driver';
 import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
+import { ClaudeCliService } from '../common/services/claude-cli.service';
 
 @Injectable()
 export class Neo4jService implements OnModuleInit, OnModuleDestroy {
   private driver: Driver | null = null;
   private readonly logger = new Logger(Neo4jService.name);
 
-  constructor(@Optional() private readonly pg?: PgService) {}
+  constructor(
+    @Optional() private readonly pg?: PgService,
+    @Optional() private readonly claudeCli?: ClaudeCliService,
+  ) {}
 
   onModuleInit() {
     const uri = process.env.NEO4J_URI;
@@ -453,8 +457,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     assistantResponse: string,
   ): Promise<void> {
     const apiKey = process.env.OPENROUTER_API_KEY;
-    const anthropicKey = process.env.ANTHROPIC_API_KEY;
-    if ((!apiKey && !anthropicKey) || !this.driver) return;
+    if (!this.driver) return;
 
     try {
       // Получаем предыдущую реплику ассистента — нужна чтобы понять, с чем
@@ -504,16 +507,16 @@ ${assistantResponse.slice(0, 1500)}
 Если пользователь не сказал и явно не согласился ни с чем — верни все массивы пустыми.`;
 
       let content: string | null = null;
-      if (anthropicKey) {
-        const Anthropic = require('@anthropic-ai/sdk');
-        const client = new Anthropic({ apiKey: anthropicKey });
-        const msg = await client.messages.create({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 1024,
-          messages: [{ role: 'user', content: prompt }],
-        });
-        content = msg.content?.[0]?.text || null;
-      } else if (apiKey) {
+      // Try Claude via OAuth first
+      try {
+        content = await this.claudeCli?.text(prompt, { model: 'claude-haiku-4-5' }) ?? null;
+      } catch (e: any) {
+        this.logger.warn(`claude CLI failed in neo4j consolidateFromChat: ${e.message}`);
+        content = null;
+      }
+
+      // Fallback to OpenRouter if claude CLI failed
+      if (!content && apiKey) {
         const resp = await axios.post(
           'https://openrouter.ai/api/v1/chat/completions',
           {
