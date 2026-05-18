@@ -6,6 +6,7 @@ import { renderMedia, selectComposition } from '@remotion/renderer';
 import { apiClient } from '../api-client';
 import { logger } from '../logger';
 import { synthesize, writeSynthResultToFile } from '../tts';
+import { probeDurationSec } from '../postprocess/ffmpeg';
 import { chunkSubtitles } from '../tts/subtitle-chunker';
 import { generateImage, writeImageToFile } from '../media/image-gen';
 import { searchStockVideo, downloadStockVideo } from '../media/stock-video';
@@ -42,9 +43,12 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
     await persist(input.videoId, state);
     tmp = await TempDir.create(input.videoId);
 
-    // STEP 1: Synthesize voices for each dialog turn
+    // STEP 1: Synthesize voices for each dialog turn + measure actual durations.
+    // Real TTS duration can differ from Claude's tStart/tEnd estimates by 2-3 seconds.
+    // We re-time the dialog later from these measured durations to avoid cropping words.
     if (!state.voicesSynthesized || state.voicesSynthesized.length !== ctx.scenario.dialog.length) {
       const urls: string[] = [];
+      const durations: number[] = [];
       for (let i = 0; i < ctx.scenario.dialog.length; i++) {
         const turn = ctx.scenario.dialog[i];
         const res = await synthesize({
@@ -55,10 +59,13 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
         });
         const localPath = await writeSynthResultToFile(res, tmp.root, `voice-${i}`);
         const url = await uploadAudioToMinio(localPath, `videos/${input.videoId}/voice-${i}`);
+        const dur = await probeDurationSec(localPath);
         urls.push(url);
-        logger.info({ videoId: input.videoId, i, url }, 'voice synthesized');
+        durations.push(dur);
+        logger.info({ videoId: input.videoId, i, url, durationSec: dur }, 'voice synthesized');
       }
       state.voicesSynthesized = urls;
+      state.voiceDurations = durations;
       await persist(input.videoId, state);
     } else {
       logger.info({ videoId: input.videoId }, 'voices already synthesized — skipping');
@@ -112,13 +119,35 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
     const musicUrl = track ? track.publicUrl : null;
 
     // STEP 4: Build Remotion props
-    const dialog = ctx.scenario.dialog.map((t, i) => ({
-      speaker: t.speaker,
-      text: t.text,
-      tStart: t.tStart,
-      tEnd: t.tEnd,
-      voiceUrl: state.voicesSynthesized![i],
-    }));
+    // Re-time dialog using measured TTS durations so words don't get cropped.
+    // Each turn: tStart = previous tEnd + 0.4s pause; tEnd = tStart + actualVoiceDur + 0.1s tail
+    // First turn starts at original tStart (Claude's intro budget, usually 2s).
+    const voiceDurations = state.voiceDurations ?? [];
+    const TURN_PAUSE = 0.4;
+    const TURN_TAIL = 0.15;
+    const FIRST_TURN_START = ctx.scenario.dialog[0]?.tStart ?? 2;
+    let cursor = FIRST_TURN_START;
+    const dialog = ctx.scenario.dialog.map((t, i) => {
+      const tStart = i === 0 ? FIRST_TURN_START : cursor;
+      const dur = (voiceDurations[i] && voiceDurations[i] > 0)
+        ? voiceDurations[i]
+        : t.tEnd - t.tStart;
+      const tEnd = tStart + dur + TURN_TAIL;
+      cursor = tEnd + TURN_PAUSE;
+      return {
+        speaker: t.speaker,
+        text: t.text,
+        tStart,
+        tEnd,
+        voiceUrl: state.voicesSynthesized![i],
+      };
+    });
+    if (voiceDurations.length > 0) {
+      logger.info(
+        { videoId: input.videoId, voiceDurations, retimed: dialog.map((d) => [d.tStart, d.tEnd]) },
+        're-timed dialog using actual TTS durations',
+      );
+    }
 
     // Dynamic video duration: stop ~5 sec after the last dialog turn (5 sec for CTA).
     // No more dead silence padding to a hardcoded 60 sec.

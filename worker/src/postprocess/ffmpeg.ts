@@ -3,6 +3,27 @@ import { spawn } from 'child_process';
 import ffmpegStatic from 'ffmpeg-static';
 import { logger } from '../logger';
 
+/**
+ * Probe audio/video file duration in seconds via ffmpeg stderr.
+ * Returns 0 if probe failed.
+ */
+export async function probeDurationSec(filePath: string): Promise<number> {
+  return new Promise<number>((resolve) => {
+    const bin = process.env.FFMPEG_PATH || (ffmpegStatic as unknown as string) || 'ffmpeg';
+    const proc = spawn(bin, ['-i', filePath, '-f', 'null', '-'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    proc.stderr.on('data', (c) => { stderr += c.toString(); });
+    proc.on('error', () => resolve(0));
+    proc.on('close', () => {
+      // ffmpeg prints: "  Duration: 00:00:05.66, ..." (HH:MM:SS.MS)
+      const m = stderr.match(/Duration:\s+(\d+):(\d+):(\d+(?:\.\d+)?)/);
+      if (!m) return resolve(0);
+      const sec = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
+      resolve(sec);
+    });
+  });
+}
+
 // Prefer the statically-bundled binary; fall back to $FFMPEG_PATH env override or
 // the system ffmpeg if the static binary is unavailable / not executable.
 const FFMPEG_BIN =

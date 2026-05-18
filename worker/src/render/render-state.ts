@@ -4,6 +4,8 @@ import { apiClient } from '../api-client';
 export interface RenderState {
   scenarioLoaded?: boolean;
   voicesSynthesized?: string[];
+  /** Actual TTS duration of each voice file in seconds — used to recompute dialog timeline. */
+  voiceDurations?: number[];
   imagesGenerated?: string[];
   stockVideosDownloaded?: string[];
   remotionRendered?: boolean;
