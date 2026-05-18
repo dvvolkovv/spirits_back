@@ -33,6 +33,8 @@ export class ClaudeAgentService {
   async streamSmmProducer(
     ctx: ToolContext,
     userMessage: string,
+    chatSessionId: string,
+    agentName: string,
     res: Response,
   ): Promise<void> {
     const cwd = path.join(SESSION_ROOT, ctx.userId);
@@ -44,6 +46,7 @@ export class ClaudeAgentService {
     const mcpServer = this.buildMcpServer(ctx);
     let newSessionId: string | undefined;
     let totalCostUsd = 0;
+    let assistantText = '';
     const translator = new SdkEventTranslator();
 
     try {
@@ -71,6 +74,10 @@ export class ClaudeAgentService {
 
         const events = translator.translate(event);
         for (const e of events) {
+          // Buffer assistant text for history persistence
+          if (e.type === 'item' && typeof (e as any).content === 'string') {
+            assistantText += (e as any).content;
+          }
           res.write(JSON.stringify(e) + '\n');
         }
       }
@@ -82,6 +89,19 @@ export class ClaudeAgentService {
     // Persist session id for resume
     if (newSessionId && newSessionId !== resumeId) {
       await this.saveSessionId(ctx.userId, newSessionId);
+    }
+
+    // Persist assistant response to chat history
+    if (assistantText.trim()) {
+      try {
+        await this.pg.query(
+          `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
+           VALUES ($1, 'ai', $2, $3, 'text')`,
+          [chatSessionId, agentName, assistantText],
+        );
+      } catch (e: any) {
+        this.logger.warn(`Failed to persist SMM assistant response: ${e.message}`);
+      }
     }
 
     // Token accounting hook — placeholder until Task 5
