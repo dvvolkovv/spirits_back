@@ -16,6 +16,20 @@ export class ProfileService {
     );
     if (res.rows.length === 0) return null;
     const row = res.rows[0];
+    const pd = row.profile_data || {};
+
+    // Entity-поля (values/beliefs/desires/intents/interests/skills) — источник
+    // правды Neo4j (компакция работает только там). profile_data.values и т.п.
+    // — устаревший снапшот, может содержать testовый мусор и удалённое; не
+    // подмешиваем его. Не-entity поля (name, family_name, avatar_url,
+    // contactVisible, smm_sdk_session_id, и пр.) остаются из profile_data.
+    const neo = this.neo4j ? await this.neo4j.getProfileEntities(userId).catch(() => null) : null;
+    const ENTITY_KEYS = new Set(['values', 'beliefs', 'desires', 'intents', 'interests', 'skills', 'valuesRich', 'beliefsRich', 'desiresRich', 'intentsRich', 'interestsRich', 'skillsRich']);
+    const pdNonEntities: Record<string, any> = {};
+    for (const [k, v] of Object.entries(pd)) {
+      if (!ENTITY_KEYS.has(k)) pdNonEntities[k] = v;
+    }
+
     return [{
       profileJson: {
         id: row.id,
@@ -24,10 +38,27 @@ export class ProfileService {
         tokens: row.tokens,
         email: row.email,
         isadmin: row.isadmin === true || row.isadmin === 'true',
-        profile_data: row.profile_data || {},
+        profile_data: pd, // raw column для обратной совместимости со старым фронтом
         created_at: row.created_at,
         updated_at: row.updated_at,
-        ...(row.profile_data || {}),
+        ...pdNonEntities,
+        // Свежие entities из Neo4j (если есть). Имя/фамилия — из profile_data
+        // (туда их пишет ProfileService.updateProfile + KYC), Neo4j редко
+        // имеет name заполненным.
+        name: pd.name || neo?.name,
+        family_name: pd.family_name || neo?.family_name,
+        values: neo?.values || [],
+        beliefs: neo?.beliefs || [],
+        desires: neo?.desires || [],
+        intents: neo?.intents || [],
+        interests: neo?.interests || [],
+        skills: neo?.skills || [],
+        valuesRich: neo?.valuesRich || [],
+        beliefsRich: neo?.beliefsRich || [],
+        desiresRich: neo?.desiresRich || [],
+        intentsRich: neo?.intentsRich || [],
+        interestsRich: neo?.interestsRich || [],
+        skillsRich: neo?.skillsRich || [],
       },
     }];
   }
