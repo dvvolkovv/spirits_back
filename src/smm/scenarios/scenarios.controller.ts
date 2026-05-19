@@ -1,6 +1,6 @@
 // src/smm/scenarios/scenarios.controller.ts
 import {
-  Body, Controller, Delete, Get, NotFoundException, Param, Post, Req, UseGuards,
+  BadRequestException, Body, Controller, Delete, Get, NotFoundException, Param, Patch, Post, Req, UseGuards,
 } from '@nestjs/common';
 import { JwtGuard } from '../../common/guards/jwt.guard';
 import { AdminGuard } from '../../common/guards/admin.guard';
@@ -95,6 +95,71 @@ export class ScenariosController {
       } catch { /* ignore */ }
     }
     return { ok: true };
+  }
+
+  /**
+   * Manual edit of a scenario from the UI (ScenarioEditModal). No Claude call,
+   * no token charge — just direct field updates. After approve already produced
+   * a video, edits won't auto-rerender; the user clicks "Сделать заново" to
+   * regenerate the mp4 with the new dialog/b-roll.
+   */
+  @Patch(':id')
+  async update(
+    @Param('id') id: string,
+    @Body() body: {
+      title?: string;
+      mood?: string;
+      assistant_role?: string;
+      dialog?: Array<{ speaker: 'hero' | 'assistant'; text: string; tStart: number; tEnd: number }>;
+      broll_prompts?: Array<{ atSec: number; type: 'ai_image' | 'stock_video'; prompt: string }>;
+    },
+  ) {
+    const existing = await this.pg.query(`SELECT id FROM smm_scenario WHERE id = $1`, [id]);
+    if (existing.rows.length === 0) throw new NotFoundException(`scenario ${id} not found`);
+
+    const sets: string[] = [];
+    const vals: any[] = [];
+    let i = 1;
+    if (typeof body.title === 'string') {
+      if (!body.title.trim()) throw new BadRequestException('title cannot be empty');
+      sets.push(`title = $${i++}`); vals.push(body.title.trim());
+    }
+    if (typeof body.mood === 'string') {
+      const allowed = ['dramatic', 'inspiring', 'calm', 'uplifting', 'tense', 'neutral'];
+      if (!allowed.includes(body.mood)) throw new BadRequestException(`mood must be one of ${allowed.join(', ')}`);
+      sets.push(`mood = $${i++}`); vals.push(body.mood);
+    }
+    if (typeof body.assistant_role === 'string' && body.assistant_role.trim()) {
+      sets.push(`assistant_role = $${i++}`); vals.push(body.assistant_role.trim());
+    }
+    if (Array.isArray(body.dialog)) {
+      if (body.dialog.length === 0) throw new BadRequestException('dialog must have at least 1 turn');
+      for (const t of body.dialog) {
+        if (!['hero', 'assistant'].includes(t.speaker)) throw new BadRequestException(`speaker must be 'hero' or 'assistant'`);
+        if (typeof t.text !== 'string' || !t.text.trim()) throw new BadRequestException('dialog text required');
+        if (typeof t.tStart !== 'number' || typeof t.tEnd !== 'number' || t.tEnd <= t.tStart) {
+          throw new BadRequestException('dialog tStart/tEnd invalid');
+        }
+      }
+      sets.push(`dialog = $${i++}::jsonb`); vals.push(JSON.stringify(body.dialog));
+    }
+    if (Array.isArray(body.broll_prompts)) {
+      for (const b of body.broll_prompts) {
+        if (typeof b.atSec !== 'number') throw new BadRequestException('broll atSec must be a number');
+        if (!['ai_image', 'stock_video'].includes(b.type)) throw new BadRequestException(`broll type must be 'ai_image' or 'stock_video'`);
+        if (typeof b.prompt !== 'string' || !b.prompt.trim()) throw new BadRequestException('broll prompt required');
+      }
+      sets.push(`broll_prompts = $${i++}::jsonb`); vals.push(JSON.stringify(body.broll_prompts));
+    }
+    if (sets.length === 0) {
+      return { ok: true, updated: 0 };
+    }
+    vals.push(id);
+    await this.pg.query(
+      `UPDATE smm_scenario SET ${sets.join(', ')} WHERE id = $${i}`,
+      vals,
+    );
+    return { ok: true, updated: sets.length };
   }
 
   @Delete(':id')
