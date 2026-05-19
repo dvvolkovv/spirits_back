@@ -76,6 +76,11 @@ export class VideosController {
       replacedAt: new Date().toISOString(),
     });
 
+    // CRITICAL: render_state contains idempotency flags (remotionRendered,
+    // voicesSynthesized, imagesGenerated, stockVideosDownloaded, …) which the
+    // pipeline uses to short-circuit already-completed steps. Wiping the whole
+    // state preserves only previous_versions for audit — every step rebuilds
+    // from scratch, producing a fresh mp4 with new TTS and new b-roll.
     await this.pg.query(
       `UPDATE smm_video
           SET status = 'queued',
@@ -83,12 +88,7 @@ export class VideosController {
               duration_sec = NULL,
               size_bytes = NULL,
               error_message = NULL,
-              render_state = jsonb_set(
-                COALESCE(render_state, '{}'::jsonb),
-                '{previous_versions}',
-                $2::jsonb,
-                true
-              )
+              render_state = jsonb_build_object('previous_versions', $2::jsonb)
         WHERE id = $1`,
       [id, JSON.stringify(prev)],
     );

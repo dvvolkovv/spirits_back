@@ -132,7 +132,7 @@ export class ScenarioService {
     return ids;
   }
 
-  async regenerate(scenarioId: string, feedback: string): Promise<void> {
+  async regenerate(scenarioId: string, feedback: string): Promise<{ costUsd: number }> {
     const existing = await this.pg.query(
       `SELECT s.*, c.topic, c.source_mode FROM smm_scenario s
         JOIN smm_campaign c ON c.id = s.campaign_id
@@ -152,10 +152,11 @@ ${JSON.stringify({
 
 Сохрани общую тематику (${row.topic ?? 'auto'}), но переработай согласно фидбеку. Верни ОДИН JSON-объект (не массив) в том же формате.`;
 
-    const text = (await this.claudeCli.text(userMsg, {
+    const cliRes = await this.claudeCli.textWithCost(userMsg, {
       system: SYSTEM_PROMPT,
       model: 'claude-haiku-4-5',
-    })).trim();
+    });
+    const text = cliRes.text.trim();
     if (!text) throw new Error('Claude returned empty text on regen');
     const json = this.extractJson(text);
     const s: ClaudeScenarioJson = JSON.parse(json);
@@ -177,7 +178,8 @@ ${JSON.stringify({
         s.mood, JSON.stringify(brollPrompts), scenarioId,
       ],
     );
-    this.logger.log(`Regenerated scenario ${scenarioId}`);
+    this.logger.log(`Regenerated scenario ${scenarioId} (cost=$${cliRes.costUsd.toFixed(4)})`);
+    return { costUsd: cliRes.costUsd };
   }
 
   async getById(scenarioId: string): Promise<SmmScenario | null> {

@@ -17,11 +17,24 @@ export class ClaudeCliService {
   private readonly claudeBin = process.env.CLAUDE_BIN ?? '/usr/bin/claude';
 
   /**
+   * Run one-shot Claude prompt via OAuth and return text + cost.
+   */
+  async textWithCost(prompt: string, opts: ClaudeCliOptions = {}): Promise<{ text: string; costUsd: number }> {
+    const res = await this.runRaw(prompt, opts);
+    return { text: res.text, costUsd: res.costUsd };
+  }
+
+  /**
    * Run one-shot Claude prompt via OAuth (no API key required).
    * Returns the assistant's text response.
    * Throws on subprocess failure or non-zero exit.
    */
   async text(prompt: string, opts: ClaudeCliOptions = {}): Promise<string> {
+    const res = await this.runRaw(prompt, opts);
+    return res.text;
+  }
+
+  private async runRaw(prompt: string, opts: ClaudeCliOptions): Promise<{ text: string; costUsd: number }> {
     const model = opts.model ?? 'claude-haiku-4-5';
     const timeoutMs = opts.timeoutMs ?? 60_000;
 
@@ -39,7 +52,7 @@ export class ClaudeCliService {
       '--disallowedTools', 'all',
     ];
 
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<{ text: string; costUsd: number }>((resolve, reject) => {
       const proc = spawn(this.claudeBin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '';
       let stderr = '';
@@ -65,10 +78,11 @@ export class ClaudeCliService {
             return;
           }
           const text: string = json.result ?? '';
-          if (json.total_cost_usd) {
-            this.logger.debug(`claude CLI cost: $${json.total_cost_usd.toFixed(4)}, ${json.duration_ms}ms`);
+          const costUsd: number = typeof json.total_cost_usd === 'number' ? json.total_cost_usd : 0;
+          if (costUsd) {
+            this.logger.debug(`claude CLI cost: $${costUsd.toFixed(4)}, ${json.duration_ms}ms`);
           }
-          resolve(text);
+          resolve({ text, costUsd });
         } catch (e: any) {
           this.logger.error(`claude CLI parse error: ${e.message}, stdout: ${stdout.slice(0, 200)}`);
           reject(new Error(`claude CLI returned invalid JSON: ${e.message}`));

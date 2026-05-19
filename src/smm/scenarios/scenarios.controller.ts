@@ -68,8 +68,32 @@ export class ScenariosController {
   }
 
   @Post(':id/regenerate')
-  async regen(@Param('id') id: string, @Body() body: { feedback: string }) {
-    await this.scenarios.regenerate(id, body.feedback || '');
+  async regen(@Req() req: any, @Param('id') id: string, @Body() body: { feedback: string }) {
+    const r = await this.scenarios.regenerate(id, body.feedback || '');
+    // Deduct Claude cost from the user's Linkeon balance and attribute it to
+    // the ai-сообщение that contains this scenario, so "X токенов" updates.
+    const tokens = Math.ceil(r.costUsd * 100_000);
+    if (tokens > 0) {
+      try {
+        await this.pg.query(
+          `UPDATE ai_profiles_consolidated
+              SET tokens = GREATEST(0, tokens - $1), updated_at = now()
+            WHERE user_id = $2`,
+          [tokens, req.user.phone],
+        );
+        await this.pg.query(
+          `UPDATE custom_chat_history
+              SET tokens_used = COALESCE(tokens_used, 0) + $1
+            WHERE id = (
+              SELECT id FROM custom_chat_history
+               WHERE sender_type = 'ai'
+                 AND position('smm_scenario:id=' || $2::text in content) > 0
+               ORDER BY created_at DESC LIMIT 1
+            )`,
+          [tokens, id],
+        );
+      } catch { /* ignore */ }
+    }
     return { ok: true };
   }
 
