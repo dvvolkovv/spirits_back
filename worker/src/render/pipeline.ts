@@ -223,10 +223,11 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
     // STEP 5: Remotion render
     // __dirname is worker/dist/render/ at runtime, so remotion/ is two levels up then into remotion/
     const remotionRoot = path.join(__dirname, '..', '..', 'remotion', 'src', 'Root.tsx');
+    const remotionPublic = path.join(__dirname, '..', '..', 'remotion', 'public');
     const rawMp4 = tmp.file('render-raw.mp4');
     if (!state.remotionRendered) {
-      logger.info({ videoId: input.videoId, remotionRoot }, 'remotion render start');
-      const bundled = await bundle({ entryPoint: remotionRoot });
+      logger.info({ videoId: input.videoId, remotionRoot, remotionPublic }, 'remotion render start');
+      const bundled = await bundle({ entryPoint: remotionRoot, publicDir: remotionPublic });
       const composition = await selectComposition({
         serveUrl: bundled,
         id: 'ChatCase',
