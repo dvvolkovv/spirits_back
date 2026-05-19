@@ -57,9 +57,11 @@ const SYSTEM_PROMPT = `Ты — креативный сценарист коро
    - mindfulness — осознанность, медитация, присутствие, эмоциональная регуляция
    - assistant — универсальный помощник по бытовым/общим задачам (используй только если ничто другое не подходит)
 4. mood — одно из: dramatic | inspiring | calm | uplifting | tense | neutral
-5. broll_prompts — 1-2 кадра-вставки. type='ai_image' для скриншотов/абстрактных сцен, type='stock_video' для людей/живых сцен.
-   - at_sec — в какой момент ролика появляется (0..50)
-   - prompt — короткий промпт на английском для Imagen/Pexels
+5. broll_prompts — ОБЯЗАТЕЛЬНО 1-3 кадра-вставки. КАЖДЫЙ объект ДОЛЖЕН содержать ВСЕ три поля:
+   - at_sec (число!) — в какой момент ролика появляется (0..50). Распредели по таймлайну так, чтобы покрыть весь ролик: первый at_sec=0, последующие — равномерно до окончания диалога.
+   - type — 'ai_image' для скриншотов/абстрактных сцен, 'stock_video' для людей/живых сцен.
+   - prompt — короткий промпт на английском для Imagen/Pexels.
+   Если at_sec отсутствует в твоём ответе — это БАГ. Никогда не пропускай его.
 6. Реплики на русском, живой разговорный язык. БЕЗ канцелярита.
 
 ФОРМАТ ОТВЕТА: чистый JSON-массив. Никаких пояснений до или после. Пример одного элемента:
@@ -109,8 +111,10 @@ export class ScenarioService {
         tStart: t.t_start,
         tEnd: t.t_end,
       }));
-      const brollPrompts: SmmBrollPrompt[] = (s.broll_prompts ?? []).map((b) => ({
-        atSec: b.at_sec,
+      const brollPrompts: SmmBrollPrompt[] = (s.broll_prompts ?? []).map((b, i, arr) => ({
+        atSec: typeof b.at_sec === 'number'
+          ? b.at_sec
+          : Math.round((i / Math.max(arr.length, 1)) * 40),
         type: b.type,
         prompt: b.prompt,
       }));
@@ -164,8 +168,12 @@ ${JSON.stringify({
     const dialog: SmmDialogTurn[] = s.dialog.map((t) => ({
       speaker: t.speaker, text: t.text, tStart: t.t_start, tEnd: t.t_end,
     }));
-    const brollPrompts: SmmBrollPrompt[] = (s.broll_prompts ?? []).map((b) => ({
-      atSec: b.at_sec, type: b.type, prompt: b.prompt,
+    const brollPrompts: SmmBrollPrompt[] = (s.broll_prompts ?? []).map((b, i, arr) => ({
+      atSec: typeof b.at_sec === 'number'
+        ? b.at_sec
+        : Math.round((i / Math.max(arr.length, 1)) * 40),
+      type: b.type,
+      prompt: b.prompt,
     }));
 
     await this.pg.query(
