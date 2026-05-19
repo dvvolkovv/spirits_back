@@ -14,7 +14,10 @@ export class AgentsService {
 
   async getAgents(): Promise<any[]> {
     const res = await this.pg.query(
-      'SELECT id, name, description, category FROM agents ORDER BY id',
+      `SELECT id, name, COALESCE(display_name, name) AS "displayName",
+              description, category
+         FROM agents
+        ORDER BY id`,
     );
     return res.rows;
   }
