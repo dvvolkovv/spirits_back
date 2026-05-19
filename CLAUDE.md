@@ -28,30 +28,52 @@
 - **Payments:** YooKassa
 - **Storage:** Локальные файлы (avatars, images) через Nginx /static/
 
-## Деплой (унифицированный)
+## Деплой (git-based)
 
-**Используй `scripts/deploy.sh`** — он сам делает: build фронта → rsync → sync бэка → npm build → pm2 restart → health-wait → smoke. Выходит non-zero при любом сбое. Это рекомендуемый путь после **каждого** изменения, т.к. smoke автоматически прогоняется.
+**Только через `scripts/deploy.sh`.** Деплой идёт **из git** — никаких rsync с локалки. На проде:
+- `/home/dvolkov/spirits_back/` — git-клон `dvvolkovv/spirits_back`, ветка `b2b`
+- `/home/dvolkov/spirits_front_src/` — git-клон `dvvolkovv/spirits` (build делается тут)
+- `/home/dvolkov/spirits_front/` — nginx-served `dist/` (output фронт-билда)
+
+Пайплайн `scripts/deploy.sh`:
+1. Проверка: локальный репо чистый (нет uncommitted) — иначе exit
+2. `git push origin b2b` (бэк + фронт)
+3. SSH прод: `git fetch + reset --hard origin/b2b` → `npm ci + npm run build + pm2 restart` (back) / `pnpm install + pnpm build + rsync dist→nginx` (front)
+4. Health-wait `/webhook/agents`
+5. Полный smoke (unit + API + Playwright)
 
 ```bash
 bash ~/Downloads/spirits_back/scripts/deploy.sh
 ```
 
-Env-переменные: `BASE_URL`, `TEST_PHONE`, `PROD_HOST`, `SKIP_SMOKE=1` (только деплой), `SMOKE_ONLY=1` (без деплоя, только smoke против текущего прода).
+Env-переменные: `BASE_URL`, `TEST_PHONE`, `PROD_HOST`, `BRANCH`, `BACK_ONLY=1`, `FRONT_ONLY=1`, `SKIP_SMOKE=1`, `SMOKE_ONLY=1`.
 
-### Ручные команды (если deploy.sh не подходит)
+**Почему git, а не rsync**: `rsync --delete` много раз сносил `.env`, `public/agent-avatars/` и `worker/.env` потому что они gitignored / отсутствовали локально. Каждое такое падение приводило к выпадению SMSAERO / OPENAI / ANTHROPIC / MCP_SECRET / NEO4J_* / KLING / PEXELS. Git-pull трогает **только tracked-файлы** — `.env` и `public/` на проде живут постоянно, никем не задеваются.
+
+**Prerequisites на проде** (one-time setup):
+- Pubkey `~/.ssh/id_rsa.pub` добавлен как Deploy Key в обоих GitHub-репах (read-only access)
+- Обе репы клонированы (`/home/dvolkov/spirits_back`, `/home/dvolkov/spirits_front_src`)
+- `pnpm` установлен в `~/.npm-global/` (PATH прописан в `~/.bashrc`)
+- В `.env` на проде лежат секреты (см. бэкап `/home/dvolkov/backups/linkeon/`)
+
+### Ручные команды (если что-то сломалось)
+
+**Бэк** (через ssh):
 ```bash
-# Бэк
-cd ~/Downloads/spirits_back
-rsync -az src/ dvolkov@212.113.106.202:~/spirits_back/src/
-ssh dvolkov@212.113.106.202 "cd ~/spirits_back && npm run build && pm2 restart linkeon-api"
-
-# Фронт
-cd ~/Downloads/spirits_front
-echo "VITE_BACKEND_URL=https://my.linkeon.io" > .env
-pnpm build
-rsync -az --delete dist/ dvolkov@212.113.106.202:/home/dvolkov/spirits_front/
+ssh dvolkov@212.113.106.202 "cd /home/dvolkov/spirits_back && git fetch origin && git reset --hard origin/b2b && npm ci && npm run build && pm2 restart linkeon-api"
 ```
-После ручного деплоя **ОБЯЗАТЕЛЬНО** прогнать smoke вручную: `bash ~/Downloads/spirits_back/tests/smoke/run.sh`.
+
+**Фронт**:
+```bash
+ssh dvolkov@212.113.106.202 "
+  export PATH=\$HOME/.npm-global/bin:\$PATH
+  cd /home/dvolkov/spirits_front_src && git fetch origin && git reset --hard origin/b2b
+  echo 'VITE_BACKEND_URL=https://my.linkeon.io' > .env
+  pnpm install --frozen-lockfile && pnpm build
+  rsync -az --delete dist/ /home/dvolkov/spirits_front/
+"
+```
+После ручного деплоя **ОБЯЗАТЕЛЬНО** прогнать smoke: `bash ~/Downloads/spirits_back/tests/smoke/run.sh`.
 
 ## 💾 Бэкапы
 
