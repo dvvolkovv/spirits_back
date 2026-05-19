@@ -67,6 +67,7 @@ export class ClaudeAgentService {
     const mcpServer = this.buildMcpServer(ctx);
     let newSessionId: string | undefined;
     let totalCostUsd = 0;
+    let renderTokensCharged = 0;
     let assistantText = '';
     const translator = new SdkEventTranslator();
 
@@ -110,7 +111,18 @@ export class ClaudeAgentService {
               }
             } else if (toolName === 'approve_scenarios' && Array.isArray(r?.approved)) {
               for (const a of r.approved) {
-                if (a?.videoId) assistantText += `\n\n{{smm_video:id=${a.videoId}}}`;
+                if (a?.videoId) {
+                  assistantText += `\n\n{{smm_video:id=${a.videoId}}}`;
+                  // Attribute render cost to this assistant message so the
+                  // "X токенов" суффикс отражает полную стоимость (Claude API + рендер).
+                  try {
+                    const rRes = await this.pg.query(
+                      `SELECT tokens_charged FROM smm_video WHERE id = $1`,
+                      [a.videoId],
+                    );
+                    renderTokensCharged += Number(rRes.rows[0]?.tokens_charged ?? 0);
+                  } catch { /* ignore — fallback to Claude-only cost */ }
+                }
               }
             } else if (toolName === 'regenerate_scenario' && r?.scenarioId) {
               assistantText += `\n\n{{smm_scenario:id=${r.scenarioId}}}`;
@@ -124,9 +136,12 @@ export class ClaudeAgentService {
           }
           // Inject Linkeon-token deduction into the end event so frontend
           // shows "X токенов" suffix on the assistant message bubble.
-          if (e.type === 'end' && totalCostUsd > 0) {
-            const linkeonTokens = Math.ceil(totalCostUsd * 100_000);
-            (e as any).usage = { total: linkeonTokens, costUsd: totalCostUsd };
+          // Total = Claude API cost + render charges this turn.
+          if (e.type === 'end') {
+            const linkeonTokens = Math.ceil(totalCostUsd * 100_000) + renderTokensCharged;
+            if (linkeonTokens > 0) {
+              (e as any).usage = { total: linkeonTokens, costUsd: totalCostUsd };
+            }
           }
           res.write(JSON.stringify(e) + '\n');
         }
@@ -144,7 +159,7 @@ export class ClaudeAgentService {
     // Persist assistant response to chat history (with Linkeon-token count
     // so history reload shows the same "X токенов" suffix).
     if (assistantText.trim()) {
-      const tokensUsed = totalCostUsd > 0 ? Math.ceil(totalCostUsd * 100_000) : 0;
+      const tokensUsed = Math.ceil(totalCostUsd * 100_000) + renderTokensCharged;
       try {
         await this.pg.query(
           `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)

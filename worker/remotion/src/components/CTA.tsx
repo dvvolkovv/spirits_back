@@ -1,12 +1,21 @@
 // worker/remotion/src/components/CTA.tsx
 import { AbsoluteFill, interpolate, Sequence, useCurrentFrame, useVideoConfig } from 'remotion';
+import { AssistantRole } from '../types';
 
 interface Props {
   atSec: number;
   durationSec: number;
+  assistantRole: AssistantRole;
 }
 
-export const CTA: React.FC<Props> = ({ atSec, durationSec }) => {
+const ROLE_HEADLINE: Record<string, string> = {
+  psy: 'ИИ-психолог',
+  lawyer: 'ИИ-юрист',
+  coach: 'ИИ-коуч',
+};
+
+export const CTA: React.FC<Props> = ({ atSec, durationSec, assistantRole }) => {
+  const headline = ROLE_HEADLINE[assistantRole] ?? 'ИИ-ассистент';
   const { fps } = useVideoConfig();
   const frame = useCurrentFrame();
   const startFrame = Math.round(atSec * fps);
@@ -44,7 +53,7 @@ export const CTA: React.FC<Props> = ({ atSec, durationSec }) => {
               textAlign: 'center',
             }}
           >
-            ИИ-психолог
+            {headline}
           </div>
           <div
             style={{

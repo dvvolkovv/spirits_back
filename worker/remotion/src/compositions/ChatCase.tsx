@@ -45,7 +45,7 @@ export const ChatCase: React.FC<CaseVideoProps> = (props) => {
       ))}
 
       {/* Layer 4: CTA overlay last 5s */}
-      <CTA atSec={ctaAt} durationSec={5} />
+      <CTA atSec={ctaAt} durationSec={5} assistantRole={props.assistantRole} />
 
       {/* Layer 5: Background music */}
       {props.musicUrl ? <BackgroundMusic src={props.musicUrl} volume={0.15} /> : null}
