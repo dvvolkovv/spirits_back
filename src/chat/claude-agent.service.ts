@@ -99,6 +99,29 @@ export class ClaudeAgentService {
           if (e.type === 'item' && typeof (e as any).content === 'string') {
             assistantText += (e as any).content;
           }
+          // Buffer SMM card markers so history reload restores ScenarioCard/SmmVideoPlayer.
+          // Mirrors the frontend stream-handler logic (ChatInterface.tsx:970-1006).
+          if (e.type === 'tool_result') {
+            const r = (e as any).result;
+            const toolName = (e as any).tool as string;
+            if (toolName === 'generate_scenarios' && Array.isArray(r?.scenarios)) {
+              for (const sc of r.scenarios) {
+                if (sc?.id) assistantText += `\n\n{{smm_scenario:id=${sc.id}}}`;
+              }
+            } else if (toolName === 'approve_scenarios' && Array.isArray(r?.approved)) {
+              for (const a of r.approved) {
+                if (a?.videoId) assistantText += `\n\n{{smm_video:id=${a.videoId}}}`;
+              }
+            } else if (toolName === 'regenerate_scenario' && r?.scenarioId) {
+              assistantText += `\n\n{{smm_scenario:id=${r.scenarioId}}}`;
+            } else if (toolName === 'connect_social') {
+              if (r?.method === 'oauth' && r.authorizeUrl) {
+                assistantText += `\n\n{{smm_social_connect_button:platform=${r.platform},authorize_url=${r.authorizeUrl}}}`;
+              } else if (r?.method === 'manual' && r.platform === 'telegram') {
+                assistantText += `\n\n{{smm_social_connect_telegram}}`;
+              }
+            }
+          }
           // Inject Linkeon-token deduction into the end event so frontend
           // shows "X токенов" suffix on the assistant message bubble.
           if (e.type === 'end' && totalCostUsd > 0) {
