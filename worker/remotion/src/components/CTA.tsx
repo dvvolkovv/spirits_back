@@ -10,12 +10,23 @@ interface Props {
 
 const ROLE_HEADLINE: Record<string, string> = {
   psy: 'ИИ-психолог',
-  lawyer: 'ИИ-юрист',
   coach: 'ИИ-коуч',
+  lawyer: 'ИИ-юрист',
+  accountant: 'ИИ-бухгалтер',
+  marketer: 'ИИ-маркетолог',
+  hr: 'ИИ-HR-эксперт',
+  business: 'ИИ-бизнес-эксперт',
+  copywriter: 'ИИ-копирайтер',
+  astrologer: 'ИИ-астролог',
+  numerologist: 'ИИ-нумеролог',
+  humandesign: 'ИИ-Human Design',
+  gamepractic: 'ИИ-игропрактик',
+  mindfulness: 'ИИ-наставник осознанности',
+  assistant: 'ИИ-ассистент',
 };
 
 export const CTA: React.FC<Props> = ({ atSec, durationSec, assistantRole }) => {
-  const headline = ROLE_HEADLINE[assistantRole] ?? 'ИИ-ассистент';
+  const headline = ROLE_HEADLINE[assistantRole] ?? 'ИИ-ассистент Linkeon';
   const { fps } = useVideoConfig();
   const frame = useCurrentFrame();
   const startFrame = Math.round(atSec * fps);

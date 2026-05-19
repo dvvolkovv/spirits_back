@@ -34,7 +34,37 @@ export class ScenariosController {
 
   @Post(':id/approve')
   async approveOne(@Req() req: any, @Param('id') id: string) {
-    return this.approval.approveScenarios({ userId: req.user.phone, scenarioIds: [id] });
+    const result = await this.approval.approveScenarios({
+      userId: req.user.phone,
+      scenarioIds: [id],
+    });
+    // Attribute render cost to the ai-сообщение that introduced this scenario.
+    // ChatInterface fetches custom_chat_history on reload — without this update
+    // (a) "X токенов" suffix would only reflect Claude API cost and (b) the
+    // SmmVideoPlayer wouldn't restore until the user opens the ScenarioCard.
+    for (const a of result.approved) {
+      try {
+        const vRes = await this.pg.query(
+          `SELECT tokens_charged FROM smm_video WHERE id = $1`,
+          [a.videoId],
+        );
+        const charge = Number(vRes.rows[0]?.tokens_charged ?? 0);
+        await this.pg.query(
+          `UPDATE custom_chat_history
+              SET tokens_used = COALESCE(tokens_used, 0) + $1,
+                  content     = content || E'\n\n{{smm_video:id=' || $2::text || '}}'
+            WHERE id = (
+              SELECT id FROM custom_chat_history
+               WHERE sender_type = 'ai'
+                 AND position('smm_scenario:id=' || $3::text in content) > 0
+                 AND position('smm_video:id=' || $2::text in content) = 0
+               ORDER BY created_at DESC LIMIT 1
+            )`,
+          [charge, a.videoId, a.scenarioId],
+        );
+      } catch { /* ignore — UI still works through ScenarioCard.videoId */ }
+    }
+    return result;
   }
 
   @Post(':id/regenerate')
