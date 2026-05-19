@@ -53,6 +53,60 @@ rsync -az --delete dist/ dvolkov@212.113.106.202:/home/dvolkov/spirits_front/
 ```
 После ручного деплоя **ОБЯЗАТЕЛЬНО** прогнать smoke вручную: `bash ~/Downloads/spirits_back/tests/smoke/run.sh`.
 
+## 💾 Бэкапы
+
+Скрипт: `/home/dvolkov/backups/linkeon/backup.sh` на проде. Cron daily 03:00 UTC. Ретеншн 30 дней. Каждый снапшот → `/home/dvolkov/backups/linkeon/YYYYMMDD-HHMMSS/`:
+
+| Файл | Что |
+|------|-----|
+| `spirits_back.env` | основной `.env` бэкенда (часто пропадал — главная причина существования этого backup'а) |
+| `spirits_back-worker.env` | `.env` SMM-воркера |
+| `linkeon.sql.gz` | `pg_dump` базы `linkeon` (chat history, profiles, payments, tokens, agents) |
+| `neo4j.dump.gz` | offline `neo4j-admin database dump` (Profile + Value/Belief/Desire/Intent/Interest/Skill nodes + relationships). Делается через краткую остановку контейнера (~20с). |
+| `agent-avatars.tar.gz` | PNG/JPG из `public/agent-avatars/` |
+
+**Лог**: `/home/dvolkov/backups/linkeon/backup.log` (append).
+
+**Ручной запуск**:
+```bash
+ssh dvolkov@212.113.106.202 "/home/dvolkov/backups/linkeon/backup.sh"
+```
+
+**Локальная копия на Mac** (отдельная машина — на случай если прод-сервер потеряется):
+```bash
+LATEST=$(ssh dvolkov@212.113.106.202 'ls -t /home/dvolkov/backups/linkeon/2*/ -d | head -1')
+rsync -az "dvolkov@212.113.106.202:$LATEST" ~/Downloads/spirits_backups/$(date -u +%Y%m%d-%H%M%S)/
+```
+
+### Восстановление
+
+**`.env`** — `scp` файла обратно на сервер, `pm2 restart linkeon-api`.
+
+**PostgreSQL `linkeon`**:
+```bash
+scp linkeon.sql.gz dvolkov@212.113.106.202:/tmp/
+ssh dvolkov@212.113.106.202 "gunzip -c /tmp/linkeon.sql.gz | PGPASSWORD=linkeon_pass_2026 psql -h localhost -p 5433 -U linkeon -d linkeon"
+```
+Дамп с `--clean --if-exists` — DROP'ит существующие таблицы перед INSERT'ом, так что чистая накатка поверх работает.
+
+**Neo4j**:
+```bash
+scp neo4j.dump.gz dvolkov@212.113.106.202:/tmp/
+ssh dvolkov@212.113.106.202 "
+  gunzip /tmp/neo4j.dump.gz
+  docker cp /tmp/neo4j.dump neo4j:/tmp/neo4j.dump
+  docker stop neo4j
+  docker run --rm --volumes-from neo4j neo4j:5 neo4j-admin database load neo4j --from-path=/tmp --overwrite-destination=true
+  docker start neo4j
+"
+```
+
+**Avatars**:
+```bash
+scp agent-avatars.tar.gz dvolkov@212.113.106.202:/tmp/
+ssh dvolkov@212.113.106.202 "tar xzf /tmp/agent-avatars.tar.gz -C /home/dvolkov/spirits_back/public/"
+```
+
 ## Тестовые аккаунты
 | | Телефон | Роль |
 |--|---------|------|
