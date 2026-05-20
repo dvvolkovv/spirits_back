@@ -99,7 +99,7 @@ export class AuthController {
    * Фиксированный список + pattern для динамических referral-аккаунтов.
    */
   private isTestPhone(phone: string): boolean {
-    const FIXED = ['70000000000', '79030169187'];
+    const FIXED = ['70000000000', '79030169187', '79169403771'];
     if (FIXED.includes(phone)) return true;
     return /^790300\d{5}$/.test(phone);
   }
