@@ -57,6 +57,7 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
           speaker: turn.speaker,
           role: ctx.scenario.assistantRole,
           text: turn.text,
+          voiceOverride: ctx.scenario.ttsVoiceId,
         });
         const localPath = await writeSynthResultToFile(res, tmp.root, `voice-${i}`);
         const url = await uploadAudioToMinio(localPath, `videos/${input.videoId}/voice-${i}`);

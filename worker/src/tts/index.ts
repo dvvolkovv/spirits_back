@@ -23,6 +23,13 @@ export interface SynthRequest {
   role: AssistantRole;
   heroGender?: HeroGender;
   text: string;
+  /**
+   * Creator-mode override for Yandex voice. When set, both speakers (hero +
+   * assistant) use this same voice id (monologue/dialog from one expert).
+   * For Linkeon-official campaigns this is null and the per-role map is used.
+   * No effect on ElevenLabs (premium tier) for now.
+   */
+  voiceOverride?: string | null;
 }
 
 export interface SynthResult {
@@ -32,7 +39,9 @@ export interface SynthResult {
 
 export async function synthesize(req: SynthRequest): Promise<SynthResult> {
   if (req.tier === 'economy') {
-    const voice = pickYandexVoice(req.speaker, req.role, req.heroGender);
+    const voice = req.voiceOverride
+      ? { voice: req.voiceOverride, emotion: 'neutral' as const }
+      : pickYandexVoice(req.speaker, req.role, req.heroGender);
     const bytes = await synthesizeYandex({ text: req.text, voice });
     return { format: 'lpcm', bytes };
   }

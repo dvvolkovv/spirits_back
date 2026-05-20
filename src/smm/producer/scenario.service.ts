@@ -3,6 +3,8 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../../common/services/pg.service';
 import { ClaudeCliService } from '../../common/services/claude-cli.service';
 import { CreatorCampaignService } from './creator-campaign.service';
+import { pickRandomVoice } from './voice-picker';
+import { SmmCreatorCampaign } from '../entities/smm-creator-campaign.entity';
 import {
   SmmScenario,
   rowToScenario,
@@ -114,7 +116,7 @@ export class ScenarioService {
     const userMsg = this.buildUserMsg(input);
     this.logger.log(`Generating ${input.count} scenarios, mode=${input.mode}, topic="${input.topic ?? ''}"`);
 
-    const { systemPrompt, isLinkeonOfficial } = await this.resolveSystemPrompt(input.campaignId, input.topic ?? null);
+    const { systemPrompt, isLinkeonOfficial, creator } = await this.resolveSystemPrompt(input.campaignId, input.topic ?? null);
 
     const text = (await this.claudeCli.text(userMsg, {
       system: systemPrompt,
@@ -144,16 +146,18 @@ export class ScenarioService {
       }));
 
       const role = isLinkeonOfficial ? s.assistant_role : 'expert';
+      const ttsVoiceId = isLinkeonOfficial ? null : pickRandomVoice(creator!.voiceGender);
 
       const r = await this.pg.query(
         `INSERT INTO smm_scenario
-           (campaign_id, title, assistant_role, dialog, mood, broll_prompts, tts_tier, status)
-         VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, 'pending_review')
+           (campaign_id, title, assistant_role, dialog, mood, broll_prompts, tts_tier, status, tts_voice_id)
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, 'pending_review', $8)
          RETURNING id`,
         [
           input.campaignId, s.title, role,
           JSON.stringify(dialog), s.mood,
           JSON.stringify(brollPrompts), ttsTier,
+          ttsVoiceId,
         ],
       );
       ids.push(r.rows[0].id);
@@ -172,7 +176,7 @@ export class ScenarioService {
     if (existing.rows.length === 0) throw new Error(`scenario ${scenarioId} not found`);
     const row = existing.rows[0];
 
-    const { systemPrompt, isLinkeonOfficial } = await this.resolveSystemPrompt(row.campaign_id, row.topic ?? null);
+    const { systemPrompt, isLinkeonOfficial, creator } = await this.resolveSystemPrompt(row.campaign_id, row.topic ?? null);
 
     const userMsg = `Перегенерируй сценарий по этому фидбеку: "${feedback}"
 
@@ -205,15 +209,18 @@ ${JSON.stringify({
     }));
 
     const role = isLinkeonOfficial ? s.assistant_role : 'expert';
+    const ttsVoiceId = isLinkeonOfficial ? null : pickRandomVoice(creator!.voiceGender);
 
     await this.pg.query(
       `UPDATE smm_scenario
           SET title = $1, assistant_role = $2, dialog = $3::jsonb,
-              mood = $4, broll_prompts = $5::jsonb, status = 'pending_review'
+              mood = $4, broll_prompts = $5::jsonb, status = 'pending_review',
+              tts_voice_id = $7
         WHERE id = $6`,
       [
         s.title, role, JSON.stringify(dialog),
         s.mood, JSON.stringify(brollPrompts), scenarioId,
+        ttsVoiceId,
       ],
     );
     this.logger.log(`Regenerated scenario ${scenarioId} (cost=$${cliRes.costUsd.toFixed(4)})`);
@@ -223,7 +230,7 @@ ${JSON.stringify({
   private async resolveSystemPrompt(
     campaignId: string,
     topic: string | null,
-  ): Promise<{ systemPrompt: string; isLinkeonOfficial: boolean }> {
+  ): Promise<{ systemPrompt: string; isLinkeonOfficial: boolean; creator: SmmCreatorCampaign | null }> {
     const campRes = await this.pg.query(
       `SELECT is_linkeon_official FROM smm_campaign WHERE id = $1`,
       [campaignId],
@@ -231,7 +238,7 @@ ${JSON.stringify({
     const isLinkeonOfficial = Boolean(campRes.rows[0]?.is_linkeon_official);
 
     if (isLinkeonOfficial) {
-      return { systemPrompt: SYSTEM_PROMPT, isLinkeonOfficial: true };
+      return { systemPrompt: SYSTEM_PROMPT, isLinkeonOfficial: true, creator: null };
     }
 
     const creator = await this.creatorCampaigns.getByCampaign(campaignId);
@@ -245,7 +252,7 @@ ${JSON.stringify({
       .replace('{cta_label}', creator.ctaLabel)
       .replace('{cta_handle}', creator.ctaHandle);
 
-    return { systemPrompt, isLinkeonOfficial: false };
+    return { systemPrompt, isLinkeonOfficial: false, creator };
   }
 
   async getById(scenarioId: string): Promise<SmmScenario | null> {

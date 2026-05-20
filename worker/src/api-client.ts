@@ -34,6 +34,7 @@ export interface SmmRenderContext {
     brollPrompts: SmmBrollPrompt[];
     musicTrackId: string | null;
     ttsTier: 'economy' | 'premium';
+    ttsVoiceId: string | null;
   };
 }
 

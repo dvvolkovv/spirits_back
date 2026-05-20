@@ -30,6 +30,7 @@ export interface SmmScenario {
   brollPrompts: SmmBrollPrompt[];
   musicTrackId: string | null;
   ttsTier: SmmTtsTier;
+  ttsVoiceId: string | null;
   status: SmmScenarioStatus;
   createdAt: Date;
   updatedAt: Date;
@@ -46,6 +47,7 @@ export function rowToScenario(row: any): SmmScenario {
     brollPrompts: row.broll_prompts as SmmBrollPrompt[],
     musicTrackId: row.music_track_id ?? null,
     ttsTier: row.tts_tier,
+    ttsVoiceId: row.tts_voice_id ?? null,
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
