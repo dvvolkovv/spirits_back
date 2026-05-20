@@ -8,6 +8,8 @@ export interface SmmCreatorCampaign {
   ctaLabel: string;
   voiceGender: SmmCreatorVoiceGender;
   genre: SmmCreatorGenre;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 export function rowToCreatorCampaign(row: any): SmmCreatorCampaign {
@@ -17,5 +19,7 @@ export function rowToCreatorCampaign(row: any): SmmCreatorCampaign {
     ctaLabel: row.cta_label,
     voiceGender: row.voice_gender,
     genre: row.genre,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
