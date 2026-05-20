@@ -275,6 +275,38 @@ cd ~/Downloads/spirits_back/tests && node runner.js  # api (32) + e2e (18) = 50
 - Аватарки и изображения раздаются из `/static/` через Nginx (файлы в `~/spirits_back/public/`)
 
 
+## ➕ Добавление нового ассистента
+
+Каждый ассистент = одна строка в таблице `agents`. UI берёт список из `GET /webhook/agents`, никаких отдельных шагов на фронте делать не нужно.
+
+### Обязательные поля при INSERT в `agents`
+
+| Поле | Зачем |
+|------|-------|
+| `name` | **Технический идентификатор** (snake_case, уникальный). Используется в `chat.service.ts` для роутинга и в `changeAgentOnServer` на фронте. После создания **не меняется**. |
+| `display_name` | Что видит пользователь (`Юлия`, `Михаил`). Если совпадает с `name` — можно не задавать, fallback на `name`. |
+| `description` | **Критично** — попадает в системный промпт ВСЕХ остальных ассистентов через блок «Коллеги-ассистенты в Linkeon» ([chat.service.ts:538](src/chat/chat.service.ts#L538)). Без этого описания коллеги не смогут представить нового сотрудника пользователю. Формат: «Юрист — помогает разобраться в правовых вопросах». |
+| `system_prompt` | Персональный prompt — характер, методики, ограничения, тон. Используется в `streamUniversalAgent` после блока «Персона и инструкции ассистента». |
+| `category` | `business` / `personal` / `assistant` / `smm` — определяет в каком разделе UI группируется (см. `AssistantSelection.tsx`). |
+
+### Дополнительные шаги
+
+1. **Аватарка**: положить квадратный JPEG (рекомендуем 1024×1024, < 500 KB) в `~/spirits_back/public/agent-avatars/<id>.jpg`. Раздаётся через `/webhook/0cdacf32-7bfd-4888-b24f-3a6af3b5f99e/agent/avatar/<id>`. Если меняешь аватарку существующего ассистента — bump `DB_VERSION` в `spirits_front/src/utils/avatarCache.ts` чтобы IndexedDB-кеш у клиентов очистился.
+
+2. **Если у ассистента нестандартный pipeline** (как Юля с in-process MCP tools и Claude Agent SDK через OAuth): добавить ветку в `chat.service.ts` `streamChat()` по `agent.name === '<your_name>'` ДО fallback на `streamUniversalAgent`. Пример: блок `if (agent?.name === 'smm_producer')` на line ~96.
+
+3. **Знание о новом ассистенте у коллег — автоматическое** (из его `description` поля). Никаких ручных правок в существующих system_prompt'ах делать не нужно. Это гарантирует [chat.service.ts:538-557](src/chat/chat.service.ts#L538-L557) — на каждом запросе перечитывается список из БД.
+
+### Smoke-проверка
+
+После добавления:
+```bash
+curl -s https://my.linkeon.io/webhook/agents | jq '.[] | select(.name == "<your_name>")'
+# Должно вернуть запись с display_name + description + category.
+```
+И через любого другого ассистента в чате спросить «расскажи про <display_name>» — он должен корректно представить новичка.
+
+
 ## 📞 Outbound AI calls — общая инфраструктура с Taler ID
 
 my.linkeon.io может использовать готовую инфраструктуру обзвона из Taler ID. Разворачивать свой SIP/LiveKit/агента НЕ нужно — всё shared.
