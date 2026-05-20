@@ -65,6 +65,8 @@ export class ClaudeAgentService {
     const resumeId = await this.loadSessionId(ctx.userId);
 
     const mcpServer = this.buildMcpServer(ctx);
+    const ctxBlock = `Контекст юзера: isAdmin=${ctx.isAdmin}.`;
+    const systemPromptWithCtx = `${ctxBlock}\n\n${SMM_PRODUCER_SYSTEM_PROMPT}`;
     let newSessionId: string | undefined;
     let totalCostUsd = 0;
     let renderTokensCharged = 0;
@@ -76,7 +78,7 @@ export class ClaudeAgentService {
         prompt: userMessage,
         options: {
           model: 'claude-haiku-4-5',
-          systemPrompt: SMM_PRODUCER_SYSTEM_PROMPT,
+          systemPrompt: systemPromptWithCtx,
           mcpServers: { 'smm-tools': mcpServer },
           disallowedTools: DISALLOWED_BUILTINS,
           cwd,
