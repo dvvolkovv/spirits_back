@@ -1,10 +1,13 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { PgService } from '../common/services/pg.service';
+import { StorageService } from '../common/services/storage.service';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import axios from 'axios';
 import { Response } from 'express';
+
+const ASSETS_BUCKET = 'linkeon-assets';
 
 @Injectable()
 export class MiscService {
@@ -15,6 +18,7 @@ export class MiscService {
   constructor(
     private readonly neo4j: Neo4jService,
     private readonly pg: PgService,
+    private readonly storage: StorageService,
   ) {
     this.s3 = new S3Client({
       region: process.env.AWS_REGION || 'ru-central1',
@@ -313,18 +317,29 @@ ${blocks.join('\n\n---\n\n')}
     return lines.join('\n');
   }
 
-  /** Save user-uploaded image to public/generated/ and history (zero cost). */
+  /**
+   * Upload an image buffer to MinIO bucket `linkeon-assets` under images/<filename>.<ext>.
+   * Returns the public URL — same URL works for both browsers (via nginx /smm-media/)
+   * and the worker (no presign needed, bucket is public-read).
+   */
+  private async uploadAssetImage(buffer: Buffer, ext: string): Promise<string> {
+    const contentType = ext === 'png' ? 'image/png'
+      : ext === 'webp' ? 'image/webp'
+      : 'image/jpeg';
+    const key = `images/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    return this.storage.upload({
+      bucket: ASSETS_BUCKET,
+      key,
+      body: buffer,
+      contentType,
+      cacheControl: 'public, max-age=2592000',
+    });
+  }
+
+  /** Save user-uploaded image to MinIO assets and history (zero cost). */
   async saveUploadedImage(userId: string, buffer: Buffer, mimetype: string): Promise<string> {
-    const fs = require('fs');
-    const path = require('path');
-    const publicDir = path.join(process.cwd(), 'public', 'generated');
-    if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
-
     const ext = /jpe?g/i.test(mimetype) ? 'jpg' : (mimetype.includes('webp') ? 'webp' : 'png');
-    const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-    fs.writeFileSync(path.join(publicDir, filename), buffer);
-    const url = `/static/generated/${filename}`;
-
+    const url = await this.uploadAssetImage(buffer, ext);
     await this.saveGeneratedImage(userId, '[uploaded]', url, 0);
     return url;
   }
@@ -443,9 +458,7 @@ ${blocks.join('\n\n---\n\n')}
       }
 
       const ext = mimeType.includes('jpeg') ? 'jpg' : 'png';
-      const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-      fs.writeFileSync(path.join(publicDir, filename), Buffer.from(b64Image, 'base64'));
-      const imageUrl = `/static/generated/${filename}`;
+      const imageUrl = await this.uploadAssetImage(Buffer.from(b64Image, 'base64'), ext);
 
       // Deduct tokens
       await this.pg.query(
@@ -545,9 +558,7 @@ ${blocks.join('\n\n---\n\n')}
 
       const outMime = imgPart.inlineData.mimeType || 'image/png';
       const ext = outMime.includes('jpeg') ? 'jpg' : 'png';
-      const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-      fs.writeFileSync(path.join(publicDir, filename), Buffer.from(imgPart.inlineData.data, 'base64'));
-      const imageUrl = `/static/generated/${filename}`;
+      const imageUrl = await this.uploadAssetImage(Buffer.from(imgPart.inlineData.data, 'base64'), ext);
 
       this.logger.log(`${geminiModel} edited image`);
 
@@ -633,9 +644,7 @@ ${blocks.join('\n\n---\n\n')}
 
       const outMime = imgPart.inlineData.mimeType || 'image/png';
       const ext = outMime.includes('jpeg') ? 'jpg' : 'png';
-      const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-      fs.writeFileSync(path.join(publicDir, filename), Buffer.from(imgPart.inlineData.data, 'base64'));
-      const imageUrl = `/static/generated/${filename}`;
+      const imageUrl = await this.uploadAssetImage(Buffer.from(imgPart.inlineData.data, 'base64'), ext);
 
       this.logger.log(`${geminiModel} composed image from ${sources.length} sources`);
 

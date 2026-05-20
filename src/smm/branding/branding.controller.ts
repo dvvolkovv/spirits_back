@@ -13,12 +13,13 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { Request, Response } from 'express';
-import * as fs from 'fs';
-import * as path from 'path';
 import * as multer from 'multer';
 import { JwtGuard } from '../../common/guards/jwt.guard';
 import { PgService } from '../../common/services/pg.service';
+import { StorageService } from '../../common/services/storage.service';
 import { CreatorCampaignService } from '../producer/creator-campaign.service';
+
+const ASSETS_BUCKET = 'linkeon-assets';
 
 @Controller('smm/campaigns')
 @UseGuards(JwtGuard)
@@ -31,6 +32,7 @@ export class BrandingController {
   constructor(
     private readonly pg: PgService,
     private readonly creators: CreatorCampaignService,
+    private readonly storage: StorageService,
   ) {}
 
   /**
@@ -75,16 +77,19 @@ export class BrandingController {
           const ext = file.mimetype === 'image/png' ? 'png'
             : file.mimetype === 'image/webp' ? 'webp'
             : 'jpg';
-          const dir = path.join(process.cwd(), 'public', 'smm-logos');
-          await fs.promises.mkdir(dir, { recursive: true });
-          const filename = `${id}.${ext}`;
-          const target = path.join(dir, filename);
-          await fs.promises.writeFile(target, file.buffer);
-          // Absolute URL so the worker can fetch the image during render.
-          const base = (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '');
-          const url = `${base}/static/smm-logos/${filename}?t=${Date.now()}`;
-          const updated = await this.creators.updateBranding(id, { logoUrl: url });
-          res.status(200).json({ ok: true, logoUrl: url, settings: updated });
+          // Store in MinIO so rsync --delete никогда не сносит лого.
+          // Cache-buster ?t=<ts> на конец URL — клиент видит новый адрес
+          // после замены и не показывает старое из кеша.
+          const url = await this.storage.upload({
+            bucket: ASSETS_BUCKET,
+            key: `smm-logos/${id}.${ext}`,
+            body: file.buffer,
+            contentType: file.mimetype,
+            cacheControl: 'public, max-age=2592000',
+          });
+          const versionedUrl = `${url}?t=${Date.now()}`;
+          const updated = await this.creators.updateBranding(id, { logoUrl: versionedUrl });
+          res.status(200).json({ ok: true, logoUrl: versionedUrl, settings: updated });
           resolve();
         } catch (e: any) {
           res.status(500).json({ error: e.message });
@@ -176,15 +181,16 @@ export class BrandingController {
           const ext = file.mimetype === 'image/png' ? 'png'
             : file.mimetype === 'image/webp' ? 'webp'
             : 'jpg';
-          const dir = path.join(process.cwd(), 'public', 'smm-backgrounds');
-          await fs.promises.mkdir(dir, { recursive: true });
-          const filename = `${id}.${ext}`;
-          const target = path.join(dir, filename);
-          await fs.promises.writeFile(target, file.buffer);
-          const base = (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '');
-          const url = `${base}/static/smm-backgrounds/${filename}?t=${Date.now()}`;
-          const updated = await this.creators.updateBranding(id, { bgImageUrl: url });
-          res.status(200).json({ ok: true, bgImageUrl: url, settings: updated });
+          const url = await this.storage.upload({
+            bucket: ASSETS_BUCKET,
+            key: `smm-backgrounds/${id}.${ext}`,
+            body: file.buffer,
+            contentType: file.mimetype,
+            cacheControl: 'public, max-age=2592000',
+          });
+          const versionedUrl = `${url}?t=${Date.now()}`;
+          const updated = await this.creators.updateBranding(id, { bgImageUrl: versionedUrl });
+          res.status(200).json({ ok: true, bgImageUrl: versionedUrl, settings: updated });
           resolve();
         } catch (e: any) {
           res.status(500).json({ error: e.message });

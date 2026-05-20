@@ -1,32 +1,20 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { StorageService } from '../common/services/storage.service';
+
+const ASSETS_BUCKET = 'linkeon-assets';
 
 @Injectable()
 export class AvatarService {
   private readonly logger = new Logger(AvatarService.name);
-  private s3: S3Client | null = null;
 
-  constructor(private readonly pg: PgService) {
-    if (process.env.AWS_ACCESS_KEY_ID) {
-      const config: any = {
-        region: process.env.AWS_REGION || 'us-east-1',
-        credentials: {
-          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-        },
-      };
-      // MinIO / custom S3-compatible endpoint
-      if (process.env.AWS_ENDPOINT) {
-        config.endpoint = process.env.AWS_ENDPOINT;
-        config.forcePathStyle = process.env.AWS_FORCE_PATH_STYLE === 'true';
-      }
-      this.s3 = new S3Client(config);
-    }
-  }
+  constructor(
+    private readonly pg: PgService,
+    private readonly storage: StorageService,
+  ) {}
 
   async getAvatar(userId: string): Promise<{ url: string } | null> {
-    // Check profile_data first
+    // Check profile_data first — holds canonical avatar URL (now a MinIO link).
     const res = await this.pg.query(
       'SELECT profile_data FROM ai_profiles_consolidated WHERE user_id = $1',
       [userId],
@@ -34,7 +22,7 @@ export class AvatarService {
     const avatarUrl = res.rows[0]?.profile_data?.avatar_url;
     if (avatarUrl) return { url: avatarUrl };
 
-    // Check local file
+    // Legacy fallback: local file from before the MinIO migration.
     const path = require('path');
     const fs = require('fs');
     const localPath = path.join(process.cwd(), 'public', 'avatars', `${userId}.jpg`);
@@ -45,15 +33,16 @@ export class AvatarService {
   }
 
   async uploadAvatar(userId: string, buffer: Buffer, mimetype: string): Promise<{ url: string }> {
-    const path = require('path');
-    const fs = require('fs');
-
-    // Save locally
-    const dir = path.join(process.cwd(), 'public', 'avatars');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const filename = `${userId}.jpg`;
-    fs.writeFileSync(path.join(dir, filename), buffer);
-    const url = `/static/avatars/${filename}`;
+    const ext = /png/i.test(mimetype) ? 'png'
+      : /webp/i.test(mimetype) ? 'webp'
+      : 'jpg';
+    const url = await this.storage.upload({
+      bucket: ASSETS_BUCKET,
+      key: `avatars/users/${userId}.${ext}`,
+      body: buffer,
+      contentType: mimetype || 'image/jpeg',
+      cacheControl: 'public, max-age=2592000',
+    });
 
     await this.pg.query(
       `UPDATE ai_profiles_consolidated
@@ -66,6 +55,17 @@ export class AvatarService {
   }
 
   async getAgentAvatar(agentId: string): Promise<string | null> {
+    // After backfill all agent avatars live in MinIO. Local file remains as a
+    // fallback for environments that didn't run the backfill yet.
+    const minioKey = `avatars/agents/${agentId}.jpg`;
+    const minioUrl = this.storage.publicUrl(ASSETS_BUCKET, minioKey);
+    // Check if it exists by HEAD-ing via S3 list — cheap, single object.
+    try {
+      const keys = await this.storage.list({ bucket: ASSETS_BUCKET, prefix: minioKey, maxKeys: 1 });
+      if (keys.includes(minioKey)) return minioUrl;
+    } catch { /* fall through */ }
+
+    // Legacy local-file fallback (pre-migration).
     const path = require('path');
     const fs = require('fs');
     const localPath = path.join(process.cwd(), 'public', 'agent-avatars', `${agentId}.jpg`);
