@@ -13,6 +13,7 @@ import { MusicService } from './music/music.service';
 import { ScenarioService } from './producer/scenario.service';
 import { TrendsService } from './producer/trends.service';
 import { ApprovalService } from './producer/approval.service';
+import { CreatorCampaignService } from './producer/creator-campaign.service';
 import { SmmProducerToolsService } from './producer/smm-producer-tools.service';
 import { ScenariosController } from './scenarios/scenarios.controller';
 import { VideosController } from './videos/videos.controller';
@@ -39,6 +40,7 @@ import { SocialAccountController } from './social-accounts/social-account.contro
     ScenarioService,
     TrendsService,
     ApprovalService,
+    CreatorCampaignService,
     SmmProducerToolsService,
     OAuthStateService,
     VkOAuthService,
@@ -57,6 +59,7 @@ import { SocialAccountController } from './social-accounts/social-account.contro
     ScenarioService,
     TrendsService,
     ApprovalService,
+    CreatorCampaignService,
     SmmProducerToolsService,
     OAuthStateService,
     VkOAuthService,
