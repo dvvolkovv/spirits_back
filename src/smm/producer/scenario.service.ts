@@ -2,6 +2,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../../common/services/pg.service';
 import { ClaudeCliService } from '../../common/services/claude-cli.service';
+import { CreatorCampaignService } from './creator-campaign.service';
+import { pickRandomVoice } from './voice-picker';
+import { SmmCreatorCampaign } from '../entities/smm-creator-campaign.entity';
 import {
   SmmScenario,
   rowToScenario,
@@ -79,6 +82,26 @@ const SYSTEM_PROMPT = `Ты — креативный сценарист коро
   ]
 }`;
 
+const CREATOR_MODE_SYSTEM_PROMPT = `Ты — креативный сценарист коротких вертикальных видео для эксперта-блогера.
+
+ЗАДАЧА: сгенерируй сценарии 30-60-секундных вертикальных видео в формате
+"зритель задаёт вопрос → эксперт по теме отвечает → итог + CTA".
+
+ПАРАМЕТРЫ КАМПАНИИ:
+- Тема: {topic}
+- Жанр: {genre}
+- CTA: {cta_label} → {cta_handle}
+
+ПРАВИЛА:
+1. Каждый сценарий — это узнаваемый запрос аудитории, на который у эксперта есть точный ответ.
+2. dialog: 2-4 реплики, каждая 5-15 секунд. t_start/t_end в секундах (0-55).
+3. assistant_role фиксированно: 'expert' (не выбирай из 14 Linkeon-ролей).
+4. mood — одно из: dramatic | inspiring | calm | uplifting | tense | neutral
+5. broll_prompts — ОБЯЗАТЕЛЬНО 1-3 кадра. КАЖДЫЙ объект ДОЛЖЕН содержать at_sec (число), type ('ai_image' или 'stock_video'), prompt (английский, для Imagen/Pexels).
+6. Реплики на русском, живой разговорный язык. БЕЗ канцелярита.
+
+ФОРМАТ ОТВЕТА: чистый JSON-массив. Никаких пояснений до или после.`;
+
 @Injectable()
 export class ScenarioService {
   private readonly logger = new Logger(ScenarioService.name);
@@ -86,14 +109,17 @@ export class ScenarioService {
   constructor(
     private readonly pg: PgService,
     private readonly claudeCli: ClaudeCliService,
+    private readonly creatorCampaigns: CreatorCampaignService,
   ) {}
 
   async generate(input: GenerateInput): Promise<string[]> {
     const userMsg = this.buildUserMsg(input);
     this.logger.log(`Generating ${input.count} scenarios, mode=${input.mode}, topic="${input.topic ?? ''}"`);
 
+    const { systemPrompt, isLinkeonOfficial, creator } = await this.resolveSystemPrompt(input.campaignId, input.topic ?? null);
+
     const text = (await this.claudeCli.text(userMsg, {
-      system: SYSTEM_PROMPT,
+      system: systemPrompt,
       model: 'claude-haiku-4-5',
     })).trim();
     if (!text) throw new Error('Claude returned empty text');
@@ -119,15 +145,19 @@ export class ScenarioService {
         prompt: b.prompt,
       }));
 
+      const role = isLinkeonOfficial ? s.assistant_role : 'expert';
+      const ttsVoiceId = isLinkeonOfficial ? null : pickRandomVoice(creator!.voiceGender);
+
       const r = await this.pg.query(
         `INSERT INTO smm_scenario
-           (campaign_id, title, assistant_role, dialog, mood, broll_prompts, tts_tier, status)
-         VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, 'pending_review')
+           (campaign_id, title, assistant_role, dialog, mood, broll_prompts, tts_tier, status, tts_voice_id)
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, 'pending_review', $8)
          RETURNING id`,
         [
-          input.campaignId, s.title, s.assistant_role,
+          input.campaignId, s.title, role,
           JSON.stringify(dialog), s.mood,
           JSON.stringify(brollPrompts), ttsTier,
+          ttsVoiceId,
         ],
       );
       ids.push(r.rows[0].id);
@@ -146,6 +176,8 @@ export class ScenarioService {
     if (existing.rows.length === 0) throw new Error(`scenario ${scenarioId} not found`);
     const row = existing.rows[0];
 
+    const { systemPrompt, isLinkeonOfficial, creator } = await this.resolveSystemPrompt(row.campaign_id, row.topic ?? null);
+
     const userMsg = `Перегенерируй сценарий по этому фидбеку: "${feedback}"
 
 Текущий сценарий:
@@ -157,7 +189,7 @@ ${JSON.stringify({
 Сохрани общую тематику (${row.topic ?? 'auto'}), но переработай согласно фидбеку. Верни ОДИН JSON-объект (не массив) в том же формате.`;
 
     const cliRes = await this.claudeCli.textWithCost(userMsg, {
-      system: SYSTEM_PROMPT,
+      system: systemPrompt,
       model: 'claude-haiku-4-5',
     });
     const text = cliRes.text.trim();
@@ -176,18 +208,51 @@ ${JSON.stringify({
       prompt: b.prompt,
     }));
 
+    const role = isLinkeonOfficial ? s.assistant_role : 'expert';
+    const ttsVoiceId = isLinkeonOfficial ? null : pickRandomVoice(creator!.voiceGender);
+
     await this.pg.query(
       `UPDATE smm_scenario
           SET title = $1, assistant_role = $2, dialog = $3::jsonb,
-              mood = $4, broll_prompts = $5::jsonb, status = 'pending_review'
+              mood = $4, broll_prompts = $5::jsonb, status = 'pending_review',
+              tts_voice_id = $7
         WHERE id = $6`,
       [
-        s.title, s.assistant_role, JSON.stringify(dialog),
+        s.title, role, JSON.stringify(dialog),
         s.mood, JSON.stringify(brollPrompts), scenarioId,
+        ttsVoiceId,
       ],
     );
     this.logger.log(`Regenerated scenario ${scenarioId} (cost=$${cliRes.costUsd.toFixed(4)})`);
     return { costUsd: cliRes.costUsd };
+  }
+
+  private async resolveSystemPrompt(
+    campaignId: string,
+    topic: string | null,
+  ): Promise<{ systemPrompt: string; isLinkeonOfficial: boolean; creator: SmmCreatorCampaign | null }> {
+    const campRes = await this.pg.query(
+      `SELECT is_linkeon_official FROM smm_campaign WHERE id = $1`,
+      [campaignId],
+    );
+    const isLinkeonOfficial = Boolean(campRes.rows[0]?.is_linkeon_official);
+
+    if (isLinkeonOfficial) {
+      return { systemPrompt: SYSTEM_PROMPT, isLinkeonOfficial: true, creator: null };
+    }
+
+    const creator = await this.creatorCampaigns.getByCampaign(campaignId);
+    if (!creator) {
+      throw new Error('Creator settings missing — call set_creator_campaign_settings first');
+    }
+
+    const systemPrompt = CREATOR_MODE_SYSTEM_PROMPT
+      .replace('{topic}', topic ?? 'свободная')
+      .replace('{genre}', creator.genre)
+      .replace('{cta_label}', creator.ctaLabel)
+      .replace('{cta_handle}', creator.ctaHandle);
+
+    return { systemPrompt, isLinkeonOfficial: false, creator };
   }
 
   async getById(scenarioId: string): Promise<SmmScenario | null> {

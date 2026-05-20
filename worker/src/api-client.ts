@@ -34,6 +34,12 @@ export interface SmmRenderContext {
     brollPrompts: SmmBrollPrompt[];
     musicTrackId: string | null;
     ttsTier: 'economy' | 'premium';
+    ttsVoiceId: string | null;
+  };
+  campaign: {
+    isLinkeonOfficial: boolean;
+    ctaHandle?: string;
+    ctaLabel?: string;
   };
 }
 

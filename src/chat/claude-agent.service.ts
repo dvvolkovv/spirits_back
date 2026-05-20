@@ -65,6 +65,8 @@ export class ClaudeAgentService {
     const resumeId = await this.loadSessionId(ctx.userId);
 
     const mcpServer = this.buildMcpServer(ctx);
+    const ctxBlock = `Контекст юзера: isAdmin=${ctx.isAdmin}.`;
+    const systemPromptWithCtx = `${ctxBlock}\n\n${SMM_PRODUCER_SYSTEM_PROMPT}`;
     let newSessionId: string | undefined;
     let totalCostUsd = 0;
     let renderTokensCharged = 0;
@@ -76,7 +78,7 @@ export class ClaudeAgentService {
         prompt: userMessage,
         options: {
           model: 'claude-haiku-4-5',
-          systemPrompt: SMM_PRODUCER_SYSTEM_PROMPT,
+          systemPrompt: systemPromptWithCtx,
           mcpServers: { 'smm-tools': mcpServer },
           disallowedTools: DISALLOWED_BUILTINS,
           cwd,
@@ -299,6 +301,17 @@ export class ClaudeAgentService {
           video_id: z.string().optional(),
         },
         async (args: any) => handle('list_publications', args),
+      ),
+      tool(
+        'set_creator_campaign_settings',
+        'Сохранить настройки кампании внешнего автора: CTA-ссылка, пол голоса, жанр. ВЫЗЫВАЙ ПЕРВЫМ для не-админских юзеров — до generate_scenarios.',
+        {
+          cta_handle: z.string(),
+          cta_label: z.string().optional(),
+          voice_gender: z.enum(['male', 'female']),
+          genre: z.enum(['dialog', 'monologue', 'fact_explanation']).optional(),
+        },
+        async (args: any) => handle('set_creator_campaign_settings', args),
       ),
     ];
 

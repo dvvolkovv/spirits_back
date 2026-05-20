@@ -109,7 +109,12 @@ export class ChatService {
         [chatSessionId, agent.id, message],
       );
 
-      const ctx = { userId };
+      const adminRes = await this.pg.query(
+        `SELECT isadmin FROM ai_profiles_consolidated WHERE user_id = $1`,
+        [userId],
+      );
+      const isAdmin = Boolean(adminRes.rows[0]?.isadmin);
+      const ctx = { userId, isAdmin };
       try {
         await this.claudeAgent.streamSmmProducer(ctx, message, chatSessionId, agent.id, res);
       } catch (err: any) {

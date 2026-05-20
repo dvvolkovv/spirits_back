@@ -4,6 +4,7 @@ import { PgService } from '../../common/services/pg.service';
 import { ScenarioService, SourceMode } from './scenario.service';
 import { TrendsService } from './trends.service';
 import { ApprovalService } from './approval.service';
+import { CreatorCampaignService } from './creator-campaign.service';
 import { PublicationService } from '../publication/publication.service';
 import { OAuthStateService, Platform as OAuthPlatform } from '../oauth/oauth-state.service';
 import { VkOAuthService } from '../oauth/vk-oauth.service';
@@ -11,9 +12,11 @@ import { YouTubeOAuthService } from '../oauth/youtube-oauth.service';
 import { TikTokOAuthService } from '../oauth/tiktok-oauth.service';
 import { MetaOAuthService } from '../oauth/meta-oauth.service';
 import { parseScheduleTime } from '../publication/time-parser';
+import { SmmCreatorVoiceGender, SmmCreatorGenre } from '../entities/smm-creator-campaign.entity';
 
 export interface ToolContext {
   userId: string;
+  isAdmin: boolean;
   /** Most recent campaign id this user opened in the current chat session (optional). */
   recentCampaignId?: string;
 }
@@ -27,6 +30,7 @@ export class SmmProducerToolsService {
     private readonly scenario: ScenarioService,
     private readonly trends: TrendsService,
     private readonly approval: ApprovalService,
+    private readonly creatorCampaigns: CreatorCampaignService,
     private readonly publication: PublicationService,
     private readonly oauthState: OAuthStateService,
     private readonly vk: VkOAuthService,
@@ -49,6 +53,17 @@ export class SmmProducerToolsService {
         case 'schedule_publication': return await this.schedulePublication(input, ctx);
         case 'cancel_publication':   return await this.cancelPublication(input);
         case 'list_publications':    return await this.listPublications(input, ctx);
+        case 'set_creator_campaign_settings': {
+          const camp = await this.getOrCreateDraftCampaign(ctx.userId, ctx.isAdmin);
+          const settings = await this.creatorCampaigns.upsert({
+            campaignId: camp.id,
+            ctaHandle: input.cta_handle,
+            ctaLabel: input.cta_label,
+            voiceGender: input.voice_gender as SmmCreatorVoiceGender,
+            genre: input.genre as SmmCreatorGenre | undefined,
+          });
+          return { ok: true, campaignId: camp.id, settings };
+        }
         default:
           return { error: `unknown tool: ${toolName}` };
       }
@@ -62,13 +77,17 @@ export class SmmProducerToolsService {
     input: { mode: SourceMode; count: number; topic?: string },
     ctx: ToolContext,
   ): Promise<{ campaignId: string; scenarios: Array<{ id: string; title: string }> }> {
-    // 1. Create campaign
-    const cRes = await this.pg.query(
-      `INSERT INTO smm_campaign (user_id, source_mode, requested_count, topic, status)
-       VALUES ($1, $2, $3, $4, 'drafting') RETURNING id`,
-      [ctx.userId, input.mode, input.count, input.topic ?? null],
+    // 1. Resolve campaign — reuse draft from set_creator_campaign_settings if any.
+    const campaign = await this.getOrCreateDraftCampaign(ctx.userId, ctx.isAdmin);
+    const campaignId = campaign.id;
+    await this.pg.query(
+      `UPDATE smm_campaign
+         SET source_mode = $1,
+             requested_count = $2,
+             topic = $3
+       WHERE id = $4`,
+      [input.mode, input.count, input.topic ?? null, campaignId],
     );
-    const campaignId = cRes.rows[0].id;
 
     // 2. For trends mode — fetch trends context
     let trendsContext: string | undefined;
@@ -205,5 +224,27 @@ export class SmmProducerToolsService {
         externalUrl: p.externalUrl,
       })),
     };
+  }
+
+  /**
+   * Return the latest draft campaign for the user, or create a new one if none
+   * exists. is_linkeon_official mirrors the caller's admin status at creation
+   * time (creator-mode flag for Task 3).
+   */
+  private async getOrCreateDraftCampaign(userId: string, isAdmin: boolean): Promise<{ id: string }> {
+    const existing = await this.pg.query(
+      `SELECT id FROM smm_campaign
+        WHERE user_id = $1 AND status = 'drafting'
+        ORDER BY created_at DESC LIMIT 1`,
+      [userId],
+    );
+    if (existing.rows[0]?.id) return { id: existing.rows[0].id };
+
+    const created = await this.pg.query(
+      `INSERT INTO smm_campaign (user_id, source_mode, requested_count, status, is_linkeon_official)
+       VALUES ($1, 'auto', 1, 'drafting', $2) RETURNING id`,
+      [userId, isAdmin],
+    );
+    return { id: created.rows[0].id };
   }
 }

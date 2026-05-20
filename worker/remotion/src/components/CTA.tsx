@@ -6,6 +6,9 @@ interface Props {
   atSec: number;
   durationSec: number;
   assistantRole: AssistantRole;
+  isLinkeonOfficial: boolean;
+  ctaHandle?: string;
+  ctaLabel?: string;
 }
 
 const ROLE_HEADLINE: Record<string, string> = {
@@ -31,7 +34,14 @@ const FOREST_600 = '#2dd4bf';
 const FOREST_700 = '#0d9488';
 const FOREST_900 = '#134e4a';
 
-export const CTA: React.FC<Props> = ({ atSec, durationSec, assistantRole }) => {
+export const CTA: React.FC<Props> = ({
+  atSec,
+  durationSec,
+  assistantRole,
+  isLinkeonOfficial,
+  ctaHandle,
+  ctaLabel,
+}) => {
   const headline = ROLE_HEADLINE[assistantRole] ?? 'ИИ-ассистент Linkeon';
   const { fps } = useVideoConfig();
   const frame = useCurrentFrame();
@@ -50,6 +60,173 @@ export const CTA: React.FC<Props> = ({ atSec, durationSec, assistantRole }) => {
   // Logo gets a gentle floating breath
   const logoFloat = Math.sin(localFrame / 8) * 4;
 
+  // Shared forest gradient background — brand stays in fabric even for creator-mode
+  // (это нативная реклама платформы).
+  const background = (
+    <>
+      {/* Soft accent glow behind logo for depth */}
+      <div
+        style={{
+          position: 'absolute',
+          top: '20%',
+          width: 600,
+          height: 600,
+          background: `radial-gradient(circle, ${FOREST_500}33 0%, transparent 70%)`,
+          filter: 'blur(40px)',
+        }}
+      />
+    </>
+  );
+
+  const officialContent = (
+    <>
+      <div
+        style={{
+          transform: `scale(${scale}) translateY(${logoFloat}px)`,
+          marginBottom: 50,
+          zIndex: 1,
+        }}
+      >
+        <Img
+          src={staticFile('linkeon-logo.png')}
+          style={{
+            width: 200,
+            height: 200,
+            objectFit: 'contain',
+            filter: 'drop-shadow(0 8px 24px rgba(0,0,0,0.4))',
+          }}
+        />
+      </div>
+
+      <div
+        style={{
+          transform: `scale(${scale})`,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          zIndex: 1,
+        }}
+      >
+        <div
+          style={{
+            fontSize: 78,
+            fontWeight: 800,
+            color: '#ffffff',
+            fontFamily: 'Inter, sans-serif',
+            textAlign: 'center',
+            letterSpacing: -1,
+            lineHeight: 1.05,
+          }}
+        >
+          {headline}
+        </div>
+        <div
+          style={{
+            fontSize: 48,
+            fontWeight: 500,
+            color: '#a7f3d0',
+            marginTop: 20,
+            textAlign: 'center',
+            fontFamily: 'Inter, sans-serif',
+            letterSpacing: 0.5,
+          }}
+        >
+          всегда на связи
+        </div>
+
+        <div
+          style={{
+            marginTop: 56,
+            padding: '22px 56px',
+            background: '#ffffff',
+            color: FOREST_700,
+            fontSize: 46,
+            fontWeight: 800,
+            borderRadius: 999,
+            fontFamily: 'Inter, sans-serif',
+            boxShadow: '0 10px 40px rgba(0,0,0,0.25)',
+            letterSpacing: -0.5,
+          }}
+        >
+          my.linkeon.io
+        </div>
+      </div>
+    </>
+  );
+
+  const creatorContent = (
+    <>
+      <div
+        style={{
+          transform: `scale(${scale}) translateY(${logoFloat}px)`,
+          marginBottom: 30,
+          zIndex: 1,
+        }}
+      >
+        <Img
+          src={staticFile('linkeon-logo.png')}
+          style={{
+            width: 100,
+            height: 100,
+            objectFit: 'contain',
+            filter: 'drop-shadow(0 6px 18px rgba(0,0,0,0.4))',
+          }}
+        />
+      </div>
+
+      <div
+        style={{
+          transform: `scale(${scale})`,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          zIndex: 1,
+        }}
+      >
+        <div
+          style={{
+            fontSize: 78,
+            fontWeight: 800,
+            color: '#ffffff',
+            fontFamily: 'Inter, sans-serif',
+            textAlign: 'center',
+            letterSpacing: -1,
+            lineHeight: 1.05,
+          }}
+        >
+          {ctaLabel ?? 'Подписывайся'}
+        </div>
+        <div
+          style={{
+            fontSize: 84,
+            fontWeight: 800,
+            color: '#a7f3d0',
+            marginTop: 28,
+            textAlign: 'center',
+            fontFamily: 'Inter, sans-serif',
+            letterSpacing: -0.5,
+            lineHeight: 1.05,
+          }}
+        >
+          {ctaHandle ?? ''}
+        </div>
+
+        <div
+          style={{
+            marginTop: 64,
+            fontSize: 30,
+            fontWeight: 500,
+            color: 'rgba(255,255,255,0.7)',
+            fontFamily: 'Inter, sans-serif',
+            letterSpacing: 0.3,
+          }}
+        >
+          создано на my.linkeon.io
+        </div>
+      </div>
+    </>
+  );
+
   return (
     <Sequence from={startFrame} durationInFrames={durFrames}>
       <AbsoluteFill
@@ -62,89 +239,8 @@ export const CTA: React.FC<Props> = ({ atSec, durationSec, assistantRole }) => {
           opacity,
         }}
       >
-        {/* Soft accent glow behind logo for depth */}
-        <div
-          style={{
-            position: 'absolute',
-            top: '20%',
-            width: 600,
-            height: 600,
-            background: `radial-gradient(circle, ${FOREST_500}33 0%, transparent 70%)`,
-            filter: 'blur(40px)',
-          }}
-        />
-
-        <div
-          style={{
-            transform: `scale(${scale}) translateY(${logoFloat}px)`,
-            marginBottom: 50,
-            zIndex: 1,
-          }}
-        >
-          <Img
-            src={staticFile('linkeon-logo.png')}
-            style={{
-              width: 200,
-              height: 200,
-              objectFit: 'contain',
-              filter: 'drop-shadow(0 8px 24px rgba(0,0,0,0.4))',
-            }}
-          />
-        </div>
-
-        <div
-          style={{
-            transform: `scale(${scale})`,
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            zIndex: 1,
-          }}
-        >
-          <div
-            style={{
-              fontSize: 78,
-              fontWeight: 800,
-              color: '#ffffff',
-              fontFamily: 'Inter, sans-serif',
-              textAlign: 'center',
-              letterSpacing: -1,
-              lineHeight: 1.05,
-            }}
-          >
-            {headline}
-          </div>
-          <div
-            style={{
-              fontSize: 48,
-              fontWeight: 500,
-              color: '#a7f3d0',
-              marginTop: 20,
-              textAlign: 'center',
-              fontFamily: 'Inter, sans-serif',
-              letterSpacing: 0.5,
-            }}
-          >
-            всегда на связи
-          </div>
-
-          <div
-            style={{
-              marginTop: 56,
-              padding: '22px 56px',
-              background: '#ffffff',
-              color: FOREST_700,
-              fontSize: 46,
-              fontWeight: 800,
-              borderRadius: 999,
-              fontFamily: 'Inter, sans-serif',
-              boxShadow: '0 10px 40px rgba(0,0,0,0.25)',
-              letterSpacing: -0.5,
-            }}
-          >
-            my.linkeon.io
-          </div>
-        </div>
+        {background}
+        {isLinkeonOfficial ? officialContent : creatorContent}
       </AbsoluteFill>
     </Sequence>
   );

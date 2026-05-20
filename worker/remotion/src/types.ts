@@ -37,4 +37,10 @@ export interface CaseVideoProps {
   musicUrl: string | null;
   /** Total duration in seconds. Composition always 60s for MVP. */
   totalDurationSec: number;
+  /** True for admin/Linkeon-official campaigns — CTA shows Linkeon branding + ИИ-<role>. */
+  isLinkeonOfficial: boolean;
+  /** Creator-mode: handle (e.g. "@ekat_travels") shown in CTA. */
+  ctaHandle?: string;
+  /** Creator-mode: CTA headline (e.g. "Подписывайся"). */
+  ctaLabel?: string;
 }
