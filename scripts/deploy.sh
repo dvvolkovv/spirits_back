@@ -83,6 +83,15 @@ deploy_backend() {
     npm ci --no-audit --no-fund 2>&1 | tail -3
     npm run build 2>&1 | tail -3
     pm2 restart linkeon-api 2>&1 | tail -2
+    # SMM worker shares the repo but has its own package.json + tsc build.
+    # Without this block changes to worker/* never reach the running PM2 process.
+    if [ -d worker ]; then
+      cd worker
+      npm ci --no-audit --no-fund 2>&1 | tail -3
+      npm run build 2>&1 | tail -3
+      pm2 restart linkeon-smm-worker 2>&1 | tail -2
+      cd ..
+    fi
   " || { red "  backend deploy failed"; exit 1; }
 
   bold "[back 3/3] health-wait"
