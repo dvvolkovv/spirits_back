@@ -36,6 +36,10 @@ export async function searchStockVideo(input: StockSearchInput): Promise<StockVi
   const maxDur = input.maxDurationSec ?? 10;
   const minH = input.minHeight ?? 1080;
 
+  // Collect all suitable matches so we can randomise the pick — Pexels orders
+  // results by relevance and always returning videos[0] makes regenerated
+  // clips byte-identical (same TTS + same stock = same final mp4).
+  const candidates: StockVideoMatch[] = [];
   for (const v of (r.data.videos || [])) {
     if (v.duration > maxDur) continue;
     const portrait = (v.video_files || []).filter((f: any) =>
@@ -44,16 +48,19 @@ export async function searchStockVideo(input: StockSearchInput): Promise<StockVi
     if (portrait.length === 0) continue;
     portrait.sort((a: any, b: any) => a.height - b.height);
     const file = portrait[0];
-    return {
+    candidates.push({
       id: v.id,
       url: v.url,
       durationSec: v.duration,
       width: file.width,
       height: file.height,
       downloadUrl: file.link,
-    };
+    });
   }
-  return null;
+  if (candidates.length === 0) return null;
+  const pick = candidates[Math.floor(Math.random() * candidates.length)];
+  logger.debug({ query: input.query, candidates: candidates.length, pickedId: pick.id }, 'stock video picked');
+  return pick;
 }
 
 export async function downloadStockVideo(url: string, outDir: string, basename: string): Promise<string> {

@@ -21,6 +21,12 @@ export async function synthesizeYandex(input: YandexSynthInput): Promise<Buffer>
   params.set('lang', 'ru-RU');
   params.set('voice', input.voice.voice);
   if (input.voice.emotion) params.set('emotion', input.voice.emotion);
+  // Slight per-call speed variance — between [0.95, 1.05]. This keeps cadence
+  // natural but ensures the synthesized audio bytes differ between renders
+  // (otherwise «Сделать заново» produced byte-identical mp4 because TTS was
+  // deterministic for the same text+voice).
+  const speed = 0.95 + Math.random() * 0.10;
+  params.set('speed', speed.toFixed(3));
   params.set('format', 'lpcm');
   params.set('sampleRateHertz', '48000');
   params.set('folderId', folderId);
