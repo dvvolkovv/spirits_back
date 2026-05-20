@@ -300,6 +300,17 @@ export class ClaudeAgentService {
         },
         async (args: any) => handle('list_publications', args),
       ),
+      tool(
+        'set_creator_campaign_settings',
+        'Сохранить настройки кампании внешнего автора: CTA-ссылка, пол голоса, жанр. ВЫЗЫВАЙ ПЕРВЫМ для не-админских юзеров — до generate_scenarios.',
+        {
+          cta_handle: z.string(),
+          cta_label: z.string().optional(),
+          voice_gender: z.enum(['male', 'female']),
+          genre: z.enum(['dialog', 'monologue', 'fact_explanation']).optional(),
+        },
+        async (args: any) => handle('set_creator_campaign_settings', args),
+      ),
     ];
 
     return createSdkMcpServer({
