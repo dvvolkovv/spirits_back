@@ -10,6 +10,7 @@ export interface SmmCampaign {
   sourceMode: SmmSourceMode;
   requestedCount: number;
   status: SmmCampaignStatus;
+  isLinkeonOfficial: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -23,6 +24,7 @@ export function rowToCampaign(row: any): SmmCampaign {
     sourceMode: row.source_mode,
     requestedCount: row.requested_count,
     status: row.status,
+    isLinkeonOfficial: row.is_linkeon_official ?? false,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
