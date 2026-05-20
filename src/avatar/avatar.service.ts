@@ -55,23 +55,11 @@ export class AvatarService {
   }
 
   async getAgentAvatar(agentId: string): Promise<string | null> {
-    // After backfill all agent avatars live in MinIO. Local file remains as a
-    // fallback for environments that didn't run the backfill yet.
-    const minioKey = `avatars/agents/${agentId}.jpg`;
-    const minioUrl = this.storage.publicUrl(ASSETS_BUCKET, minioKey);
-    // Check if it exists by HEAD-ing via S3 list — cheap, single object.
-    try {
-      const keys = await this.storage.list({ bucket: ASSETS_BUCKET, prefix: minioKey, maxKeys: 1 });
-      if (keys.includes(minioKey)) return minioUrl;
-    } catch { /* fall through */ }
-
-    // Legacy local-file fallback (pre-migration).
-    const path = require('path');
-    const fs = require('fs');
-    const localPath = path.join(process.cwd(), 'public', 'agent-avatars', `${agentId}.jpg`);
-    if (fs.existsSync(localPath)) {
-      return `/static/agent-avatars/${agentId}.jpg`;
-    }
-    return null;
+    // After backfill all agent avatars live in MinIO at the canonical path.
+    // Return the URL directly without HEAD/list checks (one extra S3 round-trip
+    // per avatar request is too costly when N agents render simultaneously).
+    // If the object doesn't exist, MinIO returns 404 and the frontend `<img onError>`
+    // handler hides the broken image (see AssistantSelection.tsx).
+    return this.storage.publicUrl(ASSETS_BUCKET, `avatars/agents/${agentId}.jpg`);
   }
 }
