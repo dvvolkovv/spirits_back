@@ -77,13 +77,17 @@ export class SmmProducerToolsService {
     input: { mode: SourceMode; count: number; topic?: string },
     ctx: ToolContext,
   ): Promise<{ campaignId: string; scenarios: Array<{ id: string; title: string }> }> {
-    // 1. Create campaign
-    const cRes = await this.pg.query(
-      `INSERT INTO smm_campaign (user_id, source_mode, requested_count, topic, status)
-       VALUES ($1, $2, $3, $4, 'drafting') RETURNING id`,
-      [ctx.userId, input.mode, input.count, input.topic ?? null],
+    // 1. Resolve campaign — reuse draft from set_creator_campaign_settings if any.
+    const campaign = await this.getOrCreateDraftCampaign(ctx.userId, ctx.isAdmin);
+    const campaignId = campaign.id;
+    await this.pg.query(
+      `UPDATE smm_campaign
+         SET source_mode = $1,
+             requested_count = $2,
+             topic = $3
+       WHERE id = $4`,
+      [input.mode, input.count, input.topic ?? null, campaignId],
     );
-    const campaignId = cRes.rows[0].id;
 
     // 2. For trends mode — fetch trends context
     let trendsContext: string | undefined;
