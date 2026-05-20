@@ -85,7 +85,7 @@ const SYSTEM_PROMPT = `Ты — креативный сценарист коро
 const CREATOR_MODE_SYSTEM_PROMPT = `Ты — креативный сценарист коротких вертикальных видео для эксперта-блогера.
 
 ЗАДАЧА: сгенерируй сценарии 30-60-секундных вертикальных видео в формате
-"зритель задаёт вопрос → эксперт по теме отвечает → итог + CTA".
+"зритель (роль 'hero') задаёт вопрос → эксперт (роль 'assistant') отвечает → итог + CTA".
 
 ПАРАМЕТРЫ КАМПАНИИ:
 - Тема: {topic}
@@ -95,12 +95,25 @@ const CREATOR_MODE_SYSTEM_PROMPT = `Ты — креативный сценари
 ПРАВИЛА:
 1. Каждый сценарий — это узнаваемый запрос аудитории, на который у эксперта есть точный ответ.
 2. dialog: 2-4 реплики, каждая 5-15 секунд. t_start/t_end в секундах (0-55).
-3. assistant_role фиксированно: 'expert' (не выбирай из 14 Linkeon-ролей).
-4. mood — одно из: dramatic | inspiring | calm | uplifting | tense | neutral
-5. broll_prompts — ОБЯЗАТЕЛЬНО 1-3 кадра. КАЖДЫЙ объект ДОЛЖЕН содержать at_sec (число), type ('ai_image' или 'stock_video'), prompt (английский, для Imagen/Pexels).
-6. Реплики на русском, живой разговорный язык. БЕЗ канцелярита.
+3. speaker КАЖДОЙ реплики — СТРОГО одно из двух значений: 'hero' (зритель/аудитория) или 'assistant' (эксперт-автор). НИКАКИХ 'viewer', 'expert', 'user' и т.д. — только эти два литерала.
+4. assistant_role фиксированно: 'expert' (не выбирай из 14 Linkeon-ролей).
+5. mood — одно из: dramatic | inspiring | calm | uplifting | tense | neutral
+6. broll_prompts — ОБЯЗАТЕЛЬНО 1-3 кадра. КАЖДЫЙ объект ДОЛЖЕН содержать at_sec (число), type ('ai_image' или 'stock_video'), prompt (английский, для Imagen/Pexels).
+7. Реплики на русском, живой разговорный язык. БЕЗ канцелярита.
 
 ФОРМАТ ОТВЕТА: чистый JSON-массив. Никаких пояснений до или после.`;
+
+/**
+ * Defense-in-depth: Claude haiku sometimes emits 'viewer'/'expert' speakers in
+ * creator-mode despite the prompt. We coerce them to the canonical 'hero'/'assistant'
+ * before persisting so downstream validators (PATCH route, TTS picker) don't fail.
+ */
+function normalizeSpeaker(raw: string): 'hero' | 'assistant' {
+  const s = (raw ?? '').toLowerCase().trim();
+  if (s === 'viewer' || s === 'user' || s === 'audience') return 'hero';
+  if (s === 'expert' || s === 'author' || s === 'creator') return 'assistant';
+  return s === 'hero' ? 'hero' : 'assistant';
+}
 
 @Injectable()
 export class ScenarioService {
@@ -132,7 +145,7 @@ export class ScenarioService {
     const ids: string[] = [];
     for (const s of arr.slice(0, input.count)) {
       const dialog: SmmDialogTurn[] = s.dialog.map((t) => ({
-        speaker: t.speaker,
+        speaker: normalizeSpeaker(t.speaker),
         text: t.text,
         tStart: t.t_start,
         tEnd: t.t_end,
@@ -198,7 +211,7 @@ ${JSON.stringify({
     const s: ClaudeScenarioJson = JSON.parse(json);
 
     const dialog: SmmDialogTurn[] = s.dialog.map((t) => ({
-      speaker: t.speaker, text: t.text, tStart: t.t_start, tEnd: t.t_end,
+      speaker: normalizeSpeaker(t.speaker), text: t.text, tStart: t.t_start, tEnd: t.t_end,
     }));
     const brollPrompts: SmmBrollPrompt[] = (s.broll_prompts ?? []).map((b, i, arr) => ({
       atSec: typeof b.at_sec === 'number'
