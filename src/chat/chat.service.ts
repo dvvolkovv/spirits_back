@@ -141,13 +141,15 @@ export class ChatService {
       );
     }
 
-    // Build system prompt with platform context + profile
-    const allAgents = await this.pg.query('SELECT name, description, system_prompt FROM agents ORDER BY id');
-    const agentsList = allAgents.rows.map(a => `${a.name} — ${a.description}`).join(', ');
+    // Build system prompt with platform context + profile.
+    // Use display_name (e.g. Юлия) instead of internal name (smm_producer) so the
+    // assistant introduces coworkers with their human-friendly names.
+    const allAgents = await this.pg.query('SELECT name, COALESCE(display_name, name) AS display_name, description, system_prompt FROM agents ORDER BY id');
+    const agentsList = allAgents.rows.map(a => `${a.display_name} — ${a.description}`).join(', ');
 
     const otherAgents = allAgents.rows
       .filter(a => a.name !== agent.name)
-      .map(a => `${a.name} — ${a.description}`)
+      .map(a => `${a.display_name} — ${a.description}`)
       .join(', ');
 
     const platformContext = `ТЫ — ${agent.name}, ${agent.description || 'ассистент'}. Всегда представляйся именно этим именем.
@@ -535,6 +537,28 @@ export class ChatService {
     if (agentSystemPrompt && agentSystemPrompt.trim()) {
       contextPrefix += `--- Персона и инструкции ассистента ${agentName} ---\n${agentSystemPrompt.trim()}\n\n`;
     }
+
+    // Coworker awareness — каждый ассистент должен знать про остальных, чтобы
+    // суметь представить их пользователю и не делать вид, что новых коллег нет.
+    // Берём список из БД (включая Юлю-SMM-продюсера id=15).
+    try {
+      const coworkersRes = await this.pg.query(
+        `SELECT COALESCE(display_name, name) AS display_name, description
+           FROM agents
+          WHERE id != $1 AND description IS NOT NULL
+          ORDER BY id`,
+        [Number(agentId)],
+      );
+      if (coworkersRes.rows.length > 0) {
+        const lines = coworkersRes.rows
+          .map((a: any) => `• ${a.display_name} — ${a.description}`)
+          .join('\n');
+        contextPrefix +=
+          `--- Коллеги-ассистенты в Linkeon ---\n` +
+          `${lines}\n\n` +
+          `Если пользователь спрашивает про кого-то из них или просит сделать что-то по их специализации — расскажи про коллегу честно, без выдумок, и предложи переключиться на него.\n\n`;
+      }
+    } catch { /* non-fatal — продолжаем без блока коллег */ }
 
     // YouTube transcripts — fetch on our side and inject; remote agent has no YouTube parsing.
     const ytIds = this.extractYouTubeIds(message);
