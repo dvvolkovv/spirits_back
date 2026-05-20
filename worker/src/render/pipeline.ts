@@ -224,6 +224,8 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
       ctaLabel: ctx.campaign.ctaLabel,
       logoUrl: ctx.campaign.logoUrl,
       ctaSlogan: ctx.campaign.ctaSlogan,
+      bgColor: ctx.campaign.bgColor,
+      bgImageUrl: ctx.campaign.bgImageUrl,
     };
 
     // STEP 5: Remotion render

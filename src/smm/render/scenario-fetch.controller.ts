@@ -20,6 +20,10 @@ export interface RenderJobCampaignInfo {
   logoUrl?: string;
   /** Short slogan rendered between logo and handle on the CTA frame. */
   ctaSlogan?: string;
+  /** Creator-customised background color/gradient for the video. */
+  bgColor?: string;
+  /** Creator-uploaded background image URL. Overrides bgColor if set. */
+  bgImageUrl?: string;
 }
 
 export interface RenderJobContext {
@@ -60,7 +64,8 @@ export class ScenarioFetchController {
     const campaign: RenderJobCampaignInfo = { isLinkeonOfficial };
     if (!isLinkeonOfficial) {
       const ccRes = await this.pg.query(
-        `SELECT cta_handle, cta_label, logo_url, cta_slogan FROM smm_creator_campaign WHERE campaign_id = $1`,
+        `SELECT cta_handle, cta_label, logo_url, cta_slogan, bg_color, bg_image_url
+           FROM smm_creator_campaign WHERE campaign_id = $1`,
         [scenario.campaignId],
       );
       if (ccRes.rows.length > 0) {
@@ -68,6 +73,8 @@ export class ScenarioFetchController {
         campaign.ctaLabel = ccRes.rows[0].cta_label ?? undefined;
         campaign.logoUrl = ccRes.rows[0].logo_url ?? undefined;
         campaign.ctaSlogan = ccRes.rows[0].cta_slogan ?? undefined;
+        campaign.bgColor = ccRes.rows[0].bg_color ?? undefined;
+        campaign.bgImageUrl = ccRes.rows[0].bg_image_url ?? undefined;
       }
     }
 

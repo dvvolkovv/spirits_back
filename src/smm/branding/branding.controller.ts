@@ -95,15 +95,18 @@ export class BrandingController {
   }
 
   /**
-   * Update text-only branding fields (slogan, default publish caption).
-   * Body: { ctaSlogan?: string|null, publishCaption?: string|null }
+   * Update text-only branding fields (slogan, default publish caption, bg color).
    * Passing `null` clears the field; omitting it leaves it unchanged.
    */
   @Patch(':id/branding')
   async updateBranding(
     @Req() req: any,
     @Param('id') id: string,
-    @Body() body: { ctaSlogan?: string | null; publishCaption?: string | null },
+    @Body() body: {
+      ctaSlogan?: string | null;
+      publishCaption?: string | null;
+      bgColor?: string | null;
+    },
   ) {
     await this.assertCanAccessCampaign(id, req);
     if (typeof body.ctaSlogan === 'string' && body.ctaSlogan.length > 120) {
@@ -112,9 +115,17 @@ export class BrandingController {
     if (typeof body.publishCaption === 'string' && body.publishCaption.length > 2000) {
       throw new BadRequestException('publishCaption max 2000 chars');
     }
+    if (typeof body.bgColor === 'string') {
+      // Defensive: only allow simple CSS color values / gradients up to 200 chars.
+      // No quotes (to keep React inline-style sanitised), no script-y patterns.
+      if (body.bgColor.length > 200 || /["<>]|javascript:/i.test(body.bgColor)) {
+        throw new BadRequestException('bgColor: max 200 chars, no quotes/script tokens');
+      }
+    }
     const updated = await this.creators.updateBranding(id, {
       ctaSlogan: body.ctaSlogan === undefined ? undefined : (body.ctaSlogan || null),
       publishCaption: body.publishCaption === undefined ? undefined : (body.publishCaption || null),
+      bgColor: body.bgColor === undefined ? undefined : (body.bgColor || null),
     });
     return { ok: true, settings: updated };
   }
@@ -126,6 +137,57 @@ export class BrandingController {
   async clearLogo(@Req() req: any, @Param('id') id: string) {
     await this.assertCanAccessCampaign(id, req);
     const updated = await this.creators.updateBranding(id, { logoUrl: null });
+    return { ok: true, settings: updated };
+  }
+
+  /**
+   * Upload custom background image. Replaces bg_image_url; bg_color is left as-is
+   * (renderer prefers image if both set, so уже хранимый цвет — это fallback).
+   */
+  @Post(':id/background')
+  async uploadBackground(@Req() req: Request, @Res() res: Response, @Param('id') id: string) {
+    await this.assertCanAccessCampaign(id, req);
+    return new Promise<void>((resolve) => {
+      this.upload.single('file')(req as any, res as any, async (err: any) => {
+        if (err) {
+          res.status(400).json({ error: err.message ?? 'upload failed' });
+          return resolve();
+        }
+        const file = (req as any).file;
+        if (!file) {
+          res.status(400).json({ error: 'no file' });
+          return resolve();
+        }
+        if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.mimetype)) {
+          res.status(400).json({ error: 'expected png/jpeg/webp' });
+          return resolve();
+        }
+        try {
+          const ext = file.mimetype === 'image/png' ? 'png'
+            : file.mimetype === 'image/webp' ? 'webp'
+            : 'jpg';
+          const dir = path.join(process.cwd(), 'public', 'smm-backgrounds');
+          await fs.promises.mkdir(dir, { recursive: true });
+          const filename = `${id}.${ext}`;
+          const target = path.join(dir, filename);
+          await fs.promises.writeFile(target, file.buffer);
+          const base = (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '');
+          const url = `${base}/static/smm-backgrounds/${filename}?t=${Date.now()}`;
+          const updated = await this.creators.updateBranding(id, { bgImageUrl: url });
+          res.status(200).json({ ok: true, bgImageUrl: url, settings: updated });
+          resolve();
+        } catch (e: any) {
+          res.status(500).json({ error: e.message });
+          resolve();
+        }
+      });
+    });
+  }
+
+  @Post(':id/background/clear')
+  async clearBackground(@Req() req: any, @Param('id') id: string) {
+    await this.assertCanAccessCampaign(id, req);
+    const updated = await this.creators.updateBranding(id, { bgImageUrl: null });
     return { ok: true, settings: updated };
   }
 }

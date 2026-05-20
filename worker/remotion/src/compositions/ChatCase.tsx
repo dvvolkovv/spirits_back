@@ -1,5 +1,5 @@
 // worker/remotion/src/compositions/ChatCase.tsx
-import { AbsoluteFill } from 'remotion';
+import { AbsoluteFill, Img } from 'remotion';
 import { CaseVideoProps } from '../types';
 import { ChatBubble } from '../components/ChatBubble';
 import { BRollImage } from '../components/BRollImage';
@@ -7,6 +7,8 @@ import { BRollVideo } from '../components/BRollVideo';
 import { Subtitle } from '../components/Subtitle';
 import { CTA } from '../components/CTA';
 import { BackgroundMusic } from '../components/BackgroundMusic';
+
+const DEFAULT_BG = 'linear-gradient(180deg, #1a1a2e 0%, #0f3460 50%, #16213e 100%)';
 
 export const defaultProps: CaseVideoProps = {
   title: 'Sample',
@@ -26,8 +28,31 @@ export const ChatCase: React.FC<CaseVideoProps> = (props) => {
   // CTA always covers the last 5 seconds
   const ctaAt = Math.max(0, props.totalDurationSec - 5);
 
+  // Background precedence (creator-mode):
+  // 1. bgImageUrl — Remotion <Img> covers the whole frame (waits for image load)
+  // 2. bgColor — CSS color/gradient string passed straight to style.background
+  // 3. default forest gradient
+  const useBgImage = !!props.bgImageUrl;
+  const bgStyle = useBgImage
+    ? { background: '#000' } // placeholder behind the <Img>
+    : { background: props.bgColor || DEFAULT_BG };
+
   return (
-    <AbsoluteFill style={{ background: 'linear-gradient(180deg, #1a1a2e 0%, #0f3460 50%, #16213e 100%)' }}>
+    <AbsoluteFill style={bgStyle}>
+      {/* Layer 0: Background image (if uploaded) — sits below everything else */}
+      {useBgImage && (
+        <Img
+          src={props.bgImageUrl!}
+          style={{
+            position: 'absolute',
+            inset: 0,
+            width: '100%',
+            height: '100%',
+            objectFit: 'cover',
+          }}
+        />
+      )}
+
       {/* Layer 1: B-roll (background) */}
       {props.broll.map((b, i) =>
         b.type === 'image' ? (

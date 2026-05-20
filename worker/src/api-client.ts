@@ -42,6 +42,8 @@ export interface SmmRenderContext {
     ctaLabel?: string;
     logoUrl?: string;
     ctaSlogan?: string;
+    bgColor?: string;
+    bgImageUrl?: string;
   };
 }
 

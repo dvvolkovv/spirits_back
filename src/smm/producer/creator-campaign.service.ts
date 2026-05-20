@@ -58,7 +58,13 @@ export class CreatorCampaignService {
    */
   async updateBranding(
     campaignId: string,
-    fields: { logoUrl?: string | null; ctaSlogan?: string | null; publishCaption?: string | null },
+    fields: {
+      logoUrl?: string | null;
+      ctaSlogan?: string | null;
+      publishCaption?: string | null;
+      bgColor?: string | null;
+      bgImageUrl?: string | null;
+    },
   ): Promise<SmmCreatorCampaign | null> {
     const sets: string[] = [];
     const vals: any[] = [];
@@ -71,6 +77,12 @@ export class CreatorCampaignService {
     }
     if (fields.publishCaption !== undefined) {
       sets.push(`publish_caption = $${i++}`); vals.push(fields.publishCaption);
+    }
+    if (fields.bgColor !== undefined) {
+      sets.push(`bg_color = $${i++}`); vals.push(fields.bgColor);
+    }
+    if (fields.bgImageUrl !== undefined) {
+      sets.push(`bg_image_url = $${i++}`); vals.push(fields.bgImageUrl);
     }
     if (sets.length === 0) return this.getByCampaign(campaignId);
     sets.push(`updated_at = now()`);

@@ -14,6 +14,10 @@ export interface SmmCreatorCampaign {
   ctaSlogan: string | null;
   /** Default caption pre-filled in PublishModal. User can still edit per publication. */
   publishCaption: string | null;
+  /** CSS color or gradient for the video background. Falls back to default gradient. */
+  bgColor: string | null;
+  /** Public URL of an uploaded background image. Wins over bgColor when set. */
+  bgImageUrl: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -28,6 +32,8 @@ export function rowToCreatorCampaign(row: any): SmmCreatorCampaign {
     logoUrl: row.logo_url ?? null,
     ctaSlogan: row.cta_slogan ?? null,
     publishCaption: row.publish_caption ?? null,
+    bgColor: row.bg_color ?? null,
+    bgImageUrl: row.bg_image_url ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

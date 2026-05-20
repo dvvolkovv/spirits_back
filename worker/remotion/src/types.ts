@@ -47,4 +47,8 @@ export interface CaseVideoProps {
   logoUrl?: string;
   /** Creator-mode: short slogan rendered between logo and handle. */
   ctaSlogan?: string;
+  /** Creator-mode: CSS color/gradient for video background. */
+  bgColor?: string;
+  /** Creator-mode: background image URL (wins over bgColor). */
+  bgImageUrl?: string;
 }
