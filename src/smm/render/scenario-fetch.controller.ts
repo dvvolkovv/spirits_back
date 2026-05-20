@@ -12,9 +12,16 @@ import { PgService } from '../../common/services/pg.service';
 import { rowToScenario, SmmScenario } from '../entities/smm-scenario.entity';
 import { rowToVideo, SmmVideo } from '../entities/smm-video.entity';
 
+export interface RenderJobCampaignInfo {
+  isLinkeonOfficial: boolean;
+  ctaHandle?: string;
+  ctaLabel?: string;
+}
+
 export interface RenderJobContext {
   video: SmmVideo;
   scenario: SmmScenario;
+  campaign: RenderJobCampaignInfo;
 }
 
 @Controller('smm/internal')
@@ -37,7 +44,28 @@ export class ScenarioFetchController {
     if (sRes.rows.length === 0) throw new NotFoundException(`scenario ${video.scenarioId} not found`);
     const scenario = rowToScenario(sRes.rows[0]);
 
-    return { video, scenario };
+    // Campaign meta: is_linkeon_official toggles CTA branding; for creator-mode
+    // pull cta_handle + cta_label from smm_creator_campaign.
+    const cRes = await this.pg.query(
+      `SELECT is_linkeon_official FROM smm_campaign WHERE id = $1`,
+      [scenario.campaignId],
+    );
+    if (cRes.rows.length === 0) throw new NotFoundException(`campaign ${scenario.campaignId} not found`);
+    const isLinkeonOfficial = !!cRes.rows[0].is_linkeon_official;
+
+    const campaign: RenderJobCampaignInfo = { isLinkeonOfficial };
+    if (!isLinkeonOfficial) {
+      const ccRes = await this.pg.query(
+        `SELECT cta_handle, cta_label FROM smm_creator_campaign WHERE campaign_id = $1`,
+        [scenario.campaignId],
+      );
+      if (ccRes.rows.length > 0) {
+        campaign.ctaHandle = ccRes.rows[0].cta_handle ?? undefined;
+        campaign.ctaLabel = ccRes.rows[0].cta_label ?? undefined;
+      }
+    }
+
+    return { video, scenario, campaign };
   }
 
   @Get('music-tracks')

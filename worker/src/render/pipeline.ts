@@ -219,6 +219,9 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
       subtitles,
       musicUrl,
       totalDurationSec,
+      isLinkeonOfficial: ctx.campaign.isLinkeonOfficial,
+      ctaHandle: ctx.campaign.ctaHandle,
+      ctaLabel: ctx.campaign.ctaLabel,
     };
 
     // STEP 5: Remotion render

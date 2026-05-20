@@ -17,6 +17,9 @@ export const defaultProps: CaseVideoProps = {
   subtitles: [],
   musicUrl: null,
   totalDurationSec: 60,
+  isLinkeonOfficial: true,
+  ctaHandle: undefined,
+  ctaLabel: undefined,
 };
 
 export const ChatCase: React.FC<CaseVideoProps> = (props) => {
@@ -45,7 +48,14 @@ export const ChatCase: React.FC<CaseVideoProps> = (props) => {
       ))}
 
       {/* Layer 4: CTA overlay last 5s */}
-      <CTA atSec={ctaAt} durationSec={5} assistantRole={props.assistantRole} />
+      <CTA
+        atSec={ctaAt}
+        durationSec={5}
+        assistantRole={props.assistantRole}
+        isLinkeonOfficial={props.isLinkeonOfficial}
+        ctaHandle={props.ctaHandle}
+        ctaLabel={props.ctaLabel}
+      />
 
       {/* Layer 5: Background music */}
       {props.musicUrl ? <BackgroundMusic src={props.musicUrl} volume={0.15} /> : null}

@@ -36,6 +36,11 @@ export interface SmmRenderContext {
     ttsTier: 'economy' | 'premium';
     ttsVoiceId: string | null;
   };
+  campaign: {
+    isLinkeonOfficial: boolean;
+    ctaHandle?: string;
+    ctaLabel?: string;
+  };
 }
 
 export interface RenderCallbackInput {
