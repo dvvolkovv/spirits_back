@@ -341,7 +341,22 @@ ${blocks.join('\n\n---\n\n')}
       'SELECT id, prompt, image_url, tokens_spent, created_at FROM generated_images WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
       [userId],
     );
-    return res.rows;
+    // Defensive filter: drop rows whose local file no longer exists on disk
+    // (rsync --delete or manual cleanup can desync the DB). Saves the frontend
+    // from rendering broken <img> placeholders for ghost rows.
+    const fs = await import('fs');
+    const path = await import('path');
+    return res.rows.filter((row: any) => {
+      const url: string = row.image_url ?? '';
+      if (url.startsWith('http')) return true; // remote URL — trust it
+      if (!url.startsWith('/static/')) return true; // unknown shape — keep
+      const localPath = path.join(process.cwd(), 'public', url.replace('/static/', ''));
+      try {
+        return fs.statSync(localPath).isFile();
+      } catch {
+        return false;
+      }
+    });
   }
 
   async deleteGeneratedImage(userId: string, imageId: number): Promise<void> {
