@@ -1,15 +1,15 @@
 // src/smm/scenarios/scenarios.controller.ts
 import {
-  BadRequestException, Body, Controller, Delete, Get, NotFoundException, Param, Patch, Post, Req, UseGuards,
+  BadRequestException, Body, Controller, Delete, ForbiddenException, Get,
+  NotFoundException, Param, Patch, Post, Req, UseGuards,
 } from '@nestjs/common';
 import { JwtGuard } from '../../common/guards/jwt.guard';
-import { AdminGuard } from '../../common/guards/admin.guard';
 import { ScenarioService } from '../producer/scenario.service';
 import { ApprovalService } from '../producer/approval.service';
 import { PgService } from '../../common/services/pg.service';
 
 @Controller('smm/scenarios')
-@UseGuards(JwtGuard, AdminGuard)
+@UseGuards(JwtGuard)
 export class ScenariosController {
   constructor(
     private readonly scenarios: ScenarioService,
@@ -17,8 +17,29 @@ export class ScenariosController {
     private readonly pg: PgService,
   ) {}
 
+  /**
+   * Ensure the JWT user owns the campaign that this scenario belongs to.
+   * Admins can read/modify any scenario; non-admins can only touch their own.
+   * Throws ForbiddenException on mismatch, NotFoundException if scenario missing.
+   */
+  private async assertCanAccessScenario(scenarioId: string, req: any): Promise<void> {
+    const r = await this.pg.query(
+      `SELECT c.user_id
+         FROM smm_scenario s
+         JOIN smm_campaign c ON c.id = s.campaign_id
+        WHERE s.id = $1`,
+      [scenarioId],
+    );
+    if (r.rows.length === 0) throw new NotFoundException(`scenario ${scenarioId} not found`);
+    if (req.user?.isAdmin) return;
+    if (r.rows[0].user_id !== req.user?.phone) {
+      throw new ForbiddenException('not your scenario');
+    }
+  }
+
   @Get(':id')
-  async getOne(@Param('id') id: string) {
+  async getOne(@Req() req: any, @Param('id') id: string) {
+    await this.assertCanAccessScenario(id, req);
     const s = await this.scenarios.getById(id);
     if (!s) throw new NotFoundException(`scenario ${id} not found`);
     // Attach latest rendered video id (if any) — frontend uses this to embed
@@ -34,6 +55,7 @@ export class ScenariosController {
 
   @Post(':id/approve')
   async approveOne(@Req() req: any, @Param('id') id: string) {
+    await this.assertCanAccessScenario(id, req);
     const result = await this.approval.approveScenarios({
       userId: req.user.phone,
       scenarioIds: [id],
@@ -69,6 +91,7 @@ export class ScenariosController {
 
   @Post(':id/regenerate')
   async regen(@Req() req: any, @Param('id') id: string, @Body() body: { feedback: string }) {
+    await this.assertCanAccessScenario(id, req);
     const r = await this.scenarios.regenerate(id, body.feedback || '');
     // Deduct Claude cost from the user's Linkeon balance and attribute it to
     // the ai-сообщение that contains this scenario, so "X токенов" updates.
@@ -105,6 +128,7 @@ export class ScenariosController {
    */
   @Patch(':id')
   async update(
+    @Req() req: any,
     @Param('id') id: string,
     @Body() body: {
       title?: string;
@@ -114,6 +138,7 @@ export class ScenariosController {
       broll_prompts?: Array<{ atSec: number; type: 'ai_image' | 'stock_video'; prompt: string }>;
     },
   ) {
+    await this.assertCanAccessScenario(id, req);
     const existing = await this.pg.query(`SELECT id FROM smm_scenario WHERE id = $1`, [id]);
     if (existing.rows.length === 0) throw new NotFoundException(`scenario ${id} not found`);
 
@@ -163,7 +188,8 @@ export class ScenariosController {
   }
 
   @Delete(':id')
-  async reject(@Param('id') id: string) {
+  async reject(@Req() req: any, @Param('id') id: string) {
+    await this.assertCanAccessScenario(id, req);
     await this.approval.rejectScenario(id);
     return { ok: true };
   }

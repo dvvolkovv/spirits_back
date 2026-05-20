@@ -1,7 +1,6 @@
 // src/smm/videos/videos.controller.ts
-import { BadRequestException, Controller, Get, NotFoundException, Param, Post, Body, Req, UseGuards } from '@nestjs/common';
+import { BadRequestException, Controller, ForbiddenException, Get, NotFoundException, Param, Post, Body, Req, UseGuards } from '@nestjs/common';
 import { JwtGuard } from '../../common/guards/jwt.guard';
-import { AdminGuard } from '../../common/guards/admin.guard';
 import { PgService } from '../../common/services/pg.service';
 import { rowToVideo } from '../entities/smm-video.entity';
 import { ApprovalService } from '../producer/approval.service';
@@ -12,7 +11,7 @@ import { InsufficientTokensError } from '../billing/insufficient-tokens.error';
 import { RenderQueueService } from '../render/render-queue.service';
 
 @Controller('smm/videos')
-@UseGuards(JwtGuard, AdminGuard)
+@UseGuards(JwtGuard)
 export class VideosController {
   constructor(
     private readonly pg: PgService,
@@ -22,21 +21,43 @@ export class VideosController {
     private readonly renderQueue: RenderQueueService,
   ) {}
 
+  /**
+   * Admins can read/modify any video; non-admins only their own (via campaign.user_id).
+   */
+  private async assertCanAccessVideo(videoId: string, req: any): Promise<void> {
+    const r = await this.pg.query(
+      `SELECT c.user_id
+         FROM smm_video v
+         JOIN smm_scenario s ON s.id = v.scenario_id
+         JOIN smm_campaign c ON c.id = s.campaign_id
+        WHERE v.id = $1`,
+      [videoId],
+    );
+    if (r.rows.length === 0) throw new NotFoundException(`video ${videoId} not found`);
+    if (req.user?.isAdmin) return;
+    if (r.rows[0].user_id !== req.user?.phone) {
+      throw new ForbiddenException('not your video');
+    }
+  }
+
   @Get(':id')
-  async getOne(@Param('id') id: string) {
+  async getOne(@Req() req: any, @Param('id') id: string) {
+    await this.assertCanAccessVideo(id, req);
     const r = await this.pg.query(`SELECT * FROM smm_video WHERE id = $1`, [id]);
     if (r.rows.length === 0) throw new NotFoundException(`video ${id} not found`);
     return rowToVideo(r.rows[0]);
   }
 
   @Post(':id/approve')
-  async approve(@Param('id') id: string) {
+  async approve(@Req() req: any, @Param('id') id: string) {
+    await this.assertCanAccessVideo(id, req);
     await this.approval.approveVideo(id);
     return { ok: true };
   }
 
   @Post(':id/reject')
-  async reject(@Param('id') id: string, @Body() body: { reason?: string }) {
+  async reject(@Req() req: any, @Param('id') id: string, @Body() body: { reason?: string }) {
+    await this.assertCanAccessVideo(id, req);
     await this.approval.rejectVideo(id, body?.reason);
     return { ok: true };
   }
@@ -51,6 +72,7 @@ export class VideosController {
    */
   @Post(':id/regenerate')
   async regenerate(@Req() req: any, @Param('id') id: string) {
+    await this.assertCanAccessVideo(id, req);
     const vRes = await this.pg.query(
       `SELECT v.id, v.status, v.scenario_id, v.mp4_url, v.duration_sec, v.size_bytes,
               v.render_state, s.tts_tier, c.user_id
@@ -150,6 +172,7 @@ export class VideosController {
     if (!Array.isArray(body?.platforms) || body.platforms.length === 0) {
       throw new NotFoundException('platforms is required');
     }
+    await this.assertCanAccessVideo(id, req);
     // Look up video → its scenario → campaign.user_id (for authz + scheduling).
     const vRes = await this.pg.query(
       `SELECT v.id, v.status, c.user_id
