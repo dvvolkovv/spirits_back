@@ -40,6 +40,8 @@ export interface SmmRenderContext {
     isLinkeonOfficial: boolean;
     ctaHandle?: string;
     ctaLabel?: string;
+    logoUrl?: string;
+    ctaSlogan?: string;
   };
 }
 

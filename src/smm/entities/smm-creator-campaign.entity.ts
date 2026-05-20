@@ -8,6 +8,12 @@ export interface SmmCreatorCampaign {
   ctaLabel: string;
   voiceGender: SmmCreatorVoiceGender;
   genre: SmmCreatorGenre;
+  /** Public URL of the creator's logo (uploaded to MinIO). Null = use Linkeon-only branding. */
+  logoUrl: string | null;
+  /** Short slogan rendered between logo and handle on the CTA frame. */
+  ctaSlogan: string | null;
+  /** Default caption pre-filled in PublishModal. User can still edit per publication. */
+  publishCaption: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -19,6 +25,9 @@ export function rowToCreatorCampaign(row: any): SmmCreatorCampaign {
     ctaLabel: row.cta_label,
     voiceGender: row.voice_gender,
     genre: row.genre,
+    logoUrl: row.logo_url ?? null,
+    ctaSlogan: row.cta_slogan ?? null,
+    publishCaption: row.publish_caption ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

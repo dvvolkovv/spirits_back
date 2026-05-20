@@ -16,6 +16,10 @@ export interface RenderJobCampaignInfo {
   isLinkeonOfficial: boolean;
   ctaHandle?: string;
   ctaLabel?: string;
+  /** Creator-uploaded logo (absolute URL). Falls back to Linkeon-only branding if absent. */
+  logoUrl?: string;
+  /** Short slogan rendered between logo and handle on the CTA frame. */
+  ctaSlogan?: string;
 }
 
 export interface RenderJobContext {
@@ -56,12 +60,14 @@ export class ScenarioFetchController {
     const campaign: RenderJobCampaignInfo = { isLinkeonOfficial };
     if (!isLinkeonOfficial) {
       const ccRes = await this.pg.query(
-        `SELECT cta_handle, cta_label FROM smm_creator_campaign WHERE campaign_id = $1`,
+        `SELECT cta_handle, cta_label, logo_url, cta_slogan FROM smm_creator_campaign WHERE campaign_id = $1`,
         [scenario.campaignId],
       );
       if (ccRes.rows.length > 0) {
         campaign.ctaHandle = ccRes.rows[0].cta_handle ?? undefined;
         campaign.ctaLabel = ccRes.rows[0].cta_label ?? undefined;
+        campaign.logoUrl = ccRes.rows[0].logo_url ?? undefined;
+        campaign.ctaSlogan = ccRes.rows[0].cta_slogan ?? undefined;
       }
     }
 

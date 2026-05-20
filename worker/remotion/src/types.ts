@@ -43,4 +43,8 @@ export interface CaseVideoProps {
   ctaHandle?: string;
   /** Creator-mode: CTA headline (e.g. "Подписывайся"). */
   ctaLabel?: string;
+  /** Creator-mode: uploaded logo URL — overrides Linkeon-logo in centre, Linkeon moves to corner. */
+  logoUrl?: string;
+  /** Creator-mode: short slogan rendered between logo and handle. */
+  ctaSlogan?: string;
 }

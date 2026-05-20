@@ -49,4 +49,36 @@ export class CreatorCampaignService {
     );
     return r.rows[0] ? rowToCreatorCampaign(r.rows[0]) : null;
   }
+
+  /**
+   * Partial update of branding fields. Only fields explicitly provided are written —
+   * undefined leaves the existing value, null clears it. Used by the branding UI
+   * (logo upload, slogan edit, default caption) without touching wizard-set
+   * cta_handle / voice_gender / genre.
+   */
+  async updateBranding(
+    campaignId: string,
+    fields: { logoUrl?: string | null; ctaSlogan?: string | null; publishCaption?: string | null },
+  ): Promise<SmmCreatorCampaign | null> {
+    const sets: string[] = [];
+    const vals: any[] = [];
+    let i = 1;
+    if (fields.logoUrl !== undefined) {
+      sets.push(`logo_url = $${i++}`); vals.push(fields.logoUrl);
+    }
+    if (fields.ctaSlogan !== undefined) {
+      sets.push(`cta_slogan = $${i++}`); vals.push(fields.ctaSlogan);
+    }
+    if (fields.publishCaption !== undefined) {
+      sets.push(`publish_caption = $${i++}`); vals.push(fields.publishCaption);
+    }
+    if (sets.length === 0) return this.getByCampaign(campaignId);
+    sets.push(`updated_at = now()`);
+    vals.push(campaignId);
+    const r = await this.pg.query(
+      `UPDATE smm_creator_campaign SET ${sets.join(', ')} WHERE campaign_id = $${i} RETURNING *`,
+      vals,
+    );
+    return r.rows[0] ? rowToCreatorCampaign(r.rows[0]) : null;
+  }
 }

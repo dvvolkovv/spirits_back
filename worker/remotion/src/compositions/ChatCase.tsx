@@ -55,6 +55,8 @@ export const ChatCase: React.FC<CaseVideoProps> = (props) => {
         isLinkeonOfficial={props.isLinkeonOfficial}
         ctaHandle={props.ctaHandle}
         ctaLabel={props.ctaLabel}
+        logoUrl={props.logoUrl}
+        ctaSlogan={props.ctaSlogan}
       />
 
       {/* Layer 5: Background music */}

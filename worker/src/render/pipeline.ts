@@ -222,6 +222,8 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
       isLinkeonOfficial: ctx.campaign.isLinkeonOfficial,
       ctaHandle: ctx.campaign.ctaHandle,
       ctaLabel: ctx.campaign.ctaLabel,
+      logoUrl: ctx.campaign.logoUrl,
+      ctaSlogan: ctx.campaign.ctaSlogan,
     };
 
     // STEP 5: Remotion render

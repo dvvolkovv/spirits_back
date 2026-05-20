@@ -17,6 +17,7 @@ import { CreatorCampaignService } from './producer/creator-campaign.service';
 import { SmmProducerToolsService } from './producer/smm-producer-tools.service';
 import { ScenariosController } from './scenarios/scenarios.controller';
 import { VideosController } from './videos/videos.controller';
+import { BrandingController } from './branding/branding.controller';
 import { PublicationContextController } from './publication/publication-context.controller';
 import { PublicationCallbackController } from './publication/publication-callback.controller';
 import { OAuthStateService } from './oauth/oauth-state.service';
@@ -28,7 +29,7 @@ import { OAuthController } from './oauth/oauth.controller';
 import { SocialAccountController } from './social-accounts/social-account.controller';
 
 @Module({
-  controllers: [SmmController, RenderCallbackController, ScenarioFetchController, ScenariosController, VideosController, PublicationContextController, PublicationCallbackController, OAuthController, SocialAccountController],
+  controllers: [SmmController, RenderCallbackController, ScenarioFetchController, ScenariosController, VideosController, BrandingController, PublicationContextController, PublicationCallbackController, OAuthController, SocialAccountController],
   providers: [
     SmmBillingService,
     SmmPricingService,

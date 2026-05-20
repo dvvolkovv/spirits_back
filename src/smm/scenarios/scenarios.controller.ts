@@ -6,6 +6,7 @@ import {
 import { JwtGuard } from '../../common/guards/jwt.guard';
 import { ScenarioService } from '../producer/scenario.service';
 import { ApprovalService } from '../producer/approval.service';
+import { CreatorCampaignService } from '../producer/creator-campaign.service';
 import { PgService } from '../../common/services/pg.service';
 
 @Controller('smm/scenarios')
@@ -14,6 +15,7 @@ export class ScenariosController {
   constructor(
     private readonly scenarios: ScenarioService,
     private readonly approval: ApprovalService,
+    private readonly creators: CreatorCampaignService,
     private readonly pg: PgService,
   ) {}
 
@@ -50,7 +52,23 @@ export class ScenariosController {
         ORDER BY created_at DESC LIMIT 1`,
       [id],
     );
-    return { ...s, videoId: v.rows[0]?.id ?? null };
+    // Campaign-level flags for the branding UI. is_linkeon_official decides
+    // whether to surface the "Brand" button at all; creatorSettings preload
+    // logo/slogan/publishCaption for non-Linkeon campaigns.
+    const cRes = await this.pg.query(
+      `SELECT is_linkeon_official FROM smm_campaign WHERE id = $1`,
+      [s.campaignId],
+    );
+    const isLinkeonOfficial = !!cRes.rows[0]?.is_linkeon_official;
+    const creatorSettings = isLinkeonOfficial
+      ? null
+      : await this.creators.getByCampaign(s.campaignId);
+    return {
+      ...s,
+      videoId: v.rows[0]?.id ?? null,
+      isLinkeonOfficial,
+      creatorSettings,
+    };
   }
 
   @Post(':id/approve')

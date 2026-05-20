@@ -9,6 +9,10 @@ interface Props {
   isLinkeonOfficial: boolean;
   ctaHandle?: string;
   ctaLabel?: string;
+  /** Creator-mode: uploaded logo URL — replaces Linkeon-logo in centre. */
+  logoUrl?: string;
+  /** Creator-mode: short slogan between logo and handle. */
+  ctaSlogan?: string;
 }
 
 const ROLE_HEADLINE: Record<string, string> = {
@@ -41,6 +45,8 @@ export const CTA: React.FC<Props> = ({
   isLinkeonOfficial,
   ctaHandle,
   ctaLabel,
+  logoUrl,
+  ctaSlogan,
 }) => {
   const headline = ROLE_HEADLINE[assistantRole] ?? 'ИИ-ассистент Linkeon';
   const { fps } = useVideoConfig();
@@ -154,22 +160,63 @@ export const CTA: React.FC<Props> = ({
     </>
   );
 
+  // Centre logo: creator's uploaded logo if provided, else Linkeon as fallback brand.
+  const centreLogoSrc = logoUrl ?? staticFile('linkeon-logo.png');
+  const hasOwnLogo = !!logoUrl;
+
   const creatorContent = (
     <>
+      {/* When the creator uploaded their own logo, Linkeon-logo shrinks to a corner badge. */}
+      {hasOwnLogo && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 40,
+            right: 40,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            zIndex: 2,
+            opacity: 0.85,
+          }}
+        >
+          <Img
+            src={staticFile('linkeon-logo.png')}
+            style={{
+              width: 36,
+              height: 36,
+              objectFit: 'contain',
+              filter: 'drop-shadow(0 2px 6px rgba(0,0,0,0.4))',
+            }}
+          />
+          <span style={{
+            fontSize: 22,
+            fontWeight: 600,
+            color: 'rgba(255,255,255,0.85)',
+            fontFamily: 'Inter, sans-serif',
+          }}>
+            на my.linkeon.io
+          </span>
+        </div>
+      )}
+
       <div
         style={{
           transform: `scale(${scale}) translateY(${logoFloat}px)`,
-          marginBottom: 30,
+          marginBottom: 24,
           zIndex: 1,
         }}
       >
         <Img
-          src={staticFile('linkeon-logo.png')}
+          src={centreLogoSrc}
           style={{
-            width: 100,
-            height: 100,
+            width: hasOwnLogo ? 220 : 100,
+            height: hasOwnLogo ? 220 : 100,
             objectFit: 'contain',
-            filter: 'drop-shadow(0 6px 18px rgba(0,0,0,0.4))',
+            borderRadius: hasOwnLogo ? 24 : 0,
+            background: hasOwnLogo ? 'rgba(255,255,255,0.95)' : undefined,
+            padding: hasOwnLogo ? 16 : 0,
+            filter: 'drop-shadow(0 8px 24px rgba(0,0,0,0.4))',
           }}
         />
       </div>
@@ -185,7 +232,7 @@ export const CTA: React.FC<Props> = ({
       >
         <div
           style={{
-            fontSize: 78,
+            fontSize: 70,
             fontWeight: 800,
             color: '#ffffff',
             fontFamily: 'Inter, sans-serif',
@@ -196,12 +243,32 @@ export const CTA: React.FC<Props> = ({
         >
           {ctaLabel ?? 'Подписывайся'}
         </div>
+
+        {/* Optional creator slogan between headline and handle */}
+        {ctaSlogan && (
+          <div
+            style={{
+              fontSize: 32,
+              fontWeight: 500,
+              color: '#d1fae5',
+              marginTop: 16,
+              maxWidth: '85%',
+              textAlign: 'center',
+              fontFamily: 'Inter, sans-serif',
+              letterSpacing: 0.2,
+              lineHeight: 1.25,
+            }}
+          >
+            {ctaSlogan}
+          </div>
+        )}
+
         <div
           style={{
-            fontSize: 84,
+            fontSize: 72,
             fontWeight: 800,
             color: '#a7f3d0',
-            marginTop: 28,
+            marginTop: ctaSlogan ? 24 : 28,
             textAlign: 'center',
             fontFamily: 'Inter, sans-serif',
             letterSpacing: -0.5,
@@ -211,18 +278,20 @@ export const CTA: React.FC<Props> = ({
           {ctaHandle ?? ''}
         </div>
 
-        <div
-          style={{
-            marginTop: 64,
-            fontSize: 30,
-            fontWeight: 500,
-            color: 'rgba(255,255,255,0.7)',
-            fontFamily: 'Inter, sans-serif',
-            letterSpacing: 0.3,
-          }}
-        >
-          создано на my.linkeon.io
-        </div>
+        {!hasOwnLogo && (
+          <div
+            style={{
+              marginTop: 56,
+              fontSize: 30,
+              fontWeight: 500,
+              color: 'rgba(255,255,255,0.7)',
+              fontFamily: 'Inter, sans-serif',
+              letterSpacing: 0.3,
+            }}
+          >
+            создано на my.linkeon.io
+          </div>
+        )}
       </div>
     </>
   );
