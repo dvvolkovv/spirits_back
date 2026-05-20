@@ -59,6 +59,8 @@ export class CreatorCampaignService {
   async updateBranding(
     campaignId: string,
     fields: {
+      ctaHandle?: string;
+      ctaLabel?: string;
       logoUrl?: string | null;
       ctaSlogan?: string | null;
       publishCaption?: string | null;
@@ -69,6 +71,12 @@ export class CreatorCampaignService {
     const sets: string[] = [];
     const vals: any[] = [];
     let i = 1;
+    if (fields.ctaHandle !== undefined) {
+      sets.push(`cta_handle = $${i++}`); vals.push(fields.ctaHandle);
+    }
+    if (fields.ctaLabel !== undefined) {
+      sets.push(`cta_label = $${i++}`); vals.push(fields.ctaLabel);
+    }
     if (fields.logoUrl !== undefined) {
       sets.push(`logo_url = $${i++}`); vals.push(fields.logoUrl);
     }

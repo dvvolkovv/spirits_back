@@ -103,12 +103,22 @@ export class BrandingController {
     @Req() req: any,
     @Param('id') id: string,
     @Body() body: {
+      ctaHandle?: string;
+      ctaLabel?: string;
       ctaSlogan?: string | null;
       publishCaption?: string | null;
       bgColor?: string | null;
     },
   ) {
     await this.assertCanAccessCampaign(id, req);
+    if (typeof body.ctaHandle === 'string') {
+      if (!body.ctaHandle.trim()) throw new BadRequestException('ctaHandle cannot be empty');
+      if (body.ctaHandle.length > 120) throw new BadRequestException('ctaHandle max 120 chars');
+    }
+    if (typeof body.ctaLabel === 'string') {
+      if (!body.ctaLabel.trim()) throw new BadRequestException('ctaLabel cannot be empty');
+      if (body.ctaLabel.length > 60) throw new BadRequestException('ctaLabel max 60 chars');
+    }
     if (typeof body.ctaSlogan === 'string' && body.ctaSlogan.length > 120) {
       throw new BadRequestException('ctaSlogan max 120 chars');
     }
@@ -116,13 +126,13 @@ export class BrandingController {
       throw new BadRequestException('publishCaption max 2000 chars');
     }
     if (typeof body.bgColor === 'string') {
-      // Defensive: only allow simple CSS color values / gradients up to 200 chars.
-      // No quotes (to keep React inline-style sanitised), no script-y patterns.
       if (body.bgColor.length > 200 || /["<>]|javascript:/i.test(body.bgColor)) {
         throw new BadRequestException('bgColor: max 200 chars, no quotes/script tokens');
       }
     }
     const updated = await this.creators.updateBranding(id, {
+      ctaHandle: body.ctaHandle === undefined ? undefined : body.ctaHandle.trim(),
+      ctaLabel: body.ctaLabel === undefined ? undefined : body.ctaLabel.trim(),
       ctaSlogan: body.ctaSlogan === undefined ? undefined : (body.ctaSlogan || null),
       publishCaption: body.publishCaption === undefined ? undefined : (body.publishCaption || null),
       bgColor: body.bgColor === undefined ? undefined : (body.bgColor || null),
