@@ -111,6 +111,30 @@ REMOTE
   green "  ✓ minio установлен (запустим после configure_secrets)"
 }
 
+install_node_stack() {
+  bold "[4/N] Node 22 + pnpm + pm2 (для юзера $TEST_USER)"
+  ssh_test 'bash -s' <<'REMOTE'
+set -e
+export NVM_DIR="$HOME/.nvm"
+if [ ! -d "$NVM_DIR" ]; then
+  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+fi
+. "$NVM_DIR/nvm.sh"
+nvm install 22
+nvm alias default 22
+
+if ! command -v pnpm >/dev/null; then
+  npm install -g pnpm
+fi
+if ! command -v pm2 >/dev/null; then
+  npm install -g pm2
+fi
+
+node -v && pnpm -v && pm2 -v
+REMOTE
+  green "  ✓ node stack установлен"
+}
+
 precheck_dns() {
   bold "[0/N] Проверяю DNS"
   # Пробуем несколько resolver'ов — propagation между ними может занять минуты.
@@ -138,5 +162,6 @@ precheck_dns
 install_system_packages
 install_neo4j
 install_minio
+install_node_stack
 echo
 echo "TODO: остальные шаги provisioning'а добавим в следующих задачах."
