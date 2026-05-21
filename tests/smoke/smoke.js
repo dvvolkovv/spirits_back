@@ -205,7 +205,71 @@ async function step(name, fn) {
     return `${n} fresh rows for ${sessionId}`;
   });
 
-  // -- 10. Avatar endpoint ----------------------------------------------
+  // -- 10. Ping-sweep всех ассистентов ----------------------------------
+  // Каждому отправляем короткий «ответь одним словом» и проверяем что
+  // стрим вернул >30 байт. Ловит:
+  //   - сломанный system_prompt в БД у конкретного агента
+  //   - проблемы с MCP-tools у конкретного агента
+  //   - падение r.linkeon.io для одной персоны
+  //   - Маша (id=3): её отдельный streamChat-path через Anthropic SDK
+  //   - Юля (smm_producer): её путь через ClaudeAgentService с OAuth
+  //
+  // Цена: ~$0.05-0.10 за прогон (Anthropic API за всех агентов разом).
+  // Время: 1-3 мин в зависимости от r.linkeon.io.
+  await step('all assistants respond to ping', async () => {
+    if (!jwt) throw new Error('no JWT');
+    const agentsResp = await axios.get(`${BASE_URL}/webhook/agents`, { timeout: 10000 });
+    const agents = agentsResp.data;
+    if (!Array.isArray(agents) || agents.length === 0) throw new Error('no agents to ping');
+
+    const results = [];
+    for (const a of agents) {
+      const t0 = Date.now();
+      const msg = `ping ${Date.now()} — ответь одним словом «ок», без пояснений`;
+      try {
+        const r = await axios.post(
+          `${BASE_URL}/webhook/soulmate/chat`,
+          { message: msg, assistantId: a.id },
+          {
+            headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
+            responseType: 'stream',
+            timeout: 120000,
+            validateStatus: () => true,
+          },
+        );
+        if (r.status !== 200) {
+          results.push({ id: a.id, name: a.name, bytes: 0, ms: Date.now() - t0, ok: false, err: `status ${r.status}` });
+          continue;
+        }
+        let bytes = 0;
+        await new Promise((resolve) => {
+          r.data.on('data', (chunk) => { bytes += chunk.length; });
+          r.data.on('end', resolve);
+          r.data.on('error', resolve);
+          setTimeout(resolve, 100000);
+        });
+        const ms = Date.now() - t0;
+        results.push({ id: a.id, name: a.name, bytes, ms, ok: bytes > 30 });
+      } catch (e) {
+        results.push({ id: a.id, name: a.name, bytes: 0, ms: Date.now() - t0, ok: false, err: e.message });
+      }
+    }
+
+    // Печатаем все результаты — пользователь видит per-agent статус.
+    console.log();
+    for (const r of results) {
+      const mark = r.ok ? '✓' : '✗';
+      const extra = r.ok ? `${r.bytes}b in ${(r.ms / 1000).toFixed(1)}s` : (r.err || `${r.bytes}b in ${(r.ms / 1000).toFixed(1)}s`);
+      console.log(`      ${mark} id=${r.id.toString().padStart(2)} ${r.name.padEnd(14)} — ${extra}`);
+    }
+    const failed = results.filter(r => !r.ok);
+    if (failed.length > 0) {
+      throw new Error(`${failed.length}/${results.length} agents failed ping: ${failed.map(f => `${f.name}(${f.err || 'short'})`).join(', ')}`);
+    }
+    return `${results.length} agents OK`;
+  });
+
+  // -- 11. Avatar endpoint ----------------------------------------------
   await step('agent avatar endpoint serves image (Райя)', async () => {
     const r = await axios.get(
       `${BASE_URL}/webhook/0cdacf32-7bfd-4888-b24f-3a6af3b5f99e/agent/avatar/14`,
