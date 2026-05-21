@@ -7,6 +7,9 @@ export const SMM_PRODUCER_TOOLS = [
       "'topic' — user gave an explicit theme (passed in `topic` arg); " +
       "'trends' — fetch what's hot in Russian social media and pick from there; " +
       "'auto' — let Claude pick freely from psy/lawyer/coach domains. " +
+      'For admin users you can additionally pass `premium_genre` to render each scenario in a premium ' +
+      "style ('surreal' — невозможные кадры через kling; 'pov' — от лица предмета; 'cinematic' — киноязык). " +
+      'Без premium_genre = классика. ' +
       'Creates a campaign + N pending_review scenarios in DB. Returns the campaignId and an array of scenario IDs and titles.',
     input_schema: {
       type: 'object',
@@ -14,6 +17,11 @@ export const SMM_PRODUCER_TOOLS = [
         mode: { type: 'string', enum: ['auto', 'topic', 'trends'] },
         count: { type: 'integer', minimum: 1, maximum: 10, default: 3 },
         topic: { type: 'string', description: 'Only for mode=topic. The user-specified theme in Russian.' },
+        premium_genre: {
+          type: 'string',
+          enum: ['surreal', 'pov', 'cinematic'],
+          description: 'Optional. Admin-only. Премиум-стиль через kling 2.0 + nano-banana keyframes. Omit for классический сценарий.',
+        },
       },
       required: ['mode', 'count'],
     },
