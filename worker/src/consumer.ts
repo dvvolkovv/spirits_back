@@ -40,6 +40,7 @@ export function startRenderWorker(): Worker<RenderJobPayload> {
         durationSec: result.durationSec,
         sizeBytes: result.sizeBytes,
         errorMessage: result.errorMessage,
+        escapeHatch: result.escapeHatch,
       });
       return result;
     },

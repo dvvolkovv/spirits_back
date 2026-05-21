@@ -16,6 +16,16 @@ export interface SmmBrollPrompt {
   prompt: string;
 }
 
+export type PremiumGenre = 'surreal' | 'pov' | 'cinematic';
+
+export interface PremiumScene {
+  type: 'kling' | 'imagen';
+  keyframe_prompt?: string;
+  motion_prompt?: string;
+  image_prompt?: string;
+  duration?: number;
+}
+
 export interface SmmRenderContext {
   video: {
     id: string;
@@ -35,6 +45,9 @@ export interface SmmRenderContext {
     musicTrackId: string | null;
     ttsTier: 'economy' | 'premium';
     ttsVoiceId: string | null;
+    premiumGenre: PremiumGenre | null;
+    klingSceneCount: number;
+    scenes: PremiumScene[] | null;
   };
   campaign: {
     isLinkeonOfficial: boolean;
@@ -49,11 +62,12 @@ export interface SmmRenderContext {
 
 export interface RenderCallbackInput {
   videoId: string;
-  status: 'ready' | 'failed';
+  status: 'ready' | 'failed' | 'escape_hatch_offered';
   mp4Url?: string;
   durationSec?: number;
   sizeBytes?: number;
   errorMessage?: string;
+  escapeHatch?: { sceneIdx: number; message: string };
 }
 
 export interface SmmPublicationContext {

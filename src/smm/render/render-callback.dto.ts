@@ -5,8 +5,8 @@ export class RenderCallbackDto {
   @IsUUID()
   videoId!: string;
 
-  @IsIn(['ready', 'failed'])
-  status!: 'ready' | 'failed';
+  @IsIn(['ready', 'failed', 'escape_hatch_offered'])
+  status!: 'ready' | 'failed' | 'escape_hatch_offered';
 
   @IsOptional() @IsString()
   mp4Url?: string;
@@ -19,6 +19,9 @@ export class RenderCallbackDto {
 
   @IsOptional() @IsString()
   errorMessage?: string;
+
+  @IsOptional() @IsObject()
+  escapeHatch?: { sceneIdx: number; message: string };
 }
 
 export class RenderStateUpdateDto {

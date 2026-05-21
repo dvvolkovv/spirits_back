@@ -50,6 +50,22 @@ export class RenderCallbackController {
       );
       if (res.rowCount === 0) throw new NotFoundException(`video ${dto.videoId} not found`);
       this.logger.log(`Video ${dto.videoId} marked ready: ${dto.mp4Url}`);
+    } else if (dto.status === 'escape_hatch_offered') {
+      // Premium pipeline исчерпал 3 retries на одной из kling-сцен.
+      // Не refund'им — юзер сам выберет действие через POST /videos/:id/escape-hatch.
+      const res = await this.pg.query(
+        `UPDATE smm_video
+            SET status = 'escape_hatch_offered',
+                render_state = jsonb_set(
+                  coalesce(render_state, '{}'::jsonb),
+                  '{escape_hatch}',
+                  $1::jsonb
+                )
+          WHERE id = $2 RETURNING id`,
+        [JSON.stringify(dto.escapeHatch ?? {}), dto.videoId],
+      );
+      if (res.rowCount === 0) throw new NotFoundException(`video ${dto.videoId} not found`);
+      this.logger.log(`Video ${dto.videoId} escape hatch offered: ${JSON.stringify(dto.escapeHatch)}`);
     } else {
       const res = await this.pg.query(
         `UPDATE smm_video SET status = 'failed', error_message = $1

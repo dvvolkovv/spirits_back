@@ -8,6 +8,8 @@ import { logger } from '../logger';
 import { synthesize, writeSynthResultToFile } from '../tts';
 import { probeDurationSec } from '../postprocess/ffmpeg';
 import { klingText2Video } from '../media/kling';
+import { processPremiumScenes } from './premium-pipeline';
+import { EscapeHatchError } from './escape-hatch.error';
 import { chunkSubtitles } from '../tts/subtitle-chunker';
 import { generateImage, writeImageToFile } from '../media/image-gen';
 import { searchStockVideo, downloadStockVideo } from '../media/stock-video';
@@ -27,11 +29,12 @@ export interface PipelineInput {
 }
 
 export interface PipelineResult {
-  status: 'ready' | 'failed';
+  status: 'ready' | 'failed' | 'escape_hatch_offered';
   mp4Url?: string;
   durationSec?: number;
   sizeBytes?: number;
   errorMessage?: string;
+  escapeHatch?: { sceneIdx: number; message: string };
 }
 
 export async function runRenderPipeline(input: PipelineInput): Promise<PipelineResult> {
@@ -43,6 +46,32 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
     const state: RenderState = { ...(ctx.video.renderState as RenderState), scenarioLoaded: true };
     await persist(input.videoId, state);
     tmp = await TempDir.create(input.videoId);
+
+    // STEP 0.5: Premium-mode — оживить kling-сцены до основного рендера.
+    // nano-banana keyframe → kling image2video → vision-QA loop (до 3 retries).
+    // Если EscapeHatchError — выходим со специальным статусом, не платим за рендер.
+    const scenarioScenes = ctx.scenario.scenes ?? null;
+    const isPremium = !!ctx.scenario.premiumGenre && Array.isArray(scenarioScenes);
+    if (isPremium && scenarioScenes) {
+      const wrappedScenes = { scenes: scenarioScenes };
+      try {
+        if (!state.premiumScenesProcessed) {
+          await processPremiumScenes(wrappedScenes);
+          state.premiumScenesProcessed = true;
+          state.premiumScenes = wrappedScenes.scenes as unknown as RenderState['premiumScenes'];
+          await persist(input.videoId, state);
+        }
+      } catch (e) {
+        if (e instanceof EscapeHatchError) {
+          logger.warn({ videoId: input.videoId, sceneIdx: e.sceneIdx, msg: e.message }, 'premium escape hatch');
+          return {
+            status: 'escape_hatch_offered',
+            escapeHatch: { sceneIdx: e.sceneIdx, message: e.message },
+          };
+        }
+        throw e;
+      }
+    }
 
     // STEP 1: Synthesize voices for each dialog turn + measure actual durations.
     // Real TTS duration can differ from Claude's tStart/tEnd estimates by 2-3 seconds.
@@ -210,6 +239,19 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
       .filter((b) => b.mediaUrl);
 
     const subtitles = dialog.flatMap((d) => chunkSubtitles(d.text, d.tStart, d.tEnd));
+
+    // Premium: kling-сцены и Imagen-кадры сгенерированы на STEP 0.5 — собираем их
+    // для Remotion в виде последовательности фон-сцен. По умолчанию каждая сцена
+    // длится 5 сек, остальное добивается классическим bg image/color.
+    const premiumScenes = isPremium && state.premiumScenes
+      ? state.premiumScenes.map((s, i) => ({
+          atSec: i * (s.duration ?? 5),
+          durationSec: s.duration ?? 5,
+          mediaUrl: s.videoUrl ?? s.keyframeUrl ?? '',
+          type: s.type,
+        })).filter((s) => !!s.mediaUrl)
+      : [];
+
     const remotionProps = {
       title: ctx.scenario.title,
       assistantRole: ctx.scenario.assistantRole,
@@ -226,6 +268,7 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
       ctaSlogan: ctx.campaign.ctaSlogan,
       bgColor: ctx.campaign.bgColor,
       bgImageUrl: ctx.campaign.bgImageUrl,
+      premiumScenes,
     };
 
     // STEP 5: Remotion render
@@ -238,7 +281,7 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
       const bundled = await bundle({ entryPoint: remotionRoot, publicDir: remotionPublic });
       const composition = await selectComposition({
         serveUrl: bundled,
-        id: 'ChatCase',
+        id: isPremium ? 'PremiumChatCase' : 'ChatCase',
         inputProps: remotionProps as unknown as Record<string, unknown>,
       });
       await renderMedia({

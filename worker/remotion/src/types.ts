@@ -20,6 +20,16 @@ export interface BrollProps {
   type: 'image' | 'video';
 }
 
+export interface PremiumSceneProps {
+  /** Когда сцена выходит на передний план (сек от начала ролика) */
+  atSec: number;
+  /** Длительность сцены в секундах */
+  durationSec: number;
+  /** Public URL kling-клипа (mp4) для type: 'kling', или Imagen-картинки для type: 'imagen' */
+  mediaUrl: string;
+  type: 'kling' | 'imagen';
+}
+
 export interface SubtitleChunkProps {
   text: string;
   tStart: number;
@@ -51,4 +61,8 @@ export interface CaseVideoProps {
   bgColor?: string;
   /** Creator-mode: background image URL (wins over bgColor). */
   bgImageUrl?: string;
+  /** Premium-mode: kling-кадры + Imagen-кадры, занимающие весь экран как фон.
+   * Если задано, PremiumChatCase рендерит их вместо bgImage/bgColor.
+   * ChatCase (классика) игнорирует это поле. */
+  premiumScenes?: PremiumSceneProps[];
 }
