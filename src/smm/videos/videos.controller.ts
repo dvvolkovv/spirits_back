@@ -105,9 +105,11 @@ export class VideosController {
     if (!gen) throw new NotFoundException(`no premium generation for video ${id}`);
 
     if (body.choice === 'refund') {
+      // 100% возврат премиум + TTS (видео так и не доставлено).
       await this.premiumGen.refund({
         generationId: gen.id, refundTokens: gen.tokensCharged, status: 'full_refund',
       });
+      await this.billing.refund({ videoId: id, reason: 'escape_hatch_refund' });
       await this.pg.query(`UPDATE smm_video SET status = 'cancelled' WHERE id = $1`, [id]);
       return { ok: true, refunded: gen.tokensCharged };
     }
@@ -139,9 +141,12 @@ export class VideosController {
       if (!body.newGenre || !['surreal', 'pov', 'cinematic'].includes(body.newGenre)) {
         throw new BadRequestException('newGenre required and must be surreal|pov|cinematic');
       }
+      // 100% возврат премиум + TTS — юзер пересоздаёт ролик с нуля,
+      // на новой генерации будет новая charge-транзакция.
       await this.premiumGen.refund({
         generationId: gen.id, refundTokens: gen.tokensCharged, status: 'full_refund',
       });
+      await this.billing.refund({ videoId: id, reason: 'escape_hatch_switch_genre' });
       // Меняем жанр на сценарии. Юзер сам должен подтвердить новую цену через UI
       // (preview + confirm) — фронт перезапускает /scenarios/:id/render с новым жанром.
       await this.pg.query(

@@ -2,8 +2,16 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PgService } from '../../common/services/pg.service';
 import { SmmBillingService } from '../billing/smm-billing.service';
+import { SmmPremiumGenerationService } from '../billing/smm-premium-generation.service';
 import { InsufficientTokensError } from '../billing/insufficient-tokens.error';
 import { RenderQueueService } from '../render/render-queue.service';
+import { PremiumGenre } from '../entities/smm-scenario.entity';
+
+/** Стоимость premium-режима в токенах сверх TTS-тарифа. */
+function premiumTokensCost(klingSceneCount: number): number {
+  if (klingSceneCount <= 1) return 100_000;
+  return 180_000;
+}
 
 export interface ApproveScenariosInput {
   userId: string;
@@ -22,6 +30,7 @@ export class ApprovalService {
   constructor(
     private readonly pg: PgService,
     private readonly billing: SmmBillingService,
+    private readonly premiumGen: SmmPremiumGenerationService,
     private readonly queue: RenderQueueService,
   ) {}
 
@@ -40,7 +49,8 @@ export class ApprovalService {
     for (const scenarioId of input.scenarioIds) {
       try {
         const scRes = await this.pg.query(
-          `SELECT id, tts_tier, status FROM smm_scenario WHERE id = $1`, [scenarioId]);
+          `SELECT id, tts_tier, status, premium_genre, kling_scene_count
+             FROM smm_scenario WHERE id = $1`, [scenarioId]);
         if (scRes.rows.length === 0) {
           result.failed.push({ scenarioId, reason: 'not_found' });
           continue;
@@ -74,6 +84,36 @@ export class ApprovalService {
             continue;
           }
           throw err;
+        }
+
+        // Premium: списываем дополнительные токены за kling-сцены.
+        // Если списание фейлится — откатываем TTS-charge и видео-строку.
+        const premiumGenre: PremiumGenre | null = row.premium_genre ?? null;
+        const klingSceneCount: number = Number(row.kling_scene_count ?? 0);
+        if (premiumGenre && klingSceneCount > 0) {
+          try {
+            await this.premiumGen.charge({
+              userId: input.userId,
+              videoId,
+              genre: premiumGenre,
+              sceneCount: klingSceneCount,
+              tokensCost: premiumTokensCost(klingSceneCount),
+            });
+            this.logger.log(`Premium charge ${premiumTokensCost(klingSceneCount)} tokens for video ${videoId} (genre=${premiumGenre}, scenes=${klingSceneCount})`);
+          } catch (err: any) {
+            // Refund TTS charge + drop video, чтобы не висело висяком
+            await this.billing.refund({ videoId, reason: 'premium_charge_failed' });
+            await this.pg.query(`DELETE FROM smm_video WHERE id = $1`, [videoId]);
+            if (err instanceof InsufficientTokensError) {
+              result.failed.push({ scenarioId, reason: 'insufficient_tokens', detail: 'premium scenes require extra tokens' });
+              continue;
+            }
+            if (/rate.limit/i.test(err.message ?? '')) {
+              result.failed.push({ scenarioId, reason: 'error', detail: 'rate_limit_exceeded' });
+              continue;
+            }
+            throw err;
+          }
         }
 
         const jobId = await this.queue.enqueue({ videoId, scenarioId });

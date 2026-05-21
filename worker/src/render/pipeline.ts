@@ -47,8 +47,9 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
     await persist(input.videoId, state);
     tmp = await TempDir.create(input.videoId);
 
-    // STEP 0.5: Premium-mode — оживить kling-сцены до основного рендера.
-    // nano-banana keyframe → kling image2video → vision-QA loop (до 3 retries).
+    // STEP 0.5: Premium-mode — оживить kling-сцены + сгенерить imagen-сцены.
+    // kling: nano-banana keyframe → kling image2video → vision-QA loop (до 3 retries).
+    // imagen: generateImage → upload в MinIO.
     // Если EscapeHatchError — выходим со специальным статусом, не платим за рендер.
     const scenarioScenes = ctx.scenario.scenes ?? null;
     const isPremium = !!ctx.scenario.premiumGenre && Array.isArray(scenarioScenes);
@@ -56,7 +57,26 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
       const wrappedScenes = { scenes: scenarioScenes };
       try {
         if (!state.premiumScenesProcessed) {
+          // Kling-сцены обрабатываются отдельным модулем (nano-banana + QA-loop).
           await processPremiumScenes(wrappedScenes);
+
+          // Imagen-сцены: статичные кадры, которые Юля заложила в scenes_json.
+          // Генерируем через тот же Imagen-pipeline что и b-roll, грузим в MinIO.
+          for (let i = 0; i < wrappedScenes.scenes.length; i++) {
+            const s = wrappedScenes.scenes[i] as any;
+            if (s.type !== 'imagen') continue;
+            const prompt = s.image_prompt || s.prompt;
+            if (!prompt) {
+              logger.warn(`premium imagen scene ${i}: no prompt — skipping`);
+              continue;
+            }
+            const bytes = await generateImage({ prompt, aspectRatio: '9:16' });
+            const localPath = await writeImageToFile(bytes, tmp!.root, `premium-img-${i}`);
+            const url = await uploadImageToMinio(localPath, `videos/${input.videoId}/premium-img-${i}`);
+            s.imageUrl = url;
+            logger.info({ videoId: input.videoId, sceneIdx: i, url }, 'premium imagen generated');
+          }
+
           state.premiumScenesProcessed = true;
           state.premiumScenes = wrappedScenes.scenes as unknown as RenderState['premiumScenes'];
           await persist(input.videoId, state);
@@ -241,15 +261,18 @@ export async function runRenderPipeline(input: PipelineInput): Promise<PipelineR
     const subtitles = dialog.flatMap((d) => chunkSubtitles(d.text, d.tStart, d.tEnd));
 
     // Premium: kling-сцены и Imagen-кадры сгенерированы на STEP 0.5 — собираем их
-    // для Remotion в виде последовательности фон-сцен. По умолчанию каждая сцена
-    // длится 5 сек, остальное добивается классическим bg image/color.
+    // для Remotion в виде последовательности фон-сцен. Если Юля задала at_sec —
+    // используем его, иначе раскладываем последовательно по 5 сек.
     const premiumScenes = isPremium && state.premiumScenes
-      ? state.premiumScenes.map((s, i) => ({
-          atSec: i * (s.duration ?? 5),
-          durationSec: s.duration ?? 5,
-          mediaUrl: s.videoUrl ?? s.keyframeUrl ?? '',
-          type: s.type,
-        })).filter((s) => !!s.mediaUrl)
+      ? state.premiumScenes.map((s, i) => {
+          const duration = s.duration ?? 5;
+          // at_sec из scenes_json если есть; иначе подряд (i * 5)
+          const atSec = typeof s.at_sec === 'number' ? s.at_sec : i * duration;
+          const mediaUrl = s.type === 'kling'
+            ? (s.videoUrl ?? '')
+            : (s.imageUrl ?? '');
+          return { atSec, durationSec: duration, mediaUrl, type: s.type };
+        }).filter((s) => !!s.mediaUrl)
       : [];
 
     const remotionProps = {

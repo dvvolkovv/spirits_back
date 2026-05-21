@@ -6,10 +6,12 @@ export interface PremiumSceneState {
   keyframe_prompt?: string;
   motion_prompt?: string;
   image_prompt?: string;
-  videoUrl?: string;
+  videoUrl?: string;     // kling-выход (mp4)
+  imageUrl?: string;     // imagen-выход (jpg в MinIO)
   keyframeUrl?: string;
   attempts?: number;
   duration?: number;
+  at_sec?: number;
 }
 
 export interface RenderState {
