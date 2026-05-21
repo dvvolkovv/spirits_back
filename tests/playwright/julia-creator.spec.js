@@ -46,7 +46,15 @@ async function loginAsJulia(page) {
   return { access, refresh };
 }
 
+// Test полагается на конкретного юзера (79169403771 по умолчанию) с готовой
+// SMM-историей. На test.linkeon.io этого юзера нет — БД свежая. Скипаем
+// весь describe-блок если идём на test (определяем по hostname в BASE_URL).
 test.describe('Юля (SMM Producer) creator-mode E2E', () => {
+  test.skip(
+    /test\.linkeon\.io/.test(BASE),
+    'julia-creator требует прод-данных (SMM-сценариев конкретного юзера); test-стенд их не имеет',
+  );
+
   test('login → see Юля → open chat with her', async ({ page }) => {
     await loginAsJulia(page);
     await page.goto(`${BASE}/chat`);

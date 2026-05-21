@@ -42,7 +42,7 @@ async function loginViaStorage(page) {
 test.describe('my.linkeon.io smoke', () => {
   test('login → /chat → assistants visible', async ({ page }) => {
     await loginViaStorage(page);
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('domcontentloaded');
     // The page should render — wait for any assistant card/button
     // (selectors vary; we just check the page didn't redirect to /onboarding)
     expect(page.url()).toContain('/chat');
@@ -66,7 +66,7 @@ test.describe('my.linkeon.io smoke', () => {
       sessionStorage.setItem('selected_assistant', s);
     }, [access, refresh, JSON.stringify(userData), JSON.stringify(assistant)]);
     await page.goto('/chat');
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('domcontentloaded');
 
     // The chat textarea/input should be rendered now
     const input = page.locator('textarea, input[type="text"]').first();
@@ -75,16 +75,21 @@ test.describe('my.linkeon.io smoke', () => {
   });
 
   test('per-tab independence: two contexts hold different assistants', async ({ browser }) => {
-    // Open two isolated browser contexts (= two browser windows with separate sessionStorage)
-    const c1 = await browser.newContext();
-    const c2 = await browser.newContext();
+    // Open two isolated browser contexts (= two browser windows with separate sessionStorage).
+    // httpCredentials НЕ пробрасывается из playwright.config.use в browser.newContext() —
+    // нужно передавать вручную, иначе test.linkeon.io отдаст 401 от nginx Basic Auth.
+    const ctxOpts = process.env.BASIC_AUTH
+      ? { httpCredentials: (() => { const [u, ...r] = process.env.BASIC_AUTH.split(':'); return { username: u, password: r.join(':') }; })() }
+      : {};
+    const c1 = await browser.newContext(ctxOpts);
+    const c2 = await browser.newContext(ctxOpts);
     const p1 = await c1.newPage();
     const p2 = await c2.newPage();
     try {
       await loginViaStorage(p1);
       await loginViaStorage(p2);
-      await p1.waitForLoadState('networkidle');
-      await p2.waitForLoadState('networkidle');
+      await p1.waitForLoadState('domcontentloaded');
+      await p2.waitForLoadState('domcontentloaded');
 
       // Set different assistants in sessionStorage on each
       await p1.evaluate(() => {
@@ -97,8 +102,8 @@ test.describe('my.linkeon.io smoke', () => {
       // Reload to re-init React state from sessionStorage
       await p1.reload();
       await p2.reload();
-      await p1.waitForLoadState('networkidle');
-      await p2.waitForLoadState('networkidle');
+      await p1.waitForLoadState('domcontentloaded');
+      await p2.waitForLoadState('domcontentloaded');
 
       // Each context's sessionStorage stays independent
       const a1 = await p1.evaluate(() => JSON.parse(sessionStorage.getItem('selected_assistant') || 'null'));
