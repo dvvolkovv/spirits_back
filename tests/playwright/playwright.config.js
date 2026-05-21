@@ -12,6 +12,13 @@ module.exports = defineConfig({
   reporter: [['list']],
   use: {
     baseURL: process.env.BASE_URL || 'https://my.linkeon.io',
+    // Basic Auth для test.linkeon.io. На проде BASIC_AUTH пустой → undefined → ничего не меняется.
+    httpCredentials: process.env.BASIC_AUTH
+      ? (() => {
+          const [username, ...rest] = process.env.BASIC_AUTH.split(':');
+          return { username, password: rest.join(':') };
+        })()
+      : undefined,
     headless: true,
     actionTimeout: 15000,
     navigationTimeout: 30000,
