@@ -14,4 +14,5 @@ module.exports = {
   ...require('./approval.integration.test'),
   ...require('./producer-tools.integration.test'),
   ...require('./time-parser.unit.test'),
+  ...require('./premium-billing.integration.test'),
 };

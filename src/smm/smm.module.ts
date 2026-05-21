@@ -27,6 +27,7 @@ import { TikTokOAuthService } from './oauth/tiktok-oauth.service';
 import { MetaOAuthService } from './oauth/meta-oauth.service';
 import { OAuthController } from './oauth/oauth.controller';
 import { SocialAccountController } from './social-accounts/social-account.controller';
+import { SmmPremiumGenerationService } from './billing/smm-premium-generation.service';
 
 @Module({
   controllers: [SmmController, RenderCallbackController, ScenarioFetchController, ScenariosController, VideosController, BrandingController, PublicationContextController, PublicationCallbackController, OAuthController, SocialAccountController],
@@ -48,6 +49,7 @@ import { SocialAccountController } from './social-accounts/social-account.contro
     YouTubeOAuthService,
     TikTokOAuthService,
     MetaOAuthService,
+    SmmPremiumGenerationService,
   ],
   exports: [
     SmmBillingService,
@@ -67,6 +69,7 @@ import { SocialAccountController } from './social-accounts/social-account.contro
     YouTubeOAuthService,
     TikTokOAuthService,
     MetaOAuthService,
+    SmmPremiumGenerationService,
   ],
 })
 export class SmmModule {}
