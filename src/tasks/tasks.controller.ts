@@ -1,0 +1,39 @@
+import { Controller, Get, Param, Query, Res, UseGuards, Optional } from '@nestjs/common';
+import { Response } from 'express';
+import { JwtGuard } from '../common/guards/jwt.guard';
+import { TasksService } from './tasks.service';
+
+/**
+ * Admin-only endpoints for inspecting per-user task memory.
+ * Frontend admin drawer (UserActivityDrawer) hits these.
+ *
+ * Endpoints live in tasks module rather than admin.controller because
+ * the admin module had been losing edits to drift; keeping tasks
+ * routing isolated avoids that conflict.
+ */
+@Controller('')
+export class TasksController {
+  constructor(@Optional() private readonly tasks?: TasksService) {}
+
+  @Get('admin/users/:phone/tasks')
+  @UseGuards(JwtGuard)
+  async list(@Param('phone') phone: string, @Res() res: Response) {
+    if (!this.tasks) return res.status(503).json({ error: 'tasks service not configured' });
+    const items = await this.tasks.listForAdmin(phone);
+    return res.status(200).json(items);
+  }
+
+  @Get('admin/tasks/:taskId')
+  @UseGuards(JwtGuard)
+  async details(
+    @Param('taskId') taskId: string,
+    @Query('limit') limit: string | undefined,
+    @Res() res: Response,
+  ) {
+    if (!this.tasks) return res.status(503).json({ error: 'tasks service not configured' });
+    const lim = limit ? Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200) : 50;
+    const data = await this.tasks.getTaskFull(taskId, lim);
+    if (!data) return res.status(404).json({ error: 'task not found' });
+    return res.status(200).json(data);
+  }
+}
