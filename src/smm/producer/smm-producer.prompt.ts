@@ -13,6 +13,12 @@ export function buildPremiumPromptSection(genre: PremiumGenre | null): string {
 Для type:'kling' сцены ОБЯЗАТЕЛЬНЫ два поля:
 - keyframe_prompt: подробное описание стартового кадра (что видно, фотореализм или стилизация, освещение)
 - motion_prompt: что происходит в течение 5 секунд (одно конкретное движение/превращение)
+
+Для type:'imagen' сцены ОБЯЗАТЕЛЬНО поле:
+- image_prompt: описание статичного кадра (англоязычный prompt для Imagen, например "frustrated office worker, vertical 9:16")
+
+НЕ используй поле \`prompt\` для imagen-сцен — только \`image_prompt\`. Если хочешь добавить
+время появления сцены — поле \`at_sec\` опционально (целое число секунд от начала ролика).
 `;
 
   const dict: Record<PremiumGenre, string> = {
