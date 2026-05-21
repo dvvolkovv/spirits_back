@@ -327,6 +327,95 @@ REMOTE
   green "  ✓ .env файлы записаны"
 }
 
+setup_nginx_and_tls() {
+  bold "[9/N] Nginx + Let's Encrypt"
+  # shellcheck disable=SC1090
+  . "$LOCAL_ENV_FILE"
+  local basic_user basic_pass
+  basic_user="${TEST_BASIC_AUTH%%:*}"
+  basic_pass="${TEST_BASIC_AUTH#*:}"
+
+  ssh_test "sudo bash -s" <<REMOTE
+set -e
+
+# 1. minimal vhost на 80 для http-01
+mkdir -p /var/www/letsencrypt
+cat > /etc/nginx/sites-available/$TEST_DOMAIN <<EOF
+server {
+  listen 80;
+  server_name $TEST_DOMAIN;
+  location /.well-known/acme-challenge/ { root /var/www/letsencrypt; }
+  location / { return 200 "bootstrap"; add_header Content-Type text/plain; }
+}
+EOF
+ln -sf /etc/nginx/sites-available/$TEST_DOMAIN /etc/nginx/sites-enabled/$TEST_DOMAIN
+rm -f /etc/nginx/sites-enabled/default
+nginx -t
+systemctl reload nginx
+
+# 2. certbot — webroot, чтобы не править nginx на лету
+if [ ! -d /etc/letsencrypt/live/$TEST_DOMAIN ]; then
+  certbot certonly --webroot -w /var/www/letsencrypt \\
+    -d $TEST_DOMAIN \\
+    --non-interactive --agree-tos -m $LE_EMAIL
+fi
+
+# 3. htpasswd
+if [ ! -f /etc/nginx/.htpasswd-test ]; then
+  htpasswd -cb /etc/nginx/.htpasswd-test '$basic_user' '$basic_pass'
+else
+  htpasswd -b /etc/nginx/.htpasswd-test '$basic_user' '$basic_pass'
+fi
+chmod 644 /etc/nginx/.htpasswd-test
+
+# 4. финальный vhost: 80 → redirect, 443 TLS+BasicAuth+proxy
+cat > /etc/nginx/sites-available/$TEST_DOMAIN <<EOF
+server {
+  listen 80;
+  server_name $TEST_DOMAIN;
+  location /.well-known/acme-challenge/ { root /var/www/letsencrypt; }
+  location / { return 301 https://\\\$host\\\$request_uri; }
+}
+
+server {
+  listen 443 ssl http2;
+  server_name $TEST_DOMAIN;
+  ssl_certificate     /etc/letsencrypt/live/$TEST_DOMAIN/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/$TEST_DOMAIN/privkey.pem;
+
+  location /.well-known/acme-challenge/ {
+    root /var/www/letsencrypt;
+    auth_basic off;
+  }
+
+  auth_basic           "linkeon test";
+  auth_basic_user_file /etc/nginx/.htpasswd-test;
+
+  root /home/$TEST_USER/spirits_front;
+  index index.html;
+  location / { try_files \\\$uri /index.html; }
+
+  location /webhook/ {
+    proxy_pass http://127.0.0.1:3001;
+    proxy_set_header Host \\\$host;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Real-IP \\\$remote_addr;
+    proxy_buffering off;
+    proxy_read_timeout 600s;
+  }
+
+  location /minio/ {
+    proxy_pass http://127.0.0.1:9000/;
+    proxy_set_header Host \\\$host;
+  }
+}
+EOF
+nginx -t
+systemctl reload nginx
+REMOTE
+  green "  ✓ Nginx + TLS + BasicAuth настроены"
+}
+
 precheck_dns
 install_system_packages
 install_neo4j
@@ -336,5 +425,6 @@ generate_secrets
 configure_services
 clone_repos
 write_env_files
+setup_nginx_and_tls
 echo
 echo "TODO: остальные шаги provisioning'а добавим в следующих задачах."
