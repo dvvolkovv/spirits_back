@@ -135,6 +135,45 @@ REMOTE
   green "  ✓ node stack установлен"
 }
 
+generate_secrets() {
+  bold "[5/N] Генерация секретов"
+  if [ -f "$LOCAL_ENV_FILE" ]; then
+    green "  $LOCAL_ENV_FILE уже существует — не перезаписываю"
+    return 0
+  fi
+
+  gen() { openssl rand -hex 24; }
+  local pg_pass neo4j_pass minio_user minio_pass jwt_a jwt_r basic_pass
+  pg_pass=$(gen)
+  neo4j_pass=$(gen)
+  minio_user="linkeon-test"
+  minio_pass=$(gen)
+  jwt_a=$(gen)
+  jwt_r=$(gen)
+  basic_pass=$(openssl rand -base64 18 | tr -d '/+=' | head -c 24)
+
+  cat > "$LOCAL_ENV_FILE" <<EOF
+# Сгенерировано provision-test.sh $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# GITIGNORED. Не комитить.
+TEST_HOST=$TEST_HOST
+TEST_BACK_PATH=/home/$TEST_USER/spirits_back
+TEST_FRONT_SRC=/home/$TEST_USER/spirits_front_src
+TEST_FRONT_SERVED=/home/$TEST_USER/spirits_front
+TEST_BASE_URL=https://$TEST_DOMAIN
+TEST_BASIC_AUTH=linkeon:$basic_pass
+
+# Backend .env values (для отладки/восстановления)
+POSTGRES_PASSWORD=$pg_pass
+NEO4J_PASSWORD=$neo4j_pass
+MINIO_ACCESS_KEY=$minio_user
+MINIO_SECRET_KEY=$minio_pass
+JWT_ACCESS_SECRET=$jwt_a
+JWT_REFRESH_SECRET=$jwt_r
+EOF
+  chmod 600 "$LOCAL_ENV_FILE"
+  green "  ✓ $LOCAL_ENV_FILE создан"
+}
+
 precheck_dns() {
   bold "[0/N] Проверяю DNS"
   # Пробуем несколько resolver'ов — propagation между ними может занять минуты.
@@ -163,5 +202,6 @@ install_system_packages
 install_neo4j
 install_minio
 install_node_stack
+generate_secrets
 echo
 echo "TODO: остальные шаги provisioning'а добавим в следующих задачах."
