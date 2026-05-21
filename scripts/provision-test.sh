@@ -398,7 +398,12 @@ server {
   index index.html;
   location / { try_files \\\$uri /index.html; }
 
+  # API: без Basic Auth. JWT (Bearer) и Basic не уживаются в одном Authorization
+  # хедере — клиенты с Bearer-токеном получали 401 от nginx до того как запрос
+  # доходил до API. Публичные эндпоинты защищены тем что хост test.linkeon.io
+  # не индексируется и SMS Aero/YooKassa не настроены (всё no-op).
   location /webhook/ {
+    auth_basic off;
     proxy_pass http://127.0.0.1:3001;
     proxy_set_header Host \\\$host;
     proxy_set_header X-Forwarded-Proto https;
@@ -407,7 +412,11 @@ server {
     proxy_read_timeout 600s;
   }
 
+  # MinIO: без Basic Auth — public objects (аватары, музыка) фронт грузит
+  # с URL https://test.linkeon.io/minio/<bucket>/... ИЗ-под basic-auth страницы,
+  # т.е. браузер не подмешает там Basic. Так же как на проде из MinIO напрямую.
   location /minio/ {
+    auth_basic off;
     proxy_pass http://127.0.0.1:9000/;
     proxy_set_header Host \\\$host;
   }
