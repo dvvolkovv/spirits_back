@@ -4,6 +4,18 @@ import * as path from 'path';
 import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
 
+function cosineSim(a: number[], b: number[]): number {
+  if (!a || !b || a.length !== b.length) return 0;
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  return denom === 0 ? 0 : dot / denom;
+}
+
 export interface TaskRow {
   id: string;
   user_id: string;
@@ -128,6 +140,53 @@ export class TasksService implements OnModuleInit {
       [taskId, eventsLimit],
     );
     return { task: tRes.rows[0], events: eRes.rows.reverse() };
+  }
+
+  /**
+   * Готовый текстовый блок «Активные задачи пользователя» для инжекта в
+   * system_prompt любого ассистента. Топ-5 по семантической близости к текущей
+   * реплике юзера (если есть OpenAI ключ), иначе по recency. Если задач нет —
+   * возвращает пустую строку, ничего не инжектится.
+   *
+   * Формат:
+   *   --- Активные задачи пользователя ---
+   *   1. <title>
+   *      <summary>
+   *   2. ...
+   */
+  async buildContextForPrompt(userId: string, userMessage: string = ''): Promise<string> {
+    if (!this.pg) return '';
+    const all = await this.listActive(userId);
+    if (all.length === 0) return '';
+
+    const TOP_N = 5;
+    let selected: TaskRow[];
+    if (all.length <= TOP_N) {
+      selected = all;
+    } else {
+      // Семантическая релевантность через cosine между embedding'ом
+      // текущей реплики и task.embedding. Если embedding юзер-реплики
+      // не получилось посчитать — fallback на recency.
+      const qVec = await this.embed(userMessage);
+      if (!qVec) {
+        selected = all.slice(0, TOP_N);
+      } else {
+        const scored = all.map(t => ({
+          t,
+          score: t.embedding ? cosineSim(qVec, t.embedding) : -1,
+        }));
+        scored.sort((a, b) => b.score - a.score);
+        selected = scored.slice(0, TOP_N).map(s => s.t);
+      }
+    }
+
+    const lines = selected
+      .map((t, i) => {
+        const summary = (t.summary || '').trim() || '(описание пусто)';
+        return `${i + 1}. ${t.title}\n   ${summary}`;
+      })
+      .join('\n');
+    return `--- Активные задачи пользователя ---\n${lines}\n\nЕсли реплика пользователя относится к одной из этих задач — продолжай разговор с учётом этого контекста. Если нужна полная инструкция по задаче (claudemd) или история событий — попроси пользователя уточнить.\n`;
   }
 
   /** Список задач юзера для admin UI (все статусы). */
@@ -325,7 +384,7 @@ ${assistantMessage.slice(0, 3000)}
 
   /**
    * Толерантный JSON-парсер (повтор Neo4jService.extractJsonObject — модель
-   * иногда возвращает с ```json``` обёрткой или прозой вокруг).
+   * иногда возвращает с markdown-обёрткой или прозой вокруг).
    */
   private parseJsonTolerant(text: string): any | null {
     if (!text) return null;

@@ -175,9 +175,18 @@ export class ChatService {
 • Для коучинговых/психологических/нумерологических практик это правило тоже действует: сначала отражение/гипотеза/интерпретация/направление — и только потом, при необходимости, один открытый вопрос.
 • Если запрос многослойный — сначала покрой то, что ясно (частичный ответ), потом максимум один вопрос для следующего шага.`;
 
-    const volatileSystemPrompt = (profileText && profileText.trim())
+    let volatileSystemPrompt = (profileText && profileText.trim())
       ? `\n\n--- Профиль пользователя ---\n${profileText}`
       : '';
+    // Cross-agent active tasks (см. TasksService.buildContextForPrompt).
+    if (this.tasksService) {
+      try {
+        const tasksCtx = await this.tasksService.buildContextForPrompt(userId, message);
+        if (tasksCtx) volatileSystemPrompt += `\n\n${tasksCtx}`;
+      } catch (e: any) {
+        this.logger.warn(`tasks context injection failed (Маша): ${e?.message}`);
+      }
+    }
 
     // Плоская строка для путей, не поддерживающих структурный system (DeepSeek greeting, OpenRouter fallback)
     const systemPrompt = stableSystemPrompt + volatileSystemPrompt;
@@ -581,6 +590,17 @@ export class ChatService {
 
     if (profileText && profileText.trim()) {
       contextPrefix += `User profile:\n${profileText}\n\n`;
+    }
+    // Активные задачи пользователя (cross-agent) — топ-5 по релевантности
+    // к текущей реплике. Юзер видит ассистентов как продолжающих контекст
+    // незаконченных дел, а не отвечающих с нуля.
+    if (this.tasksService) {
+      try {
+        const tasksCtx = await this.tasksService.buildContextForPrompt(userId, message);
+        if (tasksCtx) contextPrefix += tasksCtx + '\n';
+      } catch (e: any) {
+        this.logger.warn(`tasks context injection failed: ${e?.message}`);
+      }
     }
     if (recentHistory.length > 0) {
       const historyLines = recentHistory
