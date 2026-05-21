@@ -143,50 +143,96 @@ export class TasksService implements OnModuleInit {
   }
 
   /**
-   * Готовый текстовый блок «Активные задачи пользователя» для инжекта в
-   * system_prompt любого ассистента. Топ-5 по семантической близости к текущей
-   * реплике юзера (если есть OpenAI ключ), иначе по recency. Если задач нет —
-   * возвращает пустую строку, ничего не инжектится.
+   * Готовый текстовый блок для инжекта в system_prompt любого ассистента.
    *
-   * Формат:
-   *   --- Активные задачи пользователя ---
-   *   1. <title>
-   *      <summary>
-   *   2. ...
+   * Состоит из двух частей:
+   *   1. «Активные задачи» — топ-5 active по релевантности к текущей реплике
+   *      (или по recency, если embedding юзер-реплики не получилось посчитать).
+   *   2. «Архивные задачи (возможно, связанные)» — топ-3 archived с cosine
+   *      similarity ≥ ARCHIVE_RECALL_THRESHOLD к текущей реплике. Это и есть
+   *      авто-recall старых проектов («помнишь, год назад мы делали X?»).
+   *
+   * Если задач нет вовсе — пустая строка, ничего не инжектится.
    */
   async buildContextForPrompt(userId: string, userMessage: string = ''): Promise<string> {
     if (!this.pg) return '';
-    const all = await this.listActive(userId);
-    if (all.length === 0) return '';
 
-    const TOP_N = 5;
-    let selected: TaskRow[];
-    if (all.length <= TOP_N) {
-      selected = all;
-    } else {
-      // Семантическая релевантность через cosine между embedding'ом
-      // текущей реплики и task.embedding. Если embedding юзер-реплики
-      // не получилось посчитать — fallback на recency.
-      const qVec = await this.embed(userMessage);
-      if (!qVec) {
-        selected = all.slice(0, TOP_N);
-      } else {
-        const scored = all.map(t => ({
-          t,
-          score: t.embedding ? cosineSim(qVec, t.embedding) : -1,
-        }));
-        scored.sort((a, b) => b.score - a.score);
-        selected = scored.slice(0, TOP_N).map(s => s.t);
-      }
+    const TOP_ACTIVE = 5;
+    const TOP_ARCHIVE = 3;
+    const ARCHIVE_RECALL_THRESHOLD = 0.62; // 0..1 — эмпирически: ниже шум, выше пропуски
+
+    const active = await this.listActive(userId);
+    let archived: TaskRow[] = [];
+    if (this.pg) {
+      const res = await this.pg.query(
+        `SELECT * FROM tasks WHERE user_id = $1 AND status = 'archived' LIMIT 500`,
+        [userId],
+      );
+      archived = res.rows;
     }
 
-    const lines = selected
-      .map((t, i) => {
-        const summary = (t.summary || '').trim() || '(описание пусто)';
-        return `${i + 1}. ${t.title}\n   ${summary}`;
-      })
-      .join('\n');
-    return `--- Активные задачи пользователя ---\n${lines}\n\nЕсли реплика пользователя относится к одной из этих задач — продолжай разговор с учётом этого контекста. Если нужна полная инструкция по задаче (claudemd) или история событий — попроси пользователя уточнить.\n`;
+    if (active.length === 0 && archived.length === 0) return '';
+
+    // One embedding call для ранжирования обоих списков. Если ключ OpenAI
+    // не настроен — qVec=null, активные берём по recency, archived recall
+    // не делаем (без embedding'а ничего не сматчишь).
+    const qVec = userMessage ? await this.embed(userMessage) : null;
+
+    // Активные
+    let selectedActive: TaskRow[];
+    if (active.length <= TOP_ACTIVE) {
+      selectedActive = active;
+    } else if (qVec) {
+      const scored = active.map(t => ({
+        t,
+        score: t.embedding ? cosineSim(qVec, t.embedding) : -1,
+      }));
+      scored.sort((a, b) => b.score - a.score);
+      selectedActive = scored.slice(0, TOP_ACTIVE).map(s => s.t);
+    } else {
+      selectedActive = active.slice(0, TOP_ACTIVE);
+    }
+
+    // Архивные (recall) — только если есть embedding юзер-реплики
+    let selectedArchive: Array<{ t: TaskRow; score: number }> = [];
+    if (qVec && archived.length > 0) {
+      const scored = archived
+        .filter(t => t.embedding)
+        .map(t => ({ t, score: cosineSim(qVec, t.embedding!) }));
+      scored.sort((a, b) => b.score - a.score);
+      selectedArchive = scored
+        .filter(x => x.score >= ARCHIVE_RECALL_THRESHOLD)
+        .slice(0, TOP_ARCHIVE);
+    }
+
+    const parts: string[] = [];
+
+    if (selectedActive.length > 0) {
+      const lines = selectedActive
+        .map((t, i) => {
+          const summary = (t.summary || '').trim() || '(описание пусто)';
+          return `${i + 1}. ${t.title}\n   ${summary}`;
+        })
+        .join('\n');
+      parts.push(
+        `--- Активные задачи пользователя ---\n${lines}\n\nЕсли реплика пользователя относится к одной из этих задач — продолжай разговор с учётом этого контекста.`,
+      );
+    }
+
+    if (selectedArchive.length > 0) {
+      const lines = selectedArchive
+        .map((x, i) => {
+          const summary = (x.t.summary || '').trim() || '(описание пусто)';
+          const dateLabel = x.t.last_active_at ? ` · последняя активность ${new Date(x.t.last_active_at).toISOString().slice(0, 10)}` : '';
+          return `${i + 1}. ${x.t.title}${dateLabel}\n   ${summary}`;
+        })
+        .join('\n');
+      parts.push(
+        `--- Архивные задачи (возможно, связанные с этим запросом) ---\n${lines}\n\nЕсли пользователь явно ссылается на одну из этих архивных задач («помнишь когда мы…», «то что было год назад…») — можешь поднять её контекст. Иначе не упоминай их без необходимости, чтобы не отвлекать от текущего разговора.`,
+      );
+    }
+
+    return parts.length > 0 ? parts.join('\n\n') + '\n' : '';
   }
 
   /** Список задач юзера для admin UI (все статусы). */
