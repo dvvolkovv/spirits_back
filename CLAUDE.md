@@ -28,25 +28,29 @@
 - **Payments:** YooKassa
 - **Storage:** Локальные файлы (avatars, images) через Nginx /static/
 
-## Деплой (git-based)
+## Деплой (двухфазный: test → prod)
 
-**Только через `scripts/deploy.sh`.** Деплой идёт **из git** — никаких rsync с локалки. На проде:
-- `/home/dvolkov/spirits_back/` — git-клон `dvvolkovv/spirits_back`, ветка `b2b`
-- `/home/dvolkov/spirits_front_src/` — git-клон `dvvolkovv/spirits` (build делается тут)
-- `/home/dvolkov/spirits_front/` — nginx-served `dist/` (output фронт-билда)
+**Только через `scripts/deploy.sh`.** Деплой идёт **из git** — никаких rsync с локалки. Пайплайн:
 
-Пайплайн `scripts/deploy.sh`:
-1. Проверка: локальный репо чистый (нет uncommitted) — иначе exit
-2. `git push origin b2b` (бэк + фронт)
-3. SSH прод: `git fetch + reset --hard origin/b2b` → `npm ci + npm run build + pm2 restart` (back) / `pnpm install + pnpm build + rsync dist→nginx` (front)
-4. Health-wait `/webhook/agents`
-5. Полный smoke (unit + API + Playwright)
+1. **PHASE 1 — test.linkeon.io** (`dv@85.192.61.231`). `git pull` → build → `pm2 restart` → smoke (`BASE_URL=https://test.linkeon.io`, `BASIC_AUTH=<линкеон>:<пароль>` из gitignored `scripts/test-server.env.local`).
+2. **PHASE 2 — my.linkeon.io** (`dvolkov@212.113.106.202`). То же на проде. **Запускается ТОЛЬКО если PHASE 1 smoke зелёный.** Если test красный — deploy.sh выходит с кодом 1 ДО касания прода.
 
 ```bash
 bash ~/Downloads/spirits_back/scripts/deploy.sh
 ```
 
-Env-переменные: `BASE_URL`, `TEST_PHONE`, `PROD_HOST`, `BRANCH`, `BACK_ONLY=1`, `FRONT_ONLY=1`, `SKIP_SMOKE=1`, `SMOKE_ONLY=1`.
+Раскладка путей одинакова в обеих средах (с заменой `dvolkov` ↔ `dv`):
+- `~/spirits_back/` — git-клон `dvvolkovv/spirits_back`, ветка `b2b`
+- `~/spirits_front_src/` — git-клон `dvvolkovv/spirits` (build делается тут)
+- `~/spirits_front/` — nginx-served `dist/`
+
+Полезные флаги: `TEST_ONLY=1`, `PROD_ONLY=1` (hotfix), `FRONT_ONLY=1`, `BACK_ONLY=1`, `SKIP_SMOKE=1`, `SKIP_TEST_SMOKE=1`, `SKIP_PROD_SMOKE=1`, `SMOKE_ONLY=1`. Полный список — в шапке `scripts/deploy.sh`.
+
+### Тестовый сервер
+
+`test.linkeon.io` (`dv@85.192.61.231`, Ubuntu 24.04). Полный зеркальный стек: PostgreSQL/Redis/Neo4j/MinIO. SMS Aero и YooKassa отключены через пустые env. `DEBUG_SMS_CODES=true`. Доступ закрыт Basic Auth на уровне Nginx.
+
+**Bootstrap (один раз):** `bash scripts/provision-test.sh`. Скрипт идемпотентный, можно перезапускать. Креды генерятся и складываются в `scripts/test-server.env.local` (gitignored).
 
 **Почему git, а не rsync**: `rsync --delete` много раз сносил `.env`, `public/agent-avatars/` и `worker/.env` потому что они gitignored / отсутствовали локально. Каждое такое падение приводило к выпадению SMSAERO / OPENAI / ANTHROPIC / MCP_SECRET / NEO4J_* / KLING / PEXELS. Git-pull трогает **только tracked-файлы** — `.env` и `public/` на проде живут постоянно, никем не задеваются.
 
