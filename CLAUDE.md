@@ -278,6 +278,44 @@ cd ~/Downloads/spirits_back/tests && node runner.js  # api (32) + e2e (18) = 50
 - Реферальная система: 2 уровня комиссий, commissions в `referral_commissions`
 - Аватарки и изображения раздаются из `/static/` через Nginx (файлы в `~/spirits_back/public/`)
 
+## 📋 Tasks — операционная память пользователя (cross-agent)
+
+Каждый юзер имеет автоматически создаваемые **задачи** — структурированный контекст текущих и прошлых проектов/обязательств. **Все ассистенты видят все задачи** одного юзера и могут продолжать работу с того места, где её бросил другой ассистент.
+
+**Таблицы** (миграция [src/tasks/migrations/001_tasks.sql](src/tasks/migrations/001_tasks.sql) применяется в `TasksService.onModuleInit`):
+- `tasks` — id (uuid), user_id, title, summary, claudemd, claudemd_locked, status (`active|archived|done`), last_active_at, embedding (`double precision[]` 256-dim), created_at, updated_at
+- `task_events` — id (bigserial), task_id, kind (`user_message|agent_response|note|milestone|decision|status_change`), content, agent_id, created_at
+
+**Структура задачи**:
+- `claudemd` — стабильная инструкция/manual задачи (цель, контекст, участники, ограничения). Перезаписывается редко.
+- `summary` — текущее «где мы сейчас» (1-3 предложения). Регенерится после каждого значимого события.
+- `task_events` — append-only timeline: что произошло, кем, когда.
+
+**Auto-extract** ([TasksService.extractFromTurn](src/tasks/tasks.service.ts)): после каждой пары `human+ai` в chat history (`setImmediate` рядом с `consolidateFromChat`) делается 1 LLM-вызов Haiku 4.5 (~$0.001) который возвращает одно из:
+- `none` — реплика бытовая
+- `append` — про существующую задачу: добавить event, обновить summary, опционально переписать claudemd (если `claudemd_locked=false`)
+- `create` — новая задача: title/summary/claudemd/первый event
+
+**Context injection** ([TasksService.buildContextForPrompt](src/tasks/tasks.service.ts)): перед каждым chat-turn'ом в system_prompt инжектится:
+1. **Активные задачи** — топ-5 по cosine между embedding юзер-сообщения и task.embedding (или по recency если OPENAI_API_KEY отсутствует). Только `title + summary`.
+2. **Архивные задачи (recall)** — топ-3 archived с cosine ≥ 0.62 к текущему сообщению. Авто-всплытие старых проектов когда юзер «помнишь, мы делали X?».
+
+**Cron** ([scheduler/task-archiver.service.ts](src/scheduler/task-archiver.service.ts)): `0 30 04 * * *` (04:30 UTC) переводит active задачи без событий >60 дней в `archived`. **Задачи никогда не удаляются** — archived доступны через recall и admin drawer.
+
+**Admin endpoints** ([tasks.controller.ts](src/tasks/tasks.controller.ts)):
+- `GET /webhook/admin/users/:phone/tasks` — список всех задач юзера (active first, потом archived/done)
+- `GET /webhook/admin/tasks/:taskId?limit=N` — полный объект задачи + последние N событий
+
+**Admin UI** ([UserActivityDrawer.tsx](src/components/admin/UserActivityDrawer.tsx)): секция «Задачи» в drawer'е юзера показывает список с статус-pill'ами и `claudemd_locked` бейджем; click на задачу раскрывает inline её `claudemd` + timeline событий.
+
+**Стоимость per turn**: +1 Haiku 4.5 call (~$0.001) + 1 OpenAI embedding (~$0.00002 при text-embedding-3-large dim=256). Не блокирует ответ юзеру (всё в `setImmediate`).
+
+**Что вне scope текущей реализации**:
+- User-facing UI для управления задачами (rename / merge / archive вручную)
+- LLM-tool `get_task(id)` — пока инжектится только title+summary, полный claudemd видит только админ через drawer
+- Follow-up reminders («N дней нет активности по задаче — напомнить?»)
+- `claudemd_locked=true` существует в схеме, но UI для блокировки manual-а пока нет — выставлять напрямую через UPDATE
+
 
 ## ➕ Добавление нового ассистента
 
