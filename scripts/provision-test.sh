@@ -20,6 +20,33 @@ red()   { printf "\033[31m%s\033[0m\n" "$1" >&2; }
 
 ssh_test() { ssh -o StrictHostKeyChecking=accept-new "$TEST_HOST" "$@"; }
 
+install_system_packages() {
+  bold "[1/N] System packages (nginx, postgresql, redis, certbot, htpasswd, dig)"
+  ssh_test 'sudo bash -s' <<'REMOTE'
+set -e
+export DEBIAN_FRONTEND=noninteractive
+
+# Если postgresql-16 не находится в default repos — добавь PGDG.
+if ! apt-cache show postgresql-16 >/dev/null 2>&1; then
+  install -d /usr/share/postgresql-common/pgdg
+  curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+  echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+fi
+
+apt-get update -qq
+apt-get install -y -qq \
+  nginx \
+  postgresql-16 postgresql-contrib \
+  redis-server \
+  certbot python3-certbot-nginx \
+  apache2-utils \
+  dnsutils curl wget gnupg ca-certificates \
+  build-essential
+systemctl enable --now nginx postgresql redis-server
+REMOTE
+  green "  ✓ system packages установлены"
+}
+
 precheck_dns() {
   bold "[0/N] Проверяю DNS"
   # Пробуем несколько resolver'ов — propagation между ними может занять минуты.
@@ -44,5 +71,6 @@ precheck_dns() {
 }
 
 precheck_dns
+install_system_packages
 echo
 echo "TODO: остальные шаги provisioning'а добавим в следующих задачах."
