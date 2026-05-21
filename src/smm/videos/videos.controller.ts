@@ -7,8 +7,10 @@ import { ApprovalService } from '../producer/approval.service';
 import { PublicationService, Platform } from '../publication/publication.service';
 import { parseScheduleTime } from '../publication/time-parser';
 import { SmmBillingService } from '../billing/smm-billing.service';
+import { SmmPremiumGenerationService } from '../billing/smm-premium-generation.service';
 import { InsufficientTokensError } from '../billing/insufficient-tokens.error';
 import { RenderQueueService } from '../render/render-queue.service';
+import { PremiumGenre } from '../entities/smm-scenario.entity';
 
 @Controller('smm/videos')
 @UseGuards(JwtGuard)
@@ -18,6 +20,7 @@ export class VideosController {
     private readonly approval: ApprovalService,
     private readonly publication: PublicationService,
     private readonly billing: SmmBillingService,
+    private readonly premiumGen: SmmPremiumGenerationService,
     private readonly renderQueue: RenderQueueService,
   ) {}
 
@@ -70,6 +73,89 @@ export class VideosController {
    * Allowed when status is one of: ready, approved, failed, rejected
    * (i.e. NOT queued/rendering — would conflict with the in-flight job).
    */
+  /**
+   * Escape hatch — пользователь сделал выбор после того как премиум-pipeline
+   * исчерпал retries на одной из kling-сцен (status === 'escape_hatch_offered').
+   *
+   * Варианты body.choice:
+   *   - 'refund': 100% возврат, видео отменено (cancelled), generation = full_refund
+   *   - 'keep_static': 50% возврат, premium_genre сбрасывается в NULL,
+   *      сценарий перерендеривается в «классике» без kling (queued).
+   *   - 'switch_genre': 100% возврат, scenario.premium_genre = newGenre,
+   *      видео отменено; юзер должен запустить новую генерацию заново (другая цена).
+   */
+  @Post(':id/escape-hatch')
+  async escapeHatch(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() body: { choice: 'refund' | 'keep_static' | 'switch_genre'; newGenre?: PremiumGenre },
+  ) {
+    await this.assertCanAccessVideo(id, req);
+    const vRes = await this.pg.query(
+      `SELECT status, scenario_id FROM smm_video WHERE id = $1`,
+      [id],
+    );
+    if (vRes.rows.length === 0) throw new NotFoundException(`video ${id} not found`);
+    if (vRes.rows[0].status !== 'escape_hatch_offered') {
+      throw new BadRequestException(`video ${id} is ${vRes.rows[0].status}, not escape_hatch_offered`);
+    }
+    const scenarioId = vRes.rows[0].scenario_id;
+
+    const gen = await this.premiumGen.findByVideoId(id);
+    if (!gen) throw new NotFoundException(`no premium generation for video ${id}`);
+
+    if (body.choice === 'refund') {
+      await this.premiumGen.refund({
+        generationId: gen.id, refundTokens: gen.tokensCharged, status: 'full_refund',
+      });
+      await this.pg.query(`UPDATE smm_video SET status = 'cancelled' WHERE id = $1`, [id]);
+      return { ok: true, refunded: gen.tokensCharged };
+    }
+
+    if (body.choice === 'keep_static') {
+      const half = Math.floor(gen.tokensCharged / 2);
+      await this.premiumGen.refund({
+        generationId: gen.id, refundTokens: half, status: 'partial_refund',
+      });
+      // Сбрасываем premium-разметку → re-render как классика
+      await this.pg.query(
+        `UPDATE smm_scenario SET premium_genre = NULL, kling_scene_count = 0, scenes_json = NULL
+          WHERE id = $1`,
+        [scenarioId],
+      );
+      await this.pg.query(
+        `UPDATE smm_video
+            SET status = 'queued',
+                render_state = jsonb_build_object('previous_premium_attempt', render_state->'escape_hatch')
+          WHERE id = $1`,
+        [id],
+      );
+      const jobId = await this.renderQueue.enqueue({ videoId: id, scenarioId });
+      await this.pg.query(`UPDATE smm_video SET render_job_id = $1 WHERE id = $2`, [jobId, id]);
+      return { ok: true, refunded: half, requeued: true };
+    }
+
+    if (body.choice === 'switch_genre') {
+      if (!body.newGenre || !['surreal', 'pov', 'cinematic'].includes(body.newGenre)) {
+        throw new BadRequestException('newGenre required and must be surreal|pov|cinematic');
+      }
+      await this.premiumGen.refund({
+        generationId: gen.id, refundTokens: gen.tokensCharged, status: 'full_refund',
+      });
+      // Меняем жанр на сценарии. Юзер сам должен подтвердить новую цену через UI
+      // (preview + confirm) — фронт перезапускает /scenarios/:id/render с новым жанром.
+      await this.pg.query(
+        `UPDATE smm_scenario SET premium_genre = $1, scenes_json = NULL, kling_scene_count = 0
+          WHERE id = $2`,
+        [body.newGenre, scenarioId],
+      );
+      await this.pg.query(`UPDATE smm_video SET status = 'cancelled' WHERE id = $1`, [id]);
+      return { ok: true, refunded: gen.tokensCharged, switched_to: body.newGenre };
+    }
+
+    throw new BadRequestException(`unknown choice: ${body.choice}`);
+  }
+
   @Post(':id/regenerate')
   async regenerate(@Req() req: any, @Param('id') id: string) {
     await this.assertCanAccessVideo(id, req);
