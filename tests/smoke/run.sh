@@ -4,6 +4,8 @@
 #   layer = unit | api | browser | all (default)
 #
 # Env: BASE_URL (default https://my.linkeon.io), TEST_PHONE (default 70000000000)
+#      BASIC_AUTH (optional, user:pass for Basic Auth on test server)
+#      SSH_TARGET (optional, override SSH host for DB-check, default dvolkov@212.113.106.202)
 
 set -uo pipefail
 
@@ -13,6 +15,8 @@ cd "$ROOT"
 
 BASE_URL="${BASE_URL:-https://my.linkeon.io}"
 TEST_PHONE="${TEST_PHONE:-70000000000}"
+BASIC_AUTH="${BASIC_AUTH:-}"
+SSH_TARGET="${SSH_TARGET:-dvolkov@212.113.106.202}"
 
 print_header() {
   echo
@@ -33,7 +37,9 @@ fi
 
 if [[ "$LAYER" == "api" || "$LAYER" == "all" ]]; then
   print_header "LAYER 2/3 — API + DB smoke (Node)"
-  if ! BASE_URL="$BASE_URL" TEST_PHONE="$TEST_PHONE" node smoke/smoke.js; then
+  if ! BASE_URL="$BASE_URL" TEST_PHONE="$TEST_PHONE" \
+       BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" \
+       node smoke/smoke.js; then
     echo "  ✗ api/db failed"
     FAILED=1
   fi
@@ -42,6 +48,7 @@ fi
 if [[ "$LAYER" == "browser" || "$LAYER" == "all" ]]; then
   print_header "LAYER 3/3 — Browser smoke (Playwright)"
   if ! BASE_URL="$BASE_URL" TEST_PHONE="$TEST_PHONE" \
+       BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" \
        npx playwright test --config=playwright/playwright.config.js --reporter=list; then
     echo "  ✗ browser failed"
     FAILED=1
