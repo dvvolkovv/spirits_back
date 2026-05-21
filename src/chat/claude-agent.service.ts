@@ -207,11 +207,13 @@ export class ClaudeAgentService {
     const tools = [
       tool(
         'generate_scenarios',
-        "Generate N short-video scenarios for SMM. Use mode='topic' if user gave a topic, 'trends' for trending topics, 'auto' otherwise. count defaults to 3.",
+        "Generate N short-video scenarios for SMM. Use mode='topic' if user gave a topic, 'trends' for trending topics, 'auto' otherwise. count defaults to 3. " +
+        "For admin users you can pass premium_genre ('surreal'|'pov'|'cinematic') to render scenarios in a premium style with kling 2.0 + nano-banana keyframes. Omit for классика.",
         {
           mode: z.enum(['topic', 'trends', 'auto']),
           count: z.number().int().min(1).max(10),
           topic: z.string().optional(),
+          premium_genre: z.enum(['surreal', 'pov', 'cinematic']).optional(),
         },
         async (args: any) => handle('generate_scenarios', args),
       ),
