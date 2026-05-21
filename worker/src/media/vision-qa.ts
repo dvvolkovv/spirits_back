@@ -4,7 +4,7 @@ import { config } from '../config';
 import { logger } from '../logger';
 
 const VISION_MODEL = 'gemini-2.5-flash';
-const GOOD_THRESHOLD = 0.65;
+const GOOD_THRESHOLD = 0.4;
 
 export interface ClipScore { score: number; reason: string; good: boolean; }
 

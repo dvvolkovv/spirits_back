@@ -82,11 +82,18 @@ export async function processPremiumScenes(scenario: PremiumScenario): Promise<v
     scene.keyframeUrl = keyframePath;
     scene.attempts = 0;
 
-    let videoUrl: string | null = null;
-    let lastSuccessfulClipPath: string | null = null;
+    // Best-of-N: запускаем kling до MAX_ATTEMPTS раз. Если qa.good — берём сразу.
+    // Если все < threshold, берём с максимальным score (не escape hatch — ролик всё равно
+    // лучше доставить чем уйти в refund flow на каждой проблемной сцене).
+    // Escape hatch фирится только когда kling вообще не вернул mp4 ни разу (API down).
+    const durationSec = (scene as any).duration === 10 ? 10 : 5;
+    let bestUrl: string | null = null;
+    let bestClipPath: string | null = null;
+    let bestScore = -1;
+    let bestReason = '';
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       scene.attempts = attempt;
-      videoUrl = await klingImage2Video(keyframePath, scene.motion_prompt);
+      const videoUrl = await klingImage2Video(keyframePath, scene.motion_prompt, { durationSec });
       if (!videoUrl) {
         logger.warn(`scene ${i} attempt ${attempt}: kling returned null`);
         continue;
@@ -94,17 +101,23 @@ export async function processPremiumScenes(scenario: PremiumScenario): Promise<v
       const localClip = await downloadToTmp(videoUrl, '.mp4');
       const qa = await scoreClip(localClip, scene.motion_prompt);
       logger.info({ sceneIdx: i, attempt, score: qa.score, reason: qa.reason }, 'vision-QA verdict');
-      if (qa.good) {
-        scene.videoUrl = videoUrl;
-        lastSuccessfulClipPath = localClip;
-        break;
+      if (qa.score > bestScore) {
+        bestScore = qa.score;
+        bestUrl = videoUrl;
+        bestClipPath = localClip;
+        bestReason = qa.reason;
       }
-      videoUrl = null;
+      if (qa.good) break; // ранний выход на первом good
     }
-    if (!videoUrl) {
-      throw new EscapeHatchError(i, `scene ${i}: 3 attempts failed vision-QA`);
+    if (!bestUrl) {
+      // Только сюда попадаем если kling вернул null на ВСЕ 3 попытки (API down).
+      throw new EscapeHatchError(i, `scene ${i}: kling returned no video in ${MAX_ATTEMPTS} attempts`);
+    }
+    scene.videoUrl = bestUrl;
+    if (bestScore < 0.4) {
+      logger.warn({ sceneIdx: i, bestScore, bestReason }, 'best-of-N below threshold — using anyway');
     }
     // Для следующей kling-сцены извлечём lastFrame из этого клипа.
-    lastKlingClipPath = lastSuccessfulClipPath;
+    lastKlingClipPath = bestClipPath;
   }
 }

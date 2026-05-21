@@ -9,12 +9,18 @@ import { PremiumGenre } from '../entities/smm-scenario.entity';
 
 /**
  * Стоимость premium-режима в токенах сверх TTS-тарифа.
- * Формула: 20k базы + 80k за каждую kling-сцену. Каждый kling-клип — 5 сек.
- * Примеры: 1 сцена (5 сек) = 100k; 3 (15 сек) = 260k; 6 (30 сек) = 500k.
+ * Формула: 20k базы + 16k за КАЖДУЮ секунду kling-видео.
+ * Так 5-сек и 10-сек клипы оцениваются справедливо (10-сек = 2× стоимость по факту).
+ * Примеры:
+ *   1×5сек: 20k + 80k = 100k
+ *   1×10сек: 20k + 160k = 180k
+ *   3×10сек (30 сек ролик): 20k + 480k = 500k
+ *   6×5сек (30 сек ролик): 20k + 480k = 500k  ← одинаково
+ *   6×10сек (60 сек ролик): 20k + 960k = 980k  ← ~Pro-пакет
  */
-function premiumTokensCost(klingSceneCount: number): number {
-  const n = Math.max(1, klingSceneCount);
-  return 20_000 + 80_000 * n;
+function premiumTokensCost(totalKlingSeconds: number): number {
+  const sec = Math.max(5, totalKlingSeconds);
+  return 20_000 + 16_000 * sec;
 }
 
 export interface ApproveScenariosInput {
@@ -53,7 +59,7 @@ export class ApprovalService {
     for (const scenarioId of input.scenarioIds) {
       try {
         const scRes = await this.pg.query(
-          `SELECT id, tts_tier, status, premium_genre, kling_scene_count
+          `SELECT id, tts_tier, status, premium_genre, kling_scene_count, scenes_json
              FROM smm_scenario WHERE id = $1`, [scenarioId]);
         if (scRes.rows.length === 0) {
           result.failed.push({ scenarioId, reason: 'not_found' });
@@ -95,15 +101,21 @@ export class ApprovalService {
         const premiumGenre: PremiumGenre | null = row.premium_genre ?? null;
         const klingSceneCount: number = Number(row.kling_scene_count ?? 0);
         if (premiumGenre && klingSceneCount > 0) {
+          // Sum total kling-seconds from scenes_json (default 5 per scene if не указано).
+          const scenesArr: any[] = Array.isArray(row.scenes_json) ? row.scenes_json : [];
+          const totalKlingSec = scenesArr
+            .filter((s) => s?.type === 'kling')
+            .reduce((acc, s) => acc + (s?.duration === 10 ? 10 : 5), 0);
+          const cost = premiumTokensCost(totalKlingSec);
           try {
             await this.premiumGen.charge({
               userId: input.userId,
               videoId,
               genre: premiumGenre,
               sceneCount: klingSceneCount,
-              tokensCost: premiumTokensCost(klingSceneCount),
+              tokensCost: cost,
             });
-            this.logger.log(`Premium charge ${premiumTokensCost(klingSceneCount)} tokens for video ${videoId} (genre=${premiumGenre}, scenes=${klingSceneCount})`);
+            this.logger.log(`Premium charge ${cost} tokens for video ${videoId} (genre=${premiumGenre}, scenes=${klingSceneCount}, klingSec=${totalKlingSec})`);
           } catch (err: any) {
             // Refund TTS charge + drop video, чтобы не висело висяком
             await this.billing.refund({ videoId, reason: 'premium_charge_failed' });

@@ -182,8 +182,8 @@ export class ScenarioService {
         if (klingSceneCount < 1) {
           throw new Error(`Claude returned no kling scenes for premium mode (genre="${premiumGenre}")`);
         }
-        if (klingSceneCount > 12) {
-          throw new Error(`Claude returned ${klingSceneCount} kling scenes — max 12 (60-сек ролик)`);
+        if (klingSceneCount > 6) {
+          throw new Error(`Claude returned ${klingSceneCount} kling scenes — max 6 (cost-контроль)`);
         }
       }
 

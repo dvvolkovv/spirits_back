@@ -245,8 +245,8 @@ export class ScenariosController {
             throw new BadRequestException('scene duration must be a positive number');
           }
         }
-        if (klingCount > 12) {
-          throw new BadRequestException('cannot have more than 12 kling scenes per scenario (max 60-сек ролик)');
+        if (klingCount > 6) {
+          throw new BadRequestException('cannot have more than 6 kling scenes per scenario (cost-контроль)');
         }
         sets.push(`scenes_json = $${i++}::jsonb`); vals.push(JSON.stringify(body.scenes));
         sets.push(`kling_scene_count = $${i++}`); vals.push(klingCount);

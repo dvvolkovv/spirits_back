@@ -51,6 +51,44 @@ export class VideosController {
     return rowToVideo(r.rows[0]);
   }
 
+  /**
+   * Список всех видео, принадлежащих текущему юзеру (через campaign.user_id).
+   * Возвращает готовые/неготовые, отсортировано по created_at DESC. Лимит 100.
+   * Включаем title из сценария и premium_genre для UI-бейджа.
+   */
+  @Get()
+  async listMine(@Req() req: any) {
+    if (!req.user?.phone) {
+      throw new ForbiddenException('not authenticated');
+    }
+    const r = await this.pg.query(
+      `SELECT v.id, v.status, v.mp4_url, v.duration_sec, v.size_bytes,
+              v.tokens_charged, v.created_at, v.updated_at,
+              s.title, s.assistant_role, s.mood, s.premium_genre
+         FROM smm_video v
+         JOIN smm_scenario s ON s.id = v.scenario_id
+         JOIN smm_campaign c ON c.id = s.campaign_id
+        WHERE c.user_id = $1
+        ORDER BY v.created_at DESC
+        LIMIT 100`,
+      [req.user.phone],
+    );
+    return r.rows.map((row: any) => ({
+      id: row.id,
+      status: row.status,
+      mp4Url: row.mp4_url,
+      durationSec: row.duration_sec,
+      sizeBytes: row.size_bytes,
+      tokensCharged: Number(row.tokens_charged ?? 0),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      title: row.title,
+      assistantRole: row.assistant_role,
+      mood: row.mood,
+      premiumGenre: row.premium_genre,
+    }));
+  }
+
   @Post(':id/approve')
   async approve(@Req() req: any, @Param('id') id: string) {
     await this.assertCanAccessVideo(id, req);
