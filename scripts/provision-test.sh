@@ -259,6 +259,74 @@ REMOTE
   green "  ✓ сервисы настроены"
 }
 
+clone_repos() {
+  bold "[7/N] Клонирование репозиториев"
+  ssh_test 'bash -s' <<'REMOTE'
+set -e
+cd ~
+if [ ! -d spirits_back ]; then
+  git clone git@github.com:dvvolkovv/spirits_back.git
+fi
+cd spirits_back && git fetch origin && git checkout b2b && git reset --hard origin/b2b && cd ..
+
+if [ ! -d spirits_front_src ]; then
+  git clone git@github.com:dvvolkovv/spirits.git spirits_front_src
+fi
+cd spirits_front_src && git fetch origin && git checkout b2b && git reset --hard origin/b2b && cd ..
+
+mkdir -p ~/spirits_front
+REMOTE
+  green "  ✓ репозитории склонированы"
+}
+
+write_env_files() {
+  bold "[8/N] .env файлы для back и front"
+  # shellcheck disable=SC1090
+  . "$LOCAL_ENV_FILE"
+
+  ssh_test "bash -s" <<REMOTE
+set -e
+cat > ~/spirits_back/.env <<EOF
+NODE_ENV=production
+PORT=3001
+DEBUG_SMS_CODES=true
+
+SMSAERO_LOGIN=
+SMSAERO_API_KEY=
+YOOKASSA_SHOP_ID=
+YOOKASSA_SECRET_KEY=
+
+JWT_ACCESS_SECRET=$JWT_ACCESS_SECRET
+JWT_REFRESH_SECRET=$JWT_REFRESH_SECRET
+
+POSTGRES_HOST=127.0.0.1
+POSTGRES_PORT=5432
+POSTGRES_DB=linkeon
+POSTGRES_USER=linkeon
+POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+
+NEO4J_URI=bolt://127.0.0.1:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=$NEO4J_PASSWORD
+
+MINIO_ENDPOINT=http://127.0.0.1:9000
+MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY
+MINIO_SECRET_KEY=$MINIO_SECRET_KEY
+MINIO_PUBLIC_URL=https://$TEST_DOMAIN/minio
+MINIO_BUCKET_MUSIC=linkeon-smm-music
+EOF
+chmod 600 ~/spirits_back/.env
+
+cat > ~/spirits_front_src/.env <<EOF
+VITE_BACKEND_URL=https://$TEST_DOMAIN
+EOF
+REMOTE
+  green "  ✓ .env файлы записаны"
+}
+
 precheck_dns
 install_system_packages
 install_neo4j
@@ -266,5 +334,7 @@ install_minio
 install_node_stack
 generate_secrets
 configure_services
+clone_repos
+write_env_files
 echo
 echo "TODO: остальные шаги provisioning'а добавим в следующих задачах."
