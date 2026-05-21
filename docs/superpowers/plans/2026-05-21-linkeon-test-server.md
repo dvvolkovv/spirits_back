@@ -91,14 +91,25 @@ DNS-запись A на `85.192.61.231` создаётся вручную в DNS
   
   precheck_dns() {
     bold "[0/N] Проверяю DNS"
-    local resolved
-    resolved=$(dig +short "$TEST_DOMAIN" @1.1.1.1 | tail -1)
-    if [[ "$resolved" != "85.192.61.231" ]]; then
-      red "  DNS $TEST_DOMAIN резолвится в '$resolved', ожидаю 85.192.61.231"
+    # Пробуем несколько resolver'ов — propagation между ними может занять минуты.
+    # Достаточно, чтобы хоть один ответил правильным IP.
+    local resolvers=("" "@1.1.1.1" "@8.8.8.8")
+    local ok=""
+    for r in "${resolvers[@]}"; do
+      local resolved
+      # shellcheck disable=SC2086
+      resolved=$(dig +short "$TEST_DOMAIN" $r 2>/dev/null | tail -1)
+      if [[ "$resolved" == "85.192.61.231" ]]; then
+        ok="${r:-system}"
+        break
+      fi
+    done
+    if [[ -z "$ok" ]]; then
+      red "  DNS $TEST_DOMAIN не резолвится в 85.192.61.231 ни через system, ни через 1.1.1.1/8.8.8.8"
       red "  Проверь DNS-запись и подожди ~5 минут перед повтором."
       exit 1
     fi
-    green "  ✓ DNS ок"
+    green "  ✓ DNS ок (через $ok)"
   }
   
   precheck_dns
