@@ -47,7 +47,7 @@ export function startRenderWorker(): Worker<RenderJobPayload> {
     {
       connection: redisConn(),
       concurrency: 2,                // 2 parallel renders (Chromium-bound)
-      lockDuration: 20 * 60 * 1000,  // 20 min — Remotion + potential Kling fallback (~4 min/clip)
+      lockDuration: 60 * 60 * 1000,  // 60 min — premium mode может делать 6-12 kling-клипов последовательно (~3 мин каждый)
     },
   );
 
