@@ -54,8 +54,10 @@ red()   { printf "\033[31m%s\033[0m\n" "$1"; }
 
 # Wrap ssh — server's pnpm/node may not be in default non-login PATH.
 # Uses $HOST and $PATH_EXPORT set by run_phase().
+# PATH_EXPORT may contain a glob (e.g. .nvm/versions/node/v22*/bin) — use
+# $(echo ...) on the remote to expand it before adding to PATH.
 ssh_remote() {
-  ssh "$HOST" "export PATH=$PATH_EXPORT:\$HOME/.npm-global/bin:\$PATH; $*"
+  ssh "$HOST" "export PATH=\$(echo $PATH_EXPORT):\$HOME/.npm-global/bin:\$PATH; $*"
 }
 
 push_local_repo() {
@@ -169,7 +171,9 @@ run_phase() {
   fi
 
   # Smoke
-  local skip_var="SKIP_${phase^^}_SMOKE"  # SKIP_TEST_SMOKE / SKIP_PROD_SMOKE
+  local phase_upper
+  phase_upper="$(echo "$phase" | tr '[:lower:]' '[:upper:]')"
+  local skip_var="SKIP_${phase_upper}_SMOKE"  # SKIP_TEST_SMOKE / SKIP_PROD_SMOKE
   if [[ -z "${SKIP_SMOKE:-}" && -z "${!skip_var:-}" ]]; then
     bold "=== SMOKE ($ENV_NAME) ==="
     cd "$LOCAL_BACK_DIR/tests"
