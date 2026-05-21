@@ -50,7 +50,7 @@
 /home/dv/spirits_back/         git репо backend (origin = spirits_back, branch b2b)
 /home/dv/spirits_front_src/    git репо frontend (origin = spirits, branch b2b)
 /home/dv/spirits_front/        dist фронта, отдаётся Nginx
-/home/dv/minio-data/           MinIO storage
+/var/lib/minio-data/           MinIO storage (system path — /home/dv 750 не пускает minio user)
 /etc/nginx/sites-enabled/test.linkeon.io
 /etc/nginx/.htpasswd-test
 ```
