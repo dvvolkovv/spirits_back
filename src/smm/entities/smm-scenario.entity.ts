@@ -7,6 +7,8 @@ export type SmmTtsTier = 'economy' | 'premium';
 export type SmmScenarioStatus =
   | 'pending_review' | 'approved' | 'rejected' | 'regenerating';
 
+export type PremiumGenre = 'surreal' | 'pov' | 'cinematic';
+
 export interface SmmDialogTurn {
   speaker: 'hero' | 'assistant';
   text: string;
@@ -34,6 +36,8 @@ export interface SmmScenario {
   status: SmmScenarioStatus;
   createdAt: Date;
   updatedAt: Date;
+  premiumGenre: PremiumGenre | null;
+  klingSceneCount: number;
 }
 
 export function rowToScenario(row: any): SmmScenario {
@@ -51,5 +55,7 @@ export function rowToScenario(row: any): SmmScenario {
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    premiumGenre: row.premium_genre ?? null,
+    klingSceneCount: row.kling_scene_count ?? 0,
   };
 }
