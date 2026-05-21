@@ -29,13 +29,6 @@ const { execSync } = require('child_process');
 const BASE_URL = process.env.BASE_URL || 'https://my.linkeon.io';
 const TEST_PHONE = process.env.TEST_PHONE || '70000000000';
 
-// Basic Auth for test-server (test.linkeon.io).
-// On prod BASIC_AUTH is empty/unset — nothing changes.
-if (process.env.BASIC_AUTH) {
-  const [username, ...passParts] = process.env.BASIC_AUTH.split(':');
-  axios.defaults.auth = { username, password: passParts.join(':') };
-}
-
 // DB check runs via SSH+psql on the prod server (PG listens on loopback only).
 // Override SSH_TARGET if running from another host or in CI.
 const SSH_TARGET = process.env.SSH_TARGET || 'dvolkov@212.113.106.202';

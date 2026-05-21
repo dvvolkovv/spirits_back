@@ -149,6 +149,7 @@ run_phase() {
       BASE_URL="$TEST_BASE_URL"
       BASIC_AUTH="${TEST_BASIC_AUTH:-}"
       SSH_TARGET="$TEST_HOST"
+      PG_DSN="${TEST_PG_DSN:-}"
       ;;
     prod)
       ENV_NAME=prod
@@ -160,9 +161,10 @@ run_phase() {
       BASE_URL="${PROD_BASE_URL:-https://my.linkeon.io}"
       BASIC_AUTH=
       SSH_TARGET="$PROD_HOST"
+      PG_DSN=  # smoke.js имеет default для прода
       ;;
   esac
-  export ENV_NAME HOST PATH_EXPORT BACK_PATH FRONT_SRC FRONT_SERVED BASE_URL BASIC_AUTH BRANCH SSH_TARGET
+  export ENV_NAME HOST PATH_EXPORT BACK_PATH FRONT_SRC FRONT_SERVED BASE_URL BASIC_AUTH BRANCH SSH_TARGET PG_DSN
 
   if [[ -z "${SMOKE_ONLY:-}" ]]; then
     if [[ -z "${FRONT_ONLY:-}" ]]; then deploy_backend;  fi
@@ -178,7 +180,7 @@ run_phase() {
   if [[ -z "${SKIP_SMOKE:-}" && -z "${!skip_var:-}" ]]; then
     bold "=== SMOKE ($ENV_NAME) ==="
     cd "$LOCAL_BACK_DIR/tests"
-    if BASE_URL="$BASE_URL" BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" bash smoke/run.sh; then
+    if BASE_URL="$BASE_URL" BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" PG_DSN="$PG_DSN" bash smoke/run.sh; then
       green "  ✓ SMOKE GREEN ($ENV_NAME)"
     else
       red "  ✗ SMOKE FAILED ($ENV_NAME)"

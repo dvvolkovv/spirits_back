@@ -161,6 +161,7 @@ TEST_FRONT_SRC=/home/$TEST_USER/spirits_front_src
 TEST_FRONT_SERVED=/home/$TEST_USER/spirits_front
 TEST_BASE_URL=https://$TEST_DOMAIN
 TEST_BASIC_AUTH=linkeon:$basic_pass
+TEST_PG_DSN=postgresql://linkeon:$pg_pass@127.0.0.1:5432/linkeon
 
 # Backend .env values (для отладки/восстановления)
 POSTGRES_PASSWORD=$pg_pass
@@ -478,6 +479,34 @@ REMOTE
   green "  ✓ initial build + PM2 готовы"
 }
 
+seed_minio_assets() {
+  bold "[11/N] MinIO bucket linkeon-assets + agent avatars из прода"
+  # shellcheck disable=SC1090
+  . "$LOCAL_ENV_FILE"
+
+  # mc клиент (на test)
+  ssh_test 'command -v mc >/dev/null || (sudo wget -qO /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc && sudo chmod +x /usr/local/bin/mc); mc --version | head -1 >/dev/null'
+  ssh_test "mc alias set local http://127.0.0.1:9000 '$MINIO_ACCESS_KEY' '$MINIO_SECRET_KEY' 2>&1 | tail -1"
+
+  # Создать bucket + public-read (idempotent)
+  ssh_test 'mc mb local/linkeon-assets 2>&1 | tail -1 | grep -vqE "already (exists|owned)" && echo created || echo "(bucket exists)"; mc anonymous set download local/linkeon-assets 2>&1 | tail -1'
+
+  # Залить аватарки агентов из прода (через публичный URL, без прямого MinIO-доступа на проде)
+  local n_uploaded=0
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  trap "rm -rf $tmpdir" RETURN
+  for i in $(seq 1 30); do
+    if curl -sf "https://my.linkeon.io/smm-media/linkeon-assets/avatars/agents/$i.jpg" -o "$tmpdir/$i.jpg" 2>/dev/null; then
+      n_uploaded=$((n_uploaded + 1))
+    fi
+  done
+  if [[ $n_uploaded -gt 0 ]]; then
+    tar czf - -C "$tmpdir" . | ssh_test "mkdir -p /tmp/avatars-stage && tar xzf - -C /tmp/avatars-stage && for f in /tmp/avatars-stage/*.jpg; do mc cp \"\$f\" \"local/linkeon-assets/avatars/agents/\$(basename \$f)\" >/dev/null 2>&1; done; rm -rf /tmp/avatars-stage; mc ls local/linkeon-assets/avatars/agents/ | wc -l"
+  fi
+  green "  ✓ MinIO bucket + $n_uploaded аватарок"
+}
+
 precheck_dns
 install_system_packages
 install_neo4j
@@ -489,6 +518,7 @@ clone_repos
 write_env_files
 setup_nginx_and_tls
 initial_build_and_pm2
+seed_minio_assets
 echo
 green "═══════════════════════════════════════════════════════════════"
 green "  ✓ test.linkeon.io готов"

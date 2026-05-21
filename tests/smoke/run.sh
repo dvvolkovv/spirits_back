@@ -17,6 +17,7 @@ BASE_URL="${BASE_URL:-https://my.linkeon.io}"
 TEST_PHONE="${TEST_PHONE:-70000000000}"
 BASIC_AUTH="${BASIC_AUTH:-}"
 SSH_TARGET="${SSH_TARGET:-dvolkov@212.113.106.202}"
+PG_DSN="${PG_DSN:-}"
 
 print_header() {
   echo
@@ -38,7 +39,7 @@ fi
 if [[ "$LAYER" == "api" || "$LAYER" == "all" ]]; then
   print_header "LAYER 2/3 — API + DB smoke (Node)"
   if ! BASE_URL="$BASE_URL" TEST_PHONE="$TEST_PHONE" \
-       BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" \
+       BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" PG_DSN="$PG_DSN" \
        node smoke/smoke.js; then
     echo "  ✗ api/db failed"
     FAILED=1
