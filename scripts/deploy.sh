@@ -1,37 +1,38 @@
 #!/usr/bin/env bash
-# Git-based deploy for my.linkeon.io — двухфазный пайплайн: test → smoke → prod → smoke.
+# Двухфазный деплой my.linkeon.io.
 #
-# Prerequisites (one-time setup):
-#   - /home/dvolkov/spirits_back is a git repo with origin = git@github.com:dvvolkovv/spirits_back.git
-#   - /home/dvolkov/spirits_front_src is a git repo with origin = git@github.com:dvvolkovv/spirits.git
-#   - Prod's id_rsa.pub is registered as a Deploy Key in both GitHub repos (read access)
-#   - /home/dvolkov/spirits_front/ is the nginx-served dist (output of front build)
-#   - pnpm installed via ~/.npm-global (PATH set in ~/.bashrc)
+# PHASE 1 (test):  push origin → ssh test → git pull → build → pm2 restart → smoke
+# PHASE 2 (prod):  то же на проде. Запускается ТОЛЬКО если PHASE 1 зелёная.
 #
-# This script:
-#   1. Pushes any local changes (so server can pull them)
-#   2. Backend: ssh → git pull → npm ci → npm run build → pm2 restart
-#   3. Frontend: ssh → git pull source → pnpm install → pnpm build → rsync to served dir
-#   4. Wait for health endpoint
-#   5. Run smoke pipeline (unit + api + browser)
-#   Repeats for both TEST and PROD phases.
+# Креды test-сервера лежат в scripts/test-server.env.local (gitignored,
+# создаётся scripts/provision-test.sh — там же установка всего стека на test).
 #
-# Why git-based: rsync --delete had been wiping .env, public/agent-avatars/
-# and other untracked-on-local files. Git-pull only updates tracked files;
-# .env and public/ stay untouched on server permanently.
+# Prerequisites (one-time, для test делает provision-test.sh; для прода — вручную):
+#   - на сервере git-репо $BACK_PATH (origin=spirits_back) и $FRONT_SRC (origin=spirits)
+#   - server's pubkey зарегистрирован как Deploy Key в обоих GitHub-репо (read-only)
+#   - $FRONT_SERVED — отдельная папка под Nginx, туда rsync'ается dist/
+#   - node+pm2 установлены (на проде — ~/.npm-global; на тесте — nvm)
 #
-# Env overrides:
-#   PROD_HOST     dvolkov@212.113.106.202
-#   BRANCH        b2b
-#   SKIP_BUILD    set to 1 to skip build steps (e.g., only sync code + restart)
-#   SKIP_SMOKE    set to 1 to skip all smoke
-#   SKIP_TEST_SMOKE  set to 1 to skip smoke after test phase
-#   SKIP_PROD_SMOKE  set to 1 to skip smoke after prod phase
-#   SMOKE_ONLY    set to 1 to skip deploy and just run smoke (both phases)
-#   FRONT_ONLY    set to 1 to deploy frontend only
-#   BACK_ONLY     set to 1 to deploy backend only
-#   TEST_ONLY     set to 1 to deploy test phase only (skip prod)
-#   PROD_ONLY     set to 1 to deploy prod phase only (skip test)
+# Env флаги:
+#   TEST_ONLY=1        — только PHASE 1
+#   PROD_ONLY=1        — только PHASE 2 (hotfix в обход test, использовать осторожно)
+#   FRONT_ONLY=1       — пропустить backend в обеих фазах
+#   BACK_ONLY=1        — пропустить frontend в обеих фазах
+#   SKIP_SMOKE=1       — пропустить обе smoke-проверки
+#   SKIP_TEST_SMOKE=1  — задеплоить на test без smoke (потом обычный прод-деплой + его smoke)
+#   SKIP_PROD_SMOKE=1  — на проде задеплоить без smoke
+#   SMOKE_ONLY=1       — пропустить деплой, гонять только smoke текущей фазы
+#
+# Прод-настройки (можно переопределить через env):
+#   PROD_HOST          dvolkov@212.113.106.202
+#   PROD_BACK_PATH     /home/dvolkov/spirits_back
+#   PROD_FRONT_SRC     /home/dvolkov/spirits_front_src
+#   PROD_FRONT_SERVED  /home/dvolkov/spirits_front
+#   PROD_BASE_URL      https://my.linkeon.io
+#   BRANCH             b2b
+#
+# Why git-based (не rsync): --delete сносил .env, public/agent-avatars/
+# и другие untracked-локально файлы. Git-pull обновляет только трекаемое.
 
 set -uo pipefail
 
