@@ -2,11 +2,13 @@
 // Minimal Kling text2video wrapper for SMM b-roll fallback when Pexels finds nothing.
 // Polls the task ~3 min max. Returns mp4 URL or null on failure/timeout.
 import axios from 'axios';
+import * as fs from 'fs/promises';
 import * as jwt from 'jsonwebtoken';
 import { logger } from '../logger';
 
 const POLL_INTERVAL_MS = 8_000;
 const POLL_MAX_ATTEMPTS = 30;   // 30 × 8s ≈ 4 minutes max wait
+const KLING_PREMIUM_MODEL = 'kling-v2-master';
 
 function getKlingToken(): string | null {
   const ak = process.env.KLING_ACCESS_KEY;
@@ -97,5 +99,63 @@ export async function klingText2Video(prompt: string): Promise<string | null> {
   }
 
   logger.warn({ taskId }, `Kling text2video timeout after ${POLL_MAX_ATTEMPTS * POLL_INTERVAL_MS / 1000}s`);
+  return null;
+}
+
+export async function klingImage2Video(
+  keyframePath: string,
+  motionPrompt: string,
+  opts: { durationSec?: number } = {},
+): Promise<string | null> {
+  const token = getKlingToken();
+  if (!token) { logger.warn('Kling credentials not set'); return null; }
+
+  const imgB64 = (await fs.readFile(keyframePath)).toString('base64');
+  const duration = String(opts.durationSec ?? 5);
+
+  let taskId: string;
+  try {
+    const resp = await axios.post(
+      'https://api.klingai.com/v1/videos/image2video',
+      {
+        model_name: KLING_PREMIUM_MODEL,
+        image: imgB64,
+        prompt: motionPrompt,
+        cfg_scale: 0.5,
+        mode: 'std',
+        duration,
+      },
+      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 30_000, validateStatus: () => true },
+    );
+    if (resp.status !== 200 || resp.data?.code !== 0) {
+      logger.error({ status: resp.status, body: JSON.stringify(resp.data).slice(0, 300) }, 'Kling image2video create failed');
+      return null;
+    }
+    taskId = resp.data?.data?.task_id;
+    if (!taskId) return null;
+  } catch (e: any) { logger.error(`Kling image2video create error: ${e.message}`); return null; }
+
+  for (let i = 0; i < POLL_MAX_ATTEMPTS; i++) {
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    try {
+      const t = getKlingToken();
+      if (!t) return null;
+      const resp = await axios.get(
+        `https://api.klingai.com/v1/videos/image2video/${taskId}`,
+        { headers: { Authorization: `Bearer ${t}` }, timeout: 30_000, validateStatus: () => true },
+      );
+      const status = (resp.data?.data?.task_status as string | undefined)?.toLowerCase();
+      if (status === 'succeed') {
+        const url = resp.data?.data?.task_result?.videos?.[0]?.url;
+        if (url) { logger.info({ taskId, url }, 'Kling image2video done'); return url as string; }
+        return null;
+      }
+      if (status === 'failed') {
+        logger.warn({ taskId, msg: resp.data?.data?.task_status_msg }, 'Kling image2video failed');
+        return null;
+      }
+    } catch (e: any) { logger.warn(`Kling image2video poll error: ${e.message}`); }
+  }
+  logger.warn({ taskId }, `Kling image2video timeout`);
   return null;
 }
