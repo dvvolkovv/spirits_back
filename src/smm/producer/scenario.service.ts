@@ -12,7 +12,10 @@ import {
   SmmBrollPrompt,
   SmmMood,
   SmmTtsTier,
+  PremiumGenre,
+  PremiumScene,
 } from '../entities/smm-scenario.entity';
+import { buildPremiumPromptSection } from './smm-producer.prompt';
 
 export type SourceMode = 'auto' | 'topic' | 'trends';
 
@@ -22,6 +25,7 @@ export interface GenerateInput {
   count: number;
   topic?: string | null;
   trendsContext?: string;
+  premiumGenre?: PremiumGenre | null;
 }
 
 type AssistantRoleId =
@@ -35,6 +39,7 @@ interface ClaudeScenarioJson {
   mood: SmmMood;
   dialog: Array<{ speaker: 'hero' | 'assistant'; text: string; t_start: number; t_end: number }>;
   broll_prompts: Array<{ at_sec: number; type: 'ai_image' | 'stock_video'; prompt: string }>;
+  scenes?: PremiumScene[];
 }
 
 const SYSTEM_PROMPT = `Ты — креативный сценарист коротких видео для Linkeon (платформа из 14 AI-ассистентов).
@@ -127,9 +132,12 @@ export class ScenarioService {
 
   async generate(input: GenerateInput): Promise<string[]> {
     const userMsg = this.buildUserMsg(input);
-    this.logger.log(`Generating ${input.count} scenarios, mode=${input.mode}, topic="${input.topic ?? ''}"`);
+    const premiumGenre = input.premiumGenre ?? null;
+    this.logger.log(`Generating ${input.count} scenarios, mode=${input.mode}, topic="${input.topic ?? ''}", premiumGenre=${premiumGenre ?? 'none'}`);
 
-    const { systemPrompt, isLinkeonOfficial, creator } = await this.resolveSystemPrompt(input.campaignId, input.topic ?? null);
+    const { systemPrompt: basePrompt, isLinkeonOfficial, creator } = await this.resolveSystemPrompt(input.campaignId, input.topic ?? null);
+    const premiumSection = buildPremiumPromptSection(premiumGenre);
+    const systemPrompt = premiumSection ? basePrompt + '\n\n' + premiumSection : basePrompt;
 
     const text = (await this.claudeCli.text(userMsg, {
       system: systemPrompt,
@@ -161,16 +169,35 @@ export class ScenarioService {
       const role = isLinkeonOfficial ? s.assistant_role : 'expert';
       const ttsVoiceId = isLinkeonOfficial ? null : pickRandomVoice(creator!.voiceGender);
 
+      // Premium-mode: validate and extract scenes
+      let scenes: PremiumScene[] | null = null;
+      let klingSceneCount = 0;
+      if (premiumGenre) {
+        const rawScenes = s.scenes;
+        if (!Array.isArray(rawScenes) || rawScenes.length === 0) {
+          throw new Error(`Claude returned no scenes array for premium genre "${premiumGenre}"`);
+        }
+        scenes = rawScenes as PremiumScene[];
+        klingSceneCount = scenes.filter((sc) => sc.type === 'kling').length;
+        if (klingSceneCount < 1 || klingSceneCount > 2) {
+          throw new Error(`Claude returned invalid kling_scene_count for premium mode: ${klingSceneCount}`);
+        }
+      }
+
       const r = await this.pg.query(
         `INSERT INTO smm_scenario
-           (campaign_id, title, assistant_role, dialog, mood, broll_prompts, tts_tier, status, tts_voice_id)
-         VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, 'pending_review', $8)
+           (campaign_id, title, assistant_role, dialog, mood, broll_prompts, tts_tier, status, tts_voice_id,
+            premium_genre, kling_scene_count, scenes_json)
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, 'pending_review', $8, $9, $10, $11::jsonb)
          RETURNING id`,
         [
           input.campaignId, s.title, role,
           JSON.stringify(dialog), s.mood,
           JSON.stringify(brollPrompts), ttsTier,
           ttsVoiceId,
+          premiumGenre,
+          klingSceneCount,
+          scenes !== null ? JSON.stringify(scenes) : null,
         ],
       );
       ids.push(r.rows[0].id);

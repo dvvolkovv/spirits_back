@@ -22,6 +22,14 @@ export interface SmmBrollPrompt {
   prompt: string;
 }
 
+export interface PremiumScene {
+  type: 'kling' | 'imagen';
+  keyframe_prompt?: string;
+  motion_prompt?: string;
+  image_prompt?: string;
+  duration?: number;
+}
+
 export interface SmmScenario {
   id: string;
   campaignId: string;
@@ -38,6 +46,7 @@ export interface SmmScenario {
   updatedAt: Date;
   premiumGenre: PremiumGenre | null;
   klingSceneCount: number;
+  scenes: PremiumScene[] | null;
 }
 
 export function rowToScenario(row: any): SmmScenario {
@@ -57,5 +66,6 @@ export function rowToScenario(row: any): SmmScenario {
     updatedAt: row.updated_at,
     premiumGenre: row.premium_genre ?? null,
     klingSceneCount: row.kling_scene_count ?? 0,
+    scenes: row.scenes_json ?? null,
   };
 }

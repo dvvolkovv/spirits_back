@@ -15,4 +15,5 @@ module.exports = {
   ...require('./producer-tools.integration.test'),
   ...require('./time-parser.unit.test'),
   ...require('./premium-billing.integration.test'),
+  ...require('./premium-prompt.unit.test'),
 };
