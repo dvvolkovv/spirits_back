@@ -2,6 +2,14 @@
 -- Core database schema for Linkeon backend.
 -- Creates fundamental tables that exist on prod but have no prior migration.
 -- Idempotent (all CREATE ... IF NOT EXISTS).
+--
+-- ⚠️  TODO/WARNING — НЕ ВЕРИФИЦИРОВАНО ПРОТИВ PROD-СХЕМЫ.
+-- Этот файл создан 2026-05-21 субагентом по reverse-engineering'у кода
+-- (а не дампом из живой prod-БД). CREATE TABLE IF NOT EXISTS гарантирует,
+-- что миграция не упадёт на prod если таблицы уже есть — НО разница в
+-- колонках/типах/индексах не будет обнаружена. Перед тем как запускать
+-- `npm run migrate` на prod, выполнить `pg_dump --schema-only` с prod и
+-- сравнить с этим файлом. Сейчас deploy.sh миграции на проде не дёргает.
 
 -- Enums -----------------------------------------------------------------------
 DO $$ BEGIN
