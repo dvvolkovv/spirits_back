@@ -74,7 +74,7 @@ export class SmmProducerToolsService {
   }
 
   private async generateScenarios(
-    input: { mode: SourceMode; count: number; topic?: string },
+    input: { mode: SourceMode; count: number; topic?: string; premium_genre?: 'surreal' | 'pov' | 'cinematic' | null },
     ctx: ToolContext,
   ): Promise<{ campaignId: string; scenarios: Array<{ id: string; title: string }> }> {
     // 1. Resolve campaign — reuse draft from set_creator_campaign_settings if any.
@@ -98,12 +98,14 @@ export class SmmProducerToolsService {
     }
 
     // 3. Generate
+    const premiumGenre = ctx.isAdmin ? (input.premium_genre ?? null) : null;
     const ids = await this.scenario.generate({
       campaignId,
       mode: input.mode,
       count: input.count,
       topic: input.topic ?? null,
       trendsContext,
+      premiumGenre,
     });
 
     // 4. Return id+title for each

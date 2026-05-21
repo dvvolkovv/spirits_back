@@ -154,8 +154,17 @@ export class ScenariosController {
       assistant_role?: string;
       dialog?: Array<{ speaker: 'hero' | 'assistant'; text: string; tStart: number; tEnd: number }>;
       broll_prompts?: Array<{ atSec: number; type: 'ai_image' | 'stock_video'; prompt: string }>;
+      premiumGenre?: 'surreal' | 'pov' | 'cinematic' | null;
     },
   ) {
+    if (body.premiumGenre !== undefined && body.premiumGenre !== null) {
+      if (!['surreal', 'pov', 'cinematic'].includes(body.premiumGenre)) {
+        throw new BadRequestException('premiumGenre must be surreal|pov|cinematic|null');
+      }
+      if (!req.user?.isAdmin) {
+        throw new ForbiddenException('premium mode is admin-only during Phase 1');
+      }
+    }
     await this.assertCanAccessScenario(id, req);
     const existing = await this.pg.query(`SELECT id FROM smm_scenario WHERE id = $1`, [id]);
     if (existing.rows.length === 0) throw new NotFoundException(`scenario ${id} not found`);
@@ -193,6 +202,10 @@ export class ScenariosController {
         if (typeof b.prompt !== 'string' || !b.prompt.trim()) throw new BadRequestException('broll prompt required');
       }
       sets.push(`broll_prompts = $${i++}::jsonb`); vals.push(JSON.stringify(body.broll_prompts));
+    }
+    if (body.premiumGenre !== undefined) {
+      // null is allowed (clears premium mode); non-null values already validated above
+      sets.push(`premium_genre = $${i++}`); vals.push(body.premiumGenre ?? null);
     }
     if (sets.length === 0) {
       return { ok: true, updated: 0 };
