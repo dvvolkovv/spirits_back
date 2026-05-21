@@ -155,6 +155,13 @@ export class ScenariosController {
       dialog?: Array<{ speaker: 'hero' | 'assistant'; text: string; tStart: number; tEnd: number }>;
       broll_prompts?: Array<{ atSec: number; type: 'ai_image' | 'stock_video'; prompt: string }>;
       premiumGenre?: 'surreal' | 'pov' | 'cinematic' | null;
+      scenes?: Array<{
+        type: 'kling' | 'imagen';
+        keyframe_prompt?: string;
+        motion_prompt?: string;
+        image_prompt?: string;
+        duration?: number;
+      }> | null;
     },
   ) {
     if (body.premiumGenre !== undefined && body.premiumGenre !== null) {
@@ -206,6 +213,48 @@ export class ScenariosController {
     if (body.premiumGenre !== undefined) {
       // null is allowed (clears premium mode); non-null values already validated above
       sets.push(`premium_genre = $${i++}`); vals.push(body.premiumGenre ?? null);
+    }
+    if (body.scenes !== undefined) {
+      // Только админы могут писать scenes (premium-режим Phase 1).
+      if (!req.user?.isAdmin) {
+        throw new ForbiddenException('editing premium scenes is admin-only during Phase 1');
+      }
+      if (body.scenes !== null) {
+        if (!Array.isArray(body.scenes) || body.scenes.length === 0) {
+          throw new BadRequestException('scenes must be a non-empty array or null');
+        }
+        let klingCount = 0;
+        for (const s of body.scenes) {
+          if (!['kling', 'imagen'].includes(s.type)) {
+            throw new BadRequestException(`scene type must be 'kling' or 'imagen'`);
+          }
+          if (s.type === 'kling') {
+            if (typeof s.keyframe_prompt !== 'string' || !s.keyframe_prompt.trim()) {
+              throw new BadRequestException('kling scene requires keyframe_prompt');
+            }
+            if (typeof s.motion_prompt !== 'string' || !s.motion_prompt.trim()) {
+              throw new BadRequestException('kling scene requires motion_prompt');
+            }
+            klingCount++;
+          } else {
+            if (typeof s.image_prompt !== 'string' || !s.image_prompt.trim()) {
+              throw new BadRequestException('imagen scene requires image_prompt');
+            }
+          }
+          if (s.duration !== undefined && (typeof s.duration !== 'number' || s.duration <= 0)) {
+            throw new BadRequestException('scene duration must be a positive number');
+          }
+        }
+        if (klingCount > 2) {
+          throw new BadRequestException('cannot have more than 2 kling scenes per scenario');
+        }
+        sets.push(`scenes_json = $${i++}::jsonb`); vals.push(JSON.stringify(body.scenes));
+        sets.push(`kling_scene_count = $${i++}`); vals.push(klingCount);
+      } else {
+        // null = clear premium scenes
+        sets.push(`scenes_json = NULL`);
+        sets.push(`kling_scene_count = 0`);
+      }
     }
     if (sets.length === 0) {
       return { ok: true, updated: 0 };
