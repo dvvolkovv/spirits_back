@@ -47,6 +47,24 @@ REMOTE
   green "  ✓ system packages установлены"
 }
 
+install_neo4j() {
+  bold "[2/N] Neo4j 5 community"
+  ssh_test 'sudo bash -s' <<'REMOTE'
+set -e
+if command -v neo4j >/dev/null 2>&1; then
+  echo "  neo4j уже установлен"
+  exit 0
+fi
+export DEBIAN_FRONTEND=noninteractive
+curl -fsSL https://debian.neo4j.com/neotechnology.gpg.key | gpg --dearmor -o /usr/share/keyrings/neo4j.gpg
+echo "deb [signed-by=/usr/share/keyrings/neo4j.gpg] https://debian.neo4j.com stable 5" > /etc/apt/sources.list.d/neo4j.list
+apt-get update -qq
+apt-get install -y -qq neo4j
+systemctl enable --now neo4j
+REMOTE
+  green "  ✓ neo4j установлен"
+}
+
 precheck_dns() {
   bold "[0/N] Проверяю DNS"
   # Пробуем несколько resolver'ов — propagation между ними может занять минуты.
@@ -72,5 +90,6 @@ precheck_dns() {
 
 precheck_dns
 install_system_packages
+install_neo4j
 echo
 echo "TODO: остальные шаги provisioning'а добавим в следующих задачах."
