@@ -307,6 +307,9 @@ POSTGRES_PASSWORD=$POSTGRES_PASSWORD
 
 REDIS_HOST=127.0.0.1
 REDIS_PORT=6379
+REDIS_URL=redis://127.0.0.1:6379
+
+DATABASE_URL=postgresql://linkeon:$POSTGRES_PASSWORD@127.0.0.1:5432/linkeon
 
 NEO4J_URI=bolt://127.0.0.1:7687
 NEO4J_USER=neo4j
@@ -416,6 +419,53 @@ REMOTE
   green "  ✓ Nginx + TLS + BasicAuth настроены"
 }
 
+initial_build_and_pm2() {
+  bold "[10/N] Первая сборка back + front, запуск PM2"
+  ssh_test 'bash -s' <<'REMOTE'
+set -e
+export NVM_DIR="$HOME/.nvm"
+. "$NVM_DIR/nvm.sh"
+
+cd ~/spirits_back
+npm ci --no-audit --no-fund 2>&1 | tail -3
+npm run build 2>&1 | tail -3
+set -a; . .env; set +a; npm run migrate 2>&1
+
+if pm2 describe linkeon-api >/dev/null 2>&1; then
+  pm2 restart linkeon-api
+else
+  pm2 start dist/main.js --name linkeon-api --time
+fi
+
+if [ -d worker ]; then
+  cd worker
+  npm ci --no-audit --no-fund 2>&1 | tail -3
+  npm run build 2>&1 | tail -3
+  if pm2 describe linkeon-smm-worker >/dev/null 2>&1; then
+    pm2 restart linkeon-smm-worker
+  else
+    pm2 start dist/index.js --name linkeon-smm-worker --time
+  fi
+  cd ..
+fi
+
+cd ~/spirits_front_src
+pnpm install --frozen-lockfile --ignore-scripts 2>&1 | tail -3
+pnpm build 2>&1 | tail -3
+rsync -az dist/ ~/spirits_front/
+
+pm2 save
+REMOTE
+
+  # pm2 startup — нужен sudo, делаем отдельно
+  ssh_test 'bash -s' <<'REMOTE'
+export NVM_DIR="$HOME/.nvm"
+. "$NVM_DIR/nvm.sh"
+sudo env PATH="$PATH:$(dirname $(which node))" pm2 startup systemd -u $USER --hp $HOME
+REMOTE
+  green "  ✓ initial build + PM2 готовы"
+}
+
 precheck_dns
 install_system_packages
 install_neo4j
@@ -426,5 +476,11 @@ configure_services
 clone_repos
 write_env_files
 setup_nginx_and_tls
+initial_build_and_pm2
 echo
-echo "TODO: остальные шаги provisioning'а добавим в следующих задачах."
+green "═══════════════════════════════════════════════════════════════"
+green "  ✓ test.linkeon.io готов"
+green "═══════════════════════════════════════════════════════════════"
+echo "  URL:        https://$TEST_DOMAIN"
+echo "  Basic Auth: см. \$TEST_BASIC_AUTH в $LOCAL_ENV_FILE"
+echo "  Деплой:     bash scripts/deploy.sh (TEST_ONLY=1 для проверки)"
