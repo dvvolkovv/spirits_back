@@ -65,6 +65,52 @@ REMOTE
   green "  ✓ neo4j установлен"
 }
 
+install_minio() {
+  bold "[3/N] MinIO"
+  ssh_test 'sudo bash -s' <<'REMOTE'
+set -e
+if [ -x /usr/local/bin/minio ]; then
+  echo "  minio binary уже на месте"
+else
+  wget -qO /usr/local/bin/minio https://dl.min.io/server/minio/release/linux-amd64/minio
+  chmod +x /usr/local/bin/minio
+fi
+
+id minio >/dev/null 2>&1 || useradd -r -s /sbin/nologin minio
+install -d -o minio -g minio /home/dv/minio-data /etc/minio
+
+cat > /etc/systemd/system/minio.service <<'UNIT'
+[Unit]
+Description=MinIO
+After=network-online.target
+
+[Service]
+User=minio
+Group=minio
+EnvironmentFile=/etc/minio/minio.env
+ExecStart=/usr/local/bin/minio server --address :9000 --console-address :9001 /home/dv/minio-data
+Restart=always
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# placeholder env, реальные значения положим в configure_secrets (Task 8)
+if [ ! -f /etc/minio/minio.env ]; then
+  cat > /etc/minio/minio.env <<EOF
+MINIO_ROOT_USER=placeholder
+MINIO_ROOT_PASSWORD=placeholder-replace-me
+EOF
+  chmod 600 /etc/minio/minio.env
+fi
+
+systemctl daemon-reload
+systemctl enable minio
+REMOTE
+  green "  ✓ minio установлен (запустим после configure_secrets)"
+}
+
 precheck_dns() {
   bold "[0/N] Проверяю DNS"
   # Пробуем несколько resolver'ов — propagation между ними может занять минуты.
@@ -91,5 +137,6 @@ precheck_dns() {
 precheck_dns
 install_system_packages
 install_neo4j
+install_minio
 echo
 echo "TODO: остальные шаги provisioning'а добавим в следующих задачах."
