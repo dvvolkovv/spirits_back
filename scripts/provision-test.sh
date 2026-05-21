@@ -77,7 +77,7 @@ else
 fi
 
 id minio >/dev/null 2>&1 || useradd -r -s /sbin/nologin minio
-install -d -o minio -g minio /home/dv/minio-data /etc/minio
+install -d -o minio -g minio /var/lib/minio-data /etc/minio
 
 cat > /etc/systemd/system/minio.service <<'UNIT'
 [Unit]
@@ -88,7 +88,7 @@ After=network-online.target
 User=minio
 Group=minio
 EnvironmentFile=/etc/minio/minio.env
-ExecStart=/usr/local/bin/minio server --address :9000 --console-address :9001 /home/dv/minio-data
+ExecStart=/usr/local/bin/minio server --address :9000 --console-address :9001 /var/lib/minio-data
 Restart=always
 LimitNOFILE=65536
 
@@ -197,11 +197,74 @@ precheck_dns() {
   green "  ✓ DNS ок (через $ok)"
 }
 
+configure_services() {
+  bold "[6/N] Настройка PG/Neo4j/MinIO с реальными секретами"
+  # shellcheck disable=SC1090
+  . "$LOCAL_ENV_FILE"
+
+  ssh_test "sudo bash -s" <<REMOTE
+set -e
+
+# PostgreSQL: юзер linkeon + БД linkeon
+sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='linkeon'" | grep -q 1 \\
+  || sudo -u postgres psql -c "CREATE USER linkeon WITH PASSWORD '$POSTGRES_PASSWORD'"
+sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='linkeon'" | grep -q 1 \\
+  || sudo -u postgres createdb -O linkeon linkeon
+sudo -u postgres psql -c "ALTER USER linkeon WITH PASSWORD '$POSTGRES_PASSWORD'"
+
+# Neo4j: смена дефолтного пароля. На свежей установке Neo4j 5 default neo4j/neo4j
+# требует change-on-login, поэтому пробуем два пути:
+# 1) set-initial-password (работает только если auth ещё не использовался)
+# 2) cypher-shell с ALTER CURRENT USER (работает после default-auth в состоянии "change required")
+if [ ! -f /var/lib/neo4j/.password-set ]; then
+  systemctl stop neo4j
+  if neo4j-admin dbms set-initial-password "$NEO4J_PASSWORD" 2>&1 | tee /tmp/neo4j-init.log; then
+    if grep -qE "Changed password|set" /tmp/neo4j-init.log; then
+      :  # успех
+    fi
+  fi
+  systemctl start neo4j
+
+  # Дождаться bolt-порта
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if (echo > /dev/tcp/127.0.0.1/7687) 2>/dev/null; then break; fi
+    sleep 2
+  done
+
+  # Проверка: попробуем подключиться новым паролем. Если не пускает —
+  # значит set-initial-password не сработал, делаем через cypher-shell.
+  if ! cypher-shell -a bolt://127.0.0.1:7687 -u neo4j -p "$NEO4J_PASSWORD" "RETURN 1" >/dev/null 2>&1; then
+    cypher-shell -a bolt://127.0.0.1:7687 -u neo4j -p neo4j \\
+      "ALTER CURRENT USER SET PASSWORD FROM 'neo4j' TO '$NEO4J_PASSWORD'" \\
+      || { echo "FATAL: Neo4j password change failed via cypher-shell" >&2; exit 1; }
+  fi
+
+  touch /var/lib/neo4j/.password-set
+fi
+
+# MinIO: подменить env, рестарт
+cat > /etc/minio/minio.env <<EOF
+MINIO_ROOT_USER=$MINIO_ACCESS_KEY
+MINIO_ROOT_PASSWORD=$MINIO_SECRET_KEY
+EOF
+chmod 600 /etc/minio/minio.env
+systemctl restart minio
+
+# Дождаться MinIO health
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then break; fi
+  sleep 2
+done
+REMOTE
+  green "  ✓ сервисы настроены"
+}
+
 precheck_dns
 install_system_packages
 install_neo4j
 install_minio
 install_node_stack
 generate_secrets
+configure_services
 echo
 echo "TODO: остальные шаги provisioning'а добавим в следующих задачах."
