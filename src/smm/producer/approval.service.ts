@@ -7,10 +7,14 @@ import { InsufficientTokensError } from '../billing/insufficient-tokens.error';
 import { RenderQueueService } from '../render/render-queue.service';
 import { PremiumGenre } from '../entities/smm-scenario.entity';
 
-/** Стоимость premium-режима в токенах сверх TTS-тарифа. */
+/**
+ * Стоимость premium-режима в токенах сверх TTS-тарифа.
+ * Формула: 20k базы + 80k за каждую kling-сцену. Каждый kling-клип — 5 сек.
+ * Примеры: 1 сцена (5 сек) = 100k; 3 (15 сек) = 260k; 6 (30 сек) = 500k.
+ */
 function premiumTokensCost(klingSceneCount: number): number {
-  if (klingSceneCount <= 1) return 100_000;
-  return 180_000;
+  const n = Math.max(1, klingSceneCount);
+  return 20_000 + 80_000 * n;
 }
 
 export interface ApproveScenariosInput {

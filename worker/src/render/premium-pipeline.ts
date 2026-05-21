@@ -6,6 +6,7 @@ import axios from 'axios';
 import { klingImage2Video } from '../media/kling';
 import { generateKeyframe } from '../media/keyframe-gen';
 import { scoreClip } from '../media/vision-qa';
+import { extractLastFrame } from '../postprocess/ffmpeg';
 import { EscapeHatchError } from './escape-hatch.error';
 import { logger } from '../logger';
 
@@ -31,17 +32,58 @@ async function downloadToTmp(url: string, ext: string): Promise<string> {
   return out;
 }
 
+/**
+ * Обрабатывает kling-сцены сценария ПОСЛЕДОВАТЕЛЬНО:
+ *   - Сцена 1: nano-banana keyframe (из keyframe_prompt)
+ *   - Сцены 2..N: keyframe = последний кадр предыдущего kling-клипа (ffmpeg extract)
+ * Это даёт визуально бесшовный переход между сценами — конец сцены N и начало N+1
+ * совпадают по кадру.
+ *
+ * Если у сцены N>1 явно указан keyframe_prompt и lastFramePath не извлечён — используем prompt.
+ * (например, если сцены не подряд — между ними imagen-сцена).
+ */
 export async function processPremiumScenes(scenario: PremiumScenario): Promise<void> {
+  // lastKlingClipPath — путь к скачанному mp4-клипу последней успешной kling-сцены,
+  // используется чтобы extractLastFrame подал keyframe следующей сцене.
+  let lastKlingClipPath: string | null = null;
+
   for (let i = 0; i < scenario.scenes.length; i++) {
     const scene = scenario.scenes[i];
-    if (scene.type !== 'kling') continue;
-    if (!scene.keyframe_prompt || !scene.motion_prompt) {
-      throw new Error(`scene ${i}: kling type requires keyframe_prompt + motion_prompt`);
+    if (scene.type !== 'kling') {
+      // imagen-сцена «разрывает» chain: следующая kling-сцена снова нуждается в своём keyframe_prompt
+      lastKlingClipPath = null;
+      continue;
     }
-    const keyframePath = await generateKeyframe(scene.keyframe_prompt);
+    if (!scene.motion_prompt) {
+      throw new Error(`scene ${i}: kling type requires motion_prompt`);
+    }
+
+    // keyframe: либо из предыдущего kling-клипа (chain), либо nano-banana (новый сегмент)
+    let keyframePath: string;
+    if (lastKlingClipPath) {
+      keyframePath = path.join(os.tmpdir(), `lastframe-${crypto.randomUUID()}.jpg`);
+      try {
+        await extractLastFrame(lastKlingClipPath, keyframePath);
+        logger.info({ sceneIdx: i, source: 'last-frame-chain' }, 'keyframe from previous clip');
+      } catch (e: any) {
+        logger.warn({ sceneIdx: i, err: e.message }, 'extractLastFrame failed — falling back to nano-banana');
+        if (!scene.keyframe_prompt) {
+          throw new Error(`scene ${i}: last-frame extract failed and no keyframe_prompt fallback`);
+        }
+        keyframePath = await generateKeyframe(scene.keyframe_prompt);
+      }
+    } else {
+      if (!scene.keyframe_prompt) {
+        throw new Error(`scene ${i}: first kling scene requires keyframe_prompt`);
+      }
+      keyframePath = await generateKeyframe(scene.keyframe_prompt);
+      logger.info({ sceneIdx: i, source: 'nano-banana' }, 'keyframe generated');
+    }
     scene.keyframeUrl = keyframePath;
     scene.attempts = 0;
+
     let videoUrl: string | null = null;
+    let lastSuccessfulClipPath: string | null = null;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       scene.attempts = attempt;
       videoUrl = await klingImage2Video(keyframePath, scene.motion_prompt);
@@ -52,11 +94,17 @@ export async function processPremiumScenes(scenario: PremiumScenario): Promise<v
       const localClip = await downloadToTmp(videoUrl, '.mp4');
       const qa = await scoreClip(localClip, scene.motion_prompt);
       logger.info({ sceneIdx: i, attempt, score: qa.score, reason: qa.reason }, 'vision-QA verdict');
-      if (qa.good) { scene.videoUrl = videoUrl; break; }
+      if (qa.good) {
+        scene.videoUrl = videoUrl;
+        lastSuccessfulClipPath = localClip;
+        break;
+      }
       videoUrl = null;
     }
     if (!videoUrl) {
       throw new EscapeHatchError(i, `scene ${i}: 3 attempts failed vision-QA`);
     }
+    // Для следующей kling-сцены извлечём lastFrame из этого клипа.
+    lastKlingClipPath = lastSuccessfulClipPath;
   }
 }

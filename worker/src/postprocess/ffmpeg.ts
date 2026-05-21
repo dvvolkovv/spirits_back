@@ -32,6 +32,38 @@ const FFMPEG_BIN =
   'ffmpeg';
 
 /**
+ * Извлекает последний кадр видео в JPG. Используется в premium-pipeline для
+ * seamless-перехода: keyframe следующей kling-сцены = последний кадр предыдущей.
+ * Берём -1 сек до конца чтобы избежать чёрного / артефактов на самом краю.
+ */
+export async function extractLastFrame(videoPath: string, outputJpg: string): Promise<void> {
+  const dur = await probeDurationSec(videoPath);
+  const seek = Math.max(0, dur - 0.2); // 200 мс до конца
+  const args = [
+    '-y',
+    '-ss', String(seek),
+    '-i', videoPath,
+    '-frames:v', '1',
+    '-q:v', '2',
+    outputJpg,
+  ];
+  return new Promise<void>((resolve, reject) => {
+    const proc = spawn(FFMPEG_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    proc.stderr.on('data', (c) => { stderr += c.toString(); });
+    proc.on('error', (err) => reject(new Error(`ffmpeg lastframe error: ${err.message}`)));
+    proc.on('close', (code) => {
+      if (code === 0) {
+        logger.info({ videoPath, outputJpg, seek }, 'last frame extracted');
+        resolve();
+      } else {
+        reject(new Error(`ffmpeg lastframe exited code=${code}: ${stderr.slice(-500)}`));
+      }
+    });
+  });
+}
+
+/**
  * Re-encode the raw Remotion output into a TikTok/Reels-friendly MP4:
  *   - H.264 main profile (good balance of compat and quality)
  *   - yuv420p pixel format

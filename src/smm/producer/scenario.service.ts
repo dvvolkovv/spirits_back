@@ -179,8 +179,11 @@ export class ScenarioService {
         }
         scenes = rawScenes as PremiumScene[];
         klingSceneCount = scenes.filter((sc) => sc.type === 'kling').length;
-        if (klingSceneCount < 1 || klingSceneCount > 2) {
-          throw new Error(`Claude returned invalid kling_scene_count for premium mode: ${klingSceneCount}`);
+        if (klingSceneCount < 1) {
+          throw new Error(`Claude returned no kling scenes for premium mode (genre="${premiumGenre}")`);
+        }
+        if (klingSceneCount > 12) {
+          throw new Error(`Claude returned ${klingSceneCount} kling scenes — max 12 (60-сек ролик)`);
         }
       }
 
