@@ -185,6 +185,23 @@ export class ClaudeAgentService {
             WHERE user_id = $2`,
           [tokensToDeduct, ctx.userId],
         );
+        // Write a completed row to token_consumption_tasks so SMM-producer
+        // shows up in admin/usage/assistants stats (which JOINs agents on
+        // this table). Tokens were already deducted directly above; status
+        // = 'completed' so the regular cron (TokenAccountingService) skips
+        // this row.
+        try {
+          const execId = Math.floor(Math.random() * 2_000_000_000);
+          await this.pg.query(
+            `INSERT INTO token_consumption_tasks
+              (execution_id, user_id, status, agent_id, input_tokens, output_tokens,
+               tokens_to_consume, created_at, completed_at, updated_at)
+             VALUES ($1, $2, 'completed', $3, 0, 0, $4, now(), now(), now())`,
+            [execId, ctx.userId, agentId, tokensToDeduct],
+          );
+        } catch (e: any) {
+          this.logger.warn(`Failed to log SMM usage row: ${e.message}`);
+        }
         this.logger.log(
           `SMM agent billing: user=${ctx.userId} cost=$${totalCostUsd.toFixed(4)} deducted=${tokensToDeduct}`,
         );
