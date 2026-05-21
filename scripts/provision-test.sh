@@ -416,6 +416,9 @@ EOF
 nginx -t
 systemctl reload nginx
 REMOTE
+
+  # nginx (www-data) должен иметь +x на домашнюю директорию пользователя
+  ssh_test "chmod o+x /home/$TEST_USER"
   green "  ✓ Nginx + TLS + BasicAuth настроены"
 }
 
