@@ -21,6 +21,7 @@ import { SupportModule } from './support/support.module';
 import { ContactsModule } from './contacts/contacts.module';
 import { McpModule } from './mcp/mcp.module';
 import { SmmModule } from './smm/smm.module';
+import { TasksModule } from './tasks/tasks.module';
 
 @Module({
   imports: [
@@ -46,6 +47,7 @@ import { SmmModule } from './smm/smm.module';
     ContactsModule,
     McpModule,
     SmmModule,
+    TasksModule,
   ],
 })
 export class AppModule {}

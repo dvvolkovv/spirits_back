@@ -5,6 +5,7 @@ import { KlingService } from '../misc/kling.service';
 import { ChatToolsService, CHAT_TOOLS } from './chat-tools';
 import { SmmProducerToolsService } from '../smm/producer/smm-producer-tools.service';
 import { ClaudeAgentService } from './claude-agent.service';
+import { TasksService } from '../tasks/tasks.service';
 import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import { Request, Response } from 'express';
@@ -28,6 +29,7 @@ export class ChatService {
     private readonly tools: ChatToolsService,
     private readonly smmProducerTools: SmmProducerToolsService,
     private readonly claudeAgent: ClaudeAgentService,
+    @Optional() private readonly tasksService?: TasksService,
   ) {
     if (process.env.ANTHROPIC_API_KEY) {
       this.anthropic = new Anthropic({
@@ -428,6 +430,10 @@ export class ChatService {
         if (this.neo4j) {
           await this.neo4j.consolidateFromChat(userId, String(assistantId), message, fullText);
         }
+        // Operational task memory (cross-agent)
+        if (this.tasksService) {
+          try { await this.tasksService.extractFromTurn(userId, String(assistantId), message, fullText); } catch {}
+        }
       } catch (e) {
         this.logger.error(`Post-chat save error: ${e.message}`);
       }
@@ -635,6 +641,9 @@ export class ChatService {
           await this.addTokenTask(userId, 0, textCost, agentId);
           if (this.neo4j) {
             try { await this.neo4j.consolidateFromChat(userId, assistantId, message, fullText); } catch {}
+          }
+          if (this.tasksService) {
+            try { await this.tasksService.extractFromTurn(userId, assistantId, message, fullText); } catch {}
           }
         }
       } catch (e: any) {
@@ -879,13 +888,15 @@ export class ChatService {
     return this.saveChatHistory(userId, agentId, userMsg, assistantMsg, tokensUsed);
   }
 
-  /** Public wrapper для chat.controller — после upload-and-chat обогащаем профиль. */
+  /** Public wrapper для chat.controller — после upload-and-chat обогащаем профиль + tasks. */
   async consolidateAfterChatPublic(userId: string, agentId: string, userMessage: string, assistantResponse: string): Promise<void> {
-    if (!this.neo4j) return;
-    try {
-      await this.neo4j.consolidateFromChat(userId, agentId, userMessage, assistantResponse);
-    } catch (e: any) {
-      this.logger.warn(`consolidateAfterChatPublic failed: ${e?.message}`);
+    if (this.neo4j) {
+      try { await this.neo4j.consolidateFromChat(userId, agentId, userMessage, assistantResponse); } catch (e: any) {
+        this.logger.warn(`consolidateAfterChatPublic neo4j failed: ${e?.message}`);
+      }
+    }
+    if (this.tasksService) {
+      try { await this.tasksService.extractFromTurn(userId, agentId, userMessage, assistantResponse); } catch {}
     }
   }
 
