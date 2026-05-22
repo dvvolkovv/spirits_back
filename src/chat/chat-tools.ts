@@ -69,7 +69,7 @@ export const CHAT_TOOLS = [
   {
     name: 'generate_video',
     description:
-      'Generate a short 5-10s video using Kling. Use when the user asks for a video / animation / "оживи" an image / "сделай видео".',
+      'Generate a short 5-10s video using Kling. Use when the user asks for a video / animation / "оживи" an image / "сделай видео". ВАЖНО: для mode="text2video" без sourceImageUrl мы сначала автоматически генерируем стилл-кадр через Nano Banana 2 (Imagen 4.0 Ultra primary), а потом анимируем его в image2video — это даёт стабильно лучше композицию, чем «голый» text2video Kling. Итоговая стоимость = картинка 5000 + видео по обычной image2video-сетке (например, kling-v1-6 std 5s → 5000 + 25000 = 30000). Если у тебя уже есть подходящая картинка (из предыдущего generate_image / edit_image / compose_image), передай её как sourceImageUrl и mode="image2video" — это избавит от лишней генерации.',
     input_schema: {
       type: 'object',
       properties: {
@@ -94,7 +94,15 @@ export const CHAT_TOOLS = [
 
 export type ToolResult =
   | { ok: true; kind: 'image'; imageUrl: string; tokensSpent: number }
-  | { ok: true; kind: 'video'; jobId: string; status: string; tokensSpent: number }
+  | {
+      ok: true;
+      kind: 'video';
+      jobId: string;
+      status: string;
+      tokensSpent: number;
+      stillImageUrl?: string;
+      imageTokensSpent?: number;
+    }
   | { ok: false; error: string; [k: string]: any };
 
 @Injectable()
@@ -208,9 +216,63 @@ export class ChatToolsService {
       }
 
       if (name === 'generate_video') {
-        const dto = input as CreateVideoJobDto;
-        const r = await this.video.createJob(userId, dto);
-        return { ok: true, kind: 'video', jobId: r.jobId, status: r.status, tokensSpent: r.tokensSpent };
+        const dto = { ...(input as CreateVideoJobDto) };
+
+        // Auto-chain: text2video без sourceImageUrl → сначала Nano Banana (std),
+        // потом image2video на сгенерированной картинке. Image2video у Kling даёт
+        // стабильно лучше композицию и меньше «шевелится фон», чем text2video.
+        let stillImageUrl: string | undefined;
+        let imageTokensSpent = 0;
+        if (dto.mode === 'text2video' && !dto.sourceImageUrl) {
+          const imgPrompt = String(dto.prompt ?? '').slice(0, 2000);
+          if (!imgPrompt) return { ok: false, error: 'prompt required for text2video' };
+          try {
+            const imgResult = await this.misc.generateImage(userId, { prompt: imgPrompt, quality: 'std' });
+            const imgUrl = imgResult?.images?.[0]?.url;
+            if (!imgUrl) return { ok: false, error: 'auto image step failed (no url)' };
+            stillImageUrl = imgUrl;
+            imageTokensSpent = Number(imgResult.tokensSpent || 0);
+            dto.mode = 'image2video';
+            dto.sourceImageUrl = imgUrl;
+          } catch (e: any) {
+            if (/недостаточно|insufficient/i.test(e?.message || '')) {
+              const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
+              return {
+                ok: false, error: 'insufficient_tokens',
+                balance: Number(bal.rows[0]?.tokens || 0),
+                required: 5000,
+                stage: 'auto_image',
+              };
+            }
+            return { ok: false, error: `auto image step failed: ${e?.message || 'unknown'}` };
+          }
+        }
+
+        try {
+          const r = await this.video.createJob(userId, dto);
+          return {
+            ok: true,
+            kind: 'video',
+            jobId: r.jobId,
+            status: r.status,
+            tokensSpent: r.tokensSpent + imageTokensSpent,
+            ...(stillImageUrl ? { stillImageUrl, imageTokensSpent } : {}),
+          };
+        } catch (e: any) {
+          if (e instanceof InsufficientTokensError) {
+            return {
+              ok: false, error: 'insufficient_tokens',
+              balance: e.balance, required: e.required,
+              stage: 'video',
+              ...(stillImageUrl ? { stillImageUrl, imageTokensSpent } : {}),
+            };
+          }
+          return {
+            ok: false,
+            error: e?.message || 'video creation failed',
+            ...(stillImageUrl ? { stillImageUrl, imageTokensSpent } : {}),
+          };
+        }
       }
 
       return { ok: false, error: `unknown tool: ${name}` };
