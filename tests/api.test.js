@@ -267,6 +267,16 @@ module.exports = {
     assertStatus(resp, 401, 403);
   },
 
+  'GET /webhook/user/tasks/:id — without token returns 401/403': async () => {
+    const resp = await http.get('/webhook/user/tasks/00000000-0000-0000-0000-000000000000');
+    assertStatus(resp, 401, 403);
+  },
+
+  'GET /webhook/user/tasks/:id — with invalid token returns 401/403': async () => {
+    const resp = await http.get('/webhook/user/tasks/00000000-0000-0000-0000-000000000000', { headers: bearer('invalid-token-xyz') });
+    assertStatus(resp, 401, 403);
+  },
+
   // ============================================================
   // WITH VALID JWT (only runs if TEST_JWT is set)
   // ============================================================

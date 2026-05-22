@@ -46,4 +46,21 @@ export class TasksController {
     const items = await this.tasks.listForUser(userId);
     return res.status(200).json(items);
   }
+
+  @Get('user/tasks/:taskId')
+  @UseGuards(JwtGuard)
+  async detailsUser(
+    @Param('taskId') taskId: string,
+    @Query('limit') limit: string | undefined,
+    @Req() req: any,
+    @Res() res: Response,
+  ) {
+    if (!this.tasks) return res.status(503).json({ error: 'tasks service not configured' });
+    const userId: string = req.user?.phone;
+    if (!userId) return res.status(401).json({ error: 'unauthorized' });
+    const lim = limit ? Math.min(Math.max(parseInt(limit, 10) || 30, 1), 200) : 30;
+    const data = await this.tasks.getTaskFullForUser(taskId, userId, lim);
+    if (!data) return res.status(404).json({ error: 'task not found' });
+    return res.status(200).json(data);
+  }
 }
