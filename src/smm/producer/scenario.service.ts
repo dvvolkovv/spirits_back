@@ -139,9 +139,13 @@ export class ScenarioService {
     const premiumSection = buildPremiumPromptSection(premiumGenre);
     const systemPrompt = premiumSection ? basePrompt + '\n\n' + premiumSection : basePrompt;
 
+    // Premium-режим требует более длинных сценариев (6 сцен с motion_prompts) —
+    // дефолтный 60s timeout не хватает, кладём 5 мин.
+    const timeoutMs = premiumGenre ? 5 * 60_000 : 60_000;
     const text = (await this.claudeCli.text(userMsg, {
       system: systemPrompt,
       model: 'claude-haiku-4-5',
+      timeoutMs,
     })).trim();
     if (!text) throw new Error('Claude returned empty text');
     const json = this.extractJson(text);
