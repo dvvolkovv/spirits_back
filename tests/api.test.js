@@ -277,6 +277,22 @@ module.exports = {
     assertStatus(resp, 401, 403);
   },
 
+  'PATCH /webhook/user/tasks/:id — without token returns 401/403': async () => {
+    const resp = await http.patch('/webhook/user/tasks/00000000-0000-0000-0000-000000000000',
+      { status: 'archived' },
+      { headers: { 'Content-Type': 'application/json' } },
+    );
+    assertStatus(resp, 401, 403);
+  },
+
+  'PATCH /webhook/user/tasks/:id — with invalid token returns 401/403': async () => {
+    const resp = await http.patch('/webhook/user/tasks/00000000-0000-0000-0000-000000000000',
+      { status: 'archived' },
+      { headers: { ...bearer('invalid-token-xyz'), 'Content-Type': 'application/json' } },
+    );
+    assertStatus(resp, 401, 403);
+  },
+
   // ============================================================
   // WITH VALID JWT (only runs if TEST_JWT is set)
   // ============================================================

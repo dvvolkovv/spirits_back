@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Query, Req, Res, UseGuards, Optional } from '@nestjs/common';
+import { Body, Controller, Get, Param, Patch, Query, Req, Res, UseGuards, Optional } from '@nestjs/common';
 import { Response } from 'express';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { TasksService } from './tasks.service';
@@ -62,5 +62,29 @@ export class TasksController {
     const data = await this.tasks.getTaskFullForUser(taskId, userId, lim);
     if (!data) return res.status(404).json({ error: 'task not found' });
     return res.status(200).json(data);
+  }
+
+  @Patch('user/tasks/:taskId')
+  @UseGuards(JwtGuard)
+  async setStatusUser(
+    @Param('taskId') taskId: string,
+    @Body() body: { status?: string },
+    @Req() req: any,
+    @Res() res: Response,
+  ) {
+    if (!this.tasks) return res.status(503).json({ error: 'tasks service not configured' });
+    const userId: string = req.user?.phone;
+    if (!userId) return res.status(401).json({ error: 'unauthorized' });
+    const status = body?.status;
+    if (!status || !['active', 'archived', 'done'].includes(status)) {
+      return res.status(400).json({ error: 'invalid status', allowed: ['active', 'archived', 'done'] });
+    }
+    try {
+      const updated = await this.tasks.setStatus(taskId, userId, status as any);
+      if (!updated) return res.status(404).json({ error: 'task not found' });
+      return res.status(200).json(updated);
+    } catch (e: any) {
+      return res.status(500).json({ error: e?.message || 'failed' });
+    }
   }
 }
