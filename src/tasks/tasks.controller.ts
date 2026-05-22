@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Query, Res, UseGuards, Optional } from '@nestjs/common';
+import { Controller, Get, Param, Query, Req, Res, UseGuards, Optional } from '@nestjs/common';
 import { Response } from 'express';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { TasksService } from './tasks.service';
@@ -35,5 +35,15 @@ export class TasksController {
     const data = await this.tasks.getTaskFull(taskId, lim);
     if (!data) return res.status(404).json({ error: 'task not found' });
     return res.status(200).json(data);
+  }
+
+  @Get('user/tasks')
+  @UseGuards(JwtGuard)
+  async listUser(@Req() req: any, @Res() res: Response) {
+    if (!this.tasks) return res.status(503).json({ error: 'tasks service not configured' });
+    const userId: string = req.user?.phone;
+    if (!userId) return res.status(401).json({ error: 'unauthorized' });
+    const items = await this.tasks.listForUser(userId);
+    return res.status(200).json(items);
   }
 }
