@@ -247,6 +247,30 @@ export class TasksService implements OnModuleInit {
     return res.rows;
   }
 
+  /**
+   * Список задач юзера для пользовательского UI (раздел «Задачи» в /profile).
+   * Возвращает только поля, нужные UI: без claudemd (это для агентов, не для юзера в MVP).
+   * Сортировка: active сверху, потом по last_active_at desc.
+   */
+  async listForUser(userId: string): Promise<Array<{
+    id: string;
+    title: string;
+    status: 'active' | 'archived' | 'done';
+    summary: string | null;
+    last_active_at: string | null;
+  }>> {
+    if (!this.pg) return [];
+    const res = await this.pg.query(
+      `SELECT id, title, status, summary, last_active_at
+         FROM tasks
+         WHERE user_id = $1
+         ORDER BY (status = 'active') DESC, last_active_at DESC
+         LIMIT 200`,
+      [userId],
+    );
+    return res.rows;
+  }
+
   // ─────────────────────────────────────────────────────────────────────
   // INTERNALS
   // ─────────────────────────────────────────────────────────────────────
