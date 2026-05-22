@@ -89,16 +89,21 @@ export class KlingService {
       prompt: params.prompt,
       negative_prompt: params.negativePrompt,
       cfg_scale: params.cfgScale ?? 0.5,
-      mode: params.mode,
       duration: String(params.duration),
     };
+    // kling-v2-master не принимает mode='std' — Kling возвращает 400. Передаём
+    // mode только для v1-6.
+    if (params.model === 'kling-v1-6') body.mode = params.mode;
     if (params.cameraControl) body.camera_control = params.cameraControl;
     const resp = await axios.post(
       'https://api.klingai.com/v1/videos/text2video',
       body,
-      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 30000 },
+      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 30000, validateStatus: () => true },
     );
-    if (resp.data?.code !== 0) throw new Error(`Kling text2video: ${resp.data?.message || 'unknown error'}`);
+    if (resp.status !== 200 || resp.data?.code !== 0) {
+      const msg = resp.data?.message || resp.data?.error || `HTTP ${resp.status}`;
+      throw new Error(`Kling text2video: ${msg} (body: ${JSON.stringify(resp.data).slice(0, 200)})`);
+    }
     return { taskId: resp.data.data.task_id };
   }
 
@@ -119,16 +124,20 @@ export class KlingService {
       prompt: params.prompt,
       negative_prompt: params.negativePrompt,
       cfg_scale: params.cfgScale ?? 0.5,
-      mode: params.mode,
       duration: String(params.duration),
     };
+    // kling-v2-master не принимает mode='std' — Kling возвращает 400.
+    if (params.model === 'kling-v1-6') body.mode = params.mode;
     if (params.cameraControl) body.camera_control = params.cameraControl;
     const resp = await axios.post(
       'https://api.klingai.com/v1/videos/image2video',
       body,
-      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 30000 },
+      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 30000, validateStatus: () => true },
     );
-    if (resp.data?.code !== 0) throw new Error(`Kling image2video: ${resp.data?.message || 'unknown error'}`);
+    if (resp.status !== 200 || resp.data?.code !== 0) {
+      const msg = resp.data?.message || resp.data?.error || `HTTP ${resp.status}`;
+      throw new Error(`Kling image2video: ${msg} (body: ${JSON.stringify(resp.data).slice(0, 200)})`);
+    }
     return { taskId: resp.data.data.task_id };
   }
 
