@@ -216,63 +216,18 @@ export class ChatToolsService {
       }
 
       if (name === 'generate_video') {
-        const dto = { ...(input as CreateVideoJobDto) };
-
-        // Auto-chain: text2video без sourceImageUrl → сначала Nano Banana (std),
-        // потом image2video на сгенерированной картинке. Image2video у Kling даёт
-        // стабильно лучше композицию и меньше «шевелится фон», чем text2video.
-        let stillImageUrl: string | undefined;
-        let imageTokensSpent = 0;
-        if (dto.mode === 'text2video' && !dto.sourceImageUrl) {
-          const imgPrompt = String(dto.prompt ?? '').slice(0, 2000);
-          if (!imgPrompt) return { ok: false, error: 'prompt required for text2video' };
-          try {
-            const imgResult = await this.misc.generateImage(userId, { prompt: imgPrompt, quality: 'std' });
-            const imgUrl = imgResult?.images?.[0]?.url;
-            if (!imgUrl) return { ok: false, error: 'auto image step failed (no url)' };
-            stillImageUrl = imgUrl;
-            imageTokensSpent = Number(imgResult.tokensSpent || 0);
-            dto.mode = 'image2video';
-            dto.sourceImageUrl = imgUrl;
-          } catch (e: any) {
-            if (/недостаточно|insufficient/i.test(e?.message || '')) {
-              const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
-              return {
-                ok: false, error: 'insufficient_tokens',
-                balance: Number(bal.rows[0]?.tokens || 0),
-                required: 5000,
-                stage: 'auto_image',
-              };
-            }
-            return { ok: false, error: `auto image step failed: ${e?.message || 'unknown'}` };
-          }
-        }
-
-        try {
-          const r = await this.video.createJob(userId, dto);
-          return {
-            ok: true,
-            kind: 'video',
-            jobId: r.jobId,
-            status: r.status,
-            tokensSpent: r.tokensSpent + imageTokensSpent,
-            ...(stillImageUrl ? { stillImageUrl, imageTokensSpent } : {}),
-          };
-        } catch (e: any) {
-          if (e instanceof InsufficientTokensError) {
-            return {
-              ok: false, error: 'insufficient_tokens',
-              balance: e.balance, required: e.required,
-              stage: 'video',
-              ...(stillImageUrl ? { stillImageUrl, imageTokensSpent } : {}),
-            };
-          }
-          return {
-            ok: false,
-            error: e?.message || 'video creation failed',
-            ...(stillImageUrl ? { stillImageUrl, imageTokensSpent } : {}),
-          };
-        }
+        // Auto-chain (text2video → image+image2video) теперь живёт в VideoService.createJob,
+        // чтобы и UI-форма /webhook/video/jobs, и MCP-инструмент отрабатывали одинаково.
+        const dto = input as CreateVideoJobDto;
+        const r = await this.video.createJob(userId, dto);
+        return {
+          ok: true,
+          kind: 'video',
+          jobId: r.jobId,
+          status: r.status,
+          tokensSpent: r.tokensSpent,
+          ...(r.stillImageUrl ? { stillImageUrl: r.stillImageUrl, imageTokensSpent: r.imageTokensSpent ?? 0 } : {}),
+        };
       }
 
       return { ok: false, error: `unknown tool: ${name}` };

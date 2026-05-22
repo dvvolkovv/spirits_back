@@ -6,6 +6,7 @@ import {
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import { KlingService } from '../misc/kling.service';
+import { MiscService } from '../misc/misc.service';
 import {
   CreateVideoJobDto, VideoJobRow, computeTokenCost,
   VideoMode, VideoModel, VideoQuality,
@@ -53,12 +54,31 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly pg: PgService,
     private readonly kling: KlingService,
+    private readonly misc: MiscService,
   ) {}
 
   async createJob(
     userId: string,
     dto: CreateVideoJobDto,
-  ): Promise<{ jobId: string; status: string; tokensSpent: number }> {
+  ): Promise<{ jobId: string; status: string; tokensSpent: number; stillImageUrl?: string; imageTokensSpent?: number }> {
+    // Auto-chain: text2video без sourceImageUrl → сначала Nano Banana (std),
+    // потом image2video на сгенерированной картинке. Image2video у Kling даёт
+    // стабильно лучше композицию и меньше «шевелится фон», чем text2video.
+    // Цепочка живёт здесь (в сервисе), чтобы и UI-форма /webhook/video/jobs,
+    // и MCP-инструмент generate_video из чата отрабатывали одинаково.
+    let autoStillUrl: string | undefined;
+    let autoStillTokens = 0;
+    if (dto.mode === 'text2video' && !dto.sourceImageUrl) {
+      const imgPrompt = String(dto.prompt ?? '').slice(0, 2000);
+      if (!imgPrompt) throw new BadRequestException('text2video requires prompt');
+      const imgResult = await this.misc.generateImage(userId, { prompt: imgPrompt, quality: 'std' });
+      const imgUrl = imgResult?.images?.[0]?.url;
+      if (!imgUrl) throw new Error('auto image step failed (no url)');
+      autoStillUrl = imgUrl;
+      autoStillTokens = Number(imgResult.tokensSpent || 0);
+      dto = { ...dto, mode: 'image2video', sourceImageUrl: imgUrl };
+    }
+
     const mode = dto.mode;
     const model = (dto.model ?? 'kling-v1-6') as VideoModel;
     const quality = (dto.quality ?? 'std') as VideoQuality;
@@ -201,7 +221,12 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         `UPDATE video_jobs SET kling_task_id=$1, status='processing', updated_at=now() WHERE id=$2`,
         [taskId, jobId],
       );
-      return { jobId, status: 'processing', tokensSpent: cost };
+      return {
+        jobId,
+        status: 'processing',
+        tokensSpent: cost + autoStillTokens,
+        ...(autoStillUrl ? { stillImageUrl: autoStillUrl, imageTokensSpent: autoStillTokens } : {}),
+      };
     } catch (e: any) {
       this.logger.error(`createJob Kling error: ${e.message}`);
       // refund + mark failed in a short transaction
