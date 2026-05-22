@@ -2,7 +2,7 @@
 /**
  * Smoke tests for my.linkeon.io — short, ~30s, run after every deploy.
  *
- * What we check (10 critical paths):
+ * What we check (12 critical paths):
  *   1.  /webhook/agents reachable, returns ≥13 agents including Райя
  *   2.  SMS send endpoint accepts test phone
  *   3.  Debug OTP returns code (proves DEBUG_SMS_CODES=true, env intact)
@@ -13,7 +13,11 @@
  *   8.  /webhook/soulmate/chat streams a non-empty response (smoke check on
  *       streamUniversalAgent → r.linkeon.io path)
  *   9.  custom_chat_history has new rows for our session_id
- *  10.  agent avatars endpoint returns image bytes
+ *  10.  all 15 assistants respond to a ping (ping-sweep)
+ *  11.  /webhook/imagegen end-to-end: Imagen/Gemini → MinIO → public URL
+ *       (catches MinIO permissions, S3 ACL, Nginx /smm-media routing). Burns
+ *       ~5000 tokens from the test account per smoke run.
+ *  12.  agent avatars endpoint returns image bytes
  *
  * Exit code: 0 = all green, 1 = any failure.
  *
@@ -269,7 +273,38 @@ async function step(name, fn) {
     return `${results.length} agents OK`;
   });
 
-  // -- 11. Avatar endpoint ----------------------------------------------
+  // -- 11. Image generation end-to-end ----------------------------------
+  // Ловит регрессии в Imagen/Gemini API ключах, MinIO permissions, S3 upload,
+  // публичной отдаче через Nginx /smm-media/. Это ровно тот путь, что
+  // используется в чате (generate_image MCP) и в авто-цепочке text2video.
+  // Стоит ~5000 токенов с тестового аккаунта на каждый прогон.
+  await step('image generation end-to-end (Imagen → MinIO → public URL)', async () => {
+    if (!jwt) throw new Error('no JWT from earlier step');
+    const r = await axios.post(
+      `${BASE_URL}/webhook/imagegen`,
+      { prompt: 'simple test pattern: blue circle on white background', quality: 'std' },
+      { headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' }, timeout: 60000 },
+    );
+    if (r.status !== 200) throw new Error(`status ${r.status}`);
+    const url = r.data?.images?.[0]?.url;
+    if (!url) throw new Error(`no image url in response: ${JSON.stringify(r.data).slice(0, 200)}`);
+    if (!/^https?:\/\//.test(url)) throw new Error(`url not absolute: ${url}`);
+
+    // Verify URL is publicly reachable + returns an image (catches MinIO ACL
+    // or Nginx routing regressions even if upload itself "succeeded").
+    const fetched = await axios.get(url, {
+      responseType: 'arraybuffer', timeout: 15000, maxRedirects: 3,
+    });
+    if (fetched.status !== 200) throw new Error(`public fetch ${fetched.status} for ${url}`);
+    const ct = fetched.headers['content-type'] || '';
+    if (!/image\//.test(ct)) throw new Error(`unexpected content-type ${ct} for ${url}`);
+    if (!fetched.data || fetched.data.length < 2000) {
+      throw new Error(`image suspiciously small: ${fetched.data?.length || 0} bytes`);
+    }
+    return `${fetched.data.length} bytes, ${ct}, spent ${r.data.tokensSpent ?? '?'}t`;
+  });
+
+  // -- 12. Avatar endpoint ----------------------------------------------
   await step('agent avatar endpoint serves image (Райя)', async () => {
     const r = await axios.get(
       `${BASE_URL}/webhook/0cdacf32-7bfd-4888-b24f-3a6af3b5f99e/agent/avatar/14`,
