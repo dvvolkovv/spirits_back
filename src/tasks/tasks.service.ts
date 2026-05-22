@@ -271,6 +271,60 @@ export class TasksService implements OnModuleInit {
     return res.rows;
   }
 
+  /**
+   * Детали задачи для user-эндпоинта: проверяет владение,
+   * джойнит события с agent_name, не возвращает claudemd.
+   */
+  async getTaskFullForUser(
+    taskId: string,
+    userId: string,
+    eventsLimit = 20,
+  ): Promise<{
+    task: {
+      id: string;
+      title: string;
+      summary: string | null;
+      status: 'active' | 'archived' | 'done';
+      last_active_at: string | null;
+    };
+    events: Array<{
+      id: string;
+      content: string;
+      agent_id: number | null;
+      agent_name: string | null;
+      created_at: string;
+    }>;
+  } | null> {
+    if (!this.pg) return null;
+    const tRes = await this.pg.query(
+      `SELECT id, title, summary, status, last_active_at
+         FROM tasks
+         WHERE id = $1 AND user_id = $2`,
+      [taskId, userId],
+    );
+    if (!tRes.rows.length) return null;
+    const task = tRes.rows[0];
+    const eRes = await this.pg.query(
+      `SELECT e.id, e.content, e.agent_id, COALESCE(a.display_name, a.name) AS agent_name, e.created_at
+         FROM task_events e
+         LEFT JOIN agents a ON a.id = e.agent_id
+         WHERE e.task_id = $1
+         ORDER BY e.created_at DESC
+         LIMIT $2`,
+      [taskId, eventsLimit],
+    );
+    return {
+      task: {
+        id: task.id,
+        title: task.title,
+        summary: task.summary,
+        status: task.status,
+        last_active_at: task.last_active_at,
+      },
+      events: eRes.rows.reverse(),
+    };
+  }
+
   // ─────────────────────────────────────────────────────────────────────
   // INTERNALS
   // ─────────────────────────────────────────────────────────────────────
