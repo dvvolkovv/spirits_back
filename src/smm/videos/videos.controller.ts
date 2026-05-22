@@ -46,9 +46,20 @@ export class VideosController {
   @Get(':id')
   async getOne(@Req() req: any, @Param('id') id: string) {
     await this.assertCanAccessVideo(id, req);
-    const r = await this.pg.query(`SELECT * FROM smm_video WHERE id = $1`, [id]);
+    const r = await this.pg.query(
+      `SELECT v.*, s.premium_genre, s.kling_scene_count
+         FROM smm_video v
+         JOIN smm_scenario s ON s.id = v.scenario_id
+        WHERE v.id = $1`,
+      [id],
+    );
     if (r.rows.length === 0) throw new NotFoundException(`video ${id} not found`);
-    return rowToVideo(r.rows[0]);
+    const video = rowToVideo(r.rows[0]);
+    return {
+      ...video,
+      premiumGenre: r.rows[0].premium_genre ?? null,
+      klingSceneCount: Number(r.rows[0].kling_scene_count ?? 0),
+    };
   }
 
   /**
