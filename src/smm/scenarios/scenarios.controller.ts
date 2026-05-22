@@ -168,9 +168,6 @@ export class ScenariosController {
       if (!['surreal', 'pov', 'cinematic'].includes(body.premiumGenre)) {
         throw new BadRequestException('premiumGenre must be surreal|pov|cinematic|null');
       }
-      if (!req.user?.isAdmin) {
-        throw new ForbiddenException('premium mode is admin-only during Phase 1');
-      }
     }
     await this.assertCanAccessScenario(id, req);
     const existing = await this.pg.query(`SELECT id FROM smm_scenario WHERE id = $1`, [id]);
@@ -215,10 +212,6 @@ export class ScenariosController {
       sets.push(`premium_genre = $${i++}`); vals.push(body.premiumGenre ?? null);
     }
     if (body.scenes !== undefined) {
-      // Только админы могут писать scenes (premium-режим Phase 1).
-      if (!req.user?.isAdmin) {
-        throw new ForbiddenException('editing premium scenes is admin-only during Phase 1');
-      }
       if (body.scenes !== null) {
         if (!Array.isArray(body.scenes) || body.scenes.length === 0) {
           throw new BadRequestException('scenes must be a non-empty array or null');

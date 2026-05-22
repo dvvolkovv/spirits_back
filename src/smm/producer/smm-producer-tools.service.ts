@@ -97,8 +97,8 @@ export class SmmProducerToolsService {
       else this.logger.warn('trends unavailable, falling back to auto-mode generation');
     }
 
-    // 3. Generate
-    const premiumGenre = ctx.isAdmin ? (input.premium_genre ?? null) : null;
+    // 3. Generate — premium доступен всем юзерам
+    const premiumGenre = input.premium_genre ?? null;
     const ids = await this.scenario.generate({
       campaignId,
       mode: input.mode,
