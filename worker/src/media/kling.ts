@@ -7,7 +7,7 @@ import * as jwt from 'jsonwebtoken';
 import { logger } from '../logger';
 
 const POLL_INTERVAL_MS = 8_000;
-const POLL_MAX_ATTEMPTS = 30;   // 30 × 8s ≈ 4 minutes max wait
+const POLL_MAX_ATTEMPTS = 60;   // 60 × 8s = 8 minutes max wait (china peak hours)
 const KLING_PREMIUM_MODEL = 'kling-v2-master';
 
 function getKlingToken(): string | null {
