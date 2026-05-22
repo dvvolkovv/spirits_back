@@ -325,6 +325,35 @@ export class TasksService implements OnModuleInit {
     };
   }
 
+  /**
+   * Меняет статус задачи. Проверяет владение через WHERE user_id.
+   * Возвращает обновлённую запись или null, если задача не принадлежит юзеру.
+   */
+  async setStatus(
+    taskId: string,
+    userId: string,
+    status: 'active' | 'archived' | 'done',
+  ): Promise<{
+    id: string;
+    title: string;
+    summary: string | null;
+    status: 'active' | 'archived' | 'done';
+    last_active_at: string | null;
+  } | null> {
+    if (!['active', 'archived', 'done'].includes(status)) {
+      throw new Error(`invalid status: ${status}`);
+    }
+    if (!this.pg) return null;
+    const res = await this.pg.query(
+      `UPDATE tasks
+         SET status = $1, updated_at = now()
+         WHERE id = $2 AND user_id = $3
+         RETURNING id, title, summary, status, last_active_at`,
+      [status, taskId, userId],
+    );
+    return res.rows.length ? res.rows[0] : null;
+  }
+
   // ─────────────────────────────────────────────────────────────────────
   // INTERNALS
   // ─────────────────────────────────────────────────────────────────────
