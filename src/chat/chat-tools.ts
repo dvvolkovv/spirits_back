@@ -28,7 +28,7 @@ export const CHAT_TOOLS = [
       type: 'object',
       properties: {
         prompt: { type: 'string', description: 'What to change in the image (in the user\'s language).' },
-        sourceImageUrl: { type: 'string', description: 'URL of the image to edit. Must be either /static/generated/... (previously generated on this platform) or an absolute https:// URL.' },
+        sourceImageUrl: { type: 'string', description: 'URL of the image to edit. Pass the imageUrl field returned by a previous generate_image / edit_image / compose_image tool result (absolute https:// MinIO URL). Legacy /static/generated/... paths are also accepted for backward compatibility with older chat history.' },
         quality: { type: 'string', enum: ['std', 'hd'], default: 'std' },
       },
       required: ['prompt', 'sourceImageUrl'],
@@ -47,7 +47,7 @@ export const CHAT_TOOLS = [
           items: { type: 'string' },
           minItems: 2,
           maxItems: 3,
-          description: 'Array of 2-3 image URLs. Can be /static/generated/... from previous tool results, or absolute https:// URLs.',
+          description: 'Array of 2-3 image URLs. Pass imageUrl fields from previous generate_image / edit_image / compose_image tool results (absolute https:// MinIO URLs). Legacy /static/generated/... paths also accepted for older chat history.',
         },
         quality: { type: 'string', enum: ['std', 'hd'], default: 'std' },
       },
@@ -61,7 +61,7 @@ export const CHAT_TOOLS = [
     input_schema: {
       type: 'object',
       properties: {
-        sourceImageUrl: { type: 'string', description: 'URL of the image to upscale. /static/generated/... or absolute https://.' },
+        sourceImageUrl: { type: 'string', description: 'URL of the image to upscale. Pass the imageUrl from a previous tool result (absolute https:// MinIO URL). Legacy /static/generated/... also accepted.' },
       },
       required: ['sourceImageUrl'],
     },

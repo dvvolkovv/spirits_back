@@ -872,38 +872,6 @@ export class ChatService {
     return card.image_url;
   }
 
-  private async generateImageForChat(userId: string, prompt: string): Promise<{ url: string; text: string } | null> {
-    const apiKey = process.env.GOOGLE_AI_API_KEY;
-    if (!apiKey) return null;
-
-    try {
-      const model = 'imagen-4.0-generate-001';
-      const resp = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:predict?key=${apiKey}`,
-        { instances: [{ prompt }], parameters: { sampleCount: 1, aspectRatio: '1:1' } },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 120000 },
-      );
-
-      const pred = resp.data?.predictions?.[0];
-      if (!pred?.bytesBase64Encoded) return null;
-
-      const fs = require('fs');
-      const path = require('path');
-      const publicDir = path.join(process.cwd(), 'public', 'generated');
-      if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
-
-      const ext = (pred.mimeType || '').includes('jpeg') ? 'jpg' : 'png';
-      const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-      fs.writeFileSync(path.join(publicDir, filename), Buffer.from(pred.bytesBase64Encoded, 'base64'));
-
-      await this.pg.query('UPDATE ai_profiles_consolidated SET tokens = tokens - 5000, updated_at = now() WHERE user_id = $1', [userId]);
-      return { url: `/static/generated/${filename}`, text: '' };
-    } catch (e) {
-      this.logger.error(`Image gen error: ${e.response?.data ? JSON.stringify(e.response.data).slice(0, 300) : e.message}`);
-      return null;
-    }
-  }
-
   async saveChatHistoryPublic(userId: string, agentId: string, userMsg: string, assistantMsg: string, tokensUsed = 0) {
     return this.saveChatHistory(userId, agentId, userMsg, assistantMsg, tokensUsed);
   }
