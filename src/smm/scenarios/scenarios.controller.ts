@@ -224,19 +224,25 @@ export class ScenariosController {
           throw new BadRequestException('scenes must be a non-empty array or null');
         }
         let klingCount = 0;
+        let isFirstKling = true;
         for (const s of body.scenes) {
           if (!['kling', 'imagen'].includes(s.type)) {
             throw new BadRequestException(`scene type must be 'kling' or 'imagen'`);
           }
           if (s.type === 'kling') {
-            if (typeof s.keyframe_prompt !== 'string' || !s.keyframe_prompt.trim()) {
-              throw new BadRequestException('kling scene requires keyframe_prompt');
+            // keyframe_prompt обязателен только для первой kling-сцены — остальные
+            // получают keyframe через extract-last-frame chain в worker'е.
+            if (isFirstKling && (typeof s.keyframe_prompt !== 'string' || !s.keyframe_prompt.trim())) {
+              throw new BadRequestException('first kling scene requires keyframe_prompt');
             }
             if (typeof s.motion_prompt !== 'string' || !s.motion_prompt.trim()) {
               throw new BadRequestException('kling scene requires motion_prompt');
             }
             klingCount++;
+            isFirstKling = false;
           } else {
+            isFirstKling = true; // imagen разрывает chain
+
             if (typeof s.image_prompt !== 'string' || !s.image_prompt.trim()) {
               throw new BadRequestException('imagen scene requires image_prompt');
             }
