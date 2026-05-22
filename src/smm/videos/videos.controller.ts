@@ -190,20 +190,16 @@ export class VideosController {
       if (!body.newGenre || !['surreal', 'pov', 'cinematic'].includes(body.newGenre)) {
         throw new BadRequestException('newGenre required and must be surreal|pov|cinematic');
       }
-      // 100% возврат премиум + TTS — юзер пересоздаёт ролик с нуля,
-      // на новой генерации будет новая charge-транзакция.
+      // 100% возврат премиум + TTS. Сценарий + видео отменяем — Юля должна заново
+      // сгенерить кадры под новый жанр (motion_prompts разные у Surreal vs Cinematic).
+      // Юзеру в UI показываем подсказку «попроси Юлю сделать ролик в стиле <newGenre>».
       await this.premiumGen.refund({
         generationId: gen.id, refundTokens: gen.tokensCharged, status: 'full_refund',
       });
       await this.billing.refund({ videoId: id, reason: 'escape_hatch_switch_genre' });
-      // Меняем жанр на сценарии. Юзер сам должен подтвердить новую цену через UI
-      // (preview + confirm) — фронт перезапускает /scenarios/:id/render с новым жанром.
-      await this.pg.query(
-        `UPDATE smm_scenario SET premium_genre = $1, scenes_json = NULL, kling_scene_count = 0
-          WHERE id = $2`,
-        [body.newGenre, scenarioId],
-      );
       await this.pg.query(`UPDATE smm_video SET status = 'cancelled' WHERE id = $1`, [id]);
+      // Сценарий помечаем rejected чтобы он не висел "approved" в админке.
+      await this.pg.query(`UPDATE smm_scenario SET status = 'rejected' WHERE id = $1`, [scenarioId]);
       return { ok: true, refunded: gen.tokensCharged, switched_to: body.newGenre };
     }
 
