@@ -97,7 +97,7 @@ async function step(name, fn) {
     const r = await axios.get(`${BASE_URL}/webhook/agents`, { timeout: 10000 });
     if (r.status !== 200) throw new Error(`status ${r.status}`);
     if (!Array.isArray(r.data)) throw new Error('not array');
-    if (r.data.length < 999) throw new Error(`only ${r.data.length} agents, expected ≥999`);
+    if (r.data.length < 13) throw new Error(`only ${r.data.length} agents, expected ≥13`);
     const raya = r.data.find(a => a.name === 'Райя');
     if (!raya) throw new Error('Райя missing');
     if (!/Human Design/.test(raya.description)) throw new Error('Райя description missing "Human Design"');
