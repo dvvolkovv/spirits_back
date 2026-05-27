@@ -46,8 +46,11 @@ fi
 PROD_HOST="${PROD_HOST:-dvolkov@212.113.106.202}"
 BRANCH="${BRANCH:-b2b}"
 
-LOCAL_BACK_DIR="${LOCAL_BACK_DIR:-$HOME/Downloads/spirits_back}"
-LOCAL_FRONT_DIR="${LOCAL_FRONT_DIR:-$HOME/Downloads/spirits_front}"
+# Default to script-relative paths so the script works regardless of
+# where the repo is cloned. Override via env if your layout differs.
+_BACK_DIR_DEFAULT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOCAL_BACK_DIR="${LOCAL_BACK_DIR:-$_BACK_DIR_DEFAULT}"
+LOCAL_FRONT_DIR="${LOCAL_FRONT_DIR:-$(dirname "$_BACK_DIR_DEFAULT")/spirits_front}"
 
 bold()  { printf "\033[1m%s\033[0m\n" "$1"; }
 green() { printf "\033[32m%s\033[0m\n" "$1"; }

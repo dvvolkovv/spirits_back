@@ -23,7 +23,7 @@ ssh_test() { ssh -o StrictHostKeyChecking=accept-new "$TEST_HOST" "$@"; }
 install_system_packages() {
   bold "[1/N] System packages (nginx, postgresql, redis, certbot, htpasswd, dig)"
   ssh_test 'sudo bash -s' <<'REMOTE'
-set -e
+set -eo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 # Если postgresql-16 не находится в default repos — добавь PGDG.
@@ -50,7 +50,7 @@ REMOTE
 install_neo4j() {
   bold "[2/N] Neo4j 5 community"
   ssh_test 'sudo bash -s' <<'REMOTE'
-set -e
+set -eo pipefail
 if command -v neo4j >/dev/null 2>&1; then
   echo "  neo4j уже установлен"
   exit 0
@@ -68,7 +68,7 @@ REMOTE
 install_minio() {
   bold "[3/N] MinIO"
   ssh_test 'sudo bash -s' <<'REMOTE'
-set -e
+set -eo pipefail
 if [ -x /usr/local/bin/minio ]; then
   echo "  minio binary уже на месте"
 else
@@ -114,7 +114,7 @@ REMOTE
 install_node_stack() {
   bold "[4/N] Node 22 + pnpm + pm2 (для юзера $TEST_USER)"
   ssh_test 'bash -s' <<'REMOTE'
-set -e
+set -eo pipefail
 export NVM_DIR="$HOME/.nvm"
 if [ ! -d "$NVM_DIR" ]; then
   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
@@ -137,42 +137,47 @@ REMOTE
 
 generate_secrets() {
   bold "[5/N] Генерация секретов"
+
+  # Source existing values if any (idempotent merge).
   if [ -f "$LOCAL_ENV_FILE" ]; then
-    green "  $LOCAL_ENV_FILE уже существует — не перезаписываю"
-    return 0
+    # shellcheck disable=SC1090
+    . "$LOCAL_ENV_FILE"
   fi
 
   gen() { openssl rand -hex 24; }
-  local pg_pass neo4j_pass minio_user minio_pass jwt_a jwt_r basic_pass
-  pg_pass=$(gen)
-  neo4j_pass=$(gen)
-  minio_user="linkeon-test"
-  minio_pass=$(gen)
-  jwt_a=$(gen)
-  jwt_r=$(gen)
-  basic_pass=$(openssl rand -base64 18 | tr -d '/+=' | head -c 24)
+
+  # Generate any missing secrets. Existing values are preserved.
+  POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(gen)}"
+  NEO4J_PASSWORD="${NEO4J_PASSWORD:-$(gen)}"
+  MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:-linkeon-test}"
+  MINIO_SECRET_KEY="${MINIO_SECRET_KEY:-$(gen)}"
+  JWT_ACCESS_SECRET="${JWT_ACCESS_SECRET:-$(gen)}"
+  JWT_REFRESH_SECRET="${JWT_REFRESH_SECRET:-$(gen)}"
+  SMM_WORKER_SECRET="${SMM_WORKER_SECRET:-$(gen)}"
+  TEST_BASIC_AUTH="${TEST_BASIC_AUTH:-linkeon:$(openssl rand -base64 18 | tr -d '/+=' | head -c 24)}"
 
   cat > "$LOCAL_ENV_FILE" <<EOF
-# Сгенерировано provision-test.sh $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Сгенерировано/обновлено provision-test.sh $(date -u +%Y-%m-%dT%H:%M:%SZ)
 # GITIGNORED. Не комитить.
 TEST_HOST=$TEST_HOST
 TEST_BACK_PATH=/home/$TEST_USER/spirits_back
 TEST_FRONT_SRC=/home/$TEST_USER/spirits_front_src
 TEST_FRONT_SERVED=/home/$TEST_USER/spirits_front
 TEST_BASE_URL=https://$TEST_DOMAIN
-TEST_BASIC_AUTH=linkeon:$basic_pass
-TEST_PG_DSN=postgresql://linkeon:$pg_pass@127.0.0.1:5432/linkeon
+TEST_BASIC_AUTH=$TEST_BASIC_AUTH
+TEST_PG_DSN=postgresql://linkeon:$POSTGRES_PASSWORD@127.0.0.1:5432/linkeon
 
 # Backend .env values (для отладки/восстановления)
-POSTGRES_PASSWORD=$pg_pass
-NEO4J_PASSWORD=$neo4j_pass
-MINIO_ACCESS_KEY=$minio_user
-MINIO_SECRET_KEY=$minio_pass
-JWT_ACCESS_SECRET=$jwt_a
-JWT_REFRESH_SECRET=$jwt_r
+POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+NEO4J_PASSWORD=$NEO4J_PASSWORD
+MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY
+MINIO_SECRET_KEY=$MINIO_SECRET_KEY
+JWT_ACCESS_SECRET=$JWT_ACCESS_SECRET
+JWT_REFRESH_SECRET=$JWT_REFRESH_SECRET
+SMM_WORKER_SECRET=$SMM_WORKER_SECRET
 EOF
   chmod 600 "$LOCAL_ENV_FILE"
-  green "  ✓ $LOCAL_ENV_FILE создан"
+  green "  ✓ $LOCAL_ENV_FILE up-to-date"
 }
 
 precheck_dns() {
@@ -204,7 +209,7 @@ configure_services() {
   . "$LOCAL_ENV_FILE"
 
   ssh_test "sudo bash -s" <<REMOTE
-set -e
+set -eo pipefail
 
 # PostgreSQL: юзер linkeon + БД linkeon
 sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='linkeon'" | grep -q 1 \\
@@ -263,7 +268,7 @@ REMOTE
 clone_repos() {
   bold "[7/N] Клонирование репозиториев"
   ssh_test 'bash -s' <<'REMOTE'
-set -e
+set -eo pipefail
 cd ~
 if [ ! -d spirits_back ]; then
   git clone git@github.com:dvvolkovv/spirits_back.git
@@ -286,7 +291,7 @@ write_env_files() {
   . "$LOCAL_ENV_FILE"
 
   ssh_test "bash -s" <<REMOTE
-set -e
+set -eo pipefail
 cat > ~/spirits_back/.env <<EOF
 NODE_ENV=production
 PORT=3001
@@ -321,14 +326,51 @@ MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY
 MINIO_SECRET_KEY=$MINIO_SECRET_KEY
 MINIO_PUBLIC_URL=https://$TEST_DOMAIN/minio
 MINIO_BUCKET_MUSIC=linkeon-smm-music
+MINIO_BUCKET_VIDEOS=linkeon-smm-videos
+
+SMM_WORKER_SECRET=$SMM_WORKER_SECRET
 EOF
 chmod 600 ~/spirits_back/.env
+
+# Worker .env — отдельный, т.к. worker/src/config.ts грузит ../.env
+# Required: REDIS_URL, SMM_API_URL, SMM_WORKER_SECRET, все MINIO_*.
+# Optional (TTS/Kling/Pexels/GoogleAI) — пусто на test, видео-pipeline не гоняем.
+mkdir -p ~/spirits_back/worker
+cat > ~/spirits_back/worker/.env <<EOF
+LOG_LEVEL=info
+
+REDIS_URL=redis://127.0.0.1:6379
+
+SMM_API_URL=https://$TEST_DOMAIN
+SMM_WORKER_SECRET=$SMM_WORKER_SECRET
+
+MINIO_ENDPOINT=http://127.0.0.1:9000
+MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY
+MINIO_SECRET_KEY=$MINIO_SECRET_KEY
+MINIO_PUBLIC_URL=https://$TEST_DOMAIN/minio
+MINIO_BUCKET_VIDEOS=linkeon-smm-videos
+MINIO_BUCKET_MUSIC=linkeon-smm-music
+
+YANDEX_SPEECHKIT_API_KEY=
+YANDEX_TTS_FOLDER_ID=
+ELEVENLABS_API_KEY=
+ELEVENLABS_VOICE_HERO_M=
+ELEVENLABS_VOICE_HERO_F=
+ELEVENLABS_VOICE_PSY=
+ELEVENLABS_VOICE_LAWYER=
+ELEVENLABS_VOICE_COACH=
+KLING_ACCESS_KEY=
+KLING_SECRET_KEY=
+GOOGLE_AI_API_KEY=
+PEXELS_API_KEY=
+EOF
+chmod 600 ~/spirits_back/worker/.env
 
 cat > ~/spirits_front_src/.env <<EOF
 VITE_BACKEND_URL=https://$TEST_DOMAIN
 EOF
 REMOTE
-  green "  ✓ .env файлы записаны"
+  green "  ✓ .env файлы записаны (back + worker + front)"
 }
 
 setup_nginx_and_tls() {
@@ -340,7 +382,7 @@ setup_nginx_and_tls() {
   basic_pass="${TEST_BASIC_AUTH#*:}"
 
   ssh_test "sudo bash -s" <<REMOTE
-set -e
+set -eo pipefail
 
 # 1. minimal vhost на 80 для http-01
 mkdir -p /var/www/letsencrypt
@@ -435,7 +477,7 @@ REMOTE
 initial_build_and_pm2() {
   bold "[10/N] Первая сборка back + front, запуск PM2"
   ssh_test 'bash -s' <<'REMOTE'
-set -e
+set -eo pipefail
 export NVM_DIR="$HOME/.nvm"
 . "$NVM_DIR/nvm.sh"
 
