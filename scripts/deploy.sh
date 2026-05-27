@@ -61,7 +61,7 @@ red()   { printf "\033[31m%s\033[0m\n" "$1"; }
 # PATH_EXPORT may contain a glob (e.g. .nvm/versions/node/v22*/bin) — use
 # $(echo ...) on the remote to expand it before adding to PATH.
 ssh_remote() {
-  ssh "$HOST" "export PATH=\$(echo $PATH_EXPORT):\$HOME/.npm-global/bin:\$PATH; $*"
+  ssh -o StrictHostKeyChecking=accept-new "$HOST" "export PATH=\$(echo $PATH_EXPORT):\$HOME/.npm-global/bin:\$PATH; $*"
 }
 
 push_local_repo() {
