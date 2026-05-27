@@ -13,22 +13,37 @@ const { test, expect } = require('@playwright/test');
 const axios = require('axios');
 
 const BASE = process.env.BASE_URL || 'https://my.linkeon.io';
-const TEST_PHONE = process.env.TEST_PHONE || '79169403771';
+const TEST_PHONE = process.env.TEST_PHONE || '70000000000';
+const ADMIN_PHONE = process.env.ADMIN_PHONE || '79030169187';
 
-// Existing scenarios for this phone (created earlier today):
-const EXISTING_SCENARIO_ID = '0cc71a98-b70b-4f20-b8d4-9d1834b27f47';
-
-async function getJwt() {
-  await axios.get(`${BASE}/webhook/898c938d-f094-455c-86af-969617e62f7a/sms/${TEST_PHONE}`);
-  const codeRes = await axios.get(`${BASE}/webhook/debug/sms-code/${TEST_PHONE}`);
+async function getJwtFor(phone) {
+  await axios.get(`${BASE}/webhook/898c938d-f094-455c-86af-969617e62f7a/sms/${phone}`);
+  const codeRes = await axios.get(`${BASE}/webhook/debug/sms-code/${phone}`);
   const code = codeRes.data.code;
   const loginRes = await axios.get(
-    `${BASE}/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/${TEST_PHONE}/${code}`,
+    `${BASE}/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/${phone}/${code}`,
   );
   return {
     access: loginRes.data['access-token'],
     refresh: loginRes.data['refresh-token'],
   };
+}
+
+async function getJwt() {
+  return getJwtFor(TEST_PHONE);
+}
+
+// Idempotent fixture seed for the edit-flow test. Inserts a campaign + scenario
+// + chat_history row marked with `[smoke-seed]` so the ScenarioCard renders
+// in TEST_PHONE's chat with Юля. Prior seed rows are cleaned up by the endpoint.
+async function seedScenarioForTest() {
+  const { access: adminJwt } = await getJwtFor(ADMIN_PHONE);
+  const res = await axios.post(
+    `${BASE}/webhook/smm/admin/seed-scenario`,
+    { phone: TEST_PHONE },
+    { headers: { Authorization: `Bearer ${adminJwt}`, 'Content-Type': 'application/json' } },
+  );
+  return res.data;
 }
 
 async function loginAsJulia(page) {
@@ -46,15 +61,10 @@ async function loginAsJulia(page) {
   return { access, refresh };
 }
 
-// Test полагается на конкретного юзера (79169403771 по умолчанию) с готовой
-// SMM-историей. На test.linkeon.io этого юзера нет — БД свежая. Скипаем
-// весь describe-блок если идём на test (определяем по hostname в BASE_URL).
+// Использует seedScenarioForTest() для подготовки фикстуры — работает
+// и на test.linkeon.io, и на my.linkeon.io. ADMIN_PHONE должен существовать
+// в БД с isadmin=true (на обоих стендах: 79030169187 по умолчанию).
 test.describe('Юля (SMM Producer) creator-mode E2E', () => {
-  test.skip(
-    /test\.linkeon\.io/.test(BASE),
-    'julia-creator требует прод-данных (SMM-сценариев конкретного юзера); test-стенд их не имеет',
-  );
-
   test('login → see Юля → open chat with her', async ({ page }) => {
     await loginAsJulia(page);
     await page.goto(`${BASE}/chat`);
@@ -70,6 +80,11 @@ test.describe('Юля (SMM Producer) creator-mode E2E', () => {
 
   test('edit existing scenario → save → check toast + network → reload persistence', async ({ page }) => {
     test.setTimeout(240_000);
+
+    // Seed: ensure a ScenarioCard exists in TEST_PHONE's chat with Юля.
+    // Idempotent — replaces any prior [smoke-seed] row.
+    const seeded = await seedScenarioForTest();
+    console.log(`[INFO] seeded scenario: ${seeded.scenarioId} (campaign ${seeded.campaignId})`);
 
     // Capture console errors + network calls
     const consoleErrors = [];
