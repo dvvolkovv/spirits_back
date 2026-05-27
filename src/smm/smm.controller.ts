@@ -105,7 +105,8 @@ export class SmmController {
         `${SEED_MARKER} starter scenario ${new Date().toISOString()}`,
         'psy',
         JSON.stringify([
-          { role: 'narrator', text: 'placeholder dialog line for smoke seed' },
+          { speaker: 'hero', text: 'Smoke seed placeholder.', tStart: 0, tEnd: 1 },
+          { speaker: 'assistant', text: 'Smoke seed reply.', tStart: 1, tEnd: 2 },
         ]),
         'neutral',
       ],
