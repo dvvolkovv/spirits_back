@@ -70,6 +70,11 @@ function fail(name, err) {
 async function step(name, fn) {
   try {
     const extra = await fn();
+    if (extra && typeof extra === 'object' && extra.skipped) {
+      results.push({ name, status: 'SKIP' });
+      console.log(`  ⊘ ${name} — ${extra.reason || 'skipped'}`);
+      return;
+    }
     pass(name, extra || '');
   } catch (e) {
     fail(name, e.message || String(e));
@@ -283,8 +288,15 @@ async function step(name, fn) {
     const r = await axios.post(
       `${BASE_URL}/webhook/imagegen`,
       { prompt: 'simple test pattern: blue circle on white background', quality: 'std' },
-      { headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' }, timeout: 60000 },
+      {
+        headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
+        timeout: 60000,
+        validateStatus: () => true,
+      },
     );
+    if (r.status === 501) {
+      return { skipped: true, reason: r.data?.error || 'imagegen not configured on this server' };
+    }
     if (r.status !== 200) throw new Error(`status ${r.status}`);
     const url = r.data?.images?.[0]?.url;
     if (!url) throw new Error(`no image url in response: ${JSON.stringify(r.data).slice(0, 200)}`);
@@ -320,8 +332,10 @@ async function step(name, fn) {
   console.log();
   console.log('─'.repeat(70));
   const passN = results.filter(r => r.status === 'PASS').length;
+  const skipN = results.filter(r => r.status === 'SKIP').length;
   const failN = failures.length;
-  console.log(`RESULT: ${passN} passed, ${failN} failed`);
+  const skipFragment = skipN > 0 ? `, ${skipN} skipped` : '';
+  console.log(`RESULT: ${passN} passed${skipFragment}, ${failN} failed`);
   if (failN > 0) {
     console.log();
     console.log('Failures:');

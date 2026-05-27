@@ -39,6 +39,13 @@ export class MiscController {
   @Post('imagegen')
   @UseGuards(JwtGuard)
   async imageGen(@CurrentUser() user: any, @Req() req: Request, @Res() res: Response) {
+    if (!process.env.GOOGLE_AI_API_KEY) {
+      return res.status(501).json({
+        error: 'imagegen not configured on this server',
+        capability: 'imagegen',
+        configured: false,
+      });
+    }
     try {
       const { prompt, quality, aspect_ratio } = req.body;
       if (!prompt) return res.status(400).json({ error: 'Missing prompt' });

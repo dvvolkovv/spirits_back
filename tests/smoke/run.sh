@@ -11,6 +11,7 @@ set -uo pipefail
 
 LAYER="${1:-all}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 cd "$ROOT"
 
 BASE_URL="${BASE_URL:-https://my.linkeon.io}"
@@ -30,7 +31,15 @@ FAILED=0
 
 if [[ "$LAYER" == "unit" || "$LAYER" == "all" ]]; then
   print_header "LAYER 1/3 — Backend unit tests (Jest)"
-  if ! npx jest unit/ --silent; then
+  # Some unit tests import from ../../dist/* (compiled output).
+  # Build first if dist/ is missing or older than the newest src/*.ts.
+  newest_src=$(find "$REPO_ROOT/src" -name '*.ts' -type f -printf '%T@\n' 2>/dev/null | sort -nr | head -1)
+  dist_mtime=$(stat -c '%Y' "$REPO_ROOT/dist/main.js" 2>/dev/null || echo 0)
+  if [[ -z "$newest_src" ]] || [[ "${newest_src%.*}" -gt "$dist_mtime" ]]; then
+    echo "  • building dist/ (out-of-date or missing)…"
+    (cd "$REPO_ROOT" && npm run build --silent) || { echo "  ✗ build failed"; FAILED=1; }
+  fi
+  if [[ "$FAILED" -eq 0 ]] && ! npx jest unit/ --silent; then
     echo "  ✗ unit failed"
     FAILED=1
   fi
