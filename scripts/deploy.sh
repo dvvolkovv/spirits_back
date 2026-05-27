@@ -22,6 +22,9 @@
 #   SKIP_TEST_SMOKE=1  — задеплоить на test без smoke (потом обычный прод-деплой + его smoke)
 #   SKIP_PROD_SMOKE=1  — на проде задеплоить без smoke
 #   SMOKE_ONLY=1       — пропустить деплой, гонять только smoke текущей фазы
+#   NO_ROLLBACK=1      — отключить авто-rollback на проде при smoke failure
+#                        (по умолчанию: если PHASE 2 smoke красный — откат
+#                         back+front к pre-deploy SHA, restart сервисов)
 #
 # Прод-настройки (можно переопределить через env):
 #   PROD_HOST          dvolkov@212.113.106.202
@@ -78,6 +81,83 @@ push_local_repo() {
   fi
   git push origin "$BRANCH" 2>&1 | tail -3
   cd - >/dev/null
+}
+
+capture_pre_deploy_state() {
+  # Записываем SHA back/front ДО reset --hard, чтобы было куда откатиться
+  # при failure smoke. Выводы ssh_remote могут содержать PATH-export строки —
+  # вытаскиваем последнюю строку и фильтруем по hex-shape.
+  local back_sha front_sha
+  back_sha=$(ssh_remote "cd $BACK_PATH && git rev-parse HEAD" 2>/dev/null | tail -1 | tr -d '[:space:]')
+  front_sha=$(ssh_remote "cd $FRONT_SRC && git rev-parse HEAD" 2>/dev/null | tail -1 | tr -d '[:space:]')
+  if [[ ! "$back_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    red "  ! couldn't capture back pre-deploy SHA ($ENV_NAME) — rollback won't work"
+    PRE_BACK_SHA=""
+  else
+    PRE_BACK_SHA="$back_sha"
+  fi
+  if [[ ! "$front_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    red "  ! couldn't capture front pre-deploy SHA ($ENV_NAME) — rollback won't work"
+    PRE_FRONT_SHA=""
+  else
+    PRE_FRONT_SHA="$front_sha"
+  fi
+  if [[ -n "$PRE_BACK_SHA$PRE_FRONT_SHA" ]]; then
+    echo "  ↪ captured pre-deploy state: back=${PRE_BACK_SHA:0:8} front=${PRE_FRONT_SHA:0:8}"
+  fi
+}
+
+rollback_backend() {
+  if [[ -z "${PRE_BACK_SHA:-}" ]]; then
+    red "  ✗ NO pre-deploy back SHA — manual rollback required ($ENV_NAME)"
+    return 1
+  fi
+  red "  ↩ rolling back backend ($ENV_NAME) → ${PRE_BACK_SHA:0:8}"
+  ssh_remote "
+    set -eo pipefail
+    cd $BACK_PATH
+    git reset --hard $PRE_BACK_SHA
+    npm ci --no-audit --no-fund 2>&1 | tail -3
+    npm run build 2>&1 | tail -3
+    pm2 restart linkeon-api 2>&1 | tail -2
+    if [ -d worker ]; then
+      cd worker
+      npm ci --no-audit --no-fund 2>&1 | tail -3
+      npm run build 2>&1 | tail -3
+      pm2 restart linkeon-smm-worker 2>&1 | tail -2
+      cd ..
+    fi
+  " && green "  ↩ backend rolled back ($ENV_NAME)" \
+    || { red "  ✗ ROLLBACK BACKEND FAILED — $ENV_NAME needs manual intervention"; return 1; }
+}
+
+rollback_frontend() {
+  if [[ -z "${PRE_FRONT_SHA:-}" ]]; then
+    red "  ✗ NO pre-deploy front SHA — manual rollback required ($ENV_NAME)"
+    return 1
+  fi
+  red "  ↩ rolling back frontend ($ENV_NAME) → ${PRE_FRONT_SHA:0:8}"
+  ssh_remote "
+    set -eo pipefail
+    cd $FRONT_SRC
+    git reset --hard $PRE_FRONT_SHA
+    echo 'VITE_BACKEND_URL=$BASE_URL' > .env
+    pnpm install --frozen-lockfile 2>&1 | tail -3
+    pnpm build 2>&1 | tail -3
+    rsync -az dist/ $FRONT_SERVED/
+  " && green "  ↩ frontend rolled back ($ENV_NAME)" \
+    || { red "  ✗ ROLLBACK FRONTEND FAILED — $ENV_NAME needs manual intervention"; return 1; }
+}
+
+# Откат back+front к captured SHA после smoke failure. Триггерится только
+# на проде по умолчанию; отключается NO_ROLLBACK=1. Не откатывает то, что
+# не деплоилось (FRONT_ONLY=1 / BACK_ONLY=1 учитываются).
+rollback_phase() {
+  bold "=== ROLLBACK ($ENV_NAME) ==="
+  local rc=0
+  if [[ -z "${FRONT_ONLY:-}" ]]; then rollback_backend  || rc=1; fi
+  if [[ -z "${BACK_ONLY:-}"  ]]; then rollback_frontend || rc=1; fi
+  return "$rc"
 }
 
 deploy_backend() {
@@ -170,6 +250,11 @@ run_phase() {
   export ENV_NAME HOST PATH_EXPORT BACK_PATH FRONT_SRC FRONT_SERVED BASE_URL BASIC_AUTH BRANCH SSH_TARGET PG_DSN
 
   if [[ -z "${SMOKE_ONLY:-}" ]]; then
+    # Capture pre-deploy state on prod (по умолчанию) для авто-rollback'а
+    # при smoke failure. NO_ROLLBACK=1 отключает.
+    if [[ "$phase" == "prod" && -z "${NO_ROLLBACK:-}" ]]; then
+      capture_pre_deploy_state
+    fi
     if [[ -z "${FRONT_ONLY:-}" ]]; then deploy_backend;  fi
     if [[ -z "${BACK_ONLY:-}"  ]]; then deploy_frontend; fi
   else
@@ -187,6 +272,9 @@ run_phase() {
       green "  ✓ SMOKE GREEN ($ENV_NAME)"
     else
       red "  ✗ SMOKE FAILED ($ENV_NAME)"
+      if [[ "$phase" == "prod" && -z "${NO_ROLLBACK:-}" && -z "${SMOKE_ONLY:-}" ]]; then
+        rollback_phase || red "  ✗ rollback had partial failures — check $ENV_NAME manually"
+      fi
       return 1
     fi
   else
