@@ -3,6 +3,7 @@ import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
 import { EmailService } from './email.service';
 import { OAuthGoogleService } from './oauth-google.service';
+import { OAuthYandexService } from './oauth-yandex.service';
 import { IdentityService } from '../identity/identity.service';
 import { JwtService } from '../common/services/jwt.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
@@ -25,6 +26,7 @@ export class AuthController {
     private readonly jwt: JwtService,
     private readonly redis: RedisService,
     private readonly googleOAuth: OAuthGoogleService,
+    private readonly yandexOAuth: OAuthYandexService,
   ) {}
 
   // SMS OTP request — UUID hardcoded to match frontend
@@ -250,8 +252,7 @@ location.replace('/chat');
     if (provider === 'google') {
       authorizeUrl = this.googleOAuth.buildAuthorizeUrl(state);
     } else {
-      // yandex — will be wired in Task 12
-      return res.set(CORS).status(503).json({ error: 'yandex not yet wired' });
+      authorizeUrl = this.yandexOAuth.buildAuthorizeUrl(state);
     }
 
     return res.set(CORS).status(200).json({ authorizeUrl });
@@ -282,6 +283,37 @@ location.replace('/chat');
     }
 
     const { userId } = await this.identity.resolveOrCreate('google', userInfo);
+    return res.set(CORS).status(200).json({
+      'access-token':  this.jwt.signAccess(userId),
+      'refresh-token': this.jwt.signRefresh(userId),
+    });
+  }
+
+  @Post('auth/oauth/yandex')
+  async oauthYandex(@Body() body: { code?: string; state?: string }, @Res() res: Response) {
+    const { code, state } = body || {};
+    if (!code || !state) return res.set(CORS).status(400).json({ error: 'missing code/state' });
+
+    const stateRaw = await this.redis.get(`oauth-state-${state}`);
+    if (!stateRaw) return res.set(CORS).status(400).json({ error: 'state expired' });
+    await this.redis.del(`oauth-state-${state}`);
+    const stateData = JSON.parse(stateRaw);
+    if (stateData.provider !== 'yandex') return res.set(CORS).status(400).json({ error: 'state mismatch' });
+
+    let userInfo;
+    try {
+      userInfo = await this.yandexOAuth.exchangeCodeForUserinfo(code);
+    } catch (e: any) {
+      return res.set(CORS).status(400).json({ error: 'yandex exchange failed', detail: e.message });
+    }
+
+    if (stateData.intent === 'link' && stateData.userId) {
+      const r = await this.identity.linkMethod(stateData.userId, 'yandex', userInfo);
+      if (!r.ok) return res.set(CORS).status(409).json({ error: 'conflict' });
+      return res.set(CORS).status(200).json({ linked: true });
+    }
+
+    const { userId } = await this.identity.resolveOrCreate('yandex', userInfo);
     return res.set(CORS).status(200).json({
       'access-token':  this.jwt.signAccess(userId),
       'refresh-token': this.jwt.signRefresh(userId),

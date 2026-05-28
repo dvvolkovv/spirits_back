@@ -411,4 +411,14 @@ module.exports = {
     const resp = await http.post('/webhook/auth/oauth/google', { code: 'x', state: 'not-in-redis' }, { headers: { 'Content-Type': 'application/json' } });
     assertStatus(resp, 400);
   },
+
+  'POST /webhook/auth/oauth/yandex — missing code/state → 400': async () => {
+    const resp = await http.post('/webhook/auth/oauth/yandex', {}, { headers: { 'Content-Type': 'application/json' } });
+    assertStatus(resp, 400);
+  },
+
+  'POST /webhook/auth/oauth/yandex — invalid state → 400': async () => {
+    const resp = await http.post('/webhook/auth/oauth/yandex', { code: 'x', state: 'not-in-redis' }, { headers: { 'Content-Type': 'application/json' } });
+    assertStatus(resp, 400);
+  },
 };
