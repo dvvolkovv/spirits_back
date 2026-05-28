@@ -47,7 +47,7 @@ if [[ -f "$TEST_ENV_FILE" ]]; then
 fi
 
 PROD_HOST="${PROD_HOST:-dvolkov@212.113.106.202}"
-BRANCH="${BRANCH:-b2b}"
+BRANCH="${BRANCH:-main}"
 
 # Default to script-relative paths so the script works regardless of
 # where the repo is cloned. Override via env if your layout differs.
