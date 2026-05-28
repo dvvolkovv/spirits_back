@@ -184,12 +184,20 @@ test.describe('Юля (SMM Producer) creator-mode E2E', () => {
     await saveBtn.click();
     console.log('[INFO] Clicked «Сохранить»');
 
-    // Wait for save to complete: either toast OR modal closes
-    await page.waitForTimeout(3000);
-
-    // Check for toast — react-hot-toast renders in a portal
+    // Wait for save to complete: modal closes on success (onClose() called after onSaved()).
+    // A fixed waitForTimeout(3000) allowed page.reload() to abort the in-flight PATCH
+    // before the response arrived — the server saved the data but the frontend never
+    // received the response, so the modal stayed open and no toast showed.
     const successToast = page.getByText('Сценарий обновлён');
     const errorToast = page.getByText(/Не удалось сохранить/);
+
+    let modalClosed = false;
+    try {
+      await page.getByText('Редактирование сценария').waitFor({ state: 'hidden', timeout: 15000 });
+      modalClosed = true;
+    } catch (_) {
+      // Modal still open — either save failed or server is very slow
+    }
 
     const sawSuccess = await successToast.isVisible().catch(() => false);
     const sawError = await errorToast.isVisible().catch(() => false);
@@ -202,7 +210,7 @@ test.describe('Юля (SMM Producer) creator-mode E2E', () => {
 
     // Check modal closed
     const modalStillOpen = await page.getByText('Редактирование сценария').isVisible().catch(() => false);
-    console.log(`[INFO] sawSuccessToast=${sawSuccess}, sawErrorToast=${sawError}, modalStillOpen=${modalStillOpen}`);
+    console.log(`[INFO] sawSuccessToast=${sawSuccess}, sawErrorToast=${sawError}, modalStillOpen=${modalStillOpen}, modalClosed=${modalClosed}`);
 
     // Now check the ScenarioCard reflects the new title (without reload)
     await page.waitForTimeout(1000);
@@ -228,12 +236,13 @@ test.describe('Юля (SMM Producer) creator-mode E2E', () => {
     // Core: data must persist — this is the original bug being tested.
     expect(persisted, 'new title persists after reload').toBe(true);
     expect(sawError, 'no error toast').toBe(false);
-    // PATCH capture and toast are best-effort: the response sometimes doesn't
-    // reach Playwright on slow servers, but persistence proves the save worked.
+    expect(modalClosed, 'modal closes on successful save').toBe(true);
+    // Now that we wait for modal close, the PATCH response should be captured.
+    // Fallback log kept for environments where Playwright misses the response.
     if (patchCalls.length > 0) {
       expect(patchCalls[0].status, 'PATCH should return 200').toBe(200);
     } else {
-      console.log('[WARN] PATCH response not captured by Playwright (network race), but data persisted — OK');
+      console.log('[WARN] PATCH response not captured by Playwright, but modal closed + data persisted — OK');
     }
   });
 });
