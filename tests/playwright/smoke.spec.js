@@ -24,14 +24,23 @@ async function getJwt() {
   };
 }
 
-// Устанавливает Basic Auth на уровне страницы (не контекста) — обходит ограничение
-// Playwright, где httpCredentials/extraHTTPHeaders из playwright.config не работают
-// для fixture-страниц если nginx не шлёт WWW-Authenticate challenge.
+// Добавляет Basic Auth через page.route() — единственный надёжный способ когда nginx
+// не шлёт WWW-Authenticate challenge. Interceptor добавляет Authorization: Basic только
+// если заголовок ещё не установлен (Bearer-токены из React-app не затрагиваются).
 async function applyBasicAuth(page) {
-  if (!process.env.BASIC_AUTH) return;
-  const [u, ...r] = process.env.BASIC_AUTH.split(':');
+  const auth = process.env.BASIC_AUTH;
+  console.log('[applyBasicAuth] BASIC_AUTH:', auth ? `set (${auth.length} chars)` : 'NOT SET — skipping');
+  if (!auth) return;
+  const [u, ...r] = auth.split(':');
   const encoded = Buffer.from(`${u}:${r.join(':')}`).toString('base64');
-  await page.setExtraHTTPHeaders({ Authorization: `Basic ${encoded}` });
+  await page.route('**/*', async (route) => {
+    const headers = route.request().headers();
+    if (!headers['authorization']) {
+      await route.continue({ headers: { ...headers, authorization: `Basic ${encoded}` } });
+    } else {
+      await route.continue();
+    }
+  });
 }
 
 async function loginViaStorage(page) {

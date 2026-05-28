@@ -46,14 +46,22 @@ async function seedScenarioForTest() {
   return res.data;
 }
 
-// Устанавливает Basic Auth на уровне страницы — для test.linkeon.io за nginx Basic Auth.
-// page.setExtraHTTPHeaders применяется к navigation-запросам; fetch() из скриптов
-// страницы не затрагивается (Bearer-токены в API-запросах сохраняются).
+// Добавляет Basic Auth через page.route() — единственный надёжный способ когда nginx
+// не шлёт WWW-Authenticate challenge. Bearer-токены из React-app не затрагиваются.
 async function applyBasicAuth(page) {
-  if (!process.env.BASIC_AUTH) return;
-  const [u, ...r] = process.env.BASIC_AUTH.split(':');
+  const auth = process.env.BASIC_AUTH;
+  console.log('[applyBasicAuth] BASIC_AUTH:', auth ? `set (${auth.length} chars)` : 'NOT SET — skipping');
+  if (!auth) return;
+  const [u, ...r] = auth.split(':');
   const encoded = Buffer.from(`${u}:${r.join(':')}`).toString('base64');
-  await page.setExtraHTTPHeaders({ Authorization: `Basic ${encoded}` });
+  await page.route('**/*', async (route) => {
+    const headers = route.request().headers();
+    if (!headers['authorization']) {
+      await route.continue({ headers: { ...headers, authorization: `Basic ${encoded}` } });
+    } else {
+      await route.continue();
+    }
+  });
 }
 
 async function loginAsJulia(page) {
