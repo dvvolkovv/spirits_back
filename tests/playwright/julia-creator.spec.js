@@ -46,7 +46,18 @@ async function seedScenarioForTest() {
   return res.data;
 }
 
+// Устанавливает Basic Auth на уровне страницы — для test.linkeon.io за nginx Basic Auth.
+// page.setExtraHTTPHeaders применяется к navigation-запросам; fetch() из скриптов
+// страницы не затрагивается (Bearer-токены в API-запросах сохраняются).
+async function applyBasicAuth(page) {
+  if (!process.env.BASIC_AUTH) return;
+  const [u, ...r] = process.env.BASIC_AUTH.split(':');
+  const encoded = Buffer.from(`${u}:${r.join(':')}`).toString('base64');
+  await page.setExtraHTTPHeaders({ Authorization: `Basic ${encoded}` });
+}
+
 async function loginAsJulia(page) {
+  await applyBasicAuth(page);
   const { access, refresh } = await getJwt();
   // Pre-select Юля (smm_producer, id=21 — verifying below) so chat renders
   // directly without going through AssistantSelection. We'll also fall back

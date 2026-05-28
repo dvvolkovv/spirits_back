@@ -24,7 +24,18 @@ async function getJwt() {
   };
 }
 
+// Устанавливает Basic Auth на уровне страницы (не контекста) — обходит ограничение
+// Playwright, где httpCredentials/extraHTTPHeaders из playwright.config не работают
+// для fixture-страниц если nginx не шлёт WWW-Authenticate challenge.
+async function applyBasicAuth(page) {
+  if (!process.env.BASIC_AUTH) return;
+  const [u, ...r] = process.env.BASIC_AUTH.split(':');
+  const encoded = Buffer.from(`${u}:${r.join(':')}`).toString('base64');
+  await page.setExtraHTTPHeaders({ Authorization: `Basic ${encoded}` });
+}
+
 async function loginViaStorage(page) {
+  await applyBasicAuth(page);
   const { access, refresh } = await getJwt();
   // AuthContext requires BOTH `authToken` and `userData` to consider the
   // user logged in (see AuthContext.tsx initAuth). tokenManager reads
