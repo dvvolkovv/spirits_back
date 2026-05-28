@@ -65,8 +65,7 @@ test.describe('my.linkeon.io smoke', () => {
       localStorage.setItem('userData', u);
       sessionStorage.setItem('selected_assistant', s);
     }, [access, refresh, JSON.stringify(userData), JSON.stringify(assistant)]);
-    await page.goto('/chat');
-    await page.waitForLoadState('domcontentloaded');
+    await page.goto('/chat', { waitUntil: 'domcontentloaded' });
 
     // The chat textarea/input should be rendered now
     const input = page.locator('textarea, input[type="text"]').first();
