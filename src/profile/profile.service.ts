@@ -18,6 +18,17 @@ export class ProfileService {
     const row = res.rows[0];
     const pd = row.profile_data || {};
 
+    // Get phone + signup_method from user_id table (phone users have primary_phone set)
+    const userIdRow = await this.pg.query(
+      'SELECT primary_phone, primary_email, signup_method FROM user_id WHERE internal_id = $1',
+      [userId],
+    );
+    const uidRow = userIdRow.rows[0] || {};
+    // phone: for phone-registered users, primary_phone is set; others have no phone
+    const phone = uidRow.primary_phone || null;
+    // identity email: fallback for email/oauth users where ai_profiles_consolidated.email is not set
+    const identityEmail = row.email || uidRow.primary_email || null;
+
     // Entity-поля (values/beliefs/desires/intents/interests/skills) — источник
     // правды Neo4j (компакция работает только там). profile_data.values и т.п.
     // — устаревший снапшот, может содержать testовый мусор и удалённое; не
@@ -36,7 +47,9 @@ export class ProfileService {
         user_id: row.user_id,
         preferred_agent: row.preferred_agent,
         tokens: row.tokens,
-        email: row.email,
+        phone,
+        email: identityEmail,
+        signup_method: uidRow.signup_method || null,
         isadmin: row.isadmin === true || row.isadmin === 'true',
         profile_data: pd, // raw column для обратной совместимости со старым фронтом
         created_at: row.created_at,
