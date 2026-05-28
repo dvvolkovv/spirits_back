@@ -73,6 +73,11 @@ export class IdentityService implements OnModuleInit {
         `UPDATE user_identities SET last_used_at = now() WHERE provider = $1 AND provider_sub = $2`,
         [provider, providerSub],
       );
+      // Reactivate soft-deleted account — tokens in ai_profiles_consolidated are preserved
+      await this.pg.query(
+        `UPDATE user_id SET state = 'active', update_date = now() WHERE internal_id = $1 AND state = 'deleted'`,
+        [userId],
+      );
       return { userId, isNew: false, mergedExisting: false };
     }
 

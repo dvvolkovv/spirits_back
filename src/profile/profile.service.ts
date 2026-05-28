@@ -82,8 +82,19 @@ export class ProfileService {
 
   async deleteProfile(userId: string) {
     await this.pg.query('DELETE FROM custom_chat_history WHERE session_id LIKE $1', [`${userId}_%`]);
-    await this.pg.query('DELETE FROM ai_profiles_consolidated WHERE user_id = $1', [userId]);
-    await this.pg.query('DELETE FROM user_id WHERE primary_phone = $1 OR internal_id = $1', [userId]);
+    // Preserve token balance: clear profile data but keep the row so tokens survive re-registration
+    await this.pg.query(
+      `UPDATE ai_profiles_consolidated
+       SET profile_data = '{}', email = NULL, preferred_agent = NULL, isadmin = false, updated_at = now()
+       WHERE user_id = $1`,
+      [userId],
+    );
+    // Soft-delete: mark user as deleted but keep user_id + user_identities rows so that
+    // re-registration with the same phone/email/OAuth restores the old token balance.
+    await this.pg.query(
+      `UPDATE user_id SET state = 'deleted', update_date = now() WHERE internal_id = $1`,
+      [userId],
+    );
     return { success: true };
   }
 
