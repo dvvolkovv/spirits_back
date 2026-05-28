@@ -75,10 +75,15 @@ test.describe('my.linkeon.io smoke', () => {
 
   test('per-tab independence: two contexts hold different assistants', async ({ browser }) => {
     // Open two isolated browser contexts (= two browser windows with separate sessionStorage).
-    // httpCredentials НЕ пробрасывается из playwright.config.use в browser.newContext() —
-    // нужно передавать вручную, иначе test.linkeon.io отдаст 401 от nginx Basic Auth.
+    // Используем extraHTTPHeaders (а не httpCredentials) — nginx не шлёт WWW-Authenticate,
+    // поэтому httpCredentials не работают. extraHTTPHeaders добавляет Authorization к
+    // navigation-запросам из нового контекста.
     const ctxOpts = process.env.BASIC_AUTH
-      ? { httpCredentials: (() => { const [u, ...r] = process.env.BASIC_AUTH.split(':'); return { username: u, password: r.join(':') }; })() }
+      ? (() => {
+          const [u, ...r] = process.env.BASIC_AUTH.split(':');
+          const encoded = Buffer.from(`${u}:${r.join(':')}`).toString('base64');
+          return { extraHTTPHeaders: { Authorization: `Basic ${encoded}` } };
+        })()
       : {};
     const c1 = await browser.newContext(ctxOpts);
     const c2 = await browser.newContext(ctxOpts);
