@@ -22,6 +22,7 @@ import { ContactsModule } from './contacts/contacts.module';
 import { McpModule } from './mcp/mcp.module';
 import { SmmModule } from './smm/smm.module';
 import { TasksModule } from './tasks/tasks.module';
+import { IdentityModule } from './identity/identity.module';
 
 @Module({
   imports: [
@@ -48,6 +49,7 @@ import { TasksModule } from './tasks/tasks.module';
     McpModule,
     SmmModule,
     TasksModule,
+    IdentityModule,
   ],
 })
 export class AppModule {}
