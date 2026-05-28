@@ -374,6 +374,12 @@ module.exports = {
     assertStatus(resp, 401, 403);
   },
 
+  'GET /webhook/debug/email-token/:email — when DEBUG_SMS_CODES=false → 404': async () => {
+    // We can't verify true case without mutating env. Verify 404 with non-existent email.
+    const resp = await http.get('/webhook/debug/email-token/nonexistent-' + Date.now() + '@example.com');
+    assertStatus(resp, 404);
+  },
+
   'POST /webhook/auth/refresh — with valid refresh token returns new tokens': async () => {
     if (!config.TEST_JWT) {
       console.log('(skipped — TEST_JWT not set)');

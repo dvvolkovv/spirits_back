@@ -5,6 +5,7 @@ import { EmailService } from './email.service';
 import { IdentityService } from '../identity/identity.service';
 import { JwtService } from '../common/services/jwt.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
+import { RedisService } from '../common/services/redis.service';
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -21,6 +22,7 @@ export class AuthController {
     private readonly email: EmailService,
     private readonly identity: IdentityService,
     private readonly jwt: JwtService,
+    private readonly redis: RedisService,
   ) {}
 
   // SMS OTP request — UUID hardcoded to match frontend
@@ -74,6 +76,25 @@ export class AuthController {
     const code = await this.authService.getDebugCode(phone);
     if (!code) return res.status(404).json({ error: 'No code' });
     return res.status(200).json({ code });
+  }
+
+  @Get('debug/email-token/:email')
+  async debugEmailToken(@Param('email') email: string, @Res() res: Response) {
+    if (process.env.DEBUG_SMS_CODES !== 'true') {
+      return res.status(404).json({ error: 'not enabled' });
+    }
+    const normalized = email.trim().toLowerCase();
+    // Search active ml-* tokens for this email
+    const allKeys = await this.redis.keys('ml-*');
+    for (const key of allKeys) {
+      // Skip rate-limit keys (ml-rate-*)
+      if (key.startsWith('ml-rate-')) continue;
+      const v = await this.redis.get(key);
+      if (v === normalized) {
+        return res.status(200).json({ token: key.slice(3), email: v });
+      }
+    }
+    return res.status(404).json({ error: 'no active token' });
   }
 
   /**
