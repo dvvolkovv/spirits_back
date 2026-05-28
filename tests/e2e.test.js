@@ -34,6 +34,29 @@ async function loginWithOtp() {
   auth.refresh = resp.data['refresh-token'];
 }
 
+async function loginWithMagicLink(email) {
+  // 1. Request magic-link
+  const reqResp = await http.post('/webhook/auth/email/request',
+    { email },
+    { headers: { 'Content-Type': 'application/json' } });
+  if (reqResp.status !== 200) throw new Error(`request failed: ${reqResp.status} ${JSON.stringify(reqResp.data)}`);
+
+  // 2. Get token via debug endpoint
+  await new Promise(r => setTimeout(r, 500));
+  const tokenResp = await http.get(`/webhook/debug/email-token/${encodeURIComponent(email)}`);
+  if (!tokenResp.data?.token) throw new Error(`no debug token: ${JSON.stringify(tokenResp.data)}`);
+
+  // 3. Confirm with Accept: application/json (else backend returns HTML)
+  const confirmResp = await http.get(`/webhook/auth/email/confirm?token=${tokenResp.data.token}`,
+    { headers: { Accept: 'application/json' } });
+  if (!confirmResp.data?.['access-token']) throw new Error(`confirm failed: ${confirmResp.status} ${JSON.stringify(confirmResp.data)}`);
+
+  return {
+    access: confirmResp.data['access-token'],
+    refresh: confirmResp.data['refresh-token'],
+  };
+}
+
 function parseChatStream(rawData) {
   if (typeof rawData !== 'string') rawData = JSON.stringify(rawData);
   const lines = rawData.split('\n').filter(l => l.trim());
@@ -187,6 +210,15 @@ module.exports = {
   'REFERRAL: GET /webhook/referral/stats': async () => {
     const resp = await http.get('/webhook/referral/stats', headers());
     if (![200, 404].includes(resp.status)) throw new Error(`Status ${resp.status}`);
+  },
+
+  'magic-link flow: request → debug-token → confirm → /profile works': async () => {
+    const testEmail = `e2e-test-${Date.now()}@example.com`;
+    const tokens = await loginWithMagicLink(testEmail);
+
+    // Verify JWT works on protected endpoint
+    const profile = await http.get('/webhook/profile', { headers: { Authorization: `Bearer ${tokens.access}` } });
+    if (profile.status !== 200) throw new Error(`profile failed with new JWT: ${profile.status} ${JSON.stringify(profile.data)}`);
   },
 
   'E2E FLOW: логин → чат → история → профиль': async () => {
