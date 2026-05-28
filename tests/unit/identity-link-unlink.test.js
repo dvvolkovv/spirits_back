@@ -26,7 +26,7 @@ describe('linkMethod', () => {
     ]);
     const svc = new IdentityService(pg);
     const out = await svc.linkMethod('u1', 'email', { email: 'taken@x.com' });
-    expect(out).toEqual({ ok: false, reason: 'conflict' });
+    expect(out).toEqual({ ok: false, reason: 'conflict', conflictUserId: 'u-other' });
   });
 
   test('повторная привязка той же identity своему userId — ok', async () => {
