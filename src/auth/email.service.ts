@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import * as bcrypt from 'bcryptjs';
-import { Resend } from 'resend';
+import * as nodemailer from 'nodemailer';
 import { RedisService } from '../common/services/redis.service';
 import { PgService } from '../common/services/pg.service';
 
@@ -11,16 +11,23 @@ import { PgService } from '../common/services/pg.service';
 export class EmailService {
   private readonly logger = new Logger(EmailService.name);
   private tempmailDomains: Set<string>;
-  private resend: Resend | null = null;
-  private readonly fromAddress = process.env.EMAIL_FROM || 'noreply@my.linkeon.io';
+  private transporter: nodemailer.Transporter | null = null;
+  private readonly fromAddress = process.env.EMAIL_FROM || 'noreply@linkeon.io';
 
   constructor(
     @Optional() private readonly redis?: RedisService,
     @Optional() private readonly pg?: PgService,
   ) {
     this.tempmailDomains = this.loadTempmailDomains();
-    const key = process.env.RESEND_API_KEY;
-    if (key) this.resend = new Resend(key);
+    const smtpHost = process.env.SMTP_HOST;
+    if (smtpHost) {
+      this.transporter = nodemailer.createTransport({
+        host: smtpHost,
+        port: parseInt(process.env.SMTP_PORT || '25'),
+        secure: false,
+        ignoreTLS: false,
+      });
+    }
   }
 
   private loadTempmailDomains(): Set<string> {
@@ -59,11 +66,11 @@ export class EmailService {
 
   async sendMagicLink(email: string, token: string): Promise<void> {
     const url = `${process.env.PUBLIC_BASE_URL || 'https://my.linkeon.io'}/webhook/auth/email/confirm?token=${token}`;
-    if (!this.resend) {
-      this.logger.warn(`Resend not configured. Magic-link for ${email}: ${url}`);
+    if (!this.transporter) {
+      this.logger.warn(`SMTP not configured. Magic-link for ${email}: ${url}`);
       return;
     }
-    await this.resend.emails.send({
+    await this.transporter.sendMail({
       from: this.fromAddress,
       to: email,
       subject: 'Вход в linkeon.io',
