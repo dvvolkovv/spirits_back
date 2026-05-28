@@ -1,5 +1,23 @@
 # My.Linkeon (b.linkeon.io)
 
+> ## ⚠️ DEPLOY POLICY — ЧИТАТЬ ПЕРВЫМ
+>
+> **Единственный способ выкатить изменения — `bash ~/Downloads/spirits_back/scripts/deploy.sh`.**
+> Это касается ЛЮБОГО Claude Code-агента, работающего в этих репозиториях (`spirits_back`, `spirits_front`), включая параллельные сессии у других людей.
+>
+> Пайплайн идёт **только из git** через `test.linkeon.io → smoke → my.linkeon.io → smoke`. Прод не трогается, пока test красный.
+>
+> **🚫 ЗАПРЕЩЕНО** (даже как «быстрый фикс», «один маленький патч», «smoke потом прогоним»):
+> - `ssh ... git pull && pm2 restart` вручную
+> - `rsync` фронта с локалки на прод
+> - Любая правка файлов на сервере через `ssh` / редактор
+> - Запуск `npm/pnpm build` напрямую на проде в обход скрипта
+> - Деплой только на прод без прохождения test (кроме явного `PROD_ONLY=1` hotfix-сценария — и только после согласования с владельцем)
+>
+> **Почему так жёстко** ([подробности ниже](#почему-git-а-не-rsync)): rsync уже несколько раз сносил `.env` / `public/agent-avatars/` / `worker/.env`, выпиливая SMSAERO / OPENAI / ANTHROPIC / MCP_SECRET / NEO4J_* / KLING / PEXELS. Ручной `git pull` мимо `deploy.sh` пропускает smoke и роняет прод, не упав на test.
+>
+> Если `deploy.sh` сломан и ничего не катится — **сначала чинить скрипт**, а не обходить его руками. См. [«Break-glass recovery»](#break-glass-recovery-только-если-deploysh-сам-сломан) ниже — это аварийная процедура, не способ доставки изменений.
+
 ## Обзор
 Платформа для поиска единомышленников. NestJS бэкенд + React фронтенд.
 
@@ -30,7 +48,9 @@
 
 ## Деплой (двухфазный: test → prod)
 
-**Только через `scripts/deploy.sh`.** Деплой идёт **из git** — никаких rsync с локалки. Пайплайн:
+**Только через `scripts/deploy.sh`. Без исключений.** См. [DEPLOY POLICY](#-deploy-policy--читать-первым) в шапке файла — там же запрещённые действия и причина запрета.
+
+Деплой идёт **из git** — никаких rsync с локалки. Пайплайн:
 
 1. **PHASE 1 — test.linkeon.io** (`dv@85.192.61.231`). `git pull` → build → `pm2 restart` → smoke (`BASE_URL=https://test.linkeon.io`, `BASIC_AUTH=<линкеон>:<пароль>` из gitignored `scripts/test-server.env.local`).
 2. **PHASE 2 — my.linkeon.io** (`dvolkov@212.113.106.202`). То же на проде. **Запускается ТОЛЬКО если PHASE 1 smoke зелёный.** Если test красный — deploy.sh выходит с кодом 1 ДО касания прода.
@@ -52,7 +72,7 @@ bash ~/Downloads/spirits_back/scripts/deploy.sh
 
 **Bootstrap (один раз):** `bash scripts/provision-test.sh`. Скрипт идемпотентный, можно перезапускать. Креды генерятся и складываются в `scripts/test-server.env.local` (gitignored).
 
-**Почему git, а не rsync**: `rsync --delete` много раз сносил `.env`, `public/agent-avatars/` и `worker/.env` потому что они gitignored / отсутствовали локально. Каждое такое падение приводило к выпадению SMSAERO / OPENAI / ANTHROPIC / MCP_SECRET / NEO4J_* / KLING / PEXELS. Git-pull трогает **только tracked-файлы** — `.env` и `public/` на проде живут постоянно, никем не задеваются.
+<a id="почему-git-а-не-rsync"></a>**Почему git, а не rsync**: `rsync --delete` много раз сносил `.env`, `public/agent-avatars/` и `worker/.env` потому что они gitignored / отсутствовали локально. Каждое такое падение приводило к выпадению SMSAERO / OPENAI / ANTHROPIC / MCP_SECRET / NEO4J_* / KLING / PEXELS. Git-pull трогает **только tracked-файлы** — `.env` и `public/` на проде живут постоянно, никем не задеваются.
 
 **Prerequisites на проде** (one-time setup):
 - Pubkey `~/.ssh/id_rsa.pub` добавлен как Deploy Key в обоих GitHub-репах (read-only access)
@@ -60,7 +80,18 @@ bash ~/Downloads/spirits_back/scripts/deploy.sh
 - `pnpm` установлен в `~/.npm-global/` (PATH прописан в `~/.bashrc`)
 - В `.env` на проде лежат секреты (см. бэкап `/home/dvolkov/backups/linkeon/`)
 
-### Ручные команды (если что-то сломалось)
+<a id="break-glass-recovery-только-если-deploysh-сам-сломан"></a>
+### Break-glass recovery (ТОЛЬКО если `deploy.sh` сам сломан)
+
+⚠️ **Это аварийная процедура для восстановления, а не способ выкатить фичу/фикс.**
+Используется только если `scripts/deploy.sh` не запускается / падает на инфраструктурном шаге, а прод нужно срочно поднять. Если изменения не требуют пожарной выкатки — **сначала чините скрипт**.
+
+Условия применения:
+1. `deploy.sh` уронился до фазы прода (или прод уже сломан и `pm2` не отвечает на новый деплой).
+2. Test-сервер недоступен / GitHub недоступен — и есть таймер.
+3. Владелец/дежурный явно согласовал ручную выкатку.
+
+Если все три условия не выполнены — **этими командами пользоваться нельзя**, идите чинить `deploy.sh`.
 
 **Бэк** (через ssh):
 ```bash
@@ -77,7 +108,10 @@ ssh dvolkov@212.113.106.202 "
   rsync -az --delete dist/ /home/dvolkov/spirits_front/
 "
 ```
-После ручного деплоя **ОБЯЗАТЕЛЬНО** прогнать smoke: `bash ~/Downloads/spirits_back/tests/smoke/run.sh`.
+
+После break-glass:
+1. **ОБЯЗАТЕЛЬНО** прогнать smoke: `bash ~/Downloads/spirits_back/tests/smoke/run.sh`.
+2. Завести пост-мортем: почему `deploy.sh` не сработал и что нужно поправить, чтобы следующий деплой снова пошёл через скрипт.
 
 ## 💾 Бэкапы
 
