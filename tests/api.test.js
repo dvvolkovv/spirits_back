@@ -421,4 +421,28 @@ module.exports = {
     const resp = await http.post('/webhook/auth/oauth/yandex', { code: 'x', state: 'not-in-redis' }, { headers: { 'Content-Type': 'application/json' } });
     assertStatus(resp, 400);
   },
+
+  // ============================================================
+  // IDENTITY ENDPOINTS (require Bearer)
+  // ============================================================
+
+  'GET /webhook/auth/identities — without token → 401/403': async () => {
+    const resp = await http.get('/webhook/auth/identities');
+    assertStatus(resp, 401, 403);
+  },
+
+  'DELETE /webhook/auth/identities/:id — without token → 401/403': async () => {
+    const resp = await http.delete('/webhook/auth/identities/some-uuid');
+    assertStatus(resp, 401, 403);
+  },
+
+  'POST /webhook/auth/identities/link/phone — without token → 401/403': async () => {
+    const resp = await http.post('/webhook/auth/identities/link/phone', { phone: '79030169187', code: '123456' }, { headers: { 'Content-Type': 'application/json' } });
+    assertStatus(resp, 401, 403);
+  },
+
+  'POST /webhook/auth/identities/link/email — without token → 401/403': async () => {
+    const resp = await http.post('/webhook/auth/identities/link/email', { token: 'whatever' }, { headers: { 'Content-Type': 'application/json' } });
+    assertStatus(resp, 401, 403);
+  },
 };

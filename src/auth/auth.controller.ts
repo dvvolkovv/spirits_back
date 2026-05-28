@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, Param, Query, Req, Res, HttpStatus, Logger, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Post, Param, Query, Req, Res, HttpStatus, Logger, UseGuards } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
 import { EmailService } from './email.service';
@@ -318,6 +318,60 @@ location.replace('/chat');
       'access-token':  this.jwt.signAccess(userId),
       'refresh-token': this.jwt.signRefresh(userId),
     });
+  }
+
+  @UseGuards(JwtGuard)
+  @Get('auth/identities')
+  async listMyIdentities(@Req() req: any, @Res() res: Response) {
+    const userId = req.user?.userId;
+    if (!userId) return res.set(CORS).status(401).json({ error: 'unauthorized' });
+    const items = await this.identity.listIdentities(userId);
+    return res.set(CORS).status(200).json(items);
+  }
+
+  @UseGuards(JwtGuard)
+  @Post('auth/identities/link/phone')
+  async linkPhone(@Body() body: { phone?: string; code?: string }, @Req() req: any, @Res() res: Response) {
+    const userId = req.user?.userId;
+    if (!userId) return res.set(CORS).status(401).json({ error: 'unauthorized' });
+    const phone = (body?.phone || '').replace(/\D/g, '');
+    const code = body?.code;
+    if (!phone || !code) return res.set(CORS).status(400).json({ error: 'missing phone/code' });
+
+    // Validate SMS code (same logic as login)
+    const stored = await this.redis.get(`sc-${phone}`);
+    if (!stored || stored !== code) return res.set(CORS).status(401).json({ error: 'invalid code' });
+    await this.redis.del(`sc-${phone}`);
+
+    const r = await this.identity.linkMethod(userId, 'phone', { phone });
+    if (!r.ok) return res.set(CORS).status(409).json({ error: (r as any).reason });
+    return res.set(CORS).status(200).json({ ok: true });
+  }
+
+  @UseGuards(JwtGuard)
+  @Post('auth/identities/link/email')
+  async linkEmail(@Body() body: { token?: string }, @Req() req: any, @Res() res: Response) {
+    const userId = req.user?.userId;
+    if (!userId) return res.set(CORS).status(401).json({ error: 'unauthorized' });
+    const token = body?.token;
+    if (!token) return res.set(CORS).status(400).json({ error: 'missing token' });
+
+    const email = await this.email.consumeMagicToken(token);
+    if (!email) return res.set(CORS).status(400).json({ error: 'invalid token' });
+
+    const r = await this.identity.linkMethod(userId, 'email', { email });
+    if (!r.ok) return res.set(CORS).status(409).json({ error: (r as any).reason });
+    return res.set(CORS).status(200).json({ ok: true });
+  }
+
+  @UseGuards(JwtGuard)
+  @Delete('auth/identities/:id')
+  async unlinkIdentity(@Param('id') id: string, @Req() req: any, @Res() res: Response) {
+    const userId = req.user?.userId;
+    if (!userId) return res.set(CORS).status(401).json({ error: 'unauthorized' });
+    const r = await this.identity.unlinkMethod(userId, id);
+    if (!r.ok) return res.set(CORS).status(400).json({ error: (r as any).reason });
+    return res.set(CORS).status(200).json({ ok: true });
   }
 
   /**
