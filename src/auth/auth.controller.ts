@@ -2,6 +2,7 @@ import { Body, Controller, Get, Post, Param, Query, Req, Res, HttpStatus, Logger
 import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
 import { EmailService } from './email.service';
+import { OAuthGoogleService } from './oauth-google.service';
 import { IdentityService } from '../identity/identity.service';
 import { JwtService } from '../common/services/jwt.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
@@ -23,6 +24,7 @@ export class AuthController {
     private readonly identity: IdentityService,
     private readonly jwt: JwtService,
     private readonly redis: RedisService,
+    private readonly googleOAuth: OAuthGoogleService,
   ) {}
 
   // SMS OTP request — UUID hardcoded to match frontend
@@ -217,6 +219,73 @@ location.replace('/chat');
     const hash = await this.email.hashPassword(password);
     await this.identity.setUserPasswordHash(userId, hash);
     return res.set(CORS).status(200).json({ ok: true });
+  }
+
+  @Post('auth/oauth/init')
+  async oauthInit(@Body() body: { provider?: string; intent?: 'login' | 'link' }, @Req() req: any, @Res() res: Response) {
+    const provider = body?.provider;
+    if (provider !== 'google' && provider !== 'yandex') {
+      return res.set(CORS).status(400).json({ error: 'invalid provider' });
+    }
+    const intent = body?.intent === 'link' ? 'link' : 'login';
+
+    let userId: string | undefined;
+    if (intent === 'link') {
+      const authHeader = req.headers['authorization'];
+      if (!authHeader?.startsWith('Bearer ')) {
+        return res.set(CORS).status(401).json({ error: 'auth required for link' });
+      }
+      try {
+        const payload = this.jwt.verify(authHeader.substring(7));
+        userId = payload.userId;
+      } catch {
+        return res.set(CORS).status(401).json({ error: 'invalid token' });
+      }
+    }
+
+    const state = require('crypto').randomBytes(24).toString('base64url');
+    await this.redis.set(`oauth-state-${state}`, JSON.stringify({ provider, intent, userId }), 300);
+
+    let authorizeUrl: string;
+    if (provider === 'google') {
+      authorizeUrl = this.googleOAuth.buildAuthorizeUrl(state);
+    } else {
+      // yandex — will be wired in Task 12
+      return res.set(CORS).status(503).json({ error: 'yandex not yet wired' });
+    }
+
+    return res.set(CORS).status(200).json({ authorizeUrl });
+  }
+
+  @Post('auth/oauth/google')
+  async oauthGoogle(@Body() body: { code?: string; state?: string }, @Res() res: Response) {
+    const { code, state } = body || {};
+    if (!code || !state) return res.set(CORS).status(400).json({ error: 'missing code/state' });
+
+    const stateRaw = await this.redis.get(`oauth-state-${state}`);
+    if (!stateRaw) return res.set(CORS).status(400).json({ error: 'state expired' });
+    await this.redis.del(`oauth-state-${state}`);
+    const stateData = JSON.parse(stateRaw);
+    if (stateData.provider !== 'google') return res.set(CORS).status(400).json({ error: 'state mismatch' });
+
+    let userInfo;
+    try {
+      userInfo = await this.googleOAuth.exchangeCodeForUserinfo(code);
+    } catch (e: any) {
+      return res.set(CORS).status(400).json({ error: 'google exchange failed', detail: e.message });
+    }
+
+    if (stateData.intent === 'link' && stateData.userId) {
+      const r = await this.identity.linkMethod(stateData.userId, 'google', userInfo);
+      if (!r.ok) return res.set(CORS).status(409).json({ error: 'conflict' });
+      return res.set(CORS).status(200).json({ linked: true });
+    }
+
+    const { userId } = await this.identity.resolveOrCreate('google', userInfo);
+    return res.set(CORS).status(200).json({
+      'access-token':  this.jwt.signAccess(userId),
+      'refresh-token': this.jwt.signRefresh(userId),
+    });
   }
 
   /**

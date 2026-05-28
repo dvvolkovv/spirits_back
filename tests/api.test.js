@@ -396,4 +396,19 @@ module.exports = {
       if (!resp.data['refresh-token']) throw new Error('Missing refresh-token in refresh response');
     }
   },
+
+  'POST /webhook/auth/oauth/init — invalid provider → 400': async () => {
+    const resp = await http.post('/webhook/auth/oauth/init', { provider: 'facebook' }, { headers: { 'Content-Type': 'application/json' } });
+    assertStatus(resp, 400);
+  },
+
+  'POST /webhook/auth/oauth/google — missing code/state → 400': async () => {
+    const resp = await http.post('/webhook/auth/oauth/google', {}, { headers: { 'Content-Type': 'application/json' } });
+    assertStatus(resp, 400);
+  },
+
+  'POST /webhook/auth/oauth/google — invalid state → 400': async () => {
+    const resp = await http.post('/webhook/auth/oauth/google', { code: 'x', state: 'not-in-redis' }, { headers: { 'Content-Type': 'application/json' } });
+    assertStatus(resp, 400);
+  },
 };
