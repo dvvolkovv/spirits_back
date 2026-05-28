@@ -12,11 +12,13 @@ module.exports = defineConfig({
   reporter: [['list']],
   use: {
     baseURL: process.env.BASE_URL || 'https://my.linkeon.io',
-    // Basic Auth для test.linkeon.io. На проде BASIC_AUTH пустой → undefined → ничего не меняется.
+    // Basic Auth для test.linkeon.io. send:'always' — шлём credentials проактивно,
+    // т.к. nginx отвечает 401 без WWW-Authenticate challenge (Playwright без этой опции
+    // не ретраит запрос с credentials). На проде BASIC_AUTH пустой → undefined.
     httpCredentials: process.env.BASIC_AUTH
       ? (() => {
           const [username, ...rest] = process.env.BASIC_AUTH.split(':');
-          return { username, password: rest.join(':') };
+          return { username, password: rest.join(':'), send: 'always' };
         })()
       : undefined,
     headless: true,
