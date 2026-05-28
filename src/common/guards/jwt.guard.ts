@@ -29,26 +29,26 @@ export class JwtGuard implements CanActivate {
       throw new UnauthorizedException('Invalid or expired token');
     }
 
-    const phone: string = payload.phone;
+    const userId: string = payload.userId ?? payload.sub;
     let isAdmin = false;
-    const cached = this.adminCache.get(phone);
+    const cached = this.adminCache.get(userId);
     if (cached && cached.expires > Date.now()) {
       isAdmin = cached.isAdmin;
     } else {
       try {
         const r = await this.pg.query(
           `SELECT isadmin FROM ai_profiles_consolidated WHERE user_id = $1`,
-          [phone],
+          [userId],
         );
         isAdmin = Boolean(r.rows[0]?.isadmin);
-        this.adminCache.set(phone, { isAdmin, expires: Date.now() + 60_000 });
+        this.adminCache.set(userId, { isAdmin, expires: Date.now() + 60_000 });
       } catch {
         // Если БД легла — пусть пользователь работает как не-админ, не отдаём 500
         isAdmin = false;
       }
     }
 
-    request.user = { phone, sub: payload.sub, isAdmin };
+    request.user = { userId, sub: payload.sub, isAdmin };
     return true;
   }
 }

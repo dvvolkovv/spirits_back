@@ -43,11 +43,11 @@ export class OAuthController {
     if (!['vk', 'youtube', 'tiktok', 'instagram'].includes(platform)) {
       throw new BadRequestException(`unsupported platform: ${platform}`);
     }
-    await this.limiter.check(req.user.phone, 'smm_oauth_start', 5, 3600);
+    await this.limiter.check(req.user.userId, 'smm_oauth_start', 5, 3600);
     const platformLabels: Record<string, string> = {
       vk: 'VK', youtube: 'YouTube', tiktok: 'TikTok', instagram: 'Instagram',
     };
-    const stateToken = await this.state.create(req.user.phone, platform as Platform, redirect);
+    const stateToken = await this.state.create(req.user.userId, platform as Platform, redirect);
     let authorizeUrl: string;
     try {
       switch (platform) {

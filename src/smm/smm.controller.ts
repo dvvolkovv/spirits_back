@@ -29,7 +29,7 @@ export class SmmController {
     @Req() req: any,
     @Body() dto: CreateCampaignDto,
   ): Promise<SmmCampaign> {
-    const userId = req.user.phone;
+    const userId = req.user.userId;
     const res = await this.pg.query(
       `INSERT INTO smm_campaign
           (user_id, conversation_id, topic, source_mode, requested_count)

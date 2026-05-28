@@ -20,7 +20,7 @@ export class SocialAccountController {
 
   @Get()
   async list(@Req() req: any) {
-    const rows = await this.accounts.listForUser(req.user.phone);
+    const rows = await this.accounts.listForUser(req.user.userId);
     // Don't return credentials field — leak prevention
     return rows.map((a) => ({
       id: a.id,
@@ -33,7 +33,7 @@ export class SocialAccountController {
 
   @Post('telegram')
   async createTelegram(@Req() req: any, @Body() dto: CreateTelegramAccountDto) {
-    await this.limiter.check(req.user.phone, 'smm_social_create', 10, 3600);
+    await this.limiter.check(req.user.userId, 'smm_social_create', 10, 3600);
     // Validate bot token by calling Telegram getMe
     let displayName = dto.displayName;
     try {
@@ -56,7 +56,7 @@ export class SocialAccountController {
 
     const finalDisplayName: string = displayName ?? `${dto.chatId}`;
     const account = await this.accounts.create({
-      userId: req.user.phone,
+      userId: req.user.userId,
       platform: 'telegram',
       displayName: finalDisplayName,
       credentialsPlain: { botToken: dto.botToken, chatId: dto.chatId },
@@ -69,7 +69,7 @@ export class SocialAccountController {
   async remove(@Req() req: any, @Param('id') id: string) {
     const acc = await this.accounts.findById(id);
     if (!acc) throw new NotFoundException(`account ${id}`);
-    if (acc.userId !== req.user.phone) throw new ForbiddenException();
+    if (acc.userId !== req.user.userId) throw new ForbiddenException();
     const ok = await this.accounts.deleteById(id);
     return { ok };
   }

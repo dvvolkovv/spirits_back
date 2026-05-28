@@ -82,7 +82,7 @@ export class VideosController {
         WHERE c.user_id = $1
         ORDER BY v.created_at DESC
         LIMIT 100`,
-      [req.user.phone],
+      [req.user.userId],
     );
     return r.rows.map((row: any) => ({
       id: row.id,

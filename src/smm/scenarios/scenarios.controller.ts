@@ -75,7 +75,7 @@ export class ScenariosController {
   async approveOne(@Req() req: any, @Param('id') id: string) {
     await this.assertCanAccessScenario(id, req);
     const result = await this.approval.approveScenarios({
-      userId: req.user.phone,
+      userId: req.user.userId,
       scenarioIds: [id],
     });
     // Attribute render cost to the ai-сообщение that introduced this scenario.
@@ -120,7 +120,7 @@ export class ScenariosController {
           `UPDATE ai_profiles_consolidated
               SET tokens = GREATEST(0, tokens - $1), updated_at = now()
             WHERE user_id = $2`,
-          [tokens, req.user.phone],
+          [tokens, req.user.userId],
         );
         await this.pg.query(
           `UPDATE custom_chat_history
