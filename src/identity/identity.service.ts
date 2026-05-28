@@ -193,4 +193,35 @@ export class IdentityService implements OnModuleInit {
       lastUsedAt: r.last_used_at,
     }));
   }
+
+  async findIdentityByEmail(email: string): Promise<{ userId: string } | null> {
+    if (!this.pg) return null;
+    const normalized = email.trim().toLowerCase();
+    const r = await this.pg.query(
+      `SELECT user_id FROM user_identities
+       WHERE provider = 'email' AND provider_sub = $1 AND email_verified = true
+       LIMIT 1`,
+      [normalized],
+    );
+    return r.rows[0] ? { userId: r.rows[0].user_id } : null;
+  }
+
+  async getUserPasswordHash(userId: string): Promise<string | null> {
+    if (!this.pg) return null;
+    const r = await this.pg.query(`SELECT password_hash FROM user_id WHERE internal_id = $1`, [userId]);
+    return r.rows[0]?.password_hash || null;
+  }
+
+  async setUserPasswordHash(userId: string, hash: string): Promise<void> {
+    if (!this.pg) return;
+    await this.pg.query(`UPDATE user_id SET password_hash = $1 WHERE internal_id = $2`, [hash, userId]);
+  }
+
+  async touchIdentity(provider: Provider, providerSub: string): Promise<void> {
+    if (!this.pg) return;
+    await this.pg.query(
+      `UPDATE user_identities SET last_used_at = now() WHERE provider = $1 AND provider_sub = $2`,
+      [provider, providerSub],
+    );
+  }
 }

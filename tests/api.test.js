@@ -359,6 +359,21 @@ module.exports = {
     assertJSON(resp);
   },
 
+  'POST /webhook/auth/email/login — missing fields → 400': async () => {
+    const resp = await http.post('/webhook/auth/email/login', {}, { headers: { 'Content-Type': 'application/json' } });
+    assertStatus(resp, 400);
+  },
+
+  'POST /webhook/auth/email/login — unknown email → 401': async () => {
+    const resp = await http.post('/webhook/auth/email/login', { email: 'nobody-' + Date.now() + '@example.com', password: 'xxxxxxxx' }, { headers: { 'Content-Type': 'application/json' } });
+    assertStatus(resp, 401);
+  },
+
+  'POST /webhook/auth/email/set-password — without token → 401': async () => {
+    const resp = await http.post('/webhook/auth/email/set-password', { password: 'abcdefgh' }, { headers: { 'Content-Type': 'application/json' } });
+    assertStatus(resp, 401, 403);
+  },
+
   'POST /webhook/auth/refresh — with valid refresh token returns new tokens': async () => {
     if (!config.TEST_JWT) {
       console.log('(skipped — TEST_JWT not set)');

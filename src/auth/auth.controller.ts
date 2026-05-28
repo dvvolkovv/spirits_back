@@ -1,9 +1,10 @@
-import { Body, Controller, Get, Post, Param, Query, Req, Res, HttpStatus, Logger } from '@nestjs/common';
+import { Body, Controller, Get, Post, Param, Query, Req, Res, HttpStatus, Logger, UseGuards } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
 import { EmailService } from './email.service';
 import { IdentityService } from '../identity/identity.service';
 import { JwtService } from '../common/services/jwt.service';
+import { JwtGuard } from '../common/guards/jwt.guard';
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -156,6 +157,45 @@ location.replace('/chat');
 </script>
 </body></html>
     `);
+  }
+
+  @Post('auth/email/login')
+  async emailLogin(@Body() body: { email?: string; password?: string }, @Res() res: Response) {
+    const email = (body?.email || '').trim().toLowerCase();
+    const password = body?.password;
+    if (!email || !password) return res.set(CORS).status(400).json({ error: 'missing fields' });
+
+    const idResult = await this.identity.findIdentityByEmail(email);
+    if (!idResult) return res.set(CORS).status(401).json({ error: 'invalid credentials' });
+    const userId = idResult.userId;
+
+    const hash = await this.identity.getUserPasswordHash(userId);
+    if (!hash) return res.set(CORS).status(401).json({ error: 'no password set' });
+
+    const ok = await this.email.verifyPassword(password, hash);
+    if (!ok) return res.set(CORS).status(401).json({ error: 'invalid credentials' });
+
+    await this.identity.touchIdentity('email', email);
+
+    return res.set(CORS).status(200).json({
+      'access-token':  this.jwt.signAccess(userId),
+      'refresh-token': this.jwt.signRefresh(userId),
+    });
+  }
+
+  @UseGuards(JwtGuard)
+  @Post('auth/email/set-password')
+  async setPassword(@Body() body: { password?: string }, @Req() req: any, @Res() res: Response) {
+    const password = body?.password;
+    if (!password || password.length < 8) {
+      return res.set(CORS).status(400).json({ error: 'password must be 8+ chars' });
+    }
+    const userId = req.user?.userId;
+    if (!userId) return res.set(CORS).status(401).json({ error: 'unauthorized' });
+
+    const hash = await this.email.hashPassword(password);
+    await this.identity.setUserPasswordHash(userId, hash);
+    return res.set(CORS).status(200).json({ ok: true });
   }
 
   /**
