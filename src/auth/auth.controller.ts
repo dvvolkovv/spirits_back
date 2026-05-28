@@ -167,6 +167,14 @@ export class AuthController {
     }
     const escapedAccess  = JSON.stringify(tokens['access-token']);
     const escapedRefresh = JSON.stringify(tokens['refresh-token']);
+    // Минимальный userData чтобы AuthContext инициализировался (он требует и authToken, и userData;
+    // профиль подтянется через apiClient после монтирования).
+    const userDataBlob = JSON.stringify({
+      id: userId,
+      phone: '',
+      profile: { values: [], beliefs: [], desires: [], intentions: [], completion: 0 },
+    });
+    const escapedUserData = JSON.stringify(userDataBlob);
     res.set(CORS).status(200).type('html').send(`
 <!doctype html>
 <html><head><meta charset="utf-8"><title>Вход выполнен</title></head>
@@ -177,6 +185,7 @@ try {
   localStorage.setItem('jwt_access_token', ${escapedAccess});
   localStorage.setItem('jwt_refresh_token', ${escapedRefresh});
   localStorage.setItem('authToken', ${escapedAccess});
+  localStorage.setItem('userData', ${escapedUserData});
 } catch(e) {}
 location.replace('/chat');
 </script>
