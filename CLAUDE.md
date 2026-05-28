@@ -269,6 +269,15 @@ cd ~/Downloads/spirits_back/tests && node runner.js  # api (32) + e2e (18) = 50
 - `SMSAERO_LOGIN` / `SMSAERO_API_KEY` — SMS Aero
 - `YOOKASSA_SHOP_ID` / `YOOKASSA_SECRET_KEY` — YooKassa
 - `DEBUG_SMS_CODES=true` — debug endpoint для SMS кодов
+- `SMTP_HOST=185.4.75.22` / `SMTP_PORT=2525` — email (exim4 relay, `ssh root@185.4.75.22`)
+
+## SMTP (email magic-link)
+
+- **Сервер:** `185.4.75.22` (`ssh root@185.4.75.22`), exim4
+- **Порт:** `2525` (25/465/587 заблокированы на уровне ISP с прод-сервера 212.113.106.202; port 2525 open — добавлен вручную в `/etc/exim4/exim4.conf.template`)
+- **Relay nets:** `212.113.106.202` (прод), `85.192.61.231` (test) — в `dc_relay_nets` в `/etc/exim4/update-exim4.conf.conf`
+- **TLS:** self-signed сертификат, в `email.service.ts` стоит `tls: { rejectUnauthorized: false }`
+- **ВАЖНО:** на сервере ещё есть `/etc/exim4/update.exim.conf` — отдельный конфиг для другого домена/аккаунта (s17514494.fastvps-server.com). Не трогать.
 
 ## Важные особенности
 - Системный промпт каждого ассистента включает контекст платформы и список всех ассистентов
