@@ -36,7 +36,7 @@ async function loginViaStorage(page) {
     localStorage.setItem('authToken', a);
     localStorage.setItem('userData', u);
   }, [access, refresh, JSON.stringify(userData)]);
-  await page.goto('/chat');
+  await page.goto('/chat', { waitUntil: 'domcontentloaded' });
 }
 
 test.describe('my.linkeon.io smoke', () => {

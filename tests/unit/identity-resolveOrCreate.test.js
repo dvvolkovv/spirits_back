@@ -16,6 +16,7 @@ describe('IdentityService.resolveOrCreate', () => {
     const pg = makePg([
       { rows: [{ user_id: 'u1' }] },
       { rows: [], rowCount: 1 },
+      { rows: [], rowCount: 0 }, // reactivate soft-delete (no-op if not deleted)
     ]);
     const svc = new IdentityService(pg);
     const out = await svc.resolveOrCreate('phone', { phone: '79030169187' });
@@ -55,6 +56,7 @@ describe('IdentityService.resolveOrCreate', () => {
     const pg = makePg([
       { rows: [{ user_id: 'u1' }] },
       { rows: [], rowCount: 1 },
+      { rows: [], rowCount: 0 }, // reactivate soft-delete (no-op if not deleted)
     ]);
     const svc = new IdentityService(pg);
     await svc.resolveOrCreate('phone', { phone: '+7 (903) 016-91-87' });
