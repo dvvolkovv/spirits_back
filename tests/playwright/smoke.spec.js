@@ -75,6 +75,7 @@ test.describe('my.linkeon.io smoke', () => {
     // directly (skipping AssistantSelection welcome card). We're just
     // smoke-testing that the UI shows the chat layout, not the actual
     // streaming — that's already covered by the API smoke.
+    await applyBasicAuth(page);
     const { access, refresh } = await getJwt();
     const userData = { phone: TEST_PHONE };
     const assistant = { id: 12, name: 'Роман', description: 'Помогаю делать все' };
@@ -95,16 +96,9 @@ test.describe('my.linkeon.io smoke', () => {
 
   test('per-tab independence: two contexts hold different assistants', async ({ browser }) => {
     // Open two isolated browser contexts (= two browser windows with separate sessionStorage).
-    // Используем extraHTTPHeaders (а не httpCredentials) — nginx не шлёт WWW-Authenticate,
-    // поэтому httpCredentials не работают. extraHTTPHeaders добавляет Authorization к
-    // navigation-запросам из нового контекста.
-    const ctxOpts = process.env.BASIC_AUTH
-      ? (() => {
-          const [u, ...r] = process.env.BASIC_AUTH.split(':');
-          const encoded = Buffer.from(`${u}:${r.join(':')}`).toString('base64');
-          return { extraHTTPHeaders: { Authorization: `Basic ${encoded}` } };
-        })()
-      : {};
+    // Basic Auth через page.route() в loginViaStorage → applyBasicAuth().
+    // extraHTTPHeaders не используем: переопределяет Bearer → API 401.
+    const ctxOpts = {};
     const c1 = await browser.newContext(ctxOpts);
     const c2 = await browser.newContext(ctxOpts);
     const p1 = await c1.newPage();

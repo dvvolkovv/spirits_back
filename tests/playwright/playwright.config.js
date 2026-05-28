@@ -12,19 +12,10 @@ module.exports = defineConfig({
   reporter: [['list']],
   use: {
     baseURL: process.env.BASE_URL || 'https://my.linkeon.io',
-    // Basic Auth для test.linkeon.io.
-    // httpCredentials НЕ работает когда nginx возвращает 401 без WWW-Authenticate
-    // (Playwright ждёт challenge, которого нет). Используем extraHTTPHeaders —
-    // он применяется к navigation-запросам из фикстурных страниц, но НЕ к fetch()
-    // из скриптов страницы (API-запросы к /webhook/ — безопасно, там Basic Auth
-    // в nginx отключён). На проде BASIC_AUTH пустой → пустой объект.
-    extraHTTPHeaders: process.env.BASIC_AUTH
-      ? (() => {
-          const [u, ...r] = process.env.BASIC_AUTH.split(':');
-          const encoded = Buffer.from(`${u}:${r.join(':')}`).toString('base64');
-          return { Authorization: `Basic ${encoded}` };
-        })()
-      : {},
+    // Basic Auth для test.linkeon.io обрабатывается через page.route() в applyBasicAuth().
+    // extraHTTPHeaders намеренно убран: он применяется ко ВСЕМ запросам включая fetch() из
+    // скриптов страницы, переопределяет Authorization: Bearer → API получает 401 и разлогинивает.
+    // page.route() добавляет Basic только если Authorization не установлен — Bearer-запросы не трогает.
     headless: true,
     actionTimeout: 15000,
     navigationTimeout: 45000,
