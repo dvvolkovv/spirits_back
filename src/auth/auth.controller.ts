@@ -288,10 +288,11 @@ location.replace('/chat');
     if (stateData.intent === 'link' && stateData.userId) {
       const r = await this.identity.linkMethod(stateData.userId, 'google', userInfo);
       if (!r.ok) {
-        if (r.reason === 'conflict' && r.conflictUserId) {
+        const rFail = r as { ok: false; reason: 'conflict' | 'invalid'; conflictUserId?: string };
+        if (rFail.reason === 'conflict' && rFail.conflictUserId) {
           const mergeToken = require('crypto').randomBytes(24).toString('base64url');
-          const conflictTokens = await this.identity.getTokenBalance(r.conflictUserId);
-          await this.redis.set(`merge-token-${mergeToken}`, JSON.stringify({ targetUserId: stateData.userId, conflictUserId: r.conflictUserId }), 300);
+          const conflictTokens = await this.identity.getTokenBalance(rFail.conflictUserId);
+          await this.redis.set(`merge-token-${mergeToken}`, JSON.stringify({ targetUserId: stateData.userId, conflictUserId: rFail.conflictUserId }), 300);
           return res.set(CORS).status(409).json({ error: 'conflict', mergeToken, conflictTokens });
         }
         return res.set(CORS).status(409).json({ error: 'conflict' });
@@ -327,10 +328,11 @@ location.replace('/chat');
     if (stateData.intent === 'link' && stateData.userId) {
       const r = await this.identity.linkMethod(stateData.userId, 'yandex', userInfo);
       if (!r.ok) {
-        if (r.reason === 'conflict' && r.conflictUserId) {
+        const rFail = r as { ok: false; reason: 'conflict' | 'invalid'; conflictUserId?: string };
+        if (rFail.reason === 'conflict' && rFail.conflictUserId) {
           const mergeToken = require('crypto').randomBytes(24).toString('base64url');
-          const conflictTokens = await this.identity.getTokenBalance(r.conflictUserId);
-          await this.redis.set(`merge-token-${mergeToken}`, JSON.stringify({ targetUserId: stateData.userId, conflictUserId: r.conflictUserId }), 300);
+          const conflictTokens = await this.identity.getTokenBalance(rFail.conflictUserId);
+          await this.redis.set(`merge-token-${mergeToken}`, JSON.stringify({ targetUserId: stateData.userId, conflictUserId: rFail.conflictUserId }), 300);
           return res.set(CORS).status(409).json({ error: 'conflict', mergeToken, conflictTokens });
         }
         return res.set(CORS).status(409).json({ error: 'conflict' });
