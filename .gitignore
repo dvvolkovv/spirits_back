@@ -4,3 +4,4 @@ dist/
 *.log
 .worktrees/
 scripts/test-server.env.local
+test-results/
