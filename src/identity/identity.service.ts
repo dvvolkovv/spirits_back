@@ -18,16 +18,25 @@ export class IdentityService implements OnModuleInit {
       path.join(__dirname, '..', '..', 'src', 'identity', 'migrations', '001_identity_init.sql'),
     ];
     for (const p of candidates) {
-      try {
-        if (fs.existsSync(p)) {
-          const sql = fs.readFileSync(p, 'utf8');
+      if (!fs.existsSync(p)) continue;
+      const sql = fs.readFileSync(p, 'utf8');
+      // Retry up to 5× with 1s backoff — PG pool connections are lazy and
+      // occasionally the first query races against pool warm-up on startup.
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
           await this.pg.query(sql);
           this.logger.log(`identity migration 001 applied from ${p}`);
           return;
+        } catch (e: any) {
+          if (attempt < 5) {
+            this.logger.warn(`identity migration attempt ${attempt} failed: ${e.message} — retrying in 1s`);
+            await new Promise(r => setTimeout(r, 1000));
+          } else {
+            this.logger.error(`identity migration failed after ${attempt} attempts (${p}): ${e.message}`);
+          }
         }
-      } catch (e: any) {
-        this.logger.error(`identity migration failed (${p}): ${e.message}`);
       }
+      return;
     }
     this.logger.warn('identity migration sql not found, skipping');
   }
