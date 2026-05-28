@@ -275,7 +275,7 @@ cd ~/Downloads/spirits_back/tests && node runner.js  # api (32) + e2e (18) = 50
 
 - **Сервер:** `185.4.75.22` (`ssh root@185.4.75.22`), exim4
 - **Порт:** `2525` (25/465/587 заблокированы на уровне ISP с прод-сервера 212.113.106.202; port 2525 open — добавлен вручную в `/etc/exim4/exim4.conf.template`)
-- **Relay nets:** `212.113.106.202` (прод), `85.192.61.231` (test) — в `dc_relay_nets` в `/etc/exim4/update-exim4.conf.conf`
+- **Relay nets:** `212.113.106.202` (прод), `85.192.61.231` (test) — прописаны в `relay_from_hosts` прямо в `/etc/exim4/exim4.conf.template` (строка `hostlist relay_from_hosts = 127.0.0.1 : 212.113.106.202 : 85.192.61.231`). `dc_relay_nets` в `update-exim4.conf.conf` — НЕ применяется к шаблону, не использовать.
 - **TLS:** self-signed сертификат, в `email.service.ts` стоит `tls: { rejectUnauthorized: false }`
 - **ВАЖНО:** на сервере ещё есть `/etc/exim4/update.exim.conf` — отдельный конфиг для другого домена/аккаунта (s17514494.fastvps-server.com). Не трогать.
 
