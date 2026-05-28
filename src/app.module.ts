@@ -23,6 +23,7 @@ import { McpModule } from './mcp/mcp.module';
 import { SmmModule } from './smm/smm.module';
 import { TasksModule } from './tasks/tasks.module';
 import { IdentityModule } from './identity/identity.module';
+import { MonitoringModule } from './monitoring/monitoring.module';
 
 @Module({
   imports: [
@@ -50,6 +51,7 @@ import { IdentityModule } from './identity/identity.module';
     SmmModule,
     TasksModule,
     IdentityModule,
+    MonitoringModule,
   ],
 })
 export class AppModule {}
