@@ -139,13 +139,58 @@ export class IdentityService implements OnModuleInit {
     this.logger.log(`welcome bonus ${this.WELCOME_BONUS} → ${userId}`);
   }
 
-  async linkMethod<P extends Provider>(_userId: string, _provider: P, _data: ProviderData<P>): Promise<{ ok: true } | { ok: false; reason: 'conflict' | 'invalid' }> {
-    throw new Error('not implemented');
+  async linkMethod<P extends Provider>(userId: string, provider: P, data: ProviderData<P>): Promise<{ ok: true } | { ok: false; reason: 'conflict' | 'invalid' }> {
+    if (!this.pg) return { ok: false, reason: 'invalid' };
+
+    const providerSub = this.normalize(provider, data);
+    const { email, verified } = this.extractEmail(provider, data);
+
+    const existing = await this.pg.query(
+      `SELECT user_id FROM user_identities WHERE provider = $1 AND provider_sub = $2 LIMIT 1`,
+      [provider, providerSub],
+    );
+    if (existing.rows.length) {
+      if (existing.rows[0].user_id === userId) return { ok: true };
+      return { ok: false, reason: 'conflict' };
+    }
+    await this.pg.query(
+      `INSERT INTO user_identities (user_id, provider, provider_sub, email, email_verified, last_used_at)
+       VALUES ($1, $2, $3, $4, $5, now())`,
+      [userId, provider, providerSub, email, verified],
+    );
+    return { ok: true };
   }
-  async unlinkMethod(_userId: string, _identityId: string): Promise<{ ok: true } | { ok: false; reason: 'last_method' }> {
-    throw new Error('not implemented');
+
+  async unlinkMethod(userId: string, identityId: string): Promise<{ ok: true } | { ok: false; reason: 'last_method' }> {
+    if (!this.pg) return { ok: false, reason: 'last_method' };
+    const cnt = await this.pg.query(
+      `SELECT count(*)::int AS count FROM user_identities WHERE user_id = $1`,
+      [userId],
+    );
+    if (parseInt(cnt.rows[0].count, 10) <= 1) return { ok: false, reason: 'last_method' };
+    await this.pg.query(
+      `DELETE FROM user_identities WHERE id = $1 AND user_id = $2`,
+      [identityId, userId],
+    );
+    return { ok: true };
   }
-  async listIdentities(_userId: string): Promise<Identity[]> {
-    throw new Error('not implemented');
+
+  async listIdentities(userId: string): Promise<Identity[]> {
+    if (!this.pg) return [];
+    const res = await this.pg.query(
+      `SELECT id, provider, provider_sub, email, email_verified, created_at, last_used_at
+         FROM user_identities WHERE user_id = $1
+         ORDER BY created_at`,
+      [userId],
+    );
+    return res.rows.map(r => ({
+      id: r.id,
+      provider: r.provider,
+      providerSub: r.provider_sub,
+      email: r.email,
+      emailVerified: r.email_verified,
+      createdAt: r.created_at,
+      lastUsedAt: r.last_used_at,
+    }));
   }
 }
