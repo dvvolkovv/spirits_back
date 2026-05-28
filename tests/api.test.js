@@ -63,6 +63,20 @@ module.exports = {
   },
 
   // --- Token Refresh ---
+  'POST /webhook/auth/email/request — invalid email → 400': async () => {
+    const resp = await http.post('/webhook/auth/email/request', { email: 'notanemail' }, { headers: { 'Content-Type': 'application/json' } });
+    assertStatus(resp, 400);
+  },
+  'POST /webhook/auth/email/request — tempmail → 400': async () => {
+    const resp = await http.post('/webhook/auth/email/request', { email: 'foo@10minutemail.com' }, { headers: { 'Content-Type': 'application/json' } });
+    assertStatus(resp, 400);
+    if (resp.data?.error !== 'tempmail_blocked') throw new Error(`expected tempmail_blocked, got ${JSON.stringify(resp.data)}`);
+  },
+  'GET /webhook/auth/email/confirm — without token → 400': async () => {
+    const resp = await http.get('/webhook/auth/email/confirm');
+    assertStatus(resp, 400);
+  },
+
   'POST /webhook/auth/refresh — without token returns 401/400': async () => {
     const resp = await http.post('/webhook/auth/refresh', {}, {
       headers: { 'Content-Type': 'application/json' },

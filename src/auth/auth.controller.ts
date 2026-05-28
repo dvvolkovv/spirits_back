@@ -1,6 +1,9 @@
-import { Controller, Get, Post, Param, Req, Res, HttpStatus, Logger } from '@nestjs/common';
+import { Body, Controller, Get, Post, Param, Query, Req, Res, HttpStatus, Logger } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
+import { EmailService } from './email.service';
+import { IdentityService } from '../identity/identity.service';
+import { JwtService } from '../common/services/jwt.service';
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -12,7 +15,12 @@ const CORS = {
 export class AuthController {
   private readonly logger = new Logger(AuthController.name);
 
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly email: EmailService,
+    private readonly identity: IdentityService,
+    private readonly jwt: JwtService,
+  ) {}
 
   // SMS OTP request — UUID hardcoded to match frontend
   @Get('898c938d-f094-455c-86af-969617e62f7a/sms/:phone')
@@ -92,6 +100,62 @@ export class AuthController {
     } catch (err) {
       return res.status(500).json({ error: err.message || 'Internal error' });
     }
+  }
+
+  @Post('auth/email/request')
+  async emailRequest(@Body() body: { email?: string }, @Req() req: Request, @Res() res: Response) {
+    const rawEmail = (body?.email || '').trim().toLowerCase();
+    if (!rawEmail || !rawEmail.includes('@')) {
+      return res.set(CORS).status(400).json({ error: 'invalid email' });
+    }
+    if (this.email.isTempmail(rawEmail)) {
+      return res.set(CORS).status(400).json({ error: 'tempmail_blocked', message: 'Используйте постоянную почту' });
+    }
+    const ip = ((req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown') as string).split(',')[0].trim();
+    const rl = await this.email.checkRateLimit(rawEmail, ip);
+    if (!rl.ok) {
+      return res.set(CORS).status(429).json({ error: 'rate_limit', reason: (rl as { ok: false; reason: string }).reason });
+    }
+    const token = await this.email.generateMagicToken(rawEmail);
+    await this.email.sendMagicLink(rawEmail, token);
+    return res.set(CORS).status(200).json({ sent: true });
+  }
+
+  @Get('auth/email/confirm')
+  async emailConfirm(@Query('token') token: string, @Req() req: Request, @Res() res: Response) {
+    if (!token) {
+      return res.set(CORS).status(400).type('html').send('<html><body><h1>Ссылка устарела</h1></body></html>');
+    }
+    const email = await this.email.consumeMagicToken(token);
+    if (!email) {
+      return res.set(CORS).status(400).type('html').send('<html><body><h1>Ссылка устарела или уже использована</h1></body></html>');
+    }
+    const { userId } = await this.identity.resolveOrCreate('email', { email });
+    const tokens = {
+      'access-token':  this.jwt.signAccess(userId),
+      'refresh-token': this.jwt.signRefresh(userId),
+    };
+    // JSON для XHR-ответа, HTML с inline-script для прямого клика по ссылке
+    if ((req.headers['accept'] || '').includes('application/json')) {
+      return res.set(CORS).status(200).json(tokens);
+    }
+    const escapedAccess  = JSON.stringify(tokens['access-token']);
+    const escapedRefresh = JSON.stringify(tokens['refresh-token']);
+    res.set(CORS).status(200).type('html').send(`
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Вход выполнен</title></head>
+<body style="font-family:system-ui;padding:40px;text-align:center">
+<p>Заходим...</p>
+<script>
+try {
+  localStorage.setItem('jwt_access_token', ${escapedAccess});
+  localStorage.setItem('jwt_refresh_token', ${escapedRefresh});
+  localStorage.setItem('authToken', ${escapedAccess});
+} catch(e) {}
+location.replace('/chat');
+</script>
+</body></html>
+    `);
   }
 
   /**
