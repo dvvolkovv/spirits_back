@@ -501,7 +501,7 @@ ${blocks.join('\n\n---\n\n')}
     // External URL — fetch (limit 8 MB)
     const resp = await axios.get(srcUrl, { responseType: 'arraybuffer', timeout: 30000, maxContentLength: 8 * 1024 * 1024 });
     const buf = Buffer.from(resp.data);
-    const mime = (resp.headers['content-type'] || 'image/png').split(';')[0].trim();
+    const mime = (String(resp.headers['content-type'] || 'image/png')).split(';')[0].trim();
     if (!mime.startsWith('image/')) throw new Error('URL did not return an image');
     return { b64: buf.toString('base64'), mime };
   }
