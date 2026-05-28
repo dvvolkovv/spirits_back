@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { RedisService } from '../common/services/redis.service';
 import { JwtService } from '../common/services/jwt.service';
+import { IdentityService } from '../identity/identity.service';
 import axios from 'axios';
 
 @Injectable()
@@ -12,6 +13,7 @@ export class AuthService {
     private readonly pg: PgService,
     private readonly redis: RedisService,
     private readonly jwtSvc: JwtService,
+    private readonly identity: IdentityService,
   ) {}
 
   async requestSmsCode(phone: string): Promise<{ status: string }> {
@@ -30,18 +32,6 @@ export class AuthService {
 
     if (userRes.rows.length > 0 && userRes.rows[0].state === 'blocked') {
       return { status: 'blocked' };
-    }
-
-    // Create user if not exists
-    if (userRes.rows.length === 0) {
-      await this.pg.query(
-        `INSERT INTO user_id (primary_phone, state, internal_id) VALUES ($1, 'active', $2) ON CONFLICT (internal_id) DO NOTHING`,
-        [phone, phone],
-      );
-      await this.pg.query(
-        `INSERT INTO ai_profiles_consolidated (user_id, tokens, isadmin) VALUES ($1, 25000, false) ON CONFLICT DO NOTHING`,
-        [phone],
-      );
     }
 
     // Generate 6-digit code
@@ -100,15 +90,11 @@ export class AuthService {
 
     await this.redis.del(`sc-${phone}`);
 
-    // Ensure profile exists
-    await this.pg.query(
-      `INSERT INTO ai_profiles_consolidated (user_id, tokens, isadmin) VALUES ($1, 25000, false) ON CONFLICT DO NOTHING`,
-      [phone],
-    );
+    const { userId } = await this.identity.resolveOrCreate('phone', { phone });
 
     return {
-      'access-token': this.jwtSvc.signAccess(phone),
-      'refresh-token': this.jwtSvc.signRefresh(phone),
+      'access-token': this.jwtSvc.signAccess(userId),
+      'refresh-token': this.jwtSvc.signRefresh(userId),
     };
   }
 
@@ -147,9 +133,10 @@ export class AuthService {
     try {
       const payload = this.jwtSvc.verify(refreshToken);
       if (payload.type !== 'refresh') return null;
+      const userId: string = payload.userId ?? payload.sub;
       return {
-        'access-token': this.jwtSvc.signAccess(payload.phone),
-        'refresh-token': this.jwtSvc.signRefresh(payload.phone),
+        'access-token': this.jwtSvc.signAccess(userId),
+        'refresh-token': this.jwtSvc.signRefresh(userId),
       };
     } catch {
       return null;

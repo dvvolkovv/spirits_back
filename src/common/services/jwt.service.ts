@@ -7,17 +7,17 @@ export class JwtService {
   private readonly accessExpires = parseInt(process.env.JWT_ACCESS_EXPIRES || '7200');
   private readonly refreshExpires = parseInt(process.env.JWT_REFRESH_EXPIRES || '2592000');
 
-  signAccess(phone: string): string {
+  signAccess(userId: string): string {
     return jwt.sign(
-      { sub: phone, phone, type: 'access' },
+      { sub: userId, userId, type: 'access' },
       this.secret,
       { expiresIn: this.accessExpires },
     );
   }
 
-  signRefresh(phone: string): string {
+  signRefresh(userId: string): string {
     return jwt.sign(
-      { sub: phone, phone, type: 'refresh' },
+      { sub: userId, userId, type: 'refresh' },
       this.secret,
       { expiresIn: this.refreshExpires },
     );
