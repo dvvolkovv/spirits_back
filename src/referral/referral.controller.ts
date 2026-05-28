@@ -11,14 +11,14 @@ export class ReferralController {
   @Post('referral/register')
   @UseGuards(JwtGuard)
   async register(@CurrentUser() user: any, @Body() body: { slug: string }, @Res() res: Response) {
-    const result = await this.referralService.register(user.phone, body.slug);
+    const result = await this.referralService.register(user.userId, body.slug);
     return res.status(result.success ? 200 : 400).json(result);
   }
 
   @Get('referral/stats')
   @UseGuards(JwtGuard)
   async getStats(@CurrentUser() user: any, @Res() res: Response) {
-    const result = await this.referralService.getStats(user.phone);
+    const result = await this.referralService.getStats(user.userId);
     return res.status(200).json(result);
   }
 }

@@ -34,7 +34,7 @@ export class ScenariosController {
     );
     if (r.rows.length === 0) throw new NotFoundException(`scenario ${scenarioId} not found`);
     if (req.user?.isAdmin) return;
-    if (r.rows[0].user_id !== req.user?.phone) {
+    if (r.rows[0].user_id !== req.user?.userId) {
       throw new ForbiddenException('not your scenario');
     }
   }

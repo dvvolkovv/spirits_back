@@ -15,13 +15,13 @@ export class ProfileController {
   @Get('profile')
   @UseGuards(JwtGuard)
   async getProfile(@CurrentUser() user: any, @Res() res: Response) {
-    const profile = await this.profileService.getProfile(user.phone);
+    const profile = await this.profileService.getProfile(user.userId);
     if (!profile) return res.status(404).json({ error: 'Profile not found' });
 
     // Entities (values, beliefs, etc.) live in Neo4j only
     if (this.neo4j && profile[0]?.profileJson) {
       try {
-        const neo4jData = await this.neo4j.getProfileEntities(user.phone);
+        const neo4jData = await this.neo4j.getProfileEntities(user.userId);
         if (neo4jData) {
           Object.assign(profile[0].profileJson, neo4jData);
         }
@@ -34,7 +34,7 @@ export class ProfileController {
   @Post('profile-update')
   @UseGuards(JwtGuard)
   async updateProfile(@CurrentUser() user: any, @Body() body: any, @Res() res: Response) {
-    const result = await this.profileService.updateProfile(user.phone, body);
+    const result = await this.profileService.updateProfile(user.userId, body);
 
     // Entities live in Neo4j only — full replace
     if (this.neo4j) {
@@ -44,7 +44,7 @@ export class ProfileController {
       };
       for (const [field, type] of Object.entries(entityFields)) {
         if (Array.isArray(body[field])) {
-          await this.neo4j.replaceEntities(user.phone, type, body[field]);
+          await this.neo4j.replaceEntities(user.userId, type, body[field]);
         }
       }
     }
@@ -55,7 +55,7 @@ export class ProfileController {
   @Delete('profile')
   @UseGuards(JwtGuard)
   async deleteProfile(@CurrentUser() user: any, @Res() res: Response) {
-    const result = await this.profileService.deleteProfile(user.phone);
+    const result = await this.profileService.deleteProfile(user.userId);
     return res.status(200).json(result);
   }
 
@@ -70,7 +70,7 @@ export class ProfileController {
   @Post('set-email')
   @UseGuards(JwtGuard)
   async setEmail(@CurrentUser() user: any, @Body() body: { email: string }, @Res() res: Response) {
-    const result = await this.profileService.setEmail(user.phone, body.email);
+    const result = await this.profileService.setEmail(user.userId, body.email);
     return res.status(200).json(result);
   }
 }

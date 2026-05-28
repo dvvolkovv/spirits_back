@@ -28,7 +28,7 @@ export class VideoController {
   ) {
     try {
       await this.limiter.check(req.ip || 'unknown', 'video-create', 20, 60);
-      const result = await this.video.createJob(user.phone, dto);
+      const result = await this.video.createJob(user.userId, dto);
       return res.json(result);
     } catch (e: any) {
       if (e instanceof InsufficientTokensError) {
@@ -48,7 +48,7 @@ export class VideoController {
   @Get('jobs/:id')
   @UseGuards(JwtGuard)
   async getJob(@CurrentUser() user: any, @Param('id') id: string) {
-    return this.video.getJob(user.phone, id);
+    return this.video.getJob(user.userId, id);
   }
 
   @Get('jobs')
@@ -58,7 +58,7 @@ export class VideoController {
     @Query('status') status?: string,
     @Query('limit') limit?: string,
   ) {
-    const jobs = await this.video.listJobs(user.phone, {
+    const jobs = await this.video.listJobs(user.userId, {
       status,
       limit: limit ? parseInt(limit, 10) : undefined,
     });
@@ -68,7 +68,7 @@ export class VideoController {
   @Delete('jobs/:id')
   @UseGuards(JwtGuard)
   async deleteJob(@CurrentUser() user: any, @Param('id') id: string) {
-    await this.video.deleteJob(user.phone, id);
+    await this.video.deleteJob(user.userId, id);
     return { ok: true };
   }
 
@@ -82,7 +82,7 @@ export class VideoController {
   ) {
     await this.limiter.check(req.ip || 'unknown', 'video-upload', 60, 60);
     const url = await this.video.uploadUserAsset(
-      user.phone,
+      user.userId,
       'image',
       file.buffer,
       file.mimetype,
@@ -101,7 +101,7 @@ export class VideoController {
   ) {
     await this.limiter.check(req.ip || 'unknown', 'video-upload', 60, 60);
     const url = await this.video.uploadUserAsset(
-      user.phone,
+      user.userId,
       'audio',
       file.buffer,
       file.mimetype,

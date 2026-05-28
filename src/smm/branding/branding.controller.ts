@@ -45,7 +45,7 @@ export class BrandingController {
     );
     if (r.rows.length === 0) throw new NotFoundException(`campaign ${campaignId} not found`);
     if (req.user?.isAdmin) return;
-    if (r.rows[0].user_id !== req.user?.phone) {
+    if (r.rows[0].user_id !== req.user?.userId) {
       throw new ForbiddenException('not your campaign');
     }
   }

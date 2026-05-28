@@ -11,7 +11,7 @@ export class TokensController {
   @Get('user/tokens')
   @UseGuards(JwtGuard)
   async getTokens(@CurrentUser() user: any, @Res() res: Response) {
-    const tokens = await this.profileService.getTokenBalance(user.phone);
+    const tokens = await this.profileService.getTokenBalance(user.userId);
     return res.status(200).json({ success: true, tokens });
   }
 }

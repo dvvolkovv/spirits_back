@@ -21,29 +21,29 @@ export class DozvonController {
 
   @Get('campaigns')
   list(@CurrentUser() user: any) {
-    return this.dozvon.getCampaigns(user.phone);
+    return this.dozvon.getCampaigns(user.userId);
   }
 
   @Post('campaigns')
   create(@CurrentUser() user: any, @Body() body: { title?: string; task_text?: string }) {
-    return this.dozvon.createCampaign(user.phone, body || {});
+    return this.dozvon.createCampaign(user.userId, body || {});
   }
 
   @Get('campaigns/:id')
   get(@CurrentUser() user: any, @Param('id', ParseIntPipe) id: number) {
-    return this.dozvon.getCampaign(user.phone, id);
+    return this.dozvon.getCampaign(user.userId, id);
   }
 
   @Delete('campaigns/:id')
   remove(@CurrentUser() user: any, @Param('id', ParseIntPipe) id: number) {
-    return this.dozvon.deleteCampaign(user.phone, id);
+    return this.dozvon.deleteCampaign(user.userId, id);
   }
 
   // ─── CHAT (planning dialog) ─────────────────────────────────────
 
   @Get('campaigns/:id/history')
   async history(@CurrentUser() user: any, @Param('id', ParseIntPipe) id: number) {
-    await this.dozvon.getCampaign(user.phone, id); // ACL — 404/forbidden если чужая
+    await this.dozvon.getCampaign(user.userId, id); // ACL — 404/forbidden если чужая
     return this.chat.getHistory(id);
   }
 
@@ -55,7 +55,7 @@ export class DozvonController {
     @Res() res: Response,
   ) {
     if (!body?.message?.trim()) throw new BadRequestException('message is required');
-    await this.dozvon.getCampaign(user.phone, id);
+    await this.dozvon.getCampaign(user.userId, id);
     await this.chat.streamChat(id, body.message.trim(), res);
   }
 
@@ -63,7 +63,7 @@ export class DozvonController {
 
   @Post('campaigns/:id/execute')
   execute(@CurrentUser() user: any, @Param('id', ParseIntPipe) id: number) {
-    return this.dozvon.executeCampaign(user.phone, id);
+    return this.dozvon.executeCampaign(user.userId, id);
   }
 
   // ─── PRICING ────────────────────────────────────────────────────

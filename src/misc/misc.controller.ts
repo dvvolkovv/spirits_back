@@ -52,10 +52,10 @@ export class MiscController {
 
       const tokenCost = quality === 'hd' ? 10000 : 5000;
       // Check balance
-      const balRes = await this.miscService.checkTokenBalance(user.phone, tokenCost);
+      const balRes = await this.miscService.checkTokenBalance(user.userId, tokenCost);
       if (!balRes.ok) return res.status(400).json({ error: 'Недостаточно токенов' });
 
-      const result = await this.miscService.generateImage(user.phone, { prompt, quality, aspect_ratio });
+      const result = await this.miscService.generateImage(user.userId, { prompt, quality, aspect_ratio });
       return res.status(200).json(result);
     } catch (err) {
       return res.status(500).json({ error: err.message || 'Image generation failed' });
@@ -71,10 +71,10 @@ export class MiscController {
       if (!sourceImageUrl) return res.status(400).json({ error: 'Missing sourceImageUrl' });
 
       const tokenCost = quality === 'hd' ? 10000 : 5000;
-      const balRes = await this.miscService.checkTokenBalance(user.phone, tokenCost);
+      const balRes = await this.miscService.checkTokenBalance(user.userId, tokenCost);
       if (!balRes.ok) return res.status(400).json({ error: 'Недостаточно токенов' });
 
-      const result = await this.miscService.editImage(user.phone, { prompt, sourceImageUrl, quality });
+      const result = await this.miscService.editImage(user.userId, { prompt, sourceImageUrl, quality });
       return res.status(200).json(result);
     } catch (err) {
       return res.status(500).json({ error: err.message || 'Image edit failed' });
@@ -91,7 +91,7 @@ export class MiscController {
         return res.status(400).json({ error: 'Поддерживаются только PNG / JPEG / WEBP' });
       }
       try {
-        const url = await this.miscService.saveUploadedImage(user.phone, buffer, mimetype);
+        const url = await this.miscService.saveUploadedImage(user.userId, buffer, mimetype);
         return res.status(200).json({ url, tokensSpent: 0 });
       } catch (e: any) {
         return res.status(500).json({ error: e.message || 'upload failed' });
@@ -121,10 +121,10 @@ export class MiscController {
       const { sourceImageUrl } = req.body;
       if (!sourceImageUrl) return res.status(400).json({ error: 'Missing sourceImageUrl' });
 
-      const balRes = await this.miscService.checkTokenBalance(user.phone, 10000);
+      const balRes = await this.miscService.checkTokenBalance(user.userId, 10000);
       if (!balRes.ok) return res.status(400).json({ error: 'Недостаточно токенов' });
 
-      const result = await this.miscService.upscaleImage(user.phone, { sourceImageUrl });
+      const result = await this.miscService.upscaleImage(user.userId, { sourceImageUrl });
       return res.status(200).json(result);
     } catch (err) {
       return res.status(500).json({ error: err.message || 'Image upscale failed' });
@@ -142,10 +142,10 @@ export class MiscController {
       }
 
       const tokenCost = quality === 'hd' ? 10000 : 5000;
-      const balRes = await this.miscService.checkTokenBalance(user.phone, tokenCost);
+      const balRes = await this.miscService.checkTokenBalance(user.userId, tokenCost);
       if (!balRes.ok) return res.status(400).json({ error: 'Недостаточно токенов' });
 
-      const result = await this.miscService.composeImage(user.phone, { prompt, sourceImageUrls, quality });
+      const result = await this.miscService.composeImage(user.userId, { prompt, sourceImageUrls, quality });
       return res.status(200).json(result);
     } catch (err) {
       return res.status(500).json({ error: err.message || 'Image compose failed' });
@@ -155,14 +155,14 @@ export class MiscController {
   @Get('imagegen/history')
   @UseGuards(JwtGuard)
   async imageHistory(@CurrentUser() user: any, @Res() res: Response) {
-    const images = await this.miscService.getImageHistory(user.phone);
+    const images = await this.miscService.getImageHistory(user.userId);
     return res.status(200).json(images);
   }
 
   @Delete('imagegen/history')
   @UseGuards(JwtGuard)
   async deleteImage(@CurrentUser() user: any, @Query('id') id: string, @Res() res: Response) {
-    await this.miscService.deleteGeneratedImage(user.phone, parseInt(id));
+    await this.miscService.deleteGeneratedImage(user.userId, parseInt(id));
     return res.status(200).json({ success: true });
   }
 
@@ -171,7 +171,7 @@ export class MiscController {
     if (!auth?.startsWith('Bearer ')) return null;
     try {
       const payload = this.jwtSvc.verify(auth.substring(7));
-      return payload.type === 'access' ? payload.phone : null;
+      return payload.type === 'access' ? payload.userId : null;
     } catch {
       return null;
     }

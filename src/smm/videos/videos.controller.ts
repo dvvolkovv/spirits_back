@@ -38,7 +38,7 @@ export class VideosController {
     );
     if (r.rows.length === 0) throw new NotFoundException(`video ${videoId} not found`);
     if (req.user?.isAdmin) return;
-    if (r.rows[0].user_id !== req.user?.phone) {
+    if (r.rows[0].user_id !== req.user?.userId) {
       throw new ForbiddenException('not your video');
     }
   }
@@ -69,7 +69,7 @@ export class VideosController {
    */
   @Get()
   async listMine(@Req() req: any) {
-    if (!req.user?.phone) {
+    if (!req.user?.userId) {
       throw new ForbiddenException('not authenticated');
     }
     const r = await this.pg.query(

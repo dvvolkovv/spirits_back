@@ -22,7 +22,7 @@ export class PaymentsController {
     };
     const pkg = body.package || body.package_id || 'basic';
     const mapped = pkgMap[pkg] || { amount: body.amount || 149, pkg: 'basic' };
-    const result = await this.paymentsService.createPayment(user.phone, mapped.amount, mapped.pkg);
+    const result = await this.paymentsService.createPayment(user.userId, mapped.amount, mapped.pkg);
     return res.status(200).json(result);
   }
 
@@ -33,7 +33,7 @@ export class PaymentsController {
 
     // If no payment_id — find latest payment for this user
     if (!paymentId) {
-      const latest = await this.paymentsService.getLatestPayment(user.phone);
+      const latest = await this.paymentsService.getLatestPayment(user.userId);
       if (latest) paymentId = latest.payment_id;
     }
 
@@ -41,7 +41,7 @@ export class PaymentsController {
       return res.status(200).json({ status: 'not_found' });
     }
 
-    const result = await this.paymentsService.verifyPayment(paymentId, user.phone);
+    const result = await this.paymentsService.verifyPayment(paymentId, user.userId);
     return res.status(200).json(result);
   }
 
@@ -54,7 +54,7 @@ export class PaymentsController {
   @Post('coupon/redeem')
   @UseGuards(JwtGuard)
   async redeemCoupon(@CurrentUser() user: any, @Body() body: { code: string }, @Res() res: Response) {
-    const result = await this.paymentsService.redeemCoupon(user.phone, body.code);
+    const result = await this.paymentsService.redeemCoupon(user.userId, body.code);
     return res.status(200).json(result);
   }
 }

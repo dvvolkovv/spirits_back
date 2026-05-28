@@ -14,7 +14,7 @@ export class AvatarController {
   @Get('avatar')
   @UseGuards(JwtGuard)
   async getAvatar(@CurrentUser() user: any, @Res() res: Response) {
-    const avatar = await this.avatarService.getAvatar(user.phone);
+    const avatar = await this.avatarService.getAvatar(user.userId);
     if (!avatar) return res.status(204).end();
 
     // If local file, serve it directly as binary
@@ -36,7 +36,7 @@ export class AvatarController {
     // If raw binary (not multipart) — body is already Buffer from body-parser raw
     if (contentType.startsWith('image/') && Buffer.isBuffer(req.body) && req.body.length > 0) {
       try {
-        const result = await this.avatarService.uploadAvatar(user.phone, req.body, contentType);
+        const result = await this.avatarService.uploadAvatar(user.userId, req.body, contentType);
         return res.status(200).json(result);
       } catch (e) {
         return res.status(500).json({ error: e.message });
@@ -50,7 +50,7 @@ export class AvatarController {
         const file = (req as any).file;
         if (!file) return res.status(400).json({ error: 'No file uploaded' });
         try {
-          const result = await this.avatarService.uploadAvatar(user.phone, file.buffer, file.mimetype);
+          const result = await this.avatarService.uploadAvatar(user.userId, file.buffer, file.mimetype);
           resolve(res.status(200).json(result));
         } catch (e) {
           resolve(res.status(500).json({ error: e.message }));

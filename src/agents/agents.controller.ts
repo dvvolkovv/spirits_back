@@ -24,7 +24,7 @@ export class AgentsController {
   @Post('change-agent')
   @UseGuards(JwtGuard)
   async changeAgent(@CurrentUser() user: any, @Body() body: { agent: string }, @Res() res: Response) {
-    const result = await this.agentsService.changeAgent(user.phone, body.agent);
+    const result = await this.agentsService.changeAgent(user.userId, body.agent);
     return res.status(200).json(result);
   }
 

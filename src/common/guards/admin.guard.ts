@@ -7,10 +7,10 @@ export class AdminGuard implements CanActivate {
 
   async canActivate(ctx: ExecutionContext): Promise<boolean> {
     const user = ctx.switchToHttp().getRequest().user;
-    if (!user?.phone) throw new ForbiddenException('Admin only');
+    if (!user?.userId) throw new ForbiddenException('Admin only');
     const res = await this.pg.query(
       `SELECT isadmin FROM ai_profiles_consolidated WHERE user_id = $1`,
-      [user.phone],
+      [user.userId],
     );
     if (!res.rows[0]?.isadmin) throw new ForbiddenException('Admin only');
     return true;

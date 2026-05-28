@@ -41,7 +41,7 @@ export class TasksController {
   @UseGuards(JwtGuard)
   async listUser(@Req() req: any, @Res() res: Response) {
     if (!this.tasks) return res.status(503).json({ error: 'tasks service not configured' });
-    const userId: string = req.user?.phone;
+    const userId: string = req.user?.userId;
     if (!userId) return res.status(401).json({ error: 'unauthorized' });
     const items = await this.tasks.listForUser(userId);
     return res.status(200).json(items);
@@ -56,7 +56,7 @@ export class TasksController {
     @Res() res: Response,
   ) {
     if (!this.tasks) return res.status(503).json({ error: 'tasks service not configured' });
-    const userId: string = req.user?.phone;
+    const userId: string = req.user?.userId;
     if (!userId) return res.status(401).json({ error: 'unauthorized' });
     const lim = limit ? Math.min(Math.max(parseInt(limit, 10) || 30, 1), 200) : 30;
     const data = await this.tasks.getTaskFullForUser(taskId, userId, lim);
@@ -73,7 +73,7 @@ export class TasksController {
     @Res() res: Response,
   ) {
     if (!this.tasks) return res.status(503).json({ error: 'tasks service not configured' });
-    const userId: string = req.user?.phone;
+    const userId: string = req.user?.userId;
     if (!userId) return res.status(401).json({ error: 'unauthorized' });
     const status = body?.status;
     if (!status || !['active', 'archived', 'done'].includes(status)) {

@@ -14,7 +14,7 @@ export class ContactsController {
   async publicProfile(@CurrentUser() user: any, @Param('userId') userIdRaw: string, @Res() res: Response) {
     const userId = Number(userIdRaw);
     if (!userId || Number.isNaN(userId)) throw new BadRequestException('invalid userId');
-    const p = await this.contacts.getPublicProfile(user.phone, userId);
+    const p = await this.contacts.getPublicProfile(user.userId, userId);
     if (!p) return res.status(404).json({ error: 'not_found' });
     return res.status(200).json(p);
   }
@@ -25,7 +25,7 @@ export class ContactsController {
   async publicProfileByPhone(@CurrentUser() user: any, @Param('phone') phone: string, @Res() res: Response) {
     const userId = await this.contacts.idByPhone(phone);
     if (!userId) return res.status(404).json({ error: 'not_found' });
-    const p = await this.contacts.getPublicProfile(user.phone, userId);
+    const p = await this.contacts.getPublicProfile(user.userId, userId);
     if (!p) return res.status(404).json({ error: 'not_found' });
     return res.status(200).json(p);
   }
@@ -39,7 +39,7 @@ export class ContactsController {
   ) {
     if (!body?.userId) throw new BadRequestException('userId required');
     try {
-      const r = await this.contacts.createRequest(user.phone, Number(body.userId), body.message?.slice(0, 500) ?? null);
+      const r = await this.contacts.createRequest(user.userId, Number(body.userId), body.message?.slice(0, 500) ?? null);
       return res.status(200).json(r);
     } catch (e: any) {
       return res.status(400).json({ error: e.message });
@@ -49,14 +49,14 @@ export class ContactsController {
   @Get('contact-requests')
   @UseGuards(JwtGuard)
   async incoming(@CurrentUser() user: any, @Res() res: Response) {
-    const rows = await this.contacts.listIncoming(user.phone);
+    const rows = await this.contacts.listIncoming(user.userId);
     return res.status(200).json(rows);
   }
 
   @Get('contact-requests/sent')
   @UseGuards(JwtGuard)
   async outgoing(@CurrentUser() user: any, @Res() res: Response) {
-    const rows = await this.contacts.listOutgoing(user.phone);
+    const rows = await this.contacts.listOutgoing(user.userId);
     return res.status(200).json(rows);
   }
 
@@ -72,7 +72,7 @@ export class ContactsController {
     if (!id || Number.isNaN(id)) throw new BadRequestException('invalid id');
     if (decision !== 'approve' && decision !== 'reject') throw new BadRequestException('decision must be approve|reject');
     const r = await this.contacts.resolve(
-      user.phone,
+      user.userId,
       id,
       decision === 'approve' ? 'approved' : 'rejected',
     );
@@ -83,7 +83,7 @@ export class ContactsController {
   @Get('contact-visibility')
   @UseGuards(JwtGuard)
   async getVisibility(@CurrentUser() user: any, @Res() res: Response) {
-    const visibility = await this.contacts.contactVisibility(user.phone);
+    const visibility = await this.contacts.contactVisibility(user.userId);
     return res.status(200).json({ visibility });
   }
 
@@ -97,7 +97,7 @@ export class ContactsController {
     if (!['public', 'matchOnly', 'private'].includes(body?.visibility)) {
       throw new BadRequestException('visibility must be public|matchOnly|private');
     }
-    await this.contacts.setContactVisibility(user.phone, body.visibility);
+    await this.contacts.setContactVisibility(user.userId, body.visibility);
     return res.status(200).json({ success: true, visibility: body.visibility });
   }
 }

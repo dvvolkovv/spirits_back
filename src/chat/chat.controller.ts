@@ -23,7 +23,7 @@ export class ChatController {
     if (authHeader?.startsWith('Bearer ')) {
       try {
         const payload = this.jwtSvc.verify(authHeader.substring(7));
-        if (payload.type === 'access') userId = payload.phone;
+        if (payload.type === 'access') userId = payload.userId;
       } catch {}
     }
 
@@ -67,7 +67,7 @@ export class ChatController {
     if (authHeader?.startsWith('Bearer ')) {
       try {
         const payload = this.jwtSvc.verify(authHeader.substring(7));
-        if (payload.type === 'access') userId = payload.phone;
+        if (payload.type === 'access') userId = payload.userId;
       } catch {}
     }
     if (!userId) {
@@ -218,14 +218,14 @@ export class ChatController {
   @Get('chat/history')
   @UseGuards(JwtGuard)
   async getHistory(@CurrentUser() user: any, @Query('assistantId') assistantId: string, @Query('limit') limit: string, @Query('offset') offset: string, @Res() res: Response) {
-    const history = await this.chatService.getChatHistory(user.phone, assistantId, parseInt(limit) || 30, parseInt(offset) || 0);
+    const history = await this.chatService.getChatHistory(user.userId, assistantId, parseInt(limit) || 30, parseInt(offset) || 0);
     return res.status(200).json(history);
   }
 
   @Delete('chat/history')
   @UseGuards(JwtGuard)
   async deleteHistory(@CurrentUser() user: any, @Query('assistantId') assistantId: string, @Res() res: Response) {
-    const result = await this.chatService.deleteChatHistory(user.phone, assistantId);
+    const result = await this.chatService.deleteChatHistory(user.userId, assistantId);
     return res.status(200).json(result);
   }
 
