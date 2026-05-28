@@ -67,8 +67,7 @@ async function loginAsJulia(page) {
 test.describe('Юля (SMM Producer) creator-mode E2E', () => {
   test('login → see Юля → open chat with her', async ({ page }) => {
     await loginAsJulia(page);
-    await page.goto(`${BASE}/chat`);
-    await page.waitForLoadState('networkidle');
+    await page.goto(`${BASE}/chat`, { waitUntil: 'domcontentloaded' });
 
     expect(page.url()).toContain('/chat');
 
@@ -129,8 +128,7 @@ test.describe('Юля (SMM Producer) creator-mode E2E', () => {
       sessionStorage.setItem('selected_assistant', j);
     }, JSON.stringify(julia));
 
-    await page.goto(`${BASE}/chat`);
-    await page.waitForLoadState('networkidle');
+    await page.goto(`${BASE}/chat`, { waitUntil: 'domcontentloaded' });
 
     // Wait for chat to load (history fetch). The ScenarioCard from prior
     // session should render in chat history.
@@ -213,8 +211,7 @@ test.describe('Юля (SMM Producer) creator-mode E2E', () => {
     console.log(`[INFO] Card shows new title (no-reload): ${cardUpdated}`);
 
     // Reload and verify persistence
-    await page.reload();
-    await page.waitForLoadState('networkidle');
+    await page.reload({ waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(4000);
 
     // Scroll to ensure messages render

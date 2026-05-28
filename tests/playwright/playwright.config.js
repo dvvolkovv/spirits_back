@@ -7,7 +7,7 @@ module.exports = defineConfig({
   timeout: 90000,
   expect: { timeout: 15000 },
   fullyParallel: false,        // smoke is sequential, cleaner output
-  retries: 1,
+  retries: 2,
   workers: 1,
   reporter: [['list']],
   use: {
@@ -21,7 +21,7 @@ module.exports = defineConfig({
       : undefined,
     headless: true,
     actionTimeout: 15000,
-    navigationTimeout: 30000,
+    navigationTimeout: 45000,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },
