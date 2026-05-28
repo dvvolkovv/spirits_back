@@ -25,7 +25,7 @@ export class EmailService {
         host: smtpHost,
         port: parseInt(process.env.SMTP_PORT || '25'),
         secure: false,
-        ignoreTLS: false,
+        tls: { rejectUnauthorized: false },
       });
     }
   }
