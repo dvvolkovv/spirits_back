@@ -17,7 +17,7 @@ interface TrackBody {
 export class EventsController {
   constructor(private readonly events: EventsService) {}
 
-  @Post('webhook/events/track')
+  @Post('events/track')
   track(@Body() body: TrackBody, @Req() req: Request, @Res() res: Response) {
     if (!body?.name) {
       return res.status(400).json({ error: 'name required' });

@@ -11,7 +11,10 @@ CREATE TABLE IF NOT EXISTS events (
   name        TEXT NOT NULL,                 -- 'landing_view', 'signup_completed', ...
   props       JSONB NOT NULL DEFAULT '{}'::jsonb,
   source      TEXT,                          -- 'organic' | 'referral:<slug>' | 'utm:<campaign>' | ...
-  cohort_week DATE GENERATED ALWAYS AS ((date_trunc('week', ts))::date) STORED
+  -- Timezone fixed to UTC so the expression is IMMUTABLE (Postgres won't
+  -- accept it otherwise). Without `AT TIME ZONE 'UTC'` the result depends
+  -- on session TZ and migration fails on first run.
+  cohort_week DATE GENERATED ALWAYS AS ((date_trunc('week', ts AT TIME ZONE 'UTC'))::date) STORED
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_ts        ON events (ts DESC);

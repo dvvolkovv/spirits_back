@@ -33,15 +33,26 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
       path.join(__dirname, 'migrations', '001_events.sql'),
       path.join(__dirname, '..', '..', 'src', 'events', 'migrations', '001_events.sql'),
     ];
-    for (const p of candidates) {
-      try {
-        if (fs.existsSync(p)) {
-          await this.pg.query(fs.readFileSync(p, 'utf8'));
-          this.log.log(`events migration 001 applied from ${p}`);
+    const found = candidates.find((p) => fs.existsSync(p));
+    if (!found) {
+      this.log.warn('events migration sql not found, skipping');
+    } else {
+      const sql = fs.readFileSync(found, 'utf8');
+      // Retry to ride out the case where PgService's pool isn't ready on
+      // the first tick — same pattern as IdentityService.
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          await this.pg.query(sql);
+          this.log.log(`events migration 001 applied from ${found}`);
           break;
+        } catch (e: any) {
+          if (attempt === 5) {
+            this.log.error(`events migration failed after 5 attempts: ${e.message}`);
+          } else {
+            this.log.warn(`events migration attempt ${attempt} failed: ${e.message} — retrying in 1s`);
+            await new Promise((r) => setTimeout(r, 1000));
+          }
         }
-      } catch (e: any) {
-        this.log.error(`events migration failed (${p}): ${e.message}`);
       }
     }
 
