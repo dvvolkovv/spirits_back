@@ -18,14 +18,22 @@ export interface FunnelStep {
   key: string;
   label: string;
   count: number;
-  ratioToFirst: number;     // % of step 1 that reached this step
-  ratioToPrev: number | null; // % conversion from prev step
+  // % of step 1 that reached this step. null where identity type changes
+  // between steps (session_id → user_id) — comparing those would mix units.
+  ratioToFirst: number | null;
+  // % conversion from prev step. null on first step, on identity-type
+  // change, or when the previous step had 0 entries (avoid div/0 nonsense).
+  ratioToPrev: number | null;
+  // 'session' = anonymous (counted by distinct session_id),
+  // 'user'    = identified user (counted by distinct user_id).
+  identity: 'session' | 'user';
 }
 
 export interface FunnelResponse {
   from: string;
   to: string;
   source: string | null;
+  excludedUsers: string[];
   steps: FunnelStep[];
   generatedAt: string;
 }
@@ -33,12 +41,25 @@ export interface FunnelResponse {
 interface StepDef {
   key: string;
   label: string;
-  // Returns: SELECT user_id, MIN(ts) AS first_ts FROM ... — keyed by user_id
-  // (or session_id for the anonymous landing step).
-  query: (from: string, to: string, source: string | null) => { sql: string; params: any[] };
-  // For anonymous steps that have no user_id (landing); they count distinct sessions.
-  identityColumn?: 'user_id' | 'session_id';
+  identity: 'session' | 'user';
+  query: (
+    from: string,
+    to: string,
+    source: string | null,
+    excludedUsers: string[],
+  ) => { sql: string; params: any[] };
 }
+
+// Smoke tests + the admin keep firing the same atomic events under fixed
+// phone numbers — they would otherwise look like real funnel traffic.
+// Override via FUNNEL_EXCLUDED_USERS (comma-separated phones).
+const DEFAULT_EXCLUDED_USERS = ['70000000000', '79030169187'];
+const EXCLUDED_USERS: string[] =
+  (process.env.FUNNEL_EXCLUDED_USERS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean) || [];
+const effectiveExcluded = EXCLUDED_USERS.length > 0 ? EXCLUDED_USERS : DEFAULT_EXCLUDED_USERS;
 
 @Injectable()
 export class FunnelService {
@@ -46,14 +67,49 @@ export class FunnelService {
 
   constructor(private readonly pg: PgService) {}
 
+  // Per-user simple step: distinct user_id who fired this atomic event
+  // in window, excluding test/admin users.
+  private userStep(name: string): StepDef['query'] {
+    return (from, to, source, excluded) => ({
+      sql: `
+        SELECT user_id, MIN(ts) AS first_ts
+        FROM events
+        WHERE name = $1
+          AND ts >= $2 AND ts < $3
+          AND user_id IS NOT NULL
+          AND user_id <> ALL($4::text[])
+          ${source ? 'AND source = $5' : ''}
+        GROUP BY user_id`,
+      params: source ? [name, from, to, excluded, source] : [name, from, to, excluded],
+    });
+  }
+
+  // N-th occurrence per user (window-function), e.g. 2nd payment_success.
+  private nthUserStep(name: string, n: number): StepDef['query'] {
+    return (from, to, source, excluded) => ({
+      sql: `
+        SELECT user_id, ts FROM (
+          SELECT user_id, ts,
+                 ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY ts) AS rn
+          FROM events
+          WHERE name = $1
+            AND user_id IS NOT NULL
+            AND user_id <> ALL($4::text[])
+            ${source ? 'AND source = $5' : ''}
+        ) t
+        WHERE rn = $6 AND ts >= $2 AND ts < $3`,
+      params: source ? [name, from, to, excluded, source, n] : [name, from, to, excluded, n],
+    });
+  }
+
   private steps: StepDef[] = [
     {
       key: 'landing_view',
       label: 'Посетитель',
-      identityColumn: 'session_id',
+      identity: 'session',
       query: (from, to, source) => ({
         sql: `
-          SELECT session_id AS identity, MIN(ts) AS first_ts
+          SELECT session_id, MIN(ts) AS first_ts
           FROM events
           WHERE name = 'landing_view'
             AND ts >= $1 AND ts < $2
@@ -63,196 +119,88 @@ export class FunnelService {
         params: source ? [from, to, source] : [from, to],
       }),
     },
-    {
-      key: 'otp_request',
-      label: 'Запросил SMS-код',
-      query: (from, to, source) => ({
-        sql: `
-          SELECT user_id AS identity, MIN(ts) AS first_ts
-          FROM events
-          WHERE name = 'otp_request'
-            AND ts >= $1 AND ts < $2
-            AND user_id IS NOT NULL
-            ${source ? 'AND source = $3' : ''}
-          GROUP BY user_id`,
-        params: source ? [from, to, source] : [from, to],
-      }),
-    },
-    {
-      key: 'otp_verified',
-      label: 'Ввёл код',
-      query: (from, to, source) => ({
-        sql: `
-          SELECT user_id AS identity, MIN(ts) AS first_ts
-          FROM events
-          WHERE name = 'otp_verified'
-            AND ts >= $1 AND ts < $2
-            AND user_id IS NOT NULL
-            ${source ? 'AND source = $3' : ''}
-          GROUP BY user_id`,
-        params: source ? [from, to, source] : [from, to],
-      }),
-    },
-    {
-      key: 'signup_completed',
-      label: 'Зарегистрирован',
-      query: (from, to, source) => ({
-        sql: `
-          SELECT user_id AS identity, MIN(ts) AS first_ts
-          FROM events
-          WHERE name = 'signup_completed'
-            AND ts >= $1 AND ts < $2
-            AND user_id IS NOT NULL
-            ${source ? 'AND source = $3' : ''}
-          GROUP BY user_id`,
-        params: source ? [from, to, source] : [from, to],
-      }),
-    },
-    {
-      key: 'first_message_sent',
-      label: 'Первое сообщение',
-      query: (from, to, source) => ({
-        sql: `
-          SELECT user_id AS identity, MIN(ts) AS first_ts
-          FROM events
-          WHERE name = 'message_sent'
-            AND ts >= $1 AND ts < $2
-            AND user_id IS NOT NULL
-            ${source ? 'AND source = $3' : ''}
-          GROUP BY user_id`,
-        params: source ? [from, to, source] : [from, to],
-      }),
-    },
-    {
-      key: 'first_response_received',
-      label: 'Получил ответ',
-      query: (from, to, source) => ({
-        sql: `
-          SELECT user_id AS identity, MIN(ts) AS first_ts
-          FROM events
-          WHERE name = 'response_received'
-            AND ts >= $1 AND ts < $2
-            AND user_id IS NOT NULL
-            ${source ? 'AND source = $3' : ''}
-          GROUP BY user_id`,
-        params: source ? [from, to, source] : [from, to],
-      }),
-    },
+    { key: 'otp_request',             label: 'Запросил SMS-код',          identity: 'user', query: this.userStep('otp_request') },
+    { key: 'otp_verified',            label: 'Ввёл код',                  identity: 'user', query: this.userStep('otp_verified') },
+    { key: 'signup_completed',        label: 'Зарегистрирован',           identity: 'user', query: this.userStep('signup_completed') },
+    { key: 'first_message_sent',      label: 'Первое сообщение',          identity: 'user', query: this.userStep('message_sent') },
+    { key: 'first_response_received', label: 'Получил ответ',             identity: 'user', query: this.userStep('response_received') },
     {
       key: 'meaningful_dialog',
       label: 'Диалог 3+ реплик',
-      query: (from, to, source) => ({
+      identity: 'user',
+      query: (from, to, source, excluded) => ({
         sql: `
-          SELECT user_id AS identity, MIN(third_msg_ts) AS first_ts
-          FROM (
+          SELECT user_id, MIN(third_msg_ts) AS first_ts FROM (
             SELECT user_id, ts AS third_msg_ts,
                    ROW_NUMBER() OVER (PARTITION BY user_id, session_id ORDER BY ts) AS rn
             FROM events
             WHERE name = 'message_sent'
               AND ts >= $1 AND ts < $2
               AND user_id IS NOT NULL
-              ${source ? 'AND source = $3' : ''}
+              AND user_id <> ALL($3::text[])
+              ${source ? 'AND source = $4' : ''}
           ) t
-          WHERE rn = 3
+          WHERE rn >= 3
           GROUP BY user_id`,
-        params: source ? [from, to, source] : [from, to],
+        params: source ? [from, to, excluded, source] : [from, to, excluded],
       }),
     },
-    {
-      key: 'payment_initiated',
-      label: 'Инициировал платёж',
-      query: (from, to, source) => ({
-        sql: `
-          SELECT user_id AS identity, MIN(ts) AS first_ts
-          FROM events
-          WHERE name = 'payment_initiated'
-            AND ts >= $1 AND ts < $2
-            AND user_id IS NOT NULL
-            ${source ? 'AND source = $3' : ''}
-          GROUP BY user_id`,
-        params: source ? [from, to, source] : [from, to],
-      }),
-    },
-    {
-      key: 'first_payment_success',
-      label: 'Первая оплата',
-      query: (from, to, source) => ({
-        sql: `
-          SELECT user_id AS identity, MIN(ts) AS first_ts
-          FROM events
-          WHERE name = 'payment_success'
-            AND ts >= $1 AND ts < $2
-            AND user_id IS NOT NULL
-            ${source ? 'AND source = $3' : ''}
-          GROUP BY user_id`,
-        params: source ? [from, to, source] : [from, to],
-      }),
-    },
-    {
-      key: 'second_payment_success',
-      label: 'Вторая оплата',
-      query: (from, to, source) => ({
-        sql: `
-          SELECT user_id AS identity, ts AS first_ts FROM (
-            SELECT user_id, ts,
-                   ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY ts) AS rn
-            FROM events
-            WHERE name = 'payment_success'
-              AND user_id IS NOT NULL
-              ${source ? 'AND source = $3' : ''}
-          ) t
-          WHERE rn = 2 AND ts >= $1 AND ts < $2`,
-        params: source ? [from, to, source] : [from, to],
-      }),
-    },
-    {
-      key: 'recurring_buyer',
-      label: 'Постоянный плательщик (3+)',
-      query: (from, to, source) => ({
-        sql: `
-          SELECT user_id AS identity, ts AS first_ts FROM (
-            SELECT user_id, ts,
-                   ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY ts) AS rn
-            FROM events
-            WHERE name = 'payment_success'
-              AND user_id IS NOT NULL
-              ${source ? 'AND source = $3' : ''}
-          ) t
-          WHERE rn = 3 AND ts >= $1 AND ts < $2`,
-        params: source ? [from, to, source] : [from, to],
-      }),
-    },
+    { key: 'payment_initiated',      label: 'Инициировал платёж',          identity: 'user', query: this.userStep('payment_initiated') },
+    { key: 'first_payment_success',  label: 'Первая оплата',               identity: 'user', query: this.userStep('payment_success') },
+    { key: 'second_payment_success', label: 'Вторая оплата',               identity: 'user', query: this.nthUserStep('payment_success', 2) },
+    { key: 'recurring_buyer',        label: 'Постоянный плательщик (3+)',  identity: 'user', query: this.nthUserStep('payment_success', 3) },
   ];
 
   async getFunnel(fromIso: string, toIso: string, source: string | null): Promise<FunnelResponse> {
     const results: FunnelStep[] = [];
-    let firstCount = 0;
-    let prevCount = 0;
+    let firstUserCount = 0;
+    let prev: FunnelStep | null = null;
 
     for (const step of this.steps) {
-      const { sql, params } = step.query(fromIso, toIso, source);
+      const { sql, params } = step.query(fromIso, toIso, source, effectiveExcluded);
       let count = 0;
       try {
         const r = await this.pg.query(sql, params);
-        count = r.rows.length;
+        count = r.rowCount ?? r.rows.length;
       } catch (e: any) {
         this.log.error(`funnel step ${step.key} failed: ${e.message}`);
       }
-      if (results.length === 0) firstCount = count;
-      results.push({
+
+      // ratioToFirst is meaningful only between user-keyed steps; the very
+      // first user-keyed step becomes the new denominator (visitor → user
+      // is an identity-type change we don't compute as a number).
+      const isFirstUser = step.identity === 'user' && firstUserCount === 0;
+      if (isFirstUser) firstUserCount = count;
+
+      let ratioToFirst: number | null = null;
+      if (step.identity === 'user' && firstUserCount > 0 && !isFirstUser) {
+        ratioToFirst = (count / firstUserCount) * 100;
+      } else if (isFirstUser && firstUserCount > 0) {
+        ratioToFirst = 100;
+      }
+
+      let ratioToPrev: number | null = null;
+      if (prev && prev.identity === step.identity && prev.count > 0) {
+        ratioToPrev = (count / prev.count) * 100;
+      }
+
+      const stepRow: FunnelStep = {
         key: step.key,
         label: step.label,
         count,
-        ratioToFirst: firstCount > 0 ? (count / firstCount) * 100 : 0,
-        ratioToPrev: results.length === 0 ? null : prevCount > 0 ? (count / prevCount) * 100 : 0,
-      });
-      prevCount = count;
+        ratioToFirst,
+        ratioToPrev,
+        identity: step.identity,
+      };
+      results.push(stepRow);
+      prev = stepRow;
     }
 
     return {
       from: fromIso,
       to: toIso,
       source,
+      excludedUsers: effectiveExcluded,
       steps: results,
       generatedAt: new Date().toISOString(),
     };
