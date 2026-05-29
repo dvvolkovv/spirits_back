@@ -94,12 +94,12 @@ export class AuthService {
 
     await this.redis.del(`sc-${phone}`);
 
-    const { userId, isNew } = await this.identity.resolveOrCreate('phone', { phone });
+    // IdentityService is the single point that emits signup_completed and
+    // auth_succeeded — covers SMS, Google, Yandex, email magic-link. Here
+    // we only emit the SMS-specific otp_verified.
+    const { userId } = await this.identity.resolveOrCreate('phone', { phone });
 
     this.events?.track('otp_verified', { userId, props: { channel: 'sms' } });
-    if (isNew) {
-      this.events?.track('signup_completed', { userId, props: { channel: 'sms' } });
-    }
 
     return {
       'access-token': this.jwtSvc.signAccess(userId),

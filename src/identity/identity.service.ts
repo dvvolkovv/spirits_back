@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
+import { EventsService } from '../events/events.service';
 import type { Provider, ProviderData, Identity, ResolveResult } from './identity.types';
 
 @Injectable()
@@ -9,7 +10,10 @@ export class IdentityService implements OnModuleInit {
   private readonly logger = new Logger(IdentityService.name);
   private readonly WELCOME_BONUS = 25000;
 
-  constructor(@Optional() private readonly pg?: PgService) {}
+  constructor(
+    @Optional() private readonly pg?: PgService,
+    @Optional() private readonly events?: EventsService,
+  ) {}
 
   async onModuleInit() {
     if (!this.pg) return;
@@ -78,6 +82,7 @@ export class IdentityService implements OnModuleInit {
         `UPDATE user_id SET state = 'active', update_date = now() WHERE internal_id = $1 AND state = 'deleted'`,
         [userId],
       );
+      this.events?.track('auth_succeeded', { userId, props: { method: provider, is_new: false } });
       return { userId, isNew: false, mergedExisting: false };
     }
 
@@ -94,6 +99,7 @@ export class IdentityService implements OnModuleInit {
            VALUES ($1, $2, $3, $4, $5, now())`,
           [userId, provider, providerSub, email, verified],
         );
+        this.events?.track('auth_succeeded', { userId, props: { method: provider, is_new: false, merged: true } });
         return { userId, isNew: false, mergedExisting: true };
       }
     }
@@ -130,6 +136,8 @@ export class IdentityService implements OnModuleInit {
       );
       await this.issueWelcomeBonus(userId);
       await this.pg.query(`COMMIT`);
+      this.events?.track('signup_completed', { userId, props: { method: provider } });
+      this.events?.track('auth_succeeded', { userId, props: { method: provider, is_new: true } });
       return { userId, isNew: true, mergedExisting: false };
     } catch (e: any) {
       await this.pg.query(`ROLLBACK`);

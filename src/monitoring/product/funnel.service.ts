@@ -119,9 +119,14 @@ export class FunnelService {
         params: source ? [from, to, source] : [from, to],
       }),
     },
+    // OTP steps are SMS-only. Users entering via Google/Yandex/email skip
+    // them entirely. They're kept so SMS-specific drops (no code, wrong
+    // code) are visible — but they don't drive the activation ratio.
     { key: 'otp_request',             label: 'Запросил SMS-код',          identity: 'user', query: this.userStep('otp_request') },
     { key: 'otp_verified',            label: 'Ввёл код',                  identity: 'user', query: this.userStep('otp_verified') },
-    { key: 'signup_completed',        label: 'Зарегистрирован',           identity: 'user', query: this.userStep('signup_completed') },
+    // auth_succeeded covers ALL methods — SMS, Google, Yandex, email.
+    { key: 'auth_succeeded',          label: 'Залогинился (любым способом)', identity: 'user', query: this.userStep('auth_succeeded') },
+    { key: 'signup_completed',        label: 'Зарегистрирован (новый юзер)', identity: 'user', query: this.userStep('signup_completed') },
     { key: 'first_message_sent',      label: 'Первое сообщение',          identity: 'user', query: this.userStep('message_sent') },
     { key: 'first_response_received', label: 'Получил ответ',             identity: 'user', query: this.userStep('response_received') },
     {
