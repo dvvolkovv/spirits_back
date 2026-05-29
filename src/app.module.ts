@@ -24,6 +24,7 @@ import { SmmModule } from './smm/smm.module';
 import { TasksModule } from './tasks/tasks.module';
 import { IdentityModule } from './identity/identity.module';
 import { MonitoringModule } from './monitoring/monitoring.module';
+import { EventsModule } from './events/events.module';
 
 @Module({
   imports: [
@@ -51,6 +52,7 @@ import { MonitoringModule } from './monitoring/monitoring.module';
     SmmModule,
     TasksModule,
     IdentityModule,
+    EventsModule,
     MonitoringModule,
   ],
 })
