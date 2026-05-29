@@ -160,6 +160,27 @@ rollback_phase() {
   return "$rc"
 }
 
+# Align test-server nginx htpasswd with this machine's TEST_BASIC_AUTH.
+# Local scripts/test-server.env.local is gitignored, so two dev machines
+# can drift — provision-test.sh on one of them regenerates the password,
+# updates the server and that machine's env file, but leaves the other
+# machine's file stale. Running this before smoke makes whichever creds
+# are in *this* env file authoritative, so smoke's Basic Auth always works.
+sync_test_basic_auth() {
+  [[ "$ENV_NAME" != "test" ]] && return 0
+  [[ -z "${BASIC_AUTH:-}" || "$BASIC_AUTH" != *:* ]] && return 0
+  bold "[smoke pre] aligning test htpasswd with local BASIC_AUTH"
+  local user="${BASIC_AUTH%%:*}"
+  local pass="${BASIC_AUTH#*:}"
+  ssh -o StrictHostKeyChecking=accept-new "$HOST" \
+    "sudo bash -c \"command -v htpasswd >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get -y install apache2-utils >/dev/null; \
+     if [ -f /etc/nginx/.htpasswd-test ]; then htpasswd -b /etc/nginx/.htpasswd-test '$user' '$pass' >/dev/null; \
+     else htpasswd -cb /etc/nginx/.htpasswd-test '$user' '$pass' >/dev/null; fi; \
+     systemctl reload nginx\"" \
+    && green "  ✓ htpasswd synced" \
+    || red   "  ! htpasswd sync failed (smoke may still 401)"
+}
+
 deploy_backend() {
   bold "=== BACKEND ($ENV_NAME) ==="
   bold "[back 1/3] pushing local commits to origin"
@@ -266,6 +287,7 @@ run_phase() {
   phase_upper="$(echo "$phase" | tr '[:lower:]' '[:upper:]')"
   local skip_var="SKIP_${phase_upper}_SMOKE"  # SKIP_TEST_SMOKE / SKIP_PROD_SMOKE
   if [[ -z "${SKIP_SMOKE:-}" && -z "${!skip_var:-}" ]]; then
+    sync_test_basic_auth
     bold "=== SMOKE ($ENV_NAME) ==="
     cd "$LOCAL_BACK_DIR/tests"
     if BASE_URL="$BASE_URL" BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" PG_DSN="$PG_DSN" bash smoke/run.sh; then
