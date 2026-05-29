@@ -33,6 +33,20 @@ export class MonitoringController {
     }
   }
 
+  @Get('admin/monitoring/tech/databases')
+  @UseGuards(JwtGuard, AdminGuard)
+  async techDatabases(@Res() res: Response) {
+    try {
+      const data = await this.monitoring.getDatabases();
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(503).json({
+        error: 'prometheus_unreachable',
+        message: e?.message || String(e),
+      });
+    }
+  }
+
   @Get('admin/monitoring/funnel')
   @UseGuards(JwtGuard, AdminGuard)
   async getFunnel(

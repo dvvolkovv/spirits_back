@@ -22,6 +22,32 @@ interface ProbeOverview {
   tlsSecLeft: number | null;
 }
 
+export interface PostgresOverview {
+  instance: string;
+  up: boolean;
+  dbSizeBytes: number | null;
+  connections: number | null;
+  tps: number | null;          // commits / sec, last 5m
+  cacheHitRatio: number | null; // 0..1 — block hit / (hit + read)
+  deadlocks: number | null;     // since stats reset
+}
+
+export interface RedisOverview {
+  instance: string;
+  up: boolean;
+  memoryUsedBytes: number | null;
+  connectedClients: number | null;
+  opsPerSec: number | null;     // commands / sec, last 5m
+  keyspaceHitRatio: number | null; // 0..1
+  evictedKeys: number | null;   // since start
+}
+
+export interface DatabasesOverview {
+  postgres: PostgresOverview[];
+  redis: RedisOverview[];
+  generatedAt: string;
+}
+
 @Injectable()
 export class MonitoringService {
   private readonly log = new Logger(MonitoringService.name);
@@ -64,6 +90,73 @@ export class MonitoringService {
     for (const r of uptime) ensure(r.metric).uptimeSec = parseFloat(r.value[1]);
 
     return Array.from(byInstance.values()).sort((a, b) => a.instance.localeCompare(b.instance));
+  }
+
+  async getDatabases(): Promise<DatabasesOverview> {
+    const [
+      pgUp, pgSize, pgConn, pgTps, pgHit, pgRead, pgDl,
+      rUp, rMem, rClients, rOps, rHits, rMisses, rEvicted,
+    ] = await Promise.all([
+      this.query('pg_up'),
+      this.query('pg_database_size_bytes{datname="linkeon"}'),
+      this.query('sum by (instance) (pg_stat_database_numbackends{datname="linkeon"})'),
+      this.query('sum by (instance) (rate(pg_stat_database_xact_commit{datname="linkeon"}[5m]))'),
+      this.query('sum by (instance) (rate(pg_stat_database_blks_hit{datname="linkeon"}[5m]))'),
+      this.query('sum by (instance) (rate(pg_stat_database_blks_read{datname="linkeon"}[5m]))'),
+      this.query('sum by (instance) (pg_stat_database_deadlocks{datname="linkeon"})'),
+      this.query('redis_up'),
+      this.query('redis_memory_used_bytes'),
+      this.query('redis_connected_clients'),
+      this.query('rate(redis_commands_processed_total[5m])'),
+      this.query('redis_keyspace_hits_total'),
+      this.query('redis_keyspace_misses_total'),
+      this.query('redis_evicted_keys_total'),
+    ]);
+
+    const idx = (rows: any[]): Map<string, number> => {
+      const m = new Map<string, number>();
+      for (const r of rows) m.set(r.metric.instance, parseFloat(r.value[1]));
+      return m;
+    };
+    const pUp = idx(pgUp), pSize = idx(pgSize), pConn = idx(pgConn), pTps = idx(pgTps),
+          pHit = idx(pgHit), pRead = idx(pgRead), pDl = idx(pgDl);
+    const rUpM = idx(rUp), rMemM = idx(rMem), rClM = idx(rClients), rOpsM = idx(rOps),
+          rHM = idx(rHits), rMM = idx(rMisses), rEvM = idx(rEvicted);
+
+    const pgInstances = Array.from(new Set(pgUp.map((r) => r.metric.instance)));
+    const rInstances  = Array.from(new Set(rUp.map((r) => r.metric.instance)));
+
+    const postgres: PostgresOverview[] = pgInstances.sort().map((i) => {
+      const hit = pHit.get(i) ?? null;
+      const read = pRead.get(i) ?? null;
+      const cacheHit = hit !== null && read !== null && hit + read > 0 ? hit / (hit + read) : null;
+      return {
+        instance: i,
+        up: pUp.get(i) === 1,
+        dbSizeBytes: pSize.get(i) ?? null,
+        connections: pConn.get(i) ?? null,
+        tps: pTps.get(i) ?? null,
+        cacheHitRatio: cacheHit,
+        deadlocks: pDl.get(i) ?? null,
+      };
+    });
+
+    const redis: RedisOverview[] = rInstances.sort().map((i) => {
+      const hits = rHM.get(i) ?? null;
+      const misses = rMM.get(i) ?? null;
+      const ratio = hits !== null && misses !== null && hits + misses > 0 ? hits / (hits + misses) : null;
+      return {
+        instance: i,
+        up: rUpM.get(i) === 1,
+        memoryUsedBytes: rMemM.get(i) ?? null,
+        connectedClients: rClM.get(i) ?? null,
+        opsPerSec: rOpsM.get(i) ?? null,
+        keyspaceHitRatio: ratio,
+        evictedKeys: rEvM.get(i) ?? null,
+      };
+    });
+
+    return { postgres, redis, generatedAt: new Date().toISOString() };
   }
 
   async getProbes(): Promise<ProbeOverview[]> {
