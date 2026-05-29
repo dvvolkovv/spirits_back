@@ -5,6 +5,7 @@ import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { JwtService } from '../common/services/jwt.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
+import { EventsService } from '../events/events.service';
 import * as fs from 'fs';
 
 @Controller('')
@@ -13,6 +14,7 @@ export class ChatController {
     private readonly chatService: ChatService,
     private readonly jwtSvc: JwtService,
     @Optional() private readonly neo4j: Neo4jService,
+    @Optional() private readonly events?: EventsService,
   ) {}
 
   @Post('soulmate/chat')
@@ -49,15 +51,31 @@ export class ChatController {
       } catch {}
     }
 
-    await this.chatService.streamChat(
-      userId,
-      message,
-      String(assistantId),
-      sessionId || `${userId}_${assistantId}`,
-      profileText,
-      res,
-      req,
-    );
+    const finalSessionId = sessionId || `${userId}_${assistantId}`;
+    const startedAt = Date.now();
+    try {
+      await this.chatService.streamChat(
+        userId,
+        message,
+        String(assistantId),
+        finalSessionId,
+        profileText,
+        res,
+        req,
+      );
+      this.events?.track('response_received', {
+        userId,
+        sessionId: finalSessionId,
+        props: { assistant_id: String(assistantId), duration_ms: Date.now() - startedAt },
+      });
+    } catch (e: any) {
+      this.events?.track('response_failed', {
+        userId,
+        sessionId: finalSessionId,
+        props: { assistant_id: String(assistantId), error: e?.message?.slice(0, 200) || 'unknown' },
+      });
+      throw e;
+    }
   }
 
   @Post('agent/upload-and-chat')

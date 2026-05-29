@@ -1,8 +1,9 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { RedisService } from '../common/services/redis.service';
 import { JwtService } from '../common/services/jwt.service';
 import { IdentityService } from '../identity/identity.service';
+import { EventsService } from '../events/events.service';
 import axios from 'axios';
 
 @Injectable()
@@ -14,6 +15,7 @@ export class AuthService {
     private readonly redis: RedisService,
     private readonly jwtSvc: JwtService,
     private readonly identity: IdentityService,
+    @Optional() private readonly events?: EventsService,
   ) {}
 
   async requestSmsCode(phone: string): Promise<{ status: string }> {
@@ -42,6 +44,8 @@ export class AuthService {
 
     // Send SMS via SMS Aero
     await this.sendSms(phone, code);
+
+    this.events?.track('otp_request', { userId: phone, props: { channel: 'sms' } });
 
     return { status: 'sent' };
   }
@@ -90,7 +94,12 @@ export class AuthService {
 
     await this.redis.del(`sc-${phone}`);
 
-    const { userId } = await this.identity.resolveOrCreate('phone', { phone });
+    const { userId, isNew } = await this.identity.resolveOrCreate('phone', { phone });
+
+    this.events?.track('otp_verified', { userId, props: { channel: 'sms' } });
+    if (isNew) {
+      this.events?.track('signup_completed', { userId, props: { channel: 'sms' } });
+    }
 
     return {
       'access-token': this.jwtSvc.signAccess(userId),

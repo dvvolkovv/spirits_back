@@ -1,6 +1,7 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { ReferralService } from '../referral/referral.service';
+import { EventsService } from '../events/events.service';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -11,6 +12,7 @@ export class PaymentsService {
   constructor(
     private readonly pg: PgService,
     @Optional() private readonly referralService: ReferralService,
+    @Optional() private readonly events?: EventsService,
   ) {}
 
   async createPayment(userId: string, amount: number, pkg: string) {
@@ -45,6 +47,11 @@ export class PaymentsService {
        VALUES ($1, $2, $3, $4, $5, 'pending', $6)`,
       [resp.data.id, userId, pkg, amount, tokensForPkg, confirmUrl],
     );
+
+    this.events?.track('payment_initiated', {
+      userId,
+      props: { payment_id: resp.data.id, package: pkg, amount, tokens: tokensForPkg },
+    });
 
     return {
       payment_id: resp.data.id,
@@ -105,6 +112,15 @@ export class PaymentsService {
         }
       }
     }
+
+    this.events?.track('payment_success', {
+      userId,
+      props: {
+        payment_id: paymentId,
+        amount: Number(paymentRow.rows[0]?.amount || 0),
+        tokens: tokensToAdd,
+      },
+    });
   }
 
   async getLatestPayment(userId: string): Promise<any | null> {

@@ -6,6 +6,7 @@ import { ChatToolsService, CHAT_TOOLS } from './chat-tools';
 import { SmmProducerToolsService } from '../smm/producer/smm-producer-tools.service';
 import { ClaudeAgentService } from './claude-agent.service';
 import { TasksService } from '../tasks/tasks.service';
+import { EventsService } from '../events/events.service';
 import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import { Request, Response } from 'express';
@@ -30,6 +31,7 @@ export class ChatService {
     private readonly smmProducerTools: SmmProducerToolsService,
     private readonly claudeAgent: ClaudeAgentService,
     @Optional() private readonly tasksService?: TasksService,
+    @Optional() private readonly events?: EventsService,
   ) {
     if (process.env.ANTHROPIC_API_KEY) {
       this.anthropic = new Anthropic({
@@ -57,6 +59,12 @@ export class ChatService {
       res.status(404).json({ error: 'Agent not found' });
       return;
     }
+
+    this.events?.track('message_sent', {
+      userId,
+      sessionId,
+      props: { assistant_id: String(agent.id), assistant_name: agent.name, length: message?.length || 0 },
+    });
 
     // Get chat history (individual rows: session_id, sender_type, content)
     const chatSessionId = `${userId}_${assistantId}`;
