@@ -1,7 +1,8 @@
-import { Controller, Get, Query, Res, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Headers, Post, Query, Res, UnauthorizedException, UseGuards } from '@nestjs/common';
 import { Response } from 'express';
 import { MonitoringService } from './monitoring.service';
 import { LogsService } from './logs.service';
+import { SyntheticService } from './synthetic.service';
 import { FunnelService } from './product/funnel.service';
 import { EconomyService, EconomyWindow } from './product/economy.service';
 import { QualityService, QualityWindow } from './product/quality.service';
@@ -21,6 +22,7 @@ export class MonitoringController {
     private readonly economy: EconomyService,
     private readonly quality: QualityService,
     private readonly profile: ProfileDepthService,
+    private readonly synthetic: SyntheticService,
   ) {}
 
   @Get('admin/monitoring/tech/overview')
@@ -56,6 +58,41 @@ export class MonitoringController {
         message: e?.message || String(e),
       });
     }
+  }
+
+  @Get('admin/monitoring/tech/synthetic')
+  @UseGuards(JwtGuard, AdminGuard)
+  async syntheticOverview(@Res() res: Response) {
+    try {
+      const data = await this.synthetic.getOverview();
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'synthetic_failed', message: e?.message || String(e) });
+    }
+  }
+
+  // Synthetic results push — called by the runner on node-3 every N minutes.
+  // Auth: shared secret in x-synthetic-token header (env SYNTHETIC_PUSH_TOKEN).
+  @Post('monitoring/synthetic/push')
+  async syntheticPush(
+    @Headers('x-synthetic-token') token: string | undefined,
+    @Body() body: { scenario?: string; success?: boolean; duration_ms?: number; message?: string },
+    @Res() res: Response,
+  ) {
+    const expected = process.env.SYNTHETIC_PUSH_TOKEN || '';
+    if (!expected || token !== expected) {
+      throw new UnauthorizedException('invalid synthetic token');
+    }
+    if (!body?.scenario || typeof body.success !== 'boolean') {
+      return res.status(400).json({ error: 'scenario + success required' });
+    }
+    await this.synthetic.record(
+      body.scenario,
+      body.success,
+      Number(body.duration_ms || 0),
+      body.message || null,
+    );
+    return res.status(204).end();
   }
 
   @Get('admin/monitoring/logs/labels')

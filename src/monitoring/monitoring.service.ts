@@ -42,9 +42,20 @@ export interface RedisOverview {
   evictedKeys: number | null;   // since start
 }
 
+export interface MinioOverview {
+  instance: string;
+  up: boolean;
+  buckets: number | null;
+  objects: number | null;
+  usedBytes: number | null;
+  freeBytes: number | null;
+  totalBytes: number | null;
+}
+
 export interface DatabasesOverview {
   postgres: PostgresOverview[];
   redis: RedisOverview[];
+  minio: MinioOverview[];
   generatedAt: string;
 }
 
@@ -156,7 +167,34 @@ export class MonitoringService {
       };
     });
 
-    return { postgres, redis, generatedAt: new Date().toISOString() };
+    // MinIO — native /minio/v2/metrics/cluster endpoint
+    const [mUp, mBuckets, mObjects, mUsed, mFree, mTotal] = await Promise.all([
+      this.query('up{job="minio"}'),
+      this.query('minio_cluster_bucket_total'),
+      this.query('minio_cluster_usage_object_total'),
+      this.query('minio_cluster_usage_total_bytes'),
+      this.query('minio_cluster_capacity_usable_free_bytes'),
+      this.query('minio_cluster_capacity_usable_total_bytes'),
+    ]);
+    const idxMinio = (rows: any[]): Map<string, number> => {
+      const m = new Map<string, number>();
+      for (const r of rows) m.set(r.metric.instance, parseFloat(r.value[1]));
+      return m;
+    };
+    const mU = idxMinio(mUp), mB = idxMinio(mBuckets), mO = idxMinio(mObjects),
+          mUs = idxMinio(mUsed), mF = idxMinio(mFree), mT = idxMinio(mTotal);
+    const mInstances = Array.from(new Set(mUp.map((r) => r.metric.instance)));
+    const minio: MinioOverview[] = mInstances.sort().map((i) => ({
+      instance: i,
+      up: mU.get(i) === 1,
+      buckets: mB.get(i) ?? null,
+      objects: mO.get(i) ?? null,
+      usedBytes: mUs.get(i) ?? null,
+      freeBytes: mF.get(i) ?? null,
+      totalBytes: mT.get(i) ?? null,
+    }));
+
+    return { postgres, redis, minio, generatedAt: new Date().toISOString() };
   }
 
   async getProbes(): Promise<ProbeOverview[]> {
