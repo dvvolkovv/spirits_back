@@ -7,12 +7,13 @@ import { FunnelService } from './product/funnel.service';
 import { EconomyService } from './product/economy.service';
 import { QualityService } from './product/quality.service';
 import { ProfileDepthService } from './product/profile-depth.service';
+import { SummaryService } from './product/summary.service';
 import { CommonModule } from '../common/common.module';
 import { Neo4jModule } from '../neo4j/neo4j.module';
 
 @Module({
   imports: [CommonModule, Neo4jModule],
   controllers: [MonitoringController],
-  providers: [MonitoringService, LogsService, SyntheticService, FunnelService, EconomyService, QualityService, ProfileDepthService],
+  providers: [MonitoringService, LogsService, SyntheticService, FunnelService, EconomyService, QualityService, ProfileDepthService, SummaryService],
 })
 export class MonitoringModule {}

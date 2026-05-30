@@ -7,6 +7,7 @@ import { FunnelService } from './product/funnel.service';
 import { EconomyService, EconomyWindow } from './product/economy.service';
 import { QualityService, QualityWindow } from './product/quality.service';
 import { ProfileDepthService } from './product/profile-depth.service';
+import { SummaryService } from './product/summary.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 
@@ -23,7 +24,19 @@ export class MonitoringController {
     private readonly quality: QualityService,
     private readonly profile: ProfileDepthService,
     private readonly synthetic: SyntheticService,
+    private readonly summary: SummaryService,
   ) {}
+
+  @Get('admin/monitoring/overview')
+  @UseGuards(JwtGuard, AdminGuard)
+  async summaryOverview(@Res() res: Response) {
+    try {
+      const data = await this.summary.getOverview();
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'summary_failed', message: e?.message || String(e) });
+    }
+  }
 
   @Get('admin/monitoring/tech/overview')
   @UseGuards(JwtGuard, AdminGuard)
