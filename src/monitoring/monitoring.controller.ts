@@ -10,12 +10,16 @@ import { ProfileDepthService } from './product/profile-depth.service';
 import { SummaryService } from './product/summary.service';
 import { NetworkingService, NetworkingWindow } from './product/networking.service';
 import { ChurnService } from './product/churn.service';
+import { SupportService, SupportWindow } from './product/support.service';
+import { ContentService, ContentWindow } from './product/content.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 
 const ECONOMY_WINDOWS: EconomyWindow[] = ['24h', '7d', '30d', '90d', 'all'];
 const QUALITY_WINDOWS: QualityWindow[] = ['24h', '7d', '30d', 'all'];
 const NETWORKING_WINDOWS: NetworkingWindow[] = ['24h', '7d', '30d', '90d', 'all'];
+const SUPPORT_WINDOWS: SupportWindow[] = ['24h', '7d', '30d', '90d', 'all'];
+const CONTENT_WINDOWS: ContentWindow[] = ['24h', '7d', '30d', '90d', 'all'];
 
 @Controller('')
 export class MonitoringController {
@@ -30,6 +34,8 @@ export class MonitoringController {
     private readonly summary: SummaryService,
     private readonly networking: NetworkingService,
     private readonly churn: ChurnService,
+    private readonly support: SupportService,
+    private readonly content: ContentService,
   ) {}
 
   @Get('admin/monitoring/overview')
@@ -153,6 +159,30 @@ export class MonitoringController {
       return res.status(200).json(data);
     } catch (e: any) {
       return res.status(503).json({ error: 'loki_query_failed', message: e?.message || String(e) });
+    }
+  }
+
+  @Get('admin/monitoring/product/support')
+  @UseGuards(JwtGuard, AdminGuard)
+  async getSupport(@Query('window') window: string | undefined, @Res() res: Response) {
+    const w = (SUPPORT_WINDOWS as string[]).includes(window || '') ? (window as SupportWindow) : '30d';
+    try {
+      const data = await this.support.getOverview(w);
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'support_failed', message: e?.message || String(e) });
+    }
+  }
+
+  @Get('admin/monitoring/product/content')
+  @UseGuards(JwtGuard, AdminGuard)
+  async getContent(@Query('window') window: string | undefined, @Res() res: Response) {
+    const w = (CONTENT_WINDOWS as string[]).includes(window || '') ? (window as ContentWindow) : '30d';
+    try {
+      const data = await this.content.getOverview(w);
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'content_failed', message: e?.message || String(e) });
     }
   }
 
