@@ -83,6 +83,13 @@ export class ContentService {
       [window, interval, excluded],
     );
 
+    // video_jobs uses 'ready' for completed (Kling's status name); dozvon
+    // uses 'done'. We accept the common variants so the same code works
+    // across both tables.
+    const COMPLETED = "('completed','succeeded','done','ready')";
+    const FAILED    = "('failed','error')";
+    const IN_FLIGHT = "('pending','processing','queued')";
+
     const videos = await this.one<any>(
       `WITH v AS (
          SELECT * FROM video_jobs
@@ -90,22 +97,22 @@ export class ContentService {
            AND ${inWindow('created_at')}
        )
        SELECT
-         COUNT(*)::int                                                              AS total,
-         COUNT(*) FILTER (WHERE status IN ('completed','succeeded','done'))::int    AS completed,
-         COUNT(*) FILTER (WHERE status IN ('failed','error'))::int                  AS failed,
-         COUNT(*) FILTER (WHERE status IN ('pending','processing','queued'))::int   AS in_flight,
-         AVG(tokens_spent)::numeric(10,1)                                           AS avg_tokens,
+         COUNT(*)::int                                                AS total,
+         COUNT(*) FILTER (WHERE status IN ${COMPLETED})::int          AS completed,
+         COUNT(*) FILTER (WHERE status IN ${FAILED})::int             AS failed,
+         COUNT(*) FILTER (WHERE status IN ${IN_FLIGHT})::int          AS in_flight,
+         AVG(tokens_spent)::numeric(10,1)                             AS avg_tokens,
          (SELECT AVG(EXTRACT(EPOCH FROM (updated_at - created_at))) FROM v
-          WHERE status IN ('completed','succeeded','done'))                         AS avg_wait_sec
+          WHERE status IN ${COMPLETED})                               AS avg_wait_sec
        FROM v`,
       [window, interval, excluded],
     );
 
     const dozvon = await this.one<any>(
       `SELECT
-         COUNT(*)::int                                                              AS total,
-         COUNT(*) FILTER (WHERE status IN ('completed','succeeded','done'))::int    AS completed,
-         AVG(duration_sec) FILTER (WHERE duration_sec IS NOT NULL)::numeric(10,1)   AS avg_duration_sec
+         COUNT(*)::int                                                AS total,
+         COUNT(*) FILTER (WHERE status IN ${COMPLETED})::int          AS completed,
+         AVG(duration_sec) FILTER (WHERE duration_sec IS NOT NULL)::numeric(10,1) AS avg_duration_sec
        FROM dozvon_calls
        WHERE ${inWindow('created_at')}`,
       [window, interval],
