@@ -8,11 +8,14 @@ import { EconomyService, EconomyWindow } from './product/economy.service';
 import { QualityService, QualityWindow } from './product/quality.service';
 import { ProfileDepthService } from './product/profile-depth.service';
 import { SummaryService } from './product/summary.service';
+import { NetworkingService, NetworkingWindow } from './product/networking.service';
+import { ChurnService } from './product/churn.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 
 const ECONOMY_WINDOWS: EconomyWindow[] = ['24h', '7d', '30d', '90d', 'all'];
 const QUALITY_WINDOWS: QualityWindow[] = ['24h', '7d', '30d', 'all'];
+const NETWORKING_WINDOWS: NetworkingWindow[] = ['24h', '7d', '30d', '90d', 'all'];
 
 @Controller('')
 export class MonitoringController {
@@ -25,6 +28,8 @@ export class MonitoringController {
     private readonly profile: ProfileDepthService,
     private readonly synthetic: SyntheticService,
     private readonly summary: SummaryService,
+    private readonly networking: NetworkingService,
+    private readonly churn: ChurnService,
   ) {}
 
   @Get('admin/monitoring/overview')
@@ -148,6 +153,29 @@ export class MonitoringController {
       return res.status(200).json(data);
     } catch (e: any) {
       return res.status(503).json({ error: 'loki_query_failed', message: e?.message || String(e) });
+    }
+  }
+
+  @Get('admin/monitoring/product/networking')
+  @UseGuards(JwtGuard, AdminGuard)
+  async getNetworking(@Query('window') window: string | undefined, @Res() res: Response) {
+    const w = (NETWORKING_WINDOWS as string[]).includes(window || '') ? (window as NetworkingWindow) : '30d';
+    try {
+      const data = await this.networking.getOverview(w);
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'networking_failed', message: e?.message || String(e) });
+    }
+  }
+
+  @Get('admin/monitoring/product/churn')
+  @UseGuards(JwtGuard, AdminGuard)
+  async getChurn(@Res() res: Response) {
+    try {
+      const data = await this.churn.getOverview();
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'churn_failed', message: e?.message || String(e) });
     }
   }
 
