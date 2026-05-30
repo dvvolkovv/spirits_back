@@ -42,6 +42,21 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     return this.driver.session();
   }
 
+  /**
+   * Run a read-only Cypher query and return the rows as plain objects.
+   * Used by monitoring metric services that don't want to manage sessions.
+   */
+  async readRows(cypher: string, params: Record<string, any> = {}): Promise<Record<string, any>[]> {
+    if (!this.driver) return [];
+    const session = this.driver.session({ defaultAccessMode: neo4j.session.READ });
+    try {
+      const r = await session.run(cypher, params);
+      return r.records.map((rec) => rec.toObject());
+    } finally {
+      await session.close();
+    }
+  }
+
   async createOrGetProfile(userId: string): Promise<any> {
     const session = this.getSession();
     if (!session) return null;

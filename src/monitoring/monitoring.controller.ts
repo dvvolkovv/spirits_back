@@ -4,10 +4,13 @@ import { MonitoringService } from './monitoring.service';
 import { LogsService } from './logs.service';
 import { FunnelService } from './product/funnel.service';
 import { EconomyService, EconomyWindow } from './product/economy.service';
+import { QualityService, QualityWindow } from './product/quality.service';
+import { ProfileDepthService } from './product/profile-depth.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 
 const ECONOMY_WINDOWS: EconomyWindow[] = ['24h', '7d', '30d', '90d', 'all'];
+const QUALITY_WINDOWS: QualityWindow[] = ['24h', '7d', '30d', 'all'];
 
 @Controller('')
 export class MonitoringController {
@@ -16,6 +19,8 @@ export class MonitoringController {
     private readonly logs: LogsService,
     private readonly funnel: FunnelService,
     private readonly economy: EconomyService,
+    private readonly quality: QualityService,
+    private readonly profile: ProfileDepthService,
   ) {}
 
   @Get('admin/monitoring/tech/overview')
@@ -93,6 +98,29 @@ export class MonitoringController {
       return res.status(200).json(data);
     } catch (e: any) {
       return res.status(503).json({ error: 'loki_query_failed', message: e?.message || String(e) });
+    }
+  }
+
+  @Get('admin/monitoring/product/quality')
+  @UseGuards(JwtGuard, AdminGuard)
+  async getQuality(@Query('window') window: string | undefined, @Res() res: Response) {
+    const w = (QUALITY_WINDOWS as string[]).includes(window || '') ? (window as QualityWindow) : '30d';
+    try {
+      const data = await this.quality.getOverview(w);
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'quality_failed', message: e?.message || String(e) });
+    }
+  }
+
+  @Get('admin/monitoring/product/profile')
+  @UseGuards(JwtGuard, AdminGuard)
+  async getProfileDepth(@Res() res: Response) {
+    try {
+      const data = await this.profile.getOverview();
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'profile_failed', message: e?.message || String(e) });
     }
   }
 
