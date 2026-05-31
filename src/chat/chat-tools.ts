@@ -69,7 +69,7 @@ export const CHAT_TOOLS = [
   {
     name: 'generate_video',
     description:
-      'Generate a short 5-10s video using Kling. Use when the user asks for a video / animation / "оживи" an image / "сделай видео". ВАЖНО: для mode="text2video" без sourceImageUrl мы сначала автоматически генерируем стилл-кадр через Nano Banana 2 (Imagen 4.0 Ultra primary), а потом анимируем его в image2video — это даёт стабильно лучше композицию, чем «голый» text2video Kling. Итоговая стоимость = картинка 5000 + видео по обычной image2video-сетке (например, kling-v1-6 std 5s → 5000 + 25000 = 30000). Если у тебя уже есть подходящая картинка (из предыдущего generate_image / edit_image / compose_image), передай её как sourceImageUrl и mode="image2video" — это избавит от лишней генерации.',
+      'Generate a video using Kling. По умолчанию 5–10s одним вызовом. Если пользователь просит видео длиннее (15/20/24/30/45/60 секунд) — передай targetDurationSec (число секунд от 5 до 60). При targetDurationSec > 10 мы под капотом цепляем base 10s + N × extend 5s и ffmpeg-склеиваем в один MP4 ровно нужной длительности (например, 24s = 10s + 3×5s = 25s сгенерированного → trim до 24s). Стоимость = base + N × extend, считается автоматически. Long-form работает только с mode="text2video" / "image2video". ВАЖНО: для mode="text2video" без sourceImageUrl мы сначала генерируем стилл-кадр через Nano Banana 2 (+5000 токенов), потом анимируем — даёт стабильнее композицию. Если у тебя уже есть подходящая картинка — передай sourceImageUrl и mode="image2video".',
     input_schema: {
       type: 'object',
       properties: {
@@ -78,6 +78,12 @@ export const CHAT_TOOLS = [
         model: { type: 'string', enum: ['kling-v1-6', 'kling-v2-master'], default: 'kling-v1-6' },
         quality: { type: 'string', enum: ['std', 'pro'], default: 'std' },
         duration: { type: 'number', enum: [5, 10], default: 5 },
+        targetDurationSec: {
+          type: 'number',
+          minimum: 5,
+          maximum: 60,
+          description: 'Final video length in seconds. Use when user wants > 10s; backend chains extends and concats. Only valid for text2video / image2video.',
+        },
         sourceImageUrl: { type: 'string' },
         sourceVideoId: { type: 'string' },
         cameraType: {
