@@ -1,4 +1,5 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
+import { Neo4jService } from '../neo4j/neo4j.service';
 
 const PROM_URL = process.env.PROMETHEUS_URL || 'http://10.10.0.3:9090';
 const TIMEOUT_MS = 5000;
@@ -52,6 +53,18 @@ export interface MinioOverview {
   totalBytes: number | null;
 }
 
+export interface Neo4jJvmOverview {
+  instance: string;
+  up: boolean;
+  heapUsedBytes: number | null;
+  heapMaxBytes: number | null;
+  heapUsedPct: number | null;
+  threads: number | null;
+  gcTimeSecTotal: number | null;
+  nodes: number | null;          // count(*) MATCH (n) — from Cypher
+  relationships: number | null;  // count(*) MATCH ()-[r]->()
+}
+
 export interface NginxOverview {
   instance: string;
   up: boolean;
@@ -69,12 +82,15 @@ export interface DatabasesOverview {
   redis: RedisOverview[];
   minio: MinioOverview[];
   nginx: NginxOverview[];
+  neo4j: Neo4jJvmOverview[];
   generatedAt: string;
 }
 
 @Injectable()
 export class MonitoringService {
   private readonly log = new Logger(MonitoringService.name);
+
+  constructor(@Optional() private readonly neo4j?: Neo4jService) {}
 
   private async query(promql: string): Promise<Array<{ metric: Record<string, string>; value: [number, string] }>> {
     const url = `${PROM_URL}/api/v1/query?query=${encodeURIComponent(promql)}`;
@@ -239,7 +255,60 @@ export class MonitoringService {
       waiting: nWa.get(i) ?? null,
     }));
 
-    return { postgres, redis, minio, nginx, generatedAt: new Date().toISOString() };
+    // Neo4j — JVM stats from jmx_prometheus_javaagent (Neo4j 5 Community
+    // removed org.neo4j.* MBeans, but JVM-level stats are still useful);
+    // node/relationship counts come from a small Cypher query.
+    const [n4Up, n4HeapUsed, n4HeapMax, n4Threads, n4GcTime] = await Promise.all([
+      this.query('up{job="neo4j-jmx"}'),
+      this.query('jvm_memory_used_bytes{area="heap",job="neo4j-jmx"}'),
+      this.query('jvm_memory_max_bytes{area="heap",job="neo4j-jmx"}'),
+      this.query('jvm_threads_current{job="neo4j-jmx"}'),
+      this.query('sum by (instance) (jvm_gc_collection_seconds_sum{job="neo4j-jmx"})'),
+    ]);
+    const idxNeo = (rows: any[]): Map<string, number> => {
+      const m = new Map<string, number>();
+      for (const r of rows) m.set(r.metric.instance, parseFloat(r.value[1]));
+      return m;
+    };
+    const n4U = idxNeo(n4Up), n4Hu = idxNeo(n4HeapUsed), n4Hm = idxNeo(n4HeapMax),
+          n4T = idxNeo(n4Threads), n4G = idxNeo(n4GcTime);
+    const n4Instances = Array.from(new Set(n4Up.map((r) => r.metric.instance)));
+
+    // Counts from Cypher (one query per overview call; only ~1ms for this size graph)
+    let nodes: number | null = null;
+    let rels: number | null = null;
+    if (this.neo4j) {
+      try {
+        const r1 = await this.neo4j.readRows('MATCH (n) RETURN count(n) AS c');
+        nodes = typeof r1[0]?.c?.toNumber === 'function' ? r1[0].c.toNumber() : Number(r1[0]?.c ?? 0);
+      } catch (e: any) {
+        this.log.error(`neo4j node count failed: ${e.message}`);
+      }
+      try {
+        const r2 = await this.neo4j.readRows('MATCH ()-[r]->() RETURN count(r) AS c');
+        rels = typeof r2[0]?.c?.toNumber === 'function' ? r2[0].c.toNumber() : Number(r2[0]?.c ?? 0);
+      } catch (e: any) {
+        this.log.error(`neo4j rel count failed: ${e.message}`);
+      }
+    }
+
+    const neo4j: Neo4jJvmOverview[] = n4Instances.sort().map((i) => {
+      const heapUsed = n4Hu.get(i) ?? null;
+      const heapMax  = n4Hm.get(i) ?? null;
+      return {
+        instance: i,
+        up: n4U.get(i) === 1,
+        heapUsedBytes: heapUsed,
+        heapMaxBytes:  heapMax,
+        heapUsedPct: heapUsed !== null && heapMax && heapMax > 0 ? (heapUsed / heapMax) * 100 : null,
+        threads: n4T.get(i) ?? null,
+        gcTimeSecTotal: n4G.get(i) ?? null,
+        nodes,
+        relationships: rels,
+      };
+    });
+
+    return { postgres, redis, minio, nginx, neo4j, generatedAt: new Date().toISOString() };
   }
 
   async getProbes(): Promise<ProbeOverview[]> {
