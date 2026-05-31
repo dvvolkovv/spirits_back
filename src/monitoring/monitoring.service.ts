@@ -52,10 +52,23 @@ export interface MinioOverview {
   totalBytes: number | null;
 }
 
+export interface NginxOverview {
+  instance: string;
+  up: boolean;
+  activeConnections: number | null;
+  reqPerSec: number | null;          // rate over last 5m
+  acceptedTotal: number | null;
+  handledTotal: number | null;
+  reading: number | null;
+  writing: number | null;
+  waiting: number | null;
+}
+
 export interface DatabasesOverview {
   postgres: PostgresOverview[];
   redis: RedisOverview[];
   minio: MinioOverview[];
+  nginx: NginxOverview[];
   generatedAt: string;
 }
 
@@ -194,7 +207,39 @@ export class MonitoringService {
       totalBytes: mT.get(i) ?? null,
     }));
 
-    return { postgres, redis, minio, generatedAt: new Date().toISOString() };
+    // Nginx — nginx-prometheus-exporter
+    const [nUp, nActive, nAccepted, nHandled, nReading, nWriting, nWaiting, nReqRate] = await Promise.all([
+      this.query('up{job="nginx"}'),
+      this.query('nginx_connections_active'),
+      this.query('nginx_connections_accepted'),
+      this.query('nginx_connections_handled'),
+      this.query('nginx_connections_reading'),
+      this.query('nginx_connections_writing'),
+      this.query('nginx_connections_waiting'),
+      this.query('rate(nginx_http_requests_total[5m])'),
+    ]);
+    const idxNginx = (rows: any[]): Map<string, number> => {
+      const m = new Map<string, number>();
+      for (const r of rows) m.set(r.metric.instance, parseFloat(r.value[1]));
+      return m;
+    };
+    const nU = idxNginx(nUp), nA = idxNginx(nActive), nAc = idxNginx(nAccepted),
+          nH = idxNginx(nHandled), nR = idxNginx(nReading), nW = idxNginx(nWriting),
+          nWa = idxNginx(nWaiting), nReq = idxNginx(nReqRate);
+    const nInstances = Array.from(new Set(nUp.map((r) => r.metric.instance)));
+    const nginx: NginxOverview[] = nInstances.sort().map((i) => ({
+      instance: i,
+      up: nU.get(i) === 1,
+      activeConnections: nA.get(i) ?? null,
+      reqPerSec: nReq.get(i) ?? null,
+      acceptedTotal: nAc.get(i) ?? null,
+      handledTotal: nH.get(i) ?? null,
+      reading: nR.get(i) ?? null,
+      writing: nW.get(i) ?? null,
+      waiting: nWa.get(i) ?? null,
+    }));
+
+    return { postgres, redis, minio, nginx, generatedAt: new Date().toISOString() };
   }
 
   async getProbes(): Promise<ProbeOverview[]> {
