@@ -542,6 +542,30 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     }
 
     // All segments done — concat + trim + upload as the final job's video.
+    //
+    // Concurrency: pollJob is called every 5s for every 'processing' job.
+    // composeFinalVideo takes 30-120s (download segments + ffmpeg + S3 upload),
+    // so without a lock the next tick re-enters with the same job, both pollers
+    // download into the same tmpDir, the first one's `finally rmSync` nukes
+    // files the second one is about to read → ENOENT seg_NN.mp4 spam.
+    // We take an optimistic lock via composed_plan.concat_started_at and
+    // RETURNING — only the winner runs concat.
+    const lockRes = await this.pg.query(
+      `UPDATE video_jobs
+          SET composed_plan = composed_plan || jsonb_build_object('concat_started_at', to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"')),
+              updated_at = now()
+        WHERE id = $1
+          AND status = 'processing'
+          AND (composed_plan->>'concat_started_at') IS NULL
+        RETURNING id`,
+      [job.id],
+    );
+    if (lockRes.rowCount === 0) {
+      // Another tick already took the lock. Bail out — that tick will set
+      // status to ready/failed when it finishes.
+      this.logger.debug(`Composed job ${job.id}: concat already in flight, skipping`);
+      return;
+    }
     try {
       const targetSec = plan.target_duration_sec;
       const finalUrl = await this.composeFinalVideo(job.id, plan.segment_video_urls, targetSec);
@@ -564,9 +588,11 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  // Download all Kling segments, ffmpeg-concat (re-encode to normalize
-  // codec/timing differences), trim to the exact target duration, upload to
-  // S3, and return the public URL. Tmp dir is cleaned on success or error.
+  // Download all Kling segments, ffmpeg-concat with normalization (scale +
+  // setsar + concat filter — robust to codec/timing/SAR differences between
+  // Kling base 10s and extend 5s outputs, where concat demuxer was failing
+  // with "Invalid data found when processing input"), trim to the exact
+  // target duration, upload to S3, return the public URL.
   private async composeFinalVideo(jobId: string, segmentUrls: string[], targetDurationSec: number): Promise<string> {
     const tmpDir = path.join(os.tmpdir(), `composed_${jobId}`);
     fs.mkdirSync(tmpDir, { recursive: true });
@@ -580,31 +606,57 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         localPaths.push(dst);
       }
 
-      // 2. Concat list file (concat demuxer expects 'file <path>' lines)
-      const listFile = path.join(tmpDir, 'list.txt');
-      fs.writeFileSync(listFile, localPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n') + '\n');
-
-      // 3. ffmpeg: concat + trim. Re-encode (concat demuxer requires matching
-      // codecs; Kling segments differ slightly between base and extend output).
+      // 2. ffmpeg concat filter (NOT demuxer) — normalizes each segment to
+      // 1280x720 / yuv420p / SAR 1 / 30fps before concat. Audio is dropped
+      // because Kling base/extend videos are silent and adding an empty
+      // track here would just bloat output without value.
+      // The 16:9 1280×720 target matches Kling's default output; segments
+      // already at this size get a no-op scale.
       const outPath = path.join(tmpDir, 'output.mp4');
+      const n = localPaths.length;
+      const filter =
+        localPaths.map((_, i) =>
+          `[${i}:v]scale=1280:720:force_original_aspect_ratio=decrease,` +
+          `pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,` +
+          `setsar=1,fps=30,format=yuv420p[v${i}]`,
+        ).join(';') +
+        ';' +
+        localPaths.map((_, i) => `[v${i}]`).join('') +
+        `concat=n=${n}:v=1:a=0[v]`;
+
       await new Promise<void>((resolve, reject) => {
         const args = [
           '-y',
-          '-f', 'concat', '-safe', '0', '-i', listFile,
+          ...localPaths.flatMap((p) => ['-i', p]),
+          '-filter_complex', filter,
+          '-map', '[v]',
           '-t', String(targetDurationSec),
           '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-          '-c:a', 'aac', '-b:a', '128k',
+          '-pix_fmt', 'yuv420p',
           '-movflags', '+faststart',
+          '-an',
           outPath,
         ];
         const ff = spawn('ffmpeg', args);
         let stderr = '';
         ff.stderr.on('data', (d) => { stderr += d.toString(); });
-        ff.on('close', (code) => code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}: ${stderr.slice(-400)}`)));
+        ff.on('close', (code) => {
+          if (code === 0) return resolve();
+          // libx264 emits a wall of stats lines at the end of stderr that
+          // crowd out the actual error. Pull the most diagnostic lines
+          // (anything with "Error", "Invalid", "Conversion failed", "No such",
+          // "Cannot") to surface the real cause.
+          const errLines = stderr.split('\n')
+            .filter((l) => /error|invalid|cannot|no such|failed|unable/i.test(l) && !/^\[libx264/.test(l))
+            .slice(-8)
+            .join(' | ');
+          const msg = errLines || stderr.slice(-400);
+          reject(new Error(`ffmpeg exit ${code}: ${msg.slice(0, 400)}`));
+        });
         ff.on('error', reject);
       });
 
-      // 4. Upload to S3
+      // 3. Upload to S3
       const key = `videos/${jobId}.mp4`;
       await new Upload({
         client: this.s3,

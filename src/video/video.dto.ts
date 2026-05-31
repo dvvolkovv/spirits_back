@@ -60,6 +60,9 @@ export interface ComposedPlan {
   // time a segment finishes successfully; bumped when we re-submit after
   // a transient Kling error (e.g. "Internal error"). Capped server-side.
   current_segment_attempt?: number;
+  // ISO timestamp set when concat starts. Used as an optimistic lock so a
+  // concurrent poller tick can't enter composeFinalVideo for the same job.
+  concat_started_at?: string;
 }
 
 export interface VideoJobRow {
