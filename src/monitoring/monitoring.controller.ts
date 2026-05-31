@@ -12,6 +12,7 @@ import { NetworkingService, NetworkingWindow } from './product/networking.servic
 import { ChurnService } from './product/churn.service';
 import { SupportService, SupportWindow } from './product/support.service';
 import { ContentService, ContentWindow } from './product/content.service';
+import { PersonasService } from './product/personas.service';
 import { SmsHealthService } from './sms-health.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
@@ -37,6 +38,7 @@ export class MonitoringController {
     private readonly churn: ChurnService,
     private readonly support: SupportService,
     private readonly content: ContentService,
+    private readonly personas: PersonasService,
     private readonly smsHealth: SmsHealthService,
   ) {}
 
@@ -172,6 +174,17 @@ export class MonitoringController {
       return res.status(200).json(data);
     } catch (e: any) {
       return res.status(503).json({ error: 'loki_query_failed', message: e?.message || String(e) });
+    }
+  }
+
+  @Get('admin/monitoring/product/personas')
+  @UseGuards(JwtGuard, AdminGuard)
+  async getPersonas(@Res() res: Response) {
+    try {
+      const data = await this.personas.getOverview();
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'personas_failed', message: e?.message || String(e) });
     }
   }
 
