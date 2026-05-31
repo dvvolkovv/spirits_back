@@ -385,16 +385,32 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async expireStaleJobs() {
+    // Composed long-form jobs legitimately take much longer than 15 min
+    // (4 segments × ~8 min each). For them we allow 8 min per segment +
+    // 5 min for concat/upload, capped at 60 min hard ceiling.
+    // For simple jobs the original 15 min still applies.
     const stale = await this.pg.query(
-      `SELECT id, user_id, tokens_spent
+      `SELECT id, user_id, tokens_spent, composed_plan,
+              CASE
+                WHEN composed_plan IS NOT NULL
+                  THEN LEAST(60, 5 + 8 * COALESCE((composed_plan->>'segments_total')::int, 1))
+                ELSE $1::int
+              END AS budget_min
        FROM video_jobs
        WHERE status='processing'
-         AND created_at < now() - ($1 || ' minutes')::interval
        FOR UPDATE SKIP LOCKED`,
-      [String(this.JOB_TIMEOUT_MINUTES)],
+      [this.JOB_TIMEOUT_MINUTES],
     );
-    for (const row of stale.rows as Array<{ id: string; user_id: string; tokens_spent: number }>) {
-      await this.failAndRefund(row.id, row.user_id, Number(row.tokens_spent), 'timeout (15 min)');
+    for (const row of stale.rows as Array<{ id: string; user_id: string; tokens_spent: number; budget_min: number; composed_plan: any }>) {
+      const ageMinutes = await this.pg.query(
+        `SELECT EXTRACT(EPOCH FROM (now() - created_at))/60 AS m FROM video_jobs WHERE id=$1`,
+        [row.id],
+      );
+      const ageMin = Number((ageMinutes.rows[0] as any)?.m ?? 0);
+      if (ageMin > row.budget_min) {
+        await this.failAndRefund(row.id, row.user_id, Number(row.tokens_spent),
+          `timeout (${Math.round(ageMin)} > ${row.budget_min} min)`);
+      }
     }
   }
 
