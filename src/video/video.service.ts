@@ -431,9 +431,54 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         await this.finalizeSimpleJob(job, res.videoId ?? null, res.videoUrl);
       }
     } else if (res.status === 'failed') {
+      if (job.composed_plan && this.isTransientKlingError(res.error)) {
+        const retried = await this.retryComposedSegment(job, res.error ?? '');
+        if (retried) return;
+      }
       await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), res.error ?? 'failed');
     }
     // 'submitted' / 'processing' — no-op until next tick
+  }
+
+  // Kling extends sporadically fail with "Internal error" without any
+  // structural problem (verified twice in testing). One retry recovers
+  // most of these. We never retry the base segment — those failures are
+  // typically real (bad prompt, content moderation, etc.).
+  private readonly MAX_SEGMENT_RETRIES = 1;
+  private isTransientKlingError(msg: string | undefined): boolean {
+    if (!msg) return false;
+    return /internal error|timeout|rate limit|service unavailable|temporarily/i.test(msg);
+  }
+
+  private async retryComposedSegment(job: VideoJobRow, error: string): Promise<boolean> {
+    const plan = job.composed_plan!;
+    // Only retry mid-chain (after we already have at least one segment).
+    if (plan.segments_done === 0) return false;
+    const attempt = (plan.current_segment_attempt ?? 0) + 1;
+    if (attempt > this.MAX_SEGMENT_RETRIES) {
+      this.logger.warn(`Composed job ${job.id}: segment ${plan.segments_done + 1} exhausted retries (${attempt - 1})`);
+      return false;
+    }
+    const lastVideoId = plan.segment_kling_video_ids[plan.segment_kling_video_ids.length - 1];
+    if (!lastVideoId) return false;
+    try {
+      const { taskId } = await this.kling.createVideoExtendTask({
+        videoId: lastVideoId,
+        prompt: job.prompt ?? undefined,
+        negativePrompt: job.negative_prompt ?? undefined,
+        cfgScale: job.cfg_scale ?? undefined,
+      });
+      plan.current_segment_attempt = attempt;
+      await this.pg.query(
+        `UPDATE video_jobs SET kling_task_id=$1, composed_plan=$2, updated_at=now() WHERE id=$3`,
+        [taskId, JSON.stringify(plan), job.id],
+      );
+      this.logger.warn(`Composed job ${job.id}: segment ${plan.segments_done + 1} retry ${attempt}/${this.MAX_SEGMENT_RETRIES} after Kling error: ${error.slice(0, 100)}`);
+      return true;
+    } catch (e: any) {
+      this.logger.error(`Composed job ${job.id}: retry submission failed: ${e.message}`);
+      return false;
+    }
   }
 
   private async finalizeSimpleJob(job: VideoJobRow, klingVideoId: string | null, klingVideoUrl: string) {
@@ -460,10 +505,12 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
 
   private async advanceComposedJob(job: VideoJobRow, klingVideoId: string | null, klingVideoUrl: string) {
     const plan: ComposedPlan = job.composed_plan!;
-    // Record the just-finished segment
+    // Record the just-finished segment. Reset retry counter — the next
+    // segment starts with a clean budget.
     plan.segment_kling_video_ids.push(klingVideoId ?? '');
     plan.segment_video_urls.push(klingVideoUrl);
     plan.segments_done += 1;
+    plan.current_segment_attempt = 0;
 
     this.logger.log(`Composed job ${job.id}: segment ${plan.segments_done}/${plan.segments_total} done`);
 

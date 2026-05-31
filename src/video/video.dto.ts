@@ -56,6 +56,10 @@ export interface ComposedPlan {
   segments_done: number;
   segment_kling_video_ids: string[];
   segment_video_urls: string[];
+  // Retry counter for the segment currently in flight. Reset to 0 every
+  // time a segment finishes successfully; bumped when we re-submit after
+  // a transient Kling error (e.g. "Internal error"). Capped server-side.
+  current_segment_attempt?: number;
 }
 
 export interface VideoJobRow {
