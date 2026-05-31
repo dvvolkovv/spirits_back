@@ -656,18 +656,24 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         ff.on('error', reject);
       });
 
-      // 3. Upload to S3
-      const key = `videos/${jobId}.mp4`;
-      await new Upload({
-        client: this.s3,
-        params: {
-          Bucket: this.s3Bucket,
-          Key: key,
-          Body: fs.createReadStream(outPath),
-          ContentType: 'video/mp4',
-        },
-      }).done();
-      return this.s3PublicUrl(key);
+      // 3. Persist the composed mp4. We deliberately bypass S3 for composed
+      // jobs because Yandex Object Storage signing has been silently failing
+      // for video uploads in this deployment for a while (every existing
+      // 'ready' simple job has a Kling-CDN video_url, meaning rehostToS3 was
+      // hitting the catch path and falling back to klingUrl). Simple jobs are
+      // OK with that fallback because Kling holds the original mp4 for a
+      // while. Composed jobs CAN'T fall back — the mp4 lives only here.
+      // So we write to public/videos and serve via Nginx /static/ (which is
+      // already configured: location /static/ -> alias /home/dvolkov/spirits_back/public/).
+      const publicDir = process.env.PUBLIC_DIR
+        ? process.env.PUBLIC_DIR
+        : path.resolve(process.cwd(), 'public');
+      const videosDir = path.join(publicDir, 'videos');
+      fs.mkdirSync(videosDir, { recursive: true });
+      const finalPath = path.join(videosDir, `${jobId}.mp4`);
+      fs.copyFileSync(outPath, finalPath);
+      const backend = (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '');
+      return `${backend}/static/videos/${jobId}.mp4`;
     } finally {
       try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
     }
