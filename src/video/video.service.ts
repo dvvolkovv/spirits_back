@@ -8,7 +8,7 @@ import { PgService } from '../common/services/pg.service';
 import { KlingService } from '../misc/kling.service';
 import { MiscService } from '../misc/misc.service';
 import {
-  CreateVideoJobDto, VideoJobRow, computeTokenCost,
+  CreateVideoJobDto, VideoJobRow, ComposedPlan, computeTokenCost, computeComposedQuote,
   VideoMode, VideoModel, VideoQuality,
 } from './video.dto';
 import { S3Client, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
@@ -82,7 +82,30 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     const mode = dto.mode;
     const model = (dto.model ?? 'kling-v1-6') as VideoModel;
     const quality = (dto.quality ?? 'std') as VideoQuality;
-    const duration = (dto.duration ?? 5) as 5 | 10;
+
+    // --- composed long-form video planning ---
+    // When the user asks for > 10s, we chain a base 10s + N × extend 5s and
+    // ffmpeg-concat. Only text2video and image2video are valid entry modes.
+    let composedTarget: number | null = null;
+    let composedPlan: ComposedPlan | null = null;
+    if (typeof dto.targetDurationSec === 'number' && dto.targetDurationSec > 10) {
+      if (mode !== 'text2video' && mode !== 'image2video') {
+        throw new BadRequestException('long video requires mode text2video or image2video');
+      }
+      if (dto.targetDurationSec > 60) {
+        throw new BadRequestException('long video max length is 60 seconds');
+      }
+      composedTarget = Math.round(dto.targetDurationSec);
+      const quote = computeComposedQuote(mode, model, quality, composedTarget);
+      composedPlan = {
+        target_duration_sec: composedTarget,
+        segments_total: quote.segments,
+        segments_done: 0,
+        segment_kling_video_ids: [],
+        segment_video_urls: [],
+      };
+    }
+    const duration = composedPlan ? 10 : ((dto.duration ?? 5) as 5 | 10);
 
     // --- mode-specific validation ---
     if (mode === 'image2video' && !dto.sourceImageUrl) {
@@ -125,7 +148,12 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     }
 
     // --- cost ---
-    const cost = computeTokenCost(mode, model, quality, duration);
+    // For composed jobs the entire planned chain is reserved up-front so the
+    // user can't run out of tokens mid-chain. On failure we refund this full
+    // amount (existing failAndRefund handles it via tokens_spent).
+    const cost = composedPlan
+      ? computeComposedQuote(mode as 'text2video' | 'image2video', model, quality, composedPlan.target_duration_sec).totalCost
+      : computeTokenCost(mode, model, quality, duration);
 
     // --- normalize image URL to absolute (Kling rejects relative paths) ---
     let imgUrlAbsolute: string | null = null;
@@ -162,8 +190,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       const ins = await client.query(
         `INSERT INTO video_jobs
          (user_id, mode, model, quality, duration_sec, prompt, negative_prompt, cfg_scale,
-          source_image_url, source_video_id, camera_type, camera_config, audio_url, tokens_spent, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending')
+          source_image_url, source_video_id, camera_type, camera_config, audio_url, tokens_spent, status,
+          target_duration_sec, composed_plan)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending',$15,$16)
          RETURNING id`,
         [
           userId, mode, model, quality, duration,
@@ -173,6 +202,8 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
           dto.cameraConfig ? JSON.stringify(dto.cameraConfig) : null,
           dto.audioUrl ?? null,
           cost,
+          composedTarget,
+          composedPlan ? JSON.stringify(composedPlan) : null,
         ],
       );
       jobId = (ins.rows[0] as any).id as string;
@@ -309,7 +340,26 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   private readonly POLL_INTERVAL_MS = 5000;
   private readonly JOB_TIMEOUT_MINUTES = 15;
 
-  onModuleInit() {
+  async onModuleInit() {
+    // 002 migration — adds target_duration_sec + composed_plan for long-form
+    // video. Reused for any future video schema changes. IF NOT EXISTS so it's
+    // idempotent across restarts.
+    const candidates = [
+      path.join(__dirname, 'migrations', '002_composed_video.sql'),
+      path.join(__dirname, '..', '..', 'src', 'video', 'migrations', '002_composed_video.sql'),
+    ];
+    for (const p of candidates) {
+      try {
+        if (fs.existsSync(p)) {
+          await this.pg.query(fs.readFileSync(p, 'utf8'));
+          this.logger.log(`video migration 002 applied from ${p}`);
+          break;
+        }
+      } catch (e: any) {
+        this.logger.error(`video migration 002 failed (${p}): ${e.message}`);
+      }
+    }
+
     this.pollTimer = setInterval(
       () => this.tick().catch((e) => this.logger.error(`tick error: ${e.message}`)),
       this.POLL_INTERVAL_MS,
@@ -350,33 +400,162 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
 
   private async pollJob(job: VideoJobRow) {
     if (!job.kling_task_id) return;
-    const res = await this.kling.getVideoTaskStatus(job.kling_task_id, job.mode);
+    // For composed jobs the current Kling call is a base text2video/image2video
+    // for segment 1, then a Kling 'extend' for segments 2..N. We query the
+    // matching path based on which segment is in flight.
+    const currentMode: VideoMode = job.composed_plan && job.composed_plan.segments_done > 0
+      ? 'extend'
+      : job.mode;
+    const res = await this.kling.getVideoTaskStatus(job.kling_task_id, currentMode);
+
     if (res.status === 'succeed' && res.videoUrl) {
-      let finalVideoUrl = res.videoUrl;
-      let thumbUrl: string | null = null;
-      try {
-        finalVideoUrl = await this.rehostToS3(job.id, res.videoUrl);
-        thumbUrl = await this.extractAndUploadThumbnail(job.id, finalVideoUrl);
-      } catch (s3err: any) {
-        this.logger.warn(`Video job ${job.id}: S3 rehost failed (${s3err.message}), using Kling CDN URL directly`);
-        finalVideoUrl = res.videoUrl;
-        thumbUrl = null;
+      if (job.composed_plan) {
+        await this.advanceComposedJob(job, res.videoId ?? null, res.videoUrl);
+      } else {
+        await this.finalizeSimpleJob(job, res.videoId ?? null, res.videoUrl);
       }
-      await this.pg.query(
-        `UPDATE video_jobs
-            SET status='ready',
-                video_url=$1,
-                thumbnail_url=$2,
-                kling_task_id = COALESCE($3, kling_task_id),
-                updated_at=now()
-          WHERE id=$4`,
-        [finalVideoUrl, thumbUrl, res.videoId ?? null, job.id],
-      );
-      this.logger.log(`Video job ${job.id} ready: ${finalVideoUrl}`);
     } else if (res.status === 'failed') {
       await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), res.error ?? 'failed');
     }
     // 'submitted' / 'processing' — no-op until next tick
+  }
+
+  private async finalizeSimpleJob(job: VideoJobRow, klingVideoId: string | null, klingVideoUrl: string) {
+    let finalVideoUrl = klingVideoUrl;
+    let thumbUrl: string | null = null;
+    try {
+      finalVideoUrl = await this.rehostToS3(job.id, klingVideoUrl);
+      thumbUrl = await this.extractAndUploadThumbnail(job.id, finalVideoUrl);
+    } catch (s3err: any) {
+      this.logger.warn(`Video job ${job.id}: S3 rehost failed (${s3err.message}), using Kling CDN URL directly`);
+      finalVideoUrl = klingVideoUrl;
+      thumbUrl = null;
+    }
+    await this.pg.query(
+      `UPDATE video_jobs
+          SET status='ready', video_url=$1, thumbnail_url=$2,
+              kling_task_id = COALESCE($3, kling_task_id),
+              updated_at=now()
+        WHERE id=$4`,
+      [finalVideoUrl, thumbUrl, klingVideoId, job.id],
+    );
+    this.logger.log(`Video job ${job.id} ready: ${finalVideoUrl}`);
+  }
+
+  private async advanceComposedJob(job: VideoJobRow, klingVideoId: string | null, klingVideoUrl: string) {
+    const plan: ComposedPlan = job.composed_plan!;
+    // Record the just-finished segment
+    plan.segment_kling_video_ids.push(klingVideoId ?? '');
+    plan.segment_video_urls.push(klingVideoUrl);
+    plan.segments_done += 1;
+
+    this.logger.log(`Composed job ${job.id}: segment ${plan.segments_done}/${plan.segments_total} done`);
+
+    if (plan.segments_done < plan.segments_total) {
+      // Fire the next extend. Kling extends always take a Kling video_id of
+      // the previous segment, not a public URL.
+      if (!klingVideoId) {
+        await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent),
+          'missing Kling video_id on intermediate segment');
+        return;
+      }
+      try {
+        const { taskId } = await this.kling.createVideoExtendTask({
+          videoId: klingVideoId,
+          prompt: job.prompt ?? undefined,
+          negativePrompt: job.negative_prompt ?? undefined,
+          cfgScale: job.cfg_scale ?? undefined,
+        });
+        await this.pg.query(
+          `UPDATE video_jobs SET kling_task_id=$1, composed_plan=$2, updated_at=now() WHERE id=$3`,
+          [taskId, JSON.stringify(plan), job.id],
+        );
+      } catch (e: any) {
+        this.logger.error(`Composed job ${job.id} extend failed at segment ${plan.segments_done}: ${e.message}`);
+        await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent),
+          `extend failed: ${String(e.message).slice(0, 200)}`);
+      }
+      return;
+    }
+
+    // All segments done — concat + trim + upload as the final job's video.
+    try {
+      const targetSec = plan.target_duration_sec;
+      const finalUrl = await this.composeFinalVideo(job.id, plan.segment_video_urls, targetSec);
+      let thumbUrl: string | null = null;
+      try {
+        thumbUrl = await this.extractAndUploadThumbnail(job.id, finalUrl);
+      } catch { /* thumbnail is nice-to-have */ }
+      await this.pg.query(
+        `UPDATE video_jobs
+            SET status='ready', video_url=$1, thumbnail_url=$2,
+                composed_plan=$3, updated_at=now()
+          WHERE id=$4`,
+        [finalUrl, thumbUrl, JSON.stringify(plan), job.id],
+      );
+      this.logger.log(`Composed job ${job.id} ready (${targetSec}s, ${plan.segments_total} segments): ${finalUrl}`);
+    } catch (e: any) {
+      this.logger.error(`Composed job ${job.id} concat failed: ${e.message}`);
+      await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent),
+        `concat: ${String(e.message).slice(0, 200)}`);
+    }
+  }
+
+  // Download all Kling segments, ffmpeg-concat (re-encode to normalize
+  // codec/timing differences), trim to the exact target duration, upload to
+  // S3, and return the public URL. Tmp dir is cleaned on success or error.
+  private async composeFinalVideo(jobId: string, segmentUrls: string[], targetDurationSec: number): Promise<string> {
+    const tmpDir = path.join(os.tmpdir(), `composed_${jobId}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+    try {
+      // 1. Download segments
+      const localPaths: string[] = [];
+      for (let i = 0; i < segmentUrls.length; i++) {
+        const dst = path.join(tmpDir, `seg_${String(i).padStart(2, '0')}.mp4`);
+        const resp = await axios.get(segmentUrls[i], { responseType: 'arraybuffer', timeout: 120000 });
+        fs.writeFileSync(dst, Buffer.from(resp.data));
+        localPaths.push(dst);
+      }
+
+      // 2. Concat list file (concat demuxer expects 'file <path>' lines)
+      const listFile = path.join(tmpDir, 'list.txt');
+      fs.writeFileSync(listFile, localPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n') + '\n');
+
+      // 3. ffmpeg: concat + trim. Re-encode (concat demuxer requires matching
+      // codecs; Kling segments differ slightly between base and extend output).
+      const outPath = path.join(tmpDir, 'output.mp4');
+      await new Promise<void>((resolve, reject) => {
+        const args = [
+          '-y',
+          '-f', 'concat', '-safe', '0', '-i', listFile,
+          '-t', String(targetDurationSec),
+          '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+          '-c:a', 'aac', '-b:a', '128k',
+          '-movflags', '+faststart',
+          outPath,
+        ];
+        const ff = spawn('ffmpeg', args);
+        let stderr = '';
+        ff.stderr.on('data', (d) => { stderr += d.toString(); });
+        ff.on('close', (code) => code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}: ${stderr.slice(-400)}`)));
+        ff.on('error', reject);
+      });
+
+      // 4. Upload to S3
+      const key = `videos/${jobId}.mp4`;
+      await new Upload({
+        client: this.s3,
+        params: {
+          Bucket: this.s3Bucket,
+          Key: key,
+          Body: fs.createReadStream(outPath),
+          ContentType: 'video/mp4',
+        },
+      }).done();
+      return this.s3PublicUrl(key);
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    }
   }
 
   private async failAndRefund(jobId: string, userId: string, tokens: number, reason: string) {

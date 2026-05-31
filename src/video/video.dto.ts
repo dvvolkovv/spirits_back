@@ -19,6 +19,12 @@ export class CreateVideoJobDto {
   @IsOptional() @IsIn([5, 10])
   duration?: 5 | 10;
 
+  // Composed long-form video. When > 10, backend plans a chain of Kling
+  // calls (base 10s + N × extend 5s) and ffmpeg-concats the result down to
+  // exactly this duration. Only valid for text2video / image2video.
+  @IsOptional() @IsNumber() @Min(5) @Max(60)
+  targetDurationSec?: number;
+
   @IsOptional() @IsString()
   prompt?: string;
 
@@ -44,6 +50,14 @@ export class CreateVideoJobDto {
   audioUrl?: string;
 }
 
+export interface ComposedPlan {
+  target_duration_sec: number;
+  segments_total: number;
+  segments_done: number;
+  segment_kling_video_ids: string[];
+  segment_video_urls: string[];
+}
+
 export interface VideoJobRow {
   id: string;
   user_id: string;
@@ -67,6 +81,8 @@ export interface VideoJobRow {
   error_message: string | null;
   created_at: string;
   updated_at: string;
+  target_duration_sec: number | null;
+  composed_plan: ComposedPlan | null;
 }
 
 export const VIDEO_PRICING: Record<string, number> = {
@@ -99,4 +115,35 @@ export function computeTokenCost(mode: VideoMode, model: VideoModel, quality: Vi
   const v = VIDEO_PRICING[key];
   if (v == null) throw new Error(`Unsupported combination: ${key}`);
   return v;
+}
+
+// Plan a composed long-form video. Base = 10s, each extend = +5s.
+// Returns total cost and segment count. The final video gets ffmpeg-trimmed
+// to targetDurationSec on assembly, so the user-requested length is exact.
+export interface ComposedQuote {
+  segments: number;          // total Kling calls (1 base + N extends)
+  rawDurationSec: number;    // sum of generated seconds, before trim
+  totalCost: number;         // tokens
+  baseCost: number;
+  extendUnitCost: number;
+}
+
+export function computeComposedQuote(
+  mode: 'text2video' | 'image2video',
+  model: VideoModel,
+  quality: VideoQuality,
+  targetDurationSec: number,
+): ComposedQuote {
+  const baseDuration = 10;
+  const extendDuration = 5;
+  const baseCost   = computeTokenCost(mode, model, quality, baseDuration);
+  const extendUnit = computeTokenCost('extend', model, quality, extendDuration);
+  const extendCount = Math.ceil(Math.max(0, targetDurationSec - baseDuration) / extendDuration);
+  return {
+    segments: 1 + extendCount,
+    rawDurationSec: baseDuration + extendCount * extendDuration,
+    baseCost,
+    extendUnitCost: extendUnit,
+    totalCost: baseCost + extendCount * extendUnit,
+  };
 }
