@@ -109,13 +109,15 @@ export class SummaryService {
     );
   }
 
-  // AI-share поддержки: % tickets that resolved without owner involvement.
-  // Proxy: count of tickets where status NOT IN ('owner_handling') divided by total.
-  // (Full version would require support_events history.)
+  // AI-share поддержки: % tickets that never had an 'escalate' event,
+  // i.e. AI handled them end-to-end without owner involvement. Matches
+  // the stricter definition used by SupportService.
   private async aiShareSupport(): Promise<number | null> {
     return this.num(
       `SELECT CASE WHEN COUNT(*) = 0 THEN NULL
-              ELSE 100.0 * COUNT(*) FILTER (WHERE status <> 'owner_handling') / COUNT(*) END AS v
+              ELSE 100.0 * COUNT(*) FILTER (
+                WHERE id NOT IN (SELECT ticket_id FROM support_events WHERE action = 'escalate')
+              ) / COUNT(*) END AS v
        FROM support_tickets`,
     );
   }
