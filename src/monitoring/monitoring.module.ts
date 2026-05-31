@@ -12,12 +12,13 @@ import { NetworkingService } from './product/networking.service';
 import { ChurnService } from './product/churn.service';
 import { SupportService } from './product/support.service';
 import { ContentService } from './product/content.service';
+import { SmsHealthService } from './sms-health.service';
 import { CommonModule } from '../common/common.module';
 import { Neo4jModule } from '../neo4j/neo4j.module';
 
 @Module({
   imports: [CommonModule, Neo4jModule],
   controllers: [MonitoringController],
-  providers: [MonitoringService, LogsService, SyntheticService, FunnelService, EconomyService, QualityService, ProfileDepthService, SummaryService, NetworkingService, ChurnService, SupportService, ContentService],
+  providers: [MonitoringService, LogsService, SyntheticService, FunnelService, EconomyService, QualityService, ProfileDepthService, SummaryService, NetworkingService, ChurnService, SupportService, ContentService, SmsHealthService],
 })
 export class MonitoringModule {}

@@ -79,11 +79,20 @@ export class AuthService {
         // validateStatus + body capture — раньше ошибка ловилась как голое
         // «status code 400» без тела, что мешало диагностике.
         this.logger.error(`SMS Aero ${resp.status} for ${phone}: ${JSON.stringify(resp.data).slice(0, 300)}`);
+        this.events?.track('sms_aero_failure', {
+          userId: phone,
+          props: { http_status: resp.status, reason: resp.data?.message?.slice(0, 100) || 'unknown' },
+        });
       } else {
         this.logger.log(`SMS sent to ${phone}`);
+        this.events?.track('sms_aero_success', { userId: phone });
       }
     } catch (e) {
       this.logger.error(`SMS send failed: ${e.message}`);
+      this.events?.track('sms_aero_failure', {
+        userId: phone,
+        props: { http_status: 0, reason: e.message?.slice(0, 100) || 'network' },
+      });
     }
   }
 
