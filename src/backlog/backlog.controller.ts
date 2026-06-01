@@ -28,6 +28,10 @@ export class BacklogController {
         const item = await this.backlog.create(String(user.userId), data);
         return res.status(200).json(item);
       }
+      case 'create_from_ticket': {
+        const item = await this.backlog.createFromTicket(String(user.userId), String(data.ticket_id || data.id));
+        return res.status(200).json(item);
+      }
       case 'update': {
         const item = await this.backlog.update(String(data.id), data);
         return res.status(200).json(item);

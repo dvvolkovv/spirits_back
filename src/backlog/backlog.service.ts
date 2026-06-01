@@ -1,5 +1,6 @@
 import { Injectable, Logger, OnModuleInit, BadRequestException, NotFoundException } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
+import { ClaudeCliService } from '../common/services/claude-cli.service';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -18,6 +19,7 @@ export interface BacklogItem {
   created_at: string;
   updated_at: string;
   comments_count?: number;
+  from_ticket_id?: string | null;
 }
 
 export interface BacklogComment {
@@ -35,22 +37,27 @@ const ALLOWED_COMPLEXITY: BacklogComplexity[] = ['low', 'medium', 'high'];
 export class BacklogService implements OnModuleInit {
   private readonly logger = new Logger(BacklogService.name);
 
-  constructor(private readonly pg: PgService) {}
+  constructor(
+    private readonly pg: PgService,
+    private readonly claude: ClaudeCliService,
+  ) {}
 
   async onModuleInit() {
-    const candidates = [
-      path.join(__dirname, 'migrations', '001_backlog.sql'),
-      path.join(__dirname, '..', '..', 'src', 'backlog', 'migrations', '001_backlog.sql'),
-    ];
-    for (const p of candidates) {
-      try {
-        if (fs.existsSync(p)) {
-          await this.pg.query(fs.readFileSync(p, 'utf8'));
-          this.logger.log(`backlog migration 001 applied from ${p}`);
-          return;
+    for (const file of ['001_backlog.sql', '002_from_ticket.sql']) {
+      const candidates = [
+        path.join(__dirname, 'migrations', file),
+        path.join(__dirname, '..', '..', 'src', 'backlog', 'migrations', file),
+      ];
+      for (const p of candidates) {
+        try {
+          if (fs.existsSync(p)) {
+            await this.pg.query(fs.readFileSync(p, 'utf8'));
+            this.logger.log(`backlog migration ${file} applied from ${p}`);
+            break;
+          }
+        } catch (e: any) {
+          this.logger.error(`backlog migration ${file} failed (${p}): ${e.message}`);
         }
-      } catch (e: any) {
-        this.logger.error(`backlog migration 001 failed (${p}): ${e.message}`);
       }
     }
   }
@@ -116,6 +123,88 @@ export class BacklogService implements OnModuleInit {
     return res.rows[0] as BacklogItem;
   }
 
+  // Build a backlog item from a support ticket conversation.
+  // Reads the ticket + visible messages, asks Claude to summarize the
+  // product gap into {title, analysis_md, complexity}, inserts a `proposed`
+  // backlog item with a soft reference back to the ticket so we can later
+  // notify the user when the feature ships.
+  async createFromTicket(adminUserId: string, ticketId: string): Promise<BacklogItem> {
+    const ticketRes = await this.pg.query(
+      `SELECT id, user_id, topic FROM support_tickets WHERE id = $1`,
+      [ticketId],
+    );
+    const ticket = ticketRes.rows[0] as { id: string; user_id: string; topic: string | null } | undefined;
+    if (!ticket) throw new NotFoundException('ticket not found');
+
+    const msgsRes = await this.pg.query(
+      `SELECT sender_type, content, created_at
+         FROM support_messages
+        WHERE ticket_id = $1 AND visible_to_user = true
+        ORDER BY created_at ASC`,
+      [ticketId],
+    );
+    const messages = msgsRes.rows as Array<{ sender_type: string; content: string; created_at: string }>;
+    if (messages.length === 0) throw new BadRequestException('ticket has no visible messages to summarize');
+
+    const conversation = messages
+      .map((m) => `[${m.sender_type.toUpperCase()}] ${String(m.content).slice(0, 2000)}`)
+      .join('\n\n')
+      .slice(0, 12000);
+
+    const prompt = [
+      'You are a product analyst on the my.linkeon.io support team.',
+      'Read the support conversation below and summarize the underlying product gap — what feature is missing or broken — into a backlog item for the engineering team.',
+      '',
+      'Return ONLY valid JSON, no prose around it, with exactly these three fields:',
+      '{',
+      '  "title": "<short Russian feature title, 4-10 words>",',
+      '  "analysis_md": "<markdown body in Russian. Three sections: ## Запрос пользователя, ## Что нужно сделать, ## Контекст из тикета>",',
+      '  "complexity": "low" | "medium" | "high"',
+      '}',
+      '',
+      'Conversation:',
+      conversation,
+    ].join('\n');
+
+    let parsed: { title?: string; analysis_md?: string; complexity?: string } = {};
+    try {
+      const { text } = await this.claude.textWithCost(prompt, {
+        model: 'claude-haiku-4-5',
+        timeoutMs: 60_000,
+      });
+      // Claude sometimes wraps JSON in ```json ... ``` fences — strip.
+      const cleaned = text.trim()
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```\s*$/i, '');
+      parsed = JSON.parse(cleaned);
+    } catch (e: any) {
+      this.logger.warn(`createFromTicket: Claude parse failed (${e.message}), inserting a stub`);
+      parsed = {
+        title: ticket.topic || `Запрос от пользователя ${ticket.user_id}`,
+        analysis_md: '## Запрос пользователя\n\n_Автоматическая сводка не получилась. Сырая переписка:_\n\n```\n' +
+          conversation.slice(0, 4000) +
+          '\n```',
+        complexity: 'medium',
+      };
+    }
+
+    const title = String(parsed.title || '').trim() || `Запрос из тикета ${ticketId.slice(0, 8)}`;
+    const analysis = String(parsed.analysis_md || '').trim();
+    const complexityIn = String(parsed.complexity || '').toLowerCase();
+    const complexity: BacklogComplexity | null = ALLOWED_COMPLEXITY.includes(complexityIn as BacklogComplexity)
+      ? complexityIn as BacklogComplexity
+      : null;
+
+    const ins = await this.pg.query(
+      `INSERT INTO backlog_items
+         (title, analysis_md, complexity, status, created_by, from_ticket_id)
+       VALUES ($1, $2, $3, 'proposed', $4, $5)
+       RETURNING *`,
+      [title, analysis, complexity, adminUserId, ticketId],
+    );
+    return ins.rows[0] as BacklogItem;
+  }
+
   async update(id: string, data: Partial<{
     title: string;
     analysis_md: string;
@@ -162,6 +251,14 @@ export class BacklogService implements OnModuleInit {
       return r.rows[0] as BacklogItem;
     }
 
+    // Snapshot the pre-update status so we can detect a transition to 'done'
+    // and trigger the auto-notify-user-on-done flow below.
+    const before = await this.pg.query(
+      `SELECT status, title, from_ticket_id FROM backlog_items WHERE id = $1`,
+      [id],
+    );
+    const prev = before.rows[0] as { status: BacklogStatus; title: string; from_ticket_id: string | null } | undefined;
+
     params.push(id);
     const r = await this.pg.query(
       `UPDATE backlog_items
@@ -171,7 +268,35 @@ export class BacklogService implements OnModuleInit {
       params,
     );
     if (!r.rows[0]) throw new NotFoundException('backlog item not found');
-    return r.rows[0] as BacklogItem;
+    const updated = r.rows[0] as BacklogItem;
+
+    // Phase-2 auto-notify: backlog item born from a ticket transitions to
+    // done → drop a system-style message into the originating ticket so the
+    // user gets a heads-up that the feature they asked for is now live.
+    // We insert directly into support_messages to avoid a backlog→support
+    // module dependency.
+    if (
+      prev && prev.from_ticket_id &&
+      prev.status !== 'done' && updated.status === 'done'
+    ) {
+      try {
+        const note = `🎉 Запрошенная вами доработка теперь доступна: «${updated.title}». Если что-то не работает или есть пожелания — напишите в ответ.`;
+        await this.pg.query(
+          `INSERT INTO support_messages (ticket_id, sender_type, sender_id, content)
+           VALUES ($1, 'owner', $2, $3)`,
+          [prev.from_ticket_id, 'backlog-automation', note],
+        );
+        await this.pg.query(
+          `UPDATE support_tickets SET last_message_at = now(), updated_at = now() WHERE id = $1`,
+          [prev.from_ticket_id],
+        );
+        this.logger.log(`Notified ticket ${prev.from_ticket_id} of backlog ${id} completion`);
+      } catch (e: any) {
+        this.logger.warn(`Failed to notify ticket ${prev.from_ticket_id}: ${e.message}`);
+      }
+    }
+
+    return updated;
   }
 
   async remove(id: string): Promise<{ ok: true }> {
