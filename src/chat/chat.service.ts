@@ -5,6 +5,7 @@ import { KlingService } from '../misc/kling.service';
 import { ChatToolsService, CHAT_TOOLS } from './chat-tools';
 import { SmmProducerToolsService } from '../smm/producer/smm-producer-tools.service';
 import { ClaudeAgentService } from './claude-agent.service';
+import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { TasksService } from '../tasks/tasks.service';
 import { EventsService } from '../events/events.service';
 import Anthropic from '@anthropic-ai/sdk';
@@ -19,7 +20,7 @@ export class ChatService {
   // (streamUniversalAgent → r.linkeon.io). Применяется только для текстовых
   // токенов; MCP-инструменты (картинки, видео) списываются их сервисами
   // независимо и НЕ умножаются здесь. Не касается Маши (id=3, локальный
-  // Anthropic-путь через streamChat).
+  // ClaudeCliService — OAuth subscription, без отдельного API-биллинга).
   private readonly SDK_TEXT_MULTIPLIER = 2;
   private anthropic: Anthropic | null = null;
 
@@ -30,6 +31,7 @@ export class ChatService {
     private readonly tools: ChatToolsService,
     private readonly smmProducerTools: SmmProducerToolsService,
     private readonly claudeAgent: ClaudeAgentService,
+    private readonly claudeCli: ClaudeCliService,
     @Optional() private readonly tasksService?: TasksService,
     @Optional() private readonly events?: EventsService,
   ) {
@@ -138,10 +140,12 @@ export class ChatService {
       return;
     }
 
-    // Route ALL agents except Маша (id=3 — uses метафорические карты через Anthropic+CHAT_TOOLS path)
-    // via streamUniversalAgent → r.linkeon.io with MCP tools (image/video/code execution).
+    // Route ALL agents except Маша (id=3) via streamUniversalAgent →
+    // r.linkeon.io with MCP tools (image/video/code execution).
     // Cheaper, unified, MCP delivers Nano Banana + Kling natively.
-    // detectMediaIntent exception removed — r.linkeon.io handles media via MCP bridge.
+    // Маша runs locally via ClaudeCliService (OAuth subscription, no per-
+    // call billing) because her flow is metaphor-card driven, not tool-
+    // heavy; the card pull happens in post-processing below.
     if (agent.id !== 3) {
       return this.streamUniversalAgent(
         userId, message, String(assistantId), String(agent.id),
@@ -245,169 +249,42 @@ export class ChatService {
       }
     }
 
-    // Regular text chat — stream to client (buffer for Маша to filter tool tags)
+    // Маша runs via Claude CLI (OAuth subscription) — no separate API-key
+    // billing, no streaming, no tool use. The CHAT_TOOLS loop and the
+    // Anthropic-SDK streaming path were removed because Маша's value is
+    // the metaphor-card flow (handled by post-processing below), not
+    // image/video generation. If we need to bring tools back for her,
+    // route through streamUniversalAgent like every other assistant.
     const isМаша = agent.name === 'Маша';
-    const needsBuffering = isМаша; // Маша needs post-processing for card detection
     res.write(JSON.stringify({ type: 'begin' }) + '\n');
 
     const chunks: string[] = [];
     let inputTokens = 0;
     let outputTokens = 0;
 
-    if (this.anthropic) {
-      try {
-        const MAX_ITERATIONS = 5;
-        // Anthropic messages accept strings OR content blocks. We start with llmMessages
-        // (role+content string pairs) and extend it across iterations when tools are called.
-        const messagesForLLM: any[] = [...llmMessages];
+    try {
+      // Compose a single one-shot prompt: system + recent history + current user message.
+      // ClaudeCliService passes everything in one prompt — no separate messages array.
+      const historyText = recentHistory
+        .map((m) => `${m.type === 'user' ? 'USER' : 'ASSISTANT'}: ${m.content}`)
+        .join('\n\n');
+      const promptForCli = [
+        historyText ? `Предыдущий контекст диалога:\n${historyText}\n\n---\n\n` : '',
+        `Сообщение пользователя:\n${message}`,
+      ].join('');
 
-        // cache_control на последнем стабильном system-блоке кэширует tools + стабильный system.
-        // Волатильный блок (profileText) идёт ПОСЛЕ кэша — он не попадает в кэш, и это нормально.
-        const systemBlocks: any[] = [
-          { type: 'text', text: stableSystemPrompt, cache_control: { type: 'ephemeral' } },
-        ];
-        if (volatileSystemPrompt) {
-          systemBlocks.push({ type: 'text', text: volatileSystemPrompt });
-        }
-
-        for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
-          const stream = this.anthropic.messages.stream({
-            model: 'claude-haiku-4-5-20251001',
-            max_tokens: 4096,
-            system: systemBlocks,
-            tools: CHAT_TOOLS as any,
-            messages: messagesForLLM,
-          });
-
-          // Stream only text chunks; ignore tool-use content blocks for the typewriter effect.
-          // We'll decide what to do after finalMessage() arrives.
-          stream.on('text', (text) => {
-            chunks.push(text);
-            if (!needsBuffering) {
-              res.write(JSON.stringify({ type: 'item', content: text }) + '\n');
-            }
-          });
-
-          const finalMessage = await stream.finalMessage();
-          inputTokens += finalMessage.usage?.input_tokens || 0;
-          outputTokens += finalMessage.usage?.output_tokens || 0;
-          const u: any = finalMessage.usage || {};
-          this.logger.log(`chat[${agent.name}] cache: read=${u.cache_read_input_tokens ?? 0} write=${u.cache_creation_input_tokens ?? 0} input=${u.input_tokens ?? 0}`);
-
-          if (finalMessage.stop_reason !== 'tool_use') {
-            // Plain completion — nothing more to do
-            break;
-          }
-
-          // Find all tool_use blocks in this turn (usually one)
-          const toolUseBlocks = (finalMessage.content as any[]).filter((b) => b?.type === 'tool_use');
-          if (toolUseBlocks.length === 0) break;
-
-          // Push the full assistant turn (text + tool_use blocks) into the conversation
-          messagesForLLM.push({ role: 'assistant', content: finalMessage.content });
-
-          const toolResults: any[] = [];
-          for (const tu of toolUseBlocks) {
-            // Announce tool start to the client
-            res.write(JSON.stringify({
-              type: 'tool_start',
-              tool: tu.name,
-              input: tu.input,
-            }) + '\n');
-
-            const result = await this.tools.executeTool(userId, tu.name, tu.input);
-
-            // Announce tool result to the client — frontend uses this to render inline video/image cards
-            res.write(JSON.stringify({
-              type: 'tool_result',
-              tool: tu.name,
-              result,
-            }) + '\n');
-
-            // For image tool: inject markdown image into chunks so it ends up in saved history + final text
-            if (result.ok && result.kind === 'image') {
-              const md = `\n\n![Сгенерированное изображение](${result.imageUrl})`;
-              chunks.push(md);
-              if (!needsBuffering) {
-                res.write(JSON.stringify({ type: 'item', content: md }) + '\n');
-              }
-            }
-
-            toolResults.push({
-              type: 'tool_result',
-              tool_use_id: tu.id,
-              content: JSON.stringify(result),
-            });
-          }
-
-          // Feed the results back to the LLM so it can respond with natural-language follow-up
-          messagesForLLM.push({ role: 'user', content: toolResults });
-          // loop continues — next iteration gets the LLM's reply
-        }
-      } catch (e: any) {
-        const isForbidden = e?.status === 403 || String(e?.message).includes('forbidden') || String(e?.message).includes('Request not allowed');
-        if (isForbidden && process.env.OPENROUTER_API_KEY) {
-          this.logger.warn(`Primary Anthropic key blocked (403), retrying via OpenRouter`);
-          chunks.length = 0;
-          try {
-            const tok = await this.streamToolLoopViaOpenRouter(userId, systemPrompt, llmMessages, chunks, needsBuffering, res);
-            inputTokens += tok.inputTokens;
-            outputTokens += tok.outputTokens;
-          } catch (e2: any) {
-            this.logger.error(`OpenRouter tool-loop error: ${e2.message}`);
-            chunks.push('Ошибка соединения с ассистентом.');
-          }
-        } else {
-          this.logger.error(`Anthropic stream error: ${e.message}`);
-          chunks.push('Ошибка соединения с ассистентом.');
-        }
-      }
-    } else {
-      try {
-        const orMessages = [{ role: 'system', content: systemPrompt }, ...llmMessages];
-        const response = await axios.post(
-          'https://openrouter.ai/api/v1/chat/completions',
-          { model: 'anthropic/claude-haiku-4.5', messages: orMessages, stream: true },
-          {
-            headers: {
-              Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-              'Content-Type': 'application/json',
-              'HTTP-Referer': 'https://my.linkeon.io',
-            },
-            responseType: 'stream',
-            timeout: 120000,
-          },
-        );
-        await new Promise<void>((resolve, reject) => {
-          let buffer = '';
-          response.data.on('data', (chunk: Buffer) => {
-            buffer += chunk.toString();
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
-            for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed || trimmed === 'data: [DONE]') continue;
-              if (!trimmed.startsWith('data: ')) continue;
-              try {
-                const json = JSON.parse(trimmed.substring(6));
-                const content = json.choices?.[0]?.delta?.content;
-                if (content) {
-                  chunks.push(content);
-                  if (!needsBuffering) {
-                    res.write(JSON.stringify({ type: 'item', content }) + '\n');
-                  }
-                }
-                if (json.usage) { inputTokens = json.usage.prompt_tokens || 0; outputTokens = json.usage.completion_tokens || 0; }
-              } catch {}
-            }
-          });
-          response.data.on('end', () => resolve());
-          response.data.on('error', (err: Error) => reject(err));
-        });
-      } catch (e) {
-        this.logger.error(`OpenRouter stream error: ${e.message}`);
-        chunks.push('Ошибка соединения с ассистентом.');
-      }
+      const { text, costUsd } = await this.claudeCli.textWithCost(promptForCli, {
+        system: systemPrompt,
+        model: 'claude-haiku-4-5',
+        timeoutMs: 60_000,
+      });
+      this.logger.log(`chat[${agent.name}] via Claude CLI: $${costUsd.toFixed(4)}, ${text.length} chars`);
+      chunks.push(text);
+      // Buffer behaviour: hold the text until we've done card-detection
+      // post-processing (item line is emitted at the end of this method).
+    } catch (e: any) {
+      this.logger.error(`Claude CLI error for ${agent.name}: ${e.message}`);
+      chunks.push('Ошибка соединения с ассистентом.');
     }
     // Clean and post-process the full response
     const rawFull = chunks.join('');
@@ -430,10 +307,9 @@ export class ChatService {
     }
 
     const tokensUsed = inputTokens + outputTokens;
-    // For buffered (Маша) — send cleaned text; for streamed — already sent chunk by chunk
-    if (needsBuffering) {
-      res.write(JSON.stringify({ type: 'item', content: fullText }) + '\n');
-    }
+    // This path is Маша-only and the Claude CLI returns a single block, so
+    // we always emit the final text as one `item` line right before `end`.
+    res.write(JSON.stringify({ type: 'item', content: fullText }) + '\n');
     res.write(JSON.stringify({ type: 'end', content: fullText, usage: { input: inputTokens, output: outputTokens, total: tokensUsed } }) + '\n');
     res.end();
 
