@@ -1,12 +1,27 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import * as jwt from 'jsonwebtoken';
 import axios from 'axios';
+import { PgService } from '../common/services/pg.service';
 
 @Injectable()
 export class KlingService {
   private readonly logger = new Logger(KlingService.name);
   private readonly ak = process.env.KLING_ACCESS_KEY || '';
   private readonly sk = process.env.KLING_SECRET_KEY || '';
+
+  // Direct PG insert (instead of EventsService) — same pattern as
+  // ClaudeCliService — KlingService lives in MiscModule which is also
+  // imported by VideoModule and would create a cycle if we routed
+  // through EventsService. Schema is the same `events` table.
+  constructor(@Optional() private readonly pg?: PgService) {}
+
+  private trackCall(method: string, model: string, ok: boolean, latencyMs: number, errorShort?: string, taskId?: string) {
+    if (!this.pg) return;
+    this.pg.query(
+      `INSERT INTO events (name, props) VALUES ('kling_call', $1::jsonb)`,
+      [JSON.stringify({ method, model, ok, latency_ms: latencyMs, error_short: errorShort?.slice(0, 200), task_id: taskId })],
+    ).catch((e: any) => this.logger.warn(`kling_call event insert failed: ${e.message}`));
+  }
 
   private getToken(): string {
     const now = Math.floor(Date.now() / 1000);
@@ -18,23 +33,28 @@ export class KlingService {
   }
 
   async generateImage(prompt: string, aspectRatio = '1:1'): Promise<{ url: string } | null> {
+    const t0 = Date.now();
+    const model = 'kling-v1';
     if (!this.ak || !this.sk) {
       this.logger.warn('Kling credentials not set');
+      this.trackCall('generateImage', model, false, 0, 'credentials_not_set');
       return null;
     }
 
+    let taskId: string | undefined;
     try {
       // Create task
       const token = this.getToken();
       const createResp = await axios.post(
         'https://api.klingai.com/v1/images/generations',
-        { model: 'kling-v1', prompt, n: 1, aspect_ratio: aspectRatio },
+        { model, prompt, n: 1, aspect_ratio: aspectRatio },
         { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 15000 },
       );
 
-      const taskId = createResp.data?.data?.task_id;
+      taskId = createResp.data?.data?.task_id;
       if (!taskId) {
         this.logger.error(`Kling create failed: ${JSON.stringify(createResp.data)}`);
+        this.trackCall('generateImage', model, false, Date.now() - t0, `create_failed: ${JSON.stringify(createResp.data).slice(0, 150)}`);
         return null;
       }
 
@@ -55,19 +75,25 @@ export class KlingService {
           const images = pollResp.data?.data?.task_result?.images;
           if (images?.length > 0) {
             this.logger.log(`Kling image ready: ${taskId}`);
+            this.trackCall('generateImage', model, true, Date.now() - t0, undefined, taskId);
             return { url: images[0].url };
           }
         } else if (status === 'failed') {
-          this.logger.error(`Kling task failed: ${taskId} - ${pollResp.data?.data?.task_status_msg}`);
+          const msg = pollResp.data?.data?.task_status_msg;
+          this.logger.error(`Kling task failed: ${taskId} - ${msg}`);
+          this.trackCall('generateImage', model, false, Date.now() - t0, msg || 'task_failed', taskId);
           return null;
         }
         // else: submitted/processing — continue polling
       }
 
       this.logger.error(`Kling task timeout: ${taskId}`);
+      this.trackCall('generateImage', model, false, Date.now() - t0, 'poll_timeout', taskId);
       return null;
     } catch (e) {
-      this.logger.error(`Kling error: ${e.response?.data ? JSON.stringify(e.response.data) : e.message}`);
+      const msg = e.response?.data ? JSON.stringify(e.response.data).slice(0, 200) : e.message;
+      this.logger.error(`Kling error: ${msg}`);
+      this.trackCall('generateImage', model, false, Date.now() - t0, msg, taskId);
       return null;
     }
   }
@@ -83,6 +109,7 @@ export class KlingService {
     duration: 5 | 10;
     cameraControl?: { type: string; config?: Record<string, number> };
   }): Promise<{ taskId: string }> {
+    const t0 = Date.now();
     const token = this.getToken();
     const body: any = {
       model_name: params.model,
@@ -95,16 +122,30 @@ export class KlingService {
     // mode только для v1-6.
     if (params.model === 'kling-v1-6') body.mode = params.mode;
     if (params.cameraControl) body.camera_control = params.cameraControl;
-    const resp = await axios.post(
-      'https://api.klingai.com/v1/videos/text2video',
-      body,
-      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 30000, validateStatus: () => true },
-    );
-    if (resp.status !== 200 || resp.data?.code !== 0) {
-      const msg = resp.data?.message || resp.data?.error || `HTTP ${resp.status}`;
-      throw new Error(`Kling text2video: ${msg} (body: ${JSON.stringify(resp.data).slice(0, 200)})`);
+    try {
+      const resp = await axios.post(
+        'https://api.klingai.com/v1/videos/text2video',
+        body,
+        { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 30000, validateStatus: () => true },
+      );
+      if (resp.status !== 200 || resp.data?.code !== 0) {
+        const msg = resp.data?.message || resp.data?.error || `HTTP ${resp.status}`;
+        this.trackCall('text2video', params.model, false, Date.now() - t0, msg);
+        throw new Error(`Kling text2video: ${msg} (body: ${JSON.stringify(resp.data).slice(0, 200)})`);
+      }
+      const taskId = resp.data.data.task_id;
+      this.trackCall('text2video', params.model, true, Date.now() - t0, undefined, taskId);
+      return { taskId };
+    } catch (e: any) {
+      // If we already tracked above (non-200 path), don't double-track. The
+      // condition `e.message.startsWith('Kling text2video:')` is true only
+      // for the synthetic Error we threw — network errors flow through here
+      // unhandled.
+      if (!/^Kling text2video:/.test(e.message)) {
+        this.trackCall('text2video', params.model, false, Date.now() - t0, e.message);
+      }
+      throw e;
     }
-    return { taskId: resp.data.data.task_id };
   }
 
   async createImage2VideoTask(params: {
@@ -117,6 +158,7 @@ export class KlingService {
     duration: 5 | 10;
     cameraControl?: { type: string; config?: Record<string, number> };
   }): Promise<{ taskId: string }> {
+    const t0 = Date.now();
     const token = this.getToken();
     const body: any = {
       model_name: params.model,
@@ -126,19 +168,28 @@ export class KlingService {
       cfg_scale: params.cfgScale ?? 0.5,
       duration: String(params.duration),
     };
-    // kling-v2-master не принимает mode='std' — Kling возвращает 400.
     if (params.model === 'kling-v1-6') body.mode = params.mode;
     if (params.cameraControl) body.camera_control = params.cameraControl;
-    const resp = await axios.post(
-      'https://api.klingai.com/v1/videos/image2video',
-      body,
-      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 30000, validateStatus: () => true },
-    );
-    if (resp.status !== 200 || resp.data?.code !== 0) {
-      const msg = resp.data?.message || resp.data?.error || `HTTP ${resp.status}`;
-      throw new Error(`Kling image2video: ${msg} (body: ${JSON.stringify(resp.data).slice(0, 200)})`);
+    try {
+      const resp = await axios.post(
+        'https://api.klingai.com/v1/videos/image2video',
+        body,
+        { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 30000, validateStatus: () => true },
+      );
+      if (resp.status !== 200 || resp.data?.code !== 0) {
+        const msg = resp.data?.message || resp.data?.error || `HTTP ${resp.status}`;
+        this.trackCall('image2video', params.model, false, Date.now() - t0, msg);
+        throw new Error(`Kling image2video: ${msg} (body: ${JSON.stringify(resp.data).slice(0, 200)})`);
+      }
+      const taskId = resp.data.data.task_id;
+      this.trackCall('image2video', params.model, true, Date.now() - t0, undefined, taskId);
+      return { taskId };
+    } catch (e: any) {
+      if (!/^Kling image2video:/.test(e.message)) {
+        this.trackCall('image2video', params.model, false, Date.now() - t0, e.message);
+      }
+      throw e;
     }
-    return { taskId: resp.data.data.task_id };
   }
 
   async createVideoExtendTask(params: {
@@ -147,6 +198,8 @@ export class KlingService {
     negativePrompt?: string;
     cfgScale?: number;
   }): Promise<{ taskId: string }> {
+    const t0 = Date.now();
+    const model = 'kling-extend';
     const token = this.getToken();
     const body: any = {
       video_id: params.videoId,
@@ -154,13 +207,26 @@ export class KlingService {
       negative_prompt: params.negativePrompt,
       cfg_scale: params.cfgScale ?? 0.5,
     };
-    const resp = await axios.post(
-      'https://api.klingai.com/v1/videos/video-extend',
-      body,
-      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 30000 },
-    );
-    if (resp.data?.code !== 0) throw new Error(`Kling video-extend: ${resp.data?.message || 'unknown error'}`);
-    return { taskId: resp.data.data.task_id };
+    try {
+      const resp = await axios.post(
+        'https://api.klingai.com/v1/videos/video-extend',
+        body,
+        { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 30000 },
+      );
+      if (resp.data?.code !== 0) {
+        const msg = resp.data?.message || 'unknown error';
+        this.trackCall('extend', model, false, Date.now() - t0, msg);
+        throw new Error(`Kling video-extend: ${msg}`);
+      }
+      const taskId = resp.data.data.task_id;
+      this.trackCall('extend', model, true, Date.now() - t0, undefined, taskId);
+      return { taskId };
+    } catch (e: any) {
+      if (!/^Kling video-extend:/.test(e.message)) {
+        this.trackCall('extend', model, false, Date.now() - t0, e.message);
+      }
+      throw e;
+    }
   }
 
   async createLipSyncTask(params: {
@@ -170,6 +236,8 @@ export class KlingService {
     text?: string;
     voiceId?: string;
   }): Promise<{ taskId: string }> {
+    const t0 = Date.now();
+    const model = 'kling-lipsync';
     const token = this.getToken();
     const body: any = {
       input: {
@@ -180,13 +248,26 @@ export class KlingService {
         ...(params.voiceId ? { voice_id: params.voiceId }   : {}),
       },
     };
-    const resp = await axios.post(
-      'https://api.klingai.com/v1/videos/lip-sync',
-      body,
-      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 30000 },
-    );
-    if (resp.data?.code !== 0) throw new Error(`Kling lip-sync: ${resp.data?.message || 'unknown error'}`);
-    return { taskId: resp.data.data.task_id };
+    try {
+      const resp = await axios.post(
+        'https://api.klingai.com/v1/videos/lip-sync',
+        body,
+        { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 30000 },
+      );
+      if (resp.data?.code !== 0) {
+        const msg = resp.data?.message || 'unknown error';
+        this.trackCall('lipsync', model, false, Date.now() - t0, msg);
+        throw new Error(`Kling lip-sync: ${msg}`);
+      }
+      const taskId = resp.data.data.task_id;
+      this.trackCall('lipsync', model, true, Date.now() - t0, undefined, taskId);
+      return { taskId };
+    } catch (e: any) {
+      if (!/^Kling lip-sync:/.test(e.message)) {
+        this.trackCall('lipsync', model, false, Date.now() - t0, e.message);
+      }
+      throw e;
+    }
   }
 
   async getVideoTaskStatus(

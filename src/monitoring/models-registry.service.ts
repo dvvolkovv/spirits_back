@@ -53,8 +53,10 @@ const EXPECTED: ExpectedModel[] = [
   { provider: 'Kling',      model: 'kling-v1',                       kind: 'image', purpose: 'Альтернативный image gen (older Kling)', caller: 'kling.generateImage', via: 'API key' },
 
   // ---- Video generation ----
-  { provider: 'Kling',      model: 'kling-v1-6',     kind: 'video', purpose: 'Базовый видео-движок (text2video / image2video / extend / lipsync) — std/pro', caller: 'video.createJob', via: 'API key' },
-  { provider: 'Kling',      model: 'kling-v2-master',kind: 'video', purpose: 'Премиум видео-движок (лучше для лиц)',                                       caller: 'video.createJob (quality=master)', via: 'API key' },
+  { provider: 'Kling',      model: 'kling-v1-6',     kind: 'video', purpose: 'Базовый видео-движок (text2video / image2video) — std/pro', caller: 'video.createJob', via: 'API key' },
+  { provider: 'Kling',      model: 'kling-v2-master',kind: 'video', purpose: 'Премиум видео-движок (лучше для лиц)',                       caller: 'video.createJob (quality=master)', via: 'API key' },
+  { provider: 'Kling',      model: 'kling-extend',   kind: 'video', purpose: 'Расширение существующего видео (+5с за вызов) для composed long-form', caller: 'video.advanceComposedJob → kling.createVideoExtendTask', via: 'API key' },
+  { provider: 'Kling',      model: 'kling-lipsync',  kind: 'video', purpose: 'Лип-синк аудио → видео (создать или продолжить)',                       caller: 'video.createJob (mode=lipsync) → kling.createLipSyncTask', via: 'API key' },
 
   // ---- TTS (audio) ----
   { provider: 'ElevenLabs',     model: 'eleven_multilingual_v2', kind: 'audio', purpose: 'TTS для голосов hero/lawyer/coach/psy в SMM-пайпе', caller: 'smm-worker → ElevenLabs API', via: 'API key' },
@@ -168,22 +170,38 @@ export class ModelsRegistryService implements OnModuleInit {
     this.lastRefreshAt = Date.now();
   }
 
-  // Aggregate `claude_cli_call` events grouped by model. This is the only
-  // event we track per-model today (added in chat.service instrumentation).
-  // When we add per-call tracking for OpenRouter / Kling / Gemini / Eleven /
-  // Yandex, just union them here.
+  // Aggregate per-model call counts from every per-provider event we
+  // instrument. As of 2026-06-01 we track:
+  //  - claude_cli_call (chat, vpm, backlog, tasks via ClaudeCliService)
+  //  - kling_call (image + video + extend + lipsync via KlingService)
+  // To add a new provider: emit `<provider>_call` events with at minimum
+  // {model, ok, latency_ms} props, then add it to the UNION below.
   private async queryClaudeCliCounts(): Promise<Map<string, DynamicCounts>> {
     try {
       const r = await this.pg.query(
-        `SELECT
-           COALESCE(props->>'model', 'unknown') AS model,
-           COUNT(*) FILTER (WHERE ts > now() - interval '24 hours')::int AS calls_24h,
-           COUNT(*) FILTER (WHERE ts > now() - interval '30 days')::int  AS calls_30d,
-           COALESCE(SUM((props->>'cost_usd')::numeric) FILTER (WHERE ts > now() - interval '30 days'), 0)::float AS cost_usd_30d,
-           MAX(ts) AS last_seen
-         FROM events
-         WHERE name = 'claude_cli_call'
-         GROUP BY 1`,
+        `SELECT model,
+                SUM(calls_24h)::int AS calls_24h,
+                SUM(calls_30d)::int AS calls_30d,
+                SUM(cost_usd_30d)::float AS cost_usd_30d,
+                MAX(last_seen) AS last_seen
+           FROM (
+             SELECT COALESCE(props->>'model', 'unknown') AS model,
+                    COUNT(*) FILTER (WHERE ts > now() - interval '24 hours')::int AS calls_24h,
+                    COUNT(*) FILTER (WHERE ts > now() - interval '30 days')::int  AS calls_30d,
+                    COALESCE(SUM((props->>'cost_usd')::numeric) FILTER (WHERE ts > now() - interval '30 days'), 0)::float AS cost_usd_30d,
+                    MAX(ts) AS last_seen
+               FROM events WHERE name = 'claude_cli_call'
+               GROUP BY 1
+             UNION ALL
+             SELECT COALESCE(props->>'model', 'unknown') AS model,
+                    COUNT(*) FILTER (WHERE ts > now() - interval '24 hours')::int AS calls_24h,
+                    COUNT(*) FILTER (WHERE ts > now() - interval '30 days')::int  AS calls_30d,
+                    0::float AS cost_usd_30d,
+                    MAX(ts) AS last_seen
+               FROM events WHERE name = 'kling_call'
+               GROUP BY 1
+           ) sub
+           GROUP BY model`,
       );
       const out = new Map<string, DynamicCounts>();
       for (const row of r.rows as any[]) {
