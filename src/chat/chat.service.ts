@@ -913,6 +913,21 @@ export class ChatService {
        VALUES ($1, 'ai', $2, $3, 'text', $4)`,
       [sessionId, agentNum, assistantMsg, tokensUsed],
     );
+
+    // Telemetry: one event per finished user↔assistant exchange. Feeds the
+    // VPM snapshot (active_users_7d, chat_calls_7d) and the product metrics
+    // funnel/economy/quality views. Fire-and-forget — EventsService buffers
+    // and flushes asynchronously.
+    this.events?.track('chat_message_sent', {
+      userId,
+      props: {
+        assistant_id: agentId,
+        tokens_used: tokensUsed,
+        user_msg_len: userMsg.length,
+        assistant_msg_len: assistantMsg.length,
+      },
+      source: 'chat.saveChatHistory',
+    });
   }
 
   private async addTokenTask(userId: string, inputTokens: number, outputTokens: number, agentId?: string) {
