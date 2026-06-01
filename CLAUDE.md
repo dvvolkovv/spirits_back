@@ -140,7 +140,8 @@ ssh dvolkov@212.113.106.202 "
 | `spirits_back.env` | основной `.env` бэкенда (часто пропадал — главная причина существования этого backup'а) |
 | `spirits_back-worker.env` | `.env` SMM-воркера |
 | `linkeon.sql.gz` | `pg_dump` базы `linkeon` (chat history, profiles, payments, tokens, agents) |
-| `neo4j.dump.gz` | offline `neo4j-admin database dump` (Profile + Value/Belief/Desire/Intent/Interest/Skill nodes + relationships). Делается через краткую остановку контейнера (~20с). |
+| `neo4j.schema.txt` | human-readable schema snapshot (labels, relationship types, property keys, constraints, indexes, dbms info) через `cypher-shell`. Удобно дифать между снапшотами, чтобы ловить случайные изменения схемы без восстановления дампа. Делается ДО шага neo4j.dump, fail-soft при упавшем Neo4j. |
+| `neo4j.dump.gz` | offline `neo4j-admin database dump` (Profile + Value/Belief/Desire/Intent/Interest/Skill nodes + relationships, ВКЛЮЧАЯ constraints/indexes). Делается через краткую остановку контейнера (~20с). |
 | `agent-avatars.tar.gz` | PNG/JPG из `public/agent-avatars/` |
 
 **Лог**: `/home/dvolkov/backups/linkeon/backup.log` (append).
