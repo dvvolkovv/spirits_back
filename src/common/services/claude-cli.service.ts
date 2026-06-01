@@ -1,6 +1,7 @@
 // src/common/services/claude-cli.service.ts
 import { Injectable, Logger } from '@nestjs/common';
 import { spawn } from 'child_process';
+import { PgService } from './pg.service';
 
 export interface ClaudeCliOptions {
   /** System prompt prepended to user message. Concatenated with prompt via SYSTEM marker. */
@@ -15,6 +16,25 @@ export interface ClaudeCliOptions {
 export class ClaudeCliService {
   private readonly logger = new Logger(ClaudeCliService.name);
   private readonly claudeBin = process.env.CLAUDE_BIN ?? '/usr/bin/claude';
+
+  // Direct PG insert (not EventsService) because ClaudeCliService lives in
+  // CommonModule and EventsService lives in EventsModule which imports
+  // CommonModule — injecting EventsService here creates a module cycle.
+  // The DB schema is identical (events table), so direct insert is equivalent.
+  constructor(private readonly pg?: PgService) {}
+
+  private trackCallEvent(opts: { costUsd: number; model: string; durationMs: number; ok: boolean }) {
+    if (!this.pg) return;
+    this.pg.query(
+      `INSERT INTO events (name, props) VALUES ('claude_cli_call', $1::jsonb)`,
+      [JSON.stringify({
+        cost_usd: opts.costUsd,
+        model: opts.model,
+        duration_ms: opts.durationMs,
+        ok: opts.ok,
+      })],
+    ).catch((e: any) => this.logger.warn(`claude_cli_call event insert failed: ${e.message}`));
+  }
 
   /**
    * Run one-shot Claude prompt via OAuth and return text + cost.
@@ -82,6 +102,12 @@ export class ClaudeCliService {
           if (costUsd) {
             this.logger.debug(`claude CLI cost: $${costUsd.toFixed(4)}, ${json.duration_ms}ms`);
           }
+          this.trackCallEvent({
+            costUsd,
+            model,
+            durationMs: Number(json.duration_ms) || 0,
+            ok: true,
+          });
           resolve({ text, costUsd });
         } catch (e: any) {
           this.logger.error(`claude CLI parse error: ${e.message}, stdout: ${stdout.slice(0, 200)}`);

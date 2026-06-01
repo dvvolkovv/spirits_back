@@ -1,0 +1,230 @@
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
+import { PgService } from '../common/services/pg.service';
+import axios from 'axios';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+
+/**
+ * Claude health/usage monitoring.
+ *
+ * Unlike SMS Aero / OpenRouter / ElevenLabs, Claude has no $-balance to
+ * report. We use it two ways:
+ *  1. via `claude` CLI authenticated against a Claude Max subscription
+ *     (OAuth) — a flat-rate plan with rate limits but no balance
+ *  2. via Anthropic API with a pay-as-you-go key — billing on file
+ *
+ * So "balance" here is reframed as:
+ *  - subscription status (max / pro / free, expires_at)
+ *  - rolling spend over 24h / 30d, aggregated from `events` rows
+ *    inserted by ClaudeCliService on every CLI call
+ *  - API key validity (cheap probe to /v1/models)
+ *  - daily call count
+ *
+ * If we ever burn more than a configurable monthly $ threshold,
+ * Telegram alert fires (cooldown 24h).
+ */
+
+interface UsageSnapshot {
+  // Rolling sums from events table
+  cost24hUsd: number | null;
+  cost30dUsd: number | null;
+  calls24h: number | null;
+  calls30d: number | null;
+  topModels30d: Array<{ model: string; calls: number; cost_usd: number }>;
+  // Subscription (claude CLI OAuth credentials)
+  subscriptionType: string | null;       // 'max' | 'pro' | 'free' | null
+  subscriptionExpiresAt: string | null;  // ISO or null
+  // Anthropic API key health (separate from CLI subscription)
+  apiKeyValid: boolean | null;
+  apiKeyError: string | null;
+  fetchedAt: string;
+}
+
+const ALERT_THRESHOLD_30D_USD = Number(process.env.CLAUDE_SPEND_ALERT_THRESHOLD_30D_USD || 100);
+const ALERT_COOLDOWN_HOURS = Number(process.env.CLAUDE_SPEND_ALERT_COOLDOWN_H || 24);
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TG_CHAT  = process.env.TELEGRAM_CHAT_ID  || '';
+
+export interface ClaudeHealthOverview {
+  generatedAt: string;
+  usage: UsageSnapshot;
+  alertThreshold30dUsd: number;
+  configured: {
+    apiKey: boolean;
+    cliCredentials: boolean;
+  };
+}
+
+@Injectable()
+export class ClaudeHealthService implements OnModuleInit {
+  private readonly log = new Logger(ClaudeHealthService.name);
+  private cache: UsageSnapshot = {
+    cost24hUsd: null, cost30dUsd: null,
+    calls24h: null, calls30d: null,
+    topModels30d: [],
+    subscriptionType: null,
+    subscriptionExpiresAt: null,
+    apiKeyValid: null, apiKeyError: null,
+    fetchedAt: new Date(0).toISOString(),
+  };
+  private lastAlertAt: Date | null = null;
+
+  constructor(private readonly pg: PgService) {}
+
+  async onModuleInit() {
+    this.refresh().catch(() => {});
+  }
+
+  @Cron(CronExpression.EVERY_HOUR)
+  async hourly() {
+    await this.refresh();
+    await this.maybeAlert();
+  }
+
+  private async refresh(): Promise<void> {
+    const [usage, subscription, apiKey] = await Promise.all([
+      this.aggregateUsage(),
+      this.readSubscription(),
+      this.probeApiKey(),
+    ]);
+    this.cache = {
+      ...usage,
+      ...subscription,
+      ...apiKey,
+      fetchedAt: new Date().toISOString(),
+    };
+  }
+
+  private async aggregateUsage() {
+    try {
+      const sums = await this.pg.query(
+        `SELECT
+           COALESCE(SUM((props->>'cost_usd')::numeric) FILTER (WHERE ts >= now() - interval '24 hours'), 0) AS cost_24h,
+           COALESCE(SUM((props->>'cost_usd')::numeric) FILTER (WHERE ts >= now() - interval '30 days'),  0) AS cost_30d,
+           COUNT(*) FILTER (WHERE ts >= now() - interval '24 hours')::int AS calls_24h,
+           COUNT(*) FILTER (WHERE ts >= now() - interval '30 days')::int  AS calls_30d
+         FROM events WHERE name = 'claude_cli_call'`,
+      );
+      const r = sums.rows[0] as any;
+      const models = await this.pg.query(
+        `SELECT
+           COALESCE(props->>'model', 'unknown') AS model,
+           COUNT(*)::int AS calls,
+           COALESCE(SUM((props->>'cost_usd')::numeric), 0)::float AS cost_usd
+         FROM events
+         WHERE name = 'claude_cli_call' AND ts >= now() - interval '30 days'
+         GROUP BY 1 ORDER BY cost_usd DESC LIMIT 5`,
+      );
+      return {
+        cost24hUsd: Number(r?.cost_24h) || 0,
+        cost30dUsd: Number(r?.cost_30d) || 0,
+        calls24h: Number(r?.calls_24h) || 0,
+        calls30d: Number(r?.calls_30d) || 0,
+        topModels30d: models.rows.map((m: any) => ({
+          model: String(m.model),
+          calls: Number(m.calls),
+          cost_usd: Number(m.cost_usd),
+        })),
+      };
+    } catch (e: any) {
+      this.log.warn(`Claude usage aggregation failed: ${e.message}`);
+      return {
+        cost24hUsd: null, cost30dUsd: null,
+        calls24h: null, calls30d: null,
+        topModels30d: [],
+      };
+    }
+  }
+
+  // Claude CLI stores OAuth credentials at ~/.claude/.credentials.json with
+  // a `claudeAiOauth` object containing subscriptionType + expires_at.
+  // Reading the file is cheap and lives on the same filesystem as our
+  // pm2 process — no extra moving parts.
+  private async readSubscription() {
+    try {
+      const home = process.env.HOME || os.homedir();
+      const credPath = process.env.CLAUDE_CREDENTIALS_PATH || path.join(home, '.claude', '.credentials.json');
+      if (!fs.existsSync(credPath)) {
+        return { subscriptionType: null, subscriptionExpiresAt: null };
+      }
+      const raw = JSON.parse(fs.readFileSync(credPath, 'utf8'));
+      const oauth = raw?.claudeAiOauth || {};
+      const subType: string | null = oauth?.subscriptionType ?? null;
+      const expiresAtNum = oauth?.expires_at;
+      let subExpires: string | null = null;
+      if (typeof expiresAtNum === 'number' && expiresAtNum > 0) {
+        // Unix seconds OR ms — pick by magnitude
+        const ms = expiresAtNum > 1e12 ? expiresAtNum : expiresAtNum * 1000;
+        subExpires = new Date(ms).toISOString();
+      }
+      return { subscriptionType: subType, subscriptionExpiresAt: subExpires };
+    } catch (e: any) {
+      this.log.warn(`Reading claude credentials failed: ${e.message}`);
+      return { subscriptionType: null, subscriptionExpiresAt: null };
+    }
+  }
+
+  // Cheap key-validity probe. /v1/models requires only a valid x-api-key
+  // and no spend; success means the key is live and not revoked. Doesn't
+  // expose balance — Anthropic doesn't have a public balance endpoint
+  // even for non-admin keys.
+  private async probeApiKey(): Promise<{ apiKeyValid: boolean | null; apiKeyError: string | null }> {
+    const key = process.env.ANTHROPIC_API_KEY;
+    if (!key) return { apiKeyValid: null, apiKeyError: 'ANTHROPIC_API_KEY not set' };
+    try {
+      const r = await axios.get('https://api.anthropic.com/v1/models', {
+        headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+        timeout: 8000,
+        validateStatus: () => true,
+      });
+      if (r.status >= 200 && r.status < 300) {
+        return { apiKeyValid: true, apiKeyError: null };
+      }
+      return {
+        apiKeyValid: false,
+        apiKeyError: `anthropic ${r.status}: ${JSON.stringify(r.data).slice(0, 200)}`,
+      };
+    } catch (e: any) {
+      return { apiKeyValid: null, apiKeyError: e?.message || 'network' };
+    }
+  }
+
+  private async maybeAlert(): Promise<void> {
+    const c30 = this.cache.cost30dUsd;
+    if (c30 === null || c30 < ALERT_THRESHOLD_30D_USD) return;
+    if (!TG_TOKEN || !TG_CHAT) return;
+    const now = new Date();
+    if (this.lastAlertAt && (now.getTime() - this.lastAlertAt.getTime()) < ALERT_COOLDOWN_HOURS * 3600_000) {
+      return;
+    }
+    try {
+      await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+        chat_id: TG_CHAT,
+        parse_mode: 'HTML',
+        text: `<b>⚠️ Claude: высокий расход за 30 дней</b>\n` +
+              `Сейчас: <b>$${c30.toFixed(2)}</b>\n` +
+              `Порог: $${ALERT_THRESHOLD_30D_USD}\n` +
+              `Подписка: ${this.cache.subscriptionType || 'не определена'}\n` +
+              `Биллинг: https://console.anthropic.com/settings/billing`,
+      }, { timeout: 8000 });
+      this.lastAlertAt = now;
+      this.log.warn(`Claude spend over threshold: $${c30} — Telegram alert sent`);
+    } catch (e: any) {
+      this.log.error(`Telegram alert failed: ${e?.message || 'unknown'}`);
+    }
+  }
+
+  async getOverview(): Promise<ClaudeHealthOverview> {
+    return {
+      generatedAt: new Date().toISOString(),
+      usage: this.cache,
+      alertThreshold30dUsd: ALERT_THRESHOLD_30D_USD,
+      configured: {
+        apiKey: !!process.env.ANTHROPIC_API_KEY,
+        cliCredentials: this.cache.subscriptionType !== null,
+      },
+    };
+  }
+}
