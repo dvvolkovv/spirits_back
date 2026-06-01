@@ -1,0 +1,37 @@
+-- 001_vpm.sql
+-- Virtual Product Manager: stored runs of the LLM-driven product review
+-- + individual recommendations the operator can act on.
+
+CREATE TABLE IF NOT EXISTS vpm_runs (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  triggered_by    text,                    -- admin user_id, NULL for cron
+  trigger         text NOT NULL DEFAULT 'manual'
+                    CHECK (trigger IN ('manual','cron')),
+  snapshot        jsonb NOT NULL,          -- raw metrics+context shown to the LLM
+  cost_usd        numeric(10, 6),
+  duration_ms     int,
+  error_message   text,
+  created_at      timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_vpm_runs_created ON vpm_runs (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS vpm_recommendations (
+  id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  run_id              uuid NOT NULL REFERENCES vpm_runs(id) ON DELETE CASCADE,
+  priority            text NOT NULL DEFAULT 'medium'
+                        CHECK (priority IN ('critical','high','medium','low')),
+  title               text NOT NULL,
+  rationale_md        text NOT NULL DEFAULT '',
+  proposed_action_md  text NOT NULL DEFAULT '',
+  related_metrics     jsonb NOT NULL DEFAULT '[]'::jsonb,
+  status              text NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','in_backlog','dismissed','done')),
+  backlog_item_id     uuid,                -- soft FK to backlog_items.id
+  status_changed_at   timestamptz,
+  status_changed_by   text,
+  created_at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_vpm_recommendations_status ON vpm_recommendations (status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vpm_recommendations_run    ON vpm_recommendations (run_id);

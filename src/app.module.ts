@@ -26,6 +26,7 @@ import { IdentityModule } from './identity/identity.module';
 import { MonitoringModule } from './monitoring/monitoring.module';
 import { EventsModule } from './events/events.module';
 import { BacklogModule } from './backlog/backlog.module';
+import { VpmModule } from './vpm/vpm.module';
 
 @Module({
   imports: [
@@ -56,6 +57,7 @@ import { BacklogModule } from './backlog/backlog.module';
     EventsModule,
     MonitoringModule,
     BacklogModule,
+    VpmModule,
   ],
 })
 export class AppModule {}

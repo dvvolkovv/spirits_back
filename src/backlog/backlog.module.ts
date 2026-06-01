@@ -7,5 +7,6 @@ import { CommonModule } from '../common/common.module';
   imports: [CommonModule],
   controllers: [BacklogController],
   providers: [BacklogService],
+  exports: [BacklogService],
 })
 export class BacklogModule {}
