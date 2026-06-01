@@ -19,6 +19,7 @@ import { ElevenLabsHealthService } from './elevenlabs-health.service';
 import { ClaudeHealthService } from './claude-health.service';
 import { BackupHealthService } from './backup-health.service';
 import { ModelsRegistryService } from './models-registry.service';
+import { JobsMonitorService } from './jobs-monitor.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 
@@ -50,6 +51,7 @@ export class MonitoringController {
     private readonly claudeHealth: ClaudeHealthService,
     private readonly backupHealth: BackupHealthService,
     private readonly models: ModelsRegistryService,
+    private readonly jobs: JobsMonitorService,
   ) {}
 
   @Get('admin/monitoring/overview')
@@ -161,6 +163,17 @@ export class MonitoringController {
       return res.status(200).json(data);
     } catch (e: any) {
       return res.status(500).json({ error: 'models_failed', message: e?.message || String(e) });
+    }
+  }
+
+  @Get('admin/monitoring/tech/jobs')
+  @UseGuards(JwtGuard, AdminGuard)
+  async jobsOverview(@Res() res: Response) {
+    try {
+      const data = await this.jobs.getOverview();
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'jobs_failed', message: e?.message || String(e) });
     }
   }
 
