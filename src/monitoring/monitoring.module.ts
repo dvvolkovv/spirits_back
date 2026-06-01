@@ -18,12 +18,13 @@ import { OpenRouterHealthService } from './openrouter-health.service';
 import { ElevenLabsHealthService } from './elevenlabs-health.service';
 import { ClaudeHealthService } from './claude-health.service';
 import { BackupHealthService } from './backup-health.service';
+import { ModelsRegistryService } from './models-registry.service';
 import { CommonModule } from '../common/common.module';
 import { Neo4jModule } from '../neo4j/neo4j.module';
 
 @Module({
   imports: [CommonModule, Neo4jModule],
   controllers: [MonitoringController],
-  providers: [MonitoringService, LogsService, SyntheticService, FunnelService, EconomyService, QualityService, ProfileDepthService, SummaryService, NetworkingService, ChurnService, SupportService, ContentService, PersonasService, SmsHealthService, OpenRouterHealthService, ElevenLabsHealthService, ClaudeHealthService, BackupHealthService],
+  providers: [MonitoringService, LogsService, SyntheticService, FunnelService, EconomyService, QualityService, ProfileDepthService, SummaryService, NetworkingService, ChurnService, SupportService, ContentService, PersonasService, SmsHealthService, OpenRouterHealthService, ElevenLabsHealthService, ClaudeHealthService, BackupHealthService, ModelsRegistryService],
 })
 export class MonitoringModule {}

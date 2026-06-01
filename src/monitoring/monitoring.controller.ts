@@ -18,6 +18,7 @@ import { OpenRouterHealthService } from './openrouter-health.service';
 import { ElevenLabsHealthService } from './elevenlabs-health.service';
 import { ClaudeHealthService } from './claude-health.service';
 import { BackupHealthService } from './backup-health.service';
+import { ModelsRegistryService } from './models-registry.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 
@@ -48,6 +49,7 @@ export class MonitoringController {
     private readonly elevenlabsHealth: ElevenLabsHealthService,
     private readonly claudeHealth: ClaudeHealthService,
     private readonly backupHealth: BackupHealthService,
+    private readonly models: ModelsRegistryService,
   ) {}
 
   @Get('admin/monitoring/overview')
@@ -148,6 +150,17 @@ export class MonitoringController {
       return res.status(200).json(data);
     } catch (e: any) {
       return res.status(500).json({ error: 'backups_failed', message: e?.message || String(e) });
+    }
+  }
+
+  @Get('admin/monitoring/tech/models')
+  @UseGuards(JwtGuard, AdminGuard)
+  async modelsOverview(@Res() res: Response) {
+    try {
+      const data = await this.models.getOverview();
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'models_failed', message: e?.message || String(e) });
     }
   }
 
