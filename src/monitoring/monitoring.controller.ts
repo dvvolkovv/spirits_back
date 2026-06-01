@@ -15,6 +15,7 @@ import { ContentService, ContentWindow } from './product/content.service';
 import { PersonasService } from './product/personas.service';
 import { SmsHealthService } from './sms-health.service';
 import { OpenRouterHealthService } from './openrouter-health.service';
+import { ElevenLabsHealthService } from './elevenlabs-health.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 
@@ -42,6 +43,7 @@ export class MonitoringController {
     private readonly personas: PersonasService,
     private readonly smsHealth: SmsHealthService,
     private readonly openrouterHealth: OpenRouterHealthService,
+    private readonly elevenlabsHealth: ElevenLabsHealthService,
   ) {}
 
   @Get('admin/monitoring/overview')
@@ -109,6 +111,17 @@ export class MonitoringController {
       return res.status(200).json(data);
     } catch (e: any) {
       return res.status(500).json({ error: 'openrouter_failed', message: e?.message || String(e) });
+    }
+  }
+
+  @Get('admin/monitoring/tech/elevenlabs')
+  @UseGuards(JwtGuard, AdminGuard)
+  async elevenlabsOverview(@Res() res: Response) {
+    try {
+      const data = await this.elevenlabsHealth.getOverview();
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'elevenlabs_failed', message: e?.message || String(e) });
     }
   }
 
