@@ -12,7 +12,7 @@ export class SupportController {
 
   @Get('ticket')
   async getTicket(@CurrentUser() u: any) {
-    const t = await this.support.getLatestOrCreateTicket(u.phone);
+    const t = await this.support.getLatestOrCreateTicket(u.userId);
     return {
       id: t.id,
       status: t.status,
@@ -26,12 +26,12 @@ export class SupportController {
   @Get('tickets')
   async listTickets(@CurrentUser() u: any, @Query('limit') limit?: string) {
     const n = limit ? parseInt(limit, 10) : 10;
-    return this.support.listUserTicketsWithMessages(u.phone, isNaN(n) ? 10 : n);
+    return this.support.listUserTicketsWithMessages(u.userId, isNaN(n) ? 10 : n);
   }
 
   @Get('ticket/:id/messages')
   async getMessages(@CurrentUser() u: any, @Param('id') id: string) {
-    const rows = await this.support.listMessages(u.phone, id, false);
+    const rows = await this.support.listMessages(u.userId, id, false);
     return rows.map((m) => ({
       id: m.id,
       senderType: m.sender_type,
@@ -42,7 +42,7 @@ export class SupportController {
 
   @Post('message')
   async postMessage(@CurrentUser() u: any, @Body() dto: PostUserMessageDto) {
-    return this.support.postUserMessage(u.phone, dto);
+    return this.support.postUserMessage(u.userId, dto);
   }
 
   @Get('health')
@@ -79,7 +79,7 @@ export class SupportController {
     @Param('id') id: string,
     @Body() body: { content: string; visibleToUser?: boolean },
   ) {
-    await this.support.adminReply(id, u.phone, body.content, body.visibleToUser !== false);
+    await this.support.adminReply(id, u.userId, body.content, body.visibleToUser !== false);
     return { ok: true };
   }
 
@@ -90,7 +90,7 @@ export class SupportController {
     @Param('id') id: string,
     @Body() body: { status: string; note?: string },
   ) {
-    await this.support.adminSetStatus(id, u.phone, body.status, body.note);
+    await this.support.adminSetStatus(id, u.userId, body.status, body.note);
     return { ok: true };
   }
 }
