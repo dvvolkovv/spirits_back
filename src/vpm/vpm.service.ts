@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit, BadRequestException, NotFoundExceptio
 import { PgService } from '../common/services/pg.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { BacklogService, BacklogItem } from '../backlog/backlog.service';
+import { PersonasService } from '../monitoring/product/personas.service';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -44,6 +45,7 @@ export class VpmService implements OnModuleInit {
     private readonly pg: PgService,
     private readonly claude: ClaudeCliService,
     private readonly backlog: BacklogService,
+    private readonly personas: PersonasService,
   ) {}
 
   async onModuleInit() {
@@ -133,6 +135,98 @@ export class VpmService implements OnModuleInit {
       snapshot.usage = usage.rows[0];
     } catch { /* silent */ }
 
+    // 5. Real-user funnel & retention. Chat activity is sourced from
+    // custom_chat_history (real history back to 2026-04), NOT the events table —
+    // event-based chat tracking only started 2026-06-01, which is exactly why
+    // usage.chat_calls_7d == chat_calls_30d. Test/synthetic numbers are excluded
+    // so the VPM reasons on real users (the smoke account alone spams hundreds
+    // of messages). chat user = prefix of session_id ("<phone>_<assistantId>").
+    const TEST_USERS = ['70000000000', '79030169187', '79169403771', '79656445804'];
+    const TEST_PATTERN = '^790300[0-9]{5}$';
+    try {
+      const funnel = await this.pg.query(
+        `WITH chat AS (
+           SELECT split_part(session_id,'_',1) AS uid, created_at
+             FROM custom_chat_history
+            WHERE sender_type='human'
+              AND split_part(session_id,'_',1) <> ALL($1)
+              AND split_part(session_id,'_',1) !~ $2
+         ),
+         firsts AS (SELECT uid, min(created_at) AS first_at FROM chat GROUP BY uid)
+         SELECT
+           (SELECT COUNT(DISTINCT uid) FROM chat WHERE created_at > now()-interval '7 days')  AS active_users_7d_real,
+           (SELECT COUNT(*) FROM firsts WHERE first_at > now()-interval '7 days')              AS first_chat_users_7d,
+           (SELECT COUNT(*) FROM (
+              SELECT uid FROM chat WHERE created_at > now()-interval '7 days'
+              GROUP BY uid HAVING COUNT(DISTINCT date_trunc('day',created_at)) >= 2
+           ) r)                                                                                AS returning_users_7d,
+           (SELECT COUNT(*) FROM chat WHERE created_at > now()-interval '7 days')              AS chat_messages_7d_real,
+           (SELECT COUNT(*) FROM chat WHERE created_at > now()-interval '30 days')             AS chat_messages_30d_real`,
+        [TEST_USERS, TEST_PATTERN],
+      );
+      const reg = await this.pg.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE created_at > now()-interval '7 days')  AS registrations_7d,
+           COUNT(*) FILTER (WHERE created_at > now()-interval '30 days') AS registrations_30d
+         FROM ai_profiles_consolidated
+         WHERE user_id <> ALL($1) AND user_id !~ $2`,
+        [TEST_USERS, TEST_PATTERN],
+      );
+      const ttf = await this.pg.query(
+        `WITH firsts AS (
+           SELECT split_part(session_id,'_',1) AS uid, min(created_at) AS first_chat
+             FROM custom_chat_history WHERE sender_type='human' GROUP BY 1
+         )
+         SELECT round(EXTRACT(EPOCH FROM percentile_cont(0.5) WITHIN GROUP (
+                  ORDER BY (f.first_chat - p.created_at)))/60.0, 1) AS median_time_to_first_chat_min
+           FROM ai_profiles_consolidated p
+           JOIN firsts f ON f.uid = p.user_id
+          WHERE p.created_at > now()-interval '30 days'
+            AND f.first_chat >= p.created_at
+            AND p.user_id <> ALL($1) AND p.user_id !~ $2`,
+        [TEST_USERS, TEST_PATTERN],
+      );
+      snapshot.funnel = { ...funnel.rows[0], ...reg.rows[0], ...ttf.rows[0] };
+    } catch { /* silent */ }
+
+    // 6. Referral funnel (acquisition channel health)
+    try {
+      const ref = await this.pg.query(
+        `SELECT
+           (SELECT COUNT(*) FROM referral_referees WHERE registered_at > now()-interval '7 days') AS referral_registrations_7d,
+           (SELECT COUNT(*) FROM referral_referees)                                               AS referral_referees_total,
+           (SELECT COUNT(*) FROM events WHERE name='referral_click' AND ts > now()-interval '7 days') AS referral_clicks_7d,
+           (SELECT COUNT(*) FROM referral_leaders WHERE is_active)                                 AS referral_active_leaders`,
+      );
+      snapshot.referral = ref.rows[0];
+    } catch { /* silent */ }
+
+    // 7. User personas (rule-based segments — who actually uses the product).
+    // Compact view so the prompt stays small; full detail is in the admin UI.
+    try {
+      const p = await this.personas.getOverview();
+      snapshot.personas = {
+        total_users: p.totalUsers,
+        buckets: p.buckets.map((b) => ({
+          persona: b.key,
+          label: b.label,
+          users: b.users,
+          share_pct: b.sharePct,
+          avg_payment_rub: b.avgPaymentRub,
+          avg_messages: b.avgMessages,
+          retention_14d_pct: b.retention14dPct,
+          top_assistant: b.topAssistants?.[0]?.displayName ?? b.topAssistants?.[0]?.name ?? null,
+        })),
+      };
+    } catch { /* silent */ }
+
+    snapshot.baseline_note =
+      'usage.* (chat_calls_7d/30d, active_users_7d) come from the events table, where chat instrumentation ' +
+      'started 2026-06-01 — so chat_calls_7d == chat_calls_30d is EXPECTED until 30d of events accrue, not a bug. ' +
+      'For real history use funnel.chat_messages_*_real (from custom_chat_history, back to 2026-04). ' +
+      'funnel.* and referral.referral_registrations exclude test numbers (70000000000, 79030169187, 79169403771, 79656445804, 790300xxxxx); ' +
+      'usage.* still includes them, so usage.active_users_7d may be inflated by the smoke/test accounts.';
+
     snapshot.generated_at = new Date().toISOString();
     return snapshot;
   }
@@ -151,7 +245,9 @@ export class VpmService implements OnModuleInit {
       'Правила:',
       '- Не предлагай задачи, которые уже в бэклоге (см. backlog_recent_proposed) или уже сделаны недавно (backlog_recent_done).',
       '- Опирайся на конкретные метрики и тикеты в snapshot. В rationale_md явно укажи на что смотришь.',
-      '- Если данных не хватает — это тоже рекомендация (например, "Добавить метрику X").',
+      '- Смотри на `personas` (сегменты пользователей: кто реально платит, у кого retention, к каким ассистентам идут) — стройте гипотезы по acquisition/retention/монетизации под конкретные персоны, а не «в среднем».',
+      '- Различай реальные метрики и тестовый трафик: `funnel.*` и `personas` уже исключают тестовые номера; `usage.*` — нет (см. `baseline_note`). Не делай выводов из раздутого тестами `usage`.',
+      '- Если тебе не хватает какой-то метрики для решения — так и напиши: заведи рекомендацию «Добавить метрику X в snapshot» с тем, что именно нужно мерить и зачем. Снимок метрик расширяемый.',
       '- Не повторяй prior_recommendations с тем же смыслом.',
       '- Priority: critical = блокирует бизнес сейчас. high = реальная боль для пользователей. medium = улучшение. low = nice-to-have / cleanup.',
       '',
