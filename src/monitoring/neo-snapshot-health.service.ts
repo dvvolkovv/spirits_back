@@ -26,6 +26,12 @@ import * as path from 'path';
  *
  * Gated on NEO4J_DR_HOST — unset (e.g. the test server, which has no node-3)
  * → configured:false, doesn't probe, doesn't drag health down.
+ *
+ * Env is read in the constructor, NOT at module load: these providers are
+ * `import`ed (and any module-level `process.env` reads would run) before
+ * ConfigModule.forRoot() populates process.env from .env. Reading in the
+ * constructor — which runs during Nest's instantiation, after forRoot — is
+ * what actually sees the .env values.
  */
 
 interface NeoDrFile {
@@ -56,15 +62,6 @@ export interface NeoSnapshotOverview {
   error: string | null;
 }
 
-const BACKUP_ROOT = process.env.BACKUP_DIR || '/home/dvolkov/backups/linkeon';
-const DR_HOST = process.env.NEO4J_DR_HOST || '';
-const DR_USER = process.env.NEO4J_DR_SSH_USER || 'dvolkov';
-const DR_DIR = process.env.NEO4J_DR_DIR || '/var/lib/linkeon-dr/neo4j';
-const FRESH_HOURS = Number(process.env.NEO4J_DR_FRESH_HOURS || 48);
-const ALERT_COOLDOWN_HOURS = Number(process.env.NEO4J_DR_ALERT_COOLDOWN_H || 12);
-const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '';
-
 // The DR-mirrored artifacts. The dump drives health; schema is informational.
 const DR_FILES = ['neo4j.dump.gz', 'neo4j.schema.txt'];
 const CRITICAL_FILE = 'neo4j.dump.gz';
@@ -72,48 +69,71 @@ const CRITICAL_FILE = 'neo4j.dump.gz';
 @Injectable()
 export class NeoSnapshotHealthService implements OnModuleInit {
   private readonly log = new Logger(NeoSnapshotHealthService.name);
-  private cache: NeoSnapshotOverview = this.emptyOverview();
+
+  // Resolved from env in the constructor (see class doc — module-load is too early).
+  private readonly backupRoot: string;
+  private readonly drHost: string;
+  private readonly drUser: string;
+  private readonly drDir: string;
+  private readonly freshHours: number;
+  private readonly alertCooldownH: number;
+  private readonly tgToken: string;
+  private readonly tgChat: string;
+
+  private cache: NeoSnapshotOverview;
   private lastAlertAt: Date | null = null;
+
+  constructor() {
+    this.backupRoot = process.env.BACKUP_DIR || '/home/dvolkov/backups/linkeon';
+    this.drHost = process.env.NEO4J_DR_HOST || '';
+    this.drUser = process.env.NEO4J_DR_SSH_USER || 'dvolkov';
+    this.drDir = process.env.NEO4J_DR_DIR || '/var/lib/linkeon-dr/neo4j';
+    this.freshHours = Number(process.env.NEO4J_DR_FRESH_HOURS || 48);
+    this.alertCooldownH = Number(process.env.NEO4J_DR_ALERT_COOLDOWN_H || 12);
+    this.tgToken = process.env.TELEGRAM_BOT_TOKEN || '';
+    this.tgChat = process.env.TELEGRAM_CHAT_ID || '';
+    this.cache = this.emptyOverview();
+  }
 
   private emptyOverview(error: string | null = null): NeoSnapshotOverview {
     return {
       generatedAt: new Date(0).toISOString(),
-      configured: !!DR_HOST,
+      configured: !!this.drHost,
       reachable: false,
-      host: DR_HOST || null,
-      dir: DR_HOST ? DR_DIR : null,
+      host: this.drHost || null,
+      dir: this.drHost ? this.drDir : null,
       files: [],
       dumpSizeBytes: null,
       prevDumpSizeBytes: null,
-      freshHours: FRESH_HOURS,
+      freshHours: this.freshHours,
       healthy: false,
       error,
     };
   }
 
   async onModuleInit() {
-    if (DR_HOST) this.refresh().catch(() => {});
+    if (this.drHost) this.refresh().catch(() => {});
   }
 
   @Cron(CronExpression.EVERY_HOUR)
   async hourly() {
-    if (!DR_HOST) return;
+    if (!this.drHost) return;
     await this.refresh();
     await this.maybeAlert();
   }
 
-  // Newest two snapshot dirs under BACKUP_ROOT (latest, previous).
+  // Newest two snapshot dirs under backupRoot (latest, previous).
   private snapshotDirs(): string[] {
-    if (!fs.existsSync(BACKUP_ROOT)) return [];
-    return fs.readdirSync(BACKUP_ROOT)
+    if (!fs.existsSync(this.backupRoot)) return [];
+    return fs.readdirSync(this.backupRoot)
       .filter((n) => /^\d{8}-\d{6}$/.test(n))
-      .map((n) => path.join(BACKUP_ROOT, n))
+      .map((n) => path.join(this.backupRoot, n))
       .filter((p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } })
       .sort();
   }
 
   private async refresh(): Promise<void> {
-    if (!DR_HOST) { this.cache = this.emptyOverview(); return; }
+    if (!this.drHost) { this.cache = this.emptyOverview(); return; }
     try {
       const dirs = this.snapshotDirs();
       const latestDir = dirs.length ? dirs[dirs.length - 1] : null;
@@ -166,18 +186,18 @@ export class NeoSnapshotHealthService implements OnModuleInit {
         && !!dump
         && dump.localPresent && dump.remotePresent
         && dump.inSync
-        && dump.remoteAgeHours != null && dump.remoteAgeHours <= FRESH_HOURS;
+        && dump.remoteAgeHours != null && dump.remoteAgeHours <= this.freshHours;
 
       this.cache = {
         generatedAt: new Date().toISOString(),
         configured: true,
         reachable: remote.reachable,
-        host: DR_HOST,
-        dir: DR_DIR,
+        host: this.drHost,
+        dir: this.drDir,
         files,
         dumpSizeBytes: dump?.localSizeBytes ?? null,
         prevDumpSizeBytes,
-        freshHours: FRESH_HOURS,
+        freshHours: this.freshHours,
         healthy,
         error: remote.reachable ? null : (remote.error || 'node-3 unreachable'),
       };
@@ -195,7 +215,7 @@ export class NeoSnapshotHealthService implements OnModuleInit {
   }> {
     const fileList = DR_FILES.join(' ');
     const remoteCmd =
-      `cd ${DR_DIR} 2>/dev/null || exit 7; for f in ${fileList}; do ` +
+      `cd ${this.drDir} 2>/dev/null || exit 7; for f in ${fileList}; do ` +
       `if [ -f "$f" ]; then echo "$f|$(stat -c '%s|%Y' "$f")|$(md5sum "$f" | cut -d' ' -f1)"; ` +
       `else echo "$f|MISSING"; fi; done`;
 
@@ -228,7 +248,7 @@ export class NeoSnapshotHealthService implements OnModuleInit {
         '-o', 'BatchMode=yes',
         '-o', 'ConnectTimeout=8',
         '-o', 'StrictHostKeyChecking=accept-new',
-        `${DR_USER}@${DR_HOST}`,
+        `${this.drUser}@${this.drHost}`,
         remoteCmd,
       ];
       const proc = spawn('ssh', args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -266,21 +286,21 @@ export class NeoSnapshotHealthService implements OnModuleInit {
       if (!dump || !dump.remotePresent) problems.push('neo4j.dump.gz отсутствует на node-3');
       else {
         if (!dump.inSync) problems.push('md5 дампа на node-3 не совпадает с прод-latest (рассинхрон)');
-        if (dump.remoteAgeHours != null && dump.remoteAgeHours > FRESH_HOURS) {
-          problems.push(`копия на node-3 ${dump.remoteAgeHours.toFixed(1)}ч (порог ${FRESH_HOURS}ч)`);
+        if (dump.remoteAgeHours != null && dump.remoteAgeHours > this.freshHours) {
+          problems.push(`копия на node-3 ${dump.remoteAgeHours.toFixed(1)}ч (порог ${this.freshHours}ч)`);
         }
       }
     }
-    if (problems.length === 0 || !TG_TOKEN || !TG_CHAT) return;
+    if (problems.length === 0 || !this.tgToken || !this.tgChat) return;
     const now = new Date();
-    if (this.lastAlertAt && (now.getTime() - this.lastAlertAt.getTime()) < ALERT_COOLDOWN_HOURS * 3600_000) return;
+    if (this.lastAlertAt && (now.getTime() - this.lastAlertAt.getTime()) < this.alertCooldownH * 3600_000) return;
     try {
-      await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-        chat_id: TG_CHAT,
+      await axios.post(`https://api.telegram.org/bot${this.tgToken}/sendMessage`, {
+        chat_id: this.tgChat,
         parse_mode: 'HTML',
         text: `<b>⚠️ Neo4j DR (node-3): проблемы</b>\n` +
           problems.map((p) => `• ${p}`).join('\n') +
-          `\n\nЦель: <code>${DR_USER}@${DR_HOST}:${DR_DIR}</code>`,
+          `\n\nЦель: <code>${this.drUser}@${this.drHost}:${this.drDir}</code>`,
       }, { timeout: 8000 });
       this.lastAlertAt = now;
       this.log.warn(`Neo4j DR alert sent: ${problems.join(' | ')}`);
@@ -292,7 +312,7 @@ export class NeoSnapshotHealthService implements OnModuleInit {
   async getOverview(): Promise<NeoSnapshotOverview> {
     // Serve cache; if it was never populated (e.g. first call before the cron),
     // refresh on-demand so the widget isn't empty right after a restart.
-    if (DR_HOST && this.cache.generatedAt === new Date(0).toISOString()) {
+    if (this.drHost && this.cache.generatedAt === new Date(0).toISOString()) {
       await this.refresh();
     }
     return this.cache;
