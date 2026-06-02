@@ -189,10 +189,12 @@ ssh dvolkov@212.113.106.202 "tar xzf /tmp/agent-avatars.tar.gz -C /home/dvolkov/
 ## Тестовые аккаунты
 | | Телефон | Роль |
 |--|---------|------|
-| Admin | `79030169187` | isadmin=true, реферальный лидер (test-leader) |
-| Test | `70000000000` | тестовый пользователь |
+| **Claude dev/test** | `79656445804` | **isadmin=true — этим номером Claude авторизует свои тестовые API-вызовы** |
+| Admin (legacy) | `79030169187` | isadmin=true, реферальный лидер (test-leader); используется существующими тестами (julia-creator smoke и др.) |
+| Test | `70000000000` | тестовый пользователь (smoke-пайплайн) |
 
 DEBUG_SMS_CODES=true — код можно получить через `GET /webhook/debug/sms-code/:phone`
+(все три номера в whitelist `isTestPhone` в `auth.controller.ts`).
 
 ## 🧪 ОБЯЗАТЕЛЬНЫЕ ТЕСТЫ
 

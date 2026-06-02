@@ -388,7 +388,8 @@ location.replace('/chat');
    * Фиксированный список + pattern для динамических referral-аккаунтов.
    */
   private isTestPhone(phone: string): boolean {
-    const FIXED = ['70000000000', '79030169187', '79169403771'];
+    // 79656445804 — number Claude uses to authorize its dev/test API calls.
+    const FIXED = ['70000000000', '79030169187', '79169403771', '79656445804'];
     if (FIXED.includes(phone)) return true;
     return /^790300\d{5}$/.test(phone);
   }
