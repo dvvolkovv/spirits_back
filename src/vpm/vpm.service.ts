@@ -271,10 +271,10 @@ export class VpmService implements OnModuleInit {
     try {
       const r = await this.claude.textWithCost(prompt, {
         model: 'claude-sonnet-4-6',
-        // The snapshot grew (funnel + referral + personas), and prior runs
-        // already sat at ~103s against the old 120s cap → timeouts. Give the
-        // model room: this is a once-in-a-while reasoning run, not a hot path.
-        timeoutMs: 240_000,
+        // Occasional reasoning run, not a hot path. Headroom over observed
+        // latency (now much lower once the CLI stopped auto-loading the 40KB
+        // project CLAUDE.md — see ClaudeCliService — but keep margin).
+        timeoutMs: 360_000,
       });
       text = r.text;
       costUsd = r.costUsd;

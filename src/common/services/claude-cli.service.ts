@@ -1,6 +1,7 @@
 // src/common/services/claude-cli.service.ts
 import { Injectable, Logger } from '@nestjs/common';
 import { spawn } from 'child_process';
+import * as os from 'os';
 import { PgService } from './pg.service';
 
 export interface ClaudeCliOptions {
@@ -70,10 +71,18 @@ export class ClaudeCliService {
       '--output-format', 'json',
       '--allowedTools', '',          // disable all built-in tools
       '--disallowedTools', 'all',
+      '--strict-mcp-config',         // load NO MCP servers (none passed) — these
+                                     // one-shot calls use no tools; skipping MCP
+                                     // startup avoids stalls in the pm2 env.
     ];
 
+    // Spawn from a neutral cwd: the backend runs in /home/dvolkov/spirits_back,
+    // whose ~40KB CLAUDE.md the CLI would auto-discover and prepend to EVERY
+    // one-shot prompt — irrelevant context that inflated input and tripled
+    // VPM-generation latency (82s standalone vs ~226s from the service). These
+    // calls always carry their own full prompt, so no project context is needed.
     return new Promise<{ text: string; costUsd: number }>((resolve, reject) => {
-      const proc = spawn(this.claudeBin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      const proc = spawn(this.claudeBin, args, { stdio: ['ignore', 'pipe', 'pipe'], cwd: os.tmpdir() });
       let stdout = '';
       let stderr = '';
       const timer = setTimeout(() => {
