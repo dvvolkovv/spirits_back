@@ -30,8 +30,9 @@ interface BalanceSnapshot {
 
 const ALERT_THRESHOLD_CHARS = Number(process.env.ELEVENLABS_BALANCE_ALERT_THRESHOLD || 50_000);
 const ALERT_COOLDOWN_HOURS = Number(process.env.ELEVENLABS_BALANCE_ALERT_COOLDOWN_H || 12);
-const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const TG_CHAT  = process.env.TELEGRAM_CHAT_ID  || '';
+// NOTE: Telegram creds are read at call time inside maybeAlert(), not here —
+// module-level process.env reads run before ConfigModule loads .env, so a
+// const here would always be '' and silently disable alerts.
 
 export interface ElevenLabsHealthOverview {
   generatedAt: string;
@@ -120,6 +121,8 @@ export class ElevenLabsHealthService implements OnModuleInit {
   private async maybeAlert(): Promise<void> {
     const left = this.balanceCache.charactersLeft;
     if (left === null || left > ALERT_THRESHOLD_CHARS) return;
+    const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+    const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '';
     if (!TG_TOKEN || !TG_CHAT) return;
     const now = new Date();
     if (this.lastAlertAt && (now.getTime() - this.lastAlertAt.getTime()) < ALERT_COOLDOWN_HOURS * 3600_000) {

@@ -44,8 +44,9 @@ interface UsageSnapshot {
 
 const ALERT_THRESHOLD_30D_USD = Number(process.env.CLAUDE_SPEND_ALERT_THRESHOLD_30D_USD || 100);
 const ALERT_COOLDOWN_HOURS = Number(process.env.CLAUDE_SPEND_ALERT_COOLDOWN_H || 24);
-const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const TG_CHAT  = process.env.TELEGRAM_CHAT_ID  || '';
+// NOTE: Telegram creds are read at call time inside maybeAlert(), not here —
+// module-level process.env reads run before ConfigModule loads .env, so a
+// const here would always be '' and silently disable alerts.
 
 export interface ClaudeHealthOverview {
   generatedAt: string;
@@ -194,6 +195,8 @@ export class ClaudeHealthService implements OnModuleInit {
   private async maybeAlert(): Promise<void> {
     const c30 = this.cache.cost30dUsd;
     if (c30 === null || c30 < ALERT_THRESHOLD_30D_USD) return;
+    const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+    const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '';
     if (!TG_TOKEN || !TG_CHAT) return;
     const now = new Date();
     if (this.lastAlertAt && (now.getTime() - this.lastAlertAt.getTime()) < ALERT_COOLDOWN_HOURS * 3600_000) {

@@ -53,8 +53,9 @@ interface SnapshotInfo {
 const BACKUP_ROOT = process.env.BACKUP_DIR || '/home/dvolkov/backups/linkeon';
 const FRESH_HOURS = Number(process.env.BACKUP_FRESH_HOURS || 36);
 const ALERT_COOLDOWN_HOURS = Number(process.env.BACKUP_ALERT_COOLDOWN_H || 12);
-const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const TG_CHAT  = process.env.TELEGRAM_CHAT_ID  || '';
+// NOTE: Telegram creds are read at call time inside maybeAlert(), not here —
+// module-level process.env reads run before ConfigModule loads .env, so a
+// const here would always be '' and silently disable alerts.
 
 // What backup.sh writes. neo4j.schema.txt was added 2026-06-01 — the
 // service treats it as "expected if recent enough" so old snapshots
@@ -267,6 +268,8 @@ export class BackupHealthService implements OnModuleInit {
       }
     }
     if (problems.length === 0) return;
+    const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+    const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '';
     if (!TG_TOKEN || !TG_CHAT) return;
     const now = new Date();
     if (this.lastAlertAt && (now.getTime() - this.lastAlertAt.getTime()) < ALERT_COOLDOWN_HOURS * 3600_000) {

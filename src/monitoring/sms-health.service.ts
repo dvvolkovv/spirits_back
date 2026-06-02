@@ -26,8 +26,9 @@ interface BalanceSnapshot {
 
 const ALERT_THRESHOLD_RUB = Number(process.env.SMS_BALANCE_ALERT_THRESHOLD || 500);
 const ALERT_COOLDOWN_HOURS = Number(process.env.SMS_BALANCE_ALERT_COOLDOWN_H || 12);
-const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const TG_CHAT  = process.env.TELEGRAM_CHAT_ID  || '';
+// NOTE: Telegram creds are read at call time inside maybeAlert(), not here —
+// module-level process.env reads run before ConfigModule loads .env, so a
+// const here would always be '' and silently disable alerts.
 
 export interface SmsHealthOverview {
   generatedAt: string;
@@ -98,6 +99,8 @@ export class SmsHealthService implements OnModuleInit {
   private async maybeAlert(): Promise<void> {
     const rub = this.balanceCache.rub;
     if (rub === null || rub > ALERT_THRESHOLD_RUB) return;
+    const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+    const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '';
     if (!TG_TOKEN || !TG_CHAT) return;
     const now = new Date();
     if (this.lastAlertAt && (now.getTime() - this.lastAlertAt.getTime()) < ALERT_COOLDOWN_HOURS * 3600_000) {

@@ -31,8 +31,9 @@ interface BalanceSnapshot {
 // "a day of moderate traffic" for our chat usage.
 const ALERT_THRESHOLD_USD = Number(process.env.OPENROUTER_BALANCE_ALERT_THRESHOLD_USD || 5);
 const ALERT_COOLDOWN_HOURS = Number(process.env.OPENROUTER_BALANCE_ALERT_COOLDOWN_H || 12);
-const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const TG_CHAT  = process.env.TELEGRAM_CHAT_ID  || '';
+// NOTE: Telegram creds are read at call time inside maybeAlert(), not here —
+// module-level process.env reads run before ConfigModule loads .env, so a
+// const here would always be '' and silently disable alerts.
 
 export interface OpenRouterHealthOverview {
   generatedAt: string;
@@ -108,6 +109,8 @@ export class OpenRouterHealthService implements OnModuleInit {
   private async maybeAlert(): Promise<void> {
     const usd = this.balanceCache.usd;
     if (usd === null || usd > ALERT_THRESHOLD_USD) return;
+    const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+    const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '';
     if (!TG_TOKEN || !TG_CHAT) return;
     const now = new Date();
     if (this.lastAlertAt && (now.getTime() - this.lastAlertAt.getTime()) < ALERT_COOLDOWN_HOURS * 3600_000) {

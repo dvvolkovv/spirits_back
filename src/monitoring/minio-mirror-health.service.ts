@@ -1,4 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
+import axios from 'axios';
 import * as fs from 'fs';
 
 /**
@@ -58,12 +60,62 @@ export class MinioMirrorHealthService {
 
   private readonly statusPath: string;
   private readonly freshMin: number;
+  private readonly alertCooldownH: number;
+  private lastAlertAt: Date | null = null;
 
   constructor() {
     this.statusPath = process.env.MINIO_MIRROR_STATUS
       || '/home/dvolkov/backups/linkeon/minio-mirror-status.json';
     // Cron is hourly; allow a couple of missed runs before flagging stale.
     this.freshMin = Number(process.env.MINIO_MIRROR_FRESH_MIN || 180);
+    this.alertCooldownH = Number(process.env.MINIO_MIRROR_ALERT_COOLDOWN_H || 6);
+  }
+
+  // DR Sprint 4: hourly alert pass — Telegram heads-up if the mirror goes
+  // stale, a bucket stops being covered, or mc logged errors.
+  @Cron(CronExpression.EVERY_HOUR)
+  async hourly() {
+    try {
+      const ov = await this.getOverview();
+      await this.maybeAlert(ov);
+    } catch (e: any) {
+      this.log.warn(`minio mirror hourly alert pass failed: ${e.message}`);
+    }
+  }
+
+  private async maybeAlert(ov: MinioMirrorOverview): Promise<void> {
+    if (!ov.configured) return; // not running here (e.g. test) — nothing to alert on
+    const problems: string[] = [];
+    if (!ov.statusPresent || ov.error) {
+      problems.push(`статус зеркала недоступен: ${ov.error || 'нет файла'}`);
+    } else {
+      if (ov.ageMin != null && ov.ageMin > ov.freshMin) {
+        problems.push(`последний sync ${(ov.ageMin / 60).toFixed(1)}ч назад (порог ${(ov.freshMin / 60).toFixed(0)}ч)`);
+      }
+      const behind = ov.buckets.filter((b) => !b.inSync).map((b) => `${b.bucket} (${b.dstObjects}/${b.srcObjects})`);
+      if (behind.length) problems.push(`бакеты отстают: ${behind.join(', ')}`);
+      if (ov.errors.length) problems.push(`ошибки mc (${ov.errors.length}): ${ov.errors.slice(0, 3).join('; ').slice(0, 200)}`);
+    }
+
+    if (problems.length === 0) return;
+    const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+    const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '';
+    if (!TG_TOKEN || !TG_CHAT) return;
+    const now = new Date();
+    if (this.lastAlertAt && (now.getTime() - this.lastAlertAt.getTime()) < this.alertCooldownH * 3600_000) return;
+    try {
+      await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+        chat_id: TG_CHAT,
+        parse_mode: 'HTML',
+        text: `<b>⚠️ MinIO DR-зеркало (node-3): проблемы</b>\n` +
+          problems.map((p) => `• ${p}`).join('\n') +
+          `\n\nДеталь: <code>/admin/monitoring/tech/minio-dr</code>`,
+      }, { timeout: 8000 });
+      this.lastAlertAt = now;
+      this.log.warn(`MinIO DR alert sent: ${problems.join(' | ')}`);
+    } catch (e: any) {
+      this.log.error(`Telegram alert failed: ${e?.message || 'unknown'}`);
+    }
   }
 
   private empty(configured: boolean, error: string | null = null): MinioMirrorOverview {

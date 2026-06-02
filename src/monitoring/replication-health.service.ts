@@ -1,4 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
+import axios from 'axios';
 import { Pool } from 'pg';
 import { PgService } from '../common/services/pg.service';
 
@@ -102,14 +104,73 @@ const LAG_THRESHOLD_SEC = Number(process.env.REPLICATION_LAG_THRESHOLD_SEC || 60
 const APPLY_BACKLOG_THRESHOLD_BYTES = Number(
   process.env.REPLICATION_APPLY_BACKLOG_THRESHOLD_BYTES || 16 * 1024 * 1024,
 );
+const ALERT_COOLDOWN_HOURS = Number(process.env.REPLICATION_ALERT_COOLDOWN_H || 6);
 
 @Injectable()
 export class ReplicationHealthService implements OnModuleDestroy {
   private readonly log = new Logger(ReplicationHealthService.name);
   private standbyPool: Pool | null = null;
   private standbyPoolBroken = false;
+  private lastAlertAt: Date | null = null;
 
   constructor(private readonly pg: PgService) {}
+
+  // DR Sprint 4: hourly alert pass. The widget is pull-only (admin opens Инфра);
+  // this pushes a Telegram heads-up when the publisher↔standby link degrades so
+  // a stalled replica doesn't sit unnoticed until someone looks.
+  @Cron(CronExpression.EVERY_HOUR)
+  async hourly() {
+    try {
+      const ov = await this.getOverview();
+      await this.maybeAlert(ov);
+    } catch (e: any) {
+      this.log.warn(`replication hourly alert pass failed: ${e.message}`);
+    }
+  }
+
+  private async maybeAlert(ov: ReplicationOverview): Promise<void> {
+    const problems: string[] = [];
+    if (ov.error) {
+      problems.push(`не удалось опросить publisher: ${ov.error}`);
+    } else {
+      if (ov.standbys.length === 0) problems.push('нет подключённых standby (репликация не идёт)');
+      const notStreaming = ov.standbys.filter((s) => s.state !== 'streaming').map((s) => `${s.client_addr}:${s.state}`);
+      if (notStreaming.length) problems.push(`standby не в streaming: ${notStreaming.join(', ')}`);
+      if (ov.maxReplayLagSec != null && ov.maxReplayLagSec > ov.thresholdSec) {
+        problems.push(`replay lag ${ov.maxReplayLagSec.toFixed(1)}с > порога ${ov.thresholdSec}с`);
+      }
+      const lostSlots = ov.slots.filter((s) => s.wal_status === 'lost').map((s) => s.slot_name);
+      if (lostSlots.length) problems.push(`WAL-слоты потеряны: ${lostSlots.join(', ')}`);
+    }
+    // Standby self-view, only when configured.
+    if (ov.standby.configured) {
+      if (!ov.standby.reachable) problems.push(`standby (node-3) недоступен: ${ov.standby.error || 'unknown'}`);
+      else if (!ov.standby.healthy) {
+        if (ov.standby.replayPaused) problems.push('replay на standby приостановлен');
+        if (ov.standby.receiver?.status !== 'streaming') problems.push(`wal receiver на standby: ${ov.standby.receiver?.status ?? 'нет'}`);
+      }
+    }
+
+    if (problems.length === 0) return;
+    const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+    const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '';
+    if (!TG_TOKEN || !TG_CHAT) return;
+    const now = new Date();
+    if (this.lastAlertAt && (now.getTime() - this.lastAlertAt.getTime()) < ALERT_COOLDOWN_HOURS * 3600_000) return;
+    try {
+      await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+        chat_id: TG_CHAT,
+        parse_mode: 'HTML',
+        text: `<b>⚠️ Репликация PostgreSQL: проблемы</b>\n` +
+          problems.map((p) => `• ${p}`).join('\n') +
+          `\n\nДеталь: <code>/admin/monitoring/tech/replication</code>`,
+      }, { timeout: 8000 });
+      this.lastAlertAt = now;
+      this.log.warn(`Replication alert sent: ${problems.join(' | ')}`);
+    } catch (e: any) {
+      this.log.error(`Telegram alert failed: ${e?.message || 'unknown'}`);
+    }
+  }
 
   async onModuleDestroy() {
     if (this.standbyPool) {
