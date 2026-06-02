@@ -1,22 +1,38 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Pool } from 'pg';
 import { PgService } from '../common/services/pg.service';
 
 /**
- * Replication health — surfaces PostgreSQL streaming replication state on
- * prod (the publisher side; the standby on node-3 is a passive consumer).
+ * Replication health — surfaces PostgreSQL streaming replication state for the
+ * DR setup: prod (212.113.106.202) is the publisher, node-3 (10.10.0.3 over
+ * WireGuard) is a hot standby consuming WAL through slot `node3_dr`.
  *
- * Three signals:
- *  - Connected standbys with state + per-client lag (write/flush/replay)
- *  - Replication slots — restart_lsn, wal_status, retention (or lack of)
- *  - Health summary: at least one streaming standby with replay lag below
- *    threshold? Anything stale?
+ * Two vantage points:
  *
- * Read from prod's local Postgres via PgService (the api server's PG conn
- * already points at prod). No standby-side metrics yet — those would
- * require either an SSH probe or a Prometheus pg_exporter on node-3.
+ *  1. Publisher side (prod's local Postgres, via PgService — the api conn
+ *     already points there):
+ *       - Connected standbys with state + per-client lag (write/flush/replay)
+ *       - Replication slots — restart_lsn, wal_status, retention
+ *
+ *  2. Standby side (node-3, via a separate lazily-opened pool over WG):
+ *       - pg_is_in_recovery — is it actually a standby?
+ *       - wal receiver status, sender, slot
+ *       - receive vs replay LSN → apply backlog (bytes of received-but-not-yet-
+ *         applied WAL — meaningful regardless of write traffic)
+ *       - last-xact replay age (reported but NOT used for health: on a
+ *         low-write standby it grows during idle even though replication is
+ *         perfectly healthy — the authoritative lag is the publisher-side
+ *         replay_lag and the apply-backlog byte count)
+ *
+ * Standby probe is gated: it runs only when STANDBY_DATABASE_URL is set, or
+ * REPLICATION_STANDBY_HOST is set (then the conn string is derived from
+ * DATABASE_URL by swapping the host — same role/password, it's a physical
+ * replica). Where neither is configured (e.g. the test server, which has no
+ * standby) the standby block reports `configured: false` and does not drag
+ * down overall health.
  *
  * Standby setup (Sprint 1 done 2026-06-01):
- *  - Standby Docker container `postgres-standby` on node-3 (10.10.0.3)
+ *  - Standby Docker container `postgres-standby` on node-3, 10.10.0.3:5433
  *  - Slot name `node3_dr`, role `replicator`
  *  - WG tunnel 10.10.0.1 ↔ 10.10.0.3 as transport
  */
@@ -45,25 +61,213 @@ interface SlotRow {
   safe_wal_size_bytes: number | null;
 }
 
+// The standby's own view of itself (queried directly on node-3).
+export interface StandbyView {
+  configured: boolean;       // is a standby endpoint configured at all?
+  reachable: boolean;        // did the probe connect + query OK?
+  inRecovery: boolean | null;
+  replayPaused: boolean | null;
+  receiveLsn: string | null;
+  replayLsn: string | null;
+  applyBacklogBytes: number | null;   // received - replayed; 0 == fully applied
+  lastXactReplayAgeSec: number | null; // idle-sensitive — informational only
+  receiver: {
+    status: string | null;            // streaming / stopping / ...
+    senderHost: string | null;
+    senderPort: number | null;
+    slotName: string | null;
+    writtenLsn: string | null;
+    flushedLsn: string | null;
+    latestEndLsn: string | null;
+    lastMsgReceiptTime: string | null;
+    sinceLastMsgSec: number | null;
+  } | null;
+  healthy: boolean;          // in_recovery + receiver streaming + backlog ok + not paused
+  error: string | null;
+}
+
 export interface ReplicationOverview {
   generatedAt: string;
   standbys: StandbyRow[];
   slots: SlotRow[];
-  healthy: boolean;         // at least one streaming standby + max replay_lag below threshold
+  standby: StandbyView;     // node-3's self-reported state
+  healthy: boolean;         // publisher healthy AND (standby unconfigured OR standby healthy)
   maxReplayLagSec: number | null;
   thresholdSec: number;
   error: string | null;
 }
 
 const LAG_THRESHOLD_SEC = Number(process.env.REPLICATION_LAG_THRESHOLD_SEC || 60);
+// One 16MB WAL segment of received-but-unapplied WAL is the default "behind" alarm.
+const APPLY_BACKLOG_THRESHOLD_BYTES = Number(
+  process.env.REPLICATION_APPLY_BACKLOG_THRESHOLD_BYTES || 16 * 1024 * 1024,
+);
 
 @Injectable()
-export class ReplicationHealthService {
+export class ReplicationHealthService implements OnModuleDestroy {
   private readonly log = new Logger(ReplicationHealthService.name);
+  private standbyPool: Pool | null = null;
+  private standbyPoolBroken = false;
 
   constructor(private readonly pg: PgService) {}
 
+  async onModuleDestroy() {
+    if (this.standbyPool) {
+      try { await this.standbyPool.end(); } catch { /* ignore */ }
+      this.standbyPool = null;
+    }
+  }
+
+  // Resolve the standby connection string, or null if standby probing is off.
+  private standbyConnString(): string | null {
+    const explicit = process.env.STANDBY_DATABASE_URL;
+    if (explicit) return explicit;
+    const host = process.env.REPLICATION_STANDBY_HOST;
+    if (!host) return null;
+    const base = process.env.DATABASE_URL;
+    if (!base) return null;
+    try {
+      // Physical replica → same role/password/db as prod. Swap only the host
+      // (and optionally the port) so the secret lives in one place.
+      const url = new URL(base);
+      url.hostname = host;
+      const port = process.env.REPLICATION_STANDBY_PORT;
+      if (port) url.port = port;
+      return url.toString();
+    } catch (e: any) {
+      this.log.warn(`cannot derive standby conn string: ${e.message}`);
+      return null;
+    }
+  }
+
+  private getStandbyPool(): Pool | null {
+    if (this.standbyPoolBroken) return null;
+    if (this.standbyPool) return this.standbyPool;
+    const conn = this.standbyConnString();
+    if (!conn) return null;
+    try {
+      this.standbyPool = new Pool({
+        connectionString: conn,
+        max: 2,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 4000,
+        // A standby probe must never hang the monitoring endpoint.
+        statement_timeout: 4000,
+        query_timeout: 4000,
+        application_name: 'linkeon-replication-monitor',
+      });
+      this.standbyPool.on('error', (err) => {
+        this.log.warn(`standby pool error: ${err.message}`);
+      });
+      return this.standbyPool;
+    } catch (e: any) {
+      this.log.warn(`cannot create standby pool: ${e.message}`);
+      this.standbyPoolBroken = true;
+      return null;
+    }
+  }
+
+  private async getStandbyView(): Promise<StandbyView> {
+    const empty: StandbyView = {
+      configured: false,
+      reachable: false,
+      inRecovery: null,
+      replayPaused: null,
+      receiveLsn: null,
+      replayLsn: null,
+      applyBacklogBytes: null,
+      lastXactReplayAgeSec: null,
+      receiver: null,
+      healthy: false,
+      error: null,
+    };
+
+    const pool = this.getStandbyPool();
+    if (!pool) return empty; // probing disabled → configured:false, not counted against health
+
+    try {
+      const [rec, wr] = await Promise.all([
+        pool.query(
+          `SELECT pg_is_in_recovery()                               AS in_recovery,
+                  pg_is_wal_replay_paused()                         AS replay_paused,
+                  pg_last_wal_receive_lsn()::text                   AS receive_lsn,
+                  pg_last_wal_replay_lsn()::text                    AS replay_lsn,
+                  pg_wal_lsn_diff(pg_last_wal_receive_lsn(),
+                                  pg_last_wal_replay_lsn())::float8  AS apply_backlog_bytes,
+                  EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))::float8
+                                                                    AS last_xact_replay_age_sec`,
+        ),
+        pool.query(
+          `SELECT status, sender_host, sender_port, slot_name,
+                  written_lsn::text    AS written_lsn,
+                  flushed_lsn::text    AS flushed_lsn,
+                  latest_end_lsn::text AS latest_end_lsn,
+                  last_msg_receipt_time,
+                  EXTRACT(EPOCH FROM (now() - last_msg_receipt_time))::float8 AS since_last_msg_sec
+             FROM pg_stat_wal_receiver`,
+        ),
+      ]);
+
+      const r = rec.rows[0] || {};
+      const w = wr.rows[0];
+      const inRecovery = r.in_recovery === true || r.in_recovery === 't';
+      const applyBacklogBytes = r.apply_backlog_bytes != null ? Number(r.apply_backlog_bytes) : null;
+      const replayPaused = r.replay_paused === true || r.replay_paused === 't';
+
+      const receiver = w
+        ? {
+            status: w.status ?? null,
+            senderHost: w.sender_host ?? null,
+            senderPort: w.sender_port != null ? Number(w.sender_port) : null,
+            slotName: w.slot_name ?? null,
+            writtenLsn: w.written_lsn ?? null,
+            flushedLsn: w.flushed_lsn ?? null,
+            latestEndLsn: w.latest_end_lsn ?? null,
+            lastMsgReceiptTime: w.last_msg_receipt_time
+              ? new Date(w.last_msg_receipt_time).toISOString()
+              : null,
+            sinceLastMsgSec: w.since_last_msg_sec != null ? Number(w.since_last_msg_sec) : null,
+          }
+        : null;
+
+      // Healthy = it really is a standby, the receiver is streaming, replay
+      // isn't paused, and it has applied (nearly) all the WAL it received.
+      // Note: we deliberately do NOT use lastXactReplayAgeSec here — see the
+      // class doc; it grows in idle and would false-alarm.
+      const healthy =
+        inRecovery &&
+        receiver?.status === 'streaming' &&
+        !replayPaused &&
+        (applyBacklogBytes == null || applyBacklogBytes <= APPLY_BACKLOG_THRESHOLD_BYTES);
+
+      return {
+        configured: true,
+        reachable: true,
+        inRecovery,
+        replayPaused,
+        receiveLsn: r.receive_lsn ?? null,
+        replayLsn: r.replay_lsn ?? null,
+        applyBacklogBytes,
+        lastXactReplayAgeSec: r.last_xact_replay_age_sec != null ? Number(r.last_xact_replay_age_sec) : null,
+        receiver,
+        healthy,
+        error: null,
+      };
+    } catch (e: any) {
+      this.log.warn(`standby probe failed: ${e.message}`);
+      return { ...empty, configured: true, reachable: false, error: e?.message || 'standby probe failed' };
+    }
+  }
+
   async getOverview(): Promise<ReplicationOverview> {
+    let publisherError: string | null = null;
+    let standbys: StandbyRow[] = [];
+    let slots: SlotRow[] = [];
+
+    // Publisher side and standby side are independent — probe them together so
+    // a slow standby connect doesn't serialize behind the prod queries.
+    const standbyViewP = this.getStandbyView();
+
     try {
       const [sb, sl] = await Promise.all([
         this.pg.query(
@@ -86,7 +290,7 @@ export class ReplicationHealthService {
              FROM pg_replication_slots`,
         ),
       ]);
-      const standbys: StandbyRow[] = sb.rows.map((r: any) => ({
+      standbys = sb.rows.map((r: any) => ({
         pid: Number(r.pid),
         client_addr: r.client_addr,
         application_name: r.application_name,
@@ -99,7 +303,7 @@ export class ReplicationHealthService {
         replay_lsn: r.replay_lsn,
         reply_time: r.reply_time ? new Date(r.reply_time).toISOString() : null,
       }));
-      const slots: SlotRow[] = sl.rows.map((r: any) => ({
+      slots = sl.rows.map((r: any) => ({
         slot_name: r.slot_name,
         slot_type: r.slot_type,
         active: !!r.active,
@@ -108,33 +312,35 @@ export class ReplicationHealthService {
         restart_lsn: r.restart_lsn,
         safe_wal_size_bytes: r.safe_wal_size_bytes != null ? Number(r.safe_wal_size_bytes) : null,
       }));
-      const maxReplayLagSec = standbys.length === 0
-        ? null
-        : Math.max(...standbys.map((s) => s.replay_lag_sec ?? 0));
-      const healthy = standbys.length > 0
-        && standbys.every((s) => s.state === 'streaming')
-        && (maxReplayLagSec == null || maxReplayLagSec <= LAG_THRESHOLD_SEC)
-        && slots.every((s) => s.wal_status !== 'lost');
-      return {
-        generatedAt: new Date().toISOString(),
-        standbys,
-        slots,
-        healthy,
-        maxReplayLagSec,
-        thresholdSec: LAG_THRESHOLD_SEC,
-        error: null,
-      };
     } catch (e: any) {
-      this.log.warn(`replication overview failed: ${e.message}`);
-      return {
-        generatedAt: new Date().toISOString(),
-        standbys: [],
-        slots: [],
-        healthy: false,
-        maxReplayLagSec: null,
-        thresholdSec: LAG_THRESHOLD_SEC,
-        error: e?.message || 'query failed',
-      };
+      this.log.warn(`replication overview (publisher) failed: ${e.message}`);
+      publisherError = e?.message || 'query failed';
     }
+
+    const standby = await standbyViewP;
+
+    const maxReplayLagSec = standbys.length === 0
+      ? null
+      : Math.max(...standbys.map((s) => s.replay_lag_sec ?? 0));
+
+    const publisherHealthy = !publisherError
+      && standbys.length > 0
+      && standbys.every((s) => s.state === 'streaming')
+      && (maxReplayLagSec == null || maxReplayLagSec <= LAG_THRESHOLD_SEC)
+      && slots.every((s) => s.wal_status !== 'lost');
+
+    // The standby only counts against health when it's actually configured.
+    const standbyOk = !standby.configured || standby.healthy;
+
+    return {
+      generatedAt: new Date().toISOString(),
+      standbys,
+      slots,
+      standby,
+      healthy: publisherHealthy && standbyOk,
+      maxReplayLagSec,
+      thresholdSec: LAG_THRESHOLD_SEC,
+      error: publisherError,
+    };
   }
 }
