@@ -55,6 +55,18 @@ export class VeoService {
     return { 'x-goog-api-key': this.apiKey, 'Content-Type': 'application/json' };
   }
 
+  // Map upstream errors to a job error_message. A 429/quota is an operational
+  // ceiling (Veo daily RPD on the key), not a user error — surface it plainly
+  // so the assistant/UI can say "try later" instead of a raw billing message.
+  private describeError(e: any, label: 'generate' | 'extend'): string {
+    const status = e.response?.status;
+    const raw = e.response?.data?.error?.message || e.message || 'unknown error';
+    if (status === 429 || /RESOURCE_EXHAUSTED|exceeded your current quota/i.test(raw)) {
+      return 'Veo: достигнут дневной лимит генераций видео — попробуйте позже (или администратору: повысить квоту Veo для ключа).';
+    }
+    return `Veo ${label} failed: ${raw}`;
+  }
+
   private trackCall(method: string, tier: VeoTier, ok: boolean, latencyMs: number, errorShort?: string, op?: string) {
     if (!this.pg) return;
     this.pg.query(
@@ -104,9 +116,9 @@ export class VeoService {
       this.trackCall('generate', opts.tier, true, Date.now() - t0, undefined, name);
       return name;
     } catch (e: any) {
-      const msg = e.response?.data?.error?.message || e.message;
+      const msg = this.describeError(e, 'generate');
       this.trackCall('generate', opts.tier, false, Date.now() - t0, msg);
-      throw new Error(`Veo generate failed: ${msg}`);
+      throw new Error(msg);
     }
   }
 
@@ -131,9 +143,9 @@ export class VeoService {
       this.trackCall('extend', opts.tier, true, Date.now() - t0, undefined, name);
       return name;
     } catch (e: any) {
-      const msg = e.response?.data?.error?.message || e.message;
+      const msg = this.describeError(e, 'extend');
       this.trackCall('extend', opts.tier, false, Date.now() - t0, msg);
-      throw new Error(`Veo extend failed: ${msg}`);
+      throw new Error(msg);
     }
   }
 
