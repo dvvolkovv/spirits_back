@@ -201,6 +201,40 @@ export class VpmService implements OnModuleInit {
       snapshot.referral = ref.rows[0];
     } catch { /* silent */ }
 
+    // 6b. Registration channel attribution (backlog e6dd4d6f). The source is
+    // captured on the ANONYMOUS landing event (no user_id yet), so we link it
+    // to the registrant via session_id. Populates going forward as users land
+    // with the source-tracking client; historical regs show "unknown".
+    try {
+      const bySource = await this.pg.query(
+        `WITH regs AS (
+           SELECT user_id FROM ai_profiles_consolidated
+            WHERE created_at > now()-interval '30 days'
+              AND user_id <> ALL($1) AND user_id !~ $2
+         ),
+         sess AS (
+           SELECT DISTINCT e.session_id, e.user_id
+             FROM events e JOIN regs r ON r.user_id = e.user_id
+            WHERE e.session_id IS NOT NULL
+         ),
+         src AS (
+           SELECT DISTINCT ON (e.session_id) e.session_id, e.source
+             FROM events e
+            WHERE e.source IS NOT NULL AND e.source <> ''
+            ORDER BY e.session_id, e.ts ASC
+         )
+         SELECT COALESCE(src.source,'unknown') AS source, count(DISTINCT regs.user_id)::int AS registrations_30d
+           FROM regs
+           LEFT JOIN sess ON sess.user_id = regs.user_id
+           LEFT JOIN src  ON src.session_id = sess.session_id
+          GROUP BY 1 ORDER BY 2 DESC`,
+        [TEST_USERS, TEST_PATTERN],
+      );
+      snapshot.registrations_by_source_30d = Object.fromEntries(
+        bySource.rows.map((r: any) => [r.source, r.registrations_30d]),
+      );
+    } catch { /* silent */ }
+
     // 7. User personas (rule-based segments — who actually uses the product).
     // Compact view so the prompt stays small; full detail is in the admin UI.
     try {
