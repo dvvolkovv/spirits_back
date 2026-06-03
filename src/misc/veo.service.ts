@@ -120,7 +120,7 @@ export class VeoService {
         `${API_BASE}/models/${MODEL_ID[opts.tier]}:predictLongRunning`,
         {
           instances: [{ prompt: opts.prompt, video: { uri: opts.videoUri } }],
-          parameters: { resolution: '720p', numberOfVideos: 1 },
+          parameters: { resolution: '720p' },
         },
         { headers: this.headers(), timeout: 30_000 },
       );
