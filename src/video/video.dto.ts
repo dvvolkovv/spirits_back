@@ -2,15 +2,25 @@
 import { IsString, IsOptional, IsNumber, IsIn, IsObject, Min, Max } from 'class-validator';
 
 export type VideoMode = 'text2video' | 'image2video' | 'extend' | 'lipsync';
-export type VideoModel = 'kling-v1-6' | 'kling-v2-master';
+export type VideoModel = 'kling-v1-6' | 'kling-v2-master' | 'veo-3.1-fast' | 'veo-3.1';
 export type VideoQuality = 'std' | 'pro';
+
+// Veo 3.1 (Google) — long-form talking-head with native audio + portrait
+// consistency, via the Gemini Developer API. backlog a0132032.
+export const VEO_MODELS: VideoModel[] = ['veo-3.1-fast', 'veo-3.1'];
+export function isVeoModel(model: string): boolean {
+  return (VEO_MODELS as string[]).includes(model);
+}
+export function veoTier(model: VideoModel): 'fast' | 'standard' {
+  return model === 'veo-3.1' ? 'standard' : 'fast';
+}
 export type VideoStatus = 'pending' | 'processing' | 'ready' | 'failed';
 
 export class CreateVideoJobDto {
   @IsIn(['text2video', 'image2video', 'extend', 'lipsync'])
   mode!: VideoMode;
 
-  @IsOptional() @IsIn(['kling-v1-6', 'kling-v2-master'])
+  @IsOptional() @IsIn(['kling-v1-6', 'kling-v2-master', 'veo-3.1-fast', 'veo-3.1'])
   model?: VideoModel;
 
   @IsOptional() @IsIn(['std', 'pro'])
@@ -56,6 +66,10 @@ export interface ComposedPlan {
   segments_done: number;
   segment_kling_video_ids: string[];
   segment_video_urls: string[];
+  // --- Veo provider (native extend chain — one continuous video, no concat) ---
+  provider?: 'kling' | 'veo';
+  veo_tier?: 'fast' | 'standard';
+  veo_last_uri?: string | null;   // download uri of the latest (cumulative) clip
   // Retry counter for the segment currently in flight. Reset to 0 every
   // time a segment finishes successfully; bumped when we re-submit after
   // a transient Kling error (e.g. "Internal error"). Capped server-side.
@@ -152,5 +166,33 @@ export function computeComposedQuote(
     baseCost,
     extendUnitCost: extendUnit,
     totalCost: baseCost + extendCount * extendUnit,
+  };
+}
+
+// Veo 3.1 quote: base 8s + N×7s native extends, output trimmed to target.
+// PROVISIONAL token pricing (Sprint 2 finalizes user pricing with the owner) —
+// derived from cost: Fast $0.15/s, Standard $0.40/s, ~base 8s + 7s/extend, with
+// the per-24s targets from the backlog analysis (~300-450k tokens Fast).
+const VEO_BASE_SEC = 8;
+const VEO_EXTEND_SEC = 7;
+const VEO_PRICING: Record<'fast' | 'standard', { base: number; extendUnit: number }> = {
+  fast:     { base: 120_000, extendUnit: 105_000 },
+  standard: { base: 320_000, extendUnit: 280_000 },
+};
+export interface VeoQuote {
+  tier: 'fast' | 'standard';
+  segments: number;        // 1 base + N extends
+  rawDurationSec: number;  // generated seconds before trim
+  totalCost: number;       // tokens
+}
+export function computeVeoQuote(model: VideoModel, targetDurationSec: number): VeoQuote {
+  const tier = veoTier(model);
+  const p = VEO_PRICING[tier];
+  const extendCount = Math.ceil(Math.max(0, targetDurationSec - VEO_BASE_SEC) / VEO_EXTEND_SEC);
+  return {
+    tier,
+    segments: 1 + extendCount,
+    rawDurationSec: VEO_BASE_SEC + extendCount * VEO_EXTEND_SEC,
+    totalCost: p.base + extendCount * p.extendUnit,
   };
 }

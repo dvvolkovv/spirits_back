@@ -7,9 +7,11 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import { KlingService } from '../misc/kling.service';
 import { MiscService } from '../misc/misc.service';
+import { VeoService } from '../misc/veo.service';
 import {
   CreateVideoJobDto, VideoJobRow, ComposedPlan, computeTokenCost, computeComposedQuote,
   VideoMode, VideoModel, VideoQuality,
+  isVeoModel, veoTier, computeVeoQuote,
 } from './video.dto';
 import { S3Client, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
@@ -55,12 +57,20 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     private readonly pg: PgService,
     private readonly kling: KlingService,
     private readonly misc: MiscService,
+    private readonly veo: VeoService,
   ) {}
 
   async createJob(
     userId: string,
     dto: CreateVideoJobDto,
   ): Promise<{ jobId: string; status: string; tokensSpent: number; stillImageUrl?: string; imageTokensSpent?: number }> {
+    // Veo 3.1 (Google) is a separate provider — long-form talking head with
+    // native audio + portrait, one continuous video (no Kling auto-still /
+    // ffmpeg concat). Route before any Kling-specific setup.
+    if (isVeoModel(dto.model ?? '')) {
+      return this.createVeoJob(userId, dto);
+    }
+
     // Auto-chain: text2video без sourceImageUrl → сначала Nano Banana (std),
     // потом image2video на сгенерированной картинке. Image2video у Kling даёт
     // стабильно лучше композицию и меньше «шевелится фон», чем text2video.
@@ -80,7 +90,8 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     }
 
     const mode = dto.mode;
-    const model = (dto.model ?? 'kling-v1-6') as VideoModel;
+    // Veo models already returned above, so this path is Kling-only.
+    const model = (dto.model ?? 'kling-v1-6') as 'kling-v1-6' | 'kling-v2-master';
     const quality = (dto.quality ?? 'std') as VideoQuality;
 
     // --- composed long-form video planning ---
@@ -416,6 +427,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
 
   private async pollJob(job: VideoJobRow) {
     if (!job.kling_task_id) return;
+    if (isVeoModel(job.model)) { await this.pollVeoJob(job); return; }
     // For composed jobs the current Kling call is a base text2video/image2video
     // for segment 1, then a Kling 'extend' for segments 2..N. We query the
     // matching path based on which segment is in flight.
@@ -775,6 +787,193 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       return null;
     } finally {
       try { fs.unlinkSync(tmpPath); } catch {}
+    }
+  }
+
+  // ================= VEO 3.1 PROVIDER =================
+
+  private async fetchPortraitB64(url: string): Promise<{ b64: string; mime: string } | null> {
+    try {
+      let u = url;
+      if (u.startsWith('/')) {
+        u = (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '') + u;
+      }
+      const resp = await axios.get(u, { responseType: 'arraybuffer', timeout: 30000, maxContentLength: 12 * 1024 * 1024 });
+      const mime = (resp.headers['content-type'] as string) || 'image/jpeg';
+      return { b64: Buffer.from(resp.data).toString('base64'), mime };
+    } catch (e: any) {
+      this.logger.warn(`Veo portrait fetch failed: ${e.message}`);
+      return null;
+    }
+  }
+
+  private async createVeoJob(
+    userId: string,
+    dto: CreateVideoJobDto,
+  ): Promise<{ jobId: string; status: string; tokensSpent: number }> {
+    if (!this.veo.isConfigured()) throw new BadRequestException('Veo is not configured (GOOGLE_AI_API_KEY)');
+    const model = dto.model as VideoModel;
+    const mode = dto.mode;
+    if (mode !== 'text2video' && mode !== 'image2video') {
+      throw new BadRequestException('Veo supports mode text2video or image2video');
+    }
+    const prompt = String(dto.prompt ?? '').trim();
+    if (!prompt) throw new BadRequestException('Veo requires a prompt');
+
+    const target = Math.round(dto.targetDurationSec ?? dto.duration ?? 8);
+    if (target < 4 || target > 60) throw new BadRequestException('Veo length must be 4–60 seconds');
+
+    const quote = computeVeoQuote(model, target);
+    const cost = quote.totalCost;
+
+    let imgUrlAbsolute: string | null = null;
+    if (mode === 'image2video') {
+      if (!dto.sourceImageUrl) throw new BadRequestException('image2video requires sourceImageUrl');
+      imgUrlAbsolute = dto.sourceImageUrl.startsWith('/')
+        ? (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '') + dto.sourceImageUrl
+        : dto.sourceImageUrl;
+    }
+
+    const active = await this.pg.query(
+      `SELECT COUNT(*)::int AS n FROM video_jobs WHERE user_id=$1 AND status IN ('pending','processing')`,
+      [userId],
+    );
+    if ((active.rows[0] as any).n >= this.MAX_CONCURRENT_PER_USER) {
+      throw new ConflictException('too many concurrent jobs — wait for one to finish');
+    }
+
+    const plan: ComposedPlan = {
+      target_duration_sec: target,
+      segments_total: quote.segments,
+      segments_done: 0,
+      segment_kling_video_ids: [],
+      segment_video_urls: [],
+      provider: 'veo',
+      veo_tier: quote.tier,
+      veo_last_uri: null,
+    };
+
+    const client = await this.pg.getClient();
+    let jobId: string;
+    try {
+      await client.query('BEGIN');
+      const balRes = await client.query(`SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1 FOR UPDATE`, [userId]);
+      const balance = Number((balRes.rows[0] as any)?.tokens ?? 0);
+      if (balance < cost) { await client.query('ROLLBACK'); throw new InsufficientTokensError(balance, cost); }
+      await client.query(`UPDATE ai_profiles_consolidated SET tokens = tokens - $1 WHERE user_id = $2`, [cost, userId]);
+      const ins = await client.query(
+        `INSERT INTO video_jobs (user_id, mode, model, quality, duration_sec, prompt, negative_prompt,
+            source_image_url, tokens_spent, status, target_duration_sec, composed_plan)
+         VALUES ($1,$2,$3,'std',8,$4,$5,$6,$7,'pending',$8,$9) RETURNING id`,
+        [userId, mode, model, prompt, dto.negativePrompt ?? null, imgUrlAbsolute, cost, target, JSON.stringify(plan)],
+      );
+      jobId = (ins.rows[0] as any).id as string;
+      await client.query('COMMIT');
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw e;
+    } finally {
+      client.release();
+    }
+
+    try {
+      let imageB64: string | undefined; let imageMime: string | undefined;
+      if (imgUrlAbsolute) {
+        const p = await this.fetchPortraitB64(imgUrlAbsolute);
+        if (!p) throw new Error('could not fetch portrait image');
+        imageB64 = p.b64; imageMime = p.mime;
+      }
+      const operation = await this.veo.startGenerate({
+        prompt, tier: quote.tier, durationSeconds: 8,
+        aspectRatio: '16:9', resolution: '720p',
+        imageB64, imageMime, negativePrompt: dto.negativePrompt ?? undefined,
+      });
+      await this.pg.query(
+        `UPDATE video_jobs SET kling_task_id=$1, status='processing', updated_at=now() WHERE id=$2`,
+        [operation, jobId],
+      );
+      return { jobId, status: 'processing', tokensSpent: cost };
+    } catch (e: any) {
+      this.logger.error(`createVeoJob start error: ${e.message}`);
+      await this.failAndRefund(jobId, userId, cost, `veo_start: ${String(e.message).slice(0, 300)}`);
+      throw new BadRequestException(`Veo rejected the request: ${e.message}`);
+    }
+  }
+
+  private async pollVeoJob(job: VideoJobRow) {
+    const plan = job.composed_plan;
+    if (!plan) { await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), 'veo job missing plan'); return; }
+    const st = await this.veo.getOperation(job.kling_task_id!);
+    if (!st.done) return;
+    if (st.error || !st.videoUri) {
+      await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo: ${st.error ?? 'no video'}`);
+      return;
+    }
+
+    // Veo extend output is the FULL cumulative video — the latest uri is the
+    // whole clip so far, no concat needed.
+    plan.segments_done += 1;
+    plan.veo_last_uri = st.videoUri;
+
+    if (plan.segments_done < plan.segments_total) {
+      try {
+        const op = await this.veo.startExtend({
+          prompt: job.prompt ?? 'continue the scene naturally',
+          tier: plan.veo_tier || veoTier(job.model),
+          videoUri: st.videoUri,
+        });
+        await this.pg.query(
+          `UPDATE video_jobs SET kling_task_id=$1, composed_plan=$2, updated_at=now() WHERE id=$3`,
+          [op, JSON.stringify(plan), job.id],
+        );
+        this.logger.log(`Veo job ${job.id}: segment ${plan.segments_done}/${plan.segments_total} done, extending`);
+      } catch (e: any) {
+        await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo_extend: ${String(e.message).slice(0, 200)}`);
+      }
+      return;
+    }
+
+    try {
+      const buf = await this.veo.downloadVideo(st.videoUri);
+      const url = await this.storeVeoFinal(job.id, buf, plan.target_duration_sec);
+      let thumbUrl: string | null = null;
+      try { thumbUrl = await this.extractAndUploadThumbnail(job.id, url); } catch { /* nice-to-have */ }
+      await this.pg.query(
+        `UPDATE video_jobs SET status='ready', video_url=$1, thumbnail_url=$2, composed_plan=$3, updated_at=now() WHERE id=$4`,
+        [url, thumbUrl, JSON.stringify(plan), job.id],
+      );
+      this.logger.log(`Veo job ${job.id} ready (${plan.target_duration_sec}s, ${plan.segments_total} segments): ${url}`);
+    } catch (e: any) {
+      this.logger.error(`Veo job ${job.id} finalize failed: ${e.message}`);
+      await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo_finalize: ${String(e.message).slice(0, 200)}`);
+    }
+  }
+
+  // Write the Veo mp4, ffmpeg-trim to the exact requested length (the native
+  // extend chain overshoots in 7s steps), serve from public/videos via Nginx.
+  private async storeVeoFinal(jobId: string, input: Buffer, targetSec: number): Promise<string> {
+    const tmpDir = path.join(os.tmpdir(), `veo_${jobId}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+    try {
+      const inPath = path.join(tmpDir, 'in.mp4');
+      fs.writeFileSync(inPath, input);
+      const outPath = path.join(tmpDir, 'out.mp4');
+      await new Promise<void>((resolve, reject) => {
+        const ff = spawn('ffmpeg', ['-y', '-i', inPath, '-t', String(targetSec), '-c', 'copy', '-movflags', '+faststart', outPath]);
+        let stderr = '';
+        ff.stderr.on('data', (d) => { stderr += d.toString(); });
+        ff.on('close', (code) => code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}: ${stderr.slice(-300)}`)));
+        ff.on('error', reject);
+      });
+      const publicDir = process.env.PUBLIC_DIR ? process.env.PUBLIC_DIR : path.resolve(process.cwd(), 'public');
+      const videosDir = path.join(publicDir, 'videos');
+      fs.mkdirSync(videosDir, { recursive: true });
+      const finalPath = path.join(videosDir, `${jobId}.mp4`);
+      fs.copyFileSync(outPath, finalPath);
+      const backend = (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '');
+      return `${backend}/static/videos/${jobId}.mp4`;
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
     }
   }
 }
