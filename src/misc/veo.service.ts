@@ -144,8 +144,17 @@ export class VeoService {
     if (d.error) {
       return { done: true, videoUri: null, error: d.error?.message || JSON.stringify(d.error).slice(0, 200) };
     }
-    const uri = d.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri ?? null;
-    if (!uri) return { done: true, videoUri: null, error: 'operation done but no video uri' };
+    const gvr = d.response?.generateVideoResponse;
+    const uri = gvr?.generatedSamples?.[0]?.video?.uri ?? null;
+    if (!uri) {
+      // Veo can finish "done" with zero samples when its safety/content filter
+      // (RAI) rejects the generation — surface that reason so the assistant can
+      // tell the user to rephrase, instead of an opaque "no video uri".
+      const rai = Array.isArray(gvr?.raiMediaFilteredReasons) && gvr.raiMediaFilteredReasons.length
+        ? String(gvr.raiMediaFilteredReasons.join(' ')).slice(0, 400)
+        : null;
+      return { done: true, videoUri: null, error: rai ? `Veo отклонил генерацию (фильтр контента): ${rai}` : 'operation done but no video uri' };
+    }
     return { done: true, videoUri: uri, error: null };
   }
 
