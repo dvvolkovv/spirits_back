@@ -426,8 +426,11 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async pollJob(job: VideoJobRow) {
-    if (!job.kling_task_id) return;
+    // Veo first — its chain has a "between segments" state with no in-flight
+    // operation (kling_task_id=null) that must still be polled to start the
+    // next extend once the prior clip is processed.
     if (isVeoModel(job.model)) { await this.pollVeoJob(job); return; }
+    if (!job.kling_task_id) return;
     // For composed jobs the current Kling call is a base text2video/image2video
     // for segment 1, then a Kling 'extend' for segments 2..N. We query the
     // matching path based on which segment is in flight.
@@ -900,52 +903,85 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private readonly MAX_VEO_EXTEND_ATTEMPTS = 6;
+
   private async pollVeoJob(job: VideoJobRow) {
     const plan = job.composed_plan;
     if (!plan) { await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), 'veo job missing plan'); return; }
-    const st = await this.veo.getOperation(job.kling_task_id!);
-    if (!st.done) return;
-    if (st.error || !st.videoUri) {
-      await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo: ${st.error ?? 'no video'}`);
+    const tier = plan.veo_tier || veoTier(job.model);
+
+    // Phase 1 — an operation (base or extend) is in flight: poll it.
+    if (job.kling_task_id) {
+      const st = await this.veo.getOperation(job.kling_task_id);
+      if (!st.done) return;
+      if (st.error || !st.videoUri) {
+        await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo: ${st.error ?? 'no video'}`);
+        return;
+      }
+      // Segment finished. Veo's extend output is the FULL cumulative video, so
+      // the latest uri is the whole clip so far — no ffmpeg concat.
+      plan.segments_done += 1;
+      plan.veo_last_uri = st.videoUri;
+      plan.current_segment_attempt = 0;
+
+      if (plan.segments_done >= plan.segments_total) {
+        // Final segment — download, trim to exact target, store, mark ready.
+        try {
+          const buf = await this.veo.downloadVideo(st.videoUri);
+          const url = await this.storeVeoFinal(job.id, buf, plan.target_duration_sec);
+          let thumbUrl: string | null = null;
+          try { thumbUrl = await this.extractAndUploadThumbnail(job.id, url); } catch { /* nice-to-have */ }
+          await this.pg.query(
+            `UPDATE video_jobs SET status='ready', video_url=$1, thumbnail_url=$2, composed_plan=$3, updated_at=now() WHERE id=$4`,
+            [url, thumbUrl, JSON.stringify(plan), job.id],
+          );
+          this.logger.log(`Veo job ${job.id} ready (${plan.target_duration_sec}s, ${plan.segments_total} segments): ${url}`);
+        } catch (e: any) {
+          this.logger.error(`Veo job ${job.id} finalize failed: ${e.message}`);
+          await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo_finalize: ${String(e.message).slice(0, 200)}`);
+        }
+        return;
+      }
+
+      // More segments needed — clear the in-flight op and persist progress.
+      // The next extend starts on a later tick, once the source clip is ACTIVE
+      // (Veo rejects extends on a not-yet-processed video). kling_task_id=NULL
+      // marks the "between segments" state; pollJob still routes veo jobs here.
+      await this.pg.query(
+        `UPDATE video_jobs SET kling_task_id=NULL, composed_plan=$1, updated_at=now() WHERE id=$2`,
+        [JSON.stringify(plan), job.id],
+      );
       return;
     }
 
-    // Veo extend output is the FULL cumulative video — the latest uri is the
-    // whole clip so far, no concat needed.
-    plan.segments_done += 1;
-    plan.veo_last_uri = st.videoUri;
-
-    if (plan.segments_done < plan.segments_total) {
+    // Phase 2 — between segments: start the next extend once the last clip has
+    // finished processing (state ACTIVE). Otherwise retry on a later tick.
+    if (plan.segments_done > 0 && plan.segments_done < plan.segments_total && plan.veo_last_uri) {
+      const state = await this.veo.getFileState(plan.veo_last_uri);
+      if (state !== 'ACTIVE') return; // still processing — wait for the next tick
       try {
         const op = await this.veo.startExtend({
           prompt: job.prompt ?? 'continue the scene naturally',
-          tier: plan.veo_tier || veoTier(job.model),
-          videoUri: st.videoUri,
+          tier,
+          videoUri: plan.veo_last_uri,
         });
+        plan.current_segment_attempt = 0;
         await this.pg.query(
           `UPDATE video_jobs SET kling_task_id=$1, composed_plan=$2, updated_at=now() WHERE id=$3`,
           [op, JSON.stringify(plan), job.id],
         );
-        this.logger.log(`Veo job ${job.id}: segment ${plan.segments_done}/${plan.segments_total} done, extending`);
+        this.logger.log(`Veo job ${job.id}: extending segment ${plan.segments_done + 1}/${plan.segments_total}`);
       } catch (e: any) {
-        await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo_extend: ${String(e.message).slice(0, 200)}`);
+        const attempt = (plan.current_segment_attempt ?? 0) + 1;
+        if (attempt >= this.MAX_VEO_EXTEND_ATTEMPTS) {
+          await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo_extend: ${String(e.message).slice(0, 200)}`);
+          return;
+        }
+        plan.current_segment_attempt = attempt;
+        await this.pg.query(`UPDATE video_jobs SET composed_plan=$1, updated_at=now() WHERE id=$2`, [JSON.stringify(plan), job.id]);
+        this.logger.warn(`Veo job ${job.id} extend start failed (attempt ${attempt}, will retry): ${e.message}`);
       }
       return;
-    }
-
-    try {
-      const buf = await this.veo.downloadVideo(st.videoUri);
-      const url = await this.storeVeoFinal(job.id, buf, plan.target_duration_sec);
-      let thumbUrl: string | null = null;
-      try { thumbUrl = await this.extractAndUploadThumbnail(job.id, url); } catch { /* nice-to-have */ }
-      await this.pg.query(
-        `UPDATE video_jobs SET status='ready', video_url=$1, thumbnail_url=$2, composed_plan=$3, updated_at=now() WHERE id=$4`,
-        [url, thumbUrl, JSON.stringify(plan), job.id],
-      );
-      this.logger.log(`Veo job ${job.id} ready (${plan.target_duration_sec}s, ${plan.segments_total} segments): ${url}`);
-    } catch (e: any) {
-      this.logger.error(`Veo job ${job.id} finalize failed: ${e.message}`);
-      await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo_finalize: ${String(e.message).slice(0, 200)}`);
     }
   }
 
