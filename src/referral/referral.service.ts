@@ -29,14 +29,39 @@ export class ReferralService {
     return { success: true, leader_name: leader.rows[0].name };
   }
 
-  async getStats(userId: string) {
-    const leader = await this.pg.query(
+  // Get the user's referral-leader row, creating one on first request so every
+  // user has a shareable link (task bbb80368). We only supply name/slug/
+  // user_phone — commission_pct (10), level (1), parent_commission_pct (0),
+  // is_active are the program's schema defaults (marketing-agreed), NOT changed
+  // here. slug = 8 hex chars (matches the slug CHECK ^[a-z0-9-]+$).
+  private async getOrCreateLeader(userId: string): Promise<any> {
+    const existing = await this.pg.query(
       'SELECT * FROM referral_leaders WHERE user_phone = $1 LIMIT 1',
       [userId],
     );
-    if (!leader.rows.length) return { referrals: 0, earnings: 0, isLeader: false };
+    if (existing.rows.length) return existing.rows[0];
 
-    const l = leader.rows[0];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const slug = (await this.pg.query(
+        `SELECT substr(replace(gen_random_uuid()::text, '-', ''), 1, 8) AS s`,
+      )).rows[0].s as string;
+      const taken = await this.pg.query('SELECT 1 FROM referral_leaders WHERE slug = $1', [slug]);
+      if (taken.rows.length) continue;
+      // Re-check user didn't get a row concurrently before inserting.
+      const recheck = await this.pg.query('SELECT * FROM referral_leaders WHERE user_phone = $1 LIMIT 1', [userId]);
+      if (recheck.rows.length) return recheck.rows[0];
+      const ins = await this.pg.query(
+        `INSERT INTO referral_leaders (name, slug, user_phone) VALUES ($1, $2, $3) RETURNING *`,
+        [userId, slug, userId],
+      );
+      this.logger.log(`Auto-created self-serve referral leader for ${userId} (slug ${slug})`);
+      return ins.rows[0];
+    }
+    throw new Error('could not allocate a unique referral slug');
+  }
+
+  async getStats(userId: string) {
+    const l = await this.getOrCreateLeader(userId);
 
     // Get referees
     const refs = await this.pg.query(
