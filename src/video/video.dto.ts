@@ -170,14 +170,14 @@ export function computeComposedQuote(
 }
 
 // Veo 3.1 quote: base 8s + N×7s native extends, output trimmed to target.
-// PROVISIONAL token pricing (Sprint 2 finalizes user pricing with the owner) —
-// derived from cost: Fast $0.15/s, Standard $0.40/s, ~base 8s + 7s/extend, with
-// the per-24s targets from the backlog analysis (~300-450k tokens Fast).
+// User pricing set by the owner 2026-06-03: ~2× cost ("доступная"), i.e. a 24s
+// Fast clip ≈ 700₽ ≈ 280k tokens (ref ~2.5₽/1000 tokens; our cost ~360₽/24s).
+// → Fast base(8s) 90k, +7s extend 63k. Standard ≈ 2.7× Fast (cost $0.40 vs $0.15/s).
 const VEO_BASE_SEC = 8;
 const VEO_EXTEND_SEC = 7;
 const VEO_PRICING: Record<'fast' | 'standard', { base: number; extendUnit: number }> = {
-  fast:     { base: 120_000, extendUnit: 105_000 },
-  standard: { base: 320_000, extendUnit: 280_000 },
+  fast:     { base: 90_000,  extendUnit: 63_000 },
+  standard: { base: 240_000, extendUnit: 170_000 },
 };
 export interface VeoQuote {
   tier: 'fast' | 'standard';
