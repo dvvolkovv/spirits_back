@@ -69,13 +69,16 @@ export const CHAT_TOOLS = [
   {
     name: 'generate_video',
     description:
-      'Generate a video using Kling. По умолчанию 5–10s одним вызовом. Если пользователь просит видео длиннее (15/20/24/30/45/60 секунд) — передай targetDurationSec (число секунд от 5 до 60). При targetDurationSec > 10 мы под капотом цепляем base 10s + N × extend 5s и ffmpeg-склеиваем в один MP4 ровно нужной длительности (например, 24s = 10s + 3×5s = 25s сгенерированного → trim до 24s). Стоимость = base + N × extend, считается автоматически. Long-form работает только с mode="text2video" / "image2video". ВАЖНО: для mode="text2video" без sourceImageUrl мы сначала генерируем стилл-кадр через Nano Banana 2 (+5000 токенов), потом анимируем — даёт стабильнее композицию. Если у тебя уже есть подходящая картинка — передай sourceImageUrl и mode="image2video".',
+      'Генерация видео. ДВА движка — выбирай по задаче через поле model:\n' +
+      '• Veo 3.1 (model="veo-3.1-fast", или "veo-3.1" для макс. качества) — БЕРИ ЕГО, когда пользователю нужна «говорящая голова» / человек, говорящий в камеру / видео из его ПОРТРЕТА / синхронная озвучка-реплика, особенно длиннее ~10с. Реплику/речь пиши ПРЯМО в prompt — Veo сам произносит её с синхронными губами (нативный звук, отдельный аудио-шаг не нужен). Одно непрерывное видео до 60с (targetDurationSec). Портрет — передай sourceImageUrl + mode="image2video" (без портрета — mode="text2video"). У Veo НЕ используются quality / cameraType / duration 5-10.\n' +
+      '• Kling (model="kling-v1-6" по умолчанию, "kling-v2-master" премиум) — универсальная генерация сцен/анимации без обязательной речи. До 10с одним вызовом; длиннее — targetDurationSec (5–60), под капотом base 10s + N×extend 5s + ffmpeg-склейка. Для mode="text2video" без sourceImageUrl сначала генерируется стилл через Nano Banana (+5000 токенов). Есть картинка — sourceImageUrl + mode="image2video".\n' +
+      'Стоимость считается автоматически по движку и длине. Long-form (targetDurationSec) — только text2video / image2video.',
     input_schema: {
       type: 'object',
       properties: {
         mode: { type: 'string', enum: ['text2video', 'image2video', 'extend', 'lipsync'] },
         prompt: { type: 'string' },
-        model: { type: 'string', enum: ['kling-v1-6', 'kling-v2-master'], default: 'kling-v1-6' },
+        model: { type: 'string', enum: ['kling-v1-6', 'kling-v2-master', 'veo-3.1-fast', 'veo-3.1'], default: 'kling-v1-6' },
         quality: { type: 'string', enum: ['std', 'pro'], default: 'std' },
         duration: { type: 'number', enum: [5, 10], default: 5 },
         targetDurationSec: {
