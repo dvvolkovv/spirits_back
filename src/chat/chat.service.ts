@@ -580,7 +580,15 @@ export class ChatService {
       const FormData = require('form-data');
       const fd = new FormData();
       fd.append('message', prompt);
-      fd.append('sessionId', `${userId}_${assistantId}`);
+      // sessionId namespace version. r.linkeon.io's Claude Code caches the MCP
+      // tool list per session for the session's lifetime, so adding a new tool
+      // (Veo to generate_video) is invisible to already-warm sessions — they
+      // keep rejecting veo-3.1-* as an unknown enum value. Bumping this suffix
+      // forces fresh sessions that re-fetch tools/list (now including Veo).
+      // Continuity is preserved: persona + last-6-message history are re-injected
+      // into every prompt above, so r.linkeon.io-side memory is non-critical.
+      // BUMP THIS when MCP tool schemas change and must reach live sessions.
+      fd.append('sessionId', `${userId}_${assistantId}_v2`);
 
       const agentRes = await axios.post(`${AGENT_URL}/chat`, fd, {
         headers: fd.getHeaders(),
