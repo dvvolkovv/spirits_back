@@ -519,6 +519,26 @@ export class ChatService {
     const streamStartTime = Date.now();
     const chunks: string[] = []; // hoisted so catch block can access partial response
 
+    // Guard against the upstream (r.linkeon.io / Claude subscription) leaking a
+    // raw "You've hit your session limit · resets …" notice as if it were the
+    // assistant's reply. Detect it, replace with a graceful message, and
+    // suppress any further chunks for this turn.
+    let limitHit = false;
+    const LIMIT_RE = /(hit your (?:session|usage) limit|(?:session|usage) limit\b[^.\n]*reset|rate limit)/i;
+    const forwardItem = (text: string) => {
+      if (limitHit) return;
+      if (LIMIT_RE.test(text)) {
+        limitHit = true;
+        const friendly = 'Извините, сервис ассистентов сейчас перегружен и временно недоступен — попробуйте, пожалуйста, через несколько минут. 🙏';
+        chunks.length = 0;
+        chunks.push(friendly);
+        safeWrite({ type: 'item', content: friendly });
+        return;
+      }
+      chunks.push(text);
+      safeWrite({ type: 'item', content: text });
+    };
+
     // Single persistence point — dedupe via `saved` flag so success and error paths
     // both call but only one actually writes.
     let saved = false;
@@ -541,7 +561,7 @@ export class ChatService {
       const textCost = fullText.length * this.SDK_TEXT_MULTIPLIER;
       try {
         await this.saveChatHistory(userId, assistantId, message, aiText, textCost);
-        if (fullText.length > 0) {
+        if (fullText.length > 0 && !limitHit) {
           await this.addTokenTask(userId, 0, textCost, agentId);
           if (this.neo4j) {
             try { await this.neo4j.consolidateFromChat(userId, assistantId, message, fullText); } catch {}
@@ -585,12 +605,10 @@ export class ChatService {
                 const ev = JSON.parse(line.slice(6));
 
                 if (ev.type === 'delta' || ev.type === 'text') {
-                  chunks.push(ev.text);
-                  safeWrite({ type: 'item', content: ev.text });
+                  forwardItem(ev.text);
                 } else if (ev.type === 'result' && ev.text) {
                   if (chunks.length === 0) {
-                    chunks.push(ev.text);
-                    safeWrite({ type: 'item', content: ev.text });
+                    forwardItem(ev.text);
                   }
                 } else if (ev.type === 'done') {
                   // Collect output files info if any
