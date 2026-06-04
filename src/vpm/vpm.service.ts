@@ -208,7 +208,12 @@ export class VpmService implements OnModuleInit {
          FROM sessions`,
         [TEST_USERS, TEST_PATTERN],
       );
-      snapshot.funnel = { ...funnel.rows[0], ...reg.rows[0], ...ttf.rows[0], ...depth.rows[0] };
+      const funnelMerged: any = { ...funnel.rows[0], ...reg.rows[0], ...ttf.rows[0], ...depth.rows[0] };
+      // activation_rate_7d = % зарегистрировавшихся, дошедших до первого чата (c45c71df)
+      const fcu = Number(funnelMerged.first_chat_users_7d) || 0;
+      const reg7 = Number(funnelMerged.registrations_7d) || 0;
+      funnelMerged.activation_rate_7d = reg7 > 0 ? Math.round((100 * fcu) / reg7 * 10) / 10 : null;
+      snapshot.funnel = funnelMerged;
     } catch { /* silent */ }
 
     // 6. Referral funnel (acquisition channel health)

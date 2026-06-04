@@ -226,6 +226,8 @@ export class AdminService {
   //  доставать человека повторно.
   private static readonly RETENTION_CAMPAIGN = 'retention_reengage_v1';
   private static readonly RETENTION_COOLDOWN_DAYS = 14;
+  private static readonly ACTIVATION_CAMPAIGN = 'activation_nudge_v1';
+  private static readonly ACTIVATION_COOLDOWN_DAYS = 14;
   private static readonly TEST_USERS = ['70000000000', '79030169187', '79169403771', '79656445804'];
   private static readonly TEST_PATTERN = '^790300[0-9]{5}$';
 
@@ -336,6 +338,104 @@ export class AdminService {
     }
     return {
       campaign: AdminService.RETENTION_CAMPAIGN,
+      sent: results.filter((r) => r.status === 'sent').length,
+      failed: results.filter((r) => r.status === 'failed').length,
+      skipped_cooldown: drafts.length - targets.length,
+      results,
+    };
+  }
+
+  // --- Activation (c45c71df): нудж новичкам, которые зарегистрировались, но ни
+  //  разу не написали. Зеркало retention-аутрича: preview ничего не шлёт; send
+  //  требует confirm:true; cooldown 14 дней + лог в events. Канал — SMS.
+  private buildActivationMessage(assistantName: string | null): string {
+    const who = assistantName ? `${assistantName} из LINKEON` : 'Роман из LINKEON';
+    return `Здравствуйте! Вы недавно зарегистрировались в LINKEON — ${who} готов(а) помочь с первым вопросом, когда будет удобно: https://my.linkeon.io/chat. Если пока не до этого — это нормально, не отвлекаем.`;
+  }
+
+  /** Build activation drafts: registered ≥minHours ago, never chatted. Sends nothing. */
+  async buildActivationOutreach(opts?: { minHours?: number; maxDays?: number }) {
+    const minHours = opts?.minHours ?? 24;
+    const maxDays = opts?.maxDays ?? 14;
+    const seg = await this.pg.query(
+      `SELECT a.user_id AS phone, a.preferred_agent, a.created_at,
+              COALESCE(ag.display_name, ag.name) AS assistant_name,
+              EXTRACT(EPOCH FROM now() - a.created_at) / 3600.0 AS hours_since_reg
+         FROM ai_profiles_consolidated a
+         LEFT JOIN agents ag ON ag.name = a.preferred_agent
+        WHERE a.created_at < now() - make_interval(hours => $1)
+          AND a.created_at > now() - make_interval(days => $2)
+          AND a.user_id ~ '^7[0-9]{10}$'
+          AND a.user_id <> ALL($3)
+          AND a.user_id !~ $4
+          AND NOT EXISTS (
+            SELECT 1 FROM custom_chat_history c
+             WHERE c.sender_type = 'human'
+               AND (c.session_id = a.user_id OR c.session_id LIKE a.user_id || '\\_%')
+          )
+        ORDER BY a.created_at DESC`,
+      [minHours, maxDays, AdminService.TEST_USERS, AdminService.TEST_PATTERN],
+    );
+    const drafts = await Promise.all(seg.rows.map(async (r) => {
+      const sent = await this.pg.query(
+        `SELECT ts FROM events
+          WHERE name = 'activation_outreach' AND user_id = $1 AND props->>'status' = 'sent'
+          ORDER BY ts DESC LIMIT 1`,
+        [r.phone],
+      );
+      const lastSentAt = sent.rows[0]?.ts || null;
+      const inCooldown = lastSentAt
+        ? Date.now() - new Date(lastSentAt).getTime() < AdminService.ACTIVATION_COOLDOWN_DAYS * 864e5
+        : false;
+      return {
+        phone: r.phone,
+        preferred_agent: r.preferred_agent || null,
+        assistant_name: r.assistant_name || null,
+        created_at: r.created_at,
+        hours_since_reg: Math.round(Number(r.hours_since_reg) || 0),
+        message: this.buildActivationMessage(r.assistant_name),
+        last_sent_at: lastSentAt,
+        in_cooldown: inCooldown,
+      };
+    }));
+    return {
+      channel: 'sms',
+      campaign: AdminService.ACTIVATION_CAMPAIGN,
+      window: { min_hours: minHours, max_days: maxDays },
+      cooldown_days: AdminService.ACTIVATION_COOLDOWN_DAYS,
+      count: drafts.length,
+      drafts,
+    };
+  }
+
+  /** Send activation SMS. GATED: confirm:true (owner). Mirrors sendRetentionOutreach. */
+  async sendActivationOutreach(data: { confirm?: boolean; phones?: string[]; resend?: boolean; minHours?: number; maxDays?: number }) {
+    if (!data?.confirm) {
+      return { error: 'confirm_required', message: 'Отправка реальным пользователям требует confirm:true (подтверждение владельца).' };
+    }
+    const { drafts } = await this.buildActivationOutreach({ minHours: data.minHours, maxDays: data.maxDays });
+    let targets = drafts;
+    if (Array.isArray(data.phones) && data.phones.length) {
+      const set = new Set(data.phones);
+      targets = targets.filter((d) => set.has(d.phone));
+    }
+    if (!data.resend) targets = targets.filter((d) => !d.in_cooldown);
+
+    const results: Array<{ phone: string; status: string; error: string | null }> = [];
+    for (const d of targets) {
+      const r = await this.sendOutreachSms(d.phone, d.message);
+      const status = r.ok ? 'sent' : 'failed';
+      await this.pg.query(
+        `INSERT INTO events (user_id, name, props) VALUES ($1, 'activation_outreach', $2::jsonb)`,
+        [d.phone, JSON.stringify({
+          phone: d.phone, preferred_agent: d.preferred_agent, hours_since_reg: d.hours_since_reg,
+          status, campaign: AdminService.ACTIVATION_CAMPAIGN, error: r.error || null,
+        })],
+      ).catch((e) => this.logger.warn(`activation log insert failed: ${e.message}`));
+      results.push({ phone: d.phone, status, error: r.error || null });
+    }
+    return {
+      campaign: AdminService.ACTIVATION_CAMPAIGN,
       sent: results.filter((r) => r.status === 'sent').length,
       failed: results.filter((r) => r.status === 'failed').length,
       skipped_cooldown: drafts.length - targets.length,

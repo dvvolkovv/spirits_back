@@ -214,6 +214,30 @@ async function step(name, fn) {
     return `${endpoints.length} admin stats endpoints OK`;
   });
 
+  // -- 6e. Lifecycle outreach: activation preview + confirm-gate + retention 48h --
+  await step('lifecycle outreach: preview + confirm-gate', async () => {
+    const ADM = '79030169187';
+    await axios.get(`${BASE_URL}/webhook/898c938d-f094-455c-86af-969617e62f7a/sms/${ADM}`, { timeout: 8000 });
+    const codeRes = await axios.get(`${BASE_URL}/webhook/debug/sms-code/${ADM}`, { timeout: 5000 });
+    const loginRes = await axios.get(`${BASE_URL}/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/${ADM}/${codeRes.data.code}`, { timeout: 8000 });
+    const ajwt = loginRes.data['access-token'];
+    const H = { headers: { Authorization: `Bearer ${ajwt}`, 'Content-Type': 'application/json' }, timeout: 12000 };
+    // activation preview: shape
+    const prev = await axios.post(`${BASE_URL}/webhook/admin/activation`, { action: 'preview' }, H);
+    if (prev.status !== 200 || typeof prev.data?.count !== 'number' || !Array.isArray(prev.data?.drafts)) {
+      throw new Error(`activation preview shape: ${JSON.stringify(prev.data).slice(0,150)}`);
+    }
+    // activation send WITHOUT confirm → must be refused (400, не шлёт)
+    const send = await axios.post(`${BASE_URL}/webhook/admin/activation`, { action: 'send' }, { ...H, validateStatus: () => true });
+    if (send.status !== 400 || send.data?.error !== 'confirm_required') {
+      throw new Error(`activation send must be gated, got ${send.status} ${JSON.stringify(send.data).slice(0,120)}`);
+    }
+    // retention preview with 48h window (minDays:2)
+    const ret = await axios.post(`${BASE_URL}/webhook/admin/retention`, { action: 'preview', minDays: 2 }, H);
+    if (ret.status !== 200 || typeof ret.data?.count !== 'number') throw new Error('retention 48h preview shape');
+    return `activation drafts=${prev.data.count}, gated OK, retention(2d)=${ret.data.count}`;
+  });
+
   // -- 7. Tokens balance --------------------------------------------------
   await step('GET /webhook/user/tokens returns numeric balance', async () => {
     if (!jwt) throw new Error('no JWT');

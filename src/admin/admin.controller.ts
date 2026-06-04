@@ -212,4 +212,24 @@ export class AdminController {
         return res.status(400).json({ error: `Unknown action: ${action}` });
     }
   }
+
+  // Activation outreach (backlog c45c71df). preview только строит черновики;
+  // send — реальная SMS-рассылка новичкам, требует confirm:true (владелец).
+  @Post('admin/activation')
+  @UseGuards(JwtGuard)
+  async activationAction(@Body() body: any, @Res() res: Response) {
+    const { action, ...data } = body;
+    switch (action) {
+      case 'preview': {
+        const out = await this.adminService.buildActivationOutreach(data);
+        return res.status(200).json(out);
+      }
+      case 'send': {
+        const out = await this.adminService.sendActivationOutreach(data);
+        return res.status((out as any).error ? 400 : 200).json(out);
+      }
+      default:
+        return res.status(400).json({ error: `Unknown action: ${action}` });
+    }
+  }
 }
