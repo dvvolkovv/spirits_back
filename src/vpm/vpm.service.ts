@@ -186,7 +186,29 @@ export class VpmService implements OnModuleInit {
             AND p.user_id <> ALL($1) AND p.user_id !~ $2`,
         [TEST_USERS, TEST_PATTERN],
       );
-      snapshot.funnel = { ...funnel.rows[0], ...reg.rows[0], ...ttf.rows[0] };
+      // Session depth (8ebe8593): avg human messages per session_id (= per
+      // user×assistant conversation), distinct from personas.avg_messages which
+      // is cumulative across everything. Surfaces whether a typical visit goes
+      // deep or stalls early — the lever for the Curious persona (avg_messages=2).
+      const depth = await this.pg.query(
+        `WITH sessions AS (
+           SELECT session_id,
+                  split_part(session_id,'_',2) AS assistant_id,
+                  COUNT(*) AS human_msgs
+             FROM custom_chat_history
+            WHERE sender_type='human'
+              AND split_part(session_id,'_',1) <> ALL($1)
+              AND split_part(session_id,'_',1) !~ $2
+            GROUP BY session_id
+         )
+         SELECT
+           round(AVG(human_msgs)::numeric, 1)                                          AS avg_messages_per_session,
+           round(AVG(human_msgs) FILTER (WHERE assistant_id = '12')::numeric, 1)        AS avg_messages_per_session_roman,
+           COUNT(*)                                                                     AS sessions_total
+         FROM sessions`,
+        [TEST_USERS, TEST_PATTERN],
+      );
+      snapshot.funnel = { ...funnel.rows[0], ...reg.rows[0], ...ttf.rows[0], ...depth.rows[0] };
     } catch { /* silent */ }
 
     // 6. Referral funnel (acquisition channel health)
@@ -259,7 +281,10 @@ export class VpmService implements OnModuleInit {
       'started 2026-06-01 — so chat_calls_7d == chat_calls_30d is EXPECTED until 30d of events accrue, not a bug. ' +
       'For real history use funnel.chat_messages_*_real (from custom_chat_history, back to 2026-04). ' +
       'funnel.* and referral.referral_registrations exclude test numbers (70000000000, 79030169187, 79169403771, 79656445804, 790300xxxxx); ' +
-      'usage.* still includes them, so usage.active_users_7d may be inflated by the smoke/test accounts.';
+      'usage.* still includes them, so usage.active_users_7d may be inflated by the smoke/test accounts. ' +
+      'funnel.avg_messages_per_session = avg human messages per session_id (one user×assistant conversation) — ' +
+      'session depth of a single visit, distinct from personas.*.avg_messages which is cumulative across all chats; ' +
+      'avg_messages_per_session_roman is the same restricted to Роман (the Curious persona\'s top assistant, where suggested-prompt chips now nudge depth — backlog 8ebe8593).';
 
     snapshot.generated_at = new Date().toISOString();
     return snapshot;
