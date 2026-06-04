@@ -825,19 +825,45 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     if (segments <= 1) return [clean];
     // Разбиваем на предложения (латиница + кириллица + CJK-пунктуация).
     const sentences = clean.split(/(?<=[.!?。！？…])\s+/).map((s) => s.trim()).filter(Boolean);
-    const out: string[] = [];
-    // Короткий промпт (0–1 предложение) нечего распределять: база говорит всё,
-    // extend'ы — продолжение без повтора речи.
     if (sentences.length <= 1) {
-      out.push(clean || this.veoContinuationPrompt());
+      const out = [clean || this.veoContinuationPrompt()];
       for (let i = 1; i < segments; i++) out.push(this.veoContinuationPrompt());
       return out;
     }
-    // Раскладываем предложения максимально равномерно по сегментам.
-    const perSeg = Math.ceil(sentences.length / segments);
+
+    // Извлекаем САМУ РЕПЛИКУ — текст в кавычках (то, что персонаж проговаривает).
+    // Распределяем именно её по сегментам начиная с БАЗОВОГО, а «обвязку»
+    // (сцена/внешность/инструкция говорения = PREFIX, субтитры/плашка/стиль =
+    // SUFFIX) повторяем в КАЖДОМ сегменте. Так: (1) первые 8с уже несут нужную
+    // русскую речь (баг: раньше шла английская импровизация); (2) персонаж и
+    // субтитры консистентны на всю длину (раньше описание было только в базе).
+    const speechRe = /["«»“”„]|\bsays?\b|\bspeaks?\b|говор|произнос|реплик/i;
+    const qm = clean.match(/["«“„]([\s\S]+?)["»”]/);
+    if (!qm || !qm[1].trim()) {
+      // Нет реплики в кавычках — база несёт всё, extend'ы продолжают без повтора.
+      const out = [clean];
+      for (let i = 1; i < segments; i++) out.push(this.veoContinuationPrompt());
+      return out;
+    }
+    const prefix = clean.slice(0, qm.index).trim();              // сцена + «он говорит:»
+    const suffix = clean.slice((qm.index ?? 0) + qm[0].length).trim(); // субтитры/плашка/стиль
+    // Сцена БЕЗ инструкции говорения — для «молчащих» хвостовых сегментов.
+    const sceneOnly = prefix
+      .split(/(?<=[.!?…])\s+/).map((s) => s.trim()).filter(Boolean)
+      .filter((s) => !speechRe.test(s)).join(' ').trim();
+    const scriptSentences = qm[1].trim()
+      .split(/(?<=[.!?…])\s+/).map((s) => s.trim()).filter(Boolean);
+
+    const perSeg = Math.max(1, Math.ceil(scriptSentences.length / segments));
+    const out: string[] = [];
     for (let i = 0; i < segments; i++) {
-      const chunk = sentences.slice(i * perSeg, (i + 1) * perSeg);
-      out.push(chunk.length ? chunk.join(' ') : this.veoContinuationPrompt());
+      const chunk = scriptSentences.slice(i * perSeg, (i + 1) * perSeg);
+      if (chunk.length) {
+        out.push([prefix, `"${chunk.join(' ')}"`, suffix].filter(Boolean).join(' '));
+      } else {
+        // Слова кончились — та же сцена + субтитры, естественная пауза без речи.
+        out.push([sceneOnly, this.veoContinuationPrompt(), suffix].filter(Boolean).join(' '));
+      }
     }
     return out;
   }
