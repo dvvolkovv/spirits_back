@@ -214,6 +214,125 @@ export class AdminService {
     };
   }
 
+  // ===========================================================================
+  //  Retention re-engagement (backlog 72cfc486, покрывает и aa769d61)
+  // ===========================================================================
+  //  Возврат «уснувших» пользователей: кто общался, но затих 3..30 дней назад
+  //  (окно, а не «навсегда» — кого давно нет, не трогаем). Tone-guardrail из
+  //  комментария: строго вежливо, персонализированно (по ассистенту, с которым
+  //  человек общался), с уважением к личному пространству и явным «без давления».
+  //  Те же гарантии необратимости, что у реферального аутрича: preview ничего не
+  //  шлёт; send требует confirm:true; cooldown 14 дней + лог в events не дают
+  //  доставать человека повторно.
+  private static readonly RETENTION_CAMPAIGN = 'retention_reengage_v1';
+  private static readonly RETENTION_COOLDOWN_DAYS = 14;
+  private static readonly TEST_USERS = ['70000000000', '79030169187', '79169403771', '79656445804'];
+  private static readonly TEST_PATTERN = '^790300[0-9]{5}$';
+
+  private buildRetentionMessage(assistantName: string | null): string {
+    const who = assistantName ? `${assistantName} из LINKEON` : 'Ваш ассистент в LINKEON';
+    return `Здравствуйте! ${who} будет рад продолжить разговор, если будет желание — можно вернуться в чат: https://my.linkeon.io/chat. Если сейчас не до этого, это совершенно нормально, не отвлекаем.`;
+  }
+
+  /** Build re-engagement drafts for users inactive within [minDays, maxDays]. Sends nothing. */
+  async buildRetentionOutreach(opts?: { minDays?: number; maxDays?: number }) {
+    const minDays = opts?.minDays ?? 3;
+    const maxDays = opts?.maxDays ?? 30;
+    const seg = await this.pg.query(
+      `WITH last_chat AS (
+         SELECT split_part(session_id,'_',1) AS uid,
+                split_part(session_id,'_',2) AS assistant_id,
+                max(created_at) AS last_at
+           FROM custom_chat_history
+          WHERE sender_type='human'
+            AND split_part(session_id,'_',1) <> ALL($1)
+            AND split_part(session_id,'_',1) !~ $2
+          GROUP BY 1,2
+       ),
+       per_user AS (
+         SELECT DISTINCT ON (uid) uid, assistant_id, last_at
+           FROM last_chat ORDER BY uid, last_at DESC
+       )
+       SELECT pu.uid AS phone, pu.assistant_id, pu.last_at,
+              COALESCE(a.display_name, a.name) AS assistant_name,
+              EXTRACT(DAY FROM now()-pu.last_at)::int AS days_inactive
+         FROM per_user pu
+         LEFT JOIN agents a ON a.id = CASE WHEN pu.assistant_id ~ '^[0-9]+$' THEN pu.assistant_id::int END
+        WHERE pu.last_at < now() - make_interval(days => $3)
+          AND pu.last_at > now() - make_interval(days => $4)
+        ORDER BY pu.last_at DESC`,
+      [AdminService.TEST_USERS, AdminService.TEST_PATTERN, minDays, maxDays],
+    );
+    const drafts = await Promise.all(seg.rows.map(async (r) => {
+      const sent = await this.pg.query(
+        `SELECT ts FROM events
+          WHERE name='retention_outreach' AND user_id=$1 AND props->>'status'='sent'
+          ORDER BY ts DESC LIMIT 1`,
+        [r.phone],
+      );
+      const lastSentAt = sent.rows[0]?.ts || null;
+      const inCooldown = lastSentAt
+        ? (Date.now() - new Date(lastSentAt).getTime()) < AdminService.RETENTION_COOLDOWN_DAYS * 864e5
+        : false;
+      return {
+        phone: r.phone,
+        assistant_id: r.assistant_id,
+        assistant_name: r.assistant_name || null,
+        last_at: r.last_at,
+        days_inactive: r.days_inactive,
+        message: this.buildRetentionMessage(r.assistant_name),
+        last_sent_at: lastSentAt,
+        in_cooldown: inCooldown,
+      };
+    }));
+    return {
+      channel: 'sms',
+      campaign: AdminService.RETENTION_CAMPAIGN,
+      window: { min_days: minDays, max_days: maxDays },
+      cooldown_days: AdminService.RETENTION_COOLDOWN_DAYS,
+      count: drafts.length,
+      drafts,
+    };
+  }
+
+  /**
+   * Send re-engagement SMS. GATED: confirm:true (owner). Optional phones[] limits
+   * the batch. Respects the cooldown unless resend:true. Every attempt logged.
+   */
+  async sendRetentionOutreach(data: { confirm?: boolean; phones?: string[]; resend?: boolean; minDays?: number; maxDays?: number }) {
+    if (!data?.confirm) {
+      return { error: 'confirm_required', message: 'Отправка реальным пользователям требует confirm:true (подтверждение владельца).' };
+    }
+    const { drafts } = await this.buildRetentionOutreach({ minDays: data.minDays, maxDays: data.maxDays });
+    let targets = drafts;
+    if (Array.isArray(data.phones) && data.phones.length) {
+      const set = new Set(data.phones);
+      targets = targets.filter((d) => set.has(d.phone));
+    }
+    if (!data.resend) targets = targets.filter((d) => !d.in_cooldown);
+
+    const results: Array<{ phone: string; status: string; error: string | null }> = [];
+    for (const d of targets) {
+      const r = await this.sendOutreachSms(d.phone, d.message);
+      const status = r.ok ? 'sent' : 'failed';
+      await this.pg.query(
+        `INSERT INTO events (user_id, name, props) VALUES ($1, 'retention_outreach', $2::jsonb)`,
+        [d.phone, JSON.stringify({
+          phone: d.phone, assistant_id: d.assistant_id, days_inactive: d.days_inactive,
+          status, campaign: AdminService.RETENTION_CAMPAIGN, error: r.error || null,
+        })],
+      ).catch((e) => this.logger.warn(`retention log insert failed: ${e.message}`));
+      results.push({ phone: d.phone, status, error: r.error || null });
+    }
+    return {
+      campaign: AdminService.RETENTION_CAMPAIGN,
+      sent: results.filter((r) => r.status === 'sent').length,
+      failed: results.filter((r) => r.status === 'failed').length,
+      skipped_cooldown: drafts.length - targets.length,
+      results,
+    };
+  }
+
   private async sendOutreachSms(phone: string, text: string): Promise<{ ok: boolean; error?: string }> {
     const login = process.env.SMSAERO_LOGIN, apiKey = process.env.SMSAERO_API_KEY;
     if (!login || !apiKey) return { ok: false, error: 'SMS Aero credentials not set' };

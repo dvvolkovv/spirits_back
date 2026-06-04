@@ -192,4 +192,24 @@ export class AdminController {
         return res.status(400).json({ error: `Unknown action: ${action}` });
     }
   }
+
+  // Retention re-engagement (backlog 72cfc486). preview только строит черновики;
+  // send — реальная SMS-рассылка, требует confirm:true (подтверждение владельца).
+  @Post('admin/retention')
+  @UseGuards(JwtGuard)
+  async retentionAction(@Body() body: any, @Res() res: Response) {
+    const { action, ...data } = body;
+    switch (action) {
+      case 'preview': {
+        const out = await this.adminService.buildRetentionOutreach(data);
+        return res.status(200).json(out);
+      }
+      case 'send': {
+        const out = await this.adminService.sendRetentionOutreach(data);
+        return res.status((out as any).error ? 400 : 200).json(out);
+      }
+      default:
+        return res.status(400).json({ error: `Unknown action: ${action}` });
+    }
+  }
 }
