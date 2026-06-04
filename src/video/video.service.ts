@@ -810,6 +810,38 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  // Veo генерит видео сегментами по 8с (база + extend'ы), и каждый сегмент —
+  // отдельный prompt. Если во все сегменты класть один и тот же текст с репликой,
+  // Veo проговаривает её ЗАНОВО в каждом куске (жалоба владельца: речь повторяется
+  // каждые 8с). Поэтому распределяем предложения промпта по сегментам, чтобы речь
+  // прозвучала один раз на всю длину. Хвостовые сегменты без текста получают
+  // продолжение БЕЗ речи (естественная пауза), а не повтор.
+  private veoContinuationPrompt(): string {
+    return 'Continue the previous shot seamlessly: the same person and setting, natural lifelike motion — subtle head movement, blinking, calm facial expression. The person has finished speaking: no new dialogue, and do not repeat any earlier spoken words.';
+  }
+
+  private buildVeoSegmentPrompts(prompt: string, segments: number): string[] {
+    const clean = String(prompt || '').trim();
+    if (segments <= 1) return [clean];
+    // Разбиваем на предложения (латиница + кириллица + CJK-пунктуация).
+    const sentences = clean.split(/(?<=[.!?。！？…])\s+/).map((s) => s.trim()).filter(Boolean);
+    const out: string[] = [];
+    // Короткий промпт (0–1 предложение) нечего распределять: база говорит всё,
+    // extend'ы — продолжение без повтора речи.
+    if (sentences.length <= 1) {
+      out.push(clean || this.veoContinuationPrompt());
+      for (let i = 1; i < segments; i++) out.push(this.veoContinuationPrompt());
+      return out;
+    }
+    // Раскладываем предложения максимально равномерно по сегментам.
+    const perSeg = Math.ceil(sentences.length / segments);
+    for (let i = 0; i < segments; i++) {
+      const chunk = sentences.slice(i * perSeg, (i + 1) * perSeg);
+      out.push(chunk.length ? chunk.join(' ') : this.veoContinuationPrompt());
+    }
+    return out;
+  }
+
   private async createVeoJob(
     userId: string,
     dto: CreateVideoJobDto,
@@ -845,6 +877,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       throw new ConflictException('too many concurrent jobs — wait for one to finish');
     }
 
+    const segmentPrompts = this.buildVeoSegmentPrompts(prompt, quote.segments);
     const plan: ComposedPlan = {
       target_duration_sec: target,
       segments_total: quote.segments,
@@ -854,6 +887,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       provider: 'veo',
       veo_tier: quote.tier,
       veo_last_uri: null,
+      veo_segment_prompts: segmentPrompts,
     };
 
     const client = await this.pg.getClient();
@@ -887,7 +921,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         imageB64 = p.b64; imageMime = p.mime;
       }
       const operation = await this.veo.startGenerate({
-        prompt, tier: quote.tier, durationSeconds: 8,
+        prompt: segmentPrompts[0] ?? prompt, tier: quote.tier, durationSeconds: 8,
         aspectRatio: '16:9', resolution: '720p',
         imageB64, imageMime, negativePrompt: dto.negativePrompt ?? undefined,
       });
@@ -963,8 +997,12 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       const state = await this.veo.getFileState(plan.veo_last_uri);
       if (state !== 'ACTIVE') return; // still processing — wait for the next tick
       try {
+        // Prompt сегмента: своя порция речи (распределена при создании). Если
+        // распределения нет (старое задание) — продолжение без повтора реплики,
+        // НЕ полный job.prompt (он и вызывал повтор речи каждые 8с).
+        const segPrompt = plan.veo_segment_prompts?.[plan.segments_done] ?? this.veoContinuationPrompt();
         const op = await this.veo.startExtend({
-          prompt: job.prompt ?? 'continue the scene naturally',
+          prompt: segPrompt,
           tier,
           videoUri: plan.veo_last_uri,
         });

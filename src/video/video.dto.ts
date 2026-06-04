@@ -70,6 +70,11 @@ export interface ComposedPlan {
   provider?: 'kling' | 'veo';
   veo_tier?: 'fast' | 'standard';
   veo_last_uri?: string | null;   // download uri of the latest (cumulative) clip
+  // Per-segment prompts. The user's script/speech is distributed across the
+  // segments so Veo speaks it ONCE end-to-end instead of repeating the full
+  // line in every 8s segment (a0132032 fix). Index = segment number; base uses
+  // [0], extend N uses [N]. Empty tail segments get a no-speech continuation.
+  veo_segment_prompts?: string[];
   // Retry counter for the segment currently in flight. Reset to 0 every
   // time a segment finishes successfully; bumped when we re-submit after
   // a transient Kling error (e.g. "Internal error"). Capped server-side.
