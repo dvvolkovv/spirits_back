@@ -188,6 +188,32 @@ async function step(name, fn) {
     return `eligible=${s.data.eligible} msgs=${s.data.message_count}`;
   });
 
+  // -- 6d. Admin management stats endpoints respond (SQL-регрессия) --------
+  // Бьём по 6 агрегатам «управления» (исключают тестовых) — битый SQL даст 500.
+  // Нужен admin-JWT: 79030169187 (isadmin, в whitelist debug-OTP).
+  await step('admin management stats endpoints return 200', async () => {
+    const ADM = '79030169187';
+    await axios.get(`${BASE_URL}/webhook/898c938d-f094-455c-86af-969617e62f7a/sms/${ADM}`, { timeout: 8000 });
+    const codeRes = await axios.get(`${BASE_URL}/webhook/debug/sms-code/${ADM}`, { timeout: 5000 });
+    const loginRes = await axios.get(`${BASE_URL}/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/${ADM}/${codeRes.data.code}`, { timeout: 8000 });
+    const ajwt = loginRes.data['access-token'];
+    if (!ajwt) throw new Error('no admin JWT');
+    const H = { headers: { Authorization: `Bearer ${ajwt}` }, timeout: 12000 };
+    const endpoints = [
+      '/webhook/admin/payments?limit=5',
+      '/webhook/admin/payments/stats?days=7',
+      '/webhook/admin/users/tokens?limit=5',
+      '/webhook/admin/tokens/stats?days=7',
+      '/webhook/admin/users/active?days=7',
+      '/webhook/admin/usage/assistants?days=7',
+    ];
+    for (const ep of endpoints) {
+      const r = await axios.get(`${BASE_URL}${ep}`, H);
+      if (r.status !== 200) throw new Error(`${ep} → ${r.status}`);
+    }
+    return `${endpoints.length} admin stats endpoints OK`;
+  });
+
   // -- 7. Tokens balance --------------------------------------------------
   await step('GET /webhook/user/tokens returns numeric balance', async () => {
     if (!jwt) throw new Error('no JWT');

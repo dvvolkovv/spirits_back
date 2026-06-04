@@ -229,6 +229,15 @@ export class AdminService {
   private static readonly TEST_USERS = ['70000000000', '79030169187', '79169403771', '79656445804'];
   private static readonly TEST_PATTERN = '^790300[0-9]{5}$';
 
+  // Предикат «не тестовый пользователь» для агрегатов «управления». `col` —
+  // колонка с телефоном (user_id). Константы инлайнятся (статичные, без
+  // инъекции) — чтобы не сдвигать позиционные $-параметры в многочисленных
+  // запросах. Тот же фильтр, что в economy.service (VPM). Задача b60ab28b.
+  private static excludeTest(col: string): string {
+    const arr = AdminService.TEST_USERS.map((u) => `'${u}'`).join(', ');
+    return `${col} <> ALL(ARRAY[${arr}]::text[]) AND ${col} !~ '${AdminService.TEST_PATTERN}'`;
+  }
+
   private buildRetentionMessage(assistantName: string | null): string {
     const who = assistantName ? `${assistantName} из LINKEON` : 'Ваш ассистент в LINKEON';
     return `Здравствуйте! ${who} будет рад продолжить разговор, если будет желание — можно вернуться в чат: https://my.linkeon.io/chat. Если сейчас не до этого, это совершенно нормально, не отвлекаем.`;
@@ -398,10 +407,10 @@ export class AdminService {
   async listPayments(opts: { status?: string; limit?: number } = {}) {
     const limit = Math.min(Math.max(opts.limit ?? 200, 1), 1000);
     const params: any[] = [limit];
-    let where = '';
+    let where = `WHERE ${AdminService.excludeTest('p.user_id')}`;
     if (opts.status && opts.status !== 'all') {
       params.push(opts.status);
-      where = `WHERE p.status = $${params.length}`;
+      where += ` AND p.status = $${params.length}`;
     }
     const res = await this.pg.query(
       `SELECT
@@ -475,6 +484,7 @@ export class AdminService {
        LEFT JOIN referral_referees rr ON rr.referee_phone = a.user_id
        LEFT JOIN referral_leaders rl ON rl.id = rr.leader_id
        WHERE a.user_id IS NOT NULL
+         AND ${AdminService.excludeTest('a.user_id')}
          ${sortBy === 'spent_period' ? 'AND COALESCE(spent_period.spent, 0) > 0' : ''}
        ORDER BY ${sortBy} DESC NULLS LAST
        LIMIT $1`,
@@ -487,7 +497,8 @@ export class AdminService {
          COUNT(*) AS users_total,
          COALESCE(SUM(a.tokens), 0)::bigint AS total_balance
        FROM ai_profiles_consolidated a
-       WHERE a.user_id IS NOT NULL`,
+       WHERE a.user_id IS NOT NULL
+         AND ${AdminService.excludeTest('a.user_id')}`,
     );
     const t = totalsRes.rows[0] || {};
 
@@ -535,6 +546,7 @@ export class AdminService {
        FROM buckets b
        LEFT JOIN token_transactions t
          ON date_trunc('${bucket}', t.created_at) = b.bucket
+        AND ${AdminService.excludeTest('t.user_id')}
        GROUP BY b.bucket
        ORDER BY b.bucket ASC`,
       [stepCount],
@@ -548,7 +560,8 @@ export class AdminService {
          COALESCE(ABS(SUM(amount)), 0)::bigint AS spent_all,
          COUNT(DISTINCT user_id) FILTER (WHERE created_at >= now() - interval '30 days') AS active_users_30d
        FROM token_transactions
-       WHERE transaction_type = 'consumed'`,
+       WHERE transaction_type = 'consumed'
+         AND ${AdminService.excludeTest('user_id')}`,
     );
     const t = totalsRes.rows[0] || {};
 
@@ -592,6 +605,7 @@ export class AdminService {
          FROM token_transactions t
          WHERE t.created_at >= now() - make_interval(days => $2)
            AND t.transaction_type = 'consumed'
+           AND ${AdminService.excludeTest('t.user_id')}
          GROUP BY 1
        ) active ON active.bucket = d.bucket
        LEFT JOIN (
@@ -599,6 +613,7 @@ export class AdminService {
                 COUNT(*) AS new_users
          FROM ai_profiles_consolidated a
          WHERE a.created_at >= now() - make_interval(days => $2)
+           AND ${AdminService.excludeTest('a.user_id')}
          GROUP BY 1
        ) newr ON newr.bucket = d.bucket
        ORDER BY d.bucket`,
@@ -607,22 +622,29 @@ export class AdminService {
 
     const totalsRes = await this.pg.query(
       `SELECT
-         (SELECT COUNT(*) FROM ai_profiles_consolidated)::int AS total_users,
          (SELECT COUNT(*) FROM ai_profiles_consolidated
-            WHERE created_at >= now() - interval '30 days')::int AS new_30d,
+            WHERE ${AdminService.excludeTest('user_id')})::int AS total_users,
          (SELECT COUNT(*) FROM ai_profiles_consolidated
-            WHERE created_at >= now() - interval '7 days')::int AS new_7d,
+            WHERE created_at >= now() - interval '30 days'
+            AND ${AdminService.excludeTest('user_id')})::int AS new_30d,
          (SELECT COUNT(*) FROM ai_profiles_consolidated
-            WHERE created_at >= date_trunc('day', now()))::int AS new_today,
+            WHERE created_at >= now() - interval '7 days'
+            AND ${AdminService.excludeTest('user_id')})::int AS new_7d,
+         (SELECT COUNT(*) FROM ai_profiles_consolidated
+            WHERE created_at >= date_trunc('day', now())
+            AND ${AdminService.excludeTest('user_id')})::int AS new_today,
          (SELECT COUNT(DISTINCT user_id) FROM token_transactions
             WHERE transaction_type = 'consumed'
-            AND created_at >= date_trunc('day', now()))::int AS dau,
+            AND created_at >= date_trunc('day', now())
+            AND ${AdminService.excludeTest('user_id')})::int AS dau,
          (SELECT COUNT(DISTINCT user_id) FROM token_transactions
             WHERE transaction_type = 'consumed'
-            AND created_at >= now() - interval '7 days')::int AS wau,
+            AND created_at >= now() - interval '7 days'
+            AND ${AdminService.excludeTest('user_id')})::int AS wau,
          (SELECT COUNT(DISTINCT user_id) FROM token_transactions
             WHERE transaction_type = 'consumed'
-            AND created_at >= now() - interval '30 days')::int AS mau
+            AND created_at >= now() - interval '30 days'
+            AND ${AdminService.excludeTest('user_id')})::int AS mau
       `,
     );
 
@@ -654,6 +676,7 @@ export class AdminService {
        LEFT JOIN token_consumption_tasks t
          ON date_trunc('day', t.created_at)::date = d.day
         AND t.status = 'completed'
+        AND ${AdminService.excludeTest('t.user_id')}
        GROUP BY d.day
        ORDER BY d.day ASC`,
       [days],
@@ -674,6 +697,7 @@ export class AdminService {
          ON t.agent_id = a.id
         AND t.status = 'completed'
         AND t.created_at >= now() - $1 * interval '1 day'
+        AND ${AdminService.excludeTest('t.user_id')}
        GROUP BY a.id, a.name, a.description
        ORDER BY tokens DESC, queries DESC, a.id ASC`,
       [days],
@@ -693,7 +717,8 @@ export class AdminService {
          COUNT(DISTINCT user_id) FILTER (WHERE created_at >= now() - interval '7 days')::int AS active_users_7d,
          COUNT(DISTINCT user_id) FILTER (WHERE created_at >= now() - interval '30 days')::int AS active_users_30d
        FROM token_consumption_tasks
-       WHERE status = 'completed' AND agent_id IS NOT NULL`,
+       WHERE status = 'completed' AND agent_id IS NOT NULL
+         AND ${AdminService.excludeTest('user_id')}`,
     );
     const tot = totalsRes.rows[0] || {};
 
@@ -1055,6 +1080,7 @@ export class AdminService {
        FROM days d
        LEFT JOIN payments p
          ON date_trunc('day', COALESCE(p.completed_at, p.created_at)) = d.day
+        AND ${AdminService.excludeTest('p.user_id')}
        GROUP BY d.day
        ORDER BY d.day ASC`,
       [days],
@@ -1080,7 +1106,8 @@ export class AdminService {
              AND date_trunc('day', COALESCE(completed_at, created_at)) = date_trunc('day', now())
          ), 0) AS revenue_today,
          COUNT(DISTINCT user_id) FILTER (WHERE status = 'succeeded') AS unique_payers
-       FROM payments`,
+       FROM payments
+       WHERE ${AdminService.excludeTest('user_id')}`,
     );
     const t = totalsRes.rows[0] || {};
 
