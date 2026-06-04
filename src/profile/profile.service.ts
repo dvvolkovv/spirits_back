@@ -51,6 +51,7 @@ export class ProfileService {
         email: identityEmail,
         signup_method: uidRow.signup_method || null,
         isadmin: row.isadmin === true || row.isadmin === 'true',
+        onboarded: row.onboarded === true,
         profile_data: pd, // raw column для обратной совместимости со старым фронтом
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -91,6 +92,14 @@ export class ProfileService {
       );
     }
     return { success: true };
+  }
+
+  async completeOnboarding(userId: string) {
+    await this.pg.query(
+      `UPDATE ai_profiles_consolidated SET onboarded = true, updated_at = now() WHERE user_id = $1`,
+      [userId],
+    );
+    return { onboarded: true };
   }
 
   async deleteProfile(userId: string) {

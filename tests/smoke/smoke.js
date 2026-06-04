@@ -157,6 +157,21 @@ async function step(name, fn) {
     return 'profile data returned';
   });
 
+  // -- 6b. Onboarding flag: exposed in profile + complete() is idempotent --
+  await step('onboarding flag exposed + /onboarding/complete sets it', async () => {
+    if (!jwt) throw new Error('no JWT');
+    const prof = await axios.get(`${BASE_URL}/webhook/profile`, {
+      headers: { Authorization: `Bearer ${jwt}` }, timeout: 10000,
+    });
+    const pj = (Array.isArray(prof.data) ? prof.data[0] : prof.data)?.profileJson;
+    if (!pj || typeof pj.onboarded !== 'boolean') throw new Error('profile.onboarded is not boolean');
+    const comp = await axios.post(`${BASE_URL}/webhook/onboarding/complete`, {}, {
+      headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' }, timeout: 10000,
+    });
+    if (comp.status !== 200 || comp.data?.onboarded !== true) throw new Error('complete did not return onboarded:true');
+    return 'onboarded boolean + complete OK';
+  });
+
   // -- 7. Tokens balance --------------------------------------------------
   await step('GET /webhook/user/tokens returns numeric balance', async () => {
     if (!jwt) throw new Error('no JWT');

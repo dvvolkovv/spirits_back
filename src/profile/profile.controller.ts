@@ -73,4 +73,11 @@ export class ProfileController {
     const result = await this.profileService.setEmail(user.userId, body.email);
     return res.status(200).json(result);
   }
+
+  @Post('onboarding/complete')
+  @UseGuards(JwtGuard)
+  async completeOnboarding(@CurrentUser() user: any, @Res() res: Response) {
+    const result = await this.profileService.completeOnboarding(user.userId);
+    return res.status(200).json(result);
+  }
 }
