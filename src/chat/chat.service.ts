@@ -588,7 +588,7 @@ export class ChatService {
       // Continuity is preserved: persona + last-6-message history are re-injected
       // into every prompt above, so r.linkeon.io-side memory is non-critical.
       // BUMP THIS when MCP tool schemas change and must reach live sessions.
-      fd.append('sessionId', `${userId}_${assistantId}_v2`);
+      fd.append('sessionId', `${userId}_${assistantId}_v3`);
 
       const agentRes = await axios.post(`${AGENT_URL}/chat`, fd, {
         headers: fd.getHeaders(),
@@ -655,6 +655,7 @@ export class ChatService {
         const jobsRes = await this.pg.query(
           `SELECT id FROM video_jobs
            WHERE user_id = $1 AND created_at >= $2::timestamptz
+             AND status <> 'failed'
            ORDER BY created_at ASC`,
           [userId, startTimeIso],
         );

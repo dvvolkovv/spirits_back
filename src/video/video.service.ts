@@ -899,7 +899,10 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     } catch (e: any) {
       this.logger.error(`createVeoJob start error: ${e.message}`);
       await this.failAndRefund(jobId, userId, cost, `veo_start: ${String(e.message).slice(0, 300)}`);
-      throw new BadRequestException(`Veo rejected the request: ${e.message}`);
+      // e.message уже информативно (VeoService.describeError даёт дружелюбный
+      // текст по квоте/контент-фильтру). Не оборачиваем в «Veo rejected the
+      // request» — для дневного лимита это вводит в заблуждение.
+      throw new BadRequestException(e?.message || 'Veo: не удалось запустить генерацию');
     }
   }
 

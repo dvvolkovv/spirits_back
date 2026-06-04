@@ -62,7 +62,18 @@ export class VeoService {
     const status = e.response?.status;
     const raw = e.response?.data?.error?.message || e.message || 'unknown error';
     if (status === 429 || /RESOURCE_EXHAUSTED|exceeded your current quota/i.test(raw)) {
-      return 'Veo: достигнут дневной лимит генераций видео — попробуйте позже (или администратору: повысить квоту Veo для ключа).';
+      // Когда именно снова заработает. Google иногда кладёт RetryInfo.retryDelay
+      // (короткий — это per-minute rate limit). Если его нет — это дневная квота
+      // (RPD), которая сбрасывается раз в сутки в полночь по тихоокеанскому
+      // времени (≈ 10–11 утра МСК).
+      const details: any[] = e.response?.data?.error?.details || [];
+      const retry = details.find((d) => typeof d?.['@type'] === 'string' && d['@type'].includes('RetryInfo'));
+      const delayStr: string | undefined = retry?.retryDelay; // напр. "57s"
+      const delaySec = delayStr ? parseInt(String(delayStr), 10) : NaN;
+      if (Number.isFinite(delaySec) && delaySec > 0 && delaySec < 3600) {
+        return `Veo: временный лимит частоты запросов. Можно повторить примерно через ${delaySec < 60 ? `${delaySec} сек` : `${Math.ceil(delaySec / 60)} мин`}.`;
+      }
+      return 'Veo: на сегодня исчерпан дневной лимит генераций видео. Лимит обновляется раз в сутки около 10:00–11:00 МСК — попробуйте позже. (админу: повысить квоту Veo для ключа в Google AI Studio / Cloud Console.)';
     }
     return `Veo ${label} failed: ${raw}`;
   }
