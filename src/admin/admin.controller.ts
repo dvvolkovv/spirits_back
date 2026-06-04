@@ -178,6 +178,16 @@ export class AdminController {
         const result = await this.adminService.markAllPaid(data.leader_id);
         return res.status(200).json(result);
       }
+      case 'outreach_preview': {
+        // Только строит персональные черновики (ничего не шлёт) — backlog 82cda5af.
+        const out = await this.adminService.buildReferralOutreach();
+        return res.status(200).json(out);
+      }
+      case 'outreach_send': {
+        // Реальная SMS-рассылка лидерам — требует confirm:true (подтверждение владельца).
+        const out = await this.adminService.sendReferralOutreach(data);
+        return res.status((out as any).error ? 400 : 200).json(out);
+      }
       default:
         return res.status(400).json({ error: `Unknown action: ${action}` });
     }

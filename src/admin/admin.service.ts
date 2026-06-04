@@ -1,8 +1,10 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
+import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
 
 @Injectable()
 export class AdminService {
+  private readonly logger = new Logger(AdminService.name);
   constructor(private readonly pg: PgService) {}
 
   // --- Coupons ---
@@ -102,6 +104,132 @@ export class AdminService {
       },
       leaders,
     };
+  }
+
+  // ===========================================================================
+  //  Referral-leader outreach (backlog 82cda5af)
+  // ===========================================================================
+  //  Канал заморожен (referral_clicks_7d = 0) при 10 активных лидерах, которые
+  //  исторически приводили людей — нужно их персонально реактивировать.
+  //  Tone-guardrail из комментария задачи: тёпло, с учётом достижений/прогресса,
+  //  без навязчивости. Сообщение генерится из РЕАЛЬНОЙ статистики лидера.
+  //
+  //  Отправка наружу (реальным людям) — необратимое действие, поэтому:
+  //   • outreach_preview только СТРОИТ черновики (ничего не шлёт);
+  //   • outreach_send требует явный confirm:true (его ставит владелец из UI),
+  //     идемпотентен (повторно не шлёт уже отправленным) и логируется в events.
+  private static readonly OUTREACH_CAMPAIGN = 'leaders_reactivation_2026_06';
+
+  private referralLink(slug: string): string {
+    return `https://my.linkeon.io/?ref=${slug}`;
+  }
+
+  // «1 друга / 2 друга / 5 друзей» (винительный после «пригласили»).
+  private ruFriends(n: number): string {
+    const m10 = n % 10, m100 = n % 100;
+    if (m10 === 1 && m100 !== 11) return 'друга';
+    if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return 'друга';
+    return 'друзей';
+  }
+
+  private buildLeaderOutreachMessage(l: { slug: string; total_referees: number; total_commission_rub: number; pending_rub: number }): string {
+    const link = this.referralLink(l.slug);
+    const n = l.total_referees || 0;
+    const earned = Math.round(l.total_commission_rub || 0);
+    const pending = Math.round(l.pending_rub || 0);
+    if (n > 0) {
+      let msg = `Здравствуйте! Спасибо, что вы с LINKEON. Вы уже пригласили ${n} ${this.ruFriends(n)} и заработали ${earned} ₽`;
+      if (pending > 0) msg += ` (${pending} ₽ ожидают выплаты)`;
+      msg += `. Если поделитесь своей ссылкой ещё с одним знакомым на этой неделе — это поможет и им, и вам: ${link}. Спасибо, что вы с нами!`;
+      return msg;
+    }
+    return `Здравствуйте! Ваша персональная ссылка LINKEON готова: ${link}. Если поделитесь ею с одним знакомым, кому это может быть полезно, — будем очень признательны. Без спешки, по желанию.`;
+  }
+
+  /** Build personalized drafts for every active leader with a phone. Sends nothing. */
+  async buildReferralOutreach() {
+    const { leaders } = await this.getReferralStats();
+    const active = leaders.filter((l) => l.is_active);
+    const targets = active.filter((l) => l.user_phone);
+    const drafts = await Promise.all(targets.map(async (l) => {
+      const sent = await this.pg.query(
+        `SELECT ts FROM events
+          WHERE name = 'referral_outreach' AND props->>'leader_id' = $1 AND props->>'status' = 'sent'
+          ORDER BY ts DESC LIMIT 1`,
+        [l.id],
+      );
+      return {
+        leader_id: l.id,
+        name: l.name,
+        phone: l.user_phone,
+        slug: l.slug,
+        link: this.referralLink(l.slug),
+        total_referees: l.total_referees,
+        total_commission_rub: l.total_commission_rub,
+        pending_rub: l.pending_rub,
+        message: this.buildLeaderOutreachMessage(l),
+        already_sent_at: sent.rows[0]?.ts || null,
+      };
+    }));
+    const skipped_no_phone = active.filter((l) => !l.user_phone).map((l) => ({ leader_id: l.id, name: l.name }));
+    return { channel: 'sms', campaign: AdminService.OUTREACH_CAMPAIGN, count: drafts.length, drafts, skipped_no_phone };
+  }
+
+  /**
+   * Send the outreach SMS. GATED: requires confirm:true (owner action). Optional
+   * leader_ids restricts the batch; resend:true re-sends to already-contacted
+   * leaders (default skips them). Every attempt is logged to events.
+   */
+  async sendReferralOutreach(data: { confirm?: boolean; leader_ids?: string[]; resend?: boolean }) {
+    if (!data?.confirm) {
+      return { error: 'confirm_required', message: 'Отправка реальным лидерам требует confirm:true (подтверждение владельца).' };
+    }
+    const { drafts } = await this.buildReferralOutreach();
+    let targets = drafts;
+    if (Array.isArray(data.leader_ids) && data.leader_ids.length) {
+      const set = new Set(data.leader_ids);
+      targets = targets.filter((d) => set.has(d.leader_id));
+    }
+    if (!data.resend) targets = targets.filter((d) => !d.already_sent_at);
+
+    const results: Array<{ leader_id: string; name: string; phone: string; status: string; error: string | null }> = [];
+    for (const d of targets) {
+      const r = await this.sendOutreachSms(d.phone, d.message);
+      const status = r.ok ? 'sent' : 'failed';
+      await this.pg.query(
+        `INSERT INTO events (user_id, name, props) VALUES ($1, 'referral_outreach', $2::jsonb)`,
+        [d.phone, JSON.stringify({
+          leader_id: d.leader_id, phone: d.phone, status,
+          campaign: AdminService.OUTREACH_CAMPAIGN, error: r.error || null,
+        })],
+      ).catch((e) => this.logger.warn(`outreach log insert failed: ${e.message}`));
+      results.push({ leader_id: d.leader_id, name: d.name, phone: d.phone, status, error: r.error || null });
+    }
+    return {
+      campaign: AdminService.OUTREACH_CAMPAIGN,
+      sent: results.filter((r) => r.status === 'sent').length,
+      failed: results.filter((r) => r.status === 'failed').length,
+      skipped_already_sent: drafts.length - targets.length,
+      results,
+    };
+  }
+
+  private async sendOutreachSms(phone: string, text: string): Promise<{ ok: boolean; error?: string }> {
+    const login = process.env.SMSAERO_LOGIN, apiKey = process.env.SMSAERO_API_KEY;
+    if (!login || !apiKey) return { ok: false, error: 'SMS Aero credentials not set' };
+    try {
+      const auth = Buffer.from(`${login}:${apiKey}`).toString('base64');
+      const resp = await axios.get('https://gate.smsaero.ru/v2/sms/send', {
+        params: { number: phone, text, sign: 'SMSAero' },
+        headers: { Authorization: `Basic ${auth}` },
+        timeout: 10000,
+        validateStatus: () => true,
+      });
+      if (resp.status >= 400) return { ok: false, error: `SMS Aero ${resp.status}: ${JSON.stringify(resp.data).slice(0, 200)}` };
+      return { ok: true };
+    } catch (e: any) {
+      return { ok: false, error: e.message?.slice(0, 200) || 'network error' };
+    }
   }
 
   async createReferralLeader(data: any) {
