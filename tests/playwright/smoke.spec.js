@@ -102,6 +102,33 @@ test.describe('my.linkeon.io smoke', () => {
     await expect(input).toBeVisible();
   });
 
+  test('offer banner: does not break chat; dismissable if shown', async ({ page }) => {
+    // Eligibility зависит от данных (≥15 сообщений + не платил + не в cooldown),
+    // поэтому толерантно: чат-инпут обязан рендериться (значит OfferBanner не
+    // ломает чат); если баннер показан — «×» его убирает.
+    const { access, refresh } = await getJwt();
+    const userData = { phone: TEST_PHONE };
+    const assistant = { id: 12, name: 'Роман', description: 'Помогаю делать все' };
+    await page.addInitScript(([a, r, u, s]) => {
+      localStorage.setItem('jwt_access_token', a);
+      localStorage.setItem('jwt_refresh_token', r);
+      localStorage.setItem('authToken', a);
+      localStorage.setItem('userData', u);
+      sessionStorage.setItem('selected_assistant', s);
+    }, [access, refresh, JSON.stringify(userData), JSON.stringify(assistant)]);
+    await page.goto('/chat', { waitUntil: 'domcontentloaded' });
+
+    const input = page.locator('textarea, input[type="text"]').first();
+    await input.waitFor({ state: 'visible', timeout: 20000 });
+    await expect(input).toBeVisible();
+
+    const banner = page.getByTestId('offer-banner');
+    if (await banner.isVisible().catch(() => false)) {
+      await page.getByTestId('offer-dismiss').click();
+      await expect(banner).toBeHidden({ timeout: 5000 });
+    }
+  });
+
   test('per-tab independence: two contexts hold different assistants', async ({ browser }) => {
     // Open two isolated browser contexts (= two browser windows with separate sessionStorage).
     // httpCredentials НЕ пробрасывается из playwright.config.use в browser.newContext() —
