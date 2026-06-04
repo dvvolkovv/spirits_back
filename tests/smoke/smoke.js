@@ -309,6 +309,12 @@ async function step(name, fn) {
     if (r.status === 501) {
       return { skipped: true, reason: r.data?.error || 'imagegen not configured on this server' };
     }
+    // 400 «недостаточно токенов» = у smoke-аккаунта кончился баланс (картинка
+    // стоит 5000/прогон, каждый деплой дренит). Это состояние БАЛАНСА окружения,
+    // не регрессия кода — SKIP с предупреждением (пополнить аккаунт), не fail.
+    if (r.status === 400 && /insufficient|недостаточно/i.test(JSON.stringify(r.data || ''))) {
+      return { skipped: true, reason: 'у smoke-аккаунта кончились токены — пополните баланс тест-аккаунта; деплой не блокируется' };
+    }
     // 5xx from the generate call = upstream Imagen/Gemini unavailable or quota
     // (429/500/503). External — SKIP, don't roll back our deploy. Our own infra
     // (MinIO ACL / Nginx routing) is still validated by the public-fetch step
