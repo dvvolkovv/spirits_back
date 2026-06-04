@@ -25,6 +25,11 @@
 #   NO_ROLLBACK=1      — отключить авто-rollback на проде при smoke failure
 #                        (по умолчанию: если PHASE 2 smoke красный — откат
 #                         back+front к pre-deploy SHA, restart сервисов)
+#   SMOKE_ATTEMPTS=N   — сколько раз прогнать smoke прежде чем считать фазу
+#                        красной (default 2). Первый прогон ещё и прогревает
+#                        холодные пути; откат только если ВСЕ попытки красные.
+#                        Anti-flake: одиночный флейк больше не валит хороший
+#                        деплой ложным откатом.
 #
 # Прод-настройки (можно переопределить через env):
 #   PROD_HOST          dvolkov@212.113.106.202
@@ -64,7 +69,23 @@ red()   { printf "\033[31m%s\033[0m\n" "$1"; }
 # PATH_EXPORT may contain a glob (e.g. .nvm/versions/node/v22*/bin) — use
 # $(echo ...) on the remote to expand it before adding to PATH.
 ssh_remote() {
-  ssh -o StrictHostKeyChecking=accept-new "$HOST" "export PATH=\$(echo $PATH_EXPORT):\$HOME/.npm-global/bin:\$PATH; $*"
+  # Retry on transient SSH connection failures (exit 255: "Connection reset by
+  # peer" / "kex_exchange_identification"), which have aborted both deploys and
+  # — worse — rollbacks mid-run. The remote commands we run are idempotent
+  # (git reset --hard, npm ci, build, rsync, pm2 restart), so re-running after a
+  # dropped connection is safe. A non-255 exit (the remote command's own status)
+  # is returned immediately and never retried. Warnings go to stderr so callers
+  # that capture stdout (e.g. SHA capture) aren't polluted.
+  local attempt rc
+  for attempt in 1 2 3; do
+    ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o ServerAliveInterval=15 \
+        "$HOST" "export PATH=\$(echo $PATH_EXPORT):\$HOME/.npm-global/bin:\$PATH; $*"
+    rc=$?
+    [[ $rc -ne 255 ]] && return $rc
+    echo "  ! ssh to ${ENV_NAME:-remote} dropped (transient, code 255) — retry $attempt/3" >&2
+    sleep $((attempt * 3))
+  done
+  return 255
 }
 
 push_local_repo() {
@@ -290,10 +311,29 @@ run_phase() {
     sync_test_basic_auth
     bold "=== SMOKE ($ENV_NAME) ==="
     cd "$LOCAL_BACK_DIR/tests"
-    if BASE_URL="$BASE_URL" BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" PG_DSN="$PG_DSN" bash smoke/run.sh; then
-      green "  ✓ SMOKE GREEN ($ENV_NAME)"
+    # Smoke can flake on transient cold paths right after a restart (LLM /
+    # r.linkeon.io latency, Neo4j driver reconnect → "Failed to fetch"/timeout).
+    # A single flaky run used to trigger a FALSE rollback of a good deploy,
+    # which is why these tests stopped being trustworthy. Run up to
+    # SMOKE_ATTEMPTS times (default 2): the first run also warms the app, so a
+    # transient flake clears on the next attempt. Roll back ONLY when EVERY
+    # attempt is red — that is a real, reproducible regression.
+    local max_attempts="${SMOKE_ATTEMPTS:-2}"
+    local smoke_ok=0 attempt
+    for attempt in $(seq 1 "$max_attempts"); do
+      if [[ $attempt -gt 1 ]]; then
+        bold "  ↻ smoke flaked — retry $attempt/$max_attempts ($ENV_NAME); the app is now warm from attempt $((attempt-1))"
+        sleep 5
+      fi
+      if BASE_URL="$BASE_URL" BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" PG_DSN="$PG_DSN" bash smoke/run.sh; then
+        smoke_ok=1; break
+      fi
+    done
+    if [[ $smoke_ok -eq 1 ]]; then
+      if [[ $attempt -gt 1 ]]; then green "  ✓ SMOKE GREEN ($ENV_NAME) — passed on attempt $attempt (attempt 1 was a flake)"
+      else green "  ✓ SMOKE GREEN ($ENV_NAME)"; fi
     else
-      red "  ✗ SMOKE FAILED ($ENV_NAME)"
+      red "  ✗ SMOKE FAILED ($ENV_NAME) — red on all $max_attempts attempts (real regression, not a flake)"
       if [[ "$phase" == "prod" && -z "${NO_ROLLBACK:-}" && -z "${SMOKE_ONLY:-}" ]]; then
         rollback_phase || red "  ✗ rollback had partial failures — check $ENV_NAME manually"
       fi

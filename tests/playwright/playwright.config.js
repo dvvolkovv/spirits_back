@@ -7,7 +7,12 @@ module.exports = defineConfig({
   timeout: 90000,
   expect: { timeout: 15000 },
   fullyParallel: false,        // smoke is sequential, cleaner output
-  retries: 1,
+  // 2 retries: browser smoke runs right after a deploy when cold paths
+  // (LLM / r.linkeon.io / Neo4j reconnect) can throw a one-off "Failed to
+  // fetch". Per-test retry clears those without failing the whole smoke (which
+  // would falsely roll back a good deploy). The deploy script adds a second
+  // outer retry on top of this for the non-browser layers.
+  retries: 2,
   workers: 1,
   reporter: [['list']],
   use: {

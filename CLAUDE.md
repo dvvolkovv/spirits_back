@@ -209,6 +209,23 @@ bash ~/Downloads/spirits_back/tests/smoke/run.sh api     # 9 API+DB (Node)
 bash ~/Downloads/spirits_back/tests/smoke/run.sh browser # 3 Playwright
 ```
 
+#### Анти-флейк (доверяй результату, не перепроверяй вручную)
+
+Smoke бьёт по холодным путям сразу после рестарта (LLM / r.linkeon.io / Neo4j
+reconnect), поэтому одиночный прогон иногда даёт ложный «Failed to fetch». Чтобы
+флейк **не валил хороший деплой ложным откатом**, в `deploy.sh` встроены три уровня:
+
+1. **Smoke-ретрай** (`SMOKE_ATTEMPTS`, default 2): фаза считается красной, только
+   если **все** попытки красные. Первый прогон ещё и прогревает приложение, так
+   что транзиентный флейк проходит со второй попытки. Откат на проде — лишь при
+   стабильно красном (реальная регрессия).
+2. **Playwright `retries: 2`**: браузерные one-off ошибки авто-ретраятся внутри прогона.
+3. **`ssh_remote` ретрай транзиентного SSH (код 255)**: `Connection reset` /
+   `kex_exchange_identification` больше не обрывают деплой и откат на середине.
+
+Вывод: **зелёный `ALL PHASES GREEN` достоверен — ручная перепроверка не нужна.**
+Если smoke красный после всех попыток — это настоящая регрессия, не флейк.
+
 **Слой 1 — Jest unit** ([tests/unit/extractJsonObject.test.js](tests/unit/extractJsonObject.test.js))
 Пинит толерантный JSON-парсер для `Neo4jService.consolidateFromChat` — 12 кейсов: markdown-fences, прозa до/после, вложенные `{}`, эскейпы, регрессия на «position 105».
 
