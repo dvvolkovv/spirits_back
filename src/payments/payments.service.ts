@@ -2,6 +2,7 @@ import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { ReferralService } from '../referral/referral.service';
 import { EventsService } from '../events/events.service';
+import { creditWithBonus, OFFER_MSG_THRESHOLD } from '../offer/offer-bonus';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -92,14 +93,36 @@ export class PaymentsService {
     );
     const tokensToAdd = Number(paymentRow.rows[0]?.tokens || 0);
 
+    // Оффер вовлечённому неплатящему: +50% к ПЕРВОЙ оплате. Считаем ДО пометки
+    // succeeded, чтобы prior-count был корректен. Бонус строго server-side —
+    // от клиента не зависит (накрутки нет). Идемпотентность — гардом выше.
+    const priorPaid = await this.pg.query(
+      `SELECT count(*)::int AS n FROM payments WHERE user_id = $1 AND status = 'succeeded'`,
+      [userId],
+    );
+    const firstPayment = (priorPaid.rows[0]?.n ?? 0) === 0;
+    const msgCnt = await this.pg.query(
+      `SELECT count(*)::int AS n FROM custom_chat_history
+       WHERE sender_type = 'human' AND (session_id = $1 OR session_id LIKE $1 || '\\_%')`,
+      [userId],
+    );
+    const engaged = (msgCnt.rows[0]?.n ?? 0) >= OFFER_MSG_THRESHOLD;
+    const credit = creditWithBonus(tokensToAdd, firstPayment, engaged);
+
     await this.pg.query(
       'UPDATE payments SET status = $1, completed_at = now(), updated_at = now() WHERE payment_id = $2',
       ['succeeded', paymentId],
     );
     await this.pg.query(
       'UPDATE ai_profiles_consolidated SET tokens = tokens + $1, updated_at = now() WHERE user_id = $2',
-      [tokensToAdd, userId],
+      [credit, userId],
     );
+    if (credit > tokensToAdd) {
+      this.events?.track('offer_converted', {
+        userId,
+        props: { base: tokensToAdd, bonus: credit - tokensToAdd, payment_id: paymentId },
+      });
+    }
 
     // Process referral commission
     if (this.referralService) {

@@ -172,6 +172,22 @@ async function step(name, fn) {
     return 'onboarded boolean + complete OK';
   });
 
+  // -- 6c. Offer: status shape + dismiss ----------------------------------
+  await step('offer status shape + dismiss', async () => {
+    if (!jwt) throw new Error('no JWT');
+    const s = await axios.get(`${BASE_URL}/webhook/offer/status`, {
+      headers: { Authorization: `Bearer ${jwt}` }, timeout: 10000,
+    });
+    if (typeof s.data?.eligible !== 'boolean' || s.data?.bonus_pct !== 50 || typeof s.data?.message_count !== 'number') {
+      throw new Error(`bad offer/status shape: ${JSON.stringify(s.data)}`);
+    }
+    const d = await axios.post(`${BASE_URL}/webhook/offer/dismiss`, {}, {
+      headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' }, timeout: 10000,
+    });
+    if (d.data?.ok !== true) throw new Error('dismiss did not return ok');
+    return `eligible=${s.data.eligible} msgs=${s.data.message_count}`;
+  });
+
   // -- 7. Tokens balance --------------------------------------------------
   await step('GET /webhook/user/tokens returns numeric balance', async () => {
     if (!jwt) throw new Error('no JWT');

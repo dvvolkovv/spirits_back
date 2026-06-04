@@ -27,6 +27,7 @@ import { MonitoringModule } from './monitoring/monitoring.module';
 import { EventsModule } from './events/events.module';
 import { BacklogModule } from './backlog/backlog.module';
 import { VpmModule } from './vpm/vpm.module';
+import { OfferModule } from './offer/offer.module';
 
 @Module({
   imports: [
@@ -58,6 +59,7 @@ import { VpmModule } from './vpm/vpm.module';
     MonitoringModule,
     BacklogModule,
     VpmModule,
+    OfferModule,
   ],
 })
 export class AppModule {}
