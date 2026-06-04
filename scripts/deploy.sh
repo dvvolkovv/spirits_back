@@ -323,7 +323,10 @@ run_phase() {
     for attempt in $(seq 1 "$max_attempts"); do
       if [[ $attempt -gt 1 ]]; then
         bold "  ↻ smoke flaked — retry $attempt/$max_attempts ($ENV_NAME); the app is now warm from attempt $((attempt-1))"
-        sleep 5
+        # 20s gap (not 5): transient infra/network blips (slow page.goto, upstream
+        # 4xx/5xx, test-server hiccup) often last 10–20s — a too-tight retry lands
+        # inside the same blip and false-fails. SMOKE_RETRY_GAP overrides.
+        sleep "${SMOKE_RETRY_GAP:-20}"
       fi
       if BASE_URL="$BASE_URL" BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" PG_DSN="$PG_DSN" bash smoke/run.sh; then
         smoke_ok=1; break
