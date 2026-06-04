@@ -245,6 +245,7 @@ export class AdminService {
                 max(created_at) AS last_at
            FROM custom_chat_history
           WHERE sender_type='human'
+            AND split_part(session_id,'_',1) ~ '^7[0-9]{10}$'   -- только валидные RU-номера (session_id бывает с UUID/'dozvon'-префиксом — им SMS не шлём)
             AND split_part(session_id,'_',1) <> ALL($1)
             AND split_part(session_id,'_',1) !~ $2
           GROUP BY 1,2
