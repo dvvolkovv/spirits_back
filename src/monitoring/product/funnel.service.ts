@@ -187,11 +187,8 @@ export class FunnelService {
   ];
 
   async getFunnel(fromIso: string, toIso: string, source: string | null): Promise<FunnelResponse> {
-    const results: FunnelStep[] = [];
-    let cohort: Set<string> | null = null;   // накопительная когорта user-шагов
-    let firstUserCount = 0;
-    let prevUserCount: number | null = null;
-
+    // 1. Сырые множества идентификаторов по каждому шагу (юзеры/сессии).
+    const raw: Array<{ step: StepDef; ids: Set<string> }> = [];
     for (const step of this.steps) {
       const { sql, params } = step.query(fromIso, toIso, source, effectiveExcluded);
       let ids: string[] = [];
@@ -201,28 +198,46 @@ export class FunnelService {
       } catch (e: any) {
         this.log.error(`funnel step ${step.key} failed: ${e.message}`);
       }
+      raw.push({ step, ids: new Set(ids) });
+    }
 
+    // 2. ОБРАТНОЕ накопительное объединение для user-шагов: когорта шага =
+    //    объединение этого и всех последующих шагов (достиг позднего шага →
+    //    прошёл и этот). Гарантирует монотонность «от большего к меньшему» И
+    //    устойчиво к недо-инструментированным верхним событиям (напр. юзер
+    //    написал, но его auth_succeeded не записан — он всё равно попадёт в
+    //    «Залогинился»).
+    const cohortSize: number[] = new Array(raw.length).fill(0);
+    let acc = new Set<string>();
+    for (let i = raw.length - 1; i >= 0; i--) {
+      if (raw[i].step.identity !== 'user') continue;
+      for (const u of raw[i].ids) acc.add(u);
+      cohortSize[i] = acc.size;
+    }
+
+    // 3. Собираем шаги с процентами.
+    const results: FunnelStep[] = [];
+    let firstUserCount = 0;
+    let firstSeen = false;
+    let prevUserCount: number | null = null;
+    for (let i = 0; i < raw.length; i++) {
+      const step = raw[i].step;
       let count: number;
       let ratioToFirst: number | null = null;
       let ratioToPrev: number | null = null;
 
       if (step.identity === 'session') {
-        // Верх воронки: отдельный тип счёта, в когорту не входит.
-        count = new Set(ids).size;
+        count = raw[i].ids.size; // верх воронки — отдельный тип счёта
       } else {
-        const stepUsers = new Set(ids);
-        if (cohort === null) {
-          // Первый user-шаг — знаменатель.
-          cohort = stepUsers;
-          firstUserCount = cohort.size;
-          ratioToFirst = firstUserCount > 0 ? 100 : null;
+        count = cohortSize[i];
+        if (!firstSeen) {
+          firstSeen = true;
+          firstUserCount = count;
+          ratioToFirst = count > 0 ? 100 : null;
         } else {
-          // Подмножество предыдущей когорты → монотонно не возрастает.
-          cohort = new Set([...cohort].filter((u) => stepUsers.has(u)));
-          ratioToFirst = firstUserCount > 0 ? (cohort.size / firstUserCount) * 100 : null;
-          ratioToPrev = prevUserCount && prevUserCount > 0 ? (cohort.size / prevUserCount) * 100 : null;
+          ratioToFirst = firstUserCount > 0 ? (count / firstUserCount) * 100 : null;
+          ratioToPrev = prevUserCount && prevUserCount > 0 ? (count / prevUserCount) * 100 : null;
         }
-        count = cohort.size;
         prevUserCount = count;
       }
 
