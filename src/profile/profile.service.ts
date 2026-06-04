@@ -1,13 +1,40 @@
-import { Injectable, Optional } from '@nestjs/common';
+import { Injectable, Logger, Optional, OnModuleInit } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
+import * as fs from 'fs';
+import * as path from 'path';
 
 @Injectable()
-export class ProfileService {
+export class ProfileService implements OnModuleInit {
+  private readonly logger = new Logger(ProfileService.name);
+
   constructor(
     private readonly pg: PgService,
     @Optional() private readonly neo4j?: Neo4jService,
   ) {}
+
+  // Применяем миграции профиля при старте (как BacklogService) — глобального
+  // раннера нет, каждый модуль накатывает свои .sql сам. Так pm2 restart на
+  // деплое добавит колонку onboarded + бэкфилл до прогона smoke.
+  async onModuleInit() {
+    for (const file of ['001_onboarded_flag.sql']) {
+      const candidates = [
+        path.join(__dirname, 'migrations', file),
+        path.join(__dirname, '..', '..', 'src', 'profile', 'migrations', file),
+      ];
+      for (const p of candidates) {
+        try {
+          if (fs.existsSync(p)) {
+            await this.pg.query(fs.readFileSync(p, 'utf8'));
+            this.logger.log(`profile migration ${file} applied from ${p}`);
+            break;
+          }
+        } catch (e: any) {
+          this.logger.error(`profile migration ${file} failed (${p}): ${e.message}`);
+        }
+      }
+    }
+  }
 
   async getProfile(userId: string) {
     const res = await this.pg.query(
