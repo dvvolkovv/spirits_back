@@ -73,6 +73,35 @@ test.describe('my.linkeon.io smoke', () => {
     await expect(input).toBeVisible();
   });
 
+  test('onboarding match: reopen → pick theme → lands in chat', async ({ page }) => {
+    // Flag-independent: открываем match-экран всегда-доступной кнопкой
+    // «Подобрать специалиста» (работает и для уже onboarded-пользователей).
+    const { access, refresh } = await getJwt();
+    const userData = { phone: TEST_PHONE };
+    const assistant = { id: 12, name: 'Роман', description: 'Помогаю делать все' };
+    await page.addInitScript(([a, r, u, s]) => {
+      localStorage.setItem('jwt_access_token', a);
+      localStorage.setItem('jwt_refresh_token', r);
+      localStorage.setItem('authToken', a);
+      localStorage.setItem('userData', u);
+      sessionStorage.setItem('selected_assistant', s);
+    }, [access, refresh, JSON.stringify(userData), JSON.stringify(assistant)]);
+    await page.goto('/chat', { waitUntil: 'domcontentloaded' });
+
+    const reopen = page.getByTestId('reopen-match');
+    await reopen.waitFor({ state: 'visible', timeout: 20000 });
+    await reopen.click();
+
+    const themes = page.getByTestId('onboarding-theme');
+    await expect(themes.first()).toBeVisible({ timeout: 10000 });
+    await themes.first().click();
+
+    // вернулись в чат — поле ввода видно
+    const input = page.locator('textarea, input[type="text"]').first();
+    await input.waitFor({ state: 'visible', timeout: 20000 });
+    await expect(input).toBeVisible();
+  });
+
   test('per-tab independence: two contexts hold different assistants', async ({ browser }) => {
     // Open two isolated browser contexts (= two browser windows with separate sessionStorage).
     // httpCredentials НЕ пробрасывается из playwright.config.use в browser.newContext() —
