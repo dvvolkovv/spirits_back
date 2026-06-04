@@ -238,6 +238,31 @@ async function step(name, fn) {
     return `activation drafts=${prev.data.count}, gated OK, retention(2d)=${ret.data.count}`;
   });
 
+  // -- 6f. Funnel: monotonic user-steps + full test exclusion (f084b02a) ---
+  await step('funnel monotonic + excludes test users', async () => {
+    const ADM = '79030169187';
+    await axios.get(`${BASE_URL}/webhook/898c938d-f094-455c-86af-969617e62f7a/sms/${ADM}`, { timeout: 8000 });
+    const codeRes = await axios.get(`${BASE_URL}/webhook/debug/sms-code/${ADM}`, { timeout: 5000 });
+    const loginRes = await axios.get(`${BASE_URL}/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/${ADM}/${codeRes.data.code}`, { timeout: 8000 });
+    const ajwt = loginRes.data['access-token'];
+    const to = new Date(); const from = new Date(to.getTime() - 30 * 864e5);
+    const r = await axios.get(`${BASE_URL}/webhook/admin/monitoring/funnel?from=${from.toISOString()}&to=${to.toISOString()}`,
+      { headers: { Authorization: `Bearer ${ajwt}` }, timeout: 12000 });
+    if (r.status !== 200 || !Array.isArray(r.data?.steps)) throw new Error('funnel shape');
+    // тестовый дев-номер должен быть в исключениях
+    if (!r.data.excludedUsers.includes('79656445804')) throw new Error('funnel does not exclude 79656445804');
+    // user-шаги монотонно не возрастают (истинная воронка)
+    const userSteps = r.data.steps.filter((s) => s.identity === 'user');
+    for (let i = 1; i < userSteps.length; i++) {
+      if (userSteps[i].count > userSteps[i - 1].count) {
+        throw new Error(`funnel not monotonic: ${userSteps[i - 1].key}=${userSteps[i - 1].count} → ${userSteps[i].key}=${userSteps[i].count}`);
+      }
+    }
+    // каждый шаг должен иметь i-подсказку
+    if (!r.data.steps.every((s) => typeof s.hint === 'string' && s.hint.length > 0)) throw new Error('funnel steps missing hints');
+    return `funnel OK: ${userSteps.length} user-steps monotonic, hints present`;
+  });
+
   // -- 7. Tokens balance --------------------------------------------------
   await step('GET /webhook/user/tokens returns numeric balance', async () => {
     if (!jwt) throw new Error('no JWT');
