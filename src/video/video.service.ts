@@ -905,8 +905,23 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     if (mode !== 'text2video' && mode !== 'image2video') {
       throw new BadRequestException('Veo supports mode text2video or image2video');
     }
-    const prompt = String(dto.prompt ?? '').trim();
+    let prompt = String(dto.prompt ?? '').trim();
     if (!prompt) throw new BadRequestException('Veo requires a prompt');
+
+    // Нормализация промпта (баг владельца 2026-06-05): ассистент иногда шлёт в
+    // Veo ТОЛЬКО реплику (голый сценарий без сцены/«говорит в камеру»/субтитров).
+    // Из «фото + голая речь» Veo делает вырожденную базу, и extend на ней падает
+    // с "internal server issue". Если в промпте нет визуального обрамления —
+    // оборачиваем речь в talking-head шаблон (речь в кавычках), тогда сегментер
+    // корректно распределит реплику и сохранит сцену+субтитры в каждом сегменте.
+    const SCENE_RE = /camera|кадр|\bscene\b|сцен|background|\bфон\b|wearing|\bодет|lighting|освещ|portrait|talking|\bspeaks?\b|в камеру|\bvideo\b|\bвидео\b|\bsuit\b|костюм|office|офис|9:16|16:9|subtitle|субтитр|vertical|вертикал|\bshot\b|says:|говорит/i;
+    if (!SCENE_RE.test(prompt)) {
+      const who = dto.mode === 'image2video'
+        ? 'The person from the reference photo'
+        : 'A confident professional in their 40s';
+      prompt = `Talking-head business video-card. ${who} looks directly into the camera in a clean modern office with soft cinematic lighting and shallow depth of field, natural perfectly lip-synced speech, calm confident tone, slight smile. He speaks in his native language and says: "${prompt}" Burned-in subtitles at the bottom of the frame, in sync with the speech.`;
+      this.logger.log('Veo prompt normalized (bare speech → talking-head frame)');
+    }
 
     const target = Math.round(dto.targetDurationSec ?? dto.duration ?? 8);
     if (target < 4 || target > 60) throw new BadRequestException('Veo length must be 4–60 seconds');
