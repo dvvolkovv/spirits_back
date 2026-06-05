@@ -188,6 +188,22 @@ async function step(name, fn) {
     return `eligible=${s.data.eligible} msgs=${s.data.message_count}`;
   });
 
+  // -- 6c2. Video asset upload → MinIO (раньше падало 500 на пустых AWS_*) ----
+  await step('video image upload stores to MinIO + served', async () => {
+    if (!jwt) throw new Error('no JWT');
+    const FormData = require('form-data');
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+    const fd = new FormData();
+    fd.append('file', png, { filename: 'px.png', contentType: 'image/png' });
+    const r = await axios.post(`${BASE_URL}/webhook/video/upload-image`, fd, {
+      headers: { Authorization: `Bearer ${jwt}`, ...fd.getHeaders() }, timeout: 15000,
+    });
+    if (r.status !== 200 || !r.data?.url) throw new Error(`upload bad resp: ${r.status} ${JSON.stringify(r.data).slice(0, 150)}`);
+    const got = await axios.get(r.data.url, { responseType: 'arraybuffer', timeout: 15000, validateStatus: () => true });
+    if (got.status !== 200) throw new Error(`uploaded url not served (${got.status}): ${r.data.url}`);
+    return `uploaded+served ${r.data.url.replace(/^https?:\/\/[^/]+/, '')}`;
+  });
+
   // -- 6d. Admin management stats endpoints respond (SQL-регрессия) --------
   // Бьём по 6 агрегатам «управления» (исключают тестовых) — битый SQL даст 500.
   // Нужен admin-JWT: 79030169187 (isadmin, в whitelist debug-OTP).

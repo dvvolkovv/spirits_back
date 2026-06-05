@@ -33,24 +33,26 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(VideoService.name);
   private readonly MAX_CONCURRENT_PER_USER = 3;
 
+  // Хранилище ассетов видео — СВОЙ MinIO (не Yandex S3). Раньше клиент смотрел
+  // на storage.yandexcloud.net с пустыми AWS_* → загрузка фото падала с
+  // "X-Amz-Credential malformed" (500 → фронт "upload failed"). MinIO S3-
+  // совместим: тот же S3Client с endpoint/кредами MinIO и path-style. Готовое
+  // видео отдаётся отдельно из локального /static/videos; здесь — загруженные
+  // пользователем фото/аудио, авто-стиллы, превью, rehost.
   private s3 = new S3Client({
-    region: process.env.AWS_REGION ?? 'ru-central1',
-    endpoint: process.env.AWS_ENDPOINT ?? 'https://storage.yandexcloud.net',
-    forcePathStyle: process.env.AWS_FORCE_PATH_STYLE === 'true',
+    region: 'us-east-1', // MinIO игнорирует регион, но SDK его требует
+    endpoint: process.env.MINIO_ENDPOINT ?? 'http://127.0.0.1:9000',
+    forcePathStyle: true,
     credentials: {
-      accessKeyId: process.env.AWS_ACCESS_KEY_ID ?? '',
-      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? '',
+      accessKeyId: process.env.MINIO_ACCESS_KEY ?? '',
+      secretAccessKey: process.env.MINIO_SECRET_KEY ?? '',
     },
   });
-  private readonly s3Bucket = process.env.AWS_S3_BUCKET || 'linkeon.io';
+  private readonly s3Bucket = process.env.MINIO_BUCKET_VIDEOS || 'linkeon-smm-videos';
 
   private s3PublicUrl(key: string): string {
-    const endpoint = (process.env.AWS_ENDPOINT ?? 'https://storage.yandexcloud.net').replace(/\/$/, '');
-    if (process.env.AWS_FORCE_PATH_STYLE === 'true') {
-      return `${endpoint}/${this.s3Bucket}/${key}`;
-    }
-    const host = endpoint.replace(/^https?:\/\//, '');
-    return `https://${this.s3Bucket}.${host}/${key}`;
+    const base = (process.env.MINIO_PUBLIC_URL ?? 'https://my.linkeon.io/smm-media').replace(/\/$/, '');
+    return `${base}/${this.s3Bucket}/${key}`;
   }
 
   constructor(
