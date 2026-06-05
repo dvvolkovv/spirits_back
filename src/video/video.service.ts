@@ -994,6 +994,43 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   }
 
   private readonly MAX_VEO_EXTEND_ATTEMPTS = 6;
+  // Сколько раз переотправлять сегмент при ТРАНЗИЕНТНОЙ ошибке рендера Veo
+  // ("internal server issue"/5xx). Google такие просит повторить.
+  private readonly MAX_VEO_OP_RETRIES = 3;
+
+  // Переотправка текущего сегмента после транзиентной ошибки операции Veo.
+  // База (segments_done=0) — заново startGenerate (фото из source_image_url +
+  // prompt[0]); extend — очищаем in-flight op, Phase 2 пере-extend'ит от
+  // veo_last_uri (с проверкой ACTIVE) на следующем тике.
+  private async restartVeoSegment(job: VideoJobRow, plan: ComposedPlan): Promise<void> {
+    const tier = plan.veo_tier || veoTier(job.model);
+    try {
+      if (plan.segments_done === 0) {
+        let imageB64: string | undefined; let imageMime: string | undefined;
+        if (job.source_image_url) {
+          const p = await this.fetchPortraitB64(job.source_image_url);
+          if (p) { imageB64 = p.b64; imageMime = p.mime; }
+        }
+        const op = await this.veo.startGenerate({
+          prompt: plan.veo_segment_prompts?.[0] ?? job.prompt ?? '', tier, durationSeconds: 8,
+          aspectRatio: '16:9', resolution: '720p', imageB64, imageMime,
+          negativePrompt: job.negative_prompt ?? undefined,
+        });
+        await this.pg.query(
+          `UPDATE video_jobs SET kling_task_id=$1, composed_plan=$2, updated_at=now() WHERE id=$3`,
+          [op, JSON.stringify(plan), job.id],
+        );
+      } else {
+        // extend: сбрасываем in-flight op → Phase 2 пере-extend'ит на след. тике.
+        await this.pg.query(
+          `UPDATE video_jobs SET kling_task_id=NULL, composed_plan=$1, updated_at=now() WHERE id=$2`,
+          [JSON.stringify(plan), job.id],
+        );
+      }
+    } catch (e: any) {
+      await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo_retry: ${String(e.message).slice(0, 200)}`);
+    }
+  }
 
   private async pollVeoJob(job: VideoJobRow) {
     const plan = job.composed_plan;
@@ -1005,7 +1042,20 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       const st = await this.veo.getOperation(job.kling_task_id);
       if (!st.done) return;
       if (st.error || !st.videoUri) {
-        await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo: ${st.error ?? 'no video'}`);
+        const err = st.error ?? 'no video';
+        // Транзиентная ошибка рендеринга Google: операция принята (generate/
+        // extend вернули ok), но рендер упал с "internal server issue"/5xx и
+        // Google просит повторить. Переотправляем ТОТ ЖЕ сегмент, а не валим всю
+        // задачу. Не-транзиентные (RAI-контент-фильтр, квота, "no video") — fail.
+        const transient = st.error && /internal server|try again|temporarily|unavailable|backend error|please retry|deadline exceeded|\b50[0-3]\b/i.test(err);
+        const retries = (plan.veo_op_retries ?? 0) + 1;
+        if (transient && retries <= this.MAX_VEO_OP_RETRIES) {
+          plan.veo_op_retries = retries;
+          this.logger.warn(`Veo job ${job.id}: segment ${plan.segments_done + 1} transient op error (retry ${retries}/${this.MAX_VEO_OP_RETRIES}): ${err.slice(0, 120)}`);
+          await this.restartVeoSegment(job, plan);
+          return;
+        }
+        await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo: ${err}`);
         return;
       }
       // Segment finished. Veo's extend output is the FULL cumulative video, so
@@ -1013,6 +1063,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       plan.segments_done += 1;
       plan.veo_last_uri = st.videoUri;
       plan.current_segment_attempt = 0;
+      plan.veo_op_retries = 0;
 
       if (plan.segments_done >= plan.segments_total) {
         // Final segment — download, trim to exact target, store, mark ready.

@@ -79,6 +79,11 @@ export interface ComposedPlan {
   // time a segment finishes successfully; bumped when we re-submit after
   // a transient Kling error (e.g. "Internal error"). Capped server-side.
   current_segment_attempt?: number;
+  // Retry counter for TRANSIENT Veo operation-result errors (operation accepted
+  // ok, но рендеринг упал с "internal server issue" / 500 — Google просит
+  // повторить). Отдельный от current_segment_attempt, т.к. тот сбрасывается при
+  // старте extend в Phase 2 и не накапливался бы. Сбрасывается при успехе сегмента.
+  veo_op_retries?: number;
   // ISO timestamp set when concat starts. Used as an optimistic lock so a
   // concurrent poller tick can't enter composeFinalVideo for the same job.
   concat_started_at?: string;
