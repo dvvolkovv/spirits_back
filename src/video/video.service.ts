@@ -13,7 +13,7 @@ import {
   VideoMode, VideoModel, VideoQuality,
   isVeoModel, veoTier, computeVeoQuote,
 } from './video.dto';
-import { S3Client, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, DeleteObjectCommand, CreateBucketCommand, PutBucketPolicyCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import axios from 'axios';
 import { spawn } from 'child_process';
@@ -53,6 +53,30 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   private s3PublicUrl(key: string): string {
     const base = (process.env.MINIO_PUBLIC_URL ?? 'https://my.linkeon.io/smm-media').replace(/\/$/, '');
     return `${base}/${this.s3Bucket}/${key}`;
+  }
+
+  // Самопровизионинг бакета: на проде linkeon-smm-videos уже есть (SMM), но на
+  // test/новом окружении его нет (NoSuchBucket → 500). Создаём при первой
+  // загрузке; ТОЛЬКО для созданного нами ставим public-read (существующий
+  // прод-бакет с его политикой не трогаем).
+  private bucketReady = false;
+  private async ensureBucket(): Promise<void> {
+    if (this.bucketReady) return;
+    try {
+      await this.s3.send(new CreateBucketCommand({ Bucket: this.s3Bucket }));
+      await this.s3.send(new PutBucketPolicyCommand({
+        Bucket: this.s3Bucket,
+        Policy: JSON.stringify({
+          Version: '2012-10-17',
+          Statement: [{ Effect: 'Allow', Principal: '*', Action: ['s3:GetObject'], Resource: [`arn:aws:s3:::${this.s3Bucket}/*`] }],
+        }),
+      }));
+      this.logger.log(`Created MinIO bucket ${this.s3Bucket} (public-read)`);
+    } catch (e: any) {
+      const code = e?.name || e?.Code || '';
+      if (!/BucketAlready/i.test(code)) this.logger.warn(`ensureBucket(${this.s3Bucket}): ${e.message}`);
+    }
+    this.bucketReady = true;
   }
 
   constructor(
@@ -749,6 +773,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     const extMatch = origName.match(/\.([a-z0-9]{2,5})$/i);
     const ext = extMatch ? extMatch[1].toLowerCase() : kind === 'image' ? 'jpg' : 'mp3';
     const key = `video-uploads/${userId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    await this.ensureBucket();
     await this.s3.send(new PutObjectCommand({
       Bucket: this.s3Bucket,
       Key: key,
