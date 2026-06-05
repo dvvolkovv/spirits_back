@@ -908,6 +908,15 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     let prompt = String(dto.prompt ?? '').trim();
     if (!prompt) throw new BadRequestException('Veo requires a prompt');
 
+    // A (фидбэк katya): формат и разрешение Veo вместо захардкоженных 16:9/720p.
+    // Формат — из dto, иначе авто-детект «вертикальное/reels» из исходного
+    // промпта, иначе 16:9. Разрешение — из dto, иначе 1080p (детализация кожи;
+    // 720p выглядел «пластиково»). Детектим ДО нормализации — по словам юзера.
+    const aspectRatio: '16:9' | '9:16' = dto.aspectRatio === '9:16' || dto.aspectRatio === '16:9'
+      ? dto.aspectRatio
+      : (/вертикал|vertical|\breels\b|рилс|9:16|сторис|stories|tiktok|тикток|shorts|шортс/i.test(prompt) ? '9:16' : '16:9');
+    const resolution: '720p' | '1080p' = dto.resolution === '720p' ? '720p' : '1080p';
+
     // Нормализация промпта (баг владельца 2026-06-05): ассистент иногда шлёт в
     // Veo ТОЛЬКО реплику (голый сценарий без сцены/«говорит в камеру»/субтитров).
     // Из «фото + голая речь» Veo делает вырожденную базу, и extend на ней падает
@@ -954,6 +963,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       segment_video_urls: [],
       provider: 'veo',
       veo_tier: quote.tier,
+      veo_aspect_ratio: aspectRatio,
+      veo_resolution: resolution,
+      veo_reference_images: imgUrlAbsolute ? [imgUrlAbsolute] : [],
       veo_last_uri: null,
       veo_segment_prompts: segmentPrompts,
     };
@@ -982,16 +994,18 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     }
 
     try {
-      let imageB64: string | undefined; let imageMime: string | undefined;
+      // B: портрет идёт как referenceImages (Ingredients) — идентичность по всему
+      // ролику, не только первый кадр (фидбэк katya «нет сходства»).
+      let refImages: Array<{ b64: string; mime: string }> | undefined;
       if (imgUrlAbsolute) {
         const p = await this.fetchPortraitB64(imgUrlAbsolute);
         if (!p) throw new Error('could not fetch portrait image');
-        imageB64 = p.b64; imageMime = p.mime;
+        refImages = [{ b64: p.b64, mime: p.mime }];
       }
       const operation = await this.veo.startGenerate({
         prompt: segmentPrompts[0] ?? prompt, tier: quote.tier, durationSeconds: 8,
-        aspectRatio: '16:9', resolution: '720p',
-        imageB64, imageMime, negativePrompt: dto.negativePrompt ?? undefined,
+        aspectRatio, resolution,
+        referenceImagesB64: refImages, negativePrompt: dto.negativePrompt ?? undefined,
       });
       await this.pg.query(
         `UPDATE video_jobs SET kling_task_id=$1, status='processing', updated_at=now() WHERE id=$2`,
@@ -1021,14 +1035,15 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     const tier = plan.veo_tier || veoTier(job.model);
     try {
       if (plan.segments_done === 0) {
-        let imageB64: string | undefined; let imageMime: string | undefined;
+        let refImages: Array<{ b64: string; mime: string }> | undefined;
         if (job.source_image_url) {
           const p = await this.fetchPortraitB64(job.source_image_url);
-          if (p) { imageB64 = p.b64; imageMime = p.mime; }
+          if (p) refImages = [{ b64: p.b64, mime: p.mime }];
         }
         const op = await this.veo.startGenerate({
           prompt: plan.veo_segment_prompts?.[0] ?? job.prompt ?? '', tier, durationSeconds: 8,
-          aspectRatio: '16:9', resolution: '720p', imageB64, imageMime,
+          aspectRatio: plan.veo_aspect_ratio ?? '16:9', resolution: plan.veo_resolution ?? '720p',
+          referenceImagesB64: refImages,
           negativePrompt: job.negative_prompt ?? undefined,
         });
         await this.pg.query(

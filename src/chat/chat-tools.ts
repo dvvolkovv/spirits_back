@@ -93,6 +93,16 @@ export const CHAT_TOOLS = [
           description: 'Final video length in seconds. Use when user wants > 10s; backend chains extends and concats. Only valid for text2video / image2video.',
         },
         sourceImageUrl: { type: 'string' },
+        aspectRatio: {
+          type: 'string',
+          enum: ['16:9', '9:16'],
+          description: 'Veo only. 9:16 — вертикаль для соцсетей/Reels/Shorts/Stories/TikTok; 16:9 — горизонталь. Если не задан, бэкенд авто-детектит вертикаль по словам в промпте. Спрашивай/ставь 9:16, когда пользователю нужно видео для телефона/соцсетей.',
+        },
+        resolution: {
+          type: 'string',
+          enum: ['720p', '1080p'],
+          description: 'Veo only. 1080p — выше детализация (кожа/поры), дефолт. 720p — быстрее/легче. Extend-сегменты всегда 720p (ограничение Veo), поэтому 1080p эффективнее на роликах ≤8с.',
+        },
         sourceVideoId: { type: 'string' },
         cameraType: {
           type: 'string',

@@ -99,12 +99,22 @@ export class VeoService {
     resolution?: '720p' | '1080p';
     imageB64?: string;
     imageMime?: string;
+    // referenceImages (Veo «Ingredients») — ведут идентичность персонажа по ВСЕМУ
+    // ролику, а не только в первом кадре. Для портрета это даёт лучшее сходство
+    // (фидбэк katya: с first-frame лица «не было совсем»). ВЗАИМОисключимо с image
+    // (API даёт 400, если передать оба) — поэтому при наличии reference не шлём image.
+    referenceImagesB64?: Array<{ b64: string; mime: string }>;
     negativePrompt?: string;
   }): Promise<string> {
     if (!this.apiKey) throw new Error('GOOGLE_AI_API_KEY not configured');
     const t0 = Date.now();
     const instance: any = { prompt: opts.prompt };
-    if (opts.imageB64) {
+    if (opts.referenceImagesB64?.length) {
+      instance.referenceImages = opts.referenceImagesB64.map((r) => ({
+        image: { bytesBase64Encoded: r.b64, mimeType: r.mime || 'image/jpeg' },
+        referenceType: 'asset',
+      }));
+    } else if (opts.imageB64) {
       // Veo image input is Imagen-style bytesBase64Encoded — NOT inlineData/uri
       // (both rejected by the model). Validated against the live API.
       instance.image = { bytesBase64Encoded: opts.imageB64, mimeType: opts.imageMime || 'image/jpeg' };

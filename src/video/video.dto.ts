@@ -41,6 +41,18 @@ export class CreateVideoJobDto {
   @IsOptional() @IsString()
   negativePrompt?: string;
 
+  // Veo: формат вывода. 9:16 для соцсетей/Reels (фидбэк katya — не было выбора,
+  // мы хардкодили 16:9). Если не задан — авто-детект «вертикальное/reels» из
+  // промпта, иначе 16:9.
+  @IsOptional() @IsIn(['16:9', '9:16'])
+  aspectRatio?: '16:9' | '9:16';
+
+  // Veo: разрешение базового сегмента. 1080p даёт детализацию (поры/кожа) —
+  // 720p выглядел «пластиково». Extend у Veo всегда 720p (ограничение API),
+  // поэтому 1080p эффективен на коротких (≤8с) роликах.
+  @IsOptional() @IsIn(['720p', '1080p'])
+  resolution?: '720p' | '1080p';
+
   @IsOptional() @IsNumber() @Min(0) @Max(1)
   cfgScale?: number;
 
@@ -69,6 +81,9 @@ export interface ComposedPlan {
   // --- Veo provider (native extend chain — one continuous video, no concat) ---
   provider?: 'kling' | 'veo';
   veo_tier?: 'fast' | 'standard';
+  veo_aspect_ratio?: '16:9' | '9:16';   // формат базы (extend наследует)
+  veo_resolution?: '720p' | '1080p';    // разрешение базы (extend всегда 720p)
+  veo_reference_images?: string[];       // URL референс-фото (Ingredients, B)
   veo_last_uri?: string | null;   // download uri of the latest (cumulative) clip
   // Per-segment prompts. The user's script/speech is distributed across the
   // segments so Veo speaks it ONCE end-to-end instead of repeating the full
