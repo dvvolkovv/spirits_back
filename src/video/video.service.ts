@@ -1136,7 +1136,10 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo: ${err}`);
         return;
       }
-      // --- Concat-режим (вертикаль): клип независимый, его и складываем ---
+      // --- Concat-режим (вертикаль): клип готов — скачиваем в part-файл,
+      // продвигаем счётчик и СНИМАЕМ in-flight op. Сама склейка (финализация)
+      // выполняется отдельным тиком под оптимистичным локом (см. ниже) — иначе
+      // два тика планировщика запускают два параллельных ffmpeg в один output.
       if (plan.veo_concat) {
         try {
           const buf = await this.veo.downloadVideo(st.videoUri);
@@ -1148,33 +1151,6 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         plan.segments_done += 1;
         plan.current_segment_attempt = 0;
         plan.veo_op_retries = 0;
-
-        if (plan.segments_done >= plan.segments_total) {
-          // Все клипы готовы — concat (с сохранением звука) → trim → ready.
-          try {
-            const parts = Array.from({ length: plan.segments_total }, (_, i) => this.veoPartPath(job.id, i));
-            const url = await this.composeVeoClips(
-              job.id, parts, plan.target_duration_sec,
-              plan.veo_aspect_ratio ?? '9:16', plan.veo_resolution ?? '720p',
-            );
-            let thumbUrl: string | null = null;
-            try { thumbUrl = await this.extractAndUploadThumbnail(job.id, url); } catch { /* nice-to-have */ }
-            await this.pg.query(
-              `UPDATE video_jobs SET status='ready', video_url=$1, thumbnail_url=$2, composed_plan=$3, updated_at=now() WHERE id=$4`,
-              [url, thumbUrl, JSON.stringify(plan), job.id],
-            );
-            this.cleanupVeoParts(job.id);
-            this.logger.log(`Veo job ${job.id} ready (concat ${plan.segments_total}×8s vertical, ${plan.target_duration_sec}s): ${url}`);
-          } catch (e: any) {
-            this.logger.error(`Veo job ${job.id} concat failed: ${e.message}`);
-            await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo_concat: ${String(e.message).slice(0, 200)}`);
-            this.cleanupVeoParts(job.id);
-          }
-          return;
-        }
-
-        // Ещё клипы впереди — снять in-flight op; следующий независимый клип
-        // стартует в Phase 2 на следующем тике.
         await this.pg.query(
           `UPDATE video_jobs SET kling_task_id=NULL, composed_plan=$1, updated_at=now() WHERE id=$2`,
           [JSON.stringify(plan), job.id],
@@ -1216,6 +1192,44 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         `UPDATE video_jobs SET kling_task_id=NULL, composed_plan=$1, updated_at=now() WHERE id=$2`,
         [JSON.stringify(plan), job.id],
       );
+      return;
+    }
+
+    // Phase 2 (concat-режим, ФИНАЛИЗАЦИЯ): все клипы готовы — склеиваем. Берём
+    // оптимистичный лок concat_started_at атомарным UPDATE (как Kling-concat),
+    // чтобы параллельный тик не запустил второй ffmpeg в тот же output.
+    if (plan.veo_concat && plan.segments_done >= plan.segments_total) {
+      const claim = await this.pg.query(
+        `UPDATE video_jobs
+            SET composed_plan = composed_plan || jsonb_build_object('concat_started_at', to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"')),
+                updated_at = now()
+          WHERE id = $1 AND (composed_plan->>'concat_started_at') IS NULL
+          RETURNING id`,
+        [job.id],
+      );
+      if ((claim.rowCount ?? 0) === 0) {
+        this.logger.debug(`Veo job ${job.id}: concat already in flight, skipping`);
+        return;
+      }
+      try {
+        const parts = Array.from({ length: plan.segments_total }, (_, i) => this.veoPartPath(job.id, i));
+        const url = await this.composeVeoClips(
+          job.id, parts, plan.target_duration_sec,
+          plan.veo_aspect_ratio ?? '9:16', plan.veo_resolution ?? '720p',
+        );
+        let thumbUrl: string | null = null;
+        try { thumbUrl = await this.extractAndUploadThumbnail(job.id, url); } catch { /* nice-to-have */ }
+        await this.pg.query(
+          `UPDATE video_jobs SET status='ready', video_url=$1, thumbnail_url=$2, updated_at=now() WHERE id=$3`,
+          [url, thumbUrl, job.id],
+        );
+        this.cleanupVeoParts(job.id);
+        this.logger.log(`Veo job ${job.id} ready (concat ${plan.segments_total}×8s vertical, ${plan.target_duration_sec}s): ${url}`);
+      } catch (e: any) {
+        this.logger.error(`Veo job ${job.id} concat failed: ${e.message}`);
+        await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo_concat: ${String(e.message).slice(0, 200)}`);
+        this.cleanupVeoParts(job.id);
+      }
       return;
     }
 
