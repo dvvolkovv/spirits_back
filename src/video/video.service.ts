@@ -994,18 +994,20 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     }
 
     try {
-      // B: портрет идёт как referenceImages (Ingredients) — идентичность по всему
-      // ролику, не только первый кадр (фидбэк katya «нет сходства»).
-      let refImages: Array<{ b64: string; mime: string }> | undefined;
+      // Портрет — first-frame image (НЕ referenceImages): именно он даёт
+      // lip-sync talking-head с речью. referenceImages/Ingredients ведут
+      // персонажа, но убивают озвучку (проверено: тот же промпт без речи).
+      // Идентичность держится первым кадром + правильным форматом (A, 9:16).
+      let imageB64: string | undefined; let imageMime: string | undefined;
       if (imgUrlAbsolute) {
         const p = await this.fetchPortraitB64(imgUrlAbsolute);
         if (!p) throw new Error('could not fetch portrait image');
-        refImages = [{ b64: p.b64, mime: p.mime }];
+        imageB64 = p.b64; imageMime = p.mime;
       }
       const operation = await this.veo.startGenerate({
         prompt: segmentPrompts[0] ?? prompt, tier: quote.tier, durationSeconds: 8,
         aspectRatio, resolution,
-        referenceImagesB64: refImages, negativePrompt: dto.negativePrompt ?? undefined,
+        imageB64, imageMime, negativePrompt: dto.negativePrompt ?? undefined,
       });
       await this.pg.query(
         `UPDATE video_jobs SET kling_task_id=$1, status='processing', updated_at=now() WHERE id=$2`,
@@ -1035,15 +1037,15 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     const tier = plan.veo_tier || veoTier(job.model);
     try {
       if (plan.segments_done === 0) {
-        let refImages: Array<{ b64: string; mime: string }> | undefined;
+        let imageB64: string | undefined; let imageMime: string | undefined;
         if (job.source_image_url) {
           const p = await this.fetchPortraitB64(job.source_image_url);
-          if (p) refImages = [{ b64: p.b64, mime: p.mime }];
+          if (p) { imageB64 = p.b64; imageMime = p.mime; }
         }
         const op = await this.veo.startGenerate({
           prompt: plan.veo_segment_prompts?.[0] ?? job.prompt ?? '', tier, durationSeconds: 8,
           aspectRatio: plan.veo_aspect_ratio ?? '16:9', resolution: plan.veo_resolution ?? '720p',
-          referenceImagesB64: refImages,
+          imageB64, imageMime,
           negativePrompt: job.negative_prompt ?? undefined,
         });
         await this.pg.query(
