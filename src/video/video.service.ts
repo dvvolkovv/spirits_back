@@ -11,7 +11,7 @@ import { VeoService } from '../misc/veo.service';
 import {
   CreateVideoJobDto, VideoJobRow, ComposedPlan, computeTokenCost, computeComposedQuote,
   VideoMode, VideoModel, VideoQuality,
-  isVeoModel, veoTier, computeVeoQuote,
+  isVeoModel, veoTier, computeVeoQuote, computeVeoConcatQuote,
 } from './video.dto';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, CreateBucketCommand, PutBucketPolicyCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
@@ -945,13 +945,21 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     const target = Math.round(dto.targetDurationSec ?? dto.duration ?? 8);
     if (target < 4 || target > 60) throw new BadRequestException('Veo length must be 4–60 seconds');
 
-    const quote = computeVeoQuote(model, target);
+    // 9:16 длиннее 8с: Veo extend умеет только 16:9, поэтому длинную вертикаль
+    // собираем как concat независимых 8с-клипов (автоматизация ручной склейки —
+    // фидбэк katya). Каждый клип — полная база (цена N×base). 16:9 и короткая
+    // вертикаль (≤8с) идут прежним путём (база + native extend).
+    const veoConcat = aspectRatio === '9:16' && target > 8;
+    const quote = veoConcat ? computeVeoConcatQuote(model, target) : computeVeoQuote(model, target);
     const cost = quote.totalCost;
 
-    // Veo extend требует вход 720p — поэтому 1080p возможен ТОЛЬКО для
-    // односегментных роликов (≤8с, без extend). Для длинных база тоже 720p,
-    // иначе extend падает "Resolution of the input video must be 720p".
-    const effectiveResolution: '720p' | '1080p' = quote.segments > 1 ? '720p' : resolution;
+    // Veo extend требует вход 720p — поэтому в extend-цепочке 1080p возможен
+    // ТОЛЬКО для односегментных роликов (≤8с). В concat-режиме каждый клип —
+    // независимая база (extend нет), значит 1080p доступен на любой длине — что
+    // ещё и помогает с «пластиковой» текстурой (фидбэк katya #4).
+    const effectiveResolution: '720p' | '1080p' = veoConcat
+      ? resolution
+      : (quote.segments > 1 ? '720p' : resolution);
 
     // До 3 референс-фото (Veo Ingredients) — сходство лица сильно лучше с
     // несколькими ракурсами (фидбэк katya: «нужно минимум 3 фото»).
@@ -993,6 +1001,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       veo_reference_images: refUrls,
       veo_last_uri: null,
       veo_segment_prompts: segmentPrompts,
+      veo_concat: veoConcat,
     };
 
     const client = await this.pg.getClient();
@@ -1054,6 +1063,26 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   private async restartVeoSegment(job: VideoJobRow, plan: ComposedPlan): Promise<void> {
     const tier = plan.veo_tier || veoTier(job.model);
     try {
+      // Concat-режим (вертикаль): КАЖДЫЙ сегмент — независимая база, поэтому
+      // транзиентный ретрай переотправляет текущий клип заново (а не сбрасывает
+      // extend, которого здесь нет).
+      if (plan.veo_concat) {
+        const refUrls = plan.veo_reference_images?.length
+          ? plan.veo_reference_images
+          : (job.source_image_url ? [job.source_image_url] : []);
+        const refImages = await this.fetchReferenceImagesB64(refUrls);
+        const op = await this.veo.startGenerate({
+          prompt: plan.veo_segment_prompts?.[plan.segments_done] ?? job.prompt ?? '', tier, durationSeconds: 8,
+          aspectRatio: plan.veo_aspect_ratio ?? '9:16', resolution: plan.veo_resolution ?? '720p',
+          referenceImagesB64: refImages,
+          negativePrompt: job.negative_prompt ?? undefined,
+        });
+        await this.pg.query(
+          `UPDATE video_jobs SET kling_task_id=$1, composed_plan=$2, updated_at=now() WHERE id=$3`,
+          [op, JSON.stringify(plan), job.id],
+        );
+        return;
+      }
       if (plan.segments_done === 0) {
         const refUrls = plan.veo_reference_images?.length
           ? plan.veo_reference_images
@@ -1107,6 +1136,52 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo: ${err}`);
         return;
       }
+      // --- Concat-режим (вертикаль): клип независимый, его и складываем ---
+      if (plan.veo_concat) {
+        try {
+          const buf = await this.veo.downloadVideo(st.videoUri);
+          fs.writeFileSync(this.veoPartPath(job.id, plan.segments_done), buf);
+        } catch (e: any) {
+          await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo_clip_dl: ${String(e.message).slice(0, 200)}`);
+          return;
+        }
+        plan.segments_done += 1;
+        plan.current_segment_attempt = 0;
+        plan.veo_op_retries = 0;
+
+        if (plan.segments_done >= plan.segments_total) {
+          // Все клипы готовы — concat (с сохранением звука) → trim → ready.
+          try {
+            const parts = Array.from({ length: plan.segments_total }, (_, i) => this.veoPartPath(job.id, i));
+            const url = await this.composeVeoClips(
+              job.id, parts, plan.target_duration_sec,
+              plan.veo_aspect_ratio ?? '9:16', plan.veo_resolution ?? '720p',
+            );
+            let thumbUrl: string | null = null;
+            try { thumbUrl = await this.extractAndUploadThumbnail(job.id, url); } catch { /* nice-to-have */ }
+            await this.pg.query(
+              `UPDATE video_jobs SET status='ready', video_url=$1, thumbnail_url=$2, composed_plan=$3, updated_at=now() WHERE id=$4`,
+              [url, thumbUrl, JSON.stringify(plan), job.id],
+            );
+            this.cleanupVeoParts(job.id);
+            this.logger.log(`Veo job ${job.id} ready (concat ${plan.segments_total}×8s vertical, ${plan.target_duration_sec}s): ${url}`);
+          } catch (e: any) {
+            this.logger.error(`Veo job ${job.id} concat failed: ${e.message}`);
+            await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo_concat: ${String(e.message).slice(0, 200)}`);
+            this.cleanupVeoParts(job.id);
+          }
+          return;
+        }
+
+        // Ещё клипы впереди — снять in-flight op; следующий независимый клип
+        // стартует в Phase 2 на следующем тике.
+        await this.pg.query(
+          `UPDATE video_jobs SET kling_task_id=NULL, composed_plan=$1, updated_at=now() WHERE id=$2`,
+          [JSON.stringify(plan), job.id],
+        );
+        return;
+      }
+
       // Segment finished. Veo's extend output is the FULL cumulative video, so
       // the latest uri is the whole clip so far — no ffmpeg concat.
       plan.segments_done += 1;
@@ -1144,6 +1219,39 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    // Phase 2 (concat-режим): просто запускаем следующий НЕЗАВИСИМЫЙ 8с-клип
+    // (та же тройка фото для сходства + своя порция реплики). Ждать ACTIVE не
+    // нужно — мы не extend'им предыдущий клип, а генерим новый с нуля.
+    if (plan.veo_concat && plan.segments_done > 0 && plan.segments_done < plan.segments_total) {
+      try {
+        const refImages = await this.fetchReferenceImagesB64(
+          plan.veo_reference_images?.length ? plan.veo_reference_images : (job.source_image_url ? [job.source_image_url] : []),
+        );
+        const op = await this.veo.startGenerate({
+          prompt: plan.veo_segment_prompts?.[plan.segments_done] ?? job.prompt ?? '', tier, durationSeconds: 8,
+          aspectRatio: plan.veo_aspect_ratio ?? '9:16', resolution: plan.veo_resolution ?? '720p',
+          referenceImagesB64: refImages, negativePrompt: job.negative_prompt ?? undefined,
+        });
+        plan.current_segment_attempt = 0;
+        await this.pg.query(
+          `UPDATE video_jobs SET kling_task_id=$1, composed_plan=$2, updated_at=now() WHERE id=$3`,
+          [op, JSON.stringify(plan), job.id],
+        );
+        this.logger.log(`Veo job ${job.id}: generating clip ${plan.segments_done + 1}/${plan.segments_total} (concat)`);
+      } catch (e: any) {
+        const attempt = (plan.current_segment_attempt ?? 0) + 1;
+        if (attempt >= this.MAX_VEO_EXTEND_ATTEMPTS) {
+          await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo_clip: ${String(e.message).slice(0, 200)}`);
+          this.cleanupVeoParts(job.id);
+          return;
+        }
+        plan.current_segment_attempt = attempt;
+        await this.pg.query(`UPDATE video_jobs SET composed_plan=$1, updated_at=now() WHERE id=$2`, [JSON.stringify(plan), job.id]);
+        this.logger.warn(`Veo job ${job.id} clip start failed (attempt ${attempt}, will retry): ${e.message}`);
+      }
+      return;
+    }
+
     // Phase 2 — between segments: start the next extend once the last clip has
     // finished processing (state ACTIVE). Otherwise retry on a later tick.
     if (plan.segments_done > 0 && plan.segments_done < plan.segments_total && plan.veo_last_uri) {
@@ -1176,6 +1284,97 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         this.logger.warn(`Veo job ${job.id} extend start failed (attempt ${attempt}, will retry): ${e.message}`);
       }
       return;
+    }
+  }
+
+  // --- Concat-режим (вертикаль): склейка независимых 8с-клипов ---
+
+  // Staging-путь part-файла клипа. Лежит под public/videos/_veoconcat/<jobId>/,
+  // т.е. на персистентном диске (переживает рестарт между тиками планировщика).
+  private veoConcatDir(jobId: string): string {
+    const publicDir = process.env.PUBLIC_DIR ? process.env.PUBLIC_DIR : path.resolve(process.cwd(), 'public');
+    return path.join(publicDir, 'videos', '_veoconcat', jobId);
+  }
+  private veoPartPath(jobId: string, idx: number): string {
+    const dir = this.veoConcatDir(jobId);
+    fs.mkdirSync(dir, { recursive: true });
+    return path.join(dir, `seg_${String(idx).padStart(2, '0')}.mp4`);
+  }
+  private cleanupVeoParts(jobId: string): void {
+    try { fs.rmSync(this.veoConcatDir(jobId), { recursive: true, force: true }); } catch {}
+  }
+
+  // Размер кадра под формат+разрешение Veo (для нормализации перед concat).
+  private veoFrameDims(aspect: '16:9' | '9:16', resolution: '720p' | '1080p'): [number, number] {
+    if (aspect === '9:16') return resolution === '1080p' ? [1080, 1920] : [720, 1280];
+    return resolution === '1080p' ? [1920, 1080] : [1280, 720];
+  }
+
+  // Склейка готовых локальных клипов в один вертикальный ролик С СОХРАНЕНИЕМ
+  // ЗВУКА (в отличие от composeFinalVideo для Kling, где аудио выбрасывается —
+  // Kling немой). Каждый клип нормализуется по видео (scale+pad+fps+SAR) и аудио
+  // (aresample 48k/stereo/fltp), затем concat=...:a=1. Итог режется до target.
+  private async composeVeoClips(
+    jobId: string,
+    partPaths: string[],
+    targetDurationSec: number,
+    aspect: '16:9' | '9:16',
+    resolution: '720p' | '1080p',
+  ): Promise<string> {
+    for (const p of partPaths) {
+      if (!fs.existsSync(p)) throw new Error(`missing clip part ${path.basename(p)}`);
+    }
+    const [W, H] = this.veoFrameDims(aspect, resolution);
+    const tmpDir = path.join(os.tmpdir(), `veoconcat_${jobId}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+    try {
+      const n = partPaths.length;
+      const vChains = partPaths.map((_, i) =>
+        `[${i}:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,` +
+        `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p[v${i}]`,
+      );
+      const aChains = partPaths.map((_, i) =>
+        `[${i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=N/SR/TB[a${i}]`,
+      );
+      const concatInputs = partPaths.map((_, i) => `[v${i}][a${i}]`).join('');
+      const filter = [...vChains, ...aChains].join(';') + ';' +
+        concatInputs + `concat=n=${n}:v=1:a=1[v][a]`;
+
+      const outPath = path.join(tmpDir, 'output.mp4');
+      await new Promise<void>((resolve, reject) => {
+        const args = [
+          '-y',
+          ...partPaths.flatMap((p) => ['-i', p]),
+          '-filter_complex', filter,
+          '-map', '[v]', '-map', '[a]',
+          '-t', String(targetDurationSec),
+          '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+          '-pix_fmt', 'yuv420p',
+          '-c:a', 'aac', '-b:a', '192k',
+          '-movflags', '+faststart',
+          outPath,
+        ];
+        const ff = spawn('ffmpeg', args);
+        let stderr = '';
+        ff.stderr.on('data', (d) => { stderr += d.toString(); });
+        ff.on('close', (code) => {
+          if (code === 0) return resolve();
+          const errLines = stderr.split('\n')
+            .filter((l) => /error|invalid|cannot|no such|failed|unable/i.test(l) && !/^\[libx264/.test(l))
+            .slice(-8).join(' | ');
+          reject(new Error(`ffmpeg exit ${code}: ${(errLines || stderr.slice(-400)).slice(0, 400)}`));
+        });
+        ff.on('error', reject);
+      });
+
+      const publicDir = process.env.PUBLIC_DIR ? process.env.PUBLIC_DIR : path.resolve(process.cwd(), 'public');
+      const videosDir = path.join(publicDir, 'videos');
+      fs.mkdirSync(videosDir, { recursive: true });
+      fs.copyFileSync(outPath, path.join(videosDir, `${jobId}.mp4`));
+      const backend = (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '');
+      return `${backend}/static/videos/${jobId}.mp4`;
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
     }
   }
 

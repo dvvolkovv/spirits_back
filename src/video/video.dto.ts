@@ -89,6 +89,11 @@ export interface ComposedPlan {
   veo_aspect_ratio?: '16:9' | '9:16';   // формат базы (extend наследует)
   veo_resolution?: '720p' | '1080p';    // разрешение базы (extend всегда 720p)
   veo_reference_images?: string[];       // URL референс-фото (Ingredients, B)
+  // 9:16 + >8с: вместо native extend (он только 16:9) генерим N независимых
+  // 8с-клипов и ffmpeg-concat'им их (с сохранением звука). segment_video_urls
+  // здесь не используется — клипы складываются в локальные part-файлы по
+  // соглашению об именах, см. video.service.composeVeoClips.
+  veo_concat?: boolean;
   veo_last_uri?: string | null;   // download uri of the latest (cumulative) clip
   // Per-segment prompts. The user's script/speech is distributed across the
   // segments so Veo speaks it ONCE end-to-end instead of repeating the full
@@ -224,5 +229,24 @@ export function computeVeoQuote(model: VideoModel, targetDurationSec: number): V
     segments: 1 + extendCount,
     rawDurationSec: VEO_BASE_SEC + extendCount * VEO_EXTEND_SEC,
     totalCost: p.base + extendCount * p.extendUnit,
+  };
+}
+
+// Вертикальные ролики (9:16) длиннее 8с: Veo native extend работает ТОЛЬКО в
+// 16:9 (API: "Aspect ratio of the input video must be 16:9"). Поэтому длинную
+// вертикаль собираем как ffmpeg-concat независимых 8с-клипов — автоматизация
+// ручной склейки, о которой писала katya. Каждый клип = полная базовая
+// генерация (нет «дешёвого» extend), поэтому цена = N × base (решение владельца
+// 2026-06-06: «по факту N×база»). Каждый клип несёт свою порцию реплики
+// (buildVeoSegmentPrompts) — монолог течёт сквозь стыки.
+export function computeVeoConcatQuote(model: VideoModel, targetDurationSec: number): VeoQuote {
+  const tier = veoTier(model);
+  const p = VEO_PRICING[tier];
+  const clips = Math.max(1, Math.ceil(targetDurationSec / VEO_BASE_SEC));
+  return {
+    tier,
+    segments: clips,
+    rawDurationSec: clips * VEO_BASE_SEC,
+    totalCost: clips * p.base,
   };
 }
