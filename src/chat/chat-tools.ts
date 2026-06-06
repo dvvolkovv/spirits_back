@@ -93,6 +93,11 @@ export const CHAT_TOOLS = [
           description: 'Final video length in seconds. Use when user wants > 10s; backend chains extends and concats. Only valid for text2video / image2video.',
         },
         sourceImageUrl: { type: 'string' },
+        sourceImageUrls: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Veo image2video: до 3 URL референс-фото человека (разные ракурсы). Сходство лица заметно лучше с 3 фото, чем с 1 — проси у пользователя несколько фото для «видео из портрета».',
+        },
         aspectRatio: {
           type: 'string',
           enum: ['16:9', '9:16'],

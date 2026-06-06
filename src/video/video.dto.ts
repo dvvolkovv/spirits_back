@@ -1,5 +1,5 @@
 // src/video/video.dto.ts
-import { IsString, IsOptional, IsNumber, IsIn, IsObject, Min, Max } from 'class-validator';
+import { IsString, IsOptional, IsNumber, IsIn, IsObject, IsArray, Min, Max } from 'class-validator';
 
 export type VideoMode = 'text2video' | 'image2video' | 'extend' | 'lipsync';
 export type VideoModel = 'kling-v1-6' | 'kling-v2-master' | 'veo-3.1-fast' | 'veo-3.1';
@@ -58,6 +58,11 @@ export class CreateVideoJobDto {
 
   @IsOptional() @IsString()
   sourceImageUrl?: string;
+
+  // Veo image2video: до 3 референс-фото (Ingredients) — сильно лучше сходство
+  // лица с несколькими ракурсами (фидбэк katya). Приоритетнее sourceImageUrl.
+  @IsOptional() @IsArray() @IsString({ each: true })
+  sourceImageUrls?: string[];
 
   @IsOptional() @IsString()
   sourceVideoId?: string;

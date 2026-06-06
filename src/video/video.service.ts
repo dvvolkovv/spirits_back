@@ -822,6 +822,16 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
 
   // ================= VEO 3.1 PROVIDER =================
 
+  // Скачать до 3 референс-фото в base64 для Veo referenceImages (Ingredients).
+  private async fetchReferenceImagesB64(urls: string[]): Promise<Array<{ b64: string; mime: string }>> {
+    const out: Array<{ b64: string; mime: string }> = [];
+    for (const u of (urls || []).slice(0, 3)) {
+      const p = await this.fetchPortraitB64(u);
+      if (p) out.push({ b64: p.b64, mime: p.mime });
+    }
+    return out;
+  }
+
   private async fetchPortraitB64(url: string): Promise<{ b64: string; mime: string } | null> {
     try {
       let u = url;
@@ -938,13 +948,23 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     const quote = computeVeoQuote(model, target);
     const cost = quote.totalCost;
 
-    let imgUrlAbsolute: string | null = null;
-    if (mode === 'image2video') {
-      if (!dto.sourceImageUrl) throw new BadRequestException('image2video requires sourceImageUrl');
-      imgUrlAbsolute = dto.sourceImageUrl.startsWith('/')
-        ? (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '') + dto.sourceImageUrl
-        : dto.sourceImageUrl;
+    // До 3 референс-фото (Veo Ingredients) — сходство лица сильно лучше с
+    // несколькими ракурсами (фидбэк katya: «нужно минимум 3 фото»).
+    // referenceImages ведут идентичность по всему ролику И не ломают речь
+    // (проверено: 3 фото + чёткий промпт с репликой → есть озвучка).
+    // sourceImageUrls приоритетнее одиночного sourceImageUrl (back-compat).
+    const toAbs = (u: string) => u.startsWith('/')
+      ? (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '') + u
+      : u;
+    const refUrls: string[] = (
+      Array.isArray(dto.sourceImageUrls) && dto.sourceImageUrls.length
+        ? dto.sourceImageUrls
+        : (dto.sourceImageUrl ? [dto.sourceImageUrl] : [])
+    ).filter(Boolean).slice(0, 3).map(toAbs);
+    if (mode === 'image2video' && refUrls.length === 0) {
+      throw new BadRequestException('image2video requires sourceImageUrl(s)');
     }
+    const imgUrlAbsolute: string | null = refUrls[0] ?? null;
 
     const active = await this.pg.query(
       `SELECT COUNT(*)::int AS n FROM video_jobs WHERE user_id=$1 AND status IN ('pending','processing')`,
@@ -965,7 +985,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       veo_tier: quote.tier,
       veo_aspect_ratio: aspectRatio,
       veo_resolution: resolution,
-      veo_reference_images: imgUrlAbsolute ? [imgUrlAbsolute] : [],
+      veo_reference_images: refUrls,
       veo_last_uri: null,
       veo_segment_prompts: segmentPrompts,
     };
@@ -994,20 +1014,13 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     }
 
     try {
-      // Портрет — first-frame image (НЕ referenceImages): именно он даёт
-      // lip-sync talking-head с речью. referenceImages/Ingredients ведут
-      // персонажа, но убивают озвучку (проверено: тот же промпт без речи).
-      // Идентичность держится первым кадром + правильным форматом (A, 9:16).
-      let imageB64: string | undefined; let imageMime: string | undefined;
-      if (imgUrlAbsolute) {
-        const p = await this.fetchPortraitB64(imgUrlAbsolute);
-        if (!p) throw new Error('could not fetch portrait image');
-        imageB64 = p.b64; imageMime = p.mime;
-      }
+      // Портрет(ы) → referenceImages (Veo Ingredients): сходство по всему ролику.
+      // С чётким промптом речь сохраняется (проверено 3 фото + реплика → есть звук).
+      const refImages = await this.fetchReferenceImagesB64(refUrls);
       const operation = await this.veo.startGenerate({
         prompt: segmentPrompts[0] ?? prompt, tier: quote.tier, durationSeconds: 8,
         aspectRatio, resolution,
-        imageB64, imageMime, negativePrompt: dto.negativePrompt ?? undefined,
+        referenceImagesB64: refImages, negativePrompt: dto.negativePrompt ?? undefined,
       });
       await this.pg.query(
         `UPDATE video_jobs SET kling_task_id=$1, status='processing', updated_at=now() WHERE id=$2`,
@@ -1037,15 +1050,14 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     const tier = plan.veo_tier || veoTier(job.model);
     try {
       if (plan.segments_done === 0) {
-        let imageB64: string | undefined; let imageMime: string | undefined;
-        if (job.source_image_url) {
-          const p = await this.fetchPortraitB64(job.source_image_url);
-          if (p) { imageB64 = p.b64; imageMime = p.mime; }
-        }
+        const refUrls = plan.veo_reference_images?.length
+          ? plan.veo_reference_images
+          : (job.source_image_url ? [job.source_image_url] : []);
+        const refImages = await this.fetchReferenceImagesB64(refUrls);
         const op = await this.veo.startGenerate({
           prompt: plan.veo_segment_prompts?.[0] ?? job.prompt ?? '', tier, durationSeconds: 8,
           aspectRatio: plan.veo_aspect_ratio ?? '16:9', resolution: plan.veo_resolution ?? '720p',
-          imageB64, imageMime,
+          referenceImagesB64: refImages,
           negativePrompt: job.negative_prompt ?? undefined,
         });
         await this.pg.query(
