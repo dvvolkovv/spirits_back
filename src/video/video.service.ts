@@ -948,6 +948,11 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     const quote = computeVeoQuote(model, target);
     const cost = quote.totalCost;
 
+    // Veo extend требует вход 720p — поэтому 1080p возможен ТОЛЬКО для
+    // односегментных роликов (≤8с, без extend). Для длинных база тоже 720p,
+    // иначе extend падает "Resolution of the input video must be 720p".
+    const effectiveResolution: '720p' | '1080p' = quote.segments > 1 ? '720p' : resolution;
+
     // До 3 референс-фото (Veo Ingredients) — сходство лица сильно лучше с
     // несколькими ракурсами (фидбэк katya: «нужно минимум 3 фото»).
     // referenceImages ведут идентичность по всему ролику И не ломают речь
@@ -984,7 +989,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       provider: 'veo',
       veo_tier: quote.tier,
       veo_aspect_ratio: aspectRatio,
-      veo_resolution: resolution,
+      veo_resolution: effectiveResolution,
       veo_reference_images: refUrls,
       veo_last_uri: null,
       veo_segment_prompts: segmentPrompts,
@@ -1019,7 +1024,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       const refImages = await this.fetchReferenceImagesB64(refUrls);
       const operation = await this.veo.startGenerate({
         prompt: segmentPrompts[0] ?? prompt, tier: quote.tier, durationSeconds: 8,
-        aspectRatio, resolution,
+        aspectRatio, resolution: effectiveResolution,
         referenceImagesB64: refImages, negativePrompt: dto.negativePrompt ?? undefined,
       });
       await this.pg.query(
