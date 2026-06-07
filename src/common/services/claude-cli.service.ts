@@ -96,8 +96,18 @@ export class ClaudeCliService {
       proc.on('close', (code) => {
         clearTimeout(timer);
         if (code !== 0) {
-          this.logger.error(`claude CLI exit ${code}: ${stderr.slice(0, 400)}`);
-          reject(new Error(`claude CLI exited with code ${code}: ${stderr.slice(0, 200)}`));
+          // Реальная причина часто уходит в stdout (CLI с --output-format json
+          // печатает {is_error, result} и при ненулевом коде, либо текстовую
+          // ошибку авторизации). stderr нередко пуст — поэтому подмешиваем stdout.
+          let detail = stderr.trim();
+          if (!detail && stdout.trim()) {
+            try {
+              const j = JSON.parse(stdout);
+              detail = String(j.result ?? j.error ?? stdout).slice(0, 400);
+            } catch { detail = stdout.trim().slice(0, 400); }
+          }
+          this.logger.error(`claude CLI exit ${code}: stderr=${stderr.slice(0, 300)} stdout=${stdout.slice(0, 300)}`);
+          reject(new Error(`claude CLI exited with code ${code}: ${detail.slice(0, 200) || '(no output)'}`));
           return;
         }
         try {
