@@ -6,6 +6,7 @@ import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import axios from 'axios';
 import { Response } from 'express';
+import { query } from '@anthropic-ai/claude-agent-sdk';
 
 const ASSETS_BUCKET = 'linkeon-assets';
 
@@ -771,34 +772,37 @@ ${blocks.join('\n\n---\n\n')}
 
   private async streamLLM(systemPrompt: string, userMessage: string, res: Response): Promise<void> {
     try {
-      const anthropicKey = process.env.ANTHROPIC_API_KEY;
-      if (anthropicKey) {
-        const Anthropic = require('@anthropic-ai/sdk');
-        const client = new Anthropic({ apiKey: anthropicKey });
-        const stream = client.messages.stream({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 4096,
-          system: systemPrompt,
-          messages: [{ role: 'user', content: userMessage }],
-        });
-        const chunks: string[] = [];
-        stream.on('text', (text: string) => {
-          chunks.push(text);
-          res.write(JSON.stringify({ type: 'item', content: text }) + '\n');
-        });
-        await stream.finalMessage();
-        // Post-process: strip code blocks from search_result JSON
-        const full = chunks.join('');
-        if (full.includes('search_result:') && full.includes('```')) {
-          let cleaned = full.replace(/search_result:\s*```(?:json)?\s*\n?/g, 'search_result:');
-          cleaned = cleaned.replace(/\n?```\s*$/g, '');
-          // Re-send cleaned version as final item
-          res.write(JSON.stringify({ type: 'replace', content: cleaned }) + '\n');
+      const chunks: string[] = [];
+      for await (const event of query({
+        prompt: userMessage,
+        options: {
+          model: 'claude-haiku-4-5',
+          systemPrompt,
+          permissionMode: 'bypassPermissions',
+          settingSources: [],
+          includePartialMessages: true,
+        } as any,
+      })) {
+        // Извлекаем только text-delta — сохраняем wire format вызывающих
+        // (searchProfiles / analyzeCompatibility): они шлют только "item" + опц. "replace".
+        if (event.type === 'stream_event') {
+          const inner = (event as any).event;
+          if (inner?.type === 'content_block_delta' && inner.delta?.type === 'text_delta'
+              && typeof inner.delta.text === 'string') {
+            const text = inner.delta.text;
+            chunks.push(text);
+            res.write(JSON.stringify({ type: 'item', content: text }) + '\n');
+          }
         }
-      } else {
-        res.write(JSON.stringify({ type: 'item', content: 'LLM не настроен.' }) + '\n');
       }
-    } catch (e) {
+      // Post-process: вычистить code-блоки из search_result JSON
+      const full = chunks.join('');
+      if (full.includes('search_result:') && full.includes('```')) {
+        let cleaned = full.replace(/search_result:\s*```(?:json)?\s*\n?/g, 'search_result:');
+        cleaned = cleaned.replace(/\n?```\s*$/g, '');
+        res.write(JSON.stringify({ type: 'replace', content: cleaned }) + '\n');
+      }
+    } catch (e: any) {
       this.logger.error(`LLM error: ${e.message}`);
       res.write(JSON.stringify({ type: 'item', content: 'Ошибка при обработке запроса.' }) + '\n');
     }
