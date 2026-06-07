@@ -2,11 +2,11 @@ import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { KlingService } from '../misc/kling.service';
-import { ChatToolsService, CHAT_TOOLS } from './chat-tools';
+import { ChatToolsService } from './chat-tools';
 import { SmmProducerToolsService } from '../smm/producer/smm-producer-tools.service';
 import { ClaudeAgentService } from './claude-agent.service';
+import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { TasksService } from '../tasks/tasks.service';
-import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import { Request, Response } from 'express';
 // Agent server at r.linkeon.io (remote Claude Code)
@@ -17,10 +17,9 @@ export class ChatService {
   // Множитель цены за текст для агентов, идущих через SDK-путь
   // (streamUniversalAgent → r.linkeon.io). Применяется только для текстовых
   // токенов; MCP-инструменты (картинки, видео) списываются их сервисами
-  // независимо и НЕ умножаются здесь. Не касается Маши (id=3, локальный
-  // Anthropic-путь через streamChat).
+  // независимо и НЕ умножаются здесь. Маша считается отдельно — через
+  // total_cost_usd из ClaudeCliService.
   private readonly SDK_TEXT_MULTIPLIER = 2;
-  private anthropic: Anthropic | null = null;
 
   constructor(
     private readonly pg: PgService,
@@ -29,14 +28,9 @@ export class ChatService {
     private readonly tools: ChatToolsService,
     private readonly smmProducerTools: SmmProducerToolsService,
     private readonly claudeAgent: ClaudeAgentService,
+    private readonly claudeCli: ClaudeCliService,
     @Optional() private readonly tasksService?: TasksService,
-  ) {
-    if (process.env.ANTHROPIC_API_KEY) {
-      this.anthropic = new Anthropic({
-        apiKey: process.env.ANTHROPIC_API_KEY,
-      });
-    }
-  }
+  ) {}
 
   async streamChat(
     userId: string,
@@ -130,10 +124,11 @@ export class ChatService {
       return;
     }
 
-    // Route ALL agents except Маша (id=3 — uses метафорические карты через Anthropic+CHAT_TOOLS path)
-    // via streamUniversalAgent → r.linkeon.io with MCP tools (image/video/code execution).
-    // Cheaper, unified, MCP delivers Nano Banana + Kling natively.
-    // detectMediaIntent exception removed — r.linkeon.io handles media via MCP bridge.
+    // Все агенты кроме Маши идут через streamUniversalAgent → r.linkeon.io
+    // (MCP image/video tools, code execution). Маша остаётся локально потому
+    // что её метафорические карты подмешиваются регуляркой post-processing'ом
+    // из metaphor_cards postgres-таблицы (см. ниже) — r.linkeon.io об этом
+    // не знает.
     if (agent.id !== 3) {
       return this.streamUniversalAgent(
         userId, message, String(assistantId), String(agent.id),
@@ -237,195 +232,60 @@ export class ChatService {
       }
     }
 
-    // Regular text chat — stream to client (buffer for Маша to filter tool tags)
-    const isМаша = agent.name === 'Маша';
-    const needsBuffering = isМаша; // Маша needs post-processing for card detection
+    // Маша-only путь (agent.id === 3): остальные агенты выше уже ушли в streamUniversalAgent.
+    // Один вызов ClaudeCli (OAuth), потом post-processing для инжекта метафорической карты,
+    // потом single 'item' + 'end' событие. Без streaming, без CHAT_TOOLS — Маша их не звала.
     res.write(JSON.stringify({ type: 'begin' }) + '\n');
 
-    const chunks: string[] = [];
     let inputTokens = 0;
     let outputTokens = 0;
+    let rawText = '';
 
-    if (this.anthropic) {
-      try {
-        const MAX_ITERATIONS = 5;
-        // Anthropic messages accept strings OR content blocks. We start with llmMessages
-        // (role+content string pairs) and extend it across iterations when tools are called.
-        const messagesForLLM: any[] = [...llmMessages];
+    // Собираем prompt: история + текущая реплика. systemPrompt уже включает
+    // platformContext + agent.system_prompt + правило ответа + profileText + tasks ctx.
+    const priorTurns = llmMessages
+      .slice(0, -1) // last is current message — добавляем отдельно как USER
+      .map(m => `${m.role.toUpperCase()}: ${m.content}`)
+      .join('\n\n');
+    const fullPrompt = priorTurns ? `${priorTurns}\n\nUSER: ${message}` : `USER: ${message}`;
 
-        // cache_control на последнем стабильном system-блоке кэширует tools + стабильный system.
-        // Волатильный блок (profileText) идёт ПОСЛЕ кэша — он не попадает в кэш, и это нормально.
-        const systemBlocks: any[] = [
-          { type: 'text', text: stableSystemPrompt, cache_control: { type: 'ephemeral' } },
-        ];
-        if (volatileSystemPrompt) {
-          systemBlocks.push({ type: 'text', text: volatileSystemPrompt });
-        }
-
-        for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
-          const stream = this.anthropic.messages.stream({
-            model: 'claude-haiku-4-5-20251001',
-            max_tokens: 4096,
-            system: systemBlocks,
-            tools: CHAT_TOOLS as any,
-            messages: messagesForLLM,
-          });
-
-          // Stream only text chunks; ignore tool-use content blocks for the typewriter effect.
-          // We'll decide what to do after finalMessage() arrives.
-          stream.on('text', (text) => {
-            chunks.push(text);
-            if (!needsBuffering) {
-              res.write(JSON.stringify({ type: 'item', content: text }) + '\n');
-            }
-          });
-
-          const finalMessage = await stream.finalMessage();
-          inputTokens += finalMessage.usage?.input_tokens || 0;
-          outputTokens += finalMessage.usage?.output_tokens || 0;
-          const u: any = finalMessage.usage || {};
-          this.logger.log(`chat[${agent.name}] cache: read=${u.cache_read_input_tokens ?? 0} write=${u.cache_creation_input_tokens ?? 0} input=${u.input_tokens ?? 0}`);
-
-          if (finalMessage.stop_reason !== 'tool_use') {
-            // Plain completion — nothing more to do
-            break;
-          }
-
-          // Find all tool_use blocks in this turn (usually one)
-          const toolUseBlocks = (finalMessage.content as any[]).filter((b) => b?.type === 'tool_use');
-          if (toolUseBlocks.length === 0) break;
-
-          // Push the full assistant turn (text + tool_use blocks) into the conversation
-          messagesForLLM.push({ role: 'assistant', content: finalMessage.content });
-
-          const toolResults: any[] = [];
-          for (const tu of toolUseBlocks) {
-            // Announce tool start to the client
-            res.write(JSON.stringify({
-              type: 'tool_start',
-              tool: tu.name,
-              input: tu.input,
-            }) + '\n');
-
-            const result = await this.tools.executeTool(userId, tu.name, tu.input);
-
-            // Announce tool result to the client — frontend uses this to render inline video/image cards
-            res.write(JSON.stringify({
-              type: 'tool_result',
-              tool: tu.name,
-              result,
-            }) + '\n');
-
-            // For image tool: inject markdown image into chunks so it ends up in saved history + final text
-            if (result.ok && result.kind === 'image') {
-              const md = `\n\n![Сгенерированное изображение](${result.imageUrl})`;
-              chunks.push(md);
-              if (!needsBuffering) {
-                res.write(JSON.stringify({ type: 'item', content: md }) + '\n');
-              }
-            }
-
-            toolResults.push({
-              type: 'tool_result',
-              tool_use_id: tu.id,
-              content: JSON.stringify(result),
-            });
-          }
-
-          // Feed the results back to the LLM so it can respond with natural-language follow-up
-          messagesForLLM.push({ role: 'user', content: toolResults });
-          // loop continues — next iteration gets the LLM's reply
-        }
-      } catch (e: any) {
-        const isForbidden = e?.status === 403 || String(e?.message).includes('forbidden') || String(e?.message).includes('Request not allowed');
-        if (isForbidden && process.env.OPENROUTER_API_KEY) {
-          this.logger.warn(`Primary Anthropic key blocked (403), retrying via OpenRouter`);
-          chunks.length = 0;
-          try {
-            const tok = await this.streamToolLoopViaOpenRouter(userId, systemPrompt, llmMessages, chunks, needsBuffering, res);
-            inputTokens += tok.inputTokens;
-            outputTokens += tok.outputTokens;
-          } catch (e2: any) {
-            this.logger.error(`OpenRouter tool-loop error: ${e2.message}`);
-            chunks.push('Ошибка соединения с ассистентом.');
-          }
-        } else {
-          this.logger.error(`Anthropic stream error: ${e.message}`);
-          chunks.push('Ошибка соединения с ассистентом.');
-        }
-      }
-    } else {
-      try {
-        const orMessages = [{ role: 'system', content: systemPrompt }, ...llmMessages];
-        const response = await axios.post(
-          'https://openrouter.ai/api/v1/chat/completions',
-          { model: 'anthropic/claude-haiku-4.5', messages: orMessages, stream: true },
-          {
-            headers: {
-              Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-              'Content-Type': 'application/json',
-              'HTTP-Referer': 'https://my.linkeon.io',
-            },
-            responseType: 'stream',
-            timeout: 120000,
-          },
-        );
-        await new Promise<void>((resolve, reject) => {
-          let buffer = '';
-          response.data.on('data', (chunk: Buffer) => {
-            buffer += chunk.toString();
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
-            for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed || trimmed === 'data: [DONE]') continue;
-              if (!trimmed.startsWith('data: ')) continue;
-              try {
-                const json = JSON.parse(trimmed.substring(6));
-                const content = json.choices?.[0]?.delta?.content;
-                if (content) {
-                  chunks.push(content);
-                  if (!needsBuffering) {
-                    res.write(JSON.stringify({ type: 'item', content }) + '\n');
-                  }
-                }
-                if (json.usage) { inputTokens = json.usage.prompt_tokens || 0; outputTokens = json.usage.completion_tokens || 0; }
-              } catch {}
-            }
-          });
-          response.data.on('end', () => resolve());
-          response.data.on('error', (err: Error) => reject(err));
-        });
-      } catch (e) {
-        this.logger.error(`OpenRouter stream error: ${e.message}`);
-        chunks.push('Ошибка соединения с ассистентом.');
-      }
+    try {
+      const r = await this.claudeCli.textWithCost(fullPrompt, {
+        system: systemPrompt,
+        model: 'claude-haiku-4-5',
+        timeoutMs: 90_000,
+      });
+      rawText = r.text || '';
+      // Биллинг как у Юли: $1 = 100k Linkeon-tokens. Кладём всё в outputTokens
+      // (split input/output здесь не информативен — берём суммарную стоимость).
+      outputTokens = Math.ceil(r.costUsd * 100_000);
+      this.logger.log(`Маша claude CLI: cost=$${r.costUsd.toFixed(4)} tokens=${outputTokens}`);
+    } catch (e: any) {
+      this.logger.error(`Маша claude CLI error: ${e.message}`);
+      rawText = 'Извините, временные проблемы со связью. Попробуйте ещё раз через минуту.';
     }
-    // Clean and post-process the full response
-    const rawFull = chunks.join('');
-    let fullText = this.stripToolTags(rawFull);
 
-    // If Маша tried to show a metaphor card, fetch a real one
-    // Detect metaphor card: tool tags, fake URLs, or Маша talking about showing a card
+    // Clean and post-process the full response
+    let fullText = this.stripToolTags(rawText);
+
+    // Маша иногда говорит «вот карта», «вытяни карту» — backend ловит regex'ом
+    // и подвешивает реальную карту из metaphor_cards (postgres). LLM сама про
+    // URL не знает, она просто описывает образ.
     const cardPattern = /(?:get_metaphor_card|images\.linkeon\.io|image_url|вот.*карт|первая карта|следующая карта|покажу.*карт|новая карта|вытяни.*карт|твоя карта|вот она|карту для тебя|достаю карту|тяну карту|открываю карту|Что ты видишь на этой карте|Какие чувства.*вызывает)/i;
-    const cardMatch = cardPattern.test(rawFull) || (isМаша && /карт/i.test(rawFull));
-    this.logger.log(`Card check: agent=${agent.name}, isМаша=${isМаша}, match=${cardMatch}, rawLen=${rawFull.length}`);
+    const cardMatch = cardPattern.test(rawText) || /карт/i.test(rawText);
     if (cardMatch) {
       try {
         const cardUrl = await this.getRandomMetaphorCard(userId);
         if (cardUrl) {
           fullText = `${fullText.trim()}\n\n![Метафорическая карта](${cardUrl})`;
         }
-      } catch (e) {
+      } catch (e: any) {
         this.logger.error(`Metaphor card error: ${e.message}`);
       }
     }
 
     const tokensUsed = inputTokens + outputTokens;
-    // For buffered (Маша) — send cleaned text; for streamed — already sent chunk by chunk
-    if (needsBuffering) {
-      res.write(JSON.stringify({ type: 'item', content: fullText }) + '\n');
-    }
+    res.write(JSON.stringify({ type: 'item', content: fullText }) + '\n');
     res.write(JSON.stringify({ type: 'end', content: fullText, usage: { input: inputTokens, output: outputTokens, total: tokensUsed } }) + '\n');
     res.end();
 
@@ -946,61 +806,5 @@ export class ChatService {
     return { success: true };
   }
 
-  private async streamToolLoopViaOpenRouter(
-    userId: string,
-    systemPrompt: string,
-    llmMessages: { role: 'user' | 'assistant'; content: string }[],
-    chunks: string[],
-    needsBuffering: boolean,
-    res: Response,
-  ): Promise<{ inputTokens: number; outputTokens: number }> {
-    const openaiTools = CHAT_TOOLS.map(t => ({
-      type: 'function',
-      function: { name: t.name, description: t.description, parameters: (t as any).input_schema },
-    }));
-    const messages: any[] = [{ role: 'system', content: systemPrompt }, ...llmMessages];
-    let inputTokens = 0, outputTokens = 0;
-
-    for (let iter = 0; iter < 5; iter++) {
-      const resp = await axios.post(
-        'https://openrouter.ai/api/v1/chat/completions',
-        { model: 'anthropic/claude-haiku-4.5', messages, tools: openaiTools, tool_choice: 'auto' },
-        {
-          headers: {
-            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-            'Content-Type': 'application/json',
-            'HTTP-Referer': 'https://my.linkeon.io',
-          },
-          timeout: 60000,
-        },
-      );
-      const choice = resp.data.choices[0];
-      inputTokens += resp.data.usage?.prompt_tokens || 0;
-      outputTokens += resp.data.usage?.completion_tokens || 0;
-      const assistantMsg = choice.message;
-      if (assistantMsg.content) {
-        chunks.push(assistantMsg.content);
-        if (!needsBuffering) res.write(JSON.stringify({ type: 'item', content: assistantMsg.content }) + '\n');
-      }
-      messages.push(assistantMsg);
-      if (choice.finish_reason !== 'tool_calls' || !assistantMsg.tool_calls?.length) break;
-      const toolResultMsgs: any[] = [];
-      for (const tc of assistantMsg.tool_calls) {
-        const name = tc.function.name;
-        const input = JSON.parse(tc.function.arguments || '{}');
-        res.write(JSON.stringify({ type: 'tool_start', tool: name, input }) + '\n');
-        const result = await this.tools.executeTool(userId, name, input);
-        res.write(JSON.stringify({ type: 'tool_result', tool: name, result }) + '\n');
-        if (result.ok && (result as any).kind === 'image') {
-          const md = `\n\n![Сгенерированное изображение](${(result as any).imageUrl})`;
-          chunks.push(md);
-          if (!needsBuffering) res.write(JSON.stringify({ type: 'item', content: md }) + '\n');
-        }
-        toolResultMsgs.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) });
-      }
-      messages.push(...toolResultMsgs);
-    }
-    return { inputTokens, outputTokens };
-  }
 
 }
