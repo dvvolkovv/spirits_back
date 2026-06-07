@@ -66,9 +66,14 @@ export class AttributionService {
               AND user_id NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
          ),
          first_src AS (
+           -- Только источники ПРИВЛЕЧЕНИЯ. Бэкенд пишет в events.source и
+           -- внутренние метки (напр. 'chat.saveChatHistory') — их игнорируем,
+           -- иначе они подменяют реальный источник юзера.
            SELECT DISTINCT ON (e.user_id) e.user_id, e.source
              FROM events e
-            WHERE e.user_id IS NOT NULL AND e.source IS NOT NULL AND e.source <> ''
+            WHERE e.user_id IS NOT NULL AND e.source IS NOT NULL
+              AND (e.source LIKE 'utm:%' OR e.source LIKE 'referral:%'
+                   OR e.source LIKE 'ref-site:%' OR e.source IN ('direct','organic'))
             ORDER BY e.user_id, e.ts ASC
          ),
          chat AS (
