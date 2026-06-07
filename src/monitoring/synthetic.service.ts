@@ -1,7 +1,19 @@
 import { Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
+import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
+
+// Критичные сценарии: их падение = деградация продукта, алертим немедленно.
+// chat_streaming бьёт по /webhook/soulmate/chat (r.linkeon.io) — это и есть
+// AI-путь пользователей, который «молча» лёг при недельном лимите подписки.
+const CRITICAL_SCENARIOS = (process.env.SYNTHETIC_CRITICAL_SCENARIOS || 'chat_streaming,auth_refresh')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+// Если раннер (node-3 cron) перестал слать результаты дольше этого — мониторинг
+// «ослеп», тоже алертим.
+const STALE_MINUTES = Number(process.env.SYNTHETIC_STALE_MINUTES || 40);
+const REALERT_HOURS = Number(process.env.SYNTHETIC_REALERT_H || 3);
 
 /**
  * Synthetic E2E results.
@@ -34,8 +46,82 @@ export interface SyntheticOverview {
 @Injectable()
 export class SyntheticService implements OnModuleInit {
   private readonly log = new Logger(SyntheticService.name);
+  // Состояние алертов: статус и время последнего алерта по сценарию + по протуханию.
+  private lastStatus = new Map<string, boolean>();
+  private lastAlertAt = new Map<string, Date>();
+  private lastStaleAlertAt: Date | null = null;
 
   constructor(@Optional() private readonly pg?: PgService) {}
+
+  // Проверка результатов synthetic + Telegram-алерты. Сам раннер крутится на
+  // node-3 и пишет сюда; здесь — реакция на его данные (раньше её не было:
+  // synthetic копил статусы, но никто не оповещал о падении).
+  @Cron('0 */15 * * * *')
+  async checkAndAlert(): Promise<void> {
+    if (!this.pg) return;
+    let overview: SyntheticOverview;
+    try {
+      overview = await this.getOverview();
+    } catch (e: any) {
+      this.log.error(`synthetic alert check failed: ${e.message}`);
+      return;
+    }
+    if (!overview.scenarios.length) return; // нет данных вообще — отдельно не шумим
+
+    const now = new Date();
+    const send = async (text: string) => {
+      const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+      const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '';
+      if (!TG_TOKEN || !TG_CHAT) { this.log.warn(`synthetic alert (no Telegram creds): ${text.replace(/<[^>]+>/g, '')}`); return; }
+      try {
+        await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,
+          { chat_id: TG_CHAT, parse_mode: 'HTML', text }, { timeout: 8000 });
+      } catch (e: any) {
+        this.log.error(`synthetic Telegram alert failed: ${e?.message || 'unknown'}`);
+      }
+    };
+    const cooled = (key: string) => {
+      const at = this.lastAlertAt.get(key);
+      return !at || (now.getTime() - at.getTime()) >= REALERT_HOURS * 3600_000;
+    };
+
+    // 1. Протухание: самый свежий результat среди всех сценариев старше порога →
+    // раннер не шлёт данные, мониторинг ослеп.
+    const newest = overview.scenarios
+      .map((s) => (s.latestTs ? new Date(s.latestTs).getTime() : 0))
+      .reduce((a, b) => Math.max(a, b), 0);
+    const ageMin = newest ? (now.getTime() - newest) / 60000 : Infinity;
+    if (ageMin > STALE_MINUTES) {
+      const staleCooled = !this.lastStaleAlertAt || (now.getTime() - this.lastStaleAlertAt.getTime()) >= REALERT_HOURS * 3600_000;
+      if (staleCooled) {
+        await send(`<b>🟠 Синтетический мониторинг «ослеп»</b>\nНет результатов уже ${Math.round(ageMin)} мин (порог ${STALE_MINUTES}). Раннер на node-3, возможно, не работает — продуктовые сбои сейчас можно не заметить.`);
+        this.lastStaleAlertAt = now;
+      }
+    } else {
+      this.lastStaleAlertAt = null;
+    }
+
+    // 2. Критичные сценарии: падение → алерт, восстановление → отбой.
+    for (const s of overview.scenarios) {
+      if (!CRITICAL_SCENARIOS.includes(s.scenario)) continue;
+      const ok = s.latestSuccess === true;
+      const prev = this.lastStatus.get(s.scenario);
+      if (!ok && (prev !== false || cooled(s.scenario))) {
+        const label = s.scenario === 'chat_streaming' ? 'AI-чат (r.linkeon.io)' : s.scenario;
+        await send(
+          `<b>🔴 Synthetic: критичный сценарий упал</b>\n` +
+          `Сценарий: <b>${label}</b>\n` +
+          `Ошибка: ${s.latestMessage ? String(s.latestMessage).slice(0, 160) : '—'}\n` +
+          `Успех за 24ч: ${s.successRate24hPct != null ? s.successRate24hPct.toFixed(0) + '%' : '—'} · проверка: ${s.latestTs || '—'}`,
+        );
+        this.lastAlertAt.set(s.scenario, now);
+      } else if (ok && prev === false) {
+        await send(`<b>🟢 Synthetic: «${s.scenario}» восстановлен</b>\nСнова отвечает (проверка: ${s.latestTs || '—'}).`);
+        this.lastAlertAt.delete(s.scenario);
+      }
+      this.lastStatus.set(s.scenario, ok);
+    }
+  }
 
   async onModuleInit() {
     if (!this.pg) return;
