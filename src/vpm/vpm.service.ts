@@ -265,7 +265,7 @@ export class VpmService implements OnModuleInit {
     // 7. User personas (rule-based segments — who actually uses the product).
     // Compact view so the prompt stays small; full detail is in the admin UI.
     try {
-      const p = await this.personas.getOverview();
+      const p = await this.personas.getLatest();
       snapshot.personas = {
         total_users: p.totalUsers,
         buckets: p.buckets.map((b) => ({

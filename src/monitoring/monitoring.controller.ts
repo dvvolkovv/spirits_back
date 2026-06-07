@@ -1,4 +1,5 @@
 import { Body, Controller, Get, Headers, Post, Query, Res, UnauthorizedException, UseGuards } from '@nestjs/common';
+import { CurrentUser } from '../common/decorators/user.decorator';
 import { Response } from 'express';
 import { MonitoringService } from './monitoring.service';
 import { LogsService } from './logs.service';
@@ -298,7 +299,19 @@ export class MonitoringController {
   @UseGuards(JwtGuard, AdminGuard)
   async getPersonas(@Res() res: Response) {
     try {
-      const data = await this.personas.getOverview();
+      const data = await this.personas.getLatest();
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'personas_failed', message: e?.message || String(e) });
+    }
+  }
+
+  // Кнопка «Обновить» в UI: реальный пересчёт + запись в persona_runs.
+  @Post('admin/monitoring/product/personas/recompute')
+  @UseGuards(JwtGuard, AdminGuard)
+  async recomputePersonas(@CurrentUser() u: any, @Res() res: Response) {
+    try {
+      const data = await this.personas.recompute(u?.userId ? String(u.userId) : null, 'manual');
       return res.status(200).json(data);
     } catch (e: any) {
       return res.status(500).json({ error: 'personas_failed', message: e?.message || String(e) });

@@ -1,13 +1,15 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { PgService } from '../../common/services/pg.service';
 
 /**
  * Personas — see monitoring.functions.md §3.9.
  *
  * Rule-based assignment, not clustering — at 40 active users k-means
- * gives noise. Recompute on each request (small dataset). When the
- * user base grows past ~500, persist into a user_personas table and
- * run a nightly cron instead.
+ * gives noise. The classification is plain SQL (no LLM → 0 tokens), but we
+ * persist each run into `persona_runs` (snapshot + meta) so the admin sees
+ * the same VPM-style "last run / cost" line and the «Обновить» button does a
+ * real, observable recompute instead of a silent re-fetch. When the user base
+ * grows past ~500, move the recompute onto a nightly cron.
  *
  * Rules:
  *   content_creator   ≥ 5 image/video generations
@@ -17,13 +19,20 @@ import { PgService } from '../../common/services/pg.service';
  *   curious           total messages < 5
  *   mixed             everything else
  *
- * Test users are excluded via the existing FUNNEL_EXCLUDED_USERS env.
+ * Excluded from the calculation:
+ *   - все админ-аккаунты (isadmin=true) — сюда же попадает владелец, т.к. раздел
+ *     «Персоны» виден только под AdminGuard. Динамически, без хардкода номера.
+ *   - канонический список тест-номеров (mirror auth.controller isTestPhone).
+ *   - что добавлено в env FUNNEL_EXCLUDED_USERS.
  */
 
-const DEFAULT_EXCLUDED = ['70000000000', '79030169187'];
-const EXCLUDED = (process.env.FUNNEL_EXCLUDED_USERS || '')
+// Канонический whitelist тест-номеров (синхронно с auth.controller.isTestPhone).
+const TEST_PHONES = ['70000000000', '79030169187', '79169403771', '79656445804'];
+const ENV_EXCLUDED = (process.env.FUNNEL_EXCLUDED_USERS || '')
   .split(',').map((s) => s.trim()).filter(Boolean);
-const excluded = EXCLUDED.length > 0 ? EXCLUDED : DEFAULT_EXCLUDED;
+// Тест-номера + env. Админы исключаются отдельно подзапросом по isadmin (ловит
+// владельца автоматически, даже если его номер не в списке).
+const excluded = Array.from(new Set([...TEST_PHONES, ...ENV_EXCLUDED]));
 
 export type PersonaKey = 'business' | 'personal_growth' | 'content_creator' | 'smm' | 'curious' | 'mixed';
 
@@ -40,11 +49,22 @@ export interface PersonaBucket {
   topAssistants: Array<{ name: string; displayName: string | null; share: number }>;
 }
 
+export interface PersonaRunMeta {
+  createdAt: string;
+  triggeredBy: string | null;
+  trigger: 'manual' | 'cron' | 'auto';
+  durationMs: number | null;
+  totalUsers: number;
+  tokensSpent: number;     // всегда 0 — разметка правило-ориентированная, без LLM
+  error: string | null;
+}
+
 export interface PersonasOverview {
   generatedAt: string;
   excludedUsers: string[];
   totalUsers: number;
   buckets: PersonaBucket[];
+  lastRun?: PersonaRunMeta;   // мета пересчёта, породившего этот снапшот
 }
 
 const PERSONA_META: Record<PersonaKey, { label: string; description: string }> = {
@@ -75,11 +95,35 @@ const PERSONA_META: Record<PersonaKey, { label: string; description: string }> =
 };
 
 @Injectable()
-export class PersonasService {
+export class PersonasService implements OnModuleInit {
   private readonly log = new Logger(PersonasService.name);
   constructor(private readonly pg: PgService) {}
 
-  async getOverview(): Promise<PersonasOverview> {
+  async onModuleInit() {
+    // Лог пересчётов персон (VPM-стиль). tokens_spent всегда 0 — разметка
+    // правило-ориентированная, без LLM; колонка есть для единообразия UI.
+    try {
+      await this.pg.query(`
+        CREATE TABLE IF NOT EXISTS persona_runs (
+          id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          triggered_by  text,
+          trigger       text NOT NULL DEFAULT 'manual',
+          duration_ms   integer,
+          total_users   integer,
+          tokens_spent  integer NOT NULL DEFAULT 0,
+          error_message text,
+          snapshot      jsonb,
+          created_at    timestamptz NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS persona_runs_created_idx ON persona_runs (created_at DESC);
+      `);
+    } catch (e: any) {
+      this.log.error(`persona_runs migration failed: ${e.message}`);
+    }
+  }
+
+  // Чистый пересчёт по правилам (SQL, без LLM). Возвращает overview без lastRun.
+  private async computeOverview(): Promise<PersonasOverview> {
     const sql = `
       WITH
       -- per-user message volume + category share
@@ -96,6 +140,7 @@ export class PersonasService {
         WHERE e.name = 'message_sent'
           AND e.user_id IS NOT NULL
           AND e.user_id <> ALL($1::text[])
+          AND e.user_id NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
         GROUP BY e.user_id
       ),
       gen AS (
@@ -160,6 +205,7 @@ export class PersonasService {
         WHERE e.name = 'message_sent'
           AND e.user_id IS NOT NULL
           AND e.user_id <> ALL($1::text[])
+          AND e.user_id NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
       ),
       gen AS (
         SELECT user_id, SUM(c) AS gen_count FROM (
@@ -237,5 +283,75 @@ export class PersonasService {
       totalUsers,
       buckets: buckets.sort((a, b) => b.users - a.users),
     };
+  }
+
+  // Реальный пересчёт: гоняет правила, замеряет время, пишет строку в
+  // persona_runs (снапшот + мета) и возвращает свежий overview с lastRun.
+  // Это то, что дёргает кнопка «Обновить» — наблюдаемое действие, а не тихий
+  // повторный GET.
+  async recompute(triggeredBy: string | null, trigger: 'manual' | 'cron' | 'auto' = 'manual'): Promise<PersonasOverview> {
+    const t0 = Date.now();
+    let overview: PersonasOverview | null = null;
+    let error: string | null = null;
+    try {
+      overview = await this.computeOverview();
+    } catch (e: any) {
+      error = e?.message || String(e);
+      this.log.error(`personas recompute failed: ${error}`);
+    }
+    const durationMs = Date.now() - t0;
+    const totalUsers = overview?.totalUsers ?? 0;
+
+    let createdAt = new Date().toISOString();
+    try {
+      const ins = await this.pg.query(
+        `INSERT INTO persona_runs (triggered_by, trigger, duration_ms, total_users, tokens_spent, error_message, snapshot)
+         VALUES ($1, $2, $3, $4, 0, $5, $6)
+         RETURNING created_at`,
+        [triggeredBy, trigger, durationMs, totalUsers, error, overview ? JSON.stringify(overview) : null],
+      );
+      createdAt = new Date(ins.rows[0]?.created_at ?? createdAt).toISOString();
+    } catch (e: any) {
+      this.log.error(`persona_runs insert failed: ${e.message}`);
+    }
+
+    const lastRun: PersonaRunMeta = {
+      createdAt, triggeredBy, trigger, durationMs, totalUsers, tokensSpent: 0, error,
+    };
+    if (!overview) {
+      // Пересчёт упал — отдаём пустой каркас + мету с ошибкой, чтобы UI показал её.
+      return { generatedAt: createdAt, excludedUsers: excluded, totalUsers: 0, buckets: [], lastRun };
+    }
+    return { ...overview, lastRun };
+  }
+
+  // Отдаёт последний сохранённый снапшот + мету последнего запуска (мгновенно,
+  // без пересчёта). Если снапшотов ещё нет — считает первый раз (trigger=auto).
+  async getLatest(): Promise<PersonasOverview> {
+    let row: any = null;
+    try {
+      const r = await this.pg.query(
+        `SELECT triggered_by, trigger, duration_ms, total_users, tokens_spent, error_message, snapshot, created_at
+           FROM persona_runs
+          WHERE snapshot IS NOT NULL AND error_message IS NULL
+          ORDER BY created_at DESC LIMIT 1`,
+      );
+      row = r.rows[0] ?? null;
+    } catch (e: any) {
+      this.log.error(`persona_runs read failed: ${e.message}`);
+    }
+    if (!row) return this.recompute(null, 'auto');
+
+    const snap: PersonasOverview = typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot;
+    const lastRun: PersonaRunMeta = {
+      createdAt: new Date(row.created_at).toISOString(),
+      triggeredBy: row.triggered_by ?? null,
+      trigger: row.trigger,
+      durationMs: row.duration_ms ?? null,
+      totalUsers: row.total_users ?? snap.totalUsers ?? 0,
+      tokensSpent: row.tokens_spent ?? 0,
+      error: row.error_message ?? null,
+    };
+    return { ...snap, lastRun };
   }
 }
