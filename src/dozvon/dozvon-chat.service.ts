@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Response } from 'express';
 import { PgService } from '../common/services/pg.service';
-import Anthropic from '@anthropic-ai/sdk';
+import { query } from '@anthropic-ai/claude-agent-sdk';
 
 const MODEL = 'claude-sonnet-4-5';
 const MAX_HISTORY = 40;
@@ -55,7 +55,6 @@ export interface ChatMessage {
 @Injectable()
 export class DozvonChatService {
   private readonly logger = new Logger(DozvonChatService.name);
-  private readonly anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
   constructor(private readonly pg: PgService) {}
 
@@ -111,30 +110,45 @@ export class DozvonChatService {
         }`
       : '';
 
+    // Agent SDK не принимает messages-array — собираем prompt из истории.
+    const priorTurns = history
+      .slice(-MAX_HISTORY)
+      .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
+      .join('\n\n');
+
     let assistantText = '';
     try {
-      // Server-side web_search tool — Anthropic делает поиск сам, результат
-      // автоматически вплетается в генерацию. Нам ничего исполнять не нужно.
-      const stream = this.anthropic.messages.stream({
-        model: MODEL,
-        max_tokens: 4096,
-        system: SYSTEM_PROMPT + contextNote,
-        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 5 } as any],
-        messages: history.slice(-MAX_HISTORY).map((m) => ({ role: m.role, content: m.content })),
-      });
-      stream.on('text', (text: string) => {
-        assistantText += text;
-        res.write(JSON.stringify({ type: 'delta', text }) + '\n');
-      });
-      // Сигнал фронту когда начинается web-поиск.
-      stream.on('inputJson', () => {/* noop */});
-      stream.on('streamEvent', (ev: any) => {
-        if (ev?.type === 'content_block_start' && ev.content_block?.type === 'server_tool_use' &&
-            ev.content_block?.name === 'web_search') {
-          res.write(JSON.stringify({ type: 'tool', name: 'web_search', query: ev.content_block.input?.query || '' }) + '\n');
+      for await (const event of query({
+        prompt: priorTurns,
+        options: {
+          model: MODEL,
+          systemPrompt: SYSTEM_PROMPT + contextNote,
+          allowedTools: ['WebSearch'],
+          permissionMode: 'bypassPermissions',
+          settingSources: [],
+          includePartialMessages: true,
+        } as any,
+      })) {
+        // Text deltas → стриминг во фронт как раньше.
+        if (event.type === 'stream_event') {
+          const inner = (event as any).event;
+          if (inner?.type === 'content_block_delta' && inner.delta?.type === 'text_delta'
+              && typeof inner.delta.text === 'string') {
+            const text = inner.delta.text;
+            assistantText += text;
+            res.write(JSON.stringify({ type: 'delta', text }) + '\n');
+          }
         }
-      });
-      await stream.finalMessage();
+        // Сигнал фронту о начале web-поиска (нужно для UI-индикатора "ищу").
+        if (event.type === 'assistant') {
+          for (const block of ((event as any).message?.content || []) as any[]) {
+            if (block.type === 'tool_use' && block.name === 'WebSearch') {
+              const q = String(block.input?.query || '');
+              res.write(JSON.stringify({ type: 'tool', name: 'web_search', query: q }) + '\n');
+            }
+          }
+        }
+      }
     } catch (e: any) {
       this.logger.error(`streamChat error: ${e.message}`);
       assistantText = assistantText || 'Произошла ошибка. Попробуйте ещё раз.';
