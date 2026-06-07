@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
+import { shouldSkipTaskExtraction } from './extract-prefilter';
 
 function cosineSim(a: number[], b: number[]): number {
   if (!a || !b || a.length !== b.length) return 0;
@@ -85,6 +86,7 @@ export class TasksService implements OnModuleInit {
     assistantMessage: string,
   ): Promise<void> {
     if (!this.pg) return;
+    if (shouldSkipTaskExtraction(userMessage)) return;
     const anthropicKey = process.env.ANTHROPIC_API_KEY;
     if (!anthropicKey) return;
 
