@@ -34,7 +34,6 @@ ssh_test() { ssh -o StrictHostKeyChecking=accept-new "$TEST_HOST" "$@"; }
 BACK_KEYS=(
   GOOGLE_AI_API_KEY
   OPENROUTER_API_KEY
-  ANTHROPIC_API_KEY
   PERPLEXITY_API_KEY
   DEEPSEEK_API_KEY
   KLING_ACCESS_KEY
