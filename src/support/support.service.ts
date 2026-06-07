@@ -3,7 +3,8 @@ import {
 } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
-import Anthropic from '@anthropic-ai/sdk';
+import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
 import { PgService } from '../common/services/pg.service';
 import {
   SupportTicketRow, SupportMessageRow, PostUserMessageDto, LIMITS, SenderType,
@@ -12,104 +13,15 @@ import { TelegramNotifierService } from './telegram-notifier.service';
 import { VideoService } from '../video/video.service';
 import { CreateVideoJobDto } from '../video/video.dto';
 
-const SUPPORT_TOOLS = [
-  {
-    name: 'get_user_context',
-    description:
-      'Fetch current user context: token balance, isAdmin flag, email, preferred agent, profile name, account age.',
-    input_schema: { type: 'object', properties: {}, required: [] },
-  },
-  {
-    name: 'get_recent_jobs',
-    description:
-      'List the user\'s most recent image/video generation jobs (last 10). Useful if they complain about a generation that failed, was slow, or returned wrong result.',
-    input_schema: {
-      type: 'object',
-      properties: { kind: { type: 'string', enum: ['video', 'image', 'all'], default: 'all' } },
-      required: [],
-    },
-  },
-  {
-    name: 'check_service_health',
-    description:
-      'Return current status of platform services (backend, database, LLM, Kling, payments). Call this when the user reports something is broken or you need to verify availability before answering.',
-    input_schema: { type: 'object', properties: {}, required: [] },
-  },
-  {
-    name: 'refund_tokens',
-    description:
-      `Credit tokens back to the user when there is a clear, verifiable reason.
-Legitimate reasons (call this ONLY in these cases):
-  * A video/image generation has status='failed' AND the failure is tied to an upstream service issue (confirmed via check_service_health or get_recent_jobs).
-  * The user reports a double-charge AND get_recent_jobs shows two identical jobs created within 60s.
-  * Service_health shows the relevant service was 'down' at the time of a failed charge.
-DO NOT call refund_tokens when:
-  * User simply wants more tokens or is dissatisfied with the result quality (that's NOT a bug).
-  * You cannot confirm the failure via tools.
-  * The user wants a cash refund (only owner can do that — escalate instead).
-Hard limits enforced by backend:
-  * ≤ 10 000 tokens per call, ≤ 20 000 per ticket total, ≤ 30 000 per user per day.
-If you exceed limits, the call will fail and you should escalate_to_owner.`,
-    input_schema: {
-      type: 'object',
-      properties: {
-        amount: { type: 'integer', description: 'Tokens to credit. Must equal the tokens_spent of the failed job(s).' },
-        reason: { type: 'string', description: 'Concrete reason citing evidence (e.g. "video job abc123 failed, Kling was degraded at the time")' },
-        reference: { type: 'string', description: 'Optional related entity id (video_job id, payment id, etc.)' },
-      },
-      required: ['amount', 'reason'],
-    },
-  },
-  {
-    name: 'rerun_failed_job',
-    description:
-      `Re-queue a failed video-generation job for the user. The original job must have status='failed' and the failure must be tied to an upstream issue (Kling timeout, degraded service, etc.) — verify via get_recent_jobs and check_service_health first.
-Behaviour:
-  * Refunds the tokens spent on the failed job (same amount, same safe-limits as refund_tokens).
-  * Queues an identical new job with the same prompt and parameters.
-  * Net token balance unchanged; user gets a new job id to watch.
-Do not call this for:
-  * text2video → rerun supported ✓
-  * image2video → rerun supported ✓
-  * extend / lipsync → not yet supported, just refund and tell user to re-submit manually.`,
-    input_schema: {
-      type: 'object',
-      properties: {
-        job_id: { type: 'string', description: 'UUID of the failed video_jobs row' },
-      },
-      required: ['job_id'],
-    },
-  },
-  {
-    name: 'escalate_to_owner',
-    description:
-      'Flag the ticket for a human owner to pick up. Use when: user explicitly asks for a human, you cannot solve the issue with available tools, you detect a payment/refund dispute, refund_tokens failed due to limits, or you have asked clarifying questions 3+ times without progress.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        reason: { type: 'string', description: 'Short reason why human is needed' },
-        urgency: { type: 'string', enum: ['low', 'normal', 'high', 'critical'], default: 'normal' },
-        summary: { type: 'string', description: 'One-paragraph summary of the situation for the owner' },
-      },
-      required: ['reason', 'summary'],
-    },
-  },
-];
-
 @Injectable()
 export class SupportService implements OnModuleInit {
   private readonly logger = new Logger(SupportService.name);
-  private anthropic: Anthropic | null = null;
 
   constructor(
     private readonly pg: PgService,
     @Optional() private readonly telegram?: TelegramNotifierService,
     @Optional() private readonly video?: VideoService,
-  ) {
-    if (process.env.ANTHROPIC_API_KEY) {
-      this.anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    }
-  }
+  ) {}
 
   async onModuleInit() {
     const candidates = [
@@ -326,20 +238,12 @@ export class SupportService implements OnModuleInit {
   // -------------------- AI response (tool-loop) --------------------
 
   private async generateAiResponse(ticketId: string, userId: string): Promise<void> {
-    if (!this.anthropic) {
-      await this.insertMessage(ticketId, 'ai', null,
-        'Поддержка сейчас недоступна (AI не сконфигурирован). Мы уведомили команду — они ответят в ближайшее время.',
-        { error: 'no_anthropic_key' });
-      await this.escalate(ticketId, userId, 'AI key missing', 'critical', 'AI unavailable — manual handling required.');
-      return;
-    }
-
     const history = await this.listMessages(userId, ticketId, true);
     const profile = await this.getUserContextData(userId);
     const health = await this.getServiceHealth();
 
     const systemPrompt = this.buildSystemPrompt(profile, health);
-    const conversation: any[] = history
+    const conversation = history
       .filter((m) => m.sender_type === 'user' || m.sender_type === 'ai' || m.sender_type === 'owner')
       .map((m) => ({
         role: m.sender_type === 'user' ? 'user' : 'assistant',
@@ -351,52 +255,54 @@ export class SupportService implements OnModuleInit {
       return;
     }
 
+    // Свернём conversation в plain-text prompt: Agent SDK не принимает messages-array
+    // напрямую. История prior turns + последняя реплика пользователя.
+    const lastUser = conversation[conversation.length - 1].content;
+    const priorTurns = conversation.slice(0, -1)
+      .map((t) => `${t.role.toUpperCase()}: ${t.content}`)
+      .join('\n\n');
+    const prompt = priorTurns ? `${priorTurns}\n\nUSER: ${lastUser}` : `USER: ${lastUser}`;
+
+    const mcp = this.buildSupportMcp(ticketId, userId);
     let finalText = '';
     let escalated = false;
     const toolInvocations: any[] = [];
 
-    for (let turn = 0; turn < LIMITS.AI_MAX_TURNS; turn++) {
-      let resp: any;
-      try {
-        resp = await this.anthropic.messages.create({
-          model: 'claude-opus-4-7',
-          max_tokens: 1500,
-          system: systemPrompt,
-          tools: SUPPORT_TOOLS as any,
-          messages: conversation,
-        });
-      } catch (e: any) {
-        this.logger.error(`anthropic error: ${e.message}`);
-        await this.insertMessage(ticketId, 'ai', null,
-          'Извините, у меня сейчас временные проблемы со связью. Попробуйте переформулировать или напишите ещё раз через минуту — если не получится, я передам команде.',
-          { error: e.message });
-        return;
+    try {
+      for await (const event of query({
+        prompt,
+        options: {
+          model: 'claude-haiku-4-5',
+          systemPrompt,
+          mcpServers: { 'support-tools': mcp },
+          permissionMode: 'bypassPermissions',
+          settingSources: [],
+          maxTurns: LIMITS.AI_MAX_TURNS,
+        } as any,
+      })) {
+        if (event.type === 'assistant') {
+          for (const block of ((event as any).message?.content || []) as any[]) {
+            if (block.type === 'text' && typeof block.text === 'string') {
+              finalText += block.text;
+            }
+            if (block.type === 'tool_use') {
+              // Сохраняем имя без mcp__ префикса для удобства чтения в БД.
+              const name = String(block.name || '').replace(/^mcp__[^_]+__/, '');
+              toolInvocations.push({ name, input: block.input });
+              if (name === 'escalate_to_owner') escalated = true;
+            }
+          }
+        }
       }
-
-      // Assemble assistant turn into conversation (needed for follow-up turns)
-      conversation.push({ role: 'assistant', content: resp.content });
-
-      const toolUseBlocks = (resp.content || []).filter((b: any) => b?.type === 'tool_use');
-      const textBlocks = (resp.content || []).filter((b: any) => b?.type === 'text');
-      const currentText = textBlocks.map((b: any) => b.text).join('').trim();
-      if (currentText) finalText = currentText;
-
-      if (resp.stop_reason !== 'tool_use' || toolUseBlocks.length === 0) break;
-
-      const toolResults: any[] = [];
-      for (const tu of toolUseBlocks) {
-        const result = await this.executeTool(ticketId, userId, tu.name, tu.input || {});
-        toolInvocations.push({ name: tu.name, input: tu.input, result });
-        if (tu.name === 'escalate_to_owner') escalated = true;
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: tu.id,
-          content: JSON.stringify(result),
-        });
-      }
-      conversation.push({ role: 'user', content: toolResults });
+    } catch (e: any) {
+      this.logger.error(`support OAuth error: ${e.message}`);
+      await this.insertMessage(ticketId, 'ai', null,
+        'Извините, у меня сейчас временные проблемы со связью. Попробуйте переформулировать или напишите ещё раз через минуту — если не получится, я передам команде.',
+        { error: e.message });
+      return;
     }
 
+    finalText = finalText.trim();
     if (!finalText) {
       finalText = escalated
         ? 'Передал вопрос команде. С вами свяжутся отсюда в этом же чате, как только разберутся.'
@@ -404,10 +310,65 @@ export class SupportService implements OnModuleInit {
     }
 
     await this.insertMessage(ticketId, 'ai', null, finalText, { tools: toolInvocations });
+  }
 
-    if (escalated) {
-      // already handled by escalate_to_owner tool; nothing else to do here
-    }
+  // MCP-сервер для tool-loop: 1:1 порт SUPPORT_TOOLS на zod-схемы Agent SDK.
+  // Handlers закрывают замыкания на ticketId/userId, дальше делегируют в
+  // существующий executeTool — тот ничего не знает про MCP, остаётся как был.
+  private buildSupportMcp(ticketId: string, userId: string): any {
+    const dispatch = async (name: string, args: any) => {
+      const result = await this.executeTool(ticketId, userId, name, args || {});
+      return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+    };
+    return createSdkMcpServer({
+      name: 'support-tools',
+      tools: [
+        tool(
+          'get_user_context',
+          'Fetch current user context: token balance, isAdmin flag, email, preferred agent, profile name, account age.',
+          {},
+          async (a: any) => dispatch('get_user_context', a),
+        ),
+        tool(
+          'get_recent_jobs',
+          "List the user's most recent image/video generation jobs (last 10). Useful if they complain about a generation that failed, was slow, or returned wrong result.",
+          { kind: z.enum(['video', 'image', 'all']).optional() },
+          async (a: any) => dispatch('get_recent_jobs', a),
+        ),
+        tool(
+          'check_service_health',
+          'Return current status of platform services (backend, database, LLM, Kling, payments). Call this when the user reports something is broken or you need to verify availability before answering.',
+          {},
+          async (a: any) => dispatch('check_service_health', a),
+        ),
+        tool(
+          'refund_tokens',
+          'Credit tokens back to the user when there is a clear, verifiable reason (failed job tied to upstream issue, confirmed double-charge, service was down at charge time). DO NOT use just because user wants more tokens or is unhappy with quality. Hard limits: ≤10k per call, ≤20k per ticket, ≤30k per user/day — exceeding fails the call, then escalate.',
+          {
+            amount: z.number().int(),
+            reason: z.string(),
+            reference: z.string().optional(),
+          },
+          async (a: any) => dispatch('refund_tokens', a),
+        ),
+        tool(
+          'rerun_failed_job',
+          'Re-queue a failed video-generation job: refunds tokens + queues identical new job. Verify failure tied to upstream issue first. Supported modes: text2video, image2video. Not yet supported: extend, lipsync — refund and tell user to re-submit manually.',
+          { job_id: z.string() },
+          async (a: any) => dispatch('rerun_failed_job', a),
+        ),
+        tool(
+          'escalate_to_owner',
+          'Flag the ticket for a human owner to pick up. Use when: user explicitly asks for a human, you cannot solve the issue with available tools, you detect a payment/refund dispute, refund_tokens failed due to limits, or you have asked clarifying questions 3+ times without progress.',
+          {
+            reason: z.string(),
+            urgency: z.enum(['low', 'normal', 'high', 'critical']).optional(),
+            summary: z.string(),
+          },
+          async (a: any) => dispatch('escalate_to_owner', a),
+        ),
+      ],
+    });
   }
 
   private buildSystemPrompt(profile: any, health?: { services: any[] }): string {

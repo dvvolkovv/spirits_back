@@ -24,7 +24,7 @@
 - **Backend:** NestJS 10, TypeScript, PostgreSQL 16, Redis, Neo4j (Docker), PM2
 - **Frontend:** React 18, TypeScript, Vite 5, Tailwind CSS, pnpm
 - **Auth:** JWT HS256 (access 2h, refresh 30d), SMS OTP через SMS Aero
-- **AI:** OpenRouter (GPT-4o-mini), Anthropic SDK (fallback)
+- **AI:** Claude через OAuth (Claude Max subscription, credentials в `~/.claude/.credentials.json` на сервере) — все LLM-консьюмеры (Маша, support, dozvon, tasks-extractor, scan-document, search/compat, neo4j, profile-compaction, Юля, остальные агенты через `r.linkeon.io`). OpenAI/OpenRouter (`gpt-4o-mini`) — fallback в neo4j/profile-compaction. DeepSeek — отдельный канал для бесплатного приветствия. **ANTHROPIC_API_KEY больше не используется** — если случится OAuth-сбой, чинить через `claude auth login` на сервере, не через возврат API-ключа.
 - **Payments:** YooKassa
 - **Storage:** Локальные файлы (avatars, images) через Nginx /static/
 

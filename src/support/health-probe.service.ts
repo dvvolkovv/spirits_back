@@ -118,40 +118,58 @@ export class HealthProbeService implements OnModuleInit {
   private async probeAnthropic(): Promise<ProbeResult> {
     const claudeBin = process.env.CLAUDE_BIN ?? '/usr/bin/claude';
     const t0 = Date.now();
-    return new Promise<ProbeResult>((resolve) => {
+
+    // Binary check
+    const binResult = await new Promise<{ ok: boolean; err: string | null }>((resolve) => {
       const { spawn } = require('child_process');
       const proc = spawn(claudeBin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
-      let out = '';
       let err = '';
-      proc.stdout.on('data', (b: Buffer) => { out += b.toString(); });
       proc.stderr.on('data', (b: Buffer) => { err += b.toString(); });
-      proc.on('close', (code: number) => {
-        const lat = Date.now() - t0;
-        if (code === 0) {
-          resolve({
-            service: 'anthropic',
-            status: 'healthy',
-            latencyMs: lat,
-            lastError: null,
-          });
-        } else {
-          resolve({
-            service: 'anthropic',
-            status: 'down',
-            latencyMs: lat,
-            lastError: `claude --version exit ${code}: ${err.slice(0, 100) || out.slice(0, 100)}`,
-          });
-        }
-      });
-      proc.on('error', (e: Error) => {
-        resolve({
-          service: 'anthropic',
-          status: 'down',
-          latencyMs: Date.now() - t0,
-          lastError: e.message,
-        });
-      });
+      proc.on('close', (code: number) => resolve({ ok: code === 0, err: code === 0 ? null : `claude --version exit ${code}: ${err.slice(0, 100)}` }));
+      proc.on('error', (e: Error) => resolve({ ok: false, err: e.message }));
     });
+
+    if (!binResult.ok) {
+      return { service: 'anthropic', status: 'down', latencyMs: Date.now() - t0, lastError: binResult.err };
+    }
+
+    // OAuth credentials check — фиксирует expired token / missing creds до того как Юля начнёт падать.
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+    const credsPath = path.join(os.homedir(), '.claude', '.credentials.json');
+    let credsDetails: { expiresInMin: number | null; subscriptionType: string | null } = { expiresInMin: null, subscriptionType: null };
+    let credsError: string | null = null;
+
+    try {
+      const raw = fs.readFileSync(credsPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      const oauth = parsed?.claudeAiOauth;
+      if (!oauth?.accessToken) {
+        credsError = 'credentials.json missing claudeAiOauth.accessToken';
+      } else {
+        const expiresAt = Number(oauth.expiresAt ?? 0);
+        const expiresInMs = expiresAt - Date.now();
+        credsDetails = {
+          expiresInMin: expiresAt ? Math.floor(expiresInMs / 60000) : null,
+          subscriptionType: oauth.subscriptionType ?? null,
+        };
+        if (expiresAt && expiresInMs < 0) {
+          credsError = `OAuth token expired ${Math.abs(Math.floor(expiresInMs / 60000))}min ago`;
+        }
+      }
+    } catch (e: any) {
+      credsError = `credentials.json: ${e.message}`;
+    }
+
+    const lat = Date.now() - t0;
+    return {
+      service: 'anthropic',
+      status: credsError ? 'degraded' : 'healthy',
+      latencyMs: lat,
+      lastError: credsError,
+      details: credsDetails,
+    };
   }
 
   private async probeOpenRouter(): Promise<ProbeResult> {
