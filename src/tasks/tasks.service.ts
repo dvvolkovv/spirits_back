@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
+import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { shouldSkipTaskExtraction } from './extract-prefilter';
 
 function cosineSim(a: number[], b: number[]): number {
@@ -40,7 +41,10 @@ export class TasksService implements OnModuleInit {
   // semantic search, если юзер «помнишь когда-то...».
   private readonly ACTIVE_TTL_DAYS = 60;
 
-  constructor(@Optional() private readonly pg?: PgService) {}
+  constructor(
+    @Optional() private readonly pg?: PgService,
+    @Optional() private readonly claudeCli?: ClaudeCliService,
+  ) {}
 
   async onModuleInit() {
     if (!this.pg) return;
@@ -87,8 +91,7 @@ export class TasksService implements OnModuleInit {
   ): Promise<void> {
     if (!this.pg) return;
     if (shouldSkipTaskExtraction(userMessage)) return;
-    const anthropicKey = process.env.ANTHROPIC_API_KEY;
-    if (!anthropicKey) return;
+    if (!this.claudeCli) return;
 
     try {
       const active = await this.listActive(userId);
@@ -378,9 +381,7 @@ export class TasksService implements OnModuleInit {
     assistantMessage: string,
     activeTasks: TaskRow[],
   ): Promise<any | null> {
-    const Anthropic = require('@anthropic-ai/sdk');
-    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
+    if (!this.claudeCli) return null;
     const activeBlock = activeTasks.length === 0
       ? '(нет активных задач)'
       : activeTasks
@@ -424,12 +425,13 @@ ${assistantMessage.slice(0, 3000)}
 ИЛИ
 {"action": "create", "title": "...", "summary": "...", "claudemd": "...", "firstEventContent": "..."}`;
 
-    const msg = await client.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 2048,
-      messages: [{ role: 'user', content: prompt }],
-    });
-    const text = msg.content?.[0]?.text || '';
+    let text: string;
+    try {
+      text = await this.claudeCli.text(prompt, { model: 'claude-haiku-4-5' });
+    } catch (e: any) {
+      this.logger.warn(`tasks askLLMForDecision OAuth failed: ${e?.message}`);
+      return null;
+    }
     const parsed = this.parseJsonTolerant(text);
     if (!parsed?.action) return null;
     if (!['none', 'append', 'create'].includes(parsed.action)) return null;
