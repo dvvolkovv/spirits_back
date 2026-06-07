@@ -14,6 +14,7 @@ import { ChurnService } from './product/churn.service';
 import { SupportService, SupportWindow } from './product/support.service';
 import { ContentService, ContentWindow } from './product/content.service';
 import { PersonasService } from './product/personas.service';
+import { AttributionService } from './product/attribution.service';
 import { SmsHealthService } from './sms-health.service';
 import { OpenRouterHealthService } from './openrouter-health.service';
 import { ElevenLabsHealthService } from './elevenlabs-health.service';
@@ -49,6 +50,7 @@ export class MonitoringController {
     private readonly support: SupportService,
     private readonly content: ContentService,
     private readonly personas: PersonasService,
+    private readonly attribution: AttributionService,
     private readonly smsHealth: SmsHealthService,
     private readonly openrouterHealth: OpenRouterHealthService,
     private readonly elevenlabsHealth: ElevenLabsHealthService,
@@ -303,6 +305,20 @@ export class MonitoringController {
       return res.status(200).json(data);
     } catch (e: any) {
       return res.status(500).json({ error: 'personas_failed', message: e?.message || String(e) });
+    }
+  }
+
+  // Воронка по источникам привлечения (UTM/referral/referrer) — атрибуция до
+  // оплаты (задача маркетолога d5245dce). window — дней (по умолчанию 30).
+  @Get('admin/monitoring/product/attribution')
+  @UseGuards(JwtGuard, AdminGuard)
+  async getAttribution(@Query('window') window: string | undefined, @Res() res: Response) {
+    const wd = window ? parseInt(window, 10) : 30;
+    try {
+      const data = await this.attribution.getOverview(isNaN(wd) ? 30 : wd);
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'attribution_failed', message: e?.message || String(e) });
     }
   }
 
