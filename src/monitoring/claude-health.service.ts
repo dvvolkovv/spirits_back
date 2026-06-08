@@ -261,9 +261,14 @@ export class ClaudeHealthService implements OnModuleInit {
   // and no spend; success means the key is live and not revoked. Doesn't
   // expose balance — Anthropic doesn't have a public balance endpoint
   // even for non-admin keys.
+  // NB: после миграции на OAuth-подписку (Дмитрий, 2026-06-07) ANTHROPIC_API_KEY
+  // штатно ОТСУТСТВУЕТ в .env — весь AI идёт через OAuth (claude CLI / Agent SDK).
+  // Поэтому отсутствие ключа — это норма (OAuth-режим), а не сбой: возвращаем
+  // apiKeyValid=null без ошибки, чтобы мониторинг не показывал ложную проблему.
+  // Реальный сигнал здоровья AI — liveness-проба (probeLiveness, OAuth).
   private async probeApiKey(): Promise<{ apiKeyValid: boolean | null; apiKeyError: string | null }> {
     const key = process.env.ANTHROPIC_API_KEY;
-    if (!key) return { apiKeyValid: null, apiKeyError: 'ANTHROPIC_API_KEY not set' };
+    if (!key) return { apiKeyValid: null, apiKeyError: null };
     try {
       const r = await axios.get('https://api.anthropic.com/v1/models', {
         headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' },
