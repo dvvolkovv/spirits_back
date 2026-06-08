@@ -359,7 +359,7 @@ export class SupportService implements OnModuleInit {
       let resp: any;
       try {
         resp = await this.anthropic.messages.create({
-          model: 'claude-opus-4-7',
+          model: 'claude-haiku-4-5-20251001',
           max_tokens: 1500,
           system: systemPrompt,
           tools: SUPPORT_TOOLS as any,

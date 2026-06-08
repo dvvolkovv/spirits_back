@@ -161,7 +161,7 @@ export class IdentityService implements OnModuleInit {
     this.logger.log(`welcome bonus ${this.WELCOME_BONUS} → ${userId}`);
   }
 
-  async linkMethod<P extends Provider>(userId: string, provider: P, data: ProviderData<P>): Promise<{ ok: true } | { ok: false; reason: 'conflict' | 'invalid' }> {
+  async linkMethod<P extends Provider>(userId: string, provider: P, data: ProviderData<P>): Promise<{ ok: true } | { ok: false; reason: 'conflict' | 'invalid'; conflictUserId?: string }> {
     if (!this.pg) return { ok: false, reason: 'invalid' };
 
     const providerSub = this.normalize(provider, data);
@@ -173,7 +173,7 @@ export class IdentityService implements OnModuleInit {
     );
     if (existing.rows.length) {
       if (existing.rows[0].user_id === userId) return { ok: true };
-      return { ok: false, reason: 'conflict' };
+      return { ok: false, reason: 'conflict', conflictUserId: existing.rows[0].user_id };
     }
     await this.pg.query(
       `INSERT INTO user_identities (user_id, provider, provider_sub, email, email_verified, last_used_at)
@@ -181,6 +181,27 @@ export class IdentityService implements OnModuleInit {
       [userId, provider, providerSub, email, verified],
     );
     return { ok: true };
+  }
+
+  async mergeAccounts(conflictUserId: string, targetUserId: string): Promise<void> {
+    if (!this.pg) throw new Error('pg not configured');
+    await this.pg.query(
+      `UPDATE user_identities SET user_id = $1 WHERE user_id = $2`,
+      [targetUserId, conflictUserId],
+    );
+    await this.pg.query(
+      `UPDATE user_id SET state = 'deleted', update_date = now() WHERE internal_id = $1`,
+      [conflictUserId],
+    );
+  }
+
+  async getTokenBalance(userId: string): Promise<number> {
+    if (!this.pg) return 0;
+    const res = await this.pg.query(
+      `SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1`,
+      [userId],
+    );
+    return Number(res.rows[0]?.tokens ?? 0);
   }
 
   async unlinkMethod(userId: string, identityId: string): Promise<{ ok: true } | { ok: false; reason: 'last_method' }> {

@@ -290,6 +290,10 @@ write_env_files() {
   # shellcheck disable=SC1090
   . "$LOCAL_ENV_FILE"
 
+  # Если в LOCAL_ENV_FILE есть API-ключи (положены sync-api-keys-to-test.sh),
+  # они попадут в .env через shell-expansion ниже. Иначе — пустые строки.
+  _k() { eval "echo \"\${${1}:-}\""; }
+
   ssh_test "bash -s" <<REMOTE
 set -eo pipefail
 cat > ~/spirits_back/.env <<EOF
@@ -297,10 +301,10 @@ NODE_ENV=production
 PORT=3001
 DEBUG_SMS_CODES=true
 
-SMSAERO_LOGIN=
-SMSAERO_API_KEY=
-YOOKASSA_SHOP_ID=
-YOOKASSA_SECRET_KEY=
+SMSAERO_LOGIN=$(_k SMSAERO_LOGIN)
+SMSAERO_API_KEY=$(_k SMSAERO_API_KEY)
+YOOKASSA_SHOP_ID=$(_k YOOKASSA_SHOP_ID)
+YOOKASSA_SECRET_KEY=$(_k YOOKASSA_SECRET_KEY)
 
 JWT_ACCESS_SECRET=$JWT_ACCESS_SECRET
 JWT_REFRESH_SECRET=$JWT_REFRESH_SECRET

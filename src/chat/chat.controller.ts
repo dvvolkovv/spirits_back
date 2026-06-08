@@ -7,6 +7,11 @@ import { JwtService } from '../common/services/jwt.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { EventsService } from '../events/events.service';
 import * as fs from 'fs';
+import * as fsp from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
+import * as crypto from 'crypto';
+import { query } from '@anthropic-ai/claude-agent-sdk';
 
 @Controller('')
 export class ChatController {
@@ -250,9 +255,7 @@ export class ChatController {
   @Post('scan-document')
   @UseGuards(JwtGuard)
   async scanDocument(@CurrentUser() user: any, @Req() req: Request, @Res() res: Response) {
-    const anthropicKey = process.env.ANTHROPIC_API_KEY;
-    if (!anthropicKey) return res.status(500).json({ error: 'LLM not configured' });
-
+    let cwd: string | null = null;
     try {
       // Handle multipart file upload via multer
       const multer = require('multer');
@@ -267,41 +270,48 @@ export class ChatController {
       const file = (req as any).file;
       if (!file) return res.status(400).json({ error: 'No file uploaded' });
 
-      const base64 = file.buffer.toString('base64');
-      const mediaType = file.mimetype || 'application/pdf';
-      const filename = file.originalname || 'document.pdf';
+      // Записываем загруженный файл в одноразовый cwd, разрешаем Read tool —
+      // SDK прочитает PDF/изображение нативно через vision Claude.
+      cwd = path.join(os.tmpdir(), `scan-${crypto.randomUUID()}`);
+      await fsp.mkdir(cwd, { recursive: true });
+      const safeName = (file.originalname || 'document.pdf').replace(/[^\w.\-]/g, '_');
+      const filePath = path.join(cwd, safeName);
+      await fsp.writeFile(filePath, file.buffer);
 
-      const Anthropic = require('@anthropic-ai/sdk');
-      const client = new Anthropic({ apiKey: anthropicKey });
-      const msg = await client.messages.create({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 4096,
-        messages: [{
-          role: 'user',
-          content: [
-            {
-              type: 'document',
-              source: { type: 'base64', media_type: mediaType, data: base64 },
-            },
-            {
-              type: 'text',
-              text: `Проанализируй этот документ (${filename}) и извлеки профиль пользователя. Верни ТОЛЬКО JSON:
+      let collected = '';
+      for await (const event of query({
+        prompt: `Прочитай файл ${safeName} (он в текущей директории) и извлеки профиль пользователя. Верни ТОЛЬКО JSON без markdown-обёрток:
 {"name":"Имя","family_name":"Фамилия","profile":["факты"],"values":["ценности"],"skills":["навыки"],"beliefs":["убеждения"],"desires":["желания"],"interests":["интересы"],"search":["что ищет"]}`,
-            },
-          ],
-        }],
-      });
+        options: {
+          model: 'claude-haiku-4-5',
+          cwd,
+          allowedTools: ['Read'],
+          permissionMode: 'bypassPermissions',
+          settingSources: [],
+        } as any,
+      })) {
+        if (event.type === 'assistant') {
+          for (const block of ((event as any).message?.content || []) as any[]) {
+            if (block.type === 'text') collected += block.text;
+          }
+        }
+      }
 
-      let text = msg.content?.[0]?.text || '';
-      if (text.includes('```')) text = text.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
-      // Find JSON in response
+      let text = collected.trim();
+      if (text.includes('```')) {
+        text = text.replace(/^[\s\S]*?```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
+      }
       const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) return res.status(200).json({ output: { profile: [text] } });
+      if (!jsonMatch) return res.status(200).json({ output: { profile: [collected] } });
       const parsed = JSON.parse(jsonMatch[0]);
       return res.status(200).json({ output: parsed });
-    } catch (e) {
+    } catch (e: any) {
       console.error('scan-document error:', e);
       return res.status(500).json({ error: e.message || 'Document parsing failed' });
+    } finally {
+      if (cwd) {
+        await fsp.rm(cwd, { recursive: true, force: true }).catch(() => {});
+      }
     }
   }
 }

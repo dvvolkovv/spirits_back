@@ -287,7 +287,16 @@ location.replace('/chat');
 
     if (stateData.intent === 'link' && stateData.userId) {
       const r = await this.identity.linkMethod(stateData.userId, 'google', userInfo);
-      if (!r.ok) return res.set(CORS).status(409).json({ error: 'conflict' });
+      if (!r.ok) {
+        const rFail = r as { ok: false; reason: 'conflict' | 'invalid'; conflictUserId?: string };
+        if (rFail.reason === 'conflict' && rFail.conflictUserId) {
+          const mergeToken = require('crypto').randomBytes(24).toString('base64url');
+          const conflictTokens = await this.identity.getTokenBalance(rFail.conflictUserId);
+          await this.redis.set(`merge-token-${mergeToken}`, JSON.stringify({ targetUserId: stateData.userId, conflictUserId: rFail.conflictUserId }), 300);
+          return res.set(CORS).status(409).json({ error: 'conflict', mergeToken, conflictTokens });
+        }
+        return res.set(CORS).status(409).json({ error: 'conflict' });
+      }
       return res.set(CORS).status(200).json({ linked: true });
     }
 
@@ -318,7 +327,16 @@ location.replace('/chat');
 
     if (stateData.intent === 'link' && stateData.userId) {
       const r = await this.identity.linkMethod(stateData.userId, 'yandex', userInfo);
-      if (!r.ok) return res.set(CORS).status(409).json({ error: 'conflict' });
+      if (!r.ok) {
+        const rFail = r as { ok: false; reason: 'conflict' | 'invalid'; conflictUserId?: string };
+        if (rFail.reason === 'conflict' && rFail.conflictUserId) {
+          const mergeToken = require('crypto').randomBytes(24).toString('base64url');
+          const conflictTokens = await this.identity.getTokenBalance(rFail.conflictUserId);
+          await this.redis.set(`merge-token-${mergeToken}`, JSON.stringify({ targetUserId: stateData.userId, conflictUserId: rFail.conflictUserId }), 300);
+          return res.set(CORS).status(409).json({ error: 'conflict', mergeToken, conflictTokens });
+        }
+        return res.set(CORS).status(409).json({ error: 'conflict' });
+      }
       return res.set(CORS).status(200).json({ linked: true });
     }
 
@@ -327,6 +345,24 @@ location.replace('/chat');
       'access-token':  this.jwt.signAccess(userId),
       'refresh-token': this.jwt.signRefresh(userId),
     });
+  }
+
+  @UseGuards(JwtGuard)
+  @Post('auth/identities/merge')
+  async mergeAccounts(@Body() body: { mergeToken?: string }, @Req() req: any, @Res() res: Response) {
+    const targetUserId = req.user?.userId;
+    if (!targetUserId) return res.set(CORS).status(401).json({ error: 'unauthorized' });
+    const { mergeToken } = body || {};
+    if (!mergeToken) return res.set(CORS).status(400).json({ error: 'missing mergeToken' });
+
+    const raw = await this.redis.get(`merge-token-${mergeToken}`);
+    if (!raw) return res.set(CORS).status(400).json({ error: 'mergeToken expired or invalid' });
+    const { targetUserId: storedTarget, conflictUserId } = JSON.parse(raw);
+    if (storedTarget !== targetUserId) return res.set(CORS).status(403).json({ error: 'token mismatch' });
+
+    await this.redis.del(`merge-token-${mergeToken}`);
+    await this.identity.mergeAccounts(conflictUserId, targetUserId);
+    return res.set(CORS).status(200).json({ merged: true });
   }
 
   @UseGuards(JwtGuard)

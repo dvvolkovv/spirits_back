@@ -24,7 +24,27 @@ async function getJwt() {
   };
 }
 
+// Добавляет Basic Auth через page.route() — единственный надёжный способ когда nginx
+// не шлёт WWW-Authenticate challenge. Interceptor добавляет Authorization: Basic только
+// если заголовок ещё не установлен (Bearer-токены из React-app не затрагиваются).
+async function applyBasicAuth(page) {
+  const auth = process.env.BASIC_AUTH;
+  console.log('[applyBasicAuth] BASIC_AUTH:', auth ? `set (${auth.length} chars)` : 'NOT SET — skipping');
+  if (!auth) return;
+  const [u, ...r] = auth.split(':');
+  const encoded = Buffer.from(`${u}:${r.join(':')}`).toString('base64');
+  await page.route('**/*', async (route) => {
+    const headers = route.request().headers();
+    if (!headers['authorization']) {
+      await route.continue({ headers: { ...headers, authorization: `Basic ${encoded}` } });
+    } else {
+      await route.continue();
+    }
+  });
+}
+
 async function loginViaStorage(page) {
+  await applyBasicAuth(page);
   const { access, refresh } = await getJwt();
   // AuthContext requires BOTH `authToken` and `userData` to consider the
   // user logged in (see AuthContext.tsx initAuth). tokenManager reads
@@ -55,6 +75,7 @@ test.describe('my.linkeon.io smoke', () => {
     // directly (skipping AssistantSelection welcome card). We're just
     // smoke-testing that the UI shows the chat layout, not the actual
     // streaming — that's already covered by the API smoke.
+    await applyBasicAuth(page);
     const { access, refresh } = await getJwt();
     const userData = { phone: TEST_PHONE };
     const assistant = { id: 12, name: 'Роман', description: 'Помогаю делать все' };
@@ -131,11 +152,9 @@ test.describe('my.linkeon.io smoke', () => {
 
   test('per-tab independence: two contexts hold different assistants', async ({ browser }) => {
     // Open two isolated browser contexts (= two browser windows with separate sessionStorage).
-    // httpCredentials НЕ пробрасывается из playwright.config.use в browser.newContext() —
-    // нужно передавать вручную, иначе test.linkeon.io отдаст 401 от nginx Basic Auth.
-    const ctxOpts = process.env.BASIC_AUTH
-      ? { httpCredentials: (() => { const [u, ...r] = process.env.BASIC_AUTH.split(':'); return { username: u, password: r.join(':') }; })() }
-      : {};
+    // Basic Auth через page.route() в loginViaStorage → applyBasicAuth().
+    // extraHTTPHeaders не используем: переопределяет Bearer → API 401.
+    const ctxOpts = {};
     const c1 = await browser.newContext(ctxOpts);
     const c2 = await browser.newContext(ctxOpts);
     const p1 = await c1.newPage();

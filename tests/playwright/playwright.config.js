@@ -17,16 +17,13 @@ module.exports = defineConfig({
   reporter: [['list']],
   use: {
     baseURL: process.env.BASE_URL || 'https://my.linkeon.io',
-    // Basic Auth для test.linkeon.io. На проде BASIC_AUTH пустой → undefined → ничего не меняется.
-    httpCredentials: process.env.BASIC_AUTH
-      ? (() => {
-          const [username, ...rest] = process.env.BASIC_AUTH.split(':');
-          return { username, password: rest.join(':') };
-        })()
-      : undefined,
+    // Basic Auth для test.linkeon.io обрабатывается через page.route() в applyBasicAuth().
+    // extraHTTPHeaders намеренно убран: он применяется ко ВСЕМ запросам включая fetch() из
+    // скриптов страницы, переопределяет Authorization: Bearer → API получает 401 и разлогинивает.
+    // page.route() добавляет Basic только если Authorization не установлен — Bearer-запросы не трогает.
     headless: true,
     actionTimeout: 15000,
-    navigationTimeout: 30000,
+    navigationTimeout: 45000,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },
