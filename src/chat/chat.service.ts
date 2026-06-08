@@ -2,13 +2,11 @@ import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { KlingService } from '../misc/kling.service';
-import { ChatToolsService, CHAT_TOOLS } from './chat-tools';
+import { ChatToolsService } from './chat-tools';
 import { SmmProducerToolsService } from '../smm/producer/smm-producer-tools.service';
 import { ClaudeAgentService } from './claude-agent.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { TasksService } from '../tasks/tasks.service';
-import { EventsService } from '../events/events.service';
-import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import { Request, Response } from 'express';
 // Agent server at r.linkeon.io (remote Claude Code)
@@ -19,10 +17,9 @@ export class ChatService {
   // Множитель цены за текст для агентов, идущих через SDK-путь
   // (streamUniversalAgent → r.linkeon.io). Применяется только для текстовых
   // токенов; MCP-инструменты (картинки, видео) списываются их сервисами
-  // независимо и НЕ умножаются здесь. Не касается Маши (id=3, локальный
-  // ClaudeCliService — OAuth subscription, без отдельного API-биллинга).
+  // независимо и НЕ умножаются здесь. Маша считается отдельно — через
+  // total_cost_usd из ClaudeCliService.
   private readonly SDK_TEXT_MULTIPLIER = 2;
-  private anthropic: Anthropic | null = null;
 
   constructor(
     private readonly pg: PgService,
@@ -33,14 +30,7 @@ export class ChatService {
     private readonly claudeAgent: ClaudeAgentService,
     private readonly claudeCli: ClaudeCliService,
     @Optional() private readonly tasksService?: TasksService,
-    @Optional() private readonly events?: EventsService,
-  ) {
-    if (process.env.ANTHROPIC_API_KEY) {
-      this.anthropic = new Anthropic({
-        apiKey: process.env.ANTHROPIC_API_KEY,
-      });
-    }
-  }
+  ) {}
 
   async streamChat(
     userId: string,
@@ -61,12 +51,6 @@ export class ChatService {
       res.status(404).json({ error: 'Agent not found' });
       return;
     }
-
-    this.events?.track('message_sent', {
-      userId,
-      sessionId,
-      props: { assistant_id: String(agent.id), assistant_name: agent.name, length: message?.length || 0 },
-    });
 
     // Get chat history (individual rows: session_id, sender_type, content)
     const chatSessionId = `${userId}_${assistantId}`;
@@ -140,12 +124,11 @@ export class ChatService {
       return;
     }
 
-    // Route ALL agents except Маша (id=3) via streamUniversalAgent →
-    // r.linkeon.io with MCP tools (image/video/code execution).
-    // Cheaper, unified, MCP delivers Nano Banana + Kling natively.
-    // Маша runs locally via ClaudeCliService (OAuth subscription, no per-
-    // call billing) because her flow is metaphor-card driven, not tool-
-    // heavy; the card pull happens in post-processing below.
+    // Все агенты кроме Маши идут через streamUniversalAgent → r.linkeon.io
+    // (MCP image/video tools, code execution). Маша остаётся локально потому
+    // что её метафорические карты подмешиваются регуляркой post-processing'ом
+    // из metaphor_cards postgres-таблицы (см. ниже) — r.linkeon.io об этом
+    // не знает.
     if (agent.id !== 3) {
       return this.streamUniversalAgent(
         userId, message, String(assistantId), String(agent.id),
@@ -176,7 +159,7 @@ export class ChatService {
 • Генерация изображений — создание визуалов для бизнеса
 • Мой профиль — ценности, навыки, интересы, намерения пользователя
 При первом приветствии кратко представься и упомяни других ассистентов. Используй только текст без таблиц.
-Ты умеешь генерировать изображения (tool generate_image — через Google Imagen 4.0 Ultra с фолбэком на Nano Banana 2 / Nano Banana Pro, параметр quality: std|hd; hd = 4K и лучший рендер текста), редактировать уже созданные картинки (tool edit_image — передай sourceImageUrl из предыдущего tool-результата и prompt с описанием изменения: "сделай фон закатным", "убери человека", "поменяй цвет на красный", "добавь шапку"), объединять 2-3 картинки в одну (tool compose_image — массив sourceImageUrls и prompt: "возьми лицо из первой и посади на персонажа из второй", "соедини товар с этим фоном"), улучшать качество картинки — детализация, шумоподавление (tool upscale_image — только sourceImageUrl) и короткие видео 5–10 секунд через Kling (tool generate_video, режимы text2video / image2video / extend / lipsync). Если пользователь просит картинку, постер, иллюстрацию или «нарисуй …» — сразу вызывай generate_image. Если просит видео, ролик, анимацию, «оживи картинку» — вызывай generate_video. ВАЖНО про видео: text2video без картинки даёт нестабильный результат, поэтому при mode="text2video" без sourceImageUrl мы внутри инструмента автоматически сначала генерим стилл-кадр (Nano Banana, std, +5000 токенов), потом анимируем его — итоговая стоимость ≈ image+video (например, 5000 + 25000 = 30000 для kling-v1-6 std 5s). Если у тебя уже есть подходящая картинка (после generate_image / edit_image / compose_image — её URL в imageUrl tool-результата), используй mode="image2video" с этим sourceImageUrl, не плати за лишнюю генерацию. Не придумывай отговорки и не отправляй на другие разделы — у тебя есть эти инструменты. Картинки и видео создаются ТОЛЬКО этими инструментами: не имитируй продакшн текстом и не давай выдуманных ссылок на файлы (.mp4/.srt/«скачать») — готовый результат приходит пользователю автоматически карточкой. При ошибке инструмента честно сообщи об ошибке без ссылки.`;
+Ты умеешь генерировать изображения (tool generate_image — через Google Imagen 4.0 Ultra с фолбэком на Nano Banana 2 / Nano Banana Pro, параметр quality: std|hd; hd = 4K и лучший рендер текста), редактировать уже созданные картинки (tool edit_image — передай sourceImageUrl из предыдущего tool-результата и prompt с описанием изменения: "сделай фон закатным", "убери человека", "поменяй цвет на красный", "добавь шапку"), объединять 2-3 картинки в одну (tool compose_image — массив sourceImageUrls и prompt: "возьми лицо из первой и посади на персонажа из второй", "соедини товар с этим фоном"), улучшать качество картинки — детализация, шумоподавление (tool upscale_image — только sourceImageUrl) и короткие видео 5–10 секунд через Kling (tool generate_video, режимы text2video / image2video / extend / lipsync). Если пользователь просит картинку, постер, иллюстрацию или «нарисуй …» — сразу вызывай generate_image. Если просит видео, ролик, анимацию, «оживи картинку» — вызывай generate_video. ВАЖНО про видео: text2video без картинки даёт нестабильный результат, поэтому при mode="text2video" без sourceImageUrl мы внутри инструмента автоматически сначала генерим стилл-кадр (Nano Banana, std, +5000 токенов), потом анимируем его — итоговая стоимость ≈ image+video (например, 5000 + 25000 = 30000 для kling-v1-6 std 5s). Если у тебя уже есть подходящая картинка (после generate_image / edit_image / compose_image — её URL в imageUrl tool-результата), используй mode="image2video" с этим sourceImageUrl, не плати за лишнюю генерацию. Не придумывай отговорки и не отправляй на другие разделы — у тебя есть эти инструменты.`;
 
     // Стабильная часть (одинаковая между вызовами для одного агента) — кэшируется.
     // Волатильную (profileText) кладём ПОСЛЕ кэша, иначе изменение профиля юзера ломает префикс.
@@ -249,66 +232,59 @@ export class ChatService {
       }
     }
 
-    // Маша runs via Claude CLI (OAuth subscription) — no separate API-key
-    // billing, no streaming, no tool use. The CHAT_TOOLS loop and the
-    // Anthropic-SDK streaming path were removed because Маша's value is
-    // the metaphor-card flow (handled by post-processing below), not
-    // image/video generation. If we need to bring tools back for her,
-    // route through streamUniversalAgent like every other assistant.
-    const isМаша = agent.name === 'Маша';
+    // Маша-only путь (agent.id === 3): остальные агенты выше уже ушли в streamUniversalAgent.
+    // Один вызов ClaudeCli (OAuth), потом post-processing для инжекта метафорической карты,
+    // потом single 'item' + 'end' событие. Без streaming, без CHAT_TOOLS — Маша их не звала.
     res.write(JSON.stringify({ type: 'begin' }) + '\n');
 
-    const chunks: string[] = [];
     let inputTokens = 0;
     let outputTokens = 0;
+    let rawText = '';
+
+    // Собираем prompt: история + текущая реплика. systemPrompt уже включает
+    // platformContext + agent.system_prompt + правило ответа + profileText + tasks ctx.
+    const priorTurns = llmMessages
+      .slice(0, -1) // last is current message — добавляем отдельно как USER
+      .map(m => `${m.role.toUpperCase()}: ${m.content}`)
+      .join('\n\n');
+    const fullPrompt = priorTurns ? `${priorTurns}\n\nUSER: ${message}` : `USER: ${message}`;
 
     try {
-      // Compose a single one-shot prompt: system + recent history + current user message.
-      // ClaudeCliService passes everything in one prompt — no separate messages array.
-      const historyText = recentHistory
-        .map((m) => `${m.type === 'user' ? 'USER' : 'ASSISTANT'}: ${m.content}`)
-        .join('\n\n');
-      const promptForCli = [
-        historyText ? `Предыдущий контекст диалога:\n${historyText}\n\n---\n\n` : '',
-        `Сообщение пользователя:\n${message}`,
-      ].join('');
-
-      const { text, costUsd } = await this.claudeCli.textWithCost(promptForCli, {
+      const r = await this.claudeCli.textWithCost(fullPrompt, {
         system: systemPrompt,
         model: 'claude-haiku-4-5',
-        timeoutMs: 60_000,
+        timeoutMs: 90_000,
       });
-      this.logger.log(`chat[${agent.name}] via Claude CLI: $${costUsd.toFixed(4)}, ${text.length} chars`);
-      chunks.push(text);
-      // Buffer behaviour: hold the text until we've done card-detection
-      // post-processing (item line is emitted at the end of this method).
+      rawText = r.text || '';
+      // Биллинг как у Юли: $1 = 100k Linkeon-tokens. Кладём всё в outputTokens
+      // (split input/output здесь не информативен — берём суммарную стоимость).
+      outputTokens = Math.ceil(r.costUsd * 100_000);
+      this.logger.log(`Маша claude CLI: cost=$${r.costUsd.toFixed(4)} tokens=${outputTokens}`);
     } catch (e: any) {
-      this.logger.error(`Claude CLI error for ${agent.name}: ${e.message}`);
-      chunks.push('Ошибка соединения с ассистентом.');
+      this.logger.error(`Маша claude CLI error: ${e.message}`);
+      rawText = 'Извините, временные проблемы со связью. Попробуйте ещё раз через минуту.';
     }
-    // Clean and post-process the full response
-    const rawFull = chunks.join('');
-    let fullText = this.stripToolTags(rawFull);
 
-    // If Маша tried to show a metaphor card, fetch a real one
-    // Detect metaphor card: tool tags, fake URLs, or Маша talking about showing a card
+    // Clean and post-process the full response
+    let fullText = this.stripToolTags(rawText);
+
+    // Маша иногда говорит «вот карта», «вытяни карту» — backend ловит regex'ом
+    // и подвешивает реальную карту из metaphor_cards (postgres). LLM сама про
+    // URL не знает, она просто описывает образ.
     const cardPattern = /(?:get_metaphor_card|images\.linkeon\.io|image_url|вот.*карт|первая карта|следующая карта|покажу.*карт|новая карта|вытяни.*карт|твоя карта|вот она|карту для тебя|достаю карту|тяну карту|открываю карту|Что ты видишь на этой карте|Какие чувства.*вызывает)/i;
-    const cardMatch = cardPattern.test(rawFull) || (isМаша && /карт/i.test(rawFull));
-    this.logger.log(`Card check: agent=${agent.name}, isМаша=${isМаша}, match=${cardMatch}, rawLen=${rawFull.length}`);
+    const cardMatch = cardPattern.test(rawText) || /карт/i.test(rawText);
     if (cardMatch) {
       try {
         const cardUrl = await this.getRandomMetaphorCard(userId);
         if (cardUrl) {
           fullText = `${fullText.trim()}\n\n![Метафорическая карта](${cardUrl})`;
         }
-      } catch (e) {
+      } catch (e: any) {
         this.logger.error(`Metaphor card error: ${e.message}`);
       }
     }
 
     const tokensUsed = inputTokens + outputTokens;
-    // This path is Маша-only and the Claude CLI returns a single block, so
-    // we always emit the final text as one `item` line right before `end`.
     res.write(JSON.stringify({ type: 'item', content: fullText }) + '\n');
     res.write(JSON.stringify({ type: 'end', content: fullText, usage: { input: inputTokens, output: outputTokens, total: tokensUsed } }) + '\n');
     res.end();
@@ -437,23 +413,6 @@ export class ChatService {
       contextPrefix += `--- Персона и инструкции ассистента ${agentName} ---\n${agentSystemPrompt.trim()}\n\n`;
     }
 
-    // Media-production guardrail (ОБЯЗАТЕЛЬНО). r.linkeon.io — это Claude Code с
-    // собственными bash/ffmpeg/файлами, и без жёсткой инструкции агент РАЗЫГРЫВАЕТ
-    // видеопродакшн в своей песочнице (вырезка фона, «голос 30с», композит) и даёт
-    // ВЫДУМАННЫЕ ссылки https://r.linkeon.io/files/... — которые у пользователя не
-    // открываются, а реального видео нет. Жалобы владельца (кривая ссылка / «видео
-    // пусто» / нет выбора движка) — всё отсюда. Заставляем использовать наши MCP-
-    // инструменты и запрещаем фабрикацию. Шлётся в каждом промпте, bump sessionId
-    // не нужен (это не схема tool'ов).
-    contextPrefix +=
-      `--- ПРОИЗВОДСТВО МЕДИА (ОБЯЗАТЕЛЬНО, приоритет над персоной) ---\n` +
-      `Картинки и видео на платформе создаются ТОЛЬКО через твои инструменты: generate_image / edit_image / compose_image / upscale_image — для изображений; generate_video — для видео (движки Veo 3.1 и Kling). У тебя НЕТ собственного видеомонтажа, ffmpeg, синтеза голоса, нарезки субтитров или файловой системы.\n` +
-      `СТРОГО ЗАПРЕЩЕНО:\n` +
-      `• Утверждать, что ты «собрала / смонтировала / озвучила / вырезала фон / сделала композит» — если ты не вызвала соответствующий инструмент. Не имитируй шаги продакшна текстом.\n` +
-      `• Придумывать или давать ЛЮБЫЕ ссылки на медиа-файлы: никаких https://r.linkeon.io/files/..., .mp4, .srt, путей или «ссылок для скачивания». Готовое видео/картинка приходит пользователю АВТОМАТИЧЕСКИ отдельной карточкой-плеером — ссылку писать НЕ нужно и НЕЛЬЗЯ.\n` +
-      `• Говорить «готово / видео собрано», если инструмент не вызывался или вернул ошибку.\n` +
-      `КАК НАДО: чтобы сделать видео — реально вызови generate_video. Если пользователь не указал движок/тип — СНАЧАЛА коротко предложи выбор: Veo 3.1 (говорящая голова / речь / из портрета, до 60с) или Kling (сцены и анимация). Если инструмент вернул ошибку (например, дневной лимит Veo) — честно передай текст ошибки пользователю и НЕ давай никакой ссылки, не делай вид, что видео готовится или готово.\n\n`;
-
     // Coworker awareness — каждый ассистент должен знать про остальных, чтобы
     // суметь представить их пользователю и не делать вид, что новых коллег нет.
     // Берём список из БД (включая Юлю-SMM-продюсера id=15).
@@ -536,26 +495,6 @@ export class ChatService {
     const streamStartTime = Date.now();
     const chunks: string[] = []; // hoisted so catch block can access partial response
 
-    // Guard against the upstream (r.linkeon.io / Claude subscription) leaking a
-    // raw "You've hit your session limit · resets …" notice as if it were the
-    // assistant's reply. Detect it, replace with a graceful message, and
-    // suppress any further chunks for this turn.
-    let limitHit = false;
-    const LIMIT_RE = /(hit your (?:session|usage) limit|(?:session|usage) limit\b[^.\n]*reset|rate limit)/i;
-    const forwardItem = (text: string) => {
-      if (limitHit) return;
-      if (LIMIT_RE.test(text)) {
-        limitHit = true;
-        const friendly = 'Извините, сервис ассистентов сейчас перегружен и временно недоступен — попробуйте, пожалуйста, через несколько минут. 🙏';
-        chunks.length = 0;
-        chunks.push(friendly);
-        safeWrite({ type: 'item', content: friendly });
-        return;
-      }
-      chunks.push(text);
-      safeWrite({ type: 'item', content: text });
-    };
-
     // Single persistence point — dedupe via `saved` flag so success and error paths
     // both call but only one actually writes.
     let saved = false;
@@ -578,7 +517,7 @@ export class ChatService {
       const textCost = fullText.length * this.SDK_TEXT_MULTIPLIER;
       try {
         await this.saveChatHistory(userId, assistantId, message, aiText, textCost);
-        if (fullText.length > 0 && !limitHit) {
+        if (fullText.length > 0) {
           await this.addTokenTask(userId, 0, textCost, agentId);
           if (this.neo4j) {
             try { await this.neo4j.consolidateFromChat(userId, assistantId, message, fullText); } catch {}
@@ -597,15 +536,7 @@ export class ChatService {
       const FormData = require('form-data');
       const fd = new FormData();
       fd.append('message', prompt);
-      // sessionId namespace version. r.linkeon.io's Claude Code caches the MCP
-      // tool list per session for the session's lifetime, so adding a new tool
-      // (Veo to generate_video) is invisible to already-warm sessions — they
-      // keep rejecting veo-3.1-* as an unknown enum value. Bumping this suffix
-      // forces fresh sessions that re-fetch tools/list (now including Veo).
-      // Continuity is preserved: persona + last-6-message history are re-injected
-      // into every prompt above, so r.linkeon.io-side memory is non-critical.
-      // BUMP THIS when MCP tool schemas change and must reach live sessions.
-      fd.append('sessionId', `${userId}_${assistantId}_v4`);
+      fd.append('sessionId', `${userId}_${assistantId}`);
 
       const agentRes = await axios.post(`${AGENT_URL}/chat`, fd, {
         headers: fd.getHeaders(),
@@ -630,10 +561,12 @@ export class ChatService {
                 const ev = JSON.parse(line.slice(6));
 
                 if (ev.type === 'delta' || ev.type === 'text') {
-                  forwardItem(ev.text);
+                  chunks.push(ev.text);
+                  safeWrite({ type: 'item', content: ev.text });
                 } else if (ev.type === 'result' && ev.text) {
                   if (chunks.length === 0) {
-                    forwardItem(ev.text);
+                    chunks.push(ev.text);
+                    safeWrite({ type: 'item', content: ev.text });
                   }
                 } else if (ev.type === 'done') {
                   // Collect output files info if any
@@ -672,7 +605,6 @@ export class ChatService {
         const jobsRes = await this.pg.query(
           `SELECT id FROM video_jobs
            WHERE user_id = $1 AND created_at >= $2::timestamptz
-             AND status <> 'failed'
            ORDER BY created_at ASC`,
           [userId, startTimeIso],
         );
@@ -833,21 +765,6 @@ export class ChatService {
        VALUES ($1, 'ai', $2, $3, 'text', $4)`,
       [sessionId, agentNum, assistantMsg, tokensUsed],
     );
-
-    // Telemetry: one event per finished user↔assistant exchange. Feeds the
-    // VPM snapshot (active_users_7d, chat_calls_7d) and the product metrics
-    // funnel/economy/quality views. Fire-and-forget — EventsService buffers
-    // and flushes asynchronously.
-    this.events?.track('chat_message_sent', {
-      userId,
-      props: {
-        assistant_id: agentId,
-        tokens_used: tokensUsed,
-        user_msg_len: userMsg.length,
-        assistant_msg_len: assistantMsg.length,
-      },
-      source: 'chat.saveChatHistory',
-    });
   }
 
   private async addTokenTask(userId: string, inputTokens: number, outputTokens: number, agentId?: string) {
@@ -889,61 +806,5 @@ export class ChatService {
     return { success: true };
   }
 
-  private async streamToolLoopViaOpenRouter(
-    userId: string,
-    systemPrompt: string,
-    llmMessages: { role: 'user' | 'assistant'; content: string }[],
-    chunks: string[],
-    needsBuffering: boolean,
-    res: Response,
-  ): Promise<{ inputTokens: number; outputTokens: number }> {
-    const openaiTools = CHAT_TOOLS.map(t => ({
-      type: 'function',
-      function: { name: t.name, description: t.description, parameters: (t as any).input_schema },
-    }));
-    const messages: any[] = [{ role: 'system', content: systemPrompt }, ...llmMessages];
-    let inputTokens = 0, outputTokens = 0;
-
-    for (let iter = 0; iter < 5; iter++) {
-      const resp = await axios.post(
-        'https://openrouter.ai/api/v1/chat/completions',
-        { model: 'anthropic/claude-haiku-4.5', messages, tools: openaiTools, tool_choice: 'auto' },
-        {
-          headers: {
-            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-            'Content-Type': 'application/json',
-            'HTTP-Referer': 'https://my.linkeon.io',
-          },
-          timeout: 60000,
-        },
-      );
-      const choice = resp.data.choices[0];
-      inputTokens += resp.data.usage?.prompt_tokens || 0;
-      outputTokens += resp.data.usage?.completion_tokens || 0;
-      const assistantMsg = choice.message;
-      if (assistantMsg.content) {
-        chunks.push(assistantMsg.content);
-        if (!needsBuffering) res.write(JSON.stringify({ type: 'item', content: assistantMsg.content }) + '\n');
-      }
-      messages.push(assistantMsg);
-      if (choice.finish_reason !== 'tool_calls' || !assistantMsg.tool_calls?.length) break;
-      const toolResultMsgs: any[] = [];
-      for (const tc of assistantMsg.tool_calls) {
-        const name = tc.function.name;
-        const input = JSON.parse(tc.function.arguments || '{}');
-        res.write(JSON.stringify({ type: 'tool_start', tool: name, input }) + '\n');
-        const result = await this.tools.executeTool(userId, name, input);
-        res.write(JSON.stringify({ type: 'tool_result', tool: name, result }) + '\n');
-        if (result.ok && (result as any).kind === 'image') {
-          const md = `\n\n![Сгенерированное изображение](${(result as any).imageUrl})`;
-          chunks.push(md);
-          if (!needsBuffering) res.write(JSON.stringify({ type: 'item', content: md }) + '\n');
-        }
-        toolResultMsgs.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) });
-      }
-      messages.push(...toolResultMsgs);
-    }
-    return { inputTokens, outputTokens };
-  }
 
 }
