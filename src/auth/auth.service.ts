@@ -51,6 +51,17 @@ export class AuthService {
   }
 
   private async sendSms(phone: string, code: string): Promise<void> {
+    // Telegram-like skip-list для тестовых телефонов: smoke/playwright за двухфазный
+    // деплой дёргают /sms/:phone 4-6 раз, SMS Aero отбивает 400 (blacklist) — забивает
+    // логи и расходует rate-limit. Код всё равно лежит в Redis (sendCode), так что
+    // /webhook/debug/sms-code/:phone и smoke-чек работают как раньше.
+    const skipList = (process.env.SMS_AERO_SKIP_PHONES || '')
+      .split(',').map(s => s.trim()).filter(Boolean);
+    if (skipList.includes(phone)) {
+      this.logger.log(`SMS Aero skipped for ${phone} (in SMS_AERO_SKIP_PHONES). Code in Redis.`);
+      return;
+    }
+
     const login = process.env.SMSAERO_LOGIN;
     const apiKey = process.env.SMSAERO_API_KEY;
     if (!login || !apiKey) {
