@@ -1,8 +1,8 @@
 import { Injectable, Logger, OnModuleInit, NotFoundException } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
-import Anthropic from '@anthropic-ai/sdk';
 import { PgService } from '../common/services/pg.service';
+import { ClaudeCliService } from '../common/services/claude-cli.service';
 
 export interface CustomAgentRow {
   id: string;
@@ -17,9 +17,11 @@ export interface CustomAgentRow {
 @Injectable()
 export class CustomAgentsService implements OnModuleInit {
   private readonly logger = new Logger(CustomAgentsService.name);
-  private anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-  constructor(private readonly pg: PgService) {}
+  constructor(
+    private readonly pg: PgService,
+    private readonly claudeCli: ClaudeCliService,
+  ) {}
 
   async onModuleInit() {
     const candidates = [
@@ -128,23 +130,20 @@ export class CustomAgentsService implements OnModuleInit {
 
 Отвечай строго JSON-объектом вида {"name": "...", "systemPrompt": "..."} без markdown-обёртки.`;
 
-    const resp = await this.anthropic.messages.create({
-      model: 'claude-haiku-4-5',
-      max_tokens: 2000,
+    const text = await this.claudeCli.text(description.trim(), {
       system: sys,
-      messages: [{ role: 'user', content: description.trim() }],
+      model: 'claude-haiku-4-5',
+      timeoutMs: 60_000,
     });
 
-    const textBlock = resp.content.find((b: any) => b.type === 'text') as any;
-    if (!textBlock?.text) {
-      throw new Error('Empty response from Haiku');
-    }
+    if (!text) throw new Error('Empty response from Claude CLI');
 
     let parsed: { name: string; systemPrompt: string };
     try {
-      parsed = JSON.parse(textBlock.text);
+      parsed = JSON.parse(text);
     } catch {
-      const cleaned = textBlock.text.replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '');
+      // Иногда модель оборачивает в ```json — снимаем
+      const cleaned = text.replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '').trim();
       parsed = JSON.parse(cleaned);
     }
 
