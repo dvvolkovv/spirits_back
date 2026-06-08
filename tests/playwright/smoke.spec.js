@@ -97,6 +97,7 @@ test.describe('my.linkeon.io smoke', () => {
   test('onboarding match: reopen → pick theme → lands in chat', async ({ page }) => {
     // Flag-independent: открываем match-экран всегда-доступной кнопкой
     // «Подобрать специалиста» (работает и для уже onboarded-пользователей).
+    await applyBasicAuth(page);  // test.linkeon.io за nginx Basic Auth — иначе 401 до SPA
     const { access, refresh } = await getJwt();
     const userData = { phone: TEST_PHONE };
     const assistant = { id: 12, name: 'Роман', description: 'Помогаю делать все' };
@@ -127,6 +128,7 @@ test.describe('my.linkeon.io smoke', () => {
     // Eligibility зависит от данных (≥15 сообщений + не платил + не в cooldown),
     // поэтому толерантно: чат-инпут обязан рендериться (значит OfferBanner не
     // ломает чат); если баннер показан — «×» его убирает.
+    await applyBasicAuth(page);  // test.linkeon.io за nginx Basic Auth — иначе 401 до SPA
     const { access, refresh } = await getJwt();
     const userData = { phone: TEST_PHONE };
     const assistant = { id: 12, name: 'Роман', description: 'Помогаю делать все' };
