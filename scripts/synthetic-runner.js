@@ -171,13 +171,22 @@ const scenarios = (jwtUser) => [
 
 async function push(scenario, success, durationMs, message) {
   try {
-    await fetch(`${BASE}/webhook/monitoring/synthetic/push`, {
+    const r = await fetch(`${BASE}/webhook/monitoring/synthetic/push`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-synthetic-token': TOKEN },
       body: JSON.stringify({ scenario, success, duration_ms: durationMs, message }),
     });
+    // fetch НЕ бросает на 4xx/5xx — обязательно проверяем статус, иначе
+    // отвергнутый пуш (напр. 401 при рассинхроне SYNTHETIC_PUSH_TOKEN) уходит
+    // молча и мониторинг «слепнет» (инцидент 2026-05-31). Логируем + ненулевой код.
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      console.error(`push REJECTED for ${scenario}: HTTP ${r.status} ${body.slice(0, 120)}`);
+      process.exitCode = 1;
+    }
   } catch (e) {
     console.error(`push failed for ${scenario}: ${e.message}`);
+    process.exitCode = 1;
   }
 }
 
