@@ -37,7 +37,7 @@
 #   PROD_FRONT_SRC     /home/dvolkov/spirits_front_src
 #   PROD_FRONT_SERVED  /home/dvolkov/spirits_front
 #   PROD_BASE_URL      https://my.linkeon.io
-#   BRANCH             b2b
+#   BRANCH             main
 #
 # Why git-based (не rsync): --delete сносил .env, public/agent-avatars/
 # и другие untracked-локально файлы. Git-pull обновляет только трекаемое.

@@ -273,12 +273,12 @@ cd ~
 if [ ! -d spirits_back ]; then
   git clone git@github.com:dvvolkovv/spirits_back.git
 fi
-cd spirits_back && git fetch origin && git checkout b2b && git reset --hard origin/b2b && cd ..
+cd spirits_back && git fetch origin && git checkout main && git reset --hard origin/main && cd ..
 
 if [ ! -d spirits_front_src ]; then
   git clone git@github.com:dvvolkovv/spirits.git spirits_front_src
 fi
-cd spirits_front_src && git fetch origin && git checkout b2b && git reset --hard origin/b2b && cd ..
+cd spirits_front_src && git fetch origin && git checkout main && git reset --hard origin/main && cd ..
 
 mkdir -p ~/spirits_front
 REMOTE

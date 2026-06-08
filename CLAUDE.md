@@ -78,7 +78,7 @@ bash ~/Downloads/spirits_back/scripts/deploy.sh
 ```
 
 Раскладка путей одинакова в обеих средах (с заменой `dvolkov` ↔ `dv`):
-- `~/spirits_back/` — git-клон `dvvolkovv/spirits_back`, ветка `b2b`
+- `~/spirits_back/` — git-клон `dvvolkovv/spirits_back`, ветка `main` (главная/деплойная — deploy.sh катит `main`)
 - `~/spirits_front_src/` — git-клон `dvvolkovv/spirits` (build делается тут)
 - `~/spirits_front/` — nginx-served `dist/`
 
@@ -113,14 +113,14 @@ bash ~/Downloads/spirits_back/scripts/deploy.sh
 
 **Бэк** (через ssh):
 ```bash
-ssh dvolkov@212.113.106.202 "cd /home/dvolkov/spirits_back && git fetch origin && git reset --hard origin/b2b && npm ci && npm run build && pm2 restart linkeon-api"
+ssh dvolkov@212.113.106.202 "cd /home/dvolkov/spirits_back && git fetch origin && git reset --hard origin/main && npm ci && npm run build && pm2 restart linkeon-api"
 ```
 
 **Фронт**:
 ```bash
 ssh dvolkov@212.113.106.202 "
   export PATH=\$HOME/.npm-global/bin:\$PATH
-  cd /home/dvolkov/spirits_front_src && git fetch origin && git reset --hard origin/b2b
+  cd /home/dvolkov/spirits_front_src && git fetch origin && git reset --hard origin/main
   echo 'VITE_BACKEND_URL=https://my.linkeon.io' > .env
   pnpm install --frozen-lockfile && pnpm build
   rsync -az --delete dist/ /home/dvolkov/spirits_front/
