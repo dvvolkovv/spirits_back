@@ -5,6 +5,7 @@ import { CommonModule } from './common/common.module';
 import { AuthModule } from './auth/auth.module';
 import { ProfileModule } from './profile/profile.module';
 import { AgentsModule } from './agents/agents.module';
+import { CustomAgentsModule } from './custom-agents/custom-agents.module';
 import { ChatModule } from './chat/chat.module';
 import { TokensModule } from './tokens/tokens.module';
 import { PaymentsModule } from './payments/payments.module';
@@ -38,6 +39,7 @@ import { OfferModule } from './offer/offer.module';
     AuthModule,
     ProfileModule,
     AgentsModule,
+    CustomAgentsModule,
     ChatModule,
     TokensModule,
     PaymentsModule,
