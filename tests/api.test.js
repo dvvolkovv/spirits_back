@@ -445,4 +445,33 @@ module.exports = {
     const resp = await http.post('/webhook/auth/identities/link/email', { token: 'whatever' }, { headers: { 'Content-Type': 'application/json' } });
     assertStatus(resp, 401, 403);
   },
+
+  // ============================================================
+  // CUSTOM AGENTS (auth required)
+  // ============================================================
+
+  'GET /webhook/custom-agents без токена — 401': async () => {
+    const r = await http.get('/webhook/custom-agents');
+    assertStatus(r, 401);
+  },
+
+  'POST /webhook/custom-agents без токена — 401': async () => {
+    const r = await http.post('/webhook/custom-agents', { name: 'x', systemPrompt: 'y'.repeat(30) });
+    assertStatus(r, 401);
+  },
+
+  'POST /webhook/custom-agents/draft без токена — 401': async () => {
+    const r = await http.post('/webhook/custom-agents/draft', { description: 'кинокритик' });
+    assertStatus(r, 401);
+  },
+
+  'PATCH /webhook/custom-agents/:id без токена — 401': async () => {
+    const r = await http.patch('/webhook/custom-agents/00000000-0000-0000-0000-000000000000', { name: 'x' });
+    assertStatus(r, 401);
+  },
+
+  'DELETE /webhook/custom-agents/:id без токена — 401': async () => {
+    const r = await http.delete('/webhook/custom-agents/00000000-0000-0000-0000-000000000000');
+    assertStatus(r, 401);
+  },
 };
