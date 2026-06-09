@@ -4,7 +4,7 @@
 
 CREATE TABLE IF NOT EXISTS custom_agents (
   id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  owner_user_id uuid NOT NULL,
+  owner_user_id text NOT NULL,
   name          text NOT NULL,
   description   text,
   system_prompt text NOT NULL,

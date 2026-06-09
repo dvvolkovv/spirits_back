@@ -24,22 +24,27 @@ export class CustomAgentsService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
+    await this.applyMigration('001_custom_agents.sql');
+    await this.applyMigration('002_owner_user_id_to_text.sql');
+  }
+
+  private async applyMigration(filename: string) {
     const candidates = [
-      path.join(__dirname, 'migrations', '001_custom_agents.sql'),
-      path.join(__dirname, '..', '..', 'src', 'custom-agents', 'migrations', '001_custom_agents.sql'),
+      path.join(__dirname, 'migrations', filename),
+      path.join(__dirname, '..', '..', 'src', 'custom-agents', 'migrations', filename),
     ];
     for (const p of candidates) {
       try {
         if (fs.existsSync(p)) {
           await this.pg.query(fs.readFileSync(p, 'utf8'));
-          this.logger.log(`custom_agents migration applied from ${p}`);
+          this.logger.log(`custom_agents migration ${filename} applied from ${p}`);
           return;
         }
       } catch (e: any) {
-        this.logger.error(`custom_agents migration failed (${p}): ${e.message}`);
+        this.logger.error(`custom_agents migration ${filename} failed (${p}): ${e.message}`);
       }
     }
-    this.logger.warn('custom_agents migration sql not found, skipping');
+    this.logger.warn(`custom_agents migration ${filename} not found, skipping`);
   }
 
   async list(ownerId: string): Promise<CustomAgentRow[]> {
