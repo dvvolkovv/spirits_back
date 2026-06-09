@@ -73,13 +73,16 @@ export class TgBotService implements OnModuleInit {
 
     const chatType = msg.chat?.type;
 
-    if (chatType === 'private' && typeof msg.text === 'string' && msg.text.startsWith('/start ')) {
-      const token = msg.text.substring('/start '.length).trim();
-      await this.handleDmStart(msg, token);
+    // В группах Telegram добавляет к командам @<botname>: `/start@LinkeonTestBot <token>`.
+    // В личке — без суффикса. Парсим оба формата.
+    const startToken = typeof msg.text === 'string' ? this.parseStartToken(msg.text) : null;
+
+    if (chatType === 'private' && startToken) {
+      await this.handleDmStart(msg, startToken);
       return;
     }
 
-    if (chatType === 'private' && msg.text === '/start') {
+    if (chatType === 'private' && (msg.text === '/start' || msg.text?.startsWith('/start@'))) {
       await this.grammy.sendMessage(
         msg.chat.id,
         'Привет! Для подключения зайди в Linkeon и нажми «Подключить Telegram».',
@@ -93,14 +96,19 @@ export class TgBotService implements OnModuleInit {
     }
 
     if (chatType === 'group' || chatType === 'supergroup') {
-      if (typeof msg.text === 'string' && msg.text.startsWith('/start ')) {
-        const token = msg.text.substring('/start '.length).trim();
-        await this.handleGroupClaim(msg, token);
+      if (startToken) {
+        await this.handleGroupClaim(msg, startToken);
         return;
       }
       await this.handleGroupMessage(msg);
       return;
     }
+  }
+
+  // Парсит `/start <token>` и `/start@<botname> <token>`. Возвращает токен или null.
+  private parseStartToken(text: string): string | null {
+    const m = text.match(/^\/start(?:@\S+)?\s+(\S+)/);
+    return m ? m[1] : null;
   }
 
   private async handleDmStart(msg: any, token: string): Promise<void> {
