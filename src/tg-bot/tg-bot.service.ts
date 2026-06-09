@@ -8,6 +8,7 @@ import { TgConfigService } from './tg-config.service';
 import { TgRouterService } from './tg-router.service';
 import { TgVoiceService } from './tg-voice.service';
 import { TgBillingService } from './tg-billing.service';
+import { TgCommandsService } from './tg-commands.service';
 import { TgGrammyClient } from './tg-grammy.client';
 
 @Injectable()
@@ -22,6 +23,7 @@ export class TgBotService implements OnModuleInit {
     private readonly router: TgRouterService,
     private readonly voice: TgVoiceService,
     private readonly billing: TgBillingService,
+    private readonly commands: TgCommandsService,
     private readonly grammy: TgGrammyClient,
   ) {}
 
@@ -204,10 +206,13 @@ export class TgBotService implements OnModuleInit {
     try {
       await this.router.persistUserMessage(cfg, ctx);
 
+      // Phase 8: handle slash-commands (/help /balance /silent /resume) ДО LLM-вызова.
+      // tryHandle вернёт true если это была команда — в таком случае биллинг не запускаем.
+      const handled = await this.commands.tryHandle(cfg, msg);
+      if (handled) return;
+
       const should = await this.router.shouldRespond(cfg, ctx);
       if (!should) return;
-
-      // Phase 8 добавит handling команд (/help, /balance, /silent, /resume) ДО LLM-вызова
 
       const ownerRes = await this.pg.query(
         `SELECT profile_data->>'name' AS first_name FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
