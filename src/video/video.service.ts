@@ -857,49 +857,72 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     return 'Continue the previous shot seamlessly: the same person and setting, natural lifelike motion — subtle head movement, blinking, calm facial expression. The person has finished speaking: no new dialogue, and do not repeat any earlier spoken words.';
   }
 
+  // Любая кавычка-пара: гильеметы «», типографские "" „", прямые "".
+  private static readonly QUOTE_RE = /«([^»]+)»|“([^”]+)”|„([^“"]+)[“"]|"([^"]+)"/g;
+
   private buildVeoSegmentPrompts(prompt: string, segments: number): string[] {
     const clean = String(prompt || '').trim();
     if (segments <= 1) return [clean];
-    // Разбиваем на предложения (латиница + кириллица + CJK-пунктуация).
-    const sentences = clean.split(/(?<=[.!?。！？…])\s+/).map((s) => s.trim()).filter(Boolean);
-    if (sentences.length <= 1) {
-      const out = [clean || this.veoContinuationPrompt()];
-      for (let i = 1; i < segments; i++) out.push(this.veoContinuationPrompt());
-      return out;
-    }
 
-    // Извлекаем САМУ РЕПЛИКУ — текст в кавычках (то, что персонаж проговаривает).
-    // Распределяем именно её по сегментам начиная с БАЗОВОГО, а «обвязку»
-    // (сцена/внешность/инструкция говорения = PREFIX, субтитры/плашка/стиль =
-    // SUFFIX) повторяем в КАЖДОМ сегменте. Так: (1) первые 8с уже несут нужную
-    // русскую речь (баг: раньше шла английская импровизация); (2) персонаж и
-    // субтитры консистентны на всю длину (раньше описание было только в базе).
-    const speechRe = /["«»“”„]|\bsays?\b|\bspeaks?\b|говор|произнос|реплик/i;
-    const qm = clean.match(/["«“„]([\s\S]+?)["»”]/);
-    if (!qm || !qm[1].trim()) {
-      // Нет реплики в кавычках — база несёт всё, extend'ы продолжают без повтора.
+    // Собираем ВСЕ реплики в кавычках (это то, что персонаж проговаривает).
+    const quotes: string[] = [];
+    const qre = new RegExp(VideoService.QUOTE_RE.source, 'g');
+    let m: RegExpExecArray | null;
+    while ((m = qre.exec(clean))) {
+      const q = (m[1] || m[2] || m[3] || m[4] || '').trim();
+      if (q) quotes.push(q);
+    }
+    if (quotes.length === 0) {
+      // Нет реплики в кавычках — база несёт всё, хвосты продолжают без речи.
       const out = [clean];
       for (let i = 1; i < segments; i++) out.push(this.veoContinuationPrompt());
       return out;
     }
-    const prefix = clean.slice(0, qm.index).trim();              // сцена + «он говорит:»
-    const suffix = clean.slice((qm.index ?? 0) + qm[0].length).trim(); // субтитры/плашка/стиль
-    // Сцена БЕЗ инструкции говорения — для «молчащих» хвостовых сегментов.
-    const sceneOnly = prefix
-      .split(/(?<=[.!?…])\s+/).map((s) => s.trim()).filter(Boolean)
-      .filter((s) => !speechRe.test(s)).join(' ').trim();
-    const scriptSentences = qm[1].trim()
-      .split(/(?<=[.!?…])\s+/).map((s) => s.trim()).filter(Boolean);
 
+    // Полный сценарий речи. Если есть сводный блок «Spoken dialogue / реплика /
+    // весь текст: «…»» — он авторитетен (полный список); иначе склеиваем
+    // уникальные реплики по порядку (раскадровка по beat'ам). Это и был баг
+    // (бэклог: повтор фразы на стыке клипов у katya) — раньше брали ТОЛЬКО первую
+    // кавычку и считали её всей репликой, а остаток дублировался в каждый клип.
+    let fullScript = '';
+    const sd = clean.match(/(?:spoken dialogue|реплик[аи]|полный текст|весь текст|говорит)[^«“"„]{0,60}?[«“"„]([^»”"]+)[»”"]/i);
+    if (sd && sd[1].trim()) {
+      fullScript = sd[1].trim();
+    } else {
+      const uniq: string[] = [];
+      for (const q of quotes) if (!uniq.includes(q)) uniq.push(q);
+      fullScript = uniq.join(' ');
+    }
+
+    // ВЫРЕЗАЕМ всю речь из тела промпта (и метку Spoken dialogue), чтобы полный
+    // текст не «утекал» в каждый клип. Визуальные/тайминговые/тон-указания
+    // (без слов) остаются — они нужны для картинки.
+    let body = clean
+      .replace(/(?:spoken dialogue|реплика|полный текст|весь текст)[^\n«“"„]*[:：]?/gi, '')
+      .replace(new RegExp(VideoService.QUOTE_RE.source, 'g'), '')
+      .replace(/[ \t]{2,}/g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+
+    const scriptSentences = fullScript
+      .split(/(?<=[.!?。！？…])\s+/).map((s) => s.trim()).filter(Boolean);
     const perSeg = Math.max(1, Math.ceil(scriptSentences.length / segments));
+
     const out: string[] = [];
     for (let i = 0; i < segments; i++) {
       const chunk = scriptSentences.slice(i * perSeg, (i + 1) * perSeg);
       if (chunk.length) {
-        out.push([prefix, `"${chunk.join(' ')}"`, suffix].filter(Boolean).join(' '));
+        out.push(
+          `${body}\n\n=== РЕЧЬ В ЭТОМ ФРАГМЕНТЕ (СТРОГО) ===\n` +
+          `Персонаж произносит вслух ровно и ТОЛЬКО эти слова, одной непрерывной речью, ` +
+          `без повторов и без любых других реплик: «${chunk.join(' ')}»`,
+        );
       } else {
-        // Слова кончились — та же сцена + субтитры, естественная пауза без речи.
-        out.push([sceneOnly, this.veoContinuationPrompt(), suffix].filter(Boolean).join(' '));
+        out.push(
+          `${body}\n\n=== РЕЧЬ В ЭТОМ ФРАГМЕНТЕ (СТРОГО) ===\n` +
+          `Персонаж МОЛЧИТ: продолжает сцену естественно (моргание, лёгкие движения головы, ` +
+          `спокойное выражение), БЕЗ речи и без повтора ранее сказанного.`,
+        );
       }
     }
     return out;

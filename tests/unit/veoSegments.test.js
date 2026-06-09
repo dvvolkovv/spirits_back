@@ -1,75 +1,92 @@
 /**
  * Unit-тест разбивки промпта Veo по сегментам (video.service.buildVeoSegmentPrompts).
- * Inline-копия логики (intentional, как extractJsonObject.test) — пинит контракт:
- * речь должна начинаться с БАЗОВОГО сегмента, преамбула и оверлеи — в каждом.
- * Баг владельца (2026-06-04): первые 8с шли без русской речи (Veo импровизировал
- * английскую), персонаж описан только в базе → extend'ы «уплывали».
+ * Inline-копия логики (intentional, как остальные veo/* тесты).
+ *
+ * Контракт: речь распределяется по клипам БЕЗ повторов, а полный текст реплики
+ * ВЫРЕЗАЕТСЯ из тела промпта (иначе утекает в каждый клип). Баг katya 2026-06-09:
+ * 16с-вертикаль = 2 клипа, на стыке (8с) второй клип повторял начало сценария,
+ * потому что промпт нёс реплику дважды (раскадровка по beat'ам + блок «Spoken
+ * dialogue: «весь текст»»), а старый сплиттер брал только ПЕРВУЮ кавычку и
+ * дублировал остаток в каждый клип.
  */
-function veoContinuationPrompt() {
-  return 'Continue the previous shot seamlessly: the same person and setting, natural lifelike motion. The person has finished speaking: no new dialogue.';
-}
-function buildVeoSegmentPrompts(prompt, segments) {
+
+const QUOTE_SRC = '«([^»]+)»|“([^”]+)”|„([^“"]+)[“"]|"([^"]+)"';
+const continuation = () => 'Continue the previous shot seamlessly: no new dialogue, do not repeat earlier words.';
+
+function build(prompt, segments) {
   const clean = String(prompt || '').trim();
   if (segments <= 1) return [clean];
-  const sentences = clean.split(/(?<=[.!?。！？…])\s+/).map((s) => s.trim()).filter(Boolean);
-  if (sentences.length <= 1) {
-    const out = [clean || veoContinuationPrompt()];
-    for (let i = 1; i < segments; i++) out.push(veoContinuationPrompt());
-    return out;
+  const quotes = [];
+  const qre = new RegExp(QUOTE_SRC, 'g');
+  let m;
+  while ((m = qre.exec(clean))) {
+    const q = (m[1] || m[2] || m[3] || m[4] || '').trim();
+    if (q) quotes.push(q);
   }
-  const speechRe = /["«»“”„]|\bsays?\b|\bspeaks?\b|говор|произнос|реплик/i;
-  const qm = clean.match(/["«“„]([\s\S]+?)["»”]/);
-  if (!qm || !qm[1].trim()) {
+  if (quotes.length === 0) {
     const out = [clean];
-    for (let i = 1; i < segments; i++) out.push(veoContinuationPrompt());
+    for (let i = 1; i < segments; i++) out.push(continuation());
     return out;
   }
-  const prefix = clean.slice(0, qm.index).trim();
-  const suffix = clean.slice((qm.index ?? 0) + qm[0].length).trim();
-  const sceneOnly = prefix
-    .split(/(?<=[.!?…])\s+/).map((s) => s.trim()).filter(Boolean)
-    .filter((s) => !speechRe.test(s)).join(' ').trim();
-  const scriptSentences = qm[1].trim()
-    .split(/(?<=[.!?…])\s+/).map((s) => s.trim()).filter(Boolean);
-  const perSeg = Math.max(1, Math.ceil(scriptSentences.length / segments));
+  let full = '';
+  const sd = clean.match(/(?:spoken dialogue|реплик[аи]|полный текст|весь текст|говорит)[^«“"„]{0,60}?[«“"„]([^»”"]+)[»”"]/i);
+  if (sd && sd[1].trim()) full = sd[1].trim();
+  else { const u = []; for (const q of quotes) if (!u.includes(q)) u.push(q); full = u.join(' '); }
+  const body = clean
+    .replace(/(?:spoken dialogue|реплика|полный текст|весь текст)[^\n«“"„]*[:：]?/gi, '')
+    .replace(new RegExp(QUOTE_SRC, 'g'), '')
+    .replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+  const ss = full.split(/(?<=[.!?。！？…])\s+/).map((s) => s.trim()).filter(Boolean);
+  const perSeg = Math.max(1, Math.ceil(ss.length / segments));
   const out = [];
   for (let i = 0; i < segments; i++) {
-    const chunk = scriptSentences.slice(i * perSeg, (i + 1) * perSeg);
-    if (chunk.length) {
-      out.push([prefix, `"${chunk.join(' ')}"`, suffix].filter(Boolean).join(' '));
-    } else {
-      out.push([sceneOnly, veoContinuationPrompt(), suffix].filter(Boolean).join(' '));
-    }
+    const c = ss.slice(i * perSeg, (i + 1) * perSeg);
+    out.push(c.length
+      ? `${body}\n=== РЕЧЬ ===\nтолько эти слова: «${c.join(' ')}»`
+      : `${body}\n=== РЕЧЬ ===\nМОЛЧИТ`);
   }
   return out;
 }
 
-const CTO_PROMPT = [
-  'Vertical 9:16 business video-card for a CTO.',
-  'A confident friendly man in his 40s with short dark hair and light stubble, wearing a dark business suit.',
-  'Background: blurred server racks, glowing dashboards, dark teal tech palette.',
-  'He looks into camera and speaks directly to the viewer with synchronized lip movement.',
-  'Native Russian speech, lips synced, he says: "Я технический директор.',
-  'Двадцать лет в IT и финтехе.',
-  'Готов превращать технологии в рост бизнеса."',
-  'Hardcoded burned-in Russian subtitles at the bottom of the frame.',
-  'A small clean nameplate caption showing the handle "DmitryT · CTO".',
-  'Cinematic soft lighting, shallow depth of field, clean native audio.',
-].join(' ');
+describe('buildVeoSegmentPrompts', () => {
+  test('1 сегмент — промпт как есть', () => {
+    expect(build('текст', 1)).toEqual(['текст']);
+  });
 
-describe('Veo segment prompts', () => {
-  const segs = buildVeoSegmentPrompts(CTO_PROMPT, 4);
+  test('простой случай: одна реплика делится на 2 клипа без повтора', () => {
+    const out = build('Девушка говорит: «Привет. Как дела? Пока.» Тёплый свет.', 2);
+    expect(out[0]).toContain('Привет');
+    expect(out[1]).toContain('Пока');
+    expect(out[1]).not.toContain('Привет');  // нет повтора
+  });
 
-  test('базовый сегмент (0) содержит начало русской речи', () => {
-    expect(segs[0]).toMatch(/Я технический директор|he says/i);
+  test('кейс katya: раскадровка + блок Spoken dialogue → НЕТ повтора на стыке', () => {
+    const prompt = [
+      'Talking head, 16s, dusty rose top.',
+      '0–3s: close-up. «Первый полёт с малышом пугает.» (сочувствие)',
+      '3–6s: pull back. «Слёзы, ушки. Сама так боялась.» (тепло)',
+      '9–12s: medium. «Кормите при взлёте и посадке.» (практично)',
+      '14–16s: lean in. «Напишите МАЛЫШ, дам чек-лист.» (дружелюбно)',
+      'Spoken dialogue (4 sentences): «Первый полёт с малышом пугает. Слёзы, ушки. Сама так боялась. Кормите при взлёте и посадке. Напишите МАЛЫШ, дам чек-лист.»',
+      'Critical: no extra voices.',
+    ].join('\n');
+    const out = build(prompt, 2);
+    // полный текст вырезан из тела — нет дубля в "обвязке"
+    expect(out[0]).not.toContain('Spoken dialogue');
+    // клип 1 несёт первую половину, клип 2 — вторую; БЕЗ пересечений
+    expect(out[0]).toContain('Первый полёт');
+    expect(out[1]).not.toContain('Первый полёт');     // ← главное: нет повтора
+    expect(out[1]).toContain('Напишите МАЛЫШ');
+    expect(out[0]).not.toContain('Напишите МАЛЫШ');
+    // визуальная обвязка сохранилась
+    expect(out[0]).toContain('dusty rose');
+    expect(out[1]).toContain('dusty rose');
   });
-  test('преамбула (внешность) повторяется в КАЖДОМ сегменте — консистентный персонаж', () => {
-    for (const s of segs) expect(s).toMatch(/man in his 40s|short dark hair/i);
-  });
-  test('субтитры присутствуют в КАЖДОМ сегменте — на всю длину', () => {
-    for (const s of segs) expect(s).toMatch(/subtitles/i);
-  });
-  test('речь распределена (не вся в одном сегменте)', () => {
-    expect(segs[1]).toMatch(/Двадцать лет|Готов превращать|Continue the previous/i);
+
+  test('нет кавычек — база несёт всё, хвост продолжает без речи', () => {
+    const out = build('Мужчина в офисе смотрит в камеру. Тёплый свет.', 3);
+    expect(out[0]).toContain('офисе');
+    expect(out[1]).toBe(continuation());
+    expect(out[2]).toBe(continuation());
   });
 });
