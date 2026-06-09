@@ -6,6 +6,7 @@ import { TgIdentityService } from './tg-identity.service';
 import { TgClaimService } from './tg-claim.service';
 import { TgConfigService } from './tg-config.service';
 import { TgRouterService } from './tg-router.service';
+import { TgVoiceService } from './tg-voice.service';
 import { TgGrammyClient } from './tg-grammy.client';
 
 @Injectable()
@@ -18,6 +19,7 @@ export class TgBotService implements OnModuleInit {
     private readonly claim: TgClaimService,
     private readonly configs: TgConfigService,
     private readonly router: TgRouterService,
+    private readonly voice: TgVoiceService,
     private readonly grammy: TgGrammyClient,
   ) {}
 
@@ -139,18 +141,27 @@ export class TgBotService implements OnModuleInit {
 
   private async handleGroupMessage(msg: any): Promise<void> {
     const cfg = await this.configs.getActiveByTgChatId(msg.chat.id);
-    if (!cfg) return;  // нет активного конфига (бот в группе без claim'а)
+    if (!cfg) return;
 
     const isVoice = !!(msg.voice || msg.audio);
-    const text = msg.text ?? msg.caption ?? '';
+    let workingText: string = msg.text ?? msg.caption ?? '';
+    let actualIsVoice = false;
+    let voiceFileId: string | undefined;
 
-    // Voice — Phase 6 добавит STT. Пока пропускаем.
     if (isVoice) {
-      this.logger.debug(`voice in chat ${msg.chat.id} — STT not implemented yet`);
-      return;
+      voiceFileId = msg.voice?.file_id ?? msg.audio?.file_id;
+      if (!voiceFileId) return;
+      try {
+        workingText = await this.voice.transcribe(voiceFileId);
+        actualIsVoice = true;
+        this.logger.log(`voice transcribed in chat ${msg.chat.id}: "${workingText.substring(0, 50)}..."`);
+      } catch (e: any) {
+        this.logger.warn(`STT failed for chat ${msg.chat.id}: ${e.message}`);
+        return;
+      }
     }
 
-    if (!text) return;  // ни текста ни voice
+    if (!workingText) return;
 
     const botUserId = await this.grammy.getBotUserId();
     const ctx = {
@@ -158,13 +169,13 @@ export class TgBotService implements OnModuleInit {
       msgId: msg.message_id,
       fromTgUserId: msg.from.id,
       fromTgUserName: msg.from.first_name ?? msg.from.username ?? null,
-      text,
+      text: workingText,
       replyToBotMessageId: msg.reply_to_message?.message_id,
       replyToFromBot: msg.reply_to_message?.from?.id === botUserId,
-      isVoice: false,
+      isVoice: actualIsVoice,
+      voiceFileId,
     };
 
-    // Per-chat advisory lock — последовательная обработка
     const lockId = this.hashLock(`tg-chat:${msg.chat.id}`);
     const lockRes = await this.pg.query(`SELECT pg_try_advisory_lock($1)`, [lockId]);
     if (!lockRes.rows[0].pg_try_advisory_lock) {
@@ -178,9 +189,8 @@ export class TgBotService implements OnModuleInit {
       const should = await this.router.shouldRespond(cfg, ctx);
       if (!should) return;
 
-      // Phase 8 добавит handling команд (/help, /balance, /silent, /resume) до LLM-вызова
+      // Phase 8 добавит handling команд (/help, /balance, /silent, /resume) ДО LLM-вызова
 
-      // Имя владельца берём из ai_profiles_consolidated.profile_data->>'name'
       const ownerRes = await this.pg.query(
         `SELECT profile_data->>'name' AS first_name FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
         [cfg.owner_user_id],
@@ -188,12 +198,40 @@ export class TgBotService implements OnModuleInit {
       const ownerFirstName = ownerRes.rows[0]?.first_name ?? 'Linkeon-пользователь';
 
       const reply = await this.router.generateReply(cfg, ownerFirstName);
-      await this.grammy.sendMessage(msg.chat.id, reply.text, {
-        reply_to_message_id: msg.message_id,
-      });
 
-      // Phase 7 включит реальный billing. Пока tokensCharged = 0.
-      await this.router.persistAssistantReply(cfg, reply.text, 'text', 0);
+      // Voice reply policy
+      const wantsVoice =
+        cfg.voice_reply_mode === 'always' ||
+        (cfg.voice_reply_mode === 'mirror' && actualIsVoice);
+
+      let contentType: 'text' | 'voice_reply' = 'text';
+      let voiceTtsCostUsd = 0;
+
+      if (wantsVoice) {
+        try {
+          const tts = await this.voice.synthesize(reply.text);
+          voiceTtsCostUsd = tts.costUsd;
+          await this.grammy.sendVoice(msg.chat.id, tts.buffer, {
+            reply_to_message_id: msg.message_id,
+            caption: reply.text.substring(0, 1024),
+          });
+          contentType = 'voice_reply';
+        } catch (e: any) {
+          this.logger.warn(`TTS failed for chat ${msg.chat.id}, fallback to text: ${e.message}`);
+          await this.grammy.sendMessage(msg.chat.id, reply.text, {
+            reply_to_message_id: msg.message_id,
+          });
+        }
+      } else {
+        await this.grammy.sendMessage(msg.chat.id, reply.text, {
+          reply_to_message_id: msg.message_id,
+        });
+      }
+
+      // Phase 7 включит реальный billing — пока tokensCharged = 0,
+      // но voiceTtsCostUsd уже зафиксирован для будущего расчёта.
+      void voiceTtsCostUsd;  // прячем ошибку «unused» — используется в Phase 7
+      await this.router.persistAssistantReply(cfg, reply.text, contentType, 0);
     } finally {
       await this.pg.query(`SELECT pg_advisory_unlock($1)`, [lockId]);
     }
