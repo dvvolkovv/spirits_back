@@ -69,8 +69,12 @@ export class ClaudeCliService {
       fullPrompt,
       '--model', model,
       '--output-format', 'json',
-      '--allowedTools', '',          // disable all built-in tools
-      '--disallowedTools', 'all',
+      '--allowedTools', '',          // disable all built-in tools. Раньше
+                                     // дублировали через --disallowedTools all,
+                                     // но claude CLI ≥2.1.150 строго валидирует
+                                     // имена тулов и ругается "all matches no
+                                     // known tool" → exit 1. Пустой allowedTools
+                                     // и без disallowedTools достаточно.
       '--strict-mcp-config',         // load NO MCP servers (none passed) — these
                                      // one-shot calls use no tools; skipping MCP
                                      // startup avoids stalls in the pm2 env.
