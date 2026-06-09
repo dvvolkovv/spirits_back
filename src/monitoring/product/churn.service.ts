@@ -93,9 +93,13 @@ export class ChurnService {
            AND internal_id <> ALL($1::text[])
        ),
        active AS (
-         SELECT DISTINCT user_id AS uid
-         FROM events
-         WHERE name = 'message_sent' AND ts >= now() - interval '14 days'
+         -- Активность по custom_chat_history (канонический источник чата с апреля),
+         -- а НЕ по events.message_sent — он пишется только с ~2026-06-01 и
+         -- недосчитывает активность в окнах, заходящих раньше → ложный отвал
+         -- активных старых юзеров (бэклог 4f6d998f). uid = префикс session_id (= телефон).
+         SELECT DISTINCT split_part(session_id, '_', 1) AS uid
+         FROM custom_chat_history
+         WHERE sender_type = 'human' AND created_at >= now() - interval '14 days'
        )
        SELECT
          (SELECT COUNT(*)::int FROM cohort) AS cohort,
@@ -112,9 +116,13 @@ export class ChurnService {
            AND internal_id <> ALL($1::text[])
        ),
        active AS (
-         SELECT DISTINCT user_id AS uid
-         FROM events
-         WHERE name = 'message_sent' AND ts >= now() - interval '14 days'
+         -- Активность по custom_chat_history (канонический источник чата с апреля),
+         -- а НЕ по events.message_sent — он пишется только с ~2026-06-01 и
+         -- недосчитывает активность в окнах, заходящих раньше → ложный отвал
+         -- активных старых юзеров (бэклог 4f6d998f). uid = префикс session_id (= телефон).
+         SELECT DISTINCT split_part(session_id, '_', 1) AS uid
+         FROM custom_chat_history
+         WHERE sender_type = 'human' AND created_at >= now() - interval '14 days'
        )
        SELECT
          (SELECT COUNT(*)::int FROM cohort) AS cohort,
@@ -142,10 +150,10 @@ export class ChurnService {
        WHERE u.state = 'active'
          AND u.internal_id <> ALL($1::text[])
          AND NOT EXISTS (
-           SELECT 1 FROM events e
-           WHERE e.user_id = u.internal_id
-             AND e.name = 'message_sent'
-             AND e.ts >= now() - interval '14 days'
+           SELECT 1 FROM custom_chat_history h
+           WHERE split_part(h.session_id, '_', 1) = u.internal_id
+             AND h.sender_type = 'human'
+             AND h.created_at >= now() - interval '14 days'
          )`,
       [excluded],
     );
@@ -171,10 +179,10 @@ export class ChurnService {
        SELECT
          COUNT(*)::int AS cohort,
          COUNT(*) FILTER (WHERE NOT EXISTS (
-           SELECT 1 FROM events e
-           WHERE e.user_id = cohort.uid
-             AND e.name = 'message_sent'
-             AND e.ts BETWEEN cohort.signup_ts AND cohort.signup_ts + interval '24 hours'
+           SELECT 1 FROM custom_chat_history h
+           WHERE split_part(h.session_id, '_', 1) = cohort.uid
+             AND h.sender_type = 'human'
+             AND h.created_at BETWEEN cohort.signup_ts AND cohort.signup_ts + interval '24 hours'
          ))::int AS bounced
        FROM cohort`,
       [excluded],
@@ -187,9 +195,9 @@ export class ChurnService {
          (SELECT COUNT(*)::int FROM contact_requests WHERE status = 'pending'
             AND created_at < now() - interval '7 days')                                AS pending_ignored,
          (SELECT COUNT(*)::int FROM user_blocks)                                       AS blocks_total,
-         (SELECT COUNT(DISTINCT user_id)::int FROM events
-            WHERE name = 'message_sent' AND ts >= now() - interval '30 days'
-              AND user_id <> ALL($1::text[]))                                          AS active_30d`,
+         (SELECT COUNT(DISTINCT split_part(session_id, '_', 1))::int FROM custom_chat_history
+            WHERE sender_type = 'human' AND created_at >= now() - interval '30 days'
+              AND split_part(session_id, '_', 1) <> ALL($1::text[]))                    AS active_30d`,
       [excluded],
     );
 
@@ -211,14 +219,14 @@ export class ChurnService {
          w.week,
          COUNT(*)::int                                                                AS signups,
          COUNT(*) FILTER (WHERE EXISTS (
-           SELECT 1 FROM events e
-           WHERE e.user_id = w.uid AND e.name = 'message_sent'
-             AND e.ts BETWEEN w.signup_ts + interval '6 days' AND w.signup_ts + interval '8 days'
+           SELECT 1 FROM custom_chat_history h
+           WHERE split_part(h.session_id, '_', 1) = w.uid AND h.sender_type = 'human'
+             AND h.created_at BETWEEN w.signup_ts + interval '6 days' AND w.signup_ts + interval '8 days'
          ))::int                                                                       AS retained_d7,
          COUNT(*) FILTER (WHERE EXISTS (
-           SELECT 1 FROM events e
-           WHERE e.user_id = w.uid AND e.name = 'message_sent'
-             AND e.ts BETWEEN w.signup_ts + interval '29 days' AND w.signup_ts + interval '31 days'
+           SELECT 1 FROM custom_chat_history h
+           WHERE split_part(h.session_id, '_', 1) = w.uid AND h.sender_type = 'human'
+             AND h.created_at BETWEEN w.signup_ts + interval '29 days' AND w.signup_ts + interval '31 days'
          ))::int                                                                       AS retained_d30
        FROM weeks w
        GROUP BY w.week ORDER BY w.week DESC LIMIT 12`,
