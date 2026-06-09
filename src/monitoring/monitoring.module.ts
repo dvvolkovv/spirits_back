@@ -15,8 +15,6 @@ import { ContentService } from './product/content.service';
 import { PersonasService } from './product/personas.service';
 import { AttributionService } from './product/attribution.service';
 import { SmsHealthService } from './sms-health.service';
-import { OpenRouterHealthService } from './openrouter-health.service';
-import { ElevenLabsHealthService } from './elevenlabs-health.service';
 import { ClaudeHealthService } from './claude-health.service';
 import { BackupHealthService } from './backup-health.service';
 import { ModelsRegistryService } from './models-registry.service';
@@ -30,6 +28,6 @@ import { Neo4jModule } from '../neo4j/neo4j.module';
 @Module({
   imports: [CommonModule, Neo4jModule],
   controllers: [MonitoringController],
-  providers: [MonitoringService, LogsService, SyntheticService, FunnelService, EconomyService, QualityService, ProfileDepthService, SummaryService, NetworkingService, ChurnService, SupportService, ContentService, PersonasService, AttributionService, SmsHealthService, OpenRouterHealthService, ElevenLabsHealthService, ClaudeHealthService, BackupHealthService, ModelsRegistryService, JobsMonitorService, ReplicationHealthService, NeoSnapshotHealthService, MinioMirrorHealthService],
+  providers: [MonitoringService, LogsService, SyntheticService, FunnelService, EconomyService, QualityService, ProfileDepthService, SummaryService, NetworkingService, ChurnService, SupportService, ContentService, PersonasService, AttributionService, SmsHealthService, ClaudeHealthService, BackupHealthService, ModelsRegistryService, JobsMonitorService, ReplicationHealthService, NeoSnapshotHealthService, MinioMirrorHealthService],
 })
 export class MonitoringModule {}

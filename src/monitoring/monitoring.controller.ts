@@ -16,8 +16,6 @@ import { ContentService, ContentWindow } from './product/content.service';
 import { PersonasService } from './product/personas.service';
 import { AttributionService } from './product/attribution.service';
 import { SmsHealthService } from './sms-health.service';
-import { OpenRouterHealthService } from './openrouter-health.service';
-import { ElevenLabsHealthService } from './elevenlabs-health.service';
 import { ClaudeHealthService } from './claude-health.service';
 import { BackupHealthService } from './backup-health.service';
 import { ModelsRegistryService } from './models-registry.service';
@@ -52,8 +50,6 @@ export class MonitoringController {
     private readonly personas: PersonasService,
     private readonly attribution: AttributionService,
     private readonly smsHealth: SmsHealthService,
-    private readonly openrouterHealth: OpenRouterHealthService,
-    private readonly elevenlabsHealth: ElevenLabsHealthService,
     private readonly claudeHealth: ClaudeHealthService,
     private readonly backupHealth: BackupHealthService,
     private readonly models: ModelsRegistryService,
@@ -120,27 +116,8 @@ export class MonitoringController {
     }
   }
 
-  @Get('admin/monitoring/tech/openrouter')
-  @UseGuards(JwtGuard, AdminGuard)
-  async openrouterOverview(@Res() res: Response) {
-    try {
-      const data = await this.openrouterHealth.getOverview();
-      return res.status(200).json(data);
-    } catch (e: any) {
-      return res.status(500).json({ error: 'openrouter_failed', message: e?.message || String(e) });
-    }
-  }
-
-  @Get('admin/monitoring/tech/elevenlabs')
-  @UseGuards(JwtGuard, AdminGuard)
-  async elevenlabsOverview(@Res() res: Response) {
-    try {
-      const data = await this.elevenlabsHealth.getOverview();
-      return res.status(200).json(data);
-    } catch (e: any) {
-      return res.status(500).json({ error: 'elevenlabs_failed', message: e?.message || String(e) });
-    }
-  }
+  // OpenRouter и ElevenLabs убраны из мониторинга (b0821507/94bc572c): OpenRouter
+  // дропнут OAuth-миграцией, ElevenLabs не используется.
 
   @Get('admin/monitoring/tech/claude')
   @UseGuards(JwtGuard, AdminGuard)
