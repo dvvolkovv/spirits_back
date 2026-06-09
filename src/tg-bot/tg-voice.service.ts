@@ -5,9 +5,23 @@ import { TgGrammyClient } from './tg-grammy.client';
 @Injectable()
 export class TgVoiceService {
   private readonly logger = new Logger(TgVoiceService.name);
-  private openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  // Ленивая инициализация: OpenAI() в конструкторе кидает если apiKey не задан,
+  // что роняло весь Nest-bootstrap на test-сервере без OPENAI_API_KEY (где voice
+  // не нужен, потому что нет TG_BOT_TOKEN). Создаём клиент при первом вызове.
+  private _openai: OpenAI | null = null;
 
   constructor(private readonly grammy: TgGrammyClient) {}
+
+  private get openai(): OpenAI {
+    if (!this._openai) {
+      const apiKey = process.env.OPENAI_API_KEY;
+      if (!apiKey) {
+        throw new Error('OPENAI_API_KEY not set — voice STT/TTS unavailable');
+      }
+      this._openai = new OpenAI({ apiKey });
+    }
+    return this._openai;
+  }
 
   /**
    * Whisper STT. На нас (Linkeon) — не списываем с пользователя.
