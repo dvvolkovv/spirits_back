@@ -42,11 +42,39 @@ export class ChatService {
     req?: Request,
   ): Promise<void> {
     // Get agent
-    const isNumeric = /^\d+$/.test(assistantId);
-    const agentRes = isNumeric
-      ? await this.pg.query('SELECT * FROM agents WHERE id = $1 LIMIT 1', [parseInt(assistantId, 10)])
-      : await this.pg.query('SELECT * FROM agents WHERE name = $1 LIMIT 1', [assistantId]);
-    const agent = agentRes.rows[0];
+    // Custom-agent branch: "custom:<uuid>" references user-created agents.
+    // Owner-check is enforced — a user cannot use another user's custom agent.
+    let agent: any;
+    if (assistantId.startsWith('custom:')) {
+      const customId = assistantId.substring('custom:'.length);
+      const customRes = await this.pg.query(
+        `SELECT id, name, description, system_prompt FROM custom_agents
+          WHERE id = $1 AND owner_user_id = $2
+          LIMIT 1`,
+        [customId, userId],
+      );
+      if (customRes.rows[0]) {
+        // Shape matches the agents table row used downstream
+        agent = {
+          id: `custom:${customRes.rows[0].id}`,
+          name: customRes.rows[0].name,
+          display_name: customRes.rows[0].name,
+          description: customRes.rows[0].description || '',
+          system_prompt: customRes.rows[0].system_prompt || '',
+        };
+      } else {
+        // Orphaned / not owned — fall back to the platform default agent (Роман, id=1)
+        this.logger.warn(`custom agent ${customId} not found or not owned by ${userId}, falling back to default`);
+        const fallbackRes = await this.pg.query('SELECT * FROM agents ORDER BY id LIMIT 1');
+        agent = fallbackRes.rows[0];
+      }
+    } else {
+      const isNumeric = /^\d+$/.test(assistantId);
+      const agentRes = isNumeric
+        ? await this.pg.query('SELECT * FROM agents WHERE id = $1 LIMIT 1', [parseInt(assistantId, 10)])
+        : await this.pg.query('SELECT * FROM agents WHERE name = $1 LIMIT 1', [assistantId]);
+      agent = agentRes.rows[0];
+    }
     if (!agent) {
       res.status(404).json({ error: 'Agent not found' });
       return;
