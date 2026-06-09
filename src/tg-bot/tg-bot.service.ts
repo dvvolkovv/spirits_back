@@ -29,6 +29,7 @@ export class TgBotService implements OnModuleInit {
 
   async onModuleInit() {
     await this.applyMigration('001_tg_bot_schema.sql');
+    await this.applyMigration('002_tg_bot_custom_agent_fk.sql');
   }
 
   private async applyMigration(filename: string) {
@@ -55,6 +56,10 @@ export class TgBotService implements OnModuleInit {
       const msg = update.message ?? update.edited_message;
       if (msg) {
         await this.handleMessage(msg);
+        return;
+      }
+      if (update.my_chat_member) {
+        await this.handleMyChatMember(update.my_chat_member);
         return;
       }
     } catch (e: any) {
@@ -268,6 +273,35 @@ export class TgBotService implements OnModuleInit {
       await this.billing.checkBalanceAlerts(cfg.id, cfg.owner_user_id, ownerTg?.tgUserId ?? null);
     } finally {
       await this.pg.query(`SELECT pg_advisory_unlock($1)`, [lockId]);
+    }
+  }
+
+  /**
+   * Bot kicked/left from a chat — archive the config + DM owner.
+   * Telegram sends `my_chat_member` update with new_status='left'/'kicked' (also 'banned').
+   */
+  private async handleMyChatMember(event: any): Promise<void> {
+    const newStatus = event.new_chat_member?.status;
+    if (!['left', 'kicked', 'banned'].includes(newStatus)) return;
+
+    const cfg = await this.configs.getActiveByTgChatId(event.chat.id);
+    if (!cfg) return;
+
+    await this.pg.query(
+      `UPDATE tg_bot_configs SET status = 'archived', archived_at = now() WHERE id = $1`,
+      [cfg.id],
+    );
+    this.logger.log(`config ${cfg.id} archived — bot ${newStatus} from chat ${event.chat.id}`);
+
+    // DM owner (silent failure ok — owner may not have started DM with bot)
+    const ownerTg = await this.identity.getIdentityByLinkeonId(cfg.owner_user_id);
+    if (ownerTg) {
+      try {
+        await this.grammy.sendMessage(
+          ownerTg.tgUserId,
+          `Бот «${cfg.display_name}» удалён из «${cfg.tg_chat_title ?? 'группы'}». Конфигурация архивирована — её можно восстановить в кабинете.`,
+        );
+      } catch { /* ignore */ }
     }
   }
 

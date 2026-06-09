@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleInit, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, NotFoundException, BadRequestException } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
@@ -116,7 +116,19 @@ export class CustomAgentsService implements OnModuleInit {
   }
 
   async remove(id: string, ownerId: string): Promise<void> {
-    await this.getById(id, ownerId);
+    await this.getById(id, ownerId);  // throws NotFound if absent or not owned
+    // FK-блок: проверяем что роль не используется в активных tg_bot_configs
+    const usageRes = await this.pg.query(
+      `SELECT id, display_name FROM tg_bot_configs
+        WHERE custom_agent_id = $1 AND status != 'deleted'`,
+      [id],
+    );
+    if (usageRes.rows.length > 0) {
+      const names = usageRes.rows.map((r: any) => r.display_name).join(', ');
+      throw new BadRequestException(
+        `Эта роль используется в ${usageRes.rows.length} ботах: ${names}. Сначала отвяжи или удали их.`,
+      );
+    }
     await this.pg.query(
       `DELETE FROM custom_agents WHERE id = $1 AND owner_user_id = $2`,
       [id, ownerId],
