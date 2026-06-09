@@ -1,6 +1,7 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post, Res, UseGuards, UsePipes, ValidationPipe } from '@nestjs/common';
 import { Response } from 'express';
 import { JwtGuard } from '../common/guards/jwt.guard';
+import { AdminGuard } from '../common/guards/admin.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { CustomAgentsService } from './custom-agents.service';
 import { CreateCustomAgentDto, UpdateCustomAgentDto, DraftPromptDto } from './custom-agents.dto';
@@ -26,6 +27,7 @@ export class CustomAgentsController {
     );
   }
 
+  @UseGuards(AdminGuard)
   @Post('custom-agents')
   async create(@CurrentUser() user: any, @Body() dto: CreateCustomAgentDto, @Res() res: Response) {
     const row = await this.agents.create(user.userId, dto);
@@ -39,12 +41,14 @@ export class CustomAgentsController {
     });
   }
 
+  @UseGuards(AdminGuard)
   @Post('custom-agents/draft')
   async draft(@CurrentUser() _user: any, @Body() dto: DraftPromptDto, @Res() res: Response) {
     const draft = await this.agents.draftPrompt(dto.description);
     return res.status(200).json(draft);
   }
 
+  @UseGuards(AdminGuard)
   @Patch('custom-agents/:id')
   async update(
     @CurrentUser() user: any,
@@ -63,6 +67,7 @@ export class CustomAgentsController {
     });
   }
 
+  @UseGuards(AdminGuard)
   @Delete('custom-agents/:id')
   async remove(@CurrentUser() user: any, @Param('id') id: string, @Res() res: Response) {
     await this.agents.remove(id, user.userId);

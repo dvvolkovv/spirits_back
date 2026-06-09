@@ -1,6 +1,7 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post, Res, UseGuards, UsePipes, ValidationPipe } from '@nestjs/common';
 import { Response } from 'express';
 import { JwtGuard } from '../common/guards/jwt.guard';
+import { AdminGuard } from '../common/guards/admin.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { TgIdentityService } from './tg-identity.service';
 import { TgConfigService, TgBotConfigRow } from './tg-config.service';
@@ -22,6 +23,7 @@ export class TgBotConfigController {
     return res.status(200).json({ bound: true, tgUsername: id.tgUsername, tgFirstName: id.tgFirstName });
   }
 
+  @UseGuards(AdminGuard)
   @Post('identity-link')
   async identityLink(@CurrentUser() user: any, @Res() res: Response) {
     const token = await this.identity.createAuthToken(user.userId);
@@ -35,6 +37,7 @@ export class TgBotConfigController {
     return res.status(200).json(rows.map(this.toJson));
   }
 
+  @UseGuards(AdminGuard)
   @Post('configs')
   async create(@CurrentUser() user: any, @Body() dto: CreateBotConfigDto, @Res() res: Response) {
     const result = await this.configs.createPending(user.userId, dto);
@@ -51,6 +54,7 @@ export class TgBotConfigController {
     return res.status(200).json(this.toJson(cfg));
   }
 
+  @UseGuards(AdminGuard)
   @Patch('configs/:id')
   async update(
     @CurrentUser() user: any,
@@ -62,6 +66,7 @@ export class TgBotConfigController {
     return res.status(200).json(this.toJson(cfg));
   }
 
+  @UseGuards(AdminGuard)
   @Delete('configs/:id')
   async remove(@CurrentUser() user: any, @Param('id') id: string, @Res() res: Response) {
     await this.configs.archive(id, user.userId);
