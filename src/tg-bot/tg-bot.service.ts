@@ -7,6 +7,7 @@ import { TgClaimService } from './tg-claim.service';
 import { TgConfigService } from './tg-config.service';
 import { TgRouterService } from './tg-router.service';
 import { TgVoiceService } from './tg-voice.service';
+import { TgBillingService } from './tg-billing.service';
 import { TgGrammyClient } from './tg-grammy.client';
 
 @Injectable()
@@ -20,6 +21,7 @@ export class TgBotService implements OnModuleInit {
     private readonly configs: TgConfigService,
     private readonly router: TgRouterService,
     private readonly voice: TgVoiceService,
+    private readonly billing: TgBillingService,
     private readonly grammy: TgGrammyClient,
   ) {}
 
@@ -163,6 +165,22 @@ export class TgBotService implements OnModuleInit {
 
     if (!workingText) return;
 
+    // Pre-flight: balance check. При 0 — однократное сообщение в группе.
+    const preBalance = await this.billing.getBalance(cfg.owner_user_id);
+    if (preBalance <= 0) {
+      const notified = await this.billing.hasZeroBalanceFlag(cfg.id);
+      if (!notified) {
+        try {
+          await this.grammy.sendMessage(
+            msg.chat.id,
+            `У владельца закончились токены. Пополнить: https://my.linkeon.io/tokens`,
+          );
+          await this.billing.markZeroBalanceNotified(cfg.id);
+        } catch { /* ignore */ }
+      }
+      return;
+    }
+
     const botUserId = await this.grammy.getBotUserId();
     const ctx = {
       chatId: msg.chat.id,
@@ -228,10 +246,21 @@ export class TgBotService implements OnModuleInit {
         });
       }
 
-      // Phase 7 включит реальный billing — пока tokensCharged = 0,
-      // но voiceTtsCostUsd уже зафиксирован для будущего расчёта.
-      void voiceTtsCostUsd;  // прячем ошибку «unused» — используется в Phase 7
-      await this.router.persistAssistantReply(cfg, reply.text, contentType, 0);
+      const totalCostUsd = reply.costUsd + voiceTtsCostUsd;
+      const tokensCharged = this.billing.tokensFromUsd(totalCostUsd);
+      const newBalance = await this.billing.deduct(cfg.owner_user_id, tokensCharged);
+      this.logger.log(
+        `tg-bot billing: config=${cfg.id} cost=$${totalCostUsd.toFixed(5)} deducted=${tokensCharged} balance=${newBalance}`,
+      );
+      // При успешном списании > 0 — сбрасываем flag, чтобы при следующем падении в 0 снова срабатывало однократное сообщение
+      if (newBalance > 0) {
+        await this.billing.clearZeroBalanceFlag(cfg.id);
+      }
+      await this.router.persistAssistantReply(cfg, reply.text, contentType, tokensCharged);
+
+      // DM-alert при низком балансе (post-deduct)
+      const ownerTg = await this.identity.getIdentityByLinkeonId(cfg.owner_user_id);
+      await this.billing.checkBalanceAlerts(cfg.id, cfg.owner_user_id, ownerTg?.tgUserId ?? null);
     } finally {
       await this.pg.query(`SELECT pg_advisory_unlock($1)`, [lockId]);
     }
