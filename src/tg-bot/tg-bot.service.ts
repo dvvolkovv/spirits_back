@@ -4,6 +4,8 @@ import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
 import { TgIdentityService } from './tg-identity.service';
 import { TgClaimService } from './tg-claim.service';
+import { TgConfigService } from './tg-config.service';
+import { TgRouterService } from './tg-router.service';
 import { TgGrammyClient } from './tg-grammy.client';
 
 @Injectable()
@@ -14,6 +16,8 @@ export class TgBotService implements OnModuleInit {
     private readonly pg: PgService,
     private readonly identity: TgIdentityService,
     private readonly claim: TgClaimService,
+    private readonly configs: TgConfigService,
+    private readonly router: TgRouterService,
     private readonly grammy: TgGrammyClient,
   ) {}
 
@@ -83,7 +87,8 @@ export class TgBotService implements OnModuleInit {
         await this.handleGroupClaim(msg, token);
         return;
       }
-      // Group message routing — Phase 4+
+      await this.handleGroupMessage(msg);
+      return;
     }
   }
 
@@ -126,9 +131,78 @@ export class TgBotService implements OnModuleInit {
       const ownerTgId = msg.from.id;
       try {
         await this.grammy.sendMessage(ownerTgId, `Не получилось привязать бота: ${e.message}`);
-      } catch { /* ignore — may not have DM with bot */ }
+      } catch { /* ignore */ }
       this.logger.warn(`claim failed for chat ${msg.chat.id}: ${e.message}`);
       try { await this.grammy.leaveChat(msg.chat.id); } catch { /* ignore */ }
     }
+  }
+
+  private async handleGroupMessage(msg: any): Promise<void> {
+    const cfg = await this.configs.getActiveByTgChatId(msg.chat.id);
+    if (!cfg) return;  // нет активного конфига (бот в группе без claim'а)
+
+    const isVoice = !!(msg.voice || msg.audio);
+    const text = msg.text ?? msg.caption ?? '';
+
+    // Voice — Phase 6 добавит STT. Пока пропускаем.
+    if (isVoice) {
+      this.logger.debug(`voice in chat ${msg.chat.id} — STT not implemented yet`);
+      return;
+    }
+
+    if (!text) return;  // ни текста ни voice
+
+    const botUserId = await this.grammy.getBotUserId();
+    const ctx = {
+      chatId: msg.chat.id,
+      msgId: msg.message_id,
+      fromTgUserId: msg.from.id,
+      fromTgUserName: msg.from.first_name ?? msg.from.username ?? null,
+      text,
+      replyToBotMessageId: msg.reply_to_message?.message_id,
+      replyToFromBot: msg.reply_to_message?.from?.id === botUserId,
+      isVoice: false,
+    };
+
+    // Per-chat advisory lock — последовательная обработка
+    const lockId = this.hashLock(`tg-chat:${msg.chat.id}`);
+    const lockRes = await this.pg.query(`SELECT pg_try_advisory_lock($1)`, [lockId]);
+    if (!lockRes.rows[0].pg_try_advisory_lock) {
+      this.logger.debug(`chat ${msg.chat.id} busy, skipping`);
+      return;
+    }
+
+    try {
+      await this.router.persistUserMessage(cfg, ctx);
+
+      const should = await this.router.shouldRespond(cfg, ctx);
+      if (!should) return;
+
+      // Phase 8 добавит handling команд (/help, /balance, /silent, /resume) до LLM-вызова
+
+      // Имя владельца берём из ai_profiles_consolidated.profile_data->>'name'
+      const ownerRes = await this.pg.query(
+        `SELECT profile_data->>'name' AS first_name FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
+        [cfg.owner_user_id],
+      );
+      const ownerFirstName = ownerRes.rows[0]?.first_name ?? 'Linkeon-пользователь';
+
+      const reply = await this.router.generateReply(cfg, ownerFirstName);
+      await this.grammy.sendMessage(msg.chat.id, reply.text, {
+        reply_to_message_id: msg.message_id,
+      });
+
+      // Phase 7 включит реальный billing. Пока tokensCharged = 0.
+      await this.router.persistAssistantReply(cfg, reply.text, 'text', 0);
+    } finally {
+      await this.pg.query(`SELECT pg_advisory_unlock($1)`, [lockId]);
+    }
+  }
+
+  // hashtext-эквивалент: 32-битный знаковый int для pg_advisory_lock
+  private hashLock(key: string): number {
+    let h = 0;
+    for (let i = 0; i < key.length; i++) h = ((h << 5) - h + key.charCodeAt(i)) | 0;
+    return h;
   }
 }

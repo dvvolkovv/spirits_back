@@ -6,10 +6,14 @@ import { TgGrammyClient } from './tg-grammy.client';
 import { TgIdentityService } from './tg-identity.service';
 import { TgConfigService } from './tg-config.service';
 import { TgClaimService } from './tg-claim.service';
+import { TgRouterService } from './tg-router.service';
+import { AgentsModule } from '../agents/agents.module';
+import { CommonModule } from '../common/common.module';
 
 @Module({
+  imports: [AgentsModule, CommonModule],
   controllers: [TgBotController, TgBotConfigController],
-  providers: [TgBotService, TgGrammyClient, TgIdentityService, TgConfigService, TgClaimService],
-  exports: [TgBotService, TgGrammyClient, TgIdentityService, TgConfigService, TgClaimService],
+  providers: [TgBotService, TgGrammyClient, TgIdentityService, TgConfigService, TgClaimService, TgRouterService],
+  exports: [TgBotService, TgGrammyClient, TgIdentityService, TgConfigService, TgClaimService, TgRouterService],
 })
 export class TgBotModule {}
