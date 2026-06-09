@@ -6,6 +6,13 @@ import { IdentityService } from '../identity/identity.service';
 import { EventsService } from '../events/events.service';
 import axios from 'axios';
 
+// Тест/служебные номера (mirror auth.controller.isTestPhone). Для них при
+// DEBUG_SMS_CODES=true НЕ шлём реальную SMS через SMSAERO — код и так доступен
+// через /webhook/debug/sms-code. Иначе мониторинг/smoke/тесты жгут платные SMS
+// (бэклог b0821507: резкий рост SMS-расхода после внедрения мониторинга; и явно
+// «не слать на 79030169187»).
+const TEST_PHONES = ['70000000000', '79030169187', '79169403771', '79656445804'];
+
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
@@ -42,10 +49,18 @@ export class AuthService {
     // Store in Redis with 5 min TTL
     await this.redis.set(`sc-${phone}`, code, 300);
 
-    // Send SMS via SMS Aero
-    await this.sendSms(phone, code);
+    // Тест/служебные номера при DEBUG_SMS_CODES — БЕЗ реального SMSAERO (код
+    // забирается из Redis через debug-эндпоинт). Останавливает SMS-расход от
+    // мониторинга/smoke/тестов (b0821507).
+    const isTest = TEST_PHONES.includes(phone) && process.env.DEBUG_SMS_CODES === 'true';
+    if (isTest) {
+      this.logger.log(`Test phone ${phone}: SMSAERO skipped (DEBUG_SMS_CODES), code in Redis`);
+    } else {
+      // Send SMS via SMS Aero
+      await this.sendSms(phone, code);
+    }
 
-    this.events?.track('otp_request', { userId: phone, props: { channel: 'sms' } });
+    this.events?.track('otp_request', { userId: phone, props: { channel: 'sms', sent: !isTest } });
 
     return { status: 'sent' };
   }
