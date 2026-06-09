@@ -81,11 +81,54 @@ export class TgRouterService {
         const elapsed = Date.now() - new Date(cfg.last_reply_at).getTime();
         if (elapsed < 60_000) return false;
       }
-      // Phase 5 заменит fallback на smartGate (Haiku-вызов)
-      return this.shouldRespondStrict(ctx.text, botUsername, cfg.display_name, !!ctx.replyToFromBot);
+      // 1. Если триггер сработал явно (как в strict) — пускаем сразу, без гейта
+      if (this.shouldRespondStrict(ctx.text, botUsername, cfg.display_name, !!ctx.replyToFromBot)) {
+        return true;
+      }
+      // 2. Иначе — гейт через Haiku
+      return await this.smartGate(cfg, ctx);
     }
 
     return false;
+  }
+
+  /**
+   * Haiku-гейт для режима smart: per-message «стоит ли вмешаться?».
+   * Гейт-вызовы — БЕСПЛАТНЫЕ для пользователя (мы не плюсуем costUsd в billing
+   * согласно спеку: «STT и smart-gate не списываются с владельца»).
+   */
+  private async smartGate(cfg: TgBotConfigRow, ctx: IncomingMessageContext): Promise<boolean> {
+    let systemPrompt = '';
+    try {
+      const resolved = await this.resolveSystemPrompt(cfg);
+      systemPrompt = resolved.systemPrompt;
+    } catch {
+      // no resolvable agent — gate говорит no
+      return false;
+    }
+
+    const history = await this.loadHistory(cfg.id);
+    const recent = history.slice(-10).map(m => `${m.role}: ${m.content}`).join('\n');
+
+    const gatePrompt = `Роль ассистента: ${systemPrompt.substring(0, 500)}...
+
+Последние сообщения группы:
+${recent}
+
+Новое сообщение от ${ctx.fromTgUserName || 'user'}: "${ctx.text}"
+
+Должен ли этот ассистент вмешаться сейчас? Ответь строго "yes" или "no" — больше ничего.`;
+
+    try {
+      const text = await this.claudeCli.text(gatePrompt, {
+        model: 'claude-haiku-4-5',
+        timeoutMs: 15_000,
+      });
+      return text.trim().toLowerCase().startsWith('yes');
+    } catch (e: any) {
+      this.logger.warn(`smart-gate failed, defaulting to no: ${e.message}`);
+      return false;
+    }
   }
 
   /**
