@@ -6,7 +6,7 @@ import { TgBotService } from './tg-bot.service';
 export class TgBotController {
   constructor(private readonly bot: TgBotService) {}
 
-  @Post('webhook/telegram/:secret')
+  @Post('telegram/:secret')
   @HttpCode(200)
   async handle(
     @Param('secret') urlSecret: string,

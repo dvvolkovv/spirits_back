@@ -7,7 +7,7 @@ import { TgIdentityService } from './tg-identity.service';
 import { TgConfigService, TgBotConfigRow } from './tg-config.service';
 import { CreateBotConfigDto, UpdateBotConfigDto } from './tg-bot.dto';
 
-@Controller('webhook/tg-bot')
+@Controller('tg-bot')
 @UseGuards(JwtGuard)
 @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
 export class TgBotConfigController {
