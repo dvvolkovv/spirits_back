@@ -40,6 +40,13 @@ export class TgGrammyClient implements OnModuleInit {
     return this.bot.api.sendMessage(chatId, text, options);
   }
 
+  async sendChatAction(
+    chatId: number,
+    action: 'typing' | 'upload_photo' | 'record_voice' | 'upload_voice' | 'upload_document' | 'choose_sticker' | 'find_location' | 'record_video' | 'upload_video' | 'record_video_note' | 'upload_video_note',
+  ) {
+    return this.bot.api.sendChatAction(chatId, action);
+  }
+
   async sendVoice(chatId: number, voice: Buffer, options: any = {}) {
     return this.bot.api.sendVoice(chatId, new InputFile(voice), options);
   }

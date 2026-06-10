@@ -332,8 +332,15 @@ export class TgBotService implements OnModuleInit {
     const lockRes = await this.pg.query(`SELECT pg_try_advisory_lock($1)`, [lockId]);
     if (!lockRes.rows[0].pg_try_advisory_lock) {
       this.logger.debug(`chat ${msg.chat.id} busy, skipping`);
+      // Без обратной связи юзер не понимает что произошло. typing-action длится
+      // ~5с и сигнализирует "вижу тебя, но занят" без отдельного сообщения-спама.
+      try { await this.grammy.sendChatAction(msg.chat.id, 'typing'); } catch { /* ignore */ }
       return;
     }
+
+    // Typing-индикатор пока думает Claude (до 90с). Telegram action длится ~5с —
+    // обновляем каждые 4с. Останавливаем как только Claude вернул ответ.
+    let typingTimer: NodeJS.Timeout | null = null;
 
     try {
       await this.router.persistUserMessage(cfg, ctx);
@@ -346,6 +353,11 @@ export class TgBotService implements OnModuleInit {
       const should = await this.router.shouldRespond(cfg, ctx);
       if (!should) return;
 
+      this.grammy.sendChatAction(msg.chat.id, 'typing').catch(() => {});
+      typingTimer = setInterval(() => {
+        this.grammy.sendChatAction(msg.chat.id, 'typing').catch(() => {});
+      }, 4000);
+
       const ownerRes = await this.pg.query(
         `SELECT profile_data->>'name' AS first_name FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
         [cfg.owner_user_id],
@@ -353,6 +365,10 @@ export class TgBotService implements OnModuleInit {
       const ownerFirstName = ownerRes.rows[0]?.first_name ?? 'Linkeon-пользователь';
 
       const reply = await this.router.generateReply(cfg, ownerFirstName, attachments);
+
+      // Claude отработал — гасим typing-loop, дальше каждый исходящий канал
+      // (voice/photo/document) выставит свой собственный action.
+      if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
 
       // Парсим маркеры {{image:...}} и {{file:...}} — они идут отдельными сообщениями,
       // в основном тексте их быть не должно.
@@ -370,6 +386,7 @@ export class TgBotService implements OnModuleInit {
 
       if (wantsVoice && textToSend) {
         try {
+          this.grammy.sendChatAction(msg.chat.id, 'record_voice').catch(() => {});
           const tts = await this.voice.synthesize(textToSend);
           voiceTtsCostUsd = tts.costUsd;
           await this.grammy.sendVoice(msg.chat.id, tts.buffer, {
@@ -418,6 +435,7 @@ export class TgBotService implements OnModuleInit {
       const ownerTg = await this.identity.getIdentityByLinkeonId(cfg.owner_user_id);
       await this.billing.checkBalanceAlerts(cfg.id, cfg.owner_user_id, ownerTg?.tgUserId ?? null);
     } finally {
+      if (typingTimer) clearInterval(typingTimer);
       await this.pg.query(`SELECT pg_advisory_unlock($1)`, [lockId]);
       // Чистим временные файлы независимо от исхода.
       for (const p of attachments) {
@@ -512,6 +530,7 @@ export class TgBotService implements OnModuleInit {
   /** Отправляет один маркер: генерим картинку или скачиваем по URL → шлём в чат. */
   private async dispatchOutgoingMarker(cfg: TgBotConfigRow, msg: any, m: OutgoingMarker): Promise<void> {
     if (m.kind === 'image') {
+      this.grammy.sendChatAction(msg.chat.id, 'upload_photo').catch(() => {});
       const res = await this.misc.generateImage(cfg.owner_user_id, { prompt: m.prompt });
       const url = res?.images?.[0]?.url;
       if (!url) throw new Error('image-gen вернул пустой URL');
@@ -523,6 +542,7 @@ export class TgBotService implements OnModuleInit {
     }
     // file: качаем сами и шлём как document, чтобы Telegram не ограничивал
     // по размеру изображения (для картинок лучше отдельный {{image:…}})
+    this.grammy.sendChatAction(msg.chat.id, 'upload_document').catch(() => {});
     if (!/^https?:\/\//i.test(m.url)) throw new Error('url должен быть https');
     const resp = await axios.get(m.url, { responseType: 'arraybuffer', timeout: 30_000, maxContentLength: MAX_ATTACHMENT_BYTES });
     const buf = Buffer.from(resp.data);
