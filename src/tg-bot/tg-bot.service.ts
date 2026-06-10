@@ -90,6 +90,11 @@ export class TgBotService implements OnModuleInit {
       return;
     }
 
+    if (chatType === 'private' && typeof msg.text === 'string' && msg.text.startsWith('/')) {
+      await this.handleDmCommand(msg);
+      return;
+    }
+
     if (chatType === 'channel') {
       try { await this.grammy.leaveChat(msg.chat.id); } catch { /* ignore */ }
       return;
@@ -109,6 +114,92 @@ export class TgBotService implements OnModuleInit {
   private parseStartToken(text: string): string | null {
     const m = text.match(/^\/start(?:@\S+)?\s+(\S+)/);
     return m ? m[1] : null;
+  }
+
+  // Команды в личке с ботом: /help (всем) и /balance (привязанному юзеру).
+  // /silent /resume — групповые, в DM не имеют смысла.
+  private async handleDmCommand(msg: any): Promise<void> {
+    const text = msg.text.toLowerCase().trim();
+    const cmd = text.split('@')[0].split(' ')[0];
+
+    if (cmd === '/help') {
+      await this.grammy.sendMessage(
+        msg.chat.id,
+        `Я бот Linkeon — отвечаю в группах, куда меня добавил владелец.
+
+Команды (работают и здесь, и в группе — где надо, привязка по твоему Telegram):
+/start — подключить Telegram к Linkeon
+/balance — баланс токенов твоего аккаунта
+/silent — замолчать все твои боты во всех группах
+/resume — снова включить их
+/help — это сообщение
+
+В группе /silent /resume управляют только тем ботом, в чате с которым вызваны.
+
+Веб-кабинет: https://my.linkeon.io/telegram-bots`,
+      );
+      return;
+    }
+
+    if (cmd === '/balance') {
+      const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
+      if (!ownerId) {
+        await this.grammy.sendMessage(
+          msg.chat.id,
+          'Telegram не привязан к Linkeon. Зайди в кабинет и нажми «Подключить Telegram».',
+        );
+        return;
+      }
+      const bal = await this.billing.getBalance(ownerId);
+      await this.grammy.sendMessage(
+        msg.chat.id,
+        `Баланс: *${bal.toLocaleString('ru-RU')}* токенов.\nПополнить: https://my.linkeon.io/tokens`,
+        { parse_mode: 'Markdown' },
+      );
+      return;
+    }
+
+    if (cmd === '/silent' || cmd === '/resume') {
+      const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
+      if (!ownerId) {
+        await this.grammy.sendMessage(
+          msg.chat.id,
+          'Telegram не привязан к Linkeon. /start или зайди в кабинет и нажми «Подключить Telegram».',
+        );
+        return;
+      }
+      const targetStatus = cmd === '/silent' ? 'silent' : 'active';
+      const fromStatuses = cmd === '/silent' ? ['active'] : ['silent'];
+      const r = await this.pg.query(
+        `UPDATE tg_bot_configs SET status = $1
+          WHERE owner_user_id = $2 AND status = ANY($3::text[])
+          RETURNING id, display_name, tg_chat_title`,
+        [targetStatus, ownerId, fromStatuses],
+      );
+      if (r.rowCount === 0) {
+        await this.grammy.sendMessage(
+          msg.chat.id,
+          cmd === '/silent'
+            ? 'У тебя нет активных ботов, которых можно замолчать.'
+            : 'У тебя нет молчащих ботов, которых можно возобновить.',
+        );
+        return;
+      }
+      const list = r.rows.map(b => `• *${b.display_name}* в «${b.tg_chat_title ?? 'группе'}»`).join('\n');
+      const verb = cmd === '/silent' ? '🤫 Замолкли' : '✅ Снова на связи';
+      await this.grammy.sendMessage(
+        msg.chat.id,
+        `${verb}:\n${list}`,
+        { parse_mode: 'Markdown' },
+      );
+      return;
+    }
+
+    // неизвестная команда — не ругаемся, /help подскажет
+    await this.grammy.sendMessage(
+      msg.chat.id,
+      `Не знаю такой команды. /help — список доступных.`,
+    );
   }
 
   private async handleDmStart(msg: any, token: string): Promise<void> {
