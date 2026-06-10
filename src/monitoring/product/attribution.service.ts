@@ -60,21 +60,35 @@ export class AttributionService {
     try {
       const r = await this.pg.query(
         `WITH regs AS (
-           SELECT user_id FROM ai_profiles_consolidated
+           SELECT user_id, signup_source FROM ai_profiles_consolidated
             WHERE created_at > now() - ($1 || ' days')::interval
               AND user_id <> ALL($2) AND user_id !~ $3
               AND user_id NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
          ),
-         first_src AS (
-           -- Только источники ПРИВЛЕЧЕНИЯ. Бэкенд пишет в events.source и
-           -- внутренние метки (напр. 'chat.saveChatHistory') — их игнорируем,
-           -- иначе они подменяют реальный источник юзера.
-           SELECT DISTINCT ON (e.user_id) e.user_id, e.source
+         -- session_id'ы зарегистрировавшихся (из их событий, где user_id уже есть)
+         sess AS (
+           SELECT DISTINCT e.session_id, e.user_id
+             FROM events e JOIN regs r ON r.user_id = e.user_id
+            WHERE e.session_id IS NOT NULL
+         ),
+         -- источник ПРИВЛЕЧЕНИЯ по сессии: самое раннее событие с source. source
+         -- захватывается на АНОНИМНОМ landing_view (user_id=null) — поэтому связь
+         -- идёт через session_id, а НЕ через user_id (иначе все регистрации
+         -- падают в 'unknown' — баг до 2026-06-10). Внутренние метки
+         -- (chat.saveChatHistory и пр.) отфильтрованы.
+         src AS (
+           SELECT DISTINCT ON (e.session_id) e.session_id, e.source, e.ts
              FROM events e
-            WHERE e.user_id IS NOT NULL AND e.source IS NOT NULL
+            WHERE e.source IS NOT NULL
               AND (e.source LIKE 'utm:%' OR e.source LIKE 'referral:%'
                    OR e.source LIKE 'ref-site:%' OR e.source IN ('direct','organic'))
-            ORDER BY e.user_id, e.ts ASC
+            ORDER BY e.session_id, e.ts ASC
+         ),
+         -- first-touch источник юзера = source его самой ранней сессии с source
+         first_src AS (
+           SELECT DISTINCT ON (sess.user_id) sess.user_id, src.source
+             FROM sess JOIN src ON src.session_id = sess.session_id
+            ORDER BY sess.user_id, src.ts ASC
          ),
          chat AS (
            SELECT split_part(session_id,'_',1) AS uid, min(created_at) AS first_chat
@@ -84,7 +98,9 @@ export class AttributionService {
            SELECT user_id, SUM(amount)::numeric AS rev
              FROM payments WHERE status='succeeded' GROUP BY 1
          )
-         SELECT COALESCE(fs.source,'unknown') AS source,
+         -- Источник: НАДЁЖНЫЙ signup_source (записан при регистрации) приоритетнее
+         -- session-эвристики fs (она не доживает между визитами/доменами).
+         SELECT COALESCE(NULLIF(r.signup_source,''), fs.source, 'unknown') AS source,
                 COUNT(*)::int                                        AS registrations,
                 COUNT(*) FILTER (WHERE c.uid IS NOT NULL)::int       AS activated,
                 COUNT(*) FILTER (WHERE p.user_id IS NOT NULL)::int   AS payers,

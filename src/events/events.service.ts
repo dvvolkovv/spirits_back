@@ -56,6 +56,17 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
+    // Колонка для надёжной атрибуции источника привлечения (signup_source).
+    // session_id между анонимным лендингом и регистрацией не доживает — поэтому
+    // фронт явно передаёт source после авторизации (events/attribute).
+    try {
+      await this.pg.query(
+        `ALTER TABLE ai_profiles_consolidated ADD COLUMN IF NOT EXISTS signup_source text`,
+      );
+    } catch (e: any) {
+      this.log.error(`signup_source column migration failed: ${e.message}`);
+    }
+
     this.timer = setInterval(() => this.flush().catch(() => {}), FLUSH_INTERVAL_MS);
     this.timer.unref?.();
   }
@@ -63,6 +74,25 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
   async onModuleDestroy() {
     if (this.timer) clearInterval(this.timer);
     await this.flush().catch(() => {});
+  }
+
+  // Записать источник привлечения юзера ОДИН раз (first-touch): только если
+  // signup_source ещё пуст. Игнорируем внутренние/служебные метки — пишем лишь
+  // реальные источники (utm:/referral:/ref-site:/direct/organic).
+  async setSignupSourceIfEmpty(userId: string, source: string): Promise<void> {
+    if (!this.pg) return;
+    const ok = /^(utm:|referral:|ref-site:|direct$|organic$)/.test(source);
+    if (!ok) return;
+    try {
+      await this.pg.query(
+        `UPDATE ai_profiles_consolidated
+            SET signup_source = $2
+          WHERE user_id = $1 AND (signup_source IS NULL OR signup_source = '')`,
+        [userId, source],
+      );
+    } catch (e: any) {
+      this.log.warn(`setSignupSourceIfEmpty failed: ${e.message}`);
+    }
   }
 
   // Fire-and-forget tracking. Never throws — failure is logged only.
