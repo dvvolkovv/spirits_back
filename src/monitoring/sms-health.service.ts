@@ -3,6 +3,7 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import { EventsService } from '../events/events.service';
 import axios from 'axios';
+import { sendTelegramPayload } from '../common/telegram-alert';
 
 /**
  * SMS Aero passive health monitoring.
@@ -107,7 +108,7 @@ export class SmsHealthService implements OnModuleInit {
       return;
     }
     try {
-      await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      await sendTelegramPayload({
         chat_id: TG_CHAT,
         parse_mode: 'HTML',
         text: `<b>⚠️ SMS Aero: низкий баланс</b>\n` +

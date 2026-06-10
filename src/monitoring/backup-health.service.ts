@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { spawn } from 'child_process';
 import axios from 'axios';
+import { sendTelegramPayload } from '../common/telegram-alert';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -276,7 +277,7 @@ export class BackupHealthService implements OnModuleInit {
       return;
     }
     try {
-      await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      await sendTelegramPayload({
         chat_id: TG_CHAT,
         parse_mode: 'HTML',
         text: `<b>⚠️ Бэкап: обнаружены проблемы</b>\n` +

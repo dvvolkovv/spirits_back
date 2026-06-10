@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { spawn } from 'child_process';
 import axios from 'axios';
+import { sendTelegramPayload } from '../common/telegram-alert';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -295,7 +296,7 @@ export class NeoSnapshotHealthService implements OnModuleInit {
     const now = new Date();
     if (this.lastAlertAt && (now.getTime() - this.lastAlertAt.getTime()) < this.alertCooldownH * 3600_000) return;
     try {
-      await axios.post(`https://api.telegram.org/bot${this.tgToken}/sendMessage`, {
+      await sendTelegramPayload({
         chat_id: this.tgChat,
         parse_mode: 'HTML',
         text: `<b>⚠️ Neo4j DR (node-3): проблемы</b>\n` +

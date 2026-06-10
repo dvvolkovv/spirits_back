@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import axios from 'axios';
+import { sendTelegramPayload } from '../common/telegram-alert';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
@@ -74,8 +75,7 @@ export class SyntheticService implements OnModuleInit {
       const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '';
       if (!TG_TOKEN || !TG_CHAT) { this.log.warn(`synthetic alert (no Telegram creds): ${text.replace(/<[^>]+>/g, '')}`); return; }
       try {
-        await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,
-          { chat_id: TG_CHAT, parse_mode: 'HTML', text }, { timeout: 8000 });
+        await sendTelegramPayload({ chat_id: TG_CHAT, parse_mode: 'HTML', text }, { timeout: 8000 });
       } catch (e: any) {
         this.log.error(`synthetic Telegram alert failed: ${e?.message || 'unknown'}`);
       }

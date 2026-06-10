@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import axios from 'axios';
+import { sendTelegramPayload } from '../common/telegram-alert';
 import * as fs from 'fs';
 
 /**
@@ -104,7 +105,7 @@ export class MinioMirrorHealthService {
     const now = new Date();
     if (this.lastAlertAt && (now.getTime() - this.lastAlertAt.getTime()) < this.alertCooldownH * 3600_000) return;
     try {
-      await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      await sendTelegramPayload({
         chat_id: TG_CHAT,
         parse_mode: 'HTML',
         text: `<b>⚠️ MinIO DR-зеркало (node-3): проблемы</b>\n` +

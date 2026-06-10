@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import axios from 'axios';
+import { sendTelegramPayload } from '../common/telegram-alert';
 import { Pool } from 'pg';
 import { PgService } from '../common/services/pg.service';
 
@@ -158,7 +159,7 @@ export class ReplicationHealthService implements OnModuleDestroy {
     const now = new Date();
     if (this.lastAlertAt && (now.getTime() - this.lastAlertAt.getTime()) < ALERT_COOLDOWN_HOURS * 3600_000) return;
     try {
-      await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      await sendTelegramPayload({
         chat_id: TG_CHAT,
         parse_mode: 'HTML',
         text: `<b>⚠️ Репликация PostgreSQL: проблемы</b>\n` +
