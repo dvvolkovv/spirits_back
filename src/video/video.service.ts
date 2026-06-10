@@ -860,6 +860,61 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   // Любая кавычка-пара: гильеметы «», типографские "" „", прямые "".
   private static readonly QUOTE_RE = /«([^»]+)»|“([^”]+)”|„([^“"]+)[“"]|"([^"]+)"/g;
 
+  // Ёфикатор: восстанавливает «ё» в ОДНОЗНАЧНЫХ словах (взлет→взлёт). Veo иначе
+  // читает «е». Словарь — безопасный список eyo (только слова без омографов;
+  // «полет/полёт» НЕ входит, ошибок не вводим). Данные лежат как .txt в репо
+  // (src/video/yo-safe.txt) — НЕ зависим от ESM-пакета eyo-kernel (на проде
+  // Node 20, require(ESM) упал бы). Карта формы-без-ё → формы-с-ё строится 1 раз.
+  private static _yoMap: Map<string, string> | null = null;
+
+  private loadYoMap(): Map<string, string> {
+    if (VideoService._yoMap) return VideoService._yoMap;
+    const map = new Map<string, string>();
+    try {
+      const candidates = [
+        path.join(__dirname, 'yo-safe.txt'),
+        path.join(__dirname, '..', '..', 'src', 'video', 'yo-safe.txt'),
+      ];
+      const file = candidates.find((p) => fs.existsSync(p));
+      if (file) {
+        const txt = fs.readFileSync(file, 'utf8');
+        for (const raw of txt.split('\n')) {
+          const line = raw.trim();
+          if (!line) continue;
+          // Формат: «основа» либо «основа(оконч1|оконч2|...)». Формы = основа и
+          // основа+каждое окончание.
+          const m = line.match(/^([^(]+)(?:\(([^)]*)\))?$/);
+          if (!m) continue;
+          const base = m[1];
+          const forms = [base];
+          if (m[2]) for (const e of m[2].split('|')) forms.push(base + e);
+          for (const f of forms) {
+            const key = f.replace(/ё/g, 'е').replace(/Ё/g, 'Е').toLowerCase();
+            if (key !== f.toLowerCase()) map.set(key, f.toLowerCase());
+          }
+        }
+      } else {
+        this.logger.warn('yo-safe.txt not found — ёфикация отключена');
+      }
+    } catch (e: any) {
+      this.logger.warn(`yo dict load failed: ${e.message}`);
+    }
+    VideoService._yoMap = map;
+    return map;
+  }
+
+  private yofy(text: string): string {
+    if (!text) return text;
+    const map = this.loadYoMap();
+    if (map.size === 0) return text;
+    return text.replace(/[а-яёА-ЯЁ]+/g, (w: string) => {
+      const v = map.get(w.toLowerCase());
+      if (!v) return w;
+      // Восстановить регистр первой буквы (реплики обычно не капсом целиком).
+      return /^[А-ЯЁ]/.test(w) ? v.charAt(0).toUpperCase() + v.slice(1) : v;
+    });
+  }
+
   private buildVeoSegmentPrompts(prompt: string, segments: number): string[] {
     const clean = String(prompt || '').trim();
     if (segments <= 1) return [clean];
@@ -1009,6 +1064,11 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     if ((active.rows[0] as any).n >= this.MAX_CONCURRENT_PER_USER) {
       throw new ConflictException('too many concurrent jobs — wait for one to finish');
     }
+
+    // Авто-ёфикация реплики: Veo читает «е» вместо «ё» (взлет→«взлет» вместо
+    // «взлёт» — фидбэк katya). Безопасный словарь (eyo) правит только однозначные
+    // слова, не вводя ошибок. Снимает целый класс е/ё-ошибок без ручной работы.
+    prompt = this.yofy(prompt);
 
     const segmentPrompts = this.buildVeoSegmentPrompts(prompt, quote.segments);
     const plan: ComposedPlan = {
