@@ -338,9 +338,15 @@ export class TgBotService implements OnModuleInit {
       return;
     }
 
-    // Typing-индикатор пока думает Claude (до 90с). Telegram action длится ~5с —
-    // обновляем каждые 4с. Останавливаем как только Claude вернул ответ.
+    // Typing-индикатор пока думает Claude. Telegram action длится ~5с — обновляем
+    // каждые 4с. Останавливаем как только Claude вернул ответ.
     let typingTimer: NodeJS.Timeout | null = null;
+    // Status-сообщение в чате — редактируется по приходу tool_use событий.
+    let statusMsgId: number | null = null;
+    let statusLastLabel = '';
+    let statusLastEditAt = 0;
+    let statusPendingLabel: string | null = null;
+    let statusPendingTimer: NodeJS.Timeout | null = null;
 
     try {
       await this.router.persistUserMessage(cfg, ctx);
@@ -358,17 +364,97 @@ export class TgBotService implements OnModuleInit {
         this.grammy.sendChatAction(msg.chat.id, 'typing').catch(() => {});
       }, 4000);
 
+      // Стартовое status-сообщение. Если оно не отправилось (rate-limit/permission)
+      // — продолжаем без статуса, не блокируем основной поток.
+      try {
+        const sent = await this.grammy.sendMessage(msg.chat.id, '🤔 Думаю...', {
+          reply_to_message_id: msg.message_id,
+        });
+        statusMsgId = sent.message_id;
+        statusLastLabel = '🤔 Думаю...';
+      } catch (e: any) {
+        this.logger.warn(`failed to send status msg in chat ${msg.chat.id}: ${e.message}`);
+      }
+
+      const editStatus = async (label: string): Promise<void> => {
+        if (!statusMsgId || label === statusLastLabel) return;
+        const now = Date.now();
+        const since = now - statusLastEditAt;
+        // Telegram лимитит editMessageText ~1 req/sec на чат — throttle 1.5с.
+        if (since >= 1500) {
+          statusLastEditAt = now;
+          statusLastLabel = label;
+          try {
+            await this.grammy.editMessageText(msg.chat.id, statusMsgId, label);
+          } catch (e: any) {
+            // "message is not modified" — нормально, "message to edit not found" — статус удалён.
+            const m = String(e.message ?? '');
+            if (!m.includes('not modified') && !m.includes('not found')) {
+              this.logger.debug(`status edit failed in chat ${msg.chat.id}: ${m}`);
+            }
+          }
+        } else {
+          statusPendingLabel = label;
+          if (!statusPendingTimer) {
+            statusPendingTimer = setTimeout(() => {
+              statusPendingTimer = null;
+              const l = statusPendingLabel;
+              statusPendingLabel = null;
+              if (l && l !== statusLastLabel) editStatus(l).catch(() => {});
+            }, 1500 - since);
+          }
+        }
+      };
+
+      const labelFor = (toolName: string): string => {
+        if (toolName === 'Read') return '📄 Читаю файл...';
+        if (toolName === 'Write') return '✏️ Пишу файл...';
+        if (toolName === 'Edit') return '✏️ Редактирую файл...';
+        if (toolName === 'Bash') return '⚙️ Выполняю команду...';
+        if (toolName === 'Glob') return '🔍 Ищу файлы...';
+        if (toolName === 'Grep') return '🔍 Ищу в файлах...';
+        if (toolName === 'WebSearch') return '🌐 Ищу в интернете...';
+        if (toolName === 'WebFetch') return '🌐 Открываю страницу...';
+        if (/generate_image|edit_image|compose_image/i.test(toolName)) return '🎨 Готовлю картинку...';
+        if (/upscale_image/i.test(toolName)) return '✨ Улучшаю картинку...';
+        if (/generate_video/i.test(toolName)) return '🎬 Генерирую видео...';
+        return `⚙️ ${toolName}...`;
+      };
+
       const ownerRes = await this.pg.query(
         `SELECT profile_data->>'name' AS first_name FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
         [cfg.owner_user_id],
       );
       const ownerFirstName = ownerRes.rows[0]?.first_name ?? 'Linkeon-пользователь';
 
-      const reply = await this.router.generateReply(cfg, ownerFirstName, attachments);
+      let reply: { text: string; costUsd: number };
+      try {
+        reply = await this.router.generateReply(cfg, ownerFirstName, attachments, (ev) => {
+          if (ev.kind === 'tool_use') editStatus(labelFor(ev.name)).catch(() => {});
+        });
+      } catch (e: any) {
+        // Не вылетаем тихо — пишем юзеру в статус, что не получилось.
+        if (statusMsgId) {
+          try {
+            await this.grammy.editMessageText(
+              msg.chat.id,
+              statusMsgId,
+              `⚠️ Не получилось обработать запрос: ${String(e.message || 'неизвестная ошибка').slice(0, 200)}`,
+            );
+            statusMsgId = null; // не удалять в finally — оставляем как уведомление
+          } catch { /* ignore */ }
+        }
+        throw e;
+      }
 
-      // Claude отработал — гасим typing-loop, дальше каждый исходящий канал
-      // (voice/photo/document) выставит свой собственный action.
+      // Claude отработал — гасим status-throttle, typing-loop, и удаляем статус,
+      // дальше каждый исходящий канал (voice/photo/document) выставит свой action.
       if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
+      if (statusPendingTimer) { clearTimeout(statusPendingTimer); statusPendingTimer = null; }
+      if (statusMsgId) {
+        try { await this.grammy.deleteMessage(msg.chat.id, statusMsgId); } catch { /* ignore */ }
+        statusMsgId = null;
+      }
 
       // Парсим маркеры {{image:...}} и {{file:...}} — они идут отдельными сообщениями,
       // в основном тексте их быть не должно.
@@ -436,6 +522,12 @@ export class TgBotService implements OnModuleInit {
       await this.billing.checkBalanceAlerts(cfg.id, cfg.owner_user_id, ownerTg?.tgUserId ?? null);
     } finally {
       if (typingTimer) clearInterval(typingTimer);
+      if (statusPendingTimer) clearTimeout(statusPendingTimer);
+      if (statusMsgId) {
+        // Сюда попадаем только если ни success-cleanup, ни error-edit не отработали
+        // (например ранний throw до try-блока с generateReply). Прибираем за собой.
+        try { await this.grammy.deleteMessage(msg.chat.id, statusMsgId); } catch { /* ignore */ }
+      }
       await this.pg.query(`SELECT pg_advisory_unlock($1)`, [lockId]);
       // Чистим временные файлы независимо от исхода.
       for (const p of attachments) {

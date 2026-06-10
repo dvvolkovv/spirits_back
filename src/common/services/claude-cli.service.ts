@@ -4,16 +4,25 @@ import { spawn } from 'child_process';
 import * as os from 'os';
 import { PgService } from './pg.service';
 
+export interface ClaudeCliProgressEvent {
+  kind: 'tool_use';
+  name: string;
+}
+
 export interface ClaudeCliOptions {
   /** System prompt prepended to user message. Concatenated with prompt via SYSTEM marker. */
   system?: string;
   /** Model alias or full name. Defaults to claude-haiku-4-5. */
   model?: string;
-  /** Timeout in ms. Default 60_000 (60s). */
+  /** Timeout in ms. Default 60_000 (60s). Set to 0 to disable timeout completely. */
   timeoutMs?: number;
   /** Файлы для multimodal-вызова (фото, PDF, txt). Пути к локальным файлам.
    *  При наличии — добавляются как @<path> в конец промпта и включается tool Read. */
   attachments?: string[];
+  /** Колбэк прогресса. Если задан — CLI переключается в stream-json и колбэк
+   *  вызывается на каждое tool_use событие. Подходит для UX-индикации
+   *  (например edit-message в Telegram). */
+  onProgress?: (event: ClaudeCliProgressEvent) => void;
 }
 
 @Injectable()
@@ -61,6 +70,7 @@ export class ClaudeCliService {
   private async runRaw(prompt: string, opts: ClaudeCliOptions): Promise<{ text: string; costUsd: number }> {
     const model = opts.model ?? 'claude-haiku-4-5';
     const timeoutMs = opts.timeoutMs ?? 60_000;
+    const streaming = !!opts.onProgress;
 
     const hasAttachments = (opts.attachments?.length ?? 0) > 0;
 
@@ -84,12 +94,14 @@ export class ClaudeCliService {
       '-p',
       fullPrompt,
       '--model', model,
-      '--output-format', 'json',
+      '--output-format', streaming ? 'stream-json' : 'json',
       '--allowedTools', allowedTools,
       '--strict-mcp-config',         // load NO MCP servers (none passed) — these
                                      // one-shot calls use no tools; skipping MCP
                                      // startup avoids stalls in the pm2 env.
     ];
+    // stream-json требует --verbose, иначе CLI отвергает комбинацию.
+    if (streaming) args.push('--verbose');
 
     // Spawn from a neutral cwd: the backend runs in /home/dvolkov/spirits_back,
     // whose ~40KB CLAUDE.md the CLI would auto-discover and prepend to EVERY
@@ -100,16 +112,84 @@ export class ClaudeCliService {
       const proc = spawn(this.claudeBin, args, { stdio: ['ignore', 'pipe', 'pipe'], cwd: os.tmpdir() });
       let stdout = '';
       let stderr = '';
-      const timer = setTimeout(() => {
-        proc.kill('SIGTERM');
-        reject(new Error(`claude CLI timeout after ${timeoutMs}ms`));
-      }, timeoutMs);
 
-      proc.stdout.on('data', (b) => { stdout += b.toString(); });
+      // Stream-mode accumulators (заполняются по мере прихода NDJSON).
+      let streamLineBuf = '';
+      let streamResultText = '';
+      let streamCostUsd = 0;
+      let streamDurationMs = 0;
+      let streamIsError = false;
+      let streamErrorDetail = '';
+
+      let timer: NodeJS.Timeout | null = null;
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          proc.kill('SIGTERM');
+          reject(new Error(`claude CLI timeout after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }
+
+      proc.stdout.on('data', (b) => {
+        const chunk = b.toString();
+        stdout += chunk;
+        if (!streaming) return;
+        streamLineBuf += chunk;
+        let nl: number;
+        while ((nl = streamLineBuf.indexOf('\n')) >= 0) {
+          const line = streamLineBuf.slice(0, nl).trim();
+          streamLineBuf = streamLineBuf.slice(nl + 1);
+          if (!line) continue;
+          let ev: any;
+          try { ev = JSON.parse(line); } catch { continue; }
+          if (ev.type === 'assistant' && Array.isArray(ev.message?.content)) {
+            for (const c of ev.message.content) {
+              if (c?.type === 'tool_use' && typeof c.name === 'string' && opts.onProgress) {
+                try { opts.onProgress({ kind: 'tool_use', name: c.name }); } catch { /* user callback safety */ }
+              }
+            }
+          }
+          if (ev.type === 'result') {
+            streamResultText = typeof ev.result === 'string' ? ev.result : '';
+            streamCostUsd = typeof ev.total_cost_usd === 'number' ? ev.total_cost_usd : 0;
+            streamDurationMs = Number(ev.duration_ms) || 0;
+            if (ev.is_error) {
+              streamIsError = true;
+              streamErrorDetail = String(ev.result ?? ev.error ?? 'unknown');
+            }
+          }
+        }
+      });
       proc.stderr.on('data', (b) => { stderr += b.toString(); });
 
       proc.on('close', (code) => {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
+
+        // Stream mode: всё уже распарсено по ходу, просто возвращаем накопленное.
+        if (streaming) {
+          if (code !== 0) {
+            this.logger.error(`claude CLI exit ${code}: stderr=${stderr.slice(0, 300)} stdout=${stdout.slice(0, 300)}`);
+            const detail = streamErrorDetail || stderr.trim() || stdout.trim().slice(0, 400);
+            reject(new Error(`claude CLI exited with code ${code}: ${detail.slice(0, 200) || '(no output)'}`));
+            return;
+          }
+          if (streamIsError) {
+            reject(new Error(`claude CLI error: ${streamErrorDetail}`));
+            return;
+          }
+          if (streamCostUsd) {
+            this.logger.debug(`claude CLI cost: $${streamCostUsd.toFixed(4)}, ${streamDurationMs}ms (stream)`);
+          }
+          this.trackCallEvent({
+            costUsd: streamCostUsd,
+            model,
+            durationMs: streamDurationMs,
+            ok: true,
+          });
+          resolve({ text: streamResultText, costUsd: streamCostUsd });
+          return;
+        }
+
+        // Non-streaming path: одноразовый JSON parse на выходе.
         if (code !== 0) {
           // Реальная причина часто уходит в stdout (CLI с --output-format json
           // печатает {is_error, result} и при ненулевом коде, либо текстовую
@@ -150,7 +230,7 @@ export class ClaudeCliService {
       });
 
       proc.on('error', (err) => {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         reject(new Error(`claude CLI spawn error: ${err.message}`));
       });
     });

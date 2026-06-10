@@ -47,6 +47,14 @@ export class TgGrammyClient implements OnModuleInit {
     return this.bot.api.sendChatAction(chatId, action);
   }
 
+  async editMessageText(chatId: number, messageId: number, text: string, options: any = {}) {
+    return this.bot.api.editMessageText(chatId, messageId, text, options);
+  }
+
+  async deleteMessage(chatId: number, messageId: number) {
+    return this.bot.api.deleteMessage(chatId, messageId);
+  }
+
   async sendVoice(chatId: number, voice: Buffer, options: any = {}) {
     return this.bot.api.sendVoice(chatId, new InputFile(voice), options);
   }

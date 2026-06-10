@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
-import { ClaudeCliService } from '../common/services/claude-cli.service';
+import { ClaudeCliService, ClaudeCliProgressEvent } from '../common/services/claude-cli.service';
 import { AgentsService } from '../agents/agents.service';
 import { TgGrammyClient } from './tg-grammy.client';
 import { TgConfigService, TgBotConfigRow } from './tg-config.service';
@@ -195,6 +195,7 @@ ${recent}
     cfg: TgBotConfigRow,
     ownerFirstName: string,
     attachmentPaths?: string[],
+    onProgress?: (event: ClaudeCliProgressEvent) => void,
   ): Promise<{ text: string; costUsd: number }> {
     const { systemPrompt } = await this.resolveSystemPrompt(cfg);
     const history = await this.loadHistory(cfg.id);
@@ -221,11 +222,15 @@ ${systemPrompt}`;
       ? history.map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n\n')
       : '(пустая переписка — поздоровайся первым)';
 
+    // timeoutMs: 0 — без таймаута. Юзер видит реальный прогресс через onProgress
+    // (status-сообщение в чате), так что молчания в TG больше нет, и обрывать
+    // Claude по часам не нужно.
     const { text, costUsd } = await this.claudeCli.textWithCost(userPrompt, {
       system: systemWithCtx,
       model: 'claude-sonnet-4-6',
-      timeoutMs: 90_000,
+      timeoutMs: 0,
       attachments: attachmentPaths?.length ? attachmentPaths : undefined,
+      onProgress,
     });
 
     return { text: text.trim() || '...', costUsd };
