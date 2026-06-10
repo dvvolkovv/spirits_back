@@ -217,13 +217,18 @@ warm_chat_path() {
   tok=$(curl -s "${ca[@]}" -m 15 "$base/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/$phone/$code" \
         | sed -n 's/.*"access-token":"\([^"]*\)".*/\1/p')
   [[ -z "$tok" ]] && return 0
+  # Прогрев browser-критичных эндпоинтов: ChatInterface не отрендерит кнопку
+  # reopen-match (smoke 97/126), пока холодные agents/profile не ответят — на
+  # холодном старте это >20с и валит browser-тесты. Будим их заранее.
+  curl -s "${ca[@]}" -m 20 "$base/webhook/agents" >/dev/null 2>&1 || true
+  curl -s "${ca[@]}" -m 20 "$base/webhook/profile" -H "Authorization: Bearer $tok" >/dev/null 2>&1 || true
   # 1-й чат будит r.linkeon (может быть медленным), 2-й уже тёплый и точно сохранится
   for _ in 1 2; do
     curl -s "${ca[@]}" -m 60 -X POST "$base/webhook/soulmate/chat" \
       -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
       -d '{"chatInput":"deploy warmup","assistant":"12"}' >/dev/null 2>&1 || true
   done
-  green "  ✓ chat-path warmed ($base)"
+  green "  ✓ chat+browser paths warmed ($base)"
 }
 
 deploy_backend() {
