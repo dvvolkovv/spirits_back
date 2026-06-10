@@ -75,9 +75,13 @@ interface UsageSnapshot {
 
 const ALERT_THRESHOLD_30D_USD = Number(process.env.CLAUDE_SPEND_ALERT_THRESHOLD_30D_USD || 100);
 const ALERT_COOLDOWN_HOURS = Number(process.env.CLAUDE_SPEND_ALERT_COOLDOWN_H || 24);
-// Повторное напоминание о продолжающемся простое AI (первый алерт — сразу при
-// переходе ok→down; дальше не чаще раза в этот интервал, чтобы не спамить).
+// Повторное напоминание о продолжающемся простое (после первого алерта — не
+// чаще раза в этот интервал).
 const OUTAGE_REALERT_HOURS = Number(process.env.CLAUDE_OUTAGE_REALERT_H || 3);
+// Сколько ПОДРЯД провалов пробы до алерта. ≥2 (≈30 мин при тике 15 мин) гасит
+// транзиентные сбои (OAuth refresh, rate) и не даёт рестарту api слать ложный
+// мгновенный алерт — после рестарта счётчик с нуля, нужно 2 подряд провала.
+const OUTAGE_ALERT_AFTER_FAILS = Number(process.env.CLAUDE_OUTAGE_FAILS || 2);
 // NOTE: Telegram creds are read at call time inside maybeAlert(), not here —
 // module-level process.env reads run before ConfigModule loads .env, so a
 // const here would always be '' and silently disable alerts.
@@ -106,8 +110,10 @@ export class ClaudeHealthService implements OnModuleInit {
     fetchedAt: new Date(0).toISOString(),
   };
   private lastAlertAt: Date | null = null;
-  // Liveness alert state
-  private lastLlmStatus: 'ok' | 'down' | null = null;
+  // Liveness alert state. consecutiveDown — подряд-провалы CLI-пробы (сброс к 0
+  // при ok и при рестарте). Факт «уже заалертили про этот простой» персистится в
+  // monitor_alert_state, чтобы рестарт во время длящегося простоя не дублировал.
+  private cliConsecutiveDown = 0;
   private lastOutageAlertAt: Date | null = null;
 
   constructor(
@@ -117,8 +123,37 @@ export class ClaudeHealthService implements OnModuleInit {
 
   async onModuleInit() {
     this.refresh().catch(() => {});
-    // Не пробим LLM прямо на старте (пусть приложение поднимется); первый
+    // Персист состояния алерта — переживает рестарты (иначе каждый рестарт во
+    // время простоя слал бы «новый» алерт; инцидент 2026-06-10).
+    try {
+      await this.pg.query(
+        `CREATE TABLE IF NOT EXISTS monitor_alert_state (
+           component   text PRIMARY KEY,
+           alerted     boolean NOT NULL DEFAULT false,
+           updated_at  timestamptz NOT NULL DEFAULT now()
+         )`,
+      );
+    } catch (e: any) {
+      this.log.error(`monitor_alert_state migration failed: ${e.message}`);
+    }
+    // Не пробим прямо на старте (пусть приложение поднимется); первый
     // liveness-тик придёт по крону.
+  }
+
+  private async getAlerted(component: string): Promise<boolean> {
+    try {
+      const r = await this.pg.query(`SELECT alerted FROM monitor_alert_state WHERE component=$1`, [component]);
+      return r.rows[0]?.alerted === true;
+    } catch { return false; }
+  }
+  private async setAlerted(component: string, alerted: boolean): Promise<void> {
+    try {
+      await this.pg.query(
+        `INSERT INTO monitor_alert_state (component, alerted, updated_at) VALUES ($1,$2,now())
+         ON CONFLICT (component) DO UPDATE SET alerted=$2, updated_at=now()`,
+        [component, alerted],
+      );
+    } catch (e: any) { this.log.error(`setAlerted(${component}) failed: ${e.message}`); }
   }
 
   @Cron(CronExpression.EVERY_HOUR)
@@ -135,11 +170,14 @@ export class ClaudeHealthService implements OnModuleInit {
     await this.maybeAlertOutage();
   }
 
-  // Минимальный реальный вызов LLM через тот же claude CLI, на котором работает
-  // весь AI платформы (подписка). Успех = непустой ответ. Любой сбой (вкл.
-  // «недельный лимит») → llmStatus='down' + классифицированная причина.
+  // Проба ЛОКАЛЬНОГО claude CLI — путь, по которому работают Маша, Виртуальный PM
+  // и Виртуальный маркетолог (и tasks-извлечение). НЕ путь чат-ассистентов: они
+  // идут через r.linkeon.io, который мониторится отдельно synthetic-сценарием
+  // chat_streaming. Поэтому алерт здесь — про CLI-путь, а не про «весь AI»
+  // (инцидент 2026-06-10: проба ложно сообщала о недоступности всех ассистентов).
   private async probeLiveness(): Promise<void> {
     const t0 = Date.now();
+    let down = false;
     try {
       const text = await this.claudeCli.text('Reply with exactly: ok', {
         model: 'claude-haiku-4-5',
@@ -153,19 +191,22 @@ export class ClaudeHealthService implements OnModuleInit {
         this.cache.llmOutageKind = null;
         this.cache.llmError = null;
       } else {
+        down = true;
         this.cache.llmStatus = 'down';
         this.cache.llmOutageKind = 'other';
-        this.cache.llmError = 'пустой ответ LLM';
+        this.cache.llmError = 'пустой ответ CLI';
       }
     } catch (e: any) {
       const { kind, human } = classifyLlmError(e?.message || String(e));
+      down = true;
       this.cache.llmStatus = 'down';
       this.cache.llmOutageKind = kind;
       this.cache.llmError = human;
       this.cache.llmLatencyMs = Date.now() - t0;
       this.cache.llmCheckedAt = new Date().toISOString();
-      this.log.error(`LLM liveness probe DOWN (${kind}): ${human}`);
+      this.log.error(`Claude CLI liveness probe DOWN (${kind}): ${human}`);
     }
+    this.cliConsecutiveDown = down ? this.cliConsecutiveDown + 1 : 0;
   }
 
   private async refresh(): Promise<void> {
@@ -315,45 +356,55 @@ export class ClaudeHealthService implements OnModuleInit {
     }
   }
 
-  // Алерт о простое AI: при переходе ok→down — сразу; пока down — повтор не чаще
-  // OUTAGE_REALERT_HOURS; при восстановлении down→ok — отбой. Это и есть «мониторинг
-  // сообщает о полной деградации», которого не было.
+  // Алерт о простое CLI-пути (Маша / Виртуальный PM / маркетолог). Точный охват:
+  // НЕ «весь AI» — чат-ассистенты (r.linkeon.io) мониторятся отдельно synthetic
+  // chat_streaming. Алерт только после OUTAGE_ALERT_AFTER_FAILS подряд провалов
+  // (гасит транзиент и рестарт-спам); повтор не чаще OUTAGE_REALERT_HOURS; факт
+  // алерта персистится (рестарт во время простоя не дублирует); при ok — отбой.
   private async maybeAlertOutage(): Promise<void> {
     const status = this.cache.llmStatus;
     if (status === null) return;
     const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
     const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '';
     const now = new Date();
+    const COMPONENT = 'claude_cli';
 
     const send = async (text: string) => {
-      if (!TG_TOKEN || !TG_CHAT) { this.log.warn(`AI outage alert (no Telegram creds): ${text.replace(/<[^>]+>/g, '')}`); return; }
+      if (!TG_TOKEN || !TG_CHAT) { this.log.warn(`CLI outage alert (no Telegram creds): ${text.replace(/<[^>]+>/g, '')}`); return; }
       try {
         await sendTelegramPayload({ chat_id: TG_CHAT, parse_mode: 'HTML', text }, { timeout: 8000 });
       } catch (e: any) {
-        this.log.error(`AI outage Telegram alert failed: ${e?.message || 'unknown'}`);
+        this.log.error(`CLI outage Telegram alert failed: ${e?.message || 'unknown'}`);
       }
     };
 
+    const alreadyAlerted = await this.getAlerted(COMPONENT);
+
     if (status === 'down') {
-      const firstDown = this.lastLlmStatus !== 'down';
+      // Алертим только при устойчивом простое (≥K подряд) и если ещё не алертили
+      // (или прошёл realert-интервал).
+      if (this.cliConsecutiveDown < OUTAGE_ALERT_AFTER_FAILS) return;
       const cooled = !this.lastOutageAlertAt ||
         (now.getTime() - this.lastOutageAlertAt.getTime()) >= OUTAGE_REALERT_HOURS * 3600_000;
-      if (firstDown || cooled) {
+      if (!alreadyAlerted || cooled) {
         await send(
-          `<b>🔴 AI ПЛАТФОРМЫ НЕДОСТУПЕН</b>\n` +
+          `<b>🔴 Локальный Claude CLI недоступен</b>\n` +
           `Причина: <b>${this.cache.llmError || 'неизвестно'}</b> (${this.cache.llmOutageKind})\n` +
-          `Затронуто: все ассистенты (r.linkeon.io), Юля, Маша, Виртуальный PM/маркетолог — весь AI на общей Claude-подписке.\n` +
-          `Проверка: ${this.cache.llmCheckedAt || '—'}`,
+          `Затронуто: <b>Маша, Виртуальный PM, Виртуальный маркетолог</b> (CLI-путь на OAuth-подписке). ` +
+          `Чат-ассистенты (r.linkeon.io) — отдельный путь, см. synthetic chat_streaming.\n` +
+          `Провалов подряд: ${this.cliConsecutiveDown}. Проверка: ${this.cache.llmCheckedAt || '—'}\n` +
+          `Починка: на проде \`claude\` → /login (обновить OAuth).`,
         );
         this.lastOutageAlertAt = now;
-        this.log.error(`AI outage alert sent (${this.cache.llmOutageKind})`);
+        await this.setAlerted(COMPONENT, true);
+        this.log.error(`Claude CLI outage alert sent (${this.cache.llmOutageKind}, ${this.cliConsecutiveDown} fails)`);
       }
-    } else if (status === 'ok' && this.lastLlmStatus === 'down') {
-      await send(`<b>🟢 AI платформы восстановлен</b>\nОтвечает снова (проверка: ${this.cache.llmCheckedAt || '—'}, ${this.cache.llmLatencyMs ?? '—'}мс)`);
+    } else if (status === 'ok' && alreadyAlerted) {
+      await send(`<b>🟢 Локальный Claude CLI восстановлен</b>\nМаша/VPM/маркетолог снова работают (проверка: ${this.cache.llmCheckedAt || '—'}, ${this.cache.llmLatencyMs ?? '—'}мс).`);
       this.lastOutageAlertAt = null;
-      this.log.warn('AI recovery alert sent');
+      await this.setAlerted(COMPONENT, false);
+      this.log.warn('Claude CLI recovery alert sent');
     }
-    this.lastLlmStatus = status;
   }
 
   async getOverview(): Promise<ClaudeHealthOverview> {
