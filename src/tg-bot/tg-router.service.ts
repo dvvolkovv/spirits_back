@@ -15,6 +15,8 @@ export interface IncomingMessageContext {
   replyToFromBot?: boolean;
   isVoice: boolean;
   voiceFileId?: string;
+  /** Локальные пути к скачанным attachment-ам (фото, docs). Передаются в Claude. */
+  attachmentPaths?: string[];
 }
 
 @Injectable()
@@ -189,11 +191,29 @@ ${recent}
    * Вызов Claude через ClaudeCliService (OAuth, без API key).
    * История склеивается в одну user-prompt; system prompt идёт отдельно.
    */
-  async generateReply(cfg: TgBotConfigRow, ownerFirstName: string): Promise<{ text: string; costUsd: number }> {
+  async generateReply(
+    cfg: TgBotConfigRow,
+    ownerFirstName: string,
+    attachmentPaths?: string[],
+  ): Promise<{ text: string; costUsd: number }> {
     const { systemPrompt } = await this.resolveSystemPrompt(cfg);
     const history = await this.loadHistory(cfg.id);
 
+    // В системный промпт добавляем инструкцию про markup для отправки файлов:
+    //   {{image: <prompt>}}                                  — сгенерировать картинку
+    //   {{file: url=<https-url> | caption=<...> | name=...}} — прикрепить файл по URL
+    // Бот распарсит маркеры, вырежет из текста и отправит как отдельные сообщения.
+    const ioInstructions = `
+ВОЗМОЖНОСТИ:
+- Ты видишь приложенные пользователем файлы (фото, PDF, txt) если они есть.
+- Ты можешь приложить файлы к своему ответу через маркеры:
+  • {{image: КРАТКИЙ_ПРОМПТ_ДЛЯ_КАРТИНКИ}} — сгенерирует и пришлёт картинку
+  • {{file: url=<https://...> | caption=<подпись> | name=<имя>}} — пришлёт файл по URL
+- Маркеры пиши на отдельной строке. Можно несколько подряд. Не больше 3 за ответ.
+- Сам по себе текст до/после маркера тоже отправится — пиши коротко.`;
+
     const systemWithCtx = `Ты в Telegram-группе. Владелец бота, который платит за твою работу: ${ownerFirstName}. Текущая дата/время: ${new Date().toISOString()}.
+${ioInstructions}
 
 ${systemPrompt}`;
 
@@ -205,6 +225,7 @@ ${systemPrompt}`;
       system: systemWithCtx,
       model: 'claude-sonnet-4-6',
       timeoutMs: 90_000,
+      attachments: attachmentPaths?.length ? attachmentPaths : undefined,
     });
 
     return { text: text.trim() || '...', costUsd };

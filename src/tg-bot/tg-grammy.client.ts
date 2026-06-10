@@ -44,6 +44,19 @@ export class TgGrammyClient implements OnModuleInit {
     return this.bot.api.sendVoice(chatId, new InputFile(voice), options);
   }
 
+  async sendPhoto(chatId: number, photo: Buffer | string, options: any = {}) {
+    // photo может быть Buffer (загруженный файл) или URL/file_id (строка).
+    const input = typeof photo === 'string' ? photo : new InputFile(photo);
+    return this.bot.api.sendPhoto(chatId, input as any, options);
+  }
+
+  async sendDocument(chatId: number, doc: Buffer | string, filename: string | undefined, options: any = {}) {
+    const input = typeof doc === 'string'
+      ? doc
+      : new InputFile(doc, filename);
+    return this.bot.api.sendDocument(chatId, input as any, options);
+  }
+
   async leaveChat(chatId: number) {
     return this.bot.api.leaveChat(chatId);
   }

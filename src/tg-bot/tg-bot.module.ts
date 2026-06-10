@@ -12,9 +12,10 @@ import { TgBillingService } from './tg-billing.service';
 import { TgCommandsService } from './tg-commands.service';
 import { AgentsModule } from '../agents/agents.module';
 import { CommonModule } from '../common/common.module';
+import { MiscModule } from '../misc/misc.module';
 
 @Module({
-  imports: [AgentsModule, CommonModule],
+  imports: [AgentsModule, CommonModule, MiscModule],
   controllers: [TgBotController, TgBotConfigController],
   providers: [
     TgBotService, TgGrammyClient, TgIdentityService, TgConfigService,

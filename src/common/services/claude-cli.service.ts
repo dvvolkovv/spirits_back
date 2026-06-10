@@ -11,6 +11,9 @@ export interface ClaudeCliOptions {
   model?: string;
   /** Timeout in ms. Default 60_000 (60s). */
   timeoutMs?: number;
+  /** Файлы для multimodal-вызова (фото, PDF, txt). Пути к локальным файлам.
+   *  При наличии — добавляются как @<path> в конец промпта и включается tool Read. */
+  attachments?: string[];
 }
 
 @Injectable()
@@ -59,22 +62,30 @@ export class ClaudeCliService {
     const model = opts.model ?? 'claude-haiku-4-5';
     const timeoutMs = opts.timeoutMs ?? 60_000;
 
-    // Compose final prompt: system + user (claude -p has no separate --system arg)
+    const hasAttachments = (opts.attachments?.length ?? 0) > 0;
+
+    // Compose final prompt: system + user (claude -p has no separate --system arg).
+    // Если есть attachments — добавляем @<path> ссылки в конец user-блока, Claude
+    // подтянет их через Read tool.
+    let userBlock = prompt;
+    if (hasAttachments) {
+      const refs = opts.attachments!.map(p => `@${p}`).join(' ');
+      userBlock = `${prompt}\n\nПриложенные файлы: ${refs}`;
+    }
     const fullPrompt = opts.system
-      ? `${opts.system}\n\n---\n\nUSER REQUEST:\n${prompt}`
-      : prompt;
+      ? `${opts.system}\n\n---\n\nUSER REQUEST:\n${userBlock}`
+      : userBlock;
+
+    // С attachments нужен Read tool, чтобы CLI смог открыть файлы из @<path>.
+    // Без attachments — пустой allowedTools полностью отключает built-in тулы.
+    const allowedTools = hasAttachments ? 'Read' : '';
 
     const args = [
       '-p',
       fullPrompt,
       '--model', model,
       '--output-format', 'json',
-      '--allowedTools', '',          // disable all built-in tools. Раньше
-                                     // дублировали через --disallowedTools all,
-                                     // но claude CLI ≥2.1.150 строго валидирует
-                                     // имена тулов и ругается "all matches no
-                                     // known tool" → exit 1. Пустой allowedTools
-                                     // и без disallowedTools достаточно.
+      '--allowedTools', allowedTools,
       '--strict-mcp-config',         // load NO MCP servers (none passed) — these
                                      // one-shot calls use no tools; skipping MCP
                                      // startup avoids stalls in the pm2 env.

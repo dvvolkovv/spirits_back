@@ -1,15 +1,26 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
+import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
 import { TgIdentityService } from './tg-identity.service';
 import { TgClaimService } from './tg-claim.service';
-import { TgConfigService } from './tg-config.service';
+import { TgConfigService, TgBotConfigRow } from './tg-config.service';
 import { TgRouterService } from './tg-router.service';
 import { TgVoiceService } from './tg-voice.service';
 import { TgBillingService } from './tg-billing.service';
 import { TgCommandsService } from './tg-commands.service';
 import { TgGrammyClient } from './tg-grammy.client';
+import { MiscService } from '../misc/misc.service';
+
+// Лимит размера файла, который мы готовы скачать с Telegram и передать в Claude.
+// Telegram сам отдаёт через Bot API до 20 МБ; больше — нужен MTProto, не наш кейс.
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
+type OutgoingMarker =
+  | { kind: 'image'; prompt: string }
+  | { kind: 'file'; url: string; caption?: string; name?: string };
 
 @Injectable()
 export class TgBotService implements OnModuleInit {
@@ -25,6 +36,7 @@ export class TgBotService implements OnModuleInit {
     private readonly billing: TgBillingService,
     private readonly commands: TgCommandsService,
     private readonly grammy: TgGrammyClient,
+    private readonly misc: MiscService,
   ) {}
 
   async onModuleInit() {
@@ -269,6 +281,21 @@ export class TgBotService implements OnModuleInit {
       }
     }
 
+    // Скачиваем приложенные фото/документы. Если пусто — просто пустой массив.
+    const attachments: string[] = [];
+    if (!isVoice) {
+      try {
+        const dl = await this.downloadIncomingAttachments(msg);
+        attachments.push(...dl);
+      } catch (e: any) {
+        this.logger.warn(`attachment download failed in chat ${msg.chat.id}: ${e.message}`);
+      }
+    }
+
+    // Если есть файлы но текста нет — даём LLM плейсхолдер, иначе будет early return.
+    if (!workingText && attachments.length > 0) {
+      workingText = '(юзер прислал файл без подписи — разбери и прокомментируй)';
+    }
     if (!workingText) return;
 
     // Pre-flight: balance check. При 0 — однократное сообщение в группе.
@@ -298,6 +325,7 @@ export class TgBotService implements OnModuleInit {
       replyToFromBot: msg.reply_to_message?.from?.id === botUserId,
       isVoice: actualIsVoice,
       voiceFileId,
+      attachmentPaths: attachments.length ? attachments : undefined,
     };
 
     const lockId = this.hashLock(`tg-chat:${msg.chat.id}`);
@@ -324,9 +352,13 @@ export class TgBotService implements OnModuleInit {
       );
       const ownerFirstName = ownerRes.rows[0]?.first_name ?? 'Linkeon-пользователь';
 
-      const reply = await this.router.generateReply(cfg, ownerFirstName);
+      const reply = await this.router.generateReply(cfg, ownerFirstName, attachments);
 
-      // Voice reply policy
+      // Парсим маркеры {{image:...}} и {{file:...}} — они идут отдельными сообщениями,
+      // в основном тексте их быть не должно.
+      const { cleanText, markers } = this.extractOutgoingMarkers(reply.text);
+
+      // Voice reply policy. Голос — только для текстовой части ответа, не для файлов.
       const wantsVoice =
         cfg.voice_reply_mode === 'always' ||
         (cfg.voice_reply_mode === 'mirror' && actualIsVoice);
@@ -334,25 +366,40 @@ export class TgBotService implements OnModuleInit {
       let contentType: 'text' | 'voice_reply' = 'text';
       let voiceTtsCostUsd = 0;
 
-      if (wantsVoice) {
+      const textToSend = cleanText || (markers.length > 0 ? '' : '...');
+
+      if (wantsVoice && textToSend) {
         try {
-          const tts = await this.voice.synthesize(reply.text);
+          const tts = await this.voice.synthesize(textToSend);
           voiceTtsCostUsd = tts.costUsd;
           await this.grammy.sendVoice(msg.chat.id, tts.buffer, {
             reply_to_message_id: msg.message_id,
-            caption: reply.text.substring(0, 1024),
+            caption: textToSend.substring(0, 1024),
           });
           contentType = 'voice_reply';
         } catch (e: any) {
           this.logger.warn(`TTS failed for chat ${msg.chat.id}, fallback to text: ${e.message}`);
-          await this.grammy.sendMessage(msg.chat.id, reply.text, {
+          await this.grammy.sendMessage(msg.chat.id, textToSend, {
             reply_to_message_id: msg.message_id,
           });
         }
-      } else {
-        await this.grammy.sendMessage(msg.chat.id, reply.text, {
+      } else if (textToSend) {
+        await this.grammy.sendMessage(msg.chat.id, textToSend, {
           reply_to_message_id: msg.message_id,
         });
+      }
+
+      // Отправляем каждый attachment-маркер отдельным сообщением. Ошибка по
+      // конкретному файлу не валит остальные — логируем и продолжаем.
+      for (const m of markers.slice(0, 3)) {
+        try {
+          await this.dispatchOutgoingMarker(cfg, msg, m);
+        } catch (e: any) {
+          this.logger.warn(`outgoing marker (${m.kind}) failed in chat ${msg.chat.id}: ${e.message}`);
+          try {
+            await this.grammy.sendMessage(msg.chat.id, `(не удалось приложить ${m.kind}: ${e.message})`);
+          } catch { /* ignore */ }
+        }
       }
 
       const totalCostUsd = reply.costUsd + voiceTtsCostUsd;
@@ -372,7 +419,118 @@ export class TgBotService implements OnModuleInit {
       await this.billing.checkBalanceAlerts(cfg.id, cfg.owner_user_id, ownerTg?.tgUserId ?? null);
     } finally {
       await this.pg.query(`SELECT pg_advisory_unlock($1)`, [lockId]);
+      // Чистим временные файлы независимо от исхода.
+      for (const p of attachments) {
+        try { fs.unlinkSync(p); } catch { /* ignore */ }
+      }
     }
+  }
+
+  /** Скачиваем фото/документ с Telegram → /tmp. Возвращает локальные пути. */
+  private async downloadIncomingAttachments(msg: any): Promise<string[]> {
+    const paths: string[] = [];
+    // photo — массив размеров; берём самый большой (последний)
+    if (Array.isArray(msg.photo) && msg.photo.length > 0) {
+      const largest = msg.photo[msg.photo.length - 1];
+      const p = await this.downloadOneFile(largest.file_id, largest.file_size, 'jpg');
+      if (p) paths.push(p);
+    }
+    if (msg.document) {
+      const d = msg.document;
+      // расширение из mime или из имени файла
+      const ext = this.guessExtension(d.mime_type, d.file_name);
+      const p = await this.downloadOneFile(d.file_id, d.file_size, ext);
+      if (p) paths.push(p);
+    }
+    return paths;
+  }
+
+  private async downloadOneFile(
+    fileId: string,
+    fileSize: number | undefined,
+    ext: string,
+  ): Promise<string | null> {
+    if (fileSize && fileSize > MAX_ATTACHMENT_BYTES) {
+      this.logger.warn(`skip oversized attachment: ${fileId} (${fileSize} bytes)`);
+      return null;
+    }
+    const file = await this.grammy.getFile(fileId);
+    if (!file.file_path) return null;
+    const buf = await this.grammy.downloadFile(file.file_path);
+    const safeExt = ext.replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'bin';
+    const p = path.join(os.tmpdir(), `tg-attach-${fileId.slice(0, 16)}-${Date.now()}.${safeExt}`);
+    fs.writeFileSync(p, buf);
+    return p;
+  }
+
+  private guessExtension(mime: string | undefined, name: string | undefined): string {
+    if (name && name.includes('.')) return name.split('.').pop()!.toLowerCase();
+    if (!mime) return 'bin';
+    if (mime.includes('pdf')) return 'pdf';
+    if (mime.includes('png')) return 'png';
+    if (mime.includes('jpeg') || mime.includes('jpg')) return 'jpg';
+    if (mime.includes('webp')) return 'webp';
+    if (mime.includes('plain')) return 'txt';
+    if (mime.includes('markdown')) return 'md';
+    return 'bin';
+  }
+
+  /**
+   * Извлекает маркеры {{image:...}} и {{file:...}} из ответа LLM.
+   * Возвращает текст без маркеров + список найденных. Кейсы:
+   *   {{image: подсолнух в стиле Ван Гога}}
+   *   {{file: url=https://my.linkeon.io/some.pdf | caption=Отчёт | name=q4.pdf}}
+   */
+  private extractOutgoingMarkers(reply: string): {
+    cleanText: string;
+    markers: OutgoingMarker[];
+  } {
+    const markers: OutgoingMarker[] = [];
+    // Жадно матчим всё внутри {{…}} — но без вложенных скобок.
+    const re = /\{\{(image|file)\s*:\s*([^{}]+?)\}\}/gi;
+    const cleanText = reply.replace(re, (_full, kind: string, body: string) => {
+      const k = kind.toLowerCase() as 'image' | 'file';
+      if (k === 'image') {
+        const prompt = body.trim();
+        if (prompt) markers.push({ kind: 'image', prompt });
+      } else {
+        const parts = body.split('|').map((s: string) => s.trim());
+        const kv: Record<string, string> = {};
+        for (const pp of parts) {
+          const m = pp.match(/^(\w+)\s*=\s*(.+)$/);
+          if (m) kv[m[1].toLowerCase()] = m[2].trim();
+        }
+        if (kv.url) {
+          markers.push({ kind: 'file', url: kv.url, caption: kv.caption, name: kv.name });
+        }
+      }
+      return ''; // вырезаем маркер из текста
+    }).replace(/\n{3,}/g, '\n\n').trim();
+    return { cleanText, markers };
+  }
+
+  /** Отправляет один маркер: генерим картинку или скачиваем по URL → шлём в чат. */
+  private async dispatchOutgoingMarker(cfg: TgBotConfigRow, msg: any, m: OutgoingMarker): Promise<void> {
+    if (m.kind === 'image') {
+      const res = await this.misc.generateImage(cfg.owner_user_id, { prompt: m.prompt });
+      const url = res?.images?.[0]?.url;
+      if (!url) throw new Error('image-gen вернул пустой URL');
+      await this.grammy.sendPhoto(msg.chat.id, url, {
+        reply_to_message_id: msg.message_id,
+        caption: m.prompt.slice(0, 1024),
+      });
+      return;
+    }
+    // file: качаем сами и шлём как document, чтобы Telegram не ограничивал
+    // по размеру изображения (для картинок лучше отдельный {{image:…}})
+    if (!/^https?:\/\//i.test(m.url)) throw new Error('url должен быть https');
+    const resp = await axios.get(m.url, { responseType: 'arraybuffer', timeout: 30_000, maxContentLength: MAX_ATTACHMENT_BYTES });
+    const buf = Buffer.from(resp.data);
+    const name = m.name || m.url.split('/').pop() || 'file.bin';
+    await this.grammy.sendDocument(msg.chat.id, buf, name, {
+      reply_to_message_id: msg.message_id,
+      caption: m.caption?.slice(0, 1024),
+    });
   }
 
   /**
