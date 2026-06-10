@@ -23,6 +23,13 @@ export interface ClaudeCliOptions {
    *  вызывается на каждое tool_use событие. Подходит для UX-индикации
    *  (например edit-message в Telegram). */
   onProgress?: (event: ClaudeCliProgressEvent) => void;
+  /** Рабочая директория Claude. По умолчанию os.tmpdir(). Для агентных
+   *  сценариев (Bash/Write/Edit) передавай изолированный sandbox-dir. */
+  cwd?: string;
+  /** Полностью переопределяет --allowedTools. По умолчанию: 'Read' если есть
+   *  attachments, иначе ''. Передавай явный список (например 'Bash,Write,Read,Edit')
+   *  для агентного режима. */
+  allowedTools?: string;
 }
 
 @Injectable()
@@ -88,7 +95,10 @@ export class ClaudeCliService {
 
     // С attachments нужен Read tool, чтобы CLI смог открыть файлы из @<path>.
     // Без attachments — пустой allowedTools полностью отключает built-in тулы.
-    const allowedTools = hasAttachments ? 'Read' : '';
+    // Если caller передал явный allowedTools — используем его (агентный режим).
+    const allowedTools = opts.allowedTools !== undefined
+      ? opts.allowedTools
+      : (hasAttachments ? 'Read' : '');
 
     const args = [
       '-p',
@@ -108,8 +118,10 @@ export class ClaudeCliService {
     // one-shot prompt — irrelevant context that inflated input and tripled
     // VPM-generation latency (82s standalone vs ~226s from the service). These
     // calls always carry their own full prompt, so no project context is needed.
+    // Caller may override cwd для агентного sandbox-режима.
+    const spawnCwd = opts.cwd ?? os.tmpdir();
     return new Promise<{ text: string; costUsd: number }>((resolve, reject) => {
-      const proc = spawn(this.claudeBin, args, { stdio: ['ignore', 'pipe', 'pipe'], cwd: os.tmpdir() });
+      const proc = spawn(this.claudeBin, args, { stdio: ['ignore', 'pipe', 'pipe'], cwd: spawnCwd });
       let stdout = '';
       let stderr = '';
 

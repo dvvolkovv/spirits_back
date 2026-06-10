@@ -20,7 +20,23 @@ const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 
 type OutgoingMarker =
   | { kind: 'image'; prompt: string }
+  | { kind: 'image_edit'; source: string; prompt: string }
+  | { kind: 'image_compose'; sources: string[]; prompt: string }
+  | { kind: 'upscale'; source: string }
   | { kind: 'file'; url: string; caption?: string; name?: string };
+
+// Файлы которые мы готовы автоматически прикреплять из песочницы Claude.
+// Скрипты и исходники намеренно НЕ включены — Claude может писать .py/.sh
+// как рабочий код, артефактом считается то что юзеру полезно само по себе.
+const SANDBOX_OUTPUT_EXTS = new Set([
+  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'rtf',
+  'csv', 'tsv', 'txt', 'md', 'html', 'json', 'xml', 'yaml', 'yml',
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'tiff',
+  'mp3', 'wav', 'ogg', 'm4a', 'aac', 'flac',
+  'mp4', 'mov', 'webm', 'mkv', 'avi',
+  'zip', 'tar', 'gz', 'tgz', '7z',
+]);
+const MAX_SANDBOX_OUTPUT_SIZE = 49 * 1024 * 1024; // Telegram document limit 50MB
 
 @Injectable()
 export class TgBotService implements OnModuleInit {
@@ -347,6 +363,9 @@ export class TgBotService implements OnModuleInit {
     let statusLastEditAt = 0;
     let statusPendingLabel: string | null = null;
     let statusPendingTimer: NodeJS.Timeout | null = null;
+    // Песочница — выдаём Claude изолированную пустую папку под Bash/Write.
+    // Если что-то там создаст с whitelist-расширением — авто-приложим к ответу.
+    let sandboxDir: string | null = null;
 
     try {
       await this.router.persistUserMessage(cfg, ctx);
@@ -358,6 +377,16 @@ export class TgBotService implements OnModuleInit {
 
       const should = await this.router.shouldRespond(cfg, ctx);
       if (!should) return;
+
+      // Создаём per-request песочницу. Если mkdir упадёт — Claude поработает
+      // без Bash/Write (старый режим, только текст + медиа-маркеры).
+      try {
+        const candidate = path.join(os.tmpdir(), `tg-bot-${cfg.id}-${msg.message_id}-${Date.now()}`);
+        fs.mkdirSync(candidate, { recursive: true, mode: 0o700 });
+        sandboxDir = candidate;
+      } catch (e: any) {
+        this.logger.warn(`sandbox mkdir failed for chat ${msg.chat.id}: ${e.message}`);
+      }
 
       this.grammy.sendChatAction(msg.chat.id, 'typing').catch(() => {});
       typingTimer = setInterval(() => {
@@ -431,7 +460,7 @@ export class TgBotService implements OnModuleInit {
       try {
         reply = await this.router.generateReply(cfg, ownerFirstName, attachments, (ev) => {
           if (ev.kind === 'tool_use') editStatus(labelFor(ev.name)).catch(() => {});
-        });
+        }, sandboxDir ?? undefined);
       } catch (e: any) {
         // Не вылетаем тихо — пишем юзеру в статус, что не получилось.
         if (statusMsgId) {
@@ -459,6 +488,10 @@ export class TgBotService implements OnModuleInit {
       // Парсим маркеры {{image:...}} и {{file:...}} — они идут отдельными сообщениями,
       // в основном тексте их быть не должно.
       const { cleanText, markers } = this.extractOutgoingMarkers(reply.text);
+
+      // Сканим песочницу — что Claude насоздавал из артефактов. Скрипты (.py/.sh)
+      // в whitelist не входят, посылаем только итоговые файлы.
+      const sandboxOutputs = sandboxDir ? this.scanSandboxOutputs(sandboxDir) : [];
 
       // Voice reply policy. Голос — только для текстовой части ответа, не для файлов.
       const wantsVoice =
@@ -505,6 +538,20 @@ export class TgBotService implements OnModuleInit {
         }
       }
 
+      // Артефакты из песочницы Claude (PDF/DOCX/XLSX/etc.) — каждый отдельным
+      // документом. Лимит уже наложен в scanSandboxOutputs (5 файлов max).
+      for (const f of sandboxOutputs) {
+        try {
+          this.grammy.sendChatAction(msg.chat.id, 'upload_document').catch(() => {});
+          const buf = fs.readFileSync(f);
+          await this.grammy.sendDocument(msg.chat.id, buf, path.basename(f), {
+            reply_to_message_id: msg.message_id,
+          });
+        } catch (e: any) {
+          this.logger.warn(`sandbox file ${path.basename(f)} send failed in chat ${msg.chat.id}: ${e.message}`);
+        }
+      }
+
       const totalCostUsd = reply.costUsd + voiceTtsCostUsd;
       const tokensCharged = this.billing.tokensFromUsd(totalCostUsd);
       const newBalance = await this.billing.deduct(cfg.owner_user_id, tokensCharged);
@@ -527,6 +574,11 @@ export class TgBotService implements OnModuleInit {
         // Сюда попадаем только если ни success-cleanup, ни error-edit не отработали
         // (например ранний throw до try-блока с generateReply). Прибираем за собой.
         try { await this.grammy.deleteMessage(msg.chat.id, statusMsgId); } catch { /* ignore */ }
+      }
+      // Песочницу сносим целиком — независимо от того успешно отдали артефакты
+      // или Claude упал на полпути. Если оставить — диск засрётся.
+      if (sandboxDir) {
+        try { fs.rmSync(sandboxDir, { recursive: true, force: true }); } catch { /* ignore */ }
       }
       await this.pg.query(`SELECT pg_advisory_unlock($1)`, [lockId]);
       // Чистим временные файлы независимо от исхода.
@@ -586,10 +638,13 @@ export class TgBotService implements OnModuleInit {
   }
 
   /**
-   * Извлекает маркеры {{image:...}} и {{file:...}} из ответа LLM.
-   * Возвращает текст без маркеров + список найденных. Кейсы:
-   *   {{image: подсолнух в стиле Ван Гога}}
-   *   {{file: url=https://my.linkeon.io/some.pdf | caption=Отчёт | name=q4.pdf}}
+   * Извлекает медиа-маркеры из ответа LLM. Возвращает текст без них + список.
+   * Поддерживаемые формы:
+   *   {{image: <prompt>}}
+   *   {{image_edit: source=<url> | prompt=<...>}}
+   *   {{image_compose: sources=<url>,<url>[,<url>] | prompt=<...>}}
+   *   {{upscale: source=<url>}}
+   *   {{file: url=<url> | caption=<...> | name=<...>}}
    */
   private extractOutgoingMarkers(reply: string): {
     cleanText: string;
@@ -597,22 +652,32 @@ export class TgBotService implements OnModuleInit {
   } {
     const markers: OutgoingMarker[] = [];
     // Жадно матчим всё внутри {{…}} — но без вложенных скобок.
-    const re = /\{\{(image|file)\s*:\s*([^{}]+?)\}\}/gi;
+    const re = /\{\{(image|image_edit|image_compose|upscale|file)\s*:\s*([^{}]+?)\}\}/gi;
     const cleanText = reply.replace(re, (_full, kind: string, body: string) => {
-      const k = kind.toLowerCase() as 'image' | 'file';
+      const k = kind.toLowerCase();
       if (k === 'image') {
         const prompt = body.trim();
         if (prompt) markers.push({ kind: 'image', prompt });
-      } else {
-        const parts = body.split('|').map((s: string) => s.trim());
-        const kv: Record<string, string> = {};
-        for (const pp of parts) {
-          const m = pp.match(/^(\w+)\s*=\s*(.+)$/);
-          if (m) kv[m[1].toLowerCase()] = m[2].trim();
+        return '';
+      }
+      // Остальные виды — key=value пары через |
+      const parts = body.split('|').map((s: string) => s.trim());
+      const kv: Record<string, string> = {};
+      for (const pp of parts) {
+        const m = pp.match(/^(\w+)\s*=\s*(.+)$/);
+        if (m) kv[m[1].toLowerCase()] = m[2].trim();
+      }
+      if (k === 'image_edit') {
+        if (kv.source && kv.prompt) markers.push({ kind: 'image_edit', source: kv.source, prompt: kv.prompt });
+      } else if (k === 'image_compose') {
+        const sources = (kv.sources ?? '').split(',').map(s => s.trim()).filter(Boolean);
+        if (sources.length >= 2 && kv.prompt) {
+          markers.push({ kind: 'image_compose', sources: sources.slice(0, 3), prompt: kv.prompt });
         }
-        if (kv.url) {
-          markers.push({ kind: 'file', url: kv.url, caption: kv.caption, name: kv.name });
-        }
+      } else if (k === 'upscale') {
+        if (kv.source) markers.push({ kind: 'upscale', source: kv.source });
+      } else if (k === 'file') {
+        if (kv.url) markers.push({ kind: 'file', url: kv.url, caption: kv.caption, name: kv.name });
       }
       return ''; // вырезаем маркер из текста
     }).replace(/\n{3,}/g, '\n\n').trim();
@@ -632,6 +697,38 @@ export class TgBotService implements OnModuleInit {
       });
       return;
     }
+    if (m.kind === 'image_edit') {
+      this.grammy.sendChatAction(msg.chat.id, 'upload_photo').catch(() => {});
+      const res = await this.misc.editImage(cfg.owner_user_id, { prompt: m.prompt, sourceImageUrl: m.source });
+      const url = res?.images?.[0]?.url;
+      if (!url) throw new Error('image-edit вернул пустой URL');
+      await this.grammy.sendPhoto(msg.chat.id, url, {
+        reply_to_message_id: msg.message_id,
+        caption: m.prompt.slice(0, 1024),
+      });
+      return;
+    }
+    if (m.kind === 'image_compose') {
+      this.grammy.sendChatAction(msg.chat.id, 'upload_photo').catch(() => {});
+      const res = await this.misc.composeImage(cfg.owner_user_id, { prompt: m.prompt, sourceImageUrls: m.sources });
+      const url = res?.images?.[0]?.url;
+      if (!url) throw new Error('image-compose вернул пустой URL');
+      await this.grammy.sendPhoto(msg.chat.id, url, {
+        reply_to_message_id: msg.message_id,
+        caption: m.prompt.slice(0, 1024),
+      });
+      return;
+    }
+    if (m.kind === 'upscale') {
+      this.grammy.sendChatAction(msg.chat.id, 'upload_photo').catch(() => {});
+      const res = await this.misc.upscaleImage(cfg.owner_user_id, { sourceImageUrl: m.source });
+      const url = res?.images?.[0]?.url;
+      if (!url) throw new Error('upscale вернул пустой URL');
+      await this.grammy.sendPhoto(msg.chat.id, url, {
+        reply_to_message_id: msg.message_id,
+      });
+      return;
+    }
     // file: качаем сами и шлём как document, чтобы Telegram не ограничивал
     // по размеру изображения (для картинок лучше отдельный {{image:…}})
     this.grammy.sendChatAction(msg.chat.id, 'upload_document').catch(() => {});
@@ -643,6 +740,38 @@ export class TgBotService implements OnModuleInit {
       reply_to_message_id: msg.message_id,
       caption: m.caption?.slice(0, 1024),
     });
+  }
+
+  /**
+   * Scan Claude's sandbox cwd for output artifacts. Recursive walk, ограничиваем
+   * по whitelist расширений (см. SANDBOX_OUTPUT_EXTS) и размеру файла. Скрипты
+   * (.py/.sh/etc.) сюда не попадают — это рабочие файлы Claude, не результат.
+   */
+  private scanSandboxOutputs(dir: string): string[] {
+    const results: string[] = [];
+    const walk = (d: string) => {
+      let entries: fs.Dirent[];
+      try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        const full = path.join(d, e.name);
+        if (e.isDirectory()) {
+          // Не лезем в node_modules / __pycache__ / .git и подобные служебные дирки.
+          if (e.name.startsWith('.') || ['node_modules', '__pycache__', 'venv', '.venv'].includes(e.name)) continue;
+          walk(full);
+          continue;
+        }
+        if (!e.isFile()) continue;
+        const ext = (e.name.split('.').pop() ?? '').toLowerCase();
+        if (!SANDBOX_OUTPUT_EXTS.has(ext)) continue;
+        let size: number;
+        try { size = fs.statSync(full).size; } catch { continue; }
+        if (size === 0 || size > MAX_SANDBOX_OUTPUT_SIZE) continue;
+        results.push(full);
+      }
+    };
+    walk(dir);
+    // Ограничиваем количество — иначе одно сообщение бота заполонит чат.
+    return results.slice(0, 5);
   }
 
   /**
