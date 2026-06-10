@@ -43,6 +43,10 @@ const MAX_SANDBOX_OUTPUT_SIZE = 49 * 1024 * 1024; // Telegram document limit 50M
 @Injectable()
 export class TgBotService implements OnModuleInit {
   private readonly logger = new Logger(TgBotService.name);
+  // Throttle для busy-сообщения "минутку, заканчиваю предыдущее" —
+  // не спамим если юзер пишет 10 сообщений подряд. In-memory, сбрасывается
+  // при рестарте бэка, что приемлемо.
+  private readonly lastBusyNoticeAt = new Map<number, number>();
 
   constructor(
     private readonly pg: PgService,
@@ -295,6 +299,15 @@ export class TgBotService implements OnModuleInit {
         workingText = await this.voice.transcribe(voiceFileId);
         actualIsVoice = true;
         this.logger.log(`voice transcribed in chat ${msg.chat.id}: "${workingText.substring(0, 50)}..."`);
+        // Echo расшифровки — чтобы юзер видел что бот услышал и мог поправить
+        // если что-то не так. Fire-and-forget: ошибка отправки не блокирует флоу.
+        if (workingText) {
+          this.grammy.sendMessage(
+            msg.chat.id,
+            `🎙️ _«${workingText.slice(0, 1024)}»_`,
+            { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' },
+          ).catch(() => {});
+        }
       } catch (e: any) {
         this.logger.warn(`STT failed for chat ${msg.chat.id}: ${e.message}`);
         return;
@@ -318,18 +331,23 @@ export class TgBotService implements OnModuleInit {
     }
     if (!workingText) return;
 
-    // Pre-flight: balance check. При 0 — однократное сообщение в группе.
+    // Pre-flight: balance check. При ≤ 0 — повторяемое уведомление каждые
+    // 10 минут, чтобы юзеры с пустым балансом не думали, что бот молча умер.
     const preBalance = await this.billing.getBalance(cfg.owner_user_id);
     if (preBalance <= 0) {
-      const notified = await this.billing.hasZeroBalanceFlag(cfg.id);
-      if (!notified) {
+      const ZERO_BALANCE_COOLDOWN_MS = 10 * 60 * 1000;
+      const recent = await this.billing.recentlyNotifiedZeroBalance(cfg.id, ZERO_BALANCE_COOLDOWN_MS);
+      if (!recent) {
         try {
           await this.grammy.sendMessage(
             msg.chat.id,
-            `У владельца закончились токены. Пополнить: https://my.linkeon.io/tokens`,
+            `⚠️ У владельца закончились токены (баланс: ${preBalance}). Бот не отвечает пока баланс не пополнят: https://my.linkeon.io/tokens`,
+            { reply_to_message_id: msg.message_id },
           );
           await this.billing.markZeroBalanceNotified(cfg.id);
-        } catch { /* ignore */ }
+        } catch (e: any) {
+          this.logger.warn(`zero-balance notify failed in chat ${msg.chat.id}: ${e.message}`);
+        }
       }
       return;
     }
@@ -352,9 +370,27 @@ export class TgBotService implements OnModuleInit {
     const lockRes = await this.pg.query(`SELECT pg_try_advisory_lock($1)`, [lockId]);
     if (!lockRes.rows[0].pg_try_advisory_lock) {
       this.logger.debug(`chat ${msg.chat.id} busy, skipping`);
-      // Без обратной связи юзер не понимает что произошло. typing-action длится
-      // ~5с и сигнализирует "вижу тебя, но занят" без отдельного сообщения-спама.
-      try { await this.grammy.sendChatAction(msg.chat.id, 'typing'); } catch { /* ignore */ }
+      // Раньше дропали тихо (только typing-action). Теперь:
+      // 1) Сохраняем сообщение юзера в БД — чтобы в истории не было дыр
+      // 2) Раз в 60с шлём явное "минутку" в чат
+      try { await this.router.persistUserMessage(cfg, ctx); } catch (e: any) {
+        this.logger.warn(`busy-skip persistUserMessage failed in chat ${msg.chat.id}: ${e.message}`);
+      }
+      const lastNotice = this.lastBusyNoticeAt.get(msg.chat.id) ?? 0;
+      if (Date.now() - lastNotice > 60_000) {
+        this.lastBusyNoticeAt.set(msg.chat.id, Date.now());
+        try {
+          await this.grammy.sendMessage(
+            msg.chat.id,
+            '⏳ Минутку — заканчиваю предыдущий запрос. Подожди или повтори через 30 секунд.',
+            { reply_to_message_id: msg.message_id },
+          );
+        } catch (e: any) {
+          this.logger.warn(`busy-skip notice failed in chat ${msg.chat.id}: ${e.message}`);
+        }
+      } else {
+        try { await this.grammy.sendChatAction(msg.chat.id, 'typing'); } catch { /* ignore */ }
+      }
       return;
     }
 

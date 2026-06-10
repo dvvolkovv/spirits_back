@@ -71,12 +71,19 @@ export class TgBillingService {
     }
   }
 
-  async hasZeroBalanceFlag(configId: string): Promise<boolean> {
+  /**
+   * Уже ли мы уведомляли владельца о нулевом балансе в последние cooldownMs.
+   * Раньше при первом срабатывании ставился флаг навсегда — после чего бот
+   * молча игнорил ВСЕ следующие сообщения, выглядело как «бот завис».
+   */
+  async recentlyNotifiedZeroBalance(configId: string, cooldownMs: number): Promise<boolean> {
     const r = await this.pg.query(
       `SELECT last_zero_balance_msg_at FROM tg_bot_configs WHERE id = $1`,
       [configId],
     );
-    return !!r.rows[0]?.last_zero_balance_msg_at;
+    const last = r.rows[0]?.last_zero_balance_msg_at;
+    if (!last) return false;
+    return Date.now() - new Date(last).getTime() < cooldownMs;
   }
 
   async markZeroBalanceNotified(configId: string): Promise<void> {
