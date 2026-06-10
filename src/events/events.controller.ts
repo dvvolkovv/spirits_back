@@ -43,11 +43,12 @@ export class EventsController {
   // signup_source ОДИН раз (если ещё пуст) — first-touch не перетирается.
   @Post('events/attribute')
   @UseGuards(JwtGuard)
-  async attribute(@CurrentUser() u: any, @Body() body: { source?: string }, @Res() res: Response) {
+  async attribute(@CurrentUser() u: any, @Body() body: { source?: string; campaign?: string }, @Res() res: Response) {
     const userId = u?.userId ? String(u.userId) : null;
     const src = (body?.source || '').trim();
+    const campaign = (body?.campaign || '').trim();
     if (userId && src) {
-      await this.events.setSignupSourceIfEmpty(userId, src);
+      await this.events.setSignupSourceIfEmpty(userId, src, campaign);
     }
     return res.status(204).end();
   }

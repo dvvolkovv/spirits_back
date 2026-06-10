@@ -26,10 +26,21 @@ export interface AttributionRow {
   revenueRub: number;      // суммарная выручка от этих юзеров
 }
 
+// A/B-разрез по кампании+креативу (signup_campaign = utm_campaign/utm_content),
+// например biz_jun26/cr_A vs biz_jun26/cr_B — какой креатив даёт регистрации/оплаты.
+export interface CampaignRow {
+  campaign: string;
+  registrations: number;
+  activated: number;
+  payers: number;
+  revenueRub: number;
+}
+
 export interface AttributionOverview {
   generatedAt: string;
   windowDays: number;
   rows: AttributionRow[];
+  byCampaign: CampaignRow[];
   totals: { landings: number; registrations: number; activated: number; payers: number; revenueRub: number };
   note: string;
 }
@@ -115,6 +126,42 @@ export class AttributionService {
       funnelRows = r.rows;
     } catch (e: any) { this.log.warn(`attribution funnel failed: ${e.message}`); }
 
+    // A/B-разрез по кампании+креативу (signup_campaign), только непустые.
+    let campaignRows: CampaignRow[] = [];
+    try {
+      const cr = await this.pg.query(
+        `WITH regs AS (
+           SELECT user_id, signup_campaign FROM ai_profiles_consolidated
+            WHERE created_at > now() - ($1 || ' days')::interval
+              AND signup_campaign IS NOT NULL AND signup_campaign <> ''
+              AND user_id <> ALL($2) AND user_id !~ $3
+              AND user_id NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
+         ),
+         chat AS (
+           SELECT split_part(session_id,'_',1) AS uid, min(created_at) AS first_chat
+             FROM custom_chat_history WHERE sender_type='human' GROUP BY 1
+         ),
+         pay AS (SELECT user_id, SUM(amount)::numeric AS rev FROM payments WHERE status='succeeded' GROUP BY 1)
+         SELECT r.signup_campaign AS campaign,
+                COUNT(*)::int                                        AS registrations,
+                COUNT(*) FILTER (WHERE c.uid IS NOT NULL)::int       AS activated,
+                COUNT(*) FILTER (WHERE p.user_id IS NOT NULL)::int   AS payers,
+                COALESCE(SUM(p.rev),0)::numeric                      AS revenue
+           FROM regs r
+           LEFT JOIN chat c ON c.uid = r.user_id
+           LEFT JOIN pay p  ON p.user_id = r.user_id
+          GROUP BY 1 ORDER BY 2 DESC`,
+        [String(wd), TEST_USERS, TEST_PATTERN],
+      );
+      campaignRows = cr.rows.map((x: any) => ({
+        campaign: String(x.campaign),
+        registrations: Number(x.registrations) || 0,
+        activated: Number(x.activated) || 0,
+        payers: Number(x.payers) || 0,
+        revenueRub: Math.round(Number(x.revenue) || 0),
+      }));
+    } catch (e: any) { this.log.warn(`attribution byCampaign failed: ${e.message}`); }
+
     // Слияние по источнику.
     const bySource = new Map<string, AttributionRow>();
     const ensure = (s: string): AttributionRow => {
@@ -148,6 +195,7 @@ export class AttributionService {
       generatedAt: new Date().toISOString(),
       windowDays: wd,
       rows,
+      byCampaign: campaignRows,
       totals,
       note:
         'First-touch: источник юзера = самое раннее его событие с source. ' +

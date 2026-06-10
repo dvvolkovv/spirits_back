@@ -63,8 +63,13 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
       await this.pg.query(
         `ALTER TABLE ai_profiles_consolidated ADD COLUMN IF NOT EXISTS signup_source text`,
       );
+      // signup_campaign = utm_campaign/utm_content — для A/B-разреза по креативу
+      // (source хранит только канал utm:vk/cpc).
+      await this.pg.query(
+        `ALTER TABLE ai_profiles_consolidated ADD COLUMN IF NOT EXISTS signup_campaign text`,
+      );
     } catch (e: any) {
-      this.log.error(`signup_source column migration failed: ${e.message}`);
+      this.log.error(`signup_source/campaign column migration failed: ${e.message}`);
     }
 
     this.timer = setInterval(() => this.flush().catch(() => {}), FLUSH_INTERVAL_MS);
@@ -79,16 +84,18 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
   // Записать источник привлечения юзера ОДИН раз (first-touch): только если
   // signup_source ещё пуст. Игнорируем внутренние/служебные метки — пишем лишь
   // реальные источники (utm:/referral:/ref-site:/direct/organic).
-  async setSignupSourceIfEmpty(userId: string, source: string): Promise<void> {
+  async setSignupSourceIfEmpty(userId: string, source: string, campaign?: string): Promise<void> {
     if (!this.pg) return;
     const ok = /^(utm:|referral:|ref-site:|direct$|organic$)/.test(source);
     if (!ok) return;
+    const camp = (campaign || '').trim().slice(0, 120) || null;
     try {
       await this.pg.query(
         `UPDATE ai_profiles_consolidated
-            SET signup_source = $2
+            SET signup_source = $2,
+                signup_campaign = COALESCE(NULLIF($3,''), signup_campaign)
           WHERE user_id = $1 AND (signup_source IS NULL OR signup_source = '')`,
-        [userId, source],
+        [userId, source, camp],
       );
     } catch (e: any) {
       this.log.warn(`setSignupSourceIfEmpty failed: ${e.message}`);
