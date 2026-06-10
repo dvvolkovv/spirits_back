@@ -30,6 +30,7 @@ import { BacklogModule } from './backlog/backlog.module';
 import { VpmModule } from './vpm/vpm.module';
 import { VmmModule } from './vmm/vmm.module';
 import { OfferModule } from './offer/offer.module';
+import { TgBotModule } from './tg-bot/tg-bot.module';
 
 @Module({
   imports: [
@@ -64,6 +65,7 @@ import { OfferModule } from './offer/offer.module';
     VpmModule,
     VmmModule,
     OfferModule,
+    TgBotModule,
   ],
 })
 export class AppModule {}
