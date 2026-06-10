@@ -72,6 +72,11 @@ export class TgGrammyClient implements OnModuleInit {
     return this.bot.api.sendDocument(chatId, input as any, options);
   }
 
+  async sendVideo(chatId: number, video: Buffer | string, options: any = {}) {
+    const input = typeof video === 'string' ? video : new InputFile(video);
+    return this.bot.api.sendVideo(chatId, input as any, options);
+  }
+
   async leaveChat(chatId: number) {
     return this.bot.api.leaveChat(chatId);
   }

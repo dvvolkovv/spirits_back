@@ -196,21 +196,34 @@ ${recent}
     ownerFirstName: string,
     attachmentPaths?: string[],
     onProgress?: (event: ClaudeCliProgressEvent) => void,
+    sandboxDir?: string,
   ): Promise<{ text: string; costUsd: number }> {
     const { systemPrompt } = await this.resolveSystemPrompt(cfg);
     const history = await this.loadHistory(cfg.id);
 
-    // В системный промпт добавляем инструкцию про markup для отправки файлов:
-    //   {{image: <prompt>}}                                  — сгенерировать картинку
-    //   {{file: url=<https-url> | caption=<...> | name=...}} — прикрепить файл по URL
-    // Бот распарсит маркеры, вырежет из текста и отправит как отдельные сообщения.
+    // В системный промпт добавляем инструкцию про markup для отправки файлов
+    // и про доступные инструменты. Если есть sandboxDir — даём Claude Bash/Write/
+    // и сообщаем что любые артефакты в cwd авто-прикрепятся к ответу.
+    const sandboxBlock = sandboxDir ? `
+- ТЫ В BASH-ОКРУЖЕНИИ. cwd = ${sandboxDir} (изолированная пустая папка только для тебя).
+- Доступные инструменты: Bash, Write, Edit, Read, Glob, Grep.
+- Pre-installed: python3, pip, ffmpeg, ImageMagick, LibreOffice (для конвертации в PDF), poppler-utils, curl.
+- Если нужна Python-библиотека — \`pip install --user <name>\`.
+- Любой файл, который ты создашь в cwd с расширением pdf/docx/xlsx/pptx/csv/txt/md/html/json/png/jpg/mp3/mp4/zip и т.п. — авто-прикрепится к ответу как документ (до 5 файлов). Скрипты (.py/.sh) не прикрепляются — используй их как рабочий код.
+- НЕ зашивай в имена файлов кириллицу/пробелы — только [a-z0-9_-]. Telegram плохо переваривает не-ASCII в filename.
+- Большие задачи (PDF из нескольких страниц, диаграммы, таблицы) — пиши Python-скрипт (reportlab/openpyxl/python-pptx) и запускай через Bash.` : '';
+
     const ioInstructions = `
 ВОЗМОЖНОСТИ:
-- Ты видишь приложенные пользователем файлы (фото, PDF, txt) если они есть.
-- Ты можешь приложить файлы к своему ответу через маркеры:
-  • {{image: КРАТКИЙ_ПРОМПТ_ДЛЯ_КАРТИНКИ}} — сгенерирует и пришлёт картинку
-  • {{file: url=<https://...> | caption=<подпись> | name=<имя>}} — пришлёт файл по URL
-- Маркеры пиши на отдельной строке. Можно несколько подряд. Не больше 3 за ответ.
+- Ты видишь приложенные пользователем файлы (фото, PDF, txt) если они есть.${sandboxBlock}
+- Медиа-маркеры для прикрепления изображений и файлов к ответу:
+  • {{image: КРАТКИЙ_ПРОМПТ}} — сгенерирует и пришлёт новую картинку (Imagen 4.0 Ultra)
+  • {{image_edit: source=<url> | prompt=<что изменить>}} — отредактирует существующую (Gemini Nano Banana Pro)
+  • {{image_compose: sources=<url1>,<url2>[,<url3>] | prompt=<инструкция>}} — склеит 2-3 картинки в одну
+  • {{upscale: source=<url>}} — улучшит качество до 4K
+  • {{video: prompt=<описание> | mode=text2video|image2video | source=<url>? | duration=5|10}} — сгенерирует видео (Kling, 1-3 минуты). Юзер получит сообщение "видео в очереди" сразу, а сам ролик придёт автоматически когда готов. Для image2video передавай source=<url> картинки.
+  • {{file: url=<https://...> | caption=<подпись> | name=<имя>}} — приложит файл по https-URL
+- Маркеры пиши на отдельной строке. Не больше 3 за ответ. source/sources — это URL картинок из предыдущих сообщений в чате.
 - Сам по себе текст до/после маркера тоже отправится — пиши коротко.`;
 
     const systemWithCtx = `Ты в Telegram-группе. Владелец бота, который платит за твою работу: ${ownerFirstName}. Текущая дата/время: ${new Date().toISOString()}.
@@ -225,12 +238,18 @@ ${systemPrompt}`;
     // timeoutMs: 0 — без таймаута. Юзер видит реальный прогресс через onProgress
     // (status-сообщение в чате), так что молчания в TG больше нет, и обрывать
     // Claude по часам не нужно.
+    // В sandbox-режиме разрешаем агентные tools — Claude может сам писать скрипты,
+    // запускать их и читать результаты. В песочнице — только в её cwd.
+    const allowedTools = sandboxDir ? 'Bash,Write,Edit,Read,Glob,Grep' : undefined;
+
     const { text, costUsd } = await this.claudeCli.textWithCost(userPrompt, {
       system: systemWithCtx,
       model: 'claude-sonnet-4-6',
       timeoutMs: 0,
       attachments: attachmentPaths?.length ? attachmentPaths : undefined,
       onProgress,
+      cwd: sandboxDir,
+      allowedTools,
     });
 
     return { text: text.trim() || '...', costUsd };
