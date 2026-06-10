@@ -202,6 +202,30 @@ sync_test_basic_auth() {
     || red   "  ! htpasswd sync failed (smoke may still 401)"
 }
 
+# Прогрев chat-пути перед smoke (см. вызов в run_phase). После pm2 restart связь
+# linkeon-api ↔ r.linkeon.io холодная: первый chat-вызов медленный/падает, ответ
+# не успевает сохраниться → smoke-чек custom_chat_history видит 0 строк и валит
+# деплой ложно. Здесь: SMS-auth тест-юзера 70000000000 + 2 чата Роману (id=12),
+# чтобы разбудить связь и создать свежие строки в БД. Fire-and-forget (|| true).
+warm_chat_path() {
+  local base="$1" auth="$2"
+  local ca=(); [[ -n "$auth" ]] && ca=(-u "$auth")
+  local phone=70000000000 code tok
+  curl -s "${ca[@]}" -m 15 "$base/webhook/898c938d-f094-455c-86af-969617e62f7a/sms/$phone" >/dev/null 2>&1 || return 0
+  code=$(curl -s "${ca[@]}" -m 15 "$base/webhook/debug/sms-code/$phone" | grep -oE '[0-9]{4,6}' | head -1)
+  [[ -z "$code" ]] && return 0
+  tok=$(curl -s "${ca[@]}" -m 15 "$base/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/$phone/$code" \
+        | sed -n 's/.*"access-token":"\([^"]*\)".*/\1/p')
+  [[ -z "$tok" ]] && return 0
+  # 1-й чат будит r.linkeon (может быть медленным), 2-й уже тёплый и точно сохранится
+  for _ in 1 2; do
+    curl -s "${ca[@]}" -m 60 -X POST "$base/webhook/soulmate/chat" \
+      -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
+      -d '{"chatInput":"deploy warmup","assistant":"12"}' >/dev/null 2>&1 || true
+  done
+  green "  ✓ chat-path warmed ($base)"
+}
+
 deploy_backend() {
   bold "=== BACKEND ($ENV_NAME) ==="
   bold "[back 1/3] pushing local commits to origin"
@@ -310,6 +334,12 @@ run_phase() {
   if [[ -z "${SKIP_SMOKE:-}" && -z "${!skip_var:-}" ]]; then
     sync_test_basic_auth
     bold "=== SMOKE ($ENV_NAME) ==="
+    # Прогрев chat-пути ПОСЛЕ рестарта и ДО smoke: связь с r.linkeon.io холодная
+    # сразу после pm2 restart, первый chat-вызов медленный/фейлит → smoke-чек
+    # "custom_chat_history persisted" видит 0 строк и валит хороший деплой
+    # (стабильный ложный rollback, 2026-06-10). Будим связь и создаём свежие
+    # строки в БД до проверки. Не критично к успеху — || true.
+    warm_chat_path "$BASE_URL" "$BASIC_AUTH" || true
     cd "$LOCAL_BACK_DIR/tests"
     # Smoke can flake on transient cold paths right after a restart (LLM /
     # r.linkeon.io latency, Neo4j driver reconnect → "Failed to fetch"/timeout).
