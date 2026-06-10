@@ -211,10 +211,10 @@ warm_chat_path() {
   local base="$1" auth="$2"
   local ca=(); [[ -n "$auth" ]] && ca=(-u "$auth")
   local phone=70000000000 code tok
-  curl -s "${ca[@]}" -m 15 "$base/webhook/898c938d-f094-455c-86af-969617e62f7a/sms/$phone" >/dev/null 2>&1 || return 0
-  code=$(curl -s "${ca[@]}" -m 15 "$base/webhook/debug/sms-code/$phone" | grep -oE '[0-9]{4,6}' | head -1)
+  curl -s ${ca[@]+"${ca[@]}"} -m 15 "$base/webhook/898c938d-f094-455c-86af-969617e62f7a/sms/$phone" >/dev/null 2>&1 || return 0
+  code=$(curl -s ${ca[@]+"${ca[@]}"} -m 15 "$base/webhook/debug/sms-code/$phone" | grep -oE '[0-9]{4,6}' | head -1)
   [[ -z "$code" ]] && return 0
-  tok=$(curl -s "${ca[@]}" -m 15 "$base/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/$phone/$code" \
+  tok=$(curl -s ${ca[@]+"${ca[@]}"} -m 15 "$base/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/$phone/$code" \
         | sed -n 's/.*"access-token":"\([^"]*\)".*/\1/p')
   [[ -z "$tok" ]] && return 0
   # Прогрев browser-критичных эндпоинтов: ChatInterface не отрендерит кнопку
@@ -224,7 +224,7 @@ warm_chat_path() {
   curl -s "${ca[@]}" -m 20 "$base/webhook/profile" -H "Authorization: Bearer $tok" >/dev/null 2>&1 || true
   # 1-й чат будит r.linkeon (может быть медленным), 2-й уже тёплый и точно сохранится
   for _ in 1 2; do
-    curl -s "${ca[@]}" -m 60 -X POST "$base/webhook/soulmate/chat" \
+    curl -s ${ca[@]+"${ca[@]}"} -m 60 -X POST "$base/webhook/soulmate/chat" \
       -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
       -d '{"chatInput":"deploy warmup","assistant":"12"}' >/dev/null 2>&1 || true
   done
