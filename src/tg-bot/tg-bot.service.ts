@@ -13,6 +13,7 @@ import { TgBillingService } from './tg-billing.service';
 import { TgCommandsService } from './tg-commands.service';
 import { TgGrammyClient } from './tg-grammy.client';
 import { MiscService } from '../misc/misc.service';
+import { VideoService } from '../video/video.service';
 
 // Лимит размера файла, который мы готовы скачать с Telegram и передать в Claude.
 // Telegram сам отдаёт через Bot API до 20 МБ; больше — нужен MTProto, не наш кейс.
@@ -23,6 +24,7 @@ type OutgoingMarker =
   | { kind: 'image_edit'; source: string; prompt: string }
   | { kind: 'image_compose'; sources: string[]; prompt: string }
   | { kind: 'upscale'; source: string }
+  | { kind: 'video'; prompt: string; source?: string; duration?: number; mode: 'text2video' | 'image2video'; model?: string }
   | { kind: 'file'; url: string; caption?: string; name?: string };
 
 // Файлы которые мы готовы автоматически прикреплять из песочницы Claude.
@@ -53,11 +55,13 @@ export class TgBotService implements OnModuleInit {
     private readonly commands: TgCommandsService,
     private readonly grammy: TgGrammyClient,
     private readonly misc: MiscService,
+    private readonly video: VideoService,
   ) {}
 
   async onModuleInit() {
     await this.applyMigration('001_tg_bot_schema.sql');
     await this.applyMigration('002_tg_bot_custom_agent_fk.sql');
+    await this.applyMigration('003_tg_bot_video_delivery.sql');
   }
 
   private async applyMigration(filename: string) {
@@ -446,7 +450,7 @@ export class TgBotService implements OnModuleInit {
         if (toolName === 'WebFetch') return '🌐 Открываю страницу...';
         if (/generate_image|edit_image|compose_image/i.test(toolName)) return '🎨 Готовлю картинку...';
         if (/upscale_image/i.test(toolName)) return '✨ Улучшаю картинку...';
-        if (/generate_video/i.test(toolName)) return '🎬 Генерирую видео...';
+        if (/generate_video|video/i.test(toolName)) return '🎬 Запускаю генерацию видео...';
         return `⚙️ ${toolName}...`;
       };
 
@@ -652,7 +656,7 @@ export class TgBotService implements OnModuleInit {
   } {
     const markers: OutgoingMarker[] = [];
     // Жадно матчим всё внутри {{…}} — но без вложенных скобок.
-    const re = /\{\{(image|image_edit|image_compose|upscale|file)\s*:\s*([^{}]+?)\}\}/gi;
+    const re = /\{\{(image|image_edit|image_compose|upscale|video|file)\s*:\s*([^{}]+?)\}\}/gi;
     const cleanText = reply.replace(re, (_full, kind: string, body: string) => {
       const k = kind.toLowerCase();
       if (k === 'image') {
@@ -676,6 +680,19 @@ export class TgBotService implements OnModuleInit {
         }
       } else if (k === 'upscale') {
         if (kv.source) markers.push({ kind: 'upscale', source: kv.source });
+      } else if (k === 'video') {
+        if (kv.prompt) {
+          const mode = (kv.mode === 'image2video' ? 'image2video' : 'text2video') as 'text2video' | 'image2video';
+          const duration = kv.duration ? Math.max(5, Math.min(10, parseInt(kv.duration, 10) || 5)) : 5;
+          markers.push({
+            kind: 'video',
+            prompt: kv.prompt,
+            source: kv.source || undefined,
+            duration: duration as 5 | 10,
+            mode,
+            model: kv.model || undefined,
+          });
+        }
       } else if (k === 'file') {
         if (kv.url) markers.push({ kind: 'file', url: kv.url, caption: kv.caption, name: kv.name });
       }
@@ -727,6 +744,31 @@ export class TgBotService implements OnModuleInit {
       await this.grammy.sendPhoto(msg.chat.id, url, {
         reply_to_message_id: msg.message_id,
       });
+      return;
+    }
+    if (m.kind === 'video') {
+      // Видео — async (Kling/Veo: 1-3 минуты). Запускаем job, привязываем к
+      // чату, юзеру сразу пишем "в очереди". TgVideoDispatchService доставит
+      // результат когда status=ready.
+      this.grammy.sendChatAction(msg.chat.id, 'record_video').catch(() => {});
+      const dto: any = {
+        mode: m.mode,
+        prompt: m.prompt,
+        duration: m.duration ?? 5,
+      };
+      if (m.model) dto.model = m.model;
+      if (m.source) dto.sourceImageUrl = m.source;
+      const job = await this.video.createJob(cfg.owner_user_id, dto);
+      await this.pg.query(
+        `INSERT INTO tg_bot_video_jobs (job_id, tg_chat_id, tg_reply_to_message_id, config_id)
+         VALUES ($1, $2, $3, $4) ON CONFLICT (job_id) DO NOTHING`,
+        [job.jobId, msg.chat.id, msg.message_id, cfg.id],
+      );
+      await this.grammy.sendMessage(
+        msg.chat.id,
+        '🎬 Видео в очереди (1-3 минуты). Пришлю как только будет готово.',
+        { reply_to_message_id: msg.message_id },
+      );
       return;
     }
     // file: качаем сами и шлём как document, чтобы Telegram не ограничивал
