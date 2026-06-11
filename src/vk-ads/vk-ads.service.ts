@@ -167,4 +167,96 @@ export class VkAdsService implements OnModuleInit {
       return { configured: true, error: e.message };
     }
   }
+
+  // Полная сводка для админ-вкладки «Реклама»: кампании → объявления, период
+  // (по датам с данными), расход и метрики эффективности + связка с нашими
+  // регистрациями/оплатами через signup_campaign (= utm_campaign/utm_content).
+  async dashboardForAdmin(windowDays = 60): Promise<any> {
+    if (!this.configured()) return { configured: false };
+    try {
+      // 1. По объявлению (creative) за окно: метрики рекламы + период.
+      const creatives = await this.pg.query(
+        `SELECT utm_campaign, utm_content,
+                min(banner_id) AS banner_id,
+                min(date) AS date_from, max(date) AS date_to,
+                SUM(shows)::int AS shows, SUM(clicks)::int AS clicks,
+                SUM(goals)::int AS goals,
+                SUM(spent)::numeric(12,2) AS spent,
+                CASE WHEN SUM(shows)>0 THEN round(100.0*SUM(clicks)/SUM(shows),2) END AS ctr,
+                CASE WHEN SUM(clicks)>0 THEN round(SUM(spent)/SUM(clicks),2) END AS cpc
+           FROM vk_ads_stats
+          WHERE date > now() - ($1 || ' days')::interval
+          GROUP BY 1,2`,
+        [String(windowDays)],
+      );
+
+      // 2. Наши результаты по signup_campaign (= campaign/content).
+      const reg = await this.pg.query(
+        `SELECT signup_campaign,
+                COUNT(*)::int AS registrations,
+                COUNT(*) FILTER (WHERE user_id IN (SELECT user_id FROM payments WHERE status='succeeded'))::int AS payers
+           FROM ai_profiles_consolidated
+          WHERE signup_campaign IS NOT NULL AND signup_campaign <> ''
+          GROUP BY 1`,
+      );
+      const regByKey = new Map<string, { registrations: number; payers: number }>();
+      for (const r of reg.rows) regByKey.set(r.signup_campaign, { registrations: r.registrations, payers: r.payers });
+
+      // 3. Последняя выгрузка (для отображения «обновлено» и свежести cron).
+      const fetched = await this.pg.query(`SELECT max(fetched_at) AS last FROM vk_ads_stats`);
+      const lastFetchedAt = fetched.rows[0]?.last ?? null;
+
+      // 4. Собираем дерево кампания → объявления.
+      const campaigns = new Map<string, any>();
+      for (const c of creatives.rows) {
+        const camp = c.utm_campaign || '(без кампании)';
+        const key = `${c.utm_campaign}/${c.utm_content}`;
+        const rk = regByKey.get(key) || { registrations: 0, payers: 0 };
+        const spent = Number(c.spent) || 0;
+        const creative = {
+          content: c.utm_content || '(без метки)',
+          bannerId: c.banner_id,
+          dateFrom: c.date_from, dateTo: c.date_to,
+          shows: c.shows, clicks: c.clicks, goals: c.goals,
+          spent, ctr: c.ctr != null ? Number(c.ctr) : null, cpc: c.cpc != null ? Number(c.cpc) : null,
+          registrations: rk.registrations, payers: rk.payers,
+          cpr: rk.registrations > 0 ? Math.round((spent / rk.registrations) * 100) / 100 : null,
+        };
+        if (!campaigns.has(camp)) {
+          campaigns.set(camp, {
+            campaign: camp, channel: 'VK Реклама',
+            dateFrom: c.date_from, dateTo: c.date_to,
+            shows: 0, clicks: 0, goals: 0, spent: 0, registrations: 0, payers: 0,
+            creatives: [] as any[],
+          });
+        }
+        const cc = campaigns.get(camp);
+        cc.creatives.push(creative);
+        cc.shows += creative.shows; cc.clicks += creative.clicks; cc.goals += creative.goals;
+        cc.spent += spent; cc.registrations += rk.registrations; cc.payers += rk.payers;
+        if (c.date_from < cc.dateFrom) cc.dateFrom = c.date_from;
+        if (c.date_to > cc.dateTo) cc.dateTo = c.date_to;
+      }
+
+      const campaignList = Array.from(campaigns.values()).map((cc) => {
+        cc.spent = Math.round(cc.spent * 100) / 100;
+        cc.ctr = cc.shows > 0 ? Math.round((10000 * cc.clicks) / cc.shows) / 100 : null;
+        cc.cpc = cc.clicks > 0 ? Math.round((cc.spent / cc.clicks) * 100) / 100 : null;
+        cc.cpr = cc.registrations > 0 ? Math.round((cc.spent / cc.registrations) * 100) / 100 : null;
+        cc.creatives.sort((a: any, b: any) => b.spent - a.spent);
+        return cc;
+      }).sort((a, b) => b.spent - a.spent);
+
+      const totals = campaignList.reduce((t, c) => ({
+        shows: t.shows + c.shows, clicks: t.clicks + c.clicks,
+        spent: Math.round((t.spent + c.spent) * 100) / 100,
+        registrations: t.registrations + c.registrations, payers: t.payers + c.payers,
+      }), { shows: 0, clicks: 0, spent: 0, registrations: 0, payers: 0 });
+
+      return { configured: true, windowDays, lastFetchedAt, campaigns: campaignList, totals };
+    } catch (e: any) {
+      this.log.warn(`vk-ads dashboardForAdmin failed: ${e.message}`);
+      return { configured: true, error: e.message };
+    }
+  }
 }

@@ -23,11 +23,20 @@ export class VkAdsController {
     return res.status(200).json(await this.vk.summaryForVmm(30));
   }
 
+  // Полная сводка для админ-вкладки «Реклама» (кампании → объявления + период,
+  // бюджет/расход, метрики, связка с регистрациями/оплатами).
+  @Get('admin/vk-ads/dashboard')
+  @UseGuards(JwtGuard, AdminGuard)
+  async dashboard(@Res() res: Response) {
+    return res.status(200).json(await this.vk.dashboardForAdmin(60));
+  }
+
   @Post('admin/vk-ads')
   @UseGuards(JwtGuard, AdminGuard)
   async action(@Body() body: any, @Res() res: Response) {
     if (body?.action === 'refresh') return res.status(200).json(await this.vk.fetchAndStore() ?? {});
     if (body?.action === 'summary') return res.status(200).json(await this.vk.summaryForVmm(body.window || 30));
+    if (body?.action === 'dashboard') return res.status(200).json(await this.vk.dashboardForAdmin(body.window || 60));
     return res.status(400).json({ error: 'unknown action' });
   }
 }
