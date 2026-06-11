@@ -29,6 +29,7 @@ import { EventsModule } from './events/events.module';
 import { BacklogModule } from './backlog/backlog.module';
 import { VpmModule } from './vpm/vpm.module';
 import { VmmModule } from './vmm/vmm.module';
+import { VkAdsModule } from './vk-ads/vk-ads.module';
 import { OfferModule } from './offer/offer.module';
 import { TgBotModule } from './tg-bot/tg-bot.module';
 
@@ -64,6 +65,7 @@ import { TgBotModule } from './tg-bot/tg-bot.module';
     BacklogModule,
     VpmModule,
     VmmModule,
+    VkAdsModule,
     OfferModule,
     TgBotModule,
   ],

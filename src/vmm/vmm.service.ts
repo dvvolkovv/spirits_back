@@ -3,6 +3,7 @@ import { PgService } from '../common/services/pg.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { BacklogService, BacklogItem } from '../backlog/backlog.service';
 import { PersonasService } from '../monitoring/product/personas.service';
+import { VkAdsService } from '../vk-ads/vk-ads.service';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -65,6 +66,7 @@ export class VmmService implements OnModuleInit {
     private readonly claude: ClaudeCliService,
     private readonly backlog: BacklogService,
     private readonly personas: PersonasService,
+    private readonly vkAds: VkAdsService,
   ) {}
 
   async onModuleInit() {
@@ -255,6 +257,15 @@ export class VmmService implements OnModuleInit {
       };
     } catch { /* silent */ }
 
+    // 6b. VK Реклама — реальные метрики кампаний по креативу (показы/клики/расход/
+    // CTR/CPC) за 14 дней, сопоставленные с нашими регистрациями/оплатами через
+    // utm_campaign/utm_content (signup_campaign) → CPR по креативу. Это даёт
+    // маркетологу фактические данные платного канала, а не только наши события.
+    try {
+      const vk = await this.vkAds.summaryForVmm(14);
+      if (vk && vk.configured !== false) snapshot.vk_ads = vk;
+    } catch { /* silent */ }
+
     // 7. Чтобы не предлагать дубли — недавний бэклог и прошлые рекомендации маркетолога.
     try {
       const recentProposed = await this.pg.query(
@@ -293,7 +304,8 @@ export class VmmService implements OnModuleInit {
       'Твоя задача: посмотреть на снимок маркетинга (ниже) и предложить **3–7 конкретных задач** по маркетингу на ближайшие 1–2 недели. Это могут быть: выбор/тест каналов привлечения, UTM-разметка и измеримость до запуска рекламы, креативы/мессседжи под конкретные персоны, лендинг/оффер, активация и удержание новых юзеров, монетизация, конкретные эксперименты.',
       '',
       'Правила:',
-      '- Опирайся на конкретные цифры из snapshot (acquisition, registrations_by_source, monetization, signup_cohorts, personas). В rationale_md явно укажи, на что смотришь.',
+      '- Опирайся на конкретные цифры из snapshot (acquisition, registrations_by_source, monetization, signup_cohorts, personas, vk_ads). В rationale_md явно укажи, на что смотришь.',
+      '- Если есть `vk_ads` (данные VK Рекламы по креативу: показы/клики/расход/CTR/CPC + связка с регистрациями/оплатами и CPR) — анализируй их в первую очередь для решений по платному каналу: какой креатив масштабировать (низкий CPC/CPR, высокий CTR), какой выключить, где не хватает конверсии в регистрацию/оплату несмотря на клики. Не делай выводов по креативу с горсткой кликов — отметь, что данных мало.',
       '- Сегментируй: предлагай под конкретные `personas` (кто платит, у кого retention, к каким ассистентам идут) — какой канал и какое сообщение под какую персону, а не «в среднем».',
       '- Помни про раннюю стадию (см. context_note): не строй выводов из шума на крошечном N; если данных мало — предложи дешёвый эксперимент/замер, а не дорогую кампанию вслепую.',
       '- Для рекламы цени ИЗМЕРИМОСТЬ: размечать кампании UTM, что именно мерить (CAC, конверсия в активацию/оплату по каналу), какие события не хватает трекать — заведи это задачей, если нужно.',

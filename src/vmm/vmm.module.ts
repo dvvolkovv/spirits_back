@@ -4,9 +4,10 @@ import { VmmService } from './vmm.service';
 import { PersonasService } from '../monitoring/product/personas.service';
 import { CommonModule } from '../common/common.module';
 import { BacklogModule } from '../backlog/backlog.module';
+import { VkAdsModule } from '../vk-ads/vk-ads.module';
 
 @Module({
-  imports: [CommonModule, BacklogModule],
+  imports: [CommonModule, BacklogModule, VkAdsModule],
   controllers: [VmmController],
   // PersonasService — stateless query service (deps: PgService only), provided
   // here directly so the marketing snapshot can include persona segments without
