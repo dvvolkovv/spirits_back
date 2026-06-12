@@ -54,16 +54,35 @@ export class OfferService implements OnModuleInit {
     return r.rows.length > 0;
   }
 
+  // Время первого сообщения пользователя (для триггера «после first_chat»).
+  async firstChatAt(userId: string): Promise<Date | null> {
+    const r = await this.pg.query(
+      `SELECT min(created_at) AS t FROM custom_chat_history
+        WHERE sender_type = 'human' AND (session_id = $1 OR session_id LIKE $1 || '\\_%')`,
+      [userId],
+    );
+    return r.rows[0]?.t ? new Date(r.rows[0].t) : null;
+  }
+
   async status(userId: string) {
-    const [n, paid, prof] = await Promise.all([
+    const [n, paid, prof, firstChat] = await Promise.all([
       this.messageCount(userId),
       this.hasPaid(userId),
       this.pg.query(`SELECT offer_dismissed_at FROM ai_profiles_consolidated WHERE user_id = $1`, [userId]),
+      this.firstChatAt(userId),
     ]);
     const dismissedAt = prof.rows[0]?.offer_dismissed_at;
     const inCooldown = dismissedAt ? Date.now() - new Date(dismissedAt).getTime() < COOLDOWN_MS : false;
+    // +50%-оффер: вовлечённому неплатящему (>= порога сообщений).
     const eligible = n >= OFFER_MSG_THRESHOLD && !paid && !inCooldown;
-    return { eligible, bonus_pct: OFFER_BONUS_PCT, message_count: n };
+    // Триггер «после first_chat» (c732734f): лёгкий in-app нудж к первой оплате
+    // для тех, кто пообщался ≥3ч назад, но не дотянул до +50%-оффера и не платил.
+    // Без обещания бонуса — финансовые условия не меняем.
+    const FIRST_CHAT_DELAY_MS = 3 * 3600e3;
+    const firstChatNudge =
+      !paid && !inCooldown && !eligible && n >= 1 &&
+      !!firstChat && Date.now() - firstChat.getTime() >= FIRST_CHAT_DELAY_MS;
+    return { eligible, first_chat_nudge: firstChatNudge, bonus_pct: OFFER_BONUS_PCT, message_count: n };
   }
 
   async dismiss(userId: string) {
