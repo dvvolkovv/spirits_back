@@ -392,6 +392,12 @@ ${blocks.join('\n\n---\n\n')}
     const { prompt, quality } = body;
     if (!prompt) throw new Error('Missing prompt');
 
+    // Соотношение сторон под площадку (Imagen поддерживает фикс. набор). По
+    // умолчанию 1:1. Под рекламные форматы VK полезны 9:16 (истории/клипы),
+    // 3:4 (вертикаль в ленте), 16:9 (горизонт). Неизвестное → 1:1.
+    const ALLOWED_RATIOS = ['1:1', '3:4', '4:3', '9:16', '16:9'];
+    const aspectRatio = ALLOWED_RATIOS.includes(body?.aspect_ratio) ? body.aspect_ratio : '1:1';
+
     const apiKey = process.env.GOOGLE_AI_API_KEY;
     if (!apiKey) throw new Error('Google AI API key not configured');
 
@@ -420,7 +426,7 @@ ${blocks.join('\n\n---\n\n')}
       try {
         const imagenResp = await axios.post(
           `https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-ultra-generate-001:predict?key=${apiKey}`,
-          { instances: [{ prompt }], parameters: { sampleCount: 1, aspectRatio: '1:1', personGeneration: 'allow_adult' } },
+          { instances: [{ prompt }], parameters: { sampleCount: 1, aspectRatio, personGeneration: 'allow_adult' } },
           { headers: { 'Content-Type': 'application/json' }, timeout: 90000 },
         );
         const pred = (imagenResp.data?.predictions || [])[0];
