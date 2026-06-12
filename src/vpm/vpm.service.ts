@@ -474,7 +474,9 @@ export class VpmService implements OnModuleInit {
           ? '## Связанные метрики\n\n' + rec.related_metrics.map((m) => `- ${m}`).join('\n')
           : '',
       ].filter(Boolean).join('\n'),
-      status: 'proposed',
+      // Одобрение рекомендации = задача сразу одобрена в бэклоге (не нужно
+      // одобрять второй раз вручную — фидбэк владельца).
+      status: 'approved',
     });
     const updated = await this.pg.query(
       `UPDATE vpm_recommendations
