@@ -41,24 +41,83 @@ export class VkAdsService implements OnModuleInit {
     return !!process.env.VK_ADS_CLIENT_ID && !!process.env.VK_ADS_CLIENT_SECRET;
   }
 
-  private async getToken(): Promise<string | null> {
-    if (this.token && Date.now() < this.tokenExp - 60_000) return this.token;
-    if (!this.configured()) return null;
+  private creds() {
+    return new URLSearchParams({
+      client_id: process.env.VK_ADS_CLIENT_ID!,
+      client_secret: process.env.VK_ADS_CLIENT_SECRET!,
+    });
+  }
+
+  // VK Ads ограничивает число ОДНОВРЕМЕННО активных access-token'ов на client.
+  // Если упёрлись в лимит (token_limit_exceeded) — удаляем все токены клиента и
+  // выпускаем свежий. Токен кэшируется в памяти на 24ч, так что в норме мы
+  // выпускаем ~1 токен в сутки и до лимита не доходим; это страховка от
+  // накопления «висящих» токенов (ручные прогоны, рестарты, параллельные клиенты).
+  private async deleteAllTokens(): Promise<void> {
     try {
-      const r = await axios.post(`${API}/oauth2/token.json`,
-        new URLSearchParams({
-          grant_type: 'client_credentials',
-          client_id: process.env.VK_ADS_CLIENT_ID!,
-          client_secret: process.env.VK_ADS_CLIENT_SECRET!,
-        }).toString(),
-        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 15000 },
-      );
-      this.token = r.data?.access_token || null;
-      this.tokenExp = Date.now() + (Number(r.data?.expires_in) || 86400) * 1000;
-      return this.token;
+      const body = this.creds();
+      body.set('grant_type', 'client_credentials');
+      await axios.post(`${API}/oauth2/token/delete.json`, body.toString(),
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 15000 });
+      this.log.warn('VK Ads: deleted all client tokens to free the active-token limit');
     } catch (e: any) {
-      this.log.error(`VK Ads token failed: ${e?.response?.status || ''} ${e.message}`);
+      this.log.error(`VK Ads token/delete failed: ${e?.response?.status || ''} ${e.message}`);
+    }
+  }
+
+  private async mintToken(): Promise<string | null> {
+    const body = this.creds();
+    body.set('grant_type', 'client_credentials');
+    try {
+      const r = await axios.post(`${API}/oauth2/token.json`, body.toString(),
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 15000 });
+      if (r.data?.access_token) {
+        this.token = r.data.access_token;
+        this.tokenExp = Date.now() + (Number(r.data?.expires_in) || 86400) * 1000;
+        return this.token;
+      }
       return null;
+    } catch (e: any) {
+      const errCode = e?.response?.data?.error;
+      if (errCode === 'token_limit_exceeded') {
+        // Освобождаем слоты и пробуем один раз ещё.
+        await this.deleteAllTokens();
+        try {
+          const r2 = await axios.post(`${API}/oauth2/token.json`, body.toString(),
+            { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 15000 });
+          this.token = r2.data?.access_token || null;
+          this.tokenExp = Date.now() + (Number(r2.data?.expires_in) || 86400) * 1000;
+          return this.token;
+        } catch (e2: any) {
+          this.log.error(`VK Ads token retry failed: ${e2?.response?.data?.error || e2.message}`);
+          return null;
+        }
+      }
+      this.log.error(`VK Ads token failed: ${e?.response?.status || ''} ${errCode || e.message}`);
+      return null;
+    }
+  }
+
+  private async getToken(force = false): Promise<string | null> {
+    if (!force && this.token && Date.now() < this.tokenExp - 60_000) return this.token;
+    if (!this.configured()) return null;
+    return this.mintToken();
+  }
+
+  // GET к VK API с авто-перевыпуском токена при 401 (если токен отозвали/протух
+  // вне нашего знания — например, его удалил delete-all из-за лимита).
+  private async vkGet(url: string): Promise<any> {
+    let token = await this.getToken();
+    if (!token) throw new Error('VK Ads not configured / no token');
+    try {
+      return await axios.get(url, { headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
+    } catch (e: any) {
+      if (e?.response?.status === 401) {
+        token = await this.getToken(true);
+        if (!token) throw e;
+        return await axios.get(url, { headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
+      }
+      throw e;
     }
   }
 
@@ -70,12 +129,10 @@ export class VkAdsService implements OnModuleInit {
   }
 
   async fetchAndStore(): Promise<{ stored: number } | null> {
-    const token = await this.getToken();
-    if (!token) return null;
-    const auth = { headers: { Authorization: `Bearer ${token}` }, timeout: 20000 };
+    if (!this.configured()) return null;
 
     // 1. Баннеры + utm-маппинг (utm_content/utm_campaign из url объявления).
-    const bres = await axios.get(`${API}/banners.json?fields=id,name,urls,ad_plan_id&limit=200`, auth);
+    const bres = await this.vkGet(`${API}/banners.json?fields=id,name,urls,ad_plan_id&limit=200`);
     const banners: any[] = bres.data?.items || [];
     if (!banners.length) return { stored: 0 };
     const utm = new Map<number, { campaign: string | null; content: string | null; adPlan: number | null }>();
@@ -94,8 +151,8 @@ export class VkAdsService implements OnModuleInit {
     const today = Date.now();
     const dateFrom = fmt(today - day);
     const dateTo = fmt(today);
-    const sres = await axios.get(
-      `${API}/statistics/banners/day.json?id=${ids}&date_from=${dateFrom}&date_to=${dateTo}`, auth,
+    const sres = await this.vkGet(
+      `${API}/statistics/banners/day.json?id=${ids}&date_from=${dateFrom}&date_to=${dateTo}`,
     );
     const items: any[] = sres.data?.items || [];
 
