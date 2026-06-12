@@ -281,6 +281,14 @@ export class VpmService implements OnModuleInit {
       };
     } catch { /* silent */ }
 
+    // Сессии на пользователя + разбивка сессий по персонам (b6ec07e2): глубина
+    // вовлечения по сегментам — кто возвращается в новые диалоги, а кто заходит раз.
+    try {
+      const sbp = await this.personas.sessionsByPersona();
+      if (snapshot.funnel) snapshot.funnel.avg_sessions_per_user = sbp.avgSessionsPerUser;
+      snapshot.sessions_by_persona = sbp.byPersona;
+    } catch { /* silent */ }
+
     snapshot.baseline_note =
       'usage.* (chat_calls_7d/30d, active_users_7d) come from the events table, where chat instrumentation ' +
       'started 2026-06-01 — so chat_calls_7d == chat_calls_30d is EXPECTED until 30d of events accrue, not a bug. ' +

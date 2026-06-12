@@ -354,4 +354,80 @@ export class PersonasService implements OnModuleInit {
     };
     return { ...snap, lastRun };
   }
+
+  // Разбивка сессий (диалогов user×assistant из custom_chat_history) по персонам
+  // + avg sessions/user. Переиспользует ту же rule-based классификацию (msg/gen/
+  // pay/classified), что и персоны, и джойнит к сессиям. Для snapshot VPM (b6ec07e2).
+  async sessionsByPersona(): Promise<{
+    avgSessionsPerUser: number | null;
+    totalSessions: number;
+    byPersona: Array<{ persona: PersonaKey; users: number; sessions: number; avgSessionsPerUser: number | null; avgMsgsPerSession: number | null }>;
+  }> {
+    const sql = `
+      WITH
+      msg AS (
+        SELECT e.user_id, COUNT(*) AS total_msgs,
+               SUM(CASE WHEN a.category='business' THEN 1 ELSE 0 END)::numeric AS biz_msgs,
+               SUM(CASE WHEN a.category='personal' THEN 1 ELSE 0 END)::numeric AS per_msgs,
+               SUM(CASE WHEN a.category='smm'      THEN 1 ELSE 0 END)::numeric AS smm_msgs
+          FROM events e LEFT JOIN agents a ON a.id::text = (e.props->>'assistant_id')
+         WHERE e.name='message_sent' AND e.user_id IS NOT NULL
+           AND e.user_id <> ALL($1::text[])
+           AND e.user_id NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
+         GROUP BY e.user_id
+      ),
+      gen AS (
+        SELECT user_id, SUM(c) AS gen_count FROM (
+          SELECT user_id, COUNT(*) AS c FROM generated_images GROUP BY 1
+          UNION ALL SELECT user_id, COUNT(*) AS c FROM video_jobs GROUP BY 1
+        ) x GROUP BY 1
+      ),
+      classified AS (
+        SELECT m.user_id,
+          CASE
+            WHEN COALESCE(g.gen_count,0) >= 5      THEN 'content_creator'
+            WHEN m.smm_msgs / m.total_msgs >= 0.40 THEN 'smm'
+            WHEN m.biz_msgs / m.total_msgs >= 0.40 THEN 'business'
+            WHEN m.per_msgs / m.total_msgs >= 0.40 THEN 'personal_growth'
+            WHEN m.total_msgs < 5                  THEN 'curious'
+            ELSE 'mixed'
+          END AS persona
+        FROM msg m LEFT JOIN gen g ON g.user_id = m.user_id
+      ),
+      sessions AS (
+        SELECT split_part(session_id,'_',1) AS uid, session_id, COUNT(*) AS msgs
+          FROM custom_chat_history
+         WHERE sender_type='human'
+         GROUP BY session_id
+      )
+      SELECT c.persona,
+             COUNT(DISTINCT c.user_id)::int AS users,
+             COUNT(s.session_id)::int AS sessions,
+             round(COUNT(s.session_id)::numeric / NULLIF(COUNT(DISTINCT c.user_id),0), 2) AS avg_sessions_per_user,
+             round(AVG(s.msgs)::numeric, 1) AS avg_msgs_per_session
+        FROM classified c
+        LEFT JOIN sessions s ON s.uid = c.user_id
+       GROUP BY c.persona
+       ORDER BY sessions DESC NULLS LAST`;
+    try {
+      const r = await this.pg.query(sql, [excluded]);
+      const byPersona = r.rows.map((x: any) => ({
+        persona: x.persona as PersonaKey,
+        users: Number(x.users) || 0,
+        sessions: Number(x.sessions) || 0,
+        avgSessionsPerUser: x.avg_sessions_per_user != null ? Number(x.avg_sessions_per_user) : null,
+        avgMsgsPerSession: x.avg_msgs_per_session != null ? Number(x.avg_msgs_per_session) : null,
+      }));
+      const totalSessions = byPersona.reduce((s, p) => s + p.sessions, 0);
+      const totalUsers = byPersona.reduce((s, p) => s + p.users, 0);
+      return {
+        avgSessionsPerUser: totalUsers > 0 ? Math.round((totalSessions / totalUsers) * 100) / 100 : null,
+        totalSessions,
+        byPersona,
+      };
+    } catch (e: any) {
+      this.log.error(`sessionsByPersona failed: ${e.message}`);
+      return { avgSessionsPerUser: null, totalSessions: 0, byPersona: [] };
+    }
+  }
 }
