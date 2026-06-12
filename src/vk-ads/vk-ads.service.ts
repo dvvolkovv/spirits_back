@@ -249,6 +249,38 @@ export class VkAdsService implements OnModuleInit {
     };
   }
 
+  // Достаём из объявления его наполнение для предпросмотра в админке: тексты,
+  // ссылки на картинки (по форматам), видео и куда ведёт объявление.
+  private bannerContent(b: any): { landingUrl: string | null; texts: any; images: any[]; video: string | null } {
+    const tb = b.textblocks || {};
+    const content = b.content || {};
+    const pickUrl = (slot: string): string | null => {
+      const v = content[slot]?.variants as Record<string, any> | undefined;
+      if (!v) return null;
+      return v.original?.url || v.uploaded?.url || (Object.values(v).find((x: any) => x?.url) as any)?.url || null;
+    };
+    const images: any[] = [];
+    for (const slot of ['image_1080x1350', 'image_607x1080', 'image_1080x607', 'image_600x600']) {
+      const url = pickUrl(slot);
+      if (url) images.push({ slot, url });
+    }
+    let video: string | null = null;
+    for (const slot of ['video_portrait_9_16_30s', 'video_portrait_9_16_180s', 'video_portrait_4_5_30s', 'video_landscape_180s']) {
+      const url = pickUrl(slot);
+      if (url) { video = url; break; }
+    }
+    return {
+      landingUrl: b.urls?.primary?.url || null,
+      texts: {
+        title: tb.title_40_vkads?.text || tb.title_30_additional?.text || null,
+        text90: tb.text_90?.text || null,
+        textLong: tb.text_long?.text || null,
+      },
+      images,
+      video,
+    };
+  }
+
   // Полная сводка для админ-вкладки «Реклама»: кампании → объявления с РЕАЛЬНЫМ
   // статусом (активна/пауза/модерация/завершена), доставкой и датами из VK +
   // расход/метрики из нашей БД + связка с регистрациями/оплатами (signup_campaign).
@@ -261,7 +293,7 @@ export class VkAdsService implements OnModuleInit {
       try {
         const pr = await this.vkGet(`${API}/ad_plans.json?limit=100&fields=id,name,status,delivery,date_start,date_end,budget_limit_day`);
         plans = pr.data?.items || [];
-        const br = await this.vkGet(`${API}/banners.json?limit=200&fields=id,name,ad_plan_id,status,moderation_status,delivery,urls`);
+        const br = await this.vkGet(`${API}/banners.json?limit=200&fields=id,name,ad_plan_id,status,moderation_status,delivery,urls,content,textblocks`);
         banners = br.data?.items || [];
       } catch (e: any) {
         this.log.warn(`vk-ads dashboard: live meta fetch failed: ${e.message}`);
@@ -325,6 +357,7 @@ export class VkAdsService implements OnModuleInit {
             shows, clicks, goals: Number(st.goals) || 0, spent,
             ...calc(shows, clicks, spent, regs),
             registrations: regs, payers: Number(rk.payers) || 0,
+            ...this.bannerContent(b),
           };
           const key = String(p.id);
           if (!campaigns.has(key)) {
