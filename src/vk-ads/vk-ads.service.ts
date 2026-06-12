@@ -225,84 +225,160 @@ export class VkAdsService implements OnModuleInit {
     }
   }
 
-  // Полная сводка для админ-вкладки «Реклама»: кампании → объявления, период
-  // (по датам с данными), расход и метрики эффективности + связка с нашими
-  // регистрациями/оплатами через signup_campaign (= utm_campaign/utm_content).
+  // Состояние кампании/объявления для UI — берём из живых метаданных VK, а не из
+  // наличия статистики (иначе пауза/завершённая выглядят как активные).
+  private planState(p: any, today: string): string {
+    if (p.date_end && today > p.date_end) return 'finished';
+    if (p.status === 'blocked') return 'paused';
+    if (p.delivery === 'delivering') return 'delivering';
+    return 'active_idle'; // активна, но показов нет (до старта / модерация / нет ставки)
+  }
+  private bannerState(b: any): string {
+    const m = b.moderation_status;
+    if (m === 'pending') return 'moderation';
+    if (m === 'banned' || m === 'rejected' || m === 'declined') return 'rejected';
+    if (b.status === 'blocked') return 'paused';
+    if (b.delivery === 'delivering') return 'delivering';
+    return 'idle';
+  }
+  private utmOf(b: any): { campaign: string | null; content: string | null } {
+    const blob = JSON.stringify(b.urls ?? b);
+    return {
+      campaign: blob.match(/utm_campaign=([A-Za-z0-9_]+)/)?.[1] ?? null,
+      content: blob.match(/utm_content=([A-Za-z0-9_]+)/)?.[1] ?? null,
+    };
+  }
+
+  // Полная сводка для админ-вкладки «Реклама»: кампании → объявления с РЕАЛЬНЫМ
+  // статусом (активна/пауза/модерация/завершена), доставкой и датами из VK +
+  // расход/метрики из нашей БД + связка с регистрациями/оплатами (signup_campaign).
   async dashboardForAdmin(windowDays = 60): Promise<any> {
     if (!this.configured()) return { configured: false };
     try {
-      // 1. По объявлению (creative) за окно: метрики рекламы + период.
-      const creatives = await this.pg.query(
-        `SELECT utm_campaign, utm_content,
-                min(banner_id) AS banner_id,
+      // 1. Живые метаданные из VK — источник правды по статусу/датам/доставке.
+      let plans: any[] = [];
+      let banners: any[] = [];
+      try {
+        const pr = await this.vkGet(`${API}/ad_plans.json?limit=100&fields=id,name,status,delivery,date_start,date_end,budget_limit_day`);
+        plans = pr.data?.items || [];
+        const br = await this.vkGet(`${API}/banners.json?limit=200&fields=id,name,ad_plan_id,status,moderation_status,delivery,urls`);
+        banners = br.data?.items || [];
+      } catch (e: any) {
+        this.log.warn(`vk-ads dashboard: live meta fetch failed: ${e.message}`);
+      }
+
+      // 2. Статистика по banner_id за окно (из нашей БД).
+      const statsRes = await this.pg.query(
+        `SELECT banner_id, utm_campaign, utm_content,
                 min(date) AS date_from, max(date) AS date_to,
-                SUM(shows)::int AS shows, SUM(clicks)::int AS clicks,
-                SUM(goals)::int AS goals,
-                SUM(spent)::numeric(12,2) AS spent,
-                CASE WHEN SUM(shows)>0 THEN round(100.0*SUM(clicks)/SUM(shows),2) END AS ctr,
-                CASE WHEN SUM(clicks)>0 THEN round(SUM(spent)/SUM(clicks),2) END AS cpc
+                SUM(shows)::int AS shows, SUM(clicks)::int AS clicks, SUM(goals)::int AS goals,
+                SUM(spent)::numeric(12,2) AS spent
            FROM vk_ads_stats
           WHERE date > now() - ($1 || ' days')::interval
-          GROUP BY 1,2`,
+          GROUP BY 1,2,3`,
         [String(windowDays)],
       );
+      const statByBanner = new Map<number, any>();
+      for (const s of statsRes.rows) statByBanner.set(Number(s.banner_id), s);
 
-      // 2. Наши результаты по signup_campaign (= campaign/content).
+      // 3. Регистрации/оплаты по signup_campaign (= campaign/content).
       const reg = await this.pg.query(
-        `SELECT signup_campaign,
-                COUNT(*)::int AS registrations,
+        `SELECT signup_campaign, COUNT(*)::int AS registrations,
                 COUNT(*) FILTER (WHERE user_id IN (SELECT user_id FROM payments WHERE status='succeeded'))::int AS payers
            FROM ai_profiles_consolidated
           WHERE signup_campaign IS NOT NULL AND signup_campaign <> ''
           GROUP BY 1`,
       );
-      const regByKey = new Map<string, { registrations: number; payers: number }>();
-      for (const r of reg.rows) regByKey.set(r.signup_campaign, { registrations: r.registrations, payers: r.payers });
+      const regByKey = new Map<string, any>();
+      for (const r of reg.rows) regByKey.set(r.signup_campaign, r);
 
-      // 3. Последняя выгрузка (для отображения «обновлено» и свежести cron).
       const fetched = await this.pg.query(`SELECT max(fetched_at) AS last FROM vk_ads_stats`);
       const lastFetchedAt = fetched.rows[0]?.last ?? null;
+      const today = new Date(Date.now()).toISOString().slice(0, 10);
 
-      // 4. Собираем дерево кампания → объявления.
+      const calc = (shows: number, clicks: number, spent: number, regs: number) => ({
+        ctr: shows > 0 ? Math.round((10000 * clicks) / shows) / 100 : null,
+        cpc: clicks > 0 ? Math.round((spent / clicks) * 100) / 100 : null,
+        cpr: regs > 0 ? Math.round((spent / regs) * 100) / 100 : null,
+      });
+
       const campaigns = new Map<string, any>();
-      for (const c of creatives.rows) {
-        const camp = c.utm_campaign || '(без кампании)';
-        const key = `${c.utm_campaign}/${c.utm_content}`;
-        const rk = regByKey.get(key) || { registrations: 0, payers: 0 };
-        const spent = Number(c.spent) || 0;
-        const creative = {
-          content: c.utm_content || '(без метки)',
-          bannerId: c.banner_id,
-          dateFrom: c.date_from, dateTo: c.date_to,
-          shows: c.shows, clicks: c.clicks, goals: c.goals,
-          spent, ctr: c.ctr != null ? Number(c.ctr) : null, cpc: c.cpc != null ? Number(c.cpc) : null,
-          registrations: rk.registrations, payers: rk.payers,
-          cpr: rk.registrations > 0 ? Math.round((spent / rk.registrations) * 100) / 100 : null,
-        };
-        if (!campaigns.has(camp)) {
-          campaigns.set(camp, {
-            campaign: camp, channel: 'VK Реклама',
-            dateFrom: c.date_from, dateTo: c.date_to,
-            shows: 0, clicks: 0, goals: 0, spent: 0, registrations: 0, payers: 0,
-            creatives: [] as any[],
-          });
+
+      if (plans.length > 0 && banners.length > 0) {
+        // ---- Путь со статусами: группируем по ad_plan (реальная кампания) ----
+        const planById = new Map<number, any>();
+        for (const p of plans) planById.set(p.id, p);
+        for (const b of banners) {
+          const p = planById.get(b.ad_plan_id);
+          if (!p) continue;
+          const utm = this.utmOf(b);
+          const st = statByBanner.get(Number(b.id)) || {};
+          const shows = Number(st.shows) || 0, clicks = Number(st.clicks) || 0, spent = Number(st.spent) || 0;
+          const regKey = utm.campaign && utm.content ? `${utm.campaign}/${utm.content}` : null;
+          const rk = (regKey && regByKey.get(regKey)) || { registrations: 0, payers: 0 };
+          const regs = Number(rk.registrations) || 0;
+          const creative = {
+            content: utm.content || b.name || `#${b.id}`,
+            bannerId: b.id,
+            state: this.bannerState(b),
+            status: b.status ?? null, moderationStatus: b.moderation_status ?? null, delivery: b.delivery ?? null,
+            shows, clicks, goals: Number(st.goals) || 0, spent,
+            ...calc(shows, clicks, spent, regs),
+            registrations: regs, payers: Number(rk.payers) || 0,
+          };
+          const key = String(p.id);
+          if (!campaigns.has(key)) {
+            campaigns.set(key, {
+              campaign: utm.campaign || p.name, planId: p.id, planName: p.name, channel: 'VK Реклама',
+              state: this.planState(p, today), status: p.status ?? null, delivery: p.delivery ?? null,
+              dateFrom: p.date_start ?? null, dateTo: p.date_end ?? null,
+              budgetDay: p.budget_limit_day != null ? Number(p.budget_limit_day) : null,
+              shows: 0, clicks: 0, goals: 0, spent: 0, registrations: 0, payers: 0, creatives: [] as any[],
+            });
+          }
+          const cc = campaigns.get(key);
+          if ((cc.campaign === p.name) && utm.campaign) cc.campaign = utm.campaign;
+          cc.creatives.push(creative);
+          cc.shows += shows; cc.clicks += clicks; cc.goals += creative.goals;
+          cc.spent += spent; cc.registrations += regs; cc.payers += creative.payers;
         }
-        const cc = campaigns.get(camp);
-        cc.creatives.push(creative);
-        cc.shows += creative.shows; cc.clicks += creative.clicks; cc.goals += creative.goals;
-        cc.spent += spent; cc.registrations += rk.registrations; cc.payers += rk.payers;
-        if (c.date_from < cc.dateFrom) cc.dateFrom = c.date_from;
-        if (c.date_to > cc.dateTo) cc.dateTo = c.date_to;
+      } else {
+        // ---- Fallback (VK-мета недоступна): группируем по utm_campaign из БД, без статуса ----
+        for (const s of statsRes.rows) {
+          if (!s.utm_content) continue;
+          const camp = s.utm_campaign || '(без кампании)';
+          const shows = Number(s.shows) || 0, clicks = Number(s.clicks) || 0, spent = Number(s.spent) || 0;
+          const rk = regByKey.get(`${s.utm_campaign}/${s.utm_content}`) || { registrations: 0, payers: 0 };
+          const regs = Number(rk.registrations) || 0;
+          if (!campaigns.has(camp)) {
+            campaigns.set(camp, {
+              campaign: camp, planId: null, planName: null, channel: 'VK Реклама',
+              state: 'unknown', status: null, delivery: null,
+              dateFrom: s.date_from, dateTo: s.date_to, budgetDay: null,
+              shows: 0, clicks: 0, goals: 0, spent: 0, registrations: 0, payers: 0, creatives: [] as any[],
+            });
+          }
+          const cc = campaigns.get(camp);
+          cc.creatives.push({
+            content: s.utm_content, bannerId: Number(s.banner_id), state: 'unknown',
+            status: null, moderationStatus: null, delivery: null,
+            shows, clicks, goals: Number(s.goals) || 0, spent, ...calc(shows, clicks, spent, regs),
+            registrations: regs, payers: Number(rk.payers) || 0,
+          });
+          cc.shows += shows; cc.clicks += clicks; cc.goals += Number(s.goals) || 0;
+          cc.spent += spent; cc.registrations += regs; cc.payers += Number(rk.payers) || 0;
+          if (s.date_from < cc.dateFrom) cc.dateFrom = s.date_from;
+          if (s.date_to > cc.dateTo) cc.dateTo = s.date_to;
+        }
       }
 
+      const STATE_ORDER: Record<string, number> = { delivering: 0, active_idle: 1, moderation: 1, unknown: 2, paused: 3, finished: 4 };
       const campaignList = Array.from(campaigns.values()).map((cc) => {
         cc.spent = Math.round(cc.spent * 100) / 100;
-        cc.ctr = cc.shows > 0 ? Math.round((10000 * cc.clicks) / cc.shows) / 100 : null;
-        cc.cpc = cc.clicks > 0 ? Math.round((cc.spent / cc.clicks) * 100) / 100 : null;
-        cc.cpr = cc.registrations > 0 ? Math.round((cc.spent / cc.registrations) * 100) / 100 : null;
-        cc.creatives.sort((a: any, b: any) => b.spent - a.spent);
+        Object.assign(cc, calc(cc.shows, cc.clicks, cc.spent, cc.registrations));
+        cc.creatives.sort((a: any, b: any) => b.spent - a.spent || b.shows - a.shows);
         return cc;
-      }).sort((a, b) => b.spent - a.spent);
+      }).sort((a, b) => ((STATE_ORDER[a.state] ?? 9) - (STATE_ORDER[b.state] ?? 9)) || (b.spent - a.spent));
 
       const totals = campaignList.reduce((t, c) => ({
         shows: t.shows + c.shows, clicks: t.clicks + c.clicks,
@@ -310,7 +386,7 @@ export class VkAdsService implements OnModuleInit {
         registrations: t.registrations + c.registrations, payers: t.payers + c.payers,
       }), { shows: 0, clicks: 0, spent: 0, registrations: 0, payers: 0 });
 
-      return { configured: true, windowDays, lastFetchedAt, campaigns: campaignList, totals };
+      return { configured: true, windowDays, lastFetchedAt, liveMeta: plans.length > 0, campaigns: campaignList, totals };
     } catch (e: any) {
       this.log.warn(`vk-ads dashboardForAdmin failed: ${e.message}`);
       return { configured: true, error: e.message };
