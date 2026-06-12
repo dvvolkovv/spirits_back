@@ -4,7 +4,7 @@ import { ClaudeCliService } from '../common/services/claude-cli.service';
 import * as fs from 'fs';
 import * as path from 'path';
 
-export type BacklogStatus = 'proposed' | 'approved' | 'in_progress' | 'done' | 'rejected';
+export type BacklogStatus = 'proposed' | 'approved' | 'in_progress' | 'waiting' | 'done' | 'rejected';
 export type BacklogComplexity = 'low' | 'medium' | 'high';
 
 export interface BacklogItem {
@@ -30,7 +30,7 @@ export interface BacklogComment {
   created_at: string;
 }
 
-const ALLOWED_STATUSES: BacklogStatus[] = ['proposed', 'approved', 'in_progress', 'done', 'rejected'];
+const ALLOWED_STATUSES: BacklogStatus[] = ['proposed', 'approved', 'in_progress', 'waiting', 'done', 'rejected'];
 const ALLOWED_COMPLEXITY: BacklogComplexity[] = ['low', 'medium', 'high'];
 
 @Injectable()
@@ -43,7 +43,7 @@ export class BacklogService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
-    for (const file of ['001_backlog.sql', '002_from_ticket.sql']) {
+    for (const file of ['001_backlog.sql', '002_from_ticket.sql', '003_waiting_status.sql']) {
       const candidates = [
         path.join(__dirname, 'migrations', file),
         path.join(__dirname, '..', '..', 'src', 'backlog', 'migrations', file),

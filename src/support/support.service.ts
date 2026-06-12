@@ -187,6 +187,16 @@ export class SupportService implements OnModuleInit {
       [ticket.id],
     );
 
+    // Если по этому тикету есть задача бэклога в статусе «ожидание» (ждали ответ
+    // клиента) — клиент ответил, возвращаем задачу в работу. Fire-and-forget.
+    this.pg.query(
+      `UPDATE backlog_items SET status = 'in_progress', updated_at = now()
+        WHERE from_ticket_id = $1 AND status = 'waiting'`,
+      [ticket.id],
+    ).then((r) => {
+      if (r.rowCount) this.logger.log(`backlog: ${r.rowCount} waiting task(s) → in_progress (ticket ${ticket.id} reply)`);
+    }).catch((e) => this.logger.warn(`backlog waiting→in_progress failed: ${e.message}`));
+
     // Generate AI response only if ticket is still AI-handled.
     if (ticket.status === 'ai_handling') {
       this.generateAiResponse(ticket.id, userId).catch((e) =>
