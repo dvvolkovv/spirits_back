@@ -21,4 +21,15 @@ export class ReferralController {
     const result = await this.referralService.getStats(user.userId);
     return res.status(200).json(result);
   }
+
+  // Вывод накопленных комиссий токенами на баланс (мгновенно).
+  @Post('referral/payout')
+  @UseGuards(JwtGuard)
+  async payout(@CurrentUser() user: any, @Body() body: { method?: string }, @Res() res: Response) {
+    if (body?.method && body.method !== 'tokens') {
+      return res.status(400).json({ error: 'Поддерживается только вывод токенами' });
+    }
+    const result = await this.referralService.payoutTokens(user.userId);
+    return res.status(200).json(result);
+  }
 }

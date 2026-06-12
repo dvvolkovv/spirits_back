@@ -1,11 +1,84 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, BadRequestException } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 
+// Курс/порог вывода реферальных комиссий токенами (подтверждено владельцем).
+const PAYOUT_RATE_TOKENS_PER_RUB = 600;
+const PAYOUT_MIN_RUB = 100;
+
 @Injectable()
-export class ReferralService {
+export class ReferralService implements OnModuleInit {
   private readonly logger = new Logger(ReferralService.name);
 
   constructor(private readonly pg: PgService) {}
+
+  async onModuleInit() {
+    // Журнал выплат комиссий токенами (аудит + атомарность/идемпотентность).
+    try {
+      await this.pg.query(`
+        CREATE TABLE IF NOT EXISTS referral_token_payouts (
+          id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+          leader_id uuid NOT NULL,
+          user_phone varchar(20) NOT NULL,
+          rub numeric(10,2) NOT NULL,
+          tokens integer NOT NULL,
+          rate integer NOT NULL,
+          commission_ids uuid[] NOT NULL,
+          created_at timestamptz DEFAULT now()
+        )`);
+    } catch (e: any) {
+      this.logger.error(`referral_token_payouts migration failed: ${e.message}`);
+    }
+  }
+
+  // Вывод накопленных невыплаченных комиссий ТОКЕНАМИ на баланс (мгновенно,
+  // без модерации — внутренняя операция). Атомарно: зачисление токенов +
+  // пометка комиссий paid_out + запись в журнал, в одной транзакции.
+  async payoutTokens(userId: string): Promise<{ rub: number; tokens: number; newBalance: number }> {
+    const leaderRes = await this.pg.query('SELECT id FROM referral_leaders WHERE user_phone = $1 LIMIT 1', [userId]);
+    const leaderId = leaderRes.rows[0]?.id;
+    if (!leaderId) throw new BadRequestException('Реферальный аккаунт не найден');
+
+    const client = await this.pg.getClient();
+    try {
+      await client.query('BEGIN');
+      // Блокируем невыплаченные комиссии этого лидера, чтобы исключить двойной вывод.
+      const unpaid = await client.query(
+        `SELECT id, commission_rub FROM referral_commissions
+          WHERE leader_id = $1 AND paid_out = false FOR UPDATE`,
+        [leaderId],
+      );
+      const rub = Math.round(unpaid.rows.reduce((s, r) => s + (Number(r.commission_rub) || 0), 0) * 100) / 100;
+      if (rub < PAYOUT_MIN_RUB) {
+        await client.query('ROLLBACK');
+        throw new BadRequestException(`Минимум для вывода — ${PAYOUT_MIN_RUB} ₽ (у вас ${rub} ₽)`);
+      }
+      const tokens = Math.round(rub * PAYOUT_RATE_TOKENS_PER_RUB);
+      const ids = unpaid.rows.map((r) => r.id);
+
+      const bal = await client.query(
+        'UPDATE ai_profiles_consolidated SET tokens = COALESCE(tokens,0) + $1 WHERE user_id = $2 RETURNING tokens',
+        [tokens, userId],
+      );
+      if (!bal.rows[0]) {
+        await client.query('ROLLBACK');
+        throw new BadRequestException('Профиль не найден для зачисления токенов');
+      }
+      await client.query('UPDATE referral_commissions SET paid_out = true WHERE id = ANY($1)', [ids]);
+      await client.query(
+        `INSERT INTO referral_token_payouts (leader_id, user_phone, rub, tokens, rate, commission_ids)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [leaderId, userId, rub, tokens, PAYOUT_RATE_TOKENS_PER_RUB, ids],
+      );
+      await client.query('COMMIT');
+      this.logger.log(`referral payout tokens: ${userId} ${rub}₽ → ${tokens} tokens`);
+      return { rub, tokens, newBalance: Number(bal.rows[0].tokens) || 0 };
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
 
   async register(userId: string, slug: string) {
     const leader = await this.pg.query(
