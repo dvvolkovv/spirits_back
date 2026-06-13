@@ -57,11 +57,17 @@ const EXPECTED: ExpectedModel[] = [
   { provider: 'Kling',      model: 'kling-v2-master',kind: 'video', purpose: 'Премиум видео-движок (лучше для лиц)',                       caller: 'video.createJob (quality=master)', via: 'API key' },
   { provider: 'Kling',      model: 'kling-extend',   kind: 'video', purpose: 'Расширение существующего видео (+5с за вызов) для composed long-form', caller: 'video.advanceComposedJob → kling.createVideoExtendTask', via: 'API key' },
   { provider: 'Kling',      model: 'kling-lipsync',  kind: 'video', purpose: 'Лип-синк аудио → видео (создать или продолжить)',                       caller: 'video.createJob (mode=lipsync) → kling.createLipSyncTask', via: 'API key' },
+  { provider: 'Google',     model: 'veo-3.1-generate-preview', kind: 'video', purpose: 'Veo 3.1 — генерация видео (9:16/16:9, talking-head, длинные ролики concat). Стоимость — оценка (см. VEO_EST_USD_PER_CALL)', caller: 'video.createJob (model=veo-3.1) → veo.generate', via: 'API key' },
 
   // ---- TTS (audio) ----
   { provider: 'ElevenLabs',     model: 'eleven_multilingual_v2', kind: 'audio', purpose: 'TTS для голосов hero/lawyer/coach/psy в SMM-пайпе', caller: 'smm-worker → ElevenLabs API', via: 'API key' },
   { provider: 'Yandex SpeechKit', model: 'yandexcloud-tts-v1',  kind: 'audio', purpose: 'TTS fallback для SMM-видео когда ElevenLabs не нужен', caller: 'smm-worker → speech.synthesize', via: 'API key' },
 ];
+
+// Veo не логирует стоимость в событии veo_call, поэтому оцениваем расход как
+// число вызовов × оценочную цену одного 8-сек клипа. ГРУБАЯ ОЦЕНКА — уточнить
+// по реальному биллингу Google Veo 3.1 и поправить это число.
+const VEO_EST_USD_PER_CALL = 2.0;
 
 interface DynamicCounts {
   calls_30d: number;
@@ -199,6 +205,15 @@ export class ModelsRegistryService implements OnModuleInit {
                     0::float AS cost_usd_30d,
                     MAX(ts) AS last_seen
                FROM events WHERE name = 'kling_call'
+               GROUP BY 1
+             UNION ALL
+             SELECT COALESCE(props->>'model', 'unknown') AS model,
+                    COUNT(*) FILTER (WHERE ts > now() - interval '24 hours')::int AS calls_24h,
+                    COUNT(*) FILTER (WHERE ts > now() - interval '30 days')::int  AS calls_30d,
+                    -- Veo не отдаёт стоимость в событии → оцениваем: вызовы × оценка/клип.
+                    (COUNT(*) FILTER (WHERE ts > now() - interval '30 days') * ${VEO_EST_USD_PER_CALL})::float AS cost_usd_30d,
+                    MAX(ts) AS last_seen
+               FROM events WHERE name = 'veo_call' AND COALESCE((props->>'ok')::boolean, true) = true
                GROUP BY 1
            ) sub
            GROUP BY model`,
