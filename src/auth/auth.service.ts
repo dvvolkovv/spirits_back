@@ -25,7 +25,7 @@ export class AuthService {
     @Optional() private readonly events?: EventsService,
   ) {}
 
-  async requestSmsCode(phone: string): Promise<{ status: string }> {
+  async requestSmsCode(phone: string, sid?: string | null, src?: string | null): Promise<{ status: string }> {
     // Check if code already exists in Redis
     const existing = await this.redis.get(`sc-${phone}`);
     if (existing) {
@@ -60,7 +60,10 @@ export class AuthService {
       await this.sendSms(phone, code);
     }
 
-    this.events?.track('otp_request', { userId: phone, props: { channel: 'sms', sent: !isTest } });
+    // sid/src прокидываются с фронта (?sid=&src=) — чтобы шаг регистрации был
+    // привязан к рекламной сессии и источнику (раньше otp_* шли без атрибуции,
+    // и пост-клик воронка была слепой).
+    this.events?.track('otp_request', { userId: phone, sessionId: sid || null, source: src || null, props: { channel: 'sms', sent: !isTest } });
 
     return { status: 'sent' };
   }
@@ -122,7 +125,7 @@ export class AuthService {
     }
   }
 
-  async checkCode(phone: string, code: string): Promise<{ 'access-token': string; 'refresh-token': string; 'is-new-user': boolean } | null> {
+  async checkCode(phone: string, code: string, sid?: string | null, src?: string | null): Promise<{ 'access-token': string; 'refresh-token': string; 'is-new-user': boolean } | null> {
     const stored = await this.redis.get(`sc-${phone}`);
     if (!stored) return null; // expired
     if (stored !== code) return null; // wrong code
@@ -134,7 +137,7 @@ export class AuthService {
     // we only emit the SMS-specific otp_verified.
     const { userId, isNew } = await this.identity.resolveOrCreate('phone', { phone });
 
-    this.events?.track('otp_verified', { userId, props: { channel: 'sms' } });
+    this.events?.track('otp_verified', { userId, sessionId: sid || null, source: src || null, props: { channel: 'sms' } });
 
     return {
       'access-token': this.jwtSvc.signAccess(userId),

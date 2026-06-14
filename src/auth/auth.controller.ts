@@ -31,8 +31,13 @@ export class AuthController {
 
   // SMS OTP request — UUID hardcoded to match frontend
   @Get('898c938d-f094-455c-86af-969617e62f7a/sms/:phone')
-  async sendSms(@Param('phone') phone: string, @Res() res: Response) {
-    const result = await this.authService.requestSmsCode(phone);
+  async sendSms(
+    @Param('phone') phone: string,
+    @Query('sid') sid: string,
+    @Query('src') src: string,
+    @Res() res: Response,
+  ) {
+    const result = await this.authService.requestSmsCode(phone, sid, src);
     if (result.status === 'blocked') {
       return res.set(CORS).status(403).send('User blocked');
     }
@@ -44,9 +49,11 @@ export class AuthController {
   async checkCode(
     @Param('phone') phone: string,
     @Param('code') code: string,
+    @Query('sid') sid: string,
+    @Query('src') src: string,
     @Res() res: Response,
   ) {
-    const tokens = await this.authService.checkCode(phone, code);
+    const tokens = await this.authService.checkCode(phone, code, sid, src);
     if (!tokens) {
       return res.set(CORS).status(401).json({ error: 'Invalid or expired code' });
     }
