@@ -22,12 +22,13 @@ import { JobsMonitorService } from './jobs-monitor.service';
 import { ReplicationHealthService } from './replication-health.service';
 import { NeoSnapshotHealthService } from './neo-snapshot-health.service';
 import { MinioMirrorHealthService } from './minio-mirror-health.service';
+import { GeoAvailabilityService } from './geo-availability.service';
 import { CommonModule } from '../common/common.module';
 import { Neo4jModule } from '../neo4j/neo4j.module';
 
 @Module({
   imports: [CommonModule, Neo4jModule],
   controllers: [MonitoringController],
-  providers: [MonitoringService, LogsService, SyntheticService, FunnelService, EconomyService, QualityService, ProfileDepthService, SummaryService, NetworkingService, ChurnService, SupportService, ContentService, PersonasService, AttributionService, SmsHealthService, ClaudeHealthService, BackupHealthService, ModelsRegistryService, JobsMonitorService, ReplicationHealthService, NeoSnapshotHealthService, MinioMirrorHealthService],
+  providers: [MonitoringService, LogsService, SyntheticService, FunnelService, EconomyService, QualityService, ProfileDepthService, SummaryService, NetworkingService, ChurnService, SupportService, ContentService, PersonasService, AttributionService, SmsHealthService, ClaudeHealthService, BackupHealthService, ModelsRegistryService, JobsMonitorService, ReplicationHealthService, NeoSnapshotHealthService, MinioMirrorHealthService, GeoAvailabilityService],
 })
 export class MonitoringModule {}

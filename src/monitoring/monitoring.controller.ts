@@ -17,6 +17,7 @@ import { PersonasService } from './product/personas.service';
 import { AttributionService } from './product/attribution.service';
 import { SmsHealthService } from './sms-health.service';
 import { ClaudeHealthService } from './claude-health.service';
+import { GeoAvailabilityService } from './geo-availability.service';
 import { BackupHealthService } from './backup-health.service';
 import { ModelsRegistryService } from './models-registry.service';
 import { JobsMonitorService } from './jobs-monitor.service';
@@ -51,6 +52,7 @@ export class MonitoringController {
     private readonly attribution: AttributionService,
     private readonly smsHealth: SmsHealthService,
     private readonly claudeHealth: ClaudeHealthService,
+    private readonly geo: GeoAvailabilityService,
     private readonly backupHealth: BackupHealthService,
     private readonly models: ModelsRegistryService,
     private readonly jobs: JobsMonitorService,
@@ -127,6 +129,16 @@ export class MonitoringController {
       return res.status(200).json(data);
     } catch (e: any) {
       return res.status(500).json({ error: 'claude_failed', message: e?.message || String(e) });
+    }
+  }
+
+  @Get('admin/monitoring/tech/geo')
+  @UseGuards(JwtGuard, AdminGuard)
+  async geoOverview(@Res() res: Response) {
+    try {
+      return res.status(200).json(await this.geo.getLatest());
+    } catch (e: any) {
+      return res.status(500).json({ error: 'geo_failed', message: e?.message || String(e) });
     }
   }
 
