@@ -96,6 +96,54 @@ export class FunnelService {
     });
   }
 
+  // ── Платёжные шаги берём из таблицы payments (источник истины, совпадает с
+  // разделом «Платежи»), а НЕ из событий payment_success: события эмитятся
+  // ненадёжно (часть исторических оплат и путей подтверждения их не писала),
+  // из-за чего «Вторая оплата» показывала 0 при реальных повторных оплатах.
+  // source-фильтр — через signup_source профиля (у payments своей метки нет).
+  private paymentInWindow(succeededOnly: boolean): StepDef['query'] {
+    return (from, to, source, excluded) => {
+      const dateCol = succeededOnly ? 'COALESCE(completed_at, created_at)' : 'created_at';
+      const statusCond = succeededOnly ? `status = 'succeeded'` : 'TRUE';
+      const srcCond = source
+        ? `AND user_id IN (SELECT user_id FROM ai_profiles_consolidated WHERE signup_source = $4)`
+        : '';
+      return {
+        sql: `
+          SELECT user_id FROM payments
+          WHERE ${statusCond} AND user_id IS NOT NULL
+            AND ${NOT_TEST('user_id', '$3')}
+            AND ${dateCol} >= $1 AND ${dateCol} < $2
+            ${srcCond}
+          GROUP BY user_id`,
+        params: source ? [from, to, excluded, source] : [from, to, excluded],
+      };
+    };
+  }
+
+  // N-я УСПЕШНАЯ оплата пользователя (по payments), попавшая в окно.
+  private nthPaymentStep(n: number): StepDef['query'] {
+    return (from, to, source, excluded) => {
+      const srcCond = source
+        ? `AND user_id IN (SELECT user_id FROM ai_profiles_consolidated WHERE signup_source = $4)`
+        : '';
+      const nParam = source ? '$5' : '$4';
+      return {
+        sql: `
+          SELECT user_id FROM (
+            SELECT user_id, COALESCE(completed_at, created_at) AS ts,
+                   ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY COALESCE(completed_at, created_at)) AS rn
+            FROM payments
+            WHERE status = 'succeeded' AND user_id IS NOT NULL
+              AND ${NOT_TEST('user_id', '$3')}
+              ${srcCond}
+          ) t
+          WHERE rn = ${nParam} AND ts >= $1 AND ts < $2`,
+        params: source ? [from, to, excluded, source, n] : [from, to, excluded, n],
+      };
+    };
+  }
+
   private steps: StepDef[] = [
     {
       key: 'landing_view',
@@ -159,30 +207,30 @@ export class FunnelService {
     {
       key: 'payment_initiated',
       label: 'Инициировал платёж',
-      hint: 'Из вовлечённых — кто нажал «оплатить» (создан платёж). Подмножество предыдущего.',
+      hint: 'Из вовлечённых — кто создал платёж (по таблице payments, любой статус). Подмножество предыдущего.',
       identity: 'user',
-      query: this.userStep('payment_initiated'),
+      query: this.paymentInWindow(false),
     },
     {
       key: 'first_payment_success',
       label: 'Первая оплата',
-      hint: 'Из инициировавших — кто успешно оплатил впервые. Подмножество предыдущего.',
+      hint: 'Из инициировавших — кто успешно оплатил (по таблице payments, status=succeeded). Подмножество предыдущего.',
       identity: 'user',
-      query: this.userStep('payment_success'),
+      query: this.paymentInWindow(true),
     },
     {
       key: 'second_payment_success',
       label: 'Вторая оплата',
-      hint: 'Из оплативших — кто оплатил второй раз (повторная покупка). Подмножество предыдущего.',
+      hint: 'Из оплативших — кто оплатил второй раз (2-я успешная оплата по таблице payments). Подмножество предыдущего.',
       identity: 'user',
-      query: this.nthUserStep('payment_success', 2),
+      query: this.nthPaymentStep(2),
     },
     {
       key: 'recurring_buyer',
       label: 'Постоянный плательщик (3+)',
-      hint: 'Кто оплатил 3+ раза. Подмножество «Вторая оплата».',
+      hint: 'Кто оплатил 3+ раза (3-я успешная оплата по таблице payments). Подмножество «Вторая оплата».',
       identity: 'user',
-      query: this.nthUserStep('payment_success', 3),
+      query: this.nthPaymentStep(3),
     },
   ];
 
