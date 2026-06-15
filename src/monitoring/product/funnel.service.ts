@@ -78,6 +78,21 @@ export class FunnelService {
     });
   }
 
+  // Шаг верха воронки по уникальным СЕССИЯМ (анонимный трафик до входа).
+  private sessionStep(name: string): StepDef['query'] {
+    return (from, to, source) => ({
+      sql: `
+        SELECT session_id
+        FROM events
+        WHERE name = $1
+          AND ts >= $2 AND ts < $3
+          AND session_id IS NOT NULL
+          ${source ? 'AND source = $4' : ''}
+        GROUP BY session_id`,
+      params: source ? [name, from, to, source] : [name, from, to],
+    });
+  }
+
   // N-е событие `name` у юзера (window-function), напр. 2-я оплата.
   private nthUserStep(name: string, n: number): StepDef['query'] {
     return (from, to, source, excluded) => ({
@@ -161,6 +176,20 @@ export class FunnelService {
           GROUP BY session_id`,
         params: source ? [from, to, source] : [from, to],
       }),
+    },
+    {
+      key: 'landing_cta_click',
+      label: 'Нажал «Начать»',
+      hint: 'Сессии, кликнувшие CTA на лендинге (по session_id). Верх воронки — счёт по сессиям, поэтому процент к предыдущему не считается. Трекинг кликов с 2026-06-14.',
+      identity: 'session',
+      query: this.sessionStep('landing_cta_click'),
+    },
+    {
+      key: 'app_page_hit',
+      label: 'Дошёл до приложения',
+      hint: 'Сессии, доехавшие до страницы приложения (ранний маяк — ловит даже отвал на загрузке JS). Счёт по сессиям приложения. Только рекламный трафик (utm/ref/seg).',
+      identity: 'session',
+      query: this.sessionStep('app_page_hit'),
     },
     {
       key: 'auth_succeeded',
