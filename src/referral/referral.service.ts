@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit, BadRequestException, Optional } from 
 import { PgService } from '../common/services/pg.service';
 import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
 import { EventsService } from '../events/events.service';
+import axios from 'axios';
 
 // Двусторонний реф-бонус: приглашённому — стартовые токены при переходе по
 // ссылке (у пригласившего «сторона» = существующая комиссия с оплат).
@@ -68,6 +69,54 @@ export class ReferralService implements OnModuleInit {
     } catch (e: any) {
       this.logger.error(`referral_referees.bonus_tokens migration failed: ${e.message}`);
     }
+    // Флаг «уже уведомили SMS о достижении порога вывода» (1 SMS на цикл накопления).
+    try {
+      await this.pg.query(`ALTER TABLE referral_leaders ADD COLUMN IF NOT EXISTS payout_notified boolean NOT NULL DEFAULT false`);
+    } catch (e: any) {
+      this.logger.error(`referral_leaders.payout_notified migration failed: ${e.message}`);
+    }
+  }
+
+  // SMS лидеру при достижении порога вывода (>= WITHDRAW_MIN_RUB). Платный канал
+  // оправдан на этой сумме (подтверждено владельцем). Один SMS на цикл: флаг
+  // payout_notified сбрасывается при выводе. Только реальные номера (не oauth-id).
+  private async sendSms(phone: string, text: string): Promise<boolean> {
+    const login = process.env.SMSAERO_LOGIN, apiKey = process.env.SMSAERO_API_KEY;
+    if (!login || !apiKey) return false;
+    try {
+      const auth = Buffer.from(`${login}:${apiKey}`).toString('base64');
+      const resp = await axios.get('https://gate.smsaero.ru/v2/sms/send', {
+        params: { number: phone, text, sign: 'SMSAero' },
+        headers: { Authorization: `Basic ${auth}` }, timeout: 10000, validateStatus: () => true,
+      });
+      return resp.status < 400;
+    } catch { return false; }
+  }
+
+  private async notifyPayoutIfReady(leaderId: string): Promise<void> {
+    try {
+      const r = await this.pg.query(
+        `SELECT l.user_phone, l.payout_notified,
+                COALESCE(SUM(c.commission_rub) FILTER (WHERE NOT c.paid_out), 0) AS pending
+           FROM referral_leaders l LEFT JOIN referral_commissions c ON c.leader_id = l.id
+          WHERE l.id = $1 GROUP BY l.user_phone, l.payout_notified`,
+        [leaderId],
+      );
+      const row = r.rows[0];
+      if (!row || row.payout_notified) return;
+      const pending = Math.round(Number(row.pending) * 100) / 100;
+      const phone = String(row.user_phone || '');
+      if (pending < WITHDRAW_MIN_RUB) return;
+      if (!/^\d{10,15}$/.test(phone)) return; // не SMS-абельный (oauth/email id)
+      const ok = await this.sendSms(phone, `Linkeon: у вас ${pending} руб. реферального вознаграждения. Вывести деньгами или токенами — в приложении: профиль, раздел «Рефералы».`);
+      if (ok) {
+        await this.pg.query('UPDATE referral_leaders SET payout_notified = true WHERE id = $1', [leaderId]);
+        this.events?.track('referral_payout_sms', { userId: phone, props: { leader_id: leaderId, pending } });
+        this.logger.log(`referral payout SMS → ${phone}: ${pending}₽`);
+      }
+    } catch (e: any) {
+      this.logger.warn(`notifyPayoutIfReady failed: ${e.message}`);
+    }
   }
 
   // DEV-1: заявка на вывод накопленных комиссий ДЕНЬГАМИ. Резервирует комиссии
@@ -102,6 +151,7 @@ export class ReferralService implements OnModuleInit {
       }
       const ids = unpaid.rows.map((r) => r.id);
       await client.query('UPDATE referral_commissions SET paid_out = true WHERE id = ANY($1)', [ids]);
+      await client.query('UPDATE referral_leaders SET payout_notified = false WHERE id = $1', [leaderId]);
       const ins = await client.query(
         `INSERT INTO referral_withdrawals (leader_id, user_phone, amount_rub, method, requisites, commission_ids)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, amount_rub`,
@@ -206,6 +256,7 @@ export class ReferralService implements OnModuleInit {
         throw new BadRequestException('Профиль не найден для зачисления токенов');
       }
       await client.query('UPDATE referral_commissions SET paid_out = true WHERE id = ANY($1)', [ids]);
+      await client.query('UPDATE referral_leaders SET payout_notified = false WHERE id = $1', [leaderId]);
       await client.query(
         `INSERT INTO referral_token_payouts (leader_id, user_phone, rub, tokens, rate, commission_ids)
          VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -395,5 +446,11 @@ export class ReferralService implements OnModuleInit {
     }
 
     this.logger.log(`Commission created: payment=${paymentId}, referee=${refereePhone}, amount=${amountRub}, commission=${commissionRub}`);
+
+    // SMS-уведомление лидерам, чьё накопление достигло порога вывода (>1000₽).
+    await this.notifyPayoutIfReady(leader_id).catch(() => {});
+    if (parent_leader_id && Number(parent_commission_pct) > 0) {
+      await this.notifyPayoutIfReady(parent_leader_id).catch(() => {});
+    }
   }
 }

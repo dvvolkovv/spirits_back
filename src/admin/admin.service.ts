@@ -150,7 +150,9 @@ export class AdminService {
   async buildReferralOutreach() {
     const { leaders } = await this.getReferralStats();
     const active = leaders.filter((l) => l.is_active);
-    const targets = active.filter((l) => l.user_phone);
+    // Реактивируем только заслуженных: есть привлечённые И заработанная комиссия
+    // (не беспокоим SMS-ом тех, у кого нет результатов) — указание владельца.
+    const targets = active.filter((l) => l.user_phone && l.total_referees > 0 && l.total_commission_rub > 0);
     const drafts = await Promise.all(targets.map(async (l) => {
       const sent = await this.pg.query(
         `SELECT ts FROM events
