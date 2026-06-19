@@ -32,4 +32,16 @@ export class ReferralController {
     const result = await this.referralService.payoutTokens(user.userId);
     return res.status(200).json(result);
   }
+
+  // DEV-1: заявка на вывод комиссий ДЕНЬГАМИ (ручная выплата командой).
+  @Post('referral/withdraw')
+  @UseGuards(JwtGuard)
+  async withdraw(@CurrentUser() user: any, @Body() body: { method: string; requisites: string }, @Res() res: Response) {
+    try {
+      const result = await this.referralService.requestWithdrawal(user.userId, body?.method, body?.requisites);
+      return res.status(200).json(result);
+    } catch (e: any) {
+      return res.status(400).json({ error: e?.message || 'Не удалось создать заявку' });
+    }
+  }
 }

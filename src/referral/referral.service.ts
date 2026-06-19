@@ -1,9 +1,15 @@
 import { Injectable, Logger, OnModuleInit, BadRequestException } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
+import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
 
 // Курс/порог вывода реферальных комиссий токенами (подтверждено владельцем).
 const PAYOUT_RATE_TOKENS_PER_RUB = 600;
 const PAYOUT_MIN_RUB = 100;
+
+// Вывод ДЕНЬГАМИ (заявка на ручную выплату командой). WITHDRAW_MIN_RUB —
+// денежный параметр, поставлен по умолчанию 1000₽, подтвердить/изменить у владельца.
+const WITHDRAW_MIN_RUB = 1000;
+const WITHDRAW_METHODS = ['card', 'sbp'];
 
 @Injectable()
 export class ReferralService implements OnModuleInit {
@@ -27,6 +33,127 @@ export class ReferralService implements OnModuleInit {
         )`);
     } catch (e: any) {
       this.logger.error(`referral_token_payouts migration failed: ${e.message}`);
+    }
+    // Заявки на вывод ДЕНЬГАМИ — команда обрабатывает вручную (DEV-1).
+    try {
+      await this.pg.query(`
+        CREATE TABLE IF NOT EXISTS referral_withdrawals (
+          id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+          leader_id uuid NOT NULL,
+          user_phone varchar(20) NOT NULL,
+          amount_rub numeric(10,2) NOT NULL,
+          method varchar(20) NOT NULL,
+          requisites text NOT NULL,
+          status varchar(20) NOT NULL DEFAULT 'pending',
+          commission_ids uuid[] NOT NULL,
+          created_at timestamptz DEFAULT now(),
+          processed_at timestamptz,
+          processed_by varchar(40)
+        )`);
+    } catch (e: any) {
+      this.logger.error(`referral_withdrawals migration failed: ${e.message}`);
+    }
+  }
+
+  // DEV-1: заявка на вывод накопленных комиссий ДЕНЬГАМИ. Резервирует комиссии
+  // (paid_out=true) в той же транзакции — исключает двойной вывод (и деньгами, и
+  // токенами). Реальная выплата — вручную командой; статус ведётся в
+  // referral_withdrawals. DEV-2: после создания — Telegram-уведомление команде.
+  async requestWithdrawal(userId: string, method: string, requisites: string): Promise<{ id: string; amount_rub: number; status: string }> {
+    method = String(method || '').trim().toLowerCase();
+    requisites = String(requisites || '').trim();
+    if (!WITHDRAW_METHODS.includes(method)) {
+      throw new BadRequestException(`Способ вывода: ${WITHDRAW_METHODS.join(' / ')}`);
+    }
+    if (requisites.length < 4) throw new BadRequestException('Укажите реквизиты для вывода');
+
+    const leaderRes = await this.pg.query('SELECT id FROM referral_leaders WHERE user_phone = $1 LIMIT 1', [userId]);
+    const leaderId = leaderRes.rows[0]?.id;
+    if (!leaderId) throw new BadRequestException('Реферальный аккаунт не найден');
+
+    const client = await this.pg.getClient();
+    let row: { id: string; amount_rub: number };
+    try {
+      await client.query('BEGIN');
+      const unpaid = await client.query(
+        `SELECT id, commission_rub FROM referral_commissions
+          WHERE leader_id = $1 AND paid_out = false FOR UPDATE`,
+        [leaderId],
+      );
+      const rub = Math.round(unpaid.rows.reduce((s, r) => s + (Number(r.commission_rub) || 0), 0) * 100) / 100;
+      if (rub < WITHDRAW_MIN_RUB) {
+        await client.query('ROLLBACK');
+        throw new BadRequestException(`Минимум для вывода деньгами — ${WITHDRAW_MIN_RUB} ₽ (у вас ${rub} ₽)`);
+      }
+      const ids = unpaid.rows.map((r) => r.id);
+      await client.query('UPDATE referral_commissions SET paid_out = true WHERE id = ANY($1)', [ids]);
+      const ins = await client.query(
+        `INSERT INTO referral_withdrawals (leader_id, user_phone, amount_rub, method, requisites, commission_ids)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, amount_rub`,
+        [leaderId, userId, rub, method, requisites, ids],
+      );
+      await client.query('COMMIT');
+      row = { id: ins.rows[0].id, amount_rub: Number(ins.rows[0].amount_rub) };
+      this.logger.log(`referral withdrawal request: ${userId} ${rub}₽ via ${method} (id ${row.id})`);
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+      throw e;
+    } finally {
+      client.release();
+    }
+
+    // DEV-2: оперативное уведомление команде (fire-and-forget, не блокирует ответ).
+    if (telegramConfigured()) {
+      const text =
+        `💸 <b>Заявка на вывод реф-средств</b>\n` +
+        `Лидер: <code>${userId}</code>\n` +
+        `Сумма: <b>${row.amount_rub} ₽</b>\n` +
+        `Способ: ${method} · реквизиты: <code>${requisites}</code>\n` +
+        `Заявка: <code>${row.id}</code>\n` +
+        `Обработать: admin → Рефералы (mark paid/rejected)`;
+      sendTelegramAlert(text).catch((e) => this.logger.warn(`withdrawal TG notify failed: ${e.message}`));
+    }
+    return { id: row.id, amount_rub: row.amount_rub, status: 'pending' };
+  }
+
+  // Админ: список заявок (по статусу или все).
+  async listWithdrawals(status?: string): Promise<any[]> {
+    const params: any[] = [];
+    let where = '';
+    if (status) { params.push(status); where = `WHERE status = $1`; }
+    const r = await this.pg.query(
+      `SELECT id, user_phone, amount_rub, method, requisites, status, created_at, processed_at, processed_by
+         FROM referral_withdrawals ${where} ORDER BY created_at DESC LIMIT 200`,
+      params,
+    );
+    return r.rows;
+  }
+
+  // Админ: обработать заявку. paid -> выплачено; rejected -> вернуть комиссии в пул.
+  async processWithdrawal(id: string, decision: 'paid' | 'rejected', adminPhone: string): Promise<{ id: string; status: string }> {
+    if (decision !== 'paid' && decision !== 'rejected') throw new BadRequestException('decision: paid | rejected');
+    const client = await this.pg.getClient();
+    try {
+      await client.query('BEGIN');
+      const w = await client.query('SELECT * FROM referral_withdrawals WHERE id = $1 FOR UPDATE', [id]);
+      if (!w.rows[0]) { await client.query('ROLLBACK'); throw new BadRequestException('Заявка не найдена'); }
+      if (w.rows[0].status !== 'pending') { await client.query('ROLLBACK'); throw new BadRequestException(`Заявка уже обработана (${w.rows[0].status})`); }
+      if (decision === 'rejected') {
+        // Вернуть зарезервированные комиссии в пул (доступны к повторному выводу).
+        await client.query('UPDATE referral_commissions SET paid_out = false WHERE id = ANY($1)', [w.rows[0].commission_ids]);
+      }
+      await client.query(
+        `UPDATE referral_withdrawals SET status = $1, processed_at = now(), processed_by = $2 WHERE id = $3`,
+        [decision, adminPhone || 'admin', id],
+      );
+      await client.query('COMMIT');
+      this.logger.log(`referral withdrawal ${id} -> ${decision} by ${adminPhone}`);
+      return { id, status: decision };
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+      throw e;
+    } finally {
+      client.release();
     }
   }
 

@@ -3,11 +3,14 @@ import { Response } from 'express';
 import { AdminService } from './admin.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { ProfileCompactionService } from '../scheduler/profile-compaction.service';
+import { ReferralService } from '../referral/referral.service';
+import { CurrentUser } from '../common/decorators/user.decorator';
 
 @Controller('')
 export class AdminController {
   constructor(
     private readonly adminService: AdminService,
+    private readonly referralService: ReferralService,
     @Optional() private readonly compaction?: ProfileCompactionService,
   ) {}
 
@@ -159,9 +162,21 @@ export class AdminController {
 
   @Post('admin/referral')
   @UseGuards(JwtGuard)
-  async referralAction(@Body() body: any, @Res() res: Response) {
+  async referralAction(@CurrentUser() user: any, @Body() body: any, @Res() res: Response) {
     const { action, ...data } = body;
     switch (action) {
+      case 'withdrawals_list': {
+        const list = await this.referralService.listWithdrawals(data.status);
+        return res.status(200).json(list);
+      }
+      case 'withdrawal_process': {
+        try {
+          const r = await this.referralService.processWithdrawal(data.id, data.decision, user?.userId);
+          return res.status(200).json(r);
+        } catch (e: any) {
+          return res.status(400).json({ error: e?.message || 'Ошибка обработки' });
+        }
+      }
       case 'create': {
         const leader = await this.adminService.createReferralLeader(data);
         return res.status(200).json(leader);

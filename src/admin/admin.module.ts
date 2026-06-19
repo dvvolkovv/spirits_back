@@ -3,9 +3,10 @@ import { AdminController } from './admin.controller';
 import { AdminService } from './admin.service';
 import { CommonModule } from '../common/common.module';
 import { SchedulerModule } from '../scheduler/scheduler.module';
+import { ReferralModule } from '../referral/referral.module';
 
 @Module({
-  imports: [CommonModule, SchedulerModule],
+  imports: [CommonModule, SchedulerModule, ReferralModule],
   controllers: [AdminController],
   providers: [AdminService],
 })
