@@ -10,6 +10,7 @@ import {
   SupportTicketRow, SupportMessageRow, PostUserMessageDto, LIMITS, SenderType,
 } from './support.dto';
 import { TelegramNotifierService } from './telegram-notifier.service';
+import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
 import { VideoService } from '../video/video.service';
 import { CreateVideoJobDto } from '../video/video.dto';
 
@@ -232,6 +233,17 @@ export class SupportService implements OnModuleInit {
     );
     const name = p.rows[0]?.name || this.maskPhone(userId);
     await this.telegram.notifyUserReply({ ticketId, userName: name, userText: text, ticketStatus: status });
+    // Если выделенный support-чат не настроен (TELEGRAM_SUPPORT_CHAT_ID пуст),
+    // дублируем в мониторинговый @linkeon_alert_bot (чат «Поддержка linkeon») —
+    // чтобы сообщение, ждущее живого оператора, не осталось незамеченным.
+    if (!process.env.TELEGRAM_SUPPORT_CHAT_ID && telegramConfigured()) {
+      const link = `${process.env.ADMIN_ORIGIN || 'https://my.linkeon.io'}/admin`;
+      await sendTelegramAlert(
+        `🆘 <b>Поддержка: сообщение ждёт оператора</b>\n` +
+        `Клиент: ${name}\nТикет: <code>${ticketId}</code> (${status})\n` +
+        `«${text.slice(0, 300)}»\n\nОткрыть: ${link}`,
+      ).catch(() => {});
+    }
     await this.pg.query(
       `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
        VALUES ($1, 'system', NULL, 'user_reply_ping', $2::jsonb)`,
