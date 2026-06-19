@@ -6,6 +6,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 const COOLDOWN_MS = 7 * 864e5; // 7 дней
+// DEV-4: надж к участию в рефералке для вовлечённых юзеров (после «ага»).
+const REFERRAL_NUDGE_MSG_THRESHOLD = 6;   // признак реальной вовлечённости
+const REFERRAL_COOLDOWN_MS = 14 * 864e5;  // реже, чем оффер
 
 @Injectable()
 export class OfferService implements OnModuleInit {
@@ -34,6 +37,12 @@ export class OfferService implements OnModuleInit {
           this.logger.error(`offer migration ${file} failed (${p}): ${e.message}`);
         }
       }
+    }
+    // DEV-4: колонка кулдауна реф-наджа (отдельно от offer_dismissed_at).
+    try {
+      await this.pg.query(`ALTER TABLE ai_profiles_consolidated ADD COLUMN IF NOT EXISTS referral_nudge_dismissed_at timestamptz`);
+    } catch (e: any) {
+      this.logger.error(`referral_nudge_dismissed_at column migration failed: ${e.message}`);
     }
   }
 
@@ -68,11 +77,16 @@ export class OfferService implements OnModuleInit {
     const [n, paid, prof, firstChat] = await Promise.all([
       this.messageCount(userId),
       this.hasPaid(userId),
-      this.pg.query(`SELECT offer_dismissed_at FROM ai_profiles_consolidated WHERE user_id = $1`, [userId]),
+      this.pg.query(`SELECT offer_dismissed_at, referral_nudge_dismissed_at FROM ai_profiles_consolidated WHERE user_id = $1`, [userId]),
       this.firstChatAt(userId),
     ]);
     const dismissedAt = prof.rows[0]?.offer_dismissed_at;
     const inCooldown = dismissedAt ? Date.now() - new Date(dismissedAt).getTime() < COOLDOWN_MS : false;
+    // DEV-4: реф-надж — вовлечённому юзеру (вкл. платящих, они лучшие рефереры),
+    // со своим кулдауном. Фронт покажет его, только если нет платёжного оффера.
+    const refDismissedAt = prof.rows[0]?.referral_nudge_dismissed_at;
+    const refInCooldown = refDismissedAt ? Date.now() - new Date(refDismissedAt).getTime() < REFERRAL_COOLDOWN_MS : false;
+    const referralNudge = n >= REFERRAL_NUDGE_MSG_THRESHOLD && !refInCooldown;
     // +50%-оффер: вовлечённому неплатящему (>= порога сообщений).
     const eligible = n >= OFFER_MSG_THRESHOLD && !paid && !inCooldown;
     // Триггер «после first_chat» (c732734f): лёгкий in-app нудж к первой оплате
@@ -82,15 +96,16 @@ export class OfferService implements OnModuleInit {
     const firstChatNudge =
       !paid && !inCooldown && !eligible && n >= 1 &&
       !!firstChat && Date.now() - firstChat.getTime() >= FIRST_CHAT_DELAY_MS;
-    return { eligible, first_chat_nudge: firstChatNudge, bonus_pct: OFFER_BONUS_PCT, message_count: n };
+    return { eligible, first_chat_nudge: firstChatNudge, referral_nudge: referralNudge, bonus_pct: OFFER_BONUS_PCT, message_count: n };
   }
 
-  async dismiss(userId: string) {
+  async dismiss(userId: string, kind: 'offer' | 'referral' = 'offer') {
+    const col = kind === 'referral' ? 'referral_nudge_dismissed_at' : 'offer_dismissed_at';
     await this.pg.query(
-      `UPDATE ai_profiles_consolidated SET offer_dismissed_at = now() WHERE user_id = $1`,
+      `UPDATE ai_profiles_consolidated SET ${col} = now() WHERE user_id = $1`,
       [userId],
     );
-    this.events?.track('offer_dismissed', { userId, props: {} });
+    this.events?.track(kind === 'referral' ? 'referral_nudge_dismissed' : 'offer_dismissed', { userId, props: {} });
     return { ok: true };
   }
 }

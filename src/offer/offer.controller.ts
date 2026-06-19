@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Res, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Query, Res, UseGuards } from '@nestjs/common';
 import { Response } from 'express';
 import { OfferService } from './offer.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
@@ -16,7 +16,8 @@ export class OfferController {
 
   @Post('offer/dismiss')
   @UseGuards(JwtGuard)
-  async dismiss(@CurrentUser() user: any, @Res() res: Response) {
-    return res.status(200).json(await this.offer.dismiss(user.userId));
+  async dismiss(@CurrentUser() user: any, @Query('kind') kind: string, @Res() res: Response) {
+    const k = kind === 'referral' ? 'referral' : 'offer';
+    return res.status(200).json(await this.offer.dismiss(user.userId, k));
   }
 }
