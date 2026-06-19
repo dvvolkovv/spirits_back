@@ -1,6 +1,12 @@
-import { Injectable, Logger, OnModuleInit, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, BadRequestException, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
+import { EventsService } from '../events/events.service';
+
+// Двусторонний реф-бонус: приглашённому — стартовые токены при переходе по
+// ссылке (у пригласившего «сторона» = существующая комиссия с оплат).
+// REFEREE_BONUS_TOKENS — токеновый параметр, дефолт 10000, подтвердить у владельца.
+const REFEREE_BONUS_TOKENS = 10000;
 
 // Курс/порог вывода реферальных комиссий токенами (подтверждено владельцем).
 const PAYOUT_RATE_TOKENS_PER_RUB = 600;
@@ -15,7 +21,10 @@ const WITHDRAW_METHODS = ['card', 'sbp'];
 export class ReferralService implements OnModuleInit {
   private readonly logger = new Logger(ReferralService.name);
 
-  constructor(private readonly pg: PgService) {}
+  constructor(
+    private readonly pg: PgService,
+    @Optional() private readonly events?: EventsService,
+  ) {}
 
   async onModuleInit() {
     // Журнал выплат комиссий токенами (аудит + атомарность/идемпотентность).
@@ -52,6 +61,12 @@ export class ReferralService implements OnModuleInit {
         )`);
     } catch (e: any) {
       this.logger.error(`referral_withdrawals migration failed: ${e.message}`);
+    }
+    // Двусторонний бонус: сколько токенов начислено приглашённому (аудит/идемпотентность).
+    try {
+      await this.pg.query(`ALTER TABLE referral_referees ADD COLUMN IF NOT EXISTS bonus_tokens integer NOT NULL DEFAULT 0`);
+    } catch (e: any) {
+      this.logger.error(`referral_referees.bonus_tokens migration failed: ${e.message}`);
     }
   }
 
@@ -213,6 +228,8 @@ export class ReferralService implements OnModuleInit {
       [slug],
     );
     if (!leader.rows.length) return { success: false, error: 'Invalid referral link' };
+    // Анти-абуз: нельзя пригласить самого себя (и получить бонус).
+    if (leader.rows[0].user_phone === userId) return { success: false, error: 'Нельзя пригласить самого себя' };
 
     // Check if already registered as referee
     const existing = await this.pg.query(
@@ -221,12 +238,28 @@ export class ReferralService implements OnModuleInit {
     );
     if (existing.rows.length) return { success: false, error: 'Already registered' };
 
-    await this.pg.query(
+    const ins = await this.pg.query(
       `INSERT INTO referral_referees (referee_phone, leader_id)
-       VALUES ($1, $2) ON CONFLICT (referee_phone) DO NOTHING`,
+       VALUES ($1, $2) ON CONFLICT (referee_phone) DO NOTHING RETURNING id`,
       [userId, leader.rows[0].id],
     );
-    return { success: true, leader_name: leader.rows[0].name };
+
+    // Двусторонний бонус: приглашённому — стартовые токены (один раз, только при
+    // новой записи referee → не фармится повторными запросами).
+    let bonusTokens = 0;
+    if (ins.rows.length) {
+      const bal = await this.pg.query(
+        'UPDATE ai_profiles_consolidated SET tokens = COALESCE(tokens,0) + $1 WHERE user_id = $2 RETURNING tokens',
+        [REFEREE_BONUS_TOKENS, userId],
+      );
+      if (bal.rows.length) {
+        bonusTokens = REFEREE_BONUS_TOKENS;
+        await this.pg.query('UPDATE referral_referees SET bonus_tokens = $1 WHERE referee_phone = $2', [bonusTokens, userId]);
+        this.events?.track('referral_referee_bonus', { userId, props: { tokens: bonusTokens, leader_id: leader.rows[0].id } });
+        this.logger.log(`referee bonus: ${userId} +${bonusTokens} tokens (leader ${leader.rows[0].id})`);
+      }
+    }
+    return { success: true, leader_name: leader.rows[0].name, bonus_tokens: bonusTokens };
   }
 
   // Get the user's referral-leader row, creating one on first request so every
@@ -307,6 +340,7 @@ export class ReferralService implements OnModuleInit {
 
     return {
       referral_link: `https://my.linkeon.io/?ref=${l.slug}`,
+      referee_bonus_tokens: REFEREE_BONUS_TOKENS,
       leader: {
         name: l.name,
         slug: l.slug,
