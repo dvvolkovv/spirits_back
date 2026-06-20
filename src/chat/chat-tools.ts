@@ -21,6 +21,26 @@ export const CHAT_TOOLS = [
     },
   },
   {
+    name: 'generate_banner',
+    description:
+      'Сгенерировать РЕКЛАМНЫЙ БАННЕР / афишу / обложку с ИДЕАЛЬНЫМ текстом. ОБЯЗАТЕЛЬНО используй этот инструмент (а НЕ generate_image), когда на картинке нужен читаемый текст: заголовок, слоган, цена, призыв к действию, надпись на русском. Почему: модели плохо рендерят кириллицу прямо в картинке (буквы «плывут»). Здесь фон генерится БЕЗ текста, а текст накладывается программно поверх — буквы всегда идеальные. Передавай ТОЛЬКО осмысленный текст в title/subtitle/cta (НЕ дублируй его в prompt — prompt описывает только фон/сцену). Cost: 5000 tokens (std) / 10000 (hd).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'Описание ТОЛЬКО фоновой сцены/стиля (без текста). Напр.: «тёплое летнее побережье на закате, мягкое боке, кинематографичный свет».' },
+        title: { type: 'string', description: 'Главный заголовок (крупно). Коротко, до ~6 слов.' },
+        subtitle: { type: 'string', description: 'Подзаголовок / пояснение (опц.).' },
+        cta: { type: 'string', description: 'Призыв к действию — текст на кнопке-плашке (опц.). Напр. «Записаться», «Купить со скидкой».' },
+        aspect_ratio: { type: 'string', enum: ['1:1', '3:4', '4:3', '9:16', '16:9'], default: '1:1', description: '9:16 — истории/Reels, 1:1 — пост, 16:9 — обложка/горизонт.' },
+        position: { type: 'string', enum: ['top', 'center', 'bottom'], default: 'bottom', description: 'Где разместить текстовый блок.' },
+        theme: { type: 'string', enum: ['dark', 'light'], default: 'dark', description: 'dark = светлый текст на тёмной подложке (универсально); light = тёмный текст на светлой.' },
+        accent: { type: 'string', description: 'HEX-цвет плашки CTA, напр. «#2f8f4e» (опц.).' },
+        quality: { type: 'string', enum: ['std', 'hd'], default: 'std' },
+      },
+      required: ['prompt'],
+    },
+  },
+  {
     name: 'edit_image',
     description:
       'Edit / modify an existing image using Nano Banana 2 (std) or Nano Banana Pro (hd, 4K). Use when the user wants to change, fix, or iterate on a previously generated image — "сделай небо закатным", "убери фон", "добавь шапку", "сделай его рыжим", "замени надпись на X". Pass sourceImageUrl from the previous generate_image / edit_image tool result (imageUrl field). Cost: 5000 tokens (std) or 10000 tokens (hd).',
@@ -170,6 +190,39 @@ export class ChatToolsService {
             };
           }
           return { ok: false, error: e?.message || 'image generation failed' };
+        }
+      }
+
+      if (name === 'generate_banner') {
+        const prompt = String(input?.prompt ?? '').slice(0, 2000);
+        if (!prompt) return { ok: false, error: 'empty prompt' };
+        const title = String(input?.title ?? '').slice(0, 200);
+        const subtitle = String(input?.subtitle ?? '').slice(0, 300);
+        const cta = String(input?.cta ?? '').slice(0, 120);
+        if (!title && !subtitle && !cta) return { ok: false, error: 'banner requires at least title, subtitle or cta' };
+        const quality = input?.quality === 'hd' ? 'hd' : 'std';
+        const aspect_ratio = ['1:1', '3:4', '4:3', '9:16', '16:9'].includes(input?.aspect_ratio) ? input.aspect_ratio : '1:1';
+        const position = ['top', 'center', 'bottom'].includes(input?.position) ? input.position : 'bottom';
+        const theme = input?.theme === 'light' ? 'light' : 'dark';
+        const accent = typeof input?.accent === 'string' ? input.accent : undefined;
+
+        try {
+          const result = await this.misc.generateBanner(userId, {
+            prompt, title, subtitle, cta, quality, aspect_ratio, position, theme, accent,
+          });
+          const imageUrl = result?.images?.[0]?.url;
+          if (!imageUrl) return { ok: false, error: 'banner generation failed' };
+          return { ok: true, kind: 'image', imageUrl, tokensSpent: Number(result.tokensSpent || 0) };
+        } catch (e: any) {
+          if (/недостаточно|insufficient/i.test(e?.message || '')) {
+            const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
+            return {
+              ok: false, error: 'insufficient_tokens',
+              balance: Number(bal.rows[0]?.tokens || 0),
+              required: quality === 'hd' ? 10000 : 5000,
+            };
+          }
+          return { ok: false, error: e?.message || 'banner generation failed' };
         }
       }
 

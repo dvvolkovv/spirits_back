@@ -62,6 +62,30 @@ export class MiscController {
     }
   }
 
+  @Post('bannergen')
+  @UseGuards(JwtGuard)
+  async bannerGen(@CurrentUser() user: any, @Req() req: Request, @Res() res: Response) {
+    if (!process.env.GOOGLE_AI_API_KEY) {
+      return res.status(501).json({ error: 'imagegen not configured on this server', capability: 'imagegen', configured: false });
+    }
+    try {
+      const { prompt, title, subtitle, cta, quality, aspect_ratio, position, theme, accent } = req.body;
+      if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
+      if (!title && !subtitle && !cta) return res.status(400).json({ error: 'Нужен хотя бы заголовок, подзаголовок или CTA' });
+
+      const tokenCost = quality === 'hd' ? 10000 : 5000;
+      const balRes = await this.miscService.checkTokenBalance(user.userId, tokenCost);
+      if (!balRes.ok) return res.status(400).json({ error: 'Недостаточно токенов' });
+
+      const result = await this.miscService.generateBanner(user.userId, {
+        prompt, title, subtitle, cta, quality, aspect_ratio, position, theme, accent,
+      });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(500).json({ error: err.message || 'Banner generation failed' });
+    }
+  }
+
   @Post('imageedit')
   @UseGuards(JwtGuard)
   async imageEdit(@CurrentUser() user: any, @Req() req: Request, @Res() res: Response) {

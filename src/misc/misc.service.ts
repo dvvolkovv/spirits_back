@@ -7,6 +7,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import axios from 'axios';
 import { Response } from 'express';
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { renderBannerOverlay, BannerPosition, BannerTheme } from './banner-overlay';
 
 const ASSETS_BUCKET = 'linkeon-assets';
 
@@ -413,56 +414,8 @@ ${blocks.join('\n\n---\n\n')}
       throw new Error('Недостаточно токенов');
     }
 
-    const fs = require('fs');
-    const path = require('path');
-    const publicDir = path.join(process.cwd(), 'public', 'generated');
-    if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
-
     try {
-      let b64Image: string | null = null;
-      let mimeType = 'image/png';
-
-      // Primary: Imagen 4.0 Ultra (best quality, blocks people with children)
-      try {
-        const imagenResp = await axios.post(
-          `https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-ultra-generate-001:predict?key=${apiKey}`,
-          { instances: [{ prompt }], parameters: { sampleCount: 1, aspectRatio, personGeneration: 'allow_adult' } },
-          { headers: { 'Content-Type': 'application/json' }, timeout: 90000 },
-        );
-        const pred = (imagenResp.data?.predictions || [])[0];
-        if (pred?.bytesBase64Encoded) {
-          b64Image = pred.bytesBase64Encoded;
-          mimeType = pred.mimeType || 'image/png';
-          this.logger.log('Imagen 4.0 Ultra generated image');
-        } else {
-          this.logger.warn('Imagen Ultra returned no image (content policy), falling back to Gemini');
-        }
-      } catch (imagenErr: any) {
-        this.logger.warn(`Imagen Ultra error: ${imagenErr.message}, falling back to Gemini`);
-      }
-
-      // Fallback: Nano Banana 2 (std) / Nano Banana Pro (hd) — new Gemini 3.x image models
-      // Pro: gemini-3-pro-image-preview — 4K, лучший рендер текста, дороже
-      // Flash: gemini-3.1-flash-image-preview — оптимум цена/скорость/качество
-      if (!b64Image) {
-        const geminiModel = quality === 'hd' ? 'gemini-3-pro-image-preview' : 'gemini-3.1-flash-image-preview';
-        const geminiResp = await axios.post(
-          `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${apiKey}`,
-          { contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseModalities: ['IMAGE'] } },
-          { headers: { 'Content-Type': 'application/json' }, timeout: 90000 },
-        );
-        const parts = geminiResp.data?.candidates?.[0]?.content?.parts || [];
-        const imgPart = parts.find((p: any) => p.inlineData?.data);
-        if (imgPart) {
-          b64Image = imgPart.inlineData.data;
-          mimeType = imgPart.inlineData.mimeType || 'image/png';
-          this.logger.log(`${geminiModel} generated image`);
-        }
-      }
-
-      if (!b64Image) {
-        throw new Error('Модель не вернула изображений. Попробуйте изменить промпт.');
-      }
+      const { b64Image, mimeType } = await this.generateRawImage(prompt, aspectRatio, quality);
 
       const ext = mimeType.includes('jpeg') ? 'jpg' : 'png';
       const imageUrl = await this.uploadAssetImage(Buffer.from(b64Image, 'base64'), ext);
@@ -482,6 +435,128 @@ ${blocks.join('\n\n---\n\n')}
         this.logger.error(`Image gen API error: ${JSON.stringify(e.response.data).slice(0, 500)}`);
       }
       throw new Error(e.message || 'Image generation failed');
+    }
+  }
+
+  /**
+   * Сырая генерация картинки: Imagen 4.0 Ultra (primary) → Nano Banana (fallback).
+   * Возвращает base64 + mime. Не списывает токены и не пишет историю — это делают
+   * вызывающие методы (generateImage / generateBanner).
+   */
+  private async generateRawImage(
+    prompt: string,
+    aspectRatio: string,
+    quality?: string,
+  ): Promise<{ b64Image: string; mimeType: string }> {
+    const apiKey = process.env.GOOGLE_AI_API_KEY;
+    if (!apiKey) throw new Error('Google AI API key not configured');
+
+    let b64Image: string | null = null;
+    let mimeType = 'image/png';
+
+    // Primary: Imagen 4.0 Ultra (best quality, blocks people with children)
+    try {
+      const imagenResp = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-ultra-generate-001:predict?key=${apiKey}`,
+        { instances: [{ prompt }], parameters: { sampleCount: 1, aspectRatio, personGeneration: 'allow_adult' } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 90000 },
+      );
+      const pred = (imagenResp.data?.predictions || [])[0];
+      if (pred?.bytesBase64Encoded) {
+        b64Image = pred.bytesBase64Encoded;
+        mimeType = pred.mimeType || 'image/png';
+        this.logger.log('Imagen 4.0 Ultra generated image');
+      } else {
+        this.logger.warn('Imagen Ultra returned no image (content policy), falling back to Gemini');
+      }
+    } catch (imagenErr: any) {
+      this.logger.warn(`Imagen Ultra error: ${imagenErr.message}, falling back to Gemini`);
+    }
+
+    // Fallback: Nano Banana 2 (std) / Nano Banana Pro (hd) — new Gemini 3.x image models
+    if (!b64Image) {
+      const geminiModel = quality === 'hd' ? 'gemini-3-pro-image-preview' : 'gemini-3.1-flash-image-preview';
+      const geminiResp = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${apiKey}`,
+        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseModalities: ['IMAGE'] } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 90000 },
+      );
+      const parts = geminiResp.data?.candidates?.[0]?.content?.parts || [];
+      const imgPart = parts.find((p: any) => p.inlineData?.data);
+      if (imgPart) {
+        b64Image = imgPart.inlineData.data;
+        mimeType = imgPart.inlineData.mimeType || 'image/png';
+        this.logger.log(`${geminiModel} generated image`);
+      }
+    }
+
+    if (!b64Image) {
+      throw new Error('Модель не вернула изображений. Попробуйте изменить промпт.');
+    }
+    return { b64Image, mimeType };
+  }
+
+  /**
+   * Генерация баннера с ИДЕАЛЬНЫМ текстом: фон генерится БЕЗ букв (модели плохо
+   * рендерят кириллицу), а заголовок/подзаголовок/CTA накладываются программно
+   * через canvas (см. banner-overlay.ts). Стоимость = как у обычной картинки.
+   */
+  async generateBanner(userId: string, body: any): Promise<any> {
+    const scene: string = (body?.prompt || '').trim();
+    const title: string = (body?.title || '').trim();
+    const subtitle: string = (body?.subtitle || '').trim();
+    const cta: string = (body?.cta || '').trim();
+    if (!scene) throw new Error('Missing prompt');
+    if (!title && !subtitle && !cta) throw new Error('Нужен хотя бы заголовок, подзаголовок или CTA');
+
+    const ALLOWED_RATIOS = ['1:1', '3:4', '4:3', '9:16', '16:9'];
+    const aspectRatio = ALLOWED_RATIOS.includes(body?.aspect_ratio) ? body.aspect_ratio : '1:1';
+    const quality = body?.quality;
+    const position: BannerPosition = ['top', 'center', 'bottom'].includes(body?.position) ? body.position : 'bottom';
+    const theme: BannerTheme = body?.theme === 'light' ? 'light' : 'dark';
+    const accent: string | undefined = body?.accent;
+
+    const tokenCost = quality === 'hd' ? 10000 : 5000;
+    const balanceRes = await this.pg.query(
+      'SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1',
+      [userId],
+    );
+    const currentTokens = Number(balanceRes.rows[0]?.tokens || 0);
+    if (currentTokens < tokenCost) throw new Error('Недостаточно токенов');
+
+    // Фон БЕЗ текста — критично, иначе модель «подмешает» кривые буквы.
+    const where =
+      position === 'top' ? 'в верхней части'
+      : position === 'center' ? 'по центру'
+      : 'в нижней части';
+    const bgPrompt =
+      `${scene}\n\n` +
+      `СТРОГО: на изображении НЕ должно быть никакого текста, букв, слов, надписей, ` +
+      `логотипов, цифр, подписей или водяных знаков. Чистый фон без текста. ` +
+      `Оставь спокойную, неперегруженную область ${where} кадра под наложение текста ` +
+      `(ровный тон или мягкое боке, без важных деталей и лиц в этой зоне). ` +
+      `Профессиональная композиция для рекламного баннера. ` +
+      `No text, no letters, no words, no captions, no watermark, no logo.`;
+
+    try {
+      const { b64Image } = await this.generateRawImage(bgPrompt, aspectRatio, quality);
+      const bgBuffer = Buffer.from(b64Image, 'base64');
+      const bannerBuffer = await renderBannerOverlay(bgBuffer, { title, subtitle, cta, position, theme, accent });
+      const imageUrl = await this.uploadAssetImage(bannerBuffer, 'png');
+
+      await this.pg.query(
+        'UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2',
+        [tokenCost, userId],
+      );
+      const histLabel = `[banner] ${title || subtitle || cta} — ${scene}`.slice(0, 500);
+      await this.saveGeneratedImage(userId, histLabel, imageUrl, tokenCost);
+
+      return { images: [{ url: imageUrl }], tokensSpent: tokenCost };
+    } catch (e: any) {
+      if (e.response?.data) {
+        this.logger.error(`Banner gen API error: ${JSON.stringify(e.response.data).slice(0, 500)}`);
+      }
+      throw new Error(e.message || 'Banner generation failed');
     }
   }
 
