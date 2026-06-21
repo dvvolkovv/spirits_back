@@ -13,6 +13,7 @@ import { TikTokOAuthService } from '../oauth/tiktok-oauth.service';
 import { MetaOAuthService } from '../oauth/meta-oauth.service';
 import { parseScheduleTime } from '../publication/time-parser';
 import { SmmCreatorVoiceGender, SmmCreatorGenre } from '../entities/smm-creator-campaign.entity';
+import { MiscService } from '../../misc/misc.service';
 
 export interface ToolContext {
   userId: string;
@@ -37,6 +38,7 @@ export class SmmProducerToolsService {
     private readonly yt: YouTubeOAuthService,
     private readonly tt: TikTokOAuthService,
     private readonly meta: MetaOAuthService,
+    private readonly misc: MiscService,
   ) {}
 
   async handle(toolName: string, input: any, ctx: ToolContext): Promise<any> {
@@ -53,6 +55,7 @@ export class SmmProducerToolsService {
         case 'schedule_publication': return await this.schedulePublication(input, ctx);
         case 'cancel_publication':   return await this.cancelPublication(input);
         case 'list_publications':    return await this.listPublications(input, ctx);
+        case 'generate_banner':      return await this.generateBanner(input, ctx);
         case 'set_creator_campaign_settings': {
           const camp = await this.getOrCreateDraftCampaign(ctx.userId, ctx.isAdmin);
           const settings = await this.creatorCampaigns.upsert({
@@ -70,6 +73,34 @@ export class SmmProducerToolsService {
     } catch (err: any) {
       this.logger.error(`tool ${toolName} failed: ${err.message}`);
       return { error: err.message };
+    }
+  }
+
+  /**
+   * Баннер/статичный пост с идеальным текстом: фон без букв + программное
+   * наложение заголовка/подзаголовка/CTA. Делегирует в MiscService.generateBanner.
+   */
+  private async generateBanner(input: any, ctx: ToolContext): Promise<any> {
+    const title = String(input?.title ?? '').slice(0, 200);
+    const subtitle = String(input?.subtitle ?? '').slice(0, 300);
+    const cta = String(input?.cta ?? '').slice(0, 120);
+    if (!input?.prompt) return { error: 'empty prompt' };
+    if (!title && !subtitle && !cta) return { error: 'banner requires at least title, subtitle or cta' };
+    try {
+      const result = await this.misc.generateBanner(ctx.userId, {
+        prompt: String(input.prompt).slice(0, 2000),
+        title, subtitle, cta,
+        quality: input?.quality === 'hd' ? 'hd' : 'std',
+        aspect_ratio: input?.aspect_ratio,
+        position: input?.position,
+        theme: input?.theme,
+        accent: input?.accent,
+      });
+      const imageUrl = result?.images?.[0]?.url;
+      if (!imageUrl) return { error: 'banner generation failed' };
+      return { ok: true, imageUrl, tokensSpent: Number(result.tokensSpent || 0) };
+    } catch (e: any) {
+      return { error: e?.message || 'banner generation failed' };
     }
   }
 

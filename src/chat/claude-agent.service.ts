@@ -128,6 +128,10 @@ export class ClaudeAgentService {
               }
             } else if (toolName === 'regenerate_scenario' && r?.scenarioId) {
               assistantText += `\n\n{{smm_scenario:id=${r.scenarioId}}}`;
+            } else if (toolName === 'generate_banner' && r?.ok && r?.imageUrl) {
+              // Прямой URL картинки авто-рендерится фронтом как инлайн-<img>
+              // (IMAGE_URL_REGEX в customMarkdown). Кладём в текст — попадёт и в историю.
+              assistantText += `\n\n${r.imageUrl}`;
             } else if (toolName === 'connect_social') {
               if (r?.method === 'oauth' && r.authorizeUrl) {
                 assistantText += `\n\n{{smm_social_connect_button:platform=${r.platform},authorize_url=${r.authorizeUrl}}}`;
@@ -331,6 +335,22 @@ export class ClaudeAgentService {
           genre: z.enum(['dialog', 'monologue', 'fact_explanation']).optional(),
         },
         async (args: any) => handle('set_creator_campaign_settings', args),
+      ),
+      tool(
+        'generate_banner',
+        'Сгенерировать СТАТИЧНЫЙ баннер/афишу/обложку поста с идеальным текстом (для соцсетей, постов, превью). Фон генерится БЕЗ текста, а заголовок/подзаголовок/CTA накладываются программно — кириллица всегда ровная. Используй, когда пользователь просит баннер, афишу, картинку-пост, обложку с надписью (НЕ видео). Описывай в prompt только фон/сцену без текста; текст — в title/subtitle/cta.',
+        {
+          prompt: z.string(),
+          title: z.string().optional(),
+          subtitle: z.string().optional(),
+          cta: z.string().optional(),
+          aspect_ratio: z.enum(['1:1', '3:4', '4:3', '9:16', '16:9']).optional(),
+          position: z.enum(['top', 'center', 'bottom']).optional(),
+          theme: z.enum(['dark', 'light']).optional(),
+          accent: z.string().optional(),
+          quality: z.enum(['std', 'hd']).optional(),
+        },
+        async (args: any) => handle('generate_banner', args),
       ),
     ];
 

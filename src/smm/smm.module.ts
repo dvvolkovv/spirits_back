@@ -28,8 +28,10 @@ import { MetaOAuthService } from './oauth/meta-oauth.service';
 import { OAuthController } from './oauth/oauth.controller';
 import { SocialAccountController } from './social-accounts/social-account.controller';
 import { SmmPremiumGenerationService } from './billing/smm-premium-generation.service';
+import { MiscModule } from '../misc/misc.module';
 
 @Module({
+  imports: [MiscModule],
   controllers: [SmmController, RenderCallbackController, ScenarioFetchController, ScenariosController, VideosController, BrandingController, PublicationContextController, PublicationCallbackController, OAuthController, SocialAccountController],
   providers: [
     SmmBillingService,
