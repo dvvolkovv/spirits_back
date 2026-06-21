@@ -131,7 +131,8 @@ export class ClaudeAgentService {
             } else if (toolName === 'generate_banner' && r?.ok && r?.imageUrl) {
               // Прямой URL картинки авто-рендерится фронтом как инлайн-<img>
               // (IMAGE_URL_REGEX в customMarkdown). Кладём в текст — попадёт и в историю.
-              assistantText += `\n\n${r.imageUrl}`;
+              // Окружаем переводами строк, чтобы текст модели не приклеился к URL.
+              assistantText += `\n\n${r.imageUrl}\n\n`;
             } else if (toolName === 'connect_social') {
               if (r?.method === 'oauth' && r.authorizeUrl) {
                 assistantText += `\n\n{{smm_social_connect_button:platform=${r.platform},authorize_url=${r.authorizeUrl}}}`;
