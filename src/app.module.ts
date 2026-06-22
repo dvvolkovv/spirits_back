@@ -32,6 +32,7 @@ import { VmmModule } from './vmm/vmm.module';
 import { VkAdsModule } from './vk-ads/vk-ads.module';
 import { OfferModule } from './offer/offer.module';
 import { TgBotModule } from './tg-bot/tg-bot.module';
+import { VoiceModule } from './voice/voice.module';
 
 @Module({
   imports: [
@@ -68,6 +69,7 @@ import { TgBotModule } from './tg-bot/tg-bot.module';
     VkAdsModule,
     OfferModule,
     TgBotModule,
+    VoiceModule,
   ],
 })
 export class AppModule {}

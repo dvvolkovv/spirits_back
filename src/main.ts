@@ -1,6 +1,7 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { RequestMethod, ValidationPipe } from '@nestjs/common';
+import { attachVoiceWs } from './voice/voice-ws';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bodyParser: false });
@@ -23,6 +24,9 @@ async function bootstrap() {
   });
 
   app.useGlobalPipes(new ValidationPipe({ transform: true, whitelist: false }));
+
+  // WebSocket-шлюз потоковой диктовки (SpeechKit) поверх того же HTTP-сервера.
+  attachVoiceWs(app);
 
   const port = process.env.PORT || 3001;
   await app.listen(port);
