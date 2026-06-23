@@ -17,6 +17,12 @@ import { PgService } from '../common/services/pg.service';
  */
 const API = 'https://ads.vk.com/api/v2';
 
+// Тест/служебные номера и админы исключаются из подсчёта регистраций по кампании
+// (как в attribution/vmm/funnel), иначе тест-аккаунт с signup_campaign даёт
+// ложные «регистрации» по креативу (напр. creator_jun у 79656445804).
+const TEST_USERS = ['70000000000', '79030169187', '79169403771', '79656445804'];
+const TEST_PATTERN = '^790300[0-9]{5}$';
+
 @Injectable()
 export class VkAdsService implements OnModuleInit {
   private readonly log = new Logger(VkAdsService.name);
@@ -203,6 +209,8 @@ export class VkAdsService implements OnModuleInit {
                   COUNT(*) FILTER (WHERE user_id IN (SELECT user_id FROM payments WHERE status='succeeded'))::int AS payers
              FROM ai_profiles_consolidated
             WHERE signup_campaign IS NOT NULL
+              AND user_id <> ALL($2) AND user_id !~ $3
+              AND user_id NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
             GROUP BY 1
          )
          SELECT a.utm_campaign, a.utm_content, a.shows, a.clicks, a.spent, a.ctr, a.cpc,
@@ -211,7 +219,7 @@ export class VkAdsService implements OnModuleInit {
            FROM ads a
            LEFT JOIN reg r ON r.signup_campaign = a.utm_campaign || '/' || a.utm_content
           ORDER BY a.spent DESC`,
-        [String(windowDays)],
+        [String(windowDays), TEST_USERS, TEST_PATTERN],
       );
       const total = r.rows.reduce((t: any, x: any) => ({
         spent: t.spent + Number(x.spent || 0),
@@ -319,7 +327,10 @@ export class VkAdsService implements OnModuleInit {
                 COUNT(*) FILTER (WHERE user_id IN (SELECT user_id FROM payments WHERE status='succeeded'))::int AS payers
            FROM ai_profiles_consolidated
           WHERE signup_campaign IS NOT NULL AND signup_campaign <> ''
+            AND user_id <> ALL($1) AND user_id !~ $2
+            AND user_id NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
           GROUP BY 1`,
+        [TEST_USERS, TEST_PATTERN],
       );
       const regByKey = new Map<string, any>();
       for (const r of reg.rows) regByKey.set(r.signup_campaign, r);
