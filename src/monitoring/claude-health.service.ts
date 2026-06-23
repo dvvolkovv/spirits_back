@@ -73,7 +73,7 @@ interface UsageSnapshot {
   fetchedAt: string;
 }
 
-const ALERT_THRESHOLD_30D_USD = Number(process.env.CLAUDE_SPEND_ALERT_THRESHOLD_30D_USD || 100);
+const ALERT_THRESHOLD_30D_USD = Number(process.env.CLAUDE_SPEND_ALERT_THRESHOLD_30D_USD || 300);
 const ALERT_COOLDOWN_HOURS = Number(process.env.CLAUDE_SPEND_ALERT_COOLDOWN_H || 24);
 // Повторное напоминание о продолжающемся простое (после первого алерта — не
 // чаще раза в этот интервал).
@@ -109,7 +109,6 @@ export class ClaudeHealthService implements OnModuleInit {
     llmStatus: null, llmOutageKind: null, llmError: null, llmCheckedAt: null, llmLatencyMs: null,
     fetchedAt: new Date(0).toISOString(),
   };
-  private lastAlertAt: Date | null = null;
   // Liveness alert state. consecutiveDown — подряд-провалы CLI-пробы (сброс к 0
   // при ok и при рестарте). Факт «уже заалертили про этот простой» персистится в
   // monitor_alert_state, чтобы рестарт во время длящегося простоя не дублировал.
@@ -154,6 +153,14 @@ export class ClaudeHealthService implements OnModuleInit {
         [component, alerted],
       );
     } catch (e: any) { this.log.error(`setAlerted(${component}) failed: ${e.message}`); }
+  }
+  // Состояние + время последнего перехода (для persisted-кулдауна, переживает рестарт PM2).
+  private async getAlertState(component: string): Promise<{ alerted: boolean; updatedAt: Date | null }> {
+    try {
+      const r = await this.pg.query(`SELECT alerted, updated_at FROM monitor_alert_state WHERE component=$1`, [component]);
+      if (!r.rows[0]) return { alerted: false, updatedAt: null };
+      return { alerted: r.rows[0].alerted === true, updatedAt: r.rows[0].updated_at ? new Date(r.rows[0].updated_at) : null };
+    } catch { return { alerted: false, updatedAt: null }; }
   }
 
   @Cron(CronExpression.EVERY_HOUR)
@@ -331,12 +338,23 @@ export class ClaudeHealthService implements OnModuleInit {
 
   private async maybeAlert(): Promise<void> {
     const c30 = this.cache.cost30dUsd;
-    if (c30 === null || c30 < ALERT_THRESHOLD_30D_USD) return;
+    if (c30 === null) return;
     const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
     const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '';
     if (!TG_TOKEN || !TG_CHAT) return;
-    const now = new Date();
-    if (this.lastAlertAt && (now.getTime() - this.lastAlertAt.getTime()) < ALERT_COOLDOWN_HOURS * 3600_000) {
+    const COMP = 'claude_spend';
+
+    // Ниже порога — сбросить флаг, чтобы при следующем превышении снова алертнуть.
+    if (c30 < ALERT_THRESHOLD_30D_USD) {
+      if (await this.getAlerted(COMP)) await this.setAlerted(COMP, false);
+      return;
+    }
+
+    // Превышение: алертим не чаще раза в ALERT_COOLDOWN_HOURS. Состояние persisted
+    // в monitor_alert_state (updated_at), поэтому рестарт PM2 НЕ сбрасывает кулдаун
+    // и не приводит к спаму (это был баг in-memory lastAlertAt).
+    const st = await this.getAlertState(COMP);
+    if (st.alerted && st.updatedAt && (Date.now() - st.updatedAt.getTime()) < ALERT_COOLDOWN_HOURS * 3600_000) {
       return;
     }
     try {
@@ -349,7 +367,7 @@ export class ClaudeHealthService implements OnModuleInit {
               `Подписка: ${this.cache.subscriptionType || 'не определена'}\n` +
               `Биллинг: https://console.anthropic.com/settings/billing`,
       }, { timeout: 8000 });
-      this.lastAlertAt = now;
+      await this.setAlerted(COMP, true); // пишет updated_at=now → старт кулдауна
       this.log.warn(`Claude spend over threshold: $${c30} — Telegram alert sent`);
     } catch (e: any) {
       this.log.error(`Telegram alert failed: ${e?.message || 'unknown'}`);
