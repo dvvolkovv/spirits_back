@@ -277,6 +277,14 @@ export class VpmService implements OnModuleInit {
           avg_messages: b.avgMessages,
           retention_14d_pct: b.retention14dPct,
           top_assistant: b.topAssistants?.[0]?.displayName ?? b.topAssistants?.[0]?.name ?? null,
+          // Полный breakdown по ассистентам внутри персоны (топ-3, доля сообщений
+          // в %) — чтобы видеть, КАКИЕ ассистенты держат самый ценный (Business) и
+          // не конвертящий (Mixed) сегменты, а не только #1. Пусто = у персоны не
+          // захвачен assistant_id в событиях (само по себе сигнал к доработке трекинга).
+          assistant_breakdown: (b.topAssistants ?? []).map((a) => ({
+            assistant: a.displayName ?? a.name,
+            share_pct: Math.round(a.share * 100),
+          })),
         })),
       };
     } catch { /* silent */ }

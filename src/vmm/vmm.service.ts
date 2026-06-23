@@ -253,6 +253,10 @@ export class VmmService implements OnModuleInit {
           avg_payment_rub: b.avgPaymentRub,
           retention_14d_pct: b.retention14dPct,
           top_assistant: b.topAssistants?.[0]?.displayName ?? b.topAssistants?.[0]?.name ?? null,
+          assistant_breakdown: (b.topAssistants ?? []).map((a) => ({
+            assistant: a.displayName ?? a.name,
+            share_pct: Math.round(a.share * 100),
+          })),
         })),
       };
     } catch { /* silent */ }
