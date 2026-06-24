@@ -96,7 +96,8 @@ export class OfferService implements OnModuleInit {
     const firstChatNudge =
       !paid && !inCooldown && !eligible && n >= 1 &&
       !!firstChat && Date.now() - firstChat.getTime() >= FIRST_CHAT_DELAY_MS;
-    return { eligible, first_chat_nudge: firstChatNudge, referral_nudge: referralNudge, bonus_pct: OFFER_BONUS_PCT, message_count: n };
+    // paid — нужен фронту для session-peak паунолла Романа (d6b733de): не наджим платящих.
+    return { eligible, first_chat_nudge: firstChatNudge, referral_nudge: referralNudge, bonus_pct: OFFER_BONUS_PCT, message_count: n, paid };
   }
 
   async dismiss(userId: string, kind: 'offer' | 'referral' = 'offer') {
