@@ -227,6 +227,7 @@ export class AdminService {
   //  шлёт; send требует confirm:true; cooldown 14 дней + лог в events не дают
   //  доставать человека повторно.
   private static readonly RETENTION_CAMPAIGN = 'retention_reengage_v1';
+  private static readonly CURIOUS_CAMPAIGN = 'curious_return_v1';   // 3a54efe4
   private static readonly RETENTION_COOLDOWN_DAYS = 14;
   private static readonly ACTIVATION_CAMPAIGN = 'activation_nudge_v1';
   private static readonly ACTIVATION_COOLDOWN_DAYS = 14;
@@ -340,6 +341,92 @@ export class AdminService {
     }
     return {
       campaign: AdminService.RETENTION_CAMPAIGN,
+      sent: results.filter((r) => r.status === 'sent').length,
+      failed: results.filter((r) => r.status === 'failed').length,
+      skipped_cooldown: drafts.length - targets.length,
+      results,
+    };
+  }
+
+  // --- Curious return-trigger (3a54efe4): персона Curious (одна глубокая сессия,
+  //  не возвращаются) — мягкий SMS-повод вернуться за второй сессией через 24–48ч.
+  //  Окно и сегмент отличаются от общего retention; свой campaign для отдельного
+  //  кулдауна/лога. Та же необратимость: preview ничего не шлёт; send — confirm:true.
+  private buildCuriousReturnMessage(): string {
+    // Согласован с владельцем. Generic (не по ассистенту) — у Curious контекст тонкий.
+    return 'Здравствуйте! Напомним, что у нас есть ассистенты под любые задачи. Если есть время и желание — приходите в https://my.linkeon.io/chat и повышайте свою эффективность 👍';
+  }
+
+  /** Curious: последний чат 24–48ч назад и <5 сообщений всего. Ничего не шлёт. */
+  async buildCuriousReturnOutreach() {
+    const seg = await this.pg.query(
+      `WITH last_chat AS (
+         SELECT split_part(session_id,'_',1) AS uid, max(created_at) AS last_at
+           FROM custom_chat_history
+          WHERE sender_type='human'
+            AND split_part(session_id,'_',1) ~ '^7[0-9]{10}$'
+            AND split_part(session_id,'_',1) <> ALL($1)
+            AND split_part(session_id,'_',1) !~ $2
+          GROUP BY 1
+       ),
+       msgcnt AS (
+         SELECT user_id, COUNT(*) AS n FROM events WHERE name='message_sent' GROUP BY 1
+       )
+       SELECT lc.uid AS phone, lc.last_at,
+              round(EXTRACT(EPOCH FROM now()-lc.last_at)/3600.0)::int AS hours_inactive
+         FROM last_chat lc
+         JOIN msgcnt mc ON mc.user_id = lc.uid
+        WHERE lc.last_at < now() - interval '24 hours'
+          AND lc.last_at > now() - interval '48 hours'
+          AND mc.n < 5                                                            -- персона Curious
+          AND lc.uid NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
+        ORDER BY lc.last_at DESC`,
+      [AdminService.TEST_USERS, AdminService.TEST_PATTERN],
+    );
+    const msg = this.buildCuriousReturnMessage();
+    const drafts = await Promise.all(seg.rows.map(async (r: any) => {
+      const sent = await this.pg.query(
+        `SELECT ts FROM events WHERE name='retention_outreach' AND user_id=$1
+            AND props->>'campaign'=$2 AND props->>'status'='sent' ORDER BY ts DESC LIMIT 1`,
+        [r.phone, AdminService.CURIOUS_CAMPAIGN],
+      );
+      const lastSentAt = sent.rows[0]?.ts || null;
+      const inCooldown = lastSentAt
+        ? (Date.now() - new Date(lastSentAt).getTime()) < AdminService.RETENTION_COOLDOWN_DAYS * 864e5
+        : false;
+      return { phone: r.phone, last_at: r.last_at, hours_inactive: r.hours_inactive, message: msg, last_sent_at: lastSentAt, in_cooldown: inCooldown };
+    }));
+    return {
+      channel: 'sms', campaign: AdminService.CURIOUS_CAMPAIGN,
+      window: { min_hours: 24, max_hours: 48 }, cooldown_days: AdminService.RETENTION_COOLDOWN_DAYS,
+      count: drafts.length, drafts,
+    };
+  }
+
+  /** Send Curious return SMS. GATED: confirm:true (владелец). */
+  async sendCuriousReturnOutreach(data: { confirm?: boolean; phones?: string[]; resend?: boolean }) {
+    if (!data?.confirm) {
+      return { error: 'confirm_required', message: 'Отправка реальным пользователям требует confirm:true (подтверждение владельца).' };
+    }
+    const { drafts } = await this.buildCuriousReturnOutreach();
+    let targets = drafts;
+    if (Array.isArray(data.phones) && data.phones.length) {
+      const set = new Set(data.phones);
+      targets = targets.filter((d) => set.has(d.phone));
+    }
+    if (!data.resend) targets = targets.filter((d) => !d.in_cooldown);
+    const results: Array<{ phone: string; status: string; error: string | null }> = [];
+    for (const d of targets) {
+      const r = await this.sendOutreachSms(d.phone, d.message);
+      const status = r.ok ? 'sent' : 'failed';
+      await this.pg.query(
+        `INSERT INTO events (user_id, name, props) VALUES ($1, 'retention_outreach', $2::jsonb)`,
+        [d.phone, JSON.stringify({ phone: d.phone, status, campaign: AdminService.CURIOUS_CAMPAIGN, error: r.error || null })],
+      ).catch((e) => this.logger.warn(`curious outreach log insert failed: ${e.message}`));
+      results.push({ phone: d.phone, status, error: r.error || null });
+    }
+    return {
+      campaign: AdminService.CURIOUS_CAMPAIGN,
       sent: results.filter((r) => r.status === 'sent').length,
       failed: results.filter((r) => r.status === 'failed').length,
       skipped_cooldown: drafts.length - targets.length,

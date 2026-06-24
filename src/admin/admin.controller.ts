@@ -223,6 +223,15 @@ export class AdminController {
         const out = await this.adminService.sendRetentionOutreach(data);
         return res.status((out as any).error ? 400 : 200).json(out);
       }
+      // Curious return-trigger (3a54efe4): сегмент Curious, окно 24–48ч.
+      case 'curious_preview': {
+        const out = await this.adminService.buildCuriousReturnOutreach();
+        return res.status(200).json(out);
+      }
+      case 'curious_send': {
+        const out = await this.adminService.sendCuriousReturnOutreach(data);
+        return res.status((out as any).error ? 400 : 200).json(out);
+      }
       default:
         return res.status(400).json({ error: `Unknown action: ${action}` });
     }
