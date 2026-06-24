@@ -219,9 +219,9 @@ export class PersonasService implements OnModuleInit {
           m.user_id,
           CASE
             WHEN COALESCE(g.gen_count, 0) >= 5                     THEN 'content_creator'
-            WHEN m.smm / NULLIF(m.total, 0) >= 0.40                THEN 'smm'
-            WHEN m.biz / NULLIF(m.total, 0) >= 0.40                THEN 'business'
-            WHEN m.per / NULLIF(m.total, 0) >= 0.40                THEN 'personal_growth'
+            WHEN m.smm::numeric / NULLIF(m.total, 0) >= 0.40       THEN 'smm'
+            WHEN m.biz::numeric / NULLIF(m.total, 0) >= 0.40       THEN 'business'
+            WHEN m.per::numeric / NULLIF(m.total, 0) >= 0.40       THEN 'personal_growth'
             WHEN m.total < 5                                       THEN 'curious'
             ELSE 'mixed'
           END AS persona
