@@ -70,12 +70,12 @@ export class SpeechkitSttService implements OnModuleInit {
     call.on('data', (resp: any) => {
       const pull = (u: any) => (u?.alternatives || []).map((a: any) => a.text).join(' ').trim();
       if (resp.partial) { const t = pull(resp.partial); if (t) cb.onPartial(t); }
+      // Коммитим финал РОВНО ОДИН раз. SpeechKit на одну фразу шлёт и `final`,
+      // и позже `final_refinement.normalized_text` (нормализованный тот же текст) —
+      // коммит обоих давал дубль (одно сразу, второе с задержкой). Берём только
+      // final. (Нормализацию чисел/дат можно вернуть позже как REPLACE последнего
+      // сегмента, а не append — иначе снова дубль.)
       if (resp.final) { const t = pull(resp.final); if (t) cb.onFinal(t); }
-      // final_refinement.normalized_text — нормализованный финал (числа/даты), приоритетнее
-      if (resp.final_refinement?.normalized_text) {
-        const t = pull(resp.final_refinement.normalized_text);
-        if (t) cb.onFinal(t);
-      }
     });
     call.on('error', (err: Error) => { safeClose(); cb.onError(err); });
     call.on('end', () => { safeClose(); cb.onEnd(); });
