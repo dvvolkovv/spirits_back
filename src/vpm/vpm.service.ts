@@ -310,6 +310,14 @@ export class VpmService implements OnModuleInit {
       snapshot.sessions_by_persona = sbp.byPersona;
     } catch { /* silent */ }
 
+    // Открытия приложения vs чат-сессии по персонам за 7d (7311bfb9): диагностика
+    // барьера — низкий chat/open ratio = discovery (открывают, но не пишут),
+    // ~0 открытий = re-engagement (не возвращаются). app_open инструментирован
+    // на фронте недавно — наполняется вперёд.
+    try {
+      snapshot.opens_vs_chats_by_persona = await this.personas.opensVsChatsByPersona();
+    } catch { /* silent */ }
+
     snapshot.baseline_note =
       'usage.* (chat_calls_7d/30d, active_users_7d) come from the events table, where chat instrumentation ' +
       'started 2026-06-01 — so chat_calls_7d == chat_calls_30d is EXPECTED until 30d of events accrue, not a bug. ' +

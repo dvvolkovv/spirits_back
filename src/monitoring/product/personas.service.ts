@@ -430,4 +430,79 @@ export class PersonasService implements OnModuleInit {
       return { avgSessionsPerUser: null, totalSessions: 0, byPersona: [] };
     }
   }
+
+  // Открытия приложения vs чат-сессии по персонам за 7d (задача 7311bfb9).
+  // app_opens_7d — события app_open (открытие авторизованным юзером, ставится
+  // фронтом раз на сессию браузера). chat_sessions_7d — диалоги с ≥1 сообщением
+  // за 7d. Ratio chat/open диагностирует барьер Mixed: низкий ratio → discovery
+  // (открывают, но не пишут); ~0 открытий → re-engagement (не возвращаются).
+  async opensVsChatsByPersona(): Promise<Array<{
+    persona: PersonaKey; appOpens7d: number; chatSessions7d: number; chatToOpenRatio: number | null;
+  }>> {
+    const sql = `
+      WITH
+      msg AS (
+        SELECT e.user_id, COUNT(*) AS total_msgs,
+               SUM(CASE WHEN a.category='business' THEN 1 ELSE 0 END)::numeric AS biz_msgs,
+               SUM(CASE WHEN a.category='personal' THEN 1 ELSE 0 END)::numeric AS per_msgs,
+               SUM(CASE WHEN a.category='smm'      THEN 1 ELSE 0 END)::numeric AS smm_msgs
+          FROM events e LEFT JOIN agents a ON a.id::text = (e.props->>'assistant_id')
+         WHERE e.name='message_sent' AND e.user_id IS NOT NULL
+           AND e.user_id <> ALL($1::text[])
+           AND e.user_id NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
+         GROUP BY e.user_id
+      ),
+      gen AS (
+        SELECT user_id, SUM(c) AS gen_count FROM (
+          SELECT user_id, COUNT(*) AS c FROM generated_images GROUP BY 1
+          UNION ALL SELECT user_id, COUNT(*) AS c FROM video_jobs GROUP BY 1
+        ) x GROUP BY 1
+      ),
+      classified AS (
+        SELECT m.user_id,
+          CASE
+            WHEN COALESCE(g.gen_count,0) >= 5      THEN 'content_creator'
+            WHEN m.smm_msgs / m.total_msgs >= 0.40 THEN 'smm'
+            WHEN m.biz_msgs / m.total_msgs >= 0.40 THEN 'business'
+            WHEN m.per_msgs / m.total_msgs >= 0.40 THEN 'personal_growth'
+            WHEN m.total_msgs < 5                  THEN 'curious'
+            ELSE 'mixed'
+          END AS persona
+        FROM msg m LEFT JOIN gen g ON g.user_id = m.user_id
+      ),
+      opens AS (
+        SELECT user_id, COUNT(*) AS n FROM events
+         WHERE name='app_open' AND user_id IS NOT NULL AND ts > now()-interval '7 days'
+         GROUP BY user_id
+      ),
+      chats AS (
+        SELECT split_part(session_id,'_',1) AS uid, COUNT(DISTINCT session_id) AS n
+          FROM custom_chat_history
+         WHERE sender_type='human' AND created_at > now()-interval '7 days'
+         GROUP BY 1
+      )
+      SELECT c.persona,
+             COALESCE(SUM(o.n),0)::int  AS app_opens_7d,
+             COALESCE(SUM(ch.n),0)::int AS chat_sessions_7d
+        FROM classified c
+        LEFT JOIN opens o  ON o.user_id = c.user_id
+        LEFT JOIN chats ch ON ch.uid    = c.user_id
+       GROUP BY c.persona`;
+    try {
+      const r = await this.pg.query(sql, [excluded]);
+      return r.rows.map((x: any) => {
+        const opens = Number(x.app_opens_7d) || 0;
+        const chats = Number(x.chat_sessions_7d) || 0;
+        return {
+          persona: x.persona as PersonaKey,
+          appOpens7d: opens,
+          chatSessions7d: chats,
+          chatToOpenRatio: opens > 0 ? Math.round((chats / opens) * 100) / 100 : null,
+        };
+      });
+    } catch (e: any) {
+      this.log.error(`opensVsChatsByPersona failed: ${e.message}`);
+      return [];
+    }
+  }
 }
