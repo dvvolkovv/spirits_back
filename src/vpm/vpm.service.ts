@@ -226,6 +226,19 @@ export class VpmService implements OnModuleInit {
            (SELECT COUNT(*) FROM referral_leaders WHERE is_active)                                 AS referral_active_leaders`,
       );
       snapshot.referral = ref.rows[0];
+      // Топ-3 точки касания по кликам за 7d (71afe7f7): какая из 5 механик
+      // (dashboard_cta / notification_link / in_chat_share / profile_share /
+      // manual_copy) реально даёт клики, а какие мертвы. touch встроен в ссылку
+      // (&rt=) и читается на приходе → events.referral_click.props.referral_touch.
+      const touch = await this.pg.query(
+        `SELECT COALESCE(NULLIF(props->>'referral_touch',''),'direct') AS touch, COUNT(*)::int AS clicks
+           FROM events
+          WHERE name='referral_click' AND ts > now()-interval '7 days'
+          GROUP BY 1 ORDER BY 2 DESC LIMIT 3`,
+      );
+      snapshot.referral.touchpoints_7d = touch.rows.map((r: any) => ({
+        touch: r.touch, clicks: Number(r.clicks) || 0,
+      }));
     } catch { /* silent */ }
 
     // 6b. Registration channel attribution (backlog e6dd4d6f). The source is
