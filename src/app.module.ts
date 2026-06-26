@@ -33,6 +33,7 @@ import { VkAdsModule } from './vk-ads/vk-ads.module';
 import { OfferModule } from './offer/offer.module';
 import { TgBotModule } from './tg-bot/tg-bot.module';
 import { VoiceModule } from './voice/voice.module';
+import { VoiceAvatarModule } from './voice-avatar/voice-avatar.module';
 
 @Module({
   imports: [
@@ -70,6 +71,7 @@ import { VoiceModule } from './voice/voice.module';
     OfferModule,
     TgBotModule,
     VoiceModule,
+    VoiceAvatarModule,
   ],
 })
 export class AppModule {}
