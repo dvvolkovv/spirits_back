@@ -1053,12 +1053,18 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     // надбавку за speech-to-speech. На финализации Veo дорожка заменяется на голос
     // пользователя (applyOwnVoiceIfNeeded), при сбое — fallback на нативный голос.
     let ownVoice = false;
+    let voiceDirection: string | null = null;
     if (dto.ownVoice) {
-      if (!(await this.voice.hasReadyVoice(userId))) {
+      const vr = await this.voice.getUserVoice(userId);
+      if (!vr || vr.status !== 'ready' || !vr.elevenlabs_voice_id) {
         throw new BadRequestException('own voice not ready — upload a voice sample first');
       }
       ownVoice = true;
       cost += computeOwnVoiceSurcharge(target);
+      // Авто-дескриптор голоса (профайлер): зададим голос Veo-рассказчика близким
+      // к юзеру → у speech-to-speech минимум примеси (источник≈цель). Инжектим
+      // в промпт ниже, до нарезки сегментов.
+      voiceDirection = vr.voice_descriptor?.veo_voice_prompt || null;
     }
 
     // Veo extend требует вход 720p — поэтому в extend-цепочке 1080p возможен
@@ -1099,6 +1105,12 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     // «взлёт» — фидбэк katya). Безопасный словарь (eyo) правит только однозначные
     // слова, не вводя ошибок. Снимает целый класс е/ё-ошибок без ручной работы.
     prompt = this.yofy(prompt);
+
+    // «Голосом оригинала»: добавляем голос-директиву из авто-дескриптора, чтобы
+    // Veo-рассказчик звучал близко к юзеру (источник для последующего STS).
+    if (ownVoice && voiceDirection) {
+      prompt = `${prompt} VOICE DIRECTION (the narrator must speak in this voice): ${voiceDirection}`;
+    }
 
     const segmentPrompts = this.buildVeoSegmentPrompts(prompt, quote.segments);
     const plan: ComposedPlan = {
