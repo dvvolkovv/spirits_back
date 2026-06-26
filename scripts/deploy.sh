@@ -228,7 +228,15 @@ warm_chat_path() {
       -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
       -d '{"chatInput":"deploy warmup","assistant":"12"}' >/dev/null 2>&1 || true
   done
-  green "  ✓ chat+browser paths warmed ($base)"
+  # Юля/smm_producer (id=15) — ОТДЕЛЬНЫЙ тяжёлый путь (Claude Agent SDK + in-process
+  # MCP tools, ветка по agent.name в chat.service), не покрытый прогревом Романа.
+  # Холодный первый вызов медленный (>20с) → browser-smoke julia-creator.spec.js
+  # падает И его churn роняет соседние render-тесты (per-tab). Root-cause 2026-06-26
+  # (backlog ad11a003): warm = зелёно 7/7, cold-after-restart = красно. Будим заранее.
+  curl -s ${ca[@]+${ca[@]+"${ca[@]}"}} -m 90 -X POST "$base/webhook/soulmate/chat" \
+    -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
+    -d '{"chatInput":"deploy warmup","assistant":"15"}' >/dev/null 2>&1 || true
+  green "  ✓ chat+browser+smm paths warmed ($base)"
 }
 
 deploy_backend() {
