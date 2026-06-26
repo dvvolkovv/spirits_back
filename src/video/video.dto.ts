@@ -1,5 +1,5 @@
 // src/video/video.dto.ts
-import { IsString, IsOptional, IsNumber, IsIn, IsObject, IsArray, Min, Max } from 'class-validator';
+import { IsString, IsOptional, IsNumber, IsIn, IsObject, IsArray, IsBoolean, Min, Max } from 'class-validator';
 
 export type VideoMode = 'text2video' | 'image2video' | 'extend' | 'lipsync';
 export type VideoModel = 'kling-v1-6' | 'kling-v2-master' | 'veo-3.1-fast' | 'veo-3.1';
@@ -75,6 +75,12 @@ export class CreateVideoJobDto {
 
   @IsOptional() @IsString()
   audioUrl?: string;
+
+  // «Голосом оригинала» (96cba3f7): только Veo. После генерации финальная
+  // аудиодорожка заменяется на голос пользователя (clone + speech-to-speech),
+  // тайминг/липсинк сохраняются. Требует готового user_voice.
+  @IsOptional() @IsBoolean()
+  ownVoice?: boolean;
 }
 
 export interface ComposedPlan {
@@ -139,6 +145,7 @@ export interface VideoJobRow {
   updated_at: string;
   target_duration_sec: number | null;
   composed_plan: ComposedPlan | null;
+  own_voice?: boolean;
 }
 
 export const VIDEO_PRICING: Record<string, number> = {
@@ -249,4 +256,20 @@ export function computeVeoConcatQuote(model: VideoModel, targetDurationSec: numb
     rawDurationSec: clips * VEO_BASE_SEC,
     totalCost: clips * p.base,
   };
+}
+
+// Надбавка за «видео голосом оригинала» = себестоимость ElevenLabs speech-to-speech
+// × тот же markup, что у Veo. Veo-основа (комментарий выше): fast $0.15/с → 90k
+// токенов за 8с = $1.20 ⇒ 75 000 токенов за $1 (сходится на standard: $0.40/с →
+// 240k/8с). STS биллится по символам; символы ролика ≈ длительность × ~15 симв/с;
+// публичная ставка ElevenLabs ~$0.30 за 1000 символов. Итого ≈ 338 токенов/сек —
+// мизер против Veo (90k/8с). Подтверждено владельцем 2026-06-26 (96cba3f7).
+const STS_CHARS_PER_SEC = 15;
+const STS_USD_PER_1K_CHARS = 0.30;
+const VOICE_TOKENS_PER_USD = 75_000;
+export function computeOwnVoiceSurcharge(targetDurationSec: number): number {
+  const sec = Math.max(1, Math.round(targetDurationSec || 0));
+  const chars = sec * STS_CHARS_PER_SEC;
+  const usd = (chars / 1000) * STS_USD_PER_1K_CHARS;
+  return Math.ceil(usd * VOICE_TOKENS_PER_USD);
 }

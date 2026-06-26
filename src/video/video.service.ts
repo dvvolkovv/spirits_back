@@ -11,8 +11,9 @@ import { VeoService } from '../misc/veo.service';
 import {
   CreateVideoJobDto, VideoJobRow, ComposedPlan, computeTokenCost, computeComposedQuote,
   VideoMode, VideoModel, VideoQuality,
-  isVeoModel, veoTier, computeVeoQuote, computeVeoConcatQuote,
+  isVeoModel, veoTier, computeVeoQuote, computeVeoConcatQuote, computeOwnVoiceSurcharge,
 } from './video.dto';
+import { VoiceAvatarService } from '../voice-avatar/voice-avatar.service';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, CreateBucketCommand, PutBucketPolicyCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import axios from 'axios';
@@ -84,6 +85,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     private readonly kling: KlingService,
     private readonly misc: MiscService,
     private readonly veo: VeoService,
+    private readonly voice: VoiceAvatarService,
   ) {}
 
   async createJob(
@@ -394,6 +396,22 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         }
       } catch (e: any) {
         this.logger.error(`video migration 002 failed (${p}): ${e.message}`);
+      }
+    }
+
+    // 003 — own_voice flag (видео голосом оригинала, 96cba3f7). Idempotent.
+    for (const p of [
+      path.join(__dirname, 'migrations', '003_own_voice.sql'),
+      path.join(__dirname, '..', '..', 'src', 'video', 'migrations', '003_own_voice.sql'),
+    ]) {
+      try {
+        if (fs.existsSync(p)) {
+          await this.pg.query(fs.readFileSync(p, 'utf8'));
+          this.logger.log(`video migration 003 applied from ${p}`);
+          break;
+        }
+      } catch (e: any) {
+        this.logger.error(`video migration 003 failed (${p}): ${e.message}`);
       }
     }
 
@@ -1029,7 +1047,19 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     // вертикаль (≤8с) идут прежним путём (база + native extend).
     const veoConcat = aspectRatio === '9:16' && target > 8;
     const quote = veoConcat ? computeVeoConcatQuote(model, target) : computeVeoQuote(model, target);
-    const cost = quote.totalCost;
+    let cost = quote.totalCost;
+
+    // «Голосом оригинала» (96cba3f7): только при готовом клоне у юзера; добавляем
+    // надбавку за speech-to-speech. На финализации Veo дорожка заменяется на голос
+    // пользователя (applyOwnVoiceIfNeeded), при сбое — fallback на нативный голос.
+    let ownVoice = false;
+    if (dto.ownVoice) {
+      if (!(await this.voice.hasReadyVoice(userId))) {
+        throw new BadRequestException('own voice not ready — upload a voice sample first');
+      }
+      ownVoice = true;
+      cost += computeOwnVoiceSurcharge(target);
+    }
 
     // Veo extend требует вход 720p — поэтому в extend-цепочке 1080p возможен
     // ТОЛЬКО для односегментных роликов (≤8с). В concat-режиме каждый клип —
@@ -1097,9 +1127,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       await client.query(`UPDATE ai_profiles_consolidated SET tokens = tokens - $1 WHERE user_id = $2`, [cost, userId]);
       const ins = await client.query(
         `INSERT INTO video_jobs (user_id, mode, model, quality, duration_sec, prompt, negative_prompt,
-            source_image_url, tokens_spent, status, target_duration_sec, composed_plan)
-         VALUES ($1,$2,$3,'std',8,$4,$5,$6,$7,'pending',$8,$9) RETURNING id`,
-        [userId, mode, model, prompt, dto.negativePrompt ?? null, imgUrlAbsolute, cost, target, JSON.stringify(plan)],
+            source_image_url, tokens_spent, status, target_duration_sec, composed_plan, own_voice)
+         VALUES ($1,$2,$3,'std',8,$4,$5,$6,$7,'pending',$8,$9,$10) RETURNING id`,
+        [userId, mode, model, prompt, dto.negativePrompt ?? null, imgUrlAbsolute, cost, target, JSON.stringify(plan), ownVoice],
       );
       jobId = (ins.rows[0] as any).id as string;
       await client.query('COMMIT');
@@ -1255,6 +1285,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
           const url = await this.storeVeoFinal(job.id, buf, plan.target_duration_sec);
           let thumbUrl: string | null = null;
           try { thumbUrl = await this.extractAndUploadThumbnail(job.id, url); } catch { /* nice-to-have */ }
+          await this.applyOwnVoiceIfNeeded(job.id, job.user_id);
           await this.pg.query(
             `UPDATE video_jobs SET status='ready', video_url=$1, thumbnail_url=$2, composed_plan=$3, updated_at=now() WHERE id=$4`,
             [url, thumbUrl, JSON.stringify(plan), job.id],
@@ -1302,6 +1333,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         );
         let thumbUrl: string | null = null;
         try { thumbUrl = await this.extractAndUploadThumbnail(job.id, url); } catch { /* nice-to-have */ }
+        await this.applyOwnVoiceIfNeeded(job.id, job.user_id);
         await this.pg.query(
           `UPDATE video_jobs SET status='ready', video_url=$1, thumbnail_url=$2, updated_at=now() WHERE id=$3`,
           [url, thumbUrl, job.id],
@@ -1477,6 +1509,59 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
 
   // Write the Veo mp4, ffmpeg-trim to the exact requested length (the native
   // extend chain overshoots in 7s steps), serve from public/videos via Nginx.
+  // Замена аудиодорожки Veo на голос пользователя (96cba3f7): extract → STS →
+  // remux поверх готового public/videos/{jobId}.mp4. Тайминг/липсинк сохраняются
+  // (STS не меняет длительность). Best-effort: при ЛЮБОМ сбое оставляем нативный
+  // голос Veo (ролик не теряется) — только пишем в лог.
+  private async applyOwnVoiceIfNeeded(jobId: string, userId: string): Promise<void> {
+    let flagged = false;
+    try {
+      const r = await this.pg.query(`SELECT own_voice FROM video_jobs WHERE id=$1`, [jobId]);
+      flagged = !!(r.rows[0] as any)?.own_voice;
+    } catch { return; }
+    if (!flagged) return;
+
+    const voice = await this.voice.getUserVoice(userId);
+    if (!voice || voice.status !== 'ready' || !voice.elevenlabs_voice_id) {
+      this.logger.warn(`own_voice: job ${jobId} flagged but user ${userId} has no ready voice — keeping native Veo audio`);
+      return;
+    }
+    const publicDir = process.env.PUBLIC_DIR ? process.env.PUBLIC_DIR : path.resolve(process.cwd(), 'public');
+    const finalPath = path.join(publicDir, 'videos', `${jobId}.mp4`);
+    if (!fs.existsSync(finalPath)) {
+      this.logger.warn(`own_voice: final file missing for ${jobId} (${finalPath}) — keeping native`);
+      return;
+    }
+    const tmpDir = path.join(os.tmpdir(), `ov_${jobId}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+    try {
+      const srcAudio = path.join(tmpDir, 'src.mp3');
+      await this.runFfmpeg(['-y', '-i', finalPath, '-vn', '-ac', '1', '-ar', '44100', '-b:a', '192k', srcAudio]);
+      const converted = await this.voice.convert(voice.elevenlabs_voice_id, fs.readFileSync(srcAudio));
+      const convAudio = path.join(tmpDir, 'voice.mp3');
+      fs.writeFileSync(convAudio, converted);
+      const outPath = path.join(tmpDir, 'out.mp4');
+      await this.runFfmpeg(['-y', '-i', finalPath, '-i', convAudio, '-map', '0:v:0', '-map', '1:a:0',
+        '-c:v', 'copy', '-c:a', 'aac', '-shortest', '-movflags', '+faststart', outPath]);
+      fs.copyFileSync(outPath, finalPath);
+      this.logger.log(`own_voice applied to job ${jobId} (voice ${voice.elevenlabs_voice_id})`);
+    } catch (e: any) {
+      this.logger.error(`own_voice failed for ${jobId} (keeping native Veo audio): ${e.message}`);
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    }
+  }
+
+  private runFfmpeg(args: string[]): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const ff = spawn('ffmpeg', args);
+      let stderr = '';
+      ff.stderr.on('data', (d) => { stderr += d.toString(); });
+      ff.on('error', reject);
+      ff.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}: ${stderr.slice(-300)}`))));
+    });
+  }
+
   private async storeVeoFinal(jobId: string, input: Buffer, targetSec: number): Promise<string> {
     const tmpDir = path.join(os.tmpdir(), `veo_${jobId}`);
     fs.mkdirSync(tmpDir, { recursive: true });
