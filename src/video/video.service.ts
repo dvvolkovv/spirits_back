@@ -1291,6 +1291,22 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       plan.veo_op_retries = 0;
 
       if (plan.segments_done >= plan.segments_total) {
+        // Claim finalization атомарно: applyOwnVoiceIfNeeded добавляет ~15с, и
+        // следующий 5-сек тик поллера успевает повторно войти в финал того же
+        // 'processing'-джоба → двойной STS+remux. Оптимистичный лок как в
+        // concat-пути (concat_started_at). Второй тик видит claim и выходит.
+        const claim = await this.pg.query(
+          `UPDATE video_jobs
+              SET composed_plan = composed_plan || jsonb_build_object('finalize_started_at', to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"')),
+                  updated_at = now()
+            WHERE id = $1 AND (composed_plan->>'finalize_started_at') IS NULL
+            RETURNING id`,
+          [job.id],
+        );
+        if ((claim.rowCount ?? 0) === 0) {
+          this.logger.debug(`Veo job ${job.id}: finalize already in flight, skipping`);
+          return;
+        }
         // Final segment — download, trim to exact target, store, mark ready.
         try {
           const buf = await this.veo.downloadVideo(st.videoUri);
