@@ -18,6 +18,19 @@ const PAYOUT_MIN_RUB = 100;
 const WITHDRAW_MIN_RUB = 1000;
 const WITHDRAW_METHODS = ['card', 'sbp'];
 
+// Авто-тиры комиссии L1: % растёт по числу ОПЛАТИВШИХ рефери (подтверждено
+// владельцем 2026-06-27). 0–4 → 10%, 5–14 → 12%, 15+ → 15%. Спец-сделки админа
+// (leader.commission_pct выше тира) сохраняются — берём max. L2-parent % не трогаем.
+const COMMISSION_TIERS: Array<{ min: number; pct: number }> = [
+  { min: 15, pct: 15 },
+  { min: 5, pct: 12 },
+  { min: 0, pct: 10 },
+];
+export function tierPct(paidReferees: number): number {
+  for (const t of COMMISSION_TIERS) if (paidReferees >= t.min) return t.pct;
+  return 10;
+}
+
 @Injectable()
 export class ReferralService implements OnModuleInit {
   private readonly logger = new Logger(ReferralService.name);
@@ -417,6 +430,20 @@ export class ReferralService implements OnModuleInit {
   /**
    * Called after successful payment to create referral commissions
    */
+  // Число УНИКАЛЬНЫХ оплативших рефери лидера (по L1-комиссиям) ВКЛЮЧАЯ текущего —
+  // для авто-тира комиссии. Текущий рефери добавляется через UNION, т.к. его
+  // L1-строка ещё не вставлена в момент расчёта.
+  private async countPaidReferees(leaderId: string, currentReferee: string): Promise<number> {
+    const r = await this.pg.query(
+      `SELECT COUNT(DISTINCT rp)::int AS n FROM (
+         SELECT referee_phone AS rp FROM referral_commissions WHERE leader_id = $1 AND commission_level = 1
+         UNION SELECT $2
+       ) u`,
+      [leaderId, currentReferee],
+    );
+    return Number((r.rows[0] as any)?.n || 1);
+  }
+
   async processPaymentCommission(refereePhone: string, paymentId: string, amountRub: number): Promise<void> {
     // Find which leader referred this user
     const referee = await this.pg.query(
@@ -427,12 +454,15 @@ export class ReferralService implements OnModuleInit {
 
     const { leader_id, commission_pct, parent_leader_id, parent_commission_pct } = referee.rows[0];
 
-    // Level 1 commission (direct leader)
-    const commissionRub = amountRub * (Number(commission_pct) / 100);
+    // Level 1 commission (direct leader) — авто-тир по числу оплативших рефери
+    // (включая текущего). max(тир, спец-сделка админа), чтобы не понижать ручные %.
+    const paidReferees = await this.countPaidReferees(leader_id, refereePhone);
+    const effectivePct = Math.max(tierPct(paidReferees), Number(commission_pct) || 0);
+    const commissionRub = amountRub * (effectivePct / 100);
     await this.pg.query(
       `INSERT INTO referral_commissions (leader_id, payment_id, referee_phone, commission_level, payment_amount_rub, commission_pct, commission_rub)
        VALUES ($1, $2, $3, 1, $4, $5, $6)`,
-      [leader_id, paymentId, refereePhone, amountRub, commission_pct, commissionRub],
+      [leader_id, paymentId, refereePhone, amountRub, effectivePct, commissionRub],
     );
 
     // Level 2 commission (parent leader, if exists)
