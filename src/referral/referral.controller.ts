@@ -22,6 +22,13 @@ export class ReferralController {
     return res.status(200).json(result);
   }
 
+  // ④ Лента реферальной активности (in-app уведомления): присоединился / заработал.
+  @Get('referral/activity')
+  @UseGuards(JwtGuard)
+  async activity(@CurrentUser() user: any, @Res() res: Response) {
+    return res.status(200).json(await this.referralService.getActivity(user.userId));
+  }
+
   // Вывод накопленных комиссий токенами на баланс (мгновенно).
   @Post('referral/payout')
   @UseGuards(JwtGuard)

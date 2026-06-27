@@ -430,6 +430,30 @@ export class ReferralService implements OnModuleInit {
   /**
    * Called after successful payment to create referral commissions
    */
+  // Лента реферальной активности для кабинета (in-app уведомления, ④): кто
+  // присоединился по ссылке + начисления комиссий. Телефоны рефери маскируем
+  // (приватность — минимизация раскрытия данных).
+  async getActivity(userId: string): Promise<{ items: Array<any> }> {
+    const l = await this.getOrCreateLeader(userId);
+    const mask = (p: any): string => {
+      const s = String(p || '').replace(/\D/g, '');
+      return s.length >= 4 ? '•••' + s.slice(-4) : 'друг';
+    };
+    const joined = await this.pg.query(
+      `SELECT registered_at AS at, referee_phone FROM referral_referees WHERE leader_id = $1 ORDER BY registered_at DESC LIMIT 30`,
+      [l.id],
+    );
+    const earned = await this.pg.query(
+      `SELECT created_at AS at, commission_rub, referee_phone, commission_level FROM referral_commissions WHERE leader_id = $1 ORDER BY created_at DESC LIMIT 30`,
+      [l.id],
+    );
+    const items = [
+      ...joined.rows.map((r: any) => ({ type: 'joined', at: r.at, who: mask(r.referee_phone) })),
+      ...earned.rows.map((r: any) => ({ type: 'earned', at: r.at, rub: Number(r.commission_rub), who: mask(r.referee_phone), level: r.commission_level })),
+    ].sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime()).slice(0, 20);
+    return { items };
+  }
+
   // Число УНИКАЛЬНЫХ оплативших рефери лидера (по L1-комиссиям) ВКЛЮЧАЯ текущего —
   // для авто-тира комиссии. Текущий рефери добавляется через UNION, т.к. его
   // L1-строка ещё не вставлена в момент расчёта.
