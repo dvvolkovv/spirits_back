@@ -71,7 +71,7 @@ export class AttributionService {
     try {
       const r = await this.pg.query(
         `WITH regs AS (
-           SELECT user_id, signup_source FROM ai_profiles_consolidated
+           SELECT user_id, signup_source, created_at FROM ai_profiles_consolidated
             WHERE created_at > now() - ($1 || ' days')::interval
               AND user_id <> ALL($2) AND user_id !~ $3
               AND user_id NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
@@ -111,7 +111,15 @@ export class AttributionService {
          )
          -- Источник: НАДЁЖНЫЙ signup_source (записан при регистрации) приоритетнее
          -- session-эвристики fs (она не доживает между визитами/доменами).
-         SELECT COALESCE(NULLIF(r.signup_source,''), fs.source, 'unknown') AS source,
+         -- Источник без сигнала: легаси (рег. до запуска трекинга 2026-06-10) →
+         -- «до трекинга» (источник никогда не сохранялся), а не «Неизвестно».
+         -- Реальный пробел трекинга после 06-10 (если будет) остаётся 'unknown'.
+         SELECT CASE
+                  WHEN COALESCE(NULLIF(r.signup_source,''), fs.source) IS NOT NULL
+                    THEN COALESCE(NULLIF(r.signup_source,''), fs.source)
+                  WHEN r.created_at < TIMESTAMP '2026-06-10' THEN 'до трекинга'
+                  ELSE 'unknown'
+                END AS source,
                 COUNT(*)::int                                        AS registrations,
                 COUNT(*) FILTER (WHERE c.uid IS NOT NULL)::int       AS activated,
                 COUNT(*) FILTER (WHERE p.user_id IS NOT NULL)::int   AS payers,
