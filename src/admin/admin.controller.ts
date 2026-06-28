@@ -203,6 +203,16 @@ export class AdminController {
         const out = await this.adminService.sendReferralOutreach(data);
         return res.status((out as any).error ? 400 : 200).json(out);
       }
+      case 'advocate_preview': {
+        // Адвокаты (вовлечённые платящие, 0 рефералов): только черновики SMS+email.
+        const out = await this.adminService.buildAdvocateOutreach();
+        return res.status(200).json(out);
+      }
+      case 'advocate_send': {
+        // Реальная рассылка адвокатам (SMS+email) — требует confirm:true.
+        const out = await this.adminService.sendAdvocateOutreach(data);
+        return res.status((out as any).error ? 400 : 200).json(out);
+      }
       default:
         return res.status(400).json({ error: `Unknown action: ${action}` });
     }

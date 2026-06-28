@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
+import * as nodemailer from 'nodemailer';
 import { PgService } from '../common/services/pg.service';
 
 @Injectable()
@@ -548,6 +549,148 @@ export class AdminService {
     } catch (e: any) {
       return { ok: false, error: e.message?.slice(0, 200) || 'network error' };
     }
+  }
+
+  // ===========================================================================
+  //  Advocate activation outreach — мотивируем «как 79066893121»: вовлечённые
+  //  платящие, ещё не приводившие рефералов. SMS + email. preview ничего не шлёт;
+  //  send требует confirm:true. Лог в events (advocate_outreach) + cooldown по факту
+  //  отправки. Это активация адвокатов (в дополнение к реактивации заслуженных лидеров).
+  // ===========================================================================
+  private static readonly ADVOCATE_CAMPAIGN = 'advocate_activation_v1';
+  private static readonly ADVOCATE_MIN_RESPONSES = 30;
+  private advoEmailTx: nodemailer.Transporter | null = null;
+
+  private getEmailTx(): nodemailer.Transporter | null {
+    if (this.advoEmailTx) return this.advoEmailTx;
+    const host = process.env.SMTP_HOST;
+    if (!host) return null;
+    this.advoEmailTx = nodemailer.createTransport({
+      host, port: parseInt(process.env.SMTP_PORT || '25'),
+      secure: false, tls: { rejectUnauthorized: false },
+    });
+    return this.advoEmailTx;
+  }
+
+  private async sendOutreachEmail(to: string, subject: string, html: string): Promise<{ ok: boolean; error?: string }> {
+    const tx = this.getEmailTx();
+    if (!tx) return { ok: false, error: 'smtp_not_configured' };
+    try {
+      await tx.sendMail({ from: process.env.EMAIL_FROM || 'noreply@linkeon.io', to, subject, html });
+      return { ok: true };
+    } catch (e: any) {
+      return { ok: false, error: e.message?.slice(0, 200) || 'smtp error' };
+    }
+  }
+
+  // get-or-create реф-slug юзеру (мог не заходить в реф-кабинет) — как в ReferralService.
+  private async ensureSlug(userId: string): Promise<string> {
+    const ex = await this.pg.query('SELECT slug FROM referral_leaders WHERE user_phone = $1 LIMIT 1', [userId]);
+    if (ex.rows.length) return ex.rows[0].slug;
+    for (let i = 0; i < 5; i++) {
+      const slug = (await this.pg.query(`SELECT substr(replace(gen_random_uuid()::text, '-', ''), 1, 8) AS s`)).rows[0].s as string;
+      const taken = await this.pg.query('SELECT 1 FROM referral_leaders WHERE slug = $1', [slug]);
+      if (taken.rows.length) continue;
+      const re = await this.pg.query('SELECT slug FROM referral_leaders WHERE user_phone = $1 LIMIT 1', [userId]);
+      if (re.rows.length) return re.rows[0].slug;
+      const ins = await this.pg.query('INSERT INTO referral_leaders (name, slug, user_phone) VALUES ($1, $2, $3) RETURNING slug', [userId, slug, userId]);
+      return ins.rows[0].slug;
+    }
+    throw new Error('could not allocate referral slug');
+  }
+
+  private buildAdvocateSms(link: string): string {
+    return `Linkeon: вы активно пользуетесь сервисом — пригласите друзей! Им +20 000 токенов на старт, вам % с их пополнений (ставка растёт: 12% от 5 друзей, 15% от 15). Ваша ссылка: ${link}`;
+  }
+  private buildAdvocateEmail(link: string): string {
+    return `<p>Здравствуйте!</p>`
+      + `<p>Вы активно пользуетесь Linkeon — спасибо, что вы с нами. Если сервис вам полезен, пригласите друзей:</p>`
+      + `<ul><li>другу — <b>+20 000 токенов</b> на старт,</li>`
+      + `<li>вам — <b>% с его пополнений</b>, и ставка растёт за результат: <b>12%</b> от 5 приглашённых, <b>15%</b> от 15.</li></ul>`
+      + `<p>Ваша персональная ссылка:<br><a href="${link}">${link}</a></p>`
+      + `<p>Без спешки, по желанию. Спасибо, что вы с нами!</p>`;
+  }
+
+  /** Черновики для вовлечённых платящих без рефералов. Ничего не шлёт. */
+  async buildAdvocateOutreach() {
+    const seg = await this.pg.query(
+      `WITH eng AS (
+         SELECT user_id, count(*) FILTER (WHERE name='response_received') AS resp, max(ts)::date AS last_seen
+           FROM events WHERE user_id IS NOT NULL GROUP BY 1
+       )
+       SELECT pr.user_id, pr.email, e.resp, e.last_seen
+         FROM ai_profiles_consolidated pr
+         JOIN eng e ON e.user_id = pr.user_id
+        WHERE pr.user_id IN (SELECT user_id FROM payments WHERE status='succeeded')
+          AND e.resp >= $3
+          AND pr.isadmin IS NOT TRUE
+          AND pr.user_id <> ALL($1) AND pr.user_id !~ $2
+          AND pr.user_id NOT IN (
+            SELECT l.user_phone FROM referral_leaders l
+             JOIN referral_referees rr ON rr.leader_id = l.id
+          )
+        ORDER BY e.resp DESC`,
+      [AdminService.TEST_USERS, AdminService.TEST_PATTERN, AdminService.ADVOCATE_MIN_RESPONSES],
+    );
+    const drafts = [];
+    for (const u of seg.rows) {
+      const slug = await this.ensureSlug(u.user_id);
+      const link = this.referralLink(slug);
+      const sent = await this.pg.query(
+        `SELECT ts FROM events WHERE name='advocate_outreach' AND user_id=$1 AND props->>'status'='sent' ORDER BY ts DESC LIMIT 1`,
+        [u.user_id],
+      );
+      const isPhone = /^7\d{10}$/.test(u.user_id);
+      drafts.push({
+        user_id: u.user_id,
+        phone: isPhone ? u.user_id : null,
+        email: u.email || null,
+        responses: Number(u.resp),
+        last_seen: u.last_seen,
+        slug, link,
+        sms: this.buildAdvocateSms(link),
+        email_subject: 'Пригласите друзей в Linkeon — им бонус, вам вознаграждение',
+        email_html: this.buildAdvocateEmail(link),
+        already_sent_at: sent.rows[0]?.ts || null,
+      });
+    }
+    return { channel: 'sms+email', campaign: AdminService.ADVOCATE_CAMPAIGN, count: drafts.length, drafts };
+  }
+
+  /** Реальная рассылка адвокатам (SMS+email). GATED: confirm:true. */
+  async sendAdvocateOutreach(data: { confirm?: boolean; user_ids?: string[]; resend?: boolean }) {
+    if (!data?.confirm) {
+      return { error: 'confirm_required', message: 'Отправка реальным пользователям требует confirm:true (подтверждение владельца).' };
+    }
+    const { drafts } = await this.buildAdvocateOutreach();
+    let targets = drafts;
+    if (Array.isArray(data.user_ids) && data.user_ids.length) {
+      const set = new Set(data.user_ids);
+      targets = targets.filter((d) => set.has(d.user_id));
+    }
+    if (!data.resend) targets = targets.filter((d) => !d.already_sent_at);
+
+    const results = [];
+    for (const d of targets) {
+      const sms = d.phone ? await this.sendOutreachSms(d.phone, d.sms) : { ok: false, error: 'no_phone' };
+      const email = d.email ? await this.sendOutreachEmail(d.email, d.email_subject, d.email_html) : { ok: false, error: 'no_email' };
+      const status = sms.ok || email.ok ? 'sent' : 'failed';
+      await this.pg.query(
+        `INSERT INTO events (user_id, name, props) VALUES ($1, 'advocate_outreach', $2::jsonb)`,
+        [d.user_id, JSON.stringify({
+          status, sms_ok: sms.ok, email_ok: email.ok,
+          campaign: AdminService.ADVOCATE_CAMPAIGN, error: sms.error || email.error || null,
+        })],
+      ).catch((e) => this.logger.warn(`advocate outreach log failed: ${e.message}`));
+      results.push({ user_id: d.user_id, sms_ok: sms.ok, email_ok: email.ok, status, error: sms.error || email.error || null });
+    }
+    return {
+      campaign: AdminService.ADVOCATE_CAMPAIGN,
+      sent: results.filter((r) => r.status === 'sent').length,
+      failed: results.filter((r) => r.status === 'failed').length,
+      skipped_already_sent: drafts.length - targets.length,
+      results,
+    };
   }
 
   async createReferralLeader(data: any) {
