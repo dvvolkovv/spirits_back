@@ -322,6 +322,15 @@ export class ReferralService implements OnModuleInit {
         this.events?.track('referral_referee_bonus', { userId, props: { tokens: bonusTokens, leader_id: leader.rows[0].id } });
         this.logger.log(`referee bonus: ${userId} +${bonusTokens} tokens (leader ${leader.rows[0].id})`);
       }
+      // Атрибуция (A): реферал = referral-источник. Пишем signup_source, если он
+      // пуст ИЛИ direct/organic — НЕ затираем реальный внешний канал (utm/ref-site).
+      // Иначе реферал, зашедший без ?ref в URL (через сохранённый slug), оставался
+      // бы 'direct' и не атрибутировался как реферальный в воронке.
+      await this.pg.query(
+        `UPDATE ai_profiles_consolidated SET signup_source = $2
+           WHERE user_id = $1 AND (signup_source IS NULL OR signup_source IN ('direct','organic'))`,
+        [userId, 'referral:' + slug],
+      ).catch(() => {});
     }
     return { success: true, leader_name: leader.rows[0].name, bonus_tokens: bonusTokens };
   }
