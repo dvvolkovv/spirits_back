@@ -78,6 +78,37 @@ export class FunnelService {
     });
   }
 
+  // Шаг «первое сообщение/ответ»: атомарное событие ИЛИ реальная строка в
+  // custom_chat_history (server-side истина). Закрывает дыру трекинга — до
+  // появления событий message_sent/response_received (~2026-06) юзеры получали
+  // ответы, но события не писались → воронка их теряла. В истории нет source,
+  // поэтому при ВЫБРАННОМ source остаёмся на событийном пути (как раньше);
+  // без source (общая воронка) — объединяем с историей. excludeStubs убирает
+  // заглушки-ошибки ("Ответ не пришёл"/"Ошибка запуска") из счёта ai-ответов.
+  private chatBackedStep(eventName: string, senderType: 'human' | 'ai', excludeStubs: boolean): StepDef['query'] {
+    return (from, to, source, excluded) => {
+      if (source) return this.userStep(eventName)(from, to, source, excluded);
+      const stubFilter = excludeStubs
+        ? `AND content NOT ILIKE '%Ответ не пришёл%' AND content NOT ILIKE 'Ошибка запуска%'`
+        : '';
+      return {
+        sql: `
+          SELECT user_id FROM (
+            SELECT user_id FROM events
+              WHERE name = $1 AND ts >= $2 AND ts < $3 AND user_id IS NOT NULL
+                AND ${NOT_TEST('user_id', '$4')}
+            UNION
+            SELECT split_part(session_id, '_', 1) AS user_id FROM custom_chat_history
+              WHERE sender_type = $5 AND created_at >= $2 AND created_at < $3 ${stubFilter}
+                AND ${NOT_TEST("split_part(session_id, '_', 1)", '$4')}
+          ) u
+          WHERE user_id IS NOT NULL AND user_id <> ''
+          GROUP BY user_id`,
+        params: [eventName, from, to, excluded, senderType],
+      };
+    };
+  }
+
   // Шаг верха воронки по уникальным СЕССИЯМ (анонимный трафик до входа).
   private sessionStep(name: string): StepDef['query'] {
     return (from, to, source) => ({
@@ -203,14 +234,14 @@ export class FunnelService {
       label: 'Первое сообщение',
       hint: 'Из вошедших — кто отправил хотя бы одно сообщение ассистенту. Подмножество «Залогинился».',
       identity: 'user',
-      query: this.userStep('message_sent'),
+      query: this.chatBackedStep('message_sent', 'human', false),
     },
     {
       key: 'first_response_received',
       label: 'Получил ответ',
       hint: 'Из написавших — кто получил ответ ассистента (диалог реально начался). Подмножество предыдущего.',
       identity: 'user',
-      query: this.userStep('response_received'),
+      query: this.chatBackedStep('response_received', 'ai', true),
     },
     {
       key: 'meaningful_dialog',
