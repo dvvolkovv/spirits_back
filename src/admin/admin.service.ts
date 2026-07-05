@@ -1,7 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
 import axios from 'axios';
 import * as nodemailer from 'nodemailer';
 import { PgService } from '../common/services/pg.service';
+import { sendTelegramAlert } from '../common/telegram-alert';
 
 @Injectable()
 export class AdminService {
@@ -691,6 +693,47 @@ export class AdminService {
       skipped_already_sent: drafts.length - targets.length,
       results,
     };
+  }
+
+  // АВТО-триггер advocate-нуджа: ежедневно находит НОВЫХ «вовлечённых платящих без
+  // рефералов» (сегмент buildAdvocateOutreach; cooldown = событие advocate_outreach
+  // 'sent', already_sent_at) и шлёт приглашение (SMS+email) без ручного confirm.
+  // Дневной кап + Telegram-сводка владельцу для видимости. Отключается
+  // ADVOCATE_AUTONUDGE_DISABLED=1. Одноразово на юзера (уже нуджнутых пропускаем).
+  private static readonly ADVOCATE_AUTONUDGE_MAX_PER_RUN = 20;
+
+  @Cron('0 23 8 * * *') // ежедневно 08:23 UTC (~13:23 Yekb / 11:23 MSK)
+  async autoAdvocateNudge(): Promise<void> {
+    if (process.env.ADVOCATE_AUTONUDGE_DISABLED === '1') return;
+    try {
+      const { drafts } = await this.buildAdvocateOutreach();
+      const fresh = drafts
+        .filter((d) => !d.already_sent_at)
+        .slice(0, AdminService.ADVOCATE_AUTONUDGE_MAX_PER_RUN);
+      if (!fresh.length) return;
+      const sentUsers: string[] = [];
+      for (const d of fresh) {
+        const sms = d.phone ? await this.sendOutreachSms(d.phone, d.sms) : { ok: false, error: 'no_phone' };
+        const email = d.email ? await this.sendOutreachEmail(d.email, d.email_subject, d.email_html) : { ok: false, error: 'no_email' };
+        const status = sms.ok || email.ok ? 'sent' : 'failed';
+        if (status === 'sent') sentUsers.push(d.user_id);
+        await this.pg.query(
+          `INSERT INTO events (user_id, name, props) VALUES ($1, 'advocate_outreach', $2::jsonb)`,
+          [d.user_id, JSON.stringify({
+            status, sms_ok: sms.ok, email_ok: email.ok, auto: true,
+            campaign: AdminService.ADVOCATE_CAMPAIGN, error: sms.error || email.error || null,
+          })],
+        ).catch((e) => this.logger.warn(`auto advocate log failed: ${e.message}`));
+      }
+      this.logger.log(`advocate auto-nudge: sent ${sentUsers.length}/${fresh.length}`);
+      if (sentUsers.length > 0) {
+        await sendTelegramAlert(
+          `🤝 <b>Advocate auto-nudge</b>: отправлено ${sentUsers.length} вовлечённым платящим (реф-приглашение SMS+email).\nЮзеры: ${sentUsers.join(', ')}`,
+        ).catch(() => {});
+      }
+    } catch (e: any) {
+      this.logger.error(`advocate auto-nudge failed: ${e.message}`);
+    }
   }
 
   async createReferralLeader(data: any) {
