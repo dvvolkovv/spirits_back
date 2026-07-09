@@ -1,8 +1,10 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import { ReferralService } from '../referral/referral.service';
 import { EventsService } from '../events/events.service';
 import { creditWithBonus, OFFER_MSG_THRESHOLD } from '../offer/offer-bonus';
+import { sendTelegramAlert } from '../common/telegram-alert';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -144,6 +146,62 @@ export class PaymentsService {
         tokens: tokensToAdd,
       },
     });
+  }
+
+  // Реконсиляция «зависших» pending-платежей (safety-net к вебхуку). Раз в 30 мин
+  // опрашиваем YooKassa по pending старше 15 мин и:
+  //  • succeeded → processSucceededPayment (идемпотентно начисляет токены+реф,
+  //    ставит succeeded) — ловит ПРОПУЩЕННЫЕ вебхуки («оплатил, а токенов нет») + TG-алерт;
+  //  • canceled  → помечаем canceled (чистим админку от мёртвых брошенных корзин).
+  // Свежие pending (<15 мин) не трогаем — идёт оплата/вебхук. Отключается PAYMENT_RECONCILE_DISABLED=1.
+  @Cron('0 9,39 * * * *')
+  async reconcilePendingPayments(): Promise<void> {
+    if (process.env.PAYMENT_RECONCILE_DISABLED === '1') return;
+    const shopId = process.env.YOOKASSA_SHOP_ID;
+    const secretKey = process.env.YOOKASSA_SECRET_KEY;
+    if (!shopId || !secretKey) return;
+    let rows: Array<{ payment_id: string; user_id: string }>;
+    try {
+      rows = (await this.pg.query(
+        `SELECT payment_id, user_id FROM payments
+          WHERE status = 'pending' AND created_at < now() - interval '15 minutes'
+          ORDER BY created_at DESC LIMIT 100`,
+      )).rows as any;
+    } catch (e: any) {
+      this.logger.error(`reconcile query failed: ${e.message}`);
+      return;
+    }
+    if (!rows.length) return;
+    let credited = 0, canceled = 0;
+    for (const p of rows) {
+      try {
+        const resp = await axios.get(`https://api.yookassa.ru/v3/payments/${p.payment_id}`, {
+          auth: { username: shopId, password: secretKey }, timeout: 10000, validateStatus: () => true,
+        });
+        if (resp.status >= 400) continue; // 404/purged — пропускаем
+        const st = resp.data?.status;
+        if (st === 'succeeded') {
+          const uid = resp.data?.metadata?.userId || p.user_id;
+          await this.processSucceededPayment(p.payment_id, uid); // идемпотентно
+          credited++;
+          this.logger.warn(`reconcile: payment ${p.payment_id} PAID but was stuck pending — credited user ${uid}`);
+          await sendTelegramAlert(
+            `⚠️ <b>Платёж-реконсиляция</b>: ${p.payment_id} оплачен в YooKassa, но завис в pending (пропущенный вебхук). Токены начислены юзеру ${uid}.`,
+          ).catch(() => {});
+        } else if (st === 'canceled') {
+          await this.pg.query(
+            `UPDATE payments SET status='canceled', updated_at=now() WHERE payment_id=$1 AND status='pending'`,
+            [p.payment_id],
+          );
+          canceled++;
+        }
+      } catch (e: any) {
+        this.logger.warn(`reconcile ${p.payment_id} failed: ${e.message}`);
+      }
+    }
+    if (credited || canceled) {
+      this.logger.log(`payment reconcile: stuck-paid credited=${credited}, marked-canceled=${canceled}, checked=${rows.length}`);
+    }
   }
 
   async getLatestPayment(userId: string): Promise<any | null> {
