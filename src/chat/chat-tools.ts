@@ -5,6 +5,7 @@ import { MiscService } from '../misc/misc.service';
 import { PgService } from '../common/services/pg.service';
 import { VideoService, InsufficientTokensError } from '../video/video.service';
 import { CreateVideoJobDto } from '../video/video.dto';
+import { RoutineStore, ENERGY_PROMPT } from '../routine-push/routine-store.service';
 
 export const CHAT_TOOLS = [
   {
@@ -139,6 +140,28 @@ export const CHAT_TOOLS = [
       required: ['mode'],
     },
   },
+  {
+    name: 'manage_routine',
+    description:
+      'Настроить или выключить ЕЖЕДНЕВНОЕ проактивное сообщение от тебя пользователю (утренняя рутина: ты сам напишешь ему в заданный час каждый день). ' +
+      'Вызывай, КОГДА пользователь просит регулярно / каждый день / по утрам напоминать, писать, присылать что-то (энергию дня, сводку, мотивацию, план и т.п.). ' +
+      'Доставка — через push-уведомления. Если инструмент вернёт delivered_hint=true, значит у пользователя не включены уведомления — тактично попроси включить их в Настройках (тумблер «Уведомления на этом устройстве»), иначе рутина не дойдёт. ' +
+      'ВАЖНО: не говори пользователю «настроил/буду присылать», ПОКА не вызвал этот инструмент и не получил ok:true. Не выдумывай эту возможность без вызова.\n' +
+      '• action="enable" — создать/обновить рутину; "disable" — выключить.\n' +
+      '• assistant — ТВОЁ имя как ассистента (например "Райя", "Михаил"): рутина будет идти от тебя.\n' +
+      '• hour — локальный час отправки, 0..23 (по умолчанию 8 — утро). Если пользователь назвал время — передай его час.\n' +
+      '• prompt — инструкция САМОМУ СЕБЕ: что именно генерировать и присылать каждый день (от первого лица, например «Дай короткую энергию дня и один фокус» или «Сделай сводку по моим задачам на день»). Если не задано — тёплая энергия дня.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['enable', 'disable'], default: 'enable' },
+        assistant: { type: 'string', description: 'Твоё имя как ассистента (напр. "Райя"). По нему привязывается рутина.' },
+        hour: { type: 'number', minimum: 0, maximum: 23, description: 'Локальный час отправки 0..23 (по умолчанию 8).' },
+        prompt: { type: 'string', description: 'Что генерировать и присылать каждый день (инструкция себе). По умолчанию — энергия дня.' },
+      },
+      required: ['action'],
+    },
+  },
 ];
 
 export type ToolResult =
@@ -152,6 +175,7 @@ export type ToolResult =
       stillImageUrl?: string;
       imageTokensSpent?: number;
     }
+  | { ok: true; kind: 'routine'; enabled: boolean; hour: number; assistant: string; delivered_hint?: boolean }
   | { ok: false; error: string; [k: string]: any };
 
 @Injectable()
@@ -163,10 +187,51 @@ export class ChatToolsService {
     private readonly misc: MiscService,
     private readonly pg: PgService,
     private readonly video: VideoService,
+    private readonly routines: RoutineStore,
   ) {}
 
   async executeTool(userId: string, name: string, input: any): Promise<ToolResult> {
     try {
+      if (name === 'manage_routine') {
+        const action = input?.action === 'disable' ? 'disable' : 'enable';
+        const who = String(input?.assistant ?? '').trim();
+        // Резолвим ассистента (от кого рутина) по имени/display_name или числовому id.
+        let assistantId: string | null = null;
+        if (/^\d+$/.test(who)) {
+          assistantId = who;
+        } else if (who) {
+          const a = await this.pg.query(
+            `SELECT id FROM agents
+              WHERE lower(COALESCE(display_name, name)) = lower($1) OR lower(name) = lower($1)
+              LIMIT 1`,
+            [who],
+          );
+          if (a.rows[0]) assistantId = String(a.rows[0].id);
+        }
+        if (!assistantId) {
+          return { ok: false, error: 'Укажи assistant — своё имя ассистента (например "Райя"), чтобы привязать рутину к тебе.' };
+        }
+        const hour = Number.isFinite(input?.hour) ? Math.min(23, Math.max(0, Math.trunc(input.hour))) : 8;
+        const prompt = String(input?.prompt ?? '').trim().slice(0, 1000) || ENERGY_PROMPT;
+        const tz = (await this.routines.knownTz(userId)) || 'Europe/Moscow';
+        const row = await this.routines.upsert(userId, assistantId, {
+          enabled: action === 'enable',
+          sendHour: hour,
+          tz,
+          prompt,
+        });
+        // Есть ли у пользователя подписка на push — иначе рутина не дойдёт.
+        const subs = await this.pg.query('SELECT 1 FROM push_subscriptions WHERE user_id = $1 LIMIT 1', [userId]);
+        return {
+          ok: true,
+          kind: 'routine',
+          enabled: row.enabled,
+          hour: row.sendHour,
+          assistant: who,
+          delivered_hint: action === 'enable' && subs.rowCount === 0,
+        };
+      }
+
       if (name === 'generate_image') {
         const prompt = String(input?.prompt ?? '').slice(0, 2000);
         if (!prompt) return { ok: false, error: 'empty prompt' };

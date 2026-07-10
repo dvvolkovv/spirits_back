@@ -35,6 +35,7 @@ import { TgBotModule } from './tg-bot/tg-bot.module';
 import { VoiceModule } from './voice/voice.module';
 import { VoiceAvatarModule } from './voice-avatar/voice-avatar.module';
 import { PushModule } from './push/push.module';
+import { RoutineStoreModule } from './routine-push/routine-store.module';
 import { RoutinePushModule } from './routine-push/routine-push.module';
 
 @Module({
@@ -75,6 +76,7 @@ import { RoutinePushModule } from './routine-push/routine-push.module';
     VoiceModule,
     VoiceAvatarModule,
     PushModule,
+    RoutineStoreModule,
     RoutinePushModule,
   ],
 })
