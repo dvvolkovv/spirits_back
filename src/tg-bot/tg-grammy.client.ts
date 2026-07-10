@@ -24,13 +24,18 @@ export class TgGrammyClient implements OnModuleInit {
       return;
     }
     const webhookUrl = `${baseUrl}/webhook/telegram/${urlSecret}`;
+    // TG_WEBHOOK_IP: my.linkeon.io резолвится в RF-edge (Selectel), до которого
+    // подсети Telegram DC не доходят (ingress-фильтрация). Пин IP заставляет
+    // Telegram слать webhook напрямую в AEZA-origin, минуя DNS.
+    const webhookIp = process.env.TG_WEBHOOK_IP || undefined;
     try {
       await this.bot.api.setWebhook(webhookUrl, {
         secret_token: headerSecret,
         allowed_updates: ['message', 'edited_message', 'my_chat_member', 'callback_query'],
         drop_pending_updates: false,
+        ...(webhookIp ? { ip_address: webhookIp } : {}),
       });
-      this.logger.log(`Telegram webhook set: ${webhookUrl}`);
+      this.logger.log(`Telegram webhook set: ${webhookUrl}${webhookIp ? ` (ip pinned: ${webhookIp})` : ''}`);
     } catch (e: any) {
       this.logger.error(`setWebhook failed: ${e.message}`);
     }
