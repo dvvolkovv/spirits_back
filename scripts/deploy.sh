@@ -193,11 +193,16 @@ sync_test_basic_auth() {
   bold "[smoke pre] aligning test htpasswd with local BASIC_AUTH"
   local user="${BASIC_AUTH%%:*}"
   local pass="${BASIC_AUTH#*:}"
-  ssh -o StrictHostKeyChecking=accept-new "$HOST" \
-    "sudo bash -c \"command -v htpasswd >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get -y install apache2-utils >/dev/null; \
-     if [ -f /etc/nginx/.htpasswd-test ]; then htpasswd -b /etc/nginx/.htpasswd-test '$user' '$pass' >/dev/null; \
-     else htpasswd -cb /etc/nginx/.htpasswd-test '$user' '$pass' >/dev/null; fi; \
-     systemctl reload nginx\"" \
+  # Пароль подаём через stdin в `htpasswd -i`, НЕ через argv. Прежний вариант
+  # (`htpasswd -b '$user' '$pass'` внутри тройной вложенности ssh→sudo→bash -c)
+  # молча писал битый хэш → smoke ловил nginx 401 на КАЖДОМ прогоне и валил
+  # деплой ложным «регрешном» (debugged 2026-07-10). Заодно секрет больше не
+  # светится в списке процессов на сервере. `printf` — builtin, argv не палит.
+  local hf=/etc/nginx/.htpasswd-test
+  printf '%s' "$pass" | ssh -o StrictHostKeyChecking=accept-new "$HOST" \
+    "sudo sh -c 'command -v htpasswd >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get -y install apache2-utils >/dev/null; \
+     if [ -f $hf ]; then htpasswd -i $hf $user >/dev/null; else htpasswd -ic $hf $user >/dev/null; fi; \
+     systemctl reload nginx'" \
     && green "  ✓ htpasswd synced" \
     || red   "  ! htpasswd sync failed (smoke may still 401)"
 }
