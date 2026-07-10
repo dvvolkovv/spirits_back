@@ -35,9 +35,15 @@ export class AuthController {
     @Param('phone') phone: string,
     @Query('sid') sid: string,
     @Query('src') src: string,
+    @Query('nosms') nosms: string,
     @Res() res: Response,
   ) {
-    const result = await this.authService.requestSmsCode(phone, sid, src);
+    // ?nosms=1 — маркер автоматического вызова (Claude-ceremony/тесты): для
+    // «двойного» номера 79656445804 глушит реальную SMS (код берётся из Redis).
+    // На обычный вход владельца (без флага) SMS уходит. См. auth.service.
+    const result = await this.authService.requestSmsCode(phone, sid, src, {
+      suppressSms: nosms === '1' || nosms === 'true',
+    });
     if (result.status === 'blocked') {
       return res.set(CORS).status(403).send('User blocked');
     }

@@ -6,12 +6,19 @@ import { IdentityService } from '../identity/identity.service';
 import { EventsService } from '../events/events.service';
 import axios from 'axios';
 
-// Тест/служебные номера (mirror auth.controller.isTestPhone). Для них при
-// DEBUG_SMS_CODES=true НЕ шлём реальную SMS через SMSAERO — код и так доступен
-// через /webhook/debug/sms-code. Иначе мониторинг/smoke/тесты жгут платные SMS
-// (бэклог b0821507: резкий рост SMS-расхода после внедрения мониторинга; и явно
-// «не слать на 79030169187»).
-const TEST_PHONES = ['70000000000', '79030169187', '79169403771', '79656445804'];
+// Чисто служебные номера: при DEBUG_SMS_CODES=true НИКОГДА не шлём реальную SMS
+// (код доступен через /webhook/debug/sms-code). Это smoke/мониторинг/playwright
+// и невалидные номера (70000000000 — не MSISDN). Бэклог b0821507: рост SMS-расхода
+// после мониторинга; явно «не слать на 79030169187».
+const PURE_TEST_PHONES = ['70000000000', '79030169187', '79169403771'];
+const PURE_TEST_PATTERN = /^790300\d{5}$/;
+
+// «Двойные» номера: реальный телефон, который ЗАОДНО используется как dev/test
+// (79656445804 — им же владелец логинится с телефона). Для них реальную SMS
+// шлём НА ОБЫЧНЫЙ вход, а глушим ТОЛЬКО когда вызов помечен как автоматический
+// (?nosms=1 от Claude-ceremony/тестов) — иначе владелец не может войти по SMS
+// (инцидент 2026-07-10). Код всё равно кладётся в Redis для debug-эндпоинта.
+const DEV_DUAL_PHONES = ['79656445804'];
 
 @Injectable()
 export class AuthService {
@@ -25,7 +32,7 @@ export class AuthService {
     @Optional() private readonly events?: EventsService,
   ) {}
 
-  async requestSmsCode(phone: string, sid?: string | null, src?: string | null): Promise<{ status: string }> {
+  async requestSmsCode(phone: string, sid?: string | null, src?: string | null, opts?: { suppressSms?: boolean }): Promise<{ status: string }> {
     // Check if code already exists in Redis
     const existing = await this.redis.get(`sc-${phone}`);
     if (existing) {
@@ -49,16 +56,21 @@ export class AuthService {
     // Store in Redis with 5 min TTL
     await this.redis.set(`sc-${phone}`, code, 300);
 
-    // Тест/служебные номера при DEBUG_SMS_CODES — БЕЗ реального SMSAERO (код
-    // забирается из Redis через debug-эндпоинт). Останавливает SMS-расход от
-    // мониторинга/smoke/тестов (b0821507).
-    const isTest = TEST_PHONES.includes(phone) && process.env.DEBUG_SMS_CODES === 'true';
-    if (isTest) {
-      this.logger.log(`Test phone ${phone}: SMSAERO skipped (DEBUG_SMS_CODES), code in Redis`);
+    // Решаем, глушить ли реальную SMS. Только при DEBUG_SMS_CODES=true:
+    //  • чисто служебные номера — всегда глушим (код в Redis);
+    //  • «двойной» номер владельца (79656445804) — глушим ТОЛЬКО если вызов
+    //    помечен автоматическим (suppressSms=?nosms=1); обычный вход шлёт SMS.
+    const debug = process.env.DEBUG_SMS_CODES === 'true';
+    const isPureTest = PURE_TEST_PHONES.includes(phone) || PURE_TEST_PATTERN.test(phone);
+    const isDevDual = DEV_DUAL_PHONES.includes(phone);
+    const skipSms = debug && (isPureTest || (isDevDual && !!opts?.suppressSms));
+    if (skipSms) {
+      this.logger.log(`Phone ${phone}: SMSAERO skipped (${isPureTest ? 'pure-test' : 'dev-dual+nosms'}), code in Redis`);
     } else {
       // Send SMS via SMS Aero
       await this.sendSms(phone, code);
     }
+    const isTest = skipSms; // for the otp_request event's `sent` flag below
 
     // sid/src прокидываются с фронта (?sid=&src=) — чтобы шаг регистрации был
     // привязан к рекламной сессии и источнику (раньше otp_* шли без атрибуции,
