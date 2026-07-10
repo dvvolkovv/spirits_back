@@ -88,6 +88,44 @@ export class TgConfigService {
     return { config, claimToken, deepLink };
   }
 
+  // Перевыпуск claim-токена для существующего конфига (pending/archived).
+  // Кейс: бот вышел из группы (протухший claim, кик) — юзер переподключает
+  // тот же конфиг свежей ссылкой вместо создания нового.
+  async reissueClaim(
+    id: string,
+    ownerId: string,
+  ): Promise<{ config: TgBotConfigRow; claimToken: string; deepLink: string }> {
+    const cfg = await this.getById(id, ownerId);
+    if (!['pending', 'archived'].includes(cfg.status)) {
+      throw new BadRequestException(
+        `reissue доступен только для pending/archived конфигов (сейчас: ${cfg.status})`,
+      );
+    }
+
+    const updRes = await this.pg.query(
+      `UPDATE tg_bot_configs
+          SET status = 'pending', tg_chat_id = NULL, tg_chat_title = NULL, archived_at = NULL
+        WHERE id = $1
+        RETURNING *`,
+      [id],
+    );
+    const config: TgBotConfigRow = updRes.rows[0];
+
+    const expires = new Date(Date.now() + this.CLAIM_TTL_MS);
+    const tokRes = await this.pg.query(
+      `INSERT INTO tg_claim_tokens (kind, owner_user_id, config_id, expires_at)
+       VALUES ('claim', $1, $2, $3)
+       RETURNING token`,
+      [ownerId, id, expires],
+    );
+    const claimToken = tokRes.rows[0].token;
+
+    const botUsername = process.env.TG_BOT_USERNAME || 'LinkeonAgentBot';
+    const deepLink = `https://t.me/${botUsername}?startgroup=${claimToken}`;
+
+    return { config, claimToken, deepLink };
+  }
+
   async listForOwner(ownerId: string): Promise<TgBotConfigRow[]> {
     const r = await this.pg.query(
       `SELECT * FROM tg_bot_configs

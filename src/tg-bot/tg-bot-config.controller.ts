@@ -45,6 +45,16 @@ export class TgBotConfigController {
     });
   }
 
+  @Post('configs/:id/reissue-claim')
+  async reissueClaim(@CurrentUser() user: any, @Param('id') id: string, @Res() res: Response) {
+    const result = await this.configs.reissueClaim(id, user.userId);
+    return res.status(200).json({
+      config: this.toJson(result.config),
+      claimToken: result.claimToken,
+      deepLink: result.deepLink,
+    });
+  }
+
   @Get('configs/:id')
   async detail(@CurrentUser() user: any, @Param('id') id: string, @Res() res: Response) {
     const cfg = await this.configs.getById(id, user.userId);
