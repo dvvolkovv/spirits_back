@@ -34,6 +34,7 @@ import { OfferModule } from './offer/offer.module';
 import { TgBotModule } from './tg-bot/tg-bot.module';
 import { VoiceModule } from './voice/voice.module';
 import { VoiceAvatarModule } from './voice-avatar/voice-avatar.module';
+import { PushModule } from './push/push.module';
 
 @Module({
   imports: [
@@ -72,6 +73,7 @@ import { VoiceAvatarModule } from './voice-avatar/voice-avatar.module';
     TgBotModule,
     VoiceModule,
     VoiceAvatarModule,
+    PushModule,
   ],
 })
 export class AppModule {}
