@@ -764,6 +764,70 @@ export class ChatService {
     return this.saveChatHistory(userId, agentId, userMsg, assistantMsg, tokensUsed);
   }
 
+  /**
+   * Публичная НЕ-стримовая генерация ответа ассистента — для проактивных
+   * рутинных пушей (Слой 3, RoutinePushService). Собирает персона-префикс +
+   * профиль пользователя + сообщение, прогоняет через r.linkeon.io и возвращает
+   * готовый текст. Историю/токены НЕ пишет (это делает вызывающий). Пустой
+   * ответ → пустая строка.
+   */
+  async generateAgentReply(userId: string, assistantId: string, message: string): Promise<string> {
+    const isNumeric = /^\d+$/.test(assistantId);
+    const agentRes = isNumeric
+      ? await this.pg.query('SELECT * FROM agents WHERE id = $1 LIMIT 1', [parseInt(assistantId, 10)])
+      : await this.pg.query('SELECT * FROM agents WHERE name = $1 LIMIT 1', [assistantId]);
+    const agent = agentRes.rows[0];
+    if (!agent) throw new Error(`generateAgentReply: agent not found: ${assistantId}`);
+    const agentName = agent.display_name || agent.name;
+
+    let profileText = '';
+    if (this.neo4j) { try { profileText = await this.neo4j.getProfileDescription(userId); } catch {} }
+
+    let prefix =
+      `СИСТЕМНАЯ ИНСТРУКЦИЯ (имеет приоритет над всеми остальными). ` +
+      `Ты ассистент по имени **${agentName}**${agent.description ? ` — ${agent.description}` : ''} на платформе LINKEON.IO. ` +
+      `Всегда представляйся именно как ${agentName}. Никогда не упоминай, что ты Claude или другая AI-система помимо ${agentName}. ` +
+      `ЯЗЫК ОТВЕТА: всегда на русском языке.\n\n`;
+    if (agent.system_prompt && agent.system_prompt.trim()) {
+      prefix += `--- Персона и инструкции ассистента ${agentName} ---\n${agent.system_prompt.trim()}\n\n`;
+    }
+    if (profileText && profileText.trim()) {
+      prefix += `User profile:\n${profileText}\n\n`;
+    }
+    const prompt = prefix + message;
+
+    const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
+    const FormData = require('form-data');
+    const fd = new FormData();
+    fd.append('message', prompt);
+    fd.append('sessionId', `${userId}_${assistantId}`);
+    const chunks: string[] = [];
+    const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
+      headers: fd.getHeaders(),
+      responseType: 'stream',
+      timeout: 300000,
+    });
+    await new Promise<void>((resolve, reject) => {
+      let buffer = '';
+      resp.data.on('data', (chunk: Buffer) => {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const ev = JSON.parse(line.slice(6));
+            if (ev.type === 'delta' || ev.type === 'text') chunks.push(ev.text);
+            else if (ev.type === 'result' && ev.text && chunks.length === 0) chunks.push(ev.text);
+          } catch {}
+        }
+      });
+      resp.data.on('end', () => resolve());
+      resp.data.on('error', reject);
+    });
+    return this.stripToolTags(chunks.join('')).trim();
+  }
+
   /** Public wrapper для chat.controller — после upload-and-chat обогащаем профиль + tasks. */
   async consolidateAfterChatPublic(userId: string, agentId: string, userMessage: string, assistantResponse: string): Promise<void> {
     if (this.neo4j) {

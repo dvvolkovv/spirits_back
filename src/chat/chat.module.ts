@@ -12,6 +12,6 @@ import { SmmModule } from '../smm/smm.module';
   imports: [MiscModule, CommonModule, VideoModule, SmmModule],
   controllers: [ChatController],
   providers: [ChatService, ChatToolsService, ClaudeAgentService],
-  exports: [ChatToolsService],
+  exports: [ChatToolsService, ChatService],
 })
 export class ChatModule {}
