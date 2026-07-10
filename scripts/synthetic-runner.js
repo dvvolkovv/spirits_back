@@ -73,6 +73,17 @@ async function refreshTokens() {
   return access;
 }
 
+// Плейсхолдеры, которые бэк/relay отдают ЮЗЕРУ при недоступности модели.
+// Байты приходят (стрим «работает»), но это не ответ AI — сбой. Инцидент
+// 2026-07-10: OAuth-токен relay протух, все ответы = «временный сбой…»,
+// а synthetic 8 часов рапортовал зелёным, потому что считал только байты.
+const AI_ERROR_MARKERS = [
+  'временный сбой связи с моделью',
+  'Ответ не пришёл',
+  'Ошибка запуска агента',
+  'сессия была очищена',
+];
+
 async function streamFirstByte(url, body) {
   const ft = fetchTimeout(TIMEOUT_MS);
   const r = await fetch(url, {
@@ -87,16 +98,21 @@ async function streamFirstByte(url, body) {
   ft.done();
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const reader = r.body.getReader();
+  const decoder = new TextDecoder();
   let total = 0;
+  let text = '';
   const start = Date.now();
   while (Date.now() - start < 20_000) {
     const { value, done } = await reader.read();
     if (done) break;
     total += value.byteLength;
-    if (total > 1024) break;
+    text += decoder.decode(value, { stream: true });
+    if (total > 4096) break;
   }
   reader.cancel().catch(() => {});
   if (total === 0) throw new Error('stream ended empty');
+  const marker = AI_ERROR_MARKERS.find((m) => text.includes(m));
+  if (marker) throw new Error(`AI error placeholder in stream: «${marker}»`);
   return total;
 }
 
