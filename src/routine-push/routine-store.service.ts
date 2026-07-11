@@ -38,7 +38,11 @@ export class RoutineStore {
   // ── Локальное время в tz без сторонних либ ───────────────────────────────────
   localHour(tz: string, now: Date): number {
     try {
-      return parseInt(new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: '2-digit', hour12: false, hourCycle: 'h23' }).format(now), 10);
+      // ВАЖНО: у части ICU полночь форматируется как "24", а не "00" (даже с
+      // hourCycle h23) — из-за этого рутина срабатывала в полночь вместо
+      // заданного часа. Нормализуем `% 24` (24→0). Инцидент 2026-07-11.
+      const h = parseInt(new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: '2-digit', hour12: false, hourCycle: 'h23' }).format(now), 10);
+      return Number.isFinite(h) ? (h % 24) : now.getUTCHours();
     } catch { return now.getUTCHours(); }
   }
   localDate(tz: string, now: Date): string {
