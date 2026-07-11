@@ -97,8 +97,13 @@ export class RoutineStore {
       : 8;
     const tz = (opts.tz && /^[\w+\-/]+$/.test(opts.tz)) ? opts.tz : 'Europe/Moscow';
 
-    // Включение уже после send_hour → помечаем сегодня отправленным, чтобы не
-    // выстрелить пуш немедленно (первый настоящий — завтра утром).
+    // last_sent авторитетно пересчитывается на КАЖДЫЙ upsert:
+    //  • час УЖЕ прошёл сегодня (localHour >= hour) → помечаем сегодня «отправлено»
+    //    (не стреляем немедленно при включении задним числом);
+    //  • час ещё ВПЕРЕДИ сегодня → сбрасываем в NULL, чтобы рутина сработала
+    //    сегодня в новый час (иначе смена времени «залипала» на старом флаге —
+    //    инцидент 2026-07-11: включил с дефолтным 8:00 в 9:29, сменил на 10:00,
+    //    а флаг «сегодня отправлено» остался и 10:00 скипнулся).
     const now = new Date();
     const markToday = opts.enabled && this.localHour(tz, now) >= hour;
     const today = this.localDate(tz, now);
@@ -112,9 +117,9 @@ export class RoutineStore {
              enabled = EXCLUDED.enabled,
              send_hour = EXCLUDED.send_hour,
              tz = EXCLUDED.tz,
-             last_sent_date = CASE WHEN $9 THEN EXCLUDED.last_sent_date ELSE routine_pushes.last_sent_date END,
+             last_sent_date = EXCLUDED.last_sent_date,
              updated_at = now()`,
-      [userId, this.kindFor(assistantId), assistantId, opts.prompt, hour, tz, opts.enabled, markToday ? today : null, markToday],
+      [userId, this.kindFor(assistantId), assistantId, opts.prompt, hour, tz, opts.enabled, markToday ? today : null],
     );
     return (await this.get(userId, assistantId))!;
   }
