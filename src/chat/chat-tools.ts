@@ -143,21 +143,25 @@ export const CHAT_TOOLS = [
   {
     name: 'manage_routine',
     description:
-      'Настроить или выключить ЕЖЕДНЕВНОЕ проактивное сообщение от тебя пользователю (утренняя рутина: ты сам напишешь ему в заданный час каждый день). ' +
-      'Вызывай, КОГДА пользователь просит регулярно / каждый день / по утрам напоминать, писать, присылать что-то (энергию дня, сводку, мотивацию, план и т.п.). ' +
-      'Доставка — через push-уведомления. Если инструмент вернёт delivered_hint=true, значит у пользователя не включены уведомления — тактично попроси включить их в Настройках (тумблер «Уведомления на этом устройстве»), иначе рутина не дойдёт. ' +
-      'ВАЖНО: не говори пользователю «настроил/буду присылать», ПОКА не вызвал этот инструмент и не получил ok:true. Не выдумывай эту возможность без вызова.\n' +
-      '• action="enable" — создать/обновить рутину; "disable" — выключить.\n' +
-      '• assistant — ТВОЁ имя как ассистента (например "Райя", "Михаил"): рутина будет идти от тебя.\n' +
-      '• hour — локальный час отправки, 0..23 (по умолчанию 8 — утро). Если пользователь назвал время — передай его час.\n' +
-      '• prompt — инструкция САМОМУ СЕБЕ: что именно генерировать и присылать каждый день (от первого лица, например «Дай короткую энергию дня и один фокус» или «Сделай сводку по моим задачам на день»). Если не задано — тёплая энергия дня.',
+      'Настроить/выключить/показать РЕГУЛЯРНОЕ проактивное сообщение от тебя пользователю (рутина: ты сам пишешь ему в заданный час в выбранные дни). ' +
+      'Вызывай, КОГДА пользователь просит регулярно / каждый день / по будням / по утрам / в такое-то время напоминать, писать, присылать что-то (энергию дня, сводку, мотивацию, план и т.п.). ' +
+      'Доставка — через push-уведомления. Если вернётся delivered_hint=true, у пользователя не включены уведомления — тактично попроси включить их в Настройках (тумблер «Уведомления на этом устройстве»), иначе рутина не дойдёт. ' +
+      'ВАЖНО: не говори «настроил/буду присылать», ПОКА не вызвал инструмент и не получил ok:true. Не выдумывай эту возможность без вызова.\n' +
+      '• action="enable" — создать/обновить рутину; "disable" — выключить твою рутину у этого пользователя; "list" — показать все его рутины.\n' +
+      '• assistant — ТВОЁ имя как ассистента (например "Райя", "Михаил"): рутина идёт от тебя. Обязательно для enable/disable.\n' +
+      '• title — короткое имя рутины для пользователя (например "Энергия дня", "Сводка по бизнесу", "Зарядка"). \n' +
+      '• hour — локальный час отправки, 0..23 (по умолчанию 8). Если пользователь назвал время — передай его час.\n' +
+      '• days — массив дней недели (0=Вс,1=Пн,…,6=Сб), напр. [1,2,3,4,5] для будней, [0,6] для выходных. Пропусти или [] = каждый день.\n' +
+      '• prompt — инструкция САМОМУ СЕБЕ: что именно генерировать и присылать (от первого лица, напр. «Дай короткую энергию дня и один фокус» или «Сделай сводку по моим задачам»). Если не задано — тёплая энергия дня.',
     input_schema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['enable', 'disable'], default: 'enable' },
-        assistant: { type: 'string', description: 'Твоё имя как ассистента (напр. "Райя"). По нему привязывается рутина.' },
+        action: { type: 'string', enum: ['enable', 'disable', 'list'], default: 'enable' },
+        assistant: { type: 'string', description: 'Твоё имя как ассистента (напр. "Райя"). Обязательно для enable/disable.' },
+        title: { type: 'string', description: 'Короткое имя рутины для пользователя (напр. "Энергия дня", "Сводка").' },
         hour: { type: 'number', minimum: 0, maximum: 23, description: 'Локальный час отправки 0..23 (по умолчанию 8).' },
-        prompt: { type: 'string', description: 'Что генерировать и присылать каждый день (инструкция себе). По умолчанию — энергия дня.' },
+        days: { type: 'array', items: { type: 'number', minimum: 0, maximum: 6 }, description: 'Дни недели 0=Вс..6=Сб. [1,2,3,4,5]=будни, [0,6]=выходные. Пусто = каждый день.' },
+        prompt: { type: 'string', description: 'Что генерировать и присылать (инструкция себе). По умолчанию — энергия дня.' },
       },
       required: ['action'],
     },
@@ -175,7 +179,18 @@ export type ToolResult =
       stillImageUrl?: string;
       imageTokensSpent?: number;
     }
-  | { ok: true; kind: 'routine'; enabled: boolean; hour: number; assistant: string; delivered_hint?: boolean }
+  | {
+      ok: true;
+      kind: 'routine';
+      action: string;
+      title?: string;
+      hour?: number;
+      days?: number[] | null;
+      enabled?: boolean;
+      assistant?: string;
+      delivered_hint?: boolean;
+      routines?: Array<{ title: string; hour: number; days: number[] | null; enabled: boolean; assistantId: string }>;
+    }
   | { ok: false; error: string; [k: string]: any };
 
 @Injectable()
@@ -193,9 +208,19 @@ export class ChatToolsService {
   async executeTool(userId: string, name: string, input: any): Promise<ToolResult> {
     try {
       if (name === 'manage_routine') {
-        const action = input?.action === 'disable' ? 'disable' : 'enable';
-        const who = String(input?.assistant ?? '').trim();
+        const action = ['disable', 'list'].includes(input?.action) ? input.action : 'enable';
+
+        // Показать текущие рутины пользователя.
+        if (action === 'list') {
+          const rows = await this.routines.list(userId);
+          return {
+            ok: true, kind: 'routine', action: 'list',
+            routines: rows.map((r) => ({ title: r.title, hour: r.sendHour, days: r.days, enabled: r.enabled, assistantId: r.assistantId })),
+          };
+        }
+
         // Резолвим ассистента (от кого рутина) по имени/display_name или числовому id.
+        const who = String(input?.assistant ?? '').trim();
         let assistantId: string | null = null;
         if (/^\d+$/.test(who)) {
           assistantId = who;
@@ -211,24 +236,32 @@ export class ChatToolsService {
         if (!assistantId) {
           return { ok: false, error: 'Укажи assistant — своё имя ассистента (например "Райя"), чтобы привязать рутину к тебе.' };
         }
-        const hour = Number.isFinite(input?.hour) ? Math.min(23, Math.max(0, Math.trunc(input.hour))) : 8;
-        const prompt = String(input?.prompt ?? '').trim().slice(0, 1000) || ENERGY_PROMPT;
-        const tz = (await this.routines.knownTz(userId)) || 'Europe/Moscow';
-        const row = await this.routines.upsert(userId, assistantId, {
-          enabled: action === 'enable',
-          sendHour: hour,
-          tz,
-          prompt,
-        });
-        // Есть ли у пользователя подписка на push — иначе рутина не дойдёт.
+
+        // Существующая рутина этого ассистента (одна на ассистента в чат-потоке) —
+        // обновляем её, иначе создаём новую (без дублей от повторных просьб).
+        const existing = await this.routines.findByAssistant(userId, assistantId);
+
+        if (action === 'disable') {
+          if (existing) await this.routines.update(userId, existing.id, { enabled: false });
+          return { ok: true, kind: 'routine', action: 'disable', assistant: who, enabled: false };
+        }
+
+        // enable → create-or-update
+        const hour = Number.isFinite(input?.hour) ? Math.min(23, Math.max(0, Math.trunc(input.hour))) : (existing?.sendHour ?? 8);
+        const prompt = String(input?.prompt ?? '').trim().slice(0, 1000) || existing?.prompt || ENERGY_PROMPT;
+        const title = String(input?.title ?? '').trim().slice(0, 80) || existing?.title || (assistantId === '14' ? 'Энергия дня' : 'Напоминание');
+        const days = Array.isArray(input?.days) ? input.days : (existing?.days ?? null);
+        const tz = existing?.tz || (await this.routines.knownTz(userId)) || 'Europe/Moscow';
+
+        const row = existing
+          ? await this.routines.update(userId, existing.id, { title, prompt, sendHour: hour, days, enabled: true })
+          : await this.routines.create(userId, { title, assistantId, prompt, sendHour: hour, tz, days, enabled: true });
+
         const subs = await this.pg.query('SELECT 1 FROM push_subscriptions WHERE user_id = $1 LIMIT 1', [userId]);
         return {
-          ok: true,
-          kind: 'routine',
-          enabled: row.enabled,
-          hour: row.sendHour,
-          assistant: who,
-          delivered_hint: action === 'enable' && subs.rowCount === 0,
+          ok: true, kind: 'routine', action: 'enable',
+          title: row?.title, hour: row?.sendHour, days: row?.days ?? null, enabled: true, assistant: who,
+          delivered_hint: subs.rowCount === 0,
         };
       }
 
