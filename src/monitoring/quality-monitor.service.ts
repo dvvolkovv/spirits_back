@@ -1,7 +1,9 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import { sendTelegramAlert } from '../common/telegram-alert';
+import { ChatService } from '../chat/chat.service';
+import { SyntheticService } from './synthetic.service';
 
 /**
  * Quality self-monitoring (инициатива «гарантия качества доставки», беклог
@@ -38,7 +40,57 @@ export class QualityMonitorService {
   private readonly log = new Logger(QualityMonitorService.name);
   private lastAlertAt: Record<string, number> = {};
 
-  constructor(private readonly pg: PgService) {}
+  constructor(
+    private readonly pg: PgService,
+    @Optional() private readonly chat?: ChatService,
+    @Optional() private readonly synthetic?: SyntheticService,
+  ) {}
+
+  // ── Синтетическая quality-проба (#5): реально гоняем чат через r.linkeon.io
+  // и верифицируем КАЧЕСТВО ответа (не пустой, на русском, без ошибки-плейсхолдера),
+  // а не только 200 OK. Без списания токенов (generateAgentReply не списывает).
+  @Cron('0 7,37 * * * *') // каждые 30 мин, со смещением от других кронов
+  async qualityProbe() {
+    if (process.env.QUALITY_PROBE_DISABLED === 'true' || !this.chat) return;
+    const probeUser = process.env.QUALITY_PROBE_USER || '70000000000';
+    const assistantId = process.env.QUALITY_PROBE_ASSISTANT || '12'; // Роман
+    const prompt = 'Техническая проверка. Ответь ОДНИМ коротким предложением на русском языке: пожелай хорошего дня.';
+    const started = Date.now();
+    let text = '';
+    let hardFail: string | null = null;
+    try {
+      text = await this.chat.generateAgentReply(probeUser, assistantId, prompt);
+    } catch (e: any) {
+      hardFail = `generate failed: ${e?.message || 'unknown'}`;
+    }
+    const durationMs = Date.now() - started;
+
+    const issues: string[] = [];
+    if (hardFail) {
+      issues.push(hardFail);
+    } else if (!text || text.trim().length < 5) {
+      issues.push('пустой/слишком короткий ответ');
+    } else {
+      if (/ошибка запуска агента|ответ не пришёл|failed to fetch|internal server error/i.test(text)) {
+        issues.push('ответ-плейсхолдер ошибки');
+      }
+      const letters = (text.match(/\p{L}/gu) || []).length;
+      const cyr = (text.match(/[Ѐ-ӿ]/g) || []).length;
+      if (letters >= 20 && cyr / letters < 0.3) issues.push('ответ не на русском (англ-утечка)');
+    }
+    const ok = issues.length === 0;
+
+    try { await this.synthetic?.record('chat_quality_probe', ok, durationMs, ok ? 'ok' : issues.join('; ')); } catch {}
+    if (!ok) {
+      await this.alert(
+        'quality_probe',
+        `⚠️ КАЧЕСТВО: синтетическая проба чата УПАЛА — ${issues.join('; ')}.\n` +
+        `Ответ: "${String(text).slice(0, 140)}"\n👉 Проверить r.linkeon.io / персона-промпт / модель.`,
+      );
+    } else {
+      this.log.log(`quality probe ok (${durationMs}ms)`);
+    }
+  }
 
   private cooled(kind: string): boolean {
     const last = this.lastAlertAt[kind] || 0;

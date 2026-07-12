@@ -26,9 +26,10 @@ import { MinioMirrorHealthService } from './minio-mirror-health.service';
 import { GeoAvailabilityService } from './geo-availability.service';
 import { CommonModule } from '../common/common.module';
 import { Neo4jModule } from '../neo4j/neo4j.module';
+import { ChatModule } from '../chat/chat.module';
 
 @Module({
-  imports: [CommonModule, Neo4jModule],
+  imports: [CommonModule, Neo4jModule, ChatModule],
   controllers: [MonitoringController],
   providers: [MonitoringService, LogsService, SyntheticService, FunnelService, EconomyService, QualityService, ProfileDepthService, SummaryService, NetworkingService, ChurnService, SupportService, ContentService, PersonasService, AttributionService, SmsHealthService, ClaudeHealthService, BackupHealthService, ModelsRegistryService, JobsMonitorService, QualityMonitorService, ReplicationHealthService, NeoSnapshotHealthService, MinioMirrorHealthService, GeoAvailabilityService],
 })
