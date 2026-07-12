@@ -26,12 +26,15 @@ const CHAT_WINDOW_MIN = Number(process.env.QUALITY_CHAT_WINDOW_MIN || 120);
 const CHAT_MIN_SAMPLE = Number(process.env.QUALITY_CHAT_MIN_SAMPLE || 20);
 const EMPTY_ALERT_PCT = Number(process.env.QUALITY_EMPTY_ALERT_PCT || 15);
 const LEAK_ALERT_PCT = Number(process.env.QUALITY_LEAK_ALERT_PCT || 10);
+const REFUND_WINDOW_MIN = Number(process.env.QUALITY_REFUND_WINDOW_MIN || 120);
+const REFUND_SPIKE_COUNT = Number(process.env.QUALITY_REFUND_SPIKE_COUNT || 6);
 
 export interface QualityOverview {
   generatedAt: string;
   providerFailures: { window_min: number; count: number; sample: string | null };
   videoFailureRate: { window_min: number; failed: number; total: number; pct: number | null };
   chat: { window_min: number; responses: number; empty: number; emptyPct: number | null; englishLeak: number; leakPct: number | null; deduped: number };
+  refunds: { window_min: number; count: number; tokens: number };
   alerts: string[];
 }
 
@@ -170,11 +173,25 @@ export class QualityMonitorService {
       alerts.push(`english_leak: ${leakN}/${responses} (${leakPct}%)`);
     }
 
+    // 4) Всплеск возвратов токенов = всплеск сбоев доставки (авто-рефанды видео и т.п.).
+    const ref = await this.pg.query(
+      `SELECT count(*)::int AS n, COALESCE(SUM(amount), 0)::bigint AS tokens
+         FROM token_transactions
+        WHERE transaction_type = 'refund' AND created_at > now() - ($1 || ' minutes')::interval`,
+      [REFUND_WINDOW_MIN],
+    );
+    const refCount = Number(ref.rows[0]?.n || 0);
+    const refTokens = Number(ref.rows[0]?.tokens || 0);
+    if (refCount >= REFUND_SPIKE_COUNT) {
+      alerts.push(`refund_spike: ${refCount} возвратов за ${REFUND_WINDOW_MIN}m`);
+    }
+
     return {
       generatedAt: new Date().toISOString(),
       providerFailures: { window_min: PROVIDER_FAIL_WINDOW_MIN, count: provCount, sample: provSample },
       videoFailureRate: { window_min: FAILRATE_WINDOW_MIN, failed: f, total: t, pct },
       chat: { window_min: CHAT_WINDOW_MIN, responses, empty: emptyN, emptyPct, englishLeak: leakN, leakPct, deduped: dedupedN },
+      refunds: { window_min: REFUND_WINDOW_MIN, count: refCount, tokens: refTokens },
       alerts,
     };
   }
@@ -211,6 +228,12 @@ export class QualityMonitorService {
       await this.alert(
         'english_leak',
         `⚠️ КАЧЕСТВО: всплеск англоязычных ответов — ${ov.chat.englishLeak}/${ov.chat.responses} (${ov.chat.leakPct}%) за ${ov.chat.window_min} мин. Проверить персона-промпт / r.linkeon.io.`,
+      );
+    }
+    if (ov.refunds.count >= REFUND_SPIKE_COUNT) {
+      await this.alert(
+        'refund_spike',
+        `⚠️ КАЧЕСТВО: всплеск возвратов токенов — ${ov.refunds.count} за ${ov.refunds.window_min} мин (${ov.refunds.tokens} ток.). Обычно = всплеск сбоев доставки (видео/провайдер). Проверить причину.`,
       );
     }
   }
