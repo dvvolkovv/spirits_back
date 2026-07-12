@@ -21,6 +21,17 @@ export class ChatService {
   // total_cost_usd из ClaudeCliService.
   private readonly SDK_TEXT_MULTIPLIER = 2;
 
+  // Идемпотентность отправки: гасит дубли от повторных запросов (обрыв связи,
+  // таймаут стрима, двойной тап) — второй идентичный запрос НЕ запускает агента
+  // и НЕ списывает токены, пока первый «в полёте» или только что завершился.
+  // In-memory (единый PM2-процесс). Инцидент 2026-07-12 (дубли картинок/текста).
+  private readonly inflight = new Map<string, { state: 'running' | 'done'; ts: number }>();
+  private readonly DEDUP_COOLDOWN_MS = 12000;
+  private readonly DEDUP_RUNNING_TTL_MS = 600000; // страховка от «залипшего» running
+  private dupKey(userId: string, assistantId: string, message: string): string {
+    return `${userId}::${assistantId}::${(message || '').trim().slice(0, 300)}`;
+  }
+
   constructor(
     private readonly pg: PgService,
     @Optional() private readonly neo4j: Neo4jService,
@@ -406,6 +417,36 @@ export class ChatService {
   ): Promise<void> {
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
+    // Идемпотентность: если идентичный запрос уже «в полёте» или только что
+    // завершился — не гоняем агента и не списываем токены второй раз.
+    const dkey = this.dupKey(userId, assistantId, message);
+    {
+      const nowTs = Date.now();
+      const ex = this.inflight.get(dkey);
+      const blocked = ex && (
+        (ex.state === 'running' && nowTs - ex.ts < this.DEDUP_RUNNING_TTL_MS) ||
+        (ex.state === 'done' && nowTs - ex.ts < this.DEDUP_COOLDOWN_MS)
+      );
+      if (blocked) {
+        this.logger.log(`dedup: duplicate send skipped for ${userId}_${assistantId} (state=${ex!.state})`);
+        res.status(200);
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        const note = ex!.state === 'running'
+          ? 'Секунду — я ещё обрабатываю ваш предыдущий такой же запрос. Ответ появится здесь, не отправляйте повторно.'
+          : 'Этот запрос я только что обработал — ответ выше. Если нужно заново, немного переформулируйте.';
+        try {
+          res.write(JSON.stringify({ type: 'begin' }) + '\n');
+          res.write(JSON.stringify({ type: 'item', content: note }) + '\n');
+          res.write(JSON.stringify({ type: 'end', content: note, usage: { input: 0, output: 0, total: 0 } }) + '\n');
+          res.end();
+        } catch {}
+        return;
+      }
+      this.inflight.set(dkey, { state: 'running', ts: nowTs });
+    }
+
     // Client disconnect tracking — backend keeps reading r.linkeon.io even if frontend bails.
     let clientDisconnected = false;
     if (req) {
@@ -529,6 +570,13 @@ export class ChatService {
     const persistResponse = async (final: boolean) => {
       if (saved) return;
       saved = true;
+      // Снимаем in-flight метку → включаем короткий кулдаун на идентичный повтор,
+      // затем чистим ключ, чтобы карта не росла.
+      this.inflight.set(dkey, { state: 'done', ts: Date.now() });
+      setTimeout(() => {
+        const e = this.inflight.get(dkey);
+        if (e && e.state === 'done' && Date.now() - e.ts >= this.DEDUP_COOLDOWN_MS) this.inflight.delete(dkey);
+      }, this.DEDUP_COOLDOWN_MS + 2000);
       const fullText = chunks.join('').trim();
       if (final && fullText.length === 0) {
         this.logger.warn(
