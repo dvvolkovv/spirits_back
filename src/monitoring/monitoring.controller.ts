@@ -16,6 +16,7 @@ import { ContentService, ContentWindow } from './product/content.service';
 import { PersonasService } from './product/personas.service';
 import { AttributionService } from './product/attribution.service';
 import { SmsHealthService } from './sms-health.service';
+import { QualityMonitorService } from './quality-monitor.service';
 import { ClaudeHealthService } from './claude-health.service';
 import { GeoAvailabilityService } from './geo-availability.service';
 import { BackupHealthService } from './backup-health.service';
@@ -51,6 +52,7 @@ export class MonitoringController {
     private readonly personas: PersonasService,
     private readonly attribution: AttributionService,
     private readonly smsHealth: SmsHealthService,
+    private readonly qualityMonitor: QualityMonitorService,
     private readonly claudeHealth: ClaudeHealthService,
     private readonly geo: GeoAvailabilityService,
     private readonly backupHealth: BackupHealthService,
@@ -115,6 +117,17 @@ export class MonitoringController {
       return res.status(200).json(data);
     } catch (e: any) {
       return res.status(500).json({ error: 'sms_failed', message: e?.message || String(e) });
+    }
+  }
+
+  @Get('admin/monitoring/tech/quality')
+  @UseGuards(JwtGuard, AdminGuard)
+  async qualityOverview(@Res() res: Response) {
+    try {
+      const data = await this.qualityMonitor.getOverview();
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'quality_failed', message: e?.message || String(e) });
     }
   }
 
