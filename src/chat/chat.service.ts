@@ -643,63 +643,81 @@ export class ChatService {
     };
 
     try {
-      // Build multipart form
-      const FormData = require('form-data');
-      const fd = new FormData();
-      fd.append('message', prompt);
-      fd.append('sessionId', `${userId}_${assistantId}`);
+      // Один вызов upstream r.linkeon: парсит SSE, пушит в chunks и стримит
+      // 'item' клиенту. Вынесено в замыкание ради self-heal ретрая пустого потока.
+      const callUpstreamOnce = async (): Promise<void> => {
+        const FormData = require('form-data');
+        const fd = new FormData();
+        fd.append('message', prompt);
+        fd.append('sessionId', `${userId}_${assistantId}`);
 
-      const agentRes = await axios.post(`${AGENT_URL}/chat`, fd, {
-        headers: fd.getHeaders(),
-        responseType: 'stream',
-        timeout: 600000, // 10 min
-      });
-      let inputTokens = 0;
-      let outputTokens = 0;
+        const agentRes = await axios.post(`${AGENT_URL}/chat`, fd, {
+          headers: fd.getHeaders(),
+          responseType: 'stream',
+          timeout: 600000, // 10 min
+        });
 
-      await new Promise<void>((resolve, reject) => {
-        let buffer = '';
-        agentRes.data.on('data', (chunk: Buffer) => {
-          try {
-            lastDataAt = Date.now();
-            buffer += chunk.toString();
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
+        await new Promise<void>((resolve, reject) => {
+          let buffer = '';
+          agentRes.data.on('data', (chunk: Buffer) => {
+            try {
+              lastDataAt = Date.now();
+              buffer += chunk.toString();
+              const lines = buffer.split('\n');
+              buffer = lines.pop() || '';
 
-            for (const line of lines) {
-              if (!line.startsWith('data: ')) continue;
-              try {
-                const ev = JSON.parse(line.slice(6));
+              for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                try {
+                  const ev = JSON.parse(line.slice(6));
 
-                if (ev.type === 'delta' || ev.type === 'text') {
-                  chunks.push(ev.text);
-                  safeWrite({ type: 'item', content: ev.text });
-                } else if (ev.type === 'result' && ev.text) {
-                  if (chunks.length === 0) {
+                  if (ev.type === 'delta' || ev.type === 'text') {
                     chunks.push(ev.text);
                     safeWrite({ type: 'item', content: ev.text });
-                  }
-                } else if (ev.type === 'done') {
-                  // Collect output files info if any
-                  if (ev.outputFiles && ev.outputFiles.length > 0) {
-                    const fileLinks = ev.outputFiles
-                      .map((f: any) => `[Скачать ${f.name}](${AGENT_URL}${f.url})`)
-                      .join('\n');
-                    if (fileLinks && !chunks.join('').includes(AGENT_URL)) {
-                      chunks.push('\n\n' + fileLinks);
-                      safeWrite({ type: 'item', content: '\n\n' + fileLinks });
+                  } else if (ev.type === 'result' && ev.text) {
+                    if (chunks.length === 0) {
+                      chunks.push(ev.text);
+                      safeWrite({ type: 'item', content: ev.text });
+                    }
+                  } else if (ev.type === 'done') {
+                    // Collect output files info if any
+                    if (ev.outputFiles && ev.outputFiles.length > 0) {
+                      const fileLinks = ev.outputFiles
+                        .map((f: any) => `[Скачать ${f.name}](${AGENT_URL}${f.url})`)
+                        .join('\n');
+                      if (fileLinks && !chunks.join('').includes(AGENT_URL)) {
+                        chunks.push('\n\n' + fileLinks);
+                        safeWrite({ type: 'item', content: '\n\n' + fileLinks });
+                      }
                     }
                   }
-                }
-              } catch {}
+                } catch {}
+              }
+            } catch (e: any) {
+              this.logger.warn(`data handler error (non-fatal): ${e.message}`);
             }
-          } catch (e: any) {
-            this.logger.warn(`data handler error (non-fatal): ${e.message}`);
-          }
+          });
+          agentRes.data.on('end', () => resolve());
+          agentRes.data.on('error', (err: Error) => reject(err));
         });
-        agentRes.data.on('end', () => resolve());
-        agentRes.data.on('error', (err: Error) => reject(err));
-      });
+      };
+
+      await callUpstreamOnce();
+
+      // SELF-HEAL: r.linkeon иногда отдаёт ПУСТОЙ поток (0 delta-событий, ~сотни
+      // мс) — корень жалоб «постоянно выдаёт ошибку». Если ничего не пришло и
+      // клиент ещё на связи — тихо повторяем upstream ОДИН раз, прежде чем отдать
+      // юзеру пустоту. Безопасно: при пустом chunks клиенту ещё не ушло ни одного
+      // 'item' (дублей не будет). Инцидент/находка 2026-07-12.
+      if (chunks.length === 0 && !clientDisconnected) {
+        this.logger.warn(`empty stream from r.linkeon for ${userId}_${assistantId} — self-heal retry`);
+        this.events?.track('chat_quality', {
+          userId, sessionId: `${userId}_${assistantId}`,
+          props: { assistant_id: assistantId, self_heal_retry: true },
+        });
+        await new Promise((r) => setTimeout(r, 800));
+        try { await callUpstreamOnce(); } catch (e: any) { this.logger.warn(`self-heal retry failed: ${e.message}`); }
+      }
 
       // Strip any [VIDEO_JOB:<uuid>] markers Roman may have hallucinated.
       // We re-inject only verified jobs from DB query below.
