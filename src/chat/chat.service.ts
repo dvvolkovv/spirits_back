@@ -872,7 +872,7 @@ export class ChatService {
    * готовый текст. Историю/токены НЕ пишет (это делает вызывающий). Пустой
    * ответ → пустая строка.
    */
-  async generateAgentReply(userId: string, assistantId: string, message: string): Promise<string> {
+  async generateAgentReply(userId: string, assistantId: string, message: string, sessionIdOverride?: string): Promise<string> {
     const isNumeric = /^\d+$/.test(assistantId);
     const agentRes = isNumeric
       ? await this.pg.query('SELECT * FROM agents WHERE id = $1 LIMIT 1', [parseInt(assistantId, 10)])
@@ -901,7 +901,10 @@ export class ChatService {
     const FormData = require('form-data');
     const fd = new FormData();
     fd.append('message', prompt);
-    fd.append('sessionId', `${userId}_${assistantId}`);
+    // sessionIdOverride — для синтетических проб: изолированная сессия, чтобы не
+    // коллидить с реальной сессией юзера/другими пробами (r.linkeon отдаёт пустой
+    // поток при конкурентном обращении к ЗАНЯТОЙ сессии — инцидент 2026-07-12).
+    fd.append('sessionId', sessionIdOverride || `${userId}_${assistantId}`);
     const chunks: string[] = [];
     const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
       headers: fd.getHeaders(),

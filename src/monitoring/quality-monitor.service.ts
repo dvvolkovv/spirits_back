@@ -58,7 +58,11 @@ export class QualityMonitorService {
     let text = '';
     let hardFail: string | null = null;
     try {
-      text = await this.chat!.generateAgentReply(probeUser, assistantId, prompt);
+      // Изолированная эфемерная сессия на каждую пробу — чтобы не коллидить с
+      // реальной сессией юзера/node-3-раннером (иначе r.linkeon отдаёт пустой
+      // поток из-за занятой сессии). Инцидент 2026-07-12.
+      const probeSession = `qprobe_${assistantId}_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+      text = await this.chat!.generateAgentReply(probeUser, assistantId, prompt, probeSession);
     } catch (e: any) {
       hardFail = `generate failed: ${e?.message || 'unknown'}`;
     }
