@@ -20,11 +20,16 @@ const FAILRATE_WINDOW_MIN = Number(process.env.QUALITY_FAILRATE_WINDOW_MIN || 12
 const FAILRATE_MIN_SAMPLE = Number(process.env.QUALITY_FAILRATE_MIN_SAMPLE || 5);
 const FAILRATE_ALERT_PCT = Number(process.env.QUALITY_FAILRATE_ALERT_PCT || 50);
 const ALERT_COOLDOWN_H = Number(process.env.QUALITY_ALERT_COOLDOWN_H || 3);
+const CHAT_WINDOW_MIN = Number(process.env.QUALITY_CHAT_WINDOW_MIN || 120);
+const CHAT_MIN_SAMPLE = Number(process.env.QUALITY_CHAT_MIN_SAMPLE || 20);
+const EMPTY_ALERT_PCT = Number(process.env.QUALITY_EMPTY_ALERT_PCT || 15);
+const LEAK_ALERT_PCT = Number(process.env.QUALITY_LEAK_ALERT_PCT || 10);
 
 export interface QualityOverview {
   generatedAt: string;
   providerFailures: { window_min: number; count: number; sample: string | null };
   videoFailureRate: { window_min: number; failed: number; total: number; pct: number | null };
+  chat: { window_min: number; responses: number; empty: number; emptyPct: number | null; englishLeak: number; leakPct: number | null; deduped: number };
   alerts: string[];
 }
 
@@ -78,10 +83,34 @@ export class QualityMonitorService {
       alerts.push(`video_failrate: ${f}/${t} (${pct}%) за ${FAILRATE_WINDOW_MIN}m`);
     }
 
+    // 3) Качество чат-ответов из телеметрии chat_quality: пустые ответы и англ-утечки.
+    const chatRes = await this.pg.query(
+      `SELECT
+         count(*) FILTER (WHERE COALESCE((props->>'deduped')::boolean, false) = false)::int AS responses,
+         count(*) FILTER (WHERE COALESCE((props->>'empty')::boolean, false))::int AS empty,
+         count(*) FILTER (WHERE COALESCE((props->>'english_leak')::boolean, false))::int AS leak,
+         count(*) FILTER (WHERE COALESCE((props->>'deduped')::boolean, false))::int AS deduped
+       FROM events WHERE name = 'chat_quality' AND ts > now() - ($1 || ' minutes')::interval`,
+      [CHAT_WINDOW_MIN],
+    );
+    const responses = Number(chatRes.rows[0]?.responses || 0);
+    const emptyN = Number(chatRes.rows[0]?.empty || 0);
+    const leakN = Number(chatRes.rows[0]?.leak || 0);
+    const dedupedN = Number(chatRes.rows[0]?.deduped || 0);
+    const emptyPct = responses > 0 ? Math.round((emptyN / responses) * 100) : null;
+    const leakPct = responses > 0 ? Math.round((leakN / responses) * 100) : null;
+    if (responses >= CHAT_MIN_SAMPLE && emptyPct !== null && emptyPct >= EMPTY_ALERT_PCT) {
+      alerts.push(`empty_responses: ${emptyN}/${responses} (${emptyPct}%)`);
+    }
+    if (responses >= CHAT_MIN_SAMPLE && leakPct !== null && leakPct >= LEAK_ALERT_PCT) {
+      alerts.push(`english_leak: ${leakN}/${responses} (${leakPct}%)`);
+    }
+
     return {
       generatedAt: new Date().toISOString(),
       providerFailures: { window_min: PROVIDER_FAIL_WINDOW_MIN, count: provCount, sample: provSample },
       videoFailureRate: { window_min: FAILRATE_WINDOW_MIN, failed: f, total: t, pct },
+      chat: { window_min: CHAT_WINDOW_MIN, responses, empty: emptyN, emptyPct, englishLeak: leakN, leakPct, deduped: dedupedN },
       alerts,
     };
   }
@@ -106,6 +135,18 @@ export class QualityMonitorService {
       await this.alert(
         'video_failrate',
         `⚠️ КАЧЕСТВО: высокая доля падений видео — ${ov.videoFailureRate.failed}/${ov.videoFailureRate.total} (${ov.videoFailureRate.pct}%) за ${ov.videoFailureRate.window_min} мин. Проверить пайплайн/провайдера.`,
+      );
+    }
+    if (ov.chat.responses >= CHAT_MIN_SAMPLE && ov.chat.emptyPct !== null && ov.chat.emptyPct >= EMPTY_ALERT_PCT) {
+      await this.alert(
+        'empty_responses',
+        `⚠️ КАЧЕСТВО: много пустых ответов ассистентов — ${ov.chat.empty}/${ov.chat.responses} (${ov.chat.emptyPct}%) за ${ov.chat.window_min} мин. Проверить r.linkeon.io / стриминг.`,
+      );
+    }
+    if (ov.chat.responses >= CHAT_MIN_SAMPLE && ov.chat.leakPct !== null && ov.chat.leakPct >= LEAK_ALERT_PCT) {
+      await this.alert(
+        'english_leak',
+        `⚠️ КАЧЕСТВО: всплеск англоязычных ответов — ${ov.chat.englishLeak}/${ov.chat.responses} (${ov.chat.leakPct}%) за ${ov.chat.window_min} мин. Проверить персона-промпт / r.linkeon.io.`,
       );
     }
   }

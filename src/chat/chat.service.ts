@@ -7,6 +7,7 @@ import { SmmProducerToolsService } from '../smm/producer/smm-producer-tools.serv
 import { ClaudeAgentService } from './claude-agent.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { TasksService } from '../tasks/tasks.service';
+import { EventsService } from '../events/events.service';
 import axios from 'axios';
 import { Request, Response } from 'express';
 // Agent server at r.linkeon.io (remote Claude Code)
@@ -41,7 +42,23 @@ export class ChatService {
     private readonly claudeAgent: ClaudeAgentService,
     private readonly claudeCli: ClaudeCliService,
     @Optional() private readonly tasksService?: TasksService,
+    @Optional() private readonly events?: EventsService,
   ) {}
+
+  // Эвристика англ-утечки: длинный ответ, в котором почти нет кириллицы (после
+  // вырезания кода/URL) — вероятно, ассистент «съехал» на английский или утёк
+  // служебный вывод. Для агрегатной телеметрии (не для блокировки).
+  private looksEnglishLeak(text: string): boolean {
+    if (!text) return false;
+    const cleaned = text
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/https?:\/\/\S+/g, ' ')
+      .replace(/`[^`]*`/g, ' ');
+    const letters = (cleaned.match(/\p{L}/gu) || []).length;
+    if (letters < 40) return false;
+    const cyr = (cleaned.match(/[Ѐ-ӿ]/g) || []).length;
+    return cyr / letters < 0.1;
+  }
 
   async streamChat(
     userId: string,
@@ -429,6 +446,10 @@ export class ChatService {
       );
       if (blocked) {
         this.logger.log(`dedup: duplicate send skipped for ${userId}_${assistantId} (state=${ex!.state})`);
+        this.events?.track('chat_quality', {
+          userId, sessionId: `${userId}_${assistantId}`,
+          props: { assistant_id: assistantId, deduped: true },
+        });
         res.status(200);
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         res.setHeader('Cache-Control', 'no-cache');
@@ -578,6 +599,20 @@ export class ChatService {
         if (e && e.state === 'done' && Date.now() - e.ts >= this.DEDUP_COOLDOWN_MS) this.inflight.delete(dkey);
       }, this.DEDUP_COOLDOWN_MS + 2000);
       const fullText = chunks.join('').trim();
+      if (final) {
+        // Quality-телеметрия: пустой ответ / англ-утечка / объём — для агрегатов
+        // и алертов регрессии (инициатива «гарантия качества», беклог a867ef3b).
+        this.events?.track('chat_quality', {
+          userId, sessionId: `${userId}_${assistantId}`,
+          props: {
+            assistant_id: assistantId,
+            ok: fullText.length > 0,
+            empty: fullText.length === 0,
+            chars: fullText.length,
+            english_leak: this.looksEnglishLeak(fullText),
+          },
+        });
+      }
       if (final && fullText.length === 0) {
         this.logger.warn(
           `empty stream for session ${userId}_${assistantId} — r.linkeon.io completed without delta events ` +
