@@ -15,7 +15,7 @@ import * as path from 'path';
  * publish-скрипт (scripts/ota-publish.sh) рядом с самим бандлом
  * public/app-ota/<version>.zip (раздаётся nginx-ом как /static/app-ota/...).
  */
-@Controller('webhook/app-ota')
+@Controller('app-ota')
 export class AppOtaController {
   private manifestPath() {
     return path.join(process.cwd(), 'public', 'app-ota', 'latest.json');
