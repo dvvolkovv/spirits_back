@@ -4,6 +4,7 @@ import { AvatarService } from './avatar.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import * as multer from 'multer';
+import axios from 'axios';
 
 @Controller('')
 export class AvatarController {
@@ -24,8 +25,16 @@ export class AvatarController {
       return res.sendFile(filePath);
     }
 
-    // If remote URL, redirect
-    return res.redirect(avatar.url);
+    // If remote URL — проксируем байты (не redirect): см. коммент в getAgentAvatar
+    // (кросс-ориджин + Authorization = префлайт, redirect за ним не следуется).
+    try {
+      const img = await axios.get(avatar.url, { responseType: 'arraybuffer', timeout: 15000 });
+      res.setHeader('Content-Type', img.headers['content-type'] || 'image/jpeg');
+      res.setHeader('Cache-Control', 'private, max-age=3600');
+      return res.send(Buffer.from(img.data));
+    } catch {
+      return res.redirect(avatar.url);
+    }
   }
 
   @Post('avatar')
@@ -69,6 +78,18 @@ export class AvatarController {
   async getAgentAvatar(@Param('agentId') agentId: string, @Res() res: Response) {
     const url = await this.avatarService.getAgentAvatar(agentId);
     if (!url) return res.status(404).json({ error: 'No avatar' });
-    return res.redirect(url);
+    // Проксируем байты изображения вместо 302-редиректа: кросс-ориджин клиенты
+    // (натив-приложение, WebView) шлют Authorization → запрос префлайтится, а
+    // браузер НЕ следует за redirect на префлайтнутом запросе → CORS-ошибка →
+    // аватарки не грузятся. Прямая отдача байтов убирает redirect (инцидент
+    // 2026-07-13). Веб (same-origin) не затронут. Клиент кэширует в IndexedDB.
+    try {
+      const img = await axios.get(url, { responseType: 'arraybuffer', timeout: 15000 });
+      res.setHeader('Content-Type', img.headers['content-type'] || 'image/jpeg');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      return res.send(Buffer.from(img.data));
+    } catch {
+      return res.redirect(url); // fallback — если апстрим недоступен
+    }
   }
 }
