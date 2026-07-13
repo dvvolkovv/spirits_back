@@ -41,7 +41,7 @@ export class AppWidgetController {
     let assistantName: string | null = null;
     let contextLine = '';
     const last = await this.pg.query(
-      `SELECT agent, content
+      `SELECT session_id, agent, content
          FROM custom_chat_history
         WHERE session_id LIKE ($1 || '\\_%') ESCAPE '\\'
         ORDER BY created_at DESC
@@ -50,17 +50,29 @@ export class AppWidgetController {
     );
     if (last.rows[0]) {
       contextLine = snippet(last.rows[0].content || '');
-      const agentName = last.rows[0].agent;
-      if (agentName) {
-        const a = await this.pg.query(
-          `SELECT id::text AS id, COALESCE(display_name, name) AS display_name
-             FROM agents WHERE name = $1 LIMIT 1`,
-          [agentName],
+      // Ассистента берём из session_id (`<userId>_<assistantId>`) — надёжнее,
+      // чем колонка agent (у human-реплик она может быть пустой).
+      const sid: string = last.rows[0].session_id || '';
+      let aid: string | null = sid.startsWith(userId + '_') ? sid.slice(userId.length + 1) : null;
+      if (aid && aid.includes('_')) aid = aid.split('_')[0];
+      let row: any = null;
+      if (aid && /^\d+$/.test(aid)) {
+        const r = await this.pg.query(
+          `SELECT id::text AS id, COALESCE(display_name, name) AS display_name FROM agents WHERE id = $1::int LIMIT 1`,
+          [aid],
         );
-        if (a.rows[0]) {
-          assistantId = a.rows[0].id;
-          assistantName = a.rows[0].display_name;
-        }
+        row = r.rows[0];
+      }
+      if (!row && last.rows[0].agent) {
+        const r = await this.pg.query(
+          `SELECT id::text AS id, COALESCE(display_name, name) AS display_name FROM agents WHERE name = $1 LIMIT 1`,
+          [last.rows[0].agent],
+        );
+        row = r.rows[0];
+      }
+      if (row) {
+        assistantId = row.id;
+        assistantName = row.display_name;
       }
     }
 
