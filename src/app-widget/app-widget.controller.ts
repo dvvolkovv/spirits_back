@@ -92,9 +92,16 @@ export class AppWidgetController {
       if (e.rows[0]) energyLine = snippet(e.rows[0].content || '', 100);
     }
 
+    // URL аватарки ассистента (публичный эндпоинт, теперь отдаёт байты) —
+    // натив-виджет скачает и покажет кружком.
+    const avatarUrl = assistantId
+      ? `https://my.linkeon.io/webhook/0cdacf32-7bfd-4888-b24f-3a6af3b5f99e/agent/avatar/${assistantId}`
+      : '';
+
     return {
       assistantId,
       assistantName,
+      avatarUrl,
       contextLine,
       energyLine,
       hasEnergy: !!energyLine,
