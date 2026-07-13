@@ -76,6 +76,33 @@ export class AppWidgetController {
       }
     }
 
+    // Недавние ассистенты (для динамических персональных ярлыков [Натив 5]):
+    // топ-3 различных ассистента по свежести активности.
+    const recentAssistants: Array<{ id: string; name: string }> = [];
+    const sessions = await this.pg.query(
+      `SELECT session_id, MAX(created_at) AS mx
+         FROM custom_chat_history
+        WHERE session_id LIKE ($1 || '\\_%') ESCAPE '\\'
+        GROUP BY session_id
+        ORDER BY mx DESC
+        LIMIT 8`,
+      [userId],
+    );
+    const seenAid = new Set<string>();
+    for (const s of sessions.rows) {
+      const sid: string = s.session_id || '';
+      let aid: string | null = sid.startsWith(userId + '_') ? sid.slice(userId.length + 1) : null;
+      if (aid && aid.includes('_')) aid = aid.split('_')[0];
+      if (!aid || !/^\d+$/.test(aid) || seenAid.has(aid)) continue;
+      seenAid.add(aid);
+      const r = await this.pg.query(
+        `SELECT id::text AS id, COALESCE(display_name, name) AS display_name FROM agents WHERE id = $1::int LIMIT 1`,
+        [aid],
+      );
+      if (r.rows[0]) recentAssistants.push({ id: r.rows[0].id, name: r.rows[0].display_name });
+      if (recentAssistants.length >= 3) break;
+    }
+
     // Энергия дня — только при реально включённой энерго-рутине.
     let energyLine: string | null = null;
     const er = await this.pg.query(
@@ -105,6 +132,7 @@ export class AppWidgetController {
       contextLine,
       energyLine,
       hasEnergy: !!energyLine,
+      recentAssistants,
     };
   }
 }
