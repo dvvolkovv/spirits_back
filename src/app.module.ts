@@ -37,6 +37,7 @@ import { VoiceAvatarModule } from './voice-avatar/voice-avatar.module';
 import { PushModule } from './push/push.module';
 import { RoutineStoreModule } from './routine-push/routine-store.module';
 import { RoutinePushModule } from './routine-push/routine-push.module';
+import { AppOtaModule } from './app-ota/app-ota.module';
 
 @Module({
   imports: [
@@ -78,6 +79,7 @@ import { RoutinePushModule } from './routine-push/routine-push.module';
     PushModule,
     RoutineStoreModule,
     RoutinePushModule,
+    AppOtaModule,
   ],
 })
 export class AppModule {}
