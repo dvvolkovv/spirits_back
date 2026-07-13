@@ -28,6 +28,16 @@ export class PushController {
     return res.json({ ok: true });
   }
 
+  // Регистрация нативного FCM-токена (Capacitor push-notifications) [Натив 3].
+  @Post('register-native')
+  @UseGuards(JwtGuard)
+  async registerNative(@CurrentUser() user: any, @Body() body: any, @Res() res: Response) {
+    const token = body?.token || body?.value;
+    if (!token) return res.status(400).json({ ok: false, error: 'token required' });
+    await this.push.registerNative(user.userId, token);
+    return res.json({ ok: true });
+  }
+
   // Тестовый пуш самому себе (проверка транспорта с устройства).
   @Post('test')
   @UseGuards(JwtGuard)
