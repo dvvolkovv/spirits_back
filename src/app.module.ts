@@ -38,6 +38,7 @@ import { PushModule } from './push/push.module';
 import { RoutineStoreModule } from './routine-push/routine-store.module';
 import { RoutinePushModule } from './routine-push/routine-push.module';
 import { AppOtaModule } from './app-ota/app-ota.module';
+import { AppWidgetModule } from './app-widget/app-widget.module';
 
 @Module({
   imports: [
@@ -80,6 +81,7 @@ import { AppOtaModule } from './app-ota/app-ota.module';
     RoutineStoreModule,
     RoutinePushModule,
     AppOtaModule,
+    AppWidgetModule,
   ],
 })
 export class AppModule {}
