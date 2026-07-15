@@ -553,9 +553,11 @@ export class ChatService {
       }
     }
     if (recentHistory.length > 0) {
+      // stripLeakedToolSyntax: заражённая история заставляет модель имитировать
+      // текстовый tool-синтаксис вместо реальных вызовов (см. инцидент 2026-07-10).
       const historyLines = recentHistory
         .slice(-6)
-        .map(m => `${m.type === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
+        .map(m => `${m.type === 'user' ? 'User' : 'Assistant'}: ${this.stripLeakedToolSyntax(m.content)}`)
         .join('\n');
       contextPrefix += `Recent conversation context:\n${historyLines}\n\n`;
     }
@@ -598,7 +600,7 @@ export class ChatService {
         const e = this.inflight.get(dkey);
         if (e && e.state === 'done' && Date.now() - e.ts >= this.DEDUP_COOLDOWN_MS) this.inflight.delete(dkey);
       }, this.DEDUP_COOLDOWN_MS + 2000);
-      const fullText = chunks.join('').trim();
+      const fullText = this.stripLeakedToolSyntax(chunks.join('').trim());
       if (final) {
         // Quality-телеметрия: пустой ответ / англ-утечка / объём — для агрегатов
         // и алертов регрессии (инициатива «гарантия качества», беклог a867ef3b).
@@ -801,6 +803,24 @@ export class ChatService {
     }
   }
 
+  /**
+   * Убирает утёкший в текст tool-call синтаксис — глитч деградации модели на
+   * сверхдлинном контексте (инцидент 2026-07-10, сессия Романа): модель пишет
+   * <invoke>/<parameter>-блоки и строки-артефакты «court» текстом вместо
+   * реальных tool_use. Не трогает markdown-картинки ![](url) — так юзеру
+   * показываются MCP-изображения в universal-agent-пути.
+   */
+  private stripLeakedToolSyntax(text: string): string {
+    if (!text) return text;
+    return text
+      .replace(/<invoke name="[^"]*">[\s\S]*?<\/invoke>/g, '')
+      .replace(/<invoke name="[^"]*">[\s\S]*$/g, '')
+      .replace(/<\/?(?:invoke|parameter|function_calls)\b[^>]*>/g, '')
+      .replace(/(^|\n)court(?=\n|$)/g, '$1')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
   private stripToolTags(text: string): string {
     return text
       .replace(/<\/?function_calls>/g, '')
@@ -808,7 +828,8 @@ export class ChatService {
       .replace(/<\/?get_profile>/g, '')
       .replace(/<\/?tool_call>/g, '')
       .replace(/<\/?tool_result>/g, '')
-      .replace(/<\/?invoke>/g, '')
+      .replace(/<\/?invoke\b[^>]*>/g, '')
+      .replace(/<\/?parameter\b[^>]*>/g, '')
       .replace(/<\/?antml:[^>]*>/g, '')
       .replace(/\[?\s*\{\s*"tool_name"\s*:\s*"[^"]*"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\}\s*\]?/g, '')
       // Remove fake/empty/placeholder markdown images
