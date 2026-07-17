@@ -681,7 +681,11 @@ export class ChatService {
         const FormData = require('form-data');
         const fd = new FormData();
         fd.append('message', prompt);
-        fd.append('sessionId', `${userId}_${assistantId}`);
+        // fresh: relay (r.linkeon.io) держит СВОЮ память по sessionId и резюмит
+        // Claude-сессию — обычный id протаскивал прошлый контекст (задачи,
+        // разговоры) в «чистый лист» мимо наших блокировок. Fresh-сессия
+        // получает на relay собственную чистую память.
+        fd.append('sessionId', fresh && freshSessionId ? freshSessionId : `${userId}_${assistantId}`);
 
         const agentRes = await axios.post(`${AGENT_URL}/chat`, fd, {
           headers: fd.getHeaders(),
