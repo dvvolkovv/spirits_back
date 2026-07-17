@@ -68,6 +68,10 @@ export class ChatService {
     profileText: string,
     res: Response,
     req?: Request,
+    // «Чистый лист»: история и запись идут в отдельную fresh-сессию (sessionId),
+    // прошлые задачи в промпт не инжектятся. Профиль ЧИТАЕТСЯ (вариант A) и
+    // ФОРМИРУЕТСЯ (consolidateFromChat работает от переданных сообщений).
+    fresh: boolean = false,
   ): Promise<void> {
     // Get agent
     // Custom-agent branch: "custom:<uuid>" references user-created agents.
@@ -109,7 +113,8 @@ export class ChatService {
     }
 
     // Get chat history (individual rows: session_id, sender_type, content)
-    const chatSessionId = `${userId}_${assistantId}`;
+    // fresh: история и запись — в отдельной fresh-сессии из controller'а.
+    const chatSessionId = fresh ? sessionId : `${userId}_${assistantId}`;
     const histRes = await this.pg.query(
       `SELECT sender_type, content FROM custom_chat_history
        WHERE session_id = $1
@@ -190,7 +195,7 @@ export class ChatService {
         userId, message, String(assistantId), String(agent.id),
         recentHistory, profileText, res,
         agent.name, agent.description || '', agent.system_prompt || '',
-        req,
+        req, fresh, chatSessionId,
       );
     }
 
@@ -230,7 +235,8 @@ export class ChatService {
       ? `\n\n--- Профиль пользователя ---\n${profileText}`
       : '';
     // Cross-agent active tasks (см. TasksService.buildContextForPrompt).
-    if (this.tasksService) {
+    // fresh: чистый лист — прошлые задачи в промпт не тянем.
+    if (this.tasksService && !fresh) {
       try {
         const tasksCtx = await this.tasksService.buildContextForPrompt(userId, message);
         if (tasksCtx) volatileSystemPrompt += `\n\n${tasksCtx}`;
@@ -278,7 +284,7 @@ export class ChatService {
         res.write(JSON.stringify({ type: 'end', content: greetText, usage: { input: 0, output: 0, total: 0 } }) + '\n');
         res.end();
         setImmediate(async () => {
-          try { await this.saveChatHistory(userId, String(assistantId), message, greetText); } catch {}
+          try { await this.saveChatHistory(userId, String(assistantId), message, greetText, 0, fresh ? chatSessionId : undefined); } catch {}
           // No token deduction for greeting
         });
         return;
@@ -349,14 +355,16 @@ export class ChatService {
     setImmediate(async () => {
       try {
         const tokensUsed = inputTokens + outputTokens;
-        await this.saveChatHistory(userId, String(assistantId), message, fullText, tokensUsed);
+        await this.saveChatHistory(userId, String(assistantId), message, fullText, tokensUsed, fresh ? chatSessionId : undefined);
         await this.addTokenTask(userId, inputTokens, outputTokens, String(agent.id));
-        // Extract profile entities from conversation
+        // Extract profile entities from conversation — работает и в fresh-режиме:
+        // «чистый лист» не тянет прошлый контекст, но профиль формирует.
         if (this.neo4j) {
           await this.neo4j.consolidateFromChat(userId, String(assistantId), message, fullText);
         }
-        // Operational task memory (cross-agent)
-        if (this.tasksService) {
+        // Operational task memory (cross-agent). В fresh-режиме выключено:
+        // чистый лист не должен порождать боковых задач.
+        if (this.tasksService && !fresh) {
           try { await this.tasksService.extractFromTurn(userId, String(assistantId), message, fullText); } catch {}
         }
       } catch (e) {
@@ -431,6 +439,8 @@ export class ChatService {
     agentDescription: string = '',
     agentSystemPrompt: string = '',
     req?: Request,
+    fresh: boolean = false,
+    freshSessionId?: string,
   ): Promise<void> {
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
@@ -474,7 +484,7 @@ export class ChatService {
     // AI-строка допишется в persistResponse по завершении.
     let userMsgPersisted = false;
     try {
-      await this.saveUserMessageRow(userId, assistantId, message);
+      await this.saveUserMessageRow(userId, assistantId, message, fresh ? freshSessionId : undefined);
       userMsgPersisted = true;
     } catch (e: any) {
       this.logger.warn(`early user-msg persist failed (fallback to end-of-stream): ${e.message}`);
@@ -555,8 +565,8 @@ export class ChatService {
     }
     // Активные задачи пользователя (cross-agent) — топ-5 по релевантности
     // к текущей реплике. Юзер видит ассистентов как продолжающих контекст
-    // незаконченных дел, а не отвечающих с нуля.
-    if (this.tasksService) {
+    // незаконченных дел, а не отвечающих с нуля. fresh: чистый лист — не тянем.
+    if (this.tasksService && !fresh) {
       try {
         const tasksCtx = await this.tasksService.buildContextForPrompt(userId, message);
         if (tasksCtx) contextPrefix += tasksCtx + '\n';
@@ -641,17 +651,21 @@ export class ChatService {
       if (!aiText) return; // skip empty intermediate persists
       const textCost = fullText.length * this.SDK_TEXT_MULTIPLIER;
       try {
+        const sessOverride = fresh ? freshSessionId : undefined;
         if (userMsgPersisted) {
-          await this.saveAssistantMessageRow(userId, assistantId, aiText, textCost);
+          await this.saveAssistantMessageRow(userId, assistantId, aiText, textCost, sessOverride);
         } else {
-          await this.saveChatHistory(userId, assistantId, message, aiText, textCost);
+          await this.saveChatHistory(userId, assistantId, message, aiText, textCost, sessOverride);
         }
         if (fullText.length > 0) {
           await this.addTokenTask(userId, 0, textCost, agentId);
+          // Профиль формируется и в fresh-режиме (чистый лист скрывает контекст,
+          // но не отключает обучение профиля).
           if (this.neo4j) {
             try { await this.neo4j.consolidateFromChat(userId, assistantId, message, fullText); } catch {}
           }
-          if (this.tasksService) {
+          // Задачи из fresh-разговора не извлекаем — чистый лист без побочных задач.
+          if (this.tasksService && !fresh) {
             try { await this.tasksService.extractFromTurn(userId, assistantId, message, fullText); } catch {}
           }
         }
@@ -981,13 +995,13 @@ export class ChatService {
     }
   }
 
-  private async saveChatHistory(userId: string, agentId: string, userMsg: string, assistantMsg: string, tokensUsed = 0) {
-    await this.saveUserMessageRow(userId, agentId, userMsg);
-    await this.saveAssistantMessageRow(userId, agentId, assistantMsg, tokensUsed);
+  private async saveChatHistory(userId: string, agentId: string, userMsg: string, assistantMsg: string, tokensUsed = 0, sessionIdOverride?: string) {
+    await this.saveUserMessageRow(userId, agentId, userMsg, sessionIdOverride);
+    await this.saveAssistantMessageRow(userId, agentId, assistantMsg, tokensUsed, sessionIdOverride);
   }
 
-  private async saveUserMessageRow(userId: string, agentId: string, userMsg: string) {
-    const sessionId = `${userId}_${agentId}`;
+  private async saveUserMessageRow(userId: string, agentId: string, userMsg: string, sessionIdOverride?: string) {
+    const sessionId = sessionIdOverride || `${userId}_${agentId}`;
     const agentNum = /^\d+$/.test(agentId) ? parseInt(agentId, 10) : null;
     await this.pg.query(
       `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
@@ -996,8 +1010,8 @@ export class ChatService {
     );
   }
 
-  private async saveAssistantMessageRow(userId: string, agentId: string, assistantMsg: string, tokensUsed = 0) {
-    const sessionId = `${userId}_${agentId}`;
+  private async saveAssistantMessageRow(userId: string, agentId: string, assistantMsg: string, tokensUsed = 0, sessionIdOverride?: string) {
+    const sessionId = sessionIdOverride || `${userId}_${agentId}`;
     const agentNum = /^\d+$/.test(agentId) ? parseInt(agentId, 10) : null;
     await this.pg.query(
       `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
@@ -1016,8 +1030,8 @@ export class ChatService {
     );
   }
 
-  async getChatHistory(userId: string, assistantId: string, limit = 30, offset = 0): Promise<{ messages: any[]; hasMore: boolean }> {
-    const sessionId = `${userId}_${assistantId}`;
+  async getChatHistory(userId: string, assistantId: string, limit = 30, offset = 0, sessionIdOverride?: string): Promise<{ messages: any[]; hasMore: boolean }> {
+    const sessionId = sessionIdOverride || `${userId}_${assistantId}`;
     const res = await this.pg.query(
       `SELECT id, sender_type, content, created_at, tokens_used FROM custom_chat_history
        WHERE session_id = $1

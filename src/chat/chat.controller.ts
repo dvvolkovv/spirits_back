@@ -56,7 +56,12 @@ export class ChatController {
       } catch {}
     }
 
-    const finalSessionId = sessionId || `${userId}_${assistantId}`;
+    // «Чистый лист»: фронт передаёт fresh=true + freshTs (метка включения
+    // режима). Сессия собирается на бэке — фронт не знает формат userId.
+    const fresh = body.fresh === true && /^\d{6,}$/.test(String(body.freshTs || ''));
+    const finalSessionId = fresh
+      ? `${userId}_${assistantId}_fresh_${body.freshTs}`
+      : (sessionId || `${userId}_${assistantId}`);
     const startedAt = Date.now();
     try {
       await this.chatService.streamChat(
@@ -67,6 +72,7 @@ export class ChatController {
         profileText,
         res,
         req,
+        fresh,
       );
       this.events?.track('response_received', {
         userId,
@@ -240,8 +246,12 @@ export class ChatController {
 
   @Get('chat/history')
   @UseGuards(JwtGuard)
-  async getHistory(@CurrentUser() user: any, @Query('assistantId') assistantId: string, @Query('limit') limit: string, @Query('offset') offset: string, @Res() res: Response) {
-    const history = await this.chatService.getChatHistory(user.userId, assistantId, parseInt(limit) || 30, parseInt(offset) || 0);
+  async getHistory(@CurrentUser() user: any, @Query('assistantId') assistantId: string, @Query('limit') limit: string, @Query('offset') offset: string, @Query('freshTs') freshTs: string, @Res() res: Response) {
+    // freshTs: история fresh-сессии «чистого листа» (переживает F5 на фронте).
+    const sessionOverride = freshTs && /^\d{6,}$/.test(freshTs)
+      ? `${user.userId}_${assistantId}_fresh_${freshTs}`
+      : undefined;
+    const history = await this.chatService.getChatHistory(user.userId, assistantId, parseInt(limit) || 30, parseInt(offset) || 0, sessionOverride);
     return res.status(200).json(history);
   }
 
