@@ -468,6 +468,18 @@ export class ChatService {
       this.inflight.set(dkey, { state: 'running', ts: nowTs });
     }
 
+    // Сообщение юзера — в историю СРАЗУ, не в конце стрима. Иначе: юзер пишет,
+    // переключается на другого ассистента, возвращается до конца стрима (30-60с) —
+    // истории хода ещё нет, его сообщение «исчезло» (жалоба 2026-07-17).
+    // AI-строка допишется в persistResponse по завершении.
+    let userMsgPersisted = false;
+    try {
+      await this.saveUserMessageRow(userId, assistantId, message);
+      userMsgPersisted = true;
+    } catch (e: any) {
+      this.logger.warn(`early user-msg persist failed (fallback to end-of-stream): ${e.message}`);
+    }
+
     // Client disconnect tracking — backend keeps reading r.linkeon.io even if frontend bails.
     let clientDisconnected = false;
     if (req) {
@@ -629,7 +641,11 @@ export class ChatService {
       if (!aiText) return; // skip empty intermediate persists
       const textCost = fullText.length * this.SDK_TEXT_MULTIPLIER;
       try {
-        await this.saveChatHistory(userId, assistantId, message, aiText, textCost);
+        if (userMsgPersisted) {
+          await this.saveAssistantMessageRow(userId, assistantId, aiText, textCost);
+        } else {
+          await this.saveChatHistory(userId, assistantId, message, aiText, textCost);
+        }
         if (fullText.length > 0) {
           await this.addTokenTask(userId, 0, textCost, agentId);
           if (this.neo4j) {
@@ -966,17 +982,23 @@ export class ChatService {
   }
 
   private async saveChatHistory(userId: string, agentId: string, userMsg: string, assistantMsg: string, tokensUsed = 0) {
+    await this.saveUserMessageRow(userId, agentId, userMsg);
+    await this.saveAssistantMessageRow(userId, agentId, assistantMsg, tokensUsed);
+  }
+
+  private async saveUserMessageRow(userId: string, agentId: string, userMsg: string) {
     const sessionId = `${userId}_${agentId}`;
     const agentNum = /^\d+$/.test(agentId) ? parseInt(agentId, 10) : null;
-
-    // Insert user message
     await this.pg.query(
       `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
        VALUES ($1, 'human', $2, $3, 'text')`,
       [sessionId, agentNum, userMsg],
     );
+  }
 
-    // Insert assistant message with tokens_used
+  private async saveAssistantMessageRow(userId: string, agentId: string, assistantMsg: string, tokensUsed = 0) {
+    const sessionId = `${userId}_${agentId}`;
+    const agentNum = /^\d+$/.test(agentId) ? parseInt(agentId, 10) : null;
     await this.pg.query(
       `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
        VALUES ($1, 'ai', $2, $3, 'text', $4)`,
