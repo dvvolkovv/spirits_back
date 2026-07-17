@@ -73,7 +73,7 @@ export class ClaudeAgentService {
     let assistantText = '';
     const translator = new SdkEventTranslator();
 
-    try {
+    const runStream = async (resume: string | undefined) => {
       for await (const event of query({
         prompt: userMessage,
         options: {
@@ -82,7 +82,7 @@ export class ClaudeAgentService {
           mcpServers: { 'smm-tools': mcpServer },
           disallowedTools: DISALLOWED_BUILTINS,
           cwd,
-          resume: resumeId,
+          resume,
           permissionMode: 'bypassPermissions',
           includePartialMessages: true,
           settingSources: [],
@@ -153,9 +153,29 @@ export class ClaudeAgentService {
           res.write(JSON.stringify(e) + '\n');
         }
       }
+    };
+
+    try {
+      await runStream(resumeId);
     } catch (err: any) {
-      this.logger.error(`Claude Agent SDK failed: ${err.message}`);
-      res.write(JSON.stringify({ type: 'error', message: err.message }) + '\n');
+      // Протухший resume: transcript-файл сессии удалён (ротация/чистка), а ID
+      // остался в БД. Без сброса КАЖДОЕ сообщение падает одинаково — юзер
+      // навсегда заблокирован (инцидент 2026-07-17, Юлия). Сбрасываем и
+      // прозрачно рестартуем с чистой сессией.
+      const staleSession = resumeId && /No conversation found with session ID/i.test(err?.message ?? '');
+      if (staleSession) {
+        this.logger.warn(`SMM session ${resumeId} протухла (transcript удалён) — сброс + retry без resume`);
+        await this.clearSessionId(ctx.userId);
+        try {
+          await runStream(undefined);
+        } catch (err2: any) {
+          this.logger.error(`Claude Agent SDK failed (fresh retry): ${err2.message}`);
+          res.write(JSON.stringify({ type: 'error', message: err2.message }) + '\n');
+        }
+      } else {
+        this.logger.error(`Claude Agent SDK failed: ${err.message}`);
+        res.write(JSON.stringify({ type: 'error', message: err.message }) + '\n');
+      }
     }
 
     // Persist session id for resume
@@ -379,5 +399,19 @@ export class ClaudeAgentService {
         WHERE user_id = $2`,
       [JSON.stringify({ smm_sdk_session_id: sessionId }), userId],
     );
+  }
+
+  private async clearSessionId(userId: string): Promise<void> {
+    try {
+      await this.pg.query(
+        `UPDATE ai_profiles_consolidated
+            SET profile_data = profile_data - 'smm_sdk_session_id',
+                updated_at = now()
+          WHERE user_id = $1`,
+        [userId],
+      );
+    } catch (e: any) {
+      this.logger.warn(`clearSessionId(${userId}) failed: ${e.message}`);
+    }
   }
 }
