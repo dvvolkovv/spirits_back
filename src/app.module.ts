@@ -39,6 +39,7 @@ import { RoutineStoreModule } from './routine-push/routine-store.module';
 import { RoutinePushModule } from './routine-push/routine-push.module';
 import { AppOtaModule } from './app-ota/app-ota.module';
 import { AppWidgetModule } from './app-widget/app-widget.module';
+import { TripModule } from './trip/trip.module';
 
 @Module({
   imports: [
@@ -82,6 +83,7 @@ import { AppWidgetModule } from './app-widget/app-widget.module';
     RoutinePushModule,
     AppOtaModule,
     AppWidgetModule,
+    TripModule,
   ],
 })
 export class AppModule {}
