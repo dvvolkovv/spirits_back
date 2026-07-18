@@ -118,3 +118,32 @@ export function validateTripPlan(p: any): string[] {
 
   return errors;
 }
+
+export interface GeoTrigger {
+  id: string;
+  lat: number;
+  lon: number;
+  radiusM: number;
+  title: string;
+  body: string;
+}
+
+export interface TimeTrigger {
+  id: string;
+  at: string;
+  title: string;
+  body: string;
+}
+
+export interface CoPilotState {
+  mode: 'idle' | 'pre_trip' | 'active' | 'done';
+  headline: string;
+  sub?: string; // «ближайшее действие»
+  contextLines: { icon: string; text: string; tone?: 'ok' | 'warn' | 'crit' }[];
+  reminders: TripReminder[];
+  geoTriggers: GeoTrigger[];
+  timeTriggers: TimeTrigger[];
+  deadlineBufferHours?: number;
+  version: number;
+  serverTime: string;
+}
