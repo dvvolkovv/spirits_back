@@ -25,7 +25,10 @@ export function computeState(plan: TripPlan, now: Date, actions: TripAction[] = 
       deadlineDatetime = action.payload.datetime;
     } else if (action.kind === 'reminder_done' && action.payload?.id) {
       const rem = reminders.find((r) => r.id === action.payload.id);
-      if (rem) rem.done = true;
+      // Honor an explicit done flag so the launcher can UN-check a reminder
+      // (toggle both ways). Absent flag defaults to true for backward-compat
+      // with older queued actions that only ever meant "mark done".
+      if (rem) rem.done = action.payload.done !== false;
     }
   }
 

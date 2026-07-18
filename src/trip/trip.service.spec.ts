@@ -54,6 +54,20 @@ describe('computeState', () => {
     expect(pack?.done).toBeFalsy();
   });
 
+  it('reminder_done with done:false UN-checks a reminder; last action wins when replayed in order', () => {
+    const now = new Date('2026-07-19T10:00:00');
+    // pack is seeded done:true — the user un-checks it, then re-checks meds and un-checks it again.
+    const state = computeState(TRIP_2026_07, now, [
+      { kind: 'reminder_done', payload: { id: 'pack', done: false } },
+      { kind: 'reminder_done', payload: { id: 'meds', done: true } },
+      { kind: 'reminder_done', payload: { id: 'meds', done: false } },
+    ]);
+    const pack = state.reminders.find((r) => r.id === 'pack');
+    const meds = state.reminders.find((r) => r.id === 'meds');
+    expect(pack?.done).toBe(false); // seeded-done reminder can be un-checked
+    expect(meds?.done).toBe(false); // last action (done:false) wins over the earlier done:true
+  });
+
   it('geoTriggers only include fuelPoints/roadMarks with lat/lon (seed has none -> empty)', () => {
     const now = new Date('2026-07-21T12:00:00');
     const state = computeState(TRIP_2026_07, now, []);
