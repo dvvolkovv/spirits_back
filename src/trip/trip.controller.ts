@@ -4,7 +4,7 @@ import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { TripPlan } from './trip.types';
 
-@Controller('webhook/trip')
+@Controller('trip')
 export class TripController {
   constructor(private readonly trip: TripService) {}
 
