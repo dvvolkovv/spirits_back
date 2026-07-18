@@ -13,11 +13,17 @@
     "test": "jest"
   },
   "jest": {
-    "moduleFileExtensions": ["js", "json", "ts"],
-    "rootDir": "src",
-    "testRegex": ".*\\.spec\\.ts$",
+    "moduleFileExtensions": [
+      "js",
+      "json",
+      "ts"
+    ],
+    "testMatch": [
+      "**/src/**/*.spec.ts",
+      "**/tests/**/*.test.js"
+    ],
     "transform": {
-      "^.+\\.(t|j)s$": "ts-jest"
+      "^.+\\.ts$": "ts-jest"
     },
     "testEnvironment": "node"
   },
