@@ -53,6 +53,16 @@ describe('calendar eventsFromIcs', () => {
     expect(sync?.at).toBe('2026-07-20T10:00:00.000Z');
   });
 
+  it('populates end from DTEND (16:00 Yekaterinburg = 11:00 UTC), carried through the recurrence expansion', () => {
+    const sync = eventsFromIcs(ICS, 'yandex', WIN_START, WIN_END).find((e) => e.title === 'Синк Триентос');
+    expect(sync?.end).toBe('2026-07-20T11:00:00.000Z');
+  });
+
+  it('a one-off VEVENT with no DTEND gets a zero-duration end (node-ical\'s RFC 5545 §3.6.1 default: end = start for a date-time DTSTART with no DTEND/DURATION)', () => {
+    const once = eventsFromIcs(ICS, 'yandex', WIN_START, WIN_END).find((e) => e.title === 'Разовая встреча');
+    expect(once?.end).toBe(once?.at);
+  });
+
   it('malformed ICS never throws — returns []', () => {
     expect(eventsFromIcs('not a calendar', 'x', WIN_START, WIN_END)).toEqual([]);
   });

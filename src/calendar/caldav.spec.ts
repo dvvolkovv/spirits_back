@@ -94,6 +94,23 @@ describe('YandexCalDavConnector', () => {
     expect(evs).toEqual([]);
   });
 
+  it('listEvents() populates end (ISO instant) from the VEVENT DTEND when present', async () => {
+    (global as any).fetch = jest.fn(async (url: string, opts: any) => {
+      if (opts?.method === 'REPORT') {
+        return { ok: true, status: 207, text: async () =>
+          `<?xml version="1.0"?><multistatus xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+           <response><propstat><prop><C:calendar-data>BEGIN:VCALENDAR\nBEGIN:VEVENT\nDTSTART:20260720T100000Z\nDTEND:20260720T113000Z\nSUMMARY:Синк\nUID:e2\nEND:VEVENT\nEND:VCALENDAR</C:calendar-data></prop></propstat></response>
+           </multistatus>` } as any;
+      }
+      return { ok: false, status: 404, text: async () => '' } as any;
+    });
+    const evs = await new YandexCalDavConnector().listEvents(creds, new Date('2026-07-18Z'), new Date('2026-07-24Z'));
+    const sync = evs.find((e) => e.uid === 'e2');
+    // 90-minute event — asserting a real end proves conflict-overlap logic no longer has to
+    // fall back to the 1h default (the bug this test guards against).
+    expect(sync?.end).toBe('2026-07-20T11:30:00.000Z');
+  });
+
   it('listEvents() resolves to [] when res.text() rejects', async () => {
     (global as any).fetch = jest.fn(async () => {
       return { ok: true, status: 207, text: async () => { throw new Error('stream error'); } } as any;
@@ -229,6 +246,15 @@ describe('YandexCalDavConnector tasks', () => {
     expect(report.url).toBe(TASK_COLLECTION_URL);
     expect(tasks.find((t) => t.uid === 't1')).toMatchObject({ title: 'Купить билеты', done: false });
     expect(tasks.find((t) => t.uid === 't2')).toMatchObject({ title: 'Сделано', done: true });
+  });
+
+  it('listTasks() normalizes basic-format DUE;TZID=Asia/Yekaterinburg to an ISO instant (not the raw ICS stamp)', async () => {
+    const tasks = await new YandexCalDavConnector().listTasks(credsWithTasks, new Date('2026-07-18Z'), new Date('2026-07-24Z'));
+    const t1 = tasks.find((t) => t.uid === 't1');
+    // Raw ICS stamp "20260720T090000" would produce NaN via `new Date(due+"+05:00")` if left
+    // unconverted — assert it's a real ISO instant: 09:00 Yekaterinburg (+05:00) == 04:00 UTC.
+    expect(t1?.due).toBe('2026-07-20T04:00:00.000Z');
+    expect(new Date(t1!.due!).getTime()).not.toBeNaN();
   });
 
   it('listTasks() resolves to [] when fetch rejects', async () => {

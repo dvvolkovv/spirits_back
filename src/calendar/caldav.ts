@@ -23,6 +23,26 @@ function icsLocal(naive: string): string {
   return naive.replace(/[-:]/g, '').replace(/\.\d+$/, '');
 }
 
+/**
+ * Convert an ICS basic-format value (as extracted from a DUE/DTSTART line, i.e. WITHOUT the
+ * leading `;TZID=...` param — already stripped by the caller's regex) into an ISO instant string.
+ * Two shapes seen in the wild:
+ *  - `20260720T090000` — basic local wall-clock. We only ever write these with
+ *    `TZID=Asia/Yekaterinburg` (see buildVEvent/buildVTodo), so read them back with the same
+ *    fixed +05:00 offset (Russia has no DST).
+ *  - `20260720T090000Z` — already UTC (trailing Z per RFC 5545 form 2).
+ * Returns undefined if the value doesn't match the expected basic shape.
+ */
+function basicToIso(raw: string): string | undefined {
+  const isUtc = raw.endsWith('Z');
+  const basic = isUtc ? raw.slice(0, -1) : raw;
+  const m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})$/.exec(basic);
+  if (!m) return undefined;
+  const naive = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}`;
+  const d = new Date(isUtc ? `${naive}Z` : `${naive}${OFFSET}`);
+  return isNaN(d.getTime()) ? undefined : d.toISOString();
+}
+
 export function buildVEvent(e: ProposedEvent, uid: string): string {
   const start = new Date(`${e.datetime}${OFFSET}`);
   const end = new Date(start.getTime() + (e.durationMin ?? 60) * 60_000);
@@ -192,7 +212,11 @@ export class YandexCalDavConnector implements CalendarConnector {
           const ev = parsed[k];
           if (ev?.type === 'VEVENT' && ev.start) {
             const s = new Date(ev.start);
-            if (s >= start && s < end) out.push({ at: s.toISOString(), title: String(ev.summary || '').trim() || 'Событие', source: 'yandex', uid: ev.uid });
+            if (s >= start && s < end) {
+              const item: CalEvent = { at: s.toISOString(), title: String(ev.summary || '').trim() || 'Событие', source: 'yandex', uid: ev.uid };
+              if (ev.end) item.end = new Date(ev.end).toISOString();
+              out.push(item);
+            }
           }
         }
       }
@@ -283,8 +307,11 @@ export class YandexCalDavConnector implements CalendarConnector {
         const title = /^SUMMARY:(.*)$/m.exec(block)?.[1]?.trim();
         const uid = /^UID:(.*)$/m.exec(block)?.[1]?.trim();
         const dueLine = /^DUE[^:]*:(.*)$/m.exec(block)?.[1]?.trim();
+        // dueLine is the ICS basic value (TZID param already stripped by the regex above) —
+        // normalize to an ISO instant so downstream `new Date(due)` parsing never yields NaN.
+        const due = dueLine ? (basicToIso(dueLine) ?? dueLine) : undefined;
         const done = /^STATUS:COMPLETED\s*$/m.test(block);
-        if (uid) out.push({ uid, title: title || 'Задача', due: dueLine || undefined, done, source: 'yandex' });
+        if (uid) out.push({ uid, title: title || 'Задача', due, done, source: 'yandex' });
       }
       return out;
     } catch (e) {
