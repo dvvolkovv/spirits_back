@@ -59,4 +59,20 @@ describe('YandexCalDavConnector', () => {
     const evs = await new YandexCalDavConnector().listEvents(creds, new Date('2026-07-18Z'), new Date('2026-07-24Z'));
     expect(evs.map((e) => e.title)).toContain('Существующая');
   });
+
+  it('listEvents() resolves to [] when fetch rejects', async () => {
+    (global as any).fetch = jest.fn(async () => {
+      throw new Error('network down');
+    });
+    const evs = await new YandexCalDavConnector().listEvents(creds, new Date('2026-07-18Z'), new Date('2026-07-24Z'));
+    expect(evs).toEqual([]);
+  });
+
+  it('listEvents() resolves to [] when res.text() rejects', async () => {
+    (global as any).fetch = jest.fn(async () => {
+      return { ok: true, status: 207, text: async () => { throw new Error('stream error'); } } as any;
+    });
+    const evs = await new YandexCalDavConnector().listEvents(creds, new Date('2026-07-18Z'), new Date('2026-07-24Z'));
+    expect(evs).toEqual([]);
+  });
 });

@@ -72,27 +72,29 @@ export class YandexCalDavConnector implements CalendarConnector {
       <C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">
         <C:time-range start="${fmt(start)}" end="${fmt(end)}"/>
       </C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`;
-    let res: any;
     try {
-      res = await fetch(this.calendarUrl(creds), {
+      const res = await fetch(this.calendarUrl(creds), {
         method: 'REPORT',
         headers: { Authorization: this.authHeader(creds), Depth: '1', 'Content-Type': 'application/xml' },
         body: report, signal: AbortSignal.timeout(8000),
       } as any);
-    } catch { return []; }
-    if (res.status !== 207) return [];
-    const xml = await res.text();
-    const out: CalEvent[] = [];
-    for (const m of xml.matchAll(/BEGIN:VEVENT[\s\S]*?END:VEVENT/g)) {
-      const parsed: any = ical.parseICS(`BEGIN:VCALENDAR\n${m[0]}\nEND:VCALENDAR`);
-      for (const k of Object.keys(parsed)) {
-        const ev = parsed[k];
-        if (ev?.type === 'VEVENT' && ev.start) {
-          const s = new Date(ev.start);
-          if (s >= start && s < end) out.push({ at: s.toISOString(), title: String(ev.summary || '').trim() || 'Событие', source: 'yandex', uid: ev.uid });
+      if (res.status !== 207) return [];
+      const xml = await res.text();
+      const out: CalEvent[] = [];
+      for (const m of xml.matchAll(/BEGIN:VEVENT[\s\S]*?END:VEVENT/g)) {
+        const parsed: any = ical.parseICS(`BEGIN:VCALENDAR\n${m[0]}\nEND:VCALENDAR`);
+        for (const k of Object.keys(parsed)) {
+          const ev = parsed[k];
+          if (ev?.type === 'VEVENT' && ev.start) {
+            const s = new Date(ev.start);
+            if (s >= start && s < end) out.push({ at: s.toISOString(), title: String(ev.summary || '').trim() || 'Событие', source: 'yandex', uid: ev.uid });
+          }
         }
       }
+      return out;
+    } catch (e) {
+      console.debug('caldav listEvents failed', e);
+      return [];
     }
-    return out;
   }
 }
