@@ -43,6 +43,28 @@ export function buildVEvent(e: ProposedEvent, uid: string): string {
   ].filter(Boolean).join('\r\n');
 }
 
+/** Trailing integer id of an href's last path segment (e.g. ".../events-9999999/" -> 9999999n), or null if none. */
+function trailingId(href: string): bigint | null {
+  const seg = href.replace(/\/+$/, '').split('/').pop() || '';
+  const m = /(\d+)$/.exec(seg);
+  return m ? BigInt(m[1]) : null;
+}
+
+/**
+ * Numeric-aware href comparator: hrefs whose last path segment ends in digits are ordered
+ * ascending by that number (as BigInt, so digit-width doesn't skew the sort — "events-9999999"
+ * sorts before "events-10000000" even though lexicographically "1" < "9"). Hrefs without a
+ * trailing number sort after all numbered ones, and among themselves lexicographically.
+ */
+function collectionIdComparator(a: string, b: string): number {
+  const na = trailingId(a);
+  const nb = trailingId(b);
+  if (na !== null && nb !== null) return na < nb ? -1 : na > nb ? 1 : 0;
+  if (na !== null) return -1;
+  if (nb !== null) return 1;
+  return a.localeCompare(b);
+}
+
 export class YandexCalDavConnector implements CalendarConnector {
   private calendarHomeUrl(creds: CalendarCreds): string {
     return `${creds.baseUrl.replace(/\/$/, '')}/calendars/${encodeURIComponent(creds.username)}/`;
@@ -91,7 +113,7 @@ export class YandexCalDavConnector implements CalendarConnector {
       if (href && isCalendar && hasVevent) hrefs.push(href.trim());
     }
     if (hrefs.length === 0) return null;
-    hrefs.sort(); // lowest events-<id> = the default personal calendar
+    hrefs.sort(collectionIdComparator); // lowest numeric events-<id> = the default personal calendar
     const path = hrefs[0];
     console.debug('caldav discoverCollection: chose', path);
     // return absolute URL (path is server-absolute like /calendars/<user>/events-<id>/)

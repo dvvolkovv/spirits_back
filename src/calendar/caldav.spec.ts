@@ -122,6 +122,34 @@ describe('YandexCalDavConnector.discoverCollection', () => {
     expect(result).toBe(`${YANDEX_CALDAV_BASE}/calendars/u%40yandex.ru/events-19201090/`);
   });
 
+  it('picks the numerically-lowest events-* collection across digit-width boundaries (events-9999999 < events-10000000)', async () => {
+    const multistatus = `<?xml version="1.0"?>
+      <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+        <D:response>
+          <D:href>/calendars/u%40yandex.ru/events-10000000/</D:href>
+          <D:propstat><D:prop>
+            <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+            <C:supported-calendar-component-set><C:comp name="VEVENT"/></C:supported-calendar-component-set>
+          </D:prop></D:propstat>
+        </D:response>
+        <D:response>
+          <D:href>/calendars/u%40yandex.ru/events-9999999/</D:href>
+          <D:propstat><D:prop>
+            <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+            <C:supported-calendar-component-set><C:comp name="VEVENT"/></C:supported-calendar-component-set>
+          </D:prop></D:propstat>
+        </D:response>
+      </D:multistatus>`;
+    (global as any).fetch = jest.fn(async (url: string, opts: any) => {
+      expect(opts.method).toBe('PROPFIND');
+      expect(url).toBe(HOME_URL);
+      return { ok: true, status: 207, text: async () => multistatus } as any;
+    });
+    const result = await new YandexCalDavConnector().discoverCollection(credsNoCollection);
+    // Lexicographic sort would wrongly pick "events-10000000" ('1' < '9'); numeric sort must pick events-9999999.
+    expect(result).toBe(`${YANDEX_CALDAV_BASE}/calendars/u%40yandex.ru/events-9999999/`);
+  });
+
   it('returns null when PROPFIND does not return 207', async () => {
     (global as any).fetch = jest.fn(async () => ({ ok: false, status: 404, text: async () => '' } as any));
     const result = await new YandexCalDavConnector().discoverCollection(credsNoCollection);

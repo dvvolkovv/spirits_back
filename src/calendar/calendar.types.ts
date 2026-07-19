@@ -24,4 +24,5 @@ export interface CalendarConnector {
   test(creds: CalendarCreds): Promise<boolean>;
   listEvents(creds: CalendarCreds, start: Date, end: Date): Promise<CalEvent[]>;
   createEvent(creds: CalendarCreds, event: ProposedEvent): Promise<{ uid: string }>;
+  discoverCollection(creds: CalendarCreds): Promise<string | null>;
 }
