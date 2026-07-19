@@ -215,6 +215,7 @@ export type ToolResult =
   | {
       ok: true;
       kind: 'calendar_proposal';
+      proposalId: string;
       event: { title: string; datetime: string; durationMin?: number; note?: string };
       connected: boolean;
       conflicts: { title: string; at: string }[];
@@ -448,10 +449,12 @@ export class ChatToolsService {
         };
         if (!event.title || !event.datetime) return { ok: false, error: 'title и datetime обязательны' };
         const status = await this.calendar.getStatus(userId);
-        const conflicts = status.connected
+        const connected = status.connected;
+        const conflicts = connected
           ? (await this.calendar.findConflicts(userId, event)).map((c) => ({ title: c.title, at: c.at }))
           : [];
-        return { ok: true, kind: 'calendar_proposal', event, connected: status.connected, conflicts };
+        const proposalId = await this.calendar.saveProposal(userId, event, connected, conflicts);
+        return { ok: true, kind: 'calendar_proposal', proposalId, event, connected, conflicts };
       }
 
       return { ok: false, error: `unknown tool: ${name}` };

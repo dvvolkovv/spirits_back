@@ -759,6 +759,7 @@ export class ChatService {
       // We re-inject only verified jobs from DB query below.
       for (let i = 0; i < chunks.length; i++) {
         chunks[i] = chunks[i].replace(/\s*\[VIDEO_JOB:[0-9a-f-]{36}\]\s*/gi, '');
+        chunks[i] = chunks[i].replace(/\s*\[CALENDAR_PROPOSAL:[0-9a-f-]{36}\]\s*/gi, '');
       }
 
       // Detect video jobs created during this stream by querying recent jobs.
@@ -781,6 +782,28 @@ export class ChatService {
         }
       } catch (e: any) {
         this.logger.warn(`video marker injection failed: ${e.message}`);
+      }
+
+      // Detect calendar proposals created during this stream, same mechanism as
+      // video jobs above: the MCP-bridge (agent) path used by real agents doesn't
+      // emit structural tool_result events, so propose_calendar_event persists to
+      // calendar_proposals and we tag the stream with [CALENDAR_PROPOSAL:<uuid>]
+      // markers for the frontend to render the T6 card. Border = streamStartTime,
+      // scoped to this user.
+      try {
+        const startTimeIso = new Date(streamStartTime).toISOString();
+        const propRes = await this.pg.query(
+          `SELECT id FROM calendar_proposals WHERE user_id = $1 AND created_at >= $2::timestamptz ORDER BY created_at ASC`,
+          [userId, startTimeIso],
+        );
+        if (propRes.rows.length > 0) {
+          const markers = propRes.rows.map((r: any) => `[CALENDAR_PROPOSAL:${r.id}]`).join('\n');
+          const tail = '\n\n' + markers;
+          chunks.push(tail);
+          safeWrite({ type: 'item', content: tail });
+        }
+      } catch (e: any) {
+        this.logger.warn(`calendar marker injection failed: ${e.message}`);
       }
 
       const fullText = chunks.join('');

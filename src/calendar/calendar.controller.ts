@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Delete, Body, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Delete, Body, Param, UseGuards } from '@nestjs/common';
 import { CalendarService } from './calendar.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
@@ -31,5 +31,12 @@ export class CalendarController {
   async disconnect(@CurrentUser() user: any) {
     await this.calendar.disconnect(String(user.userId));
     return { ok: true };
+  }
+
+  @Get('proposal/:id')
+  @UseGuards(JwtGuard)
+  async proposal(@Param('id') id: string) {
+    const p = await this.calendar.getProposal(id);
+    return p ?? { error: 'not found' };
   }
 }

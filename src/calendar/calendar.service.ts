@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { YandexCalDavConnector } from './caldav';
 import { CalEvent, CalendarCreds, ProposedEvent } from './calendar.types';
@@ -32,6 +33,39 @@ export class CalendarService {
          username TEXT NOT NULL, secret_enc TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT true,
          PRIMARY KEY (user_id, provider))`,
     );
+    await this.pg.query(
+      `CREATE TABLE IF NOT EXISTS calendar_proposals (
+         id UUID PRIMARY KEY,
+         user_id TEXT NOT NULL,
+         event JSONB NOT NULL,
+         connected BOOLEAN NOT NULL,
+         conflicts JSONB NOT NULL DEFAULT '[]'::jsonb,
+         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+       )`,
+    );
+  }
+
+  /** Persist a proposal so the MCP-bridge (agent) path can be surfaced to chat via [CALENDAR_PROPOSAL:<id>] marker. */
+  async saveProposal(
+    userId: string,
+    event: ProposedEvent,
+    connected: boolean,
+    conflicts: { title: string; at: string }[],
+  ): Promise<string> {
+    const id = randomUUID();
+    await this.pg.query(
+      `INSERT INTO calendar_proposals (id, user_id, event, connected, conflicts) VALUES ($1,$2,$3::jsonb,$4,$5::jsonb)`,
+      [id, userId, JSON.stringify(event), connected, JSON.stringify(conflicts)],
+    );
+    return id;
+  }
+
+  async getProposal(
+    id: string,
+  ): Promise<{ event: ProposedEvent; connected: boolean; conflicts: { title: string; at: string }[] } | null> {
+    const r = await this.pg.query(`SELECT event, connected, conflicts FROM calendar_proposals WHERE id = $1`, [id]);
+    const row = r.rows[0];
+    return row ? { event: row.event, connected: row.connected, conflicts: row.conflicts } : null;
   }
 
   private async creds(userId: string): Promise<CalendarCreds | null> {
