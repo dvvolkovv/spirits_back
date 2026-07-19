@@ -52,3 +52,35 @@ describe('CalendarService.createEvent — write-scoping (no cross-user writes)',
     }
   });
 });
+
+// Same write-scoping guarantee for the task (VTODO) surface added in Task 2 — setTaskDone must
+// never touch another user's connection either.
+describe('CalendarService.setTaskDone — write-scoping (no cross-user writes)', () => {
+  it('is scoped to the passed userId and fails closed when that user has no connection', async () => {
+    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const service = new CalendarService(pg as any);
+
+    const result = await service.setTaskDone('userB', 'uid', true);
+
+    // No connection for userB -> fail closed, no write attempted.
+    expect(result).toEqual({ ok: false, error: 'Задачи недоступны' });
+    // The lookup queried calendar_connections scoped to userB's own id — matches creds()'s
+    // `SELECT ... FROM calendar_connections WHERE user_id=$1 AND enabled=true LIMIT 1`, [userId].
+    expect(pg.query).toHaveBeenCalledWith(expect.stringContaining('calendar_connections'), ['userB']);
+  });
+
+  it("never reaches another user's (the owner's) connection while setting a task done for userB", async () => {
+    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const service = new CalendarService(pg as any);
+
+    await service.setTaskDone('userB', 'uid', true);
+
+    // '79656445804' stands in for the owner's account (see CLAUDE.md test accounts). The only
+    // WHERE-clause param used anywhere during this call must be the caller's own id ('userB') —
+    // proving userB's write can never touch the owner's (or anyone else's) row.
+    expect(pg.query).not.toHaveBeenCalledWith(expect.anything(), ['79656445804']);
+    for (const call of pg.query.mock.calls) {
+      expect(call[1]).toEqual(['userB']);
+    }
+  });
+});
