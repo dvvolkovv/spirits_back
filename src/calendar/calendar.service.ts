@@ -61,9 +61,10 @@ export class CalendarService {
   }
 
   async getProposal(
+    userId: string,
     id: string,
   ): Promise<{ event: ProposedEvent; connected: boolean; conflicts: { title: string; at: string }[] } | null> {
-    const r = await this.pg.query(`SELECT event, connected, conflicts FROM calendar_proposals WHERE id = $1`, [id]);
+    const r = await this.pg.query(`SELECT event, connected, conflicts FROM calendar_proposals WHERE id = $1 AND user_id = $2`, [id, userId]);
     const row = r.rows[0];
     return row ? { event: row.event, connected: row.connected, conflicts: row.conflicts } : null;
   }

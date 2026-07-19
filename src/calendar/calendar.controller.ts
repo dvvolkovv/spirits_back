@@ -35,8 +35,8 @@ export class CalendarController {
 
   @Get('proposal/:id')
   @UseGuards(JwtGuard)
-  async proposal(@Param('id') id: string) {
-    const p = await this.calendar.getProposal(id);
+  async proposal(@CurrentUser() user: any, @Param('id') id: string) {
+    const p = await this.calendar.getProposal(String(user.userId), id);
     return p ?? { error: 'not found' };
   }
 }
