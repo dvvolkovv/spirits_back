@@ -53,6 +53,8 @@ describe('YandexCalDavConnector', () => {
     const put = calls.find((c) => c.method === 'PUT');
     expect(put.url).toContain(r.uid);
     expect(put.body).toContain('BEGIN:VEVENT');
+    expect(put.body).toContain('BEGIN:VTIMEZONE');
+    expect(put.body).toContain('TZID:Asia/Yekaterinburg');
   });
 
   it('listEvents() REPORTs and parses returned VEVENTs', async () => {

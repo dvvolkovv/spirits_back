@@ -6,6 +6,18 @@ export const YANDEX_CALDAV_BASE = 'https://caldav.yandex.ru';
 const TZID = 'Asia/Yekaterinburg';
 const OFFSET = '+05:00'; // Russia has no DST
 
+const VTIMEZONE_ASIA_YEKATERINBURG = (
+  'BEGIN:VTIMEZONE\r\n' +
+  'TZID:Asia/Yekaterinburg\r\n' +
+  'BEGIN:STANDARD\r\n' +
+  'DTSTART:19700101T000000\r\n' +
+  'TZOFFSETFROM:+0500\r\n' +
+  'TZOFFSETTO:+0500\r\n' +
+  'TZNAME:+05\r\n' +
+  'END:STANDARD\r\n' +
+  'END:VTIMEZONE'
+);
+
 /** Format a naive local datetime "2026-07-20T15:00:00" as an ICS local stamp "20260720T150000". */
 function icsLocal(naive: string): string {
   return naive.replace(/[-:]/g, '').replace(/\.\d+$/, '');
@@ -54,7 +66,7 @@ export class YandexCalDavConnector implements CalendarConnector {
 
   async createEvent(creds: CalendarCreds, event: ProposedEvent): Promise<{ uid: string }> {
     const uid = randomUUID();
-    const body = `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Linkeon//trip//RU\r\n${buildVEvent(event, uid)}\r\nEND:VCALENDAR\r\n`;
+    const body = `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Linkeon//trip//RU\r\n${VTIMEZONE_ASIA_YEKATERINBURG}\r\n${buildVEvent(event, uid)}\r\nEND:VCALENDAR\r\n`;
     const res = await fetch(`${this.calendarUrl(creds)}${uid}.ics`, {
       method: 'PUT',
       headers: { Authorization: this.authHeader(creds), 'Content-Type': 'text/calendar; charset=utf-8' },
