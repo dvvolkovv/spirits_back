@@ -4,7 +4,8 @@ import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
 import { TripPlan, CoPilotState, GeoTrigger, TimeTrigger, validateTripPlan } from './trip.types';
 import { TRIP_2026_07 } from './seed-2026-07';
-import { CalEvent, CalendarSource, fetchCalendarEvents, foldCalendarLines } from './calendar';
+import { CalEvent, foldCalendarLines } from './calendar';
+import { CalendarService } from '../calendar/calendar.service';
 
 export const TRIP_STATE_VERSION = 1;
 const OWNER_USER_ID = '79656445804';
@@ -192,7 +193,10 @@ export class TripService implements OnModuleInit {
   private readonly logger = new Logger(TripService.name);
   private readonly calCache = new Map<string, { at: number; events: CalEvent[] }>();
 
-  constructor(private readonly pg: PgService) {}
+  constructor(
+    private readonly pg: PgService,
+    private readonly calendar: CalendarService,
+  ) {}
 
   async onModuleInit() {
     const file = '001_trip.sql';
@@ -241,6 +245,10 @@ export class TripService implements OnModuleInit {
     } catch (e: any) {
       this.logger.error(`trip seed failed: ${e.message}`);
     }
+
+    // Optimistic cache-bust: a calendar write (via CalendarService) invalidates this user's
+    // 30-min calCache immediately, so the co-pilot surface reflects the new event on next read.
+    this.calendar.onWrite = (userId: string) => this.calCache.delete(userId);
   }
 
   private async loadPlan(userId: string): Promise<TripPlan | null> {
@@ -286,28 +294,13 @@ export class TripService implements OnModuleInit {
    * never break state. Privacy: only the trip window is fetched/kept — nothing outside it.
    */
   private async loadCalendarEvents(userId: string, plan: TripPlan): Promise<CalEvent[]> {
-    const sources = await this.loadCalendars(userId);
-    if (sources.length === 0) return [];
     const cached = this.calCache.get(userId);
     if (cached && Date.now() - cached.at < CAL_TTL_MS) return cached.events;
     const start = new Date(`${plan.window.activateFrom}+05:00`);
     const end = new Date(`${plan.window.endEstimated}+05:00`);
-    const events = await fetchCalendarEvents(sources, start, end);
+    const events = await this.calendar.listEvents(userId, start, end);
     this.calCache.set(userId, { at: Date.now(), events });
     return events;
-  }
-
-  private async loadCalendars(userId: string): Promise<CalendarSource[]> {
-    try {
-      const res = await this.pg.query(
-        `SELECT url, kind FROM trip_calendars WHERE user_id = $1 AND enabled = true`,
-        [userId],
-      );
-      return res.rows.map((r: any) => ({ url: r.url, source: r.kind }));
-    } catch (e: any) {
-      this.logger.error(`loadCalendars failed: ${e.message}`);
-      return [];
-    }
   }
 
   async applyAction(userId: string, idemKey: string, kind: string, payload: any): Promise<CoPilotState> {
