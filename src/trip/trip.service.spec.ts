@@ -82,4 +82,13 @@ describe('computeCopilotState', () => {
     expect(s.version).toBeGreaterThan(0);
     expect(s.serverTime).toBe(now.toISOString());
   });
+
+  it('конфликт детектится между двумя событиями БЕЗ uid (ICS-источник)', () => {
+    const events = [
+      { title: 'Личная', at: '2026-07-20T10:00:00Z', end: '2026-07-20T11:00:00Z', source: 'yandex' },
+      { title: 'Рабочая', at: '2026-07-20T10:30:00Z', end: '2026-07-20T11:30:00Z', source: 'corp' },
+    ] as any;
+    const s = computeCopilotState({ tasks: [], events, now });
+    expect(s.contextLines.filter((l) => l.tone === 'warn').length).toBe(2);
+  });
 });

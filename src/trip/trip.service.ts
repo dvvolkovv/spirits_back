@@ -56,14 +56,14 @@ export function computeCopilotState(input: { tasks: Task[]; events: CalEvent[]; 
     hour: '2-digit',
     minute: '2-digit',
   });
-  for (const e of events) {
-    const conflict = events.some((o) => o.uid !== e.uid && overlaps(e, o));
+  events.forEach((e, i) => {
+    const conflict = events.some((o, j) => j !== i && overlaps(e, o));
     contextLines.push({
       icon: conflict ? '⚠️' : '📅',
       text: `${fmt.format(new Date(e.at)).replace(/,/g, '')} — ${e.title}${conflict ? ' (пересечение)' : ''}`,
       tone: conflict ? 'warn' : undefined,
     });
-  }
+  });
 
   const reminders = tasks.map((t) => ({ id: t.uid, text: t.title, when: t.due ?? '', critical: false, done: t.done }));
   const timeTriggers = pending
