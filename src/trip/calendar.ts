@@ -39,7 +39,9 @@ function planInstant(naive: string): number {
  * Folds trip-window calendar events into contextLines for the sheet. An event whose start falls
  * within [departPlanned − 3h, endEstimated] is flagged as a conflict (⚠️/warn — you can't be at a
  * meeting and on the road); other in-window events are informational (📅). Deterministic given the
- * fixed Yekaterinburg timezone, so it's unit-testable alongside computeState.
+ * fixed Yekaterinburg timezone, so it's unit-testable on its own. Not called from trip.service
+ * anymore (computeCopilotState folds conflicts inline over real events) — kept for its own tests
+ * and as a reusable "departure window" folder if needed again.
  */
 export function foldCalendarLines(
   events: CalEvent[],
