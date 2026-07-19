@@ -171,20 +171,28 @@ export const CHAT_TOOLS = [
     name: 'propose_calendar_event',
     description:
       'ПРЕДЛОЖИТЬ пользователю добавить событие/задачу с датой-временем в его календарь (ты НЕ пишешь сам — только предлагаешь карточкой, пользователь подтверждает). ' +
-      'Вызывай, когда в разговоре появляется конкретное дело с датой/временем (встреча, выезд, дедлайн, дело из плана). ' +
+      'Вызывай, когда в разговоре появляется конкретное дело с датой/временем (встреча, выезд, дедлайн, дело из плана) — ИЛИ дело без фиксированного времени, которое стоит просто держать в списке. ' +
       'Чат идёт как обычно — это ДОБАВОЧНОЕ предложение. НЕ говори «добавил/внёс в календарь», пока пользователь не подтвердил и не пришёл ok. ' +
       'Если календарь не подключён (в результате connected=false) — тактично предложи подключить календарь, чтобы планировать время через Линкеон, не только общаться.\n' +
-      '• title — краткое название события.\n• datetime — локальное время начала ISO без зоны, напр. "2026-07-20T15:00:00".\n' +
-      '• durationMin — длительность в минутах (по умолчанию 60).\n• note — короткая заметка (необязательно).',
+      '• title — краткое название.\n• kind — "event" (по умолчанию) для встречи/звонка/приёма с конкретным временем, или "task" если у дела нет фиксированного времени и его можно просто "выполнить"/отметить сделанным (кладём в задачи "Мои дела").\n' +
+      '• datetime — локальное время ISO без зоны, напр. "2026-07-20T15:00:00". Для kind="event" обязательно; для kind="task" необязательно (подсказка по сроку/дедлайну).\n' +
+      '• durationMin — длительность в минутах, только для event (по умолчанию 60).\n• note — короткая заметка (необязательно).',
     input_schema: {
       type: 'object',
       properties: {
         title: { type: 'string' },
-        datetime: { type: 'string', description: 'ISO локальное время начала без зоны, напр. "2026-07-20T15:00:00".' },
-        durationMin: { type: 'number', description: 'Длительность, мин (по умолчанию 60).' },
+        kind: {
+          type: 'string',
+          enum: ['event', 'task'],
+          default: 'event',
+          description:
+            'Если у дела нет фиксированного времени и его можно "выполнить"/отметить сделанным — kind="task" (кладём в задачи "Мои дела"). Встреча/звонок/приём с конкретным временем — kind="event".',
+        },
+        datetime: { type: 'string', description: 'ISO локальное время без зоны, напр. "2026-07-20T15:00:00". Обязательно для kind="event"; для kind="task" — необязательный ориентир по сроку.' },
+        durationMin: { type: 'number', description: 'Длительность, мин (по умолчанию 60). Только для kind="event".' },
         note: { type: 'string' },
       },
-      required: ['title', 'datetime'],
+      required: ['title'],
     },
   },
 ];
@@ -216,7 +224,8 @@ export type ToolResult =
       ok: true;
       kind: 'calendar_proposal';
       proposalId: string;
-      event: { title: string; datetime: string; durationMin?: number; note?: string };
+      itemKind: 'event' | 'task';
+      event: { title: string; datetime?: string; durationMin?: number; note?: string };
       connected: boolean;
       conflicts: { title: string; at: string }[];
     }
@@ -441,20 +450,25 @@ export class ChatToolsService {
       }
 
       if (name === 'propose_calendar_event') {
+        const kind: 'event' | 'task' = input?.kind === 'task' ? 'task' : 'event';
+        const rawDatetime = input?.datetime ? String(input.datetime) : '';
         const event = {
           title: String(input?.title || '').trim(),
-          datetime: String(input?.datetime || ''),
+          datetime: rawDatetime || undefined,
           durationMin: input?.durationMin,
           note: input?.note,
         };
-        if (!event.title || !event.datetime) return { ok: false, error: 'title и datetime обязательны' };
+        if (!event.title) return { ok: false, error: 'title обязателен' };
+        if (kind === 'event' && !event.datetime) return { ok: false, error: 'title и datetime обязательны для события' };
         const status = await this.calendar.getStatus(userId);
         const connected = status.connected;
-        const conflicts = connected
-          ? (await this.calendar.findConflicts(userId, event)).map((c) => ({ title: c.title, at: c.at }))
+        // Conflicts only make sense when there's a concrete point in time to collide with —
+        // task without datetime has nothing to check against.
+        const conflicts = connected && event.datetime
+          ? (await this.calendar.findConflicts(userId, event as any)).map((c) => ({ title: c.title, at: c.at }))
           : [];
-        const proposalId = await this.calendar.saveProposal(userId, event, connected, conflicts);
-        return { ok: true, kind: 'calendar_proposal', proposalId, event, connected, conflicts };
+        const proposalId = await this.calendar.saveProposal(userId, event as any, connected, conflicts, kind);
+        return { ok: true, kind: 'calendar_proposal', proposalId, itemKind: kind, event, connected, conflicts };
       }
 
       return { ok: false, error: `unknown tool: ${name}` };

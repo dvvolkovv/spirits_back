@@ -2,7 +2,7 @@ import { Controller, Get, Post, Delete, Body, Param, UseGuards } from '@nestjs/c
 import { CalendarService } from './calendar.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
-import { ProposedEvent } from './calendar.types';
+import { ProposedEvent, ProposedTask } from './calendar.types';
 
 @Controller('calendar') // global prefix 'webhook' → /webhook/calendar/*
 export class CalendarController {
@@ -24,6 +24,18 @@ export class CalendarController {
   @UseGuards(JwtGuard)
   async createEvent(@CurrentUser() user: any, @Body() body: ProposedEvent) {
     return this.calendar.createEvent(String(user.userId), body);
+  }
+
+  @Post('tasks')
+  @UseGuards(JwtGuard)
+  async createTask(@CurrentUser() user: any, @Body() body: ProposedTask) {
+    return this.calendar.createTask(String(user.userId), body);
+  }
+
+  @Post('tasks/:uid/done')
+  @UseGuards(JwtGuard)
+  async setTaskDone(@CurrentUser() user: any, @Param('uid') uid: string, @Body() body: { done: boolean }) {
+    return this.calendar.setTaskDone(String(user.userId), uid, body?.done);
   }
 
   @Delete('connect')

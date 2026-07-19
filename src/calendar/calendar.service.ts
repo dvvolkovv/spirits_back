@@ -45,6 +45,9 @@ export class CalendarService {
          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
        )`,
     );
+    // kind = 'event' | 'task' — which surface the proposal targets ("Мои дела" vs the calendar).
+    // Default 'event' preserves the pre-T4 behaviour for already-stored proposals.
+    await this.pg.query(`ALTER TABLE calendar_proposals ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'event'`);
   }
 
   /** Persist a proposal so the MCP-bridge (agent) path can be surfaced to chat via [CALENDAR_PROPOSAL:<id>] marker. */
@@ -53,11 +56,12 @@ export class CalendarService {
     event: ProposedEvent,
     connected: boolean,
     conflicts: { title: string; at: string }[],
+    kind: 'event' | 'task' = 'event',
   ): Promise<string> {
     const id = randomUUID();
     await this.pg.query(
-      `INSERT INTO calendar_proposals (id, user_id, event, connected, conflicts) VALUES ($1,$2,$3::jsonb,$4,$5::jsonb)`,
-      [id, userId, JSON.stringify(event), connected, JSON.stringify(conflicts)],
+      `INSERT INTO calendar_proposals (id, user_id, event, connected, conflicts, kind) VALUES ($1,$2,$3::jsonb,$4,$5::jsonb,$6)`,
+      [id, userId, JSON.stringify(event), connected, JSON.stringify(conflicts), kind],
     );
     return id;
   }
@@ -65,10 +69,10 @@ export class CalendarService {
   async getProposal(
     userId: string,
     id: string,
-  ): Promise<{ event: ProposedEvent; connected: boolean; conflicts: { title: string; at: string }[] } | null> {
-    const r = await this.pg.query(`SELECT event, connected, conflicts FROM calendar_proposals WHERE id = $1 AND user_id = $2`, [id, userId]);
+  ): Promise<{ event: ProposedEvent; connected: boolean; conflicts: { title: string; at: string }[]; kind: 'event' | 'task' } | null> {
+    const r = await this.pg.query(`SELECT event, connected, conflicts, kind FROM calendar_proposals WHERE id = $1 AND user_id = $2`, [id, userId]);
     const row = r.rows[0];
-    return row ? { event: row.event, connected: row.connected, conflicts: row.conflicts } : null;
+    return row ? { event: row.event, connected: row.connected, conflicts: row.conflicts, kind: row.kind } : null;
   }
 
   private async creds(userId: string): Promise<CalendarCreds | null> {
