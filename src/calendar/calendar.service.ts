@@ -33,6 +33,7 @@ export class CalendarService {
          username TEXT NOT NULL, secret_enc TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT true,
          PRIMARY KEY (user_id, provider))`,
     );
+    await this.pg.query(`ALTER TABLE calendar_connections ADD COLUMN IF NOT EXISTS collection_url TEXT`);
     await this.pg.query(
       `CREATE TABLE IF NOT EXISTS calendar_proposals (
          id UUID PRIMARY KEY,
@@ -71,12 +72,17 @@ export class CalendarService {
 
   private async creds(userId: string): Promise<CalendarCreds | null> {
     const r = await this.pg.query(
-      `SELECT base_url, username, secret_enc FROM calendar_connections WHERE user_id=$1 AND enabled=true LIMIT 1`,
+      `SELECT base_url, username, secret_enc, collection_url FROM calendar_connections WHERE user_id=$1 AND enabled=true LIMIT 1`,
       [userId],
     );
     const row = r.rows[0];
     if (!row) return null;
-    return { baseUrl: row.base_url, username: row.username, appPassword: decryptSecret(row.secret_enc) };
+    return {
+      baseUrl: row.base_url,
+      username: row.username,
+      appPassword: decryptSecret(row.secret_enc),
+      collectionUrl: row.collection_url || undefined,
+    };
   }
 
   async getStatus(userId: string): Promise<{ connected: boolean; provider?: string }> {
@@ -88,11 +94,13 @@ export class CalendarService {
     const baseUrl = 'https://caldav.yandex.ru'; // provider→baseUrl map; yandex only for now
     const ok = await this.connector.test({ baseUrl, username, appPassword });
     if (!ok) return { ok: false, error: 'Не удалось подключиться — проверь логин и пароль приложения' };
+    const collectionUrl = await this.connector.discoverCollection({ baseUrl, username, appPassword });
+    if (!collectionUrl) return { ok: false, error: 'Не нашёл календарь для записи' };
     await this.pg.query(
-      `INSERT INTO calendar_connections (user_id, provider, base_url, username, secret_enc, enabled)
-       VALUES ($1,$2,$3,$4,$5,true)
-       ON CONFLICT (user_id, provider) DO UPDATE SET base_url=EXCLUDED.base_url, username=EXCLUDED.username, secret_enc=EXCLUDED.secret_enc, enabled=true`,
-      [userId, provider, baseUrl, username, encryptSecret(appPassword)],
+      `INSERT INTO calendar_connections (user_id, provider, base_url, username, secret_enc, enabled, collection_url)
+       VALUES ($1,$2,$3,$4,$5,true,$6)
+       ON CONFLICT (user_id, provider) DO UPDATE SET base_url=EXCLUDED.base_url, username=EXCLUDED.username, secret_enc=EXCLUDED.secret_enc, enabled=true, collection_url=EXCLUDED.collection_url`,
+      [userId, provider, baseUrl, username, encryptSecret(appPassword), collectionUrl],
     );
     this.onWrite?.(userId); // connecting changes what listEvents returns — bust the co-pilot cache
     return { ok: true };

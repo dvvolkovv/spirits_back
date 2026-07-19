@@ -17,6 +17,7 @@ export interface CalendarCreds {
   baseUrl: string;
   username: string;
   appPassword: string;
+  collectionUrl?: string;
 }
 
 export interface CalendarConnector {

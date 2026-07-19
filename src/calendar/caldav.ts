@@ -44,9 +44,8 @@ export function buildVEvent(e: ProposedEvent, uid: string): string {
 }
 
 export class YandexCalDavConnector implements CalendarConnector {
-  private calendarUrl(creds: CalendarCreds): string {
-    // Yandex default calendar collection for a user.
-    return `${creds.baseUrl.replace(/\/$/, '')}/calendars/${encodeURIComponent(creds.username)}/events-default/`;
+  private calendarHomeUrl(creds: CalendarCreds): string {
+    return `${creds.baseUrl.replace(/\/$/, '')}/calendars/${encodeURIComponent(creds.username)}/`;
   }
   private authHeader(creds: CalendarCreds): string {
     return 'Basic ' + Buffer.from(`${creds.username}:${creds.appPassword}`).toString('base64');
@@ -54,20 +53,65 @@ export class YandexCalDavConnector implements CalendarConnector {
 
   async test(creds: CalendarCreds): Promise<boolean> {
     try {
-      const res = await fetch(this.calendarUrl(creds), {
+      const res = await fetch(this.calendarHomeUrl(creds), {
         method: 'PROPFIND',
         headers: { Authorization: this.authHeader(creds), Depth: '0', 'Content-Type': 'application/xml' },
-        body: '<propfind xmlns="DAV:"><prop><resourcetype/></prop></propfind>',
+        body: '<?xml version="1.0"?><propfind xmlns="DAV:"><prop><current-user-principal/></prop></propfind>',
         signal: AbortSignal.timeout(8000),
       } as any);
       return res.status === 207 || (res.status >= 200 && res.status < 300);
     } catch { return false; }
   }
 
+  /**
+   * Discover the account's default event collection under the calendar home.
+   * Yandex does not expose schedule-default-calendar-URL, so we PROPFIND the
+   * home (Depth 1) and pick the lowest-sorted `events-*` collection that
+   * supports VEVENT — that's the account's "Мои события" default; secondary
+   * calendars (e.g. shared/"Алиса") get higher ids.
+   */
+  async discoverCollection(creds: CalendarCreds): Promise<string | null> {
+    let res: any;
+    try {
+      res = await fetch(this.calendarHomeUrl(creds), {
+        method: 'PROPFIND',
+        headers: { Authorization: this.authHeader(creds), Depth: '1', 'Content-Type': 'application/xml' },
+        body: '<?xml version="1.0"?><propfind xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><prop><resourcetype/><C:supported-calendar-component-set/></prop></propfind>',
+        signal: AbortSignal.timeout(8000),
+      } as any);
+    } catch { return null; }
+    if (res.status !== 207) return null;
+    const xml = (await res.text()).replace(/<(\/?)[a-zA-Z0-9]+:/g, '<$1'); // strip ns prefixes
+    const hrefs: string[] = [];
+    for (const m of xml.matchAll(/<response>([\s\S]*?)<\/response>/g)) {
+      const b = m[1];
+      const href = /<href>([^<]*)<\/href>/.exec(b)?.[1];
+      const isCalendar = /<resourcetype>[\s\S]*<calendar\/?>[\s\S]*<\/resourcetype>/.test(b) || /<calendar\/>/.test(b);
+      const hasVevent = /comp name="VEVENT"/.test(b);
+      if (href && isCalendar && hasVevent) hrefs.push(href.trim());
+    }
+    if (hrefs.length === 0) return null;
+    hrefs.sort(); // lowest events-<id> = the default personal calendar
+    const path = hrefs[0];
+    console.debug('caldav discoverCollection: chose', path);
+    // return absolute URL (path is server-absolute like /calendars/<user>/events-<id>/)
+    const origin = new URL(creds.baseUrl).origin;
+    return path.startsWith('http') ? path : origin + path;
+  }
+
+  private async resolveCollection(creds: CalendarCreds): Promise<string | null> {
+    if (creds.collectionUrl) return creds.collectionUrl;
+    // Defensive one-shot fallback if collectionUrl wasn't stored (e.g. legacy connection).
+    return this.discoverCollection(creds);
+  }
+
   async createEvent(creds: CalendarCreds, event: ProposedEvent): Promise<{ uid: string }> {
+    const collectionUrl = await this.resolveCollection(creds);
+    if (!collectionUrl) throw new Error('CalDAV collection not found');
     const uid = randomUUID();
     const body = `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Linkeon//trip//RU\r\n${VTIMEZONE_ASIA_YEKATERINBURG}\r\n${buildVEvent(event, uid)}\r\nEND:VCALENDAR\r\n`;
-    const res = await fetch(`${this.calendarUrl(creds)}${uid}.ics`, {
+    const base = collectionUrl.endsWith('/') ? collectionUrl : `${collectionUrl}/`;
+    const res = await fetch(`${base}${uid}.ics`, {
       method: 'PUT',
       headers: { Authorization: this.authHeader(creds), 'Content-Type': 'text/calendar; charset=utf-8' },
       body,
@@ -85,7 +129,9 @@ export class YandexCalDavConnector implements CalendarConnector {
         <C:time-range start="${fmt(start)}" end="${fmt(end)}"/>
       </C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`;
     try {
-      const res = await fetch(this.calendarUrl(creds), {
+      const collectionUrl = await this.resolveCollection(creds);
+      if (!collectionUrl) return [];
+      const res = await fetch(collectionUrl, {
         method: 'REPORT',
         headers: { Authorization: this.authHeader(creds), Depth: '1', 'Content-Type': 'application/xml' },
         body: report, signal: AbortSignal.timeout(8000),
