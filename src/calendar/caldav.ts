@@ -32,13 +32,20 @@ export function buildVEvent(e: ProposedEvent, uid: string): string {
     hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
   }).format(end).replace(' ', 'T');
   const esc = (s: string) => s.replace(/([,;\\])/g, '\\$1').replace(/\n/g, '\\n');
+  // DTSTAMP is REQUIRED by RFC 5545; without it Yandex stores the event but its
+  // web/app UI won't render it. CREATED/SEQUENCE/STATUS keep the event well-formed.
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
   return [
     'BEGIN:VEVENT',
     `UID:${uid}`,
+    `DTSTAMP:${stamp}`,
+    `CREATED:${stamp}`,
     `SUMMARY:${esc(e.title)}`,
     e.note ? `DESCRIPTION:${esc(e.note)}` : '',
     `DTSTART;TZID=${TZID}:${icsLocal(e.datetime)}`,
     `DTEND;TZID=${TZID}:${icsLocal(endNaive)}`,
+    'STATUS:CONFIRMED',
+    'SEQUENCE:0',
     'END:VEVENT',
   ].filter(Boolean).join('\r\n');
 }

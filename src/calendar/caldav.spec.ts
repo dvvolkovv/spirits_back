@@ -8,6 +8,7 @@ describe('buildVEvent', () => {
     );
     expect(ics).toContain('BEGIN:VEVENT');
     expect(ics).toContain('UID:uid-123');
+    expect(ics).toMatch(/DTSTAMP:\d{8}T\d{6}Z/); // required by RFC 5545 or Yandex UI won't render
     expect(ics).toContain('SUMMARY:Синк Триентос');
     expect(ics).toContain('DTSTART;TZID=Asia/Yekaterinburg:20260720T150000');
     expect(ics).toContain('DTEND;TZID=Asia/Yekaterinburg:20260720T160000');
