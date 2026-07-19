@@ -6,6 +6,7 @@ import { PgService } from '../common/services/pg.service';
 import { VideoService, InsufficientTokensError } from '../video/video.service';
 import { CreateVideoJobDto } from '../video/video.dto';
 import { RoutineStore, ENERGY_PROMPT } from '../routine-push/routine-store.service';
+import { CalendarService } from '../calendar/calendar.service';
 
 export const CHAT_TOOLS = [
   {
@@ -166,6 +167,26 @@ export const CHAT_TOOLS = [
       required: ['action'],
     },
   },
+  {
+    name: 'propose_calendar_event',
+    description:
+      'ПРЕДЛОЖИТЬ пользователю добавить событие/задачу с датой-временем в его календарь (ты НЕ пишешь сам — только предлагаешь карточкой, пользователь подтверждает). ' +
+      'Вызывай, когда в разговоре появляется конкретное дело с датой/временем (встреча, выезд, дедлайн, дело из плана). ' +
+      'Чат идёт как обычно — это ДОБАВОЧНОЕ предложение. НЕ говори «добавил/внёс в календарь», пока пользователь не подтвердил и не пришёл ok. ' +
+      'Если календарь не подключён (в результате connected=false) — тактично предложи подключить календарь, чтобы планировать время через Линкеон, не только общаться.\n' +
+      '• title — краткое название события.\n• datetime — локальное время начала ISO без зоны, напр. "2026-07-20T15:00:00".\n' +
+      '• durationMin — длительность в минутах (по умолчанию 60).\n• note — короткая заметка (необязательно).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string' },
+        datetime: { type: 'string', description: 'ISO локальное время начала без зоны, напр. "2026-07-20T15:00:00".' },
+        durationMin: { type: 'number', description: 'Длительность, мин (по умолчанию 60).' },
+        note: { type: 'string' },
+      },
+      required: ['title', 'datetime'],
+    },
+  },
 ];
 
 export type ToolResult =
@@ -191,6 +212,14 @@ export type ToolResult =
       delivered_hint?: boolean;
       routines?: Array<{ title: string; hour: number; days: number[] | null; enabled: boolean; assistantId: string }>;
     }
+  | {
+      ok: true;
+      kind: 'calendar_proposal';
+      proposalId: string;
+      event: { title: string; datetime: string; durationMin?: number; note?: string };
+      connected: boolean;
+      conflicts: { title: string; at: string }[];
+    }
   | { ok: false; error: string; [k: string]: any };
 
 @Injectable()
@@ -203,6 +232,7 @@ export class ChatToolsService {
     private readonly pg: PgService,
     private readonly video: VideoService,
     private readonly routines: RoutineStore,
+    private readonly calendar: CalendarService,
   ) {}
 
   async executeTool(userId: string, name: string, input: any): Promise<ToolResult> {
@@ -408,6 +438,23 @@ export class ChatToolsService {
           tokensSpent: r.tokensSpent,
           ...(r.stillImageUrl ? { stillImageUrl: r.stillImageUrl, imageTokensSpent: r.imageTokensSpent ?? 0 } : {}),
         };
+      }
+
+      if (name === 'propose_calendar_event') {
+        const event = {
+          title: String(input?.title || '').trim(),
+          datetime: String(input?.datetime || ''),
+          durationMin: input?.durationMin,
+          note: input?.note,
+        };
+        if (!event.title || !event.datetime) return { ok: false, error: 'title и datetime обязательны' };
+        const status = await this.calendar.getStatus(userId);
+        const connected = status.connected;
+        const conflicts = connected
+          ? (await this.calendar.findConflicts(userId, event)).map((c) => ({ title: c.title, at: c.at }))
+          : [];
+        const proposalId = await this.calendar.saveProposal(userId, event, connected, conflicts);
+        return { ok: true, kind: 'calendar_proposal', proposalId, event, connected, conflicts };
       }
 
       return { ok: false, error: `unknown tool: ${name}` };
