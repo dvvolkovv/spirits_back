@@ -91,23 +91,23 @@ describe('YandexCalDavConnector.discoverCollection', () => {
     const multistatus = `<?xml version="1.0"?>
       <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
         <D:response>
-          <D:href>/calendars/u%40yandex.ru/events-34526171/</D:href>
+          <href xmlns="DAV:">/calendars/u%40yandex.ru/events-34526171/</href>
           <D:propstat><D:prop>
-            <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+            <D:resourcetype><D:collection/><C:calendar xmlns:C="urn:ietf:params:xml:ns:caldav"/></D:resourcetype>
             <C:supported-calendar-component-set><C:comp name="VEVENT"/></C:supported-calendar-component-set>
           </D:prop></D:propstat>
         </D:response>
         <D:response>
-          <D:href>/calendars/u%40yandex.ru/events-19201090/</D:href>
+          <href xmlns="DAV:">/calendars/u%40yandex.ru/events-19201090/</href>
           <D:propstat><D:prop>
-            <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+            <D:resourcetype><D:collection/><C:calendar xmlns:C="urn:ietf:params:xml:ns:caldav"/></D:resourcetype>
             <C:supported-calendar-component-set><C:comp name="VEVENT"/></C:supported-calendar-component-set>
           </D:prop></D:propstat>
         </D:response>
         <D:response>
-          <D:href>/calendars/u%40yandex.ru/todos-1/</D:href>
+          <href xmlns="DAV:">/calendars/u%40yandex.ru/todos-1/</href>
           <D:propstat><D:prop>
-            <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+            <D:resourcetype><D:collection/><C:calendar xmlns:C="urn:ietf:params:xml:ns:caldav"/></D:resourcetype>
             <C:supported-calendar-component-set><C:comp name="VTODO"/></C:supported-calendar-component-set>
           </D:prop></D:propstat>
         </D:response>
@@ -126,16 +126,16 @@ describe('YandexCalDavConnector.discoverCollection', () => {
     const multistatus = `<?xml version="1.0"?>
       <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
         <D:response>
-          <D:href>/calendars/u%40yandex.ru/events-10000000/</D:href>
+          <href xmlns="DAV:">/calendars/u%40yandex.ru/events-10000000/</href>
           <D:propstat><D:prop>
-            <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+            <D:resourcetype><D:collection/><C:calendar xmlns:C="urn:ietf:params:xml:ns:caldav"/></D:resourcetype>
             <C:supported-calendar-component-set><C:comp name="VEVENT"/></C:supported-calendar-component-set>
           </D:prop></D:propstat>
         </D:response>
         <D:response>
-          <D:href>/calendars/u%40yandex.ru/events-9999999/</D:href>
+          <href xmlns="DAV:">/calendars/u%40yandex.ru/events-9999999/</href>
           <D:propstat><D:prop>
-            <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+            <D:resourcetype><D:collection/><C:calendar xmlns:C="urn:ietf:params:xml:ns:caldav"/></D:resourcetype>
             <C:supported-calendar-component-set><C:comp name="VEVENT"/></C:supported-calendar-component-set>
           </D:prop></D:propstat>
         </D:response>

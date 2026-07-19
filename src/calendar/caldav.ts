@@ -107,9 +107,11 @@ export class YandexCalDavConnector implements CalendarConnector {
     const hrefs: string[] = [];
     for (const m of xml.matchAll(/<response>([\s\S]*?)<\/response>/g)) {
       const b = m[1];
-      const href = /<href>([^<]*)<\/href>/.exec(b)?.[1];
-      const isCalendar = /<resourcetype>[\s\S]*<calendar\/?>[\s\S]*<\/resourcetype>/.test(b) || /<calendar\/>/.test(b);
-      const hasVevent = /comp name="VEVENT"/.test(b);
+      // Yandex emits tags WITH attributes: `<href xmlns="DAV:">` and `<calendar xmlns:C="…"/>`,
+      // so these matchers must tolerate attributes (bare `<href>`/`<calendar/>` would miss them).
+      const href = /<href[^>]*>([^<]*)<\/href>/.exec(b)?.[1];
+      const isCalendar = /<calendar[\s/>]/.test(b);
+      const hasVevent = /<comp\s+name="VEVENT"/.test(b);
       if (href && isCalendar && hasVevent) hrefs.push(href.trim());
     }
     if (hrefs.length === 0) return null;
