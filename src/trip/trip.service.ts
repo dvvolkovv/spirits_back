@@ -4,9 +4,11 @@ import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
 import { TripPlan, CoPilotState, GeoTrigger, TimeTrigger, validateTripPlan } from './trip.types';
 import { TRIP_2026_07 } from './seed-2026-07';
+import { CalEvent, CalendarSource, fetchCalendarEvents, foldCalendarLines } from './calendar';
 
 export const TRIP_STATE_VERSION = 1;
 const OWNER_USER_ID = '79656445804';
+const CAL_TTL_MS = 30 * 60 * 1000; // calendar fetch cache TTL (per user)
 
 export interface TripAction {
   kind: string;
@@ -16,7 +18,12 @@ export interface TripAction {
 // Pure function: given a plan, "now", and the ordered list of actions applied
 // so far, deterministically compute the co-pilot State. No I/O, no LLM — the
 // launcher and tests both need this to be reproducible.
-export function computeState(plan: TripPlan, now: Date, actions: TripAction[] = []): CoPilotState {
+export function computeState(
+  plan: TripPlan,
+  now: Date,
+  actions: TripAction[] = [],
+  calEvents: CalEvent[] = [],
+): CoPilotState {
   const reminders = plan.reminders.map((r) => ({ ...r }));
   let deadlineDatetime = plan.deadline.datetime;
 
@@ -116,6 +123,14 @@ export function computeState(plan: TripPlan, now: Date, actions: TripAction[] = 
     headline = `Поездка «${plan.title}» завершена`;
   }
 
+  // Calendar events in the trip window (personal Yandex + work Outlook), conflicts flagged.
+  // Only while the co-pilot is up (pre_trip/active) — idle/done have nothing to reconcile.
+  if ((mode === 'pre_trip' || mode === 'active') && calEvents.length > 0) {
+    for (const line of foldCalendarLines(calEvents, plan.window.departPlanned, plan.window.endEstimated)) {
+      contextLines.push(line);
+    }
+  }
+
   const geoTriggers: GeoTrigger[] = [];
   for (const fp of plan.fuelPoints) {
     if (typeof fp.lat === 'number' && typeof fp.lon === 'number') {
@@ -175,6 +190,7 @@ export function computeState(plan: TripPlan, now: Date, actions: TripAction[] = 
 @Injectable()
 export class TripService implements OnModuleInit {
   private readonly logger = new Logger(TripService.name);
+  private readonly calCache = new Map<string, { at: number; events: CalEvent[] }>();
 
   constructor(private readonly pg: PgService) {}
 
@@ -194,6 +210,22 @@ export class TripService implements OnModuleInit {
       } catch (e: any) {
         this.logger.error(`trip migration ${file} failed (${p}): ${e.message}`);
       }
+    }
+
+    try {
+      // Read-only ICS calendar sources per user (personal + work). URLs carry private tokens, so
+      // they're stored in the DB (not committed) — seeded out-of-band via SQL, not in code.
+      await this.pg.query(
+        `CREATE TABLE IF NOT EXISTS trip_calendars (
+           user_id TEXT NOT NULL,
+           kind    TEXT NOT NULL,
+           url     TEXT NOT NULL,
+           enabled BOOLEAN NOT NULL DEFAULT true,
+           PRIMARY KEY (user_id, kind)
+         )`,
+      );
+    } catch (e: any) {
+      this.logger.error(`trip_calendars table init failed: ${e.message}`);
     }
 
     try {
@@ -243,7 +275,39 @@ export class TripService implements OnModuleInit {
       };
     }
     const actions = await this.loadActions(userId, plan.id);
-    return computeState(plan, new Date(), actions);
+    const calEvents = await this.loadCalendarEvents(userId, plan);
+    return computeState(plan, new Date(), actions, calEvents);
+  }
+
+  /**
+   * Trip-window calendar events (personal + work ICS), cached per user with a 30-min TTL so a hot
+   * getState (the app's widget worker polls it) doesn't refetch 100 KB of ICS every call. Fully
+   * best-effort: no configured calendars, an unreachable feed, or a fetch error all yield [] and
+   * never break state. Privacy: only the trip window is fetched/kept — nothing outside it.
+   */
+  private async loadCalendarEvents(userId: string, plan: TripPlan): Promise<CalEvent[]> {
+    const sources = await this.loadCalendars(userId);
+    if (sources.length === 0) return [];
+    const cached = this.calCache.get(userId);
+    if (cached && Date.now() - cached.at < CAL_TTL_MS) return cached.events;
+    const start = new Date(`${plan.window.activateFrom}+05:00`);
+    const end = new Date(`${plan.window.endEstimated}+05:00`);
+    const events = await fetchCalendarEvents(sources, start, end);
+    this.calCache.set(userId, { at: Date.now(), events });
+    return events;
+  }
+
+  private async loadCalendars(userId: string): Promise<CalendarSource[]> {
+    try {
+      const res = await this.pg.query(
+        `SELECT url, kind FROM trip_calendars WHERE user_id = $1 AND enabled = true`,
+        [userId],
+      );
+      return res.rows.map((r: any) => ({ url: r.url, source: r.kind }));
+    } catch (e: any) {
+      this.logger.error(`loadCalendars failed: ${e.message}`);
+      return [];
+    }
   }
 
   async applyAction(userId: string, idemKey: string, kind: string, payload: any): Promise<CoPilotState> {
