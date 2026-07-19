@@ -1,9 +1,11 @@
 import { Module, OnModuleInit } from '@nestjs/common';
 import { CommonModule } from '../common/common.module';
 import { CalendarService } from './calendar.service';
+import { CalendarController } from './calendar.controller';
 
 @Module({
   imports: [CommonModule],
+  controllers: [CalendarController],
   providers: [CalendarService],
   exports: [CalendarService],
 })

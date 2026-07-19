@@ -59,11 +59,13 @@ export class CalendarService {
        ON CONFLICT (user_id, provider) DO UPDATE SET base_url=EXCLUDED.base_url, username=EXCLUDED.username, secret_enc=EXCLUDED.secret_enc, enabled=true`,
       [userId, provider, baseUrl, username, encryptSecret(appPassword)],
     );
+    this.onWrite?.(userId); // connecting changes what listEvents returns — bust the co-pilot cache
     return { ok: true };
   }
 
   async disconnect(userId: string): Promise<void> {
     await this.pg.query(`UPDATE calendar_connections SET enabled=false WHERE user_id=$1`, [userId]);
+    this.onWrite?.(userId); // disconnecting also changes the co-pilot view — bust the cache
   }
 
   /** All events in [start,end): the CalDAV connection (live) + read-only ICS sources (trip_calendars). */
