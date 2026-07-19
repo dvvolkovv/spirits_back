@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { YandexCalDavConnector } from './caldav';
-import { CalEvent, CalendarCreds, ProposedEvent } from './calendar.types';
+import { CalEvent, CalendarCreds, ProposedEvent, ProposedTask, Task } from './calendar.types';
 import { fetchCalendarEvents } from '../trip/calendar'; // read-only ICS sources (T6)
 import { encryptSecret, decryptSecret } from './crypto';
 
@@ -34,6 +34,7 @@ export class CalendarService {
          PRIMARY KEY (user_id, provider))`,
     );
     await this.pg.query(`ALTER TABLE calendar_connections ADD COLUMN IF NOT EXISTS collection_url TEXT`);
+    await this.pg.query(`ALTER TABLE calendar_connections ADD COLUMN IF NOT EXISTS todo_collection_url TEXT`);
     await this.pg.query(
       `CREATE TABLE IF NOT EXISTS calendar_proposals (
          id UUID PRIMARY KEY,
@@ -44,6 +45,9 @@ export class CalendarService {
          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
        )`,
     );
+    // kind = 'event' | 'task' — which surface the proposal targets ("Мои дела" vs the calendar).
+    // Default 'event' preserves the pre-T4 behaviour for already-stored proposals.
+    await this.pg.query(`ALTER TABLE calendar_proposals ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'event'`);
   }
 
   /** Persist a proposal so the MCP-bridge (agent) path can be surfaced to chat via [CALENDAR_PROPOSAL:<id>] marker. */
@@ -52,11 +56,12 @@ export class CalendarService {
     event: ProposedEvent,
     connected: boolean,
     conflicts: { title: string; at: string }[],
+    kind: 'event' | 'task' = 'event',
   ): Promise<string> {
     const id = randomUUID();
     await this.pg.query(
-      `INSERT INTO calendar_proposals (id, user_id, event, connected, conflicts) VALUES ($1,$2,$3::jsonb,$4,$5::jsonb)`,
-      [id, userId, JSON.stringify(event), connected, JSON.stringify(conflicts)],
+      `INSERT INTO calendar_proposals (id, user_id, event, connected, conflicts, kind) VALUES ($1,$2,$3::jsonb,$4,$5::jsonb,$6)`,
+      [id, userId, JSON.stringify(event), connected, JSON.stringify(conflicts), kind],
     );
     return id;
   }
@@ -64,15 +69,15 @@ export class CalendarService {
   async getProposal(
     userId: string,
     id: string,
-  ): Promise<{ event: ProposedEvent; connected: boolean; conflicts: { title: string; at: string }[] } | null> {
-    const r = await this.pg.query(`SELECT event, connected, conflicts FROM calendar_proposals WHERE id = $1 AND user_id = $2`, [id, userId]);
+  ): Promise<{ event: ProposedEvent; connected: boolean; conflicts: { title: string; at: string }[]; kind: 'event' | 'task' } | null> {
+    const r = await this.pg.query(`SELECT event, connected, conflicts, kind FROM calendar_proposals WHERE id = $1 AND user_id = $2`, [id, userId]);
     const row = r.rows[0];
-    return row ? { event: row.event, connected: row.connected, conflicts: row.conflicts } : null;
+    return row ? { event: row.event, connected: row.connected, conflicts: row.conflicts, kind: row.kind } : null;
   }
 
   private async creds(userId: string): Promise<CalendarCreds | null> {
     const r = await this.pg.query(
-      `SELECT base_url, username, secret_enc, collection_url FROM calendar_connections WHERE user_id=$1 AND enabled=true LIMIT 1`,
+      `SELECT base_url, username, secret_enc, collection_url, todo_collection_url FROM calendar_connections WHERE user_id=$1 AND enabled=true LIMIT 1`,
       [userId],
     );
     const row = r.rows[0];
@@ -82,6 +87,7 @@ export class CalendarService {
       username: row.username,
       appPassword: decryptSecret(row.secret_enc),
       collectionUrl: row.collection_url || undefined,
+      taskCollectionUrl: row.todo_collection_url || undefined,
     };
   }
 
@@ -96,11 +102,14 @@ export class CalendarService {
     if (!ok) return { ok: false, error: 'Не удалось подключиться — проверь логин и пароль приложения' };
     const collectionUrl = await this.connector.discoverCollection({ baseUrl, username, appPassword });
     if (!collectionUrl) return { ok: false, error: 'Не нашёл календарь для записи' };
+    // Task (VTODO) collection is best-effort: not every account has a "Мои дела" list, and its
+    // absence must not block connecting the calendar itself — tasks just stay unavailable.
+    const todoCollectionUrl = await this.connector.discoverTaskCollection({ baseUrl, username, appPassword });
     await this.pg.query(
-      `INSERT INTO calendar_connections (user_id, provider, base_url, username, secret_enc, enabled, collection_url)
-       VALUES ($1,$2,$3,$4,$5,true,$6)
-       ON CONFLICT (user_id, provider) DO UPDATE SET base_url=EXCLUDED.base_url, username=EXCLUDED.username, secret_enc=EXCLUDED.secret_enc, enabled=true, collection_url=EXCLUDED.collection_url`,
-      [userId, provider, baseUrl, username, encryptSecret(appPassword), collectionUrl],
+      `INSERT INTO calendar_connections (user_id, provider, base_url, username, secret_enc, enabled, collection_url, todo_collection_url)
+       VALUES ($1,$2,$3,$4,$5,true,$6,$7)
+       ON CONFLICT (user_id, provider) DO UPDATE SET base_url=EXCLUDED.base_url, username=EXCLUDED.username, secret_enc=EXCLUDED.secret_enc, enabled=true, collection_url=EXCLUDED.collection_url, todo_collection_url=EXCLUDED.todo_collection_url`,
+      [userId, provider, baseUrl, username, encryptSecret(appPassword), collectionUrl, todoCollectionUrl],
     );
     this.onWrite?.(userId); // connecting changes what listEvents returns — bust the co-pilot cache
     return { ok: true };
@@ -145,6 +154,44 @@ export class CalendarService {
     } catch (e: any) {
       this.logger.error(`createEvent failed: ${e.message}`);
       return { ok: false, error: 'Не удалось записать событие' };
+    }
+  }
+
+  async createTask(userId: string, task: ProposedTask): Promise<{ ok: boolean; uid?: string; error?: string }> {
+    const creds = await this.creds(userId);
+    if (!creds || !creds.taskCollectionUrl) return { ok: false, error: 'Задачи недоступны' };
+    try {
+      const { uid } = await this.connector.createTask(creds, task);
+      this.onWrite?.(userId); // optimistic: refresh co-pilot surface now
+      return { ok: true, uid };
+    } catch (e: any) {
+      this.logger.error(`createTask failed: ${e.message}`);
+      return { ok: false, error: 'Не удалось записать задачу' };
+    }
+  }
+
+  async listTasks(userId: string, start: Date, end: Date): Promise<Task[]> {
+    const creds = await this.creds(userId);
+    if (!creds || !creds.taskCollectionUrl) return [];
+    try {
+      return await this.connector.listTasks(creds, start, end);
+    } catch (e: any) {
+      this.logger.error(`listTasks failed: ${e.message}`);
+      return [];
+    }
+  }
+
+  async setTaskDone(userId: string, uid: string, done: boolean): Promise<{ ok: boolean; error?: string }> {
+    const creds = await this.creds(userId);
+    if (!creds || !creds.taskCollectionUrl) return { ok: false, error: 'Задачи недоступны' };
+    try {
+      const ok = await this.connector.setTaskDone(creds, uid, done);
+      if (!ok) return { ok: false, error: 'Не удалось обновить задачу' };
+      this.onWrite?.(userId); // optimistic: refresh co-pilot surface now
+      return { ok: true };
+    } catch (e: any) {
+      this.logger.error(`setTaskDone failed: ${e.message}`);
+      return { ok: false, error: 'Не удалось обновить задачу' };
     }
   }
 }

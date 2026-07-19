@@ -16,7 +16,8 @@ describe('propose_calendar_event tool', () => {
     expect(r).toMatchObject({ ok: true, kind: 'calendar_proposal', connected: true, proposalId: 'test-id' });
     expect(r.conflicts).toHaveLength(1);
     expect(r.conflicts[0]).toEqual({ title: 'Встреча', at: '2026-07-20T10:00:00Z' });
-    expect(saveProposalFn).toHaveBeenCalledWith('u1', expect.objectContaining({ title: 'Синк' }), true, r.conflicts);
+    expect(r.itemKind).toBe('event');
+    expect(saveProposalFn).toHaveBeenCalledWith('u1', expect.objectContaining({ title: 'Синк' }), true, r.conflicts, 'event');
   });
   it('not connected: returns proposal with connected:false, no calendar read', async () => {
     const findConflictsFn = jest.fn(async () => []);
@@ -25,6 +26,21 @@ describe('propose_calendar_event tool', () => {
     expect(r).toMatchObject({ ok: true, kind: 'calendar_proposal', connected: false, proposalId: 'test-id' });
     expect(r.conflicts).toEqual([]);
     expect(findConflictsFn).not.toHaveBeenCalled();
-    expect(saveProposalFn).toHaveBeenCalledWith('u1', expect.objectContaining({ title: 'Синк' }), false, []);
+    expect(saveProposalFn).toHaveBeenCalledWith('u1', expect.objectContaining({ title: 'Синк' }), false, [], 'event');
+  });
+  it('kind=task, connected: returns proposal with itemKind task, no conflict check (no datetime)', async () => {
+    const findConflictsFn = jest.fn(async () => []);
+    const { svc: service, saveProposalFn } = svc({ connected: true }, [], findConflictsFn);
+    const r: any = await service.executeTool('u1', 'propose_calendar_event', { title: 'Собрать вещи', kind: 'task' });
+    expect(r).toMatchObject({ ok: true, kind: 'calendar_proposal', itemKind: 'task', connected: true, proposalId: 'test-id' });
+    expect(r.conflicts).toEqual([]);
+    expect(findConflictsFn).not.toHaveBeenCalled();
+    expect(saveProposalFn).toHaveBeenCalledWith(
+      'u1',
+      expect.objectContaining({ title: 'Собрать вещи' }),
+      true,
+      [],
+      'task',
+    );
   });
 });

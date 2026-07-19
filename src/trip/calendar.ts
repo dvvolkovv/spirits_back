@@ -10,6 +10,8 @@ import * as ical from 'node-ical';
 export interface CalEvent {
   /** ISO-инстант начала события (UTC). */
   at: string;
+  /** ISO-инстант конца события (UTC), если DTEND присутствует в ICS. */
+  end?: string;
   title: string;
   /** 'yandex' | 'corp' — источник, для иконки/отладки. */
   source: string;
@@ -39,7 +41,9 @@ function planInstant(naive: string): number {
  * Folds trip-window calendar events into contextLines for the sheet. An event whose start falls
  * within [departPlanned − 3h, endEstimated] is flagged as a conflict (⚠️/warn — you can't be at a
  * meeting and on the road); other in-window events are informational (📅). Deterministic given the
- * fixed Yekaterinburg timezone, so it's unit-testable alongside computeState.
+ * fixed Yekaterinburg timezone, so it's unit-testable on its own. Not called from trip.service
+ * anymore (computeCopilotState folds conflicts inline over real events) — kept for its own tests
+ * and as a reusable "departure window" folder if needed again.
  */
 export function foldCalendarLines(
   events: CalEvent[],
@@ -86,6 +90,9 @@ export function eventsFromIcs(icsText: string, source: string, start: Date, end:
     if (!ev || ev.type !== 'VEVENT' || !ev.start) continue;
     const title = String(ev.summary || '').trim() || 'Событие';
 
+    // Duration of the (first) occurrence, used to derive each recurrence's end from its start.
+    const durationMs = ev.end ? new Date(ev.end).getTime() - new Date(ev.start).getTime() : undefined;
+
     if (ev.rrule) {
       let occ: Date[] = [];
       try {
@@ -99,11 +106,17 @@ export function eventsFromIcs(icsText: string, source: string, start: Date, end:
         // EXDATE keys in node-ical are date strings; skip cancelled occurrences.
         const dayKey = iso.slice(0, 10);
         if (Object.keys(exdates).some((k) => k.startsWith(dayKey))) continue;
-        out.push({ at: iso, title, source });
+        const item: CalEvent = { at: iso, title, source };
+        if (durationMs !== undefined) item.end = new Date(d.getTime() + durationMs).toISOString();
+        out.push(item);
       }
     } else {
       const s = new Date(ev.start);
-      if (s >= start && s < end) out.push({ at: s.toISOString(), title, source });
+      if (s >= start && s < end) {
+        const item: CalEvent = { at: s.toISOString(), title, source };
+        if (ev.end) item.end = new Date(ev.end).toISOString();
+        out.push(item);
+      }
     }
   }
   return out;
