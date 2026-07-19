@@ -1,4 +1,22 @@
-import { buildVEvent, YandexCalDavConnector, YANDEX_CALDAV_BASE } from './caldav';
+import { buildVEvent, buildVTodo, YandexCalDavConnector, YANDEX_CALDAV_BASE } from './caldav';
+
+describe('buildVTodo', () => {
+  it('builds a VTODO with DTSTAMP, SUMMARY, STATUS and optional DUE', () => {
+    const ics = buildVTodo({ title: 'Собрать вещи', datetime: '2026-07-20T09:00:00' }, 'u1', false);
+    expect(ics).toContain('BEGIN:VTODO');
+    expect(ics).toContain('UID:u1');
+    expect(ics).toMatch(/DTSTAMP:\d{8}T\d{6}Z/);
+    expect(ics).toContain('SUMMARY:Собрать вещи');
+    expect(ics).toContain('DUE;TZID=Asia/Yekaterinburg:20260720T090000');
+    expect(ics).toContain('STATUS:NEEDS-ACTION');
+  });
+  it('done=true → STATUS:COMPLETED + COMPLETED + PERCENT-COMPLETE:100', () => {
+    const ics = buildVTodo({ title: 'X' }, 'u2', true);
+    expect(ics).toContain('STATUS:COMPLETED');
+    expect(ics).toContain('PERCENT-COMPLETE:100');
+    expect(ics).toMatch(/COMPLETED:\d{8}T\d{6}Z/);
+  });
+});
 
 describe('buildVEvent', () => {
   it('builds a valid VEVENT with DTSTART/DTEND from datetime + duration', () => {
@@ -160,6 +178,127 @@ describe('YandexCalDavConnector.discoverCollection', () => {
   it('returns null when fetch rejects', async () => {
     (global as any).fetch = jest.fn(async () => { throw new Error('network down'); });
     const result = await new YandexCalDavConnector().discoverCollection(credsNoCollection);
+    expect(result).toBeNull();
+  });
+});
+
+const TASK_COLLECTION_URL = `${YANDEX_CALDAV_BASE}/calendars/u%40yandex.ru/todos-7415896/`;
+const credsWithTasks = { ...creds, taskCollectionUrl: TASK_COLLECTION_URL };
+
+describe('YandexCalDavConnector tasks', () => {
+  let calls: any[];
+  beforeEach(() => {
+    calls = [];
+    (global as any).fetch = jest.fn(async (url: string, opts: any) => {
+      calls.push({ url, method: opts?.method, headers: opts?.headers, body: opts?.body });
+      if (opts?.method === 'PUT') return { ok: true, status: 201, text: async () => '' } as any;
+      if (opts?.method === 'GET') {
+        return { ok: true, status: 200, text: async () =>
+          'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:t1\r\nDTSTAMP:20260719T100000Z\r\nSUMMARY:Купить билеты\r\nDUE;TZID=Asia/Yekaterinburg:20260720T090000\r\nSTATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR' } as any;
+      }
+      if (opts?.method === 'REPORT') {
+        return { ok: true, status: 207, text: async () =>
+          `<?xml version="1.0"?><multistatus xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+           <response><propstat><prop><C:calendar-data>BEGIN:VCALENDAR\nBEGIN:VTODO\nUID:t1\nSUMMARY:Купить билеты\nDUE;TZID=Asia/Yekaterinburg:20260720T090000\nSTATUS:NEEDS-ACTION\nEND:VTODO\nEND:VCALENDAR</C:calendar-data></prop></propstat></response>
+           <response><propstat><prop><C:calendar-data>BEGIN:VCALENDAR\nBEGIN:VTODO\nUID:t2\nSUMMARY:Сделано\nSTATUS:COMPLETED\nEND:VTODO\nEND:VCALENDAR</C:calendar-data></prop></propstat></response>
+           </multistatus>` } as any;
+      }
+      return { ok: false, status: 404, text: async () => '' } as any;
+    });
+  });
+
+  it('createTask() PUTs a VTODO under creds.taskCollectionUrl and returns the uid', async () => {
+    const r = await new YandexCalDavConnector().createTask(credsWithTasks, { title: 'Собрать вещи', datetime: '2026-07-20T09:00:00' });
+    expect(r.uid).toBeTruthy();
+    const put = calls.find((c) => c.method === 'PUT');
+    expect(put.url).toBe(`${TASK_COLLECTION_URL}${r.uid}.ics`);
+    expect(put.body).toContain('BEGIN:VTODO');
+    expect(put.body).toContain('STATUS:NEEDS-ACTION');
+  });
+
+  it('createTask() throws when PUT is not 2xx', async () => {
+    (global as any).fetch = jest.fn(async () => ({ ok: false, status: 500, text: async () => '' } as any));
+    await expect(
+      new YandexCalDavConnector().createTask(credsWithTasks, { title: 'X' }),
+    ).rejects.toThrow();
+  });
+
+  it('listTasks() REPORTs against creds.taskCollectionUrl and parses VTODOs incl. done from STATUS:COMPLETED', async () => {
+    const tasks = await new YandexCalDavConnector().listTasks(credsWithTasks, new Date('2026-07-18Z'), new Date('2026-07-24Z'));
+    const report = calls.find((c) => c.method === 'REPORT');
+    expect(report.url).toBe(TASK_COLLECTION_URL);
+    expect(tasks.find((t) => t.uid === 't1')).toMatchObject({ title: 'Купить билеты', done: false });
+    expect(tasks.find((t) => t.uid === 't2')).toMatchObject({ title: 'Сделано', done: true });
+  });
+
+  it('listTasks() resolves to [] when fetch rejects', async () => {
+    (global as any).fetch = jest.fn(async () => { throw new Error('network down'); });
+    const tasks = await new YandexCalDavConnector().listTasks(credsWithTasks, new Date('2026-07-18Z'), new Date('2026-07-24Z'));
+    expect(tasks).toEqual([]);
+  });
+
+  it('setTaskDone() GETs current VTODO, re-PUTs with STATUS:COMPLETED preserving title/due, returns true on 2xx', async () => {
+    const ok = await new YandexCalDavConnector().setTaskDone(credsWithTasks, 't1', true);
+    expect(ok).toBe(true);
+    const put = calls.find((c) => c.method === 'PUT');
+    expect(put.url).toBe(`${TASK_COLLECTION_URL}t1.ics`);
+    expect(put.body).toContain('SUMMARY:Купить билеты');
+    expect(put.body).toContain('STATUS:COMPLETED');
+    expect(put.body).toContain('DUE;TZID=Asia/Yekaterinburg:20260720T090000');
+  });
+
+  it('setTaskDone() returns false when GET fails', async () => {
+    (global as any).fetch = jest.fn(async () => ({ ok: false, status: 404, text: async () => '' } as any));
+    const ok = await new YandexCalDavConnector().setTaskDone(credsWithTasks, 'missing', true);
+    expect(ok).toBe(false);
+  });
+
+  it('setTaskDone() returns false when fetch rejects', async () => {
+    (global as any).fetch = jest.fn(async () => { throw new Error('network down'); });
+    const ok = await new YandexCalDavConnector().setTaskDone(credsWithTasks, 't1', true);
+    expect(ok).toBe(false);
+  });
+});
+
+describe('YandexCalDavConnector.discoverTaskCollection', () => {
+  const credsNoCollection = { baseUrl: YANDEX_CALDAV_BASE, username: 'u@yandex.ru', appPassword: 'app-pass' };
+
+  it('parses a multistatus with a VTODO todos-* collection amongst VEVENT calendars, returns absolute URL', async () => {
+    const multistatus = `<?xml version="1.0"?>
+      <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+        <D:response>
+          <href xmlns="DAV:">/calendars/u%40yandex.ru/events-19201090/</href>
+          <D:propstat><D:prop>
+            <D:resourcetype><D:collection/><C:calendar xmlns:C="urn:ietf:params:xml:ns:caldav"/></D:resourcetype>
+            <C:supported-calendar-component-set><C:comp name="VEVENT"/></C:supported-calendar-component-set>
+          </D:prop></D:propstat>
+        </D:response>
+        <D:response>
+          <href xmlns="DAV:">/calendars/u%40yandex.ru/todos-7415896/</href>
+          <D:propstat><D:prop>
+            <D:resourcetype><D:collection/><C:calendar xmlns:C="urn:ietf:params:xml:ns:caldav"/></D:resourcetype>
+            <C:supported-calendar-component-set><C:comp name="VTODO"/></C:supported-calendar-component-set>
+          </D:prop></D:propstat>
+        </D:response>
+      </D:multistatus>`;
+    (global as any).fetch = jest.fn(async (url: string, opts: any) => {
+      expect(opts.method).toBe('PROPFIND');
+      expect(url).toBe(HOME_URL);
+      return { ok: true, status: 207, text: async () => multistatus } as any;
+    });
+    const result = await new YandexCalDavConnector().discoverTaskCollection(credsNoCollection);
+    expect(result).toBe(`${YANDEX_CALDAV_BASE}/calendars/u%40yandex.ru/todos-7415896/`);
+  });
+
+  it('returns null when PROPFIND does not return 207', async () => {
+    (global as any).fetch = jest.fn(async () => ({ ok: false, status: 404, text: async () => '' } as any));
+    const result = await new YandexCalDavConnector().discoverTaskCollection(credsNoCollection);
+    expect(result).toBeNull();
+  });
+
+  it('returns null when fetch rejects', async () => {
+    (global as any).fetch = jest.fn(async () => { throw new Error('network down'); });
+    const result = await new YandexCalDavConnector().discoverTaskCollection(credsNoCollection);
     expect(result).toBeNull();
   });
 });

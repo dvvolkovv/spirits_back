@@ -1,6 +1,6 @@
 import * as ical from 'node-ical';
 import { randomUUID } from 'crypto';
-import { CalendarConnector, CalendarCreds, CalEvent, ProposedEvent } from './calendar.types';
+import { CalendarConnector, CalendarCreds, CalEvent, ProposedEvent, ProposedTask, Task } from './calendar.types';
 
 export const YANDEX_CALDAV_BASE = 'https://caldav.yandex.ru';
 const TZID = 'Asia/Yekaterinburg';
@@ -48,6 +48,22 @@ export function buildVEvent(e: ProposedEvent, uid: string): string {
     'SEQUENCE:0',
     'END:VEVENT',
   ].filter(Boolean).join('\r\n');
+}
+
+/** Build a VTODO block. DTSTAMP is REQUIRED (RFC 5545) — Yandex stores it but won't render without it. */
+export function buildVTodo(t: { title: string; datetime?: string; note?: string }, uid: string, done: boolean): string {
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
+  const esc = (s: string) => s.replace(/([,;\\])/g, '\\$1').replace(/\n/g, '\\n');
+  const lines = [
+    'BEGIN:VTODO', `UID:${uid}`, `DTSTAMP:${stamp}`, `SUMMARY:${esc(t.title)}`,
+    t.note ? `DESCRIPTION:${esc(t.note)}` : '',
+    t.datetime ? `DUE;TZID=${TZID}:${icsLocal(t.datetime)}` : '',
+    done ? 'STATUS:COMPLETED' : 'STATUS:NEEDS-ACTION',
+    done ? 'PERCENT-COMPLETE:100' : '',
+    done ? `COMPLETED:${stamp}` : '',
+    'END:VTODO',
+  ];
+  return lines.filter(Boolean).join('\r\n');
 }
 
 /** Trailing integer id of an href's last path segment (e.g. ".../events-9999999/" -> 9999999n), or null if none. */
@@ -184,6 +200,128 @@ export class YandexCalDavConnector implements CalendarConnector {
     } catch (e) {
       console.debug('caldav listEvents failed', e);
       return [];
+    }
+  }
+
+  /**
+   * Discover the account's default task (VTODO) collection under the calendar home.
+   * Mirrors discoverCollection but filters on VTODO support and picks the lowest-sorted
+   * `todos-*` collection — that's the account's "Мои дела" default.
+   */
+  async discoverTaskCollection(creds: CalendarCreds): Promise<string | null> {
+    let res: any;
+    try {
+      res = await fetch(this.calendarHomeUrl(creds), {
+        method: 'PROPFIND',
+        headers: { Authorization: this.authHeader(creds), Depth: '1', 'Content-Type': 'application/xml' },
+        body: '<?xml version="1.0"?><propfind xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><prop><resourcetype/><C:supported-calendar-component-set/></prop></propfind>',
+        signal: AbortSignal.timeout(8000),
+      } as any);
+    } catch { return null; }
+    if (res.status !== 207) return null;
+    const xml = (await res.text()).replace(/<(\/?)[a-zA-Z0-9]+:/g, '<$1'); // strip ns prefixes
+    const hrefs: string[] = [];
+    for (const m of xml.matchAll(/<response>([\s\S]*?)<\/response>/g)) {
+      const b = m[1];
+      // Yandex emits tags WITH attributes: `<href xmlns="DAV:">` and `<calendar xmlns:C="…"/>`,
+      // so these matchers must tolerate attributes (bare `<href>`/`<calendar/>` would miss them).
+      const href = /<href[^>]*>([^<]*)<\/href>/.exec(b)?.[1];
+      const isCalendar = /<calendar[\s/>]/.test(b);
+      const hasVtodo = /<comp\s+name="VTODO"/.test(b);
+      if (href && isCalendar && hasVtodo) hrefs.push(href.trim());
+    }
+    if (hrefs.length === 0) return null;
+    hrefs.sort(collectionIdComparator); // lowest numeric todos-<id> = the default task list
+    const path = hrefs[0];
+    console.debug('caldav discoverTaskCollection: chose', path);
+    const origin = new URL(creds.baseUrl).origin;
+    return path.startsWith('http') ? path : origin + path;
+  }
+
+  private async resolveTaskCollection(creds: CalendarCreds): Promise<string | null> {
+    if (creds.taskCollectionUrl) return creds.taskCollectionUrl;
+    // Defensive one-shot fallback if taskCollectionUrl wasn't stored (e.g. legacy connection).
+    return this.discoverTaskCollection(creds);
+  }
+
+  async createTask(creds: CalendarCreds, task: ProposedTask): Promise<{ uid: string }> {
+    const taskCol = await this.resolveTaskCollection(creds);
+    if (!taskCol) throw new Error('CalDAV task collection not found');
+    const uid = randomUUID();
+    const body = `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Linkeon//trip//RU\r\n${buildVTodo(task, uid, false)}\r\nEND:VCALENDAR\r\n`;
+    const base = taskCol.endsWith('/') ? taskCol : `${taskCol}/`;
+    const res = await fetch(`${base}${uid}.ics`, {
+      method: 'PUT',
+      headers: { Authorization: this.authHeader(creds), 'Content-Type': 'text/calendar; charset=utf-8' },
+      body,
+      signal: AbortSignal.timeout(8000),
+    } as any);
+    if (res.status < 200 || res.status >= 300) throw new Error(`CalDAV PUT failed: ${res.status}`);
+    return { uid };
+  }
+
+  async listTasks(creds: CalendarCreds, start: Date, end: Date): Promise<Task[]> {
+    const fmt = (d: Date) => d.toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
+    const report = `<?xml version="1.0"?><C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+      <D:prop><C:calendar-data/></D:prop>
+      <C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VTODO">
+        <C:time-range start="${fmt(start)}" end="${fmt(end)}"/>
+      </C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`;
+    try {
+      const taskCol = await this.resolveTaskCollection(creds);
+      if (!taskCol) return [];
+      const res = await fetch(taskCol, {
+        method: 'REPORT',
+        headers: { Authorization: this.authHeader(creds), Depth: '1', 'Content-Type': 'application/xml' },
+        body: report, signal: AbortSignal.timeout(8000),
+      } as any);
+      if (res.status !== 207) return [];
+      const xml = await res.text();
+      const out: Task[] = [];
+      for (const m of xml.matchAll(/BEGIN:VTODO[\s\S]*?END:VTODO/g)) {
+        const block = m[0];
+        const title = /^SUMMARY:(.*)$/m.exec(block)?.[1]?.trim();
+        const uid = /^UID:(.*)$/m.exec(block)?.[1]?.trim();
+        const dueLine = /^DUE[^:]*:(.*)$/m.exec(block)?.[1]?.trim();
+        const done = /^STATUS:COMPLETED\s*$/m.test(block);
+        if (uid) out.push({ uid, title: title || 'Задача', due: dueLine || undefined, done, source: 'yandex' });
+      }
+      return out;
+    } catch (e) {
+      console.debug('caldav listTasks failed', e);
+      return [];
+    }
+  }
+
+  async setTaskDone(creds: CalendarCreds, uid: string, done: boolean): Promise<boolean> {
+    try {
+      const taskCol = await this.resolveTaskCollection(creds);
+      if (!taskCol) return false;
+      const base = taskCol.endsWith('/') ? taskCol : `${taskCol}/`;
+      const url = `${base}${uid}.ics`;
+      const getRes = await fetch(url, {
+        method: 'GET',
+        headers: { Authorization: this.authHeader(creds) },
+        signal: AbortSignal.timeout(8000),
+      } as any);
+      if (getRes.status < 200 || getRes.status >= 300) return false;
+      const current = await getRes.text();
+      const title = /^SUMMARY:(.*)$/m.exec(current)?.[1]?.trim() || 'Задача';
+      const dueLine = /^DUE[^:]*:(.*)$/m.exec(current)?.[1]?.trim();
+      // dueLine is an ICS local stamp "20260720T090000" — reverse icsLocal() back to naive "2026-07-20T09:00:00".
+      const dueMatch = dueLine ? /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/.exec(dueLine) : null;
+      const datetime = dueMatch ? `${dueMatch[1]}-${dueMatch[2]}-${dueMatch[3]}T${dueMatch[4]}:${dueMatch[5]}:${dueMatch[6]}` : undefined;
+      const body = `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Linkeon//trip//RU\r\n${buildVTodo({ title, datetime }, uid, done)}\r\nEND:VCALENDAR\r\n`;
+      const putRes = await fetch(url, {
+        method: 'PUT',
+        headers: { Authorization: this.authHeader(creds), 'Content-Type': 'text/calendar; charset=utf-8' },
+        body,
+        signal: AbortSignal.timeout(8000),
+      } as any);
+      return putRes.status >= 200 && putRes.status < 300;
+    } catch (e) {
+      console.debug('caldav setTaskDone failed', e);
+      return false;
     }
   }
 }
