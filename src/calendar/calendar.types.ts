@@ -1,3 +1,5 @@
+import { Recurrence } from './recurrence';
+
 export interface CalEvent {
   at: string;        // ISO instant (UTC)
   end?: string;
@@ -11,6 +13,8 @@ export interface ProposedEvent {
   datetime: string;  // naive local (Asia/Yekaterinburg wall-clock), e.g. "2026-07-20T15:00:00"
   durationMin?: number;
   note?: string;
+  recurrence?: Recurrence;
+  dates?: string[];
 }
 
 export interface Task {

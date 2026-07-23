@@ -43,6 +43,27 @@ function basicToIso(raw: string): string | undefined {
   return isNaN(d.getTime()) ? undefined : d.toISOString();
 }
 
+/**
+ * Build an RFC 5545 RRULE value (without the `RRULE:` prefix) from a Recurrence.
+ * Order matters for the test fixtures / readability: FREQ, [INTERVAL], [BYDAY], then exactly
+ * one of COUNT/UNTIL. `until` is a naive local date ("YYYY-MM-DD") rendered as an inclusive
+ * end-of-day UTC stamp (`YYYYMMDDT235959Z`) per the local Asia/Yekaterinburg offset.
+ */
+function buildRRule(r: ProposedEvent['recurrence']): string {
+  const parts = [`FREQ=${r!.freq.toUpperCase()}`];
+  if (r!.interval && r!.interval > 1) parts.push(`INTERVAL=${r!.interval}`);
+  if (r!.freq === 'weekly' && r!.byDay && r!.byDay.length > 0) parts.push(`BYDAY=${r!.byDay.join(',')}`);
+  if (r!.count) {
+    parts.push(`COUNT=${r!.count}`);
+  } else if (r!.until) {
+    // Per plan: end-of-day UTC-stamp form, i.e. the naive local date's 23:59:59 with a literal
+    // `Z` suffix — NOT a real Asia/Yekaterinburg->UTC conversion (RRULE UNTIL just needs to be
+    // an unambiguous inclusive bound; Yandex accepts this form).
+    parts.push(`UNTIL=${r!.until.replace(/-/g, '')}T235959Z`);
+  }
+  return parts.join(';');
+}
+
 export function buildVEvent(e: ProposedEvent, uid: string): string {
   const start = new Date(`${e.datetime}${OFFSET}`);
   const end = new Date(start.getTime() + (e.durationMin ?? 60) * 60_000);
@@ -64,6 +85,7 @@ export function buildVEvent(e: ProposedEvent, uid: string): string {
     e.note ? `DESCRIPTION:${esc(e.note)}` : '',
     `DTSTART;TZID=${TZID}:${icsLocal(e.datetime)}`,
     `DTEND;TZID=${TZID}:${icsLocal(endNaive)}`,
+    e.recurrence ? `RRULE:${buildRRule(e.recurrence)}` : '',
     'STATUS:CONFIRMED',
     'SEQUENCE:0',
     'END:VEVENT',
