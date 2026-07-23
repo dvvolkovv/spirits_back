@@ -42,7 +42,7 @@ export interface CalendarCreds {
 export interface CalendarConnector {
   test(creds: CalendarCreds): Promise<boolean>;
   listEvents(creds: CalendarCreds, start: Date, end: Date): Promise<CalEvent[]>;
-  createEvent(creds: CalendarCreds, event: ProposedEvent): Promise<{ uid: string }>;
+  createEvent(creds: CalendarCreds, event: ProposedEvent): Promise<{ created: number; failed: number; uids: string[]; error?: string }>;
   discoverCollection(creds: CalendarCreds): Promise<string | null>;
   discoverTaskCollection(creds: CalendarCreds): Promise<string | null>;
   createTask(creds: CalendarCreds, task: ProposedTask): Promise<{ uid: string }>;

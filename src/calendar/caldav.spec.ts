@@ -69,11 +69,11 @@ describe('YandexCalDavConnector', () => {
     expect(calls[0].headers.Authorization).toMatch(/^Basic /);
   });
 
-  it('createEvent() PUTs an .ics under creds.collectionUrl and returns the uid', async () => {
+  it('createEvent() PUTs an .ics under creds.collectionUrl and returns created:1 + the uid', async () => {
     const r = await new YandexCalDavConnector().createEvent(creds, { title: 'X', datetime: '2026-07-20T15:00:00' });
-    expect(r.uid).toBeTruthy();
+    expect(r).toEqual({ created: 1, failed: 0, uids: [expect.any(String)] });
     const put = calls.find((c) => c.method === 'PUT');
-    expect(put.url).toBe(`${COLLECTION_URL}${r.uid}.ics`);
+    expect(put.url).toBe(`${COLLECTION_URL}${r.uids[0]}.ics`);
     expect(put.body).toContain('BEGIN:VEVENT');
     expect(put.body).toContain('BEGIN:VTIMEZONE');
     expect(put.body).toContain('TZID:Asia/Yekaterinburg');

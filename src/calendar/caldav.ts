@@ -194,20 +194,58 @@ export class YandexCalDavConnector implements CalendarConnector {
     return this.discoverCollection(creds);
   }
 
-  async createEvent(creds: CalendarCreds, event: ProposedEvent): Promise<{ uid: string }> {
+  /**
+   * PUT a single VEVENT (already fully built, e.g. carrying its own RRULE) under `base` with a
+   * fresh uid. Never throws — network/HTTP failures are reported via the returned `error` so the
+   * series writer below can continue past a single bad PUT instead of aborting the whole batch.
+   */
+  private async putVEvent(creds: CalendarCreds, base: string, event: ProposedEvent, uid: string): Promise<{ ok: boolean; error?: string }> {
+    const body = `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Linkeon//trip//RU\r\n${VTIMEZONE_ASIA_YEKATERINBURG}\r\n${buildVEvent(event, uid)}\r\nEND:VCALENDAR\r\n`;
+    try {
+      const res = await fetch(`${base}${uid}.ics`, {
+        method: 'PUT',
+        headers: { Authorization: this.authHeader(creds), 'Content-Type': 'text/calendar; charset=utf-8' },
+        body,
+        signal: AbortSignal.timeout(8000),
+      } as any);
+      if (res.status < 200 || res.status >= 300) return { ok: false, error: `CalDAV PUT failed: ${res.status}` };
+      return { ok: true };
+    } catch (e: any) {
+      return { ok: false, error: e?.message || 'CalDAV PUT failed' };
+    }
+  }
+
+  /**
+   * Write one or many VEVENTs depending on the shape of `event`:
+   *  - `event.recurrence` set → ONE VEVENT carrying the RRULE (buildVEvent already renders it) →
+   *    one PUT. The whole series lives in a single ICS resource.
+   *  - `event.dates` set (no recurrence) → one independent VEVENT + PUT per date. Partial success
+   *    is allowed and expected — a single bad PUT must not abort the remaining dates.
+   *  - neither → today's plain single-occurrence behaviour (one VEVENT, one PUT).
+   */
+  async createEvent(creds: CalendarCreds, event: ProposedEvent): Promise<{ created: number; failed: number; uids: string[]; error?: string }> {
     const collectionUrl = await this.resolveCollection(creds);
     if (!collectionUrl) throw new Error('CalDAV collection not found');
-    const uid = randomUUID();
-    const body = `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Linkeon//trip//RU\r\n${VTIMEZONE_ASIA_YEKATERINBURG}\r\n${buildVEvent(event, uid)}\r\nEND:VCALENDAR\r\n`;
     const base = collectionUrl.endsWith('/') ? collectionUrl : `${collectionUrl}/`;
-    const res = await fetch(`${base}${uid}.ics`, {
-      method: 'PUT',
-      headers: { Authorization: this.authHeader(creds), 'Content-Type': 'text/calendar; charset=utf-8' },
-      body,
-      signal: AbortSignal.timeout(8000),
-    } as any);
-    if (res.status < 200 || res.status >= 300) throw new Error(`CalDAV PUT failed: ${res.status}`);
-    return { uid };
+
+    if (event.dates && event.dates.length > 0) {
+      let created = 0;
+      let failed = 0;
+      let error: string | undefined;
+      const uids: string[] = [];
+      for (const d of event.dates) {
+        const uid = randomUUID();
+        const single: ProposedEvent = { ...event, datetime: d, recurrence: undefined, dates: undefined };
+        const r = await this.putVEvent(creds, base, single, uid);
+        if (r.ok) { created++; uids.push(uid); } else { failed++; error = r.error; }
+      }
+      return { created, failed, uids, error };
+    }
+
+    // Single VEVENT covers both the recurrence case (RRULE inside) and the plain single-occurrence case.
+    const uid = randomUUID();
+    const r = await this.putVEvent(creds, base, event, uid);
+    return r.ok ? { created: 1, failed: 0, uids: [uid] } : { created: 0, failed: 1, uids: [], error: r.error };
   }
 
   async listEvents(creds: CalendarCreds, start: Date, end: Date): Promise<CalEvent[]> {

@@ -5,6 +5,7 @@ import { YandexCalDavConnector } from './caldav';
 import { CalEvent, CalendarCreds, ProposedEvent, ProposedTask, Task } from './calendar.types';
 import { fetchCalendarEvents } from '../trip/calendar'; // read-only ICS sources (T6)
 import { encryptSecret, decryptSecret } from './crypto';
+import { expandOccurrences } from './recurrence';
 
 const OFFSET = '+05:00';
 
@@ -50,7 +51,12 @@ export class CalendarService {
     await this.pg.query(`ALTER TABLE calendar_proposals ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'event'`);
   }
 
-  /** Persist a proposal so the MCP-bridge (agent) path can be surfaced to chat via [CALENDAR_PROPOSAL:<id>] marker. */
+  /**
+   * Persist a proposal so the MCP-bridge (agent) path can be surfaced to chat via
+   * [CALENDAR_PROPOSAL:<id>] marker. Anti-dupe: if an identical (same user, same event JSON)
+   * proposal was already saved in the last 10s — e.g. an agent re-emitting the tool call — return
+   * that existing id instead of INSERTing a second row (avoids duplicate cards for one request).
+   */
   async saveProposal(
     userId: string,
     event: ProposedEvent,
@@ -58,10 +64,16 @@ export class CalendarService {
     conflicts: { title: string; at: string }[],
     kind: 'event' | 'task' = 'event',
   ): Promise<string> {
+    const eventJson = JSON.stringify(event);
+    const dupe = await this.pg.query(
+      `SELECT id FROM calendar_proposals WHERE user_id=$1 AND created_at > now() - interval '10 seconds' AND event = $2::jsonb LIMIT 1`,
+      [userId, eventJson],
+    );
+    if (dupe.rows[0]) return dupe.rows[0].id;
     const id = randomUUID();
     await this.pg.query(
       `INSERT INTO calendar_proposals (id, user_id, event, connected, conflicts, kind) VALUES ($1,$2,$3::jsonb,$4,$5::jsonb,$6)`,
-      [id, userId, JSON.stringify(event), connected, JSON.stringify(conflicts), kind],
+      [id, userId, eventJson, connected, JSON.stringify(conflicts), kind],
     );
     return id;
   }
@@ -69,10 +81,28 @@ export class CalendarService {
   async getProposal(
     userId: string,
     id: string,
-  ): Promise<{ event: ProposedEvent; connected: boolean; conflicts: { title: string; at: string }[]; kind: 'event' | 'task' } | null> {
+  ): Promise<{
+    event: ProposedEvent;
+    connected: boolean;
+    conflicts: { title: string; at: string }[];
+    kind: 'event' | 'task';
+    occurrenceCount: number;
+    firstAt?: string;
+    lastAt?: string;
+  } | null> {
     const r = await this.pg.query(`SELECT event, connected, conflicts, kind FROM calendar_proposals WHERE id = $1 AND user_id = $2`, [id, userId]);
     const row = r.rows[0];
-    return row ? { event: row.event, connected: row.connected, conflicts: row.conflicts, kind: row.kind } : null;
+    if (!row) return null;
+    const occ = expandOccurrences(row.event);
+    return {
+      event: row.event,
+      connected: row.connected,
+      conflicts: row.conflicts,
+      kind: row.kind,
+      occurrenceCount: occ.length,
+      firstAt: occ[0],
+      lastAt: occ[occ.length - 1],
+    };
   }
 
   private async creds(userId: string): Promise<CalendarCreds | null> {
@@ -136,21 +166,47 @@ export class CalendarService {
     return out.sort((a, b) => a.at.localeCompare(b.at));
   }
 
+  /**
+   * Series-aware conflict check: expand every occurrence (single datetime / recurrence / dates —
+   * see expandOccurrences), then do ONE listEvents call spanning the whole range (earliest
+   * occurrence -3h .. latest occurrence + duration + 3h) rather than one round-trip per occurrence.
+   * Each occurrence is then checked for overlap against every listed event; matches are merged and
+   * deduped (by uid, falling back to title+at for uid-less sources).
+   */
   async findConflicts(userId: string, event: ProposedEvent): Promise<CalEvent[]> {
-    const at = new Date(`${event.datetime}${OFFSET}`);
-    const start = new Date(at.getTime() - 3 * 60 * 60_000);
-    const end = new Date(at.getTime() + (event.durationMin ?? 60) * 60_000 + 3 * 60 * 60_000);
+    const occ = expandOccurrences(event);
+    if (occ.length === 0) return [];
+    const durationMin = event.durationMin ?? 60;
+    const occInstants = occ.map((o) => new Date(`${o}${OFFSET}`).getTime());
+    const start = new Date(Math.min(...occInstants) - 3 * 60 * 60_000);
+    const end = new Date(Math.max(...occInstants) + durationMin * 60_000 + 3 * 60 * 60_000);
     const events = await this.listEvents(userId, start, end);
-    return events.filter((e) => overlaps(event, e));
+
+    const seen = new Set<string>();
+    const matches: CalEvent[] = [];
+    for (const o of occ) {
+      const proposedOcc: ProposedEvent = { ...event, datetime: o, recurrence: undefined, dates: undefined };
+      for (const e of events) {
+        if (!overlaps(proposedOcc, e)) continue;
+        const key = e.uid ?? `${e.title}|${e.at}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        matches.push(e);
+      }
+    }
+    return matches;
   }
 
-  async createEvent(userId: string, event: ProposedEvent): Promise<{ ok: boolean; uid?: string; error?: string }> {
+  async createEvent(
+    userId: string,
+    event: ProposedEvent,
+  ): Promise<{ ok: boolean; created?: number; failed?: number; uids?: string[]; error?: string }> {
     const creds = await this.creds(userId);
     if (!creds) return { ok: false, error: 'Календарь не подключён' };
     try {
-      const { uid } = await this.connector.createEvent(creds, event);
-      this.onWrite?.(userId); // optimistic: refresh co-pilot surface now
-      return { ok: true, uid };
+      const { created, failed, uids, error } = await this.connector.createEvent(creds, event);
+      if (created > 0) this.onWrite?.(userId); // optimistic: refresh co-pilot surface now
+      return { ok: created > 0, created, failed, uids, error };
     } catch (e: any) {
       this.logger.error(`createEvent failed: ${e.message}`);
       return { ok: false, error: 'Не удалось записать событие' };
