@@ -7,6 +7,7 @@ import { VideoService, InsufficientTokensError } from '../video/video.service';
 import { CreateVideoJobDto } from '../video/video.dto';
 import { RoutineStore, ENERGY_PROMPT } from '../routine-push/routine-store.service';
 import { CalendarService } from '../calendar/calendar.service';
+import { Recurrence, expandOccurrences } from '../calendar/recurrence';
 
 export const CHAT_TOOLS = [
   {
@@ -170,12 +171,17 @@ export const CHAT_TOOLS = [
   {
     name: 'propose_calendar_event',
     description:
-      'ПРЕДЛОЖИТЬ пользователю добавить событие/задачу с датой-временем в его календарь (ты НЕ пишешь сам — только предлагаешь карточкой, пользователь подтверждает). ' +
+      'ПРЕДЛОЖИТЬ пользователю добавить событие/задачу (в т.ч. СЕРИЮ повторяющихся событий или набор дат) с датой-временем в его календарь ' +
+      '(ты НЕ пишешь сам — только предлагаешь карточкой, пользователь подтверждает). ' +
       'Вызывай, когда в разговоре появляется конкретное дело с датой/временем (встреча, выезд, дедлайн, дело из плана) — ИЛИ дело без фиксированного времени, которое стоит просто держать в списке. ' +
       'Чат идёт как обычно — это ДОБАВОЧНОЕ предложение. НЕ говори «добавил/внёс в календарь», пока пользователь не подтвердил и не пришёл ok. ' +
       'Если календарь не подключён (в результате connected=false) — тактично предложи подключить календарь, чтобы планировать время через Линкеон, не только общаться.\n' +
       '• title — краткое название.\n• kind — "event" (по умолчанию) для встречи/звонка/приёма с конкретным временем, или "task" если у дела нет фиксированного времени и его можно просто "выполнить"/отметить сделанным (кладём в задачи "Мои дела").\n' +
-      '• datetime — локальное время ISO без зоны, напр. "2026-07-20T15:00:00". Для kind="event" обязательно; для kind="task" необязательно (подсказка по сроку/дедлайну).\n' +
+      'КАК ЗАДАТЬ ВРЕМЯ (для kind="event" — ровно один способ из трёх, не смешивай):\n' +
+      '  1) Одноразовое конкретное время → только datetime.\n' +
+      '  2) Регулярный повтор по правилу (каждый будний день, каждый понедельник, раз в N дней и т.п.) → recurrence + datetime = время ПЕРВОГО вхождения серии.\n' +
+      '  3) Набор конкретных, но НЕ регулярных дат (напр. «во вторник и в пятницу», разрозненные даты без единого правила) → dates (массив ISO-datetime), datetime/recurrence не заполняй.\n' +
+      'ВАЖНО: даже если пользователь просит повторяющееся или несколько дел сразу — вызови этот инструмент ОДИН РАЗ на весь запрос (через recurrence или dates), НЕ вызывай его по одному разу на каждую дату.\n' +
       '• durationMin — длительность в минутах, только для event (по умолчанию 60).\n• note — короткая заметка (необязательно).',
     input_schema: {
       type: 'object',
@@ -188,7 +194,39 @@ export const CHAT_TOOLS = [
           description:
             'Если у дела нет фиксированного времени и его можно "выполнить"/отметить сделанным — kind="task" (кладём в задачи "Мои дела"). Встреча/звонок/приём с конкретным временем — kind="event".',
         },
-        datetime: { type: 'string', description: 'ISO локальное время без зоны, напр. "2026-07-20T15:00:00". Обязательно для kind="event"; для kind="task" — необязательный ориентир по сроку.' },
+        datetime: {
+          type: 'string',
+          description:
+            'ISO локальное время без зоны, напр. "2026-07-20T15:00:00". Для kind="event" без recurrence/dates — обязательно (разовое событие). ' +
+            'Вместе с recurrence — это время ПЕРВОГО вхождения серии (тоже обязательно). Вместе с dates — не заполняй, используй сам массив dates. ' +
+            'Для kind="task" — необязательный ориентир по сроку.',
+        },
+        recurrence: {
+          type: 'object',
+          description:
+            'Регулярный ПОВТОР события по правилу (каждый будний день / раз в неделю по понедельникам / раз в 2 дня и т.д.). ' +
+            'Только для kind="event". Передавай ВМЕСТЕ с datetime (время первого вхождения). НЕ используй одновременно с dates. ' +
+            'Если повтор нерегулярный (разрозненные даты без общего правила) — используй dates вместо recurrence.',
+          properties: {
+            freq: { type: 'string', enum: ['daily', 'weekly'], description: '"daily" — каждый N-й день; "weekly" — по дням недели из byDay, каждые N недель.' },
+            byDay: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Только для freq="weekly": дни недели MO,TU,WE,TH,FR,SA,SU. Напр. ["MO","TU","WE","TH","FR"] для будних дней. Если пусто — берётся день недели datetime.',
+            },
+            interval: { type: 'number', description: 'Шаг повтора, по умолчанию 1 (напр. interval=2 у weekly — через неделю, у daily — через день).' },
+            count: { type: 'number', description: 'Сколько раз повторить, 1..100. Укажи РОВНО ОДНО из count/until.' },
+            until: { type: 'string', description: 'Дата окончания повтора включительно, напр. "2026-08-21" (без времени). Укажи РОВНО ОДНО из count/until.' },
+          },
+        },
+        dates: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Набор КОНКРЕТНЫХ нерегулярных дат-времени для одного и того же дела (когда нет единого правила повтора). ' +
+            'Каждый элемент — ISO локальное время без зоны, как в datetime. Только для kind="event", НЕ используй одновременно с datetime/recurrence. ' +
+            'Максимум 100 элементов. Передай их ВСЕ одним вызовом инструмента — не вызывай инструмент по одному разу на каждую дату.',
+        },
         durationMin: { type: 'number', description: 'Длительность, мин (по умолчанию 60). Только для kind="event".' },
         note: { type: 'string' },
       },
@@ -225,11 +263,59 @@ export type ToolResult =
       kind: 'calendar_proposal';
       proposalId: string;
       itemKind: 'event' | 'task';
-      event: { title: string; datetime?: string; durationMin?: number; note?: string };
+      event: { title: string; datetime?: string; durationMin?: number; note?: string; recurrence?: Recurrence; dates?: string[] };
       connected: boolean;
       conflicts: { title: string; at: string }[];
+      occurrenceCount?: number;
     }
   | { ok: false; error: string; [k: string]: any };
+
+/**
+ * Pure validation for propose_calendar_event's time-spec (Task 3 of the recurring-calendar plan).
+ * `kind==='task'` is unconstrained (datetime optional, recurrence/dates ignored — unchanged pre-existing
+ * behaviour). `kind==='event'` must pick EXACTLY ONE way to say "when": a plain `datetime`, a `recurrence`
+ * (which itself requires `datetime` as the series' first occurrence — that pairing counts as ONE choice,
+ * not two), or a `dates` list. `recurrence` additionally requires exactly one of `count`/`until`, with
+ * `count` (when given) an integer 1..100. `dates` (when given) must be non-empty and ≤100 entries.
+ */
+export function validateProposedEvent(input: {
+  kind: 'event' | 'task';
+  datetime?: string;
+  recurrence?: Recurrence;
+  dates?: string[];
+}): { ok: true } | { ok: false; error: string } {
+  const { kind, datetime, recurrence, dates } = input;
+  if (kind === 'task') return { ok: true };
+
+  const hasRecurrence = recurrence !== undefined && recurrence !== null;
+  const hasDates = dates !== undefined && dates !== null;
+  // `datetime` only counts as its own "way to say when" if it's not the mandatory start of a
+  // recurrence — otherwise datetime+recurrence would wrongly look like two specs.
+  const hasPlainDatetime = !!datetime && !hasRecurrence;
+  const specsCount = (hasRecurrence ? 1 : 0) + (hasDates ? 1 : 0) + (hasPlainDatetime ? 1 : 0);
+  if (specsCount !== 1) {
+    return { ok: false, error: 'Укажи ровно один способ времени для события: datetime (разово), recurrence (регулярный повтор) или dates (набор дат)' };
+  }
+
+  if (hasRecurrence) {
+    if (!datetime) return { ok: false, error: 'recurrence требует datetime — время первого вхождения серии' };
+    const hasCount = recurrence!.count !== undefined && recurrence!.count !== null;
+    const hasUntil = recurrence!.until !== undefined && recurrence!.until !== null;
+    if (hasCount === hasUntil) {
+      return { ok: false, error: 'Укажи ровно одно из recurrence.count или recurrence.until' };
+    }
+    if (hasCount && (!Number.isInteger(recurrence!.count) || recurrence!.count! < 1 || recurrence!.count! > 100)) {
+      return { ok: false, error: 'recurrence.count должен быть целым числом от 1 до 100' };
+    }
+  }
+
+  if (hasDates) {
+    if (!Array.isArray(dates) || dates.length === 0) return { ok: false, error: 'dates не должен быть пустым' };
+    if (dates.length > 100) return { ok: false, error: 'dates: максимум 100 элементов' };
+  }
+
+  return { ok: true };
+}
 
 @Injectable()
 export class ChatToolsService {
@@ -452,23 +538,31 @@ export class ChatToolsService {
       if (name === 'propose_calendar_event') {
         const kind: 'event' | 'task' = input?.kind === 'task' ? 'task' : 'event';
         const rawDatetime = input?.datetime ? String(input.datetime) : '';
+        const recurrence: Recurrence | undefined = input?.recurrence && typeof input.recurrence === 'object' ? input.recurrence : undefined;
+        const dates: string[] | undefined = Array.isArray(input?.dates) ? input.dates.map((d: any) => String(d)) : undefined;
         const event = {
           title: String(input?.title || '').trim(),
           datetime: rawDatetime || undefined,
           durationMin: input?.durationMin,
           note: input?.note,
+          recurrence,
+          dates,
         };
         if (!event.title) return { ok: false, error: 'title обязателен' };
-        if (kind === 'event' && !event.datetime) return { ok: false, error: 'title и datetime обязательны для события' };
+        const validation = validateProposedEvent({ kind, datetime: event.datetime, recurrence: event.recurrence, dates: event.dates });
+        if (validation.ok === false) return { ok: false, error: validation.error };
+        const occ = expandOccurrences(event);
+        const occurrenceCount = occ.length;
         const status = await this.calendar.getStatus(userId);
         const connected = status.connected;
         // Conflicts only make sense when there's a concrete point in time to collide with —
-        // task without datetime has nothing to check against.
+        // task without datetime has nothing to check against. Series-awareness (checking every
+        // occurrence, not just the first) is Task 4 — findConflicts still takes the raw event here.
         const conflicts = connected && event.datetime
           ? (await this.calendar.findConflicts(userId, event as any)).map((c) => ({ title: c.title, at: c.at }))
           : [];
         const proposalId = await this.calendar.saveProposal(userId, event as any, connected, conflicts, kind);
-        return { ok: true, kind: 'calendar_proposal', proposalId, itemKind: kind, event, connected, conflicts };
+        return { ok: true, kind: 'calendar_proposal', proposalId, itemKind: kind, event, connected, conflicts, occurrenceCount };
       }
 
       return { ok: false, error: `unknown tool: ${name}` };
