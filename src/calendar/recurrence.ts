@@ -65,7 +65,10 @@ export function expandOccurrences(e: { datetime?: string; recurrence?: Recurrenc
         // weekly
         const dayCode = DOW[curDow];
         const dayMatches = byDay && byDay.length > 0 ? byDay.includes(dayCode) : curDow === startDow;
-        const weekIndex = Math.floor(dayOffset / 7);
+        // RFC 5545 counts WEEKLY INTERVAL in WKST (Monday-default) weeks, NOT in 7-day windows
+        // from DTSTART. Bucket by whole Monday-weeks between this date and the start so INTERVAL>1
+        // agrees with how Yandex actually expands the RRULE. `(dow+6)%7` = days since Monday.
+        const weekIndex = Math.round((dayOffset - ((curDow + 6) % 7) + ((startDow + 6) % 7)) / 7);
         matches = dayMatches && weekIndex % step === 0;
       }
       if (matches) {

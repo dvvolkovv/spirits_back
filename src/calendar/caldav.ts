@@ -233,7 +233,9 @@ export class YandexCalDavConnector implements CalendarConnector {
       let failed = 0;
       let error: string | undefined;
       const uids: string[] = [];
-      for (const d of event.dates) {
+      // Cap defensively: the chat tool validates dates ≤ 100, but the REST write endpoint takes
+      // the body raw — never fire an unbounded run of sequential CalDAV PUTs.
+      for (const d of event.dates.slice(0, 100)) {
         const uid = randomUUID();
         const single: ProposedEvent = { ...event, datetime: d, recurrence: undefined, dates: undefined };
         const r = await this.putVEvent(creds, base, single, uid);

@@ -20,6 +20,16 @@ describe('expandOccurrences', () => {
       recurrence: { freq: 'daily', interval: 2, count: 3 } });
     expect(occ).toEqual(['2026-08-17T10:00:00','2026-08-19T10:00:00','2026-08-21T10:00:00']);
   });
+  it('weekly interval 2 buckets by WKST (Monday) weeks, not 7-day windows from DTSTART', () => {
+    // DTSTART Wed 2026-08-19, every 2nd week on Mon+Wed. Mon 2026-08-24 is in the NEXT
+    // Monday-week (interval-skipped) — it must NOT be emitted (matches Yandex's RRULE).
+    const occ = expandOccurrences({ datetime: '2026-08-19T10:00:00',
+      recurrence: { freq: 'weekly', byDay: ['MO','WE'], interval: 2, count: 4 } });
+    expect(occ).toContain('2026-08-19T10:00:00'); // Wed, week 0
+    expect(occ).not.toContain('2026-08-24T10:00:00'); // Mon, week 1 — skipped by interval 2
+    expect(occ).toContain('2026-08-31T10:00:00'); // Mon, week 2 — emitted
+    expect(occ).toContain('2026-09-02T10:00:00'); // Wed, week 2
+  });
   it('explicit dates sorted', () => {
     expect(expandOccurrences({ dates: ['2026-08-19T09:00:00','2026-08-17T09:00:00'] }))
       .toEqual(['2026-08-17T09:00:00','2026-08-19T09:00:00']);

@@ -558,7 +558,11 @@ export class ChatToolsService {
         // Conflicts only make sense when there's a concrete point in time to collide with —
         // task without datetime has nothing to check against. Series-awareness (checking every
         // occurrence, not just the first) is Task 4 — findConflicts still takes the raw event here.
-        const conflicts = connected && event.datetime
+        // Check conflicts for any EVENT that has occurrences — single datetime, a recurrence
+        // (which carries datetime), OR a dates-only series (no top-level datetime). The old
+        // `event.datetime` guard silently skipped conflict detection for dates-only series.
+        const hasOccurrences = !!event.datetime || !!(event.dates && event.dates.length);
+        const conflicts = connected && kind === 'event' && hasOccurrences
           ? (await this.calendar.findConflicts(userId, event as any)).map((c) => ({ title: c.title, at: c.at }))
           : [];
         const proposalId = await this.calendar.saveProposal(userId, event as any, connected, conflicts, kind);
