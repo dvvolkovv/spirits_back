@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { ProvisionInput, ProvisionResult, RefreshResult } from './talerid.types';
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -30,7 +30,10 @@ export function toE164(phone: string): string {
  */
 @Injectable()
 export class TalerIdOauthClient {
-  constructor(private readonly fetchFn: FetchLike = globalThis.fetch as FetchLike) {}
+  // @Optional so Nest DI injects `undefined` (no provider for a bare Function token) → the
+  // default globalThis.fetch applies at boot; tests still pass a mock explicitly. Without this
+  // the whole app fails to boot ("can't resolve dependencies of TalerIdOauthClient").
+  constructor(@Optional() private readonly fetchFn: FetchLike = globalThis.fetch as FetchLike) {}
 
   private baseUrl(): string {
     return process.env.TALERID_BASE_URL || 'https://staging.id.taler.tirol';
