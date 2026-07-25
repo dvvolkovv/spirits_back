@@ -314,9 +314,9 @@ export class ChatService {
     try {
       const r = await this.claudeCli.textWithCost(fullPrompt, {
         system: systemPrompt,
-        // 'opus' — алиас последнего Opus (сейчас claude-opus-5); заметно дороже
-        // Haiku, биллинг юзеру идёт от costUsd, так что цена сообщения вырастет.
-        model: 'opus',
+        // 'default' — рекомендуемая модель CLI (сейчас Opus 5, при исчерпании
+        // лимита подписки сам даунгрейдится). Биллинг юзеру идёт от costUsd.
+        model: 'default',
         timeoutMs: 90_000,
       });
       rawText = r.text || '';
