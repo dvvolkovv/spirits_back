@@ -3,17 +3,19 @@ import { CommonModule } from '../common/common.module';
 import { TalerIdStoreService } from './talerid-store.service';
 import { TalerIdOauthClient } from './talerid-oauth.client';
 import { TalerIdOauthService } from './talerid-oauth.service';
+import { TalerIdCalendarConnector } from './talerid-calendar.connector';
 
 /**
  * TalerID reference connector (see docs/superpowers/plans/2026-07-25-talerid-connector-linkeon.md).
  * Task 1 ships the connection store, Task 2 the HTTP client, Task 3 the token
- * service (rotation-safe refresh) gluing them together. Later tasks extend
- * this module with the MCP calendar connector and the connect/status/disconnect
- * controller.
+ * service (rotation-safe refresh) gluing them together, Task 4 the MCP calendar
+ * connector (list/create events over TalerID's stateless Streamable HTTP MCP).
+ * A later task extends this module with the co-pilot aggregation/write-routing
+ * and the connect/status/disconnect controller.
  */
 @Module({
   imports: [CommonModule],
-  providers: [TalerIdStoreService, TalerIdOauthClient, TalerIdOauthService],
-  exports: [TalerIdStoreService, TalerIdOauthService],
+  providers: [TalerIdStoreService, TalerIdOauthClient, TalerIdOauthService, TalerIdCalendarConnector],
+  exports: [TalerIdStoreService, TalerIdOauthService, TalerIdCalendarConnector],
 })
 export class TalerIdModule {}
