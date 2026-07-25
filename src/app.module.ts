@@ -41,6 +41,7 @@ import { AppOtaModule } from './app-ota/app-ota.module';
 import { AppWidgetModule } from './app-widget/app-widget.module';
 import { TripModule } from './trip/trip.module';
 import { CalendarModule } from './calendar/calendar.module';
+import { TalerIdModule } from './talerid/talerid.module';
 
 @Module({
   imports: [
@@ -86,6 +87,7 @@ import { CalendarModule } from './calendar/calendar.module';
     AppWidgetModule,
     TripModule,
     CalendarModule,
+    TalerIdModule,
   ],
 })
 export class AppModule {}
