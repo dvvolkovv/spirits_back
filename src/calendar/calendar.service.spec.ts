@@ -26,7 +26,9 @@ describe('overlaps', () => {
 describe('CalendarService.createEvent — write-scoping (no cross-user writes)', () => {
   it('is scoped to the passed userId and fails closed when that user has no connection', async () => {
     const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
-    const service = new CalendarService(pg as any);
+    const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
+    const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
 
     const result = await service.createEvent('userB', { title: 'x', datetime: '2026-07-20T15:00:00' });
 
@@ -39,7 +41,9 @@ describe('CalendarService.createEvent — write-scoping (no cross-user writes)',
 
   it("never reaches another user's (the owner's) connection while creating an event for userB", async () => {
     const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
-    const service = new CalendarService(pg as any);
+    const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
+    const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
 
     await service.createEvent('userB', { title: 'x', datetime: '2026-07-20T15:00:00' });
 
@@ -58,7 +62,9 @@ describe('CalendarService.createEvent — write-scoping (no cross-user writes)',
 describe('CalendarService.setTaskDone — write-scoping (no cross-user writes)', () => {
   it('is scoped to the passed userId and fails closed when that user has no connection', async () => {
     const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
-    const service = new CalendarService(pg as any);
+    const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
+    const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
 
     const result = await service.setTaskDone('userB', 'uid', true);
 
@@ -71,7 +77,9 @@ describe('CalendarService.setTaskDone — write-scoping (no cross-user writes)',
 
   it("never reaches another user's (the owner's) connection while setting a task done for userB", async () => {
     const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
-    const service = new CalendarService(pg as any);
+    const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
+    const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
 
     await service.setTaskDone('userB', 'uid', true);
 

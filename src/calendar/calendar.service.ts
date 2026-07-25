@@ -6,6 +6,8 @@ import { CalEvent, CalendarCreds, ProposedEvent, ProposedTask, Task } from './ca
 import { fetchCalendarEvents } from '../trip/calendar'; // read-only ICS sources (T6)
 import { encryptSecret, decryptSecret } from './crypto';
 import { expandOccurrences } from './recurrence';
+import { TalerIdStoreService } from '../talerid/talerid-store.service';
+import { TalerIdCalendarConnector } from '../talerid/talerid-calendar.connector';
 
 const OFFSET = '+05:00';
 
@@ -25,7 +27,26 @@ export class CalendarService {
   /** cache-bust hook set by TripService so an optimistic write refreshes the co-pilot surface. */
   onWrite?: (userId: string) => void;
 
-  constructor(private readonly pg: PgService) {}
+  constructor(
+    private readonly pg: PgService,
+    private readonly talerIdStore: TalerIdStoreService,
+    private readonly talerIdConnector: TalerIdCalendarConnector,
+  ) {}
+
+  /**
+   * Best-effort "is TalerID the connected ecosystem for this user" check. Wrapped defensively —
+   * a store failure must never break the (Yandex) calendar path, it just means we treat the user
+   * as TalerID-not-connected for this call.
+   */
+  private async talerIdConnected(userId: string): Promise<boolean> {
+    try {
+      const conn = await this.talerIdStore.getConnection(userId);
+      return conn?.status === 'connected';
+    } catch (e: any) {
+      this.logger.error(`talerid getConnection failed: ${e.message}`);
+      return false;
+    }
+  }
 
   async ensureTable(): Promise<void> {
     await this.pg.query(
@@ -150,7 +171,13 @@ export class CalendarService {
     this.onWrite?.(userId); // disconnecting also changes the co-pilot view — bust the cache
   }
 
-  /** All events in [start,end): the CalDAV connection (live) + read-only ICS sources (trip_calendars). */
+  /**
+   * All events in [start,end): the CalDAV connection (live) + read-only ICS sources
+   * (trip_calendars) + TalerID (if connected). This union is what feeds the co-pilot
+   * (TripService reads via this method), so a connected TalerID account automatically
+   * flows into the co-pilot surface with no trip.service changes needed.
+   * No cross-source dedup (out of scope — plan §10.5, simple union).
+   */
   async listEvents(userId: string, start: Date, end: Date): Promise<CalEvent[]> {
     const out: CalEvent[] = [];
     const creds = await this.creds(userId);
@@ -163,6 +190,11 @@ export class CalendarService {
       const sources = icsRows.rows.map((r: any) => ({ url: r.url, source: r.kind }));
       if (sources.length) out.push(...(await fetchCalendarEvents(sources, start, end)));
     } catch (e: any) { this.logger.error(`ics list failed: ${e.message}`); }
+    try {
+      if (await this.talerIdConnected(userId)) {
+        out.push(...(await this.talerIdConnector.listEvents(userId, start, end)));
+      }
+    } catch (e: any) { this.logger.error(`talerid list failed: ${e.message}`); } // defensive — connector already degrades to [] on its own
     return out.sort((a, b) => a.at.localeCompare(b.at));
   }
 
@@ -197,10 +229,28 @@ export class CalendarService {
     return matches;
   }
 
+  /**
+   * Write-target routing (card flow): default is "TalerID if connected, else Yandex" — there is
+   * no per-user target-pref column in this slice (plan §Task5 keeps it simple); if a future slice
+   * needs an explicit choice when BOTH are connected, that preference would plug in right here.
+   * Recurrence: Yandex keeps writing RRULE as before; TalerID has none, so its connector expands
+   * the series into N single-event creates internally (see TalerIdCalendarConnector.createEvent).
+   */
   async createEvent(
     userId: string,
     event: ProposedEvent,
   ): Promise<{ ok: boolean; created?: number; failed?: number; uids?: string[]; error?: string }> {
+    if (await this.talerIdConnected(userId)) {
+      try {
+        const { created, failed, ids } = await this.talerIdConnector.createEvent(userId, event);
+        if (created > 0) this.onWrite?.(userId); // optimistic: refresh co-pilot surface now
+        return { ok: created > 0, created, failed, uids: ids };
+      } catch (e: any) {
+        this.logger.error(`talerid createEvent failed: ${e.message}`);
+        return { ok: false, error: 'Не удалось записать событие' };
+      }
+    }
+
     const creds = await this.creds(userId);
     if (!creds) return { ok: false, error: 'Календарь не подключён' };
     try {
