@@ -82,6 +82,7 @@ export class TalerIdCalendarConnector {
       const text = result?.content?.[0]?.text;
       return typeof text === 'string' ? JSON.parse(text) : text;
     } finally {
+      try { await client.close(); } catch { /* best-effort cleanup */ }
       try { await transport.close(); } catch { /* best-effort cleanup */ }
     }
   }
@@ -96,13 +97,18 @@ export class TalerIdCalendarConnector {
       const out: CalEvent[] = [];
       for (const ev of events) {
         if (!ev?.startAt) continue;
+        const startMs = new Date(ev.startAt).getTime();
+        if (Number.isNaN(startMs)) continue; // skip ONE malformed row, keep the rest (don't drop the batch)
         const item: CalEvent = {
-          at: new Date(ev.startAt).toISOString(),
+          at: new Date(startMs).toISOString(),
           title: String(ev.title || '').trim() || 'Событие',
           source: 'talerid',
           uid: ev.id,
         };
-        if (ev.endAt) item.end = new Date(ev.endAt).toISOString();
+        if (ev.endAt) {
+          const endMs = new Date(ev.endAt).getTime();
+          if (!Number.isNaN(endMs)) item.end = new Date(endMs).toISOString();
+        }
         out.push(item);
       }
       return out;

@@ -244,7 +244,8 @@ export class CalendarService {
       try {
         const { created, failed, ids } = await this.talerIdConnector.createEvent(userId, event);
         if (created > 0) this.onWrite?.(userId); // optimistic: refresh co-pilot surface now
-        return { ok: created > 0, created, failed, uids: ids };
+        // Mirror the Yandex shape: on total failure give the card UI something to show.
+        return { ok: created > 0, created, failed, uids: ids, error: created > 0 ? undefined : 'Не удалось записать событие' };
       } catch (e: any) {
         this.logger.error(`talerid createEvent failed: ${e.message}`);
         return { ok: false, error: 'Не удалось записать событие' };

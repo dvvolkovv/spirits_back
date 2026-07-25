@@ -180,6 +180,35 @@ describe('TalerIdOauthService', () => {
       expect(store.updateAccess).toHaveBeenCalledTimes(1);
     });
 
+    it('concurrent calls with expired access share ONE refresh (single-flight, rotation-safe)', async () => {
+      const pastExpiry = new Date(Date.now() - 60 * 1000);
+      const store = makeStore({
+        getConnection: jest.fn().mockResolvedValue({
+          userId: 'user-1', taleridUserId: 'tid-1', scopes: 'mcp:calendar', status: 'connected', accessExpiresAt: pastExpiry,
+        }),
+        getAccess: jest.fn().mockResolvedValue({ accessToken: 'stale-access', expiresAt: pastExpiry }),
+        getRefresh: jest.fn().mockResolvedValue('old-refresh'),
+      });
+      let resolveRefresh: (v: any) => void = () => {};
+      const client = makeClient({
+        refresh: jest.fn().mockImplementation(() => new Promise((res) => { resolveRefresh = res; })),
+      });
+      const service = new TalerIdOauthService(store, client);
+
+      const p1 = service.getBackendAccessToken('user-1');
+      const p2 = service.getBackendAccessToken('user-1');
+      await new Promise((r) => setImmediate(r)); // let both reach the single-flight
+      resolveRefresh({ accessToken: 'new-access', refreshToken: 'new-refresh', expiresIn: 900, scope: 'mcp:calendar' });
+      const [r1, r2] = await Promise.all([p1, p2]);
+
+      // The whole point: the rotated refresh is presented to TalerID only ONCE.
+      expect(client.refresh).toHaveBeenCalledTimes(1);
+      expect(store.updateRefresh).toHaveBeenCalledTimes(1);
+      expect(store.updateRefresh).toHaveBeenCalledWith('user-1', 'new-refresh');
+      expect(r1).toBe('new-access');
+      expect(r2).toBe('new-access');
+    });
+
     it('no stored access at all (absent) → calls refresh and returns new access', async () => {
       const store = makeStore({
         getConnection: jest.fn().mockResolvedValue({

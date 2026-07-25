@@ -36,6 +36,8 @@ const EXPIRY_SKEW_MS = 60_000;
 @Injectable()
 export class TalerIdOauthService {
   private readonly logger = new Logger(TalerIdOauthService.name);
+  /** Per-user in-flight refresh (single-flight) — see getBackendAccessToken. */
+  private readonly refreshInFlight = new Map<string, Promise<string | null>>();
 
   constructor(
     private readonly store: TalerIdStoreService,
@@ -75,10 +77,37 @@ export class TalerIdOauthService {
     const connection = await this.store.getConnection(userId);
     if (!connection || connection.status !== 'connected') return null;
 
+    const fresh = await this.freshStoredAccess(userId);
+    if (fresh) return fresh;
+
+    // Single-flight the refresh per user. TalerID rotates the refresh on every
+    // exchange (rotateRefreshToken=true) and revokes the WHOLE grant chain if the
+    // old, now-rotated refresh is presented twice — so concurrent callers (co-pilot
+    // union + a card write, two surface loads, …) must share ONE refresh, not race
+    // two of them. In-process map is correct for our single PM2 instance; a
+    // multi-replica deploy would need a DB compare-and-swap instead.
+    const inFlight = this.refreshInFlight.get(userId);
+    if (inFlight) return inFlight;
+
+    const p = this.doRefresh(userId).finally(() => this.refreshInFlight.delete(userId));
+    this.refreshInFlight.set(userId, p);
+    return p;
+  }
+
+  /** Stored access token if still valid (minus skew), else null. */
+  private async freshStoredAccess(userId: string): Promise<string | null> {
     const stored = await this.store.getAccess(userId);
     if (stored?.accessToken && stored.expiresAt && stored.expiresAt.getTime() - EXPIRY_SKEW_MS > Date.now()) {
       return stored.accessToken;
     }
+    return null;
+  }
+
+  private async doRefresh(userId: string): Promise<string | null> {
+    // Re-check inside the single-flight: another flight may have just refreshed
+    // while we waited for the slot — never present an already-rotated refresh.
+    const fresh = await this.freshStoredAccess(userId);
+    if (fresh) return fresh;
 
     const refreshToken = await this.store.getRefresh(userId);
     if (!refreshToken) return null;
