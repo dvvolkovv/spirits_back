@@ -8,6 +8,7 @@ import { ClaudeAgentService } from './claude-agent.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { TasksService } from '../tasks/tasks.service';
 import { EventsService } from '../events/events.service';
+import { TalerIdOauthService } from '../talerid/talerid-oauth.service';
 import axios from 'axios';
 import { Request, Response } from 'express';
 // Agent server at r.linkeon.io (remote Claude Code)
@@ -43,7 +44,30 @@ export class ChatService {
     private readonly claudeCli: ClaudeCliService,
     @Optional() private readonly tasksService?: TasksService,
     @Optional() private readonly events?: EventsService,
+    @Optional() private readonly talerIdOauth?: TalerIdOauthService,
   ) {}
+
+  /**
+   * Agent-direct: the TalerID fields to hand the file-agent for a connected user,
+   * or null when the user hasn't connected the ecosystem (a single cheap DB read
+   * for the vast majority). token = the full-scope access token (rotation-safe,
+   * cached); mcpUrl = the MCP endpoint of the env this backend points at, so the
+   * shared file-agent hits staging vs api.talerid.io correctly. Never throws —
+   * a mint failure degrades to null (agent runs without TalerID tools).
+   */
+  async taleridAgentFields(userId: string): Promise<{ token: string; mcpUrl: string } | null> {
+    if (!this.talerIdOauth) return null;
+    let token: string | null = null;
+    try {
+      token = await this.talerIdOauth.getBackendAccessToken(userId);
+    } catch (e: any) {
+      this.logger.warn(`talerid token mint failed for ${userId}: ${e?.message}`);
+      return null;
+    }
+    if (!token) return null;
+    const base = (process.env.TALERID_BASE_URL || 'https://staging.id.taler.tirol').replace(/\/$/, '');
+    return { token, mcpUrl: `${base}/mcp` };
+  }
 
   // Эвристика англ-утечки: длинный ответ, в котором почти нет кириллицы (после
   // вырезания кода/URL) — вероятно, ассистент «съехал» на английский или утёк
@@ -688,6 +712,18 @@ export class ChatService {
         // разговоры) в «чистый лист» мимо наших блокировок. Fresh-сессия
         // получает на relay собственную чистую память.
         fd.append('sessionId', fresh && freshSessionId ? freshSessionId : `${userId}_${assistantId}`);
+
+        // Agent-direct TalerID: when the user connected the TalerID ecosystem, hand
+        // the file-agent a full-scope access token + the MCP base URL of the env we
+        // point at (staging vs api.talerid.io). The file-agent injects a per-session
+        // MCP config and allowlists ONLY notes/messages tools — NEVER calendar (that
+        // stays on the backend-mediated card flow). Not connected → fields omitted →
+        // agent runs exactly as today.
+        const tid = await this.taleridAgentFields(userId);
+        if (tid) {
+          fd.append('talerid_token', tid.token);
+          fd.append('talerid_mcp_url', tid.mcpUrl);
+        }
 
         const agentRes = await axios.post(`${AGENT_URL}/chat`, fd, {
           headers: fd.getHeaders(),

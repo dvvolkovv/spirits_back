@@ -8,9 +8,10 @@ import { CommonModule } from '../common/common.module';
 import { VideoModule } from '../video/video.module';
 import { SmmModule } from '../smm/smm.module';
 import { CalendarModule } from '../calendar/calendar.module';
+import { TalerIdModule } from '../talerid/talerid.module';
 
 @Module({
-  imports: [MiscModule, CommonModule, VideoModule, SmmModule, CalendarModule],
+  imports: [MiscModule, CommonModule, VideoModule, SmmModule, CalendarModule, TalerIdModule],
   controllers: [ChatController],
   providers: [ChatService, ChatToolsService, ClaudeAgentService],
   exports: [ChatToolsService, ChatService],
