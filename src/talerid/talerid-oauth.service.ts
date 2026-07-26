@@ -15,32 +15,33 @@ function isProvisionFail(result: ProvisionResult): result is ProvisionFail {
   return result.ok === false;
 }
 
+/** Fallback grant if a stored connection predates the scopes column being set. */
+const CALENDAR_SCOPE = ['mcp:calendar'];
+
 /**
- * Full scope set Linkeon requests at connect time. TalerID grants the
- * INTERSECTION with the linkeon-partner client's allowedScopes, so this is
- * safe to request before TalerID widens the client: pre-widening it grants
- * calendar only (identical to the original calendar-only slice), post-widening
- * it grants notes/messages/mail too — with NO code change here. We always
- * store and refresh with the scope TalerID actually GRANTED (result.scope),
- * never this requested set, so a refresh never asks for more than the grant.
+ * The mcp: scopes Linkeon requests at connect time, from env `TALERID_SCOPES`
+ * (space-separated), defaulting to calendar only.
+ *
+ * ⚠️ MUST be a SUBSET of the linkeon-partner client's allowedScopes IN THIS ENV:
+ * TalerID's /partner/provision REJECTS (HTTP 400) a request containing any scope
+ * the client doesn't allow — it does NOT silently intersect (verified live
+ * 2026-07-26). So this is configured per-environment: PROD (calendar-only) leaves
+ * it at the default; DEV/test (calendar+notes+messages) sets
+ * `TALERID_SCOPES="mcp:calendar mcp:notes mcp:messages.read mcp:messages.send"`.
+ * When TalerID widens a client's allowedScopes, widen this env var there too.
  *
  * One token, not two: the same access token serves the backend calendar
  * connector AND the agent-direct path. The agent is prevented from touching
  * calendar not by a narrower token (a second refresh would rotate the shared
  * refresh and revoke the chain) but by the file-agent's `--allowedTools`
- * allowlist, which omits the talerid calendar tools. See the connector design
- * doc, section "ОДИН токен + tool-allowlist".
+ * allowlist. The token naturally carries only what THIS env granted, so on a
+ * calendar-only env the agent simply sees no notes/messages tools.
  */
-const ALL_SCOPES = [
-  'mcp:calendar',
-  'mcp:notes',
-  'mcp:messages.read',
-  'mcp:messages.send',
-  'mcp:mail.read',
-  'mcp:mail.send',
-];
-/** Fallback grant if a stored connection predates the scopes column being set. */
-const CALENDAR_SCOPE = ['mcp:calendar'];
+function requestedScopes(): string[] {
+  const raw = (process.env.TALERID_SCOPES || 'mcp:calendar').trim();
+  const parsed = raw.split(/\s+/).filter(Boolean);
+  return parsed.length ? parsed : CALENDAR_SCOPE;
+}
 
 /** Skew buffer: treat a stored access token as expired this many ms before its
  * real expiry, so we never hand a caller a token that dies mid-flight. */
@@ -73,7 +74,7 @@ export class TalerIdOauthService {
     email?: string,
     firstName?: string,
   ): Promise<TalerIdConnectionStatus> {
-    const result = await this.client.provision({ phone, email, firstName, scopes: ALL_SCOPES });
+    const result = await this.client.provision({ phone, email, firstName, scopes: requestedScopes() });
 
     if (isProvisionFail(result)) {
       // ambiguous (409, last-10 phone match) or error (401/403/5xx/network) —

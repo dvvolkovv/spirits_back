@@ -89,10 +89,19 @@ export class TalerIdCalendarConnector {
 
   async listEvents(userId: string, start: Date, end: Date): Promise<CalEvent[]> {
     try {
-      const raw = await this.callTool(userId, 'list_calendar_events', {
-        from: start.toISOString(),
-        to: end.toISOString(),
-      });
+      // TalerID's list_calendar_events filters on DATE-ONLY strings (YYYY-MM-DD),
+      // NOT full ISO datetimes — passing a datetime returns nothing on a real
+      // account (verified live: raw date-only query finds events, datetime finds
+      // 0). Callers pass precise Date windows (co-pilot day view, findConflicts
+      // intraday ±3h), so collapse to dates and guarantee to > from (an intraday
+      // window would otherwise give from==to and miss the day). Over-fetching to
+      // day granularity is harmless — callers re-filter by each event's precise at.
+      const from = start.toISOString().slice(0, 10);
+      let to = end.toISOString().slice(0, 10);
+      if (to <= from) {
+        to = new Date(new Date(`${from}T00:00:00Z`).getTime() + 86_400_000).toISOString().slice(0, 10);
+      }
+      const raw = await this.callTool(userId, 'list_calendar_events', { from, to });
       const events = Array.isArray(raw) ? raw : Array.isArray(raw?.events) ? raw.events : [];
       const out: CalEvent[] = [];
       for (const ev of events) {

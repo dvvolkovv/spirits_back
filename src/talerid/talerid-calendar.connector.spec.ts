@@ -28,9 +28,10 @@ describe('TalerIdCalendarConnector', () => {
       const end = new Date('2026-08-18T00:00:00Z');
       const result = await connector.listEvents('user-1', start, end);
 
+      // TalerID filters on DATE-ONLY strings, not ISO datetimes (see connector).
       expect(callTool).toHaveBeenCalledWith('user-1', 'list_calendar_events', {
-        from: start.toISOString(),
-        to: end.toISOString(),
+        from: '2026-08-17',
+        to: '2026-08-18',
       });
       expect(result).toEqual([
         {
@@ -41,6 +42,20 @@ describe('TalerIdCalendarConnector', () => {
           uid: 'evt-1',
         },
       ]);
+    });
+
+    it('intraday window (same UTC date) → to is bumped +1 day so the day is included', async () => {
+      const oauth = makeOauth();
+      const connector = new TalerIdCalendarConnector(oauth);
+      const callTool = jest.spyOn(connector as any, 'callTool').mockResolvedValue([]);
+
+      // 09:00..11:30 on the same day — both slice to 2026-08-17 → must bump `to`.
+      await connector.listEvents('user-1', new Date('2026-08-17T09:00:00Z'), new Date('2026-08-17T11:30:00Z'));
+
+      expect(callTool).toHaveBeenCalledWith('user-1', 'list_calendar_events', {
+        from: '2026-08-17',
+        to: '2026-08-18',
+      });
     });
 
     it('no token (oauth returns null) -> []', async () => {

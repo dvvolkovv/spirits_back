@@ -24,7 +24,14 @@ describe('TalerIdOauthService', () => {
   }
 
   describe('connect', () => {
-    it('success → requests the FULL scope set, stores the GRANTED scope, returns connected', async () => {
+    const OLD_SCOPES_ENV = process.env.TALERID_SCOPES;
+    afterEach(() => {
+      if (OLD_SCOPES_ENV === undefined) delete process.env.TALERID_SCOPES;
+      else process.env.TALERID_SCOPES = OLD_SCOPES_ENV;
+    });
+
+    it('success → requests the env scope set (default calendar), stores the GRANTED scope, returns connected', async () => {
+      delete process.env.TALERID_SCOPES;
       const store = makeStore();
       const client = makeClient({
         provision: jest.fn().mockResolvedValue({
@@ -44,12 +51,14 @@ describe('TalerIdOauthService', () => {
       const after = Date.now();
 
       expect(result).toBe('connected');
-      // We REQUEST the full set; TalerID intersects with the client's allowedScopes.
+      // Default (no TALERID_SCOPES) = calendar only. TalerID REJECTS a request with
+      // any scope the client doesn't allow (no intersection), so we request exactly
+      // the env's allowed subset.
       expect(client.provision).toHaveBeenCalledWith({
         phone: '79656445804',
         email: 'a@b.com',
         firstName: 'Dmitry',
-        scopes: ['mcp:calendar', 'mcp:notes', 'mcp:messages.read', 'mcp:messages.send', 'mcp:mail.read', 'mcp:mail.send'],
+        scopes: ['mcp:calendar'],
       });
       expect(store.saveConnection).toHaveBeenCalledTimes(1);
       const [userId, params] = store.saveConnection.mock.calls[0];
@@ -64,6 +73,24 @@ describe('TalerIdOauthService', () => {
       expect(expiresAtMs).toBeGreaterThanOrEqual(before + 900 * 1000);
       expect(expiresAtMs).toBeLessThanOrEqual(after + 900 * 1000);
       expect(store.setStatus).not.toHaveBeenCalled();
+    });
+
+    it('TALERID_SCOPES env drives the requested scopes (DEV: calendar+notes+messages)', async () => {
+      process.env.TALERID_SCOPES = 'mcp:calendar mcp:notes mcp:messages.read mcp:messages.send';
+      const store = makeStore();
+      const client = makeClient({
+        provision: jest.fn().mockResolvedValue({
+          ok: true, taleridUserId: 'tid-1', accessToken: 'a', refreshToken: 'r', expiresIn: 900,
+          scope: 'openid mcp:calendar mcp:notes mcp:messages.read mcp:messages.send offline_access',
+        }),
+      });
+      const service = new TalerIdOauthService(store, client);
+
+      await service.connect('user-1', '79656445804');
+
+      expect(client.provision).toHaveBeenCalledWith(expect.objectContaining({
+        scopes: ['mcp:calendar', 'mcp:notes', 'mcp:messages.read', 'mcp:messages.send'],
+      }));
     });
 
     it('post-widening: TalerID grants the full set → stores the full granted scope string', async () => {
