@@ -24,7 +24,7 @@ describe('TalerIdOauthService', () => {
   }
 
   describe('connect', () => {
-    it('success → saveConnection called with the right fields + scope mcp:calendar, returns connected', async () => {
+    it('success → requests the FULL scope set, stores the GRANTED scope, returns connected', async () => {
       const store = makeStore();
       const client = makeClient({
         provision: jest.fn().mockResolvedValue({
@@ -33,6 +33,7 @@ describe('TalerIdOauthService', () => {
           accessToken: 'acc-1',
           refreshToken: 'ref-1',
           expiresIn: 900,
+          // Pre-widening: TalerID grants only calendar even though we asked for all.
           scope: 'mcp:calendar',
         }),
       });
@@ -43,11 +44,12 @@ describe('TalerIdOauthService', () => {
       const after = Date.now();
 
       expect(result).toBe('connected');
+      // We REQUEST the full set; TalerID intersects with the client's allowedScopes.
       expect(client.provision).toHaveBeenCalledWith({
         phone: '79656445804',
         email: 'a@b.com',
         firstName: 'Dmitry',
-        scopes: ['mcp:calendar'],
+        scopes: ['mcp:calendar', 'mcp:notes', 'mcp:messages.read', 'mcp:messages.send', 'mcp:mail.read', 'mcp:mail.send'],
       });
       expect(store.saveConnection).toHaveBeenCalledTimes(1);
       const [userId, params] = store.saveConnection.mock.calls[0];
@@ -55,12 +57,50 @@ describe('TalerIdOauthService', () => {
       expect(params.taleridUserId).toBe('tid-1');
       expect(params.refreshToken).toBe('ref-1');
       expect(params.accessToken).toBe('acc-1');
+      // We store what was GRANTED (result.scope), not what we requested.
       expect(params.scopes).toBe('mcp:calendar');
       expect(params.accessExpiresAt).toBeInstanceOf(Date);
       const expiresAtMs = params.accessExpiresAt.getTime();
       expect(expiresAtMs).toBeGreaterThanOrEqual(before + 900 * 1000);
       expect(expiresAtMs).toBeLessThanOrEqual(after + 900 * 1000);
       expect(store.setStatus).not.toHaveBeenCalled();
+    });
+
+    it('post-widening: TalerID grants the full set → stores the full granted scope string', async () => {
+      const store = makeStore();
+      const grantedFull = 'mcp:calendar mcp:notes mcp:messages.read mcp:messages.send mcp:mail.read mcp:mail.send';
+      const client = makeClient({
+        provision: jest.fn().mockResolvedValue({
+          ok: true,
+          taleridUserId: 'tid-1',
+          accessToken: 'acc-1',
+          refreshToken: 'ref-1',
+          expiresIn: 900,
+          scope: grantedFull,
+        }),
+      });
+      const service = new TalerIdOauthService(store, client);
+
+      await service.connect('user-1', '79656445804');
+
+      const [, params] = store.saveConnection.mock.calls[0];
+      expect(params.scopes).toBe(grantedFull);
+    });
+
+    it('provision omits scope → stores calendar fallback (never undefined)', async () => {
+      const store = makeStore();
+      const client = makeClient({
+        provision: jest.fn().mockResolvedValue({
+          ok: true, taleridUserId: 'tid-1', accessToken: 'acc-1', refreshToken: 'ref-1', expiresIn: 900,
+          // no `scope` field
+        }),
+      });
+      const service = new TalerIdOauthService(store, client);
+
+      await service.connect('user-1', '79656445804');
+
+      const [, params] = store.saveConnection.mock.calls[0];
+      expect(params.scopes).toBe('mcp:calendar');
     });
 
     it('ambiguous → setStatus("ambiguous"), no saveConnection, returns ambiguous', async () => {
@@ -178,6 +218,51 @@ describe('TalerIdOauthService', () => {
       // rotation persistence must happen before returning, i.e. both calls actually made
       expect(store.updateRefresh).toHaveBeenCalledTimes(1);
       expect(store.updateAccess).toHaveBeenCalledTimes(1);
+    });
+
+    it('refresh requests the connection GRANTED scope (full set post-widening), not a hardcoded calendar scope', async () => {
+      const pastExpiry = new Date(Date.now() - 60 * 1000);
+      const grantedFull = 'mcp:calendar mcp:notes mcp:messages.read mcp:messages.send mcp:mail.read mcp:mail.send';
+      const store = makeStore({
+        getConnection: jest.fn().mockResolvedValue({
+          userId: 'user-1', taleridUserId: 'tid-1', scopes: grantedFull, status: 'connected', accessExpiresAt: pastExpiry,
+        }),
+        getAccess: jest.fn().mockResolvedValue({ accessToken: 'stale-access', expiresAt: pastExpiry }),
+        getRefresh: jest.fn().mockResolvedValue('old-refresh'),
+      });
+      const client = makeClient({
+        refresh: jest.fn().mockResolvedValue({
+          accessToken: 'new-access', refreshToken: 'new-refresh', expiresIn: 900, scope: grantedFull,
+        }),
+      });
+      const service = new TalerIdOauthService(store, client);
+
+      await service.getBackendAccessToken('user-1');
+
+      expect(client.refresh).toHaveBeenCalledWith('old-refresh', [
+        'mcp:calendar', 'mcp:notes', 'mcp:messages.read', 'mcp:messages.send', 'mcp:mail.read', 'mcp:mail.send',
+      ]);
+    });
+
+    it('refresh falls back to calendar scope when a legacy connection has no stored scopes', async () => {
+      const pastExpiry = new Date(Date.now() - 60 * 1000);
+      const store = makeStore({
+        getConnection: jest.fn().mockResolvedValue({
+          userId: 'user-1', taleridUserId: 'tid-1', scopes: '', status: 'connected', accessExpiresAt: pastExpiry,
+        }),
+        getAccess: jest.fn().mockResolvedValue({ accessToken: 'stale-access', expiresAt: pastExpiry }),
+        getRefresh: jest.fn().mockResolvedValue('old-refresh'),
+      });
+      const client = makeClient({
+        refresh: jest.fn().mockResolvedValue({
+          accessToken: 'new-access', refreshToken: 'new-refresh', expiresIn: 900, scope: 'mcp:calendar',
+        }),
+      });
+      const service = new TalerIdOauthService(store, client);
+
+      await service.getBackendAccessToken('user-1');
+
+      expect(client.refresh).toHaveBeenCalledWith('old-refresh', ['mcp:calendar']);
     });
 
     it('concurrent calls with expired access share ONE refresh (single-flight, rotation-safe)', async () => {

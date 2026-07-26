@@ -15,9 +15,32 @@ function isProvisionFail(result: ProvisionResult): result is ProvisionFail {
   return result.ok === false;
 }
 
-/** Scope this slice deals with exclusively — the calendar connector (Task 4). */
+/**
+ * Full scope set Linkeon requests at connect time. TalerID grants the
+ * INTERSECTION with the linkeon-partner client's allowedScopes, so this is
+ * safe to request before TalerID widens the client: pre-widening it grants
+ * calendar only (identical to the original calendar-only slice), post-widening
+ * it grants notes/messages/mail too — with NO code change here. We always
+ * store and refresh with the scope TalerID actually GRANTED (result.scope),
+ * never this requested set, so a refresh never asks for more than the grant.
+ *
+ * One token, not two: the same access token serves the backend calendar
+ * connector AND the agent-direct path. The agent is prevented from touching
+ * calendar not by a narrower token (a second refresh would rotate the shared
+ * refresh and revoke the chain) but by the file-agent's `--allowedTools`
+ * allowlist, which omits the talerid calendar tools. See the connector design
+ * doc, section "ОДИН токен + tool-allowlist".
+ */
+const ALL_SCOPES = [
+  'mcp:calendar',
+  'mcp:notes',
+  'mcp:messages.read',
+  'mcp:messages.send',
+  'mcp:mail.read',
+  'mcp:mail.send',
+];
+/** Fallback grant if a stored connection predates the scopes column being set. */
 const CALENDAR_SCOPE = ['mcp:calendar'];
-const CALENDAR_SCOPE_STR = 'mcp:calendar';
 
 /** Skew buffer: treat a stored access token as expired this many ms before its
  * real expiry, so we never hand a caller a token that dies mid-flight. */
@@ -50,7 +73,7 @@ export class TalerIdOauthService {
     email?: string,
     firstName?: string,
   ): Promise<TalerIdConnectionStatus> {
-    const result = await this.client.provision({ phone, email, firstName, scopes: CALENDAR_SCOPE });
+    const result = await this.client.provision({ phone, email, firstName, scopes: ALL_SCOPES });
 
     if (isProvisionFail(result)) {
       // ambiguous (409, last-10 phone match) or error (401/403/5xx/network) —
@@ -64,14 +87,21 @@ export class TalerIdOauthService {
       refreshToken: result.refreshToken,
       accessToken: result.accessToken,
       accessExpiresAt: new Date(Date.now() + result.expiresIn * 1000),
-      scopes: CALENDAR_SCOPE_STR,
+      // Store what TalerID ACTUALLY granted, not what we requested — pre-widening
+      // this is 'mcp:calendar', post-widening the full set. Refresh reads it back.
+      scopes: result.scope || CALENDAR_SCOPE.join(' '),
     });
     return 'connected';
   }
 
   /**
-   * Returns a valid mcp:calendar access token for this user, or null if not
-   * connected / connection isn't in 'connected' status / refresh fails.
+   * Returns a valid access token carrying this connection's full granted scope
+   * (calendar, and — post TalerID widening — notes/messages/mail), or null if
+   * not connected / connection isn't in 'connected' status / refresh fails.
+   *
+   * This is the SINGLE token both consumers use: the backend calendar connector
+   * and the agent-direct path (the agent is scope-limited by the file-agent's
+   * --allowedTools allowlist, not by a narrower token — see ALL_SCOPES doc).
    */
   async getBackendAccessToken(userId: string): Promise<string | null> {
     const connection = await this.store.getConnection(userId);
@@ -112,9 +142,19 @@ export class TalerIdOauthService {
     const refreshToken = await this.store.getRefresh(userId);
     if (!refreshToken) return null;
 
+    // Refresh with the scope TalerID GRANTED this connection (stored at connect
+    // / previous refresh), never a hardcoded set — asking for more than the
+    // grant would fail, asking for a fixed subset would silently drop the
+    // notes/messages/mail scopes the agent needs. Fallback to calendar for
+    // connections saved before the scopes column carried the full grant.
+    const connection = await this.store.getConnection(userId);
+    const grantedScope = connection?.scopes
+      ? connection.scopes.split(/\s+/).filter(Boolean)
+      : CALENDAR_SCOPE;
+
     let refreshed;
     try {
-      refreshed = await this.client.refresh(refreshToken, CALENDAR_SCOPE);
+      refreshed = await this.client.refresh(refreshToken, grantedScope);
     } catch (e: any) {
       this.logger.warn(`talerid refresh failed for user ${userId}: ${e?.message}`);
       return null;
