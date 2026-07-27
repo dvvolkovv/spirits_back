@@ -183,7 +183,7 @@ describe('TalerIdOauthClient', () => {
       expect(url.searchParams.get('code_challenge')).toBe('chal-1');
       expect(url.searchParams.get('code_challenge_method')).toBe('S256');
       expect(url.searchParams.get('state')).toBe('st-1');
-      expect(url.searchParams.get('scope')).toBe('openid email');
+      expect(url.searchParams.get('scope')).toBe('openid');
       expect(url.searchParams.get('redirect_uri')).toBe('https://my.linkeon.io/webhook/ecosystem/talerid/oauth/callback');
     });
 

@@ -68,7 +68,9 @@ export class TalerIdOauthClient {
       client_id: this.webClientId(),
       redirect_uri: this.linkRedirectUri(),
       response_type: 'code',
-      scope: 'openid email',
+      // linkeon-partner-web allows `openid` only (TalerID); we don't need email —
+      // the id_token.sub is all attach-phone consumes; UI shows a neutral label.
+      scope: 'openid',
       state,
       code_challenge: codeChallenge,
       code_challenge_method: 'S256',
