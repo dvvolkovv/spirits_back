@@ -37,7 +37,7 @@ describe('TalerIdLinkService', () => {
       const stashed = JSON.parse(value);
       expect(stashed).toEqual({ userId: 'user-1', verifier: expect.any(String), phone: '79656445804' });
       expect(stashed.verifier.length).toBeGreaterThanOrEqual(43); // PKCE min
-      expect(ttl).toBe(600);
+      expect(ttl).toBe(1800);
       // Authorize URL carries the S256 challenge derived from the (server-only) verifier, not the verifier.
       expect(authorizeUrl).toContain('code_challenge=');
       expect(authorizeUrl).not.toContain(stashed.verifier);

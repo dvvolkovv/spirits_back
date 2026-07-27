@@ -35,7 +35,11 @@ interface LinkState { userId: string; verifier: string; phone: string; }
 @Injectable()
 export class TalerIdLinkService {
   private readonly logger = new Logger(TalerIdLinkService.name);
-  private static readonly TTL_S = 600; // 10 min — matches TalerID's id_token iat anti-replay window
+  // 30 min — the manual copy-link → open-browser → login → consent flow easily exceeds 10 min
+  // (a too-tight TTL silently sent the callback down the 'expired' path — the phone never moved).
+  // Well within TalerID's id_token iat anti-replay window check (that is on the FRESH id_token
+  // minted at code-exchange time, not on our state).
+  private static readonly TTL_S = 1800;
   private static readonly KEY = (state: string) => `talerid:link:${state}`;
 
   constructor(
@@ -58,16 +62,18 @@ export class TalerIdLinkService {
    * with it). One-time state (deleted on use) prevents replay. Never throws.
    */
   async completeLink(state: string, code: string): Promise<LinkStatus> {
-    if (!state || !code) return 'error';
+    const tag = `state=${(state || '').slice(0, 8)}`;
+    if (!state || !code) { this.logger.warn(`link callback: missing state/code (${tag})`); return 'error'; }
     const key = TalerIdLinkService.KEY(state);
     const raw = await this.redis.get(key);
-    if (!raw) return 'expired';
+    if (!raw) { this.logger.warn(`link callback: state missing/expired (${tag}) — TTL passed or already consumed`); return 'expired'; }
     await this.redis.del(key); // one-time use — reuse/replay lands here as 'expired'
 
     let st: LinkState;
-    try { st = JSON.parse(raw); } catch { return 'error'; }
+    try { st = JSON.parse(raw); } catch { this.logger.warn(`link callback: bad state payload (${tag})`); return 'error'; }
     const { userId, verifier, phone } = st;
-    if (!userId || !verifier || !phone) return 'error';
+    if (!userId || !verifier || !phone) { this.logger.warn(`link callback: incomplete state (${tag})`); return 'error'; }
+    this.logger.log(`link callback: state ok for user ${userId} (${tag}) — exchanging code`);
 
     let idToken: string;
     try {
@@ -85,11 +91,13 @@ export class TalerIdLinkService {
       this.logger.warn(`talerid link: attach-phone failed for user ${userId}: kind=${attach.kind} status=${attach.status}`);
       return 'error';
     }
+    this.logger.log(`link callback: attach OK for user ${userId} → talerid_user_id=${attach.taleridUserId} merged=${JSON.stringify(attach.merged || {})}`);
 
     // Phone is now on the real account → the existing provision-by-phone finds it and stores tokens
     // (overwriting any prior duplicate connection for this user). No new token plumbing.
     try {
       const status = await this.oauth.connect(userId, phone);
+      this.logger.log(`link callback: post-attach provision status=${status} for user ${userId} → outcome=${status === 'connected' ? 'linked' : 'error'}`);
       return status === 'connected' ? 'linked' : 'error';
     } catch (e: any) {
       this.logger.warn(`talerid link: post-attach provision failed for user ${userId}: ${e?.message}`);
