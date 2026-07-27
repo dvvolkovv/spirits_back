@@ -1,5 +1,5 @@
 import { Injectable, Optional } from '@nestjs/common';
-import { ProvisionInput, ProvisionResult, RefreshResult } from './talerid.types';
+import { ProvisionInput, ProvisionResult, RefreshResult, AttachPhoneResult } from './talerid.types';
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -49,6 +49,97 @@ export class TalerIdOauthClient {
 
   private clientSecret(): string {
     return process.env.TALERID_CLIENT_SECRET || '';
+  }
+
+  // ── Account linking (OAuth-link) — web client, public + PKCE S256 ──────────────
+  /** The user-facing web OAuth client (distinct from the refresh-only `linkeon-partner`). */
+  private webClientId(): string {
+    return process.env.TALERID_WEB_CLIENT_ID || 'linkeon-partner-web';
+  }
+  /** Server-side callback that TalerID redirects to — must match the registered redirect_uri. */
+  private linkRedirectUri(): string {
+    const base = (process.env.PUBLIC_BASE_URL || 'https://my.linkeon.io').replace(/\/$/, '');
+    return `${base}/webhook/ecosystem/talerid/oauth/callback`;
+  }
+
+  /** Build the TalerID authorize URL for the linking code-flow (PKCE S256, public client). */
+  buildAuthorizeUrl(state: string, codeChallenge: string): string {
+    const params = new URLSearchParams({
+      client_id: this.webClientId(),
+      redirect_uri: this.linkRedirectUri(),
+      response_type: 'code',
+      scope: 'openid email',
+      state,
+      code_challenge: codeChallenge,
+      code_challenge_method: 'S256',
+    });
+    return `${this.baseUrl()}/oauth/auth?${params.toString()}`;
+  }
+
+  /**
+   * POST {BASE}/oauth/token grant_type=authorization_code — public client, NO secret,
+   * PKCE code_verifier. Returns the id_token (proof-of-login; its `sub` = the account
+   * the user authenticated as). Throws on non-2xx / missing id_token.
+   */
+  async exchangeCodeForIdToken(code: string, codeVerifier: string): Promise<string> {
+    const params = new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: this.linkRedirectUri(),
+      client_id: this.webClientId(),
+      code_verifier: codeVerifier,
+    });
+    const res = await this.fetchFn(`${this.baseUrl()}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    });
+    if (!res.ok) throw new Error(`TalerID code exchange failed: HTTP ${res.status}`);
+    const data = await res.json();
+    if (!data.id_token) throw new Error('TalerID code exchange: no id_token in response');
+    return data.id_token as string;
+  }
+
+  /**
+   * POST {BASE}/partner/attach-phone (partner-secret) — attach the Linkeon-SMS-verified
+   * phone to the account proven by id_token, merging the phone-keyed duplicate.
+   * 200 → ok; 409 → one of three named guardrails (mapped to discrete kinds via the body
+   * `error` code); 401 → bad/expired id_token; else/network → 'error'. Never throws.
+   */
+  async attachPhone(idToken: string, phone: string): Promise<AttachPhoneResult> {
+    let res: Response;
+    try {
+      res = await this.fetchFn(`${this.baseUrl()}/partner/attach-phone`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-partner-secret': this.partnerSecret(),
+        },
+        body: JSON.stringify({ id_token: idToken, phone: toE164(phone) }),
+      });
+    } catch {
+      return { ok: false, kind: 'error', status: 0 };
+    }
+
+    if (res.status === 200) {
+      const data = await res.json();
+      return { ok: true, taleridUserId: data.talerid_user_id, merged: data.merged };
+    }
+    if (res.status === 409) {
+      // Body carries the named reason; match defensively across field names/substrings.
+      let code = '';
+      try {
+        const b: any = await res.json();
+        code = String(b?.error || b?.code || b?.kind || b?.message || '');
+      } catch { /* no/invalid body */ }
+      const kind = /different_phone/.test(code) ? 'different_phone'
+        : /another_account|belongs/.test(code) ? 'phone_taken'
+        : /messenger|messages/.test(code) ? 'has_messages'
+        : 'error';
+      return { ok: false, kind, status: 409 };
+    }
+    if (res.status === 401) return { ok: false, kind: 'invalid_login', status: 401 };
+    return { ok: false, kind: 'error', status: res.status };
   }
 
   /**

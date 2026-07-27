@@ -1,6 +1,8 @@
-import { Controller, Get, Post, Delete, UseGuards, HttpCode, HttpStatus, Logger } from '@nestjs/common';
+import { Controller, Get, Post, Delete, UseGuards, HttpCode, HttpStatus, Logger, Query, Res } from '@nestjs/common';
+import { Response } from 'express';
 import { TalerIdOauthService } from './talerid-oauth.service';
 import { TalerIdStoreService } from './talerid-store.service';
+import { TalerIdLinkService } from './talerid-link.service';
 import { PgService } from '../common/services/pg.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
@@ -19,6 +21,7 @@ export class TalerIdController {
   constructor(
     private readonly oauth: TalerIdOauthService,
     private readonly store: TalerIdStoreService,
+    private readonly link: TalerIdLinkService,
     private readonly pg: PgService,
   ) {}
 
@@ -76,5 +79,49 @@ export class TalerIdController {
   async disconnect(@CurrentUser() user: any) {
     await this.oauth.disconnect(String(user.userId));
     return { ok: true };
+  }
+
+  /**
+   * Account linking — leg 1 (authenticated). Look the user's phone up server-side and stash it with
+   * the PKCE state, then return the TalerID authorize URL for the frontend to open. No phone ever
+   * comes from the (public) callback. `no_phone` → the user has no phone on file (shouldn't happen
+   * for an SMS-onboarded user) → frontend keeps the plain "завести новый" path.
+   */
+  @Post('oauth/start')
+  @UseGuards(JwtGuard)
+  @HttpCode(HttpStatus.OK)
+  async oauthStart(@CurrentUser() user: any) {
+    const userId = String(user.userId);
+    const { phone } = await this.lookupProvisionInput(userId);
+    if (!phone) return { error: 'no_phone' };
+    return this.link.startLink(userId, phone);
+  }
+
+  /**
+   * Account linking — leg 2 (PUBLIC: TalerID redirects the user's browser here after login; the
+   * Linkeon JWT is NOT present — the request is tied back to the user via the one-time `state`).
+   * Resolves the outcome and redirects the browser back into the SPA with ?talerid_link=<status>,
+   * which the frontend turns into a toast + a status refresh.
+   */
+  @Get('oauth/callback')
+  async oauthCallback(
+    @Query('code') code: string,
+    @Query('state') state: string,
+    @Query('error') error: string,
+    @Res() res: Response,
+  ) {
+    const base = (process.env.PUBLIC_BASE_URL || 'https://my.linkeon.io').replace(/\/$/, '');
+    let status: string;
+    if (error) {
+      status = 'cancelled'; // user denied/aborted at TalerID's login screen
+    } else {
+      try {
+        status = await this.link.completeLink(state, code);
+      } catch (e: any) {
+        this.logger.warn(`talerid oauth callback failed: ${e?.message}`);
+        status = 'error';
+      }
+    }
+    return res.redirect(`${base}/?talerid_link=${encodeURIComponent(status)}`);
   }
 }

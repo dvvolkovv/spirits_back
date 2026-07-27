@@ -164,12 +164,15 @@ describe('TalerIdController', () => {
     } as any;
   }
 
+  // Account-linking service — not exercised by these connect/status/disconnect tests; stub it.
+  const makeLink = () => ({ startLink: jest.fn(), completeLink: jest.fn() } as any);
+
   describe('connect', () => {
     it('calls TalerIdOauthService.connect with the user phone (raw, no +) and returns the status', async () => {
       const oauth = makeOauth({ connect: jest.fn().mockResolvedValue('connected') });
       const store = makeStore();
       const pg = makePg({ uid: [{ primary_phone: '79656445804', primary_email: null }], profile: [{ email: 'a@b.com', profile_data: { name: 'Dmitry' } }] });
-      const controller = new TalerIdController(oauth, store, pg);
+      const controller = new TalerIdController(oauth, store, makeLink(), pg);
 
       const result = await controller.connect({ userId: 'user-1' });
 
@@ -181,7 +184,7 @@ describe('TalerIdController', () => {
       const oauth = makeOauth({ connect: jest.fn().mockResolvedValue('ambiguous') });
       const store = makeStore();
       const pg = makePg({ uid: [{ primary_phone: '79656445804' }] });
-      const controller = new TalerIdController(oauth, store, pg);
+      const controller = new TalerIdController(oauth, store, makeLink(), pg);
 
       const result = await controller.connect({ userId: 'user-1' });
 
@@ -192,7 +195,7 @@ describe('TalerIdController', () => {
       const oauth = makeOauth();
       const store = makeStore();
       const pg = makePg({ uid: [{ primary_phone: null }] });
-      const controller = new TalerIdController(oauth, store, pg);
+      const controller = new TalerIdController(oauth, store, makeLink(), pg);
 
       const result = await controller.connect({ userId: 'user-1' });
 
@@ -206,7 +209,7 @@ describe('TalerIdController', () => {
       const oauth = makeOauth();
       const store = makeStore({ getConnection: jest.fn().mockResolvedValue({ status: 'connected' }) });
       const pg = makePg();
-      const controller = new TalerIdController(oauth, store, pg);
+      const controller = new TalerIdController(oauth, store, makeLink(), pg);
 
       const result = await controller.status({ userId: 'user-1' });
 
@@ -217,7 +220,7 @@ describe('TalerIdController', () => {
       const oauth = makeOauth();
       const store = makeStore(); // getConnection -> null
       const pg = makePg();
-      const controller = new TalerIdController(oauth, store, pg);
+      const controller = new TalerIdController(oauth, store, makeLink(), pg);
 
       const result = await controller.status({ userId: 'user-1' });
 
@@ -230,7 +233,7 @@ describe('TalerIdController', () => {
       const oauth = makeOauth();
       const store = makeStore();
       const pg = makePg();
-      const controller = new TalerIdController(oauth, store, pg);
+      const controller = new TalerIdController(oauth, store, makeLink(), pg);
 
       const result = await controller.disconnect({ userId: 'user-1' });
 
