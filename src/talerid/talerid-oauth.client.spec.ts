@@ -233,7 +233,7 @@ describe('TalerIdOauthClient', () => {
       ['something_else', 'error'],
     ])('attachPhone 409 error=%s → kind "%s"', async (code, kind) => {
       const client = new TalerIdOauthClient(jest.fn().mockResolvedValue(jsonResponse(409, { error: code })));
-      expect(await client.attachPhone('idt', '79656445804')).toEqual({ ok: false, kind, status: 409 });
+      expect(await client.attachPhone('idt', '79656445804')).toEqual({ ok: false, kind, status: 409, reason: code });
     });
 
     it('attachPhone 401 → invalid_login; network error → error/status 0', async () => {

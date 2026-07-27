@@ -57,6 +57,8 @@ export interface AttachPhoneFail {
    *  has_messages=409 merge_has_messenger_data; invalid_login=401; error=anything else/network. */
   kind: 'different_phone' | 'phone_taken' | 'has_messages' | 'invalid_login' | 'error';
   status: number;
+  /** Raw server error code/body (for diagnostics — logged when kind falls through to 'error'). */
+  reason?: string;
 }
 export type AttachPhoneResult = AttachPhoneOk | AttachPhoneFail;
 

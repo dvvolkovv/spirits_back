@@ -88,7 +88,7 @@ export class TalerIdLinkService {
       if (attach.kind === 'different_phone') return 'different_phone';
       if (attach.kind === 'phone_taken') return 'phone_taken';
       if (attach.kind === 'has_messages') return 'has_messages';
-      this.logger.warn(`talerid link: attach-phone failed for user ${userId}: kind=${attach.kind} status=${attach.status}`);
+      this.logger.warn(`talerid link: attach-phone failed for user ${userId}: kind=${attach.kind} status=${attach.status} reason=${attach.reason || '(none)'}`);
       return 'error';
     }
     this.logger.log(`link callback: attach OK for user ${userId} → talerid_user_id=${attach.taleridUserId} merged=${JSON.stringify(attach.merged || {})}`);

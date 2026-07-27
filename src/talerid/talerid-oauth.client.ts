@@ -138,7 +138,7 @@ export class TalerIdOauthClient {
         : /another_account|belongs/.test(code) ? 'phone_taken'
         : /messenger|messages/.test(code) ? 'has_messages'
         : 'error';
-      return { ok: false, kind, status: 409 };
+      return { ok: false, kind, status: 409, reason: code };
     }
     if (res.status === 401) return { ok: false, kind: 'invalid_login', status: 401 };
     return { ok: false, kind: 'error', status: res.status };
