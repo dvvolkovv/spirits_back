@@ -2,11 +2,19 @@ import { Controller, Get, Post, Body, Param, Query, Res, UseGuards, Optional } f
 import { Response } from 'express';
 import { AdminService } from './admin.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
+import { AdminGuard } from '../common/guards/admin.guard';
 import { ProfileCompactionService } from '../scheduler/profile-compaction.service';
 import { ReferralService } from '../referral/referral.service';
 import { CurrentUser } from '../common/decorators/user.decorator';
 
+// AdminGuard на уровне класса: все 13 маршрутов здесь — admin/*, и раньше
+// каждый стоял под одним лишь JwtGuard, то есть был открыт ЛЮБОМУ
+// залогиненному пользователю (утечка телефонов/балансов всех юзеров через
+// admin/users/tokens и выпуск купонов себе через admin/coupons).
+// Остальные админские контроллеры (smm, monitoring, vmm, vpm, backlog,
+// support, vk-ads, dozvon) уже используют эту пару — здесь её забыли.
 @Controller('')
+@UseGuards(JwtGuard, AdminGuard)
 export class AdminController {
   constructor(
     private readonly adminService: AdminService,
@@ -17,7 +25,6 @@ export class AdminController {
   // --- Coupons (action-based POST) ---
 
   @Post('admin/coupons')
-  @UseGuards(JwtGuard)
   async coupons(@Body() body: any, @Res() res: Response) {
     const { action, ...data } = body;
     switch (action) {
@@ -45,7 +52,6 @@ export class AdminController {
   // --- Referral Admin ---
 
   @Get('admin/referral/stats')
-  @UseGuards(JwtGuard)
   async referralStats(@Res() res: Response) {
     const stats = await this.adminService.getReferralStats();
     return res.status(200).json(stats);
@@ -54,7 +60,6 @@ export class AdminController {
   // --- Payments ---
 
   @Get('admin/payments')
-  @UseGuards(JwtGuard)
   async listPayments(
     @Query('status') status: string | undefined,
     @Query('limit') limit: string | undefined,
@@ -68,7 +73,6 @@ export class AdminController {
   }
 
   @Get('admin/payments/stats')
-  @UseGuards(JwtGuard)
   async paymentsStats(@Query('days') days: string | undefined, @Res() res: Response) {
     const stats = await this.adminService.getPaymentsStats({
       days: days ? parseInt(days, 10) || undefined : undefined,
@@ -79,7 +83,6 @@ export class AdminController {
   // --- Tokens ---
 
   @Get('admin/users/tokens')
-  @UseGuards(JwtGuard)
   async usersTokens(
     @Query('limit') limit: string | undefined,
     @Query('sort') sort: string | undefined,
@@ -95,7 +98,6 @@ export class AdminController {
   }
 
   @Get('admin/tokens/stats')
-  @UseGuards(JwtGuard)
   async tokensStats(
     @Query('bucket') bucket: string | undefined,
     @Query('days') days: string | undefined,
@@ -109,7 +111,6 @@ export class AdminController {
   }
 
   @Get('admin/users/:phone/activity')
-  @UseGuards(JwtGuard)
   async userActivity(
     @Param('phone') phone: string,
     @Query('days') days: string | undefined,
@@ -122,7 +123,6 @@ export class AdminController {
   }
 
   @Post('admin/profile/compact')
-  @UseGuards(JwtGuard)
   async profileCompact(@Body() body: any, @Res() res: Response) {
     if (!this.compaction) return res.status(503).json({ error: 'compaction not configured' });
     const userId = String(body?.userId || '').trim();
@@ -136,7 +136,6 @@ export class AdminController {
   }
 
   @Get('admin/users/active')
-  @UseGuards(JwtGuard)
   async usersActive(
     @Query('days') days: string | undefined,
     @Query('bucket') bucket: string | undefined,
@@ -152,7 +151,6 @@ export class AdminController {
   // --- Usage stats ---
 
   @Get('admin/usage/assistants')
-  @UseGuards(JwtGuard)
   async assistantsUsage(@Query('days') days: string | undefined, @Res() res: Response) {
     const stats = await this.adminService.getAssistantsUsageStats({
       days: days ? parseInt(days, 10) || undefined : undefined,
@@ -161,7 +159,6 @@ export class AdminController {
   }
 
   @Post('admin/referral')
-  @UseGuards(JwtGuard)
   async referralAction(@CurrentUser() user: any, @Body() body: any, @Res() res: Response) {
     const { action, ...data } = body;
     switch (action) {
@@ -221,7 +218,6 @@ export class AdminController {
   // Retention re-engagement (backlog 72cfc486). preview только строит черновики;
   // send — реальная SMS-рассылка, требует confirm:true (подтверждение владельца).
   @Post('admin/retention')
-  @UseGuards(JwtGuard)
   async retentionAction(@Body() body: any, @Res() res: Response) {
     const { action, ...data } = body;
     switch (action) {
@@ -250,7 +246,6 @@ export class AdminController {
   // Activation outreach (backlog c45c71df). preview только строит черновики;
   // send — реальная SMS-рассылка новичкам, требует confirm:true (владелец).
   @Post('admin/activation')
-  @UseGuards(JwtGuard)
   async activationAction(@Body() body: any, @Res() res: Response) {
     const { action, ...data } = body;
     switch (action) {

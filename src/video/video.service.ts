@@ -541,16 +541,24 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async finalizeSimpleJob(job: VideoJobRow, klingVideoId: string | null, klingVideoUrl: string) {
-    let finalVideoUrl = klingVideoUrl;
+    // Rehost Kling → MinIO. Fallback на klingVideoUrl намеренно убран
+    // (2026-07-28): Kling CDN отдаёт 403 через ~месяц, а раньше fallback тихо
+    // сохранял её и задача помечалась ready — пользователь получал битую ссылку
+    // спустя недели. Если MinIO упал — задача считается провалившейся, токены
+    // возвращаются.
+    let finalVideoUrl: string;
     let thumbUrl: string | null = null;
     try {
       finalVideoUrl = await this.rehostToS3(job.id, klingVideoUrl);
-      thumbUrl = await this.extractAndUploadThumbnail(job.id, finalVideoUrl);
     } catch (s3err: any) {
-      this.logger.warn(`Video job ${job.id}: S3 rehost failed (${s3err.message}), using Kling CDN URL directly`);
-      finalVideoUrl = klingVideoUrl;
-      thumbUrl = null;
+      this.logger.error(`Video job ${job.id}: MinIO rehost failed: ${s3err.message}`);
+      await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent),
+        `rehost to MinIO failed: ${String(s3err.message).slice(0, 200)}`);
+      return;
     }
+    try {
+      thumbUrl = await this.extractAndUploadThumbnail(job.id, finalVideoUrl);
+    } catch { /* thumbnail is nice-to-have */ }
     await this.pg.query(
       `UPDATE video_jobs
           SET status='ready', video_url=$1, thumbnail_url=$2,
@@ -651,7 +659,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   // setsar + concat filter — robust to codec/timing/SAR differences between
   // Kling base 10s and extend 5s outputs, where concat demuxer was failing
   // with "Invalid data found when processing input"), trim to the exact
-  // target duration, upload to S3, return the public URL.
+  // target duration, upload to MinIO, return the public URL.
   private async composeFinalVideo(jobId: string, segmentUrls: string[], targetDurationSec: number): Promise<string> {
     const tmpDir = path.join(os.tmpdir(), `composed_${jobId}`);
     fs.mkdirSync(tmpDir, { recursive: true });
@@ -715,24 +723,23 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         ff.on('error', reject);
       });
 
-      // 3. Persist the composed mp4. We deliberately bypass S3 for composed
-      // jobs because Yandex Object Storage signing has been silently failing
-      // for video uploads in this deployment for a while (every existing
-      // 'ready' simple job has a Kling-CDN video_url, meaning rehostToS3 was
-      // hitting the catch path and falling back to klingUrl). Simple jobs are
-      // OK with that fallback because Kling holds the original mp4 for a
-      // while. Composed jobs CAN'T fall back — the mp4 lives only here.
-      // So we write to public/videos and serve via Nginx /static/ (which is
-      // already configured: location /static/ -> alias /home/dvolkov/spirits_back/public/).
-      const publicDir = process.env.PUBLIC_DIR
-        ? process.env.PUBLIC_DIR
-        : path.resolve(process.cwd(), 'public');
-      const videosDir = path.join(publicDir, 'videos');
-      fs.mkdirSync(videosDir, { recursive: true });
-      const finalPath = path.join(videosDir, `${jobId}.mp4`);
-      fs.copyFileSync(outPath, finalPath);
-      const backend = (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '');
-      return `${backend}/static/videos/${jobId}.mp4`;
+      // 3. Persist the composed mp4 в MinIO — тот же путь, что и у simple
+      // jobs. Раньше composed писались в public/videos через Nginx /static/,
+      // потому что Yandex Object Storage тихо ронял загрузки; после миграции
+      // video.service на локальный MinIO (июнь 2026) обход больше не нужен.
+      await this.ensureBucket();
+      const key = `videos/${jobId}.mp4`;
+      const body = fs.createReadStream(outPath);
+      await new Upload({
+        client: this.s3,
+        params: {
+          Bucket: this.s3Bucket,
+          Key: key,
+          Body: body,
+          ContentType: 'video/mp4',
+        },
+      }).done();
+      return this.s3PublicUrl(key);
     } finally {
       try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
     }
