@@ -5,6 +5,7 @@ import { TalerIdOauthClient } from './talerid-oauth.client';
 import { TalerIdOauthService } from './talerid-oauth.service';
 import { TalerIdLinkService } from './talerid-link.service';
 import { TalerIdCalendarConnector } from './talerid-calendar.connector';
+import { TalerIdNotesConnector } from './talerid-notes.connector';
 import { TalerIdController } from './talerid.controller';
 
 /**
@@ -19,7 +20,7 @@ import { TalerIdController } from './talerid.controller';
 @Module({
   imports: [CommonModule],
   controllers: [TalerIdController],
-  providers: [TalerIdStoreService, TalerIdOauthClient, TalerIdOauthService, TalerIdLinkService, TalerIdCalendarConnector],
-  exports: [TalerIdStoreService, TalerIdOauthService, TalerIdCalendarConnector],
+  providers: [TalerIdStoreService, TalerIdOauthClient, TalerIdOauthService, TalerIdLinkService, TalerIdCalendarConnector, TalerIdNotesConnector],
+  exports: [TalerIdStoreService, TalerIdOauthService, TalerIdCalendarConnector, TalerIdNotesConnector],
 })
 export class TalerIdModule {}

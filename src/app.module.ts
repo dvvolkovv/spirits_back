@@ -40,6 +40,7 @@ import { RoutinePushModule } from './routine-push/routine-push.module';
 import { AppOtaModule } from './app-ota/app-ota.module';
 import { AppWidgetModule } from './app-widget/app-widget.module';
 import { TripModule } from './trip/trip.module';
+import { NotesModule } from './notes/notes.module';
 import { CalendarModule } from './calendar/calendar.module';
 import { TalerIdModule } from './talerid/talerid.module';
 
@@ -86,6 +87,7 @@ import { TalerIdModule } from './talerid/talerid.module';
     AppOtaModule,
     AppWidgetModule,
     TripModule,
+    NotesModule,
     CalendarModule,
     TalerIdModule,
   ],

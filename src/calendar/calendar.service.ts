@@ -70,6 +70,33 @@ export class CalendarService {
     // kind = 'event' | 'task' — which surface the proposal targets ("Мои дела" vs the calendar).
     // Default 'event' preserves the pre-T4 behaviour for already-stored proposals.
     await this.pg.query(`ALTER TABLE calendar_proposals ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'event'`);
+    // status = pending | accepted | dismissed [a5131311]: чтобы лаунчер показывал НЕзакрытые
+    // предложения агента и мог их принять/отклонить. Дефолт 'pending'; старые строки не всплывут
+    // из-за окна свежести в listPendingProposals (не бэкфиллим — окно решает).
+    await this.pg.query(`ALTER TABLE calendar_proposals ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending'`);
+  }
+
+  /**
+   * Pending-предложения событий для витрины лаунчера [a5131311]. Окно свежести 2 дня — старые
+   * (доредизайновые) предложения не всплывают; только kind='event' (их можно «добавить в календарь»).
+   */
+  async listPendingProposals(userId: string): Promise<{ id: string; event: ProposedEvent; kind: string }[]> {
+    const r = await this.pg.query(
+      `SELECT id, event, kind FROM calendar_proposals
+       WHERE user_id = $1 AND status = 'pending' AND kind = 'event'
+         AND created_at > now() - interval '2 days'
+       ORDER BY created_at ASC`,
+      [userId],
+    );
+    return r.rows.map((row) => ({ id: row.id, event: row.event, kind: row.kind }));
+  }
+
+  /** Перевести pending→status. Идемпотентно: трогает только pending-строку данного пользователя. */
+  async setProposalStatus(userId: string, id: string, status: 'accepted' | 'dismissed'): Promise<void> {
+    await this.pg.query(
+      `UPDATE calendar_proposals SET status = $3 WHERE id = $1 AND user_id = $2 AND status = 'pending'`,
+      [id, userId, status],
+    );
   }
 
   /**

@@ -1,4 +1,4 @@
-import { computeCopilotState } from './trip.service';
+import { computeCopilotState, mergeEvents, TripService } from './trip.service';
 
 const now = new Date('2026-07-19T10:00:00+05:00');
 const task = (uid: string, title: string, due?: string, done = false) => ({ uid, title, due, done, source: 'yandex' });
@@ -75,6 +75,96 @@ describe('computeCopilotState', () => {
     });
     expect(s.reminders.length).toBe(3);
     expect(s.timeTriggers.map((t) => t.id)).toEqual(['task-t1']);
+  });
+
+  it('events[] структурированы (ISO at + conflict) для ранжирования в лаунчере [784fd182]', () => {
+    const s = computeCopilotState({
+      tasks: [],
+      events: [
+        ev('e1', 'Встреча', '2026-07-20T10:30:00Z', '2026-07-20T11:30:00Z'),
+        ev('e2', 'Выезд', '2026-07-20T11:00:00Z', '2026-07-20T12:00:00Z'),
+        ev('e3', 'Одиночное', '2026-07-21T09:00:00Z'),
+      ],
+      now,
+    });
+    expect(s.events?.length).toBe(3);
+    // первые два пересекаются → conflict:true у обоих; третье — false
+    expect(s.events?.[0]).toMatchObject({ title: 'Встреча', at: '2026-07-20T10:30:00Z', conflict: true });
+    expect(s.events?.[1]).toMatchObject({ title: 'Выезд', conflict: true });
+    expect(s.events?.[2]).toMatchObject({ title: 'Одиночное', conflict: false });
+  });
+
+  it('нет событий -> events[] пуст (не undefined), обратная совместимость', () => {
+    const s = computeCopilotState({ tasks: [], events: [], now });
+    expect(s.events).toEqual([]);
+  });
+
+  describe('mergeEvents [6ad042df]', () => {
+    it('дедуп одного митинга из ICS и TalerID по заголовку+минуте', () => {
+      const ics = [ev('e1', 'Стендап', '2026-07-20T10:00:00Z')] as any;
+      const talerid = [
+        { title: 'стендап', at: '2026-07-20T10:00:30Z', source: 'talerid', uid: 'tx1' }, // та же минута, иной регистр
+        { title: 'Личное TalerID', at: '2026-07-20T14:00:00Z', source: 'talerid', uid: 'tx2' },
+      ] as any;
+      const merged = mergeEvents(ics, talerid);
+      expect(merged.length).toBe(2);
+      expect(merged.map((e) => e.title)).toEqual(['Стендап', 'Личное TalerID']); // ICS-дубль выиграл, TalerID-уникум добавлен
+      expect(merged[0].source).toBe('yandex');
+    });
+
+    it('разные события из обоих источников сохраняются', () => {
+      const a = [ev('e1', 'A', '2026-07-20T10:00:00Z')] as any;
+      const b = [{ title: 'B', at: '2026-07-20T11:00:00Z', source: 'talerid' }] as any;
+      expect(mergeEvents(a, b).map((e) => e.title)).toEqual(['A', 'B']);
+    });
+
+    it('пустые источники → пустой результат', () => {
+      expect(mergeEvents([], [])).toEqual([]);
+    });
+  });
+
+  describe('applyAction — предложения агента [a5131311]', () => {
+    const makeCalendar = (overrides: any = {}) => ({
+      listTasks: jest.fn().mockResolvedValue([]),
+      listEvents: jest.fn().mockResolvedValue([]),
+      listPendingProposals: jest.fn().mockResolvedValue([]),
+      createEvent: jest.fn().mockResolvedValue({ created: 1, failed: 0, ids: ['e1'] }),
+      setProposalStatus: jest.fn().mockResolvedValue(undefined),
+      getProposal: jest.fn(),
+      setTaskDone: jest.fn().mockResolvedValue(undefined),
+      ...overrides,
+    });
+    const taleridCal = { listEvents: jest.fn().mockResolvedValue([]) } as any;
+    const svc = (calendar: any) => new TripService({} as any, calendar, taleridCal);
+
+    it('proposal_accept → пишет event в календарь + помечает accepted', async () => {
+      const event = { title: 'Созвон', datetime: '2026-07-20T15:00:00', durationMin: 60 };
+      const calendar = makeCalendar({ getProposal: jest.fn().mockResolvedValue({ kind: 'event', event }) });
+      await svc(calendar).applyAction('u1', 'idem-1', 'proposal_accept', { id: 'p1' });
+      expect(calendar.createEvent).toHaveBeenCalledWith('u1', event);
+      expect(calendar.setProposalStatus).toHaveBeenCalledWith('u1', 'p1', 'accepted');
+    });
+
+    it('proposal_dismiss → помечает dismissed, в календарь НЕ пишет', async () => {
+      const calendar = makeCalendar();
+      await svc(calendar).applyAction('u1', 'idem-2', 'proposal_dismiss', { id: 'p2' });
+      expect(calendar.createEvent).not.toHaveBeenCalled();
+      expect(calendar.setProposalStatus).toHaveBeenCalledWith('u1', 'p2', 'dismissed');
+    });
+
+    it('proposal_accept без id → BadRequest', async () => {
+      const calendar = makeCalendar();
+      await expect(svc(calendar).applyAction('u1', 'idem-3', 'proposal_accept', {})).rejects.toThrow();
+    });
+
+    it('getState докладывает pending-предложения в state.proposals', async () => {
+      const event = { title: 'Встреча', datetime: '2026-07-20T16:00:00' };
+      const calendar = makeCalendar({
+        listPendingProposals: jest.fn().mockResolvedValue([{ id: 'p9', event, kind: 'event' }]),
+      });
+      const state = await svc(calendar).getState('u1');
+      expect(state.proposals).toEqual([{ id: 'p9', kind: 'calendar_event', payload: { event } }]);
+    });
   });
 
   it('serverTime и version проставлены', () => {

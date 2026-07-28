@@ -33,6 +33,17 @@ export interface CoPilotState {
   headline: string;
   sub?: string; // «ближайшее действие»
   contextLines: { icon: string; text: string; tone?: 'ok' | 'warn' | 'crit' }[];
+  /**
+   * Структурированные события календаря (в дополнение к contextLines, которые несут лишь
+   * форматированный текст) — чтобы лаунчер мог РАНЖИРОВАТЬ и показывать «ближайшую встречу»
+   * по времени [784fd182]. Отсортированы по времени начала. Старые потребители поле игнорируют.
+   */
+  events?: { at: string; end?: string; title: string; conflict: boolean }[];
+  /**
+   * Pending-предложения агента [a5131311]: типизированные артефакты (пока `calendar_event`),
+   * которые лаунчер показывает карточкой с [Добавить]/[Отклонить]. Absent/[] — нечего предлагать.
+   */
+  proposals?: { id: string; kind: string; payload: any }[];
   reminders: TripReminder[];
   geoTriggers: GeoTrigger[];
   timeTriggers: TimeTrigger[];

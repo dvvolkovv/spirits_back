@@ -3,6 +3,7 @@ import { PgService } from '../common/services/pg.service';
 import { CoPilotState } from './trip.types';
 import { CalendarService } from '../calendar/calendar.service';
 import { CalEvent, Task } from '../calendar/calendar.types';
+import { TalerIdCalendarConnector } from '../talerid/talerid-calendar.connector';
 
 export const TRIP_STATE_VERSION = 1;
 
@@ -26,6 +27,27 @@ export interface TripAction {
  *   checkboxes; reminders[i].id is the task uid (carries into task_done).
  * - timeTriggers: pending tasks that have a due date.
  */
+/**
+ * Слить события из нескольких источников (ICS-календари + TalerID) в один список [6ad042df],
+ * убрав дубли: один и тот же митинг может прийти и из Yandex/Outlook-ICS, и из TalerID-календаря.
+ * Ключ дедупа = нормализованный заголовок + время начала с точностью до минуты. Порядок входа
+ * сохраняется (первый источник выигрывает). Чистая функция — юнит-тестируется без сети.
+ */
+export function mergeEvents(...sources: CalEvent[][]): CalEvent[] {
+  const seen = new Set<string>();
+  const out: CalEvent[] = [];
+  for (const list of sources) {
+    for (const e of list) {
+      const minute = e.at ? new Date(e.at).toISOString().slice(0, 16) : '';
+      const key = `${(e.title || '').trim().toLowerCase()}|${minute}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(e);
+    }
+  }
+  return out;
+}
+
 export function computeCopilotState(input: { tasks: Task[]; events: CalEvent[]; now: Date }): CoPilotState {
   const { tasks, events, now } = input;
   const parse = (s: string) => new Date(s.includes('+') || s.endsWith('Z') ? s : `${s}+05:00`).getTime();
@@ -56,6 +78,7 @@ export function computeCopilotState(input: { tasks: Task[]; events: CalEvent[]; 
     hour: '2-digit',
     minute: '2-digit',
   });
+  const eventsOut: NonNullable<CoPilotState['events']> = [];
   events.forEach((e, i) => {
     const conflict = events.some((o, j) => j !== i && overlaps(e, o));
     contextLines.push({
@@ -63,6 +86,9 @@ export function computeCopilotState(input: { tasks: Task[]; events: CalEvent[]; 
       text: `${fmt.format(new Date(e.at)).replace(/,/g, '')} — ${e.title}${conflict ? ' (пересечение)' : ''}`,
       tone: conflict ? 'warn' : undefined,
     });
+    // Структурированное событие для лаунчера [784fd182]: ISO-время → он сам ранжирует/рендерит
+    // «ближайшую встречу». contextLines оставляем для обратной совместимости.
+    eventsOut.push({ at: e.at, end: e.end, title: e.title, conflict });
   });
 
   const reminders = tasks.map((t) => ({ id: t.uid, text: t.title, when: t.due ?? '', critical: false, done: t.done }));
@@ -74,6 +100,7 @@ export function computeCopilotState(input: { tasks: Task[]; events: CalEvent[]; 
     headline,
     sub: undefined,
     contextLines,
+    events: eventsOut,
     reminders,
     geoTriggers: [],
     timeTriggers,
@@ -89,6 +116,7 @@ export class TripService implements OnModuleInit {
   constructor(
     private readonly pg: PgService,
     private readonly calendar: CalendarService,
+    private readonly taleridCalendar: TalerIdCalendarConnector,
   ) {}
 
   async onModuleInit() {
@@ -118,11 +146,24 @@ export class TripService implements OnModuleInit {
     const now = new Date();
     const start = now;
     const end = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-    const [tasks, events] = await Promise.all([
+    const [tasks, icsEvents, taleridEvents] = await Promise.all([
       this.calendar.listTasks(userId, start, end),
       this.calendar.listEvents(userId, start, end),
+      // TalerID-календарь — ещё один источник событий [6ad042df]. Коннектор best-effort:
+      // при не-подключённом TalerID / ошибке MCP вернёт [], со-пилот не ломается.
+      this.taleridCalendar.listEvents(userId, start, end),
     ]);
-    return computeCopilotState({ tasks, events, now: new Date() });
+    const events = mergeEvents(icsEvents, taleridEvents);
+    const state = computeCopilotState({ tasks, events, now: new Date() });
+    // Pending-предложения агента [a5131311] — докладываем в стейт (чистая computeCopilotState их не
+    // знает, это async из БД). Absent-safe: пустой список → лаунчер ничего не показывает.
+    const pending = await this.calendar.listPendingProposals(userId);
+    state.proposals = pending.map((p) => ({
+      id: p.id,
+      kind: 'calendar_event',
+      payload: { event: p.event },
+    }));
+    return state;
   }
 
   /**
@@ -141,6 +182,22 @@ export class TripService implements OnModuleInit {
       const uid = payload?.uid;
       if (!uid) throw new BadRequestException('uid required');
       await this.calendar.setTaskDone(userId, uid, Boolean(payload?.done));
+    } else if (kind === 'proposal_accept') {
+      // Предложение агента принято из лаунчера [a5131311]: пишем событие в календарь (только по
+      // подтверждению) и закрываем предложение. Идемпотентно: setStatus трогает лишь pending.
+      const id = payload?.id;
+      if (!id) throw new BadRequestException('id required');
+      const p = await this.calendar.getProposal(userId, id);
+      // Пишем в календарь только по подтверждению, только event-предложение. createEvent ДО
+      // setStatus: если запись упадёт, предложение останется pending (не потеряется).
+      if (p && p.kind === 'event' && p.event) {
+        await this.calendar.createEvent(userId, p.event);
+      }
+      await this.calendar.setProposalStatus(userId, id, 'accepted');
+    } else if (kind === 'proposal_dismiss') {
+      const id = payload?.id;
+      if (!id) throw new BadRequestException('id required');
+      await this.calendar.setProposalStatus(userId, id, 'dismissed');
     }
 
     return this.getState(userId);
