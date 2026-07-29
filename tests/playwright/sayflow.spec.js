@@ -14,7 +14,12 @@ async function getJwt() {
   return { access: r.data['access-token'], refresh: r.data['refresh-token'] };
 }
 
+// Точечная регрессия (не boot-smoke): требует прод-фронт без Basic Auth и живого LLM/тест-юзера.
+// Деплой-smoke гоняет весь tests/playwright/*.spec.js в т.ч. против test.linkeon.io (Basic Auth) —
+// там этот тест не пройдёт (401 при загрузке скрипта). Поэтому в smoke он СКИПАЕТСЯ; запуск вручную:
+//   RUN_SAYFLOW=1 BASE_URL=https://my.linkeon.io npx playwright test playwright/sayflow.spec.js
 test('quick-ask: ?say=+assistant=roman → Роман выбран и текст отправлен', async ({ page }) => {
+  test.skip(process.env.RUN_SAYFLOW !== '1', 'targeted prod regression — run with RUN_SAYFLOW=1');
   const { access, refresh } = await getJwt();
   const agents = (await axios.get(`${BASE}/webhook/agents`)).data;
   const raya = agents.find((a) => a.name === 'Райя'); // полный объект — иначе UI падает на missing-полях
