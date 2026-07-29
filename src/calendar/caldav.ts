@@ -326,10 +326,28 @@ export class YandexCalDavConnector implements CalendarConnector {
       const parsed: any = ical.parseICS(`BEGIN:VCALENDAR\n${m[0]}\nEND:VCALENDAR`);
       for (const k of Object.keys(parsed)) {
         const ev = parsed[k];
-        if (ev?.type === 'VEVENT' && ev.start) {
-          const s = new Date(ev.start);
+        if (ev?.type !== 'VEVENT' || !ev.start) continue;
+        const title = String(ev.summary || '').trim() || 'Событие';
+        const startMs = new Date(ev.start).getTime();
+        const durationMs = ev.end ? new Date(ev.end).getTime() - startMs : 3_600_000;
+        if (ev.rrule) {
+          // ПОВТОРЯЮЩЕЕСЯ: у master-VEVENT DTSTART обычно В ПРОШЛОМ (напр. еженедельный синк с
+          // февраля). Фильтровать по нему = выкинуть КАЖДУЮ повторяющуюся встречу (это и был баг
+          // «календарь пуст»). Разворачиваем rrule и берём вхождения, попадающие в окно.
+          let occurrences: Date[] = [];
+          try { occurrences = ev.rrule.between(start, end, true); } catch { occurrences = []; }
+          const exdates = ev.exdate
+            ? new Set(Object.keys(ev.exdate).map((x: string) => new Date(ev.exdate[x]).getTime()))
+            : new Set<number>();
+          for (const occ of occurrences) {
+            const occMs = occ.getTime();
+            if (exdates.has(occMs)) continue;
+            out.push({ at: new Date(occMs).toISOString(), title, source: 'yandex', uid: `${ev.uid}-${occMs}`, end: new Date(occMs + durationMs).toISOString() });
+          }
+        } else {
+          const s = new Date(startMs);
           if (s >= start && s < end) {
-            const item: CalEvent = { at: s.toISOString(), title: String(ev.summary || '').trim() || 'Событие', source: 'yandex', uid: ev.uid };
+            const item: CalEvent = { at: s.toISOString(), title, source: 'yandex', uid: ev.uid };
             if (ev.end) item.end = new Date(ev.end).toISOString();
             out.push(item);
           }
