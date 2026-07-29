@@ -289,38 +289,6 @@ export class YandexCalDavConnector implements CalendarConnector {
     return out;
   }
 
-  /** TEMP debug2 [diag]: сырой VCALENDAR (с VTIMEZONE+RRULE) + что node-ical развернул. Удалить. */
-  async debugRawCal(creds: CalendarCreds, start: Date, end: Date): Promise<any> {
-    const fmt = (d: Date) => d.toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
-    const report = `<?xml version="1.0"?><C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><C:calendar-data/></D:prop><C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT"><C:time-range start="${fmt(start)}" end="${fmt(end)}"/></C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`;
-    const collections = await this.discoverAllCollections(creds);
-    const out: any[] = [];
-    for (const url of collections) {
-      try {
-        const res = await fetch(url, { method: 'REPORT', headers: { Authorization: this.authHeader(creds), Depth: '1', 'Content-Type': 'application/xml' }, body: report, signal: AbortSignal.timeout(8000) } as any);
-        const xml = await res.text();
-        for (const m of xml.matchAll(/BEGIN:VCALENDAR[\s\S]*?END:VCALENDAR/g)) {
-          const cal = m[0];
-          if (!/RRULE/.test(cal)) continue;
-          const parsed: any = ical.parseICS(cal);
-          for (const ev of Object.values(parsed) as any[]) {
-            if (ev?.type !== 'VEVENT') continue;
-            const info: any = {
-              summary: ev.summary,
-              dtstartRaw: /DTSTART[^\r\n]*/.exec(cal)?.[0],
-              rruleRaw: /RRULE[^\r\n]*/.exec(cal)?.[0],
-              hasVtimezone: /BEGIN:VTIMEZONE/.test(cal),
-              parsedStart: ev.start?.toISOString?.() ?? String(ev.start),
-            };
-            if (ev.rrule) { try { info.occurrences = ev.rrule.between(start, end, true).map((d: Date) => d.toISOString()); } catch (e: any) { info.rruleError = e?.message; } }
-            out.push(info);
-          }
-        }
-      } catch (e: any) { out.push({ url, error: e?.message }); }
-    }
-    return { window: { start: start.toISOString(), end: end.toISOString() }, events: out };
-  }
-
   /** REPORT one VEVENT collection over the window and parse it into CalEvents. */
   private async reportEvents(creds: CalendarCreds, collectionUrl: string, report: string, start: Date, end: Date): Promise<CalEvent[]> {
     const res = await fetch(collectionUrl, {

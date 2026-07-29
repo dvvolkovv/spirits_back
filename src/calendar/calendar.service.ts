@@ -304,15 +304,6 @@ export class CalendarService {
     }
   }
 
-  /** TEMP debug2 [diag]: сырой VCALENDAR по «Синк» + что node-ical развернул. Удалить. */
-  async debugRawCal(userId: string): Promise<any> {
-    const now = new Date();
-    const end = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-    const creds = await this.creds(userId);
-    if (!creds) return { hasCreds: false };
-    return this.connector.debugRawCal(creds, now, end);
-  }
-
   async listTasks(userId: string, start: Date, end: Date): Promise<Task[]> {
     const creds = await this.creds(userId);
     if (!creds || !creds.taskCollectionUrl) return [];
