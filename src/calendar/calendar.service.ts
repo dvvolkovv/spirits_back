@@ -88,7 +88,17 @@ export class CalendarService {
        ORDER BY created_at ASC`,
       [userId],
     );
-    return r.rows.map((row) => ({ id: row.id, event: row.event, kind: row.kind }));
+    // Показываем только предложения на БУДУЩЕЕ: предложение «поставить встречу вчера» для уже
+    // сделанного дела висело и путало owner'а. Прошедший datetime → предложение неактуально.
+    const now = Date.now();
+    return r.rows
+      .map((row) => ({ id: row.id, event: row.event as ProposedEvent, kind: row.kind }))
+      .filter((p) => {
+        const dt = p.event?.datetime;
+        if (!dt) return true; // без времени (напр. dates-серия) — не отбрасываем
+        const t = new Date(`${dt}${dt.includes('+') || dt.endsWith('Z') ? '' : OFFSET}`).getTime();
+        return Number.isNaN(t) || t >= now - 60 * 60_000; // грейс час: «идёт сейчас» ещё показываем
+      });
   }
 
   /** Перевести pending→status. Идемпотентно: трогает только pending-строку данного пользователя. */
