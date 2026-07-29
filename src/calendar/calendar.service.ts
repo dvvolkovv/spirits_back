@@ -304,21 +304,6 @@ export class CalendarService {
     }
   }
 
-  /** TEMP debug [diag]: полная картина по календарю пользователя — какие календари видит CalDAV и
-   *  что в них лежит, + сырой ответ TalerID. Чтобы точно понять, почему co-pilot пуст. Удалить. */
-  async debugCalendar(userId: string): Promise<any> {
-    const now = new Date();
-    const end = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-    const creds = await this.creds(userId);
-    const caldav = creds ? await this.connector.debugListRaw(creds, now, end) : { hasCreds: false };
-    let talerid: any;
-    try {
-      const ev = await this.talerIdConnector.listEvents(userId, now, end);
-      talerid = { count: ev.length, sample: ev.slice(0, 5) };
-    } catch (e: any) { talerid = { error: e?.message }; }
-    return { window: { start: now.toISOString(), end: end.toISOString() }, caldav, talerid };
-  }
-
   async listTasks(userId: string, start: Date, end: Date): Promise<Task[]> {
     const creds = await this.creds(userId);
     if (!creds || !creds.taskCollectionUrl) return [];
