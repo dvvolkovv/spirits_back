@@ -317,6 +317,29 @@ export class CalendarService {
   }
 
   /**
+   * Удалить событие [удаление 2026-07-29]. Роутинг по source: 'talerid' → MCP delete_calendar_event,
+   * иначе → CalDAV DELETE ресурса. ICS-источники (read-only) удалять нельзя → честная ошибка.
+   * uid — из co-pilot events (talerid: ev.id; caldav: uid ресурса). Успех → бастим co-pilot-кэш.
+   */
+  async deleteEvent(userId: string, uid: string, source?: string): Promise<{ ok: boolean; error?: string }> {
+    if (!uid) return { ok: false, error: 'Нет идентификатора события' };
+    if (source === 'talerid') {
+      const r = await this.talerIdConnector.deleteEvent(userId, uid);
+      if (r.ok) this.onWrite?.(userId);
+      return r;
+    }
+    if (source && source !== 'yandex') {
+      // corp/ICS и прочие read-only источники — удалять нечем.
+      return { ok: false, error: 'Это событие из внешнего календаря — удали его в источнике' };
+    }
+    const creds = await this.creds(userId);
+    if (!creds) return { ok: false, error: 'Календарь не подключён' };
+    const r = await this.connector.deleteEvent(creds, uid);
+    if (r.ok) this.onWrite?.(userId);
+    return r;
+  }
+
+  /**
    * Quick-add из свободной фразы [виджет-календарь]: «добавь ревью в календарь на 11:00» → событие
    * в календаре, БЕЗ карточки-предложения и без чата (лаунчер зовёт это через приложение-хранителя).
    * Одним фокусным вызовом Haiku 4.5 превращаем фразу в структурированное событие (та же форма, что

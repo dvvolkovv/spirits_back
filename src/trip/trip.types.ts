@@ -38,7 +38,7 @@ export interface CoPilotState {
    * форматированный текст) — чтобы лаунчер мог РАНЖИРОВАТЬ и показывать «ближайшую встречу»
    * по времени [784fd182]. Отсортированы по времени начала. Старые потребители поле игнорируют.
    */
-  events?: { at: string; end?: string; title: string; conflict: boolean }[];
+  events?: { at: string; end?: string; title: string; conflict: boolean; uid?: string; source?: string }[];
   /**
    * Pending-предложения агента [a5131311]: типизированные артефакты (пока `calendar_event`),
    * которые лаунчер показывает карточкой с [Добавить]/[Отклонить]. Absent/[] — нечего предлагать.

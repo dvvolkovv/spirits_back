@@ -161,4 +161,18 @@ export class TalerIdCalendarConnector {
 
     return { created, failed, ids };
   }
+
+  /**
+   * Удалить событие в TalerID по его id (uid из listEvents == ev.id) через MCP delete_calendar_event
+   * [удаление 2026-07-29, owner подтвердил поддержку]. Best-effort: ошибка MCP → {ok:false}.
+   */
+  async deleteEvent(userId: string, id: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      await this.callTool(userId, 'delete_calendar_event', { id });
+      return { ok: true };
+    } catch (e: any) {
+      this.logger.debug(`talerid deleteEvent ${id} failed for user ${userId}: ${e?.message}`);
+      return { ok: false, error: 'Не удалось удалить событие' };
+    }
+  }
 }

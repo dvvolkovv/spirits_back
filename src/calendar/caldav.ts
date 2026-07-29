@@ -224,6 +224,31 @@ export class YandexCalDavConnector implements CalendarConnector {
   }
 
   /**
+   * Удалить событие по uid: DELETE ресурса `${collectionUrl}${uid}.ics` [удаление 2026-07-29].
+   * Best-effort — надёжно работает для событий, СОЗДАННЫХ Линкеоном (мы кладём их как `<uid>.ics`).
+   * Для событий, заведённых во внешнем UI (href ≠ uid.ics) или повторов может не совпасть — тогда
+   * вернём ok:false, лаунчер честно покажет «не удалось». 404 трактуем как успех (уже нет).
+   */
+  async deleteEvent(creds: CalendarCreds, uid: string): Promise<{ ok: boolean; error?: string }> {
+    const base = creds.collectionUrl;
+    if (!base) return { ok: false, error: 'Календарь не подключён' };
+    // Синтетический uid повтора вида "<uid>-<occMs>" → берём базовый uid ресурса.
+    const resourceUid = uid.replace(/-\d{10,}$/, '');
+    try {
+      const res = await fetch(`${base}${resourceUid}.ics`, {
+        method: 'DELETE',
+        headers: { Authorization: this.authHeader(creds) },
+        signal: AbortSignal.timeout(8000),
+      } as any);
+      if (res.status === 404) return { ok: true }; // уже удалено
+      if (res.status < 200 || res.status >= 300) return { ok: false, error: `CalDAV DELETE failed: ${res.status}` };
+      return { ok: true };
+    } catch (e: any) {
+      return { ok: false, error: e?.message || 'CalDAV DELETE failed' };
+    }
+  }
+
+  /**
    * Write one or many VEVENTs depending on the shape of `event`:
    *  - `event.recurrence` set → ONE VEVENT carrying the RRULE (buildVEvent already renders it) →
    *    one PUT. The whole series lives in a single ICS resource.

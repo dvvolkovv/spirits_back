@@ -88,7 +88,8 @@ export function computeCopilotState(input: { tasks: Task[]; events: CalEvent[]; 
     });
     // Структурированное событие для лаунчера [784fd182]: ISO-время → он сам ранжирует/рендерит
     // «ближайшую встречу». contextLines оставляем для обратной совместимости.
-    eventsOut.push({ at: e.at, end: e.end, title: e.title, conflict });
+    // uid+source [удаление 2026-07-29] — чтобы лаунчер мог удалить событие через нужный коннектор.
+    eventsOut.push({ at: e.at, end: e.end, title: e.title, conflict, uid: e.uid, source: e.source });
   });
 
   const reminders = tasks.map((t) => ({ id: t.uid, text: t.title, when: t.due ?? '', critical: false, done: t.done }));
@@ -219,6 +220,11 @@ export class TripService implements OnModuleInit {
       const id = payload?.id;
       if (!id) throw new BadRequestException('id required');
       await this.calendar.setProposalStatus(userId, id, 'dismissed');
+    } else if (kind === 'event_delete') {
+      // Удаление события из календаря из виджета [удаление 2026-07-29]. payload {uid, source}.
+      const uid = payload?.uid;
+      if (!uid) throw new BadRequestException('uid required');
+      await this.calendar.deleteEvent(userId, String(uid), payload?.source ? String(payload.source) : undefined);
     }
 
     return this.getState(userId);
