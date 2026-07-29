@@ -18,4 +18,11 @@ export class NotesController {
   async list(@CurrentUser() user: any) {
     return this.notes.listNotes(String(user.userId));
   }
+
+  // TEMP debug [diag] — сырой ответ TalerID list_notes. Удалить после отладки.
+  @Get('debug')
+  @UseGuards(JwtGuard)
+  async debug(@CurrentUser() user: any) {
+    return this.notes.debugRaw(String(user.userId));
+  }
 }

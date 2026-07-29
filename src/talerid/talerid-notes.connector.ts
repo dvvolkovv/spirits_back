@@ -56,6 +56,16 @@ export class TalerIdNotesConnector {
     }
   }
 
+  /** TEMP debug [diag]: сырой ответ list_notes (и ошибка, если есть) — понять форму/скоуп. Удалить. */
+  async debugRaw(userId: string): Promise<any> {
+    try {
+      const raw = await this.callTool(userId, 'list_notes', { limit: 100 });
+      return { ok: true, isArray: Array.isArray(raw), keys: raw && typeof raw === 'object' ? Object.keys(raw) : null, raw };
+    } catch (e: any) {
+      return { ok: false, error: e?.message };
+    }
+  }
+
   /** Список заметок пользователя. Дефолтит в [] при любой проблеме. */
   async listNotes(userId: string): Promise<TalerIdNote[]> {
     try {
