@@ -158,6 +158,17 @@ export class YandexCalDavConnector implements CalendarConnector {
    * calendars (e.g. shared/"Алиса") get higher ids.
    */
   async discoverCollection(creds: CalendarCreds): Promise<string | null> {
+    // Default WRITE target = lowest-numbered events-<id> (account's «Мои события»).
+    return (await this.discoverAllCollections(creds))[0] ?? null;
+  }
+
+  /**
+   * ALL of the account's VEVENT collections, sorted (default first) [multi-calendar read fix].
+   * discoverCollection picked only the lowest-id calendar, so events living in ANY other calendar
+   * (рабочий, «Алиса», shared, второй личный) were invisible in the co-pilot even though they
+   * exist. listEvents now reads the union across all of these; createEvent still writes to [0].
+   */
+  async discoverAllCollections(creds: CalendarCreds): Promise<string[]> {
     let res: any;
     try {
       res = await fetch(this.calendarHomeUrl(creds), {
@@ -166,8 +177,8 @@ export class YandexCalDavConnector implements CalendarConnector {
         body: '<?xml version="1.0"?><propfind xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><prop><resourcetype/><C:supported-calendar-component-set/></prop></propfind>',
         signal: AbortSignal.timeout(8000),
       } as any);
-    } catch { return null; }
-    if (res.status !== 207) return null;
+    } catch { return []; }
+    if (res.status !== 207) return [];
     const xml = (await res.text()).replace(/<(\/?)[a-zA-Z0-9]+:/g, '<$1'); // strip ns prefixes
     const hrefs: string[] = [];
     for (const m of xml.matchAll(/<response>([\s\S]*?)<\/response>/g)) {
@@ -179,13 +190,10 @@ export class YandexCalDavConnector implements CalendarConnector {
       const hasVevent = /<comp\s+name="VEVENT"/.test(b);
       if (href && isCalendar && hasVevent) hrefs.push(href.trim());
     }
-    if (hrefs.length === 0) return null;
+    if (hrefs.length === 0) return [];
     hrefs.sort(collectionIdComparator); // lowest numeric events-<id> = the default personal calendar
-    const path = hrefs[0];
-    console.debug('caldav discoverCollection: chose', path);
-    // return absolute URL (path is server-absolute like /calendars/<user>/events-<id>/)
     const origin = new URL(creds.baseUrl).origin;
-    return path.startsWith('http') ? path : origin + path;
+    return hrefs.map((h) => (h.startsWith('http') ? h : origin + h));
   }
 
   private async resolveCollection(creds: CalendarCreds): Promise<string | null> {
@@ -257,36 +265,55 @@ export class YandexCalDavConnector implements CalendarConnector {
       <C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">
         <C:time-range start="${fmt(start)}" end="${fmt(end)}"/>
       </C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`;
-    try {
-      const collectionUrl = await this.resolveCollection(creds);
-      if (!collectionUrl) return [];
-      const res = await fetch(collectionUrl, {
-        method: 'REPORT',
-        headers: { Authorization: this.authHeader(creds), Depth: '1', 'Content-Type': 'application/xml' },
-        body: report, signal: AbortSignal.timeout(8000),
-      } as any);
-      if (res.status !== 207) return [];
-      const xml = await res.text();
-      const out: CalEvent[] = [];
-      for (const m of xml.matchAll(/BEGIN:VEVENT[\s\S]*?END:VEVENT/g)) {
-        const parsed: any = ical.parseICS(`BEGIN:VCALENDAR\n${m[0]}\nEND:VCALENDAR`);
-        for (const k of Object.keys(parsed)) {
-          const ev = parsed[k];
-          if (ev?.type === 'VEVENT' && ev.start) {
-            const s = new Date(ev.start);
-            if (s >= start && s < end) {
-              const item: CalEvent = { at: s.toISOString(), title: String(ev.summary || '').trim() || 'Событие', source: 'yandex', uid: ev.uid };
-              if (ev.end) item.end = new Date(ev.end).toISOString();
-              out.push(item);
-            }
+    // Read across ALL of the account's calendars, not just the default [multi-calendar fix]:
+    // the user's meetings live in whichever calendar they use, not necessarily events-<lowest>.
+    let collections = await this.discoverAllCollections(creds);
+    if (collections.length === 0) {
+      const one = await this.resolveCollection(creds); // fallback: stored/default
+      if (one) collections = [one]; else return [];
+    }
+    const perCollection = await Promise.all(
+      collections.map((url) => this.reportEvents(creds, url, report, start, end).catch(() => [] as CalEvent[])),
+    );
+    // Union + dedup by uid (a single event can't legitimately appear twice, but be safe).
+    const seen = new Set<string>();
+    const out: CalEvent[] = [];
+    for (const arr of perCollection) {
+      for (const ev of arr) {
+        const key = ev.uid || `${ev.title}|${ev.at}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(ev);
+      }
+    }
+    return out;
+  }
+
+  /** REPORT one VEVENT collection over the window and parse it into CalEvents. */
+  private async reportEvents(creds: CalendarCreds, collectionUrl: string, report: string, start: Date, end: Date): Promise<CalEvent[]> {
+    const res = await fetch(collectionUrl, {
+      method: 'REPORT',
+      headers: { Authorization: this.authHeader(creds), Depth: '1', 'Content-Type': 'application/xml' },
+      body: report, signal: AbortSignal.timeout(8000),
+    } as any);
+    if (res.status !== 207) return [];
+    const xml = await res.text();
+    const out: CalEvent[] = [];
+    for (const m of xml.matchAll(/BEGIN:VEVENT[\s\S]*?END:VEVENT/g)) {
+      const parsed: any = ical.parseICS(`BEGIN:VCALENDAR\n${m[0]}\nEND:VCALENDAR`);
+      for (const k of Object.keys(parsed)) {
+        const ev = parsed[k];
+        if (ev?.type === 'VEVENT' && ev.start) {
+          const s = new Date(ev.start);
+          if (s >= start && s < end) {
+            const item: CalEvent = { at: s.toISOString(), title: String(ev.summary || '').trim() || 'Событие', source: 'yandex', uid: ev.uid };
+            if (ev.end) item.end = new Date(ev.end).toISOString();
+            out.push(item);
           }
         }
       }
-      return out;
-    } catch (e) {
-      console.debug('caldav listEvents failed', e);
-      return [];
     }
+    return out;
   }
 
   /**

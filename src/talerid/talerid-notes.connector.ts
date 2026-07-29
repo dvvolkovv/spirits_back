@@ -59,7 +59,9 @@ export class TalerIdNotesConnector {
   /** Список заметок пользователя. Дефолтит в [] при любой проблеме. */
   async listNotes(userId: string): Promise<TalerIdNote[]> {
     try {
-      const raw = await this.callTool(userId, 'list_notes', {});
+      // TalerID list_notes принимает { limit } — БЕЗ него живой e2e не находил заметки
+      // (talerid-dev-agent.e2e зовёт с limit:50). Пустой {} = пустой список (баг «заметки пусты»).
+      const raw = await this.callTool(userId, 'list_notes', { limit: 100 });
       const notes = Array.isArray(raw) ? raw : Array.isArray(raw?.notes) ? raw.notes : [];
       const out: TalerIdNote[] = [];
       for (const n of notes) {
