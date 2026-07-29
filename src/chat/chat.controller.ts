@@ -107,19 +107,28 @@ export class ChatController {
     const multer = require('multer');
     const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
 
+    // any(), а не single('file'): принимаем и один файл, и группу.
+    //
+    // Раньше стоял upload.single('file') — ровно один файл за запрос, и
+    // клиенту приходилось слать пачку последовательно, отдельным диалогом на
+    // каждый. При этом дальше, на агент, файл уже уходил под именем `files`
+    // во множественном числе, то есть ограничение было только на входе.
+    //
+    // Старое имя поля `file` продолжает работать: any() собирает всё, что
+    // прислали, независимо от имени.
     await new Promise<void>((resolve, reject) => {
-      upload.single('file')(req as any, res as any, (err: any) => {
+      upload.any()(req as any, res as any, (err: any) => {
         if (err) reject(err);
         else resolve();
       });
     });
 
-    const file = (req as any).file;
+    const files: any[] = (req as any).files || [];
     const body = (req as any).body || {};
     const message = body.message || body.task || '';
     const assistantId = body.assistantId || 'Роман';
 
-    if (!file) return res.status(400).json({ error: 'No file uploaded' });
+    if (!files.length) return res.status(400).json({ error: 'No file uploaded' });
 
     let profileText = '';
     if (this.neo4j) {
@@ -139,7 +148,11 @@ export class ChatController {
     const FormData = require('form-data');
     const axios = require('axios');
     const fd = new FormData();
-    fd.append('files', file.buffer, { filename: file.originalname, contentType: file.mimetype });
+    // Поле `files` повторяется по разу на файл — так multipart и передаёт
+    // список. Агент это поле принимал и раньше, менялся только вход.
+    for (const f of files) {
+      fd.append('files', f.buffer, { filename: f.originalname, contentType: f.mimetype });
+    }
     fd.append('message', fullMessage);
     fd.append('sessionId', `${userId}_${assistantId}`);
 
@@ -217,7 +230,10 @@ export class ChatController {
       // Save history — гарантированно, даже если клиент дисконнектился
       // на любом этапе. Запускаем после res.end чтобы не блокировать ответ.
       if (fullText.length > 0) {
-        const userMsgForHistory = `📎 ${file.originalname}\n${message}`;
+        // Все имена в одну строку: при группе файлов в истории должно быть
+        // видно, что именно присылали, а не только первый из них.
+        const names = files.map((f: any) => f.originalname).join(', ');
+        const userMsgForHistory = `📎 ${names}\n${message}`;
         setImmediate(async () => {
           try {
             await this.chatService.saveChatHistoryPublic(

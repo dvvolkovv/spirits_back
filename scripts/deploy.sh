@@ -100,7 +100,22 @@ push_local_repo() {
     git status -sb | head -10
     exit 1
   fi
-  git push origin "$BRANCH" 2>&1 | tail -3
+  # Отказ push — ОСТАНОВКА, а не предупреждение.
+  #
+  # Раньше результат push игнорировался: вывод уходил в tail, а pipe отдавал
+  # код успешного tail. Когда локальная ветка отставала от origin, push
+  # отклонялся как non-fast-forward, деплой ехал дальше и выкатывал то, что
+  # УЖЕ лежало в origin. Smoke при этом зеленел — сервис ведь жив, — и деплой
+  # рапортовал ALL PHASES GREEN, хотя изменений на проде не было.
+  local push_log
+  if ! push_log=$(git push origin "$BRANCH" 2>&1); then
+    red "  $name: push в origin/$BRANCH отклонён — деплой остановлен"
+    echo "$push_log" | tail -5
+    git status -sb | head -2
+    red "  сделайте git pull --rebase и повторите"
+    exit 1
+  fi
+  echo "$push_log" | tail -3
   cd - >/dev/null
 }
 
