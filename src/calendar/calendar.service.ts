@@ -1,6 +1,7 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
+import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { YandexCalDavConnector } from './caldav';
 import { CalEvent, CalendarCreds, ProposedEvent, ProposedTask, Task } from './calendar.types';
 import { fetchCalendarEvents } from '../trip/calendar'; // read-only ICS sources (T6)
@@ -31,6 +32,7 @@ export class CalendarService {
     private readonly pg: PgService,
     private readonly talerIdStore: TalerIdStoreService,
     private readonly talerIdConnector: TalerIdCalendarConnector,
+    @Optional() private readonly claudeCli?: ClaudeCliService,
   ) {}
 
   /**
@@ -101,11 +103,24 @@ export class CalendarService {
       });
   }
 
-  /** Перевести pending→status. Идемпотентно: трогает только pending-строку данного пользователя. */
-  async setProposalStatus(userId: string, id: string, status: 'accepted' | 'dismissed'): Promise<void> {
-    await this.pg.query(
+  /**
+   * Перевести pending→status. Возвращает true, только если РЕАЛЬНО флипнули pending-строку
+   * (rowCount>0). Идемпотентность приёма предложения строится на этом: второй accept того же id
+   * вернёт false → вызывающий не создаёт второе событие (см. TripService.applyAction).
+   */
+  async setProposalStatus(userId: string, id: string, status: 'accepted' | 'dismissed'): Promise<boolean> {
+    const r = await this.pg.query(
       `UPDATE calendar_proposals SET status = $3 WHERE id = $1 AND user_id = $2 AND status = 'pending'`,
       [id, userId, status],
+    );
+    return (r.rowCount ?? 0) > 0;
+  }
+
+  /** Откат accepted→pending, если запись события в календарь провалилась (не теряем предложение). */
+  async revertProposalToPending(userId: string, id: string): Promise<void> {
+    await this.pg.query(
+      `UPDATE calendar_proposals SET status = 'pending' WHERE id = $1 AND user_id = $2 AND status = 'accepted'`,
+      [id, userId],
     );
   }
 
@@ -299,6 +314,96 @@ export class CalendarService {
       this.logger.error(`createEvent failed: ${e.message}`);
       return { ok: false, error: 'Не удалось записать событие' };
     }
+  }
+
+  /**
+   * Quick-add из свободной фразы [виджет-календарь]: «добавь ревью в календарь на 11:00» → событие
+   * в календаре, БЕЗ карточки-предложения и без чата (лаунчер зовёт это через приложение-хранителя).
+   * Одним фокусным вызовом Haiku 4.5 превращаем фразу в структурированное событие (та же форма, что
+   * у агентского propose_calendar_event), затем createEvent/createTask и человекочитаемый whenText.
+   */
+  async quickAddFromText(
+    userId: string,
+    text: string,
+  ): Promise<{ ok: boolean; title?: string; whenText?: string; datetime?: string; kind?: string; error?: string }> {
+    const phrase = (text || '').trim();
+    if (!phrase) return { ok: false, error: 'Пустой запрос' };
+    if (!this.claudeCli) return { ok: false, error: 'Разбор фразы недоступен' };
+
+    // Текущее локальное время (Екатеринбург, без DST) — модели нужен «сейчас», чтобы понять
+    // «сегодня/завтра/в 11:00». Даём ISO с зоной + человекочитаемо.
+    const now = new Date();
+    const nowLocalIso = new Date(now.getTime() + 5 * 3600_000).toISOString().replace('Z', OFFSET);
+    const prompt =
+      `Ты парсер календарных фраз. Текущее локальное время пользователя: ${nowLocalIso} (Asia/Yekaterinburg).\n` +
+      `Преврати фразу в ОДНО событие календаря. Верни СТРОГО JSON без пояснений:\n` +
+      `{"title": "...", "kind": "event"|"task", "datetime": "YYYY-MM-DDTHH:MM:SS" | null, "durationMin": 60}\n` +
+      `Правила: title — краткое название дела (без слов «добавь/поставь/в календарь»). ` +
+      `Если есть конкретное время → kind="event", datetime = локальное ISO без зоны (относительно «сейчас»: ` +
+      `«на 11:00» без даты = ближайшие сегодня/завтра в 11:00, если 11:00 сегодня уже прошло — завтра). ` +
+      `Если времени нет вовсе → kind="task", datetime=null. durationMin по умолчанию 60. ` +
+      `Не выдумывай дату, если её нет — бери ближайшую подходящую от «сейчас».\n` +
+      `Фраза: ${JSON.stringify(phrase)}`;
+
+    let parsed: any = null;
+    try {
+      const raw = await this.claudeCli.text(prompt, { model: 'claude-haiku-4-5' });
+      parsed = this.parseJsonTolerant(raw);
+    } catch (e: any) {
+      this.logger.error(`quickAdd parse failed: ${e.message}`);
+      return { ok: false, error: 'Не удалось разобрать фразу' };
+    }
+    const title = String(parsed?.title || '').trim();
+    if (!title) return { ok: false, error: 'Не понял, что добавить' };
+    const kind = parsed?.kind === 'task' ? 'task' : 'event';
+    const datetime = typeof parsed?.datetime === 'string' && parsed.datetime ? parsed.datetime : undefined;
+    const durationMin = Number.isFinite(parsed?.durationMin) ? Number(parsed.durationMin) : 60;
+
+    if (kind === 'task' || !datetime) {
+      const res = await this.createTask(userId, { title, note: parsed?.note });
+      return res.ok
+        ? { ok: true, title, kind: 'task', whenText: 'в задачи «Мои дела»' }
+        : { ok: false, error: res.error || 'Не удалось добавить задачу' };
+    }
+    const event: ProposedEvent = { title, datetime, durationMin, note: parsed?.note };
+    const res = await this.createEvent(userId, event);
+    if (!res.ok) return { ok: false, error: res.error || 'Не удалось добавить событие' };
+    return { ok: true, title, kind: 'event', datetime, whenText: this.humanWhen(datetime) };
+  }
+
+  /** «сегодня 11:00» / «завтра 15:30» / «29.07 11:00» — для inline-подтверждения в виджете. */
+  private humanWhen(datetimeLocal: string): string {
+    const t = new Date(`${datetimeLocal}${datetimeLocal.includes('+') || datetimeLocal.endsWith('Z') ? '' : OFFSET}`);
+    if (Number.isNaN(t.getTime())) return datetimeLocal;
+    const nowY = new Date(Date.now() + 5 * 3600_000);
+    const evY = new Date(t.getTime() + 5 * 3600_000);
+    const hh = String(evY.getUTCHours()).padStart(2, '0');
+    const mm = String(evY.getUTCMinutes()).padStart(2, '0');
+    const dayDiff = Math.floor((Date.UTC(evY.getUTCFullYear(), evY.getUTCMonth(), evY.getUTCDate()) -
+      Date.UTC(nowY.getUTCFullYear(), nowY.getUTCMonth(), nowY.getUTCDate())) / 86400_000);
+    const when = dayDiff === 0 ? 'сегодня' : dayDiff === 1 ? 'завтра'
+      : `${String(evY.getUTCDate()).padStart(2, '0')}.${String(evY.getUTCMonth() + 1).padStart(2, '0')}`;
+    return `${when} ${hh}:${mm}`;
+  }
+
+  /** Толерантный JSON-парсер (модель иногда оборачивает в markdown/прозу). */
+  private parseJsonTolerant(text: string): any | null {
+    if (!text) return null;
+    let s = text.trim();
+    if (s.startsWith('```')) s = s.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '').trim();
+    try { return JSON.parse(s); } catch { /* fall through to brace scan */ }
+    const start = s.indexOf('{');
+    if (start === -1) return null;
+    let depth = 0, inStr = false, esc = false;
+    for (let i = start; i < s.length; i++) {
+      const c = s[i];
+      if (esc) { esc = false; continue; }
+      if (c === '\\') { if (inStr) esc = true; continue; }
+      if (c === '"') { inStr = !inStr; continue; }
+      if (!inStr && c === '{') depth++;
+      if (!inStr && c === '}') { depth--; if (depth === 0) { try { return JSON.parse(s.slice(start, i + 1)); } catch { return null; } } }
+    }
+    return null;
   }
 
   async createTask(userId: string, task: ProposedTask): Promise<{ ok: boolean; uid?: string; error?: string }> {

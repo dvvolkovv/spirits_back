@@ -158,11 +158,29 @@ export class TripService implements OnModuleInit {
     // Pending-предложения агента [a5131311] — докладываем в стейт (чистая computeCopilotState их не
     // знает, это async из БД). Absent-safe: пустой список → лаунчер ничего не показывает.
     const pending = await this.calendar.listPendingProposals(userId);
-    state.proposals = pending.map((p) => ({
-      id: p.id,
-      kind: 'calendar_event',
-      payload: { event: p.event },
-    }));
+    // Контентный дедуп [фикс дублей 2026-07-29]: не предлагаем добавить то, что УЖЕ есть в календаре.
+    // Кроет кросс-поверхностный вектор: событие создали в чате (POST /calendar/events, статус
+    // предложения не тронут) → без этого фильтра виджет показал бы предложение снова → второй add.
+    // Матч по нормализованному title + datetime в пределах ±10 мин (или тот же день, если без времени).
+    const norm = (s: string) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const eventInCalendar = (ev: { title?: string; datetime?: string }): boolean => {
+      const t = norm(ev?.title || '');
+      if (!t) return false;
+      const pdt = ev?.datetime ? new Date(`${ev.datetime}${ev.datetime.includes('+') || ev.datetime.endsWith('Z') ? '' : '+05:00'}`).getTime() : NaN;
+      return events.some((e) => {
+        if (norm(e.title) !== t) return false;
+        if (Number.isNaN(pdt)) return true; // предложение без времени + совпал title → считаем что уже есть
+        const et = new Date(e.at).getTime();
+        return Number.isFinite(et) && Math.abs(et - pdt) <= 10 * 60_000;
+      });
+    };
+    state.proposals = pending
+      .filter((p) => !eventInCalendar(p.event as any))
+      .map((p) => ({
+        id: p.id,
+        kind: 'calendar_event',
+        payload: { event: p.event },
+      }));
     return state;
   }
 
@@ -183,17 +201,20 @@ export class TripService implements OnModuleInit {
       if (!uid) throw new BadRequestException('uid required');
       await this.calendar.setTaskDone(userId, uid, Boolean(payload?.done));
     } else if (kind === 'proposal_accept') {
-      // Предложение агента принято из лаунчера [a5131311]: пишем событие в календарь (только по
-      // подтверждению) и закрываем предложение. Идемпотентно: setStatus трогает лишь pending.
+      // Предложение агента принято из лаунчера [a5131311]. Идемпотентность [фикс дублей 2026-07-29]:
+      // СНАЧАЛА флипаем pending→accepted (атомарно, rowCount) и создаём событие ТОЛЬКО если реально
+      // флипнули — второй accept того же id (двойной тап / гонка) вернёт false и НЕ задвоит событие.
+      // При ошибке записи откатываем статус в pending, чтобы предложение не потерялось.
       const id = payload?.id;
       if (!id) throw new BadRequestException('id required');
-      const p = await this.calendar.getProposal(userId, id);
-      // Пишем в календарь только по подтверждению, только event-предложение. createEvent ДО
-      // setStatus: если запись упадёт, предложение останется pending (не потеряется).
-      if (p && p.kind === 'event' && p.event) {
-        await this.calendar.createEvent(userId, p.event);
+      const flipped = await this.calendar.setProposalStatus(userId, id, 'accepted');
+      if (flipped) {
+        const p = await this.calendar.getProposal(userId, id);
+        if (p && p.kind === 'event' && p.event) {
+          const res = await this.calendar.createEvent(userId, p.event);
+          if (!res.ok) await this.calendar.revertProposalToPending(userId, id);
+        }
       }
-      await this.calendar.setProposalStatus(userId, id, 'accepted');
     } else if (kind === 'proposal_dismiss') {
       const id = payload?.id;
       if (!id) throw new BadRequestException('id required');

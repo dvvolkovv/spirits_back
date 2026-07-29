@@ -32,6 +32,13 @@ export class CalendarController {
     return this.calendar.createTask(String(user.userId), body);
   }
 
+  // Inline quick-add из виджета лаунчера [календарь-виджет]: свободная фраза → событие, без чата/карточки.
+  @Post('quick-add')
+  @UseGuards(JwtGuard)
+  async quickAdd(@CurrentUser() user: any, @Body() body: { text?: string }) {
+    return this.calendar.quickAddFromText(String(user.userId), body?.text || '');
+  }
+
   @Post('tasks/:uid/done')
   @UseGuards(JwtGuard)
   async setTaskDone(@CurrentUser() user: any, @Param('uid') uid: string, @Body() body: { done: boolean }) {
