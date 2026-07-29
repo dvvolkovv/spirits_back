@@ -289,6 +289,29 @@ export class YandexCalDavConnector implements CalendarConnector {
     return out;
   }
 
+  /** TEMP debug [diag]: raw per-collection REPORT — какие календари найдены и что в них реально
+   *  лежит в окне (summary/DTSTART/есть ли RRULE) — чтобы понять, почему co-pilot пуст. Удалить. */
+  async debugListRaw(creds: CalendarCreds, start: Date, end: Date): Promise<any> {
+    const fmt = (d: Date) => d.toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
+    const report = `<?xml version="1.0"?><C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><C:calendar-data/></D:prop><C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT"><C:time-range start="${fmt(start)}" end="${fmt(end)}"/></C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`;
+    const collections = await this.discoverAllCollections(creds);
+    const per: any[] = [];
+    for (const url of collections) {
+      try {
+        const res = await fetch(url, { method: 'REPORT', headers: { Authorization: this.authHeader(creds), Depth: '1', 'Content-Type': 'application/xml' }, body: report, signal: AbortSignal.timeout(8000) } as any);
+        const xml = await res.text();
+        const blocks = [...xml.matchAll(/BEGIN:VEVENT[\s\S]*?END:VEVENT/g)];
+        const samples = blocks.slice(0, 8).map((m) => ({
+          summary: /SUMMARY:(.*)/.exec(m[0])?.[1]?.trim(),
+          dtstart: /DTSTART[^:\n]*:([^\r\n]*)/.exec(m[0])?.[1]?.trim(),
+          hasRrule: /RRULE:/.test(m[0]),
+        }));
+        per.push({ url, status: res.status, veventBlocks: blocks.length, samples });
+      } catch (e: any) { per.push({ url, error: e?.message }); }
+    }
+    return { collectionsFound: collections.length, collections, perCollection: per };
+  }
+
   /** REPORT one VEVENT collection over the window and parse it into CalEvents. */
   private async reportEvents(creds: CalendarCreds, collectionUrl: string, report: string, start: Date, end: Date): Promise<CalEvent[]> {
     const res = await fetch(collectionUrl, {

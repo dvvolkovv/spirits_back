@@ -14,6 +14,13 @@ export class CalendarController {
     return this.calendar.getStatus(String(user.userId));
   }
 
+  // TEMP debug [diag] — удалить после отладки пустого co-pilot.
+  @Get('debug')
+  @UseGuards(JwtGuard)
+  async debug(@CurrentUser() user: any) {
+    return this.calendar.debugCalendar(String(user.userId));
+  }
+
   @Post('connect')
   @UseGuards(JwtGuard)
   async connect(@CurrentUser() user: any, @Body() body: { provider?: string; username: string; appPassword: string }) {
