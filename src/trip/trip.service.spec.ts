@@ -63,7 +63,7 @@ describe('computeCopilotState', () => {
     expect(s2.contextLines.some((l) => l.tone === 'warn')).toBe(true);
   });
 
-  it('reminders содержат все задачи (done и pending), timeTriggers — только pending с due', () => {
+  it('reminders содержат все задачи; обычные дела (без дедлайна/событий) НЕ пушат по времени', () => {
     const s = computeCopilotState({
       tasks: [
         task('t1', 'Собрать вещи', '2026-07-20T09:00:00'),
@@ -74,7 +74,8 @@ describe('computeCopilotState', () => {
       now,
     });
     expect(s.reminders.length).toBe(3);
-    expect(s.timeTriggers.map((t) => t.id)).toEqual(['task-t1']);
+    // Модель «пора»: обычные дела по времени не пушим (важно не время, а факт). Нет событий/дедлайнов → пусто.
+    expect(s.timeTriggers).toEqual([]);
   });
 
   it('events[] структурированы (ISO at + conflict) для ранжирования в лаунчере [784fd182]', () => {
@@ -137,7 +138,8 @@ describe('computeCopilotState', () => {
       ...overrides,
     });
     const taleridCal = { listEvents: jest.fn().mockResolvedValue([]) } as any;
-    const svc = (calendar: any) => new TripService({} as any, calendar, taleridCal);
+    const linkeonTasks = { list: jest.fn().mockResolvedValue([]) } as any;
+    const svc = (calendar: any) => new TripService({} as any, calendar, taleridCal, linkeonTasks);
 
     it('proposal_accept → пишет event в календарь + помечает accepted', async () => {
       const event = { title: 'Созвон', datetime: '2026-07-20T15:00:00', durationMin: 60 };

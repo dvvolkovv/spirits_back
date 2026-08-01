@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit, BadRequestException } from '@nestjs/c
 import { PgService } from '../common/services/pg.service';
 import { CoPilotState } from './trip.types';
 import { CalendarService } from '../calendar/calendar.service';
+import { LinkeonTasksService } from '../calendar/linkeon-tasks.service';
 import { CalEvent, Task } from '../calendar/calendar.types';
 import { TalerIdCalendarConnector } from '../talerid/talerid-calendar.connector';
 
@@ -68,16 +69,28 @@ export function computeCopilotState(input: {
 
   const isDone = (t: Task) => t.done || t.status === 'done';
   const isDropped = (t: Task) => t.status === 'dropped';
+  const localDay = (ms: number) =>
+    new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Yekaterinburg' }).format(new Date(ms)); // YYYY-MM-DD
+  const today = localDay(now.getTime());
+  const doneToday = (t: Task) => {
+    if (!isDone(t)) return false;
+    const ref = t.doneAt || (t.occurrenceDate ? `${t.occurrenceDate}T00:00:00` : undefined) || t.due;
+    return ref ? localDay(parse(ref)) === today : false;
+  };
   // Все не-закрытые (для reminders/timeTriggers — обратная совместимость).
   const pending = tasks
     .filter((t) => !isDone(t) && !isDropped(t))
     .sort((a, b) => (a.due ? parse(a.due) : Infinity) - (b.due ? parse(b.due) : Infinity));
-  // Зона «Дела и рутины»: сегодня + просроченные. due=null («когда-нибудь») ИЛИ due<=горизонт (в т.ч.
-  // просрочка, т.к. due<now<горизонт). Дела дальше горизонта не показываем — всплывут когда приблизятся.
-  const zoneTasks = pending.filter((t) => !t.due || parse(t.due) <= horizonEnd);
+  // Зона «Дела и рутины»: не снятые; ПЕНДИНГ в горизонте (сегодня + просроченные; due=null=«когда-нибудь»)
+  // + СДЕЛАННЫЕ СЕГОДНЯ (приглушённо — видно что уже закрыто). Дальше горизонта и сделанные не сегодня — нет.
+  const zoneTasks = tasks
+    .filter((t) => !isDropped(t))
+    .filter((t) => (isDone(t) ? doneToday(t) : !t.due || parse(t.due) <= horizonEnd))
+    .sort((a, b) => (a.due ? parse(a.due) : Infinity) - (b.due ? parse(b.due) : Infinity));
 
-  const headline = zoneTasks[0]
-    ? `Ближайшее: ${zoneTasks[0].title}`
+  const firstPending = zoneTasks.find((t) => !isDone(t));
+  const headline = firstPending
+    ? `Ближайшее: ${firstPending.title}`
     : horizonEvents[0]
       ? `Ближайшее событие: ${horizonEvents[0].title}`
       : 'Пока всё спокойно';
@@ -112,19 +125,31 @@ export function computeCopilotState(input: {
   const tasksOut: NonNullable<CoPilotState['tasks']> = zoneTasks.map((t) => ({
     uid: t.uid,
     title: t.title,
-    status: 'pending',
+    status: isDone(t) ? 'done' : 'pending',
     due: t.due,
     deadline: t.deadline,
     isRoutine: Boolean(t.recurrence || t.isRoutine),
     occurrenceDate: t.occurrenceDate,
-    overdue: Boolean(t.due && parse(t.due) < now.getTime()),
+    overdue: Boolean(!isDone(t) && t.due && parse(t.due) < now.getTime()),
+    doneAt: t.doneAt,
     source: t.source,
   }));
 
   const reminders = tasks.map((t) => ({ id: t.uid, text: t.title, when: t.due ?? '', critical: false, done: isDone(t) }));
-  const timeTriggers = pending
-    .filter((t) => t.due)
-    .map((t) => ({ id: `task-${t.uid}`, at: t.due!, title: 'Напоминание', body: t.title }));
+  // Напоминания «пора» [модель 2026-08-01]: СОБЫТИЕ пушит за лид-тайм (время критично, ждут другие);
+  // обычные дела по времени НЕ пушат (важно не время, а факт — висят в виджете). Исключение — жёсткий
+  // ДЕДЛАЙН дела. Анти-нудж: только критичное.
+  const LEAD_MIN = 10;
+  const eventTriggers = horizonEvents.map((e) => ({
+    id: `event-${e.uid || e.at}`,
+    at: new Date(parse(e.at) - LEAD_MIN * 60_000).toISOString(),
+    title: 'Скоро событие',
+    body: e.title,
+  }));
+  const deadlineTriggers = pending
+    .filter((t) => t.deadline)
+    .map((t) => ({ id: `deadline-${t.uid}`, at: t.deadline!, title: 'Дедлайн', body: t.title }));
+  const timeTriggers = [...eventTriggers, ...deadlineTriggers];
 
   return {
     headline,
@@ -150,6 +175,7 @@ export class TripService implements OnModuleInit {
     private readonly pg: PgService,
     private readonly calendar: CalendarService,
     private readonly taleridCalendar: TalerIdCalendarConnector,
+    private readonly linkeonTasks: LinkeonTasksService,
   ) {}
 
   async onModuleInit() {
@@ -179,13 +205,17 @@ export class TripService implements OnModuleInit {
     const now = new Date();
     const start = now;
     const end = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-    const [tasks, icsEvents, taleridEvents] = await Promise.all([
+    const [vtodoTasks, linkeonTasks, icsEvents, taleridEvents] = await Promise.all([
       this.calendar.listTasks(userId, start, end),
+      // Дела/рутины Линкеона [«дом дел», 2026-08-01] — облачная правда, наш стор.
+      this.linkeonTasks.list(userId, start, end, now),
       this.calendar.listEvents(userId, start, end),
       // TalerID-календарь — ещё один источник событий [6ad042df]. Коннектор best-effort:
       // при не-подключённом TalerID / ошибке MCP вернёт [], со-пилот не ломается.
       this.taleridCalendar.listEvents(userId, start, end),
     ]);
+    // Дела: сначала линкеоновские (наш стор), затем внешние VTODO (Яндекс) — источник несёт t.source.
+    const tasks = [...linkeonTasks, ...vtodoTasks];
     const events = mergeEvents(icsEvents, taleridEvents);
     const state = computeCopilotState({ tasks, events, now: new Date() });
     // Pending-предложения агента [a5131311] — докладываем в стейт (чистая computeCopilotState их не
@@ -232,7 +262,33 @@ export class TripService implements OnModuleInit {
     if (kind === 'task_done') {
       const uid = payload?.uid;
       if (!uid) throw new BadRequestException('uid required');
-      await this.calendar.setTaskDone(userId, uid, Boolean(payload?.done));
+      // Линкеоновское дело/рутина → наш стор (occurrenceDate для рутины); иначе внешний VTODO (Яндекс).
+      if (payload?.source === 'linkeon') {
+        await this.linkeonTasks.setDone(userId, String(uid), Boolean(payload?.done), payload?.occurrenceDate ? String(payload.occurrenceDate) : undefined);
+      } else {
+        await this.calendar.setTaskDone(userId, String(uid), Boolean(payload?.done));
+      }
+    } else if (kind === 'routine_done') {
+      const uid = payload?.uid;
+      if (!uid) throw new BadRequestException('uid required');
+      await this.linkeonTasks.setDone(userId, String(uid), Boolean(payload?.done), payload?.occurrenceDate ? String(payload.occurrenceDate) : undefined);
+    } else if (kind === 'task_reschedule') {
+      const uid = payload?.uid;
+      if (!uid || !payload?.newDue) throw new BadRequestException('uid+newDue required');
+      await this.linkeonTasks.reschedule(userId, String(uid), String(payload.newDue), payload?.occurrenceDate ? String(payload.occurrenceDate) : undefined);
+    } else if (kind === 'task_drop') {
+      const uid = payload?.uid;
+      if (!uid) throw new BadRequestException('uid required');
+      await this.linkeonTasks.drop(userId, String(uid));
+    } else if (kind === 'task_create') {
+      if (!payload?.title) throw new BadRequestException('title required');
+      await this.linkeonTasks.create(userId, {
+        title: String(payload.title),
+        due: payload?.due ? String(payload.due) : undefined,
+        deadline: payload?.deadline ? String(payload.deadline) : undefined,
+        note: payload?.note ? String(payload.note) : undefined,
+        recurrence: payload?.recurrence,
+      });
     } else if (kind === 'proposal_accept') {
       // Предложение агента принято из лаунчера [a5131311]. Идемпотентность [фикс дублей 2026-07-29]:
       // СНАЧАЛА флипаем pending→accepted (атомарно, rowCount) и создаём событие ТОЛЬКО если реально

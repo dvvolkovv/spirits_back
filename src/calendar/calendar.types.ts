@@ -29,6 +29,7 @@ export interface Task {
   status?: 'pending' | 'done' | 'dropped';
   isRoutine?: boolean;    // явный флаг (стор Линкеона выставляет при разворачивании серии)
   occurrenceDate?: string;// YYYY-MM-DD: за какой день эта отметка (рутина)
+  doneAt?: string;        // ISO: когда закрыто (сервер ставит; для «сделано сегодня» + аналитики)
 }
 
 export interface ProposedTask {

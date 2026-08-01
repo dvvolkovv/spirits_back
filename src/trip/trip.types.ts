@@ -54,6 +54,7 @@ export interface CoPilotState {
     isRoutine?: boolean;
     occurrenceDate?: string;
     overdue?: boolean;
+    doneAt?: string;
     source?: string;
   }[];
   next?: { at: string; title: string };

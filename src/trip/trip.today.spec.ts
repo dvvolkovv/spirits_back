@@ -63,6 +63,21 @@ describe('computeCopilotState — модель «твой сегодня»', () 
     expect(uids).not.toContain('dp');
   });
 
+  it('сделанное СЕГОДНЯ показывается (status=done, приглушённо), сделанное вчера — нет', () => {
+    const s = computeCopilotState({
+      now,
+      events: [],
+      tasks: [
+        tk('today', 'Витамины', { done: true, status: 'done', doneAt: '2026-08-01T08:15:00+05:00' }),
+        tk('yest', 'Вчерашнее', { done: true, status: 'done', doneAt: '2026-07-31T20:00:00+05:00' }),
+      ],
+    });
+    const uids = s.tasks!.map((x) => x.uid);
+    expect(uids).toContain('today');
+    expect(uids).not.toContain('yest');
+    expect(s.tasks!.find((x) => x.uid === 'today')!.status).toBe('done');
+  });
+
   it('headline = ближайшее дело зоны; reminders хранят все задачи (совместимость)', () => {
     const s = computeCopilotState({
       now,
@@ -75,5 +90,22 @@ describe('computeCopilotState — модель «твой сегодня»', () 
     });
     expect(s.headline).toContain('Раннее дело');
     expect(s.reminders.map((r) => r.id).sort()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('напоминания «пора»: событие за 10 мин + дедлайн-дело пушат, обычное дело — нет', () => {
+    const s = computeCopilotState({
+      now,
+      events: [ev('2026-08-01T11:00:00+05:00', 'Синк')],
+      tasks: [
+        tk('d', 'Отчёт', { deadline: '2026-08-01T15:00:00+05:00' }),
+        tk('n', 'Обычное', { due: '2026-08-01T12:00:00+05:00' }),
+      ],
+    });
+    const ids = s.timeTriggers.map((t) => t.id);
+    expect(ids.some((id) => id.startsWith('event-'))).toBe(true);
+    expect(ids).toContain('deadline-d');
+    expect(ids.some((id) => id.includes('-n'))).toBe(false); // обычное дело не пушит
+    const evTrig = s.timeTriggers.find((t) => t.id.startsWith('event-'))!;
+    expect(new Date(evTrig.at).getTime()).toBe(new Date('2026-08-01T10:50:00+05:00').getTime()); // лид-тайм 10 мин
   });
 });
