@@ -86,6 +86,7 @@ describe('computeCopilotState', () => {
         ev('e3', 'Одиночное', '2026-07-21T09:00:00Z'),
       ],
       now,
+      horizonHours: 24 * 30, // тест про СТРУКТУРУ/конфликт, не про горизонт — берём все 3
     });
     expect(s.events?.length).toBe(3);
     // первые два пересекаются → conflict:true у обоих; третье — false
@@ -128,8 +129,9 @@ describe('computeCopilotState', () => {
       listTasks: jest.fn().mockResolvedValue([]),
       listEvents: jest.fn().mockResolvedValue([]),
       listPendingProposals: jest.fn().mockResolvedValue([]),
-      createEvent: jest.fn().mockResolvedValue({ created: 1, failed: 0, ids: ['e1'] }),
-      setProposalStatus: jest.fn().mockResolvedValue(undefined),
+      createEvent: jest.fn().mockResolvedValue({ ok: true, created: 1, failed: 0, uids: ['e1'] }),
+      setProposalStatus: jest.fn().mockResolvedValue(true), // прод возвращает rowCount>0 при флипе pending→accepted
+      revertProposalToPending: jest.fn().mockResolvedValue(undefined),
       getProposal: jest.fn(),
       setTaskDone: jest.fn().mockResolvedValue(undefined),
       ...overrides,

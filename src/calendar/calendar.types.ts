@@ -20,9 +20,15 @@ export interface ProposedEvent {
 export interface Task {
   uid: string;
   title: string;
-  due?: string;
+  due?: string;           // мягкий ориентир по времени (ISO)
   done: boolean;
   source: string;
+  // --- модель «твой сегодня» [2026-08-01], все опциональны (обратная совместимость с CalDAV/TalerID) ---
+  deadline?: string;      // жёсткий срок, отдельно от due
+  recurrence?: Recurrence;// задано → это рутина (повторяющееся дело)
+  status?: 'pending' | 'done' | 'dropped';
+  isRoutine?: boolean;    // явный флаг (стор Линкеона выставляет при разворачивании серии)
+  occurrenceDate?: string;// YYYY-MM-DD: за какой день эта отметка (рутина)
 }
 
 export interface ProposedTask {

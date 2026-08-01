@@ -48,18 +48,38 @@ export function mergeEvents(...sources: CalEvent[][]): CalEvent[] {
   return out;
 }
 
-export function computeCopilotState(input: { tasks: Task[]; events: CalEvent[]; now: Date }): CoPilotState {
+export function computeCopilotState(input: {
+  tasks: Task[];
+  events: CalEvent[];
+  now: Date;
+  horizonHours?: number;
+}): CoPilotState {
   const { tasks, events, now } = input;
+  const horizonHours = input.horizonHours ?? 36;
+  const horizonEnd = now.getTime() + horizonHours * 3_600_000;
   const parse = (s: string) => new Date(s.includes('+') || s.endsWith('Z') ? s : `${s}+05:00`).getTime();
 
+  // --- «Твой сегодня» [2026-08-01] ---
+  // События: в ГОРИЗОНТЕ (показываем по времени) vs ЗА горизонтом (→ «Дальше», не засоряем сегодня).
+  const sortedEvents = [...events].sort((a, b) => parse(a.at) - parse(b.at));
+  const horizonEvents = sortedEvents.filter((e) => parse(e.at) <= horizonEnd);
+  const beyond = sortedEvents.filter((e) => parse(e.at) > horizonEnd);
+  const nextBeyond = beyond[0];
+
+  const isDone = (t: Task) => t.done || t.status === 'done';
+  const isDropped = (t: Task) => t.status === 'dropped';
+  // Все не-закрытые (для reminders/timeTriggers — обратная совместимость).
   const pending = tasks
-    .filter((t) => !t.done)
+    .filter((t) => !isDone(t) && !isDropped(t))
     .sort((a, b) => (a.due ? parse(a.due) : Infinity) - (b.due ? parse(b.due) : Infinity));
-  const next = pending[0];
-  const headline = next
-    ? `Ближайшее: ${next.title}`
-    : events[0]
-      ? `Ближайшее событие: ${events[0].title}`
+  // Зона «Дела и рутины»: сегодня + просроченные. due=null («когда-нибудь») ИЛИ due<=горизонт (в т.ч.
+  // просрочка, т.к. due<now<горизонт). Дела дальше горизонта не показываем — всплывут когда приблизятся.
+  const zoneTasks = pending.filter((t) => !t.due || parse(t.due) <= horizonEnd);
+
+  const headline = zoneTasks[0]
+    ? `Ближайшее: ${zoneTasks[0].title}`
+    : horizonEvents[0]
+      ? `Ближайшее событие: ${horizonEvents[0].title}`
       : 'Пока всё спокойно';
 
   const contextLines: CoPilotState['contextLines'] = [];
@@ -79,20 +99,29 @@ export function computeCopilotState(input: { tasks: Task[]; events: CalEvent[]; 
     minute: '2-digit',
   });
   const eventsOut: NonNullable<CoPilotState['events']> = [];
-  events.forEach((e, i) => {
-    const conflict = events.some((o, j) => j !== i && overlaps(e, o));
+  horizonEvents.forEach((e, i) => {
+    const conflict = horizonEvents.some((o, j) => j !== i && overlaps(e, o));
     contextLines.push({
       icon: conflict ? '⚠️' : '📅',
       text: `${fmt.format(new Date(e.at)).replace(/,/g, '')} — ${e.title}${conflict ? ' (пересечение)' : ''}`,
       tone: conflict ? 'warn' : undefined,
     });
-    // Структурированное событие для лаунчера [784fd182]: ISO-время → он сам ранжирует/рендерит
-    // «ближайшую встречу». contextLines оставляем для обратной совместимости.
-    // uid+source [удаление 2026-07-29] — чтобы лаунчер мог удалить событие через нужный коннектор.
     eventsOut.push({ at: e.at, end: e.end, title: e.title, conflict, uid: e.uid, source: e.source });
   });
 
-  const reminders = tasks.map((t) => ({ id: t.uid, text: t.title, when: t.due ?? '', critical: false, done: t.done }));
+  const tasksOut: NonNullable<CoPilotState['tasks']> = zoneTasks.map((t) => ({
+    uid: t.uid,
+    title: t.title,
+    status: 'pending',
+    due: t.due,
+    deadline: t.deadline,
+    isRoutine: Boolean(t.recurrence || t.isRoutine),
+    occurrenceDate: t.occurrenceDate,
+    overdue: Boolean(t.due && parse(t.due) < now.getTime()),
+    source: t.source,
+  }));
+
+  const reminders = tasks.map((t) => ({ id: t.uid, text: t.title, when: t.due ?? '', critical: false, done: isDone(t) }));
   const timeTriggers = pending
     .filter((t) => t.due)
     .map((t) => ({ id: `task-${t.uid}`, at: t.due!, title: 'Напоминание', body: t.title }));
@@ -102,6 +131,9 @@ export function computeCopilotState(input: { tasks: Task[]; events: CalEvent[]; 
     sub: undefined,
     contextLines,
     events: eventsOut,
+    tasks: tasksOut,
+    next: nextBeyond ? { at: nextBeyond.at, title: nextBeyond.title } : undefined,
+    horizonHours,
     reminders,
     geoTriggers: [],
     timeTriggers,

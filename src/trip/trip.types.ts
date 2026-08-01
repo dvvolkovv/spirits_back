@@ -40,6 +40,25 @@ export interface CoPilotState {
    */
   events?: { at: string; end?: string; title: string; conflict: boolean; uid?: string; source?: string }[];
   /**
+   * Модель «твой сегодня» [2026-08-01]. Две зоны: `events` (по времени, в горизонте) и `tasks`
+   * (дела/рутины к выполнению — сегодня + просроченные, висят пока не закрыты). `next` — «Дальше»:
+   * ближайшее крупное ЗА горизонтом, чтобы не быть слепым, но и не засорять «сегодня». Старые
+   * потребители новые поля игнорируют.
+   */
+  tasks?: {
+    uid: string;
+    title: string;
+    status: 'pending' | 'done' | 'dropped';
+    due?: string;
+    deadline?: string;
+    isRoutine?: boolean;
+    occurrenceDate?: string;
+    overdue?: boolean;
+    source?: string;
+  }[];
+  next?: { at: string; title: string };
+  horizonHours?: number;
+  /**
    * Pending-предложения агента [a5131311]: типизированные артефакты (пока `calendar_event`),
    * которые лаунчер показывает карточкой с [Добавить]/[Отклонить]. Absent/[] — нечего предлагать.
    */
