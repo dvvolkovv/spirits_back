@@ -1,9 +1,8 @@
-import { Controller, Get, Post, Delete, Body, UseGuards, HttpCode, HttpStatus, Logger, Query, Res } from '@nestjs/common';
+import { Controller, Get, Post, Delete, UseGuards, HttpCode, HttpStatus, Logger, Query, Res } from '@nestjs/common';
 import { Response } from 'express';
 import { TalerIdOauthService } from './talerid-oauth.service';
 import { TalerIdStoreService } from './talerid-store.service';
 import { TalerIdLinkService } from './talerid-link.service';
-import { TalerIdCalendarConnector } from './talerid-calendar.connector';
 import { PgService } from '../common/services/pg.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
@@ -23,16 +22,8 @@ export class TalerIdController {
     private readonly oauth: TalerIdOauthService,
     private readonly store: TalerIdStoreService,
     private readonly link: TalerIdLinkService,
-    private readonly calConnector: TalerIdCalendarConnector,
     private readonly pg: PgService,
   ) {}
-
-  // ⚠️ ВРЕМЕННО (2026-08-02): сырой MCP для миграции умываний event→task. Удалить после.
-  @Post('test-raw')
-  @UseGuards(JwtGuard)
-  async testRaw(@CurrentUser() user: any, @Body() body: { name?: string; args?: any }) {
-    return this.calConnector.rawCall(String(user.userId), String(body?.name || ''), body?.args || {});
-  }
 
   /**
    * Best-effort profile lookup for provisioning: phone is required (TalerID accounts are keyed by

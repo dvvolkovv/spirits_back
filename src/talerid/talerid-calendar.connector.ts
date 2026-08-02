@@ -261,12 +261,4 @@ export class TalerIdCalendarConnector {
     }
   }
 
-  // ⚠️ ВРЕМЕННО (2026-08-02): сырой MCP-вызов для миграции умываний event→task. Удалить после.
-  async rawCall(userId: string, name: string, args: Record<string, any>): Promise<any> {
-    try {
-      return await this.callTool(userId, name, args);
-    } catch (e: any) {
-      return { __error: e?.message };
-    }
-  }
 }
