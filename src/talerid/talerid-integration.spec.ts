@@ -36,7 +36,7 @@ describe('CalendarService — TalerID aggregation + write routing', () => {
       });
       const talerStore = makeTalerStore(); // getConnection -> null
       const talerConnector = makeTalerConnector();
-      const service = new CalendarService(pg, talerStore, talerConnector);
+      const service = new CalendarService(pg, talerStore, talerConnector, {} as any);
       // Stub the private Yandex connector's listEvents via the instance (avoid real CalDAV I/O).
       (service as any).connector.listEvents = jest.fn().mockResolvedValue([
         { at: '2026-07-26T10:00:00.000Z', title: 'Yandex event', source: 'yandex' },
@@ -60,7 +60,7 @@ describe('CalendarService — TalerID aggregation + write routing', () => {
       const talerConnector = makeTalerConnector({
         listEvents: jest.fn().mockResolvedValue([{ at: '2026-07-27T09:00:00.000Z', title: 'TalerID event', source: 'talerid' }]),
       });
-      const service = new CalendarService(pg, talerStore, talerConnector);
+      const service = new CalendarService(pg, talerStore, talerConnector, {} as any);
       (service as any).connector.listEvents = jest.fn().mockResolvedValue([
         { at: '2026-07-26T10:00:00.000Z', title: 'Yandex event', source: 'yandex' },
       ]);
@@ -83,7 +83,7 @@ describe('CalendarService — TalerID aggregation + write routing', () => {
       });
       const talerStore = makeTalerStore({ getConnection: jest.fn().mockRejectedValue(new Error('boom')) });
       const talerConnector = makeTalerConnector({ listEvents: jest.fn().mockRejectedValue(new Error('should not even be reached')) });
-      const service = new CalendarService(pg, talerStore, talerConnector);
+      const service = new CalendarService(pg, talerStore, talerConnector, {} as any);
       (service as any).connector.listEvents = jest.fn().mockResolvedValue([
         { at: '2026-07-26T10:00:00.000Z', title: 'Yandex event', source: 'yandex' },
       ]);
@@ -103,7 +103,7 @@ describe('CalendarService — TalerID aggregation + write routing', () => {
       const talerConnector = makeTalerConnector({
         createEvent: jest.fn().mockResolvedValue({ created: 1, failed: 0, ids: ['tid-1'] }),
       });
-      const service = new CalendarService(pg, talerStore, talerConnector);
+      const service = new CalendarService(pg, talerStore, talerConnector, {} as any);
       const yandexCreateSpy = jest.fn();
       (service as any).connector.createEvent = yandexCreateSpy;
 
@@ -123,7 +123,7 @@ describe('CalendarService — TalerID aggregation + write routing', () => {
       });
       const talerStore = makeTalerStore(); // getConnection -> null
       const talerConnector = makeTalerConnector();
-      const service = new CalendarService(pg, talerStore, talerConnector);
+      const service = new CalendarService(pg, talerStore, talerConnector, {} as any);
       const yandexCreateSpy = jest.fn().mockResolvedValue({ created: 1, failed: 0, uids: ['yandex-uid'] });
       (service as any).connector.createEvent = yandexCreateSpy;
 
@@ -138,7 +138,7 @@ describe('CalendarService — TalerID aggregation + write routing', () => {
       const pg = makePg(); // no calendar_connections row
       const talerStore = makeTalerStore();
       const talerConnector = makeTalerConnector();
-      const service = new CalendarService(pg, talerStore, talerConnector);
+      const service = new CalendarService(pg, talerStore, talerConnector, {} as any);
 
       const result = await service.createEvent('user-1', proposed);
 

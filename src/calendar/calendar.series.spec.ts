@@ -89,7 +89,7 @@ describe('CalendarService.createEvent — wraps the series writer', () => {
     };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
-    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
     jest.spyOn(require('./crypto'), 'decryptSecret').mockReturnValue('app-pass');
     const onWrite = jest.fn();
     service.onWrite = onWrite;
@@ -108,7 +108,7 @@ describe('CalendarService.createEvent — wraps the series writer', () => {
     };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
-    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
     jest.spyOn(require('./crypto'), 'decryptSecret').mockReturnValue('app-pass');
     const onWrite = jest.fn();
     service.onWrite = onWrite;
@@ -125,7 +125,7 @@ describe('CalendarService.findConflicts — series-aware', () => {
     const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
-    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
     // Weekly MO-FR count:10 from Mon 2026-08-17 09:45 → occ[5] = 2026-08-24T09:45:00 (per recurrence.spec fixture)
     const event = {
       title: 'Отвезти Эдика', datetime: '2026-08-17T09:45:00', durationMin: 60,
@@ -146,7 +146,7 @@ describe('CalendarService.findConflicts — series-aware', () => {
     const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
-    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
     (service as any).listEvents = jest.fn().mockResolvedValue([]);
     const conflicts = await service.findConflicts('u1', { title: 'X' } as any);
     expect(conflicts).toEqual([]);
@@ -157,7 +157,7 @@ describe('CalendarService.findConflicts — series-aware', () => {
     const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
-    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
     const event = { title: 'Ежедневная встреча', datetime: '2026-08-17T09:00:00', durationMin: 60, recurrence: { freq: 'daily', count: 3 } } as any;
     // A single recurring existing event whose window happens to overlap the proposed slot
     // representation identically on repeated checks — should still count once.
@@ -177,7 +177,7 @@ describe('CalendarService.saveProposal — anti-duplicate window', () => {
     const pg = { query };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
-    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
     const event = { title: 'X', datetime: '2026-08-17T09:00:00' } as any;
     const id = await service.saveProposal('u1', event, true, []);
     expect(id).toBe('existing-id');
@@ -192,7 +192,7 @@ describe('CalendarService.saveProposal — anti-duplicate window', () => {
     const pg = { query };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
-    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
     const event = { title: 'X', datetime: '2026-08-17T09:00:00' } as any;
     const id = await service.saveProposal('u1', event, true, []);
     expect(typeof id).toBe('string');
@@ -211,7 +211,7 @@ describe('CalendarService.getProposal — occurrenceCount/firstAt/lastAt', () =>
     const pg = { query: jest.fn().mockResolvedValue({ rows: [row] }) };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
-    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
     const p = await service.getProposal('u1', 'id1');
     expect(p?.occurrenceCount).toBe(10);
     expect(p?.firstAt).toBe('2026-08-17T09:45:00');
@@ -223,7 +223,7 @@ describe('CalendarService.getProposal — occurrenceCount/firstAt/lastAt', () =>
     const pg = { query: jest.fn().mockResolvedValue({ rows: [row] }) };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
-    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
     const p = await service.getProposal('u1', 'id1');
     expect(p?.occurrenceCount).toBe(1);
     expect(p?.firstAt).toBe('2026-08-17T09:00:00');
@@ -234,7 +234,7 @@ describe('CalendarService.getProposal — occurrenceCount/firstAt/lastAt', () =>
     const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
-    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
     const p = await service.getProposal('u1', 'missing');
     expect(p).toBeNull();
   });

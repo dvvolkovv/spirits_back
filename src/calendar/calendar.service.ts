@@ -6,7 +6,8 @@ import { YandexCalDavConnector } from './caldav';
 import { CalEvent, CalendarCreds, ProposedEvent, ProposedTask, Task } from './calendar.types';
 import { fetchCalendarEvents } from '../trip/calendar'; // read-only ICS sources (T6)
 import { encryptSecret, decryptSecret } from './crypto';
-import { expandOccurrences } from './recurrence';
+import { expandOccurrences, Recurrence } from './recurrence';
+import { LinkeonTasksService } from './linkeon-tasks.service';
 import { TalerIdStoreService } from '../talerid/talerid-store.service';
 import { TalerIdCalendarConnector } from '../talerid/talerid-calendar.connector';
 
@@ -32,6 +33,7 @@ export class CalendarService {
     private readonly pg: PgService,
     private readonly talerIdStore: TalerIdStoreService,
     private readonly talerIdConnector: TalerIdCalendarConnector,
+    private readonly linkeonTasks: LinkeonTasksService,
     @Optional() private readonly claudeCli?: ClaudeCliService,
   ) {}
 
@@ -359,13 +361,20 @@ export class CalendarService {
     const nowLocalIso = new Date(now.getTime() + 5 * 3600_000).toISOString().replace('Z', OFFSET);
     const prompt =
       `Ты парсер календарных фраз. Текущее локальное время пользователя: ${nowLocalIso} (Asia/Yekaterinburg).\n` +
-      `Преврати фразу в ОДНО событие календаря. Верни СТРОГО JSON без пояснений:\n` +
-      `{"title": "...", "kind": "event"|"task", "datetime": "YYYY-MM-DDTHH:MM:SS" | null, "durationMin": 60}\n` +
-      `Правила: title — краткое название дела (без слов «добавь/поставь/в календарь»). ` +
-      `Если есть конкретное время → kind="event", datetime = локальное ISO без зоны (относительно «сейчас»: ` +
-      `«на 11:00» без даты = ближайшие сегодня/завтра в 11:00, если 11:00 сегодня уже прошло — завтра). ` +
-      `Если времени нет вовсе → kind="task", datetime=null. durationMin по умолчанию 60. ` +
-      `Не выдумывай дату, если её нет — бери ближайшую подходящую от «сейчас».\n` +
+      `Преврати фразу в ОДНУ запись. Верни СТРОГО JSON без пояснений:\n` +
+      `{"title":"...","kind":"event"|"task","datetime":"YYYY-MM-DDTHH:MM:SS"|null,"durationMin":60,` +
+      `"recurrence":{"freq":"daily"|"weekly","byDay":["MO","TU","WE","TH","FR","SA","SU"],"interval":1}|null,` +
+      `"deadline":"YYYY-MM-DDTHH:MM:SS"|null}\n` +
+      `Правила:\n` +
+      `- СОБЫТИЕ (kind=event) — обязательство во времени, обычно с другими или жёсткий слот (встреча, ` +
+      `созвон, приём, дейлик). datetime = когда, локальное ISO без зоны.\n` +
+      `- ДЕЛО (kind=task) — личное намерение что-то сделать (купить, позвонить, помыться, отправить, ` +
+      `сходить). datetime = мягкий ориентир по времени, может быть null если времени нет.\n` +
+      `- Повтор («каждый день/по утрам/по будням/каждый понедельник/еженедельно») → recurrence ` +
+      `(это рутина, обычно kind=task; byDay для еженедельного), иначе recurrence=null.\n` +
+      `- «до HH:MM / крайний срок / дедлайн / успеть к» → deadline, иначе null.\n` +
+      `- title — краткое название (без «добавь/поставь/напомни/в календарь»). Относительное время ` +
+      `(«на 11:00», «вечером») от «сейчас»; если сегодня прошло — завтра. Не выдумывай дату, если её нет.\n` +
       `Фраза: ${JSON.stringify(phrase)}`;
 
     let parsed: any = null;
@@ -381,12 +390,23 @@ export class CalendarService {
     const kind = parsed?.kind === 'task' ? 'task' : 'event';
     const datetime = typeof parsed?.datetime === 'string' && parsed.datetime ? parsed.datetime : undefined;
     const durationMin = Number.isFinite(parsed?.durationMin) ? Number(parsed.durationMin) : 60;
+    const recurrence: Recurrence | undefined =
+      parsed?.recurrence && (parsed.recurrence.freq === 'daily' || parsed.recurrence.freq === 'weekly')
+        ? {
+            freq: parsed.recurrence.freq,
+            byDay: Array.isArray(parsed.recurrence.byDay) ? parsed.recurrence.byDay : undefined,
+            interval: Number.isFinite(parsed.recurrence.interval) ? Number(parsed.recurrence.interval) : undefined,
+          }
+        : undefined;
+    const deadline = typeof parsed?.deadline === 'string' && parsed.deadline ? `${parsed.deadline}${OFFSET}` : undefined;
 
-    if (kind === 'task' || !datetime) {
-      const res = await this.createTask(userId, { title, note: parsed?.note });
-      return res.ok
-        ? { ok: true, title, kind: 'task', whenText: 'в задачи «Мои дела»' }
-        : { ok: false, error: res.error || 'Не удалось добавить задачу' };
+    // ДЕЛО/РУТИНА → облачный «дом дел» Линкеона (LinkeonTasksService), НЕ Яндекс-VTODO [owner 2026-08-02].
+    if (kind === 'task' || recurrence) {
+      const due = datetime ? `${datetime}${OFFSET}` : undefined;
+      await this.linkeonTasks.create(userId, { title, due, deadline, recurrence, note: parsed?.note });
+      if (this.onWrite) this.onWrite(userId);
+      const whenText = recurrence ? 'рутина' : datetime ? this.humanWhen(datetime) : 'в дела';
+      return { ok: true, title, kind: 'task', whenText, datetime };
     }
     const event: ProposedEvent = { title, datetime, durationMin, note: parsed?.note };
     const res = await this.createEvent(userId, event);

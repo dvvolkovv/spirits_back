@@ -28,7 +28,7 @@ describe('CalendarService.createEvent — write-scoping (no cross-user writes)',
     const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
-    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
 
     const result = await service.createEvent('userB', { title: 'x', datetime: '2026-07-20T15:00:00' });
 
@@ -43,7 +43,7 @@ describe('CalendarService.createEvent — write-scoping (no cross-user writes)',
     const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
-    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
 
     await service.createEvent('userB', { title: 'x', datetime: '2026-07-20T15:00:00' });
 
@@ -64,7 +64,7 @@ describe('CalendarService.setTaskDone — write-scoping (no cross-user writes)',
     const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
-    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
 
     const result = await service.setTaskDone('userB', 'uid', true);
 
@@ -79,7 +79,7 @@ describe('CalendarService.setTaskDone — write-scoping (no cross-user writes)',
     const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
-    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any);
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
 
     await service.setTaskDone('userB', 'uid', true);
 
