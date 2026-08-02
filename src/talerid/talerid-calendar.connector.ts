@@ -261,38 +261,4 @@ export class TalerIdCalendarConnector {
     }
   }
 
-  async createTask(userId: string, opts: { title: string; due?: string; deadline?: string; note?: string; recurrence?: any; idempotencyKey?: string }): Promise<{ id?: string; ok: boolean }> {
-    try {
-      const args: Record<string, any> = { title: opts.title };
-      if (opts.due) args.due = opts.due;
-      if (opts.deadline) args.deadline = opts.deadline;
-      if (opts.note) args.note = opts.note;
-      if (opts.recurrence) args.recurrence = opts.recurrence;
-      if (opts.idempotencyKey) args.idempotency_key = opts.idempotencyKey;
-      const r = await this.callTool(userId, 'create_task', args);
-      return { id: r?.uid, ok: true };
-    } catch (e: any) {
-      this.logger.debug(`talerid create_task failed for user ${userId}: ${e?.message}`);
-      return { ok: false };
-    }
-  }
-
-  // ⚠️ ВРЕМЕННО (2026-08-02): сырой вызов MCP-инструмента для отладки формата ответа. Удалить.
-  async rawCall(userId: string, name: string, args: Record<string, any>): Promise<any> {
-    try {
-      return await this.callTool(userId, name, args);
-    } catch (e: any) {
-      return { __error: e?.message };
-    }
-  }
-
-  async deleteTask(userId: string, id: string): Promise<{ ok: boolean }> {
-    try {
-      await this.callTool(userId, 'delete_task', { id });
-      return { ok: true };
-    } catch (e: any) {
-      this.logger.debug(`talerid delete_task ${id} failed for user ${userId}: ${e?.message}`);
-      return { ok: false };
-    }
-  }
 }

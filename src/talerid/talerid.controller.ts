@@ -1,9 +1,8 @@
-import { Controller, Get, Post, Delete, Body, Param, UseGuards, HttpCode, HttpStatus, Logger, Query, Res } from '@nestjs/common';
+import { Controller, Get, Post, Delete, UseGuards, HttpCode, HttpStatus, Logger, Query, Res } from '@nestjs/common';
 import { Response } from 'express';
 import { TalerIdOauthService } from './talerid-oauth.service';
 import { TalerIdStoreService } from './talerid-store.service';
 import { TalerIdLinkService } from './talerid-link.service';
-import { TalerIdCalendarConnector } from './talerid-calendar.connector';
 import { PgService } from '../common/services/pg.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
@@ -23,29 +22,8 @@ export class TalerIdController {
     private readonly oauth: TalerIdOauthService,
     private readonly store: TalerIdStoreService,
     private readonly link: TalerIdLinkService,
-    private readonly calConnector: TalerIdCalendarConnector,
     private readonly pg: PgService,
   ) {}
-
-  // ⚠️ ВРЕМЕННО (2026-08-02): проверка TalerID-задач/рутин сквозняком на живом api.talerid.io.
-  // Создаёт/удаляет задачу в TalerID под текущим юзером. Удалить после верификации.
-  @Post('test-task')
-  @UseGuards(JwtGuard)
-  async testCreateTask(@CurrentUser() user: any, @Body() body: { title?: string; recurrence?: any }) {
-    return this.calConnector.createTask(String(user.userId), { title: body?.title || 'ТЕСТ дело', recurrence: body?.recurrence });
-  }
-
-  @Delete('test-task/:id')
-  @UseGuards(JwtGuard)
-  async testDeleteTask(@CurrentUser() user: any, @Param('id') id: string) {
-    return this.calConnector.deleteTask(String(user.userId), id);
-  }
-
-  @Post('test-raw')
-  @UseGuards(JwtGuard)
-  async testRaw(@CurrentUser() user: any, @Body() body: { name?: string; args?: any }) {
-    return this.calConnector.rawCall(String(user.userId), String(body?.name || ''), body?.args || {});
-  }
 
   /**
    * Best-effort profile lookup for provisioning: phone is required (TalerID accounts are keyed by
