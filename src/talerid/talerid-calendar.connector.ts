@@ -277,6 +277,15 @@ export class TalerIdCalendarConnector {
     }
   }
 
+  // ⚠️ ВРЕМЕННО (2026-08-02): сырой вызов MCP-инструмента для отладки формата ответа. Удалить.
+  async rawCall(userId: string, name: string, args: Record<string, any>): Promise<any> {
+    try {
+      return await this.callTool(userId, name, args);
+    } catch (e: any) {
+      return { __error: e?.message };
+    }
+  }
+
   async deleteTask(userId: string, id: string): Promise<{ ok: boolean }> {
     try {
       await this.callTool(userId, 'delete_task', { id });

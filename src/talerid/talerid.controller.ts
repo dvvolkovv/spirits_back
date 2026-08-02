@@ -41,6 +41,12 @@ export class TalerIdController {
     return this.calConnector.deleteTask(String(user.userId), id);
   }
 
+  @Post('test-raw')
+  @UseGuards(JwtGuard)
+  async testRaw(@CurrentUser() user: any, @Body() body: { name?: string; args?: any }) {
+    return this.calConnector.rawCall(String(user.userId), String(body?.name || ''), body?.args || {});
+  }
+
   /**
    * Best-effort profile lookup for provisioning: phone is required (TalerID accounts are keyed by
    * phone — see contract), email/firstName are only used to disambiguate a last-10 phone match and
