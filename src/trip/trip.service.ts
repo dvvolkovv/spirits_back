@@ -63,8 +63,12 @@ export function computeCopilotState(input: {
   // --- «Твой сегодня» [2026-08-01] ---
   // События: в ГОРИЗОНТЕ (показываем по времени) vs ЗА горизонтом (→ «Дальше», не засоряем сегодня).
   const sortedEvents = [...events].sort((a, b) => parse(a.at) - parse(b.at));
-  const horizonEvents = sortedEvents.filter((e) => parse(e.at) <= horizonEnd);
-  const beyond = sortedEvents.filter((e) => parse(e.at) > horizonEnd);
+  // Событие релевантно, пока НЕ закончилось: прошедшие (уже отгремевшие) уходят, иначе «ближайшим»
+  // становится утренняя рутина, отшумевшая с утра, вместо реальной вечерней записи сегодня.
+  const notEnded = (e: CalEvent) => (e.end ? parse(e.end) : parse(e.at) + 3_600_000) >= now.getTime();
+  const upcoming = sortedEvents.filter(notEnded);
+  const horizonEvents = upcoming.filter((e) => parse(e.at) <= horizonEnd);
+  const beyond = upcoming.filter((e) => parse(e.at) > horizonEnd);
   const nextBeyond = beyond[0];
 
   const isDone = (t: Task) => t.done || t.status === 'done';
