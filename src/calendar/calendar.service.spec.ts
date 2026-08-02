@@ -1,5 +1,23 @@
 import { encryptSecret, decryptSecret } from './crypto';
 import { overlaps, CalendarService } from './calendar.service';
+import { YandexCalDavConnector } from './caldav';
+
+describe('connect() app-password hygiene', () => {
+  beforeAll(() => { process.env.CALENDAR_SECRET_KEY = '0123456789abcdef0123456789abcdef'; });
+  afterEach(() => jest.restoreAllMocks());
+  // Regression: Яндекс показывает пароль приложения группами через пробелы; введённый как есть,
+  // он уходил в Basic-auth с пробелами → 401 на «правильном» пароле. connect() должен вырезать ВСЕ пробелы.
+  it('strips whitespace from the app-password and trims the username', async () => {
+    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const service = new CalendarService(pg as any, {} as any, {} as any, {} as any);
+    const testSpy = jest.spyOn(YandexCalDavConnector.prototype, 'test').mockResolvedValue(true);
+    jest.spyOn(YandexCalDavConnector.prototype, 'discoverCollection').mockResolvedValue('https://cal.example/');
+    jest.spyOn(YandexCalDavConnector.prototype, 'discoverTaskCollection').mockResolvedValue(null);
+    const res = await service.connect('userA', 'yandex', '  me@yandex.ru ', 'abcd efgh ijkl mnop');
+    expect(res.ok).toBe(true);
+    expect(testSpy).toHaveBeenCalledWith(expect.objectContaining({ username: 'me@yandex.ru', appPassword: 'abcdefghijklmnop' }));
+  });
+});
 
 describe('secret crypto', () => {
   beforeAll(() => { process.env.CALENDAR_SECRET_KEY = '0123456789abcdef0123456789abcdef'; });

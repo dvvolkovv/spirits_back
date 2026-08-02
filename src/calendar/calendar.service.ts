@@ -228,6 +228,11 @@ export class CalendarService {
 
   async connect(userId: string, provider: string, username: string, appPassword: string): Promise<{ ok: boolean; error?: string }> {
     const baseUrl = 'https://caldav.yandex.ru'; // provider→baseUrl map; yandex only for now
+    username = (username || '').trim();
+    // Яндекс ПОКАЗЫВАЕТ пароль приложения группами через пробелы («xxxx xxxx xxxx xxxx»), но сам
+    // пароль — 16 символов без пробелов. Если ввести как показано, Basic-auth уходит с пробелами
+    // → 401 на «правильном» пароле. Убираем ВСЕ пробелы (app-пароли Яндекса/Google их не содержат).
+    appPassword = (appPassword || '').replace(/\s+/g, '');
     const ok = await this.connector.test({ baseUrl, username, appPassword });
     if (!ok) return { ok: false, error: 'Не удалось подключиться — проверь логин и пароль приложения' };
     const collectionUrl = await this.connector.discoverCollection({ baseUrl, username, appPassword });
