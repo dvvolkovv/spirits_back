@@ -56,8 +56,14 @@ export function computeCopilotState(input: {
   horizonHours?: number;
 }): CoPilotState {
   const { tasks, events, now } = input;
-  const horizonHours = input.horizonHours ?? 36;
-  const horizonEnd = now.getTime() + horizonHours * 3_600_000;
+  // Горизонт «твой сегодня» = СЕГОДНЯ + ЗАВТРА целиком (календарные дни Asia/Yekaterinburg),
+  // послезавтра НЕ показываем. Явный horizonHours (тесты/спец-режимы) → старое скользящее now+Nч.
+  const localDayStr = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Yekaterinburg' }).format(now);
+  const startOfTodayMs = new Date(`${localDayStr}T00:00:00+05:00`).getTime();
+  const horizonEnd = input.horizonHours != null
+    ? now.getTime() + input.horizonHours * 3_600_000
+    : startOfTodayMs + 2 * 86_400_000;
+  const horizonHours = input.horizonHours ?? 48;
   const parse = (s: string) => new Date(s.includes('+') || s.endsWith('Z') ? s : `${s}+05:00`).getTime();
 
   // --- «Твой сегодня» [2026-08-01] ---
