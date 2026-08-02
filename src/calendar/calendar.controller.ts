@@ -59,6 +59,22 @@ export class CalendarController {
     return this.calendar.reconnect(String(user.userId));
   }
 
+  // Рабочий Outlook через локальный Exchange (EWS/NTLM), read-only.
+  @Post('exchange/connect')
+  @UseGuards(JwtGuard)
+  async connectExchange(@CurrentUser() user: any, @Body() body: { server?: string; domain?: string; login?: string; password?: string }) {
+    return this.calendar.connectExchange(
+      String(user.userId), body?.server || '', body?.domain || '', body?.login || '', body?.password || '',
+    );
+  }
+
+  @Delete('exchange')
+  @UseGuards(JwtGuard)
+  async disconnectExchange(@CurrentUser() user: any) {
+    await this.calendar.disconnectExchange(String(user.userId));
+    return { ok: true };
+  }
+
   // Read-only календари по ссылке (ICS): Outlook «Опубликовать календарь», Google, iCloud и т.п.
   @Get('ics')
   @UseGuards(JwtGuard)

@@ -6,6 +6,7 @@ import { YandexCalDavConnector } from './caldav';
 import { CalEvent, CalendarCreds, ProposedEvent, ProposedTask, Task } from './calendar.types';
 import { fetchCalendarEvents } from '../trip/calendar'; // read-only ICS sources (T6)
 import { encryptSecret, decryptSecret } from './crypto';
+import { ExchangeEwsConnector, ExchangeCreds } from './exchange';
 import { expandOccurrences, Recurrence } from './recurrence';
 import { LinkeonTasksService } from './linkeon-tasks.service';
 import { TalerIdStoreService } from '../talerid/talerid-store.service';
@@ -26,6 +27,7 @@ export function overlaps(p: ProposedEvent, existing: CalEvent, durationMin = 60)
 export class CalendarService {
   private readonly logger = new Logger(CalendarService.name);
   private readonly connector = new YandexCalDavConnector();
+  private readonly exchange = new ExchangeEwsConnector();
   /** cache-bust hook set by TripService so an optimistic write refreshes the co-pilot surface. */
   onWrite?: (userId: string) => void;
 
@@ -182,7 +184,7 @@ export class CalendarService {
 
   private async creds(userId: string): Promise<CalendarCreds | null> {
     const r = await this.pg.query(
-      `SELECT base_url, username, secret_enc, collection_url, todo_collection_url FROM calendar_connections WHERE user_id=$1 AND enabled=true LIMIT 1`,
+      `SELECT base_url, username, secret_enc, collection_url, todo_collection_url FROM calendar_connections WHERE user_id=$1 AND enabled=true AND provider='yandex' LIMIT 1`,
       [userId],
     );
     const row = r.rows[0];
@@ -196,26 +198,32 @@ export class CalendarService {
     };
   }
 
-  async getStatus(userId: string): Promise<{ connected: boolean; provider?: string; username?: string; canReenable?: boolean }> {
+  async getStatus(userId: string): Promise<{ connected: boolean; provider?: string; username?: string; canReenable?: boolean; exchange?: { connected: boolean; username?: string } }> {
     const active = await this.pg.query(
-      `SELECT provider, username FROM calendar_connections WHERE user_id=$1 AND enabled=true LIMIT 1`,
+      `SELECT provider, username FROM calendar_connections WHERE user_id=$1 AND enabled=true AND provider='yandex' LIMIT 1`,
       [userId],
     );
-    if (active.rows[0]) return { connected: true, provider: active.rows[0].provider, username: active.rows[0].username };
+    // Exchange (рабочий Outlook по EWS) — отдельным полем, параллельно CalDAV-яндексу.
+    const ex = await this.pg.query(
+      `SELECT username, enabled FROM calendar_connections WHERE user_id=$1 AND provider='exchange' LIMIT 1`,
+      [userId],
+    );
+    const exchange = ex.rows[0]?.enabled ? { connected: true, username: ex.rows[0].username } : { connected: false };
+    if (active.rows[0]) return { connected: true, provider: active.rows[0].provider, username: active.rows[0].username, exchange };
     // Отключено, но креды сохранены → предложим переподключить в один тап (без повторного ввода пароля).
     const stored = await this.pg.query(
-      `SELECT provider, username FROM calendar_connections WHERE user_id=$1 AND secret_enc IS NOT NULL LIMIT 1`,
+      `SELECT provider, username FROM calendar_connections WHERE user_id=$1 AND secret_enc IS NOT NULL AND provider='yandex' LIMIT 1`,
       [userId],
     );
-    if (stored.rows[0]) return { connected: false, canReenable: true, provider: stored.rows[0].provider, username: stored.rows[0].username };
-    return { connected: false };
+    if (stored.rows[0]) return { connected: false, canReenable: true, provider: stored.rows[0].provider, username: stored.rows[0].username, exchange };
+    return { connected: false, exchange };
   }
 
   /** Переподключить сохранённое (отключённое) подключение: проверяем сохранённый пароль приложения
    *  и, если он ещё годен, снова включаем — без повторного ввода. Устарел → просим ввести заново. */
   async reconnect(userId: string): Promise<{ ok: boolean; error?: string }> {
     const row = (await this.pg.query(
-      `SELECT provider, base_url, username, secret_enc FROM calendar_connections WHERE user_id=$1 AND secret_enc IS NOT NULL ORDER BY enabled DESC LIMIT 1`,
+      `SELECT provider, base_url, username, secret_enc FROM calendar_connections WHERE user_id=$1 AND secret_enc IS NOT NULL AND provider='yandex' ORDER BY enabled DESC LIMIT 1`,
       [userId],
     )).rows[0];
     if (!row) return { ok: false, error: 'Нет сохранённого подключения' };
@@ -251,8 +259,44 @@ export class CalendarService {
   }
 
   async disconnect(userId: string): Promise<void> {
-    await this.pg.query(`UPDATE calendar_connections SET enabled=false WHERE user_id=$1`, [userId]);
+    await this.pg.query(`UPDATE calendar_connections SET enabled=false WHERE user_id=$1 AND provider='yandex'`, [userId]);
     this.onWrite?.(userId); // disconnecting also changes the co-pilot view — bust the cache
+  }
+
+  // ---- Exchange (рабочий Outlook по EWS/NTLM), read-only ----
+
+  private async exchangeCreds(userId: string): Promise<ExchangeCreds | null> {
+    const row = (await this.pg.query(
+      `SELECT base_url, username, secret_enc FROM calendar_connections WHERE user_id=$1 AND provider='exchange' AND enabled=true LIMIT 1`,
+      [userId],
+    )).rows[0];
+    if (!row) return null;
+    return { server: row.base_url, username: row.username, password: decryptSecret(row.secret_enc) };
+  }
+
+  /** Подключить рабочий Exchange по EWS: NTLM username = login@domain, пароль хранится шифрованно.
+   *  Проверяем кредами реальный запрос, иначе «подключим» неработающее. */
+  async connectExchange(userId: string, server: string, domain: string, login: string, password: string): Promise<{ ok: boolean; error?: string }> {
+    server = (server || 'mail.clearwayintegration.com').trim().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+    domain = (domain || '').trim();
+    login = (login || '').trim();
+    if (!server || !login || !password) return { ok: false, error: 'Нужны сервер, логин и пароль' };
+    const username = domain ? `${login}@${domain}` : login;
+    const ok = await this.exchange.test({ server, username, password });
+    if (!ok) return { ok: false, error: 'Не удалось войти — проверь домен, логин и пароль' };
+    await this.pg.query(
+      `INSERT INTO calendar_connections (user_id, provider, base_url, username, secret_enc, enabled)
+       VALUES ($1,'exchange',$2,$3,$4,true)
+       ON CONFLICT (user_id, provider) DO UPDATE SET base_url=EXCLUDED.base_url, username=EXCLUDED.username, secret_enc=EXCLUDED.secret_enc, enabled=true`,
+      [userId, server, username, encryptSecret(password)],
+    );
+    this.onWrite?.(userId);
+    return { ok: true };
+  }
+
+  async disconnectExchange(userId: string): Promise<void> {
+    await this.pg.query(`UPDATE calendar_connections SET enabled=false WHERE user_id=$1 AND provider='exchange'`, [userId]);
+    this.onWrite?.(userId);
   }
 
   // ---- Read-only календари по ссылке (ICS): Outlook «Опубликовать календарь», Google, iCloud и т.п.
@@ -310,6 +354,10 @@ export class CalendarService {
       try { out.push(...(await this.connector.listEvents(creds, start, end))); }
       catch (e: any) { this.logger.error(`caldav list failed: ${e.message}`); }
     }
+    try {
+      const exCreds = await this.exchangeCreds(userId);
+      if (exCreds) out.push(...(await this.exchange.listEvents(exCreds, start, end)));
+    } catch (e: any) { this.logger.error(`exchange list failed: ${e.message}`); }
     try {
       const icsRows = await this.pg.query(`SELECT url, kind FROM trip_calendars WHERE user_id=$1 AND enabled=true`, [userId]);
       const sources = icsRows.rows.map((r: any) => ({ url: r.url, source: r.kind }));
