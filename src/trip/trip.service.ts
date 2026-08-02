@@ -84,7 +84,10 @@ export function computeCopilotState(input: {
   const today = localDay(now.getTime());
   const doneToday = (t: Task) => {
     if (!isDone(t)) return false;
-    const ref = t.doneAt || (t.occurrenceDate ? `${t.occurrenceDate}T00:00:00` : undefined) || t.due;
+    // «Сделано» показываем только за СЕГОДНЯШНИЙ ПО РАСПИСАНИЮ день: рутина — вхождение сегодня,
+    // разовое — due сегодня; без срока — по факту выполнения (doneAt). Иначе вчерашние дела,
+    // закрытые сегодня «в догонку», засоряют «сегодня» стопкой галочек.
+    const ref = (t.occurrenceDate ? `${t.occurrenceDate}T00:00:00` : undefined) || t.due || t.doneAt;
     return ref ? localDay(parse(ref)) === today : false;
   };
   // Все не-закрытые (для reminders/timeTriggers — обратная совместимость).
