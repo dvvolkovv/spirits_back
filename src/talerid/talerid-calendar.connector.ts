@@ -3,7 +3,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { TalerIdOauthService } from './talerid-oauth.service';
 import { expandOccurrences } from '../calendar/recurrence';
-import { CalEvent, ProposedEvent } from '../calendar/calendar.types';
+import { CalEvent, ProposedEvent, Task } from '../calendar/calendar.types';
 
 const TZID = 'Asia/Yekaterinburg';
 const OFFSET = '+05:00'; // Asia/Yekaterinburg, no DST — mirrors src/calendar/{recurrence,caldav}.ts
@@ -173,6 +173,91 @@ export class TalerIdCalendarConnector {
     } catch (e: any) {
       this.logger.debug(`talerid deleteEvent ${id} failed for user ${userId}: ${e?.message}`);
       return { ok: false, error: 'Не удалось удалить событие' };
+    }
+  }
+
+  // ---- Задачи/рутины TalerID [Фаза 2 спеки, live на PROD 2026-08-02: list_tasks/set_task_status/
+  //      update_task, scope mcp:calendar]. Зеркалит форму linkeon-tasks.list (→ зона «Дела»
+  //      применяет ту же логику). Best-effort: не подключён / ошибка MCP → []/{ok:false}. ----
+
+  private localDay(ms: number): string {
+    return new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Yekaterinburg' }).format(new Date(ms));
+  }
+
+  async listTasks(userId: string, start: Date, end: Date, now: Date): Promise<Task[]> {
+    try {
+      const from = start.toISOString().slice(0, 10);
+      let to = end.toISOString().slice(0, 10);
+      if (to <= from) to = new Date(new Date(`${from}T00:00:00Z`).getTime() + 86_400_000).toISOString().slice(0, 10);
+      const raw = await this.callTool(userId, 'list_tasks', { from, to, includeDone: true });
+      const rows = Array.isArray(raw) ? raw : Array.isArray(raw?.tasks) ? raw.tasks : [];
+      const out: Task[] = [];
+      const toMs = end.getTime();
+      const today = this.localDay(now.getTime());
+      for (const t of rows) {
+        if (!t?.id) continue;
+        const title = String(t.title || '').trim() || 'Дело';
+        const deadline = t.deadline ? new Date(t.deadline).toISOString() : undefined;
+        if (t.recurrence && Array.isArray(t.occurrences)) {
+          // Рутина: поштучные вхождения; прошедшие дни не тащим (сброс каждый день), skipped прячем,
+          // done показываем только сегодня (приглушённо), pending — висит.
+          for (const o of t.occurrences) {
+            const occDate: string = o?.occurrenceDate;
+            if (!occDate || occDate < today) continue;
+            const st = o?.status || 'pending';
+            if (st === 'skipped') continue;
+            const instant = o?.dueOverride ? new Date(o.dueOverride) : new Date(`${occDate}T09:00:00${OFFSET}`);
+            if (Number.isNaN(instant.getTime()) || instant.getTime() > toMs) continue;
+            if (st === 'done') {
+              if (occDate === today) {
+                out.push({ uid: t.id, title, due: instant.toISOString(), done: true, status: 'done', isRoutine: true, occurrenceDate: occDate, doneAt: o?.doneAt ? new Date(o.doneAt).toISOString() : instant.toISOString(), source: 'talerid' });
+              }
+            } else {
+              out.push({ uid: t.id, title, due: instant.toISOString(), deadline, done: false, status: 'pending', isRoutine: true, occurrenceDate: occDate, source: 'talerid' });
+            }
+          }
+        } else {
+          // Разовое дело: pending (без срока / в окне / просрочено) висит; done-сегодня приглушённо.
+          const done = t.status === 'done';
+          const due = t.due ? new Date(t.due).toISOString() : undefined;
+          if (done) {
+            if (t.doneAt && this.localDay(new Date(t.doneAt).getTime()) === today) {
+              out.push({ uid: t.id, title, due, deadline, done: true, status: 'done', doneAt: new Date(t.doneAt).toISOString(), source: 'talerid' });
+            }
+          } else if (t.status !== 'dropped' && (!due || new Date(due).getTime() <= toMs)) {
+            out.push({ uid: t.id, title, due, deadline, done: false, status: 'pending', source: 'talerid' });
+          }
+        }
+      }
+      return out;
+    } catch (e: any) {
+      this.logger.debug(`talerid listTasks degraded to [] for user ${userId}: ${e?.message}`);
+      return [];
+    }
+  }
+
+  async setTaskStatus(userId: string, id: string, status: 'done' | 'pending' | 'dropped', occurrenceDate?: string): Promise<{ ok: boolean }> {
+    try {
+      const args: Record<string, any> = { id, status };
+      if (occurrenceDate) args.occurrenceDate = occurrenceDate; // рутина: конкретный день (§3.4)
+      await this.callTool(userId, 'set_task_status', args);
+      return { ok: true };
+    } catch (e: any) {
+      this.logger.debug(`talerid set_task_status ${id} failed for user ${userId}: ${e?.message}`);
+      return { ok: false };
+    }
+  }
+
+  // Перенос: у TalerID нет per-occurrence-reschedule инструмента (dueOverride есть в модели, но tool —
+  // нет). Разовое двигаем через update_task(due). Перенос вхождения рутины — best-effort no-op.
+  async rescheduleTask(userId: string, id: string, newDue: string, occurrenceDate?: string): Promise<{ ok: boolean }> {
+    if (occurrenceDate) return { ok: false };
+    try {
+      await this.callTool(userId, 'update_task', { id, due: newDue });
+      return { ok: true };
+    } catch (e: any) {
+      this.logger.debug(`talerid update_task ${id} failed for user ${userId}: ${e?.message}`);
+      return { ok: false };
     }
   }
 }

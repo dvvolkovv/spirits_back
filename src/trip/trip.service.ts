@@ -209,7 +209,7 @@ export class TripService implements OnModuleInit {
     const now = new Date();
     const start = now;
     const end = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-    const [vtodoTasks, linkeonTasks, icsEvents, taleridEvents] = await Promise.all([
+    const [vtodoTasks, linkeonTasks, icsEvents, taleridEvents, taleridTasks] = await Promise.all([
       this.calendar.listTasks(userId, start, end),
       // Дела/рутины Линкеона [«дом дел», 2026-08-01] — облачная правда, наш стор.
       this.linkeonTasks.list(userId, start, end, now),
@@ -217,9 +217,11 @@ export class TripService implements OnModuleInit {
       // TalerID-календарь — ещё один источник событий [6ad042df]. Коннектор best-effort:
       // при не-подключённом TalerID / ошибке MCP вернёт [], со-пилот не ломается.
       this.taleridCalendar.listEvents(userId, start, end),
+      // Дела/рутины TalerID [Фаза 2 спеки live 2026-08-02] — ещё один источник дел, best-effort.
+      this.taleridCalendar.listTasks(userId, start, end, now),
     ]);
-    // Дела: сначала линкеоновские (наш стор), затем внешние VTODO (Яндекс) — источник несёт t.source.
-    const tasks = [...linkeonTasks, ...vtodoTasks];
+    // Дела: линкеоновские (наш стор) + внешние VTODO (Яндекс) + TalerID — источник несёт t.source.
+    const tasks = [...linkeonTasks, ...vtodoTasks, ...taleridTasks];
     const events = mergeEvents(icsEvents, taleridEvents);
     const state = computeCopilotState({ tasks, events, now: new Date() });
     // Pending-предложения агента [a5131311] — докладываем в стейт (чистая computeCopilotState их не
@@ -266,24 +268,41 @@ export class TripService implements OnModuleInit {
     if (kind === 'task_done') {
       const uid = payload?.uid;
       if (!uid) throw new BadRequestException('uid required');
-      // Линкеоновское дело/рутина → наш стор (occurrenceDate для рутины); иначе внешний VTODO (Яндекс).
+      // Маршрут по источнику: наш стор (occurrenceDate для рутины) / TalerID (set_task_status) / внешний VTODO (Яндекс).
+      const occ = payload?.occurrenceDate ? String(payload.occurrenceDate) : undefined;
       if (payload?.source === 'linkeon') {
-        await this.linkeonTasks.setDone(userId, String(uid), Boolean(payload?.done), payload?.occurrenceDate ? String(payload.occurrenceDate) : undefined);
+        await this.linkeonTasks.setDone(userId, String(uid), Boolean(payload?.done), occ);
+      } else if (payload?.source === 'talerid') {
+        await this.taleridCalendar.setTaskStatus(userId, String(uid), payload?.done === false ? 'pending' : 'done', occ);
       } else {
         await this.calendar.setTaskDone(userId, String(uid), Boolean(payload?.done));
       }
     } else if (kind === 'routine_done') {
       const uid = payload?.uid;
       if (!uid) throw new BadRequestException('uid required');
-      await this.linkeonTasks.setDone(userId, String(uid), Boolean(payload?.done), payload?.occurrenceDate ? String(payload.occurrenceDate) : undefined);
+      const occ = payload?.occurrenceDate ? String(payload.occurrenceDate) : undefined;
+      if (payload?.source === 'talerid') {
+        await this.taleridCalendar.setTaskStatus(userId, String(uid), payload?.done === false ? 'pending' : 'done', occ);
+      } else {
+        await this.linkeonTasks.setDone(userId, String(uid), Boolean(payload?.done), occ);
+      }
     } else if (kind === 'task_reschedule') {
       const uid = payload?.uid;
       if (!uid || !payload?.newDue) throw new BadRequestException('uid+newDue required');
-      await this.linkeonTasks.reschedule(userId, String(uid), String(payload.newDue), payload?.occurrenceDate ? String(payload.occurrenceDate) : undefined);
+      const occ = payload?.occurrenceDate ? String(payload.occurrenceDate) : undefined;
+      if (payload?.source === 'talerid') {
+        await this.taleridCalendar.rescheduleTask(userId, String(uid), String(payload.newDue), occ);
+      } else {
+        await this.linkeonTasks.reschedule(userId, String(uid), String(payload.newDue), occ);
+      }
     } else if (kind === 'task_drop') {
       const uid = payload?.uid;
       if (!uid) throw new BadRequestException('uid required');
-      await this.linkeonTasks.drop(userId, String(uid));
+      if (payload?.source === 'talerid') {
+        await this.taleridCalendar.setTaskStatus(userId, String(uid), 'dropped');
+      } else {
+        await this.linkeonTasks.drop(userId, String(uid));
+      }
     } else if (kind === 'task_create') {
       if (!payload?.title) throw new BadRequestException('title required');
       await this.linkeonTasks.create(userId, {

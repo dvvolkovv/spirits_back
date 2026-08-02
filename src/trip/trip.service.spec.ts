@@ -137,7 +137,12 @@ describe('computeCopilotState', () => {
       setTaskDone: jest.fn().mockResolvedValue(undefined),
       ...overrides,
     });
-    const taleridCal = { listEvents: jest.fn().mockResolvedValue([]) } as any;
+    const taleridCal = {
+      listEvents: jest.fn().mockResolvedValue([]),
+      listTasks: jest.fn().mockResolvedValue([]),
+      setTaskStatus: jest.fn().mockResolvedValue({ ok: true }),
+      rescheduleTask: jest.fn().mockResolvedValue({ ok: true }),
+    } as any;
     const linkeonTasks = { list: jest.fn().mockResolvedValue([]) } as any;
     const svc = (calendar: any) => new TripService({} as any, calendar, taleridCal, linkeonTasks);
 
