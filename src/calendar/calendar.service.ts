@@ -196,9 +196,34 @@ export class CalendarService {
     };
   }
 
-  async getStatus(userId: string): Promise<{ connected: boolean; provider?: string }> {
-    const r = await this.pg.query(`SELECT provider FROM calendar_connections WHERE user_id=$1 AND enabled=true LIMIT 1`, [userId]);
-    return r.rows[0] ? { connected: true, provider: r.rows[0].provider } : { connected: false };
+  async getStatus(userId: string): Promise<{ connected: boolean; provider?: string; username?: string; canReenable?: boolean }> {
+    const active = await this.pg.query(
+      `SELECT provider, username FROM calendar_connections WHERE user_id=$1 AND enabled=true LIMIT 1`,
+      [userId],
+    );
+    if (active.rows[0]) return { connected: true, provider: active.rows[0].provider, username: active.rows[0].username };
+    // Отключено, но креды сохранены → предложим переподключить в один тап (без повторного ввода пароля).
+    const stored = await this.pg.query(
+      `SELECT provider, username FROM calendar_connections WHERE user_id=$1 AND secret_enc IS NOT NULL LIMIT 1`,
+      [userId],
+    );
+    if (stored.rows[0]) return { connected: false, canReenable: true, provider: stored.rows[0].provider, username: stored.rows[0].username };
+    return { connected: false };
+  }
+
+  /** Переподключить сохранённое (отключённое) подключение: проверяем сохранённый пароль приложения
+   *  и, если он ещё годен, снова включаем — без повторного ввода. Устарел → просим ввести заново. */
+  async reconnect(userId: string): Promise<{ ok: boolean; error?: string }> {
+    const row = (await this.pg.query(
+      `SELECT provider, base_url, username, secret_enc FROM calendar_connections WHERE user_id=$1 AND secret_enc IS NOT NULL ORDER BY enabled DESC LIMIT 1`,
+      [userId],
+    )).rows[0];
+    if (!row) return { ok: false, error: 'Нет сохранённого подключения' };
+    const ok = await this.connector.test({ baseUrl: row.base_url, username: row.username, appPassword: decryptSecret(row.secret_enc) });
+    if (!ok) return { ok: false, error: 'Сохранённый пароль больше не подходит — подключи заново по логину и паролю' };
+    await this.pg.query(`UPDATE calendar_connections SET enabled=true WHERE user_id=$1 AND provider=$2`, [userId, row.provider]);
+    this.onWrite?.(userId); // переподключение меняет co-pilot view — сбрасываем кэш
+    return { ok: true };
   }
 
   async connect(userId: string, provider: string, username: string, appPassword: string): Promise<{ ok: boolean; error?: string }> {

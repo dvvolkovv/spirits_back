@@ -52,6 +52,13 @@ export class CalendarController {
     return { ok: true };
   }
 
+  // Переподключить сохранённое (отключённое) подключение одним тапом — без повторного ввода пароля.
+  @Post('reconnect')
+  @UseGuards(JwtGuard)
+  async reconnect(@CurrentUser() user: any) {
+    return this.calendar.reconnect(String(user.userId));
+  }
+
   @Get('proposal/:id')
   @UseGuards(JwtGuard)
   async proposal(@CurrentUser() user: any, @Param('id') id: string) {
