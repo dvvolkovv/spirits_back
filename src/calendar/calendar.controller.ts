@@ -59,6 +59,26 @@ export class CalendarController {
     return this.calendar.reconnect(String(user.userId));
   }
 
+  // Read-only календари по ссылке (ICS): Outlook «Опубликовать календарь», Google, iCloud и т.п.
+  @Get('ics')
+  @UseGuards(JwtGuard)
+  async listIcs(@CurrentUser() user: any) {
+    return this.calendar.listIcs(String(user.userId));
+  }
+
+  @Post('ics')
+  @UseGuards(JwtGuard)
+  async addIcs(@CurrentUser() user: any, @Body() body: { url?: string; kind?: string }) {
+    return this.calendar.addIcs(String(user.userId), body?.kind || 'outlook', body?.url || '');
+  }
+
+  @Delete('ics/:kind')
+  @UseGuards(JwtGuard)
+  async removeIcs(@CurrentUser() user: any, @Param('kind') kind: string) {
+    await this.calendar.removeIcs(String(user.userId), kind);
+    return { ok: true };
+  }
+
   @Get('proposal/:id')
   @UseGuards(JwtGuard)
   async proposal(@CurrentUser() user: any, @Param('id') id: string) {

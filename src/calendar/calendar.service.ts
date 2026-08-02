@@ -255,6 +255,47 @@ export class CalendarService {
     this.onWrite?.(userId); // disconnecting also changes the co-pilot view — bust the cache
   }
 
+  // ---- Read-only календари по ссылке (ICS): Outlook «Опубликовать календарь», Google, iCloud и т.п.
+  //      Хранятся в trip_calendars (PK user_id+kind), читаются в listEvents → co-pilot. ----
+
+  async listIcs(userId: string): Promise<Array<{ kind: string; url: string; enabled: boolean }>> {
+    const r = await this.pg.query(
+      `SELECT kind, url, enabled FROM trip_calendars WHERE user_id=$1 ORDER BY kind`,
+      [userId],
+    );
+    return r.rows;
+  }
+
+  /** Добавить/обновить ICS-источник по ссылке. Проверяем, что ссылка реально отдаёт iCalendar,
+   *  иначе пользователь молча «подключит» пустоту. webcal:// → https://. */
+  async addIcs(userId: string, kind: string, url: string): Promise<{ ok: boolean; error?: string }> {
+    kind = (kind || 'outlook').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32) || 'outlook';
+    let u = (url || '').trim();
+    if (u.toLowerCase().startsWith('webcal://')) u = 'https://' + u.slice('webcal://'.length);
+    if (!/^https?:\/\//i.test(u)) return { ok: false, error: 'Нужна ссылка вида https://… (или webcal://…)' };
+    let text = '';
+    try {
+      const res = await fetch(u, { signal: AbortSignal.timeout(8000) } as any);
+      if (!res.ok) return { ok: false, error: `Ссылка недоступна (код ${res.status})` };
+      text = await res.text();
+    } catch {
+      return { ok: false, error: 'Не удалось открыть ссылку — проверь адрес' };
+    }
+    if (!text.includes('BEGIN:VCALENDAR')) return { ok: false, error: 'По ссылке не календарь (нет данных iCalendar)' };
+    await this.pg.query(
+      `INSERT INTO trip_calendars (user_id, kind, url, enabled) VALUES ($1,$2,$3,true)
+       ON CONFLICT (user_id, kind) DO UPDATE SET url=EXCLUDED.url, enabled=true`,
+      [userId, kind, u],
+    );
+    this.onWrite?.(userId); // новый источник меняет co-pilot view — сбрасываем кэш
+    return { ok: true };
+  }
+
+  async removeIcs(userId: string, kind: string): Promise<void> {
+    await this.pg.query(`DELETE FROM trip_calendars WHERE user_id=$1 AND kind=$2`, [userId, kind]);
+    this.onWrite?.(userId);
+  }
+
   /**
    * All events in [start,end): the CalDAV connection (live) + read-only ICS sources
    * (trip_calendars) + TalerID (if connected). This union is what feeds the co-pilot
