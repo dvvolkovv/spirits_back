@@ -195,7 +195,7 @@ export class TalerIdCalendarConnector {
       const toMs = end.getTime();
       const today = this.localDay(now.getTime());
       for (const t of rows) {
-        if (!t?.id) continue;
+        if (!t?.uid) continue;
         const title = String(t.title || '').trim() || 'Дело';
         const deadline = t.deadline ? new Date(t.deadline).toISOString() : undefined;
         if (t.recurrence && Array.isArray(t.occurrences)) {
@@ -210,10 +210,10 @@ export class TalerIdCalendarConnector {
             if (Number.isNaN(instant.getTime()) || instant.getTime() > toMs) continue;
             if (st === 'done') {
               if (occDate === today) {
-                out.push({ uid: t.id, title, due: instant.toISOString(), done: true, status: 'done', isRoutine: true, occurrenceDate: occDate, doneAt: o?.doneAt ? new Date(o.doneAt).toISOString() : instant.toISOString(), source: 'talerid' });
+                out.push({ uid: t.uid, title, due: instant.toISOString(), done: true, status: 'done', isRoutine: true, occurrenceDate: occDate, doneAt: o?.doneAt ? new Date(o.doneAt).toISOString() : instant.toISOString(), source: 'talerid' });
               }
             } else {
-              out.push({ uid: t.id, title, due: instant.toISOString(), deadline, done: false, status: 'pending', isRoutine: true, occurrenceDate: occDate, source: 'talerid' });
+              out.push({ uid: t.uid, title, due: instant.toISOString(), deadline, done: false, status: 'pending', isRoutine: true, occurrenceDate: occDate, source: 'talerid' });
             }
           }
         } else {
@@ -222,10 +222,10 @@ export class TalerIdCalendarConnector {
           const due = t.due ? new Date(t.due).toISOString() : undefined;
           if (done) {
             if (t.doneAt && this.localDay(new Date(t.doneAt).getTime()) === today) {
-              out.push({ uid: t.id, title, due, deadline, done: true, status: 'done', doneAt: new Date(t.doneAt).toISOString(), source: 'talerid' });
+              out.push({ uid: t.uid, title, due, deadline, done: true, status: 'done', doneAt: new Date(t.doneAt).toISOString(), source: 'talerid' });
             }
           } else if (t.status !== 'dropped' && (!due || new Date(due).getTime() <= toMs)) {
-            out.push({ uid: t.id, title, due, deadline, done: false, status: 'pending', source: 'talerid' });
+            out.push({ uid: t.uid, title, due, deadline, done: false, status: 'pending', source: 'talerid' });
           }
         }
       }
@@ -270,7 +270,7 @@ export class TalerIdCalendarConnector {
       if (opts.recurrence) args.recurrence = opts.recurrence;
       if (opts.idempotencyKey) args.idempotency_key = opts.idempotencyKey;
       const r = await this.callTool(userId, 'create_task', args);
-      return { id: r?.id, ok: true };
+      return { id: r?.uid, ok: true };
     } catch (e: any) {
       this.logger.debug(`talerid create_task failed for user ${userId}: ${e?.message}`);
       return { ok: false };
