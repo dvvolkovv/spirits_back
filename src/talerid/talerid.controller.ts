@@ -1,8 +1,9 @@
-import { Controller, Get, Post, Delete, UseGuards, HttpCode, HttpStatus, Logger, Query, Res } from '@nestjs/common';
+import { Body, Controller, Get, Post, Delete, UseGuards, HttpCode, HttpStatus, Logger, Query, Res } from '@nestjs/common';
 import { Response } from 'express';
 import { TalerIdOauthService } from './talerid-oauth.service';
 import { TalerIdStoreService } from './talerid-store.service';
 import { TalerIdLinkService } from './talerid-link.service';
+import { TalerIdLoginService } from './talerid-login.service';
 import { PgService } from '../common/services/pg.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
@@ -22,6 +23,7 @@ export class TalerIdController {
     private readonly oauth: TalerIdOauthService,
     private readonly store: TalerIdStoreService,
     private readonly link: TalerIdLinkService,
+    private readonly login: TalerIdLoginService,
     private readonly pg: PgService,
   ) {}
 
@@ -111,6 +113,21 @@ export class TalerIdController {
     @Res() res: Response,
   ) {
     const base = (process.env.PUBLIC_BASE_URL || 'https://my.linkeon.io').replace(/\/$/, '');
+
+    // Один redirect_uri на два сценария: привязку и вход. Он зарегистрирован
+    // у провайдера, и заводить второй ради входа значило бы держать две
+    // регистрации ради одного и того же обмена. Различаем по state.
+    if (!error && (await this.login.isLoginState(state))) {
+      const handoff = await this.login.completeLogin(state, code);
+      // Токены уезжают не в адресной строке, а одноразовым кодом: строка
+      // осела бы в истории браузера и в логах прокси.
+      return res.redirect(
+        handoff
+          ? `${base}/?talerid_login=${encodeURIComponent(handoff)}`
+          : `${base}/?talerid_login_error=1`,
+      );
+    }
+
     let status: string;
     if (error) {
       status = 'cancelled'; // user denied/aborted at TalerID's login screen
@@ -123,5 +140,28 @@ export class TalerIdController {
       }
     }
     return res.redirect(`${base}/?talerid_link=${encodeURIComponent(status)}`);
+  }
+
+  /**
+   * Вход через Taler ID — шаг 1. Публичный: человек ещё НЕ вошёл в Linkeon,
+   * тем и отличается от `oauth/start`, который привязывает провайдера к уже
+   * существующей сессии и требует JWT.
+   */
+  @Post('login/start')
+  @HttpCode(HttpStatus.OK)
+  async loginStart() {
+    return this.login.startLogin();
+  }
+
+  /**
+   * Вход через Taler ID — шаг 3. Обмен одноразового кода на токены Linkeon.
+   * Код живёт две минуты и срабатывает единожды.
+   */
+  @Post('login/redeem')
+  @HttpCode(HttpStatus.OK)
+  async loginRedeem(@Body() body: { handoff?: string }, @Res() res: Response) {
+    const tokens = await this.login.redeemHandoff(body?.handoff || '');
+    if (!tokens) return res.status(400).json({ error: 'handoff expired or already used' });
+    return res.status(200).json(tokens);
   }
 }

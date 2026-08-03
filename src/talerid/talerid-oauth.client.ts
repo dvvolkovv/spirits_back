@@ -63,19 +63,70 @@ export class TalerIdOauthClient {
   }
 
   /** Build the TalerID authorize URL for the linking code-flow (PKCE S256, public client). */
-  buildAuthorizeUrl(state: string, codeChallenge: string): string {
+  buildAuthorizeUrl(state: string, codeChallenge: string, scope = 'openid'): string {
     const params = new URLSearchParams({
       client_id: this.webClientId(),
       redirect_uri: this.linkRedirectUri(),
       response_type: 'code',
-      // linkeon-partner-web allows `openid` only (TalerID); we don't need email —
-      // the id_token.sub is all attach-phone consumes; UI shows a neutral label.
-      scope: 'openid',
+      // Default `openid` — all attach-phone consumes is id_token.sub, and linking
+      // shows a neutral consent screen. Sign-in passes `openid email`: it has to
+      // recognise a returning user, and email is the only identifying scope this
+      // client is allowed — `phone` comes back invalid_scope (probed live).
+      scope,
       state,
       code_challenge: codeChallenge,
       code_challenge_method: 'S256',
     });
     return `${this.baseUrl()}/oauth/auth?${params.toString()}`;
+  }
+
+  /**
+   * Sign-in leg: code → userinfo. Unlike {@link exchangeCodeForIdToken} (linking,
+   * which only needs proof-of-login) this needs the account's identity, so it
+   * takes the access_token to {BASE}/oauth/me.
+   *
+   * Returns the same shape as the Google/Yandex services so IdentityService can
+   * treat TalerID as one more ordinary provider.
+   */
+  async exchangeCodeForUserinfo(
+    code: string,
+    codeVerifier: string,
+  ): Promise<{ sub: string; email: string; emailVerified: boolean }> {
+    const params = new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: this.linkRedirectUri(),
+      client_id: this.webClientId(),
+      code_verifier: codeVerifier,
+    });
+    const tokenRes = await this.fetchFn(`${this.baseUrl()}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    });
+    if (!tokenRes.ok) throw new Error(`TalerID code exchange failed: HTTP ${tokenRes.status}`);
+    const tokens = await tokenRes.json();
+    const accessToken = tokens?.access_token;
+    if (!accessToken) throw new Error('TalerID code exchange: no access_token in response');
+
+    const meRes = await this.fetchFn(`${this.baseUrl()}/oauth/me`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!meRes.ok) throw new Error(`TalerID userinfo failed: HTTP ${meRes.status}`);
+    const me = await meRes.json();
+
+    const sub = me?.sub;
+    const email = me?.email;
+    if (!sub) throw new Error('TalerID userinfo: no sub');
+    // Without an email we cannot recognise a returning user, and signing them in
+    // would silently mint a second account beside the one they already have.
+    if (!email) throw new Error('TalerID userinfo: no email (scope not granted?)');
+
+    return {
+      sub: String(sub),
+      email: String(email),
+      emailVerified: me?.email_verified === true,
+    };
   }
 
   /**

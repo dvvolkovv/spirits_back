@@ -1,9 +1,11 @@
 import { Module } from '@nestjs/common';
 import { CommonModule } from '../common/common.module';
+import { IdentityModule } from '../identity/identity.module';
 import { TalerIdStoreService } from './talerid-store.service';
 import { TalerIdOauthClient } from './talerid-oauth.client';
 import { TalerIdOauthService } from './talerid-oauth.service';
 import { TalerIdLinkService } from './talerid-link.service';
+import { TalerIdLoginService } from './talerid-login.service';
 import { TalerIdCalendarConnector } from './talerid-calendar.connector';
 import { TalerIdNotesConnector } from './talerid-notes.connector';
 import { TalerIdController } from './talerid.controller';
@@ -18,9 +20,9 @@ import { TalerIdController } from './talerid.controller';
  * controller below.
  */
 @Module({
-  imports: [CommonModule],
+  imports: [CommonModule, IdentityModule],
   controllers: [TalerIdController],
-  providers: [TalerIdStoreService, TalerIdOauthClient, TalerIdOauthService, TalerIdLinkService, TalerIdCalendarConnector, TalerIdNotesConnector],
+  providers: [TalerIdStoreService, TalerIdOauthClient, TalerIdOauthService, TalerIdLinkService, TalerIdLoginService, TalerIdCalendarConnector, TalerIdNotesConnector],
   exports: [TalerIdStoreService, TalerIdOauthService, TalerIdCalendarConnector, TalerIdNotesConnector],
 })
 export class TalerIdModule {}
