@@ -76,6 +76,17 @@ export class SmmController {
     const smmAgentId: number = agentRes.rows[0].id;
     const sessionId = `${userId}_${smmAgentId}`;
 
+    // Онбординг: без onboarded=true ChatPage показывает экран подбора
+    // ассистента вместо чата (showMatch = user.onboarded === false), карточка
+    // сценария не рендерится и тест падает на «не нашёл Редактировать».
+    // На проде флаг стоял от старых прогонов, на свежей test-базе — нет,
+    // отчего smoke был красным только там. Фикстура обязана приводить юзера
+    // в готовое состояние сама, а не рассчитывать на обжитую базу.
+    await this.pg.query(
+      `UPDATE ai_profiles_consolidated SET onboarded = true, updated_at = now() WHERE user_id = $1`,
+      [userId],
+    );
+
     // Cleanup prior seed rows (smm_scenario cascades from smm_campaign).
     await this.pg.query(
       `DELETE FROM smm_campaign WHERE user_id = $1 AND topic = $2`,

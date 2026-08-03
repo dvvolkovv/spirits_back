@@ -153,6 +153,19 @@ test.describe('Юля (SMM Producer) creator-mode E2E', () => {
     // session should render in chat history.
     await page.waitForTimeout(4000);
 
+    // Онбординг-заслонка. Если профиль отдал onboarded=false, ChatPage рисует
+    // экран подбора ассистента вместо чата — карточки сценария там нет, и тест
+    // падал невнятным «не нашёл Редактировать». Сид теперь ставит флаг сам,
+    // так что сюда попадать не должны; проверка оставлена как понятная
+    // диагностика, если фикстура снова разъедется с фронтом.
+    const matchScreen = page.getByRole('heading', { name: /С чего начнём\?|Where shall we start\?/ });
+    if (await matchScreen.isVisible().catch(() => false)) {
+      throw new Error(
+        'Вместо чата показан экран подбора ассистента (onboarded=false у тест-юзера). ' +
+        'Сид /webhook/smm/admin/seed-scenario должен выставлять onboarded=true.',
+      );
+    }
+
     // Scroll messages container to top to load history if lazy.
     // Look for an "Edit" button in any ScenarioCard
     const editBtn = page.getByRole('button', { name: /^Редактировать(?: сценарий)?$/ }).first();
@@ -208,7 +221,12 @@ test.describe('Юля (SMM Producer) creator-mode E2E', () => {
     // before the response arrived — the server saved the data but the frontend never
     // received the response, so the modal stayed open and no toast showed.
     const successToast = page.getByText('Сценарий обновлён');
-    const errorToast = page.getByText(/Не удалось сохранить/);
+    // Ловим не только тост из catch («Не удалось сохранить»), но и валидацию
+    // в handleSave: она делает return ДО PATCH, и раньше такой отказ выглядел
+    // как «запрос не ушёл, тостов нет» — причину приходилось искать руками.
+    const errorToast = page.getByText(
+      /Не удалось сохранить|не может быть пустым|Нужна хотя бы одна реплика|должен быть больше|обязателен|Не больше 6 kling/,
+    );
 
     let modalClosed = false;
     try {
