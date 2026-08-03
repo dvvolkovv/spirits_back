@@ -1,15 +1,17 @@
-export type Provider = 'phone' | 'email' | 'google' | 'yandex';
+export type Provider = 'phone' | 'email' | 'google' | 'yandex' | 'talerid';
 
 export interface PhoneData   { phone: string }
 export interface EmailData   { email: string }
 export interface GoogleData  { sub: string; email: string; emailVerified: boolean }
 export interface YandexData  { sub: string; email: string; emailVerified: boolean }
+export interface TaleridData { sub: string; email: string; emailVerified: boolean }
 
 export type ProviderData<P extends Provider> =
-  P extends 'phone'  ? PhoneData :
-  P extends 'email'  ? EmailData :
-  P extends 'google' ? GoogleData :
-  P extends 'yandex' ? YandexData : never;
+  P extends 'phone'   ? PhoneData :
+  P extends 'email'   ? EmailData :
+  P extends 'google'  ? GoogleData :
+  P extends 'yandex'  ? YandexData :
+  P extends 'talerid' ? TaleridData : never;
 
 export interface Identity {
   id: string;

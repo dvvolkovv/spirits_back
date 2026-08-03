@@ -48,13 +48,16 @@ export class IdentityService implements OnModuleInit {
   private normalize(provider: Provider, data: any): string {
     if (provider === 'phone') return (data.phone || '').replace(/\D/g, '');
     if (provider === 'email') return (data.email || '').trim().toLowerCase();
-    if (provider === 'google' || provider === 'yandex') return data.sub;
+    // talerid отдаёт тот же {sub,email,emailVerified}, что google/yandex —
+    // без этой ветки normalize бросал бы «unknown provider» уже в рантайме,
+    // хотя типы бы сошлись.
+    if (provider === 'google' || provider === 'yandex' || provider === 'talerid') return data.sub;
     throw new Error(`unknown provider: ${provider}`);
   }
 
   private extractEmail(provider: Provider, data: any): { email: string | null; verified: boolean } {
     if (provider === 'email')  return { email: this.normalize('email', data), verified: true };
-    if (provider === 'google' || provider === 'yandex') {
+    if (provider === 'google' || provider === 'yandex' || provider === 'talerid') {
       return { email: (data.email || '').trim().toLowerCase(), verified: Boolean(data.emailVerified) };
     }
     return { email: null, verified: false };

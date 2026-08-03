@@ -4,7 +4,7 @@ BEGIN;
 CREATE TABLE IF NOT EXISTS user_identities (
   id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id        text NOT NULL REFERENCES user_id(internal_id) ON DELETE CASCADE,
-  provider       text NOT NULL CHECK (provider IN ('phone','email','google','yandex')),
+  provider       text NOT NULL CHECK (provider IN ('phone','email','google','yandex','talerid')),
   provider_sub   text NOT NULL,
   email          text,
   email_verified boolean NOT NULL DEFAULT false,
@@ -14,6 +14,24 @@ CREATE TABLE IF NOT EXISTS user_identities (
 );
 CREATE INDEX IF NOT EXISTS idx_user_identities_user ON user_identities(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_identities_email_verified ON user_identities(email) WHERE email_verified;
+
+-- Расширение списка провайдеров на УЖЕ созданной таблице: CREATE TABLE IF NOT
+-- EXISTS выше существующий CHECK не трогает, поэтому пересоздаём его явно —
+-- и только если он ещё не знает про talerid. Файл прогоняется при каждом
+-- старте сервиса, так что блок обязан быть идемпотентным.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'user_identities'::regclass
+      AND conname  = 'user_identities_provider_check'
+      AND pg_get_constraintdef(oid) NOT LIKE '%talerid%'
+  ) THEN
+    ALTER TABLE user_identities DROP CONSTRAINT user_identities_provider_check;
+    ALTER TABLE user_identities ADD  CONSTRAINT user_identities_provider_check
+      CHECK (provider IN ('phone','email','google','yandex','talerid'));
+  END IF;
+END $$;
 
 ALTER TABLE user_id ADD COLUMN IF NOT EXISTS password_hash    text;
 ALTER TABLE user_id ADD COLUMN IF NOT EXISTS signup_method    text;
