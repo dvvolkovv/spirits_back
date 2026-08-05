@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Req, Res, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Body, Req, Res, UseGuards, Query } from '@nestjs/common';
 import { Response } from 'express';
 import { AgentsService } from './agents.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
@@ -19,8 +19,8 @@ export class AgentsController {
   }
 
   @Get('agents')
-  async getAgents(@Res() res: Response) {
-    const agents = await this.agentsService.getAgents();
+  async getAgents(@Query('lang') lang: string, @Res() res: Response) {
+    const agents = await this.agentsService.getAgents(lang);
     return res.status(200).json(agents);
   }
 

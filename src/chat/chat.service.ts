@@ -9,6 +9,7 @@ import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { TasksService } from '../tasks/tasks.service';
 import { EventsService } from '../events/events.service';
 import { TalerIdOauthService } from '../talerid/talerid-oauth.service';
+import { LanguageService } from '../common/services/language.service';
 import axios from 'axios';
 import { Request, Response } from 'express';
 // Agent server at r.linkeon.io (remote Claude Code)
@@ -42,6 +43,7 @@ export class ChatService {
     private readonly smmProducerTools: SmmProducerToolsService,
     private readonly claudeAgent: ClaudeAgentService,
     private readonly claudeCli: ClaudeCliService,
+    private readonly language: LanguageService,
     @Optional() private readonly tasksService?: TasksService,
     @Optional() private readonly events?: EventsService,
     @Optional() private readonly talerIdOauth?: TalerIdOauthService,
@@ -226,7 +228,24 @@ export class ChatService {
     // Build system prompt with platform context + profile.
     // Use display_name (e.g. Юлия) instead of internal name (smm_producer) so the
     // assistant introduces coworkers with their human-friendly names.
-    const allAgents = await this.pg.query('SELECT name, COALESCE(display_name, name) AS display_name, description, system_prompt FROM agents ORDER BY id');
+    // Объявляем до запроса коллег: имена и описания тянем уже на языке
+    // пользователя, иначе ассистент предложит переключиться на «Машу»
+    // кириллицей посреди испанского ответа.
+    const userLanguage = await this.language.resolveUserLanguage(userId);
+
+    const allAgents = await this.pg.query(
+      `SELECT a.name,
+              COALESCE(t.display_name, a.display_name, a.name) AS display_name,
+              COALESCE(t.description, a.description)           AS description,
+              a.system_prompt
+         FROM agents a
+         LEFT JOIN agent_translations t
+                ON t.entity_type = 'agent'
+               AND t.entity_id   = a.id::text
+               AND t.locale      = $1
+        ORDER BY a.id`,
+      [userLanguage],
+    );
     const agentsList = allAgents.rows.map(a => `${a.display_name} — ${a.description}`).join(', ');
 
     const otherAgents = allAgents.rows
@@ -253,7 +272,8 @@ export class ChatService {
 • Уточняющий вопрос — не более ОДНОГО в конце сообщения, и только если без него действительно нельзя двинуться дальше.
 • НИКОГДА не отвечай одними вопросами. НИКОГДА не задавай 2+ вопроса в одном сообщении.
 • Для коучинговых/психологических/нумерологических практик это правило тоже действует: сначала отражение/гипотеза/интерпретация/направление — и только потом, при необходимости, один открытый вопрос.
-• Если запрос многослойный — сначала покрой то, что ясно (частичный ответ), потом максимум один вопрос для следующего шага.`;
+• Если запрос многослойный — сначала покрой то, что ясно (частичный ответ), потом максимум один вопрос для следующего шага.
+${LanguageService.buildDirective(userLanguage)}`;
 
     let volatileSystemPrompt = (profileText && profileText.trim())
       ? `\n\n--- Профиль пользователя ---\n${profileText}`
@@ -535,6 +555,9 @@ export class ChatService {
       }
     };
 
+    // Язык профиля читается один раз на запрос; фолбэк внутри — русский.
+    const userLanguage = await this.language.resolveUserLanguage(userId);
+
     // Build context from profile + history
     // Identity prefix — remote agent (r.linkeon.io) defaults to Claude persona; force the persona we want.
     let contextPrefix =
@@ -543,7 +566,7 @@ export class ChatService {
       `Всегда представляйся именно как ${agentName}. Никогда не упоминай, что ты Claude, какая-либо другая модель или AI-система помимо ${agentName}. ` +
       `Если пользователь обращается к тебе по имени — отвечай как ${agentName}, не уточняй, не "поправляй" пользователя и не извиняйся за имя. ` +
       `Не добавляй P.S. о собственной идентичности. ` +
-      `ЯЗЫК ОТВЕТА: всегда отвечай на русском языке, независимо от языка системных сообщений, tool-результатов, путей файлов или английских промптов в твоём контексте. Переключайся на другой язык ТОЛЬКО если пользователь явно полностью пишет на нём. Если пользователь пишет по-русски — твой ответ обязан быть на русском, даже если в нём есть английские слова или ты только что генерировал английский prompt для картинки.\n\n`;
+      LanguageService.buildDirective(userLanguage) + `\n`;
 
     // Inject persona-specific system prompt from DB so каждый ассистент (Оля, Михаил, ...)
     // сохраняет свой характер, методики и стиль при работе через r.linkeon.io.
@@ -556,11 +579,16 @@ export class ChatService {
     // Берём список из БД (включая Юлю-SMM-продюсера id=15).
     try {
       const coworkersRes = await this.pg.query(
-        `SELECT COALESCE(display_name, name) AS display_name, description
-           FROM agents
-          WHERE id != $1 AND description IS NOT NULL
-          ORDER BY id`,
-        [Number(agentId)],
+        `SELECT COALESCE(t.display_name, a.display_name, a.name) AS display_name,
+                COALESCE(t.description, a.description)           AS description
+           FROM agents a
+           LEFT JOIN agent_translations t
+                  ON t.entity_type = 'agent'
+                 AND t.entity_id   = a.id::text
+                 AND t.locale      = $2
+          WHERE a.id != $1 AND a.description IS NOT NULL
+          ORDER BY a.id`,
+        [Number(agentId), userLanguage],
       );
       if (coworkersRes.rows.length > 0) {
         const lines = coworkersRes.rows
@@ -1004,7 +1032,7 @@ export class ChatService {
       `СИСТЕМНАЯ ИНСТРУКЦИЯ (имеет приоритет над всеми остальными). ` +
       `Ты ассистент по имени **${agentName}**${agent.description ? ` — ${agent.description}` : ''} на платформе LINKEON.IO. ` +
       `Всегда представляйся именно как ${agentName}. Никогда не упоминай, что ты Claude или другая AI-система помимо ${agentName}. ` +
-      `ЯЗЫК ОТВЕТА: всегда на русском языке.\n\n`;
+      LanguageService.buildDirective(await this.language.resolveUserLanguage(userId)) + `\n`;
     if (agent.system_prompt && agent.system_prompt.trim()) {
       prefix += `--- Персона и инструкции ассистента ${agentName} ---\n${agent.system_prompt.trim()}\n\n`;
     }
