@@ -1,5 +1,5 @@
 // day-framing.spec.ts
-import { activeWindow, buildMorningFacts, buildEveningFacts, factsHash } from './day-framing';
+import { activeWindow, buildMorningFacts, buildEveningFacts, factsHash, framingPrompt } from './day-framing';
 
 const ev = (at: string, title: string, end?: string) => ({ at, title, end });
 const task = (title: string, status = 'pending', due?: string) => ({ uid: title, title, status, due });
@@ -55,5 +55,14 @@ describe('factsHash', () => {
   it('is stable and changes with content', () => {
     expect(factsHash({ a: 1 })).toBe(factsHash({ a: 1 }));
     expect(factsHash({ a: 1 })).not.toBe(factsHash({ a: 2 }));
+  });
+});
+
+describe('framingPrompt', () => {
+  it('framingPrompt embeds facts and forbids invention', () => {
+    const f = buildMorningFacts({ now: new Date('2026-08-06T02:30:00Z'), events: [], tasks: [] });
+    const p = framingPrompt(f);
+    expect(p).toMatch(/только из этих фактов|не выдумывай/i);
+    expect(p).toContain(JSON.stringify(f)); // факты переданы дословно
   });
 });
