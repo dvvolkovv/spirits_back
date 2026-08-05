@@ -1,4 +1,5 @@
 import { computeCopilotState, mergeEvents, TripService } from './trip.service';
+import { buildMorningFacts, factsHash } from './day-framing';
 
 const now = new Date('2026-07-19T10:00:00+05:00');
 const task = (uid: string, title: string, due?: string, done = false) => ({ uid, title, due, done, source: 'yandex' });
@@ -189,5 +190,73 @@ describe('computeCopilotState', () => {
     ] as any;
     const s = computeCopilotState({ tasks: [], events, now });
     expect(s.contextLines.filter((l) => l.tone === 'warn').length).toBe(2);
+  });
+
+  describe('generateFramingAsync — Ф3 day framing, facts→LLM→store [2026-08-05]', () => {
+    // Расширяет тест-харнесс TripService (позиционный конструктор, см. свежий `svc(calendar)` выше)
+    // мокнутыми dayFramingStore/chat — реальный LLM-путь reuse'ит ChatService.generateAgentReply
+    // (тот же вызов, что и routine-push.service.ts → deliver(), НЕ отдельный самодельный клиент).
+    const makeTripService = (overrides: any = {}) => {
+      const calendar =
+        overrides.calendar ??
+        ({
+          listTasks: jest.fn().mockResolvedValue([]),
+          listEvents: jest.fn().mockResolvedValue([]),
+          listPendingProposals: jest.fn().mockResolvedValue([]),
+        } as any);
+      const taleridCal =
+        overrides.taleridCal ??
+        ({ listEvents: jest.fn().mockResolvedValue([]), listTasks: jest.fn().mockResolvedValue([]) } as any);
+      const linkeonTasks = overrides.linkeonTasks ?? ({ list: jest.fn().mockResolvedValue([]) } as any);
+      const dayFramingStore =
+        overrides.dayFramingStore ?? ({ get: jest.fn().mockResolvedValue(null), upsert: jest.fn() } as any);
+      const chat = overrides.chat ?? ({ generateAgentReply: jest.fn().mockResolvedValue('') } as any);
+      return new TripService({} as any, calendar, taleridCal, linkeonTasks, chat, dayFramingStore);
+    };
+
+    it('строит факты, дёргает chat.generateAgentReply, апсертит результат в store', async () => {
+      const store = { get: jest.fn().mockResolvedValue(null), upsert: jest.fn() };
+      const chat = { generateAgentReply: jest.fn().mockResolvedValue('Утро: одна встреча в 09:45.') };
+      const svc = makeTripService({ dayFramingStore: store, chat });
+      await svc.generateFramingAsync(
+        'u1',
+        'morning',
+        [{ at: '2026-08-06T04:45:00Z', title: 'A' }] as any,
+        [],
+        new Date('2026-08-06T02:30:00Z'),
+      );
+      expect(chat.generateAgentReply).toHaveBeenCalled();
+      expect(store.upsert).toHaveBeenCalledWith(
+        'u1',
+        expect.any(String),
+        'morning',
+        expect.stringContaining('09:45'),
+        null,
+        expect.any(String),
+      );
+    });
+
+    it('пропускает LLM, если facts_hash не изменился (строка уже есть)', async () => {
+      const facts = buildMorningFacts({ now: new Date('2026-08-06T02:30:00Z'), events: [], tasks: [] });
+      const store = {
+        get: jest.fn().mockResolvedValue({ factsHash: factsHash(facts), dismissed: false }),
+        upsert: jest.fn(),
+      };
+      const chat = { generateAgentReply: jest.fn() };
+      const svc = makeTripService({ dayFramingStore: store, chat });
+      await svc.generateFramingAsync('u1', 'morning', [], [], new Date('2026-08-06T02:30:00Z'));
+      expect(chat.generateAgentReply).not.toHaveBeenCalled();
+      expect(store.upsert).not.toHaveBeenCalled();
+    });
+
+    it('best-effort: ошибка LLM не throw-ится наружу', async () => {
+      const store = { get: jest.fn().mockResolvedValue(null), upsert: jest.fn() };
+      const chat = { generateAgentReply: jest.fn().mockRejectedValue(new Error('r.linkeon.io down')) };
+      const svc = makeTripService({ dayFramingStore: store, chat });
+      await expect(
+        svc.generateFramingAsync('u1', 'morning', [], [], new Date('2026-08-06T02:30:00Z')),
+      ).resolves.toBeUndefined();
+      expect(store.upsert).not.toHaveBeenCalled();
+    });
   });
 });
