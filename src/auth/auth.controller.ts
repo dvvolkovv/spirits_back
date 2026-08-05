@@ -36,6 +36,7 @@ export class AuthController {
     @Query('sid') sid: string,
     @Query('src') src: string,
     @Query('nosms') nosms: string,
+    @Query('lang') lang: string,
     @Res() res: Response,
   ) {
     // ?nosms=1 — маркер автоматического вызова (Claude-ceremony/тесты): для
@@ -43,6 +44,7 @@ export class AuthController {
     // На обычный вход владельца (без флага) SMS уходит. См. auth.service.
     const result = await this.authService.requestSmsCode(phone, sid, src, {
       suppressSms: nosms === '1' || nosms === 'true',
+      lang,
     });
     if (result.status === 'blocked') {
       return res.set(CORS).status(403).send('User blocked');

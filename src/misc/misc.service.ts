@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { PgService } from '../common/services/pg.service';
+import { LanguageService } from '../common/services/language.service';
 import { StorageService } from '../common/services/storage.service';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
@@ -10,6 +11,45 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { renderBannerOverlay, BannerPosition, BannerTheme } from './banner-overlay';
 
 const ASSETS_BUCKET = 'linkeon-assets';
+
+/**
+ * Фолбэк-сообщения поиска/совместимости. Уходят во фронт как готовый контент
+ * стрима (не как код ошибки), поэтому локализуются здесь, а не в ru.json.
+ */
+const SEARCH_MESSAGES: Record<string, { noResults: string; noTargets: string; noData: string }> = {
+  ru: {
+    noResults: 'К сожалению, по вашему запросу не найдено подходящих людей. Попробуйте изменить запрос или расширить критерии поиска.',
+    noTargets: 'Не указаны пользователи для анализа.',
+    noData: 'Не удалось сравнить профили — нет данных с персональными описаниями (gloss/embedding).',
+  },
+  en: {
+    noResults: 'Unfortunately, no matching people were found for your query. Try rephrasing it or widening your search criteria.',
+    noTargets: 'No users specified for analysis.',
+    noData: 'Could not compare the profiles — there is no data with personal descriptions (gloss/embedding).',
+  },
+  es: {
+    noResults: 'Lamentablemente, no se ha encontrado a nadie que coincida con tu búsqueda. Prueba a reformularla o a ampliar los criterios.',
+    noTargets: 'No se han indicado usuarios para el análisis.',
+    noData: 'No se han podido comparar los perfiles: no hay datos con descripciones personales (gloss/embedding).',
+  },
+  de: {
+    noResults: 'Leider wurden zu deiner Anfrage keine passenden Personen gefunden. Formuliere die Anfrage um oder erweitere die Suchkriterien.',
+    noTargets: 'Es wurden keine Nutzer für die Analyse angegeben.',
+    noData: 'Die Profile konnten nicht verglichen werden — es liegen keine Daten mit persönlichen Beschreibungen (Gloss/Embedding) vor.',
+  },
+  fr: {
+    noResults: "Malheureusement, aucune personne correspondant à votre requête n'a été trouvée. Essayez de la reformuler ou d'élargir vos critères.",
+    noTargets: "Aucun utilisateur n'a été indiqué pour l'analyse.",
+    noData: 'Impossible de comparer les profils : il n’y a pas de données avec des descriptions personnelles (gloss/embedding).',
+  },
+  zh: {
+    noResults: '很抱歉，没有找到符合你查询条件的人。请尝试调整查询内容或放宽搜索条件。',
+    noTargets: '未指定要分析的用户。',
+    noData: '无法比较这些档案——缺少带有个人描述（gloss/embedding）的数据。',
+  },
+};
+
+const searchMsg = (lang: string) => SEARCH_MESSAGES[lang] || SEARCH_MESSAGES.ru;
 
 @Injectable()
 export class MiscService {
@@ -21,6 +61,7 @@ export class MiscService {
     private readonly neo4j: Neo4jService,
     private readonly pg: PgService,
     private readonly storage: StorageService,
+    private readonly language: LanguageService,
   ) {
     this.s3 = new S3Client({
       region: process.env.AWS_REGION || 'ru-central1',
@@ -58,10 +99,11 @@ export class MiscService {
     res.setHeader('X-Accel-Buffering', 'no');
     res.setHeader('Access-Control-Allow-Origin', '*');
 
+    const userLanguage = await this.language.resolveUserLanguage(userId);
     const matches = await this.searchProfiles(query, userId);
 
     if (matches.length === 0) {
-      const noResults = 'К сожалению, по вашему запросу не найдено подходящих людей. Попробуйте изменить запрос или расширить критерии поиска.\n\nsearch_result:[]';
+      const noResults = `${searchMsg(userLanguage).noResults}\n\nsearch_result:[]`;
       res.write(JSON.stringify({ type: 'item', content: noResults }) + '\n');
       res.end();
       return;
@@ -106,7 +148,10 @@ ${matchesBlock}
 2. На отдельной строке напиши search_result: и JSON-массив в формате:
 [{"userId":<integer>,"name":"<имя или короткое описание роли>","values":["val1"],"intents":[],"interests":[],"skills":[],"corellation":0.85,"matchReason":"<1 предложение объяснение по matched gloss>"}]
 
-Поле userId — integer из карты выше (используй именно userId, не id и не phone). Поля values/interests/intents/skills заполни ТЕМИ canonical-именами узлов, которые matched. corellation — totalScore / max(totalScore). Не добавляй phone в JSON никогда.`;
+Поле userId — integer из карты выше (используй именно userId, не id и не phone). Поля values/interests/intents/skills заполни ТЕМИ canonical-именами узлов, которые matched. corellation — totalScore / max(totalScore). Не добавляй phone в JSON никогда.
+
+Заголовки и прозаический комментарий пиши на языке пользователя (см. ниже). Ключ search_result: и имена полей JSON — служебные, их НЕ переводи.
+${LanguageService.buildDirective(userLanguage)}`;
 
     const userMessage = `Запрос поиска: "${query}"`;
     await this.streamLLM(systemPrompt, userMessage, res);
@@ -120,8 +165,10 @@ ${matchesBlock}
     res.setHeader('X-Accel-Buffering', 'no');
     res.setHeader('Access-Control-Allow-Origin', '*');
 
+    const userLanguage = await this.language.resolveUserLanguage(userId);
+
     if (!targetUsers.length) {
-      res.write(JSON.stringify({ type: 'item', content: 'Не указаны пользователи для анализа.' }) + '\n');
+      res.write(JSON.stringify({ type: 'item', content: searchMsg(userLanguage).noTargets }) + '\n');
       res.end();
       return;
     }
@@ -150,7 +197,7 @@ ${matchesBlock}
     }
 
     if (!blocks.length) {
-      res.write(JSON.stringify({ type: 'item', content: 'Не удалось сравнить профили — нет данных с персональными описаниями (gloss/embedding).' }) + '\n');
+      res.write(JSON.stringify({ type: 'item', content: searchMsg(userLanguage).noData }) + '\n');
       res.end();
       return;
     }
@@ -161,7 +208,7 @@ ${matchesBlock}
 
 ${blocks.join('\n\n---\n\n')}
 
-На основе приведённых данных напиши анализ совместимости на русском. Для каждой сравниваемой пары:
+На основе приведённых данных напиши анализ совместимости. Для каждой сравниваемой пары:
 
 1. **Общий процент совместимости** — возьми из поля "overall_score" (оно уже рассчитано как взвешенный cosine) и округли до целого.
 2. **Что общего** — используй раздел "Overlaps": для 3-5 главных пересечений напиши 1-2 предложения, ссылаясь на *персональные gloss обеих сторон* side-by-side. Не "оба ценят семью", а конкретно "для А это … тогда как для Б это …, и оба сходятся на …".
@@ -170,7 +217,8 @@ ${blocks.join('\n\n---\n\n')}
 
 Используй markdown (заголовки, списки). НЕ используй таблицы.
 
-ВАЖНО про приватность: в тексте НИКОГДА не упоминай телефонные номера, phone, userId, цифровые идентификаторы пользователей. Обращайся как "Вы" (для себя) и "Собеседник" / "ваш собеседник" (для другого) или просто по имени, если оно попадается в gloss.`;
+ВАЖНО про приватность: в тексте НИКОГДА не упоминай телефонные номера, phone, userId, цифровые идентификаторы пользователей. Обращайся как "Вы" (для себя) и "Собеседник" / "ваш собеседник" (для другого) или просто по имени, если оно попадается в gloss.
+${LanguageService.buildDirective(userLanguage)}`;
 
     await this.streamLLM(systemPrompt, 'Проанализируй совместимость этих людей', res);
   }

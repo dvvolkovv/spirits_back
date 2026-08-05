@@ -32,7 +32,7 @@ export class AuthService {
     @Optional() private readonly events?: EventsService,
   ) {}
 
-  async requestSmsCode(phone: string, sid?: string | null, src?: string | null, opts?: { suppressSms?: boolean }): Promise<{ status: string }> {
+  async requestSmsCode(phone: string, sid?: string | null, src?: string | null, opts?: { suppressSms?: boolean; lang?: string | null }): Promise<{ status: string }> {
     // Check if code already exists in Redis
     const existing = await this.redis.get(`sc-${phone}`);
     if (existing) {
@@ -68,7 +68,7 @@ export class AuthService {
       this.logger.log(`Phone ${phone}: SMSAERO skipped (${isPureTest ? 'pure-test' : 'dev-dual+nosms'}), code in Redis`);
     } else {
       // Send SMS via SMS Aero
-      await this.sendSms(phone, code);
+      await this.sendSms(phone, code, opts?.lang);
     }
     const isTest = skipSms; // for the otp_request event's `sent` flag below
 
@@ -80,7 +80,32 @@ export class AuthService {
     return { status: 'sent' };
   }
 
-  private async sendSms(phone: string, code: string): Promise<void> {
+  /**
+   * Текст SMS на языке интерфейса пользователя.
+   *
+   * Раньше он был только русским, и после перехода на международный ввод
+   * телефона немец или испанец получал бы «Код 1234 для входа в linkeon.io».
+   * Язык приходит query-параметром от формы входа: профиля на этот момент
+   * ещё нет, читать язык неоткуда.
+   *
+   * Последняя строка — WebOTP-маркер (`@<hostname> #<code>`), формат строгий
+   * и от языка не зависит: по нему Chrome Android и Safari iOS подставляют
+   * код в форму автоматически.
+   */
+  private smsText(code: string, lang?: string | null): string {
+    const line: Record<string, string> = {
+      ru: `Код ${code} для входа в linkeon.io`,
+      en: `${code} is your linkeon.io login code`,
+      es: `${code} es tu codigo de acceso a linkeon.io`,
+      de: `${code} ist dein Login-Code fur linkeon.io`,
+      fr: `${code} est ton code de connexion a linkeon.io`,
+      zh: `${code} 是你的 linkeon.io 登录验证码`,
+    };
+    const root = String(lang ?? '').toLowerCase().split(/[-_]/)[0];
+    return `${line[root] ?? line.ru}\n@my.linkeon.io #${code}`;
+  }
+
+  private async sendSms(phone: string, code: string, lang?: string | null): Promise<void> {
     // Telegram-like skip-list для тестовых телефонов: smoke/playwright за двухфазный
     // деплой дёргают /sms/:phone 4-6 раз, SMS Aero отбивает 400 (blacklist) — забивает
     // логи и расходует rate-limit. Код всё равно лежит в Redis (sendCode), так что
@@ -109,7 +134,7 @@ export class AuthService {
       const resp = await axios.get(url, {
         params: {
           number: phone,
-          text: `Код ${code} для входа в linkeon.io\n@my.linkeon.io #${code}`,
+          text: this.smsText(code, lang),
           sign: 'SMSAero',
         },
         headers: { Authorization: `Basic ${auth}` },
