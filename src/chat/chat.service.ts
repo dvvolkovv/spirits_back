@@ -236,6 +236,8 @@ export class ChatService {
       .map(a => `${a.display_name} — ${a.description}`)
       .join(', ');
 
+    const userLanguage = await this.language.resolveUserLanguage(userId);
+
     const platformContext = `ТЫ — ${agent.name}, ${agent.description || 'ассистент'}. Всегда представляйся именно этим именем.
 
 О КОНТЕКСТЕ И ПЛАТФОРМЕ
@@ -255,7 +257,8 @@ export class ChatService {
 • Уточняющий вопрос — не более ОДНОГО в конце сообщения, и только если без него действительно нельзя двинуться дальше.
 • НИКОГДА не отвечай одними вопросами. НИКОГДА не задавай 2+ вопроса в одном сообщении.
 • Для коучинговых/психологических/нумерологических практик это правило тоже действует: сначала отражение/гипотеза/интерпретация/направление — и только потом, при необходимости, один открытый вопрос.
-• Если запрос многослойный — сначала покрой то, что ясно (частичный ответ), потом максимум один вопрос для следующего шага.`;
+• Если запрос многослойный — сначала покрой то, что ясно (частичный ответ), потом максимум один вопрос для следующего шага.
+${LanguageService.buildDirective(userLanguage)}`;
 
     let volatileSystemPrompt = (profileText && profileText.trim())
       ? `\n\n--- Профиль пользователя ---\n${profileText}`
@@ -1009,7 +1012,7 @@ export class ChatService {
       `СИСТЕМНАЯ ИНСТРУКЦИЯ (имеет приоритет над всеми остальными). ` +
       `Ты ассистент по имени **${agentName}**${agent.description ? ` — ${agent.description}` : ''} на платформе LINKEON.IO. ` +
       `Всегда представляйся именно как ${agentName}. Никогда не упоминай, что ты Claude или другая AI-система помимо ${agentName}. ` +
-      `ЯЗЫК ОТВЕТА: всегда на русском языке.\n\n`;
+      LanguageService.buildDirective(await this.language.resolveUserLanguage(userId)) + `\n`;
     if (agent.system_prompt && agent.system_prompt.trim()) {
       prefix += `--- Персона и инструкции ассистента ${agentName} ---\n${agent.system_prompt.trim()}\n\n`;
     }
