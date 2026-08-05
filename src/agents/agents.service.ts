@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
+import { LanguageService } from '../common/services/language.service';
 
 @Injectable()
 export class AgentsService {
@@ -12,12 +13,26 @@ export class AgentsService {
     return res.rows;
   }
 
-  async getAgents(): Promise<any[]> {
+  /**
+   * Локаль приходит query-параметром, а не из профиля: эндпоинт /webhook/agents
+   * публичный (без JwtGuard), userId там недоступен.
+   * Незаполненный перевод деградирует в русские колонки, а не в пустоту.
+   */
+  async getAgents(locale?: string): Promise<any[]> {
+    const lang = LanguageService.normalize(locale);
     const res = await this.pg.query(
-      `SELECT id, name, COALESCE(display_name, name) AS "displayName",
-              description, category
-         FROM agents
-        ORDER BY id`,
+      `SELECT a.id,
+              a.name,
+              COALESCE(t.display_name, a.display_name, a.name) AS "displayName",
+              COALESCE(t.description, a.description)           AS description,
+              a.category
+         FROM agents a
+         LEFT JOIN agent_translations t
+                ON t.entity_type = 'agent'
+               AND t.entity_id   = a.id::text
+               AND t.locale      = $1
+        ORDER BY a.id`,
+      [lang],
     );
     return res.rows;
   }
