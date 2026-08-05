@@ -259,4 +259,82 @@ describe('computeCopilotState', () => {
       expect(store.upsert).not.toHaveBeenCalled();
     });
   });
+
+  describe('getState — dayFraming exposure (lazy async) [Task 5, 2026-08-05]', () => {
+    // 2026-08-06T02:30:00Z == 07:30 в Asia/Yekaterinburg (UTC+5), без событий сегодня →
+    // activeWindow(now, []) === 'morning' (day-framing.ts). Fake timers freeze `new Date()`
+    // so the same instant is seen by getState's internal `now` and this test's expectations.
+    const NOW = new Date('2026-08-06T02:30:00Z');
+
+    const makeTripService = (overrides: any = {}) => {
+      const calendar =
+        overrides.calendar ??
+        ({
+          listTasks: jest.fn().mockResolvedValue([]),
+          listEvents: jest.fn().mockResolvedValue(overrides.events ?? []),
+          listPendingProposals: jest.fn().mockResolvedValue([]),
+        } as any);
+      const taleridCal =
+        overrides.taleridCal ??
+        ({ listEvents: jest.fn().mockResolvedValue([]), listTasks: jest.fn().mockResolvedValue([]) } as any);
+      const linkeonTasks =
+        overrides.linkeonTasks ?? ({ list: jest.fn().mockResolvedValue(overrides.tasks ?? []) } as any);
+      const dayFramingStore =
+        overrides.dayFramingStore ?? ({ get: jest.fn().mockResolvedValue(null), upsert: jest.fn() } as any);
+      const chat = overrides.chat ?? ({ generateAgentReply: jest.fn().mockResolvedValue('') } as any);
+      return new TripService({} as any, calendar, taleridCal, linkeonTasks, chat, dayFramingStore);
+    };
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+      jest.setSystemTime(NOW);
+    });
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('getState reports dayFraming when window active and row exists', async () => {
+      const facts = buildMorningFacts({ now: NOW, events: [], tasks: [] });
+      const store = {
+        get: jest.fn().mockResolvedValue({ text: 'Утро: спокойно', action: null, factsHash: factsHash(facts), dismissed: false }),
+        upsert: jest.fn(),
+      };
+      const svc = makeTripService({ dayFramingStore: store });
+      const state = await svc.getState('u1');
+      expect(state.dayFraming).toEqual({ kind: 'morning', text: 'Утро: спокойно' });
+    });
+
+    it('getState omits dayFraming when dismissed', async () => {
+      const facts = buildMorningFacts({ now: NOW, events: [], tasks: [] });
+      const store = {
+        get: jest.fn().mockResolvedValue({ text: 'x', action: null, factsHash: factsHash(facts), dismissed: true }),
+        upsert: jest.fn(),
+      };
+      const svc = makeTripService({ dayFramingStore: store });
+      const state = await svc.getState('u1');
+      expect(state.dayFraming).toBeUndefined();
+    });
+
+    it('getState omits dayFraming + fires generateFramingAsync (fire-and-forget) when no row exists', async () => {
+      const store = { get: jest.fn().mockResolvedValue(null), upsert: jest.fn() };
+      const svc = makeTripService({ dayFramingStore: store });
+      const spy = jest.spyOn(svc, 'generateFramingAsync').mockResolvedValue(undefined);
+      const state = await svc.getState('u1');
+      expect(state.dayFraming).toBeUndefined();
+      expect(spy).toHaveBeenCalledWith('u1', 'morning', expect.any(Array), expect.any(Array), expect.any(Date));
+      expect(store.get).toHaveBeenCalledWith('u1', '2026-08-06', 'morning');
+    });
+
+    it('getState omits dayFraming + re-triggers generation when stored row is stale (factsHash mismatch)', async () => {
+      const store = {
+        get: jest.fn().mockResolvedValue({ text: 'stale', action: null, factsHash: 'stale-hash', dismissed: false }),
+        upsert: jest.fn(),
+      };
+      const svc = makeTripService({ dayFramingStore: store });
+      const spy = jest.spyOn(svc, 'generateFramingAsync').mockResolvedValue(undefined);
+      const state = await svc.getState('u1');
+      expect(state.dayFraming).toBeUndefined();
+      expect(spy).toHaveBeenCalled();
+    });
+  });
 });

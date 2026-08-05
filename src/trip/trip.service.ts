@@ -7,7 +7,7 @@ import { CalEvent, Task } from '../calendar/calendar.types';
 import { TalerIdCalendarConnector } from '../talerid/talerid-calendar.connector';
 import { DayFramingStore } from '../calendar/day-framing.store';
 import { ChatService } from '../chat/chat.service';
-import { buildMorningFacts, buildEveningFacts, framingPrompt, factsHash } from './day-framing';
+import { activeWindow, buildMorningFacts, buildEveningFacts, framingPrompt, factsHash } from './day-framing';
 
 // Ассистент, чьим "голосом" фреймится день [Ф3, 2026-08-05] — тот же RAYA_ID='14', которым
 // routine-push.service.ts доставляет проактивные пуши (см. deliver() там же). Единый персонаж,
@@ -273,6 +273,27 @@ export class TripService implements OnModuleInit {
         kind: 'calendar_event',
         payload: { event: p.event },
       }));
+    // Ф3 «day framing» [Task 5, 2026-08-05]: если сейчас активно утро/вечер (activeWindow, T1) —
+    // отдаём сохранённую строку (T3) когда она свежая (тот же factsHash что дали бы сейчас
+    // buildMorning/EveningFacts) и не dismissed; иначе окно есть, но строки нет/устарела — гоним
+    // ленивую async-генерацию (T4) и НЕ ждём её здесь: getState не должен блокироваться на LLM.
+    const dayFramingNow = new Date();
+    const window = activeWindow(dayFramingNow, events);
+    if (window) {
+      const day = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Yekaterinburg' }).format(dayFramingNow);
+      const row = await this.dayFramingStore.get(userId, day, window);
+      const facts =
+        window === 'morning'
+          ? buildMorningFacts({ now: dayFramingNow, events, tasks })
+          : buildEveningFacts({ now: dayFramingNow, events, tasks });
+      const fresh = row && row.factsHash === factsHash(facts);
+      if (row && !row.dismissed && fresh) {
+        state.dayFraming = { kind: window, text: row.text, ...(row.action ? { action: row.action } : {}) };
+      } else if (!row || !fresh) {
+        // ленивая async-генерация; появится на следующем фетче. НЕ ждём.
+        void this.generateFramingAsync(userId, window, events, tasks, dayFramingNow);
+      }
+    }
     return state;
   }
 
