@@ -16,7 +16,9 @@ CREATE TABLE IF NOT EXISTS agent_translations (
 CREATE INDEX IF NOT EXISTS agent_translations_lookup
   ON agent_translations (locale, entity_type);
 
--- Накат на прод (migrate-runner сломан на base/001):
---   psql -f src/agents/migrations/001_agent_translations.sql
---   INSERT INTO schema_migrations (name) VALUES ('agents/001_agent_translations')
---     ON CONFLICT DO NOTHING;
+-- Накат вручную (migrate-runner сломан на base/001 и не докатывает ничего после):
+--   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f src/agents/migrations/001_agent_translations.sql
+--   psql "$DATABASE_URL" -c "INSERT INTO schema_migrations (filename)
+--     VALUES ('agents/001_agent_translations.sql') ON CONFLICT DO NOTHING"
+-- Колонка называется filename (не name), значение — путь вида <модуль>/<файл>.sql.
+-- Применено на test.linkeon.io 2026-08-05.
