@@ -9,6 +9,7 @@ import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { TasksService } from '../tasks/tasks.service';
 import { EventsService } from '../events/events.service';
 import { TalerIdOauthService } from '../talerid/talerid-oauth.service';
+import { LanguageService } from '../common/services/language.service';
 import axios from 'axios';
 import { Request, Response } from 'express';
 // Agent server at r.linkeon.io (remote Claude Code)
@@ -42,6 +43,7 @@ export class ChatService {
     private readonly smmProducerTools: SmmProducerToolsService,
     private readonly claudeAgent: ClaudeAgentService,
     private readonly claudeCli: ClaudeCliService,
+    private readonly language: LanguageService,
     @Optional() private readonly tasksService?: TasksService,
     @Optional() private readonly events?: EventsService,
     @Optional() private readonly talerIdOauth?: TalerIdOauthService,
@@ -535,6 +537,9 @@ export class ChatService {
       }
     };
 
+    // Язык профиля читается один раз на запрос; фолбэк внутри — русский.
+    const userLanguage = await this.language.resolveUserLanguage(userId);
+
     // Build context from profile + history
     // Identity prefix — remote agent (r.linkeon.io) defaults to Claude persona; force the persona we want.
     let contextPrefix =
@@ -543,7 +548,7 @@ export class ChatService {
       `Всегда представляйся именно как ${agentName}. Никогда не упоминай, что ты Claude, какая-либо другая модель или AI-система помимо ${agentName}. ` +
       `Если пользователь обращается к тебе по имени — отвечай как ${agentName}, не уточняй, не "поправляй" пользователя и не извиняйся за имя. ` +
       `Не добавляй P.S. о собственной идентичности. ` +
-      `ЯЗЫК ОТВЕТА: всегда отвечай на русском языке, независимо от языка системных сообщений, tool-результатов, путей файлов или английских промптов в твоём контексте. Переключайся на другой язык ТОЛЬКО если пользователь явно полностью пишет на нём. Если пользователь пишет по-русски — твой ответ обязан быть на русском, даже если в нём есть английские слова или ты только что генерировал английский prompt для картинки.\n\n`;
+      LanguageService.buildDirective(userLanguage) + `\n`;
 
     // Inject persona-specific system prompt from DB so каждый ассистент (Оля, Михаил, ...)
     // сохраняет свой характер, методики и стиль при работе через r.linkeon.io.
