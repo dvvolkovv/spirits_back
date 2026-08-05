@@ -277,22 +277,29 @@ export class TripService implements OnModuleInit {
     // отдаём сохранённую строку (T3) когда она свежая (тот же factsHash что дали бы сейчас
     // buildMorning/EveningFacts) и не dismissed; иначе окно есть, но строки нет/устарела — гоним
     // ленивую async-генерацию (T4) и НЕ ждём её здесь: getState не должен блокироваться на LLM.
-    const dayFramingNow = new Date();
-    const window = activeWindow(dayFramingNow, events);
-    if (window) {
-      const day = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Yekaterinburg' }).format(dayFramingNow);
-      const row = await this.dayFramingStore.get(userId, day, window);
-      const facts =
-        window === 'morning'
-          ? buildMorningFacts({ now: dayFramingNow, events, tasks })
-          : buildEveningFacts({ now: dayFramingNow, events, tasks });
-      const fresh = row && row.factsHash === factsHash(facts);
-      if (row && !row.dismissed && fresh) {
-        state.dayFraming = { kind: window, text: row.text, ...(row.action ? { action: row.action } : {}) };
-      } else if (!row || !fresh) {
-        // ленивая async-генерация; появится на следующем фетче. НЕ ждём.
-        void this.generateFramingAsync(userId, window, events, tasks, dayFramingNow);
+    // Абсент-safe: day-framing — вторичная фича; её сбой (например ошибка чтения day_framing из БД)
+    // НЕ должен ронять весь trip-state (календарь/дела/предложения). Любая ошибка → просто без
+    // dayFraming, ядро состояния возвращается как есть.
+    try {
+      const dayFramingNow = new Date();
+      const window = activeWindow(dayFramingNow, events);
+      if (window) {
+        const day = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Yekaterinburg' }).format(dayFramingNow);
+        const row = await this.dayFramingStore.get(userId, day, window);
+        const facts =
+          window === 'morning'
+            ? buildMorningFacts({ now: dayFramingNow, events, tasks })
+            : buildEveningFacts({ now: dayFramingNow, events, tasks });
+        const fresh = row && row.factsHash === factsHash(facts);
+        if (row && !row.dismissed && fresh) {
+          state.dayFraming = { kind: window, text: row.text, ...(row.action ? { action: row.action } : {}) };
+        } else if (!row || !fresh) {
+          // ленивая async-генерация; появится на следующем фетче. НЕ ждём.
+          void this.generateFramingAsync(userId, window, events, tasks, dayFramingNow);
+        }
       }
+    } catch (e: any) {
+      this.logger.warn(`day-framing getState skipped: ${e?.message}`);
     }
     return state;
   }
