@@ -228,15 +228,30 @@ export class ChatService {
     // Build system prompt with platform context + profile.
     // Use display_name (e.g. Юлия) instead of internal name (smm_producer) so the
     // assistant introduces coworkers with their human-friendly names.
-    const allAgents = await this.pg.query('SELECT name, COALESCE(display_name, name) AS display_name, description, system_prompt FROM agents ORDER BY id');
+    // Объявляем до запроса коллег: имена и описания тянем уже на языке
+    // пользователя, иначе ассистент предложит переключиться на «Машу»
+    // кириллицей посреди испанского ответа.
+    const userLanguage = await this.language.resolveUserLanguage(userId);
+
+    const allAgents = await this.pg.query(
+      `SELECT a.name,
+              COALESCE(t.display_name, a.display_name, a.name) AS display_name,
+              COALESCE(t.description, a.description)           AS description,
+              a.system_prompt
+         FROM agents a
+         LEFT JOIN agent_translations t
+                ON t.entity_type = 'agent'
+               AND t.entity_id   = a.id::text
+               AND t.locale      = $1
+        ORDER BY a.id`,
+      [userLanguage],
+    );
     const agentsList = allAgents.rows.map(a => `${a.display_name} — ${a.description}`).join(', ');
 
     const otherAgents = allAgents.rows
       .filter(a => a.name !== agent.name)
       .map(a => `${a.display_name} — ${a.description}`)
       .join(', ');
-
-    const userLanguage = await this.language.resolveUserLanguage(userId);
 
     const platformContext = `ТЫ — ${agent.name}, ${agent.description || 'ассистент'}. Всегда представляйся именно этим именем.
 
@@ -564,11 +579,16 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // Берём список из БД (включая Юлю-SMM-продюсера id=15).
     try {
       const coworkersRes = await this.pg.query(
-        `SELECT COALESCE(display_name, name) AS display_name, description
-           FROM agents
-          WHERE id != $1 AND description IS NOT NULL
-          ORDER BY id`,
-        [Number(agentId)],
+        `SELECT COALESCE(t.display_name, a.display_name, a.name) AS display_name,
+                COALESCE(t.description, a.description)           AS description
+           FROM agents a
+           LEFT JOIN agent_translations t
+                  ON t.entity_type = 'agent'
+                 AND t.entity_id   = a.id::text
+                 AND t.locale      = $2
+          WHERE a.id != $1 AND a.description IS NOT NULL
+          ORDER BY a.id`,
+        [Number(agentId), userLanguage],
       );
       if (coworkersRes.rows.length > 0) {
         const lines = coworkersRes.rows
