@@ -29,7 +29,13 @@ export class AvatarController {
     // (кросс-ориджин + Authorization = префлайт, redirect за ним не следуется).
     try {
       const img = await axios.get(avatar.url, { responseType: 'arraybuffer', timeout: 15000 });
-      res.setHeader('Content-Type', img.headers['content-type'] || 'image/jpeg');
+      // Типы axios допускают boolean среди значений заголовка, а setHeader его
+      // не принимает — сужаем явно, иначе сборка не проходит.
+      const contentType = img.headers['content-type'];
+      res.setHeader(
+        'Content-Type',
+        typeof contentType === 'string' ? contentType : 'image/jpeg',
+      );
       res.setHeader('Cache-Control', 'private, max-age=3600');
       return res.send(Buffer.from(img.data));
     } catch {
@@ -85,7 +91,13 @@ export class AvatarController {
     // 2026-07-13). Веб (same-origin) не затронут. Клиент кэширует в IndexedDB.
     try {
       const img = await axios.get(url, { responseType: 'arraybuffer', timeout: 15000 });
-      res.setHeader('Content-Type', img.headers['content-type'] || 'image/jpeg');
+      // Типы axios допускают boolean среди значений заголовка, а setHeader его
+      // не принимает — сужаем явно, иначе сборка не проходит.
+      const contentType = img.headers['content-type'];
+      res.setHeader(
+        'Content-Type',
+        typeof contentType === 'string' ? contentType : 'image/jpeg',
+      );
       res.setHeader('Cache-Control', 'public, max-age=86400');
       return res.send(Buffer.from(img.data));
     } catch {
