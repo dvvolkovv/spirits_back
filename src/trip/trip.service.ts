@@ -423,6 +423,12 @@ export class TripService implements OnModuleInit {
       const id = payload?.id;
       if (!id) throw new BadRequestException('id required');
       await this.calendar.setProposalStatus(userId, id, 'dismissed');
+    } else if (kind === 'day_framing_dismiss') {
+      // Карточка «day framing» (Ф3, Task 6) отпущена из лаунчера — [Понятно]. payload {kind: 'morning'|'evening'}.
+      const k = payload?.kind;
+      if (k !== 'morning' && k !== 'evening') throw new BadRequestException('day_framing_dismiss requires kind');
+      const day = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Yekaterinburg' }).format(new Date());
+      await this.dayFramingStore.markDismissed(userId, day, k);
     } else if (kind === 'event_delete') {
       // Удаление события из календаря из виджета [удаление 2026-07-29]. payload {uid, source}.
       const uid = payload?.uid;

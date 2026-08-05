@@ -177,6 +177,45 @@ describe('computeCopilotState', () => {
     });
   });
 
+  describe('applyAction — day_framing_dismiss [Task 6, 2026-08-05]', () => {
+    const makeTripService = (overrides: any = {}) => {
+      const calendar =
+        overrides.calendar ??
+        ({
+          listTasks: jest.fn().mockResolvedValue([]),
+          listEvents: jest.fn().mockResolvedValue([]),
+          listPendingProposals: jest.fn().mockResolvedValue([]),
+        } as any);
+      const taleridCal =
+        overrides.taleridCal ??
+        ({ listEvents: jest.fn().mockResolvedValue([]), listTasks: jest.fn().mockResolvedValue([]) } as any);
+      const linkeonTasks = overrides.linkeonTasks ?? ({ list: jest.fn().mockResolvedValue([]) } as any);
+      const dayFramingStore = overrides.dayFramingStore ?? ({ get: jest.fn().mockResolvedValue(null), markDismissed: jest.fn() } as any);
+      const chat = overrides.chat ?? ({ generateAgentReply: jest.fn().mockResolvedValue('') } as any);
+      return new TripService({} as any, calendar, taleridCal, linkeonTasks, chat, dayFramingStore);
+    };
+
+    it('day_framing_dismiss с kind=morning → зовёт store.markDismissed(userId, day, "morning")', async () => {
+      const store = { get: jest.fn().mockResolvedValue(null), markDismissed: jest.fn() };
+      await makeTripService({ dayFramingStore: store }).applyAction('u1', 'idem-1', 'day_framing_dismiss', { kind: 'morning' });
+      expect(store.markDismissed).toHaveBeenCalledWith('u1', expect.any(String), 'morning');
+    });
+
+    it('day_framing_dismiss с kind=evening → зовёт store.markDismissed(userId, day, "evening")', async () => {
+      const store = { get: jest.fn().mockResolvedValue(null), markDismissed: jest.fn() };
+      await makeTripService({ dayFramingStore: store }).applyAction('u1', 'idem-2', 'day_framing_dismiss', { kind: 'evening' });
+      expect(store.markDismissed).toHaveBeenCalledWith('u1', expect.any(String), 'evening');
+    });
+
+    it('day_framing_dismiss без/с невалидным kind → BadRequest, store не тронут', async () => {
+      const store = { get: jest.fn().mockResolvedValue(null), markDismissed: jest.fn() };
+      const svc = makeTripService({ dayFramingStore: store });
+      await expect(svc.applyAction('u1', 'idem-3', 'day_framing_dismiss', {})).rejects.toThrow();
+      await expect(svc.applyAction('u1', 'idem-4', 'day_framing_dismiss', { kind: 'noon' })).rejects.toThrow();
+      expect(store.markDismissed).not.toHaveBeenCalled();
+    });
+  });
+
   it('serverTime и version проставлены', () => {
     const s = computeCopilotState({ tasks: [], events: [], now });
     expect(s.version).toBeGreaterThan(0);
