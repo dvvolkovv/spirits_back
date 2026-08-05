@@ -5,6 +5,14 @@ import { CalendarService } from '../calendar/calendar.service';
 import { LinkeonTasksService } from '../calendar/linkeon-tasks.service';
 import { CalEvent, Task } from '../calendar/calendar.types';
 import { TalerIdCalendarConnector } from '../talerid/talerid-calendar.connector';
+import { DayFramingStore } from '../calendar/day-framing.store';
+import { ChatService } from '../chat/chat.service';
+import { activeWindow, buildMorningFacts, buildEveningFacts, framingPrompt, factsHash } from './day-framing';
+
+// Ассистент, чьим "голосом" фреймится день [Ф3, 2026-08-05] — тот же RAYA_ID='14', которым
+// routine-push.service.ts доставляет проактивные пуши (см. deliver() там же). Единый персонаж,
+// не отдельный клиент/промпт-канал.
+const FRAMING_ASSISTANT_ID = '14';
 
 export const TRIP_STATE_VERSION = 1;
 
@@ -189,6 +197,12 @@ export class TripService implements OnModuleInit {
     private readonly calendar: CalendarService,
     private readonly taleridCalendar: TalerIdCalendarConnector,
     private readonly linkeonTasks: LinkeonTasksService,
+    // Ф3 day framing [2026-08-05] — опциональны в сигнатуре ТОЛЬКО чтобы не трогать
+    // существующие позиционные `new TripService(pg, calendar, taleridCal, linkeonTasks)`
+    // в старых тестах; в реальном DI-графе (TripModule импортирует ChatModule+CalendarModule)
+    // оба провайдера всегда приходят.
+    private readonly chat?: ChatService,
+    private readonly dayFramingStore?: DayFramingStore,
   ) {}
 
   async onModuleInit() {
@@ -259,7 +273,76 @@ export class TripService implements OnModuleInit {
         kind: 'calendar_event',
         payload: { event: p.event },
       }));
+    // Ф3 «day framing» [Task 5, 2026-08-05]: если сейчас активно утро/вечер (activeWindow, T1) —
+    // отдаём сохранённую строку (T3) когда она свежая (тот же factsHash что дали бы сейчас
+    // buildMorning/EveningFacts) и не dismissed; иначе окно есть, но строки нет/устарела — гоним
+    // ленивую async-генерацию (T4) и НЕ ждём её здесь: getState не должен блокироваться на LLM.
+    // Абсент-safe: day-framing — вторичная фича; её сбой (например ошибка чтения day_framing из БД)
+    // НЕ должен ронять весь trip-state (календарь/дела/предложения). Любая ошибка → просто без
+    // dayFraming, ядро состояния возвращается как есть.
+    try {
+      const dayFramingNow = new Date();
+      const window = activeWindow(dayFramingNow, events);
+      if (window) {
+        const day = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Yekaterinburg' }).format(dayFramingNow);
+        const row = await this.dayFramingStore.get(userId, day, window);
+        const facts =
+          window === 'morning'
+            ? buildMorningFacts({ now: dayFramingNow, events, tasks })
+            : buildEveningFacts({ now: dayFramingNow, events, tasks });
+        const fresh = row && row.factsHash === factsHash(facts);
+        if (row && !row.dismissed && fresh) {
+          state.dayFraming = { kind: window, text: row.text, ...(row.action ? { action: row.action } : {}) };
+        } else if (!row || !fresh) {
+          // ленивая async-генерация; появится на следующем фетче. НЕ ждём.
+          void this.generateFramingAsync(userId, window, events, tasks, dayFramingNow);
+        }
+      }
+    } catch (e: any) {
+      this.logger.warn(`day-framing getState skipped: ${e?.message}`);
+    }
     return state;
+  }
+
+  /**
+   * Ф3 «day framing» — генерация тёплой строки на утро/вечер [2026-08-05]: детерминированные
+   * факты (buildMorningFacts/buildEveningFacts, T1) → хеш → если факты не менялись с последней
+   * генерации (DayFramingStore.get, T3), выходим без похода в LLM; иначе гоним факты в
+   * framingPrompt (T2) через ТОТ ЖЕ путь генерации текста ассистента, что и проактивные рутинные
+   * пуши — ChatService.generateAgentReply (см. routine-push.service.ts:59 `deliver()`, которая
+   * зовёт `this.chat.generateAgentReply(userId, assistantId, prompt)` и возвращает готовый текст
+   * от r.linkeon.io). Отдельного/самодельного LLM-клиента здесь нет.
+   *
+   * v1: `action` всегда null — авто-предложение переноса дела в свободное окно (спека §8) это
+   * отдельная итерация; лаунчер уже умеет показывать карточку без action (только [Понятно]).
+   *
+   * Best-effort: НИКОГДА не бросает наружу — вызывающий (Task 5, getState) не должен падать из-за
+   * сбоя генерации/LLM/БД, ошибка только логируется.
+   */
+  async generateFramingAsync(
+    userId: string,
+    window: 'morning' | 'evening',
+    events: CalEvent[],
+    tasks: Task[],
+    now: Date,
+  ): Promise<void> {
+    try {
+      const facts =
+        window === 'morning'
+          ? buildMorningFacts({ now, events, tasks })
+          : buildEveningFacts({ now, events, tasks });
+      const hash = factsHash(facts);
+      const day = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Yekaterinburg' }).format(now);
+      const existing = await this.dayFramingStore?.get(userId, day, window);
+      if (existing && existing.factsHash === hash) return; // факты не изменились — уже есть свежая строка
+      const raw = await this.chat?.generateAgentReply(userId, FRAMING_ASSISTANT_ID, framingPrompt(facts));
+      const text = (raw || '').trim();
+      if (!text) return;
+      const action = null; // v1 — см. doc-комментарий выше
+      await this.dayFramingStore?.upsert(userId, day, window, text, action, hash);
+    } catch (e: any) {
+      this.logger.warn(`day-framing gen failed (${userId}/${window}): ${e?.message}`);
+    }
   }
 
   /**
@@ -340,6 +423,12 @@ export class TripService implements OnModuleInit {
       const id = payload?.id;
       if (!id) throw new BadRequestException('id required');
       await this.calendar.setProposalStatus(userId, id, 'dismissed');
+    } else if (kind === 'day_framing_dismiss') {
+      // Карточка «day framing» (Ф3, Task 6) отпущена из лаунчера — [Понятно]. payload {kind: 'morning'|'evening'}.
+      const k = payload?.kind;
+      if (k !== 'morning' && k !== 'evening') throw new BadRequestException('day_framing_dismiss requires kind');
+      const day = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Yekaterinburg' }).format(new Date());
+      await this.dayFramingStore.markDismissed(userId, day, k);
     } else if (kind === 'event_delete') {
       // Удаление события из календаря из виджета [удаление 2026-07-29]. payload {uid, source}.
       const uid = payload?.uid;

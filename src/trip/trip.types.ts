@@ -64,6 +64,13 @@ export interface CoPilotState {
    * которые лаунчер показывает карточкой с [Добавить]/[Отклонить]. Absent/[] — нечего предлагать.
    */
   proposals?: { id: string; kind: string; payload: any }[];
+  /**
+   * Ф3 «day framing» [Task 5, 2026-08-05]: тёплая утренняя/вечерняя строка (+опциональное
+   * proposal-действие), появляется только когда активно окно (day-framing.ts:activeWindow) И
+   * есть свежая недемиссед строка в DayFramingStore. Absent-safe: нет окна / нет строки /
+   * dismissed → поле просто отсутствует, генерация в этом случае лишь запускается async (не блокирует).
+   */
+  dayFraming?: { kind: 'morning' | 'evening'; text: string; action?: { kind: 'proposal'; proposalId: string } };
   reminders: TripReminder[];
   geoTriggers: GeoTrigger[];
   timeTriggers: TimeTrigger[];
