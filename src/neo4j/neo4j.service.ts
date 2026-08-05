@@ -116,7 +116,12 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
       const name = rec.get('name');
       const familyName = rec.get('family_name');
       const lines = [
-        `Profile: ${rec.get('phone')}${name ? ` name: ${name}` : ''}${familyName ? ` family name: ${familyName}` : ''}`,
+        // Идентификатор профиля в промпт НЕ кладём. Раньше здесь стоял
+        // rec.get('phone'), а userId у телефонной регистрации — это сам номер,
+        // то есть номер уезжал в system-промпт ко всем AI-провайдерам, включая
+        // DeepSeek (КНР). Модели он не нужен: строка чисто описательная, ничего
+        // её не парсит. Имя и фамилия остаются — они несут смысл для диалога.
+        `Profile:${name ? ` name: ${name}` : ''}${familyName ? ` family name: ${familyName}` : ''}`,
         `Interests: ${fmt(rec.get('interests'))}`,
         `Desires: ${fmt(rec.get('desires'))}`,
         `Beliefs: ${fmt(rec.get('beliefs'))}`,
