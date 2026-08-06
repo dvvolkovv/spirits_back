@@ -130,18 +130,53 @@ async function step(name, fn) {
   //       the marker template.)
 
   // -- 5. check-code returns JWT ----------------------------------------
+  //
+  // Код одноразовый: check-code удаляет его из Redis (auth.service). Любой
+  // посторонний, кто успел им воспользоваться между нашими шагами, оставляет
+  // нас с 401 «Invalid or expired code» — и деплой падает ложно, хотя вход
+  // исправен (проверено вручную сразу после такого падения 2026-08-06).
+  //
+  // Поэтому одна пересдача всей цепочки: новый SMS → новый код → проверка.
+  // Настоящая поломка входа провалит обе попытки, так что гейт не ослабляется.
   await step('check-code returns JWT tokens', async () => {
+    const exchange = async (code) => {
+      const r = await axios.get(
+        `${BASE_URL}/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/${TEST_PHONE}/${code}`,
+        { timeout: 10000, validateStatus: () => true },
+      );
+      return r;
+    };
+
+    const freshCode = async () => {
+      await axios.get(
+        `${BASE_URL}/webhook/898c938d-f094-455c-86af-969617e62f7a/sms/${TEST_PHONE}`,
+        { timeout: 10000, validateStatus: () => true },
+      );
+      const d = await axios.get(`${BASE_URL}/webhook/debug/sms-code/${TEST_PHONE}`, {
+        timeout: 5000,
+        validateStatus: () => true,
+      });
+      return d.data?.code;
+    };
+
     if (!otpCode) throw new Error('no OTP code from previous step');
-    const r = await axios.get(
-      `${BASE_URL}/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/${TEST_PHONE}/${otpCode}`,
-      { timeout: 10000, validateStatus: () => true },
-    );
+    let r = await exchange(otpCode);
+    let retried = false;
+
+    if (r.status !== 200) {
+      retried = true;
+      const code = await freshCode();
+      if (!code) throw new Error(`no fresh OTP after ${r.status}`);
+      otpCode = code;
+      r = await exchange(code);
+    }
+
     if (r.status !== 200) throw new Error(`status ${r.status}: ${JSON.stringify(r.data).slice(0, 200)}`);
     const access = r.data?.['access-token'];
     const refresh = r.data?.['refresh-token'];
     if (!access || !refresh) throw new Error(`tokens missing: ${JSON.stringify(r.data)}`);
     jwt = access;
-    return 'access + refresh present';
+    return retried ? 'access + refresh present (со второй попытки)' : 'access + refresh present';
   });
 
   // -- 6. Profile fetch with JWT ----------------------------------------
