@@ -263,8 +263,15 @@ test.describe('my.linkeon.io smoke', () => {
 
       // Заголовок профиля по-английски — значит перевод реально доехал,
       // а не откатился на русский шаблон.
-      await expect(page.getByRole('heading', { name: 'Profile' })).toBeVisible({ timeout: 20000 });
-      await expect(page.locator('body')).not.toContainText('Профиль');
+      //
+      // Проверяем именно h1 и точным текстом. getByRole({name}) ищет
+      // ПОДСТРОКУ: 'Profile' совпал разом с «My profile» (h1) и «Profile
+      // parameters» (h2) и упал на strict mode — тест сломался ровно там,
+      // где перевод как раз работал.
+      const heading = page.locator('h1').first();
+      await expect(heading).toBeVisible({ timeout: 20000 });
+      await expect(heading).toHaveText('My profile');
+      await expect(heading).not.toContainText(/[А-Яа-яЁё]/);
     } finally {
       // Аккаунт общий с остальными тестами — вернуть русский обязательно,
       // иначе следующий прогон упадёт на проверках по русскому тексту.
