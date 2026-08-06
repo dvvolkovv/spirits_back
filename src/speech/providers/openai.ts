@@ -15,6 +15,10 @@ function getClient(): OpenAI {
 /**
  * Синтез через OpenAI tts-1. Просим mp3, а не opus: в MinIO клип лежит одним
  * каноническим форматом для веба и мобилки, Telegram конвертирует его сам.
+ *
+ * Лимит текста: `input` у tts-1 жёстко ограничен 4096 символами на стороне
+ * OpenAI (запрос с большим текстом отклоняется). Порог проверяется в сервисе
+ * синтеза (следующая задача), не в адаптере.
  */
 export async function synthesizeOpenai(text: string, voice: string): Promise<Buffer> {
   const resp = await getClient().audio.speech.create({
