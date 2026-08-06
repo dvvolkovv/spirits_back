@@ -36,6 +36,15 @@ export function activeWindow(now: Date, events: CalEvent[], tz = TZ): DayWindow 
   return null;
 }
 
+/** Незакрытые дела, относящиеся к СЕГОДНЯ: due сегодня или просрочено (localDay(due) ≤ сегодня).
+ *  Будущие (завтра+) и бессрочные «когда-нибудь» (без due) в дневную сводку НЕ берём — иначе весь
+ *  бэклог раздувает счётчик (owner 2026-08-05: «осталось одно дело, а не 15»). Синхронно с тем, что
+ *  показывает дом/лок: сводка дня = про СЕГОДНЯ, а не про весь список задач. */
+function todaysUnfinished(now: Date, tasks: Task[]): Task[] {
+  const today = localDay(now.getTime());
+  return tasks.filter((t) => isPending(t) && !!t.due && localDay(parse(t.due)) <= today);
+}
+
 function freeSlots(now: Date, evs: CalEvent[], minMin = 30): { start: string; end: string }[] {
   const out: { start: string; end: string }[] = [];
   for (let i = 0; i < evs.length - 1; i++) {
@@ -48,7 +57,7 @@ function freeSlots(now: Date, evs: CalEvent[], minMin = 30): { start: string; en
 
 export function buildMorningFacts(input: { now: Date; events: CalEvent[]; tasks: Task[] }) {
   const evs = todaysEvents(input.now, input.events);
-  const unfinished = input.tasks.filter(isPending).map((t) => ({ title: t.title, due: t.due, routine: !!t.isRoutine }));
+  const unfinished = todaysUnfinished(input.now, input.tasks).map((t) => ({ title: t.title, due: t.due, routine: !!t.isRoutine }));
   return {
     kind: 'morning' as const,
     eventCount: evs.length,
@@ -60,7 +69,7 @@ export function buildMorningFacts(input: { now: Date; events: CalEvent[]; tasks:
 }
 
 export function buildEveningFacts(input: { now: Date; events: CalEvent[]; tasks: Task[] }) {
-  const unfinished = input.tasks.filter(isPending).map((t) => ({ title: t.title }));
+  const unfinished = todaysUnfinished(input.now, input.tasks).map((t) => ({ title: t.title }));
   return {
     kind: 'evening' as const,
     unfinishedCount: unfinished.length,
