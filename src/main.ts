@@ -7,13 +7,6 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bodyParser: false });
 
   const bodyParser = require('body-parser');
-  // Коллбэки Changelly: тело нужно байт в байт (подпись считается по байтам),
-  // поэтому raw монтируется ДО json — тот увидит req._body и парсить не станет.
-  // Любой content-type: спека Changelly его не фиксирует.
-  app.use(
-    '/webhook/callbacks/changelly',
-    bodyParser.raw({ type: () => true, limit: '256kb' }),
-  );
   app.use(bodyParser.raw({ type: ['image/*'], limit: '10mb' }));
   app.use(bodyParser.json({ limit: '50mb', type: ['application/json', 'text/*'] }));
   app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));

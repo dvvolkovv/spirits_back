@@ -43,7 +43,6 @@ import { TripModule } from './trip/trip.module';
 import { NotesModule } from './notes/notes.module';
 import { CalendarModule } from './calendar/calendar.module';
 import { TalerIdModule } from './talerid/talerid.module';
-import { CallbacksModule } from './callbacks/callbacks.module';
 
 @Module({
   imports: [
@@ -91,7 +90,6 @@ import { CallbacksModule } from './callbacks/callbacks.module';
     NotesModule,
     CalendarModule,
     TalerIdModule,
-    CallbacksModule,
   ],
 })
 export class AppModule {}
