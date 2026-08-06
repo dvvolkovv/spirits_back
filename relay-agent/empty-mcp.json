@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "linkeon": {
+      "type": "http",
+      "url": "https://my.linkeon.io/mcp",
+      "headers": {
+        "Authorization": "Bearer fcbd9f6555df46fcff5050052e3387243300b8270b8250c04db0d50f1f3015a7"
+      }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+# Секрет: GEMINI_API_KEY. Живёт только на сервере.
+.env
+
+# 69 МБ, ставятся из package-lock.json.
+node_modules/
+
+# Ручные бэкапы: их заменяет история git.
+*.bak
+*.bak.*
+*.bak-*
+_old-backups/
+
+# Рабочие каталоги агента на сервере.
+sessions/
+uploads/
+*.log
