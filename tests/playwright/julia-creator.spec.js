@@ -33,6 +33,26 @@ async function getJwt() {
   return getJwtFor(TEST_PHONE);
 }
 
+/**
+ * Приводит язык аккаунта к русскому.
+ *
+ * Язык интерфейса хранится в профиле и ПЕРЕБИВАЕТ язык браузера. Причём
+ * фронт сам записывает туда определённый язык, если поле пустое: один
+ * прогон под en-US — и аккаунт «залипает» на английском, а все проверки
+ * по русскому тексту падают уже независимо от локали Playwright.
+ */
+async function forceRussianProfile(access) {
+  try {
+    await axios.post(
+      `${BASE}/webhook/profile-update`,
+      { language: 'ru' },
+      { headers: { Authorization: `Bearer ${access}` } },
+    );
+  } catch (e) {
+    console.log('[forceRussianProfile] не удалось выставить язык:', e.message);
+  }
+}
+
 // Idempotent fixture seed for the edit-flow test. Inserts a campaign + scenario
 // + chat_history row marked with `[smoke-seed]` so the ScenarioCard renders
 // in TEST_PHONE's chat with Юля. Prior seed rows are cleaned up by the endpoint.
@@ -67,11 +87,13 @@ async function applyBasicAuth(page) {
 async function loginAsJulia(page) {
   await applyBasicAuth(page);
   const { access, refresh } = await getJwt();
+  await forceRussianProfile(access);
   // Pre-select Юля (smm_producer, id=21 — verifying below) so chat renders
   // directly without going through AssistantSelection. We'll also fall back
   // to clicking Юля in the UI if needed.
   const userData = { phone: TEST_PHONE };
   await page.addInitScript(([a, r, u]) => {
+    localStorage.setItem('i18nextLng', 'ru');
     localStorage.setItem('jwt_access_token', a);
     localStorage.setItem('jwt_refresh_token', r);
     localStorage.setItem('authToken', a);

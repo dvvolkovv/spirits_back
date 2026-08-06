@@ -24,6 +24,26 @@ async function getJwt() {
   };
 }
 
+/**
+ * Приводит язык аккаунта к русскому.
+ *
+ * Язык интерфейса хранится в профиле и ПЕРЕБИВАЕТ язык браузера. Причём
+ * фронт сам записывает туда определённый язык, если поле пустое: один
+ * прогон под en-US — и аккаунт «залипает» на английском, а все проверки
+ * по русскому тексту падают уже независимо от локали Playwright.
+ */
+async function forceRussianProfile(access) {
+  try {
+    await axios.post(
+      `${BASE}/webhook/profile-update`,
+      { language: 'ru' },
+      { headers: { Authorization: `Bearer ${access}` } },
+    );
+  } catch (e) {
+    console.log('[forceRussianProfile] не удалось выставить язык:', e.message);
+  }
+}
+
 // Добавляет Basic Auth через page.route() — единственный надёжный способ когда nginx
 // не шлёт WWW-Authenticate challenge. Interceptor добавляет Authorization: Basic только
 // если заголовок ещё не установлен (Bearer-токены из React-app не затрагиваются).
@@ -46,11 +66,13 @@ async function applyBasicAuth(page) {
 async function loginViaStorage(page) {
   await applyBasicAuth(page);
   const { access, refresh } = await getJwt();
+  await forceRussianProfile(access);
   // AuthContext requires BOTH `authToken` and `userData` to consider the
   // user logged in (see AuthContext.tsx initAuth). tokenManager reads
   // jwt_access_token / jwt_refresh_token for apiClient calls.
   const userData = { phone: TEST_PHONE };
   await page.addInitScript(([a, r, u]) => {
+    localStorage.setItem('i18nextLng', 'ru');
     localStorage.setItem('jwt_access_token', a);
     localStorage.setItem('jwt_refresh_token', r);
     localStorage.setItem('authToken', a);
@@ -77,10 +99,12 @@ test.describe('my.linkeon.io smoke', () => {
     // streaming — that's already covered by the API smoke.
     await applyBasicAuth(page);
     const { access, refresh } = await getJwt();
+  await forceRussianProfile(access);
     const userData = { phone: TEST_PHONE };
     const assistant = { id: 12, name: 'Роман', description: 'Помогаю делать все' };
     await page.addInitScript(([a, r, u, s]) => {
-      localStorage.setItem('jwt_access_token', a);
+      localStorage.setItem('i18nextLng', 'ru');
+    localStorage.setItem('jwt_access_token', a);
       localStorage.setItem('jwt_refresh_token', r);
       localStorage.setItem('authToken', a);
       localStorage.setItem('userData', u);
@@ -99,10 +123,12 @@ test.describe('my.linkeon.io smoke', () => {
     // «Подобрать специалиста» (работает и для уже onboarded-пользователей).
     await applyBasicAuth(page);  // test.linkeon.io за nginx Basic Auth — иначе 401 до SPA
     const { access, refresh } = await getJwt();
+  await forceRussianProfile(access);
     const userData = { phone: TEST_PHONE };
     const assistant = { id: 12, name: 'Роман', description: 'Помогаю делать все' };
     await page.addInitScript(([a, r, u, s]) => {
-      localStorage.setItem('jwt_access_token', a);
+      localStorage.setItem('i18nextLng', 'ru');
+    localStorage.setItem('jwt_access_token', a);
       localStorage.setItem('jwt_refresh_token', r);
       localStorage.setItem('authToken', a);
       localStorage.setItem('userData', u);
@@ -130,10 +156,12 @@ test.describe('my.linkeon.io smoke', () => {
     // ломает чат); если баннер показан — «×» его убирает.
     await applyBasicAuth(page);  // test.linkeon.io за nginx Basic Auth — иначе 401 до SPA
     const { access, refresh } = await getJwt();
+  await forceRussianProfile(access);
     const userData = { phone: TEST_PHONE };
     const assistant = { id: 12, name: 'Роман', description: 'Помогаю делать все' };
     await page.addInitScript(([a, r, u, s]) => {
-      localStorage.setItem('jwt_access_token', a);
+      localStorage.setItem('i18nextLng', 'ru');
+    localStorage.setItem('jwt_access_token', a);
       localStorage.setItem('jwt_refresh_token', r);
       localStorage.setItem('authToken', a);
       localStorage.setItem('userData', u);

@@ -21,6 +21,10 @@ module.exports = defineConfig({
     // extraHTTPHeaders намеренно убран: он применяется ко ВСЕМ запросам включая fetch() из
     // скриптов страницы, переопределяет Authorization: Bearer → API получает 401 и разлогинивает.
     // page.route() добавляет Basic только если Authorization не установлен — Bearer-запросы не трогает.
+    // Язык интерфейса теперь зависит от языка браузера: i18next определяет его
+    // как ['localStorage', 'navigator']. Без явной локали Playwright ходит как
+    // en-US, и все проверки по русскому тексту падают — что и случилось.
+    locale: 'ru-RU',
     headless: true,
     actionTimeout: 15000,
     navigationTimeout: 45000,

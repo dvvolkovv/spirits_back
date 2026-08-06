@@ -14,6 +14,26 @@ async function getJwt() {
   return { access: r.data['access-token'], refresh: r.data['refresh-token'] };
 }
 
+/**
+ * Приводит язык аккаунта к русскому.
+ *
+ * Язык интерфейса хранится в профиле и ПЕРЕБИВАЕТ язык браузера. Причём
+ * фронт сам записывает туда определённый язык, если поле пустое: один
+ * прогон под en-US — и аккаунт «залипает» на английском, а все проверки
+ * по русскому тексту падают уже независимо от локали Playwright.
+ */
+async function forceRussianProfile(access) {
+  try {
+    await axios.post(
+      `${BASE}/webhook/profile-update`,
+      { language: 'ru' },
+      { headers: { Authorization: `Bearer ${access}` } },
+    );
+  } catch (e) {
+    console.log('[forceRussianProfile] не удалось выставить язык:', e.message);
+  }
+}
+
 // Точечная регрессия (не boot-smoke): требует прод-фронт без Basic Auth и живого LLM/тест-юзера.
 // Деплой-smoke гоняет весь tests/playwright/*.spec.js в т.ч. против test.linkeon.io (Basic Auth) —
 // там этот тест не пройдёт (401 при загрузке скрипта). Поэтому в smoke он СКИПАЕТСЯ; запуск вручную:
@@ -21,9 +41,11 @@ async function getJwt() {
 test('quick-ask: ?say=+assistant=roman → Роман выбран и текст отправлен', async ({ page }) => {
   test.skip(process.env.RUN_SAYFLOW !== '1', 'targeted prod regression — run with RUN_SAYFLOW=1');
   const { access, refresh } = await getJwt();
+  await forceRussianProfile(access);
   const agents = (await axios.get(`${BASE}/webhook/agents`)).data;
   const raya = agents.find((a) => a.name === 'Райя'); // полный объект — иначе UI падает на missing-полях
   await page.addInitScript(([a, r, u, rayaObj]) => {
+    localStorage.setItem('i18nextLng', 'ru');
     localStorage.setItem('jwt_access_token', a);
     localStorage.setItem('jwt_refresh_token', r);
     localStorage.setItem('authToken', a);
