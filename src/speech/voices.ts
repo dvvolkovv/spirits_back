@@ -1,0 +1,125 @@
+// src/speech/voices.ts
+export type TtsProvider = 'yandex' | 'openai';
+export type Gender = 'm' | 'f';
+
+export interface VoiceEntry {
+  id: string;
+  provider: TtsProvider;
+  gender: Gender;
+  /** Человекочитаемое имя для UI. Не переводим — имя собственное. */
+  title: string;
+  /** Тембр в двух словах. Уходит в описание инструмента для модели. */
+  description: string;
+}
+
+export const VOICE_CATALOG: VoiceEntry[] = [
+  // ── Yandex SpeechKit (ru) ────────────────────────────────────────────
+  { id: 'alena',     provider: 'yandex', gender: 'f', title: 'Алёна',     description: 'тёплый женский, universal' },
+  { id: 'jane',      provider: 'yandex', gender: 'f', title: 'Джейн',     description: 'мягкий женский, подходит для эмпатичных ролей' },
+  { id: 'omazh',     provider: 'yandex', gender: 'f', title: 'Омаж',      description: 'деловой женский, спокойный' },
+  { id: 'dasha',     provider: 'yandex', gender: 'f', title: 'Даша',      description: 'молодой женский, живой' },
+  { id: 'julia',     provider: 'yandex', gender: 'f', title: 'Юлия',      description: 'низкий женский' },
+  { id: 'lera',      provider: 'yandex', gender: 'f', title: 'Лера',      description: 'нейтральный женский' },
+  { id: 'masha',     provider: 'yandex', gender: 'f', title: 'Маша',      description: 'звонкий женский' },
+  { id: 'marina',    provider: 'yandex', gender: 'f', title: 'Марина',    description: 'зрелый женский' },
+  { id: 'zahar',     provider: 'yandex', gender: 'm', title: 'Захар',     description: 'уверенный мужской, universal' },
+  { id: 'filipp',    provider: 'yandex', gender: 'm', title: 'Филипп',    description: 'дружелюбный мужской' },
+  { id: 'ermil',     provider: 'yandex', gender: 'm', title: 'Ермил',     description: 'мягкий мужской' },
+  { id: 'madirus',   provider: 'yandex', gender: 'm', title: 'Мадирус',   description: 'глубокий мужской, деловой' },
+  { id: 'alexander', provider: 'yandex', gender: 'm', title: 'Александр', description: 'нейтральный мужской' },
+  { id: 'kirill',    provider: 'yandex', gender: 'm', title: 'Кирилл',    description: 'молодой мужской' },
+  { id: 'anton',     provider: 'yandex', gender: 'm', title: 'Антон',     description: 'спокойный мужской' },
+
+  // ── OpenAI tts-1 (не-ru) ─────────────────────────────────────────────
+  { id: 'alloy',   provider: 'openai', gender: 'f', title: 'Alloy',   description: 'нейтральный, ровный' },
+  { id: 'nova',    provider: 'openai', gender: 'f', title: 'Nova',    description: 'тёплый женский' },
+  { id: 'shimmer', provider: 'openai', gender: 'f', title: 'Shimmer', description: 'светлый женский' },
+  { id: 'echo',    provider: 'openai', gender: 'm', title: 'Echo',    description: 'ровный мужской' },
+  { id: 'onyx',    provider: 'openai', gender: 'm', title: 'Onyx',    description: 'глубокий мужской' },
+  { id: 'fable',   provider: 'openai', gender: 'm', title: 'Fable',   description: 'повествовательный, мягкий' },
+];
+
+/** Дефолты по ассистентам. Ключ — имя из agents.name (оно же preferred_agent). */
+interface AssistantDefault { gender: Gender; yandex: string; openai: string }
+
+export const ASSISTANT_DEFAULTS: Record<string, AssistantDefault> = {
+  'Роман':      { gender: 'm', yandex: 'zahar',   openai: 'onyx' },
+  'Миша':       { gender: 'm', yandex: 'filipp',  openai: 'echo' },
+  'Андрей':     { gender: 'm', yandex: 'madirus', openai: 'onyx' },
+  'Алексей':    { gender: 'm', yandex: 'madirus', openai: 'echo' },
+  'Герман':     { gender: 'm', yandex: 'filipp',  openai: 'fable' },
+  'Виталий':    { gender: 'm', yandex: 'zahar',   openai: 'fable' },
+  'Шанкара':    { gender: 'm', yandex: 'filipp',  openai: 'fable' },
+  'Оля':        { gender: 'f', yandex: 'alena',   openai: 'nova' },
+  'Маша':       { gender: 'f', yandex: 'jane',    openai: 'shimmer' },
+  'Ирина':      { gender: 'f', yandex: 'omazh',   openai: 'nova' },
+  'Александра': { gender: 'f', yandex: 'omazh',   openai: 'nova' },
+  'Екатерина':  { gender: 'f', yandex: 'alena',   openai: 'alloy' },
+  'Анна':       { gender: 'f', yandex: 'alena',   openai: 'alloy' },
+  'Лиана':      { gender: 'f', yandex: 'jane',    openai: 'shimmer' },
+  'Райя':       { gender: 'f', yandex: 'jane',    openai: 'shimmer' },
+};
+
+const GENDER_DEFAULT: Record<Gender, { yandex: string; openai: string }> = {
+  m: { yandex: 'zahar', openai: 'onyx' },
+  f: { yandex: 'alena', openai: 'nova' },
+};
+
+export function providerForLang(lang: string): TtsProvider {
+  return lang === 'ru' ? 'yandex' : 'openai';
+}
+
+export function isValidVoice(voiceId: string | undefined, provider: TtsProvider): boolean {
+  if (!voiceId) return false;
+  return VOICE_CATALOG.some((v) => v.id === voiceId && v.provider === provider);
+}
+
+export type VoiceSource = 'requested' | 'user' | 'assistant' | 'gender-default';
+
+export interface ResolveVoiceInput {
+  lang: string;
+  assistantName?: string;
+  /** profile_data.assistant_voices[assistantName] */
+  userChoice?: string;
+  /** параметр voice из вызова инструмента */
+  requested?: string;
+}
+
+export interface ResolvedVoice {
+  voice: string;
+  provider: TtsProvider;
+  source: VoiceSource;
+  /** Уровни, отброшенные из-за невалидного голоса — для warn-лога. */
+  rejected: Array<{ source: VoiceSource; voice: string }>;
+}
+
+/**
+ * Четыре уровня приоритета, первый валидный выигрывает. Невалидный голос
+ * (выдуманный моделью id или голос чужого провайдера) не роняет вызов —
+ * уровень отбрасывается и попадает в `rejected` для лога.
+ */
+export function resolveVoice(input: ResolveVoiceInput): ResolvedVoice {
+  const provider = providerForLang(input.lang);
+  const rejected: Array<{ source: VoiceSource; voice: string }> = [];
+
+  const def = input.assistantName ? ASSISTANT_DEFAULTS[input.assistantName] : undefined;
+  const gender: Gender = def?.gender ?? 'f';
+
+  const candidates: Array<{ source: VoiceSource; voice: string | undefined }> = [
+    { source: 'requested', voice: input.requested },
+    { source: 'user', voice: input.userChoice },
+    { source: 'assistant', voice: def ? def[provider] : undefined },
+    { source: 'gender-default', voice: GENDER_DEFAULT[gender][provider] },
+  ];
+
+  for (const c of candidates) {
+    if (!c.voice) continue;
+    if (isValidVoice(c.voice, provider)) {
+      return { voice: c.voice, provider, source: c.source, rejected };
+    }
+    rejected.push({ source: c.source, voice: c.voice });
+  }
+
+  // Недостижимо: gender-default всегда валиден. Оставлено ради тотальности типа.
+  return { voice: GENDER_DEFAULT.f[provider], provider, source: 'gender-default', rejected };
+}
