@@ -1,4 +1,4 @@
-import { VOICE_CATALOG, resolveVoice, providerForLang } from './voices';
+import { VOICE_CATALOG, ASSISTANT_DEFAULTS, GENDER_DEFAULT, resolveVoice, providerForLang, isValidVoice } from './voices';
 
 describe('providerForLang', () => {
   it('ru → yandex, всё остальное → openai', () => {
@@ -49,6 +49,12 @@ describe('resolveVoice — приоритеты', () => {
     expect(r.voice).toBe('alena');
     expect(r.source).toBe('gender-default');
   });
+
+  it('4b: неизвестный ассистент, английский язык → женский дефолт openai', () => {
+    const r = resolveVoice({ lang: 'en', assistantName: 'Незнакомец' });
+    expect(r.voice).toBe('nova');
+    expect(r.source).toBe('gender-default');
+  });
 });
 
 describe('resolveVoice — откаты при невалидном голосе', () => {
@@ -75,6 +81,34 @@ describe('resolveVoice — откаты при невалидном голосе
       const r = resolveVoice({ lang, assistantName: 'Оля' });
       const entry = VOICE_CATALOG.find((v) => v.id === r.voice && v.provider === providerForLang(lang));
       expect(entry).toBeDefined();
+    }
+  });
+});
+
+describe('консистентность ASSISTANT_DEFAULTS и GENDER_DEFAULT против VOICE_CATALOG', () => {
+  it('у каждого ассистента дефолтные голоса валидны для своего провайдера', () => {
+    for (const def of Object.values(ASSISTANT_DEFAULTS)) {
+      expect(isValidVoice(def.yandex, 'yandex')).toBe(true);
+      expect(isValidVoice(def.openai, 'openai')).toBe(true);
+    }
+  });
+
+  it('у каждого ассистента gender совпадает с gender обоих его дефолтных голосов в каталоге', () => {
+    for (const def of Object.values(ASSISTANT_DEFAULTS)) {
+      const yandexEntry = VOICE_CATALOG.find((v) => v.id === def.yandex && v.provider === 'yandex');
+      const openaiEntry = VOICE_CATALOG.find((v) => v.id === def.openai && v.provider === 'openai');
+      expect(yandexEntry?.gender).toBe(def.gender);
+      expect(openaiEntry?.gender).toBe(def.gender);
+    }
+  });
+
+  it('каждая комбинация GENDER_DEFAULT[gender][provider] есть в каталоге с тем же gender и provider', () => {
+    for (const gender of ['m', 'f'] as const) {
+      for (const provider of ['yandex', 'openai'] as const) {
+        const voiceId = GENDER_DEFAULT[gender][provider];
+        const entry = VOICE_CATALOG.find((v) => v.id === voiceId && v.provider === provider && v.gender === gender);
+        expect(entry).toBeDefined();
+      }
     }
   });
 });

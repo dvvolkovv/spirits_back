@@ -60,11 +60,22 @@ export const ASSISTANT_DEFAULTS: Record<string, AssistantDefault> = {
   'Райя':       { gender: 'f', yandex: 'jane',    openai: 'shimmer' },
 };
 
-const GENDER_DEFAULT: Record<Gender, { yandex: string; openai: string }> = {
+export const GENDER_DEFAULT: Record<Gender, { yandex: string; openai: string }> = {
   m: { yandex: 'zahar', openai: 'onyx' },
   f: { yandex: 'alena', openai: 'nova' },
 };
 
+/**
+ * Определяет провайдера TTS по языку.
+ *
+ * Контракт: `lang` должен быть уже нормализованным корневым кодом языка
+ * (`ru`, `en`, `de`, `fr`, `es`, `zh`, …) — результатом
+ * `LanguageService.resolveUserLanguage()` / `LanguageService.normalize()`
+ * на бэкенде. Сырые BCP-47 теги вида `ru-RU` сюда передавать нельзя:
+ * сравнение строгое (`lang === 'ru'`), поэтому `ru-RU` не совпадёт с `ru`
+ * и молча уедет на openai-ветку. Нормализация — забота вызывающей стороны,
+ * не этого модуля.
+ */
 export function providerForLang(lang: string): TtsProvider {
   return lang === 'ru' ? 'yandex' : 'openai';
 }
@@ -77,6 +88,13 @@ export function isValidVoice(voiceId: string | undefined, provider: TtsProvider)
 export type VoiceSource = 'requested' | 'user' | 'assistant' | 'gender-default';
 
 export interface ResolveVoiceInput {
+  /**
+   * Уже нормализованный корневой код языка (`ru`, `en`, `de`, `fr`, `es`,
+   * `zh`, …), см. `LanguageService.resolveUserLanguage()` /
+   * `LanguageService.normalize()` на бэкенде. Не передавать сырой BCP-47
+   * тег (`ru-RU`) — `providerForLang` сравнивает строго и молча отправит
+   * его на openai-ветку.
+   */
   lang: string;
   assistantName?: string;
   /** profile_data.assistant_voices[assistantName] */
