@@ -14,6 +14,51 @@ import axios from 'axios';
 import { Request, Response } from 'express';
 // Agent server at r.linkeon.io (remote Claude Code)
 
+/** Файл в папке сессии, как его отдаёт relay (`GET /session/:sid/files`). */
+export interface SessionFile { name: string; url: string }
+
+/**
+ * Достраивает ссылки, которые ассистент оставил пустыми: `[Скачать отчёт.pdf]()`.
+ *
+ * Ассистенту инструкцией запрещено писать пути и URL — их подставляет
+ * платформа. Но она прикладывает только файлы, ИЗМЕНЁННЫЕ за текущий шаг:
+ * relay сравнивает mtime с состоянием на старте запроса. На многошаговой
+ * работе это теряет результат — ролики пишутся на одних шагах, итоговый
+ * отчёт собирается на последнем, и к нему не прикладывается ничего, хотя
+ * файлы лежат целые.
+ *
+ * Сопоставляем ТОЛЬКО по именам, которые ассистент уже упомянул, и только
+ * если такой файл действительно есть в папке сессии. Полный список к ответу
+ * не цепляем: сессия живёт неделями, и это навесило бы десятки ссылок на
+ * каждую реплику — так уже было, пришлось откатывать.
+ */
+export function resolveEmptyFileLinks(
+  text: string,
+  files: SessionFile[],
+  agentUrl: string,
+): string[] {
+  const byName = new Map<string, string>();
+  for (const f of files || []) {
+    if (f?.name && f?.url) byName.set(String(f.name), String(f.url));
+  }
+  if (byName.size === 0) return [];
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const m of text.matchAll(/\[([^\]]+)\]\(\s*\)/g)) {
+    const label = String(m[1]);
+    // Метка бывает и «Скачать имя.pdf», и просто «имя.pdf» — берём последнее
+    // слово, похожее на имя файла с расширением.
+    const withExt = label.match(/([^\s/\\]+\.[A-Za-z0-9]{2,5})\s*$/);
+    const name = withExt ? withExt[1] : label.trim();
+    const url = byName.get(name);
+    if (!url || seen.has(name)) continue;
+    seen.add(name);
+    out.push(`[Скачать ${name}](${agentUrl}${url})`);
+  }
+  return out;
+}
+
 @Injectable()
 export class ChatService {
   private readonly logger = new Logger(ChatService.name);
@@ -819,6 +864,44 @@ ${LanguageService.buildDirective(userLanguage)}`;
         });
         await new Promise((r) => setTimeout(r, 800));
         try { await callUpstreamOnce(); } catch (e: any) { this.logger.warn(`self-heal retry failed: ${e.message}`); }
+      }
+
+      // Пустые ссылки на файлы: `[Скачать отчёт.pdf]()` → подставляем адрес.
+      //
+      // Ассистенту инструкцией запрещено писать пути и URL — их подставляет
+      // платформа. Но подставляет она только файлы, ИЗМЕНЁННЫЕ за текущий шаг
+      // (relay сравнивает mtime с состоянием на старте запроса). На
+      // многошаговой работе это теряет результат: ролики собираются на одних
+      // шагах, итоговый отчёт — на последнем, и к нему не прикладывается
+      // ничего, хотя файлы лежат целые. Человек видит «Скачать …» с пустыми
+      // скобками.
+      //
+      // Чиним узко: только те имена, что ассистент уже упомянул пустой
+      // ссылкой, и только если такой файл реально есть в папке сессии.
+      // Полный список к ответу не цепляем — сессия живёт неделями, и это
+      // навесило бы десятки ссылок на каждую реплику.
+      try {
+        const full = chunks.join('');
+        const empty = [...full.matchAll(/\[([^\]]+)\]\(\s*\)/g)];
+        if (empty.length > 0 && !clientDisconnected) {
+          const sid = fresh && freshSessionId ? freshSessionId : `${userId}_${assistantId}`;
+          const listed = await axios
+            .get(`${AGENT_URL}/session/${encodeURIComponent(sid)}/files`, { timeout: 10_000 })
+            .then((r) => (Array.isArray(r.data) ? r.data : []))
+            .catch(() => [] as any[]);
+
+          const resolved = resolveEmptyFileLinks(full, listed, AGENT_URL);
+
+          if (resolved.length > 0) {
+            const tail = '\n\n' + resolved.join('\n');
+            chunks.push(tail);
+            safeWrite({ type: 'item', content: tail });
+            this.logger.log(`filled ${resolved.length} empty file link(s) for ${sid}`);
+          }
+        }
+      } catch (e: any) {
+        // Подстановка — украшение: не смогли, ответ всё равно уходит целиком.
+        this.logger.warn(`empty-link fill failed (non-fatal): ${e.message}`);
       }
 
       // Strip any [VIDEO_JOB:<uuid>] markers Roman may have hallucinated.
