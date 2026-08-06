@@ -5,6 +5,7 @@ import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { SmmProducerToolsService, ToolContext } from '../smm/producer/smm-producer-tools.service';
 import { SMM_PRODUCER_SYSTEM_PROMPT } from '../smm/producer/smm-producer.prompt';
@@ -15,6 +16,14 @@ const SESSION_ROOT = path.join(
   process.env.HOME ?? '/home/dvolkov',
   '.linkeon-smm-sessions',
 );
+
+/**
+ * Имя каталога сессии по userId. Именно хеш, а не сам userId: рабочий каталог
+ * SDK сообщает модели, а userId у телефонной регистрации — это номер телефона.
+ */
+function sessionDirFor(userId: string): string {
+  return crypto.createHash('sha256').update(userId).digest('hex').slice(0, 32);
+}
 
 // Claude Code built-ins to disable — SMM Producer должен использовать только наши MCP tools.
 const DISALLOWED_BUILTINS = [
@@ -43,7 +52,12 @@ export class ClaudeAgentService {
     agentId: number,
     res: Response,
   ): Promise<void> {
-    const cwd = path.join(SESSION_ROOT, ctx.userId);
+    // Каталог именуем хешем, а не userId. SDK штатно сообщает модели свой
+    // рабочий каталог, а userId у телефонной регистрации — это сам номер:
+    // иначе номер уезжал бы в Anthropic в составе environment-блока.
+    // Хеш детерминирован, поэтому возобновление сессии по каталогу работает
+    // как раньше — меняется только имя папки.
+    const cwd = path.join(SESSION_ROOT, sessionDirFor(ctx.userId));
     await fs.promises.mkdir(cwd, { recursive: true });
 
     // Pre-flight balance check (defense-in-depth — chat.service.ts also checks).
