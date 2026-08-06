@@ -223,4 +223,52 @@ test.describe('my.linkeon.io smoke', () => {
       await c2.close();
     }
   });
+
+  // Страница поиска не была покрыта вовсе, а из неё выпилили мёртвую ветку
+  // поиска по телефонам (~170 строк за `{false ? …}`). Проверяем каркас:
+  // страница отрисовалась, поле ввода на месте, редиректа на онбординг нет.
+  test('search page renders with its input', async ({ page }) => {
+    await loginViaStorage(page);
+    await page.goto('/search', { waitUntil: 'domcontentloaded' });
+
+    expect(page.url()).toContain('/search');
+    await expect(page.getByTestId('search-root')).toBeVisible({ timeout: 20000 });
+    await expect(page.getByTestId('search-input')).toBeVisible();
+
+    // Ввод принимается — компонент живой, а не просто отрисованная разметка.
+    await page.getByTestId('search-input').fill('психолог');
+    await expect(page.getByTestId('search-input')).toHaveValue('психолог');
+  });
+
+  // Английский интерфейс: остальной smoke закреплён на русском, поэтому
+  // регрессия «перевод не доезжает» им не ловится вообще.
+  test('English profile language switches the UI', async ({ page }) => {
+    await applyBasicAuth(page);
+    const { access, refresh } = await getJwt();
+    await axios.post(
+      `${BASE}/webhook/profile-update`,
+      { language: 'en' },
+      { headers: { Authorization: `Bearer ${access}` } },
+    );
+    try {
+      const userData = { phone: TEST_PHONE };
+      await page.addInitScript(([a, r, u]) => {
+        localStorage.setItem('i18nextLng', 'en');
+        localStorage.setItem('jwt_access_token', a);
+        localStorage.setItem('jwt_refresh_token', r);
+        localStorage.setItem('authToken', a);
+        localStorage.setItem('userData', u);
+      }, [access, refresh, JSON.stringify(userData)]);
+      await page.goto('/profile', { waitUntil: 'domcontentloaded' });
+
+      // Заголовок профиля по-английски — значит перевод реально доехал,
+      // а не откатился на русский шаблон.
+      await expect(page.getByRole('heading', { name: 'Profile' })).toBeVisible({ timeout: 20000 });
+      await expect(page.locator('body')).not.toContainText('Профиль');
+    } finally {
+      // Аккаунт общий с остальными тестами — вернуть русский обязательно,
+      // иначе следующий прогон упадёт на проверках по русскому тексту.
+      await forceRussianProfile(access);
+    }
+  });
 });
