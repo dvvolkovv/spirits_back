@@ -1,8 +1,32 @@
 import { Injectable, Logger, Optional, OnModuleInit } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
+import { VOICE_CATALOG } from '../speech/voices';
 import * as fs from 'fs';
 import * as path from 'path';
+
+/** Ассистентов в каталоге полтора десятка; 50 — запас, за которым уже мусор. */
+const MAX_VOICE_OVERRIDES = 50;
+
+/**
+ * Пользовательский выбор голосов (`profile_data.assistant_voices`) приходит из
+ * браузера, поэтому проверяем всё: ключ — имя ассистента (оно же
+ * `preferred_agent`), значение — id голоса из каталога. Несуществующие id
+ * выбрасываем, `null` трактуем как «сбросить на дефолт» (resolveVoice сам
+ * подставит голос ассистента, когда переопределения нет).
+ */
+export function sanitizeAssistantVoices(raw: any): Record<string, string> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const valid = new Set(VOICE_CATALOG.map((v) => v.id));
+  const out: Record<string, string> = {};
+  for (const [assistant, voice] of Object.entries(raw)) {
+    if (Object.keys(out).length >= MAX_VOICE_OVERRIDES) break;
+    if (typeof voice !== 'string') continue;
+    if (!valid.has(voice)) continue;
+    out[assistant] = voice;
+  }
+  return out;
+}
 
 @Injectable()
 export class ProfileService implements OnModuleInit {
@@ -108,6 +132,13 @@ export class ProfileService implements OnModuleInit {
     // Entities (values, beliefs, etc.) are stored in Neo4j only — strip them here
     const { values, desires, intents, intentions, beliefs, interests, skills, ...rest } = data;
     const patch: Record<string, any> = { ...rest };
+
+    // Только если поле реально пришло: безусловная санитизация подставила бы
+    // assistant_voices: {} в каждый апдейт профиля и стирала бы выбор голосов
+    // при любом сохранении имени.
+    if ('assistant_voices' in patch) {
+      patch.assistant_voices = sanitizeAssistantVoices(patch.assistant_voices);
+    }
 
     if (Object.keys(patch).length > 0) {
       await this.pg.query(
