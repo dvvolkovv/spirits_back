@@ -163,6 +163,31 @@ test.describe('экран входа', () => {
     // подробности в отчёте по Задаче 1.
   });
 
+  test('РЕГРЕССИЯ: сообщение о неверном коде остаётся на экране', async ({ page }) => {
+    // До 2026-08-07 эффект по появлению error тут же звал onErrorClear, и текст
+    // не доживал до следующей отрисовки: человек видел, как ячейки молча
+    // обнуляются, без единого слова объяснения. Тем же путём пропадало
+    // сообщение про переполненный localStorage.
+    await openLogin(page);
+    await page.getByTestId('consent-checkbox').check();
+    await page.getByTestId('switch-to-phone').click();
+    await page.getByTestId('phone-input').fill(NATIONAL);
+    await page.getByTestId('phone-submit-btn').click();
+    await expect(page.getByTestId('otp-input-0')).toBeVisible({ timeout: 15000 });
+
+    await page.getByTestId('otp-input-0').pressSequentially('111111');
+
+    // Сообщение обязано пережить несколько секунд, а не мигнуть на кадр.
+    const message = page.locator('.text-red-600');
+    await expect(message).toBeVisible({ timeout: 10000 });
+    await page.waitForTimeout(3000);
+    await expect(message).toBeVisible();
+
+    // ...и уйти, когда человек начал вводить код заново.
+    await page.getByTestId('otp-input-0').pressSequentially('9');
+    await expect(message).toHaveCount(0);
+  });
+
   test('запрос ссылки на почту доходит до экрана «проверь почту»', async ({ page }) => {
     await openLogin(page);
     await page.getByTestId('consent-checkbox').check();
