@@ -16,11 +16,29 @@ CREATE TABLE IF NOT EXISTS speech_clips (
   provider     text NOT NULL,
   voice        text NOT NULL,
   lang         text NOT NULL,
-  created_at   timestamptz NOT NULL DEFAULT now()
+  -- tokens_spent — сколько реально списано за ЭТОТ синтез. У кэш-хита списания
+  -- нет, поэтому сумма по стриму (chat.service.ts, toolSpent) обязана считаться
+  -- только по created_at >= начала стрима, а не по last_used_at.
+  tokens_spent int NOT NULL DEFAULT 0,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  -- last_used_at — момент последней ВЫДАЧИ клипа, включая бесплатный кэш-хит.
+  -- Без него повтор того же текста не получал маркера {{audio:id=...}}: блок
+  -- инъекции в chat.service.ts ищет клипы за время стрима, а created_at у
+  -- кэш-хита старый — инструмент отчитывался успехом, а плеера не было.
+  last_used_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- Отдельными ALTER'ами — на случай, если таблица уже создана прежней версией
+-- этого же файла (миграция не выкачена ни на один сервер, но повторное
+-- применение должно быть безопасным).
+ALTER TABLE speech_clips ADD COLUMN IF NOT EXISTS tokens_spent int NOT NULL DEFAULT 0;
+ALTER TABLE speech_clips ADD COLUMN IF NOT EXISTS last_used_at timestamptz NOT NULL DEFAULT now();
 
 CREATE UNIQUE INDEX IF NOT EXISTS speech_clips_user_key
   ON speech_clips (user_id, cache_key);
 
 CREATE INDEX IF NOT EXISTS speech_clips_user_created
   ON speech_clips (user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS speech_clips_user_last_used
+  ON speech_clips (user_id, last_used_at DESC);

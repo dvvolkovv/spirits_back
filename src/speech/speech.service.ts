@@ -129,6 +129,19 @@ export class SpeechService {
     );
     if (hit.rows.length) {
       const row = hit.rows[0];
+      // Кэш-хит бесплатен, но его надо пометить как выданный ИМЕННО СЕЙЧАС.
+      // Блок инъекции маркеров в chat.service.ts отбирает клипы за время стрима,
+      // а created_at у кэш-хита старый: без этого UPDATE повтор того же текста
+      // не давал пользователю плеера вообще — инструмент возвращал ok, модель
+      // сообщала об успехе, а карточки не появлялось.
+      //
+      // Падение UPDATE не должно ронять выдачу уже готового клипа: хуже, чем
+      // отсутствие маркера, только отсутствие ответа.
+      try {
+        await this.pg.query('UPDATE speech_clips SET last_used_at = now() WHERE id = $1', [row.id]);
+      } catch (e: any) {
+        this.logger.warn(`failed to bump last_used_at for clip ${row.id}: ${e.message}`);
+      }
       return {
         ok: true, clipId: String(row.id), audioUrl: row.url,
         durationSec: Number(row.duration_sec ?? 0), chars: Number(row.chars),
@@ -164,12 +177,17 @@ export class SpeechService {
     // механизм кэша, а сценка по ролям шлёт несколько синтезов подряд. Два
     // параллельных вызова с одним текстом иначе дали бы 23505 unique_violation
     // и 500-ку вместо кэш-хита.
+    //
+    // tokens_spent пишем сразу суммой `required`, ещё до списания: строка живёт
+    // только если списание прошло — при провале она удаляется компенсацией ниже.
+    // Так в таблице нет клипов с записанной, но не взятой платой. Из этой
+    // колонки chat.service.ts собирает индикатор «X токенов» под сообщением.
     const ins = await this.pg.query(
-      `INSERT INTO speech_clips (user_id, assistant_id, cache_key, url, duration_sec, chars, provider, voice, lang)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      `INSERT INTO speech_clips (user_id, assistant_id, cache_key, url, duration_sec, chars, provider, voice, lang, tokens_spent)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
        ON CONFLICT (user_id, cache_key) DO NOTHING
        RETURNING id`,
-      [userId, assistantName, cacheKey, url, durationSec, text.length, resolved.provider, resolved.voice, lang],
+      [userId, assistantName, cacheKey, url, durationSec, text.length, resolved.provider, resolved.voice, lang, required],
     );
 
     if (ins.rows.length === 0) {

@@ -72,10 +72,20 @@ function makeService(overrides: any = {}) {
   const deduct = jest.fn();
   /** Каждый откат неоплаченного клипа: (clipId, userId). */
   const deleted = jest.fn();
+  /** Каждая отметка «клип выдан сейчас» на кэш-хите: (clipId). */
+  const touched = jest.fn();
   let clipSeq = 0;
 
   const pg = {
     query: jest.fn(async (sql: string, params: any[] = []) => {
+      // Строго до общей ветки `FROM speech_clips` — это UPDATE, а не SELECT.
+      if (/UPDATE speech_clips SET last_used_at/.test(sql)) {
+        const [id] = params;
+        const row = rows.clips.find((c) => c.id === id);
+        if (row) row.last_used_at = Date.now();
+        touched(id);
+        return { rows: [], rowCount: row ? 1 : 0 };
+      }
       if (/UPDATE ai_profiles_consolidated SET tokens = tokens - \$1/.test(sql)) {
         const [amount, uid] = params;
         const guarded = /tokens >= \$1/.test(sql);
@@ -96,11 +106,13 @@ function makeService(overrides: any = {}) {
         return { rows: hit ? [hit] : [] };
       }
       if (/INSERT INTO speech_clips/.test(sql)) {
-        const row = {
-          id: `clip-${++clipSeq}`, user_id: params[0], assistant_id: params[1], cache_key: params[2],
-          url: params[3], duration_sec: params[4], chars: params[5],
-          provider: params[6], voice: params[7], lang: params[8],
-        };
+        // Колонки читаем ИЗ ТЕКСТА запроса и сопоставляем с params по позиции:
+        // так заглушка не «знает» схему заранее и уронит тест, если сервис
+        // перестанет писать tokens_spent.
+        const cols = String(sql.match(/INSERT INTO speech_clips \(([^)]*)\)/)?.[1] ?? '')
+          .split(',').map((c) => c.trim());
+        const row: any = { id: `clip-${++clipSeq}`, tokens_spent: 0, last_used_at: Date.now() };
+        cols.forEach((c, i) => { row[c] = params[i]; });
         rows.clips.push(row);
         return { rows: [row] };
       }
@@ -117,7 +129,7 @@ function makeService(overrides: any = {}) {
   const svc = new SpeechService(pg as any, storage as any, language as any, redis as any);
   // Подменяем сетевые вызовы — тестируем оркестрацию, не HTTP.
   (svc as any).synthesizeWith = jest.fn(async () => Buffer.from('fake-mp3-bytes'));
-  return { svc, pg, storage, deduct, deleted, rows, state, language, redis };
+  return { svc, pg, storage, deduct, deleted, touched, rows, state, language, redis };
 }
 
 describe('SpeechService.synthesize', () => {
@@ -330,6 +342,109 @@ describe('SpeechService — гонка баланса при параллель�
     expect(upd).toBeDefined();
     expect(upd).toMatch(/tokens >= \$1/);
     expect(upd).toMatch(/RETURNING tokens/);
+  });
+});
+
+/**
+ * Дефект 1. Кэш-хит отдавал старую строку и ничего в ней не трогал, а маркер
+ * `{{audio:id=...}}` дописывается в chat.service.ts по клипам «за время
+ * стрима». created_at у кэш-хита старый — маркер не подставлялся: инструмент
+ * вернул ok, модель написала «готово», плеера у пользователя нет. Причём это
+ * заявленная фича («повтор того же текста бесплатно»), а не редкий угол.
+ */
+describe('SpeechService — кэш-хит помечается как выданный сейчас (дефект 1)', () => {
+  it('повтор двигает last_used_at у найденного клипа', async () => {
+    const { svc, touched, rows } = makeService();
+    const first: any = await svc.synthesize('u1', { text: 'Привет' });
+    expect(touched).not.toHaveBeenCalled(); // первый синтез — вставка, не хит
+
+    const second: any = await svc.synthesize('u1', { text: 'Привет' });
+    expect(second.cached).toBe(true);
+    // Отметили ровно тот клип, который отдали, — не «какой-нибудь».
+    expect(touched).toHaveBeenCalledTimes(1);
+    expect(touched).toHaveBeenCalledWith(rows.clips[0].id);
+    expect(second.clipId).toBe(first.clipId);
+  });
+
+  it('клип, доставшийся от параллельного вызова, тоже свежий по времени — отдельная отметка не нужна', async () => {
+    // Строку вставил параллельный вызов ЗА ЭТОТ ЖЕ стрим, её created_at уже
+    // внутри окна. Проверяем, что выдача не падает и денег не берёт.
+    const { svc, pg, deduct } = makeService();
+    let insertSeen = false;
+    (pg.query as jest.Mock).mockImplementation(async (sql: string) => {
+      if (/INSERT INTO speech_clips/.test(sql)) { insertSeen = true; return { rows: [] }; }
+      if (/FROM speech_clips/.test(sql)) {
+        return insertSeen
+          ? { rows: [{ id: 'clip-parallel', url: 'https://minio.test/a.mp3', duration_sec: 2, chars: 6 }] }
+          : { rows: [] };
+      }
+      if (/preferred_agent/.test(sql)) return { rows: [{ preferred_agent: 'Роман', profile_data: {} }] };
+      if (/SELECT tokens/.test(sql)) return { rows: [{ tokens: 100000 }] };
+      return { rows: [] };
+    });
+
+    const r: any = await svc.synthesize('u1', { text: 'Привет' });
+    expect(r.ok).toBe(true);
+    expect(r.tokensSpent).toBe(0);
+    expect(deduct).not.toHaveBeenCalled();
+  });
+
+  it('падение UPDATE last_used_at не ломает выдачу готового клипа', async () => {
+    const { svc, pg } = makeService();
+    await svc.synthesize('u1', { text: 'Привет' });
+
+    const orig = (pg.query as jest.Mock).getMockImplementation()!;
+    (pg.query as jest.Mock).mockImplementation(async (sql: string, params: any[] = []) => {
+      if (/UPDATE speech_clips SET last_used_at/.test(sql)) throw new Error('deadlock detected');
+      return orig(sql, params);
+    });
+
+    const r: any = await svc.synthesize('u1', { text: 'Привет' });
+    expect(r.ok).toBe(true);
+    expect(r.cached).toBe(true);
+  });
+});
+
+/**
+ * Дефект 2. У speech_clips не было колонки tokens_spent, и озвучка не попадала
+ * в индикатор «X токенов» под сообщением: сценка из десяти реплик уводила
+ * баланс на 10 000 молча. Сумму собирает chat.service.ts запросом
+ * SUM(tokens_spent) по created_at за время стрима — значит платa обязана
+ * лежать в самой строке клипа.
+ */
+describe('SpeechService — фактическая плата пишется в строку клипа (дефект 2)', () => {
+  it('INSERT кладёт в tokens_spent ровно списанную сумму', async () => {
+    const { svc, deduct, rows } = makeService();
+    // 1500 символов → две начатые тысячи → 2000 токенов.
+    await svc.synthesize('u1', { text: 'я'.repeat(1500) });
+
+    expect(deduct).toHaveBeenCalledWith('u1', 2000);
+    expect(rows.clips).toHaveLength(1);
+    expect(Number(rows.clips[0].tokens_spent)).toBe(2000);
+  });
+
+  it('короткий текст — 1000, и в строке ровно 1000, а не длина текста', async () => {
+    const { svc, rows } = makeService();
+    await svc.synthesize('u1', { text: 'Привет' });
+    expect(Number(rows.clips[0].tokens_spent)).toBe(1000);
+  });
+
+  it('неоплаченный клип не остаётся в таблице со своей суммой', async () => {
+    // Иначе SUM(tokens_spent) показал бы пользователю плату, которую не взяли.
+    const { svc, rows } = makeService({ balance: 1000 });
+    await Promise.all([
+      svc.synthesize('u1', { text: 'раз' }),
+      svc.synthesize('u1', { text: 'два' }),
+    ]);
+    expect(rows.clips).toHaveLength(1);
+    expect(rows.clips.reduce((s: number, c: any) => s + Number(c.tokens_spent), 0)).toBe(1000);
+  });
+
+  it('кэш-хит новой строки не создаёт — значит и в сумму стрима ничего не добавит', async () => {
+    const { svc, rows } = makeService();
+    await svc.synthesize('u1', { text: 'Привет' });
+    await svc.synthesize('u1', { text: 'Привет' });
+    expect(rows.clips).toHaveLength(1);
   });
 });
 
