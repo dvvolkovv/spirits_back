@@ -6,7 +6,7 @@ function svc(status: any, conflicts: any[], findConflictsFn?: jest.Mock) {
   const saveProposalFn = jest.fn(async () => 'test-id');
   const calendar = { getStatus: getStatusFn, findConflicts: findConflictsImpl, saveProposal: saveProposalFn } as any;
   // остальные зависимости не нужны для этой ветки — передать заглушки
-  return { svc: new ChatToolsService({} as any, {} as any, {} as any, {} as any, {} as any, calendar), findConflictsFn: findConflictsImpl, saveProposalFn };
+  return { svc: new ChatToolsService({} as any, {} as any, {} as any, {} as any, {} as any, calendar, {} as any), findConflictsFn: findConflictsImpl, saveProposalFn };
 }
 
 describe('propose_calendar_event tool', () => {
