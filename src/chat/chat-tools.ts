@@ -8,6 +8,7 @@ import { CreateVideoJobDto } from '../video/video.dto';
 import { RoutineStore, ENERGY_PROMPT } from '../routine-push/routine-store.service';
 import { CalendarService } from '../calendar/calendar.service';
 import { Recurrence, expandOccurrences } from '../calendar/recurrence';
+import { SpeechService } from '../speech/speech.service';
 
 export const CHAT_TOOLS = [
   {
@@ -233,6 +234,34 @@ export const CHAT_TOOLS = [
       required: ['title'],
     },
   },
+  {
+    name: 'generate_speech',
+    description:
+      'Озвучить текст голосом и показать пользователю аудио-плеер. Вызывай, когда просят «озвучь», ' +
+      '«прочитай вслух», «наговори голосом», «сделай аудио». ' +
+      'Голос можно выбрать любой — он НЕ обязан совпадать с твоей персоной: можно озвучить реплику ' +
+      'женским голосом, а в одном ответе сделать несколько клипов разными голосами (диалог, сценка по ролям) — ' +
+      'для этого вызови инструмент по разу на каждую реплику со своим voice. ' +
+      'Язык берётся из настроек пользователя автоматически, параметра языка нет. ' +
+      'НИКОГДА не придумывай ссылку на аудио сам — плеер появляется у пользователя отдельной карточкой. ' +
+      'Если инструмент вернул ошибку — передай её текст пользователю и НЕ утверждай, что аудио «готовится». ' +
+      'Стоимость: 1000 токенов за каждую начатую 1000 символов. Максимум за вызов — 2000 символов ' +
+      'для русского и 4000 для остальных языков (ограничения провайдеров). Текст длиннее вернёт ' +
+      'ошибку text_too_long с точным максимумом — тогда сократи или озвучь несколькими вызовами. ' +
+      'Голоса для русского: alena (тёплый женский), jane (мягкий женский), omazh (деловой женский), ' +
+      'marina (зрелый женский), zahar (уверенный мужской), filipp (дружелюбный мужской), ' +
+      'ermil (мягкий мужской), madirus (глубокий деловой мужской). ' +
+      'Голоса для остальных языков: alloy, nova, shimmer (женские), echo, onyx, fable (мужские). ' +
+      'Если voice не передан — берётся голос, назначенный пользователем, иначе голос ассистента по умолчанию.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'Текст для озвучки. До 2000 символов на русском, до 4000 на других языках.' },
+        voice: { type: 'string', description: 'Необязательный id голоса из списка выше. Несуществующий id молча заменяется на голос по умолчанию.' },
+      },
+      required: ['text'],
+    },
+  },
 ];
 
 export type ToolResult =
@@ -267,6 +296,17 @@ export type ToolResult =
       connected: boolean;
       conflicts: { title: string; at: string }[];
       occurrenceCount?: number;
+    }
+  | {
+      ok: true;
+      kind: 'audio';
+      clipId: string;
+      /** audioUrl намеренно отсутствует — см. ветку generate_speech в executeTool. */
+      durationSec: number;
+      chars: number;
+      voice: string;
+      tokensSpent: number;
+      cached: boolean;
     }
   | { ok: false; error: string; [k: string]: any };
 
@@ -328,6 +368,7 @@ export class ChatToolsService {
     private readonly video: VideoService,
     private readonly routines: RoutineStore,
     private readonly calendar: CalendarService,
+    private readonly speech: SpeechService,
   ) {}
 
   async executeTool(userId: string, name: string, input: any): Promise<ToolResult> {
@@ -387,6 +428,26 @@ export class ChatToolsService {
           ok: true, kind: 'routine', action: 'enable',
           title: row?.title, hour: row?.sendHour, days: row?.days ?? null, enabled: true, assistant: who,
           delivered_hint: subs.rowCount === 0,
+        };
+      }
+
+      if (name === 'generate_speech') {
+        // assistantId из аргументов сознательно игнорируется: по MCP модель сама
+        // подставляет аргументы, ассистент берётся из preferred_agent в БД.
+        const r = await this.speech.synthesize(userId, {
+          text: String(input?.text ?? ''),
+          voice: typeof input?.voice === 'string' ? input.voice : undefined,
+        });
+        if (!r.ok) return r as any;
+        // audioUrl наружу НЕ отдаём. Результат инструмента уходит в контекст
+        // модели, и инструкция «не придумывай ссылку» не мешает ей вставить
+        // ссылку, которую ей же и дали — пользователь видел голый URL MinIO
+        // рядом с плеером. Плеер собирается из clipId маркером
+        // `{{audio:id=<uuid>}}`, сам URL модели не нужен.
+        return {
+          ok: true, kind: 'audio', clipId: r.clipId,
+          durationSec: r.durationSec, chars: r.chars, voice: r.voice,
+          tokensSpent: r.tokensSpent, cached: r.cached,
         };
       }
 

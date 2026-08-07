@@ -327,6 +327,28 @@ async function step(name, fn) {
     return `balance=${tokens}`;
   });
 
+  // -- 7b. TTS end-to-end: text -> audio bytes for launcher voice loop -----
+  await step('POST /webhook/tts returns non-empty audio', async () => {
+    if (!jwt) throw new Error('no JWT');
+    const r = await axios.post(
+      `${BASE_URL}/webhook/tts`,
+      { text: 'Готово' },
+      {
+        headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
+        responseType: 'arraybuffer',
+        timeout: 20000,
+        validateStatus: () => true,
+      },
+    );
+    if (r.status !== 200) throw new Error(`status ${r.status}: ${Buffer.from(r.data).toString().slice(0, 200)}`);
+    const ct = r.headers['content-type'] || '';
+    if (!/^audio\/(ogg|mpeg)$/.test(ct)) throw new Error(`unexpected content-type: ${ct}`);
+    if (!r.data || r.data.length < 100) throw new Error(`audio suspiciously small: ${r.data?.length || 0} bytes`);
+    const cost = r.headers['x-tts-cost'];
+    if (!cost) throw new Error('X-TTS-Cost header missing');
+    return `${r.data.length} bytes, ${ct}, cost=$${cost}`;
+  });
+
   // -- 8. Chat streaming smoke ------------------------------------------
   // Use Роман (id=12) — universal agent, fast, doesn't need history context.
   await step('chat streaming returns non-empty response (Роман)', async () => {

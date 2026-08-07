@@ -909,6 +909,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       for (let i = 0; i < chunks.length; i++) {
         chunks[i] = chunks[i].replace(/\s*\[VIDEO_JOB:[0-9a-f-]{36}\]\s*/gi, '');
         chunks[i] = chunks[i].replace(/\s*\[CALENDAR_PROPOSAL:[0-9a-f-]{36}\]\s*/gi, '');
+        chunks[i] = chunks[i].replace(/\s*\{\{audio:id=[0-9a-f-]{36}\}\}\s*/gi, '');
       }
 
       // Detect video jobs created during this stream by querying recent jobs.
@@ -955,18 +956,66 @@ ${LanguageService.buildDirective(userLanguage)}`;
         this.logger.warn(`calendar marker injection failed: ${e.message}`);
       }
 
+      // Detect speech clips synthesized during this stream — same mechanism as
+      // video jobs and calendar proposals above. generate_speech идёт через тот
+      // же MCP-bridge и структурных tool_result не даёт, поэтому без этой
+      // дописки плеер у пользователя не появлялся вообще: инструмент отработал,
+      // токены списаны, клип в БД — и всё. Маркер `{{audio:id=<uuid>}}` фронт
+      // уже умеет разбирать (customMarkdown.tsx, AUDIO_CLIP_REGEX).
+      //
+      // Пуш в `chunks` обязателен, а не только safeWrite: из chunks собирается
+      // fullText, который персистится в историю — иначе плеер исчезал бы после
+      // перезагрузки страницы. Border = streamStartTime, scoped to this user.
+      //
+      // Условие шире, чем у видео/календаря: `created_at ИЛИ last_used_at`.
+      // Повтор того же текста — заявленная фича («бесплатно из кэша»), клип при
+      // этом не создаётся заново, у него старый created_at, и по одному
+      // created_at маркер бы не подставился: инструмент вернул бы ok, модель
+      // сказала бы «готово», а плеера бы не было. SpeechService на кэш-хите
+      // двигает last_used_at — по нему такой клип и попадает в выборку.
+      //
+      // LIMIT 50 — предохранитель: при потолке 20 синтезов в минуту длинный
+      // стрим теоретически даёт сотни клипов, и все их маркеры уехали бы в один
+      // ответ. Сортировка ASC, поэтому обрезаются самые старые.
+      try {
+        const startTimeIso = new Date(streamStartTime).toISOString();
+        const clipsRes = await this.pg.query(
+          `SELECT id FROM speech_clips
+           WHERE user_id = $1 AND (created_at >= $2::timestamptz OR last_used_at >= $2::timestamptz)
+           ORDER BY created_at ASC
+           LIMIT 50`,
+          [userId, startTimeIso],
+        );
+        if (clipsRes.rows.length > 0) {
+          const markers = clipsRes.rows.map((r: any) => `{{audio:id=${r.id}}}`).join('\n');
+          const tail = '\n\n' + markers;
+          chunks.push(tail);
+          safeWrite({ type: 'item', content: tail });
+        }
+      } catch (e: any) {
+        this.logger.warn(`speech marker injection failed: ${e.message}`);
+      }
+
       const fullText = chunks.join('');
       // Text cost: длина ответа × SDK-множитель. Картинки/видео списываются
       // их MCP-сервисами отдельно (см. toolSpent ниже).
       const tokensUsed = fullText.length * this.SDK_TEXT_MULTIPLIER;
 
       // Sum up tool-charged tokens (image, video, etc.) during this stream.
-      // MCP-tools (MiscService.generateImage, VideoService.createJob) deduct
-      // directly from ai_profiles_consolidated and write rows into
-      // generated_images / video_jobs with tokens_spent. Aggregate from there.
+      // MCP-tools (MiscService.generateImage, VideoService.createJob,
+      // SpeechService.synthesize) deduct directly from ai_profiles_consolidated
+      // and write rows into generated_images / video_jobs / speech_clips with
+      // tokens_spent. Aggregate from there.
+      //
+      // У speech_clips граница НАМЕРЕННО по created_at, без last_used_at —
+      // в отличие от выборки маркеров выше. Кэш-хит выдаёт старый клип
+      // бесплатно (tokensSpent: 0) и лишь двигает last_used_at; включи его
+      // сюда — и в индикаторе «X токенов» всплыла бы плата за давний синтез,
+      // которую сейчас не брали. Свежая вставка проходит по created_at и
+      // несёт ровно ту сумму, что реально списана.
       let toolSpent = 0;
+      const startIso = new Date(streamStartTime).toISOString();
       try {
-        const startIso = new Date(streamStartTime).toISOString();
         const r = await this.pg.query(
           `SELECT
              COALESCE((SELECT SUM(tokens_spent) FROM generated_images WHERE user_id = $1 AND created_at >= $2::timestamptz), 0)::bigint
@@ -978,6 +1027,22 @@ ${LanguageService.buildDirective(userLanguage)}`;
         toolSpent = Number(r.rows[0]?.spent ?? 0);
       } catch (e: any) {
         this.logger.warn(`tool spend query failed: ${e.message}`);
+      }
+      // Озвучка — отдельным запросом, а не четвёртым слагаемым в том же SELECT:
+      // speech_clips новее остальных таблиц, и на сервере, где миграция ещё не
+      // докатилась, отсутствие relation уронило бы весь запрос разом — вместе с
+      // уже работающим учётом картинок и видео (ровно так же, как падает
+      // выборка маркеров выше, см. её catch). Своим try/catch озвучка теряет
+      // только себя.
+      try {
+        const s = await this.pg.query(
+          `SELECT COALESCE(SUM(tokens_spent), 0)::bigint AS spent
+             FROM speech_clips WHERE user_id = $1 AND created_at >= $2::timestamptz`,
+          [userId, startIso],
+        );
+        toolSpent += Number(s.rows[0]?.spent ?? 0);
+      } catch (e: any) {
+        this.logger.warn(`speech spend query failed: ${e.message}`);
       }
 
       const displayedTotal = tokensUsed + toolSpent;

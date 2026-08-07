@@ -475,7 +475,7 @@ git commit -m "feat(speech): миграция таблицы speech_clips"
 Создать `src/speech/speech.service.spec.ts`:
 
 ```typescript
-import { tokenCostFor, cacheKeyFor, estimateDurationSec, MAX_CHARS } from './speech.service';
+import { tokenCostFor, cacheKeyFor, estimateDurationSec, maxCharsFor } from './speech.service';
 
 describe('tokenCostFor', () => {
   it('округляет вверх до целых тысяч', () => {
@@ -511,9 +511,25 @@ describe('estimateDurationSec', () => {
   });
 });
 
-describe('MAX_CHARS', () => {
-  it('потолок 5000 символов', () => {
-    expect(MAX_CHARS).toBe(5000);
+describe('maxCharsFor — потолок свой у каждого провайдера', () => {
+  it('yandex — 2000 символов: 15 КБ лимит тела, кириллица раздувается в 6 раз', () => {
+    expect(maxCharsFor('yandex')).toBe(2000);
+  });
+
+  it('openai — 4000 символов: у tts-1 лимит 4096 на input', () => {
+    expect(maxCharsFor('openai')).toBe(4000);
+  });
+
+  it('потолок yandex реально влезает в 15 КБ тела на кириллице', () => {
+    const params = new URLSearchParams();
+    params.set('text', 'я'.repeat(maxCharsFor('yandex')));
+    expect(Buffer.byteLength(params.toString())).toBeLessThan(15000);
+  });
+
+  it('вдвое больший текст в лимит уже НЕ влезает — проверка, что потолок не декоративный', () => {
+    const params = new URLSearchParams();
+    params.set('text', 'я'.repeat(maxCharsFor('yandex') * 2));
+    expect(Buffer.byteLength(params.toString())).toBeGreaterThan(15000);
   });
 });
 ```
@@ -530,9 +546,30 @@ Expected: FAIL — `Cannot find module './speech.service'`
 ```typescript
 // src/speech/speech.service.ts
 import { createHash } from 'crypto';
+import { TtsProvider } from './voices';
 
-export const MAX_CHARS = 5000;
 export const RATE_LIMIT_PER_MIN = 20;
+
+/**
+ * Потолок длины у каждого провайдера свой — единой константы быть не может.
+ *
+ * Yandex: лимит не на символы, а 15 КБ на тело POST-запроса. В
+ * application/x-www-form-urlencoded каждый байт кодируется как %XX, кириллица
+ * занимает 2 байта → 6 символов тела на символ текста. Замер: 5000 кириллических
+ * символов = 30 005 байт (вдвое сверх лимита), 2000 = 12 005 байт (влезает
+ * с запасом). На латинице тот же текст прошёл бы — поэтому баг не ловится
+ * короткой тестовой фразой и вылезает на первом длинном русском ответе.
+ *
+ * OpenAI: у tts-1 жёсткий лимит 4096 символов на input, берём 4000.
+ */
+const MAX_CHARS_BY_PROVIDER: Record<TtsProvider, number> = {
+  yandex: 2000,
+  openai: 4000,
+};
+
+export function maxCharsFor(provider: TtsProvider): number {
+  return MAX_CHARS_BY_PROVIDER[provider];
+}
 
 /** 1000 токенов за каждую начатую 1000 символов. */
 export function tokenCostFor(chars: number): number {
@@ -673,14 +710,31 @@ describe('SpeechService.synthesize', () => {
     expect(misc.deductTokens).not.toHaveBeenCalled();
   });
 
-  it('текст длиннее потолка отклоняется без синтеза', async () => {
+  it('на русском потолок 2000 символов — 2001 отклоняется без синтеза', async () => {
     const { svc, storage } = makeService();
-    const r = await svc.synthesize('u1', { text: 'а'.repeat(5001) });
+    const r = await svc.synthesize('u1', { text: 'я'.repeat(2001) });
 
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.error).toBe('text_too_long');
+    expect(r.maxChars).toBe(2000);
     expect(storage.upload).not.toHaveBeenCalled();
+  });
+
+  it('на английском тот же текст проходит — потолок там 4000', async () => {
+    const { svc } = makeService({ lang: 'en' });
+    const r = await svc.synthesize('u1', { text: 'a'.repeat(2001) });
+    expect(r.ok).toBe(true);
+  });
+
+  it('на английском 4001 символ отклоняется', async () => {
+    const { svc } = makeService({ lang: 'en' });
+    const r = await svc.synthesize('u1', { text: 'a'.repeat(4001) });
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error).toBe('text_too_long');
+    expect(r.maxChars).toBe(4000);
   });
 
   it('пустой текст отклоняется', async () => {
@@ -705,6 +759,32 @@ describe('SpeechService.synthesize', () => {
     if (!r.ok) return;
     expect(r.provider).toBe('openai');
     expect(r.voice).toBe('onyx');
+  });
+
+  it('гонку выиграл параллельный вызов — отдаём его клип и не списываем повторно', async () => {
+    const { svc, pg, misc } = makeService();
+    // INSERT ... ON CONFLICT DO NOTHING вернул ноль строк: параллельный вызов
+    // успел вставить ту же пару (user_id, cache_key) и уже оплатил синтез.
+    let insertSeen = false;
+    (pg.query as jest.Mock).mockImplementation(async (sql: string, params: any[] = []) => {
+      if (/INSERT INTO speech_clips/.test(sql)) { insertSeen = true; return { rows: [] }; }
+      if (/FROM speech_clips/.test(sql)) {
+        return insertSeen
+          ? { rows: [{ id: 'clip-parallel', url: 'https://minio.test/a.mp3', duration_sec: 2, chars: 6 }] }
+          : { rows: [] };
+      }
+      if (/preferred_agent/.test(sql)) return { rows: [{ preferred_agent: 'Роман', profile_data: {} }] };
+      if (/SELECT tokens/.test(sql)) return { rows: [{ tokens: 100000 }] };
+      return { rows: [] };
+    });
+
+    const r = await svc.synthesize('u1', { text: 'Привет' });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.clipId).toBe('clip-parallel');
+    expect(r.cached).toBe(true);
+    expect(r.tokensSpent).toBe(0);
+    expect(misc.deductTokens).not.toHaveBeenCalled();
   });
 });
 ```
@@ -745,7 +825,7 @@ export type SynthesizeResult =
       tokensSpent: number; cached: boolean;
     }
   | { ok: false; error: 'insufficient_tokens'; balance: number; required: number }
-  | { ok: false; error: 'text_too_long'; maxChars: number }
+  | { ok: false; error: 'text_too_long'; maxChars: number; provider: TtsProvider }
   | { ok: false; error: 'rate_limited'; retryAfterSec: number }
   | { ok: false; error: string };
 
@@ -764,7 +844,6 @@ export class SpeechService {
   async synthesize(userId: string, input: SynthesizeInput): Promise<SynthesizeResult> {
     const text = String(input.text ?? '').trim();
     if (!text) return { ok: false, error: 'empty text' };
-    if (text.length > MAX_CHARS) return { ok: false, error: 'text_too_long', maxChars: MAX_CHARS };
 
     const lang = await this.language.resolveUserLanguage(userId);
 
@@ -781,6 +860,13 @@ export class SpeechService {
     const resolved = resolveVoice({ lang, assistantName, userChoice, requested: input.voice });
     for (const r of resolved.rejected) {
       this.logger.warn(`voice rejected: source=${r.source} voice=${r.voice} lang=${lang}`);
+    }
+
+    // Потолок длины проверяем только здесь: он зависит от провайдера, а провайдер
+    // известен лишь после разрешения языка и голоса.
+    const maxChars = maxCharsFor(resolved.provider);
+    if (text.length > maxChars) {
+      return { ok: false, error: 'text_too_long', maxChars, provider: resolved.provider };
     }
 
     const cacheKey = cacheKeyFor(text, resolved.voice, lang);
@@ -820,11 +906,33 @@ export class SpeechService {
     });
 
     const durationSec = estimateDurationSec(text.length);
+
+    // ON CONFLICT обязателен: уникальный индекс (user_id, cache_key) — это и есть
+    // механизм кэша, а сценка по ролям шлёт несколько синтезов подряд. Два
+    // параллельных вызова с одним текстом иначе дали бы 23505 unique_violation
+    // и 500-ку вместо кэш-хита.
     const ins = await this.pg.query(
       `INSERT INTO speech_clips (user_id, assistant_id, cache_key, url, duration_sec, chars, provider, voice, lang)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT (user_id, cache_key) DO NOTHING
+       RETURNING id`,
       [userId, assistantName, cacheKey, url, durationSec, text.length, resolved.provider, resolved.voice, lang],
     );
+
+    if (ins.rows.length === 0) {
+      // Гонку выиграл параллельный вызов — он уже оплатил синтез. Отдаём его клип
+      // и второй раз денег не берём.
+      const existing = await this.pg.query(
+        'SELECT id, url, duration_sec, chars FROM speech_clips WHERE user_id = $1 AND cache_key = $2',
+        [userId, cacheKey],
+      );
+      const row = existing.rows[0];
+      return {
+        ok: true, clipId: String(row.id), audioUrl: row.url,
+        durationSec: Number(row.duration_sec ?? 0), chars: Number(row.chars),
+        voice: resolved.voice, provider: resolved.provider, tokensSpent: 0, cached: true,
+      };
+    }
 
     // Списываем только после успешного синтеза и заливки.
     await this.misc.deductTokens(userId, required);
@@ -1056,7 +1164,10 @@ import { SpeechService } from './speech.service';
 import { VOICE_CATALOG, providerForLang } from './voices';
 import { LanguageService } from '../common/services/language.service';
 
-@Controller('webhook/speech')
+// Префикс без 'webhook': он уже навешен глобально в main.ts через
+// app.setGlobalPrefix('webhook'). С 'webhook/speech' маршрут стал бы
+// /webhook/webhook/speech.
+@Controller('speech')
 export class SpeechController {
   constructor(
     private readonly speech: SpeechService,
@@ -1236,7 +1347,9 @@ Expected: FAIL — `unknown tool: generate_speech`
       'Язык берётся из настроек пользователя автоматически, параметра языка нет. ' +
       'НИКОГДА не придумывай ссылку на аудио сам — плеер появляется у пользователя отдельной карточкой. ' +
       'Если инструмент вернул ошибку — передай её текст пользователю и НЕ утверждай, что аудио «готовится». ' +
-      'Стоимость: 1000 токенов за каждую начатую 1000 символов, максимум 5000 символов за вызов. ' +
+      'Стоимость: 1000 токенов за каждую начатую 1000 символов. Максимум за вызов — 2000 символов ' +
+      'для русского и 4000 для остальных языков (ограничения провайдеров). Текст длиннее вернёт ' +
+      'ошибку text_too_long с точным максимумом — тогда сократи или озвучь несколькими вызовами. ' +
       'Голоса для русского: alena (тёплый женский), jane (мягкий женский), omazh (деловой женский), ' +
       'dasha, julia, lera, masha, marina (женские), zahar (уверенный мужской), filipp (дружелюбный мужской), ' +
       'ermil (мягкий мужской), madirus (глубокий деловой мужской), alexander, kirill, anton (мужские). ' +
@@ -1245,7 +1358,7 @@ Expected: FAIL — `unknown tool: generate_speech`
     input_schema: {
       type: 'object',
       properties: {
-        text: { type: 'string', description: 'Текст для озвучки, до 5000 символов.' },
+        text: { type: 'string', description: 'Текст для озвучки. До 2000 символов на русском, до 4000 на других языках.' },
         voice: { type: 'string', description: 'Необязательный id голоса из списка выше. Несуществующий id молча заменяется на голос по умолчанию.' },
       },
       required: ['text'],
