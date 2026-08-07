@@ -339,7 +339,9 @@ git commit -m "feat(speech): сервис метаданных клипа"
 
 ## Task 3: Строки локализации
 
-Делается ДО карточки: в `l10n.yaml` включён `untranslated-messages-file`, поэтому карточка со ссылками на несуществующие ключи не соберётся.
+Делается ДО карточки: без ключей в `app_ru.arb` не появятся геттеры в `app_localizations.dart`, и карточка не пройдёт `flutter analyze`.
+
+Учти: `flutter gen-l10n` при забытом ключе НЕ падает — он завершается кодом 0, пишет пропуск в `l10n-missing.json` и подставляет русский текст в чужую локаль. Единственная реальная проверка — `node tool/check_arb.mjs` (exit 1). Она добавлена в CI, но при локальной работе её надо звать руками.
 
 **Files:**
 - Modify: `lib/l10n/app_ru.arb`, `app_en.arb`, `app_es.arb`, `app_de.arb`, `app_fr.arb`, `app_zh.arb`
