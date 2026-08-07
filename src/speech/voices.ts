@@ -12,23 +12,28 @@ export interface VoiceEntry {
   description: string;
 }
 
+/**
+ * Каталог обязан содержать только голоса, которые провайдер реально принимает:
+ * `resolveVoice` считает валидным любой голос ИЗ каталога, поэтому лишняя запись
+ * не отсеивается валидацией, а доходит до провайдера и падает там уже на живом
+ * пользователе.
+ *
+ * Список сверен с боевым API 2026-08-07 прогоном `scripts/generate-voice-samples.ts`.
+ * Тогда же выяснилось, что SpeechKit v1 не знает семь голосов, которые попали сюда
+ * из документации: dasha, julia, lera, masha, alexander, kirill, anton — все они
+ * отвечали `400 Unsupported voice is requested`. Прежде чем добавлять голос,
+ * прогони этот скрипт: он и есть проверка каталога на соответствие реальности.
+ */
 export const VOICE_CATALOG: VoiceEntry[] = [
   // ── Yandex SpeechKit (ru) ────────────────────────────────────────────
   { id: 'alena',     provider: 'yandex', gender: 'f', title: 'Алёна',     description: 'тёплый женский, universal' },
   { id: 'jane',      provider: 'yandex', gender: 'f', title: 'Джейн',     description: 'мягкий женский, подходит для эмпатичных ролей' },
   { id: 'omazh',     provider: 'yandex', gender: 'f', title: 'Омаж',      description: 'деловой женский, спокойный' },
-  { id: 'dasha',     provider: 'yandex', gender: 'f', title: 'Даша',      description: 'молодой женский, живой' },
-  { id: 'julia',     provider: 'yandex', gender: 'f', title: 'Юлия',      description: 'низкий женский' },
-  { id: 'lera',      provider: 'yandex', gender: 'f', title: 'Лера',      description: 'нейтральный женский' },
-  { id: 'masha',     provider: 'yandex', gender: 'f', title: 'Маша',      description: 'звонкий женский' },
   { id: 'marina',    provider: 'yandex', gender: 'f', title: 'Марина',    description: 'зрелый женский' },
   { id: 'zahar',     provider: 'yandex', gender: 'm', title: 'Захар',     description: 'уверенный мужской, universal' },
   { id: 'filipp',    provider: 'yandex', gender: 'm', title: 'Филипп',    description: 'дружелюбный мужской' },
   { id: 'ermil',     provider: 'yandex', gender: 'm', title: 'Ермил',     description: 'мягкий мужской' },
   { id: 'madirus',   provider: 'yandex', gender: 'm', title: 'Мадирус',   description: 'глубокий мужской, деловой' },
-  { id: 'alexander', provider: 'yandex', gender: 'm', title: 'Александр', description: 'нейтральный мужской' },
-  { id: 'kirill',    provider: 'yandex', gender: 'm', title: 'Кирилл',    description: 'молодой мужской' },
-  { id: 'anton',     provider: 'yandex', gender: 'm', title: 'Антон',     description: 'спокойный мужской' },
 
   // ── OpenAI tts-1 (не-ru) ─────────────────────────────────────────────
   // Описания по-английски намеренно: провайдер выбирается по языку пользователя,
