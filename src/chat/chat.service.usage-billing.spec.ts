@@ -1,6 +1,14 @@
 import { Readable } from 'stream';
 import axios from 'axios';
 import { ChatService } from './chat.service';
+import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
+
+/**
+ * Ожидания выводятся из курса, а не зашиты числами: курс — бизнес-решение и
+ * меняется через env, формула — код. Иначе смена курса красит тесты, ничего
+ * не сообщая о правильности расчёта. Сам курс закреплён отдельным тестом ниже.
+ */
+const forUsd = (usd: number) => Math.max(1, Math.ceil(usd * SEAT_TOKENS_PER_USD));
 
 jest.mock('axios');
 
@@ -115,21 +123,21 @@ describe('SDK-биллинг: взвешенные токены из сырог�
 
   // Веса — отношения цен Anthropic к input: read 0.1, запись 5м 1.25,
   // запись 1ч 2, output 5. Единица переводится в доллары по $5/MTok (opus-5),
-  // дальше в Linkeon-токены по курсу 1200/$.
+  // дальше в Linkeon-токены по курсу SEAT_TOKENS_PER_USD.
   const BASE_USAGE = {
     input: 1000, output: 1000, cacheRead: 100_000,
     cacheWrite5m: 10_000, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
   };
 
   it('считает по взвешенной формуле, а не по costUsd', async () => {
-    // 1000 + 0.1×100000 + 1.25×10000 + 5×1000 = 28 500 единиц
-    // 28 500 × $5/MTok = $0.1425 → ×1200 = 171 токен.
-    // costUsd намеренно вранья — если код возьмёт его, получится 1200.
+    // 1000 + 0.1×100000 + 1.25×10000 + 5×1000 = 28 500 единиц → $0.1425.
+    // costUsd намеренно завышен: если код возьмёт его вместо usage,
+    // спишется втрое больше и тест это поймает.
     const h = makeHarness({ answer: ANSWER, costUsd: 1.0, usage: BASE_USAGE });
     await h.run();
 
-    expect(chargedTokens(h.pgCalls)).toBe(171);
-    expect(chargedTokens(h.pgCalls)).not.toBe(1200);
+    expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.1425));
+    expect(chargedTokens(h.pgCalls)).not.toBe(forUsd(1.0));
   });
 
   it('часовой кэш дороже пятиминутного — TTL нельзя схлопывать', async () => {
@@ -142,9 +150,9 @@ describe('SDK-биллинг: взвешенные токены из сырог�
     });
     await long.run();
 
-    // 1.25x против 2x при прочих равных: 171 против 216.
-    expect(chargedTokens(short.pgCalls)).toBe(171);
-    expect(chargedTokens(long.pgCalls)).toBe(216);
+    // 1.25x против 2x при прочих равных: $0.1425 против $0.18.
+    expect(chargedTokens(short.pgCalls)).toBe(forUsd(0.1425));
+    expect(chargedTokens(long.pgCalls)).toBe(forUsd(0.18));
   });
 
   it('дешёвый кэш-ридер платит меньше, чем генератор текста', async () => {
@@ -169,7 +177,7 @@ describe('SDK-биллинг: взвешенные токены из сырог�
     const h = makeHarness({ answer: ANSWER, costUsd: 0.5 });
     await h.run();
 
-    expect(chargedTokens(h.pgCalls)).toBe(600);
+    expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.5));
   });
 
   it('нулевой usage не считается за расход — уходит на costUsd', async () => {
@@ -177,7 +185,7 @@ describe('SDK-биллинг: взвешенные токены из сырог�
     const h = makeHarness({ answer: ANSWER, costUsd: 0.5, usage: zero });
     await h.run();
 
-    expect(chargedTokens(h.pgCalls)).toBe(600);
+    expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.5));
   });
 });
 
@@ -187,11 +195,11 @@ describe('SDK-биллинг: запасные пути', () => {
   afterEach(() => jest.clearAllMocks());
 
   it('списывает от costUsd по курсу, а не по длине ответа', async () => {
-    // 0.5 × 1200 = 600 — заведомо не совпадает с 200 от старой формулы.
+    // Сумма от costUsd заведомо не совпадает с 200 от старой формулы.
     const h = makeHarness({ answer: ANSWER, costUsd: 0.5 });
     await h.run();
 
-    expect(chargedTokens(h.pgCalls)).toBe(600);
+    expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.5));
     expect(chargedTokens(h.pgCalls)).not.toBe(OLD_FORMULA);
   });
 
@@ -228,5 +236,17 @@ describe('SDK-биллинг: запасные пути', () => {
     await h.run();
 
     expect(chargedTokens(h.pgCalls)).toBe(OLD_FORMULA);
+  });
+});
+
+describe('курс сиденья', () => {
+  it('зафиксирован на 3600 — бизнес-решение, а не случайное число', () => {
+    // Выведен из экономики сиденья: пользовательская нагрузка ~$6 400/мес,
+    // цель — выручка 3x стоимости подписки (~48 000 ₽/мес) при цене пакета
+    // 1990 ₽ за 1M токенов. Обоснование целиком — в common/billing-rates.ts.
+    //
+    // Если этот тест покраснел — курс поменяли. Убедись, что это осознанно и
+    // что вместе с ним пересчитаны пакеты и мигрированы балансы пользователей.
+    expect(SEAT_TOKENS_PER_USD).toBe(3600);
   });
 });

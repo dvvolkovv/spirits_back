@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from './tg-grammy.client';
+import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
 
 @Injectable()
 export class TgBillingService {
@@ -12,10 +13,13 @@ export class TgBillingService {
   ) {}
 
   /**
-   * USD-стоимость → Linkeon-токены. Та же формула что в chat/claude-agent.service.ts.
+   * USD-стоимость → Linkeon-токены. Курс общий со всеми путями, которые едят
+   * ёмкость подписки Claude (SDK-путь, Маша) — см. common/billing-rates.ts.
+   * Раньше здесь было 100_000 против 1_200 в SDK-пути: один и тот же доллар
+   * расхода списывался в 83 раза по-разному в зависимости от ассистента.
    */
   tokensFromUsd(usd: number): number {
-    return Math.ceil(usd * 100_000);
+    return Math.ceil(usd * SEAT_TOKENS_PER_USD);
   }
 
   /**

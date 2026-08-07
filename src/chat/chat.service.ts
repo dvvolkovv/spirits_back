@@ -12,6 +12,7 @@ import { TalerIdOauthService } from '../talerid/talerid-oauth.service';
 import { LanguageService } from '../common/services/language.service';
 import axios from 'axios';
 import { Request, Response } from 'express';
+import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
 // Agent server at r.linkeon.io (remote Claude Code)
 
 /** Файл в папке сессии, как его отдаёт relay (`GET /session/:sid/files`). */
@@ -117,17 +118,9 @@ export class ChatService {
 
   // Курс перевода реальной стоимости хода в Linkeon-токены для SDK-пути.
   //
-  // ВНИМАНИЕ: это не то же самое, что курс Маши ($1 = 100_000 токенов). Значение
-  // по умолчанию подобрано РЕВЕНЮ-НЕЙТРАЛЬНЫМ к старой формуле: замер 2026-08-07
-  // дал 253 492 списанных токена при $214.29 реальной стоимости за сутки, то есть
-  // ≈1183 токена за доллар. Смысл перехода на usage не в том, чтобы собрать
-  // больше денег сразу, а в том, чтобы РАСПРЕДЕЛИТЬ плату по реальной нагрузке:
-  // тяжёлый юзер начинает платить кратно больше, лёгкий — меньше, суммарно так же.
-  //
-  // Поднимать курс к 100_000 (единая шкала с Машей) можно только вместе с
-  // перетарификацией пакетов и миграцией балансов — иначе купленные ранее
-  // остатки (на 2026-08-07 это ~7.95M токенов) сгорят за сутки.
-  private readonly TOKENS_PER_USD = Number(process.env.SDK_TOKENS_PER_USD || 1200);
+  // Курс общий для всех путей, которые едят ёмкость подписки Claude —
+  // обоснование и оговорки в common/billing-rates.ts.
+  private readonly TOKENS_PER_USD = SEAT_TOKENS_PER_USD;
 
   // Веса для перевода сырого usage во «взвешенные токены» — это отношения цен
   // Anthropic к цене input-токена. Ключевое свойство: у opus, sonnet и haiku
@@ -487,9 +480,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
         timeoutMs: 90_000,
       });
       rawText = r.text || '';
-      // Биллинг как у Юли: $1 = 100k Linkeon-tokens. Кладём всё в outputTokens
-      // (split input/output здесь не информативен — берём суммарную стоимость).
-      outputTokens = Math.ceil(r.costUsd * 100_000);
+      // Курс общий со всеми путями, которые едят ёмкость подписки Claude —
+      // см. common/billing-rates.ts. Кладём всё в outputTokens (split
+      // input/output здесь не информативен — берём суммарную стоимость).
+      outputTokens = Math.ceil(r.costUsd * SEAT_TOKENS_PER_USD);
       this.logger.log(`Маша claude CLI: cost=$${r.costUsd.toFixed(4)} tokens=${outputTokens}`);
     } catch (e: any) {
       this.logger.error(`Маша claude CLI error: ${e.message}`);
