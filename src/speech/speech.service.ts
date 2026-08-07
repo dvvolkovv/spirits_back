@@ -3,7 +3,6 @@ import { createHash } from 'crypto';
 import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
-import { MiscService } from '../misc/misc.service';
 import { LanguageService } from '../common/services/language.service';
 import { RedisService } from '../common/services/redis.service';
 import { resolveVoice, TtsProvider } from './voices';
@@ -79,7 +78,6 @@ export class SpeechService {
   constructor(
     private readonly pg: PgService,
     private readonly storage: StorageService,
-    private readonly misc: MiscService,
     private readonly language: LanguageService,
     private readonly redis: RedisService,
   ) {}
@@ -189,11 +187,54 @@ export class SpeechService {
       };
     }
 
-    // Списываем только после успешного синтеза и заливки.
-    await this.misc.deductTokens(userId, required);
+    // Списываем только после успешного синтеза и заливки — и УСЛОВНЫМ UPDATE,
+    // а не общим MiscService.deductTokens.
+    //
+    // deductTokens делает безусловный `tokens = tokens - $1`, а проверка баланса
+    // выше — отдельный запрос. Описание инструмента прямо поощряет пачку вызовов
+    // подряд («сценка по ролям»), и параллельные вызовы все читают один и тот же
+    // достаточный баланс, после чего каждый списывает: баланс 1000 и пять
+    // параллельных синтезов дают −4000. Условие `tokens >= $1` делает
+    // проверку и списание одной атомарной операцией.
+    //
+    // Общий deductTokens намеренно НЕ трогаем: им пользуются другие фичи, и
+    // менять его поведение за их спиной опасно.
+    //
+    // Ноль строк = денег не хватило. Синтез к этому моменту уже выполнен и файл
+    // залит — это осознанная плата за то, что списание идёт последним: лучше
+    // один раз впустую сходить к провайдеру, чем увести баланс в минус.
+    //
+    // А строку в speech_clips в этом случае надо убрать компенсацией: пара
+    // (user_id, cache_key) — это и есть кэш, и неоплаченный клип достался бы
+    // пользователю бесплатно при первом же повторе того же текста. Удаляем
+    // адресно по id только что вставленной строки, чтобы не задеть клип
+    // параллельного вызова (тот случай уже отработан веткой ON CONFLICT выше).
+    //
+    // Объект в MinIO остаётся сиротой — он недостижим без строки (getClip ходит
+    // по id + user_id), а ключ детерминирован (audio/<cache_key>.mp3), так что
+    // оплаченный повтор просто перезапишет его тем же содержимым.
+    const clipId = String(ins.rows[0].id);
+    const paid = await this.pg.query(
+      'UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2 AND tokens >= $1 RETURNING tokens',
+      [required, userId],
+    );
+    if (paid.rows.length === 0) {
+      try {
+        await this.pg.query('DELETE FROM speech_clips WHERE id = $1 AND user_id = $2', [clipId, userId]);
+      } catch (e: any) {
+        this.logger.error(`failed to roll back unpaid clip ${clipId}: ${e.message}`);
+      }
+      const cur = await this.pg.query(
+        'SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1',
+        [userId],
+      );
+      const now = Number(cur.rows[0]?.tokens ?? 0);
+      this.logger.warn(`speech deduct lost the race: user=${userId} required=${required} balance=${now}`);
+      return { ok: false, error: 'insufficient_tokens', balance: now, required };
+    }
 
     return {
-      ok: true, clipId: String(ins.rows[0].id), audioUrl: url, durationSec,
+      ok: true, clipId, audioUrl: url, durationSec,
       chars: text.length, voice: resolved.voice, provider: resolved.provider,
       tokensSpent: required, cached: false,
     };

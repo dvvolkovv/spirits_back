@@ -909,6 +909,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       for (let i = 0; i < chunks.length; i++) {
         chunks[i] = chunks[i].replace(/\s*\[VIDEO_JOB:[0-9a-f-]{36}\]\s*/gi, '');
         chunks[i] = chunks[i].replace(/\s*\[CALENDAR_PROPOSAL:[0-9a-f-]{36}\]\s*/gi, '');
+        chunks[i] = chunks[i].replace(/\s*\{\{audio:id=[0-9a-f-]{36}\}\}\s*/gi, '');
       }
 
       // Detect video jobs created during this stream by querying recent jobs.
@@ -953,6 +954,32 @@ ${LanguageService.buildDirective(userLanguage)}`;
         }
       } catch (e: any) {
         this.logger.warn(`calendar marker injection failed: ${e.message}`);
+      }
+
+      // Detect speech clips synthesized during this stream — same mechanism as
+      // video jobs and calendar proposals above. generate_speech идёт через тот
+      // же MCP-bridge и структурных tool_result не даёт, поэтому без этой
+      // дописки плеер у пользователя не появлялся вообще: инструмент отработал,
+      // токены списаны, клип в БД — и всё. Маркер `{{audio:id=<uuid>}}` фронт
+      // уже умеет разбирать (customMarkdown.tsx, AUDIO_CLIP_REGEX).
+      //
+      // Пуш в `chunks` обязателен, а не только safeWrite: из chunks собирается
+      // fullText, который персистится в историю — иначе плеер исчезал бы после
+      // перезагрузки страницы. Border = streamStartTime, scoped to this user.
+      try {
+        const startTimeIso = new Date(streamStartTime).toISOString();
+        const clipsRes = await this.pg.query(
+          `SELECT id FROM speech_clips WHERE user_id = $1 AND created_at >= $2::timestamptz ORDER BY created_at ASC`,
+          [userId, startTimeIso],
+        );
+        if (clipsRes.rows.length > 0) {
+          const markers = clipsRes.rows.map((r: any) => `{{audio:id=${r.id}}}`).join('\n');
+          const tail = '\n\n' + markers;
+          chunks.push(tail);
+          safeWrite({ type: 'item', content: tail });
+        }
+      } catch (e: any) {
+        this.logger.warn(`speech marker injection failed: ${e.message}`);
       }
 
       const fullText = chunks.join('');

@@ -57,19 +57,47 @@ describe('maxCharsFor — потолок свой у каждого провай
   });
 });
 
-/** Минимальные заглушки зависимостей — без сети и БД. */
+/**
+ * Минимальные заглушки зависимостей — без сети и БД.
+ *
+ * Баланс — настоящее изменяемое состояние, а UPDATE в заглушке ведёт себя как
+ * Postgres: условие `AND tokens >= $1` берётся ИЗ ТЕКСТА запроса. Уберёшь
+ * условие в сервисе — заглушка спишет безусловно и уведёт баланс в минус,
+ * ровно как боевая БД. Иначе тест на гонку был бы декоративным.
+ */
 function makeService(overrides: any = {}) {
-  const rows: Record<string, any[]> = { clips: [] };
+  const rows: { clips: any[] } = { clips: [] };
+  const state = { balance: overrides.balance ?? 100000 };
+  /** Каждое фактическое списание: (userId, amount). */
+  const deduct = jest.fn();
+  /** Каждый откат неоплаченного клипа: (clipId, userId). */
+  const deleted = jest.fn();
+  let clipSeq = 0;
 
   const pg = {
     query: jest.fn(async (sql: string, params: any[] = []) => {
+      if (/UPDATE ai_profiles_consolidated SET tokens = tokens - \$1/.test(sql)) {
+        const [amount, uid] = params;
+        const guarded = /tokens >= \$1/.test(sql);
+        if (guarded && state.balance < amount) return { rows: [] };
+        state.balance -= amount;
+        deduct(uid, amount);
+        return { rows: [{ tokens: state.balance }] };
+      }
+      if (/DELETE FROM speech_clips/.test(sql)) {
+        const [id, uid] = params;
+        const before = rows.clips.length;
+        rows.clips = rows.clips.filter((c) => !(c.id === id && c.user_id === uid));
+        deleted(id, uid);
+        return { rows: [], rowCount: before - rows.clips.length };
+      }
       if (/FROM speech_clips/.test(sql)) {
         const hit = rows.clips.find((c) => c.user_id === params[0] && c.cache_key === params[1]);
         return { rows: hit ? [hit] : [] };
       }
       if (/INSERT INTO speech_clips/.test(sql)) {
         const row = {
-          id: 'clip-1', user_id: params[0], assistant_id: params[1], cache_key: params[2],
+          id: `clip-${++clipSeq}`, user_id: params[0], assistant_id: params[1], cache_key: params[2],
           url: params[3], duration_sec: params[4], chars: params[5],
           provider: params[6], voice: params[7], lang: params[8],
         };
@@ -77,25 +105,24 @@ function makeService(overrides: any = {}) {
         return { rows: [row] };
       }
       if (/preferred_agent/.test(sql)) return { rows: [{ preferred_agent: 'Роман', profile_data: {} }] };
-      if (/SELECT tokens/.test(sql)) return { rows: [{ tokens: overrides.balance ?? 100000 }] };
+      if (/SELECT tokens/.test(sql)) return { rows: [{ tokens: state.balance }] };
       return { rows: [] };
     }),
   };
 
   const storage = { upload: jest.fn(async () => 'https://minio.test/linkeon-assets/audio/x.mp3') };
-  const misc = { deductTokens: jest.fn(async () => undefined) };
   const language = { resolveUserLanguage: jest.fn(async () => overrides.lang ?? 'ru') };
   const redis = { incr: jest.fn(async () => 1), expire: jest.fn(async () => undefined) };
 
-  const svc = new SpeechService(pg as any, storage as any, misc as any, language as any, redis as any);
+  const svc = new SpeechService(pg as any, storage as any, language as any, redis as any);
   // Подменяем сетевые вызовы — тестируем оркестрацию, не HTTP.
   (svc as any).synthesizeWith = jest.fn(async () => Buffer.from('fake-mp3-bytes'));
-  return { svc, pg, storage, misc, language, redis };
+  return { svc, pg, storage, deduct, deleted, rows, state, language, redis };
 }
 
 describe('SpeechService.synthesize', () => {
   it('успешный синтез списывает токены и возвращает клип', async () => {
-    const { svc, misc, storage } = makeService();
+    const { svc, deduct, storage } = makeService();
     const r = await svc.synthesize('u1', { text: 'Привет, это тест' });
 
     expect(r.ok).toBe(true);
@@ -104,11 +131,11 @@ describe('SpeechService.synthesize', () => {
     expect(r.tokensSpent).toBe(1000);
     expect(r.cached).toBe(false);
     expect(storage.upload).toHaveBeenCalledTimes(1);
-    expect(misc.deductTokens).toHaveBeenCalledWith('u1', 1000);
+    expect(deduct).toHaveBeenCalledWith('u1', 1000);
   });
 
   it('повтор того же текста берётся из кэша и не стоит токенов', async () => {
-    const { svc, misc, storage } = makeService();
+    const { svc, deduct, storage } = makeService();
     await svc.synthesize('u1', { text: 'Привет' });
     const second = await svc.synthesize('u1', { text: 'Привет' });
 
@@ -117,7 +144,7 @@ describe('SpeechService.synthesize', () => {
     expect(second.cached).toBe(true);
     expect(second.tokensSpent).toBe(0);
     expect(storage.upload).toHaveBeenCalledTimes(1);
-    expect(misc.deductTokens).toHaveBeenCalledTimes(1);
+    expect(deduct).toHaveBeenCalledTimes(1);
   });
 
   it('смена голоса обходит кэш', async () => {
@@ -128,7 +155,7 @@ describe('SpeechService.synthesize', () => {
   });
 
   it('при нехватке баланса не синтезирует и не списывает', async () => {
-    const { svc, misc, storage } = makeService({ balance: 500 });
+    const { svc, deduct, storage } = makeService({ balance: 500 });
     const r = await svc.synthesize('u1', { text: 'Привет' });
 
     expect(r.ok).toBe(false);
@@ -140,7 +167,7 @@ describe('SpeechService.synthesize', () => {
     expect(err.required).toBe(1000);
     expect(err.balance).toBe(500);
     expect(storage.upload).not.toHaveBeenCalled();
-    expect(misc.deductTokens).not.toHaveBeenCalled();
+    expect(deduct).not.toHaveBeenCalled();
   });
 
   it('на русском потолок 2000 символов — 2001 отклоняется без синтеза', async () => {
@@ -179,12 +206,12 @@ describe('SpeechService.synthesize', () => {
   });
 
   it('за упавший синтез токены не списываются', async () => {
-    const { svc, misc } = makeService();
+    const { svc, deduct } = makeService();
     (svc as any).synthesizeWith = jest.fn(async () => { throw new Error('Yandex TTS 503'); });
 
     const r = await svc.synthesize('u1', { text: 'Привет' });
     expect(r.ok).toBe(false);
-    expect(misc.deductTokens).not.toHaveBeenCalled();
+    expect(deduct).not.toHaveBeenCalled();
   });
 
   it('английский язык уводит на openai-голос', async () => {
@@ -197,7 +224,7 @@ describe('SpeechService.synthesize', () => {
   });
 
   it('гонку выиграл параллельный вызов — отдаём его клип и не списываем повторно', async () => {
-    const { svc, pg, misc } = makeService();
+    const { svc, pg, deduct } = makeService();
     // INSERT ... ON CONFLICT DO NOTHING вернул ноль строк: параллельный вызов
     // успел вставить ту же пару (user_id, cache_key) и уже оплатил синтез.
     let insertSeen = false;
@@ -219,7 +246,90 @@ describe('SpeechService.synthesize', () => {
     expect(r.clipId).toBe('clip-parallel');
     expect(r.cached).toBe(true);
     expect(r.tokensSpent).toBe(0);
-    expect(misc.deductTokens).not.toHaveBeenCalled();
+    expect(deduct).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Гонка баланса. Проверка баланса и списание — два разных запроса, а описание
+ * инструмента прямо поощряет пачку синтезов подряд («сценка по ролям»). При
+ * безусловном `tokens = tokens - $1` все параллельные вызовы читают один и тот
+ * же достаточный баланс и списывают каждый: 1000 на счету и пять вызовов по
+ * 1000 давали −4000.
+ *
+ * Лечится условным UPDATE `... AND tokens >= $1 RETURNING tokens` — проверка и
+ * списание становятся одной атомарной операцией. Ноль строк = денег не хватило.
+ */
+describe('SpeechService — гонка баланса при параллельных синтезах', () => {
+  it('пять параллельных вызовов при балансе на один: платит один, баланс не уходит в минус', async () => {
+    const { svc, state, deduct } = makeService({ balance: 1000 });
+
+    // Разные тексты — чтобы кэш не схлопнул вызовы в один и гонка была настоящей.
+    const results = await Promise.all(
+      ['раз', 'два', 'три', 'четыре', 'пять'].map((t) => svc.synthesize('u1', { text: t })),
+    );
+
+    expect(state.balance).toBe(0);
+    expect(state.balance).toBeGreaterThanOrEqual(0);
+    expect(deduct).toHaveBeenCalledTimes(1);
+
+    const okCount = results.filter((r) => r.ok).length;
+    expect(okCount).toBe(1);
+
+    const failed = results.filter((r) => !r.ok) as any[];
+    expect(failed).toHaveLength(4);
+    for (const f of failed) {
+      expect(f.error).toBe('insufficient_tokens');
+      expect(f.required).toBe(1000);
+      expect(f.balance).toBe(0);
+    }
+  });
+
+  it('неоплаченный клип откатывается из БД — иначе он попал бы в кэш бесплатно', async () => {
+    const { svc, state, deduct, deleted, rows } = makeService({ balance: 1000 });
+
+    const [winner, loser] = await Promise.all([
+      svc.synthesize('u1', { text: 'раз' }),
+      svc.synthesize('u1', { text: 'два' }),
+    ]);
+    const paidOk = [winner, loser].filter((r) => r.ok);
+    expect(paidOk).toHaveLength(1);
+    expect(state.balance).toBe(0);
+    expect(deduct).toHaveBeenCalledTimes(1);
+
+    // В БД остаётся ровно один клип — оплаченный. Строка проигравшего снесена
+    // компенсацией сразу после провалившегося списания.
+    expect(rows.clips).toHaveLength(1);
+    expect(deleted).toHaveBeenCalledTimes(1);
+
+    // Повтор текста, за который не заплатили, обязан снова упереться в баланс,
+    // а не отдаться бесплатно из кэша.
+    const failedText = (winner as any).ok ? 'два' : 'раз';
+    const retry: any = await svc.synthesize('u1', { text: failedText });
+    expect(retry.ok).toBe(false);
+    expect(retry.error).toBe('insufficient_tokens');
+    expect(deduct).toHaveBeenCalledTimes(1);
+    expect(state.balance).toBe(0);
+
+    // Оплаченный клип, наоборот, из кэша отдаётся и при нулевом балансе.
+    const paidText = (winner as any).ok ? 'раз' : 'два';
+    const cachedRetry: any = await svc.synthesize('u1', { text: paidText });
+    expect(cachedRetry.ok).toBe(true);
+    expect(cachedRetry.cached).toBe(true);
+    expect(cachedRetry.tokensSpent).toBe(0);
+  });
+
+  it('списание идёт условным UPDATE, а не безусловным deductTokens', async () => {
+    const { svc, pg } = makeService();
+    await svc.synthesize('u1', { text: 'Привет' });
+
+    const upd = (pg.query as jest.Mock).mock.calls
+      .map((c: any[]) => String(c[0]))
+      .find((sql: string) => /UPDATE ai_profiles_consolidated SET tokens/.test(sql));
+
+    expect(upd).toBeDefined();
+    expect(upd).toMatch(/tokens >= \$1/);
+    expect(upd).toMatch(/RETURNING tokens/);
   });
 });
 
@@ -259,7 +369,7 @@ describe('SpeechService — rate limit', () => {
 
 describe('SpeechService — ретрай провайдера', () => {
   it('одна неудача ретраится и вызов завершается успешно', async () => {
-    const { svc, misc } = makeService();
+    const { svc, deduct } = makeService();
     const inner = jest.fn()
       .mockRejectedValueOnce(new Error('ECONNRESET'))
       .mockResolvedValueOnce(Buffer.from('fake-mp3-bytes'));
@@ -272,11 +382,11 @@ describe('SpeechService — ретрай провайдера', () => {
     const r = await svc.synthesize('u1', { text: 'Привет' });
     expect(r.ok).toBe(true);
     expect(inner).toHaveBeenCalledTimes(2);
-    expect(misc.deductTokens).toHaveBeenCalledTimes(1);
+    expect(deduct).toHaveBeenCalledTimes(1);
   });
 
   it('две неудачи подряд — отказ, ретраев ровно два вызова', async () => {
-    const { svc, misc } = makeService();
+    const { svc, deduct } = makeService();
     const inner = jest.fn().mockRejectedValue(new Error('Yandex TTS 503'));
     // makeService глушит synthesizeWith целиком — но ретрай живёт именно в нём,
     // поэтому здесь заглушку снимаем (возвращая настоящий метод с прототипа)
@@ -287,6 +397,6 @@ describe('SpeechService — ретрай провайдера', () => {
     const r = await svc.synthesize('u1', { text: 'Привет' });
     expect(r.ok).toBe(false);
     expect(inner).toHaveBeenCalledTimes(2);
-    expect(misc.deductTokens).not.toHaveBeenCalled();
+    expect(deduct).not.toHaveBeenCalled();
   });
 });

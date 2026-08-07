@@ -24,6 +24,35 @@ describe('generate_speech', () => {
     expect(r.tokensSpent).toBe(1000);
   });
 
+  it('audioUrl наружу НЕ отдаётся — иначе модель вставит голый URL MinIO в ответ', async () => {
+    const { svc } = makeTools({
+      ok: true, clipId: 'c1', audioUrl: 'https://minio.test/linkeon-assets/audio/abc.mp3',
+      durationSec: 3.2, chars: 48, voice: 'zahar', provider: 'yandex',
+      tokensSpent: 1000, cached: false,
+    });
+
+    const r: any = await svc.executeTool('u1', 'generate_speech', { text: 'Привет' });
+
+    // Результат инструмента уходит в контекст модели. Инструкция «не придумывай
+    // ссылку» не мешает ей вставить ссылку, которую ей же и дали.
+    expect(r).not.toHaveProperty('audioUrl');
+    expect(JSON.stringify(r)).not.toContain('minio');
+    expect(JSON.stringify(r)).not.toContain('.mp3');
+  });
+
+  it('состав полей результата зафиксирован — ничего лишнего в контекст модели', async () => {
+    const { svc } = makeTools({
+      ok: true, clipId: 'c1', audioUrl: 'https://minio.test/a.mp3',
+      durationSec: 3.2, chars: 48, voice: 'zahar', provider: 'yandex',
+      tokensSpent: 1000, cached: false,
+    });
+
+    const r: any = await svc.executeTool('u1', 'generate_speech', { text: 'Привет' });
+    expect(Object.keys(r).sort()).toEqual(
+      ['cached', 'chars', 'clipId', 'durationSec', 'kind', 'ok', 'tokensSpent', 'voice'].sort(),
+    );
+  });
+
   it('нехватка токенов прокидывается как есть', async () => {
     const { svc } = makeTools({ ok: false, error: 'insufficient_tokens', balance: 10, required: 1000 });
     const r: any = await svc.executeTool('u1', 'generate_speech', { text: 'Привет' });

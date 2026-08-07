@@ -301,7 +301,7 @@ export type ToolResult =
       ok: true;
       kind: 'audio';
       clipId: string;
-      audioUrl: string;
+      /** audioUrl намеренно отсутствует — см. ветку generate_speech в executeTool. */
       durationSec: number;
       chars: number;
       voice: string;
@@ -439,8 +439,13 @@ export class ChatToolsService {
           voice: typeof input?.voice === 'string' ? input.voice : undefined,
         });
         if (!r.ok) return r as any;
+        // audioUrl наружу НЕ отдаём. Результат инструмента уходит в контекст
+        // модели, и инструкция «не придумывай ссылку» не мешает ей вставить
+        // ссылку, которую ей же и дали — пользователь видел голый URL MinIO
+        // рядом с плеером. Плеер собирается из clipId маркером
+        // `{{audio:id=<uuid>}}`, сам URL модели не нужен.
         return {
-          ok: true, kind: 'audio', clipId: r.clipId, audioUrl: r.audioUrl,
+          ok: true, kind: 'audio', clipId: r.clipId,
           durationSec: r.durationSec, chars: r.chars, voice: r.voice,
           tokensSpent: r.tokensSpent, cached: r.cached,
         };
