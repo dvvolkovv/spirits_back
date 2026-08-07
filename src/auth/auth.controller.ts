@@ -158,7 +158,15 @@ export class AuthController {
       return res.set(CORS).status(429).json({ error: 'rate_limit', reason: (rl as { ok: false; reason: string }).reason });
     }
     const token = await this.email.generateMagicToken(rawEmail);
-    await this.email.sendMagicLink(rawEmail, token);
+    try {
+      await this.email.sendMagicLink(rawEmail, token);
+    } catch (e) {
+      // Внятный код вместо необработанного 500: экран входа покажет
+      // «Не удалось отправить ссылку», и человек поймёт, что надо повторить,
+      // вместо того чтобы смотреть на вечный спиннер (инцидент 2026-08-07).
+      this.logger.error(`magic-link не отправлен на ${rawEmail}: ${(e as Error).message}`);
+      return res.set(CORS).status(502).json({ error: 'mail_failed' });
+    }
     return res.set(CORS).status(200).json({ sent: true });
   }
 

@@ -7,6 +7,13 @@ import * as nodemailer from 'nodemailer';
 import { RedisService } from '../common/services/redis.service';
 import { PgService } from '../common/services/pg.service';
 
+/**
+ * Верхняя граница ожидания отправки письма на уровне сервиса.
+ * Настраивается переменной окружения — чтобы тест не ждал реальные 12 секунд
+ * и не зависел от загруженности машины.
+ */
+const SEND_TIMEOUT_MS = parseInt(process.env.SMTP_SEND_TIMEOUT_MS || '12000', 10);
+
 @Injectable()
 export class EmailService {
   private readonly logger = new Logger(EmailService.name);
@@ -26,6 +33,13 @@ export class EmailService {
         port: parseInt(process.env.SMTP_PORT || '25'),
         secure: false,
         tls: { rejectUnauthorized: false },
+        // Умолчания nodemailer здесь неприемлемы: 2 минуты на соединение и
+        // 10 минут на сокет. Ответ на POST /webhook/auth/email/request ждёт
+        // отправки, поэтому недоступный SMTP превращался в вечный спиннер на
+        // экране входа — ни успеха, ни ошибки (инцидент 2026-08-07).
+        connectionTimeout: 7000,
+        greetingTimeout: 7000,
+        socketTimeout: 10000,
       });
     }
   }
@@ -70,7 +84,11 @@ export class EmailService {
       this.logger.warn(`SMTP not configured. Magic-link for ${email}: ${url}`);
       return;
     }
-    await this.transporter.sendMail({
+    // Жёсткий предохранитель поверх таймаутов транспорта: они покрывают
+    // соединение и сокет, но не гарантируют, что промис вообще завершится
+    // (наблюдалось на test.linkeon.io — 40+ секунд без ответа). Здесь мы
+    // гарантируем верхнюю границу ожидания на уровне сервиса.
+    const send = this.transporter.sendMail({
       from: this.fromAddress,
       to: email,
       subject: 'Вход в linkeon.io',
@@ -80,6 +98,22 @@ export class EmailService {
         <p>Ссылка действует 10 минут. Если ты не запрашивал вход — просто игнорируй это письмо.</p>
       `,
     });
+
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        send,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`SMTP timeout: письмо на ${email} не ушло за ${SEND_TIMEOUT_MS} мс`)),
+            SEND_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+
     this.logger.log(`magic-link sent to ${email}`);
   }
 
