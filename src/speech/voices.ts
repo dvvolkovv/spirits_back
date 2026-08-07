@@ -31,12 +31,16 @@ export const VOICE_CATALOG: VoiceEntry[] = [
   { id: 'anton',     provider: 'yandex', gender: 'm', title: 'Антон',     description: 'спокойный мужской' },
 
   // ── OpenAI tts-1 (не-ru) ─────────────────────────────────────────────
-  { id: 'alloy',   provider: 'openai', gender: 'f', title: 'Alloy',   description: 'нейтральный, ровный' },
-  { id: 'nova',    provider: 'openai', gender: 'f', title: 'Nova',    description: 'тёплый женский' },
-  { id: 'shimmer', provider: 'openai', gender: 'f', title: 'Shimmer', description: 'светлый женский' },
-  { id: 'echo',    provider: 'openai', gender: 'm', title: 'Echo',    description: 'ровный мужской' },
-  { id: 'onyx',    provider: 'openai', gender: 'm', title: 'Onyx',    description: 'глубокий мужской' },
-  { id: 'fable',   provider: 'openai', gender: 'm', title: 'Fable',   description: 'повествовательный, мягкий' },
+  // Описания по-английски намеренно: провайдер выбирается по языку пользователя,
+  // поэтому эти голоса видит в настройках только не-русскоязычный интерфейс.
+  // Русское описание там смотрелось бы чужеродно (каталог отдаётся как данные и
+  // на фронте не переводится).
+  { id: 'alloy',   provider: 'openai', gender: 'f', title: 'Alloy',   description: 'neutral, even-toned' },
+  { id: 'nova',    provider: 'openai', gender: 'f', title: 'Nova',    description: 'warm female' },
+  { id: 'shimmer', provider: 'openai', gender: 'f', title: 'Shimmer', description: 'bright female' },
+  { id: 'echo',    provider: 'openai', gender: 'm', title: 'Echo',    description: 'steady male' },
+  { id: 'onyx',    provider: 'openai', gender: 'm', title: 'Onyx',    description: 'deep male' },
+  { id: 'fable',   provider: 'openai', gender: 'm', title: 'Fable',   description: 'narrative, soft' },
 ];
 
 /** Дефолты по ассистентам. Ключ — имя из agents.name (оно же preferred_agent). */
