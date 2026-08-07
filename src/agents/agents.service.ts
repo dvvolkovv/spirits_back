@@ -14,6 +14,17 @@ export class AgentsService {
   }
 
   /**
+   * Служебные строки таблицы agents, которые НЕ являются ассистентами для выбора
+   * пользователем. Существуют только как носители system_prompt для отдельных
+   * фич и адресуются по id из своего кода, а не через экран выбора.
+   *
+   * `getAgents` отдаёт таблицу целиком, поэтому без этого фильтра любая такая
+   * строка автоматически превращается в карточку на экране выбора ассистента и
+   * в строку в настройках голосов.
+   */
+  private static readonly SERVICE_AGENTS = ['linkeon_voice'];
+
+  /**
    * Локаль приходит query-параметром, а не из профиля: эндпоинт /webhook/agents
    * публичный (без JwtGuard), userId там недоступен.
    * Незаполненный перевод деградирует в русские колонки, а не в пустоту.
@@ -31,8 +42,9 @@ export class AgentsService {
                 ON t.entity_type = 'agent'
                AND t.entity_id   = a.id::text
                AND t.locale      = $1
+        WHERE a.name <> ALL($2::text[])
         ORDER BY a.id`,
-      [lang],
+      [lang, AgentsService.SERVICE_AGENTS],
     );
     return res.rows;
   }
