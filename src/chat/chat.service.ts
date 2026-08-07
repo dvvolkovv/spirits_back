@@ -69,6 +69,20 @@ export class ChatService {
   // total_cost_usd из ClaudeCliService.
   private readonly SDK_TEXT_MULTIPLIER = 2;
 
+  // Курс перевода реальной стоимости хода в Linkeon-токены для SDK-пути.
+  //
+  // ВНИМАНИЕ: это не то же самое, что курс Маши ($1 = 100_000 токенов). Значение
+  // по умолчанию подобрано РЕВЕНЮ-НЕЙТРАЛЬНЫМ к старой формуле: замер 2026-08-07
+  // дал 253 492 списанных токена при $214.29 реальной стоимости за сутки, то есть
+  // ≈1183 токена за доллар. Смысл перехода на usage не в том, чтобы собрать
+  // больше денег сразу, а в том, чтобы РАСПРЕДЕЛИТЬ плату по реальной нагрузке:
+  // тяжёлый юзер начинает платить кратно больше, лёгкий — меньше, суммарно так же.
+  //
+  // Поднимать курс к 100_000 (единая шкала с Машей) можно только вместе с
+  // перетарификацией пакетов и миграцией балансов — иначе купленные ранее
+  // остатки (на 2026-08-07 это ~7.95M токенов) сгорят за сутки.
+  private readonly TOKENS_PER_USD = Number(process.env.SDK_TOKENS_PER_USD || 1200);
+
   // Идемпотентность отправки: гасит дубли от повторных запросов (обрыв связи,
   // таймаут стрима, двойной тап) — второй идентичный запрос НЕ запускает агента
   // и НЕ списывает токены, пока первый «в полёте» или только что завершился.
@@ -707,6 +721,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
     const streamStartTime = Date.now();
     const chunks: string[] = []; // hoisted so catch block can access partial response
+    // Реальная стоимость хода в USD — приходит от file-agent в событии `done`
+    // (сумма total_cost_usd по всем result-событиям Claude CLI, включая
+    // субагентов и внутренние ретраи). Объявлено здесь, а не внутри
+    // callUpstreamOnce: self-heal может дёрнуть upstream дважды, и оба прогона
+    // реально оплачены — считаем оба.
+    let agentCostUsd = 0;
 
     // Single persistence point — dedupe via `saved` flag so success and error paths
     // both call but only one actually writes.
@@ -748,7 +768,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
       const aiText = fullText
         || (final ? '_Ответ не пришёл. Попробуйте отправить сообщение ещё раз._' : '');
       if (!aiText) return; // skip empty intermediate persists
-      const textCost = fullText.length * this.SDK_TEXT_MULTIPLIER;
+      // ЭТО реальная точка списания (ниже addTokenTask). Считаем так же, как для
+      // показа юзеру в `end`: от реальной стоимости хода, с откатом на длину
+      // текста, если costUsd не пришёл (старая сборка релея или обрыв до `done`).
+      const textCost = agentCostUsd > 0
+        ? Math.ceil(agentCostUsd * this.TOKENS_PER_USD)
+        : fullText.length * this.SDK_TEXT_MULTIPLIER;
       try {
         const sessOverride = fresh ? freshSessionId : undefined;
         if (userMsgPersisted) {
@@ -827,6 +852,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
                       safeWrite({ type: 'item', content: ev.text });
                     }
                   } else if (ev.type === 'done') {
+                    if (typeof ev.costUsd === 'number' && ev.costUsd > 0) {
+                      agentCostUsd += ev.costUsd;
+                    }
                     // Collect output files info if any
                     if (ev.outputFiles && ev.outputFiles.length > 0) {
                       const fileLinks = ev.outputFiles
@@ -997,9 +1025,25 @@ ${LanguageService.buildDirective(userLanguage)}`;
       }
 
       const fullText = chunks.join('');
-      // Text cost: длина ответа × SDK-множитель. Картинки/видео списываются
-      // их MCP-сервисами отдельно (см. toolSpent ниже).
-      const tokensUsed = fullText.length * this.SDK_TEXT_MULTIPLIER;
+      // Text cost. Основной путь — от РЕАЛЬНОЙ стоимости хода: file-agent
+      // присылает costUsd в событии `done`, мы переводим его в Linkeon-токены
+      // по курсу TOKENS_PER_USD. Старая формула (длина ответа × множитель)
+      // осталась запасной: она игнорировала input и кэш, то есть ~90% расхода,
+      // и потому не зависела от того, сколько работы реально выполнено.
+      // Fallback нужен, если релей ещё старой сборки и costUsd не шлёт —
+      // иначе ход стал бы бесплатным.
+      // Картинки/видео списываются MCP-сервисами отдельно (см. toolSpent ниже).
+      const tokensUsed = agentCostUsd > 0
+        ? Math.ceil(agentCostUsd * this.TOKENS_PER_USD)
+        : fullText.length * this.SDK_TEXT_MULTIPLIER;
+      if (agentCostUsd > 0) {
+        this.logger.log(
+          `billing: usage-based cost=$${agentCostUsd.toFixed(4)} tokens=${tokensUsed} ` +
+          `(старая формула дала бы ${fullText.length * this.SDK_TEXT_MULTIPLIER})`,
+        );
+      } else {
+        this.logger.warn('billing: costUsd от file-agent не пришёл — списываю по длине текста');
+      }
 
       // Sum up tool-charged tokens (image, video, etc.) during this stream.
       // MCP-tools (MiscService.generateImage, VideoService.createJob,
