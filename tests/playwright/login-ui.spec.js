@@ -195,4 +195,26 @@ test.describe('экран входа', () => {
     await page.getByTestId('email-submit-btn').click();
     await expect(page.locator('body')).toContainText(/Проверь почту|Проверьте почту/, { timeout: 15000 });
   });
+
+  test('форма кликабельна без согласия, неактивна только кнопка', async ({ page }) => {
+    // До пересборки весь блок шёл под opacity-40 pointer-events-none.
+    await openLogin(page);
+    await page.getByTestId('email-input').fill('someone@example.com');
+    await expect(page.getByTestId('email-input')).toHaveValue('someone@example.com');
+    await expect(page.getByTestId('email-submit-btn')).toBeDisabled();
+    await expect(page.getByTestId('oauth-yandex')).toBeDisabled();
+    await expect(page.locator('body')).not.toContainText('Сначала примите условия');
+
+    await page.getByTestId('consent-checkbox').check();
+    await expect(page.getByTestId('email-submit-btn')).toBeEnabled();
+    await expect(page.getByTestId('oauth-yandex')).toBeEnabled();
+  });
+
+  test('переключение формы работает в обе стороны', async ({ page }) => {
+    await openLogin(page);
+    await page.getByTestId('switch-to-phone').click();
+    await expect(page.getByTestId('phone-input')).toBeVisible();
+    await page.getByTestId('switch-to-email').click();
+    await expect(page.getByTestId('email-input')).toBeVisible();
+  });
 });
