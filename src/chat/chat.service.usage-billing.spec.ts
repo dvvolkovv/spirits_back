@@ -34,8 +34,11 @@ interface Harness {
   run: () => Promise<void>;
 }
 
-/** `costUsd: null` — релей старой сборки, поле вообще не приходит. */
-function makeHarness(opts: { answer: string; costUsd: number | null }): Harness {
+/**
+ * `costUsd: null` — релей старой сборки, поле вообще не приходит.
+ * `usage` — сырой расход; если не задан, проверяется откат на costUsd.
+ */
+function makeHarness(opts: { answer: string; costUsd: number | null; usage?: Record<string, number> }): Harness {
   const pgCalls: { sql: string; params: any[] }[] = [];
 
   const pg = {
@@ -67,6 +70,7 @@ function makeHarness(opts: { answer: string; costUsd: number | null }): Harness 
 
   const done: any = { type: 'done' };
   if (opts.costUsd !== null) done.costUsd = opts.costUsd;
+  if (opts.usage) done.usage = opts.usage;
 
   (axios.post as jest.Mock).mockResolvedValue({
     data: sseStream([{ type: 'delta', text: opts.answer }, done]),
@@ -106,7 +110,78 @@ function chargedTokens(pgCalls: { sql: string; params: any[] }[]): number | unde
 
 const ANSWER = 'x'.repeat(100); // старая формула: 100 × 2 = 200 токенов
 
-describe('SDK-биллинг по реальному usage', () => {
+describe('SDK-биллинг: взвешенные токены из сырого usage', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  // Веса — отношения цен Anthropic к input: read 0.1, запись 5м 1.25,
+  // запись 1ч 2, output 5. Единица переводится в доллары по $5/MTok (opus-5),
+  // дальше в Linkeon-токены по курсу 1200/$.
+  const BASE_USAGE = {
+    input: 1000, output: 1000, cacheRead: 100_000,
+    cacheWrite5m: 10_000, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
+  };
+
+  it('считает по взвешенной формуле, а не по costUsd', async () => {
+    // 1000 + 0.1×100000 + 1.25×10000 + 5×1000 = 28 500 единиц
+    // 28 500 × $5/MTok = $0.1425 → ×1200 = 171 токен.
+    // costUsd намеренно вранья — если код возьмёт его, получится 1200.
+    const h = makeHarness({ answer: ANSWER, costUsd: 1.0, usage: BASE_USAGE });
+    await h.run();
+
+    expect(chargedTokens(h.pgCalls)).toBe(171);
+    expect(chargedTokens(h.pgCalls)).not.toBe(1200);
+  });
+
+  it('часовой кэш дороже пятиминутного — TTL нельзя схлопывать', async () => {
+    const short = makeHarness({ answer: ANSWER, costUsd: 0, usage: BASE_USAGE });
+    await short.run();
+
+    const long = makeHarness({
+      answer: ANSWER, costUsd: 0,
+      usage: { ...BASE_USAGE, cacheWrite5m: 0, cacheWrite1h: 10_000 },
+    });
+    await long.run();
+
+    // 1.25x против 2x при прочих равных: 171 против 216.
+    expect(chargedTokens(short.pgCalls)).toBe(171);
+    expect(chargedTokens(long.pgCalls)).toBe(216);
+  });
+
+  it('дешёвый кэш-ридер платит меньше, чем генератор текста', async () => {
+    // Одинаковое число сырых токенов, но у одного это cache_read (0.1x),
+    // у другого output (5x) — разница в цене ровно пятидесятикратная.
+    const reader = makeHarness({
+      answer: ANSWER, costUsd: 0,
+      usage: { ...BASE_USAGE, input: 0, output: 0, cacheRead: 50_000, cacheWrite5m: 0 },
+    });
+    await reader.run();
+
+    const writer = makeHarness({
+      answer: ANSWER, costUsd: 0,
+      usage: { ...BASE_USAGE, input: 0, output: 50_000, cacheRead: 0, cacheWrite5m: 0 },
+    });
+    await writer.run();
+
+    expect(chargedTokens(writer.pgCalls)! / chargedTokens(reader.pgCalls)!).toBeCloseTo(50, 0);
+  });
+
+  it('без usage откатывается на costUsd', async () => {
+    const h = makeHarness({ answer: ANSWER, costUsd: 0.5 });
+    await h.run();
+
+    expect(chargedTokens(h.pgCalls)).toBe(600);
+  });
+
+  it('нулевой usage не считается за расход — уходит на costUsd', async () => {
+    const zero = { input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0 };
+    const h = makeHarness({ answer: ANSWER, costUsd: 0.5, usage: zero });
+    await h.run();
+
+    expect(chargedTokens(h.pgCalls)).toBe(600);
+  });
+});
+
+describe('SDK-биллинг: запасные пути', () => {
   const OLD_FORMULA = ANSWER.length * 2;
 
   afterEach(() => jest.clearAllMocks());

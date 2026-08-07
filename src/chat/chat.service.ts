@@ -18,6 +18,21 @@ import { Request, Response } from 'express';
 export interface SessionFile { name: string; url: string }
 
 /**
+ * Сырой расход хода, как его присылает file-agent в событии `done`.
+ * Записи в кэш разделены по TTL: 5 минут стоят 1.25x input, час — 2x,
+ * складывать их в одно число нельзя.
+ */
+export interface SdkUsageTotals {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite5m: number;
+  cacheWrite1h: number;
+  webSearch: number;
+  webFetch: number;
+}
+
+/**
  * Дособирает ссылки на файлы, которые ассистент оформить не смог.
  *
  * Ассистенту инструкцией запрещено писать пути и URL: их подставляет
@@ -113,6 +128,24 @@ export class ChatService {
   // перетарификацией пакетов и миграцией балансов — иначе купленные ранее
   // остатки (на 2026-08-07 это ~7.95M токенов) сгорят за сутки.
   private readonly TOKENS_PER_USD = Number(process.env.SDK_TOKENS_PER_USD || 1200);
+
+  // Веса для перевода сырого usage во «взвешенные токены» — это отношения цен
+  // Anthropic к цене input-токена. Ключевое свойство: у opus, sonnet и haiku
+  // отношения ОДИНАКОВЫЕ (out = 5x in, cache_read = 0.1x, запись 5м = 1.25x,
+  // запись 1ч = 2x), поэтому единица не зависит от того, какая модель отработала,
+  // и не плывёт, когда Anthropic меняет абсолютные цены.
+  //
+  // Единица = «сколько стоила бы та же работа во входных токенах».
+  private readonly W_INPUT = 1;
+  private readonly W_CACHE_READ = 0.1;
+  private readonly W_CACHE_WRITE_5M = 1.25;
+  private readonly W_CACHE_WRITE_1H = 2;
+  private readonly W_OUTPUT = 5;
+
+  // Цена input-токена модели, на которой крутится SDK-путь (сейчас opus-5, $5/MTok).
+  // Нужна только чтобы перевести взвешенные единицы обратно в доллары и дальше в
+  // токены по единому курсу TOKENS_PER_USD.
+  private readonly SDK_INPUT_USD_PER_MTOK = Number(process.env.SDK_INPUT_USD_PER_MTOK || 5);
 
   // Идемпотентность отправки: гасит дубли от повторных запросов (обрыв связи,
   // таймаут стрима, двойной тап) — второй идентичный запрос НЕ запускает агента
@@ -758,6 +791,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // callUpstreamOnce: self-heal может дёрнуть upstream дважды, и оба прогона
     // реально оплачены — считаем оба.
     let agentCostUsd = 0;
+    // Сырой usage оттуда же. Суммируется по обоим прогонам self-heal, как и стоимость.
+    const agentUsage: SdkUsageTotals = {
+      input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
+    };
 
     // Single persistence point — dedupe via `saved` flag so success and error paths
     // both call but only one actually writes.
@@ -799,12 +836,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
       const aiText = fullText
         || (final ? '_Ответ не пришёл. Попробуйте отправить сообщение ещё раз._' : '');
       if (!aiText) return; // skip empty intermediate persists
-      // ЭТО реальная точка списания (ниже addTokenTask). Считаем так же, как для
-      // показа юзеру в `end`: от реальной стоимости хода, с откатом на длину
-      // текста, если costUsd не пришёл (старая сборка релея или обрыв до `done`).
-      const textCost = agentCostUsd > 0
-        ? Math.ceil(agentCostUsd * this.TOKENS_PER_USD)
-        : fullText.length * this.SDK_TEXT_MULTIPLIER;
+      // ЭТО реальная точка списания (ниже addTokenTask). Логируем только здесь:
+      // путь показа считает то же самое, дублировать в лог незачем.
+      const charge = this.computeSdkCharge(agentUsage, agentCostUsd, fullText.length);
+      const textCost = charge.tokens;
+      const logLine = `billing[${charge.source}]: tokens=${textCost} ${charge.note}`;
+      if (charge.source === 'length') this.logger.warn(logLine);
+      else this.logger.log(logLine);
       try {
         const sessOverride = fresh ? freshSessionId : undefined;
         if (userMsgPersisted) {
@@ -885,6 +923,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
                   } else if (ev.type === 'done') {
                     if (typeof ev.costUsd === 'number' && ev.costUsd > 0) {
                       agentCostUsd += ev.costUsd;
+                    }
+                    if (ev.usage && typeof ev.usage === 'object') {
+                      for (const k of Object.keys(agentUsage) as (keyof SdkUsageTotals)[]) {
+                        const v = ev.usage[k];
+                        if (typeof v === 'number' && v > 0) agentUsage[k] += v;
+                      }
                     }
                     // Collect output files info if any
                     if (ev.outputFiles && ev.outputFiles.length > 0) {
@@ -1059,17 +1103,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Fallback нужен, если релей ещё старой сборки и costUsd не шлёт —
       // иначе ход стал бы бесплатным.
       // Картинки/видео списываются MCP-сервисами отдельно (см. toolSpent ниже).
-      const tokensUsed = agentCostUsd > 0
-        ? Math.ceil(agentCostUsd * this.TOKENS_PER_USD)
-        : fullText.length * this.SDK_TEXT_MULTIPLIER;
-      if (agentCostUsd > 0) {
-        this.logger.log(
-          `billing: usage-based cost=$${agentCostUsd.toFixed(4)} tokens=${tokensUsed} ` +
-          `(старая формула дала бы ${fullText.length * this.SDK_TEXT_MULTIPLIER})`,
-        );
-      } else {
-        this.logger.warn('billing: costUsd от file-agent не пришёл — списываю по длине текста');
-      }
+      // Число для индикатора «X токенов». Считается тем же методом, что и реальное
+      // списание в persistResponse, — иначе юзер увидит одно, а спишется другое.
+      const tokensUsed = this.computeSdkCharge(agentUsage, agentCostUsd, fullText.length).tokens;
 
       // Sum up tool-charged tokens (image, video, etc.) during this stream.
       // MCP-tools (MiscService.generateImage, VideoService.createJob,
@@ -1329,6 +1365,57 @@ ${LanguageService.buildDirective(userLanguage)}`;
        VALUES ($1, 'ai', $2, $3, 'text', $4)`,
       [sessionId, agentNum, assistantMsg, tokensUsed],
     );
+  }
+
+  /**
+   * Сколько Linkeon-токенов списать за ход SDK-пути.
+   *
+   * Три источника по убыванию точности:
+   *   1. сырой usage от file-agent → взвешенные токены (основной путь);
+   *   2. total_cost_usd, если usage не пришёл;
+   *   3. длина ответа × множитель — последний рубеж, чтобы ход не стал бесплатным.
+   *
+   * Возвращает и диагностику: она уходит в лог, чтобы видеть, насколько
+   * взвешенная формула расходится с costUsd. Расхождение = то, чего в четырёх
+   * полях нет (серверные инструменты вроде веб-поиска, разнотипные модели у
+   * субагентов). Пока оно логируется, а не домножается: подгонять коэффициент
+   * имеет смысл по накопленным данным, а не наугад.
+   */
+  private computeSdkCharge(
+    usage: SdkUsageTotals | null,
+    costUsd: number,
+    textLength: number,
+  ): { tokens: number; source: 'usage' | 'cost' | 'length'; note: string } {
+    if (usage && (usage.input || usage.output || usage.cacheRead || usage.cacheWrite5m || usage.cacheWrite1h)) {
+      const weighted =
+        usage.input * this.W_INPUT +
+        usage.cacheRead * this.W_CACHE_READ +
+        usage.cacheWrite5m * this.W_CACHE_WRITE_5M +
+        usage.cacheWrite1h * this.W_CACHE_WRITE_1H +
+        usage.output * this.W_OUTPUT;
+      const impliedUsd = (weighted * this.SDK_INPUT_USD_PER_MTOK) / 1e6;
+      const tokens = Math.max(1, Math.ceil(impliedUsd * this.TOKENS_PER_USD));
+      const drift = costUsd > 0 ? impliedUsd / costUsd : NaN;
+      const note =
+        `weighted=${Math.round(weighted)} implied=$${impliedUsd.toFixed(4)} ` +
+        `reported=$${costUsd.toFixed(4)} ` +
+        (Number.isFinite(drift) ? `покрытие=${(drift * 100).toFixed(0)}%` : 'costUsd нет') +
+        (usage.webSearch ? ` поисков=${usage.webSearch}` : '') +
+        (usage.webFetch ? ` fetch=${usage.webFetch}` : '');
+      return { tokens, source: 'usage', note };
+    }
+    if (costUsd > 0) {
+      return {
+        tokens: Math.ceil(costUsd * this.TOKENS_PER_USD),
+        source: 'cost',
+        note: `usage не пришёл, считаю по costUsd=$${costUsd.toFixed(4)}`,
+      };
+    }
+    return {
+      tokens: textLength * this.SDK_TEXT_MULTIPLIER,
+      source: 'length',
+      note: 'ни usage, ни costUsd — откат на длину текста',
+    };
   }
 
   private async addTokenTask(userId: string, inputTokens: number, outputTokens: number, agentId?: string) {
