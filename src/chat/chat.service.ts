@@ -18,19 +18,25 @@ import { Request, Response } from 'express';
 export interface SessionFile { name: string; url: string }
 
 /**
- * Достраивает ссылки, которые ассистент оставил пустыми: `[Скачать отчёт.pdf]()`.
+ * Дособирает ссылки на файлы, которые ассистент оформить не смог.
  *
- * Ассистенту инструкцией запрещено писать пути и URL — их подставляет
- * платформа. Но она прикладывает только файлы, ИЗМЕНЁННЫЕ за текущий шаг:
+ * Ассистенту инструкцией запрещено писать пути и URL: их подставляет
+ * платформа. Но подставляет она только файлы, ИЗМЕНЁННЫЕ за текущий шаг —
  * relay сравнивает mtime с состоянием на старте запроса. На многошаговой
- * работе это теряет результат — ролики пишутся на одних шагах, итоговый
+ * работе это теряет результат: ролики пишутся на одних шагах, итоговый
  * отчёт собирается на последнем, и к нему не прикладывается ничего, хотя
  * файлы лежат целые.
  *
- * Сопоставляем ТОЛЬКО по именам, которые ассистент уже упомянул, и только
- * если такой файл действительно есть в папке сессии. Полный список к ответу
- * не цепляем: сессия живёт неделями, и это навесило бы десятки ссылок на
- * каждую реплику — так уже было, пришлось откатывать.
+ * Оставшись без механизма, ассистент выкручивается — и каждый раз
+ * по-разному. Наблюдались три формы, все три и обрабатываем:
+ *  1. пустые скобки `[Скачать отчёт.pdf]()`;
+ *  2. адрес в блоке кода — внутри ``` разметка не работает, кликнуть нельзя;
+ *  3. адрес голым текстом — этот фронт подсвечивает сам, трогать не нужно.
+ *
+ * Возвращаем список готовых markdown-ссылок, которые вызывающий дописывает
+ * в конец ответа. Полный список файлов сессии НЕ прикладываем: сессия живёт
+ * неделями, файлов там десятки, и они начали бы липнуть к каждой реплике —
+ * это уже случалось в бою и было откачено.
  */
 export function resolveEmptyFileLinks(
   text: string,
@@ -41,21 +47,46 @@ export function resolveEmptyFileLinks(
   for (const f of files || []) {
     if (f?.name && f?.url) byName.set(String(f.name), String(f.url));
   }
-  if (byName.size === 0) return [];
 
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const m of text.matchAll(/\[([^\]]+)\]\(\s*\)/g)) {
-    const label = String(m[1]);
-    // Метка бывает и «Скачать имя.pdf», и просто «имя.pdf» — берём последнее
-    // слово, похожее на имя файла с расширением.
-    const withExt = label.match(/([^\s/\\]+\.[A-Za-z0-9]{2,5})\s*$/);
-    const name = withExt ? withExt[1] : label.trim();
-    const url = byName.get(name);
-    if (!url || seen.has(name)) continue;
-    seen.add(name);
-    out.push(`[Скачать ${name}](${agentUrl}${url})`);
+
+  /** Уже кликабельно, если адрес стоит внутри `](...)`. */
+  const isLinked = (url: string) =>
+    new RegExp(`\\]\\(\\s*${url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(text);
+
+  const push = (name: string, url: string) => {
+    if (seen.has(url)) return;
+    seen.add(url);
+    out.push(`[Скачать ${name}](${url})`);
+  };
+
+  // 1. Пустые скобки: имя есть, адреса нет.
+  if (byName.size > 0) {
+    for (const m of text.matchAll(/\[([^\]]+)\]\(\s*\)/g)) {
+      const label = String(m[1]);
+      // Метка бывает «Скачать имя.pdf» и просто «имя.pdf» — берём последнее
+      // слово, похожее на имя файла с расширением.
+      const withExt = label.match(/([^\s/\\]+\.[A-Za-z0-9]{2,5})\s*$/);
+      const name = withExt ? withExt[1] : label.trim();
+      const rel = byName.get(name);
+      if (rel) push(name, `${agentUrl}${rel}`);
+    }
   }
+
+  // 2. Готовый адрес в тексте, но не оформленный ссылкой. Чаще всего это
+  //    блок кода: ассистент кладёт туда URL и просит «скопируй строку».
+  const urlRe = new RegExp(
+    `${agentUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/files/[^\\s\`'"<>)\\]]+`,
+    'g',
+  );
+  for (const m of text.matchAll(urlRe)) {
+    const url = String(m[0]);
+    if (isLinked(url)) continue; // уже кликабельно — второй раз не надо
+    const name = decodeURIComponent(url.split('/').pop() || '').trim();
+    if (name) push(name, url);
+  }
+
   return out;
 }
 
@@ -894,29 +925,24 @@ ${LanguageService.buildDirective(userLanguage)}`;
         try { await callUpstreamOnce(); } catch (e: any) { this.logger.warn(`self-heal retry failed: ${e.message}`); }
       }
 
-      // Пустые ссылки на файлы: `[Скачать отчёт.pdf]()` → подставляем адрес.
-      //
-      // Ассистенту инструкцией запрещено писать пути и URL — их подставляет
-      // платформа. Но подставляет она только файлы, ИЗМЕНЁННЫЕ за текущий шаг
-      // (relay сравнивает mtime с состоянием на старте запроса). На
-      // многошаговой работе это теряет результат: ролики собираются на одних
-      // шагах, итоговый отчёт — на последнем, и к нему не прикладывается
-      // ничего, хотя файлы лежат целые. Человек видит «Скачать …» с пустыми
-      // скобками.
-      //
-      // Чиним узко: только те имена, что ассистент уже упомянул пустой
-      // ссылкой, и только если такой файл реально есть в папке сессии.
-      // Полный список к ответу не цепляем — сессия живёт неделями, и это
-      // навесило бы десятки ссылок на каждую реплику.
+      // Ссылки на файлы, которые ассистент оформить не смог — см.
+      // resolveEmptyFileLinks. Две формы: пустые скобки `[Скачать x.pdf]()`
+      // и готовый адрес, набранный текстом (обычно в блоке кода, где
+      // разметка не работает и кликнуть нельзя).
       try {
         const full = chunks.join('');
-        const empty = [...full.matchAll(/\[([^\]]+)\]\(\s*\)/g)];
-        if (empty.length > 0 && !clientDisconnected) {
+        const hasEmpty = /\[[^\]]+\]\(\s*\)/.test(full);
+        const hasBareUrl = full.includes(`${AGENT_URL}/files/`);
+        if ((hasEmpty || hasBareUrl) && !clientDisconnected) {
           const sid = fresh && freshSessionId ? freshSessionId : `${userId}_${assistantId}`;
-          const listed = await axios
-            .get(`${AGENT_URL}/session/${encodeURIComponent(sid)}/files`, { timeout: 10_000 })
-            .then((r) => (Array.isArray(r.data) ? r.data : []))
-            .catch(() => [] as any[]);
+          // Список нужен только чтобы сопоставить ИМЯ из пустых скобок с
+          // адресом. Готовый адрес самодостаточен — ради него relay не дёргаем.
+          const listed = hasEmpty
+            ? await axios
+                .get(`${AGENT_URL}/session/${encodeURIComponent(sid)}/files`, { timeout: 10_000 })
+                .then((r) => (Array.isArray(r.data) ? r.data : []))
+                .catch(() => [] as any[])
+            : [];
 
           const resolved = resolveEmptyFileLinks(full, listed, AGENT_URL);
 
@@ -924,7 +950,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
             const tail = '\n\n' + resolved.join('\n');
             chunks.push(tail);
             safeWrite({ type: 'item', content: tail });
-            this.logger.log(`filled ${resolved.length} empty file link(s) for ${sid}`);
+            this.logger.log(`filled ${resolved.length} file link(s) for ${sid}`);
           }
         }
       } catch (e: any) {

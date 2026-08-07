@@ -67,4 +67,51 @@ describe('resolveEmptyFileLinks', () => {
     const out = resolveEmptyFileLinks('[Скачать montazhnyy-list.csv](   )', files, AGENT);
     expect(out).toHaveLength(1);
   });
+
+  // Реальный случай из чата: ассистент положил адрес в блок кода и написал
+  // «скопируй строку». Внутри ``` разметка не работает — кликнуть нельзя,
+  // и человек говорит «ссылки нет», хотя адрес перед глазами.
+  it('адрес в блоке кода превращается в кликабельную ссылку', () => {
+    const text = [
+      'Итог — версия 3:',
+      '```',
+      'https://r.linkeon.io/files/79030169187_12/film-chernovaya-sborka-v3.mp4',
+      '```',
+      'Дальше нужен твой глаз.',
+    ].join('\n');
+    const out = resolveEmptyFileLinks(text, files, AGENT);
+    expect(out).toEqual([
+      '[Скачать film-chernovaya-sborka-v3.mp4](https://r.linkeon.io/files/79030169187_12/film-chernovaya-sborka-v3.mp4)',
+    ]);
+  });
+
+  it('адреса нет в списке сессии — всё равно оформляем: он уже проверен ассистентом', () => {
+    // Список нужен только для пустых скобок; готовый адрес самодостаточен.
+    const text = 'https://r.linkeon.io/files/sid/otchet.pdf';
+    expect(resolveEmptyFileLinks(text, [], AGENT)).toHaveLength(1);
+  });
+
+  it('уже кликабельная ссылка не дублируется', () => {
+    const text = '[Скачать v3](https://r.linkeon.io/files/79030169187_12/film-chernovaya-sborka-v3.mp4)';
+    expect(resolveEmptyFileLinks(text, files, AGENT)).toEqual([]);
+  });
+
+  it('один адрес, упомянутый дважды, даёт одну ссылку', () => {
+    const text = 'вот: https://r.linkeon.io/files/s/a.mp4 и ещё раз https://r.linkeon.io/files/s/a.mp4';
+    expect(resolveEmptyFileLinks(text, files, AGENT)).toHaveLength(1);
+  });
+
+  it('пустые скобки и адрес на ОДИН файл не дают двух ссылок', () => {
+    const text = '[Скачать montazhnyy-list.csv]() https://r.linkeon.io/files/79030169187_12/montazhnyy-list.csv';
+    expect(resolveEmptyFileLinks(text, files, AGENT)).toHaveLength(1);
+  });
+
+  it('чужие адреса не трогаем', () => {
+    const text = 'Смотри https://example.com/files/secret.pdf и https://my.linkeon.io/chat';
+    expect(resolveEmptyFileLinks(text, files, AGENT)).toEqual([]);
+  });
+
+  it('текст без единого адреса и скобок не даёт ничего', () => {
+    expect(resolveEmptyFileLinks('Правлю кадры, скоро покажу.', files, AGENT)).toEqual([]);
+  });
 });
