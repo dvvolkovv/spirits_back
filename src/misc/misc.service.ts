@@ -433,8 +433,53 @@ ${LanguageService.buildDirective(userLanguage)}`;
     return { ok: Number(res.rows[0]?.tokens || 0) >= required };
   }
 
-  async deductTokens(userId: string, amount: number): Promise<void> {
-    await this.pg.query('UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2', [amount, userId]);
+  /**
+   * Списание ПОСЛЕ уже выполненной работы. Возвращает, сколько списалось
+   * фактически — может быть меньше запрошенного, если баланса не хватило.
+   *
+   * Идёт через consume_user_tokens, а не прямым UPDATE, по двум причинам.
+   *
+   * Первая: прямой `tokens = tokens - $1` уводил баланс в минус. Проверка
+   * баланса у вызывающих — отдельный запрос, между ним и списанием проходят
+   * секунды генерации, и параллельные вызовы читают один и тот же достаточный
+   * баланс, после чего каждый списывает. На 2026-08-08 один пользователь так
+   * оказался на −7 363. Процедура берёт строку под FOR UPDATE и списывает не
+   * больше остатка, поэтому проверка и списание атомарны. Тот же диагноз см. в
+   * SpeechService — там обошли локально своим условным UPDATE.
+   *
+   * Вторая: процедура пишет в token_transactions. У прямых UPDATE записи не
+   * было, и по тому же пользователю нельзя было понять, за что списали — ноль
+   * строк в истории.
+   *
+   * Отказывать здесь нельзя: работа выполнена и результат отдан. Поэтому берём
+   * сколько есть, иначе услуга окажется бесплатной. Случай «не хватило»
+   * вызывающий может отработать по возвращённому числу.
+   */
+  async deductTokens(userId: string, amount: number, description?: string): Promise<number> {
+    if (!(amount > 0)) return 0;
+    try {
+      const r = await this.pg.query(
+        `SELECT consume_user_tokens($1, $2, $3) AS res`,
+        [userId, amount, description ?? null],
+      );
+      const raw = r.rows[0]?.res;
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      const used = Number(parsed?.tokens_used ?? 0);
+      if (used < amount) {
+        this.logger.warn(`deductTokens: ${userId} запрошено ${amount}, списано ${used} — не хватило баланса`);
+      }
+      return used;
+    } catch (e: any) {
+      // Процедуры может не оказаться на старой базе. В минус всё равно не уходим.
+      this.logger.warn(`consume_user_tokens недоступна (${e.message}) — списываю с полом`);
+      await this.pg.query(
+        `UPDATE ai_profiles_consolidated
+            SET tokens = GREATEST(0, tokens - $1), updated_at = now()
+          WHERE user_id = $2`,
+        [amount, userId],
+      );
+      return amount;
+    }
   }
 
   async generateImage(userId: string, body: any): Promise<any> {
@@ -469,10 +514,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       const imageUrl = await this.uploadAssetImage(Buffer.from(b64Image, 'base64'), ext);
 
       // Deduct tokens
-      await this.pg.query(
-        'UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2',
-        [tokenCost, userId],
-      );
+      await this.deductTokens(userId, tokenCost, 'image');
 
       // Save to history
       await this.saveGeneratedImage(userId, prompt, imageUrl, tokenCost);
@@ -592,10 +634,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       const bannerBuffer = await renderBannerOverlay(bgBuffer, { title, subtitle, cta, position, theme, accent });
       const imageUrl = await this.uploadAssetImage(bannerBuffer, 'png');
 
-      await this.pg.query(
-        'UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2',
-        [tokenCost, userId],
-      );
+      await this.deductTokens(userId, tokenCost, 'image');
       const histLabel = `[banner] ${title || subtitle || cta} — ${scene}`.slice(0, 500);
       await this.saveGeneratedImage(userId, histLabel, imageUrl, tokenCost);
 
@@ -692,10 +731,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
       this.logger.log(`${geminiModel} edited image`);
 
-      await this.pg.query(
-        'UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2',
-        [tokenCost, userId],
-      );
+      await this.deductTokens(userId, tokenCost, 'image');
       await this.saveGeneratedImage(userId, `[edit] ${prompt}`, imageUrl, tokenCost);
 
       return { images: [{ url: imageUrl }], tokensSpent: tokenCost };
@@ -778,10 +814,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
       this.logger.log(`${geminiModel} composed image from ${sources.length} sources`);
 
-      await this.pg.query(
-        'UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2',
-        [tokenCost, userId],
-      );
+      await this.deductTokens(userId, tokenCost, 'image');
       await this.saveGeneratedImage(userId, `[compose ${sources.length}] ${prompt}`, imageUrl, tokenCost);
 
       return { images: [{ url: imageUrl }], tokensSpent: tokenCost };

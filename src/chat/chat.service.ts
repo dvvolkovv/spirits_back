@@ -13,6 +13,7 @@ import { LanguageService } from '../common/services/language.service';
 import axios from 'axios';
 import { Request, Response } from 'express';
 import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
+import { sendTelegramAlert } from '../common/telegram-alert';
 // Agent server at r.linkeon.io (remote Claude Code)
 
 /** Файл в папке сессии, как его отдаёт relay (`GET /session/:sid/files`). */
@@ -139,6 +140,12 @@ export class ChatService {
   // Нужна только чтобы перевести взвешенные единицы обратно в доллары и дальше в
   // токены по единому курсу TOKENS_PER_USD.
   private readonly SDK_INPUT_USD_PER_MTOK = Number(process.env.SDK_INPUT_USD_PER_MTOK || 5);
+
+  // Порог алерта на дорогой ход, в долларах реальной стоимости. Обычные ходы
+  // укладываются в $0.05–0.20, тяжёлые с субагентами доходили до $3.7; ход за
+  // $47 у юриста 2026-08-08 прошёл незамеченным. $5 ловит выбросы и молчит на
+  // рабочем потоке.
+  private readonly EXPENSIVE_TURN_ALERT_USD = Number(process.env.SDK_ALERT_USD || 5);
 
   // Идемпотентность отправки: гасит дубли от повторных запросов (обрыв связи,
   // таймаут стрима, двойной тап) — второй идентичный запрос НЕ запускает агента
@@ -837,6 +844,25 @@ ${LanguageService.buildDirective(userLanguage)}`;
       const logLine = `billing[${charge.source}]: tokens=${textCost} ${charge.note}`;
       if (charge.source === 'length') this.logger.warn(logLine);
       else this.logger.log(logLine);
+
+      // Алерт на аномально дорогой ход. Про ход юриста за $47 (169 208 токенов,
+      // 23% его баланса за одно сообщение) мы узнали только потому, что полезли
+      // смотреть логи руками — сам по себе такой ход ничем себя не обозначает.
+      // Порог в долларах, а не в токенах: он не поедет при смене курса.
+      // fire-and-forget — алерт не должен влиять на списание.
+      if (agentCostUsd >= this.EXPENSIVE_TURN_ALERT_USD) {
+        const balLeft = await this.pg
+          .query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1', [userId])
+          .then((r) => Number(r.rows[0]?.tokens ?? 0))
+          .catch(() => -1);
+        void sendTelegramAlert(
+          `💸 <b>Дорогой ход</b>\n` +
+          `Юзер: <code>${userId}</code>, ассистент ${assistantId}\n` +
+          `Стоимость: <b>$${agentCostUsd.toFixed(2)}</b> → списано ${textCost.toLocaleString('ru')} токенов\n` +
+          `Остаток: ${balLeft < 0 ? 'н/д' : balLeft.toLocaleString('ru')}\n` +
+          `<code>${charge.note}</code>`,
+        ).catch(() => {});
+      }
       try {
         const sessOverride = fresh ? freshSessionId : undefined;
         if (userMsgPersisted) {

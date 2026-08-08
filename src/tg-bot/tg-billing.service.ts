@@ -23,17 +23,27 @@ export class TgBillingService {
   }
 
   /**
-   * Атомарное списание. Возвращает новый баланс.
+   * Списание после уже отправленного ответа. Возвращает новый баланс.
+   *
+   * Раньше здесь стоял безусловный `tokens = tokens - $1` с комментарием
+   * «атомарное списание» — атомарным он не был: читал и писал без блокировки
+   * строки и без пола, поэтому уводил баланс в минус. consume_user_tokens
+   * берёт строку под FOR UPDATE, списывает не больше остатка и пишет запись
+   * в token_transactions.
    */
   async deduct(ownerUserId: string, tokens: number): Promise<number> {
     if (tokens <= 0) return await this.getBalance(ownerUserId);
-    const r = await this.pg.query(
-      `UPDATE ai_profiles_consolidated SET tokens = tokens - $1
-        WHERE user_id = $2
-        RETURNING tokens`,
-      [tokens, ownerUserId],
-    );
-    return Number(r.rows[0]?.tokens ?? 0);
+    try {
+      await this.pg.query(`SELECT consume_user_tokens($1, $2, $3)`, [ownerUserId, tokens, 'tg-bot']);
+    } catch (e: any) {
+      this.logger.warn(`consume_user_tokens недоступна (${e.message}) — списываю с полом`);
+      await this.pg.query(
+        `UPDATE ai_profiles_consolidated SET tokens = GREATEST(0, tokens - $1), updated_at = now()
+          WHERE user_id = $2`,
+        [tokens, ownerUserId],
+      );
+    }
+    return await this.getBalance(ownerUserId);
   }
 
   async getBalance(ownerUserId: string): Promise<number> {

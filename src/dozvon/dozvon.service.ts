@@ -243,10 +243,19 @@ export class DozvonService {
       );
       const ownerPhone = ownerRes.rows[0]?.user_id;
       if (ownerPhone && tokensSpent > 0) {
-        await this.pg.query(
-          `UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2`,
-          [tokensSpent, ownerPhone],
-        );
+        // Через процедуру, а не прямым UPDATE: она берёт строку под FOR UPDATE,
+        // не даёт уйти ниже нуля и пишет запись в token_transactions. Звонок к
+        // этому моменту уже состоялся, поэтому отказывать нельзя — списываем
+        // сколько есть.
+        try {
+          await this.pg.query(`SELECT consume_user_tokens($1, $2, $3)`, [ownerPhone, tokensSpent, 'dozvon']);
+        } catch (e: any) {
+          this.logger.warn(`consume_user_tokens недоступна (${e.message}) — списываю с полом`);
+          await this.pg.query(
+            `UPDATE ai_profiles_consolidated SET tokens = GREATEST(0, tokens - $1), updated_at = now() WHERE user_id = $2`,
+            [tokensSpent, ownerPhone],
+          );
+        }
         await this.pg.query(
           `UPDATE dozvon_calls SET tokens_spent = $1 WHERE id = $2`,
           [tokensSpent, payload.call_id],
