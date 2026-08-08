@@ -1388,12 +1388,25 @@ ${LanguageService.buildDirective(userLanguage)}`;
         usage.cacheWrite1h * this.W_CACHE_WRITE_1H +
         usage.output * this.W_OUTPUT;
       const impliedUsd = (weighted * this.SDK_INPUT_USD_PER_MTOK) / 1e6;
-      const tokens = Math.max(1, Math.ceil(impliedUsd * this.TOKENS_PER_USD));
+
+      // Списываем по МАКСИМУМУ из взвешенного и заявленного, и вот почему.
+      // Верхний `usage` в result-событии НЕ включает расход субагентов — проверено
+      // 2026-08-08: у хода с одним субагентом cache_creation в usage был 42 319,
+      // а в modelUsage (он сходится с total_cost_usd) — 62 650. Разница в 20 331
+      // токен это ровно субагент. Считай мы только по usage, фан-аут снова стал бы
+      // частично бесплатным — ровно та дыра, из-за которой всё и затевалось.
+      //
+      // total_cost_usd полон всегда. Без субагентов обе величины совпадают
+      // (покрытие 100% на живых ходах прода), так что максимум ничего не меняет;
+      // с субагентами побеждает costUsd и расход учитывается целиком.
+      const billableUsd = Math.max(impliedUsd, costUsd);
+      const tokens = Math.max(1, Math.ceil(billableUsd * this.TOKENS_PER_USD));
       const drift = costUsd > 0 ? impliedUsd / costUsd : NaN;
       const note =
         `weighted=${Math.round(weighted)} implied=$${impliedUsd.toFixed(4)} ` +
         `reported=$${costUsd.toFixed(4)} ` +
         (Number.isFinite(drift) ? `покрытие=${(drift * 100).toFixed(0)}%` : 'costUsd нет') +
+        (costUsd > impliedUsd ? ' взято=reported' : ' взято=implied') +
         (usage.webSearch ? ` поисков=${usage.webSearch}` : '') +
         (usage.webFetch ? ` fetch=${usage.webFetch}` : '');
       return { tokens, source: 'usage', note };

@@ -129,15 +129,16 @@ describe('SDK-биллинг: взвешенные токены из сырог�
     cacheWrite5m: 10_000, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
   };
 
-  it('считает по взвешенной формуле, а не по costUsd', async () => {
+  it('считает по взвешенной формуле, когда стоимость хода неизвестна', async () => {
     // 1000 + 0.1×100000 + 1.25×10000 + 5×1000 = 28 500 единиц → $0.1425.
-    // costUsd намеренно завышен: если код возьмёт его вместо usage,
-    // спишется втрое больше и тест это поймает.
-    const h = makeHarness({ answer: ANSWER, costUsd: 1.0, usage: BASE_USAGE });
+    // costUsd = 0 убирает его из сравнения по максимуму, остаётся чистая
+    // проверка весов. Приоритет между двумя источниками проверяется отдельно,
+    // в блоке про субагентов.
+    const h = makeHarness({ answer: ANSWER, costUsd: 0, usage: BASE_USAGE });
     await h.run();
 
     expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.1425));
-    expect(chargedTokens(h.pgCalls)).not.toBe(forUsd(1.0));
+    expect(chargedTokens(h.pgCalls)).not.toBe(ANSWER.length * 2);
   });
 
   it('часовой кэш дороже пятиминутного — TTL нельзя схлопывать', async () => {
@@ -248,5 +249,33 @@ describe('курс сиденья', () => {
     // Если этот тест покраснел — курс поменяли. Убедись, что это осознанно и
     // что вместе с ним пересчитаны пакеты и мигрированы балансы пользователей.
     expect(SEAT_TOKENS_PER_USD).toBe(3600);
+  });
+});
+
+describe('расход субагентов не теряется', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  // Верхний usage в result-событии НЕ содержит токенов субагентов (проверено
+  // 2026-08-08: 42 319 против 62 650 в modelUsage). costUsd полон всегда,
+  // поэтому списываем по максимуму из двух.
+  const USAGE_BEZ_SUBAGENTOV = {
+    input: 1000, output: 1000, cacheRead: 100_000,
+    cacheWrite5m: 10_000, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
+  }; // = $0.1425 по весам
+
+  it('берёт costUsd, когда он больше взвешенного (был фан-аут)', async () => {
+    const h = makeHarness({ answer: ANSWER, costUsd: 0.5, usage: USAGE_BEZ_SUBAGENTOV });
+    await h.run();
+
+    // Взвешенное дало бы $0.1425 и потеряло бы расход субагентов.
+    expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.5));
+    expect(chargedTokens(h.pgCalls)).not.toBe(forUsd(0.1425));
+  });
+
+  it('берёт взвешенное, когда оно больше (costUsd занижен или частичен)', async () => {
+    const h = makeHarness({ answer: ANSWER, costUsd: 0.01, usage: USAGE_BEZ_SUBAGENTOV });
+    await h.run();
+
+    expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.1425));
   });
 });
