@@ -103,7 +103,10 @@ describe('PriemService.handleCallback', () => {
     expect(payments.processSucceededPayment).toHaveBeenCalledWith('p-1', 'u1');
   });
 
-  it.each(['created', 'awaiting_payment', 'detected', 'confirming', 'converting', 'underpaid', 'expired', 'failed'])(
+  // onramp_pending — оплата картой: клиент платит, Changelly ещё покупает крипту.
+  // Деньги в пути, зачислять нельзя.
+  it.each(['created', 'awaiting_payment', 'onramp_pending', 'detected', 'confirming',
+           'converting', 'conversion_retry', 'underpaid', 'overpaid', 'expired', 'failed', 'refunded'])(
     'не зачисляет в состоянии %s',
     async (state) => {
       const { svc, payments } = makeService([{ user_id: 'u1', status: 'pending' }]);
