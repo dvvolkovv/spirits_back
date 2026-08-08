@@ -8,6 +8,13 @@ async function bootstrap() {
 
   const bodyParser = require('body-parser');
   app.use(bodyParser.raw({ type: ['image/*'], limit: '10mb' }));
+
+  // Коллбэк «Приёма» — СЫРЫМ телом, и обязательно ДО глобального JSON ниже.
+  // Подпись HMAC считается по тем самым байтам, что пришли; разобранный и
+  // собранный обратно JSON её не пройдёт — изменится порядок ключей или пробелы.
+  // Путь указан целиком с префиксом: setGlobalPrefix ниже на app.use не влияет.
+  app.use('/webhook/priem/callback', bodyParser.raw({ type: '*/*', limit: '1mb' }));
+
   app.use(bodyParser.json({ limit: '50mb', type: ['application/json', 'text/*'] }));
   app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
