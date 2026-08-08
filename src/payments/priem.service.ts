@@ -1,4 +1,5 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
 import { createHmac, timingSafeEqual, randomUUID } from 'node:crypto';
 import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
@@ -40,6 +41,18 @@ const SETTLED = 'settled';
 
 /** Допустимый возраст подписи. Старше — это повтор перехваченного запроса. */
 const SIGNATURE_MAX_AGE_SEC = 300;
+
+/** Состояния, после которых опрашивать платёж больше незачем. */
+const TERMINAL_FAILED = ['expired', 'failed', 'refunded'];
+
+/**
+ * Сколько ждать до отказа от опроса. Коллбэк «Приём» повторяет 33 часа; берём
+ * с запасом, но не бесконечно — иначе брошенные счета будут опрашиваться вечно.
+ */
+const POLL_WINDOW_HOURS = 72;
+
+/** Сколько платежей опрашивать за один проход, чтобы не долбить их API. */
+const POLL_BATCH = 20;
 
 @Injectable()
 export class PriemService {
@@ -193,6 +206,54 @@ export class PriemService {
     await this.payments.processSucceededPayment(paymentId, userId);
     this.logger.log(`платёж ${paymentId} зачислен пользователю ${userId}`);
     return true;
+  }
+
+  /**
+   * Страховка на случай, когда коллбэк не дошёл.
+   *
+   * Заведена по факту: 2026-08-08 платёж 3426dc27 дошёл у «Приёма» до settled,
+   * а коллбэк к нам не пришёл ни разу за 33 часа, отведённые на повторы. Их же
+   * документация предупреждает: «не полагайтесь на один лишь коллбэк». Без
+   * опроса такой платёж висит в pending, пока кто-то не заметит руками — для
+   * приёма денег это неприемлемо.
+   *
+   * Сбой доставки после этого перестаёт быть потерей платежа и становится
+   * задержкой на пару минут.
+   */
+  @Cron('0 */2 * * * *')
+  async pollPendingPayments(): Promise<void> {
+    if (!this.apiKey) return;
+
+    const rows = await this.pg.query(
+      `SELECT payment_id FROM payments
+        WHERE provider = 'priem'
+          AND status = 'pending'
+          AND created_at > now() - ($1 || ' hours')::interval
+          -- строки, где создание в «Приёме» не удалось: payment_id так и остался
+          -- нашим ключом идемпотентности, опрашивать по нему нечего
+          AND payment_id NOT LIKE 'linkeon-%'
+        ORDER BY created_at
+        LIMIT $2`,
+      [POLL_WINDOW_HOURS, POLL_BATCH],
+    );
+    if (rows.rows.length === 0) return;
+
+    for (const row of rows.rows) {
+      const id = row.payment_id;
+      try {
+        const state = await this.syncPayment(id);
+        if (state && TERMINAL_FAILED.includes(state)) {
+          // Больше не опрашиваем: деньги не придут.
+          await this.pg.query(
+            `UPDATE payments SET status = 'failed', updated_at = now() WHERE payment_id = $1 AND status = 'pending'`,
+            [id],
+          );
+          this.logger.log(`платёж ${id} в состоянии ${state} — помечен failed`);
+        }
+      } catch (e: any) {
+        this.logger.warn(`опрос ${id} не удался: ${e.message}`);
+      }
+    }
   }
 
   /**

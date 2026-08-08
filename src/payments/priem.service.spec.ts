@@ -146,3 +146,86 @@ describe('PriemService.packages', () => {
     }
   });
 });
+
+/**
+ * Опрос висящих платежей — страховка на случай, когда коллбэк не дошёл.
+ * Заведена по факту: 2026-08-08 платёж дошёл у «Приёма» до settled, а коллбэк
+ * не пришёл ни разу. Без опроса такой платёж висит в pending, пока кто-то не
+ * заметит руками.
+ */
+describe('PriemService.pollPendingPayments', () => {
+  const OLD_KEY = process.env.PRIEM_API_KEY;
+  beforeAll(() => { process.env.PRIEM_API_KEY = 'priem_test'; });
+  afterAll(() => { process.env.PRIEM_API_KEY = OLD_KEY; });
+
+  function harness(pendingRows: { payment_id: string }[]) {
+    const queries: { sql: string; params: any[] }[] = [];
+    const pg = {
+      query: jest.fn(async (sql: string, params: any[] = []) => {
+        queries.push({ sql, params });
+        if (/SELECT payment_id FROM payments/.test(sql)) return { rows: pendingRows };
+        return { rows: [] };
+      }),
+    };
+    const svc = new PriemService(pg as any, { processSucceededPayment: jest.fn() } as any);
+    return { svc, queries, pg };
+  }
+
+  it('не опрашивает строки, где создание в «Приёме» не удалось', async () => {
+    // У таких payment_id так и остался нашим ключом идемпотентности —
+    // платежа на их стороне не существует, спрашивать не о чем.
+    const { svc, queries } = harness([]);
+    await svc.pollPendingPayments();
+
+    const sel = queries.find((q) => /SELECT payment_id FROM payments/.test(q.sql));
+    expect(sel!.sql).toMatch(/NOT LIKE 'linkeon-%'/);
+    expect(sel!.sql).toMatch(/provider = 'priem'/);
+    expect(sel!.sql).toMatch(/status = 'pending'/);
+  });
+
+  it('опрашивает каждый висящий платёж', async () => {
+    const { svc } = harness([{ payment_id: 'a' }, { payment_id: 'b' }]);
+    const sync = jest.spyOn(svc, 'syncPayment').mockResolvedValue('confirming');
+    await svc.pollPendingPayments();
+
+    expect(sync).toHaveBeenCalledTimes(2);
+    expect(sync).toHaveBeenCalledWith('a');
+    expect(sync).toHaveBeenCalledWith('b');
+  });
+
+  it('помечает failed те, что уже не оплатят — иначе опрос вечен', async () => {
+    const { svc, queries } = harness([{ payment_id: 'protuh' }]);
+    jest.spyOn(svc, 'syncPayment').mockResolvedValue('expired');
+    await svc.pollPendingPayments();
+
+    const upd = queries.find((q) => /UPDATE payments SET status = 'failed'/.test(q.sql));
+    expect(upd).toBeDefined();
+    expect(upd!.params).toContain('protuh');
+  });
+
+  it('не помечает failed те, что ещё в пути', async () => {
+    const { svc, queries } = harness([{ payment_id: 'v-puti' }]);
+    jest.spyOn(svc, 'syncPayment').mockResolvedValue('converting');
+    await svc.pollPendingPayments();
+
+    expect(queries.find((q) => /UPDATE payments SET status = 'failed'/.test(q.sql))).toBeUndefined();
+  });
+
+  it('сбой опроса одного платежа не срывает остальные', async () => {
+    const { svc } = harness([{ payment_id: 'a' }, { payment_id: 'b' }]);
+    const sync = jest.spyOn(svc, 'syncPayment')
+      .mockRejectedValueOnce(new Error('сеть отвалилась'))
+      .mockResolvedValueOnce('settled');
+    await expect(svc.pollPendingPayments()).resolves.toBeUndefined();
+    expect(sync).toHaveBeenCalledTimes(2);
+  });
+
+  it('без ключа API не ходит в базу вовсе', async () => {
+    const saved = process.env.PRIEM_API_KEY;
+    delete process.env.PRIEM_API_KEY;
+    const { svc, queries } = harness([{ payment_id: 'a' }]);
+    await svc.pollPendingPayments();
+    expect(queries).toHaveLength(0);
+    process.env.PRIEM_API_KEY = saved;
+  });
+});
