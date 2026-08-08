@@ -1,26 +1,29 @@
-import { Controller, Post, Get, Body, Req, Res, UseGuards } from '@nestjs/common';
+import { Controller, Post, Get, Body, Query, Req, Res, UseGuards } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { PriemService } from './priem.service';
-import { LanguageService } from '../common/services/language.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 
 @Controller('')
 export class PriemController {
-  constructor(
-    private readonly priem: PriemService,
-    private readonly language: LanguageService,
-  ) {}
+  constructor(private readonly priem: PriemService) {}
 
   /**
-   * Какие способы оплаты доступны этому пользователю. Решает язык профиля:
-   * ru — YooKassa, остальные — «Приём». Фронт по этому ответу рисует витрину и
-   * не гадает сам.
+   * Какие способы оплаты доступны. Решает язык: ru — YooKassa в рублях,
+   * остальные — «Приём» в долларах. Фронт по этому ответу рисует витрину и не
+   * дублирует правило у себя.
    */
   @Get('payments/methods')
-  @UseGuards(JwtGuard)
-  async methods(@CurrentUser() user: any, @Res() res: Response) {
-    const lang = await this.language.resolveUserLanguage(user.userId);
+  async methods(@Query('lang') langParam: string, @Res() res: Response) {
+    // БЕЗ JwtGuard намеренно. Страница /tokens открывается по прямой ссылке с
+    // лендинга, то есть посетитель ещё не авторизован: под гардом запрос
+    // отвечал бы 401, витрина откатывалась бы к рублёвой, и англоязычный гость
+    // видел бы рубли.
+    //
+    // Язык берём из параметра — фронт передаёт свой текущий. Для авторизованного
+    // это и есть язык профиля: AuthContext синхронизирует i18n с ним при входе.
+    // Секретов эндпоинт не отдаёт: только список пакетов и имя провайдера.
+    const lang = (langParam || 'ru').split('-')[0].toLowerCase();
 
     // Пока ключи «Приёма» не прописаны, крипто-витрину не показываем никому:
     // иначе иностранец увидел бы пакеты и получил отказ по клику. До появления
