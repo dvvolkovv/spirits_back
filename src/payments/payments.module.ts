@@ -3,11 +3,12 @@ import { PaymentsController } from './payments.controller';
 import { PaymentsService } from './payments.service';
 import { PriemController } from './priem.controller';
 import { PriemService } from './priem.service';
+import { TokenHistoryController } from './history.controller';
 import { ReferralModule } from '../referral/referral.module';
 
 @Module({
   imports: [ReferralModule],
-  controllers: [PaymentsController, PriemController],
+  controllers: [PaymentsController, PriemController, TokenHistoryController],
   providers: [PaymentsService, PriemService],
   exports: [PriemService],
 })

@@ -207,9 +207,12 @@ export class AuthService {
     }
     const balanceBefore = Number(before.rows[0].tokens || 0);
 
+    // Через процедуру: ручная правка баланса тоже должна оставлять след, иначе
+    // токены у пользователя появляются или пропадают без объяснения. delta может
+    // быть отрицательной — add_user_tokens не даст уйти ниже нуля.
     await this.pg.query(
-      'UPDATE ai_profiles_consolidated SET tokens = tokens + $1, updated_at = now() WHERE user_id = $2',
-      [delta, phone],
+      `SELECT add_user_tokens($1, $2, 'adjustment', $3, NULL)`,
+      [phone, delta, 'Корректировка администратором'],
     );
 
     const balanceAfter = balanceBefore + delta;

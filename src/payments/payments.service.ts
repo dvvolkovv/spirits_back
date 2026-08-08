@@ -90,7 +90,7 @@ export class PaymentsService {
     if (existing.rows[0]?.status === 'succeeded') return; // already processed
 
     const paymentRow = await this.pg.query(
-      'SELECT tokens, user_id, amount FROM payments WHERE payment_id = $1',
+      'SELECT tokens, user_id, amount, package_id, provider, currency FROM payments WHERE payment_id = $1',
       [paymentId],
     );
     const tokensToAdd = Number(paymentRow.rows[0]?.tokens || 0);
@@ -115,9 +115,26 @@ export class PaymentsService {
       'UPDATE payments SET status = $1, completed_at = now(), updated_at = now() WHERE payment_id = $2',
       ['succeeded', paymentId],
     );
+    // Через add_user_tokens, а не прямым UPDATE: процедура заодно пишет строку
+    // в token_transactions с balance_after. Без неё пополнений в истории не было
+    // вовсе — на 2026-08-08 в таблице 29 840 списаний и НОЛЬ покупок, то есть
+    // пользователь видел, как токены тают, но не видел, откуда они взялись.
+    const payRow = paymentRow.rows[0] || {};
     await this.pg.query(
-      'UPDATE ai_profiles_consolidated SET tokens = tokens + $1, updated_at = now() WHERE user_id = $2',
-      [credit, userId],
+      `SELECT add_user_tokens($1, $2, 'purchase', $3, $4::jsonb)`,
+      [
+        userId,
+        credit,
+        `Пополнение: ${payRow.package_id || 'пакет'}`,
+        JSON.stringify({
+          payment_id: paymentId,
+          provider: payRow.provider || 'yookassa',
+          amount: Number(payRow.amount || 0),
+          currency: payRow.currency || 'RUB',
+          base_tokens: tokensToAdd,
+          bonus_tokens: credit - tokensToAdd,
+        }),
+      ],
     );
     if (credit > tokensToAdd) {
       this.events?.track('offer_converted', {
@@ -258,9 +275,10 @@ export class PaymentsService {
       'UPDATE coupons SET usage_count = usage_count + 1 WHERE id = $1',
       [res.rows[0].id],
     );
+    // Через процедуру — чтобы купон тоже попал в историю пополнений.
     await this.pg.query(
-      'UPDATE ai_profiles_consolidated SET tokens = tokens + $1, updated_at = now() WHERE user_id = $2',
-      [tokens, userId],
+      `SELECT add_user_tokens($1, $2, 'coupon', $3, $4::jsonb)`,
+      [userId, tokens, 'Промокод', JSON.stringify({ coupon_id: res.rows[0].id })],
     );
     return { success: true, tokens_added: tokens };
   }

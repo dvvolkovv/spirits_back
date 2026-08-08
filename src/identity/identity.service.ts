@@ -157,9 +157,11 @@ export class IdentityService implements OnModuleInit {
       [userId],
     );
     if (claimed.rows.length === 0) return;
+    // Через процедуру: стартовый бонус — тоже пополнение, и в истории он должен
+    // быть видно, иначе у нового юзера баланс возникает из ниоткуда.
     await this.pg.query(
-      `UPDATE ai_profiles_consolidated SET tokens = tokens + $1 WHERE user_id = $2`,
-      [this.WELCOME_BONUS, userId],
+      `SELECT add_user_tokens($1, $2, 'bonus', $3, NULL)`,
+      [userId, this.WELCOME_BONUS, 'Приветственный бонус'],
     );
     this.logger.log(`welcome bonus ${this.WELCOME_BONUS} → ${userId}`);
   }
