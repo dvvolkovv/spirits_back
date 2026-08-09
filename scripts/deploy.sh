@@ -285,14 +285,20 @@ deploy_backend() {
   " || { red "  backend deploy failed ($ENV_NAME)"; exit 1; }
 
   bold "[back 3/3] health-wait"
-  for i in $(seq 1 30); do
+  # A healthy prod cold boot (NestJS + every module's onModuleInit SQL migrations +
+  # Neo4j/Redis reconnect) can legitimately take longer than the old fixed 30s, which
+  # false-failed the deploy on a perfectly healthy backend (backlog c5140bad). Poll a
+  # generous, env-tunable window instead. Waiting longer only delays detecting a REAL
+  # crash — it never turns a broken backend green — so the tradeoff favours the higher bound.
+  local max_wait="${HEALTH_WAIT_SECONDS:-90}"
+  for (( i=1; i<=max_wait; i++ )); do
     code=$(curl -s ${BASIC_AUTH:+-u "$BASIC_AUTH"} -o /dev/null -w "%{http_code}" "${BASE_URL}/webhook/agents" || echo "0")
     if [[ "$code" == "200" ]]; then
       green "  ✓ /webhook/agents = 200 after ${i}s"
       return 0
     fi
-    if [[ "$i" == "30" ]]; then
-      red "  ✗ backend didn't come up within 30s (last $code)"
+    if (( i == max_wait )); then
+      red "  ✗ backend didn't come up within ${max_wait}s (last $code)"
       exit 1
     fi
     sleep 1
