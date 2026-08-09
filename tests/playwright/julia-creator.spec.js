@@ -112,10 +112,15 @@ test.describe('Юля (SMM Producer) creator-mode E2E', () => {
 
     expect(page.url()).toContain('/chat');
 
-    // Юля must appear somewhere on the assistants page
-    const julia = page.getByText(/Юлия|Юля/).first();
+    // Юля must appear somewhere on the assistants page. Match language-AGNOSTICALLY:
+    // after the i18n feature (localized assistant cards) prod renders the smm_producer
+    // card as English "Julia" depending on the resolved UI language, while test renders
+    // "Юлия" — a hardcoded Russian-only match made this smoke red ONLY on prod and
+    // rolled back every deploy (backlog 33d1e47c). The card's identity, not its localized
+    // spelling, is what this smoke verifies, so accept either language's name.
+    const julia = page.getByText(/Юлия|Юля|Julia/i).first();
     await expect(julia).toBeVisible({ timeout: 20000 });
-    console.log('[OK] Юля is visible on chat page');
+    console.log('[OK] Юля/Julia is visible on chat page');
   });
 
   test('edit existing scenario → save → check toast + network → reload persistence', async ({ page }) => {
