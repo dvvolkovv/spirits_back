@@ -44,6 +44,11 @@ export class ChatController {
     const message = body.message || body.chatInput;
     const assistantId = body.assistantId || body.assistant;
     const sessionId = body.sessionId;
+    // Язык интерфейса. Фронт шлёт его в каждом чат-запросе (ChatInterface.tsx),
+    // но до 2026-08-09 бэк это поле не читал вовсе. Используется только как
+    // подстраховка при пустом языке в профиле — приоритет разбирается в
+    // LanguageService.resolveUserLanguage.
+    const requestLang = typeof body.lang === 'string' ? body.lang : undefined;
     if (!message || !assistantId) {
       return res.status(400).json({ error: 'Missing message or assistantId' });
     }
@@ -73,6 +78,7 @@ export class ChatController {
         res,
         req,
         fresh,
+        requestLang,
       );
       this.events?.track('response_received', {
         userId,

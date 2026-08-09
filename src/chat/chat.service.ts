@@ -221,6 +221,9 @@ export class ChatService {
     // прошлые задачи в промпт не инжектятся. Профиль ЧИТАЕТСЯ (вариант A) и
     // ФОРМИРУЕТСЯ (consolidateFromChat работает от переданных сообщений).
     fresh: boolean = false,
+    // Язык интерфейса из тела запроса — подсказка на случай пустого профиля.
+    // Профиль остаётся главным, приоритет разбирает resolveUserLanguage.
+    requestLang?: string,
   ): Promise<void> {
     // Get agent
     // Custom-agent branch: "custom:<uuid>" references user-created agents.
@@ -344,7 +347,7 @@ export class ChatService {
         userId, message, String(assistantId), String(agent.id),
         recentHistory, profileText, res,
         agent.name, agent.description || '', agent.system_prompt || '',
-        req, fresh, chatSessionId,
+        req, fresh, chatSessionId, requestLang,
       );
     }
 
@@ -354,7 +357,7 @@ export class ChatService {
     // Объявляем до запроса коллег: имена и описания тянем уже на языке
     // пользователя, иначе ассистент предложит переключиться на «Машу»
     // кириллицей посреди испанского ответа.
-    const userLanguage = await this.language.resolveUserLanguage(userId);
+    const userLanguage = await this.language.resolveUserLanguage(userId, requestLang);
 
     const allAgents = await this.pg.query(
       `SELECT a.name,
@@ -611,6 +614,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     req?: Request,
     fresh: boolean = false,
     freshSessionId?: string,
+    // Подсказка языка из тела запроса — см. streamChat и resolveUserLanguage.
+    requestLang?: string,
   ): Promise<void> {
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
@@ -680,7 +685,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     };
 
     // Язык профиля читается один раз на запрос; фолбэк внутри — русский.
-    const userLanguage = await this.language.resolveUserLanguage(userId);
+    const userLanguage = await this.language.resolveUserLanguage(userId, requestLang);
 
     // Build context from profile + history
     // Identity prefix — remote agent (r.linkeon.io) defaults to Claude persona; force the persona we want.
