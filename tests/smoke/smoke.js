@@ -314,6 +314,27 @@ async function step(name, fn) {
     return `funnel OK: ${userSteps.length} user-steps monotonic, hints present`;
   });
 
+  // -- 6b. Top up the test account so the token-consuming steps below (TTS,
+  // chat streaming) never red the smoke merely because a prior run drained the
+  // balance (~5000 tokens/run). debug/add-tokens is gated by DEBUG_SMS_CODES +
+  // the test-phone whitelist, so it's a no-op safety on any non-debug env.
+  // NON-FATAL by design: a failed top-up must not itself fail the smoke — worst
+  // case the consuming steps run on whatever balance exists, as before. (02b48d89)
+  await step('top up test balance (avoid dry-run false-fail)', async () => {
+    if (!jwt) throw new Error('no JWT');
+    const TOPUP = 50000;
+    const r = await axios.post(
+      `${BASE_URL}/webhook/debug/add-tokens/${TEST_PHONE}/${TOPUP}`,
+      {},
+      { timeout: 10000, validateStatus: () => true },
+    );
+    if (r.status !== 200) {
+      return `SKIP (status ${r.status}) — consuming steps run on existing balance`;
+    }
+    const bal = r.data?.tokens ?? r.data?.balance ?? '?';
+    return `+${TOPUP} → balance=${bal}`;
+  });
+
   // -- 7. Tokens balance --------------------------------------------------
   await step('GET /webhook/user/tokens returns numeric balance', async () => {
     if (!jwt) throw new Error('no JWT');
