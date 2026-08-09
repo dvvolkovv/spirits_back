@@ -41,8 +41,18 @@ export class LanguageService {
     );
   }
 
-  /** Язык из profile_data. Фолбэк — русский, в том числе при ошибке БД. */
-  async resolveUserLanguage(userId: string): Promise<string> {
+  /**
+   * Язык из profile_data. Фолбэк — русский, в том числе при ошибке БД.
+   *
+   * requestHint — язык интерфейса, который фронт кладёт в тело чат-запроса.
+   * Он используется ТОЛЬКО когда в профиле языка нет: профиль это явный выбор
+   * пользователя, синхронный между вебом и мобильным приложением, и запрос его
+   * не перебивает. Подсказка закрывает две дыры: гонку у новорега (AuthContext
+   * пишет язык в профиль без await, первое сообщение успевает уйти раньше) и
+   * профили, заведённые до мультиязычности — на 2026-08-09 таких на проде
+   * 158 из 174.
+   */
+  async resolveUserLanguage(userId: string, requestHint?: string | null): Promise<string> {
     try {
       const res = await this.pg.query(
         `SELECT profile_data->>'language' AS language
@@ -51,7 +61,9 @@ export class LanguageService {
           LIMIT 1`,
         [userId],
       );
-      return LanguageService.normalize(res.rows[0]?.language);
+      const stored = res.rows[0]?.language;
+      if (stored) return LanguageService.normalize(stored);
+      return LanguageService.normalize(requestHint);
     } catch {
       return DEFAULT_LANGUAGE;
     }
