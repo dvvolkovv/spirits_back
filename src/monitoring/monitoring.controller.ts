@@ -25,6 +25,7 @@ import { JobsMonitorService } from './jobs-monitor.service';
 import { ReplicationHealthService } from './replication-health.service';
 import { NeoSnapshotHealthService } from './neo-snapshot-health.service';
 import { MinioMirrorHealthService } from './minio-mirror-health.service';
+import { NanoBananaHealthService } from './nanobanana-health.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 
@@ -61,6 +62,7 @@ export class MonitoringController {
     private readonly replication: ReplicationHealthService,
     private readonly neoSnapshot: NeoSnapshotHealthService,
     private readonly minioMirror: MinioMirrorHealthService,
+    private readonly nanoBanana: NanoBananaHealthService,
   ) {}
 
   @Get('admin/monitoring/overview')
@@ -117,6 +119,17 @@ export class MonitoringController {
       return res.status(200).json(data);
     } catch (e: any) {
       return res.status(500).json({ error: 'sms_failed', message: e?.message || String(e) });
+    }
+  }
+
+  @Get('admin/monitoring/tech/nanobanana')
+  @UseGuards(JwtGuard, AdminGuard)
+  async nanoBananaOverview(@Res() res: Response) {
+    try {
+      const data = this.nanoBanana.getOverview();
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'nanobanana_failed', message: e?.message || String(e) });
     }
   }
 
