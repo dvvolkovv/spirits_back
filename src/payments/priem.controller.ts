@@ -46,7 +46,14 @@ export class PriemController {
     const packageId = String(body?.package || body?.package_id || '');
     try {
       const result = await this.priem.createPayment(user.userId, packageId);
-      return res.status(200).json({ payment_id: result.paymentId, payment_url: result.paymentUrl });
+      // Обе ссылки — на ОДИН платёж: карточный путь не заводит второго счёта и
+      // коллбэк придёт с тем же paymentId. Клиент выбирает способ у нас, мы
+      // ведём его на соответствующую страницу.
+      return res.status(200).json({
+        payment_id: result.paymentId,
+        payment_url: result.paymentUrl,
+        card_url: result.cardUrl,
+      });
     } catch (e: any) {
       return res.status(400).json({ error: e.message });
     }

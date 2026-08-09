@@ -20,7 +20,16 @@ export interface PriemPackage {
   id: string;
   tokens: number;
   usd: number;
+  /** Доступна ли для этого пакета оплата картой (см. CARD_MINIMUM_USD). */
+  cardAvailable?: boolean;
 }
+
+/**
+ * Минимум для оплаты картой у «Приёма». Подтверждён их замером на живом
+ * виджете 2026-08-09: при $5 отказ, при $10 и $28 квотирует. Ниже порога они
+ * отдают cardUrl = null, и кнопку рисовать нельзя — она вела бы в отказ.
+ */
+export const CARD_MINIMUM_USD = 10;
 
 /**
  * Долларовые пакеты. Намеренно НЕ конвертируются из рублёвых.
@@ -77,7 +86,9 @@ export class PriemService {
   }
 
   packages(): PriemPackage[] {
-    return PRIEM_PACKAGES;
+    // Признак считаем здесь, а не держим в константе: порог принадлежит
+    // «Приёму», и правило должно жить в одном месте.
+    return PRIEM_PACKAGES.map((p) => ({ ...p, cardAvailable: p.usd >= CARD_MINIMUM_USD }));
   }
 
   /**
@@ -88,7 +99,10 @@ export class PriemService {
    * останется в pending, и повторная попытка с тем же ключом вернёт тот же
    * платёж, а не выставит второй счёт.
    */
-  async createPayment(userId: string, packageId: string): Promise<{ paymentId: string; paymentUrl: string }> {
+  async createPayment(
+    userId: string,
+    packageId: string,
+  ): Promise<{ paymentId: string; paymentUrl: string; cardUrl: string | null }> {
     const pkg = PRIEM_PACKAGES.find((p) => p.id === packageId);
     if (!pkg) throw new Error(`неизвестный пакет: ${packageId}`);
     if (!this.apiKey) throw new Error('PRIEM_API_KEY не задан');
@@ -135,8 +149,19 @@ export class PriemService {
       [data.id, data.paymentUrl, idempotencyKey],
     );
 
+    // cardUrl НЕ сохраняем в базу намеренно. «Приём» предупреждает: у
+    // зачисленного или истёкшего платежа он становится null, а страница
+    // отвечает 409. Сохранённая ссылка со временем протухает, и кнопка из неё
+    // повела бы в отказ — рисовать её можно только по свежему ответу.
+    const cardUrl = typeof data.cardUrl === 'string' && data.cardUrl ? data.cardUrl : null;
+    if (!cardUrl && pkg.usd >= CARD_MINIMUM_USD) {
+      // Пакет выше порога, а ссылки нет — значит что-то изменилось на их
+      // стороне. Не падаем (криптопуть работает), но это стоит увидеть.
+      this.logger.warn(`платёж ${data.id} на $${pkg.usd}: cardUrl не пришёл, хотя сумма выше порога`);
+    }
+
     this.logger.log(`платёж ${data.id} на $${pkg.usd} создан для ${userId} (пакет ${pkg.id})`);
-    return { paymentId: data.id, paymentUrl: data.paymentUrl };
+    return { paymentId: data.id, paymentUrl: data.paymentUrl, cardUrl };
   }
 
   /**

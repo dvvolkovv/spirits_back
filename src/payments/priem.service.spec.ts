@@ -1,4 +1,5 @@
 import { createHmac } from 'node:crypto';
+import axios from 'axios';
 import { PriemService } from './priem.service';
 
 /**
@@ -230,5 +231,60 @@ describe('PriemService.pollPendingPayments', () => {
     await svc.pollPendingPayments();
     expect(queries).toHaveLength(0);
     process.env.PRIEM_API_KEY = saved;
+  });
+});
+
+/**
+ * Оплата картой. «Приём» отдаёт cardUrl рядом с paymentUrl — это тот же платёж,
+ * коллбэк придёт с тем же paymentId. Минимум $10 подтверждён их замером на
+ * живом виджете 2026-08-09 (при $5 отказ, при $10 и $28 квотирует).
+ */
+describe('PriemService — оплата картой', () => {
+  const OLD = process.env.PRIEM_API_KEY;
+  beforeAll(() => { process.env.PRIEM_API_KEY = 'priem_test'; });
+  afterAll(() => { process.env.PRIEM_API_KEY = OLD; });
+
+  it('пакеты дешевле $10 помечены как недоступные для карты', () => {
+    const { svc } = makeService();
+    for (const p of svc.packages()) {
+      expect(p.cardAvailable).toBe(p.usd >= 10);
+    }
+  });
+
+  it('все наши пакеты проходят порог карты', () => {
+    // Если кто-то заведёт пакет дешевле $10, кнопка «Картой» на нём вела бы
+    // в отказ: «Приём» отдаёт для таких cardUrl = null.
+    const { svc } = makeService();
+    expect(svc.packages().every((p) => p.cardAvailable)).toBe(true);
+  });
+
+  it('cardUrl не сохраняется в базу — он протухает', async () => {
+    // У зачисленного или истёкшего платежа cardUrl становится null, а страница
+    // отвечает 409. Сохранённая ссылка со временем ведёт в отказ, поэтому
+    // кнопка рисуется только по свежему ответу.
+    const { svc, queries } = makeService();
+    jest.spyOn(axios, 'post').mockResolvedValue({
+      data: { id: 'p-1', paymentUrl: 'https://pay/x', cardUrl: 'https://api.priem.io/pay/p-1/card' },
+    } as any);
+
+    const r = await svc.createPayment('u1', 'pro_usd');
+    expect(r.cardUrl).toBe('https://api.priem.io/pay/p-1/card');
+
+    const writes = queries.filter((q) => /INSERT INTO payments|UPDATE payments/.test(q.sql));
+    expect(writes.length).toBeGreaterThan(0);
+    for (const w of writes) {
+      expect(JSON.stringify(w.params)).not.toContain('/card');
+    }
+  });
+
+  it('отсутствие cardUrl не ломает создание платежа', async () => {
+    const { svc } = makeService();
+    jest.spyOn(axios, 'post').mockResolvedValue({
+      data: { id: 'p-2', paymentUrl: 'https://pay/y' },
+    } as any);
+
+    const r = await svc.createPayment('u1', 'pro_usd');
+    expect(r.cardUrl).toBeNull();
+    expect(r.paymentUrl).toBe('https://pay/y');
   });
 });
