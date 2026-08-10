@@ -42,9 +42,11 @@ export class TokenAccountingService {
     this.isRunning = true;
     try {
       const tasks = await this.pg.query(
-        `SELECT id, user_id, input_tokens, output_tokens, tokens_to_consume, agent_id
-         FROM token_consumption_tasks
-         WHERE status = 'pending'
+        `SELECT t.id, t.user_id, t.input_tokens, t.output_tokens, t.tokens_to_consume,
+                t.agent_id, t.metadata, a.name AS agent_name
+         FROM token_consumption_tasks t
+         LEFT JOIN agents a ON a.id = t.agent_id
+         WHERE t.status = 'pending'
          LIMIT 50`,
       );
 
@@ -75,8 +77,12 @@ export class TokenAccountingService {
           }
 
           // Try stored procedure first, fallback to direct update
+          const { description, metadata } = this.explainCharge(task);
           try {
-            await this.pg.query(`SELECT consume_user_tokens($1, $2)`, [task.user_id, tokensToDeduct]);
+            await this.pg.query(
+              `SELECT consume_user_tokens($1, $2, $3, $4)`,
+              [task.user_id, tokensToDeduct, description, metadata],
+            );
           } catch {
             await this.pg.query(
               `UPDATE ai_profiles_consolidated
@@ -105,5 +111,33 @@ export class TokenAccountingService {
     } finally {
       this.isRunning = false;
     }
+  }
+
+  /**
+   * «За что списали» — строкой и фактами рядом с самим списанием.
+   *
+   * consume_user_tokens принимает description и metadata с самого начала, и
+   * покупки ими пользуются («Пополнение: premium» + payment_id). Чат-путь звал
+   * процедуру двумя аргументами, поэтому все consumed-строки лежали с NULL: в
+   * базе ход на 862 673 токена выглядел так же, как соседний на 3 170, и
+   * разбор 2026-08-10 свёлся к чтению pm2-логов и транскриптов релея.
+   *
+   * Пользователю это пока не показывается: /tokens/history сознательно отдаёт
+   * только начисления (расход виден в чате под каждым сообщением), а лента на
+   * десятки тысяч consumed-строк была бы шумом. Читатель этих полей —
+   * поддержка и админка, которым иначе нечем ответить на «за что списали».
+   *
+   * Длительность приписываем только там, где она о чём-то говорит. «0 мин» у
+   * каждой второй строки — шум, который обесценит признак ровно в тех случаях,
+   * ради которых он и заводится.
+   */
+  private explainCharge(task: any): { description: string; metadata: string | null } {
+    const facts = task.metadata && typeof task.metadata === 'object' ? task.metadata : null;
+    const who = task.agent_name ? `ассистента «${task.agent_name}»` : 'ассистента';
+    const minutes = Math.round(Number(facts?.durationMs ?? 0) / 60_000);
+    const description = minutes >= 1
+      ? `Ответ ${who}, ${minutes} мин работы`
+      : `Ответ ${who}`;
+    return { description, metadata: facts ? JSON.stringify(facts) : null };
   }
 }

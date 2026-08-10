@@ -35,6 +35,22 @@ export interface SdkUsageTotals {
 }
 
 /**
+ * Чем ход объясняет своё списание. Едет в token_consumption_tasks.metadata,
+ * оттуда TokenAccountingService переносит в token_transactions рядом с
+ * человекочитаемым description.
+ *
+ * `source` тут важнее суммы: `usage` при низком покрытии означает, что
+ * взвешенный расчёт хода не видел (был фан-аут субагентов) и сумма пришла от
+ * costUsd — именно так набежали 862 673 токена 2026-08-10.
+ */
+export interface ChargeFacts {
+  costUsd: number;
+  source: 'usage' | 'cost' | 'length';
+  durationMs: number;
+  replyChars: number;
+}
+
+/**
  * Дособирает ссылки на файлы, которые ассистент оформить не смог.
  *
  * Ассистенту инструкцией запрещено писать пути и URL: их подставляет
@@ -472,6 +488,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     let inputTokens = 0;
     let outputTokens = 0;
     let rawText = '';
+    let costUsd = 0;
+    const turnStartedAt = Date.now();
 
     // Собираем prompt: история + текущая реплика. systemPrompt уже включает
     // platformContext + agent.system_prompt + правило ответа + profileText + tasks ctx.
@@ -494,6 +512,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // см. common/billing-rates.ts. Кладём всё в outputTokens (split
       // input/output здесь не информативен — берём суммарную стоимость).
       outputTokens = Math.ceil(r.costUsd * SEAT_TOKENS_PER_USD);
+      costUsd = r.costUsd;
       this.logger.log(`Маша claude CLI: cost=$${r.costUsd.toFixed(4)} tokens=${outputTokens}`);
     } catch (e: any) {
       this.logger.error(`Маша claude CLI error: ${e.message}`);
@@ -529,7 +548,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
       try {
         const tokensUsed = inputTokens + outputTokens;
         await this.saveChatHistory(userId, String(assistantId), message, fullText, tokensUsed, fresh ? chatSessionId : undefined);
-        await this.addTokenTask(userId, inputTokens, outputTokens, String(agent.id));
+        await this.addTokenTask(userId, inputTokens, outputTokens, String(agent.id), {
+          costUsd: Number(costUsd.toFixed(4)),
+          source: 'cost', // у этого пути сырого usage нет — только total_cost_usd от CLI
+          durationMs: Date.now() - turnStartedAt,
+          replyChars: fullText.length,
+        });
         // Extract profile entities from conversation — работает и в fresh-режиме:
         // «чистый лист» не тянет прошлый контекст, но профиль формирует.
         if (this.neo4j) {
@@ -876,7 +900,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
           await this.saveChatHistory(userId, assistantId, message, aiText, textCost, sessOverride);
         }
         if (fullText.length > 0) {
-          await this.addTokenTask(userId, 0, textCost, agentId);
+          await this.addTokenTask(userId, 0, textCost, agentId, {
+            costUsd: Number(agentCostUsd.toFixed(4)),
+            source: charge.source,
+            durationMs: Date.now() - streamStartTime,
+            replyChars: fullText.length,
+          });
           // Профиль формируется и в fresh-режиме (чистый лист скрывает контекст,
           // но не отключает обучение профиля).
           if (this.neo4j) {
@@ -1456,13 +1485,28 @@ ${LanguageService.buildDirective(userLanguage)}`;
     };
   }
 
-  private async addTokenTask(userId: string, inputTokens: number, outputTokens: number, agentId?: string) {
+  /**
+   * Факты о ходе, которые доедут до истории списаний. Здесь они известны
+   * целиком, а в token_transactions до этого уходило голое отрицательное
+   * число: разбор списания на 862 673 токена (2026-08-10) пришлось собирать
+   * из pm2-логов и транскриптов релея, хотя всё нужное было ровно тут.
+   *
+   * Число субагентов было бы полезнее длительности, но релей его в событии
+   * `done` не присылает — пока считаем минуты работы за его прокси.
+   */
+  private async addTokenTask(
+    userId: string,
+    inputTokens: number,
+    outputTokens: number,
+    agentId?: string,
+    facts?: ChargeFacts,
+  ) {
     const executionId = Math.floor(Math.random() * 2000000000);
     const agentIdNum = agentId && /^\d+$/.test(agentId) ? parseInt(agentId, 10) : null;
     await this.pg.query(
-      `INSERT INTO token_consumption_tasks (execution_id, user_id, status, agent_id, input_tokens, output_tokens, tokens_to_consume)
-       VALUES ($1, $2, 'pending', $3, $4, $5, 0)`,
-      [executionId, userId, agentIdNum, inputTokens, outputTokens],
+      `INSERT INTO token_consumption_tasks (execution_id, user_id, status, agent_id, input_tokens, output_tokens, tokens_to_consume, metadata)
+       VALUES ($1, $2, 'pending', $3, $4, $5, 0, $6)`,
+      [executionId, userId, agentIdNum, inputTokens, outputTokens, facts ? JSON.stringify(facts) : null],
     );
   }
 

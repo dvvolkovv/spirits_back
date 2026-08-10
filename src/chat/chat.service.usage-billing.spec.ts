@@ -279,3 +279,51 @@ describe('расход субагентов не теряется', () => {
     expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.1425));
   });
 });
+
+/**
+ * Ход обязан рассказать о себе в очередь списания.
+ *
+ * Сумму мы считаем правильно, но в token_transactions она уходила голой:
+ * description = NULL, metadata = NULL. Разбор списания на 862 673 токена
+ * (2026-08-10) свёлся к чтению pm2-логов и транскриптов релея — при том, что
+ * стоимость хода, его длительность и источник расчёта известны ровно здесь.
+ *
+ * Метаданные едут через token_consumption_tasks.metadata, оттуда
+ * TokenAccountingService переносит их в транзакцию (см. его spec).
+ */
+describe('SDK-биллинг: за что списали', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  const taskMeta = (pgCalls: { sql: string; params: any[] }[]) => {
+    const row = pgCalls.find((c) => /INSERT INTO token_consumption_tasks/.test(c.sql));
+    const raw = row?.params[5];
+    return raw ? JSON.parse(raw) : undefined;
+  };
+
+  it('кладёт в задачу стоимость хода и источник расчёта', async () => {
+    const h = makeHarness({ answer: ANSWER, costUsd: 0.5 });
+    await h.run();
+
+    expect(taskMeta(h.pgCalls)).toMatchObject({ costUsd: 0.5, source: 'cost' });
+  });
+
+  it('различает источник расчёта — по нему видно, откуда взялась сумма', async () => {
+    // Именно это поле объясняет ход 2026-08-10: source=usage при покрытии 2%
+    // означает «сумма пришла от costUsd, потому что взвешенное её не видело».
+    const h = makeHarness({
+      answer: ANSWER, costUsd: 0.5,
+      usage: { input: 1000, output: 1000, cacheRead: 100_000, cacheWrite5m: 10_000, cacheWrite1h: 0, webSearch: 0, webFetch: 0 },
+    });
+    await h.run();
+
+    expect(taskMeta(h.pgCalls)!.source).toBe('usage');
+  });
+
+  it('запоминает длительность хода и длину ответа', async () => {
+    const h = makeHarness({ answer: ANSWER, costUsd: 0.5 });
+    await h.run();
+
+    expect(typeof taskMeta(h.pgCalls)!.durationMs).toBe('number');
+    expect(taskMeta(h.pgCalls)!.replyChars).toBe(ANSWER.length);
+  });
+});
