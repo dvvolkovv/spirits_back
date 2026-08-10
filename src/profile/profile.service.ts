@@ -1,6 +1,8 @@
 import { Injectable, Logger, Optional, OnModuleInit } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
+import { IdentityService } from '../identity/identity.service';
+import { OAuthAppleService } from '../auth/oauth-apple.service';
 import { VOICE_CATALOG } from '../speech/voices';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -35,6 +37,8 @@ export class ProfileService implements OnModuleInit {
   constructor(
     private readonly pg: PgService,
     @Optional() private readonly neo4j?: Neo4jService,
+    @Optional() private readonly identity?: IdentityService,
+    @Optional() private readonly apple?: OAuthAppleService,
   ) {}
 
   // Применяем миграции профиля при старте (как BacklogService) — глобального
@@ -161,6 +165,16 @@ export class ProfileService implements OnModuleInit {
   }
 
   async deleteProfile(userId: string) {
+    // Отзыв доступа Apple — обязательное требование к приложениям с Sign in
+    // with Apple: без него приложение навсегда остаётся в настройках Apple ID
+    // пользователя, а повторный вход молча возвращает прежнюю связку, будто
+    // аккаунт и не удаляли.
+    //
+    // Делается ДО удаления: после него identity-строки ещё нужны, чтобы найти
+    // сохранённый refresh-токен. Неудача отзыва удаление не срывает —
+    // человек попросил удалить аккаунт, и внешний сбой не повод ему отказать.
+    await this.revokeAppleAccess(userId);
+
     await this.pg.query('DELETE FROM custom_chat_history WHERE session_id LIKE $1', [`${userId}_%`]);
     // Preserve token balance: clear profile data but keep the row so tokens survive re-registration
     await this.pg.query(
@@ -176,6 +190,18 @@ export class ProfileService implements OnModuleInit {
       [userId],
     );
     return { success: true };
+  }
+
+  private async revokeAppleAccess(userId: string): Promise<void> {
+    if (!this.identity || !this.apple) return;
+    try {
+      const tokens = await this.identity.providerRefreshTokens(userId, 'apple');
+      for (const token of tokens) {
+        await this.apple.revokeToken(token, this.apple.primaryClientId());
+      }
+    } catch (e: any) {
+      this.logger?.warn?.(`отзыв доступа Apple при удалении ${userId} не удался: ${e.message}`);
+    }
   }
 
   async getUserProfile(userId: string) {

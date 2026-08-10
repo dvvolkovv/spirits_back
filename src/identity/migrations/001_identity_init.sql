@@ -52,4 +52,12 @@ FROM user_id
 WHERE internal_id IS NOT NULL AND internal_id != ''
 ON CONFLICT (provider, provider_sub) DO NOTHING;
 
+-- Refresh-токен Apple. Хранится ради одного действия — отзыва доступа при
+-- удалении аккаунта: Apple требует его от каждого приложения с входом через
+-- Apple, а отозвать по identityToken нельзя, только по refresh или access.
+--
+-- Заполняется единственный раз, при первом входе: authorizationCode Apple
+-- отдаёт вместе с identityToken, и обменять его можно ровно однажды.
+ALTER TABLE user_identities ADD COLUMN IF NOT EXISTS provider_refresh_token text;
+
 COMMIT;

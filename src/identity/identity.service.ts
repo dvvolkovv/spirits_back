@@ -226,6 +226,40 @@ export class IdentityService implements OnModuleInit {
     );
   }
 
+
+  /**
+   * Сохранить refresh-токен провайдера.
+   *
+   * Пока нужен только Apple: без него нечем отозвать доступ при удалении
+   * аккаунта, а Apple этого требует. Пишем один раз, при первом входе —
+   * authorizationCode обменивается ровно однажды, и повторно токен взять
+   * будет неоткуда.
+   */
+  async saveProviderRefreshToken(
+    provider: Provider,
+    providerSub: string,
+    refreshToken: string,
+  ): Promise<void> {
+    if (!this.pg) throw new Error('pg not configured');
+    await this.pg.query(
+      `UPDATE user_identities
+          SET provider_refresh_token = $3
+        WHERE provider = $1 AND provider_sub = $2`,
+      [provider, providerSub, refreshToken],
+    );
+  }
+
+  /** Все сохранённые refresh-токены пользователя по провайдеру. */
+  async providerRefreshTokens(userId: string, provider: Provider): Promise<string[]> {
+    if (!this.pg) return [];
+    const res = await this.pg.query(
+      `SELECT provider_refresh_token FROM user_identities
+        WHERE user_id = $1 AND provider = $2 AND provider_refresh_token IS NOT NULL`,
+      [userId, provider],
+    );
+    return res.rows.map((r: any) => r.provider_refresh_token).filter(Boolean);
+  }
+
   async getTokenBalance(userId: string): Promise<number> {
     if (!this.pg) return 0;
     const res = await this.pg.query(

@@ -6,10 +6,15 @@ import * as jwt from 'jsonwebtoken';
 /**
  * Вход через Apple.
  *
- * Отличается от Google и Яндекса тем, что обмена кода на userinfo нет: на
- * устройстве нативный диалог сразу отдаёт подписанный identityToken, и наша
- * задача — проверить подпись, а не ходить за данными. Поэтому здесь нет ни
- * clientSecret, ни redirectUri.
+ * Отличается от Google и Яндекса тем, что за данными пользователя ходить не
+ * нужно: системный диалог на устройстве сразу отдаёт подписанный
+ * identityToken, и наша задача — проверить подпись. Поэтому redirectUri здесь
+ * нет вовсе.
+ *
+ * Серверные вызовы к Apple всё-таки есть, но ради другого: обменять
+ * authorizationCode на refresh-токен и потом отозвать его при удалении
+ * аккаунта. Отзыв — обязательное требование Apple, и выполнить его по одному
+ * identityToken нельзя.
  *
  * Проверяем всё, что можно проверить: подпись по ключам Apple, издателя,
  * получателя (наш bundle id) и срок. Пропустить хотя бы одно — значит принять
@@ -52,8 +57,114 @@ export class OAuthAppleService {
   private keysFetchedAt = 0;
   private static readonly KEYS_TTL_MS = 24 * 60 * 60 * 1000;
 
+  /**
+   * Ключ для серверных обращений к Apple: обмен кода и отзыв токена.
+   *
+   * APPLE_PRIVATE_KEY — содержимое .p8 целиком. В переменной окружения
+   * переводы строк обычно превращаются в \n, поэтому разворачиваем обратно:
+   * без настоящих переносов PKCS#8 не разбирается.
+   */
+  private readonly privateKey = (process.env.APPLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+  private readonly keyId = process.env.APPLE_KEY_ID || '';
+  private readonly teamId = process.env.APPLE_TEAM_ID || '';
+
   isConfigured(): boolean {
     return this.audiences.length > 0;
+  }
+
+  /** Готов ли сервис к серверным вызовам Apple (обмен кода, отзыв). */
+  canCallApple(): boolean {
+    return Boolean(this.privateKey && this.keyId && this.teamId);
+  }
+
+  /**
+   * client_secret для Apple — это JWT, подписанный нашим .p8 по ES256.
+   *
+   * Живёт недолго намеренно: Apple разрешает до полугода, но секрет,
+   * который валяется где-то полгода, — это секрет, который утечёт. Он
+   * дешёвый, генерируем на каждый вызов.
+   */
+  private clientSecret(clientId: string): string {
+    return jwt.sign({}, this.privateKey, {
+      algorithm: 'ES256',
+      keyid: this.keyId,
+      issuer: this.teamId,
+      audience: 'https://appleid.apple.com',
+      subject: clientId,
+      expiresIn: 300,
+    });
+  }
+
+  /**
+   * Меняет authorizationCode на refresh-токен Apple.
+   *
+   * Нужен ровно для одного: чтобы потом суметь отозвать доступ при удалении
+   * аккаунта. Apple требует этого от каждого приложения с входом через Apple,
+   * а отозвать по identityToken нельзя — только по refresh или access токену,
+   * который выдаётся исключительно в обмен на код.
+   *
+   * Возвращает null, если обмен не удался: вход из-за этого срывать нельзя —
+   * человек уже подтвердил его в системном диалоге.
+   */
+  async exchangeCodeForRefreshToken(code: string, clientId: string): Promise<string | null> {
+    if (!this.canCallApple()) {
+      this.logger.warn('ключ Apple не настроен — refresh-токен не получен, отзыв работать не будет');
+      return null;
+    }
+    try {
+      const resp = await axios.post(
+        'https://appleid.apple.com/auth/token',
+        new URLSearchParams({
+          client_id: clientId,
+          client_secret: this.clientSecret(clientId),
+          code,
+          grant_type: 'authorization_code',
+        }),
+        {
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          timeout: 15_000,
+        },
+      );
+      return resp.data?.refresh_token || null;
+    } catch (e: any) {
+      this.logger.warn(`обмен кода Apple не удался: ${e.response?.data?.error || e.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Отзывает доступ приложения к учётной записи Apple.
+   *
+   * Обязательное требование Apple к приложениям с Sign in with Apple: при
+   * удалении аккаунта связь должна разрываться, иначе в настройках Apple ID
+   * приложение висит вечно, а повторный вход молча возвращает старую связку.
+   */
+  async revokeToken(refreshToken: string, clientId: string): Promise<boolean> {
+    if (!this.canCallApple()) return false;
+    try {
+      await axios.post(
+        'https://appleid.apple.com/auth/revoke',
+        new URLSearchParams({
+          client_id: clientId,
+          client_secret: this.clientSecret(clientId),
+          token: refreshToken,
+          token_type_hint: 'refresh_token',
+        }),
+        {
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          timeout: 15_000,
+        },
+      );
+      return true;
+    } catch (e: any) {
+      this.logger.warn(`отзыв токена Apple не удался: ${e.response?.data?.error || e.message}`);
+      return false;
+    }
+  }
+
+  /** Идентификатор клиента для серверных вызовов: у нативного входа это bundle id. */
+  primaryClientId(): string {
+    return this.audiences[0];
   }
 
   /**

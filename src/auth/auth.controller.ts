@@ -389,7 +389,7 @@ location.replace('/chat');
    */
   @Post('auth/apple/native')
   async appleNative(
-    @Body() body: { identityToken?: string; fullName?: string },
+    @Body() body: { identityToken?: string; fullName?: string; authorizationCode?: string },
     @Req() req: any,
     @Res() res: Response,
   ) {
@@ -435,6 +435,24 @@ location.replace('/chat');
     }
 
     const { userId, isNew } = await this.identity.resolveOrCreate('apple', userInfo);
+
+    // Обмен кода на refresh-токен — ради будущего отзыва при удалении
+    // аккаунта: Apple требует этого, а по identityToken отозвать нельзя.
+    // Код одноразовый, поэтому меняем при первом же входе и сохраняем.
+    // Неудача обмена вход НЕ срывает: человек уже подтвердил его в диалоге,
+    // а отзыв — наша забота, не его.
+    const code = (body?.authorizationCode || '').trim();
+    if (code) {
+      const refresh = await this.appleOAuth.exchangeCodeForRefreshToken(
+        code,
+        this.appleOAuth.primaryClientId(),
+      );
+      if (refresh) {
+        await this.identity
+          .saveProviderRefreshToken('apple', userInfo.sub, refresh)
+          .catch((e: any) => this.logger.warn(`refresh-токен Apple не сохранён: ${e.message}`));
+      }
+    }
 
     // Имя приходит один-единственный раз — при первом входе. Записываем сразу
     // и только если своего имени у профиля ещё нет: перетирать то, что человек
