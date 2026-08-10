@@ -14,7 +14,17 @@ function challengeFor(verifier: string): string {
 }
 function genState(): string { return b64url(randomBytes(24)); }
 
-interface LoginState { verifier: string }
+interface LoginState {
+  verifier: string;
+  /**
+   * Вход начали из мобильного приложения.
+   *
+   * Помним со старта: в callback приходит браузер, и по нему уже не понять,
+   * кто начинал. А знать надо — возврат мобильному клиенту нужен ссылкой в
+   * приложение, страницу Linkeon он из системного браузера не увидит.
+   */
+  mobile?: boolean;
+}
 
 /**
  * Вход через Taler ID — пятый способ, наравне с телефоном, почтой, Google
@@ -58,11 +68,18 @@ export class TalerIdLoginService {
     private readonly jwt: JwtService,
   ) {}
 
-  /** Первый шаг: запомнить PKCE-verifier и отдать адрес окна согласия. */
-  async startLogin(): Promise<{ authorizeUrl: string }> {
+  /**
+   * Первый шаг: запомнить PKCE-verifier и отдать адрес окна согласия.
+   *
+   * [platform] присылает клиент: `mobile` — приложение, всё остальное
+   * (включая отсутствие) — веб. Незнакомое значение трактуем как веб:
+   * ошибиться в сторону веба безопасно, ошибиться в сторону приложения —
+   * значит увести браузер на схему, которую в вебе никто не откроет.
+   */
+  async startLogin(platform?: string): Promise<{ authorizeUrl: string }> {
     const state = genState();
     const verifier = genVerifier();
-    const payload: LoginState = { verifier };
+    const payload: LoginState = { verifier, mobile: platform === 'mobile' };
     await this.redis.set(
       TalerIdLoginService.KEY(state),
       JSON.stringify(payload),
@@ -77,10 +94,23 @@ export class TalerIdLoginService {
     };
   }
 
-  /** Это state входа, а не привязки? Нужно контроллеру общего callback-а. */
-  async isLoginState(state: string): Promise<boolean> {
-    if (!state) return false;
-    return Boolean(await this.redis.get(TalerIdLoginService.KEY(state)));
+  /**
+   * Это state входа, а не привязки? Нужно контроллеру общего callback-а.
+   * `null` — не вход; иначе сразу отдаём, куда возвращать человека.
+   *
+   * Отдельно от [completeLogin] потому, что знать это надо и когда обмена
+   * не будет: при отказе на стороне провайдера мобильного клиента всё
+   * равно нужно вернуть в приложение, а не бросить в браузере.
+   */
+  async peekLogin(state: string): Promise<{ mobile: boolean } | null> {
+    if (!state) return null;
+    const raw = await this.redis.get(TalerIdLoginService.KEY(state));
+    if (!raw) return null;
+    try {
+      return { mobile: (JSON.parse(raw) as LoginState).mobile === true };
+    } catch {
+      return { mobile: false };
+    }
   }
 
   /**

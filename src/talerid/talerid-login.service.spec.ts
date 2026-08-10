@@ -109,8 +109,40 @@ describe('TalerIdLoginService', () => {
 
   it('чужой state не проходит', async () => {
     const { svc } = makeService();
-    expect(await svc.isLoginState('never-issued')).toBe(false);
+    expect(await svc.peekLogin('never-issued')).toBeNull();
     expect(await svc.completeLogin('never-issued', 'code')).toBeNull();
+  });
+
+  // Мобильному клиенту возврат нужен в приложение, а не на веб-страницу:
+  // согласие проходит в системном браузере, и страницы Linkeon приложение
+  // уже не видит. Кто начал вход, помним со старта — в callback-е признака
+  // взять неоткуда, туда приходит браузер.
+  it('мобильный старт запоминается до самого возврата', async () => {
+    const { svc } = makeService();
+    const { authorizeUrl } = await svc.startLogin('mobile');
+    expect(await svc.peekLogin(stateFrom(authorizeUrl))).toEqual({ mobile: true });
+  });
+
+  it('веб-старт остаётся веб-стартом', async () => {
+    const { svc } = makeService();
+    const { authorizeUrl } = await svc.startLogin();
+    expect(await svc.peekLogin(stateFrom(authorizeUrl))).toEqual({ mobile: false });
+  });
+
+  it('незнакомая платформа не считается мобильной', async () => {
+    const { svc } = makeService();
+    const { authorizeUrl } = await svc.startLogin('smart-fridge');
+    expect(await svc.peekLogin(stateFrom(authorizeUrl))).toEqual({ mobile: false });
+  });
+
+  it('после обмена state перестаёт быть входом', async () => {
+    const { svc } = makeService();
+    const { authorizeUrl } = await svc.startLogin('mobile');
+    const state = stateFrom(authorizeUrl);
+
+    await svc.completeLogin(state, 'code-1');
+
+    expect(await svc.peekLogin(state)).toBeNull();
   });
 
   it('сбой обмена не выдаёт сессию', async () => {
@@ -127,6 +159,6 @@ describe('TalerIdLoginService', () => {
     const { svc, redis } = makeService();
     // Привязка кладёт свой ключ в другое пространство имён.
     await redis.set('talerid:link:abc', JSON.stringify({ userId: 'u', verifier: 'v', phone: '7' }));
-    expect(await svc.isLoginState('abc')).toBe(false);
+    expect(await svc.peekLogin('abc')).toBeNull();
   });
 });

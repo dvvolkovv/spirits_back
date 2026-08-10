@@ -168,12 +168,23 @@ describe('TalerIdController', () => {
   const makeLink = () => ({ startLink: jest.fn(), completeLink: jest.fn() } as any);
   // Вход через TalerID — отдельный сервис рядом с привязкой; в этих тестах
   // он не участвует, но контроллер его требует.
-  const makeLogin = () => ({
+  const makeLogin = (overrides: Partial<Record<string, jest.Mock>> = {}) => ({
     startLogin: jest.fn(),
-    isLoginState: jest.fn().mockResolvedValue(false),
+    peekLogin: jest.fn().mockResolvedValue(null),
     completeLogin: jest.fn(),
     redeemHandoff: jest.fn(),
+    ...overrides,
   } as any);
+
+  /** Ловит адрес редиректа вместо настоящего express-ответа. */
+  function makeRes() {
+    const res: any = { redirected: null as string | null };
+    res.redirect = (url: string) => {
+      res.redirected = url;
+      return res;
+    };
+    return res;
+  }
 
   describe('connect', () => {
     it('calls TalerIdOauthService.connect with the user phone (raw, no +) and returns the status', async () => {
@@ -233,6 +244,105 @@ describe('TalerIdController', () => {
       const result = await controller.status({ userId: 'user-1' });
 
       expect(result).toEqual({ connected: false, status: null });
+    });
+  });
+
+  // Вход из мобильного приложения: согласие проходит в системном браузере
+  // (иначе установленный Taler ID его не перехватит), и возврат обязан
+  // уйти ссылкой в приложение — веб-страницу Linkeon оно оттуда не видит.
+  describe('login callback — куда возвращается человек', () => {
+    function makeController(login: any) {
+      return new TalerIdController(makeOauth(), makeStore(), makeLink(), login, makePg());
+    }
+
+    it('мобильный вход возвращается в приложение', async () => {
+      const login = makeLogin({
+        peekLogin: jest.fn().mockResolvedValue({ mobile: true }),
+        completeLogin: jest.fn().mockResolvedValue('handoff-1'),
+      });
+      const res = makeRes();
+
+      await makeController(login).oauthCallback('code-1', 'state-1', undefined as any, res);
+
+      expect(res.redirected).toBe('linkeon://auth/talerid?talerid_login=handoff-1');
+    });
+
+    it('веб-вход по-прежнему возвращается на страницу', async () => {
+      const login = makeLogin({
+        peekLogin: jest.fn().mockResolvedValue({ mobile: false }),
+        completeLogin: jest.fn().mockResolvedValue('handoff-2'),
+      });
+      const res = makeRes();
+
+      await makeController(login).oauthCallback('code-1', 'state-1', undefined as any, res);
+
+      expect(res.redirected).toBe('https://my.linkeon.io/?talerid_login=handoff-2');
+    });
+
+    it('несостоявшийся обмен уводит мобильного в приложение, а не в браузер', async () => {
+      const login = makeLogin({
+        peekLogin: jest.fn().mockResolvedValue({ mobile: true }),
+        completeLogin: jest.fn().mockResolvedValue(null),
+      });
+      const res = makeRes();
+
+      await makeController(login).oauthCallback('code-1', 'state-1', undefined as any, res);
+
+      expect(res.redirected).toBe('linkeon://auth/talerid?talerid_login_error=1');
+    });
+
+    // Отказ на стороне провайдера — это тоже конец входа, а не привязки:
+    // раньше он уводил человека на `?talerid_link=cancelled`, о котором
+    // экран входа ничего не знает, и в приложении оборвался бы совсем.
+    it('отказ на стороне провайдера остаётся в потоке входа', async () => {
+      const login = makeLogin({ peekLogin: jest.fn().mockResolvedValue({ mobile: true }) });
+      const res = makeRes();
+
+      await makeController(login).oauthCallback('', 'state-1', 'access_denied', res);
+
+      expect(res.redirected).toBe('linkeon://auth/talerid?talerid_login_error=1');
+      expect(login.completeLogin).not.toHaveBeenCalled();
+    });
+
+    it('привязка не задета — у неё свой возврат', async () => {
+      const link = makeLink();
+      link.completeLink = jest.fn().mockResolvedValue('linked');
+      const controller = new TalerIdController(
+        makeOauth(), makeStore(), link, makeLogin(), makePg(),
+      );
+      const res = makeRes();
+
+      await controller.oauthCallback('code-1', 'state-1', undefined as any, res);
+
+      expect(res.redirected).toBe('https://my.linkeon.io/?talerid_link=linked');
+    });
+  });
+
+  describe('login/start', () => {
+    it('признак мобильного клиента доезжает до сервиса', async () => {
+      const login = makeLogin({
+        startLogin: jest.fn().mockResolvedValue({ authorizeUrl: 'https://x' }),
+      });
+      const controller = new TalerIdController(
+        makeOauth(), makeStore(), makeLink(), login, makePg(),
+      );
+
+      await controller.loginStart({ platform: 'mobile' });
+
+      expect(login.startLogin).toHaveBeenCalledWith('mobile');
+    });
+
+    it('веб-клиент платформу не присылает и остаётся вебом', async () => {
+      const login = makeLogin({
+        startLogin: jest.fn().mockResolvedValue({ authorizeUrl: 'https://x' }),
+      });
+      const controller = new TalerIdController(
+        makeOauth(), makeStore(), makeLink(), login, makePg(),
+      );
+
+      await controller.loginStart({} as any);
+
+      expect(login.startLogin).toHaveBeenCalledWith(undefined);
     });
   });
 

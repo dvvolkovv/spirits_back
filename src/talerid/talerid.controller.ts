@@ -117,14 +117,24 @@ export class TalerIdController {
     // Один redirect_uri на два сценария: привязку и вход. Он зарегистрирован
     // у провайдера, и заводить второй ради входа значило бы держать две
     // регистрации ради одного и того же обмена. Различаем по state.
-    if (!error && (await this.login.isLoginState(state))) {
+    const login = await this.login.peekLogin(state);
+    if (login) {
+      // Мобильному клиенту возврат нужен ссылкой в приложение: согласие он
+      // проходил в системном браузере (иначе установленный Taler ID его не
+      // перехватит), и страницы Linkeon оттуда уже не видит.
+      const back = login.mobile
+        ? (process.env.TALERID_MOBILE_RETURN_URL || 'linkeon://auth/talerid')
+        : `${base}/`;
+      // Отказ на стороне провайдера — тоже конец входа, а не привязки:
+      // возврат с `talerid_link` экран входа не понимает.
+      if (error) return res.redirect(`${back}?talerid_login_error=1`);
       const handoff = await this.login.completeLogin(state, code);
       // Токены уезжают не в адресной строке, а одноразовым кодом: строка
       // осела бы в истории браузера и в логах прокси.
       return res.redirect(
         handoff
-          ? `${base}/?talerid_login=${encodeURIComponent(handoff)}`
-          : `${base}/?talerid_login_error=1`,
+          ? `${back}?talerid_login=${encodeURIComponent(handoff)}`
+          : `${back}?talerid_login_error=1`,
       );
     }
 
@@ -146,11 +156,14 @@ export class TalerIdController {
    * Вход через Taler ID — шаг 1. Публичный: человек ещё НЕ вошёл в Linkeon,
    * тем и отличается от `oauth/start`, который привязывает провайдера к уже
    * существующей сессии и требует JWT.
+   *
+   * `platform: 'mobile'` шлёт приложение — по нему решается, куда вернуть
+   * человека после согласия. Веб его не присылает и не задет.
    */
   @Post('login/start')
   @HttpCode(HttpStatus.OK)
-  async loginStart() {
-    return this.login.startLogin();
+  async loginStart(@Body() body: { platform?: string }) {
+    return this.login.startLogin(body?.platform);
   }
 
   /**
