@@ -105,21 +105,33 @@ export class AdminController {
   async listPayments(
     @Query('status') status: string | undefined,
     @Query('limit') limit: string | undefined,
+    @Query('includeTest') includeTest: string | undefined,
     @Res() res: Response,
   ) {
     const items = await this.adminService.listPayments({
       status,
       limit: limit ? parseInt(limit, 10) || undefined : undefined,
+      includeTest: AdminController.isTruthy(includeTest),
     });
     return res.status(200).json(items);
   }
 
   @Get('admin/payments/stats')
-  async paymentsStats(@Query('days') days: string | undefined, @Res() res: Response) {
+  async paymentsStats(
+    @Query('days') days: string | undefined,
+    @Query('includeTest') includeTest: string | undefined,
+    @Res() res: Response,
+  ) {
     const stats = await this.adminService.getPaymentsStats({
       days: days ? parseInt(days, 10) || undefined : undefined,
+      includeTest: AdminController.isTruthy(includeTest),
     });
     return res.status(200).json(stats);
+  }
+
+  /** Флаг из query-строки. Всё, кроме явного «да», считаем выключенным. */
+  private static isTruthy(v: string | undefined): boolean {
+    return v === '1' || v === 'true';
   }
 
   // --- Tokens ---

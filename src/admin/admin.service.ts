@@ -246,6 +246,24 @@ export class AdminService {
     return `${col} <> ALL(ARRAY[${arr}]::text[]) AND ${col} !~ '${AdminService.TEST_PATTERN}'`;
   }
 
+  // Тот же предикат, но опциональный: `WHERE true` вместо фильтра, когда
+  // тестовые аккаунты просят показать. Пишется отдельным методом, чтобы
+  // условие «включаем/не включаем» не расползлось строковой склейкой по
+  // вызовам — иначе первый же пропущенный `WHERE` даст выручку с тестовых.
+  private static testFilter(col: string, includeTest?: boolean): string {
+    return includeTest ? 'true' : AdminService.excludeTest(col);
+  }
+
+  // Тот же предикат в JS — чтобы помечать строки в выдаче. Без пометки
+  // включённые тестовые платежи неотличимы от боевых прямо в таблице.
+  private static isTestUser(userId: string): boolean {
+    const id = String(userId ?? '');
+    return (
+      AdminService.TEST_USERS.includes(id) ||
+      new RegExp(AdminService.TEST_PATTERN).test(id)
+    );
+  }
+
   private buildRetentionMessage(assistantName: string | null): string {
     const who = assistantName ? `${assistantName} из LINKEON` : 'Ваш ассистент в LINKEON';
     return `Здравствуйте! ${who} будет рад продолжить разговор, если будет желание — можно вернуться в чат: https://my.linkeon.io/chat. Если сейчас не до этого, это совершенно нормально, не отвлекаем.`;
@@ -911,10 +929,17 @@ export class AdminService {
 
   // --- Payments ---
 
-  async listPayments(opts: { status?: string; limit?: number } = {}) {
+  /**
+   * Список платежей для админки.
+   *
+   * `provider` и `currency` отдаются обязательно: в таблице лежат две валюты —
+   * рубли YooKassa и доллары «Приёма» (крипта и иностранные карты), — и без
+   * этих полей $25 в выдаче неотличимы от 25 ₽.
+   */
+  async listPayments(opts: { status?: string; limit?: number; includeTest?: boolean } = {}) {
     const limit = Math.min(Math.max(opts.limit ?? 200, 1), 1000);
     const params: any[] = [limit];
-    let where = `WHERE ${AdminService.excludeTest('p.user_id')}`;
+    let where = `WHERE ${AdminService.testFilter('p.user_id', opts.includeTest)}`;
     if (opts.status && opts.status !== 'all') {
       params.push(opts.status);
       where += ` AND p.status = $${params.length}`;
@@ -922,7 +947,7 @@ export class AdminService {
     const res = await this.pg.query(
       `SELECT
          p.id, p.payment_id, p.user_id AS phone, p.package_id,
-         p.amount, p.tokens, p.status,
+         p.amount, p.tokens, p.status, p.provider, p.currency,
          p.created_at, p.completed_at,
          rl.id AS referral_leader_id,
          rl.name AS referral_leader_name,
@@ -943,6 +968,11 @@ export class AdminService {
       amount: Number(r.amount) || 0,
       tokens: Number(r.tokens) || 0,
       status: r.status,
+      // Колонки появились вместе с «Приёмом»; у строк, залитых до него,
+      // они пустые — это рублёвая YooKassa и ничто иное.
+      provider: r.provider || 'yookassa',
+      currency: r.currency || 'RUB',
+      is_test: AdminService.isTestUser(r.phone),
       created_at: r.created_at,
       completed_at: r.completed_at,
       referral_leader: r.referral_leader_id
@@ -1567,8 +1597,17 @@ export class AdminService {
     };
   }
 
-  async getPaymentsStats(opts: { days?: number } = {}) {
+  /**
+   * Сводка по платежам.
+   *
+   * Выручка везде разложена по валютам и нигде не схлопывается в одно число.
+   * Курса у нас нет и выдумывать его здесь нельзя: `SUM(amount)` по всей
+   * таблице приводил $25 «Приёма» в выручку как 25 ₽, то есть занижал валютную
+   * оплату примерно в 80 раз. Складывать разрешено только счётчики.
+   */
+  async getPaymentsStats(opts: { days?: number; includeTest?: boolean } = {}) {
     const days = Math.min(Math.max(opts.days ?? 30, 1), 365);
+    const notTest = AdminService.testFilter('p.user_id', opts.includeTest);
 
     const dailyRes = await this.pg.query(
       `WITH days AS (
@@ -1580,17 +1619,41 @@ export class AdminService {
        )
        SELECT
          d.day,
+         COALESCE(p.currency, 'RUB') AS currency,
          COALESCE(SUM(CASE WHEN p.status = 'succeeded' THEN p.amount ELSE 0 END), 0)::numeric AS revenue,
          COALESCE(SUM(CASE WHEN p.status = 'succeeded' THEN 1 ELSE 0 END), 0)::int AS succeeded_count,
          COALESCE(SUM(CASE WHEN p.status = 'pending'   THEN 1 ELSE 0 END), 0)::int AS pending_count,
-         COALESCE(SUM(CASE WHEN p.status = 'canceled'  THEN 1 ELSE 0 END), 0)::int AS canceled_count
+         COALESCE(SUM(CASE WHEN p.status = 'canceled'  THEN 1 ELSE 0 END), 0)::int AS canceled_count,
+         COALESCE(SUM(CASE WHEN p.status = 'failed'    THEN 1 ELSE 0 END), 0)::int AS failed_count
        FROM days d
        LEFT JOIN payments p
          ON date_trunc('day', COALESCE(p.completed_at, p.created_at)) = d.day
-        AND ${AdminService.excludeTest('p.user_id')}
-       GROUP BY d.day
+        AND ${notTest}
+       GROUP BY d.day, COALESCE(p.currency, 'RUB')
        ORDER BY d.day ASC`,
       [days],
+    );
+
+    const revenueRes = await this.pg.query(
+      `SELECT
+         COALESCE(p.currency, 'RUB') AS currency,
+         COALESCE(SUM(p.amount) FILTER (WHERE p.status = 'succeeded'), 0) AS revenue_all,
+         COALESCE(SUM(p.amount) FILTER (
+           WHERE p.status = 'succeeded'
+             AND COALESCE(p.completed_at, p.created_at) >= now() - interval '30 days'
+         ), 0) AS revenue_30d,
+         COALESCE(SUM(p.amount) FILTER (
+           WHERE p.status = 'succeeded'
+             AND COALESCE(p.completed_at, p.created_at) >= now() - interval '7 days'
+         ), 0) AS revenue_7d,
+         COALESCE(SUM(p.amount) FILTER (
+           WHERE p.status = 'succeeded'
+             AND date_trunc('day', COALESCE(p.completed_at, p.created_at)) = date_trunc('day', now())
+         ), 0) AS revenue_today
+       FROM payments p
+       WHERE ${notTest}
+       GROUP BY COALESCE(p.currency, 'RUB')
+       ORDER BY 1 ASC`,
     );
 
     const totalsRes = await this.pg.query(
@@ -1598,43 +1661,70 @@ export class AdminService {
          COUNT(*) FILTER (WHERE status = 'succeeded') AS succeeded_count,
          COUNT(*) FILTER (WHERE status = 'pending')   AS pending_count,
          COUNT(*) FILTER (WHERE status = 'canceled')  AS canceled_count,
+         COUNT(*) FILTER (WHERE status = 'failed')    AS failed_count,
          COUNT(*)                                       AS total_count,
-         COALESCE(SUM(amount) FILTER (WHERE status = 'succeeded'), 0) AS revenue_all,
-         COALESCE(SUM(amount) FILTER (
-           WHERE status = 'succeeded'
-             AND COALESCE(completed_at, created_at) >= now() - interval '30 days'
-         ), 0) AS revenue_30d,
-         COALESCE(SUM(amount) FILTER (
-           WHERE status = 'succeeded'
-             AND COALESCE(completed_at, created_at) >= now() - interval '7 days'
-         ), 0) AS revenue_7d,
-         COALESCE(SUM(amount) FILTER (
-           WHERE status = 'succeeded'
-             AND date_trunc('day', COALESCE(completed_at, created_at)) = date_trunc('day', now())
-         ), 0) AS revenue_today,
          COUNT(DISTINCT user_id) FILTER (WHERE status = 'succeeded') AS unique_payers
-       FROM payments
-       WHERE ${AdminService.excludeTest('user_id')}`,
+       FROM payments p
+       WHERE ${notTest}`,
     );
     const t = totalsRes.rows[0] || {};
 
+    // Валюты, которые реально встретились. Порядок фиксируем рублём вперёд:
+    // это домашняя валюта, и в карточках она должна стоять первой. Дубли
+    // снимаем на всякий случай — группировка идёт по COALESCE, но выдача
+    // валют не то место, где стоит полагаться на форму запроса.
+    const currencies = [
+      ...new Set(revenueRes.rows.map((r: any) => String(r.currency || 'RUB'))),
+    ].sort((a, b) => (a === 'RUB' ? -1 : b === 'RUB' ? 1 : a.localeCompare(b)));
+
+    /** Собрать {RUB: n, USD: n} по одному из revenue_*-полей. */
+    const byCurrency = (field: string): Record<string, number> => {
+      const acc: Record<string, number> = {};
+      for (const cur of currencies) acc[cur] = 0;
+      // Именно +=, а не присваивание: строки с currency = NULL и с 'RUB'
+      // сходятся в одну метку, и второй такой группе нельзя затирать первую.
+      for (const r of revenueRes.rows) {
+        const cur = String((r as any).currency || 'RUB');
+        acc[cur] = (acc[cur] || 0) + (Number((r as any)[field]) || 0);
+      }
+      return acc;
+    };
+
+    // Дневной ряд приходит по строке на (день × валюта) — сворачиваем обратно
+    // в один день, держа выручку раздельно, а счётчики складывая.
+    const dailyByDay = new Map<string, any>();
+    for (const r of dailyRes.rows as any[]) {
+      const key = String(r.day);
+      let entry = dailyByDay.get(key);
+      if (!entry) {
+        entry = { day: r.day, revenue: {}, succeeded: 0, pending: 0, canceled: 0, failed: 0 };
+        for (const cur of currencies) entry.revenue[cur] = 0;
+        dailyByDay.set(key, entry);
+      }
+      const cur = String(r.currency || 'RUB');
+      entry.revenue[cur] = (entry.revenue[cur] || 0) + (Number(r.revenue) || 0);
+      entry.succeeded += Number(r.succeeded_count) || 0;
+      entry.pending += Number(r.pending_count) || 0;
+      entry.canceled += Number(r.canceled_count) || 0;
+      entry.failed += Number(r.failed_count) || 0;
+    }
+
     return {
-      daily: dailyRes.rows.map(r => ({
-        day: r.day,
-        revenue: Number(r.revenue) || 0,
-        succeeded: Number(r.succeeded_count) || 0,
-        pending: Number(r.pending_count) || 0,
-        canceled: Number(r.canceled_count) || 0,
-      })),
+      currencies,
+      include_test: !!opts.includeTest,
+      daily: [...dailyByDay.values()],
       totals: {
         succeeded_count: Number(t.succeeded_count) || 0,
         pending_count: Number(t.pending_count) || 0,
         canceled_count: Number(t.canceled_count) || 0,
+        // failed выставляет только «Приём» (expired/failed/refunded). Раньше он
+        // не попадал ни в один счётчик, и total_count не сходился с их суммой.
+        failed_count: Number(t.failed_count) || 0,
         total_count: Number(t.total_count) || 0,
-        revenue_all: Number(t.revenue_all) || 0,
-        revenue_30d: Number(t.revenue_30d) || 0,
-        revenue_7d: Number(t.revenue_7d) || 0,
-        revenue_today: Number(t.revenue_today) || 0,
+        revenue_all: byCurrency('revenue_all'),
+        revenue_30d: byCurrency('revenue_30d'),
+        revenue_7d: byCurrency('revenue_7d'),
+        revenue_today: byCurrency('revenue_today'),
         unique_payers: Number(t.unique_payers) || 0,
       },
     };
