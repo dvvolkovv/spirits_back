@@ -4,6 +4,7 @@ import { AuthService } from './auth.service';
 import { EmailService } from './email.service';
 import { OAuthGoogleService } from './oauth-google.service';
 import { OAuthYandexService } from './oauth-yandex.service';
+import { OAuthAppleService } from './oauth-apple.service';
 import { IdentityService } from '../identity/identity.service';
 import { JwtService } from '../common/services/jwt.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
@@ -27,6 +28,7 @@ export class AuthController {
     private readonly redis: RedisService,
     private readonly googleOAuth: OAuthGoogleService,
     private readonly yandexOAuth: OAuthYandexService,
+    private readonly appleOAuth: OAuthAppleService,
   ) {}
 
   // SMS OTP request — UUID hardcoded to match frontend
@@ -364,6 +366,89 @@ location.replace('/chat');
     }
 
     const { userId } = await this.identity.resolveOrCreate('yandex', userInfo);
+    return res.set(CORS).status(200).json({
+      'access-token':  this.jwt.signAccess(userId),
+      'refresh-token': this.jwt.signRefresh(userId),
+    });
+  }
+
+  /**
+   * Нативный вход через Apple.
+   *
+   * Отдельный путь от /auth/oauth/*: у Apple на устройстве нет ни обмена кода,
+   * ни redirect_uri — системный диалог сразу отдаёт подписанный identityToken.
+   * Гонять его через общий OAuth-флоу означало бы городить state и колбэк там,
+   * где они не нужны.
+   *
+   * `fullName` присылается ТОЛЬКО при самой первой авторизации: Apple второй
+   * раз имя не отдаёт ни при каких условиях. Поэтому его сохраняем сразу и
+   * никогда не ждём повторно.
+   *
+   * Поддерживает и вход, и привязку к существующему аккаунту — как остальные
+   * провайдеры: с Bearer-токеном это привязка, без него вход.
+   */
+  @Post('auth/apple/native')
+  async appleNative(
+    @Body() body: { identityToken?: string; fullName?: string },
+    @Req() req: any,
+    @Res() res: Response,
+  ) {
+    const identityToken = body?.identityToken;
+    if (!identityToken) {
+      return res.set(CORS).status(400).json({ error: 'missing identityToken' });
+    }
+
+    let userInfo: { sub: string; email: string; emailVerified: boolean };
+    try {
+      userInfo = await this.appleOAuth.verifyIdentityToken(identityToken);
+    } catch (e: any) {
+      // Неверная подпись, чужой aud, протухший токен — всё это 401, а не 400:
+      // запрос сформирован правильно, не принят именно предъявленный токен.
+      return res.set(CORS).status(401).json({ error: 'invalid apple token', detail: e.message });
+    }
+
+    // Привязка к текущему аккаунту, если пришли с Bearer.
+    const authHeader = req.headers['authorization'];
+    if (authHeader?.startsWith('Bearer ')) {
+      let userId: string | undefined;
+      try {
+        userId = this.jwt.verify(authHeader.substring(7)).userId;
+      } catch {
+        return res.set(CORS).status(401).json({ error: 'invalid token' });
+      }
+      const r = await this.identity.linkMethod(userId!, 'apple', userInfo);
+      if (!r.ok) {
+        const rFail = r as { ok: false; reason: 'conflict' | 'invalid'; conflictUserId?: string };
+        if (rFail.reason === 'conflict' && rFail.conflictUserId) {
+          const mergeToken = require('crypto').randomBytes(24).toString('base64url');
+          const conflictTokens = await this.identity.getTokenBalance(rFail.conflictUserId);
+          await this.redis.set(
+            `merge-token-${mergeToken}`,
+            JSON.stringify({ targetUserId: userId, conflictUserId: rFail.conflictUserId }),
+            300,
+          );
+          return res.set(CORS).status(409).json({ error: 'conflict', mergeToken, conflictTokens });
+        }
+        return res.set(CORS).status(409).json({ error: 'conflict' });
+      }
+      return res.set(CORS).status(200).json({ linked: true });
+    }
+
+    const { userId, isNew } = await this.identity.resolveOrCreate('apple', userInfo);
+
+    // Имя приходит один-единственный раз — при первом входе. Записываем сразу
+    // и только если своего имени у профиля ещё нет: перетирать то, что человек
+    // указал сам, нельзя.
+    const fullName = (body?.fullName || '').trim();
+    if (isNew && fullName) {
+      try {
+        await this.identity.setDisplayNameIfEmpty(userId, fullName);
+      } catch (e: any) {
+        // Имя — не повод не пустить в приложение.
+        this.logger?.warn?.(`имя из Apple не сохранилось: ${e.message}`);
+      }
+    }
+
     return res.set(CORS).status(200).json({
       'access-token':  this.jwt.signAccess(userId),
       'refresh-token': this.jwt.signRefresh(userId),

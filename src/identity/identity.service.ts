@@ -51,13 +51,13 @@ export class IdentityService implements OnModuleInit {
     // talerid отдаёт тот же {sub,email,emailVerified}, что google/yandex —
     // без этой ветки normalize бросал бы «unknown provider» уже в рантайме,
     // хотя типы бы сошлись.
-    if (provider === 'google' || provider === 'yandex' || provider === 'talerid') return data.sub;
+    if (provider === 'google' || provider === 'yandex' || provider === 'talerid' || provider === 'apple') return data.sub;
     throw new Error(`unknown provider: ${provider}`);
   }
 
   private extractEmail(provider: Provider, data: any): { email: string | null; verified: boolean } {
     if (provider === 'email')  return { email: this.normalize('email', data), verified: true };
-    if (provider === 'google' || provider === 'yandex' || provider === 'talerid') {
+    if (provider === 'google' || provider === 'yandex' || provider === 'talerid' || provider === 'apple') {
       return { email: (data.email || '').trim().toLowerCase(), verified: Boolean(data.emailVerified) };
     }
     return { email: null, verified: false };
@@ -197,6 +197,32 @@ export class IdentityService implements OnModuleInit {
     await this.pg.query(
       `UPDATE user_id SET state = 'deleted', update_date = now() WHERE internal_id = $1`,
       [conflictUserId],
+    );
+  }
+
+  /**
+   * Записать имя в профиль, если своего там ещё нет.
+   *
+   * Нужен для входа через Apple: имя приходит ТОЛЬКО при самой первой
+   * авторизации и больше никогда — второй раз Apple его не отдаёт ни при
+   * каких условиях. Поэтому его надо сохранить сразу.
+   *
+   * Условие «если пусто» обязательно: у Apple имя можно подставить любое,
+   * а человек мог уже указать своё в профиле. Перетирать введённое руками
+   * данными провайдера нельзя.
+   */
+  async setDisplayNameIfEmpty(userId: string, name: string): Promise<void> {
+    if (!this.pg) throw new Error('pg not configured');
+    const trimmed = name.trim();
+    if (!trimmed) return;
+
+    await this.pg.query(
+      `UPDATE ai_profiles_consolidated
+          SET profile_data = COALESCE(profile_data, '{}'::jsonb) || jsonb_build_object('name', $2::text),
+              updated_at = now()
+        WHERE user_id = $1
+          AND COALESCE(NULLIF(TRIM(profile_data->>'name'), ''), NULL) IS NULL`,
+      [userId, trimmed],
     );
   }
 

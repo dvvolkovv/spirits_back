@@ -4,11 +4,12 @@ import { AuthService } from './auth.service';
 import { EmailService } from './email.service';
 import { OAuthGoogleService } from './oauth-google.service';
 import { OAuthYandexService } from './oauth-yandex.service';
+import { OAuthAppleService } from './oauth-apple.service';
 import { IdentityModule } from '../identity/identity.module';
 
 @Module({
   imports: [IdentityModule],
   controllers: [AuthController],
-  providers: [AuthService, EmailService, OAuthGoogleService, OAuthYandexService],
+  providers: [AuthService, EmailService, OAuthGoogleService, OAuthYandexService, OAuthAppleService],
 })
 export class AuthModule {}
