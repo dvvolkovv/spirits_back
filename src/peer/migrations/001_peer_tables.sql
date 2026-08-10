@@ -87,3 +87,23 @@ CREATE TABLE IF NOT EXISTS user_reports (
 
 CREATE INDEX IF NOT EXISTS idx_user_reports_target
   ON user_reports (target_id, created_at DESC);
+
+-- Очередь модерации.
+--
+-- Жалоба до сих пор была записью в никуда: INSERT сюда есть, а SELECT нет
+-- ни одного во всём бэкенде — ни эндпоинта, ни экрана. При этом оферта
+-- обещает рассмотреть жалобу в течение 24 часов. Обязательство без
+-- механизма хуже отсутствующего: магазины приложений спрашивают именно
+-- чем оно обеспечено.
+--
+-- Колонки добавляются здесь, а НЕ отдельным файлом миграции: onModuleInit
+-- в peer.service.ts читает только 001, файлы 002 и далее не исполняются.
+-- Новый файл выглядел бы рабочим и молча ничего не делал.
+ALTER TABLE user_reports ADD COLUMN IF NOT EXISTS status      text NOT NULL DEFAULT 'new';
+ALTER TABLE user_reports ADD COLUMN IF NOT EXISTS resolution  text;
+ALTER TABLE user_reports ADD COLUMN IF NOT EXISTS resolved_at timestamptz;
+ALTER TABLE user_reports ADD COLUMN IF NOT EXISTS resolved_by text;
+
+-- Частичный индекс: очередь читают по неразобранным, а их всегда меньшинство.
+CREATE INDEX IF NOT EXISTS idx_user_reports_open
+  ON user_reports (created_at) WHERE status = 'new';

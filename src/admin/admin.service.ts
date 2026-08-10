@@ -777,6 +777,138 @@ export class AdminService {
     return { success: true };
   }
 
+
+  // --- Модерация ---
+  //
+  // Жалобы копились в user_reports с самого запуска peer-переписки, и до сих
+  // пор их никто не читал: во всём бэкенде был один INSERT и ни одного
+  // SELECT. Оферта при этом обещает рассмотреть жалобу в течение 24 часов.
+
+  /**
+   * Очередь жалоб.
+   *
+   * Отдаёт вместе с жалобой то, что нужно решить по ней, не уходя с экрана:
+   * имена обеих сторон, текст сообщения из контекста жалобы и не заблокирован
+   * ли нарушитель уже. Без этого модератору пришлось бы искать переписку
+   * руками по телефону.
+   */
+  async listReports(opts: { status?: string; limit?: number } = {}) {
+    const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
+    const params: any[] = [limit];
+    // По умолчанию — только неразобранные: очередь, а не архив.
+    let where = "WHERE r.status = 'new'";
+    if (opts.status === 'all') {
+      where = 'WHERE true';
+    } else if (opts.status && opts.status !== 'new') {
+      params.push(opts.status);
+      where = `WHERE r.status = $${params.length}`;
+    }
+
+    const res = await this.pg.query(
+      `SELECT
+         r.id, r.reporter_id, r.target_id, r.reason,
+         r.context_type, r.context_id,
+         r.status, r.resolution, r.resolved_at, r.resolved_by,
+         r.created_at,
+         reporter.profile_data->>'name' AS reporter_name,
+         target.profile_data->>'name'   AS target_name,
+         tu.state AS target_state,
+         pm.body  AS context_message
+       FROM user_reports r
+       LEFT JOIN ai_profiles_consolidated reporter ON reporter.user_id = r.reporter_id
+       LEFT JOIN ai_profiles_consolidated target   ON target.user_id   = r.target_id
+       LEFT JOIN user_id tu ON tu.internal_id = r.target_id
+       LEFT JOIN peer_messages pm ON pm.id = r.context_id
+       ${where}
+       ORDER BY r.created_at ASC
+       LIMIT $1`,
+      params,
+    );
+
+    return res.rows.map((r: any) => ({
+      id: r.id,
+      reporterId: r.reporter_id,
+      reporterName: r.reporter_name,
+      targetId: r.target_id,
+      targetName: r.target_name,
+      targetBlocked: r.target_state === 'blocked',
+      reason: r.reason,
+      contextType: r.context_type,
+      contextMessage: r.context_message,
+      status: r.status,
+      resolution: r.resolution,
+      resolvedAt: r.resolved_at,
+      resolvedBy: r.resolved_by,
+      createdAt: r.created_at,
+      // Часы с момента поступления: оферта обещает 24, и просроченное
+      // должно быть видно сразу, а не вычисляться глазами.
+      ageHours: Math.floor((Date.now() - new Date(r.created_at).getTime()) / 3_600_000),
+    }));
+  }
+
+  /** Сколько жалоб ждёт и есть ли просроченные — для бейджа в админке. */
+  async reportsSummary() {
+    const res = await this.pg.query(
+      `SELECT
+         count(*)::int                                                   AS open,
+         count(*) FILTER (WHERE created_at < now() - interval '24 hours')::int AS overdue
+       FROM user_reports WHERE status = 'new'`,
+    );
+    const row = res.rows[0] || {};
+    return { open: Number(row.open || 0), overdue: Number(row.overdue || 0) };
+  }
+
+  /**
+   * Разобрать жалобу.
+   *
+   * `block` дополнительно переводит аккаунт нарушителя в состояние blocked —
+   * это то же состояние, что проверяется при входе (auth.service.ts), то есть
+   * человек перестаёт входить, а не просто помечается.
+   */
+  async resolveReport(
+    id: string,
+    opts: { action: 'dismiss' | 'content_removed' | 'block'; note?: string; moderator: string },
+  ) {
+    const found = await this.pg.query('SELECT target_id, status FROM user_reports WHERE id = $1', [id]);
+    if (found.rows.length === 0) return { ok: false as const, reason: 'not_found' as const };
+
+    if (opts.action === 'block') {
+      await this.pg.query(
+        `UPDATE user_id SET state = 'blocked', update_date = now() WHERE internal_id = $1`,
+        [found.rows[0].target_id],
+      );
+    }
+
+    await this.pg.query(
+      `UPDATE user_reports
+          SET status = $2, resolution = $3, resolved_at = now(), resolved_by = $4
+        WHERE id = $1`,
+      [id, opts.action === 'dismiss' ? 'dismissed' : 'resolved', opts.note || opts.action, opts.moderator],
+    );
+
+    this.logger.log(`жалоба ${id}: ${opts.action} модератором ${opts.moderator}`);
+    return { ok: true as const };
+  }
+
+  /**
+   * Ежечасное напоминание о неразобранных жалобах.
+   *
+   * Без него очередь остаётся такой же немой, как таблица до неё: экран есть,
+   * но заходить на него никто не будет, пока не позовут. Молчим, когда
+   * разбирать нечего.
+   */
+  @Cron('0 5 * * * *')
+  async remindAboutReports() {
+    try {
+      const { open, overdue } = await this.reportsSummary();
+      if (open === 0) return;
+      const suffix = overdue > 0 ? `, из них просрочено ${overdue}` : '';
+      await sendTelegramAlert(`🚩 Неразобранных жалоб: ${open}${suffix}`);
+    } catch (e: any) {
+      this.logger.warn(`напоминание о жалобах не ушло: ${e.message}`);
+    }
+  }
+
   // --- Payments ---
 
   async listPayments(opts: { status?: string; limit?: number } = {}) {

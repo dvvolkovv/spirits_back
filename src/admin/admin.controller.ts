@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Param, Query, Res, UseGuards, Optional } from '@nestjs/common';
+import { Controller, Get, Post, Body, Param, Query, Req, Res, UseGuards, Optional } from '@nestjs/common';
 import { Response } from 'express';
 import { AdminService } from './admin.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
@@ -55,6 +55,48 @@ export class AdminController {
   async referralStats(@Res() res: Response) {
     const stats = await this.adminService.getReferralStats();
     return res.status(200).json(stats);
+  }
+
+  // --- Модерация ---
+
+  @Get('admin/reports')
+  async listReports(
+    @Query('status') status: string | undefined,
+    @Query('limit') limit: string | undefined,
+    @Res() res: Response,
+  ) {
+    const items = await this.adminService.listReports({
+      status,
+      limit: limit ? parseInt(limit, 10) || undefined : undefined,
+    });
+    return res.status(200).json(items);
+  }
+
+  @Get('admin/reports/summary')
+  async reportsSummary(@Res() res: Response) {
+    return res.status(200).json(await this.adminService.reportsSummary());
+  }
+
+  @Post('admin/reports/:id/resolve')
+  async resolveReport(
+    @Param('id') id: string,
+    @Body() body: { action?: string; note?: string },
+    @Req() req: any,
+    @Res() res: Response,
+  ) {
+    const action = body?.action;
+    if (action !== 'dismiss' && action !== 'content_removed' && action !== 'block') {
+      return res.status(400).json({ error: 'action must be dismiss | content_removed | block' });
+    }
+    const result = await this.adminService.resolveReport(id, {
+      action,
+      note: body?.note,
+      // Кто разобрал — из токена, а не из тела: иначе решение можно приписать
+      // кому угодно.
+      moderator: req.user?.userId || 'unknown',
+    });
+    if (!result.ok) return res.status(404).json({ error: 'report not found' });
+    return res.status(200).json({ ok: true });
   }
 
   // --- Payments ---
