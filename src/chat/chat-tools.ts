@@ -7,8 +7,16 @@ import { VideoService, InsufficientTokensError } from '../video/video.service';
 import { CreateVideoJobDto } from '../video/video.dto';
 import { RoutineStore, ENERGY_PROMPT } from '../routine-push/routine-store.service';
 import { CalendarService } from '../calendar/calendar.service';
+import { CalEvent } from '../calendar/calendar.types';
 import { Recurrence, expandOccurrences } from '../calendar/recurrence';
 import { SpeechService } from '../speech/speech.service';
+
+/** UTC ISO instant → product-local (+05:00) ISO string, for human-readable read_calendar output. */
+function toLocalIso(utcIso: string): string {
+  const t = new Date(utcIso).getTime();
+  if (isNaN(t)) return utcIso;
+  return new Date(t + 5 * 3_600_000).toISOString().replace(/\.\d{3}Z$/, '+05:00');
+}
 
 export const CHAT_TOOLS = [
   {
@@ -235,6 +243,33 @@ export const CHAT_TOOLS = [
     },
   },
   {
+    name: 'read_calendar',
+    description:
+      'ПРОЧИТАТЬ реальные события календаря пользователя за период (фактический календарь, НЕ предложения). ' +
+      'Вызывай, когда пользователь спрашивает про своё расписание/занятость/прошедшие или будущие события/сколько времени потрачено: ' +
+      '«что у меня на этой неделе», «сколько часов я занимался/потратил на X», «когда была встреча с …», «свободен ли вторник», «какие события были в августе». ' +
+      'Возвращает список событий (title, start, end, durationMin, source) из ВСЕХ подключённых календарей пользователя (Яндекс/Exchange/ICS/TalerID), отсортированных по времени. ' +
+      'По полю durationMin можно посчитать суммарные часы (напр. сумма durationMin по событиям с нужным названием / 60). ' +
+      'Текущую дату/время бери из контекста разговора и САМ вычисли границы периода («эта неделя», «вчера», «за август», «последние 7 дней»). ' +
+      'Если connected=false и событий нет — тактично предложи подключить календарь в профиле, чтобы Линкеон видел расписание.\n' +
+      '• from — начало периода (включительно). ISO локально без зоны: дата "2026-08-10" или дата-время "2026-08-10T09:00:00".\n' +
+      '• to — конец периода. Если указана только дата — включает весь этот день целиком. Максимум окно 366 дней.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        from: {
+          type: 'string',
+          description: 'Начало периода включительно. ISO локально без зоны: "2026-08-10" (дата) или "2026-08-10T09:00:00" (дата-время).',
+        },
+        to: {
+          type: 'string',
+          description: 'Конец периода. ISO локально; если указана только дата — включительно весь этот день. Максимум 366 дней от from.',
+        },
+      },
+      required: ['from', 'to'],
+    },
+  },
+  {
     name: 'generate_speech',
     description:
       'Озвучить текст голосом и показать пользователю аудио-плеер. Вызывай, когда просят «озвучь», ' +
@@ -296,6 +331,16 @@ export type ToolResult =
       connected: boolean;
       conflicts: { title: string; at: string }[];
       occurrenceCount?: number;
+    }
+  | {
+      ok: true;
+      kind: 'calendar_read';
+      from: string;
+      to: string;
+      connected: boolean;
+      count: number;
+      totalDurationMin: number;
+      events: { title: string; start: string; end?: string; durationMin?: number; source: string }[];
     }
   | {
       ok: true;
@@ -628,6 +673,30 @@ export class ChatToolsService {
           : [];
         const proposalId = await this.calendar.saveProposal(userId, event as any, connected, conflicts, kind);
         return { ok: true, kind: 'calendar_proposal', proposalId, itemKind: kind, event, connected, conflicts, occurrenceCount };
+      }
+
+      if (name === 'read_calendar') {
+        const from = String(input?.from || '').trim();
+        const to = String(input?.to || '').trim();
+        if (!from || !to) return { ok: false, error: 'from и to обязательны (период чтения календаря)' };
+        let events: CalEvent[];
+        try {
+          events = await this.calendar.listEventsLocalRange(userId, from, to);
+        } catch (e: any) {
+          return { ok: false, error: e?.message || 'не удалось прочитать календарь' };
+        }
+        // connected: события есть → точно подключён; иначе спрашиваем статус (Яндекс/Exchange), чтобы
+        // ассистент мог тактично предложить подключение, если календарь пуст И не подключён.
+        const status = await this.calendar.getStatus(userId);
+        const connected = events.length > 0 || status.connected || !!status.exchange?.connected;
+        const mapped = events.map((e) => {
+          const startMs = new Date(e.at).getTime();
+          const endMs = e.end ? new Date(e.end).getTime() : NaN;
+          const durationMin = !isNaN(endMs) && endMs > startMs ? Math.round((endMs - startMs) / 60_000) : undefined;
+          return { title: e.title, start: toLocalIso(e.at), end: e.end ? toLocalIso(e.end) : undefined, durationMin, source: e.source };
+        });
+        const totalDurationMin = mapped.reduce((s, e) => s + (e.durationMin || 0), 0);
+        return { ok: true, kind: 'calendar_read', from, to, connected, count: mapped.length, totalDurationMin, events: mapped };
       }
 
       return { ok: false, error: `unknown tool: ${name}` };

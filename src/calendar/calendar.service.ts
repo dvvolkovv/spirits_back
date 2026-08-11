@@ -14,6 +14,22 @@ import { TalerIdCalendarConnector } from '../talerid/talerid-calendar.connector'
 
 const OFFSET = '+05:00';
 
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+/** Append the product TZ offset when the ISO string carries none (no trailing Z / ±hh:mm). */
+function withOffset(s: string): string {
+  return /[zZ]$|[+-]\d{2}:?\d{2}$/.test(s) ? s : `${s}${OFFSET}`;
+}
+/** Parse an ISO-local range start: date-only → 00:00 that day (product TZ). */
+export function parseLocalStart(s: string): Date {
+  return new Date(withOffset(DATE_ONLY_RE.test(s) ? `${s}T00:00:00` : s));
+}
+/** Parse an ISO-local range end: a date-only bound is INCLUSIVE of that whole day → next-day 00:00
+ *  (listEvents' window is half-open [start, end)); a datetime is used as-is. */
+export function parseLocalEnd(s: string): Date {
+  if (DATE_ONLY_RE.test(s)) return new Date(new Date(withOffset(`${s}T00:00:00`)).getTime() + 86_400_000);
+  return new Date(withOffset(s));
+}
+
 /** Pure overlap check: does a proposed event (naive local + duration) intersect an existing CalEvent? */
 export function overlaps(p: ProposedEvent, existing: CalEvent, durationMin = 60): boolean {
   const ps = new Date(`${p.datetime}${OFFSET}`).getTime();
@@ -369,6 +385,21 @@ export class CalendarService {
       }
     } catch (e: any) { this.logger.error(`talerid list failed: ${e.message}`); } // defensive — connector already degrades to [] on its own
     return out.sort((a, b) => a.at.localeCompare(b.at));
+  }
+
+  /**
+   * Assistant-facing read over a LOCAL date/datetime range (read_calendar tool). Accepts ISO-local
+   * strings without timezone — a date "2026-08-10" or a datetime "2026-08-10T09:00:00" — interpreted
+   * in the product TZ (OFFSET). A date-only `to` is INCLUSIVE of that whole day. Returns the same
+   * union as listEvents. Throws on an invalid/backwards range; the window is capped at 366 days.
+   */
+  async listEventsLocalRange(userId: string, fromLocal: string, toLocal: string): Promise<CalEvent[]> {
+    const start = parseLocalStart(fromLocal);
+    const end = parseLocalEnd(toLocal);
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) throw new Error('некорректные даты периода');
+    if (end.getTime() <= start.getTime()) throw new Error('конец периода должен быть позже начала');
+    if (end.getTime() - start.getTime() > 366 * 86_400_000) throw new Error('период слишком большой (максимум 366 дней)');
+    return this.listEvents(userId, start, end);
   }
 
   /**
