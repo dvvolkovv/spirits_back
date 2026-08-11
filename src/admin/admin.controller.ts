@@ -212,6 +212,19 @@ export class AdminController {
     return res.status(200).json(stats);
   }
 
+  // --- Устройства ---
+
+  @Get('admin/devices/stats')
+  async deviceStats(@Res() res: Response) {
+    return res.status(200).json(await this.adminService.getDeviceStats());
+  }
+
+  @Get('admin/devices')
+  async userDevices(@Query('userId') userId: string, @Res() res: Response) {
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    return res.status(200).json(await this.adminService.getUserDevices(userId));
+  }
+
   @Post('admin/referral')
   async referralAction(@CurrentUser() user: any, @Body() body: any, @Res() res: Response) {
     const { action, ...data } = body;
