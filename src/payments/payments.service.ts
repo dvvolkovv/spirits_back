@@ -5,6 +5,7 @@ import { ReferralService } from '../referral/referral.service';
 import { EventsService } from '../events/events.service';
 import { creditWithBonus, OFFER_MSG_THRESHOLD } from '../offer/offer-bonus';
 import { sendTelegramAlert } from '../common/telegram-alert';
+import { resolvePackage } from './packages';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -229,18 +230,33 @@ export class PaymentsService {
     return res.rows[0] || null;
   }
 
+  /**
+   * Сколько токенов начислить за пакет.
+   *
+   * Объём приходит из общего модуля прайса. Своя карта здесь была третьей
+   * копией и 08.04.2026 подвела: `starter` в ней отсутствовал, сработал
+   * откат, и десять человек получили по 149 000 токенов вместо 50 000.
+   *
+   * Откат по сумме сейчас НЕДОСТИЖИМ: единственный путь сюда — createPayment,
+   * а его зовёт только контроллер, который уже отверг незнакомый пакет
+   * отказом 400. Он оставлен вторым слоем на случай, если этот гард когда-то
+   * уберут или появится второй вызывающий.
+   *
+   * Не заменять на throw: платёж в YooKassa создаётся выше по коду, а строка
+   * в payments пишется ниже. Исключение здесь оставило бы висящий счёт, за
+   * который можно заплатить и ничего не получить, — это хуже неверного числа.
+   * Поэтому вместо падения громкий лог: срабатывание отката означает, что
+   * инвариант нарушен и разбираться надо немедленно.
+   */
   private tokensForPackage(pkg: string, amount: number): number {
-    const map: Record<string, number> = {
-      basic: 50000,
-      starter: 50000,
-      standard: 200000,
-      extended: 200000,
-      premium: 1000000,
-      professional: 1000000,
-      business: 3_000_000,
-      maximum: 7_000_000,
-    };
-    return map[pkg] || Math.floor((amount || 0) * 1000);
+    const known = resolvePackage(pkg);
+    if (known) return known.tokens;
+
+    this.logger.error(
+      `tokensForPackage: пакет "${pkg}" не найден в прайсе — начисляю по сумме ${amount}. ` +
+        'Это не должно происходить: контроллер отвергает незнакомые пакеты раньше.',
+    );
+    return Math.floor((amount || 0) * 1000);
   }
 
   async handleNotification(body: any) {
