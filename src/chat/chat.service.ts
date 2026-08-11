@@ -51,6 +51,41 @@ export interface ChargeFacts {
 }
 
 /**
+ * Ошибки апстрима, которые релей отдаёт как обычный текст ответа.
+ *
+ * Claude CLI при отвале подписки или протухшем OAuth печатает сообщение в
+ * stdout и выходит. Для релея это просто текст, он передаёт его дальше как
+ * ответ ассистента — с нулевым costUsd и без usage, потому что модель не
+ * работала. 11.08.2026 такой ход четырём пользователям обошёлся в 288 токенов
+ * каждому: сработал откат «длина × 2», и мы взяли деньги за чужую поломку.
+ *
+ * Строки английские и стабильные — это тексты CLI, не наши. Держим список
+ * узким: задача отличить поломку от работы, а не угадывать все сбои.
+ */
+const UPSTREAM_ERROR_SIGNATURES = [
+  'disabled claude subscription access',
+  'oauth token has expired',
+  'invalid api key',
+  'claude code process exited',
+  'credit balance is too low',
+];
+
+/**
+ * Похож ли ответ на проброшенную ошибку апстрима, а не на работу ассистента.
+ *
+ * Порог длины обязателен: ассистента могут СПРОСИТЬ про такую ошибку, и его
+ * разбор — полноценный ответ, за который списать надо. Пробросы короткие (на
+ * проде 144 символа), разборы — в разы длиннее.
+ */
+export function isUpstreamErrorReply(text: string): boolean {
+  if (!text) return false;
+  const trimmed = text.trim();
+  if (trimmed.length > 400) return false;
+  const low = trimmed.toLowerCase();
+  return UPSTREAM_ERROR_SIGNATURES.some(sig => low.includes(sig));
+}
+
+/**
  * Дособирает ссылки на файлы, которые ассистент оформить не смог.
  *
  * Ассистенту инструкцией запрещено писать пути и URL: их подставляет
@@ -885,7 +920,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       if (!aiText) return; // skip empty intermediate persists
       // ЭТО реальная точка списания (ниже addTokenTask). Логируем только здесь:
       // путь показа считает то же самое, дублировать в лог незачем.
-      const charge = this.computeSdkCharge(agentUsage, agentCostUsd, fullText.length);
+      const charge = this.computeSdkCharge(agentUsage, agentCostUsd, fullText);
       const textCost = charge.tokens;
       const logLine = `billing[${charge.source}]: tokens=${textCost} ${charge.note}`;
       if (charge.source === 'length') this.logger.warn(logLine);
@@ -1180,7 +1215,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Картинки/видео списываются MCP-сервисами отдельно (см. toolSpent ниже).
       // Число для индикатора «X токенов». Считается тем же методом, что и реальное
       // списание в persistResponse, — иначе юзер увидит одно, а спишется другое.
-      const tokensUsed = this.computeSdkCharge(agentUsage, agentCostUsd, fullText.length).tokens;
+      const tokensUsed = this.computeSdkCharge(agentUsage, agentCostUsd, fullText).tokens;
 
       // Sum up tool-charged tokens (image, video, etc.) during this stream.
       // MCP-tools (MiscService.generateImage, VideoService.createJob,
@@ -1460,8 +1495,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
   private computeSdkCharge(
     usage: SdkUsageTotals | null,
     costUsd: number,
-    textLength: number,
+    text: string,
   ): { tokens: number; source: 'usage' | 'cost' | 'length'; note: string } {
+    const textLength = text.length;
     if (usage && (usage.input || usage.output || usage.cacheRead || usage.cacheWrite5m || usage.cacheWrite1h)) {
       const weighted =
         usage.input * this.W_INPUT +
@@ -1498,6 +1534,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
         tokens: Math.ceil(costUsd * this.TOKENS_PER_USD),
         source: 'cost',
         note: `usage не пришёл, считаю по costUsd=$${costUsd.toFixed(4)}`,
+      };
+    }
+    // Ни usage, ни costUsd — модель либо не работала вовсе, либо релей потерял
+    // цифры. Различаем по тексту: проброс ошибки апстрима бесплатен, всё
+    // остальное считаем по длине, иначе настоящая работа (в том числе
+    // субагентная) окажется подарком при каждом сбое телеметрии.
+    if (isUpstreamErrorReply(text)) {
+      return {
+        tokens: 0,
+        source: 'length',
+        note: 'ответ — проброс ошибки апстрима, не списываю',
       };
     }
     return {
