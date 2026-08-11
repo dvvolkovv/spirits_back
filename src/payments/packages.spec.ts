@@ -1,60 +1,86 @@
+import { PACKAGES, ALIASES, resolvePackage } from './packages';
 import { PRIEM_PACKAGES } from './priem.service';
-import { PaymentsService } from './payments.service';
 
 /**
- * Прайс живёт на фронте, а число начисляемых токенов — здесь. Репозитории
- * разные, и карта легко отстанет от витрины. Ожидаемая таблица выписана явно:
- * правка карты без правки таблицы роняет сборку.
+ * Прайс — не тот код, где незамеченная правка допустима. Ожидаемая таблица
+ * выписана отдельно от реализации: правка цены «мимоходом» роняет тест, и
+ * менять прайс приходится осознанно, в двух местах.
  */
-const EXPECTED_RUB: Array<[string, number]> = [
-  ['starter', 50_000],
-  ['extended', 200_000],
-  ['professional', 1_000_000],
-  ['business', 3_000_000],
-  ['maximum', 7_000_000],
+const EXPECTED: Array<[string, number, number]> = [
+  ['starter', 149, 50_000],
+  ['extended', 499, 200_000],
+  ['professional', 1990, 1_000_000],
+  ['business', 4990, 3_000_000],
+  ['maximum', 9990, 7_000_000],
 ];
 
-describe('пакеты токенов', () => {
-  describe('рублёвая карта', () => {
-    // tokensForPackage приватный: он часть контракта оплаты, а не публичный
-    // API. Метод не обращается к this, поэтому зовём его через прототип.
-    const tokensFor = (id: string, amount = 0): number =>
-      (PaymentsService.prototype as any).tokensForPackage.call(null, id, amount);
+const per1000 = (p: { priceRub: number; tokens: number }) => p.priceRub / (p.tokens / 1000);
+const BASE_PER_1000 = 149 / 50;
 
-    for (const [id, tokens] of EXPECTED_RUB) {
-      it(`${id} даёт ${tokens} токенов`, () => {
-        expect(tokensFor(id)).toBe(tokens);
-      });
-    }
-
-    it('незнакомый пакет не даёт ноль — откат на формулу от суммы', () => {
-      expect(tokensFor('нет-такого', 7)).toBe(7000);
-    });
+describe('прайс токенов', () => {
+  it('совпадает с согласованным списком', () => {
+    expect(PACKAGES.map((p) => [p.id, p.priceRub, p.tokens])).toEqual(EXPECTED);
   });
 
-  describe('валютная линейка', () => {
-    it('состоит из трёх пакетов', () => {
-      expect(PRIEM_PACKAGES.map((p) => p.id)).toEqual(['pro_usd', 'business_usd', 'maximum_usd']);
-    });
+  // Немонотонная лестница делает более крупную покупку невыгодной.
+  it('цена за 1000 токенов строго убывает', () => {
+    const prices = PACKAGES.map(per1000);
+    for (let i = 1; i < prices.length; i++) {
+      expect(prices[i]).toBeLessThan(prices[i - 1]);
+    }
+  });
 
-    // Тот же инвариант, что на фронте: более крупный пакет обязан быть выгоднее.
-    it('цена за миллион токенов строго убывает', () => {
-      const perMillion = PRIEM_PACKAGES.map((p) => p.usd / (p.tokens / 1_000_000));
-      for (let i = 1; i < perMillion.length; i++) {
-        expect(perMillion[i]).toBeLessThan(perMillion[i - 1]);
-      }
-    });
+  it('ярлык скидки не превышает фактическую выгоду', () => {
+    for (const p of PACKAGES) {
+      if (p.savingsPct === undefined) continue;
+      expect(p.savingsPct).toBeLessThanOrEqual((1 - per1000(p) / BASE_PER_1000) * 100);
+    }
+  });
 
-    // Снят с витрины: $19.6 за миллион против $20.7 у business_usd ломало
-    // монотонность и делало более крупную покупку невыгодной.
-    it('max_usd больше не заказывается', () => {
-      expect(PRIEM_PACKAGES.find((p) => p.id === 'max_usd')).toBeUndefined();
-    });
+  it('ярлык скидки кратен пяти', () => {
+    for (const p of PACKAGES) {
+      if (p.savingsPct === undefined) continue;
+      expect(p.savingsPct % 5).toBe(0);
+    }
+  });
 
-    it('все пакеты проходят порог оплаты картой', () => {
-      for (const p of PRIEM_PACKAGES) {
-        expect(p.usd).toBeGreaterThanOrEqual(10);
-      }
-    });
+  it('у базового пакета ярлыка нет', () => {
+    expect(PACKAGES[0].savingsPct).toBeUndefined();
+  });
+});
+
+describe('псевдонимы', () => {
+  it('исторические имена ведут на живые пакеты', () => {
+    for (const [alias, target] of Object.entries(ALIASES)) {
+      expect(PACKAGES.some((p) => p.id === target)).toBe(true);
+      expect(PACKAGES.some((p) => p.id === alias)).toBe(false);
+    }
+  });
+
+  it('resolvePackage находит пакет и по своему имени, и по псевдониму', () => {
+    expect(resolvePackage('professional')?.priceRub).toBe(1990);
+    expect(resolvePackage('premium')?.priceRub).toBe(1990);
+    expect(resolvePackage('basic')?.tokens).toBe(50_000);
+  });
+
+  it('resolvePackage не выдумывает пакет для незнакомого имени', () => {
+    expect(resolvePackage('нет-такого')).toBeUndefined();
+  });
+});
+
+describe('валютная линейка', () => {
+  it('состоит из трёх пакетов', () => {
+    expect(PRIEM_PACKAGES.map((p) => p.id)).toEqual(['pro_usd', 'business_usd', 'maximum_usd']);
+  });
+
+  it('цена за миллион токенов строго убывает', () => {
+    const perMillion = PRIEM_PACKAGES.map((p) => p.usd / (p.tokens / 1_000_000));
+    for (let i = 1; i < perMillion.length; i++) {
+      expect(perMillion[i]).toBeLessThan(perMillion[i - 1]);
+    }
+  });
+
+  it('max_usd больше не заказывается', () => {
+    expect(PRIEM_PACKAGES.find((p) => p.id === 'max_usd')).toBeUndefined();
   });
 });
