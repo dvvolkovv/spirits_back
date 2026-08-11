@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { PgService } from './pg.service';
 
-export const SUPPORTED_LANGUAGES = ['ru', 'en', 'es', 'de', 'fr', 'zh'] as const;
+export const SUPPORTED_LANGUAGES = ['ru', 'en', 'es', 'de', 'fr', 'zh', 'pt'] as const;
 export const DEFAULT_LANGUAGE = 'ru';
 
 /** Названия для системного промпта — модель понимает их однозначнее кодов. */
@@ -12,6 +12,10 @@ export const LANGUAGE_NAMES: Record<string, string> = {
   de: 'German / Deutsch (немецком)',
   fr: 'French / français (французском)',
   zh: 'Simplified Chinese / 简体中文 (упрощённом китайском)',
+  // Европейский португальский, а не бразильский: витрина в App Store
+  // заведена как Portugal, и интерфейс переведён под неё. Модели это
+  // важно — варианты расходятся заметно (utilizador против usuário).
+  pt: 'European Portuguese / português de Portugal (европейском португальском)',
 };
 
 @Injectable()
