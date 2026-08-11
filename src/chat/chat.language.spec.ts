@@ -41,7 +41,12 @@ describe('resolveUserLanguage — приоритет профиля и подс�
 
   it('подсказка схлопывается до корня и проверяется по списку', async () => {
     expect(await svcWith(null).resolveUserLanguage('u3', 'es-MX')).toBe('es');
-    expect(await svcWith(null).resolveUserLanguage('u4', 'pt-BR')).toBe('ru');
+    // 'pt-BR' здесь стоял как пример НЕподдерживаемого языка — португальский с
+    // тех пор добавили, и тест краснел. Теперь он проверяет обе половины
+    // утверждения: живой региональный вариант схлопывается до корня, мёртвый
+    // откатывается в русский.
+    expect(await svcWith(null).resolveUserLanguage('u4', 'pt-BR')).toBe('pt');
+    expect(await svcWith(null).resolveUserLanguage('u6', 'ja-JP')).toBe('ru');
   });
 
   it('нет ни профиля, ни подсказки — русский', async () => {

@@ -14,9 +14,22 @@ describe('LanguageService', () => {
     });
 
     it('падает в русский на неизвестном и пустом', () => {
-      expect(LanguageService.normalize('pt')).toBe('ru');
+      // Раньше примером неподдерживаемого языка служил 'pt'. Португальский с тех
+      // пор добавили в SUPPORTED_LANGUAGES, и тест краснел, требуя от живого
+      // языка отката в русский. Берём коды, которых в списке заведомо нет.
+      expect(LanguageService.normalize('ja')).toBe('ru');
+      expect(LanguageService.normalize('klingon')).toBe('ru');
       expect(LanguageService.normalize(undefined)).toBe('ru');
       expect(LanguageService.normalize(null)).toBe('ru');
+    });
+
+    it('каждый язык из списка нормализуется сам в себя', () => {
+      // Страховка от повторения истории: язык, добавленный в SUPPORTED_LANGUAGES,
+      // больше не может втихую откатываться в русский, а этот тест — устареть,
+      // потому что он читает сам список, а не его копию.
+      for (const code of SUPPORTED_LANGUAGES) {
+        expect(LanguageService.normalize(code)).toBe(code);
+      }
     });
   });
 

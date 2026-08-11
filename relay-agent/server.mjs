@@ -99,12 +99,98 @@ kind: 'task' — ДЕЛО/задача, которую можно «выполн
 
 const sessionMap = new Map();
 
+// ── Персист карты сессий ─────────────────────────────────────────────────────
+// sessionMap живёт в памяти, и до этой правки ЛЮБОЙ рестарт релея обнулял её
+// целиком: все пользователи разом теряли --resume и начинали claude-сессию с
+// нуля. 11.08.2026 один плановый выкат сбросил 91 сессию — в том числе
+// многодневную работу юриста над 144-страничной апелляционной жалобой.
+// Потери не видно ни в одном логе: ассистент просто перестаёт помнить, о чём
+// шла речь, а пользователь думает, что он «поглупел».
+//
+// Файл рядом с кодом, а не в /tmp: tmpfs чистится при перезагрузке, и смысл
+// персиста пропал бы ровно там, где он нужнее всего.
+const SESSION_STORE_PATH = "/home/dv/file-agent/sessions.json";
+
+function loadSessionMap() {
+  let raw;
+  try {
+    raw = JSON.parse(fs.readFileSync(SESSION_STORE_PATH, "utf8"));
+  } catch {
+    return; // файла нет (первый запуск) или он битый — начинаем с чистой карты
+  }
+  if (!raw || typeof raw !== "object") return;
+  let restored = 0;
+  let dropped = 0;
+  for (const [sid, claudeSid] of Object.entries(raw)) {
+    if (typeof claudeSid !== "string" || !claudeSid) continue;
+    // Транскрипт мог быть удалён (ротация, чистка диска) — тогда --resume
+    // упадёт «No conversation found» на ПЕРВОМ же сообщении пользователя.
+    // Дешевле отбросить запись сейчас, чем ронять ход потом.
+    if (!fs.existsSync(sessionJsonlPath(claudeSid))) { dropped++; continue; }
+    sessionMap.set(sid, claudeSid);
+    restored++;
+  }
+  console.log("sessions restored: " + restored + (dropped ? ", dropped (нет транскрипта): " + dropped : ""));
+}
+
+// Запись пачкой: ev.session_id приходит в КАЖДОМ событии стрима, и писать файл
+// на каждое означало бы сотни записей в секунду на ровном месте.
+let persistTimer = null;
+function scheduleSessionPersist() {
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    try {
+      // Через временный файл + rename: rename атомарен, поэтому падение посреди
+      // записи не оставит обрезанный JSON, из которого не поднимется ни одна
+      // сессия.
+      const tmp = SESSION_STORE_PATH + ".tmp";
+      fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(sessionMap)));
+      fs.renameSync(tmp, SESSION_STORE_PATH);
+    } catch (e) {
+      console.log("sessions persist failed: " + e.message);
+    }
+  }, 2000);
+  // unref: незаконченный таймер не должен держать процесс при остановке.
+  if (persistTimer.unref) persistTimer.unref();
+}
+
+/** Запомнить claude-сессию. Пишем на диск только когда значение реально сменилось. */
+function rememberSession(sid, claudeSid) {
+  if (sessionMap.get(sid) === claudeSid) return;
+  sessionMap.set(sid, claudeSid);
+  scheduleSessionPersist();
+}
+
+/** Забыть сессию (ротация по размеру, сброс из-за перегруза картинками). */
+function forgetSession(sid) {
+  if (!sessionMap.has(sid)) return;
+  sessionMap.delete(sid);
+  scheduleSessionPersist();
+}
+
+// Сохранить немедленно, не дожидаясь таймера: pm2 restart шлёт SIGINT/SIGTERM,
+// и без этого последние 2 секунды изменений терялись бы при каждом выкате.
+function persistNow() {
+  try {
+    fs.writeFileSync(SESSION_STORE_PATH, JSON.stringify(Object.fromEntries(sessionMap)));
+  } catch { /* остановке помешать не можем */ }
+}
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => { persistNow(); process.exit(0); });
+}
+
 // Ротация раздутых сессий: бесконечный --resume копит мегабайты английского
 // тул-вывода (JSONL до 20+ МБ) → постоянная авто-компакция, падение качества
 // и языковые утечки. При превышении порога начинаем свежую Claude-сессию,
 // передав хвост диалога в промпт для непрерывности.
 const SESSION_ROTATE_BYTES = 4 * 1024 * 1024;
 const sessionJsonlPath = (claudeSid) => "/home/dv/.claude/projects/-tmp/" + claudeSid + ".jsonl";
+
+// Поднимаем карту сессий с диска. Строго ЗДЕСЬ, а не выше: loadSessionMap
+// проверяет наличие транскриптов через sessionJsonlPath, а он объявлен const —
+// не поднимается, и вызов раньше упал бы в temporal dead zone.
+loadSessionMap();
 
 function extractTailDialogue(claudeSid, maxMsgs = 30, maxCharsPerMsg = 1500) {
   try {
@@ -413,6 +499,13 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   // error and has no specific message to show. Useless to the user — filter out.
   const NO_RESP_PLACEHOLDER = "No response requested.";
 
+  // Протухший --resume: id сессии у нас есть, а транскрипта под ним уже нет.
+  // Раньше это было почти невозможно (карта жила ровно столько же, сколько
+  // процесс), но с персистом на диск карта переживает и рестарт, и чистку
+  // ~/.claude — и без обработки КАЖДОЕ сообщение такого пользователя падало бы
+  // одинаково, навсегда. Ловим и переигрываем с чистой сессии.
+  const STALE_RESUME_RE = /No conversation found with session ID|session .* not found/i;
+
   function runOnce(useResume) {
     return new Promise((resolve) => {
       const runArgs = useResume && sessionMap.has(sessionId)
@@ -450,9 +543,10 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       let imageLimitHit = false;
       let transientHit = false;
       let maxTurnsHit = false;
+      let staleResumeHit = false;
 
       const handleEvent = (ev) => {
-        if (ev.session_id) sessionMap.set(sessionId, ev.session_id);
+        if (ev.session_id) rememberSession(sessionId, ev.session_id);
         if (ev.type === "result") {
           // Потолок шагов. Проверяем ЗДЕСЬ, а не в ветке `result && ev.result`
           // ниже: при error_max_turns CLI не кладёт в result никакого текста,
@@ -504,6 +598,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
             ev.is_error === true ||
             (typeof ev.subtype === "string" && ev.subtype !== "success") ||
             !!ev.api_error_status;
+          if (STALE_RESUME_RE.test(ev.result)) { staleResumeHit = true; return; }
           // Отказ CLI — не показываем сырой английский текст и не берём денег.
           // Проверяем ДО isErrorResult: «You've hit your session limit» приходил
           // и без is_error/api_error_status, обычным успешным result.
@@ -540,23 +635,32 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         }
       });
 
-      child.stderr.on("data", () => {});
+      // stderr раньше молча выбрасывался. Именно туда CLI пишет отказ
+      // «No conversation found with session ID» — при протухшем --resume
+      // валидного stream-json на stdout не появляется вовсе, и распознать
+      // причину больше негде. Держим только хвост: чужой болтливый stderr не
+      // должен раздувать память.
+      let errTail = "";
+      child.stderr.on("data", (chunk) => {
+        errTail = (errTail + chunk.toString()).slice(-4000);
+        if (STALE_RESUME_RE.test(errTail)) staleResumeHit = true;
+      });
 
       child.on("close", () => {
         if (buf.trim()) { try { handleEvent(JSON.parse(buf)); } catch {} }
         try { execSync("pkill -f 'bun.*server.ts' --newer " + child.pid + " 2>/dev/null || true"); } catch {}
         const cur = activeChildren.get(sessionId);
         if (cur && cur.child === child) activeChildren.delete(sessionId);
-        resolve({ imageLimitHit, transientHit, maxTurnsHit });
+        resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit });
       });
 
       child.on("error", (err) => {
         // Network/spawn errors are transient too
         if (TRANSIENT_RE.test(err.message || '')) {
-          resolve({ imageLimitHit: false, transientHit: true, maxTurnsHit: false });
+          resolve({ imageLimitHit: false, transientHit: true, maxTurnsHit: false, staleResumeHit: false });
         } else {
           if (!clientDisconnected) res.write("data: " + JSON.stringify({ type: "error", text: err.message }) + "\n\n");
-          resolve({ imageLimitHit: false, transientHit: false, maxTurnsHit: false });
+          resolve({ imageLimitHit: false, transientHit: false, maxTurnsHit: false, staleResumeHit: false });
         }
       });
     });
@@ -570,7 +674,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         const st = fs.statSync(sessionJsonlPath(claudeSid));
         if (st.size > SESSION_ROTATE_BYTES) {
           const tail = extractTailDialogue(claudeSid);
-          sessionMap.delete(sessionId);
+          forgetSession(sessionId);
           useResume = false;
           if (tail) {
             prompt = "Недавний диалог с этим пользователем (только контекст для непрерывности — отвечай ТОЛЬКО на последнее сообщение ниже):\n" + tail + "\n---\n\n" + prompt;
@@ -580,9 +684,21 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       } catch {}
     }
     let r = await runOnce(useResume);
+
+    // Протухший resume. Сессия есть в карте, транскрипта под ней нет — такое
+    // стало возможным с тех пор, как карта переживает рестарт. Без этой ветки
+    // пользователь застревал бы НАВСЕГДА: каждое его сообщение падало бы
+    // одинаково, потому что мёртвый id остаётся в карте.
+    if (r.staleResumeHit && useResume) {
+      console.log("stale resume для " + sessionId + " — сброс и переигрыш с чистой сессии");
+      forgetSession(sessionId);
+      useResume = false;
+      r = await runOnce(false);
+    }
+
     if (r.imageLimitHit) {
       // Session is bloated with images — drop and retry fresh, transparently.
-      sessionMap.delete(sessionId);
+      forgetSession(sessionId);
       notice("_(сессия была очищена — слишком много изображений; продолжаю с чистого листа)_");
       r = await runOnce(false);
     } else if (r.transientHit && taleridWriteUsed) {
