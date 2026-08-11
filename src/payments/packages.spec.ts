@@ -88,9 +88,13 @@ describe('валютная линейка', () => {
 
 describe('начисление за пакет', () => {
   // tokensForPackage приватный: это часть контракта оплаты, а не публичный
-  // API. Метод не обращается к this, поэтому зовём его через прототип.
+  // API, поэтому зовём его через прототип. Метод при откате логирует через
+  // this.logger — подставляем заглушку вместо реального экземпляра сервиса
+  // (тянуть его целиком с зависимостями pg/referral/events ради вызова
+  // одного метода незачем).
+  const fakeThis = { logger: { error: () => {} } };
   const tokensFor = (id: string, amount = 0): number =>
-    (PaymentsService.prototype as any).tokensForPackage.call(null, id, amount);
+    (PaymentsService.prototype as any).tokensForPackage.call(fakeThis, id, amount);
 
   for (const [id, , tokens] of EXPECTED) {
     it(`${id} начисляет ${tokens}`, () => {
