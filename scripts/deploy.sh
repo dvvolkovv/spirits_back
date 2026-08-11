@@ -25,6 +25,12 @@
 #   NO_ROLLBACK=1      — отключить авто-rollback на проде при smoke failure
 #                        (по умолчанию: если PHASE 2 smoke красный — откат
 #                         back+front к pre-deploy SHA, restart сервисов)
+#   STREAM_DRAIN_SECONDS=N — сколько ждать завершения живых чат-ходов перед
+#                        рестартом (default 1800). Рестарт посреди стрима
+#                        убивает ответ молча — см. wait_for_streams_drain.
+#   FORCE_RESTART=1    — не ждать живые ходы (оборвёт чей-то ответ; только
+#                        когда прод лежит и ждать нечего).
+#
 #   SMOKE_ATTEMPTS=N   — сколько раз прогнать smoke прежде чем считать фазу
 #                        красной (default 2). Первый прогон ещё и прогревает
 #                        холодные пути; откат только если ВСЕ попытки красные.
@@ -259,10 +265,58 @@ warm_chat_path() {
   green "  ✓ chat+browser+smm paths warmed ($base)"
 }
 
+# Ждём, пока на среде не останется чат-ходов в полёте.
+#
+# pm2 restart посреди стрима убивает ход НАСМЕРТЬ и молча: ответа не появляется
+# вовсе (заглушка «попробуйте ещё раз» пишется в persistResponse того же
+# процесса), пользователю не показывается ошибка, ретрая нет, в истории остаётся
+# его вопрос без ответа. 2026-08-10 20:22 так потеряли ход юриста: выкат пришёл
+# через 58 секунд после вопроса на 27 274 символа, релей ещё три минуты доделывал
+# работу на ≈$25 в никуда, пользователь ждал полтора часа и не понимал, что
+# случилось.
+#
+# Окно большое (30 минут по умолчанию): ходы юридических ассистентов с фан-аутом
+# субагентов идут по 20–25 минут — именно их дороже всего рвать.
+#
+# Если эндпоинта нет (бэкенд старее этой правки) — не блокируем деплой, иначе
+# первый же выкат самой правки стал бы невозможен.
+wait_for_streams_drain() {
+  local max_wait="${STREAM_DRAIN_SECONDS:-1800}"
+  local step=15
+  local waited=0
+  local n
+  while (( waited < max_wait )); do
+    n=$(curl -s --max-time 10 ${BASIC_AUTH:+-u "$BASIC_AUTH"} \
+          "${BASE_URL}/webhook/chat/active-streams" \
+        | sed -n 's/.*"active"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+    if [[ -z "$n" ]]; then
+      red "  ⚠ $ENV_NAME: /webhook/chat/active-streams не ответил числом — жду вслепую нельзя, иду дальше"
+      return 0
+    fi
+    if (( n == 0 )); then
+      green "  ✓ $ENV_NAME: живых ходов нет — можно перезапускать"
+      return 0
+    fi
+    bold "  ⏳ $ENV_NAME: ходов в полёте $n — жду (${waited}/${max_wait}s)"
+    sleep "$step"
+    waited=$(( waited + step ))
+  done
+  red "  ✗ $ENV_NAME: за ${max_wait}s ходы так и не закончились."
+  red "    Рестарт сейчас оборвёт живой ответ. Либо подожди, либо FORCE_RESTART=1."
+  return 1
+}
+
 deploy_backend() {
   bold "=== BACKEND ($ENV_NAME) ==="
   bold "[back 1/3] pushing local commits to origin"
   push_local_repo "$LOCAL_BACK_DIR" "spirits_back"
+
+  if [[ "${FORCE_RESTART:-0}" == "1" ]]; then
+    red "  ⚠ FORCE_RESTART=1 — рестарт без ожидания, живые ходы будут оборваны"
+  else
+    bold "[back 1.5/3] ожидание завершения живых чат-ходов ($ENV_NAME)"
+    wait_for_streams_drain || exit 1
+  fi
 
   bold "[back 2/3] pulling on $ENV_NAME + building + restarting"
   ssh_remote "

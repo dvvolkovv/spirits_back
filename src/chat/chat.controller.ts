@@ -22,6 +22,19 @@ export class ChatController {
     @Optional() private readonly events?: EventsService,
   ) {}
 
+  /**
+   * Сколько ходов прямо сейчас в полёте. Спрашивает deploy.sh перед
+   * `pm2 restart`: рестарт посреди стрима убивает ответ молча — ни ошибки
+   * пользователю, ни ретрая, ни строки в истории (инцидент 2026-08-10 20:22).
+   *
+   * Без авторизации сознательно: у деплой-скрипта нет токена, а наружу уходит
+   * одно число без единой подробности о том, кто и о чём говорит.
+   */
+  @Get('chat/active-streams')
+  activeStreams() {
+    return { active: this.chatService.getActiveStreamCount() };
+  }
+
   @Post('soulmate/chat')
   async chat(@Req() req: Request, @Res() res: Response) {
     // Auth: check Bearer but don't throw (auth inside workflow behavior)

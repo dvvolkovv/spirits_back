@@ -831,7 +831,7 @@ export class AdminService {
          reporter.profile_data->>'name' AS reporter_name,
          target.profile_data->>'name'   AS target_name,
          tu.state AS target_state,
-         pm.body  AS context_message
+         pm.content AS context_message
        FROM user_reports r
        LEFT JOIN ai_profiles_consolidated reporter ON reporter.user_id = r.reporter_id
        LEFT JOIN ai_profiles_consolidated target   ON target.user_id   = r.target_id

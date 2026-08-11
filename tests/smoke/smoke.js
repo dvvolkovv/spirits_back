@@ -257,6 +257,13 @@ async function step(name, fn) {
       '/webhook/admin/tokens/stats?days=7',
       '/webhook/admin/users/active?days=7',
       '/webhook/admin/usage/assistants?days=7',
+      // Очередь жалоб. Стоит здесь не для полноты: её запрос делает JOIN к
+      // peer_messages и профилям, и опечатка в имени колонки роняет ручку
+      // пятисоткой. Юнит-тесты такое не ловят в принципе — подставной pg
+      // запоминает SQL, но не исполняет его. Поймали уже после выката:
+      // pm.body вместо pm.content.
+      '/webhook/admin/reports?limit=5',
+      '/webhook/admin/reports/summary',
     ];
     for (const ep of endpoints) {
       const r = await axios.get(`${BASE_URL}${ep}`, H);

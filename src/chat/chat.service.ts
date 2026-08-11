@@ -170,6 +170,23 @@ export class ChatService {
   private readonly inflight = new Map<string, { state: 'running' | 'done'; ts: number }>();
   private readonly DEDUP_COOLDOWN_MS = 12000;
   private readonly DEDUP_RUNNING_TTL_MS = 600000; // страховка от «залипшего» running
+
+  /**
+   * Сколько ходов прямо сейчас в полёте. Считается отдельно от inflight-мапы:
+   * у той TTL 10 минут (страховка дедупа), а ходы юридических ассистентов идут
+   * по 20–25 минут — как раз те, которые нельзя рвать.
+   *
+   * Нужен деплою. 2026-08-10 в 20:22 выкат перезапустил процесс через 58 секунд
+   * после того, как пользователь отправил сообщение: ход убило посреди стрима,
+   * ответа не появилось вовсе (заглушка «попробуйте ещё раз» живёт в
+   * persistResponse того же процесса), а релей ещё три минуты жёг токены в никуда.
+   */
+  private activeStreams = 0;
+
+  /** Ходов в полёте. 0 — можно перезапускать, не порвав ничей ответ. */
+  getActiveStreamCount(): number {
+    return this.activeStreams;
+  }
   private dupKey(userId: string, assistantId: string, message: string): string {
     return `${userId}::${assistantId}::${(message || '').trim().slice(0, 300)}`;
   }
@@ -922,6 +939,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
     };
 
     try {
+      // Ход пошёл в upstream — с этого места и до finally его нельзя рвать
+      // рестартом. Инкремент внутри try, чтобы декремент в finally был парным
+      // при любом исходе.
+      this.activeStreams++;
       // Один вызов upstream r.linkeon: парсит SSE, пушит в chunks и стримит
       // 'item' клиенту. Вынесено в замыкание ради self-heal ретрая пустого потока.
       const callUpstreamOnce = async (): Promise<void> => {
@@ -1230,6 +1251,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Async persist — preserves user message + partial response.
       setImmediate(() => { void persistResponse(true); });
     } finally {
+      this.activeStreams--;
       clearInterval(heartbeat);
     }
   }
