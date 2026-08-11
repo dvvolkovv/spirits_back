@@ -1,5 +1,6 @@
 import { PACKAGES, ALIASES, resolvePackage } from './packages';
 import { PRIEM_PACKAGES } from './priem.service';
+import { PaymentsService } from './payments.service';
 
 /**
  * Прайс — не тот код, где незамеченная правка допустима. Ожидаемая таблица
@@ -82,5 +83,30 @@ describe('валютная линейка', () => {
 
   it('max_usd больше не заказывается', () => {
     expect(PRIEM_PACKAGES.find((p) => p.id === 'max_usd')).toBeUndefined();
+  });
+});
+
+describe('начисление за пакет', () => {
+  // tokensForPackage приватный: это часть контракта оплаты, а не публичный
+  // API. Метод не обращается к this, поэтому зовём его через прототип.
+  const tokensFor = (id: string, amount = 0): number =>
+    (PaymentsService.prototype as any).tokensForPackage.call(null, id, amount);
+
+  for (const [id, , tokens] of EXPECTED) {
+    it(`${id} начисляет ${tokens}`, () => {
+      expect(tokensFor(id)).toBe(tokens);
+    });
+  }
+
+  it('исторические имена начисляют столько же, сколько нынешние', () => {
+    expect(tokensFor('basic')).toBe(tokensFor('starter'));
+    expect(tokensFor('standard')).toBe(tokensFor('extended'));
+    expect(tokensFor('premium')).toBe(tokensFor('professional'));
+  });
+
+  // Откат существует, чтобы платёж не остался без начисления вовсе. Число
+  // будет не то, но деньги не пропадут, и это лучше нуля.
+  it('незнакомый пакет откатывается на формулу от суммы', () => {
+    expect(tokensFor('нет-такого', 7)).toBe(7000);
   });
 });

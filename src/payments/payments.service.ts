@@ -5,6 +5,7 @@ import { ReferralService } from '../referral/referral.service';
 import { EventsService } from '../events/events.service';
 import { creditWithBonus, OFFER_MSG_THRESHOLD } from '../offer/offer-bonus';
 import { sendTelegramAlert } from '../common/telegram-alert';
+import { resolvePackage } from './packages';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -229,18 +230,19 @@ export class PaymentsService {
     return res.rows[0] || null;
   }
 
+  /**
+   * Сколько токенов начислить за пакет.
+   *
+   * Объём приходит из общего модуля прайса. Своя карта здесь была третьей
+   * копией и 08.04.2026 подвела: `starter` в ней отсутствовал, сработал
+   * откат, и десять человек получили по 149 000 токенов вместо 50 000.
+   *
+   * Откат по сумме оставлен намеренно: если имя пакета всё же окажется
+   * незнакомым, платёж не должен остаться без начисления вовсе. Число будет
+   * не то, но деньги не пропадут.
+   */
   private tokensForPackage(pkg: string, amount: number): number {
-    const map: Record<string, number> = {
-      basic: 50000,
-      starter: 50000,
-      standard: 200000,
-      extended: 200000,
-      premium: 1000000,
-      professional: 1000000,
-      business: 3_000_000,
-      maximum: 7_000_000,
-    };
-    return map[pkg] || Math.floor((amount || 0) * 1000);
+    return resolvePackage(pkg)?.tokens ?? Math.floor((amount || 0) * 1000);
   }
 
   async handleNotification(body: any) {
