@@ -9,6 +9,7 @@ import { IdentityService } from '../identity/identity.service';
 import { JwtService } from '../common/services/jwt.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { RedisService } from '../common/services/redis.service';
+import { DevicesService } from '../devices/devices.service';
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -29,6 +30,7 @@ export class AuthController {
     private readonly googleOAuth: OAuthGoogleService,
     private readonly yandexOAuth: OAuthYandexService,
     private readonly appleOAuth: OAuthAppleService,
+    private readonly devices: DevicesService,
   ) {}
 
   // SMS OTP request — UUID hardcoded to match frontend
@@ -61,12 +63,15 @@ export class AuthController {
     @Param('code') code: string,
     @Query('sid') sid: string,
     @Query('src') src: string,
+    @Req() req: Request,
     @Res() res: Response,
   ) {
     const tokens = await this.authService.checkCode(phone, code, sid, src);
     if (!tokens) {
       return res.set(CORS).status(401).json({ error: 'Invalid or expired code' });
     }
+    // У телефонной регистрации внутренний идентификатор — сам номер.
+    void this.devices.record(phone, req.headers['user-agent']);
     return res.set(CORS).status(200).json(tokens);
   }
 
@@ -78,10 +83,14 @@ export class AuthController {
       return res.status(401).json({ error: 'Missing token' });
     }
     const token = authHeader.substring(7);
-    const tokens = await this.authService.refreshTokens(token);
-    if (!tokens) {
+    const result = await this.authService.refreshTokens(token);
+    if (!result) {
       return res.status(401).json({ error: 'Invalid refresh token' });
     }
+    // userId наружу не уходит: он нужен только для записи устройства, а форма
+    // ответа читается уже выложенными клиентами и меняться не должна.
+    const { userId, ...tokens } = result;
+    void this.devices.record(userId, req.headers['user-agent']);
     return res.status(200).json(tokens);
   }
 

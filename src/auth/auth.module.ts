@@ -6,9 +6,10 @@ import { OAuthGoogleService } from './oauth-google.service';
 import { OAuthYandexService } from './oauth-yandex.service';
 import { OAuthAppleService } from './oauth-apple.service';
 import { IdentityModule } from '../identity/identity.module';
+import { DevicesModule } from '../devices/devices.module';
 
 @Module({
-  imports: [IdentityModule],
+  imports: [IdentityModule, DevicesModule],
   controllers: [AuthController],
   providers: [AuthService, EmailService, OAuthGoogleService, OAuthYandexService, OAuthAppleService],
 })

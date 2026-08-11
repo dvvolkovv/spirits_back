@@ -219,7 +219,9 @@ export class AuthService {
     return { phone, balance_before: balanceBefore, balance_after: balanceAfter };
   }
 
-  async refreshTokens(refreshToken: string): Promise<{ 'access-token': string; 'refresh-token': string } | null> {
+  async refreshTokens(
+    refreshToken: string,
+  ): Promise<{ 'access-token': string; 'refresh-token': string; userId: string } | null> {
     try {
       const payload = this.jwtSvc.verify(refreshToken);
       if (payload.type !== 'refresh') return null;
@@ -227,6 +229,7 @@ export class AuthService {
       return {
         'access-token': this.jwtSvc.signAccess(userId),
         'refresh-token': this.jwtSvc.signRefresh(userId),
+        userId,
       };
     } catch {
       return null;

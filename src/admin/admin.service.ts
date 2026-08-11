@@ -1861,4 +1861,102 @@ export class AdminService {
       },
     };
   }
+
+  // --- Устройства ---
+
+  /** Окно свежести сводки: активными считаем тех, кто заходил за 30 дней. */
+  private static readonly DEVICE_WINDOW = "last_seen > now() - interval '30 days'";
+
+  /** Устройства одного человека, свежие первыми. */
+  async getUserDevices(userId: string) {
+    const res = await this.pg.query(
+      `SELECT signature, platform, os_name, os_version, browser_name, browser_version,
+              first_seen, last_seen, seen_count
+         FROM user_devices
+        WHERE user_id = $1
+        ORDER BY last_seen DESC`,
+      [userId],
+    );
+    return res.rows.map((r) => ({
+      signature: r.signature,
+      platform: r.platform,
+      os: [r.os_name, r.os_version].filter(Boolean).join(' ') || null,
+      browser: [r.browser_name, r.browser_version].filter(Boolean).join(' ') || null,
+      first_seen: r.first_seen,
+      last_seen: r.last_seen,
+      seen_count: Number(r.seen_count) || 0,
+    }));
+  }
+
+  /**
+   * Сводка по устройствам активных пользователей.
+   *
+   * Везде считаются РАЗЛИЧНЫЕ пользователи, а не строки: два браузера у одного
+   * человека дают единицу в «десктоп», а не двойку.
+   *
+   * Проценты по корзинам намеренно не сходятся к 100%: человек с ноутбуком и
+   * телефоном попадает в обе. Подписать это обязан интерфейс.
+   *
+   * ВНИМАНИЕ на два разных «unknown», которые легко спутать:
+   *   - `unknownUsers` — клиент, которого классификатор не узнал вовсе. Рост
+   *     этого числа означает, что процентам верить нельзя.
+   *   - `unknown` в разбивке по ОС — это ещё и Flutter: он сообщает платформу
+   *     (`app_flutter`), но операционную систему из его строки не достать.
+   *     Это НЕ признак поломки разбора.
+   * Интерфейс обязан называть их по-разному, иначе нормальная работа Flutter
+   * будет выглядеть как деградация классификатора.
+   */
+  async getDeviceStats() {
+    const W = AdminService.DEVICE_WINDOW;
+
+    const bucket = async (column: string) => {
+      const res = await this.pg.query(
+        `SELECT COALESCE(${column}, 'unknown') AS key, COUNT(DISTINCT user_id)::int AS users
+           FROM user_devices
+          WHERE ${W}
+          GROUP BY 1
+          ORDER BY users DESC`,
+      );
+      return res.rows.map((r) => ({ key: r.key, users: Number(r.users) || 0 }));
+    };
+
+    const totalRes = await this.pg.query(
+      `SELECT COUNT(DISTINCT user_id)::int AS users FROM user_devices WHERE ${W}`,
+    );
+
+    const mobilePlatforms = "('mobile','app_flutter','app_webview')";
+
+    const touchedRes = await this.pg.query(
+      `SELECT COUNT(DISTINCT user_id)::int AS users
+         FROM user_devices
+        WHERE ${W} AND platform IN ${mobilePlatforms}`,
+    );
+
+    const onlyRes = await this.pg.query(
+      `SELECT COUNT(*)::int AS users FROM (
+         SELECT user_id
+           FROM user_devices
+          WHERE ${W}
+          GROUP BY user_id
+         HAVING bool_and(platform IN ${mobilePlatforms})
+       ) t`,
+    );
+
+    const unknownRes = await this.pg.query(
+      `SELECT COUNT(DISTINCT user_id)::int AS users
+         FROM user_devices
+        WHERE ${W} AND platform = 'unknown'`,
+    );
+
+    return {
+      windowDays: 30,
+      totalUsers: Number(totalRes.rows[0]?.users) || 0,
+      byPlatform: await bucket('platform'),
+      byOs: await bucket('os_name'),
+      byBrowser: await bucket('browser_name'),
+      mobileTouched: Number(touchedRes.rows[0]?.users) || 0,
+      mobileOnly: Number(onlyRes.rows[0]?.users) || 0,
+      unknownUsers: Number(unknownRes.rows[0]?.users) || 0,
+    };
+  }
 }
