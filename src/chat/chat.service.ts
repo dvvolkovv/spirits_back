@@ -218,9 +218,32 @@ export class ChatService {
    */
   private activeStreams = 0;
 
+  /**
+   * Живые ходы поимённо: `${userId}_${assistantId}` → когда начался.
+   *
+   * Счётчика выше не хватает: он отвечает деплою на вопрос «можно ли сейчас
+   * рестартовать», а фронту нужен другой — «идёт ли ход ИМЕННО у меня». Без
+   * этого перезагрузка страницы посреди долгого ответа выглядит как зависший
+   * чат: индикатор «печатает» жил только в памяти вкладки и после F5 исчезал,
+   * ответ ещё считался, а пользователь видел тишину и слал «?» — и этим «?»
+   * убивал собственный ход (релей пре-эмптит предыдущий процесс сессии).
+   */
+  private readonly activeTurns = new Map<string, number>();
+
   /** Ходов в полёте. 0 — можно перезапускать, не порвав ничей ответ. */
   getActiveStreamCount(): number {
     return this.activeStreams;
+  }
+
+  /**
+   * Идёт ли прямо сейчас ход по этой паре пользователь+ассистент, и сколько он
+   * уже длится. Для индикатора «ассистент работает» после перезагрузки.
+   */
+  getActiveTurn(userId: string, assistantId: string): { active: boolean; startedMsAgo: number } {
+    const startedAt = this.activeTurns.get(`${userId}_${assistantId}`);
+    return startedAt
+      ? { active: true, startedMsAgo: Date.now() - startedAt }
+      : { active: false, startedMsAgo: 0 };
   }
   private dupKey(userId: string, assistantId: string, message: string): string {
     return `${userId}::${assistantId}::${(message || '').trim().slice(0, 300)}`;
@@ -277,6 +300,22 @@ export class ChatService {
     return cyr / letters < 0.1;
   }
 
+  /**
+   * Служебный отказ Claude CLI, притворившийся ответом ассистента: протухший
+   * вход, исчерпанная сессия, пустой баланс. Такой «ответ» нельзя ни показывать
+   * дословно, ни тарифицировать.
+   *
+   * Ограничение по длине — намеренное. Отказ CLI это одна короткая строка
+   * целиком; настоящий ответ ассистента, который лишь ЦИТИРУЕТ такую фразу
+   * («у меня выскочило „Not logged in“, что делать?»), под порог не попадёт и
+   * пострадать не должен.
+   */
+  private looksCliFailure(text: string): boolean {
+    const t = (text || '').trim();
+    if (!t || t.length > 300) return false;
+    return /Not logged in|Please run \/login|hit your (session|usage) limit|Invalid API key|Credit balance is too low|OAuth token (has )?expired/i.test(t);
+  }
+
   async streamChat(
     userId: string,
     message: string,
@@ -292,6 +331,11 @@ export class ChatService {
     // Язык интерфейса из тела запроса — подсказка на случай пустого профиля.
     // Профиль остаётся главным, приоритет разбирает resolveUserLanguage.
     requestLang?: string,
+    // Часовой пояс клиента (IANA, из Intl.DateTimeFormat). Без него модель
+    // живёт по UTC сервера и расходится с пользователем: юрист из ЯНАО (UTC+5)
+    // 11.08 писала «я тебе в 19:44 файлы направляю», а ассистент видел 14:44 и
+    // объяснял ей эту разницу вручную посреди рабочего разговора.
+    clientTz?: string,
   ): Promise<void> {
     // Get agent
     // Custom-agent branch: "custom:<uuid>" references user-created agents.
@@ -415,7 +459,7 @@ export class ChatService {
         userId, message, String(assistantId), String(agent.id),
         recentHistory, profileText, res,
         agent.name, agent.description || '', agent.system_prompt || '',
-        req, fresh, chatSessionId, requestLang,
+        req, fresh, chatSessionId, requestLang, clientTz,
       );
     }
 
@@ -692,6 +736,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     freshSessionId?: string,
     // Подсказка языка из тела запроса — см. streamChat и resolveUserLanguage.
     requestLang?: string,
+    // Часовой пояс клиента (IANA) — см. streamChat.
+    clientTz?: string,
   ): Promise<void> {
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
@@ -806,6 +852,32 @@ ${LanguageService.buildDirective(userLanguage)}`;
       }
     } catch { /* non-fatal — продолжаем без блока коллег */ }
 
+    // Текущее время ГЛАЗАМИ ПОЛЬЗОВАТЕЛЯ. Без этого модель считает время по UTC
+    // сервера: 11.08 пользовательница из ЯНАО (UTC+5) написала «я тебе в 19:44
+    // файлы направляю», ассистент видел у себя 14:44, и разницу в пять часов ему
+    // пришлось разбирать с ней вручную посреди рабочего разговора. Сроки, дедлайны
+    // и «сегодня/завтра» до этой правки тоже считались от чужого времени.
+    //
+    // Пояс берём только из запроса и молча пропускаем блок, если фронт его не
+    // прислал или прислал мусор: показать заведомо чужое время хуже, чем никакое.
+    if (clientTz && /^[A-Za-z]+\/[A-Za-z0-9_+\-\/]+$/.test(clientTz)) {
+      try {
+        const now = new Date();
+        const local = new Intl.DateTimeFormat('ru-RU', {
+          timeZone: clientTz,
+          dateStyle: 'full',
+          timeStyle: 'short',
+        }).format(now);
+        contextPrefix +=
+          `--- Время пользователя ---\n` +
+          `Сейчас у пользователя: ${local} (часовой пояс ${clientTz}).\n` +
+          `Считай «сегодня», «завтра», сроки и дедлайны от ЭТОГО времени, а не от своего системного.\n\n`;
+      } catch (e: any) {
+        // Незнакомый Intl пояс — не повод ронять ход.
+        this.logger.warn(`не удалось отформатировать время для пояса ${clientTz}: ${e?.message}`);
+      }
+    }
+
     // YouTube transcripts — fetch on our side and inject; remote agent has no YouTube parsing.
     const ytIds = this.extractYouTubeIds(message);
     if (ytIds.length > 0) {
@@ -877,6 +949,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const agentUsage: SdkUsageTotals = {
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
     };
+    // Релей сообщил, что ход закончился БЕЗ финального ответа: упёрлись в потолок
+    // шагов, ход прерван новым сообщением пользователя, отказ CLI или сбой связи.
+    // Такой ход не тарифицируется — платить за пустоту пользователь не должен.
+    // Расход перед Anthropic при этом реален, поэтому частота таких ходов уезжает
+    // в chat_quality: рост — это счёт, который мы оплачиваем в одиночку.
+    let turnFailed = false;
+    let failReason = '';
 
     // Single persistence point — dedupe via `saved` flag so success and error paths
     // both call but only one actually writes.
@@ -891,7 +970,19 @@ ${LanguageService.buildDirective(userLanguage)}`;
         const e = this.inflight.get(dkey);
         if (e && e.state === 'done' && Date.now() - e.ts >= this.DEDUP_COOLDOWN_MS) this.inflight.delete(dkey);
       }, this.DEDUP_COOLDOWN_MS + 2000);
-      const fullText = this.stripLeakedToolSyntax(chunks.join('').trim());
+      let fullText = this.stripLeakedToolSyntax(chunks.join('').trim());
+      // Защита в глубину. Основной барьер — FATAL_RE на релее, но он ловит только
+      // известные ему сигнатуры и только в своей сборке. Если служебный отказ CLI
+      // всё же долетел сюда целым ответом, пользователь не должен увидеть его
+      // дословно и тем более за него заплатить: в истории 79088644408 лежат
+      // «You've hit your session limit · resets 11:50am (UTC)» и «Not logged in ·
+      // Please run /login», выданные как реплики ассистента и стоившие токенов.
+      if (this.looksCliFailure(fullText)) {
+        this.logger.error(`CLI-отказ долетел до бэкенда как ответ (${userId}_${assistantId}): ${fullText.slice(0, 120)}`);
+        turnFailed = true;
+        failReason = failReason || 'cli_fatal_text';
+        fullText = '_Не получилось: временный сбой на стороне платформы. Токены за этот ход не списаны — попробуйте отправить сообщение ещё раз._';
+      }
       if (final) {
         // Quality-телеметрия: пустой ответ / англ-утечка / объём — для агрегатов
         // и алертов регрессии (инициатива «гарантия качества», беклог a867ef3b).
@@ -899,10 +990,16 @@ ${LanguageService.buildDirective(userLanguage)}`;
           userId, sessionId: `${userId}_${assistantId}`,
           props: {
             assistant_id: assistantId,
-            ok: fullText.length > 0,
+            // Оборванный ход больше не проходит как ok. Раньше огрызок из одних
+            // прогресс-меток («…Вношу группу А.», 209 символов) улетал сюда как
+            // {ok:true} — по телеметрии всё было здорово, пока пользователь слал
+            // «?» в тишину.
+            ok: fullText.length > 0 && !turnFailed,
             empty: fullText.length === 0,
             chars: fullText.length,
             english_leak: this.looksEnglishLeak(fullText),
+            failed: turnFailed,
+            fail_reason: failReason || undefined,
           },
         });
       }
@@ -921,9 +1018,15 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // ЭТО реальная точка списания (ниже addTokenTask). Логируем только здесь:
       // путь показа считает то же самое, дублировать в лог незачем.
       const charge = this.computeSdkCharge(agentUsage, agentCostUsd, fullText);
-      const textCost = charge.tokens;
-      const logLine = `billing[${charge.source}]: tokens=${textCost} ${charge.note}`;
-      if (charge.source === 'length') this.logger.warn(logLine);
+      // Ход без финального ответа пользователю не выставляется — решение владельца.
+      // Расход перед Anthropic всё равно понесён, поэтому пишем его в лог явно:
+      // иначе «бесплатные» ходы станут невидимой статьёй затрат.
+      const textCost = turnFailed ? 0 : charge.tokens;
+      const logLine = turnFailed
+        ? `billing[skipped:${failReason}]: ход без финального ответа — не тарифицирован, ` +
+          `иначе списали бы ${charge.tokens} (${charge.note})`
+        : `billing[${charge.source}]: tokens=${textCost} ${charge.note}`;
+      if (turnFailed || charge.source === 'length') this.logger.warn(logLine);
       else this.logger.log(logLine);
 
       // Алерт на аномально дорогой ход. Про ход юриста за $47 (169 208 токенов,
@@ -952,12 +1055,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
           await this.saveChatHistory(userId, assistantId, message, aiText, textCost, sessOverride);
         }
         if (fullText.length > 0) {
-          await this.addTokenTask(userId, 0, textCost, agentId, {
-            costUsd: Number(agentCostUsd.toFixed(4)),
-            source: charge.source,
-            durationMs: Date.now() - streamStartTime,
-            replyChars: fullText.length,
-          });
+          // Списание — только за ход, доведённый до финального ответа. Обучение
+          // профиля и разбор задач идут в любом случае: оборванный ход всё равно
+          // был настоящим разговором, и терять из него контекст незачем.
+          if (!turnFailed) {
+            await this.addTokenTask(userId, 0, textCost, agentId, {
+              costUsd: Number(agentCostUsd.toFixed(4)),
+              source: charge.source,
+              durationMs: Date.now() - streamStartTime,
+              replyChars: fullText.length,
+            });
+          }
           // Профиль формируется и в fresh-режиме (чистый лист скрывает контекст,
           // но не отключает обучение профиля).
           if (this.neo4j) {
@@ -978,6 +1086,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // рестартом. Инкремент внутри try, чтобы декремент в finally был парным
       // при любом исходе.
       this.activeStreams++;
+      this.activeTurns.set(`${userId}_${assistantId}`, streamStartTime);
       // Один вызов upstream r.linkeon: парсит SSE, пушит в chunks и стримит
       // 'item' клиенту. Вынесено в замыкание ради self-heal ретрая пустого потока.
       const callUpstreamOnce = async (): Promise<void> => {
@@ -1025,12 +1134,27 @@ ${LanguageService.buildDirective(userLanguage)}`;
                   if (ev.type === 'delta' || ev.type === 'text') {
                     chunks.push(ev.text);
                     safeWrite({ type: 'item', content: ev.text });
+                  } else if (ev.type === 'notice' && ev.text) {
+                    // Служебная реплика платформы («ответ прерван», «упёрлись в
+                    // лимит шагов»). В отличие от `result` — дописывается ВСЕГДА.
+                    //
+                    // Раньше релей слал такие пояснения обычным `result`, и ветка
+                    // ниже глушила их всякий раз, когда текст уже шёл, — то есть
+                    // ровно в том случае, ради которого они и написаны. Поэтому
+                    // оборванный ответ выглядел как молчание: пользователь читал
+                    // «Вношу группу А.» и тишину, а потом слал «?».
+                    chunks.push(ev.text);
+                    safeWrite({ type: 'item', content: ev.text });
                   } else if (ev.type === 'result' && ev.text) {
                     if (chunks.length === 0) {
                       chunks.push(ev.text);
                       safeWrite({ type: 'item', content: ev.text });
                     }
                   } else if (ev.type === 'done') {
+                    if (ev.failed === true) {
+                      turnFailed = true;
+                      failReason = typeof ev.failReason === 'string' ? ev.failReason : 'unknown';
+                    }
                     if (typeof ev.costUsd === 'number' && ev.costUsd > 0) {
                       agentCostUsd += ev.costUsd;
                     }
@@ -1287,6 +1411,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       setImmediate(() => { void persistResponse(true); });
     } finally {
       this.activeStreams--;
+      this.activeTurns.delete(`${userId}_${assistantId}`);
       clearInterval(heartbeat);
     }
   }

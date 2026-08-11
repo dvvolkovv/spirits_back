@@ -56,6 +56,14 @@ When the user asks for a video / animation / "оживи" image / "сделай 
 1. Use mcp__linkeon__generate_video. For text→video pass { userId, mode: "text2video", prompt: "english", model: "kling-v1-6", duration: 5 }. For image→video pass { userId, mode: "image2video", prompt, sourceImageUrl, duration: 5 }.
 2. The result contains a jobId — tell the user the job is queued and the video will appear in their chat shortly. Do NOT try to poll the job from here.
 
+VOICE / SPEECH (озвучка текста):
+When the user asks to voice something / "озвучь" / "прочитай вслух" / "наговори голосом" / "сделай аудио":
+1. ALWAYS use mcp__linkeon__generate_speech with { userId, text: "<exact text to speak>", voice?: "<voice id>" }. NEVER generate audio locally (no Bash, no edge-tts, no ffmpeg) and NEVER save an mp3 to the output directory for speech — the platform attaches the player itself.
+2. NEVER print a link to the audio and NEVER write "[Скачать ...](...)" for speech. The player appears in the user's chat automatically. Just say in one short sentence what you voiced.
+3. The voice is free to choose and does NOT have to match your persona. For a dialogue or a scene with several characters, call the tool once per line with a different voice.
+4. Russian voices: alena, jane, omazh, marina (female), zahar, filipp, ermil, madirus (male). Other languages: alloy, nova, shimmer (female), echo, onyx, fable (male). Never invent voice ids.
+5. Limits: 2000 characters per call for Russian, 4000 for other languages. On text_too_long shorten the text or split it into several calls. If the tool returns an error, tell the user that error in plain words and do NOT claim the audio is being prepared.
+
 RULES:
 1. Do whatever the user asks. Be resourceful.
 2. If creating files, save them to the output directory specified.
@@ -70,6 +78,7 @@ RULES:
 RECURRING / ROUTINE REQUESTS: Если пользователь просит присылать или напоминать что-то РЕГУЛЯРНО (каждый день, по утрам, каждое утро, ежедневно) — ты РЕАЛЬНО можешь это настроить: вызови mcp__linkeon__manage_routine с { userId, action: "enable", assistant: "<твоё имя, напр. Райя>", hour: <локальный час 0..23, утро=8>, prompt: "<что именно генерировать и присылать каждый день, от первого лица>" }. Чтобы выключить — action: "disable". ВАЖНО: НЕ говори "буду присылать / настроил", пока не вызвал инструмент и не получил ok:true. Если ответ содержит delivered_hint:true — тактично попроси пользователя включить уведомления в Настройках (тумблер «Уведомления на этом устройстве»), иначе рутина не дойдёт.
 
 ДЕЛА И СОБЫТИЯ В КАЛЕНДАРЬ: Если в разговоре появляется что-то, что стоит запланировать, ты можешь ПРЕДЛОЖИТЬ это карточкой: вызови mcp__linkeon__propose_calendar_event с { userId, title, kind, note и ОДНИМ из способов задать время }.
+ПРОЧИТАТЬ КАЛЕНДАРЬ: Если пользователь спрашивает про своё расписание/занятость, что запланировано, когда была встреча или СКОЛЬКО ВРЕМЕНИ он потратил на что-то — вызови mcp__linkeon__read_calendar с { userId, from, to } (from/to — ISO-даты локально, напр. "2026-08-04".."2026-08-11"; период вычисли сам из текущей даты). Вернётся список событий с durationMin — по нему считай суммарные часы. Не выдумывай события — бери только из результата инструмента.
 
 kind: 'task' — ДЕЛО/задача, которую можно «выполнить» и отметить галочкой (собрать вещи, купить подарок, подготовить документы) → раздел «Мои дела». 'event' — ВСТРЕЧА/звонок/приём/занятие/дедлайн с конкретным временем (по умолчанию).
 
@@ -97,7 +106,7 @@ const sessionMap = new Map();
 const SESSION_ROTATE_BYTES = 4 * 1024 * 1024;
 const sessionJsonlPath = (claudeSid) => "/home/dv/.claude/projects/-tmp/" + claudeSid + ".jsonl";
 
-function extractTailDialogue(claudeSid, maxMsgs = 10, maxCharsPerMsg = 400) {
+function extractTailDialogue(claudeSid, maxMsgs = 30, maxCharsPerMsg = 1500) {
   try {
     const lines = fs.readFileSync(sessionJsonlPath(claudeSid), "utf8").split("\n");
     const msgs = [];
@@ -288,7 +297,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   // and widen allowedTools + system prompt to the notes/messages tools. Cleaned up
   // when the request finishes (see finally below). Falls back safely on any error.
   let mcpConfigPath = BASE_MCP_PATH;
-  let allowedTools = "Bash(*),Read(*),Write(*),Edit(*),Glob(*),Grep(*),WebSearch(*),WebFetch(*),mcp__linkeon__generate_image,mcp__linkeon__edit_image,mcp__linkeon__compose_image,mcp__linkeon__upscale_image,mcp__linkeon__generate_video,mcp__linkeon__generate_banner,mcp__linkeon__manage_routine,mcp__linkeon__propose_calendar_event";
+  let allowedTools = "Bash(*),Read(*),Write(*),Edit(*),Glob(*),Grep(*),WebSearch(*),WebFetch(*),mcp__linkeon__generate_image,mcp__linkeon__edit_image,mcp__linkeon__compose_image,mcp__linkeon__upscale_image,mcp__linkeon__generate_video,mcp__linkeon__generate_banner,mcp__linkeon__manage_routine,mcp__linkeon__propose_calendar_event,mcp__linkeon__generate_speech,mcp__linkeon__read_calendar";
   let systemPrompt = SYSTEM_PROMPT;
   let taleridMcpPath = null;
   // Set when the agent uses a TalerID *write* tool this request. The transient
@@ -322,7 +331,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
     "--output-format", "stream-json",
     "--verbose",
     "--include-partial-messages",
-    "--max-turns", "20",
+    "--max-turns", "40",
     "--allowedTools", allowedTools,
     "--disallowedTools", "mcp__plugin_telegram_telegram__reply,mcp__plugin_telegram_telegram__react,mcp__plugin_telegram_telegram__edit_message,mcp__plugin_telegram_telegram__download_attachment,ToolSearch",
     "--mcp-config", mcpConfigPath,
@@ -334,6 +343,50 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   // Уже отдали клиенту хоть один кусок текста в этом ходе? Тогда переигрывать
   // ход нельзя — ответ склеится со вторым и юзер прочитает одно и то же дважды.
   let streamedAny = false;
+  // Ход закончился, не выдав финального ответа. Бэкенд по этому флагу не спишет
+  // за него токены: пользователь не должен платить за пустоту.
+  //
+  // До этой правки три РАЗНЫЕ поломки выглядели для пользователя одинаково —
+  // текст обрывался на полуслове без единого слова объяснения:
+  //   1. упёрлись в --max-turns (CLI отдаёт result без текста, и старая ветка
+  //      `ev.type === "result" && ev.result` не отправляла клиенту НИЧЕГО);
+  //   2. ход убит пре-эмптом, потому что пользователь прислал новое сообщение;
+  //   3. transient-сбой после того, как часть текста уже ушла.
+  // Разбор истории 79088644408 за 11.08: 19 сообщений «?» за неделю — это и есть
+  // тычки в молчащий чат.
+  let turnFailed = false;
+  let failReason = "";
+  // Служебная реплика ПЛАТФОРМЫ, а не текст модели. Отдельный тип нужен потому,
+  // что `result` бэкенд намеренно игнорирует, когда текст уже шёл (иначе с
+  // --include-partial-messages финальный result продублировал бы весь ответ).
+  // Из-за этого все пояснения релея пропадали ровно в том случае, ради которого
+  // писались. `notice` бэкенд дописывает всегда.
+  const notice = (text, reason) => {
+    if (reason) { turnFailed = true; failReason = reason; }
+    console.log("[notice] " + sessionId + " " + (reason || "info") + ": " + text.trim().slice(0, 140));
+    if (!clientDisconnected) {
+      try { res.write("data: " + JSON.stringify({ type: "notice", text }) + "\n\n"); } catch {}
+    }
+  };
+  // Реальный расход хода. total_cost_usd — сумма по всем result-событиям,
+  // включая повторные попытки и субагентов. Рядом собираем сырой usage:
+  // бэкенд считает по нему взвешенные токены (веса = отношения цен Anthropic
+  // к input, одинаковые для всей линейки моделей), а costUsd оставлен для
+  // сверки и как запасной путь.
+  //
+  // cache_creation разделён по TTL НАМЕРЕННО: запись на 5 минут стоит 1.25x
+  // input, на час — 2x. Сложишь их в одно число — часовой кэш будет считаться
+  // по цене пятиминутного, то есть на 60% дешевле реального.
+  let totalCostUsd = 0;
+  const usageTotals = {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite5m: 0,
+    cacheWrite1h: 0,
+    webSearch: 0,
+    webFetch: 0,
+  };
   res.on("close", () => { clientDisconnected = true; });
 
   // Pattern matching Anthropic's "image dimensions exceed 2000px in many-image session" rejection.
@@ -341,6 +394,20 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   const IMG_LIMIT_RE = /exceeds the dimension limit for many-image requests|Start a new session with fewer images/i;
   // Transient errors — retry once with the same session (auth refresh, rate limit, 5xx, network blips).
   const TRANSIENT_RE = /\b(401|403|429|500|502|503|504)\b|Unauthorized|rate.?limit|overload|Service Unavailable|Internal Server Error|API Error|fetch failed|socket hang up|ECONNRESET|ETIMEDOUT|EAI_AGAIN/i;
+
+  // Отказы САМОГО CLI, а не модели: протухший вход, исчерпанная сессия, пустой
+  // баланс. Ретраем не лечатся, и — главное — их текст английский и служебный.
+  // Ни один из них не попадал ни в IMG_LIMIT_RE, ни в TRANSIENT_RE, поэтому
+  // уходил пользователю ДОСЛОВНО как ответ ассистента, да ещё и тарифицировался:
+  // в истории 79088644408 лежат «You've hit your session limit · resets 11:50am
+  // (UTC)» ×4 (03.08) и «Not logged in · Please run /login» (07.08) — она даже
+  // переспросила «что это?».
+  const FATAL_RE = /Not logged in|Please run \/login|hit your (session|usage) limit|Invalid API key|Credit balance is too low|OAuth token (has )?expired/i;
+  const fatalHint = (raw) => (
+    /Not logged in|Please run \/login|Invalid API key|OAuth token/i.test(raw)
+      ? "_(сбой авторизации на стороне платформы — мы уже знаем о проблеме и чиним. Токены за этот ход не списаны, повторите чуть позже.)_"
+      : "_(платформа временно упёрлась в лимит модели. Токены за этот ход не списаны — повторите через несколько минут.)_"
+  );
 
   // Claude Code SDK emits this literal placeholder when a turn ends in a rate-limit
   // error and has no specific message to show. Useless to the user — filter out.
@@ -355,8 +422,13 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       // kill it first. Two parallel `claude --resume <same>` processes race
       // on the JSONL session lock and neither makes progress.
       const prev = activeChildren.get(sessionId);
-      if (prev && prev.pid && !prev.killed) {
-        try { prev.kill("SIGKILL"); } catch {}
+      if (prev && prev.child && prev.child.pid && !prev.child.killed) {
+        // Предупредить ТОТ, прерываемый, запрос — у него своё res и свой notice.
+        // Без этого пользователь видел, как ответ обрывается на полуслове, и не
+        // понимал, что оборвал его сам (11.08: запрос «?» стартовал в 15:26:48,
+        // предыдущий ход умер в 15:26:49 — и с неё за него ещё списали токены).
+        try { prev.preempt(); } catch {}
+        try { prev.child.kill("SIGKILL"); } catch {}
       }
 
       const child = spawn("claude", runArgs, {
@@ -364,16 +436,52 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env, MCP_TIMEOUT: "120000", MCP_TOOL_TIMEOUT: "600000", PATH: process.env.PATH + ":/home/dv/agent-env/bin:/home/dv/.bun/bin" },
       });
-      activeChildren.set(sessionId, child);
+      activeChildren.set(sessionId, {
+        child,
+        preempt: () => notice(
+          "\n\n_(ответ прерван: вы отправили новое сообщение, и ассистент переключился на него. Токены за прерванный ход не списаны.)_",
+          "preempted",
+        ),
+      });
       child.stdin.write(prompt);
       child.stdin.end();
 
       let buf = "";
       let imageLimitHit = false;
       let transientHit = false;
+      let maxTurnsHit = false;
 
       const handleEvent = (ev) => {
         if (ev.session_id) sessionMap.set(sessionId, ev.session_id);
+        if (ev.type === "result") {
+          // Потолок шагов. Проверяем ЗДЕСЬ, а не в ветке `result && ev.result`
+          // ниже: при error_max_turns CLI не кладёт в result никакого текста,
+          // та ветка не срабатывала — и клиент не получал вообще ничего.
+          if (ev.subtype === "error_max_turns" || /max.?turns/i.test(String(ev.result || ""))) {
+            maxTurnsHit = true;
+          }
+          if (typeof ev.total_cost_usd === "number") totalCostUsd += ev.total_cost_usd;
+          const u = ev.usage || {};
+          const cc = u.cache_creation || {};
+          const st = u.server_tool_use || {};
+          const n = (x) => (typeof x === "number" ? x : 0);
+          usageTotals.input += n(u.input_tokens);
+          usageTotals.output += n(u.output_tokens);
+          usageTotals.cacheRead += n(u.cache_read_input_tokens);
+          // Разбивка по TTL появилась не во всех версиях CLI. Если её нет —
+          // считаем весь cache_creation пятиминутным (консервативно: дешевле
+          // недосписать, чем взять за часовой кэш, которого не было).
+          const w5 = n(cc.ephemeral_5m_input_tokens);
+          const w1 = n(cc.ephemeral_1h_input_tokens);
+          if (w5 || w1) {
+            usageTotals.cacheWrite5m += w5;
+            usageTotals.cacheWrite1h += w1;
+          } else {
+            usageTotals.cacheWrite5m += n(u.cache_creation_input_tokens);
+          }
+          usageTotals.webSearch += n(st.web_search_requests);
+          usageTotals.webFetch += n(st.web_fetch_requests);
+        }
         if (ev.type === "stream_event" && ev.event) {
           const se = ev.event;
           if (se.type === "content_block_delta" && se.delta && se.delta.type === "text_delta" && se.delta.text) {
@@ -396,6 +504,13 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
             ev.is_error === true ||
             (typeof ev.subtype === "string" && ev.subtype !== "success") ||
             !!ev.api_error_status;
+          // Отказ CLI — не показываем сырой английский текст и не берём денег.
+          // Проверяем ДО isErrorResult: «You've hit your session limit» приходил
+          // и без is_error/api_error_status, обычным успешным result.
+          if (FATAL_RE.test(ev.result)) {
+            notice(fatalHint(ev.result), "cli_fatal");
+            return;
+          }
           if (isErrorResult && IMG_LIMIT_RE.test(ev.result) && useResume) {
             // Suppress this error from client — we will retry fresh
             imageLimitHit = true;
@@ -430,17 +545,18 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       child.on("close", () => {
         if (buf.trim()) { try { handleEvent(JSON.parse(buf)); } catch {} }
         try { execSync("pkill -f 'bun.*server.ts' --newer " + child.pid + " 2>/dev/null || true"); } catch {}
-        if (activeChildren.get(sessionId) === child) activeChildren.delete(sessionId);
-        resolve({ imageLimitHit, transientHit });
+        const cur = activeChildren.get(sessionId);
+        if (cur && cur.child === child) activeChildren.delete(sessionId);
+        resolve({ imageLimitHit, transientHit, maxTurnsHit });
       });
 
       child.on("error", (err) => {
         // Network/spawn errors are transient too
         if (TRANSIENT_RE.test(err.message || '')) {
-          resolve({ imageLimitHit: false, transientHit: true });
+          resolve({ imageLimitHit: false, transientHit: true, maxTurnsHit: false });
         } else {
           if (!clientDisconnected) res.write("data: " + JSON.stringify({ type: "error", text: err.message }) + "\n\n");
-          resolve({ imageLimitHit: false, transientHit: false });
+          resolve({ imageLimitHit: false, transientHit: false, maxTurnsHit: false });
         }
       });
     });
@@ -467,30 +583,47 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
     if (r.imageLimitHit) {
       // Session is bloated with images — drop and retry fresh, transparently.
       sessionMap.delete(sessionId);
-      if (!clientDisconnected) {
-        res.write("data: " + JSON.stringify({ type: "result", text: "_(сессия была очищена — слишком много изображений; продолжаю с чистого листа)_" }) + "\n\n");
-      }
+      notice("_(сессия была очищена — слишком много изображений; продолжаю с чистого листа)_");
       r = await runOnce(false);
     } else if (r.transientHit && taleridWriteUsed) {
       // A TalerID write already happened this turn — re-running would risk a
       // double-send (send_message is not deduped server-side). Do NOT retry;
       // ask the user to check rather than blindly re-executing the write.
-      if (!clientDisconnected) {
-        res.write("data: " + JSON.stringify({ type: "result", text: "_(связь с моделью прервалась после действия — проверьте результат, возможно всё прошло; при необходимости повторите)_" }) + "\n\n");
-      }
+      notice("_(связь с моделью прервалась после действия — проверьте результат, возможно всё прошло; при необходимости повторите)_", "transient_after_write");
     } else if (r.transientHit && streamedAny) {
       // Ответ (пусть и частичный) клиент уже прочитал — повтор дал бы дубль.
-      if (!clientDisconnected) {
-        res.write("data: " + JSON.stringify({ type: "result", text: "\n\n_(связь с моделью прервалась — если ответ оборван, повторите вопрос)_" }) + "\n\n");
-      }
+      notice("\n\n_(связь с моделью прервалась, ответ оборван. Токены за этот ход не списаны — повторите вопрос.)_", "transient_after_partial");
     } else if (r.transientHit) {
       // 401/429/5xx/network blip — wait briefly and retry on the same session.
       await new Promise((res) => setTimeout(res, 1500));
       r = await runOnce(useResume);
       // If retry also fails transiently, surface a friendly message rather than raw error.
-      if (r.transientHit && !clientDisconnected) {
-        res.write("data: " + JSON.stringify({ type: "result", text: "_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_" }) + "\n\n");
+      if (r.transientHit) {
+        notice("_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_", "transient");
       }
+    }
+
+    // Потолок шагов: сессия ЖИВА, CLI просто остановил ход на 40-м инструменте.
+    // Раньше это давало немой обрыв — ровно случай 11.08 08:24, где в стенограмме
+    // оказалось 40 tool_use подряд и обрыв на полуслове (у соседнего успешного
+    // хода — 23). Для юриста с 144-страничной жалобой сорок шагов не потолок, а
+    // рабочая норма, поэтому продолжаем сами, а не просим пользователя повторять.
+    //
+    // Продолжение идёт тем же --resume, поэтому модель видит всё, что уже
+    // сделала. Два продолжения — предохранитель от бесконечного цикла на задаче,
+    // которая не сходится в принципе.
+    let continues = 0;
+    while (r.maxTurnsHit && continues < 2 && !clientDisconnected) {
+      continues++;
+      notice("\n\n_(работа получилась длинной — продолжаю с того места, где остановился…)_");
+      prompt = "Продолжи прерванную работу ровно с того места, где остановился, и доведи ответ до конца. Не начинай заново и не пересказывай уже сделанное.";
+      r = await runOnce(true);
+    }
+    if (r.maxTurnsHit) {
+      notice(
+        "\n\n_(задача оказалась слишком большой даже для трёх заходов. Напишите «продолжай» — ассистент доведёт её до конца. Токены за незавершённый ход не списаны.)_",
+        "max_turns",
+      );
     }
 
     // Collect output files
@@ -503,17 +636,25 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
           try {
             const stat = fs.statSync(full);
             if (stat.isDirectory()) walk(full, rel);
-            else outputFiles.push({ name: rel, size: stat.size, url: "/files/" + sessionId + "/" + rel, fresh: !filesBefore.has(rel) || stat.mtimeMs > filesBefore.get(rel), mtime: stat.mtimeMs });
+            else if (!filesBefore.has(rel) || stat.mtimeMs > filesBefore.get(rel)) outputFiles.push({ name: rel, size: stat.size, url: "/files/" + sessionId + "/" + rel });
           } catch {}
         }
       };
       walk(outDir, "");
-      outputFiles.sort((a, b) => (a.mtime || 0) - (b.mtime || 0));
     }
 
     stopHeartbeat();
     if (!clientDisconnected) {
-      res.write("data: " + JSON.stringify({ type: "done", outputFiles }) + "\n\n");
+      // failed — «ход не выдал финального ответа». Бэкенд по нему пропускает
+      // списание: платить за пустоту пользователь не должен.
+      res.write("data: " + JSON.stringify({
+        type: "done",
+        outputFiles,
+        costUsd: totalCostUsd,
+        usage: usageTotals,
+        failed: turnFailed,
+        failReason,
+      }) + "\n\n");
       res.end();
     }
   })().catch(() => { stopHeartbeat(); }).finally(() => {

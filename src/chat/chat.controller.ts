@@ -12,6 +12,22 @@ import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { decodeMultipartFilename } from '../common/utils/multipart-filename';
+
+/**
+ * Потолок загрузки, ОДИН на всю цепочку. Раньше каждое звено держало свой, и
+ * узким местом оказался nginx прода (50 МБ на весь запрос) — про который не
+ * знали ни бэкенд (100 МБ на файл), ни релей (500 МБ), ни фронт (лимита нет
+ * вовсе). Пользователь просто получал 413 и надпись «не удалось обработать
+ * файл»: 11.08 она трижды пыталась отправить 56–61 МБ сканов и трижды
+ * упиралась в стену без объяснения.
+ *
+ * Значение согласовано с `client_max_body_size` в nginx (120m — запас на
+ * служебные поля multipart) и продублировано во фронте, чтобы отказ приходил
+ * ДО выгрузки сотни мегабайт по мобильному интернету.
+ */
+export const MAX_UPLOAD_TOTAL_BYTES = 100 * 1024 * 1024;
+export const MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024;
 
 @Controller('')
 export class ChatController {
@@ -33,6 +49,21 @@ export class ChatController {
   @Get('chat/active-streams')
   activeStreams() {
     return { active: this.chatService.getActiveStreamCount() };
+  }
+
+  /**
+   * Идёт ли ход прямо сейчас у ЭТОГО пользователя с этим ассистентом.
+   *
+   * Фронт спрашивает при загрузке чата: индикатор «печатает» жил только в
+   * памяти вкладки, и перезагрузка посреди пятиминутного ответа превращала
+   * работающий чат в молчащий. Пользователь решал, что всё зависло, и слал «?» —
+   * а этим «?» убивал собственный ход, потому что релей пре-эмптит предыдущий
+   * процесс сессии.
+   */
+  @Get('chat/active-turn')
+  @UseGuards(JwtGuard)
+  activeTurn(@CurrentUser() user: any, @Query('assistantId') assistantId: string) {
+    return this.chatService.getActiveTurn(user.userId, assistantId);
   }
 
   @Post('soulmate/chat')
@@ -62,6 +93,9 @@ export class ChatController {
     // подстраховка при пустом языке в профиле — приоритет разбирается в
     // LanguageService.resolveUserLanguage.
     const requestLang = typeof body.lang === 'string' ? body.lang : undefined;
+    // Часовой пояс клиента (IANA). Фронт берёт его из Intl и шлёт в каждом
+    // запросе — иначе ассистент считает время по UTC сервера.
+    const clientTz = typeof body.tz === 'string' ? body.tz.slice(0, 64) : undefined;
     if (!message || !assistantId) {
       return res.status(400).json({ error: 'Missing message or assistantId' });
     }
@@ -92,6 +126,7 @@ export class ChatController {
         req,
         fresh,
         requestLang,
+        clientTz,
       );
       this.events?.track('response_received', {
         userId,
@@ -124,7 +159,7 @@ export class ChatController {
     }
 
     const multer = require('multer');
-    const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
+    const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_UPLOAD_FILE_BYTES } });
 
     // any(), а не single('file'): принимаем и один файл, и группу.
     //
@@ -135,19 +170,44 @@ export class ChatController {
     //
     // Старое имя поля `file` продолжает работать: any() собирает всё, что
     // прислали, независимо от имени.
-    await new Promise<void>((resolve, reject) => {
-      upload.any()(req as any, res as any, (err: any) => {
-        if (err) reject(err);
-        else resolve();
-      });
+    // Ошибку multer'а раньше просто пробрасывали наружу — Nest отвечал голым
+    // 500, фронт показывал «не удалось обработать файл», и причина («файл
+    // больше лимита») не доходила до пользователя вообще. Отвечаем внятным
+    // кодом: фронту есть что показать, а нам — что искать в логах.
+    const uploadErr: any = await new Promise<any>((resolve) => {
+      upload.any()(req as any, res as any, (err: any) => resolve(err || null));
     });
+    if (uploadErr) {
+      const tooBig = uploadErr.code === 'LIMIT_FILE_SIZE';
+      // eslint-disable-next-line no-console
+      console.warn(`[upload-and-chat] multer отказал для ${userId}: ${uploadErr.code || uploadErr.message}`);
+      return res.status(tooBig ? 413 : 400).json({
+        error: tooBig ? 'file_too_large' : 'upload_failed',
+        maxFileBytes: MAX_UPLOAD_FILE_BYTES,
+        detail: uploadErr.message,
+      });
+    }
 
-    const files: any[] = (req as any).files || [];
+    const files: any[] = ((req as any).files || []).map((f: any) => ({
+      ...f,
+      originalname: decodeMultipartFilename(f.originalname),
+    }));
     const body = (req as any).body || {};
     const message = body.message || body.task || '';
     const assistantId = body.assistantId || 'Роман';
 
     if (!files.length) return res.status(400).json({ error: 'No file uploaded' });
+
+    const totalBytes = files.reduce((sum: number, f: any) => sum + (f.size || f.buffer?.length || 0), 0);
+    if (totalBytes > MAX_UPLOAD_TOTAL_BYTES) {
+      // eslint-disable-next-line no-console
+      console.warn(`[upload-and-chat] партия ${Math.round(totalBytes / 1048576)} МБ превышает потолок для ${userId}`);
+      return res.status(413).json({
+        error: 'batch_too_large',
+        totalBytes,
+        maxTotalBytes: MAX_UPLOAD_TOTAL_BYTES,
+      });
+    }
 
     let profileText = '';
     if (this.neo4j) {
@@ -212,6 +272,11 @@ export class ChatController {
             try {
               const ev = JSON.parse(line.slice(6));
               if (ev.type === 'delta' || ev.type === 'text') {
+                chunks.push(ev.text);
+                safeWrite({ type: 'item', content: ev.text });
+              } else if (ev.type === 'notice' && ev.text) {
+                // Служебная реплика платформы — показываем всегда, в отличие от
+                // `result` ниже (тот дублировал бы уже отданный текст).
                 chunks.push(ev.text);
                 safeWrite({ type: 'item', content: ev.text });
               } else if (ev.type === 'result' && ev.text && chunks.length === 0) {
