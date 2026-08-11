@@ -237,6 +237,8 @@ export class PaymentsService {
       extended: 200000,
       premium: 1000000,
       professional: 1000000,
+      business: 3_000_000,
+      maximum: 7_000_000,
     };
     return map[pkg] || Math.floor((amount || 0) * 1000);
   }
