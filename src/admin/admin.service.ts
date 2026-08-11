@@ -10,6 +10,13 @@ export class AdminService {
   private readonly logger = new Logger(AdminService.name);
   constructor(private readonly pg: PgService) {}
 
+  /** Позднейшая из двух отметок времени; null, если обеих нет. */
+  private static latest(a: any, b: any): any {
+    if (!a) return b || null;
+    if (!b) return a;
+    return new Date(b).getTime() > new Date(a).getTime() ? b : a;
+  }
+
   // --- Coupons ---
 
   async listCoupons() {
@@ -284,6 +291,19 @@ export class AdminService {
             AND split_part(session_id,'_',1) <> ALL($1)
             AND split_part(session_id,'_',1) !~ $2
           GROUP BY 1,2
+          UNION ALL
+         -- Диалог в Telegram-боте — тоже активность: без этой ветки владелец
+         -- активного бота попадает в «давно не заходил» и получает SMS.
+         SELECT tc.owner_user_id AS uid,
+                COALESCE(tc.preset_agent_id,'') AS assistant_id,
+                max(m.created_at) AS last_at
+           FROM tg_bot_messages m
+           JOIN tg_bot_configs tc ON tc.id = m.config_id
+          WHERE m.role='user'
+            AND tc.owner_user_id ~ '^7[0-9]{10}$'
+            AND tc.owner_user_id <> ALL($1)
+            AND tc.owner_user_id !~ $2
+          GROUP BY 1,2
        ),
        per_user AS (
          SELECT DISTINCT ON (uid) uid, assistant_id, last_at
@@ -382,16 +402,39 @@ export class AdminService {
   async buildCuriousReturnOutreach() {
     const seg = await this.pg.query(
       `WITH last_chat AS (
-         SELECT split_part(session_id,'_',1) AS uid, max(created_at) AS last_at
-           FROM custom_chat_history
-          WHERE sender_type='human'
-            AND split_part(session_id,'_',1) ~ '^7[0-9]{10}$'
-            AND split_part(session_id,'_',1) <> ALL($1)
-            AND split_part(session_id,'_',1) !~ $2
-          GROUP BY 1
+         -- Активность = веб-чат ИЛИ Telegram-бот. Один uid приходит из обеих
+         -- веток, поэтому внешний GROUP BY берёт позднейшую отметку.
+         SELECT uid, max(last_at) AS last_at FROM (
+           SELECT split_part(session_id,'_',1) AS uid, max(created_at) AS last_at
+             FROM custom_chat_history
+            WHERE sender_type='human'
+              AND split_part(session_id,'_',1) ~ '^7[0-9]{10}$'
+              AND split_part(session_id,'_',1) <> ALL($1)
+              AND split_part(session_id,'_',1) !~ $2
+            GROUP BY 1
+           UNION ALL
+           SELECT tc.owner_user_id AS uid, max(m.created_at) AS last_at
+             FROM tg_bot_messages m
+             JOIN tg_bot_configs tc ON tc.id = m.config_id
+            WHERE m.role='user'
+              AND tc.owner_user_id ~ '^7[0-9]{10}$'
+              AND tc.owner_user_id <> ALL($1)
+              AND tc.owner_user_id !~ $2
+            GROUP BY 1
+         ) src GROUP BY 1
        ),
        msgcnt AS (
-         SELECT user_id, COUNT(*) AS n FROM events WHERE name='message_sent' GROUP BY 1
+         -- «Меньше пяти сообщений» тоже считаем по обоим каналам, иначе
+         -- разговорчивый в боте выглядит как едва заглянувший.
+         SELECT user_id, SUM(n) AS n FROM (
+           SELECT user_id, COUNT(*) AS n FROM events WHERE name='message_sent' GROUP BY 1
+           UNION ALL
+           SELECT tc.owner_user_id AS user_id, COUNT(*) AS n
+             FROM tg_bot_messages m
+             JOIN tg_bot_configs tc ON tc.id = m.config_id
+            WHERE m.role='user'
+            GROUP BY 1
+         ) src GROUP BY 1
        )
        SELECT lc.uid AS phone, lc.last_at,
               round(EXTRACT(EPOCH FROM now()-lc.last_at)/3600.0)::int AS hours_inactive
@@ -482,6 +525,15 @@ export class AdminService {
             SELECT 1 FROM custom_chat_history c
              WHERE c.sender_type = 'human'
                AND (c.session_id = a.user_id OR c.session_id LIKE a.user_id || '\\_%')
+          )
+          -- 79235216999 привязал бота 20.06 и в тот же день написал в него
+          -- девять раз, а 22.06 получил нудж «зарегистрировался и не начал»:
+          -- сегмент видел только веб-чат.
+          AND NOT EXISTS (
+            SELECT 1 FROM tg_bot_messages m
+              JOIN tg_bot_configs tc ON tc.id = m.config_id
+             WHERE tc.owner_user_id = a.user_id
+               AND m.role = 'user'
           )
         ORDER BY a.created_at DESC`,
       [minHours, maxDays, AdminService.TEST_USERS, AdminService.TEST_PATTERN],
@@ -998,7 +1050,9 @@ export class AdminService {
          COALESCE(spent_period.last_active, NULL) AS last_active,
          pay.paid_count::int AS paid_count,
          COALESCE(pay.paid_rub, 0)::numeric AS paid_rub,
-         rl.name AS referral_leader_name
+         rl.name AS referral_leader_name,
+         COALESCE(tg.msgs, 0)::int AS tg_messages,
+         tg.last_at AS tg_last_active
        FROM ai_profiles_consolidated a
        LEFT JOIN (
          SELECT user_id, ABS(SUM(amount)) AS spent
@@ -1006,6 +1060,16 @@ export class AdminService {
          WHERE transaction_type = 'consumed'
          GROUP BY user_id
        ) spent_total ON spent_total.user_id = a.user_id
+       LEFT JOIN (
+         -- Активность в Telegram-боте за то же окно. Нужна отдельной колонкой:
+         -- до 9b40a80 TG-списания шли мимо token_transactions, поэтому по
+         -- расходу такой пользователь выглядит мёртвым.
+         SELECT c.owner_user_id AS user_id, COUNT(*) AS msgs, MAX(m.created_at) AS last_at
+         FROM tg_bot_messages m
+         JOIN tg_bot_configs c ON c.id = m.config_id
+         WHERE m.role = 'user' AND m.created_at >= now() - make_interval(hours => $2)
+         GROUP BY c.owner_user_id
+       ) tg ON tg.user_id = a.user_id
        LEFT JOIN (
          SELECT user_id, ABS(SUM(amount)) AS spent, MAX(created_at) AS last_active
          FROM token_transactions
@@ -1047,10 +1111,14 @@ export class AdminService {
         balance: Number(r.balance) || 0,
         spent_total: Number(r.spent_total) || 0,
         spent_period: Number(r.spent_period) || 0,
-        last_active: r.last_active,
+        // Последняя активность — позднейшая из двух: списание в вебе и
+        // реплика в боте. Историческую TG-активность видно только по второй.
+        last_active: AdminService.latest(r.last_active, r.tg_last_active),
         paid_count: Number(r.paid_count) || 0,
         paid_rub: Number(r.paid_rub) || 0,
         referral_leader_name: r.referral_leader_name || null,
+        tg_messages: Number(r.tg_messages) || 0,
+        tg_last_active: r.tg_last_active || null,
       })),
       totals: {
         users_with_balance: Number(t.users_with_balance) || 0,
@@ -1355,20 +1423,26 @@ export class AdminService {
 
     const u = userRes.rows[0];
 
-    // 2) Queries totals (token_consumption_tasks for completed agent runs;
-    //    falls back to message count from custom_chat_history).
+    // 2) Queries totals: веб-путь пишет token_consumption_tasks, TG-путь — нет,
+    //    поэтому его реплики считаем прямо по tg_bot_messages. Без второй ветки
+    //    у пользователя, живущего в боте, здесь стоял ноль при живом расходе.
     let queriesTotal = 0;
     let queriesPeriod = 0;
     try {
       const r = await this.pg.query(
         `SELECT
-           COUNT(*) FILTER (WHERE status = 'completed' AND agent_id IS NOT NULL)::int AS total,
-           COUNT(*) FILTER (
-             WHERE status = 'completed' AND agent_id IS NOT NULL
-               AND created_at >= now() - make_interval(days => $2)
-           )::int AS period
-         FROM token_consumption_tasks
-         WHERE user_id = $1`,
+           COUNT(*)::int AS total,
+           COUNT(*) FILTER (WHERE created_at >= now() - make_interval(days => $2))::int AS period
+         FROM (
+           SELECT created_at
+             FROM token_consumption_tasks
+            WHERE user_id = $1 AND status = 'completed' AND agent_id IS NOT NULL
+           UNION ALL
+           SELECT m.created_at
+             FROM tg_bot_messages m
+             JOIN tg_bot_configs c ON c.id = m.config_id
+            WHERE c.owner_user_id = $1 AND m.role = 'user'
+         ) q`,
         [phone, days],
       );
       queriesTotal = Number(r.rows[0]?.total) || 0;
@@ -1425,12 +1499,24 @@ export class AdminService {
            GROUP BY 1
          ) spent ON spent.day = d.day
          LEFT JOIN (
-           SELECT date_trunc('day', created_at)::date AS day, COUNT(*) AS queries
-           FROM custom_chat_history
-           WHERE session_id LIKE $1 || '\\_%' ESCAPE '\\'
-             AND sender_type = 'human'
-             AND created_at >= now() - make_interval(days => $2)
-           GROUP BY 1
+           SELECT day, SUM(n)::int AS queries FROM (
+             -- Веб-ветку фильтруем префиксом session_id, а не split_part по
+             -- всей таблице: иначе теряется idx_custom_chat_session.
+             SELECT date_trunc('day', created_at)::date AS day, COUNT(*) AS n
+             FROM custom_chat_history
+             WHERE session_id LIKE $1 || '\\_%' ESCAPE '\\'
+               AND sender_type = 'human'
+               AND created_at >= now() - make_interval(days => $2)
+             GROUP BY 1
+             UNION ALL
+             SELECT date_trunc('day', m.created_at)::date AS day, COUNT(*) AS n
+             FROM tg_bot_messages m
+             JOIN tg_bot_configs c ON c.id = m.config_id
+             WHERE c.owner_user_id = $1
+               AND m.role = 'user'
+               AND m.created_at >= now() - make_interval(days => $2)
+             GROUP BY 1
+           ) u GROUP BY day
          ) qs ON qs.day = d.day
          ORDER BY d.day ASC`,
         [phone, days],
@@ -1446,20 +1532,41 @@ export class AdminService {
 
     // 5) By-assistant: queries (token_consumption_tasks completed) + tokens (sum of tokens_to_consume).
     //    LEFT JOIN agents to get name; HAVING queries > 0 keeps it tight.
-    let byAssistant: Array<{ id: number; name: string; queries: number; tokens: number; last_used: string | null }> = [];
+    let byAssistant: Array<{ id: number; name: string; queries: number; tokens: number; last_used: string | null; source: string }> = [];
     try {
       const r = await this.pg.query(
-        `SELECT
+        `WITH src AS (
+           SELECT t.agent_id AS agent_id, 'web'::text AS source,
+                  t.created_at, COALESCE(t.tokens_to_consume, 0)::bigint AS tokens,
+                  true AS is_query
+             FROM token_consumption_tasks t
+            WHERE t.user_id = $1 AND t.status = 'completed' AND t.agent_id IS NOT NULL
+           UNION ALL
+           -- В TG токены списываются на строке ответа ассистента, а запросом
+           -- считается реплика человека — поэтому берём обе роли, но queries
+           -- фильтруем по is_query.
+           SELECT NULLIF(c.preset_agent_id, '')::int, 'telegram',
+                  m.created_at, COALESCE(m.tokens_charged, 0)::bigint,
+                  m.role = 'user'
+             FROM tg_bot_messages m
+             JOIN tg_bot_configs c ON c.id = m.config_id
+            WHERE c.owner_user_id = $1
+              AND m.role IN ('user', 'assistant')
+              AND c.preset_agent_id ~ '^[0-9]+$'
+         )
+         SELECT
            a.id,
            COALESCE(a.name, 'Agent ' || a.id::text) AS name,
-           COUNT(t.*)::int AS queries,
-           COALESCE(SUM(t.tokens_to_consume), 0)::bigint AS tokens,
-           MAX(t.created_at) AS last_used
-         FROM token_consumption_tasks t
-         JOIN agents a ON a.id = t.agent_id
-         WHERE t.user_id = $1
-           AND t.status = 'completed'
-           AND t.agent_id IS NOT NULL
+           COUNT(*) FILTER (WHERE s.is_query)::int AS queries,
+           COALESCE(SUM(s.tokens), 0)::bigint AS tokens,
+           MAX(s.created_at) AS last_used,
+           CASE
+             WHEN COUNT(*) FILTER (WHERE s.source = 'telegram') = 0 THEN 'web'
+             WHEN COUNT(*) FILTER (WHERE s.source = 'web') = 0 THEN 'telegram'
+             ELSE 'both'
+           END AS source
+         FROM src s
+         JOIN agents a ON a.id = s.agent_id
          GROUP BY a.id, a.name
          ORDER BY queries DESC, tokens DESC, a.id ASC
          LIMIT 100`,
@@ -1471,6 +1578,7 @@ export class AdminService {
         queries: Number(row.queries) || 0,
         tokens: Number(row.tokens) || 0,
         last_used: row.last_used,
+        source: row.source || 'web',
       }));
     } catch {
       byAssistant = [];
@@ -1499,34 +1607,58 @@ export class AdminService {
       transactions = [];
     }
 
-    // 7) Recent messages (last 10 from custom_chat_history; agent name via JOIN).
+    // 7) Recent messages (last 10): веб-чат и Telegram-бот в одной ленте,
+    //    каждая строка помечена источником, у TG — ещё и названием чата.
     let recentMessages: Array<{
       id: string; created_at: string; agent_id: number | null;
       agent_name: string | null; role: string; preview: string;
+      source: string; channel_title: string | null;
     }> = [];
     try {
       const r = await this.pg.query(
-        `SELECT
-           c.id::text AS id,
-           c.created_at,
-           c.agent AS agent_id,
-           a.name AS agent_name,
-           c.sender_type AS role,
-           SUBSTRING(c.content, 1, 80) AS preview
-         FROM custom_chat_history c
-         LEFT JOIN agents a ON a.id = c.agent
-         WHERE c.session_id LIKE $1 || '\\_%' ESCAPE '\\'
-         ORDER BY c.created_at DESC
+        `SELECT id, created_at, agent_id, agent_name, role, preview, source, channel_title
+         FROM (
+           SELECT
+             c.id::text AS id,
+             c.created_at,
+             c.agent AS agent_id,
+             a.name AS agent_name,
+             c.sender_type AS role,
+             SUBSTRING(c.content, 1, 80) AS preview,
+             'web'::text AS source,
+             NULL::text AS channel_title
+           FROM custom_chat_history c
+           LEFT JOIN agents a ON a.id = c.agent
+           WHERE c.session_id LIKE $1 || '\\_%' ESCAPE '\\'
+           UNION ALL
+           SELECT
+             'tg-' || m.id::text,
+             m.created_at,
+             NULLIF(cfg.preset_agent_id, '')::int,
+             COALESCE(a.name, cfg.display_name),
+             CASE WHEN m.role = 'user' THEN 'human' ELSE 'ai' END,
+             SUBSTRING(m.content, 1, 80),
+             'telegram',
+             COALESCE(NULLIF(cfg.tg_chat_title, ''), cfg.display_name)
+           FROM tg_bot_messages m
+           JOIN tg_bot_configs cfg ON cfg.id = m.config_id
+           LEFT JOIN agents a ON a.id::text = cfg.preset_agent_id
+           WHERE cfg.owner_user_id = $1
+             AND m.role IN ('user', 'assistant')
+         ) u
+         ORDER BY created_at DESC
          LIMIT 10`,
         [phone],
       );
       recentMessages = r.rows.map(row => ({
         id: row.id,
         created_at: row.created_at,
-        agent_id: row.agent_id !== null ? Number(row.agent_id) : null,
+        agent_id: row.agent_id !== null && row.agent_id !== undefined ? Number(row.agent_id) : null,
         agent_name: row.agent_name || null,
         role: row.role,
         preview: row.preview || '',
+        source: row.source === 'telegram' ? 'telegram' : 'web',
+        channel_title: row.channel_title || null,
       }));
     } catch {
       recentMessages = [];
