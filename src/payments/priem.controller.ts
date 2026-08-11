@@ -1,6 +1,7 @@
 import { Controller, Post, Get, Body, Query, Req, Res, UseGuards } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { PriemService } from './priem.service';
+import { PACKAGES } from './packages';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 
@@ -30,12 +31,28 @@ export class PriemController {
     // PRIEM_API_KEY и PRIEM_WEBHOOK_SECRET поведение ровно прежнее.
     const useCrypto = lang !== 'ru' && this.priem.configured();
 
+    // Прайс отдаётся обоим путям. Рублёвый берётся из общего модуля: раньше
+    // здесь стояло `packages: []` с пометкой «рублёвые зашиты на фронте», и
+    // ровно из-за этого прайс расходился между витриной, лендингом и
+    // контроллером оплаты.
+    //
+    // Поле `price` — в валюте ответа. У валютных пакетов рядом сохраняется
+    // `usd`: его читают уже выложенные витрины, и убрать его можно только
+    // после того, как все они перейдут на `price`.
+    const packages = useCrypto
+      ? this.priem.packages().map((p) => ({ ...p, price: p.usd }))
+      : PACKAGES.map((p) => ({
+          id: p.id,
+          tokens: p.tokens,
+          price: p.priceRub,
+          savingsPct: p.savingsPct,
+        }));
+
     return res.status(200).json({
       language: lang,
       provider: useCrypto ? 'priem' : 'yookassa',
       currency: useCrypto ? 'USD' : 'RUB',
-      // Пакеты отдаём только для крипто-витрины: рублёвые зашиты на фронте.
-      packages: useCrypto ? this.priem.packages() : [],
+      packages,
       available: true,
     });
   }
