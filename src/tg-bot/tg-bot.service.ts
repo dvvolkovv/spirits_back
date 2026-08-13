@@ -368,8 +368,11 @@ export class TgBotService implements OnModuleInit {
     };
 
     const lockId = this.hashLock(`tg-chat:${msg.chat.id}`);
-    const lockRes = await this.pg.query(`SELECT pg_try_advisory_lock($1)`, [lockId]);
-    if (!lockRes.rows[0].pg_try_advisory_lock) {
+    // Лок берётся на выделенном соединении и на нём же снимается. Через
+    // this.pg.query() это было сломано: unlock уезжал на другое соединение пула,
+    // возвращал false, и чат оглушало до закрытия соединения по таймауту.
+    const lock = await this.pg.tryAdvisoryLock(lockId);
+    if (!lock) {
       this.logger.debug(`chat ${msg.chat.id} busy, skipping`);
       // Раньше дропали тихо (только typing-action). Теперь:
       // 1) Сохраняем сообщение юзера в БД — чтобы в истории не было дыр
@@ -636,7 +639,7 @@ export class TgBotService implements OnModuleInit {
       if (sandboxDir) {
         try { fs.rmSync(sandboxDir, { recursive: true, force: true }); } catch { /* ignore */ }
       }
-      await this.pg.query(`SELECT pg_advisory_unlock($1)`, [lockId]);
+      await lock.release();
       // Чистим временные файлы независимо от исхода.
       for (const p of attachments) {
         try { fs.unlinkSync(p); } catch { /* ignore */ }
