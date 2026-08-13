@@ -340,6 +340,32 @@ cd ~/Downloads/spirits_back/tests && node runner.js  # api (32) + e2e (18) = 50
 - `GET /webhook/admin/referral/stats` — полная статистика рефералов (summary + leaders)
 - `POST /webhook/admin/referral` — управление рефералами `{action: create|toggle|mark_paid|mark_all_paid}`
 
+### Мониторинг Telegram-бота
+- `GET /webhook/admin/monitoring/tech/tg-bot` — состояние доставки и обработки
+
+Бот работает на webhook, а не на polling, поэтому здоровье доставки читается из
+`getWebhookInfo` (`TgHealthService`, проба раз в 5 мин, результат пишется в
+`synthetic_runs` сценарием `tg_webhook`). Алерты в общий Telegram-канал.
+
+Roundtrip «написать боту и дождаться ответа» невозможен: бот не может писать
+боту, нужна MTProto-сессия живого юзера. Вместо этого обработка проверяется по
+`tg_bot_messages.answer_expected_at` — отметке, которую бот ставит сам, когда
+решил ответить. Без неё детектор пришлось бы строить на «user-строка без
+assistant-строки», а это ложная тревога на каждом групповом чате:
+`persistUserMessage` сохраняет и те сообщения, которые бот игнорирует намеренно.
+
+| ENV | Дефолт | Что делает |
+|-----|--------|------------|
+| `TG_UNANSWERED_ALERT_MIN` | 15 | Через сколько минут молчания чат считается зависшим |
+| `TG_PENDING_UPDATES_MAX` | 20 | Порог очереди недоставленных апдейтов |
+| `TG_WEBHOOK_ERROR_FRESH_MIN` | 30 | Насколько свежей должна быть ошибка доставки, чтобы алертить |
+| `TG_HEALTH_ALERT_COOLDOWN_H` | 3 | Кулдаун повторного алерта |
+| `SYNTHETIC_IN_PROCESS_SCENARIOS` | `tg_webhook` | Сценарии, которые пишет сам бэкенд — исключены из детектора «раннер умер» |
+
+⚠️ `SYNTHETIC_IN_PROCESS_SCENARIOS` не косметика: свежесть synthetic считается по
+максимуму среди сценариев, и запись изнутри процесса каждые 5 минут держала бы
+«newest» вечно свежим — падение раннера на node-3 перестало бы детектироваться.
+
 ### Misc
 - `POST /webhook/imagegen` — генерация изображений (заглушка)
 - `POST /webhook/scan-document` — сканирование документа (заглушка)

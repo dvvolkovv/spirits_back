@@ -66,6 +66,7 @@ export class TgBotService implements OnModuleInit {
     await this.applyMigration('001_tg_bot_schema.sql');
     await this.applyMigration('002_tg_bot_custom_agent_fk.sql');
     await this.applyMigration('003_tg_bot_video_delivery.sql');
+    await this.applyMigration('004_tg_bot_answer_watch.sql');
   }
 
   private async applyMigration(filename: string) {
@@ -373,7 +374,13 @@ export class TgBotService implements OnModuleInit {
       // Раньше дропали тихо (только typing-action). Теперь:
       // 1) Сохраняем сообщение юзера в БД — чтобы в истории не было дыр
       // 2) Раз в 60с шлём явное "минутку" в чат
-      try { await this.router.persistUserMessage(cfg, ctx); } catch (e: any) {
+      try {
+        await this.router.persistUserMessage(cfg, ctx);
+        // Юзеру ниже уходит «минутку» — значит ответа он ждёт. Если лок залип и
+        // не отпустится, ответа не будет никогда: без этой отметки такой чат
+        // молчит бесконечно и никто об этом не узнает.
+        await this.router.markAnswerExpected(ctx.chatId, ctx.msgId);
+      } catch (e: any) {
         this.logger.warn(`busy-skip persistUserMessage failed in chat ${msg.chat.id}: ${e.message}`);
       }
       const lastNotice = this.lastBusyNoticeAt.get(msg.chat.id) ?? 0;
@@ -417,6 +424,15 @@ export class TgBotService implements OnModuleInit {
 
       const should = await this.router.shouldRespond(cfg, ctx);
       if (!should) return;
+
+      // Решение принято — дальше молчание означает сбой, а не режим адресации.
+      // Мониторинг вторичен: не смогли отметить — работаем дальше без надзора,
+      // но ответ юзеру не роняем.
+      try {
+        await this.router.markAnswerExpected(ctx.chatId, ctx.msgId);
+      } catch (e: any) {
+        this.logger.warn(`markAnswerExpected failed in chat ${msg.chat.id}: ${e.message}`);
+      }
 
       // Создаём per-request песочницу. Если mkdir упадёт — Claude поработает
       // без Bash/Write (старый режим, только текст + медиа-маркеры).

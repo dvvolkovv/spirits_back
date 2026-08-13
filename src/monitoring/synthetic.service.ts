@@ -15,6 +15,13 @@ const CRITICAL_SCENARIOS = (process.env.SYNTHETIC_CRITICAL_SCENARIOS || 'chat_st
 // «ослеп», тоже алертим.
 const STALE_MINUTES = Number(process.env.SYNTHETIC_STALE_MINUTES || 40);
 const REALERT_HOURS = Number(process.env.SYNTHETIC_REALERT_H || 3);
+// Сценарии, которые пишет САМ бэкенд через record(), а не внешний раннер с
+// node-3. Свежесть считается только по внешним: иначе in-process запись каждые
+// 5 минут держит «newest» вечно свежим, и детектор «раннер умер» больше никогда
+// не сработает — мониторинг ослепнет ровно так, как этот детектор и должен был
+// поймать. Собственные алерты у таких сценариев свои (см. TgHealthService).
+const IN_PROCESS_SCENARIOS = (process.env.SYNTHETIC_IN_PROCESS_SCENARIOS || 'tg_webhook')
+  .split(',').map((s) => s.trim()).filter(Boolean);
 
 /**
  * Synthetic E2E results.
@@ -87,11 +94,14 @@ export class SyntheticService implements OnModuleInit {
 
     // 1. Протухание: самый свежий результat среди всех сценариев старше порога →
     // раннер не шлёт данные, мониторинг ослеп.
-    const newest = overview.scenarios
+    // Внешних результатов нет вообще (свежая среда, раннер ещё не заводили) —
+    // молчим, как и при полностью пустой таблице.
+    const external = overview.scenarios.filter((s) => !IN_PROCESS_SCENARIOS.includes(s.scenario));
+    const newest = external
       .map((s) => (s.latestTs ? new Date(s.latestTs).getTime() : 0))
       .reduce((a, b) => Math.max(a, b), 0);
     const ageMin = newest ? (now.getTime() - newest) / 60000 : Infinity;
-    if (ageMin > STALE_MINUTES) {
+    if (external.length && ageMin > STALE_MINUTES) {
       const staleCooled = !this.lastStaleAlertAt || (now.getTime() - this.lastStaleAlertAt.getTime()) >= REALERT_HOURS * 3600_000;
       if (staleCooled) {
         await send(`<b>🟠 Синтетический мониторинг «ослеп»</b>\nНет результатов уже ${Math.round(ageMin)} мин (порог ${STALE_MINUTES}). Раннер на node-3, возможно, не работает — продуктовые сбои сейчас можно не заметить.`);

@@ -168,6 +168,27 @@ ${recent}
   }
 
   /**
+   * Пометить сообщение как «ответ обязателен». Ставится там, где решение уже
+   * принято — после shouldRespond()===true и в busy-skip, где юзеру обещана
+   * «минутка». По этой отметке monitoring/TgHealthService ловит тихие отказы:
+   * ответ не пришёл, а исключения никто не увидел (всё логируется в warn).
+   *
+   * Без отметки детектор пришлось бы строить на «user-строка без assistant-
+   * строки», а это ложная тревога на каждом групповом чате — persistUserMessage
+   * сохраняет и те сообщения, которые бот игнорирует намеренно.
+   *
+   * Ошибка здесь не должна ронять ответ пользователю: мониторинг вторичен по
+   * отношению к работе бота, поэтому вызывающий заворачивает в try/catch.
+   */
+  async markAnswerExpected(chatId: number, msgId: number): Promise<void> {
+    await this.pg.query(
+      `UPDATE tg_bot_messages SET answer_expected_at = now()
+        WHERE tg_chat_id = $1 AND tg_message_id = $2 AND role = 'user'`,
+      [chatId, msgId],
+    );
+  }
+
+  /**
    * Последние 20 сообщений группы. Формат для prompt: chronological строки
    * "USER [Vasya]: ..." / "ASSISTANT: ...".
    */
