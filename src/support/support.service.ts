@@ -13,6 +13,8 @@ import { TelegramNotifierService } from './telegram-notifier.service';
 import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
 import { VideoService } from '../video/video.service';
 import { CreateVideoJobDto } from '../video/video.dto';
+import { MailService } from '../common/services/mail.service';
+import { buildOwnerReplyEmail } from './support-mail';
 
 @Injectable()
 export class SupportService implements OnModuleInit {
@@ -22,6 +24,7 @@ export class SupportService implements OnModuleInit {
     private readonly pg: PgService,
     @Optional() private readonly telegram?: TelegramNotifierService,
     @Optional() private readonly video?: VideoService,
+    @Optional() private readonly mail?: MailService,
   ) {}
 
   async onModuleInit() {
@@ -838,6 +841,80 @@ ${healthSummary}
        VALUES ($1, 'owner', $2, 'reply', $3)`,
       [ticketId, ownerId, JSON.stringify({ visibleToUser, length: trimmed.length })],
     );
+    // Fire-and-forget: письмо не должно держать ответ админки, а его сбой —
+    // ронять уже сохранённую реплику. Метод не бросает.
+    if (visibleToUser) void this.notifyOwnerReplyByEmail(ticketId, trimmed);
+  }
+
+  /**
+   * Письмо пользователю о ручном ответе поддержки.
+   *
+   * Зачем: до этого ответ владельца жил только в support_messages — человек
+   * видел его, лишь если сам заходил в раздел поддержки. Telegram-уведомления
+   * ходят в другую сторону (владельцу о новом тикете), пуша по тикетам нет.
+   *
+   * Правило антиспама — одно письмо на один ход пользователя: серия реплик
+   * владельца подряд даёт одно уведомление, следующее уйдёт только после того,
+   * как пользователь снова напишет. Отсюда сравнение с временем последнего
+   * сообщения от 'user' вместо таймерного кулдауна: разговор, где владелец
+   * отвечает через десять минут после новой реплики, письмо не теряет.
+   *
+   * Никогда не бросает: результат отправки уходит в support_events
+   * (action = 'notify_email'), там же видно, почему письма не было.
+   */
+  async notifyOwnerReplyByEmail(
+    ticketId: string, content: string,
+  ): Promise<{ sent: boolean; reason?: string }> {
+    try {
+      if (!this.mail?.isConfigured()) return { sent: false, reason: 'smtp_not_configured' };
+
+      const r = await this.pg.query(
+        `SELECT p.email,
+                p.profile_data->>'language' AS language,
+                EXISTS (
+                  SELECT 1 FROM support_events e
+                   WHERE e.ticket_id = t.id
+                     AND e.action = 'notify_email'
+                     AND e.created_at > COALESCE(
+                           (SELECT max(m.created_at) FROM support_messages m
+                             WHERE m.ticket_id = t.id AND m.sender_type = 'user'),
+                           '-infinity'::timestamptz)
+                ) AS already_notified
+           FROM support_tickets t
+           JOIN ai_profiles_consolidated p ON p.user_id = t.user_id
+          WHERE t.id = $1`,
+        [ticketId],
+      );
+      const row = r.rows[0];
+      if (!row) return { sent: false, reason: 'no_profile' };
+
+      // Адрес есть не у всех: аккаунты по телефону часто его не заполняют.
+      const to = String(row.email || '').trim();
+      if (!to) return { sent: false, reason: 'no_email' };
+      if (row.already_notified) return { sent: false, reason: 'already_notified' };
+
+      const base = (process.env.PUBLIC_BASE_URL || 'https://my.linkeon.io').replace(/\/$/, '');
+      const { subject, html } = buildOwnerReplyEmail(row.language, { text: content, url: `${base}/support` });
+      const res = await this.mail.send(to, subject, html);
+
+      await this.pg.query(
+        `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
+         VALUES ($1, 'system', $2, 'notify_email', $3)`,
+        [ticketId, null, JSON.stringify({ ok: res.ok, error: res.error, to: this.maskEmail(to) })],
+      );
+      if (!res.ok) this.logger.warn(`support notify_email failed (${ticketId}): ${res.error}`);
+      return { sent: res.ok, reason: res.error };
+    } catch (e: any) {
+      this.logger.error(`support notify_email crashed (${ticketId}): ${e?.message}`);
+      return { sent: false, reason: 'internal_error' };
+    }
+  }
+
+  /** В support_events кладём адрес в укороченном виде — лога хватает, PII меньше. */
+  private maskEmail(email: string): string {
+    const [name, domain] = email.split('@');
+    if (!domain) return '***';
+    return `${name.slice(0, 2)}***@${domain}`;
   }
 
   async adminSetStatus(ticketId: string, ownerId: string, status: string, note?: string) {
@@ -902,6 +979,7 @@ ${healthSummary}
        VALUES ($1, 'owner', $2, 'reply', $3)`,
       [ticketId, `tg:${telegramUserId}`, JSON.stringify({ via: 'telegram', author: displayName, length: content.length })],
     );
+    if (visibleToUser) void this.notifyOwnerReplyByEmail(ticketId, content);
   }
 
   async adminStats(windowDays = 7) {
