@@ -1,6 +1,7 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
+import { excludedUsers } from '../common/test-users';
 import { sendTelegramAlert } from '../common/telegram-alert';
 import { ChatService } from '../chat/chat.service';
 import { SyntheticService } from './synthetic.service';
@@ -33,7 +34,7 @@ export interface QualityOverview {
   generatedAt: string;
   providerFailures: { window_min: number; count: number; sample: string | null };
   videoFailureRate: { window_min: number; failed: number; total: number; pct: number | null };
-  chat: { window_min: number; responses: number; empty: number; emptyPct: number | null; englishLeak: number; leakPct: number | null; deduped: number };
+  chat: { window_min: number; responses: number; empty: number; emptyPct: number | null; langMismatch: number; leakPct: number | null; deduped: number };
   refunds: { window_min: number; count: number; tokens: number };
   alerts: string[];
 }
@@ -154,15 +155,30 @@ export class QualityMonitorService {
       alerts.push(`video_failrate: ${f}/${t} (${pct}%) за ${FAILRATE_WINDOW_MIN}m`);
     }
 
-    // 3) Качество чат-ответов из телеметрии chat_quality: пустые ответы и англ-утечки.
+    // 3) Качество чат-ответов из телеметрии chat_quality: пустые ответы и ответы
+    // не на языке собеседника.
+    //
+    // Считаем ТОЛЬКО lang_mismatch. Старый проп english_leak сюда не берётся
+    // намеренно: он вычислялся правилом «мало кириллицы — значит дефект», под
+    // которое попадал любой корректный ответ не по-русски. Смешивать его с
+    // новым значением — значит тащить в метрику заведомо ложные срабатывания.
+    //
+    // Удалённые учётки и тестовые номера исключены: 15.08.2026 алерт «всплеск
+    // англоязычных ответов» целиком состоял из аккаунтов, заведённых и снесённых
+    // в тот же день при отладке удаления профиля.
     const chatRes = await this.pg.query(
       `SELECT
-         count(*) FILTER (WHERE COALESCE((props->>'deduped')::boolean, false) = false)::int AS responses,
-         count(*) FILTER (WHERE COALESCE((props->>'empty')::boolean, false))::int AS empty,
-         count(*) FILTER (WHERE COALESCE((props->>'english_leak')::boolean, false))::int AS leak,
-         count(*) FILTER (WHERE COALESCE((props->>'deduped')::boolean, false))::int AS deduped
-       FROM events WHERE name = 'chat_quality' AND ts > now() - ($1 || ' minutes')::interval`,
-      [CHAT_WINDOW_MIN],
+         count(*) FILTER (WHERE COALESCE((e.props->>'deduped')::boolean, false) = false)::int AS responses,
+         count(*) FILTER (WHERE COALESCE((e.props->>'empty')::boolean, false))::int AS empty,
+         count(*) FILTER (WHERE COALESCE((e.props->>'lang_mismatch')::boolean, false))::int AS leak,
+         count(*) FILTER (WHERE COALESCE((e.props->>'deduped')::boolean, false))::int AS deduped
+       FROM events e
+       LEFT JOIN user_id u ON u.internal_id = e.user_id
+      WHERE e.name = 'chat_quality'
+        AND e.ts > now() - ($1 || ' minutes')::interval
+        AND COALESCE(u.state, '') <> 'deleted'
+        AND NOT (e.user_id = ANY($2::text[]))`,
+      [CHAT_WINDOW_MIN, excludedUsers()],
     );
     const responses = Number(chatRes.rows[0]?.responses || 0);
     const emptyN = Number(chatRes.rows[0]?.empty || 0);
@@ -174,7 +190,7 @@ export class QualityMonitorService {
       alerts.push(`empty_responses: ${emptyN}/${responses} (${emptyPct}%)`);
     }
     if (responses >= CHAT_MIN_SAMPLE && leakPct !== null && leakPct >= LEAK_ALERT_PCT) {
-      alerts.push(`english_leak: ${leakN}/${responses} (${leakPct}%)`);
+      alerts.push(`lang_mismatch: ${leakN}/${responses} (${leakPct}%)`);
     }
 
     // 4) Всплеск возвратов токенов = всплеск сбоев доставки (авто-рефанды видео и т.п.).
@@ -194,7 +210,7 @@ export class QualityMonitorService {
       generatedAt: new Date().toISOString(),
       providerFailures: { window_min: PROVIDER_FAIL_WINDOW_MIN, count: provCount, sample: provSample },
       videoFailureRate: { window_min: FAILRATE_WINDOW_MIN, failed: f, total: t, pct },
-      chat: { window_min: CHAT_WINDOW_MIN, responses, empty: emptyN, emptyPct, englishLeak: leakN, leakPct, deduped: dedupedN },
+      chat: { window_min: CHAT_WINDOW_MIN, responses, empty: emptyN, emptyPct, langMismatch: leakN, leakPct, deduped: dedupedN },
       refunds: { window_min: REFUND_WINDOW_MIN, count: refCount, tokens: refTokens },
       alerts,
     };
@@ -230,8 +246,8 @@ export class QualityMonitorService {
     }
     if (ov.chat.responses >= CHAT_MIN_SAMPLE && ov.chat.leakPct !== null && ov.chat.leakPct >= LEAK_ALERT_PCT) {
       await this.alert(
-        'english_leak',
-        `⚠️ КАЧЕСТВО: всплеск англоязычных ответов — ${ov.chat.englishLeak}/${ov.chat.responses} (${ov.chat.leakPct}%) за ${ov.chat.window_min} мин. Проверить персона-промпт / r.linkeon.io.`,
+        'lang_mismatch',
+        `⚠️ КАЧЕСТВО: ответы не на языке собеседника — ${ov.chat.langMismatch}/${ov.chat.responses} (${ov.chat.leakPct}%) за ${ov.chat.window_min} мин. Проверить персона-промпт / языковую директиву / r.linkeon.io.`,
       );
     }
     if (ov.refunds.count >= REFUND_SPIKE_COUNT) {

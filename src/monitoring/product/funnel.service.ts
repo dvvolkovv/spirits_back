@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../../common/services/pg.service';
+import { excludedUsers, TEST_USER_PATTERN } from '../../common/test-users';
 
 /**
  * Sales funnel — see monitoring.functions.md §3.8.
@@ -35,16 +36,12 @@ export interface FunnelResponse {
 }
 
 // Полный список тестовых/админ-номеров + паттерн — тот же, что в VPM/economy.
-const TEST_USERS = ['70000000000', '79030169187', '79169403771', '79656445804'];
-const TEST_PATTERN = '^790300[0-9]{5}$';
-// Конфигурируемый override (через запятую). По умолчанию — полный список.
-const EXCLUDED_USERS: string[] = (process.env.FUNNEL_EXCLUDED_USERS || '')
-  .split(',').map((s) => s.trim()).filter(Boolean);
-const effectiveExcluded = EXCLUDED_USERS.length > 0 ? EXCLUDED_USERS : TEST_USERS;
+// Список общий с метриками качества — см. common/test-users.ts.
+const effectiveExcluded = excludedUsers();
 
 // SQL-фрагмент «не тестовый user_id»: массив (param) + паттерн (инлайн-константа).
 const NOT_TEST = (col: string, arrayParam: string) =>
-  `${col} <> ALL(${arrayParam}::text[]) AND ${col} !~ '${TEST_PATTERN}'`;
+  `${col} <> ALL(${arrayParam}::text[]) AND ${col} !~ '${TEST_USER_PATTERN}'`;
 
 interface StepDef {
   key: string;

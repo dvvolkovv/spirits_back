@@ -290,16 +290,61 @@ export class ChatService {
   // Эвристика англ-утечки: длинный ответ, в котором почти нет кириллицы (после
   // вырезания кода/URL) — вероятно, ассистент «съехал» на английский или утёк
   // служебный вывод. Для агрегатной телеметрии (не для блокировки).
-  private looksEnglishLeak(text: string): boolean {
-    if (!text) return false;
+  /**
+   * Письменность текста: кириллица / латиница / китайский. 'unknown' — букв
+   * слишком мало либо ни одна не набирает уверенного большинства.
+   */
+  private dominantScript(text: string): 'cyrillic' | 'latin' | 'han' | 'unknown' {
+    if (!text) return 'unknown';
     const cleaned = text
       .replace(/```[\s\S]*?```/g, ' ')
       .replace(/https?:\/\/\S+/g, ' ')
       .replace(/`[^`]*`/g, ' ');
-    const letters = (cleaned.match(/\p{L}/gu) || []).length;
-    if (letters < 40) return false;
-    const cyr = (cleaned.match(/[Ѐ-ӿ]/g) || []).length;
-    return cyr / letters < 0.1;
+    const cyr = (cleaned.match(/\p{Script=Cyrillic}/gu) || []).length;
+    const lat = (cleaned.match(/\p{Script=Latin}/gu) || []).length;
+    const han = (cleaned.match(/\p{Script=Han}/gu) || []).length;
+    const total = cyr + lat + han;
+    if (total < 40) return 'unknown';
+    const [best, score] = ([['cyrillic', cyr], ['latin', lat], ['han', han]] as const)
+      .reduce((a, b) => (b[1] > a[1] ? b : a));
+    // Смешанный текст (термины латиницей в русском ответе) не считаем сменой
+    // языка: у ответа на русском с парой английских слов латиница не наберёт 60%.
+    return score / total >= 0.6 ? best : 'unknown';
+  }
+
+  /** Ожидаемая письменность для языка интерфейса. */
+  private scriptForLanguage(lang: string): 'cyrillic' | 'latin' | 'han' | 'unknown' {
+    if (lang === 'ru') return 'cyrillic';
+    if (lang === 'zh') return 'han';
+    if (['en', 'es', 'de', 'fr', 'pt'].includes(lang)) return 'latin';
+    return 'unknown';
+  }
+
+  /**
+   * Ответ не на том языке, на котором к ассистенту обратились.
+   *
+   * Прежняя версия называлась looksEnglishLeak и считала дефектом любой текст,
+   * где меньше 10% кириллицы. Это верно ровно для одноязычного продукта: у нас
+   * семь локалей, и корректный ответ англичанину, немцу, испанцу, французу или
+   * португальцу попадал под правило наравне с настоящей утечкой. Китайский —
+   * всегда, в нём кириллицы не бывает в принципе. 15.08.2026 такой алерт уже
+   * прилетел на ровном месте.
+   *
+   * Опорой служит язык последней реплики пользователя, а не профиль: языковая
+   * директива прямо разрешает ассистенту перейти на язык собеседника
+   * (LanguageService.buildDirective), да и в профиле язык задан у меньшинства —
+   * на 15.08.2026 у 21 учётки из 182. Профиль используется, когда по реплике
+   * судить не о чем: короткое «ок», смайлик, ссылка.
+   */
+  private looksLanguageMismatch(response: string, userLanguage: string, userMessage: string): boolean {
+    const responseScript = this.dominantScript(response);
+    if (responseScript === 'unknown') return false; // коротко или смешанно — не судим
+
+    const userScript = this.dominantScript(userMessage);
+    const expected = userScript !== 'unknown' ? userScript : this.scriptForLanguage(userLanguage);
+    if (expected === 'unknown') return false;
+
+    return responseScript !== expected;
   }
 
   /**
@@ -1020,7 +1065,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
             ok: fullText.length > 0 && !turnFailed,
             empty: fullText.length === 0,
             chars: fullText.length,
-            english_leak: this.looksEnglishLeak(fullText),
+            lang_mismatch: this.looksLanguageMismatch(fullText, userLanguage, message),
             failed: turnFailed,
             fail_reason: failReason || undefined,
           },
