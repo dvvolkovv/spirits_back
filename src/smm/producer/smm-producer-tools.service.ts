@@ -20,6 +20,12 @@ export interface ToolContext {
   isAdmin: boolean;
   /** Most recent campaign id this user opened in the current chat session (optional). */
   recentCampaignId?: string;
+  /**
+   * Готовый блок про баланс из BalanceContextService. Собирается один раз за
+   * ход в ChatService.streamChat вместе с отметкой о предупреждении — сюда
+   * приезжает строкой, пересобирать нельзя.
+   */
+  balanceBlock?: string;
 }
 
 @Injectable()

@@ -79,7 +79,10 @@ export class ClaudeAgentService {
     const resumeId = await this.loadSessionId(ctx.userId);
 
     const mcpServer = this.buildMcpServer(ctx);
-    const ctxBlock = `Контекст юзера: isAdmin=${ctx.isAdmin}.`;
+    const ctxBlock = [
+      `Контекст юзера: isAdmin=${ctx.isAdmin}.`,
+      ctx.balanceBlock || '',
+    ].filter(Boolean).join('\n\n');
     const systemPromptWithCtx = `${ctxBlock}\n\n${SMM_PRODUCER_SYSTEM_PROMPT}`;
     let newSessionId: string | undefined;
     let totalCostUsd = 0;
