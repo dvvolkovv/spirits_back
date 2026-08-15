@@ -14,6 +14,7 @@ import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert'
 import { VideoService } from '../video/video.service';
 import { CreateVideoJobDto } from '../video/video.dto';
 import { MailService } from '../common/services/mail.service';
+import { LanguageService } from '../common/services/language.service';
 import { buildOwnerReplyEmail } from './support-mail';
 
 @Injectable()
@@ -268,6 +269,7 @@ export class SupportService implements OnModuleInit {
     const health = await this.getServiceHealth();
 
     const systemPrompt = this.buildSystemPrompt(profile, health);
+
     const conversation = history
       .filter((m) => m.sender_type === 'user' || m.sender_type === 'ai' || m.sender_type === 'owner')
       .map((m) => ({
@@ -397,6 +399,7 @@ export class SupportService implements OnModuleInit {
   }
 
   private buildSystemPrompt(profile: any, health?: { services: any[] }): string {
+    const lang = LanguageService.normalize(profile?.language);
     const healthSummary = (() => {
       if (!health?.services?.length) return 'нет данных (мониторинг не запускался)';
       return health.services
@@ -409,7 +412,12 @@ export class SupportService implements OnModuleInit {
         .join('\n');
     })();
 
-    return `Ты — ИИ-поддержка платформы LINKEON.IO. Отвечай кратко, по делу, по-русски.
+    // Язык ответа больше не зашит. Раньше здесь стояло «отвечай по-русски», и
+    // человек, написавший в поддержку по-английски, получал русский ответ —
+    // поймано при записи видео для Apple. Директива та же, что у ассистентов
+    // чата: язык профиля, с переходом на язык последней реплики.
+    return `Ты — ИИ-поддержка платформы LINKEON.IO. Отвечай кратко и по делу.
+${LanguageService.buildDirective(lang)}
 
 ПЛАТФОРМА. LINKEON.IO — AI-ассистенты для бизнеса и личного роста, нетворкинг (поиск людей + совместимость + запросы на общение + чаты между пользователями), генерация изображений и видео (Kling), реферальная программа.
 
@@ -486,6 +494,9 @@ ${healthSummary}
       preferred_agent: row.preferred_agent,
       name: row.profile_data?.name || null,
       family_name: row.profile_data?.family_name || null,
+      // Язык нужен ИИ-поддержке: без него она отвечала по-русски всем,
+      // включая тех, кто пишет по-английски.
+      language: LanguageService.normalize(row.profile_data?.language),
       created_at: row.created_at,
     };
   }
