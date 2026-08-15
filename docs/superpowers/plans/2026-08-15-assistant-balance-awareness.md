@@ -541,8 +541,12 @@ export class BalanceContextService {
   private async forecastMessages(userId: string, balance: number): Promise<number | null> {
     if (balance >= FORECAST_BALANCE_CEILING) return null;
 
+    // ABS обязателен: расход в token_transactions лежит отрицательным числом
+    // (см. ABS(SUM(amount)) в admin.service.ts:1149). medianSpend отбрасывает
+    // неположительные значения как мусор, так что без ABS сюда не доехал бы
+    // ни один замер и прогноз молча исчез бы навсегда.
     const res = await this.pg.query(
-      `SELECT amount FROM token_transactions
+      `SELECT ABS(amount) AS amount FROM token_transactions
         WHERE user_id = $1
           AND transaction_type = 'consumed'
           AND created_at > now() - ($2 || ' days')::interval
