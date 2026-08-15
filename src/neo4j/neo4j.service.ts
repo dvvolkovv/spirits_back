@@ -202,6 +202,31 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /// Стирает граф пользователя при удалении аккаунта.
+  ///
+  /// Personal-данные живут здесь богаче, чем в Postgres: ценности, убеждения,
+  /// желания, намерения, интересы и навыки — всё, что ассистенты вытащили из
+  /// переписки. При удалении аккаунта Postgres чистился, а граф оставался
+  /// нетронутым, и профиль частично воскресал при следующем входе.
+  ///
+  /// Узлы сущностей общие для всех профилей (`Value {name}` один на всех),
+  /// поэтому удаляем сам профиль вместе со связями, а сущности оставляем.
+  async deleteUserGraph(userId: string): Promise<void> {
+    const session = this.getSession();
+    if (!session) return;
+    try {
+      await session.run('MATCH (p:Profile {phone: $phone}) DETACH DELETE p', {
+        phone: userId,
+      });
+    } catch (e) {
+      // Удаление аккаунта не срываем: человек попросил удалить, и недоступный
+      // Neo4j не повод ответить отказом. Postgres к этому моменту уже очищен.
+      this.logger.error(`deleteUserGraph error: ${e.message}`);
+    } finally {
+      await session.close();
+    }
+  }
+
   async updateProfileEntities(userId: string, entityType: string, values: string[]): Promise<void> {
     const session = this.getSession();
     if (!session) return;

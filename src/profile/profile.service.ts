@@ -176,19 +176,40 @@ export class ProfileService implements OnModuleInit {
     await this.revokeAppleAccess(userId);
 
     await this.pg.query('DELETE FROM custom_chat_history WHERE session_id LIKE $1', [`${userId}_%`]);
-    // Preserve token balance: clear profile data but keep the row so tokens survive re-registration
     await this.pg.query(
       `UPDATE ai_profiles_consolidated
-       SET profile_data = '{}', email = NULL, preferred_agent = NULL, isadmin = false, updated_at = now()
+       SET profile_data = '{}', email = NULL, preferred_agent = NULL, isadmin = false,
+           tokens = 0, updated_at = now()
        WHERE user_id = $1`,
       [userId],
     );
-    // Soft-delete: mark user as deleted but keep user_id + user_identities rows so that
-    // re-registration with the same phone/email/OAuth restores the old token balance.
+    await this.neo4j?.deleteUserGraph(userId);
+
+    // Связки входа рвём — иначе «удаление» им не является.
+    //
+    // Раньше строки user_identities оставались жить, чтобы перерегистрация
+    // тем же телефоном или почтой возвращала прежний баланс. Побочный эффект
+    // оказался таким: удалённый аккаунт пускал обратно по СТАРОМУ паролю, а
+    // связывание отдельной строкой поднимало ему state обратно в active. То
+    // есть с точки зрения человека аккаунт не удалялся вовсе — что и увидели
+    // при съёмке для Apple. Правило 5.1.1(v) считает это деактивацией, а не
+    // удалением.
+    //
+    // Пароль и почту в user_id гасим там же: пароль иначе остался бы годным
+    // для нового аккаунта с тем же адресом, а primary_email — единственная
+    // оставшаяся копия адреса.
+    await this.pg.query('DELETE FROM user_identities WHERE user_id = $1', [userId]);
     await this.pg.query(
-      `UPDATE user_id SET state = 'deleted', update_date = now() WHERE internal_id = $1`,
+      `UPDATE user_id
+       SET state = 'deleted', password_hash = NULL, primary_email = NULL,
+           welcome_bonus_at = NULL, update_date = now()
+       WHERE internal_id = $1`,
       [userId],
     );
+    // welcome_bonus_at сбрасываем намеренно: у пользователя с телефонным
+    // входом internal_id — это сам номер, и перерегистрация неизбежно
+    // попадёт в ту же строку. Без сброса он получил бы чистый аккаунт с
+    // нулевым балансом и без стартового бонуса.
     return { success: true };
   }
 

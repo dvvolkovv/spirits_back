@@ -80,11 +80,6 @@ export class IdentityService implements OnModuleInit {
         `UPDATE user_identities SET last_used_at = now() WHERE provider = $1 AND provider_sub = $2`,
         [provider, providerSub],
       );
-      // Reactivate soft-deleted account — tokens in ai_profiles_consolidated are preserved
-      await this.pg.query(
-        `UPDATE user_id SET state = 'active', update_date = now() WHERE internal_id = $1 AND state = 'deleted'`,
-        [userId],
-      );
       this.events?.track('auth_succeeded', { userId, props: { method: provider, is_new: false } });
       return { userId, isNew: false, mergedExisting: false };
     }
@@ -118,6 +113,19 @@ export class IdentityService implements OnModuleInit {
            VALUES ($1, 'active', $2, $3) ON CONFLICT (internal_id) DO NOTHING
            RETURNING internal_id`,
           [providerSub, userId, provider],
+        );
+        // Регистрация тем же номером после удаления неизбежно попадает в ту же
+        // строку: у телефонного входа internal_id — это сам номер, и вставка
+        // молча ничего не делает. Строку надо вернуть в активные явно, иначе
+        // человек зарегистрируется в аккаунт с состоянием deleted.
+        //
+        // Данными прошлого владельца это не грозит: удаление их уже стёрло
+        // вместе с балансом, связками и паролем. Сюда мы попадаем только
+        // когда связок нет — значит аккаунт либо новый, либо удалённый.
+        await this.pg.query(
+          `UPDATE user_id SET state = 'active', update_date = now()
+           WHERE internal_id = $1 AND state <> 'active'`,
+          [userId],
         );
       } else {
         const ins = await this.pg.query(

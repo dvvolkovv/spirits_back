@@ -219,6 +219,23 @@ export class AuthService {
     return { phone, balance_before: balanceBefore, balance_after: balanceAfter };
   }
 
+  /// Помечен ли аккаунт удалённым.
+  ///
+  /// Ошибку базы трактуем как «не удалён»: недоступный Postgres не должен
+  /// разлогинивать всех живых пользователей разом.
+  private async isDeleted(userId: string): Promise<boolean> {
+    if (!this.pg) return false;
+    try {
+      const r = await this.pg.query(
+        `SELECT state FROM user_id WHERE internal_id = $1`,
+        [userId],
+      );
+      return r.rows[0]?.state === 'deleted';
+    } catch {
+      return false;
+    }
+  }
+
   async refreshTokens(
     refreshToken: string,
   ): Promise<{ 'access-token': string; 'refresh-token': string; userId: string } | null> {
@@ -226,6 +243,10 @@ export class AuthService {
       const payload = this.jwtSvc.verify(refreshToken);
       if (payload.type !== 'refresh') return null;
       const userId: string = payload.userId ?? payload.sub;
+      // Удалённый аккаунт не продлеваем. Связки входа удаление рвёт, но на
+      // руках у клиента остаётся выданный раньше refresh-токен, и без этой
+      // проверки он молча воскрешал бы доступ до самого истечения срока.
+      if (await this.isDeleted(userId)) return null;
       return {
         'access-token': this.jwtSvc.signAccess(userId),
         'refresh-token': this.jwtSvc.signRefresh(userId),
