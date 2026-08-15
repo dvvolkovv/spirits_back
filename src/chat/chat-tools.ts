@@ -10,6 +10,25 @@ import { CalendarService } from '../calendar/calendar.service';
 import { CalEvent } from '../calendar/calendar.types';
 import { Recurrence, expandOccurrences } from '../calendar/recurrence';
 import { SpeechService } from '../speech/speech.service';
+import { TOP_UP_URL } from '../tokens/balance-context.service';
+
+/**
+ * Единый ответ инструмента на нехватку токенов.
+ *
+ * Собран в одном месте намеренно: раньше шесть точек отказа собирали объект
+ * руками, и седьмая приехала бы без ссылки на пополнение — ассистент в этот
+ * момент импровизирует, потому что кроме кода ошибки у него ничего нет.
+ */
+export function insufficientTokens(balance: number, required: number) {
+  return {
+    ok: false as const,
+    error: 'insufficient_tokens' as const,
+    balance,
+    required,
+    shortfall: Math.max(0, required - balance),
+    topUpUrl: TOP_UP_URL,
+  };
+}
 
 /** UTC ISO instant → product-local (+05:00) ISO string, for human-readable read_calendar output. */
 function toLocalIso(utcIso: string): string {
@@ -512,11 +531,7 @@ export class ChatToolsService {
         } catch (e: any) {
           if (/недостаточно|insufficient/i.test(e?.message || '')) {
             const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
-            return {
-              ok: false, error: 'insufficient_tokens',
-              balance: Number(bal.rows[0]?.tokens || 0),
-              required: quality === 'hd' ? 10000 : 5000,
-            };
+            return insufficientTokens(Number(bal.rows[0]?.tokens || 0), quality === 'hd' ? 10000 : 5000);
           }
           return { ok: false, error: e?.message || 'image generation failed' };
         }
@@ -545,11 +560,7 @@ export class ChatToolsService {
         } catch (e: any) {
           if (/недостаточно|insufficient/i.test(e?.message || '')) {
             const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
-            return {
-              ok: false, error: 'insufficient_tokens',
-              balance: Number(bal.rows[0]?.tokens || 0),
-              required: quality === 'hd' ? 10000 : 5000,
-            };
+            return insufficientTokens(Number(bal.rows[0]?.tokens || 0), quality === 'hd' ? 10000 : 5000);
           }
           return { ok: false, error: e?.message || 'banner generation failed' };
         }
@@ -570,11 +581,7 @@ export class ChatToolsService {
         } catch (e: any) {
           if (/недостаточно|insufficient/i.test(e?.message || '')) {
             const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
-            return {
-              ok: false, error: 'insufficient_tokens',
-              balance: Number(bal.rows[0]?.tokens || 0),
-              required: quality === 'hd' ? 10000 : 5000,
-            };
+            return insufficientTokens(Number(bal.rows[0]?.tokens || 0), quality === 'hd' ? 10000 : 5000);
           }
           return { ok: false, error: e?.message || 'image edit failed' };
         }
@@ -598,11 +605,7 @@ export class ChatToolsService {
         } catch (e: any) {
           if (/недостаточно|insufficient/i.test(e?.message || '')) {
             const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
-            return {
-              ok: false, error: 'insufficient_tokens',
-              balance: Number(bal.rows[0]?.tokens || 0),
-              required: quality === 'hd' ? 10000 : 5000,
-            };
+            return insufficientTokens(Number(bal.rows[0]?.tokens || 0), quality === 'hd' ? 10000 : 5000);
           }
           return { ok: false, error: e?.message || 'image compose failed' };
         }
@@ -620,7 +623,7 @@ export class ChatToolsService {
         } catch (e: any) {
           if (/недостаточно|insufficient/i.test(e?.message || '')) {
             const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
-            return { ok: false, error: 'insufficient_tokens', balance: Number(bal.rows[0]?.tokens || 0), required: 10000 };
+            return insufficientTokens(Number(bal.rows[0]?.tokens || 0), 10000);
           }
           return { ok: false, error: e?.message || 'upscale failed' };
         }
@@ -703,7 +706,7 @@ export class ChatToolsService {
     } catch (e: any) {
       this.logger.warn(`executeTool(${name}) failed: ${e.message}`);
       if (e instanceof InsufficientTokensError) {
-        return { ok: false, error: 'insufficient_tokens', balance: e.balance, required: e.required };
+        return insufficientTokens(e.balance, e.required);
       }
       return { ok: false, error: e?.message || 'tool execution failed' };
     }
