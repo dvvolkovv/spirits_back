@@ -20,7 +20,7 @@ const REALERT_HOURS = Number(process.env.SYNTHETIC_REALERT_H || 3);
 // 5 минут держит «newest» вечно свежим, и детектор «раннер умер» больше никогда
 // не сработает — мониторинг ослепнет ровно так, как этот детектор и должен был
 // поймать. Собственные алерты у таких сценариев свои (см. TgHealthService).
-const IN_PROCESS_SCENARIOS = (process.env.SYNTHETIC_IN_PROCESS_SCENARIOS || 'tg_webhook')
+const IN_PROCESS_SCENARIOS = (process.env.SYNTHETIC_IN_PROCESS_SCENARIOS || 'tg_webhook,yookassa_shop')
   .split(',').map((s) => s.trim()).filter(Boolean);
 
 /**

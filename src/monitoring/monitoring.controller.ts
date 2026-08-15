@@ -27,6 +27,7 @@ import { NeoSnapshotHealthService } from './neo-snapshot-health.service';
 import { MinioMirrorHealthService } from './minio-mirror-health.service';
 import { NanoBananaHealthService } from './nanobanana-health.service';
 import { TgHealthService } from './tg-health.service';
+import { PaymentsHealthService } from './payments-health.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 
@@ -65,6 +66,7 @@ export class MonitoringController {
     private readonly minioMirror: MinioMirrorHealthService,
     private readonly nanoBanana: NanoBananaHealthService,
     private readonly tgHealth: TgHealthService,
+    private readonly paymentsHealth: PaymentsHealthService,
   ) {}
 
   @Get('admin/monitoring/overview')
@@ -143,6 +145,17 @@ export class MonitoringController {
       return res.status(200).json(data);
     } catch (e: any) {
       return res.status(500).json({ error: 'tg_bot_failed', message: e?.message || String(e) });
+    }
+  }
+
+  @Get('admin/monitoring/tech/payments')
+  @UseGuards(JwtGuard, AdminGuard)
+  async paymentsHealthOverview(@Res() res: Response) {
+    try {
+      const data = this.paymentsHealth.getOverview();
+      return res.status(200).json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: 'payments_health_failed', message: e?.message || String(e) });
     }
   }
 

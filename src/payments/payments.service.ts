@@ -1,4 +1,4 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { Injectable, Logger, Optional, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import { ReferralService } from '../referral/referral.service';
@@ -8,9 +8,11 @@ import { sendTelegramAlert } from '../common/telegram-alert';
 import { resolvePackage } from './packages';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
+import * as fs from 'fs';
+import * as path from 'path';
 
 @Injectable()
-export class PaymentsService {
+export class PaymentsService implements OnModuleInit {
   private readonly logger = new Logger(PaymentsService.name);
 
   constructor(
@@ -18,6 +20,32 @@ export class PaymentsService {
     @Optional() private readonly referralService: ReferralService,
     @Optional() private readonly events?: EventsService,
   ) {}
+
+  // Глобальный npm run migrate на проде застрял на base/001 и не докатывает
+  // ничего после — из-за этого 001_priem_provider.sql и 002_backfill катали
+  // руками. Модульный раннер, как в tg-bot: идемпотентный SQL при старте.
+  async onModuleInit() {
+    await this.applyMigration('003_payment_attempts.sql');
+  }
+
+  private async applyMigration(filename: string) {
+    const candidates = [
+      path.join(__dirname, 'migrations', filename),
+      path.join(__dirname, '..', '..', 'src', 'payments', 'migrations', filename),
+    ];
+    for (const p of candidates) {
+      try {
+        if (fs.existsSync(p)) {
+          await this.pg.query(fs.readFileSync(p, 'utf8'));
+          this.logger.log(`payments migration ${filename} applied from ${p}`);
+          return;
+        }
+      } catch (e: any) {
+        this.logger.error(`payments migration ${filename} failed (${p}): ${e.message}`);
+      }
+    }
+    this.logger.warn(`payments migration ${filename} not found, skipping`);
+  }
 
   async createPayment(userId: string, amount: number, pkg: string) {
     const shopId = process.env.YOOKASSA_SHOP_ID;
@@ -28,20 +56,42 @@ export class PaymentsService {
     const baseReturnUrl = process.env.RETURN_URL || 'https://my.linkeon.io/payment/success';
     // First create payment, then use real payment_id in return URL
     // YooKassa allows return_url with user_id; payment_id stored in localStorage on frontend
-    const resp = await axios.post(
-      'https://api.yookassa.ru/v3/payments',
-      {
-        amount: { value: amount.toFixed(2), currency: 'RUB' },
-        confirmation: { type: 'redirect', return_url: `${baseReturnUrl}?user_id=${encodeURIComponent(userId)}` },
-        description: `Токены: ${pkg}`,
-        capture: true,
-        metadata: { userId, package: pkg },
-      },
-      {
-        auth: { username: shopId, password: secretKey },
-        headers: { 'Idempotence-Key': idempotenceKey },
-      },
-    );
+    let resp: any;
+    try {
+      resp = await axios.post(
+        'https://api.yookassa.ru/v3/payments',
+        {
+          amount: { value: amount.toFixed(2), currency: 'RUB' },
+          confirmation: { type: 'redirect', return_url: `${baseReturnUrl}?user_id=${encodeURIComponent(userId)}` },
+          description: `Токены: ${pkg}`,
+          capture: true,
+          metadata: { userId, package: pkg },
+        },
+        {
+          auth: { username: shopId, password: secretKey },
+          headers: { 'Idempotence-Key': idempotenceKey },
+        },
+      );
+    } catch (e: any) {
+      // Тело ответа провайдера — единственное место, где написана причина.
+      // Инцидент 14.08.2026: 403 означал status=disabled у магазина, но и лог,
+      // и ответ пользователю несли только «Internal server error», поэтому два
+      // дня никто не понимал, что оплаты не работают.
+      const status = e?.response?.status ?? null;
+      const body = e?.response?.data;
+      const detail = body ? JSON.stringify(body) : e.message;
+      this.logger.error(`yookassa create-payment failed: HTTP ${status ?? '—'} ${detail}`);
+      await this.recordAttempt({
+        userId, provider: 'yookassa', packageId: pkg, amount, currency: 'RUB',
+        ok: false, httpStatus: status, error: detail,
+      });
+      // 503, а не 500: у нас всё исправно, недоступен внешний провайдер.
+      // Пользователю нужен понятный текст, а не пятисотка.
+      throw new ServiceUnavailableException({
+        error: 'payment_provider_unavailable',
+        message: 'Оплата временно недоступна. Мы уже знаем о проблеме — попробуйте позже.',
+      });
+    }
 
     const tokensForPkg = this.tokensForPackage(pkg, amount);
     const confirmUrl = resp.data.confirmation?.confirmation_url || '';
@@ -57,10 +107,43 @@ export class PaymentsService {
       props: { payment_id: resp.data.id, package: pkg, amount, tokens: tokensForPkg },
     });
 
+    // Успех тоже пишем: без него «три отказа подряд» не отличить от «три отказа
+    // за месяц вперемешку с успехами», а мониторинг должен будить только на
+    // первом.
+    await this.recordAttempt({
+      userId, provider: 'yookassa', packageId: pkg, amount, currency: 'RUB',
+      ok: true, httpStatus: 200, paymentId: resp.data.id,
+    });
+
     return {
       payment_id: resp.data.id,
       confirmation_url: confirmUrl,
     };
+  }
+
+  /**
+   * Журнал попыток оплаты. Никогда не роняет сам платёж: если запись не
+   * удалась, пользователь всё равно должен получить ссылку (или внятную
+   * ошибку), а не пятисотку из-за мониторинга.
+   */
+  private async recordAttempt(a: {
+    userId: string; provider: string; packageId?: string | null;
+    amount?: number | null; currency?: string | null; ok: boolean;
+    httpStatus?: number | null; error?: string | null; paymentId?: string | null;
+  }): Promise<void> {
+    try {
+      await this.pg.query(
+        `INSERT INTO payment_attempts (user_id, provider, package_id, amount, currency, ok, http_status, error, payment_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [
+          a.userId, a.provider, a.packageId ?? null, a.amount ?? null, a.currency ?? null,
+          a.ok, a.httpStatus ?? null, a.error ? String(a.error).slice(0, 2000) : null,
+          a.paymentId ?? null,
+        ],
+      );
+    } catch (e: any) {
+      this.logger.warn(`payment_attempts insert failed: ${e.message}`);
+    }
   }
 
   async verifyPayment(paymentId: string, userId: string) {
