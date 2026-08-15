@@ -90,3 +90,33 @@ describe('директива и язык истории', () => {
     expect(d).toMatch(/языке его последнего сообщения/);
   });
 });
+
+describe('директива против русского промпта', () => {
+  // Весь системный промпт — по-русски: платформа, промпт ассистента, правила
+  // ответа. Тысячи русских слов перевешивали одну русскую строчку «отвечай
+  // по-английски», и Роман с его длинным промптом отвечал по-русски даже при
+  // language=en в профиле.
+  it('заканчивается требованием на самом целевом языке', () => {
+    expect(LanguageService.buildDirective('en').trimEnd())
+      .toMatch(/Reply in English\.$/);
+    expect(LanguageService.buildDirective('de').trimEnd())
+      .toMatch(/Antworte auf Deutsch\.$/);
+    expect(LanguageService.buildDirective('zh').trimEnd())
+      .toMatch(/请用简体中文回复。$/);
+  });
+
+  it('прямо снимает русский язык инструкций как образец', () => {
+    expect(LanguageService.buildDirective('fr'))
+      .toMatch(/НЕ.*указание отвечать по-русски/);
+  });
+
+  it('для русского строка тоже русская, без противоречия', () => {
+    expect(LanguageService.buildDirective('ru').trimEnd())
+      .toMatch(/Отвечай по-русски\.$/);
+  });
+
+  it('незнакомый язык не оставляет директиву без последней строки', () => {
+    expect(LanguageService.buildDirective('xx').trimEnd())
+      .toMatch(/Отвечай по-русски\.$/);
+  });
+});
