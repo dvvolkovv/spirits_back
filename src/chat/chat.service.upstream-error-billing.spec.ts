@@ -47,6 +47,7 @@ function makeHarness(opts: { answer: string; costUsd: number | null; usage?: Rec
     pg as any,
     null as any, null as any, null as any, null as any, null as any, null as any,
     language as any,
+    undefined /* balanceCtx */,
     undefined, undefined, undefined,
   );
 

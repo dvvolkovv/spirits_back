@@ -10,6 +10,7 @@ import { TasksService } from '../tasks/tasks.service';
 import { EventsService } from '../events/events.service';
 import { TalerIdOauthService } from '../talerid/talerid-oauth.service';
 import { LanguageService } from '../common/services/language.service';
+import { BalanceContextService } from '../tokens/balance-context.service';
 import axios from 'axios';
 import { Request, Response } from 'express';
 import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
@@ -258,6 +259,7 @@ export class ChatService {
     private readonly claudeAgent: ClaudeAgentService,
     private readonly claudeCli: ClaudeCliService,
     private readonly language: LanguageService,
+    private readonly balanceCtx: BalanceContextService,
     @Optional() private readonly tasksService?: TasksService,
     @Optional() private readonly events?: EventsService,
     @Optional() private readonly talerIdOauth?: TalerIdOauthService,
@@ -392,9 +394,13 @@ export class ChatService {
 
     // Check token balance (skip for first greeting)
     const isGreetingMsg = recentHistory.length === 0 && /привет|расскажи про себя|hello|hi$/i.test(message.trim());
-    if (!isGreetingMsg) {
+    // Баланс нужен и шлагбауму, и блоку промпта — читаем один раз.
+    let balance = 0;
+    {
       const balRes = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1', [userId]);
-      const balance = balRes.rows[0]?.tokens || 0;
+      balance = Number(balRes.rows[0]?.tokens || 0);
+    }
+    if (!isGreetingMsg) {
       if (balance <= 0) {
         res.status(200);
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
@@ -410,6 +416,13 @@ export class ChatService {
         return;
       }
     }
+
+    // Блок про баланс собирается ОДИН раз за ход и передаётся готовой строкой
+    // во все пути: побочный эффект (отметка о выданном предупреждении) должен
+    // случиться однократно, а тексты в путях — не разойтись.
+    const balanceBlock = await this.balanceCtx.buildContextForPrompt(userId, balance, {
+      isGreeting: isGreetingMsg,
+    });
 
     // Route SMM-Producer agent to its dedicated Claude Agent SDK path (Plan 4e).
     // Uses OAuth via ~/.claude/.credentials.json — no ANTHROPIC_API_KEY needed.
@@ -435,7 +448,7 @@ export class ChatService {
         [userId],
       );
       const isAdmin = Boolean(adminRes.rows[0]?.isadmin);
-      const ctx = { userId, isAdmin };
+      const ctx = { userId, isAdmin, balanceBlock };
       try {
         await this.claudeAgent.streamSmmProducer(ctx, message, chatSessionId, agent.id, res);
       } catch (err: any) {
@@ -459,7 +472,7 @@ export class ChatService {
         userId, message, String(assistantId), String(agent.id),
         recentHistory, profileText, res,
         agent.name, agent.description || '', agent.system_prompt || '',
-        req, fresh, chatSessionId, requestLang, clientTz,
+        req, fresh, chatSessionId, requestLang, clientTz, balanceBlock,
       );
     }
 
@@ -525,6 +538,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
       } catch (e: any) {
         this.logger.warn(`tasks context injection failed (Маша): ${e?.message}`);
       }
+    }
+    if (balanceBlock) {
+      volatileSystemPrompt += `\n\n${balanceBlock}`;
     }
 
     // Плоская строка для путей, не поддерживающих структурный system (DeepSeek greeting, OpenRouter fallback)
@@ -738,6 +754,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
     requestLang?: string,
     // Часовой пояс клиента (IANA) — см. streamChat.
     clientTz?: string,
+    // Готовый блок про баланс (см. BalanceContextService). Собран в streamChat,
+    // сюда приезжает строкой: пересобирать его здесь нельзя — отметка о
+    // предупреждении встала бы дважды за ход.
+    balanceBlock?: string,
   ): Promise<void> {
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
@@ -904,6 +924,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
       } catch (e: any) {
         this.logger.warn(`tasks context injection failed: ${e?.message}`);
       }
+    }
+    if (balanceBlock) {
+      contextPrefix += balanceBlock + '\n';
     }
     if (recentHistory.length > 0) {
       // stripLeakedToolSyntax: заражённая история заставляет модель имитировать

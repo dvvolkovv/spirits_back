@@ -131,6 +131,7 @@ function makeHarness(opts: { deltas: string[]; clips: ClipSpec[]; userId?: strin
     null as any,      // claudeAgent
     null as any,      // claudeCli
     language as any,  // language
+    undefined,        // balanceCtx
     undefined,        // tasksService
     undefined,        // events
     undefined,        // talerIdOauth

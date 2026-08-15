@@ -33,7 +33,8 @@ function makeService() {
   const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
   return new ChatService(
     pg as any, null as any, null as any, null as any, null as any,
-    null as any, null as any, language as any, undefined, undefined, undefined,
+    null as any, null as any, language as any, undefined /* balanceCtx */,
+    undefined, undefined, undefined,
   );
 }
 

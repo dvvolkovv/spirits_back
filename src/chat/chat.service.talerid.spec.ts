@@ -18,6 +18,7 @@ function makeService(oauth: any): ChatService {
     null as any, // claudeCli
     null as any, // language — добавлен в конструктор позже, из-за чего все
                  // последующие аргументы съезжали и oauth попадал в слот events
+    undefined,   // balanceCtx — тоже добавлен позже; taleridAgentFields его не трогает
     undefined,   // tasksService
     undefined,   // events
     oauth,       // talerIdOauth
