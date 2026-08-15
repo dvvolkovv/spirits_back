@@ -1,9 +1,17 @@
 import { BalanceContextService } from './balance-context.service';
 
-/** Фейковый PgService: отдаёт заготовленные ответы и записывает все запросы. */
+/**
+ * Фейковый PgService: отдаёт заготовленные ответы и записывает все запросы.
+ *
+ * `rowCount` у UPDATE моделируется намеренно: настоящий Postgres на
+ * несуществующем user_id отрабатывает без ошибки и трогает НОЛЬ строк, а
+ * фейк, всегда возвращавший успех, это скрывал.
+ */
 function fakePg(opts: {
   warned?: { at: string; atBalance: number } | null;
   spends?: number[];
+  /** Сколько строк тронул UPDATE. 0 = такого пользователя в таблице нет. */
+  updateRowCount?: number;
 } = {}) {
   const calls: { sql: string; params: any[] }[] = [];
   return {
@@ -15,6 +23,9 @@ function fakePg(opts: {
       }
       if (/token_transactions/.test(sql)) {
         return { rows: (opts.spends ?? []).map((a) => ({ amount: a })) };
+      }
+      if (/^\s*UPDATE/i.test(sql)) {
+        return { rows: [], rowCount: opts.updateRowCount ?? 1 };
       }
       return { rows: [] };
     },
@@ -109,6 +120,39 @@ describe('BalanceContextService — разрешение предупредит�
     await svc(pg).buildContextForPrompt('u1', 43210);
     const write = pg.calls.find((c: any) => /UPDATE/i.test(c.sql));
     expect(write).toBeUndefined();
+  });
+
+  it('отметка не сохранилась (строки нет) — предупреждения не выдаём', async () => {
+    // Иначе предупреждение повторялось бы КАЖДЫЙ ход: разрешение выдано,
+    // а запомнить его негде. Найдено прогоном сервиса против живого Postgres —
+    // фейковый pg успех UPDATE подразумевал и дефект скрывал.
+    const block = await svc(fakePg({ updateRowCount: 0 })).buildContextForPrompt('u1', 8000);
+    expect(block).not.toContain('Баланс на исходе');
+    // Цифра баланса при этом остаётся — ассистент всё ещё может ответить на вопрос
+    expect(block).toContain('8000');
+  });
+});
+
+describe('BalanceContextService — согласование числа с существительным', () => {
+  const forecastFor = async (balance: number, median: number) => {
+    const spends = [median, median, median, median, median];
+    return svc(fakePg({ spends })).buildContextForPrompt('u1', balance);
+  };
+
+  it('одно сообщение — «сообщение», а не «1 сообщений»', async () => {
+    expect(await forecastFor(500, 400)).toContain('1 сообщение ');
+  });
+
+  it('двадцать три — «сообщения»', async () => {
+    expect(await forecastFor(9200, 400)).toContain('23 сообщения ');
+  });
+
+  it('двадцать — «сообщений»', async () => {
+    expect(await forecastFor(8000, 400)).toContain('20 сообщений ');
+  });
+
+  it('два — «сообщения»', async () => {
+    expect(await forecastFor(800, 400)).toContain('2 сообщения ');
   });
 });
 

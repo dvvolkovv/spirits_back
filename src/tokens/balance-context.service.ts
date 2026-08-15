@@ -20,6 +20,25 @@ const FORECAST_WINDOW_DAYS = 14;
 export const TOP_UP_URL = 'https://my.linkeon.io/chat?view=tokens';
 
 /**
+ * Склонение «сообщение» после числа. Блок инструкции пишется по-русски, и
+ * «примерно на 1 сообщений» — брак, который уезжает прямо в промпт модели.
+ *
+ * Категории берём у Intl.PluralRules, а не выписываем правила руками: у
+ * русского их три (one/few/many) и границы неочевидны — 21 это `one`, 23 —
+ * `few`, 25 — `many`.
+ */
+const RU_PLURALS = new Intl.PluralRules('ru-RU');
+const MESSAGE_FORMS: Record<string, string> = {
+  one: 'сообщение',
+  few: 'сообщения',
+  many: 'сообщений',
+  other: 'сообщения',
+};
+function messagesWord(n: number): string {
+  return MESSAGE_FORMS[RU_PLURALS.select(n)] ?? 'сообщений';
+}
+
+/**
  * Блок про баланс для системного промпта ассистента.
  *
  * Устроен как TasksService.buildContextForPrompt: единственный публичный
@@ -47,7 +66,7 @@ export class BalanceContextService {
       let block = `--- Баланс пользователя ---\n`;
       block += forecast == null
         ? `На счету ${balance} токенов.\n`
-        : `На счету ${balance} токенов — примерно на ${forecast} сообщений при его обычном расходе.\n`;
+        : `На счету ${balance} токенов — примерно на ${forecast} ${messagesWord(forecast)} при его обычном расходе.\n`;
       block +=
         `Сам про баланс не заговаривай. Если спросят, сколько осталось — назови эту цифру, ` +
         `не выдумывай и не округляй.\n` +
@@ -120,7 +139,7 @@ export class BalanceContextService {
 
     if (!shouldWarn({ balance, warned, now: Date.now(), isGreeting })) return false;
 
-    await this.pg.query(
+    const upd = await this.pg.query(
       `UPDATE ai_profiles_consolidated
           SET profile_data = jsonb_set(
                 coalesce(profile_data, '{}'::jsonb),
@@ -131,6 +150,15 @@ export class BalanceContextService {
         WHERE user_id = $1`,
       [userId, JSON.stringify({ at: new Date().toISOString(), atBalance: balance })],
     );
+
+    // Отметку записать не удалось — молчим. Postgres на несуществующем
+    // user_id отрабатывает БЕЗ ошибки и трогает ноль строк, так что выдать
+    // здесь разрешение значило бы предупреждать заново каждый ход: запомнить
+    // выданное разрешение негде. Лучше не предупредить, чем зациклиться.
+    if (!upd.rowCount) {
+      this.logger.warn(`отметка о предупреждении не записана: нет строки профиля у ${userId}`);
+      return false;
+    }
     return true;
   }
 }
