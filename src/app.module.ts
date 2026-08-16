@@ -4,6 +4,7 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { CommonModule } from './common/common.module';
 import { AuthModule } from './auth/auth.module';
 import { ProfileModule } from './profile/profile.module';
+import { BackupModule } from './backup/backup.module';
 import { AgentsModule } from './agents/agents.module';
 import { CustomAgentsModule } from './custom-agents/custom-agents.module';
 import { ChatModule } from './chat/chat.module';
@@ -52,6 +53,7 @@ import { SpeechModule } from './speech/speech.module';
     CommonModule,
     AuthModule,
     ProfileModule,
+    BackupModule,
     AgentsModule,
     CustomAgentsModule,
     ChatModule,
