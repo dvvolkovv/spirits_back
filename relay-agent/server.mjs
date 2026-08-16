@@ -5,6 +5,7 @@ import { randomUUID } from "crypto";
 import fs from "fs";
 import path from "path";
 import { spawn, execSync } from "child_process";
+import { sessionFsKey, uploadFileName, fallbackFileName } from "./paths.mjs";
 
 const app = express();
 const PORT = 3033;
@@ -285,25 +286,23 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   if (!message) return res.status(400).json({ error: "message is required" });
 
   const sessionId = reqSessionId || randomUUID();
-  const outDir = path.join(OUTPUT_DIR, sessionId);
+  // sessionId остаётся логическим ключом сессии (sessionMap, activeChildren,
+  // --resume), а на диск и в /files-ссылки уходит его санитизированная копия.
+  // Для обычного "<телефон>_<n>" это та же строка, так что имена папок и
+  // ссылок у живых сессий не меняются. См. relay-agent/paths.mjs.
+  const fsKey = sessionFsKey(sessionId, randomUUID());
+  const outDir = path.join(OUTPUT_DIR, fsKey);
   fs.mkdirSync(outDir, { recursive: true });
 
   const renamedFiles = [];
   if (req.files && req.files.length > 0) {
     for (const f of req.files) {
-      // Linux NAME_MAX is 255 bytes. Sanitised filenames built from Cyrillic
-      // bank statements (each non-ASCII char becomes "_") routinely exceed
-      // it, so cap the base well under the limit while preserving extension.
-      const ext = path.extname(f.originalname).replace(/[^a-zA-Z0-9.]/g, "");
-      const baseRaw = path.basename(f.originalname, path.extname(f.originalname));
-      const baseSafe = baseRaw.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 180);
-      const safeName = baseSafe + ext;
-      const newPath = path.join(UPLOAD_DIR, sessionId + "_" + safeName);
+      const newPath = path.join(UPLOAD_DIR, uploadFileName(f.originalname, fsKey));
       try {
         fs.renameSync(f.path, newPath);
         renamedFiles.push({ path: newPath, name: f.originalname, size: f.size });
       } catch (e) {
-        const fallback = path.join(UPLOAD_DIR, sessionId + "_" + randomUUID() + ext);
+        const fallback = path.join(UPLOAD_DIR, fallbackFileName(f.originalname, fsKey, randomUUID()));
         try {
           fs.renameSync(f.path, fallback);
           renamedFiles.push({ path: fallback, name: f.originalname, size: f.size });
@@ -398,7 +397,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
     try {
       const base = JSON.parse(fs.readFileSync(BASE_MCP_PATH, "utf8"));
       base.mcpServers.talerid = { type: "http", url: _taleridMcpUrl, headers: { Authorization: "Bearer " + _taleridToken } };
-      taleridMcpPath = path.join(UPLOAD_DIR, sessionId + "-talerid-mcp.json");
+      taleridMcpPath = path.join(UPLOAD_DIR, fsKey + "-talerid-mcp.json");
       fs.writeFileSync(taleridMcpPath, JSON.stringify(base), { mode: 0o600 });
       mcpConfigPath = taleridMcpPath;
       allowedTools += "," + TALERID_TOOLS;
@@ -752,7 +751,9 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
           try {
             const stat = fs.statSync(full);
             if (stat.isDirectory()) walk(full, rel);
-            else if (!filesBefore.has(rel) || stat.mtimeMs > filesBefore.get(rel)) outputFiles.push({ name: rel, size: stat.size, url: "/files/" + sessionId + "/" + rel });
+            // Ссылка обязана указывать на ту же папку, которую обошёл walk:
+            // файлы лежат в OUTPUT_DIR/<fsKey>, а не в OUTPUT_DIR/<sessionId>.
+            else if (!filesBefore.has(rel) || stat.mtimeMs > filesBefore.get(rel)) outputFiles.push({ name: rel, size: stat.size, url: "/files/" + fsKey + "/" + rel });
           } catch {}
         }
       };
