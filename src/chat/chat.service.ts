@@ -998,6 +998,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
       contextPrefix += `Recent conversation context:\n${historyLines}\n\n`;
     }
 
+    // Требование языка — ПОСЛЕ всех дописанных блоков, перед самой репликой.
+    //
+    // Директива стоит в начале contextPrefix, но за ней приклеиваются персона
+    // ассистента, список коллег, профиль, задачи, баланс и история — всё
+    // по-русски. Модель читает язык последних строк как образец: Роман
+    // отвечал по-русски аккаунту с language=en даже после того, как я починил
+    // это в прямом пути к Anthropic. Здесь путь другой — через релей
+    // r.linkeon.io, — и правку пришлось повторить.
+    contextPrefix +=
+      `${LANGUAGE_REPLY_LINE[userLanguage] || LANGUAGE_REPLY_LINE[DEFAULT_LANGUAGE]}\n\n`;
+
     const prompt = contextPrefix + message;
 
     // Set streaming headers
@@ -1612,6 +1623,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
     if (profileText && profileText.trim()) {
       prefix += `User profile:\n${profileText}\n\n`;
     }
+    // Требование языка последней строкой — по той же причине, что в двух
+    // других путях: директива в начале тонет под русской персоной и профилем.
+    // Третье место, где приходится это дублировать; сборку промпта стоит
+    // однажды свести в одно место, но не посреди ответа Apple.
+    prefix +=
+      `${LANGUAGE_REPLY_LINE[await this.language.resolveUserLanguage(userId)] || LANGUAGE_REPLY_LINE[DEFAULT_LANGUAGE]}\n\n`;
+
     const prompt = prefix + message;
 
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
