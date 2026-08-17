@@ -100,6 +100,17 @@ export class ChatController {
     // Часовой пояс клиента (IANA). Фронт берёт его из Intl и шлёт в каждом
     // запросе — иначе ассистент считает время по UTC сервера.
     const clientTz = typeof body.tz === 'string' ? body.tz.slice(0, 64) : undefined;
+    // Канал распространения клиента. Мобильное приложение шлёт его заголовком
+    // в каждом запросе (ApiClient). В сборке для магазина ассистент не должен
+    // давать ссылку на пополнение: правило 3.1.1 считает нарушением любую
+    // точку доступа к оплате мимо биллинга Apple, и отказ 17.08.2026 пришёл
+    // именно за такую ссылку.
+    //
+    // Неизвестное или отсутствующее значение — НЕ магазин: так ведут себя веб
+    // и старые сборки, где оплата разрешена. Ошибиться в эту сторону дешевле,
+    // чем молча выключить пополнение всему вебу.
+    const distribution = String(req.headers['x-linkeon-distribution'] || '').toLowerCase();
+    const storeBuild = distribution === 'appstore' || distribution === 'play';
     if (!message || !assistantId) {
       return res.status(400).json({ error: 'Missing message or assistantId' });
     }
@@ -131,6 +142,7 @@ export class ChatController {
         fresh,
         requestLang,
         clientTz,
+        storeBuild,
       );
       this.events?.track('response_received', {
         userId,

@@ -383,6 +383,9 @@ export class ChatService {
     // 11.08 писала «я тебе в 19:44 файлы направляю», а ассистент видел 14:44 и
     // объяснял ей эту разницу вручную посреди рабочего разговора.
     clientTz?: string,
+    // Запрос из сборки для App Store или Google Play: ссылок на пополнение в
+    // промпте быть не должно. См. BalanceContextService.buildContextForPrompt.
+    storeBuild: boolean = false,
   ): Promise<void> {
     // Get agent
     // Custom-agent branch: "custom:<uuid>" references user-created agents.
@@ -467,6 +470,7 @@ export class ChatService {
     // случиться однократно, а тексты в путях — не разойтись.
     const balanceBlock = await this.balanceCtx.buildContextForPrompt(userId, balance, {
       isGreeting: isGreetingMsg,
+      storeBuild,
     });
 
     // Route SMM-Producer agent to its dedicated Claude Agent SDK path (Plan 4e).
