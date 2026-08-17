@@ -9,7 +9,7 @@ import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { TasksService } from '../tasks/tasks.service';
 import { EventsService } from '../events/events.service';
 import { TalerIdOauthService } from '../talerid/talerid-oauth.service';
-import { LanguageService } from '../common/services/language.service';
+import { LanguageService, LANGUAGE_REPLY_LINE, DEFAULT_LANGUAGE } from '../common/services/language.service';
 import { BalanceContextService } from '../tokens/balance-context.service';
 import axios from 'axios';
 import { Request, Response } from 'express';
@@ -593,7 +593,18 @@ ${LanguageService.buildDirective(userLanguage)}`;
     }
 
     // Плоская строка для путей, не поддерживающих структурный system (DeepSeek greeting, OpenRouter fallback)
-    const systemPrompt = stableSystemPrompt + volatileSystemPrompt;
+    // Требование ответить на нужном языке — САМОЙ последней строкой, после
+    // всего волатильного блока.
+    //
+    // Директива живёт внутри stableSystemPrompt (её часть кэшируется), но за
+    // ней приклеиваются профиль, задачи и баланс — всё по-русски. Модель
+    // читает язык последних строк как образец, и Роман снова начал отвечать
+    // по-русски аккаунту с language=en, хотя директива на месте. Дублируем
+    // короткую строку в самый конец: она короткая и кэш префикса не ломает.
+    const systemPrompt =
+      stableSystemPrompt +
+      volatileSystemPrompt +
+      `\n\n${LANGUAGE_REPLY_LINE[userLanguage] || LANGUAGE_REPLY_LINE[DEFAULT_LANGUAGE]}\n`;
 
     // Build messages array
     const llmMessages: { role: 'user' | 'assistant'; content: string }[] = [];
