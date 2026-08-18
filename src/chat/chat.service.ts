@@ -1191,7 +1191,24 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // Claude-сессию — обычный id протаскивал прошлый контекст (задачи,
         // разговоры) в «чистый лист» мимо наших блокировок. Fresh-сессия
         // получает на relay собственную чистую память.
-        fd.append('sessionId', fresh && freshSessionId ? freshSessionId : `${userId}_${assistantId}`);
+        // Язык — часть ключа сессии.
+        //
+        // Релей резюмит Claude-сессию по sessionId и тащит в неё весь прежний
+        // разговор. У человека, сменившего язык, накопленная русская переписка
+        // перевешивала любые указания в промпте: три правки подряд не помогли,
+        // ассистент отвечал «Рад снова тебя видеть» по-русски аккаунту с
+        // language=en. Другой язык — другая сессия, чистая память, никакого
+        // русского образца перед глазами.
+        //
+        // Цена: при смене языка ассистент забывает прежний разговор. Это
+        // честнее, чем отвечать не на том языке, а история в нашей БД
+        // сохраняется и показывается пользователю как была.
+        fd.append(
+          'sessionId',
+          fresh && freshSessionId
+            ? freshSessionId
+            : `${userId}_${assistantId}_${userLanguage}`,
+        );
 
         // Agent-direct TalerID: when the user connected the TalerID ecosystem, hand
         // the file-agent a full-scope access token + the MCP base URL of the env we
@@ -1639,7 +1656,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // sessionIdOverride — для синтетических проб: изолированная сессия, чтобы не
     // коллидить с реальной сессией юзера/другими пробами (r.linkeon отдаёт пустой
     // поток при конкурентном обращении к ЗАНЯТОЙ сессии — инцидент 2026-07-12).
-    fd.append('sessionId', sessionIdOverride || `${userId}_${assistantId}`);
+    // Язык в ключе сессии — по той же причине, что в основном пути: релей
+    // резюмит прежний разговор, и накопленный русский перевешивает промпт.
+    fd.append(
+      'sessionId',
+      sessionIdOverride ||
+        `${userId}_${assistantId}_${await this.language.resolveUserLanguage(userId)}`,
+    );
     const chunks: string[] = [];
     const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
       headers: fd.getHeaders(),
