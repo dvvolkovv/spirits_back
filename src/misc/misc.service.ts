@@ -528,10 +528,24 @@ ${LanguageService.buildDirective(userLanguage)}`;
     }
   }
 
+  private static readonly IMAGE_ATTEMPTS = 3;
+
   /**
-   * Сырая генерация картинки: Imagen 4.0 Ultra (primary) → Nano Banana (fallback).
+   * Сырая генерация картинки: Nano Banana 2 (std) / Nano Banana Pro (hd).
    * Возвращает base64 + mime. Не списывает токены и не пишет историю — это делают
    * вызывающие методы (generateImage / generateBanner).
+   *
+   * Imagen 4.0 Ultra отсюда убран: Google снял `imagen-4.0-ultra-generate-001`
+   * (404 «no longer available, use models/gemini-3.1-flash-image»; последняя
+   * удачная генерация — 16.08.2026 19:00). Вызов уже двое суток гарантированно
+   * падал в 404 и просто съедал round-trip перед фолбэком.
+   *
+   * Ретрай: модель периодически отдаёт HTTP 200 с `finishReason:
+   * IMAGE_RECITATION` и пустым `parts` — это фильтр Google на близкое
+   * воспроизведение обучающих данных, а не ошибка запроса. Отказ
+   * недетерминированный (на генеричном промпте ловился в половине вызовов),
+   * повтор того же промпта обычно проходит, поэтому здесь именно ретрай, а не
+   * сообщение «измените промпт».
    */
   private async generateRawImage(
     prompt: string,
@@ -541,49 +555,47 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const apiKey = process.env.GOOGLE_AI_API_KEY;
     if (!apiKey) throw new Error('Google AI API key not configured');
 
-    let b64Image: string | null = null;
-    let mimeType = 'image/png';
+    const geminiModel = quality === 'hd' ? 'gemini-3-pro-image-preview' : 'gemini-3.1-flash-image-preview';
+    let lastReason = 'no candidates';
 
-    // Primary: Imagen 4.0 Ultra (best quality, blocks people with children)
-    try {
-      const imagenResp = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-ultra-generate-001:predict?key=${apiKey}`,
-        { instances: [{ prompt }], parameters: { sampleCount: 1, aspectRatio, personGeneration: 'allow_adult' } },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 90000 },
-      );
-      const pred = (imagenResp.data?.predictions || [])[0];
-      if (pred?.bytesBase64Encoded) {
-        b64Image = pred.bytesBase64Encoded;
-        mimeType = pred.mimeType || 'image/png';
-        this.logger.log('Imagen 4.0 Ultra generated image');
-      } else {
-        this.logger.warn('Imagen Ultra returned no image (content policy), falling back to Gemini');
-      }
-    } catch (imagenErr: any) {
-      this.logger.warn(`Imagen Ultra error: ${imagenErr.message}, falling back to Gemini`);
-    }
-
-    // Fallback: Nano Banana 2 (std) / Nano Banana Pro (hd) — new Gemini 3.x image models
-    if (!b64Image) {
-      const geminiModel = quality === 'hd' ? 'gemini-3-pro-image-preview' : 'gemini-3.1-flash-image-preview';
+    for (let attempt = 1; attempt <= MiscService.IMAGE_ATTEMPTS; attempt++) {
       const geminiResp = await axios.post(
         `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${apiKey}`,
-        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseModalities: ['IMAGE'] } },
+        {
+          contents: [{ parts: [{ text: prompt }] }],
+          // imageConfig.aspectRatio — соотношение сторон раньше уходило только в
+          // параметры Imagen, поэтому вместе с ним оно молча перестало работать:
+          // что бы юзер ни выбрал, приходил квадрат. Gemini его понимает
+          // (16:9 → 1376×768, 1:1 → 1024×1024), так что передаём здесь.
+          generationConfig: { responseModalities: ['IMAGE'], imageConfig: { aspectRatio } },
+        },
         { headers: { 'Content-Type': 'application/json' }, timeout: 90000 },
       );
-      const parts = geminiResp.data?.candidates?.[0]?.content?.parts || [];
+      const candidate = geminiResp.data?.candidates?.[0];
+      const parts = candidate?.content?.parts || [];
       const imgPart = parts.find((p: any) => p.inlineData?.data);
       if (imgPart) {
-        b64Image = imgPart.inlineData.data;
-        mimeType = imgPart.inlineData.mimeType || 'image/png';
-        this.logger.log(`${geminiModel} generated image`);
+        this.logger.log(`${geminiModel} generated image (attempt ${attempt})`);
+        return {
+          b64Image: imgPart.inlineData.data,
+          mimeType: imgPart.inlineData.mimeType || 'image/png',
+        };
       }
+
+      // Без картинки. Раньше эта ветка не логировалась вообще: запрос падал, а в
+      // логе не было ни строки, и отказ выглядел как «ничего не происходило».
+      lastReason =
+        candidate?.finishReason ||
+        geminiResp.data?.promptFeedback?.blockReason ||
+        'no image part';
+      this.logger.warn(
+        `${geminiModel} returned no image (attempt ${attempt}/${MiscService.IMAGE_ATTEMPTS}, reason=${lastReason})`,
+      );
     }
 
-    if (!b64Image) {
-      throw new Error('Модель не вернула изображений. Попробуйте изменить промпт.');
-    }
-    return { b64Image, mimeType };
+    throw new Error(
+      `Модель не вернула изображений (${lastReason}). Попробуйте ещё раз или измените промпт.`,
+    );
   }
 
   /**
