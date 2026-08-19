@@ -1,5 +1,6 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Bot, InputFile } from 'grammy';
+import { splitForTelegram } from './tg-text-split';
 
 @Injectable()
 export class TgGrammyClient implements OnModuleInit {
@@ -41,8 +42,29 @@ export class TgGrammyClient implements OnModuleInit {
     }
   }
 
+  /**
+   * Отправка текста с нарезкой под лимит Telegram (4096). Без неё длинный ответ
+   * Claude ронял sendMessage с 400 «message is too long», исключение уносило
+   * управление из handleGroupMessage — ответ терялся, юзер получал молчание.
+   * Нарезка живёт здесь, а не в вызывающем коде, чтобы под защитой были все
+   * исходящие пути разом (ответ, TTS-fallback, команды, DM о балансе).
+   *
+   * Цитату (reply_to_message_id) вешаем только на первый кусок: иначе Telegram
+   * повторяет вопрос над каждым продолжением. Возвращаем последнее сообщение —
+   * вызывающие берут из ответа message_id, а куски идут подряд.
+   */
   async sendMessage(chatId: number, text: string, options: any = {}) {
-    return this.bot.api.sendMessage(chatId, text, options);
+    const chunks = splitForTelegram(text);
+    if (chunks.length <= 1) {
+      return this.bot.api.sendMessage(chatId, chunks[0] ?? text, options);
+    }
+
+    const { reply_to_message_id: _drop, ...tail } = options;
+    let sent = await this.bot.api.sendMessage(chatId, chunks[0], options);
+    for (const chunk of chunks.slice(1)) {
+      sent = await this.bot.api.sendMessage(chatId, chunk, tail);
+    }
+    return sent;
   }
 
   async sendChatAction(
