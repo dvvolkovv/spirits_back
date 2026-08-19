@@ -574,14 +574,10 @@ export class TgBotService implements OnModuleInit {
           contentType = 'voice_reply';
         } catch (e: any) {
           this.logger.warn(`TTS failed for chat ${msg.chat.id}, fallback to text: ${e.message}`);
-          await this.grammy.sendMessage(msg.chat.id, textToSend, {
-            reply_to_message_id: msg.message_id,
-          });
+          await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend);
         }
       } else if (textToSend) {
-        await this.grammy.sendMessage(msg.chat.id, textToSend, {
-          reply_to_message_id: msg.message_id,
-        });
+        await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend);
       }
 
       // Отправляем каждый attachment-маркер отдельным сообщением. Ошибка по
@@ -644,6 +640,42 @@ export class TgBotService implements OnModuleInit {
       for (const p of attachments) {
         try { fs.unlinkSync(p); } catch { /* ignore */ }
       }
+    }
+  }
+
+  /**
+   * Доставка текстовой части ответа. Единственное место, где ответ уходит
+   * юзеру, — поэтому здесь же ловится провал доставки.
+   *
+   * Раньше падение sendMessage (19.08.2026 — ответ длиннее 4096 символов)
+   * улетало наверх до handleUpdate, который только пишет строку в лог: юзер не
+   * получал ни ответа, ни ошибки, а текст не сохранялся нигде — доставать
+   * пришлось из сессии Claude CLI на проде. Нарезка в TgGrammyClient закрыла
+   * конкретную причину; здесь закрывается сам класс отказа.
+   *
+   * Ошибку пробрасываем дальше намеренно: списание и persistAssistantReply
+   * идут после доставки, и ход, которого юзер не видел, не должен ни попасть в
+   * историю как отвеченный, ни быть оплачен.
+   */
+  async deliverReplyText(chatId: number, replyToMessageId: number, text: string): Promise<void> {
+    try {
+      await this.grammy.sendMessage(chatId, text, { reply_to_message_id: replyToMessageId });
+    } catch (e: any) {
+      // Полный текст — в лог: это единственная копия ответа, за который уже
+      // заплачено ёмкостью подписки.
+      this.logger.error(
+        `доставка ответа в чат ${chatId} провалилась: ${e?.message || e}. Текст ответа (${text.length} симв.) ниже:\n${text}`,
+      );
+      try {
+        await this.grammy.sendMessage(
+          chatId,
+          '⚠️ Ответ готов, но не отправился из-за технического сбоя. Мы уже видим ошибку — попробуй переспросить.',
+          { reply_to_message_id: replyToMessageId },
+        );
+      } catch {
+        // Канал до чата мёртв целиком — сказать юзеру нечем, ошибка ниже.
+      }
+      throw e;
     }
   }
 
