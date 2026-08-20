@@ -233,8 +233,8 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         `INSERT INTO video_jobs
          (user_id, mode, model, quality, duration_sec, prompt, negative_prompt, cfg_scale,
           source_image_url, source_video_id, camera_type, camera_config, audio_url, tokens_spent, status,
-          target_duration_sec, composed_plan)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending',$15,$16)
+          target_duration_sec, composed_plan, image_tokens_spent)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending',$15,$16,$17)
          RETURNING id`,
         [
           userId, mode, model, quality, duration,
@@ -246,6 +246,8 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
           cost,
           composedTarget,
           composedPlan ? JSON.stringify(composedPlan) : null,
+          // Стоимость кадра-заготовки — чтобы возврат за провал вернул и её.
+          autoStillTokens,
         ],
       );
       jobId = (ins.rows[0] as any).id as string;
@@ -302,24 +304,12 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       };
     } catch (e: any) {
       this.logger.error(`createJob Kling error: ${e.message}`);
-      // refund + mark failed in a short transaction
-      const refundClient = await this.pg.getClient();
+      // Тот же путь, что у поздних провалов из поллера: помечает задачу,
+      // возвращает ролик вместе с кадром-заготовкой и не даёт вернуть дважды.
       try {
-        await refundClient.query('BEGIN');
-        await refundClient.query(
-          `SELECT add_user_tokens($1, $2, 'refund', $3, $4::jsonb)`,
-          [userId, cost, 'Возврат за видео', JSON.stringify({ job_id: jobId, reason: 'kling_create' })],
-        );
-        await refundClient.query(
-          `UPDATE video_jobs SET status='failed', error_message=$1, updated_at=now() WHERE id=$2`,
-          [`kling_create: ${String(e.message).slice(0, 480)}`, jobId],
-        );
-        await refundClient.query('COMMIT');
-      } catch (err) {
-        try { await refundClient.query('ROLLBACK'); } catch {}
-        this.logger.error(`refund txn failed: ${(err as any).message}`);
-      } finally {
-        refundClient.release();
+        await this.failAndRefund(jobId, userId, cost, `kling_create: ${String(e.message).slice(0, 480)}`);
+      } catch (err: any) {
+        this.logger.error(`refund txn failed: ${err.message}`);
       }
       throw new BadRequestException(`Kling rejected the request: ${e.message}`);
     }
@@ -415,6 +405,22 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         }
       } catch (e: any) {
         this.logger.error(`video migration 003 failed (${p}): ${e.message}`);
+      }
+    }
+
+    // 004 — стоимость кадра-заготовки, чтобы возврат за провал мог вернуть и её.
+    for (const p of [
+      path.join(__dirname, 'migrations', '004_image_tokens.sql'),
+      path.join(__dirname, '..', '..', 'src', 'video', 'migrations', '004_image_tokens.sql'),
+    ]) {
+      try {
+        if (fs.existsSync(p)) {
+          await this.pg.query(fs.readFileSync(p, 'utf8'));
+          this.logger.log(`video migration 004 applied from ${p}`);
+          break;
+        }
+      } catch (e: any) {
+        this.logger.error(`video migration 004 failed (${p}): ${e.message}`);
       }
     }
 
@@ -748,18 +754,41 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * Пометить задачу провалившейся и вернуть за неё токены.
+   *
+   * Пометка идёт ПЕРВОЙ и только с `status <> 'failed'`: она же и защита от
+   * повторного возврата. Поллер зовёт этот метод из нескольких мест, и без
+   * условия вторая попытка вернула бы деньги ещё раз.
+   *
+   * Возвращаем и стоимость кадра-заготовки: text2video без картинки сначала
+   * рисует кадр (отдельное списание 'image'), и при провале анимации человек
+   * остаётся без ролика, но с оплаченной заготовкой.
+   */
   private async failAndRefund(jobId: string, userId: string, tokens: number, reason: string) {
     const client = await this.pg.getClient();
     try {
       await client.query('BEGIN');
+      const marked = await client.query(
+        `UPDATE video_jobs SET status='failed', error_message=$1, updated_at=now()
+          WHERE id=$2 AND status <> 'failed'
+          RETURNING image_tokens_spent`,
+        [String(reason).slice(0, 500), jobId],
+      );
+      if (marked.rowCount === 0) {
+        await client.query('ROLLBACK');
+        this.logger.warn(`failAndRefund: задача ${jobId} уже провалена, возврат не повторяем`);
+        return;
+      }
+      const stillTokens = Number(marked.rows[0]?.image_tokens_spent ?? 0);
+      const total = Number(tokens) + stillTokens;
       await client.query(
         `SELECT add_user_tokens($1, $2, 'refund', $3, $4::jsonb)`,
-        [userId, tokens, 'Возврат за видео',
-         JSON.stringify({ job_id: jobId, reason: String(reason).slice(0, 200) })],
-      );
-      await client.query(
-        `UPDATE video_jobs SET status='failed', error_message=$1, updated_at=now() WHERE id=$2`,
-        [String(reason).slice(0, 500), jobId],
+        [userId, total, 'Возврат за видео',
+         JSON.stringify({
+           job_id: jobId, reason: String(reason).slice(0, 200),
+           video_tokens: Number(tokens), still_tokens: stillTokens,
+         })],
       );
       await client.query('COMMIT');
     } catch (e: any) {
