@@ -96,9 +96,9 @@ describe('VideoService — подтверждение, что видео сно�
     await expect(svcWith(makePg(1), redis).checkProviderRecovered()).resolves.toBeUndefined();
   });
 
-  it('тревога ставит метку «сломано» — иначе восстанавливать будет нечего', async () => {
+  it('денежный отказ ставит метку «сломано» — иначе восстанавливать будет нечего', async () => {
     const redis = makeRedis();
-    await svcWith(makePg(0), redis).alertProviderOutOfMoney('Account balance not enough (code 1102)');
+    await svcWith(makePg(0), redis).noteProviderOutOfMoney('Account balance not enough (code 1102)');
 
     expect(redis.store.has(BROKEN_KEY)).toBe(true);
   });

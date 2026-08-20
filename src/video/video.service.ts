@@ -99,9 +99,6 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   private static readonly PROVIDER_OUT_OF_MONEY =
     /balance not enough|insufficient balance|exceeded your current quota|insufficient_quota|"code"\s*:\s*1102|code 1102/i;
 
-  /** Один сигнал на серию: TTL держит тишину, пока проблему не чинят. */
-  private static readonly BILLING_ALERT_TTL_SEC = 6 * 3600;
-  private static readonly BILLING_DEDUP_KEY = 'video:provider-billing-alert';
   /** Метка «видео сломано деньгами». Без TTL: снимается только починкой. */
   private static readonly PROVIDER_BROKEN_KEY = 'video:provider-broken-since';
 
@@ -210,37 +207,31 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Предупредить владельца, что у провайдера видео кончились деньги.
+   * Пометить, что видео сломано деньгами провайдера.
    *
-   * 13.08.2026 Kling начал отвечать 1102, ролики молча уходили в failed, и
-   * заметили это только 20.08 при разборе списаний — неделю функция была
-   * сломана в тишине. Пользователь видит «не получилось», в метриках просто
-   * нет успешных задач: без явного сигнала такое не всплывает.
+   * Своего сообщения НЕ шлём: о провалах уже сообщает QualityMonitorService —
+   * он с июля считает падения по balance/quota за 60 минут и пишет
+   * «⚠️ КАЧЕСТВО: платный провайдер отказывает пользователям» в тот же чат.
+   * Первая редакция этого метода слала второе сообщение о том же событии —
+   * то есть плодила ровно ту усталость от алертов, против которой затевалась.
    *
-   * Никогда не бросает: сигнал прицеплен к возврату денег, и падение
-   * телеграма или редиса не должно этот возврат ронять.
+   * Метка нужна для другого: у монитора нет понятия «починилось», и без неё
+   * нечем подтвердить восстановление (см. checkProviderRecovered). Живёт без
+   * TTL — снимается только фактом успешной задачи; на dedup-ключе с TTL
+   * починка через сутки осталась бы без подтверждения.
+   *
+   * Никогда не бросает: метод прицеплен к возврату денег, и падение Redis не
+   * должно этот возврат ронять.
    */
-  private async alertProviderOutOfMoney(reason: string): Promise<void> {
+  private async noteProviderOutOfMoney(reason: string): Promise<void> {
     try {
       if (!VideoService.PROVIDER_OUT_OF_MONEY.test(String(reason))) return;
-
-      if (this.redis) {
-        // Два ключа с разным сроком жизни, и это не дублирование:
-        // dedup глушит повторные тревоги шесть часов, а метка «сломано»
-        // живёт без TTL и снимается только фактом успешной задачи. Если
-        // вешать восстановление на dedup, починка через сутки останется без
-        // подтверждения — ключ к тому моменту истечёт сам.
-        if (await this.redis.get(VideoService.BILLING_DEDUP_KEY)) return;
-        await this.redis.set(VideoService.BILLING_DEDUP_KEY, '1', VideoService.BILLING_ALERT_TTL_SEC);
-        await this.redis.set(VideoService.PROVIDER_BROKEN_KEY, String(Date.now()));
-      }
-      await sendTelegramAlert(
-        `🎬💸 Видео не создаётся: у провайдера кончились деньги.\n\n` +
-        `Ответ: ${String(reason).slice(0, 300)}\n\n` +
-        `Пополни счёт — до этого каждая попытка будет падать, а токены возвращаться.`,
-      );
+      if (!this.redis) return;
+      if (await this.redis.get(VideoService.PROVIDER_BROKEN_KEY)) return;
+      await this.redis.set(VideoService.PROVIDER_BROKEN_KEY, String(Date.now()));
+      this.logger.warn(`видео сломано деньгами провайдера: ${String(reason).slice(0, 200)}`);
     } catch (e: any) {
-      this.logger.warn(`не смог поднять тревогу о деньгах провайдера: ${e.message}`);
+      this.logger.warn(`не смог пометить отказ провайдера: ${e.message}`);
     }
   }
 
@@ -961,9 +952,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
          })],
       );
       await client.query('COMMIT');
-      // После возврата: молчаливый отказ по деньгам — то, из-за чего видео
-      // неделю не работало и никто не знал.
-      await this.alertProviderOutOfMoney(reason);
+      // Метка «сломано деньгами» — по ней потом подтвердится починка.
+      // Сообщение о самом провале шлёт QualityMonitorService, здесь молчим.
+      await this.noteProviderOutOfMoney(reason);
     } catch (e: any) {
       try { await client.query('ROLLBACK'); } catch {}
       this.logger.error(`failAndRefund txn error: ${e.message}`);
