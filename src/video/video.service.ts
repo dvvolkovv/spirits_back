@@ -1,10 +1,12 @@
 // src/video/video.service.ts
 import {
   Injectable, Logger, BadRequestException, ForbiddenException,
-  NotFoundException, ConflictException, OnModuleInit, OnModuleDestroy,
+  NotFoundException, ConflictException, OnModuleInit, OnModuleDestroy, Optional,
 } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
+import { RedisService } from '../common/services/redis.service';
+import { sendTelegramAlert } from '../common/telegram-alert';
 import { KlingService } from '../misc/kling.service';
 import { MiscService } from '../misc/misc.service';
 import { VeoService } from '../misc/veo.service';
@@ -86,7 +88,49 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     private readonly misc: MiscService,
     private readonly veo: VeoService,
     private readonly voice: VoiceAvatarService,
+    @Optional() private readonly redis?: RedisService,
   ) {}
+
+  /**
+   * Отказы провайдеров, которые означают «кончились деньги», а не сбой рендера.
+   * Kling отвечает `code 1102 Account balance not enough`, Google — 429 с
+   * исчерпанной квотой.
+   */
+  private static readonly PROVIDER_OUT_OF_MONEY =
+    /balance not enough|insufficient balance|exceeded your current quota|insufficient_quota|"code"\s*:\s*1102|code 1102/i;
+
+  /** Один сигнал на серию: TTL держит тишину, пока проблему не чинят. */
+  private static readonly BILLING_ALERT_TTL_SEC = 6 * 3600;
+
+  /**
+   * Предупредить владельца, что у провайдера видео кончились деньги.
+   *
+   * 13.08.2026 Kling начал отвечать 1102, ролики молча уходили в failed, и
+   * заметили это только 20.08 при разборе списаний — неделю функция была
+   * сломана в тишине. Пользователь видит «не получилось», в метриках просто
+   * нет успешных задач: без явного сигнала такое не всплывает.
+   *
+   * Никогда не бросает: сигнал прицеплен к возврату денег, и падение
+   * телеграма или редиса не должно этот возврат ронять.
+   */
+  private async alertProviderOutOfMoney(reason: string): Promise<void> {
+    try {
+      if (!VideoService.PROVIDER_OUT_OF_MONEY.test(String(reason))) return;
+
+      const key = 'video:provider-billing-alert';
+      if (this.redis) {
+        if (await this.redis.get(key)) return;
+        await this.redis.set(key, '1', VideoService.BILLING_ALERT_TTL_SEC);
+      }
+      await sendTelegramAlert(
+        `🎬💸 Видео не создаётся: у провайдера кончились деньги.\n\n` +
+        `Ответ: ${String(reason).slice(0, 300)}\n\n` +
+        `Пополни счёт — до этого каждая попытка будет падать, а токены возвращаться.`,
+      );
+    } catch (e: any) {
+      this.logger.warn(`не смог поднять тревогу о деньгах провайдера: ${e.message}`);
+    }
+  }
 
   async createJob(
     userId: string,
@@ -791,6 +835,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
          })],
       );
       await client.query('COMMIT');
+      // После возврата: молчаливый отказ по деньгам — то, из-за чего видео
+      // неделю не работало и никто не знал.
+      await this.alertProviderOutOfMoney(reason);
     } catch (e: any) {
       try { await client.query('ROLLBACK'); } catch {}
       this.logger.error(`failAndRefund txn error: ${e.message}`);
