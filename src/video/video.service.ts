@@ -106,6 +106,17 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   private static readonly PACK_EXPIRY_WARN_DAYS = 3;
 
   /**
+   * Модель, когда запрос её не назвал.
+   *
+   * Veo — основной движок: он тянет почти всю нагрузку и не зависит от
+   * сгорающих пакетов Kling. Но умеет он только text2video и image2video,
+   * поэтому lipsync и extend остаются за Kling.
+   */
+  private static defaultModelFor(mode: VideoMode): VideoModel {
+    return mode === 'lipsync' || mode === 'extend' ? 'kling-v1-6' : 'veo-3.1-fast';
+  }
+
+  /**
    * Сторож срока пакета Kling.
    *
    * Пакеты у них с датой сгорания, и остаток в этот момент просто аннулируется:
@@ -189,8 +200,17 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     // Veo 3.1 (Google) is a separate provider — long-form talking head with
     // native audio + portrait, one continuous video (no Kling auto-still /
     // ffmpeg concat). Route before any Kling-specific setup.
-    if (isVeoModel(dto.model ?? '')) {
-      return this.createVeoJob(userId, dto);
+    //
+    // Модель по умолчанию — Veo, и только для text2video / image2video.
+    // Причина: Kling за три месяца дал 8 генераций против ~56 у Veo, но стоял
+    // дефолтом, поэтому сгоревший пакет Kling ломал именно дефолтный путь —
+    // и простой 13–20.08.2026 остался незамеченным, ведь Veo всё это время
+    // работал. Режимы lipsync и extend есть только у Kling (lipsync требует
+    // kling-v1-6), им дефолт не меняем: иначе запрос без модели уходил бы в
+    // Veo и падал на «Veo supports mode text2video or image2video».
+    const requestedModel = dto.model ?? VideoService.defaultModelFor(dto.mode);
+    if (isVeoModel(requestedModel)) {
+      return this.createVeoJob(userId, { ...dto, model: requestedModel });
     }
 
     // Auto-chain: text2video без sourceImageUrl → сначала Nano Banana (std),

@@ -127,14 +127,14 @@ export const CHAT_TOOLS = [
       'ДВА движка — выбирай по задаче через поле model:\n' +
       '• Veo 3.1 (model="veo-3.1-fast", или "veo-3.1" для макс. качества) — БЕРИ ЕГО, когда пользователю нужна «говорящая голова» / человек, говорящий в камеру / видео из его ПОРТРЕТА / синхронная озвучка-реплика, особенно длиннее ~10с. Реплику/речь пиши ПРЯМО в prompt — Veo сам произносит её с синхронными губами (нативный звук, отдельный аудио-шаг не нужен). Одно непрерывное видео до 60с (targetDurationSec). Портрет — передай sourceImageUrl + mode="image2video" (без портрета — mode="text2video"). У Veo НЕ используются quality / cameraType / duration 5-10.\n' +
       '  ВАЖНО про длину речи: текст реплики должен СООТВЕТСТВОВАТЬ targetDurationSec. Ориентир — ~2–3 коротких предложения речи на каждые 8 секунд (≈20–25 слов / 8с). Для 24с дай ~6–9 предложений, для 16с — ~4–6. Если реплика короткая, а видео длинное — речь прозвучит один раз, а остаток будет естественная пауза (НЕ повтор). Поэтому либо напиши достаточно текста под нужную длину, либо подбери targetDurationSec под реальную длину реплики. Не проси длинное видео под одну короткую фразу.\n' +
-      '• Kling (model="kling-v1-6" по умолчанию, "kling-v2-master" премиум) — универсальная генерация сцен/анимации без обязательной речи. До 10с одним вызовом; длиннее — targetDurationSec (5–60), под капотом base 10s + N×extend 5s + ffmpeg-склейка. Для mode="text2video" без sourceImageUrl сначала генерируется стилл через Nano Banana (+5000 токенов). Есть картинка — sourceImageUrl + mode="image2video".\n' +
+      '• Kling (model="kling-v1-6", "kling-v2-master" премиум) — универсальная генерация сцен/анимации без обязательной речи. Дешевле Veo, поэтому проси его явно, когда речь не нужна и хватает 5–10с. До 10с одним вызовом; длиннее — targetDurationSec (5–60), под капотом base 10s + N×extend 5s + ffmpeg-склейка. Для mode="text2video" без sourceImageUrl сначала генерируется стилл через Nano Banana (+5000 токенов). Есть картинка — sourceImageUrl + mode="image2video".\n' +
       'Стоимость считается автоматически по движку и длине. Long-form (targetDurationSec) — только text2video / image2video.',
     input_schema: {
       type: 'object',
       properties: {
         mode: { type: 'string', enum: ['text2video', 'image2video', 'extend', 'lipsync'] },
         prompt: { type: 'string' },
-        model: { type: 'string', enum: ['kling-v1-6', 'kling-v2-master', 'veo-3.1-fast', 'veo-3.1'], default: 'kling-v1-6' },
+        model: { type: 'string', enum: ['kling-v1-6', 'kling-v2-master', 'veo-3.1-fast', 'veo-3.1'], default: 'veo-3.1-fast' },
         quality: { type: 'string', enum: ['std', 'pro'], default: 'std' },
         duration: { type: 'number', enum: [5, 10], default: 5 },
         targetDurationSec: {
