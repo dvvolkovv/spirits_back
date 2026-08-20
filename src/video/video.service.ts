@@ -221,9 +221,12 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         throw new InsufficientTokensError(balance, cost);
       }
 
+      // Через процедуру, а не прямым UPDATE: она пишет строку в
+      // token_transactions. Баланс проверен и строка взята под FOR UPDATE
+      // выше, поэтому частичное списание здесь исключено.
       await client.query(
-        `UPDATE ai_profiles_consolidated SET tokens = tokens - $1 WHERE user_id = $2`,
-        [cost, userId],
+        `SELECT consume_user_tokens($1, $2, $3, $4::jsonb)`,
+        [userId, cost, 'Генерация видео', JSON.stringify({ mode, model })],
       );
 
       const ins = await client.query(
@@ -304,8 +307,8 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       try {
         await refundClient.query('BEGIN');
         await refundClient.query(
-          `UPDATE ai_profiles_consolidated SET tokens = tokens + $1 WHERE user_id = $2`,
-          [cost, userId],
+          `SELECT add_user_tokens($1, $2, 'refund', $3, $4::jsonb)`,
+          [userId, cost, 'Возврат за видео', JSON.stringify({ job_id: jobId, reason: 'kling_create' })],
         );
         await refundClient.query(
           `UPDATE video_jobs SET status='failed', error_message=$1, updated_at=now() WHERE id=$2`,
@@ -750,8 +753,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     try {
       await client.query('BEGIN');
       await client.query(
-        `UPDATE ai_profiles_consolidated SET tokens = tokens + $1 WHERE user_id = $2`,
-        [tokens, userId],
+        `SELECT add_user_tokens($1, $2, 'refund', $3, $4::jsonb)`,
+        [userId, tokens, 'Возврат за видео',
+         JSON.stringify({ job_id: jobId, reason: String(reason).slice(0, 200) })],
       );
       await client.query(
         `UPDATE video_jobs SET status='failed', error_message=$1, updated_at=now() WHERE id=$2`,
@@ -1143,7 +1147,12 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       const balRes = await client.query(`SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1 FOR UPDATE`, [userId]);
       const balance = Number((balRes.rows[0] as any)?.tokens ?? 0);
       if (balance < cost) { await client.query('ROLLBACK'); throw new InsufficientTokensError(balance, cost); }
-      await client.query(`UPDATE ai_profiles_consolidated SET tokens = tokens - $1 WHERE user_id = $2`, [cost, userId]);
+      // Через процедуру — иначе списания нет в token_transactions. Баланс
+      // проверен строкой выше под FOR UPDATE.
+      await client.query(
+        `SELECT consume_user_tokens($1, $2, $3, $4::jsonb)`,
+        [userId, cost, 'Генерация видео', JSON.stringify({ mode, model, composed: true })],
+      );
       const ins = await client.query(
         `INSERT INTO video_jobs (user_id, mode, model, quality, duration_sec, prompt, negative_prompt,
             source_image_url, tokens_spent, status, target_duration_sec, composed_plan, own_voice)

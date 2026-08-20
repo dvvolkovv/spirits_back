@@ -587,24 +587,37 @@ ${healthSummary}
     const client = await this.pg.getClient();
     try {
       await client.query('BEGIN');
-      const upd = await client.query(
-        `UPDATE ai_profiles_consolidated
-         SET tokens = tokens + $1, updated_at = now()
-         WHERE user_id = $2
-         RETURNING tokens`,
-        [amount, userId],
+      // add_user_tokens заводит профиль, если его нет. Поддержке нужен отказ,
+      // а не новый пустой аккаунт, — поэтому существование проверяем сами и
+      // под тем же локом, что возьмёт процедура.
+      const exists = await client.query(
+        `SELECT 1 FROM ai_profiles_consolidated WHERE user_id = $1 FOR UPDATE`,
+        [userId],
       );
-      if (upd.rowCount === 0) {
+      if (exists.rowCount === 0) {
         await client.query('ROLLBACK');
         return { ok: false, error: 'user_not_found' };
       }
+      // Через процедуру — возврат обязан быть виден в истории пополнений.
+      const upd = await client.query(
+        `SELECT add_user_tokens($1, $2, 'refund', $3, $4::jsonb) AS res`,
+        [userId, amount, 'Возврат от поддержки',
+         JSON.stringify({ ticket_id: ticketId, reason, reference })],
+      );
+      await client.query(
+        `UPDATE ai_profiles_consolidated SET updated_at = now() WHERE user_id = $1`,
+        [userId],
+      );
       await client.query(
         `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
          VALUES ($1, 'ai', NULL, 'refund', $2::jsonb)`,
         [ticketId, JSON.stringify({ amount, reason, reference })],
       );
       await client.query('COMMIT');
-      const newBalance = Number(upd.rows[0].tokens);
+      // node-pg отдаёт json уже объектом, но на старом драйвере — строкой.
+      const raw = upd.rows[0]?.res;
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      const newBalance = Number(parsed?.new_balance ?? 0);
       this.logger.log(`refund ${amount} to ${userId} (ticket ${ticketId}): ${reason}`);
 
       // Post a system message visible to user so they see the confirmation in-chat.
@@ -681,11 +694,15 @@ ${healthSummary}
     const client = await this.pg.getClient();
     try {
       await client.query('BEGIN');
+      // Через процедуру — возврат за перезапуск обязан быть в истории.
       const upd = await client.query(
-        `UPDATE ai_profiles_consolidated
-         SET tokens = tokens + $1, updated_at = now()
-         WHERE user_id = $2 RETURNING tokens`,
-        [totalCredit, userId],
+        `SELECT add_user_tokens($1, $2, 'refund', $3, $4::jsonb) AS res`,
+        [userId, totalCredit, 'Возврат за перезапуск видео',
+         JSON.stringify({ ticket_id: ticketId, original_job_id: jobId, new_job_id: created.jobId })],
+      );
+      await client.query(
+        `UPDATE ai_profiles_consolidated SET updated_at = now() WHERE user_id = $1`,
+        [userId],
       );
       await client.query(
         `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
@@ -697,7 +714,9 @@ ${healthSummary}
         })],
       );
       await client.query('COMMIT');
-      const newBalance = Number(upd.rows[0]?.tokens || 0);
+      const rawRes = upd.rows[0]?.res;
+      const parsedRes = typeof rawRes === 'string' ? JSON.parse(rawRes) : rawRes;
+      const newBalance = Number(parsedRes?.new_balance ?? 0);
 
       await this.insertMessage(
         ticketId, 'system', null,

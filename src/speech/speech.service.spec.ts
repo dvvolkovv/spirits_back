@@ -74,6 +74,8 @@ function makeService(overrides: any = {}) {
   const deleted = jest.fn();
   /** Каждая отметка «клип выдан сейчас» на кэш-хите: (clipId). */
   const touched = jest.fn();
+  /** Строки, ушедшие в token_transactions вместе со списанием. */
+  const ledger: any[] = [];
   let clipSeq = 0;
 
   const pg = {
@@ -120,6 +122,27 @@ function makeService(overrides: any = {}) {
       if (/SELECT tokens/.test(sql)) return { rows: [{ tokens: state.balance }] };
       return { rows: [] };
     }),
+    /**
+     * Списание идёт в транзакции на выделенном соединении — вместе с ним
+     * пишется строка в token_transactions. Клиент делегирует в тот же query,
+     * поэтому все проверки выше продолжают видеть запросы, а сам реестр
+     * копится отдельно.
+     */
+    async getClient() {
+      return {
+        query: async (sql: string, params: any[] = []) => {
+          if (/^\s*(BEGIN|COMMIT|ROLLBACK)/i.test(sql)) return { rows: [] };
+          if (/INSERT INTO token_transactions/i.test(sql)) {
+            // Пишем как есть: тип транзакции стоит в запросе литералом, и
+            // позиционное сопоставление колонок с параметрами тут соврало бы.
+            ledger.push({ sql: sql.replace(/\s+/g, ' ').trim(), params });
+            return { rows: [] };
+          }
+          return pg.query(sql, params);
+        },
+        release: () => {},
+      };
+    },
   };
 
   const storage = { upload: jest.fn(async () => 'https://minio.test/linkeon-assets/audio/x.mp3') };
@@ -129,7 +152,7 @@ function makeService(overrides: any = {}) {
   const svc = new SpeechService(pg as any, storage as any, language as any, redis as any);
   // Подменяем сетевые вызовы — тестируем оркестрацию, не HTTP.
   (svc as any).synthesizeWith = jest.fn(async () => Buffer.from('fake-mp3-bytes'));
-  return { svc, pg, storage, deduct, deleted, touched, rows, state, language, redis };
+  return { svc, pg, storage, deduct, deleted, touched, ledger, rows, state, language, redis };
 }
 
 describe('SpeechService.synthesize', () => {
@@ -144,6 +167,32 @@ describe('SpeechService.synthesize', () => {
     expect(r.cached).toBe(false);
     expect(storage.upload).toHaveBeenCalledTimes(1);
     expect(deduct).toHaveBeenCalledWith('u1', 1000);
+  });
+
+  /**
+   * Расход на синтез обязан попадать в общий реестр: до 20.08.2026 условное
+   * списание меняло баланс молча, и в «Истории» его не было вовсе — сверка
+   * нашла так 333 тыс. неучтённых токенов у десяти пользователей.
+   */
+  it('пишет списание в token_transactions с верным остатком', async () => {
+    const { svc, ledger, state } = makeService({ balance: 5000 });
+    await svc.synthesize('u1', { text: 'Привет, это тест' });
+
+    expect(ledger).toHaveLength(1);
+    const [userId, amount, balanceAfter] = ledger[0].params;
+    expect(ledger[0].sql).toMatch(/'consumed'/);
+    expect(userId).toBe('u1');
+    expect(Number(amount)).toBe(-1000);
+    expect(Number(balanceAfter)).toBe(4000);
+    expect(Number(balanceAfter)).toBe(state.balance);
+  });
+
+  it('неоплаченный синтез не оставляет строки в реестре', async () => {
+    const { svc, ledger } = makeService({ balance: 10 });
+    const r = await svc.synthesize('u1', { text: 'Привет, это тест' });
+
+    expect(r.ok).toBe(false);
+    expect(ledger).toHaveLength(0);
   });
 
   it('повтор того же текста берётся из кэша и не стоит токенов', async () => {

@@ -59,9 +59,17 @@ export class SmmPremiumGenerationService {
         await client.query('ROLLBACK');
         throw new InsufficientTokensError(balance, input.tokensCost);
       }
+      // Через процедуру — она пишет строку в token_transactions. Баланс
+      // проверен и строка взята под FOR UPDATE выше, частичное списание
+      // исключено.
       await client.query(
-        `UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2`,
-        [input.tokensCost, input.userId],
+        `SELECT consume_user_tokens($1, $2, $3, $4::jsonb)`,
+        [input.userId, input.tokensCost, 'SMM: премиальная генерация',
+         JSON.stringify({ video_id: input.videoId, genre: input.genre, scenes: input.sceneCount })],
+      );
+      await client.query(
+        `UPDATE ai_profiles_consolidated SET updated_at = now() WHERE user_id = $1`,
+        [input.userId],
       );
       const ins = await client.query(
         `INSERT INTO smm_premium_generation
@@ -97,9 +105,15 @@ export class SmmPremiumGenerationService {
         await client.query('ROLLBACK');
         return;
       }
+      // Через процедуру — возврат обязан быть виден в истории пополнений.
       await client.query(
-        `UPDATE ai_profiles_consolidated SET tokens = tokens + $1, updated_at = now() WHERE user_id = $2`,
-        [input.refundTokens, row.user_id],
+        `SELECT add_user_tokens($1, $2, 'refund', $3, $4::jsonb)`,
+        [row.user_id, input.refundTokens, 'SMM: возврат за премиальную генерацию',
+         JSON.stringify({ generation_id: input.generationId, status: input.status })],
+      );
+      await client.query(
+        `UPDATE ai_profiles_consolidated SET updated_at = now() WHERE user_id = $1`,
+        [row.user_id],
       );
       await client.query(
         `UPDATE smm_premium_generation

@@ -231,11 +231,37 @@ export class SpeechService {
     // Объект в MinIO остаётся сиротой — он недостижим без строки (getClip ходит
     // по id + user_id), а ключ детерминирован (audio/<cache_key>.mp3), так что
     // оплаченный повтор просто перезапишет его тем же содержимым.
+    // Строку в token_transactions пишем сами и в одной транзакции со
+    // списанием: consume_user_tokens при нехватке забирает остаток, а здесь
+    // нужен отказ целиком (см. выше). Без этой записи расход на синтез не
+    // виден в общей истории — ровно та дыра, которую 20.08.2026 нашла сверка
+    // баланса с реестром.
     const clipId = String(ins.rows[0].id);
-    const paid = await this.pg.query(
-      'UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2 AND tokens >= $1 RETURNING tokens',
-      [required, userId],
-    );
+    const payClient = await this.pg.getClient();
+    let paid: { rows: any[] };
+    try {
+      await payClient.query('BEGIN');
+      paid = await payClient.query(
+        'UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2 AND tokens >= $1 RETURNING tokens',
+        [required, userId],
+      );
+      if (paid.rows.length > 0) {
+        await payClient.query(
+          `INSERT INTO token_transactions (user_id, transaction_type, amount, balance_after, description, metadata)
+           VALUES ($1, 'consumed', $2, $3, $4, $5::jsonb)`,
+          [userId, -required, Number(paid.rows[0].tokens), 'Синтез речи',
+           JSON.stringify({ clip_id: clipId, chars: text.length, voice: resolved.voice, provider: resolved.provider })],
+        );
+      }
+      await payClient.query('COMMIT');
+    } catch (e: any) {
+      try { await payClient.query('ROLLBACK'); } catch {}
+      this.logger.error(`speech deduct failed: ${e.message}`);
+      throw e;
+    } finally {
+      payClient.release();
+    }
+
     if (paid.rows.length === 0) {
       try {
         await this.pg.query('DELETE FROM speech_clips WHERE id = $1 AND user_id = $2', [clipId, userId]);

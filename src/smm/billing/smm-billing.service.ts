@@ -55,11 +55,19 @@ export class SmmBillingService {
         await client.query('ROLLBACK');
         throw new InsufficientTokensError(balance, cost);
       }
+      // Через процедуру, а не прямым UPDATE: она пишет строку в
+      // token_transactions, иначе списания нет в общей истории расхода.
+      // Баланс проверен и строка взята под FOR UPDATE выше, поэтому частичное
+      // списание (процедура берёт остаток, когда не хватает) здесь исключено.
       await client.query(
-        `UPDATE ai_profiles_consolidated
-            SET tokens = tokens - $1, updated_at = now()
-          WHERE user_id = $2`,
-        [cost, input.userId],
+        `SELECT consume_user_tokens($1, $2, $3, $4::jsonb)`,
+        [input.userId, cost, 'SMM: озвучка ролика',
+         JSON.stringify({ video_id: input.videoId, tier: input.tier })],
+      );
+      // Процедура updated_at не трогает, а прежний UPDATE трогал.
+      await client.query(
+        `UPDATE ai_profiles_consolidated SET updated_at = now() WHERE user_id = $1`,
+        [input.userId],
       );
       await client.query(
         `UPDATE smm_video
@@ -133,11 +141,15 @@ export class SmmBillingService {
       }
 
       // Then update balance — guaranteed exactly once thanks to the unique index above.
+      // Через процедуру: возврат обязан быть виден в общей истории пополнений.
       await client.query(
-        `UPDATE ai_profiles_consolidated
-            SET tokens = tokens + $1, updated_at = now()
-          WHERE user_id = $2`,
-        [amount, userId],
+        `SELECT add_user_tokens($1, $2, 'refund', $3, $4::jsonb)`,
+        [userId, amount, 'SMM: возврат за ролик',
+         JSON.stringify({ video_id: input.videoId, reason: input.reason })],
+      );
+      await client.query(
+        `UPDATE ai_profiles_consolidated SET updated_at = now() WHERE user_id = $1`,
+        [userId],
       );
 
       await client.query('COMMIT');
