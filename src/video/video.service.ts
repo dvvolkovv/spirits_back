@@ -228,11 +228,93 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       if (!VideoService.PROVIDER_OUT_OF_MONEY.test(String(reason))) return;
       if (!this.redis) return;
       if (await this.redis.get(VideoService.PROVIDER_BROKEN_KEY)) return;
-      await this.redis.set(VideoService.PROVIDER_BROKEN_KEY, String(Date.now()));
+      // Провайдера запоминаем: пополненный счёт Kling не должен снимать метку,
+      // поставленную исчерпанной квотой Google.
+      const provider = /kling/i.test(reason) ? 'kling' : /veo|quota/i.test(reason) ? 'veo' : 'unknown';
+      await this.redis.set(
+        VideoService.PROVIDER_BROKEN_KEY,
+        JSON.stringify({ since: Date.now(), provider }),
+      );
       this.logger.warn(`видео сломано деньгами провайдера: ${String(reason).slice(0, 200)}`);
     } catch (e: any) {
       this.logger.warn(`не смог пометить отказ провайдера: ${e.message}`);
     }
+  }
+
+  /**
+   * Разобрать метку «сломано». Старый формат — голое число, новый — JSON.
+   * Метки первого дня деплоя записаны числом, и терять их нельзя: именно на них
+   * держится напоминание.
+   */
+  private static parseBrokenMarker(raw: string): { since: number; provider: string } | null {
+    const asNumber = Number(raw);
+    if (Number.isFinite(asNumber) && asNumber > 0) return { since: asNumber, provider: 'unknown' };
+    try {
+      const o = JSON.parse(raw);
+      const since = Number(o?.since);
+      if (!Number.isFinite(since)) return null;
+      return { since, provider: String(o?.provider ?? 'unknown') };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Напоминание «видео всё ещё не работает».
+   *
+   * QualityMonitorService считает провалы за последние 60 минут, поэтому его
+   * сигнал затухает сам, как только пользователи перестают пробовать: 13.08.2026
+   * одно падение дало одно сообщение, дальше запросов не было — и неделю никто
+   * не вспоминал о поломке. Это напоминание висит на метке, а не на потоке
+   * задач, поэтому молчать из-за отсутствия попыток не может.
+   *
+   * Перед каждым повтором спрашиваем провайдера напрямую: если счёт уже
+   * пополнен, метку снимаем сами. Иначе после тихой починки (пополнили, но
+   * видео никто не заказывал — успешной задачи, которая снимает метку, просто
+   * нет) напоминание бубнило бы вечно.
+   */
+  @Cron('0 40 */12 * * *') // каждые 12 часов
+  async remindProviderStillBroken(now: number = Date.now()): Promise<void> {
+    try {
+      if (!this.redis) return;
+      const raw = await this.redis.get(VideoService.PROVIDER_BROKEN_KEY);
+      if (!raw) return;
+
+      const marker = VideoService.parseBrokenMarker(raw);
+      if (!marker) {
+        await this.redis.del(VideoService.PROVIDER_BROKEN_KEY);
+        return;
+      }
+
+      // null от getResourcePacks = спросить не удалось. Тогда считаем, что
+      // всё ещё сломано: молчание было бы худшей ошибкой, чем лишний повтор.
+      const packs = await this.kling?.getResourcePacks?.();
+      const klingAlive = Array.isArray(packs)
+        && packs.some((p) => p.status === 'online' && p.expiresAt > now && p.remaining > 0);
+
+      if (klingAlive && marker.provider !== 'veo') {
+        await this.redis.del(VideoService.PROVIDER_BROKEN_KEY);
+        await sendTelegramAlert(
+          `🎬✅ Kling: счёт пополнен, тревога снята.\n\n` +
+          `Видео снова должно работать — простой длился ${VideoService.humanDuration(now - marker.since)}.`,
+        );
+        return;
+      }
+
+      await sendTelegramAlert(
+        `🎬🚨 Видео всё ещё не работает — уже ${VideoService.humanDuration(now - marker.since)}.\n\n` +
+        `Провайдер: ${marker.provider}. Пока счёт не пополнен, каждая попытка падает, ` +
+        `а токены возвращаются пользователю.`,
+      );
+    } catch (e: any) {
+      this.logger.warn(`напоминание о поломке видео не удалось: ${e.message}`);
+    }
+  }
+
+  private static humanDuration(ms: number): string {
+    const hours = Math.round(ms / 3600_000);
+    if (hours < 48) return `${hours} ч`;
+    return `${Math.round(hours / 24)} дн`;
   }
 
   async createJob(
