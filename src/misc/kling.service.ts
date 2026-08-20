@@ -3,6 +3,17 @@ import * as jwt from 'jsonwebtoken';
 import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
 
+/** Пакет ресурсов на счёте Kling: юниты и срок, после которого остаток сгорает. */
+export interface KlingResourcePack {
+  name: string;
+  total: number;
+  remaining: number;
+  /** Момент сгорания, epoch ms. */
+  expiresAt: number;
+  /** 'online' — действует, 'expired' — сгорел. */
+  status: string;
+}
+
 @Injectable()
 export class KlingService {
   private readonly logger = new Logger(KlingService.name);
@@ -30,6 +41,47 @@ export class KlingService {
       this.sk,
       { algorithm: 'HS256', header: { alg: 'HS256', typ: 'JWT' } as any },
     );
+  }
+
+  /**
+   * Пакеты ресурсов на счёте.
+   *
+   * Нужны, чтобы ловить сгорание по сроку, а не по расходу: пакет
+   * `Trial-Video-100Units-5Con-1Months` куплен 13.07.2026 и истёк 12.08 с
+   * остатком 94 из 100 юнитов — деньги ушли не в ролики, а в срок годности, и
+   * на следующий день видео встало с `1102 Account balance not enough`.
+   *
+   * Ответ у Kling двухслойный: `data.data.resource_pack_subscribe_infos`.
+   *
+   * Никогда не бросает. null означает «спросить не удалось» — вызывающий обязан
+   * отличать это от «активных пакетов нет», иначе недоступность их API
+   * превратится в ложную тревогу.
+   */
+  async getResourcePacks(): Promise<KlingResourcePack[] | null> {
+    if (!this.ak || !this.sk) {
+      this.logger.warn('Kling credentials not set — пакеты не спросить');
+      return null;
+    }
+    try {
+      const end = Date.now();
+      const res = await axios.get('https://api.klingai.com/account/costs', {
+        params: { start_time: end - 90 * 24 * 3600 * 1000, end_time: end },
+        headers: { Authorization: `Bearer ${this.getToken()}` },
+        timeout: 20000,
+      });
+      const infos = res.data?.data?.resource_pack_subscribe_infos;
+      if (!Array.isArray(infos)) return null;
+      return infos.map((p: any) => ({
+        name: String(p.resource_pack_name ?? ''),
+        total: Number(p.total_quantity ?? 0),
+        remaining: Number(p.remaining_quantity ?? 0),
+        expiresAt: Number(p.invalid_time ?? 0),
+        status: String(p.status ?? ''),
+      }));
+    } catch (e: any) {
+      this.logger.warn(`не смог получить пакеты Kling: ${e.message}`);
+      return null;
+    }
   }
 
   async generateImage(prompt: string, aspectRatio = '1:1'): Promise<{ url: string } | null> {

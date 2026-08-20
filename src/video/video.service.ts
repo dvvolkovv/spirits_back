@@ -102,6 +102,56 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   /** Один сигнал на серию: TTL держит тишину, пока проблему не чинят. */
   private static readonly BILLING_ALERT_TTL_SEC = 6 * 3600;
 
+  /** За сколько дней до сгорания пакета начинать предупреждать. */
+  private static readonly PACK_EXPIRY_WARN_DAYS = 3;
+
+  /**
+   * Сторож срока пакета Kling.
+   *
+   * Пакеты у них с датой сгорания, и остаток в этот момент просто аннулируется:
+   * `Trial-Video-100Units-5Con-1Months` куплен 13.07.2026, истёк 12.08 с
+   * остатком 94 из 100 — то есть 94% денег ушло в срок годности. Отказы
+   * `1102` начались 13.08, и неделю никто не знал.
+   *
+   * Реактивная тревога ловит поломку уже случившейся; этот сторож должен
+   * успевать раньше. Отсюда два разных сообщения: «скоро сгорит» и «активного
+   * пакета нет».
+   *
+   * `now` параметром — чтобы тест не зависел от часов машины.
+   */
+  @Cron('0 20 6 * * *') // ежедневно 06:20 UTC, со смещением от других кронов
+  async checkKlingPackExpiry(now: number = Date.now()): Promise<void> {
+    try {
+      const packs = await this.kling?.getResourcePacks?.();
+      // null — спросить не удалось. Молчим: недоступность их API это не повод
+      // будить владельца сообщением про деньги.
+      if (!packs) return;
+
+      const alive = packs.filter((p) => p.status === 'online' && p.expiresAt > now);
+      if (alive.length === 0) {
+        await sendTelegramAlert(
+          `🎬📦 Kling: нет активного пакета — видео работать не будет.\n\n` +
+          `Последние пакеты: ${packs.map((p) => `${p.name} (${p.status}, остаток ${p.remaining}/${p.total})`).join('; ').slice(0, 300)}`,
+        );
+        return;
+      }
+
+      const soonest = alive.reduce((a, b) => (a.expiresAt <= b.expiresAt ? a : b));
+      const daysLeft = (soonest.expiresAt - now) / (24 * 3600 * 1000);
+      if (daysLeft > VideoService.PACK_EXPIRY_WARN_DAYS) return;
+
+      const date = new Date(soonest.expiresAt).toISOString().slice(0, 16).replace('T', ' ');
+      await sendTelegramAlert(
+        `🎬⏳ Kling: пакет сгорает ${date} UTC (через ${Math.floor(daysLeft)} д.).\n\n` +
+        `Остаток ${soonest.remaining} из ${soonest.total} юнитов — после этой даты он аннулируется, ` +
+        `и видео встанет с «Account balance not enough».\n\n` +
+        `В прошлый раз так сгорело 94 юнита из 100.`,
+      );
+    } catch (e: any) {
+      this.logger.warn(`проверка срока пакета Kling не удалась: ${e.message}`);
+    }
+  }
+
   /**
    * Предупредить владельца, что у провайдера видео кончились деньги.
    *
