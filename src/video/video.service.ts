@@ -101,6 +101,52 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
 
   /** Один сигнал на серию: TTL держит тишину, пока проблему не чинят. */
   private static readonly BILLING_ALERT_TTL_SEC = 6 * 3600;
+  private static readonly BILLING_DEDUP_KEY = 'video:provider-billing-alert';
+  /** Метка «видео сломано деньгами». Без TTL: снимается только починкой. */
+  private static readonly PROVIDER_BROKEN_KEY = 'video:provider-broken-since';
+
+  /**
+   * Подтвердить, что видео снова работает.
+   *
+   * Без этого цикл разомкнут: тревога уходит, а дальше тишина — и она читается
+   * одинаково и когда починили, и когда никто ничего не сделал.
+   *
+   * Признак починки — успешная задача ПОСЛЕ момента тревоги. Просто «прошло
+   * время» не годится: провайдер мог остаться пустым, а задач могло не быть
+   * вовсе.
+   *
+   * Никогда не бросает и без Redis молчит: состояние «было сломано» хранить
+   * негде, а выдумывать восстановление нельзя.
+   */
+  async checkProviderRecovered(): Promise<void> {
+    try {
+      if (!this.redis) return;
+      const brokenSince = await this.redis.get(VideoService.PROVIDER_BROKEN_KEY);
+      if (!brokenSince) return;
+
+      const since = Number(brokenSince);
+      if (!Number.isFinite(since)) {
+        await this.redis.del(VideoService.PROVIDER_BROKEN_KEY);
+        return;
+      }
+
+      const r = await this.pg.query(
+        `SELECT count(*)::int AS n FROM video_jobs
+          WHERE status = 'ready' AND updated_at > to_timestamp($1 / 1000.0)`,
+        [since],
+      );
+      if (Number(r.rows[0]?.n ?? 0) === 0) return;
+
+      await this.redis.del(VideoService.PROVIDER_BROKEN_KEY);
+      const downMin = Math.round((Date.now() - since) / 60000);
+      await sendTelegramAlert(
+        `🎬✅ Видео снова работает — задача прошла целиком.\n\n` +
+        `Простой длился примерно ${downMin} мин.`,
+      );
+    } catch (e: any) {
+      this.logger.warn(`проверка восстановления видео не удалась: ${e.message}`);
+    }
+  }
 
   /** За сколько дней до сгорания пакета начинать предупреждать. */
   private static readonly PACK_EXPIRY_WARN_DAYS = 3;
@@ -178,10 +224,15 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     try {
       if (!VideoService.PROVIDER_OUT_OF_MONEY.test(String(reason))) return;
 
-      const key = 'video:provider-billing-alert';
       if (this.redis) {
-        if (await this.redis.get(key)) return;
-        await this.redis.set(key, '1', VideoService.BILLING_ALERT_TTL_SEC);
+        // Два ключа с разным сроком жизни, и это не дублирование:
+        // dedup глушит повторные тревоги шесть часов, а метка «сломано»
+        // живёт без TTL и снимается только фактом успешной задачи. Если
+        // вешать восстановление на dedup, починка через сутки останется без
+        // подтверждения — ключ к тому моменту истечёт сам.
+        if (await this.redis.get(VideoService.BILLING_DEDUP_KEY)) return;
+        await this.redis.set(VideoService.BILLING_DEDUP_KEY, '1', VideoService.BILLING_ALERT_TTL_SEC);
+        await this.redis.set(VideoService.PROVIDER_BROKEN_KEY, String(Date.now()));
       }
       await sendTelegramAlert(
         `🎬💸 Видео не создаётся: у провайдера кончились деньги.\n\n` +
@@ -560,6 +611,11 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         this.pollJob(job).catch((e) => this.logger.error(`pollJob ${job.id} error: ${e.message}`)),
       ),
     );
+
+    // Замыкаем цикл: если висит метка «сломано деньгами», а задачи снова
+    // проходят — подтвердить починку. Без метки метод ничего не делает и в
+    // базу не ходит, так что тик от этого не тяжелеет.
+    await this.checkProviderRecovered();
   }
 
   private async expireStaleJobs() {
