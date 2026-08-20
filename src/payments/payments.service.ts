@@ -353,34 +353,70 @@ export class PaymentsService implements OnModuleInit {
     return { ok: true };
   }
 
+  /**
+   * Применение промокода.
+   *
+   * Транзакция и `FOR UPDATE` на строке купона нужны не ради самой строки, а
+   * ради сериализации: проверка «уже применял?» и вставка иначе разъезжаются
+   * между параллельными запросами. Один клик, разошедшийся в три запроса,
+   * 05.03.2026 начислил пользователю 79035281880 три миллиона токенов вместо
+   * одного — в coupon_redemptions легли три строки с совпадающим до
+   * микросекунды временем. По базе таких случаев шесть, лишнего роздано
+   * 2 300 000 токенов.
+   *
+   * Уникального индекса на (coupon_id, user_id) нет: в таблице живут те самые
+   * исторические дубли, и повесить его без удаления истории нельзя (решение
+   * владельца — историю не трогать). Значит вся защита здесь: блокировка
+   * держится до COMMIT, и второй запрос входит в критическую секцию уже после
+   * вставки первого — то есть видит её.
+   */
   async redeemCoupon(userId: string, code: string) {
-    const res = await this.pg.query(
-      'SELECT * FROM coupons WHERE code = $1 AND is_active = true LIMIT 1',
-      [code],
-    );
-    if (!res.rows.length) return { success: false, error: 'Invalid coupon' };
+    const client = await this.pg.getClient();
+    try {
+      await client.query('BEGIN');
 
-    // Check if already redeemed
-    const redeemed = await this.pg.query(
-      'SELECT id FROM coupon_redemptions WHERE coupon_id = $1 AND user_id = $2',
-      [res.rows[0].id, userId],
-    );
-    if (redeemed.rows.length > 0) return { success: false, error: 'Coupon already redeemed' };
+      const res = await client.query(
+        'SELECT * FROM coupons WHERE code = $1 AND is_active = true LIMIT 1 FOR UPDATE',
+        [code],
+      );
+      if (!res.rows.length) {
+        await client.query('ROLLBACK');
+        return { success: false, error: 'Invalid coupon' };
+      }
+      const coupon = res.rows[0];
 
-    const tokens = Number(res.rows[0].token_amount);
-    await this.pg.query(
-      'INSERT INTO coupon_redemptions (coupon_id, user_id, tokens_granted) VALUES ($1, $2, $3)',
-      [res.rows[0].id, userId, tokens],
-    );
-    await this.pg.query(
-      'UPDATE coupons SET usage_count = usage_count + 1 WHERE id = $1',
-      [res.rows[0].id],
-    );
-    // Через процедуру — чтобы купон тоже попал в историю пополнений.
-    await this.pg.query(
-      `SELECT add_user_tokens($1, $2, 'coupon', $3, $4::jsonb)`,
-      [userId, tokens, 'Промокод', JSON.stringify({ coupon_id: res.rows[0].id })],
-    );
-    return { success: true, tokens_added: tokens };
+      const redeemed = await client.query(
+        'SELECT id FROM coupon_redemptions WHERE coupon_id = $1 AND user_id = $2',
+        [coupon.id, userId],
+      );
+      if (redeemed.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return { success: false, error: 'Coupon already redeemed' };
+      }
+
+      const tokens = Number(coupon.token_amount);
+      await client.query(
+        'INSERT INTO coupon_redemptions (coupon_id, user_id, tokens_granted) VALUES ($1, $2, $3)',
+        [coupon.id, userId, tokens],
+      );
+      await client.query(
+        'UPDATE coupons SET usage_count = usage_count + 1 WHERE id = $1',
+        [coupon.id],
+      );
+      // Через процедуру — чтобы купон тоже попал в историю пополнений.
+      await client.query(
+        `SELECT add_user_tokens($1, $2, 'coupon', $3, $4::jsonb)`,
+        [userId, tokens, 'Промокод', JSON.stringify({ coupon_id: coupon.id })],
+      );
+
+      await client.query('COMMIT');
+      return { success: true, tokens_added: tokens };
+    } catch (e: any) {
+      try { await client.query('ROLLBACK'); } catch {}
+      this.logger.error(`redeemCoupon failed (${code} → ${userId}): ${e.message}`);
+      throw e;
+    } finally {
+      client.release();
+    }
   }
 }
