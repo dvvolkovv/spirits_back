@@ -22,6 +22,9 @@
 #   SKIP_TEST_SMOKE=1  — задеплоить на test без smoke (потом обычный прод-деплой + его smoke)
 #   SKIP_PROD_SMOKE=1  — на проде задеплоить без smoke
 #   SMOKE_ONLY=1       — пропустить деплой, гонять только smoke текущей фазы
+#                        (работает и для PHASE 3 — проверить лендинг, не катая)
+#   WITH_LANDING=1     — добавить PHASE 3: лендинг linkeon.io (land_linkeon)
+#   LANDING_ONLY=1     — ТОЛЬКО лендинг, без backend/frontend и без my.linkeon.io
 #   NO_ROLLBACK=1      — отключить авто-rollback на проде при smoke failure
 #                        (по умолчанию: если PHASE 2 smoke красный — откат
 #                         back+front к pre-deploy SHA, restart сервисов)
@@ -43,10 +46,22 @@
 #   PROD_FRONT_SRC     /home/dvolkov/spirits_front_src
 #   PROD_FRONT_SERVED  /home/dvolkov/spirits_front
 #   PROD_BASE_URL      https://my.linkeon.io
+#   PROD_LAND_PATH     /home/dvolkov/land_linkeon
+#   LAND_BASE_URL      https://linkeon.io
 #   BRANCH             main
 #
 # Why git-based (не rsync): --delete сносил .env, public/agent-avatars/
 # и другие untracked-локально файлы. Git-pull обновляет только трекаемое.
+#
+# PHASE 3 (лендинг linkeon.io) — почему отдельно и почему по умолчанию выключена:
+#   * это другой продукт в другом репозитории (land_linkeon), со своим темпом
+#     выката. Правка текста на лендинге не должна тянуть за собой pm2 restart
+#     API — рестарт посреди живого чат-хода молча убивает чужой ответ;
+#   * стенда лендинга на test НЕТ (ни чекаута, ни vhost'а), поэтому у неё одна
+#     фаза — прод. Это известная дыра в двухфазности, а не забытый шаг:
+#     появится стенд — сюда добавится фаза test;
+#   * nginx отдаёт dist/ ПРЯМО из чекаута ($PROD_LAND_PATH/dist), так что
+#     сборка на месте и есть выкат — отдельного rsync в served-папку нет.
 
 set -uo pipefail
 
@@ -65,6 +80,9 @@ BRANCH="${BRANCH:-main}"
 _BACK_DIR_DEFAULT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOCAL_BACK_DIR="${LOCAL_BACK_DIR:-$_BACK_DIR_DEFAULT}"
 LOCAL_FRONT_DIR="${LOCAL_FRONT_DIR:-$(dirname "$_BACK_DIR_DEFAULT")/spirits_front}"
+LOCAL_LAND_DIR="${LOCAL_LAND_DIR:-$(dirname "$_BACK_DIR_DEFAULT")/land_linkeon}"
+PROD_LAND_PATH="${PROD_LAND_PATH:-/home/dvolkov/land_linkeon}"
+LAND_BASE_URL="${LAND_BASE_URL:-https://linkeon.io}"
 
 bold()  { printf "\033[1m%s\033[0m\n" "$1"; }
 green() { printf "\033[32m%s\033[0m\n" "$1"; }
@@ -378,6 +396,136 @@ deploy_frontend() {
   green "  ✓ frontend bundle deployed ($ENV_NAME)"
 }
 
+# ── PHASE 3: лендинг linkeon.io ───────────────────────────────────────────────
+# Отдельный репозиторий land_linkeon, отдельный vhost, отдельный темп выката.
+# Подробности «почему отдельно» — в шапке файла.
+
+# SHA лендинга ДО pull — для отката, если smoke красный.
+LAND_PRE_SHA=""
+
+deploy_landing() {
+  bold "=== LANDING ($LAND_BASE_URL) ==="
+  bold "[land 1/2] pushing local commits to origin"
+  push_local_repo "$LOCAL_LAND_DIR" "land_linkeon"
+
+  LAND_PRE_SHA=$(ssh_remote "cd $PROD_LAND_PATH && git rev-parse HEAD" 2>/dev/null | tr -d '\r\n')
+  if [[ -n "$LAND_PRE_SHA" ]]; then
+    echo "  pre-deploy landing SHA: ${LAND_PRE_SHA:0:8}"
+  else
+    red "  ! не удалось снять pre-deploy SHA лендинга — авто-отката не будет"
+  fi
+
+  bold "[land 2/2] pulling on prod + building in place (nginx отдаёт dist/ отсюда же)"
+  ssh_remote "
+    set -e
+    cd $PROD_LAND_PATH
+    git fetch origin
+    git reset --hard origin/$BRANCH
+    pnpm install --frozen-lockfile 2>&1 | tail -3
+    pnpm build 2>&1 | tail -3
+  " || { red "  landing deploy failed"; exit 1; }
+  green "  ✓ landing built and served"
+}
+
+rollback_landing() {
+  [[ -z "$LAND_PRE_SHA" ]] && { red "  ✗ отката нет: pre-deploy SHA не снят"; return 1; }
+  red "  ↩ откатываю лендинг на ${LAND_PRE_SHA:0:8}"
+  ssh_remote "
+    set -e
+    cd $PROD_LAND_PATH
+    git reset --hard $LAND_PRE_SHA
+    pnpm install --frozen-lockfile 2>&1 | tail -2
+    pnpm build 2>&1 | tail -2
+  " || { red "  ✗ откат лендинга не удался — чинить руками"; return 1; }
+  green "  ✓ лендинг откачен на ${LAND_PRE_SHA:0:8}"
+}
+
+# Smoke лендинга.
+#
+# КОД ОТВЕТА ЗДЕСЬ НИЧЕГО НЕ ЗНАЧИТ: в vhost'е стоит `try_files $uri $uri/
+# /index.html`, поэтому ЛЮБОЙ путь отдаёт 200 с html — в том числе
+# несуществующий и в том числе языковой каталог, которого не собралось.
+# Поэтому каждая проверка смотрит на СОДЕРЖИМОЕ, а не на статус.
+smoke_landing() {
+  bold "=== SMOKE (landing) ==="
+  local fails=0 body
+
+  # 1. Корень отдаёт непустой пререндер. Пустой <div id="root"></div> —
+  #    это «сборка прошла, пререндер отвалился»: страница внешне жива, а
+  #    краулер видит пустоту.
+  body=$(curl -fsS --max-time 20 "$LAND_BASE_URL/" 2>/dev/null)
+  if [[ -z "$body" ]]; then
+    red "  ✗ $LAND_BASE_URL/ не ответил"; fails=$((fails+1))
+  else
+    if grep -q '<div id="root"></div>' <<<"$body"; then
+      red "  ✗ пререндер пуст: <div id=\"root\"></div> без содержимого"; fails=$((fails+1))
+    else
+      green "  ✓ корень отдаёт пререндеренный html"
+    fi
+    if ! grep -qE '<h1[^>]*>.{10,}' <<<"$body"; then
+      red "  ✗ на корне нет непустого <h1>"; fails=$((fails+1))
+    else
+      green "  ✓ <h1> на месте"
+    fi
+  fi
+
+  # 2. Каждая языковая версия отдаёт СВОЙ язык. Именно здесь ловится
+  #    SPA-фолбэк: без этой проверки /de/ вернул бы русский index.html
+  #    со статусом 200 и выглядел бы «зелёным».
+  local code path lang_ok=1
+  for code in $(ssh_remote "ls -d $PROD_LAND_PATH/dist/*/ 2>/dev/null | xargs -n1 basename" 2>/dev/null | grep -E '^[a-z]{2}$'); do
+    path="/$code/"
+    body=$(curl -fsS --max-time 20 "$LAND_BASE_URL$path" 2>/dev/null)
+    if ! grep -q "<html lang=\"$code\"" <<<"$body"; then
+      red "  ✗ $path отдаёт не $code (SPA-фолбэк или потерянная локаль)"
+      lang_ok=0; fails=$((fails+1))
+    fi
+  done
+  [[ $lang_ok -eq 1 ]] && green "  ✓ языковые версии отдают свой <html lang>"
+
+  # 3. sitemap: настоящий xml, а не подсунутый index.html.
+  body=$(curl -fsS --max-time 20 "$LAND_BASE_URL/sitemap.xml" 2>/dev/null)
+  if grep -q "<loc>$LAND_BASE_URL/</loc>" <<<"$body"; then
+    green "  ✓ sitemap.xml отдаётся и содержит корень"
+  else
+    red "  ✗ sitemap.xml пуст, не xml или без корневого <loc>"; fails=$((fails+1))
+  fi
+
+  if [[ $fails -eq 0 ]]; then
+    green "  ✓ SMOKE GREEN (landing)"
+    return 0
+  fi
+  red "  ✗ SMOKE FAILED (landing) — $fails проверок красных"
+  return 1
+}
+
+run_landing_phase() {
+  ENV_NAME=landing
+  HOST="$PROD_HOST"
+  PATH_EXPORT='$HOME/.npm-global/bin'
+  export ENV_NAME HOST PATH_EXPORT
+
+  if [[ -z "${SMOKE_ONLY:-}" ]]; then
+    deploy_landing
+  else
+    echo "(SMOKE_ONLY=1 — лендинг не катим, только smoke)"
+  fi
+
+  if [[ -n "${SKIP_SMOKE:-}" ]]; then
+    echo "(smoke skipped for landing)"
+    return 0
+  fi
+
+  smoke_landing && return 0
+
+  if [[ -z "${NO_ROLLBACK:-}" && -z "${SMOKE_ONLY:-}" ]]; then
+    rollback_landing || red "  ✗ откат лендинга прошёл частично — проверить руками"
+    smoke_landing && red "  ↩ откат вернул лендинг в рабочее состояние" \
+                  || red "  ✗ лендинг красный и ПОСЛЕ отката — чинить руками"
+  fi
+  return 1
+}
+
 run_phase() {
   local phase="$1"  # "test" или "prod"
   case "$phase" in
@@ -471,14 +619,19 @@ run_phase() {
 }
 
 # ── main ──
-if [[ -z "${PROD_ONLY:-}" ]]; then
+if [[ -z "${PROD_ONLY:-}" && -z "${LANDING_ONLY:-}" ]]; then
   bold "════════════ PHASE 1: TEST ════════════"
   run_phase test || { red "TEST phase failed — НЕ КАЧУ НА ПРОД"; exit 1; }
 fi
 
-if [[ -z "${TEST_ONLY:-}" ]]; then
+if [[ -z "${TEST_ONLY:-}" && -z "${LANDING_ONLY:-}" ]]; then
   bold "════════════ PHASE 2: PROD ════════════"
   run_phase prod || exit 2
+fi
+
+if [[ -n "${LANDING_ONLY:-}" || -n "${WITH_LANDING:-}" ]]; then
+  bold "════════════ PHASE 3: LANDING ════════════"
+  run_landing_phase || exit 3
 fi
 
 green "════════════════════════════════════════════════════════════════════"
