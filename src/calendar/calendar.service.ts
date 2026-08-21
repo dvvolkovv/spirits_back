@@ -14,6 +14,23 @@ import { TalerIdCalendarConnector } from '../talerid/talerid-calendar.connector'
 
 const OFFSET = '+05:00';
 
+/**
+ * Ответ многоходового quick-add (дизайн 2026-08-21-voice-clarify-dialog):
+ * created — создано; clarify — не хватает обязательного, задаём вопрос; chat — не команда добавления;
+ * error — сбой разбора. `ok/title/whenText/datetime/kind` оставлены для обратной совместимости со
+ * старым реле-провайдером (читает их на created), новый клиент смотрит `status`.
+ */
+export type QuickAddResponse = {
+  status: 'created' | 'clarify' | 'chat' | 'error';
+  question?: string;
+  ok?: boolean;
+  title?: string;
+  whenText?: string;
+  datetime?: string;
+  kind?: string;
+  error?: string;
+};
+
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 /** Append the product TZ offset when the ISO string carries none (no trailing Z / ±hh:mm). */
 function withOffset(s: string): string {
@@ -500,32 +517,42 @@ export class CalendarService {
   async quickAddFromText(
     userId: string,
     text: string,
-  ): Promise<{ ok: boolean; title?: string; whenText?: string; datetime?: string; kind?: string; error?: string }> {
+    answers?: { q: string; a: string }[],
+  ): Promise<QuickAddResponse> {
     const phrase = (text || '').trim();
-    if (!phrase) return { ok: false, error: 'Пустой запрос' };
-    if (!this.claudeCli) return { ok: false, error: 'Разбор фразы недоступен' };
+    if (!phrase) return { status: 'error', error: 'Пустой запрос' };
+    if (!this.claudeCli) return { status: 'error', error: 'Разбор фразы недоступен' };
 
     // Текущее локальное время (Екатеринбург, без DST) — модели нужен «сейчас», чтобы понять
     // «сегодня/завтра/в 11:00». Даём ISO с зоной + человекочитаемо.
     const now = new Date();
     const nowLocalIso = new Date(now.getTime() + 5 * 3600_000).toISOString().replace('Z', OFFSET);
+    // Многоходовость: исходная фраза + уже полученные уточнения. Сервер БЕЗ сессии — каждый ход
+    // модель заново собирает слоты из всего накопленного (см. дизайн 2026-08-21-voice-clarify-dialog).
+    const clarifyBlock = (answers && answers.length)
+      ? `\nУточнения (вопрос → ответ), учитывай их наравне с фразой:\n` +
+        answers.map((qa) => `- ${qa.q} → ${qa.a}`).join('\n') + '\n'
+      : '';
     const prompt =
-      `Ты парсер календарных фраз. Текущее локальное время пользователя: ${nowLocalIso} (Asia/Yekaterinburg).\n` +
-      `Преврати фразу в ОДНУ запись. Верни СТРОГО JSON без пояснений:\n` +
-      `{"title":"...","kind":"event"|"task","datetime":"YYYY-MM-DDTHH:MM:SS"|null,"durationMin":60,` +
+      `Ты парсер команд добавления в календарь/дела. Текущее локальное время пользователя: ` +
+      `${nowLocalIso} (Asia/Yekaterinburg).\n` +
+      `Верни СТРОГО JSON без пояснений:\n` +
+      `{"intent":"add"|"chat","kind":"event"|"task","title":"...",` +
+      `"date":"YYYY-MM-DD"|null,"time":"HH:MM"|null,"durationMin":<целое минут>|null,` +
       `"recurrence":{"freq":"daily"|"weekly","byDay":["MO","TU","WE","TH","FR","SA","SU"],"interval":1}|null,` +
       `"deadline":"YYYY-MM-DDTHH:MM:SS"|null}\n` +
       `Правила:\n` +
-      `- СОБЫТИЕ (kind=event) — обязательство во времени, обычно с другими или жёсткий слот (встреча, ` +
-      `созвон, приём, дейлик). datetime = когда, локальное ISO без зоны.\n` +
-      `- ДЕЛО (kind=task) — личное намерение что-то сделать (купить, позвонить, помыться, отправить, ` +
-      `сходить). datetime = мягкий ориентир по времени, может быть null если времени нет.\n` +
-      `- Повтор («каждый день/по утрам/по будням/каждый понедельник/еженедельно») → recurrence ` +
-      `(это рутина, обычно kind=task; byDay для еженедельного), иначе recurrence=null.\n` +
-      `- «до HH:MM / крайний срок / дедлайн / успеть к» → deadline, иначе null.\n` +
-      `- title — краткое название (без «добавь/поставь/напомни/в календарь»). Относительное время ` +
-      `(«на 11:00», «вечером») от «сейчас»; если сегодня прошло — завтра. Не выдумывай дату, если её нет.\n` +
-      `Фраза: ${JSON.stringify(phrase)}`;
+      `- intent=add — это команда что-то добавить/запланировать/напомнить. intent=chat — вопрос, ` +
+      `болтовня, «что у меня в…», всё НЕ про добавление. При chat остальные поля можно null.\n` +
+      `- СОБЫТИЕ (kind=event) — слот во времени (встреча, созвон, приём, поехать куда-то, дейлик).\n` +
+      `- ДЕЛО (kind=task) — личное дело/намерение (купить, позвонить, сделать, отправить, сходить).\n` +
+      `- date/time/durationMin заполняй ТОЛЬКО если это ЯВНО есть во фразе или уточнениях. ` +
+      `НЕ ВЫДУМЫВАЙ время и длительность, если их не сказали → ставь null. Относительные даты ` +
+      `(«завтра», «в воскресенье») разворачивай в date от «сейчас».\n` +
+      `- Повтор («каждый день/по будням/еженедельно») → recurrence (рутина, kind=task), иначе null.\n` +
+      `- «до HH:MM / крайний срок / дедлайн» → deadline, иначе null.\n` +
+      `- title — краткое название без «добавь/поставь/напомни/в календарь».\n` +
+      `Фраза: ${JSON.stringify(phrase)}${clarifyBlock}`;
 
     let parsed: any = null;
     try {
@@ -533,13 +560,57 @@ export class CalendarService {
       parsed = this.parseJsonTolerant(raw);
     } catch (e: any) {
       this.logger.error(`quickAdd parse failed: ${e.message}`);
-      return { ok: false, error: 'Не удалось разобрать фразу' };
+      return { status: 'error', error: 'Не удалось разобрать фразу' };
     }
+
+    const decision = CalendarService.decideQuickAdd(parsed);
+    if (decision.kind === 'chat') return { status: 'chat' };
+    if (decision.kind === 'clarify') return { status: 'clarify', question: decision.question };
+
+    // create
+    const { itemKind, title, date, time, durationMin, recurrence, deadline } = decision;
+    if (itemKind === 'task' || recurrence) {
+      // ДЕЛО/РУТИНА → облачный «дом дел» Линкеона (LinkeonTasksService), НЕ Яндекс-VTODO [owner 2026-08-02].
+      // Рутина без дня — ок (повторяется); одноразовое дело всегда с днём (гейт в decideQuickAdd),
+      // время по желанию (без времени берём 09:00, чтобы due не считалось просроченным с полуночи).
+      const due = recurrence
+        ? undefined
+        : `${date}T${time || '09:00'}:00${OFFSET}`;
+      await this.linkeonTasks.create(userId, { title, due, deadline, recurrence, note: parsed?.note });
+      if (this.onWrite) this.onWrite(userId);
+      const whenText = recurrence ? 'рутина' : time ? this.humanWhen(`${date}T${time}:00`) : this.humanDay(date!);
+      return { status: 'created', ok: true, title, kind: 'task', whenText, datetime: due };
+    }
+    // событие: день + время + длительность гарантированы decideQuickAdd
+    const datetime = `${date}T${time}:00`;
+    const event: ProposedEvent = { title, datetime, durationMin, note: parsed?.note };
+    const res = await this.createEvent(userId, event);
+    if (!res.ok) return { status: 'error', ok: false, error: res.error || 'Не удалось добавить событие' };
+    return { status: 'created', ok: true, title, kind: 'event', datetime, whenText: this.eventWhenText(datetime, durationMin) };
+  }
+
+  /**
+   * ЧИСТОЕ решение по разобранной фразе (без сети/БД — юнит-тестируемо). Возвращает: болтовня,
+   * переспрос (не хватает обязательного слота) или готовые слоты для создания. Обязательные слоты:
+   * СОБЫТИЕ = день+время+длительность; ДЕЛО = как минимум день (иначе невидимо в лаунчере);
+   * РУТИНА (recurrence) = день не требуется. Переспрашиваем ТОЛЬКО недостающее (owner 2026-08-21).
+   */
+  static decideQuickAdd(parsed: any):
+    | { kind: 'chat' }
+    | { kind: 'clarify'; question: string }
+    | {
+        kind: 'create';
+        itemKind: 'event' | 'task';
+        title: string;
+        date?: string;
+        time?: string;
+        durationMin?: number;
+        recurrence?: Recurrence;
+        deadline?: string;
+      } {
     const title = String(parsed?.title || '').trim();
-    if (!title) return { ok: false, error: 'Не понял, что добавить' };
-    const kind = parsed?.kind === 'task' ? 'task' : 'event';
-    const datetime = typeof parsed?.datetime === 'string' && parsed.datetime ? parsed.datetime : undefined;
-    const durationMin = Number.isFinite(parsed?.durationMin) ? Number(parsed.durationMin) : 60;
+    if (parsed?.intent === 'chat' || !title) return { kind: 'chat' };
+
     const recurrence: Recurrence | undefined =
       parsed?.recurrence && (parsed.recurrence.freq === 'daily' || parsed.recurrence.freq === 'weekly')
         ? {
@@ -548,20 +619,33 @@ export class CalendarService {
             interval: Number.isFinite(parsed.recurrence.interval) ? Number(parsed.recurrence.interval) : undefined,
           }
         : undefined;
+    const itemKind: 'event' | 'task' = parsed?.kind === 'task' || recurrence ? 'task' : 'event';
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(parsed?.date)) ? String(parsed.date) : undefined;
+    const time = /^\d{2}:\d{2}$/.test(String(parsed?.time)) ? String(parsed.time) : undefined;
+    const durationMin = Number.isFinite(parsed?.durationMin) && Number(parsed.durationMin) > 0 ? Number(parsed.durationMin) : undefined;
     const deadline = typeof parsed?.deadline === 'string' && parsed.deadline ? `${parsed.deadline}${OFFSET}` : undefined;
 
-    // ДЕЛО/РУТИНА → облачный «дом дел» Линкеона (LinkeonTasksService), НЕ Яндекс-VTODO [owner 2026-08-02].
-    if (kind === 'task' || recurrence) {
-      const due = datetime ? `${datetime}${OFFSET}` : undefined;
-      await this.linkeonTasks.create(userId, { title, due, deadline, recurrence, note: parsed?.note });
-      if (this.onWrite) this.onWrite(userId);
-      const whenText = recurrence ? 'рутина' : datetime ? this.humanWhen(datetime) : 'в дела';
-      return { ok: true, title, kind: 'task', whenText, datetime };
+    // Рутина: день не нужен (повторяется). Создаём сразу.
+    if (recurrence) return { kind: 'create', itemKind: 'task', title, time, durationMin, recurrence, deadline };
+
+    // Какие обязательные слоты отсутствуют?
+    const missing: ('date' | 'time' | 'duration')[] = [];
+    if (!date) missing.push('date');
+    if (itemKind === 'event') {
+      if (!time) missing.push('time');
+      if (!durationMin) missing.push('duration');
     }
-    const event: ProposedEvent = { title, datetime, durationMin, note: parsed?.note };
-    const res = await this.createEvent(userId, event);
-    if (!res.ok) return { ok: false, error: res.error || 'Не удалось добавить событие' };
-    return { ok: true, title, kind: 'event', datetime, whenText: this.humanWhen(datetime) };
+    if (missing.length) return { kind: 'clarify', question: CalendarService.clarifyQuestion(missing) };
+
+    return { kind: 'create', itemKind, title, date, time, durationMin, recurrence, deadline };
+  }
+
+  /** Один совмещённый вопрос по недостающим слотам («Во сколько и на сколько по времени?»). */
+  static clarifyQuestion(missing: ('date' | 'time' | 'duration')[]): string {
+    const label: Record<string, string> = { date: 'на какой день', time: 'во сколько', duration: 'на сколько по времени' };
+    const parts = missing.map((m) => label[m]);
+    const joined = parts.join(' и ');
+    return joined.charAt(0).toUpperCase() + joined.slice(1) + '?';
   }
 
   /** «сегодня 11:00» / «завтра 15:30» / «29.07 11:00» — для inline-подтверждения в виджете. */
@@ -577,6 +661,29 @@ export class CalendarService {
     const when = dayDiff === 0 ? 'сегодня' : dayDiff === 1 ? 'завтра'
       : `${String(evY.getUTCDate()).padStart(2, '0')}.${String(evY.getUTCMonth() + 1).padStart(2, '0')}`;
     return `${when} ${hh}:${mm}`;
+  }
+
+  /** «сегодня» / «завтра» / «26.08» — для дела без конкретного времени (день есть, часа нет). */
+  private humanDay(dateStr: string): string {
+    const t = new Date(`${dateStr}T12:00:00${OFFSET}`);
+    if (Number.isNaN(t.getTime())) return dateStr;
+    const nowY = new Date(Date.now() + 5 * 3600_000);
+    const evY = new Date(t.getTime() + 5 * 3600_000);
+    const dayDiff = Math.floor((Date.UTC(evY.getUTCFullYear(), evY.getUTCMonth(), evY.getUTCDate()) -
+      Date.UTC(nowY.getUTCFullYear(), nowY.getUTCMonth(), nowY.getUTCDate())) / 86400_000);
+    return dayDiff === 0 ? 'сегодня' : dayDiff === 1 ? 'завтра'
+      : `${String(evY.getUTCDate()).padStart(2, '0')}.${String(evY.getUTCMonth() + 1).padStart(2, '0')}`;
+  }
+
+  /** «завтра 15:00–16:00» — событие с длительностью показываем ЯВНО (длительность не прячем). */
+  private eventWhenText(datetimeLocal: string, durationMin: number): string {
+    const start = new Date(`${datetimeLocal}${datetimeLocal.includes('+') || datetimeLocal.endsWith('Z') ? '' : OFFSET}`);
+    if (Number.isNaN(start.getTime())) return this.humanWhen(datetimeLocal);
+    const end = new Date(start.getTime() + durationMin * 60_000);
+    const endY = new Date(end.getTime() + 5 * 3600_000);
+    const eh = String(endY.getUTCHours()).padStart(2, '0');
+    const em = String(endY.getUTCMinutes()).padStart(2, '0');
+    return `${this.humanWhen(datetimeLocal)}–${eh}:${em}`;
   }
 
   /** Толерантный JSON-парсер (модель иногда оборачивает в markdown/прозу). */
