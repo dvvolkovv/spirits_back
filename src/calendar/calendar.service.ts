@@ -670,25 +670,31 @@ export class CalendarService {
     return lines.join('\n');
   }
 
-  /** Быстрый разбор фразы. OpenRouter gpt-4o-mini ПЕРВЫМ (~1с) — иначе claude CLI даёт ~5.5с паузу
-   *  (owner: «долгая пауза после фразы»). Fallback на claude CLI, если ключа/сети нет. JSON-режим. */
+  /** Быстрый разбор фразы. Прямой OpenAI/OpenRouter gpt-4o-mini ПЕРВЫМ (~1с) — иначе claude CLI даёт
+   *  ~5.5с паузу (owner: «долгая пауза после фразы»). Порядок: OpenAI (ключ есть на проде) →
+   *  OpenRouter → claude CLI. JSON-режим. */
   private async llmJson(prompt: string): Promise<string | null> {
-    const key = process.env.OPENROUTER_API_KEY;
-    if (key) {
+    const model = process.env.QUICKADD_MODEL || 'gpt-4o-mini';
+    const endpoints: { url: string; key?: string; model: string }[] = [
+      { url: 'https://api.openai.com/v1/chat/completions', key: process.env.OPENAI_API_KEY, model },
+      { url: 'https://openrouter.ai/api/v1/chat/completions', key: process.env.OPENROUTER_API_KEY, model: `openai/${model}` },
+    ];
+    for (const ep of endpoints) {
+      if (!ep.key) continue;
       try {
         const resp = await axios.post(
-          'https://openrouter.ai/api/v1/chat/completions',
+          ep.url,
           {
-            model: process.env.QUICKADD_MODEL || 'openai/gpt-4o-mini',
+            model: ep.model,
             messages: [{ role: 'user', content: prompt }],
             response_format: { type: 'json_object' },
           },
-          { headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, timeout: 20000 },
+          { headers: { Authorization: `Bearer ${ep.key}`, 'Content-Type': 'application/json' }, timeout: 20000 },
         );
         const c = resp.data?.choices?.[0]?.message?.content;
         if (c) return c;
       } catch (e: any) {
-        this.logger.warn(`quickAdd OpenRouter failed (${e.message}); falling back to claude CLI`);
+        this.logger.warn(`quickAdd LLM ${ep.url} failed (${e.message}); trying next`);
       }
     }
     return this.claudeCli ? await this.claudeCli.text(prompt, { model: 'claude-haiku-4-5' }) : null;
