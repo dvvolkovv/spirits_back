@@ -1417,6 +1417,8 @@ export class AdminService {
         series: [],
         byAssistant: [],
         transactions: [],
+        topups: [],
+        topupTotals: [],
         recentMessages: [],
       };
     }
@@ -1607,6 +1609,76 @@ export class AdminService {
       transactions = [];
     }
 
+    // 6b) Пополнения — отдельным списком.
+    //
+    // Общий список выше отдаёт последние 20 транзакций вперемешку, и у
+    // активного человека это 20 списаний подряд: у 79035281880 пополнений 13
+    // против 912 списаний, то есть в карточке их не видно вовсе. Вопрос «когда
+    // и на что пополнялся» из админки не решался — приходилось идти в psql.
+    //
+    // Купон отдаём кодом: metadata хранит только coupon_id, а раздачи после
+    // использования из coupons удаляют (id 4, 37–39 уже нет). Тогда кода нет —
+    // отдаём null и сам id, но не выдумываем.
+    let topups: Array<Record<string, any>> = [];
+    try {
+      const r = await this.pg.query(
+        `SELECT t.created_at, t.transaction_type::text AS type, t.amount, t.balance_after,
+                COALESCE(t.description, '') AS description, t.metadata,
+                c.code AS coupon_code,
+                p.amount AS rub, p.provider, p.package_id
+           FROM token_transactions t
+           LEFT JOIN coupons c
+             ON t.metadata->>'coupon_id' ~ '^[0-9]+$'
+            AND c.id = (t.metadata->>'coupon_id')::int
+           LEFT JOIN payments p
+             ON p.payment_id = t.metadata->>'payment_id'
+          WHERE t.user_id = $1
+            AND t.transaction_type <> 'consumed'
+          ORDER BY t.created_at DESC
+          LIMIT 100`,
+        [phone],
+      );
+      topups = r.rows.map((row: any) => ({
+        at: row.created_at,
+        type: row.type,
+        tokens: Number(row.amount) || 0,
+        // У перенесённых миграцией строк в balance_after лежит ноль-заглушка.
+        // Отдаём null, чтобы админка не показала выдумку как факт.
+        balanceAfter: row.metadata?.reconstructed ? null : Number(row.balance_after),
+        description: row.description,
+        couponId: row.metadata?.coupon_id ?? null,
+        couponCode: row.coupon_code ?? null,
+        rub: row.rub != null ? Number(row.rub) : null,
+        provider: row.provider ?? null,
+        packageId: row.package_id ?? null,
+        reconstructed: Boolean(row.metadata?.reconstructed),
+      }));
+    } catch {
+      topups = [];
+    }
+
+    // 6c) Итоги по видам пополнений — по всей истории, а не по последним 100.
+    let topupTotals: Array<{ type: string; tokens: number; count: number }> = [];
+    try {
+      const r = await this.pg.query(
+        `SELECT t.transaction_type::text AS type,
+                SUM(t.amount)::bigint AS tokens,
+                COUNT(*)::int AS count
+           FROM token_transactions t
+          WHERE t.user_id = $1 AND t.transaction_type <> 'consumed'
+          GROUP BY t.transaction_type
+          ORDER BY 2 DESC`,
+        [phone],
+      );
+      topupTotals = r.rows.map((row: any) => ({
+        type: row.type,
+        tokens: Number(row.tokens) || 0,
+        count: Number(row.count) || 0,
+      }));
+    } catch {
+      topupTotals = [];
+    }
+
     // 7) Recent messages (last 10): веб-чат и Telegram-бот в одной ленте,
     //    каждая строка помечена источником, у TG — ещё и названием чата.
     let recentMessages: Array<{
@@ -1724,6 +1796,8 @@ export class AdminService {
       series,
       byAssistant,
       transactions,
+      topups,
+      topupTotals,
       recentMessages,
       payments,
     };
