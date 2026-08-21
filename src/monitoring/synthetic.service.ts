@@ -9,7 +9,10 @@ import { PgService } from '../common/services/pg.service';
 // Критичные сценарии: их падение = деградация продукта, алертим немедленно.
 // chat_streaming бьёт по /webhook/soulmate/chat (r.linkeon.io) — это и есть
 // AI-путь пользователей, который «молча» лёг при недельном лимите подписки.
-const CRITICAL_SCENARIOS = (process.env.SYNTHETIC_CRITICAL_SCENARIOS || 'chat_streaming,auth_refresh')
+// Ключ авторизации — `refresh_jwt`, именно его шлёт раннер. До 2026-08-21 здесь
+// стоял `auth_refresh`, которого в synthetic_runs не существовало никогда: сбой
+// авторизации не алертился напрямую, только рикошетом через chat_streaming.
+const CRITICAL_SCENARIOS = (process.env.SYNTHETIC_CRITICAL_SCENARIOS || 'chat_streaming,refresh_jwt')
   .split(',').map((s) => s.trim()).filter(Boolean);
 // Если раннер (node-3 cron) перестал слать результаты дольше этого — мониторинг
 // «ослеп», тоже алертим.
@@ -111,17 +114,29 @@ export class SyntheticService implements OnModuleInit {
       this.lastStaleAlertAt = null;
     }
 
+    // Без JWT раннер не выполняет chat_streaming вовсе, но помечает его красным
+    // (доступ пользователя действительно сломан). Приписывать такое падение
+    // релею нельзя: ярлык «AI-чат (r.linkeon.io)» отправляет дежурного чинить
+    // r.linkeon.io, который в этот прогон даже не опрашивался. Определяем это
+    // по статусу refresh_jwt, а не по тексту сообщения: текст локализуемый и
+    // сопоставление по нему тихо развалится при первом же переводе.
+    const authDown = overview.scenarios.some(
+      (x) => x.scenario === 'refresh_jwt' && x.latestSuccess === false,
+    );
+
     // 2. Критичные сценарии: падение → алерт, восстановление → отбой.
     for (const s of overview.scenarios) {
       if (!CRITICAL_SCENARIOS.includes(s.scenario)) continue;
       const ok = s.latestSuccess === true;
       const prev = this.lastStatus.get(s.scenario);
       if (!ok && (prev !== false || cooled(s.scenario))) {
-        const label = s.scenario === 'chat_streaming' ? 'AI-чат (r.linkeon.io)' : s.scenario;
+        const derived = s.scenario === 'chat_streaming' && authDown;
+        const label = s.scenario === 'chat_streaming' && !derived ? 'AI-чат (r.linkeon.io)' : s.scenario;
         await send(
           `<b>🔴 Synthetic: критичный сценарий упал</b>\n` +
           `Сценарий: <b>${label}</b>\n` +
           `Ошибка: ${s.latestMessage ? String(s.latestMessage).slice(0, 160) : '—'}\n` +
+          (derived ? `⚠️ Причина не в AI: не прошла авторизация (<b>refresh_jwt</b>), сам чат не проверялся.\n` : '') +
           `Успех за 24ч: ${s.successRate24hPct != null ? s.successRate24hPct.toFixed(0) + '%' : '—'} · проверка: ${s.latestTs || '—'}`,
         );
         this.lastAlertAt.set(s.scenario, now);

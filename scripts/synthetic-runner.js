@@ -13,6 +13,8 @@
  *   SYNTHETIC_PUSH_TOKEN           (required)
  *   SYNTHETIC_TEST_REFRESH_JWT     (required — bootstrap value)
  *   SYNTHETIC_STATE_FILE           (default /var/lib/synthetic/state.json)
+ *   SYNTHETIC_REFRESH_ATTEMPTS     (default 3)
+ *   SYNTHETIC_RETRY_BASE_MS        (default 1500)
  */
 
 const fs = require('fs');
@@ -23,11 +25,12 @@ const TOKEN = process.env.SYNTHETIC_PUSH_TOKEN || '';
 const STATE_FILE = process.env.SYNTHETIC_STATE_FILE || '/var/lib/synthetic/state.json';
 const TIMEOUT_MS = 30_000;
 const AGENT_UUID = '0cdacf32-7bfd-4888-b24f-3a6af3b5f99e';
-
-if (!TOKEN) {
-  console.error('SYNTHETIC_PUSH_TOKEN not set');
-  process.exit(2);
-}
+const REFRESH_ATTEMPTS = Number(process.env.SYNTHETIC_REFRESH_ATTEMPTS || 3);
+const RETRY_BASE_MS = Number(process.env.SYNTHETIC_RETRY_BASE_MS || 1500);
+// Сценарии, которым нужен JWT. Список именно положительный: раньше здесь было
+// перечисление исключений («всё, кроме agents_endpoint, agent_avatar и
+// refresh_jwt»), и в него молча попадал сам refresh_jwt.
+const NEEDS_JWT = ['profile_with_jwt', 'tokens_balance', 'chat_streaming'];
 
 // Load most recent refresh token from state file (preferred) or fall back
 // to env bootstrap value.
@@ -71,6 +74,32 @@ async function refreshTokens() {
   if (!access) throw new Error('refresh returned no access-token');
   if (newRefresh && newRefresh !== refresh) saveRefresh(newRefresh);
   return access;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Инцидент 2026-08-21 10:30 UTC: одиночный исходящий коннект с node-3 подвис,
+ * AbortController убил его на 30-й секунде, и раннер без единого ретрая
+ * пометил красными три сценария — включая критичный chat_streaming, который
+ * при этом даже не запускался. Через секунду тот же запрос прошёл за 263 мс.
+ *
+ * Повтор безопасен: refresh на бэке stateless (проверка подписи + выдача новой
+ * пары, старый токен не отзывается — auth.service.ts refreshTokens), поэтому
+ * повторная попытка не сжигает токен и не ломает следующий прогон.
+ */
+async function refreshWithRetry() {
+  let lastErr;
+  for (let attempt = 1; attempt <= REFRESH_ATTEMPTS; attempt++) {
+    try {
+      return await refreshTokens();
+    } catch (e) {
+      lastErr = e;
+      console.error(`refresh attempt ${attempt}/${REFRESH_ATTEMPTS} failed: ${e.message}`);
+      if (attempt < REFRESH_ATTEMPTS) await sleep(RETRY_BASE_MS * attempt);
+    }
+  }
+  throw new Error(`${lastErr?.message || 'refresh failed'} (попыток: ${REFRESH_ATTEMPTS})`);
 }
 
 // Плейсхолдеры, которые бэк/relay отдают ЮЗЕРУ при недоступности модели.
@@ -125,16 +154,6 @@ const scenarios = (jwtUser) => [
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const j = await r.json();
       if (!Array.isArray(j) || j.length < 10) throw new Error(`got ${Array.isArray(j) ? j.length : 'non-array'} agents`);
-      return null;
-    },
-  },
-  {
-    key: 'refresh_jwt',
-    run: async () => {
-      // Whole refresh flow is the auth scenario (no SMS involved).
-      // Bootstrap loadRefresh already happened; we re-run to verify.
-      const access = await refreshTokens();
-      if (!access) throw new Error('no access-token from refresh');
       return null;
     },
   },
@@ -206,21 +225,30 @@ async function push(scenario, success, durationMs, message) {
   }
 }
 
-(async () => {
+async function runAll() {
+  // Авторизация — это и есть сценарий refresh_jwt, одна попытка на прогон.
+  // Раньше их было две: bootstrap пушил refresh_jwt=false, а одноимённый
+  // сценарий следом пушил true. DISTINCT ON в getOverview брал позднюю строку,
+  // и дашборд показывал зелёную авторизацию рядом с красными сценариями,
+  // упавшими именно из-за неё.
+  const results = [];
   let jwtUser = null;
+  const tAuth = Date.now();
   try {
-    jwtUser = await refreshTokens();
+    jwtUser = await refreshWithRetry();
+    results.push({ key: 'refresh_jwt', ok: true, ms: Date.now() - tAuth, message: null });
   } catch (e) {
-    console.error(`bootstrap refresh failed: ${e.message}`);
-    // Report bootstrap as a failed scenario so the UI surfaces it.
-    await push('refresh_jwt', false, 0, e.message?.slice(0, 200) || 'refresh failed');
+    console.error(`refresh failed: ${e.message}`);
+    results.push({ key: 'refresh_jwt', ok: false, ms: Date.now() - tAuth, message: e?.message?.slice(0, 200) || 'refresh failed' });
   }
 
   const list = scenarios(jwtUser);
-  const results = await Promise.all(list.map(async (s) => {
+  const rest = await Promise.all(list.map(async (s) => {
     const t0 = Date.now();
-    if (s.key !== 'agents_endpoint' && s.key !== 'agent_avatar' && s.key !== 'refresh_jwt' && !jwtUser) {
-      return { key: s.key, ok: false, ms: 0, message: 'no JWT (refresh failed)' };
+    if (NEEDS_JWT.includes(s.key) && !jwtUser) {
+      // Сценарий не выполнялся. Сообщение обязано указывать на источник, иначе
+      // красный chat_streaming читается как отказ AI и уводит дежурного в релей.
+      return { key: s.key, ok: false, ms: 0, message: 'не проверялся: нет JWT (причина — refresh_jwt)' };
     }
     try {
       const note = await s.run();
@@ -229,10 +257,25 @@ async function push(scenario, success, durationMs, message) {
       return { key: s.key, ok: false, ms: Date.now() - t0, message: e?.message?.slice(0, 200) || 'unknown' };
     }
   }));
+  results.push(...rest);
 
   for (const r of results) {
     await push(r.key, r.ok, r.ms, r.message);
     const flag = r.ok ? 'OK ' : 'FAIL';
     console.log(`${flag}  ${r.key.padEnd(28)} ${r.ms}ms  ${r.message || ''}`);
   }
-})();
+  return results;
+}
+
+if (require.main === module) {
+  if (!TOKEN) {
+    console.error('SYNTHETIC_PUSH_TOKEN not set');
+    process.exit(2);
+  }
+  runAll().catch((e) => {
+    console.error(`runner crashed: ${e?.message || e}`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { runAll, refreshWithRetry, refreshTokens, scenarios };
