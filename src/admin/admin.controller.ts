@@ -25,24 +25,35 @@ export class AdminController {
   // --- Coupons (action-based POST) ---
 
   @Post('admin/coupons')
-  async coupons(@Body() body: any, @Res() res: Response) {
+  async coupons(@CurrentUser() user: any, @Body() body: any, @Res() res: Response) {
     const { action, ...data } = body;
+    // Автор действия — тот, кто держит админский токен. Раньше не сохранялся
+    // вовсе, из-за чего происхождение купонов было не выяснить.
+    const actor = user?.userId ? String(user.userId) : undefined;
     switch (action) {
       case 'list': {
         const coupons = await this.adminService.listCoupons();
         return res.status(200).json(coupons);
       }
       case 'create': {
-        const coupon = await this.adminService.createCoupon(data.code, data.token_amount || 60000);
+        const coupon = await this.adminService.createCoupon(data.code, data.token_amount || 60000, actor);
         return res.status(200).json(coupon);
       }
       case 'update': {
-        const updated = await this.adminService.updateCoupon(data.id, data);
+        const updated = await this.adminService.updateCoupon(data.id, data, actor);
         return res.status(200).json(updated);
       }
       case 'delete': {
-        const result = await this.adminService.deleteCoupon(data.id);
+        const result = await this.adminService.deleteCoupon(data.id, actor);
         return res.status(200).json(result);
+      }
+      case 'history': {
+        const history = await this.adminService.couponHistory(Number(data.id));
+        return res.status(200).json(history);
+      }
+      case 'audit': {
+        const audit = await this.adminService.couponAudit(Number(data.limit) || 50);
+        return res.status(200).json(audit);
       }
       default:
         return res.status(400).json({ error: `Unknown action: ${action}` });

@@ -1,14 +1,36 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import axios from 'axios';
 import * as nodemailer from 'nodemailer';
+import * as fs from 'fs';
+import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
 import { sendTelegramAlert } from '../common/telegram-alert';
 
 @Injectable()
-export class AdminService {
+export class AdminService implements OnModuleInit {
   private readonly logger = new Logger(AdminService.name);
   constructor(private readonly pg: PgService) {}
+
+  // Глобальный npm run migrate на проде застрял на base/001 и не докатывает
+  // ничего после — поэтому модульный раннер, как в payments/video/support.
+  async onModuleInit() {
+    for (const p of [
+      path.join(__dirname, 'migrations', '001_coupon_audit.sql'),
+      path.join(__dirname, '..', '..', 'src', 'admin', 'migrations', '001_coupon_audit.sql'),
+    ]) {
+      try {
+        if (fs.existsSync(p)) {
+          await this.pg.query(fs.readFileSync(p, 'utf8'));
+          this.logger.log(`admin migration 001 applied from ${p}`);
+          return;
+        }
+      } catch (e: any) {
+        this.logger.error(`admin migration 001 failed (${p}): ${e.message}`);
+      }
+    }
+    this.logger.warn('admin migration 001 not found, skipping');
+  }
 
   /** Позднейшая из двух отметок времени; null, если обеих нет. */
   private static latest(a: any, b: any): any {
@@ -19,23 +41,63 @@ export class AdminService {
 
   // --- Coupons ---
 
+  /**
+   * Запись в журнал действий над купонами.
+   *
+   * Никогда не роняет само действие: журнал ценен, но потерянная строка в нём
+   * хуже, чем неприменённый купон или неудалённая раздача.
+   */
+  private async auditCoupon(
+    action: 'create' | 'update' | 'delete',
+    actor: string | null,
+    coupon: { id?: number | null; code: string; token_amount?: number | null },
+    details?: any,
+  ) {
+    try {
+      await this.pg.query(
+        `INSERT INTO coupon_audit (coupon_id, code, action, actor, token_amount, details)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+        [
+          coupon.id ?? null, coupon.code, action, actor ?? null,
+          coupon.token_amount ?? null, details ? JSON.stringify(details) : null,
+        ],
+      );
+    } catch (e: any) {
+      this.logger.warn(`coupon_audit (${action} ${coupon.code}) не записан: ${e.message}`);
+    }
+  }
+
   async listCoupons() {
-    const res = await this.pg.query('SELECT * FROM coupons ORDER BY created_at DESC');
+    const res = await this.pg.query(
+      `SELECT c.*,
+              (SELECT COUNT(*) FROM coupon_redemptions r WHERE r.coupon_id = c.id)::int AS redeemed_count
+         FROM coupons c
+        ORDER BY c.created_at DESC`,
+    );
     return res.rows.map(r => ({
       ...r,
       token_amount: Number(r.token_amount),
+      // usage_count живёт в самой строке и растёт при применении, но по нему
+      // не видно дублей: считаем ещё и фактические строки применений.
+      redeemed_count: Number(r.redeemed_count) || 0,
     }));
   }
 
-  async createCoupon(code: string, tokenAmount: number) {
+  async createCoupon(code: string, tokenAmount: number, actor?: string) {
     const res = await this.pg.query(
-      'INSERT INTO coupons (code, token_amount) VALUES ($1, $2) RETURNING *',
-      [code, tokenAmount],
+      'INSERT INTO coupons (code, token_amount, created_by) VALUES ($1, $2, $3) RETURNING *',
+      [code, tokenAmount, actor ?? null],
     );
-    return res.rows[0];
+    const row = res.rows[0];
+    await this.auditCoupon('create', actor ?? null, row);
+    return row;
   }
 
-  async updateCoupon(id: number, data: { is_active?: boolean; token_amount?: number }) {
+  async updateCoupon(
+    id: number,
+    data: { is_active?: boolean; token_amount?: number },
+    actor?: string,
+  ) {
     const sets: string[] = [];
     const vals: any[] = [];
     let idx = 1;
@@ -47,12 +109,118 @@ export class AdminService {
       `UPDATE coupons SET ${sets.join(', ')} WHERE id = $${idx} RETURNING *`,
       vals,
     );
-    return res.rows[0];
+    const row = res.rows[0];
+    if (row) {
+      await this.auditCoupon('update', actor ?? null, row, { changed: data });
+    }
+    return row;
   }
 
-  async deleteCoupon(id: number) {
+  /**
+   * Удаление купона со снимком в журнал.
+   *
+   * Снимок берётся ДО DELETE — после него восстанавливать уже нечего. Именно
+   * так мы потеряли и код купона id=4, и раздачи 37–39: строки исчезли, а
+   * применения в coupon_redemptions остались ссылаться в пустоту.
+   */
+  async deleteCoupon(id: number, actor?: string) {
+    const before = await this.pg.query(
+      'SELECT id, code, token_amount, usage_count FROM coupons WHERE id = $1',
+      [id],
+    );
+    const row = before.rows[0];
+    if (!row) return { success: false, error: 'coupon not found' };
+
     await this.pg.query('DELETE FROM coupons WHERE id = $1', [id]);
+    await this.auditCoupon('delete', actor ?? null, row, {
+      usage_count: Number(row.usage_count) || 0,
+    });
     return { success: true };
+  }
+
+  /**
+   * Общий журнал действий над купонами — в том числе по удалённым.
+   *
+   * Именно здесь видно раздачи, которых уже нет в `coupons`: снимок кода и
+   * суммы остаётся, поэтому «кто и когда стёр купон на 5 000 000» перестаёт
+   * быть вопросом без ответа.
+   */
+  async couponAudit(limit = 50) {
+    const lim = Math.min(Math.max(limit, 1), 500);
+    const res = await this.pg.query(
+      `SELECT a.id, a.coupon_id, a.code, a.action, a.actor, a.token_amount, a.details, a.created_at,
+              (c.id IS NOT NULL) AS still_exists
+         FROM coupon_audit a
+         LEFT JOIN coupons c ON c.id = a.coupon_id
+        ORDER BY a.created_at DESC
+        LIMIT $1`,
+      [lim],
+    );
+    return res.rows.map((r: any) => ({
+      id: r.id,
+      couponId: r.coupon_id,
+      code: r.code,
+      action: r.action,
+      actor: r.actor,
+      tokens: r.token_amount != null ? Number(r.token_amount) : null,
+      details: r.details ?? null,
+      at: r.created_at,
+      stillExists: Boolean(r.still_exists),
+    }));
+  }
+
+  /**
+   * История одного купона: кто применял и что с ним делали администраторы.
+   *
+   * Работает и для удалённого купона: код и сумма берутся из снимка в журнале,
+   * а применения по coupon_id остаются в coupon_redemptions навсегда.
+   */
+  async couponHistory(id: number) {
+    const cur = await this.pg.query(
+      'SELECT id, code, token_amount, is_active, usage_count, created_by, created_at FROM coupons WHERE id = $1',
+      [id],
+    );
+    const auditRes = await this.pg.query(
+      `SELECT action, actor, code, token_amount, details, created_at
+         FROM coupon_audit WHERE coupon_id = $1 ORDER BY created_at ASC`,
+      [id],
+    );
+    const redRes = await this.pg.query(
+      `SELECT r.user_id, r.redeemed_at, r.tokens_granted, p.email
+         FROM coupon_redemptions r
+         LEFT JOIN ai_profiles_consolidated p ON p.user_id = r.user_id
+        WHERE r.coupon_id = $1
+        ORDER BY r.redeemed_at ASC`,
+      [id],
+    );
+
+    const coupon = cur.rows[0] ?? null;
+    const audit = auditRes.rows.map((a: any) => ({
+      action: a.action,
+      actor: a.actor,
+      at: a.created_at,
+      code: a.code,
+      tokens: a.token_amount != null ? Number(a.token_amount) : null,
+      details: a.details ?? null,
+    }));
+    // Купона уже нет — берём код из снимка удаления, иначе история безымянна.
+    const fromAudit = audit.length ? audit[audit.length - 1] : null;
+
+    return {
+      id,
+      code: coupon?.code ?? fromAudit?.code ?? null,
+      tokens: coupon ? Number(coupon.token_amount) : fromAudit?.tokens ?? null,
+      deleted: !coupon,
+      createdBy: coupon?.created_by ?? audit.find(a => a.action === 'create')?.actor ?? null,
+      createdAt: coupon?.created_at ?? audit.find(a => a.action === 'create')?.at ?? null,
+      audit,
+      redemptions: redRes.rows.map((r: any) => ({
+        userId: r.user_id,
+        at: r.redeemed_at,
+        tokens: Number(r.tokens_granted) || 0,
+        email: r.email ?? null,
+      })),
+    };
   }
 
   // --- Referrals ---
