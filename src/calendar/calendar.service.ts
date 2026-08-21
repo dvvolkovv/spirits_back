@@ -1,4 +1,5 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
+import axios from 'axios';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
@@ -521,12 +522,14 @@ export class CalendarService {
   ): Promise<QuickAddResponse> {
     const phrase = (text || '').trim();
     if (!phrase) return { status: 'error', error: 'Пустой запрос' };
-    if (!this.claudeCli) return { status: 'error', error: 'Разбор фразы недоступен' };
 
-    // Текущее локальное время (Екатеринбург, без DST) — модели нужен «сейчас», чтобы понять
-    // «сегодня/завтра/в 11:00». Даём ISO с зоной + человекочитаемо.
+    // Текущее локальное время (Екатеринбург, без DST) + СПРАВОЧНИК ДАТ на неделю вперёд. LLM плохо
+    // считает «какое число будет в воскресенье» (путал день ±1) → даём таблицу дней недели с датами,
+    // модель берёт date ОТТУДА, а не вычисляет.
     const now = new Date();
-    const nowLocalIso = new Date(now.getTime() + 5 * 3600_000).toISOString().replace('Z', OFFSET);
+    const localNow = new Date(now.getTime() + 5 * 3600_000);
+    const nowLocalIso = localNow.toISOString().replace('Z', OFFSET);
+    const dateRef = CalendarService.dateReference(localNow);
     // Многоходовость: исходная фраза + уже полученные уточнения. Сервер БЕЗ сессии — каждый ход
     // модель заново собирает слоты из всего накопленного (см. дизайн 2026-08-21-voice-clarify-dialog).
     const clarifyBlock = (answers && answers.length)
@@ -536,6 +539,7 @@ export class CalendarService {
     const prompt =
       `Ты парсер команд добавления в календарь/дела. Текущее локальное время пользователя: ` +
       `${nowLocalIso} (Asia/Yekaterinburg).\n` +
+      `Справочник дат (бери date ОТСЮДА для относительных дней, НЕ вычисляй сам):\n${dateRef}\n` +
       `Верни СТРОГО JSON без пояснений:\n` +
       `{"intent":"add"|"chat","kind":"event"|"task","title":"...",` +
       `"date":"YYYY-MM-DD"|null,"time":"HH:MM"|null,"durationMin":<целое минут>|null,` +
@@ -547,8 +551,9 @@ export class CalendarService {
       `- СОБЫТИЕ (kind=event) — слот во времени (встреча, созвон, приём, поехать куда-то, дейлик).\n` +
       `- ДЕЛО (kind=task) — личное дело/намерение (купить, позвонить, сделать, отправить, сходить).\n` +
       `- date/time/durationMin заполняй ТОЛЬКО если это ЯВНО есть во фразе или уточнениях. ` +
-      `НЕ ВЫДУМЫВАЙ время и длительность, если их не сказали → ставь null. Относительные даты ` +
-      `(«завтра», «в воскресенье») разворачивай в date от «сейчас».\n` +
+      `НЕ ВЫДУМЫВАЙ время и длительность, если их не сказали → ставь null. Относительный день ` +
+      `(«завтра», «в воскресенье», «в понедельник») → возьми соответствующую date ИЗ СПРАВОЧНИКА выше ` +
+      `(ближайшую будущую с таким днём недели).\n` +
       `- Повтор («каждый день/по будням/еженедельно») → recurrence (рутина, kind=task), иначе null.\n` +
       `- «до HH:MM / крайний срок / дедлайн» → deadline, иначе null.\n` +
       `- title — краткое название без «добавь/поставь/напомни/в календарь».\n` +
@@ -556,7 +561,8 @@ export class CalendarService {
 
     let parsed: any = null;
     try {
-      const raw = await this.claudeCli.text(prompt, { model: 'claude-haiku-4-5' });
+      const raw = await this.llmJson(prompt);
+      if (raw == null) return { status: 'error', error: 'Разбор фразы недоступен' };
       parsed = this.parseJsonTolerant(raw);
     } catch (e: any) {
       this.logger.error(`quickAdd parse failed: ${e.message}`);
@@ -646,6 +652,46 @@ export class CalendarService {
     const parts = missing.map((m) => label[m]);
     const joined = parts.join(' и ');
     return joined.charAt(0).toUpperCase() + joined.slice(1) + '?';
+  }
+
+  /** Справочник «дата → день недели» на 8 дней от сегодня — чтобы LLM брал дату относительного дня
+   *  по таблице, а не вычислял (путал ±1). [localNow] уже сдвинут в местное время (+05:00). */
+  static dateReference(localNow: Date): string {
+    const wd = ['воскресенье', 'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота'];
+    const lines: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      const d = new Date(localNow.getTime() + i * 86400_000);
+      const y = d.getUTCFullYear();
+      const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+      const day = String(d.getUTCDate()).padStart(2, '0');
+      const rel = i === 0 ? ' — сегодня' : i === 1 ? ' — завтра' : i === 2 ? ' — послезавтра' : '';
+      lines.push(`${y}-${m}-${day} — ${wd[d.getUTCDay()]}${rel}`);
+    }
+    return lines.join('\n');
+  }
+
+  /** Быстрый разбор фразы. OpenRouter gpt-4o-mini ПЕРВЫМ (~1с) — иначе claude CLI даёт ~5.5с паузу
+   *  (owner: «долгая пауза после фразы»). Fallback на claude CLI, если ключа/сети нет. JSON-режим. */
+  private async llmJson(prompt: string): Promise<string | null> {
+    const key = process.env.OPENROUTER_API_KEY;
+    if (key) {
+      try {
+        const resp = await axios.post(
+          'https://openrouter.ai/api/v1/chat/completions',
+          {
+            model: process.env.QUICKADD_MODEL || 'openai/gpt-4o-mini',
+            messages: [{ role: 'user', content: prompt }],
+            response_format: { type: 'json_object' },
+          },
+          { headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, timeout: 20000 },
+        );
+        const c = resp.data?.choices?.[0]?.message?.content;
+        if (c) return c;
+      } catch (e: any) {
+        this.logger.warn(`quickAdd OpenRouter failed (${e.message}); falling back to claude CLI`);
+      }
+    }
+    return this.claudeCli ? await this.claudeCli.text(prompt, { model: 'claude-haiku-4-5' }) : null;
   }
 
   /** «сегодня 11:00» / «завтра 15:30» / «29.07 11:00» — для inline-подтверждения в виджете. */

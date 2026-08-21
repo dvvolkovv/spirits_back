@@ -74,6 +74,19 @@ describe('CalendarService.decideQuickAdd', () => {
   });
 });
 
+describe('CalendarService.dateReference', () => {
+  it('раскладывает дни недели по датам (пятница 2026-08-21 → воскресенье=23, понедельник=24)', () => {
+    // localNow = местный полдень пятницы 21.08.2026 (в сервисе это now+5ч, читается UTC-геттерами).
+    const localNow = new Date('2026-08-21T12:00:00Z');
+    const ref = CalendarService.dateReference(localNow);
+    expect(ref).toContain('2026-08-21 — пятница — сегодня');
+    expect(ref).toContain('2026-08-22 — суббота — завтра');
+    expect(ref).toContain('2026-08-23 — воскресенье');       // БАГ был: «воскресенье» уезжало на 24
+    expect(ref).toContain('2026-08-24 — понедельник');
+    expect(ref.split('\n')).toHaveLength(8);
+  });
+});
+
 describe('CalendarService.clarifyQuestion', () => {
   it('составляет вопрос из недостающих слотов', () => {
     expect(CalendarService.clarifyQuestion(['time', 'duration'])).toBe('Во сколько и на сколько по времени?');
