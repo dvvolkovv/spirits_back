@@ -44,7 +44,12 @@ export class TgRouterService {
    * проверка не видит.
    */
   private async isSoloChat(cfg: TgBotConfigRow): Promise<boolean> {
-    if (!cfg.tg_chat_id) return true; // личка с ботом
+    // tg_chat_id пуст — конфиг ещё не подключён к группе (pending) или
+    // заархивирован; отвечать он не может, сюда попасть не должен. Это НЕ личка:
+    // бот в приватном чате вообще не отвечает, там живут только /start, /help и
+    // /balance (см. handleUpdate — в handleGroupMessage уходят только group и
+    // supergroup). Страхуемся консервативно.
+    if (!cfg.tg_chat_id) return false;
     const r = await this.pg.query(
       `SELECT count(DISTINCT tg_user_id) AS n
          FROM tg_bot_messages
