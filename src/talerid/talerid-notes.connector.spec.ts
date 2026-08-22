@@ -10,7 +10,7 @@ describe('TalerIdNotesConnector [6ad042df]', () => {
         { id: 'n1', title: 'Идеи', content: 'текст', updatedAt: '2026-07-20T10:00:00+05:00' },
       ]);
       const result = await connector.listNotes('user-1');
-      expect(callTool).toHaveBeenCalledWith('user-1', 'list_notes', {});
+      expect(callTool).toHaveBeenCalledWith('user-1', 'list_notes', { limit: 100 });
       expect(result).toEqual([
         { id: 'n1', title: 'Идеи', content: 'текст', updatedAt: new Date('2026-07-20T10:00:00+05:00').toISOString() },
       ]);
@@ -45,6 +45,24 @@ describe('TalerIdNotesConnector [6ad042df]', () => {
       const connector = new TalerIdNotesConnector(makeOauth());
       jest.spyOn(connector as any, 'callTool').mockResolvedValue({ unexpected: true });
       expect(await connector.listNotes('user-1')).toEqual([]);
+    });
+  });
+
+  describe('createNote', () => {
+    it('зовёт create_note с {title, content} и возвращает {ok, id}', async () => {
+      const connector = new TalerIdNotesConnector(makeOauth());
+      const callTool = jest.spyOn(connector as any, 'callTool').mockResolvedValue({ id: 'n9', title: 'Купить' });
+      const r = await connector.createNote('user-1', 'Купить', 'купить молоко');
+      expect(callTool).toHaveBeenCalledWith('user-1', 'create_note', { title: 'Купить', content: 'купить молоко' });
+      expect(r).toMatchObject({ ok: true, id: 'n9' });
+    });
+
+    it('сбой → {ok:false, error} (не бросает)', async () => {
+      const connector = new TalerIdNotesConnector(makeOauth());
+      jest.spyOn(connector as any, 'callTool').mockRejectedValue(new Error('mcp down'));
+      const r = await connector.createNote('user-1', 'T', 'C');
+      expect(r.ok).toBe(false);
+      expect(r.error).toBeTruthy();
     });
   });
 });

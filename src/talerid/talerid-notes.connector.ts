@@ -56,6 +56,19 @@ export class TalerIdNotesConnector {
     }
   }
 
+  /** Создать заметку в TalerID (`create_note`, args {title, content} — как в talerid-dev-agent e2e).
+   *  В отличие от listNotes НЕ глотаем ошибку молча: возвращаем {ok:false,error}, чтобы панель показала. */
+  async createNote(userId: string, title: string, content: string): Promise<{ ok: boolean; id?: string; title?: string; error?: string }> {
+    try {
+      const raw = await this.callTool(userId, 'create_note', { title, content });
+      const id = raw?.id != null ? String(raw.id) : undefined;
+      return { ok: true, id, title: String(raw?.title ?? title) };
+    } catch (e: any) {
+      this.logger.warn(`talerid createNote failed for ${userId}: ${e?.message}`);
+      return { ok: false, error: 'Не удалось создать заметку' };
+    }
+  }
+
   /** Список заметок пользователя. Дефолтит в [] при любой проблеме. */
   async listNotes(userId: string): Promise<TalerIdNote[]> {
     try {
