@@ -567,10 +567,14 @@ export class TgBotService implements OnModuleInit {
           this.grammy.sendChatAction(msg.chat.id, 'record_voice').catch(() => {});
           const tts = await this.voice.synthesize(textToSend);
           voiceTtsCostUsd = tts.costUsd;
+          const plan = TgBotService.voiceCaptionPlan(textToSend);
           await this.grammy.sendVoice(msg.chat.id, tts.buffer, {
             reply_to_message_id: msg.message_id,
-            caption: textToSend.substring(0, 1024),
+            ...(plan.caption !== undefined ? { caption: plan.caption } : {}),
           });
+          if (plan.needsSeparateText) {
+            await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend);
+          }
           contentType = 'voice_reply';
         } catch (e: any) {
           this.logger.warn(`TTS failed for chat ${msg.chat.id}, fallback to text: ${e.message}`);
@@ -618,6 +622,9 @@ export class TgBotService implements OnModuleInit {
         await this.billing.clearZeroBalanceFlag(cfg.id);
       }
       await this.router.persistAssistantReply(cfg, reply.text, contentType, tokensCharged);
+      // Пишем разговор в тот же граф Neo4j, из которого читает веб-чат: без
+      // этого бот ничего не запоминает и переспрашивает уже рассказанное.
+      await this.router.consolidateAfterReply(cfg, workingText, reply.text);
 
       // DM-alert при низком балансе (post-deduct)
       const ownerTg = await this.identity.getIdentityByLinkeonId(cfg.owner_user_id);
@@ -657,6 +664,23 @@ export class TgBotService implements OnModuleInit {
    * идут после доставки, и ход, которого юзер не видел, не должен ни попасть в
    * историю как отвеченный, ни быть оплачен.
    */
+  /**
+   * Лимит подписи к медиа в Telegram — 1024 символа, а не 4096 как у текстового
+   * сообщения. Здесь стоял substring(0, 1024): TTS озвучивал ответ целиком, а
+   * подпись молча обрывалась на полуслове — «голосом читает полностью, а текст
+   * обрезает» (жалоба владельца 22.08.2026). Нарезка splitForTelegram этот путь
+   * не прикрывала: она живёт в sendMessage, а голос уходит через sendVoice.
+   *
+   * Длинный ответ отправляем отдельным сообщением — там нарезка работает.
+   */
+  static readonly VOICE_CAPTION_LIMIT = 1024;
+
+  static voiceCaptionPlan(text: string): { caption?: string; needsSeparateText: boolean } {
+    return text.length <= TgBotService.VOICE_CAPTION_LIMIT
+      ? { caption: text, needsSeparateText: false }
+      : { needsSeparateText: true };
+  }
+
   async deliverReplyText(chatId: number, replyToMessageId: number, text: string): Promise<void> {
     try {
       await this.grammy.sendMessage(chatId, text, { reply_to_message_id: replyToMessageId });

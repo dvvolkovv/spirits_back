@@ -84,7 +84,16 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  async getProfileDescription(userId: string): Promise<string> {
+  /**
+   * Описание профиля для system-промпта.
+   *
+   * includePrivate=false отдаёт только то, что не стыдно произнести при
+   * посторонних: имя, интересы, навыки. Desires/Beliefs/Intents/Values —
+   * приватные: именно там оседает личное (образование дочери, поездка с сыном,
+   * «семья и близкие»). Нужно для Telegram-бота, который живёт в группах.
+   * Веб-чат зовёт без опций и получает всё, как раньше.
+   */
+  async getProfileDescription(userId: string, opts?: { includePrivate?: boolean }): Promise<string> {
     const session = this.getSession();
     if (!session) return '';
     try {
@@ -123,10 +132,12 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
         // её не парсит. Имя и фамилия остаются — они несут смысл для диалога.
         `Profile:${name ? ` name: ${name}` : ''}${familyName ? ` family name: ${familyName}` : ''}`,
         `Interests: ${fmt(rec.get('interests'))}`,
-        `Desires: ${fmt(rec.get('desires'))}`,
-        `Beliefs: ${fmt(rec.get('beliefs'))}`,
-        `Intents: ${fmt(rec.get('intents'))}`,
-        `Values: ${fmt(rec.get('values'))}`,
+        ...(opts?.includePrivate === false ? [] : [
+          `Desires: ${fmt(rec.get('desires'))}`,
+          `Beliefs: ${fmt(rec.get('beliefs'))}`,
+          `Intents: ${fmt(rec.get('intents'))}`,
+          `Values: ${fmt(rec.get('values'))}`,
+        ]),
         `Skills: ${fmt(rec.get('skills'))}`,
       ];
       return lines.join('\n');
