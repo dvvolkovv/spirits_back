@@ -236,7 +236,8 @@ ${recent}
 
     const ioInstructions = `
 ВОЗМОЖНОСТИ:
-- Ты видишь приложенные пользователем файлы (фото, PDF, txt) если они есть.${sandboxBlock}
+- Ты видишь приложенные пользователем файлы (фото, PDF, txt) если они есть.
+- У тебя есть интернет: WebSearch (поиск) и WebFetch (открыть страницу по URL). Если вопрос про актуальное — курсы, новости, цены, расписания, свежие релизы — проверяй в сети, а не отвечай по памяти. Обычные вопросы, где сеть не нужна, ищи не надо.${sandboxBlock}
 - Медиа-маркеры для прикрепления изображений и файлов к ответу:
   • {{image: КРАТКИЙ_ПРОМПТ}} — сгенерирует и пришлёт новую картинку (Imagen 4.0 Ultra)
   • {{image_edit: source=<url> | prompt=<что изменить>}} — отредактирует существующую (Gemini Nano Banana Pro)
@@ -261,7 +262,23 @@ ${systemPrompt}`;
     // Claude по часам не нужно.
     // В sandbox-режиме разрешаем агентные tools — Claude может сам писать скрипты,
     // запускать их и читать результаты. В песочнице — только в её cwd.
-    const allowedTools = sandboxDir ? 'Bash,Write,Edit,Read,Glob,Grep' : undefined;
+    //
+    // Веб — во всех режимах. allowedTools=undefined в claude-cli.service значит
+    // «built-in тулы выключены полностью» (или только Read при вложениях), из-за
+    // чего бот отвечал по обучающим данным и выдавал устаревшее за актуальное,
+    // молча и без ошибок в логе. Передавая список явно, мы отключаем тот дефолт,
+    // поэтому Read при вложениях приходится дописывать руками.
+    //
+    // Цена: поиск заметно дороже обычного хода (замер 22.08.2026 — $0.24 и 48 с
+    // на один вопрос с 5 поисковыми запросами). Отдельного учёта не нужно —
+    // costUsd из textWithCost уже уходит в биллинг, но на счёт владельца бота
+    // такие ходы ложатся ощутимее.
+    const WEB_TOOLS = 'WebSearch,WebFetch';
+    const allowedTools = sandboxDir
+      ? `Bash,Write,Edit,Read,Glob,Grep,${WEB_TOOLS}`
+      : attachmentPaths?.length
+        ? `Read,${WEB_TOOLS}`
+        : WEB_TOOLS;
 
     const { text, costUsd } = await this.claudeCli.textWithCost(userPrompt, {
       system: systemWithCtx,
