@@ -1,5 +1,6 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
+import { Neo4jService } from '../neo4j/neo4j.service';
 import { ClaudeCliService, ClaudeCliProgressEvent } from '../common/services/claude-cli.service';
 import { AgentsService } from '../agents/agents.service';
 import { TgGrammyClient } from './tg-grammy.client';
@@ -29,7 +30,62 @@ export class TgRouterService {
     private readonly configs: TgConfigService,
     private readonly agents: AgentsService,
     private readonly claudeCli: ClaudeCliService,
+    @Optional() private readonly neo4j?: Neo4jService,
   ) {}
+
+  /**
+   * «Сольный» чат — тот, где писал ровно один человек. Формально это группа, но
+   * фактически личный кабинет владельца: на 22.08.2026 у трёх боевых ботов из
+   * четырёх ровно один участник. В таком чате бот получает полный профиль из
+   * графа; как только появляется второй собеседник, приватные разделы
+   * (Desires/Beliefs/Intents/Values) из промпта исчезают.
+   *
+   * Ограничение честное: молчаливого читателя, который ни разу не написал, эта
+   * проверка не видит.
+   */
+  private async isSoloChat(cfg: TgBotConfigRow): Promise<boolean> {
+    if (!cfg.tg_chat_id) return true; // личка с ботом
+    const r = await this.pg.query(
+      `SELECT count(DISTINCT tg_user_id) AS n
+         FROM tg_bot_messages
+        WHERE tg_chat_id = $1 AND role = 'user' AND tg_user_id IS NOT NULL`,
+      [cfg.tg_chat_id],
+    );
+    return Number(r.rows[0]?.n ?? 0) <= 1;
+  }
+
+  /**
+   * Память о владельце — из того же графа Neo4j, которым пользуется веб-чат.
+   * Без неё бот знал только имя и переспрашивал то, что человек уже рассказывал
+   * в вебке.
+   */
+  private async loadOwnerProfile(cfg: TgBotConfigRow): Promise<string> {
+    if (!this.neo4j) return '';
+    try {
+      const solo = await this.isSoloChat(cfg);
+      return (await this.neo4j.getProfileDescription(cfg.owner_user_id, { includePrivate: solo })).trim();
+    } catch (e: any) {
+      this.logger.warn(`profile for tg bot ${cfg.id} not loaded: ${e?.message}`);
+      return '';
+    }
+  }
+
+  /**
+   * Обратная сторона: записываем разговор в тот же граф. Без этого бот не
+   * учится вообще — рассказанное ему в Telegram нигде не оседает и в вебке не
+   * видно. Только в сольном чате: в общей группе в профиль владельца попали бы
+   * чужие слова.
+   */
+  async consolidateAfterReply(cfg: TgBotConfigRow, userMessage: string, assistantResponse: string): Promise<void> {
+    if (!this.neo4j || !userMessage || !assistantResponse) return;
+    try {
+      if (!(await this.isSoloChat(cfg))) return;
+      const agentId = cfg.custom_agent_id ?? cfg.preset_agent_id ?? 'tg-bot';
+      await this.neo4j.consolidateFromChat(cfg.owner_user_id, String(agentId), userMessage, assistantResponse);
+    } catch (e: any) {
+      this.logger.warn(`neo4j consolidate for tg bot ${cfg.id} failed: ${e?.message}`);
+    }
+  }
 
   /**
    * Triggers ответа в режиме A (strict):
@@ -221,6 +277,7 @@ ${recent}
   ): Promise<{ text: string; costUsd: number }> {
     const { systemPrompt } = await this.resolveSystemPrompt(cfg);
     const history = await this.loadHistory(cfg.id);
+    const ownerProfile = await this.loadOwnerProfile(cfg);
 
     // В системный промпт добавляем инструкцию про markup для отправки файлов
     // и про доступные инструменты. Если есть sandboxDir — даём Claude Bash/Write/
@@ -248,8 +305,16 @@ ${recent}
 - Маркеры пиши на отдельной строке. Не больше 3 за ответ. source/sources — это URL картинок из предыдущих сообщений в чате.
 - Сам по себе текст до/после маркера тоже отправится — пиши коротко.`;
 
+    // Профиль владельца из графа — та же память, которой пользуется веб-чат.
+    // Без неё бот знал только имя и переспрашивал уже рассказанное.
+    const profileBlock = ownerProfile ? `
+
+ЧТО ТЫ УЖЕ ЗНАЕШЬ О ВЛАДЕЛЬЦЕ (накоплено из его разговоров в Linkeon):
+${ownerProfile}
+Пользуйся этим молча: не переспрашивай то, что здесь есть, и не зачитывай этот список вслух.` : '';
+
     const systemWithCtx = `Ты в Telegram-группе. Владелец бота, который платит за твою работу: ${ownerFirstName}. Текущая дата/время: ${new Date().toISOString()}.
-${ioInstructions}
+${ioInstructions}${profileBlock}
 
 ${systemPrompt}`;
 
