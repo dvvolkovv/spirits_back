@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
-import { TgIdentityService } from './tg-identity.service';
+import { TgIdentityService, TgIdentityConflictError } from './tg-identity.service';
 import { TgClaimService } from './tg-claim.service';
 import { TgConfigService, TgBotConfigRow } from './tg-config.service';
 import { TgRouterService } from './tg-router.service';
@@ -253,11 +253,31 @@ export class TgBotService implements OnModuleInit {
       );
       this.logger.log(`identity bound: linkeon=${ownerId} tg=${msg.from.id}`);
     } catch (e: any) {
-      await this.grammy.sendMessage(
-        msg.chat.id,
-        `Не получилось привязать: ${e.message}. Сгенерируй новую ссылку в Linkeon (старая могла истечь — TTL 15 минут).`,
+      // Провал привязки раньше не логировался вообще — задним числом нельзя было
+      // установить даже то, из какого Telegram пришли.
+      this.logger.warn(
+        `identity bind failed: tg=${msg.from?.id} @${msg.from?.username ?? '—'}: ${e?.message}`,
+      );
+      await this.grammy.sendMessage(msg.chat.id, TgBotService.bindFailureMessage(e, msg.from));
+    }
+  }
+
+  /**
+   * Раньше на любую ошибку выдавался совет «сгенерируй новую ссылку — TTL 15
+   * минут». Для занятого Telegram он бесполезен: новая ссылка упрётся в то же
+   * ограничение, и человек ходит по кругу.
+   */
+  static bindFailureMessage(e: any, from?: { id?: number; username?: string | null }): string {
+    if (e instanceof TgIdentityConflictError || e?.constraint === 'tg_user_identities_tg_user_id_key') {
+      const who = from?.username ? `@${from.username}` : `id ${from?.id ?? '—'}`;
+      return (
+        `Этот Telegram (${who}) уже привязан к другому аккаунту Linkeon. ` +
+        `Новая ссылка не поможет — ограничение не в ней. ` +
+        `Либо откройте ссылку из того Telegram-аккаунта, который хотите привязать, ` +
+        `либо сначала отвяжите этот от старого аккаунта.`
       );
     }
+    return `Не получилось привязать: ${e?.message}. Сгенерируй новую ссылку в Linkeon (старая могла истечь — TTL 15 минут).`;
   }
 
   private async handleGroupClaim(msg: any, token: string): Promise<void> {
