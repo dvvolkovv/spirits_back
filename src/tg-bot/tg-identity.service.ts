@@ -1,6 +1,21 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 
+/**
+ * Telegram, из которого пришли, уже принадлежит другому аккаунту Linkeon.
+ *
+ * Отдельный тип, потому что вызывающий код обязан отличать этот случай от
+ * протухшего токена: совет «сгенерируй новую ссылку» здесь бесполезен — новая
+ * упрётся в то же ограничение (жалоба владельца 22.08.2026, @nomira_ai был
+ * привязан к другому аккаунту с 10 июня).
+ */
+export class TgIdentityConflictError extends Error {
+  constructor(readonly tgUserId: number, readonly tgUsername: string | null) {
+    super('telegram already bound to another linkeon account');
+    this.name = 'TgIdentityConflictError';
+  }
+}
+
 @Injectable()
 export class TgIdentityService {
   private readonly logger = new Logger(TgIdentityService.name);
@@ -25,30 +40,48 @@ export class TgIdentityService {
     tgUsername: string | null,
     tgFirstName: string | null,
   ): Promise<string> {
-    const r = await this.pg.query(
-      `SELECT owner_user_id FROM tg_claim_tokens
-        WHERE token = $1 AND kind = 'auth' AND consumed_at IS NULL AND expires_at > now()
-        LIMIT 1`,
-      [token],
-    );
-    if (r.rows.length === 0) {
-      throw new BadRequestException('invalid or expired auth token');
+    // Всё одной транзакцией. Раньше токен гасился ДО вставки: при конфликте по
+    // tg_user_id привязка падала, а ссылка была уже сожжена — пользователю
+    // советовали сгенерировать новую, и она умирала так же.
+    const client = await this.pg.getClient();
+    try {
+      await client.query('BEGIN');
+      const r = await client.query(
+        `SELECT owner_user_id FROM tg_claim_tokens
+          WHERE token = $1 AND kind = 'auth' AND consumed_at IS NULL AND expires_at > now()
+          LIMIT 1
+          FOR UPDATE`,
+        [token],
+      );
+      if (r.rows.length === 0) {
+        throw new BadRequestException('invalid or expired auth token');
+      }
+      const ownerId = r.rows[0].owner_user_id;
+      await client.query(`UPDATE tg_claim_tokens SET consumed_at = now() WHERE token = $1`, [token]);
+      try {
+        await client.query(
+          `INSERT INTO tg_user_identities (linkeon_user_id, tg_user_id, tg_username, tg_first_name)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (linkeon_user_id) DO UPDATE SET
+             tg_user_id = EXCLUDED.tg_user_id,
+             tg_username = EXCLUDED.tg_username,
+             tg_first_name = EXCLUDED.tg_first_name`,
+          [ownerId, tgUserId, tgUsername, tgFirstName],
+        );
+      } catch (e: any) {
+        // ON CONFLICT закрывает только linkeon_user_id, поэтому 23505 здесь —
+        // это UNIQUE на tg_user_id: Telegram занят другим аккаунтом Linkeon.
+        if (e?.code === '23505') throw new TgIdentityConflictError(tgUserId, tgUsername);
+        throw e;
+      }
+      await client.query('COMMIT');
+      return ownerId;
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      client.release();
     }
-    const ownerId = r.rows[0].owner_user_id;
-    await this.pg.query(
-      `UPDATE tg_claim_tokens SET consumed_at = now() WHERE token = $1`,
-      [token],
-    );
-    await this.pg.query(
-      `INSERT INTO tg_user_identities (linkeon_user_id, tg_user_id, tg_username, tg_first_name)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (linkeon_user_id) DO UPDATE SET
-         tg_user_id = EXCLUDED.tg_user_id,
-         tg_username = EXCLUDED.tg_username,
-         tg_first_name = EXCLUDED.tg_first_name`,
-      [ownerId, tgUserId, tgUsername, tgFirstName],
-    );
-    return ownerId;
   }
 
   async getIdentityByLinkeonId(ownerId: string): Promise<{ tgUserId: number; tgUsername: string | null; tgFirstName: string | null } | null> {
