@@ -1,13 +1,10 @@
 import { Module } from '@nestjs/common';
-import { SpeechkitSttService } from './speechkit-stt.service';
-import { TtsService } from './tts.service';
-import { TtsController } from './tts.controller';
-import { MiscModule } from '../misc/misc.module';
+import { VoiceController } from './voice.controller';
+import { VoiceImproveService } from './voice-improve.service';
 
+/** Голосовые операции: «Улучшить» надиктованный текст (пунктуация/падежи) — opt-in, внешний ИИ. */
 @Module({
-  imports: [MiscModule],
-  controllers: [TtsController],
-  providers: [SpeechkitSttService, TtsService],
-  exports: [SpeechkitSttService, TtsService],
+  controllers: [VoiceController],
+  providers: [VoiceImproveService],
 })
 export class VoiceModule {}
