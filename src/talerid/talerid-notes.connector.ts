@@ -69,6 +69,17 @@ export class TalerIdNotesConnector {
     }
   }
 
+  /** Обновить заметку в TalerID (`update_note`, args {id, title, content}). {ok:false,error} при сбое. */
+  async updateNote(userId: string, id: string, title: string, content: string): Promise<{ ok: boolean; id?: string; title?: string; error?: string }> {
+    try {
+      const raw = await this.callTool(userId, 'update_note', { id, title, content });
+      return { ok: true, id: raw?.id != null ? String(raw.id) : id, title: String(raw?.title ?? title) };
+    } catch (e: any) {
+      this.logger.warn(`talerid updateNote failed for ${userId}/${id}: ${e?.message}`);
+      return { ok: false, error: 'Не удалось обновить заметку' };
+    }
+  }
+
   /** Список заметок пользователя. Дефолтит в [] при любой проблеме. */
   async listNotes(userId: string): Promise<TalerIdNote[]> {
     try {

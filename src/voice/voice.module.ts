@@ -14,6 +14,6 @@ import { MiscModule } from '../misc/misc.module';
   imports: [MiscModule],
   controllers: [TtsController, VoiceController],
   providers: [SpeechkitSttService, TtsService, VoiceImproveService],
-  exports: [SpeechkitSttService, TtsService],
+  exports: [SpeechkitSttService, TtsService, VoiceImproveService],
 })
 export class VoiceModule {}

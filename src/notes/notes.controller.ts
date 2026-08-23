@@ -2,6 +2,7 @@ import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { TalerIdNotesConnector } from '../talerid/talerid-notes.connector';
+import { VoiceImproveService } from '../voice/voice-improve.service';
 
 /**
  * Заметки пользователя [da5290c7]. Read-only витрина для панели заметок лаунчера — просмотр в
@@ -11,7 +12,10 @@ import { TalerIdNotesConnector } from '../talerid/talerid-notes.connector';
  */
 @Controller('notes')
 export class NotesController {
-  constructor(private readonly notes: TalerIdNotesConnector) {}
+  constructor(
+    private readonly notes: TalerIdNotesConnector,
+    private readonly improveService: VoiceImproveService,
+  ) {}
 
   @Get()
   @UseGuards(JwtGuard)
@@ -32,6 +36,25 @@ export class NotesController {
     const explicit = String(body?.title ?? '').trim();
     const title = explicit || NotesController.deriveTitle(content);
     return this.notes.createNote(String(user.userId), title, content);
+  }
+
+  /**
+   * «Улучшить» существующую заметку [2026-08-23]: причесать её текст (пунктуация/падежи) внешним ИИ
+   * и СОХРАНИТЬ обратно (update_note). Вызывается ТОЛЬКО по явному согласию пользователя (кнопка ✨ +
+   * предупреждение — на клиенте). Fail-safe: при сбое улучшения/обновления возвращаем исходный текст.
+   */
+  @Post('improve')
+  @UseGuards(JwtGuard)
+  async improve(@CurrentUser() user: any, @Body() body: { id?: string; content?: string }) {
+    const id = String(body?.id || '').trim();
+    const content = String(body?.content || '').trim();
+    if (!id || !content) return { ok: false, error: 'Нет заметки для улучшения' };
+    const improved = await this.improveService.improve(content);
+    if (improved === content) return { ok: true, id, title: NotesController.deriveTitle(content), content }; // без изменений
+    const title = NotesController.deriveTitle(improved);
+    const r = await this.notes.updateNote(String(user.userId), id, title, improved);
+    if (!r.ok) return { ok: false, error: r.error || 'Не удалось сохранить улучшение', content };
+    return { ok: true, id, title, content: improved };
   }
 
   /** Заголовок из текста: первая строка, до ~50 символов (по границе слова). */

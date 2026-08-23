@@ -65,4 +65,21 @@ describe('TalerIdNotesConnector [6ad042df]', () => {
       expect(r.error).toBeTruthy();
     });
   });
+
+  describe('updateNote', () => {
+    it('зовёт update_note с {id, title, content} и возвращает {ok, id}', async () => {
+      const connector = new TalerIdNotesConnector(makeOauth());
+      const callTool = jest.spyOn(connector as any, 'callTool').mockResolvedValue({ id: 'n5', title: 'Заголовок' });
+      const r = await connector.updateNote('user-1', 'n5', 'Заголовок', 'исправленный текст.');
+      expect(callTool).toHaveBeenCalledWith('user-1', 'update_note', { id: 'n5', title: 'Заголовок', content: 'исправленный текст.' });
+      expect(r).toMatchObject({ ok: true, id: 'n5' });
+    });
+
+    it('сбой → {ok:false, error}', async () => {
+      const connector = new TalerIdNotesConnector(makeOauth());
+      jest.spyOn(connector as any, 'callTool').mockRejectedValue(new Error('mcp down'));
+      const r = await connector.updateNote('user-1', 'n5', 'T', 'C');
+      expect(r.ok).toBe(false);
+    });
+  });
 });

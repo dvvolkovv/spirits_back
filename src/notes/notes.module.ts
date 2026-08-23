@@ -1,10 +1,11 @@
 import { Module } from '@nestjs/common';
 import { NotesController } from './notes.controller';
 import { TalerIdModule } from '../talerid/talerid.module';
+import { VoiceModule } from '../voice/voice.module';
 
-/** Панель заметок [da5290c7]: read-only `GET /webhook/notes` поверх TalerIdNotesConnector (mcp:notes). */
+/** Заметки: list/create + «Улучшить» (improve+update через VoiceImproveService) поверх TalerID. */
 @Module({
-  imports: [TalerIdModule],
+  imports: [TalerIdModule, VoiceModule],
   controllers: [NotesController],
 })
 export class NotesModule {}
