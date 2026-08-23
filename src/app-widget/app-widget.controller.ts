@@ -103,18 +103,23 @@ export class AppWidgetController {
       if (recentAssistants.length >= 3) break;
     }
 
-    // Энергия дня — только при реально включённой энерго-рутине.
+    // Энергия дня — только при реально включённой энерго-рутине (ежедневный пуш Райи).
+    // ⚠️ Гейт исторически проверял ключ 'energy_of_day', которого НЕТ НИ У КОГО (0 строк в
+    // routine_pushes) — то есть энергия не отдавалась НИ РАЗУ. Реальный ключ рутины —
+    // `daily:<assistantId>`; ассистент тот же (14 = Райя), что и в запросе контента ниже.
+    // [fix 2026-08-23]
+    const RAYA_ASSISTANT_ID = '14';
     let energyLine: string | null = null;
     const er = await this.pg.query(
-      `SELECT 1 FROM routine_pushes WHERE user_id = $1 AND kind = 'energy_of_day' LIMIT 1`,
-      [userId],
+      `SELECT 1 FROM routine_pushes WHERE user_id = $1 AND kind = $2 LIMIT 1`,
+      [userId, `daily:${RAYA_ASSISTANT_ID}`],
     );
     if (er.rows[0]) {
       const e = await this.pg.query(
         `SELECT content FROM custom_chat_history
-          WHERE session_id = $1 || '_14' AND sender_type <> 'human'
+          WHERE session_id = $1 || '_' || $2 AND sender_type <> 'human'
           ORDER BY created_at DESC LIMIT 1`,
-        [userId],
+        [userId, RAYA_ASSISTANT_ID],
       );
       if (e.rows[0]) energyLine = snippet(e.rows[0].content || '', 100);
     }
