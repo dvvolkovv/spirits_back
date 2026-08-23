@@ -2,6 +2,7 @@ import { Controller, Get, UseGuards } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
+import { EnergyFocusService } from './energy-focus.service';
 
 /**
  * Контент домашнего виджета нативного приложения [Натив 4].
@@ -29,7 +30,10 @@ function snippet(s: string, n = 90): string {
 
 @Controller('app-widget')
 export class AppWidgetController {
-  constructor(private readonly pg: PgService) {}
+  constructor(
+    private readonly pg: PgService,
+    private readonly energyFocus: EnergyFocusService,
+  ) {}
 
   @Get('content')
   @UseGuards(JwtGuard)
@@ -116,12 +120,20 @@ export class AppWidgetController {
     );
     if (er.rows[0]) {
       const e = await this.pg.query(
-        `SELECT content FROM custom_chat_history
+        `SELECT content, created_at FROM custom_chat_history
           WHERE session_id = $1 || '_' || $2 AND sender_type <> 'human'
           ORDER BY created_at DESC LIMIT 1`,
         [userId, RAYA_ASSISTANT_ID],
       );
-      if (e.rows[0]) energyLine = snippet(e.rows[0].content || '', 100);
+      if (e.rows[0]) {
+        // НЕ первые 100 символов (это приветствие + обрыв, посыл непонятен, owner 2026-08-23):
+        // дистиллируем послание Райи в одну короткую фразу-суть (кэш по метке времени сообщения).
+        energyLine = await this.energyFocus.focusFor(
+          userId,
+          e.rows[0].content || '',
+          String(e.rows[0].created_at),
+        );
+      }
     }
 
     // URL аватарки ассистента (публичный эндпоинт, теперь отдаёт байты) —
