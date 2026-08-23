@@ -43,7 +43,6 @@ import { AppWidgetModule } from './app-widget/app-widget.module';
 import { TripModule } from './trip/trip.module';
 import { NotesModule } from './notes/notes.module';
 import { CalendarModule } from './calendar/calendar.module';
-import { VoiceModule } from './voice/voice.module';
 import { TalerIdModule } from './talerid/talerid.module';
 import { SpeechModule } from './speech/speech.module';
 
@@ -93,7 +92,6 @@ import { SpeechModule } from './speech/speech.module';
     TripModule,
     NotesModule,
     CalendarModule,
-    VoiceModule,
     TalerIdModule,
     SpeechModule,
   ],
