@@ -30,7 +30,11 @@ export class CleanAskService {
    * прямых идентификаторов); бэкенд его НЕ перепроверяет и НЕ дополняет профилем — он слепое реле.
    * Возвращает текст ответа; при сбое бросает (контроллер отдаст ошибку).
    */
-  async ask(text: string, context?: string): Promise<string> {
+  async ask(
+    text: string,
+    context?: string,
+    history?: Array<{ role?: string; content?: string }>,
+  ): Promise<string> {
     const q = (text || '').trim();
     if (!q) throw new Error('empty question');
     const ctx = (context || '').trim();
@@ -42,7 +46,16 @@ export class CleanAskService {
       ? `\n\nОбезличенный контекст о собеседнике (без имён и личных данных — используй, чтобы ответ был ` +
         `уместнее, но не пытайся вычислить, кто это):\n${ctx}`
       : '';
-    fd.append('message', `${CleanAskService.SYSTEM}${ctxBlock}\n\nВопрос: ${q}`);
+    // Многоходовость: клиент присылает прежние реплики (они живут на устройстве, не на сервере).
+    // Реле по-прежнему без сессии — контекст диалога передаём в самом сообщении.
+    let histBlock = '';
+    if (Array.isArray(history) && history.length) {
+      const lines = history
+        .filter((t) => t && typeof t.content === 'string' && t.content.trim())
+        .map((t) => `${t.role === 'assistant' ? 'Ассистент' : 'Пользователь'}: ${String(t.content).trim()}`);
+      if (lines.length) histBlock = `\n\nПредыдущий разговор:\n${lines.join('\n')}`;
+    }
+    fd.append('message', `${CleanAskService.SYSTEM}${ctxBlock}${histBlock}\n\nПользователь: ${q}`);
     // Эфемерная, ни к кому не привязанная сессия — новая на каждый запрос.
     fd.append('sessionId', `anon_${randomUUID()}`);
 
