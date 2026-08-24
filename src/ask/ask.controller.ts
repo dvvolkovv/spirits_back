@@ -16,11 +16,13 @@ export class AskController {
 
   @Post()
   @UseGuards(JwtGuard)
-  async ask(@Body() body: { text?: string }) {
+  async ask(@Body() body: { text?: string; context?: string }) {
     const text = String(body?.text ?? '').trim();
     if (!text) return { ok: false, error: 'Пустой вопрос' };
+    // context — уже обезличенный на устройстве (Egress). Реле не трогает его и не подмешивает профиль.
+    const context = String(body?.context ?? '').trim();
     try {
-      const answer = await this.clean.ask(text);
+      const answer = await this.clean.ask(text, context);
       return { ok: true, answer };
     } catch (e: any) {
       return { ok: false, error: 'Не удалось получить ответ' };

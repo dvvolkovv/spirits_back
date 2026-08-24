@@ -25,15 +25,24 @@ export class CleanAskService {
     'бережно, без осуждения и морализаторства, честно и практично. Не запрашивай и не предполагай ' +
     'личных данных о собеседнике. Отвечай на русском языке.';
 
-  /** Чистый одноходовый запрос. Возвращает текст ответа; при сбое бросает (контроллер отдаст ошибку). */
-  async ask(text: string): Promise<string> {
+  /**
+   * Одноходовый запрос. `context` — УЖЕ обезличенный на устройстве контекст (Egress: без имён и
+   * прямых идентификаторов); бэкенд его НЕ перепроверяет и НЕ дополняет профилем — он слепое реле.
+   * Возвращает текст ответа; при сбое бросает (контроллер отдаст ошибку).
+   */
+  async ask(text: string, context?: string): Promise<string> {
     const q = (text || '').trim();
     if (!q) throw new Error('empty question');
+    const ctx = (context || '').trim();
 
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
     const FormData = require('form-data');
     const fd = new FormData();
-    fd.append('message', `${CleanAskService.SYSTEM}\n\n${q}`);
+    const ctxBlock = ctx
+      ? `\n\nОбезличенный контекст о собеседнике (без имён и личных данных — используй, чтобы ответ был ` +
+        `уместнее, но не пытайся вычислить, кто это):\n${ctx}`
+      : '';
+    fd.append('message', `${CleanAskService.SYSTEM}${ctxBlock}\n\nВопрос: ${q}`);
     // Эфемерная, ни к кому не привязанная сессия — новая на каждый запрос.
     fd.append('sessionId', `anon_${randomUUID()}`);
 
