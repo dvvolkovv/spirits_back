@@ -56,7 +56,11 @@ export function verifyInitData(raw: string, botToken: string): TgInitDataUser | 
   } catch {
     return null;
   }
-  if (typeof user?.id !== 'number' || !Number.isFinite(user.id)) return null;
+  // Telegram id — положительное целое. Number.isFinite пропускал бы 42.5 и
+  // отрицательные, а за пределами MAX_SAFE_INTEGER два разных id склеились бы
+  // в одно значение ещё на JSON.parse. Для поля, по которому потом ищут
+  // аккаунт, этого достаточно, чтобы завести чужой.
+  if (!Number.isSafeInteger(user?.id) || user.id <= 0) return null;
 
   return {
     tgUserId: user.id,

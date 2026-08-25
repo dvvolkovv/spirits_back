@@ -69,9 +69,21 @@ describe('verifyInitData — негативные случаи', () => {
     expect(verifyInitData(raw, BOT_TOKEN)).toBeNull();
   });
 
-  it('отвергает user с нечисловым id', () => {
-    const raw = signInitData(validFields({ user: JSON.stringify({ id: 'abc', first_name: 'X' }) }));
-    expect(verifyInitData(raw, BOT_TOKEN)).toBeNull();
+  it('отвергает hash неверной длины, а не падает', () => {
+    const raw = signInitData(validFields());
+    const short = raw.replace(/hash=[0-9a-f]+/, 'hash=abcd');
+    expect(() => verifyInitData(short, BOT_TOKEN)).not.toThrow();
+    expect(verifyInitData(short, BOT_TOKEN)).toBeNull();
+  });
+
+  it.each([
+    ['строку',              JSON.stringify({ id: 'abc', first_name: 'X' })],
+    ['дробное число',       JSON.stringify({ id: 42.5, first_name: 'X' })],
+    ['отрицательное',       JSON.stringify({ id: -42, first_name: 'X' })],
+    ['ноль',                JSON.stringify({ id: 0, first_name: 'X' })],
+    ['небезопасное целое',  JSON.stringify({ id: 9007199254740993, first_name: 'X' })],
+  ])('отвергает user с id: %s', (_label, user) => {
+    expect(verifyInitData(signInitData(validFields({ user })), BOT_TOKEN)).toBeNull();
   });
 });
 
