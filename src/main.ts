@@ -15,6 +15,10 @@ async function bootstrap() {
   // Путь указан целиком с префиксом: setGlobalPrefix ниже на app.use не влияет.
   app.use('/webhook/priem/callback', bodyParser.raw({ type: '*/*', limit: '1mb' }));
 
+  // Внутренние ручки голосового звонка — сырым телом, как и коллбэк «Приёма»:
+  // HMAC считается по пришедшим байтам, пересобранный JSON подпись не пройдёт.
+  app.use('/webhook/voice-call/internal', bodyParser.raw({ type: '*/*', limit: '1mb' }));
+
   app.use(bodyParser.json({ limit: '50mb', type: ['application/json', 'text/*'] }));
   app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
