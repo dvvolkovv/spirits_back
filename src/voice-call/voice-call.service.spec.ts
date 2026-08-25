@@ -7,8 +7,10 @@ function makeDeps(historyRows: any[] = []) {
     query: jest.fn(async (sql: string, params: any[] = []) => {
       if (/FROM custom_chat_history/i.test(sql)) return { rows: historyRows, rowCount: historyRows.length };
       if (/INSERT INTO custom_chat_history/i.test(sql)) { inserted.push(params); return { rows: [], rowCount: 1 }; }
+      // Проверка «нет ли уже живого звонка» — по умолчанию нет.
+      if (/SELECT id FROM voice_calls/i.test(sql)) return { rows: [], rowCount: 0 };
       if (/FROM voice_calls/i.test(sql)) {
-        return { rows: [{ id: 'call-1', user_id: 'u1', room_name: 'room-1', started_at: new Date(Date.now() - 60_000) }], rowCount: 1 };
+        return { rows: [{ id: 'call-1', user_id: 'u1', room_name: 'room-1', status: 'active', started_at: new Date(Date.now() - 60_000) }], rowCount: 1 };
       }
       return { rows: [], rowCount: 1 };
     }),
