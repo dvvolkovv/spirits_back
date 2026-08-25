@@ -11,6 +11,7 @@ import { EventsService } from '../events/events.service';
 import { TalerIdOauthService } from '../talerid/talerid-oauth.service';
 import { LanguageService, LANGUAGE_REPLY_LINE, DEFAULT_LANGUAGE } from '../common/services/language.service';
 import { BalanceContextService } from '../tokens/balance-context.service';
+import { BusinessProfileService } from '../business-profile/business-profile.service';
 import axios from 'axios';
 import { Request, Response } from 'express';
 import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
@@ -263,6 +264,7 @@ export class ChatService {
     @Optional() private readonly tasksService?: TasksService,
     @Optional() private readonly events?: EventsService,
     @Optional() private readonly talerIdOauth?: TalerIdOauthService,
+    @Optional() private readonly businessProfile?: BusinessProfileService,
   ) {}
 
   /**
@@ -522,6 +524,7 @@ export class ChatService {
         recentHistory, profileText, res,
         agent.name, agent.description || '', agent.system_prompt || '',
         req, fresh, chatSessionId, requestLang, clientTz, balanceBlock,
+        agent.category,
       );
     }
 
@@ -578,6 +581,15 @@ ${LanguageService.buildDirective(userLanguage)}`;
     let volatileSystemPrompt = (profileText && profileText.trim())
       ? `\n\n--- Профиль пользователя ---\n${profileText}`
       : '';
+    if (this.businessProfile) {
+      try {
+        // Маша — personal, получит строку-резюме, а не полную карточку.
+        const biz = await this.businessProfile.renderForPrompt(userId, agent.category);
+        if (biz) volatileSystemPrompt += `\n\n${biz}`;
+      } catch (e: any) {
+        this.logger.warn(`business profile injection failed (Маша): ${e?.message}`);
+      }
+    }
     // Cross-agent active tasks (см. TasksService.buildContextForPrompt).
     // fresh: чистый лист — прошлые задачи в промпт не тянем.
     if (this.tasksService && !fresh) {
@@ -818,6 +830,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // сюда приезжает строкой: пересобирать его здесь нельзя — отметка о
     // предупреждении встала бы дважды за ход.
     balanceBlock?: string,
+    // Категория агента (business/personal/assistant) — решает, какую версию
+    // карточки бизнеса вставлять ниже. См. BusinessProfileService.renderForPrompt.
+    agentCategory?: string | null,
   ): Promise<void> {
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
@@ -973,6 +988,16 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
     if (profileText && profileText.trim()) {
       contextPrefix += `User profile:\n${profileText}\n\n`;
+    }
+    // Бизнес-карточка: общее знание о деле пользователя для всех ассистентов.
+    // Полная у category='business', одна строка у остальных — решает сервис.
+    if (this.businessProfile) {
+      try {
+        const biz = await this.businessProfile.renderForPrompt(userId, agentCategory);
+        if (biz) contextPrefix += biz + '\n\n';
+      } catch (e: any) {
+        this.logger.warn(`business profile injection failed: ${e?.message}`);
+      }
     }
     // Активные задачи пользователя (cross-agent) — топ-5 по релевантности
     // к текущей реплике. Юзер видит ассистентов как продолжающих контекст
@@ -1639,6 +1664,14 @@ ${LanguageService.buildDirective(userLanguage)}`;
     }
     if (profileText && profileText.trim()) {
       prefix += `User profile:\n${profileText}\n\n`;
+    }
+    if (this.businessProfile) {
+      try {
+        const biz = await this.businessProfile.renderForPrompt(userId, agent.category);
+        if (biz) prefix += biz + '\n\n';
+      } catch (e: any) {
+        this.logger.warn(`business profile injection failed (agent reply): ${e?.message}`);
+      }
     }
     // Требование языка последней строкой — по той же причине, что в двух
     // других путях: директива в начале тонет под русской персоной и профилем.
