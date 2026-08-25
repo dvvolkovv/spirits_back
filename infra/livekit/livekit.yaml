@@ -1,0 +1,36 @@
+# LiveKit SFU для голосовых звонков Linkeon.
+# Применяется на прод-хосте как ~/livekit-dozvon/livekit.yaml — см. README.md рядом.
+#
+# Отличия от исходного конфига (16.04.2026):
+#   * udp_port вместо port_range — UDP mux. Без него каждый участник занимает
+#     2 UDP-порта, диапазон 50000-60000 упирается в ~2500 комнат «1+1» на ноду.
+#     Диапазон mux не меньше числа vCPU: один сокет — точка сериализации.
+#   * node_selector — на одной ноде ни на что не влияет, но когда появится
+#     вторая, дефолтный sort_by: random раскидывает комнаты вслепую и
+#     складывает их на одну ноду (задокументированное «стадное» поведение).
+port: 7880
+
+bind_addresses:
+  - ""
+
+rtc:
+  udp_port: 7882-7892
+  tcp_port: 7881
+  use_external_ip: true
+
+redis:
+  address: localhost:6380
+
+node_selector:
+  kind: any
+  sort_by: cpuload
+  algorithm: twochoice
+
+keys:
+  # Ключи в git не кладём. Реальный файл на хосте содержит секции keys:
+  # с парами <api-key>: <api-secret>. См. README.md, раздел «Ключи».
+  # Плейсхолдер оставлен, чтобы конфиг был валиден при локальной проверке.
+  devkey: devsecret_at_least_32_characters_long_x
+
+logging:
+  level: info
