@@ -32,11 +32,30 @@ describe('список переутверждаемых файлов схемы'
   // Ловит класс ошибки, а не конкретный файл: любой катаемый файл, который
   // трогает констрейнт провайдеров, обязан перечислить всех до единого.
   // Именно из-за дописывания «ещё одного» 002 и потерял apple.
+  //
+  // Ищем в самом CHECK-выражении, а не во всём тексте файла.
+  // Первая редакция теста грепала файл целиком и была зелёной даже с
+  // урезанным констрейнтом: имена провайдеров случайно упоминались в
+  // комментарии-шапке того же файла. Тест «проверял» комментарий.
   it.each(IDENTITY_MIGRATIONS)('%s перечисляет всех провайдеров, если трогает констрейнт', (file) => {
     const sql = fs.readFileSync(path.join(__dirname, 'migrations', file), 'utf8');
     if (!sql.includes('user_identities_provider_check')) return;
-    for (const p of ALL_PROVIDERS) {
-      expect(sql).toContain(`'${p}'`);
+
+    const clauses = sql
+      .replace(/--[^\n]*/g, '')
+      .split(/CHECK\s*\(\s*provider\s+IN\s*\(/i)
+      .slice(1)
+      .map((chunk) => chunk.split(')')[0]);
+
+    // Файл, объявляющий констрейнт, обязан содержать хотя бы одно
+    // CHECK-выражение — иначе регулярка молча ничего не нашла бы и тест
+    // прошёл бы на пустом месте.
+    expect(clauses.length).toBeGreaterThan(0);
+
+    for (const clause of clauses) {
+      for (const p of ALL_PROVIDERS) {
+        expect(clause).toContain(`'${p}'`);
+      }
     }
   });
 });
