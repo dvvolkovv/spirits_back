@@ -225,6 +225,11 @@ cli.runApp(
   new ServerOptions({
     agent: fileURLToPath(import.meta.url),
     agentName: 'linkeon-voice-host',
+    // Health-порт воркера. Дефолт SDK в production — 8081, а на прод-хосте его
+    // уже занимает nginx (10.10.0.1:8081): процесс падал с EADDRINUSE и уходил
+    // в цикл перезапусков pm2. Порт вынесен в env, чтобы не искать свободный
+    // заново на другом хосте.
+    port: Number(process.env.VOICE_HOST_PORT || 8137),
     // realtime-прокси нечего прогревать; дефолт min(cores,4) держит лишние
     // процессы впустую
     numIdleProcesses: 1,
