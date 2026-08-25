@@ -10,6 +10,17 @@ import { sendTelegramAlert } from '../common/telegram-alert';
 
 const RAYA_ID = '14';
 
+/**
+ * Стабильный ключ энерго-рутины. НЕ 'energy_of_day': по `daily:<assistantId>`
+ * app-widget.controller.ts проверяет, включена ли энергия дня (фикс 2026-08-23 —
+ * до него гейт смотрел на 'energy_of_day', которого не было ни у кого, и блок
+ * не отдавался ни разу). Любой другой ключ вернёт тот баг.
+ *
+ * Опознание идёт по нему, а не по заголовку: заголовок локализован, сравнение
+ * с русской строкой сломалось бы молча.
+ */
+const ENERGY_KIND = `daily:${RAYA_ID}`;
+
 @Injectable()
 export class RoutinePushService implements OnModuleInit {
   private readonly logger = new Logger(RoutinePushService.name);
@@ -41,9 +52,10 @@ export class RoutinePushService implements OnModuleInit {
 
   // ── Пресет «энергия дня» (быстрая кнопка на фронте) ──────────────────────────
   async ensureEnergyPreset(userId: string, tz?: string): Promise<RoutineRow> {
-    const existing = (await this.store.list(userId)).find((r) => r.assistantId === RAYA_ID && r.title === 'Энергия дня');
+    const existing = (await this.store.list(userId)).find((r) => r.kind === ENERGY_KIND);
     if (existing) return existing;
     return this.store.create(userId, {
+      kind: ENERGY_KIND,
       title: 'Энергия дня',
       assistantId: RAYA_ID,
       prompt: ENERGY_PROMPT,
@@ -55,7 +67,7 @@ export class RoutinePushService implements OnModuleInit {
   }
 
   // ── Доставка одной рутины ────────────────────────────────────────────────────
-  private async deliver(userId: string, assistantId: string, prompt: string, title?: string): Promise<number> {
+  private async deliver(userId: string, assistantId: string, prompt: string, title?: string, kind?: string): Promise<number> {
     const text = await this.chat.generateAgentReply(userId, assistantId, prompt);
     if (!text || !text.trim()) {
       this.logger.warn(`routine deliver: empty text for ${userId} / assistant ${assistantId}`);
@@ -69,7 +81,7 @@ export class RoutinePushService implements OnModuleInit {
     );
     const name = await this.assistantName(assistantId);
     const body = text.replace(/[#*_`>\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 130);
-    const isEnergy = assistantId === RAYA_ID && (title === 'Энергия дня' || !title);
+    const isEnergy = kind === ENERGY_KIND;
     return this.push.sendPush(userId, {
       title: isEnergy ? 'Энергия дня от Райи 🌅' : `${title || 'Напоминание'} · ${name} ✨`,
       body,
@@ -90,7 +102,7 @@ export class RoutinePushService implements OnModuleInit {
   async fireNow(userId: string, routineId: string): Promise<{ delivered: number } | null> {
     const r = await this.store.getById(userId, routineId);
     if (!r) return null;
-    const delivered = await this.deliver(userId, r.assistantId, r.prompt, r.title);
+    const delivered = await this.deliver(userId, r.assistantId, r.prompt, r.title, r.kind);
     return { delivered };
   }
 
@@ -111,7 +123,7 @@ export class RoutinePushService implements OnModuleInit {
         const today = this.store.localDate(r.tz, now);
         if (r.last_sent_date && this.store.toISO(r.last_sent_date) === today) continue;
         if (!(await this.store.claimToday(r.id, today))) continue;           // уже застолбили
-        const n = await this.deliver(r.user_id, r.assistant_id, r.prompt, r.title);
+        const n = await this.deliver(r.user_id, r.assistant_id, r.prompt, r.title, r.kind);
         fired++;
         this.logger.log(`routine "${r.title}" sent to ${r.user_id} (assistant ${r.assistant_id}, delivered=${n})`);
       } catch (e: any) {
