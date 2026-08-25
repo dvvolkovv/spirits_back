@@ -5,6 +5,25 @@ import { PgService } from '../common/services/pg.service';
 import { EventsService } from '../events/events.service';
 import type { Provider, ProviderData, Identity, ResolveResult } from './identity.types';
 
+/**
+ * Файлы схемы, переутверждаемые при каждом старте.
+ *
+ * Это НЕ история миграций: таблицы schema_migrations здесь нет, каждый файл
+ * идемпотентен и накатывается заново на каждом запуске. Поэтому в списке
+ * только актуальные утверждения, а не всё, что когда-либо писалось.
+ *
+ * 002_talerid_provider.sql сюда намеренно не входит. Он перезаписывает
+ * констрейнт провайдеров БЕЗ apple, и его целиком заменяет 003. До 25.08.2026
+ * загрузчик катал только 001 и выходил, поэтому 002 никогда не исполнялся —
+ * apple уцелел лишь потому, что 001 переутверждает констрейнт на каждом старте.
+ * Включить 002 в список означало бы впервые запустить заведомо устаревшее
+ * утверждение ради того, чтобы следующей строкой его откатить.
+ */
+export const IDENTITY_MIGRATIONS = [
+  '001_identity_init.sql',
+  '003_telegram_provider.sql',
+];
+
 @Injectable()
 export class IdentityService implements OnModuleInit {
   private readonly logger = new Logger(IdentityService.name);
@@ -17,8 +36,7 @@ export class IdentityService implements OnModuleInit {
 
   async onModuleInit() {
     if (!this.pg) return;
-    const files = ['001_identity_init.sql', '002_talerid_provider.sql', '003_telegram_provider.sql'];
-    for (const file of files) {
+    for (const file of IDENTITY_MIGRATIONS) {
       const candidates = [
         path.join(__dirname, 'migrations', file),
         path.join(__dirname, '..', '..', 'src', 'identity', 'migrations', file),
