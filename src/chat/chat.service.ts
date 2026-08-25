@@ -748,6 +748,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
         if (this.tasksService && !fresh) {
           try { await this.tasksService.extractFromTurn(userId, String(assistantId), message, fullText); } catch {}
         }
+        // Бизнес-карточка наполняется тем же поводом, что и задачи, но своим
+        // вызовом: у извлечения задач нет тестов, и подселять к нему вторую
+        // задачу — значит не заметить его просадку.
+        if (this.businessProfile && !fresh) {
+          try { await this.businessProfile.extractFromTurn(userId, String(assistantId), message, fullText); } catch {}
+        }
       } catch (e) {
         this.logger.error(`Post-chat save error: ${e.message}`);
       }
@@ -1193,6 +1199,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // Задачи из fresh-разговора не извлекаем — чистый лист без побочных задач.
           if (this.tasksService && !fresh) {
             try { await this.tasksService.extractFromTurn(userId, assistantId, message, fullText); } catch {}
+          }
+          if (this.businessProfile && !fresh) {
+            try { await this.businessProfile.extractFromTurn(userId, assistantId, message, fullText); } catch {}
           }
         }
       } catch (e: any) {
@@ -1732,6 +1741,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     }
     if (this.tasksService) {
       try { await this.tasksService.extractFromTurn(userId, agentId, userMessage, assistantResponse); } catch {}
+    }
+    if (this.businessProfile) {
+      try { await this.businessProfile.extractFromTurn(userId, agentId, userMessage, assistantResponse); } catch {}
     }
   }
 
