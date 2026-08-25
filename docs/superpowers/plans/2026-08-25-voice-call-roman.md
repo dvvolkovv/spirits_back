@@ -95,11 +95,15 @@ grep -n "SipClient\|createSipParticipant" src/dozvon/sip.service.ts
 
 - [ ] **Step 2: Убедиться, что на модуль никто не ссылается снаружи**
 
+Проверять надо **импорты**, а не вхождения слова: по слову `dozvon` найдутся комментарии в `admin.controller.ts` и сырой SQL к таблицам `dozvon_calls` / `dozvon_campaigns` в `admin.service.ts:1641` и `monitoring/product/content.service.ts`. Это не зависимости от модуля — таблицы мы оставляем, а запросы к ним обёрнуты в `try/catch` с graceful 0.
+
 Run:
 ```bash
-grep -rn "dozvon" --include="*.ts" src/ | grep -v "^src/dozvon/"
+grep -rnE "from ['\"].*dozvon" --include="*.ts" src/ | grep -v "^src/dozvon/"
 ```
-Expected: только строка импорта и строка в списке `imports` в `src/app.module.ts`. Если найдётся что-то ещё — остановиться и разобраться, не удалять вслепую.
+Expected: ровно одна строка — `src/app.module.ts:20`. Если найдётся что-то ещё — остановиться и разобраться, не удалять вслепую.
+
+Учти, что запись `DozvonModule,` в массиве `imports` (строка ~70) этим grep не ловится — снимать её всё равно надо, см. следующий шаг.
 
 - [ ] **Step 3: Удалить каталог и снять регистрацию модуля**
 
