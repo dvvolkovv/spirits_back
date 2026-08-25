@@ -87,10 +87,17 @@ export default defineAgent({
           question: z.string().describe('Вопрос целиком, со всем нужным контекстом'),
         }),
         execute: async ({ specialist, question }) => {
-          const r = await backend.ask(meta.callId, specialist, question);
-          return r.status === 'asked'
-            ? { status: 'asked', specialist }
-            : { status: 'rejected', reason: r.reason };
+          try {
+            const r = await backend.ask(meta.callId, specialist, question);
+            return r.status === 'asked'
+              ? { status: 'asked', specialist }
+              : { status: 'rejected', reason: r.reason };
+          } catch (e) {
+            // Модели нужен внятный ответ, а не исключение: иначе она либо
+            // замолчит, либо начнёт извиняться непонятно за что.
+            console.error('ask_specialist failed', e);
+            return { status: 'rejected', reason: 'backend_unavailable', specialist };
+          }
         },
       }),
       list_specialists: llm.tool({

@@ -6,6 +6,7 @@ import { VoiceCallInternalController } from './voice-call-internal.controller';
 import { VoiceCallService } from './voice-call.service';
 import { SpecialistJobService } from './specialist-job.service';
 import { LiveKitClient } from './livekit.client';
+import { VoiceCallReaperService } from './voice-call-reaper.service';
 
 /**
  * VOICE_CALLBACK_SECRET читается ТОЛЬКО во время запроса, в контроллере.
@@ -25,7 +26,7 @@ import { LiveKitClient } from './livekit.client';
 @Module({
   imports: [CommonModule, ChatModule],
   controllers: [VoiceCallController, VoiceCallInternalController],
-  providers: [VoiceCallService, SpecialistJobService, LiveKitClient],
+  providers: [VoiceCallService, SpecialistJobService, LiveKitClient, VoiceCallReaperService],
   exports: [VoiceCallService],
 })
 export class VoiceCallModule implements OnModuleInit {
