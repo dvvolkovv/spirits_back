@@ -12,7 +12,12 @@ function makePg() {
       }
       if (/UPDATE voice_call_jobs/i.test(sql)) {
         const j = jobs.find((x) => x.id === params[params.length - 1]);
-        if (j) j.status = /status\s*=\s*'done'|\$1/i.test(sql) ? 'done' : j.status;
+        // Статус берём из самого SQL. Раньше здесь была альтернатива
+        // /status\s*=\s*'done'|\$1/, и ветка `$1` матчилась на ЛЮБОЙ
+        // параметризованный запрос — переход в 'running' помечал job
+        // завершённым, из-за чего мок врал про число активных job.
+        const m = /SET\s+status\s*=\s*'(\w+)'/i.exec(sql);
+        if (j && m) j.status = m[1];
         return { rows: [], rowCount: 1 };
       }
       if (/SELECT count/i.test(sql)) {

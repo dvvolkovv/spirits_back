@@ -139,6 +139,10 @@ export class SpecialistJobService {
   private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const t = setTimeout(() => reject(new Error('timeout')), ms);
+      // Сторожевой таймер не должен сам по себе держать event loop живым:
+      // в сервере петлю держит HTTP-сервер, а в тестах три висящих job'а
+      // иначе заставляют jest ждать все 180 секунд и уходить в force exit.
+      t.unref?.();
       p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
     });
   }
