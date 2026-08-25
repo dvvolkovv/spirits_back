@@ -1254,7 +1254,7 @@ Expected: FAIL — модуль не найден.
 Create `src/voice-call/voice-call-internal.controller.ts`:
 
 ```typescript
-import { Body, Controller, Headers, Logger, Post, Req, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, Controller, Headers, Logger, Post, Req, UnauthorizedException } from '@nestjs/common';
 import { Request } from 'express';
 import { SpecialistJobService } from './specialist-job.service';
 import { VoiceCallService } from './voice-call.service';
@@ -1277,10 +1277,20 @@ export class VoiceCallInternalController {
     private readonly calls: VoiceCallService,
   ) {}
 
-  private assertSigned(signature: string, req: Request): void {
-    const raw = (req as any).rawBody?.toString('utf8') ?? JSON.stringify((req as any).body ?? {});
-    if (!verifyBody(process.env.VOICE_CALLBACK_SECRET as string, raw, signature)) {
+  /**
+   * Тело здесь — Buffer, а не разобранный объект: на этот путь в main.ts
+   * навешен сырой парсер. Проверяем подпись по байтам и разбираем сами.
+   */
+  private parseSigned<T>(req: Request, signature: string): T {
+    const raw: Buffer | string = (req as any).body;
+    const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw ?? '');
+    if (!verifyBody(process.env.VOICE_CALLBACK_SECRET as string, text, signature)) {
       throw new UnauthorizedException('bad signature');
+    }
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new BadRequestException('malformed json');
     }
   }
 
@@ -1288,9 +1298,8 @@ export class VoiceCallInternalController {
   async ask(
     @Headers('x-voice-signature') signature: string,
     @Req() req: Request,
-    @Body() body: { callId: string; specialist: string; question: string },
   ): Promise<AskResult> {
-    this.assertSigned(signature, req);
+    const body = this.parseSigned<{ callId: string; specialist: string; question: string }>(req, signature);
     const call = await this.calls.load(body.callId);
     return this.jobs.ask(body.callId, call.room_name, call.user_id, body.specialist, body.question);
   }
@@ -1299,9 +1308,8 @@ export class VoiceCallInternalController {
   async complete(
     @Headers('x-voice-signature') signature: string,
     @Req() req: Request,
-    @Body() body: { callId: string } & CompletePayload,
   ) {
-    this.assertSigned(signature, req);
+    const body = this.parseSigned<{ callId: string } & CompletePayload>(req, signature);
     await this.calls.complete(body.callId, { transcript: body.transcript, usage: body.usage });
     return { ok: true };
   }
@@ -1310,9 +1318,8 @@ export class VoiceCallInternalController {
   async failed(
     @Headers('x-voice-signature') signature: string,
     @Req() req: Request,
-    @Body() body: { callId: string; reason: string },
   ) {
-    this.assertSigned(signature, req);
+    const body = this.parseSigned<{ callId: string; reason: string }>(req, signature);
     await this.calls.fail(body.callId, body.reason);
     return { ok: true };
   }
@@ -1399,10 +1406,16 @@ export class VoiceCallModule implements OnModuleInit {
 
 - [ ] **Step 6: Включить сырое тело запроса и зарегистрировать модуль**
 
-В `src/main.ts` при создании приложения добавить `rawBody: true`, чтобы HMAC считался по тем самым байтам, что пришли:
+`rawBody: true` здесь **не сработает**: приложение создаётся как `NestFactory.create(AppModule, { bodyParser: false })`, парсеры навешиваются вручную, и опция Nest на них не влияет.
+
+В проекте уже есть решение ровно этой задачи — коллбэк «Приёма» ([main.ts:16](../../src/main.ts#L16), [priem.controller.ts:91](../../src/payments/priem.controller.ts#L91)). Повторяем его.
+
+В `src/main.ts`, рядом со строкой про `/webhook/priem/callback` и **обязательно до** глобального `bodyParser.json`:
 
 ```typescript
-const app = await NestFactory.create(AppModule, { rawBody: true });
+  // Внутренние ручки голосового звонка — сырым телом, как и коллбэк «Приёма»:
+  // HMAC считается по пришедшим байтам, пересобранный JSON подпись не пройдёт.
+  app.use('/webhook/voice-call/internal', bodyParser.raw({ type: '*/*', limit: '1mb' }));
 ```
 
 В `src/app.module.ts` добавить импорт и запись в `imports`:
