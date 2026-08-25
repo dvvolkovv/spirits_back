@@ -44,4 +44,15 @@ describe('business extraction prefilter', () => {
       'Долго думал что делать дальше и решил всё-таки посоветоваться, потому что у меня ИП',
     )).toBe(false);
   });
+
+  it('не принимает «ип» внутри другого слова за форму бизнеса', () => {
+    expect(shouldSkipBusinessExtraction('в принципе да, согласен с таким подходом')).toBe(true);
+    expect(shouldSkipBusinessExtraction('это типичная ситуация для нашей отрасли')).toBe(true);
+  });
+
+  it('ловит «ИП» как отдельное слово в любом регистре и позиции', () => {
+    expect(shouldSkipBusinessExtraction('у меня ИП')).toBe(false);
+    expect(shouldSkipBusinessExtraction('ип уже открыл в прошлом году')).toBe(false);
+    expect(shouldSkipBusinessExtraction('оформил ИП, что дальше?')).toBe(false);
+  });
 });
