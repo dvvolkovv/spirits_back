@@ -376,12 +376,18 @@ CREATE INDEX IF NOT EXISTS voice_call_jobs_call_status_idx
 
 - [ ] **Step 2: Проверить синтаксис на тест-ноде**
 
+Переменной `TEST_DATABASE_URL` на ноде нет. Реквизиты — в `.env` живого чекаута тестового стенда; читать оттуда можно, но **ветку в `~/spirits_back` не переключать**, это работающий стенд `test.linkeon.io`. База — `linkeon`, PostgreSQL 16.14.
+
 Run:
 ```bash
 scp src/voice-call/migrations/001_voice_calls.sql dv@85.192.61.231:/tmp/
-ssh dv@85.192.61.231 'psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f /tmp/001_voice_calls.sql && psql "$TEST_DATABASE_URL" -c "\d voice_calls"'
+ssh dv@85.192.61.231 'set -a; . ~/spirits_back/.env; set +a; \
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /tmp/001_voice_calls.sql && \
+  psql "$DATABASE_URL" -c "\d voice_calls" && psql "$DATABASE_URL" -c "\d voice_call_jobs"'
 ```
-Expected: `CREATE TABLE` без ошибок, `\d` показывает 13 колонок.
+Expected: `CREATE TABLE` без ошибок, `\d voice_calls` показывает 13 колонок, `\d voice_call_jobs` — 9.
+
+Миграция идемпотентна (`IF NOT EXISTS`), повторный прогон безопасен. **На прод сейчас не накатывать** — это шаг задачи 14.
 
 - [ ] **Step 3: Commit**
 
