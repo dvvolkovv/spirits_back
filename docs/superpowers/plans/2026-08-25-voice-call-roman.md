@@ -2232,26 +2232,33 @@ VOICE_AGENT_NAME=linkeon-voice-host
 
 Ключ `voicecall*` добавить в секцию `keys:` файла `~/livekit-dozvon/livekit.yaml` и перезапустить контейнер по процедуре из `infra/livekit/README.md`.
 
-- [ ] **Step 2: Проброс WSS через nginx**
+- [x] **Step 2: Проброс WSS через nginx — НЕ ТРЕБУЕТСЯ**
 
-Браузер не ходит на `ws://localhost:7880` — нужен TLS-вход. В конфиг nginx прода (единый файл `spirits`, **не** класть бэкап рядом в `sites-enabled` — `nginx -t` упадёт на duplicate default server) добавить:
+Проверено 25.08.2026: в конфиге `spirits` уже есть рабочий проброс, заведённый
+когда-то под dozvon и переживший удаление модуля:
 
 ```nginx
-location /livekit {
-    proxy_pass http://127.0.0.1:7880;
+location /livekit-dozvon/ {
+    proxy_pass http://127.0.0.1:7880/;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host;
-    proxy_read_timeout 3700s;
+    proxy_read_timeout 86400;
 }
 ```
 
-Run:
-```bash
-ssh dvolkov@212.113.106.202 'sudo nginx -t && sudo systemctl reload nginx'
-```
-Expected: `syntax is ok`, `test is successful`.
+Снаружи отвечает: `https://my.linkeon.io/livekit-dozvon/` → `200 OK`,
+`/livekit-dozvon/rtc/validate` → `401` (LiveKit требует токен — значит проброс
+доходит до него). `proxy_read_timeout 86400` с большим запасом на часовой звонок.
+
+Поэтому nginx не трогаем вообще, а в `.env` ставим существующий путь:
+`LIVEKIT_WS_URL=wss://my.linkeon.io/livekit-dozvon`. Имя пути историческое и
+к удалённому модулю отношения больше не имеет — переименование потребовало бы
+правки прод-nginx ради косметики.
+
+**Файрвол:** `ufw` неактивен, DROP-правил по UDP в iptables нет — медиа-диапазон
+50000–60000 не заблокирован. Отсутствие слушающих UDP-сокетов в простое нормально:
+в режиме port-range LiveKit выделяет порт под соединение.
 
 - [ ] **Step 3: Добавить воркер в деплой**
 
