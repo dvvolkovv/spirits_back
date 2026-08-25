@@ -199,7 +199,8 @@ rollback_backend() {
         || { tail -20 /tmp/vh-install.log; echo 'voice-host: npm ci FAILED'; exit 1; }
       npm run build > /tmp/vh-build.log 2>&1 \
         || { tail -20 /tmp/vh-build.log; echo 'voice-host: build FAILED'; exit 1; }
-      pm2 startOrReload ecosystem.config.js 2>&1 | tail -2
+      pm2 startOrReload ecosystem.config.cjs > /tmp/vh-pm2.log 2>&1 \
+        || { tail -20 /tmp/vh-pm2.log; echo 'voice-host: pm2 startOrReload FAILED'; exit 1; }
       cd ..
     fi
   " && green "  ↩ backend rolled back ($ENV_NAME)" \
@@ -409,7 +410,8 @@ deploy_backend() {
         || { tail -20 /tmp/vh-install.log; echo 'voice-host: npm ci FAILED'; exit 1; }
       npm run build > /tmp/vh-build.log 2>&1 \
         || { tail -20 /tmp/vh-build.log; echo 'voice-host: build FAILED'; exit 1; }
-      pm2 startOrReload ecosystem.config.js 2>&1 | tail -2
+      pm2 startOrReload ecosystem.config.cjs > /tmp/vh-pm2.log 2>&1 \
+        || { tail -20 /tmp/vh-pm2.log; echo 'voice-host: pm2 startOrReload FAILED'; exit 1; }
       cd ..
     fi
   " || { red "  backend deploy failed ($ENV_NAME)"; exit 1; }

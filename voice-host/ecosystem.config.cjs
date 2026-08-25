@@ -1,4 +1,8 @@
 // voice-host/ecosystem.config.js — PM2 config for linkeon-voice-host
+// Расширение .cjs обязательно: в package.json подпроекта стоит "type":"module"
+// (агент — ESM), поэтому .js-файл здесь читается как ESM, module.exports в нём
+// не существует, и pm2 падает на require с трейсом, который легко принять за
+// чужую ошибку. Проверено на проде 25.08.2026.
 module.exports = {
   apps: [
     {
