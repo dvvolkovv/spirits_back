@@ -10,7 +10,12 @@ describe('VoiceCallInternalController: доступ', () => {
 
   function makeCtl() {
     const jobs = { ask: jest.fn(async () => ({ status: 'asked', jobId: 'j1', specialist: 'Алексей' })) };
-    const calls = { load: jest.fn(async () => ({ id: 'call-1', user_id: 'u1', room_name: 'room-1' })), complete: jest.fn(), fail: jest.fn() };
+    const calls = {
+      load: jest.fn(async () => ({ id: 'call-1', user_id: 'u1', room_name: 'room-1', status: 'active' })),
+      isActive: jest.fn((c: { status: string }) => c.status === 'dialing' || c.status === 'active'),
+      complete: jest.fn(),
+      fail: jest.fn(),
+    };
     return { ctl: new VoiceCallInternalController(jobs as any, calls as any), jobs, calls };
   }
 
@@ -63,5 +68,13 @@ describe('VoiceCallInternalController: доступ', () => {
     process.env.VOICE_CALLBACK_SECRET = 'appeared-later';
     const res = await ctl.ask(signBody('appeared-later', raw), req(raw));
     expect(res).toMatchObject({ status: 'asked' });
+  });
+
+  it('вопрос по завершённому звонку отклоняется, к Claude не идём', async () => {
+    const { ctl, jobs, calls } = makeCtl();
+    calls.load = jest.fn(async () => ({ id: 'call-1', user_id: 'u1', room_name: 'room-1', status: 'completed' })) as any;
+    const res = await ctl.ask(signBody(SECRET, raw), req(raw));
+    expect(res).toMatchObject({ status: 'rejected' });
+    expect(jobs.ask).not.toHaveBeenCalled();
   });
 });
