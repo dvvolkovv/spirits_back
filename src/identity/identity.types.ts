@@ -1,4 +1,4 @@
-export type Provider = 'phone' | 'email' | 'google' | 'yandex' | 'talerid' | 'apple';
+export type Provider = 'phone' | 'email' | 'google' | 'yandex' | 'talerid' | 'apple' | 'telegram';
 
 export interface PhoneData   { phone: string }
 export interface EmailData   { email: string }
@@ -9,6 +9,10 @@ export interface TaleridData { sub: string; email: string; emailVerified: boolea
 // скрыть почту, и тогда приходит либо подставной адрес @privaterelay.appleid.com,
 // либо ничего. Опознаём по sub.
 export interface AppleData   { sub: string; email: string; emailVerified: boolean }
+// Telegram отдаёт только числовой id внутри подписанного initData —
+// ни почты, ни подтверждённого адреса. Поэтому слияние по email для него
+// отключено в extractEmail.
+export interface TelegramData { sub: string }
 
 export type ProviderData<P extends Provider> =
   P extends 'phone'   ? PhoneData :
@@ -16,7 +20,8 @@ export type ProviderData<P extends Provider> =
   P extends 'google'  ? GoogleData :
   P extends 'yandex'  ? YandexData :
   P extends 'talerid' ? TaleridData :
-  P extends 'apple'   ? AppleData : never;
+  P extends 'apple'    ? AppleData :
+  P extends 'telegram' ? TelegramData : never;
 
 export interface Identity {
   id: string;
