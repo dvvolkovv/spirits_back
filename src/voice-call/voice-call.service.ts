@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { ChatService } from '../chat/chat.service';
@@ -51,6 +51,18 @@ export class VoiceCallService {
   }
 
   async start(userId: string): Promise<{ callId: string; roomName: string; token: string; wsUrl: string }> {
+    // Один активный звонок на пользователя. Минута разговора стоит реальных
+    // денег, а без этой проверки N вкладок (или цикл curl с админским
+    // токеном) дают N комнат и N оплачиваемых Realtime-сессий, погасить
+    // которые нечем. Индекс voice_calls_active_idx заведён ровно под неё.
+    const active = await this.pg.query(
+      `SELECT id FROM voice_calls WHERE user_id = $1 AND status IN ('dialing','active') LIMIT 1`,
+      [userId],
+    );
+    if (active.rows[0]) {
+      throw new ConflictException({ message: 'call already in progress', callId: active.rows[0].id });
+    }
+
     const callId = randomUUID();
     const roomName = `voice_${callId}`;
 
@@ -81,6 +93,13 @@ export class VoiceCallService {
 
   async complete(callId: string, payload: CompletePayload): Promise<void> {
     const call = await this.load(callId);
+    // Идемпотентность: воркер может ретрайнуть, а подписанный запрос —
+    // прийти дважды. Без этой проверки получаем вторую карточку в ленте
+    // и вторую строку учёта на тот же звонок.
+    if (call.status === 'completed') {
+      this.logger.warn(`[complete] call=${callId} уже завершён — повтор проигнорирован`);
+      return;
+    }
     const durationSec = Math.max(0, Math.round((Date.now() - new Date(call.started_at).getTime()) / 1000));
     const cost = this.costUsd(payload.usage.audioInputTokens, payload.usage.audioOutputTokens);
 
@@ -102,10 +121,17 @@ export class VoiceCallService {
       [`${call.user_id}_${HOST_AGENT_ID}`, HOST_AGENT_ID, content],
     );
 
-    // Учитываем, но не списываем: тариф назначать пока не из чего.
+    // Учитываем, но НЕ списываем: тариф назначать пока не из чего.
+    //
+    // Статус обязан быть 'completed', а не 'pending'. TokenAccountingService
+    // раз в 5 секунд забирает все 'pending' и при tokens_to_consume = 0 не
+    // пропускает строку, а считает сумму сам — фолбэк
+    // `input_tokens + output_tokens` (token-accounting.service.ts:74-76).
+    // Со 'pending' с баланса уходило бы 1800 токенов за минуту разговора.
+    // Тот же приём с тем же обоснованием — в claude-agent.service.ts:231.
     await this.pg.query(
-      `INSERT INTO token_consumption_tasks (execution_id, user_id, status, agent_id, input_tokens, output_tokens, tokens_to_consume, metadata)
-       VALUES ($1, $2, 'pending', $3, $4, $5, 0, $6)`,
+      `INSERT INTO token_consumption_tasks (execution_id, user_id, status, agent_id, input_tokens, output_tokens, tokens_to_consume, metadata, completed_at)
+       VALUES ($1, $2, 'completed', $3, $4, $5, 0, $6, now())`,
       [
         Math.floor(Math.random() * 2_000_000_000), call.user_id, HOST_AGENT_ID,
         payload.usage.audioInputTokens, payload.usage.audioOutputTokens,
@@ -123,11 +149,24 @@ export class VoiceCallService {
     );
   }
 
+  /**
+   * Положить трубку. Красить строку в БД недостаточно: воркер остаётся в
+   * комнате один и продолжает жечь Realtime-сессию. Комнату надо закрыть —
+   * тогда воркер получит disconnect и отправит complete.
+   */
   async markInterrupted(callId: string): Promise<void> {
-    await this.pg.query(
-      `UPDATE voice_calls SET status = 'interrupted', ended_at = now() WHERE id = $1 AND status IN ('dialing','active')`,
+    const res = await this.pg.query(
+      `UPDATE voice_calls SET status = 'interrupted', ended_at = now()
+       WHERE id = $1 AND status IN ('dialing','active') RETURNING room_name`,
       [callId],
     );
+    const roomName = res.rows[0]?.room_name;
+    if (roomName) await this.livekit.closeRoom(roomName);
+  }
+
+  /** Живой ли звонок — job'ы по завершённому создавать незачем. */
+  isActive(call: { status: string }): boolean {
+    return call.status === 'dialing' || call.status === 'active';
   }
 
   async load(callId: string): Promise<any> {

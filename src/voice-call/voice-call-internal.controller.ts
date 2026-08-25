@@ -53,6 +53,12 @@ export class VoiceCallInternalController {
   ): Promise<AskResult> {
     const body = this.parseSigned<{ callId: string; specialist: string; question: string }>(req, signature);
     const call = await this.calls.load(body.callId);
+    // Звонок уже завершён/оборван — поход к Claude был бы оплачен впустую,
+    // а ответ ушёл бы в несуществующую комнату.
+    if (!this.calls.isActive(call)) {
+      this.logger.warn(`[ask] call=${body.callId} не активен (${call.status})`);
+      return { status: 'rejected', reason: 'unknown_specialist' };
+    }
     return this.jobs.ask(body.callId, call.room_name, call.user_id, body.specialist, body.question);
   }
 
