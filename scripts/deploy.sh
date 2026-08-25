@@ -187,6 +187,15 @@ rollback_backend() {
       pm2 restart linkeon-smm-worker 2>&1 | tail -2
       cd ..
     fi
+    # Голосовой воркер: свой package.json и своя сборка, как у SMM-воркера.
+    # Без этого блока правки voice-host/* не доезжают до живого процесса.
+    if [ -d voice-host ]; then
+      cd voice-host
+      npm ci --no-audit --no-fund 2>&1 | tail -3
+      npm run build 2>&1 | tail -3
+      pm2 startOrReload ecosystem.config.js 2>&1 | tail -2
+      cd ..
+    fi
   " && green "  ↩ backend rolled back ($ENV_NAME)" \
     || { red "  ✗ ROLLBACK BACKEND FAILED — $ENV_NAME needs manual intervention"; return 1; }
 }
@@ -298,6 +307,33 @@ warm_chat_path() {
 #
 # Если эндпоинта нет (бэкенд старее этой правки) — не блокируем деплой, иначе
 # первый же выкат самой правки стал бы невозможен.
+# Голосовые звонки — та же логика, что и для чат-стримов, но своя причина:
+# рестарт linkeon-api рвёт мост job'ов (ask → Claude → data-сообщение в комнату),
+# и ответ специалиста не приходит молча. Плюс воркер voice-host держит живую
+# Realtime-сессию, которая тарифицируется.
+#
+# Окно короче, чем у стримов: наш собственный потолок звонка — час, а реапер
+# добивает зависшие через 70 минут.
+wait_for_calls_drain() {
+  local max_wait="${CALL_DRAIN_SECONDS:-900}"
+  local step=15
+  local waited=0
+  local n
+  while (( waited < max_wait )); do
+    n=$(curl -s --max-time 10 ${BASIC_AUTH:+-u "$BASIC_AUTH"} \
+          "${BASE_URL}/webhook/voice-call-status/active" \
+        | sed -n 's/.*"active"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+    # Эндпоинта нет (бэкенд старее этой правки) — не блокируем первый же выкат.
+    if [[ -z "$n" ]]; then return 0; fi
+    if [[ "$n" == "0" ]]; then return 0; fi
+    bold "  ⏳ $ENV_NAME: голосовых звонков в эфире $n — жду (${waited}/${max_wait}s)"
+    sleep $step
+    waited=$((waited + step))
+  done
+  red "  ⚠ $ENV_NAME: звонки не завершились за ${max_wait}с — иду дальше"
+  return 0
+}
+
 wait_for_streams_drain() {
   local max_wait="${STREAM_DRAIN_SECONDS:-1800}"
   local step=15
@@ -334,6 +370,7 @@ deploy_backend() {
   else
     bold "[back 1.5/3] ожидание завершения живых чат-ходов ($ENV_NAME)"
     wait_for_streams_drain || exit 1
+    wait_for_calls_drain || exit 1
   fi
 
   bold "[back 2/3] pulling on $ENV_NAME + building + restarting"
@@ -352,6 +389,15 @@ deploy_backend() {
       npm ci --no-audit --no-fund 2>&1 | tail -3
       npm run build 2>&1 | tail -3
       pm2 restart linkeon-smm-worker 2>&1 | tail -2
+      cd ..
+    fi
+    # Голосовой воркер: свой package.json и своя сборка, как у SMM-воркера.
+    # Без этого блока правки voice-host/* не доезжают до живого процесса.
+    if [ -d voice-host ]; then
+      cd voice-host
+      npm ci --no-audit --no-fund 2>&1 | tail -3
+      npm run build 2>&1 | tail -3
+      pm2 startOrReload ecosystem.config.js 2>&1 | tail -2
       cd ..
     fi
   " || { red "  backend deploy failed ($ENV_NAME)"; exit 1; }

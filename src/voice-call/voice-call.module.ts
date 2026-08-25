@@ -3,6 +3,7 @@ import { CommonModule } from '../common/common.module';
 import { ChatModule } from '../chat/chat.module';
 import { VoiceCallController } from './voice-call.controller';
 import { VoiceCallInternalController } from './voice-call-internal.controller';
+import { VoiceCallStatusController } from './voice-call-status.controller';
 import { VoiceCallService } from './voice-call.service';
 import { SpecialistJobService } from './specialist-job.service';
 import { LiveKitClient } from './livekit.client';
@@ -25,7 +26,7 @@ import { VoiceCallReaperService } from './voice-call-reaper.service';
  */
 @Module({
   imports: [CommonModule, ChatModule],
-  controllers: [VoiceCallController, VoiceCallInternalController],
+  controllers: [VoiceCallController, VoiceCallInternalController, VoiceCallStatusController],
   providers: [VoiceCallService, SpecialistJobService, LiveKitClient, VoiceCallReaperService],
   exports: [VoiceCallService],
 })
