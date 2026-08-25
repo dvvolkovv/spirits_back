@@ -21,7 +21,7 @@ function ratesFor(model: string | undefined): { in: number; out: number } {
 }
 
 const PREAMBLE_MSG_LIMIT = 20;
-const PREAMBLE_CHAR_LIMIT = 4000;
+const PREAMBLE_CHAR_LIMIT = 1800;
 
 @Injectable()
 export class VoiceCallService {
@@ -35,8 +35,16 @@ export class VoiceCallService {
 
   /**
    * Контекст, с которым Роман входит в разговор: последние сообщения из чата
-   * с ним же. Если их много — сжимаем, иначе съедим контекст Realtime-сессии,
-   * а он и без того переотправляется на каждый ход.
+   * с ним же.
+   *
+   * Собирается ТОЛЬКО из базы, без похода в LLM. Раньше при истории длиннее
+   * 4000 символов здесь вызывался generateAgentReply за сжатием — и, поскольку
+   * preamble считается до dispatchAgent, пользователь сорок секунд слушал
+   * тишину, прежде чем Роман вообще входил в комнату. У реального юзера в
+   * последних 20 сообщениях оказалось 22 000 символов, так что срабатывало
+   * это всегда. Живой звонок 25.08.2026.
+   *
+   * Берём с конца, пока укладываемся в бюджет: свежие реплики важнее старых.
    */
   async buildPreamble(userId: string): Promise<string> {
     const res = await this.pg.query(
@@ -44,21 +52,20 @@ export class VoiceCallService {
        WHERE session_id = $1 ORDER BY created_at DESC LIMIT $2`,
       [`${userId}_${HOST_AGENT_ID}`, PREAMBLE_MSG_LIMIT],
     );
-    const rows = [...res.rows].reverse();
-    if (!rows.length) return '';
+    if (!res.rows.length) return '';
 
-    const flat = rows
-      .map((r: any) => `${r.sender_type === 'human' ? 'Пользователь' : 'Роман'}: ${r.content}`)
-      .join('\n');
-    if (flat.length <= PREAMBLE_CHAR_LIMIT) return flat;
-
-    const prompt =
-      `Сожми переписку в один абзац до 1500 символов: о чём говорили, что решили, ` +
-      `что осталось открытым. Только сам абзац, без вступлений.\n\n${flat}`;
-    const short = await this.chat.generateAgentReply(
-      userId, String(HOST_AGENT_ID), prompt, `voice_preamble_${randomUUID()}`,
-    );
-    return (short || '').trim().slice(0, 1500);
+    const lines: string[] = [];
+    let budget = PREAMBLE_CHAR_LIMIT;
+    for (const r of res.rows) {
+      const who = r.sender_type === 'human' ? 'Пользователь' : 'Роман';
+      const text = String(r.content || '').replace(/\s+/g, ' ').trim();
+      if (!text) continue;
+      const line = `${who}: ${text.length > 400 ? text.slice(0, 400) + '…' : text}`;
+      if (line.length > budget) break;
+      budget -= line.length;
+      lines.push(line);
+    }
+    return lines.reverse().join('\n');
   }
 
   async start(userId: string): Promise<{ callId: string; roomName: string; token: string; wsUrl: string }> {
