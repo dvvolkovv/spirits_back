@@ -1,9 +1,18 @@
 import { BusinessProfileService } from './business-profile.service';
 
-function make(opts: { claudeReply?: string; profile?: any } = {}) {
+/**
+ * category по умолчанию — 'business': большинство существующих тестов в этом
+ * файле не про гейт по категории, и без дефолта они бы сломались о новую
+ * проверку. Явный category передают только тесты, которые её и проверяют.
+ */
+function make(opts: { claudeReply?: string; profile?: any; category?: string | null } = {}) {
   const state: any = { business: opts.profile || {} };
+  const category = opts.category === undefined ? 'business' : opts.category;
   const pg = {
     query: jest.fn(async (sql: string, params: any[]) => {
+      if (/FROM agents/i.test(sql)) {
+        return { rows: category === null ? [] : [{ category }] };
+      }
       if (/SELECT/i.test(sql)) return { rows: [{ profile_data: { business: state.business } }] };
       state.business = JSON.parse(params[0]);
       return { rows: [], rowCount: 1 };
@@ -68,5 +77,43 @@ describe('extractFromTurn', () => {
     await svc.extractFromTurn('u1', '10', 'у нас УСН вроде', 'Уточню');
 
     expect(state.business.tax_mode.value).toBe('usn_d');
+  });
+
+  describe('гейт по category агента', () => {
+    it('не зовёт LLM, когда агент не business (например personal)', async () => {
+      const { svc, claudeCli } = make({ category: 'personal' });
+
+      await svc.extractFromTurn('u1', '10', 'у меня ИП на УСН доходы, команда 4 человека', 'Понял');
+
+      expect(claudeCli.text).not.toHaveBeenCalled();
+    });
+
+    it('не зовёт LLM для кастомного ассистента (agentId вида custom:<uuid>)', async () => {
+      const { svc, claudeCli, pg } = make();
+
+      await svc.extractFromTurn('u1', 'custom:6f1e2a-uuid', 'у меня ИП на УСН доходы, команда 4 человека', 'Понял');
+
+      expect(claudeCli.text).not.toHaveBeenCalled();
+      // нечисловой id — не идём в базу за категорией вообще, это не "выборка вернула
+      // пусто", а осознанный ранний выход по одной только форме agentId.
+      const agentsQueries = pg.query.mock.calls.filter(([sql]: [string]) => /FROM agents/i.test(sql));
+      expect(agentsQueries).toHaveLength(0);
+    });
+
+    it('зовёт LLM, когда агент business', async () => {
+      const { svc, claudeCli } = make({ category: 'business', claudeReply: '{"fields":{"legal_form":"ip"}}' });
+
+      await svc.extractFromTurn('u1', '10', 'у меня ИП на УСН доходы, команда 4 человека', 'Понял');
+
+      expect(claudeCli.text).toHaveBeenCalled();
+    });
+
+    it('проверка категории идёт ПОСЛЕ префильтра: на срезанной реплике запроса к базе нет вообще', async () => {
+      const { svc, pg } = make({ category: 'business' });
+
+      await svc.extractFromTurn('u1', '10', 'спасибо, всё понятно', 'Пожалуйста!');
+
+      expect(pg.query).not.toHaveBeenCalled();
+    });
   });
 });

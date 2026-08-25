@@ -153,7 +153,17 @@ export class BusinessProfileService {
     assistantMessage: string,
   ): Promise<void> {
     if (!this.pg || !this.claudeCli) return;
+    // Порядок намеренный, от дешёвого к дорогому: локальный префильтр (бесплатно)
+    // → категория агента (один SELECT, но только если реплика вообще похожа на
+    // бизнес) → missingFields (ещё один SELECT) → LLM-вызов (самое дорогое).
     if (shouldSkipBusinessExtraction(userMessage)) return;
+
+    // Спека требует category='business'; мест вызова уже четыре (три в
+    // chat.service.ts + SMM-путь Юли), и одно из них однажды уже забыли
+    // прогейтить. Проверка внутри сервиса работает для всех вызовов, включая
+    // будущие, — её нельзя пропустить по невнимательности на месте вызова.
+    const category = await this.categoryFor(agentId);
+    if (category !== 'business') return;
 
     try {
       const missing = await this.missingFields(userId);
@@ -167,6 +177,28 @@ export class BusinessProfileService {
       await this.merge(userId, fields, 'assistant');
     } catch (e: any) {
       this.logger.warn(`business extractFromTurn failed for ${userId}/${agentId}: ${e?.message}`);
+    }
+  }
+
+  /**
+   * Категория агента по agentId, или null если определить нельзя.
+   *
+   * agentId у кастомных ассистентов приходит как `custom:<uuid>` — они не
+   * строка агентов в таблице `agents` и никогда не business, но это не повод
+   * ходить в базу: нечисловой id разбираем локально и выходим сразу же.
+   */
+  private async categoryFor(agentId: string): Promise<string | null> {
+    if (!/^\d+$/.test(agentId)) return null;
+    if (!this.pg) return null;
+    try {
+      const res = await this.pg.query(
+        `SELECT category FROM agents WHERE id = $1`,
+        [parseInt(agentId, 10)],
+      );
+      return res.rows[0]?.category ?? null;
+    } catch (e: any) {
+      this.logger.warn(`categoryFor(${agentId}) failed: ${e?.message}`);
+      return null;
     }
   }
 
