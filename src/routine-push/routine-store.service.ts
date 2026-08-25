@@ -16,6 +16,7 @@ export const MAX_ROUTINES_PER_USER = 12;
 export interface RoutineRow {
   id: string;
   userId: string;
+  kind: string;              // 'energy_of_day' | 'custom' — стабильный ключ, НЕ показывается пользователю
   title: string;
   assistantId: string;
   prompt: string;
@@ -65,6 +66,7 @@ export class RoutineStore {
     return {
       id: row.id,
       userId: row.user_id,
+      kind: row.kind || 'custom',
       title: row.title || 'Напоминание',
       assistantId: row.assistant_id,
       prompt: row.prompt,
@@ -77,7 +79,7 @@ export class RoutineStore {
   }
 
   private readonly COLS =
-    'id, user_id, title, assistant_id, prompt, send_hour, tz, days, enabled, last_sent_date';
+    'id, user_id, kind, title, assistant_id, prompt, send_hour, tz, days, enabled, last_sent_date';
 
   // ── Нормализация входа ───────────────────────────────────────────────────────
   private clampHour(h: any): number {
@@ -140,7 +142,7 @@ export class RoutineStore {
 
   async create(
     userId: string,
-    data: { title: string; assistantId: string; prompt: string; sendHour?: number; tz?: string; days?: any; enabled?: boolean },
+    data: { title: string; assistantId: string; prompt: string; kind?: string; sendHour?: number; tz?: string; days?: any; enabled?: boolean },
   ): Promise<RoutineRow> {
     if ((await this.count(userId)) >= MAX_ROUTINES_PER_USER) {
       throw new Error(`limit reached: не больше ${MAX_ROUTINES_PER_USER} рутин`);
@@ -153,9 +155,9 @@ export class RoutineStore {
     const lastSent = this.computeLastSent(enabled, hour, tz, days, now);
     const r = await this.pg.query(
       `INSERT INTO routine_pushes (user_id, kind, title, assistant_id, prompt, send_hour, tz, days, enabled, last_sent_date)
-       VALUES ($1, 'custom', $2, $3, $4, $5, $6, $7, $8, $9)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING ${this.COLS}`,
-      [userId, (data.title || 'Напоминание').slice(0, 80), String(data.assistantId), data.prompt, hour, tz, days, enabled, lastSent],
+      [userId, data.kind || 'custom', (data.title || 'Напоминание').slice(0, 80), String(data.assistantId), data.prompt, hour, tz, days, enabled, lastSent],
     );
     return this.map(r.rows[0]);
   }
@@ -194,9 +196,9 @@ export class RoutineStore {
   }
 
   // ── Крон ─────────────────────────────────────────────────────────────────────
-  async listEnabled(): Promise<Array<{ id: string; user_id: string; title: string; assistant_id: string; prompt: string; send_hour: number; tz: string; days: number[] | null; last_sent_date: any }>> {
+  async listEnabled(): Promise<Array<{ id: string; user_id: string; kind: string; title: string; assistant_id: string; prompt: string; send_hour: number; tz: string; days: number[] | null; last_sent_date: any }>> {
     const r = await this.pg.query(
-      `SELECT id, user_id, title, assistant_id, prompt, send_hour, tz, days, last_sent_date
+      `SELECT id, user_id, kind, title, assistant_id, prompt, send_hour, tz, days, last_sent_date
          FROM routine_pushes WHERE enabled = true`,
     );
     return r.rows.map((row: any) => ({ ...row, days: Array.isArray(row.days) ? row.days.map((n: any) => Number(n)) : null }));
