@@ -189,10 +189,16 @@ rollback_backend() {
     fi
     # Голосовой воркер: свой package.json и своя сборка, как у SMM-воркера.
     # Без этого блока правки voice-host/* не доезжают до живого процесса.
+    # Статус проверяем явно, а не через '| tail': в этом блоке действует
+    # set -e БЕЗ pipefail, поэтому статус берётся от tail и всегда нулевой —
+    # падение сборки проглатывается молча. Первый прогон 25.08.2026 так и
+    # прошёл «зелёным» с несобравшимся воркером.
     if [ -d voice-host ]; then
       cd voice-host
-      npm ci --no-audit --no-fund 2>&1 | tail -3
-      npm run build 2>&1 | tail -3
+      npm ci --no-audit --no-fund > /tmp/vh-install.log 2>&1 \
+        || { tail -20 /tmp/vh-install.log; echo 'voice-host: npm ci FAILED'; exit 1; }
+      npm run build > /tmp/vh-build.log 2>&1 \
+        || { tail -20 /tmp/vh-build.log; echo 'voice-host: build FAILED'; exit 1; }
       pm2 startOrReload ecosystem.config.js 2>&1 | tail -2
       cd ..
     fi
@@ -393,10 +399,16 @@ deploy_backend() {
     fi
     # Голосовой воркер: свой package.json и своя сборка, как у SMM-воркера.
     # Без этого блока правки voice-host/* не доезжают до живого процесса.
+    # Статус проверяем явно, а не через '| tail': в этом блоке действует
+    # set -e БЕЗ pipefail, поэтому статус берётся от tail и всегда нулевой —
+    # падение сборки проглатывается молча. Первый прогон 25.08.2026 так и
+    # прошёл «зелёным» с несобравшимся воркером.
     if [ -d voice-host ]; then
       cd voice-host
-      npm ci --no-audit --no-fund 2>&1 | tail -3
-      npm run build 2>&1 | tail -3
+      npm ci --no-audit --no-fund > /tmp/vh-install.log 2>&1 \
+        || { tail -20 /tmp/vh-install.log; echo 'voice-host: npm ci FAILED'; exit 1; }
+      npm run build > /tmp/vh-build.log 2>&1 \
+        || { tail -20 /tmp/vh-build.log; echo 'voice-host: build FAILED'; exit 1; }
       pm2 startOrReload ecosystem.config.js 2>&1 | tail -2
       cd ..
     fi
