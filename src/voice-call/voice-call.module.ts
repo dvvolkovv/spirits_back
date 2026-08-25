@@ -8,28 +8,23 @@ import { SpecialistJobService } from './specialist-job.service';
 import { LiveKitClient } from './livekit.client';
 
 /**
- * Есть ли секрет для HMAC внутренних ручек. Читаем один раз при загрузке
- * модуля (= при старте процесса, env на это время уже статичен), а не в
- * onModuleInit — потому что от этого флага зависит СОСТАВ `controllers`,
- * а не только поведение внутри уже собранного модуля.
- */
-const HAS_VOICE_SECRET = Boolean(process.env.VOICE_CALLBACK_SECRET);
-
-/**
- * VOICE_CALLBACK_SECRET сейчас не задан ни на проде, ни на тесте. Бросить
- * исключение в onModuleInit (что сделал бы «честный» гард) уронило бы старт
- * ВСЕГО приложения — эта ручка не единственная в модуле.
+ * VOICE_CALLBACK_SECRET читается ТОЛЬКО во время запроса, в контроллере.
  *
- * Поэтому вместо fail-fast на весь процесс — деградация одного модуля:
- * без секрета VoiceCallInternalController просто не регистрируется, и
- * `/webhook/voice-call/internal/*` отвечает обычным 404 (роута нет), а не
- * 401/500 из-за попытки HMAC со `secret=undefined`. Публичный
- * VoiceCallController (start/end/get, за JwtGuard) при этом продолжает
- * работать — это отдельная поверхность, HMAC её не касается.
+ * Читать его на уровне модуля нельзя: `process.env` наполняется из `.env`
+ * через `ConfigModule.forRoot()` в app.module, а тот отрабатывает ПОЗЖЕ, чем
+ * вычисляются module-level константы импортированных модулей. Константа
+ * всегда оказывалась бы false, и внутренние ручки не регистрировались бы
+ * даже при заданном секрете — то есть фича молча не работала бы в проде.
+ * В репозитории про эти грабли уже есть три предупреждения, см.
+ * claude-health.service.ts:86 и соседей.
+ *
+ * Поэтому контроллер регистрируется всегда, а без секрета его ручки отвечают
+ * 503: недоступны, но и не открыты. Проверка в onModuleInit ниже — только
+ * диагностика в лог, она отрабатывает уже после ConfigModule.
  */
 @Module({
   imports: [CommonModule, ChatModule],
-  controllers: [VoiceCallController, ...(HAS_VOICE_SECRET ? [VoiceCallInternalController] : [])],
+  controllers: [VoiceCallController, VoiceCallInternalController],
   providers: [VoiceCallService, SpecialistJobService, LiveKitClient],
   exports: [VoiceCallService],
 })
@@ -37,11 +32,10 @@ export class VoiceCallModule implements OnModuleInit {
   private readonly logger = new Logger(VoiceCallModule.name);
 
   onModuleInit(): void {
-    if (!HAS_VOICE_SECRET) {
+    if (!process.env.VOICE_CALLBACK_SECRET) {
       this.logger.error(
-        'VOICE_CALLBACK_SECRET не задан — VoiceCallInternalController отключён ' +
-        '(/webhook/voice-call/internal/* отвечает 404). Приложение поднято, но звонки ' +
-        'работать не будут: воркеру некуда слать ask/complete/failed.',
+        'VOICE_CALLBACK_SECRET не задан — /webhook/voice-call/internal/* отвечает 503. ' +
+        'Приложение поднято, но звонки работать не будут: воркеру некуда слать ask/complete/failed.',
       );
     }
     if (!process.env.LIVEKIT_API_KEY || !process.env.LIVEKIT_API_SECRET) {

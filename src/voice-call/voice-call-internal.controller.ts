@@ -1,4 +1,4 @@
-import { BadRequestException, Controller, Headers, Logger, Post, Req, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, Controller, Headers, Logger, Post, Req, ServiceUnavailableException, UnauthorizedException } from '@nestjs/common';
 import { Request } from 'express';
 import { SpecialistJobService } from './specialist-job.service';
 import { VoiceCallService } from './voice-call.service';
@@ -26,9 +26,17 @@ export class VoiceCallInternalController {
    * навешен сырой парсер. Проверяем подпись по байтам и разбираем сами.
    */
   private parseSigned<T>(req: Request, signature: string): T {
+    // Секрет читаем на КАЖДОМ запросе, а не в константе модуля: process.env
+    // наполняется из .env через ConfigModule.forRoot(), который отрабатывает
+    // позже вычисления module-level констант. Иначе ручка была бы мертва даже
+    // при заданном секрете.
+    const secret = process.env.VOICE_CALLBACK_SECRET;
+    if (!secret) {
+      throw new ServiceUnavailableException('voice call callbacks are not configured');
+    }
     const raw: Buffer | string = (req as any).body;
     const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw ?? '');
-    if (!verifyBody(process.env.VOICE_CALLBACK_SECRET as string, text, signature)) {
+    if (!verifyBody(secret, text, signature)) {
       throw new UnauthorizedException('bad signature');
     }
     try {
