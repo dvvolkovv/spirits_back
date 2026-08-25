@@ -25,12 +25,17 @@ const preset = (over: any = {}) => ({
  * Собирает сервис с заглушками. Порядок аргументов — как в конструкторе
  * routine-push.service.ts:17 — pg, push, chat, store.
  */
-function makeService(store: any, push: any = { sendPush: jest.fn().mockResolvedValue(1) }) {
+function makeService(
+  store: any,
+  push: any = { sendPush: jest.fn().mockResolvedValue(1) },
+  lang = 'ru',
+) {
   return new RoutinePushService(
     { query: jest.fn().mockResolvedValue({ rows: [] }) } as any,          // pg
     push as any,                                                          // push
     { generateAgentReply: jest.fn().mockResolvedValue('текст') } as any,  // chat
     store as any,                                                         // store
+    { resolveUserLanguage: jest.fn().mockResolvedValue(lang) } as any,    // language
   );
 }
 
@@ -96,5 +101,27 @@ describe('deliver: выбор заголовка по kind', () => {
     await svc.fireNow('u1', 'r1');
 
     expect(sendPush.mock.calls[0][1].title).toMatch(/·/);
+  });
+});
+
+describe('deliver: язык пуша', () => {
+  it('англоязычный пользователь получает английский заголовок энерго-пуша', async () => {
+    const sendPush = jest.fn().mockResolvedValue(1);
+    const store = { getById: jest.fn().mockResolvedValue(preset()) };
+    const svc = makeService(store, { sendPush }, 'en');
+
+    await svc.fireNow('u1', 'r1');
+
+    expect(sendPush.mock.calls[0][1].title).toBe('Energy of the day from Raya 🌅');
+  });
+
+  it('для обычной рутины локализуется фолбэк имени ассистента', async () => {
+    const sendPush = jest.fn().mockResolvedValue(1);
+    const store = { getById: jest.fn().mockResolvedValue(preset({ kind: 'custom', assistantId: 'raya' })) };
+    const svc = makeService(store, { sendPush }, 'en');
+
+    await svc.fireNow('u1', 'r1');
+
+    expect(sendPush.mock.calls[0][1].title).toContain('assistant');
   });
 });

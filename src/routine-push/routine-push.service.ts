@@ -6,6 +6,8 @@ import { PgService } from '../common/services/pg.service';
 import { PushService } from '../push/push.service';
 import { ChatService } from '../chat/chat.service';
 import { RoutineStore, RoutineRow, ENERGY_PROMPT } from './routine-store.service';
+import { LanguageService } from '../common/services/language.service';
+import { routineMsg } from './routine-messages';
 import { sendTelegramAlert } from '../common/telegram-alert';
 
 const RAYA_ID = '14';
@@ -30,6 +32,7 @@ export class RoutinePushService implements OnModuleInit {
     private readonly push: PushService,
     private readonly chat: ChatService,
     private readonly store: RoutineStore,
+    private readonly language: LanguageService,
   ) {}
 
   async onModuleInit() {
@@ -54,9 +57,13 @@ export class RoutinePushService implements OnModuleInit {
   async ensureEnergyPreset(userId: string, tz?: string): Promise<RoutineRow> {
     const existing = (await this.store.list(userId)).find((r) => r.kind === ENERGY_KIND);
     if (existing) return existing;
+    // Заголовок пишется в БД один раз при создании — берём язык на этот момент.
+    // Опознание на заголовок больше не опирается, поэтому смена языка позже
+    // дубля не создаст: заголовок просто останется на языке момента создания.
+    const lang = await this.language.resolveUserLanguage(userId);
     return this.store.create(userId, {
       kind: ENERGY_KIND,
-      title: 'Энергия дня',
+      title: routineMsg(lang).energyTitle,
       assistantId: RAYA_ID,
       prompt: ENERGY_PROMPT,
       sendHour: 8,
@@ -73,29 +80,32 @@ export class RoutinePushService implements OnModuleInit {
       this.logger.warn(`routine deliver: empty text for ${userId} / assistant ${assistantId}`);
       return 0;
     }
+    const lang = await this.language.resolveUserLanguage(userId);
+    const msg = routineMsg(lang);
     const agentNum = /^\d+$/.test(assistantId) ? parseInt(assistantId, 10) : null;
     await this.pg.query(
       `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
        VALUES ($1, 'ai', $2, $3, 'text')`,
       [`${userId}_${assistantId}`, agentNum, text],
     );
-    const name = await this.assistantName(assistantId);
+    const name = await this.assistantName(assistantId, lang);
     const body = text.replace(/[#*_`>\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 130);
     const isEnergy = kind === ENERGY_KIND;
     return this.push.sendPush(userId, {
-      title: isEnergy ? 'Энергия дня от Райи 🌅' : `${title || 'Напоминание'} · ${name} ✨`,
+      title: isEnergy ? msg.energyTitle : `${title || msg.reminder} · ${name} ✨`,
       body,
       url: `/chat?assistant=${assistantId}`,
       tag: `routine_${assistantId}`,
     });
   }
 
-  private async assistantName(assistantId: string): Promise<string> {
-    if (!/^\d+$/.test(assistantId)) return 'ассистент';
+  private async assistantName(assistantId: string, lang: string): Promise<string> {
+    const fallback = routineMsg(lang).assistant;
+    if (!/^\d+$/.test(assistantId)) return fallback;
     try {
       const r = await this.pg.query('SELECT COALESCE(display_name, name) AS n FROM agents WHERE id = $1', [parseInt(assistantId, 10)]);
-      return r.rows[0]?.n || 'ассистент';
-    } catch { return 'ассистент'; }
+      return r.rows[0]?.n || fallback;
+    } catch { return fallback; }
   }
 
   // «Проверить сейчас»: генерит и шлёт немедленно конкретную рутину.
