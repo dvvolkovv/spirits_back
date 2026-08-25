@@ -30,11 +30,14 @@ describe('POST /webhook/auth/identities/link/telegram', () => {
     identity = { linkMethod: jest.fn().mockResolvedValue({ ok: true }) };
     pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
     // Прочие зависимости контроллера в этом сценарии не задействованы.
+    // AuthController принимает 10 параметров, последний — pg (PgService).
+    // Передаём его настоящим 10-м аргументом: сигнатура строго типизирована
+    // и ts-jest роняет компиляцию на недостающем обязательном параметре —
+    // «дописать реквизит после new» здесь не работает, как в исходном плане.
     ctrl = new AuthController(
       {} as any, {} as any, identity, {} as any, {} as any,
-      {} as any, {} as any, {} as any, {} as any,
+      {} as any, {} as any, {} as any, {} as any, pg,
     );
-    (ctrl as any).pg = pg;
   });
 
   it('без JWT отвечает 401', async () => {
