@@ -5,9 +5,20 @@ import { ChatService } from '../chat/chat.service';
 import { LiveKitClient } from './livekit.client';
 import { CompletePayload, HOST_AGENT_ID, SPECIALISTS } from './voice-call.types';
 
-/** Ставки OpenAI Realtime за 1M аудио-токенов, флагман. */
-const AUDIO_IN_USD_PER_1M = 32;
-const AUDIO_OUT_USD_PER_1M = 64;
+/**
+ * Ставки OpenAI Realtime за 1M аудио-токенов, по моделям.
+ *
+ * Захардкоженный флагман завышал бы цену mini в 3.2 раза — а ради измерения
+ * реальной цены минуты фича и катится в v1, так что врать тут нельзя.
+ */
+const AUDIO_RATES_USD_PER_1M: Record<string, { in: number; out: number }> = {
+  flagship: { in: 32, out: 64 },
+  mini: { in: 10, out: 20 },
+};
+
+function ratesFor(model: string | undefined): { in: number; out: number } {
+  return /mini/i.test(model || '') ? AUDIO_RATES_USD_PER_1M.mini : AUDIO_RATES_USD_PER_1M.flagship;
+}
 
 const PREAMBLE_MSG_LIMIT = 20;
 const PREAMBLE_CHAR_LIMIT = 4000;
@@ -87,8 +98,9 @@ export class VoiceCallService {
     return { callId, roomName, token, wsUrl: process.env.LIVEKIT_WS_URL || process.env.LIVEKIT_URL || 'ws://localhost:7880' };
   }
 
-  costUsd(audioIn: number, audioOut: number): number {
-    return (audioIn / 1e6) * AUDIO_IN_USD_PER_1M + (audioOut / 1e6) * AUDIO_OUT_USD_PER_1M;
+  costUsd(audioIn: number, audioOut: number, model?: string): number {
+    const r = ratesFor(model);
+    return (audioIn / 1e6) * r.in + (audioOut / 1e6) * r.out;
   }
 
   async complete(callId: string, payload: CompletePayload): Promise<void> {
@@ -101,7 +113,7 @@ export class VoiceCallService {
       return;
     }
     const durationSec = Math.max(0, Math.round((Date.now() - new Date(call.started_at).getTime()) / 1000));
-    const cost = this.costUsd(payload.usage.audioInputTokens, payload.usage.audioOutputTokens);
+    const cost = this.costUsd(payload.usage.audioInputTokens, payload.usage.audioOutputTokens, payload.usage.model);
 
     const summary = await this.summarize(call.user_id, payload.transcript);
 
@@ -135,7 +147,7 @@ export class VoiceCallService {
       [
         Math.floor(Math.random() * 2_000_000_000), call.user_id, HOST_AGENT_ID,
         payload.usage.audioInputTokens, payload.usage.audioOutputTokens,
-        JSON.stringify({ kind: 'voice_call', callId, costUsd: cost, durationSec, model: payload.usage.model }),
+        JSON.stringify({ kind: 'voice_call', callId, costUsd: cost, durationSec, durationMs: durationSec * 1000, model: payload.usage.model }),
       ],
     );
 

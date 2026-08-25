@@ -74,6 +74,14 @@ describe('VoiceCallService', () => {
     expect(svc.costUsd(600, 1200)).toBeCloseTo(600 / 1e6 * 32 + 1200 / 1e6 * 64, 6);
   });
 
+  it('у mini свои ставки, иначе цена завышена в 3.2 раза', () => {
+    const svc = new VoiceCallService({} as any, {} as any, {} as any);
+    const flagship = svc.costUsd(600, 1200, 'gpt-realtime-2.1');
+    const mini = svc.costUsd(600, 1200, 'gpt-realtime-2.1-mini');
+    expect(mini).toBeCloseTo(600 / 1e6 * 10 + 1200 / 1e6 * 20, 6);
+    expect(flagship / mini).toBeCloseTo(3.2, 5);
+  });
+
   it('строка учёта пишется completed, иначе крон спишет токены с баланса', async () => {
     const d = makeDeps([]);
     const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);

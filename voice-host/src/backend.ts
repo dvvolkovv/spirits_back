@@ -7,12 +7,24 @@ function sign(raw: string): string {
   return createHmac('sha256', SECRET).update(raw, 'utf8').digest('hex');
 }
 
+/**
+ * Таймауты подобраны под роль вызова, а не одинаковые.
+ *
+ * `ask` живёт внутри тула, который OpenAI Realtime исполняет СИНХРОННО и
+ * держит разговор, пока тот не вернётся. Зависший бэкенд без таймаута — это
+ * тишина в трубке на весь undici-дефолт (300 с), то есть ровно то поведение,
+ * ради ухода от которого мы отказались от remote MCP. Две секунды хватает:
+ * ручка только пишет строку и ставит job в очередь.
+ */
+const TIMEOUT_MS: Record<string, number> = { ask: 2_000, complete: 15_000, failed: 5_000 };
+
 async function post<T>(path: string, body: unknown): Promise<T> {
   const raw = JSON.stringify(body);
   const res = await fetch(`${BACKEND}/webhook/voice-call/internal/${path}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-voice-signature': sign(raw) },
     body: raw,
+    signal: AbortSignal.timeout(TIMEOUT_MS[path] ?? 10_000),
   });
   if (!res.ok) throw new Error(`${path} → ${res.status}`);
   return res.json() as Promise<T>;
