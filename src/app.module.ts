@@ -24,6 +24,7 @@ import { ContactsModule } from './contacts/contacts.module';
 import { McpModule } from './mcp/mcp.module';
 import { SmmModule } from './smm/smm.module';
 import { TasksModule } from './tasks/tasks.module';
+import { BusinessProfileModule } from './business-profile/business-profile.module';
 import { IdentityModule } from './identity/identity.module';
 import { MonitoringModule } from './monitoring/monitoring.module';
 import { EventsModule } from './events/events.module';
@@ -74,6 +75,7 @@ import { SpeechModule } from './speech/speech.module';
     McpModule,
     SmmModule,
     TasksModule,
+    BusinessProfileModule,
     IdentityModule,
     EventsModule,
     MonitoringModule,

@@ -106,6 +106,30 @@ export class BusinessProfileService {
     return isBusinessProfileEmpty(await this.read(userId));
   }
 
+  /**
+   * Заходил ли пользователь хоть раз к business-ассистенту.
+   *
+   * Нужно фронту, чтобы решить, показывать блок карточки. Разбор истории
+   * держим на бэке: фронт не должен знать про категории агентов.
+   *
+   * У custom_chat_history НЕТ колонки user_id — связь с пользователем идёт
+   * через session_id вида `{userId}_{assistantId}` (см. chat.service.ts:431
+   * и profile.service.ts, где удаление ходит тем же LIKE). Колонка агента
+   * называется `agent` и она integer, а не текстовый `agent_id`.
+   */
+  async hasBusinessHistory(userId: string): Promise<boolean> {
+    if (!this.pg) return false;
+    const res = await this.pg.query(
+      `SELECT 1
+         FROM custom_chat_history h
+         JOIN agents a ON a.id = h.agent
+        WHERE h.session_id LIKE $1 AND a.category = 'business'
+        LIMIT 1`,
+      [`${userId}_%`],
+    );
+    return res.rows.length > 0;
+  }
+
   /** Прочитать карточку и отрендерить блок для промпта. Вся логика формата —
    *  в чистой renderBusinessBlock; здесь только чтение. */
   async renderForPrompt(userId: string, category: string | null | undefined): Promise<string> {
