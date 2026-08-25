@@ -5,6 +5,7 @@ import {
   defineAgent,
   llm,
   voice,
+  AgentSessionEventTypes,
   ServerOptions,
   type JobContext,
   type AgentStateChangedEvent,
@@ -121,7 +122,7 @@ export default defineAgent({
       // specialist_pending предназначен фронту — игнорируем.
     });
 
-    session.on('agent_state_changed', (ev: AgentStateChangedEvent) => {
+    session.on(AgentSessionEventTypes.AgentStateChanged, (ev: AgentStateChangedEvent) => {
       const speaking = ev.newState === 'speaking';
       pending.setSpeaking(speaking);
       if (!speaking) {
@@ -129,7 +130,7 @@ export default defineAgent({
       }
     });
 
-    session.on('conversation_item_added', (ev: ConversationItemAddedEvent) => {
+    session.on(AgentSessionEventTypes.ConversationItemAdded, (ev: ConversationItemAddedEvent) => {
       if (ev.item.type !== 'message') return; // пропускаем agent_handoff-записи
       const { role, textContent } = ev.item;
       if (!textContent) return;
@@ -143,7 +144,7 @@ export default defineAgent({
     // OpenAI Realtime отчитывается по аудио-токенам через 'realtime_model_metrics'
     // — это один из вариантов объединения AgentMetrics, у остальных (llm/stt/tts/…)
     // этих полей просто нет.
-    session.on('metrics_collected', (ev: MetricsCollectedEvent) => {
+    session.on(AgentSessionEventTypes.MetricsCollected, (ev: MetricsCollectedEvent) => {
       if (ev.metrics.type === 'realtime_model_metrics') {
         audioIn += ev.metrics.inputTokenDetails.audioTokens;
         audioOut += ev.metrics.outputTokenDetails.audioTokens;
