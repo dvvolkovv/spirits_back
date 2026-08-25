@@ -165,7 +165,23 @@ export default defineAgent({
     }, SESSION_LIMIT_MS - 60_000);
 
     const hardStop = setTimeout(() => {
-      void backend.failed(meta.callId, 'session_expired').catch(() => {});
+      // Именно ЗАВЕРШАЕМ, а не только помечаем в БД. Раньше здесь был один
+      // backend.failed(): статус менялся на 'failed', а Realtime-сессия жила
+      // дальше и тарифицировалась — единственный предохранитель по деньгам
+      // ничего не останавливал. Плюс подоспевший следом complete перетирал
+      // 'failed' обратно на 'completed'.
+      void (async () => {
+        try {
+          await session.close();
+        } catch (e) {
+          console.error('session.close() failed', e);
+        }
+        try {
+          await ctx.room.disconnect();
+        } catch (e) {
+          console.error('room.disconnect() failed', e);
+        }
+      })();
     }, SESSION_LIMIT_MS);
 
     // Один shutdown-колбэк на всё: таймеры и отправка итогов.

@@ -28,6 +28,20 @@ export class LiveKitClient {
     this.logger.log(`[dispatch] room=${roomName} agent=${agentName}`);
   }
 
+  /**
+   * Закрыть комнату. Без этого воркер остаётся в ней один после того, как
+   * браузер отключился, и Realtime-сессия продолжает тарифицироваться.
+   */
+  async closeRoom(roomName: string): Promise<void> {
+    const client = new RoomServiceClient(this.httpUrl, this.apiKey, this.apiSecret);
+    try {
+      await client.deleteRoom(roomName);
+    } catch (e: any) {
+      // Комнаты уже нет — это нормальный исход, а не ошибка.
+      this.logger.warn(`deleteRoom ${roomName}: ${e?.message}`);
+    }
+  }
+
   /** Доставка сообщения в комнату. Слушают и воркер, и фронт. */
   async send(roomName: string, msg: VoiceDataMessage): Promise<void> {
     const client = new RoomServiceClient(this.httpUrl, this.apiKey, this.apiSecret);

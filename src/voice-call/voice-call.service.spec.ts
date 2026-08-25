@@ -71,4 +71,63 @@ describe('VoiceCallService', () => {
     const svc = new VoiceCallService({} as any, {} as any, {} as any);
     expect(svc.costUsd(600, 1200)).toBeCloseTo(600 / 1e6 * 32 + 1200 / 1e6 * 64, 6);
   });
+
+  it('строка учёта пишется completed, иначе крон спишет токены с баланса', async () => {
+    const d = makeDeps([]);
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+    await svc.complete('call-1', {
+      transcript: [{ role: 'user', text: 'привет', ts: 1 }],
+      usage: { audioInputTokens: 600, audioOutputTokens: 1200, model: 'gpt-realtime-2.1' },
+    });
+    const call = d.pg.query.mock.calls.find(
+      (c: any[]) => /INSERT INTO token_consumption_tasks/i.test(c[0]),
+    );
+    expect(call).toBeDefined();
+    // TokenAccountingService забирает 'pending' и при tokens_to_consume = 0
+    // считает сумму сам — со 'pending' звонок списывал бы 1800 токенов в минуту.
+    expect(call![0]).toContain("'completed'");
+    expect(call![0]).not.toContain("'pending'");
+  });
+
+  it('повторный complete не создаёт вторую карточку', async () => {
+    const d = makeDeps([]);
+    d.pg.query = jest.fn(async (sql: string, params: any[] = []) => {
+      if (/FROM voice_calls/i.test(sql)) {
+        return { rows: [{ id: 'call-1', user_id: 'u1', room_name: 'room-1', status: 'completed', started_at: new Date() }], rowCount: 1 };
+      }
+      if (/INSERT INTO custom_chat_history/i.test(sql)) { d.pg.inserted.push(params); return { rows: [], rowCount: 1 }; }
+      return { rows: [], rowCount: 1 };
+    }) as any;
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+    await svc.complete('call-1', {
+      transcript: [{ role: 'user', text: 'привет', ts: 1 }],
+      usage: { audioInputTokens: 1, audioOutputTokens: 1, model: 'm' },
+    });
+    expect(d.pg.inserted).toHaveLength(0);
+  });
+
+  it('второй звонок при живом первом отклоняется', async () => {
+    const d = makeDeps([]);
+    d.pg.query = jest.fn(async (sql: string) => {
+      if (/SELECT id FROM voice_calls/i.test(sql)) return { rows: [{ id: 'уже-идёт' }], rowCount: 1 };
+      return { rows: [], rowCount: 1 };
+    }) as any;
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+    await expect(svc.start('u1')).rejects.toMatchObject({ status: 409 });
+    expect(d.livekit.dispatchAgent).not.toHaveBeenCalled();
+  });
+
+  it('положить трубку — закрывает комнату, а не только красит строку', async () => {
+    const d = makeDeps([]);
+    d.pg.query = jest.fn(async (sql: string) => {
+      if (/UPDATE voice_calls SET status = 'interrupted'/i.test(sql)) {
+        return { rows: [{ room_name: 'room-1' }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 1 };
+    }) as any;
+    const livekit = { ...d.livekit, closeRoom: jest.fn(async () => {}) };
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, livekit as any);
+    await svc.markInterrupted('call-1');
+    expect(livekit.closeRoom).toHaveBeenCalledWith('room-1');
+  });
 });
