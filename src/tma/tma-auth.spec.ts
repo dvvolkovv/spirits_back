@@ -30,7 +30,7 @@ describe('POST /webhook/tma/auth', () => {
   beforeEach(() => {
     process.env.TG_BOT_TOKEN = BOT_TOKEN;
     pg = { query: jest.fn().mockResolvedValue({ rows: [] }), getClient: jest.fn() };
-    identity = { resolveOrCreate: jest.fn() };
+    identity = { resolveOrCreate: jest.fn(), touchIdentity: jest.fn() };
     jwt = { signAccess: jest.fn(() => 'ACC'), signRefresh: jest.fn(() => 'REF') };
     ctrl = new TmaController(pg, identity, jwt);
   });
@@ -66,6 +66,7 @@ describe('POST /webhook/tma/auth', () => {
     expect(identity.resolveOrCreate).not.toHaveBeenCalled();
     expect(jwt.signAccess).toHaveBeenCalledWith('u-known');
     expect(res._status).toBe(200);
+    expect(identity.touchIdentity).toHaveBeenCalledWith('telegram', '42');
   });
 
   it('находит старожила бота по tg_user_identities и дописывает строку в user_identities', async () => {
@@ -79,5 +80,33 @@ describe('POST /webhook/tma/auth', () => {
     expect(jwt.signAccess).toHaveBeenCalledWith('u-bot');
     const backfill = pg.query.mock.calls[2][0];
     expect(backfill).toContain('INSERT INTO user_identities');
+    expect(identity.touchIdentity).toHaveBeenCalledWith('telegram', '42');
+  });
+
+  describe('onModuleInit — сигнал об отсутствующем TG_BOT_TOKEN', () => {
+    it('логирует ошибку один раз при старте без TG_BOT_TOKEN, и не логирует, когда переменная задана', () => {
+      // beforeEach уже выставил TG_BOT_TOKEN; сохраняем его, чтобы гарантированно
+      // вернуть на место — не полагаясь на то, что следующий beforeEach это сделает.
+      const original = process.env.TG_BOT_TOKEN;
+      try {
+        delete process.env.TG_BOT_TOKEN;
+        const localCtrl = new TmaController(pg, identity, jwt);
+        const errorSpy = jest
+          .spyOn((localCtrl as any).logger, 'error')
+          .mockImplementation(() => undefined);
+
+        localCtrl.onModuleInit();
+        expect(errorSpy).toHaveBeenCalledTimes(1);
+        expect(errorSpy.mock.calls[0][0]).toContain('TG_BOT_TOKEN');
+
+        errorSpy.mockClear();
+        process.env.TG_BOT_TOKEN = BOT_TOKEN;
+        localCtrl.onModuleInit();
+        expect(errorSpy).not.toHaveBeenCalled();
+      } finally {
+        if (original === undefined) delete process.env.TG_BOT_TOKEN;
+        else process.env.TG_BOT_TOKEN = original;
+      }
+    });
   });
 });
