@@ -12,9 +12,23 @@ function makePg(profile: BusinessProfile = {}) {
       // merge шлёт JSON.stringify — мок обязан распарсить, иначе в state
       // окажется строка и обращения вида state.business.what.value упадут.
       state.business = JSON.parse(params[0]);
-      return { rows: [] };
+      // Строка профиля есть — UPDATE её реально задел.
+      return { rows: [], rowCount: 1 };
     }),
     _state: state,
+  } as any;
+}
+
+/** Для userId, которому в ai_profiles_consolidated нет строки: SELECT ничего
+ *  не находит, UPDATE не задевает ни одной строки (WHERE user_id = $2 мимо). */
+function makePgWithoutRow() {
+  return {
+    query: jest.fn(async (sql: string) => {
+      if (/SELECT/i.test(sql)) {
+        return { rows: [] };
+      }
+      return { rows: [], rowCount: 0 };
+    }),
   } as any;
 }
 
@@ -93,5 +107,23 @@ describe('BusinessProfileService.merge', () => {
     expect(missing).not.toContain('what');
     expect(missing).toContain('revenue');
     expect(missing).toHaveLength(7);
+  });
+
+  it('не сообщает об успехе, если строки профиля в базе нет', async () => {
+    const pg = makePgWithoutRow();
+    const svc = new BusinessProfileService(pg);
+
+    const result = await svc.merge('u-missing', { what: 'студия' }, 'user');
+
+    expect(result).toEqual({});
+  });
+
+  it('сохраняет и возвращает новое состояние, когда строка есть', async () => {
+    const pg = makePg({});
+    const svc = new BusinessProfileService(pg);
+
+    const result = await svc.merge('u1', { what: 'студия' }, 'user');
+
+    expect(result.what?.value).toBe('студия');
   });
 });

@@ -73,7 +73,7 @@ export class BusinessProfileService {
 
     if (!changed) return current;
 
-    await this.pg.query(
+    const res = await this.pg.query(
       `UPDATE ai_profiles_consolidated
           SET profile_data = jsonb_set(
                 COALESCE(profile_data, '{}'::jsonb), '{business}', $1::jsonb, true),
@@ -81,6 +81,18 @@ export class BusinessProfileService {
         WHERE user_id = $2`,
       [JSON.stringify(next), userId],
     );
+
+    // rowCount === 0 значит: строки профиля для этого userId нет (например,
+    // пользователь ещё не создан identity.service — сюда не наше дело её
+    // заводить, это привело бы к сиротам). Врать вызывающему, что карточка
+    // сохранена, хуже, чем просто не сохранить: фича существует, чтобы
+    // ассистент помнил бизнес пользователя, и тихая потеря записи — самый
+    // незаметный из возможных отказов.
+    if (!res.rowCount) {
+      this.logger.warn(`merge: UPDATE не задел ни одной строки — нет профиля для user_id=${userId}`);
+      return current;
+    }
+
     return next;
   }
 
