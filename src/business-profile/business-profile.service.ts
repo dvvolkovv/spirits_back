@@ -6,6 +6,7 @@ import {
   BusinessProfile,
   FieldSource,
   isBusinessProfileEmpty,
+  renderBusinessBlock,
 } from './business-profile.types';
 
 const FIELD_BY_KEY = new Map(BUSINESS_FIELDS.map(f => [f.key as string, f]));
@@ -98,5 +99,11 @@ export class BusinessProfileService {
 
   async isEmpty(userId: string): Promise<boolean> {
     return isBusinessProfileEmpty(await this.read(userId));
+  }
+
+  /** Прочитать карточку и отрендерить блок для промпта. Вся логика формата —
+   *  в чистой renderBusinessBlock; здесь только чтение. */
+  async renderForPrompt(userId: string, category: string | null | undefined): Promise<string> {
+    return renderBusinessBlock(await this.read(userId), category);
   }
 }

@@ -85,3 +85,55 @@ export function isBusinessProfileEmpty(p: BusinessProfile | undefined | null): b
   if (!p) return true;
   return !BUSINESS_FIELDS.some(f => (p[f.key]?.value || '').trim().length > 0);
 }
+
+/**
+ * Блок карточки для системного промпта.
+ *
+ * Чистая функция без похода в базу: форматирование строки тестируется
+ * без мока Postgres, а сервис остаётся тонким слоем персистентности.
+ *
+ * Лейблы английские — как соседний блок `User profile:` в chat.service.
+ * Переводить их на семь локалей не нужно: русский хвост промпта уже
+ * однажды заставил ассистента отвечать по-русски аккаунту с language=en,
+ * и повторять эту ошибку блоком побольше незачем.
+ *
+ * Единственная точка рендера на все три пути сборки промпта. В
+ * chat.service.ts рядом с блоком `User profile:` уже есть комментарий о
+ * том, что сборка промпта продублирована трижды — это предупреждение,
+ * а не наблюдение.
+ */
+export function renderBusinessBlock(
+  p: BusinessProfile,
+  category: string | null | undefined,
+): string {
+  if (isBusinessProfileEmpty(p)) return '';
+
+  if (category !== 'business') {
+    // Психологу и коучу полезно знать, что человек ведёт дело, но оборот
+    // и налоговый режим им не нужны — только суть и размер команды.
+    const what = (p.what?.value || '').trim();
+    if (!what) return '';
+    const team = (p.team?.value || '').trim();
+    return team
+      ? `Пользователь ведёт свой бизнес — ${what}; команда: ${team}.`
+      : `Пользователь ведёт свой бизнес — ${what}.`;
+  }
+
+  const lines: string[] = ['Business profile:'];
+  const missing: string[] = [];
+
+  for (const f of BUSINESS_FIELDS) {
+    const raw = (p[f.key]?.value || '').trim();
+    if (!raw) {
+      missing.push(f.promptLabel);
+      continue;
+    }
+    lines.push(`${f.promptLabel}: ${renderEnum(f.key, raw)}`);
+  }
+
+  if (missing.length > 0) {
+    lines.push(`Not filled in: ${missing.join(', ')}.`);
+  }
+
+  return lines.join('\n');
+}
