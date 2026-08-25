@@ -501,7 +501,7 @@ export class ChatService {
       const isAdmin = Boolean(adminRes.rows[0]?.isadmin);
       const ctx = { userId, isAdmin, balanceBlock };
       try {
-        await this.claudeAgent.streamSmmProducer(ctx, message, chatSessionId, agent.id, res);
+        await this.claudeAgent.streamSmmProducer(ctx, message, chatSessionId, agent.id, res, agent.category, fresh);
       } catch (err: any) {
         this.logger.error(`SMM streaming failed: ${err.message}`);
         // Best-effort error event; res may already be ended.
