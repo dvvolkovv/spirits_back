@@ -17,7 +17,6 @@ import { SchedulerModule } from './scheduler/scheduler.module';
 import { MiscModule } from './misc/misc.module';
 import { VideoModule } from './video/video.module';
 import { AdminModule } from './admin/admin.module';
-import { DozvonModule } from './dozvon/dozvon.module';
 import { PeerModule } from './peer/peer.module';
 import { SupportModule } from './support/support.module';
 import { ContactsModule } from './contacts/contacts.module';
@@ -67,7 +66,6 @@ import { SpeechModule } from './speech/speech.module';
     MiscModule,
     VideoModule,
     AdminModule,
-    DozvonModule,
     PeerModule,
     SupportModule,
     ContactsModule,
