@@ -59,6 +59,7 @@ export class TmaController implements OnModuleInit {
         [sub],
       );
       if (known.rows.length) {
+        stage = 'touch:user_identities';
         await this.identity.touchIdentity('telegram', sub);
         return this.issue(res, known.rows[0].user_id);
       }
@@ -82,6 +83,7 @@ export class TmaController implements OnModuleInit {
         // Бэкфилл выше пишет last_used_at только при первой вставке — при
         // повторном визите сработает ON CONFLICT DO NOTHING и дата замрёт
         // навсегда. touchIdentity обновляет её на каждый вход.
+        stage = 'touch:tg_user_identities';
         await this.identity.touchIdentity('telegram', sub);
         return this.issue(res, userId);
       }

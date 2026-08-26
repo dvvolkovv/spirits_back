@@ -83,6 +83,35 @@ describe('POST /webhook/tma/auth', () => {
     expect(identity.touchIdentity).toHaveBeenCalledWith('telegram', '42');
   });
 
+  describe('stage в логе называет упавшую операцию, а не предыдущую успешную', () => {
+    it('падение touchIdentity в ветке user_identities логируется как touch:user_identities', async () => {
+      pg.query.mockResolvedValueOnce({ rows: [{ user_id: 'u-known' }] });
+      identity.touchIdentity.mockRejectedValueOnce(new Error('boom'));
+      const errorSpy = jest.spyOn((ctrl as any).logger, 'error').mockImplementation(() => undefined);
+      const res = mockRes();
+
+      await expect(ctrl.auth({ initData: freshInitData() }, res)).rejects.toThrow('boom');
+
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(errorSpy.mock.calls[0][0]).toContain('touch:user_identities');
+    });
+
+    it('падение touchIdentity в ветке tg_user_identities логируется как touch:tg_user_identities', async () => {
+      pg.query
+        .mockResolvedValueOnce({ rows: [] })                              // user_identities — пусто
+        .mockResolvedValueOnce({ rows: [{ linkeon_user_id: 'u-bot' }] })  // tg_user_identities — есть
+        .mockResolvedValueOnce({ rows: [] });                             // бэкфилл INSERT
+      identity.touchIdentity.mockRejectedValueOnce(new Error('boom'));
+      const errorSpy = jest.spyOn((ctrl as any).logger, 'error').mockImplementation(() => undefined);
+      const res = mockRes();
+
+      await expect(ctrl.auth({ initData: freshInitData() }, res)).rejects.toThrow('boom');
+
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(errorSpy.mock.calls[0][0]).toContain('touch:tg_user_identities');
+    });
+  });
+
   describe('onModuleInit — сигнал об отсутствующем TG_BOT_TOKEN', () => {
     it('логирует ошибку один раз при старте без TG_BOT_TOKEN, и не логирует, когда переменная задана', () => {
       // beforeEach уже выставил TG_BOT_TOKEN; сохраняем его, чтобы гарантированно
