@@ -176,6 +176,11 @@ export default defineAgent({
         `${INTERNAL_PREFIX}: до конца звонка минута. Подведи короткий итог и попрощайся.]`,
       );
     }, SESSION_LIMIT_MS - 60_000);
+    // unref обязателен: без него часовой таймер держит event loop, процесс
+    // задания не может завершиться после закрытия сессии, и фреймворк через
+    // минуту убивает его как «job is unresponsive» — вместе с недоотправленным
+    // complete. Так дважды терялся транскрипт (25 и 26.08.2026).
+    warnAt.unref?.();
 
     const hardStop = setTimeout(() => {
       // Именно ЗАВЕРШАЕМ, а не только помечаем в БД. Раньше здесь был один
@@ -196,9 +201,16 @@ export default defineAgent({
         }
       })();
     }, SESSION_LIMIT_MS);
+    hardStop.unref?.();
 
-    // Один shutdown-колбэк на всё: таймеры и отправка итогов.
-    ctx.addShutdownCallback(async () => {
+    // Итоги отправляем при ПЕРВОМ же признаке конца звонка, а не только из
+    // shutdown-колбэка. Полагаться на shutdown оказалось нельзя: фреймворк
+    // может убить процесс раньше, чем колбэк доработает, и тогда транскрипт
+    // теряется молча — так пропали разговоры на 11 и 20 минут.
+    let sent = false;
+    const sendComplete = async (why: string) => {
+      if (sent) return;
+      sent = true;
       clearTimeout(warnAt);
       clearTimeout(hardStop);
       try {
@@ -207,10 +219,16 @@ export default defineAgent({
           audioOutputTokens: audioOut,
           model: process.env.VOICE_MODEL || 'gpt-realtime-2.1',
         });
+        console.log(`complete отправлен (${why}), реплик: ${transcript.length}`);
       } catch (e) {
-        console.error('complete callback failed', e);
+        console.error(`complete не отправлен (${why})`, e);
       }
-    });
+    };
+
+    // Закрытие сессии — самый ранний надёжный сигнал: он приходит сразу после
+    // того, как собеседник отключился, и процесс тогда ещё жив.
+    session.on(AgentSessionEventTypes.Close, () => { void sendComplete('session_closed'); });
+    ctx.addShutdownCallback(async () => { await sendComplete('shutdown'); });
 
     try {
       await session.start({
