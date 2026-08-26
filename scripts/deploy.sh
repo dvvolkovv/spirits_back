@@ -526,6 +526,30 @@ run_landing_phase() {
   return 1
 }
 
+# Смоук Telegram Mini App (/tma/, отдельная точка входа — vite.config.ts
+# rollupOptions.input.tma). Как и smoke_landing — КОД ОТВЕТА ЗДЕСЬ НИЧЕГО НЕ
+# ЗНАЧИТ: и на test, и на проде nginx отдаёт index.html с кодом 200 на любой
+# незанятый путь (SPA-фолбэк), поэтому "/tma/ вернул 200" было бы зелёным
+# даже при полностью отсутствующем location /tma/ в nginx, то есть при
+# полностью мёртвом Mini App. Сравниваем СОДЕРЖИМОЕ: бандл, отданный на
+# /tma/, должен существовать и отличаться от бандла на /.
+smoke_frontend_tma() {
+  local base="$1" auth="${2:-}"
+  local tma_bundle web_bundle
+  tma_bundle=$(curl -sf ${auth:+-u "$auth"} "$base/tma/" | grep -o 'src="/assets/[a-zA-Z0-9._-]*\.js"' | head -1)
+  web_bundle=$(curl -sf ${auth:+-u "$auth"} "$base/"     | grep -o 'src="/assets/[a-zA-Z0-9._-]*\.js"' | head -1)
+  if [[ -z "$tma_bundle" ]]; then
+    red "  ✗ /tma/ не отдал бандл ($ENV_NAME)"
+    return 1
+  fi
+  if [[ "$tma_bundle" == "$web_bundle" ]]; then
+    red "  ✗ /tma/ отдаёт веб-бандл ($ENV_NAME) — сработал SPA-фолбэк, location /tma/ не применился"
+    return 1
+  fi
+  green "  ✓ Mini App отдаётся своим бандлом ($ENV_NAME): $tma_bundle"
+  return 0
+}
+
 run_phase() {
   local phase="$1"  # "test" или "prod"
   case "$phase" in
@@ -608,6 +632,18 @@ run_phase() {
       else green "  ✓ SMOKE GREEN ($ENV_NAME)"; fi
     else
       red "  ✗ SMOKE FAILED ($ENV_NAME) — red on all $max_attempts attempts (real regression, not a flake)"
+      if [[ "$phase" == "prod" && -z "${NO_ROLLBACK:-}" && -z "${SMOKE_ONLY:-}" ]]; then
+        rollback_phase || red "  ✗ rollback had partial failures — check $ENV_NAME manually"
+      fi
+      return 1
+    fi
+
+    # Mini App — отдельная проверка содержимого (см. комментарий у
+    # smoke_frontend_tma). Не участвует в SMOKE_ATTEMPTS-ретраях основного
+    # smoke/run.sh: это статическая проверка nginx-конфига и собранного
+    # бандла, а не прогретого/холодного бэкенд-пути — флапать ей нечему.
+    if ! smoke_frontend_tma "$BASE_URL" "$BASIC_AUTH"; then
+      red "  ✗ SMOKE FAILED ($ENV_NAME) — Mini App (/tma/) не прошёл проверку"
       if [[ "$phase" == "prod" && -z "${NO_ROLLBACK:-}" && -z "${SMOKE_ONLY:-}" ]]; then
         rollback_phase || red "  ✗ rollback had partial failures — check $ENV_NAME manually"
       fi
