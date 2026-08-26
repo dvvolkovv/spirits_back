@@ -60,7 +60,7 @@ export default defineAgent({
       callId: string;
       userId: string;
       preamble: string;
-      specialists: string[];
+      specialists: { name: string; role: string }[];
     };
 
     const pending = new PendingAnswers();
