@@ -193,7 +193,11 @@ rollback_backend() {
     # set -e БЕЗ pipefail, поэтому статус берётся от tail и всегда нулевой —
     # падение сборки проглатывается молча. Первый прогон 25.08.2026 так и
     # прошёл «зелёным» с несобравшимся воркером.
-    if [ -d voice-host ]; then
+    # Пропускаем там, где нет LiveKit: на тест-стенде SFU не развёрнут вовсе
+    # (ни контейнера, ни порта 7880, ни ключей в .env), и поднятый воркер
+    # уходит в бесконечный цикл падений. Признак настроенности — свой .env
+    # подпроекта: он создаётся руками вместе с ключами LiveKit.
+    if [ -d voice-host ] && [ -f voice-host/.env ]; then
       cd voice-host
       npm ci --no-audit --no-fund > /tmp/vh-install.log 2>&1 \
         || { tail -20 /tmp/vh-install.log; echo 'voice-host: npm ci FAILED'; exit 1; }
@@ -404,7 +408,11 @@ deploy_backend() {
     # set -e БЕЗ pipefail, поэтому статус берётся от tail и всегда нулевой —
     # падение сборки проглатывается молча. Первый прогон 25.08.2026 так и
     # прошёл «зелёным» с несобравшимся воркером.
-    if [ -d voice-host ]; then
+    # Пропускаем там, где нет LiveKit: на тест-стенде SFU не развёрнут вовсе
+    # (ни контейнера, ни порта 7880, ни ключей в .env), и поднятый воркер
+    # уходит в бесконечный цикл падений. Признак настроенности — свой .env
+    # подпроекта: он создаётся руками вместе с ключами LiveKit.
+    if [ -d voice-host ] && [ -f voice-host/.env ]; then
       cd voice-host
       npm ci --no-audit --no-fund > /tmp/vh-install.log 2>&1 \
         || { tail -20 /tmp/vh-install.log; echo 'voice-host: npm ci FAILED'; exit 1; }
@@ -413,6 +421,8 @@ deploy_backend() {
       pm2 startOrReload ecosystem.config.cjs > /tmp/vh-pm2.log 2>&1 \
         || { tail -20 /tmp/vh-pm2.log; echo 'voice-host: pm2 startOrReload FAILED'; exit 1; }
       cd ..
+    elif [ -d voice-host ]; then
+      echo 'voice-host: .env отсутствует — LiveKit не настроен, воркер пропущен'
     fi
   " || { red "  backend deploy failed ($ENV_NAME)"; exit 1; }
 
