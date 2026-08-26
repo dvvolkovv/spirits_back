@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { ChatService } from '../chat/chat.service';
 import { LiveKitClient } from './livekit.client';
-import { AskResult, JOB_TIMEOUT_MS, MAX_PENDING_JOBS, SPECIALISTS } from './voice-call.types';
+import { AskResult, HOST_AGENT_ID, JOB_TIMEOUT_MS, MAX_PENDING_JOBS, SPECIALISTS } from './voice-call.types';
 
 /**
  * Мост между быстрым голосовым ведущим и медленными профильными ассистентами.
@@ -12,6 +12,11 @@ import { AskResult, JOB_TIMEOUT_MS, MAX_PENDING_JOBS, SPECIALISTS } from './voic
  * синхронно и держит разговор, пока тот не вернётся. Поэтому ask() пишет job,
  * отдаёт jobId и уходит, а ответ доставляется отдельным data-сообщением.
  */
+/** Столько символов не стыдно произнести вслух: примерно 20–25 секунд речи. */
+const SPOKEN_ANSWER_LIMIT = 700;
+/** Сжатие не должно тянуться дольше, чем сам ответ ждали. */
+const CONDENSE_TIMEOUT_MS = 45_000;
+
 @Injectable()
 export class SpecialistJobService {
   private readonly logger = new Logger(SpecialistJobService.name);
@@ -111,11 +116,22 @@ export class SpecialistJobService {
       const answer = (text || '').trim();
       if (!answer) throw new Error('пустой ответ специалиста');
 
+      // В БД кладём ответ целиком: он попадёт в транскрипт и карточку звонка,
+      // где длина не мешает и текст можно перечитать.
       await this.pg.query(
         `UPDATE voice_call_jobs SET status = 'done', answer = $1, finished_at = now(), latency_ms = $2 WHERE id = $3`,
         [answer, Date.now() - started, jobId],
       );
-      await this.safeSend(roomName, { v: 1, type: 'specialist_answer', jobId, specialist, text: answer });
+
+      // А в голос уходит короткая выжимка.
+      //
+      // Раньше отправляли ответ целиком, и это ломало разговор: 26.08.2026
+      // Роман получил два ответа на 9 274 и 11 210 символов — 20 тысяч разом
+      // в контекст realtime-сессии, которая переотправляется модели на каждом
+      // ходу. Через пару минут он замолчал совсем. Да и зачитывать вслух
+      // многостраничный разбор бессмысленно: голосом нужен смысл, а не текст.
+      const spoken = await this.condense(userId, specialist, answer);
+      await this.safeSend(roomName, { v: 1, type: 'specialist_answer', jobId, specialist, text: spoken });
     } catch (e: any) {
       const reason = e?.message === 'timeout' ? 'timeout' : 'error';
       this.logger.warn(`job ${jobId} (${specialist}) failed: ${e?.message}`);
@@ -125,6 +141,33 @@ export class SpecialistJobService {
       );
       await this.safeSend(roomName, { v: 1, type: 'specialist_failed', jobId, specialist, reason });
     }
+  }
+
+  /**
+   * Сжать ответ специалиста до пары фраз, которые не стыдно произнести вслух.
+   *
+   * Короткие ответы отдаём как есть — гонять LLM ради трёх строк незачем.
+   * Если сжатие не удалось, лучше отдать обрезанный оригинал, чем промолчать:
+   * пользователь ждёт ответа, а не тишины.
+   */
+  private async condense(userId: string, specialist: string, answer: string): Promise<string> {
+    if (answer.length <= SPOKEN_ANSWER_LIMIT) return answer;
+
+    const prompt =
+      `Ниже ответ специалиста по имени ${specialist}. Перескажи его для произнесения ` +
+      `ВСЛУХ: 2–3 коротких предложения, только суть и главный вывод, без списков, ` +
+      `заголовков и markdown. До ${SPOKEN_ANSWER_LIMIT} символов.\n\n${answer}`;
+    try {
+      const short = await this.withTimeout(
+        this.chat.generateAgentReply(userId, String(HOST_AGENT_ID), prompt, `voice_condense_${randomUUID()}`),
+        CONDENSE_TIMEOUT_MS,
+      );
+      const trimmed = (short || '').trim();
+      if (trimmed) return trimmed.slice(0, SPOKEN_ANSWER_LIMIT);
+    } catch (e: any) {
+      this.logger.warn(`не удалось сжать ответ ${specialist}: ${e?.message}`);
+    }
+    return answer.slice(0, SPOKEN_ANSWER_LIMIT) + '…';
   }
 
   /** Сбой доставки не должен ронять job: он уже записан в БД. */

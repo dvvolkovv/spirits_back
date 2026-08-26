@@ -162,4 +162,30 @@ describe('VoiceCallService', () => {
     await svc.markInterrupted('call-1');
     expect(livekit.closeRoom).toHaveBeenCalledWith('room-1');
   });
+
+  it('транскрипт сохраняется СРАЗУ, не дожидаясь резюме от LLM', async () => {
+    // 26.08.2026 так потерялся разговор на 11 минут: complete синхронно ждал
+    // summarize (десятки секунд), воркер обрывал запрос по своему таймауту
+    // в 15 секунд, и в БД оставалось interrupted с нулём реплик.
+    const d = makeDeps([]);
+    let resolveLlm: (v: string) => void = () => {};
+    d.chat.generateAgentReply = jest.fn(() => new Promise<string>((r) => { resolveLlm = r; })) as never;
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+
+    const started = Date.now();
+    await svc.complete('call-1', {
+      transcript: [{ role: 'user', text: 'привет', ts: 1 }],
+      usage: { audioInputTokens: 600, audioOutputTokens: 1200, model: 'gpt-realtime-2.1' },
+    });
+    // complete вернулся, хотя LLM ещё висит.
+    expect(Date.now() - started).toBeLessThan(200);
+
+    const saved = d.pg.query.mock.calls.find(
+      (c: any[]) => /UPDATE voice_calls SET status = 'completed'/i.test(c[0]),
+    );
+    expect(saved).toBeDefined();
+    expect(String(saved![1][1])).toContain('привет');
+
+    resolveLlm('резюме');
+  });
 });

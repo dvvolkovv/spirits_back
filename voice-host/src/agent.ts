@@ -33,7 +33,8 @@ const TOPIC = 'linkeon';
  */
 const INTERNAL_PREFIX = '[Внутреннее сообщение';
 
-function instructions(preamble: string, specialists: string[]): string {
+function instructions(preamble: string, specialists: { name: string; role: string }[]): string {
+  const roster = specialists.map((s) => `  • ${s.name} — ${s.role}`).join('\n');
   return [
     'ГОВОРИ ТОЛЬКО ПО-РУССКИ — правило важнее всех остальных. Оно действует',
     'с самой первой фразы, включая приветствие, и не отменяется тем, что',
@@ -42,7 +43,8 @@ function instructions(preamble: string, specialists: string[]): string {
     'Ты Роман — ведущий голосового разговора на платформе LINKEON.',
     'Говори коротко, живой разговорной речью. Не зачитывай списки вслух.',
     '',
-    `Ты можешь спросить коллег-специалистов: ${specialists.join(', ')}.`,
+    'Ты можешь спросить коллег-специалистов. Выбирай строго по профилю:',
+    roster,
     'Инструмент ask_specialist ставит вопрос в работу и возвращается мгновенно —',
     'ответа в нём НЕТ. Получив подтверждение, скажи вслух, что отправил вопрос,',
     'и продолжай разговор: ответ придёт отдельно, и ты его озвучишь.',

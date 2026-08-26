@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { ChatService } from '../chat/chat.service';
 import { LiveKitClient } from './livekit.client';
-import { CompletePayload, HOST_AGENT_ID, SPECIALISTS } from './voice-call.types';
+import { CompletePayload, HOST_AGENT_ID, SPECIALIST_ROLES, SPECIALISTS } from './voice-call.types';
 
 /**
  * Ставки OpenAI Realtime за 1M аудио-токенов, по моделям.
@@ -98,7 +98,9 @@ export class VoiceCallService {
       callId,
       userId,
       preamble,
-      specialists: Object.keys(SPECIALISTS),
+      // Отдаём воркеру имена ВМЕСТЕ с ролями: по одному имени ведущий
+      // выбирает наугад и шлёт юридический вопрос бухгалтеру.
+      specialists: Object.keys(SPECIALISTS).map((n) => ({ name: n, role: SPECIALIST_ROLES[n] || '' })),
       callbackUrl: `${process.env.BACKEND_URL || 'https://my.linkeon.io'}/webhook/voice-call/internal`,
     });
 
@@ -110,11 +112,21 @@ export class VoiceCallService {
     return (audioIn / 1e6) * r.in + (audioOut / 1e6) * r.out;
   }
 
+  /**
+   * Завершение звонка. Транскрипт сохраняется СРАЗУ, резюме — в фоне.
+   *
+   * Раньше здесь синхронно вызывался summarize() (поход в LLM на десятки
+   * секунд), а воркер ждёт ответ 15 секунд и обрывает запрос. 26.08.2026
+   * так потерялся транскрипт разговора на 11 минут: в БД осталось
+   * `interrupted`, ноль реплик, стоимость пустая. Разговор, за который
+   * заплачено, не сохранился.
+   *
+   * Теперь запись в БД не зависит от того, успеет ли модель придумать резюме.
+   */
   async complete(callId: string, payload: CompletePayload): Promise<void> {
     const call = await this.load(callId);
     // Идемпотентность: воркер может ретрайнуть, а подписанный запрос —
-    // прийти дважды. Без этой проверки получаем вторую карточку в ленте
-    // и вторую строку учёта на тот же звонок.
+    // прийти дважды. Без этого получаем вторую карточку и вторую строку учёта.
     if (call.status === 'completed') {
       this.logger.warn(`[complete] call=${callId} уже завершён — повтор проигнорирован`);
       return;
@@ -122,22 +134,10 @@ export class VoiceCallService {
     const durationSec = Math.max(0, Math.round((Date.now() - new Date(call.started_at).getTime()) / 1000));
     const cost = this.costUsd(payload.usage.audioInputTokens, payload.usage.audioOutputTokens, payload.usage.model);
 
-    const summary = await this.summarize(call.user_id, payload.transcript);
-
     await this.pg.query(
       `UPDATE voice_calls SET status = 'completed', ended_at = now(), duration_sec = $1,
-         transcript = $2, summary = $3, cost_usd = $4, model = $5 WHERE id = $6`,
-      [durationSec, JSON.stringify(payload.transcript), summary, cost, payload.usage.model, callId],
-    );
-
-    // Карточка в ленте. Схема истории не меняется: это обычное сообщение,
-    // фронт узнаёт его по тегу.
-    const minutes = Math.max(1, Math.round(durationSec / 60));
-    const content = `{{voice_call: id=${callId}}}\n\nРазговор ${minutes} мин.\n\n${summary}`;
-    await this.pg.query(
-      `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
-       VALUES ($1, 'ai', $2, $3, 'text', 0)`,
-      [`${call.user_id}_${HOST_AGENT_ID}`, HOST_AGENT_ID, content],
+         transcript = $2, cost_usd = $3, model = $4 WHERE id = $5`,
+      [durationSec, JSON.stringify(payload.transcript), cost, payload.usage.model, callId],
     );
 
     // Учитываем, но НЕ списываем: тариф назначать пока не из чего.
@@ -147,7 +147,6 @@ export class VoiceCallService {
     // пропускает строку, а считает сумму сам — фолбэк
     // `input_tokens + output_tokens` (token-accounting.service.ts:74-76).
     // Со 'pending' с баланса уходило бы 1800 токенов за минуту разговора.
-    // Тот же приём с тем же обоснованием — в claude-agent.service.ts:231.
     await this.pg.query(
       `INSERT INTO token_consumption_tasks (execution_id, user_id, status, agent_id, input_tokens, output_tokens, tokens_to_consume, metadata, completed_at)
        VALUES ($1, $2, 'completed', $3, $4, $5, 0, $6, now())`,
@@ -158,7 +157,32 @@ export class VoiceCallService {
       ],
     );
 
-    this.logger.log(`[complete] call=${callId} ${durationSec}s cost=$${cost.toFixed(4)}`);
+    this.logger.log(`[complete] call=${callId} ${durationSec}s cost=$${cost.toFixed(4)} — транскрипт сохранён`);
+
+    // Резюме и карточка — в фоне. Промис намеренно не ждём: воркер должен
+    // получить ответ немедленно.
+    void this.finishSummary(callId, call.user_id, payload.transcript, durationSec)
+      .catch((e) => this.logger.error(`[complete] резюме для ${callId} не собрано: ${e?.message}`));
+  }
+
+  /** Резюме и карточка в ленте. Отваливается молча — транскрипт уже сохранён. */
+  private async finishSummary(
+    callId: string,
+    userId: string,
+    transcript: CompletePayload['transcript'],
+    durationSec: number,
+  ): Promise<void> {
+    const summary = await this.summarize(userId, transcript);
+    await this.pg.query(`UPDATE voice_calls SET summary = $1 WHERE id = $2`, [summary, callId]);
+
+    const minutes = Math.max(1, Math.round(durationSec / 60));
+    const content = `{{voice_call: id=${callId}}}\n\nРазговор ${minutes} мин.\n\n${summary}`;
+    await this.pg.query(
+      `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
+       VALUES ($1, 'ai', $2, $3, 'text', 0)`,
+      [`${userId}_${HOST_AGENT_ID}`, HOST_AGENT_ID, content],
+    );
+    this.logger.log(`[complete] call=${callId} резюме готово, карточка в ленте`);
   }
 
   async fail(callId: string, reason: string): Promise<void> {
