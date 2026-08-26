@@ -79,16 +79,25 @@ describe('VoiceCallService', () => {
     expect(d.livekit.dispatchAgent).toHaveBeenCalledWith(res.roomName, expect.objectContaining({ callId: res.callId }));
   });
 
-  it('complete пишет карточку в историю чата с тегом voice_call', async () => {
+  it('карточка в ленте появляется ПОСЛЕ фонового резюме, а не блокирует complete', async () => {
     const d = makeDeps([]);
     const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
     await svc.complete('call-1', {
       transcript: [{ role: 'user', text: 'привет', ts: 1 }, { role: 'assistant', text: 'здравствуйте', ts: 2 }],
       usage: { audioInputTokens: 600, audioOutputTokens: 1200, model: 'gpt-realtime-2.1' },
     });
+
+    // На момент возврата complete карточки ещё нет — резюме считается в фоне.
+    expect(d.pg.inserted.find((p) => String(p[2]).includes('{{voice_call:'))).toBeUndefined();
+
+    // Дать фоновой задаче отработать.
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
     const card = d.pg.inserted.find((p) => String(p[2]).includes('{{voice_call:'));
     expect(card).toBeDefined();
-    expect(String(card[2])).toContain('{{voice_call: id=call-1}}');
+    expect(String(card![2])).toContain('{{voice_call: id=call-1}}');
+    expect(String(card![2])).toContain('краткое резюме звонка');
   });
 
   it('стоимость считается по ставкам аудио-токенов', () => {
