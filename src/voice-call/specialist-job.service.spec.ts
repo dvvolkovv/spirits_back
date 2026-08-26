@@ -68,7 +68,7 @@ describe('состав списка специалистов', () => {
   });
 
   it('технический директор на месте', () => {
-    expect(findSpecialist('Кирилл')).toBe(19);
+    expect(findSpecialist('Дмитрий')).toBe(19);
   });
 });
 
