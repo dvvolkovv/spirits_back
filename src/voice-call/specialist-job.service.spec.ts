@@ -176,7 +176,7 @@ describe('SpecialistJobService', () => {
 
     // В модель — с требованием краткости: без него специалисты писали
     // трактаты по 15 000 знаков и не укладывались в таймаут.
-    const sentToModel = chat.generateAgentReply.mock.calls[0][2];
+    const [sentToModel] = chat.generateAgentReply.mock.calls.map((c: any[]) => c[2]);
     expect(sentToModel).toContain(VOICE_BRIEF);
     expect(sentToModel).toContain('Можно ли так?');
     // А в чат — вопрос Романа без нашей служебки.
