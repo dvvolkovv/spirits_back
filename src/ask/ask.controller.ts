@@ -16,14 +16,16 @@ export class AskController {
 
   @Post()
   @UseGuards(JwtGuard)
-  async ask(@Body() body: { text?: string; context?: string; history?: Array<{ role?: string; content?: string }> }) {
+  async ask(@Body() body: { text?: string; context?: string; history?: Array<{ role?: string; content?: string }>; assistant?: string }) {
     const text = String(body?.text ?? '').trim();
     if (!text) return { ok: false, error: 'Пустой вопрос' };
     // context — уже обезличенный на устройстве (Egress). Реле не трогает его и не подмешивает профиль.
     const context = String(body?.context ?? '').trim();
     const history = Array.isArray(body?.history) ? body!.history!.slice(-12) : undefined; // последние ходы
+    // assistant — имя/id персонажа (Ф3): накладываем его персону на телефон-де-ид контекст.
+    const assistant = String(body?.assistant ?? '').trim() || undefined;
     try {
-      const answer = await this.clean.ask(text, context, history);
+      const answer = await this.clean.ask(text, context, history, assistant);
       return { ok: true, answer };
     } catch (e: any) {
       return { ok: false, error: 'Не удалось получить ответ' };

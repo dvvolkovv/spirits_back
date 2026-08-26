@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
 import { randomUUID } from 'crypto';
+import { AgentsService } from '../agents/agents.service';
 
 /**
  * «Поговорить начисто» [owner 2026-08-24] — запрос в облачный LLM, НЕ связанный с пользователем.
@@ -20,6 +21,12 @@ import { randomUUID } from 'crypto';
 export class CleanAskService {
   private readonly logger = new Logger(CleanAskService.name);
 
+  // Ф3 единого чата (owner 2026-08-26): выбор персонажа и в ОБЕЗЛИЧЕННОМ режиме. Персона (роль
+  // персонажа) — это НЕ данные пользователя, а определение персонажа; профиль остаётся строго
+  // телефон-де-ид (context приходит уже обезличенным). Грузим system_prompt персонажа из БД, как
+  // это делает полный чат, и накладываем на телефон-подготовленный контекст.
+  constructor(private readonly agents: AgentsService) {}
+
   private static readonly SYSTEM =
     'Ты — живой, тактичный собеседник в приватном чате. Это ДИАЛОГ, а не справка: отвечай КОРОТКО и ' +
     'по-разговорному — обычно 2–5 предложений, как в переписке, без заголовков и длинных списков. ' +
@@ -38,10 +45,31 @@ export class CleanAskService {
     text: string,
     context?: string,
     history?: Array<{ role?: string; content?: string }>,
+    assistant?: string,
   ): Promise<string> {
     const q = (text || '').trim();
     if (!q) throw new Error('empty question');
     const ctx = (context || '').trim();
+
+    // Персона выбранного персонажа (Ф3). Роль накладывается на телефон-де-ид контекст; профиль
+    // с сервера НЕ подтягивается. Если персонаж не найден — тихо падаем на нейтральный SYSTEM.
+    let personaBlock = '';
+    const who = (assistant || '').trim();
+    if (who) {
+      try {
+        const agent =
+          (await this.agents.getAgentByName(who)) ||
+          (/^\d+$/.test(who) ? await this.agents.getAgentById(who) : null);
+        const sp = agent?.system_prompt ? String(agent.system_prompt).trim() : '';
+        if (sp) {
+          personaBlock =
+            `Ты — ассистент по имени ${agent.name || who}. Твоя персона и стиль:\n${sp}\n\n` +
+            `Оставаясь этим персонажем, следуй правилам ниже.\n\n`;
+        }
+      } catch (e: any) {
+        this.logger.warn(`persona load failed for "${who}": ${e?.message || e}`);
+      }
+    }
 
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
     const FormData = require('form-data');
@@ -59,7 +87,7 @@ export class CleanAskService {
         .map((t) => `${t.role === 'assistant' ? 'Ассистент' : 'Пользователь'}: ${String(t.content).trim()}`);
       if (lines.length) histBlock = `\n\nПредыдущий разговор:\n${lines.join('\n')}`;
     }
-    fd.append('message', `${CleanAskService.SYSTEM}${ctxBlock}${histBlock}\n\nПользователь: ${q}`);
+    fd.append('message', `${personaBlock}${CleanAskService.SYSTEM}${ctxBlock}${histBlock}\n\nПользователь: ${q}`);
     // Эфемерная, ни к кому не привязанная сессия — новая на каждый запрос.
     fd.append('sessionId', `anon_${randomUUID()}`);
 
