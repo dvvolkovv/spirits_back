@@ -7,12 +7,18 @@ import {
 function makePg() {
   const jobs: any[] = [];
   const history: any[] = [];
+  const charges: any[] = [];
   return {
     jobs,
     history,
+    charges,
     query: jest.fn(async (sql: string, params: any[] = []) => {
       if (/INSERT INTO custom_chat_history/i.test(sql)) {
         history.push({ session_id: params[0], agent: params[1], content: params[2], sender_type: /'human'/.test(sql) ? 'human' : 'ai' });
+        return { rows: [], rowCount: 1 };
+      }
+      if (/INSERT INTO token_consumption_tasks/i.test(sql)) {
+        charges.push({ user_id: params[1], agent_id: params[2], output_tokens: params[3], metadata: JSON.parse(params[4]) });
         return { rows: [], rowCount: 1 };
       }
       if (/INSERT INTO voice_call_jobs/i.test(sql)) {
@@ -78,7 +84,7 @@ describe('SpecialistJobService', () => {
 
   it('ask() отвечает быстро и НЕ вызывает LLM синхронно', async () => {
     const pg = makePg();
-    const chat = { generateAgentReply: jest.fn(async () => 'ответ юриста') };
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'ответ юриста', tokens: 1200, costUsd: 0.33 })) };
     const lk = { send: jest.fn(async () => {}) };
     const svc = new SpecialistJobService(pg as any, chat as any, lk as any, makeLang() as any);
 
@@ -89,19 +95,19 @@ describe('SpecialistJobService', () => {
     expect(res).toMatchObject({ status: 'asked', specialist: 'Алексей' });
     expect(elapsed).toBeLessThan(200);
     // Главное: на момент ответа модель ещё не звали.
-    expect(chat.generateAgentReply).not.toHaveBeenCalled();
+    expect(chat.generateAgentReplyWithCharge).not.toHaveBeenCalled();
   });
 
   it('после завершения job ответ уходит в комнату', async () => {
     const pg = makePg();
-    const chat = { generateAgentReply: jest.fn(async () => 'ответ юриста') };
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'ответ юриста', tokens: 1200, costUsd: 0.33 })) };
     const lk = { send: jest.fn(async () => {}) };
     const svc = new SpecialistJobService(pg as any, chat as any, lk as any, makeLang() as any);
 
     const res = await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'Можно ли так?');
     await svc.drainForTests();
 
-    expect(chat.generateAgentReply).toHaveBeenCalledTimes(1);
+    expect(chat.generateAgentReplyWithCharge).toHaveBeenCalledTimes(1);
     const sent = lk.send.mock.calls.map((c: any[]) => c[1]);
     expect(sent).toContainEqual(expect.objectContaining({ type: 'specialist_pending' }));
     expect(sent).toContainEqual(expect.objectContaining({
@@ -114,7 +120,7 @@ describe('SpecialistJobService', () => {
 
   it('каждый job получает изолированную сессию — иначе релей отдаёт пустой поток', async () => {
     const pg = makePg();
-    const chat = { generateAgentReply: jest.fn(async () => 'ok') };
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'ok', tokens: 1200, costUsd: 0.33 })) };
     const lk = { send: jest.fn(async () => {}) };
     const svc = new SpecialistJobService(pg as any, chat as any, lk as any, makeLang() as any);
 
@@ -122,14 +128,14 @@ describe('SpecialistJobService', () => {
     await svc.ask(CALL, ROOM, 'user-1', 'Анна', 'вопрос два');
     await svc.drainForTests();
 
-    const sessions = chat.generateAgentReply.mock.calls.map((c: any[]) => c[3]);
+    const sessions = chat.generateAgentReplyWithCharge.mock.calls.map((c: any[]) => c[3]);
     expect(sessions.every((s: string) => typeof s === 'string' && s.length > 0)).toBe(true);
     expect(new Set(sessions).size).toBe(2);
   });
 
   it('падение специалиста превращается в specialist_failed, а не в исключение', async () => {
     const pg = makePg();
-    const chat = { generateAgentReply: jest.fn(async () => { throw new Error('релей лёг'); }) };
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => { throw new Error('релей лёг'); }) };
     const lk = { send: jest.fn(async () => {}) };
     const svc = new SpecialistJobService(pg as any, chat as any, lk as any, makeLang() as any);
 
@@ -143,7 +149,7 @@ describe('SpecialistJobService', () => {
 
   it('личные ассистенты тоже доступны — не только деловая пятёрка', async () => {
     const pg = makePg();
-    const chat = { generateAgentReply: jest.fn(async () => 'карта говорит') };
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'карта говорит', tokens: 1200, costUsd: 0.33 })) };
     const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
 
     // Шанкара — ведический астролог, id 13. Первая редакция списка включала
@@ -157,7 +163,7 @@ describe('SpecialistJobService', () => {
 
   it('имя опознаётся без учёта регистра — модель диктует его из речи', async () => {
     const pg = makePg();
-    const svc = new SpecialistJobService(pg as any, { generateAgentReply: jest.fn(async () => 'ok') } as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
+    const svc = new SpecialistJobService(pg as any, { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'ok', tokens: 1200, costUsd: 0.33 })) } as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
 
     const res = await svc.ask(CALL, ROOM, 'user-1', '  шанкара ', 'вопрос');
     await svc.drainForTests();
@@ -168,7 +174,7 @@ describe('SpecialistJobService', () => {
 
   it('неизвестный специалист отклоняется без создания job', async () => {
     const pg = makePg();
-    const svc = new SpecialistJobService(pg as any, { generateAgentReply: jest.fn() } as any, { send: jest.fn() } as any, makeLang() as any);
+    const svc = new SpecialistJobService(pg as any, { generateAgentReplyWithCharge: jest.fn() } as any, { send: jest.fn() } as any, makeLang() as any);
     const res = await svc.ask(CALL, ROOM, 'user-1', 'Гэндальф', 'вопрос');
     expect(res).toEqual({ status: 'rejected', reason: 'unknown_specialist' });
     expect(pg.jobs).toHaveLength(0);
@@ -178,7 +184,7 @@ describe('SpecialistJobService', () => {
     // Ограничение в три снято по решению владельца 26.08.2026. Тест держит
     // именно снятие: пока стоял лимит, четвёртый возвращал too_many_pending.
     const pg = makePg();
-    const chat = { generateAgentReply: jest.fn(() => new Promise<string>(() => {})) }; // висят
+    const chat = { generateAgentReplyWithCharge: jest.fn(() => new Promise<never>(() => {})) }; // висят
     const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
 
     const names = ['Алексей', 'Анна', 'Виталий', 'Андрей', 'Александра'];
@@ -191,7 +197,7 @@ describe('SpecialistJobService', () => {
 
   it('консультация попадает в обычный чат со специалистом, с пометкой про голос', async () => {
     const pg = makePg();
-    const chat = { generateAgentReply: jest.fn(async () => 'коротко: так можно') };
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'коротко: так можно', tokens: 1200, costUsd: 0.33 })) };
     const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
 
     await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'Можно ли так?');
@@ -214,7 +220,7 @@ describe('SpecialistJobService', () => {
 
   it('пометка пишется на языке пользователя, а не всегда по-русски', async () => {
     const pg = makePg();
-    const chat = { generateAgentReply: jest.fn(async () => 'short answer') };
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'short answer', tokens: 1200, costUsd: 0.33 })) };
     const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeLang('en') as any);
 
     await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'May I?');
@@ -226,7 +232,7 @@ describe('SpecialistJobService', () => {
 
   it('модель просят ответить коротко, но в историю идёт чистый вопрос', async () => {
     const pg = makePg();
-    const chat = { generateAgentReply: jest.fn(async () => 'ок') };
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'ок', tokens: 1200, costUsd: 0.33 })) };
     const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
 
     await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'Можно ли так?');
@@ -234,7 +240,7 @@ describe('SpecialistJobService', () => {
 
     // В модель — с требованием краткости: без него специалисты писали
     // трактаты по 15 000 знаков и не укладывались в таймаут.
-    const [sentToModel] = chat.generateAgentReply.mock.calls.map((c: any[]) => c[2]);
+    const [sentToModel] = chat.generateAgentReplyWithCharge.mock.calls.map((c: any[]) => c[2]);
     expect(sentToModel).toContain(VOICE_BRIEF);
     expect(sentToModel).toContain('Можно ли так?');
     // А в чат — вопрос Романа без нашей служебки.
@@ -249,12 +255,75 @@ describe('SpecialistJobService', () => {
       return real(sql, params);
     }) as any;
     const lk = { send: jest.fn(async () => {}) };
-    const svc = new SpecialistJobService(pg as any, { generateAgentReply: jest.fn(async () => 'ответ') } as any, lk as any, makeLang() as any);
+    const svc = new SpecialistJobService(pg as any, { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'ответ', tokens: 1200, costUsd: 0.33 })) } as any, lk as any, makeLang() as any);
 
     await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'вопрос');
     await svc.drainForTests();
 
     // Ответ уже прозвучал бы в разговоре — падать из-за истории нельзя.
+    expect(lk.send.mock.calls.map((c: any[]) => c[1])).toContainEqual(
+      expect.objectContaining({ type: 'specialist_answer', text: 'ответ' }),
+    );
+  });
+});
+
+describe('списание за консультацию', () => {
+  const ROOM = 'voice_test_room';
+  const CALL = '11111111-1111-1111-1111-111111111111';
+
+  it('расход попадает в строку списания и в сообщение комнате', async () => {
+    // До 26.08.2026 консультации во время звонка не тарифицировались вовсе:
+    // generateAgentReply забирал текст, а costUsd и usage выбрасывал. Голос
+    // работал бесплатным каналом к платным ассистентам.
+    const pg = makePg();
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'коротко', tokens: 3200, costUsd: 0.9 })) };
+    const lk = { send: jest.fn(async () => {}) };
+    const svc = new SpecialistJobService(pg as any, chat as any, lk as any, makeLang() as any);
+
+    await svc.ask(CALL, ROOM, 'user-1', 'Виталий', 'вопрос');
+    await svc.drainForTests();
+
+    expect(pg.charges).toHaveLength(1);
+    expect(pg.charges[0]).toMatchObject({
+      user_id: 'user-1',
+      agent_id: 17,
+      output_tokens: 3200,
+      metadata: { kind: 'voice_specialist', specialist: 'Виталий' },
+    });
+    expect(lk.send.mock.calls.map((c: any[]) => c[1])).toContainEqual(
+      expect.objectContaining({ type: 'specialist_answer', tokens: 3200 }),
+    );
+  });
+
+  it('за неотвеченную консультацию не списывается ничего', async () => {
+    const pg = makePg();
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => { throw new Error('таймаут'); }) };
+    const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
+
+    await svc.ask(CALL, ROOM, 'user-1', 'Виталий', 'вопрос');
+    await svc.drainForTests();
+
+    expect(pg.charges).toHaveLength(0);
+  });
+
+  it('сбой записи списания не роняет job — ответ всё равно звучит', async () => {
+    const pg = makePg();
+    const real = pg.query;
+    pg.query = jest.fn(async (sql: string, params: any[] = []) => {
+      if (/INSERT INTO token_consumption_tasks/i.test(sql)) throw new Error('база моргнула');
+      return real(sql, params);
+    }) as any;
+    const lk = { send: jest.fn(async () => {}) };
+    const svc = new SpecialistJobService(
+      pg as any,
+      { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'ответ', tokens: 500, costUsd: 0.1 })) } as any,
+      lk as any,
+      makeLang() as any,
+    );
+
+    await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'вопрос');
+    await svc.drainForTests();
+
     expect(lk.send.mock.calls.map((c: any[]) => c[1])).toContainEqual(
       expect.objectContaining({ type: 'specialist_answer', text: 'ответ' }),
     );

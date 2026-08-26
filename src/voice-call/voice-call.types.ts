@@ -9,10 +9,12 @@ export const VOICE_DATA_TOPIC = 'linkeon';
 
 export type VoiceDataMessage =
   | { v: 1; type: 'specialist_pending'; jobId: string; specialist: string }
-  | { v: 1; type: 'specialist_answer'; jobId: string; specialist: string; text: string }
+  // tokens — сколько списано за консультацию. Показывается в окне звонка:
+  // без этой цифры расход на специалистов не виден нигде до конца месяца.
+  | { v: 1; type: 'specialist_answer'; jobId: string; specialist: string; text: string; tokens: number }
   | { v: 1; type: 'specialist_failed'; jobId: string; specialist: string; reason: 'timeout' | 'error' }
   | { v: 1; type: 'document_pending'; docId: string; title: string }
-  | { v: 1; type: 'document_ready'; docId: string; title: string }
+  | { v: 1; type: 'document_ready'; docId: string; title: string; tokens: number }
   | { v: 1; type: 'document_failed'; docId: string; title: string; reason: 'timeout' | 'error' };
 
 /** Ответ на /internal/document. Как и ask, возвращается мгновенно. */

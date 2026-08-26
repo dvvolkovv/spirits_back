@@ -21,7 +21,7 @@ describe('VoiceDocumentService', () => {
 
   it('create() возвращается мгновенно и НЕ зовёт модель синхронно', async () => {
     const pg = makePg();
-    const chat = { generateAgentReply: jest.fn(async () => 'текст документа') };
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'текст документа', tokens: 1200, costUsd: 0.33 })) };
     const svc = new VoiceDocumentService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any);
 
     const res = svc.create(CALL, ROOM, 'user-1', 'План запуска', 'по пунктам');
@@ -29,13 +29,13 @@ describe('VoiceDocumentService', () => {
     expect(res).toMatchObject({ status: 'accepted', title: 'План запуска' });
     // Главное: тул уже вернулся, а модель ещё не звали — Realtime держит
     // разговор, пока тул не ответит.
-    expect(chat.generateAgentReply).not.toHaveBeenCalled();
+    expect(chat.generateAgentReplyWithCharge).not.toHaveBeenCalled();
     await svc.drainForTests();
   });
 
   it('готовый документ попадает в чат с Романом, с заголовком', async () => {
     const pg = makePg();
-    const chat = { generateAgentReply: jest.fn(async () => 'Первый пункт. Второй пункт.') };
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'Первый пункт. Второй пункт.', tokens: 1200, costUsd: 0.33 })) };
     const svc = new VoiceDocumentService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any);
 
     svc.create(CALL, ROOM, 'user-1', 'План запуска', 'по пунктам');
@@ -52,7 +52,7 @@ describe('VoiceDocumentService', () => {
 
   it('о начале и готовности сообщается в комнату', async () => {
     const lk = { send: jest.fn(async () => {}) };
-    const svc = new VoiceDocumentService(makePg() as any, { generateAgentReply: jest.fn(async () => 'текст') } as any, lk as any);
+    const svc = new VoiceDocumentService(makePg() as any, { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'текст', tokens: 1200, costUsd: 0.33 })) } as any, lk as any);
 
     svc.create(CALL, ROOM, 'user-1', 'Письмо', '');
     await svc.drainForTests();
@@ -63,17 +63,17 @@ describe('VoiceDocumentService', () => {
   });
 
   it('документ без заголовка отклоняется, задача не заводится', () => {
-    const chat = { generateAgentReply: jest.fn() };
+    const chat = { generateAgentReplyWithCharge: jest.fn() };
     const svc = new VoiceDocumentService(makePg() as any, chat as any, { send: jest.fn() } as any);
 
     expect(svc.create(CALL, ROOM, 'user-1', '   ', 'что-то')).toEqual({ status: 'rejected', reason: 'no_title' });
-    expect(chat.generateAgentReply).not.toHaveBeenCalled();
+    expect(chat.generateAgentReplyWithCharge).not.toHaveBeenCalled();
   });
 
   it('падение модели не роняет задачу — в комнату уходит document_failed', async () => {
     const pg = makePg();
     const lk = { send: jest.fn(async () => {}) };
-    const chat = { generateAgentReply: jest.fn(async () => { throw new Error('релей лёг'); }) };
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => { throw new Error('релей лёг'); }) };
     const svc = new VoiceDocumentService(pg as any, chat as any, lk as any);
 
     svc.create(CALL, ROOM, 'user-1', 'Письмо', '');
@@ -89,7 +89,7 @@ describe('VoiceDocumentService', () => {
   it('пустой ответ модели считается провалом, а не пустым документом', async () => {
     const pg = makePg();
     const lk = { send: jest.fn(async () => {}) };
-    const svc = new VoiceDocumentService(pg as any, { generateAgentReply: jest.fn(async () => '   ') } as any, lk as any);
+    const svc = new VoiceDocumentService(pg as any, { generateAgentReplyWithCharge: jest.fn(async () => ({ text: '   ', tokens: 1200, costUsd: 0.33 })) } as any, lk as any);
 
     svc.create(CALL, ROOM, 'user-1', 'Письмо', '');
     await svc.drainForTests();
@@ -102,7 +102,7 @@ describe('VoiceDocumentService', () => {
 
   it('лимита одновременных документов нет — пятый тоже принимается', () => {
     // Снято по решению владельца 26.08.2026 вместе с лимитом на вопросы.
-    const chat = { generateAgentReply: jest.fn(() => new Promise<string>(() => {})) }; // висят
+    const chat = { generateAgentReplyWithCharge: jest.fn(() => new Promise<never>(() => {})) }; // висят
     const svc = new VoiceDocumentService(makePg() as any, chat as any, { send: jest.fn(async () => {}) } as any);
 
     const results = ['раз', 'два', 'три', 'четыре', 'пять']
@@ -112,13 +112,13 @@ describe('VoiceDocumentService', () => {
   });
 
   it('документ пишется в изолированной сессии — иначе релей отдаёт пустой поток', async () => {
-    const chat = { generateAgentReply: jest.fn(async () => 'текст') };
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'текст', tokens: 1200, costUsd: 0.33 })) };
     const svc = new VoiceDocumentService(makePg() as any, chat as any, { send: jest.fn(async () => {}) } as any);
 
     svc.create(CALL, ROOM, 'user-1', 'Письмо', '');
     await svc.drainForTests();
 
-    const session = chat.generateAgentReply.mock.calls.map((c: any[]) => c[3])[0];
+    const session = chat.generateAgentReplyWithCharge.mock.calls.map((c: any[]) => c[3])[0];
     expect(session).toMatch(/^voice_doc_/);
     expect(session).not.toBe(`user-1_${HOST_AGENT_ID}`);
   });

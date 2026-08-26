@@ -77,6 +77,7 @@ export class SpecialistJobService {
     specialist: string, agentId: number, question: string,
   ): Promise<void> {
     const started = Date.now();
+    let tokens = 0;
     await this.pg.query(`UPDATE voice_call_jobs SET status = 'running' WHERE id = $1`, [jobId]);
     await this.safeSend(roomName, { v: 1, type: 'specialist_pending', jobId, specialist });
 
@@ -88,21 +89,24 @@ export class SpecialistJobService {
       // К вопросу приписываем требование краткости: ответ пойдёт в голос.
       // В voice_call_jobs и в чат специалиста кладём вопрос БЕЗ приписки —
       // там нужен тот вопрос, который задал Роман, а не наша служебка.
-      const text = await this.withTimeout(
-        this.chat.generateAgentReply(userId, String(agentId), `${VOICE_BRIEF}\n\n${question}`, sessionId),
+      const reply = await this.withTimeout(
+        this.chat.generateAgentReplyWithCharge(userId, String(agentId), `${VOICE_BRIEF}\n\n${question}`, sessionId),
         JOB_TIMEOUT_MS,
       );
 
-      const answer = (text || '').trim();
+      const answer = (reply.text || '').trim();
       if (!answer) throw new Error('пустой ответ специалиста');
+      tokens = reply.tokens;
 
       // В БД кладём ответ целиком: он попадёт в транскрипт и карточку звонка,
       // где длина не мешает и текст можно перечитать.
       await this.pg.query(
-        `UPDATE voice_call_jobs SET status = 'done', answer = $1, finished_at = now(), latency_ms = $2 WHERE id = $3`,
-        [answer, Date.now() - started, jobId],
+        `UPDATE voice_call_jobs SET status = 'done', answer = $1, finished_at = now(),
+           latency_ms = $2, tokens_used = $3 WHERE id = $4`,
+        [answer, Date.now() - started, tokens, jobId],
       );
 
+      await this.charge(userId, agentId, specialist, tokens);
       await this.recordInSpecialistChat(userId, agentId, question, answer);
 
       // А в голос уходит короткая выжимка.
@@ -113,7 +117,12 @@ export class SpecialistJobService {
       // ходу. Через пару минут он замолчал совсем. Да и зачитывать вслух
       // многостраничный разбор бессмысленно: голосом нужен смысл, а не текст.
       const spoken = await this.condense(userId, specialist, answer);
-      await this.safeSend(roomName, { v: 1, type: 'specialist_answer', jobId, specialist, text: spoken });
+      if (spoken.tokens > 0) {
+        await this.charge(userId, HOST_AGENT_ID, `${specialist} (сжатие)`, spoken.tokens);
+        tokens += spoken.tokens;
+        await this.pg.query(`UPDATE voice_call_jobs SET tokens_used = $1 WHERE id = $2`, [tokens, jobId]);
+      }
+      await this.safeSend(roomName, { v: 1, type: 'specialist_answer', jobId, specialist, text: spoken.text, tokens });
     } catch (e: any) {
       const reason = e?.message === 'timeout' ? 'timeout' : 'error';
       this.logger.warn(`job ${jobId} (${specialist}) failed: ${e?.message}`);
@@ -122,6 +131,36 @@ export class SpecialistJobService {
         [Date.now() - started, jobId],
       );
       await this.safeSend(roomName, { v: 1, type: 'specialist_failed', jobId, specialist, reason });
+    }
+  }
+
+  /**
+   * Списать токены за консультацию.
+   *
+   * Строка идёт в 'pending' с расходом в output_tokens — ровно так же, как
+   * обычный ход чата (chat.service.ts:addTokenTask). TokenAccountingService
+   * подберёт её и спишет с баланса.
+   *
+   * Не 'completed' с нулём, как у самого звонка: минуту разговора тарифицировать
+   * пока не из чего, а консультация — та же работа ассистента, что и в текстовом
+   * чате, и стоить должна столько же. До 26.08.2026 она не стоила ничего:
+   * generateAgentReply выбрасывал расход, и голос работал бесплатным каналом
+   * к платным ассистентам.
+   */
+  private async charge(userId: string, agentId: number, specialist: string, tokens: number): Promise<void> {
+    if (tokens <= 0) return;
+    try {
+      await this.pg.query(
+        `INSERT INTO token_consumption_tasks (execution_id, user_id, status, agent_id, input_tokens, output_tokens, tokens_to_consume, metadata)
+         VALUES ($1, $2, 'pending', $3, 0, $4, 0, $5)`,
+        [
+          Math.floor(Math.random() * 2_000_000_000), userId, agentId, tokens,
+          JSON.stringify({ kind: 'voice_specialist', specialist, tokens }),
+        ],
+      );
+    } catch (e: any) {
+      // Ответ уже прозвучал; несписанные токены — беда меньшая, чем упавший job.
+      this.logger.warn(`не удалось записать списание за ${specialist}: ${e?.message}`);
     }
   }
 
@@ -173,8 +212,10 @@ export class SpecialistJobService {
    * Если сжатие не удалось, лучше отдать обрезанный оригинал, чем промолчать:
    * пользователь ждёт ответа, а не тишины.
    */
-  private async condense(userId: string, specialist: string, answer: string): Promise<string> {
-    if (answer.length <= SPOKEN_ANSWER_LIMIT) return answer;
+  private async condense(
+    userId: string, specialist: string, answer: string,
+  ): Promise<{ text: string; tokens: number }> {
+    if (answer.length <= SPOKEN_ANSWER_LIMIT) return { text: answer, tokens: 0 };
 
     const prompt =
       `Ниже ответ специалиста по имени ${specialist}. Перескажи его для произнесения ` +
@@ -182,15 +223,17 @@ export class SpecialistJobService {
       `заголовков и markdown. До ${SPOKEN_ANSWER_LIMIT} символов.\n\n${answer}`;
     try {
       const short = await this.withTimeout(
-        this.chat.generateAgentReply(userId, String(HOST_AGENT_ID), prompt, `voice_condense_${randomUUID()}`),
+        this.chat.generateAgentReplyWithCharge(userId, String(HOST_AGENT_ID), prompt, `voice_condense_${randomUUID()}`),
         CONDENSE_TIMEOUT_MS,
       );
-      const trimmed = (short || '').trim();
-      if (trimmed) return trimmed.slice(0, SPOKEN_ANSWER_LIMIT);
+      const trimmed = (short.text || '').trim();
+      // Сжатие — тоже поход в модель за счёт пользователя, и списывается
+      // отдельной строкой: иначе часть расхода снова оказалась бы бесплатной.
+      if (trimmed) return { text: trimmed.slice(0, SPOKEN_ANSWER_LIMIT), tokens: short.tokens };
     } catch (e: any) {
       this.logger.warn(`не удалось сжать ответ ${specialist}: ${e?.message}`);
     }
-    return answer.slice(0, SPOKEN_ANSWER_LIMIT) + '…';
+    return { text: answer.slice(0, SPOKEN_ANSWER_LIMIT) + '…', tokens: 0 };
   }
 
   /** Сбой доставки не должен ронять job: он уже записан в БД. */

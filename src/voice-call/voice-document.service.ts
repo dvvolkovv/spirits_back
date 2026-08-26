@@ -65,25 +65,47 @@ export class VoiceDocumentService {
 
       // Изолированная сессия — как у вопросов специалистам: при коллизии с
       // живой сессией пользователя релей отдаёт пустой поток (инцидент 2026-07-12).
-      const text = await this.withTimeout(
-        this.chat.generateAgentReply(userId, String(HOST_AGENT_ID), prompt, `voice_doc_${callId}_${docId}`),
+      const reply = await this.withTimeout(
+        this.chat.generateAgentReplyWithCharge(userId, String(HOST_AGENT_ID), prompt, `voice_doc_${callId}_${docId}`),
         DOC_TIMEOUT_MS,
       );
-      const body = (text || '').trim();
+      const body = (reply.text || '').trim();
       if (!body) throw new Error('пустой документ');
 
       await this.pg.query(
         `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
-         VALUES ($1, 'ai', $2, $3, 'text', 0)`,
-        [`${userId}_${HOST_AGENT_ID}`, HOST_AGENT_ID, `## ${title}\n\n${body}`],
+         VALUES ($1, 'ai', $2, $3, 'text', $4)`,
+        [`${userId}_${HOST_AGENT_ID}`, HOST_AGENT_ID, `## ${title}\n\n${body}`, reply.tokens],
       );
 
-      await this.safeSend(roomName, { v: 1, type: 'document_ready', docId, title });
-      this.logger.log(`документ «${title}» готов, ${body.length} знаков`);
+      await this.charge(userId, title, reply.tokens);
+      await this.safeSend(roomName, { v: 1, type: 'document_ready', docId, title, tokens: reply.tokens });
+      this.logger.log(`документ «${title}» готов, ${body.length} знаков, ${reply.tokens} токенов`);
     } catch (e: any) {
       const reason = e?.message === 'timeout' ? 'timeout' : 'error';
       this.logger.warn(`документ «${title}» не собран: ${e?.message}`);
       await this.safeSend(roomName, { v: 1, type: 'document_failed', docId, title, reason });
+    }
+  }
+
+  /**
+   * Списать токены за документ. Устроено так же, как у консультаций:
+   * строка в 'pending' с расходом в output_tokens, дальше её подбирает
+   * TokenAccountingService.
+   */
+  private async charge(userId: string, title: string, tokens: number): Promise<void> {
+    if (tokens <= 0) return;
+    try {
+      await this.pg.query(
+        `INSERT INTO token_consumption_tasks (execution_id, user_id, status, agent_id, input_tokens, output_tokens, tokens_to_consume, metadata)
+         VALUES ($1, $2, 'pending', $3, 0, $4, 0, $5)`,
+        [
+          Math.floor(Math.random() * 2_000_000_000), userId, HOST_AGENT_ID, tokens,
+          JSON.stringify({ kind: 'voice_document', title, tokens }),
+        ],
+      );
+    } catch (e: any) {
+      this.logger.warn(`не удалось записать списание за документ «${title}»: ${e?.message}`);
     }
   }
 

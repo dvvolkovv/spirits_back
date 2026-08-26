@@ -1651,7 +1651,32 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * готовый текст. Историю/токены НЕ пишет (это делает вызывающий). Пустой
    * ответ → пустая строка.
    */
+  /**
+   * Ответ ассистента вне основного потока чата. Возвращает только текст —
+   * обёртка над generateAgentReplyWithCharge для вызывающих, которым расход
+   * не нужен (резюме звонка, синтетические пробы).
+   */
   async generateAgentReply(userId: string, assistantId: string, message: string, sessionIdOverride?: string): Promise<string> {
+    const { text } = await this.generateAgentReplyWithCharge(userId, assistantId, message, sessionIdOverride);
+    return text;
+  }
+
+  /**
+   * То же самое, но со стоимостью хода.
+   *
+   * Считается тем же computeSdkCharge, что и обычный ход чата, — иначе одна
+   * и та же консультация стоила бы по-разному в зависимости от того, спросили
+   * её текстом или голосом.
+   *
+   * Раньше этот метод разбирал в потоке только текст, а `costUsd` и `usage` из
+   * события `done` выбрасывал. Из-за этого консультации специалистов во время
+   * звонка не тарифицировались вовсе: голос был бесплатным каналом к платным
+   * ассистентам. Замечено владельцем 26.08.2026, когда он попросил показывать
+   * расход на экране.
+   */
+  async generateAgentReplyWithCharge(
+    userId: string, assistantId: string, message: string, sessionIdOverride?: string,
+  ): Promise<{ text: string; tokens: number; costUsd: number }> {
     const isNumeric = /^\d+$/.test(assistantId);
     const agentRes = isNumeric
       ? await this.pg.query('SELECT * FROM agents WHERE id = $1 LIMIT 1', [parseInt(assistantId, 10)])
@@ -1706,6 +1731,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
         `${userId}_${assistantId}_${await this.language.resolveUserLanguage(userId)}`,
     );
     const chunks: string[] = [];
+    const usage: SdkUsageTotals = {
+      input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
+    };
+    let costUsd = 0;
     const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
       headers: fd.getHeaders(),
       responseType: 'stream',
@@ -1723,13 +1752,25 @@ ${LanguageService.buildDirective(userLanguage)}`;
             const ev = JSON.parse(line.slice(6));
             if (ev.type === 'delta' || ev.type === 'text') chunks.push(ev.text);
             else if (ev.type === 'result' && ev.text && chunks.length === 0) chunks.push(ev.text);
+            else if (ev.type === 'done') {
+              // Стоимость и расход — здесь же, где их берёт основной путь.
+              if (typeof ev.costUsd === 'number' && ev.costUsd > 0) costUsd += ev.costUsd;
+              if (ev.usage && typeof ev.usage === 'object') {
+                for (const k of Object.keys(usage) as (keyof SdkUsageTotals)[]) {
+                  const v = ev.usage[k];
+                  if (typeof v === 'number' && v > 0) usage[k] += v;
+                }
+              }
+            }
           } catch {}
         }
       });
       resp.data.on('end', () => resolve());
       resp.data.on('error', reject);
     });
-    return this.stripToolTags(chunks.join('')).trim();
+    const text = this.stripToolTags(chunks.join('')).trim();
+    const charge = this.computeSdkCharge(usage, costUsd, text);
+    return { text, tokens: charge.tokens, costUsd };
   }
 
   /** Public wrapper для chat.controller — после upload-and-chat обогащаем профиль + tasks. */
