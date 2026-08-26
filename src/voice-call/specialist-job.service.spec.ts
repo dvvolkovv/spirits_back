@@ -110,6 +110,31 @@ describe('SpecialistJobService', () => {
     );
   });
 
+  it('личные ассистенты тоже доступны — не только деловая пятёрка', async () => {
+    const pg = makePg();
+    const chat = { generateAgentReply: jest.fn(async () => 'карта говорит') };
+    const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
+
+    // Шанкара — ведический астролог, id 13. Первая редакция списка включала
+    // только business-ассистентов, и весь personal-блок был недоступен.
+    const res = await svc.ask(CALL, ROOM, 'user-1', 'Шанкара', 'Что по периодам?');
+    await svc.drainForTests();
+
+    expect(res).toMatchObject({ status: 'asked', specialist: 'Шанкара' });
+    expect(pg.jobs[0].specialist_agent_id).toBe(13);
+  });
+
+  it('имя опознаётся без учёта регистра — модель диктует его из речи', async () => {
+    const pg = makePg();
+    const svc = new SpecialistJobService(pg as any, { generateAgentReply: jest.fn(async () => 'ok') } as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
+
+    const res = await svc.ask(CALL, ROOM, 'user-1', '  шанкара ', 'вопрос');
+    await svc.drainForTests();
+
+    expect(res).toMatchObject({ status: 'asked' });
+    expect(pg.jobs[0].specialist_agent_id).toBe(13);
+  });
+
   it('неизвестный специалист отклоняется без создания job', async () => {
     const pg = makePg();
     const svc = new SpecialistJobService(pg as any, { generateAgentReply: jest.fn() } as any, { send: jest.fn() } as any, makeLang() as any);

@@ -5,7 +5,7 @@ import { ChatService } from '../chat/chat.service';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 import { LiveKitClient } from './livekit.client';
 import {
-  AskResult, HOST_AGENT_ID, JOB_TIMEOUT_MS, MAX_PENDING_JOBS, SPECIALISTS,
+  AskResult, findSpecialist, HOST_AGENT_ID, JOB_TIMEOUT_MS, MAX_PENDING_JOBS,
   VOICE_ASK_NOTE, VOICE_BRIEF,
 } from './voice-call.types';
 
@@ -16,8 +16,19 @@ import {
  * синхронно и держит разговор, пока тот не вернётся. Поэтому ask() пишет job,
  * отдаёт jobId и уходит, а ответ доставляется отдельным data-сообщением.
  */
-/** Столько символов не стыдно произнести вслух: примерно 20–25 секунд речи. */
-const SPOKEN_ANSWER_LIMIT = 700;
+/**
+ * Порог, выше которого ответ идёт на сжатие. Примерно 40 секунд речи.
+ *
+ * Было 700, и это стоило лишнего похода в модель почти на каждом ответе:
+ * с VOICE_BRIEF специалисты укладываются в 700–900 знаков, то есть чуть
+ * выше порога — мы гоняли отдельный вызов LLM, чтобы срезать сотню символов,
+ * и добавляли эту задержку прямо в разговор (звонок 26.08.2026: ответы 704
+ * и 802 знака, оба ушли на сжатие).
+ *
+ * Теперь сжимаются только настоящие трактаты — когда специалист проигнорировал
+ * просьбу быть кратким.
+ */
+const SPOKEN_ANSWER_LIMIT = 1200;
 /** Сжатие не должно тянуться дольше, чем сам ответ ждали. */
 const CONDENSE_TIMEOUT_MS = 45_000;
 
@@ -53,7 +64,7 @@ export class SpecialistJobService {
     specialist: string,
     question: string,
   ): Promise<AskResult> {
-    const agentId = SPECIALISTS[specialist];
+    const agentId = findSpecialist(specialist);
     if (!agentId) return { status: 'rejected', reason: 'unknown_specialist' };
 
     let pending = this.pendingByCall.get(callId);
