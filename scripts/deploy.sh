@@ -45,6 +45,8 @@
 #   PROD_BACK_PATH     /home/dvolkov/spirits_back
 #   PROD_FRONT_SRC     /home/dvolkov/spirits_front_src
 #   PROD_FRONT_SERVED  /home/dvolkov/spirits_front
+#   PROD_NGINX_CONF    /etc/nginx/sites-enabled/spirits (живой файл, НЕ симлинк —
+#                      sites-available/spirits на проде устарел и не действует)
 #   PROD_BASE_URL      https://my.linkeon.io
 #   PROD_LAND_PATH     /home/dvolkov/land_linkeon
 #   LAND_BASE_URL      https://linkeon.io
@@ -416,6 +418,14 @@ deploy_frontend() {
     red "  ⚠ dist/tma.html не собрался ($ENV_NAME) — Mini App отсутствует в этом билде"
   fi
   green "  ✓ frontend bundle deployed ($ENV_NAME)"
+
+  # Инфраструктурный шаг, не зависящий от того, собрался ли в ЭТОМ билде
+  # tma.html: location /tma/ должен быть в nginx ДО smoke, и должен быть
+  # на обеих фазах одинаково — иначе именно это молча дрейфует между test
+  # и prod (см. шапку функции). Падение здесь — то же самое, что и
+  # падение сборки: без него дальнейший smoke_frontend_tma гарантированно
+  # красный, а прод-nginx мог остаться жив только случайно.
+  ensure_tma_nginx_block || { red "  ✗ TMA nginx setup failed ($ENV_NAME) — деплой остановлен"; exit 1; }
 }
 
 # ── PHASE 3: лендинг linkeon.io ───────────────────────────────────────────────
@@ -548,6 +558,174 @@ run_landing_phase() {
   return 1
 }
 
+# Гарантирует наличие location-блока Telegram Mini App (/tma/) в nginx-конфиге
+# фазы. Раньше блок был только на test, добавленный руками в обход git — на
+# main этой правки не было вовсе, а deploy.sh уже получил smoke_frontend_tma,
+# который честно валит прод, где location /tma/ никогда не существовал.
+# Следующий же деплой (любого, по любому несвязанному поводу) после мержа
+# в main докатился бы до прод-фазы и увидел на проде ровно то же самое
+# отсутствие блока — красный smoke, паника, ручная правка прод-nginx под
+# давлением. Автоматизируем то же самое, что раньше делали руками, и делаем
+# идемпотентно на КАЖДОЙ фазе (test и prod), чтобы дрейф между ними стал
+# невозможен в принципе.
+#
+# Путь конфига РАЗНЫЙ на test и на проде (см. NGINX_CONF_PATH в run_phase):
+#   test — /etc/nginx/sites-available/test.linkeon.io, sites-enabled — симлинк на него;
+#   prod — /etc/nginx/sites-enabled/spirits САМ является живым файлом (не
+#     симлинк, sites-available/spirits — устаревшая недействующая копия).
+#     Отсюда и предостережение в CLAUDE.md: класть бэкап РЯДОМ, в
+#     sites-enabled/, нельзя — nginx читает там ВСЁ, и лишний файл валит
+#     nginx -t дублирующимся default_server.
+#
+# Идемпотентность — по стабильному маркеру-комментарию, а не по побайтовому
+# совпадению блока: ручные правки / форматирование не должны каждый раз
+# восприниматься как «блока нет» и провоцировать лишний reload.
+#
+# Вставляем ПЕРЕД SPA-фолбэком `location /` (как и было на test изначально) —
+# это тот самый bare `location /`, который отдаёт index.html на любой путь;
+# если наш блок окажется после него по логике/переносимости конфига, легче
+# перепутать порядок при будущей ручной правке. Ищем именно server-блок,
+# соответствующий домену этой фазы ($BASE_URL), а не первый попавшийся
+# `location /` в файле — на проде их несколько (b.linkeon.io редирект,
+# linkeon.io лендинг, my.linkeon.io — нужен только последний), а на test
+# один и тот же server_name встречается и в :80-редиректе (там location /
+# делает return 301, а не отдаёт SPA — это НЕ то место).
+ensure_tma_nginx_block() {
+  local conf="$NGINX_CONF_PATH"
+  local marker="# --- deploy.sh: Telegram Mini App (/tma/) — блок управляется автоматически, руками не трогать ---"
+
+  bold "[front] проверяю TMA nginx-блок ($ENV_NAME: $conf)"
+
+  local current
+  current=$(ssh_remote "sudo cat $conf" 2>/dev/null)
+  if [[ -z "$current" ]]; then
+    red "  ✗ не удалось прочитать $conf ($ENV_NAME) — TMA nginx-блок не проверен"
+    return 1
+  fi
+
+  # Проверяем ПО МАРКЕРУ, но также по факту наличия самого location /tma/ —
+  # на test этот блок уже стоит живьём, добавленный руками в обход git ДО
+  # этой правки, то есть без нашего маркера. Проверка только по маркеру
+  # приняла бы такой блок за «отсутствующий» и попыталась бы вставить
+  # ВТОРОЙ location /tma/ рядом — nginx -t упал бы на дубликате location,
+  # и хотя это отловилось бы safety-restore'ом ниже, реального «ничего не
+  # трогаю» (как требует идемпотентность) не получилось бы: бэкап, попытка
+  # записи, красный nginx -t, откат — churn там, где не должно быть вообще
+  # никакого движения.
+  if grep -qF "$marker" <<<"$current" || grep -qE '^[[:space:]]*location[[:space:]]*/tma/[[:space:]]*\{' <<<"$current"; then
+    green "  ✓ TMA nginx-блок уже на месте ($ENV_NAME) — reload не нужен"
+    return 0
+  fi
+
+  bold "  блока нет в $conf ($ENV_NAME) — добавляю перед SPA-фолбэком location /"
+
+  # Домен этой фазы — по нему отличаем нужный server{} от прочих (лендинг,
+  # b.linkeon.io редирект, :80-редирект того же домена на test).
+  local host_pattern
+  host_pattern=$(sed -E 's#^https?://##' <<<"$BASE_URL")
+
+  # alias — не root: префикс /tma/ не часть пути на диске (см. живой блок на
+  # test, откуда это и списано). try_files $uri (не /tma.html!) — версия с
+  # ведущим слэшем игнорировала $uri и заворачивала ЛЮБОЙ путь под /tma/,
+  # включая /tma/assets/*.js, на HTML — ломая все ассеты.
+  local block
+  block=$(cat <<BLOCK
+  $marker
+  location = /tma {
+    return 301 /tma/;
+  }
+  location /tma/ {
+    alias $FRONT_SERVED/;
+    try_files \$uri tma.html =404;
+  }
+BLOCK
+)
+
+  # Собираем итоговый конфиг ЛОКАЛЬНО построчным bash-циклом (не awk: awk
+  # macOS/BSD ("one true awk") падает с "newline in string" при передаче
+  # многострочного $block через -v — POSIX это разрешает только некоторым
+  # реализациям; проверено эмпирически при тестировании этой функции).
+  # Состояние по server{}: is_plain_http отсекает :80-блок того же
+  # server_name (на test у него тоже "server_name test.linkeon.io;", но его
+  # location / — это return 301, а не SPA-фолбэк). Закрывающая '}' без
+  # отступа — граница server{} (вложенные location/if закрываются с отступом).
+  local new_conf="" line
+  local in_server=0 is_plain_http=0 is_target=0 inserted=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^[[:space:]]*server[[:space:]]*\{ ]]; then
+      in_server=1; is_plain_http=0; is_target=0
+    fi
+    if [[ $in_server -eq 1 && "$line" =~ listen[[:space:]]+80([[:space:]]|\;) ]]; then
+      is_plain_http=1
+    fi
+    if [[ $in_server -eq 1 && $is_plain_http -eq 0 && "$line" == *"server_name"*"$host_pattern"* ]]; then
+      is_target=1
+    fi
+    if [[ $is_target -eq 1 && $is_plain_http -eq 0 && $inserted -eq 0 \
+          && "$line" =~ ^[[:space:]]*location[[:space:]]+/[[:space:]]*\{ ]]; then
+      new_conf+="$block"$'\n'
+      inserted=1
+    fi
+    new_conf+="$line"$'\n'
+    if [[ "$line" =~ ^\} ]]; then
+      in_server=0
+    fi
+  done <<<"$current"
+
+  if [[ $inserted -ne 1 ]]; then
+    red "  ✗ не нашёл подходящий 'location /' в server-блоке для $host_pattern ($ENV_NAME, $conf)"
+    red "    TMA-блок НЕ добавлен — разбираться руками, автоматика не угадывает структуру конфига"
+    return 1
+  fi
+
+  # Всё дальнейшее — ОДНИМ ssh-вызовом: бэкап → запись → nginx -t → reload
+  # или откат. Бэкап — в отдельный каталог /etc/nginx/deploy-backups, НЕ в
+  # sites-enabled/ (там nginx читает вообще всё — лишний файл там уже валил
+  # nginx -t дублирующимся default_server, см. CLAUDE.md) и не в conf.d/
+  # (там `include *.conf`, тоже подхватило бы бэкап при .conf-суффиксе).
+  # Содержимое гоняем через base64 одной строкой внутри команды (а не через
+  # stdin-pipe в ssh_remote) — ssh_remote ретраит команду при обрыве связи
+  # (код 255), а pipe из локальной переменной на повторной попытке был бы
+  # уже пуст. base64 — в самом аргументе команды, retry получит его заново.
+  local b64
+  # \r тоже вычищаем: BSD/macOS `base64` (в отличие от GNU) заворачивает
+  # вывод CRLF-переносами — голого `tr -d '\n'` мало, одинокие \r остаются
+  # внутри «однострочной» строки и валят GNU `base64 -d` на удалённом
+  # Ubuntu-хосте с "invalid input" (проверено эмпирически при тестировании).
+  b64=$(printf '%s' "$new_conf" | base64 | tr -d '\r\n')
+
+  local remote_out
+  remote_out=$(ssh_remote "
+    set -e
+    ts=\$(date +%Y%m%d%H%M%S)
+    bdir=/etc/nginx/deploy-backups
+    sudo mkdir -p \$bdir
+    bak=\$bdir/$(basename "$conf").\$ts.bak
+    sudo cp $conf \$bak
+    tmp=\$(mktemp)
+    echo '$b64' | base64 -d > \"\$tmp\"
+    sudo cp \"\$tmp\" $conf
+    rm -f \"\$tmp\"
+    if sudo nginx -t 2>&1; then
+      sudo systemctl reload nginx
+      echo TMA_NGINX_RESULT:OK
+    else
+      echo '  ! nginx -t упал на новом TMA-блоке — откатываю \$bak обратно' >&2
+      sudo cp \$bak $conf
+      sudo nginx -t >&2 || echo '  !! ВОССТАНОВЛЕННЫЙ конфиг ТОЖЕ не проходит nginx -t — чинить руками немедленно' >&2
+      echo TMA_NGINX_RESULT:FAIL
+    fi
+  ")
+  echo "$remote_out" | grep -v '^TMA_NGINX_RESULT:'
+
+  if grep -q '^TMA_NGINX_RESULT:OK' <<<"$remote_out"; then
+    green "  ✓ TMA nginx-блок добавлен и nginx перезагружен ($ENV_NAME)"
+    return 0
+  fi
+  red "  ✗ nginx -t не прошёл на новом TMA-блоке ($ENV_NAME) — конфиг восстановлен из бэкапа, reload НЕ выполнен"
+  return 1
+}
+
 # Смоук Telegram Mini App (/tma/, отдельная точка входа — vite.config.ts
 # rollupOptions.input.tma). Как и smoke_landing — КОД ОТВЕТА ЗДЕСЬ НИЧЕГО НЕ
 # ЗНАЧИТ: и на test, и на проде nginx отдаёт index.html с кодом 200 на любой
@@ -614,6 +792,8 @@ run_phase() {
       BASIC_AUTH="${TEST_BASIC_AUTH:-}"
       SSH_TARGET="$TEST_HOST"
       PG_DSN="${TEST_PG_DSN:-}"
+      # sites-enabled/test.linkeon.io — симлинк НА этот файл (см. ensure_tma_nginx_block).
+      NGINX_CONF_PATH="${TEST_NGINX_CONF:-/etc/nginx/sites-available/test.linkeon.io}"
       ;;
     prod)
       ENV_NAME=prod
@@ -626,9 +806,13 @@ run_phase() {
       BASIC_AUTH=
       SSH_TARGET="$PROD_HOST"
       PG_DSN=  # smoke.js имеет default для прода
+      # На проде sites-enabled/spirits — САМ живой файл, а не симлинк на
+      # sites-available (та копия устарела и не действует). См. шапку
+      # ensure_tma_nginx_block — почему это важно для бэкапов.
+      NGINX_CONF_PATH="${PROD_NGINX_CONF:-/etc/nginx/sites-enabled/spirits}"
       ;;
   esac
-  export ENV_NAME HOST PATH_EXPORT BACK_PATH FRONT_SRC FRONT_SERVED BASE_URL BASIC_AUTH BRANCH SSH_TARGET PG_DSN
+  export ENV_NAME HOST PATH_EXPORT BACK_PATH FRONT_SRC FRONT_SERVED BASE_URL BASIC_AUTH BRANCH SSH_TARGET PG_DSN NGINX_CONF_PATH
 
   # Сбрасываем перед каждой фазой: без этого прод унаследовал бы значение,
   # которое deploy_frontend выставила на ПРЕДЫДУЩЕЙ (test) фазе того же
