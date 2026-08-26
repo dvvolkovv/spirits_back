@@ -383,7 +383,17 @@ deploy_frontend() {
   push_local_repo "$LOCAL_FRONT_DIR" "spirits_front"
 
   bold "[front 2/2] pulling on $ENV_NAME + building + deploying to nginx dir"
-  ssh_remote "
+  # Ловим имя бандла, которое этот билд ИМЕННО ЧТО произвёл (из свежесобранного
+  # dist/tma.html), а не то, что могло остаться в $FRONT_SERVED от прошлого
+  # деплоя — rsync без --delete старое не чистит (см. шапку файла). Печатаем
+  # его последней строкой-маркером и вытаскиваем ниже в EXPECTED_TMA_BUNDLE:
+  # smoke_frontend_tma сверяет served-контент именно с этим значением, а не
+  # со слабым «отличается от веб-бандла» — та проверка зеленеет и на
+  # осиротевшем /tma/, оставшемся от совсем другого, более старого деплоя.
+  # Если dist/tma.html не собрался (Mini App выпал из билда) — TMA_JS пустой,
+  # это не должно валить set -e, поэтому пайп заканчивается на head (exit 0).
+  local frontend_log
+  if ! frontend_log=$(ssh_remote "
     set -e
     cd $FRONT_SRC
     git fetch origin
@@ -392,7 +402,19 @@ deploy_frontend() {
     pnpm install --frozen-lockfile 2>&1 | tail -3
     pnpm build 2>&1 | tail -3
     rsync -az dist/ $FRONT_SERVED/
-  " || { red "  frontend deploy failed ($ENV_NAME)"; exit 1; }
+    TMA_JS=\$(grep -oE 'assets/[a-zA-Z0-9._-]*\.js' dist/tma.html 2>/dev/null | head -1)
+    echo TMA_BUNDLE_MARKER:\$TMA_JS
+  "); then
+    echo "$frontend_log" | grep -v '^TMA_BUNDLE_MARKER:'
+    red "  frontend deploy failed ($ENV_NAME)"
+    exit 1
+  fi
+  echo "$frontend_log" | grep -v '^TMA_BUNDLE_MARKER:'
+  EXPECTED_TMA_BUNDLE=$(echo "$frontend_log" | grep '^TMA_BUNDLE_MARKER:' | tail -1 | cut -d: -f2-)
+  export EXPECTED_TMA_BUNDLE
+  if [[ -z "$EXPECTED_TMA_BUNDLE" ]]; then
+    red "  ⚠ dist/tma.html не собрался ($ENV_NAME) — Mini App отсутствует в этом билде"
+  fi
   green "  ✓ frontend bundle deployed ($ENV_NAME)"
 }
 
@@ -531,22 +553,50 @@ run_landing_phase() {
 # ЗНАЧИТ: и на test, и на проде nginx отдаёт index.html с кодом 200 на любой
 # незанятый путь (SPA-фолбэк), поэтому "/tma/ вернул 200" было бы зелёным
 # даже при полностью отсутствующем location /tma/ в nginx, то есть при
-# полностью мёртвом Mini App. Сравниваем СОДЕРЖИМОЕ: бандл, отданный на
-# /tma/, должен существовать и отличаться от бандла на /.
+# полностью мёртвом Mini App. Сравниваем СОДЕРЖИМОЕ.
+#
+# Раньше сравнение было только "бандл на /tma/ отличается от бандла на /" —
+# и это ловит SPA-фолбэк, но НЕ ловит осиротевший артефакт: rsync в
+# deploy_frontend работает БЕЗ --delete (см. шапку файла), поэтому старый
+# tma.html + старый tma-*.js могут годами пережить деплой, из которого
+# Mini App вообще пропал. Наблюдалось живьём на test 2026-08-26: чекаут был
+# на ветке без Mini App вовсе, dist/tma.html не собирался, а /tma/ всё равно
+# отдавал leftover прошлого деплоя — leftover‑бандл, естественно, отличался
+# от текущего веб-бандла, и старая проверка репортила зелёный.
+#
+# Поэтому теперь, если этой фазой фронт был только что собран (deploy_frontend
+# передал $expected — имя бандла из СВЕЖЕГО dist/tma.html), проверяем именно
+# "served == только что собранному", а не "served != web". Если фронт в этой
+# фазе не деплоился (SMOKE_ONLY=1 / BACK_ONLY=1 — свежего билда просто нет,
+# сравнивать не с чем), деградируем к старой слабой проверке: лучше слабый
+# сигнал, чем ложный fail на здоровом, но не пересобиравшемся в этом прогоне
+# фронте.
 smoke_frontend_tma() {
-  local base="$1" auth="${2:-}"
+  local base="$1" auth="${2:-}" expected="${3:-}"
   local tma_bundle web_bundle
   tma_bundle=$(curl -sf ${auth:+-u "$auth"} "$base/tma/" | grep -o 'src="/assets/[a-zA-Z0-9._-]*\.js"' | head -1)
-  web_bundle=$(curl -sf ${auth:+-u "$auth"} "$base/"     | grep -o 'src="/assets/[a-zA-Z0-9._-]*\.js"' | head -1)
   if [[ -z "$tma_bundle" ]]; then
     red "  ✗ /tma/ не отдал бандл ($ENV_NAME)"
     return 1
   fi
+
+  if [[ -n "$expected" ]]; then
+    if [[ "$tma_bundle" != *"$expected"* ]]; then
+      red "  ✗ /tma/ отдаёт НЕ тот бандл, что этот деплой только что собрал ($ENV_NAME): served=$tma_bundle, ожидали содержащий $expected"
+      return 1
+    fi
+    green "  ✓ Mini App отдаёт именно свежесобранный бандл ($ENV_NAME): $tma_bundle"
+    return 0
+  fi
+
+  # Фолбэк: фронт в этой фазе не деплоился, свежего dist/tma.html нет.
+  # Всё ещё ловит SPA-фолбэк, но не ловит orphaned-leftover сценарий выше.
+  web_bundle=$(curl -sf ${auth:+-u "$auth"} "$base/" | grep -o 'src="/assets/[a-zA-Z0-9._-]*\.js"' | head -1)
   if [[ "$tma_bundle" == "$web_bundle" ]]; then
     red "  ✗ /tma/ отдаёт веб-бандл ($ENV_NAME) — сработал SPA-фолбэк, location /tma/ не применился"
     return 1
   fi
-  green "  ✓ Mini App отдаётся своим бандлом ($ENV_NAME): $tma_bundle"
+  bold "  ⚠ Mini App отдаёт свой бандл ($ENV_NAME), но без сверки со свежим билдом (фронт в этой фазе не деплоился): $tma_bundle"
   return 0
 }
 
@@ -579,6 +629,14 @@ run_phase() {
       ;;
   esac
   export ENV_NAME HOST PATH_EXPORT BACK_PATH FRONT_SRC FRONT_SERVED BASE_URL BASIC_AUTH BRANCH SSH_TARGET PG_DSN
+
+  # Сбрасываем перед каждой фазой: без этого прод унаследовал бы значение,
+  # которое deploy_frontend выставила на ПРЕДЫДУЩЕЙ (test) фазе того же
+  # запуска, и smoke_frontend_tma сверяла бы прод-бандл с чужим, тестовым
+  # ожиданием. Если в этой фазе deploy_frontend не вызывается (SMOKE_ONLY=1 /
+  # BACK_ONLY=1), переменная должна остаться пустой — это сигнал для
+  # smoke_frontend_tma деградировать к слабой проверке.
+  unset EXPECTED_TMA_BUNDLE
 
   if [[ -z "${SMOKE_ONLY:-}" ]]; then
     # Capture pre-deploy state on prod (по умолчанию) для авто-rollback'а
@@ -642,7 +700,7 @@ run_phase() {
     # smoke_frontend_tma). Не участвует в SMOKE_ATTEMPTS-ретраях основного
     # smoke/run.sh: это статическая проверка nginx-конфига и собранного
     # бандла, а не прогретого/холодного бэкенд-пути — флапать ей нечему.
-    if ! smoke_frontend_tma "$BASE_URL" "$BASIC_AUTH"; then
+    if ! smoke_frontend_tma "$BASE_URL" "$BASIC_AUTH" "${EXPECTED_TMA_BUNDLE:-}"; then
       red "  ✗ SMOKE FAILED ($ENV_NAME) — Mini App (/tma/) не прошёл проверку"
       if [[ "$phase" == "prod" && -z "${NO_ROLLBACK:-}" && -z "${SMOKE_ONLY:-}" ]]; then
         rollback_phase || red "  ✗ rollback had partial failures — check $ENV_NAME manually"
