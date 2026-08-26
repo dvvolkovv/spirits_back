@@ -1,5 +1,7 @@
 import { SpecialistJobService } from './specialist-job.service';
-import { VOICE_ASK_NOTE, VOICE_BRIEF } from './voice-call.types';
+import {
+  findSpecialist, SPECIALIST_ROLES, SPECIALISTS, VOICE_ASK_NOTE, VOICE_BRIEF,
+} from './voice-call.types';
 
 /** Заглушка PgService: помнит job'ы и строки истории в памяти. */
 function makePg() {
@@ -40,6 +42,35 @@ function makePg() {
 function makeLang(language = 'ru') {
   return { resolveUserLanguage: jest.fn(async () => language) };
 }
+
+describe('состав списка специалистов', () => {
+  it('у каждого специалиста есть описание роли', () => {
+    // Без роли Роман выбирает по имени наугад: 26.08.2026 юридический вопрос
+    // уехал бухгалтеру, а архитектура телефонии — юристу. Добавить имя в
+    // SPECIALISTS и забыть про SPECIALIST_ROLES — ровно этот сценарий.
+    const withoutRole = Object.keys(SPECIALISTS).filter((n) => !SPECIALIST_ROLES[n]?.trim());
+    expect(withoutRole).toEqual([]);
+  });
+
+  it('описания не приписаны тем, кого нет в списке', () => {
+    const orphans = Object.keys(SPECIALIST_ROLES).filter((n) => !SPECIALISTS[n]);
+    expect(orphans).toEqual([]);
+  });
+
+  it('id уникальны — иначе вопрос уходит не тому', () => {
+    const ids = Object.values(SPECIALISTS);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('ведущий не может спросить сам себя', () => {
+    // HOST_AGENT_ID = 12 (Роман). Попади он в список — получилась бы петля.
+    expect(Object.values(SPECIALISTS)).not.toContain(12);
+  });
+
+  it('технический директор на месте', () => {
+    expect(findSpecialist('Кирилл')).toBe(19);
+  });
+});
 
 describe('SpecialistJobService', () => {
   const ROOM = 'voice_test_room';
