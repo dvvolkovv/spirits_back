@@ -16,7 +16,8 @@ describe('VoiceCallInternalController: доступ', () => {
       complete: jest.fn(),
       fail: jest.fn(),
     };
-    return { ctl: new VoiceCallInternalController(jobs as any, calls as any), jobs, calls };
+    const docs = { create: jest.fn(() => ({ status: 'accepted', docId: 'd1', title: 'Письмо' })) };
+    return { ctl: new VoiceCallInternalController(jobs as any, calls as any, docs as any), jobs, calls, docs };
   }
 
   beforeEach(() => { process.env.VOICE_CALLBACK_SECRET = SECRET; });
@@ -76,5 +77,31 @@ describe('VoiceCallInternalController: доступ', () => {
     const res = await ctl.ask(signBody(SECRET, raw), req(raw));
     expect(res).toMatchObject({ status: 'rejected' });
     expect(jobs.ask).not.toHaveBeenCalled();
+  });
+
+  describe('/document', () => {
+    const docBody = { callId: 'call-1', title: 'Письмо', instructions: 'коротко' };
+    const docRaw = JSON.stringify(docBody);
+
+    it('ручка документов тоже закрыта подписью', async () => {
+      const { ctl, docs } = makeCtl();
+      await expect(ctl.document('' as any, req(docRaw))).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(docs.create).not.toHaveBeenCalled();
+    });
+
+    it('с верной подписью документ ставится в работу', async () => {
+      const { ctl, docs } = makeCtl();
+      const res = await ctl.document(signBody(SECRET, docRaw), req(docRaw));
+      expect(res).toMatchObject({ status: 'accepted' });
+      expect(docs.create).toHaveBeenCalledWith('call-1', 'room-1', 'u1', 'Письмо', 'коротко');
+    });
+
+    it('документ по завершённому звонку не сочиняем', async () => {
+      const { ctl, docs, calls } = makeCtl();
+      calls.load = jest.fn(async () => ({ id: 'call-1', user_id: 'u1', room_name: 'room-1', status: 'completed' })) as any;
+      const res = await ctl.document(signBody(SECRET, docRaw), req(docRaw));
+      expect(res).toMatchObject({ status: 'rejected' });
+      expect(docs.create).not.toHaveBeenCalled();
+    });
   });
 });
