@@ -79,7 +79,20 @@ export default defineAgent({
     const session = new voice.AgentSession({
       llm: new openai.realtime.RealtimeModel({
         model: process.env.VOICE_MODEL || 'gpt-realtime-2.1',
-        voice: process.env.VOICE_NAME || 'alloy',
+        // Голоса Realtime — канонический список отдаёт сам API, если послать
+        // неверное значение: alloy, ash, ballad, coral, echo, sage, shimmer,
+        // verse, marin, cedar.
+        //
+        // Выбран НА СЛУХ, и это принципиально. Сначала стоял alloy как
+        // «нейтральный дефолт» — он женский, хотя Роман мужчина и в каталоге
+        // голосов проекта (src/speech/voices.ts) ему назначены мужские
+        // zahar/onyx. Потом я заменил его на marin, рассудив по поколению
+        // модели, и снова не послушал: marin тоже женский.
+        //
+        // Так что голос определяется ушами, а не описанием. Сэмплер, которым
+        // сравнивались кандидаты, — в истории сессии 26.08.2026: короткая
+        // Realtime-сессия на каждый голос, одна фраза, WAV в MinIO.
+        voice: process.env.VOICE_NAME || 'cedar',
       }),
     });
 
