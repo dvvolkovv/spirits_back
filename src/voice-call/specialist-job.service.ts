@@ -2,8 +2,12 @@ import { Injectable, Logger } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { ChatService } from '../chat/chat.service';
+import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 import { LiveKitClient } from './livekit.client';
-import { AskResult, HOST_AGENT_ID, JOB_TIMEOUT_MS, MAX_PENDING_JOBS, SPECIALISTS } from './voice-call.types';
+import {
+  AskResult, HOST_AGENT_ID, JOB_TIMEOUT_MS, MAX_PENDING_JOBS, SPECIALISTS,
+  VOICE_ASK_NOTE, VOICE_BRIEF,
+} from './voice-call.types';
 
 /**
  * Мост между быстрым голосовым ведущим и медленными профильными ассистентами.
@@ -39,6 +43,7 @@ export class SpecialistJobService {
     private readonly pg: PgService,
     private readonly chat: ChatService,
     private readonly livekit: LiveKitClient,
+    private readonly language: LanguageService,
   ) {}
 
   async ask(
@@ -108,8 +113,11 @@ export class SpecialistJobService {
       // сессией пользователя релей отдаёт пустой поток — инцидент 2026-07-12,
       // см. quality-monitor.service.ts:probeOnce.
       const sessionId = `voice_${callId}_${jobId}`;
+      // К вопросу приписываем требование краткости: ответ пойдёт в голос.
+      // В voice_call_jobs и в чат специалиста кладём вопрос БЕЗ приписки —
+      // там нужен тот вопрос, который задал Роман, а не наша служебка.
       const text = await this.withTimeout(
-        this.chat.generateAgentReply(userId, String(agentId), question, sessionId),
+        this.chat.generateAgentReply(userId, String(agentId), `${VOICE_BRIEF}\n\n${question}`, sessionId),
         JOB_TIMEOUT_MS,
       );
 
@@ -122,6 +130,8 @@ export class SpecialistJobService {
         `UPDATE voice_call_jobs SET status = 'done', answer = $1, finished_at = now(), latency_ms = $2 WHERE id = $3`,
         [answer, Date.now() - started, jobId],
       );
+
+      await this.recordInSpecialistChat(userId, agentId, question, answer);
 
       // А в голос уходит короткая выжимка.
       //
@@ -140,6 +150,47 @@ export class SpecialistJobService {
         [Date.now() - started, jobId],
       );
       await this.safeSend(roomName, { v: 1, type: 'specialist_failed', jobId, specialist, reason });
+    }
+  }
+
+  /**
+   * Записать консультацию в обычный чат со специалистом.
+   *
+   * До этого голосовые консультации не оставляли следа нигде, кроме
+   * voice_call_jobs, которую не отдаёт ни один эндпоинт: пользователь слышал
+   * ответ Алексея, а назавтра в чате с Алексеем не было ни вопроса, ни ответа —
+   * и сам Алексей ничего не помнил, потому что контекст следующего хода
+   * строится из custom_chat_history (chat.service.ts:431).
+   *
+   * Исполняем job в изолированной сессии (иначе релей отдаёт пустой поток при
+   * коллизии), а записываем в обычную `<userId>_<agentId>` — где исполнять и
+   * где хранить это разные вопросы, и разводить их правильно.
+   *
+   * Сбой записи job не роняет: ответ уже прозвучал, разговор идёт дальше.
+   */
+  private async recordInSpecialistChat(
+    userId: string, agentId: number, question: string, answer: string,
+  ): Promise<void> {
+    try {
+      const lang = await this.language.resolveUserLanguage(userId);
+      const note = VOICE_ASK_NOTE[lang] || VOICE_ASK_NOTE[DEFAULT_LANGUAGE];
+      const sessionId = `${userId}_${agentId}`;
+      // Двумя отдельными запросами, а не одним INSERT на две строки: история
+      // сортируется по created_at, а внутри одного оператора он у обеих строк
+      // одинаковый (это время транзакции) — вопрос и ответ могли бы
+      // перевернуться местами. Так же устроен и основной путь чата.
+      await this.pg.query(
+        `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
+         VALUES ($1, 'human', $2, $3, 'text')`,
+        [sessionId, agentId, `${note}\n\n${question}`],
+      );
+      await this.pg.query(
+        `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
+         VALUES ($1, 'ai', $2, $3, 'text', 0)`,
+        [sessionId, agentId, answer],
+      );
+    } catch (e: any) {
+      this.logger.warn(`консультация не записана в чат agent=${agentId}: ${e?.message}`);
     }
   }
 

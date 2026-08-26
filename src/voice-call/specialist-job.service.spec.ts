@@ -1,11 +1,18 @@
 import { SpecialistJobService } from './specialist-job.service';
+import { VOICE_ASK_NOTE, VOICE_BRIEF } from './voice-call.types';
 
-/** Заглушка PgService: помнит job'ы в памяти. */
+/** Заглушка PgService: помнит job'ы и строки истории в памяти. */
 function makePg() {
   const jobs: any[] = [];
+  const history: any[] = [];
   return {
     jobs,
+    history,
     query: jest.fn(async (sql: string, params: any[] = []) => {
+      if (/INSERT INTO custom_chat_history/i.test(sql)) {
+        history.push({ session_id: params[0], agent: params[1], content: params[2], sender_type: /'human'/.test(sql) ? 'human' : 'ai' });
+        return { rows: [], rowCount: 1 };
+      }
       if (/INSERT INTO voice_call_jobs/i.test(sql)) {
         jobs.push({ id: params[0], call_id: params[1], specialist_agent_id: params[2], status: 'queued' });
         return { rows: [], rowCount: 1 };
@@ -29,6 +36,11 @@ function makePg() {
   };
 }
 
+/** Заглушка LanguageService. */
+function makeLang(language = 'ru') {
+  return { resolveUserLanguage: jest.fn(async () => language) };
+}
+
 describe('SpecialistJobService', () => {
   const ROOM = 'voice_test_room';
   const CALL = '11111111-1111-1111-1111-111111111111';
@@ -37,7 +49,7 @@ describe('SpecialistJobService', () => {
     const pg = makePg();
     const chat = { generateAgentReply: jest.fn(async () => 'ответ юриста') };
     const lk = { send: jest.fn(async () => {}) };
-    const svc = new SpecialistJobService(pg as any, chat as any, lk as any);
+    const svc = new SpecialistJobService(pg as any, chat as any, lk as any, makeLang() as any);
 
     const started = Date.now();
     const res = await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'Можно ли так?');
@@ -53,7 +65,7 @@ describe('SpecialistJobService', () => {
     const pg = makePg();
     const chat = { generateAgentReply: jest.fn(async () => 'ответ юриста') };
     const lk = { send: jest.fn(async () => {}) };
-    const svc = new SpecialistJobService(pg as any, chat as any, lk as any);
+    const svc = new SpecialistJobService(pg as any, chat as any, lk as any, makeLang() as any);
 
     const res = await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'Можно ли так?');
     await svc.drainForTests();
@@ -73,7 +85,7 @@ describe('SpecialistJobService', () => {
     const pg = makePg();
     const chat = { generateAgentReply: jest.fn(async () => 'ok') };
     const lk = { send: jest.fn(async () => {}) };
-    const svc = new SpecialistJobService(pg as any, chat as any, lk as any);
+    const svc = new SpecialistJobService(pg as any, chat as any, lk as any, makeLang() as any);
 
     await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'вопрос один');
     await svc.ask(CALL, ROOM, 'user-1', 'Анна', 'вопрос два');
@@ -88,7 +100,7 @@ describe('SpecialistJobService', () => {
     const pg = makePg();
     const chat = { generateAgentReply: jest.fn(async () => { throw new Error('релей лёг'); }) };
     const lk = { send: jest.fn(async () => {}) };
-    const svc = new SpecialistJobService(pg as any, chat as any, lk as any);
+    const svc = new SpecialistJobService(pg as any, chat as any, lk as any, makeLang() as any);
 
     await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'вопрос');
     await expect(svc.drainForTests()).resolves.toBeUndefined();
@@ -100,7 +112,7 @@ describe('SpecialistJobService', () => {
 
   it('неизвестный специалист отклоняется без создания job', async () => {
     const pg = makePg();
-    const svc = new SpecialistJobService(pg as any, { generateAgentReply: jest.fn() } as any, { send: jest.fn() } as any);
+    const svc = new SpecialistJobService(pg as any, { generateAgentReply: jest.fn() } as any, { send: jest.fn() } as any, makeLang() as any);
     const res = await svc.ask(CALL, ROOM, 'user-1', 'Гэндальф', 'вопрос');
     expect(res).toEqual({ status: 'rejected', reason: 'unknown_specialist' });
     expect(pg.jobs).toHaveLength(0);
@@ -109,7 +121,7 @@ describe('SpecialistJobService', () => {
   it('четвёртый параллельный вопрос отклоняется', async () => {
     const pg = makePg();
     const chat = { generateAgentReply: jest.fn(() => new Promise<string>(() => {})) }; // висит
-    const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any);
+    const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
 
     await svc.ask(CALL, ROOM, 'u', 'Алексей', 'раз');
     await svc.ask(CALL, ROOM, 'u', 'Анна', 'два');
@@ -117,5 +129,76 @@ describe('SpecialistJobService', () => {
     const fourth = await svc.ask(CALL, ROOM, 'u', 'Андрей', 'четыре');
 
     expect(fourth).toEqual({ status: 'rejected', reason: 'too_many_pending' });
+  });
+
+  it('консультация попадает в обычный чат со специалистом, с пометкой про голос', async () => {
+    const pg = makePg();
+    const chat = { generateAgentReply: jest.fn(async () => 'коротко: так можно') };
+    const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
+
+    await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'Можно ли так?');
+    await svc.drainForTests();
+
+    // Алексей — agent id 10, значит сессия обычного чата с ним.
+    expect(pg.history).toEqual([
+      expect.objectContaining({
+        session_id: 'user-1_10',
+        sender_type: 'human',
+        content: `${VOICE_ASK_NOTE.ru}\n\nМожно ли так?`,
+      }),
+      expect.objectContaining({
+        session_id: 'user-1_10',
+        sender_type: 'ai',
+        content: 'коротко: так можно',
+      }),
+    ]);
+  });
+
+  it('пометка пишется на языке пользователя, а не всегда по-русски', async () => {
+    const pg = makePg();
+    const chat = { generateAgentReply: jest.fn(async () => 'short answer') };
+    const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeLang('en') as any);
+
+    await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'May I?');
+    await svc.drainForTests();
+
+    expect(pg.history[0].content).toBe(`${VOICE_ASK_NOTE.en}\n\nMay I?`);
+    expect(pg.history[0].content).not.toContain(VOICE_ASK_NOTE.ru);
+  });
+
+  it('модель просят ответить коротко, но в историю идёт чистый вопрос', async () => {
+    const pg = makePg();
+    const chat = { generateAgentReply: jest.fn(async () => 'ок') };
+    const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
+
+    await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'Можно ли так?');
+    await svc.drainForTests();
+
+    // В модель — с требованием краткости: без него специалисты писали
+    // трактаты по 15 000 знаков и не укладывались в таймаут.
+    const sentToModel = chat.generateAgentReply.mock.calls[0][2];
+    expect(sentToModel).toContain(VOICE_BRIEF);
+    expect(sentToModel).toContain('Можно ли так?');
+    // А в чат — вопрос Романа без нашей служебки.
+    expect(pg.history[0].content).not.toContain(VOICE_BRIEF);
+  });
+
+  it('сбой записи в историю не срывает ответ в комнату', async () => {
+    const pg = makePg();
+    const real = pg.query;
+    pg.query = jest.fn(async (sql: string, params: any[] = []) => {
+      if (/INSERT INTO custom_chat_history/i.test(sql)) throw new Error('база моргнула');
+      return real(sql, params);
+    }) as any;
+    const lk = { send: jest.fn(async () => {}) };
+    const svc = new SpecialistJobService(pg as any, { generateAgentReply: jest.fn(async () => 'ответ') } as any, lk as any, makeLang() as any);
+
+    await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'вопрос');
+    await svc.drainForTests();
+
+    // Ответ уже прозвучал бы в разговоре — падать из-за истории нельзя.
+    expect(lk.send.mock.calls.map((c: any[]) => c[1])).toContainEqual(
+      expect.objectContaining({ type: 'specialist_answer', text: 'ответ' }),
+    );
   });
 });
