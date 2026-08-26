@@ -50,6 +50,12 @@ function instructions(preamble: string, specialists: { name: string; role: strin
     'и продолжай разговор: ответ придёт отдельно, и ты его озвучишь.',
     'Никогда не молчи в ожидании ответа.',
     '',
+    'Просят сделать документ, письмо, план, список договорённостей — вызывай',
+    'create_document. Он тоже возвращается мгновенно: скажи вслух, что документ',
+    'готовится и появится в чате, и продолжай разговор. Не диктуй текст',
+    'документа вслух и не спрашивай, куда его положить: он всегда попадает в чат',
+    'с тобой.',
+    '',
     preamble ? `Контекст прошлой переписки:\n${preamble}` : 'Прошлой переписки нет.',
   ].join('\n');
 }
@@ -77,10 +83,16 @@ export default defineAgent({
       }),
     });
 
-    /** Вставить реплику прямо сейчас, если Роман молчит, иначе — в очередь. */
+    /** Отдать накопленное, если Роман свободен. Всё сразу, одной репликой. */
+    function flushPending(): void {
+      const merged = pending.take();
+      if (merged) session.generateReply({ userInput: merged });
+    }
+
+    /** Поставить реплику в очередь и попробовать произнести. */
     function pushLine(line: string): void {
-      const now = pending.offer(line);
-      if (now) session.generateReply({ userInput: now });
+      pending.push(line);
+      flushPending();
     }
 
     const tools = {
@@ -110,9 +122,35 @@ export default defineAgent({
         description: 'Список доступных специалистов.',
         execute: async () => ({ specialists: meta.specialists }),
       }),
+      create_document: llm.tool({
+        description:
+          'Составить документ и положить его в чат с пользователем. Возвращается сразу, ' +
+          'БЕЗ текста документа — он появится в чате сам. Используй, когда просят ' +
+          '«сделай документ», «набросай письмо», «оформи план», «запиши договорённости».',
+        parameters: z.object({
+          title: z.string().describe('Короткий заголовок документа'),
+          instructions: z.string().describe(
+            'Что должно быть в документе: суть, для кого, все обсуждённые детали. ' +
+            'Пиши подробно — тот, кто будет писать текст, разговора не слышал.',
+          ),
+        }),
+        execute: async ({ title, instructions }) => {
+          try {
+            const r = await backend.document(meta.callId, title, instructions);
+            return r.status === 'accepted'
+              ? { status: 'accepted', title }
+              : { status: 'rejected', reason: r.reason };
+          } catch (e) {
+            console.error('create_document failed', e);
+            return { status: 'rejected', reason: 'backend_unavailable', title };
+          }
+        },
+      }),
     };
-    // Тулов ровно два. Третий из ранней редакции спеки (save_note) снят:
-    // в голосовом разговоре он дублирует резюме звонка.
+    // Тулов три. create_document был в первой редакции спеки как save_note, я
+    // его снял, решив, что он дублирует резюме звонка, — и на живом звонке
+    // 26.08.2026 владелец попросил документ, а Роману оказалось некуда его
+    // положить. Резюме это про что говорили; документ — результат работы.
 
     // Ответы специалистов приходят из бэкенда через data-канал комнаты.
     ctx.room.on(RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
@@ -135,12 +173,15 @@ export default defineAgent({
       // specialist_pending предназначен фронту — игнорируем.
     });
 
+    // Свободен — это именно 'listening'/'idle'. Раньше здесь стояло
+    // `newState !== 'speaking'`, и состояние 'thinking' (между запросом ответа
+    // и началом речи) считалось свободным: вторая вставка уходила в модель,
+    // пока первая ещё генерировалась, и API отбивал её как
+    // conversation_already_has_active_response.
     session.on(AgentSessionEventTypes.AgentStateChanged, (ev: AgentStateChangedEvent) => {
-      const speaking = ev.newState === 'speaking';
-      pending.setSpeaking(speaking);
-      if (!speaking) {
-        for (const line of pending.drain()) session.generateReply({ userInput: line });
-      }
+      const free = ev.newState === 'listening' || ev.newState === 'idle';
+      pending.setBusy(!free);
+      if (free) flushPending();
     });
 
     session.on(AgentSessionEventTypes.ConversationItemAdded, (ev: ConversationItemAddedEvent) => {

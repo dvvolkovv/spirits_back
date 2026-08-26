@@ -10,7 +10,21 @@ export const VOICE_DATA_TOPIC = 'linkeon';
 export type VoiceDataMessage =
   | { v: 1; type: 'specialist_pending'; jobId: string; specialist: string }
   | { v: 1; type: 'specialist_answer'; jobId: string; specialist: string; text: string }
-  | { v: 1; type: 'specialist_failed'; jobId: string; specialist: string; reason: 'timeout' | 'error' };
+  | { v: 1; type: 'specialist_failed'; jobId: string; specialist: string; reason: 'timeout' | 'error' }
+  | { v: 1; type: 'document_pending'; docId: string; title: string }
+  | { v: 1; type: 'document_ready'; docId: string; title: string }
+  | { v: 1; type: 'document_failed'; docId: string; title: string; reason: 'timeout' | 'error' };
+
+/** Ответ на /internal/document. Как и ask, возвращается мгновенно. */
+export type DocumentResult =
+  | { status: 'accepted'; docId: string; title: string }
+  | { status: 'rejected'; reason: 'too_many_pending' | 'no_title' };
+
+/** Документов за раз тоже не больше трёх — по той же причине, что и вопросов. */
+export const MAX_PENDING_DOCS = 3;
+
+/** Дольше документ не сочиняем. Он длиннее ответа специалиста, отсюда запас. */
+export const DOC_TIMEOUT_MS = 300_000;
 
 /** Ответ на /internal/ask. rejected — не ошибка: модель должна это озвучить. */
 export type AskResult =

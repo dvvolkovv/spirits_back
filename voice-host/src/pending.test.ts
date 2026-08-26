@@ -1,40 +1,65 @@
-import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import assert from 'node:assert/strict';
 import { PendingAnswers } from './pending.js';
 
-test('offer() returns the text immediately when not speaking', () => {
+test('свободному Роману реплика отдаётся сразу', () => {
   const p = new PendingAnswers();
-  assert.equal(p.offer('hello'), 'hello');
-  assert.equal(p.size, 0);
+  p.push('ответ Алексея');
+  assert.equal(p.take(), 'ответ Алексея');
 });
 
-test('offer() queues and returns null while speaking', () => {
+test('пока Роман занят, реплика ждёт', () => {
   const p = new PendingAnswers();
-  p.setSpeaking(true);
-  assert.equal(p.offer('a'), null);
-  assert.equal(p.offer('b'), null);
-  assert.equal(p.size, 2);
+  p.setBusy(true);
+  p.push('ответ Алексея');
+  assert.equal(p.take(), null);
+  assert.equal(p.size, 1);
 });
 
-test('drain() returns the queue in insertion order and empties it', () => {
+test('три ответа уходят ОДНОЙ вставкой, а не тремя', () => {
+  // Ради этого класс и переписан: три подряд generateReply отбивались
+  // OpenAI как conversation_already_has_active_response, и из трёх ответов
+  // звучал один. Живой звонок 26.08.2026.
   const p = new PendingAnswers();
-  p.setSpeaking(true);
-  p.offer('first');
-  p.offer('second');
-  p.offer('third');
+  p.setBusy(true);
+  p.push('раз');
+  p.push('два');
+  p.push('три');
+  p.setBusy(false);
 
-  assert.deepEqual(p.drain(), ['first', 'second', 'third']);
-  assert.equal(p.size, 0);
-  assert.deepEqual(p.drain(), []);
+  const merged = p.take();
+  assert.equal(merged, 'раз\n\nдва\n\nтри');
+  // Второй вызов ничего не отдаёт: очередь пуста, и мы уже заняты.
+  assert.equal(p.take(), null);
 });
 
-test('offer() passes through again once speaking stops', () => {
+test('take() сам помечает занятость — состояние сессии приходит позже', () => {
+  // Между generateReply и сменой состояния на 'thinking' проходят
+  // миллисекунды, и следующий ответ вполне успевает прийти в этот зазор.
   const p = new PendingAnswers();
-  p.setSpeaking(true);
-  p.offer('queued while speaking');
-  p.setSpeaking(false);
+  p.push('первый');
+  assert.equal(p.take(), 'первый');
+  assert.equal(p.isBusy, true);
 
-  assert.equal(p.offer('live'), 'live');
-  // The earlier queued line is untouched until drain() is called explicitly.
-  assert.deepEqual(p.drain(), ['queued while speaking']);
+  p.push('второй');
+  assert.equal(p.take(), null, 'второй не должен уйти, пока первый в работе');
+});
+
+test('пустая очередь ничего не отдаёт и не занимает Романа', () => {
+  const p = new PendingAnswers();
+  assert.equal(p.take(), null);
+  assert.equal(p.isBusy, false);
+});
+
+test('накопленное за время занятости не теряется', () => {
+  const p = new PendingAnswers();
+  p.push('первый');
+  p.take(); // ушёл, Роман занят
+
+  p.push('второй');
+  p.push('третий');
+  assert.equal(p.take(), null);
+
+  p.setBusy(false); // договорил
+  assert.equal(p.take(), 'второй\n\nтретий');
 });

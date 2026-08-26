@@ -16,7 +16,7 @@ function sign(raw: string): string {
  * ради ухода от которого мы отказались от remote MCP. Две секунды хватает:
  * ручка только пишет строку и ставит job в очередь.
  */
-const TIMEOUT_MS: Record<string, number> = { ask: 2_000, complete: 15_000, failed: 5_000 };
+const TIMEOUT_MS: Record<string, number> = { ask: 2_000, document: 2_000, complete: 15_000, failed: 5_000 };
 
 async function post<T>(path: string, body: unknown): Promise<T> {
   const raw = JSON.stringify(body);
@@ -40,9 +40,15 @@ export type TranscriptEntry = { role: 'user' | 'assistant'; text: string; ts: nu
 /** Учёт аудио-токенов Realtime-сессии — то же, что CompletePayload['usage'] на бэке. */
 export type CallUsage = { audioInputTokens: number; audioOutputTokens: number; model: string };
 
+export type DocumentResult =
+  | { status: 'accepted'; docId: string; title: string }
+  | { status: 'rejected'; reason: 'too_many_pending' | 'no_title' };
+
 export const backend = {
   ask: (callId: string, specialist: string, question: string) =>
     post<AskResult>('ask', { callId, specialist, question }),
+  document: (callId: string, title: string, instructions: string) =>
+    post<DocumentResult>('document', { callId, title, instructions }),
   complete: (callId: string, transcript: TranscriptEntry[], usage: CallUsage) =>
     post<{ ok: true }>('complete', { callId, transcript, usage }),
   failed: (callId: string, reason: string) =>

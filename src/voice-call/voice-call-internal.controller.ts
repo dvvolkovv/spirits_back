@@ -2,8 +2,9 @@ import { BadRequestException, Controller, Headers, Logger, Post, Req, ServiceUna
 import { Request } from 'express';
 import { SpecialistJobService } from './specialist-job.service';
 import { VoiceCallService } from './voice-call.service';
+import { VoiceDocumentService } from './voice-document.service';
 import { verifyBody } from './hmac';
-import { AskResult, CompletePayload } from './voice-call.types';
+import { AskResult, CompletePayload, DocumentResult } from './voice-call.types';
 
 /**
  * Ручки, которые зовёт воркер linkeon-voice-host. Закрыты HMAC-подписью тела.
@@ -19,6 +20,7 @@ export class VoiceCallInternalController {
   constructor(
     private readonly jobs: SpecialistJobService,
     private readonly calls: VoiceCallService,
+    private readonly docs: VoiceDocumentService,
   ) {}
 
   /**
@@ -60,6 +62,20 @@ export class VoiceCallInternalController {
       return { status: 'rejected', reason: 'unknown_specialist' };
     }
     return this.jobs.ask(body.callId, call.room_name, call.user_id, body.specialist, body.question);
+  }
+
+  @Post('document')
+  async document(
+    @Headers('x-voice-signature') signature: string,
+    @Req() req: Request,
+  ): Promise<DocumentResult> {
+    const body = this.parseSigned<{ callId: string; title: string; instructions: string }>(req, signature);
+    const call = await this.calls.load(body.callId);
+    if (!this.calls.isActive(call)) {
+      this.logger.warn(`[document] call=${body.callId} не активен (${call.status})`);
+      return { status: 'rejected', reason: 'no_title' };
+    }
+    return this.docs.create(body.callId, call.room_name, call.user_id, body.title, body.instructions);
   }
 
   @Post('complete')
