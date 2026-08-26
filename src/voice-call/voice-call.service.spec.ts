@@ -39,13 +39,35 @@ describe('VoiceCallService', () => {
     expect(d.chat.generateAgentReply).not.toHaveBeenCalled();
   });
 
-  it('длинную историю сжимает через LLM', async () => {
+  it('длинную историю обрезает по бюджету и НЕ ходит в LLM', async () => {
+    // Сжатие через LLM стоило ~40 секунд тишины перед тем, как Роман вообще
+    // входил в комнату: preamble считается до dispatchAgent. У реального
+    // пользователя в последних 20 сообщениях 21 987 символов, так что
+    // срабатывало всегда. Живой звонок 25.08.2026.
     const long = Array.from({ length: 20 }, () => ({ sender_type: 'human', content: 'х'.repeat(300) }));
     const d = makeDeps(long);
     const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+
+    const started = Date.now();
     const p = await svc.buildPreamble('u1');
-    expect(d.chat.generateAgentReply).toHaveBeenCalled();
-    expect(p).toBe('краткое резюме звонка');
+
+    expect(d.chat.generateAgentReply).not.toHaveBeenCalled();
+    expect(Date.now() - started).toBeLessThan(100);
+    expect(p.length).toBeLessThanOrEqual(1800);
+    expect(p.length).toBeGreaterThan(0);
+  });
+
+  it('в preamble попадают самые свежие реплики, а не самые старые', async () => {
+    // Строки приходят из БД по created_at DESC; берём с начала списка, пока
+    // хватает бюджета, и разворачиваем — иначе в контекст уехала бы древность.
+    const rows = [
+      { sender_type: 'human', content: 'САМОЕ СВЕЖЕЕ' },
+      ...Array.from({ length: 19 }, (_, i) => ({ sender_type: 'ai', content: `старое ${i} ` + 'я'.repeat(200) })),
+    ];
+    const d = makeDeps(rows);
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+    const p = await svc.buildPreamble('u1');
+    expect(p).toContain('САМОЕ СВЕЖЕЕ');
   });
 
   it('start отдаёт токен и зовёт воркера', async () => {
