@@ -66,22 +66,33 @@ test.describe('админка: список ассистентов', () => {
     const count = await items.count();
     expect(count, 'ассистенты должны загрузиться').toBeGreaterThan(5);
 
-    const last = items.nth(count - 1);
-    await last.scrollIntoViewIfNeeded();
+    // Прокручиваем ТОЛЬКО саму колонку, до упора — это всё, что доступно
+    // пользователю мышью или пальцем.
+    //
+    // scrollIntoViewIfNeeded здесь использовать НЕЛЬЗЯ, и на этом я уже
+    // обжёгся: он прокручивает и родителей с overflow:hidden. Такой элемент
+    // не прокручивается жестом, но прокручивается скриптом — Playwright
+    // делал то, чего человек сделать не может, элемент «оказывался виден», и
+    // тест зеленел на сборке с багом.
+    const geometry = await page.evaluate(() => {
+      const list = document.querySelector('[data-testid="admin-assistants-list"]');
+      const sidebar = list?.closest('.overflow-y-auto');
+      if (!sidebar) return null;
+      sidebar.scrollTop = sidebar.scrollHeight; // до упора, как пользователь
+      const buttons = list.querySelectorAll('button');
+      const last = buttons[buttons.length - 1];
+      return {
+        viewport: window.innerHeight,
+        lastBottom: Math.round(last.getBoundingClientRect().bottom),
+        lastName: last.textContent?.trim(),
+      };
+    });
 
-    // Ключевая проверка: после прокрутки нижняя граница последнего элемента
-    // помещается в окно. При h-screen она уходила ниже видимой области, и
-    // никакая прокрутка её не поднимала — прокручивать было уже нечего.
-    const box = await last.boundingBox();
-    const viewportHeight = page.viewportSize()?.height ?? 0;
-    expect(box, 'последний элемент должен иметь геометрию').not.toBeNull();
+    expect(geometry, 'колонка со списком должна найтись').not.toBeNull();
     expect(
-      box.y + box.height,
-      `низ последнего элемента (${Math.round(box.y + box.height)}) должен быть внутри окна (${viewportHeight})`,
-    ).toBeLessThanOrEqual(viewportHeight);
-
-    // И он должен быть кликабельным — то есть не перекрыт и не за границей.
-    await last.click();
-    await expect(page.getByTestId('admin-assistants-list')).toBeVisible();
+      geometry.lastBottom,
+      `после прокрутки до упора низ «${geometry.lastName}» (${geometry.lastBottom}) ` +
+      `должен помещаться в окно (${geometry.viewport})`,
+    ).toBeLessThanOrEqual(geometry.viewport);
   });
 });
