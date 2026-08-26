@@ -100,15 +100,15 @@ describe('VoiceDocumentService', () => {
     );
   });
 
-  it('четвёртый одновременный документ отклоняется', () => {
-    const chat = { generateAgentReply: jest.fn(() => new Promise<string>(() => {})) }; // висит
+  it('лимита одновременных документов нет — пятый тоже принимается', () => {
+    // Снято по решению владельца 26.08.2026 вместе с лимитом на вопросы.
+    const chat = { generateAgentReply: jest.fn(() => new Promise<string>(() => {})) }; // висят
     const svc = new VoiceDocumentService(makePg() as any, chat as any, { send: jest.fn(async () => {}) } as any);
 
-    svc.create(CALL, ROOM, 'u', 'раз', '');
-    svc.create(CALL, ROOM, 'u', 'два', '');
-    svc.create(CALL, ROOM, 'u', 'три', '');
+    const results = ['раз', 'два', 'три', 'четыре', 'пять']
+      .map((t) => svc.create(CALL, ROOM, 'u', t, ''));
 
-    expect(svc.create(CALL, ROOM, 'u', 'четыре', '')).toEqual({ status: 'rejected', reason: 'too_many_pending' });
+    expect(results.every((r) => r.status === 'accepted')).toBe(true);
   });
 
   it('документ пишется в изолированной сессии — иначе релей отдаёт пустой поток', async () => {

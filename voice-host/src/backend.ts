@@ -32,7 +32,7 @@ async function post<T>(path: string, body: unknown): Promise<T> {
 
 export type AskResult =
   | { status: 'asked'; jobId: string; specialist: string }
-  | { status: 'rejected'; reason: 'too_many_pending' | 'unknown_specialist' };
+  | { status: 'rejected'; reason: 'unknown_specialist' };
 
 /** Реплика из транскрипта звонка — то же, что бэкенд ждёт в /internal/complete. */
 export type TranscriptEntry = { role: 'user' | 'assistant'; text: string; ts: number };
@@ -42,7 +42,7 @@ export type CallUsage = { audioInputTokens: number; audioOutputTokens: number; m
 
 export type DocumentResult =
   | { status: 'accepted'; docId: string; title: string }
-  | { status: 'rejected'; reason: 'too_many_pending' | 'no_title' };
+  | { status: 'rejected'; reason: 'no_title' };
 
 export const backend = {
   ask: (callId: string, specialist: string, question: string) =>

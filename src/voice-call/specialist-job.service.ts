@@ -5,7 +5,7 @@ import { ChatService } from '../chat/chat.service';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 import { LiveKitClient } from './livekit.client';
 import {
-  AskResult, findSpecialist, HOST_AGENT_ID, JOB_TIMEOUT_MS, MAX_PENDING_JOBS,
+  AskResult, findSpecialist, HOST_AGENT_ID, JOB_TIMEOUT_MS,
   VOICE_ASK_NOTE, VOICE_BRIEF,
 } from './voice-call.types';
 
@@ -37,18 +37,6 @@ export class SpecialistJobService {
   private readonly logger = new Logger(SpecialistJobService.name);
   /** Незавершённые фоновые задачи — нужны только тестам, чтобы дождаться. */
   private readonly inflight = new Set<Promise<void>>();
-  /**
-   * Лимит параллельности по звонку держим в памяти, а не через
-   * `SELECT count(*) ... WHERE status IN ('queued','running')`.
-   *
-   * Проверка-и-бронь обязана быть одним синхронным шагом. DB-вариант делает
-   * между чтением счётчика и записью новой строки минимум один await —
-   * окно, где два вызова ask(), пришедшие почти одновременно, оба увидят
-   * старый счётчик и оба проскочат лимит. Синхронный Set.add() сразу после
-   * проверки размера закрывает это окно: между чтением size и добавлением
-   * jobId нет ни одного await.
-   */
-  private readonly pendingByCall = new Map<string, Set<string>>();
 
   constructor(
     private readonly pg: PgService,
@@ -67,48 +55,21 @@ export class SpecialistJobService {
     const agentId = findSpecialist(specialist);
     if (!agentId) return { status: 'rejected', reason: 'unknown_specialist' };
 
-    let pending = this.pendingByCall.get(callId);
-    if (!pending) {
-      pending = new Set<string>();
-      this.pendingByCall.set(callId, pending);
-    }
-    if (pending.size >= MAX_PENDING_JOBS) {
-      return { status: 'rejected', reason: 'too_many_pending' };
-    }
-
     const jobId = randomUUID();
-    // Бронируем место синхронно, до первого await — иначе гонка выше вернётся.
-    pending.add(jobId);
 
-    try {
-      await this.pg.query(
-        `INSERT INTO voice_call_jobs (id, call_id, specialist_agent_id, question, status)
-         VALUES ($1, $2, $3, $4, 'queued')`,
-        [jobId, callId, agentId, question],
-      );
-    } catch (e) {
-      this.releasePending(callId, jobId);
-      throw e;
-    }
+    await this.pg.query(
+      `INSERT INTO voice_call_jobs (id, call_id, specialist_agent_id, question, status)
+       VALUES ($1, $2, $3, $4, 'queued')`,
+      [jobId, callId, agentId, question],
+    );
 
     // Фоновая часть. Промис намеренно не ждём.
     const task = this.run(jobId, callId, roomName, userId, specialist, agentId, question)
       .catch((e) => this.logger.error(`job ${jobId} crashed: ${e?.message}`))
-      .finally(() => {
-        this.inflight.delete(task);
-        this.releasePending(callId, jobId);
-      });
+      .finally(() => this.inflight.delete(task));
     this.inflight.add(task);
 
     return { status: 'asked', jobId, specialist };
-  }
-
-  /** Снять бронь слота job'а; пустой набор по звонку не держим в карте. */
-  private releasePending(callId: string, jobId: string): void {
-    const pending = this.pendingByCall.get(callId);
-    if (!pending) return;
-    pending.delete(jobId);
-    if (pending.size === 0) this.pendingByCall.delete(callId);
   }
 
   private async run(

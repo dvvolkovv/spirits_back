@@ -18,10 +18,7 @@ export type VoiceDataMessage =
 /** Ответ на /internal/document. Как и ask, возвращается мгновенно. */
 export type DocumentResult =
   | { status: 'accepted'; docId: string; title: string }
-  | { status: 'rejected'; reason: 'too_many_pending' | 'no_title' };
-
-/** Документов за раз тоже не больше трёх — по той же причине, что и вопросов. */
-export const MAX_PENDING_DOCS = 3;
+  | { status: 'rejected'; reason: 'no_title' };
 
 /** Дольше документ не сочиняем. Он длиннее ответа специалиста, отсюда запас. */
 export const DOC_TIMEOUT_MS = 300_000;
@@ -29,7 +26,7 @@ export const DOC_TIMEOUT_MS = 300_000;
 /** Ответ на /internal/ask. rejected — не ошибка: модель должна это озвучить. */
 export type AskResult =
   | { status: 'asked'; jobId: string; specialist: string }
-  | { status: 'rejected'; reason: 'too_many_pending' | 'unknown_specialist' };
+  | { status: 'rejected'; reason: 'unknown_specialist' };
 
 export interface CompletePayload {
   transcript: { role: 'user' | 'assistant'; text: string; ts: number }[];
@@ -135,8 +132,19 @@ export const VOICE_ASK_NOTE: Record<string, string> = {
 /** Роман — ведущий разговора. */
 export const HOST_AGENT_ID = 12;
 
-/** Больше трёх параллельных job на звонок не берём. */
-export const MAX_PENDING_JOBS = 3;
+// Ограничения на число параллельных вопросов и документов НЕТ — снято по
+// решению владельца 26.08.2026. Раньше было по три на звонок.
+//
+// Что это открывает, чтобы не выяснять заново: ограничителя параллельности
+// нет больше нигде на пути. Ни в chat.service, ни в самом релее r.linkeon.io —
+// каждый вопрос это отдельная сессия Claude, и они идут с подписки владельца.
+// Тройка была единственным местом, где это сдерживалось. На практике Роман за
+// ход кидал максимум четыре вопроса, так что риск сводится к зациклившейся
+// модели: тормозить её станет некому.
+//
+// Если понадобится вернуть — это не только константа: вместе с лимитом
+// исчезли бронирование слотов в обоих сервисах и причина отказа
+// too_many_pending из контрактов бэкенда и воркера.
 
 /**
  * Дольше этого специалиста не ждём — Роман извиняется и отвечает сам.

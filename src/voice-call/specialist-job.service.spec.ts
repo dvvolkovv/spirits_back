@@ -174,17 +174,19 @@ describe('SpecialistJobService', () => {
     expect(pg.jobs).toHaveLength(0);
   });
 
-  it('четвёртый параллельный вопрос отклоняется', async () => {
+  it('лимита параллельных вопросов нет — пятый тоже проходит', async () => {
+    // Ограничение в три снято по решению владельца 26.08.2026. Тест держит
+    // именно снятие: пока стоял лимит, четвёртый возвращал too_many_pending.
     const pg = makePg();
-    const chat = { generateAgentReply: jest.fn(() => new Promise<string>(() => {})) }; // висит
+    const chat = { generateAgentReply: jest.fn(() => new Promise<string>(() => {})) }; // висят
     const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
 
-    await svc.ask(CALL, ROOM, 'u', 'Алексей', 'раз');
-    await svc.ask(CALL, ROOM, 'u', 'Анна', 'два');
-    await svc.ask(CALL, ROOM, 'u', 'Виталий', 'три');
-    const fourth = await svc.ask(CALL, ROOM, 'u', 'Андрей', 'четыре');
+    const names = ['Алексей', 'Анна', 'Виталий', 'Андрей', 'Александра'];
+    const results = [];
+    for (const n of names) results.push(await svc.ask(CALL, ROOM, 'u', n, 'вопрос'));
 
-    expect(fourth).toEqual({ status: 'rejected', reason: 'too_many_pending' });
+    expect(results.every((r) => r.status === 'asked')).toBe(true);
+    expect(pg.jobs).toHaveLength(5);
   });
 
   it('консультация попадает в обычный чат со специалистом, с пометкой про голос', async () => {

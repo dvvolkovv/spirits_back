@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { ChatService } from '../chat/chat.service';
 import { LiveKitClient } from './livekit.client';
-import { DOC_TIMEOUT_MS, DocumentResult, HOST_AGENT_ID, MAX_PENDING_DOCS } from './voice-call.types';
+import { DOC_TIMEOUT_MS, DocumentResult, HOST_AGENT_ID } from './voice-call.types';
 
 /**
  * Документы, надиктованные голосом.
@@ -21,8 +21,6 @@ import { DOC_TIMEOUT_MS, DocumentResult, HOST_AGENT_ID, MAX_PENDING_DOCS } from 
 export class VoiceDocumentService {
   private readonly logger = new Logger(VoiceDocumentService.name);
   private readonly inflight = new Set<Promise<void>>();
-  /** Как и у вопросов: проверка-и-бронь одним синхронным шагом, без await. */
-  private readonly pendingByCall = new Map<string, Set<string>>();
 
   constructor(
     private readonly pg: PgService,
@@ -40,25 +38,11 @@ export class VoiceDocumentService {
     const clean = (title || '').trim();
     if (!clean) return { status: 'rejected', reason: 'no_title' };
 
-    let pending = this.pendingByCall.get(callId);
-    if (!pending) {
-      pending = new Set<string>();
-      this.pendingByCall.set(callId, pending);
-    }
-    if (pending.size >= MAX_PENDING_DOCS) {
-      return { status: 'rejected', reason: 'too_many_pending' };
-    }
-
     const docId = randomUUID();
-    pending.add(docId);
 
     const task = this.run(docId, callId, roomName, userId, clean, instructions)
       .catch((e) => this.logger.error(`документ ${docId} упал: ${e?.message}`))
-      .finally(() => {
-        this.inflight.delete(task);
-        pending!.delete(docId);
-        if (pending!.size === 0) this.pendingByCall.delete(callId);
-      });
+      .finally(() => this.inflight.delete(task));
     this.inflight.add(task);
 
     return { status: 'accepted', docId, title: clean };
