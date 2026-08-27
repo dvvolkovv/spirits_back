@@ -23,7 +23,12 @@
       "**/tests/**/*.test.js"
     ],
     "transform": {
-      "^.+\\.ts$": "ts-jest"
+      "^.+\\.ts$": [
+        "ts-jest",
+        {
+          "isolatedModules": true
+        }
+      ]
     },
     "testEnvironment": "node"
   },
