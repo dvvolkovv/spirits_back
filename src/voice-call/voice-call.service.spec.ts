@@ -119,7 +119,17 @@ describe('VoiceCallService', () => {
     expect(flagship / mini).toBeCloseTo(3.2, 5);
   });
 
-  it('строка учёта пишется completed, иначе крон спишет токены с баланса', async () => {
+  it('строка учёта пишется pending — за разговор списывается', async () => {
+    // Тест перевёрнут 27.08.2026 вместе с решением. Раньше он держал
+    // обратное: 'completed', то есть «учитываем, но не списываем» — тариф за
+    // минуту назначать было не из чего. После того как консультации
+    // специалистов начали списываться, бесплатные минуты стали
+    // непоследовательными.
+    //
+    // Опасность, из-за которой стоял 'completed', никуда не делась и закрыта
+    // иначе: TokenAccountingService при tokens_to_consume = 0 складывает
+    // input + output сам, поэтому в input идёт НОЛЬ, а в output —
+    // пересчитанная цена. Сырые аудио-токены там означали бы 1800 в минуту.
     const d = makeDeps([]);
     const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
     await svc.complete('call-1', {
@@ -130,10 +140,8 @@ describe('VoiceCallService', () => {
       (c: any[]) => /INSERT INTO token_consumption_tasks/i.test(c[0]),
     );
     expect(call).toBeDefined();
-    // TokenAccountingService забирает 'pending' и при tokens_to_consume = 0
-    // считает сумму сам — со 'pending' звонок списывал бы 1800 токенов в минуту.
-    expect(call![0]).toContain("'completed'");
-    expect(call![0]).not.toContain("'pending'");
+    expect(call![0]).toContain("'pending'");
+    expect(call![1][3]).toBe(0); // input_tokens
   });
 
   it('повторный complete не создаёт вторую карточку', async () => {
@@ -220,8 +228,8 @@ describe('списание за минуты разговора', () => {
 
     expect(d.pg.charges).toHaveLength(1);
     const c = d.pg.charges[0];
-    expect(c.status, 'со статусом completed крон строку не заберёт').toBe('pending');
-    expect(c.input, 'input обязан быть 0, иначе крон сложит его с output').toBe(0);
+    expect(c.status).toBe('pending'); // с 'completed' крон строку не заберёт
+    expect(c.input).toBe(0); // иначе крон сложит input с output
     expect(c.output).toBeGreaterThan(0);
     expect(c.output).toBeLessThan(1800); // не сырые аудио-токены
     // Сырые счётчики не теряются: без них не разобрать, из чего сложилась цена.
@@ -240,7 +248,7 @@ describe('списание за минуты разговора', () => {
     });
 
     const upd = d.pg.query.mock.calls.map((c: any[]) => c[0]).find((q: string) => /UPDATE voice_calls SET status = 'completed'/.test(q));
-    expect(upd, 'звонок обязан закрыться').toBeDefined();
+    expect(upd).toBeDefined();
     expect(upd).toContain('tokens_charged');
   });
 });
