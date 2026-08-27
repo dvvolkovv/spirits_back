@@ -6,7 +6,7 @@ import { ChatService } from '../chat/chat.service';
 import { LiveKitClient } from './livekit.client';
 import {
   CONSULT_CHARS_IN_DOC, DOC_GIST_CHARS, DOC_LEAD_CHARS, DOC_TIMEOUT_MS, DOCS_BUCKET,
-  DocumentResult, findSpecialist, HOST_AGENT_ID, MAX_CONSULT_IN_DOC,
+  DocumentResult, findSpecialist, HOST_AGENT_ID, MAX_CONSULT_IN_DOC, specialistName,
 } from './voice-call.types';
 
 /**
@@ -83,26 +83,47 @@ export class VoiceDocumentService {
     const clean = (title || '').trim();
     if (!clean) return { status: 'rejected', reason: 'no_title' };
 
-    // Кто оформляет документ — тот его и пишет, и в его чат документ ложится.
-    //
-    // Раньше документ всегда писался от лица Романа и всегда падал в его чат,
-    // что бы он ни пообещал вслух. Владелец попросил Виталия подготовить
-    // бумагу, Роман согласился — а документ уехал к Роману, и в чате Виталия
-    // было пусто. Живой звонок 26.08.2026: «нужно документ класть в чат к
-    // Виталию, если Виталий его готовил».
-    //
-    // Имени нет или оно не опознано — пишет ведущий, как и прежде.
-    const agentId = (specialist && findSpecialist(specialist)) || HOST_AGENT_ID;
-    const author = agentId === HOST_AGENT_ID ? undefined : specialist;
-
     const docId = randomUUID();
 
-    const task = this.run(docId, callId, roomName, userId, clean, instructions, agentId, author)
+    const task = this.run(docId, callId, roomName, userId, clean, instructions, specialist)
       .catch((e) => this.logger.error(`документ ${docId} упал: ${e?.message}`))
       .finally(() => this.inflight.delete(task));
     this.inflight.add(task);
 
-    return { status: 'accepted', docId, title: clean, specialist: author };
+    return { status: 'accepted', docId, title: clean, specialist };
+  }
+
+  /**
+   * Кто автор документа: явно названный специалист, а если не назвали —
+   * тот, чья консультация в этом звонке была последней.
+   *
+   * Догадка нужна потому, что Роман параметр игнорирует. В промпте прямо
+   * написано передавать имя коллеги, и он всё равно этого не делает: 27.08.2026
+   * спросил Шанкару, назвал документ «по рекомендациям Шанкары» — и оформил
+   * от себя, документ уехал в чат Романа.
+   *
+   * На послушание модели тут полагаться нельзя, а случай «спросили коллегу и
+   * сделали документ по его ответу» — основной. Итог звонка Роман и так
+   * оформляет карточкой, для этого create_document не нужен.
+   */
+  private async resolveAuthor(callId: string, specialist?: string): Promise<{ agentId: number; author?: string }> {
+    const named = specialist && findSpecialist(specialist);
+    if (named) return { agentId: named, author: specialist };
+
+    try {
+      const res = await this.pg.query(
+        `SELECT specialist_agent_id FROM voice_call_jobs
+         WHERE call_id = $1 AND status = 'done'
+         ORDER BY finished_at DESC NULLS LAST LIMIT 1`,
+        [callId],
+      );
+      const agentId = res.rows[0]?.specialist_agent_id;
+      const author = agentId ? specialistName(Number(agentId)) : undefined;
+      if (agentId && author) return { agentId: Number(agentId), author };
+    } catch (e: any) {
+      this.logger.warn(`не удалось определить автора документа для ${callId}: ${e?.message}`);
+    }
+    return { agentId: HOST_AGENT_ID };
   }
 
   /**
@@ -132,8 +153,9 @@ export class VoiceDocumentService {
   private async run(
     docId: string, callId: string, roomName: string,
     userId: string, title: string, instructions: string,
-    agentId: number, author?: string,
+    specialist?: string,
   ): Promise<void> {
+    const { agentId, author } = await this.resolveAuthor(callId, specialist);
     await this.safeSend(roomName, { v: 1, type: 'document_pending', docId, title, specialist: author });
 
     try {

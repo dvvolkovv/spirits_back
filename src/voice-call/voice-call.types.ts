@@ -99,6 +99,11 @@ export function findSpecialist(spoken: string): number | undefined {
   return hit ? SPECIALISTS[hit] : undefined;
 }
 
+/** Имя специалиста по id. Обратная сторона SPECIALISTS. */
+export function specialistName(agentId: number): string | undefined {
+  return Object.keys(SPECIALISTS).find((n) => SPECIALISTS[n] === agentId);
+}
+
 /**
  * Роли для ведущего: без них он выбирает специалиста по имени наугад.
  * 26.08.2026 юридический вопрос про согласия и информирование о стоимости

@@ -306,3 +306,56 @@ describe('документ доступен по ссылке', () => {
     );
   });
 });
+
+describe('автор определяется сам, если Роман его не назвал', () => {
+  const CALL = '11111111-1111-1111-1111-111111111111';
+  const ROOM = 'voice_room';
+
+  it('документ уходит последнему консультанту звонка', async () => {
+    // Роман спросил Шанкару, назвал документ «по рекомендациям Шанкары» — и
+    // оформил от себя: параметр specialist он игнорирует. Живой звонок
+    // 27.08.2026. На послушание модели тут полагаться нельзя.
+    const pg = makePg([{ specialist_agent_id: 13, question: 'q', answer: 'a' }]);
+    const svc = new VoiceDocumentService(
+      pg as any,
+      { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'тело', tokens: 5, costUsd: 0 })) } as any,
+      { send: jest.fn(async () => {}) } as any,
+      makeStorage() as any,
+    );
+
+    svc.create(CALL, ROOM, 'user-1', 'Окна запуска', ''); // имени НЕ передаём
+    await svc.drainForTests();
+
+    expect(pg.history[0].session_id).toBe('user-1_13');
+  });
+
+  it('явно названный специалист важнее догадки', async () => {
+    const pg = makePg([{ specialist_agent_id: 13, question: 'q', answer: 'a' }]);
+    const svc = new VoiceDocumentService(
+      pg as any,
+      { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'тело', tokens: 5, costUsd: 0 })) } as any,
+      { send: jest.fn(async () => {}) } as any,
+      makeStorage() as any,
+    );
+
+    svc.create(CALL, ROOM, 'user-1', 'Тарифы', '', 'Виталий');
+    await svc.drainForTests();
+
+    expect(pg.history[0].session_id).toBe('user-1_17');
+  });
+
+  it('консультаций не было — пишет ведущий', async () => {
+    const pg = makePg();
+    const svc = new VoiceDocumentService(
+      pg as any,
+      { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'тело', tokens: 5, costUsd: 0 })) } as any,
+      { send: jest.fn(async () => {}) } as any,
+      makeStorage() as any,
+    );
+
+    svc.create(CALL, ROOM, 'user-1', 'Заметка', '');
+    await svc.drainForTests();
+
+    expect(pg.history[0].session_id).toBe(`user-1_${HOST_AGENT_ID}`);
+  });
+});
