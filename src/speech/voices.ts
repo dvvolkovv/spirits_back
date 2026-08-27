@@ -74,6 +74,7 @@ export const ASSISTANT_DEFAULTS: Record<string, AssistantDefault> = {
   // (voices.ts:135). Технический директор говорил женским голосом — alena
   // на русском и nova на остальных языках.
   'Дмитрий':    { gender: 'm', yandex: 'ermil',   openai: 'onyx' },
+  'Кира':       { gender: 'f', yandex: 'marina',  openai: 'alloy' },
 };
 
 export const GENDER_DEFAULT: Record<Gender, { yandex: string; openai: string }> = {
