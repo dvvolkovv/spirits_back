@@ -122,7 +122,10 @@ await room.connect(url, token, { autoSubscribe: true, dynacast: true });
 console.log('connected, participants:', room.remoteParticipants.size);
 
 const session = new voice.AgentSession({
-  llm: new openai.realtime.RealtimeModel({ model: 'gpt-realtime-2.1', voice: 'cedar' }),
+  // Именно mini: на нём поедут встречи, и проверять флаги надо на той модели,
+  // которая будет работать. Набор голосов и поддержка turnDetection у моделей
+  // могут отличаться.
+  llm: new openai.realtime.RealtimeModel({ model: 'gpt-realtime-2.1-mini', voice: 'cedar' }),
 });
 
 await session.start({
@@ -147,7 +150,7 @@ Expected: процесс подключается, в комнате слышн�
 
 ```typescript
 const model = new openai.realtime.RealtimeModel({
-  model: 'gpt-realtime-2.1',
+  model: 'gpt-realtime-2.1-mini',
   voice: 'cedar',
   turnDetection: {
     type: 'server_vad',
@@ -874,6 +877,60 @@ describe('Mixer', () => {
     assert.ok(m.bufferedTicks('alice') <= Mixer.MAX_BUFFERED_TICKS);
   });
 });
+
+describe('Mixer — кто говорит', () => {
+  test('в тишине говорящего нет', () => {
+    const m = new Mixer();
+    m.tick();
+    assert.equal(m.dominant, null);
+  });
+
+  test('самый громкий и есть говорящий', () => {
+    const m = new Mixer();
+    m.push('alice', Int16Array.from({ length: SAMPLES_PER_TICK }, () => 8000));
+    m.push('bob', Int16Array.from({ length: SAMPLES_PER_TICK }, () => 200));
+    m.tick();
+    assert.equal(m.dominant, 'alice');
+  });
+
+  test('тихий фон не считается речью', () => {
+    // Иначе говорящим объявляется тот, у кого просто шумит микрофон, и
+    // разметка проставит его имя всей встрече.
+    const m = new Mixer();
+    m.push('alice', Int16Array.from({ length: SAMPLES_PER_TICK }, () => 30));
+    m.tick();
+    assert.equal(m.dominant, null);
+  });
+
+  test('говорящий меняется вместе с громкостью', () => {
+    const m = new Mixer();
+    m.push('alice', Int16Array.from({ length: SAMPLES_PER_TICK }, () => 8000));
+    m.push('bob', Int16Array.from({ length: SAMPLES_PER_TICK }, () => 200));
+    m.tick();
+    m.push('alice', Int16Array.from({ length: SAMPLES_PER_TICK }, () => 200));
+    m.push('bob', Int16Array.from({ length: SAMPLES_PER_TICK }, () => 9000));
+    m.tick();
+    assert.equal(m.dominant, 'bob');
+  });
+
+  test('пауза в речи не сбрасывает говорящего сразу', () => {
+    // Между словами есть тишина. Сброс на первом же тихом тике дробил бы
+    // одну реплику на десяток кусков с чередованием имени и null.
+    const m = new Mixer();
+    m.push('alice', Int16Array.from({ length: SAMPLES_PER_TICK }, () => 8000));
+    m.tick();
+    m.tick(); // тишина
+    assert.equal(m.dominant, 'alice');
+  });
+
+  test('после долгой тишины говорящий сбрасывается', () => {
+    const m = new Mixer();
+    m.push('alice', Int16Array.from({ length: SAMPLES_PER_TICK }, () => 8000));
+    m.tick();
+    for (let i = 0; i <= Mixer.SILENCE_TICKS_TO_RESET; i++) m.tick();
+    assert.equal(m.dominant, null);
+  });
+});
 ```
 
 - [ ] **Step 2: Запустить тест и убедиться, что он падает**
@@ -915,7 +972,32 @@ export class Mixer {
    */
   static readonly MAX_BUFFERED_TICKS = 25;
 
+  /**
+   * Ниже этой средней амплитуды тик считается тишиной, а не речью.
+   *
+   * Без порога говорящим объявляется тот, у кого просто шумит микрофон, и
+   * разметка проставляет его имя всем репликам встречи. 200 из 32767 — это
+   * заведомо фон, но подобрать окончательно надо на живой встрече.
+   */
+  static readonly SPEECH_FLOOR = 200;
+
+  /**
+   * Сколько тихих тиков подряд держим прежнего говорящего.
+   *
+   * Между словами есть паузы, и сброс на первом же тихом тике дробил бы одну
+   * реплику на десяток кусков с чередованием имени и пустоты. 25 тиков — это
+   * полсекунды, обычная межсловная пауза короче.
+   */
+  static readonly SILENCE_TICKS_TO_RESET = 25;
+
   private buffers = new Map<string, Int16Array[]>();
+  private speaker: string | null = null;
+  private silentTicks = 0;
+
+  /** Кто, скорее всего, говорит прямо сейчас. null — тишина. */
+  get dominant(): string | null {
+    return this.speaker;
+  }
 
   push(participant: string, samples: Int16Array): void {
     if (!samples.length) return;
@@ -936,13 +1018,31 @@ export class Mixer {
   /** Один смикшированный кадр. Вызывается ровно раз в TICK_MS. */
   tick(): Int16Array {
     const out = new Int16Array(SAMPLES_PER_TICK);
-    for (const queue of this.buffers.values()) {
+    let loudest: string | null = null;
+    let loudestEnergy = 0;
+
+    for (const [participant, queue] of this.buffers) {
       const chunk = this.takeTick(queue);
+      let energy = 0;
       for (let i = 0; i < chunk.length; i++) {
+        energy += Math.abs(chunk[i]);
         const sum = out[i] + chunk[i];
         out[i] = sum > 32767 ? 32767 : sum < -32768 ? -32768 : sum;
       }
+      const avg = energy / SAMPLES_PER_TICK;
+      if (avg >= Mixer.SPEECH_FLOOR && avg > loudestEnergy) {
+        loudestEnergy = avg;
+        loudest = participant;
+      }
     }
+
+    if (loudest) {
+      this.speaker = loudest;
+      this.silentTicks = 0;
+    } else if (this.speaker && ++this.silentTicks > Mixer.SILENCE_TICKS_TO_RESET) {
+      this.speaker = null;
+    }
+
     return out;
   }
 
@@ -1235,6 +1335,9 @@ export class Bridge {
   private internal = new Room();
   private mixer = new Mixer();
   private occupancy: Occupancy;
+  /** identity → отображаемое имя участника встречи */
+  private names = new Map<string, string>();
+  private lastSpeaker: string | null = null;
   private toInternal?: AudioSource;
   private toExternal?: AudioSource;
   private ticker?: NodeJS.Timeout;
@@ -1274,13 +1377,23 @@ export class Bridge {
       this.occupancy.joined(identity, this.cfg.now());
     }
 
+    // Микшер работает по identity, а людям нужно показать имя, которое человек
+    // ввёл, входя в комнату. Держим сопоставление, иначе в расшифровке окажутся
+    // служебные идентификаторы.
+    for (const [identity, p] of this.external.remoteParticipants) {
+      this.names.set(identity, p.name || identity);
+    }
+
     this.external.on(RoomEvent.ParticipantConnected, (p: RemoteParticipant) => {
       this.occupancy.joined(p.identity, this.cfg.now());
+      this.names.set(p.identity, p.name || p.identity);
       void this.reportFirstHuman();
     });
     this.external.on(RoomEvent.ParticipantDisconnected, (p: RemoteParticipant) => {
       this.occupancy.left(p.identity, this.cfg.now());
       this.mixer.remove(p.identity);
+      // names НЕ чистим: реплики этого человека уже в транскрипте, и если он
+      // вернётся, имя должно совпасть с прежним.
     });
     this.external.on(RoomEvent.TrackSubscribed, (track: RemoteTrack, _pub, p: RemoteParticipant) => {
       if (track.kind !== TrackKind.KIND_AUDIO) return;
@@ -1358,6 +1471,25 @@ export class Bridge {
     }
 
     const samples = this.mixer.tick();
+
+    // Смена говорящего — в data-канал нашей комнаты. Шлём именно НА СМЕНЕ, а не
+    // каждый тик: тик 20 мс, это полсотни пакетов в секунду на ровном месте.
+    if (this.mixer.dominant !== this.lastSpeaker) {
+      this.lastSpeaker = this.mixer.dominant;
+      const name = this.lastSpeaker ? this.names.get(this.lastSpeaker) || this.lastSpeaker : null;
+      const msg = { v: 1, type: 'speaker', name };
+      try {
+        await this.internal.localParticipant.publishData(
+          new TextEncoder().encode(JSON.stringify(msg)),
+          { reliable: true, topic: 'linkeon' },
+        );
+      } catch (e: any) {
+        // Разметка говорящего — украшение расшифровки. Уронить из-за неё
+        // встречу нельзя: звук важнее имени.
+        console.error(`[bridge ${this.cfg.callId}] publishData failed: ${e?.message}`);
+      }
+    }
+
     if (!this.toInternal) return;
     try {
       await this.toInternal.captureFrame(new AudioFrame(samples, SAMPLE_RATE, 1, SAMPLES_PER_TICK));
@@ -1691,9 +1823,25 @@ const isMeeting = meta.mode === 'meeting';
 
 Модель получает гейт, если это встреча:
 
+Модель у встречи своя. Решение владельца 27.08.2026 — `gpt-realtime-2.1-mini`: он в 3.2 раза дешевле по обеим ставкам, а роль «слушать и вовремя дёрнуть коллегу» флагмана не требует. Учёт стоимости подстроится сам — `ratesFor()` в `voice-call.service.ts` выбирает ставки по имени модели через `/mini/i`, а имя приезжает от воркера в `complete`.
+
 ```typescript
+/**
+ * Встреча идёт на mini, звонок остаётся на флагмане.
+ *
+ * Отдельная переменная, а не общая VOICE_MODEL: у звонка разговор один на один
+ * и качество ответа там видно сразу, а встреча длится вдвое дольше и почти вся
+ * состоит из молчаливого прослушивания.
+ */
+const model = isMeeting
+  ? process.env.VOICE_MEETING_MODEL || 'gpt-realtime-2.1-mini'
+  : process.env.VOICE_MODEL || 'gpt-realtime-2.1';
+
 llm: new openai.realtime.RealtimeModel({
-  model: process.env.VOICE_MODEL || 'gpt-realtime-2.1',
+  model,
+  // Голос сравнивался на флагмане. Проверить, что он есть у mini и звучит так
+  // же: набор голосов у моделей может отличаться, а на неверном значении
+  // канонический список отдаёт сам API.
   voice: meta.agentVoice || process.env.VOICE_NAME || 'cedar',
   inputAudioNoiseReduction: {
     // far_field — микрофон посреди переговорной, а не гарнитура: на встрече
@@ -1721,6 +1869,9 @@ import { callInstructions, meetingInstructions, meetingIntro } from './prompts.j
 const FOLLOWUP_WINDOW_MS = 30_000;
 
 const gate = isMeeting ? new NameGate(meta.agentName || 'Роман', FOLLOWUP_WINDOW_MS) : null;
+
+/** Кто из участников говорит сейчас — приезжает от моста по data-каналу. */
+let currentSpeaker: string | undefined;
 ```
 
 В существующем обработчике `ConversationItemAdded` (там, где сейчас копится транскрипт) — после записи в транскрипт:
@@ -1787,7 +1938,59 @@ session.generateReply({
 
 Существующий блок комментариев над `generateReply` (`agent.ts:348-357` — про гудки дозвона и про то, что до первой реплики Realtime уходит в английский) остаётся на месте: он объясняет, почему первая фраза задаётся явно, и для встречи это верно ровно так же.
 
-- [ ] **Step 3: Поднять потолок сессии для встречи**
+Там же, где воркер шлёт `complete` (`agent.ts:323-327`), в `usage.model` сейчас захардкожено `process.env.VOICE_MODEL || 'gpt-realtime-2.1'`. Заменить на ту же переменную `model` — иначе встреча на mini будет посчитана по ставкам флагмана и завысит расход втрое.
+
+- [ ] **Step 3: Проставлять говорящего в транскрипт**
+
+Мост шлёт смену говорящего в data-канал. Воркер держит текущего и помечает им реплики людей.
+
+Тип сообщения добавляется в `src/voice-call/voice-call.types.ts`, к остальным вариантам `VoiceDataMessage`:
+
+```typescript
+  // Кто из участников встречи говорит сейчас. Шлёт мост, на смене говорящего.
+  // null — тишина. Разметка приблизительная: считается по громкости дорожки,
+  // а не по распознаванию голоса, и врёт при перебиваниях.
+  | { v: 1; type: 'speaker'; name: string | null }
+```
+
+`TranscriptEntry` в `voice-host/src/backend.ts` и `CompletePayload['transcript']` в `voice-call.types.ts` получают необязательное поле:
+
+```typescript
+export type TranscriptEntry = {
+  role: 'user' | 'assistant';
+  text: string;
+  ts: number;
+  /** Кто это сказал, по разметке моста. Нет на звонке и при тишине. */
+  speaker?: string;
+};
+```
+
+Колонка `transcript` — JSONB, миграция не нужна.
+
+В `agent.ts` — приём сообщения в существующем обработчике `RoomEvent.DataReceived`, рядом с разбором `specialist_answer`:
+
+```typescript
+if (msg.type === 'speaker') {
+  currentSpeaker = msg.name || undefined;
+  return;
+}
+```
+
+И проставление при записи реплики, там же где сейчас `transcript.push`:
+
+```typescript
+transcript.push({
+  role: normalizedRole,
+  text: textContent,
+  ts: Date.now(),
+  // Только человеческие реплики: у ассистента говорящий известен и так.
+  ...(normalizedRole === 'user' && currentSpeaker ? { speaker: currentSpeaker } : {}),
+});
+```
+
+Резюме тоже должно видеть имена — в `VoiceCallService.summarize` строка склеивается как `${t.role === 'user' ? 'Пользователь' : 'Роман'}: ${t.text}`. Для встречи заменить на `t.speaker || 'Участник'` у человеческих реплик, иначе весь смысл разметки теряется на последнем шаге.
+
+- [ ] **Step 4: Поднять потолок сессии для встречи**
 
 `SESSION_LIMIT_MS` в `agent.ts:279` сейчас час. Сделать зависимым от режима:
 
@@ -1799,16 +2002,17 @@ session.generateReply({
 const SESSION_LIMIT_MS = (isMeeting ? 2 : 1) * 60 * 60 * 1000;
 ```
 
-- [ ] **Step 4: Собрать и прогнать тесты воркера**
+- [ ] **Step 5: Собрать и прогнать тесты воркера**
 
 Run: `ssh dv@85.192.61.231 'cd ~/ci/spirits_back/voice-host && source ~/.nvm/nvm.sh && npx tsc --noEmit && npm test'`
 Expected: типы проходят, тесты `pending` / `name-gate` / `mixer` / `occupancy` зелёные
 
-- [ ] **Step 5: Коммит**
+- [ ] **Step 6: Коммит**
 
 ```bash
-git add voice-host/src/prompts.ts voice-host/src/agent.ts
-git commit -m "feat(meeting): режим встречи в воркере — гейт по имени и представление"
+git add voice-host/src/prompts.ts voice-host/src/agent.ts voice-host/src/backend.ts \
+        src/voice-call/voice-call.types.ts src/voice-call/voice-call.service.ts
+git commit -m "feat(meeting): режим встречи в воркере — гейт, представление, говорящий"
 ```
 
 ---
@@ -2556,7 +2760,27 @@ if (meeting) {
 
 `agentId` берётся из текущего выбранного ассистента — карточка живёт в его чате, и заходить должен именно он. Если в компоненте ассистент называется иначе, взять существующее имя переменной, а не заводить новое.
 
-- [ ] **Step 8: Строки в семи локалях**
+- [ ] **Step 8: Показать говорящего в карточке расшифровки**
+
+`VoiceCallCard.tsx:81` сейчас рисует роль двумя вариантами — «Вы» и «Ассистент». У встречи людей несколько, и «Вы» там неверно: реплику мог сказать клиент, а не владелец чата.
+
+```tsx
+<span className="font-medium text-forest-800">
+  {line.role === 'user'
+    ? line.speaker || t('chat.voice_call.speaker_you')
+    : t('chat.voice_call.speaker_assistant')}:
+</span>{' '}
+```
+
+Поле `speaker` добавить в интерфейс `VoiceCallDetails`:
+
+```tsx
+transcript: { role: 'user' | 'assistant'; text: string; ts: number; speaker?: string }[] | null;
+```
+
+Фолбэк на «Вы» обязателен: у звонков в истории `speaker` нет и не появится, а карточка у звонка и у встречи одна.
+
+- [ ] **Step 9: Строки в семи локалях**
 
 Добавить блок `chat.meeting` рядом с существующим `chat.voice_call` (`ru.json:206`) во **все семь** файлов: `ru`, `en`, `es`, `de`, `fr`, `pt`, `zh`.
 
@@ -2573,7 +2797,7 @@ if (meeting) {
 
 Множественных форм здесь нет — категории по языкам разные, и `_few`/`_many` из русского в чужую локаль переносить нельзя. Если понадобится счётчик, брать категории из `Intl.PluralRules`.
 
-- [ ] **Step 9: Проверить полноту локалей**
+- [ ] **Step 10: Проверить полноту локалей**
 
 ```bash
 cd ~/Downloads/spirits_front
@@ -2584,7 +2808,7 @@ done
 
 Expected: `6` во всех семи файлах.
 
-- [ ] **Step 10: Прогнать тесты и сборку на ноде**
+- [ ] **Step 11: Прогнать тесты и сборку на ноде**
 
 ```bash
 git push -u origin <ветка>
@@ -2594,13 +2818,14 @@ ssh dv@85.192.61.231 'cd ~/ci/spirits_front && source ~/.nvm/nvm.sh && pnpm inst
 
 Expected: тесты зелёные, сборка проходит
 
-- [ ] **Step 11: Коммит**
+- [ ] **Step 12: Коммит**
 
 ```bash
 git add src/components/chat/MeetingJoinCard.tsx src/components/chat/MeetingStatusBar.tsx \
+        src/components/chat/VoiceCallCard.tsx \
         src/utils/customMarkdown.tsx src/utils/customMarkdown.test.ts \
         src/components/chat/ChatInterface.tsx src/i18n/locales/
-git commit -m "feat(meeting): карточка входа во встречу и плашка статуса"
+git commit -m "feat(meeting): карточка входа во встречу, плашка статуса, имена в расшифровке"
 ```
 
 ---
@@ -2734,6 +2959,9 @@ BRIDGE_URL=http://127.0.0.1:8138          # бэкенд → мост
 BRIDGE_PORT=8138                          # порт процесса моста
 TALERID_ROOM_API=https://api.talerid.io/api
 TALERID_LIVEKIT_URL=wss://api.talerid.io/livekit/
+
+# Модель встречи. Отдельно от VOICE_MODEL: звонок остаётся на флагмане.
+VOICE_MEETING_MODEL=gpt-realtime-2.1-mini
 ```
 
 `VOICE_CALLBACK_SECRET`, `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` уже заданы для звонка — мост берёт их же.
