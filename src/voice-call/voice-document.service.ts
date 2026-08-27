@@ -1,11 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
+import { StorageService } from '../common/services/storage.service';
 import { ChatService } from '../chat/chat.service';
 import { LiveKitClient } from './livekit.client';
 import {
-  CONSULT_CHARS_IN_DOC, DOC_GIST_CHARS, DOC_TIMEOUT_MS, DocumentResult,
-  findSpecialist, HOST_AGENT_ID, MAX_CONSULT_IN_DOC,
+  CONSULT_CHARS_IN_DOC, DOC_GIST_CHARS, DOC_LEAD_CHARS, DOC_TIMEOUT_MS, DOCS_BUCKET,
+  DocumentResult, findSpecialist, HOST_AGENT_ID, MAX_CONSULT_IN_DOC,
 } from './voice-call.types';
 
 /**
@@ -29,7 +30,47 @@ export class VoiceDocumentService {
     private readonly pg: PgService,
     private readonly chat: ChatService,
     private readonly livekit: LiveKitClient,
+    private readonly storage: StorageService,
   ) {}
+
+  /**
+   * Положить документ файлом и вернуть ссылку.
+   *
+   * text/plain, а не text/markdown: браузер показывает plain прямо в окне, а
+   * markdown предлагает скачать. Документ, ради которого надо лезть в папку
+   * «Загрузки», — это не «доступен по ссылке».
+   *
+   * Отдаётся как есть, без конвертации в HTML: готовой библиотеки в бэкенде
+   * нет, а самодельный markdown-конвертер — известная яма (таблицы, вложенные
+   * списки, экранирование).
+   */
+  private async publish(userId: string, docId: string, title: string, body: string): Promise<string | null> {
+    try {
+      return await this.storage.upload({
+        bucket: DOCS_BUCKET,
+        key: `documents/${userId}/${docId}.md`,
+        body: Buffer.from(`# ${title}\n\n${body}`, 'utf8'),
+        contentType: 'text/plain; charset=utf-8',
+        cacheControl: 'public, max-age=31536000',
+      });
+    } catch (e: any) {
+      // Без ссылки документ всё равно попадёт в чат текстом — это хуже, но
+      // не потеря.
+      this.logger.warn(`документ «${title}» не удалось выложить файлом: ${e?.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Первые несколько абзацев — чтобы в ленте было видно, о чём документ, но
+   * не лежала стена текста. Режем по границе абзаца, а не по символу.
+   */
+  private static lead(body: string): string {
+    if (body.length <= DOC_LEAD_CHARS) return body;
+    const cut = body.slice(0, DOC_LEAD_CHARS);
+    const lastBreak = Math.max(cut.lastIndexOf('\n\n'), cut.lastIndexOf('. '));
+    return (lastBreak > DOC_LEAD_CHARS / 3 ? cut.slice(0, lastBreak + 1) : cut).trim() + '…';
+  }
 
   create(
     callId: string,
@@ -123,10 +164,19 @@ export class VoiceDocumentService {
       const body = (reply.text || '').trim();
       if (!body) throw new Error('пустой документ');
 
+      // Файл + короткое вступление со ссылкой, а не весь текст в ленту.
+      // Документ на шесть тысяч знаков в чате — стена, которую невозможно
+      // читать. Владелец 26.08.2026: «документ должен быть доступен по ссылке
+      // или прикреплён к чату».
+      const url = await this.publish(userId, docId, title, body);
+      const content = url
+        ? `## ${title}\n\n${VoiceDocumentService.lead(body)}\n\n[Открыть документ полностью](${url})`
+        : `## ${title}\n\n${body}`;
+
       await this.pg.query(
         `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
          VALUES ($1, 'ai', $2, $3, 'text', $4)`,
-        [`${userId}_${agentId}`, agentId, `## ${title}\n\n${body}`, reply.tokens],
+        [`${userId}_${agentId}`, agentId, content, reply.tokens],
       );
 
       await this.charge(userId, agentId, title, reply.tokens);
@@ -134,7 +184,7 @@ export class VoiceDocumentService {
       // может ни сообщить о готовности, ни обсудить содержимое.
       await this.safeSend(roomName, {
         v: 1, type: 'document_ready', docId, title, tokens: reply.tokens,
-        specialist: author, text: body.slice(0, DOC_GIST_CHARS),
+        specialist: author, text: body.slice(0, DOC_GIST_CHARS), url: url || undefined,
       });
       this.logger.log(
         `документ «${title}» готов, ${body.length} знаков, ${reply.tokens} токенов, ` +

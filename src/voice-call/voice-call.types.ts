@@ -17,7 +17,7 @@ export type VoiceDataMessage =
   // сам ведущий. text — начало готового текста: без него Роман не знает,
   // что в документе, и не может ни сообщить о готовности, ни обсудить.
   | { v: 1; type: 'document_pending'; docId: string; title: string; specialist?: string }
-  | { v: 1; type: 'document_ready'; docId: string; title: string; tokens: number; specialist?: string; text?: string }
+  | { v: 1; type: 'document_ready'; docId: string; title: string; tokens: number; specialist?: string; text?: string; url?: string }
   | { v: 1; type: 'document_failed'; docId: string; title: string; reason: 'timeout' | 'error'; specialist?: string };
 
 /** Ответ на /internal/document. Как и ask, возвращается мгновенно. */
@@ -31,6 +31,10 @@ export const MAX_CONSULT_IN_DOC = 5;
 export const CONSULT_CHARS_IN_DOC = 4000;
 /** Сколько текста документа отдаём Роману, чтобы он знал его содержание. */
 export const DOC_GIST_CHARS = 1500;
+/** Сколько показываем в ленте до ссылки: документ целиком — стена текста. */
+export const DOC_LEAD_CHARS = 600;
+/** Бакет для файлов документов. Тот же, где аватары и картинки. */
+export const DOCS_BUCKET = 'linkeon-assets';
 
 /** Дольше документ не сочиняем. Он длиннее ответа специалиста, отсюда запас. */
 export const DOC_TIMEOUT_MS = 300_000;
