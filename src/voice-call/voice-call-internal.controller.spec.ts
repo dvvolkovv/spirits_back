@@ -80,7 +80,7 @@ describe('VoiceCallInternalController: доступ', () => {
   });
 
   describe('/document', () => {
-    const docBody = { callId: 'call-1', title: 'Письмо', instructions: 'коротко' };
+    const docBody = { callId: 'call-1', title: 'Письмо', instructions: 'коротко', specialist: 'Виталий' };
     const docRaw = JSON.stringify(docBody);
 
     it('ручка документов тоже закрыта подписью', async () => {
@@ -93,7 +93,9 @@ describe('VoiceCallInternalController: доступ', () => {
       const { ctl, docs } = makeCtl();
       const res = await ctl.document(signBody(SECRET, docRaw), req(docRaw));
       expect(res).toMatchObject({ status: 'accepted' });
-      expect(docs.create).toHaveBeenCalledWith('call-1', 'room-1', 'u1', 'Письмо', 'коротко');
+      // Имя специалиста обязано доехать: от него зависит, кто напишет
+      // документ и в чей чат он ляжет.
+      expect(docs.create).toHaveBeenCalledWith('call-1', 'room-1', 'u1', 'Письмо', 'коротко', 'Виталий');
     });
 
     it('документ по завершённому звонку не сочиняем', async () => {
