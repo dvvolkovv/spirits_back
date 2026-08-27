@@ -119,9 +119,18 @@ push_local_repo() {
     return
   fi
   cd "$dir"
-  if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+  # Проверка чистоты нужна для КОДА: серверы встают на origin/main жёстко, и
+  # незакоммиченная правка просто не поедет — про это и предупреждение.
+  #
+  # docs/ из неё исключены: туда ничего не выкатывается вообще. Репозиторий
+  # общий и параллельные сессии пишут в docs/ свои спеки прямо во время
+  # работы; из-за чужого черновика деплой вставал, а вычищать его — значит
+  # рвать чужой текст из-под работающей сессии (27.08.2026).
+  local dirty
+  dirty="$(git status --porcelain 2>/dev/null | grep -vE '^.. docs/' || true)"
+  if [[ -n "$dirty" ]]; then
     red "  $name: uncommitted local changes — commit them before deploy"
-    git status -sb | head -10
+    echo "$dirty" | head -10
     exit 1
   fi
   # Отказ push — ОСТАНОВКА, а не предупреждение.
