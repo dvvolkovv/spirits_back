@@ -7,7 +7,6 @@ import { VoiceCallStatusController } from './voice-call-status.controller';
 import { VoiceCallService } from './voice-call.service';
 import { SpecialistJobService } from './specialist-job.service';
 import { VoiceDocumentService } from './voice-document.service';
-import { LiveKitClient } from './livekit.client';
 import { VoiceCallReaperService } from './voice-call-reaper.service';
 import { MeetingModule } from '../meeting/meeting.module';
 
@@ -29,8 +28,8 @@ import { MeetingModule } from '../meeting/meeting.module';
 @Module({
   imports: [CommonModule, ChatModule, forwardRef(() => MeetingModule)],
   controllers: [VoiceCallController, VoiceCallInternalController, VoiceCallStatusController],
-  providers: [VoiceCallService, SpecialistJobService, VoiceDocumentService, LiveKitClient, VoiceCallReaperService],
-  exports: [VoiceCallService, LiveKitClient],
+  providers: [VoiceCallService, SpecialistJobService, VoiceDocumentService, VoiceCallReaperService],
+  exports: [VoiceCallService],
 })
 export class VoiceCallModule implements OnModuleInit {
   private readonly logger = new Logger(VoiceCallModule.name);

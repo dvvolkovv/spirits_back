@@ -10,6 +10,9 @@ import { TasksService } from '../tasks/tasks.service';
 import { EventsService } from '../events/events.service';
 import { TalerIdOauthService } from '../talerid/talerid-oauth.service';
 import { LanguageService, LANGUAGE_REPLY_LINE, DEFAULT_LANGUAGE } from '../common/services/language.service';
+import { parseMeetingLink } from '../meeting/meeting-link';
+import { RoomService } from '../meeting/room.service';
+import { buildMeetingCard } from './meeting-card';
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import axios from 'axios';
@@ -265,6 +268,7 @@ export class ChatService {
     @Optional() private readonly events?: EventsService,
     @Optional() private readonly talerIdOauth?: TalerIdOauthService,
     @Optional() private readonly businessProfile?: BusinessProfileService,
+    @Optional() private readonly rooms?: RoomService,
   ) {}
 
   /**
@@ -435,6 +439,43 @@ export class ChatService {
     // Get chat history (individual rows: session_id, sender_type, content)
     // fresh: история и запись — в отдельной fresh-сессии из controller'а.
     const chatSessionId = fresh ? sessionId : `${userId}_${assistantId}`;
+
+    // Ссылка на комнату Linkeon замыкает ход: показываем карточку «Зайти во
+    // встречу» и в модель не идём. Иначе за каждую вставленную ссылку платим
+    // ход LLM и получаем два ответа — карточку и рассуждение ассистента о ней.
+    // Тот же приём, что у приветствия и у сообщения о нехватке токенов ниже.
+    const meetingLink = this.rooms ? parseMeetingLink(message) : null;
+    if (meetingLink) {
+      const room = await this.rooms!.info(meetingLink.code).catch(() => null);
+      // Комнаты нет или она закрыта — значит это была обычная ссылка в
+      // разговоре, а не приглашение. Идём обычным путём.
+      if (room?.active) {
+        res.status(200);
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Transfer-Encoding', 'chunked');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+
+        await this.pg.query(
+          `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
+           VALUES ($1, 'human', $2, $3, 'text')`,
+          [chatSessionId, agent.id, message],
+        );
+        const card = buildMeetingCard(room.code, room.title);
+        await this.pg.query(
+          `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
+           VALUES ($1, 'ai', $2, $3, 'text', 0)`,
+          [chatSessionId, agent.id, card],
+        );
+
+        res.write(JSON.stringify({ type: 'begin' }) + '\n');
+        res.write(JSON.stringify({ type: 'item', content: card }) + '\n');
+        res.write(JSON.stringify({ type: 'end', content: card, usage: { input: 0, output: 0, total: 0 } }) + '\n');
+        res.end();
+        return;
+      }
+    }
     const histRes = await this.pg.query(
       `SELECT sender_type, content FROM custom_chat_history
        WHERE session_id = $1
