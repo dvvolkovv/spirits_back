@@ -566,42 +566,83 @@ describe('addressedByName', () => {
 describe('NameGate', () => {
   test('молчит, пока не назвали по имени', () => {
     const gate = new NameGate('Роман', 30_000);
-    assert.equal(gate.shouldRespond('погода сегодня хорошая', 1000), false);
+    assert.equal(gate.decide('погода сегодня хорошая', 1000), 'silent');
   });
 
   test('отвечает, когда назвали', () => {
     const gate = new NameGate('Роман', 30_000);
-    assert.equal(gate.shouldRespond('Роман, твоё мнение?', 1000), true);
+    assert.equal(gate.decide('Роман, твоё мнение?', 1000), 'respond');
   });
 
   test('внутри окна отвечает и без имени', () => {
     const gate = new NameGate('Роман', 30_000);
-    gate.shouldRespond('Роман, твоё мнение?', 1000);
+    gate.decide('Роман, твоё мнение?', 1000);
     gate.noteReplied(2000);
-    assert.equal(gate.shouldRespond('а почему?', 5000), true);
+    assert.equal(gate.decide('а почему?', 5000), 'respond');
   });
 
   test('после истечения окна снова молчит', () => {
     const gate = new NameGate('Роман', 30_000);
-    gate.shouldRespond('Роман, твоё мнение?', 1000);
+    gate.decide('Роман, твоё мнение?', 1000);
     gate.noteReplied(2000);
-    assert.equal(gate.shouldRespond('а почему?', 40_000), false);
+    assert.equal(gate.decide('а почему?', 40_000), 'silent');
   });
 
   test('каждый ответ продлевает окно', () => {
     const gate = new NameGate('Роман', 30_000);
-    gate.shouldRespond('Роман?', 1000);
+    gate.decide('Роман?', 1000);
     gate.noteReplied(2000);
-    gate.shouldRespond('а дальше?', 20_000);
+    gate.decide('а дальше?', 20_000);
     gate.noteReplied(21_000);
-    assert.equal(gate.shouldRespond('и что теперь?', 45_000), true);
+    assert.equal(gate.decide('и что теперь?', 45_000), 'respond');
   });
 
   test('окно не открывается само, без ответа ассистента', () => {
     const gate = new NameGate('Роман', 30_000);
-    gate.shouldRespond('Роман?', 1000);
+    gate.decide('Роман?', 1000);
     // noteReplied не вызывался — модель не ответила
-    assert.equal(gate.shouldRespond('а почему?', 5000), false);
+    assert.equal(gate.decide('а почему?', 5000), 'silent');
+  });
+
+  // Решение владельца 26.08.2026: «Роман, пока слушай» — уходит в режим
+  // слушателя. Дословная формулировка в docs/meeting-bot.md.
+  test('команда слушать уводит в режим слушателя', () => {
+    const gate = new NameGate('Роман', 30_000);
+    assert.equal(gate.decide('Роман, пока слушай', 1000), 'ack_listen');
+  });
+
+  test('в режиме слушателя молчит даже когда зовут по имени', () => {
+    const gate = new NameGate('Роман', 30_000);
+    gate.decide('Роман, пока слушай', 1000);
+    assert.equal(gate.decide('Роман, что скажешь?', 2000), 'silent');
+  });
+
+  test('в режиме слушателя не действует и окно продолжения', () => {
+    const gate = new NameGate('Роман', 30_000);
+    gate.decide('Роман?', 1000);
+    gate.noteReplied(2000);
+    gate.decide('Роман, пока слушай', 3000);
+    assert.equal(gate.decide('а почему?', 4000), 'silent');
+  });
+
+  test('обратная команда возвращает в диалог', () => {
+    const gate = new NameGate('Роман', 30_000);
+    gate.decide('Роман, пока слушай', 1000);
+    assert.equal(gate.decide('Роман, вопрос к тебе', 2000), 'ack_resume');
+    assert.equal(gate.decide('Роман, так что?', 3000), 'respond');
+  });
+
+  test('обратная команда без имени не поднимает из режима слушателя', () => {
+    // Иначе фраза «вопрос к тебе», сказанная одним человеком другому,
+    // возвращала бы ассистента в разговор, из которого его убрали.
+    const gate = new NameGate('Роман', 30_000);
+    gate.decide('Роман, пока слушай', 1000);
+    assert.equal(gate.decide('вопрос к тебе, Сергей', 2000), 'silent');
+  });
+
+  test('обычное обращение вне режима слушателя не считается командой', () => {
+    const gate = new NameGate('Роман', 30_000);
+    assert.equal(gate.decide('Роман, вопрос к тебе', 1000), 'respond');
   });
 });
 ```
@@ -650,6 +691,22 @@ export function addressedByName(text: string, name: string): boolean {
   });
 }
 
+/** Что делать с репликой, которую только что распознали. */
+export type GateDecision =
+  /** промолчать */
+  | 'silent'
+  /** дать модели ход */
+  | 'respond'
+  /** подтвердить уход в режим слушателя одной фразой */
+  | 'ack_listen'
+  /** подтвердить возвращение в диалог одной фразой */
+  | 'ack_resume';
+
+/** «Роман, пока слушай» и синонимы. */
+const LISTEN_CMD = /\b(пока\s+слушай|просто\s+слушай|молчи|в\s+режим\w*\s+слушател)/i;
+/** «Роман, вопрос к тебе» и синонимы. */
+const RESUME_CMD = /\b(вопрос\s+к\s+тебе|можешь\s+говорить|возвращайся|подключайся|включайся)/i;
+
 /**
  * Когда ассистенту позволено говорить на встрече.
  *
@@ -659,23 +716,47 @@ export function addressedByName(text: string, name: string): boolean {
  *
  * Окно открывает ФАКТ ответа (noteReplied), а не факт обращения. Если модель
  * промолчала — разговора нет, и продолжать нечего.
+ *
+ * Поверх этого — режим слушателя по голосовой команде (решение владельца
+ * 26.08.2026, docs/meeting-bot.md). Команды распознаются ТОЛЬКО вместе с
+ * именем: «вопрос к тебе», сказанное одним живым участником другому, не должно
+ * возвращать в разговор ассистента, которого оттуда специально убрали.
  */
 export class NameGate {
   private openUntil = 0;
+  private muted = false;
 
   constructor(
     private readonly name: string,
     private readonly windowMs: number,
   ) {}
 
-  shouldRespond(text: string, now: number): boolean {
-    if (addressedByName(text, this.name)) return true;
-    return now < this.openUntil;
+  decide(text: string, now: number): GateDecision {
+    const addressed = addressedByName(text, this.name);
+
+    if (addressed && LISTEN_CMD.test(text)) {
+      this.muted = true;
+      // Окно тоже гасим: без этого следующая же реплика прошла бы по нему,
+      // и режим слушателя включился бы с задержкой в полминуты.
+      this.openUntil = 0;
+      return 'ack_listen';
+    }
+
+    // Обратная команда работает только из режима слушателя. Иначе обычное
+    // «Роман, вопрос к тебе» превращалось бы в подтверждение вместо ответа.
+    if (this.muted && addressed && RESUME_CMD.test(text)) {
+      this.muted = false;
+      return 'ack_resume';
+    }
+
+    if (this.muted) return 'silent';
+    if (addressed) return 'respond';
+    return now < this.openUntil ? 'respond' : 'silent';
   }
 
   /** Ассистент только что закончил реплику — окно продолжения продлевается. */
   noteReplied(now: number): void {
-    this.openUntil = now + this.windowMs;
+    if (!this.muted) this.openUntil = now + this.windowMs;
   }
 }
 ```
@@ -1565,11 +1646,26 @@ export function meetingInstructions(ctx: MeetingPromptContext): string {
  */
 export function meetingIntro(name: string, ownerName: string): string {
   return (
-    'Ты только что вошёл во встречу. Скажи ПО-РУССКИ ровно одну короткую фразу: ' +
-    `представься как ${name}, ассистент ${ownerName}, скажи что будешь слушать и ` +
-    'подключишься, когда позовут по имени, и что разговор записывается. ' +
-    'Ни одного английского слова, никаких вопросов и никаких списков — только это.'
+    'Ты только что вошёл во встречу. Скажи ПО-РУССКИ две коротких фразы и замолчи. ' +
+    `Первая: представься как ${name}, ассистент ${ownerName}, и скажи, что разговор ` +
+    'записывается. Вторая: объясни правило обращения — если вопрос к тебе, надо ' +
+    `сказать «${name}, вопрос к тебе», а если нужно, чтобы ты просто слушал — ` +
+    `«${name}, пока слушай». Ни одного английского слова, никаких вопросов о делах ` +
+    'и никаких списков.'
   );
+}
+
+/**
+ * Подтверждения переключения режима. Короткие и заданные явно, а не отданные
+ * модели на импровизацию: это служебная реакция, и звучать она должна
+ * одинаково, чтобы участники понимали, что команда услышана.
+ */
+export function listenAck(): string {
+  return 'Скажи ПО-РУССКИ ровно «Хорошо, слушаю» и замолчи. Больше ни слова.';
+}
+
+export function resumeAck(): string {
+  return 'Скажи ПО-РУССКИ ровно «Снова на связи» и замолчи. Больше ни слова.';
 }
 ```
 
@@ -1635,11 +1731,31 @@ if (gate) {
     // Реплика человека: спрашиваем гейт, дать ли модели ход. Синтетические
     // вставки (ответы коллег) сюда не попадают — они отсеяны выше по
     // INTERNAL_PREFIX и должны звучать всегда, их пользователь уже ждёт.
-    if (gate.shouldRespond(textContent, Date.now())) session.generateReply();
+    switch (gate.decide(textContent, Date.now())) {
+      case 'respond':
+        session.generateReply();
+        break;
+      case 'ack_listen':
+        session.generateReply({ instructions: listenAck() });
+        break;
+      case 'ack_resume':
+        session.generateReply({ instructions: resumeAck() });
+        break;
+      case 'silent':
+        break;
+    }
   } else {
     gate.noteReplied(Date.now());
   }
 }
+```
+
+Импорты в `agent.ts` пополняются: `listenAck`, `resumeAck` из `./prompts.js`.
+
+⚠️ **Ответы специалистов и готовые документы приходят по data-каналу и звучат независимо от гейта** — они идут через `pushLine`/`flushPending`, минуя `ConversationItemAdded`. Это правильно: вопрос коллеге задал сам ассистент по просьбе участника, ответа ждут, и молчать в режиме слушателя тут нельзя. Но проверить на живой встрече: если участники ушли в режим слушателя, а ответ специалиста прилетел — он прозвучит.
+
+```typescript
+// (конец фрагмента)
 ```
 
 Инструкции и первая фраза:
