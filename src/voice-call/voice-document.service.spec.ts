@@ -30,7 +30,13 @@ function makePg(jobRows: any[] = []) {
     charges,
     query: jest.fn(async (sql: string, params: any[] = []) => {
       if (/INSERT INTO custom_chat_history/i.test(sql)) {
-        history.push({ session_id: params[0], agent: params[1], content: params[2], tokens: params[3] });
+        history.push({
+          session_id: params[0],
+          agent: params[1],
+          content: params[2],
+          tokens: params[3],
+          sender_type: /'human'/.test(sql) ? 'human' : 'ai',
+        });
         return { rows: [], rowCount: 1 };
       }
       if (/INSERT INTO token_consumption_tasks/i.test(sql)) {
