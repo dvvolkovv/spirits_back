@@ -2,11 +2,17 @@ import { VoiceCallService } from './voice-call.service';
 
 function makeDeps(historyRows: any[] = []) {
   const inserted: any[] = [];
+  const charges: any[] = [];
   const pg = {
     inserted,
+    charges,
     query: jest.fn(async (sql: string, params: any[] = []) => {
       if (/FROM custom_chat_history/i.test(sql)) return { rows: historyRows, rowCount: historyRows.length };
       if (/INSERT INTO custom_chat_history/i.test(sql)) { inserted.push(params); return { rows: [], rowCount: 1 }; }
+      if (/INSERT INTO token_consumption_tasks/i.test(sql)) {
+        charges.push({ status: /'(pending|completed)'/.exec(sql)?.[1], agent_id: params[2], input: params[3], output: params[4], meta: JSON.parse(params[5] || '{}') });
+        return { rows: [], rowCount: 1 };
+      }
       // Проверка «нет ли уже живого звонка» — по умолчанию нет.
       if (/SELECT id FROM voice_calls/i.test(sql)) return { rows: [], rowCount: 0 };
       if (/FROM voice_calls/i.test(sql)) {
@@ -196,5 +202,45 @@ describe('VoiceCallService', () => {
     expect(String(saved![1][1])).toContain('привет');
 
     resolveLlm('резюме');
+  });
+});
+
+describe('списание за минуты разговора', () => {
+  it('в строку учёта идёт пересчитанная цена, а не сырые аудио-токены', async () => {
+    // Аудио-токенов Realtime набегает 1800 на минуту (600 входящих + 1200
+    // исходящих). Положи их как есть — TokenAccountingService сложит
+    // input + output и спишет 1800 вместо реальных ~540.
+    const d = makeDeps();
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+
+    await svc.complete('call-1', {
+      transcript: [{ role: 'user', text: 'привет', ts: 1 }],
+      usage: { audioInputTokens: 600, audioOutputTokens: 1200, model: 'gpt-realtime-2.1' },
+    });
+
+    expect(d.pg.charges).toHaveLength(1);
+    const c = d.pg.charges[0];
+    expect(c.status, 'со статусом completed крон строку не заберёт').toBe('pending');
+    expect(c.input, 'input обязан быть 0, иначе крон сложит его с output').toBe(0);
+    expect(c.output).toBeGreaterThan(0);
+    expect(c.output).toBeLessThan(1800); // не сырые аудио-токены
+    // Сырые счётчики не теряются: без них не разобрать, из чего сложилась цена.
+    expect(c.meta.audioInputTokens).toBe(600);
+    expect(c.meta.audioOutputTokens).toBe(1200);
+    expect(c.meta.kind).toBe('voice_call');
+  });
+
+  it('списанное сохраняется в самом звонке — карточка берёт цифру оттуда', async () => {
+    const d = makeDeps();
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+
+    await svc.complete('call-1', {
+      transcript: [{ role: 'user', text: 'привет', ts: 1 }],
+      usage: { audioInputTokens: 600, audioOutputTokens: 1200, model: 'gpt-realtime-2.1' },
+    });
+
+    const upd = d.pg.query.mock.calls.map((c: any[]) => c[0]).find((q: string) => /UPDATE voice_calls SET status = 'completed'/.test(q));
+    expect(upd, 'звонок обязан закрыться').toBeDefined();
+    expect(upd).toContain('tokens_charged');
   });
 });

@@ -107,7 +107,7 @@ export class SpecialistJobService {
       );
 
       await this.charge(userId, agentId, specialist, tokens);
-      await this.recordInSpecialistChat(userId, agentId, question, answer);
+      await this.recordInSpecialistChat(userId, agentId, question, answer, tokens);
 
       // А в голос уходит короткая выжимка.
       //
@@ -180,7 +180,7 @@ export class SpecialistJobService {
    * Сбой записи job не роняет: ответ уже прозвучал, разговор идёт дальше.
    */
   private async recordInSpecialistChat(
-    userId: string, agentId: number, question: string, answer: string,
+    userId: string, agentId: number, question: string, answer: string, tokens: number,
   ): Promise<void> {
     try {
       const lang = await this.language.resolveUserLanguage(userId);
@@ -195,10 +195,14 @@ export class SpecialistJobService {
          VALUES ($1, 'human', $2, $3, 'text')`,
         [sessionId, agentId, `${note}\n\n${question}`],
       );
+      // Расход, а не ноль. Лента показывает эту цифру под ответом ассистента
+      // (ChatInterface), и с нулём получалось враньё в трёх местах сразу:
+      // в окне звонка «Виталий — 3 200 токенов», с баланса списано столько же,
+      // а в чате с Виталием под тем же ответом пусто.
       await this.pg.query(
         `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
-         VALUES ($1, 'ai', $2, $3, 'text', 0)`,
-        [sessionId, agentId, answer],
+         VALUES ($1, 'ai', $2, $3, 'text', $4)`,
+        [sessionId, agentId, answer, tokens],
       );
     } catch (e: any) {
       this.logger.warn(`консультация не записана в чат agent=${agentId}: ${e?.message}`);

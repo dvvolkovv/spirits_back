@@ -1,6 +1,7 @@
 import { ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
+import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
 import { ChatService } from '../chat/chat.service';
 import { LiveKitClient } from './livekit.client';
 import { CompletePayload, HOST_AGENT_ID, SPECIALIST_ROLES, SPECIALISTS } from './voice-call.types';
@@ -134,30 +135,45 @@ export class VoiceCallService {
     const durationSec = Math.max(0, Math.round((Date.now() - new Date(call.started_at).getTime()) / 1000));
     const cost = this.costUsd(payload.usage.audioInputTokens, payload.usage.audioOutputTokens, payload.usage.model);
 
+    // Курс общий со всеми путями, которые едят платную ёмкость, — см.
+    // common/billing-rates.ts. Минута флагманской Realtime-модели стоит около
+    // двенадцати центов, то есть примерно 540 токенов.
+    const tokens = Math.max(0, Math.ceil(cost * SEAT_TOKENS_PER_USD));
+
     await this.pg.query(
       `UPDATE voice_calls SET status = 'completed', ended_at = now(), duration_sec = $1,
-         transcript = $2, cost_usd = $3, model = $4 WHERE id = $5`,
-      [durationSec, JSON.stringify(payload.transcript), cost, payload.usage.model, callId],
+         transcript = $2, cost_usd = $3, model = $4, tokens_charged = $5 WHERE id = $6`,
+      [durationSec, JSON.stringify(payload.transcript), cost, payload.usage.model, tokens, callId],
     );
 
-    // Учитываем, но НЕ списываем: тариф назначать пока не из чего.
+    // Списываем за разговор — по решению владельца 27.08.2026. Раньше здесь
+    // стоял статус 'completed' с нулём: минуты считались, но не стоили ничего.
     //
-    // Статус обязан быть 'completed', а не 'pending'. TokenAccountingService
-    // раз в 5 секунд забирает все 'pending' и при tokens_to_consume = 0 не
-    // пропускает строку, а считает сумму сам — фолбэк
-    // `input_tokens + output_tokens` (token-accounting.service.ts:74-76).
-    // Со 'pending' с баланса уходило бы 1800 токенов за минуту разговора.
+    // В строку идёт ПЕРЕСЧИТАННАЯ величина, а не сырые аудио-токены, и это
+    // принципиально. TokenAccountingService забирает 'pending' и при
+    // tokens_to_consume = 0 считает сумму сам как `input_tokens +
+    // output_tokens` (token-accounting.service.ts:74-76). Аудио-токенов
+    // Realtime набегает 1800 на минуту разговора (600 входящих плюс 1200
+    // исходящих) — положи мы их как есть, с баланса уходило бы 1800 вместо
+    // реальных ~540. Поэтому input = 0, а в output — уже посчитанная цена.
+    //
+    // Сырые счётчики сохраняются в metadata: без них потом не разобрать,
+    // из чего сложилась стоимость.
     await this.pg.query(
-      `INSERT INTO token_consumption_tasks (execution_id, user_id, status, agent_id, input_tokens, output_tokens, tokens_to_consume, metadata, completed_at)
-       VALUES ($1, $2, 'completed', $3, $4, $5, 0, $6, now())`,
+      `INSERT INTO token_consumption_tasks (execution_id, user_id, status, agent_id, input_tokens, output_tokens, tokens_to_consume, metadata)
+       VALUES ($1, $2, 'pending', $3, 0, $4, 0, $5)`,
       [
-        Math.floor(Math.random() * 2_000_000_000), call.user_id, HOST_AGENT_ID,
-        payload.usage.audioInputTokens, payload.usage.audioOutputTokens,
-        JSON.stringify({ kind: 'voice_call', callId, costUsd: cost, durationSec, durationMs: durationSec * 1000, model: payload.usage.model }),
+        Math.floor(Math.random() * 2_000_000_000), call.user_id, HOST_AGENT_ID, tokens,
+        JSON.stringify({
+          kind: 'voice_call', callId, costUsd: cost, durationSec, durationMs: durationSec * 1000,
+          model: payload.usage.model,
+          audioInputTokens: payload.usage.audioInputTokens,
+          audioOutputTokens: payload.usage.audioOutputTokens,
+        }),
       ],
     );
 
-    this.logger.log(`[complete] call=${callId} ${durationSec}s cost=$${cost.toFixed(4)} — транскрипт сохранён`);
+    this.logger.log(`[complete] call=${callId} ${durationSec}s cost=$${cost.toFixed(4)} → ${tokens} токенов — транскрипт сохранён`);
 
     // Резюме и карточка — в фоне. Промис намеренно не ждём: воркер должен
     // получить ответ немедленно.
