@@ -182,6 +182,7 @@ describe('кому принадлежит документ', () => {
       pg as any,
       { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'тело', tokens: 1, costUsd: 0 })) } as any,
       { send: jest.fn(async () => {}) } as any,
+      makeStorage() as any,
     );
 
     svc.create(CALL, ROOM, 'user-1', 'Заметка', '', 'Гэндальф');
