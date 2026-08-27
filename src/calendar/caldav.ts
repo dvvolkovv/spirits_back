@@ -179,7 +179,13 @@ export class YandexCalDavConnector implements CalendarConnector {
       } as any);
     } catch { return []; }
     if (res.status !== 207) return [];
-    const xml = (await res.text()).replace(/<(\/?)[a-zA-Z0-9]+:/g, '<$1'); // strip ns prefixes
+    // Чтение тела тоже под catch, как и сам fetch выше. Соединение может
+    // оборваться уже после того, как пришли заголовки, — тогда res.text()
+    // реджектится, и без этого ошибка вылетала наружу вместо пустого списка.
+    let xml: string;
+    try {
+      xml = (await res.text()).replace(/<(\/?)[a-zA-Z0-9]+:/g, '<$1'); // strip ns prefixes
+    } catch { return []; }
     const hrefs: string[] = [];
     for (const m of xml.matchAll(/<response>([\s\S]*?)<\/response>/g)) {
       const b = m[1];
