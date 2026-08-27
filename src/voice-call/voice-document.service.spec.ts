@@ -1,6 +1,11 @@
 import { VoiceDocumentService } from './voice-document.service';
 import { HOST_AGENT_ID } from './voice-call.types';
 
+/** Сам документ среди строк чата: ai-строка с markdown-заголовком. */
+const docRow = (history: any[]) => history.find((h) => h.sender_type === 'ai' && String(h.content).startsWith('##'));
+/** Строки, которых быть не должно, если документ не получился. */
+const docRows = (history: any[]) => history.filter((h) => String(h.content).startsWith('##'));
+
 function makeLang() {
   return { resolveUserLanguage: jest.fn(async () => 'ru') };
 }
@@ -66,10 +71,13 @@ describe('VoiceDocumentService', () => {
     svc.create(CALL, ROOM, 'user-1', 'План запуска', 'по пунктам');
     await svc.drainForTests();
 
-    expect(pg.history).toHaveLength(1);
-    expect(pg.history[0].session_id).toBe(`user-1_${HOST_AGENT_ID}`);
-    expect(pg.history[0].content).toContain('## План запуска');
-    expect(pg.history[0].content).toContain('Первый пункт. Второй пункт.');
+    // Первой строкой — задание (оно ложится сразу), второй — сам документ.
+    expect(pg.history).toHaveLength(2);
+    expect(pg.history[0].sender_type).toBe('human');
+    const doc = docRow(pg.history);
+    expect(doc.session_id).toBe(`user-1_${HOST_AGENT_ID}`);
+    expect(doc.content).toContain('## План запуска');
+    expect(doc.content).toContain('Первый пункт. Второй пункт.');
   });
 
   it('о начале и готовности сообщается в комнату', async () => {
@@ -104,8 +112,11 @@ describe('VoiceDocumentService', () => {
     expect(lk.send.mock.calls.map((c: any[]) => c[1])).toContainEqual(
       expect.objectContaining({ type: 'document_failed', reason: 'error' }),
     );
-    // Пустой документ в ленту не пишем.
-    expect(pg.history).toHaveLength(0);
+    // Документа нет, но задание и отметка о неудаче остались: иначе не
+    // отличить «не получилось» от «ещё пишется».
+    expect(docRows(pg.history)).toHaveLength(0);
+    expect(pg.history.map((h: any) => h.sender_type)).toEqual(['human', 'ai']);
+    expect(pg.history[1].content).toContain('не удалось');
   });
 
   it('пустой ответ модели считается провалом, а не пустым документом', async () => {
@@ -116,7 +127,7 @@ describe('VoiceDocumentService', () => {
     svc.create(CALL, ROOM, 'user-1', 'Письмо', '');
     await svc.drainForTests();
 
-    expect(pg.history).toHaveLength(0);
+    expect(docRows(pg.history)).toHaveLength(0);
     expect(lk.send.mock.calls.map((c: any[]) => c[1])).toContainEqual(
       expect.objectContaining({ type: 'document_failed' }),
     );
@@ -161,7 +172,7 @@ describe('кому принадлежит документ', () => {
     await svc.drainForTests();
 
     expect(res).toMatchObject({ status: 'accepted', specialist: 'Виталий' });
-    expect(pg.history[0].session_id).toBe('user-1_17');
+    expect(docRow(pg.history).session_id).toBe('user-1_17');
     expect(pg.charges[0].agent_id).toBe(17);
     // И пишет его сам Виталий, а не ведущий.
     expect(chat.generateAgentReplyWithCharge.mock.calls.map((c: any[]) => c[1])[0]).toBe('17');
@@ -177,7 +188,7 @@ describe('кому принадлежит документ', () => {
 
     expect(res).toMatchObject({ status: 'accepted' });
     expect((res as any).specialist).toBeUndefined();
-    expect(pg.history[0].session_id).toBe(`user-1_${HOST_AGENT_ID}`);
+    expect(docRow(pg.history).session_id).toBe(`user-1_${HOST_AGENT_ID}`);
   });
 
   it('незнакомое имя не роняет документ — пишет ведущий', async () => {
@@ -193,7 +204,7 @@ describe('кому принадлежит документ', () => {
     svc.create(CALL, ROOM, 'user-1', 'Заметка', '', 'Гэндальф');
     await svc.drainForTests();
 
-    expect(pg.history[0].session_id).toBe(`user-1_${HOST_AGENT_ID}`);
+    expect(docRow(pg.history).session_id).toBe(`user-1_${HOST_AGENT_ID}`);
   });
 
   it('в промпт документа попадают ПОЛНЫЕ ответы специалистов этого звонка', async () => {
@@ -257,7 +268,7 @@ describe('документ доступен по ссылке', () => {
     expect(storage.uploads[0].contentType).toBe('text/plain; charset=utf-8');
     expect(storage.uploads[0].body).toContain('# Тарифы');
 
-    const content = pg.history[0].content;
+    const content = docRow(pg.history).content;
     expect(content).toContain('[Открыть документ полностью](https://');
     expect(content.length).toBeLessThan(LONG.length);
   });
@@ -275,8 +286,8 @@ describe('документ доступен по ссылке', () => {
     svc.create(CALL, ROOM, 'user-1', 'Заметка', '');
     await svc.drainForTests();
 
-    expect(pg.history[0].content).toContain('Три коротких слова.');
-    expect(pg.history[0].content).not.toContain('…');
+    expect(docRow(pg.history).content).toContain('Три коротких слова.');
+    expect(docRow(pg.history).content).not.toContain('…');
   });
 
   it('упавшее хранилище не теряет документ — текст ложится в ленту целиком', async () => {
@@ -292,8 +303,8 @@ describe('документ доступен по ссылке', () => {
     await svc.drainForTests();
 
     expect(pg.history).toHaveLength(1);
-    expect(pg.history[0].content).toContain(LONG.trim().slice(0, 40));
-    expect(pg.history[0].content).not.toContain('Открыть документ');
+    expect(docRow(pg.history).content).toContain(LONG.trim().slice(0, 40));
+    expect(docRow(pg.history).content).not.toContain('Открыть документ');
   });
 
   it('ссылка едет Роману вместе с готовностью', async () => {
@@ -335,7 +346,7 @@ describe('автор определяется сам, если Роман его
     svc.create(CALL, ROOM, 'user-1', 'Окна запуска', ''); // имени НЕ передаём
     await svc.drainForTests();
 
-    expect(pg.history[0].session_id).toBe('user-1_13');
+    expect(docRow(pg.history).session_id).toBe('user-1_13');
   });
 
   it('явно названный специалист важнее догадки', async () => {
@@ -351,7 +362,7 @@ describe('автор определяется сам, если Роман его
     svc.create(CALL, ROOM, 'user-1', 'Тарифы', '', 'Виталий');
     await svc.drainForTests();
 
-    expect(pg.history[0].session_id).toBe('user-1_17');
+    expect(docRow(pg.history).session_id).toBe('user-1_17');
   });
 
   it('консультаций не было — пишет ведущий', async () => {
@@ -367,7 +378,7 @@ describe('автор определяется сам, если Роман его
     svc.create(CALL, ROOM, 'user-1', 'Заметка', '');
     await svc.drainForTests();
 
-    expect(pg.history[0].session_id).toBe(`user-1_${HOST_AGENT_ID}`);
+    expect(docRow(pg.history).session_id).toBe(`user-1_${HOST_AGENT_ID}`);
   });
 });
 
