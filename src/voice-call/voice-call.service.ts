@@ -1,10 +1,15 @@
-import { ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { ConflictException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
 import { ChatService } from '../chat/chat.service';
+import { Neo4jService } from '../neo4j/neo4j.service';
+import { BusinessProfileService } from '../business-profile/business-profile.service';
 import { LiveKitClient } from './livekit.client';
-import { CompletePayload, HOST_AGENT_ID, SPECIALIST_ROLES, SPECIALISTS } from './voice-call.types';
+import {
+  CompletePayload, CONSOLIDATE_SIDE_LIMIT, HOST_AGENT_ID, HOST_CATEGORY,
+  SPECIALIST_ROLES, SPECIALISTS,
+} from './voice-call.types';
 
 /**
  * Ставки OpenAI Realtime за 1M аудио-токенов, по моделям.
@@ -32,6 +37,10 @@ export class VoiceCallService {
     private readonly pg: PgService,
     private readonly chat: ChatService,
     private readonly livekit: LiveKitClient,
+    // Необязательные — как в chat.service: без Neo4j или бизнес-профиля
+    // звонок должен работать, просто Роман будет знать о собеседнике меньше.
+    @Optional() private readonly neo4j?: Neo4jService,
+    @Optional() private readonly businessProfile?: BusinessProfileService,
   ) {}
 
   /**
@@ -48,12 +57,23 @@ export class VoiceCallService {
    * Берём с конца, пока укладываемся в бюджет: свежие реплики важнее старых.
    */
   async buildPreamble(userId: string): Promise<string> {
+    // Профиль собеседника — то же, что получают текстовые ассистенты.
+    //
+    // До 27.08.2026 Роман его не видел ВОВСЕ: в инструкцию шла только
+    // переписка из чата. Получалось, что ассистент, которому звонят голосом,
+    // знает о человеке меньше, чем тот же ассистент в текстовом окне.
+    //
+    // Оба источника необязательные и оба под catch: без профиля разговор
+    // состоится, просто Роман будет знать меньше. Ронять из-за этого звонок
+    // нельзя — он стоит денег и начат по инициативе пользователя.
+    const profile = await this.profileBlock(userId);
+
     const res = await this.pg.query(
       `SELECT sender_type, content FROM custom_chat_history
        WHERE session_id = $1 ORDER BY created_at DESC LIMIT $2`,
       [`${userId}_${HOST_AGENT_ID}`, PREAMBLE_MSG_LIMIT],
     );
-    if (!res.rows.length) return '';
+    if (!res.rows.length) return profile;
 
     const lines: string[] = [];
     let budget = PREAMBLE_CHAR_LIMIT;
@@ -66,7 +86,36 @@ export class VoiceCallService {
       budget -= line.length;
       lines.push(line);
     }
-    return lines.reverse().join('\n');
+    const history = lines.reverse().join('\n');
+    return profile ? `${profile}\n\n${history}` : history;
+  }
+
+  /**
+   * Что известно о собеседнике: профиль из Neo4j и бизнес-блок.
+   *
+   * Категория Романа — `assistant`, её и передаём: бизнес-блок сам решает,
+   * что показывать под категорию, и подменять её на `business` значило бы
+   * врать ему о том, кто спрашивает.
+   */
+  private async profileBlock(userId: string): Promise<string> {
+    const parts: string[] = [];
+    if (this.neo4j) {
+      try {
+        const text = (await this.neo4j.getProfileDescription(userId))?.trim();
+        if (text) parts.push(`Что известно о собеседнике:\n${text}`);
+      } catch (e: any) {
+        this.logger.warn(`профиль Neo4j для ${userId} не получен: ${e?.message}`);
+      }
+    }
+    if (this.businessProfile) {
+      try {
+        const biz = (await this.businessProfile.renderForPrompt(userId, HOST_CATEGORY))?.trim();
+        if (biz) parts.push(biz);
+      } catch (e: any) {
+        this.logger.warn(`бизнес-профиль для ${userId} не получен: ${e?.message}`);
+      }
+    }
+    return parts.join('\n\n');
   }
 
   async start(userId: string): Promise<{ callId: string; roomName: string; token: string; wsUrl: string }> {
@@ -175,10 +224,13 @@ export class VoiceCallService {
 
     this.logger.log(`[complete] call=${callId} ${durationSec}s cost=$${cost.toFixed(4)} → ${tokens} токенов — транскрипт сохранён`);
 
-    // Резюме и карточка — в фоне. Промис намеренно не ждём: воркер должен
-    // получить ответ немедленно.
+    // Резюме, карточка и профиль — в фоне. Промисы намеренно не ждём: воркер
+    // обрывает запрос через пятнадцать секунд, а тут походы в LLM на десятки.
+    // Так уже дважды терялся транскрипт целиком.
     void this.finishSummary(callId, call.user_id, payload.transcript, durationSec)
       .catch((e) => this.logger.error(`[complete] резюме для ${callId} не собрано: ${e?.message}`));
+    void this.consolidateCall(call.user_id, payload.transcript)
+      .catch((e) => this.logger.error(`[complete] профиль по ${callId} не обновлён: ${e?.message}`));
   }
 
   /** Резюме и карточка в ленте. Отваливается молча — транскрипт уже сохранён. */
@@ -199,6 +251,42 @@ export class VoiceCallService {
       [`${userId}_${HOST_AGENT_ID}`, HOST_AGENT_ID, content],
     );
     this.logger.log(`[complete] call=${callId} резюме готово, карточка в ленте`);
+  }
+
+  /**
+   * Прогнать разговор через ту же консолидацию, что и обычный ход чата:
+   * профиль в Neo4j, задачи, бизнес-профиль.
+   *
+   * До 27.08.2026 звонок не доходил ни до одного из трёх. Голос — самый
+   * естественный способ рассказать о себе много и быстро, и ровно он ничего
+   * не запоминал: разговор на 84 реплики не менял о человеке ничего.
+   *
+   * Транскрипт сворачивается в два хода — реплики пользователя и реплики
+   * Романа. Извлекатели рассчитаны на один обмен, а не на получасовой
+   * разговор; без потолка туда уехало бы двадцать тысяч знаков, и на выходе
+   * получился бы мусор или отказ.
+   */
+  private async consolidateCall(
+    userId: string,
+    transcript: CompletePayload['transcript'],
+  ): Promise<void> {
+    if (!transcript?.length) return;
+
+    const side = (role: 'user' | 'assistant') =>
+      transcript
+        .filter((t) => t.role === role)
+        .map((t) => t.text.trim())
+        .filter(Boolean)
+        .join(' ')
+        .slice(0, CONSOLIDATE_SIDE_LIMIT);
+
+    const said = side('user');
+    // Извлекать нечего, если человек молчал: односторонний монолог Романа
+    // фактов о собеседнике не содержит.
+    if (!said) return;
+
+    await this.chat.consolidateAfterChatPublic(userId, String(HOST_AGENT_ID), said, side('assistant'));
+    this.logger.log(`[complete] профиль обновлён по разговору (${transcript.length} реплик)`);
   }
 
   async fail(callId: string, reason: string): Promise<void> {

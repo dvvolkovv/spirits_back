@@ -29,7 +29,10 @@ function makeDeps(historyRows: any[] = []) {
       return { rows: [], rowCount: 1 };
     }),
   };
-  const chat = { generateAgentReply: jest.fn(async () => 'краткое резюме звонка') };
+  const chat = {
+    generateAgentReply: jest.fn(async () => 'краткое резюме звонка'),
+    consolidateAfterChatPublic: jest.fn(async () => {}),
+  };
   const livekit = { userToken: jest.fn(async () => 'jwt-token'), dispatchAgent: jest.fn(async () => {}), send: jest.fn(async () => {}) };
   return { pg, chat, livekit };
 }
@@ -262,5 +265,82 @@ describe('списание за минуты разговора', () => {
     const upd = d.pg.query.mock.calls.map((c: any[]) => c[0]).find((q: string) => /UPDATE voice_calls SET status = 'completed'/.test(q));
     expect(upd).toBeDefined();
     expect(upd).toContain('tokens_charged');
+  });
+});
+
+describe('разговор наполняет профиль', () => {
+  const talk = [
+    { role: 'user' as const, text: 'Мы запускаем сервис голосовых ассистентов', ts: 1 },
+    { role: 'assistant' as const, text: 'Понял, расскажите про рынок', ts: 2 },
+    { role: 'user' as const, text: 'Целимся в малый бизнес', ts: 3 },
+  ];
+
+  it('после звонка разговор уходит в консолидацию', async () => {
+    // До 27.08.2026 звонок не доходил ни до Neo4j, ни до задач, ни до
+    // бизнес-профиля: разговор на 84 реплики не менял о человеке ничего.
+    const d = makeDeps();
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+
+    await svc.complete('call-1', {
+      transcript: talk,
+      usage: { audioInputTokens: 600, audioOutputTokens: 1200, model: 'gpt-realtime-2.1' },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    expect(d.chat.consolidateAfterChatPublic).toHaveBeenCalledTimes(1);
+    const [, , said, answered] = d.chat.consolidateAfterChatPublic.mock.calls[0] as any[];
+    // Стороны разложены по ролям, а не свалены в кучу.
+    expect(said).toContain('запускаем сервис');
+    expect(said).toContain('малый бизнес');
+    expect(said).not.toContain('расскажите про рынок');
+    expect(answered).toContain('расскажите про рынок');
+  });
+
+  it('молчаливый звонок в профиль не идёт — извлекать нечего', async () => {
+    const d = makeDeps();
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+
+    await svc.complete('call-1', {
+      transcript: [{ role: 'assistant', text: 'Алло, я на связи', ts: 1 }],
+      usage: { audioInputTokens: 10, audioOutputTokens: 10, model: 'gpt-realtime-2.1' },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    expect(d.chat.consolidateAfterChatPublic).not.toHaveBeenCalled();
+  });
+
+  it('падение консолидации не срывает сохранение разговора', async () => {
+    // Транскрипт уже записан к этому моменту; профиль — дело фоновое.
+    const d = makeDeps();
+    d.chat.consolidateAfterChatPublic = jest.fn(async () => { throw new Error('Neo4j лёг'); }) as any;
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+
+    await expect(svc.complete('call-1', {
+      transcript: talk,
+      usage: { audioInputTokens: 600, audioOutputTokens: 1200, model: 'gpt-realtime-2.1' },
+    })).resolves.toBeUndefined();
+  });
+
+  it('Роман видит профиль собеседника, а не только переписку', async () => {
+    const d = makeDeps([{ sender_type: 'human', content: 'привет' }]);
+    const neo4j = { getProfileDescription: jest.fn(async () => 'Основатель, запускает голосовой сервис') };
+    const biz = { renderForPrompt: jest.fn(async () => 'Бизнес: B2B SaaS') };
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any, neo4j as any, biz as any);
+
+    const preamble = await svc.buildPreamble('u1');
+
+    expect(preamble).toContain('Основатель, запускает голосовой сервис');
+    expect(preamble).toContain('Бизнес: B2B SaaS');
+    expect(preamble).toContain('привет'); // переписка на месте
+    // Категорию передаём настоящую, а не подменяем на business.
+    expect(biz.renderForPrompt.mock.calls.map((c: any[]) => c[1])[0]).toBe('assistant');
+  });
+
+  it('без профиля звонок не ломается — преамбула просто короче', async () => {
+    const d = makeDeps([{ sender_type: 'human', content: 'привет' }]);
+    const neo4j = { getProfileDescription: jest.fn(async () => { throw new Error('Neo4j недоступен'); }) };
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any, neo4j as any, undefined);
+
+    await expect(svc.buildPreamble('u1')).resolves.toContain('привет');
   });
 });
