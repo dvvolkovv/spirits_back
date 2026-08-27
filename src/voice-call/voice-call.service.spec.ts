@@ -10,7 +10,15 @@ function makeDeps(historyRows: any[] = []) {
       if (/FROM custom_chat_history/i.test(sql)) return { rows: historyRows, rowCount: historyRows.length };
       if (/INSERT INTO custom_chat_history/i.test(sql)) { inserted.push(params); return { rows: [], rowCount: 1 }; }
       if (/INSERT INTO token_consumption_tasks/i.test(sql)) {
-        charges.push({ status: /'(pending|completed)'/.exec(sql)?.[1], agent_id: params[2], input: params[3], output: params[4], meta: JSON.parse(params[5] || '{}') });
+        // input_tokens в запросе — литеральный ноль, а не параметр, поэтому
+        // берём его из самого SQL, а из params — только то, что подставляется.
+        charges.push({
+          status: /VALUES[^)]*'(pending|completed)'/.exec(sql)?.[1],
+          sql,
+          agent_id: params[2],
+          output: params[3],
+          meta: JSON.parse(params[4] || '{}'),
+        });
         return { rows: [], rowCount: 1 };
       }
       // Проверка «нет ли уже живого звонка» — по умолчанию нет.
@@ -141,7 +149,9 @@ describe('VoiceCallService', () => {
     );
     expect(call).toBeDefined();
     expect(call![0]).toContain("'pending'");
-    expect(call![1][3]).toBe(0); // input_tokens
+    // input_tokens — литеральный ноль в самом запросе: если положить туда
+    // сырые аудио-токены, крон сложит их с output и спишет вдвое больше.
+    expect(call![0]).toMatch(/VALUES[^)]*,\s*0,\s*\$4/);
   });
 
   it('повторный complete не создаёт вторую карточку', async () => {
@@ -229,9 +239,11 @@ describe('списание за минуты разговора', () => {
     expect(d.pg.charges).toHaveLength(1);
     const c = d.pg.charges[0];
     expect(c.status).toBe('pending'); // с 'completed' крон строку не заберёт
-    expect(c.input).toBe(0); // иначе крон сложит input с output
-    expect(c.output).toBeGreaterThan(0);
-    expect(c.output).toBeLessThan(1800); // не сырые аудио-токены
+    // input_tokens зашит нулём в запросе — иначе крон сложит его с output.
+    expect(c.sql).toMatch(/VALUES[^)]*,\s*0,\s*\$4/);
+    // 600 входящих и 1200 исходящих аудио-токенов флагманской модели — это
+    // $0.096, то есть 432 токена по общему курсу. Никак не 1800.
+    expect(c.output).toBe(432);
     // Сырые счётчики не теряются: без них не разобрать, из чего сложилась цена.
     expect(c.meta.audioInputTokens).toBe(600);
     expect(c.meta.audioOutputTokens).toBe(1200);
