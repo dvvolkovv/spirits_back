@@ -22,6 +22,15 @@ import { JOB_TIMEOUT_MS } from './voice-call.types';
  */
 const STALE_CALL_MS = 70 * 60 * 1000;
 
+/**
+ * Встреча: потолок два часа плюс запас.
+ *
+ * Отдельный порог обязателен. С общим часовым реапер подбирал бы живые встречи
+ * на втором часу и обрывал их как зависшие — то есть предохранитель убивал бы
+ * ровно то, ради чего потолок и подняли.
+ */
+const STALE_MEETING_MS = 130 * 60 * 1000;
+
 @Injectable()
 export class VoiceCallReaperService {
   private readonly logger = new Logger(VoiceCallReaperService.name);
@@ -38,6 +47,7 @@ export class VoiceCallReaperService {
         `UPDATE voice_calls
             SET status = 'interrupted', ended_at = now()
           WHERE status IN ('dialing', 'active')
+            AND provider = 'linkeon'
             AND started_at < now() - ($1 || ' milliseconds')::interval
           RETURNING id, room_name`,
         [String(STALE_CALL_MS)],
@@ -45,7 +55,25 @@ export class VoiceCallReaperService {
 
       for (const row of stale.rows) {
         this.logger.warn(`[reap] звонок ${row.id} висел дольше порога — закрываю комнату`);
+        // Комната создана ради этого звонка и вместе с ним и уходит.
         await this.livekit.closeRoom(row.room_name);
+      }
+
+      const staleMeetings = await this.pg.query(
+        `UPDATE voice_calls
+            SET status = 'interrupted', ended_at = now()
+          WHERE status IN ('dialing', 'active')
+            AND provider <> 'linkeon'
+            AND started_at < now() - ($1 || ' milliseconds')::interval
+          RETURNING id, room_name`,
+        [String(STALE_MEETING_MS)],
+      );
+
+      for (const row of staleMeetings.rows) {
+        this.logger.warn(`[reap] встреча ${row.id} висела дольше порога — выгоняю ассистента`);
+        // Комнату НЕ закрываем: в ней могут быть живые люди, и закрытие
+        // выкинуло бы их всех из-за того, что зависла наша половина.
+        await this.livekit.removeAgents(row.room_name);
       }
 
       // Job'ы переживших звонков: воркер про них уже не спросит.
