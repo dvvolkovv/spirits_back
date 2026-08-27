@@ -49,15 +49,29 @@ test.describe('админка: список ассистентов', () => {
   test('последний ассистент в списке достижим прокруткой', async ({ page }) => {
     await applyBasicAuth(page);
     const { access, refresh } = await getJwtFor(ADMIN_PHONE);
-    await page.addInitScript(([a, r]) => {
+    // userData кладём С флагом isAdmin — так выглядит localStorage у реально
+    // залогиненного админа (AuthContext.persistUser сохраняет его туда).
+    //
+    // Без флага тест проверял не то, что нужно: AuthContext при старте берёт
+    // пользователя из localStorage и сразу гасит isLoading, а профиль с сервера
+    // запрашивает отдельно и позже. AdminPage смотрит user.isAdmin сразу после
+    // isLoading и уводит на /chat, если флага ещё нет. На быстром стенде
+    // профиль успевал прийти, на медленном — нет, и тест падал с невнятным
+    // «элемент не найден» вместо честного «нас выкинуло с админки».
+    await page.addInitScript(([a, r, phone]) => {
       localStorage.setItem('i18nextLng', 'ru');
       localStorage.setItem('jwt_access_token', a);
       localStorage.setItem('jwt_refresh_token', r);
       localStorage.setItem('authToken', a);
-      localStorage.setItem('userData', JSON.stringify({ phone: '79030169187' }));
-    }, [access, refresh]);
+      localStorage.setItem('userData', JSON.stringify({ phone, isAdmin: true }));
+    }, [access, refresh, ADMIN_PHONE]);
 
     await page.goto(`${BASE}/admin?tab=assistants`, { waitUntil: 'domcontentloaded' });
+
+    // Сначала убеждаемся, что вообще остались на админке: редирект на /chat
+    // означает проблему с правами, а не с вёрсткой, и путать их незачем.
+    await expect(page.getByTestId('admin-root'), 'нас выкинуло с админки — проверь isAdmin у ADMIN_PHONE')
+      .toBeVisible({ timeout: 30000 });
 
     const list = page.getByTestId('admin-assistants-list');
     await expect(list).toBeVisible({ timeout: 30000 });
