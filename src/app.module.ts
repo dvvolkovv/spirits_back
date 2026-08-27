@@ -47,6 +47,7 @@ import { CalendarModule } from './calendar/calendar.module';
 import { TalerIdModule } from './talerid/talerid.module';
 import { SpeechModule } from './speech/speech.module';
 import { VoiceCallModule } from './voice-call/voice-call.module';
+import { MeetingModule } from './meeting/meeting.module';
 
 @Module({
   imports: [
@@ -98,6 +99,7 @@ import { VoiceCallModule } from './voice-call/voice-call.module';
     TalerIdModule,
     SpeechModule,
     VoiceCallModule,
+    MeetingModule,
   ],
 })
 export class AppModule {}

@@ -13,9 +13,19 @@ export class LiveKitClient {
   private get apiKey(): string { return process.env.LIVEKIT_API_KEY || ''; }
   private get apiSecret(): string { return process.env.LIVEKIT_API_SECRET || ''; }
 
-  /** Токен участника-человека. TTL с запасом на 60-минутный потолок сессии. */
-  async userToken(roomName: string, identity: string): Promise<string> {
-    const at = new AccessToken(this.apiKey, this.apiSecret, { identity, ttl: '2h' });
+  /**
+   * Токен участника-человека.
+   *
+   * TTL 3 часа: потолок звонка час, потолок встречи два, и токен обязан
+   * пережить любой из них с запасом. Протухший посреди разговора означает
+   * невозможность переподключиться после обрыва сети.
+   *
+   * name отдельно от identity: identity — ключ участника и обязана быть
+   * уникальной, name — то, что видят люди в списке, и у тёзок совпадать
+   * вправе. Без него в комнате видны служебные идентификаторы.
+   */
+  async userToken(roomName: string, identity: string, name?: string): Promise<string> {
+    const at = new AccessToken(this.apiKey, this.apiSecret, { identity, name, ttl: '3h' });
     at.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true, canPublishData: true });
     return at.toJwt();
   }
