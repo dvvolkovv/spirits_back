@@ -102,7 +102,16 @@ ssh dv@85.192.61.231 'cd ~/ci/spirits_back && source ~/.nvm/nvm.sh && npm ci && 
 
 ## Task 1: Спайк — снять два риска до того, как писать всё остальное
 
-От первого зависит, есть ли в проекте микшер вообще. Пока не проверено, остальное писать бессмысленно.
+> **Выполнено статически 27.08.2026.** Оба риска сняты по типам SDK, см. «Результаты
+> спайка» в конце файла. Коротко: `create_response` есть — гейт жизнеспособен;
+> `AgentSession` слышит **ровно одного** участника, поэтому нужен свой микшер, но
+> подключается он не мостом, а через сеттер `session.input.audio` (Task 8а).
+>
+> Живьём остались Steps 2–4: состязание с `RoomIO`, поддержка `create_response` именно у
+> mini и звучание голоса на mini. Они требуют комнаты с двумя говорящими людьми — делать
+> после Task 12, на первой живой комнате.
+
+От первого зависит, есть ли в проекте микшер вообще.
 
 **Files:**
 - Create: `voice-host/src/spike/spike.ts` (временный, удаляется в конце задачи)
@@ -1234,6 +1243,306 @@ git commit -m "feat(meeting): правила присутствия и выхо�
 
 ---
 
+## Task 8а: Сведение речи участников в один поток
+
+Подтверждено спайком: `AgentSession` слышит одного участника. Сводим сами и подаём через `session.input.audio`.
+
+**Files:**
+- Create: `voice-host/src/mixer.ts`, `voice-host/src/mixer.test.ts`
+- Create: `voice-host/src/mixed-audio-input.ts`
+
+- [ ] **Step 1: Написать падающий тест микшера**
+
+```typescript
+// voice-host/src/mixer.test.ts
+import { test, describe } from 'node:test';
+import assert from 'node:assert/strict';
+import { Mixer, SAMPLES_PER_TICK } from './mixer.js';
+
+describe('Mixer', () => {
+  test('без участников отдаёт тишину нужной длины', () => {
+    const out = new Mixer().tick();
+    assert.equal(out.length, SAMPLES_PER_TICK);
+    assert.ok(out.every((v) => v === 0));
+  });
+
+  test('один участник проходит без изменений', () => {
+    const m = new Mixer();
+    m.push('alice', Int16Array.from({ length: SAMPLES_PER_TICK }, () => 100));
+    assert.equal(m.tick()[0], 100);
+  });
+
+  test('двое складываются', () => {
+    const m = new Mixer();
+    m.push('alice', Int16Array.from({ length: SAMPLES_PER_TICK }, () => 100));
+    m.push('bob', Int16Array.from({ length: SAMPLES_PER_TICK }, () => 50));
+    assert.equal(m.tick()[0], 150);
+  });
+
+  test('сумма ограничивается, а не переполняется', () => {
+    const m = new Mixer();
+    m.push('alice', Int16Array.from({ length: SAMPLES_PER_TICK }, () => 30000));
+    m.push('bob', Int16Array.from({ length: SAMPLES_PER_TICK }, () => 30000));
+    assert.equal(m.tick()[0], 32767);
+  });
+
+  test('ограничивается и снизу', () => {
+    const m = new Mixer();
+    m.push('alice', Int16Array.from({ length: SAMPLES_PER_TICK }, () => -30000));
+    m.push('bob', Int16Array.from({ length: SAMPLES_PER_TICK }, () => -30000));
+    assert.equal(m.tick()[0], -32768);
+  });
+
+  test('участник без данных не тормозит остальных', () => {
+    const m = new Mixer();
+    m.push('alice', Int16Array.from({ length: SAMPLES_PER_TICK }, () => 100));
+    m.push('bob', new Int16Array(0));
+    assert.equal(m.tick()[0], 100);
+  });
+
+  test('лишние сэмплы остаются на следующий тик', () => {
+    const m = new Mixer();
+    m.push('alice', Int16Array.from({ length: SAMPLES_PER_TICK * 2 }, () => 77));
+    assert.equal(m.tick()[0], 77);
+    assert.equal(m.tick()[0], 77);
+    assert.equal(m.tick()[0], 0);
+  });
+
+  test('кадр короче тика дополняется тишиной', () => {
+    const m = new Mixer();
+    m.push('alice', Int16Array.from({ length: 10 }, () => 500));
+    const out = m.tick();
+    assert.equal(out[0], 500);
+    assert.equal(out[10], 0);
+  });
+
+  test('ушедший участник перестаёт влиять на микс', () => {
+    const m = new Mixer();
+    m.push('alice', Int16Array.from({ length: SAMPLES_PER_TICK * 3 }, () => 100));
+    m.remove('alice');
+    assert.equal(m.tick()[0], 0);
+  });
+
+  test('буфер не растёт бесконечно', () => {
+    const m = new Mixer();
+    for (let i = 0; i < 200; i++) {
+      m.push('alice', Int16Array.from({ length: SAMPLES_PER_TICK }, () => 100));
+    }
+    assert.ok(m.bufferedTicks('alice') <= Mixer.MAX_BUFFERED_TICKS);
+  });
+});
+```
+
+- [ ] **Step 2: Запустить тест и убедиться, что он падает**
+
+Run: `cd voice-host && npx tsx --test src/mixer.test.ts`
+Expected: FAIL — модуля нет
+
+- [ ] **Step 3: Реализовать микшер**
+
+```typescript
+// voice-host/src/mixer.ts
+
+/** Частота на всём пути. Ресемплинга в нашем коде нет нигде. */
+export const SAMPLE_RATE = 48_000;
+/** 20 мс — стандартный размер пакета WebRTC. */
+export const TICK_MS = 20;
+export const SAMPLES_PER_TICK = (SAMPLE_RATE * TICK_MS) / 1000; // 960
+
+/**
+ * Сведение речи участников встречи в один поток.
+ *
+ * Realtime принимает ровно один вход, а AgentSession из коробки слышит только
+ * одного участника (RoomInputOptions.participantIdentity: «link to the first
+ * participant»). Сводить обязан кто-то.
+ *
+ * Складываем сэмплы, а не перемежаем кадры. Встроенный MultiInputStream умеет
+ * fan-in, но он именно перемежает: при пятерых участниках в поток пошло бы
+ * пять кадров на каждые 20 мс реального времени, и Realtime получал бы аудио
+ * впятеро быстрее реального.
+ *
+ * Кадры приходят вразнобой и разной длины, поэтому выравнивать их не пытаемся:
+ * у каждого участника свой буфер, тикер раз в 20 мс забирает из каждого по 960
+ * сэмплов. Нет данных — тишина, и молчащий не тормозит говорящего.
+ */
+export class Mixer {
+  /**
+   * Потолок буфера — полсекунды.
+   *
+   * Участник может слать быстрее, чем мы читаем (рассинхрон часов, всплеск
+   * сети). Без потолка буфер растёт неограниченно: сначала это задержка,
+   * которая только копится, потом память. Лучше выкинуть старое — во встрече
+   * важна свежая речь, а не полная.
+   */
+  static readonly MAX_BUFFERED_TICKS = 25;
+
+  private buffers = new Map<string, Int16Array[]>();
+
+  push(participant: string, samples: Int16Array): void {
+    if (!samples.length) return;
+    const queue = this.buffers.get(participant) || [];
+    queue.push(samples);
+    while (this.countTicks(queue) > Mixer.MAX_BUFFERED_TICKS) queue.shift();
+    this.buffers.set(participant, queue);
+  }
+
+  remove(participant: string): void {
+    this.buffers.delete(participant);
+  }
+
+  bufferedTicks(participant: string): number {
+    return this.countTicks(this.buffers.get(participant) || []);
+  }
+
+  /** Один смикшированный кадр. Вызывается ровно раз в TICK_MS. */
+  tick(): Int16Array {
+    const out = new Int16Array(SAMPLES_PER_TICK);
+    for (const queue of this.buffers.values()) {
+      const chunk = this.takeTick(queue);
+      for (let i = 0; i < chunk.length; i++) {
+        const sum = out[i] + chunk[i];
+        out[i] = sum > 32767 ? 32767 : sum < -32768 ? -32768 : sum;
+      }
+    }
+    return out;
+  }
+
+  private countTicks(queue: Int16Array[]): number {
+    let n = 0;
+    for (const c of queue) n += c.length;
+    return Math.ceil(n / SAMPLES_PER_TICK);
+  }
+
+  private takeTick(queue: Int16Array[]): Int16Array {
+    const out = new Int16Array(SAMPLES_PER_TICK);
+    let filled = 0;
+    while (filled < SAMPLES_PER_TICK && queue.length) {
+      const head = queue[0];
+      const need = SAMPLES_PER_TICK - filled;
+      if (head.length <= need) {
+        out.set(head, filled);
+        filled += head.length;
+        queue.shift();
+      } else {
+        out.set(head.subarray(0, need), filled);
+        // subarray, а не slice: slice на Int16Array поверх чужого буфера ведёт
+        // себя непредсказуемо, про это есть прямое предупреждение в примерах
+        // rtc-node.
+        queue[0] = head.subarray(need);
+        filled += need;
+      }
+    }
+    // Длина всегда SAMPLES_PER_TICK: недобранный хвост остаётся тишиной. Тик
+    // обязан быть ровным, иначе поток в Realtime поедет по времени.
+    return out;
+  }
+}
+```
+
+- [ ] **Step 4: Запустить тест и убедиться, что он проходит**
+
+Run: `cd voice-host && npx tsx --test src/mixer.test.ts`
+Expected: PASS, 10 тестов
+
+- [ ] **Step 5: Сломать проверку нарочно**
+
+Убрать ограничение суммы (`out[i] = sum`), прогнать — два теста на переполнение обязаны покраснеть. Вернуть.
+
+- [ ] **Step 6: Обернуть микшер в `AudioInput`**
+
+```typescript
+// voice-host/src/mixed-audio-input.ts
+import { voice } from '@livekit/agents';
+import { AudioFrame, AudioStream, RoomEvent, TrackKind, type RemoteTrack, type Room } from '@livekit/rtc-node';
+import { ReadableStream } from 'node:stream/web';
+import { Mixer, SAMPLE_RATE, SAMPLES_PER_TICK, TICK_MS } from './mixer.js';
+
+/**
+ * Вход сессии, собранный из ВСЕХ участников комнаты.
+ *
+ * Подставляется вместо штатного через `session.input.audio` — тот слышит
+ * только одного участника и, что хуже, закрывает сессию, когда именно он
+ * отключился (RoomInputOptions.closeOnDisconnect).
+ */
+export class MixedRoomAudioInput extends voice.AudioInput {
+  private mixer = new Mixer();
+  private ticker?: NodeJS.Timeout;
+  private closed = false;
+
+  constructor(private readonly room: Room) {
+    super();
+
+    const controller = { push: (_f: AudioFrame) => {} };
+    const source = new ReadableStream<AudioFrame>({
+      start: (c) => { controller.push = (f) => c.enqueue(f); },
+    });
+    this.multiStream.addInputStream(source);
+
+    for (const p of this.room.remoteParticipants.values()) {
+      for (const pub of p.trackPublications.values()) {
+        if (pub.track) this.attach(pub.track, p.identity);
+      }
+    }
+
+    this.room.on(RoomEvent.TrackSubscribed, (track: RemoteTrack, _pub, p) => {
+      this.attach(track, p.identity);
+    });
+    this.room.on(RoomEvent.ParticipantDisconnected, (p) => this.mixer.remove(p.identity));
+
+    this.ticker = setInterval(() => {
+      if (this.closed) return;
+      controller.push(new AudioFrame(this.mixer.tick(), SAMPLE_RATE, 1, SAMPLES_PER_TICK));
+    }, TICK_MS);
+    // unref обязателен: без него таймер держит event loop, процесс задания не
+    // может завершиться, и фреймворк через минуту убивает его как «job is
+    // unresponsive» — вместе с недоотправленным complete. Так дважды терялся
+    // транскрипт (25 и 26.08.2026).
+    this.ticker.unref?.();
+  }
+
+  private attach(track: RemoteTrack, identity: string): void {
+    if (track.kind !== TrackKind.KIND_AUDIO) return;
+    void (async () => {
+      const reader = new AudioStream(track, SAMPLE_RATE, 1).getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done || this.closed) break;
+          if (value) this.mixer.push(identity, value.data);
+        }
+      } catch (e) {
+        console.error(`поток участника ${identity} оборвался`, e);
+      } finally {
+        reader.releaseLock();
+        this.mixer.remove(identity);
+      }
+    })();
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+    if (this.ticker) clearInterval(this.ticker);
+    await super.close();
+  }
+}
+```
+
+⚠️ Точная форма `voice.AudioInput` и того, как подкладывать кадры в `multiStream`, проверяется первым же `tsc --noEmit`: класс абстрактный, а `multiStream` — `protected`. Если конструктор `ReadableStream` в этой связке не подойдёт, взять `TransformStream` и писать во `writable`.
+
+- [ ] **Step 7: Собрать**
+
+Run: `ssh dv@85.192.61.231 'cd ~/ci/spirits_back/voice-host && source ~/.nvm/nvm.sh && npx tsc --noEmit && npm test'`
+Expected: типы проходят, тесты зелёные
+
+- [ ] **Step 8: Коммит**
+
+```bash
+git add voice-host/src/mixer.ts voice-host/src/mixer.test.ts voice-host/src/mixed-audio-input.ts voice-host/package.json
+git commit -m "feat(meeting): сведение речи участников в один вход сессии"
+```
+
+---
+
 ## Task 9: Воркер — режим встречи
 
 **Files:**
@@ -1402,6 +1711,7 @@ llm: new openai.realtime.RealtimeModel({
 
 ```typescript
 import { NameGate } from './name-gate.js';
+import { MixedRoomAudioInput } from './mixed-audio-input.js';
 import { Occupancy } from './occupancy.js';
 import { callInstructions, callIntro, meetingInstructions, meetingIntro, listenAck, resumeAck } from './prompts.js';
 
@@ -1542,7 +1852,20 @@ await session.start({
     tools,
   }),
   room: ctx.room,
+  // На встрече штатный вход RoomIO гасим: он слышит только первого вошедшего
+  // и закрывает сессию, когда именно тот отключился. Своим входом (ниже)
+  // слышим всех. Вывод RoomIO остаётся — голос ассистента публикует он.
+  ...(isMeeting
+    ? { inputOptions: { audioEnabled: false, closeOnDisconnect: false } }
+    : {}),
 });
+
+if (isMeeting) {
+  // Подменяем вход ПОСЛЕ start(): до него сессия ещё не собрала свой
+  // AgentInput, и присвоение потерялось бы молча — ассистент сидел бы на
+  // встрече глухим.
+  session.input.audio = new MixedRoomAudioInput(ctx.room);
+}
 
 session.generateReply({
   instructions: isMeeting ? meetingIntro(agentName, meta.ownerName || 'пользователя') : callIntro(),
@@ -2554,7 +2877,85 @@ Expected: процесс `online` с ненулевым аптаймом (нул
 
 ## Результаты спайка
 
-*Заполняется в Task 1, Step 5.*
+Часть Task 1 выполнена 27.08.2026 **статически** — по объявлениям типов
+`@livekit/agents@1.7.0` и `@livekit/agents-plugin-openai@1.7.0`. Оба риска сняты, живая
+сессия для этого не понадобилась. Что осталось на живой прогон — в конце раздела.
+
+### Риск 2 — снят. `create_response` есть
+
+`api_proto.d.ts:44-56` объявляет `TurnDetectionType` для обоих режимов VAD:
+
+```typescript
+export type TurnDetectionType =
+  | { type: 'semantic_vad'; eagerness?: …; create_response?: boolean; interrupt_response?: boolean }
+  | { type: 'server_vad'; threshold?: number; prefix_padding_ms?: number;
+      silence_duration_ms?: number; create_response?: boolean; interrupt_response?: boolean };
+```
+
+Плагин принимает `turnDetection` этого типа и передаёт в сессию. **Гейт по имени
+жизнеспособен, запасной путь (генерировать всегда и глушить) не нужен.**
+
+Заодно нашлось `interrupt_response` — им же выключается перебивание ассистента чужой
+речью. На встрече это, скорее всего, нужно: перебить его должен тот, кто к нему
+обратился, а не любой звук в переговорной. В план не заложено, проверить на живой встрече.
+
+### Риск 1 — подтвердился. `AgentSession` слышит ровно одного
+
+`RoomInputOptions.participantIdentity` (`room_io.d.ts`):
+
+> The participant to link to. **If not provided, link to the first participant.**
+
+И вход устроен строго под одного: `ParticipantAudioInputStream` держит одну
+`participantIdentity`, одну `publication` и метод `setParticipant()`. То есть в комнате на
+пятерых ассистент слышал бы **только того, кто вошёл первым**.
+
+Там же нашлось второе, не менее опасное: `closeOnDisconnect` — «Close the AgentSession if
+the linked participant disconnects». Первый вошедший выходит покурить — сессия
+закрывается, хотя встреча идёт. **Обязательно `false`.**
+
+### Решение оказалось чище, чем ожидалось
+
+`AgentInput` (`io.d.ts:167-178`) имеет **сеттер**:
+
+```typescript
+get audio(): AudioInput | null;
+set audio(stream: AudioInput | null);
+```
+
+Значит вход можно подменить своим: подписаться на всех участников, свести в один поток и
+отдать сессии. Ни фиктивного участника, ни второй комнаты, ни моста — того самого, ради
+которого затевалась отменённая редакция.
+
+### Почему именно сведение, а не встроенный fan-in
+
+`AudioInput.multiStream` — это `MultiInputStream<AudioFrame>`, и он умеет
+`addInputStream()` для каждого участника. Соблазнительно: свести не нужно вовсе, фреймворк
+сам всё смерджит.
+
+**Так делать нельзя.** `MultiInputStream` — «fan-in multiplexer that merges multiple
+inputs into a single output», то есть он **перемежает кадры, а не складывает сэмплы**.
+Пока говорит один — сойдёт. Но дорожки LiveKit публикуются непрерывно, и при пятерых
+участниках в поток пошло бы пять кадров на каждые 20 мс реального времени: Realtime
+получал бы аудио впятеро быстрее реального и не понял бы ничего — не только во время
+наложения речи, а всё время.
+
+Оговорка: если у дорожек включён DTX, молчащие участники не шлют ничего, и эффект слабее.
+Полагаться на это нельзя — DTX зависит от настроек публикации, а сведение корректно в
+обоих случаях. **Микшер из отменённой редакции возвращается** (Task 8а), но теперь как
+источник для `session.input.audio`, а не как отдельный процесс.
+
+### Что осталось проверить живьём
+
+Статика не отвечает на три вопроса, и они требуют комнаты с двумя говорящими людьми:
+
+1. Нет ли у `session.input.audio` состязания с `RoomIO`: порядок присвоения и нужно ли
+   гасить его вход через `inputOptions: { audioEnabled: false }`.
+2. Принимает ли OpenAI `create_response: false` **у mini** — типы плагина общие для всех
+   моделей, а поддержка может отличаться.
+3. Голос `cedar` на mini: есть ли он и звучит ли мужским.
+
+Это Task 1 Steps 2–4 в исходном виде. Сделать на первой же живой комнате — то есть после
+Task 12.
 
 ---
 
