@@ -1,5 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { AccessToken, AgentDispatchClient, DataPacket_Kind, RoomServiceClient } from 'livekit-server-sdk';
+// ParticipantInfo_Kind живёт в @livekit/protocol, а не в livekit-server-sdk —
+// последний его не реэкспортирует.
+import { ParticipantInfo_Kind } from '@livekit/protocol';
 import { VOICE_DATA_TOPIC, VoiceDataMessage } from './voice-call.types';
 
 @Injectable()
@@ -49,6 +52,32 @@ export class LiveKitClient {
     } catch (e: any) {
       // Комнаты уже нет — это нормальный исход, а не ошибка.
       this.logger.warn(`deleteRoom ${roomName}: ${e?.message}`);
+    }
+  }
+
+  /**
+   * Выгнать из комнаты только участников-агентов, комнату оставить.
+   *
+   * Для встречи closeRoom не годится: в комнате живые люди, и удаление комнаты
+   * выкинет их всех из-за того, что завершилась наша половина. LiveKit метит
+   * агентов отдельным kind — гадать по идентификатору не нужно.
+   *
+   * Best-effort: не выгнали — встреча продолжается, а воркера через два часа
+   * добьёт собственный потолок сессии.
+   */
+  async removeAgents(roomName: string): Promise<void> {
+    const client = new RoomServiceClient(this.httpUrl, this.apiKey, this.apiSecret);
+    try {
+      const participants = await client.listParticipants(roomName);
+      for (const p of participants) {
+        if (p.kind !== ParticipantInfo_Kind.AGENT) continue;
+        await client.removeParticipant(roomName, p.identity).catch((e: any) => {
+          this.logger.warn(`removeParticipant ${p.identity}: ${e?.message}`);
+        });
+      }
+    } catch (e: any) {
+      // Комнаты уже нет — нормальный исход, а не ошибка.
+      this.logger.warn(`removeAgents ${roomName}: ${e?.message}`);
     }
   }
 

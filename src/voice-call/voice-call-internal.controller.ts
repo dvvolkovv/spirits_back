@@ -4,6 +4,7 @@ import { SpecialistJobService } from './specialist-job.service';
 import { VoiceCallService } from './voice-call.service';
 import { VoiceDocumentService } from './voice-document.service';
 import { verifyBody } from './hmac';
+import { MeetingService } from '../meeting/meeting.service';
 import { AskResult, CompletePayload, DocumentResult } from './voice-call.types';
 
 /**
@@ -21,6 +22,7 @@ export class VoiceCallInternalController {
     private readonly jobs: SpecialistJobService,
     private readonly calls: VoiceCallService,
     private readonly docs: VoiceDocumentService,
+    private readonly meetings: MeetingService,
   ) {}
 
   /**
@@ -85,6 +87,20 @@ export class VoiceCallInternalController {
   ) {
     const body = this.parseSigned<{ callId: string } & CompletePayload>(req, signature);
     await this.calls.complete(body.callId, { transcript: body.transcript, usage: body.usage });
+    return { ok: true };
+  }
+
+  /**
+   * Во встрече появился первый живой участник — воркер сообщает об этом,
+   * чтобы вход перестал считаться «ждём людей» и начал считаться идущим.
+   */
+  @Post('meeting-first-human')
+  async meetingFirstHuman(
+    @Headers('x-voice-signature') signature: string,
+    @Req() req: Request,
+  ) {
+    const body = this.parseSigned<{ callId: string }>(req, signature);
+    await this.meetings.noteFirstHuman(body.callId);
     return { ok: true };
   }
 

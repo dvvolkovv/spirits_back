@@ -1,23 +1,30 @@
-import { Module } from '@nestjs/common';
+import { forwardRef, Module } from '@nestjs/common';
 import { CommonModule } from '../common/common.module';
-import { LiveKitClient } from '../voice-call/livekit.client';
+import { VoiceCallModule } from '../voice-call/voice-call.module';
+import { MeetingController } from './meeting.controller';
+import { MeetingService } from './meeting.service';
 import { RoomController } from './room.controller';
 import { RoomRateLimit } from './room-rate-limit';
 import { RoomService } from './room.service';
 
 /**
- * Голосовые комнаты Linkeon.
+ * Голосовые комнаты Linkeon и присутствие в них ассистента.
  *
- * LiveKitClient объявлен здесь, а не взят из VoiceCallModule намеренно. Он без
- * состояния и без зависимостей (читает env), зато импорт VoiceCallModule
- * притащил бы за собой ChatModule — а ChatModule в свою очередь будет
- * импортировать этот модуль, когда научится разворачивать ссылку на комнату
- * в карточку. Получился бы цикл на ровном месте.
+ * Связь с VoiceCallModule обоюдная, и это не небрежность: нам нужен
+ * VoiceCallService (preamble, завершение, загрузка записи), а ему — наш
+ * MeetingService, потому что ручку «во встречу пришёл первый человек» зовёт
+ * воркер, и она обязана лежать под тем же подписанным префиксом
+ * /webhook/voice-call/internal, что и остальные его вызовы. Отсюда forwardRef
+ * с обеих сторон.
+ *
+ * LiveKitClient берётся из VoiceCallModule, а не объявляется здесь: два
+ * экземпляра работали бы одинаково (он без состояния), но расходились бы при
+ * первой же правке.
  */
 @Module({
-  imports: [CommonModule],
-  controllers: [RoomController],
-  providers: [RoomService, RoomRateLimit, LiveKitClient],
-  exports: [RoomService],
+  imports: [CommonModule, forwardRef(() => VoiceCallModule)],
+  controllers: [RoomController, MeetingController],
+  providers: [RoomService, RoomRateLimit, MeetingService],
+  exports: [RoomService, MeetingService],
 })
 export class MeetingModule {}

@@ -45,7 +45,17 @@ export type AskResult =
   | { status: 'rejected'; reason: 'unknown_specialist' };
 
 export interface CompletePayload {
-  transcript: { role: 'user' | 'assistant'; text: string; ts: number }[];
+  transcript: {
+    role: 'user' | 'assistant';
+    text: string;
+    ts: number;
+    /**
+     * Кто это сказал. Только на встрече и только у человеческих реплик:
+     * источник — активный говорящий по версии LiveKit. Разметка
+     * приблизительная, при перебивании и хоровой речи имя будет неверным.
+     */
+    speaker?: string;
+  }[];
   usage: { audioInputTokens: number; audioOutputTokens: number; model: string };
 }
 

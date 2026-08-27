@@ -56,7 +56,7 @@ export class VoiceCallService {
    *
    * Берём с конца, пока укладываемся в бюджет: свежие реплики важнее старых.
    */
-  async buildPreamble(userId: string): Promise<string> {
+  async buildPreamble(userId: string, agentId: number = HOST_AGENT_ID): Promise<string> {
     // Профиль собеседника — то же, что получают текстовые ассистенты.
     //
     // До 27.08.2026 Роман его не видел ВОВСЕ: в инструкцию шла только
@@ -71,14 +71,16 @@ export class VoiceCallService {
     const res = await this.pg.query(
       `SELECT sender_type, content FROM custom_chat_history
        WHERE session_id = $1 ORDER BY created_at DESC LIMIT $2`,
-      [`${userId}_${HOST_AGENT_ID}`, PREAMBLE_MSG_LIMIT],
+      [`${userId}_${agentId}`, PREAMBLE_MSG_LIMIT],
     );
     if (!res.rows.length) return profile;
 
     const lines: string[] = [];
     let budget = PREAMBLE_CHAR_LIMIT;
     for (const r of res.rows) {
-      const who = r.sender_type === 'human' ? 'Пользователь' : 'Роман';
+      // «Ассистент», а не «Роман»: preamble уходит модели, которая сама и
+      // есть этот ассистент, и чужое имя в её собственных репликах сбивает.
+      const who = r.sender_type === 'human' ? 'Пользователь' : 'Ассистент';
       const text = String(r.content || '').replace(/\s+/g, ' ').trim();
       if (!text) continue;
       const line = `${who}: ${text.length > 400 ? text.slice(0, 400) + '…' : text}`;
@@ -311,6 +313,27 @@ export class VoiceCallService {
     if (roomName) await this.livekit.closeRoom(roomName);
   }
 
+  /**
+   * Ассистент выходит из встречи, комната остаётся жить.
+   *
+   * Отличается от markInterrupted принципиально: там комната создана ради
+   * звонка и закрывается вместе с ним, здесь она принадлежит людям — закрытие
+   * выкинуло бы из неё всех участников из-за того, что ушла наша половина.
+   *
+   * Но одной пометки в базе мало: воркер о ней не узнает и останется в комнате
+   * жечь Realtime-сессию. Поэтому участника-агента убираем явно — он получит
+   * disconnect и отправит complete, как при обычном завершении.
+   */
+  async markInterruptedKeepingRoom(callId: string): Promise<void> {
+    const res = await this.pg.query(
+      `UPDATE voice_calls SET status = 'interrupted', ended_at = now()
+       WHERE id = $1 AND status IN ('dialing','active') RETURNING room_name`,
+      [callId],
+    );
+    const roomName = res.rows[0]?.room_name;
+    if (roomName) await this.livekit.removeAgents(roomName);
+  }
+
   /** Живой ли звонок — job'ы по завершённому создавать незачем. */
   isActive(call: { status: string }): boolean {
     return call.status === 'dialing' || call.status === 'active';
@@ -324,7 +347,12 @@ export class VoiceCallService {
 
   private async summarize(userId: string, transcript: CompletePayload['transcript']): Promise<string> {
     if (!transcript?.length) return 'Разговор без реплик.';
-    const flat = transcript.map((t) => `${t.role === 'user' ? 'Пользователь' : 'Роман'}: ${t.text}`).join('\n');
+    // На встрече у человеческих реплик есть имя говорящего — без него резюме
+    // не сможет закрепить договорённость ни за кем, и вся разметка пропадает
+    // на последнем шаге. У звонка имени нет, там остаётся «Пользователь».
+    const flat = transcript
+      .map((t) => `${t.role === 'user' ? t.speaker || 'Пользователь' : 'Ассистент'}: ${t.text}`)
+      .join('\n');
     const prompt =
       `Ниже расшифровка голосового разговора. Напиши краткое резюме: о чём говорили, ` +
       `какие решения приняты, что осталось сделать. До 800 символов, без вступлений.\n\n${flat}`;

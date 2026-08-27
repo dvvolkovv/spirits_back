@@ -1,0 +1,148 @@
+import { ConflictException, NotFoundException } from '@nestjs/common';
+import { MeetingService } from './meeting.service';
+
+describe('MeetingService', () => {
+  let pg: { query: jest.Mock };
+  let calls: {
+    buildPreamble: jest.Mock;
+    load: jest.Mock;
+    fail: jest.Mock;
+    markInterruptedKeepingRoom: jest.Mock;
+  };
+  let livekit: { dispatchAgent: jest.Mock; removeAgents: jest.Mock };
+  let rooms: { info: jest.Mock };
+  let svc: MeetingService;
+
+  const agentRow = {
+    id: 7,
+    display_name: 'Андрей',
+    system_prompt: 'Помогаю с запуском.',
+    realtime_voice: 'ash',
+  };
+
+  /** База отвечает: ассистент есть, активных входов нет. */
+  function withAgent() {
+    pg.query.mockImplementation(async (sql: string) =>
+      sql.includes('FROM agents') ? { rows: [agentRow] } : { rows: [], rowCount: 0 },
+    );
+  }
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    pg = { query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }) };
+    calls = {
+      buildPreamble: jest.fn().mockResolvedValue('Пользователь: привет'),
+      load: jest.fn(),
+      fail: jest.fn(),
+      markInterruptedKeepingRoom: jest.fn(),
+    };
+    livekit = { dispatchAgent: jest.fn(), removeAgents: jest.fn() };
+    rooms = { info: jest.fn().mockResolvedValue({ code: 'ABC234', title: 'Планёрка', active: true }) };
+    svc = new MeetingService(pg as any, calls as any, livekit as any, rooms as any);
+  });
+
+  describe('join', () => {
+    it('заводит запись и зовёт воркера в комнату ВСТРЕЧИ, а не в новую', async () => {
+      withAgent();
+      const res = await svc.join('u1', 7, 'ABC234', 'Дмитрий');
+      expect(res.callId).toEqual(expect.any(String));
+      expect(livekit.dispatchAgent).toHaveBeenCalledWith('room_ABC234', expect.any(Object));
+    });
+
+    it('передаёт режим встречи и данные ассистента', async () => {
+      withAgent();
+      await svc.join('u1', 7, 'ABC234', 'Дмитрий');
+      expect(livekit.dispatchAgent).toHaveBeenCalledWith(
+        'room_ABC234',
+        expect.objectContaining({
+          mode: 'meeting',
+          agentName: 'Андрей',
+          agentVoice: 'ash',
+          ownerName: 'Дмитрий',
+        }),
+      );
+    });
+
+    it('берёт preamble из чата с ЭТИМ ассистентом, а не с Романом', async () => {
+      withAgent();
+      await svc.join('u1', 7, 'ABC234', 'Дмитрий');
+      expect(calls.buildPreamble).toHaveBeenCalledWith('u1', 7);
+    });
+
+    it('не предлагает ведущему спрашивать самого себя', async () => {
+      withAgent();
+      await svc.join('u1', 7, 'ABC234', 'Дмитрий');
+      const meta = livekit.dispatchAgent.mock.calls[0][1] as any;
+      expect(meta.specialists.map((s: any) => s.name)).not.toContain('Андрей');
+      expect(meta.specialists.length).toBeGreaterThan(0);
+    });
+
+    it('не пускает второй вход при живом первом', async () => {
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('FROM agents')) return { rows: [agentRow] };
+        if (sql.includes('SELECT id FROM voice_calls')) return { rows: [{ id: 'existing' }] };
+        return { rows: [], rowCount: 0 };
+      });
+      await expect(svc.join('u1', 7, 'ABC234', 'Дмитрий')).rejects.toThrow(ConflictException);
+      expect(livekit.dispatchAgent).not.toHaveBeenCalled();
+    });
+
+    it('не входит в несуществующую комнату', async () => {
+      withAgent();
+      rooms.info.mockResolvedValue(null);
+      await expect(svc.join('u1', 7, 'ZZZZZZ', 'Дмитрий')).rejects.toThrow(NotFoundException);
+      expect(livekit.dispatchAgent).not.toHaveBeenCalled();
+    });
+
+    it('не входит в закрытую комнату', async () => {
+      withAgent();
+      rooms.info.mockResolvedValue({ code: 'ABC234', title: 'x', active: false });
+      await expect(svc.join('u1', 7, 'ABC234', 'Дмитрий')).rejects.toThrow(NotFoundException);
+    });
+
+    it('неизвестный ассистент — отказ', async () => {
+      pg.query.mockResolvedValue({ rows: [], rowCount: 0 });
+      await expect(svc.join('u1', 999, 'ABC234', 'Дмитрий')).rejects.toThrow(NotFoundException);
+    });
+
+    it('если dispatch не удался — запись не остаётся висеть активной', async () => {
+      // Строка в 'dialing' намертво блокирует следующую попытку: лимит
+      // «один активный вход» смотрит именно на неё.
+      withAgent();
+      livekit.dispatchAgent.mockRejectedValue(new Error('livekit down'));
+      await expect(svc.join('u1', 7, 'ABC234', 'Дмитрий')).rejects.toThrow('livekit down');
+      const failed = pg.query.mock.calls.find(([sql]: [string]) => sql.includes("status = 'failed'"));
+      expect(failed).toBeDefined();
+    });
+
+    it('пишет провайдера и код комнаты — по ним потом ищет реапер', async () => {
+      withAgent();
+      await svc.join('u1', 7, 'ABC234', 'Дмитрий');
+      const insert = pg.query.mock.calls.find(([s]: [string]) => s.includes('INSERT INTO voice_calls'));
+      expect(insert![1]).toContain('linkeon_room');
+      expect(insert![1]).toContain('ABC234');
+    });
+  });
+
+  describe('leave', () => {
+    it('выход ассистента НЕ закрывает комнату — люди продолжают встречу', async () => {
+      await svc.leave('c1');
+      expect(calls.markInterruptedKeepingRoom).toHaveBeenCalledWith('c1');
+    });
+  });
+
+  describe('noteFirstHuman', () => {
+    it('переводит вход в активный и запоминает момент', async () => {
+      await svc.noteFirstHuman('c1');
+      const upd = pg.query.mock.calls.find(([s]: [string]) => s.includes('first_human_at'));
+      expect(upd).toBeDefined();
+      expect(upd![0]).toContain("status = 'active'");
+    });
+
+    it('повторный вызов не перезаписывает момент — участники входят и выходят', async () => {
+      await svc.noteFirstHuman('c1');
+      const upd = pg.query.mock.calls.find(([s]: [string]) => s.includes('first_human_at'));
+      expect(upd![0]).toContain('COALESCE');
+    });
+  });
+});
