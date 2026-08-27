@@ -81,6 +81,15 @@ export class SpecialistJobService {
     await this.pg.query(`UPDATE voice_call_jobs SET status = 'running' WHERE id = $1`, [jobId]);
     await this.safeSend(roomName, { v: 1, type: 'specialist_pending', jobId, specialist });
 
+    // Вопрос в чат специалиста — СРАЗУ, а не вместе с ответом.
+    //
+    // Раньше обе строки писались после того, как ответ пришёл, и оба
+    // сообщения появлялись одной секундой. Пока специалист думал (а это до
+    // четырёх минут), в его чате не было ничего: со стороны выглядело так,
+    // будто запрос не дошёл. Владелец 27.08.2026: «чтобы видно было, что он
+    // работает и виден запрос от Романа».
+    await this.recordQuestion(userId, agentId, question);
+
     try {
       // Изолированная эфемерная сессия обязательна: при коллизии с реальной
       // сессией пользователя релей отдаёт пустой поток — инцидент 2026-07-12,
@@ -107,7 +116,7 @@ export class SpecialistJobService {
       );
 
       await this.charge(userId, agentId, specialist, tokens);
-      await this.recordInSpecialistChat(userId, agentId, question, answer, tokens);
+      await this.recordAnswer(userId, agentId, answer, tokens);
 
       // А в голос уходит короткая выжимка.
       //
@@ -130,6 +139,7 @@ export class SpecialistJobService {
         `UPDATE voice_call_jobs SET status = 'failed', finished_at = now(), latency_ms = $1 WHERE id = $2`,
         [Date.now() - started, jobId],
       );
+      await this.recordFailure(userId, agentId, reason);
       await this.safeSend(roomName, { v: 1, type: 'specialist_failed', jobId, specialist, reason });
     }
   }
@@ -179,34 +189,56 @@ export class SpecialistJobService {
    *
    * Сбой записи job не роняет: ответ уже прозвучал, разговор идёт дальше.
    */
-  private async recordInSpecialistChat(
-    userId: string, agentId: number, question: string, answer: string, tokens: number,
-  ): Promise<void> {
+  /**
+   * Вопрос Романа в чат специалиста, отдельной строкой и сразу.
+   *
+   * Раздельные записи вопроса и ответа нужны не только ради видимости:
+   * история сортируется по created_at, а внутри одного оператора он у обеих
+   * строк одинаковый (это время транзакции) — вопрос и ответ могли бы
+   * перевернуться местами. Так же устроен и основной путь чата.
+   */
+  private async recordQuestion(userId: string, agentId: number, question: string): Promise<void> {
     try {
       const lang = await this.language.resolveUserLanguage(userId);
       const note = VOICE_ASK_NOTE[lang] || VOICE_ASK_NOTE[DEFAULT_LANGUAGE];
-      const sessionId = `${userId}_${agentId}`;
-      // Двумя отдельными запросами, а не одним INSERT на две строки: история
-      // сортируется по created_at, а внутри одного оператора он у обеих строк
-      // одинаковый (это время транзакции) — вопрос и ответ могли бы
-      // перевернуться местами. Так же устроен и основной путь чата.
       await this.pg.query(
         `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
          VALUES ($1, 'human', $2, $3, 'text')`,
-        [sessionId, agentId, `${note}\n\n${question}`],
+        [`${userId}_${agentId}`, agentId, `${note}\n\n${question}`],
       );
-      // Расход, а не ноль. Лента показывает эту цифру под ответом ассистента
-      // (ChatInterface), и с нулём получалось враньё в трёх местах сразу:
-      // в окне звонка «Виталий — 3 200 токенов», с баланса списано столько же,
-      // а в чате с Виталием под тем же ответом пусто.
+    } catch (e: any) {
+      this.logger.warn(`вопрос не записан в чат agent=${agentId}: ${e?.message}`);
+    }
+  }
+
+  /** Ответ ложится отдельной строкой — вопрос уже в чате с начала работы. */
+  private async recordAnswer(userId: string, agentId: number, answer: string, tokens: number): Promise<void> {
+    try {
       await this.pg.query(
         `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
          VALUES ($1, 'ai', $2, $3, 'text', $4)`,
-        [sessionId, agentId, answer, tokens],
+        [`${userId}_${agentId}`, agentId, answer, tokens],
       );
     } catch (e: any) {
-      this.logger.warn(`консультация не записана в чат agent=${agentId}: ${e?.message}`);
+      this.logger.warn(`ответ не записан в чат agent=${agentId}: ${e?.message}`);
     }
+  }
+
+  /**
+   * Отметка о неудаче. Без неё вопрос висел бы в чате без ответа навсегда, и
+   * было бы не отличить «не ответил» от «ещё думает».
+   */
+  private async recordFailure(userId: string, agentId: number, reason: string): Promise<void> {
+    const text = reason === 'timeout'
+      ? 'Ответ не пришёл вовремя — вопрос задавался голосом во время звонка.'
+      : 'Ответить не удалось — вопрос задавался голосом во время звонка.';
+    try {
+      await this.pg.query(
+        `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
+         VALUES ($1, 'ai', $2, $3, 'text', 0)`,
+        [`${userId}_${agentId}`, agentId, text],
+      );
+    } catch { /* и это не повод ронять job */ }
   }
 
   /**

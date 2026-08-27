@@ -39,6 +39,13 @@ export const DOCS_BUCKET = 'linkeon-assets';
 /** Дольше документ не сочиняем. Он длиннее ответа специалиста, отсюда запас. */
 export const DOC_TIMEOUT_MS = 300_000;
 
+/**
+ * К какому объёму просим стремиться. Без потолка документы выходили на
+ * шестнадцать тысяч знаков, и второй такой не уложился в таймаут — 27.08.2026
+ * он просто не дошёл до пользователя. Столько никто и не читает.
+ */
+export const DOC_TARGET_CHARS = 6000;
+
 /** Ответ на /internal/ask. rejected — не ошибка: модель должна это озвучить. */
 export type AskResult =
   | { status: 'asked'; jobId: string; specialist: string }

@@ -3,10 +3,12 @@ import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { ChatService } from '../chat/chat.service';
+import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 import { LiveKitClient } from './livekit.client';
 import {
   CONSULT_CHARS_IN_DOC, DOC_GIST_CHARS, DOC_LEAD_CHARS, DOC_TIMEOUT_MS, DOCS_BUCKET,
-  DocumentResult, findSpecialist, HOST_AGENT_ID, MAX_CONSULT_IN_DOC, specialistName,
+  DOC_TARGET_CHARS, DocumentResult, findSpecialist, HOST_AGENT_ID, MAX_CONSULT_IN_DOC, specialistName,
+  VOICE_ASK_NOTE,
 } from './voice-call.types';
 
 /**
@@ -31,7 +33,56 @@ export class VoiceDocumentService {
     private readonly chat: ChatService,
     private readonly livekit: LiveKitClient,
     private readonly storage: StorageService,
+    private readonly language: LanguageService,
   ) {}
+
+  /**
+   * Задание на документ в чат того, кто его пишет.
+   *
+   * Пишется от лица пользователя: заказ исходит от него, Роман лишь передал
+   * поручение голосом. Пометка про голос — та же, что у вопросов
+   * специалистам, и на языке пользователя.
+   */
+  private async recordRequest(
+    userId: string, agentId: number, title: string, instructions: string,
+  ): Promise<void> {
+    try {
+      const lang = await this.language.resolveUserLanguage(userId);
+      const note = VOICE_ASK_NOTE[lang] || VOICE_ASK_NOTE[DEFAULT_LANGUAGE];
+      const body = instructions?.trim()
+        ? `${note}\n\nПодготовить документ «${title}».\n\n${instructions.trim()}`
+        : `${note}\n\nПодготовить документ «${title}».`;
+      await this.pg.query(
+        `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
+         VALUES ($1, 'human', $2, $3, 'text')`,
+        [`${userId}_${agentId}`, agentId, body],
+      );
+    } catch (e: any) {
+      this.logger.warn(`задание на документ не записано в чат agent=${agentId}: ${e?.message}`);
+    }
+  }
+
+  /**
+   * Отметка о неудаче в чате автора.
+   *
+   * Без неё задание висело бы в чате без ответа, и было бы не отличить «не
+   * получилось» от «ещё пишется». 27.08.2026 документ Шанкары упал по
+   * таймауту, и владелец решил, что запрос вообще не дошёл.
+   */
+  private async recordFailure(
+    userId: string, agentId: number, title: string, reason: string,
+  ): Promise<void> {
+    const text = reason === 'timeout'
+      ? `Документ «${title}» подготовить не успел — задача оказалась слишком объёмной. Попроси ещё раз, можно короче.`
+      : `Документ «${title}» подготовить не удалось.`;
+    try {
+      await this.pg.query(
+        `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
+         VALUES ($1, 'ai', $2, $3, 'text', 0)`,
+        [`${userId}_${agentId}`, agentId, text],
+      );
+    } catch { /* и это не повод ронять задачу */ }
+  }
 
   /**
    * Положить документ файлом и вернуть ссылку.
@@ -158,6 +209,14 @@ export class VoiceDocumentService {
     const { agentId, author } = await this.resolveAuthor(callId, specialist);
     await this.safeSend(roomName, { v: 1, type: 'document_pending', docId, title, specialist: author });
 
+    // Задание — в чат автора СРАЗУ, до того как документ написан.
+    //
+    // Раньше в чате появлялся только готовый документ, а пока он сочинялся
+    // (до пяти минут), там не было ничего. Со стороны выглядело так, будто
+    // запрос не дошёл. Владелец 27.08.2026: «чтобы видно было, что он
+    // работает и виден запрос от Романа».
+    await this.recordRequest(userId, agentId, title, instructions);
+
     try {
       // Консультации специалистов из этого же звонка — ЦЕЛИКОМ.
       //
@@ -175,7 +234,12 @@ export class VoiceDocumentService {
         (consult ? `Разбор специалистов, прозвучавший в этом разговоре — опирайся на него:\n${consult}\n\n` : '') +
         `Выдай ТОЛЬКО текст документа в markdown, без вступлений вроде «вот ваш документ» ` +
         `и без вопросов в конце. Заголовок первой строкой не дублируй — он будет добавлен ` +
-        `сверху. Пиши так, чтобы текст можно было отправить адресату как есть.`;
+        `сверху. Пиши так, чтобы текст можно было отправить адресату как есть.\n\n` +
+        // Потолок объёма. Без него документы выходили на 16 тысяч знаков, и
+        // второй такой не уложился в пятиминутный лимит — 27.08.2026 он
+        // просто не дошёл до пользователя. Столько никто и не читает: нужен
+        // документ, а не собрание сочинений.
+        `Уложись примерно в ${DOC_TARGET_CHARS} знаков. Лучше плотно и по делу, чем длинно.`;
 
       // Изолированная сессия — как у вопросов специалистам: при коллизии с
       // живой сессией пользователя релей отдаёт пустой поток (инцидент 2026-07-12).
@@ -215,6 +279,7 @@ export class VoiceDocumentService {
     } catch (e: any) {
       const reason = e?.message === 'timeout' ? 'timeout' : 'error';
       this.logger.warn(`документ «${title}» не собран: ${e?.message}`);
+      await this.recordFailure(userId, agentId, title, reason);
       await this.safeSend(roomName, { v: 1, type: 'document_failed', docId, title, reason, specialist: author });
     }
   }
