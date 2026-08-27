@@ -69,6 +69,11 @@ export const ASSISTANT_DEFAULTS: Record<string, AssistantDefault> = {
   'Райя':       { gender: 'f', yandex: 'jane',    openai: 'shimmer' },
   'Павел':      { gender: 'm', yandex: 'zahar',   openai: 'echo' },
   'Полина':     { gender: 'f', yandex: 'omazh',   openai: 'shimmer' },
+  // Дмитрия забыли завести вместе с миграцией 003, и это не косметика:
+  // resolveVoice берёт gender из ЭТОЙ карты, а при промахе подставляет 'f'
+  // (voices.ts:135). Технический директор говорил женским голосом — alena
+  // на русском и nova на остальных языках.
+  'Дмитрий':    { gender: 'm', yandex: 'ermil',   openai: 'onyx' },
 };
 
 export const GENDER_DEFAULT: Record<Gender, { yandex: string; openai: string }> = {
