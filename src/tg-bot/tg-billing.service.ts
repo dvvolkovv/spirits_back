@@ -2,10 +2,20 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from './tg-grammy.client';
 import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
+import * as telegramAlert from '../common/telegram-alert';
 
 @Injectable()
 export class TgBillingService {
   private readonly logger = new Logger(TgBillingService.name);
+
+  /**
+   * Порог алерта на дорогой ход бота, в долларах реальной стоимости. Тот же
+   * смысл и тот же дефолт, что у EXPENSIVE_TURN_ALERT_USD в вебе: порог в
+   * долларах, а не в токенах, чтобы не поехал при смене курса.
+   */
+  private readonly EXPENSIVE_TURN_ALERT_USD = Number(
+    process.env.TG_ALERT_USD || process.env.SDK_ALERT_USD || 5,
+  );
 
   constructor(
     private readonly pg: PgService,
@@ -52,6 +62,34 @@ export class TgBillingService {
       [ownerUserId],
     );
     return Number(r.rows[0]?.tokens ?? 0);
+  }
+
+  /**
+   * Алерт нам (не владельцу) на аномально дорогой ход. Владелец про списание
+   * узнаёт из баланса, а вот мы про ход за 65k токенов раньше не узнавали
+   * вообще: в вебе такой порог есть, в телеге его не было.
+   *
+   * fire-and-forget по смыслу — ответ уже отправлен и токены уже списаны,
+   * поэтому упавший телеграм не должен превращаться в исключение выше по стеку.
+   */
+  async alertIfExpensiveTurn(
+    cfg: { id: string; display_name: string; owner_user_id: string },
+    costUsd: number,
+    tokensCharged: number,
+    balanceLeft: number,
+  ): Promise<void> {
+    if (!(costUsd >= this.EXPENSIVE_TURN_ALERT_USD)) return;
+    try {
+      await telegramAlert.sendTelegramAlert(
+        `💸 <b>Дорогой ход TG-бота</b>\n` +
+        `Бот: <b>${cfg.display_name}</b> (<code>${cfg.id}</code>)\n` +
+        `Владелец: <code>${cfg.owner_user_id}</code>\n` +
+        `Стоимость: <b>$${costUsd.toFixed(2)}</b> → списано ${tokensCharged.toLocaleString('ru')} токенов\n` +
+        `Остаток: ${balanceLeft.toLocaleString('ru')}`,
+      );
+    } catch (e: any) {
+      this.logger.warn(`expensive-turn alert failed: ${e.message}`);
+    }
   }
 
   /**

@@ -350,9 +350,21 @@ ${systemPrompt}`;
         ? `Read,${WEB_TOOLS}`
         : WEB_TOOLS;
 
+    // Та же модель, что и в вебе. Веб уводит всех ассистентов кроме Маши на
+    // relay r.linkeon.io, где claude крутится на рекомендованной моделью CLI
+    // (сейчас Opus 5). Здесь путь локальный, и Sonnet стоял просто потому, что
+    // TG-ветку с Phase 4 строили на своём CLI-вызове — из-за этого один и тот
+    // же ассистент в телеге отвечал заметно слабее, чем в вебе.
+    //
+    // 'default', а не 'claude-opus-5': default сам даунгрейдится при исчерпании
+    // лимита подписки, хардкод — падает, и бот молча замолкает.
+    //
+    // Цена: тяжёлые агентные ходы (сгенерировать договор, собрать финмодель)
+    // стоили 30-65k токенов владельца ещё на Sonnet. Опус их умножает, поэтому
+    // в tg-bot.service рядом со списанием стоит алерт на дорогой ход.
     const { text, costUsd } = await this.claudeCli.textWithCost(userPrompt, {
       system: systemWithCtx,
-      model: 'claude-sonnet-4-6',
+      model: 'default',
       timeoutMs: 0,
       attachments: attachmentPaths?.length ? attachmentPaths : undefined,
       onProgress,
