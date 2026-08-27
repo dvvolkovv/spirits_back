@@ -16,7 +16,15 @@ function sign(raw: string): string {
  * ради ухода от которого мы отказались от remote MCP. Две секунды хватает:
  * ручка только пишет строку и ставит job в очередь.
  */
-const TIMEOUT_MS: Record<string, number> = { ask: 2_000, document: 2_000, complete: 15_000, failed: 5_000 };
+const TIMEOUT_MS: Record<string, number> = {
+  ask: 2_000,
+  document: 2_000,
+  complete: 15_000,
+  failed: 5_000,
+  // Отметка «во встречу пришёл первый человек» — учётная. Ждать её долго
+  // незачем: разговор от неё не зависит.
+  'meeting-first-human': 5_000,
+};
 
 async function post<T>(path: string, body: unknown): Promise<T> {
   const raw = JSON.stringify(body);
@@ -35,7 +43,17 @@ export type AskResult =
   | { status: 'rejected'; reason: 'unknown_specialist' };
 
 /** Реплика из транскрипта звонка — то же, что бэкенд ждёт в /internal/complete. */
-export type TranscriptEntry = { role: 'user' | 'assistant'; text: string; ts: number };
+export type TranscriptEntry = {
+  role: 'user' | 'assistant';
+  text: string;
+  ts: number;
+  /**
+   * Кто это сказал — по активному говорящему LiveKit. Есть только на встрече
+   * и только у человеческих реплик. Разметка приблизительная: при перебивании
+   * и хоровой речи имя будет неверным.
+   */
+  speaker?: string;
+};
 
 /** Учёт аудио-токенов Realtime-сессии — то же, что CompletePayload['usage'] на бэке. */
 export type CallUsage = { audioInputTokens: number; audioOutputTokens: number; model: string };
@@ -53,4 +71,6 @@ export const backend = {
     post<{ ok: true }>('complete', { callId, transcript, usage }),
   failed: (callId: string, reason: string) =>
     post<{ ok: true }>('failed', { callId, reason }),
+  meetingFirstHuman: (callId: string) =>
+    post<{ ok: true }>('meeting-first-human', { callId }),
 };

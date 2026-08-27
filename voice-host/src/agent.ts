@@ -17,6 +17,17 @@ import { RoomEvent } from '@livekit/rtc-node';
 import { z } from 'zod';
 import { backend, type TranscriptEntry } from './backend.js';
 import { PendingAnswers } from './pending.js';
+import { NameGate } from './name-gate.js';
+import { Occupancy } from './occupancy.js';
+import { MixedRoomAudioInput } from './mixed-audio-input.js';
+import {
+  callInstructions,
+  callIntro,
+  listenAck,
+  meetingInstructions,
+  meetingIntro,
+  resumeAck,
+} from './prompts.js';
 
 const TOPIC = 'linkeon';
 
@@ -33,35 +44,8 @@ const TOPIC = 'linkeon';
  */
 const INTERNAL_PREFIX = '[Внутреннее сообщение';
 
-function instructions(preamble: string, specialists: { name: string; role: string }[]): string {
-  const roster = specialists.map((s) => `  • ${s.name} — ${s.role}`).join('\n');
-  return [
-    'ГОВОРИ ТОЛЬКО ПО-РУССКИ — правило важнее всех остальных. Оно действует',
-    'с самой первой фразы, включая приветствие, и не отменяется тем, что',
-    'собеседник молчит или сказал что-то на другом языке.',
-    '',
-    'Ты Роман — ведущий голосового разговора на платформе LINKEON.',
-    'Говори коротко, живой разговорной речью. Не зачитывай списки вслух.',
-    '',
-    'Ты можешь спросить коллег-специалистов. Выбирай строго по профилю:',
-    roster,
-    'Инструмент ask_specialist ставит вопрос в работу и возвращается мгновенно —',
-    'ответа в нём НЕТ. Получив подтверждение, скажи вслух, что отправил вопрос,',
-    'и продолжай разговор: ответ придёт отдельно, и ты его озвучишь.',
-    'Никогда не молчи в ожидании ответа.',
-    '',
-    'Просят сделать документ, письмо, план, список договорённостей — вызывай',
-    'create_document. Он тоже возвращается мгновенно: скажи вслух, что документ',
-    'готовится, и продолжай разговор. Не диктуй текст документа вслух.',
-    'Если документ по части кого-то из коллег — передай его имя в specialist:',
-    'он напишет сам, и документ ляжет в чат С НИМ. Не обещай «Виталий',
-    'подготовит», если не указал Виталия: документ окажется в другом чате.',
-    'Когда документ будет готов, тебе придёт сообщение — сообщи вслух и',
-    'перескажи суть.',
-    '',
-    preamble ? `Контекст прошлой переписки:\n${preamble}` : 'Прошлой переписки нет.',
-  ].join('\n');
-}
+/** Сколько после своей реплики ассистент отвечает без повторного зова. */
+const FOLLOWUP_WINDOW_MS = 30_000;
 
 export default defineAgent({
   entry: async (ctx: JobContext) => {
@@ -70,18 +54,45 @@ export default defineAgent({
       userId: string;
       preamble: string;
       specialists: { name: string; role: string }[];
+      // Ниже — только для режима встречи. У звонка их нет, и всё поведение
+      // остаётся ровно таким, каким было.
+      mode?: 'call' | 'meeting';
+      agentName?: string;
+      agentPersona?: string;
+      agentVoice?: string;
+      ownerName?: string;
     };
+    const isMeeting = meta.mode === 'meeting';
+    const agentName = meta.agentName || 'Роман';
+
+    /**
+     * Встреча идёт на mini, звонок остаётся на флагмане.
+     *
+     * Отдельная переменная, а не общая VOICE_MODEL: у звонка разговор один на
+     * один и качество ответа видно сразу, а встреча длится вдвое дольше и почти
+     * вся состоит из молчаливого прослушивания. Решение владельца 27.08.2026,
+     * mini в 3.2 раза дешевле по обеим ставкам.
+     */
+    const model = isMeeting
+      ? process.env.VOICE_MEETING_MODEL || 'gpt-realtime-2.1-mini'
+      : process.env.VOICE_MODEL || 'gpt-realtime-2.1';
 
     const pending = new PendingAnswers();
     const transcript: TranscriptEntry[] = [];
     let audioIn = 0;
     let audioOut = 0;
 
+    /** Кто из участников говорит сейчас. Только на встрече. */
+    let currentSpeaker: string | undefined;
+
+    const gate = isMeeting ? new NameGate(agentName, FOLLOWUP_WINDOW_MS) : null;
+    const occupancy = isMeeting ? new Occupancy(Date.now()) : null;
+
     await ctx.connect();
 
     const session = new voice.AgentSession({
       llm: new openai.realtime.RealtimeModel({
-        model: process.env.VOICE_MODEL || 'gpt-realtime-2.1',
+        model,
         // Голоса Realtime — канонический список отдаёт сам API, если послать
         // неверное значение: alloy, ash, ballad, coral, echo, sage, shimmer,
         // verse, marin, cedar.
@@ -95,13 +106,17 @@ export default defineAgent({
         // Так что голос определяется ушами, а не описанием. Сэмплер, которым
         // сравнивались кандидаты, — в истории сессии 26.08.2026: короткая
         // Realtime-сессия на каждый голос, одна фраза, WAV в MinIO.
-        voice: process.env.VOICE_NAME || 'cedar',
+        //
+        // На встрече голос свой у каждого ассистента — берём из agents.
+        // Проверить, что выбранный голос вообще есть у mini: набор голосов у
+        // моделей может отличаться, а сравнение шло на флагмане.
+        voice: meta.agentVoice || process.env.VOICE_NAME || 'cedar',
         // Шумоподавление на входе. По умолчанию НЕ включено, и без него в
         // детектор речи попадает всё подряд: кашель, щелчки клавиш, чужой
         // голос в комнате. near_field — микрофон рядом с говорящим (гарнитура,
-        // ноутбук, телефон), это наш случай; far_field — для конференц-микрофона
-        // посреди переговорной.
-        inputAudioNoiseReduction: { type: 'near_field' },
+        // ноутбук, телефон), это случай звонка; far_field — конференц-микрофон
+        // посреди переговорной, это случай встречи.
+        inputAudioNoiseReduction: { type: isMeeting ? 'far_field' : 'near_field' },
         // Порог и тишина подняты против дефолтных 0.5 и 500 мс: короткий
         // посторонний звук не должен считаться началом реплики, а пауза в
         // середине фразы — её концом.
@@ -110,6 +125,9 @@ export default defineAgent({
           threshold: 0.65,
           prefix_padding_ms: 300,
           silence_duration_ms: 900,
+          // На встрече модель не начинает ответ сама — решает гейт по имени.
+          // Разметка реплик при этом сохраняется, мы её и слушаем.
+          ...(isMeeting ? { create_response: false } : {}),
         },
       }),
       // Перебить Романа теперь стоит дороже.
@@ -257,8 +275,51 @@ export default defineAgent({
       // Наши синтетические generateReply()-вставки заводятся с role:'user' —
       // это не реплики пользователя, в транскрипт звонка их не пускаем.
       if (normalizedRole === 'user' && textContent.startsWith(INTERNAL_PREFIX)) return;
-      transcript.push({ role: normalizedRole, text: textContent, ts: Date.now() });
+      transcript.push({
+        role: normalizedRole,
+        text: textContent,
+        ts: Date.now(),
+        // Кто это сказал — только для человеческих реплик на встрече: у
+        // ассистента говорящий известен и так. Разметка приблизительная, её
+        // источник — активный говорящий по версии LiveKit.
+        ...(isMeeting && normalizedRole === 'user' && currentSpeaker
+          ? { speaker: currentSpeaker }
+          : {}),
+      });
+
+      if (!gate) return;
+      if (normalizedRole === 'assistant') {
+        gate.noteReplied(Date.now());
+        return;
+      }
+      // Реплика человека: спрашиваем гейт, дать ли модели ход. Синтетические
+      // вставки (ответы коллег, готовые документы) сюда не попадают — они
+      // отсеяны выше по INTERNAL_PREFIX и звучат всегда, их уже ждут.
+      switch (gate.decide(textContent, Date.now())) {
+        case 'respond':
+          session.generateReply();
+          break;
+        case 'ack_listen':
+          session.generateReply({ instructions: listenAck() });
+          break;
+        case 'ack_resume':
+          session.generateReply({ instructions: resumeAck() });
+          break;
+        case 'silent':
+          break;
+      }
     });
+
+    // Разметка говорящего. LiveKit определяет активного сам — считать
+    // громкость руками не нужно.
+    if (isMeeting) {
+      ctx.room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
+        // Берём первого: при перебивании активных несколько, а реплика в
+        // транскрипте одна. Разметка приблизительная, и здесь это видно прямо.
+        const top = speakers[0];
+        currentSpeaker = top ? top.name || top.identity : undefined;
+      });
+    }
 
     // OpenAI Realtime отчитывается по аудио-токенам через 'realtime_model_metrics'
     // — это один из вариантов объединения AgentMetrics, у остальных (llm/stt/tts/…)
@@ -276,7 +337,12 @@ export default defineAgent({
     // ОБЩУЮ длину звонка (продуктовое решение, не обход API-лимита): если что-то
     // пойдёт не так и звонок зависнет на час, лучше вежливо свернуть его, чем
     // жечь токены бесконечно.
-    const SESSION_LIMIT_MS = 60 * 60 * 1000;
+    //
+    // Встреча — два часа против часа у звонка: переговоры регулярно длиннее
+    // часа. Это второй предохранитель; первый живёт в Occupancy и срабатывает
+    // раньше. Держать их согласованными: если тот промолчит, последним рубежом
+    // остаётся этот.
+    const SESSION_LIMIT_MS = (isMeeting ? 2 : 1) * 60 * 60 * 1000;
     const warnAt = setTimeout(() => {
       pushLine(
         `${INTERNAL_PREFIX}: до конца звонка минута. Подведи короткий итог и попрощайся.]`,
@@ -323,13 +389,54 @@ export default defineAgent({
         await backend.complete(meta.callId, transcript, {
           audioInputTokens: audioIn,
           audioOutputTokens: audioOut,
-          model: process.env.VOICE_MODEL || 'gpt-realtime-2.1',
+          model,
         });
         console.log(`complete отправлен (${why}), реплик: ${transcript.length}`);
       } catch (e) {
         console.error(`complete не отправлен (${why})`, e);
       }
     };
+
+    /**
+     * Кто остался во встрече и пора ли выходить.
+     *
+     * У звонка этого нет: там собеседник один, и его уход закрывает сессию
+     * штатным closeOnDisconnect. На встрече мы этот механизм отключили — он
+     * обрывал бы разговор, когда выйдет первый вошедший, — поэтому решение
+     * принимаем сами.
+     */
+    if (occupancy) {
+      // Уже сидящие до нашего входа: participantConnected по ним не придёт, и
+      // без этого прохода начавшаяся раньше встреча считалась бы пустой, а
+      // ассистент вышел бы через LOBBY_MS.
+      for (const identity of ctx.room.remoteParticipants.keys()) occupancy.joined(identity);
+
+      ctx.room.on(RoomEvent.ParticipantConnected, (p) => {
+        occupancy.joined(p.identity);
+        void backend.meetingFirstHuman(meta.callId).catch(() => {
+          // Отметка «встреча началась» — учётная, ради неё встречу не рвём.
+        });
+      });
+      ctx.room.on(RoomEvent.ParticipantDisconnected, (p) => occupancy.left(p.identity));
+
+      const watch = setInterval(() => {
+        const verdict = occupancy.verdict(Date.now());
+        if (verdict === 'stay') return;
+        clearInterval(watch);
+        console.log(`выходим из встречи: ${verdict}`);
+        void (async () => {
+          if (verdict === 'never_started') {
+            await backend.failed(meta.callId, 'во встречу так никто и не пришёл').catch(() => {});
+          }
+          try { await session.close(); } catch (e) { console.error('session.close()', e); }
+          try { await ctx.room.disconnect(); } catch (e) { console.error('room.disconnect()', e); }
+        })();
+      }, 5_000);
+      // unref обязателен: без него таймер держит event loop, процесс задания не
+      // может завершиться, и фреймворк убивает его как «job is unresponsive» —
+      // вместе с недоотправленным complete.
+      watch.unref?.();
+    }
 
     // Закрытие сессии — самый ранний надёжный сигнал: он приходит сразу после
     // того, как собеседник отключился, и процесс тогда ещё жив.
@@ -339,11 +446,32 @@ export default defineAgent({
     try {
       await session.start({
         agent: new voice.Agent({
-          instructions: instructions(meta.preamble, meta.specialists),
+          instructions: isMeeting
+            ? meetingInstructions({
+                name: agentName,
+                persona: meta.agentPersona || '',
+                preamble: meta.preamble,
+                specialists: meta.specialists,
+              })
+            : callInstructions(meta.preamble, meta.specialists),
           tools,
         }),
         room: ctx.room,
+        // На встрече штатный вход RoomIO гасим: он слышит только первого
+        // вошедшего и закрывает сессию, когда отключился именно тот. Своим
+        // входом (ниже) слышим всех. Вывод RoomIO остаётся — голос ассистента
+        // публикует он.
+        ...(isMeeting
+          ? { inputOptions: { audioEnabled: false, closeOnDisconnect: false } }
+          : {}),
       });
+
+      if (isMeeting) {
+        // Подменяем вход ПОСЛЕ start(): до него сессия ещё не собрала свой
+        // AgentInput, и присвоение потерялось бы молча — ассистент сидел бы
+        // на встрече глухим.
+        session.input.audio = new MixedRoomAudioInput(ctx.room);
+      }
 
       // Первую фразу задаём явно, а не отдаём модели на импровизацию.
       //
@@ -356,11 +484,9 @@ export default defineAgent({
       // промпте на это не влияет. Живой звонок 25.08.2026: «Hi there! Great
       // to meet you», и только на русский вопрос модель переключилась сама.
       session.generateReply({
-        instructions:
-          'Ты только что снял трубку. Скажи ПО-РУССКИ ровно одну короткую фразу: ' +
-          'поздоровайся и сообщи, что ты на связи и слушаешь. Например: ' +
-          '«Привет, Роман на связи, слушаю». Ни одного английского слова, ' +
-          'никаких вопросов о делах и никаких списков — только это.',
+        instructions: isMeeting
+          ? meetingIntro(agentName, meta.ownerName || 'пользователя')
+          : callIntro(),
       });
     } catch (e: any) {
       await backend.failed(meta.callId, e?.message || 'session start failed');
