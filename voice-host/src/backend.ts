@@ -41,14 +41,14 @@ export type TranscriptEntry = { role: 'user' | 'assistant'; text: string; ts: nu
 export type CallUsage = { audioInputTokens: number; audioOutputTokens: number; model: string };
 
 export type DocumentResult =
-  | { status: 'accepted'; docId: string; title: string }
+  | { status: 'accepted'; docId: string; title: string; specialist?: string }
   | { status: 'rejected'; reason: 'no_title' };
 
 export const backend = {
   ask: (callId: string, specialist: string, question: string) =>
     post<AskResult>('ask', { callId, specialist, question }),
-  document: (callId: string, title: string, instructions: string) =>
-    post<DocumentResult>('document', { callId, title, instructions }),
+  document: (callId: string, title: string, instructions: string, specialist?: string) =>
+    post<DocumentResult>('document', { callId, title, instructions, specialist }),
   complete: (callId: string, transcript: TranscriptEntry[], usage: CallUsage) =>
     post<{ ok: true }>('complete', { callId, transcript, usage }),
   failed: (callId: string, reason: string) =>

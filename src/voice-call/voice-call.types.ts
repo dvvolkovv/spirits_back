@@ -13,14 +13,24 @@ export type VoiceDataMessage =
   // без этой цифры расход на специалистов не виден нигде до конца месяца.
   | { v: 1; type: 'specialist_answer'; jobId: string; specialist: string; text: string; tokens: number }
   | { v: 1; type: 'specialist_failed'; jobId: string; specialist: string; reason: 'timeout' | 'error' }
-  | { v: 1; type: 'document_pending'; docId: string; title: string }
-  | { v: 1; type: 'document_ready'; docId: string; title: string; tokens: number }
-  | { v: 1; type: 'document_failed'; docId: string; title: string; reason: 'timeout' | 'error' };
+  // specialist — чей это документ и в чей чат он лёг. Пусто, если писал
+  // сам ведущий. text — начало готового текста: без него Роман не знает,
+  // что в документе, и не может ни сообщить о готовности, ни обсудить.
+  | { v: 1; type: 'document_pending'; docId: string; title: string; specialist?: string }
+  | { v: 1; type: 'document_ready'; docId: string; title: string; tokens: number; specialist?: string; text?: string }
+  | { v: 1; type: 'document_failed'; docId: string; title: string; reason: 'timeout' | 'error'; specialist?: string };
 
 /** Ответ на /internal/document. Как и ask, возвращается мгновенно. */
 export type DocumentResult =
-  | { status: 'accepted'; docId: string; title: string }
+  | { status: 'accepted'; docId: string; title: string; specialist?: string }
   | { status: 'rejected'; reason: 'no_title' };
+
+/** Сколько консультаций звонка подмешиваем в промпт документа. */
+export const MAX_CONSULT_IN_DOC = 5;
+/** И сколько знаков берём от каждой: промпт не резиновый. */
+export const CONSULT_CHARS_IN_DOC = 4000;
+/** Сколько текста документа отдаём Роману, чтобы он знал его содержание. */
+export const DOC_GIST_CHARS = 1500;
 
 /** Дольше документ не сочиняем. Он длиннее ответа специалиста, отсюда запас. */
 export const DOC_TIMEOUT_MS = 300_000;

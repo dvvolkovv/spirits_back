@@ -52,9 +52,12 @@ function instructions(preamble: string, specialists: { name: string; role: strin
     '',
     'Просят сделать документ, письмо, план, список договорённостей — вызывай',
     'create_document. Он тоже возвращается мгновенно: скажи вслух, что документ',
-    'готовится и появится в чате, и продолжай разговор. Не диктуй текст',
-    'документа вслух и не спрашивай, куда его положить: он всегда попадает в чат',
-    'с тобой.',
+    'готовится, и продолжай разговор. Не диктуй текст документа вслух.',
+    'Если документ по части кого-то из коллег — передай его имя в specialist:',
+    'он напишет сам, и документ ляжет в чат С НИМ. Не обещай «Виталий',
+    'подготовит», если не указал Виталия: документ окажется в другом чате.',
+    'Когда документ будет готов, тебе придёт сообщение — сообщи вслух и',
+    'перескажи суть.',
     '',
     preamble ? `Контекст прошлой переписки:\n${preamble}` : 'Прошлой переписки нет.',
   ].join('\n');
@@ -175,12 +178,16 @@ export default defineAgent({
             'Что должно быть в документе: суть, для кого, все обсуждённые детали. ' +
             'Пиши подробно — тот, кто будет писать текст, разговора не слышал.',
           ),
+          specialist: z.string().optional().describe(
+            'Имя специалиста, если документ по его части — он его и напишет, и ' +
+            'документ ляжет в чат с ним. Не указывай, если пишешь сам.',
+          ),
         }),
-        execute: async ({ title, instructions }) => {
+        execute: async ({ title, instructions, specialist }) => {
           try {
-            const r = await backend.document(meta.callId, title, instructions);
+            const r = await backend.document(meta.callId, title, instructions, specialist);
             return r.status === 'accepted'
-              ? { status: 'accepted', title }
+              ? { status: 'accepted', title, author: r.specialist || 'ты сам' }
               : { status: 'rejected', reason: r.reason };
           } catch (e) {
             console.error('create_document failed', e);
@@ -205,6 +212,22 @@ export default defineAgent({
       }
       if (msg?.v !== 1) return; // контракт версионирован — чужую версию не трогаем
 
+      if (msg.type === 'document_ready') {
+        // Роман должен узнать, что документ готов, ГДЕ он лежит и что в нём.
+        // Иначе он говорил «готовится» и умолкал навсегда: событие про
+        // документ в этом обработчике не разбиралось вовсе, а текст ему не
+        // отдавался. Живой звонок 26.08.2026.
+        const where = msg.specialist ? `в чат с ${msg.specialist}` : 'в чат с тобой';
+        pushLine(
+          `${INTERNAL_PREFIX}: документ «${msg.title}» готов и положен ${where}. ` +
+          `Скажи об этом вслух и коротко перескажи суть. Начало текста: ${msg.text || ''}]`,
+        );
+        return;
+      }
+      if (msg.type === 'document_failed') {
+        pushLine(`${INTERNAL_PREFIX}: документ «${msg.title}» не получился (${msg.reason}). Извинись.]`);
+        return;
+      }
       if (msg.type === 'specialist_answer') {
         pushLine(`${INTERNAL_PREFIX} от коллеги ${msg.specialist}]: ${msg.text}`);
       } else if (msg.type === 'specialist_failed') {

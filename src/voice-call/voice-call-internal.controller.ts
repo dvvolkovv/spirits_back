@@ -69,13 +69,13 @@ export class VoiceCallInternalController {
     @Headers('x-voice-signature') signature: string,
     @Req() req: Request,
   ): Promise<DocumentResult> {
-    const body = this.parseSigned<{ callId: string; title: string; instructions: string }>(req, signature);
+    const body = this.parseSigned<{ callId: string; title: string; instructions: string; specialist?: string }>(req, signature);
     const call = await this.calls.load(body.callId);
     if (!this.calls.isActive(call)) {
       this.logger.warn(`[document] call=${body.callId} не активен (${call.status})`);
       return { status: 'rejected', reason: 'no_title' };
     }
-    return this.docs.create(body.callId, call.room_name, call.user_id, body.title, body.instructions);
+    return this.docs.create(body.callId, call.room_name, call.user_id, body.title, body.instructions, body.specialist);
   }
 
   @Post('complete')
