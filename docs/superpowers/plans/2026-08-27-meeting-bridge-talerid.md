@@ -1,4 +1,17 @@
-# Мост «ассистент во внешней встрече» (Taler ID) — план реализации
+# ⛔ ОТМЕНЕНО — Мост «ассистент во внешней встрече» (Taler ID)
+
+> **Отменено 27.08.2026.** Действующий план — `2026-08-27-linkeon-meeting-rooms.md`.
+> Оттуда переиспользованы гейт по имени, правила присутствия, промпты и карточка
+> в чате; мост и клиент Taler ID выброшены — встреча идёт в нашей комнате.
+>
+> Файл оставлен ради кода моста между двумя LiveKit-комнатами и микшера с
+> подсчётом громкости: **для Zoom мост вернётся**, Attendee отдаёт аудио
+> вебсокетом. Учесть при возврате: определение говорящего вручную больше не
+> нужно, LiveKit отдаёт его событием `ActiveSpeakersChanged`.
+>
+> Ниже — исходный текст.
+
+## Исходный план
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
