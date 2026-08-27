@@ -281,9 +281,9 @@ warm_chat_path() {
   tok=$(curl -s ${ca[@]+${ca[@]+"${ca[@]}"}} -m 15 "$base/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/$phone/$code" \
         | sed -n 's/.*"access-token":"\([^"]*\)".*/\1/p')
   [[ -z "$tok" ]] && return 0
-  # Прогрев browser-критичных эндпоинтов: ChatInterface не отрендерит кнопку
-  # reopen-match (smoke 97/126), пока холодные agents/profile не ответят — на
-  # холодном старте это >20с и валит browser-тесты. Будим их заранее.
+  # Прогрев browser-критичных эндпоинтов: ChatInterface не отрендерит шапку
+  # чата (переключатель ассистента), пока холодные agents/profile не ответят —
+  # на холодном старте это >20с и валит browser-тесты. Будим их заранее.
   curl -s ${ca[@]+"${ca[@]}"} -m 20 "$base/webhook/agents" >/dev/null 2>&1 || true
   curl -s ${ca[@]+"${ca[@]}"} -m 20 "$base/webhook/profile" -H "Authorization: Bearer $tok" >/dev/null 2>&1 || true
   # 1-й чат будит r.linkeon (может быть медленным), 2-й уже тёплый и точно сохранится

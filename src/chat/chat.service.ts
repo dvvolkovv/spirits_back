@@ -413,7 +413,11 @@ export class ChatService {
       } else {
         // Orphaned / not owned — fall back to the platform default agent (Роман, id=1)
         this.logger.warn(`custom agent ${customId} not found or not owned by ${userId}, falling back to default`);
-        const fallbackRes = await this.pg.query('SELECT * FROM agents ORDER BY id LIMIT 1');
+        // is_active обязателен: скрытый ассистент не должен становиться
+        // платформенным дефолтом. Точечные выборки по id/name ниже фильтр
+        // НЕ применяют сознательно — иначе у тех, кто уже разговаривает со
+        // скрытым ассистентом, чат перестал бы открываться.
+        const fallbackRes = await this.pg.query('SELECT * FROM agents WHERE is_active ORDER BY id LIMIT 1');
         agent = fallbackRes.rows[0];
       }
     } else {
