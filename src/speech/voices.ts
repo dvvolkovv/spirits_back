@@ -67,6 +67,8 @@ export const ASSISTANT_DEFAULTS: Record<string, AssistantDefault> = {
   'Анна':       { gender: 'f', yandex: 'alena',   openai: 'alloy' },
   'Лиана':      { gender: 'f', yandex: 'jane',    openai: 'shimmer' },
   'Райя':       { gender: 'f', yandex: 'jane',    openai: 'shimmer' },
+  'Павел':      { gender: 'm', yandex: 'zahar',   openai: 'echo' },
+  'Полина':     { gender: 'f', yandex: 'omazh',   openai: 'shimmer' },
 };
 
 export const GENDER_DEFAULT: Record<Gender, { yandex: string; openai: string }> = {
