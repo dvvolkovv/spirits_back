@@ -13,6 +13,7 @@ import { LanguageService, LANGUAGE_REPLY_LINE, DEFAULT_LANGUAGE } from '../commo
 import { parseMeetingLink } from '../meeting/meeting-link';
 import { RoomService } from '../meeting/room.service';
 import { buildMeetingCard } from './meeting-card';
+import { RESPONSE_STYLE_RULE } from './response-style';
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import axios from 'axios';
@@ -621,6 +622,8 @@ export class ChatService {
 • НИКОГДА не отвечай одними вопросами. НИКОГДА не задавай 2+ вопроса в одном сообщении.
 • Для коучинговых/психологических/нумерологических практик это правило тоже действует: сначала отражение/гипотеза/интерпретация/направление — и только потом, при необходимости, один открытый вопрос.
 • Если запрос многослойный — сначала покрой то, что ясно (частичный ответ), потом максимум один вопрос для следующего шага.
+
+${RESPONSE_STYLE_RULE}
 ${LanguageService.buildDirective(userLanguage)}`;
 
     let volatileSystemPrompt = (profileText && profileText.trim())
@@ -1082,6 +1085,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // отвечал по-русски аккаунту с language=en даже после того, как я починил
     // это в прямом пути к Anthropic. Здесь путь другой — через релей
     // r.linkeon.io, — и правку пришлось повторить.
+    // Форма ответа — рядом с концом промпта, по той же причине, что и язык:
+    // персона, профиль и история перевешивают инструкции, стоящие в начале.
+    contextPrefix += `${RESPONSE_STYLE_RULE}\n\n`;
+
     contextPrefix +=
       `${LANGUAGE_REPLY_LINE[userLanguage] || LANGUAGE_REPLY_LINE[DEFAULT_LANGUAGE]}\n\n`;
 
@@ -1756,6 +1763,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // других путях: директива в начале тонет под русской персоной и профилем.
     // Третье место, где приходится это дублировать; сборку промпта стоит
     // однажды свести в одно место, но не посреди ответа Apple.
+    prefix += `${RESPONSE_STYLE_RULE}\n\n`;
     prefix +=
       `${LANGUAGE_REPLY_LINE[await this.language.resolveUserLanguage(userId)] || LANGUAGE_REPLY_LINE[DEFAULT_LANGUAGE]}\n\n`;
 
