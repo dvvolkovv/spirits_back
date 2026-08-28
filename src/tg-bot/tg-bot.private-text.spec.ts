@@ -11,8 +11,9 @@ describe('обычный текст в личном чате', () => {
   const configs = { ensurePrivateConfig: jest.fn(), getActiveByTgChatId: jest.fn() };
   const grammy = { sendMessage: jest.fn() };
 
+  const pg = { query: jest.fn() };
   const svc = new TgBotService(
-    {} as any, // pg
+    pg as any,
     identity as any,
     {} as any, // claim
     configs as any,
@@ -27,6 +28,7 @@ describe('обычный текст в личном чате', () => {
 
   beforeEach(() => {
     jest.resetAllMocks();
+    pg.query.mockResolvedValue({ rows: [{ preferred_agent: 'Кира' }] });
     (svc as any).handleChatMessage = jest.fn();
     (svc as any).handleDmCommand = jest.fn();
   });
@@ -64,5 +66,25 @@ describe('обычный текст в личном чате', () => {
 
     expect((svc as any).handleDmCommand).toHaveBeenCalled();
     expect((svc as any).handleChatMessage).not.toHaveBeenCalled();
+  });
+
+  it('/start у привязанного: здоровается и называет ассистента, а не зовёт подключаться', async () => {
+    identity.getLinkeonIdByTgUserId.mockResolvedValue('u-1');
+
+    await (svc as any).handleMessage(msg('/start'));
+
+    const [, text] = grammy.sendMessage.mock.calls[0];
+    expect(text).toContain('Кира');
+    expect(text).toContain('/assistants');
+    expect(text).not.toContain('Подключить Telegram');
+  });
+
+  it('/start у непривязанного: прежняя подсказка про подключение', async () => {
+    identity.getLinkeonIdByTgUserId.mockResolvedValue(null);
+
+    await (svc as any).handleMessage(msg('/start'));
+
+    const [, text] = grammy.sendMessage.mock.calls[0];
+    expect(text).toContain('Подключить Telegram');
   });
 });

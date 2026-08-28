@@ -37,6 +37,25 @@ export class TgGrammyClient implements OnModuleInit {
         ...(webhookIp ? { ip_address: webhookIp } : {}),
       });
       this.logger.log(`Telegram webhook set: ${webhookUrl}${webhookIp ? ` (ip pinned: ${webhookIp})` : ''}`);
+
+      // Меню команд в клиенте Telegram (кнопка «/» рядом с полем ввода).
+      // Без него про /assistants узнать неоткуда, кроме /help — а про /help
+      // тоже надо сначала догадаться. Вызов идемпотентный: Telegram просто
+      // перезаписывает список целиком, поэтому гоняем на каждом старте и не
+      // держим отдельного «а зарегистрировано ли уже» состояния.
+      try {
+        await this.bot.api.setMyCommands([
+          { command: 'assistants', description: 'Выбрать ассистента' },
+          { command: 'balance', description: 'Баланс токенов' },
+          { command: 'silent', description: 'Замолчать во всех группах' },
+          { command: 'resume', description: 'Снова отвечать' },
+          { command: 'help', description: 'Что умеет бот' },
+        ]);
+        this.logger.log('Telegram commands menu set');
+      } catch (e: any) {
+        // Меню — украшение: бот работает и без него, валить старт незачем.
+        this.logger.warn(`setMyCommands failed: ${e.message}`);
+      }
     } catch (e: any) {
       this.logger.error(`setWebhook failed: ${e.message}`);
     }

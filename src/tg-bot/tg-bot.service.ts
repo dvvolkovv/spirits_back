@@ -124,9 +124,28 @@ export class TgBotService implements OnModuleInit {
     }
 
     if (chatType === 'private' && (msg.text === '/start' || msg.text?.startsWith('/start@'))) {
+      // Привязку проверяем ДО совета «подключись»: раньше эта ветка отвечала
+      // одинаково всем, и уже привязанный человек получал предложение
+      // подключиться ещё раз — выглядело так, будто бот его не узнаёт
+      // (репорт владельца 28.08.2026, когда личка уже работала).
+      const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
+      if (!ownerId) {
+        await this.grammy.sendMessage(
+          msg.chat.id,
+          'Привет! Для подключения зайди в Linkeon и нажми «Подключить Telegram».',
+        );
+        return;
+      }
+      const prof = await this.pg.query(
+        `SELECT preferred_agent FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
+        [ownerId],
+      );
+      const current = prof.rows[0]?.preferred_agent;
       await this.grammy.sendMessage(
         msg.chat.id,
-        'Привет! Для подключения зайди в Linkeon и нажми «Подключить Telegram».',
+        (current ? `Привет! Сейчас отвечает *${current}*.` : 'Привет!') +
+          '\n\nПиши сюда — ассистент ответит. /assistants — сменить ассистента, /balance — баланс.',
+        { parse_mode: 'Markdown' },
       );
       return;
     }
