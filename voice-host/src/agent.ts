@@ -21,6 +21,7 @@ import { NameGate } from './name-gate.js';
 import { Occupancy } from './occupancy.js';
 import { MixedRoomAudioInput } from './mixed-audio-input.js';
 import {
+  answerTo,
   callInstructions,
   callIntro,
   listenAck,
@@ -370,7 +371,9 @@ export default defineAgent({
       console.log(`[гейт] ${decision} ← «${textContent.slice(0, 80)}»`);
       switch (decision) {
         case 'respond':
-          session.generateReply();
+          // Именно эта реплика, а не «разговор целиком»: иначе модель
+          // отвечает на вопрос, который слышала полчаса назад в молчании.
+          session.generateReply({ instructions: answerTo(textContent) });
           break;
         case 'ack_listen':
           session.generateReply({ instructions: listenAck() });

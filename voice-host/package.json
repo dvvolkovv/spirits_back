@@ -7,7 +7,7 @@
     "build": "tsc",
     "start": "node dist/agent.js start",
     "dev": "tsx src/agent.ts dev",
-    "test": "tsx --test src/pending.test.ts src/name-gate.test.ts src/occupancy.test.ts src/mixer.test.ts"
+    "test": "tsx --test src/pending.test.ts src/name-gate.test.ts src/occupancy.test.ts src/mixer.test.ts src/prompts.test.ts"
   },
   "dependencies": {
     "@livekit/agents": "1.7.0",
