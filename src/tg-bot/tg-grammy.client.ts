@@ -46,6 +46,7 @@ export class TgGrammyClient implements OnModuleInit {
       try {
         await this.bot.api.setMyCommands([
           { command: 'assistants', description: 'Выбрать ассистента' },
+          { command: 'language', description: 'Язык ответов' },
           { command: 'balance', description: 'Баланс токенов' },
           { command: 'silent', description: 'Замолчать во всех группах' },
           { command: 'resume', description: 'Снова отвечать' },

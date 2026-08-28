@@ -239,6 +239,10 @@ export class TgBotService implements OnModuleInit {
       await this.commands.handleAgentCallback(cb, ownerId);
       return;
     }
+    if (data.startsWith('lang:')) {
+      await this.commands.handleLanguageCallback(cb, ownerId);
+      return;
+    }
     if (data.startsWith('agents_page:')) {
       const page = Number(data.split(':')[1]) || 0;
       await this.commands.handleAssistants(cb.message, ownerId, page);
@@ -249,6 +253,19 @@ export class TgBotService implements OnModuleInit {
   private async handleDmCommand(msg: any): Promise<void> {
     const text = msg.text.toLowerCase().trim();
     const cmd = text.split('@')[0].split(' ')[0];
+
+    if (cmd === '/language') {
+      const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
+      if (!ownerId) {
+        await this.replyUnlinked(
+          msg.chat.id,
+          'Чтобы выбрать язык, нужен аккаунт Linkeon — открой его кнопкой ниже.',
+        );
+        return;
+      }
+      await this.commands.handleLanguage(msg, ownerId);
+      return;
+    }
 
     if (cmd === '/assistants') {
       const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
@@ -271,6 +288,7 @@ export class TgBotService implements OnModuleInit {
 Команды (работают и здесь, и в группе — где надо, привязка по твоему Telegram):
 /start — подключить Telegram к Linkeon
 /assistants — выбрать ассистента, который отвечает в личке
+/language — язык ответов
 /balance — баланс токенов твоего аккаунта
 /silent — замолчать все твои боты во всех группах
 /resume — снова включить их
