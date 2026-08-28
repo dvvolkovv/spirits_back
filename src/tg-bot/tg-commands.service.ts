@@ -7,6 +7,18 @@ import { TgIdentityService } from './tg-identity.service';
 import { AgentsService } from '../agents/agents.service';
 import { TgConfigService } from './tg-config.service';
 import { buildAssistantsKeyboard } from './tg-assistants-keyboard';
+import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
+
+/**
+ * Родные названия языков — те же, что показывает сайт и мини-апп
+ * (src/i18n/languages.ts во фронте). Список кодов берём из
+ * language.service, чтобы не разошёлся второй источник правды: тут только
+ * подписи для кнопок.
+ */
+const LANGUAGE_LABELS: Record<string, string> = {
+  ru: 'Русский', en: 'English', es: 'Español', de: 'Deutsch',
+  fr: 'Français', zh: '中文', pt: 'Português',
+};
 
 @Injectable()
 export class TgCommandsService {
@@ -20,6 +32,55 @@ export class TgCommandsService {
     private readonly agents: AgentsService,
     private readonly configs: TgConfigService,
   ) {}
+
+  /**
+   * /language — выбрать язык. До этого сменить его из бота было нельзя вовсе:
+   * только веб или мини-апп. Пишем в то же profile_data.language, что и они —
+   * один источник правды, как и с текущим ассистентом.
+   */
+  async handleLanguage(msg: any, ownerId: string): Promise<void> {
+    const prof = await this.pg.query(
+      `SELECT profile_data->>'language' AS language FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
+      [ownerId],
+    );
+    const current = prof.rows[0]?.language ?? null;
+    await this.grammy.sendMessage(msg.chat.id, 'На каком языке отвечать?', {
+      reply_markup: {
+        inline_keyboard: SUPPORTED_LANGUAGES.map((code) => [
+          {
+            text: code === current ? `✓ ${LANGUAGE_LABELS[code]}` : LANGUAGE_LABELS[code],
+            callback_data: `lang:${code}`,
+          },
+        ]),
+      },
+    });
+  }
+
+  /**
+   * Нажатие на язык. Код сверяем со списком: callback_data приходит от
+   * клиента, и незнакомый код молча уехал бы в профиль, а оттуда — в
+   * системный промпт ассистента.
+   */
+  async handleLanguageCallback(cb: any, ownerId: string): Promise<void> {
+    const code = String(cb.data || '').slice('lang:'.length);
+    if (!(SUPPORTED_LANGUAGES as readonly string[]).includes(code)) {
+      this.logger.warn(`callback с неизвестным языком "${code}" от ${ownerId}`);
+      await this.grammy.answerCallbackQuery(cb.id, { text: 'Такого языка нет' });
+      return;
+    }
+
+    await this.pg.query(
+      `UPDATE ai_profiles_consolidated
+          SET profile_data = COALESCE(profile_data, '{}'::jsonb) || $1::jsonb,
+              updated_at = now()
+        WHERE user_id = $2`,
+      [JSON.stringify({ language: code }), ownerId],
+    );
+    await this.grammy.answerCallbackQuery(cb.id, {});
+    await this.grammy.sendMessage(cb.message.chat.id, `Готово, отвечаю на: *${LANGUAGE_LABELS[code]}*.`, {
+      parse_mode: 'Markdown',
+    });
+  }
 
   /**
    * /assistants — список ассистентов с пометкой текущего.
