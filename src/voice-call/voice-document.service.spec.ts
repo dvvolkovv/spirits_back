@@ -124,7 +124,7 @@ describe('VoiceDocumentService', () => {
     expect(sent).toContainEqual(expect.objectContaining({ type: 'document_ready', title: 'Письмо' }));
   });
 
-  it('документ без заголовка отклоняется, задача не заводится', () => {
+  it('документ без заголовка отклоняется, задача не заводится', async () => {
     const chat = { generateAgentReplyWithCharge: jest.fn() };
     const svc = new VoiceDocumentService(makePg() as any, chat as any, { send: jest.fn() } as any, makeStorage() as any, makeLang() as any);
 
@@ -165,7 +165,7 @@ describe('VoiceDocumentService', () => {
     );
   });
 
-  it('лимита одновременных документов нет — пятый тоже принимается', () => {
+  it('лимита одновременных документов нет — пятый тоже принимается', async () => {
     // Снято по решению владельца 26.08.2026 вместе с лимитом на вопросы.
     const chat = { generateAgentReplyWithCharge: jest.fn(() => new Promise<never>(() => {})) }; // висят
     const svc = new VoiceDocumentService(makePg() as any, chat as any, { send: jest.fn(async () => {}) } as any, makeStorage() as any, makeLang() as any);
