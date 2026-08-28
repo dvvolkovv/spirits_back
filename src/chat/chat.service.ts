@@ -393,6 +393,9 @@ export class ChatService {
     // Запрос из сборки для App Store или Google Play: ссылок на пополнение в
     // промпте быть не должно. См. BalanceContextService.buildContextForPrompt.
     storeBuild: boolean = false,
+    // Пинг мониторинга, а не живой пользователь: ход уходит на дешёвую модель.
+    // Разрешён только тестовым аккаунтам — проверка в chat.controller.ts.
+    probe: boolean = false,
   ): Promise<void> {
     // Get agent
     // Custom-agent branch: "custom:<uuid>" references user-created agents.
@@ -570,7 +573,7 @@ export class ChatService {
         recentHistory, profileText, res,
         agent.name, agent.description || '', agent.system_prompt || '',
         req, fresh, chatSessionId, requestLang, clientTz, balanceBlock,
-        agent.category,
+        agent.category, probe,
       );
     }
 
@@ -736,7 +739,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
         system: systemPrompt,
         // 'default' — рекомендуемая модель CLI (сейчас Opus 5, при исчерпании
         // лимита подписки сам даунгрейдится). Биллинг юзеру идёт от costUsd.
-        model: 'default',
+        // Пинг мониторинга уходит на haiku: проверяется живость пути, а не
+        // качество ответа, и разница в цене хода — порядок.
+        model: probe ? 'haiku' : 'default',
         timeoutMs: 90_000,
       });
       rawText = r.text || '';
@@ -887,6 +892,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // Категория агента (business/personal/assistant) — решает, какую версию
     // карточки бизнеса вставлять ниже. См. BusinessProfileService.renderForPrompt.
     agentCategory?: string | null,
+    // Пинг мониторинга (smoke / synthetic-runner), а не живой пользователь.
+    // Такой ход просит у релея дешёвую модель: ответ «ок» на Opus стоит те же
+    // ~47k контекста, что и настоящая консультация. Флаг приходит только от
+    // тестовых аккаунтов — см. chat.controller.ts.
+    probe: boolean = false,
   ): Promise<void> {
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
@@ -1295,6 +1305,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
             ? freshSessionId
             : `${userId}_${assistantId}_${userLanguage}`,
         );
+
+        // Модель хода. Пинги мониторинга просят haiku: «ответь одним словом ок»
+        // не требует Opus, а обвязка Claude Code (системный промпт CLI +
+        // определения MCP-тулов, ~47k токенов) грузится независимо от содержания
+        // хода и на Opus стоит ~$0.20 против ~$0.02 на haiku. Поле необязательное:
+        // релей без поддержки `model` его просто игнорирует и остаётся на default.
+        if (probe) fd.append('model', 'haiku');
 
         // Agent-direct TalerID: when the user connected the TalerID ecosystem, hand
         // the file-agent a full-scope access token + the MCP base URL of the env we

@@ -13,6 +13,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { decodeMultipartFilename } from '../common/utils/multipart-filename';
+import { TEST_USERS } from '../common/test-users';
 
 /**
  * Потолок загрузки, ОДИН на всю цепочку. Раньше каждое звено держало свой, и
@@ -129,6 +130,15 @@ export class ChatController {
     const finalSessionId = fresh
       ? `${userId}_${assistantId}_fresh_${body.freshTs}`
       : (sessionId || `${userId}_${assistantId}`);
+
+    // Пинг мониторинга (smoke / synthetic-runner): ход уходит на дешёвую модель,
+    // потому что проверяется живость пути, а не качество ответа.
+    //
+    // Флаг признаётся ТОЛЬКО у тестовых аккаунтов. Иначе это ручка, которой
+    // любой пользователь молча понижает себе модель — и разбираться потом
+    // придётся с жалобой «ассистент поглупел», у которой нет следа ни в логах,
+    // ни в промпте.
+    const probe = body.probe === true && TEST_USERS.includes(userId);
     const startedAt = Date.now();
     try {
       await this.chatService.streamChat(
@@ -143,6 +153,7 @@ export class ChatController {
         requestLang,
         clientTz,
         storeBuild,
+        probe,
       );
       this.events?.track('response_received', {
         userId,

@@ -192,7 +192,7 @@ const scenarios = (jwtUser) => [
       // кэше доходила до $6. Одноразовая сессия стоит ровно холодный старт.
       const bytes = await streamFirstByte(`${BASE}/webhook/soulmate/chat`, {
         auth: `Bearer ${jwtUser}`,
-        payload: { chatInput: 'ping (synthetic)', assistant: '12', fresh: true, freshTs: Date.now() },
+        payload: { chatInput: 'ping (synthetic)', assistant: '12', fresh: true, freshTs: Date.now(), probe: true },
       });
       return `${bytes} bytes received`;
     },

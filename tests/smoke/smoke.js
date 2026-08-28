@@ -465,7 +465,9 @@ async function step(name, fn) {
           `${BASE_URL}/webhook/soulmate/chat`,
           // freshTs обязан быть ≥6 цифр — иначе контроллер молча проигнорирует
           // fresh и пинг снова уедет в постоянную сессию (chat.controller.ts).
-          { message: msg, assistantId: a.id, fresh: true, freshTs: Date.now() },
+          // probe: ход уходит на haiku — проверяется живость пути, не качество
+          // ответа. Флаг признаётся только тестовым аккаунтам.
+          { message: msg, assistantId: a.id, fresh: true, freshTs: Date.now(), probe: true },
           {
             headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
             responseType: 'stream',
