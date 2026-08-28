@@ -1949,12 +1949,39 @@ export class AdminService implements OnModuleInit {
       payments = [];
     }
 
+    // Привязки входа. Больше чем у трети пользователей их несколько (телефон
+    // плюс OAuth), и по одному адресу не видно, чем человек логинится; у Apple
+    // с «Скрыть мою почту» адрес вида @privaterelay.appleid.com без указания
+    // провайдера вообще выглядит мусором.
+    let identities: Array<{
+      provider: string;
+      email: string | null;
+      email_verified: boolean;
+      last_used_at: string | null;
+    }> = [];
+    try {
+      const r = await this.pg.query(
+        `SELECT provider, email, email_verified, last_used_at
+           FROM user_identities
+          WHERE user_id = $1
+          ORDER BY last_used_at DESC NULLS LAST, created_at ASC`,
+        [phone],
+      );
+      identities = r.rows.map((row: any) => ({
+        provider: String(row.provider),
+        email: row.email || null,
+        email_verified: !!row.email_verified,
+        last_used_at: row.last_used_at || null,
+      }));
+    } catch { /* таблица отсутствует → пустой список */ }
+
     return {
       user: {
         phone: u.phone,
         registered_at: u.registered_at,
         balance: Number(u.balance) || 0,
         email: u.email || null,
+        identities,
         isadmin: !!u.isadmin,
         preferred_agent: u.preferred_agent || null,
         paid_count: Number(u.paid_count) || 0,
