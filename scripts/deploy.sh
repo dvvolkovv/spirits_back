@@ -297,20 +297,38 @@ warm_chat_path() {
   # на холодном старте это >20с и валит browser-тесты. Будим их заранее.
   curl -s ${ca[@]+"${ca[@]}"} -m 20 "$base/webhook/agents" >/dev/null 2>&1 || true
   curl -s ${ca[@]+"${ca[@]}"} -m 20 "$base/webhook/profile" -H "Authorization: Bearer $tok" >/dev/null 2>&1 || true
-  # 1-й чат будит r.linkeon (может быть медленным), 2-й уже тёплый и точно сохранится
+  # fresh+probe у прогрева — не оптимизация «на всякий случай», а починка.
+  # Без них ход уезжал в ПОСТОЯННУЮ сессию релея (70000000000_12_ru), которая
+  # копится неделями: релей перечитывал её кеш целиком, и ответ «ок» из двух
+  # символов стоил $5.14 при ~1 млн взвешенных токенов (замер 28.08.2026,
+  # metadata списаний: costUsd=5.1402, replyChars=2). Тот же пинг в смоуке —
+  # с fresh+probe — стоит $0.02, потому что идёт в изолированную сессию и на
+  # haiku. Прогреву качество ответа не нужно вовсе: он будит путь.
+  #
+  # freshTs обязан быть ≥6 цифр, иначе контроллер молча проигнорирует fresh и
+  # ход снова уедет в постоянную сессию (chat.controller.ts).
+  local fts
+  fts=$(date +%s)
   for _ in 1 2; do
     curl -s ${ca[@]+${ca[@]+"${ca[@]}"}} -m 60 -X POST "$base/webhook/soulmate/chat" \
       -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
-      -d '{"chatInput":"deploy warmup","assistant":"12"}' >/dev/null 2>&1 || true
+      -d "{\"chatInput\":\"deploy warmup\",\"assistant\":\"12\",\"fresh\":true,\"freshTs\":\"$fts\",\"probe\":true}" >/dev/null 2>&1 || true
   done
   # Юля/smm_producer (id=15) — ОТДЕЛЬНЫЙ тяжёлый путь (Claude Agent SDK + in-process
   # MCP tools, ветка по agent.name в chat.service), не покрытый прогревом Романа.
   # Холодный первый вызов медленный (>20с) → browser-smoke julia-creator.spec.js
   # падает И его churn роняет соседние render-тесты (per-tab). Root-cause 2026-06-26
   # (backlog ad11a003): warm = зелёно 7/7, cold-after-restart = красно. Будим заранее.
+  #
+  # Здесь fresh есть, а probe НЕТ — намеренно. Путь Юли идёт через
+  # claudeAgent.streamSmmProducer (Claude Agent SDK + MCP-тулы), а не через
+  # общую ветку, где probe переключает модель на haiku; как probe ведёт себя
+  # в SDK-пути, не проверено, а смысл этого прогрева — разбудить именно
+  # тяжёлую обвязку. Изоляции сессии достаточно: она не даёт накопиться той
+  # самой постоянной сессии, из-за которой прогрев Романа стоил $5.
   curl -s ${ca[@]+${ca[@]+"${ca[@]}"}} -m 90 -X POST "$base/webhook/soulmate/chat" \
     -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
-    -d '{"chatInput":"deploy warmup","assistant":"15"}' >/dev/null 2>&1 || true
+    -d "{\"chatInput\":\"deploy warmup\",\"assistant\":\"15\",\"fresh\":true,\"freshTs\":\"$fts\"}" >/dev/null 2>&1 || true
   green "  ✓ chat+browser+smm paths warmed ($base)"
 }
 
