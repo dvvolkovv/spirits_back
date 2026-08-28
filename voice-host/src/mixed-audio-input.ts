@@ -61,8 +61,22 @@ export class MixedRoomAudioInput extends voice.AudioInput {
     // не ломает.
     const subscribe = (p: RemoteParticipant): void => {
       for (const pub of p.trackPublications.values()) {
-        if (pub.kind !== TrackKind.KIND_AUDIO) continue;
-        if (!pub.subscribed) pub.setSubscribed(true);
+        // ВАЖНО: не пропускаем публикации с неизвестным kind.
+        //
+        // `TrackPublication.kind` объявлен как `TrackKind | undefined` — в
+        // момент, когда мы подписываемся, данные публикации могут быть ещё не
+        // заполнены. Прежнее условие `kind !== KIND_AUDIO` тогда отсекало
+        // дорожку целиком, и в логе оставалось `"subscribed": false`, а
+        // ассистент сидел глухим. Живая встреча 28.08.2026.
+        //
+        // Видео в наших комнатах не публикуется вовсе, так что подписаться на
+        // лишнее мы не рискуем; а если оно появится — отфильтрует attach по
+        // самой дорожке, где kind уже определён.
+        if (pub.kind !== undefined && pub.kind !== TrackKind.KIND_AUDIO) continue;
+        if (!pub.subscribed) {
+          console.log(`подписываюсь на дорожку ${p.identity} (kind=${pub.kind ?? 'неизвестен'})`);
+          pub.setSubscribed(true);
+        }
         // Дорожка уже могла приехать до подписки — тогда события не будет.
         if (pub.track) this.attach(pub.track, p.identity);
       }
