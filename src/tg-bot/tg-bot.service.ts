@@ -95,6 +95,10 @@ export class TgBotService implements OnModuleInit {
         await this.handleMessage(msg);
         return;
       }
+      if (update.callback_query) {
+        await this.handleCallbackQuery(update.callback_query);
+        return;
+      }
       if (update.my_chat_member) {
         await this.handleMyChatMember(update.my_chat_member);
         return;
@@ -132,6 +136,25 @@ export class TgBotService implements OnModuleInit {
       return;
     }
 
+    // Обычный текст в личке — разговор с ассистентом. Раньше такой ветки не
+    // было вовсе: бот молчал на всё, кроме /start и команд, и личного диалога
+    // с ассистентами в Telegram просто не существовало.
+    //
+    // Ветка стоит ПОСЛЕ проверки на '/' — иначе команды уехали бы в ассистента.
+    if (chatType === 'private') {
+      const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
+      if (!ownerId) {
+        await this.grammy.sendMessage(
+          msg.chat.id,
+          'Telegram не привязан к Linkeon. Нажми /start или зайди в кабинет и нажми «Подключить Telegram».',
+        );
+        return;
+      }
+      const cfg = await this.configs.ensurePrivateConfig(ownerId, msg.chat.id);
+      await this.handleChatMessage(msg, cfg);
+      return;
+    }
+
     if (chatType === 'channel') {
       try { await this.grammy.leaveChat(msg.chat.id); } catch { /* ignore */ }
       return;
@@ -142,7 +165,7 @@ export class TgBotService implements OnModuleInit {
         await this.handleGroupClaim(msg, startToken);
         return;
       }
-      await this.handleGroupMessage(msg);
+      await this.handleChatMessage(msg);
       return;
     }
   }
@@ -155,17 +178,53 @@ export class TgBotService implements OnModuleInit {
 
   // Команды в личке с ботом: /help (всем) и /balance (привязанному юзеру).
   // /silent /resume — групповые, в DM не имеют смысла.
+  /**
+   * Нажатия инлайн-кнопок. Пока единственные — выбор ассистента и листание
+   * его списка. Непривязанный пользователь молча игнорируется: кнопку он
+   * может получить только из сообщения, которое бот прислал ему же, так что
+   * это либо чужой forward, либо отвязка аккаунта между показом и нажатием.
+   */
+  private async handleCallbackQuery(cb: any): Promise<void> {
+    const data = String(cb.data || '');
+    const ownerId = await this.identity.getLinkeonIdByTgUserId(cb.from.id);
+    if (!ownerId) return;
+
+    if (data.startsWith('agent:')) {
+      await this.commands.handleAgentCallback(cb, ownerId);
+      return;
+    }
+    if (data.startsWith('agents_page:')) {
+      const page = Number(data.split(':')[1]) || 0;
+      await this.commands.handleAssistants(cb.message, ownerId, page);
+      return;
+    }
+  }
+
   private async handleDmCommand(msg: any): Promise<void> {
     const text = msg.text.toLowerCase().trim();
     const cmd = text.split('@')[0].split(' ')[0];
 
+    if (cmd === '/assistants') {
+      const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
+      if (!ownerId) {
+        await this.grammy.sendMessage(
+          msg.chat.id,
+          'Telegram не привязан к Linkeon. Нажми /start или зайди в кабинет и нажми «Подключить Telegram».',
+        );
+        return;
+      }
+      await this.commands.handleAssistants(msg, ownerId);
+      return;
+    }
+
     if (cmd === '/help') {
       await this.grammy.sendMessage(
         msg.chat.id,
-        `Я бот Linkeon — отвечаю в группах, куда меня добавил владелец.
+        `Я бот Linkeon — отвечаю здесь в личке и в группах, куда меня добавил владелец.
 
 Команды (работают и здесь, и в группе — где надо, привязка по твоему Telegram):
 /start — подключить Telegram к Linkeon
+/assistants — выбрать ассистента, который отвечает в личке
 /balance — баланс токенов твоего аккаунта
 /silent — замолчать все твои боты во всех группах
 /resume — снова включить их
@@ -304,8 +363,17 @@ export class TgBotService implements OnModuleInit {
     }
   }
 
-  private async handleGroupMessage(msg: any): Promise<void> {
-    const cfg = await this.configs.getActiveByTgChatId(msg.chat.id);
+  /**
+   * Обработка сообщения в чате — групповом или личном. Раньше называлась
+   * handleGroupMessage: личных чатов у бота не было. Всё, что ниже (голос,
+   * вложения, баланс, история, биллинг), одинаково нужно обоим, поэтому
+   * второй такой путь не заводим.
+   *
+   * cfgIn передаёт личная ветка: там конфиг уже получен (и при необходимости
+   * создан) через ensurePrivateConfig, второй поход в БД не нужен.
+   */
+  private async handleChatMessage(msg: any, cfgIn?: TgBotConfigRow): Promise<void> {
+    const cfg = cfgIn ?? (await this.configs.getActiveByTgChatId(msg.chat.id));
     if (!cfg) return;
 
     const isVoice = !!(msg.voice || msg.audio);

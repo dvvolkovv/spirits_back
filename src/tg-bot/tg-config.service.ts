@@ -212,6 +212,50 @@ export class TgConfigService {
     return r.rows[0] ?? null;
   }
 
+  /**
+   * Конфиг для личного чата: находит активный или заводит новый.
+   *
+   * preset_agent_id заполняется текущим ассистентом владельца только ради
+   * констрейнта tg_bot_configs_check (строка без ассистента запрещена). Для
+   * приватных конфигов это поле инертно — кто отвечает, решает
+   * resolveSystemPrompt по preferred_agent. Специально НЕ обновляем его при
+   * переключении: см. комментарий там же.
+   *
+   * addressing_mode='always' — в личке отвечать на каждое сообщение; strict
+   * потребовал бы обращения по имени, что в диалоге один на один абсурдно.
+   */
+  async ensurePrivateConfig(ownerId: string, tgChatId: number): Promise<TgBotConfigRow> {
+    const existing = await this.pg.query(
+      `SELECT * FROM tg_bot_configs
+        WHERE tg_chat_id = $1 AND status IN ('active','silent')
+        LIMIT 1`,
+      [tgChatId],
+    );
+    if (existing.rows[0]) return existing.rows[0];
+
+    const prof = await this.pg.query(
+      `SELECT preferred_agent FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
+      [ownerId],
+    );
+    let agentId = '12';
+    const preferred = prof.rows[0]?.preferred_agent;
+    if (preferred) {
+      const a = await this.pg.query(`SELECT id FROM agents WHERE name = $1 LIMIT 1`, [preferred]);
+      if (a.rows[0]) agentId = String(a.rows[0].id);
+    }
+
+    const created = await this.pg.query(
+      `INSERT INTO tg_bot_configs (
+         owner_user_id, tg_chat_id, display_name, preset_agent_id,
+         addressing_mode, voice_reply_mode, status
+       ) VALUES ($1, $2, $3, $4, $5, 'mirror', 'active')
+       RETURNING *`,
+      [ownerId, tgChatId, 'Linkeon', agentId, 'always'],
+    );
+    this.logger.log(`создан приватный конфиг для чата ${tgChatId} (владелец ${ownerId})`);
+    return created.rows[0];
+  }
+
   async getMessagesForConfig(configId: string, ownerId: string, limit: number = 50): Promise<any[]> {
     await this.getById(configId, ownerId);
     const r = await this.pg.query(

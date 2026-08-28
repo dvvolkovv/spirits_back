@@ -4,6 +4,9 @@ import { TgGrammyClient } from './tg-grammy.client';
 import { TgBotConfigRow } from './tg-config.service';
 import { TgBillingService } from './tg-billing.service';
 import { TgIdentityService } from './tg-identity.service';
+import { AgentsService } from '../agents/agents.service';
+import { TgConfigService } from './tg-config.service';
+import { buildAssistantsKeyboard } from './tg-assistants-keyboard';
 
 @Injectable()
 export class TgCommandsService {
@@ -14,7 +17,64 @@ export class TgCommandsService {
     private readonly grammy: TgGrammyClient,
     private readonly billing: TgBillingService,
     private readonly identity: TgIdentityService,
+    private readonly agents: AgentsService,
+    private readonly configs: TgConfigService,
   ) {}
+
+  /**
+   * /assistants — список ассистентов с пометкой текущего.
+   *
+   * Только для лички: в группе ассистент привязан к чату, и смена одним
+   * участником сбивала бы разговор остальных.
+   */
+  async handleAssistants(msg: any, ownerId: string, page = 0): Promise<void> {
+    const agents = await this.agents.getAgents();
+    const prof = await this.pg.query(
+      `SELECT preferred_agent FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
+      [ownerId],
+    );
+    const current = prof.rows[0]?.preferred_agent ?? null;
+    await this.grammy.sendMessage(
+      msg.chat.id,
+      current ? `Сейчас отвечает *${current}*. Кого позвать?` : 'Кого позвать?',
+      { parse_mode: 'Markdown', reply_markup: buildAssistantsKeyboard(agents, page, current) },
+    );
+  }
+
+  /**
+   * Нажатие на карточку ассистента.
+   *
+   * Имя из callback_data сверяем со списком: callback_data приходит от
+   * клиента, доверять ему нельзя — иначе в preferred_agent уедет любая
+   * строка, и резолвинг будет каждый раз падать в фолбэк.
+   */
+  async handleAgentCallback(cb: any, ownerId: string): Promise<void> {
+    const name = String(cb.data || '').slice('agent:'.length);
+    const agents = await this.agents.getAgents();
+    if (!agents.some((a: any) => a.name === name)) {
+      this.logger.warn(`callback с неизвестным ассистентом "${name}" от ${ownerId}`);
+      await this.grammy.answerCallbackQuery(cb.id, { text: 'Такого ассистента нет' });
+      return;
+    }
+
+    await this.agents.changeAgent(ownerId, name);
+    await this.grammy.answerCallbackQuery(cb.id, {});
+    await this.grammy.sendMessage(cb.message.chat.id, `Теперь отвечает *${name}*.`, {
+      parse_mode: 'Markdown',
+    });
+
+    // Отметка в ленте: история в личке одна на всех ассистентов, и без неё
+    // следующий ассистент получит контекст, где он же якобы говорил чужим
+    // голосом.
+    const cfg = await this.configs.getActiveByTgChatId(cb.message.chat.id);
+    if (cfg) {
+      await this.pg.query(
+        `INSERT INTO tg_bot_messages (config_id, tg_chat_id, tg_user_id, role, content, content_type, tokens_charged)
+         VALUES ($1, $2, $3, 'assistant', $4, 'text', 0)`,
+        [cfg.id, cb.message.chat.id, cb.from.id, `— Дальше отвечает ${name}. —`],
+      );
+    }
+  }
 
   /**
    * Если text — команда из нашего списка, обработать и вернуть true.

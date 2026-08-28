@@ -5,6 +5,14 @@ import { ClaudeCliService, ClaudeCliProgressEvent } from '../common/services/cla
 import { AgentsService } from '../agents/agents.service';
 import { TgGrammyClient } from './tg-grammy.client';
 import { TgConfigService, TgBotConfigRow } from './tg-config.service';
+import { isPrivateConfig } from './tg-chat-kind';
+
+/**
+ * Дефолтный ассистент для лички, когда preferred_agent пуст или указывает на
+ * несуществующего. 12 — Роман: он стоит у девяти из десяти боевых конфигов,
+ * то есть это уже сложившийся выбор, а не новый.
+ */
+const DEFAULT_AGENT_ID = '12';
 
 export interface IncomingMessageContext {
   chatId: number;
@@ -195,7 +203,17 @@ ${recent}
   }
 
   /**
-   * Resolve system prompt: либо custom_agent (по custom_agent_id), либо preset из agents table.
+   * Кто отвечает в этом чате.
+   *
+   * Для ЛИЧНОГО чата источник правды — preferred_agent владельца, то самое
+   * поле, которое пишут веб и мини-апп. cfg.preset_agent_id в приватной
+   * строке инертен: он заполнен только чтобы удовлетворить констрейнт
+   * tg_bot_configs_check, и намеренно НЕ синхронизируется при переключении —
+   * иначе вернулась бы двойная запись, из-за которой мини-апп и бот
+   * разъезжались (см. спек 2026-08-28).
+   *
+   * Для группового чата всё по-прежнему: ассистент привязан к чату, потому
+   * что смена одним участником сбивала бы разговор остальных.
    */
   private async resolveSystemPrompt(cfg: TgBotConfigRow): Promise<{ name: string; systemPrompt: string }> {
     if (cfg.custom_agent_id) {
@@ -205,6 +223,24 @@ ${recent}
       );
       if (r.rows[0]) return { name: r.rows[0].name, systemPrompt: r.rows[0].system_prompt };
     }
+
+    if (isPrivateConfig(cfg)) {
+      const prof = await this.pg.query(
+        `SELECT preferred_agent FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
+        [cfg.owner_user_id],
+      );
+      const preferred = prof.rows[0]?.preferred_agent;
+      if (preferred) {
+        const agent = await this.agents.getAgentByName(preferred);
+        if (agent) return { name: agent.name, systemPrompt: agent.system_prompt };
+        this.logger.warn(
+          `preferred_agent "${preferred}" владельца ${cfg.owner_user_id} не найден в agents — откатываюсь на дефолтного`,
+        );
+      }
+      const fallback = await this.agents.getAgentById(DEFAULT_AGENT_ID);
+      if (fallback) return { name: fallback.name, systemPrompt: fallback.system_prompt };
+    }
+
     if (cfg.preset_agent_id) {
       const preset = await this.agents.getAgentById(cfg.preset_agent_id);
       if (preset) return { name: preset.name, systemPrompt: preset.system_prompt };

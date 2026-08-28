@@ -108,6 +108,14 @@ export class TgGrammyClient implements OnModuleInit {
     return this.bot.api.leaveChat(chatId);
   }
 
+  /**
+   * Ответ на нажатие инлайн-кнопки. Обязателен даже когда показывать нечего:
+   * без него у пользователя крутится «часики» на кнопке до таймаута.
+   */
+  async answerCallbackQuery(callbackQueryId: string, options: any = {}) {
+    return this.bot.api.answerCallbackQuery(callbackQueryId, options);
+  }
+
   async getFile(fileId: string) {
     return this.bot.api.getFile(fileId);
   }
