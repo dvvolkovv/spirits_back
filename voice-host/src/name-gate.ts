@@ -14,6 +14,17 @@ const LISTEN_CMD = /(пока\s+слушай|просто\s+слушай|мол�
 /** «Роман, вопрос к тебе» и синонимы. */
 const RESUME_CMD = /(вопрос\s+к\s+тебе|можешь\s+говорить|возвращайся|подключайся|включайся)/i;
 
+/**
+ * «Это не тебе», «помолчи», «тихо» — просьба замолчать.
+ *
+ * Проверяется РАНЬШЕ обращения по имени и раньше окна продолжения. Иначе
+ * получается замкнутый круг: во фразе «Роман, это не тебе вопрос» есть имя,
+ * гейт считает её обращением и отвечает — то есть попытка остановить
+ * ассистента сама заставляет его говорить. Поймано на живой встрече
+ * 28.08.2026.
+ */
+const STOP_CMD = /(не\s+теб[ея]|не\s+к\s+тебе|помолчи|тише|тихо|замолчи|не\s+вмешивайся|это\s+не\s+твой)/i;
+
 /** Что делать с репликой, которую только что распознали. */
 export type GateDecision =
   /** промолчать */
@@ -66,14 +77,36 @@ export function addressedByName(text: string, name: string): boolean {
 export class NameGate {
   private openUntil = 0;
   private muted = false;
+  /**
+   * Кто открыл окно продолжения.
+   *
+   * Окно нужно, чтобы доспросить «а почему?» не повторяя имя. Но оно должно
+   * действовать только для ТОГО ЖЕ человека: иначе вопрос, заданный одним
+   * участником другому, тоже попадает в окно, и ассистент влезает в чужой
+   * разговор. Ровно это и происходило на живой встрече 28.08.2026.
+   */
+  private windowOwner: string | undefined;
 
   constructor(
     private readonly name: string,
     private readonly windowMs: number,
   ) {}
 
-  decide(text: string, now: number): GateDecision {
+  /**
+   * @param speaker кто говорит, если известно. Без него окно продолжения
+   *   работает как раньше — по времени, без привязки к человеку.
+   */
+  decide(text: string, now: number, speaker?: string): GateDecision {
     const addressed = addressedByName(text, this.name);
+
+    // Просьба замолчать — раньше всего остального.
+    if (STOP_CMD.test(text)) {
+      this.openUntil = 0;
+      this.windowOwner = undefined;
+      // Молча отходим в сторону: подтверждать вслух «хорошо, молчу» — значит
+      // снова заговорить там, где попросили этого не делать.
+      return 'silent';
+    }
 
     if (addressed && LISTEN_CMD.test(text)) {
       this.muted = true;
@@ -91,8 +124,17 @@ export class NameGate {
     }
 
     if (this.muted) return 'silent';
-    if (addressed) return 'respond';
-    return now < this.openUntil ? 'respond' : 'silent';
+    if (addressed) {
+      this.windowOwner = speaker;
+      return 'respond';
+    }
+
+    // Окно продолжения — только для того, кто его открыл. Заговорил другой
+    // участник, и имени в реплике нет — это не к нам.
+    if (now < this.openUntil && (!this.windowOwner || this.windowOwner === speaker)) {
+      return 'respond';
+    }
+    return 'silent';
   }
 
   /** Ассистент закончил реплику — окно продолжения продлевается. */
