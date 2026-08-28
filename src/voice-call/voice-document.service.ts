@@ -6,9 +6,9 @@ import { ChatService } from '../chat/chat.service';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 import { LiveKitClient } from './livekit.client';
 import {
-  CONSULT_CHARS_IN_DOC, DOC_GIST_CHARS, DOC_LEAD_CHARS, DOC_TIMEOUT_MS, DOCS_BUCKET,
-  DOC_TARGET_CHARS, DocumentResult, findSpecialist, HOST_AGENT_ID, MAX_CONSULT_IN_DOC, specialistName,
-  VOICE_ASK_NOTE,
+  AUTHOR_GUESS_WINDOW_MIN, CONSULT_CHARS_IN_DOC, DOC_GIST_CHARS, DOC_LEAD_CHARS, DOC_TIMEOUT_MS,
+  DOCS_BUCKET, DOC_TARGET_CHARS, DocumentResult, findSpecialist, HOST_AGENT_ID, MAX_CONSULT_IN_DOC,
+  specialistName, VOICE_ASK_NOTE,
 } from './voice-call.types';
 
 /**
@@ -156,6 +156,11 @@ export class VoiceDocumentService {
    * На послушание модели тут полагаться нельзя, а случай «спросили коллегу и
    * сделали документ по его ответу» — основной. Итог звонка Роман и так
    * оформляет карточкой, для этого create_document не нужен.
+   *
+   * Но догадка годится ТОЛЬКО по свежему следу — см. AUTHOR_GUESS_WINDOW_MIN.
+   * Звонок короткий и об одном, а встреча идёт до двух часов и о разном:
+   * «последняя консультация» там запросто относится к другой теме, и документ
+   * уезжает человеку, который его не заказывал и не ждёт.
    */
   private async resolveAuthor(callId: string, specialist?: string): Promise<{ agentId: number; author?: string }> {
     const named = specialist && findSpecialist(specialist);
@@ -165,8 +170,10 @@ export class VoiceDocumentService {
       const res = await this.pg.query(
         `SELECT specialist_agent_id FROM voice_call_jobs
          WHERE call_id = $1 AND status = 'done'
-         ORDER BY finished_at DESC NULLS LAST LIMIT 1`,
-        [callId],
+           AND finished_at IS NOT NULL
+           AND finished_at > now() - make_interval(mins => $2)
+         ORDER BY finished_at DESC LIMIT 1`,
+        [callId, AUTHOR_GUESS_WINDOW_MIN],
       );
       const agentId = res.rows[0]?.specialist_agent_id;
       const author = agentId ? specialistName(Number(agentId)) : undefined;

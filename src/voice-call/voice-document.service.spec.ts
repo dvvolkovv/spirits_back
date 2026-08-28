@@ -6,6 +6,19 @@ const docRow = (history: any[]) => history.find((h) => h.sender_type === 'ai' &&
 /** Строки, которых быть не должно, если документ не получился. */
 const docRows = (history: any[]) => history.filter((h) => String(h.content).startsWith('##'));
 
+/**
+ * «Сейчас» для проверок окна свежести. В бою его берёт Postgres из now(),
+ * здесь — фейк, поэтому момент задан явно и от часов машины не зависит.
+ */
+const NOW = Date.UTC(2026, 7, 28, 10, 0, 0);
+
+/** Консультация звонка, законченная столько-то минут назад. */
+const jobDoneMinutesAgo = (agentId: number, minutes: number, extra: Record<string, unknown> = {}) => ({
+  specialist_agent_id: agentId,
+  finished_at: new Date(NOW - minutes * 60_000).toISOString(),
+  ...extra,
+});
+
 function makeLang() {
   return { resolveUserLanguage: jest.fn(async () => 'ru') };
 }
@@ -44,6 +57,17 @@ function makePg(jobRows: any[] = []) {
         return { rows: [], rowCount: 1 };
       }
       if (/FROM voice_call_jobs/i.test(sql)) {
+        // Догадка об авторе спрашивает только СВЕЖИЕ консультации, и фейк обязан
+        // этот отбор повторять. Иначе тест на окно зеленел бы при любом коде:
+        // фейк отдавал бы протухшую строку, сервис брал бы её автором, а тест
+        // радовался бы. Проверено обратным ходом — с прежним запросом падает.
+        if (/make_interval/i.test(sql)) {
+          const windowMs = Number(params[1]) * 60_000;
+          const fresh = jobRows.filter(
+            (r) => r.finished_at != null && NOW - new Date(r.finished_at).getTime() < windowMs,
+          );
+          return { rows: fresh, rowCount: fresh.length };
+        }
         return { rows: jobRows, rowCount: jobRows.length };
       }
       return { rows: [], rowCount: 0 };
@@ -340,7 +364,7 @@ describe('автор определяется сам, если Роман его
     // Роман спросил Шанкару, назвал документ «по рекомендациям Шанкары» — и
     // оформил от себя: параметр specialist он игнорирует. Живой звонок
     // 27.08.2026. На послушание модели тут полагаться нельзя.
-    const pg = makePg([{ specialist_agent_id: 13, question: 'q', answer: 'a' }]);
+    const pg = makePg([jobDoneMinutesAgo(13, 1, { question: 'q', answer: 'a' })]);
     const svc = new VoiceDocumentService(
       pg as any,
       { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'тело', tokens: 5, costUsd: 0 })) } as any,
@@ -369,6 +393,50 @@ describe('автор определяется сам, если Роман его
     await svc.drainForTests();
 
     expect(docRow(pg.history).session_id).toBe('user-1_17');
+  });
+
+  it('давняя консультация автором не считается — пишет ведущий', async () => {
+    // Встреча 28.08.2026: единственной консультацией был вопрос про сервис
+    // Priem.io техническому директору, а через шесть с половиной минут
+    // попросили договор купли-продажи автомобиля. Догадка связала их только по
+    // порядку следования, и договор ушёл в чат к техдиру. Юрист, чья это тема,
+    // о договоре так и не узнал, а владелец не смог добиться ответа на вопрос
+    // «кто его подготовил».
+    const pg = makePg([jobDoneMinutesAgo(19, 7, { question: 'q', answer: 'a' })]);
+    const svc = new VoiceDocumentService(
+      pg as any,
+      { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'тело', tokens: 5, costUsd: 0 })) } as any,
+      { send: jest.fn(async () => {}) } as any,
+      makeStorage() as any,
+      makeLang() as any,
+    );
+
+    svc.create(CALL, ROOM, 'user-1', 'Договор купли-продажи автомобиля', '');
+    await svc.drainForTests();
+
+    expect(docRow(pg.history).session_id).toBe(`user-1_${HOST_AGENT_ID}`);
+  });
+
+  it('свежая консультация выигрывает у протухшей', async () => {
+    // Протухшая строка не должна попадать в выборку вовсе. Иначе LIMIT 1
+    // возвращает её первой и автором становится не тот, с кем только что
+    // говорили.
+    const pg = makePg([
+      jobDoneMinutesAgo(19, 8, { question: 'q1', answer: 'a1' }),
+      jobDoneMinutesAgo(13, 2, { question: 'q2', answer: 'a2' }),
+    ]);
+    const svc = new VoiceDocumentService(
+      pg as any,
+      { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'тело', tokens: 5, costUsd: 0 })) } as any,
+      { send: jest.fn(async () => {}) } as any,
+      makeStorage() as any,
+      makeLang() as any,
+    );
+
+    svc.create(CALL, ROOM, 'user-1', 'Окна запуска', '');
+    await svc.drainForTests();
+
+    expect(docRow(pg.history).session_id).toBe('user-1_13');
   });
 
   it('консультаций не было — пишет ведущий', async () => {
