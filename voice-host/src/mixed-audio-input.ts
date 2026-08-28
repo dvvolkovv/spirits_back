@@ -31,6 +31,9 @@ export class MixedRoomAudioInput extends voice.AudioInput {
   private ticker?: ReturnType<typeof setInterval>;
   private closed = false;
   private push: (frame: AudioFrame) => void = () => {};
+  /** Сколько кадров реально пришло от участников — для диагностики. */
+  private framesIn = 0;
+  private ticks = 0;
 
   constructor(private readonly room: Room) {
     super();
@@ -98,6 +101,13 @@ export class MixedRoomAudioInput extends voice.AudioInput {
     this.ticker = setInterval(() => {
       if (this.closed) return;
       this.push(new AudioFrame(this.mixer.tick(), SAMPLE_RATE, 1, SAMPLES_PER_TICK));
+      // Раз в пять секунд — сколько кадров пришло от людей. Без этой строки
+      // отличить «никто не говорит» от «звук до нас не доходит» невозможно:
+      // и то и другое выглядит как тишина. Три захода подряд я гадал именно
+      // здесь.
+      if (++this.ticks % 250 === 0) {
+        console.log(`[вход] тиков: ${this.ticks}, кадров от участников: ${this.framesIn}`);
+      }
     }, TICK_MS);
 
     // unref обязателен: без него таймер держит event loop, процесс задания не
@@ -120,13 +130,17 @@ export class MixedRoomAudioInput extends voice.AudioInput {
     const key = `${identity}:${track.sid ?? 'no-sid'}`;
     if (this.attached.has(key)) return;
     this.attached.add(key);
+    console.log(`[вход] читаю дорожку ${key}`);
     void (async () => {
       const reader = new AudioStream(track, SAMPLE_RATE, 1).getReader();
       try {
         for (;;) {
           const { done, value } = await reader.read();
           if (done || this.closed) break;
-          if (value) this.mixer.push(identity, value.data);
+          if (value) {
+            this.framesIn++;
+            this.mixer.push(identity, value.data);
+          }
         }
       } catch (e) {
         console.error(`поток участника ${identity} оборвался`, e);

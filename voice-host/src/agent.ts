@@ -476,9 +476,26 @@ export default defineAgent({
 
       if (isMeeting) {
         // Подменяем вход ПОСЛЕ start(): до него сессия ещё не собрала свой
-        // AgentInput, и присвоение потерялось бы молча — ассистент сидел бы
-        // на встрече глухим.
-        session.input.audio = new MixedRoomAudioInput(ctx.room);
+        // AgentInput.
+        const mixed = new MixedRoomAudioInput(ctx.room);
+        session.input.audio = mixed;
+        console.log('[вход] микшер подставлен в сессию');
+
+        // И ПЕРЕПРОВЕРЯЕМ, что он там остался.
+        //
+        // RoomIO присваивает session.input.audio в своём start(), и порядок
+        // относительно нашего присваивания не гарантирован ничем — поле
+        // приватное, штатного способа отдать ему свой вход нет. Если он нас
+        // перебил, возвращаем своё и говорим об этом в лог: молча проигранная
+        // гонка выглядит как «ассистент почему-то глухой».
+        const keepMine = () => {
+          if (session.input.audio !== mixed) {
+            console.log('[вход] RoomIO перебил вход — возвращаю микшер');
+            session.input.audio = mixed;
+          }
+        };
+        setTimeout(keepMine, 500).unref?.();
+        ctx.room.on(RoomEvent.ParticipantConnected, () => keepMine());
       }
 
       // Первую фразу задаём явно, а не отдаём модели на импровизацию.
