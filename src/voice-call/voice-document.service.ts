@@ -123,25 +123,38 @@ export class VoiceDocumentService {
     return (lastBreak > DOC_LEAD_CHARS / 3 ? cut.slice(0, lastBreak + 1) : cut).trim() + '…';
   }
 
-  create(
+  /**
+   * Автора выбираем ДО ответа тулу, а не внутри фоновой задачи.
+   *
+   * Раньше наружу возвращался тот же `specialist`, что пришёл на вход. Роман
+   * имени обычно не передаёт, получал в ответ пустоту и понимал её как «пишу
+   * сам» — а бэкенд в это время отдавал документ по догадке кому-то другому.
+   * Встреча 28.08.2026: договор писал технический директор, Роман был уверен,
+   * что пишет сам, и на прямой вопрос «кто его подготовил» ответить не смог.
+   *
+   * Один индексированный запрос до возврата — не та цена, ради которой стоит
+   * держать ведущего в неведении о собственном документе.
+   */
+  async create(
     callId: string,
     roomName: string,
     userId: string,
     title: string,
     instructions: string,
     specialist?: string,
-  ): DocumentResult {
+  ): Promise<DocumentResult> {
     const clean = (title || '').trim();
     if (!clean) return { status: 'rejected', reason: 'no_title' };
 
     const docId = randomUUID();
+    const { agentId, author } = await this.resolveAuthor(callId, specialist);
 
-    const task = this.run(docId, callId, roomName, userId, clean, instructions, specialist)
+    const task = this.run(docId, callId, roomName, userId, clean, instructions, agentId, author)
       .catch((e) => this.logger.error(`документ ${docId} упал: ${e?.message}`))
       .finally(() => this.inflight.delete(task));
     this.inflight.add(task);
 
-    return { status: 'accepted', docId, title: clean, specialist };
+    return { status: 'accepted', docId, title: clean, specialist: author };
   }
 
   /**
@@ -211,9 +224,8 @@ export class VoiceDocumentService {
   private async run(
     docId: string, callId: string, roomName: string,
     userId: string, title: string, instructions: string,
-    specialist?: string,
+    agentId: number, author?: string,
   ): Promise<void> {
-    const { agentId, author } = await this.resolveAuthor(callId, specialist);
     await this.safeSend(roomName, { v: 1, type: 'document_pending', docId, title, specialist: author });
 
     // Задание — в чат автора СРАЗУ, до того как документ написан.
