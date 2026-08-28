@@ -60,7 +60,7 @@
 - **Backend:** NestJS 10, TypeScript, PostgreSQL 16, Redis, Neo4j (Docker), PM2
 - **Frontend:** React 18, TypeScript, Vite 5, Tailwind CSS, pnpm
 - **Auth:** JWT HS256 (access 2h, refresh 30d), SMS OTP через SMS Aero
-- **AI:** Claude через OAuth (Claude Max subscription, credentials в `~/.claude/.credentials.json` на сервере) — все LLM-консьюмеры (Маша, support, dozvon, tasks-extractor, scan-document, search/compat, neo4j, profile-compaction, Юля, остальные агенты через `r.linkeon.io`). OpenAI/OpenRouter (`gpt-4o-mini`) — fallback в neo4j/profile-compaction. DeepSeek — отдельный канал для бесплатного приветствия. **ANTHROPIC_API_KEY больше не используется** — если случится OAuth-сбой, чинить через `claude auth login` на сервере, не через возврат API-ключа.
+- **AI:** Claude через OAuth (Claude Max subscription, credentials в `~/.claude/.credentials.json` на сервере) — все LLM-консьюмеры (Маша, support, tasks-extractor, scan-document, search/compat, neo4j, profile-compaction, Юля, остальные агенты через `r.linkeon.io`). OpenAI/OpenRouter (`gpt-4o-mini`) — fallback в neo4j/profile-compaction. DeepSeek — отдельный канал для бесплатного приветствия. **ANTHROPIC_API_KEY больше не используется** — если случится OAuth-сбой, чинить через `claude auth login` на сервере, не через возврат API-ключа.
 - **Payments:** YooKassa
 - **Storage:** Локальные файлы (avatars, images) через Nginx /static/
 
@@ -506,185 +506,23 @@ curl -s https://my.linkeon.io/webhook/agents | jq '.[] | select(.name == "<your_
 И через любого другого ассистента в чате спросить «расскажи про <display_name>» — он должен корректно представить новичка.
 
 
-## 📞 Outbound AI calls — общая инфраструктура с Taler ID
+## 📞 Голосовая инфраструктура
 
-my.linkeon.io может использовать готовую инфраструктуру обзвона из Taler ID. Разворачивать свой SIP/LiveKit/агента НЕ нужно — всё shared.
+**Свой LiveKit SFU** работает на прод-хосте как контейнер `livekit-dozvon`
+(исторический номер, поднят 16.04.2026). Конфиг и процедура применения —
+`infra/livekit/`. Переменные бэкенда: `LIVEKIT_URL` (default
+`ws://localhost:7880`), `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`.
 
-### Что даёт shared-инфраструктура
+**Модуль `dozvon` удалён 25.08.2026** — обзвон не работал с апреля, ручка
+приёма записи была без авторизации. Таблицы `dozvon_calls` и
+`dozvon_campaigns` оставлены: 53 исторических звонка, их читает дашборд
+мониторинга.
 
-- **PSTN-звонки в РФ** через SIPNET (номер caller-ID `74951086247`, проходит через Asterisk-proxy на Selectel)
-- **Real-time streaming AI** — Deepgram STT + GPT-4o + ElevenLabs TTS в room LiveKit
-- **Запись MP3** — MeetingSummary + upload через ваш backend
-- **Listen-in** — клиент может подключиться к live-room как слушатель (canSubscribe только)
+**Историческая справка (не актуально, проверено 25.08.2026).** Раньше здесь
+был раздел про общую инфраструктуру обзвона с Taler ID: LiveKit на
+`167.172.181.34`, SIP-транк через Asterisk на Selectel, рекордер на :3100.
+Ничего из этого больше нет — бокс с июля принадлежит постороннему, Asterisk
+демонтирован 22.06.2026. Если встретишь ссылки на эти адреса в старых
+документах или задачах — они мертвы.
 
-Latency end-to-end ~700-1000мс (как у «звонит живой человек»).
-
-### Какие компоненты переиспользуются
-
-| Компонент | Адрес | Описание |
-|-----------|-------|----------|
-| **LiveKit server** | `http://167.172.181.34:7880` (DO Frankfurt) | REST API + WSS для agent/listener |
-| **LiveKit WSS (TLS proxy)** | `wss://id.taler.tirol/livekit-outbound` | для mobile/web клиентов-слушателей |
-| **SIP trunk** | `ST_BpnXtg7BirH6` | outbound через Asterisk@Selectel → SIPNET |
-| **Python agent** | `agent_name="outbound-call-agent"` | livekit-agents worker, ведёт диалог |
-| **Recorder** | `http://167.172.181.34:3100` | `/record` + `/stop-record`, пишет MP3, uploads на ваш backend |
-
-### API ключи (запросить у админа Taler ID)
-
-```env
-LIVEKIT_HOST_OUTBOUND=http://167.172.181.34:7880
-LIVEKIT_API_KEY_OUTBOUND=<ask admin>
-LIVEKIT_API_SECRET_OUTBOUND=<ask admin>
-LIVEKIT_WS_URL_OUTBOUND=wss://id.taler.tirol/livekit-outbound
-SIP_TRUNK_ID=ST_BpnXtg7BirH6
-RECORDER_URL_OUTBOUND=http://167.172.181.34:3100
-OUTBOUND_AGENT_NAME=outbound-call-agent
-OUTBOUND_CALLBACK_SECRET=<свой секрет>
-```
-
-### Минимальный NestJS-сервис (пример)
-
-```typescript
-import { Injectable } from '@nestjs/common';
-import { AgentDispatchClient, SipClient, RoomServiceClient, AccessToken } from 'livekit-server-sdk';
-import { v4 as uuidv4 } from 'uuid';
-
-const LK = process.env.LIVEKIT_HOST_OUTBOUND!;
-const LK_KEY = process.env.LIVEKIT_API_KEY_OUTBOUND!;
-const LK_SEC = process.env.LIVEKIT_API_SECRET_OUTBOUND!;
-const LK_WS = process.env.LIVEKIT_WS_URL_OUTBOUND!;
-const TRUNK = process.env.SIP_TRUNK_ID!;
-const RECORDER = process.env.RECORDER_URL_OUTBOUND!;
-const BACKEND = 'https://my.linkeon.io';  // куда слать callback
-
-@Injectable()
-export class OutboundCallService {
-  private rooms = new RoomServiceClient(LK, LK_KEY, LK_SEC);
-  private dispatcher = new AgentDispatchClient(LK, LK_KEY, LK_SEC);
-  private sip = new SipClient(LK, LK_KEY, LK_SEC);
-
-  async callPhone(opts: {
-    phone: string;        // +7...
-    callId: string;       // ваш ID для трекинга
-    prompt: string;       // промпт агента
-    questions: string[];  // что узнать
-    taskContext?: string;
-  }) {
-    const roomName = `linkeon-${uuidv4()}`;
-    await this.rooms.createRoom({ name: roomName, emptyTimeout: 300, maxParticipants: 5 });
-
-    const metadata = JSON.stringify({
-      businessName: 'Клиент',
-      phoneNumber: opts.phone,
-      questionsToAsk: opts.questions,
-      taskContext: opts.taskContext || '',
-      agentPrompt: opts.prompt,
-      callId: opts.callId,
-      campaignId: opts.callId,                 // agent требует оба поля
-      callbackUrl: `${BACKEND}/webhook/outbound-callback`,
-    });
-
-    await this.dispatcher.createDispatch(roomName, 'outbound-call-agent', { metadata });
-
-    // Non-blocking: SIP может ждать ответа до 90с
-    this.sip.createSipParticipant(TRUNK, opts.phone, roomName, {
-      participantIdentity: `sip-${opts.phone}`,
-      participantName: opts.phone,
-      waitUntilAnswered: true,
-      timeout: 90,
-    }).catch(e => console.warn('sip:', e.message));
-
-    // Start recorder 5s later
-    setTimeout(() => {
-      fetch(`${RECORDER}/record`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomName, withAi: false }),
-      }).catch(() => {});
-    }, 5000);
-
-    return { roomName };
-  }
-
-  async stopRecording(roomName: string) {
-    await fetch(`${RECORDER}/stop-record`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomName }),
-    });
-    // URL появится в вашей MeetingSummary через 30-90с (recorder.js uploads на ${BACKEND}/voice/recordings/upload)
-  }
-
-  // Листенер подключения (отдаётся клиенту, он WSS'ится в room)
-  async generateListenToken(userId: string, roomName: string) {
-    const token = new AccessToken(LK_KEY, LK_SEC, {
-      identity: `listener-${userId}`, name: 'Слушатель',
-    });
-    token.addGrant({ room: roomName, roomJoin: true, canPublish: false, canSubscribe: true });
-    return { token: await token.toJwt(), wsUrl: LK_WS, roomName };
-  }
-
-  async hangup(roomName: string) {
-    try { await this.rooms.deleteRoom(roomName); } catch {}
-  }
-}
-```
-
-### Callback-endpoint на Linkeon
-
-```typescript
-@Controller('webhook')
-export class OutboundCallbackController {
-  @Post('outbound-callback')
-  async callback(
-    @Headers('x-outbound-secret') secret: string,
-    @Body() data: {
-      callId: string; campaignId: string;
-      transcript: any[];           // turnы диалога
-      summary: string;
-      durationSec: number;
-      status: 'completed' | 'failed' | 'no_answer';
-    },
-  ) {
-    if (secret !== process.env.OUTBOUND_CALLBACK_SECRET) throw new UnauthorizedException();
-    // сохранить transcript, обновить свой Call status, выпустить event пользователю
-    return { ok: true };
-  }
-}
-```
-
-**Важно**: agent шлёт `transcript` как **массив** объектов `{role, content}` — сохраняйте как JSON (не spread-ите как объект).
-
-### Recorder upload (опционально)
-
-Recorder на DO после `/stop-record` микширует MP3 и POST-ит на `${BACKEND}/voice/recordings/upload` (multipart). Linkeon нужно реализовать этот endpoint (или указать другой `BACKEND_URL` в env рекордера — для этого надо поднять свой recorder на DO, shared recorder сейчас заточен на Taler backend).
-
-**Проще**: использовать свой recorder — скопировать `~/livekit-ai-agent/` с Taler DO-сервера, поднять на отдельном port (например 3101), задать `BACKEND_URL=https://my.linkeon.io`.
-
-### Стоимость
-
-- **SIPNET**: ~2-3 руб/мин за исходящие по РФ (баланс на общем аккаунте)
-- **OpenAI GPT-4o**: ~$0.5-1 за 5-мин звонок
-- **ElevenLabs**: ~$0.3 за 5-мин звонок
-- **Deepgram**: ~$0.03/мин
-
-**~15-20 руб за 5-минутный звонок**. Нужно вести учёт на стороне Linkeon и списывать токены.
-
-### Ограничения shared setup
-
-- **Один agent_name** `outbound-call-agent` — если нужны разные стили/промпты, передавайте через `metadata.agentPrompt`
-- **SIPNET аккаунт общий** — все звонки имеют caller-ID `+74951086247`
-- **Recording upload** по умолчанию идёт на Taler backend (нужен свой recorder чтобы получать MP3 на Linkeon backend)
-- **Balance пополняет владелец Taler** — договориться о биллинге отдельно
-
-### Что делать НЕ нужно
-
-- ❌ Разворачивать свой LiveKit/SIP/Asterisk/Agent
-- ❌ Регистрироваться в SIPNET отдельно
-- ❌ Платить за серверы DigitalOcean/Selectel
-
-### Что может понадобиться потом
-
-- **Свой caller-ID номер** — отдельный SIP ID в SIPNET + отдельный trunk в Asterisk (5 мин настройки админом Taler)
-- **Свой agent** с другим голосом/промптом по умолчанию — дубль `outbound-call-agent` с новым `agent_name` на DO
-- **Отдельный biling / квоты** — tracking на стороне Linkeon
+Голосовые звонки ассистенту — см. `docs/superpowers/specs/2026-08-25-voice-call-roman-design.md`.

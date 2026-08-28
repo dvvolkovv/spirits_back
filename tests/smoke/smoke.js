@@ -430,8 +430,26 @@ async function step(name, fn) {
   //   - Маша (id=3): её отдельный streamChat-path через Anthropic SDK
   //   - Юля (smm_producer): её путь через ClaudeAgentService с OAuth
   //
-  // Цена: ~$0.05-0.10 за прогон (Anthropic API за всех агентов разом).
   // Время: 1-3 мин в зависимости от r.linkeon.io.
+  //
+  // ЦЕНА. Прежняя оценка «~$0.05-0.10 за прогон» была занижена на два порядка.
+  // Пинги шли в ПОСТОЯННУЮ сессию `70000000000_<agentId>`, релей резюмил её
+  // через `--resume`, и каждый следующий «ответь ок» перечитывал всё, что в ней
+  // накопилось: замерено на транскриптах 25-28.08 — первый ход 38k cacheRead и
+  // $0.26, пятидесятый 353k и $0.66, а при протухшем кэше 300k переписывались
+  // заново и один пинг стоил $5.97. Умножить на 19 агентов и на две фазы
+  // деплоя (test + prod) — и smoke стал самой дорогой статьёй расхода на всём
+  // аккаунте: 58% токенов подписки уходило на номер 70000000000.
+  //
+  // Поэтому пинги идут «чистым листом»: fresh=true + freshTs даёт релею
+  // уникальный sessionId, `--resume` не применяется, накопленный контекст не
+  // перечитывается. Цена хода — холодный старт, ~$0.20 (пол задан обвязкой
+  // Claude Code: системный промпт CLI + определения MCP-тулов, ~47k токенов;
+  // ниже него на Opus не опуститься).
+  //
+  // Что при этом ПЕРЕСТАЁТ проверяться: путь с `--resume` и накопленной
+  // историей. Его намеренно оставляет за собой шаг 8 (Роман, id=12) — он ходит
+  // в постоянную сессию, как настоящий пользователь.
   await step('all assistants respond to ping', async () => {
     if (!jwt) throw new Error('no JWT');
     const agentsResp = await axios.get(`${BASE_URL}/webhook/agents`, { timeout: 10000 });
@@ -445,7 +463,11 @@ async function step(name, fn) {
       try {
         const r = await axios.post(
           `${BASE_URL}/webhook/soulmate/chat`,
-          { message: msg, assistantId: a.id },
+          // freshTs обязан быть ≥6 цифр — иначе контроллер молча проигнорирует
+          // fresh и пинг снова уедет в постоянную сессию (chat.controller.ts).
+          // probe: ход уходит на haiku — проверяется живость пути, не качество
+          // ответа. Флаг признаётся только тестовым аккаунтам.
+          { message: msg, assistantId: a.id, fresh: true, freshTs: Date.now(), probe: true },
           {
             headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
             responseType: 'stream',

@@ -1,5 +1,6 @@
 import { ProfileService } from './profile.service';
 import { IdentityService } from '../identity/identity.service';
+import { BusinessProfileService } from '../business-profile/business-profile.service';
 
 /// Удаление аккаунта должно быть удалением, а не деактивацией.
 ///
@@ -16,10 +17,34 @@ import { IdentityService } from '../identity/identity.service';
 class FakeDb {
   users = new Map<string, any>();
   identities: any[] = [];
+  /** user_id → profile_data. Моделирует ai_profiles_consolidated. */
+  profiles = new Map<string, any>();
 
   async query(sql: string, params: any[] = []) {
     const s = sql.replace(/\s+/g, ' ').trim();
 
+    if (s.startsWith('SELECT profile_data FROM ai_profiles_consolidated')) {
+      const p = this.profiles.get(params[0]);
+      return { rows: p ? [{ profile_data: p }] : [] };
+    }
+    if (s.startsWith("UPDATE ai_profiles_consolidated SET profile_data = '{}'")) {
+      if (this.profiles.has(params[0])) this.profiles.set(params[0], {});
+      return { rows: [] };
+    }
+    // merge(): SET profile_data = jsonb_set(...), updated_at = now() — не
+    // "SET updated_at" первым, порядок колонок в реальном запросе другой.
+    // $1 — уже само содержимое ветки {business}, $2 — user_id.
+    if (s.startsWith('UPDATE ai_profiles_consolidated SET profile_data = jsonb_set(')) {
+      const has = this.profiles.has(params[1]);
+      if (has) {
+        const prev = this.profiles.get(params[1]) || {};
+        this.profiles.set(params[1], { ...prev, business: JSON.parse(params[0]) });
+      }
+      // rowCount обязателен: BusinessProfileService.merge читает res.rowCount,
+      // чтобы понять, задел ли UPDATE существующую строку. Без него merge
+      // решает, что строки нет, и молча не сохраняет карточку.
+      return { rows: [], rowCount: has ? 1 : 0 };
+    }
     if (s.startsWith('DELETE FROM user_identities WHERE user_id')) {
       this.identities = this.identities.filter((i) => i.user_id !== params[0]);
       return { rows: [] };
@@ -167,5 +192,22 @@ describe('удаление аккаунта', () => {
     // Бонус выдаётся заново: баланс удаление обнулило, и аккаунт должен
     // выглядеть новым, а не пустым.
     expect(db.users.get(first.userId).welcome_bonus_at).toBe('now');
+  });
+
+  it('уносит бизнес-карточку — она персональные данные о юрлице', async () => {
+    const userId = 'u-biz-1';
+    db.profiles.set(userId, {});
+    const business = new BusinessProfileService(db as any);
+
+    await business.merge(userId, { what: 'студия маникюра', tax_mode: 'usn_d' }, 'user');
+    // Убеждаемся, что до удаления карточка действительно есть: иначе тест
+    // «после удаления пусто» прошёл бы и на пустой с самого начала базе.
+    expect(await business.read(userId)).toMatchObject({
+      what: { value: 'студия маникюра' },
+    });
+
+    await profile.deleteProfile(userId);
+
+    expect(await business.read(userId)).toEqual({});
   });
 });

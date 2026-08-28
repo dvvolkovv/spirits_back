@@ -135,7 +135,12 @@ export class AuthService {
         params: {
           number: phone,
           text: this.smsText(code, lang),
-          sign: 'SMSAero',
+          // Sender signature. Default 'SMSAero' is the shared demo signature — some carriers
+          // drop or deprioritize it, so part of the OTPs don't arrive (B1). Once a branded
+          // signature is registered+approved in the SMSAERO account, set SMSAERO_SIGN=<approved>
+          // in prod env to switch it on with no code change. Do NOT set it to an unapproved
+          // signature — SMSAERO rejects (400) unregistered signs.
+          sign: process.env.SMSAERO_SIGN || 'SMSAero',
         },
         headers: { Authorization: `Basic ${auth}` },
         timeout: 10000,

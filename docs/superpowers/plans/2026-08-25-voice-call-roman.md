@@ -95,11 +95,15 @@ grep -n "SipClient\|createSipParticipant" src/dozvon/sip.service.ts
 
 - [ ] **Step 2: Убедиться, что на модуль никто не ссылается снаружи**
 
+Проверять надо **импорты**, а не вхождения слова: по слову `dozvon` найдутся комментарии в `admin.controller.ts` и сырой SQL к таблицам `dozvon_calls` / `dozvon_campaigns` в `admin.service.ts:1641` и `monitoring/product/content.service.ts`. Это не зависимости от модуля — таблицы мы оставляем, а запросы к ним обёрнуты в `try/catch` с graceful 0.
+
 Run:
 ```bash
-grep -rn "dozvon" --include="*.ts" src/ | grep -v "^src/dozvon/"
+grep -rnE "from ['\"].*dozvon" --include="*.ts" src/ | grep -v "^src/dozvon/"
 ```
-Expected: только строка импорта и строка в списке `imports` в `src/app.module.ts`. Если найдётся что-то ещё — остановиться и разобраться, не удалять вслепую.
+Expected: ровно одна строка — `src/app.module.ts:20`. Если найдётся что-то ещё — остановиться и разобраться, не удалять вслепую.
+
+Учти, что запись `DozvonModule,` в массиве `imports` (строка ~70) этим grep не ловится — снимать её всё равно надо, см. следующий шаг.
 
 - [ ] **Step 3: Удалить каталог и снять регистрацию модуля**
 
@@ -265,18 +269,59 @@ Create `infra/livekit/README.md`:
     sysctl -w net.core.somaxconn=65535
 ```
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Починить `CLAUDE.md`**
+
+Раздел «📞 Outbound AI calls — общая инфраструктура с Taler ID» (строки ~509–690) неверен целиком и уже один раз увёл расследование не туда: он утверждает «Разворачивать свой SIP/LiveKit/агента НЕ нужно — всё shared» и «❌ Разворачивать свой LiveKit», тогда как свой LiveKit работает с апреля, а shared-инфраструктура мертва.
+
+Заменить весь раздел на короткий, с датой проверки:
+
+```markdown
+## 📞 Голосовая инфраструктура
+
+**Свой LiveKit SFU** работает на прод-хосте как контейнер `livekit-dozvon`
+(исторический номер, поднят 16.04.2026). Конфиг и процедура применения —
+`infra/livekit/`. Переменные бэкенда: `LIVEKIT_URL` (default
+`ws://localhost:7880`), `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`.
+
+**Модуль `dozvon` удалён 25.08.2026** — обзвон не работал с апреля, ручка
+приёма записи была без авторизации. Таблицы `dozvon_calls` и
+`dozvon_campaigns` оставлены: 53 исторических звонка, их читает дашборд
+мониторинга.
+
+**Историческая справка (не актуально, проверено 25.08.2026).** Раньше здесь
+был раздел про общую инфраструктуру обзвона с Taler ID: LiveKit на
+`167.172.181.34`, SIP-транк через Asterisk на Selectel, рекордер на :3100.
+Ничего из этого больше нет — бокс с июля принадлежит постороннему, Asterisk
+демонтирован 22.06.2026. Если встретишь ссылки на эти адреса в старых
+документах или задачах — они мертвы.
+
+Голосовые звонки ассистенту — см. `docs/superpowers/specs/2026-08-25-voice-call-roman-design.md`.
+```
+
+Проверить, что не осталось других мест с тем же мифом:
 
 ```bash
-git add infra/livekit
-git commit -m "infra(livekit): конфиг SFU в git
+grep -n "167.172.181.34\|outbound-call-agent\|ST_BpnXtg7BirH6\|LIVEKIT_HOST_OUTBOUND\|RECORDER_URL_OUTBOUND" CLAUDE.md
+```
+Expected: пусто после правки.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add infra/livekit CLAUDE.md
+git commit -m "infra(livekit): конфиг SFU в git, починить CLAUDE.md
 
 Конфиг существовал в одном экземпляре на прод-машине с апреля, deploy.sh
 его не катает. Добавлены UDP mux (снимает потолок ~2500 комнат на ноду)
-и node_selector cpuload/twochoice, версия образа зафиксирована вместо latest."
+и node_selector cpuload/twochoice, версия образа зафиксирована вместо latest.
+
+Раздел про shared-инфраструктуру Taler ID переписан: он утверждал
+«не разворачивать свой LiveKit» при работающем своём с апреля и описывал
+серверы, которых у нас с июня нет. Этот текст уже один раз увёл
+расследование не туда."
 ```
 
-Применение на прод — отдельно, вручную по README, не в рамках этого коммита.
+Применение конфига на прод — отдельно, вручную по README, не в рамках этого коммита.
 
 ---
 
@@ -331,12 +376,18 @@ CREATE INDEX IF NOT EXISTS voice_call_jobs_call_status_idx
 
 - [ ] **Step 2: Проверить синтаксис на тест-ноде**
 
+Переменной `TEST_DATABASE_URL` на ноде нет. Реквизиты — в `.env` живого чекаута тестового стенда; читать оттуда можно, но **ветку в `~/spirits_back` не переключать**, это работающий стенд `test.linkeon.io`. База — `linkeon`, PostgreSQL 16.14.
+
 Run:
 ```bash
 scp src/voice-call/migrations/001_voice_calls.sql dv@85.192.61.231:/tmp/
-ssh dv@85.192.61.231 'psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f /tmp/001_voice_calls.sql && psql "$TEST_DATABASE_URL" -c "\d voice_calls"'
+ssh dv@85.192.61.231 'set -a; . ~/spirits_back/.env; set +a; \
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /tmp/001_voice_calls.sql && \
+  psql "$DATABASE_URL" -c "\d voice_calls" && psql "$DATABASE_URL" -c "\d voice_call_jobs"'
 ```
-Expected: `CREATE TABLE` без ошибок, `\d` показывает 13 колонок.
+Expected: `CREATE TABLE` без ошибок, `\d voice_calls` показывает 13 колонок, `\d voice_call_jobs` — 9.
+
+Миграция идемпотентна (`IF NOT EXISTS`), повторный прогон безопасен. **На прод сейчас не накатывать** — это шаг задачи 14.
 
 - [ ] **Step 3: Commit**
 
@@ -1203,7 +1254,7 @@ Expected: FAIL — модуль не найден.
 Create `src/voice-call/voice-call-internal.controller.ts`:
 
 ```typescript
-import { Body, Controller, Headers, Logger, Post, Req, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, Controller, Headers, Logger, Post, Req, UnauthorizedException } from '@nestjs/common';
 import { Request } from 'express';
 import { SpecialistJobService } from './specialist-job.service';
 import { VoiceCallService } from './voice-call.service';
@@ -1226,10 +1277,20 @@ export class VoiceCallInternalController {
     private readonly calls: VoiceCallService,
   ) {}
 
-  private assertSigned(signature: string, req: Request): void {
-    const raw = (req as any).rawBody?.toString('utf8') ?? JSON.stringify((req as any).body ?? {});
-    if (!verifyBody(process.env.VOICE_CALLBACK_SECRET as string, raw, signature)) {
+  /**
+   * Тело здесь — Buffer, а не разобранный объект: на этот путь в main.ts
+   * навешен сырой парсер. Проверяем подпись по байтам и разбираем сами.
+   */
+  private parseSigned<T>(req: Request, signature: string): T {
+    const raw: Buffer | string = (req as any).body;
+    const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw ?? '');
+    if (!verifyBody(process.env.VOICE_CALLBACK_SECRET as string, text, signature)) {
       throw new UnauthorizedException('bad signature');
+    }
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new BadRequestException('malformed json');
     }
   }
 
@@ -1237,9 +1298,8 @@ export class VoiceCallInternalController {
   async ask(
     @Headers('x-voice-signature') signature: string,
     @Req() req: Request,
-    @Body() body: { callId: string; specialist: string; question: string },
   ): Promise<AskResult> {
-    this.assertSigned(signature, req);
+    const body = this.parseSigned<{ callId: string; specialist: string; question: string }>(req, signature);
     const call = await this.calls.load(body.callId);
     return this.jobs.ask(body.callId, call.room_name, call.user_id, body.specialist, body.question);
   }
@@ -1248,9 +1308,8 @@ export class VoiceCallInternalController {
   async complete(
     @Headers('x-voice-signature') signature: string,
     @Req() req: Request,
-    @Body() body: { callId: string } & CompletePayload,
   ) {
-    this.assertSigned(signature, req);
+    const body = this.parseSigned<{ callId: string } & CompletePayload>(req, signature);
     await this.calls.complete(body.callId, { transcript: body.transcript, usage: body.usage });
     return { ok: true };
   }
@@ -1259,9 +1318,8 @@ export class VoiceCallInternalController {
   async failed(
     @Headers('x-voice-signature') signature: string,
     @Req() req: Request,
-    @Body() body: { callId: string; reason: string },
   ) {
-    this.assertSigned(signature, req);
+    const body = this.parseSigned<{ callId: string; reason: string }>(req, signature);
     await this.calls.fail(body.callId, body.reason);
     return { ok: true };
   }
@@ -1348,10 +1406,16 @@ export class VoiceCallModule implements OnModuleInit {
 
 - [ ] **Step 6: Включить сырое тело запроса и зарегистрировать модуль**
 
-В `src/main.ts` при создании приложения добавить `rawBody: true`, чтобы HMAC считался по тем самым байтам, что пришли:
+`rawBody: true` здесь **не сработает**: приложение создаётся как `NestFactory.create(AppModule, { bodyParser: false })`, парсеры навешиваются вручную, и опция Nest на них не влияет.
+
+В проекте уже есть решение ровно этой задачи — коллбэк «Приёма» ([main.ts:16](../../src/main.ts#L16), [priem.controller.ts:91](../../src/payments/priem.controller.ts#L91)). Повторяем его.
+
+В `src/main.ts`, рядом со строкой про `/webhook/priem/callback` и **обязательно до** глобального `bodyParser.json`:
 
 ```typescript
-const app = await NestFactory.create(AppModule, { rawBody: true });
+  // Внутренние ручки голосового звонка — сырым телом, как и коллбэк «Приёма»:
+  // HMAC считается по пришедшим байтам, пересобранный JSON подпись не пройдёт.
+  app.use('/webhook/voice-call/internal', bodyParser.raw({ type: '*/*', limit: '1mb' }));
 ```
 
 В `src/app.module.ts` добавить импорт и запись в `imports`:
@@ -2168,26 +2232,33 @@ VOICE_AGENT_NAME=linkeon-voice-host
 
 Ключ `voicecall*` добавить в секцию `keys:` файла `~/livekit-dozvon/livekit.yaml` и перезапустить контейнер по процедуре из `infra/livekit/README.md`.
 
-- [ ] **Step 2: Проброс WSS через nginx**
+- [x] **Step 2: Проброс WSS через nginx — НЕ ТРЕБУЕТСЯ**
 
-Браузер не ходит на `ws://localhost:7880` — нужен TLS-вход. В конфиг nginx прода (единый файл `spirits`, **не** класть бэкап рядом в `sites-enabled` — `nginx -t` упадёт на duplicate default server) добавить:
+Проверено 25.08.2026: в конфиге `spirits` уже есть рабочий проброс, заведённый
+когда-то под dozvon и переживший удаление модуля:
 
 ```nginx
-location /livekit {
-    proxy_pass http://127.0.0.1:7880;
+location /livekit-dozvon/ {
+    proxy_pass http://127.0.0.1:7880/;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host;
-    proxy_read_timeout 3700s;
+    proxy_read_timeout 86400;
 }
 ```
 
-Run:
-```bash
-ssh dvolkov@212.113.106.202 'sudo nginx -t && sudo systemctl reload nginx'
-```
-Expected: `syntax is ok`, `test is successful`.
+Снаружи отвечает: `https://my.linkeon.io/livekit-dozvon/` → `200 OK`,
+`/livekit-dozvon/rtc/validate` → `401` (LiveKit требует токен — значит проброс
+доходит до него). `proxy_read_timeout 86400` с большим запасом на часовой звонок.
+
+Поэтому nginx не трогаем вообще, а в `.env` ставим существующий путь:
+`LIVEKIT_WS_URL=wss://my.linkeon.io/livekit-dozvon`. Имя пути историческое и
+к удалённому модулю отношения больше не имеет — переименование потребовало бы
+правки прод-nginx ради косметики.
+
+**Файрвол:** `ufw` неактивен, DROP-правил по UDP в iptables нет — медиа-диапазон
+50000–60000 не заблокирован. Отсутствие слушающих UDP-сокетов в простое нормально:
+в режиме port-range LiveKit выделяет порт под соединение.
 
 - [ ] **Step 3: Добавить воркер в деплой**
 

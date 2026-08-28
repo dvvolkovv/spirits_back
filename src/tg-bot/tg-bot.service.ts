@@ -637,6 +637,10 @@ export class TgBotService implements OnModuleInit {
       this.logger.log(
         `tg-bot billing: config=${cfg.id} cost=$${totalCostUsd.toFixed(5)} deducted=${tokensCharged} balance=${newBalance}`,
       );
+      // Аномально дорогой ход. Агентные ходы (договор, финмодель) доходили до
+      // 65k токенов ещё на Sonnet и проходили молча — теперь модель как в вебе,
+      // и такие выбросы должны быть видны нам сразу, а не из жалобы владельца.
+      await this.billing.alertIfExpensiveTurn(cfg, totalCostUsd, tokensCharged, newBalance);
       // При успешном списании > 0 — сбрасываем flag, чтобы при следующем падении в 0 снова срабатывало однократное сообщение
       if (newBalance > 0) {
         await this.billing.clearZeroBalanceFlag(cfg.id);

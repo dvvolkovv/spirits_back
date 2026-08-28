@@ -283,6 +283,15 @@ const TALERID_PROMPT = `
 
 app.post("/chat", upload.array("files", 10), (req, res) => {
   const { message, sessionId: reqSessionId } = req.body;
+  // Модель хода. По умолчанию "default" (рекомендуемая CLI — сейчас Opus 5).
+  // Бэкенд просит "haiku" для пингов мониторинга: smoke и synthetic-runner
+  // проверяют живость пути, а не качество ответа, а обвязка Claude Code
+  // (системный промпт + определения MCP-тулов, ~47k токенов) грузится на
+  // каждый вызов независимо от содержания хода. Один «ответь ок» на Opus
+  // стоил ~$0.20 против ~$0.02 на haiku, а таких пингов ~150 в сутки.
+  // Белый список обязателен: значение уезжает в argv, телу запроса веры нет.
+  const MODELS = ["default", "haiku", "sonnet", "opus"];
+  const reqModel = MODELS.includes(String(req.body.model || "")) ? String(req.body.model) : "default";
   if (!message) return res.status(400).json({ error: "message is required" });
 
   const sessionId = reqSessionId || randomUUID();
@@ -412,7 +421,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
 
   const args = [
     "--print",
-    "--model", "default",
+    "--model", reqModel,
     "--output-format", "stream-json",
     "--verbose",
     "--include-partial-messages",

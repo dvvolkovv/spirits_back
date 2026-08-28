@@ -121,9 +121,18 @@ push_local_repo() {
     return
   fi
   cd "$dir"
-  if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+  # Проверка чистоты нужна для КОДА: серверы встают на origin/main жёстко, и
+  # незакоммиченная правка просто не поедет — про это и предупреждение.
+  #
+  # docs/ из неё исключены: туда ничего не выкатывается вообще. Репозиторий
+  # общий и параллельные сессии пишут в docs/ свои спеки прямо во время
+  # работы; из-за чужого черновика деплой вставал, а вычищать его — значит
+  # рвать чужой текст из-под работающей сессии (27.08.2026).
+  local dirty
+  dirty="$(git status --porcelain 2>/dev/null | grep -vE '^.. docs/' || true)"
+  if [[ -n "$dirty" ]]; then
     red "  $name: uncommitted local changes — commit them before deploy"
-    git status -sb | head -10
+    echo "$dirty" | head -10
     exit 1
   fi
   # Отказ push — ОСТАНОВКА, а не предупреждение.
@@ -187,6 +196,26 @@ rollback_backend() {
       npm ci --no-audit --no-fund 2>&1 | tail -3
       npm run build 2>&1 | tail -3
       pm2 restart linkeon-smm-worker 2>&1 | tail -2
+      cd ..
+    fi
+    # Голосовой воркер: свой package.json и своя сборка, как у SMM-воркера.
+    # Без этого блока правки voice-host/* не доезжают до живого процесса.
+    # Статус проверяем явно, а не через '| tail': в этом блоке действует
+    # set -e БЕЗ pipefail, поэтому статус берётся от tail и всегда нулевой —
+    # падение сборки проглатывается молча. Первый прогон 25.08.2026 так и
+    # прошёл «зелёным» с несобравшимся воркером.
+    # Пропускаем там, где нет LiveKit: на тест-стенде SFU не развёрнут вовсе
+    # (ни контейнера, ни порта 7880, ни ключей в .env), и поднятый воркер
+    # уходит в бесконечный цикл падений. Признак настроенности — свой .env
+    # подпроекта: он создаётся руками вместе с ключами LiveKit.
+    if [ -d voice-host ] && [ -f voice-host/.env ]; then
+      cd voice-host
+      npm ci --no-audit --no-fund > /tmp/vh-install.log 2>&1 \
+        || { tail -20 /tmp/vh-install.log; echo 'voice-host: npm ci FAILED'; exit 1; }
+      npm run build > /tmp/vh-build.log 2>&1 \
+        || { tail -20 /tmp/vh-build.log; echo 'voice-host: build FAILED'; exit 1; }
+      pm2 startOrReload ecosystem.config.cjs > /tmp/vh-pm2.log 2>&1 \
+        || { tail -20 /tmp/vh-pm2.log; echo 'voice-host: pm2 startOrReload FAILED'; exit 1; }
       cd ..
     fi
   " && green "  ↩ backend rolled back ($ENV_NAME)" \
@@ -263,9 +292,9 @@ warm_chat_path() {
   tok=$(curl -s ${ca[@]+${ca[@]+"${ca[@]}"}} -m 15 "$base/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/$phone/$code" \
         | sed -n 's/.*"access-token":"\([^"]*\)".*/\1/p')
   [[ -z "$tok" ]] && return 0
-  # Прогрев browser-критичных эндпоинтов: ChatInterface не отрендерит кнопку
-  # reopen-match (smoke 97/126), пока холодные agents/profile не ответят — на
-  # холодном старте это >20с и валит browser-тесты. Будим их заранее.
+  # Прогрев browser-критичных эндпоинтов: ChatInterface не отрендерит шапку
+  # чата (переключатель ассистента), пока холодные agents/profile не ответят —
+  # на холодном старте это >20с и валит browser-тесты. Будим их заранее.
   curl -s ${ca[@]+"${ca[@]}"} -m 20 "$base/webhook/agents" >/dev/null 2>&1 || true
   curl -s ${ca[@]+"${ca[@]}"} -m 20 "$base/webhook/profile" -H "Authorization: Bearer $tok" >/dev/null 2>&1 || true
   # 1-й чат будит r.linkeon (может быть медленным), 2-й уже тёплый и точно сохранится
@@ -300,6 +329,33 @@ warm_chat_path() {
 #
 # Если эндпоинта нет (бэкенд старее этой правки) — не блокируем деплой, иначе
 # первый же выкат самой правки стал бы невозможен.
+# Голосовые звонки — та же логика, что и для чат-стримов, но своя причина:
+# рестарт linkeon-api рвёт мост job'ов (ask → Claude → data-сообщение в комнату),
+# и ответ специалиста не приходит молча. Плюс воркер voice-host держит живую
+# Realtime-сессию, которая тарифицируется.
+#
+# Окно короче, чем у стримов: наш собственный потолок звонка — час, а реапер
+# добивает зависшие через 70 минут.
+wait_for_calls_drain() {
+  local max_wait="${CALL_DRAIN_SECONDS:-900}"
+  local step=15
+  local waited=0
+  local n
+  while (( waited < max_wait )); do
+    n=$(curl -s --max-time 10 ${BASIC_AUTH:+-u "$BASIC_AUTH"} \
+          "${BASE_URL}/webhook/voice-call-status/active" \
+        | sed -n 's/.*"active"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+    # Эндпоинта нет (бэкенд старее этой правки) — не блокируем первый же выкат.
+    if [[ -z "$n" ]]; then return 0; fi
+    if [[ "$n" == "0" ]]; then return 0; fi
+    bold "  ⏳ $ENV_NAME: голосовых звонков в эфире $n — жду (${waited}/${max_wait}s)"
+    sleep $step
+    waited=$((waited + step))
+  done
+  red "  ⚠ $ENV_NAME: звонки не завершились за ${max_wait}с — иду дальше"
+  return 0
+}
+
 wait_for_streams_drain() {
   local max_wait="${STREAM_DRAIN_SECONDS:-1800}"
   local step=15
@@ -336,6 +392,7 @@ deploy_backend() {
   else
     bold "[back 1.5/3] ожидание завершения живых чат-ходов ($ENV_NAME)"
     wait_for_streams_drain || exit 1
+    wait_for_calls_drain || exit 1
   fi
 
   bold "[back 2/3] pulling on $ENV_NAME + building + restarting"
@@ -355,6 +412,28 @@ deploy_backend() {
       npm run build 2>&1 | tail -3
       pm2 restart linkeon-smm-worker 2>&1 | tail -2
       cd ..
+    fi
+    # Голосовой воркер: свой package.json и своя сборка, как у SMM-воркера.
+    # Без этого блока правки voice-host/* не доезжают до живого процесса.
+    # Статус проверяем явно, а не через '| tail': в этом блоке действует
+    # set -e БЕЗ pipefail, поэтому статус берётся от tail и всегда нулевой —
+    # падение сборки проглатывается молча. Первый прогон 25.08.2026 так и
+    # прошёл «зелёным» с несобравшимся воркером.
+    # Пропускаем там, где нет LiveKit: на тест-стенде SFU не развёрнут вовсе
+    # (ни контейнера, ни порта 7880, ни ключей в .env), и поднятый воркер
+    # уходит в бесконечный цикл падений. Признак настроенности — свой .env
+    # подпроекта: он создаётся руками вместе с ключами LiveKit.
+    if [ -d voice-host ] && [ -f voice-host/.env ]; then
+      cd voice-host
+      npm ci --no-audit --no-fund > /tmp/vh-install.log 2>&1 \
+        || { tail -20 /tmp/vh-install.log; echo 'voice-host: npm ci FAILED'; exit 1; }
+      npm run build > /tmp/vh-build.log 2>&1 \
+        || { tail -20 /tmp/vh-build.log; echo 'voice-host: build FAILED'; exit 1; }
+      pm2 startOrReload ecosystem.config.cjs > /tmp/vh-pm2.log 2>&1 \
+        || { tail -20 /tmp/vh-pm2.log; echo 'voice-host: pm2 startOrReload FAILED'; exit 1; }
+      cd ..
+    elif [ -d voice-host ]; then
+      echo 'voice-host: .env отсутствует — LiveKit не настроен, воркер пропущен'
     fi
   " || { red "  backend deploy failed ($ENV_NAME)"; exit 1; }
 

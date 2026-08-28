@@ -1,0 +1,564 @@
+import 'dotenv/config';
+import { fileURLToPath } from 'node:url';
+import {
+  cli,
+  defineAgent,
+  llm,
+  voice,
+  AgentSessionEventTypes,
+  ServerOptions,
+  type JobContext,
+  type AgentStateChangedEvent,
+  type ConversationItemAddedEvent,
+  type MetricsCollectedEvent,
+} from '@livekit/agents';
+import * as openai from '@livekit/agents-plugin-openai';
+import { RoomEvent } from '@livekit/rtc-node';
+import { z } from 'zod';
+import { backend, type TranscriptEntry } from './backend.js';
+import { PendingAnswers } from './pending.js';
+import { NameGate } from './name-gate.js';
+import { Occupancy } from './occupancy.js';
+import { MixedRoomAudioInput } from './mixed-audio-input.js';
+import {
+  callInstructions,
+  callIntro,
+  listenAck,
+  meetingInstructions,
+  meetingIntro,
+  resumeAck,
+} from './prompts.js';
+
+const TOPIC = 'linkeon';
+
+/**
+ * Реплики, которые мы сами вставляем через session.generateReply({ userInput })
+ * (ответ специалиста, извинение, предупреждение о конце звонка), попадают в
+ * chatCtx с role:'user' — так работает generateReply: он заводит синтетическое
+ * user-сообщение, чтобы модель на него среагировала. Это не то, что реально
+ * сказал пользователь, поэтому такие строки помечаем префиксом и вырезаем из
+ * транскрипта, который улетает в /internal/complete — иначе в резюме звонка
+ * будет «Пользователь: [Внутреннее сообщение от коллеги Алексея]: …».
+ * Ответ Романа, произнесённый в реакции на них, — обычная assistant-реплика
+ * и в транскрипте остаётся как есть.
+ */
+const INTERNAL_PREFIX = '[Внутреннее сообщение';
+
+/** Сколько после своей реплики ассистент отвечает без повторного зова. */
+const FOLLOWUP_WINDOW_MS = 30_000;
+
+export default defineAgent({
+  entry: async (ctx: JobContext) => {
+    const meta = JSON.parse(ctx.job.metadata || '{}') as {
+      callId: string;
+      userId: string;
+      preamble: string;
+      specialists: { name: string; role: string }[];
+      // Ниже — только для режима встречи. У звонка их нет, и всё поведение
+      // остаётся ровно таким, каким было.
+      mode?: 'call' | 'meeting';
+      agentName?: string;
+      agentPersona?: string;
+      agentVoice?: string;
+      ownerName?: string;
+    };
+    const isMeeting = meta.mode === 'meeting';
+    const agentName = meta.agentName || 'Роман';
+
+    /**
+     * Встреча идёт на mini, звонок остаётся на флагмане.
+     *
+     * Отдельная переменная, а не общая VOICE_MODEL: у звонка разговор один на
+     * один и качество ответа видно сразу, а встреча длится вдвое дольше и почти
+     * вся состоит из молчаливого прослушивания. Решение владельца 27.08.2026,
+     * mini в 3.2 раза дешевле по обеим ставкам.
+     */
+    const model = isMeeting
+      ? process.env.VOICE_MEETING_MODEL || 'gpt-realtime-2.1-mini'
+      : process.env.VOICE_MODEL || 'gpt-realtime-2.1';
+
+    const pending = new PendingAnswers();
+    const transcript: TranscriptEntry[] = [];
+    let audioIn = 0;
+    let audioOut = 0;
+
+    /** Кто из участников говорит сейчас. Только на встрече. */
+    let currentSpeaker: string | undefined;
+
+    const gate = isMeeting ? new NameGate(agentName, FOLLOWUP_WINDOW_MS) : null;
+    const occupancy = isMeeting ? new Occupancy(Date.now()) : null;
+
+    await ctx.connect();
+
+    if (isMeeting) {
+      // Имя в списке участников. Без него люди видят `agent-AJ_xxx` и не
+      // понимают, кто к ним зашёл, — заметил владелец на живой встрече
+      // 28.08.2026. Гостям имя выдаётся в токене, а ассистент подключается
+      // через dispatch, где identity назначает фреймворк.
+      try {
+        await ctx.room.localParticipant?.updateName(
+          `${agentName} · ассистент ${meta.ownerName || 'пользователя'}`,
+        );
+      } catch (e) {
+        // Не повод рушить встречу: без имени неудобно, но разговор возможен.
+        console.error('не удалось выставить имя ассистента', e);
+      }
+    }
+
+    const session = new voice.AgentSession({
+      llm: new openai.realtime.RealtimeModel({
+        model,
+        // Голоса Realtime — канонический список отдаёт сам API, если послать
+        // неверное значение: alloy, ash, ballad, coral, echo, sage, shimmer,
+        // verse, marin, cedar.
+        //
+        // Выбран НА СЛУХ, и это принципиально. Сначала стоял alloy как
+        // «нейтральный дефолт» — он женский, хотя Роман мужчина и в каталоге
+        // голосов проекта (src/speech/voices.ts) ему назначены мужские
+        // zahar/onyx. Потом я заменил его на marin, рассудив по поколению
+        // модели, и снова не послушал: marin тоже женский.
+        //
+        // Так что голос определяется ушами, а не описанием. Сэмплер, которым
+        // сравнивались кандидаты, — в истории сессии 26.08.2026: короткая
+        // Realtime-сессия на каждый голос, одна фраза, WAV в MinIO.
+        //
+        // На встрече голос свой у каждого ассистента — берём из agents.
+        // Проверить, что выбранный голос вообще есть у mini: набор голосов у
+        // моделей может отличаться, а сравнение шло на флагмане.
+        voice: meta.agentVoice || process.env.VOICE_NAME || 'cedar',
+        // Шумоподавление на входе. По умолчанию НЕ включено, и без него в
+        // детектор речи попадает всё подряд: кашель, щелчки клавиш, чужой
+        // голос в комнате. near_field — микрофон рядом с говорящим (гарнитура,
+        // ноутбук, телефон), это случай звонка; far_field — конференц-микрофон
+        // посреди переговорной, это случай встречи.
+        inputAudioNoiseReduction: { type: isMeeting ? 'far_field' : 'near_field' },
+        // Язык распознавания задаём ЯВНО, и это не мелочь.
+        //
+        // Без него модель угадывает язык на каждой реплике и промахивается: в
+        // транскрипте живой встречи 28.08.2026 оказались турецкий
+        // («Yoksa konuşalım»), польский («Połączysz szkoły mieszane») и
+        // болгарский — вперемешку с русским. Имя ассистента при этом
+        // превращалось в «Норман», «Raman» и «Нормальный», и гейт по имени,
+        // который сверяет текст, переставал срабатывать вовсе.
+        //
+        // keywords смещает распознавание к нужным словам — кладём туда имя
+        // ведущего и имена коллег, к которым он обращается вслух. Это ровно
+        // те слова, на которых цена ошибки максимальна.
+        ...(isMeeting
+          ? {
+              inputAudioTranscription: {
+                model: process.env.VOICE_TRANSCRIBE_MODEL || 'gpt-4o-transcribe',
+                language: 'ru',
+                keywords: [agentName, ...meta.specialists.map((x) => x.name)].slice(0, 100),
+              },
+            }
+          : {}),
+        // Порог и тишина подняты против дефолтных 0.5 и 500 мс: короткий
+        // посторонний звук не должен считаться началом реплики, а пауза в
+        // середине фразы — её концом.
+        turnDetection: {
+          type: 'server_vad',
+          threshold: 0.65,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 900,
+          // На встрече модель не начинает ответ сама — решает гейт по имени.
+          // Разметка реплик при этом сохраняется, мы её и слушаем.
+          ...(isMeeting ? { create_response: false } : {}),
+        },
+      }),
+      // Перебить Романа теперь стоит дороже.
+      //
+      // Дефолты SDK: minDuration 500 мс, minWords 0 — то есть ЛЮБЫЕ полсекунды
+      // звуковой энергии обрывают его на полуслове, распознанных слов при этом
+      // не требуется вовсе. На живом звонке 26.08.2026 это выглядело как
+      // «реагирует на каждый чих и прерывается».
+      //
+      // minWords: 2 — нужно хотя бы два разобранных слова. Кашель и щелчок так
+      // не проходят, а осмысленная реплика проходит. Если окажется, что
+      // перебить стало трудно, снижать надо именно этот параметр, а не
+      // выключать шумоподавление.
+      turnHandling: {
+        interruption: { minDuration: 800, minWords: 2 },
+      },
+    });
+
+    /** Отдать накопленное, если Роман свободен. Всё сразу, одной репликой. */
+    function flushPending(): void {
+      const merged = pending.take();
+      if (merged) session.generateReply({ userInput: merged });
+    }
+
+    /** Поставить реплику в очередь и попробовать произнести. */
+    function pushLine(line: string): void {
+      pending.push(line);
+      flushPending();
+    }
+
+    const tools = {
+      ask_specialist: llm.tool({
+        description:
+          'Поставить вопрос профильному специалисту. Возвращается сразу, БЕЗ ответа. ' +
+          'Ответ придёт позже, и ты озвучишь его сам.',
+        parameters: z.object({
+          specialist: z.string().describe('Имя специалиста'),
+          question: z.string().describe('Вопрос целиком, со всем нужным контекстом'),
+        }),
+        execute: async ({ specialist, question }) => {
+          try {
+            const r = await backend.ask(meta.callId, specialist, question);
+            return r.status === 'asked'
+              ? { status: 'asked', specialist }
+              : { status: 'rejected', reason: r.reason };
+          } catch (e) {
+            // Модели нужен внятный ответ, а не исключение: иначе она либо
+            // замолчит, либо начнёт извиняться непонятно за что.
+            console.error('ask_specialist failed', e);
+            return { status: 'rejected', reason: 'backend_unavailable', specialist };
+          }
+        },
+      }),
+      list_specialists: llm.tool({
+        description: 'Список доступных специалистов.',
+        execute: async () => ({ specialists: meta.specialists }),
+      }),
+      create_document: llm.tool({
+        description:
+          'Составить документ и положить его в чат с пользователем. Возвращается сразу, ' +
+          'БЕЗ текста документа — он появится в чате сам. Используй, когда просят ' +
+          '«сделай документ», «набросай письмо», «оформи план», «запиши договорённости».',
+        parameters: z.object({
+          title: z.string().describe('Короткий заголовок документа'),
+          instructions: z.string().describe(
+            'Что должно быть в документе: суть, для кого, все обсуждённые детали. ' +
+            'Пиши подробно — тот, кто будет писать текст, разговора не слышал.',
+          ),
+          specialist: z.string().optional().describe(
+            'Имя специалиста, если документ по его части — он его и напишет, и ' +
+            'документ ляжет в чат с ним. Не указывай, если пишешь сам.',
+          ),
+        }),
+        execute: async ({ title, instructions, specialist }) => {
+          try {
+            const r = await backend.document(meta.callId, title, instructions, specialist);
+            return r.status === 'accepted'
+              ? { status: 'accepted', title, author: r.specialist || 'ты сам' }
+              : { status: 'rejected', reason: r.reason };
+          } catch (e) {
+            console.error('create_document failed', e);
+            return { status: 'rejected', reason: 'backend_unavailable', title };
+          }
+        },
+      }),
+    };
+    // Тулов три. create_document был в первой редакции спеки как save_note, я
+    // его снял, решив, что он дублирует резюме звонка, — и на живом звонке
+    // 26.08.2026 владелец попросил документ, а Роману оказалось некуда его
+    // положить. Резюме это про что говорили; документ — результат работы.
+
+    // Ответы специалистов приходят из бэкенда через data-канал комнаты.
+    ctx.room.on(RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
+      if (topic !== TOPIC) return;
+      let msg: any;
+      try {
+        msg = JSON.parse(new TextDecoder().decode(payload));
+      } catch {
+        return;
+      }
+      if (msg?.v !== 1) return; // контракт версионирован — чужую версию не трогаем
+
+      if (msg.type === 'document_ready') {
+        // Роман должен узнать, что документ готов, ГДЕ он лежит и что в нём.
+        // Иначе он говорил «готовится» и умолкал навсегда: событие про
+        // документ в этом обработчике не разбиралось вовсе, а текст ему не
+        // отдавался. Живой звонок 26.08.2026.
+        const where = msg.specialist ? `в чат с ${msg.specialist}` : 'в чат с тобой';
+        pushLine(
+          `${INTERNAL_PREFIX}: документ «${msg.title}» готов и положен ${where}. ` +
+          `Скажи об этом вслух и коротко перескажи суть. Начало текста: ${msg.text || ''}]`,
+        );
+        return;
+      }
+      if (msg.type === 'document_failed') {
+        pushLine(`${INTERNAL_PREFIX}: документ «${msg.title}» не получился (${msg.reason}). Извинись.]`);
+        return;
+      }
+      if (msg.type === 'specialist_answer') {
+        pushLine(`${INTERNAL_PREFIX} от коллеги ${msg.specialist}]: ${msg.text}`);
+      } else if (msg.type === 'specialist_failed') {
+        pushLine(
+          `${INTERNAL_PREFIX}: ${msg.specialist} не ответил (${msg.reason}). Извинись и ответь сам.]`,
+        );
+      }
+      // specialist_pending предназначен фронту — игнорируем.
+    });
+
+    // Свободен — это именно 'listening'/'idle'. Раньше здесь стояло
+    // `newState !== 'speaking'`, и состояние 'thinking' (между запросом ответа
+    // и началом речи) считалось свободным: вторая вставка уходила в модель,
+    // пока первая ещё генерировалась, и API отбивал её как
+    // conversation_already_has_active_response.
+    session.on(AgentSessionEventTypes.AgentStateChanged, (ev: AgentStateChangedEvent) => {
+      const free = ev.newState === 'listening' || ev.newState === 'idle';
+      pending.setBusy(!free);
+      if (free) flushPending();
+    });
+
+    session.on(AgentSessionEventTypes.ConversationItemAdded, (ev: ConversationItemAddedEvent) => {
+      if (ev.item.type !== 'message') return; // пропускаем agent_handoff-записи
+      const { role, textContent } = ev.item;
+      if (!textContent) return;
+      const normalizedRole: 'user' | 'assistant' = role === 'user' ? 'user' : 'assistant';
+      // Наши синтетические generateReply()-вставки заводятся с role:'user' —
+      // это не реплики пользователя, в транскрипт звонка их не пускаем.
+      if (normalizedRole === 'user' && textContent.startsWith(INTERNAL_PREFIX)) return;
+      transcript.push({
+        role: normalizedRole,
+        text: textContent,
+        ts: Date.now(),
+        // Кто это сказал — только для человеческих реплик на встрече: у
+        // ассистента говорящий известен и так. Разметка приблизительная, её
+        // источник — активный говорящий по версии LiveKit.
+        ...(isMeeting && normalizedRole === 'user' && currentSpeaker
+          ? { speaker: currentSpeaker }
+          : {}),
+      });
+
+      if (!gate) return;
+      if (normalizedRole === 'assistant') {
+        gate.noteReplied(Date.now());
+        return;
+      }
+      // Реплика человека: спрашиваем гейт, дать ли модели ход. Синтетические
+      // вставки (ответы коллег, готовые документы) сюда не попадают — они
+      // отсеяны выше по INTERNAL_PREFIX и звучат всегда, их уже ждут.
+      switch (gate.decide(textContent, Date.now())) {
+        case 'respond':
+          session.generateReply();
+          break;
+        case 'ack_listen':
+          session.generateReply({ instructions: listenAck() });
+          break;
+        case 'ack_resume':
+          session.generateReply({ instructions: resumeAck() });
+          break;
+        case 'silent':
+          break;
+      }
+    });
+
+    // Разметка говорящего. LiveKit определяет активного сам — считать
+    // громкость руками не нужно.
+    if (isMeeting) {
+      ctx.room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
+        // Берём первого: при перебивании активных несколько, а реплика в
+        // транскрипте одна. Разметка приблизительная, и здесь это видно прямо.
+        const top = speakers[0];
+        currentSpeaker = top ? top.name || top.identity : undefined;
+      });
+    }
+
+    // OpenAI Realtime отчитывается по аудио-токенам через 'realtime_model_metrics'
+    // — это один из вариантов объединения AgentMetrics, у остальных (llm/stt/tts/…)
+    // этих полей просто нет.
+    session.on(AgentSessionEventTypes.MetricsCollected, (ev: MetricsCollectedEvent) => {
+      if (ev.metrics.type === 'realtime_model_metrics') {
+        audioIn += ev.metrics.inputTokenDetails.audioTokens;
+        audioOut += ev.metrics.outputTokenDetails.audioTokens;
+      }
+    });
+
+    // Плагин сам переоткрывает WS каждые maxSessionDuration (по умолчанию 20 мин),
+    // чтобы не упереться в серверный лимит OpenAI — это внутренний реконнект,
+    // разговор не рвётся. Ниже — отдельный, более грубый предохранитель на
+    // ОБЩУЮ длину звонка (продуктовое решение, не обход API-лимита): если что-то
+    // пойдёт не так и звонок зависнет на час, лучше вежливо свернуть его, чем
+    // жечь токены бесконечно.
+    //
+    // Встреча — два часа против часа у звонка: переговоры регулярно длиннее
+    // часа. Это второй предохранитель; первый живёт в Occupancy и срабатывает
+    // раньше. Держать их согласованными: если тот промолчит, последним рубежом
+    // остаётся этот.
+    const SESSION_LIMIT_MS = (isMeeting ? 2 : 1) * 60 * 60 * 1000;
+    const warnAt = setTimeout(() => {
+      pushLine(
+        `${INTERNAL_PREFIX}: до конца звонка минута. Подведи короткий итог и попрощайся.]`,
+      );
+    }, SESSION_LIMIT_MS - 60_000);
+    // unref обязателен: без него часовой таймер держит event loop, процесс
+    // задания не может завершиться после закрытия сессии, и фреймворк через
+    // минуту убивает его как «job is unresponsive» — вместе с недоотправленным
+    // complete. Так дважды терялся транскрипт (25 и 26.08.2026).
+    warnAt.unref?.();
+
+    const hardStop = setTimeout(() => {
+      // Именно ЗАВЕРШАЕМ, а не только помечаем в БД. Раньше здесь был один
+      // backend.failed(): статус менялся на 'failed', а Realtime-сессия жила
+      // дальше и тарифицировалась — единственный предохранитель по деньгам
+      // ничего не останавливал. Плюс подоспевший следом complete перетирал
+      // 'failed' обратно на 'completed'.
+      void (async () => {
+        try {
+          await session.close();
+        } catch (e) {
+          console.error('session.close() failed', e);
+        }
+        try {
+          await ctx.room.disconnect();
+        } catch (e) {
+          console.error('room.disconnect() failed', e);
+        }
+      })();
+    }, SESSION_LIMIT_MS);
+    hardStop.unref?.();
+
+    // Итоги отправляем при ПЕРВОМ же признаке конца звонка, а не только из
+    // shutdown-колбэка. Полагаться на shutdown оказалось нельзя: фреймворк
+    // может убить процесс раньше, чем колбэк доработает, и тогда транскрипт
+    // теряется молча — так пропали разговоры на 11 и 20 минут.
+    let sent = false;
+    const sendComplete = async (why: string) => {
+      if (sent) return;
+      sent = true;
+      clearTimeout(warnAt);
+      clearTimeout(hardStop);
+      try {
+        await backend.complete(meta.callId, transcript, {
+          audioInputTokens: audioIn,
+          audioOutputTokens: audioOut,
+          model,
+        });
+        console.log(`complete отправлен (${why}), реплик: ${transcript.length}`);
+      } catch (e) {
+        console.error(`complete не отправлен (${why})`, e);
+      }
+    };
+
+    /**
+     * Кто остался во встрече и пора ли выходить.
+     *
+     * У звонка этого нет: там собеседник один, и его уход закрывает сессию
+     * штатным closeOnDisconnect. На встрече мы этот механизм отключили — он
+     * обрывал бы разговор, когда выйдет первый вошедший, — поэтому решение
+     * принимаем сами.
+     */
+    if (occupancy) {
+      // Уже сидящие до нашего входа: participantConnected по ним не придёт, и
+      // без этого прохода начавшаяся раньше встреча считалась бы пустой, а
+      // ассистент вышел бы через LOBBY_MS.
+      for (const identity of ctx.room.remoteParticipants.keys()) occupancy.joined(identity);
+
+      ctx.room.on(RoomEvent.ParticipantConnected, (p) => {
+        occupancy.joined(p.identity);
+        void backend.meetingFirstHuman(meta.callId).catch(() => {
+          // Отметка «встреча началась» — учётная, ради неё встречу не рвём.
+        });
+      });
+      ctx.room.on(RoomEvent.ParticipantDisconnected, (p) => occupancy.left(p.identity));
+
+      const watch = setInterval(() => {
+        const verdict = occupancy.verdict(Date.now());
+        if (verdict === 'stay') return;
+        clearInterval(watch);
+        console.log(`выходим из встречи: ${verdict}`);
+        void (async () => {
+          if (verdict === 'never_started') {
+            await backend.failed(meta.callId, 'во встречу так никто и не пришёл').catch(() => {});
+          }
+          try { await session.close(); } catch (e) { console.error('session.close()', e); }
+          try { await ctx.room.disconnect(); } catch (e) { console.error('room.disconnect()', e); }
+        })();
+      }, 5_000);
+      // unref обязателен: без него таймер держит event loop, процесс задания не
+      // может завершиться, и фреймворк убивает его как «job is unresponsive» —
+      // вместе с недоотправленным complete.
+      watch.unref?.();
+    }
+
+    // Закрытие сессии — самый ранний надёжный сигнал: он приходит сразу после
+    // того, как собеседник отключился, и процесс тогда ещё жив.
+    session.on(AgentSessionEventTypes.Close, () => { void sendComplete('session_closed'); });
+    ctx.addShutdownCallback(async () => { await sendComplete('shutdown'); });
+
+    // Свой вход выставляем ДО start() — это поддержанный фреймворком порядок.
+    //
+    // agent_session.js:403 проверяет `input.audio` перед созданием RoomIO и,
+    // найдя его занятым, пишет в лог «input.audio is already set, ignoring..»
+    // и свой аудиовход не подключает. Если же присвоить ПОСЛЕ start(), RoomIO
+    // успевает поставить свой, и дальше идёт гонка за одно поле — именно на
+    // ней ассистент трижды оставался глухим (27–28.08.2026).
+    //
+    // audioEnabled при этом трогать нельзя: с `false` условие выше не
+    // сработает, а заодно заглушится весь аудиотракт.
+    if (isMeeting) {
+      session.input.audio = new MixedRoomAudioInput(ctx.room);
+      console.log('[вход] микшер подставлен до старта сессии');
+    }
+
+    try {
+      await session.start({
+        agent: new voice.Agent({
+          instructions: isMeeting
+            ? meetingInstructions({
+                name: agentName,
+                persona: meta.agentPersona || '',
+                preamble: meta.preamble,
+                specialists: meta.specialists,
+              })
+            : callInstructions(meta.preamble, meta.specialists),
+          tools,
+        }),
+        room: ctx.room,
+        // closeOnDisconnect: false — иначе сессия закрывается, когда выйдет
+        // тот участник, к которому RoomIO привязался первым, и встреча
+        // обрывается всем остальным.
+        //
+        // audioEnabled НЕ трогаем. Здесь я уже ошибся один раз: выставил
+        // false, рассуждая, что так гашу штатный вход RoomIO и остаётся мой.
+        // На деле этот флаг глушит ВЕСЬ аудиотракт сессии — в типах SDK прямо
+        // сказано, что setAttached существует ради того, чтобы mute работал и
+        // для подменённых входов. Ассистент вошёл во встречу глухим: в логах
+        // ни одного onInputSpeechStarted за весь разговор. Живая встреча
+        // 27.08.2026.
+        //
+        // Штатный вход и не появится: input.audio выставлен выше, и RoomIO,
+        // найдя поле занятым, свой аудиовход не создаёт.
+        ...(isMeeting ? { inputOptions: { closeOnDisconnect: false } } : {}),
+      });
+
+
+      // Первую фразу задаём явно, а не отдаём модели на импровизацию.
+      //
+      // Она же — сигнал «трубку сняли»: до неё пользователь слышит гудки
+      // дозвона (см. ringback.ts во фронте), и переход от гудков к живому
+      // голосу должен читаться так же однозначно, как в телефоне.
+      //
+      // До первой реплики пользователя у Realtime нет звукового сигнала о
+      // языке, и он берёт английский по умолчанию — текстовая инструкция в
+      // промпте на это не влияет. Живой звонок 25.08.2026: «Hi there! Great
+      // to meet you», и только на русский вопрос модель переключилась сама.
+      session.generateReply({
+        instructions: isMeeting
+          ? meetingIntro(agentName, meta.ownerName || 'пользователя')
+          : callIntro(),
+      });
+    } catch (e: any) {
+      await backend.failed(meta.callId, e?.message || 'session start failed');
+      throw e;
+    }
+  },
+});
+
+cli.runApp(
+  new ServerOptions({
+    agent: fileURLToPath(import.meta.url),
+    agentName: 'linkeon-voice-host',
+    // Health-порт воркера. Дефолт SDK в production — 8081, а на прод-хосте его
+    // уже занимает nginx (10.10.0.1:8081): процесс падал с EADDRINUSE и уходил
+    // в цикл перезапусков pm2. Порт вынесен в env, чтобы не искать свободный
+    // заново на другом хосте.
+    port: Number(process.env.VOICE_HOST_PORT || 8137),
+    // realtime-прокси нечего прогревать; дефолт min(cores,4) держит лишние
+    // процессы впустую
+    numIdleProcesses: 1,
+  }),
+);

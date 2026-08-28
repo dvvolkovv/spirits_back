@@ -149,19 +149,18 @@ describe('CalendarService — TalerID aggregation + write routing', () => {
 
 describe('TalerIdController', () => {
   function makeOauth(overrides: Partial<Record<string, jest.Mock>> = {}) {
-    return { connect: jest.fn(), disconnect: jest.fn().mockResolvedValue(undefined), ...overrides } as any;
+    return {
+      connect: jest.fn(),
+      // Identity lookup + provision moved into the service; the controller now delegates
+      // connect → provisionForUser and oauthStart → lookupProvisionInput.
+      provisionForUser: jest.fn().mockResolvedValue('connected'),
+      lookupProvisionInput: jest.fn().mockResolvedValue({ phone: null }),
+      disconnect: jest.fn().mockResolvedValue(undefined),
+      ...overrides,
+    } as any;
   }
   function makeStore(overrides: Partial<Record<string, jest.Mock>> = {}) {
     return { getConnection: jest.fn().mockResolvedValue(null), ...overrides } as any;
-  }
-  function makePg(rows: { uid?: any[]; profile?: any[] } = {}) {
-    return {
-      query: jest.fn().mockImplementation((sql: string) => {
-        if (sql.includes('FROM user_id')) return Promise.resolve({ rows: rows.uid ?? [] });
-        if (sql.includes('FROM ai_profiles_consolidated')) return Promise.resolve({ rows: rows.profile ?? [] });
-        return Promise.resolve({ rows: [] });
-      }),
-    } as any;
   }
 
   // Account-linking service — not exercised by these connect/status/disconnect tests; stub it.
@@ -187,38 +186,31 @@ describe('TalerIdController', () => {
   }
 
   describe('connect', () => {
-    it('calls TalerIdOauthService.connect with the user phone (raw, no +) and returns the status', async () => {
-      const oauth = makeOauth({ connect: jest.fn().mockResolvedValue('connected') });
-      const store = makeStore();
-      const pg = makePg({ uid: [{ primary_phone: '79656445804', primary_email: null }], profile: [{ email: 'a@b.com', profile_data: { name: 'Dmitry' } }] });
-      const controller = new TalerIdController(oauth, store, makeLink(), makeLogin(), pg);
+    it('delegates to provisionForUser and returns the status (identity lookup lives in the service)', async () => {
+      const oauth = makeOauth({ provisionForUser: jest.fn().mockResolvedValue('connected') });
+      const controller = new TalerIdController(oauth, makeStore(), makeLink(), makeLogin());
 
       const result = await controller.connect({ userId: 'user-1' });
 
-      expect(oauth.connect).toHaveBeenCalledWith('user-1', '79656445804', 'a@b.com', 'Dmitry');
+      expect(oauth.provisionForUser).toHaveBeenCalledWith('user-1');
       expect(result).toEqual({ status: 'connected' });
     });
 
     it('ambiguous status is returned as a normal (non-throwing) 200-shaped response', async () => {
-      const oauth = makeOauth({ connect: jest.fn().mockResolvedValue('ambiguous') });
-      const store = makeStore();
-      const pg = makePg({ uid: [{ primary_phone: '79656445804' }] });
-      const controller = new TalerIdController(oauth, store, makeLink(), makeLogin(), pg);
+      const oauth = makeOauth({ provisionForUser: jest.fn().mockResolvedValue('ambiguous') });
+      const controller = new TalerIdController(oauth, makeStore(), makeLink(), makeLogin());
 
       const result = await controller.connect({ userId: 'user-1' });
 
       expect(result).toEqual({ status: 'ambiguous' });
     });
 
-    it('no phone on file → does not call connect, returns error status', async () => {
-      const oauth = makeOauth();
-      const store = makeStore();
-      const pg = makePg({ uid: [{ primary_phone: null }] });
-      const controller = new TalerIdController(oauth, store, makeLink(), makeLogin(), pg);
+    it('no phone on file → provisionForUser reports error, controller passes it through', async () => {
+      const oauth = makeOauth({ provisionForUser: jest.fn().mockResolvedValue('error') });
+      const controller = new TalerIdController(oauth, makeStore(), makeLink(), makeLogin());
 
       const result = await controller.connect({ userId: 'user-1' });
 
-      expect(oauth.connect).not.toHaveBeenCalled();
       expect(result).toEqual({ status: 'error' });
     });
   });
@@ -227,8 +219,7 @@ describe('TalerIdController', () => {
     it('reflects getConnection', async () => {
       const oauth = makeOauth();
       const store = makeStore({ getConnection: jest.fn().mockResolvedValue({ status: 'connected' }) });
-      const pg = makePg();
-      const controller = new TalerIdController(oauth, store, makeLink(), makeLogin(), pg);
+      const controller = new TalerIdController(oauth, store, makeLink(), makeLogin());
 
       const result = await controller.status({ userId: 'user-1' });
 
@@ -238,8 +229,7 @@ describe('TalerIdController', () => {
     it('not connected → connected:false', async () => {
       const oauth = makeOauth();
       const store = makeStore(); // getConnection -> null
-      const pg = makePg();
-      const controller = new TalerIdController(oauth, store, makeLink(), makeLogin(), pg);
+      const controller = new TalerIdController(oauth, store, makeLink(), makeLogin());
 
       const result = await controller.status({ userId: 'user-1' });
 
@@ -252,7 +242,7 @@ describe('TalerIdController', () => {
   // уйти ссылкой в приложение — веб-страницу Linkeon оно оттуда не видит.
   describe('login callback — куда возвращается человек', () => {
     function makeController(login: any) {
-      return new TalerIdController(makeOauth(), makeStore(), makeLink(), login, makePg());
+      return new TalerIdController(makeOauth(), makeStore(), makeLink(), login);
     }
 
     it('мобильный вход возвращается в приложение', async () => {
@@ -308,7 +298,7 @@ describe('TalerIdController', () => {
       const link = makeLink();
       link.completeLink = jest.fn().mockResolvedValue('linked');
       const controller = new TalerIdController(
-        makeOauth(), makeStore(), link, makeLogin(), makePg(),
+        makeOauth(), makeStore(), link, makeLogin(),
       );
       const res = makeRes();
 
@@ -324,7 +314,7 @@ describe('TalerIdController', () => {
         startLogin: jest.fn().mockResolvedValue({ authorizeUrl: 'https://x' }),
       });
       const controller = new TalerIdController(
-        makeOauth(), makeStore(), makeLink(), login, makePg(),
+        makeOauth(), makeStore(), makeLink(), login,
       );
 
       await controller.loginStart({ platform: 'mobile' });
@@ -337,7 +327,7 @@ describe('TalerIdController', () => {
         startLogin: jest.fn().mockResolvedValue({ authorizeUrl: 'https://x' }),
       });
       const controller = new TalerIdController(
-        makeOauth(), makeStore(), makeLink(), login, makePg(),
+        makeOauth(), makeStore(), makeLink(), login,
       );
 
       await controller.loginStart({} as any);
@@ -350,8 +340,7 @@ describe('TalerIdController', () => {
     it('calls TalerIdOauthService.disconnect and returns ok:true', async () => {
       const oauth = makeOauth();
       const store = makeStore();
-      const pg = makePg();
-      const controller = new TalerIdController(oauth, store, makeLink(), makeLogin(), pg);
+      const controller = new TalerIdController(oauth, store, makeLink(), makeLogin());
 
       const result = await controller.disconnect({ userId: 'user-1' });
 

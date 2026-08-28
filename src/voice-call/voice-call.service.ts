@@ -1,0 +1,367 @@
+import { ConflictException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
+import { randomUUID } from 'crypto';
+import { PgService } from '../common/services/pg.service';
+import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
+import { ChatService } from '../chat/chat.service';
+import { Neo4jService } from '../neo4j/neo4j.service';
+import { BusinessProfileService } from '../business-profile/business-profile.service';
+import { LiveKitClient } from './livekit.client';
+import {
+  CompletePayload, CONSOLIDATE_SIDE_LIMIT, HOST_AGENT_ID, HOST_CATEGORY,
+  SPECIALIST_ROLES, SPECIALISTS,
+} from './voice-call.types';
+
+/**
+ * Ставки OpenAI Realtime за 1M аудио-токенов, по моделям.
+ *
+ * Захардкоженный флагман завышал бы цену mini в 3.2 раза — а ради измерения
+ * реальной цены минуты фича и катится в v1, так что врать тут нельзя.
+ */
+const AUDIO_RATES_USD_PER_1M: Record<string, { in: number; out: number }> = {
+  flagship: { in: 32, out: 64 },
+  mini: { in: 10, out: 20 },
+};
+
+function ratesFor(model: string | undefined): { in: number; out: number } {
+  return /mini/i.test(model || '') ? AUDIO_RATES_USD_PER_1M.mini : AUDIO_RATES_USD_PER_1M.flagship;
+}
+
+const PREAMBLE_MSG_LIMIT = 20;
+const PREAMBLE_CHAR_LIMIT = 1800;
+
+@Injectable()
+export class VoiceCallService {
+  private readonly logger = new Logger(VoiceCallService.name);
+
+  constructor(
+    private readonly pg: PgService,
+    private readonly chat: ChatService,
+    private readonly livekit: LiveKitClient,
+    // Необязательные — как в chat.service: без Neo4j или бизнес-профиля
+    // звонок должен работать, просто Роман будет знать о собеседнике меньше.
+    @Optional() private readonly neo4j?: Neo4jService,
+    @Optional() private readonly businessProfile?: BusinessProfileService,
+  ) {}
+
+  /**
+   * Контекст, с которым Роман входит в разговор: последние сообщения из чата
+   * с ним же.
+   *
+   * Собирается ТОЛЬКО из базы, без похода в LLM. Раньше при истории длиннее
+   * 4000 символов здесь вызывался generateAgentReply за сжатием — и, поскольку
+   * preamble считается до dispatchAgent, пользователь сорок секунд слушал
+   * тишину, прежде чем Роман вообще входил в комнату. У реального юзера в
+   * последних 20 сообщениях оказалось 22 000 символов, так что срабатывало
+   * это всегда. Живой звонок 25.08.2026.
+   *
+   * Берём с конца, пока укладываемся в бюджет: свежие реплики важнее старых.
+   */
+  async buildPreamble(userId: string, agentId: number = HOST_AGENT_ID): Promise<string> {
+    // Профиль собеседника — то же, что получают текстовые ассистенты.
+    //
+    // До 27.08.2026 Роман его не видел ВОВСЕ: в инструкцию шла только
+    // переписка из чата. Получалось, что ассистент, которому звонят голосом,
+    // знает о человеке меньше, чем тот же ассистент в текстовом окне.
+    //
+    // Оба источника необязательные и оба под catch: без профиля разговор
+    // состоится, просто Роман будет знать меньше. Ронять из-за этого звонок
+    // нельзя — он стоит денег и начат по инициативе пользователя.
+    const profile = await this.profileBlock(userId);
+
+    const res = await this.pg.query(
+      `SELECT sender_type, content FROM custom_chat_history
+       WHERE session_id = $1 ORDER BY created_at DESC LIMIT $2`,
+      [`${userId}_${agentId}`, PREAMBLE_MSG_LIMIT],
+    );
+    if (!res.rows.length) return profile;
+
+    const lines: string[] = [];
+    let budget = PREAMBLE_CHAR_LIMIT;
+    for (const r of res.rows) {
+      // «Ассистент», а не «Роман»: preamble уходит модели, которая сама и
+      // есть этот ассистент, и чужое имя в её собственных репликах сбивает.
+      const who = r.sender_type === 'human' ? 'Пользователь' : 'Ассистент';
+      const text = String(r.content || '').replace(/\s+/g, ' ').trim();
+      if (!text) continue;
+      const line = `${who}: ${text.length > 400 ? text.slice(0, 400) + '…' : text}`;
+      if (line.length > budget) break;
+      budget -= line.length;
+      lines.push(line);
+    }
+    const history = lines.reverse().join('\n');
+    return profile ? `${profile}\n\n${history}` : history;
+  }
+
+  /**
+   * Что известно о собеседнике: профиль из Neo4j и бизнес-блок.
+   *
+   * Категория Романа — `assistant`, её и передаём: бизнес-блок сам решает,
+   * что показывать под категорию, и подменять её на `business` значило бы
+   * врать ему о том, кто спрашивает.
+   */
+  private async profileBlock(userId: string): Promise<string> {
+    const parts: string[] = [];
+    if (this.neo4j) {
+      try {
+        const text = (await this.neo4j.getProfileDescription(userId))?.trim();
+        if (text) parts.push(`Что известно о собеседнике:\n${text}`);
+      } catch (e: any) {
+        this.logger.warn(`профиль Neo4j для ${userId} не получен: ${e?.message}`);
+      }
+    }
+    if (this.businessProfile) {
+      try {
+        const biz = (await this.businessProfile.renderForPrompt(userId, HOST_CATEGORY))?.trim();
+        if (biz) parts.push(biz);
+      } catch (e: any) {
+        this.logger.warn(`бизнес-профиль для ${userId} не получен: ${e?.message}`);
+      }
+    }
+    return parts.join('\n\n');
+  }
+
+  async start(userId: string): Promise<{ callId: string; roomName: string; token: string; wsUrl: string }> {
+    // Один активный звонок на пользователя. Минута разговора стоит реальных
+    // денег, а без этой проверки N вкладок (или цикл curl с админским
+    // токеном) дают N комнат и N оплачиваемых Realtime-сессий, погасить
+    // которые нечем. Индекс voice_calls_active_idx заведён ровно под неё.
+    const active = await this.pg.query(
+      `SELECT id FROM voice_calls WHERE user_id = $1 AND status IN ('dialing','active') LIMIT 1`,
+      [userId],
+    );
+    if (active.rows[0]) {
+      throw new ConflictException({ message: 'call already in progress', callId: active.rows[0].id });
+    }
+
+    const callId = randomUUID();
+    const roomName = `voice_${callId}`;
+
+    await this.pg.query(
+      `INSERT INTO voice_calls (id, user_id, agent_id, room_name, status) VALUES ($1, $2, $3, $4, 'dialing')`,
+      [callId, userId, HOST_AGENT_ID, roomName],
+    );
+
+    const [token, preamble] = await Promise.all([
+      this.livekit.userToken(roomName, `user_${userId}`),
+      this.buildPreamble(userId),
+    ]);
+
+    await this.livekit.dispatchAgent(roomName, {
+      callId,
+      userId,
+      preamble,
+      // Отдаём воркеру имена ВМЕСТЕ с ролями: по одному имени ведущий
+      // выбирает наугад и шлёт юридический вопрос бухгалтеру.
+      specialists: Object.keys(SPECIALISTS).map((n) => ({ name: n, role: SPECIALIST_ROLES[n] || '' })),
+      callbackUrl: `${process.env.BACKEND_URL || 'https://my.linkeon.io'}/webhook/voice-call/internal`,
+    });
+
+    return { callId, roomName, token, wsUrl: process.env.LIVEKIT_WS_URL || process.env.LIVEKIT_URL || 'ws://localhost:7880' };
+  }
+
+  costUsd(audioIn: number, audioOut: number, model?: string): number {
+    const r = ratesFor(model);
+    return (audioIn / 1e6) * r.in + (audioOut / 1e6) * r.out;
+  }
+
+  /**
+   * Завершение звонка. Транскрипт сохраняется СРАЗУ, резюме — в фоне.
+   *
+   * Раньше здесь синхронно вызывался summarize() (поход в LLM на десятки
+   * секунд), а воркер ждёт ответ 15 секунд и обрывает запрос. 26.08.2026
+   * так потерялся транскрипт разговора на 11 минут: в БД осталось
+   * `interrupted`, ноль реплик, стоимость пустая. Разговор, за который
+   * заплачено, не сохранился.
+   *
+   * Теперь запись в БД не зависит от того, успеет ли модель придумать резюме.
+   */
+  async complete(callId: string, payload: CompletePayload): Promise<void> {
+    const call = await this.load(callId);
+    // Идемпотентность: воркер может ретрайнуть, а подписанный запрос —
+    // прийти дважды. Без этого получаем вторую карточку и вторую строку учёта.
+    if (call.status === 'completed') {
+      this.logger.warn(`[complete] call=${callId} уже завершён — повтор проигнорирован`);
+      return;
+    }
+    const durationSec = Math.max(0, Math.round((Date.now() - new Date(call.started_at).getTime()) / 1000));
+    const cost = this.costUsd(payload.usage.audioInputTokens, payload.usage.audioOutputTokens, payload.usage.model);
+
+    // Курс общий со всеми путями, которые едят платную ёмкость, — см.
+    // common/billing-rates.ts. Минута флагманской Realtime-модели стоит около
+    // двенадцати центов, то есть примерно 540 токенов.
+    const tokens = Math.max(0, Math.ceil(cost * SEAT_TOKENS_PER_USD));
+
+    await this.pg.query(
+      `UPDATE voice_calls SET status = 'completed', ended_at = now(), duration_sec = $1,
+         transcript = $2, cost_usd = $3, model = $4, tokens_charged = $5 WHERE id = $6`,
+      [durationSec, JSON.stringify(payload.transcript), cost, payload.usage.model, tokens, callId],
+    );
+
+    // Списываем за разговор — по решению владельца 27.08.2026. Раньше здесь
+    // стоял статус 'completed' с нулём: минуты считались, но не стоили ничего.
+    //
+    // В строку идёт ПЕРЕСЧИТАННАЯ величина, а не сырые аудио-токены, и это
+    // принципиально. TokenAccountingService забирает 'pending' и при
+    // tokens_to_consume = 0 считает сумму сам как `input_tokens +
+    // output_tokens` (token-accounting.service.ts:74-76). Аудио-токенов
+    // Realtime набегает 1800 на минуту разговора (600 входящих плюс 1200
+    // исходящих) — положи мы их как есть, с баланса уходило бы 1800 вместо
+    // реальных ~540. Поэтому input = 0, а в output — уже посчитанная цена.
+    //
+    // Сырые счётчики сохраняются в metadata: без них потом не разобрать,
+    // из чего сложилась стоимость.
+    await this.pg.query(
+      `INSERT INTO token_consumption_tasks (execution_id, user_id, status, agent_id, input_tokens, output_tokens, tokens_to_consume, metadata)
+       VALUES ($1, $2, 'pending', $3, 0, $4, 0, $5)`,
+      [
+        Math.floor(Math.random() * 2_000_000_000), call.user_id, HOST_AGENT_ID, tokens,
+        JSON.stringify({
+          kind: 'voice_call', callId, costUsd: cost, durationSec, durationMs: durationSec * 1000,
+          model: payload.usage.model,
+          audioInputTokens: payload.usage.audioInputTokens,
+          audioOutputTokens: payload.usage.audioOutputTokens,
+        }),
+      ],
+    );
+
+    this.logger.log(`[complete] call=${callId} ${durationSec}s cost=$${cost.toFixed(4)} → ${tokens} токенов — транскрипт сохранён`);
+
+    // Резюме, карточка и профиль — в фоне. Промисы намеренно не ждём: воркер
+    // обрывает запрос через пятнадцать секунд, а тут походы в LLM на десятки.
+    // Так уже дважды терялся транскрипт целиком.
+    void this.finishSummary(callId, call.user_id, payload.transcript, durationSec)
+      .catch((e) => this.logger.error(`[complete] резюме для ${callId} не собрано: ${e?.message}`));
+    void this.consolidateCall(call.user_id, payload.transcript)
+      .catch((e) => this.logger.error(`[complete] профиль по ${callId} не обновлён: ${e?.message}`));
+  }
+
+  /** Резюме и карточка в ленте. Отваливается молча — транскрипт уже сохранён. */
+  private async finishSummary(
+    callId: string,
+    userId: string,
+    transcript: CompletePayload['transcript'],
+    durationSec: number,
+  ): Promise<void> {
+    const summary = await this.summarize(userId, transcript);
+    await this.pg.query(`UPDATE voice_calls SET summary = $1 WHERE id = $2`, [summary, callId]);
+
+    const minutes = Math.max(1, Math.round(durationSec / 60));
+    const content = `{{voice_call: id=${callId}}}\n\nРазговор ${minutes} мин.\n\n${summary}`;
+    await this.pg.query(
+      `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
+       VALUES ($1, 'ai', $2, $3, 'text', 0)`,
+      [`${userId}_${HOST_AGENT_ID}`, HOST_AGENT_ID, content],
+    );
+    this.logger.log(`[complete] call=${callId} резюме готово, карточка в ленте`);
+  }
+
+  /**
+   * Прогнать разговор через ту же консолидацию, что и обычный ход чата:
+   * профиль в Neo4j, задачи, бизнес-профиль.
+   *
+   * До 27.08.2026 звонок не доходил ни до одного из трёх. Голос — самый
+   * естественный способ рассказать о себе много и быстро, и ровно он ничего
+   * не запоминал: разговор на 84 реплики не менял о человеке ничего.
+   *
+   * Транскрипт сворачивается в два хода — реплики пользователя и реплики
+   * Романа. Извлекатели рассчитаны на один обмен, а не на получасовой
+   * разговор; без потолка туда уехало бы двадцать тысяч знаков, и на выходе
+   * получился бы мусор или отказ.
+   */
+  private async consolidateCall(
+    userId: string,
+    transcript: CompletePayload['transcript'],
+  ): Promise<void> {
+    if (!transcript?.length) return;
+
+    const side = (role: 'user' | 'assistant') =>
+      transcript
+        .filter((t) => t.role === role)
+        .map((t) => t.text.trim())
+        .filter(Boolean)
+        .join(' ')
+        .slice(0, CONSOLIDATE_SIDE_LIMIT);
+
+    const said = side('user');
+    // Извлекать нечего, если человек молчал: односторонний монолог Романа
+    // фактов о собеседнике не содержит.
+    if (!said) return;
+
+    await this.chat.consolidateAfterChatPublic(userId, String(HOST_AGENT_ID), said, side('assistant'));
+    this.logger.log(`[complete] профиль обновлён по разговору (${transcript.length} реплик)`);
+  }
+
+  async fail(callId: string, reason: string): Promise<void> {
+    await this.pg.query(
+      `UPDATE voice_calls SET status = 'failed', ended_at = now(), summary = $1, cost_usd = 0 WHERE id = $2`,
+      [`Звонок не состоялся: ${reason}`, callId],
+    );
+  }
+
+  /**
+   * Положить трубку. Красить строку в БД недостаточно: воркер остаётся в
+   * комнате один и продолжает жечь Realtime-сессию. Комнату надо закрыть —
+   * тогда воркер получит disconnect и отправит complete.
+   */
+  async markInterrupted(callId: string): Promise<void> {
+    const res = await this.pg.query(
+      `UPDATE voice_calls SET status = 'interrupted', ended_at = now()
+       WHERE id = $1 AND status IN ('dialing','active') RETURNING room_name`,
+      [callId],
+    );
+    const roomName = res.rows[0]?.room_name;
+    if (roomName) await this.livekit.closeRoom(roomName);
+  }
+
+  /**
+   * Ассистент выходит из встречи, комната остаётся жить.
+   *
+   * Отличается от markInterrupted принципиально: там комната создана ради
+   * звонка и закрывается вместе с ним, здесь она принадлежит людям — закрытие
+   * выкинуло бы из неё всех участников из-за того, что ушла наша половина.
+   *
+   * Но одной пометки в базе мало: воркер о ней не узнает и останется в комнате
+   * жечь Realtime-сессию. Поэтому участника-агента убираем явно — он получит
+   * disconnect и отправит complete, как при обычном завершении.
+   */
+  async markInterruptedKeepingRoom(callId: string): Promise<void> {
+    const res = await this.pg.query(
+      `UPDATE voice_calls SET status = 'interrupted', ended_at = now()
+       WHERE id = $1 AND status IN ('dialing','active') RETURNING room_name`,
+      [callId],
+    );
+    const roomName = res.rows[0]?.room_name;
+    if (roomName) await this.livekit.removeAgents(roomName);
+  }
+
+  /** Живой ли звонок — job'ы по завершённому создавать незачем. */
+  isActive(call: { status: string }): boolean {
+    return call.status === 'dialing' || call.status === 'active';
+  }
+
+  async load(callId: string): Promise<any> {
+    const res = await this.pg.query(`SELECT * FROM voice_calls WHERE id = $1`, [callId]);
+    if (!res.rows[0]) throw new NotFoundException('call not found');
+    return res.rows[0];
+  }
+
+  private async summarize(userId: string, transcript: CompletePayload['transcript']): Promise<string> {
+    if (!transcript?.length) return 'Разговор без реплик.';
+    // На встрече у человеческих реплик есть имя говорящего — без него резюме
+    // не сможет закрепить договорённость ни за кем, и вся разметка пропадает
+    // на последнем шаге. У звонка имени нет, там остаётся «Пользователь».
+    const flat = transcript
+      .map((t) => `${t.role === 'user' ? t.speaker || 'Пользователь' : 'Ассистент'}: ${t.text}`)
+      .join('\n');
+    const prompt =
+      `Ниже расшифровка голосового разговора. Напиши краткое резюме: о чём говорили, ` +
+      `какие решения приняты, что осталось сделать. До 800 символов, без вступлений.\n\n${flat}`;
+    try {
+      const s = await this.chat.generateAgentReply(userId, String(HOST_AGENT_ID), prompt, `voice_summary_${randomUUID()}`);
+      return (s || '').trim() || 'Резюме не сформировано.';
+    } catch (e: any) {
+      this.logger.warn(`summarize failed: ${e?.message}`);
+      return 'Резюме не сформировано.';
+    }
+  }
+}

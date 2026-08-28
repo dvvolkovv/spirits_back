@@ -10,7 +10,12 @@ import { TasksService } from '../tasks/tasks.service';
 import { EventsService } from '../events/events.service';
 import { TalerIdOauthService } from '../talerid/talerid-oauth.service';
 import { LanguageService, LANGUAGE_REPLY_LINE, DEFAULT_LANGUAGE } from '../common/services/language.service';
+import { parseMeetingLink } from '../meeting/meeting-link';
+import { RoomService } from '../meeting/room.service';
+import { buildMeetingCard } from './meeting-card';
+import { RESPONSE_STYLE_RULE } from './response-style';
 import { BalanceContextService } from '../tokens/balance-context.service';
+import { BusinessProfileService } from '../business-profile/business-profile.service';
 import axios from 'axios';
 import { Request, Response } from 'express';
 import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
@@ -263,6 +268,8 @@ export class ChatService {
     @Optional() private readonly tasksService?: TasksService,
     @Optional() private readonly events?: EventsService,
     @Optional() private readonly talerIdOauth?: TalerIdOauthService,
+    @Optional() private readonly businessProfile?: BusinessProfileService,
+    @Optional() private readonly rooms?: RoomService,
   ) {}
 
   /**
@@ -386,6 +393,9 @@ export class ChatService {
     // Запрос из сборки для App Store или Google Play: ссылок на пополнение в
     // промпте быть не должно. См. BalanceContextService.buildContextForPrompt.
     storeBuild: boolean = false,
+    // Пинг мониторинга, а не живой пользователь: ход уходит на дешёвую модель.
+    // Разрешён только тестовым аккаунтам — проверка в chat.controller.ts.
+    probe: boolean = false,
   ): Promise<void> {
     // Get agent
     // Custom-agent branch: "custom:<uuid>" references user-created agents.
@@ -411,7 +421,11 @@ export class ChatService {
       } else {
         // Orphaned / not owned — fall back to the platform default agent (Роман, id=1)
         this.logger.warn(`custom agent ${customId} not found or not owned by ${userId}, falling back to default`);
-        const fallbackRes = await this.pg.query('SELECT * FROM agents ORDER BY id LIMIT 1');
+        // is_active обязателен: скрытый ассистент не должен становиться
+        // платформенным дефолтом. Точечные выборки по id/name ниже фильтр
+        // НЕ применяют сознательно — иначе у тех, кто уже разговаривает со
+        // скрытым ассистентом, чат перестал бы открываться.
+        const fallbackRes = await this.pg.query('SELECT * FROM agents WHERE is_active ORDER BY id LIMIT 1');
         agent = fallbackRes.rows[0];
       }
     } else {
@@ -429,6 +443,43 @@ export class ChatService {
     // Get chat history (individual rows: session_id, sender_type, content)
     // fresh: история и запись — в отдельной fresh-сессии из controller'а.
     const chatSessionId = fresh ? sessionId : `${userId}_${assistantId}`;
+
+    // Ссылка на комнату Linkeon замыкает ход: показываем карточку «Зайти во
+    // встречу» и в модель не идём. Иначе за каждую вставленную ссылку платим
+    // ход LLM и получаем два ответа — карточку и рассуждение ассистента о ней.
+    // Тот же приём, что у приветствия и у сообщения о нехватке токенов ниже.
+    const meetingLink = this.rooms ? parseMeetingLink(message) : null;
+    if (meetingLink) {
+      const room = await this.rooms!.info(meetingLink.code).catch(() => null);
+      // Комнаты нет или она закрыта — значит это была обычная ссылка в
+      // разговоре, а не приглашение. Идём обычным путём.
+      if (room?.active) {
+        res.status(200);
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Transfer-Encoding', 'chunked');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+
+        await this.pg.query(
+          `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
+           VALUES ($1, 'human', $2, $3, 'text')`,
+          [chatSessionId, agent.id, message],
+        );
+        const card = buildMeetingCard(room.code, room.title);
+        await this.pg.query(
+          `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
+           VALUES ($1, 'ai', $2, $3, 'text', 0)`,
+          [chatSessionId, agent.id, card],
+        );
+
+        res.write(JSON.stringify({ type: 'begin' }) + '\n');
+        res.write(JSON.stringify({ type: 'item', content: card }) + '\n');
+        res.write(JSON.stringify({ type: 'end', content: card, usage: { input: 0, output: 0, total: 0 } }) + '\n');
+        res.end();
+        return;
+      }
+    }
     const histRes = await this.pg.query(
       `SELECT sender_type, content FROM custom_chat_history
        WHERE session_id = $1
@@ -499,7 +550,7 @@ export class ChatService {
       const isAdmin = Boolean(adminRes.rows[0]?.isadmin);
       const ctx = { userId, isAdmin, balanceBlock };
       try {
-        await this.claudeAgent.streamSmmProducer(ctx, message, chatSessionId, agent.id, res);
+        await this.claudeAgent.streamSmmProducer(ctx, message, chatSessionId, agent.id, res, agent.category, fresh);
       } catch (err: any) {
         this.logger.error(`SMM streaming failed: ${err.message}`);
         // Best-effort error event; res may already be ended.
@@ -522,6 +573,7 @@ export class ChatService {
         recentHistory, profileText, res,
         agent.name, agent.description || '', agent.system_prompt || '',
         req, fresh, chatSessionId, requestLang, clientTz, balanceBlock,
+        agent.category, probe,
       );
     }
 
@@ -573,11 +625,22 @@ export class ChatService {
 • НИКОГДА не отвечай одними вопросами. НИКОГДА не задавай 2+ вопроса в одном сообщении.
 • Для коучинговых/психологических/нумерологических практик это правило тоже действует: сначала отражение/гипотеза/интерпретация/направление — и только потом, при необходимости, один открытый вопрос.
 • Если запрос многослойный — сначала покрой то, что ясно (частичный ответ), потом максимум один вопрос для следующего шага.
+
+${RESPONSE_STYLE_RULE}
 ${LanguageService.buildDirective(userLanguage)}`;
 
     let volatileSystemPrompt = (profileText && profileText.trim())
       ? `\n\n--- Профиль пользователя ---\n${profileText}`
       : '';
+    if (this.businessProfile) {
+      try {
+        // Маша — personal, получит строку-резюме, а не полную карточку.
+        const biz = await this.businessProfile.renderForPrompt(userId, agent.category);
+        if (biz) volatileSystemPrompt += `\n\n${biz}`;
+      } catch (e: any) {
+        this.logger.warn(`business profile injection failed (Маша): ${e?.message}`);
+      }
+    }
     // Cross-agent active tasks (см. TasksService.buildContextForPrompt).
     // fresh: чистый лист — прошлые задачи в промпт не тянем.
     if (this.tasksService && !fresh) {
@@ -676,7 +739,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
         system: systemPrompt,
         // 'default' — рекомендуемая модель CLI (сейчас Opus 5, при исчерпании
         // лимита подписки сам даунгрейдится). Биллинг юзеру идёт от costUsd.
-        model: 'default',
+        // Пинг мониторинга уходит на haiku: проверяется живость пути, а не
+        // качество ответа, и разница в цене хода — порядок.
+        model: probe ? 'haiku' : 'default',
         timeoutMs: 90_000,
       });
       rawText = r.text || '';
@@ -735,6 +800,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // чистый лист не должен порождать боковых задач.
         if (this.tasksService && !fresh) {
           try { await this.tasksService.extractFromTurn(userId, String(assistantId), message, fullText); } catch {}
+        }
+        // Бизнес-карточка наполняется тем же поводом, что и задачи, но своим
+        // вызовом: у извлечения задач нет тестов, и подселять к нему вторую
+        // задачу — значит не заметить его просадку.
+        if (this.businessProfile && !fresh) {
+          try { await this.businessProfile.extractFromTurn(userId, String(assistantId), message, fullText); } catch {}
         }
       } catch (e) {
         this.logger.error(`Post-chat save error: ${e.message}`);
@@ -818,6 +889,14 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // сюда приезжает строкой: пересобирать его здесь нельзя — отметка о
     // предупреждении встала бы дважды за ход.
     balanceBlock?: string,
+    // Категория агента (business/personal/assistant) — решает, какую версию
+    // карточки бизнеса вставлять ниже. См. BusinessProfileService.renderForPrompt.
+    agentCategory?: string | null,
+    // Пинг мониторинга (smoke / synthetic-runner), а не живой пользователь.
+    // Такой ход просит у релея дешёвую модель: ответ «ок» на Opus стоит те же
+    // ~47k контекста, что и настоящая консультация. Флаг приходит только от
+    // тестовых аккаунтов — см. chat.controller.ts.
+    probe: boolean = false,
   ): Promise<void> {
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
@@ -974,6 +1053,16 @@ ${LanguageService.buildDirective(userLanguage)}`;
     if (profileText && profileText.trim()) {
       contextPrefix += `User profile:\n${profileText}\n\n`;
     }
+    // Бизнес-карточка: общее знание о деле пользователя для всех ассистентов.
+    // Полная у category='business', одна строка у остальных — решает сервис.
+    if (this.businessProfile) {
+      try {
+        const biz = await this.businessProfile.renderForPrompt(userId, agentCategory);
+        if (biz) contextPrefix += biz + '\n\n';
+      } catch (e: any) {
+        this.logger.warn(`business profile injection failed: ${e?.message}`);
+      }
+    }
     // Активные задачи пользователя (cross-agent) — топ-5 по релевантности
     // к текущей реплике. Юзер видит ассистентов как продолжающих контекст
     // незаконченных дел, а не отвечающих с нуля. fresh: чистый лист — не тянем.
@@ -1006,6 +1095,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // отвечал по-русски аккаунту с language=en даже после того, как я починил
     // это в прямом пути к Anthropic. Здесь путь другой — через релей
     // r.linkeon.io, — и правку пришлось повторить.
+    // Форма ответа — рядом с концом промпта, по той же причине, что и язык:
+    // персона, профиль и история перевешивают инструкции, стоящие в начале.
+    contextPrefix += `${RESPONSE_STYLE_RULE}\n\n`;
+
     contextPrefix +=
       `${LANGUAGE_REPLY_LINE[userLanguage] || LANGUAGE_REPLY_LINE[DEFAULT_LANGUAGE]}\n\n`;
 
@@ -1169,6 +1262,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
           if (this.tasksService && !fresh) {
             try { await this.tasksService.extractFromTurn(userId, assistantId, message, fullText); } catch {}
           }
+          if (this.businessProfile && !fresh) {
+            try { await this.businessProfile.extractFromTurn(userId, assistantId, message, fullText); } catch {}
+          }
         }
       } catch (e: any) {
         this.logger.warn(`persistResponse failed: ${e.message}`);
@@ -1209,6 +1305,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
             ? freshSessionId
             : `${userId}_${assistantId}_${userLanguage}`,
         );
+
+        // Модель хода. Пинги мониторинга просят haiku: «ответь одним словом ок»
+        // не требует Opus, а обвязка Claude Code (системный промпт CLI +
+        // определения MCP-тулов, ~47k токенов) грузится независимо от содержания
+        // хода и на Opus стоит ~$0.20 против ~$0.02 на haiku. Поле необязательное:
+        // релей без поддержки `model` его просто игнорирует и остаётся на default.
+        if (probe) fd.append('model', 'haiku');
 
         // Agent-direct TalerID: when the user connected the TalerID ecosystem, hand
         // the file-agent a full-scope access token + the MCP base URL of the env we
@@ -1617,7 +1720,32 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * готовый текст. Историю/токены НЕ пишет (это делает вызывающий). Пустой
    * ответ → пустая строка.
    */
+  /**
+   * Ответ ассистента вне основного потока чата. Возвращает только текст —
+   * обёртка над generateAgentReplyWithCharge для вызывающих, которым расход
+   * не нужен (резюме звонка, синтетические пробы).
+   */
   async generateAgentReply(userId: string, assistantId: string, message: string, sessionIdOverride?: string): Promise<string> {
+    const { text } = await this.generateAgentReplyWithCharge(userId, assistantId, message, sessionIdOverride);
+    return text;
+  }
+
+  /**
+   * То же самое, но со стоимостью хода.
+   *
+   * Считается тем же computeSdkCharge, что и обычный ход чата, — иначе одна
+   * и та же консультация стоила бы по-разному в зависимости от того, спросили
+   * её текстом или голосом.
+   *
+   * Раньше этот метод разбирал в потоке только текст, а `costUsd` и `usage` из
+   * события `done` выбрасывал. Из-за этого консультации специалистов во время
+   * звонка не тарифицировались вовсе: голос был бесплатным каналом к платным
+   * ассистентам. Замечено владельцем 26.08.2026, когда он попросил показывать
+   * расход на экране.
+   */
+  async generateAgentReplyWithCharge(
+    userId: string, assistantId: string, message: string, sessionIdOverride?: string,
+  ): Promise<{ text: string; tokens: number; costUsd: number }> {
     const isNumeric = /^\d+$/.test(assistantId);
     const agentRes = isNumeric
       ? await this.pg.query('SELECT * FROM agents WHERE id = $1 LIMIT 1', [parseInt(assistantId, 10)])
@@ -1640,10 +1768,19 @@ ${LanguageService.buildDirective(userLanguage)}`;
     if (profileText && profileText.trim()) {
       prefix += `User profile:\n${profileText}\n\n`;
     }
+    if (this.businessProfile) {
+      try {
+        const biz = await this.businessProfile.renderForPrompt(userId, agent.category);
+        if (biz) prefix += biz + '\n\n';
+      } catch (e: any) {
+        this.logger.warn(`business profile injection failed (agent reply): ${e?.message}`);
+      }
+    }
     // Требование языка последней строкой — по той же причине, что в двух
     // других путях: директива в начале тонет под русской персоной и профилем.
     // Третье место, где приходится это дублировать; сборку промпта стоит
     // однажды свести в одно место, но не посреди ответа Apple.
+    prefix += `${RESPONSE_STYLE_RULE}\n\n`;
     prefix +=
       `${LANGUAGE_REPLY_LINE[await this.language.resolveUserLanguage(userId)] || LANGUAGE_REPLY_LINE[DEFAULT_LANGUAGE]}\n\n`;
 
@@ -1664,6 +1801,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
         `${userId}_${assistantId}_${await this.language.resolveUserLanguage(userId)}`,
     );
     const chunks: string[] = [];
+    const usage: SdkUsageTotals = {
+      input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
+    };
+    let costUsd = 0;
     const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
       headers: fd.getHeaders(),
       responseType: 'stream',
@@ -1681,13 +1822,25 @@ ${LanguageService.buildDirective(userLanguage)}`;
             const ev = JSON.parse(line.slice(6));
             if (ev.type === 'delta' || ev.type === 'text') chunks.push(ev.text);
             else if (ev.type === 'result' && ev.text && chunks.length === 0) chunks.push(ev.text);
+            else if (ev.type === 'done') {
+              // Стоимость и расход — здесь же, где их берёт основной путь.
+              if (typeof ev.costUsd === 'number' && ev.costUsd > 0) costUsd += ev.costUsd;
+              if (ev.usage && typeof ev.usage === 'object') {
+                for (const k of Object.keys(usage) as (keyof SdkUsageTotals)[]) {
+                  const v = ev.usage[k];
+                  if (typeof v === 'number' && v > 0) usage[k] += v;
+                }
+              }
+            }
           } catch {}
         }
       });
       resp.data.on('end', () => resolve());
       resp.data.on('error', reject);
     });
-    return this.stripToolTags(chunks.join('')).trim();
+    const text = this.stripToolTags(chunks.join('')).trim();
+    const charge = this.computeSdkCharge(usage, costUsd, text);
+    return { text, tokens: charge.tokens, costUsd };
   }
 
   /** Public wrapper для chat.controller — после upload-and-chat обогащаем профиль + tasks. */
@@ -1699,6 +1852,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     }
     if (this.tasksService) {
       try { await this.tasksService.extractFromTurn(userId, agentId, userMessage, assistantResponse); } catch {}
+    }
+    if (this.businessProfile) {
+      try { await this.businessProfile.extractFromTurn(userId, agentId, userMessage, assistantResponse); } catch {}
     }
   }
 

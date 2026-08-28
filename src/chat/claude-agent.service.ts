@@ -1,5 +1,5 @@
 // src/chat/claude-agent.service.ts
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import type { Response } from 'express';
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
@@ -10,6 +10,7 @@ import { PgService } from '../common/services/pg.service';
 import { SmmProducerToolsService, ToolContext } from '../smm/producer/smm-producer-tools.service';
 import { SMM_PRODUCER_SYSTEM_PROMPT } from '../smm/producer/smm-producer.prompt';
 import { SdkEventTranslator } from './claude-agent.event-translator';
+import { BusinessProfileService } from '../business-profile/business-profile.service';
 
 // Persistent path so session resume survives reboots (tmpfs /tmp clears on reboot).
 const SESSION_ROOT = path.join(
@@ -43,6 +44,9 @@ export class ClaudeAgentService {
   constructor(
     private readonly pg: PgService,
     private readonly smmTools: SmmProducerToolsService,
+    // @Optional — как в chat.service.ts: сборка/тесты не должны падать,
+    // если модуль бизнес-карточки почему-то не подключён.
+    @Optional() private readonly businessProfile?: BusinessProfileService,
   ) {}
 
   async streamSmmProducer(
@@ -51,6 +55,14 @@ export class ClaudeAgentService {
     chatSessionId: string,
     agentId: number,
     res: Response,
+    // Категория агента (agents.category) — прокинута из chat.service.ts, как
+    // и для трёх остальных путей сборки промпта. Юля (smm_producer) в прод-базе
+    // 'business', но не хардкодим: renderBusinessBlock сам решает полная
+    // карточка или строка-резюме, опираясь на реальную категорию.
+    agentCategory?: string | null,
+    // fresh: «чистый лист» — как и в остальных путях, не пишем автособранные
+    // факты из разговора, который пользователь явно попросил не запоминать.
+    fresh: boolean = false,
   ): Promise<void> {
     // Каталог именуем хешем, а не userId. SDK штатно сообщает модели свой
     // рабочий каталог, а userId у телефонной регистрации — это сам номер:
@@ -79,9 +91,23 @@ export class ClaudeAgentService {
     const resumeId = await this.loadSessionId(ctx.userId);
 
     const mcpServer = this.buildMcpServer(ctx);
+
+    // Бизнес-карточка — тем же волатильным механизмом, что и balanceBlock:
+    // system prompt пересобирается на КАЖДЫЙ вызов (в т.ч. при resume), так
+    // что свежее состояние карточки долетает и в возобновлённую сессию.
+    let businessBlock = '';
+    if (this.businessProfile) {
+      try {
+        businessBlock = await this.businessProfile.renderForPrompt(ctx.userId, agentCategory);
+      } catch (e: any) {
+        this.logger.warn(`business profile injection failed (SMM/Юля): ${e?.message}`);
+      }
+    }
+
     const ctxBlock = [
       `Контекст юзера: isAdmin=${ctx.isAdmin}.`,
       ctx.balanceBlock || '',
+      businessBlock,
     ].filter(Boolean).join('\n\n');
     const systemPromptWithCtx = `${ctxBlock}\n\n${SMM_PRODUCER_SYSTEM_PROMPT}`;
     let newSessionId: string | undefined;
@@ -212,6 +238,16 @@ export class ClaudeAgentService {
         );
       } catch (e: any) {
         this.logger.warn(`Failed to persist SMM assistant response: ${e.message}`);
+      }
+      // Извлечение фактов о бизнесе — четвёртый путь сборки промпта не должен
+      // быть слеп к фактам разговора так же, как и не должен быть слеп к
+      // карточке в system prompt (см. вставку businessBlock выше). Гейт по
+      // category='business' — внутри BusinessProfileService.extractFromTurn,
+      // здесь его дублировать не нужно.
+      if (this.businessProfile && !fresh) {
+        try {
+          await this.businessProfile.extractFromTurn(ctx.userId, String(agentId), userMessage, assistantText);
+        } catch { /* extractFromTurn уже не бросает наружу — на всякий случай */ }
       }
     }
 

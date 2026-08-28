@@ -23,6 +23,24 @@ describe('TalerIdOauthService', () => {
     } as any;
   }
 
+  // Mimics PgService for the identity lookup used by auto-reprovision self-heal:
+  // user_id (primary_phone/primary_email) + ai_profiles_consolidated (email/profile_data).
+  function makePg(opts: { phone?: string | null; email?: string; name?: string; throws?: boolean } = {}) {
+    const { phone = '79656445804', email, name, throws } = opts;
+    return {
+      query: jest.fn((sql: string) => {
+        if (throws) return Promise.reject(new Error('pg down'));
+        if (/FROM user_id/.test(sql)) {
+          return Promise.resolve({ rows: phone == null ? [] : [{ primary_phone: phone, primary_email: email }] });
+        }
+        if (/ai_profiles_consolidated/.test(sql)) {
+          return Promise.resolve({ rows: [{ email, profile_data: name ? { name } : null }] });
+        }
+        return Promise.resolve({ rows: [] });
+      }),
+    } as any;
+  }
+
   describe('connect', () => {
     const OLD_SCOPES_ENV = process.env.TALERID_SCOPES;
     afterEach(() => {
@@ -371,6 +389,127 @@ describe('TalerIdOauthService', () => {
       expect(result).toBeNull();
       expect(store.updateRefresh).not.toHaveBeenCalled();
       expect(store.updateAccess).not.toHaveBeenCalled();
+    });
+
+    it('SELF-HEAL: refresh dies (HTTP 400) → auto-reprovision via partner-secret → returns fresh access', async () => {
+      const pastExpiry = new Date(Date.now() - 60 * 1000);
+      const store = makeStore({
+        getConnection: jest.fn().mockResolvedValue({
+          userId: 'user-1', taleridUserId: 'tid-1', scopes: 'mcp:calendar', status: 'connected', accessExpiresAt: pastExpiry,
+        }),
+        getAccess: jest.fn().mockResolvedValue({ accessToken: 'stale-access', expiresAt: pastExpiry }),
+        getRefresh: jest.fn().mockResolvedValue('dead-refresh'),
+      });
+      const client = makeClient({
+        refresh: jest.fn().mockRejectedValue(new Error('TalerID refresh failed: HTTP 400')),
+        provision: jest.fn().mockResolvedValue({
+          ok: true, taleridUserId: 'tid-1', accessToken: 'reprov-access', refreshToken: 'reprov-refresh', expiresIn: 900, scope: 'mcp:calendar',
+        }),
+      });
+      const service = new TalerIdOauthService(store, client, makePg({ phone: '79656445804', email: 'a@b.com', name: 'Dmitry' }));
+
+      const result = await service.getBackendAccessToken('user-1');
+
+      // refresh was attempted and failed; then partner-provision re-minted the connection
+      expect(client.refresh).toHaveBeenCalledTimes(1);
+      expect(client.provision).toHaveBeenCalledWith(expect.objectContaining({ phone: '79656445804', email: 'a@b.com', firstName: 'Dmitry' }));
+      // fresh tokens persisted via saveConnection (not updateRefresh — that path is the happy refresh)
+      expect(store.saveConnection).toHaveBeenCalledTimes(1);
+      const [, params] = store.saveConnection.mock.calls[0];
+      expect(params.accessToken).toBe('reprov-access');
+      expect(params.refreshToken).toBe('reprov-refresh');
+      // returns the freshly minted access directly (no store round-trip needed)
+      expect(result).toBe('reprov-access');
+    });
+
+    it('SELF-HEAL: reprovision also fails → null, status set to error (honest, stops hammering)', async () => {
+      const pastExpiry = new Date(Date.now() - 60 * 1000);
+      const store = makeStore({
+        getConnection: jest.fn().mockResolvedValue({
+          userId: 'user-1', taleridUserId: 'tid-1', scopes: 'mcp:calendar', status: 'connected', accessExpiresAt: pastExpiry,
+        }),
+        getAccess: jest.fn().mockResolvedValue({ accessToken: 'stale-access', expiresAt: pastExpiry }),
+        getRefresh: jest.fn().mockResolvedValue('dead-refresh'),
+      });
+      const client = makeClient({
+        refresh: jest.fn().mockRejectedValue(new Error('TalerID refresh failed: HTTP 400')),
+        provision: jest.fn().mockResolvedValue({ ok: false, kind: 'error', status: 500 }),
+      });
+      const service = new TalerIdOauthService(store, client, makePg({ phone: '79656445804' }));
+
+      const result = await service.getBackendAccessToken('user-1');
+
+      expect(result).toBeNull();
+      expect(store.setStatus).toHaveBeenCalledWith('user-1', 'error');
+      expect(store.saveConnection).not.toHaveBeenCalled();
+    });
+
+    it('SELF-HEAL: no phone on file → no reprovision attempt, null', async () => {
+      const pastExpiry = new Date(Date.now() - 60 * 1000);
+      const store = makeStore({
+        getConnection: jest.fn().mockResolvedValue({
+          userId: 'user-1', taleridUserId: 'tid-1', scopes: 'mcp:calendar', status: 'connected', accessExpiresAt: pastExpiry,
+        }),
+        getAccess: jest.fn().mockResolvedValue({ accessToken: 'stale-access', expiresAt: pastExpiry }),
+        getRefresh: jest.fn().mockResolvedValue('dead-refresh'),
+      });
+      const client = makeClient({
+        refresh: jest.fn().mockRejectedValue(new Error('TalerID refresh failed: HTTP 400')),
+        provision: jest.fn(),
+      });
+      const service = new TalerIdOauthService(store, client, makePg({ phone: null }));
+
+      const result = await service.getBackendAccessToken('user-1');
+
+      expect(result).toBeNull();
+      expect(client.provision).not.toHaveBeenCalled();
+    });
+
+    it('SELF-HEAL: no pg wired (legacy/tests) → refresh failure still degrades to null (no crash)', async () => {
+      const pastExpiry = new Date(Date.now() - 60 * 1000);
+      const store = makeStore({
+        getConnection: jest.fn().mockResolvedValue({
+          userId: 'user-1', taleridUserId: 'tid-1', scopes: 'mcp:calendar', status: 'connected', accessExpiresAt: pastExpiry,
+        }),
+        getAccess: jest.fn().mockResolvedValue({ accessToken: 'stale-access', expiresAt: pastExpiry }),
+        getRefresh: jest.fn().mockResolvedValue('dead-refresh'),
+      });
+      const client = makeClient({
+        refresh: jest.fn().mockRejectedValue(new Error('TalerID refresh failed: HTTP 400')),
+        provision: jest.fn(),
+      });
+      const service = new TalerIdOauthService(store, client); // no pg
+
+      const result = await service.getBackendAccessToken('user-1');
+
+      expect(result).toBeNull();
+      expect(client.provision).not.toHaveBeenCalled();
+    });
+
+    it('provisionForUser: looks up identity and provisions, returns status', async () => {
+      const store = makeStore();
+      const client = makeClient({
+        provision: jest.fn().mockResolvedValue({
+          ok: true, taleridUserId: 'tid-1', accessToken: 'a', refreshToken: 'r', expiresIn: 900, scope: 'mcp:calendar',
+        }),
+      });
+      const service = new TalerIdOauthService(store, client, makePg({ phone: '79656445804', email: 'a@b.com', name: 'Dmitry' }));
+
+      const status = await service.provisionForUser('user-1');
+
+      expect(status).toBe('connected');
+      expect(client.provision).toHaveBeenCalledWith(expect.objectContaining({ phone: '79656445804', email: 'a@b.com', firstName: 'Dmitry' }));
+    });
+
+    it('provisionForUser: no phone → error, no provision call', async () => {
+      const store = makeStore();
+      const client = makeClient({ provision: jest.fn() });
+      const service = new TalerIdOauthService(store, client, makePg({ phone: null }));
+
+      const status = await service.provisionForUser('user-1');
+
+      expect(status).toBe('error');
+      expect(client.provision).not.toHaveBeenCalled();
     });
 
     it('no refresh token stored → null (no refresh call)', async () => {

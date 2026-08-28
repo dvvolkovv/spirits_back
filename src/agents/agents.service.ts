@@ -43,6 +43,7 @@ export class AgentsService {
                AND t.entity_id   = a.id::text
                AND t.locale      = $1
         WHERE a.name <> ALL($2::text[])
+          AND a.is_active
         ORDER BY a.id`,
       [lang, AgentsService.SERVICE_AGENTS],
     );

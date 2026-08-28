@@ -184,9 +184,15 @@ const scenarios = (jwtUser) => [
   {
     key: 'chat_streaming',
     run: async () => {
+      // fresh=true: проба идёт «чистым листом», в свою одноразовую сессию.
+      // Без этого 96 проб в сутки уходили в ОДНУ постоянную сессию
+      // `70000000000_12`, релей резюмил её через `--resume`, и каждая
+      // следующая проба перечитывала весь накопленный транскрипт: цена
+      // одного «ping (synthetic)» росла с $0.26 до $0.66, а на протухшем
+      // кэше доходила до $6. Одноразовая сессия стоит ровно холодный старт.
       const bytes = await streamFirstByte(`${BASE}/webhook/soulmate/chat`, {
         auth: `Bearer ${jwtUser}`,
-        payload: { chatInput: 'ping (synthetic)', assistant: '12' },
+        payload: { chatInput: 'ping (synthetic)', assistant: '12', fresh: true, freshTs: Date.now(), probe: true },
       });
       return `${bytes} bytes received`;
     },

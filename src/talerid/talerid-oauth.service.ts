@@ -1,6 +1,7 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { TalerIdStoreService } from './talerid-store.service';
 import { TalerIdOauthClient } from './talerid-oauth.client';
+import { PgService } from '../common/services/pg.service';
 import { TalerIdConnectionStatus, ProvisionResult, ProvisionFail } from './talerid.types';
 
 /**
@@ -66,6 +67,11 @@ export class TalerIdOauthService {
   constructor(
     private readonly store: TalerIdStoreService,
     private readonly client: TalerIdOauthClient,
+    // @Optional so the many `new TalerIdOauthService(store, client)` constructions in
+    // unit tests keep compiling; in the real DI graph (TalerIdModule imports CommonModule)
+    // PgService is always injected — it's needed by the auto-reprovision self-heal to look
+    // the user's phone up. Without pg, self-heal simply no-ops (degrades to null).
+    @Optional() private readonly pg?: PgService,
   ) {}
 
   async connect(
@@ -74,13 +80,29 @@ export class TalerIdOauthService {
     email?: string,
     firstName?: string,
   ): Promise<TalerIdConnectionStatus> {
+    const { status } = await this.provisionAndSave(userId, phone, email, firstName);
+    return status;
+  }
+
+  /**
+   * Partner-provision (create-or-find by phone, partner-secret) + persist. Returns the status
+   * AND, on success, the freshly minted access token — so the auto-reprovision self-heal can
+   * hand it straight back without a store round-trip (the store may not reflect the write yet,
+   * and in unit tests it never does). On failure records the status for the caller/UI.
+   */
+  private async provisionAndSave(
+    userId: string,
+    phone: string,
+    email?: string,
+    firstName?: string,
+  ): Promise<{ status: TalerIdConnectionStatus; accessToken?: string }> {
     const result = await this.client.provision({ phone, email, firstName, scopes: requestedScopes() });
 
     if (isProvisionFail(result)) {
       // ambiguous (409, last-10 phone match) or error (401/403/5xx/network) —
       // never save tokens, just record the status for the caller/UI.
       await this.store.setStatus(userId, result.kind);
-      return result.kind;
+      return { status: result.kind };
     }
 
     await this.store.saveConnection(userId, {
@@ -92,7 +114,44 @@ export class TalerIdOauthService {
       // this is 'mcp:calendar', post-widening the full set. Refresh reads it back.
       scopes: result.scope || CALENDAR_SCOPE.join(' '),
     });
-    return 'connected';
+    return { status: 'connected', accessToken: result.accessToken };
+  }
+
+  /**
+   * Provision for a user we only have the internal id of: look their SMS-verified phone
+   * (and best-effort email/name) up server-side, then partner-provision. Used by the
+   * connect controller and by the auto-reprovision self-heal. 'error' when no phone on file.
+   */
+  async provisionForUser(userId: string): Promise<TalerIdConnectionStatus> {
+    const { phone, email, firstName } = await this.lookupProvisionInput(userId);
+    if (!phone) return 'error';
+    const { status } = await this.provisionAndSave(userId, phone, email, firstName);
+    return status;
+  }
+
+  /**
+   * Best-effort identity lookup for provisioning: phone (required) + email/firstName
+   * (optional, used only to disambiguate a last-10 phone match). Mirrors the join in
+   * ProfileService — phone stored WITHOUT '+' (TalerIdOauthClient.toE164 normalizes).
+   * Any failure (or no pg wired) → phone:null, so the caller reports 'error'/no-op.
+   */
+  async lookupProvisionInput(userId: string): Promise<{ phone: string | null; email?: string; firstName?: string }> {
+    if (!this.pg) return { phone: null };
+    try {
+      const [uidRes, profileRes] = await Promise.all([
+        this.pg.query(`SELECT primary_phone, primary_email FROM user_id WHERE internal_id=$1`, [userId]),
+        this.pg.query(`SELECT email, profile_data FROM ai_profiles_consolidated WHERE user_id=$1`, [userId]),
+      ]);
+      const uidRow = uidRes.rows[0] || {};
+      const profileRow = profileRes.rows[0] || {};
+      const phone: string | null = uidRow.primary_phone || null;
+      const email: string | undefined = profileRow.email || uidRow.primary_email || undefined;
+      const firstName: string | undefined = profileRow.profile_data?.name || undefined;
+      return { phone, email, firstName };
+    } catch (e: any) {
+      this.logger.warn(`talerid lookupProvisionInput failed for user ${userId}: ${e?.message}`);
+      return { phone: null };
+    }
   }
 
   /**
@@ -157,8 +216,13 @@ export class TalerIdOauthService {
     try {
       refreshed = await this.client.refresh(refreshToken, grantedScope);
     } catch (e: any) {
-      this.logger.warn(`talerid refresh failed for user ${userId}: ${e?.message}`);
-      return null;
+      // The refresh chain is dead (TalerID refresh tokens expire/rotate/revoke — a stale one
+      // 400s forever). Left here it stays silently connected-but-empty: every calendar/notes
+      // surface degrades to [] with no recovery. Self-heal: re-mint the connection via
+      // partner-secret (no user interaction — we hold the SMS-verified phone), then return the
+      // fresh access. This is the durable fix for "TalerID items silently vanish".
+      this.logger.warn(`talerid refresh failed for user ${userId}: ${e?.message} — attempting auto-reprovision`);
+      return this.autoReprovision(userId);
     }
 
     // Persist the rotated refresh + new access BEFORE returning — never lose
@@ -167,6 +231,30 @@ export class TalerIdOauthService {
     await this.store.updateAccess(userId, refreshed.accessToken, new Date(Date.now() + refreshed.expiresIn * 1000));
 
     return refreshed.accessToken;
+  }
+
+  /**
+   * Self-heal a dead refresh chain: look the user's phone up and re-provision via partner-secret.
+   * Runs inside the single-flight (called only from doRefresh), so at most one reprovision per
+   * user at a time. On success returns the freshly minted access token; on failure returns null
+   * and provisionAndSave has already recorded an honest non-connected status (so getBackendAccessToken
+   * short-circuits on the next call instead of hammering TalerID). Never throws.
+   */
+  private async autoReprovision(userId: string): Promise<string | null> {
+    try {
+      const { phone, email, firstName } = await this.lookupProvisionInput(userId);
+      if (!phone) {
+        this.logger.warn(`talerid auto-reprovision skipped for user ${userId}: no phone on file`);
+        return null;
+      }
+      const { status, accessToken } = await this.provisionAndSave(userId, phone, email, firstName);
+      if (status === 'connected' && accessToken) return accessToken;
+      this.logger.warn(`talerid auto-reprovision for user ${userId} did not connect: ${status}`);
+      return null;
+    } catch (e: any) {
+      this.logger.warn(`talerid auto-reprovision failed for user ${userId}: ${e?.message}`);
+      return null;
+    }
   }
 
   async disconnect(userId: string): Promise<void> {

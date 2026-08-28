@@ -118,17 +118,20 @@ test.describe('my.linkeon.io smoke', () => {
     await expect(input).toBeVisible();
   });
 
-  test('onboarding match: reopen → pick theme → lands in chat', async ({ page }) => {
-    // Flag-independent: открываем match-экран всегда-доступной кнопкой
-    // «Подобрать специалиста» (работает и для уже onboarded-пользователей).
+  test('chat header: switcher works, no "reopen match" link', async ({ page }) => {
+    // Ссылка «Подобрать специалиста» убрана из шапки. Экран подбора остался, но
+    // показывается только новым пользователям (onboarded === false) — для уже
+    // onboarded-аккаунта, каким является TEST_PHONE, он недостижим по замыслу.
+    // Раньше здесь кликали эту ссылку; теперь тест сторожит два факта: ссылки
+    // нет, а сменить ассистента по-прежнему можно выпадающим списком.
     await applyBasicAuth(page);  // test.linkeon.io за nginx Basic Auth — иначе 401 до SPA
     const { access, refresh } = await getJwt();
-  await forceRussianProfile(access);
+    await forceRussianProfile(access);
     const userData = { phone: TEST_PHONE };
     const assistant = { id: 12, name: 'Роман', description: 'Помогаю делать все' };
     await page.addInitScript(([a, r, u, s]) => {
       localStorage.setItem('i18nextLng', 'ru');
-    localStorage.setItem('jwt_access_token', a);
+      localStorage.setItem('jwt_access_token', a);
       localStorage.setItem('jwt_refresh_token', r);
       localStorage.setItem('authToken', a);
       localStorage.setItem('userData', u);
@@ -136,18 +139,20 @@ test.describe('my.linkeon.io smoke', () => {
     }, [access, refresh, JSON.stringify(userData), JSON.stringify(assistant)]);
     await page.goto('/chat', { waitUntil: 'domcontentloaded' });
 
-    const reopen = page.getByTestId('reopen-match');
-    await reopen.waitFor({ state: 'visible', timeout: 20000 });
-    await reopen.click();
+    // Шапка дождалась холодных agents/profile и отрисовалась
+    const switcher = page.getByTestId('assistant-dropdown-btn');
+    await switcher.waitFor({ state: 'visible', timeout: 20000 });
 
-    const themes = page.getByTestId('onboarding-theme');
-    await expect(themes.first()).toBeVisible({ timeout: 10000 });
-    await themes.first().click();
+    // Удалённой ссылки в DOM нет
+    await expect(page.getByTestId('reopen-match')).toHaveCount(0);
 
-    // вернулись в чат — поле ввода видно
+    // Смена ассистента доступна: список открывается
+    await switcher.click();
+    await expect(page.getByTestId('assistant-dropdown-list')).toBeVisible({ timeout: 10000 });
+
+    // Чат при этом жив — поле ввода на месте
     const input = page.locator('textarea, input[type="text"]').first();
-    await input.waitFor({ state: 'visible', timeout: 20000 });
-    await expect(input).toBeVisible();
+    await expect(input).toBeVisible({ timeout: 20000 });
   });
 
   test('offer banner: does not break chat; dismissable if shown', async ({ page }) => {

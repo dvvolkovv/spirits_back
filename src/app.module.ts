@@ -17,13 +17,13 @@ import { SchedulerModule } from './scheduler/scheduler.module';
 import { MiscModule } from './misc/misc.module';
 import { VideoModule } from './video/video.module';
 import { AdminModule } from './admin/admin.module';
-import { DozvonModule } from './dozvon/dozvon.module';
 import { PeerModule } from './peer/peer.module';
 import { SupportModule } from './support/support.module';
 import { ContactsModule } from './contacts/contacts.module';
 import { McpModule } from './mcp/mcp.module';
 import { SmmModule } from './smm/smm.module';
 import { TasksModule } from './tasks/tasks.module';
+import { BusinessProfileModule } from './business-profile/business-profile.module';
 import { IdentityModule } from './identity/identity.module';
 import { MonitoringModule } from './monitoring/monitoring.module';
 import { EventsModule } from './events/events.module';
@@ -47,6 +47,8 @@ import { CalendarModule } from './calendar/calendar.module';
 import { TalerIdModule } from './talerid/talerid.module';
 import { SpeechModule } from './speech/speech.module';
 import { TmaModule } from './tma/tma.module';
+import { VoiceCallModule } from './voice-call/voice-call.module';
+import { MeetingModule } from './meeting/meeting.module';
 
 @Module({
   imports: [
@@ -68,13 +70,13 @@ import { TmaModule } from './tma/tma.module';
     MiscModule,
     VideoModule,
     AdminModule,
-    DozvonModule,
     PeerModule,
     SupportModule,
     ContactsModule,
     McpModule,
     SmmModule,
     TasksModule,
+    BusinessProfileModule,
     IdentityModule,
     EventsModule,
     MonitoringModule,
@@ -98,6 +100,8 @@ import { TmaModule } from './tma/tma.module';
     TalerIdModule,
     SpeechModule,
     TmaModule,
+    VoiceCallModule,
+    MeetingModule,
   ],
 })
 export class AppModule {}
