@@ -23,12 +23,8 @@ export class MeetingController {
     @Body() body: { agentId: number; code: string },
   ) {
     if (!u?.isAdmin) throw new ForbiddenException('meetings are admin-only in v1');
-    return this.meetings.join(
-      u.userId,
-      Number(body?.agentId),
-      String(body?.code || ''),
-      u.name || 'пользователя',
-    );
+    // Имя владельца сервис берёт из профиля сам: в JWT его нет.
+    return this.meetings.join(u.userId, Number(body?.agentId), String(body?.code || ''));
   }
 
   @Post(':id/leave')

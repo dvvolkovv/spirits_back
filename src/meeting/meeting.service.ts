@@ -27,11 +27,34 @@ export class MeetingService {
     private readonly rooms: RoomService,
   ) {}
 
+  /**
+   * Имя владельца — из профиля, а не из токена.
+   *
+   * Раньше контроллер брал его как `u.name || 'пользователя'`, а guard кладёт
+   * в request.user только { userId, sub, isAdmin }: поля name там нет и не
+   * было. То есть фолбэк срабатывал ВСЕГДА, и на каждой встрече ассистент
+   * представлялся «ассистент пользователя». Выглядело как случайный сбой,
+   * было единственно возможным поведением — поймано на встрече 28.08.2026.
+   */
+  private async resolveOwnerName(userId: string): Promise<string> {
+    try {
+      const res = await this.pg.query(
+        `SELECT NULLIF(TRIM(profile_data->>'name'), '') AS name
+           FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
+        [userId],
+      );
+      return res.rows[0]?.name || 'пользователя';
+    } catch (e: any) {
+      // Без имени встреча состоится, без ассистента — нет.
+      this.logger.warn(`имя владельца встречи не получено (${userId}): ${e?.message}`);
+      return 'пользователя';
+    }
+  }
+
   async join(
     userId: string,
     agentId: number,
     code: string,
-    ownerName: string,
   ): Promise<{ callId: string; title: string }> {
     const agentRes = await this.pg.query(
       `SELECT id, display_name, system_prompt, realtime_voice FROM agents WHERE id = $1 LIMIT 1`,
@@ -66,6 +89,7 @@ export class MeetingService {
 
     try {
       const preamble = await this.calls.buildPreamble(userId, agentId);
+      const ownerName = await this.resolveOwnerName(userId);
 
       await this.livekit.dispatchAgent(roomName, {
         callId,

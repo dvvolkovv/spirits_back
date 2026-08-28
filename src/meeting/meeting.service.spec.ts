@@ -20,11 +20,18 @@ describe('MeetingService', () => {
     realtime_voice: 'ash',
   };
 
-  /** База отвечает: ассистент есть, активных входов нет. */
-  function withAgent() {
-    pg.query.mockImplementation(async (sql: string) =>
-      sql.includes('FROM agents') ? { rows: [agentRow] } : { rows: [], rowCount: 0 },
-    );
+  /**
+   * База отвечает: ассистент есть, активных входов нет, в профиле имя владельца.
+   *
+   * Имя отдаём именно из профиля: раньше оно приходило параметром из
+   * контроллера, и тест был зелёным просто потому, что тест же его и передал.
+   */
+  function withAgent(ownerName: string | null = 'Дмитрий') {
+    pg.query.mockImplementation(async (sql: string) => {
+      if (sql.includes('FROM agents')) return { rows: [agentRow] };
+      if (sql.includes('ai_profiles_consolidated')) return { rows: [{ name: ownerName }] };
+      return { rows: [], rowCount: 0 };
+    });
   }
 
   beforeEach(() => {
@@ -44,14 +51,14 @@ describe('MeetingService', () => {
   describe('join', () => {
     it('заводит запись и зовёт воркера в комнату ВСТРЕЧИ, а не в новую', async () => {
       withAgent();
-      const res = await svc.join('u1', 7, 'ABC234', 'Дмитрий');
+      const res = await svc.join('u1', 7, 'ABC234');
       expect(res.callId).toEqual(expect.any(String));
       expect(livekit.dispatchAgent).toHaveBeenCalledWith('room_ABC234', expect.any(Object));
     });
 
     it('передаёт режим встречи и данные ассистента', async () => {
       withAgent();
-      await svc.join('u1', 7, 'ABC234', 'Дмитрий');
+      await svc.join('u1', 7, 'ABC234');
       expect(livekit.dispatchAgent).toHaveBeenCalledWith(
         'room_ABC234',
         expect.objectContaining({
@@ -63,15 +70,37 @@ describe('MeetingService', () => {
       );
     });
 
+    it('имя владельца берёт из профиля', async () => {
+      // В JWT имени нет: guard кладёт только { userId, sub, isAdmin }. Пока
+      // контроллер передавал `u.name || 'пользователя'`, фолбэк срабатывал
+      // всегда, и на встрече 28.08.2026 Роман представился «ассистент
+      // пользователя» — при том что в профиле записано «Дмитрий».
+      withAgent('Мария');
+      await svc.join('u1', 7, 'ABC234');
+      expect(livekit.dispatchAgent).toHaveBeenCalledWith(
+        'room_ABC234',
+        expect.objectContaining({ ownerName: 'Мария' }),
+      );
+    });
+
+    it('пустое имя в профиле не ломает вход — представится обезличенно', async () => {
+      withAgent(null);
+      await svc.join('u1', 7, 'ABC234');
+      expect(livekit.dispatchAgent).toHaveBeenCalledWith(
+        'room_ABC234',
+        expect.objectContaining({ ownerName: 'пользователя' }),
+      );
+    });
+
     it('берёт preamble из чата с ЭТИМ ассистентом, а не с Романом', async () => {
       withAgent();
-      await svc.join('u1', 7, 'ABC234', 'Дмитрий');
+      await svc.join('u1', 7, 'ABC234');
       expect(calls.buildPreamble).toHaveBeenCalledWith('u1', 7);
     });
 
     it('не предлагает ведущему спрашивать самого себя', async () => {
       withAgent();
-      await svc.join('u1', 7, 'ABC234', 'Дмитрий');
+      await svc.join('u1', 7, 'ABC234');
       const meta = livekit.dispatchAgent.mock.calls[0][1] as any;
       expect(meta.specialists.map((s: any) => s.name)).not.toContain('Андрей');
       expect(meta.specialists.length).toBeGreaterThan(0);
@@ -83,26 +112,26 @@ describe('MeetingService', () => {
         if (sql.includes('SELECT id FROM voice_calls')) return { rows: [{ id: 'existing' }] };
         return { rows: [], rowCount: 0 };
       });
-      await expect(svc.join('u1', 7, 'ABC234', 'Дмитрий')).rejects.toThrow(ConflictException);
+      await expect(svc.join('u1', 7, 'ABC234')).rejects.toThrow(ConflictException);
       expect(livekit.dispatchAgent).not.toHaveBeenCalled();
     });
 
     it('не входит в несуществующую комнату', async () => {
       withAgent();
       rooms.info.mockResolvedValue(null);
-      await expect(svc.join('u1', 7, 'ZZZZZZ', 'Дмитрий')).rejects.toThrow(NotFoundException);
+      await expect(svc.join('u1', 7, 'ZZZZZZ')).rejects.toThrow(NotFoundException);
       expect(livekit.dispatchAgent).not.toHaveBeenCalled();
     });
 
     it('не входит в закрытую комнату', async () => {
       withAgent();
       rooms.info.mockResolvedValue({ code: 'ABC234', title: 'x', active: false });
-      await expect(svc.join('u1', 7, 'ABC234', 'Дмитрий')).rejects.toThrow(NotFoundException);
+      await expect(svc.join('u1', 7, 'ABC234')).rejects.toThrow(NotFoundException);
     });
 
     it('неизвестный ассистент — отказ', async () => {
       pg.query.mockResolvedValue({ rows: [], rowCount: 0 });
-      await expect(svc.join('u1', 999, 'ABC234', 'Дмитрий')).rejects.toThrow(NotFoundException);
+      await expect(svc.join('u1', 999, 'ABC234')).rejects.toThrow(NotFoundException);
     });
 
     it('если dispatch не удался — запись не остаётся висеть активной', async () => {
@@ -110,14 +139,14 @@ describe('MeetingService', () => {
       // «один активный вход» смотрит именно на неё.
       withAgent();
       livekit.dispatchAgent.mockRejectedValue(new Error('livekit down'));
-      await expect(svc.join('u1', 7, 'ABC234', 'Дмитрий')).rejects.toThrow('livekit down');
+      await expect(svc.join('u1', 7, 'ABC234')).rejects.toThrow('livekit down');
       const failed = pg.query.mock.calls.find(([sql]: [string]) => sql.includes("status = 'failed'"));
       expect(failed).toBeDefined();
     });
 
     it('пишет провайдера и код комнаты — по ним потом ищет реапер', async () => {
       withAgent();
-      await svc.join('u1', 7, 'ABC234', 'Дмитрий');
+      await svc.join('u1', 7, 'ABC234');
       const insert = pg.query.mock.calls.find(([s]: [string]) => s.includes('INSERT INTO voice_calls'));
       expect(insert![1]).toContain('linkeon_room');
       expect(insert![1]).toContain('ABC234');
