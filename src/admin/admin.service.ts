@@ -1537,7 +1537,7 @@ export class AdminService implements OnModuleInit {
          a.user_id AS phone,
          a.created_at AS registered_at,
          COALESCE(a.tokens, 0)::bigint AS balance,
-         a.email,
+         COALESCE(NULLIF(a.email, ''), ident.email) AS email,
          a.isadmin,
          a.preferred_agent,
          a.profile_data,
@@ -1567,6 +1567,16 @@ export class AdminService implements OnModuleInit {
          WHERE status = 'succeeded' AND user_id = $1
          GROUP BY user_id
        ) pay ON pay.user_id = a.user_id
+       -- У аккаунтов, заведённых через email/OAuth, почта лежит только в
+       -- user_identities: ai_profiles_consolidated.email заполняется не всегда,
+       -- и карточка показывала UUID без единого человекочитаемого признака.
+       LEFT JOIN LATERAL (
+         SELECT ui.email
+         FROM user_identities ui
+         WHERE ui.user_id = a.user_id AND NULLIF(ui.email, '') IS NOT NULL
+         ORDER BY ui.email_verified DESC NULLS LAST
+         LIMIT 1
+       ) ident ON true
        LEFT JOIN referral_referees rr ON rr.referee_phone = a.user_id
        LEFT JOIN referral_leaders rl ON rl.id = rr.leader_id
        WHERE a.user_id = $1
