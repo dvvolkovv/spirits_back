@@ -45,6 +45,8 @@
 #   PROD_BACK_PATH     /home/dvolkov/spirits_back
 #   PROD_FRONT_SRC     /home/dvolkov/spirits_front_src
 #   PROD_FRONT_SERVED  /home/dvolkov/spirits_front
+#   PROD_NGINX_CONF    /etc/nginx/sites-enabled/spirits (живой файл, НЕ симлинк —
+#                      sites-available/spirits на проде устарел и не действует)
 #   PROD_BASE_URL      https://my.linkeon.io
 #   PROD_LAND_PATH     /home/dvolkov/land_linkeon
 #   LAND_BASE_URL      https://linkeon.io
@@ -462,7 +464,17 @@ deploy_frontend() {
   push_local_repo "$LOCAL_FRONT_DIR" "spirits_front"
 
   bold "[front 2/2] pulling on $ENV_NAME + building + deploying to nginx dir"
-  ssh_remote "
+  # Ловим имя бандла, которое этот билд ИМЕННО ЧТО произвёл (из свежесобранного
+  # dist/tma.html), а не то, что могло остаться в $FRONT_SERVED от прошлого
+  # деплоя — rsync без --delete старое не чистит (см. шапку файла). Печатаем
+  # его последней строкой-маркером и вытаскиваем ниже в EXPECTED_TMA_BUNDLE:
+  # smoke_frontend_tma сверяет served-контент именно с этим значением, а не
+  # со слабым «отличается от веб-бандла» — та проверка зеленеет и на
+  # осиротевшем /tma/, оставшемся от совсем другого, более старого деплоя.
+  # Если dist/tma.html не собрался (Mini App выпал из билда) — TMA_JS пустой,
+  # это не должно валить set -e, поэтому пайп заканчивается на head (exit 0).
+  local frontend_log
+  if ! frontend_log=$(ssh_remote "
     set -e
     cd $FRONT_SRC
     git fetch origin
@@ -471,8 +483,28 @@ deploy_frontend() {
     pnpm install --frozen-lockfile 2>&1 | tail -3
     pnpm build 2>&1 | tail -3
     rsync -az dist/ $FRONT_SERVED/
-  " || { red "  frontend deploy failed ($ENV_NAME)"; exit 1; }
+    TMA_JS=\$(grep -oE 'assets/[a-zA-Z0-9._-]*\.js' dist/tma.html 2>/dev/null | head -1)
+    echo TMA_BUNDLE_MARKER:\$TMA_JS
+  "); then
+    echo "$frontend_log" | grep -v '^TMA_BUNDLE_MARKER:'
+    red "  frontend deploy failed ($ENV_NAME)"
+    exit 1
+  fi
+  echo "$frontend_log" | grep -v '^TMA_BUNDLE_MARKER:'
+  EXPECTED_TMA_BUNDLE=$(echo "$frontend_log" | grep '^TMA_BUNDLE_MARKER:' | tail -1 | cut -d: -f2-)
+  export EXPECTED_TMA_BUNDLE
+  if [[ -z "$EXPECTED_TMA_BUNDLE" ]]; then
+    red "  ⚠ dist/tma.html не собрался ($ENV_NAME) — Mini App отсутствует в этом билде"
+  fi
   green "  ✓ frontend bundle deployed ($ENV_NAME)"
+
+  # Инфраструктурный шаг, не зависящий от того, собрался ли в ЭТОМ билде
+  # tma.html: location /tma/ должен быть в nginx ДО smoke, и должен быть
+  # на обеих фазах одинаково — иначе именно это молча дрейфует между test
+  # и prod (см. шапку функции). Падение здесь — то же самое, что и
+  # падение сборки: без него дальнейший smoke_frontend_tma гарантированно
+  # красный, а прод-nginx мог остаться жив только случайно.
+  ensure_tma_nginx_block || { red "  ✗ TMA nginx setup failed ($ENV_NAME) — деплой остановлен"; exit 1; }
 }
 
 # ── PHASE 3: лендинг linkeon.io ───────────────────────────────────────────────
@@ -605,6 +637,352 @@ run_landing_phase() {
   return 1
 }
 
+# Гарантирует наличие location-блока Telegram Mini App (/tma/) в nginx-конфиге
+# фазы. Раньше блок был только на test, добавленный руками в обход git — на
+# main этой правки не было вовсе, а deploy.sh уже получил smoke_frontend_tma,
+# который честно валит прод, где location /tma/ никогда не существовал.
+# Следующий же деплой (любого, по любому несвязанному поводу) после мержа
+# в main докатился бы до прод-фазы и увидел на проде ровно то же самое
+# отсутствие блока — красный smoke, паника, ручная правка прод-nginx под
+# давлением. Автоматизируем то же самое, что раньше делали руками, и делаем
+# идемпотентно на КАЖДОЙ фазе (test и prod), чтобы дрейф между ними стал
+# невозможен в принципе.
+#
+# Путь конфига РАЗНЫЙ на test и на проде (см. NGINX_CONF_PATH в run_phase):
+#   test — /etc/nginx/sites-available/test.linkeon.io, sites-enabled — симлинк на него;
+#   prod — /etc/nginx/sites-enabled/spirits САМ является живым файлом (не
+#     симлинк, sites-available/spirits — устаревшая недействующая копия).
+#     Отсюда и предостережение в CLAUDE.md: класть бэкап РЯДОМ, в
+#     sites-enabled/, нельзя — nginx читает там ВСЁ, и лишний файл валит
+#     nginx -t дублирующимся default_server.
+#
+# Идемпотентность — по стабильному маркеру-комментарию, а не по побайтовому
+# совпадению блока: ручные правки / форматирование не должны каждый раз
+# восприниматься как «блока нет» и провоцировать лишний reload.
+#
+# Вставляем ПЕРЕД SPA-фолбэком `location /` (как и было на test изначально) —
+# это тот самый bare `location /`, который отдаёт index.html на любой путь;
+# если наш блок окажется после него по логике/переносимости конфига, легче
+# перепутать порядок при будущей ручной правке. Ищем именно server-блок,
+# соответствующий домену этой фазы ($BASE_URL), а не первый попавшийся
+# `location /` в файле — на проде их несколько (b.linkeon.io редирект,
+# linkeon.io лендинг, my.linkeon.io — нужен только последний), а на test
+# один и тот же server_name встречается и в :80-редиректе (там location /
+# делает return 301, а не отдаёт SPA — это НЕ то место).
+ensure_tma_nginx_block() {
+  local conf="$NGINX_CONF_PATH"
+  local marker="# --- deploy.sh: Telegram Mini App (/tma/) — блок управляется автоматически, руками не трогать ---"
+
+  bold "[front] проверяю TMA nginx-блок ($ENV_NAME: $conf)"
+
+  local current
+  current=$(ssh_remote "sudo cat $conf" 2>/dev/null)
+  if [[ -z "$current" ]]; then
+    red "  ✗ не удалось прочитать $conf ($ENV_NAME) — TMA nginx-блок не проверен"
+    return 1
+  fi
+
+  # Проверяем ПО МАРКЕРУ, но также по факту наличия самого location /tma/ —
+  # на test этот блок уже стоит живьём, добавленный руками в обход git ДО
+  # этой правки, то есть без нашего маркера. Проверка только по маркеру
+  # приняла бы такой блок за «отсутствующий» и попыталась бы вставить
+  # ВТОРОЙ location /tma/ рядом — nginx -t упал бы на дубликате location,
+  # и хотя это отловилось бы safety-restore'ом ниже, реального «ничего не
+  # трогаю» (как требует идемпотентность) не получилось бы: бэкап, попытка
+  # записи, красный nginx -t, откат — churn там, где не должно быть вообще
+  # никакого движения.
+  #
+  # Но маркер (или даже сам location /tma/) МОГ пережить запись, прерванную
+  # посреди хвоста файла — раньше запись шла cp-поверх-живого-файла (не
+  # rename), и сбой ровно после того, как маркер+начало блока успели лечь на
+  # диск, но до того как дошла очередь до остатка конфига, оставлял бы файл
+  # с маркером, но БЕЗ закрывающих скобок остальных location/server. Голый
+  # grep по маркеру принял бы такое за «всё ОК» и вышел бы 0, ничего не
+  # починив — обрыв становится невидимым НАВСЕГДА, следующий запуск тоже
+  # доволен. Баланс фигурных скобок — дешёвый (без похода на сервер за вторым
+  # запросом, $current уже на руках) и достаточный сигнал именно для этого
+  # сценария: усечение почти всегда рвёт вложенность раньше, чем случайно
+  # совпадёт число открывающих/закрывающих скобок. Нарочно НЕ используем тут
+  # `nginx -t` — на проде он валидирует ВЕСЬ sites-enabled разом (my.linkeon.io
+  # + linkeon.io + b.linkeon.io), и никак не связанная поломка в чужом файле
+  # дала бы ложный «наш блок битый»; подсчёт скобок смотрит только в
+  # содержимое ИМЕННО этого файла.
+  local open_braces close_braces
+  open_braces=$(grep -o '{' <<<"$current" | wc -l | tr -d ' ')
+  close_braces=$(grep -o '}' <<<"$current" | wc -l | tr -d ' ')
+  if grep -qF "$marker" <<<"$current" || grep -qE '^[[:space:]]*location[[:space:]]*/tma/[[:space:]]*\{' <<<"$current"; then
+    if [[ "$open_braces" -eq "$close_braces" && "$open_braces" -gt 0 ]]; then
+      green "  ✓ TMA nginx-блок уже на месте ($ENV_NAME) — reload не нужен"
+      return 0
+    fi
+    red "  ✗ маркер TMA-блока найден в $conf ($ENV_NAME), но файл выглядит ОБРЕЗАННЫМ (скобки: {=$open_braces }=$close_braces не сходятся)"
+    red "    Похоже на конфиг, прерванный посреди прошлой записи. РУЧНОЕ ВМЕШАТЕЛЬСТВО: сверить $conf с бэкапами в /etc/nginx/deploy-backups на $ENV_NAME — автоматика не угадывает, что откатывать"
+    return 1
+  fi
+
+  bold "  блока нет в $conf ($ENV_NAME) — добавляю перед SPA-фолбэком location /"
+
+  # Домен этой фазы — по нему отличаем нужный server{} от прочих (лендинг,
+  # b.linkeon.io редирект, :80-редирект того же домена на test).
+  local host_pattern
+  host_pattern=$(sed -E 's#^https?://##' <<<"$BASE_URL")
+
+  # Собираем итоговый конфиг ЛОКАЛЬНО построчным bash-циклом (не awk: awk
+  # macOS/BSD ("one true awk") падает с "newline in string" при передаче
+  # многострочного $block через -v — POSIX это разрешает только некоторым
+  # реализациям; проверено эмпирически при тестировании этой функции).
+  # Состояние по server{}: is_plain_http отсекает :80-блок того же
+  # server_name (на test у него тоже "server_name test.linkeon.io;", но его
+  # location / — это return 301, а не SPA-фолбэк). Закрывающая '}' без
+  # отступа — граница server{} (вложенные location/if закрываются с отступом).
+  #
+  # Отступ блока БЕРЁМ с той же строки 'location /', перед которой вставляем
+  # — не хардкодим. На test живой конфиг отформатирован в 2 пробела на
+  # уровень, на проде — в 4 (см. sites-enabled/spirits): блок с чужим
+  # отступом читался бы как явный шов ручной правки в файле, который иначе
+  # выдержан единообразно. Вложенность внутри наших двух location — это
+  # ОДИН уровень глубже относительно самого 'location /tma/', а не глобальная
+  # константа: удваиваем найденный отступ ($indent$indent), что на test даёт
+  # 2→4 пробела, на проде 4→8 — ровно то, что уже стоит в обоих живых файлах.
+  local new_conf="" line
+  local in_server=0 is_plain_http=0 is_target=0 inserted=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^[[:space:]]*server[[:space:]]*\{ ]]; then
+      in_server=1; is_plain_http=0; is_target=0
+    fi
+    if [[ $in_server -eq 1 && "$line" =~ listen[[:space:]]+80([[:space:]]|\;) ]]; then
+      is_plain_http=1
+    fi
+    if [[ $in_server -eq 1 && $is_plain_http -eq 0 && "$line" == *"server_name"*"$host_pattern"* ]]; then
+      is_target=1
+    fi
+    if [[ $is_target -eq 1 && $is_plain_http -eq 0 && $inserted -eq 0 \
+          && "$line" =~ ^([[:space:]]*)location[[:space:]]+/[[:space:]]*\{ ]]; then
+      local indent="${BASH_REMATCH[1]}"
+      # alias — не root: префикс /tma/ не часть пути на диске (см. живой
+      # блок на test, откуда это и списано). try_files $uri (не /tma.html!)
+      # — версия с ведущим слэшем игнорировала $uri и заворачивала ЛЮБОЙ
+      # путь под /tma/, включая /tma/assets/*.js, на HTML — ломая ассеты.
+      local block="${indent}${marker}
+${indent}location = /tma {
+${indent}${indent}return 301 /tma/;
+${indent}}
+${indent}location /tma/ {
+${indent}${indent}alias $FRONT_SERVED/;
+${indent}${indent}try_files \$uri tma.html =404;
+${indent}}"
+      new_conf+="$block"$'\n'
+      inserted=1
+    fi
+    new_conf+="$line"$'\n'
+    if [[ "$line" =~ ^\} ]]; then
+      in_server=0
+    fi
+  done <<<"$current"
+
+  if [[ $inserted -ne 1 ]]; then
+    red "  ✗ не нашёл подходящий 'location /' в server-блоке для $host_pattern ($ENV_NAME, $conf)"
+    red "    TMA-блок НЕ добавлен — разбираться руками, автоматика не угадывает структуру конфига"
+    return 1
+  fi
+
+  # Содержимое гоняем через base64 одной строкой внутри команды (а не через
+  # stdin-pipe в ssh_remote) — ssh_remote ретраит команду при обрыве связи
+  # (код 255), а pipe из локальной переменной на повторной попытке был бы
+  # уже пуст. base64 — в самом аргументе команды, retry получит его заново.
+  local b64
+  # \r тоже вычищаем: BSD/macOS `base64` (в отличие от GNU) заворачивает
+  # вывод CRLF-переносами — голого `tr -d '\n'` мало, одинокие \r остаются
+  # внутри «однострочной» строки и валят GNU `base64 -d` на удалённом
+  # Ubuntu-хосте с "invalid input" (проверено эмпирически при тестировании).
+  b64=$(printf '%s' "$new_conf" | base64 | tr -d '\r\n')
+
+  # confdir — локально, не на сервере: dirname зависит только от $conf,
+  # который мы уже знаем, лишний remote-вызов не нужен. Он же — директория,
+  # где будем создавать временные файлы для атомарной замены (см. ниже,
+  # почему это обязано быть ТА ЖЕ директория, что и у $conf).
+  local confdir
+  confdir=$(dirname "$conf")
+
+  # ПОЧЕМУ ATOMIC RENAME, А НЕ cp-ПОВЕРХ-ЖИВОГО-ФАЙЛА (было раньше):
+  # `sudo cp tmp conf` — это truncate+write ВНУТРИ существующего инода. Если
+  # запись оборвётся посередине (диск кончился, oom-killer, оборвался ssh),
+  # читатель (в т.ч. следующий запуск ЭТОГО скрипта) увидит наполовину
+  # записанный файл — и под `set -e` это происходит ДО строки с `nginx -t`,
+  # так что restore-ветка (которая раньше жила только в её `else`) вообще не
+  # успевает выполниться. `mv`/`rename(2)` меняет ссылку в каталоге ОДНОЙ
+  # атомарной операцией (гарантия POSIX — только в пределах одной ФС, отсюда
+  # confdir выше и mktemp именно в нём, а не в /tmp): любой читатель либо
+  # видит старый файл целиком, либо новый целиком, серединных состояний не
+  # существует в принципе.
+  #
+  # Восстановление вынесено в trap ERR, а не только в `else` после `nginx -t`
+  # — это и есть суть фикса: сбой на ЛЮБОМ шаге после снятия бэкапа (cp
+  # бэкапа, mktemp, chown/chmod временного файла, сам mv) обязан откатывать,
+  # а не только красный nginx -t. Восстановление тоже идёт через mv-поверх-
+  # временного-файла (тем же приёмом), затем nginx -t для подтверждения — и
+  # если даже восстановленный конфиг не проходит nginx -t (например бэкап
+  # сам оказался повреждён), кричим максимально громко: дальше только руки
+  # человека, бэкап-файл называем явно.
+  #
+  # Блокировки на конкурентные запуски НЕТ и специально не добавляем: риск
+  # существует только в узком окне одного прогона ensure_tma_nginx_block до
+  # первой успешной записи маркера — как только маркер+сбалансированные
+  # скобки попали на диск, идемпотентность выше замыкает дыру сама. Лочить
+  # ради этого узкого окна отдельным механизмом внутри деплой-скрипта — свой
+  # источник багов (протухшие локи, забытый unlock на аварийном выходе).
+  local remote_out
+  remote_out=$(ssh_remote "
+    set -Eeo pipefail
+    bdir=/etc/nginx/deploy-backups
+    sudo mkdir -p \$bdir
+    # mktemp вместо голого 'date +%Y%m%d%H%M%S' — секундного разрешения не
+    # хватает при двух прогонах в одну секунду (например ручной повтор сразу
+    # после сбоя): второй перетёр бы бэкап первого ДО того как тот успел бы
+    # пригодиться. mktemp гарантирует уникальность атомарно, а не 'на глаз'.
+    bak=\$(sudo mktemp \"\${bdir}/$(basename "$conf").\$(date +%Y%m%d%H%M%S).XXXXXX\")
+    backed_up=0
+    restored=0
+    tmp=''
+    rtmp=''
+    # На отвал mv (и на любой другой сбой) может остаться осиротевший
+    # scratch-файл рядом с конфигом — сам mv успевает создать/заполнить tmp
+    # ДО попытки переименования, и при неудаче переименования файл никуда не
+    # девается. Подчищаем best-effort на выходе из скрипта в ЛЮБОМ случае
+    # (успех — tmp/rtmp уже не существуют, mv их 'съел'; неуспех — чистим);
+    # rm -f не должен уронить нас самих, если и это не удастся — молчим,
+    # человек и так получит громкое сообщение об основном сбое.
+    trap 'sudo rm -f \"\$tmp\" \"\$rtmp\" 2>/dev/null' EXIT
+
+    # Восстановление собрано из явных '|| restore_ok=0' на КАЖДОМ шаге, а не
+    # из очередного голого set -e — эта функция сама может быть вызвана ИЗ
+    # trap ERR, и если положиться на set -e внутри неё, второй сбой (та же
+    # причина, что сломала исходную запись — например диск кончился ещё
+    # секунду назад) оборвал бы shell ДО echo TMA_NGINX_RESULT:FAIL и ДО
+    # финального 'чинить руками' — то есть ровно та же дыра, которую чиним,
+    # но уже внутри самого восстановления. С явными проверками функция ВСЕГДА
+    # дожидается последней строки и печатает финальный статус.
+    restore_and_report() {
+      local reason=\"\$1\"
+      if [[ \$backed_up -eq 1 && \$restored -eq 0 ]]; then
+        restored=1
+        echo \"  ! \$reason — восстанавливаю $conf из \$bak\" >&2
+        local restore_ok=1
+        # rtmp НЕ local — она же читается в EXIT-трапе снаружи функции для
+        # best-effort уборки осиротевшего scratch-файла, если mv не удался.
+        rtmp=\$(sudo mktemp \"$confdir/.tma-restore-XXXXXX\") || restore_ok=0
+        # Восстановление — ТЕМ ЖЕ атомарным приёмом (mv рядом лежащего
+        # временного файла), а не cp поверх живого: иначе сам откат рискует
+        # оборваться тем же способом, каким сломался исходный шаг.
+        [[ \$restore_ok -eq 1 ]] && { sudo cp \"\$bak\" \"\$rtmp\" || restore_ok=0; }
+        [[ \$restore_ok -eq 1 ]] && { sudo chown \"\$orig_owner\" \"\$rtmp\" || restore_ok=0; }
+        [[ \$restore_ok -eq 1 ]] && { sudo chmod \"\$orig_mode\" \"\$rtmp\" || restore_ok=0; }
+        [[ \$restore_ok -eq 1 ]] && { sudo mv \"\$rtmp\" $conf || restore_ok=0; }
+        if [[ \$restore_ok -eq 1 ]] && sudo nginx -t 2>&1; then
+          echo \"  ✓ восстановление подтверждено nginx -t\" >&2
+        else
+          echo \"  !! ВОССТАНОВЛЕНИЕ НЕ УДАЛОСЬ или восстановленный конфиг НЕ проходит nginx -t — чинить руками НЕМЕДЛЕННО, бэкап цел: \$bak\" >&2
+        fi
+      fi
+      echo TMA_NGINX_RESULT:FAIL
+    }
+    trap 'restore_and_report \"сбой на шаге записи TMA nginx-блока\"' ERR
+
+    # Владельца/права запоминаем ДО любых изменений — прод живёт под
+    # dvolkov:dvolkov 0644, test под root:root 0644, и mktemp ниже создаст
+    # временный файл root:root 0600 (сам создаётся через sudo). Наивный mv
+    # поверх живого файла сохранил бы это — сменил бы владельца на root и
+    # сломал бы следующий деплой, идущий от имени dvolkov/dv без sudo.
+    orig_owner=\$(sudo stat -c '%U:%G' $conf)
+    orig_mode=\$(sudo stat -c '%a' $conf)
+
+    sudo cp $conf \"\$bak\"
+    backed_up=1
+
+    localtmp=\$(mktemp)
+    printf '%s' '$b64' | base64 -d > \"\$localtmp\"
+    tmp=\$(sudo mktemp \"$confdir/.tma-XXXXXX\")
+    sudo cp \"\$localtmp\" \"\$tmp\"
+    rm -f \"\$localtmp\"
+    sudo chown \"\$orig_owner\" \"\$tmp\"
+    sudo chmod \"\$orig_mode\" \"\$tmp\"
+    sudo mv \"\$tmp\" $conf
+
+    if sudo nginx -t 2>&1; then
+      sudo systemctl reload nginx
+      trap - ERR
+      echo TMA_NGINX_RESULT:OK
+    else
+      trap - ERR
+      restore_and_report 'nginx -t упал на новом TMA-блоке'
+    fi
+  ")
+  echo "$remote_out" | grep -v '^TMA_NGINX_RESULT:'
+
+  if grep -q '^TMA_NGINX_RESULT:OK' <<<"$remote_out"; then
+    green "  ✓ TMA nginx-блок добавлен и nginx перезагружен ($ENV_NAME)"
+    return 0
+  fi
+  # Не утверждаем "конфиг восстановлен" безусловно — в редком двойном сбое
+  # (запись упала И откат туда же не смог, см. restore_and_report) это было
+  # бы ложным успокоением. Что реально произошло — уже сказано построчно
+  # выше (оттуда же полный путь к бэкапу, если чинить руками).
+  red "  ✗ запись TMA-блока не удалась ($ENV_NAME) — подробности и статус отката см. в выводе выше, reload НЕ выполнен"
+  return 1
+}
+
+# Смоук Telegram Mini App (/tma/, отдельная точка входа — vite.config.ts
+# rollupOptions.input.tma). Как и smoke_landing — КОД ОТВЕТА ЗДЕСЬ НИЧЕГО НЕ
+# ЗНАЧИТ: и на test, и на проде nginx отдаёт index.html с кодом 200 на любой
+# незанятый путь (SPA-фолбэк), поэтому "/tma/ вернул 200" было бы зелёным
+# даже при полностью отсутствующем location /tma/ в nginx, то есть при
+# полностью мёртвом Mini App. Сравниваем СОДЕРЖИМОЕ.
+#
+# Раньше сравнение было только "бандл на /tma/ отличается от бандла на /" —
+# и это ловит SPA-фолбэк, но НЕ ловит осиротевший артефакт: rsync в
+# deploy_frontend работает БЕЗ --delete (см. шапку файла), поэтому старый
+# tma.html + старый tma-*.js могут годами пережить деплой, из которого
+# Mini App вообще пропал. Наблюдалось живьём на test 2026-08-26: чекаут был
+# на ветке без Mini App вовсе, dist/tma.html не собирался, а /tma/ всё равно
+# отдавал leftover прошлого деплоя — leftover‑бандл, естественно, отличался
+# от текущего веб-бандла, и старая проверка репортила зелёный.
+#
+# Поэтому теперь, если этой фазой фронт был только что собран (deploy_frontend
+# передал $expected — имя бандла из СВЕЖЕГО dist/tma.html), проверяем именно
+# "served == только что собранному", а не "served != web". Если фронт в этой
+# фазе не деплоился (SMOKE_ONLY=1 / BACK_ONLY=1 — свежего билда просто нет,
+# сравнивать не с чем), деградируем к старой слабой проверке: лучше слабый
+# сигнал, чем ложный fail на здоровом, но не пересобиравшемся в этом прогоне
+# фронте.
+smoke_frontend_tma() {
+  local base="$1" auth="${2:-}" expected="${3:-}"
+  local tma_bundle web_bundle
+  tma_bundle=$(curl -sf ${auth:+-u "$auth"} "$base/tma/" | grep -o 'src="/assets/[a-zA-Z0-9._-]*\.js"' | head -1)
+  if [[ -z "$tma_bundle" ]]; then
+    red "  ✗ /tma/ не отдал бандл ($ENV_NAME)"
+    return 1
+  fi
+
+  if [[ -n "$expected" ]]; then
+    if [[ "$tma_bundle" != *"$expected"* ]]; then
+      red "  ✗ /tma/ отдаёт НЕ тот бандл, что этот деплой только что собрал ($ENV_NAME): served=$tma_bundle, ожидали содержащий $expected"
+      return 1
+    fi
+    green "  ✓ Mini App отдаёт именно свежесобранный бандл ($ENV_NAME): $tma_bundle"
+    return 0
+  fi
+
+  # Фолбэк: фронт в этой фазе не деплоился, свежего dist/tma.html нет.
+  # Всё ещё ловит SPA-фолбэк, но не ловит orphaned-leftover сценарий выше.
+  web_bundle=$(curl -sf ${auth:+-u "$auth"} "$base/" | grep -o 'src="/assets/[a-zA-Z0-9._-]*\.js"' | head -1)
+  if [[ "$tma_bundle" == "$web_bundle" ]]; then
+    red "  ✗ /tma/ отдаёт веб-бандл ($ENV_NAME) — сработал SPA-фолбэк, location /tma/ не применился"
+    return 1
+  fi
+  bold "  ⚠ Mini App отдаёт свой бандл ($ENV_NAME), но без сверки со свежим билдом (фронт в этой фазе не деплоился): $tma_bundle"
+  return 0
+}
+
 run_phase() {
   local phase="$1"  # "test" или "prod"
   case "$phase" in
@@ -619,6 +997,8 @@ run_phase() {
       BASIC_AUTH="${TEST_BASIC_AUTH:-}"
       SSH_TARGET="$TEST_HOST"
       PG_DSN="${TEST_PG_DSN:-}"
+      # sites-enabled/test.linkeon.io — симлинк НА этот файл (см. ensure_tma_nginx_block).
+      NGINX_CONF_PATH="${TEST_NGINX_CONF:-/etc/nginx/sites-available/test.linkeon.io}"
       ;;
     prod)
       ENV_NAME=prod
@@ -631,9 +1011,21 @@ run_phase() {
       BASIC_AUTH=
       SSH_TARGET="$PROD_HOST"
       PG_DSN=  # smoke.js имеет default для прода
+      # На проде sites-enabled/spirits — САМ живой файл, а не симлинк на
+      # sites-available (та копия устарела и не действует). См. шапку
+      # ensure_tma_nginx_block — почему это важно для бэкапов.
+      NGINX_CONF_PATH="${PROD_NGINX_CONF:-/etc/nginx/sites-enabled/spirits}"
       ;;
   esac
-  export ENV_NAME HOST PATH_EXPORT BACK_PATH FRONT_SRC FRONT_SERVED BASE_URL BASIC_AUTH BRANCH SSH_TARGET PG_DSN
+  export ENV_NAME HOST PATH_EXPORT BACK_PATH FRONT_SRC FRONT_SERVED BASE_URL BASIC_AUTH BRANCH SSH_TARGET PG_DSN NGINX_CONF_PATH
+
+  # Сбрасываем перед каждой фазой: без этого прод унаследовал бы значение,
+  # которое deploy_frontend выставила на ПРЕДЫДУЩЕЙ (test) фазе того же
+  # запуска, и smoke_frontend_tma сверяла бы прод-бандл с чужим, тестовым
+  # ожиданием. Если в этой фазе deploy_frontend не вызывается (SMOKE_ONLY=1 /
+  # BACK_ONLY=1), переменная должна остаться пустой — это сигнал для
+  # smoke_frontend_tma деградировать к слабой проверке.
+  unset EXPECTED_TMA_BUNDLE
 
   if [[ -z "${SMOKE_ONLY:-}" ]]; then
     # Capture pre-deploy state on prod (по умолчанию) для авто-rollback'а
@@ -687,6 +1079,18 @@ run_phase() {
       else green "  ✓ SMOKE GREEN ($ENV_NAME)"; fi
     else
       red "  ✗ SMOKE FAILED ($ENV_NAME) — red on all $max_attempts attempts (real regression, not a flake)"
+      if [[ "$phase" == "prod" && -z "${NO_ROLLBACK:-}" && -z "${SMOKE_ONLY:-}" ]]; then
+        rollback_phase || red "  ✗ rollback had partial failures — check $ENV_NAME manually"
+      fi
+      return 1
+    fi
+
+    # Mini App — отдельная проверка содержимого (см. комментарий у
+    # smoke_frontend_tma). Не участвует в SMOKE_ATTEMPTS-ретраях основного
+    # smoke/run.sh: это статическая проверка nginx-конфига и собранного
+    # бандла, а не прогретого/холодного бэкенд-пути — флапать ей нечему.
+    if ! smoke_frontend_tma "$BASE_URL" "$BASIC_AUTH" "${EXPECTED_TMA_BUNDLE:-}"; then
+      red "  ✗ SMOKE FAILED ($ENV_NAME) — Mini App (/tma/) не прошёл проверку"
       if [[ "$phase" == "prod" && -z "${NO_ROLLBACK:-}" && -z "${SMOKE_ONLY:-}" ]]; then
         rollback_phase || red "  ✗ rollback had partial failures — check $ENV_NAME manually"
       fi

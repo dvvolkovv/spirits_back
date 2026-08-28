@@ -4,7 +4,7 @@ BEGIN;
 CREATE TABLE IF NOT EXISTS user_identities (
   id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id        text NOT NULL REFERENCES user_id(internal_id) ON DELETE CASCADE,
-  provider       text NOT NULL CHECK (provider IN ('phone','email','google','yandex','talerid','apple')),
+  provider       text NOT NULL CHECK (provider IN ('phone','email','google','yandex','talerid','apple','telegram')),
   provider_sub   text NOT NULL,
   email          text,
   email_verified boolean NOT NULL DEFAULT false,
@@ -17,24 +17,35 @@ CREATE INDEX IF NOT EXISTS idx_user_identities_email_verified ON user_identities
 
 -- Расширение списка провайдеров на УЖЕ созданной таблице: CREATE TABLE IF NOT
 -- EXISTS выше существующий CHECK не трогает, поэтому пересоздаём его явно —
--- и только если он ещё не знает про самый новый провайдер. Файл прогоняется
--- при каждом старте сервиса, так что блок обязан быть идемпотентным.
+-- и только если он ещё не знает про самый новый провайдер (сейчас — telegram).
+-- Файл прогоняется при каждом старте сервиса, так что блок обязан быть
+-- идемпотентным.
 --
--- ВНИМАНИЕ: расширять список провайдеров нужно ИМЕННО ЗДЕСЬ. Отдельные файлы
--- 002_*.sql и далее в этом каталоге НЕ ИСПОЛНЯЮТСЯ: onModuleInit в
--- identity.service.ts читает только 001. Новый файл миграции выглядел бы
--- рабочим и молча ничего не делал.
+-- ОБНОВЛЕНО 25.08.2026: старая версия этого комментария утверждала, что
+-- 002_*.sql и далее в этом каталоге НЕ ИСПОЛНЯЮТСЯ и поэтому расширять список
+-- провайдеров нужно именно здесь. Это больше не так: IDENTITY_MIGRATIONS в
+-- identity.service.ts теперь катает и 003_telegram_provider.sql (после этого
+-- файла), и любой следующий пронумерованный файл, если он добавлен в список.
+-- Новые провайдеры добавлять отдельным файлом миграции + записью в
+-- IDENTITY_MIGRATIONS, а не правкой этого блока — 002_talerid_provider.sql
+-- уже показал, чем оборачивается путаница «где именно менять список»: файл
+-- был написан, но никогда не исполнялся, и apple выжил только благодаря
+-- тому, что этот DO-блок переутверждает констрейнт на каждом старте.
+--
+-- Блок оставлен (и обновлён до полного списка) на случай восстановления БД
+-- из бэкапа, снятого до появления telegram/apple, — тогда именно он первым
+-- вернёт констрейнт к жизни, ещё до того как отработает 003.
 DO $$
 BEGIN
   IF EXISTS (
     SELECT 1 FROM pg_constraint
     WHERE conrelid = 'user_identities'::regclass
       AND conname  = 'user_identities_provider_check'
-      AND pg_get_constraintdef(oid) NOT LIKE '%apple%'
+      AND pg_get_constraintdef(oid) NOT LIKE '%telegram%'
   ) THEN
     ALTER TABLE user_identities DROP CONSTRAINT user_identities_provider_check;
     ALTER TABLE user_identities ADD  CONSTRAINT user_identities_provider_check
-      CHECK (provider IN ('phone','email','google','yandex','talerid','apple'));
+      CHECK (provider IN ('phone','email','google','yandex','talerid','apple','telegram'));
   END IF;
 END $$;
 

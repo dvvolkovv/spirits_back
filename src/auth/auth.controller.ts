@@ -10,6 +10,8 @@ import { JwtService } from '../common/services/jwt.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { RedisService } from '../common/services/redis.service';
 import { DevicesService } from '../devices/devices.service';
+import { PgService } from '../common/services/pg.service';
+import { verifyInitData } from '../tma/init-data';
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -31,6 +33,7 @@ export class AuthController {
     private readonly yandexOAuth: OAuthYandexService,
     private readonly appleOAuth: OAuthAppleService,
     private readonly devices: DevicesService,
+    private readonly pg: PgService,
   ) {}
 
   // SMS OTP request — UUID hardcoded to match frontend
@@ -525,6 +528,40 @@ location.replace('/chat');
 
     const r = await this.identity.linkMethod(userId, 'phone', { phone });
     if (!r.ok) return res.set(CORS).status(409).json({ error: (r as any).reason });
+    return res.set(CORS).status(200).json({ ok: true });
+  }
+
+  /**
+   * Привязка Telegram к уже авторизованному аккаунту.
+   *
+   * Зеркало linkPhone. Направление именно такое — привязка, а не слияние:
+   * mergeAccounts переносит только строки user_identities, а токены, историю
+   * и задачи оставляет на аккаунте, который помечает удалённым. Слить
+   * телефонный аккаунт с балансом в свежий telegram-аккаунт означало бы
+   * стереть баланс.
+   */
+  @UseGuards(JwtGuard)
+  @Post('auth/identities/link/telegram')
+  async linkTelegram(@Body() body: { initData?: string }, @Req() req: any, @Res() res: Response) {
+    const userId = req.user?.userId;
+    if (!userId) return res.set(CORS).status(401).json({ error: 'unauthorized' });
+
+    const verified = verifyInitData(body?.initData || '', process.env.TG_BOT_TOKEN || '');
+    if (!verified) return res.set(CORS).status(400).json({ error: 'invalid initData' });
+
+    const r = await this.identity.linkMethod(userId, 'telegram', { sub: String(verified.tgUserId) });
+    if (!r.ok) return res.set(CORS).status(409).json({ error: (r as any).reason });
+
+    await this.pg.query(
+      `INSERT INTO tg_user_identities (linkeon_user_id, tg_user_id, tg_username, tg_first_name)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (linkeon_user_id) DO UPDATE SET
+         tg_user_id = EXCLUDED.tg_user_id,
+         tg_username = EXCLUDED.tg_username,
+         tg_first_name = EXCLUDED.tg_first_name`,
+      [userId, verified.tgUserId, verified.tgUsername, verified.tgFirstName],
+    );
+
     return res.set(CORS).status(200).json({ ok: true });
   }
 

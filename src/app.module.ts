@@ -46,6 +46,7 @@ import { AskModule } from './ask/ask.module';
 import { CalendarModule } from './calendar/calendar.module';
 import { TalerIdModule } from './talerid/talerid.module';
 import { SpeechModule } from './speech/speech.module';
+import { TmaModule } from './tma/tma.module';
 import { VoiceCallModule } from './voice-call/voice-call.module';
 import { MeetingModule } from './meeting/meeting.module';
 
@@ -98,6 +99,7 @@ import { MeetingModule } from './meeting/meeting.module';
     CalendarModule,
     TalerIdModule,
     SpeechModule,
+    TmaModule,
     VoiceCallModule,
     MeetingModule,
   ],

@@ -22,8 +22,8 @@ function fakeRes() {
 
 const req = (headers: Record<string, string>) => ({ headers }) as any;
 
-// AuthController принимает 9 параметров (authService, email, identity, jwt,
-// redis, googleOAuth, yandexOAuth, appleOAuth, devices) — refresh() трогает
+// AuthController принимает 10 параметров (authService, email, identity, jwt,
+// redis, googleOAuth, yandexOAuth, appleOAuth, devices, pg) — refresh() трогает
 // только authService и devices, остальные подставные объекты не используются
 // этим маршрутом и передаются пустыми заглушками, чтобы сохранить порядок
 // аргументов конструктора.
@@ -40,6 +40,7 @@ function makeController(authService: any, devices: any) {
     unused, // yandexOAuth
     unused, // appleOAuth
     devices,
+    unused, // pg
   );
 }
 

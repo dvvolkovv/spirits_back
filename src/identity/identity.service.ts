@@ -5,6 +5,25 @@ import { PgService } from '../common/services/pg.service';
 import { EventsService } from '../events/events.service';
 import type { Provider, ProviderData, Identity, ResolveResult } from './identity.types';
 
+/**
+ * Файлы схемы, переутверждаемые при каждом старте.
+ *
+ * Это НЕ история миграций: таблицы schema_migrations здесь нет, каждый файл
+ * идемпотентен и накатывается заново на каждом запуске. Поэтому в списке
+ * только актуальные утверждения, а не всё, что когда-либо писалось.
+ *
+ * 002_talerid_provider.sql сюда намеренно не входит. Он перезаписывает
+ * констрейнт провайдеров БЕЗ apple, и его целиком заменяет 003. До 25.08.2026
+ * загрузчик катал только 001 и выходил, поэтому 002 никогда не исполнялся —
+ * apple уцелел лишь потому, что 001 переутверждает констрейнт на каждом старте.
+ * Включить 002 в список означало бы впервые запустить заведомо устаревшее
+ * утверждение ради того, чтобы следующей строкой его откатить.
+ */
+export const IDENTITY_MIGRATIONS = [
+  '001_identity_init.sql',
+  '003_telegram_provider.sql',
+];
+
 @Injectable()
 export class IdentityService implements OnModuleInit {
   private readonly logger = new Logger(IdentityService.name);
@@ -17,32 +36,34 @@ export class IdentityService implements OnModuleInit {
 
   async onModuleInit() {
     if (!this.pg) return;
-    const candidates = [
-      path.join(__dirname, 'migrations', '001_identity_init.sql'),
-      path.join(__dirname, '..', '..', 'src', 'identity', 'migrations', '001_identity_init.sql'),
-    ];
-    for (const p of candidates) {
-      if (!fs.existsSync(p)) continue;
-      const sql = fs.readFileSync(p, 'utf8');
+    for (const file of IDENTITY_MIGRATIONS) {
+      const candidates = [
+        path.join(__dirname, 'migrations', file),
+        path.join(__dirname, '..', '..', 'src', 'identity', 'migrations', file),
+      ];
+      const found = candidates.find((p) => fs.existsSync(p));
+      if (!found) {
+        this.logger.warn(`identity migration ${file} not found, skipping`);
+        continue;
+      }
+      const sql = fs.readFileSync(found, 'utf8');
       // Retry up to 5× with 1s backoff — PG pool connections are lazy and
       // occasionally the first query races against pool warm-up on startup.
       for (let attempt = 1; attempt <= 5; attempt++) {
         try {
           await this.pg.query(sql);
-          this.logger.log(`identity migration 001 applied from ${p}`);
-          return;
+          this.logger.log(`identity migration applied: ${file}`);
+          break;
         } catch (e: any) {
           if (attempt < 5) {
-            this.logger.warn(`identity migration attempt ${attempt} failed: ${e.message} — retrying in 1s`);
-            await new Promise(r => setTimeout(r, 1000));
+            this.logger.warn(`identity migration ${file} attempt ${attempt} failed: ${e.message} — retrying in 1s`);
+            await new Promise((r) => setTimeout(r, 1000));
           } else {
-            this.logger.error(`identity migration failed after ${attempt} attempts (${p}): ${e.message}`);
+            this.logger.error(`identity migration ${file} failed after ${attempt} attempts: ${e.message}`);
           }
         }
       }
-      return;
     }
-    this.logger.warn('identity migration sql not found, skipping');
   }
 
   private normalize(provider: Provider, data: any): string {
@@ -52,6 +73,7 @@ export class IdentityService implements OnModuleInit {
     // без этой ветки normalize бросал бы «unknown provider» уже в рантайме,
     // хотя типы бы сошлись.
     if (provider === 'google' || provider === 'yandex' || provider === 'talerid' || provider === 'apple') return data.sub;
+    if (provider === 'telegram') return String(data.sub);
     throw new Error(`unknown provider: ${provider}`);
   }
 
