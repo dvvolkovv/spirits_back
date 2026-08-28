@@ -923,6 +923,28 @@ export class TgBotService implements OnModuleInit {
     return { cleanText, markers };
   }
 
+  /**
+   * Картинку шлём БАЙТАМИ, а не ссылкой.
+   *
+   * Telegram скачивает URL своими серверами, а my.linkeon.io живёт за РФ-edge
+   * Selectel, до которого подсети дата-центров Telegram не доходят — та же
+   * ingress-фильтрация, из-за которой вебхуку понадобился закреплённый IP
+   * (TG_WEBHOOK_IP). На живом ходе 28.08.2026 это выглядело так: картинка
+   * сгенерилась успешно, а sendPhoto ответил 400 «failed to get HTTP URL
+   * content», и человек увидел молчание вместо картинки.
+   *
+   * Тот же приём уже применён к маркеру file ниже.
+   */
+  private async sendPhotoFromUrl(chatId: number, url: string, options: any): Promise<void> {
+    if (!/^https?:\/\//i.test(url)) throw new Error('url картинки должен быть http(s)');
+    const resp = await axios.get(url, {
+      responseType: 'arraybuffer',
+      timeout: 30_000,
+      maxContentLength: MAX_ATTACHMENT_BYTES,
+    });
+    await this.grammy.sendPhoto(chatId, Buffer.from(resp.data), options);
+  }
+
   /** Отправляет один маркер: генерим картинку или скачиваем по URL → шлём в чат. */
   private async dispatchOutgoingMarker(cfg: TgBotConfigRow, msg: any, m: OutgoingMarker): Promise<void> {
     if (m.kind === 'image') {
@@ -930,7 +952,7 @@ export class TgBotService implements OnModuleInit {
       const res = await this.misc.generateImage(cfg.owner_user_id, { prompt: m.prompt });
       const url = res?.images?.[0]?.url;
       if (!url) throw new Error('image-gen вернул пустой URL');
-      await this.grammy.sendPhoto(msg.chat.id, url, {
+      await this.sendPhotoFromUrl(msg.chat.id, url, {
         reply_to_message_id: msg.message_id,
         caption: m.prompt.slice(0, 1024),
       });
@@ -941,7 +963,7 @@ export class TgBotService implements OnModuleInit {
       const res = await this.misc.editImage(cfg.owner_user_id, { prompt: m.prompt, sourceImageUrl: m.source });
       const url = res?.images?.[0]?.url;
       if (!url) throw new Error('image-edit вернул пустой URL');
-      await this.grammy.sendPhoto(msg.chat.id, url, {
+      await this.sendPhotoFromUrl(msg.chat.id, url, {
         reply_to_message_id: msg.message_id,
         caption: m.prompt.slice(0, 1024),
       });
@@ -952,7 +974,7 @@ export class TgBotService implements OnModuleInit {
       const res = await this.misc.composeImage(cfg.owner_user_id, { prompt: m.prompt, sourceImageUrls: m.sources });
       const url = res?.images?.[0]?.url;
       if (!url) throw new Error('image-compose вернул пустой URL');
-      await this.grammy.sendPhoto(msg.chat.id, url, {
+      await this.sendPhotoFromUrl(msg.chat.id, url, {
         reply_to_message_id: msg.message_id,
         caption: m.prompt.slice(0, 1024),
       });
@@ -963,7 +985,7 @@ export class TgBotService implements OnModuleInit {
       const res = await this.misc.upscaleImage(cfg.owner_user_id, { sourceImageUrl: m.source });
       const url = res?.images?.[0]?.url;
       if (!url) throw new Error('upscale вернул пустой URL');
-      await this.grammy.sendPhoto(msg.chat.id, url, {
+      await this.sendPhotoFromUrl(msg.chat.id, url, {
         reply_to_message_id: msg.message_id,
       });
       return;
