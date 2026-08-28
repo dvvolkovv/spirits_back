@@ -458,6 +458,21 @@ export default defineAgent({
     session.on(AgentSessionEventTypes.Close, () => { void sendComplete('session_closed'); });
     ctx.addShutdownCallback(async () => { await sendComplete('shutdown'); });
 
+    // Свой вход выставляем ДО start() — это поддержанный фреймворком порядок.
+    //
+    // agent_session.js:403 проверяет `input.audio` перед созданием RoomIO и,
+    // найдя его занятым, пишет в лог «input.audio is already set, ignoring..»
+    // и свой аудиовход не подключает. Если же присвоить ПОСЛЕ start(), RoomIO
+    // успевает поставить свой, и дальше идёт гонка за одно поле — именно на
+    // ней ассистент трижды оставался глухим (27–28.08.2026).
+    //
+    // audioEnabled при этом трогать нельзя: с `false` условие выше не
+    // сработает, а заодно заглушится весь аудиотракт.
+    if (isMeeting) {
+      session.input.audio = new MixedRoomAudioInput(ctx.room);
+      console.log('[вход] микшер подставлен до старта сессии');
+    }
+
     try {
       await session.start({
         agent: new voice.Agent({
@@ -484,34 +499,11 @@ export default defineAgent({
         // ни одного onInputSpeechStarted за весь разговор. Живая встреча
         // 27.08.2026.
         //
-        // Штатный вход не мешает: присвоение session.input.audio ниже его
-        // заменяет.
+        // Штатный вход и не появится: input.audio выставлен выше, и RoomIO,
+        // найдя поле занятым, свой аудиовход не создаёт.
         ...(isMeeting ? { inputOptions: { closeOnDisconnect: false } } : {}),
       });
 
-      if (isMeeting) {
-        // Подменяем вход ПОСЛЕ start(): до него сессия ещё не собрала свой
-        // AgentInput.
-        const mixed = new MixedRoomAudioInput(ctx.room);
-        session.input.audio = mixed;
-        console.log('[вход] микшер подставлен в сессию');
-
-        // И ПЕРЕПРОВЕРЯЕМ, что он там остался.
-        //
-        // RoomIO присваивает session.input.audio в своём start(), и порядок
-        // относительно нашего присваивания не гарантирован ничем — поле
-        // приватное, штатного способа отдать ему свой вход нет. Если он нас
-        // перебил, возвращаем своё и говорим об этом в лог: молча проигранная
-        // гонка выглядит как «ассистент почему-то глухой».
-        const keepMine = () => {
-          if (session.input.audio !== mixed) {
-            console.log('[вход] RoomIO перебил вход — возвращаю микшер');
-            session.input.audio = mixed;
-          }
-        };
-        setTimeout(keepMine, 500).unref?.();
-        ctx.room.on(RoomEvent.ParticipantConnected, () => keepMine());
-      }
 
       // Первую фразу задаём явно, а не отдаём модели на импровизацию.
       //
