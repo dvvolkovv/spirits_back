@@ -90,6 +90,21 @@ export default defineAgent({
 
     await ctx.connect();
 
+    if (isMeeting) {
+      // Имя в списке участников. Без него люди видят `agent-AJ_xxx` и не
+      // понимают, кто к ним зашёл, — заметил владелец на живой встрече
+      // 28.08.2026. Гостям имя выдаётся в токене, а ассистент подключается
+      // через dispatch, где identity назначает фреймворк.
+      try {
+        await ctx.room.localParticipant?.updateName(
+          `${agentName} · ассистент ${meta.ownerName || 'пользователя'}`,
+        );
+      } catch (e) {
+        // Не повод рушить встречу: без имени неудобно, но разговор возможен.
+        console.error('не удалось выставить имя ассистента', e);
+      }
+    }
+
     const session = new voice.AgentSession({
       llm: new openai.realtime.RealtimeModel({
         model,
