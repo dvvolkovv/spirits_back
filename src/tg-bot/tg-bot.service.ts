@@ -132,6 +132,25 @@ export class TgBotService implements OnModuleInit {
       return;
     }
 
+    // Обычный текст в личке — разговор с ассистентом. Раньше такой ветки не
+    // было вовсе: бот молчал на всё, кроме /start и команд, и личного диалога
+    // с ассистентами в Telegram просто не существовало.
+    //
+    // Ветка стоит ПОСЛЕ проверки на '/' — иначе команды уехали бы в ассистента.
+    if (chatType === 'private') {
+      const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
+      if (!ownerId) {
+        await this.grammy.sendMessage(
+          msg.chat.id,
+          'Telegram не привязан к Linkeon. Нажми /start или зайди в кабинет и нажми «Подключить Telegram».',
+        );
+        return;
+      }
+      const cfg = await this.configs.ensurePrivateConfig(ownerId, msg.chat.id);
+      await this.handleChatMessage(msg, cfg);
+      return;
+    }
+
     if (chatType === 'channel') {
       try { await this.grammy.leaveChat(msg.chat.id); } catch { /* ignore */ }
       return;
@@ -142,7 +161,7 @@ export class TgBotService implements OnModuleInit {
         await this.handleGroupClaim(msg, startToken);
         return;
       }
-      await this.handleGroupMessage(msg);
+      await this.handleChatMessage(msg);
       return;
     }
   }
@@ -304,8 +323,17 @@ export class TgBotService implements OnModuleInit {
     }
   }
 
-  private async handleGroupMessage(msg: any): Promise<void> {
-    const cfg = await this.configs.getActiveByTgChatId(msg.chat.id);
+  /**
+   * Обработка сообщения в чате — групповом или личном. Раньше называлась
+   * handleGroupMessage: личных чатов у бота не было. Всё, что ниже (голос,
+   * вложения, баланс, история, биллинг), одинаково нужно обоим, поэтому
+   * второй такой путь не заводим.
+   *
+   * cfgIn передаёт личная ветка: там конфиг уже получен (и при необходимости
+   * создан) через ensurePrivateConfig, второй поход в БД не нужен.
+   */
+  private async handleChatMessage(msg: any, cfgIn?: TgBotConfigRow): Promise<void> {
+    const cfg = cfgIn ?? (await this.configs.getActiveByTgChatId(msg.chat.id));
     if (!cfg) return;
 
     const isVoice = !!(msg.voice || msg.audio);
