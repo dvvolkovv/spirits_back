@@ -9,12 +9,13 @@ export class VoiceCallController {
   constructor(private readonly calls: VoiceCallService) {}
 
   /**
-   * v1 — только админы. Проверка серверная: скрытая кнопка на фронте это
-   * удобство, а не защита.
+   * Звонок Роману — для любого ВОШЕДШЕГО пользователя [voice Ф1, owner 2026-08-28].
+   * Раньше был admin-only (v1); теперь голос — основной вход в LinkeonOS, и звонок
+   * доступен всем залогиненным (списывается с баланса, см. VoiceCallService.complete).
+   * Анонимный звонок до входа — отдельный путь (Ф2), не здесь.
    */
   @Post('start')
   async start(@CurrentUser() u: any) {
-    if (!u?.isAdmin) throw new ForbiddenException('voice calls are admin-only in v1');
     return this.calls.start(u.userId);
   }
 
