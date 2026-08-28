@@ -56,7 +56,7 @@ describe('обычный текст в личном чате', () => {
     await (svc as any).handleMessage(msg('привет'));
 
     expect((svc as any).handleChatMessage).not.toHaveBeenCalled();
-    expect(grammy.sendMessage).toHaveBeenCalledWith(777, expect.stringContaining('/start'));
+    expect(grammy.sendMessage).toHaveBeenCalled();
   });
 
   it('команды по-прежнему идут своим путём, не в ассистента', async () => {
@@ -79,12 +79,27 @@ describe('обычный текст в личном чате', () => {
     expect(text).not.toContain('Подключить Telegram');
   });
 
-  it('/start у непривязанного: прежняя подсказка про подключение', async () => {
+  it('непривязанному даётся кнопка мини-аппа, а не совет идти в веб', async () => {
+    // Совет «зайди в кабинет» был тупиком: войти в веб можно только по
+    // телефону или почте, то есть человеку БЕЗ аккаунта предлагали то, чего
+    // он сделать не может. Мини-апп — единственная дверь для регистрации
+    // прямо из Telegram.
+    identity.getLinkeonIdByTgUserId.mockResolvedValue(null);
+
+    await (svc as any).handleMessage(msg('привет'));
+
+    const [, text, opts] = grammy.sendMessage.mock.calls[0];
+    expect(text).not.toContain('кабинет');
+    const button = opts.reply_markup.inline_keyboard[0][0];
+    expect(button.web_app.url).toContain('/tma/');
+  });
+
+  it('/start у непривязанного — та же кнопка', async () => {
     identity.getLinkeonIdByTgUserId.mockResolvedValue(null);
 
     await (svc as any).handleMessage(msg('/start'));
 
-    const [, text] = grammy.sendMessage.mock.calls[0];
-    expect(text).toContain('Подключить Telegram');
+    const [, , opts] = grammy.sendMessage.mock.calls[0];
+    expect(opts.reply_markup.inline_keyboard[0][0].web_app.url).toContain('/tma/');
   });
 });

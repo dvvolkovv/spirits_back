@@ -40,6 +40,12 @@ const SANDBOX_OUTPUT_EXTS = new Set([
 ]);
 const MAX_SANDBOX_OUTPUT_SIZE = 49 * 1024 * 1024; // Telegram document limit 50MB
 
+/**
+ * Адрес мини-аппа для кнопки привязки. Совпадает с Menu Button бота в
+ * BotFather; вынесено в env на случай смены домена.
+ */
+const TMA_URL = process.env.TMA_URL || 'https://my.linkeon.io/tma/';
+
 @Injectable()
 export class TgBotService implements OnModuleInit {
   private readonly logger = new Logger(TgBotService.name);
@@ -130,9 +136,9 @@ export class TgBotService implements OnModuleInit {
       // (репорт владельца 28.08.2026, когда личка уже работала).
       const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
       if (!ownerId) {
-        await this.grammy.sendMessage(
+        await this.replyUnlinked(
           msg.chat.id,
-          'Привет! Для подключения зайди в Linkeon и нажми «Подключить Telegram».',
+          'Привет! Чтобы начать, открой Linkeon — там можно завести аккаунт или привязать существующий.',
         );
         return;
       }
@@ -163,9 +169,9 @@ export class TgBotService implements OnModuleInit {
     if (chatType === 'private') {
       const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
       if (!ownerId) {
-        await this.grammy.sendMessage(
+        await this.replyUnlinked(
           msg.chat.id,
-          'Telegram не привязан к Linkeon. Нажми /start или зайди в кабинет и нажми «Подключить Telegram».',
+          'Чтобы я отвечал, нужен аккаунт Linkeon — открой его кнопкой ниже.',
         );
         return;
       }
@@ -203,6 +209,27 @@ export class TgBotService implements OnModuleInit {
    * может получить только из сообщения, которое бот прислал ему же, так что
    * это либо чужой forward, либо отвязка аккаунта между показом и нажатием.
    */
+  /**
+   * Ответ человеку, чей Telegram не привязан к Linkeon.
+   *
+   * Кнопка ведёт в мини-апп, и это принципиально: прежний текст советовал
+   * «зайди в кабинет и нажми Подключить Telegram», но войти в веб-кабинет
+   * можно только по телефону или почте — то есть человеку БЕЗ аккаунта
+   * предлагали сделать то, чего он сделать не может. Мини-апп — единственная
+   * дверь, где аккаунт заводится прямо из Telegram: он показывает экран
+   * выбора «начать заново» / «у меня уже есть аккаунт».
+   *
+   * web_app-кнопки Telegram разрешает только в личных чатах — здесь мы
+   * всегда в личке.
+   */
+  private async replyUnlinked(chatId: number, intro: string): Promise<void> {
+    await this.grammy.sendMessage(chatId, intro, {
+      reply_markup: {
+        inline_keyboard: [[{ text: 'Открыть Linkeon', web_app: { url: TMA_URL } }]],
+      },
+    });
+  }
+
   private async handleCallbackQuery(cb: any): Promise<void> {
     const data = String(cb.data || '');
     const ownerId = await this.identity.getLinkeonIdByTgUserId(cb.from.id);
