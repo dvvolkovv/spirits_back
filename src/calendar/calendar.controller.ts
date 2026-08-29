@@ -2,7 +2,7 @@ import { Controller, Get, Post, Delete, Body, Param, UseGuards } from '@nestjs/c
 import { CalendarService } from './calendar.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
-import { ProposedEvent, ProposedTask } from './calendar.types';
+import { ProposedEvent } from './calendar.types';
 
 @Controller('calendar') // global prefix 'webhook' → /webhook/calendar/*
 export class CalendarController {
@@ -26,10 +26,19 @@ export class CalendarController {
     return this.calendar.createEvent(String(user.userId), body);
   }
 
+  // ДЕЛО/РУТИНА из карточки-предложения (Событие/Дело селектор) → облачный «дом дел»
+  // (linkeon_tasks), как quick-add [owner 2026-08-02]. Принимает recurrence/dates: РЕКУРРЕНТНОЕ
+  // дело = ОДНА строка-рутина, а НЕ куча событий (фикс: раньше карточка на серию всегда слала
+  // /calendar/events, и «Дело» всё равно создавало события).
   @Post('tasks')
   @UseGuards(JwtGuard)
-  async createTask(@CurrentUser() user: any, @Body() body: ProposedTask) {
-    return this.calendar.createTask(String(user.userId), body);
+  async createTask(
+    @CurrentUser() user: any,
+    @Body() body: { title: string; datetime?: string; recurrence?: any; dates?: string[]; note?: string },
+  ) {
+    const ok = await this.calendar.createTaskFromProposal(String(user.userId), body);
+    const created = ok ? (Array.isArray(body?.dates) && body.dates.length ? body.dates.length : 1) : 0;
+    return { ok, created, failed: ok ? 0 : 1 };
   }
 
   // Inline quick-add из виджета лаунчера [календарь-виджет]: свободная фраза → событие, без чата/карточки.
