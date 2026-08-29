@@ -1,6 +1,6 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import axios from 'axios';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { YandexCalDavConnector } from './caldav';
@@ -582,7 +582,8 @@ export class CalendarService {
       const due = recurrence
         ? undefined
         : `${date}T${time || '09:00'}:00${OFFSET}`;
-      await this.linkeonTasks.create(userId, { title, due, deadline, recurrence, note: parsed?.note });
+      const okc = await this.createTaskRouted(userId, { title, due, deadline, recurrence, note: parsed?.note });
+      if (!okc) return { status: 'error', ok: false, error: 'Не удалось создать дело' };
       if (this.onWrite) this.onWrite(userId);
       const whenText = recurrence ? 'рутина' : time ? this.humanWhen(`${date}T${time}:00`) : this.humanDay(date!);
       return { status: 'created', ok: true, title, kind: 'task', whenText, datetime: due };
@@ -774,16 +775,13 @@ export class CalendarService {
     const anchor = (dt?: string) => (dt ? withOffset(dt) : undefined);
     try {
       if (event.dates && event.dates.length) {
+        let ok = true;
         for (const dt of event.dates.slice(0, 100)) {
-          await this.linkeonTasks.create(userId, { title, due: anchor(dt), note: event.note });
+          ok = (await this.createTaskRouted(userId, { title, due: anchor(dt), note: event.note })) && ok;
         }
-      } else {
-        await this.linkeonTasks.create(userId, {
-          title,
-          due: anchor(event.datetime),
-          recurrence: event.recurrence,
-          note: event.note,
-        });
+        if (!ok) return false;
+      } else if (!(await this.createTaskRouted(userId, { title, due: anchor(event.datetime), recurrence: event.recurrence, note: event.note }))) {
+        return false;
       }
       this.onWrite?.(userId); // optimistic co-pilot refresh
       return true;
@@ -791,6 +789,28 @@ export class CalendarService {
       this.logger.error(`createTaskFromProposal failed: ${e.message}`);
       return false;
     }
+  }
+
+  /**
+   * Единая точка записи ДЕЛА/РУТИНЫ. Если у юзера подключён TalerID — пишем в календарь TalerID
+   * (owner: TalerID = дефолт для дел И событий, как createEvent), иначе — в локальный «дом дел»
+   * linkeon_tasks. Рекуррентное дело в обоих случаях = ОДНА запись (TalerID разворачивает сам).
+   * idempotencyKey детерминированный (title+due+recurrence) → повторный «Добавить»/двойной accept
+   * возвращает ту же задачу, а не плодит дубли.
+   */
+  private async createTaskRouted(
+    userId: string,
+    t: { title: string; due?: string; deadline?: string; note?: string; recurrence?: Recurrence },
+  ): Promise<boolean> {
+    if (await this.talerIdConnected(userId)) {
+      const key = 'lk-' + createHash('sha1')
+        .update(`${userId}|${t.title}|${t.due || ''}|${t.recurrence ? JSON.stringify(t.recurrence) : ''}`)
+        .digest('hex').slice(0, 40);
+      const r = await this.talerIdConnector.createTask(userId, { ...t, idempotencyKey: key });
+      return r.ok;
+    }
+    await this.linkeonTasks.create(userId, t);
+    return true;
   }
 
   async createTask(userId: string, task: ProposedTask): Promise<{ ok: boolean; uid?: string; error?: string }> {

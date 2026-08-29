@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { TalerIdOauthService } from './talerid-oauth.service';
-import { expandOccurrences } from '../calendar/recurrence';
+import { expandOccurrences, Recurrence } from '../calendar/recurrence';
 import { CalEvent, ProposedEvent, Task } from '../calendar/calendar.types';
 
 const TZID = 'Asia/Yekaterinburg';
@@ -160,6 +160,33 @@ export class TalerIdCalendarConnector {
     }
 
     return { created, failed, ids };
+  }
+
+  /**
+   * Создать ДЕЛО/РУТИНУ в TalerID (MCP create_task, live на PROD, scope mcp:calendar). В отличие от
+   * createEvent (бьёт серию на N событий), рекуррентное дело = ОДНА задача с recurrence — TalerID сам
+   * разворачивает её во вхождения (TaskOccurrence) при чтении. Форма recurrence §3.3 совпадает с
+   * внутренней Recurrence Линкеона один-в-один. idempotencyKey → дедуп (повторный вызов вернёт ту же
+   * задачу, не создаст дубль). Возвращает uid созданной задачи. ⚠️ uid↔id асимметрия: create/list
+   * отдают `uid`, а write-инструменты берут `id` — вызывающий кладёт uid как id при записях.
+   */
+  async createTask(
+    userId: string,
+    task: { title: string; due?: string; deadline?: string; note?: string; recurrence?: Recurrence; idempotencyKey?: string },
+  ): Promise<{ ok: boolean; uid?: string; error?: string }> {
+    const args: Record<string, any> = { title: task.title };
+    if (task.due) args.due = task.due;
+    if (task.deadline) args.deadline = task.deadline;
+    if (task.note) args.note = task.note;
+    if (task.recurrence) args.recurrence = task.recurrence;
+    if (task.idempotencyKey) args.idempotency_key = task.idempotencyKey;
+    try {
+      const result = await this.callTool(userId, 'create_task', args);
+      return { ok: true, uid: result?.uid ?? result?.id };
+    } catch (e: any) {
+      this.logger.debug(`talerid createTask failed for user ${userId}: ${e?.message}`);
+      return { ok: false, error: 'Не удалось создать дело в TalerID' };
+    }
   }
 
   /**

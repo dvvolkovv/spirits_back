@@ -154,3 +154,37 @@ describe('createTaskFromProposal — task proposals route to the cloud task home
     expect(create).not.toHaveBeenCalled();
   });
 });
+
+describe('createTaskRouted — TalerID-connected users write tasks to TalerID (owner: TalerID is default)', () => {
+  beforeAll(() => { process.env.CALENDAR_SECRET_KEY = '0123456789abcdef0123456789abcdef'; });
+  it('recurring task → talerIdConnector.createTask with recurrence + idempotencyKey; NOT linkeon_tasks', async () => {
+    const createTask = jest.fn().mockResolvedValue({ ok: true, uid: 't1' });
+    const linkeonCreate = jest.fn();
+    const svc = new CalendarService(
+      { query: jest.fn().mockResolvedValue({ rows: [] }) } as any,
+      { getConnection: jest.fn().mockResolvedValue({ status: 'connected' }) } as any,
+      { createTask } as any,
+      { create: linkeonCreate } as any,
+    );
+    const ok = await svc.createTaskFromProposal('u', {
+      title: 'Уход утро', datetime: '2026-08-30T07:30:00',
+      recurrence: { freq: 'daily', until: '2026-11-24' } as any,
+    });
+    expect(ok).toBe(true);
+    expect(createTask).toHaveBeenCalledTimes(1);
+    const arg = createTask.mock.calls[0][1];
+    expect(arg.due).toBe('2026-08-30T07:30:00+05:00');
+    expect(arg.recurrence).toEqual({ freq: 'daily', until: '2026-11-24' });
+    expect(typeof arg.idempotencyKey).toBe('string');
+    expect(linkeonCreate).not.toHaveBeenCalled();
+  });
+  it('TalerID createTask fails → createTaskFromProposal returns false (proposal reverts)', async () => {
+    const svc = new CalendarService(
+      { query: jest.fn().mockResolvedValue({ rows: [] }) } as any,
+      { getConnection: jest.fn().mockResolvedValue({ status: 'connected' }) } as any,
+      { createTask: jest.fn().mockResolvedValue({ ok: false }) } as any,
+      { create: jest.fn() } as any,
+    );
+    expect(await svc.createTaskFromProposal('u', { title: 'x', datetime: '2026-09-01T09:00:00' })).toBe(false);
+  });
+});
