@@ -196,10 +196,24 @@ export default defineAgent({
       },
     });
 
+    // Гонка на конце звонка: таймер (warnAt) или data-колбэк (ответ специалиста, готовый документ)
+    // может дёрнуть generateReply уже ПОСЛЕ session.close() → фреймворк кидает «AgentSession is not
+    // running», исключение uncaught, процесс падает и pm2 его рестартит (диагностировано 29.08.2026
+    // по error-логу). Гвардим ВСЕ вызовы generateReply: флаг + try/catch.
+    let sessionClosed = false;
+    function replySafe(opts: Parameters<typeof session.generateReply>[0]): void {
+      if (sessionClosed) return;
+      try {
+        session.generateReply(opts);
+      } catch (e) {
+        console.error('generateReply после закрытия сессии проигнорирован', e);
+      }
+    }
+
     /** Отдать накопленное, если Роман свободен. Всё сразу, одной репликой. */
     function flushPending(): void {
       const merged = pending.take();
-      if (merged) session.generateReply({ userInput: merged });
+      if (merged) replySafe({ userInput: merged });
     }
 
     /** Поставить реплику в очередь и попробовать произнести. */
@@ -373,13 +387,13 @@ export default defineAgent({
         case 'respond':
           // Именно эта реплика, а не «разговор целиком»: иначе модель
           // отвечает на вопрос, который слышала полчаса назад в молчании.
-          session.generateReply({ instructions: answerTo(textContent) });
+          replySafe({ instructions: answerTo(textContent) });
           break;
         case 'ack_listen':
-          session.generateReply({ instructions: listenAck() });
+          replySafe({ instructions: listenAck() });
           break;
         case 'ack_resume':
-          session.generateReply({ instructions: resumeAck() });
+          replySafe({ instructions: resumeAck() });
           break;
         case 'silent':
           break;
@@ -516,7 +530,7 @@ export default defineAgent({
 
     // Закрытие сессии — самый ранний надёжный сигнал: он приходит сразу после
     // того, как собеседник отключился, и процесс тогда ещё жив.
-    session.on(AgentSessionEventTypes.Close, () => { void sendComplete('session_closed'); });
+    session.on(AgentSessionEventTypes.Close, () => { sessionClosed = true; void sendComplete('session_closed'); });
     ctx.addShutdownCallback(async () => { await sendComplete('shutdown'); });
 
     // Свой вход выставляем ДО start() — это поддержанный фреймворком порядок.
@@ -576,7 +590,7 @@ export default defineAgent({
       // языке, и он берёт английский по умолчанию — текстовая инструкция в
       // промпте на это не влияет. Живой звонок 25.08.2026: «Hi there! Great
       // to meet you», и только на русский вопрос модель переключилась сама.
-      session.generateReply({
+      replySafe({
         instructions: isMeeting
           ? meetingIntro(agentName, meta.ownerName || 'пользователя')
           : callIntro(),
