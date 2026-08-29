@@ -1,4 +1,4 @@
-import { ConflictException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
@@ -122,15 +122,23 @@ export class VoiceCallService {
 
   async start(userId: string): Promise<{ callId: string; roomName: string; token: string; wsUrl: string }> {
     // Один активный звонок на пользователя. Минута разговора стоит реальных
-    // денег, а без этой проверки N вкладок (или цикл curl с админским
-    // токеном) дают N комнат и N оплачиваемых Realtime-сессий, погасить
-    // которые нечем. Индекс voice_calls_active_idx заведён ровно под неё.
+    // денег, а без этого N вкладок (или цикл curl) дали бы N комнат и N
+    // оплачиваемых Realtime-сессий. Но НЕ блокируем 409-м навсегда: при грязном
+    // конце (краш/убитое приложение/оборванный disconnect — bug 2026-08-29,
+    // трубка не рвала комнату) звонок застревал в 'dialing'/'active', и любой
+    // новый упирался в 409 без выхода. Пользователь, начинающий новый звонок,
+    // старый заведомо забросил → ВЫТЕСНЯЕМ его: гасим (комната закрывается →
+    // агент выходит и отправит complete со списанием за свою часть) и заводим
+    // новый. Инвариант «один активный на пользователя» сохранён — новый вытесняет старый.
     const active = await this.pg.query(
       `SELECT id FROM voice_calls WHERE user_id = $1 AND status IN ('dialing','active') LIMIT 1`,
       [userId],
     );
     if (active.rows[0]) {
-      throw new ConflictException({ message: 'call already in progress', callId: active.rows[0].id });
+      this.logger.warn(`[start] user=${userId}: вытесняю заброшенный звонок ${active.rows[0].id}`);
+      await this.markInterrupted(active.rows[0].id).catch((e) =>
+        this.logger.error(`[start] не смог закрыть старый звонок ${active.rows[0].id}: ${e?.message}`),
+      );
     }
 
     const callId = randomUUID();

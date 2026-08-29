@@ -174,15 +174,21 @@ describe('VoiceCallService', () => {
     expect(d.pg.inserted).toHaveLength(0);
   });
 
-  it('второй звонок при живом первом отклоняется', async () => {
+  it('новый звонок при незакрытом старом ВЫТЕСНЯЕТ его (не 409), закрывает старую комнату', async () => {
+    // Грязный конец (краш/убитое приложение/оборванный disconnect) оставлял старый звонок в
+    // 'dialing'/'active', и новый упирался в 409 без выхода. Теперь новый вытесняет старый.
     const d = makeDeps([]);
     d.pg.query = jest.fn(async (sql: string) => {
-      if (/SELECT id FROM voice_calls/i.test(sql)) return { rows: [{ id: 'уже-идёт' }], rowCount: 1 };
+      if (/SELECT id FROM voice_calls/i.test(sql)) return { rows: [{ id: 'старый' }], rowCount: 1 };
+      if (/UPDATE voice_calls SET status = 'interrupted'/i.test(sql)) return { rows: [{ room_name: 'old-room' }], rowCount: 1 };
       return { rows: [], rowCount: 1 };
     }) as any;
-    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
-    await expect(svc.start('u1')).rejects.toMatchObject({ status: 409 });
-    expect(d.livekit.dispatchAgent).not.toHaveBeenCalled();
+    const livekit = { ...d.livekit, closeRoom: jest.fn(async () => {}) };
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, livekit as any);
+    const res = await svc.start('u1');
+    expect(res.callId).toBeTruthy();
+    expect(livekit.closeRoom).toHaveBeenCalledWith('old-room');   // старый звонок погашен
+    expect(livekit.dispatchAgent).toHaveBeenCalled();             // новый — поднят
   });
 
   it('положить трубку — закрывает комнату, а не только красит строку', async () => {
