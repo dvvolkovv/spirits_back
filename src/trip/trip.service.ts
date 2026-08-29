@@ -414,9 +414,14 @@ export class TripService implements OnModuleInit {
       const flipped = await this.calendar.setProposalStatus(userId, id, 'accepted');
       if (flipped) {
         const p = await this.calendar.getProposal(userId, id);
-        if (p && p.kind === 'event' && p.event) {
-          const res = await this.calendar.createEvent(userId, p.event);
-          if (!res.ok) await this.calendar.revertProposalToPending(userId, id);
+        if (p && p.event) {
+          // Роутим по типу: ДЕЛО/РУТИНА → «дом дел» (linkeon_tasks, рекуррентное = одна строка),
+          // СОБЫТИЕ → календарь. Раньше task-предложение молча НЕ создавалось (был только event-путь),
+          // а расписанные чеклисты уходили событиями — отсюда «куча событий вместо задач».
+          const ok = p.kind === 'task'
+            ? await this.calendar.createTaskFromProposal(userId, p.event as any)
+            : (await this.calendar.createEvent(userId, p.event)).ok;
+          if (!ok) await this.calendar.revertProposalToPending(userId, id);
         }
       }
     } else if (kind === 'proposal_dismiss') {

@@ -758,6 +758,41 @@ export class CalendarService {
     return null;
   }
 
+  /**
+   * Создать ДЕЛО/РУТИНУ из принятого предложения агента (propose_calendar_event kind='task').
+   * Роутим в облачный «дом дел» Линкеона (linkeon_tasks) — как quick-add [owner 2026-08-02], а НЕ в
+   * календарь-события. Рекуррентное дело = ОДНА строка-рутина (разворачивается при чтении в list()),
+   * а не N событий — это и лечит баг «задача превратилась в кучу событий». `dates`-набор → по одному
+   * делу на дату. `datetime` (локальное ISO без зоны) — срок/якорь первого вхождения; без него — без срока.
+   */
+  async createTaskFromProposal(
+    userId: string,
+    event: { title: string; datetime?: string; recurrence?: Recurrence; dates?: string[]; note?: string },
+  ): Promise<boolean> {
+    const title = String(event?.title || '').trim();
+    if (!title) return false;
+    const anchor = (dt?: string) => (dt ? withOffset(dt) : undefined);
+    try {
+      if (event.dates && event.dates.length) {
+        for (const dt of event.dates.slice(0, 100)) {
+          await this.linkeonTasks.create(userId, { title, due: anchor(dt), note: event.note });
+        }
+      } else {
+        await this.linkeonTasks.create(userId, {
+          title,
+          due: anchor(event.datetime),
+          recurrence: event.recurrence,
+          note: event.note,
+        });
+      }
+      this.onWrite?.(userId); // optimistic co-pilot refresh
+      return true;
+    } catch (e: any) {
+      this.logger.error(`createTaskFromProposal failed: ${e.message}`);
+      return false;
+    }
+  }
+
   async createTask(userId: string, task: ProposedTask): Promise<{ ok: boolean; uid?: string; error?: string }> {
     const creds = await this.creds(userId);
     if (!creds || !creds.taskCollectionUrl) return { ok: false, error: 'Задачи недоступны' };

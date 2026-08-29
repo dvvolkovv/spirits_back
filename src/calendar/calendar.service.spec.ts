@@ -110,3 +110,47 @@ describe('CalendarService.setTaskDone — write-scoping (no cross-user writes)',
     }
   });
 });
+
+describe('createTaskFromProposal — task proposals route to the cloud task home (regression: were created as events)', () => {
+  beforeAll(() => { process.env.CALENDAR_SECRET_KEY = '0123456789abcdef0123456789abcdef'; });
+  const mk = () => {
+    const create = jest.fn().mockResolvedValue({ uid: 'u1' });
+    const linkeonTasks = { create };
+    const service = new CalendarService(
+      { query: jest.fn().mockResolvedValue({ rows: [] }) } as any,
+      {} as any, {} as any, linkeonTasks as any,
+    );
+    return { service, create };
+  };
+  it('recurring task → ONE linkeon_tasks row with recurrence + TZ anchor (not N events)', async () => {
+    const { service, create } = mk();
+    const ok = await service.createTaskFromProposal('u', {
+      title: 'Уход утро', datetime: '2026-08-30T07:30:00',
+      recurrence: { freq: 'daily', until: '2026-11-24' } as any,
+    });
+    expect(ok).toBe(true);
+    expect(create).toHaveBeenCalledTimes(1);
+    const arg = create.mock.calls[0][1];
+    expect(arg.title).toBe('Уход утро');
+    expect(arg.recurrence).toEqual({ freq: 'daily', until: '2026-11-24' });
+    expect(arg.due).toBe('2026-08-30T07:30:00+05:00');
+  });
+  it('dates set → one task per date', async () => {
+    const { service, create } = mk();
+    const ok = await service.createTaskFromProposal('u', { title: 'x', dates: ['2026-09-01T09:00:00', '2026-09-03T09:00:00'] });
+    expect(ok).toBe(true);
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+  it('plain task with time → single row, due set, no recurrence', async () => {
+    const { service, create } = mk();
+    await service.createTaskFromProposal('u', { title: 'позвонить', datetime: '2026-09-01T15:00:00' });
+    const arg = create.mock.calls[0][1];
+    expect(arg.due).toBe('2026-09-01T15:00:00+05:00');
+    expect(arg.recurrence).toBeUndefined();
+  });
+  it('empty title → false, no create', async () => {
+    const { service, create } = mk();
+    expect(await service.createTaskFromProposal('u', { title: '  ' } as any)).toBe(false);
+    expect(create).not.toHaveBeenCalled();
+  });
+});
