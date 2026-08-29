@@ -188,3 +188,36 @@ describe('createTaskRouted — TalerID-connected users write tasks to TalerID (o
     expect(await svc.createTaskFromProposal('u', { title: 'x', datetime: '2026-09-01T09:00:00' })).toBe(false);
   });
 });
+
+describe('renameTasksByTitle — TalerID rename (dedupe routine occurrences by uid)', () => {
+  beforeAll(() => { process.env.CALENDAR_SECRET_KEY = '0123456789abcdef0123456789abcdef'; });
+  it('renames each unique uid once (routine returns multiple occurrences, one uid)', async () => {
+    const listTasks = jest.fn().mockResolvedValue([
+      { uid: 'lk-a', title: 'Уход утро' },
+      { uid: 'lk-a', title: 'Уход утро' },
+      { uid: 'lk-b', title: 'Другое' },
+    ]);
+    const updateTask = jest.fn().mockResolvedValue({ ok: true });
+    const svc = new CalendarService(
+      { query: jest.fn().mockResolvedValue({ rows: [] }) } as any,
+      { getConnection: jest.fn().mockResolvedValue({ status: 'connected' }) } as any,
+      { listTasks, updateTask } as any,
+      { create: jest.fn() } as any,
+    );
+    const n = await svc.renameTasksByTitle('u', 'Уход утро', 'Уход за лицом утром');
+    expect(n).toBe(1);
+    expect(updateTask).toHaveBeenCalledTimes(1);
+    expect(updateTask).toHaveBeenCalledWith('u', 'lk-a', { title: 'Уход за лицом утром' });
+  });
+  it('empty from/to → 0, no update', async () => {
+    const updateTask = jest.fn();
+    const svc = new CalendarService(
+      { query: jest.fn() } as any,
+      { getConnection: jest.fn().mockResolvedValue({ status: 'connected' }) } as any,
+      { listTasks: jest.fn(), updateTask } as any,
+      {} as any,
+    );
+    expect(await svc.renameTasksByTitle('u', '', 'x')).toBe(0);
+    expect(updateTask).not.toHaveBeenCalled();
+  });
+});

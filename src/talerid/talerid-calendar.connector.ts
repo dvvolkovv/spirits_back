@@ -190,6 +190,24 @@ export class TalerIdCalendarConnector {
   }
 
   /**
+   * Изменить дело/рутину в TalerID (MCP update_task): title/due/deadline/note/recurrence.
+   * ⚠️ update_task берёт `id` (не uid) — вызывающий передаёт uid из listTasks как id. Best-effort.
+   */
+  async updateTask(
+    userId: string,
+    id: string,
+    patch: { title?: string; due?: string; deadline?: string; note?: string; recurrence?: Recurrence | null },
+  ): Promise<{ ok: boolean; error?: string }> {
+    try {
+      await this.callTool(userId, 'update_task', { id, ...patch });
+      return { ok: true };
+    } catch (e: any) {
+      this.logger.debug(`talerid updateTask ${id} failed for user ${userId}: ${e?.message}`);
+      return { ok: false, error: 'Не удалось изменить дело в TalerID' };
+    }
+  }
+
+  /**
    * Удалить событие в TalerID по его id (uid из listEvents == ev.id) через MCP delete_calendar_event
    * [удаление 2026-07-29, owner подтвердил поддержку]. Best-effort: ошибка MCP → {ok:false}.
    */

@@ -395,6 +395,12 @@ export class TripService implements OnModuleInit {
       } else {
         await this.linkeonTasks.drop(userId, String(uid));
       }
+    } else if (kind === 'task_rename') {
+      // Переименовать дело/рутину по текущему названию (TalerID → update_task, локально → linkeon_tasks).
+      const from = String(payload?.from || '').trim();
+      const to = String(payload?.to || '').trim();
+      if (!from || !to) throw new BadRequestException('from+to required');
+      await this.calendar.renameTasksByTitle(userId, from, to);
     } else if (kind === 'task_create') {
       if (!payload?.title) throw new BadRequestException('title required');
       await this.linkeonTasks.create(userId, {

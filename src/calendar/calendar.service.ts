@@ -798,6 +798,35 @@ export class CalendarService {
    * idempotencyKey детерминированный (title+due+recurrence) → повторный «Добавить»/двойной accept
    * возвращает ту же задачу, а не плодит дубли.
    */
+  /**
+   * Переименовать дело/рутину по текущему названию (title уникален на практике). TalerID → находим
+   * задачи широким окном listTasks (рутина отдаёт несколько вхождений с ОДНИМ uid — дедуплицируем)
+   * и update_task(title). Локально → UPDATE linkeon_tasks. Возвращает число изменённых сущностей.
+   */
+  async renameTasksByTitle(userId: string, fromTitle: string, toTitle: string): Promise<number> {
+    const from = String(fromTitle || '').trim();
+    const to = String(toTitle || '').trim();
+    if (!from || !to) return 0;
+    if (await this.talerIdConnected(userId)) {
+      const now = new Date();
+      const tasks = await this.talerIdConnector.listTasks(userId, now, new Date(now.getTime() + 400 * 86_400_000), now);
+      const uids = [...new Set(tasks.filter((t) => t.title === from && t.uid).map((t) => t.uid as string))];
+      let n = 0;
+      for (const uid of uids) {
+        const r = await this.talerIdConnector.updateTask(userId, uid, { title: to });
+        if (r.ok) n++;
+      }
+      this.onWrite?.(userId);
+      return n;
+    }
+    const r = await this.pg.query(
+      `UPDATE linkeon_tasks SET title = $3, updated_at = now() WHERE user_id = $1 AND title = $2`,
+      [userId, from, to],
+    );
+    this.onWrite?.(userId);
+    return r.rowCount ?? 0;
+  }
+
   private async createTaskRouted(
     userId: string,
     t: { title: string; due?: string; deadline?: string; note?: string; recurrence?: Recurrence },
