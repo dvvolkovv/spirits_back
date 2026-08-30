@@ -8,6 +8,50 @@ describe('TalerIdCalendarConnector', () => {
     } as any;
   }
 
+  describe('listTasks — время рутины из due, а не хардкод 09:00', () => {
+    const from = new Date('2026-08-30T00:00:00Z');
+    const to = new Date('2026-09-02T00:00:00Z');
+    const now = new Date('2026-08-30T05:00:00Z'); // 10:00 Asia/Yekaterinburg
+
+    it('вечерняя рутина берёт время-суток из t.due (16:00Z=21:00), а не 09:00 (bug 2026-08-30)', async () => {
+      const connector = new TalerIdCalendarConnector(makeOauth());
+      jest.spyOn(connector as any, 'callTool').mockResolvedValue([
+        {
+          uid: 'routine-evening', title: 'Уход за лицом вечером',
+          due: '2026-08-30T16:00:00.000Z', // 21:00 локально
+          recurrence: { freq: 'daily' },
+          occurrences: [{ occurrenceDate: '2026-08-30', status: 'pending' }],
+        },
+      ]);
+      const tasks = await connector.listTasks('u1', from, to, now);
+      const r = tasks.find((t) => t.uid === 'routine-evening')!;
+      expect(r.due).toBe('2026-08-30T16:00:00.000Z'); // вечер, НЕ 04:00Z (09:00)
+    });
+
+    it('dueOverride конкретного вхождения имеет приоритет', async () => {
+      const connector = new TalerIdCalendarConnector(makeOauth());
+      jest.spyOn(connector as any, 'callTool').mockResolvedValue([
+        {
+          uid: 'r-ov', title: 'Рутина', due: '2026-08-30T16:00:00.000Z',
+          recurrence: { freq: 'daily' },
+          occurrences: [{ occurrenceDate: '2026-08-30', status: 'pending', dueOverride: '2026-08-30T07:00:00.000Z' }],
+        },
+      ]);
+      const tasks = await connector.listTasks('u1', from, to, now);
+      expect(tasks.find((t) => t.uid === 'r-ov')!.due).toBe('2026-08-30T07:00:00.000Z');
+    });
+
+    it('без t.due — fallback на 09:00 локально (04:00Z)', async () => {
+      const connector = new TalerIdCalendarConnector(makeOauth());
+      jest.spyOn(connector as any, 'callTool').mockResolvedValue([
+        { uid: 'r-none', title: 'Рутина без времени', recurrence: { freq: 'daily' },
+          occurrences: [{ occurrenceDate: '2026-08-30', status: 'pending' }] },
+      ]);
+      const tasks = await connector.listTasks('u1', from, to, now);
+      expect(tasks.find((t) => t.uid === 'r-none')!.due).toBe('2026-08-30T04:00:00.000Z');
+    });
+  });
+
   describe('listEvents', () => {
     it('maps TalerID startAt/endAt/title/id -> CalEvent with source talerid', async () => {
       const oauth = makeOauth();

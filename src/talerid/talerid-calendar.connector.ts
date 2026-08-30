@@ -229,6 +229,15 @@ export class TalerIdCalendarConnector {
     return new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Yekaterinburg' }).format(new Date(ms));
   }
 
+  /** Время-суток (HH:mm:ss) абсолютного момента в локальной зоне — как naiveLocal в linkeon-tasks. */
+  private localHms(d: Date): string {
+    const p = new Intl.DateTimeFormat('sv-SE', {
+      timeZone: 'Asia/Yekaterinburg', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+    }).formatToParts(d);
+    const g = (t: string) => p.find((x) => x.type === t)!.value;
+    return `${g('hour')}:${g('minute')}:${g('second')}`;
+  }
+
   async listTasks(userId: string, start: Date, end: Date, now: Date): Promise<Task[]> {
     try {
       const from = start.toISOString().slice(0, 10);
@@ -251,7 +260,11 @@ export class TalerIdCalendarConnector {
             if (!occDate || occDate < today) continue;
             const st = o?.status || 'pending';
             if (st === 'skipped') continue;
-            const instant = o?.dueOverride ? new Date(o.dueOverride) : new Date(`${occDate}T09:00:00${OFFSET}`);
+            // Время-суток вхождения берём из базового due рутины (утро/вечер и т.п.), а НЕ хардкодим
+            // 09:00 — иначе утренняя и вечерняя рутина обе показывались в 9:00 (bug 2026-08-30).
+            // dueOverride (перенос конкретного вхождения) имеет приоритет. Зеркалит linkeon-tasks.
+            const timeOfDay = t.due ? this.localHms(new Date(t.due)) : '09:00:00';
+            const instant = o?.dueOverride ? new Date(o.dueOverride) : new Date(`${occDate}T${timeOfDay}${OFFSET}`);
             if (Number.isNaN(instant.getTime()) || instant.getTime() > toMs) continue;
             if (st === 'done') {
               if (occDate === today) {
