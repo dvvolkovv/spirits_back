@@ -193,6 +193,40 @@ const sessionJsonlPath = (claudeSid) => "/home/dv/.claude/projects/-tmp/" + clau
 // не поднимается, и вызов раньше упал бы в temporal dead zone.
 loadSessionMap();
 
+// Порог, ниже которого сессию даже не осматриваем: подавляющее большинство
+// (143 из 166 живых на 30.08.2026) не дорастает и до половины мегабайта.
+const SESSION_SCAN_BYTES = 1536 * 1024;
+// Доля tool_result, при которой сессию считаем «инструментальной» и ротируем
+// досрочно, не дожидаясь общего потолка.
+const TOOL_HEAVY_RATIO = 0.5;
+
+/**
+ * Доля байтов, занятых результатами инструментов.
+ *
+ * Замер 30.08.2026 по 14 тяжёлым сессиям живых пользователей: tool_result дал
+ * 68.8 % объёма, и 97 % этого объёма — один инструмент Read (98 вызовов, в
+ * среднем 226 КБ, только 3 вызова из 98 с limit/offset). Читать файл целиком
+ * правильно — он для того и прислан, — но держать его в контексте все
+ * следующие сорок ходов не нужно: дальше от него нужны выводы, а они лежат в
+ * текстовых репликах и переносятся хвостом.
+ *
+ * Считаем подстрокой, без JSON.parse: файл может быть на 16 МБ, а нам нужна
+ * лишь пропорция. Ошибка от служебных вхождений пренебрежима на фоне порога.
+ */
+function toolResultShare(claudeSid) {
+  try {
+    const raw = fs.readFileSync(sessionJsonlPath(claudeSid), "utf8");
+    if (!raw.length) return 0;
+    let tool = 0;
+    for (const line of raw.split("\n")) {
+      if (line.includes('"type":"tool_result"')) tool += line.length;
+    }
+    return tool / raw.length;
+  } catch {
+    return 0;
+  }
+}
+
 function extractTailDialogue(claudeSid, maxMsgs = 30, maxCharsPerMsg = 1500) {
   try {
     const lines = fs.readFileSync(sessionJsonlPath(claudeSid), "utf8").split("\n");
@@ -712,7 +746,20 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       try {
         const claudeSid = sessionMap.get(sessionId);
         const st = fs.statSync(sessionJsonlPath(claudeSid));
-        if (st.size > SESSION_ROTATE_BYTES) {
+        // Два повода ротировать. Общий потолок ловит разговорные сессии, а
+        // «инструментальная» проверка — те, что раздулись прочитанными файлами:
+        // они добираются до потолка медленнее, но каждый ход там уже стоит
+        // сотни тысяч токенов. statSync дешёвый, поэтому сканируем содержимое
+        // только когда файл вообще подозрительного размера.
+        let heavy = false;
+        if (st.size > SESSION_SCAN_BYTES && st.size <= SESSION_ROTATE_BYTES) {
+          const share = toolResultShare(claudeSid);
+          heavy = share > TOOL_HEAVY_RATIO;
+          if (heavy) {
+            console.log("session tool-heavy (" + Math.round(share * 100) + "% tool_result, " + st.size + "): " + sessionId);
+          }
+        }
+        if (st.size > SESSION_ROTATE_BYTES || heavy) {
           const tail = extractTailDialogue(claudeSid);
           forgetSession(sessionId);
           useResume = false;
@@ -787,6 +834,25 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         "max_turns",
       );
     }
+
+    // Ход закончился — пересматриваем сессию СЕЙЧАС, а не при следующем
+    // сообщении. Проверка только «до» пропускала взрывной рост внутри одного
+    // хода: 79851805798_12_ru перевалила из-под потолка сразу на 16.71 МБ
+    // (~2.5 M токенов, вчетверо выше порога) и осталась в таком виде — человек
+    // просто не написал снова, а ротация узнаёт о переполнении лишь на входе
+    // следующего запроса. Здесь только снимаем сессию с карты: сам транскрипт
+    // не трогаем, следующий ход стартует с чистой Claude-сессии и хвостом.
+    try {
+      const csid = sessionMap.get(sessionId);
+      if (csid) {
+        const st = fs.statSync(sessionJsonlPath(csid));
+        const heavy = st.size > SESSION_SCAN_BYTES && toolResultShare(csid) > TOOL_HEAVY_RATIO;
+        if (st.size > SESSION_ROTATE_BYTES || heavy) {
+          forgetSession(sessionId);
+          console.log("session retired after turn (size " + st.size + (heavy ? ", tool-heavy" : "") + "): " + sessionId);
+        }
+      }
+    } catch { /* нет транскрипта — ротировать нечего */ }
 
     // Collect output files
     const outputFiles = [];
