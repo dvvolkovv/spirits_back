@@ -193,41 +193,34 @@ const sessionJsonlPath = (claudeSid) => "/home/dv/.claude/projects/-tmp/" + clau
 // не поднимается, и вызов раньше упал бы в temporal dead zone.
 loadSessionMap();
 
-// Порог, ниже которого сессию даже не осматриваем: подавляющее большинство
-// (143 из 166 живых на 30.08.2026) не дорастает и до половины мегабайта.
-const SESSION_SCAN_BYTES = 1536 * 1024;
-// Доля tool_result, при которой сессию считаем «инструментальной» и ротируем
-// досрочно, не дожидаясь общего потолка.
-const TOOL_HEAVY_RATIO = 0.5;
+// ── Ограничение по измеренному контексту ─────────────────────────────────────
+//
+// Цену хода задаёт РАЗМЕР КОНТЕКСТА, а не размер файла на диске. Раньше
+// ограничивали байты (4 МиБ) — косвенную величину через прикинутый коэффициент
+// «150k токенов на МБ». Итог 30.08.2026: сессия 79030169187_12_ru доросла до
+// 534k токенов, и каждое сообщение в ней стоило $5.34 — 24 022 списанных
+// токена за ответ «Понял. Пиши, если что понадобится». Ответ бесплатный,
+// платили за подъём полумиллиона токенов истории.
+//
+// Здесь ограничиваем ровно ту величину, которая стоит денег. Релей и так
+// получает её от CLI в usage каждого запроса, оставалось начать смотреть.
+//
+// Худший случай хода = контекст × 2 (запись в кэш с часовым TTL) × $5/М:
+//   120k → $1.20   (≈4 300 списанных токенов)
+//   534k → $5.34   (то, что было)
+const SESSION_MAX_CONTEXT_TOKENS = Number(process.env.SESSION_MAX_CONTEXT_TOKENS || 120000);
+// Предупреждаем на половине: рост от $0.6 к $5.3 раньше проходил молча, потому
+// что единственный алерт стоял на $5 — то есть срабатывал, когда уже поздно.
+const SESSION_WARN_CONTEXT_TOKENS = Math.floor(SESSION_MAX_CONTEXT_TOKENS / 2);
+// Сессии, доросшие до порога. Ротацию делает СЛЕДУЮЩИЙ ход обычной веткой —
+// так он получит полноценный хвост из транскрипта, а не шесть реплик от
+// бэкенда, как было бы при немедленном forgetSession.
+const rotateDue = new Set();
 
-/**
- * Доля байтов, занятых результатами инструментов.
- *
- * Замер 30.08.2026 по 14 тяжёлым сессиям живых пользователей: tool_result дал
- * 68.8 % объёма, и 97 % этого объёма — один инструмент Read (98 вызовов, в
- * среднем 226 КБ, только 3 вызова из 98 с limit/offset). Читать файл целиком
- * правильно — он для того и прислан, — но держать его в контексте все
- * следующие сорок ходов не нужно: дальше от него нужны выводы, а они лежат в
- * текстовых репликах и переносятся хвостом.
- *
- * Считаем подстрокой, без JSON.parse: файл может быть на 16 МБ, а нам нужна
- * лишь пропорция. Ошибка от служебных вхождений пренебрежима на фоне порога.
- */
-function toolResultShare(claudeSid) {
-  try {
-    const raw = fs.readFileSync(sessionJsonlPath(claudeSid), "utf8");
-    if (!raw.length) return 0;
-    let tool = 0;
-    for (const line of raw.split("\n")) {
-      if (line.includes('"type":"tool_result"')) tool += line.length;
-    }
-    return tool / raw.length;
-  } catch {
-    return 0;
-  }
-}
-
-function extractTailDialogue(claudeSid, maxMsgs = 30, maxCharsPerMsg = 1500) {
+// Хвост увеличен вдвое (было 30×1500). Он состоит только из текстовых реплик,
+// то есть ~30k токенов против сотен тысяч у самой сессии: платить за него
+// дешевле, чем за отказ ротировать. Ранняя ротация перестаёт быть жертвой.
+function extractTailDialogue(claudeSid, maxMsgs = 60, maxCharsPerMsg = 2000) {
   try {
     const lines = fs.readFileSync(sessionJsonlPath(claudeSid), "utf8").split("\n");
     const msgs = [];
@@ -525,6 +518,9 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   // input, на час — 2x. Сложишь их в одно число — часовой кэш будет считаться
   // по цене пятиминутного, то есть на 60% дешевле реального.
   let totalCostUsd = 0;
+  // Наибольший контекст среди запросов этого хода — по нему решаем, не пора ли
+  // сессии на покой. См. блок «Ограничение по измеренному контексту» ниже.
+  let maxTurnContext = 0;
   const usageTotals = {
     input: 0,
     output: 0,
@@ -636,6 +632,15 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
           }
           usageTotals.webSearch += n(st.web_search_requests);
           usageTotals.webFetch += n(st.web_fetch_requests);
+          // Размер контекста ОДНОГО запроса: сколько токенов ушло в промпт.
+          // Именно эта величина определяет цену хода, и именно её мы ограничиваем.
+          // Берём максимум, а не сумму: за ход бывает несколько запросов к модели
+          // (шаги с инструментами, продолжения после max-turns), и сумма показала
+          // бы «сколько всего обработано», а нам нужен размер самой сессии.
+          const ctx =
+            n(u.input_tokens) + n(u.cache_read_input_tokens) +
+            (w5 || w1 ? w5 + w1 : n(u.cache_creation_input_tokens));
+          if (ctx > maxTurnContext) maxTurnContext = ctx;
         }
         if (ev.type === "stream_event" && ev.event) {
           const se = ev.event;
@@ -746,20 +751,12 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       try {
         const claudeSid = sessionMap.get(sessionId);
         const st = fs.statSync(sessionJsonlPath(claudeSid));
-        // Два повода ротировать. Общий потолок ловит разговорные сессии, а
-        // «инструментальная» проверка — те, что раздулись прочитанными файлами:
-        // они добираются до потолка медленнее, но каждый ход там уже стоит
-        // сотни тысяч токенов. statSync дешёвый, поэтому сканируем содержимое
-        // только когда файл вообще подозрительного размера.
-        let heavy = false;
-        if (st.size > SESSION_SCAN_BYTES && st.size <= SESSION_ROTATE_BYTES) {
-          const share = toolResultShare(claudeSid);
-          heavy = share > TOOL_HEAVY_RATIO;
-          if (heavy) {
-            console.log("session tool-heavy (" + Math.round(share * 100) + "% tool_result, " + st.size + "): " + sessionId);
-          }
-        }
-        if (st.size > SESSION_ROTATE_BYTES || heavy) {
+        // Два повода. Основной — контекст прошлого хода перевалил порог
+        // (пометка стоит в rotateDue). Запасной — размер файла: он работает,
+        // когда usage не пришёл вовсе, и страхует от разрастания вслепую.
+        const dueByContext = rotateDue.has(sessionId);
+        if (st.size > SESSION_ROTATE_BYTES || dueByContext) {
+          rotateDue.delete(sessionId);
           const tail = extractTailDialogue(claudeSid);
           forgetSession(sessionId);
           useResume = false;
@@ -835,24 +832,29 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       );
     }
 
-    // Ход закончился — пересматриваем сессию СЕЙЧАС, а не при следующем
-    // сообщении. Проверка только «до» пропускала взрывной рост внутри одного
-    // хода: 79851805798_12_ru перевалила из-под потолка сразу на 16.71 МБ
-    // (~2.5 M токенов, вчетверо выше порога) и осталась в таком виде — человек
-    // просто не написал снова, а ротация узнаёт о переполнении лишь на входе
-    // следующего запроса. Здесь только снимаем сессию с карты: сам транскрипт
-    // не трогаем, следующий ход стартует с чистой Claude-сессии и хвостом.
-    try {
-      const csid = sessionMap.get(sessionId);
-      if (csid) {
-        const st = fs.statSync(sessionJsonlPath(csid));
-        const heavy = st.size > SESSION_SCAN_BYTES && toolResultShare(csid) > TOOL_HEAVY_RATIO;
-        if (st.size > SESSION_ROTATE_BYTES || heavy) {
-          forgetSession(sessionId);
-          console.log("session retired after turn (size " + st.size + (heavy ? ", tool-heavy" : "") + "): " + sessionId);
-        }
-      }
-    } catch { /* нет транскрипта — ротировать нечего */ }
+    // Ход закончился — смотрим, во что обошёлся его контекст, и решаем судьбу
+    // сессии СЕЙЧАС, а не при следующем сообщении. Проверка только «до»
+    // пропускала взрывной рост внутри одного хода: 79851805798_12_ru
+    // перевалила из-под потолка сразу на 16.71 МБ (~2.5 M токенов) и осталась
+    // в таком виде — человек просто не написал снова.
+    //
+    // Не сбрасываем здесь, а помечаем: ротацию сделает следующий ход обычной
+    // веткой и перенесёт хвост из транскрипта. Немедленный forgetSession
+    // оставил бы ассистенту только шесть реплик из истории бэкенда.
+    if (maxTurnContext > SESSION_MAX_CONTEXT_TOKENS) {
+      rotateDue.add(sessionId);
+      console.log(
+        "session due for rotation (контекст " + maxTurnContext + " > " +
+        SESSION_MAX_CONTEXT_TOKENS + "): " + sessionId,
+      );
+    } else if (maxTurnContext > SESSION_WARN_CONTEXT_TOKENS) {
+      // Ранний сигнал. Раньше о разгоне узнавали из алерта на $5, то есть
+      // когда ход уже стоил пользователю 24 тысячи токенов.
+      console.log(
+        "session context growing (" + maxTurnContext + ", порог " +
+        SESSION_MAX_CONTEXT_TOKENS + "): " + sessionId,
+      );
+    }
 
     // Collect output files
     const outputFiles = [];
