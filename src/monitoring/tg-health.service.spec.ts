@@ -178,9 +178,21 @@ describe('TgHealthService.checkUnanswered', () => {
     // игнорирует намеренно (группа, strict-режим) — а таких большинство.
     expect(sql).toContain('answer_expected_at IS NOT NULL');
     expect(sql).toContain('NOT EXISTS');
-    expect(sql).toContain("a.role = 'assistant'");
+    expect(sql).toContain("a.role IN ('assistant', 'system')");
     expect(sql).toContain('a.created_at > m.answer_expected_at');
     expect(mockedSend).not.toHaveBeenCalled();
+  });
+
+  it('след упавшего хода закрывает чат: разобранный сбой — не молчание', async () => {
+    // Падение генерации пишет system-строку (tg-router persistTurnFailure).
+    // Пока в NOT EXISTS стояла только 'assistant', такой чат висел в алерте
+    // сутки — юзер ошибку уже увидел, а детектор считал его замолчавшим.
+    const { svc, pg } = makeService([]);
+
+    await svc.checkUnanswered();
+
+    const sql = pg.query.mock.calls[0][0] as unknown as string;
+    expect(sql).toContain("'system'");
   });
 
   it('зависшие чаты — алерт с их числом и временем ожидания', async () => {

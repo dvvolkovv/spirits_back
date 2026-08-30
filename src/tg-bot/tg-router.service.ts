@@ -422,4 +422,24 @@ ${systemPrompt}`;
       [cfg.id],
     );
   }
+
+  /**
+   * След упавшего хода в истории чата.
+   *
+   * Роль — 'system': loadHistory берёт только 'user'/'assistant', поэтому текст
+   * ошибки не уедет в контекст следующего хода, но останется в таблице. Ради
+   * этой строки всё и делается: детектор молчания (monitoring/TgHealthService)
+   * закрывает чат, увидев после answer_expected_at ЛЮБУЮ строку бота. До 30.08.2026
+   * падение генерации не писало ничего, и один упавший ход держал алерт
+   * «бот молчит N мин» сутки — уже после того, как бот вылечен.
+   *
+   * tokens_charged = 0: списание идёт за ответ, которого здесь не было.
+   */
+  async persistTurnFailure(cfg: TgBotConfigRow, errorMessage: string): Promise<void> {
+    await this.pg.query(
+      `INSERT INTO tg_bot_messages (config_id, tg_chat_id, role, content, content_type, tokens_charged)
+       VALUES ($1, $2, 'system', $3, 'text', 0)`,
+      [cfg.id, Number(cfg.tg_chat_id), `ход упал: ${errorMessage}`],
+    );
+  }
 }

@@ -235,8 +235,13 @@ export class TgHealthService {
    *
    * Отметку answer_expected_at ставит сам бот после shouldRespond()===true и в
    * busy-skip. Сообщение считается «отвисшим», если после отметки в ТОМ ЖЕ чате
-   * появилась любая assistant-строка: чат жив, а отдельная потеря сообщения —
-   * не то, ради чего будят человека ночью. Ищем именно замолчавшие чаты.
+   * появилась любая строка бота — assistant или system: чат жив, а отдельная
+   * потеря сообщения — не то, ради чего будят человека ночью. Ищем именно
+   * замолчавшие чаты.
+   *
+   * 'system' — это след упавшего хода (tg-router persistTurnFailure). Пока
+   * учитывалась только 'assistant', любое падение генерации держало алерт сутки:
+   * юзер ошибку видел, а в БД её не было (инцидент 30.08.2026, недельный лимит).
    *
    * Нижняя граница в сутки: не поднимать вечно древние висяки (после разбора
    * инцидента они всё равно останутся в таблице) и не сканировать всю историю.
@@ -256,7 +261,7 @@ export class TgHealthService {
             AND NOT EXISTS (
                   SELECT 1 FROM tg_bot_messages a
                    WHERE a.tg_chat_id = m.tg_chat_id
-                     AND a.role = 'assistant'
+                     AND a.role IN ('assistant', 'system')
                      AND a.created_at > m.answer_expected_at
                 )
           GROUP BY m.tg_chat_id, c.tg_chat_title

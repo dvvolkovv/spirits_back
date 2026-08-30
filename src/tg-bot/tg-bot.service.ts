@@ -673,17 +673,9 @@ export class TgBotService implements OnModuleInit {
           if (ev.kind === 'tool_use') editStatus(labelFor(ev.name)).catch(() => {});
         }, sandboxDir ?? undefined);
       } catch (e: any) {
-        // Не вылетаем тихо — пишем юзеру в статус, что не получилось.
-        if (statusMsgId) {
-          try {
-            await this.grammy.editMessageText(
-              msg.chat.id,
-              statusMsgId,
-              `⚠️ Не получилось обработать запрос: ${String(e.message || 'неизвестная ошибка').slice(0, 200)}`,
-            );
-            statusMsgId = null; // не удалять в finally — оставляем как уведомление
-          } catch { /* ignore */ }
-        }
+        // Не вылетаем тихо — пишем юзеру в статус и оставляем след в БД.
+        await this.recordTurnFailure(cfg, msg.chat.id, statusMsgId, e);
+        statusMsgId = null; // не удалять в finally — оставляем как уведомление
         throw e;
       }
 
@@ -835,6 +827,40 @@ export class TgBotService implements OnModuleInit {
     return text.length <= TgBotService.VOICE_CAPTION_LIMIT
       ? { caption: text, needsSeparateText: false }
       : { needsSeparateText: true };
+  }
+
+  /**
+   * Разбор упавшего хода: уведомить юзера и оставить след в истории чата.
+   *
+   * Раньше здесь было только редактирование статус-сообщения. Текст уведомления
+   * жил исключительно в Telegram, в БД не появлялось ничего — и детектор
+   * молчания (monitoring/TgHealthService) держал алерт «бот молчит N мин» сутки,
+   * потому что искал строку бота после answer_expected_at. Инцидент 30.08.2026:
+   * недельный лимит Claude уронил один ход, юзер ошибку увидел, а алерт висел
+   * ещё час после того, как бот снова отвечал в других чатах.
+   *
+   * Метод не бросает: исходная ошибка важнее любого сбоя внутри разбора, её
+   * пробрасывает вызывающий.
+   */
+  async recordTurnFailure(
+    cfg: TgBotConfigRow,
+    chatId: number,
+    statusMsgId: number | null,
+    err: any,
+  ): Promise<void> {
+    const reason = String(err?.message || 'неизвестная ошибка').slice(0, 200);
+    if (statusMsgId) {
+      try {
+        await this.grammy.editMessageText(chatId, statusMsgId, `⚠️ Не получилось обработать запрос: ${reason}`);
+      } catch (e: any) {
+        this.logger.warn(`turn-failure notice failed in chat ${chatId}: ${e.message}`);
+      }
+    }
+    try {
+      await this.router.persistTurnFailure(cfg, reason);
+    } catch (e: any) {
+      this.logger.warn(`turn-failure persist failed in chat ${chatId}: ${e.message}`);
+    }
   }
 
   async deliverReplyText(chatId: number, replyToMessageId: number, text: string): Promise<void> {
