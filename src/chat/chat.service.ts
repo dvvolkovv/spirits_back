@@ -1072,15 +1072,30 @@ ${LanguageService.buildDirective(userLanguage)}`;
       }
     }
 
+    // Профиль и бизнес-карточка — в СТАБИЛЬНУЮ часть, к персоне.
+    //
+    // Они меняются, но не от хода к ходу: профиль пополняется консолидацией
+    // после разговоров, бизнес-карточка — при правках пользователя. В теле
+    // реплики они стоили до 6 КБ на КАЖДЫЙ ход у людей с наполненным графом
+    // (интересы, желания, убеждения) и оседали в истории отдельной копией.
+    //
+    // Класть их в --system-prompt безопасно: проверено 30.08.2026, что при
+    // --resume новый системный промпт ПРИМЕНЯЕТСЯ (сессия резюмилась с другим
+    // именем ассистента и модель отвечала новым). То есть обновлённый профиль
+    // доедет со следующим же ходом, а не застрянет до конца сессии.
+    //
+    // Цена: изменение профиля меняет системный промпт, то есть начало префикса,
+    // и один ход пройдёт по холодному кэшу. Это правильный размен — платим
+    // ровно тогда, когда профиль реально изменился, а не 44 раза подряд.
     if (profileText && profileText.trim()) {
-      contextPrefix += `User profile:\n${profileText}\n\n`;
+      stablePrefix += `User profile:\n${profileText}\n\n`;
     }
     // Бизнес-карточка: общее знание о деле пользователя для всех ассистентов.
     // Полная у category='business', одна строка у остальных — решает сервис.
     if (this.businessProfile) {
       try {
         const biz = await this.businessProfile.renderForPrompt(userId, agentCategory);
-        if (biz) contextPrefix += biz + '\n\n';
+        if (biz) stablePrefix += biz + '\n\n';
       } catch (e: any) {
         this.logger.warn(`business profile injection failed: ${e?.message}`);
       }
@@ -1795,21 +1810,26 @@ ${LanguageService.buildDirective(userLanguage)}`;
     let profileText = '';
     if (this.neo4j) { try { profileText = await this.neo4j.getProfileDescription(userId); } catch {} }
 
-    let prefix =
+    // Деление то же, что в основном пути чата: постоянное для сессии —
+    // отдельным полем в --system-prompt релея, пер-ходовое остаётся в теле.
+    // Этот путь обслуживает TG-бота, голосовые консультации и quality-пробы;
+    // до 30.08.2026 он клеил персону и профиль в каждую реплику, и в сессиях
+    // qprobe_* это было видно замером даже после починки основного пути.
+    let stablePrefix =
       `СИСТЕМНАЯ ИНСТРУКЦИЯ (имеет приоритет над всеми остальными). ` +
       `Ты ассистент по имени **${agentName}**${agent.description ? ` — ${agent.description}` : ''} на платформе LINKEON.IO. ` +
       `Всегда представляйся именно как ${agentName}. Никогда не упоминай, что ты Claude или другая AI-система помимо ${agentName}. ` +
       LanguageService.buildDirective(await this.language.resolveUserLanguage(userId)) + `\n`;
     if (agent.system_prompt && agent.system_prompt.trim()) {
-      prefix += `--- Персона и инструкции ассистента ${agentName} ---\n${agent.system_prompt.trim()}\n\n`;
+      stablePrefix += `--- Персона и инструкции ассистента ${agentName} ---\n${agent.system_prompt.trim()}\n\n`;
     }
     if (profileText && profileText.trim()) {
-      prefix += `User profile:\n${profileText}\n\n`;
+      stablePrefix += `User profile:\n${profileText}\n\n`;
     }
     if (this.businessProfile) {
       try {
         const biz = await this.businessProfile.renderForPrompt(userId, agent.category);
-        if (biz) prefix += biz + '\n\n';
+        if (biz) stablePrefix += biz + '\n\n';
       } catch (e: any) {
         this.logger.warn(`business profile injection failed (agent reply): ${e?.message}`);
       }
@@ -1818,6 +1838,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // других путях: директива в начале тонет под русской персоной и профилем.
     // Третье место, где приходится это дублировать; сборку промпта стоит
     // однажды свести в одно место, но не посреди ответа Apple.
+    //
+    // Пер-ходовая часть начинается здесь: всё, что выше, уехало в stablePrefix.
+    let prefix = '';
     prefix += `${RESPONSE_STYLE_RULE}\n\n`;
     prefix +=
       `${LANGUAGE_REPLY_LINE[await this.language.resolveUserLanguage(userId)] || LANGUAGE_REPLY_LINE[DEFAULT_LANGUAGE]}\n\n`;
@@ -1828,6 +1851,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const FormData = require('form-data');
     const fd = new FormData();
     fd.append('message', prompt);
+    if (stablePrefix) fd.append('systemPrompt', stablePrefix);
     // sessionIdOverride — для синтетических проб: изолированная сессия, чтобы не
     // коллидить с реальной сессией юзера/другими пробами (r.linkeon отдаёт пустой
     // поток при конкурентном обращении к ЗАНЯТОЙ сессии — инцидент 2026-07-12).
