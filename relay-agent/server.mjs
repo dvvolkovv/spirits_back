@@ -292,6 +292,19 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   // Белый список обязателен: значение уезжает в argv, телу запроса веры нет.
   const MODELS = ["default", "haiku", "sonnet", "opus"];
   const reqModel = MODELS.includes(String(req.body.model || "")) ? String(req.body.model) : "default";
+  // Стабильная часть промпта (identity ассистента, его персона из БД, список
+  // коллег) — постоянна для всей сессии: ключ сессии это "<телефон>_<агент>_<язык>",
+  // при смене ассистента заводится другая сессия. Раньше бэкенд клеил её к КАЖДОЙ
+  // реплике, и она оседала в истории отдельной копией на каждый ход: в сессии
+  // 79030169187_12_ru на 44 реплики пришлось 813k символов, из них 808k (99.3%) —
+  // этот повтор, ~252k токенов. Отсюда --system-prompt: отправляется один раз и
+  // кэшируется, а не переписывается на каждом холодном старте.
+  const reqSystemPrompt = String(req.body.systemPrompt || "");
+  // Хвост переписки. Нужен ТОЛЬКО когда мы стартуем без --resume: resumed-сессия
+  // уже содержит всю историю целиком, и второй её экземпляр в теле реплики —
+  // дословный дубликат (38% того же повтора). Применяется ниже, где известно,
+  // будет ли resume.
+  const reqHistory = String(req.body.history || "");
   if (!message) return res.status(400).json({ error: "message is required" });
 
   const sessionId = reqSessionId || randomUUID();
@@ -418,6 +431,12 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       systemPrompt = SYSTEM_PROMPT;
     }
   }
+
+  // Персона ассистента приезжает от бэкенда и клеится ЗДЕСЬ, после талеридной
+  // ветки: та переприсваивает systemPrompt целиком в обеих своих ветках, и
+  // приклей мы персону раньше — она бы там потерялась. Пустое поле (старый
+  // бэкенд) оставляет поведение ровно прежним.
+  if (reqSystemPrompt) systemPrompt += "\n\n" + reqSystemPrompt;
 
   const args = [
     "--print",
@@ -676,6 +695,19 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
 
   (async () => {
     let useResume = sessionMap.has(sessionId);
+
+    // Хвост переписки от бэкенда вставляем ТОЛЬКО когда стартуем без --resume.
+    // При resume Claude-сессия уже содержит всю историю, и второй её экземпляр
+    // в теле реплики — дословный дубликат: в сессии 79030169187_12_ru на него
+    // пришлось 309k символов из 813k. Флаг защищает от повторной вставки при
+    // переигрышах ниже (протухший resume, перегруз картинками).
+    let historyInjected = false;
+    const injectHistory = () => {
+      if (historyInjected || !reqHistory) return;
+      historyInjected = true;
+      prompt = reqHistory + "\n\n" + prompt;
+    };
+
     if (useResume) {
       try {
         const claudeSid = sessionMap.get(sessionId);
@@ -686,11 +718,15 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
           useResume = false;
           if (tail) {
             prompt = "Недавний диалог с этим пользователем (только контекст для непрерывности — отвечай ТОЛЬКО на последнее сообщение ниже):\n" + tail + "\n---\n\n" + prompt;
+            // Свой хвост из транскрипта подробнее бэкендовых шести реплик —
+            // второй source истории поверх него не нужен.
+            historyInjected = true;
           }
           console.log("session rotated (size " + st.size + "): " + sessionId);
         }
       } catch {}
     }
+    if (!useResume) injectHistory();
     let r = await runOnce(useResume);
 
     // Протухший resume. Сессия есть в карте, транскрипта под ней нет — такое
@@ -701,6 +737,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       console.log("stale resume для " + sessionId + " — сброс и переигрыш с чистой сессии");
       forgetSession(sessionId);
       useResume = false;
+      injectHistory();
       r = await runOnce(false);
     }
 
@@ -708,6 +745,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       // Session is bloated with images — drop and retry fresh, transparently.
       forgetSession(sessionId);
       notice("_(сессия была очищена — слишком много изображений; продолжаю с чистого листа)_");
+      injectHistory();
       r = await runOnce(false);
     } else if (r.transientHit && taleridWriteUsed) {
       // A TalerID write already happened this turn — re-running would risk a
