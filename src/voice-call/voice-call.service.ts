@@ -201,6 +201,37 @@ export class VoiceCallService {
     );
   }
 
+  /**
+   * Реплики САМОГО пользователя из его завершённых голосовых разговоров с ts > since. Устройство
+   * подтягивает их и кормит on-device каскад (owner 2026-09-01). Только role=user — слова человека,
+   * не ассистента. Возвращаем и новый курсор (max ts) для инкрементальной дотяжки.
+   */
+  async profileTurns(
+    userId: string,
+    sinceTs: number,
+  ): Promise<{ turns: { callId: string; index: number; text: string; ts: number }[]; cursor: number }> {
+    const res = await this.pg.query(
+      `SELECT id, transcript FROM voice_calls
+         WHERE user_id = $1 AND status = 'completed' AND transcript IS NOT NULL
+         ORDER BY started_at DESC LIMIT 30`,
+      [userId],
+    );
+    const turns: { callId: string; index: number; text: string; ts: number }[] = [];
+    let cursor = sinceTs;
+    for (const row of res.rows) {
+      const arr = Array.isArray(row.transcript) ? row.transcript : [];
+      arr.forEach((e: any, i: number) => {
+        const ts = typeof e?.ts === 'number' ? e.ts : 0;
+        if (e?.role === 'user' && ts > sinceTs && typeof e.text === 'string' && e.text.trim()) {
+          turns.push({ callId: String(row.id), index: i, text: e.text, ts });
+          if (ts > cursor) cursor = ts;
+        }
+      });
+    }
+    turns.sort((a, b) => a.ts - b.ts);
+    return { turns: turns.slice(0, 100), cursor };
+  }
+
   async complete(callId: string, payload: CompletePayload): Promise<void> {
     const call = await this.load(callId);
     // Идемпотентность: воркер может ретрайнуть, а подписанный запрос —
