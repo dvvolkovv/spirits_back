@@ -183,6 +183,24 @@ export class VoiceCallService {
    *
    * Теперь запись в БД не зависит от того, успеет ли модель придумать резюме.
    */
+  /**
+   * Стейджим растущий транскрипт ВО ВРЕМЯ звонка (воркер флашит раз в ~15с). Сбой Realtime
+   * API / пересоздание сессии больше не теряют уже сказанное: даже если финализирующий
+   * complete донесёт только приветствие, здесь уже лежит полный разговор (complete берёт
+   * keep-longest). Не финализируем и не тарифицируем — только сохраняем транскрипт.
+   * Пишем лишь если реплик БОЛЬШЕ сохранённого (пересозданная сессия с приветствием не
+   * затирает полный). owner 2026-09-01.
+   */
+  async progress(callId: string, transcript: CompletePayload['transcript']): Promise<void> {
+    if (!Array.isArray(transcript) || transcript.length === 0) return;
+    await this.pg.query(
+      `UPDATE voice_calls SET transcript = $2::jsonb
+         WHERE id = $1 AND status <> 'completed'
+           AND jsonb_array_length(COALESCE(transcript, '[]'::jsonb)) < $3`,
+      [callId, JSON.stringify(transcript), transcript.length],
+    );
+  }
+
   async complete(callId: string, payload: CompletePayload): Promise<void> {
     const call = await this.load(callId);
     // Идемпотентность: воркер может ретрайнуть, а подписанный запрос —
@@ -190,6 +208,20 @@ export class VoiceCallService {
     if (call.status === 'completed') {
       this.logger.warn(`[complete] call=${callId} уже завершён — повтор проигнорирован`);
       return;
+    }
+    // keep-longest: во время звонка воркер флашит растущий транскрипт через progress().
+    // Финализирующая сессия могла быть ПЕРЕСОЗДАНА после сбоя Realtime API и донести лишь
+    // приветствие — тогда полный транскрипт уже лежит в staged (call.transcript). Берём
+    // тот, где реплик больше, чтобы сбой связи не терял разговор (owner 2026-09-01: потеря
+    // 20-мин разговора — в записи осталось только приветствие).
+    const staged: CompletePayload['transcript'] = Array.isArray(call.transcript) ? call.transcript : [];
+    const incoming: CompletePayload['transcript'] = payload.transcript ?? [];
+    const transcript = incoming.length >= staged.length ? incoming : staged;
+    if (transcript !== incoming) {
+      this.logger.warn(
+        `[complete] call=${callId} финализатор принёс ${incoming.length} реплик, ` +
+          `но staged содержит ${staged.length} — берём staged (сессия пересоздавалась)`,
+      );
     }
     const durationSec = Math.max(0, Math.round((Date.now() - new Date(call.started_at).getTime()) / 1000));
     const cost = this.costUsd(payload.usage.audioInputTokens, payload.usage.audioOutputTokens, payload.usage.model);
@@ -202,7 +234,7 @@ export class VoiceCallService {
     await this.pg.query(
       `UPDATE voice_calls SET status = 'completed', ended_at = now(), duration_sec = $1,
          transcript = $2, cost_usd = $3, model = $4, tokens_charged = $5 WHERE id = $6`,
-      [durationSec, JSON.stringify(payload.transcript), cost, payload.usage.model, tokens, callId],
+      [durationSec, JSON.stringify(transcript), cost, payload.usage.model, tokens, callId],
     );
 
     // Списываем за разговор — по решению владельца 27.08.2026. Раньше здесь
@@ -237,7 +269,7 @@ export class VoiceCallService {
     // Резюме, карточка и профиль — в фоне. Промисы намеренно не ждём: воркер
     // обрывает запрос через пятнадцать секунд, а тут походы в LLM на десятки.
     // Так уже дважды терялся транскрипт целиком.
-    void this.finishSummary(callId, call.user_id, payload.transcript, durationSec)
+    void this.finishSummary(callId, call.user_id, transcript, durationSec)
       .catch((e) => this.logger.error(`[complete] резюме для ${callId} не собрано: ${e?.message}`));
     void this.consolidateCall(call.user_id, payload.transcript)
       .catch((e) => this.logger.error(`[complete] профиль по ${callId} не обновлён: ${e?.message}`));

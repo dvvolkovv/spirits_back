@@ -69,6 +69,10 @@ export const backend = {
     post<DocumentResult>('document', { callId, title, instructions, specialist }),
   complete: (callId: string, transcript: TranscriptEntry[], usage: CallUsage) =>
     post<{ ok: true }>('complete', { callId, transcript, usage }),
+  // Прогресс-флаш транскрипта во время звонка: сбой Realtime API / пересоздание сессии
+  // не теряют уже сказанное. Не финализирует — бэкенд стейджит keep-longest (owner 2026-09-01).
+  progress: (callId: string, transcript: TranscriptEntry[]) =>
+    post<{ ok: true }>('progress', { callId, transcript }),
   failed: (callId: string, reason: string) =>
     post<{ ok: true }>('failed', { callId, reason }),
   meetingFirstHuman: (callId: string) =>

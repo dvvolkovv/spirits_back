@@ -80,6 +80,21 @@ export class VoiceCallInternalController {
     return this.docs.create(body.callId, call.room_name, call.user_id, body.title, body.instructions, body.specialist);
   }
 
+  /**
+   * Прогресс-флаш транскрипта ВО ВРЕМЯ звонка (owner 2026-09-01): воркер шлёт растущий
+   * транскрипт раз в ~15с, чтобы сбой Realtime API / пересоздание сессии не потеряли уже
+   * сказанное. Не финализирует и не тарифицирует — только стейджит (keep-longest).
+   */
+  @Post('progress')
+  async progress(
+    @Headers('x-voice-signature') signature: string,
+    @Req() req: Request,
+  ) {
+    const body = this.parseSigned<{ callId: string; transcript: CompletePayload['transcript'] }>(req, signature);
+    await this.calls.progress(body.callId, body.transcript);
+    return { ok: true };
+  }
+
   @Post('complete')
   async complete(
     @Headers('x-voice-signature') signature: string,

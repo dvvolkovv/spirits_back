@@ -470,9 +470,21 @@ export default defineAgent({
     // может убить процесс раньше, чем колбэк доработает, и тогда транскрипт
     // теряется молча — так пропали разговоры на 11 и 20 минут.
     let sent = false;
+    // Прогресс-флаш транскрипта раз в 15с ВО ВРЕМЯ звонка: сбой Realtime API / пересоздание
+    // сессии больше не теряют разговор — уже сказанное уходит на бэкенд ДО любого обрыва.
+    // Бэкенд стейджит keep-longest; финальный complete берёт самый полный (owner 2026-09-01:
+    // потерялся 20-мин разговор — в записи осталось только приветствие).
+    const progressFlush = setInterval(() => {
+      if (sent || transcript.length === 0) return;
+      void backend
+        .progress(meta.callId, transcript)
+        .catch((e) => console.error('progress flush не отправлен', e));
+    }, 15_000);
+    progressFlush.unref?.();
     const sendComplete = async (why: string) => {
       if (sent) return;
       sent = true;
+      clearInterval(progressFlush);
       clearTimeout(warnAt);
       clearTimeout(hardStop);
       try {

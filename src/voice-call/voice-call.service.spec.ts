@@ -349,4 +349,67 @@ describe('разговор наполняет профиль', () => {
 
     await expect(svc.buildPreamble('u1')).resolves.toContain('привет');
   });
+
+  // --- защита транскрипта от потери при сбое Realtime API / пересоздании сессии
+  //     (owner 2026-09-01: потерялся 20-мин разговор — осталось только приветствие) ---
+
+  function completeDeps(stagedTranscript: any[]) {
+    let updatedTranscript: any[] | null = null;
+    const pg = {
+      get updatedTranscript() { return updatedTranscript; },
+      query: jest.fn(async (sql: string, params: any[] = []) => {
+        if (/UPDATE voice_calls SET status = 'completed'/i.test(sql)) {
+          updatedTranscript = JSON.parse(params[1]);
+          return { rows: [], rowCount: 1 };
+        }
+        if (/FROM voice_calls/i.test(sql)) {
+          return { rows: [{ id: 'call-1', user_id: 'u1', room_name: 'room-1', status: 'active',
+            started_at: new Date(Date.now() - 600_000), transcript: stagedTranscript }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      }),
+    };
+    const chat = { generateAgentReply: jest.fn(async () => 'резюме'), consolidateAfterChatPublic: jest.fn(async () => {}) };
+    const livekit = { userToken: jest.fn(), dispatchAgent: jest.fn(), send: jest.fn(async () => {}) };
+    return { pg, chat, livekit };
+  }
+  const usage = { audioInputTokens: 100, audioOutputTokens: 200, model: 'gpt-realtime' };
+
+  it('complete: короткий финальный транскрипт НЕ затирает полный staged (пересозданная сессия)', async () => {
+    const staged = [
+      { role: 'user', text: 'первая', ts: 1 },
+      { role: 'assistant', text: 'ответ', ts: 2 },
+      { role: 'user', text: 'вторая', ts: 3 },
+    ];
+    const d = completeDeps(staged);
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+    // Финализатор донёс лишь приветствие — но staged содержит весь разговор.
+    await svc.complete('call-1', { transcript: [{ role: 'assistant', text: 'Роман на связи', ts: 9 }], usage });
+    expect(d.pg.updatedTranscript).toHaveLength(3);
+    expect(d.pg.updatedTranscript!.map((t: any) => t.text)).toContain('вторая');
+  });
+
+  it('complete: если финальный полнее staged — берём финальный', async () => {
+    const d = completeDeps([{ role: 'assistant', text: 'приветствие', ts: 1 }]);
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+    const full = [
+      { role: 'assistant', text: 'приветствие', ts: 1 },
+      { role: 'user', text: 'вопрос', ts: 2 },
+      { role: 'assistant', text: 'ответ', ts: 3 },
+    ];
+    await svc.complete('call-1', { transcript: full, usage });
+    expect(d.pg.updatedTranscript).toHaveLength(3);
+  });
+
+  it('progress: стейджит только если реплик больше сохранённого; пустой — no-op', async () => {
+    const seen: { sql: string; params: any[] }[] = [];
+    const pg = { query: jest.fn(async (sql: string, params: any[] = []) => { seen.push({ sql, params }); return { rows: [], rowCount: 1 }; }) };
+    const svc = new VoiceCallService(pg as any, {} as any, {} as any);
+    await svc.progress('call-1', [{ role: 'user', text: 'a', ts: 1 }, { role: 'assistant', text: 'b', ts: 2 }]);
+    const updates = seen.filter((s) => /UPDATE voice_calls SET transcript/i.test(s.sql));
+    expect(updates).toHaveLength(1);
+    expect(updates[0].params[2]).toBe(2); // length-guard: пишем только если < 2 сохранено
+    await svc.progress('call-2', []); // пустой транскрипт — не трогаем БД
+    expect(seen.filter((s) => /UPDATE voice_calls SET transcript/i.test(s.sql))).toHaveLength(1);
+  });
 });
