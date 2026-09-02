@@ -4,6 +4,7 @@ import { VoiceCallModule } from '../voice-call/voice-call.module';
 import { MeetingController } from './meeting.controller';
 import { MeetingService } from './meeting.service';
 import { RoomModule } from './room.module';
+import { TalerIdRoomClient } from './talerid-room.client';
 
 /**
  * Присутствие ассистента во встрече.
@@ -21,7 +22,7 @@ import { RoomModule } from './room.module';
 @Module({
   imports: [CommonModule, RoomModule, forwardRef(() => VoiceCallModule)],
   controllers: [MeetingController],
-  providers: [MeetingService],
-  exports: [MeetingService],
+  providers: [TalerIdRoomClient, MeetingService],
+  exports: [TalerIdRoomClient, MeetingService],
 })
 export class MeetingModule {}
