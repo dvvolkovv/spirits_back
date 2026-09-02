@@ -45,8 +45,9 @@ export function classifyLlmError(msg: string): { kind: LlmOutageKind; human: str
  *  - API key validity (cheap probe to /v1/models)
  *  - daily call count
  *
- * If we ever burn more than a configurable monthly $ threshold,
- * Telegram alert fires (cooldown 24h).
+ * 30-day spend is reported, not alerted on: the Telegram alert was dropped
+ * 02.09.2026 (owner's call) — it repeated what the monitoring panel already
+ * shows and asked for no action. Liveness outages still alert.
  */
 
 interface UsageSnapshot {
@@ -74,7 +75,6 @@ interface UsageSnapshot {
 }
 
 const ALERT_THRESHOLD_30D_USD = Number(process.env.CLAUDE_SPEND_ALERT_THRESHOLD_30D_USD || 300);
-const ALERT_COOLDOWN_HOURS = Number(process.env.CLAUDE_SPEND_ALERT_COOLDOWN_H || 24);
 // Повторное напоминание о продолжающемся простое (после первого алерта — не
 // чаще раза в этот интервал).
 const OUTAGE_REALERT_HOURS = Number(process.env.CLAUDE_OUTAGE_REALERT_H || 3);
@@ -82,7 +82,7 @@ const OUTAGE_REALERT_HOURS = Number(process.env.CLAUDE_OUTAGE_REALERT_H || 3);
 // транзиентные сбои (OAuth refresh, rate) и не даёт рестарту api слать ложный
 // мгновенный алерт — после рестарта счётчик с нуля, нужно 2 подряд провала.
 const OUTAGE_ALERT_AFTER_FAILS = Number(process.env.CLAUDE_OUTAGE_FAILS || 2);
-// NOTE: Telegram creds are read at call time inside maybeAlert(), not here —
+// NOTE: Telegram creds are read at call time inside maybeAlertOutage(), not here —
 // module-level process.env reads run before ConfigModule loads .env, so a
 // const here would always be '' and silently disable alerts.
 
@@ -154,19 +154,10 @@ export class ClaudeHealthService implements OnModuleInit {
       );
     } catch (e: any) { this.log.error(`setAlerted(${component}) failed: ${e.message}`); }
   }
-  // Состояние + время последнего перехода (для persisted-кулдауна, переживает рестарт PM2).
-  private async getAlertState(component: string): Promise<{ alerted: boolean; updatedAt: Date | null }> {
-    try {
-      const r = await this.pg.query(`SELECT alerted, updated_at FROM monitor_alert_state WHERE component=$1`, [component]);
-      if (!r.rows[0]) return { alerted: false, updatedAt: null };
-      return { alerted: r.rows[0].alerted === true, updatedAt: r.rows[0].updated_at ? new Date(r.rows[0].updated_at) : null };
-    } catch { return { alerted: false, updatedAt: null }; }
-  }
 
   @Cron(CronExpression.EVERY_HOUR)
   async hourly() {
     await this.refresh();
-    await this.maybeAlert();
   }
 
   // Активная проба «жив ли AI» каждые 15 минут + алерт на отказ/восстановление.
@@ -336,43 +327,12 @@ export class ClaudeHealthService implements OnModuleInit {
     }
   }
 
-  private async maybeAlert(): Promise<void> {
-    const c30 = this.cache.cost30dUsd;
-    if (c30 === null) return;
-    const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-    const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '';
-    if (!TG_TOKEN || !TG_CHAT) return;
-    const COMP = 'claude_spend';
-
-    // Ниже порога — сбросить флаг, чтобы при следующем превышении снова алертнуть.
-    if (c30 < ALERT_THRESHOLD_30D_USD) {
-      if (await this.getAlerted(COMP)) await this.setAlerted(COMP, false);
-      return;
-    }
-
-    // Превышение: алертим не чаще раза в ALERT_COOLDOWN_HOURS. Состояние persisted
-    // в monitor_alert_state (updated_at), поэтому рестарт PM2 НЕ сбрасывает кулдаун
-    // и не приводит к спаму (это был баг in-memory lastAlertAt).
-    const st = await this.getAlertState(COMP);
-    if (st.alerted && st.updatedAt && (Date.now() - st.updatedAt.getTime()) < ALERT_COOLDOWN_HOURS * 3600_000) {
-      return;
-    }
-    try {
-      await sendTelegramPayload({
-        chat_id: TG_CHAT,
-        parse_mode: 'HTML',
-        text: `<b>⚠️ Claude: высокий расход за 30 дней</b>\n` +
-              `Сейчас: <b>$${c30.toFixed(2)}</b>\n` +
-              `Порог: $${ALERT_THRESHOLD_30D_USD}\n` +
-              `Подписка: ${this.cache.subscriptionType || 'не определена'}\n` +
-              `Биллинг: https://console.anthropic.com/settings/billing`,
-      }, { timeout: 8000 });
-      await this.setAlerted(COMP, true); // пишет updated_at=now → старт кулдауна
-      this.log.warn(`Claude spend over threshold: $${c30} — Telegram alert sent`);
-    } catch (e: any) {
-      this.log.error(`Telegram alert failed: ${e?.message || 'unknown'}`);
-    }
-  }
+  // Алерт «Claude: высокий расход за 30 дней» убран по решению владельца
+  // 02.09.2026. Расход за 30 дней — вещь ожидаемая и медленная: при пороге $300
+  // и подписке max он раз в сутки повторял то, что и так видно в админке, и
+  // ничего не требовал сделать прямо сейчас. Сама цифра никуда не делась:
+  // cost30dUsd считается в refresh() и отдаётся в overview, а панель мониторинга
+  // красит её по ALERT_THRESHOLD_30D_USD. Пропала только рассылка в Telegram.
 
   // Алерт о простое CLI-пути (Маша / Виртуальный PM / маркетолог). Точный охват:
   // НЕ «весь AI» — чат-ассистенты (r.linkeon.io) мониторятся отдельно synthetic
