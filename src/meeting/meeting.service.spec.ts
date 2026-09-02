@@ -11,6 +11,7 @@ describe('MeetingService', () => {
   };
   let livekit: { dispatchAgent: jest.Mock; removeAgents: jest.Mock };
   let rooms: { info: jest.Mock };
+  let talerIdRooms: { info: jest.Mock; join: jest.Mock };
   let svc: MeetingService;
 
   const agentRow = {
@@ -45,7 +46,16 @@ describe('MeetingService', () => {
     };
     livekit = { dispatchAgent: jest.fn(), removeAgents: jest.fn() };
     rooms = { info: jest.fn().mockResolvedValue({ code: 'ABC234', title: 'Планёрка', active: true }) };
-    svc = new MeetingService(pg as any, calls as any, livekit as any, rooms as any);
+    talerIdRooms = {
+      info: jest.fn().mockResolvedValue({
+        code: '36fc367a', title: '', roomName: 'personal-x',
+        isActive: true, requiresPassword: false, creatorName: 'Дмитрий Волков',
+      }),
+      join: jest.fn().mockResolvedValue({
+        token: 'jwt.body.sig', roomName: 'personal-x', url: 'wss://api.talerid.io/livekit/',
+      }),
+    };
+    svc = new MeetingService(pg as any, calls as any, livekit as any, rooms as any, talerIdRooms as any);
   });
 
   describe('join', () => {
@@ -172,6 +182,51 @@ describe('MeetingService', () => {
       await svc.noteFirstHuman('c1');
       const upd = pg.query.mock.calls.find(([s]: [string]) => s.includes('first_human_at'));
       expect(upd![0]).toContain('COALESCE');
+    });
+  });
+
+  describe('встреча Taler ID', () => {
+    it('берёт токен у них и передаёт воркеру внешнюю комнату', async () => {
+      withAgent();
+      await svc.join('u1', 7, '36fc367a', 'talerid');
+
+      expect(talerIdRooms.join).toHaveBeenCalledWith('36fc367a', expect.stringContaining('Андрей'));
+      const [roomName, meta] = livekit.dispatchAgent.mock.calls[0] as any[];
+      // Наша комната пустая и нужна ради job: жизненный цикл и reaper завязаны
+      // на неё, а разговор идёт целиком у них.
+      expect(roomName).toBe('talerid_36fc367a');
+      expect(meta).toMatchObject({
+        provider: 'talerid',
+        externalUrl: 'wss://api.talerid.io/livekit/',
+        externalToken: 'jwt.body.sig',
+        mode: 'meeting',
+      });
+    });
+
+    it('своя встреча внешней комнаты не получает', async () => {
+      // Иначе воркер ушёл бы наружу на обычной встрече Linkeon.
+      withAgent();
+      await svc.join('u1', 7, 'ABC234');
+      const meta = livekit.dispatchAgent.mock.calls[0][1] as any;
+      expect(meta.externalUrl).toBeUndefined();
+      expect(meta.provider).toBeUndefined();
+    });
+
+    it('комната под паролем отклоняется внятно, а не падает', async () => {
+      withAgent();
+      talerIdRooms.info.mockResolvedValue({
+        code: '36fc367a', roomName: 'r', isActive: true,
+        requiresPassword: true, creatorName: 'Кто-то', title: '',
+      });
+      await expect(svc.join('u1', 7, '36fc367a', 'talerid')).rejects.toThrow();
+      expect(talerIdRooms.join).not.toHaveBeenCalled();
+    });
+
+    it('несуществующая комната — 404, запись не остаётся в dialing', async () => {
+      withAgent();
+      talerIdRooms.info.mockResolvedValue(null);
+      await expect(svc.join('u1', 7, 'ZZZZZZ', 'talerid')).rejects.toThrow(NotFoundException);
+      expect(livekit.dispatchAgent).not.toHaveBeenCalled();
     });
   });
 });
