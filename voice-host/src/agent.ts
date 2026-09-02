@@ -20,6 +20,8 @@ import { PendingAnswers } from './pending.js';
 import { NameGate } from './name-gate.js';
 import { Occupancy } from './occupancy.js';
 import { MixedRoomAudioInput } from './mixed-audio-input.js';
+import { ExternalRoomAudioOutput } from './external-room-output.js';
+import { Room as ExternalRoom } from '@livekit/rtc-node';
 import {
   answerTo,
   callInstructions,
@@ -62,8 +64,15 @@ export default defineAgent({
       agentPersona?: string;
       agentVoice?: string;
       ownerName?: string;
+      // Чужая встреча: разговор идёт не в нашей комнате, а в комнате
+      // провайдера, куда мы входим участником по добытому токеном.
+      provider?: 'talerid';
+      externalUrl?: string;
+      externalToken?: string;
     };
     const isMeeting = meta.mode === 'meeting';
+    /** Комната, в которой реально идёт разговор: своя или чужая. */
+    const isForeign = isMeeting && !!meta.externalUrl && !!meta.externalToken;
     const agentName = meta.agentName || 'Роман';
 
     /**
@@ -99,7 +108,22 @@ export default defineAgent({
 
     await ctx.connect();
 
-    if (isMeeting) {
+    /**
+     * Чужая комната. Наша при этом остаётся пустой и нужна ради job:
+     * жизненный цикл, учёт и reaper завязаны на неё.
+     */
+    let foreign: ExternalRoom | null = null;
+    let foreignOutput: ExternalRoomAudioOutput | null = null;
+    if (isForeign) {
+      foreign = new ExternalRoom();
+      await foreign.connect(meta.externalUrl!, meta.externalToken!, {
+        autoSubscribe: true,
+        dynacast: false,
+      });
+      console.log(`[чужая] подключились к ${meta.externalUrl}`);
+    }
+
+    if (isMeeting && !isForeign) {
       // Имя в списке участников. Без него люди видят `agent-AJ_xxx` и не
       // понимают, кто к ним зашёл, — заметил владелец на живой встрече
       // 28.08.2026. Гостям имя выдаётся в токене, а ассистент подключается
@@ -403,7 +427,7 @@ export default defineAgent({
     // Разметка говорящего. LiveKit определяет активного сам — считать
     // громкость руками не нужно.
     if (isMeeting) {
-      ctx.room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
+      (foreign ?? ctx.room).on(RoomEvent.ActiveSpeakersChanged, (speakers: any[]) => {
         // Берём первого: при перебивании активных несколько, а реплика в
         // транскрипте одна. Разметка приблизительная, и здесь это видно прямо.
         const top = speakers[0];
@@ -511,15 +535,18 @@ export default defineAgent({
       // Уже сидящие до нашего входа: participantConnected по ним не придёт, и
       // без этого прохода начавшаяся раньше встреча считалась бы пустой, а
       // ассистент вышел бы через LOBBY_MS.
-      for (const identity of ctx.room.remoteParticipants.keys()) occupancy.joined(identity);
+      // Считаем участников ТОЙ комнаты, где идёт разговор: в своей при чужой
+      // встрече никого нет и не будет, и ассистент вышел бы сразу.
+      const stage = foreign ?? ctx.room;
+      for (const identity of stage.remoteParticipants.keys()) occupancy.joined(identity);
 
-      ctx.room.on(RoomEvent.ParticipantConnected, (p) => {
+      stage.on(RoomEvent.ParticipantConnected, (p: any) => {
         occupancy.joined(p.identity);
         void backend.meetingFirstHuman(meta.callId).catch(() => {
           // Отметка «встреча началась» — учётная, ради неё встречу не рвём.
         });
       });
-      ctx.room.on(RoomEvent.ParticipantDisconnected, (p) => occupancy.left(p.identity));
+      stage.on(RoomEvent.ParticipantDisconnected, (p: any) => occupancy.left(p.identity));
 
       const watch = setInterval(() => {
         const verdict = occupancy.verdict(Date.now());
@@ -543,7 +570,13 @@ export default defineAgent({
     // Закрытие сессии — самый ранний надёжный сигнал: он приходит сразу после
     // того, как собеседник отключился, и процесс тогда ещё жив.
     session.on(AgentSessionEventTypes.Close, () => { sessionClosed = true; void sendComplete('session_closed'); });
-    ctx.addShutdownCallback(async () => { await sendComplete('shutdown'); });
+    ctx.addShutdownCallback(async () => {
+      await sendComplete('shutdown');
+      // Чужую комнату закрываем сами: она не наша, и брошенный участник
+      // останется висеть у них в списке.
+      try { await foreignOutput?.close(); } catch {}
+      try { await foreign?.disconnect(); } catch {}
+    });
 
     // Свой вход выставляем ДО start() — это поддержанный фреймворком порядок.
     //
@@ -556,8 +589,18 @@ export default defineAgent({
     // audioEnabled при этом трогать нельзя: с `false` условие выше не
     // сработает, а заодно заглушится весь аудиотракт.
     if (isMeeting) {
-      session.input.audio = new MixedRoomAudioInput(ctx.room);
-      console.log('[вход] микшер подставлен до старта сессии');
+      // Оба конца — на ту комнату, где идёт разговор. Микшер принимает любую,
+      // правок не потребовал.
+      const stage = foreign ?? ctx.room;
+      session.input.audio = new MixedRoomAudioInput(stage);
+      if (foreign) {
+        foreignOutput = new ExternalRoomAudioOutput(
+          foreign,
+          `${agentName} · ассистент ${meta.ownerName || 'пользователя'}`,
+        );
+        session.output.audio = foreignOutput;
+      }
+      console.log(`[вход] микшер подставлен до старта сессии (${foreign ? 'чужая' : 'своя'} комната)`);
     }
 
     try {

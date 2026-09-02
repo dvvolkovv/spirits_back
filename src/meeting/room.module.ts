@@ -3,6 +3,7 @@ import { CommonModule } from '../common/common.module';
 import { RoomController } from './room.controller';
 import { RoomRateLimit } from './room-rate-limit';
 import { RoomService } from './room.service';
+import { TalerIdRoomClient } from './talerid-room.client';
 
 /**
  * Сами комнаты — без ассистента.
@@ -19,7 +20,7 @@ import { RoomService } from './room.service';
 @Module({
   imports: [CommonModule],
   controllers: [RoomController],
-  providers: [RoomService, RoomRateLimit],
-  exports: [RoomService],
+  providers: [RoomService, RoomRateLimit, TalerIdRoomClient],
+  exports: [RoomService, TalerIdRoomClient],
 })
 export class RoomModule {}

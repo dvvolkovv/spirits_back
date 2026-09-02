@@ -5,9 +5,13 @@ import { LiveKitClient } from '../voice-call/livekit.client';
 import { VoiceCallService } from '../voice-call/voice-call.service';
 import { SPECIALIST_ROLES, SPECIALISTS } from '../voice-call/voice-call.types';
 import { RoomService } from './room.service';
+import { TalerIdRoomClient } from './talerid-room.client';
+import { MeetingProvider } from './meeting-link';
 
 /** Провайдер встречи в voice_calls. Дальше сюда добавится 'zoom'. */
 const PROVIDER = 'linkeon_room';
+/** Он же для чужих комнат Taler ID. */
+const PROVIDER_TALERID = 'talerid';
 
 /**
  * Вход ассистента во встречу.
@@ -25,6 +29,7 @@ export class MeetingService {
     private readonly calls: VoiceCallService,
     private readonly livekit: LiveKitClient,
     private readonly rooms: RoomService,
+    private readonly talerIdRooms: TalerIdRoomClient,
   ) {}
 
   /**
@@ -55,6 +60,7 @@ export class MeetingService {
     userId: string,
     agentId: number,
     code: string,
+    provider: MeetingProvider = 'linkeon',
   ): Promise<{ callId: string; title: string }> {
     const agentRes = await this.pg.query(
       `SELECT id, display_name, system_prompt, realtime_voice FROM agents WHERE id = $1 LIMIT 1`,
@@ -74,22 +80,54 @@ export class MeetingService {
       throw new ConflictException({ message: 'call already in progress', callId: active.rows[0].id });
     }
 
-    const room = await this.rooms.info(code);
-    if (!room || !room.active) throw new NotFoundException('room not found');
-
+    const isForeign = provider === 'talerid';
     const callId = randomUUID();
-    // Комната ВСТРЕЧИ, а не новая: ассистент идёт туда, где уже сидят люди.
-    const roomName = `room_${room.code}`;
+
+    // Куда идёт ассистент и как называется комната — единственное, чем
+    // отличаются свои встречи от чужих. Всё остальное ниже общее.
+    let title: string;
+    let roomName: string;
+    let external: { url: string; token: string } | undefined;
+
+    if (isForeign) {
+      const info = await this.talerIdRooms.info(code);
+      if (!info || !info.isActive) throw new NotFoundException('room not found');
+      // Пароль в v1 не поддержан. Отказ внятный: молчаливое падение в 500
+      // выглядит как поломка, а это ожидаемое ограничение.
+      if (info.requiresPassword) {
+        throw new ConflictException({ message: 'password-protected room is not supported yet' });
+      }
+      title = info.title || info.creatorName || 'Встреча';
+      // Наша комната пустая и нужна ровно ради job: жизненный цикл, учёт и
+      // reaper завязаны на voice_calls и на disconnect из НАШЕЙ комнаты.
+      // Разговор при этом идёт целиком в комнате Taler ID.
+      roomName = `talerid_${code}`;
+    } else {
+      const room = await this.rooms.info(code);
+      if (!room || !room.active) throw new NotFoundException('room not found');
+      title = room.title;
+      // Комната ВСТРЕЧИ, а не новая: ассистент идёт туда, где уже сидят люди.
+      roomName = `room_${room.code}`;
+    }
 
     await this.pg.query(
       `INSERT INTO voice_calls (id, user_id, agent_id, room_name, status, provider, external_room)
        VALUES ($1, $2, $3, $4, 'dialing', $5, $6)`,
-      [callId, userId, agentId, roomName, PROVIDER, room.code],
+      [callId, userId, agentId, roomName, isForeign ? PROVIDER_TALERID : PROVIDER, code],
     );
 
     try {
       const preamble = await this.calls.buildPreamble(userId, agentId);
       const ownerName = await this.resolveOwnerName(userId);
+
+      if (isForeign) {
+        // Токен берём здесь, а не выше: он живёт шесть часов, и отсчёт лучше
+        // начинать как можно позже. Имя — то же, что мы показываем в своих
+        // комнатах, чтобы участники Taler ID видели, кто к ним пришёл.
+        const t = await this.talerIdRooms.join(code, `${agent.display_name} · ассистент ${ownerName}`);
+        if (!t) throw new NotFoundException('room not found');
+        external = { url: t.url, token: t.token };
+      }
 
       await this.livekit.dispatchAgent(roomName, {
         callId,
@@ -100,6 +138,9 @@ export class MeetingService {
         agentPersona: agent.system_prompt || '',
         agentVoice: agent.realtime_voice || undefined,
         ownerName,
+        // Внешняя комната: воркер повесит на неё вход и выход сессии.
+        // Для своих встреч поля нет вовсе — поведение воркера не меняется.
+        ...(external ? { provider: PROVIDER_TALERID, externalUrl: external.url, externalToken: external.token } : {}),
         // Все специалисты, кроме самого ведущего: спрашивать себя незачем, а
         // предложение это сделать модель однажды примет всерьёз.
         specialists: Object.keys(SPECIALISTS)
@@ -118,8 +159,8 @@ export class MeetingService {
       throw e;
     }
 
-    this.logger.log(`[join] call=${callId} agent=${agentId} room=${room.code}`);
-    return { callId, title: room.title };
+    this.logger.log(`[join] call=${callId} agent=${agentId} provider=${provider} room=${code}`);
+    return { callId, title };
   }
 
   /**

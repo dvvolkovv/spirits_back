@@ -17,6 +17,16 @@ function clean(s: string): string {
  * ассистента с этим тегом, фронт подменяет его карточкой. Так она оживает и
  * при перезагрузке истории, а не только в момент отправки.
  */
-export function buildMeetingCard(code: string, title: string): string {
-  return `{{meeting_join: code=${code} title=${clean(title) || 'Встреча'}}}`;
+export function buildMeetingCard(
+  code: string,
+  title: string,
+  provider: 'linkeon' | 'talerid' = 'linkeon',
+): string {
+  // Провайдер идёт ПЕРЕД кодом и только для чужих встреч.
+  //
+  // Свои карточки остаются байт в байт прежними: в истории их уже накопилось,
+  // и менять формат задним числом значит сломать разбор старых сообщений на
+  // фронте. Разбор чужих добавляется отдельной веткой, старая не трогается.
+  const head = provider === 'linkeon' ? '' : `provider=${provider} `;
+  return `{{meeting_join: ${head}code=${code} title=${clean(title) || 'Встреча'}}}`;
 }

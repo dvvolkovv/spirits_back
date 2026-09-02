@@ -13,6 +13,7 @@ import { LanguageService, LANGUAGE_REPLY_LINE, DEFAULT_LANGUAGE } from '../commo
 import { parseMeetingLink } from '../meeting/meeting-link';
 import { RoomService } from '../meeting/room.service';
 import { buildMeetingCard } from './meeting-card';
+import { TalerIdRoomClient } from '../meeting/talerid-room.client';
 import { RESPONSE_STYLE_RULE } from './response-style';
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
@@ -276,6 +277,9 @@ export class ChatService {
     @Optional() private readonly talerIdOauth?: TalerIdOauthService,
     @Optional() private readonly businessProfile?: BusinessProfileService,
     @Optional() private readonly rooms?: RoomService,
+    // Опционален по той же причине, что и rooms: ChatService поднимается и в
+    // окружениях без встреч, а падать на старте из-за ненужного клиента незачем.
+    @Optional() private readonly talerIdRooms?: TalerIdRoomClient,
   ) {}
 
   /**
@@ -456,9 +460,20 @@ export class ChatService {
     // Тот же приём, что у приветствия и у сообщения о нехватке токенов ниже.
     const meetingLink = this.rooms ? parseMeetingLink(message) : null;
     if (meetingLink) {
-      const room = await this.rooms!.info(meetingLink.code).catch(() => null);
-      // Комнаты нет или она закрыта — значит это была обычная ссылка в
-      // разговоре, а не приглашение. Идём обычным путём.
+      // Своя комната и чужая проверяются в разных местах, но ведут себя
+      // одинаково: нашли живую — показываем карточку, не нашли — это была
+      // обычная ссылка в разговоре, идём обычным путём и не мешаем.
+      const room = meetingLink.provider === 'talerid'
+        ? await this.talerIdRooms
+            ?.info(meetingLink.code)
+            .then((r) => (r && r.isActive && !r.requiresPassword
+              // Комната под паролем — вход в v1 не поддержан. Карточку не
+              // показываем: кнопка, которая заведомо не сработает, хуже её
+              // отсутствия.
+              ? { code: r.code, title: r.title || r.creatorName, active: true }
+              : null))
+            .catch(() => null) ?? null
+        : await this.rooms!.info(meetingLink.code).catch(() => null);
       if (room?.active) {
         res.status(200);
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
@@ -472,7 +487,7 @@ export class ChatService {
            VALUES ($1, 'human', $2, $3, 'text')`,
           [chatSessionId, agent.id, message],
         );
-        const card = buildMeetingCard(room.code, room.title);
+        const card = buildMeetingCard(room.code, room.title, meetingLink.provider);
         await this.pg.query(
           `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
            VALUES ($1, 'ai', $2, $3, 'text', 0)`,

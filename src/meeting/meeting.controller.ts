@@ -20,11 +20,16 @@ export class MeetingController {
   @Post('join')
   async join(
     @CurrentUser() u: any,
-    @Body() body: { agentId: number; code: string },
+    @Body() body: { agentId: number; code: string; provider?: 'linkeon' | 'talerid' },
   ) {
     if (!u?.isAdmin) throw new ForbiddenException('meetings are admin-only in v1');
     // Имя владельца сервис берёт из профиля сам: в JWT его нет.
-    return this.meetings.join(u.userId, Number(body?.agentId), String(body?.code || ''));
+    return this.meetings.join(
+      u.userId,
+      Number(body?.agentId),
+      String(body?.code || ''),
+      body?.provider === 'talerid' ? 'talerid' : 'linkeon',
+    );
   }
 
   @Post(':id/leave')
