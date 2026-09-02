@@ -9,12 +9,16 @@ export class TgBillingService {
   private readonly logger = new Logger(TgBillingService.name);
 
   /**
-   * Порог алерта на дорогой ход бота, в долларах реальной стоимости. Тот же
-   * смысл и тот же дефолт, что у EXPENSIVE_TURN_ALERT_USD в вебе: порог в
-   * долларах, а не в токенах, чтобы не поехал при смене курса.
+   * Порог алерта на дорогой ход бота, в СПИСАННЫХ токенах. Тот же смысл и тот
+   * же дефолт, что у EXPENSIVE_TURN_ALERT_TOKENS в вебе.
+   *
+   * Был в долларах себестоимости — и будил на ходах, которые для агентного бота
+   * норма (договор, финмодель, подборка тендеров — это $4–7). Токенный порог
+   * поедет при смене курса, зато он про то же число, которое владелец видит в
+   * своём балансе. Прежние TG_ALERT_USD / SDK_ALERT_USD больше не читаются.
    */
-  private readonly EXPENSIVE_TURN_ALERT_USD = Number(
-    process.env.TG_ALERT_USD || process.env.SDK_ALERT_USD || 5,
+  private readonly EXPENSIVE_TURN_ALERT_TOKENS = Number(
+    process.env.TG_ALERT_TOKENS || process.env.SDK_ALERT_TOKENS || 30_000,
   );
 
   constructor(
@@ -78,7 +82,7 @@ export class TgBillingService {
     tokensCharged: number,
     balanceLeft: number,
   ): Promise<void> {
-    if (!(costUsd >= this.EXPENSIVE_TURN_ALERT_USD)) return;
+    if (!(tokensCharged >= this.EXPENSIVE_TURN_ALERT_TOKENS)) return;
     try {
       await telegramAlert.sendTelegramAlert(
         `💸 <b>Дорогой ход TG-бота</b>\n` +

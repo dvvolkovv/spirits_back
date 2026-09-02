@@ -11,6 +11,10 @@ import * as alert from '../common/telegram-alert';
  *
  * После перевода бота на модель веба (Opus вместо Sonnet) тяжёлые агентные ходы
  * дорожают кратно, так что молчание здесь стоит слишком дорого.
+ *
+ * Порог с 02.09.2026 — в списанных токенах (30 000), общий с вебом. Долларовый
+ * будил на ходах, которые для агентного бота норма: договор или подборка
+ * тендеров легко стоят $4–7, и алерт на них перестали читать.
  */
 
 describe('TgBillingService.alertIfExpensiveTurn', () => {
@@ -34,11 +38,19 @@ describe('TgBillingService.alertIfExpensiveTurn', () => {
     expect(sent).toHaveLength(0);
   });
 
-  it('алертит, когда ход перевалил порог', async () => {
+  it('дорогой в долларах, но лёгкий по списанию — молчит', async () => {
+    // Ровно тот случай, из-за которого порог перевели в токены: $7.5 старый
+    // долларовый порог перешагивал, а для агентного хода это обычная цена.
     await svc().alertIfExpensiveTurn(cfg, 7.5, 27_000, 12_345);
 
+    expect(sent).toHaveLength(0);
+  });
+
+  it('алертит, когда ход перевалил порог в 30 тыс. токенов', async () => {
+    await svc().alertIfExpensiveTurn(cfg, 8.4, 30_000, 12_345);
+
     expect(sent).toHaveLength(1);
-    expect(sent[0]).toContain('7.50');
+    expect(sent[0]).toContain('8.40');
     expect(sent[0]).toContain('Роман');
   });
 
