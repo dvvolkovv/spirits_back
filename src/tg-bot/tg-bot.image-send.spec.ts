@@ -19,7 +19,7 @@ describe('отправка картинки в Telegram', () => {
 
   const svc = new TgBotService(
     {} as any, {} as any, {} as any, {} as any, {} as any,
-    {} as any, {} as any, {} as any, grammy as any, misc as any, {} as any,
+    {} as any, {} as any, {} as any, {} as any, grammy as any, misc as any, {} as any,
   );
 
   const cfg = { owner_user_id: 'u-1' } as any;

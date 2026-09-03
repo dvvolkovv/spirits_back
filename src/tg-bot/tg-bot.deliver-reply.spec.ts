@@ -16,7 +16,7 @@ function makeService(sendMessage: jest.Mock) {
   // Метод трогает только grammy и logger — остальные зависимости не нужны.
   const svc = new TgBotService(
     null as any, null as any, null as any, null as any, null as any, null as any,
-    null as any, null as any, grammy, null as any, null as any,
+    null as any, null as any, null as any, grammy, null as any, null as any,
   );
   const errors: string[] = [];
   (svc as any).logger = { error: (m: string) => errors.push(m), warn: () => {}, log: () => {} };

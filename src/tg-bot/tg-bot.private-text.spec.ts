@@ -21,6 +21,7 @@ describe('обычный текст в личном чате', () => {
     {} as any, // voice
     {} as any, // billing
     {} as any, // commands
+    {} as any, // meetings
     grammy as any,
     {} as any, // misc
     {} as any, // video

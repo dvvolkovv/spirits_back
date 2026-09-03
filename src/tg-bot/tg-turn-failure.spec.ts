@@ -26,7 +26,7 @@ function makeBot(over: { editMessageText?: jest.Mock; persistTurnFailure?: jest.
   const router = { persistTurnFailure: over.persistTurnFailure ?? jest.fn(async () => {}) } as any;
   const svc = new TgBotService(
     null as any, null as any, null as any, null as any, router,
-    null as any, null as any, null as any, grammy, null as any, null as any,
+    null as any, null as any, null as any, null as any, grammy, null as any, null as any,
   );
   const warns: string[] = [];
   (svc as any).logger = { error: () => {}, warn: (m: string) => warns.push(m), log: () => {}, debug: () => {} };
