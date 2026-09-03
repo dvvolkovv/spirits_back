@@ -540,13 +540,31 @@ export default defineAgent({
       const stage = foreign ?? ctx.room;
       for (const identity of stage.remoteParticipants.keys()) occupancy.joined(identity);
 
+      /**
+       * Наедине ассистент отвечает без имени.
+       *
+       * Гейт по имени защищает от вмешательства в ЧУЖОЙ разговор, а при одном
+       * собеседнике чужого разговора не бывает. Считаем удалённых участников
+       * комнаты разговора: сам ассистент в ней локальный и в счёт не идёт.
+       */
+      const syncSolo = () => {
+        const solo = stage.remoteParticipants.size <= 1;
+        gate?.setSolo(solo);
+        console.log(`[гейт] участников: ${stage.remoteParticipants.size} → ${solo ? 'наедине' : 'строгий гейт'}`);
+      };
+      syncSolo();
+
       stage.on(RoomEvent.ParticipantConnected, (p: any) => {
         occupancy.joined(p.identity);
+        syncSolo();
         void backend.meetingFirstHuman(meta.callId).catch(() => {
           // Отметка «встреча началась» — учётная, ради неё встречу не рвём.
         });
       });
-      stage.on(RoomEvent.ParticipantDisconnected, (p: any) => occupancy.left(p.identity));
+      stage.on(RoomEvent.ParticipantDisconnected, (p: any) => {
+        occupancy.left(p.identity);
+        syncSolo();
+      });
 
       const watch = setInterval(() => {
         const verdict = occupancy.verdict(Date.now());

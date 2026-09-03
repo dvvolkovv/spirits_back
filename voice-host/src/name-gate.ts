@@ -108,6 +108,21 @@ export class NameGate {
   private lastAddressedAt = 0;
 
   /**
+   * В комнате один живой участник.
+   *
+   * Тогда молчание по умолчанию теряет смысл: правило «отвечай, только когда
+   * назвали» защищает от вмешательства в чужой разговор, а чужого разговора
+   * при одном человеке не бывает. Живая встреча 03.09.2026 показала цену
+   * этого буквоедства — владелец вёл нормальную деловую беседу, а ассистент
+   * молчал на три содержательные реплики подряд просто потому, что в них не
+   * прозвучало его имя.
+   *
+   * Команды при этом продолжают работать и без имени: звать по имени, чтобы
+   * попросить помолчать, наедине тоже незачем.
+   */
+  private solo = false;
+
+  /**
    * @param windowMs сколько окно живёт после каждого ответа
    * @param maxWindowMs сколько оно живёт суммарно от обращения по имени.
    *   Две минуты: доспросить «а почему?» и уточнить ответ успеваешь, а
@@ -118,6 +133,11 @@ export class NameGate {
     private readonly windowMs: number,
     private readonly maxWindowMs: number = 120_000,
   ) {}
+
+  /** Сколько живых участников в комнате. Считает воркер по составу комнаты. */
+  setSolo(solo: boolean): void {
+    this.solo = solo;
+  }
 
   /**
    * @param speaker кто говорит, если известно. Без него окно продолжения
@@ -141,7 +161,10 @@ export class NameGate {
     // обращения (или от нуля), и доспросить после возвращения было бы нельзя.
     if (addressed) this.lastAddressedAt = now;
 
-    if (addressed && LISTEN_CMD.test(text)) {
+    // Наедине команды принимаются и без имени — обращаться не к кому больше.
+    const addressedOrSolo = addressed || this.solo;
+
+    if (addressedOrSolo && LISTEN_CMD.test(text)) {
       this.muted = true;
       // Окно тоже гасим: без этого следующая реплика прошла бы по нему, и
       // режим слушателя включился бы с задержкой в полминуты.
@@ -151,12 +174,15 @@ export class NameGate {
 
     // Обратная команда работает только из режима слушателя. Иначе обычное
     // «Роман, вопрос к тебе» превращалось бы в подтверждение вместо ответа.
-    if (this.muted && addressed && RESUME_CMD.test(text)) {
+    if (this.muted && addressedOrSolo && RESUME_CMD.test(text)) {
       this.muted = false;
       return 'ack_resume';
     }
 
     if (this.muted) return 'silent';
+    // Один человек — разговор с ним и идёт. Гейт по имени включится сам,
+    // как только в комнате появится второй.
+    if (this.solo) return 'respond';
     if (addressed) {
       this.windowOwner = speaker;
       return 'respond';

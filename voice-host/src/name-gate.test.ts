@@ -230,3 +230,46 @@ describe('NameGate — окно продолжения привязано к г�
     assert.equal(gate.decide('а почему?', 5000), 'respond');
   });
 });
+
+describe('NameGate — наедине', () => {
+  test('на один-на-один отвечает без имени', () => {
+    // Живая встреча 03.09.2026: владелец вёл деловой разговор, а ассистент
+    // молчал на «давай обсудим кампанию», «зададим вопрос юристу» и
+    // «финансист, чтобы было выгодно» — имени в них не было.
+    const gate = new NameGate('Роман', 30_000);
+    gate.setSolo(true);
+    assert.equal(gate.decide('давай обсудим кампанию', 1000), 'respond');
+  });
+
+  test('появился второй — снова молчит без имени', () => {
+    const gate = new NameGate('Роман', 30_000);
+    gate.setSolo(true);
+    assert.equal(gate.decide('давай обсудим', 1000), 'respond');
+    gate.setSolo(false);
+    assert.equal(gate.decide('давай обсудим', 2000), 'silent');
+    assert.equal(gate.decide('Роман, давай обсудим', 3000), 'respond');
+  });
+
+  test('просьба замолчать действует и наедине', () => {
+    // Иначе выключить его один на один стало бы невозможно.
+    const gate = new NameGate('Роман', 30_000);
+    gate.setSolo(true);
+    assert.equal(gate.decide('помолчи', 1000), 'silent');
+  });
+
+  test('режим слушателя наедине включается без имени', () => {
+    const gate = new NameGate('Роман', 30_000);
+    gate.setSolo(true);
+    assert.equal(gate.decide('пока слушай', 1000), 'ack_listen');
+    assert.equal(gate.decide('погода хорошая', 2000), 'silent');
+    assert.equal(gate.decide('вопрос к тебе', 3000), 'ack_resume');
+    assert.equal(gate.decide('так что скажешь?', 4000), 'respond');
+  });
+
+  test('в режиме слушателя наедине молчит несмотря на solo', () => {
+    const gate = new NameGate('Роман', 30_000);
+    gate.setSolo(true);
+    gate.decide('пока слушай', 1000);
+    assert.equal(gate.decide('что угодно', 2000), 'silent');
+  });
+});
