@@ -8,6 +8,7 @@ import { TgIdentityService, TgIdentityConflictError } from './tg-identity.servic
 import { TgClaimService } from './tg-claim.service';
 import { TgConfigService, TgBotConfigRow } from './tg-config.service';
 import { TgRouterService } from './tg-router.service';
+import { TgMeetingService } from './tg-meeting.service';
 import { TgVoiceService } from './tg-voice.service';
 import { TgBillingService } from './tg-billing.service';
 import { TgCommandsService } from './tg-commands.service';
@@ -63,6 +64,7 @@ export class TgBotService implements OnModuleInit {
     private readonly voice: TgVoiceService,
     private readonly billing: TgBillingService,
     private readonly commands: TgCommandsService,
+    private readonly meetings: TgMeetingService,
     private readonly grammy: TgGrammyClient,
     private readonly misc: MiscService,
     private readonly video: VideoService,
@@ -241,6 +243,10 @@ export class TgBotService implements OnModuleInit {
     }
     if (data.startsWith('lang:')) {
       await this.commands.handleLanguageCallback(cb, ownerId);
+      return;
+    }
+    if (TgMeetingService.isJoin(data)) {
+      await this.meetings.handleJoinCallback(cb, ownerId);
       return;
     }
     if (data.startsWith('agents_page:')) {
@@ -503,6 +509,23 @@ export class TgBotService implements OnModuleInit {
         }
       }
       return;
+    }
+
+    // Ссылка на встречу замыкает ход: показываем приглашение с кнопкой и в
+    // модель не идём. Иначе за каждую вставленную ссылку платим ход LLM и
+    // получаем два ответа — приглашение и рассуждение ассистента о нём.
+    // Тот же приём, что в вебе (chat.service.ts).
+    if (cfg.owner_user_id && typeof workingText === 'string') {
+      try {
+        const handled = await this.meetings.tryHandleLink(
+          msg.chat.id, workingText, cfg.owner_user_id,
+        );
+        if (handled) return;
+      } catch (e: any) {
+        // Не повод глушить сообщение: не получилось показать приглашение —
+        // пусть ассистент ответит как обычно.
+        this.logger.warn(`meeting link check failed in chat ${msg.chat.id}: ${e.message}`);
+      }
     }
 
     const botUserId = await this.grammy.getBotUserId();
