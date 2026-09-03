@@ -41,6 +41,41 @@ export class MeetingService {
    * представлялся «ассистент пользователя». Выглядело как случайный сбой,
    * было единственно возможным поведением — поймано на встрече 28.08.2026.
    */
+  /**
+   * Пускать ли в разговор при текущем балансе.
+   *
+   * До 03.09.2026 проверки не было нигде — ни у звонка, ни у встречи: списание
+   * идёт по факту, после разговора. Пока звонить могли одни админы, риск был
+   * нулевой. С открытием встреч всем пользователь с пустым балансом может
+   * провести час Realtime, и узнаем мы об этом постфактум.
+   *
+   * Порог — ноль, а не «хватит на час»: заранее длительность неизвестна, а
+   * отказывать человеку с непустым балансом нельзя. Задача проверки — отсечь
+   * заведомо неплатёжеспособный вход, а не гарантировать оплату.
+   */
+  private async assertCanAfford(userId: string): Promise<void> {
+    let balance = 0;
+    try {
+      const r = await this.pg.query(
+        `SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
+        [userId],
+      );
+      balance = Number(r.rows[0]?.tokens ?? 0);
+    } catch (e: any) {
+      // База недоступна — не повод не пускать: отказ по технической причине
+      // хуже, чем неоплаченная минута.
+      this.logger.warn(`баланс ${userId} не проверен: ${e?.message}`);
+      return;
+    }
+    if (balance <= 0) {
+      throw new ConflictException({
+        message: 'not enough tokens',
+        reason: 'insufficient_tokens',
+        balance,
+      });
+    }
+  }
+
   private async resolveOwnerName(userId: string): Promise<string> {
     try {
       const res = await this.pg.query(
@@ -79,6 +114,8 @@ export class MeetingService {
     if (active.rows[0]) {
       throw new ConflictException({ message: 'call already in progress', callId: active.rows[0].id });
     }
+
+    await this.assertCanAfford(userId);
 
     const isForeign = provider === 'talerid';
     const callId = randomUUID();

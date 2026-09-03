@@ -27,9 +27,12 @@ describe('MeetingService', () => {
    * Имя отдаём именно из профиля: раньше оно приходило параметром из
    * контроллера, и тест был зелёным просто потому, что тест же его и передал.
    */
+  let balance = 50_000;
+
   function withAgent(ownerName: string | null = 'Дмитрий') {
     pg.query.mockImplementation(async (sql: string) => {
       if (sql.includes('FROM agents')) return { rows: [agentRow] };
+      if (sql.includes('SELECT tokens FROM ai_profiles_consolidated')) return { rows: [{ tokens: balance }] };
       if (sql.includes('ai_profiles_consolidated')) return { rows: [{ name: ownerName }] };
       return { rows: [], rowCount: 0 };
     });
@@ -37,6 +40,7 @@ describe('MeetingService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    balance = 50_000;
     pg = { query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }) };
     calls = {
       buildPreamble: jest.fn().mockResolvedValue('Пользователь: привет'),
@@ -245,6 +249,25 @@ describe('MeetingService', () => {
       withAgent();
       await svc.join('u1', 7, 'ABC234');
       expect(livekit.ensureRoom).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('баланс', () => {
+    it('пустой баланс не пускает в разговор', async () => {
+      // Проверки не было нигде: списание идёт после разговора. Пока звонили
+      // одни админы, риск был нулевой; со встречами для всех пользователь с
+      // нулём мог провести час Realtime, и узнали бы мы постфактум.
+      withAgent();
+      balance = 0;
+      await expect(svc.join('u1', 7, 'ABC234')).rejects.toThrow();
+      expect(livekit.dispatchAgent).not.toHaveBeenCalled();
+    });
+
+    it('с непустым балансом вход проходит', async () => {
+      withAgent();
+      balance = 1;
+      await svc.join('u1', 7, 'ABC234');
+      expect(livekit.dispatchAgent).toHaveBeenCalled();
     });
   });
 });
