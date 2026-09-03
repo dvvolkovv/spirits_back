@@ -22,7 +22,6 @@ export class MeetingController {
     @CurrentUser() u: any,
     @Body() body: { agentId: number; code: string; provider?: 'linkeon' | 'talerid' },
   ) {
-    if (!u?.isAdmin) throw new ForbiddenException('meetings are admin-only in v1');
     // Имя владельца сервис берёт из профиля сам: в JWT его нет.
     return this.meetings.join(
       u.userId,

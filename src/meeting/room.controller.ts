@@ -1,7 +1,6 @@
 import {
   Body,
   Controller,
-  ForbiddenException,
   Get,
   NotFoundException,
   Param,
@@ -31,7 +30,6 @@ export class RoomController {
   @Post()
   @UseGuards(JwtGuard)
   async create(@CurrentUser() u: any, @Body() body: { title?: string }) {
-    if (!u?.isAdmin) throw new ForbiddenException('meetings are admin-only in v1');
     return this.rooms.create(u.userId, body?.title);
   }
 
