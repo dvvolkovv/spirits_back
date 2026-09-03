@@ -50,6 +50,15 @@ export class ExternalRoomAudioOutput extends voice.AudioOutput {
   private pushedSec = 0;
   /** Идёт ли ожидание доигрывания: второй flush поверх первого не нужен. */
   private flushing = false;
+  /**
+   * Номер сегмента — только для диагностики.
+   *
+   * Ассистент выпадает из встречи на длинных репликах, и обе прошлые версии
+   * причины оказались неверными. По этим строкам видно однозначно: открылся
+   * сегмент, дошло ли до ожидания, доиграл ли источник. Молчание после
+   * «жду доигрывания» означает зависший flush.
+   */
+  private segment = 0;
 
   constructor(private readonly room: Room, private readonly name = 'assistant') {
     super(SAMPLE_RATE);
@@ -84,6 +93,8 @@ export class ExternalRoomAudioOutput extends voice.AudioOutput {
     // сессия, чтобы понять, что реплика пошла в эфир.
     if (!this.segmentOpen) {
       this.segmentOpen = true;
+      this.segment += 1;
+      console.log(`[сегмент ${this.segment}] открыт`);
       this.onPlaybackStarted(Date.now());
     }
     await this.source.captureFrame(frame);
@@ -111,18 +122,28 @@ export class ExternalRoomAudioOutput extends voice.AudioOutput {
     // Нечего закрывать либо закрытие уже идёт — второй раз не начинаем.
     if (!this.segmentOpen || this.flushing) return;
     this.flushing = true;
+    // Момент входа в ожидание. Если следующей строки о закрытии не будет —
+    // значит источник не сообщил о доигрывании, и сегмент завис открытым.
+    console.log(`[сегмент ${this.segment}] flush: жду доигрывания ${this.pushedSec.toFixed(1)}с`);
     // Ждём, пока источник действительно доиграет очередь: сообщить о конце
     // раньше времени — значит дать сессии начать следующую реплику поверх
     // недоговорённой.
     void (this.source?.waitForPlayout() ?? Promise.resolve())
       .catch(() => {})
-      .then(() => this.finishSegment(false));
+      .then(() => {
+        console.log(`[сегмент ${this.segment}] источник доиграл`);
+        this.finishSegment(false);
+      });
   }
 
   /** Закрыть сегмент и обнулить счётчики — как это делает штатный вывод. */
   private finishSegment(interrupted: boolean): void {
     if (!this.segmentOpen) return;
     const position = this.pushedSec;
+    console.log(
+      `[сегмент ${this.segment}] закрыт: ${position.toFixed(1)}с` +
+      `${interrupted ? ', прерван' : ''}`,
+    );
     this.segmentOpen = false;
     this.flushing = false;
     this.pushedSec = 0;
