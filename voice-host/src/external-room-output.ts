@@ -36,8 +36,20 @@ export class ExternalRoomAudioOutput extends voice.AudioOutput {
   private frames = 0;
   /** Идёт ли сейчас сегмент речи — от первого кадра до flush/clearBuffer. */
   private segmentOpen = false;
-  /** Сколько миллисекунд отдано в этом сегменте: уходит в playbackPosition. */
-  private playedMs = 0;
+  /**
+   * Сколько СЕКУНД звука отдано в этом сегменте.
+   *
+   * Именно секунд: `playbackPosition` в PlaybackFinishedEvent измеряется в
+   * них — так считает штатный вывод SDK (`sourcePushedDuration`). Я сначала
+   * передавал миллисекунды, и OpenAI отбивал команды обрезки: «Audio content
+   * of 34350ms is already shorter than 10799999ms». Тридцать четыре секунды
+   * речи превращались в девять часов, сегмент ломался, ошибки копились и
+   * планировщик вставал — ассистент выпадал из встречи посреди фразы.
+   * Живая встреча 03.09.2026.
+   */
+  private pushedSec = 0;
+  /** Идёт ли ожидание доигрывания: второй flush поверх первого не нужен. */
+  private flushing = false;
 
   constructor(private readonly room: Room, private readonly name = 'assistant') {
     super(SAMPLE_RATE);
@@ -72,12 +84,10 @@ export class ExternalRoomAudioOutput extends voice.AudioOutput {
     // сессия, чтобы понять, что реплика пошла в эфир.
     if (!this.segmentOpen) {
       this.segmentOpen = true;
-      this.playedMs = 0;
       this.onPlaybackStarted(Date.now());
     }
     await this.source.captureFrame(frame);
-    // Длительность кадра — по числу сэмплов: она уходит в playbackPosition.
-    this.playedMs += (frame.samplesPerChannel / SAMPLE_RATE) * 1000;
+    this.pushedSec += frame.samplesPerChannel / SAMPLE_RATE;
     if (++this.frames % 250 === 0) {
       console.log(`[выход] кадров ассистента: ${this.frames}`);
     }
@@ -98,15 +108,25 @@ export class ExternalRoomAudioOutput extends voice.AudioOutput {
    */
   flush(): void {
     super.flush();
-    if (!this.segmentOpen) return;
-    this.segmentOpen = false;
-    const played = this.playedMs;
+    // Нечего закрывать либо закрытие уже идёт — второй раз не начинаем.
+    if (!this.segmentOpen || this.flushing) return;
+    this.flushing = true;
     // Ждём, пока источник действительно доиграет очередь: сообщить о конце
     // раньше времени — значит дать сессии начать следующую реплику поверх
     // недоговорённой.
     void (this.source?.waitForPlayout() ?? Promise.resolve())
       .catch(() => {})
-      .then(() => this.onPlaybackFinished({ playbackPosition: played, interrupted: false }));
+      .then(() => this.finishSegment(false));
+  }
+
+  /** Закрыть сегмент и обнулить счётчики — как это делает штатный вывод. */
+  private finishSegment(interrupted: boolean): void {
+    if (!this.segmentOpen) return;
+    const position = this.pushedSec;
+    this.segmentOpen = false;
+    this.flushing = false;
+    this.pushedSec = 0;
+    this.onPlaybackFinished({ playbackPosition: position, interrupted });
   }
 
   /**
@@ -120,10 +140,7 @@ export class ExternalRoomAudioOutput extends voice.AudioOutput {
     this.source?.clearQueue();
     // Перебивание тоже закрывает сегмент — но как прерванный. Без этого
     // сессия ждала бы конца реплики, которой уже не будет.
-    if (this.segmentOpen) {
-      this.segmentOpen = false;
-      this.onPlaybackFinished({ playbackPosition: this.playedMs, interrupted: true });
-    }
+    this.finishSegment(true);
   }
 
   /** Снять публикацию. Зовётся при закрытии сессии. */
