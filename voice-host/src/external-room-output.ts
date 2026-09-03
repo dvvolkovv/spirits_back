@@ -59,6 +59,8 @@ export class ExternalRoomAudioOutput extends voice.AudioOutput {
    * «жду доигрывания» означает зависший flush.
    */
   private segment = 0;
+  /** Перебили ли текущий сегмент. Читается задачей ожидания при закрытии. */
+  private interrupted = false;
 
   constructor(private readonly room: Room, private readonly name = 'assistant') {
     super(SAMPLE_RATE);
@@ -132,7 +134,7 @@ export class ExternalRoomAudioOutput extends voice.AudioOutput {
       .catch(() => {})
       .then(() => {
         console.log(`[сегмент ${this.segment}] источник доиграл`);
-        this.finishSegment(false);
+        this.finishSegment(this.interrupted);
       });
   }
 
@@ -147,6 +149,7 @@ export class ExternalRoomAudioOutput extends voice.AudioOutput {
     this.segmentOpen = false;
     this.flushing = false;
     this.pushedSec = 0;
+    this.interrupted = false;
     this.onPlaybackFinished({ playbackPosition: position, interrupted });
   }
 
@@ -158,10 +161,17 @@ export class ExternalRoomAudioOutput extends voice.AudioOutput {
    * встрече, где перебивают постоянно, это слышно сразу.
    */
   clearBuffer(): void {
+    // Только гасим очередь и помечаем прерывание. О завершении сегмента
+    // сообщит задача ожидания — она одна на сегмент, и это принципиально:
+    // так устроен штатный вывод SDK. Рапортовать отсюда напрямую значит
+    // объявить реплику законченной раньше, чем стих звук.
+    this.interrupted = true;
     this.source?.clearQueue();
     // Перебивание тоже закрывает сегмент — но как прерванный. Без этого
     // сессия ждала бы конца реплики, которой уже не будет.
-    this.finishSegment(true);
+    // Если ожидания нет (перебили до flush) — закрываем сами, иначе сегмент
+    // остался бы открытым навсегда.
+    if (this.segmentOpen && !this.flushing) this.finishSegment(true);
   }
 
   /** Снять публикацию. Зовётся при закрытии сессии. */
