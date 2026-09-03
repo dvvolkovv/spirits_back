@@ -34,6 +34,37 @@ export class LiveKitClient {
   }
 
   /** Позвать воркера в комнату. metadata приезжает к нему в JobContext. */
+  /**
+   * Завести комнату заранее, с увеличенным сроком жизни пустой.
+   *
+   * Нужно только для чужих встреч: там наша комната стоит ПУСТОЙ по замыслу —
+   * в ней сидит один ассистент, а разговор идёт у провайдера. LiveKit считает
+   * такую комнату брошенной и удаляет по `empty_timeout`, дефолт которого 300
+   * секунд. В нашем /etc/livekit.yaml секции `room:` нет вовсе, то есть
+   * действует именно дефолт.
+   *
+   * Ровно это и выбрасывало ассистента из встречи Taler ID: семь встреч
+   * подряд закончились на 301-й секунде — 300 секунд таймаута плюс секунда на
+   * закрытие. Со стороны выглядело как «вылетел посреди фразы», и пять версий
+   * причины подряд оказались мимо, потому что смотрели на события ПЕРЕД
+   * выходом, а не на то, что выход всегда в одну и ту же секунду.
+   *
+   * Свои комнаты этим не болеют: там живые люди, комната не пуста.
+   *
+   * Жизненным циклом по-прежнему управляет occupancy в воркере — он следит за
+   * составом комнаты ПРОВАЙДЕРА и выходит, когда там никого не осталось.
+   * Здешний таймаут лишь перестаёт мешать.
+   */
+  async ensureRoom(roomName: string, emptyTimeoutSec: number): Promise<void> {
+    const client = new RoomServiceClient(this.httpUrl, this.apiKey, this.apiSecret);
+    try {
+      await client.createRoom({ name: roomName, emptyTimeout: emptyTimeoutSec });
+    } catch (e: any) {
+      // Комната могла существовать с прошлого входа — это не ошибка.
+      this.logger.warn(`[room] ${roomName} не заведена заранее: ${e?.message}`);
+    }
+  }
+
   async dispatchAgent(roomName: string, metadata: Record<string, unknown>): Promise<void> {
     const agentName = process.env.VOICE_AGENT_NAME || 'linkeon-voice-host';
     const client = new AgentDispatchClient(this.httpUrl, this.apiKey, this.apiSecret);

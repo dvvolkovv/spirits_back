@@ -9,7 +9,7 @@ describe('MeetingService', () => {
     fail: jest.Mock;
     markInterruptedKeepingRoom: jest.Mock;
   };
-  let livekit: { dispatchAgent: jest.Mock; removeAgents: jest.Mock };
+  let livekit: { dispatchAgent: jest.Mock; removeAgents: jest.Mock; ensureRoom: jest.Mock };
   let rooms: { info: jest.Mock };
   let talerIdRooms: { info: jest.Mock; join: jest.Mock };
   let svc: MeetingService;
@@ -44,7 +44,7 @@ describe('MeetingService', () => {
       fail: jest.fn(),
       markInterruptedKeepingRoom: jest.fn(),
     };
-    livekit = { dispatchAgent: jest.fn(), removeAgents: jest.fn() };
+    livekit = { dispatchAgent: jest.fn(), removeAgents: jest.fn(), ensureRoom: jest.fn() };
     rooms = { info: jest.fn().mockResolvedValue({ code: 'ABC234', title: 'Планёрка', active: true }) };
     talerIdRooms = {
       info: jest.fn().mockResolvedValue({
@@ -227,6 +227,24 @@ describe('MeetingService', () => {
       talerIdRooms.info.mockResolvedValue(null);
       await expect(svc.join('u1', 7, 'ZZZZZZ', 'talerid')).rejects.toThrow(NotFoundException);
       expect(livekit.dispatchAgent).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('пустая комната не умирает по таймауту', () => {
+    it('для чужой встречи комната заводится заранее с запасом', async () => {
+      // Наша комната при встрече Taler ID пуста по замыслу, а дефолтный
+      // empty_timeout у LiveKit — 300 секунд. Семь встреч подряд обрывались
+      // на 301-й секунде: ассистента просто выбрасывало из удалённой комнаты.
+      withAgent();
+      await svc.join('u1', 7, '36fc367a', 'talerid');
+      expect(talerIdRooms.join).toHaveBeenCalled();
+      expect(livekit.ensureRoom).toHaveBeenCalledWith('talerid_36fc367a', 7200);
+    });
+
+    it('для своей встречи заранее заводить нечего — там живые люди', async () => {
+      withAgent();
+      await svc.join('u1', 7, 'ABC234');
+      expect(livekit.ensureRoom).not.toHaveBeenCalled();
     });
   });
 });

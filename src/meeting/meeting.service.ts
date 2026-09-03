@@ -129,6 +129,11 @@ export class MeetingService {
         external = { url: t.url, token: t.token };
       }
 
+      // Наша комната при чужой встрече пуста, и LiveKit удалил бы её через
+      // пять минут по дефолтному empty_timeout — ассистента выбрасывало
+      // ровно на 301-й секунде. Заводим заранее с запасом на всю встречу.
+      if (isForeign) await this.livekit.ensureRoom(roomName, 2 * 60 * 60);
+
       await this.livekit.dispatchAgent(roomName, {
         callId,
         userId,
