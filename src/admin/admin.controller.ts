@@ -242,6 +242,33 @@ export class AdminController {
     return res.status(200).json(stats);
   }
 
+  /**
+   * Звонки одного человека — для карточки пользователя в админке.
+   *
+   * Объявлен ДО admin/calls/:id/transcript намеренно: иначе литерал `user`
+   * попал бы в :id и запрос ушёл бы искать звонок с таким идентификатором.
+   */
+  @Get('admin/calls/user/:userId')
+  async userCalls(
+    @Param('userId') userId: string,
+    @Query('limit') limit: string | undefined,
+    @Res() res: Response,
+  ) {
+    const data = await this.adminService.getUserCalls(userId, {
+      limit: limit ? parseInt(limit, 10) || undefined : undefined,
+    });
+    return res.status(200).json(data);
+  }
+
+  @Get('admin/calls/:id/transcript')
+  async callTranscript(@Param('id') id: string, @Res() res: Response) {
+    const data = await this.adminService.getCallTranscript(id);
+    // 404, а не пустой объект: иначе интерфейс покажет пустой диалог, и это
+    // будет неотличимо от звонка, где человек молчал.
+    if (!data) return res.status(404).json({ error: 'call not found' });
+    return res.status(200).json(data);
+  }
+
   // --- Устройства ---
 
   @Get('admin/devices/stats')

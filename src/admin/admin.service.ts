@@ -6,6 +6,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
 import { sendTelegramAlert } from '../common/telegram-alert';
+import { callFlags, countUserTurns } from './callFlags';
 
 @Injectable()
 export class AdminService implements OnModuleInit {
@@ -1638,6 +1639,50 @@ export class AdminService implements OnModuleInit {
         tokens_total: tokensCall + tokensConsult,
       },
     };
+  }
+
+  /**
+   * Звонки одного человека для карточки в админке.
+   *
+   * Расшифровку СЮДА не кладём: на проде 49 расшифровок весят заметно больше
+   * остального ответа, а открывают их по одной. Пометки считаем здесь же,
+   * чтобы интерфейс не тянул диалоги ради подсчёта реплик.
+   *
+   * Тестовые аккаунты не исключаем — в отличие от агрегата в разделе: сюда
+   * приходят по конкретному user_id, и если открыли карточку тестового
+   * аккаунта, значит его и хотят посмотреть.
+   */
+  async getUserCalls(userId: string, opts: { limit?: number } = {}) {
+    const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
+    const res = await this.pg.query(
+      `SELECT c.id, c.started_at, c.ended_at, c.duration_sec, c.status,
+              c.tokens_charged, c.model, c.provider, c.summary, c.transcript
+         FROM voice_calls c
+        WHERE c.user_id = $1
+        ORDER BY c.started_at DESC
+        LIMIT $2`,
+      [userId, limit],
+    );
+
+    const calls = res.rows.map((r: any) => {
+      const { transcript, ...rest } = r;
+      return { ...rest, flags: callFlags(r), user_turns: countUserTurns(transcript) };
+    });
+    return { userId, calls };
+  }
+
+  /** Расшифровка одного звонка — по клику из списка. */
+  async getCallTranscript(callId: string) {
+    const res = await this.pg.query(
+      `SELECT id, summary, transcript, duration_sec, status, started_at
+         FROM voice_calls WHERE id = $1 LIMIT 1`,
+      [callId],
+    );
+    const row = res.rows[0];
+    if (!row) return null;
+    // Не-массив превращаем в пустой массив: интерфейс рисует реплики циклом,
+    // и строка вместо массива уронила бы весь разворот диалога.
+    return { ...row, transcript: Array.isArray(row.transcript) ? row.transcript : [] };
   }
 
   // --- Per-user activity drill-down ---
