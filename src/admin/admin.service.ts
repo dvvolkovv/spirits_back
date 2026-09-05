@@ -1526,6 +1526,120 @@ export class AdminService implements OnModuleInit {
     };
   }
 
+  // --- Голосовые звонки ---
+
+  /**
+   * Звонки в разрезе пользователей: сколько звонили и сколько за это списано.
+   *
+   * Списаний два, и лежат они в разных таблицах: voice_calls.tokens_charged —
+   * минуты разговора, voice_call_jobs.tokens_used — каждый вопрос ведущего
+   * профильному ассистенту. Отдаём обе цифры раздельно и сумму: при разборе
+   * крупного счёта первым делом надо понять, съели его минуты или консультации,
+   * а по одной общей цифре этого не видно.
+   *
+   * Встречи и звонки живут в одной таблице и различаются только provider, так
+   * что без фильтра получасовая встреча считалась бы звонком. По умолчанию
+   * отдаём звонки — раздел про них; встречи доступны через kind.
+   */
+  async getCallsByUser(
+    opts: { days?: number; kind?: 'call' | 'meeting' | 'all'; limit?: number } = {},
+  ) {
+    const days = Math.min(Math.max(opts.days ?? 30, 1), 365);
+    const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
+    // Незнакомое значение схлопывается в 'call', а не снимает фильтр: иначе
+    // произвольный ?kind= молча подмешал бы встречи в раздел звонков.
+    const kind: 'call' | 'meeting' | 'all' =
+      opts.kind === 'meeting' || opts.kind === 'all' ? opts.kind : 'call';
+
+    const providerFilter =
+      kind === 'all'
+        ? 'true'
+        : `c.provider = '${kind === 'meeting' ? 'linkeon_room' : 'linkeon'}'`;
+
+    // Общий предикат выборки. Держим одной строкой, чтобы таблица и итоги
+    // считались ровно по одному набору звонков: разъехавшись, они дали бы
+    // сумму колонок, не сходящуюся с итогом внизу.
+    const where = `
+      c.started_at >= now() - $1 * interval '1 day'
+      AND ${providerFilter}
+      AND ${AdminService.excludeTest('c.user_id')}`;
+
+    // Консультации подтягиваем коррелированным подзапросом по call_id, а не
+    // отдельным JOIN по user_id: иначе в выборку звонков приехали бы вопросы,
+    // заданные тем же человеком на встрече.
+    const consultSum = `(
+      SELECT COALESCE(SUM(j.tokens_used), 0)
+      FROM voice_call_jobs j WHERE j.call_id = c.id
+    )`;
+    const consultCount = `(
+      SELECT COUNT(*) FROM voice_call_jobs j WHERE j.call_id = c.id
+    )`;
+
+    const rowsRes = await this.pg.query(
+      `SELECT
+         c.user_id,
+         COUNT(*)::int AS calls,
+         COALESCE(SUM(c.duration_sec), 0)::bigint AS duration_sec,
+         COALESCE(SUM(c.tokens_charged), 0)::bigint AS tokens_call,
+         COALESCE(SUM(${consultSum}), 0)::bigint AS tokens_consult,
+         COALESCE(SUM(${consultCount}), 0)::int AS consults,
+         MAX(c.started_at) AS last_call
+       FROM voice_calls c
+       WHERE ${where}
+       GROUP BY c.user_id
+       ORDER BY (COALESCE(SUM(c.tokens_charged), 0) + COALESCE(SUM(${consultSum}), 0)) DESC,
+                calls DESC, c.user_id ASC
+       LIMIT ${limit}`,
+      [days],
+    );
+
+    // Итоги считаем отдельным запросом, а не суммой строк: строки обрезаны
+    // лимитом, и на большом хвосте подпись под таблицей врала бы в меньшую
+    // сторону, оставаясь правдоподобной.
+    const totalsRes = await this.pg.query(
+      `SELECT
+         COUNT(*)::int AS calls,
+         COUNT(DISTINCT c.user_id)::int AS users,
+         COALESCE(SUM(c.duration_sec), 0)::bigint AS duration_sec,
+         COALESCE(SUM(c.tokens_charged), 0)::bigint AS tokens_call,
+         COALESCE(SUM(${consultSum}), 0)::bigint AS tokens_consult
+       FROM voice_calls c
+       WHERE ${where}`,
+      [days],
+    );
+    const tot = totalsRes.rows[0] || {};
+
+    const tokensCall = Number(tot.tokens_call) || 0;
+    const tokensConsult = Number(tot.tokens_consult) || 0;
+
+    return {
+      days,
+      kind,
+      byUser: rowsRes.rows.map((r: any) => {
+        const call = Number(r.tokens_call) || 0;
+        const consult = Number(r.tokens_consult) || 0;
+        return {
+          user_id: r.user_id,
+          calls: Number(r.calls) || 0,
+          duration_sec: Number(r.duration_sec) || 0,
+          tokens_call: call,
+          tokens_consult: consult,
+          tokens_total: call + consult,
+          consults: Number(r.consults) || 0,
+          last_call: r.last_call,
+        };
+      }),
+      totals: {
+        calls: Number(tot.calls) || 0,
+        users: Number(tot.users) || 0,
+        duration_sec: Number(tot.duration_sec) || 0,
+        tokens_call: tokensCall,
+        tokens_consult: tokensConsult,
+        tokens_total: tokensCall + tokensConsult,
+      },
+    };
+  }
+
   // --- Per-user activity drill-down ---
 
   async getUserActivity(phone: string, opts: { days?: number } = {}) {

@@ -223,6 +223,25 @@ export class AdminController {
     return res.status(200).json(stats);
   }
 
+  // --- Голосовые звонки ---
+
+  @Get('admin/calls')
+  async callsByUser(
+    @Query('days') days: string | undefined,
+    @Query('kind') kind: string | undefined,
+    @Query('limit') limit: string | undefined,
+    @Res() res: Response,
+  ) {
+    // kind не валидируем здесь: сервис сам схлопывает незнакомое значение в
+    // 'call'. Проверка в двух местах разъехалась бы при добавлении провайдера.
+    const stats = await this.adminService.getCallsByUser({
+      days: days ? parseInt(days, 10) || undefined : undefined,
+      kind: kind as 'call' | 'meeting' | 'all' | undefined,
+      limit: limit ? parseInt(limit, 10) || undefined : undefined,
+    });
+    return res.status(200).json(stats);
+  }
+
   // --- Устройства ---
 
   @Get('admin/devices/stats')
