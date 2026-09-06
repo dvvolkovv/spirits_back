@@ -1321,19 +1321,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       //
       // Сравниваем charge.tokens, а не textCost: у оборванного хода textCost=0,
       // и дорогой сбой иначе прошёл бы молча — а он-то как раз и интересен.
-      if (charge.tokens >= this.EXPENSIVE_TURN_ALERT_TOKENS) {
-        const balLeft = await this.pg
-          .query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1', [userId])
-          .then((r) => Number(r.rows[0]?.tokens ?? 0))
-          .catch(() => -1);
-        void sendTelegramAlert(
-          `💸 <b>Дорогой ход</b>\n` +
-          `Юзер: <code>${userId}</code>, ассистент ${assistantId}\n` +
-          `Стоимость: <b>$${agentCostUsd.toFixed(2)}</b> → списано ${textCost.toLocaleString('ru')} токенов\n` +
-          `Остаток: ${balLeft < 0 ? 'н/д' : balLeft.toLocaleString('ru')}\n` +
-          `<code>${charge.note}</code>`,
-        ).catch(() => {});
-      }
+      await this.alertExpensiveTurn(userId, assistantId, charge, agentCostUsd, textCost);
       try {
         const sessOverride = fresh ? freshSessionId : undefined;
         if (userMsgPersisted) {
@@ -2099,6 +2087,119 @@ ${LanguageService.buildDirective(userLanguage)}`;
        VALUES ($1, $2, 'pending', $3, $4, $5, 0, $6)`,
       [executionId, userId, agentIdNum, inputTokens, outputTokens, facts ? JSON.stringify(facts) : null],
     );
+  }
+
+  /**
+   * Алерт на аномально дорогой ход. Про ход юриста за $47 (169 208 токенов,
+   * 23% его баланса за одно сообщение) мы узнали только потому, что полезли
+   * смотреть логи руками — сам по себе такой ход ничем себя не обозначает.
+   *
+   * Смотрим на `charge.tokens`, а не на списанное: у оборванного хода списано 0,
+   * и дорогой сбой иначе прошёл бы молча — а он-то как раз и интересен.
+   */
+  private async alertExpensiveTurn(
+    userId: string,
+    assistantId: string,
+    charge: { tokens: number; note: string },
+    costUsd: number,
+    chargedTokens: number,
+  ) {
+    if (charge.tokens < this.EXPENSIVE_TURN_ALERT_TOKENS) return;
+    const balLeft = await this.pg
+      .query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1', [userId])
+      .then((r) => Number(r.rows[0]?.tokens ?? 0))
+      .catch(() => -1);
+    void sendTelegramAlert(
+      `💸 <b>Дорогой ход</b>\n` +
+      `Юзер: <code>${userId}</code>, ассистент ${assistantId}\n` +
+      `Стоимость: <b>$${costUsd.toFixed(2)}</b> → списано ${chargedTokens.toLocaleString('ru')} токенов\n` +
+      `Остаток: ${balLeft < 0 ? 'н/д' : balLeft.toLocaleString('ru')}\n` +
+      `<code>${charge.note}</code>`,
+    ).catch(() => {});
+  }
+
+  /** Баланс пользователя в Linkeon-токенах. Для шлагбаумов перед дорогим ходом. */
+  async getTokenBalance(userId: string): Promise<number> {
+    const r = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1', [userId]);
+    return Number(r.rows[0]?.tokens || 0);
+  }
+
+  /**
+   * Стоимость хода с вложениями — тем же методом, что и обычный ход чата.
+   *
+   * Публичная обёртка нужна контроллеру: он показывает число пользователю в
+   * событии `end` ДО того, как ход сохранён. Формула одна на оба пути — иначе
+   * повторяется история, из-за которой всё и затевалось.
+   */
+  computeUploadCharge(usage: SdkUsageTotals | null, costUsd: number, text: string) {
+    return this.computeSdkCharge(usage, costUsd, text);
+  }
+
+  /**
+   * Списание и сохранение хода с загруженными файлами
+   * (`POST /webhook/agent/upload-and-chat`).
+   *
+   * До 06.09.2026 этот путь не тарифицировался вообще: обработчик загрузки —
+   * отдельная реализация стрима, и она читала из события `done` только
+   * `outputFiles`, а `usage` и `costUsd` выбрасывала. В историю и в индикатор
+   * уходила ДЛИНА ОТВЕТА В СИМВОЛАХ, за которой не стояло ни одной транзакции.
+   * Нашлось по жалобе «тяжёлый запрос, а списалось 2000»: пользователь
+   * 79096549517 перевёл 7 страниц медицинских документов за $5.80 реального
+   * расхода и не заплатил ничего. Таких ходов с апреля накопилось 640.
+   *
+   * Стоимость считается заново из `usage`/`costUsd`, а не принимается готовой:
+   * метод должен уметь обнулить её сам (оборванный ход, отказ CLI), и решение
+   * об этом не может жить в контроллере.
+   */
+  async persistUploadTurn(p: {
+    userId: string;
+    assistantId: string;
+    userMsg: string;
+    assistantMsg: string;
+    usage: SdkUsageTotals | null;
+    costUsd: number;
+    durationMs: number;
+    turnFailed?: boolean;
+    failReason?: string;
+  }): Promise<number> {
+    let text = p.assistantMsg;
+    let turnFailed = p.turnFailed === true;
+    let failReason = p.failReason || '';
+
+    // Защита в глубину, та же что в основном пути: служебный отказ CLI, долетевший
+    // до нас целым ответом, пользователь не должен увидеть дословно и тем более
+    // за него заплатить.
+    if (this.looksCliFailure(text)) {
+      this.logger.error(`CLI-отказ долетел как ответ на загрузку (${p.userId}_${p.assistantId}): ${text.slice(0, 120)}`);
+      turnFailed = true;
+      failReason = failReason || 'cli_fatal_text';
+      text = '_Не получилось: временный сбой на стороне платформы. Токены за этот ход не списаны — попробуйте отправить сообщение ещё раз._';
+    }
+
+    const charge = this.computeSdkCharge(p.usage, p.costUsd, text);
+    // Ход без финального ответа пользователю не выставляется — решение владельца,
+    // то же самое, что в основном пути. Релей дописывает в такой ход строку
+    // «Токены за прерванный ход не списаны», и она должна оставаться правдой.
+    const textCost = turnFailed ? 0 : charge.tokens;
+    const logLine = turnFailed
+      ? `billing[upload:skipped:${failReason}]: ход без финального ответа — не тарифицирован, ` +
+        `иначе списали бы ${charge.tokens} (${charge.note})`
+      : `billing[upload:${charge.source}]: tokens=${textCost} ${charge.note}`;
+    if (turnFailed || charge.source === 'length') this.logger.warn(logLine);
+    else this.logger.log(logLine);
+
+    await this.alertExpensiveTurn(p.userId, p.assistantId, charge, p.costUsd, textCost);
+
+    await this.saveChatHistory(p.userId, p.assistantId, p.userMsg, text, textCost);
+    if (!turnFailed) {
+      await this.addTokenTask(p.userId, 0, textCost, p.assistantId, {
+        costUsd: Number(p.costUsd.toFixed(4)),
+        source: charge.source,
+        durationMs: p.durationMs,
+        replyChars: text.length,
+      });
+    }
+    return textCost;
   }
 
   async getChatHistory(userId: string, assistantId: string, limit = 30, offset = 0, sessionIdOverride?: string): Promise<{ messages: any[]; hasMore: boolean }> {

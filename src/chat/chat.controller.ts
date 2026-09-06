@@ -1,6 +1,6 @@
 import { Controller, Post, Get, Delete, Body, Query, Req, Res, UseGuards, Optional } from '@nestjs/common';
 import { Request, Response } from 'express';
-import { ChatService } from './chat.service';
+import { ChatService, SdkUsageTotals } from './chat.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { JwtService } from '../common/services/jwt.service';
@@ -236,6 +236,28 @@ export class ChatController {
       });
     }
 
+    // Шлагбаум по балансу — тот же, что на обычном ходе чата (chat.service.ts,
+    // «Check token balance»). До 06.09.2026 его здесь не было вовсе: загрузка
+    // файлов не только не тарифицировалась, но и не спрашивала баланс, то есть
+    // пользователь с нулём получал самый дорогой тип хода без ограничений.
+    const balance = await this.chatService
+      .getTokenBalance(userId)
+      .catch(() => 0);
+    if (balance <= 0) {
+      res.status(200);
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Transfer-Encoding', 'chunked');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      const noTokensMsg = '⚠️ **Недостаточно токенов**\n\nВаш баланс исчерпан. Пополните баланс, чтобы продолжить общение с ассистентами.\n\n👉 [Пополнить баланс](/chat?view=tokens)';
+      res.write(JSON.stringify({ type: 'begin' }) + '\n');
+      res.write(JSON.stringify({ type: 'item', content: noTokensMsg }) + '\n');
+      res.write(JSON.stringify({ type: 'end', content: noTokensMsg, usage: { input: 0, output: 0, total: 0 } }) + '\n');
+      res.end();
+      return;
+    }
+
     let profileText = '';
     if (this.neo4j) {
       try { profileText = await this.neo4j.getProfileDescription(userId); } catch {}
@@ -274,6 +296,16 @@ export class ChatController {
 
     const chunks: string[] = [];
     let upstreamError: Error | null = null;
+    // Расход хода. Релей присылает его в событии `done` с 07.08.2026 — до
+    // 06.09.2026 обработчик загрузки эти поля молча выбрасывал, и ход с
+    // вложениями был бесплатным (см. persistUploadTurn).
+    const agentUsage: SdkUsageTotals = {
+      input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
+    };
+    let agentCostUsd = 0;
+    let turnFailed = false;
+    let failReason = '';
+    const streamStartTime = Date.now();
 
     // Если клиент дисконнектился (переключил ассистента), всё равно дочитываем
     // r.linkeon.io до конца и сохраняем ответ в БД — иначе результат теряется.
@@ -309,13 +341,26 @@ export class ChatController {
               } else if (ev.type === 'result' && ev.text && chunks.length === 0) {
                 chunks.push(ev.text);
                 safeWrite({ type: 'item', content: ev.text });
-              } else if (ev.type === 'done' && ev.outputFiles?.length > 0) {
-                const fileLinks = ev.outputFiles
-                  .map((f: any) => `[Скачать ${f.name}](${AGENT_URL}${f.url})`)
-                  .join('\n');
-                if (fileLinks) {
-                  chunks.push('\n\n' + fileLinks);
-                  safeWrite({ type: 'item', content: '\n\n' + fileLinks });
+              } else if (ev.type === 'done') {
+                if (ev.failed === true) {
+                  turnFailed = true;
+                  failReason = typeof ev.failReason === 'string' ? ev.failReason : 'unknown';
+                }
+                if (typeof ev.costUsd === 'number' && ev.costUsd > 0) agentCostUsd += ev.costUsd;
+                if (ev.usage && typeof ev.usage === 'object') {
+                  for (const k of Object.keys(agentUsage) as (keyof SdkUsageTotals)[]) {
+                    const v = ev.usage[k];
+                    if (typeof v === 'number' && v > 0) agentUsage[k] += v;
+                  }
+                }
+                if (ev.outputFiles?.length > 0) {
+                  const fileLinks = ev.outputFiles
+                    .map((f: any) => `[Скачать ${f.name}](${AGENT_URL}${f.url})`)
+                    .join('\n');
+                  if (fileLinks) {
+                    chunks.push('\n\n' + fileLinks);
+                    safeWrite({ type: 'item', content: '\n\n' + fileLinks });
+                  }
                 }
               }
             } catch {}
@@ -330,7 +375,13 @@ export class ChatController {
       const fullText = chunks.join('');
 
       if (fullText.length > 0) {
-        safeWrite({ type: 'end', content: fullText, usage: { input: 0, output: fullText.length, total: fullText.length } });
+        // Индикатор считается тем же методом, что и списание в persistUploadTurn.
+        // Раньше здесь стояла длина ответа в символах: пользователь видел «2073
+        // токена» за ход, за который не списали ничего.
+        const shown = turnFailed
+          ? 0
+          : this.chatService.computeUploadCharge(agentUsage, agentCostUsd, fullText).tokens;
+        safeWrite({ type: 'end', content: fullText, usage: { input: 0, output: shown, total: shown } });
       } else if (upstreamError) {
         const errText = 'Ошибка обработки файла. Попробуйте ещё раз.';
         safeWrite({ type: 'item', content: errText });
@@ -347,13 +398,17 @@ export class ChatController {
         const userMsgForHistory = `📎 ${names}\n${message}`;
         setImmediate(async () => {
           try {
-            await this.chatService.saveChatHistoryPublic(
+            await this.chatService.persistUploadTurn({
               userId,
               assistantId,
-              userMsgForHistory,
-              fullText,
-              fullText.length,
-            );
+              userMsg: userMsgForHistory,
+              assistantMsg: fullText,
+              usage: agentUsage,
+              costUsd: agentCostUsd,
+              durationMs: Date.now() - streamStartTime,
+              turnFailed,
+              failReason,
+            });
             // Обогащаем профиль (Neo4j) на основе явных самораскрытий/согласий пользователя.
             // Файловые загрузки раньше не вызывали consolidate — теперь учитываются.
             await this.chatService.consolidateAfterChatPublic(
