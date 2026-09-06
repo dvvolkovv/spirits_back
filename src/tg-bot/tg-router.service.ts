@@ -1,4 +1,6 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
+import * as fs from 'fs';
+import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { ClaudeCliService, ClaudeCliProgressEvent } from '../common/services/claude-cli.service';
@@ -248,7 +250,43 @@ ${recent}
     throw new Error(`Config ${cfg.id} has no resolvable agent`);
   }
 
+  /**
+   * Содержимое рабочей папки для промпта: имя + размер, по одной строке.
+   * Служебные каталоги пропускаем, длину списка ограничиваем — папка живёт
+   * неделю, и в активном чате там может накопиться много.
+   */
+  private listWorkspace(dir: string): string[] {
+    const out: string[] = [];
+    const walk = (d: string, prefix: string) => {
+      let entries: fs.Dirent[];
+      try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        if (out.length >= 40) return;
+        if (e.name.startsWith('.') || ['node_modules', '__pycache__', 'venv', '.venv'].includes(e.name)) continue;
+        const full = path.join(d, e.name);
+        if (e.isDirectory()) { walk(full, `${prefix}${e.name}/`); continue; }
+        if (!e.isFile()) continue;
+        try {
+          const kb = Math.max(1, Math.round(fs.statSync(full).size / 1024));
+          out.push(`${prefix}${e.name} (${kb} КБ)`);
+        } catch { /* ignore */ }
+      }
+    };
+    walk(dir, '');
+    return out;
+  }
+
   async persistUserMessage(cfg: TgBotConfigRow, ctx: IncomingMessageContext): Promise<void> {
+    // Имя вложения идёт в историю отдельной строкой. Без него следующий ход не
+    // знает, что файл вообще присылали: в папке он лежит, а в переписке о нём
+    // ни слова — модель искала бы наугад.
+    const attachmentLines = (ctx.attachmentPaths ?? [])
+      .map(p => `📎 ${p.split(/[\\/]/).pop()}`)
+      .join('\n');
+    const content = attachmentLines
+      ? (ctx.text ? `${attachmentLines}\n${ctx.text}` : attachmentLines)
+      : ctx.text;
+
     await this.pg.query(
       `INSERT INTO tg_bot_messages (config_id, tg_chat_id, tg_message_id, tg_user_id, tg_user_name, role, content, content_type, tokens_charged)
        VALUES ($1, $2, $3, $4, $5, 'user', $6, $7, 0)`,
@@ -258,7 +296,7 @@ ${recent}
         ctx.msgId,
         ctx.fromTgUserId,
         ctx.fromTgUserName,
-        ctx.text,
+        content,
         ctx.isVoice ? 'voice_transcript' : 'text',
       ],
     );
@@ -320,11 +358,22 @@ ${recent}
     const history = await this.loadHistory(cfg.id);
     const ownerProfile = await this.loadOwnerProfile(cfg);
 
+    // Что уже лежит в рабочей папке чата. Без этого списка модель не знает, что
+    // присланный три хода назад файл всё ещё на месте, и пересобирает документ
+    // по своему же тексту из истории — так «поправь договор» превращалось в
+    // «сочини договор заново».
+    const workspaceFiles = sandboxDir ? this.listWorkspace(sandboxDir) : [];
+    const filesBlock = workspaceFiles.length ? `
+- В ПАПКЕ УЖЕ ЕСТЬ ФАЙЛЫ этого чата — и присланные пользователем, и твои прошлые результаты:
+${workspaceFiles.map(f => `  • ${f}`).join('\n')}
+- Просят поправить документ — ПРАВЬ существующий файл, а не собирай заново по памяти.
+- Пользователь говорит «в файле» без вложения — значит имеет в виду файл из этого списка. Открой его, а не переспрашивай.` : '';
+
     // В системный промпт добавляем инструкцию про markup для отправки файлов
     // и про доступные инструменты. Если есть sandboxDir — даём Claude Bash/Write/
     // и сообщаем что любые артефакты в cwd авто-прикрепятся к ответу.
     const sandboxBlock = sandboxDir ? `
-- ТЫ В BASH-ОКРУЖЕНИИ. cwd = ${sandboxDir} (изолированная пустая папка только для тебя).
+- ТЫ В BASH-ОКРУЖЕНИИ. cwd = ${sandboxDir} — рабочая папка ЭТОГО чата, она сохраняется между сообщениями.${filesBlock}
 - Доступные инструменты: Bash, Write, Edit, Read, Glob, Grep.
 - Pre-installed: python3, pip, ffmpeg, ImageMagick, LibreOffice (для конвертации в PDF), poppler-utils, curl.
 - Если нужна Python-библиотека — \`pip install --user <name>\`.

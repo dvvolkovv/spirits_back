@@ -42,6 +42,26 @@ const SANDBOX_OUTPUT_EXTS = new Set([
 const MAX_SANDBOX_OUTPUT_SIZE = 49 * 1024 * 1024; // Telegram document limit 50MB
 
 /**
+ * Корень постоянных рабочих папок ботов — по папке на чат.
+ *
+ * Не os.tmpdir(): systemd-tmpfiles чистит /tmp по своему возрасту, и файл
+ * пользователя исчезал бы по чужому сроку, а не по нашему. Это ровно тот класс
+ * сюрприза, который здесь и лечится.
+ *
+ * Функция, а не константа: путь читается из окружения на каждом вызове, иначе
+ * его не подменить в тестах.
+ */
+function workspaceRoot(): string {
+  return process.env.TG_WORKSPACE_ROOT || path.join(os.homedir(), '.linkeon', 'tg-workspace');
+}
+
+/** Сколько дней простоя переживает рабочая папка чата. */
+const WORKSPACE_TTL_DAYS = Number(process.env.TG_WORKSPACE_TTL_DAYS || 7);
+
+/** Потолок на папку одного чата. Сверх него сносим самые старые файлы. */
+const WORKSPACE_MAX_BYTES = Number(process.env.TG_WORKSPACE_MAX_MB || 200) * 1024 * 1024;
+
+/**
  * Адрес мини-аппа для кнопки привязки. Совпадает с Menu Button бота в
  * BotFather; вынесено в env на случай смены домена.
  */
@@ -75,6 +95,14 @@ export class TgBotService implements OnModuleInit {
     await this.applyMigration('002_tg_bot_custom_agent_fk.sql');
     await this.applyMigration('003_tg_bot_video_delivery.sql');
     await this.applyMigration('004_tg_bot_answer_watch.sql');
+
+    // Рабочие папки чатов больше не удаляются после хода — за диском следит
+    // джанитор. unref(), чтобы таймер не держал процесс при завершении.
+    await this.pruneWorkspaces().catch((e) => this.logger.warn(`workspace prune failed: ${e.message}`));
+    setInterval(
+      () => this.pruneWorkspaces().catch((e) => this.logger.warn(`workspace prune failed: ${e.message}`)),
+      6 * 60 * 60 * 1000,
+    ).unref();
   }
 
   private async applyMigration(filename: string) {
@@ -473,11 +501,15 @@ export class TgBotService implements OnModuleInit {
       }
     }
 
+    // Рабочая папка чата — общая для всех ходов. Сюда кладём вложения, отсюда
+    // же Claude берёт свои прошлые результаты, когда просят «поправь».
+    const workspace = this.chatWorkspace(cfg.id);
+
     // Скачиваем приложенные фото/документы. Если пусто — просто пустой массив.
     const attachments: string[] = [];
-    if (!isVoice) {
+    if (!isVoice && workspace) {
       try {
-        const dl = await this.downloadIncomingAttachments(msg);
+        const dl = await this.downloadIncomingAttachments(msg, workspace);
         attachments.push(...dl);
       } catch (e: any) {
         this.logger.warn(`attachment download failed in chat ${msg.chat.id}: ${e.message}`);
@@ -588,9 +620,9 @@ export class TgBotService implements OnModuleInit {
     let statusLastEditAt = 0;
     let statusPendingLabel: string | null = null;
     let statusPendingTimer: NodeJS.Timeout | null = null;
-    // Песочница — выдаём Claude изолированную пустую папку под Bash/Write.
-    // Если что-то там создаст с whitelist-расширением — авто-приложим к ответу.
-    let sandboxDir: string | null = null;
+    // Момент старта хода: по нему отличаем свежие артефакты Claude от того, что
+    // уже лежало в папке чата с прошлых раз.
+    let turnStartedAt = Date.now();
 
     try {
       await this.router.persistUserMessage(cfg, ctx);
@@ -612,15 +644,9 @@ export class TgBotService implements OnModuleInit {
         this.logger.warn(`markAnswerExpected failed in chat ${msg.chat.id}: ${e.message}`);
       }
 
-      // Создаём per-request песочницу. Если mkdir упадёт — Claude поработает
-      // без Bash/Write (старый режим, только текст + медиа-маркеры).
-      try {
-        const candidate = path.join(os.tmpdir(), `tg-bot-${cfg.id}-${msg.message_id}-${Date.now()}`);
-        fs.mkdirSync(candidate, { recursive: true, mode: 0o700 });
-        sandboxDir = candidate;
-      } catch (e: any) {
-        this.logger.warn(`sandbox mkdir failed for chat ${msg.chat.id}: ${e.message}`);
-      }
+      // Отсечка «что сделано в этом ходе». Ставится ПОСЛЕ загрузки вложений,
+      // чтобы присланный файл заведомо остался по старую сторону границы.
+      turnStartedAt = Date.now();
 
       this.grammy.sendChatAction(msg.chat.id, 'typing').catch(() => {});
       typingTimer = setInterval(() => {
@@ -694,7 +720,7 @@ export class TgBotService implements OnModuleInit {
       try {
         reply = await this.router.generateReply(cfg, ownerFirstName, attachments, (ev) => {
           if (ev.kind === 'tool_use') editStatus(labelFor(ev.name)).catch(() => {});
-        }, sandboxDir ?? undefined);
+        }, workspace ?? undefined);
       } catch (e: any) {
         // Не вылетаем тихо — пишем юзеру в статус и оставляем след в БД.
         await this.recordTurnFailure(cfg, msg.chat.id, statusMsgId, e);
@@ -715,9 +741,11 @@ export class TgBotService implements OnModuleInit {
       // в основном тексте их быть не должно.
       const { cleanText, markers } = this.extractOutgoingMarkers(reply.text);
 
-      // Сканим песочницу — что Claude насоздавал из артефактов. Скрипты (.py/.sh)
-      // в whitelist не входят, посылаем только итоговые файлы.
-      const sandboxOutputs = sandboxDir ? this.scanSandboxOutputs(sandboxDir) : [];
+      // Сканим рабочую папку — что Claude насоздавал В ЭТОМ ходе. Скрипты
+      // (.py/.sh) в whitelist не входят, посылаем только итоговые файлы.
+      const sandboxOutputs = workspace
+        ? this.scanSandboxOutputs(workspace, turnStartedAt, new Set(attachments))
+        : [];
 
       // Voice reply policy. Голос — только для текстовой части ответа, не для файлов.
       const wantsVoice =
@@ -808,16 +836,10 @@ export class TgBotService implements OnModuleInit {
         // (например ранний throw до try-блока с generateReply). Прибираем за собой.
         try { await this.grammy.deleteMessage(msg.chat.id, statusMsgId); } catch { /* ignore */ }
       }
-      // Песочницу сносим целиком — независимо от того успешно отдали артефакты
-      // или Claude упал на полпути. Если оставить — диск засрётся.
-      if (sandboxDir) {
-        try { fs.rmSync(sandboxDir, { recursive: true, force: true }); } catch { /* ignore */ }
-      }
+      // Рабочую папку НЕ трогаем: она общая для всех ходов чата, и снос здесь —
+      // ровно та ошибка, из-за которой «поправь договор» приходило к модели без
+      // договора. За диском следит pruneWorkspaces (TTL + потолок размера).
       await lock.release();
-      // Чистим временные файлы независимо от исхода.
-      for (const p of attachments) {
-        try { fs.unlinkSync(p); } catch { /* ignore */ }
-      }
     }
   }
 
@@ -908,20 +930,61 @@ export class TgBotService implements OnModuleInit {
     }
   }
 
-  /** Скачиваем фото/документ с Telegram → /tmp. Возвращает локальные пути. */
-  private async downloadIncomingAttachments(msg: any): Promise<string[]> {
+  /**
+   * Рабочая папка чата. Одна и та же между ходами — в ней лежат и присланные
+   * пользователем файлы, и собранные ассистентом документы.
+   *
+   * Раньше на каждый ход создавалась пустая песочница, а вложение качалось в
+   * os.tmpdir() и удалялось в finally. Из-за этого «поправь договор» уходило в
+   * модель без договора, и она пересобирала его по своему же тексту из истории.
+   */
+  private chatWorkspace(configId: string): string | null {
+    // Второй кандидат — деградация, а не выбор: если основной корень недоступен
+    // (нет прав, диск), лучше папка в /tmp, чем ход вообще без вложения.
+    for (const root of [workspaceRoot(), path.join(os.tmpdir(), 'linkeon-tg-workspace')]) {
+      const dir = path.join(root, configId);
+      try {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+        return dir;
+      } catch (e: any) {
+        this.logger.warn(`workspace mkdir failed (${dir}): ${e.message}`);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Имя файла внутри рабочей папки. Держим то, которое видит пользователь: он
+   * пишет «пересчитай в dds.xlsx», и модель должна найти файл по этому имени.
+   * Разделители пути и управляющие символы срезаем — имя приходит из Telegram,
+   * то есть снаружи.
+   */
+  private workspaceFileName(originalName: string | null, ext: string, fileId: string): string {
+    const raw = (originalName ?? '').split(/[\\/]/).pop() ?? '';
+    const cleaned = raw.replace(/[\x00-\x1f]/g, '').replace(/\s+/g, '_').trim();
+    if (cleaned && cleaned !== '.' && cleaned !== '..') {
+      if (cleaned.length <= 120) return cleaned;
+      const e = path.extname(cleaned).slice(0, 10);
+      return cleaned.slice(0, 120 - e.length) + e;
+    }
+    const safeExt = ext.replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'bin';
+    return `tg-${fileId.slice(0, 16)}.${safeExt}`;
+  }
+
+  /** Скачиваем фото/документ с Telegram в рабочую папку чата. */
+  private async downloadIncomingAttachments(msg: any, destDir: string): Promise<string[]> {
     const paths: string[] = [];
     // photo — массив размеров; берём самый большой (последний)
     if (Array.isArray(msg.photo) && msg.photo.length > 0) {
       const largest = msg.photo[msg.photo.length - 1];
-      const p = await this.downloadOneFile(largest.file_id, largest.file_size, 'jpg');
+      const p = await this.downloadOneFile(largest.file_id, largest.file_size, 'jpg', destDir, null);
       if (p) paths.push(p);
     }
     if (msg.document) {
       const d = msg.document;
       // расширение из mime или из имени файла
       const ext = this.guessExtension(d.mime_type, d.file_name);
-      const p = await this.downloadOneFile(d.file_id, d.file_size, ext);
+      const p = await this.downloadOneFile(d.file_id, d.file_size, ext, destDir, d.file_name ?? null);
       if (p) paths.push(p);
     }
     return paths;
@@ -931,6 +994,8 @@ export class TgBotService implements OnModuleInit {
     fileId: string,
     fileSize: number | undefined,
     ext: string,
+    destDir: string,
+    originalName: string | null,
   ): Promise<string | null> {
     if (fileSize && fileSize > MAX_ATTACHMENT_BYTES) {
       this.logger.warn(`skip oversized attachment: ${fileId} (${fileSize} bytes)`);
@@ -939,10 +1004,77 @@ export class TgBotService implements OnModuleInit {
     const file = await this.grammy.getFile(fileId);
     if (!file.file_path) return null;
     const buf = await this.grammy.downloadFile(file.file_path);
-    const safeExt = ext.replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'bin';
-    const p = path.join(os.tmpdir(), `tg-attach-${fileId.slice(0, 16)}-${Date.now()}.${safeExt}`);
+    // Одноимённый файл перезаписываем: прислать файл с тем же именем — это
+    // «вот новая версия», а не «заведи второй».
+    const p = path.join(destDir, this.workspaceFileName(originalName, ext, fileId));
     fs.writeFileSync(p, buf);
+    this.logger.log(`attachment saved: ${p} (${buf.length} bytes)`);
     return p;
+  }
+
+  /**
+   * Чистка рабочих папок: сносим те, где ничего не трогали дольше TTL, и
+   * ужимаем распухшие до потолка.
+   *
+   * Возраст считаем по самому свежему файлу ВНУТРИ, а не по mtime самой папки:
+   * mtime каталога меняется только при добавлении/удалении записи, поэтому
+   * активный чат, где файлы правятся на месте, снесло бы из-под живого диалога.
+   */
+  private async pruneWorkspaces(): Promise<void> {
+    const root = workspaceRoot();
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return; }
+
+    const ttlMs = WORKSPACE_TTL_DAYS * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const dir = path.join(root, e.name);
+      const files = this.walkWorkspace(dir);
+
+      const newest = files.length
+        ? Math.max(...files.map(f => f.mtimeMs))
+        : (() => { try { return fs.statSync(dir).mtimeMs; } catch { return 0; } })();
+
+      if (now - newest > ttlMs) {
+        try {
+          fs.rmSync(dir, { recursive: true, force: true });
+          this.logger.log(`workspace ${e.name} removed (idle > ${WORKSPACE_TTL_DAYS}d)`);
+        } catch (err: any) {
+          this.logger.warn(`workspace ${e.name} rm failed: ${err.message}`);
+        }
+        continue;
+      }
+
+      // Потолок по размеру: выносим самые старые, пока не влезем.
+      let total = files.reduce((s, f) => s + f.size, 0);
+      if (total <= WORKSPACE_MAX_BYTES) continue;
+      for (const f of [...files].sort((a, b) => a.mtimeMs - b.mtimeMs)) {
+        if (total <= WORKSPACE_MAX_BYTES) break;
+        try { fs.rmSync(f.path, { force: true }); total -= f.size; } catch { /* ignore */ }
+      }
+      this.logger.log(`workspace ${e.name} trimmed to ${Math.round(total / 1024 / 1024)}MB`);
+    }
+  }
+
+  private walkWorkspace(dir: string): { path: string; size: number; mtimeMs: number }[] {
+    const out: { path: string; size: number; mtimeMs: number }[] = [];
+    const walk = (d: string) => {
+      let entries: fs.Dirent[];
+      try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        const full = path.join(d, e.name);
+        if (e.isDirectory()) { walk(full); continue; }
+        if (!e.isFile()) continue;
+        try {
+          const st = fs.statSync(full);
+          out.push({ path: full, size: st.size, mtimeMs: st.mtimeMs });
+        } catch { /* ignore */ }
+      }
+    };
+    walk(dir);
+    return out;
   }
 
   private guessExtension(mime: string | undefined, name: string | undefined): string {
@@ -1123,11 +1255,17 @@ export class TgBotService implements OnModuleInit {
   }
 
   /**
-   * Scan Claude's sandbox cwd for output artifacts. Recursive walk, ограничиваем
-   * по whitelist расширений (см. SANDBOX_OUTPUT_EXTS) и размеру файла. Скрипты
+   * Артефакты, сделанные Claude В ЭТОМ ходе. Recursive walk, ограничиваем по
+   * whitelist расширений (см. SANDBOX_OUTPUT_EXTS) и размеру файла. Скрипты
    * (.py/.sh/etc.) сюда не попадают — это рабочие файлы Claude, не результат.
+   *
+   * Папка теперь живёт между ходами, поэтому одной whitelist мало: без отсечки
+   * по времени бот на каждый ход заново слал бы весь накопленный архив чата.
+   * Отсекаем по двум признакам сразу — mtime старше начала хода и явный список
+   * входящих. Только mtime ненадёжен: вложение пишется в ту же папку за
+   * миллисекунды до старта, и по времени его от результата не отличить.
    */
-  private scanSandboxOutputs(dir: string): string[] {
+  private scanSandboxOutputs(dir: string, sinceMs: number, exclude: Set<string>): string[] {
     const results: string[] = [];
     const walk = (d: string) => {
       let entries: fs.Dirent[];
@@ -1141,11 +1279,13 @@ export class TgBotService implements OnModuleInit {
           continue;
         }
         if (!e.isFile()) continue;
+        if (exclude.has(full)) continue;
         const ext = (e.name.split('.').pop() ?? '').toLowerCase();
         if (!SANDBOX_OUTPUT_EXTS.has(ext)) continue;
-        let size: number;
-        try { size = fs.statSync(full).size; } catch { continue; }
-        if (size === 0 || size > MAX_SANDBOX_OUTPUT_SIZE) continue;
+        let st: fs.Stats;
+        try { st = fs.statSync(full); } catch { continue; }
+        if (st.mtimeMs < sinceMs) continue;
+        if (st.size === 0 || st.size > MAX_SANDBOX_OUTPUT_SIZE) continue;
         results.push(full);
       }
     };
