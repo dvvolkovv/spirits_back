@@ -106,4 +106,55 @@ describe('parseMeetingLink', () => {
       });
     });
   });
+
+  describe('встречи Google Meet', () => {
+    it('находит код встречи', () => {
+      expect(parseMeetingLink('созвон https://meet.google.com/abc-defg-hij в пять')).toEqual({
+        provider: 'meet', code: 'abc-defg-hij',
+      });
+    });
+
+    it('приводит код к нижнему регистру', () => {
+      // Код у Meet всегда строчный; вставленный из письма ВЕРСАЛОМ должен
+      // сойтись с тем, что мы положим в external_room и в meeting_url.
+      expect(parseMeetingLink('https://meet.google.com/ABC-DEFG-HIJ')).toEqual({
+        provider: 'meet', code: 'abc-defg-hij',
+      });
+    });
+
+    it('игнорирует query и хвост', () => {
+      expect(parseMeetingLink('https://meet.google.com/abc-defg-hij?authuser=0')).toEqual({
+        provider: 'meet', code: 'abc-defg-hij',
+      });
+    });
+
+    it('находит внутри markdown', () => {
+      expect(parseMeetingLink('[созвон](https://meet.google.com/abc-defg-hij)')).toEqual({
+        provider: 'meet', code: 'abc-defg-hij',
+      });
+    });
+
+    it('отвергает домен, лишь оканчивающийся на meet.google.com', () => {
+      // Поддомен здесь НЕ необязателен, в отличие от linkeon.io и talerid.io:
+      // у Meet его не бывает, а группа (?:[a-z0-9-]+\.)? пропустила бы это.
+      expect(parseMeetingLink('https://notmeet.google.com/abc-defg-hij')).toBeNull();
+      expect(parseMeetingLink('https://meet.google.com.evil.ru/abc-defg-hij')).toBeNull();
+    });
+
+    it('отвергает код неверной формы', () => {
+      expect(parseMeetingLink('https://meet.google.com/abcd-efgh-ijkl')).toBeNull();
+      expect(parseMeetingLink('https://meet.google.com/abc-def-hij')).toBeNull();
+      expect(parseMeetingLink('https://meet.google.com/abc123-defg-hij')).toBeNull();
+    });
+
+    it('не путает с другими путями Meet', () => {
+      expect(parseMeetingLink('https://meet.google.com/lookup/abc-defg-hij')).toBeNull();
+    });
+
+    it('ссылки трёх провайдеров не путаются', () => {
+      expect(parseMeetingLink('https://my.linkeon.io/room/ABC234')?.provider).toBe('linkeon');
+      expect(parseMeetingLink('https://api.talerid.io/room/36fc367a')?.provider).toBe('talerid');
+      expect(parseMeetingLink('https://meet.google.com/abc-defg-hij')?.provider).toBe('meet');
+    });
+  });
 });
