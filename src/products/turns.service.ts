@@ -28,6 +28,12 @@ export interface TurnRow {
 export type TurnStatus = 'queued' | 'running' | 'done' | 'failed' | 'reverted';
 
 export interface CompleteInput {
+  /**
+   * Продукт, от имени которого пришёл раннер — всегда `req.product.id` из
+   * `RunnerGuard`, никогда значение из запроса. Без этого ограничения раннер
+   * продукта A завершил бы ход продукта B, передав его `turnId` в URL.
+   */
+  productId: string;
   userId: string;
   status: Extract<TurnStatus, 'done' | 'failed' | 'reverted'>;
   result?: string;
@@ -167,14 +173,19 @@ export class TurnsService {
   async complete(turnId: string, input: CompleteInput) {
     const claimed = await this.pg.query(
       `UPDATE product_turns
-          SET status = $2, result = $3, error = $4,
-              sha_before = COALESCE($5, sha_before),
-              sha_after = $6,
-              tokens_spent = $7,
+          SET status = $3, result = $4, error = $5,
+              sha_before = COALESCE($6, sha_before),
+              sha_after = $7,
+              tokens_spent = $8,
               finished_at = now()
-        WHERE id = $1 AND status = 'running'`,
+        WHERE id = $1 AND product_id = $2 AND status = 'running'`,
       [
         turnId,
+        // RunnerGuard подтверждает, каким продуктом является раннер, но не то,
+        // что переданный в URL turnId принадлежит этому продукту. Без этого
+        // условия раннер продукта A завершил бы ход продукта B и списал бы за
+        // него с владельца A (userId здесь — это input.userId продукта A).
+        input.productId,
         input.status,
         input.result ?? null,
         input.error ?? null,
@@ -225,6 +236,20 @@ export class TurnsService {
         await this.pg.query(`UPDATE product_turns SET tokens_spent = $2 WHERE id = $1`, [turnId, used]);
       }
     }
+  }
+
+  /**
+   * Ход принадлежит продукту — или 404. Нужен там, где ограничить запросом
+   * нельзя: события уезжают в Redis по ключу хода, а продукта в этом ключе
+   * нет. `RunnerGuard` подтверждает, каким продуктом является раннер, но не
+   * то, что переданный `turnId` относится к этому продукту.
+   */
+  async assertTurnBelongsTo(turnId: string, productId: string): Promise<void> {
+    const r = await this.pg.query(
+      `SELECT 1 FROM product_turns WHERE id = $1 AND product_id = $2`,
+      [turnId, productId],
+    );
+    if (!r.rows[0]) throw new NotFoundException('Turn not found');
   }
 
   /**

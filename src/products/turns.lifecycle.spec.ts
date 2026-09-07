@@ -12,7 +12,7 @@ function makeService(opts: { claim?: any[]; used?: number; alreadyFinal?: boolea
         const rows = opts.claim ?? [{ id: 't-1', prompt: 'go', channel: 'web', user_id: 'u-1' }];
         return { rows, rowCount: rows.length };
       }
-      // Диспетчеризация по `SET status = $2` — намеренно НЕ по литералу
+      // Диспетчеризация по `SET status = $3` — намеренно НЕ по литералу
       // `AND status = 'running'`, хотя тот выглядит естественнее. Иначе мок
       // маршрутизировал бы по той же строке, которую охраняет утверждение, и
       // мутация «снять сторож состояния» одновременно снимала бы триггер
@@ -22,7 +22,7 @@ function makeService(opts: { claim?: any[]; used?: number; alreadyFinal?: boolea
       //
       // rowCount = 0 моделирует «ход уже финализирован»: сторож не нашёл
       // строки, и повтор обязан стать no-op.
-      if (sql.includes('SET status = $2')) {
+      if (sql.includes('SET status = $3')) {
         return { rows: [], rowCount: opts.alreadyFinal ? 0 : 1 };
       }
       return { rows: [], rowCount: 0 };
@@ -79,6 +79,7 @@ describe('TurnsService.complete', () => {
     const { svc, calls, deductTokens } = makeService();
 
     await svc.complete('t-1', {
+      productId: 'p-1',
       userId: 'u-1',
       status: 'done',
       result: 'готово',
@@ -98,12 +99,25 @@ describe('TurnsService.complete', () => {
     // COALESCE хранит уже записанный sha_before, когда раннер его не прислал.
     // Без него откат теряет точку возврата, а кнопка «вернуть как было»
     // перестаёт работать на ходах, доложенных без shaBefore.
-    expect(calls[0].sql).toContain('COALESCE($5, sha_before)');
-    expect(calls[0].sql).toContain('tokens_spent = $7');
-    expect(calls[0].sql).toContain('result = $3, error = $4');
+    expect(calls[0].sql).toContain('COALESCE($6, sha_before)');
+    expect(calls[0].sql).toContain('tokens_spent = $8');
+    expect(calls[0].sql).toContain('result = $4, error = $5');
     expect(calls[0].sql).toContain('finished_at = now()');
     // Сторож состояния — то, что делает повтор безвредным.
     expect(calls[0].sql).toContain("AND status = 'running'");
+  });
+
+  it('ход чужого продукта не завершается', async () => {
+    // RunnerGuard подтверждает, каким продуктом является раннер, но не то, что
+    // переданный в URL turnId принадлежит этому продукту. Без product_id в
+    // WHERE раннер продукта A завершил бы ход продукта B и списал бы за него
+    // с владельца A.
+    const { svc, calls } = makeService();
+
+    await svc.complete('t-1', { productId: 'p-1', userId: 'u-1', status: 'done', tokens: 100 });
+
+    expect(calls[0].sql).toContain('product_id = $2');
+    expect(calls[0].params[1]).toBe('p-1');
   });
 
   it('повторный complete не списывает второй раз', async () => {
@@ -112,7 +126,7 @@ describe('TurnsService.complete', () => {
     // сторожа состояния пользователь платит дважды за один ход.
     const { svc, deductTokens } = makeService({ alreadyFinal: true });
 
-    await svc.complete('t-1', { userId: 'u-1', status: 'done', tokens: 1200 });
+    await svc.complete('t-1', { productId: 'p-1', userId: 'u-1', status: 'done', tokens: 1200 });
 
     expect(deductTokens).not.toHaveBeenCalled();
   });
@@ -123,7 +137,7 @@ describe('TurnsService.complete', () => {
     // покажет пользователю расход, которого с него не взяли.
     const { svc, calls } = makeService({ used: 300 });
 
-    await svc.complete('t-1', { userId: 'u-1', status: 'done', tokens: 1200 });
+    await svc.complete('t-1', { productId: 'p-1', userId: 'u-1', status: 'done', tokens: 1200 });
 
     const fix = calls.find((c) => c.sql.includes('SET tokens_spent = $2'));
     expect(fix).toBeDefined();
@@ -133,20 +147,20 @@ describe('TurnsService.complete', () => {
   it('отрицательные токены от раннера не уходят в базу', async () => {
     const { svc, calls, deductTokens } = makeService();
 
-    await svc.complete('t-1', { userId: 'u-1', status: 'done', tokens: -5 });
+    await svc.complete('t-1', { productId: 'p-1', userId: 'u-1', status: 'done', tokens: -5 });
 
     // Кламп существует потому, что тело запроса раннера — TS-тип при
     // ValidationPipe({whitelist:false}), то есть рантайм-проверки нет вовсе.
     // Без клампа сюда прилетает 23514 от CHECK (tokens_spent >= 0), уходит
     // наружу необработанным 500, ход остаётся running и держит замок.
-    expect(calls[0].params[6]).toBe(0);
+    expect(calls[0].params[7]).toBe(0);
     expect(deductTokens).not.toHaveBeenCalled();
   });
 
   it('упавший ход не тарифицируется', async () => {
     const { svc, deductTokens } = makeService();
 
-    await svc.complete('t-1', { userId: 'u-1', status: 'failed', error: 'claude exited 1', tokens: 900 });
+    await svc.complete('t-1', { productId: 'p-1', userId: 'u-1', status: 'failed', error: 'claude exited 1', tokens: 900 });
 
     expect(deductTokens).not.toHaveBeenCalled();
   });
@@ -154,7 +168,7 @@ describe('TurnsService.complete', () => {
   it('откат по health-check не тарифицируется', async () => {
     const { svc, deductTokens } = makeService();
 
-    await svc.complete('t-1', { userId: 'u-1', status: 'reverted', shaBefore: 'aaa', tokens: 900 });
+    await svc.complete('t-1', { productId: 'p-1', userId: 'u-1', status: 'reverted', shaBefore: 'aaa', tokens: 900 });
 
     expect(deductTokens).not.toHaveBeenCalled();
   });
