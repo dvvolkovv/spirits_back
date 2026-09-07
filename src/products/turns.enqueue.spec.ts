@@ -26,11 +26,18 @@ function makeService(opts: { duplicate?: boolean } = {}) {
 
 describe('TurnsService.enqueue', () => {
   it('создаёт ход в статусе queued', async () => {
-    const { svc } = makeService();
+    const { svc, calls } = makeService();
 
     await expect(
       svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'поправь футер' }),
     ).resolves.toMatchObject({ id: 't-1', status: 'queued' });
+
+    // Утверждение о тексте обязательно: мок отдаёт захардкоженный статус и на
+    // подмену 'queued' на 'running' в INSERT не отреагирует. А подмена тихо
+    // ломает всё: claimNext ищет строго 'queued' и такой ход не подберёт
+    // никогда, продукт при этом останется занятым для замка — до сборщика
+    // зависших через полчаса. Ни ошибки, ни строки в логе.
+    expect(calls[0].sql).toContain("'queued'");
   });
 
   it('второй ход по тому же продукту отбивается 409, а не 500', async () => {
