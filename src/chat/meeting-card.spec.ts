@@ -35,4 +35,15 @@ describe('buildMeetingCard', () => {
     const card = buildMeetingCard('ABC234', 'а'.repeat(500));
     expect(card.length).toBeLessThan(300);
   });
+
+  it('карточка встречи Meet несёт провайдера и код', () => {
+    expect(buildMeetingCard('abc-defg-hij', 'Планёрка', 'meet'))
+      .toBe('{{meeting_join: provider=meet code=abc-defg-hij title=Планёрка}}');
+  });
+
+  it('своя карточка осталась байт в байт прежней', () => {
+    // В истории их накопилось, и менять формат задним числом значит сломать
+    // разбор старых сообщений на фронте.
+    expect(buildMeetingCard('ABC234', 'Планёрка')).toBe('{{meeting_join: code=ABC234 title=Планёрка}}');
+  });
 });
