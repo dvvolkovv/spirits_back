@@ -116,4 +116,38 @@ describe('Mixer', () => {
     // у bob данные кончились, у alice остался второй тик
     assert.equal(m.tick()[0], 100);
   });
+
+  test('частота задаётся конструктором', () => {
+    // 20 мс при 24 кГц — 480 сэмплов. Нужно для встреч Meet, где звук идёт
+    // через Attendee на родной частоте Realtime.
+    const m = new Mixer(480);
+    assert.equal(m.tick().length, 480);
+  });
+
+  test('по умолчанию остаётся 48 кГц', () => {
+    // Свои комнаты и Taler ID не должны заметить этой правки.
+    assert.equal(new Mixer().tick().length, 960);
+  });
+
+  test('потолок буфера считается в тиках новой частоты', () => {
+    const m = new Mixer(480);
+    for (let i = 0; i < 100; i++) m.push('u1', new Int16Array(480));
+    assert.ok(m.bufferedTicks('u1') <= Mixer.MAX_BUFFERED_TICKS);
+  });
+
+  test('на новой частоте кадры собираются встык, без потери сэмплов', () => {
+    // Куски от Attendee не кратны тику, и склейка через границу — то место,
+    // где легко потерять хвост или сдвинуть поток по времени.
+    const m = new Mixer(480);
+    const chunk = new Int16Array(700).fill(1000);
+    m.push('u1', chunk);
+    const first = m.tick();
+    assert.equal(first.length, 480);
+    assert.ok(first.every((v) => v === 1000), 'первый тик целиком из данных');
+    const second = m.tick();
+    assert.equal(second.length, 480);
+    // 700 - 480 = 220 сэмплов данных, дальше тишина.
+    assert.ok(second.slice(0, 220).every((v) => v === 1000), 'хвост не потерян');
+    assert.ok(second.slice(220).every((v) => v === 0), 'добивка тишиной');
+  });
 });
