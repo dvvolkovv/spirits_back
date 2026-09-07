@@ -25,8 +25,23 @@ const ROOM_LINK_REGEX = /https?:\/\/(?:[a-z0-9-]+\.)?linkeon\.io\/room\/([A-Za-z
  */
 const TALERID_LINK_REGEX = /https?:\/\/(?:[a-z0-9-]+\.)?talerid\.io\/room\/([A-Fa-f0-9]{6,64})/i;
 
+/**
+ * Ссылка на встречу Google Meet.
+ *
+ * Хост точный, БЕЗ необязательного поддомена — в отличие от linkeon.io и
+ * talerid.io. У Meet поддоменов не бывает, а группа `(?:[a-z0-9-]+\.)?`
+ * пропустила бы `notmeet.google.com`. Хвост домена закрыт границей `\/`
+ * сразу после `com`, иначе прошёл бы `meet.google.com.evil.ru`.
+ *
+ * Код — три-четыре-три СТРОЧНЫЕ буквы (`abc-defg-hij`). Цифр в нём не бывает,
+ * поэтому алфавит узкий: так `/lookup/` и прочие пути Meet сюда не попадают.
+ * Начало кода прижато к `\/`, конец — отрицательным просмотром, иначе из
+ * `abcd-efgh-ijkl` регулярка выкусила бы середину.
+ */
+const MEET_LINK_REGEX = /https?:\/\/meet\.google\.com\/([a-z]{3}-[a-z]{4}-[a-z]{3})(?![a-z0-9-])/i;
+
 /** Откуда встреча. Свои комнаты и чужие ведут себя одинаково, но входы разные. */
-export type MeetingProvider = 'linkeon' | 'talerid';
+export type MeetingProvider = 'linkeon' | 'talerid' | 'meet';
 
 export interface ParsedMeetingLink {
   provider: MeetingProvider;
@@ -59,6 +74,14 @@ export function parseMeetingLink(text: string): ParsedMeetingLink | null {
     // ручка сверяет строку точно. Приведение к верхнему регистру, уместное
     // для нашего алфавита, здесь увело бы в 404.
     return { provider: 'talerid', code: foreign[1] };
+  }
+
+  const meet = MEET_LINK_REGEX.exec(text);
+  if (meet) {
+    // К нижнему регистру: код у Meet строчный, а из письма его вставляют
+    // как попало. Он же уедет в external_room и в meeting_url для Attendee,
+    // и расхождение регистра развело бы одну встречу на две записи.
+    return { provider: 'meet', code: meet[1].toLowerCase() };
   }
 
   return null;
