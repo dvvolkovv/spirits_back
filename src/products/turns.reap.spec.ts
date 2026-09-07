@@ -43,3 +43,43 @@ describe('TurnsService.reapStuck', () => {
     expect(deductTokens).not.toHaveBeenCalled();
   });
 });
+
+describe('TurnsService — жизненный цикл сборщика', () => {
+  // Хуки onModuleInit/onModuleDestroy не покрывает ни один другой тест модуля:
+  // все спеки создают сервис через `new` и жизненный цикл Nest не поднимают.
+  // А сборщик — единственный механизм самовосстановления: без него умерший
+  // раннер оставляет ход в running навсегда, и замок держит продукт.
+  afterEach(() => jest.useRealTimers());
+
+  it('таймер стартует и вызывает сборщик по интервалу', async () => {
+    jest.useFakeTimers();
+    const { svc, calls } = makeService([]);
+
+    svc.onModuleInit();
+    await jest.advanceTimersByTimeAsync(5 * 60 * 1000);
+
+    expect(calls.some((c) => c.sql.includes("SET status = 'failed'"))).toBe(true);
+  });
+
+  it('таймер не держит процесс', () => {
+    jest.useFakeTimers();
+    const { svc } = makeService([]);
+
+    svc.onModuleInit();
+
+    // Без unref таймер удерживает event loop: прогон jest не завершается, а
+    // остановка приложения подвисает на пять минут.
+    expect((svc as any).reaper.hasRef()).toBe(false);
+  });
+
+  it('остановка модуля гасит таймер', async () => {
+    jest.useFakeTimers();
+    const { svc, calls } = makeService([]);
+
+    svc.onModuleInit();
+    svc.onModuleDestroy();
+    await jest.advanceTimersByTimeAsync(15 * 60 * 1000);
+
+    expect(calls).toHaveLength(0);
+  });
+});
