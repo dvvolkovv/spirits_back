@@ -30,6 +30,12 @@ describe('TurnsService.revert', () => {
     // прямое `expect(insert.params).toContain('aaa111')` красное всегда,
     // независимо от корректности реализации — проверяем подстроку явно.
     expect(insert.params.some((p) => typeof p === 'string' && p.includes('aaa111'))).toBe(true);
+    // Что именно revert передаёт в enqueue, охраняется отдельно. Без этого
+    // опечатка `productId: input.turnId` вставит turnId в колонку product_id:
+    // ход повиснет на несуществующем продукте, а мьютекс займёт не тот. И без
+    // проверки channel подмена на значение вне CHECK (channel IN
+    // ('web','telegram')) даст 500 на живой базе, но зелёный юнит-прогон.
+    expect(insert.params.slice(0, 3)).toEqual(['p-1', 'u-1', 'web']);
     // Ход ищется в пределах своего продукта. Без product_id в WHERE клиент
     // откатит чужой продукт на его же sha, передав чужой turnId — владение
     // проверено на уровне продукта, а сам ход взят по голому id.
