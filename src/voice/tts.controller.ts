@@ -4,10 +4,9 @@ import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { MiscService } from '../misc/misc.service';
 import { TtsFormat, TtsService } from './tts.service';
+import { CASH_TOKENS_PER_USD } from '../common/billing-rates';
 
 const MAX_TEXT_LENGTH = 1000;
-// $1 = 100k Linkeon-tokens — тот же курс, что в chat.service.ts (Маша/claude CLI billing).
-const USD_TO_LINKEON_TOKENS = 100_000;
 
 @Controller('')
 export class TtsController {
@@ -41,7 +40,12 @@ export class TtsController {
     // станет высокочастотным в голосовом цикле — добавить pre-check с резервом,
     // как у /webhook/imagegen (misc.service.ts generateImage: check → generate → deduct).
     const { audio, cost } = await this.ttsService.synthesize(text, format);
-    const tokensSpent = Math.ceil(cost * USD_TO_LINKEON_TOKENS);
+    // Синтез оплачивается OpenAI живыми деньгами, поэтому курс возмещения, а не
+    // курс подписки Claude. Здесь стояло 100 000 с комментарием «тот же курс,
+    // что у Маши» — но у Маши курс нормирует ёмкость подписки, а тут возвращают
+    // потраченный доллар. Наценка получалась ~2.5× вместо заданной владельцем
+    // 1.5× (решение 07.09.2026).
+    const tokensSpent = Math.ceil(cost * CASH_TOKENS_PER_USD);
     try {
       await this.miscService.deductTokens(user.userId, tokensSpent);
     } catch (e: any) {

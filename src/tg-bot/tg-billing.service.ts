@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from './tg-grammy.client';
-import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
+import { CASH_TOKENS_PER_USD, SEAT_TOKENS_PER_USD } from '../common/billing-rates';
 import * as telegramAlert from '../common/telegram-alert';
 
 @Injectable()
@@ -34,6 +34,23 @@ export class TgBillingService {
    */
   tokensFromUsd(usd: number): number {
     return Math.ceil(usd * SEAT_TOKENS_PER_USD);
+  }
+
+  /**
+   * Стоимость хода в токенах, когда в нём есть и Claude, и озвучка OpenAI.
+   *
+   * Два курса, а не один на сумму долларов. Claude — подписка, там курс
+   * нормирует дефицитную ёмкость (4500). Озвучка оплачивается OpenAI живыми
+   * деньгами, и её надо возмещать по CASH_TOKENS_PER_USD.
+   *
+   * До 07.09.2026 обе величины складывались в один totalCostUsd и делились по
+   * курсу подписки: доллар, отданный OpenAI, возвращался к нам примерно
+   * девятью рублями из восьмидесяти. Суммы на озвучке небольшие (tts-1 стоит
+   * $15 за миллион знаков), поэтому в отчётах это не бросалось в глаза — но
+   * это ровно та же ошибка, что стоила нам голосовых звонков.
+   */
+  tokensForTurn(claudeUsd: number, cashUsd: number): number {
+    return Math.ceil(claudeUsd * SEAT_TOKENS_PER_USD) + Math.ceil(cashUsd * CASH_TOKENS_PER_USD);
   }
 
   /**

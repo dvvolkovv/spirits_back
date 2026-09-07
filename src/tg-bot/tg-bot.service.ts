@@ -807,7 +807,11 @@ export class TgBotService implements OnModuleInit {
       }
 
       const totalCostUsd = reply.costUsd + voiceTtsCostUsd;
-      const tokensCharged = this.billing.tokensFromUsd(totalCostUsd);
+      // Два курса, а не один на сумму: ход Claude — по курсу подписки, озвучка
+      // OpenAI — по курсу возмещения живых денег. Раньше складывались доллары
+      // и делились по курсу подписки, и доллар, отданный OpenAI, возвращался
+      // девятью рублями из восьмидесяти.
+      const tokensCharged = this.billing.tokensForTurn(reply.costUsd, voiceTtsCostUsd);
       const newBalance = await this.billing.deduct(cfg.owner_user_id, tokensCharged);
       this.logger.log(
         `tg-bot billing: config=${cfg.id} cost=$${totalCostUsd.toFixed(5)} deducted=${tokensCharged} balance=${newBalance}`,
