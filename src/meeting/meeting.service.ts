@@ -124,7 +124,7 @@ export class MeetingService {
     // отличаются свои встречи от чужих. Всё остальное ниже общее.
     let title: string;
     let roomName: string;
-    let external: { url: string; token: string } | undefined;
+    let external: { url: string; token: string; chatUrl?: string } | undefined;
 
     if (isForeign) {
       const info = await this.talerIdRooms.info(code);
@@ -163,7 +163,14 @@ export class MeetingService {
         // комнатах, чтобы участники Taler ID видели, кто к ним пришёл.
         const t = await this.talerIdRooms.join(code, `${agent.display_name} · ассистент ${ownerName}`);
         if (!t) throw new NotFoundException('room not found');
-        external = { url: t.url, token: t.token };
+        external = {
+          url: t.url,
+          token: t.token,
+          // Пустой roomName — это не «чат без имени», а сломанный URL. Лучше
+          // не давать воркеру канал вовсе, чем дать такой, который молча
+          // отвечает 404 на каждую отправку.
+          ...(t.roomName ? { chatUrl: this.talerIdRooms.chatUrl(t.roomName) } : {}),
+        };
       }
 
       // Наша комната при чужой встрече пуста, и LiveKit удалил бы её через
@@ -182,7 +189,16 @@ export class MeetingService {
         ownerName,
         // Внешняя комната: воркер повесит на неё вход и выход сессии.
         // Для своих встреч поля нет вовсе — поведение воркера не меняется.
-        ...(external ? { provider: PROVIDER_TALERID, externalUrl: external.url, externalToken: external.token } : {}),
+        ...(external
+          ? {
+              provider: PROVIDER_TALERID,
+              externalUrl: external.url,
+              externalToken: external.token,
+              // Чат комнаты. Пишет и читает воркер: чтения по REST у них нет
+              // вовсе, входящие приезжают data-пакетом в ту же комнату.
+              ...(external.chatUrl ? { externalChatUrl: external.chatUrl } : {}),
+            }
+          : {}),
         // Все специалисты, кроме самого ведущего: спрашивать себя незачем, а
         // предложение это сделать модель однажды примет всерьёз.
         specialists: Object.keys(SPECIALISTS)
