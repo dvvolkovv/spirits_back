@@ -196,7 +196,9 @@ export class MeetingService {
               externalToken: external.token,
               // Чат комнаты. Пишет и читает воркер: чтения по REST у них нет
               // вовсе, входящие приезжают data-пакетом в ту же комнату.
-              ...(external.chatUrl ? { externalChatUrl: external.chatUrl } : {}),
+              // undefined до воркера не доедет — метаданные уходят через
+              // JSON.stringify, который такие ключи выбрасывает.
+              externalChatUrl: external.chatUrl,
             }
           : {}),
         // Все специалисты, кроме самого ведущего: спрашивать себя незачем, а

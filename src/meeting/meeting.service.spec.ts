@@ -58,7 +58,9 @@ describe('MeetingService', () => {
       join: jest.fn().mockResolvedValue({
         token: 'jwt.body.sig', roomName: 'personal-x', url: 'wss://api.talerid.io/livekit/',
       }),
-      chatUrl: jest.fn((r: string) => `https://api.talerid.io/voice/rooms/${r}/chat`),
+      // Заглушка намеренно не повторяет формат URL: форма адреса закрыта
+      // тестами самого клиента, а здесь важно, ЧТО в него передали.
+      chatUrl: jest.fn(() => 'CHAT_URL'),
     };
     svc = new MeetingService(pg as any, calls as any, livekit as any, rooms as any, talerIdRooms as any);
   });
@@ -238,7 +240,10 @@ describe('MeetingService', () => {
       withAgent();
       await svc.join('u1', 7, '36fc367a', 'talerid');
       const meta = livekit.dispatchAgent.mock.calls[0][1] as any;
-      expect(meta.externalChatUrl).toBe('https://api.talerid.io/voice/rooms/personal-x/chat');
+      // Адрес собирается по roomName их комнаты, а не по коду из ссылки:
+      // с кодом ручка отвечает 403 «No access to this room».
+      expect(talerIdRooms.chatUrl).toHaveBeenCalledWith('personal-x');
+      expect(meta.externalChatUrl).toBe('CHAT_URL');
     });
 
     it('без roomName адрес чата не кладёт — писать всё равно некуда', async () => {

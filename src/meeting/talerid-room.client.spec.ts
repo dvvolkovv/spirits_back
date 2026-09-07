@@ -119,16 +119,27 @@ describe('TalerIdRoomClient', () => {
     expect(String(f.mock.calls[0][0])).not.toContain('/admin');
   });
 
+  it('ходит по пути без префикса /api', async () => {
+    // На проде работают оба варианта, а на стенде маршрута с /api нет вовсе:
+    // он отвечает «Cannot GET», и наш клиент прочитал бы это как «комнаты не
+    // существует» (проверено живьём 07.09.2026).
+    const f = mockFetch(() => ok(REAL_INFO));
+    await new TalerIdRoomClient().info('36fc367a');
+    expect(String(f.mock.calls[0][0])).toBe(
+      'https://api.talerid.io/voice/rooms/public/36fc367a',
+    );
+  });
+
   describe('chatUrl', () => {
     it('собирает путь чата из базы и roomName', () => {
-      // Путь берёт roomName, а не код комнаты, и живёт БЕЗ префикса /api —
-      // проверено живьём 07.09.2026, оба варианта отвечают 201.
+      // Путь берёт roomName, а не код комнаты: код здесь дал бы 403
+      // «No access to this room» (проверено живьём 07.09.2026).
       expect(new TalerIdRoomClient().chatUrl('personal-c79530ed-36fc367a')).toBe(
         'https://api.talerid.io/voice/rooms/personal-c79530ed-36fc367a/chat',
       );
     });
 
-    it('слушается TALERID_BASE_URL — иначе стенд писал бы в прод', () => {
+    it('берёт базу из TALERID_BASE_URL, а не из хардкода', () => {
       process.env.TALERID_BASE_URL = 'https://staging.id.taler.tirol/';
       expect(new TalerIdRoomClient().chatUrl('room-1')).toBe(
         'https://staging.id.taler.tirol/voice/rooms/room-1/chat',
