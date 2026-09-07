@@ -1,11 +1,15 @@
 import { Body, Controller, Param, Post, Req, UseGuards } from '@nestjs/common';
 import { RunnerGuard } from './runner.guard';
 import { TurnsService, CompleteInput } from './turns.service';
+import { TurnEventsService } from './turn-events.service';
 
 @Controller('')
 @UseGuards(RunnerGuard)
 export class RunnerController {
-  constructor(private readonly turns: TurnsService) {}
+  constructor(
+    private readonly turns: TurnsService,
+    private readonly turnEvents: TurnEventsService,
+  ) {}
 
   /**
    * Long-poll раннера. Возвращает задание либо turn: null. Раннер зовёт этот
@@ -62,6 +66,19 @@ export class RunnerController {
       productId: req.product.id,
       userId: req.product.user_id,
     });
+    return { ok: true };
+  }
+
+  /**
+   * Принадлежность хода отдельно не проверяется: продукт входит в ключ
+   * буфера, поэтому раннер, пославший события не в тот ход, пишет в ключ,
+   * который никто не читает. Ограничение по конструкции, а не проверка.
+   */
+  @Post('products/runner/turns/:id/events')
+  async events(@Req() req: any, @Param('id') id: string, @Body() body: { events: any[] }) {
+    for (const event of body.events ?? []) {
+      await this.turnEvents.appendEvent(req.product.id, id, event);
+    }
     return { ok: true };
   }
 }

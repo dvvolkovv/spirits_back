@@ -6,7 +6,10 @@ function makeController(claimResult: any) {
     complete: jest.fn(async () => undefined),
     touchRunner: jest.fn(async () => undefined),
   };
-  return { ctrl: new RunnerController(turns as any), turns };
+  const turnEvents = {
+    appendEvent: jest.fn(async () => undefined),
+  };
+  return { ctrl: new RunnerController(turns as any, turnEvents as any), turns, turnEvents };
 }
 
 // Фикстура повторяет то, что кладёт в запрос RunnerGuard — всю строку
@@ -109,5 +112,30 @@ describe('RunnerController.complete', () => {
     await ctrl.complete(req() as any, 't-1', { status: 'done', productId: 'p-999' } as any);
 
     expect(turns.complete).toHaveBeenCalledWith('t-1', expect.objectContaining({ productId: 'p-1' }));
+  });
+});
+
+describe('RunnerController.events', () => {
+  it('пишет события с продуктом из guard, а не из запроса', async () => {
+    // Раннер продукта A не должен уметь адресоваться к чужому продукту,
+    // подставив id в URL: ключ буфера обязан строиться по req.product.id.
+    const { ctrl, turnEvents } = makeController(null);
+
+    await ctrl.events(req() as any, 't-1', {
+      events: [{ type: 'item', content: 'правлю футер' }, { type: 'end' }],
+    } as any);
+
+    expect(turnEvents.appendEvent).toHaveBeenNthCalledWith(1, 'p-1', 't-1', {
+      type: 'item',
+      content: 'правлю футер',
+    });
+    expect(turnEvents.appendEvent).toHaveBeenNthCalledWith(2, 'p-1', 't-1', { type: 'end' });
+  });
+
+  it('пустой список событий не падает', async () => {
+    const { ctrl, turnEvents } = makeController(null);
+
+    await expect(ctrl.events(req() as any, 't-1', {} as any)).resolves.toEqual({ ok: true });
+    expect(turnEvents.appendEvent).not.toHaveBeenCalled();
   });
 });
