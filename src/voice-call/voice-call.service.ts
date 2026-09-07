@@ -1,7 +1,7 @@
 import { Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
-import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
+import { CASH_TOKENS_PER_USD } from '../common/billing-rates';
 import { ChatService } from '../chat/chat.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
@@ -282,10 +282,14 @@ export class VoiceCallService {
       payload.usage.cachedAudioInputTokens ?? 0,
     );
 
-    // Курс общий со всеми путями, которые едят платную ёмкость, — см.
-    // common/billing-rates.ts. Минута флагманской Realtime-модели стоит около
-    // двенадцати центов, то есть примерно 540 токенов.
-    const tokens = Math.max(0, Math.ceil(cost * SEAT_TOKENS_PER_USD));
+    // Курс возмещения живых денег, а НЕ курс подписки Claude.
+    //
+    // Realtime мы оплачиваем OpenAI по счёту, поэтому берём с пользователя
+    // столько, во сколько разговор обошёлся нам, с наценкой CASH_MARKUP
+    // (решение владельца 07.09.2026). Здесь стоял SEAT_TOKENS_PER_USD — курс
+    // дефицитной ёмкости подписки, — и встреча на 69 минут при счёте OpenAI
+    // в 4.13 доллара принесла 26–55 ₽ против ~330 ₽ расхода.
+    const tokens = Math.max(0, Math.ceil(cost * CASH_TOKENS_PER_USD));
 
     await this.pg.query(
       `UPDATE voice_calls SET status = 'completed', ended_at = now(), duration_sec = $1,
