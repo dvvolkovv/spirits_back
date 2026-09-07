@@ -16,6 +16,35 @@ export interface ParticipantEvent {
   name: string;
 }
 
+/**
+ * Имя участника в сравнимом виде.
+ *
+ * Своего бота мы узнаём по имени, а не по идентификатору: `participant_uuid`
+ * у Attendee выдаётся встречей и заранее нам неизвестен. Побайтовое сравнение
+ * для этого слишком хрупко — имя собирается из `ownerName`, то есть из
+ * профиля пользователя, и по пути через Meet может измениться: схлопнутся
+ * двойные пробелы, приедет неразрывный пробел вместо обычного, разъедется
+ * нормализация юникода (NFC против NFD — «й» бывает одним символом и двумя).
+ *
+ * Цена ошибки несимметрична. Не узнали себя — бот считается участником:
+ * `count` в разговоре один-на-один никогда не станет единицей, `solo` не
+ * включится, и строгий гейт по имени будет работать там, где по замыслу
+ * ассистент отвечает свободно. Плюс его собственная речь может попасть в
+ * `speaker`. Поэтому нормализуем обе стороны и сравниваем без учёта регистра.
+ *
+ * Обрезку длинного имени это не лечит — если Meet укоротит подпись, ключи всё
+ * равно разойдутся. Дословное имя бота из встречи выясняет спайк (вопрос 4);
+ * если у Attendee найдётся стабильный признак «это бот», перейдём на него.
+ */
+function nameKey(name: string): string {
+  return String(name ?? '')
+    .normalize('NFC')
+    // Любой пробельный символ, включая неразрывный, считаем обычным пробелом.
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
 export class Presence {
   /** uuid → имя. Множество, а не счётчик: вебхуки повторяются при retry. */
   private readonly people = new Map<string, string>();
@@ -29,16 +58,26 @@ export class Presence {
    */
   private speakingName?: string;
 
+  /** Имя собственного бота, приведённое к сравнимому виду. */
+  private readonly selfKey?: string;
+
   /**
    * @param selfName имя, под которым в встрече сидит наш же бот. Attendee
    *   присылает его в join_leave наравне с людьми, и без исключения себя
    *   комната никогда не выглядела бы пустой: правила выхода не срабатывали
    *   бы, а гейт по имени не переходил бы в solo.
    */
-  constructor(private readonly selfName?: string) {}
+  constructor(selfName?: string) {
+    this.selfKey = selfName ? nameKey(selfName) : undefined;
+  }
+
+  /** Он ли это. Сравнение по нормализованному ключу, а не побайтово. */
+  private isSelf(name: string): boolean {
+    return !!this.selfKey && nameKey(name) === this.selfKey;
+  }
 
   apply(e: ParticipantEvent): void {
-    if (this.selfName && e.name === this.selfName) return;
+    if (this.isSelf(e.name)) return;
     if (e.event === 'join') {
       this.people.set(e.uuid, e.name);
       return;
@@ -53,7 +92,7 @@ export class Presence {
   }
 
   speech(uuid: string, name: string, speaking: boolean): void {
-    if (this.selfName && name === this.selfName) return;
+    if (this.isSelf(name)) return;
     if (speaking) {
       this.speakingUuid = uuid;
       this.speakingName = name;
