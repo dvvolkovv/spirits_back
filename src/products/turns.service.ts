@@ -195,7 +195,13 @@ export class TurnsService {
       // не единица наступает в трёх разных случаях, и только один из них
       // повтор. Битый `turnId` и ход, который раннер завершает не забрав,
       // означают сломанного раннера, получающего `{ok: true}` бесконечно.
-      const d = await this.pg.query(`SELECT status FROM product_turns WHERE id = $1`, [turnId]);
+      // `.catch` обязателен: эта ветка обслуживает штатный ретрай раннера и
+      // бросать не имеет права. Без него кратковременный сбой базы превращает
+      // повтор в 500, раннер повторяет, попадает туда же и получает 500 снова.
+      // Диагностика не должна быть важнее того, что она диагностирует.
+      const d = await this.pg
+        .query(`SELECT status FROM product_turns WHERE id = $1`, [turnId])
+        .catch(() => ({ rows: [] }) as any);
       const actual = d.rows[0]?.status;
       this.logger.warn(
         actual
