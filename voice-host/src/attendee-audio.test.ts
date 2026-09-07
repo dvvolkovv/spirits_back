@@ -1,7 +1,24 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { AudioFrame } from '@livekit/rtc-node';
+import { initializeLogger, loggerOptions } from '@livekit/agents';
 import { AttendeeAudioOutput, SAMPLE_RATE, SAMPLES_PER_TICK } from './attendee-audio.js';
+
+/**
+ * Логгер SDK — установка теста, а не продового кода.
+ *
+ * `voice.AudioOutput` читает глобальный логгер прямо в конструкторе
+ * (`this.logger = log()`), а инициализирует его `cli.runApp()` при старте
+ * задания. В юнит-тестах такого старта нет, и `new AttendeeAudioOutput(...)`
+ * падал бы с «logger not initialized» ещё до первого captureFrame.
+ *
+ * Здесь, а не в attendee-audio.ts: побочный эффект на уровне продового модуля
+ * существовал бы только ради тестов. Сейчас `initializeLogger` перетирает
+ * настройки безусловно, то есть `cli.runApp()` в проде их перекрыл бы — но
+ * защити библиотека однажды повторный вызов, и прод молча получил бы
+ * тестовые настройки логирования.
+ */
+if (!loggerOptions()) initializeLogger({ pretty: false });
 
 /** Минимальная заглушка ws: копит отправленное, слушателей не зовёт. */
 function fakeWs() {

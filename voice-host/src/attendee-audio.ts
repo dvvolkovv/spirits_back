@@ -1,4 +1,4 @@
-import { voice, initializeLogger, loggerOptions } from '@livekit/agents';
+import { voice } from '@livekit/agents';
 import { AudioFrame } from '@livekit/rtc-node';
 import { ReadableStream } from 'node:stream/web';
 import { WebSocketServer, type WebSocket } from 'ws';
@@ -16,19 +16,6 @@ import { Mixer, TICK_MS } from './mixer.js';
  * нигде — ни у нас, ни в Attendee.
  */
 
-/**
- * `voice.AudioOutput` читает глобальный логгер SDK прямо в конструкторе
- * (`this.logger = log()`), а инициализирует его обычно `cli.runApp()` при
- * старте процесса задания. В юнит-тестах машины сегментов такого старта нет,
- * и без страховки `new AttendeeAudioOutput(...)` падает с «logger not
- * initialized. did you forget to run initializeLogger()?» ещё до первого
- * captureFrame — это и уронило первый прогон.
- *
- * Проверка `loggerOptions()` — чтобы не перетереть логгер, который уже
- * настроил `cli.runApp()` внутри настоящего задания (уровень логирования,
- * pretty-print): наш файл там просто ничего не делает, вперёд неё.
- */
-if (!loggerOptions()) initializeLogger({ pretty: false });
 
 export const SAMPLE_RATE = 24_000;
 export const SAMPLES_PER_TICK = (SAMPLE_RATE * TICK_MS) / 1000; // 480
