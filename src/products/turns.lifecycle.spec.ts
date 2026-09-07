@@ -45,7 +45,7 @@ describe('TurnsService.claimNext', () => {
 
 describe('TurnsService.complete', () => {
   it('успешный ход списывает токены', async () => {
-    const { svc, deductTokens } = makeService();
+    const { svc, calls, deductTokens } = makeService();
 
     await svc.complete('t-1', {
       userId: 'u-1',
@@ -57,6 +57,31 @@ describe('TurnsService.complete', () => {
     });
 
     expect(deductTokens).toHaveBeenCalledWith('u-1', 1200, expect.stringContaining('product'));
+
+    // Без утверждения о WHERE подмена `id = $1` на `id = $2` проходит мимо
+    // всех тестов: мок игнорирует текст, а проверяется только вызов
+    // deductTokens, который от этого не зависит. Последствие — исход хода
+    // записывается не в ту строку либо никуда, ход остаётся running, и замок
+    // держит продукт до сборщика через полчаса.
+    expect(calls[0].sql).toContain('WHERE id = $1');
+    // COALESCE хранит уже записанный sha_before, когда раннер его не прислал.
+    // Без него откат теряет точку возврата, а кнопка «вернуть как было»
+    // перестаёт работать на ходах, доложенных без shaBefore.
+    expect(calls[0].sql).toContain('COALESCE($5, sha_before)');
+    expect(calls[0].sql).toContain('tokens_spent = $7');
+  });
+
+  it('отрицательные токены от раннера не уходят в базу', async () => {
+    const { svc, calls, deductTokens } = makeService();
+
+    await svc.complete('t-1', { userId: 'u-1', status: 'done', tokens: -5 });
+
+    // Кламп существует потому, что тело запроса раннера — TS-тип при
+    // ValidationPipe({whitelist:false}), то есть рантайм-проверки нет вовсе.
+    // Без клампа сюда прилетает 23514 от CHECK (tokens_spent >= 0), уходит
+    // наружу необработанным 500, ход остаётся running и держит замок.
+    expect(calls[0].params[6]).toBe(0);
+    expect(deductTokens).not.toHaveBeenCalled();
   });
 
   it('упавший ход не тарифицируется', async () => {
