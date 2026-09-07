@@ -35,7 +35,11 @@ describe('send', () => {
     assert.equal(url, URL);
     assert.equal(init.method, 'POST');
     assert.equal(init.headers.Authorization, 'Bearer jwt.body.sig');
+    assert.equal(init.headers['Content-Type'], 'application/json');
     assert.deepEqual(JSON.parse(init.body), { text: 'Документ готов', name: NAME });
+    // Тул исполняется синхронно и держит разговор: без таймаута зависшая
+    // ручка молчала бы всю встречу на undici-дефолте в 300 секунд.
+    assert.ok(init.signal, 'таймаут отправки не выставлен');
   });
 
   test('пустой текст никуда не шлёт', async () => {

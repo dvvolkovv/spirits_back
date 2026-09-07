@@ -256,12 +256,28 @@ export default defineAgent({
     // running», исключение uncaught, процесс падает и pm2 его рестартит (диагностировано 29.08.2026
     // по error-логу). Гвардим ВСЕ вызовы generateReply: флаг + try/catch.
     let sessionClosed = false;
+    /**
+     * Сессия ещё не поднята — это НЕ то же самое, что закрыта.
+     *
+     * `generateReply` бросает «AgentSession is not running» в обоих случаях
+     * (agent_session.js: `if (!this.activity) throw`), и до этого флага оба
+     * читались в логе как «после закрытия сессии». Разница важная: в чужую
+     * комнату мы входим ДО `session.start()`, и написанное в чат за эти
+     * несколько сотен миллисекунд попадало в проглоченное исключение — гейт
+     * при этом успевал напечатать `respond`. В логе получалось «ход дали,
+     * ответа нет», то есть ровно та картина, на которой 28.08.2026 уже ушёл
+     * час поисков.
+     */
+    let sessionStarted = false;
     function replySafe(opts: Parameters<typeof session.generateReply>[0]): void {
       if (sessionClosed) return;
       try {
         session.generateReply(opts);
       } catch (e) {
-        console.error('generateReply после закрытия сессии проигнорирован', e);
+        console.error(
+          `generateReply проигнорирован (сессия ${sessionStarted ? 'закрыта' : 'ещё не поднята'})`,
+          e,
+        );
       }
     }
 
@@ -293,8 +309,13 @@ export default defineAgent({
      * Держим ОДНО обращение — последнее. Копить их незачем: человек, не
      * дождавшись ответа, переспрашивает, и отвечать надо на переспрос, а не
      * зачитывать вслух всю очередь.
+     *
+     * Слот один на оба канала — и на речь, и на чат комнаты. Написанное
+     * вытеснит отложенный голосовой вопрос и наоборот, и это осознанно: с
+     * точки зрения встречи это два способа обратиться к ассистенту, а
+     * рассуждение про переспрос работает для них одинаково.
      */
-    let deferredReply: { instructions: string; at: number } | null = null;
+    let deferredReply: { opts: Parameters<typeof session.generateReply>[0]; at: number } | null = null;
 
     /**
      * Сколько отложенный ответ ещё уместен. Полминуты — столько же, сколько
@@ -304,13 +325,17 @@ export default defineAgent({
      */
     const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
 
-    /** Дать модели ход сейчас или отложить, если она говорит или думает. */
-    function replyOrDefer(instructions: string): void {
-      if (pending.isBusy) {
-        deferredReply = { instructions, at: Date.now() };
+    /**
+     * Дать модели ход сейчас или отложить, если она говорит, думает или ещё
+     * не поднялась. Неподнятая сессия — повод отложить, а не потерять:
+     * flushDeferred отдаст обращение на первом же переходе в 'listening'.
+     */
+    function replyOrDefer(opts: Parameters<typeof session.generateReply>[0]): void {
+      if (!sessionStarted || pending.isBusy) {
+        deferredReply = { opts, at: Date.now() };
         return;
       }
-      replySafe({ instructions });
+      replySafe(opts);
     }
 
     /** Освободилась — отдать отложенное, если оно ещё не протухло. */
@@ -326,7 +351,7 @@ export default defineAgent({
       // состояние сессии сменится через несколько миллисекунд, а ответ коллеги
       // может прийти раньше и встать поверх.
       pending.setBusy(true);
-      replySafe({ instructions: d.instructions });
+      replySafe(d.opts);
     }
 
     const tools = {
@@ -403,6 +428,16 @@ export default defineAgent({
               }),
               execute: async ({ text }) => {
                 const ok = await chat!.send(text);
+                if (ok) {
+                  // Написанное — тоже участие в встрече, и оно обязано попасть
+                  // в транскрипт. Промпт прямо велит отвечать текстом и НЕ
+                  // зачитывать написанное вслух; без этой строки в резюме
+                  // остался бы вопрос участника и ни следа ответа — тем
+                  // дырявее, чем лучше модель слушается промпта.
+                  // ConversationItemAdded такое не подберёт: вызов тула не
+                  // сообщение, и обработчик отсеивает его первым же условием.
+                  transcript.push({ role: 'assistant', text: `[в чат] ${text}`, ts: Date.now() });
+                }
                 return ok ? { status: 'sent' } : { status: 'rejected', reason: 'chat_unavailable' };
               },
             }),
@@ -450,8 +485,16 @@ export default defineAgent({
         // Документ ложится в личный чат владельца в Linkeon, и остальным в
         // комнате он не виден: у них аккаунта у нас нет. Пересказ вслух эту
         // дыру не закрывает — по надиктованному URL не перейти.
+        //
+        // Отправка асинхронная, но её исход не теряем: Роман к этому моменту
+        // уже сказал вслух «документ готов», и молчаливо не ушедшая ссылка
+        // выглядела бы как исполненное обещание.
         if (chat && msg.url) {
-          void chat.send(`Документ «${msg.title}»: ${msg.url}`);
+          const line = `Документ «${msg.title || 'без названия'}»: ${msg.url}`;
+          void chat.send(line).then((ok) => {
+            if (ok) transcript.push({ role: 'assistant', text: `[в чат] ${line}`, ts: Date.now() });
+            else console.error(`[чат] ссылка на документ «${msg.title}» не ушла`);
+          });
         }
         return;
       }
@@ -536,13 +579,13 @@ export default defineAgent({
         case 'respond':
           // Именно эта реплика, а не «разговор целиком»: иначе модель
           // отвечает на вопрос, который слышала полчаса назад в молчании.
-          replyOrDefer(answerTo(textContent));
+          replyOrDefer({ instructions: answerTo(textContent) });
           break;
         case 'ack_listen':
-          replyOrDefer(listenAck());
+          replyOrDefer({ instructions: listenAck() });
           break;
         case 'ack_resume':
-          replyOrDefer(resumeAck());
+          replyOrDefer({ instructions: resumeAck() });
           break;
         case 'silent':
           break;
@@ -590,21 +633,38 @@ export default defineAgent({
         if (!msg) return;
         console.log(`[чат] ${msg.name}: ${msg.text.slice(0, 80)}`);
 
-        // В транскрипт — с автором. Здесь он точный, в отличие от речи, где
-        // говорящий угадан по активности микрофона.
+        // В транскрипт — с автором. Имя приходит от их сервера, то есть не
+        // угадано по активности микрофона, как у речи. Но это и ДРУГАЯ строка
+        // из другого источника: у речи берётся `p.name || p.identity` из
+        // LiveKit. Совпадают ли они для одного человека — вопрос к живой
+        // встрече; если нет, он раздвоится в транскрипте.
         transcript.push({ role: 'user', text: msg.text, ts: Date.now(), speaker: msg.name });
 
-        const decision = gate ? gate.decide(msg.text, Date.now(), msg.name) : 'respond';
+        // Гейт есть всегда, где есть чат: chat ⇒ isForeign ⇒ isMeeting. Ветка
+        // «нет гейта — отвечаем на всё» была бы самой опасной из возможных.
+        const decision = gate!.decide(msg.text, Date.now(), msg.name);
         console.log(`[гейт/чат] ${decision} ← «${msg.text.slice(0, 80)}»`);
         switch (decision) {
           case 'respond':
-            replyOrDefer(answerToChat(msg.name, msg.text));
+            // userInput, а не instructions, и это не стилистика.
+            //
+            // generateReply заводит user-сообщение в контексте модели ТОЛЬКО
+            // из userInput (agent_session.js: userMessage строится из
+            // options.userInput). С instructions Роман отвечает на написанное
+            // и тут же о нём забывает: спросили в чате про смету на 200
+            // квадратов, он ответил, а на голосовое «а если 300?» отвечать
+            // уже не по чему.
+            //
+            // Обёртка INTERNAL_PREFIX — та же, что у ответов специалистов:
+            // строка осядет в контексте, но не попадёт ни в транскрипт (мы
+            // записали его выше сами, с точным автором), ни второй раз в гейт.
+            replyOrDefer({ userInput: `${INTERNAL_PREFIX}: ${answerToChat(msg.name, msg.text)}]` });
             break;
           case 'ack_listen':
-            replyOrDefer(listenAck());
+            replyOrDefer({ instructions: listenAck() });
             break;
           case 'ack_resume':
-            replyOrDefer(resumeAck());
+            replyOrDefer({ instructions: resumeAck() });
             break;
           case 'silent':
             break;
@@ -858,6 +918,9 @@ export default defineAgent({
         ...(isMeeting ? { inputOptions: { closeOnDisconnect: false } } : {}),
       });
 
+      // С этого момента generateReply работает. До него в чужой комнате мы
+      // уже сидим и уже слышим её чат — см. sessionStarted выше.
+      sessionStarted = true;
 
       // Первую фразу задаём явно, а не отдаём модели на импровизацию.
       //
