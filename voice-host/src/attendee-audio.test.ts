@@ -158,14 +158,24 @@ describe('AttendeeAudioHub', () => {
 
   test('своё соединение дождались', async () => {
     const hub = new AttendeeAudioHub();
+    let client: any;
     try {
       const port = await hub.listen('c1');
       const waiting = hub.expect(5_000);
       const { WebSocket: Client } = await import('ws');
-      new Client(`ws://127.0.0.1:${port}/?callId=c1`);
+      client = new Client(`ws://127.0.0.1:${port}/?callId=c1`);
       const ws = await waiting;
       assert.ok(ws, 'соединение должно быть получено');
-    } finally { hub.close(); }
+      // Оба конца закрываем явно: wss.close() у 'ws' не трогает уже
+      // установленные соединения, а незакрытый сокет держит event loop —
+      // без --test-force-exit процесс этого тестового файла зависает
+      // навсегда, а не просто не проходит тест. Поймано по факту 07.09.2026:
+      // осиротевший процесс tsx висел на ноде CI до ручного kill.
+      ws?.terminate();
+    } finally {
+      client?.terminate();
+      hub.close();
+    }
   });
 
   test('не дождались — null по таймауту', async () => {
