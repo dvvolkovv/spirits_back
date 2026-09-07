@@ -27,6 +27,41 @@ export async function checkHealth(url: string | null, fetchFn: FetchFn = fetch):
   }
 }
 
+export interface WaitHealthyOptions {
+  timeoutMs?: number;
+  probeEveryMs?: number;
+  sleep?: (ms: number) => Promise<unknown>;
+}
+
+/**
+ * Ждёт, пока продукт поднимется, вместо одной пробы сразу после рестарта.
+ *
+ * Замерено на живой VM: сразу после `pm2 restart` порт отвергает соединение,
+ * продукт слушает через ~200 мс. Одиночная проба в этот момент всегда красная,
+ * то есть автооткат срабатывал бы на КАЖДОМ успешном ходе и ни одна правка
+ * клиента не доезжала бы до прода.
+ *
+ * Красным считается только то, что не поднялось за весь срок: неудачная проба
+ * это ещё не отказ, а отказом становится исчерпанное ожидание.
+ */
+export async function waitHealthy(
+  url: string | null,
+  fetchFn: FetchFn,
+  opts: WaitHealthyOptions = {},
+): Promise<boolean> {
+  if (!url) return true;
+  const timeoutMs = opts.timeoutMs ?? 30_000;
+  const probeEveryMs = opts.probeEveryMs ?? 500;
+  const wait = opts.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+
+  const attempts = Math.max(1, Math.ceil(timeoutMs / probeEveryMs));
+  for (let i = 0; i < attempts; i++) {
+    if (await checkHealth(url, fetchFn)) return true;
+    if (i < attempts - 1) await wait(probeEveryMs);
+  }
+  return false;
+}
+
 export interface DeployInput {
   git: Git;
   shaBefore: string;
@@ -37,6 +72,11 @@ export interface DeployInput {
   shell?: Shell;
   fetchFn?: FetchFn;
   onPhase?: (phase: string) => void;
+  /** Сколько всего ждать подъёма после рестарта, прежде чем считать ход красным. */
+  healthTimeoutMs?: number;
+  /** Как часто пробовать health-check внутри окна ожидания. */
+  healthProbeEveryMs?: number;
+  sleep?: (ms: number) => Promise<unknown>;
 }
 
 export async function deploy(input: DeployInput): Promise<{ reverted: boolean }> {
@@ -67,7 +107,11 @@ export async function deploy(input: DeployInput): Promise<{ reverted: boolean }>
   try {
     await bringUp('Правка');
     phase('Проверяю здоровье');
-    healthy = await checkHealth(input.healthUrl, fetchFn);
+    healthy = await waitHealthy(input.healthUrl, fetchFn, {
+      timeoutMs: input.healthTimeoutMs,
+      probeEveryMs: input.healthProbeEveryMs,
+      sleep: input.sleep,
+    });
   } catch (e: any) {
     // Сборка или рестарт не отработали. Без отката коммит агента остаётся в
     // дереве, а запущен старый код: чекаут молча расходится с тем, что

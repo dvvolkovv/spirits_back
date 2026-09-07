@@ -1,4 +1,4 @@
-import { checkHealth, deploy } from './deploy';
+import { checkHealth, deploy, waitHealthy } from './deploy';
 
 function response(init: { status: number; contentType: string; body: string }) {
   return {
@@ -67,8 +67,74 @@ describe('checkHealth', () => {
   });
 });
 
+describe('waitHealthy', () => {
+  it('продукт, поднявшийся не сразу, считается здоровым', async () => {
+    // Замерено на живой VM: сразу после pm2 restart порт отвергает
+    // соединение, продукт слушает через ~200 мс. Одиночная проба в этот
+    // момент красная — и автооткат срабатывал бы на каждом успешном ходе.
+    let probe = 0;
+    const fetchFn = jest.fn(async () => {
+      probe += 1;
+      if (probe < 3) throw new Error('ECONNREFUSED');
+      return response({ status: 200, contentType: 'application/json', body: '{}' });
+    });
+
+    await expect(
+      waitHealthy('https://x/api/healthz', fetchFn as any, { sleep: async () => undefined }),
+    ).resolves.toBe(true);
+    expect(probe).toBe(3);
+  });
+
+  it('не поднявшийся за срок — красный', async () => {
+    const fetchFn = jest.fn(async () => {
+      throw new Error('ECONNREFUSED');
+    });
+
+    await expect(
+      waitHealthy('https://x/api/healthz', fetchFn as any, {
+        timeoutMs: 1000,
+        probeEveryMs: 500,
+        sleep: async () => undefined,
+      }),
+    ).resolves.toBe(false);
+    // Ровно столько проб, сколько укладывается в срок — не больше и не меньше.
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('без health_url не ждёт вовсе', async () => {
+    const fetchFn = jest.fn();
+
+    await expect(waitHealthy(null, fetchFn as any)).resolves.toBe(true);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('между пробами выдерживается пауза', async () => {
+    // Без паузы это busy-loop: тысячи запросов в секунду к поднимающемуся
+    // продукту, пока он и так занят стартом.
+    const waits: number[] = [];
+    const fetchFn = jest.fn(async () => {
+      throw new Error('ECONNREFUSED');
+    });
+
+    await waitHealthy('https://x/api/healthz', fetchFn as any, {
+      timeoutMs: 1500,
+      probeEveryMs: 500,
+      sleep: async (ms: number) => {
+        waits.push(ms);
+      },
+    });
+
+    expect(waits).toEqual([500, 500]);
+  });
+});
+
 describe('deploy', () => {
   const okShell = jest.fn(async () => undefined);
+  // Без переопределения sleep ожидание здоровья реально спало бы до 30с на
+  // каждом тесте с красным health (дефолтный healthTimeoutMs). В самих
+  // тестах deploy интересует только факт отката, а не тайминги waitHealthy —
+  // те уже разобраны отдельно в describe('waitHealthy', ...) выше.
+  const noSleep = async () => undefined;
 
   it('красный health откатывает на sha_before', async () => {
     const git = { resetHard: jest.fn(async () => undefined) };
@@ -82,6 +148,7 @@ describe('deploy', () => {
       healthUrl: 'https://x/api/healthz',
       shell: okShell,
       fetchFn: unhealthy as any,
+      sleep: noSleep,
     });
 
     expect(result.reverted).toBe(true);
@@ -101,6 +168,7 @@ describe('deploy', () => {
       healthUrl: 'https://x/api/healthz',
       shell,
       fetchFn: unhealthy as any,
+      sleep: noSleep,
     });
 
     // build+restart дважды: первый раз с новым кодом, второй после отката
@@ -123,6 +191,36 @@ describe('deploy', () => {
 
     expect(result.reverted).toBe(false);
     expect(git.resetHard).not.toHaveBeenCalled();
+  });
+
+  it('не откатывает продукт, поднявшийся не сразу после рестарта', async () => {
+    // Интеграционный уровень: waitHealthy сам по себе уже протестирован выше,
+    // но без этого теста здесь мутация «вернуть checkHealth вместо
+    // waitHealthy в deploy» прошла бы незамеченной — остальные deploy-тесты
+    // либо здоровы с первой пробы, либо падают на сборке/рестарте раньше
+    // health-check и до fetchFn вовсе не доходят.
+    const git = { resetHard: jest.fn(async () => undefined) };
+    let probe = 0;
+    const fetchFn = jest.fn(async () => {
+      probe += 1;
+      if (probe < 3) throw new Error('ECONNREFUSED');
+      return response({ status: 200, contentType: 'application/json', body: '{}' });
+    });
+
+    const result = await deploy({
+      git: git as any,
+      shaBefore: 'aaa111',
+      buildCmd: 'npm run build',
+      restartCmd: 'pm2 restart web',
+      healthUrl: 'https://x/api/healthz',
+      shell: okShell,
+      fetchFn: fetchFn as any,
+      sleep: noSleep,
+    });
+
+    expect(result.reverted).toBe(false);
+    expect(git.resetHard).not.toHaveBeenCalled();
+    expect(probe).toBe(3);
   });
 
   it('фазы отчитываются наружу', async () => {
