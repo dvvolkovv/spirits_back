@@ -126,21 +126,32 @@ describe('AttendeeAudioHub', () => {
     const hub = new AttendeeAudioHub();
     try {
       const port = await hub.listen('c1');
-      assert.ok(port >= 8140 && port <= 8179, `порт вне диапазона: ${port}`);
+      // Диапазон по умолчанию — один порт: он же потолок одновременных
+      // встреч Meet (см. комментарий у PORT_MIN/PORT_MAX в attendee-audio.ts).
+      assert.equal(port, 8140, `порт вне диапазона: ${port}`);
       const url = hub.publicUrl('c1');
       // Порт в пути, а не в host:port — TLS терминирует nginx.
       assert.match(url, new RegExp(`/attendee/${port}\\?callId=c1$`));
     } finally { hub.close(); }
   });
 
-  test('второй хаб берёт другой порт, а не падает', async () => {
-    // Ровно то, на чём сломалась прежняя схема: два задания на одном хосте.
+  test('второй хаб на ту же встречу честно отказывает, а не падает молча', async () => {
+    // Потолок в одну одновременную встречу держится ровно этим: диапазон
+    // сужен до одного порта, и второму хабу занять нечего. При потолке в
+    // одну встречу это НОРМА для второго пользователя, а не редкость — и
+    // ошибка обязана быть внятной, а не EADDRINUSE без объяснения или,
+    // того хуже, повисшим промисом.
     const a = new AttendeeAudioHub();
     const b = new AttendeeAudioHub();
     try {
-      const pa = await a.listen('c1');
-      const pb = await b.listen('c2');
-      assert.notEqual(pa, pb);
+      await a.listen('c1');
+      await assert.rejects(
+        () => b.listen('c2'),
+        (e: any) => {
+          assert.match(e.message, /занят|нет свободного порта/, `ошибка не внятная: ${e.message}`);
+          return true;
+        },
+      );
     } finally { a.close(); b.close(); }
   });
 
