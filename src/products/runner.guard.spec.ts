@@ -44,7 +44,13 @@ describe('RunnerGuard', () => {
   });
 
   it('без заголовка — 401', async () => {
-    const { guard } = makeGuard([]);
+    // Мок отдаёт НЕпустые rows намеренно. С пустыми тест носил бы имя одной
+    // защиты, а держался на другой: пустой токен дошёл бы до запроса, ничего
+    // не нашёл, и сработал бы второй страж `if (!r.rows[0])`. Исключение
+    // вылетело бы всё равно — и снятие ранней проверки `!token` осталось бы
+    // незамеченным. С непустыми rows такая мутация даёт resolves(true), то
+    // есть тест ловит ровно ту защиту, которую называет.
+    const { guard } = makeGuard([{ id: 'p-1' }]);
 
     await expect(guard.canActivate(makeContext())).rejects.toBeInstanceOf(UnauthorizedException);
   });
