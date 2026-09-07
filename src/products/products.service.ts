@@ -77,7 +77,7 @@ export class ProductsService implements OnModuleInit {
       path.join(__dirname, '..', '..', 'src', 'products', 'migrations', filename),
     ];
     let found = false;
-    for (const p of candidates) {
+    for (const p of [...new Set(candidates)]) {
       if (!fs.existsSync(p)) continue;
       found = true;
       try {
