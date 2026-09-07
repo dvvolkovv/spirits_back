@@ -14,7 +14,12 @@ function makeContext(header?: string) {
 }
 
 function makeGuard(rows: any[]) {
-  const pg = { query: jest.fn(async () => ({ rows })) };
+  // Параметры объявлены явно, хотя тело их не использует: без этого
+  // TypeScript выводит для mock.calls пустой кортеж, и обращения к
+  // calls[0][0] / calls[0][1] в утверждениях ниже становятся ошибкой типа.
+  // Jest их не ловит, а `tsc --noEmit -p tsconfig.json` — предписанная
+  // планом проверка перед выкатом — краснеет.
+  const pg = { query: jest.fn(async (_sql: string, _params?: any[]) => ({ rows })) };
   return { guard: new RunnerGuard(pg as any), pg };
 }
 
