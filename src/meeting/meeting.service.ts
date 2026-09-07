@@ -6,12 +6,15 @@ import { VoiceCallService } from '../voice-call/voice-call.service';
 import { SPECIALIST_ROLES, SPECIALISTS } from '../voice-call/voice-call.types';
 import { RoomService } from './room.service';
 import { TalerIdRoomClient } from './talerid-room.client';
+import { AttendeeClient } from './attendee.client';
 import { MeetingProvider } from './meeting-link';
 
 /** Провайдер встречи в voice_calls. Дальше сюда добавится 'zoom'. */
 const PROVIDER = 'linkeon_room';
 /** Он же для чужих комнат Taler ID. */
 const PROVIDER_TALERID = 'talerid';
+/** Он же для встреч Google Meet через Attendee. */
+const PROVIDER_MEET = 'meet';
 
 /**
  * Вход ассистента во встречу.
@@ -30,6 +33,7 @@ export class MeetingService {
     private readonly livekit: LiveKitClient,
     private readonly rooms: RoomService,
     private readonly talerIdRooms: TalerIdRoomClient,
+    private readonly attendee: AttendeeClient,
   ) {}
 
   /**
@@ -118,6 +122,7 @@ export class MeetingService {
     await this.assertCanAfford(userId);
 
     const isForeign = provider === 'talerid';
+    const isMeet = provider === 'meet';
     const callId = randomUUID();
 
     // Куда идёт ассистент и как называется комната — единственное, чем
@@ -126,7 +131,16 @@ export class MeetingService {
     let roomName: string;
     let external: { url: string; token: string } | undefined;
 
-    if (isForeign) {
+    if (isMeet) {
+      // За информацией о встрече идти некуда: публичной ручки «существует ли
+      // такая встреча» у Meet нет. Значит и карточку мы показываем, не
+      // проверив вход, и о неудаче узнаём из состояния бота уже после захода.
+      // Название берём нейтральное — настоящего у нас нет.
+      title = 'Встреча Google Meet';
+      // По callId, а не по коду: одну встречу могут позвать дважды, а
+      // room_name с уникальностью уже намучил (003_drop_room_name_unique).
+      roomName = `meet_${callId}`;
+    } else if (isForeign) {
       const info = await this.talerIdRooms.info(code);
       if (!info || !info.isActive) throw new NotFoundException('room not found');
       // Пароль в v1 не поддержан. Отказ внятный: молчаливое падение в 500
@@ -150,12 +164,30 @@ export class MeetingService {
     await this.pg.query(
       `INSERT INTO voice_calls (id, user_id, agent_id, room_name, status, provider, external_room)
        VALUES ($1, $2, $3, $4, 'dialing', $5, $6)`,
-      [callId, userId, agentId, roomName, isForeign ? PROVIDER_TALERID : PROVIDER, code],
+      [callId, userId, agentId, roomName,
+       isMeet ? PROVIDER_MEET : isForeign ? PROVIDER_TALERID : PROVIDER, code],
     );
 
     try {
       const preamble = await this.calls.buildPreamble(userId, agentId);
       const ownerName = await this.resolveOwnerName(userId);
+
+      if (isMeet) {
+        const bot = await this.attendee.createBot({
+          meetingUrl: `https://meet.google.com/${code}`,
+          // То же имя, что в своих комнатах и в Taler ID: участники должны
+          // видеть, кто к ним пришёл и от кого.
+          botName: `${agent.display_name} · ассистент ${ownerName}`,
+          callId,
+        });
+        // Причина уже в логе клиента. Наружу — внятный отказ: молчаливое 500
+        // выглядит поломкой, а это может быть просто выключенный Attendee.
+        if (!bot) throw new ConflictException({ message: 'meeting bot is unavailable' });
+        await this.pg.query(
+          `UPDATE voice_calls SET external_bot_id = $1 WHERE id = $2`,
+          [bot.botId, callId],
+        );
+      }
 
       if (isForeign) {
         // Токен берём здесь, а не выше: он живёт шесть часов, и отсчёт лучше
@@ -166,10 +198,10 @@ export class MeetingService {
         external = { url: t.url, token: t.token };
       }
 
-      // Наша комната при чужой встрече пуста, и LiveKit удалил бы её через
+      // Наша комната при внешней встрече пуста, и LiveKit удалил бы её через
       // пять минут по дефолтному empty_timeout — ассистента выбрасывало
       // ровно на 301-й секунде. Заводим заранее с запасом на всю встречу.
-      if (isForeign) await this.livekit.ensureRoom(roomName, 2 * 60 * 60);
+      if (isForeign || isMeet) await this.livekit.ensureRoom(roomName, 2 * 60 * 60);
 
       await this.livekit.dispatchAgent(roomName, {
         callId,
@@ -183,6 +215,7 @@ export class MeetingService {
         // Внешняя комната: воркер повесит на неё вход и выход сессии.
         // Для своих встреч поля нет вовсе — поведение воркера не меняется.
         ...(external ? { provider: PROVIDER_TALERID, externalUrl: external.url, externalToken: external.token } : {}),
+        ...(isMeet ? { provider: PROVIDER_MEET } : {}),
         // Все специалисты, кроме самого ведущего: спрашивать себя незачем, а
         // предложение это сделать модель однажды примет всерьёз.
         specialists: Object.keys(SPECIALISTS)
