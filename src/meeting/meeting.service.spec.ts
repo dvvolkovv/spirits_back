@@ -284,14 +284,13 @@ describe('MeetingService', () => {
   });
 
   describe('встреча Google Meet', () => {
-    it('создаёт бота и зовёт воркера в свою пустую комнату', async () => {
+    it('зовёт воркера в свою пустую комнату', async () => {
+      // Бота здесь больше НЕ создаём: порт под звук свой у каждого задания
+      // (см. AttendeeAudioHub), и знает его только воркер. Бот создаётся
+      // позже, отдельной ручкой attachBot, когда воркер сообщит свой wsUrl.
       withAgent();
       const res = await svc.join('u1', 7, 'abc-defg-hij', 'meet');
-      expect(attendee.createBot).toHaveBeenCalledWith(expect.objectContaining({
-        meetingUrl: 'https://meet.google.com/abc-defg-hij',
-        botName: 'Андрей · ассистент Дмитрий',
-        callId: res.callId,
-      }));
+      expect(attendee.createBot).not.toHaveBeenCalled();
       // Комната по callId, а не по коду встречи: одну и ту же встречу могут
       // позвать дважды, и имя по коду столкнулось бы с прошлой записью.
       expect(livekit.dispatchAgent).toHaveBeenCalledWith(
@@ -317,23 +316,6 @@ describe('MeetingService', () => {
       expect(livekit.ensureRoom).toHaveBeenCalledWith(expect.stringMatching(/^meet_/), 7200);
     });
 
-    it('запоминает id бота — без него его не вывести из встречи', async () => {
-      withAgent();
-      await svc.join('u1', 7, 'abc-defg-hij', 'meet');
-      expect(pg.query.mock.calls.some(([sql, args]: any) =>
-        /external_bot_id/.test(sql) && Array.isArray(args) && args.includes('bot_1'),
-      )).toBe(true);
-    });
-
-    it('бот не поднялся — звонок помечен failed, а не оставлен в dialing', async () => {
-      // Запись в dialing намертво блокирует пользователю следующий вход:
-      // лимит «один активный» смотрит именно на неё.
-      withAgent();
-      attendee.createBot.mockResolvedValue(null);
-      await expect(svc.join('u1', 7, 'abc-defg-hij', 'meet')).rejects.toThrow();
-      expect(pg.query.mock.calls.some(([sql]: any) => /status = 'failed'/.test(sql))).toBe(true);
-    });
-
     it('в комнату Meet не ходит за информацией — её негде взять', async () => {
       // У Meet нет публичной ручки «существует ли встреча». Проверить вход
       // заранее нельзя, о неудаче узнаём из состояния бота.
@@ -355,44 +337,47 @@ describe('MeetingService', () => {
       expect(attendee.createBot).not.toHaveBeenCalled();
       expect(livekit.dispatchAgent).toHaveBeenCalledWith('room_ABC234', expect.any(Object));
     });
+  });
 
-    it('падение UPDATE после создания бота — бот всё равно выводится', async () => {
-      // Самый коварный путь: бот уже в встрече, а id в базу не уехал.
-      // Без уборки здесь Chrome остаётся в переговорах клиента навсегда:
-      // реапер ищет по непустому external_bot_id и такую строку не найдёт.
+  describe('attachBot', () => {
+    // Порт под звук свой у каждого задания, и знает его только воркер (см.
+    // AttendeeAudioHub). Бот поэтому создаётся не в join(), а здесь — когда
+    // воркер сообщил бэкенду свой wsUrl отдельной ручкой.
+    const wsUrl = 'wss://my.linkeon.io/attendee/8141?callId=c1';
+
+    it('успех: создаёт бота и запоминает его id', async () => {
       withAgent();
-      pg.query.mockImplementation(async (sql: string) => {
-        if (sql.includes('FROM agents')) return { rows: [agentRow] };
-        if (sql.includes('SELECT tokens FROM ai_profiles_consolidated')) return { rows: [{ tokens: balance }] };
-        if (sql.includes('external_bot_id')) throw new Error('соединение оборвалось');
-        if (sql.includes('ai_profiles_consolidated')) return { rows: [{ name: 'Дмитрий' }] };
-        return { rows: [], rowCount: 0 };
+      calls.load.mockResolvedValue({ id: 'c1', agent_id: 7, user_id: 'u1', external_room: 'abc-defg-hij' });
+      const res = await svc.attachBot('c1', wsUrl);
+      expect(res).toEqual({ status: 'ok' });
+      expect(attendee.createBot).toHaveBeenCalledWith({
+        meetingUrl: 'https://meet.google.com/abc-defg-hij',
+        // То же имя, что и раньше собиралось в join(): участники должны
+        // видеть, кто к ним пришёл и от кого.
+        botName: 'Андрей · ассистент Дмитрий',
+        callId: 'c1',
+        wsUrl,
       });
-      await expect(svc.join('u1', 7, 'abc-defg-hij', 'meet')).rejects.toThrow();
-      expect(attendee.removeBot).toHaveBeenCalledWith('bot_1');
+      const upd = pg.query.mock.calls.find(([sql, args]: any) =>
+        /external_bot_id/.test(sql) && Array.isArray(args) && args.includes('bot_1'),
+      );
+      expect(upd).toBeDefined();
     });
 
-    it('падение dispatchAgent — бот тоже выводится', async () => {
+    it('Attendee не создал бота — звонок помечается failed', async () => {
       withAgent();
-      livekit.dispatchAgent.mockRejectedValue(new Error('livekit недоступен'));
-      await expect(svc.join('u1', 7, 'abc-defg-hij', 'meet')).rejects.toThrow();
-      expect(attendee.removeBot).toHaveBeenCalledWith('bot_1');
+      attendee.createBot.mockResolvedValue(null);
+      calls.load.mockResolvedValue({ id: 'c1', agent_id: 7, user_id: 'u1', external_room: 'abc-defg-hij' });
+      const res = await svc.attachBot('c1', wsUrl);
+      expect(res).toEqual({ status: 'failed' });
+      expect(calls.fail).toHaveBeenCalledWith('c1', expect.any(String));
     });
 
-    it('неудача уборки не подменяет исходную причину отказа', async () => {
-      // Наружу должна уйти причина, по которой вход не состоялся, а не то,
-      // что вдобавок не убрался бот.
-      withAgent();
-      livekit.dispatchAgent.mockRejectedValue(new Error('livekit недоступен'));
-      attendee.removeBot.mockRejectedValue(new Error('и Attendee лёг'));
-      await expect(svc.join('u1', 7, 'abc-defg-hij', 'meet')).rejects.toThrow('livekit недоступен');
-    });
-
-    it('своя встреча бота не создаёт и не убирает', async () => {
-      withAgent();
-      livekit.dispatchAgent.mockRejectedValue(new Error('livekit недоступен'));
-      await expect(svc.join('u1', 7, 'ABC234')).rejects.toThrow();
-      expect(attendee.removeBot).not.toHaveBeenCalled();
+    it('звонок не найден — failed, к Attendee не ходим', async () => {
+      calls.load.mockRejectedValue(new Error('call not found'));
+      const res = await svc.attachBot('нет-такого', wsUrl);
+      expect(res).toEqual({ status: 'failed' });
+      expect(attendee.createBot).not.toHaveBeenCalled();
     });
   });
 

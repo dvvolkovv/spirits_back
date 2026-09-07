@@ -8,7 +8,6 @@ describe('AttendeeClient', () => {
     process.env.ATTENDEE_BASE_URL = 'https://attendee.test';
     process.env.ATTENDEE_API_KEY = 'k1';
     process.env.ATTENDEE_WEBHOOK_URL = 'https://my.linkeon.io/webhook/meet/attendee';
-    process.env.ATTENDEE_AUDIO_WS_URL = 'wss://voice.linkeon.io/attendee';
   });
   afterEach(() => { global.fetch = realFetch; });
 
@@ -19,17 +18,19 @@ describe('AttendeeClient', () => {
         meetingUrl: 'https://meet.google.com/abc-defg-hij',
         botName: 'Роман · ассистент Дмитрия',
         callId: 'c1',
+        wsUrl: 'wss://my.linkeon.io/attendee/8141?callId=c1',
       });
       expect(r).toEqual({ botId: 'bot_1' });
     });
 
-    it('шлёт имя, метаданные, вебсокет и триггеры', async () => {
+    it('шлёт имя, метаданные, вебсокет как есть и триггеры', async () => {
       const spy = jest.fn().mockResolvedValue(ok({ id: 'bot_1' }));
       global.fetch = spy as any;
       await new AttendeeClient().createBot({
         meetingUrl: 'https://meet.google.com/abc-defg-hij',
         botName: 'Роман · ассистент Дмитрия',
         callId: 'c1',
+        wsUrl: 'wss://my.linkeon.io/attendee/8141?callId=c1',
       });
       const [url, init] = spy.mock.calls[0];
       expect(url).toBe('https://attendee.test/api/v1/bots');
@@ -39,8 +40,10 @@ describe('AttendeeClient', () => {
       expect(body.bot_name).toBe('Роман · ассистент Дмитрия');
       // callId в metadata — так вебхук находит звонок без своей таблицы.
       expect(body.metadata).toEqual({ callId: 'c1' });
+      // wsUrl уходит КАК ЕСТЬ, без сборки из env: порт знает только воркер,
+      // он же собирает адрес целиком (см. AttendeeAudioHub.publicUrl).
       expect(body.websocket_settings.audio).toEqual({
-        url: 'wss://voice.linkeon.io/attendee?callId=c1',
+        url: 'wss://my.linkeon.io/attendee/8141?callId=c1',
         sample_rate: 24000,
       });
       expect(body.webhooks[0].triggers).toEqual([
@@ -53,14 +56,14 @@ describe('AttendeeClient', () => {
     it('HTTP-ошибка — null, а не исключение', async () => {
       global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 502 }) as any;
       await expect(new AttendeeClient().createBot({
-        meetingUrl: 'u', botName: 'n', callId: 'c1',
+        meetingUrl: 'u', botName: 'n', callId: 'c1', wsUrl: 'wss://x/attendee/8141?callId=c1',
       })).resolves.toBeNull();
     });
 
     it('ответ без id — null', async () => {
       global.fetch = jest.fn().mockResolvedValue(ok({ state: 'joining' })) as any;
       await expect(new AttendeeClient().createBot({
-        meetingUrl: 'u', botName: 'n', callId: 'c1',
+        meetingUrl: 'u', botName: 'n', callId: 'c1', wsUrl: 'wss://x/attendee/8141?callId=c1',
       })).resolves.toBeNull();
     });
 
@@ -69,14 +72,14 @@ describe('AttendeeClient', () => {
         ok: true, status: 200, json: async () => { throw new Error('битый JSON'); },
       }) as any;
       await expect(new AttendeeClient().createBot({
-        meetingUrl: 'u', botName: 'n', callId: 'c1',
+        meetingUrl: 'u', botName: 'n', callId: 'c1', wsUrl: 'wss://x/attendee/8141?callId=c1',
       })).resolves.toBeNull();
     });
 
     it('падение сети — null', async () => {
       global.fetch = jest.fn().mockRejectedValue(new Error('ECONNREFUSED')) as any;
       await expect(new AttendeeClient().createBot({
-        meetingUrl: 'u', botName: 'n', callId: 'c1',
+        meetingUrl: 'u', botName: 'n', callId: 'c1', wsUrl: 'wss://x/attendee/8141?callId=c1',
       })).resolves.toBeNull();
     });
 
@@ -85,7 +88,7 @@ describe('AttendeeClient', () => {
       const spy = jest.fn();
       global.fetch = spy as any;
       await expect(new AttendeeClient().createBot({
-        meetingUrl: 'u', botName: 'n', callId: 'c1',
+        meetingUrl: 'u', botName: 'n', callId: 'c1', wsUrl: 'wss://x/attendee/8141?callId=c1',
       })).resolves.toBeNull();
       expect(spy).not.toHaveBeenCalled();
     });
