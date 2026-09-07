@@ -1,4 +1,4 @@
-import { RunnerConfig } from './config';
+import { RunnerConfig, DEFAULT_POLL_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS } from './config';
 import { NDJsonEvent } from './claude';
 
 export interface PollResult {
@@ -60,17 +60,37 @@ export class LinkeonApi {
     return this.url(`products/runner/turns/${encodeURIComponent(turnId)}/${suffix}`);
   }
 
+  /**
+   * Таймаут обязателен: без него повисший запрос блокирует цикл раннера
+   * навсегда. Restart=always в systemd не спасает — процесс жив, просто
+   * ничего не делает, и продукт клиента перестаёт обслуживаться молча.
+   *
+   * Реальная сеть виснет не так, как падает: заглохший TCP, обрыв без RST,
+   * прокси, принявший соединение и замолчавший. Мок в тестах этого не умеет,
+   * поэтому явление не видно на юнит-уровне вовсе.
+   */
+  private async withTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await this.fetchFn(url, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async poll(): Promise<PollResult | null> {
     try {
-      const res = await this.fetchFn(this.url('products/runner/poll'), {
-        method: 'POST',
-        headers: this.headers(),
-      });
+      const res = await this.withTimeout(
+        this.url('products/runner/poll'),
+        { method: 'POST', headers: this.headers() },
+        this.config.pollTimeoutMs ?? DEFAULT_POLL_TIMEOUT_MS,
+      );
       if (!res.ok) return null;
       return (await res.json()) as PollResult;
     } catch {
-      // Сеть легла, таймаут, DNS — что угодно. Раннер попробует на следующем
-      // цикле, падать здесь нельзя.
+      // Сеть легла, таймаут (в т.ч. наш собственный abort), DNS — что
+      // угодно. Раннер попробует на следующем цикле, падать здесь нельзя.
       return null;
     }
   }
@@ -80,11 +100,11 @@ export class LinkeonApi {
     // порциями событий, когда накопить ещё ничего не успели.
     if (events.length === 0) return true;
     try {
-      const res = await this.fetchFn(this.turnUrl(turnId, 'events'), {
-        method: 'POST',
-        headers: this.headers(),
-        body: JSON.stringify({ events }),
-      });
+      const res = await this.withTimeout(
+        this.turnUrl(turnId, 'events'),
+        { method: 'POST', headers: this.headers(), body: JSON.stringify({ events }) },
+        this.config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+      );
       return res.ok;
     } catch {
       return false;
@@ -93,11 +113,11 @@ export class LinkeonApi {
 
   async complete(turnId: string, payload: CompletePayload): Promise<boolean> {
     try {
-      const res = await this.fetchFn(this.turnUrl(turnId, 'complete'), {
-        method: 'POST',
-        headers: this.headers(),
-        body: JSON.stringify(payload),
-      });
+      const res = await this.withTimeout(
+        this.turnUrl(turnId, 'complete'),
+        { method: 'POST', headers: this.headers(), body: JSON.stringify(payload) },
+        this.config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+      );
       return res.ok;
     } catch {
       return false;

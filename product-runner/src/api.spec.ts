@@ -107,3 +107,63 @@ describe('LinkeonApi.complete', () => {
     await expect(api.complete('t-1', { status: 'done' })).resolves.toBe(false);
   });
 });
+
+describe('LinkeonApi — таймауты', () => {
+  it(
+    'повисший poll не блокирует раннера навсегда',
+    async () => {
+      // Мок, который никогда не отвечает сам — только по abort. Без таймаута
+      // этот тест висел бы до срабатывания jest-таймаута, что и есть модель
+      // реального отказа: процесс жив, цикл стоит.
+      //
+      // Важно: если signal вообще не передан (мутация, убирающая
+      // withTimeout), промис НЕ бросает синхронно на addEventListener —
+      // иначе catch-блок в poll() поймает эту случайную TypeError и вернёт
+      // тот же null, что и при штатном abort, и тест зазеленеет по неверной
+      // причине, не заметив пропажи таймаута вовсе. Вместо этого промис молча
+      // никогда не разрешается, и при отсутствии signal тест сам виснет —
+      // ловится собственным укороченным таймаутом теста (см. третий аргумент
+      // it), а не подставным исключением.
+      const fetchFn = jest.fn(
+        (_url: string, init: any) =>
+          new Promise((_resolve, reject) => {
+            if (!init.signal) return;
+            init.signal.addEventListener('abort', () => reject(new Error('aborted')));
+          }),
+      );
+      const api = new LinkeonApi(
+        { linkeonUrl: 'https://x', runnerToken: 'tok', pollTimeoutMs: 50 } as any,
+        fetchFn as any,
+      );
+
+      await expect(api.poll()).resolves.toBeNull();
+    },
+    300,
+  );
+
+  it('запрос получает signal', async () => {
+    const fetchFn = jest.fn(async (_url: string, _init: any) => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ turn: null, product: {} }),
+    }));
+    const api = new LinkeonApi({ linkeonUrl: 'https://x', runnerToken: 'tok' } as any, fetchFn as any);
+
+    await api.poll();
+
+    expect(fetchFn.mock.calls[0][1].signal).toBeDefined();
+  });
+
+  it('таймер снимается после успешного ответа', async () => {
+    // Иначе каждый запрос оставляет висящий таймер: на длинном прогоне это
+    // тысячи таймеров и процесс, который не завершается по SIGTERM.
+    const spy = jest.spyOn(global, 'clearTimeout');
+    const fetchFn = jest.fn(async () => ({ ok: true, status: 200, json: async () => ({ turn: null, product: {} }) }));
+    const api = new LinkeonApi({ linkeonUrl: 'https://x', runnerToken: 'tok' } as any, fetchFn as any);
+
+    await api.poll();
+
+    expect(spy).toHaveBeenCalled();
+    spy.mockRestore();
+  });
+});
