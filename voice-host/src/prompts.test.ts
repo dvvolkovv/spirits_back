@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { answerTo, callInstructions, meetingInstructions } from './prompts.js';
+import { answerTo, answerToChat, callInstructions, meetingInstructions } from './prompts.js';
 
 const SPECIALISTS = [
   { name: 'Алексей', role: 'юрист' },
@@ -95,5 +95,19 @@ describe('answerTo', () => {
     const s = answerTo('он сказал «потом» и ушёл');
     assert.match(s, /он сказал «потом» и ушёл/);
     assert.match(s, /Ответь ПО-РУССКИ именно на неё/);
+  });
+});
+
+describe('answerToChat', () => {
+  test('называет автора и приводит текст', () => {
+    const s = flat(answerToChat('Дмитрий Волков', 'скинь ссылку на смету'));
+    assert.match(s, /Дмитрий Волков/);
+    assert.match(s, /скинь ссылку на смету/);
+  });
+
+  test('велит отвечать голосом, а ссылки класть в чат', () => {
+    const s = flat(answerToChat('Дмитрий', 'дай ссылку'));
+    assert.match(s, /вслух|голос/i);
+    assert.match(s, /write_to_chat/);
   });
 });
