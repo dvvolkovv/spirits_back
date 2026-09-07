@@ -7,7 +7,11 @@ Type=simple
 User=%i
 WorkingDirectory=/opt/linkeon-product-runner
 EnvironmentFile=/etc/linkeon-product-runner.env
-ExecStart=/usr/bin/node /opt/linkeon-product-runner/dist/index.js
+# Путь к node подставляется при установке: захардкоженный /usr/bin/node
+# существует не везде. На тестовой ноде node стоит под nvm, и юнит с
+# /usr/bin/node падает с status=203/EXEC — проверено установкой.
+# Та же ловушка, что с CLAUDE_BIN.
+ExecStart=__NODE__ /opt/linkeon-product-runner/dist/index.js
 Restart=always
 RestartSec=5
 StandardOutput=journal
