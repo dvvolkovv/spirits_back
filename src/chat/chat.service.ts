@@ -495,7 +495,13 @@ export class ChatService {
       // Своя комната и чужая проверяются в разных местах, но ведут себя
       // одинаково: нашли живую — показываем карточку, не нашли — это была
       // обычная ссылка в разговоре, идём обычным путём и не мешаем.
-      const room = meetingLink.provider === 'talerid'
+      const room = meetingLink.provider === 'meet'
+        // Проверять нечего: публичной ручки «существует ли встреча» у Meet
+        // нет. Карточку показываем сразу — цена ошибки невелика (кнопка
+        // приведёт к внятному отказу бота), а требовать проверки значит не
+        // показывать карточку никогда.
+        ? { code: meetingLink.code, title: 'Встреча Google Meet', active: true }
+        : meetingLink.provider === 'talerid'
         ? await this.talerIdRooms
             ?.info(meetingLink.code)
             .then((r) => (r && r.isActive && !r.requiresPassword
