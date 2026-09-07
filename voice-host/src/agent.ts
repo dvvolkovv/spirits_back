@@ -53,10 +53,6 @@ const INTERNAL_PREFIX = '[Внутреннее сообщение';
 /** Сколько после своей реплики ассистент отвечает без повторного зова. */
 const FOLLOWUP_WINDOW_MS = 30_000;
 
-const ATTENDEE_WS_PORT = Number(process.env.ATTENDEE_WS_PORT || 8138);
-/** Один хаб на процесс воркера: задания находят своё соединение по callId. */
-const attendeeHub = new AttendeeAudioHub(ATTENDEE_WS_PORT);
-
 export default defineAgent({
   entry: async (ctx: JobContext) => {
     const meta = JSON.parse(ctx.job.metadata || '{}') as {
@@ -164,22 +160,60 @@ export default defineAgent({
     }
 
     /**
-     * Звук Meet-встречи. Ждём здесь, до создания сессии: без звука сессию
-     * заводить незачем, а к этому моменту ещё ничего, кроме подключённой
-     * ctx.room, не создано — закрыть при неудаче нужно только её.
+     * Звук Meet-встречи.
+     *
+     * Хаб — на ЗАДАНИЕ, не на процесс воркера. Прежняя схема держала его на
+     * уровне модуля с фиксированным портом, и это было несовместимо с
+     * процесс-моделью @livekit/agents@1.7.0: каждое задание — отдельный
+     * fork(), импортирующий модуль СРАЗУ при старте, ещё до того, как ему
+     * досталась встреча (ipc/job_proc_lazy_main.js:175-176). Пул греет
+     * замену в момент, когда задание забирает прогретый процесс
+     * (ipc/proc_pool.js:43) — и замена падала с EADDRINUSE, ломая не только
+     * Meet, а прогрев пула вообще. Решение владельца 07.09.2026: порт узнаёт
+     * тот, кто им владеет, и здесь порядок вызовов инвертирован относительно
+     * прежнего плана — сначала мы занимаем порт, потом просим бэкенд создать
+     * бота с нашим адресом. Наоборот нельзя: бот подключался бы в никуда.
      */
     let attendeeWs: WebSocket | null = null;
+    let attendeeHub: AttendeeAudioHub | null = null;
     if (isMeet) {
-      // Место занимаем и ждём: Attendee мог подключиться, пока поднималось
-      // задание, — тогда соединение уже ждёт нас.
-      attendeeWs = await attendeeHub.expect(meta.callId);
-      if (!attendeeWs) {
-        // Бот так и не подключился. Сидеть в пустой комнате и тарифицировать
-        // Realtime незачем: закрываемся сразу и внятно.
-        await backend.failed(meta.callId, 'звук встречи так и не подключился').catch(() => {});
+      attendeeHub = new AttendeeAudioHub();
+      let wsUrl: string;
+      try {
+        await attendeeHub.listen(meta.callId);
+        wsUrl = attendeeHub.publicUrl(meta.callId);
+      } catch (e: any) {
+        console.error('[meet] порт под звук не занят', e);
+        await backend.failed(meta.callId, `порт под звук не занят: ${e?.message}`).catch(() => {});
+        attendeeHub.close();
         try { await ctx.room.disconnect(); } catch {}
         return;
       }
+      const ok = await backend.meetBot(meta.callId, wsUrl).catch(() => false);
+      if (!ok) {
+        // Бот не создан: сидеть в пустой комнате и тарифицировать Realtime
+        // незачем. Бэкенд уже знает о неудаче (attachBot сам метит звонок
+        // failed), повторять вызов здесь не нужно.
+        console.log('[meet] бот Attendee не создан');
+        attendeeHub.close();
+        try { await ctx.room.disconnect(); } catch {}
+        return;
+      }
+      attendeeWs = await attendeeHub.expect();
+      if (!attendeeWs) {
+        // Бот создан, но так и не подключился к нам — заявленные Attendee
+        // ретраи (до 30 раз по 2с) и запуск Chrome не уложились в отведённое
+        // время. Закрываемся сразу и внятно, а не сидим в пустой комнате.
+        await backend.failed(meta.callId, 'звук встречи так и не подключился').catch(() => {});
+        attendeeHub.close();
+        try { await ctx.room.disconnect(); } catch {}
+        return;
+      }
+      // Обрыв посреди встречи: без обработчика 'close' ассистент говорил бы
+      // в пустоту до двухчасового потолка, а вход тикал бы тишиной —
+      // неотличимо от «никто не говорит». Сама подписка — НИЖЕ, после
+      // session.start(): здесь, в точке получения attendeeWs, переменная
+      // session ещё не объявлена (см. отчёт по ревью 07.09.2026).
       console.log('[meet] звук Attendee на связи');
     }
 
@@ -515,7 +549,13 @@ export default defineAgent({
 
     // Разметка говорящего. LiveKit определяет активного сам — считать
     // громкость руками не нужно.
-    if (isMeeting) {
+    //
+    // НЕ для Meet: наша комната там пуста по замыслу (звук идёт вебсокетом,
+    // второй комнаты нет), и подписка слушала бы тишину — на каждый пустой
+    // тик currentSpeaker затирался бы обратно в undefined, перетирая
+    // значение, которое ведёт presence из вебхука meet_speaking (обработчик
+    // meet_speaking в DataReceived выше). Находка ревью 07.09.2026.
+    if (isMeeting && !isMeet) {
       (foreign ?? ctx.room).on(RoomEvent.ActiveSpeakersChanged, (speakers: any[]) => {
         // Берём первого: при перебивании активных несколько, а реплика в
         // транскрипте одна. Разметка приблизительная, и здесь это видно прямо.
@@ -697,6 +737,10 @@ export default defineAgent({
       // метода close() у него, в отличие от ExternalRoomAudioOutput, тоже —
       // публиковать и снимать дорожку здесь нечего.
       try { attendeeWs?.close(); } catch {}
+      // Хаб теперь одноразовый, на задание, — держит занятый порт до сих
+      // пор, если не закрыть явно. Раньше close() не вызывался вовсе: хаб
+      // жил на уровне модуля и порт освобождать было незачем.
+      attendeeHub?.close();
     });
 
     // Свой вход выставляем ДО start() — это поддержанный фреймворком порядок.
@@ -789,6 +833,19 @@ export default defineAgent({
         ...(isMeeting ? { inputOptions: { closeOnDisconnect: false } } : {}),
       });
 
+      if (isMeet && attendeeWs) {
+        // Подписка на обрыв — ЗДЕСЬ, а не в точке получения attendeeWs выше:
+        // там session ещё не была объявлена (session = new voice.AgentSession
+        // создаётся ниже по файлу, а старая последовательность ждала звук ещё
+        // до неё). Без этого обработчика ассистент говорил бы в пустоту до
+        // двухчасового потолка, а вход тикал бы тишиной — неотличимо от
+        // «никто не говорит».
+        attendeeWs.on('close', () => {
+          console.log('[meet] звук Attendee оборвался — закрываем сессию');
+          void backend.failed(meta.callId, 'звук встречи оборвался').catch(() => {});
+          void session.close().catch(() => {});
+        });
+      }
 
       // Первую фразу задаём явно, а не отдаём модели на импровизацию.
       //
