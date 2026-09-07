@@ -12,9 +12,17 @@ function makeService(opts: { claim?: any[]; used?: number; alreadyFinal?: boolea
         const rows = opts.claim ?? [{ id: 't-1', prompt: 'go', channel: 'web', user_id: 'u-1' }];
         return { rows, rowCount: rows.length };
       }
-      // rowCount = 0 моделирует «ход уже финализирован»: сторож
-      // `AND status = 'running'` не нашёл строки, и повтор обязан стать no-op.
-      if (sql.includes("AND status = 'running'")) {
+      // Диспетчеризация по `SET status = $2` — намеренно НЕ по литералу
+      // `AND status = 'running'`, хотя тот выглядит естественнее. Иначе мок
+      // маршрутизировал бы по той же строке, которую охраняет утверждение, и
+      // мутация «снять сторож состояния» одновременно снимала бы триггер
+      // мок-ветки: запрос начал бы отдавать rowCount 0 всегда, сервис считал
+      // бы ход финализированным, и тест на повтор остался бы зелёным именно
+      // тогда, когда защита сломана.
+      //
+      // rowCount = 0 моделирует «ход уже финализирован»: сторож не нашёл
+      // строки, и повтор обязан стать no-op.
+      if (sql.includes('SET status = $2')) {
         return { rows: [], rowCount: opts.alreadyFinal ? 0 : 1 };
       }
       return { rows: [], rowCount: 0 };
