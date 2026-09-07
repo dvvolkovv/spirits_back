@@ -28,6 +28,11 @@ describe('ProductsService.list', () => {
     await svc.list('79030169187');
 
     expect(calls[0].params).toEqual(['79030169187']);
+    // Оба условия WHERE проверяются отдельно. Утверждение только про архивные
+    // оставляет фильтр владельца без сторожа, а этот метод отдаёт коллекцию:
+    // снятый предикат вернёт клиенту чужие продукты списком, вместе с их
+    // checkout_path, domain и host_ip.
+    expect(calls[0].sql).toContain('user_id = $1');
     expect(calls[0].sql).toContain('archived_at IS NULL');
   });
 });
@@ -51,6 +56,11 @@ describe('ProductsService.getOwned', () => {
     // форму вызова, а не участие параметра в фильтрации: убери `AND user_id =
     // $2` из запроса, оставив параметр на месте, — и тест останется зелёным.
     expect(calls[0].sql).toContain('user_id = $2');
+    // На getOwned завязаны все три клиентских маршрута из Task 8 — chat,
+    // history и revert. Без этого условия заархивированный продукт останется
+    // полностью управляемым по прямому id: клиент продолжит гонять агента в
+    // чекауте продукта, выведенного из эксплуатации.
+    expect(calls[0].sql).toContain('archived_at IS NULL');
     expect(calls[0].params).toEqual(['p-1', '70000000000']);
   });
 });
