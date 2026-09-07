@@ -182,7 +182,18 @@ export class TurnsService {
     );
 
     if (claimed.rowCount !== 1) {
-      this.logger.warn(`complete: ход ${turnId} уже финализирован, повтор проигнорирован`);
+      // Тихий успех для раннера здесь правильный — ретрай не должен получать
+      // ошибку. Но в лог нужно писать то, что есть, а не догадку: `rowCount`
+      // не единица наступает в трёх разных случаях, и только один из них
+      // повтор. Битый `turnId` и ход, который раннер завершает не забрав,
+      // означают сломанного раннера, получающего `{ok: true}` бесконечно.
+      const d = await this.pg.query(`SELECT status FROM product_turns WHERE id = $1`, [turnId]);
+      const actual = d.rows[0]?.status;
+      this.logger.warn(
+        actual
+          ? `complete: ход ${turnId} в статусе ${actual}, а не running — повтор проигнорирован`
+          : `complete: ход ${turnId} не найден`,
+      );
       return;
     }
 
