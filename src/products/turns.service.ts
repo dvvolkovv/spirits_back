@@ -317,24 +317,25 @@ export class TurnsService {
   }
 
   /**
-   * Владение здесь НЕ проверяется — историю отдаёт контроллер после
-   * `getOwned`. Это осознанное исключение из правила, по которому статус
-   * продукта, баланс и владение переехали в `enqueue`: там два входа (web и
-   * telegram), а история пока читается только из веба.
+   * Владение проверяется здесь же, второй линией к `getOwned` в контроллере.
    *
-   * Если появится телеграм-вход в историю — переносить проверку сюда, тем же
-   * приёмом, что в `enqueue`. Иначе он унаследует остальное даром и молча
-   * останется без владения.
+   * Одной контроллерной проверки мало по измеренной причине: тест на порядок
+   * вызовов через `invocationCallOrder` не ловит потерю `await` перед
+   * `getOwned` — он фиксирует момент обращения, а не завершения. У `chat` и
+   * `revert` вторая линия есть, потому что `enqueue` перепроверяет владение в
+   * SQL; у истории её не было, и потерянный `await` открывал бы чтение чужой
+   * истории правок прод-кода по угаданному UUID.
    */
-  async history(productId: string) {
+  async history(productId: string, userId: string) {
     const r = await this.pg.query(
-      `SELECT id, channel, prompt, result, status, sha_before, sha_after,
-              revert_to_sha, tokens_spent, error, created_at, finished_at
-         FROM product_turns
-        WHERE product_id = $1
-        ORDER BY created_at DESC
+      `SELECT t.id, t.channel, t.prompt, t.result, t.status, t.sha_before, t.sha_after,
+              t.revert_to_sha, t.tokens_spent, t.error, t.created_at, t.finished_at
+         FROM product_turns t
+         JOIN products p ON p.id = t.product_id
+        WHERE t.product_id = $1 AND p.user_id = $2 AND p.archived_at IS NULL
+        ORDER BY t.created_at DESC
         LIMIT 50`,
-      [productId],
+      [productId, userId],
     );
     return r.rows;
   }

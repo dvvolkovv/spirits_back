@@ -1,5 +1,5 @@
-import { Body, Controller, Get, Param, Post, Res, UseGuards } from '@nestjs/common';
-import { Response } from 'express';
+import { Body, Controller, Get, Param, Post, Req, Res, UseGuards } from '@nestjs/common';
+import { Request, Response } from 'express';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { ProductsService } from './products.service';
@@ -23,7 +23,7 @@ export class ProductsController {
   @Get('products/:id/turns')
   async history(@CurrentUser() user: any, @Param('id') id: string, @Res() res: Response) {
     await this.products.getOwned(id, user.userId);
-    return res.status(200).json(await this.turns.history(id));
+    return res.status(200).json(await this.turns.history(id, user.userId));
   }
 
   /**
@@ -41,6 +41,7 @@ export class ProductsController {
     @CurrentUser() user: any,
     @Param('id') id: string,
     @Body() body: { prompt: string },
+    @Req() req: Request,
     @Res() res: Response,
   ) {
     await this.products.getOwned(id, user.userId);
@@ -56,10 +57,24 @@ export class ProductsController {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('X-Accel-Buffering', 'no');
 
+    // Обрыв клиента прекращает чтение. Без этого генератор крутится до своего
+    // предела в 15 минут, опрашивая Redis и Postgres ради ответа, который
+    // некому принять: nginx рвёт соединение по proxy_read_timeout заметно
+    // раньше, а воркер Node всё это время занят. На параллельных ходах это
+    // накопительная утечка.
+    //
+    // Ход при этом не прерывается — он живёт на VM и договорит сам. Клиент
+    // дочитает результат из истории.
+    let clientGone = false;
+    req.on('close', () => {
+      clientGone = true;
+    });
+
     for await (const event of this.turnEvents.readEvents(id, turn.id)) {
+      if (clientGone) break;
       res.write(JSON.stringify(event) + '\n');
     }
-    res.end();
+    if (!clientGone) res.end();
   }
 
   @Post('products/:id/turns/:turnId/revert')

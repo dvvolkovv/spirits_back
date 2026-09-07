@@ -27,11 +27,12 @@ function makeService(
       if (sql.includes('SET status = $3')) {
         return { rows: [], rowCount: opts.alreadyFinal ? 0 : 1 };
       }
-      // Диспетчеризация по `SELECT id, channel` — не по `LIMIT 50` и не по
-      // `ORDER BY created_at DESC`, которые проверяют утверждения ниже: иначе
-      // снятие любого из них одновременно отключило бы саму мок-ветку, и
-      // запрос ушёл бы в безобидный дефолт вместо демонстрации сломанного SQL.
-      if (sql.includes('SELECT id, channel')) {
+      // Диспетчеризация по `SELECT t.id, t.channel` — не по `LIMIT 50`, не по
+      // `ORDER BY created_at DESC` и не по `p.user_id = $2`/`archived_at`,
+      // которые проверяют утверждения ниже: иначе снятие любого из них
+      // одновременно отключило бы саму мок-ветку, и запрос ушёл бы в
+      // безобидный дефолт вместо демонстрации сломанного SQL.
+      if (sql.includes('SELECT t.id, t.channel')) {
         return { rows: opts.historyRows ?? [], rowCount: opts.historyRows?.length ?? 0 };
       }
       return { rows: [], rowCount: 0 };
@@ -221,14 +222,20 @@ describe('TurnsService.history', () => {
     ];
     const { svc, calls } = makeService({ historyRows });
 
-    await expect(svc.history('p-1')).resolves.toEqual(historyRows);
+    await expect(svc.history('p-1', 'u-1')).resolves.toEqual(historyRows);
 
-    expect(calls[0].sql).toContain('WHERE product_id = $1');
-    expect(calls[0].params).toEqual(['p-1']);
+    expect(calls[0].sql).toContain('WHERE t.product_id = $1');
+    expect(calls[0].params).toEqual(['p-1', 'u-1']);
+    // Владение — вторая линия к проверке в контроллере. Тест на порядок
+    // вызовов через invocationCallOrder не ловит потерю await перед
+    // getOwned (он фиксирует момент обращения, а не завершения), поэтому
+    // гарантия обязана быть и здесь, в самом запросе.
+    expect(calls[0].sql).toContain('p.user_id = $2');
+    expect(calls[0].sql).toContain('p.archived_at IS NULL');
     // Без сортировки клиент увидел бы историю в порядке, зависящем от плана
     // Postgres, — на проде это часто совпадает с created_at ASC, то есть
     // «сначала самый старый ход» вместо ожидаемого «сначала последний».
-    expect(calls[0].sql).toContain('ORDER BY created_at DESC');
+    expect(calls[0].sql).toContain('ORDER BY t.created_at DESC');
     // Без LIMIT продукт с сотнями ходов отдаёт всю историю одним запросом —
     // и это ловится именно здесь, а не на статических 2 строках мока.
     expect(calls[0].sql).toContain('LIMIT 50');
