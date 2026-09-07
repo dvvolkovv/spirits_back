@@ -3,6 +3,7 @@ import { CommonModule } from '../common/common.module';
 import { VoiceCallModule } from '../voice-call/voice-call.module';
 import { MeetingController } from './meeting.controller';
 import { MeetingService } from './meeting.service';
+import { MeetWebhookController } from './meet-webhook.controller';
 import { RoomModule } from './room.module';
 
 /**
@@ -20,7 +21,7 @@ import { RoomModule } from './room.module';
  */
 @Module({
   imports: [CommonModule, RoomModule, forwardRef(() => VoiceCallModule)],
-  controllers: [MeetingController],
+  controllers: [MeetingController, MeetWebhookController],
   providers: [MeetingService],
   exports: [MeetingService],
 })
