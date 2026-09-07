@@ -51,6 +51,20 @@ describe('RunnerController.poll', () => {
     expect(Object.keys(res.turn!).sort()).toEqual(['id', 'prompt', 'revertToSha', 'userId'].sort());
   });
 
+  it('heartbeat пишется до выдачи задания, а не после', async () => {
+    // Порядок наблюдаем, а не косметичен. Если продукт в degraded, touchRunner
+    // возвращает его в running — и claimNext, отбирающий только по
+    // p.status = 'running', выдаст ход в том же цикле. Обратный порядок отдал
+    // бы turn: null, и работа поехала бы только следующим опросом.
+    const { ctrl, turns } = makeController(null);
+
+    await ctrl.poll(req() as any);
+
+    expect(turns.touchRunner.mock.invocationCallOrder[0]).toBeLessThan(
+      turns.claimNext.mock.invocationCallOrder[0],
+    );
+  });
+
   it('пустая очередь — turn: null, а не ошибка', async () => {
     const { ctrl } = makeController(null);
 
