@@ -79,6 +79,10 @@ export class RunnerController {
     for (const event of body.events ?? []) {
       await this.turnEvents.appendEvent(req.product.id, id, event);
     }
+    // Признак жизни идущего хода. Без него сборщик отбирает по длительности —
+    // то есть по догадке о смерти — и снимает замок под легитимно длинным
+    // ходом, после чего рядом стартует второй claude -p в том же чекауте.
+    await this.turns.markProgress(id, req.product.id);
     return { ok: true };
   }
 }

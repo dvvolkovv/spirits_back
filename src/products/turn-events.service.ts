@@ -61,6 +61,10 @@ export class TurnEventsService {
   ): AsyncGenerator<any> {
     const key = this.eventsKey(productId, turnId);
     let cursor = 0;
+    // 1800 тиков по 500 мс = 15 минут. Порог ПАРНЫЙ к сборщику зависших в
+    // TurnsService.reapStuck (30 минут): читатель обязан сдаваться раньше,
+    // чем ход помечается неудачным, иначе клиент получит два терминальных
+    // события подряд. Менять только вместе.
     for (let tick = 0; tick < 1800; tick++) {
       if (isCancelled()) return;
       const batch = await this.redis.lrange(key, cursor, -1);

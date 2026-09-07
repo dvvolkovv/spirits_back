@@ -5,6 +5,7 @@ function makeController(claimResult: any) {
     claimNext: jest.fn(async () => claimResult),
     complete: jest.fn(async () => undefined),
     touchRunner: jest.fn(async () => undefined),
+    markProgress: jest.fn(async () => undefined),
   };
   const turnEvents = {
     appendEvent: jest.fn(async () => undefined),
@@ -137,5 +138,16 @@ describe('RunnerController.events', () => {
 
     await expect(ctrl.events(req() as any, 't-1', {} as any)).resolves.toEqual({ ok: true });
     expect(turnEvents.appendEvent).not.toHaveBeenCalled();
+  });
+
+  it('зовёт markProgress с продуктом из guard, а не из URL', async () => {
+    // Без этой отметки сборщик зависших видит идущий ход мёртвым по чистой
+    // длительности и снимает с него замок — а второй claude -p стартует в
+    // том же чекауте, что и живой раннер.
+    const { ctrl, turns } = makeController(null);
+
+    await ctrl.events(req() as any, 't-1', { events: [{ type: 'item' }] } as any);
+
+    expect(turns.markProgress).toHaveBeenCalledWith('t-1', 'p-1');
   });
 });
