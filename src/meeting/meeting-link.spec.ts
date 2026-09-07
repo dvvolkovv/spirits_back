@@ -151,7 +151,31 @@ describe('parseMeetingLink', () => {
       expect(parseMeetingLink('https://meet.google.com/lookup/abc-defg-hij')).toBeNull();
     });
 
-    it('ссылки трёх провайдеров не путаются', () => {
+    it('находит код при полностью капсовом URL', () => {
+      // Канонический код Meet строчный, но протокол, хост и код могут прийти
+      // в любом регистре — отсюда /i в регулярке, а не голый [a-z].
+      expect(parseMeetingLink('HTTPS://MEET.GOOGLE.COM/ABC-DEFG-HIJ')).toEqual({
+        provider: 'meet', code: 'abc-defg-hij',
+      });
+    });
+
+    it('битый код своей комнаты не скрывает валидную ссылку Meet', () => {
+      // `return null` в ветке linkeon съедал всё сообщение целиком: карточка
+      // не показывалась, хотя ссылка на живую встречу в нём была.
+      expect(parseMeetingLink('https://my.linkeon.io/room/ABC01D и https://meet.google.com/abc-defg-hij')).toEqual({
+        provider: 'meet', code: 'abc-defg-hij',
+      });
+    });
+
+    it('при двух ссылках разных площадок выигрывает порядок проверки, а не текста', () => {
+      // Фиксируем фактическое поведение: ветви идут linkeon → talerid → meet,
+      // и своя комната побеждает даже стоя второй в тексте. Выбор «первая по
+      // позиции» — отдельное решение, здесь его нет.
+      const text = 'https://meet.google.com/abc-defg-hij потом https://my.linkeon.io/room/ABC234';
+      expect(parseMeetingLink(text)).toEqual({ provider: 'linkeon', code: 'ABC234' });
+    });
+
+    it('каждая площадка узнаётся по отдельности', () => {
       expect(parseMeetingLink('https://my.linkeon.io/room/ABC234')?.provider).toBe('linkeon');
       expect(parseMeetingLink('https://api.talerid.io/room/36fc367a')?.provider).toBe('talerid');
       expect(parseMeetingLink('https://meet.google.com/abc-defg-hij')?.provider).toBe('meet');
