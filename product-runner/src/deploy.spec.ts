@@ -27,6 +27,27 @@ describe('checkHealth', () => {
     await expect(checkHealth('https://x/api/healthz', fetchFn as any)).resolves.toBe(false);
   });
 
+  it('HTML по content-type нездоров даже без doctype в теле', async () => {
+    // Изолирует проверку заголовка. В общем тесте про SPA-фолбэк ответ
+    // одновременно и text/html, и с doctype — там любая из двух защит ловит
+    // случай в одиночку, поэтому снятие любой из них проходило незамеченным.
+    const fetchFn = jest.fn(async () =>
+      response({ status: 200, contentType: 'text/html; charset=utf-8', body: '<div>root</div>' }),
+    );
+
+    await expect(checkHealth('https://x/api/healthz', fetchFn as any)).resolves.toBe(false);
+  });
+
+  it('doctype в теле нездоров даже при честном content-type', async () => {
+    // Изолирует проверку тела: заголовок может соврать, а страница-заглушка
+    // прийти под application/json.
+    const fetchFn = jest.fn(async () =>
+      response({ status: 200, contentType: 'application/json', body: '<!doctype html><div id="root">' }),
+    );
+
+    await expect(checkHealth('https://x/api/healthz', fetchFn as any)).resolves.toBe(false);
+  });
+
   it('5xx — нездоров', async () => {
     const fetchFn = jest.fn(async () => response({ status: 502, contentType: 'text/plain', body: 'bad gateway' }));
 
@@ -122,6 +143,10 @@ describe('deploy', () => {
       onPhase: (p) => phases.push(p),
     });
 
-    expect(phases.length).toBeGreaterThan(0);
+    // Не `length > 0`: это остаётся истиной за счёт фазы проверки здоровья
+    // вне сборки, и снятие отчёта из bringUp проходило незамеченным.
+    expect(phases).toEqual(
+      expect.arrayContaining([expect.stringContaining('сборка'), expect.stringContaining('перезапуск')]),
+    );
   });
 });

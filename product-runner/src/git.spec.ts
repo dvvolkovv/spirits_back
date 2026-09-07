@@ -71,7 +71,10 @@ describe('Git — настоящий child_process', () => {
     const sentinel = path.join(dir, 'pwned');
     // Git без инжектированного раннера — идёт настоящий execFile.
     const git = new Git(dir);
-    await git.commitAll(`правка"; touch ${sentinel}; echo "`);
+    // Payload намеренно БЕЗ вложенных кавычек. С ними они замыкают друг
+    // друга при склейке в строку, точка с запятой теряет спецсмысл, и
+    // мутация exec/execFile проходит незамеченной — проверено.
+    await git.commitAll(`правка; touch ${sentinel} #`);
 
     expect(fs.existsSync(sentinel)).toBe(false);
     // И сообщение сохранилось буквально, а не обрезалось по разделителю.
