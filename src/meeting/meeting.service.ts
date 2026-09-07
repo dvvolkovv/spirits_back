@@ -130,6 +130,11 @@ export class MeetingService {
     let title: string;
     let roomName: string;
     let external: { url: string; token: string } | undefined;
+    // Id бота держим в переменной функции, а не только в базе: если упадёт
+    // сам UPDATE external_bot_id, в базе его не будет, а бот в встрече уже
+    // будет — и реапер, который ищет по непустому external_bot_id, такого
+    // никогда не найдёт. leave() тоже не поможет: там id тоже пуст.
+    let botId: string | null = null;
 
     if (isMeet) {
       // За информацией о встрече идти некуда: публичной ручки «существует ли
@@ -183,9 +188,10 @@ export class MeetingService {
         // Причина уже в логе клиента. Наружу — внятный отказ: молчаливое 500
         // выглядит поломкой, а это может быть просто выключенный Attendee.
         if (!bot) throw new ConflictException({ message: 'meeting bot is unavailable' });
+        botId = bot.botId;
         await this.pg.query(
           `UPDATE voice_calls SET external_bot_id = $1 WHERE id = $2`,
-          [bot.botId, callId],
+          [botId, callId],
         );
       }
 
@@ -224,6 +230,11 @@ export class MeetingService {
         callbackUrl: `${process.env.BACKEND_URL || 'https://my.linkeon.io'}/webhook/voice-call/internal`,
       });
     } catch (e: any) {
+      // Бот уже сидит в встрече — убираем его прежде всего остального.
+      // По значению из памяти, потому что в базе его может не быть: ровно
+      // этот UPDATE и мог упасть. Ошибку уборки глушим: наружу должна уйти
+      // исходная причина отказа, а не вторичная.
+      if (botId) await this.attendee.removeBot(botId).catch(() => {});
       // Запись, оставшаяся в 'dialing', намертво блокирует пользователю
       // следующую попытку — лимит «один активный вход» смотрит именно на неё.
       this.logger.error(`[join] call=${callId} не поднялся: ${e?.message}`);
@@ -272,7 +283,10 @@ export class MeetingService {
       const call = await this.calls.load(callId);
       if (call?.external_bot_id) await this.attendee.removeBot(call.external_bot_id);
     } catch (e: any) {
-      this.logger.warn(`[leave] бот call=${callId} не выведен: ${e?.message}`);
+      // Причиной может быть и calls.load() (звонка нет вовсе), а не только
+      // removeBot — сообщение про «бота» тогда сбивает с толку тем, что
+      // звонок вообще не найден. Формулировка нейтральна к обеим причинам.
+      this.logger.warn(`[leave] уборка бота для call=${callId} не состоялась: ${e?.message}`);
     }
     await this.calls.markInterruptedKeepingRoom(callId);
   }
