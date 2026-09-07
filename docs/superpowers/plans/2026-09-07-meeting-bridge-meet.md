@@ -239,81 +239,48 @@ ssh dv@85.192.61.231 'cd ~/ci/spirits_back && source ~/.nvm/nvm.sh && npx tsc --
 
 ### Task 1: Поднять Attendee на отдельном хосте
 
-**Files:**
-- Create: `spirits_back/infra/attendee/docker-compose.yml`
-- Create: `spirits_back/infra/attendee/README.md`
+**Процедура целиком — в `infra/attendee/README.md`.** Здесь только то, в чём
+первая редакция плана ошибалась, и решение, которое из этого вышло.
 
-Прод не подходит: там уже API, Postgres, Redis, Neo4j и LiveKit, а каждый бот —
-полный Chrome. Конкуренция за CPU ударит по SFU.
+⚠️ **В первой редакции здесь лежал `docker-compose.yml` с образом
+`attendeelabs/attendee:v0.5.0`. Такого образа не существует** — я его выдумал.
+Attendee **собирается из исходников**: `docker compose -f
+dev.docker-compose.yaml build`, затем `init_env.py > .env`, затем `migrate`,
+затем аккаунт и API-ключ через UI (письмо подтверждения приходит в логи
+контейнера). Postgres и Redis поднимает его собственный compose — наши трогать
+не нужно, то есть свой compose нам вообще не нужен.
 
-- [ ] **Step 1: Завести compose**
+⚠️ **Celery-режим по умолчанию не годится для продакшена**, и это сказано в
+README Attendee прямым текстом: несколько ботов в одном контейнере делят
+аудиоустройства, и звук разных встреч может перетекать; плюс рестарт
+выбрасывает живых ботов. Правильный режим — `LAUNCH_BOT_METHOD="kubernetes"`,
+по поду на бота, но официальные инструкции к нему — **в платном плане**.
 
-```yaml
-# spirits_back/infra/attendee/docker-compose.yml
-#
-# Версия образа ЗАПИНЕНА. Attendee ходит по живой вёрстке Google Meet, и
-# `latest` сломает встречу в неожиданный момент — ровно та ошибка, которую
-# infra/livekit/README.md описывает про уехавший тег.
-services:
-  attendee:
-    image: attendeelabs/attendee:v0.5.0
-    container_name: attendee-linkeon
-    restart: unless-stopped
-    env_file: ./.env
-    ports:
-      - "8000:8000"
-    depends_on: [postgres, redis]
-    # Бот запускает Chrome; shm по умолчанию 64 МБ, и вкладка Meet падает.
-    shm_size: "2gb"
+**Решение на v1: жёсткий потолок в одну одновременную встречу.** При одном боте
+перетекать нечему. Потолок держится нашей стороной, а не надеждой:
+`ATTENDEE_WS_PORT_MIN=ATTENDEE_WS_PORT_MAX=8140` в `voice-host/.env` (второе
+задание не найдёт порта и честно откажет), та же цифра в регулярке nginx, и
+проверка активных звонков в `deploy.sh` — встречу Meet видно там же по
+`provider='meet'`.
 
-  postgres:
-    image: postgres:16
-    container_name: attendee-pg
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: attendee
-      POSTGRES_USER: attendee
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    volumes: [attendee-pg:/var/lib/postgresql/data]
-
-  redis:
-    image: redis:7
-    container_name: attendee-redis
-    restart: unless-stopped
-
-volumes:
-  attendee-pg:
-```
-
-- [ ] **Step 2: Поднять и убедиться, что API отвечает**
-
-```bash
-docker compose -f infra/attendee/docker-compose.yml up -d
-curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8000/
-```
-
-Ожидается: `200` либо `302` (редирект на логин UI). Любой `5xx` — смотреть
-`docker logs attendee-linkeon`.
-
-- [ ] **Step 3: Завести проект и API-ключ**
-
-Через UI на `:8000`: создать проект, выпустить API-ключ. Ключ положить в
-`.env` бэкенда как `ATTENDEE_API_KEY`, базовый адрес — `ATTENDEE_BASE_URL`.
-В git ключи не кладём — как и в `infra/livekit`.
-
-- [ ] **Step 4: Записать процедуру в README**
-
-Скопировать структуру `infra/livekit/README.md`: где живёт, как применять
-конфиг, что рестарт рвёт активные встречи, как проверить здоровье.
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 1: Поднять по `infra/attendee/README.md`**, зафиксировав коммит
+      Attendee (не `latest`: он ходит по живой вёрстке Meet).
+- [ ] **Step 2: Записать sha** зафиксированного коммита в тот же README.
+- [ ] **Step 3: Хранилище записей — на MinIO**, а не AWS. Записи нам не нужны,
+      но переменные требуются; заводить платный аккаунт ради неиспользуемой
+      функции незачем, а MinIO уже есть.
+- [ ] **Step 4: Nginx** — положить `infra/attendee/nginx-attendee.conf`,
+      подставив адрес хоста Attendee. Диапазон в регулярке обязан совпадать с
+      портами воркера, иначе `proxy_pass` на `$1` — это SSRF на любой
+      локальный порт.
+- [ ] **Step 5: Проверить** три curl-а из README (API, ключ, наш вебсокет
+      снаружи).
+- [ ] **Step 6: Commit**
 
 ```bash
 git add infra/attendee/
-git commit -m "infra(attendee): compose и процедура запуска на отдельном хосте"
+git commit -m "infra(attendee): процедура запуска и nginx для приёма звука"
 ```
-
----
 
 ### Task 2: Спайк — гейт
 
