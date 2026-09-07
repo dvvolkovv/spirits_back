@@ -61,11 +61,13 @@ describe('Mixer', () => {
 
   test('кадр короче тика дополняется тишиной', () => {
     const m = new Mixer();
-    m.push('alice', Int16Array.from({ length: 10 }, () => 500));
+    // Уровень ниже NOISE_FLOOR_RMS: тест о геометрии кадра, а не о громкости,
+    // и выравнивание не должно в него вмешиваться.
+    m.push('alice', Int16Array.from({ length: 10 }, () => 100));
     const out = m.tick();
     assert.equal(out.length, SAMPLES_PER_TICK);
-    assert.equal(out[0], 500);
-    assert.equal(out[9], 500);
+    assert.equal(out[0], 100);
+    assert.equal(out[9], 100);
     assert.equal(out[10], 0);
   });
 
@@ -99,11 +101,13 @@ describe('Mixer', () => {
     // Во встрече важна свежая речь: если копить, задержка только растёт.
     const m = new Mixer();
     for (let i = 0; i < 200; i++) m.push('alice', frame(1));
-    m.push('alice', frame(777));
+    // Метка ниже NOISE_FLOOR_RMS: тест про вытеснение из очереди, и
+    // выравнивание громкости не должно менять искомое значение.
+    m.push('alice', frame(200));
     // Вычерпываем буфер и проверяем, что свежий кадр в нём остался.
     let seen = false;
     for (let i = 0; i < Mixer.MAX_BUFFERED_TICKS + 2; i++) {
-      if (m.tick()[0] === 777) seen = true;
+      if (m.tick()[0] === 200) seen = true;
     }
     assert.ok(seen, 'свежий кадр вытеснили вместо старого');
   });
@@ -115,5 +119,81 @@ describe('Mixer', () => {
     assert.equal(m.tick()[0], 150);
     // у bob данные кончились, у alice остался второй тик
     assert.equal(m.tick()[0], 100);
+  });
+});
+
+/**
+ * Выравнивание громкости. Встреча 07.09.2026: аудио троих участников дошло до
+ * микшера, а в транскрипт попал в основном владелец — у остальных остались
+ * обрывки. Складывая дорожки как есть, мы сохраняли разницу микрофонов.
+ */
+describe('Mixer — выравнивание громкости', () => {
+  /** Кадр-«речь» заданного уровня: знакопеременный, чтобы RMS был равен |value|. */
+  function speech(level: number, ticks = 1): Int16Array {
+    return Int16Array.from({ length: SAMPLES_PER_TICK * ticks }, (_, i) =>
+      i % 2 === 0 ? level : -level,
+    );
+  }
+
+  test('тихого поднимаем к целевому уровню', () => {
+    const m = new Mixer();
+    // Гоняем достаточно кадров, чтобы скользящая оценка дошла до уровня.
+    for (let i = 0; i < 200; i++) m.push('quiet', speech(500));
+    assert.ok(m.gainFor('quiet') > 3, `усиление ${m.gainFor('quiet')} — тихого не подняли`);
+  });
+
+  test('громкого не трогаем — только вверх, никогда вниз', () => {
+    const m = new Mixer();
+    for (let i = 0; i < 200; i++) m.push('loud', speech(12_000));
+    assert.equal(m.gainFor('loud'), 1);
+  });
+
+  test('усиление ограничено потолком — шум микрофона не станет громче речи', () => {
+    const m = new Mixer();
+    for (let i = 0; i < 200; i++) m.push('verysoft', speech(Mixer.NOISE_FLOOR_RMS + 1));
+    assert.equal(m.gainFor('verysoft'), Mixer.MAX_GAIN);
+  });
+
+  test('тишина оценку не портит — усиления нет, пока не было речи', () => {
+    const m = new Mixer();
+    for (let i = 0; i < 200; i++) m.push('silent', speech(10));
+    assert.equal(m.gainFor('silent'), 1);
+  });
+
+  test('паузы не задирают усиление говорившему', () => {
+    const m = new Mixer();
+    for (let i = 0; i < 200; i++) m.push('alice', speech(4000));
+    const во_время_речи = m.gainFor('alice');
+    for (let i = 0; i < 500; i++) m.push('alice', speech(5)); // долгая пауза
+    assert.equal(m.gainFor('alice'), во_время_речи);
+  });
+
+  test('тихий и громкий после сведения сопоставимы', () => {
+    const m = new Mixer();
+    for (let i = 0; i < 200; i++) {
+      m.push('loud', speech(9000));
+      m.push('quiet', speech(900));
+    }
+    // Считаем вклад каждого в сведение по отдельности: их усиления и есть
+    // ответ на вопрос, утонет ли тихий.
+    const вклад_громкого = 9000 * m.gainFor('loud');
+    const вклад_тихого = 900 * m.gainFor('quiet');
+    const было = 9000 / 900; // разрыв микрофонов до выравнивания
+    const стало = вклад_громкого / вклад_тихого;
+    assert.ok(
+      стало <= было / 3,
+      `разрыв ${стало.toFixed(1)}× против ${было}× — выравнивание почти не помогло`,
+    );
+  });
+
+  test('статистика отличает «молчал» от «звука не было»', () => {
+    const m = new Mixer();
+    for (let i = 0; i < 10; i++) m.push('talker', speech(5000));
+    for (let i = 0; i < 10; i++) m.push('listener', speech(5)); // микрофон есть, речи нет
+    const s = Object.fromEntries(m.stats().map((x) => [x.participant, x]));
+    assert.equal(s.talker.frames, 10);
+    assert.equal(s.talker.speechFrames, 10);
+    assert.equal(s.listener.frames, 10);
+    assert.equal(s.listener.speechFrames, 0);
   });
 });

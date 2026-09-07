@@ -19,6 +19,7 @@ import { backend, type TranscriptEntry } from './backend.js';
 import { PendingAnswers } from './pending.js';
 import { NameGate } from './name-gate.js';
 import { Occupancy } from './occupancy.js';
+import { SpeakerLedger } from './speaker-ledger.js';
 import { MixedRoomAudioInput } from './mixed-audio-input.js';
 import { ExternalRoomAudioOutput } from './external-room-output.js';
 import { Room as ExternalRoom } from '@livekit/rtc-node';
@@ -99,8 +100,18 @@ export default defineAgent({
     const transcript: TranscriptEntry[] = [];
     let audioIn = 0;
     let audioOut = 0;
+    /** Часть audioIn, приехавшая из кеша: у Realtime она дешевле в разы. */
+    let cachedAudioIn = 0;
 
-    /** Кто из участников говорит сейчас. Только на встрече. */
+    /**
+     * Кто сколько говорил с прошлой реплики. Только на встрече.
+     *
+     * Не снимок «кто активен сейчас»: коммит реплики приходит, когда человек
+     * уже замолчал, и снимок к этому моменту пуст или показывает следующего.
+     * Подробно — в speaker-ledger.ts.
+     */
+    const speakers = isMeeting ? new SpeakerLedger(Date.now()) : null;
+    /** Говорящий последней зафиксированной реплики — его же видит гейт. */
     let currentSpeaker: string | undefined;
 
     const gate = isMeeting ? new NameGate(agentName, FOLLOWUP_WINDOW_MS) : null;
@@ -246,6 +257,58 @@ export default defineAgent({
       flushPending();
     }
 
+    /**
+     * Ответ по решению гейта, отложенный до момента, когда модель освободится.
+     *
+     * Почему не отдавать сразу. `session.generateReply()` во время речи не
+     * отбивается — LiveKit кладёт запрос в свою очередь (agent_activity.js,
+     * speechQueue), а очередь ЦЕЛИКОМ вычищается, как только кто-то заговорил
+     * (там же, clear() при перебивании). На встрече это значит: пока Роман
+     * произносит одну фразу, к нему успевают обратиться ещё раз-другой, все
+     * обращения уходят в очередь, следующая же чужая реплика их стирает — и
+     * ответа не будет ни на одно. Встреча 07.09.2026: гейт дал ход 129 раз,
+     * прозвучало 45 ответов. Ровно это участники и описали словами «он не
+     * отвечает, когда спрашиваем мы».
+     *
+     * Держим ОДНО обращение — последнее. Копить их незачем: человек, не
+     * дождавшись ответа, переспрашивает, и отвечать надо на переспрос, а не
+     * зачитывать вслух всю очередь.
+     */
+    let deferredReply: { instructions: string; at: number } | null = null;
+
+    /**
+     * Сколько отложенный ответ ещё уместен. Полминуты — столько же, сколько
+     * живёт окно продолжения гейта: за этой чертой разговор ушёл дальше, и
+     * ответ на позапрошлый вопрос звучит невпопад. Именно так это и выглядело
+     * в записи — ответ приходил к реплике, которая была минуту назад.
+     */
+    const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
+
+    /** Дать модели ход сейчас или отложить, если она говорит или думает. */
+    function replyOrDefer(instructions: string): void {
+      if (pending.isBusy) {
+        deferredReply = { instructions, at: Date.now() };
+        return;
+      }
+      replySafe({ instructions });
+    }
+
+    /** Освободилась — отдать отложенное, если оно ещё не протухло. */
+    function flushDeferred(): void {
+      if (!deferredReply || pending.isBusy) return;
+      const d = deferredReply;
+      deferredReply = null;
+      if (Date.now() - d.at > DEFERRED_TTL_MS) {
+        console.log('[гейт] отложенный ответ протух — разговор ушёл дальше');
+        return;
+      }
+      // Занятость помечаем сами, как это делает PendingAnswers.take():
+      // состояние сессии сменится через несколько миллисекунд, а ответ коллеги
+      // может прийти раньше и встать поверх.
+      pending.setBusy(true);
+      replySafe({ instructions: d.instructions });
+    }
+
     const tools = {
       ask_specialist: llm.tool({
         description:
@@ -364,7 +427,13 @@ export default defineAgent({
     session.on(AgentSessionEventTypes.AgentStateChanged, (ev: AgentStateChangedEvent) => {
       const free = ev.newState === 'listening' || ev.newState === 'idle';
       pending.setBusy(!free);
-      if (free) flushPending();
+      // Сначала коллеги, потом отложенное обращение: ответа специалиста уже
+      // ждут вслух, а отложенный вопрос подождёт ещё один ход. flushDeferred
+      // сам увидит занятость, если очередь коллег ход забрала.
+      if (free) {
+        flushPending();
+        flushDeferred();
+      }
     });
 
     session.on(AgentSessionEventTypes.ConversationItemAdded, (ev: ConversationItemAddedEvent) => {
@@ -375,13 +444,17 @@ export default defineAgent({
       // Наши синтетические generateReply()-вставки заводятся с role:'user' —
       // это не реплики пользователя, в транскрипт звонка их не пускаем.
       if (normalizedRole === 'user' && textContent.startsWith(INTERNAL_PREFIX)) return;
+      // Кто это сказал — только для человеческих реплик на встрече: у
+      // ассистента говорящий известен и так. Забираем накопленное время речи
+      // за отрезок от прошлой реплики до этой, а не снимок «кто активен
+      // сейчас»: на момент коммита человек уже замолчал (см. speaker-ledger.ts).
+      if (isMeeting && normalizedRole === 'user') {
+        currentSpeaker = speakers?.takeDominant(Date.now());
+      }
       transcript.push({
         role: normalizedRole,
         text: textContent,
         ts: Date.now(),
-        // Кто это сказал — только для человеческих реплик на встрече: у
-        // ассистента говорящий известен и так. Разметка приблизительная, её
-        // источник — активный говорящий по версии LiveKit.
         ...(isMeeting && normalizedRole === 'user' && currentSpeaker
           ? { speaker: currentSpeaker }
           : {}),
@@ -389,7 +462,9 @@ export default defineAgent({
 
       if (!gate) return;
       if (normalizedRole === 'assistant') {
-        gate.noteReplied(Date.now());
+        // Текстом, а не фактом реплики: отговорка «я не расслышал вопрос»
+        // окно продолжения продлевать не должна.
+        gate.noteReplied(Date.now(), textContent);
         return;
       }
       // Реплика человека: спрашиваем гейт, дать ли модели ход. Синтетические
@@ -411,13 +486,13 @@ export default defineAgent({
         case 'respond':
           // Именно эта реплика, а не «разговор целиком»: иначе модель
           // отвечает на вопрос, который слышала полчаса назад в молчании.
-          replySafe({ instructions: answerTo(textContent) });
+          replyOrDefer(answerTo(textContent));
           break;
         case 'ack_listen':
-          replySafe({ instructions: listenAck() });
+          replyOrDefer(listenAck());
           break;
         case 'ack_resume':
-          replySafe({ instructions: resumeAck() });
+          replyOrDefer(resumeAck());
           break;
         case 'silent':
           break;
@@ -427,11 +502,27 @@ export default defineAgent({
     // Разметка говорящего. LiveKit определяет активного сам — считать
     // громкость руками не нужно.
     if (isMeeting) {
-      (foreign ?? ctx.room).on(RoomEvent.ActiveSpeakersChanged, (speakers: any[]) => {
-        // Берём первого: при перебивании активных несколько, а реплика в
-        // транскрипте одна. Разметка приблизительная, и здесь это видно прямо.
-        const top = speakers[0];
-        currentSpeaker = top ? top.name || top.identity : undefined;
+      const stage = foreign ?? ctx.room;
+      // Себя из активных вычёркиваем. LiveKit держит в activeSpeakers и
+      // локального участника, а в чужой комнате локальный — это мы: собственный
+      // голос ассистента приезжал меткой говорящего на реплику человека. На
+      // встрече 07.09.2026 шесть реплик уехали в транскрипт с
+      // speaker='Роман · ассистент Дмитрий' и ролью user — выглядело так, будто
+      // он слышит сам себя как участника.
+      (stage as any).on(RoomEvent.ActiveSpeakersChanged, (active: any[]) => {
+        // Личность читаем внутри колбэка, а не при подписке: на момент
+        // регистрации обработчика localParticipant может быть ещё не заполнен,
+        // и фильтр молча выродился бы в «никого не исключаем».
+        const selfIdentity = stage.localParticipant?.identity;
+        // Всех активных, а не первого: при хоровой речи время начисляется
+        // каждому, и реплику заберёт тот, кто говорил дольше.
+        speakers?.setActive(
+          (active || [])
+            .filter((p) => p && p.identity !== selfIdentity)
+            .map((p) => p.name || p.identity)
+            .filter(Boolean),
+          Date.now(),
+        );
       });
     }
 
@@ -442,6 +533,20 @@ export default defineAgent({
       if (ev.metrics.type === 'realtime_model_metrics') {
         audioIn += ev.metrics.inputTokenDetails.audioTokens;
         audioOut += ev.metrics.outputTokenDetails.audioTokens;
+        // Кешированный вход — отдельно, иначе он оплачивается как свежий.
+        //
+        // `inputTokenDetails.audioTokens` — это ВЕСЬ аудио-вход хода, вместе с
+        // переигранным контекстом разговора. У Realtime кеш стоит на два
+        // порядка дешевле свежего звука, а бэкенд считал всё по полной ставке.
+        // Встреча 07.09.2026: 107 642 входящих аудио-токена за 69 минут при
+        // том, что живой речи там от силы на 41 000 — остальное переигранный
+        // контекст, то есть кеш. Себестоимость разговора вышла завышенной
+        // примерно вдвое.
+        //
+        // Берём именно cachedTokensDetails.audioTokens, а не cachedTokens:
+        // второй складывает текст со звуком, и вычесть его из аудио нельзя.
+        // Поля нет — считаем кеш нулевым, то есть ровно как считали раньше.
+        cachedAudioIn += ev.metrics.inputTokenDetails.cachedTokensDetails?.audioTokens ?? 0;
       }
     });
 
@@ -514,6 +619,7 @@ export default defineAgent({
       try {
         await backend.complete(meta.callId, transcript, {
           audioInputTokens: audioIn,
+          cachedAudioInputTokens: cachedAudioIn,
           audioOutputTokens: audioOut,
           model,
         });

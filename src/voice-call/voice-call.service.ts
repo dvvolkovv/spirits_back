@@ -1,7 +1,7 @@
 import { Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
-import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
+import { CASH_TOKENS_PER_USD } from '../common/billing-rates';
 import { ChatService } from '../chat/chat.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
@@ -16,13 +16,21 @@ import {
  *
  * Захардкоженный флагман завышал бы цену mini в 3.2 раза — а ради измерения
  * реальной цены минуты фича и катится в v1, так что врать тут нельзя.
+ *
+ * `cachedIn` — кешированный аудио-вход. Он на два порядка дешевле свежего, и
+ * до 07.09.2026 его тут не было вовсе: весь входящий звук считался по полной
+ * ставке. На встрече в 69 минут это дало 107 642 входящих аудио-токена при
+ * живой речи от силы на 41 000 — разница целиком переигранный контекст, то
+ * есть кеш. Себестоимость разговора вышла завышенной примерно вдвое, и цифра
+ * выглядела правдоподобно ровно потому, что завышение шло в ту же сторону, в
+ * какую занижен курс списания.
  */
-const AUDIO_RATES_USD_PER_1M: Record<string, { in: number; out: number }> = {
-  flagship: { in: 32, out: 64 },
-  mini: { in: 10, out: 20 },
+const AUDIO_RATES_USD_PER_1M: Record<string, { in: number; cachedIn: number; out: number }> = {
+  flagship: { in: 32, cachedIn: 0.4, out: 64 },
+  mini: { in: 10, cachedIn: 0.3, out: 20 },
 };
 
-function ratesFor(model: string | undefined): { in: number; out: number } {
+function ratesFor(model: string | undefined): { in: number; cachedIn: number; out: number } {
   return /mini/i.test(model || '') ? AUDIO_RATES_USD_PER_1M.mini : AUDIO_RATES_USD_PER_1M.flagship;
 }
 
@@ -167,9 +175,21 @@ export class VoiceCallService {
     return { callId, roomName, token, wsUrl: process.env.LIVEKIT_WS_URL || process.env.LIVEKIT_URL || 'ws://localhost:7880' };
   }
 
-  costUsd(audioIn: number, audioOut: number, model?: string): number {
+  /**
+   * @param audioIn весь аудио-вход, вместе с кешированной частью
+   * @param cachedAudioIn сколько из него приехало из кеша. Это ЧАСТЬ audioIn,
+   *   а не добавка: свежий звук — разность. Ноль по умолчанию, потому что
+   *   воркер прежней версии этого числа не присылает, и без него расчёт должен
+   *   остаться ровно таким, каким был.
+   */
+  costUsd(audioIn: number, audioOut: number, model?: string, cachedAudioIn = 0): number {
     const r = ratesFor(model);
-    return (audioIn / 1e6) * r.in + (audioOut / 1e6) * r.out;
+    // Кеш не может быть больше целого и не может быть отрицательным: и то и
+    // другое дало бы отрицательную стоимость, а через неё — отрицательное
+    // списание, то есть подарок токенов за длинный разговор.
+    const cached = Math.min(Math.max(cachedAudioIn, 0), Math.max(audioIn, 0));
+    const fresh = Math.max(audioIn, 0) - cached;
+    return (fresh / 1e6) * r.in + (cached / 1e6) * r.cachedIn + (audioOut / 1e6) * r.out;
   }
 
   /**
@@ -255,12 +275,21 @@ export class VoiceCallService {
       );
     }
     const durationSec = Math.max(0, Math.round((Date.now() - new Date(call.started_at).getTime()) / 1000));
-    const cost = this.costUsd(payload.usage.audioInputTokens, payload.usage.audioOutputTokens, payload.usage.model);
+    const cost = this.costUsd(
+      payload.usage.audioInputTokens,
+      payload.usage.audioOutputTokens,
+      payload.usage.model,
+      payload.usage.cachedAudioInputTokens ?? 0,
+    );
 
-    // Курс общий со всеми путями, которые едят платную ёмкость, — см.
-    // common/billing-rates.ts. Минута флагманской Realtime-модели стоит около
-    // двенадцати центов, то есть примерно 540 токенов.
-    const tokens = Math.max(0, Math.ceil(cost * SEAT_TOKENS_PER_USD));
+    // Курс возмещения живых денег, а НЕ курс подписки Claude.
+    //
+    // Realtime мы оплачиваем OpenAI по счёту, поэтому берём с пользователя
+    // столько, во сколько разговор обошёлся нам, с наценкой CASH_MARKUP
+    // (решение владельца 07.09.2026). Здесь стоял SEAT_TOKENS_PER_USD — курс
+    // дефицитной ёмкости подписки, — и встреча на 69 минут при счёте OpenAI
+    // в 4.13 доллара принесла 26–55 ₽ против ~330 ₽ расхода.
+    const tokens = Math.max(0, Math.ceil(cost * CASH_TOKENS_PER_USD));
 
     await this.pg.query(
       `UPDATE voice_calls SET status = 'completed', ended_at = now(), duration_sec = $1,
@@ -290,6 +319,7 @@ export class VoiceCallService {
           kind: 'voice_call', callId, costUsd: cost, durationSec, durationMs: durationSec * 1000,
           model: payload.usage.model,
           audioInputTokens: payload.usage.audioInputTokens,
+          cachedAudioInputTokens: payload.usage.cachedAudioInputTokens ?? 0,
           audioOutputTokens: payload.usage.audioOutputTokens,
         }),
       ],

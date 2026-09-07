@@ -1,4 +1,6 @@
 import { VoiceCallService } from './voice-call.service';
+import { CASH_MARKUP, CASH_TOKENS_PER_USD, RUB_PER_TOKEN, RUB_PER_USD } from '../common/billing-rates';
+import type { CompletePayload } from './voice-call.types';
 
 function makeDeps(historyRows: any[] = []) {
   const inserted: any[] = [];
@@ -130,6 +132,60 @@ describe('VoiceCallService', () => {
     expect(flagship / mini).toBeCloseTo(3.2, 5);
   });
 
+  /**
+   * Смысл курса, а не его величина: разговор должен приносить БОЛЬШЕ, чем
+   * стоил. До 07.09.2026 здесь стоял курс подписки Claude, и встреча на 69
+   * минут при счёте OpenAI в 4.13 доллара приносила 26–55 ₽ против ~330 ₽
+   * расхода. Тест держит именно это, поэтому переживёт правку наценки.
+   */
+  it('выручка со звонка покрывает счёт OpenAI с наценкой', () => {
+    const svc = new VoiceCallService({} as any, {} as any, {} as any);
+    const usd = svc.costUsd(107_642, 10_775, 'gpt-realtime-2.1');
+    const выручка = Math.ceil(usd * CASH_TOKENS_PER_USD) * RUB_PER_TOKEN;
+    const расход = usd * RUB_PER_USD;
+    expect(выручка / расход).toBeCloseTo(CASH_MARKUP, 2);
+    expect(выручка).toBeGreaterThan(расход);
+  });
+
+  it('кешированный вход считается по кеш-ставке, а не по свежей', () => {
+    const svc = new VoiceCallService({} as any, {} as any, {} as any);
+    // 100k входящих, из них 80k из кеша: платим за 20k свежих и 80k кеша.
+    expect(svc.costUsd(100_000, 0, 'gpt-realtime-2.1', 80_000)).toBeCloseTo(
+      (20_000 / 1e6) * 32 + (80_000 / 1e6) * 0.4,
+      6,
+    );
+  });
+
+  it('без кеша цена прежняя — воркер старой версии поля не шлёт', () => {
+    const svc = new VoiceCallService({} as any, {} as any, {} as any);
+    expect(svc.costUsd(600, 1200, 'gpt-realtime-2.1', 0)).toBeCloseTo(
+      svc.costUsd(600, 1200, 'gpt-realtime-2.1'),
+      9,
+    );
+  });
+
+  it('кеш больше входа или отрицательный не даёт отрицательную цену', () => {
+    // Иначе через ceil(cost × курс) это превратилось бы в подарок токенов за
+    // длинный разговор.
+    const svc = new VoiceCallService({} as any, {} as any, {} as any);
+    expect(svc.costUsd(1000, 0, 'gpt-realtime-2.1', 999_999)).toBeCloseTo((1000 / 1e6) * 0.4, 9);
+    expect(svc.costUsd(1000, 0, 'gpt-realtime-2.1', -5)).toBeCloseTo((1000 / 1e6) * 32, 9);
+  });
+
+  /**
+   * Замер по живой встрече 07.09.2026: 107 642 входящих аудио-токена за 69
+   * минут при том, что живой речи там от силы на 41 000. Разница —
+   * переигранный контекст, то есть кеш, и до этой правки он оплачивался как
+   * свежий звук: себестоимость разговора выходила завышенной примерно вдвое.
+   */
+  it('на длинном разговоре кеш роняет себестоимость примерно вдвое', () => {
+    const svc = new VoiceCallService({} as any, {} as any, {} as any);
+    const было = svc.costUsd(107_642, 10_775, 'gpt-realtime-2.1');
+    const стало = svc.costUsd(107_642, 10_775, 'gpt-realtime-2.1', 107_642 - 41_310);
+    expect(было).toBeCloseTo(4.1341, 3);
+    expect(стало).toBeLessThan(было / 1.8);
+  });
+
   it('строка учёта пишется pending — за разговор списывается', async () => {
     // Тест перевёрнут 27.08.2026 вместе с решением. Раньше он держал
     // обратное: 'completed', то есть «учитываем, но не списываем» — тариф за
@@ -251,8 +307,12 @@ describe('списание за минуты разговора', () => {
     // input_tokens зашит нулём в запросе — иначе крон сложит его с output.
     expect(c.sql).toMatch(/VALUES[^)]*,\s*0,\s*\$4/);
     // 600 входящих и 1200 исходящих аудио-токенов флагманской модели — это
-    // $0.096, то есть 432 токена по общему курсу. Никак не 1800.
-    expect(c.output).toBe(432);
+    // $0.096. Курс — возмещение живых денег с наценкой, а не курс подписки:
+    // считаем от него, чтобы правка наценки не требовала правки теста.
+    // Главное здесь другое: списывается ПЕРЕСЧИТАННАЯ величина, никак не 1800
+    // сырых аудио-токенов.
+    expect(c.output).toBe(Math.ceil(0.096 * CASH_TOKENS_PER_USD));
+    expect(c.output).not.toBe(1800);
     // Сырые счётчики не теряются: без них не разобрать, из чего сложилась цена.
     expect(c.meta.audioInputTokens).toBe(600);
     expect(c.meta.audioOutputTokens).toBe(1200);
@@ -392,7 +452,7 @@ describe('разговор наполняет профиль', () => {
   it('complete: если финальный полнее staged — берём финальный', async () => {
     const d = completeDeps([{ role: 'assistant', text: 'приветствие', ts: 1 }]);
     const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
-    const full = [
+    const full: CompletePayload['transcript'] = [
       { role: 'assistant', text: 'приветствие', ts: 1 },
       { role: 'user', text: 'вопрос', ts: 2 },
       { role: 'assistant', text: 'ответ', ts: 3 },
