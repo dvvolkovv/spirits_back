@@ -30,7 +30,6 @@ describe('RunnerController.poll', () => {
       id: 't-1',
       prompt: 'поправь футер',
       user_id: 'u-1',
-      channel: 'web',
       revert_to_sha: null,
     });
 

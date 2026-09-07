@@ -9,7 +9,7 @@ function makeService(opts: { claim?: any[]; used?: number; alreadyFinal?: boolea
     query: jest.fn(async (sql: string, params: any[] = []) => {
       calls.push({ sql, params });
       if (sql.includes("SET status = 'running'")) {
-        const rows = opts.claim ?? [{ id: 't-1', prompt: 'go', channel: 'web', user_id: 'u-1' }];
+        const rows = opts.claim ?? [{ id: 't-1', prompt: 'go', user_id: 'u-1' }];
         return { rows, rowCount: rows.length };
       }
       // Диспетчеризация по `SET status = $3` — намеренно НЕ по литералу
@@ -66,9 +66,11 @@ describe('TurnsService.claimNext', () => {
     // держит продукт вечно. То есть снятие этой строки молча выключает
     // единственный механизм самовосстановления.
     expect(sqlOf(calls)).toContain('started_at = now()');
-    // Task 7 читает prompt, channel и user_id и шлёт их на VM. Мок эти поля
-    // выдумывает, поэтому усечение RETURNING без утверждения незаметно.
-    expect(sqlOf(calls)).toContain('RETURNING id, prompt, channel, user_id, revert_to_sha');
+    // Task 7 читает prompt и user_id и шлёт их на VM. Мок эти поля выдумывает,
+    // поэтому усечение RETURNING без утверждения незаметно. channel сюда не
+    // входит: RunnerController его не читает, а неиспользуемое поле рано или
+    // поздно начинают поддерживать просто потому, что оно есть.
+    expect(sqlOf(calls)).toContain('RETURNING id, prompt, user_id, revert_to_sha');
   });
 
   it('отдаёт null, когда очередь пуста', async () => {
@@ -87,7 +89,14 @@ describe('TurnsService.touchRunner', () => {
     await svc.touchRunner('p-1');
 
     expect(calls[0].sql).toContain('runner_seen_at = now()');
-    expect(calls[0].sql).toContain("CASE WHEN status = 'degraded' THEN 'running' ELSE status END");
+    // Два узких утверждения вместо одного точного сравнения всего выражения:
+    // то было бы привязано к форматированию — перенос строки или лишний
+    // пробел ронял бы тест, ничего не сломав. Здесь два разных обещания:
+    // срабатывает только на degraded, и всё остальное сохраняется как было.
+    expect(calls[0].sql).toContain("WHEN status = 'degraded'");
+    expect(calls[0].sql).toContain('ELSE status END');
+    // Условная запись — иначе два десятка записей в минуту на продукт.
+    expect(calls[0].sql).toContain("interval '30 seconds'");
     expect(calls[0].sql).toContain('WHERE id = $1');
     expect(calls[0].params).toEqual(['p-1']);
   });

@@ -52,7 +52,6 @@ export interface CompleteInput {
 export interface ClaimedTurn {
   id: string;
   prompt: string;
-  channel: string;
   user_id: string;
   /** Непустое => это откат, и раннеру надо сбросить дерево на этот sha. */
   revert_to_sha: string | null;
@@ -138,7 +137,19 @@ export class TurnsService {
       `UPDATE products
           SET runner_seen_at = now(),
               status = CASE WHEN status = 'degraded' THEN 'running' ELSE status END
-        WHERE id = $1`,
+        WHERE id = $1
+          -- Запись условная. Без этого heartbeat пишет в одну и ту же строку
+          -- каждые три секунды на каждый продукт независимо от наличия работы.
+          -- Колонки runner_seen_at и status не проиндексированы, поэтому
+          -- обновления идут HOT и катастрофы с вакуумом не будет, но два
+          -- десятка записей в минуту ни за чем не нужны. Третье условие
+          -- сохраняет мгновенное восстановление из degraded.
+          --
+          -- Требование: порог алерта «нет связи» обязан быть заметно больше
+          -- 30 секунд, иначе продукт будет мигать между статусами.
+          AND (runner_seen_at IS NULL
+               OR runner_seen_at < now() - interval '30 seconds'
+               OR status = 'degraded')`,
       [productId],
     );
   }
@@ -153,6 +164,11 @@ export class TurnsService {
           SET status = 'running', started_at = now()
         WHERE id = (
           SELECT t.id FROM product_turns t
+            -- ВАЖНО про семантику: это закрывает выдачу НОВОЙ работы, но не
+            -- прерывает ход, забранный до остановки. Тот живёт на VM минутами
+            -- — агент правит код, коммитит, собирает и перезапускает прод.
+            -- Отмена требует участия раннера и относится к его плану.
+            --
             -- Статус продукта проверяется ЗДЕСЬ, а не только в enqueue.
             -- Между постановкой хода и его забором проходит время: раннер мог
             -- лежать полчаса. Если за это время продукт перевели в stopped,
@@ -170,7 +186,7 @@ export class TurnsService {
            FOR UPDATE OF t SKIP LOCKED
            LIMIT 1
         )
-        RETURNING id, prompt, channel, user_id, revert_to_sha`,
+        RETURNING id, prompt, user_id, revert_to_sha`,
       [productId],
     );
     return r.rows[0] ?? null;
