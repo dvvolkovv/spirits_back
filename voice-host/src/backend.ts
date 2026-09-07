@@ -24,6 +24,10 @@ const TIMEOUT_MS: Record<string, number> = {
   // Отметка «во встречу пришёл первый человек» — учётная. Ждать её долго
   // незачем: разговор от неё не зависит.
   'meeting-first-human': 5_000,
+  // Создание бота Attendee — это запуск целого Chrome на его стороне и заход
+  // на страницу Meet, а не запись строки. 2 секунды, как у ask/document,
+  // здесь били бы по живым, но чуть медленным попыткам входа.
+  'meet-bot': 15_000,
 };
 
 async function post<T>(path: string, body: unknown): Promise<T> {
@@ -77,4 +81,15 @@ export const backend = {
     post<{ ok: true }>('failed', { callId, reason }),
   meetingFirstHuman: (callId: string) =>
     post<{ ok: true }>('meeting-first-human', { callId }),
+  /**
+   * Сообщить бэкенду адрес своего вебсокета, чтобы он создал бота Attendee.
+   *
+   * Порт свой на задание (AttendeeAudioHub), и до этого момента его не знает
+   * никто, кроме нас самих, — поэтому вызов идёт в эту сторону, а не бэкенд
+   * заранее решает адрес. `true` только при status:'ok': это значит, что
+   * есть смысл ждать подключения; на любой другой исход (в т.ч. сетевой сбой,
+   * пойманный вызывающим через .catch) ждать уже незачем.
+   */
+  meetBot: (callId: string, wsUrl: string) =>
+    post<{ status: 'ok' | 'failed' }>('meet-bot', { callId, wsUrl }).then((r) => r.status === 'ok'),
 };

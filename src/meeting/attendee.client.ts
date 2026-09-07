@@ -36,6 +36,16 @@ export interface CreateBotParams {
   meetingUrl: string;
   botName: string;
   callId: string;
+  /**
+   * Адрес НАШЕГО вебсокета, куда Attendee пришлёт звук.
+   *
+   * Знает его только воркер: порт свой на задание (AttendeeAudioHub), а не
+   * общий на процесс, — поэтому адрес приходит параметром, а не собирается
+   * здесь из env. Тот же довод, по которому createBot теперь зовётся не из
+   * join(), а из MeetingService.attachBot() уже после того, как воркер
+   * сообщил бэкенду свой wsUrl.
+   */
+  wsUrl: string;
 }
 
 @Injectable()
@@ -92,7 +102,6 @@ export class AttendeeClient {
 
   /** Отправить бота во встречу. `null` — не получилось, причина уже в логе. */
   async createBot(p: CreateBotParams): Promise<{ botId: string } | null> {
-    const ws = process.env.ATTENDEE_AUDIO_WS_URL || '';
     const hook = process.env.ATTENDEE_WEBHOOK_URL || '';
     const r = await this.call('/api/v1/bots', {
       method: 'POST',
@@ -104,9 +113,10 @@ export class AttendeeClient {
         // обратно в каждом событии полем bot_metadata.
         metadata: { callId: p.callId },
         websocket_settings: {
-          // callId в query — воркер по нему узнаёт, чей это звук, ещё до
-          // первого сообщения. Одного вебсокет-сервера хватает на все встречи.
-          audio: { url: `${ws}?callId=${encodeURIComponent(p.callId)}`, sample_rate: ATTENDEE_SAMPLE_RATE },
+          // wsUrl приходит от вызывающего КАК ЕСТЬ, уже с callId в query:
+          // его целиком собрал воркер (AttendeeAudioHub.publicUrl), потому
+          // что порт свой на задание, и здесь узнать его неоткуда.
+          audio: { url: p.wsUrl, sample_rate: ATTENDEE_SAMPLE_RATE },
         },
         webhooks: [{ url: hook, triggers: TRIGGERS }],
       }),

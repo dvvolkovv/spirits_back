@@ -130,11 +130,6 @@ export class MeetingService {
     let title: string;
     let roomName: string;
     let external: { url: string; token: string } | undefined;
-    // Id бота держим в переменной функции, а не только в базе: если упадёт
-    // сам UPDATE external_bot_id, в базе его не будет, а бот в встрече уже
-    // будет — и реапер, который ищет по непустому external_bot_id, такого
-    // никогда не найдёт. leave() тоже не поможет: там id тоже пуст.
-    let botId: string | null = null;
 
     if (isMeet) {
       // За информацией о встрече идти некуда: публичной ручки «существует ли
@@ -177,23 +172,12 @@ export class MeetingService {
       const preamble = await this.calls.buildPreamble(userId, agentId);
       const ownerName = await this.resolveOwnerName(userId);
 
-      if (isMeet) {
-        const bot = await this.attendee.createBot({
-          meetingUrl: `https://meet.google.com/${code}`,
-          // То же имя, что в своих комнатах и в Taler ID: участники должны
-          // видеть, кто к ним пришёл и от кого.
-          botName: `${agent.display_name} · ассистент ${ownerName}`,
-          callId,
-        });
-        // Причина уже в логе клиента. Наружу — внятный отказ: молчаливое 500
-        // выглядит поломкой, а это может быть просто выключенный Attendee.
-        if (!bot) throw new ConflictException({ message: 'meeting bot is unavailable' });
-        botId = bot.botId;
-        await this.pg.query(
-          `UPDATE voice_calls SET external_bot_id = $1 WHERE id = $2`,
-          [botId, callId],
-        );
-      }
+      // Бота Attendee здесь больше НЕ создаём. Порт под звук свой у каждого
+      // задания (AttendeeAudioHub), и знает его только воркер — раньше он
+      // читался бэкендом из общего env, что было несовместимо с процесс-
+      // моделью @livekit/agents@1.7.0 (см. attendee-audio.ts). Бота теперь
+      // создаёт attachBot() — уже после dispatchAgent, когда воркер поднял
+      // приём звука и сообщил бэкенду свой wsUrl отдельной ручкой.
 
       if (isForeign) {
         // Токен берём здесь, а не выше: он живёт шесть часов, и отсчёт лучше
@@ -230,11 +214,8 @@ export class MeetingService {
         callbackUrl: `${process.env.BACKEND_URL || 'https://my.linkeon.io'}/webhook/voice-call/internal`,
       });
     } catch (e: any) {
-      // Бот уже сидит в встрече — убираем его прежде всего остального.
-      // По значению из памяти, потому что в базе его может не быть: ровно
-      // этот UPDATE и мог упасть. Ошибку уборки глушим: наружу должна уйти
-      // исходная причина отказа, а не вторичная.
-      if (botId) await this.attendee.removeBot(botId).catch(() => {});
+      // Бота Attendee убирать здесь не нужно: в момент отказа его ещё не
+      // существует — join() дальше dispatchAgent его не создаёт (см. выше).
       // Запись, оставшаяся в 'dialing', намертво блокирует пользователю
       // следующую попытку — лимит «один активный вход» смотрит именно на неё.
       this.logger.error(`[join] call=${callId} не поднялся: ${e?.message}`);
@@ -247,6 +228,55 @@ export class MeetingService {
 
     this.logger.log(`[join] call=${callId} agent=${agentId} provider=${provider} room=${code}`);
     return { callId, title };
+  }
+
+  /**
+   * Воркер узнал порт своего вебсокета — создаём бота Attendee.
+   *
+   * Порт у каждого задания свой (AttendeeAudioHub), и до этого момента его не
+   * знает никто, кроме самого воркера. Поэтому вход во встречу (`join`)
+   * бота больше не создаёт: он появляется здесь, уже ПОСЛЕ dispatchAgent,
+   * когда воркер поднял приём звука и сообщил бэкенду свой wsUrl отдельной
+   * подписанной ручкой. Ответ синхронный: воркеру нужно знать, есть ли смысл
+   * ждать подключения Attendee, а не тарифицировать Realtime в пустоту.
+   */
+  async attachBot(callId: string, wsUrl: string): Promise<{ status: 'ok' | 'failed' }> {
+    let call: any;
+    try {
+      call = await this.calls.load(callId);
+    } catch (e: any) {
+      this.logger.error(`[attachBot] call=${callId} не найден: ${e?.message}`);
+      return { status: 'failed' };
+    }
+    try {
+      const ownerName = await this.resolveOwnerName(call.user_id);
+      const agentRes = await this.pg.query(
+        `SELECT display_name FROM agents WHERE id = $1 LIMIT 1`,
+        [call.agent_id],
+      );
+      // Тем же способом, что раньше в join(): участники должны видеть, кто к
+      // ним пришёл и от кого.
+      const botName = `${agentRes.rows[0]?.display_name || 'Ассистент'} · ассистент ${ownerName}`;
+      const bot = await this.attendee.createBot({
+        meetingUrl: `https://meet.google.com/${call.external_room}`,
+        botName,
+        callId,
+        wsUrl,
+      });
+      if (!bot) {
+        // Причина уже в логе клиента. Звонок помечаем failed сами: join()
+        // об этом отказе узнать не может — он давно вернул ответ.
+        this.logger.error(`[attachBot] call=${callId} бот Attendee не создан`);
+        await this.calls.fail(callId, 'meeting bot is unavailable');
+        return { status: 'failed' };
+      }
+      await this.pg.query(`UPDATE voice_calls SET external_bot_id = $1 WHERE id = $2`, [bot.botId, callId]);
+      return { status: 'ok' };
+    } catch (e: any) {
+      this.logger.error(`[attachBot] call=${callId} упал: ${e?.message}`);
+      await this.calls.fail(callId, e?.message || 'attach bot failed').catch(() => {});
+      return { status: 'failed' };
+    }
   }
 
   /**
