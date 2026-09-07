@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>meet-spike selftest</title>
+<body style="font:14px monospace">
+<div id="s">инициализация…</div>
+<script>
+window.__spike = { ready: false, micRms: 0, micPeakHz: 0, ticks: 0 };
+(async () => {
+  const ctx = new AudioContext({ sampleRate: 48000 });
+  // Играем 440 Гц. Это должно уйти в meet_out и попасть к нам через monitor.
+  const osc = ctx.createOscillator();
+  osc.frequency.value = 440;
+  const gain = ctx.createGain();
+  gain.gain.value = 0.3;
+  osc.connect(gain).connect(ctx.destination);
+  osc.start();
+
+  // Слушаем микрофон. Обработку звука выключаем полностью: эхоподавление и
+  // шумодав Chromium приняли бы чистый тон за шум и задавили его — тогда
+  // проверка провалилась бы не потому, что водопровод не работает.
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+  });
+  const an = ctx.createAnalyser();
+  an.fftSize = 4096;
+  ctx.createMediaStreamSource(stream).connect(an);
+
+  const time = new Float32Array(an.fftSize);
+  const spec = new Float32Array(an.frequencyBinCount);
+  window.__spike.ready = true;
+  setInterval(() => {
+    an.getFloatTimeDomainData(time);
+    let acc = 0;
+    for (const v of time) acc += v * v;
+    window.__spike.micRms = Math.sqrt(acc / time.length);
+    an.getFloatFrequencyData(spec);
+    let peak = 0;
+    for (let i = 1; i < spec.length; i++) if (spec[i] > spec[peak]) peak = i;
+    window.__spike.micPeakHz = Math.round((peak * ctx.sampleRate) / an.fftSize);
+    window.__spike.ticks++;
+    document.getElementById('s').textContent =
+      `mic rms=${window.__spike.micRms.toFixed(4)} peak=${window.__spike.micPeakHz}Hz`;
+  }, 200);
+})().catch((e) => { window.__spike = { error: String(e) }; });
+</script>
