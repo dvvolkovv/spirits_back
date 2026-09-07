@@ -22,9 +22,11 @@ import { Occupancy } from './occupancy.js';
 import { SpeakerLedger } from './speaker-ledger.js';
 import { MixedRoomAudioInput } from './mixed-audio-input.js';
 import { ExternalRoomAudioOutput } from './external-room-output.js';
+import { ExternalRoomChat } from './external-chat.js';
 import { Room as ExternalRoom } from '@livekit/rtc-node';
 import {
   answerTo,
+  answerToChat,
   callInstructions,
   callIntro,
   listenAck,
@@ -70,6 +72,12 @@ export default defineAgent({
       provider?: 'talerid';
       externalUrl?: string;
       externalToken?: string;
+      /**
+       * Ручка чата чужой комнаты. Приходит только для talerid и только когда
+       * их join отдал roomName — собирает её бэкенд, потому что база живёт в
+       * его окружении (на стенде она другая).
+       */
+      externalChatUrl?: string;
     };
     const isMeeting = meta.mode === 'meeting';
     /** Комната, в которой реально идёт разговор: своя или чужая. */
@@ -125,6 +133,7 @@ export default defineAgent({
      */
     let foreign: ExternalRoom | null = null;
     let foreignOutput: ExternalRoomAudioOutput | null = null;
+    let chat: ExternalRoomChat | null = null;
     if (isForeign) {
       foreign = new ExternalRoom();
       await foreign.connect(meta.externalUrl!, meta.externalToken!, {
@@ -132,6 +141,17 @@ export default defineAgent({
         dynacast: false,
       });
       console.log(`[чужая] подключились к ${meta.externalUrl}`);
+
+      if (meta.externalChatUrl) {
+        chat = new ExternalRoomChat(
+          meta.externalChatUrl,
+          meta.externalToken!,
+          // Имя ровно то же, под которым мы вошли в комнату: по нему же
+          // отсеивается собственное эхо.
+          `${agentName} · ассистент ${meta.ownerName || 'пользователя'}`,
+        );
+        console.log('[чат] канал комнаты подключён');
+      }
     }
 
     if (isMeeting && !isForeign) {
@@ -236,12 +256,28 @@ export default defineAgent({
     // running», исключение uncaught, процесс падает и pm2 его рестартит (диагностировано 29.08.2026
     // по error-логу). Гвардим ВСЕ вызовы generateReply: флаг + try/catch.
     let sessionClosed = false;
+    /**
+     * Сессия ещё не поднята — это НЕ то же самое, что закрыта.
+     *
+     * `generateReply` бросает «AgentSession is not running» в обоих случаях
+     * (agent_session.js: `if (!this.activity) throw`), и до этого флага оба
+     * читались в логе как «после закрытия сессии». Разница важная: в чужую
+     * комнату мы входим ДО `session.start()`, и написанное в чат за эти
+     * несколько сотен миллисекунд попадало в проглоченное исключение — гейт
+     * при этом успевал напечатать `respond`. В логе получалось «ход дали,
+     * ответа нет», то есть ровно та картина, на которой 28.08.2026 уже ушёл
+     * час поисков.
+     */
+    let sessionStarted = false;
     function replySafe(opts: Parameters<typeof session.generateReply>[0]): void {
       if (sessionClosed) return;
       try {
         session.generateReply(opts);
       } catch (e) {
-        console.error('generateReply после закрытия сессии проигнорирован', e);
+        console.error(
+          `generateReply проигнорирован (сессия ${sessionStarted ? 'закрыта' : 'ещё не поднята'})`,
+          e,
+        );
       }
     }
 
@@ -273,8 +309,13 @@ export default defineAgent({
      * Держим ОДНО обращение — последнее. Копить их незачем: человек, не
      * дождавшись ответа, переспрашивает, и отвечать надо на переспрос, а не
      * зачитывать вслух всю очередь.
+     *
+     * Слот один на оба канала — и на речь, и на чат комнаты. Написанное
+     * вытеснит отложенный голосовой вопрос и наоборот, и это осознанно: с
+     * точки зрения встречи это два способа обратиться к ассистенту, а
+     * рассуждение про переспрос работает для них одинаково.
      */
-    let deferredReply: { instructions: string; at: number } | null = null;
+    let deferredReply: { opts: Parameters<typeof session.generateReply>[0]; at: number } | null = null;
 
     /**
      * Сколько отложенный ответ ещё уместен. Полминуты — столько же, сколько
@@ -284,13 +325,17 @@ export default defineAgent({
      */
     const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
 
-    /** Дать модели ход сейчас или отложить, если она говорит или думает. */
-    function replyOrDefer(instructions: string): void {
-      if (pending.isBusy) {
-        deferredReply = { instructions, at: Date.now() };
+    /**
+     * Дать модели ход сейчас или отложить, если она говорит, думает или ещё
+     * не поднялась. Неподнятая сессия — повод отложить, а не потерять:
+     * flushDeferred отдаст обращение на первом же переходе в 'listening'.
+     */
+    function replyOrDefer(opts: Parameters<typeof session.generateReply>[0]): void {
+      if (!sessionStarted || pending.isBusy) {
+        deferredReply = { opts, at: Date.now() };
         return;
       }
-      replySafe({ instructions });
+      replySafe(opts);
     }
 
     /** Освободилась — отдать отложенное, если оно ещё не протухло. */
@@ -306,7 +351,7 @@ export default defineAgent({
       // состояние сессии сменится через несколько миллисекунд, а ответ коллеги
       // может прийти раньше и встать поверх.
       pending.setBusy(true);
-      replySafe({ instructions: d.instructions });
+      replySafe(d.opts);
     }
 
     const tools = {
@@ -367,11 +412,43 @@ export default defineAgent({
           }
         },
       }),
+      // Тул появляется только на чужой встрече с чатом. У звонка и своих
+      // комнат канала нет, и объявлять модели инструмент, который всегда
+      // отказывает, — прямой способ получить «я отправил в чат» в пустоту.
+      ...(chat
+        ? {
+            write_to_chat: llm.tool({
+              description:
+                'Написать текстом в чат встречи — сообщение увидят все участники. ' +
+                'Для того, что на слух не воспринимается: ссылки, адреса, номера, ' +
+                'короткие списки. Голосом скажи, что написал в чат, и не зачитывай ' +
+                'написанное вслух.',
+              parameters: z.object({
+                text: z.string().describe('Текст сообщения целиком, готовый к отправке'),
+              }),
+              execute: async ({ text }) => {
+                const ok = await chat!.send(text);
+                if (ok) {
+                  // Написанное — тоже участие в встрече, и оно обязано попасть
+                  // в транскрипт. Промпт прямо велит отвечать текстом и НЕ
+                  // зачитывать написанное вслух; без этой строки в резюме
+                  // остался бы вопрос участника и ни следа ответа — тем
+                  // дырявее, чем лучше модель слушается промпта.
+                  // ConversationItemAdded такое не подберёт: вызов тула не
+                  // сообщение, и обработчик отсеивает его первым же условием.
+                  transcript.push({ role: 'assistant', text: `[в чат] ${text}`, ts: Date.now() });
+                }
+                return ok ? { status: 'sent' } : { status: 'rejected', reason: 'chat_unavailable' };
+              },
+            }),
+          }
+        : {}),
     };
-    // Тулов три. create_document был в первой редакции спеки как save_note, я
-    // его снял, решив, что он дублирует резюме звонка, — и на живом звонке
-    // 26.08.2026 владелец попросил документ, а Роману оказалось некуда его
-    // положить. Резюме это про что говорили; документ — результат работы.
+    // Базовых тула три, write_to_chat — четвёртый, условный. create_document
+    // был в первой редакции спеки как save_note, я его снял, решив, что он
+    // дублирует резюме звонка, — и на живом звонке 26.08.2026 владелец
+    // попросил документ, а Роману оказалось некуда его положить. Резюме это
+    // про что говорили; документ — результат работы.
 
     // Ответы специалистов приходят из бэкенда через data-канал комнаты.
     ctx.room.on(RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
@@ -403,6 +480,22 @@ export default defineAgent({
           `Скажи вслух, что документ готов, ОБЯЗАТЕЛЬНО назови автора и коротко ` +
           `перескажи суть. Начало текста: ${msg.text || ''}]`,
         );
+        // Ссылка — участникам встречи, а не только владельцу.
+        //
+        // Документ ложится в личный чат владельца в Linkeon, и остальным в
+        // комнате он не виден: у них аккаунта у нас нет. Пересказ вслух эту
+        // дыру не закрывает — по надиктованному URL не перейти.
+        //
+        // Отправка асинхронная, но её исход не теряем: Роман к этому моменту
+        // уже сказал вслух «документ готов», и молчаливо не ушедшая ссылка
+        // выглядела бы как исполненное обещание.
+        if (chat && msg.url) {
+          const line = `Документ «${msg.title || 'без названия'}»: ${msg.url}`;
+          void chat.send(line).then((ok) => {
+            if (ok) transcript.push({ role: 'assistant', text: `[в чат] ${line}`, ts: Date.now() });
+            else console.error(`[чат] ссылка на документ «${msg.title}» не ушла`);
+          });
+        }
         return;
       }
       if (msg.type === 'document_failed') {
@@ -486,13 +579,13 @@ export default defineAgent({
         case 'respond':
           // Именно эта реплика, а не «разговор целиком»: иначе модель
           // отвечает на вопрос, который слышала полчаса назад в молчании.
-          replyOrDefer(answerTo(textContent));
+          replyOrDefer({ instructions: answerTo(textContent) });
           break;
         case 'ack_listen':
-          replyOrDefer(listenAck());
+          replyOrDefer({ instructions: listenAck() });
           break;
         case 'ack_resume':
-          replyOrDefer(resumeAck());
+          replyOrDefer({ instructions: resumeAck() });
           break;
         case 'silent':
           break;
@@ -523,6 +616,59 @@ export default defineAgent({
             .filter(Boolean),
           Date.now(),
         );
+      });
+    }
+
+    /**
+     * Написанное в чате комнаты — такое же обращение, как сказанное вслух.
+     *
+     * Проходит через тот же гейт по имени: комната общая, участники пишут и
+     * друг другу тоже, и отвечать на каждое сообщение ассистент не должен.
+     * Своё эхо отсеивает ExternalRoomChat.parse — их сервер возвращает нам
+     * наши же отправки тем же пакетом.
+     */
+    if (foreign && chat) {
+      foreign.on(RoomEvent.DataReceived, (payload: Uint8Array) => {
+        const msg = chat!.parse(payload);
+        if (!msg) return;
+        console.log(`[чат] ${msg.name}: ${msg.text.slice(0, 80)}`);
+
+        // В транскрипт — с автором. Имя приходит от их сервера, то есть не
+        // угадано по активности микрофона, как у речи. Но это и ДРУГАЯ строка
+        // из другого источника: у речи берётся `p.name || p.identity` из
+        // LiveKit. Совпадают ли они для одного человека — вопрос к живой
+        // встрече; если нет, он раздвоится в транскрипте.
+        transcript.push({ role: 'user', text: msg.text, ts: Date.now(), speaker: msg.name });
+
+        // Гейт есть всегда, где есть чат: chat ⇒ isForeign ⇒ isMeeting. Ветка
+        // «нет гейта — отвечаем на всё» была бы самой опасной из возможных.
+        const decision = gate!.decide(msg.text, Date.now(), msg.name);
+        console.log(`[гейт/чат] ${decision} ← «${msg.text.slice(0, 80)}»`);
+        switch (decision) {
+          case 'respond':
+            // userInput, а не instructions, и это не стилистика.
+            //
+            // generateReply заводит user-сообщение в контексте модели ТОЛЬКО
+            // из userInput (agent_session.js: userMessage строится из
+            // options.userInput). С instructions Роман отвечает на написанное
+            // и тут же о нём забывает: спросили в чате про смету на 200
+            // квадратов, он ответил, а на голосовое «а если 300?» отвечать
+            // уже не по чему.
+            //
+            // Обёртка INTERNAL_PREFIX — та же, что у ответов специалистов:
+            // строка осядет в контексте, но не попадёт ни в транскрипт (мы
+            // записали его выше сами, с точным автором), ни второй раз в гейт.
+            replyOrDefer({ userInput: `${INTERNAL_PREFIX}: ${answerToChat(msg.name, msg.text)}]` });
+            break;
+          case 'ack_listen':
+            replyOrDefer({ instructions: listenAck() });
+            break;
+          case 'ack_resume':
+            replyOrDefer({ instructions: resumeAck() });
+            break;
+          case 'silent':
+            break;
+        }
       });
     }
 
@@ -736,6 +882,9 @@ export default defineAgent({
                 persona: meta.agentPersona || '',
                 preamble: meta.preamble,
                 specialists: meta.specialists,
+                // Ровно то же условие, что и у тула: промпт и набор
+                // инструментов обязаны совпадать.
+                hasChat: !!chat,
               })
             : callInstructions(meta.preamble, meta.specialists),
           tools,
@@ -769,6 +918,9 @@ export default defineAgent({
         ...(isMeeting ? { inputOptions: { closeOnDisconnect: false } } : {}),
       });
 
+      // С этого момента generateReply работает. До него в чужой комнате мы
+      // уже сидим и уже слышим её чат — см. sessionStarted выше.
+      sessionStarted = true;
 
       // Первую фразу задаём явно, а не отдаём модели на импровизацию.
       //

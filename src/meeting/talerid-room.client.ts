@@ -14,6 +14,9 @@ import { Injectable, Logger } from '@nestjs/common';
  * мы об этом от пользователя. Поэтому: короткий таймаут, 404 как обычный
  * результат, любая неожиданность — null и строка в лог, а не исключение
  * наружу.
+ *
+ * Исключение — чат комнаты (`chatUrl`): он требует participant-токен, тот
+ * самый, что отдаёт `join`. Без него ручка отвечает 401.
  */
 
 /** Комната у них может отвечать долго, но обработчик чата ждать не должен. */
@@ -62,8 +65,22 @@ export class TalerIdRoomClient {
     return `wss://${host}/livekit/`;
   }
 
+  /**
+   * Путь БЕЗ префикса `/api` — единственный, который есть в обеих их средах.
+   *
+   * Раньше здесь стояло `/api/voice/rooms/public/...`. На проде работают оба
+   * варианта, а на стенде маршрута с `/api` не существует вовсе: проверено
+   * 07.09.2026 — `staging.id.taler.tirol/api/voice/rooms/public/36fc367a`
+   * отвечает «Cannot GET», тогда как тот же путь без префикса отвечает
+   * «Room not found», то есть маршрут есть и до него дошли.
+   *
+   * Разница не косметическая. Их 404 мы по своему же замыслу трактуем как
+   * «такой комнаты нет» (см. ниже), поэтому со стендовой базой ЛЮБОЙ вход в
+   * чужую встречу выглядел бы как несуществующая комната — без единой строки
+   * в логе о настоящей причине.
+   */
   private async call(path: string, init?: RequestInit): Promise<any | null> {
-    const url = `${this.base()}/api/voice/rooms/public/${path}`;
+    const url = `${this.base()}/voice/rooms/public/${path}`;
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
     try {
@@ -101,6 +118,25 @@ export class TalerIdRoomClient {
       creatorName: String(d.creatorName ?? ''),
       creatorAvatar: typeof d.creatorAvatar === 'string' ? d.creatorAvatar : undefined,
     };
+  }
+
+  /**
+   * Куда писать в чат комнаты.
+   *
+   * Ручка берёт roomName, а НЕ код из ссылки: `/voice/rooms/{roomName}/chat`,
+   * и требует participant-токен — без него 401 (проверено 07.09.2026).
+   *
+   * База — из окружения, как и у всех остальных путей этого клиента.
+   * `TALERID_BASE_URL` сейчас не выставлена ни на одном стенде, и работает
+   * прод-дефолт; в `chat.service.ts` у той же переменной дефолт стендовый.
+   * Пока это никому не мешает, но разъезжаться дальше не стоит.
+   *
+   * Сам метод только собирает адрес: писать будет воркер, у которого есть
+   * participant-токен и подключение к комнате. Хранить токен на бэкенде ради
+   * этого не нужно.
+   */
+  chatUrl(roomName: string): string {
+    return `${this.base()}/voice/rooms/${encodeURIComponent(roomName)}/chat`;
   }
 
   /**
