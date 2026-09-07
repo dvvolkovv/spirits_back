@@ -37,6 +37,14 @@ export class Mixer {
 
   private buffers = new Map<string, Int16Array[]>();
 
+  /**
+   * @param samplesPerTick сколько сэмплов в тике. По умолчанию 960 — это
+   *   48 кГц, частота LiveKit, на которой работают свои комнаты и Taler ID.
+   *   Встречи через Attendee идут на 24 кГц (родная частота Realtime, ни
+   *   одного ресемпла на пути), там тик — 480.
+   */
+  constructor(private readonly samplesPerTick: number = SAMPLES_PER_TICK) {}
+
   push(participant: string, samples: Int16Array): void {
     if (!samples.length) return;
     const queue = this.buffers.get(participant) || [];
@@ -55,7 +63,7 @@ export class Mixer {
 
   /** Один смикшированный кадр. Вызывается ровно раз в TICK_MS. */
   tick(): Int16Array {
-    const out = new Int16Array(SAMPLES_PER_TICK);
+    const out = new Int16Array(this.samplesPerTick);
     for (const queue of this.buffers.values()) {
       const chunk = this.takeTick(queue);
       for (let i = 0; i < chunk.length; i++) {
@@ -71,16 +79,16 @@ export class Mixer {
   private countTicks(queue: Int16Array[]): number {
     let n = 0;
     for (const c of queue) n += c.length;
-    return Math.ceil(n / SAMPLES_PER_TICK);
+    return Math.ceil(n / this.samplesPerTick);
   }
 
   /** Снять с очереди ровно тик; если данных меньше — сколько есть. */
   private takeTick(queue: Int16Array[]): Int16Array {
-    const out = new Int16Array(SAMPLES_PER_TICK);
+    const out = new Int16Array(this.samplesPerTick);
     let filled = 0;
-    while (filled < SAMPLES_PER_TICK && queue.length) {
+    while (filled < this.samplesPerTick && queue.length) {
       const head = queue[0];
-      const need = SAMPLES_PER_TICK - filled;
+      const need = this.samplesPerTick - filled;
       if (head.length <= need) {
         out.set(head, filled);
         filled += head.length;
@@ -94,7 +102,7 @@ export class Mixer {
         filled += need;
       }
     }
-    // Длина всегда SAMPLES_PER_TICK: недобранный хвост остаётся тишиной. Тик
+    // Длина всегда samplesPerTick: недобранный хвост остаётся тишиной. Тик
     // обязан быть ровным, иначе поток в Realtime поедет по времени.
     return out;
   }
