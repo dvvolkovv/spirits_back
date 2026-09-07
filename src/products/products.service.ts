@@ -16,24 +16,34 @@ export class ProductsService implements OnModuleInit {
   /**
    * Модуль накатывает свою схему сам: общий runner миграций на проде застрял
    * на base/001 и не докатывает ничего после. Тот же приём в custom-agents и
-   * tg-bot. Два пути-кандидата — dist (после сборки) и src (ts-node).
+   * tg-bot.
+   *
+   * ВНИМАНИЕ по порядку кандидатов: в nest-cli.json нет секции assets, поэтому
+   * .sql в dist не копируется вообще. На проде существует ВТОРОЙ путь (через
+   * src), а не первый. Первый оставлен на случай, если assets когда-нибудь
+   * добавят. Не удаляй второй как «dev-фолбэк» — это выключит миграции молча.
    */
   private async applyMigration(filename: string) {
     const candidates = [
       path.join(__dirname, 'migrations', filename),
       path.join(__dirname, '..', '..', 'src', 'products', 'migrations', filename),
     ];
+    let found = false;
     for (const p of candidates) {
+      if (!fs.existsSync(p)) continue;
+      found = true;
       try {
-        if (fs.existsSync(p)) {
-          await this.pg.query(fs.readFileSync(p, 'utf8'));
-          this.logger.log(`products migration ${filename} applied from ${p}`);
-          return;
-        }
+        await this.pg.query(fs.readFileSync(p, 'utf8'));
+        this.logger.log(`products migration ${filename} applied from ${p}`);
+        return;
       } catch (e: any) {
         this.logger.error(`products migration ${filename} failed (${p}): ${e.message}`);
       }
     }
-    this.logger.warn(`products migration ${filename} not found, skipping`);
+    if (found) {
+      this.logger.error(`products migration ${filename} was found but did not apply on any candidate path`);
+    } else {
+      this.logger.warn(`products migration ${filename} not found, skipping`);
+    }
   }
 }

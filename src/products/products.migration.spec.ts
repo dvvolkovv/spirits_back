@@ -29,4 +29,15 @@ describe('ProductsService.onModuleInit', () => {
 
     expect(queries.join('\n')).toContain('product_turns_one_active');
   });
+
+  it('не падает, если применение миграции бросает ошибку', async () => {
+    const pg = {
+      query: jest.fn(async () => {
+        throw new Error('boom');
+      }),
+    };
+    const svc = new ProductsService(pg as any);
+
+    await expect(svc.onModuleInit()).resolves.toBeUndefined();
+  });
 });
