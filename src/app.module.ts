@@ -7,6 +7,7 @@ import { ProfileModule } from './profile/profile.module';
 import { BackupModule } from './backup/backup.module';
 import { AgentsModule } from './agents/agents.module';
 import { CustomAgentsModule } from './custom-agents/custom-agents.module';
+import { ProductsModule } from './products/products.module';
 import { ChatModule } from './chat/chat.module';
 import { TokensModule } from './tokens/tokens.module';
 import { PaymentsModule } from './payments/payments.module';
@@ -60,6 +61,7 @@ import { MeetingModule } from './meeting/meeting.module';
     BackupModule,
     AgentsModule,
     CustomAgentsModule,
+    ProductsModule,
     ChatModule,
     TokensModule,
     PaymentsModule,

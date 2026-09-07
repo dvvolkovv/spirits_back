@@ -50,4 +50,14 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   async keys(pattern: string): Promise<string[]> {
     return this.client.keys(pattern);
   }
+
+  /** Добавляет значение в конец списка. Нужно буферу событий хода (products). */
+  async rpush(key: string, value: string): Promise<number> {
+    return this.client.rpush(key, value);
+  }
+
+  /** Диапазон списка включительно, как в ioredis/Redis (`-1` — последний элемент). */
+  async lrange(key: string, start: number, stop: number): Promise<string[]> {
+    return this.client.lrange(key, start, stop);
+  }
 }

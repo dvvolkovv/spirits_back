@@ -1,0 +1,66 @@
+import { NotFoundException } from '@nestjs/common';
+import { ProductsService } from './products.service';
+
+const ROW = {
+  id: 'p-1',
+  user_id: '79030169187',
+  name: 'selyanska',
+  slug: 'selyanska',
+  status: 'running',
+  checkout_path: '/home/dv/selyanska',
+};
+
+function makeService(rows: any[]) {
+  const calls: { sql: string; params: any[] }[] = [];
+  const pg = {
+    query: jest.fn(async (sql: string, params: any[] = []) => {
+      calls.push({ sql, params });
+      return { rows };
+    }),
+  };
+  return { svc: new ProductsService(pg as any), calls };
+}
+
+describe('ProductsService.list', () => {
+  it('фильтрует по владельцу и не отдаёт архивные', async () => {
+    const { svc, calls } = makeService([ROW]);
+
+    await svc.list('79030169187');
+
+    expect(calls[0].params).toEqual(['79030169187']);
+    // Оба условия WHERE проверяются отдельно. Утверждение только про архивные
+    // оставляет фильтр владельца без сторожа, а этот метод отдаёт коллекцию:
+    // снятый предикат вернёт клиенту чужие продукты списком, вместе с их
+    // checkout_path, domain и host_ip.
+    expect(calls[0].sql).toContain('user_id = $1');
+    expect(calls[0].sql).toContain('archived_at IS NULL');
+  });
+});
+
+describe('ProductsService.getOwned', () => {
+  it('отдаёт продукт своему владельцу', async () => {
+    const { svc } = makeService([ROW]);
+
+    await expect(svc.getOwned('p-1', '79030169187')).resolves.toMatchObject({ id: 'p-1' });
+  });
+
+  it('чужой продукт не отличим от несуществующего', async () => {
+    const { svc, calls } = makeService([]);
+
+    await expect(svc.getOwned('p-1', '70000000000')).rejects.toBeInstanceOf(NotFoundException);
+    // Владелец в WHERE, а не в проверке после выборки: иначе existence чужого
+    // продукта утекает через разницу между 403 и 404.
+    //
+    // Утверждение о тексте SQL здесь обязательно. Мок игнорирует sql и всегда
+    // отдаёт заданный rows, поэтому проверка одних только params фиксирует
+    // форму вызова, а не участие параметра в фильтрации: убери `AND user_id =
+    // $2` из запроса, оставив параметр на месте, — и тест останется зелёным.
+    expect(calls[0].sql).toContain('user_id = $2');
+    // На getOwned завязаны все три клиентских маршрута из Task 8 — chat,
+    // history и revert. Без этого условия заархивированный продукт останется
+    // полностью управляемым по прямому id: клиент продолжит гонять агента в
+    // чекауте продукта, выведенного из эксплуатации.
+    expect(calls[0].sql).toContain('archived_at IS NULL');
+    expect(calls[0].params).toEqual(['p-1', '70000000000']);
+  });
+});
