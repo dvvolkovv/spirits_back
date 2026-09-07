@@ -225,7 +225,7 @@ curl -sX POST "$ATTENDEE_BASE_URL/api/v1/bots" \
 | 2 | Проходит ли звук | Слышно ли эхо в встрече; фактические `sample_rate` и размер куска; time-to-first-audio |
 | 3 | `session.start()` без живой комнаты | Заводится ли сессия с нашей пустой комнатой; если нет — работает ли `session.start()` вовсе без `room`. **Главный риск плана** |
 | 4 | Виден ли бот сам себе | Приходит ли `participant_events.join_leave` про самого бота. От этого зависит, надо ли исключать себя в `presence.ts` |
-| 5 | Канонизация подписи | `grep -rn "X-Webhook-Signature" .` в исходниках Attendee → точный алгоритм для Task 4 |
+| ~~5~~ | ~~Канонизация подписи~~ | **ЗАКРЫТ 07.09.2026 по исходникам**, спайком проверять не нужно. `bots/webhook_utils.py::sign_payload` подписывает `json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",",":"))`, заголовок `X-Webhook-Signature`, base64. Телом при этом уходит `requests.post(json=…)`, то есть дефолтный `json.dumps` — с пробелами и без сортировки, **не совпадающий** с подписанной строкой. Значит проверка по сырым байтам невозможна в принципе, только по канонизации разобранного объекта. Реализовано в Task 4 |
 | 6 | Точный контракт создания бота | Какие поля приняты, какие проигнорированы; форма ответа |
 | 7 | Есть ли сброс очереди звука | Умеет ли Attendee выбросить недосказанное при перебивании. Если нет — перебивание будет слышно хуже, чем в своих комнатах, и это идёт в спеку как ограничение (см. `clearBuffer` в Task 9) |
 
@@ -377,18 +377,33 @@ git commit -m "feat(meeting): разбор ссылки на встречу Goog
 Своя реализация, а не `voice-call/hmac.ts`: там hex над сырыми байтами, здесь
 base64 над канонизированным JSON.
 
-- [ ] **Step 1: Уточнить канонизацию по исходникам**
+- [ ] **Step 1: Канонизация — уже выяснена, сверить и идти дальше**
 
-Ответ из Task 2, шага 3, вопрос 5. Если спайк ещё не прошёл — сделать сейчас,
-это одна команда в чекауте Attendee:
+**Закрыто 07.09.2026 по исходникам `attendee-labs/attendee`**, гадать не нужно.
 
-```bash
-grep -rn "X-Webhook-Signature\|def sign\|canonical" --include='*.py' .
+`bots/webhook_utils.py::sign_payload`:
+
+```python
+payload_json = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+signature = hmac.new(secret, payload_json.encode("utf-8"), hashlib.sha256).digest()
+return base64.b64encode(signature).decode("utf-8")
 ```
 
-Ниже реализация под наиболее вероятную канонизацию: рекурсивно отсортированные
-ключи, разделители без пробелов, UTF-8. **Если исходники говорят иначе —
-поправить `canonicalJson` и тесты, остальное не меняется.**
+`bots/tasks/deliver_webhook_task.py` отправляет это заголовком
+`X-Webhook-Signature`, а телом — `requests.post(url, json=webhook_data)`, то
+есть **дефолтный** `json.dumps`: с пробелами в разделителях и без сортировки.
+
+Отсюда два следствия, оба важные:
+
+1. **Байты тела и подписанная строка не совпадают.** Проверка по сырому телу
+   невозможна в принципе — только по канонизации разобранного объекта. Значит
+   реализация ниже не «вариант», а единственный путь, и `bodyParser.raw` в
+   `main.ts` для этой ручки действительно не нужен.
+2. **Дробные числа неисправимо ломают проверку.** `json.dumps(1.0)` в Python
+   даёт `1.0`, а `JSON.stringify` после `JSON.parse` — `1`; отличить float от
+   int в JS уже нельзя. Наши три триггера несут строки и целые, но
+   `event_metadata` у `bot.state_change` — свободный объект. Обойти нельзя,
+   поэтому в Task 11 ручка обязана логировать обе строки при несовпадении.
 
 - [ ] **Step 2: Написать падающие тесты**
 
@@ -1788,6 +1803,16 @@ describe('MeetWebhookController', () => {
     expect(livekit.send).not.toHaveBeenCalled();
   });
 
+  it('несовпадение подписи попадает в лог вместе с канонизацией', async () => {
+    // Иначе расхождение канонизации (например, из-за дробного числа в
+    // event_metadata) неотличимо от подделки, а выглядит как молчаливое
+    // отсутствие присутствия — то есть как сорванный в solo гейт.
+    const warn = jest.spyOn((ctl as any).logger, 'warn').mockImplementation(() => {});
+    const p = hook('bot.state_change', { new_state: 'joined' });
+    await expect(ctl.receive('мусор', p as any)).rejects.toThrow(UnauthorizedException);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('bot.state_change'));
+  });
+
   it('без секрета — 503', async () => {
     delete process.env.ATTENDEE_WEBHOOK_SECRET;
     const p = hook('bot.state_change', { new_state: 'joined' });
@@ -1824,7 +1849,7 @@ import {
 } from '@nestjs/common';
 import { LiveKitClient } from '../voice-call/livekit.client';
 import { VoiceCallService } from '../voice-call/voice-call.service';
-import { verifyAttendeeSignature } from './attendee-signature';
+import { canonicalJson, verifyAttendeeSignature } from './attendee-signature';
 
 /**
  * Вебхуки Attendee.
@@ -1878,6 +1903,21 @@ export class MeetWebhookController {
     const secret = process.env.ATTENDEE_WEBHOOK_SECRET;
     if (!secret) throw new ServiceUnavailableException('attendee webhooks are not configured');
     if (!verifyAttendeeSignature(secret, body, signature)) {
+      // Логируем канонизацию — иначе расхождение неотличимо от подделки.
+      //
+      // Причина конкретная: Attendee подписывает json.dumps(sort_keys=True),
+      // а мы пересобираем строку из разобранного объекта, потому что телом
+      // приходит другая сериализация (с пробелами, без сортировки). Дробное
+      // число в payload делает совпадение невозможным: json.dumps(1.0) даёт
+      // «1.0», а JSON.stringify после JSON.parse — «1». Наши триггеры несут
+      // целые и строки, но event_metadata — свободный объект.
+      //
+      // Без этой строки сбой выглядел бы как молчаливые 401, то есть как
+      // отсутствие присутствия — а это сорванный в solo гейт и ассистент,
+      // отвечающий на каждую реплику встречи.
+      this.logger.warn(
+        `[meet] подпись не сошлась, trigger=${body?.trigger} канонизация=${canonicalJson(body).slice(0, 500)}`,
+      );
       throw new UnauthorizedException('bad signature');
     }
 
