@@ -61,13 +61,11 @@ describe('Mixer', () => {
 
   test('кадр короче тика дополняется тишиной', () => {
     const m = new Mixer();
-    // Уровень ниже NOISE_FLOOR_RMS: тест о геометрии кадра, а не о громкости,
-    // и выравнивание не должно в него вмешиваться.
-    m.push('alice', Int16Array.from({ length: 10 }, () => 100));
+    m.push('alice', Int16Array.from({ length: 10 }, () => 500));
     const out = m.tick();
     assert.equal(out.length, SAMPLES_PER_TICK);
-    assert.equal(out[0], 100);
-    assert.equal(out[9], 100);
+    assert.equal(out[0], 500);
+    assert.equal(out[9], 500);
     assert.equal(out[10], 0);
   });
 
@@ -101,13 +99,11 @@ describe('Mixer', () => {
     // Во встрече важна свежая речь: если копить, задержка только растёт.
     const m = new Mixer();
     for (let i = 0; i < 200; i++) m.push('alice', frame(1));
-    // Метка ниже NOISE_FLOOR_RMS: тест про вытеснение из очереди, и
-    // выравнивание громкости не должно менять искомое значение.
-    m.push('alice', frame(200));
+    m.push('alice', frame(777));
     // Вычерпываем буфер и проверяем, что свежий кадр в нём остался.
     let seen = false;
     for (let i = 0; i < Mixer.MAX_BUFFERED_TICKS + 2; i++) {
-      if (m.tick()[0] === 200) seen = true;
+      if (m.tick()[0] === 777) seen = true;
     }
     assert.ok(seen, 'свежий кадр вытеснили вместо старого');
   });
@@ -128,6 +124,8 @@ describe('Mixer', () => {
  * обрывки. Складывая дорожки как есть, мы сохраняли разницу микрофонов.
  */
 describe('Mixer — выравнивание громкости', () => {
+  /** Микшер с включённым выравниванием — так его создаёт вход встречи. */
+  const leveller = () => new Mixer(true);
   /** Кадр-«речь» заданного уровня: знакопеременный, чтобы RMS был равен |value|. */
   function speech(level: number, ticks = 1): Int16Array {
     return Int16Array.from({ length: SAMPLES_PER_TICK * ticks }, (_, i) =>
@@ -136,32 +134,60 @@ describe('Mixer — выравнивание громкости', () => {
   }
 
   test('тихого поднимаем к целевому уровню', () => {
-    const m = new Mixer();
+    const m = leveller();
     // Гоняем достаточно кадров, чтобы скользящая оценка дошла до уровня.
     for (let i = 0; i < 200; i++) m.push('quiet', speech(500));
     assert.ok(m.gainFor('quiet') > 3, `усиление ${m.gainFor('quiet')} — тихого не подняли`);
   });
 
   test('громкого не трогаем — только вверх, никогда вниз', () => {
-    const m = new Mixer();
+    const m = leveller();
     for (let i = 0; i < 200; i++) m.push('loud', speech(12_000));
     assert.equal(m.gainFor('loud'), 1);
   });
 
   test('усиление ограничено потолком — шум микрофона не станет громче речи', () => {
-    const m = new Mixer();
-    for (let i = 0; i < 200; i++) m.push('verysoft', speech(Mixer.NOISE_FLOOR_RMS + 1));
+    const m = leveller();
+    for (let i = 0; i < 200; i++) m.push('verysoft', speech(Mixer.ABS_SILENCE_RMS + 5));
     assert.equal(m.gainFor('verysoft'), Mixer.MAX_GAIN);
   });
 
+  /**
+   * Тихий участник должен подтягиваться К ЦЕЛИ, а не просто «немного вверх».
+   *
+   * Порог речи стоял абсолютным (300) при речи тихого на уровне 287: в оценку
+   * попадали только пики, оценка выходила завышенной, усиление — заниженным.
+   * Опыт на синтетической встрече 07.09.2026: вход 287 поднимался до 1726 при
+   * цели 3000, и такого участника распознавание не слышало вовсе.
+   */
+  test('тихий доводится до целевого уровня, а не до половины', () => {
+    const m = leveller();
+    const level = 287; // ровно тот уровень, на котором участника теряли
+    for (let i = 0; i < 400; i++) m.push('quiet', speech(level));
+    const итог = level * m.gainFor('quiet');
+    assert.ok(
+      итог > Mixer.TARGET_RMS * 0.75,
+      `после усиления ${Math.round(итог)} при цели ${Mixer.TARGET_RMS} — недотянули`,
+    );
+  });
+
+
+  test('усиление набирается с первых кадров, а не к середине фразы', () => {
+    const m = leveller();
+    // Полсекунды речи — 50 кадров по 10 мс. К этому моменту усиление обязано
+    // быть уже почти рабочим: иначе начало первой фразы уходит неусиленным.
+    for (let i = 0; i < 50; i++) m.push('quiet', speech(287));
+    assert.ok(287 * m.gainFor('quiet') > Mixer.TARGET_RMS * 0.7, 'усиление набирается слишком медленно');
+  });
+
   test('тишина оценку не портит — усиления нет, пока не было речи', () => {
-    const m = new Mixer();
+    const m = leveller();
     for (let i = 0; i < 200; i++) m.push('silent', speech(10));
     assert.equal(m.gainFor('silent'), 1);
   });
 
   test('паузы не задирают усиление говорившему', () => {
-    const m = new Mixer();
+    const m = leveller();
     for (let i = 0; i < 200; i++) m.push('alice', speech(4000));
     const во_время_речи = m.gainFor('alice');
     for (let i = 0; i < 500; i++) m.push('alice', speech(5)); // долгая пауза
@@ -169,7 +195,7 @@ describe('Mixer — выравнивание громкости', () => {
   });
 
   test('тихий и громкий после сведения сопоставимы', () => {
-    const m = new Mixer();
+    const m = leveller();
     for (let i = 0; i < 200; i++) {
       m.push('loud', speech(9000));
       m.push('quiet', speech(900));
@@ -187,7 +213,7 @@ describe('Mixer — выравнивание громкости', () => {
   });
 
   test('статистика отличает «молчал» от «звука не было»', () => {
-    const m = new Mixer();
+    const m = leveller();
     for (let i = 0; i < 10; i++) m.push('talker', speech(5000));
     for (let i = 0; i < 10; i++) m.push('listener', speech(5)); // микрофон есть, речи нет
     const s = Object.fromEntries(m.stats().map((x) => [x.participant, x]));

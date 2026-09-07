@@ -27,7 +27,7 @@ import { Mixer, SAMPLE_RATE, SAMPLES_PER_TICK, TICK_MS } from './mixer.js';
  * подробно в mixer.ts.
  */
 export class MixedRoomAudioInput extends voice.AudioInput {
-  private mixer = new Mixer();
+  private mixer = new Mixer(true);
   private ticker?: ReturnType<typeof setInterval>;
   private closed = false;
   private push: (frame: AudioFrame) => void = () => {};

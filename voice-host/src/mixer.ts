@@ -6,6 +6,26 @@ export const TICK_MS = 20;
 
 export const SAMPLES_PER_TICK = (SAMPLE_RATE * TICK_MS) / 1000; // 960
 
+/** Что мы держим по каждому участнику: его звук и его громкость. */
+interface Track {
+  queue: Int16Array[];
+  /** Сколько кадров пришло всего — отличает «молчит» от «звук не доходит». */
+  frames: number;
+  /** Сколько из них были речью, а не тишиной. */
+  speechFrames: number;
+  /** Огибающая громкости: от неё считается, что у ЭТОГО участника речь. */
+  peak: number;
+  /** Скользящая громкость речи. Ноль — речи ещё не было. */
+  speechRms: number;
+}
+
+/** Среднеквадратичная громкость кадра. */
+function rmsOf(samples: Int16Array): number {
+  let sum = 0;
+  for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
+  return Math.sqrt(sum / samples.length);
+}
+
 /**
  * Сведение речи участников встречи в один поток.
  *
@@ -24,24 +44,6 @@ export const SAMPLES_PER_TICK = (SAMPLE_RATE * TICK_MS) / 1000; // 960
  * у каждого участника свой буфер, тикер раз в 20 мс забирает из каждого по 960
  * сэмплов. Нет данных — тишина, и молчащий не тормозит говорящего.
  */
-/** Что мы держим по каждому участнику: его звук и его громкость. */
-interface Track {
-  queue: Int16Array[];
-  /** Сколько кадров пришло всего — отличает «молчит» от «звук не доходит». */
-  frames: number;
-  /** Сколько из них были речью, а не тишиной. */
-  speechFrames: number;
-  /** Скользящая громкость речи. Ноль — речи ещё не было. */
-  speechRms: number;
-}
-
-/** Среднеквадратичная громкость кадра. */
-function rmsOf(samples: Int16Array): number {
-  let sum = 0;
-  for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
-  return Math.sqrt(sum / samples.length);
-}
-
 export class Mixer {
   /**
    * Потолок буфера — полсекунды.
@@ -63,18 +65,61 @@ export class Mixer {
   static readonly TARGET_RMS = 3000;
 
   /**
-   * Ниже этого уровня кадр считается тишиной и в оценку громкости не идёт.
+   * Ниже этого уровня кадр — тишина, и в оценку громкости он не идёт.
    *
-   * Без порога средняя громкость участника считалась бы вместе с паузами, а
-   * пауз на встрече больше, чем речи: у молчащего оценка уехала бы к нулю, и
-   * усиление выкрутилось бы в потолок на его фоновом шуме.
+   * Здесь стояло 300, и это была ровно та ошибка, из-за которой участника
+   * теряли: у тихого собеседника речь идёт на уровне 287, то есть ЦЕЛИКОМ под
+   * порогом. В оценку попадали только редкие пики, она выходила завышенной
+   * (405 вместо 287), а усиление из неё — заниженным вдвое. Опыт на
+   * синтетической встрече 07.09.2026: вход 287 поднимался до 1726 при цели
+   * 3000, и распознавание такого участника не слышало вовсе, тогда как
+   * громкого слышало всегда.
+   *
+   * Сорок — это уже почти цифровая тишина, ниже неё речи не бывает ни у
+   * какого микрофона.
+   *
+   * Ровный фоновый шум на уровне речи такой порог, конечно, не отличит:
+   * по громкости кадра они неразличимы в принципе, отличаются модуляцией.
+   * Мы сознательно ошибаемся в сторону «поднять лишнее»: цена — приподнятый
+   * фон у шумного микрофона (не выше MAX_GAIN), цена обратной ошибки —
+   * участник, которого не слышно вовсе.
    */
-  static readonly NOISE_FLOOR_RMS = 300;
+  static readonly ABS_SILENCE_RMS = 40;
+
+  /**
+   * Сколько первых речевых кадров усредняются быстро.
+   *
+   * Скользящее среднее с шагом 0.05 набирает уровень за пару секунд — а
+   * фраза столько и длится, то есть её начало уходит в модель неусиленным.
+   * В живом опыте первая фраза тихого участника целиком прошла при ×1.
+   */
+  static readonly FAST_ATTACK_FRAMES = 20;
+
+  /**
+   * Какая доля от собственной огибающей участника считается речью.
+   *
+   * Среднее по ВСЕМ кадрам громче абсолютного пола оценку занижает: внутри
+   * фразы полно тихих кадров — паузы между словами, хвосты слогов, — и
+   * громкого участника такая оценка тоже начинает усиливать (на бенче ×5.73
+   * там, где нужно ×1.25). Порог, привязанный к огибающей САМОГО участника,
+   * работает одинаково и на громком, и на тихом: у каждого «речь» меряется
+   * относительно его же уровня.
+   */
+  static readonly SPEECH_OVER_PEAK = 0.15;
 
   /** Потолок усиления. Больше — и шум тихого микрофона станет громче речи. */
-  static readonly MAX_GAIN = 8;
+  static readonly MAX_GAIN = 12;
 
   private tracks = new Map<string, Track>();
+
+  /**
+   * @param levelling выравнивать ли громкость участников. Выключено по
+   *   умолчанию: сведение и выравнивание — разные обязанности, и инварианты
+   *   сведения (геометрия тика, вытеснение очереди, ограничение суммы) должны
+   *   проверяться без усиления, иначе тест на них меряет заодно и его.
+   *   Вход встречи создаёт микшер с выравниванием.
+   */
+  constructor(private readonly levelling = false) {}
 
   push(participant: string, samples: Int16Array): void {
     if (!samples.length) return;
@@ -83,10 +128,16 @@ export class Mixer {
     while (this.countTicks(t.queue) > Mixer.MAX_BUFFERED_TICKS) t.queue.shift();
     t.frames++;
     const rms = rmsOf(samples);
-    if (rms > Mixer.NOISE_FLOOR_RMS) {
+
+    // Огибающая: мгновенно вверх, медленно вниз (около секунды на затухание).
+    t.peak = rms > t.peak ? rms : t.peak * 0.999;
+
+    if (rms > Math.max(Mixer.ABS_SILENCE_RMS, t.peak * Mixer.SPEECH_OVER_PEAK)) {
       // Скользящее среднее по РЕЧЕВЫМ кадрам: оценка не должна прыгать от
-      // одного громкого слога и не должна проседать в паузах.
-      t.speechRms = t.speechRms === 0 ? rms : t.speechRms * 0.95 + rms * 0.05;
+      // одного громкого слога и не должна проседать в паузах. В начале шаг
+      // крупнее — иначе первая фраза успевает пройти неусиленной.
+      const a = t.speechFrames < Mixer.FAST_ATTACK_FRAMES ? 0.3 : 0.05;
+      t.speechRms = t.speechFrames === 0 ? rms : t.speechRms * (1 - a) + rms * a;
       t.speechFrames++;
     }
   }
@@ -112,8 +163,10 @@ export class Mixer {
    * только верхний голос.
    */
   gainFor(participant: string): number {
+    if (!this.levelling) return 1;
     const t = this.tracks.get(participant);
-    if (!t || t.speechRms < Mixer.NOISE_FLOOR_RMS) return 1;
+    // Речи ещё не слышали — усиливать нечего и не из чего.
+    if (!t || t.speechFrames === 0 || t.speechRms < Mixer.ABS_SILENCE_RMS) return 1;
     const gain = Mixer.TARGET_RMS / t.speechRms;
     return Math.min(Math.max(gain, 1), Mixer.MAX_GAIN);
   }
@@ -148,7 +201,7 @@ export class Mixer {
   private track(participant: string): Track {
     let t = this.tracks.get(participant);
     if (!t) {
-      t = { queue: [], frames: 0, speechFrames: 0, speechRms: 0 };
+      t = { queue: [], frames: 0, speechFrames: 0, speechRms: 0, peak: 0 };
       this.tracks.set(participant, t);
     }
     return t;
