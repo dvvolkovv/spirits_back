@@ -197,6 +197,12 @@ describe('MeetingService', () => {
       await svc.leave('c1');
       expect(calls.markInterruptedKeepingRoom).toHaveBeenCalledWith('c1');
     });
+
+    it('несуществующий звонок не роняет выход', async () => {
+      calls.load.mockRejectedValue(new Error('call not found'));
+      await svc.leave('нет-такого');
+      expect(calls.markInterruptedKeepingRoom).toHaveBeenCalledWith('нет-такого');
+    });
   });
 
   describe('noteFirstHuman', () => {
@@ -348,6 +354,45 @@ describe('MeetingService', () => {
       await svc.join('u1', 7, 'ABC234');
       expect(attendee.createBot).not.toHaveBeenCalled();
       expect(livekit.dispatchAgent).toHaveBeenCalledWith('room_ABC234', expect.any(Object));
+    });
+
+    it('падение UPDATE после создания бота — бот всё равно выводится', async () => {
+      // Самый коварный путь: бот уже в встрече, а id в базу не уехал.
+      // Без уборки здесь Chrome остаётся в переговорах клиента навсегда:
+      // реапер ищет по непустому external_bot_id и такую строку не найдёт.
+      withAgent();
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('FROM agents')) return { rows: [agentRow] };
+        if (sql.includes('SELECT tokens FROM ai_profiles_consolidated')) return { rows: [{ tokens: balance }] };
+        if (sql.includes('external_bot_id')) throw new Error('соединение оборвалось');
+        if (sql.includes('ai_profiles_consolidated')) return { rows: [{ name: 'Дмитрий' }] };
+        return { rows: [], rowCount: 0 };
+      });
+      await expect(svc.join('u1', 7, 'abc-defg-hij', 'meet')).rejects.toThrow();
+      expect(attendee.removeBot).toHaveBeenCalledWith('bot_1');
+    });
+
+    it('падение dispatchAgent — бот тоже выводится', async () => {
+      withAgent();
+      livekit.dispatchAgent.mockRejectedValue(new Error('livekit недоступен'));
+      await expect(svc.join('u1', 7, 'abc-defg-hij', 'meet')).rejects.toThrow();
+      expect(attendee.removeBot).toHaveBeenCalledWith('bot_1');
+    });
+
+    it('неудача уборки не подменяет исходную причину отказа', async () => {
+      // Наружу должна уйти причина, по которой вход не состоялся, а не то,
+      // что вдобавок не убрался бот.
+      withAgent();
+      livekit.dispatchAgent.mockRejectedValue(new Error('livekit недоступен'));
+      attendee.removeBot.mockRejectedValue(new Error('и Attendee лёг'));
+      await expect(svc.join('u1', 7, 'abc-defg-hij', 'meet')).rejects.toThrow('livekit недоступен');
+    });
+
+    it('своя встреча бота не создаёт и не убирает', async () => {
+      withAgent();
+      livekit.dispatchAgent.mockRejectedValue(new Error('livekit недоступен'));
+      await expect(svc.join('u1', 7, 'ABC234')).rejects.toThrow();
+      expect(attendee.removeBot).not.toHaveBeenCalled();
     });
   });
 

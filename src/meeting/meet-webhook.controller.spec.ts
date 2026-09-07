@@ -162,4 +162,13 @@ describe('MeetWebhookController', () => {
     const p = hook('bot.state_change', { new_state: 'joined' });
     await expect(ctl.receive(sign(p), p as any)).resolves.toEqual({ ok: true });
   });
+
+  it('при переполнении вытесняет старые ключи, а не растёт бесконечно', async () => {
+    // Воркер живёт неделями; множество без потолка росло бы всю его жизнь.
+    const p = (i: number) => hook('participant_events.join_leave', {
+      participant_name: 'Ч', participant_uuid: `u${i}`, event_type: 'join', timestamp_ms: i,
+    }, `key${i}`);
+    for (let i = 0; i < 5_100; i++) await ctl.receive(sign(p(i)), p(i) as any);
+    expect((ctl as any).seen.size).toBeLessThanOrEqual(5_000);
+  });
 });
