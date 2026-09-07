@@ -7,6 +7,11 @@ Type=simple
 User=%i
 WorkingDirectory=/opt/linkeon-product-runner
 EnvironmentFile=/etc/linkeon-product-runner.env
+# PATH подставляется при установке. systemd даёт минимальный PATH, а команды
+# сборки и рестарта продукта — это почти всегда node-инструменты (npm, pm2,
+# tsc), которые на серверах стоят под nvm. Без этого раннер падает на
+# `pm2: not found` — проверено установкой.
+Environment=PATH=__NODE_BIN__:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Путь к node подставляется при установке: захардкоженный /usr/bin/node
 # существует не везде. На тестовой ноде node стоит под nvm, и юнит с
 # /usr/bin/node падает с status=203/EXEC — проверено установкой.

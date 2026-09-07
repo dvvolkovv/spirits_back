@@ -40,7 +40,8 @@ CLAUDE_BIN=/usr/bin/claude
 # Подставить фактический путь к node: /usr/bin/node есть не на всякой машине.
 # На тестовой ноде node стоит под nvm, и юнит с захардкоженным путём падает
 # с status=203/EXEC — проверено установкой.
-sed "s|__NODE__|$(command -v node)|" linkeon-product-runner.service \
+sed -e "s|__NODE__|$(command -v node)|" \
+    -e "s|__NODE_BIN__|$(dirname "$(command -v node)")|" linkeon-product-runner.service \
   | sudo tee /etc/systemd/system/linkeon-product-runner.service >/dev/null
 sudo systemctl daemon-reload
 sudo systemctl enable --now linkeon-product-runner
