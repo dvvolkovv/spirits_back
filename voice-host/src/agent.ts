@@ -26,6 +26,7 @@ import { ExternalRoomChat } from './external-chat.js';
 import { Room as ExternalRoom } from '@livekit/rtc-node';
 import {
   answerTo,
+  answerToChat,
   callInstructions,
   callIntro,
   listenAck,
@@ -572,6 +573,42 @@ export default defineAgent({
             .filter(Boolean),
           Date.now(),
         );
+      });
+    }
+
+    /**
+     * Написанное в чате комнаты — такое же обращение, как сказанное вслух.
+     *
+     * Проходит через тот же гейт по имени: комната общая, участники пишут и
+     * друг другу тоже, и отвечать на каждое сообщение ассистент не должен.
+     * Своё эхо отсеивает ExternalRoomChat.parse — их сервер возвращает нам
+     * наши же отправки тем же пакетом.
+     */
+    if (foreign && chat) {
+      foreign.on(RoomEvent.DataReceived, (payload: Uint8Array) => {
+        const msg = chat!.parse(payload);
+        if (!msg) return;
+        console.log(`[чат] ${msg.name}: ${msg.text.slice(0, 80)}`);
+
+        // В транскрипт — с автором. Здесь он точный, в отличие от речи, где
+        // говорящий угадан по активности микрофона.
+        transcript.push({ role: 'user', text: msg.text, ts: Date.now(), speaker: msg.name });
+
+        const decision = gate ? gate.decide(msg.text, Date.now(), msg.name) : 'respond';
+        console.log(`[гейт/чат] ${decision} ← «${msg.text.slice(0, 80)}»`);
+        switch (decision) {
+          case 'respond':
+            replyOrDefer(answerToChat(msg.name, msg.text));
+            break;
+          case 'ack_listen':
+            replyOrDefer(listenAck());
+            break;
+          case 'ack_resume':
+            replyOrDefer(resumeAck());
+            break;
+          case 'silent':
+            break;
+        }
       });
     }
 
