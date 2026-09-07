@@ -164,6 +164,12 @@ describe('AttendeeAudioHub', () => {
       const waiting = hub.expect(5_000);
       const { WebSocket: Client } = await import('ws');
       client = new Client(`ws://127.0.0.1:${port}/?callId=c1`);
+      // Слушатель обязателен: 'connection' на сервере иногда обгоняет 'open'
+      // на клиенте, и terminate() ниже в такой момент кидает «closed before
+      // the connection was established». Без слушателя это всплывает
+      // необработанным исключением уже ПОСЛЕ конца теста, а не просто
+      // фейлит его.
+      client.on('error', () => {});
       const ws = await waiting;
       assert.ok(ws, 'соединение должно быть получено');
       // Оба конца закрываем явно: wss.close() у 'ws' не трогает уже
