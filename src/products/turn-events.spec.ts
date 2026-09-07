@@ -249,4 +249,29 @@ describe('TurnEventsService.readEvents', () => {
       { type: 'end' },
     ]);
   });
+
+  it('дренаж не дублирует end, если хвост уже содержит терминальное событие', async () => {
+    // Зонд ревьюера: раннер дописал хвост с `end` между обычным lrange и
+    // проверкой статуса — это не краевой случай, а штатное завершение потока
+    // раннером. Без проверки внутри дренажа генератор отдал бы настоящий
+    // `end` из хвоста и следом безусловно добавил бы синтетический — клиент
+    // увидел бы `end` дважды, и обработчик завершения отработал бы дважды.
+    //
+    // Существующий тест на дренаж (выше) этого не ловит: там в хвосте два
+    // `progress`, ни один не совпадает с `event?.type === 'end'`, поэтому
+    // условие внутри дренажа для него безразлично.
+    const { svc } = makeService({
+      lrangeBatches: [
+        [JSON.stringify({ type: 'item', content: 'правлю футер' })],
+        [JSON.stringify({ type: 'end' })],
+      ],
+      turnStatus: 'done',
+    });
+
+    const events = await collect(svc.readEvents('p-1', 't-1'));
+
+    const endCount = events.filter((e) => e.type === 'end').length;
+    expect(endCount).toBe(1);
+    expect(events).toEqual([{ type: 'item', content: 'правлю футер' }, { type: 'end' }]);
+  });
 });

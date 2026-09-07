@@ -170,6 +170,29 @@ describe('ProductsController.chat', () => {
   });
 });
 
+describe('ProductsController — привязка отмены', () => {
+  it('обрыв клиента виден генератору, а не только внешней проверке', async () => {
+    // Внешний `if (clientGone) break` работает, только пока идут события,
+    // поэтому все тесты на обрыв проходят и с отвязанным предикатом:
+    // подмена `() => clientGone` на `() => false` оставляла набор зелёным и
+    // молча возвращала дыру. Заглушка ниже не отдаёт ничего — значит внешняя
+    // проверка не сработает никогда, и связка держится только на предикате.
+    const { ctrl, turnEvents } = makeController([]);
+    let captured: (() => boolean) | undefined;
+    turnEvents.readEvents = jest.fn((_p: any, _t: any, isCancelled: () => boolean) => {
+      captured = isCancelled;
+      return (async function* () {})();
+    }) as any;
+
+    const req = makeReq();
+    await ctrl.chat(user, 'p-1', { prompt: 'go' } as any, req as any, makeRes() as any);
+    req.fireClose();
+
+    expect(captured).toBeDefined();
+    expect(captured!()).toBe(true);
+  });
+});
+
 describe('ProductsController.revert', () => {
   it('проверяет владение и ставит откат', async () => {
     const { ctrl, products, turns } = makeController([]);

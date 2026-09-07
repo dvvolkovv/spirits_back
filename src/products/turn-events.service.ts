@@ -79,7 +79,15 @@ export class TurnEventsService {
         // обрезанным хвостом.
         for (const raw of await this.redis.lrange(key, cursor, -1)) {
           cursor++;
-          yield JSON.parse(raw);
+          const event = JSON.parse(raw);
+          yield event;
+          // Своего `end` достаточно. Без этой проверки дренаж отдаёт хвост и
+          // следом добавляет синтетический `end` — а хвост, ради которого он
+          // написан, это последние события раннера, который завершает поток
+          // именно `end`. То есть штатное срабатывание давало бы дубль
+          // терминального события, и обработчик завершения на клиенте
+          // отрабатывал бы дважды.
+          if (event?.type === 'end' || event?.type === 'error') return;
         }
         yield { type: 'end' };
         return;

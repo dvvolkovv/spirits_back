@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, Req, Res, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Logger, Param, Post, Req, Res, UseGuards } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
@@ -9,6 +9,8 @@ import { TurnEventsService } from './turn-events.service';
 @Controller('')
 @UseGuards(JwtGuard)
 export class ProductsController {
+  private readonly logger = new Logger(ProductsController.name);
+
   constructor(
     private readonly products: ProductsService,
     private readonly turns: TurnsService,
@@ -85,6 +87,7 @@ export class ProductsController {
       // не сможет — клиент увидел бы обрыв сокета без объяснения. Отдаём
       // событие error, чтобы NDJSON-парсер на той стороне получил внятное
       // завершение.
+      this.logger.error(`chat: поток хода ${turn.id} прерван: ${e?.message}`);
       if (!clientGone) {
         res.write(JSON.stringify({ type: 'error', message: 'Поток прерван' }) + '\n');
       }
