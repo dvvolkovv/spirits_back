@@ -1,6 +1,7 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
+import { AttendeeClient } from '../meeting/attendee.client';
 import { LiveKitClient } from './livekit.client';
 import { JOB_TIMEOUT_MS } from './voice-call.types';
 
@@ -38,6 +39,9 @@ export class VoiceCallReaperService {
   constructor(
     private readonly pg: PgService,
     private readonly livekit: LiveKitClient,
+    // Опционально: без Attendee реапер обязан продолжать работать — он
+    // подбирает и обычные звонки, которым до Meet дела нет.
+    @Optional() private readonly attendee?: AttendeeClient,
   ) {}
 
   @Cron('0 */5 * * * *') // каждые 5 минут
@@ -65,7 +69,7 @@ export class VoiceCallReaperService {
           WHERE status IN ('dialing', 'active')
             AND provider <> 'linkeon'
             AND started_at < now() - ($1 || ' milliseconds')::interval
-          RETURNING id, room_name`,
+          RETURNING id, room_name, external_bot_id`,
         [String(STALE_MEETING_MS)],
       );
 
@@ -74,6 +78,7 @@ export class VoiceCallReaperService {
         // Комнату НЕ закрываем: в ней могут быть живые люди, и закрытие
         // выкинуло бы их всех из-за того, что зависла наша половина.
         await this.livekit.removeAgents(row.room_name);
+        if (row.external_bot_id) await this.sweepBot(row.id, row.external_bot_id);
       }
 
       // Job'ы переживших звонков: воркер про них уже не спросит.
@@ -87,9 +92,49 @@ export class VoiceCallReaperService {
       );
 
       if (jobs.rowCount) this.logger.warn(`[reap] ${jobs.rowCount} зависших job закрыто`);
+
+      await this.sweepForgottenBots();
     } catch (e: any) {
       // Реапер не должен ронять планировщик — он вспомогательный.
       this.logger.error(`[reap] failed: ${e?.message}`);
     }
+  }
+
+  /**
+   * Повторные попытки вывести забытых ботов.
+   *
+   * Первая попытка (при leave или в ветке встреч выше) могла не дозвониться:
+   * контейнер Attendee перезапускается, и это ожидаемое событие. Строка к
+   * тому моменту уже в терминальном статусе, и прежним запросом её больше не
+   * выбрать — значит нужен отдельный проход по непустому external_bot_id.
+   *
+   * Без этого забытый Chrome остаётся сидеть в чужих переговорах клиента до
+   * конца встречи.
+   */
+  private async sweepForgottenBots(): Promise<void> {
+    const rows = await this.pg.query(
+      `SELECT id, external_bot_id FROM voice_calls
+        WHERE external_bot_id IS NOT NULL
+          AND status NOT IN ('dialing', 'active')
+        LIMIT 50`,
+    );
+    for (const row of rows.rows) await this.sweepBot(row.id, row.external_bot_id);
+  }
+
+  /**
+   * Убрать одного бота и решить, помечать ли запись убранной.
+   *
+   * Три исхода removeBot различаются не для красоты: `null` означает, что
+   * состояние бота НЕИЗВЕСТНО. Обнулить колонку в этом случае значит навсегда
+   * забыть про бота, который, возможно, всё ещё сидит в встрече.
+   */
+  private async sweepBot(callId: string, botId: string): Promise<void> {
+    if (!this.attendee) return;
+    const res = await this.attendee.removeBot(botId).catch(() => null);
+    if (res === null) {
+      this.logger.warn(`[reaper] бот ${botId} call=${callId}: состояние неизвестно, повторим`);
+      return;
+    }
+    await this.pg.query(`UPDATE voice_calls SET external_bot_id = NULL WHERE id = $1`, [callId]);
   }
 }

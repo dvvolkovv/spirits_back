@@ -259,8 +259,21 @@ export class MeetingService {
    * Комнату НЕ закрываем: она не наша по смыслу — в ней люди, и они продолжают
    * встречу без ассистента. Этим встреча принципиально отличается от звонка,
    * где markInterrupted закрывает комнату вместе с разговором.
+   *
+   * Ассистент вышел — бот обязан выйти вместе с ним.
+   *
+   * Загрузка и уборка обёрнуты в catch: выход ассистента важнее уборки
+   * бота. Если Attendee недоступен, звонок всё равно обязан закрыться —
+   * иначе запись останется активной и запрёт пользователю следующий вход.
+   * Забытого бота подберёт реапер.
    */
   async leave(callId: string): Promise<void> {
+    try {
+      const call = await this.calls.load(callId);
+      if (call?.external_bot_id) await this.attendee.removeBot(call.external_bot_id);
+    } catch (e: any) {
+      this.logger.warn(`[leave] бот call=${callId} не выведен: ${e?.message}`);
+    }
     await this.calls.markInterruptedKeepingRoom(callId);
   }
 }
