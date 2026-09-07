@@ -39,7 +39,9 @@ CREATE TABLE IF NOT EXISTS product_turns (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   product_id   uuid NOT NULL REFERENCES products(id) ON DELETE CASCADE,
   user_id      text NOT NULL,
-  channel      text NOT NULL,
+  -- Словарь закреплён так же, как у status: TS-тип 'web' | 'telegram' не
+  -- переживает границу рантайма, а значение приходит из контроллера.
+  channel      text NOT NULL CHECK (channel IN ('web', 'telegram')),
   prompt       text NOT NULL,
   result       text,
   status       text NOT NULL DEFAULT 'queued'
