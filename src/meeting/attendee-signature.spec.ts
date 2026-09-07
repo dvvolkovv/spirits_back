@@ -53,4 +53,37 @@ describe('verifyAttendeeSignature', () => {
     expect(verifyAttendeeSignature(SECRET, payload, 'не base64!!')).toBe(false);
     expect(verifyAttendeeSignature(SECRET, payload, undefined as any)).toBe(false);
   });
+
+  it('сходится с подписью, посчитанной настоящим Python', () => {
+    // Золотой вектор. Остальные тесты этого describe считают подпись той же
+    // canonicalJson, что и проверяемый код, — то есть доказывают
+    // самосогласованность, а не совместимость с Attendee. Этот вектор
+    // посчитан вне нашего кода, Python 3.13:
+    //
+    //   canon = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+    //                      separators=(",", ":"))
+    //   base64(hmac.new(b'test-secret', canon.encode('utf-8'), sha256).digest())
+    //
+    // Payload — как настоящее событие participant_events.join_leave, с
+    // кириллицей в имени и намеренно неотсортированными ключами.
+    const payload = {
+      trigger: 'participant_events.join_leave',
+      bot_id: 'bot_1',
+      idempotency_key: 'k1',
+      bot_metadata: { callId: 'c1' },
+      data: {
+        participant_name: 'Сергей',
+        participant_uuid: 'u1',
+        event_type: 'join',
+        timestamp_ms: 1757222400000,
+      },
+    };
+    expect(canonicalJson(payload)).toBe(
+      '{"bot_id":"bot_1","bot_metadata":{"callId":"c1"},"data":{"event_type":"join",' +
+      '"participant_name":"Сергей","participant_uuid":"u1","timestamp_ms":1757222400000},' +
+      '"idempotency_key":"k1","trigger":"participant_events.join_leave"}',
+    );
+    expect(verifyAttendeeSignature('test-secret', payload,
+      'Jk7s1DxeUQ5yFdScDKoBCTkZNNKESJ3gHAV2bh6wD9o=')).toBe(true);
+  });
 });

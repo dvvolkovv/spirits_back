@@ -64,6 +64,15 @@ describe('AttendeeClient', () => {
       })).resolves.toBeNull();
     });
 
+    it('неразобранное тело на 200 — null: без id бота нет', async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true, status: 200, json: async () => { throw new Error('битый JSON'); },
+      }) as any;
+      await expect(new AttendeeClient().createBot({
+        meetingUrl: 'u', botName: 'n', callId: 'c1',
+      })).resolves.toBeNull();
+    });
+
     it('падение сети — null', async () => {
       global.fetch = jest.fn().mockRejectedValue(new Error('ECONNREFUSED')) as any;
       await expect(new AttendeeClient().createBot({
@@ -94,6 +103,36 @@ describe('AttendeeClient', () => {
       // Реапер и leave могут прийти одновременно; 404 здесь — норма.
       global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 404 }) as any;
       await expect(new AttendeeClient().removeBot('bot_1')).resolves.toBe(false);
+    });
+
+    it('сетевой сбой — null, а не false: состояние бота неизвестно', async () => {
+      // Отличие от 404 принципиальное. false читается вызывающим как «бота и
+      // так не было», и при недоступности Attendee Chrome остался бы сидеть
+      // в чужой встрече.
+      global.fetch = jest.fn().mockRejectedValue(new Error('ECONNREFUSED')) as any;
+      await expect(new AttendeeClient().removeBot('bot_1')).resolves.toBeNull();
+    });
+
+    it('ошибка сервиса — тоже null', async () => {
+      global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 500, json: async () => ({}) }) as any;
+      await expect(new AttendeeClient().removeBot('bot_1')).resolves.toBeNull();
+    });
+
+    it('успех определяется статусом, а не телом', async () => {
+      // Тело leave нам не нужно, и его может не быть вовсе. Раньше пустой
+      // объект от заглушки парсера читался как подтверждённое удаление —
+      // случайно, а не по решению.
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true, status: 200, json: async () => { throw new Error('пустое тело'); },
+      }) as any;
+      await expect(new AttendeeClient().removeBot('bot_1')).resolves.toBe(true);
+    });
+
+    it('id бота экранируется в пути', async () => {
+      const spy = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({}) });
+      global.fetch = spy as any;
+      await new AttendeeClient().removeBot('../../admin');
+      expect(spy.mock.calls[0][0]).toBe('https://attendee.test/api/v1/bots/..%2F..%2Fadmin/leave');
     });
   });
 });
