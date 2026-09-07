@@ -1,3 +1,7 @@
+import { execFileSync } from 'child_process';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { Git } from './git';
 
 function makeGit(responses: Record<string, string> = {}) {
@@ -49,6 +53,31 @@ describe('Git.resetHard', () => {
     await git.resetHard('aaa111');
 
     expect(runs).toContainEqual(['reset', '--hard', 'aaa111']);
+  });
+});
+
+describe('Git — настоящий child_process', () => {
+  // Единственный тест, который идёт через реальную ветку execFile: все
+  // остальные подают свой run-мок и защиту от инъекции не проверяют вовсе.
+  // А защита нужна: сообщение коммита собирается из промпта пользователя.
+  it('сообщение коммита не исполняется как команда', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'runner-git-'));
+    const run = (args: string[]) => execFileSync('git', args, { cwd: dir });
+    run(['init', '-q']);
+    run(['config', 'user.email', 'runner@test']);
+    run(['config', 'user.name', 'runner']);
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
+
+    const sentinel = path.join(dir, 'pwned');
+    // Git без инжектированного раннера — идёт настоящий execFile.
+    const git = new Git(dir);
+    await git.commitAll(`правка"; touch ${sentinel}; echo "`);
+
+    expect(fs.existsSync(sentinel)).toBe(false);
+    // И сообщение сохранилось буквально, а не обрезалось по разделителю.
+    expect(run(['log', '-1', '--pretty=%s']).toString()).toContain('touch');
+
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });
 
