@@ -1,6 +1,8 @@
 import { TurnsService } from './turns.service';
 
-function makeService(opts: { claim?: any[]; used?: number; alreadyFinal?: boolean } = {}) {
+function makeService(
+  opts: { claim?: any[]; used?: number; alreadyFinal?: boolean; historyRows?: any[] } = {},
+) {
   const calls: { sql: string; params: any[] }[] = [];
   // Возвращает фактически списанное — как настоящий deductTokens, который при
   // нехватке баланса берёт остаток и отдаёт число меньше запрошенного.
@@ -25,12 +27,18 @@ function makeService(opts: { claim?: any[]; used?: number; alreadyFinal?: boolea
       if (sql.includes('SET status = $3')) {
         return { rows: [], rowCount: opts.alreadyFinal ? 0 : 1 };
       }
+      // Диспетчеризация по `SELECT id, channel` — не по `LIMIT 50` и не по
+      // `ORDER BY created_at DESC`, которые проверяют утверждения ниже: иначе
+      // снятие любого из них одновременно отключило бы саму мок-ветку, и
+      // запрос ушёл бы в безобидный дефолт вместо демонстрации сломанного SQL.
+      if (sql.includes('SELECT id, channel')) {
+        return { rows: opts.historyRows ?? [], rowCount: opts.historyRows?.length ?? 0 };
+      }
       return { rows: [], rowCount: 0 };
     }),
   };
-  const redis = { rpush: jest.fn(), expire: jest.fn(), lrange: jest.fn(async () => []) };
   return {
-    svc: new TurnsService(pg as any, { deductTokens, checkTokenBalance: jest.fn(async () => ({ ok: true })) } as any, redis as any),
+    svc: new TurnsService(pg as any, { deductTokens, checkTokenBalance: jest.fn(async () => ({ ok: true })) } as any),
     calls,
     deductTokens,
   };
@@ -94,6 +102,9 @@ describe('TurnsService.touchRunner', () => {
     // пробел ронял бы тест, ничего не сломав. Здесь два разных обещания:
     // срабатывает только на degraded, и всё остальное сохраняется как было.
     expect(calls[0].sql).toContain("WHEN status = 'degraded'");
+    // Третье условие ускоряет восстановление: без него продукт, помеченный
+    // degraded при свежей отметке, ждал бы истечения порога.
+    expect(calls[0].sql).toContain("OR status = 'degraded'");
     expect(calls[0].sql).toContain('ELSE status END');
     // Условная запись — иначе два десятка записей в минуту на продукт.
     expect(calls[0].sql).toContain("interval '30 seconds'");
@@ -199,5 +210,30 @@ describe('TurnsService.complete', () => {
     await svc.complete('t-1', { productId: 'p-1', userId: 'u-1', status: 'reverted', shaBefore: 'aaa', tokens: 900 });
 
     expect(deductTokens).not.toHaveBeenCalled();
+  });
+});
+
+describe('TurnsService.history', () => {
+  it('отдаёт ходы продукта, новые сверху, с полем отката', async () => {
+    const historyRows = [
+      { id: 't-2', channel: 'web', revert_to_sha: null },
+      { id: 't-1', channel: 'telegram', revert_to_sha: 'aaa111' },
+    ];
+    const { svc, calls } = makeService({ historyRows });
+
+    await expect(svc.history('p-1')).resolves.toEqual(historyRows);
+
+    expect(calls[0].sql).toContain('WHERE product_id = $1');
+    expect(calls[0].params).toEqual(['p-1']);
+    // Без сортировки клиент увидел бы историю в порядке, зависящем от плана
+    // Postgres, — на проде это часто совпадает с created_at ASC, то есть
+    // «сначала самый старый ход» вместо ожидаемого «сначала последний».
+    expect(calls[0].sql).toContain('ORDER BY created_at DESC');
+    // Без LIMIT продукт с сотнями ходов отдаёт всю историю одним запросом —
+    // и это ловится именно здесь, а не на статических 2 строках мока.
+    expect(calls[0].sql).toContain('LIMIT 50');
+    // revert_to_sha — то, чем фронт отличает откат от обычного хода в
+    // истории; усечение SELECT без него проходит все остальные утверждения.
+    expect(calls[0].sql).toContain('revert_to_sha');
   });
 });

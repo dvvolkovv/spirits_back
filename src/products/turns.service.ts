@@ -8,7 +8,6 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
-import { RedisService } from '../common/services/redis.service';
 import { MiscService } from '../misc/misc.service';
 
 export interface EnqueueInput {
@@ -64,7 +63,6 @@ export class TurnsService {
   constructor(
     private readonly pg: PgService,
     private readonly misc: MiscService,
-    private readonly redis: RedisService,
   ) {}
 
   async enqueue(input: EnqueueInput): Promise<TurnRow> {
@@ -316,5 +314,28 @@ export class TurnsService {
       prompt: `Откат к ${target.sha_before}`,
       revertToSha: target.sha_before,
     });
+  }
+
+  /**
+   * Владение здесь НЕ проверяется — историю отдаёт контроллер после
+   * `getOwned`. Это осознанное исключение из правила, по которому статус
+   * продукта, баланс и владение переехали в `enqueue`: там два входа (web и
+   * telegram), а история пока читается только из веба.
+   *
+   * Если появится телеграм-вход в историю — переносить проверку сюда, тем же
+   * приёмом, что в `enqueue`. Иначе он унаследует остальное даром и молча
+   * останется без владения.
+   */
+  async history(productId: string) {
+    const r = await this.pg.query(
+      `SELECT id, channel, prompt, result, status, sha_before, sha_after,
+              revert_to_sha, tokens_spent, error, created_at, finished_at
+         FROM product_turns
+        WHERE product_id = $1
+        ORDER BY created_at DESC
+        LIMIT 50`,
+      [productId],
+    );
+    return r.rows;
   }
 }

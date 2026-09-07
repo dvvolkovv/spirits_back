@@ -35,10 +35,7 @@ function makeService(
     deductTokens: jest.fn(),
     checkTokenBalance: jest.fn(async () => ({ ok: opts.balanceOk ?? true })),
   };
-  // Третьим аргументом идёт RedisService — он понадобится в Task 8 для буфера
-  // событий. Заводим заглушку сразу, чтобы сигнатура не менялась по ходу плана.
-  const redis = { rpush: jest.fn(), expire: jest.fn(), lrange: jest.fn(async () => []) };
-  return { svc: new TurnsService(pg as any, misc as any, redis as any), calls, misc };
+  return { svc: new TurnsService(pg as any, misc as any), calls, misc };
 }
 
 describe('TurnsService.enqueue', () => {

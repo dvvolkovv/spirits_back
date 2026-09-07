@@ -13,8 +13,7 @@ function makeService(target: any) {
     }),
   };
   const misc = { deductTokens: jest.fn(), checkTokenBalance: jest.fn(async () => ({ ok: true })) };
-  const redis = { rpush: jest.fn(), expire: jest.fn(), lrange: jest.fn(async () => []) };
-  return { svc: new TurnsService(pg as any, misc as any, redis as any), calls };
+  return { svc: new TurnsService(pg as any, misc as any), calls };
 }
 
 describe('TurnsService.revert', () => {
