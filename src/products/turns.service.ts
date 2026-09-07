@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   HttpException,
   HttpStatus,
@@ -199,5 +200,30 @@ export class TurnsService {
         await this.pg.query(`UPDATE product_turns SET tokens_spent = $2 WHERE id = $1`, [turnId, used]);
       }
     }
+  }
+
+  /**
+   * Откат оформляется обычным ходом со специальным prompt'ом: тот же путь
+   * reset → build → restart → health на стороне раннера, та же строка в
+   * истории. История остаётся линейной, откат отката работает без отдельного
+   * кода. Замок product_turns_one_active работает и здесь — откатить посреди
+   * живого хода нельзя.
+   */
+  async revert(input: { productId: string; turnId: string; userId: string }) {
+    const r = await this.pg.query(
+      `SELECT id, sha_before FROM product_turns
+        WHERE id = $1 AND product_id = $2`,
+      [input.turnId, input.productId],
+    );
+    const target = r.rows[0];
+    if (!target) throw new BadRequestException('Ход не найден');
+    if (!target.sha_before) throw new BadRequestException('У этого хода нет точки возврата');
+
+    return this.enqueue({
+      productId: input.productId,
+      userId: input.userId,
+      channel: 'web',
+      prompt: `__revert__:${target.sha_before}`,
+    });
   }
 }
