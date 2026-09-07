@@ -121,6 +121,11 @@ export class TurnsService {
     }
   }
 
+  /** Heartbeat раннера. Пишется на каждом опросе, независимо от наличия хода. */
+  async touchRunner(productId: string) {
+    await this.pg.query(`UPDATE products SET runner_seen_at = now() WHERE id = $1`, [productId]);
+  }
+
   /**
    * SKIP LOCKED: если раннер продукта по какой-то причине запущен в двух
    * экземплярах, второй не заблокируется на строке, а увидит пустую очередь.
