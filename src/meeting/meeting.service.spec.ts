@@ -12,6 +12,7 @@ describe('MeetingService', () => {
   let livekit: { dispatchAgent: jest.Mock; removeAgents: jest.Mock; ensureRoom: jest.Mock };
   let rooms: { info: jest.Mock };
   let talerIdRooms: { info: jest.Mock; join: jest.Mock };
+  let attendee: { createBot: jest.Mock; removeBot: jest.Mock };
   let svc: MeetingService;
 
   const agentRow = {
@@ -59,7 +60,11 @@ describe('MeetingService', () => {
         token: 'jwt.body.sig', roomName: 'personal-x', url: 'wss://api.talerid.io/livekit/',
       }),
     };
-    svc = new MeetingService(pg as any, calls as any, livekit as any, rooms as any, talerIdRooms as any);
+    attendee = {
+      createBot: jest.fn().mockResolvedValue({ botId: 'bot_1' }),
+      removeBot: jest.fn().mockResolvedValue(true),
+    };
+    svc = new MeetingService(pg as any, calls as any, livekit as any, rooms as any, talerIdRooms as any, attendee as any);
   });
 
   describe('join', () => {
@@ -249,6 +254,80 @@ describe('MeetingService', () => {
       withAgent();
       await svc.join('u1', 7, 'ABC234');
       expect(livekit.ensureRoom).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('встреча Google Meet', () => {
+    it('создаёт бота и зовёт воркера в свою пустую комнату', async () => {
+      withAgent();
+      const res = await svc.join('u1', 7, 'abc-defg-hij', 'meet');
+      expect(attendee.createBot).toHaveBeenCalledWith(expect.objectContaining({
+        meetingUrl: 'https://meet.google.com/abc-defg-hij',
+        botName: 'Андрей · ассистент Дмитрий',
+        callId: res.callId,
+      }));
+      // Комната по callId, а не по коду встречи: одну и ту же встречу могут
+      // позвать дважды, и имя по коду столкнулось бы с прошлой записью.
+      expect(livekit.dispatchAgent).toHaveBeenCalledWith(
+        `meet_${res.callId}`,
+        expect.objectContaining({ mode: 'meeting', provider: 'meet' }),
+      );
+    });
+
+    it('пишет провайдера и код встречи в запись звонка', async () => {
+      withAgent();
+      await svc.join('u1', 7, 'abc-defg-hij', 'meet');
+      const insert = pg.query.mock.calls.find(([sql]: any) => /INSERT INTO voice_calls/.test(sql));
+      expect(insert).toBeDefined();
+      expect(insert[1]).toContain('meet');
+      expect(insert[1]).toContain('abc-defg-hij');
+    });
+
+    it('комнату заводит заранее с запасом на всю встречу', async () => {
+      // Наша комната пуста по замыслу, а дефолтный empty_timeout LiveKit —
+      // 300 секунд: без этого ассистента выбрасывало ровно на 301-й секунде.
+      withAgent();
+      await svc.join('u1', 7, 'abc-defg-hij', 'meet');
+      expect(livekit.ensureRoom).toHaveBeenCalledWith(expect.stringMatching(/^meet_/), 7200);
+    });
+
+    it('запоминает id бота — без него его не вывести из встречи', async () => {
+      withAgent();
+      await svc.join('u1', 7, 'abc-defg-hij', 'meet');
+      expect(pg.query.mock.calls.some(([sql, args]: any) =>
+        /external_bot_id/.test(sql) && Array.isArray(args) && args.includes('bot_1'),
+      )).toBe(true);
+    });
+
+    it('бот не поднялся — звонок помечен failed, а не оставлен в dialing', async () => {
+      // Запись в dialing намертво блокирует пользователю следующий вход:
+      // лимит «один активный» смотрит именно на неё.
+      withAgent();
+      attendee.createBot.mockResolvedValue(null);
+      await expect(svc.join('u1', 7, 'abc-defg-hij', 'meet')).rejects.toThrow();
+      expect(pg.query.mock.calls.some(([sql]: any) => /status = 'failed'/.test(sql))).toBe(true);
+    });
+
+    it('в комнату Meet не ходит за информацией — её негде взять', async () => {
+      // У Meet нет публичной ручки «существует ли встреча». Проверить вход
+      // заранее нельзя, о неудаче узнаём из состояния бота.
+      withAgent();
+      await svc.join('u1', 7, 'abc-defg-hij', 'meet');
+      expect(rooms.info).not.toHaveBeenCalled();
+      expect(talerIdRooms.info).not.toHaveBeenCalled();
+    });
+
+    it('токен чужой комнаты не запрашивается', async () => {
+      withAgent();
+      await svc.join('u1', 7, 'abc-defg-hij', 'meet');
+      expect(talerIdRooms.join).not.toHaveBeenCalled();
+    });
+
+    it('своя встреча и Taler ID не задеты', async () => {
+      withAgent();
+      await svc.join('u1', 7, 'ABC234');
+      expect(attendee.createBot).not.toHaveBeenCalled();
+      expect(livekit.dispatchAgent).toHaveBeenCalledWith('room_ABC234', expect.any(Object));
     });
   });
 
