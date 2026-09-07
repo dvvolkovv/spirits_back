@@ -34,6 +34,19 @@ export interface CompleteInput {
   tokens?: number;
 }
 
+/**
+ * Форма, которую `claimNext` отдаёт раннеру. Отличается от `TurnRow`: там
+ * `{id, status}` для клиента, здесь всё, что нужно на VM для запуска хода.
+ * Значение пересекает границу процесса, поэтому нетипизированным быть не
+ * должно.
+ */
+export interface ClaimedTurn {
+  id: string;
+  prompt: string;
+  channel: string;
+  user_id: string;
+}
+
 @Injectable()
 export class TurnsService {
   private readonly logger = new Logger(TurnsService.name);
@@ -97,13 +110,17 @@ export class TurnsService {
    * SKIP LOCKED: если раннер продукта по какой-то причине запущен в двух
    * экземплярах, второй не заблокируется на строке, а увидит пустую очередь.
    */
-  async claimNext(productId: string) {
+  async claimNext(productId: string): Promise<ClaimedTurn | null> {
     const r = await this.pg.query(
       `UPDATE product_turns
           SET status = 'running', started_at = now()
         WHERE id = (
           SELECT id FROM product_turns
            WHERE product_id = $1 AND status = 'queued'
+           -- ORDER BY здесь страховка, а не работающая логика: частичный
+           -- уникальный индекс из Task 1 не допускает больше одной строки в
+           -- ('queued','running') на продукт, значит сортировать нечего.
+           -- Строка остаётся на случай ослабления предиката индекса.
            ORDER BY created_at
            FOR UPDATE SKIP LOCKED
            LIMIT 1
@@ -120,15 +137,33 @@ export class TurnsService {
    * клиент не получил результата и платить не должен. То же правило уже
    * действует при временном сбое связи с моделью в чате.
    */
+  // `AND status = 'running'` делает финализацию переходом состояния, а не
+  // перезаписью, и это обязательное условие, а не оптимизация.
+  //
+  // Маршрут завершения идёт с клиентской VM через интернет: таймаут чтения
+  // ответа при успешно доставленном запросе — штатное событие, и раннер
+  // обязан ретраить. Без сторожа повтор списывал бы токены второй раз за
+  // тот же ход.
+  //
+  // Второй сценарий дороже: reapStuck (Task 10) переводит зависший ход в
+  // `failed`, а опоздавший ответ раннера воскрешал бы его в `done` и брал
+  // деньги за работу, за которую решили не брать.
+  //
+  // Транзакции здесь нет намеренно. `PgService.query` ходит через пул, а
+  // `BEGIN` через пул на этом проекте уже давал код, рапортующий об откате,
+  // которого не было. Сторож состояния даёт нужное свойство дешевле: повтор
+  // становится безвредным no-op, а окно падения процесса превращается в
+  // недобор («записано, но не списано»), а не в перебор. Недобор ловится
+  // сверкой `tokens_spent` с `token_transactions`, перебор — только жалобой.
   async complete(turnId: string, input: CompleteInput) {
-    await this.pg.query(
+    const claimed = await this.pg.query(
       `UPDATE product_turns
           SET status = $2, result = $3, error = $4,
               sha_before = COALESCE($5, sha_before),
               sha_after = $6,
               tokens_spent = $7,
               finished_at = now()
-        WHERE id = $1`,
+        WHERE id = $1 AND status = 'running'`,
       [
         turnId,
         input.status,
@@ -145,8 +180,24 @@ export class TurnsService {
       ],
     );
 
+    if (claimed.rowCount !== 1) {
+      this.logger.warn(`complete: ход ${turnId} уже финализирован, повтор проигнорирован`);
+      return;
+    }
+
     if (input.status === 'done' && (input.tokens ?? 0) > 0) {
-      await this.misc.deductTokens(input.userId, input.tokens!, `product turn ${turnId}`);
+      // deductTokens возвращает, сколько списалось ФАКТИЧЕСКИ — при нехватке
+      // баланса меньше запрошенного, и её докблок прямо предлагает этим
+      // числом воспользоваться. Пишем его обратно: иначе история в кабинете
+      // покажет пользователю расход, которого с него не взяли.
+      const used = await this.misc.deductTokens(
+        input.userId,
+        Math.max(0, input.tokens!),
+        `product turn ${turnId}`,
+      );
+      if (used !== input.tokens) {
+        await this.pg.query(`UPDATE product_turns SET tokens_spent = $2 WHERE id = $1`, [turnId, used]);
+      }
     }
   }
 }
