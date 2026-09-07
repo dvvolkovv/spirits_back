@@ -1,5 +1,6 @@
 import { VoiceCallService } from './voice-call.service';
 import { CASH_MARKUP, CASH_TOKENS_PER_USD, RUB_PER_TOKEN, RUB_PER_USD } from '../common/billing-rates';
+import type { CompletePayload } from './voice-call.types';
 
 function makeDeps(historyRows: any[] = []) {
   const inserted: any[] = [];
@@ -451,7 +452,7 @@ describe('разговор наполняет профиль', () => {
   it('complete: если финальный полнее staged — берём финальный', async () => {
     const d = completeDeps([{ role: 'assistant', text: 'приветствие', ts: 1 }]);
     const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
-    const full = [
+    const full: CompletePayload['transcript'] = [
       { role: 'assistant', text: 'приветствие', ts: 1 },
       { role: 'user', text: 'вопрос', ts: 2 },
       { role: 'assistant', text: 'ответ', ts: 3 },
