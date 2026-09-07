@@ -22,6 +22,7 @@ import { Occupancy } from './occupancy.js';
 import { SpeakerLedger } from './speaker-ledger.js';
 import { MixedRoomAudioInput } from './mixed-audio-input.js';
 import { ExternalRoomAudioOutput } from './external-room-output.js';
+import { ExternalRoomChat } from './external-chat.js';
 import { Room as ExternalRoom } from '@livekit/rtc-node';
 import {
   answerTo,
@@ -70,6 +71,12 @@ export default defineAgent({
       provider?: 'talerid';
       externalUrl?: string;
       externalToken?: string;
+      /**
+       * Ручка чата чужой комнаты. Приходит только для talerid и только когда
+       * их join отдал roomName — собирает её бэкенд, потому что база живёт в
+       * его окружении (на стенде она другая).
+       */
+      externalChatUrl?: string;
     };
     const isMeeting = meta.mode === 'meeting';
     /** Комната, в которой реально идёт разговор: своя или чужая. */
@@ -125,6 +132,7 @@ export default defineAgent({
      */
     let foreign: ExternalRoom | null = null;
     let foreignOutput: ExternalRoomAudioOutput | null = null;
+    let chat: ExternalRoomChat | null = null;
     if (isForeign) {
       foreign = new ExternalRoom();
       await foreign.connect(meta.externalUrl!, meta.externalToken!, {
@@ -132,6 +140,17 @@ export default defineAgent({
         dynacast: false,
       });
       console.log(`[чужая] подключились к ${meta.externalUrl}`);
+
+      if (meta.externalChatUrl) {
+        chat = new ExternalRoomChat(
+          meta.externalChatUrl,
+          meta.externalToken!,
+          // Имя ровно то же, под которым мы вошли в комнату: по нему же
+          // отсеивается собственное эхо.
+          `${agentName} · ассистент ${meta.ownerName || 'пользователя'}`,
+        );
+        console.log('[чат] канал комнаты подключён');
+      }
     }
 
     if (isMeeting && !isForeign) {
@@ -367,11 +386,33 @@ export default defineAgent({
           }
         },
       }),
+      // Тул появляется только на чужой встрече с чатом. У звонка и своих
+      // комнат канала нет, и объявлять модели инструмент, который всегда
+      // отказывает, — прямой способ получить «я отправил в чат» в пустоту.
+      ...(chat
+        ? {
+            write_to_chat: llm.tool({
+              description:
+                'Написать текстом в чат встречи — сообщение увидят все участники. ' +
+                'Для того, что на слух не воспринимается: ссылки, адреса, номера, ' +
+                'короткие списки. Голосом скажи, что написал в чат, и не зачитывай ' +
+                'написанное вслух.',
+              parameters: z.object({
+                text: z.string().describe('Текст сообщения целиком, готовый к отправке'),
+              }),
+              execute: async ({ text }) => {
+                const ok = await chat!.send(text);
+                return ok ? { status: 'sent' } : { status: 'rejected', reason: 'chat_unavailable' };
+              },
+            }),
+          }
+        : {}),
     };
-    // Тулов три. create_document был в первой редакции спеки как save_note, я
-    // его снял, решив, что он дублирует резюме звонка, — и на живом звонке
-    // 26.08.2026 владелец попросил документ, а Роману оказалось некуда его
-    // положить. Резюме это про что говорили; документ — результат работы.
+    // Базовых тула три, write_to_chat — четвёртый, условный. create_document
+    // был в первой редакции спеки как save_note, я его снял, решив, что он
+    // дублирует резюме звонка, — и на живом звонке 26.08.2026 владелец
+    // попросил документ, а Роману оказалось некуда его положить. Резюме это
+    // про что говорили; документ — результат работы.
 
     // Ответы специалистов приходят из бэкенда через data-канал комнаты.
     ctx.room.on(RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
