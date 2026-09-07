@@ -11,7 +11,7 @@ describe('MeetingService', () => {
   };
   let livekit: { dispatchAgent: jest.Mock; removeAgents: jest.Mock; ensureRoom: jest.Mock };
   let rooms: { info: jest.Mock };
-  let talerIdRooms: { info: jest.Mock; join: jest.Mock };
+  let talerIdRooms: { info: jest.Mock; join: jest.Mock; chatUrl: jest.Mock };
   let svc: MeetingService;
 
   const agentRow = {
@@ -58,6 +58,7 @@ describe('MeetingService', () => {
       join: jest.fn().mockResolvedValue({
         token: 'jwt.body.sig', roomName: 'personal-x', url: 'wss://api.talerid.io/livekit/',
       }),
+      chatUrl: jest.fn((r: string) => `https://api.talerid.io/voice/rooms/${r}/chat`),
     };
     svc = new MeetingService(pg as any, calls as any, livekit as any, rooms as any, talerIdRooms as any);
   });
@@ -231,6 +232,33 @@ describe('MeetingService', () => {
       talerIdRooms.info.mockResolvedValue(null);
       await expect(svc.join('u1', 7, 'ZZZZZZ', 'talerid')).rejects.toThrow(NotFoundException);
       expect(livekit.dispatchAgent).not.toHaveBeenCalled();
+    });
+
+    it('кладёт в метаданные адрес чата чужой комнаты', async () => {
+      withAgent();
+      await svc.join('u1', 7, '36fc367a', 'talerid');
+      const meta = livekit.dispatchAgent.mock.calls[0][1] as any;
+      expect(meta.externalChatUrl).toBe('https://api.talerid.io/voice/rooms/personal-x/chat');
+    });
+
+    it('без roomName адрес чата не кладёт — писать всё равно некуда', async () => {
+      // join у них всегда отдаёт roomName, но клиент подставляет '' при его
+      // отсутствии. Полусобранный URL хуже отсутствующего: воркер решил бы,
+      // что чат есть, и молча ронял бы каждую отправку в 404.
+      withAgent();
+      talerIdRooms.join.mockResolvedValue({
+        token: 'jwt.body.sig', roomName: '', url: 'wss://api.talerid.io/livekit/',
+      });
+      await svc.join('u1', 7, '36fc367a', 'talerid');
+      const meta = livekit.dispatchAgent.mock.calls[0][1] as any;
+      expect(meta.externalChatUrl).toBeUndefined();
+    });
+
+    it('на своей встрече адреса чата нет', async () => {
+      withAgent();
+      await svc.join('u1', 7, 'ABC234');
+      const meta = livekit.dispatchAgent.mock.calls[0][1] as any;
+      expect(meta.externalChatUrl).toBeUndefined();
     });
   });
 
