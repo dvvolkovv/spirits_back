@@ -27,6 +27,16 @@ describe('loadConfig', () => {
     expect(cfg.linkeonUrl).toBe('https://test.linkeon.io');
   });
 
+  it('без пути к чекауту не стартует', () => {
+    // Пустой путь не безобиден: claude -p уедет работать в текущий каталог
+    // процесса, то есть агент начнёт править файлы неизвестно где на машине
+    // клиента. Отказ на старте дешевле такого хода.
+    const env: any = { ...BASE };
+    delete env.CHECKOUT_PATH;
+
+    expect(() => loadConfig(env)).toThrow(/CHECKOUT_PATH/);
+  });
+
   it('таймаут хода по умолчанию меньше серверного порога снятия зависших', () => {
     const cfg = loadConfig({ ...BASE } as any);
 
