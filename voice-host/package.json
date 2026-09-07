@@ -7,13 +7,15 @@
     "build": "tsc",
     "start": "node dist/agent.js start",
     "dev": "tsx src/agent.ts dev",
-    "test": "tsx --test src/pending.test.ts src/name-gate.test.ts src/occupancy.test.ts src/mixer.test.ts src/prompts.test.ts src/presence.test.ts"
+    "test": "tsx --test src/pending.test.ts src/name-gate.test.ts src/occupancy.test.ts src/mixer.test.ts src/prompts.test.ts src/presence.test.ts src/attendee-audio.test.ts"
   },
   "dependencies": {
     "@livekit/agents": "1.7.0",
     "@livekit/agents-plugin-openai": "1.7.0",
     "@livekit/rtc-node": "^0.13.34",
+    "@types/ws": "^8.18.1",
     "dotenv": "^17.4.2",
+    "ws": "^8.21.3",
     "zod": "^3.25.76"
   },
   "devDependencies": {
