@@ -20,7 +20,7 @@ function clean(s: string): string {
 export function buildMeetingCard(
   code: string,
   title: string,
-  provider: 'linkeon' | 'talerid' = 'linkeon',
+  provider: 'linkeon' | 'talerid' | 'meet' = 'linkeon',
 ): string {
   // Провайдер идёт ПЕРЕД кодом и только для чужих встреч.
   //
