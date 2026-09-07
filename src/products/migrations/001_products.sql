@@ -1,7 +1,7 @@
 -- 001_products.sql
 -- Реестр клиентских продуктов, которые Linkeon хостит, и история ходов
 -- живущего внутри каждого продукта агента.
--- Дизайн: docs/superpowers/specs/2026-09-07-linkeon-products-hosting-design.md
+-- Дизайн: spirits_front/docs/superpowers/specs/2026-09-07-linkeon-products-hosting-design.md
 
 CREATE TABLE IF NOT EXISTS products (
   id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
