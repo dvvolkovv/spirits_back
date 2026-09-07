@@ -46,7 +46,14 @@ export class AttendeeClient {
     return (process.env.ATTENDEE_BASE_URL || '').replace(/\/+$/, '');
   }
 
-  private async call(path: string, init: RequestInit): Promise<any | null> {
+  /**
+   * Результат вызова: статус и разобранное тело.
+   *
+   * `null` означает «не дозвонились» — таймаут, сеть, отсутствующая настройка.
+   * Это принципиально отличается от «сервис ответил, но отказал»: во втором
+   * случае мы знаем состояние бота, в первом — нет.
+   */
+  private async call(path: string, init: RequestInit): Promise<{ status: number; data: any } | null> {
     const base = this.base();
     const key = process.env.ATTENDEE_API_KEY;
     // Без настроек молчим, а не бьёмся в пустой адрес: на стендах без Attendee
@@ -61,13 +68,20 @@ export class AttendeeClient {
       const res = await fetch(`${base}${path}`, {
         ...init,
         signal: ctl.signal,
-        headers: { Authorization: `Token ${key}`, 'Content-Type': 'application/json' },
+        // Свои заголовки мёржим поверх переданных, а не затираем их целиком:
+        // сегодня никто своих не передаёт, но затирание — тихая ловушка.
+        headers: { ...(init.headers as Record<string, string> | undefined), Authorization: `Token ${key}`, 'Content-Type': 'application/json' },
       });
-      if (!res.ok) {
+      // Тело разбираем терпимо и отдельно от решения об успехе: у `leave` его
+      // может не быть вовсе, а `createBot` сам проверит наличие id.
+      let data: any = null;
+      try { data = await res.json(); } catch { data = null; }
+      // 404 не шумит в логе: для removeBot это штатный исход, а не сбой —
+      // так же, как в talerid-room.client.ts.
+      if (!res.ok && res.status !== 404) {
         this.logger.warn(`attendee ${path}: HTTP ${res.status}`);
-        return null;
       }
-      return await res.json().catch(() => ({}));
+      return { status: res.status, data };
     } catch (e: any) {
       this.logger.warn(`attendee ${path}: ${e?.name === 'AbortError' ? 'таймаут' : e?.message}`);
       return null;
@@ -80,7 +94,7 @@ export class AttendeeClient {
   async createBot(p: CreateBotParams): Promise<{ botId: string } | null> {
     const ws = process.env.ATTENDEE_AUDIO_WS_URL || '';
     const hook = process.env.ATTENDEE_WEBHOOK_URL || '';
-    const d = await this.call('/api/v1/bots', {
+    const r = await this.call('/api/v1/bots', {
       method: 'POST',
       body: JSON.stringify({
         meeting_url: p.meetingUrl,
@@ -97,19 +111,34 @@ export class AttendeeClient {
         webhooks: [{ url: hook, triggers: TRIGGERS }],
       }),
     });
-    if (!d || typeof d.id !== 'string' || !d.id) return null;
-    return { botId: d.id };
+    if (!r || r.status < 200 || r.status >= 300) return null;
+    const id = r.data?.id;
+    if (typeof id !== 'string' || !id) return null;
+    return { botId: id };
   }
 
   /**
    * Вывести бота из встречи.
    *
-   * Обязательно при любом выходе ассистента: без этого Chrome остаётся сидеть
-   * в встрече и после того, как ассистент ушёл. `false` — бота уже не было,
-   * это нормальный исход, реапер и leave могут прийти одновременно.
+   * Обязательно при любом выходе ассистента: иначе Chrome остаётся сидеть в
+   * встрече и после того, как ассистент ушёл — лишний участник в чужих
+   * переговорах, которого никто не звал.
+   *
+   * Три исхода, и различать их обязательно:
+   *   `true`  — Attendee подтвердил вывод;
+   *   `false` — бота уже не было (404). Штатный случай: реапер и leave могут
+   *             прийти одновременно;
+   *   `null`  — не дозвонились или сервис ответил ошибкой. Состояние бота
+   *             НЕИЗВЕСТНО, и считать встречу убранной нельзя — иначе при
+   *             перезапуске контейнера Attendee бот тихо остаётся в чужой
+   *             встрече. Вызывающий обязан оставить запись реаперу на
+   *             повторную попытку.
    */
-  async removeBot(botId: string): Promise<boolean> {
-    const d = await this.call(`/api/v1/bots/${encodeURIComponent(botId)}/leave`, { method: 'POST' });
-    return d !== null;
+  async removeBot(botId: string): Promise<boolean | null> {
+    const r = await this.call(`/api/v1/bots/${encodeURIComponent(botId)}/leave`, { method: 'POST' });
+    if (!r) return null;
+    if (r.status === 404) return false;
+    if (r.status >= 200 && r.status < 300) return true;
+    return null;
   }
 }
