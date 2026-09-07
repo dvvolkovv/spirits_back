@@ -45,6 +45,12 @@ describe('ProductsService.getOwned', () => {
     await expect(svc.getOwned('p-1', '70000000000')).rejects.toBeInstanceOf(NotFoundException);
     // Владелец в WHERE, а не в проверке после выборки: иначе existence чужого
     // продукта утекает через разницу между 403 и 404.
+    //
+    // Утверждение о тексте SQL здесь обязательно. Мок игнорирует sql и всегда
+    // отдаёт заданный rows, поэтому проверка одних только params фиксирует
+    // форму вызова, а не участие параметра в фильтрации: убери `AND user_id =
+    // $2` из запроса, оставив параметр на месте, — и тест останется зелёным.
+    expect(calls[0].sql).toContain('user_id = $2');
     expect(calls[0].params).toEqual(['p-1', '70000000000']);
   });
 });
