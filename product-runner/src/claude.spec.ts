@@ -1,4 +1,7 @@
-import { translateEvent, ClaudeTranslator } from './claude';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { translateEvent, ClaudeTranslator, runClaude } from './claude';
 
 describe('ClaudeTranslator', () => {
   it('system/init → begin', () => {
@@ -74,5 +77,41 @@ describe('translateEvent — потоковый разбор строк', () => 
     const t = new ClaudeTranslator();
 
     expect(translateEvent(t, 'какой-то текст\n')).toEqual([]);
+  });
+});
+
+describe('runClaude — настоящий child_process', () => {
+  // Единственный тест, идущий через настоящий spawn. Все остальные проверяют
+  // транслятор и до процесса не доходят, поэтому подмена spawn(bin, args) на
+  // spawn(bin, args, { shell: true }) прошла бы незамеченной — а промпт сюда
+  // приходит прямо от клиента.
+  it('промпт не исполняется как команда', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'runner-claude-'));
+    const sentinel = path.join(dir, 'pwned');
+
+    // Заглушка вместо claude: игнорирует аргументы, печатает одно событие.
+    // process.execPath не годится — у node флаг -p означает «выполнить и
+    // напечатать выражение», и промпт исполнился бы как JavaScript даже без
+    // shell: true.
+    const stub = path.join(dir, 'fake-claude');
+    fs.writeFileSync(stub, '#!/bin/sh\nprintf \'{"type":"system","subtype":"init"}\\n\'\n');
+    fs.chmodSync(stub, 0o755);
+
+    const events: any[] = [];
+    const res = await runClaude({
+      claudeBin: stub,
+      cwd: dir,
+      // Payload без вложенных кавычек: с ними они замыкают друг друга и
+      // мутация проходит незамеченной — проверено на git-инъекции.
+      prompt: `правка; touch ${sentinel} #`,
+      timeoutMs: 10_000,
+      onEvents: (e) => events.push(...e),
+    });
+
+    expect(res.ok).toBe(true);
+    expect(events).toEqual([{ type: 'begin' }]);
+    expect(fs.existsSync(sentinel)).toBe(false);
+
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });
