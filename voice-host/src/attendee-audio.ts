@@ -38,54 +38,116 @@ interface InboundAudio {
 }
 
 /**
- * Один вебсокет-сервер на все встречи: `callId` приходит в query, по нему
- * находим, чьё это соединение. Отдельный порт на звонок означал бы дырявый
- * файрвол и гонку за портами между заданиями.
+ * Диапазон портов под приём звука.
+ *
+ * Узкий и именованный, а не ephemeral: диапазон должен быть достижим с хоста
+ * Attendee, и открывать 32768-60999 значит проделать слишком широкую дыру.
+ * Ширина диапазона — это же и потолок одновременных встреч на хосте.
+ */
+const PORT_MIN = Number(process.env.ATTENDEE_WS_PORT_MIN || 8140);
+const PORT_MAX = Number(process.env.ATTENDEE_WS_PORT_MAX || 8179);
+
+/**
+ * Приём звука для ОДНОГО задания.
+ *
+ * Один хаб на задание, а не на процесс. Прежняя схема с общим портом на
+ * уровне модуля была неработоспособна: каждое задание в @livekit/agents —
+ * отдельный процесс, который импортирует модуль сразу при старте, ещё не
+ * зная, достанется ли ему встреча. Пул греет замену в момент, когда задание
+ * забирает прогретый процесс, и замена падала с EADDRINUSE.
+ *
+ * Отсюда и порядок: порт узнаёт тот, кто им владеет, и сообщает бэкенду, а
+ * бот создаётся уже после этого.
  */
 export class AttendeeAudioHub {
-  private readonly wss: WebSocketServer;
-  private readonly waiting = new Map<string, (ws: WebSocket) => void>();
+  private wss?: WebSocketServer;
+  private port = 0;
+  private claim?: (ws: WebSocket | null) => void;
 
-  constructor(port: number) {
-    this.wss = new WebSocketServer({ port });
+  /**
+   * Занять первый свободный порт диапазона.
+   *
+   * Перебором, а не портом 0: сообщить бэкенду публичный URL можно только
+   * зная конкретный порт, а он обязан попадать в открытый на файрволе
+   * диапазон.
+   */
+  async listen(callId: string): Promise<number> {
+    for (let p = PORT_MIN; p <= PORT_MAX; p++) {
+      try {
+        this.wss = await this.bind(p);
+        this.port = p;
+        break;
+      } catch (e: any) {
+        if (e?.code !== 'EADDRINUSE') throw e;
+      }
+    }
+    if (!this.wss) {
+      throw new Error(`нет свободного порта в диапазоне ${PORT_MIN}-${PORT_MAX}`);
+    }
+
+    // Ошибку сервера обязательно слушаем: событие 'error' без слушателя в
+    // Node бросается синхронно там, где эмитится, и роняет весь процесс
+    // задания — посреди живой встречи, без complete и без failed.
+    this.wss.on('error', (e) => console.error('[attendee] ошибка сервера', e));
+
     this.wss.on('connection', (ws, req) => {
-      const callId = new URL(req.url ?? '', 'http://x').searchParams.get('callId') ?? '';
-      const claim = this.waiting.get(callId);
-      if (!claim) {
-        // Задание ещё не поднялось или уже завершилось. Закрываем, но с
-        // записью в лог: Attendee будет ретраить, и молчание здесь означало
-        // бы необъяснимо тихую встречу.
-        console.log(`[attendee] соединение для неизвестного callId=${callId}`);
+      const got = new URL(req.url ?? '', 'http://x').searchParams.get('callId') ?? '';
+      if (got !== callId || !this.claim) {
+        console.log(`[attendee] соединение не для нас: callId=${got}`);
         ws.close();
         return;
       }
-      this.waiting.delete(callId);
-      console.log(`[attendee] звук подключился, callId=${callId}`);
+      // Тот же довод, что и для сервера: без слушателя сетевой сбой на этом
+      // сокете уронит процесс.
+      ws.on('error', (e) => console.error('[attendee] ошибка сокета', e));
+      const claim = this.claim;
+      this.claim = undefined;
+      console.log(`[attendee] звук подключился, callId=${callId}, порт ${this.port}`);
       claim(ws);
     });
-    console.log(`[attendee] жду звук на :${port}`);
+
+    console.log(`[attendee] жду звук на :${this.port}, callId=${callId}`);
+    return this.port;
+  }
+
+  private bind(port: number): Promise<WebSocketServer> {
+    return new Promise((resolve, reject) => {
+      const wss = new WebSocketServer({ port });
+      const onError = (e: any) => { wss.close(); reject(e); };
+      wss.once('error', onError);
+      wss.once('listening', () => { wss.off('error', onError); resolve(wss); });
+    });
   }
 
   /**
-   * Занять место под звонок до того, как Attendee подключится.
+   * Публичный адрес для Attendee.
    *
-   * Возвращает `null` по таймауту — вызывающий обязан на это отреагировать,
-   * а не ждать вечно.
+   * Порт уезжает в путь, а не в host:port, потому что TLS терминирует nginx:
+   * без него звук встречи шёл бы между двумя нашими хостами открытым текстом
+   * по публичной сети. Соответствующий location с диапазоном в регулярке —
+   * в плане.
    */
-  expect(callId: string, timeoutMs = CONNECT_TIMEOUT_MS): Promise<WebSocket | null> {
+  publicUrl(callId: string): string {
+    const base = (process.env.ATTENDEE_WS_PUBLIC_BASE || 'wss://my.linkeon.io').replace(/\/+$/, '');
+    return `${base}/attendee/${this.port}?callId=${encodeURIComponent(callId)}`;
+  }
+
+  /** Дождаться подключения. `null` — не дождались за отведённое время. */
+  expect(timeoutMs = CONNECT_TIMEOUT_MS): Promise<WebSocket | null> {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
-        this.waiting.delete(callId);
-        console.log(`[attendee] звук так и не подключился за ${timeoutMs / 1000}с, callId=${callId}`);
+        this.claim = undefined;
+        console.log(`[attendee] звук так и не подключился за ${timeoutMs / 1000}с`);
         resolve(null);
       }, timeoutMs);
       timer.unref?.();
-      this.waiting.set(callId, (ws) => { clearTimeout(timer); resolve(ws); });
+      this.claim = (ws) => { clearTimeout(timer); resolve(ws); };
     });
   }
 
   close(): void {
-    this.wss.close();
+    try { this.wss?.close(); } catch {}
+    this.wss = undefined;
   }
 }
 
