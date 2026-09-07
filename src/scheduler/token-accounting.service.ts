@@ -3,6 +3,26 @@ import { Cron } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 
+/**
+ * Имя ассистента для строки списания.
+ *
+ * В agents.name у части строк лежит технический слаг вместо имени: у агента 15
+ * это `smm_producer`, хотя людям он представляется Юлией. Списание за голосовую
+ * консультацию 07.09.2026 так и уехало строкой «Ответ ассистента
+ * «smm_producer»» — слаг из базы утёк в текст, который читает пользователь.
+ *
+ * Подменяем ТОЛЬКО слаг: строку из латиницы, цифр и разделителей, без единой
+ * кириллической буквы. Предпочитать metadata всегда нельзя — в голосовом пути
+ * `specialist` иногда служебный («Виталий (сжатие)» у хода, который на деле
+ * сделал Роман), и такая подмена испортила бы верные строки ради одной неверной.
+ */
+export function humanName(dbName: string | null | undefined, facts: any): string {
+  const spoken = typeof facts?.specialist === 'string' ? facts.specialist.trim() : '';
+  const looksLikeSlug = !!dbName && /^[a-z0-9_.\- ]+$/i.test(dbName);
+  if (looksLikeSlug && spoken) return spoken;
+  return dbName || spoken;
+}
+
 @Injectable()
 export class TokenAccountingService {
   private readonly logger = new Logger(TokenAccountingService.name);
@@ -133,7 +153,8 @@ export class TokenAccountingService {
    */
   private explainCharge(task: any): { description: string; metadata: string | null } {
     const facts = task.metadata && typeof task.metadata === 'object' ? task.metadata : null;
-    const who = task.agent_name ? `ассистента «${task.agent_name}»` : 'ассистента';
+    const name = humanName(task.agent_name, facts);
+    const who = name ? `ассистента «${name}»` : 'ассистента';
     const minutes = Math.round(Number(facts?.durationMs ?? 0) / 60_000);
     const description = minutes >= 1
       ? `Ответ ${who}, ${minutes} мин работы`

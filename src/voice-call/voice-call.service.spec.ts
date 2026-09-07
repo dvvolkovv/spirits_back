@@ -130,6 +130,45 @@ describe('VoiceCallService', () => {
     expect(flagship / mini).toBeCloseTo(3.2, 5);
   });
 
+  it('кешированный вход считается по кеш-ставке, а не по свежей', () => {
+    const svc = new VoiceCallService({} as any, {} as any, {} as any);
+    // 100k входящих, из них 80k из кеша: платим за 20k свежих и 80k кеша.
+    expect(svc.costUsd(100_000, 0, 'gpt-realtime-2.1', 80_000)).toBeCloseTo(
+      (20_000 / 1e6) * 32 + (80_000 / 1e6) * 0.4,
+      6,
+    );
+  });
+
+  it('без кеша цена прежняя — воркер старой версии поля не шлёт', () => {
+    const svc = new VoiceCallService({} as any, {} as any, {} as any);
+    expect(svc.costUsd(600, 1200, 'gpt-realtime-2.1', 0)).toBeCloseTo(
+      svc.costUsd(600, 1200, 'gpt-realtime-2.1'),
+      9,
+    );
+  });
+
+  it('кеш больше входа или отрицательный не даёт отрицательную цену', () => {
+    // Иначе через ceil(cost × курс) это превратилось бы в подарок токенов за
+    // длинный разговор.
+    const svc = new VoiceCallService({} as any, {} as any, {} as any);
+    expect(svc.costUsd(1000, 0, 'gpt-realtime-2.1', 999_999)).toBeCloseTo((1000 / 1e6) * 0.4, 9);
+    expect(svc.costUsd(1000, 0, 'gpt-realtime-2.1', -5)).toBeCloseTo((1000 / 1e6) * 32, 9);
+  });
+
+  /**
+   * Замер по живой встрече 07.09.2026: 107 642 входящих аудио-токена за 69
+   * минут при том, что живой речи там от силы на 41 000. Разница —
+   * переигранный контекст, то есть кеш, и до этой правки он оплачивался как
+   * свежий звук: себестоимость разговора выходила завышенной примерно вдвое.
+   */
+  it('на длинном разговоре кеш роняет себестоимость примерно вдвое', () => {
+    const svc = new VoiceCallService({} as any, {} as any, {} as any);
+    const было = svc.costUsd(107_642, 10_775, 'gpt-realtime-2.1');
+    const стало = svc.costUsd(107_642, 10_775, 'gpt-realtime-2.1', 107_642 - 41_310);
+    expect(было).toBeCloseTo(4.1341, 3);
+    expect(стало).toBeLessThan(было / 1.8);
+  });
+
   it('строка учёта пишется pending — за разговор списывается', async () => {
     // Тест перевёрнут 27.08.2026 вместе с решением. Раньше он держал
     // обратное: 'completed', то есть «учитываем, но не списываем» — тариф за

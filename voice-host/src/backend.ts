@@ -56,7 +56,17 @@ export type TranscriptEntry = {
 };
 
 /** Учёт аудио-токенов Realtime-сессии — то же, что CompletePayload['usage'] на бэке. */
-export type CallUsage = { audioInputTokens: number; audioOutputTokens: number; model: string };
+export type CallUsage = {
+  audioInputTokens: number;
+  audioOutputTokens: number;
+  /**
+   * Сколько из audioInputTokens приехало из кеша. Это ЧАСТЬ целого, а не
+   * добавка: свежий звук — разность. Необязательное, потому что старый воркер
+   * поля не шлёт; бэкенд тогда считает кеш нулевым, ровно как считал всегда.
+   */
+  cachedAudioInputTokens?: number;
+  model: string;
+};
 
 export type DocumentResult =
   | { status: 'accepted'; docId: string; title: string; specialist?: string }
