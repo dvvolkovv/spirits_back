@@ -2,7 +2,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { AudioFrame } from '@livekit/rtc-node';
 import { initializeLogger, loggerOptions } from '@livekit/agents';
-import { AttendeeAudioOutput, SAMPLE_RATE, SAMPLES_PER_TICK } from './attendee-audio.js';
+import { AttendeeAudioHub, AttendeeAudioOutput, SAMPLE_RATE, SAMPLES_PER_TICK } from './attendee-audio.js';
 
 /**
  * Логгер SDK — установка теста, а не продового кода.
@@ -118,5 +118,61 @@ describe('AttendeeAudioOutput', () => {
     const out = new AttendeeAudioOutput(ws);
     await out.captureFrame(frame());
     assert.equal(ws.sent.length, 0);
+  });
+});
+
+describe('AttendeeAudioHub', () => {
+  test('занимает порт из диапазона и отдаёт публичный URL с ним', async () => {
+    const hub = new AttendeeAudioHub();
+    try {
+      const port = await hub.listen('c1');
+      assert.ok(port >= 8140 && port <= 8179, `порт вне диапазона: ${port}`);
+      const url = hub.publicUrl('c1');
+      // Порт в пути, а не в host:port — TLS терминирует nginx.
+      assert.match(url, new RegExp(`/attendee/${port}\\?callId=c1$`));
+    } finally { hub.close(); }
+  });
+
+  test('второй хаб берёт другой порт, а не падает', async () => {
+    // Ровно то, на чём сломалась прежняя схема: два задания на одном хосте.
+    const a = new AttendeeAudioHub();
+    const b = new AttendeeAudioHub();
+    try {
+      const pa = await a.listen('c1');
+      const pb = await b.listen('c2');
+      assert.notEqual(pa, pb);
+    } finally { a.close(); b.close(); }
+  });
+
+  test('соединение с чужим callId отвергается', async () => {
+    const hub = new AttendeeAudioHub();
+    try {
+      const port = await hub.listen('c1');
+      const waiting = hub.expect(1_000);
+      const { WebSocket: Client } = await import('ws');
+      const bad = new Client(`ws://127.0.0.1:${port}/?callId=ЧУЖОЙ`);
+      await new Promise((r) => bad.on('close', r));
+      assert.equal(await waiting, null, 'чужое соединение не должно считаться нашим');
+    } finally { hub.close(); }
+  });
+
+  test('своё соединение дождались', async () => {
+    const hub = new AttendeeAudioHub();
+    try {
+      const port = await hub.listen('c1');
+      const waiting = hub.expect(5_000);
+      const { WebSocket: Client } = await import('ws');
+      new Client(`ws://127.0.0.1:${port}/?callId=c1`);
+      const ws = await waiting;
+      assert.ok(ws, 'соединение должно быть получено');
+    } finally { hub.close(); }
+  });
+
+  test('не дождались — null по таймауту', async () => {
+    const hub = new AttendeeAudioHub();
+    try {
+      await hub.listen('c1');
+      assert.equal(await hub.expect(300), null);
+    } finally { hub.close(); }
   });
 });
