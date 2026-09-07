@@ -149,4 +149,73 @@ describe('deploy', () => {
       expect.arrayContaining([expect.stringContaining('сборка'), expect.stringContaining('перезапуск')]),
     );
   });
+
+  it('отказ сборки откатывает так же, как красный health', async () => {
+    // На живой проверке deploy упал на `pm2: not found`, коммит агента
+    // остался в дереве, отката не было — чекаут разошёлся с запущенным кодом.
+    const git = { resetHard: jest.fn(async () => undefined) };
+    let calls = 0;
+    const shell = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('pm2: not found');
+    });
+
+    const result = await deploy({
+      git: git as any,
+      shaBefore: 'aaa111',
+      buildCmd: 'npm run build',
+      restartCmd: 'pm2 restart web',
+      healthUrl: 'https://x/api/healthz',
+      shell,
+      fetchFn: jest.fn() as any,
+    });
+
+    expect(result.reverted).toBe(true);
+    expect(git.resetHard).toHaveBeenCalledWith('aaa111');
+  });
+
+  it('отказ рестарта после успешной сборки тоже откатывает', async () => {
+    const git = { resetHard: jest.fn(async () => undefined) };
+    let calls = 0;
+    const shell = jest.fn(async () => {
+      calls += 1;
+      if (calls === 2) throw new Error('pm2: not found');
+    });
+
+    const result = await deploy({
+      git: git as any,
+      shaBefore: 'aaa111',
+      buildCmd: 'npm run build',
+      restartCmd: 'pm2 restart web',
+      healthUrl: 'https://x/api/healthz',
+      shell,
+      fetchFn: jest.fn() as any,
+    });
+
+    expect(result.reverted).toBe(true);
+    expect(git.resetHard).toHaveBeenCalled();
+  });
+
+  it('провал подъёма после отката не прячется от клиента', async () => {
+    // Если и откаченное не поднялось — продукт лежит, и клиент обязан узнать
+    // об этом из потока, а не из лога на чужой машине.
+    const phases: string[] = [];
+    const git = { resetHard: jest.fn(async () => undefined) };
+    const shell = jest.fn(async () => {
+      throw new Error('всё сломано');
+    });
+
+    await deploy({
+      git: git as any,
+      shaBefore: 'aaa111',
+      buildCmd: 'npm run build',
+      restartCmd: 'pm2 restart web',
+      healthUrl: 'https://x/api/healthz',
+      shell,
+      fetchFn: jest.fn() as any,
+      onPhase: (p) => phases.push(p),
+    });
+
+    expect(phases.some((p) => p.includes('Откат поднять не удалось'))).toBe(true);
+  });
 });

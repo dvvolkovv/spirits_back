@@ -63,17 +63,34 @@ export async function deploy(input: DeployInput): Promise<{ reverted: boolean }>
     }
   };
 
-  await bringUp('Правка');
-
-  phase('Проверяю здоровье');
-  if (await checkHealth(input.healthUrl, fetchFn)) {
-    return { reverted: false };
+  let healthy = false;
+  try {
+    await bringUp('Правка');
+    phase('Проверяю здоровье');
+    healthy = await checkHealth(input.healthUrl, fetchFn);
+  } catch (e: any) {
+    // Сборка или рестарт не отработали. Без отката коммит агента остаётся в
+    // дереве, а запущен старый код: чекаут молча расходится с тем, что
+    // работает, и следующий ход стартует с чужой недоделанной правки.
+    // sha_after при этом не записывается, значит кнопка отката до этого
+    // коммита не дотянется — вернуть можно только руками на VM.
+    phase(`Сборка или перезапуск не удались: ${e?.message ?? e}`);
+    healthy = false;
   }
+
+  if (healthy) return { reverted: false };
 
   // Откатить мало — надо ещё поднять откаченное. Иначе продукт останется
   // лежать на старом коде, который не собран и не запущен.
-  phase('Проверка красная, откатываю');
+  phase('Возвращаю как было');
   await input.git.resetHard(input.shaBefore);
-  await bringUp('Откат');
+  // Поднять откаченное надо в любом случае, но если и это не удалось —
+  // деваться некуда: продукт останется лежать, и об этом обязан узнать
+  // клиент, а не только лог.
+  try {
+    await bringUp('Откат');
+  } catch (e: any) {
+    phase(`Откат поднять не удалось: ${e?.message ?? e}`);
+  }
   return { reverted: true };
 }
