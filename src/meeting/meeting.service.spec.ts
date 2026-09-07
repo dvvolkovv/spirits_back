@@ -339,6 +339,62 @@ describe('MeetingService', () => {
     });
   });
 
+  describe('потолок одновременных встреч Meet', () => {
+    // Держится здесь, а не надеждой на то, что воркер не найдёт свободного
+    // порта: диапазон сужен до одного порта (см. attendee-audio.ts), и без
+    // этой проверки второй пользователь упирался бы в отказ через несколько
+    // секунд и без внятной причины — при потолке в одну встречу это норма,
+    // а не редкость.
+    it('вторая одновременная встреча Meet отклоняется внятно', async () => {
+      withAgent();
+      // Одна встреча Meet уже идёт.
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('FROM agents')) return { rows: [agentRow] };
+        if (sql.includes('SELECT tokens FROM ai_profiles_consolidated')) return { rows: [{ tokens: balance }] };
+        if (/count\(\*\)/.test(sql) && /provider/.test(sql)) return { rows: [{ n: 1 }] };
+        if (sql.includes('ai_profiles_consolidated')) return { rows: [{ name: 'Дмитрий' }] };
+        return { rows: [], rowCount: 0 };
+      });
+      await expect(svc.join('u2', 7, 'abc-defg-hij', 'meet')).rejects.toMatchObject({
+        response: expect.objectContaining({ reason: 'meet_busy' }),
+      });
+    });
+
+    it('при отказе по потолку запись звонка не создаётся', async () => {
+      // Иначе строка осталась бы в dialing и заперла пользователю его же
+      // следующий вход до реапера.
+      withAgent();
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('FROM agents')) return { rows: [agentRow] };
+        if (sql.includes('SELECT tokens FROM ai_profiles_consolidated')) return { rows: [{ tokens: balance }] };
+        if (/count\(\*\)/.test(sql) && /provider/.test(sql)) return { rows: [{ n: 1 }] };
+        if (sql.includes('ai_profiles_consolidated')) return { rows: [{ name: 'Дмитрий' }] };
+        return { rows: [], rowCount: 0 };
+      });
+      await expect(svc.join('u2', 7, 'abc-defg-hij', 'meet')).rejects.toThrow();
+      expect(pg.query.mock.calls.some(([sql]: any) => /INSERT INTO voice_calls/.test(sql))).toBe(false);
+    });
+
+    it('свободно — встреча заводится', async () => {
+      withAgent();
+      const res = await svc.join('u1', 7, 'abc-defg-hij', 'meet');
+      expect(res.callId).toEqual(expect.any(String));
+    });
+
+    it('потолок не мешает своим комнатам и Taler ID', async () => {
+      // Он про Meet, а не про встречи вообще.
+      withAgent();
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('FROM agents')) return { rows: [agentRow] };
+        if (sql.includes('SELECT tokens FROM ai_profiles_consolidated')) return { rows: [{ tokens: balance }] };
+        if (/count\(\*\)/.test(sql) && /provider/.test(sql)) return { rows: [{ n: 5 }] };
+        if (sql.includes('ai_profiles_consolidated')) return { rows: [{ name: 'Дмитрий' }] };
+        return { rows: [], rowCount: 0 };
+      });
+      await expect(svc.join('u1', 7, 'ABC234')).resolves.toBeDefined();
+    });
+  });
+
   describe('attachBot', () => {
     // Порт под звук свой у каждого задания, и знает его только воркер (см.
     // AttendeeAudioHub). Бот поэтому создаётся не в join(), а здесь — когда
