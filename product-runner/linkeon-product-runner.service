@@ -1,0 +1,17 @@
+[Unit]
+Description=Linkeon product runner
+After=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/linkeon-product-runner
+EnvironmentFile=/etc/linkeon-product-runner.env
+ExecStart=/usr/bin/node /opt/linkeon-product-runner/dist/index.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
