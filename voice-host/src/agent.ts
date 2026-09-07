@@ -777,6 +777,9 @@ export default defineAgent({
                 persona: meta.agentPersona || '',
                 preamble: meta.preamble,
                 specialists: meta.specialists,
+                // Ровно то же условие, что и у тула: промпт и набор
+                // инструментов обязаны совпадать.
+                hasChat: !!chat,
               })
             : callInstructions(meta.preamble, meta.specialists),
           tools,

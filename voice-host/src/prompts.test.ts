@@ -46,15 +46,26 @@ describe('доступ к интернету', () => {
 });
 
 describe('чат встречи', () => {
-  test('на встрече промпт объясняет, что в чат можно писать', () => {
+  test('со чатом промпт объясняет, что в него можно писать', () => {
     const s = flat(meetingInstructions({
-      name: 'Роман', persona: '', preamble: '', specialists: SPECIALISTS,
+      name: 'Роман', persona: '', preamble: '', specialists: SPECIALISTS, hasChat: true,
     }));
     assert.match(s, /write_to_chat/);
     assert.match(s, /ссылк/i);
     // Пересказ вслух того, что уже написано текстом, — главный способ
     // испортить встречу: участники слышат зачитанный URL посимвольно.
     assert.match(s, /не дублируй|не зачитывай/i);
+  });
+
+  test('без чата про него в промпте ни слова', () => {
+    // Чат есть только в чужих комнатах Taler ID; тула write_to_chat на своей
+    // встрече нет вовсе. Рассказать модели про инструмент, которого ей не
+    // дали, — значит получить обещание «написал в чат» без единого сообщения.
+    const s = flat(meetingInstructions({
+      name: 'Роман', persona: '', preamble: '', specialists: SPECIALISTS,
+    }));
+    assert.doesNotMatch(s, /write_to_chat/);
+    assert.doesNotMatch(s, /чат встречи/i);
   });
 });
 
