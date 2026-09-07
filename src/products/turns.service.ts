@@ -6,6 +6,8 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  OnModuleDestroy,
+  OnModuleInit,
 } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { MiscService } from '../misc/misc.service';
@@ -57,13 +59,52 @@ export interface ClaimedTurn {
 }
 
 @Injectable()
-export class TurnsService {
+export class TurnsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TurnsService.name);
+  private reaper?: NodeJS.Timeout;
 
   constructor(
     private readonly pg: PgService,
     private readonly misc: MiscService,
   ) {}
+
+  onModuleInit() {
+    this.reaper = setInterval(() => {
+      this.reapStuck().catch((e) => this.logger.error(`reapStuck failed: ${e.message}`));
+    }, 5 * 60 * 1000);
+    // unref, иначе таймер держит процесс и jest не завершается.
+    this.reaper.unref();
+  }
+
+  onModuleDestroy() {
+    if (this.reaper) clearInterval(this.reaper);
+  }
+
+  /**
+   * Раннер может умереть посреди хода — упасть, потерять сеть, уехать в
+   * перезагрузку VM. Ход останется `running`, а замок будет считать продукт
+   * занятым: клиент получит 409 на всё и не сможет починить это сам.
+   *
+   * Порог 30 минут: дольше живого хода агента и заметно больше, чем окно
+   * переподключения раннера после разрыва сети.
+   *
+   * Токены не списываются — работа не доведена до результата.
+   */
+  async reapStuck(): Promise<number> {
+    const r = await this.pg.query(
+      `UPDATE product_turns
+          SET status = 'failed',
+              error = 'Раннер не завершил ход: связь потеряна',
+              finished_at = now()
+        WHERE status = 'running'
+          AND started_at < now() - interval '30 minutes'
+        RETURNING id`,
+    );
+    if (r.rows.length) {
+      this.logger.warn(`reapStuck: снято ${r.rows.length} зависших ходов`);
+    }
+    return r.rows.length;
+  }
 
   async enqueue(input: EnqueueInput): Promise<TurnRow> {
     // Предусловия живут здесь, а не в контроллере, сознательно. Шлагбаум по
