@@ -16,6 +16,8 @@ export interface EnqueueInput {
   userId: string;
   channel: 'web' | 'telegram';
   prompt: string;
+  /** Только для служебного хода отката. Заполняется исключительно `revert()`. */
+  revertToSha?: string;
 }
 
 export interface TurnRow {
@@ -46,6 +48,8 @@ export interface ClaimedTurn {
   prompt: string;
   channel: string;
   user_id: string;
+  /** Непустое => это откат, и раннеру надо сбросить дерево на этот sha. */
+  revert_to_sha: string | null;
 }
 
 @Injectable()
@@ -65,9 +69,13 @@ export class TurnsService {
     // дорогой тип хода без ограничений (см. комментарий в chat.controller.ts).
     // У ходов входов тоже два, web и telegram, поэтому проверка ставится в
     // единственном общем месте.
+    // Владение проверяется здесь же, а не только в контроллере, по той же
+    // причине, что статус и баланс: у ходов два входа, web и telegram, и
+    // будущий телеграм-вход унаследовал бы шлагбаум по балансу даром, а
+    // проверку владения молча не получил. Условие в тот же запрос — бесплатно.
     const p = await this.pg.query(
-      `SELECT status FROM products WHERE id = $1 AND archived_at IS NULL`,
-      [input.productId],
+      `SELECT status FROM products WHERE id = $1 AND user_id = $2 AND archived_at IS NULL`,
+      [input.productId, input.userId],
     );
     const productStatus = p.rows[0]?.status;
     if (!productStatus) throw new NotFoundException('Product not found');
@@ -86,10 +94,10 @@ export class TurnsService {
 
     try {
       const r = await this.pg.query(
-        `INSERT INTO product_turns (product_id, user_id, channel, prompt, status)
-         VALUES ($1, $2, $3, $4, 'queued')
+        `INSERT INTO product_turns (product_id, user_id, channel, prompt, revert_to_sha, status)
+         VALUES ($1, $2, $3, $4, $5, 'queued')
          RETURNING id, status`,
-        [input.productId, input.userId, input.channel, input.prompt],
+        [input.productId, input.userId, input.channel, input.prompt, input.revertToSha ?? null],
       );
       return r.rows[0];
     } catch (e: any) {
@@ -126,7 +134,7 @@ export class TurnsService {
            FOR UPDATE SKIP LOCKED
            LIMIT 1
         )
-        RETURNING id, prompt, channel, user_id`,
+        RETURNING id, prompt, channel, user_id, revert_to_sha`,
       [productId],
     );
     return r.rows[0] ?? null;
@@ -214,11 +222,13 @@ export class TurnsService {
   }
 
   /**
-   * Откат оформляется обычным ходом со специальным prompt'ом: тот же путь
-   * reset → build → restart → health на стороне раннера, та же строка в
-   * истории. История остаётся линейной, откат отката работает без отдельного
-   * кода. Замок product_turns_one_active работает и здесь — откатить посреди
-   * живого хода нельзя.
+   * Откат оформляется обычным ходом: тот же путь reset → build → restart →
+   * health на стороне раннера, та же строка в истории. Признак отката несёт
+   * отдельная колонка `revert_to_sha`, а не содержимое prompt — prompt здесь
+   * человекочитаемый и годится для показа как есть. История остаётся
+   * линейной, откат отката работает без отдельного кода. Замок
+   * product_turns_one_active работает и здесь — откатить посреди живого хода
+   * нельзя.
    */
   async revert(input: { productId: string; turnId: string; userId: string }) {
     const r = await this.pg.query(
@@ -234,7 +244,14 @@ export class TurnsService {
       productId: input.productId,
       userId: input.userId,
       channel: 'web',
-      prompt: `__revert__:${target.sha_before}`,
+      // prompt человекочитаемый и годится для показа в истории как есть.
+      // Признак отката несёт отдельная колонка: строковый префикс внутри
+      // prompt подделывался бы обычным запросом в чат — тот передаёт тело
+      // пользователя в enqueue без разбора, а sha пользователь знает из
+      // истории. Плюс префикс пришлось бы парсить раннеру из другого
+      // репозитория, и расхождение прошло бы молча.
+      prompt: `Откат к ${target.sha_before}`,
+      revertToSha: target.sha_before,
     });
   }
 }

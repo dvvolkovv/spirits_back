@@ -70,11 +70,37 @@ describe('TurnsService.enqueue', () => {
     //
     // Колонки и плейсхолдеры охраняются раздельно: переставить можно любое из
     // двух, последствие одинаковое, а params при этом не меняется.
-    expect(insert.sql).toContain('(product_id, user_id, channel, prompt, status)');
-    expect(insert.sql).toContain('VALUES ($1, $2, $3, $4');
+    expect(insert.sql).toContain('(product_id, user_id, channel, prompt, revert_to_sha, status)');
+    expect(insert.sql).toContain('VALUES ($1, $2, $3, $4, $5');
     expect(insert.sql).toContain("'queued'");
     expect(insert.sql).toContain('RETURNING id, status');
-    expect(insert.params).toEqual(['p-1', 'u-1', 'web', 'поправь футер']);
+    expect(insert.params).toEqual(['p-1', 'u-1', 'web', 'поправь футер', null]);
+
+    // Владение проверяется в сервисе, а не только в контроллере: у ходов два
+    // входа, и телеграм-вход унаследовал бы шлагбаум по балансу даром, а
+    // проверку владения молча не получил.
+    const guard = calls.find((c) => c.sql.includes('SELECT status FROM products'))!;
+    expect(guard.sql).toContain('user_id = $2');
+    expect(guard.sql).toContain('archived_at IS NULL');
+    expect(guard.params).toEqual(['p-1', 'u-1']);
+  });
+
+  it('обычный ход не может притвориться откатом', async () => {
+    // Признак отката несёт отдельная колонка, а не префикс в prompt. Иначе
+    // POST /products/:id/chat с телом {"prompt": "__revert__:<sha>"} доехал бы
+    // до раннера как команда отката мимо всех проверок revert(), а sha
+    // пользователь знает — история сама отдаёт ему sha_before и sha_after.
+    const { svc, calls } = makeService();
+
+    await svc.enqueue({
+      productId: 'p-1',
+      userId: 'u-1',
+      channel: 'web',
+      prompt: '__revert__:deadbeef',
+    });
+
+    const insert = calls.find((c) => c.sql.includes('INSERT INTO product_turns'))!;
+    expect(insert.params[4]).toBeNull();
   });
 
   it('второй ход по тому же продукту отбивается 409, а не 500', async () => {

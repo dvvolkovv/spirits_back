@@ -64,7 +64,7 @@ describe('TurnsService.claimNext', () => {
     expect(sqlOf(calls)).toContain('started_at = now()');
     // Task 7 читает prompt, channel и user_id и шлёт их на VM. Мок эти поля
     // выдумывает, поэтому усечение RETURNING без утверждения незаметно.
-    expect(sqlOf(calls)).toContain('RETURNING id, prompt, channel, user_id');
+    expect(sqlOf(calls)).toContain('RETURNING id, prompt, channel, user_id, revert_to_sha');
   });
 
   it('отдаёт null, когда очередь пуста', async () => {

@@ -21,15 +21,16 @@ describe('TurnsService.revert', () => {
   it('ставит служебный ход отката на sha_before выбранного хода', async () => {
     const { svc, calls } = makeService({ id: 't-1', sha_before: 'aaa111' });
 
-    await svc.revert({ productId: 'p-1', turnId: 't-1', userId: 'u-1' });
+    // Возврат идёт наружу: Task 8 отдаёт его клиенту как `202 + тело`, и без
+    // него кнопка «откат поставлен» не покажет поставленный ход.
+    await expect(svc.revert({ productId: 'p-1', turnId: 't-1', userId: 'u-1' })).resolves.toMatchObject({
+      id: 't-revert',
+    });
 
     const insert = calls.find((c) => c.sql.includes('INSERT INTO product_turns'))!;
-    // sha_before целевого хода уезжает в новый ход как точка возврата — но
-    // не отдельным параметром, а встроенным в prompt ("__revert__:aaa111").
-    // `toContain` на массиве требует точного совпадения элемента, поэтому
-    // прямое `expect(insert.params).toContain('aaa111')` красное всегда,
-    // независимо от корректности реализации — проверяем подстроку явно.
-    expect(insert.params.some((p) => typeof p === 'string' && p.includes('aaa111'))).toBe(true);
+    // Точка возврата уезжает отдельной колонкой, а не подстрокой в prompt.
+    // Это и есть защита от подделки отката через обычный чат.
+    expect(insert.params[4]).toBe('aaa111');
     // Что именно revert передаёт в enqueue, охраняется отдельно. Без этого
     // опечатка `productId: input.turnId` вставит turnId в колонку product_id:
     // ход повиснет на несуществующем продукте, а мьютекс займёт не тот. И без

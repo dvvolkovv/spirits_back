@@ -48,6 +48,13 @@ CREATE TABLE IF NOT EXISTS product_turns (
                  CHECK (status IN ('queued','running','done','failed','reverted')),
   sha_before   text,
   sha_after    text,
+  -- Непустое => это служебный ход отката, и вот на какой sha возвращать.
+  -- Отдельная колонка, а не префикс в prompt: prompt приходит от пользователя
+  -- и уезжает в enqueue без разбора, поэтому управляющий канал внутри него
+  -- подделывается обычным запросом в чат. Плюс поле читают раннер (другой
+  -- репозиторий, другая машина) и фронт — строковый контракт разъехался бы
+  -- молча. Заполняется только revert().
+  revert_to_sha text,
   tokens_spent bigint NOT NULL DEFAULT 0 CHECK (tokens_spent >= 0),
   error        text,
   started_at   timestamptz,
