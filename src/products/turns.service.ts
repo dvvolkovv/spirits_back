@@ -121,9 +121,26 @@ export class TurnsService {
     }
   }
 
-  /** Heartbeat раннера. Пишется на каждом опросе, независимо от наличия хода. */
+  /**
+   * Heartbeat раннера. Пишется на каждом опросе, независимо от наличия хода.
+   *
+   * Заодно снимает `degraded`. Этот статус ставит мониторинг, когда раннер
+   * долго молчит, — и без обратного перехода он тупик: раннер оживёт, будет
+   * слать heartbeat, а продукт останется навсегда «нет связи», причём
+   * `claimNext` перестанет выдавать ему работу. Опрос и есть доказательство
+   * живости, поэтому снимать признак должен он.
+   *
+   * Остальные статусы не трогаются: `stopped` и `archived` — решение
+   * владельца, и heartbeat его не отменяет.
+   */
   async touchRunner(productId: string) {
-    await this.pg.query(`UPDATE products SET runner_seen_at = now() WHERE id = $1`, [productId]);
+    await this.pg.query(
+      `UPDATE products
+          SET runner_seen_at = now(),
+              status = CASE WHEN status = 'degraded' THEN 'running' ELSE status END
+        WHERE id = $1`,
+      [productId],
+    );
   }
 
   /**
@@ -135,14 +152,22 @@ export class TurnsService {
       `UPDATE product_turns
           SET status = 'running', started_at = now()
         WHERE id = (
-          SELECT id FROM product_turns
-           WHERE product_id = $1 AND status = 'queued'
+          SELECT t.id FROM product_turns t
+            -- Статус продукта проверяется ЗДЕСЬ, а не только в enqueue.
+            -- Между постановкой хода и его забором проходит время: раннер мог
+            -- лежать полчаса. Если за это время продукт перевели в stopped,
+            -- выдавать по нему работу нельзя — агент будет править живой прод
+            -- продукта, который считается выведенным из эксплуатации.
+            JOIN products p ON p.id = t.product_id
+           WHERE t.product_id = $1 AND t.status = 'queued'
+             AND p.status = 'running' AND p.archived_at IS NULL
            -- ORDER BY здесь страховка, а не работающая логика: частичный
            -- уникальный индекс из Task 1 не допускает больше одной строки в
            -- ('queued','running') на продукт, значит сортировать нечего.
            -- Строка остаётся на случай ослабления предиката индекса.
-           ORDER BY created_at
-           FOR UPDATE SKIP LOCKED
+           ORDER BY t.created_at
+           -- OF t: блокируем только строку хода, не строку продукта.
+           FOR UPDATE OF t SKIP LOCKED
            LIMIT 1
         )
         RETURNING id, prompt, channel, user_id, revert_to_sha`,

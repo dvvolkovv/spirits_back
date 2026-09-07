@@ -48,9 +48,13 @@ describe('TurnsService.claimNext', () => {
     // Отбор — не косметика: без product_id раннер одного продукта заберёт ход
     // чужого и пойдёт править не тот чекаут, а без status='queued' подхватит
     // уже выполняющийся ход.
-    expect(sqlOf(calls)).toContain('product_id = $1');
-    expect(sqlOf(calls)).toContain("status = 'queued'");
-    expect(sqlOf(calls)).toContain('FOR UPDATE SKIP LOCKED');
+    expect(sqlOf(calls)).toContain('t.product_id = $1');
+    expect(sqlOf(calls)).toContain("t.status = 'queued'");
+    // Статус продукта проверяется при выдаче, а не только при постановке:
+    // между ними проходит время, и продукт мог уехать в stopped.
+    expect(sqlOf(calls)).toContain("p.status = 'running'");
+    expect(sqlOf(calls)).toContain('p.archived_at IS NULL');
+    expect(sqlOf(calls)).toContain('FOR UPDATE OF t SKIP LOCKED');
     expect(sqlOf(calls)).toContain('LIMIT 1');
     // Перевод в running охраняется явно, а не через диспетчер мока: тот
     // маршрутизирует по этой же строке, поэтому покрытие есть, но невидимое —
@@ -71,6 +75,21 @@ describe('TurnsService.claimNext', () => {
     const { svc } = makeService({ claim: [] });
 
     await expect(svc.claimNext('p-1')).resolves.toBeNull();
+  });
+});
+
+describe('TurnsService.touchRunner', () => {
+  it('heartbeat снимает degraded и не трогает остальные статусы', async () => {
+    // Без обратного перехода degraded — тупик: мониторинг его ставит, никто
+    // не снимает, и продукт навсегда остаётся «нет связи» и без работы.
+    const { svc, calls } = makeService();
+
+    await svc.touchRunner('p-1');
+
+    expect(calls[0].sql).toContain('runner_seen_at = now()');
+    expect(calls[0].sql).toContain("CASE WHEN status = 'degraded' THEN 'running' ELSE status END");
+    expect(calls[0].sql).toContain('WHERE id = $1');
+    expect(calls[0].params).toEqual(['p-1']);
   });
 });
 
