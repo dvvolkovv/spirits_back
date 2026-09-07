@@ -15,12 +15,15 @@ import {
 import * as openai from '@livekit/agents-plugin-openai';
 import { RoomEvent } from '@livekit/rtc-node';
 import { z } from 'zod';
+import type { WebSocket } from 'ws';
 import { backend, type TranscriptEntry } from './backend.js';
 import { PendingAnswers } from './pending.js';
 import { NameGate } from './name-gate.js';
 import { Occupancy } from './occupancy.js';
+import { Presence } from './presence.js';
 import { MixedRoomAudioInput } from './mixed-audio-input.js';
 import { ExternalRoomAudioOutput } from './external-room-output.js';
+import { AttendeeAudioHub, AttendeeAudioInput, AttendeeAudioOutput } from './attendee-audio.js';
 import { Room as ExternalRoom } from '@livekit/rtc-node';
 import {
   answerTo,
@@ -50,6 +53,10 @@ const INTERNAL_PREFIX = '[Внутреннее сообщение';
 /** Сколько после своей реплики ассистент отвечает без повторного зова. */
 const FOLLOWUP_WINDOW_MS = 30_000;
 
+const ATTENDEE_WS_PORT = Number(process.env.ATTENDEE_WS_PORT || 8138);
+/** Один хаб на процесс воркера: задания находят своё соединение по callId. */
+const attendeeHub = new AttendeeAudioHub(ATTENDEE_WS_PORT);
+
 export default defineAgent({
   entry: async (ctx: JobContext) => {
     const meta = JSON.parse(ctx.job.metadata || '{}') as {
@@ -64,9 +71,12 @@ export default defineAgent({
       agentPersona?: string;
       agentVoice?: string;
       ownerName?: string;
-      // Чужая встреча: разговор идёт не в нашей комнате, а в комнате
-      // провайдера, куда мы входим участником по добытому токеном.
-      provider?: 'talerid';
+      // Чужая площадка. 'talerid' — разговор идёт не в нашей комнате, а в
+      // комнате провайдера, куда мы входим участником по добытому токену.
+      // 'meet' — площадка вне LiveKit вовсе: Google Meet через бота Attendee,
+      // звук ходит вебсокетом (см. isMeet ниже), externalUrl/externalToken ей
+      // не нужны.
+      provider?: 'talerid' | 'meet';
       externalUrl?: string;
       externalToken?: string;
     };
@@ -106,6 +116,36 @@ export default defineAgent({
     const gate = isMeeting ? new NameGate(agentName, FOLLOWUP_WINDOW_MS) : null;
     const occupancy = isMeeting ? new Occupancy(Date.now()) : null;
 
+    /**
+     * Встреча на площадке без LiveKit (Meet через Attendee). Отличается от
+     * isForeign тем, что второй комнаты нет вовсе: звук идёт вебсокетом, а
+     * наша комната остаётся пустой и нужна только ради job и дата-канала.
+     */
+    const isMeet = isMeeting && meta.provider === 'meet';
+
+    /**
+     * Состав встречи Meet. В нашей комнате участников нет вовсе, поэтому
+     * источник состава — вебхуки Attendee, доезжающие по дата-каналу.
+     * Исключаем себя: бот Attendee сидит в встрече полноправным участником и
+     * приходит в join_leave наравне с людьми.
+     */
+    const presence = isMeet
+      ? new Presence(`${agentName} · ассистент ${meta.ownerName || 'пользователя'}`)
+      : null;
+
+    /**
+     * Раздать состав тем, кто на него опирается.
+     *
+     * Без этого гейт по имени срывался бы в solo и ассистент отвечал на каждую
+     * реплику встречи, а правила выхода уводили бы его из живой встречи через
+     * LOBBY_MS.
+     */
+    const syncFromPresence = (): void => {
+      if (!presence) return;
+      gate?.setSolo(presence.solo);
+      console.log(`[гейт] участников: ${presence.count} → ${presence.solo ? 'наедине' : 'строгий гейт'}`);
+    };
+
     await ctx.connect();
 
     /**
@@ -121,6 +161,26 @@ export default defineAgent({
         dynacast: false,
       });
       console.log(`[чужая] подключились к ${meta.externalUrl}`);
+    }
+
+    /**
+     * Звук Meet-встречи. Ждём здесь, до создания сессии: без звука сессию
+     * заводить незачем, а к этому моменту ещё ничего, кроме подключённой
+     * ctx.room, не создано — закрыть при неудаче нужно только её.
+     */
+    let attendeeWs: WebSocket | null = null;
+    if (isMeet) {
+      // Место занимаем и ждём: Attendee мог подключиться, пока поднималось
+      // задание, — тогда соединение уже ждёт нас.
+      attendeeWs = await attendeeHub.expect(meta.callId);
+      if (!attendeeWs) {
+        // Бот так и не подключился. Сидеть в пустой комнате и тарифицировать
+        // Realtime незачем: закрываемся сразу и внятно.
+        await backend.failed(meta.callId, 'звук встречи так и не подключился').catch(() => {});
+        try { await ctx.room.disconnect(); } catch {}
+        return;
+      }
+      console.log('[meet] звук Attendee на связи');
     }
 
     if (isMeeting && !isForeign) {
@@ -354,6 +414,35 @@ export default defineAgent({
         );
       }
       // specialist_pending предназначен фронту — игнорируем.
+
+      if (msg.type === 'meet_participant') {
+        presence?.apply({ event: msg.event, uuid: msg.uuid, name: msg.name });
+        // occupancy ведёт участников множеством по ключу — отдаём ему uuid,
+        // а не имя: тёзки иначе схлопнулись бы в одного, и уход одного из них
+        // выглядел бы как уход обоих.
+        if (msg.event === 'join') occupancy?.joined(msg.uuid);
+        else occupancy?.left(msg.uuid);
+        syncFromPresence();
+        if (msg.event === 'join') {
+          // Отметка «встреча началась». Без неё voice_calls.status навсегда
+          // остаётся dialing и запирает пользователю следующий вход до
+          // реапера — то есть на 130 минут.
+          void backend.meetingFirstHuman(meta.callId).catch(() => {});
+        }
+        return;
+      }
+      if (msg.type === 'meet_speaking') {
+        presence?.speech(msg.uuid, msg.name, msg.speaking);
+        currentSpeaker = presence?.speaker;
+        return;
+      }
+      if (msg.type === 'meet_bot_state' && msg.fatal) {
+        // Не пустили, выгнали или бот умер: встречи не будет.
+        console.log(`[meet] бот в состоянии ${msg.state} — выходим`);
+        void backend.failed(meta.callId, `бот Attendee: ${msg.state}`).catch(() => {});
+        void session.close().catch(() => {});
+        return;
+      }
     });
 
     // Свободен — это именно 'listening'/'idle'. Раньше здесь стояло
@@ -532,40 +621,50 @@ export default defineAgent({
      * принимаем сами.
      */
     if (occupancy) {
-      // Уже сидящие до нашего входа: participantConnected по ним не придёт, и
-      // без этого прохода начавшаяся раньше встреча считалась бы пустой, а
-      // ассистент вышел бы через LOBBY_MS.
-      // Считаем участников ТОЙ комнаты, где идёт разговор: в своей при чужой
-      // встрече никого нет и не будет, и ассистент вышел бы сразу.
-      const stage = foreign ?? ctx.room;
-      for (const identity of stage.remoteParticipants.keys()) occupancy.joined(identity);
+      if (isMeet) {
+        // Состав приезжает вебхуками (обработчик meet_participant выше сам
+        // ведёт occupancy.joined/left и зовёт syncFromPresence). Здесь только
+        // начальная раздача: до первого события гейт обязан быть строгим,
+        // а не solo, — участников пока не показывал никто.
+        syncFromPresence();
+      } else {
+        // Уже сидящие до нашего входа: participantConnected по ним не придёт, и
+        // без этого прохода начавшаяся раньше встреча считалась бы пустой, а
+        // ассистент вышел бы через LOBBY_MS.
+        // Считаем участников ТОЙ комнаты, где идёт разговор: в своей при чужой
+        // встрече никого нет и не будет, и ассистент вышел бы сразу.
+        const stage = foreign ?? ctx.room;
+        for (const identity of stage.remoteParticipants.keys()) occupancy.joined(identity);
 
-      /**
-       * Наедине ассистент отвечает без имени.
-       *
-       * Гейт по имени защищает от вмешательства в ЧУЖОЙ разговор, а при одном
-       * собеседнике чужого разговора не бывает. Считаем удалённых участников
-       * комнаты разговора: сам ассистент в ней локальный и в счёт не идёт.
-       */
-      const syncSolo = () => {
-        const solo = stage.remoteParticipants.size <= 1;
-        gate?.setSolo(solo);
-        console.log(`[гейт] участников: ${stage.remoteParticipants.size} → ${solo ? 'наедине' : 'строгий гейт'}`);
-      };
-      syncSolo();
-
-      stage.on(RoomEvent.ParticipantConnected, (p: any) => {
-        occupancy.joined(p.identity);
+        /**
+         * Наедине ассистент отвечает без имени.
+         *
+         * Гейт по имени защищает от вмешательства в ЧУЖОЙ разговор, а при одном
+         * собеседнике чужого разговора не бывает. Считаем удалённых участников
+         * комнаты разговора: сам ассистент в ней локальный и в счёт не идёт.
+         */
+        const syncSolo = () => {
+          const solo = stage.remoteParticipants.size <= 1;
+          gate?.setSolo(solo);
+          console.log(`[гейт] участников: ${stage.remoteParticipants.size} → ${solo ? 'наедине' : 'строгий гейт'}`);
+        };
         syncSolo();
-        void backend.meetingFirstHuman(meta.callId).catch(() => {
-          // Отметка «встреча началась» — учётная, ради неё встречу не рвём.
+
+        stage.on(RoomEvent.ParticipantConnected, (p: any) => {
+          occupancy.joined(p.identity);
+          syncSolo();
+          void backend.meetingFirstHuman(meta.callId).catch(() => {
+            // Отметка «встреча началась» — учётная, ради неё встречу не рвём.
+          });
         });
-      });
-      stage.on(RoomEvent.ParticipantDisconnected, (p: any) => {
-        occupancy.left(p.identity);
-        syncSolo();
-      });
+        stage.on(RoomEvent.ParticipantDisconnected, (p: any) => {
+          occupancy.left(p.identity);
+          syncSolo();
+        });
+      }
 
+      // Таймер вердикта общий для всех ветвей: verdict() читает только
+      // occupancy, а для isMeet его ведёт обработчик meet_participant выше.
       const watch = setInterval(() => {
         const verdict = occupancy.verdict(Date.now());
         if (verdict === 'stay') return;
@@ -594,6 +693,10 @@ export default defineAgent({
       // останется висеть у них в списке.
       try { await foreignOutput?.close(); } catch {}
       try { await foreign?.disconnect(); } catch {}
+      // Закрываем только соединение: своей очереди звука у вывода нет, и
+      // метода close() у него, в отличие от ExternalRoomAudioOutput, тоже —
+      // публиковать и снимать дорожку здесь нечего.
+      try { attendeeWs?.close(); } catch {}
     });
 
     // Свой вход выставляем ДО start() — это поддержанный фреймворком порядок.
@@ -607,18 +710,26 @@ export default defineAgent({
     // audioEnabled при этом трогать нельзя: с `false` условие выше не
     // сработает, а заодно заглушится весь аудиотракт.
     if (isMeeting) {
-      // Оба конца — на ту комнату, где идёт разговор. Микшер принимает любую,
-      // правок не потребовал.
-      const stage = foreign ?? ctx.room;
-      session.input.audio = new MixedRoomAudioInput(stage);
-      if (foreign) {
-        foreignOutput = new ExternalRoomAudioOutput(
-          foreign,
-          `${agentName} · ассистент ${meta.ownerName || 'пользователя'}`,
-        );
-        session.output.audio = foreignOutput;
+      if (isMeet && attendeeWs) {
+        // Meet: звук целиком в вебсокете, комнаты для него нет вовсе — ни
+        // своей, ни чужой.
+        session.input.audio = new AttendeeAudioInput(attendeeWs);
+        session.output.audio = new AttendeeAudioOutput(attendeeWs);
+        console.log('[вход] звук Attendee подставлен до старта сессии');
+      } else {
+        // Оба конца — на ту комнату, где идёт разговор. Микшер принимает любую,
+        // правок не потребовал.
+        const stage = foreign ?? ctx.room;
+        session.input.audio = new MixedRoomAudioInput(stage);
+        if (foreign) {
+          foreignOutput = new ExternalRoomAudioOutput(
+            foreign,
+            `${agentName} · ассистент ${meta.ownerName || 'пользователя'}`,
+          );
+          session.output.audio = foreignOutput;
+        }
+        console.log(`[вход] микшер подставлен до старта сессии (${foreign ? 'чужая' : 'своя'} комната)`);
       }
-      console.log(`[вход] микшер подставлен до старта сессии (${foreign ? 'чужая' : 'своя'} комната)`);
     }
 
     try {
@@ -645,7 +756,22 @@ export default defineAgent({
         //
         // Наша комната по-прежнему нужна, но только ради job: жизненный цикл,
         // учёт и reaper завязаны на неё. Разговор же целиком в чужой.
-        room: foreign ?? ctx.room,
+        //
+        // Для Meet комнату НЕ передаём вовсе: разговор идёт вне LiveKit
+        // целиком, второй комнаты, как у Taler ID, тоже нет — привязывать
+        // сессию некуда. Это поддержанный фреймворком режим, а не обход:
+        // room в session.start() необязателен (agent_session.d.ts:434),
+        // RoomIO заводится только веткой `else if (room && !this._roomIO)`
+        // (agent_session.js:397) — без комнаты его не будет вовсе, а
+        // дальнейшие обращения к ней в этом файле guarded через `if (room …)`.
+        // AgentActivity.start() при этом всё равно безусловно снимает паузу
+        // планировщика (agent_activity.js:490, пауза стартует в true — :173),
+        // а shouldDiscardInputAudio() зависит только от прогрева эхоподавления
+        // и неперебиваемой реплики, не от комнаты и не от связанного участника
+        // (agent_activity.js:1046-1052). Наша комната при этом всё равно
+        // подключена через ctx.connect() выше — по ней идут job и дата-канал,
+        // сессия просто о ней не знает.
+        ...(isMeet ? {} : { room: foreign ?? ctx.room }),
         // closeOnDisconnect: false — иначе сессия закрывается, когда выйдет
         // тот участник, к которому RoomIO привязался первым, и встреча
         // обрывается всем остальным.
