@@ -239,20 +239,6 @@ export class TurnsService {
   }
 
   /**
-   * Ход принадлежит продукту — или 404. Нужен там, где ограничить запросом
-   * нельзя: события уезжают в Redis по ключу хода, а продукта в этом ключе
-   * нет. `RunnerGuard` подтверждает, каким продуктом является раннер, но не
-   * то, что переданный `turnId` относится к этому продукту.
-   */
-  async assertTurnBelongsTo(turnId: string, productId: string): Promise<void> {
-    const r = await this.pg.query(
-      `SELECT 1 FROM product_turns WHERE id = $1 AND product_id = $2`,
-      [turnId, productId],
-    );
-    if (!r.rows[0]) throw new NotFoundException('Turn not found');
-  }
-
-  /**
    * Откат оформляется обычным ходом: тот же путь reset → build → restart →
    * health на стороне раннера, та же строка в истории. Признак отката несёт
    * отдельная колонка `revert_to_sha`, а не содержимое prompt — prompt здесь

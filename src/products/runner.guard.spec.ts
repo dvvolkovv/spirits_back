@@ -49,6 +49,19 @@ describe('RunnerGuard', () => {
     await expect(guard.canActivate(makeContext())).rejects.toBeInstanceOf(UnauthorizedException);
   });
 
+  it('заголовок без префикса Bearer не принимается', async () => {
+    // Утверждение явное, потому что иначе эта мутация ловится случайно: без
+    // разбора префикса в хеш уходит вся строка целиком, значение расходится с
+    // константой HASH, и тест краснеет по совпадению, а не по замыслу.
+    //
+    // Разбор регистрозависимый. RFC 7235 объявляет схему авторизации
+    // регистронезависимой, то есть мы строже стандарта — это осознанно:
+    // раннера пишем мы сами, и заголовок формирует наш же код.
+    const { guard } = makeGuard([{ id: 'p-1' }]);
+
+    await expect(guard.canActivate(makeContext(TOKEN))).rejects.toBeInstanceOf(UnauthorizedException);
+  });
+
   it('неизвестный токен — 401', async () => {
     const { guard } = makeGuard([]);
 
