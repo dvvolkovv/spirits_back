@@ -85,6 +85,32 @@ describe('TurnEventsService.appendEvent', () => {
 
     expect(redis.expire).toHaveBeenCalledWith('product:p-1:turn:t-1:events', 3600);
   });
+
+  it('rpush происходит раньше expire', async () => {
+    // Порядок важен: expire по ещё не существующему ключу — no-op. Переставь
+    // вызовы местами, и первый же пакет событий останется без TTL навсегда —
+    // ключ, легший до create-эффекта rpush, никогда не получит срок жизни.
+    const { svc, redis } = makeService();
+
+    await svc.appendEvent('p-1', 't-1', { type: 'progress' });
+
+    expect(redis.rpush.mock.invocationCallOrder[0]).toBeLessThan(
+      redis.expire.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('не кладёт в буфер то, что не является объектом', async () => {
+    // Тело маршрута раннера — { events: any[] } без рантайм-валидации.
+    // {"events":[null]} не должен долетать до rpush: иначе на чтении
+    // event?.type сработает штатно (значение undefined), но JSON.stringify(null)
+    // кладёт в буфер бессмысленную строку "null" вместо того, чтобы просто
+    // ничего не писать.
+    const { svc, redis } = makeService();
+
+    await svc.appendEvent('p-1', 't-1', null);
+
+    expect(redis.rpush).not.toHaveBeenCalled();
+  });
 });
 
 describe('TurnEventsService.readEvents', () => {
@@ -165,5 +191,62 @@ describe('TurnEventsService.readEvents', () => {
     // Курсор обязан сдвинуться на число уже отданных событий (1), иначе
     // второй опрос перечитает то же самое событие заново.
     expect(lrangeCalls[1].args).toEqual([key, 1, -1]);
+  });
+
+  it('отменяется в тихом потоке — без единого события в буфере', async () => {
+    // Главный тест правки. Снаружи, в `for await` у вызывающего, isCancelled
+    // бесполезен ровно в этом сценарии: пока событий нет, генератор не
+    // доходит до yield, и проверять флаг некому. Если проверку внутри цикла
+    // убрать и оставить только внешнюю (которой здесь и нет — она в
+    // контроллере), генератор продолжит крутить lrange/pg/sleep до предела в
+    // 1800 тиков, несмотря на отмену.
+    jest.useFakeTimers();
+    let calls = 0;
+    // false в первый раз (даём тику начаться), true во все последующие —
+    // моделирует «клиент отвалился между двумя опросами».
+    const isCancelled = () => {
+      calls++;
+      return calls > 1;
+    };
+    const { svc, redisCalls } = makeService({ lrangeBatches: [[]], turnStatus: 'running' });
+
+    const gen = svc.readEvents('p-1', 't-1', isCancelled);
+    const result = gen.next();
+    // Первый тик: isCancelled() -> false, lrange, pg, дошли до sleep(500) —
+    // отдаём таймеру управление, чтобы генератор продолжил до второго тика,
+    // где isCancelled() уже вернёт true.
+    await jest.advanceTimersByTimeAsync(500);
+    await expect(result).resolves.toEqual({ value: undefined, done: true });
+
+    const lrangeCountAfterCancel = redisCalls.filter((c) => c.method === 'lrange').length;
+    expect(lrangeCountAfterCancel).toBe(1);
+
+    // Дальше отмотка времени не должна рождать новые обращения к Redis —
+    // именно это увидел зонд ревьюера: число обращений росло и после обрыва.
+    await jest.advanceTimersByTimeAsync(30_000);
+    expect(redisCalls.filter((c) => c.method === 'lrange').length).toBe(lrangeCountAfterCancel);
+  });
+
+  it('финальный дренаж: событие, дописанное между lrange и статусом, доходит до клиента', async () => {
+    // lrange вызывается дважды: первый раз ловит одно событие обычным
+    // опросом, второй (дренаж) — то, что раннер дописал уже после того, как
+    // статус хода стал терминальным, но до второго обращения к буферу.
+    const { svc } = makeService({
+      lrangeBatches: [
+        [JSON.stringify({ type: 'progress', n: 1 })],
+        [JSON.stringify({ type: 'progress', n: 2 })],
+      ],
+      turnStatus: 'done',
+    });
+
+    const events = await collect(svc.readEvents('p-1', 't-1'));
+
+    // Оба события обязаны дойти, и только потом end — без дренажа второе
+    // событие пропало бы молча, а клиент увидел бы end с обрезанным хвостом.
+    expect(events).toEqual([
+      { type: 'progress', n: 1 },
+      { type: 'progress', n: 2 },
+      { type: 'end' },
+    ]);
   });
 });

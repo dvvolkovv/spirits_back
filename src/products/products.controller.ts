@@ -70,9 +70,24 @@ export class ProductsController {
       clientGone = true;
     });
 
-    for await (const event of this.turnEvents.readEvents(id, turn.id)) {
-      if (clientGone) break;
-      res.write(JSON.stringify(event) + '\n');
+    try {
+      // Внешняя проверка `if (clientGone) break` остаётся: она закрывает
+      // гонку внутри одного тика, когда `readEvents` уже отдал событие, а
+      // обрыв случился, пока мы дописывали предыдущее в сокет. Основная
+      // защита — предикат `isCancelled`, переданный внутрь генератора: без
+      // него отмена не срабатывает, пока поток тихий (см. readEvents).
+      for await (const event of this.turnEvents.readEvents(id, turn.id, () => clientGone)) {
+        if (clientGone) break;
+        res.write(JSON.stringify(event) + '\n');
+      }
+    } catch (e: any) {
+      // Заголовки уже ушли, поэтому фильтр исключений Nest отдать чистый JSON
+      // не сможет — клиент увидел бы обрыв сокета без объяснения. Отдаём
+      // событие error, чтобы NDJSON-парсер на той стороне получил внятное
+      // завершение.
+      if (!clientGone) {
+        res.write(JSON.stringify({ type: 'error', message: 'Поток прерван' }) + '\n');
+      }
     }
     if (!clientGone) res.end();
   }

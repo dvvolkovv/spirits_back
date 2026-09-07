@@ -106,7 +106,9 @@ describe('ProductsController.chat', () => {
 
     await ctrl.chat(user, 'p-1', { prompt: 'go' } as any, makeReq() as any, makeRes() as any);
 
-    expect(turnEvents.readEvents).toHaveBeenCalledWith('p-1', 't-1');
+    // Третий аргумент — предикат отмены (см. readEvents в
+    // turn-events.service.ts); в этом тесте важны только первые два.
+    expect(turnEvents.readEvents).toHaveBeenCalledWith('p-1', 't-1', expect.any(Function));
   });
 
   it('revertToSha из тела запроса не доезжает до enqueue', async () => {

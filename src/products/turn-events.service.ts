@@ -29,6 +29,12 @@ export class TurnEventsService {
 
   /** Раннер шлёт сюда события хода; живут час — этого хватает на дочитывание. */
   async appendEvent(productId: string, turnId: string, event: any) {
+    // Тело маршрута раннера типизировано TS-типом при ValidationPipe с
+    // whitelist: false — рантайм-проверки нет. `{"events":[null]}` положил бы
+    // в буфер строку "null", а на чтении `event.type` дал бы TypeError уже
+    // ПОСЛЕ отправки заголовков: клиент увидел бы обрыв сокета без события
+    // error. Отбрасываем то, что событием быть не может.
+    if (!event || typeof event !== 'object') return;
     const key = this.eventsKey(productId, turnId);
     await this.redis.rpush(key, JSON.stringify(event));
     await this.redis.expire(key, 3600);
@@ -38,21 +44,43 @@ export class TurnEventsService {
    * Читает события хода по мере поступления. Завершается на `end` или `error`,
    * либо когда ход в базе уже не `queued`/`running` — иначе клиент повиснет
    * навсегда, если раннер умер, не дописав финальное событие.
+   *
+   * `isCancelled` — необязательный признак отмены клиентом. Опрашивается
+   * ВНУТРИ цикла, а не только снаружи в `for await` у вызывающего. Снаружи он
+   * бесполезен ровно в том случае, ради которого нужен: пока событий нет,
+   * генератор не доходит до yield, управление вызывающему не возвращается, и
+   * проверять флаг некому. А клиент чаще всего отваливается именно в тишине —
+   * агент думает, ответа нет минуту, пользователь закрывает вкладку.
+   * Брошенное соединение иначе стоит до 1800 тиков по паре запросов, то есть
+   * тысяч обращений к Redis и Postgres, и всё это время занят воркер.
    */
-  async *readEvents(productId: string, turnId: string): AsyncGenerator<any> {
+  async *readEvents(
+    productId: string,
+    turnId: string,
+    isCancelled: () => boolean = () => false,
+  ): AsyncGenerator<any> {
     const key = this.eventsKey(productId, turnId);
     let cursor = 0;
     for (let tick = 0; tick < 1800; tick++) {
+      if (isCancelled()) return;
       const batch = await this.redis.lrange(key, cursor, -1);
       for (const raw of batch) {
         cursor++;
         const event = JSON.parse(raw);
         yield event;
-        if (event.type === 'end' || event.type === 'error') return;
+        if (event?.type === 'end' || event?.type === 'error') return;
       }
       const r = await this.pg.query(`SELECT status FROM product_turns WHERE id = $1`, [turnId]);
       const status = r.rows[0]?.status;
       if (status && status !== 'queued' && status !== 'running') {
+        // Финальный дренаж перед выходом. События, дописанные между lrange
+        // выше и этим запросом, иначе не прочитаются никогда: генератор
+        // завершится, не заглянув в буфер повторно, и клиент получит `end` с
+        // обрезанным хвостом.
+        for (const raw of await this.redis.lrange(key, cursor, -1)) {
+          cursor++;
+          yield JSON.parse(raw);
+        }
         yield { type: 'end' };
         return;
       }
