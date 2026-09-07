@@ -177,6 +177,26 @@ describe('MeetingService', () => {
       await svc.leave('c1');
       expect(calls.markInterruptedKeepingRoom).toHaveBeenCalledWith('c1');
     });
+
+    it('выводит бота из встречи Meet', async () => {
+      calls.load.mockResolvedValue({ id: 'c1', provider: 'meet', external_bot_id: 'bot_1' });
+      await svc.leave('c1');
+      expect(attendee.removeBot).toHaveBeenCalledWith('bot_1');
+    });
+
+    it('своя встреча бота не имеет — не зовём', async () => {
+      calls.load.mockResolvedValue({ id: 'c1', provider: 'linkeon_room', external_bot_id: null });
+      await svc.leave('c1');
+      expect(attendee.removeBot).not.toHaveBeenCalled();
+    });
+
+    it('недоступность Attendee не мешает ассистенту выйти', async () => {
+      // Выход важнее уборки: иначе пользователь заперт лимитом активных.
+      calls.load.mockResolvedValue({ id: 'c1', provider: 'meet', external_bot_id: 'bot_1' });
+      attendee.removeBot.mockRejectedValue(new Error('сеть'));
+      await svc.leave('c1');
+      expect(calls.markInterruptedKeepingRoom).toHaveBeenCalledWith('c1');
+    });
   });
 
   describe('noteFirstHuman', () => {
