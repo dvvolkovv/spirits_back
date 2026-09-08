@@ -62,3 +62,24 @@ psql "$DATABASE_URL" -c 'SELECT slug, runner_seen_at FROM products'
 
 `runner_seen_at` обновляется на каждом опросе, даже когда заданий нет.
 Молчание дольше порога означает, что раннер мёртв, а не что ходов не было.
+
+## Подпроект в корне репозитория — обязательный шаг
+
+`product-runner/` лежит в корне `spirits_back` рядом с `worker/`, `voice-host/`
+и `relay-agent/`. У всех них свои `package.json` и `tsconfig.json`, и каждый
+обязан быть исключён из `tsconfig.build.json` бэкенда:
+
+```json
+"exclude": ["node_modules", "test", "dist", "scripts", "tests",
+            "worker", "voice-host", "product-runner", "**/*spec.ts"]
+```
+
+Без этого файлы подпроекта попадают в сборку бэкенда, общий корень исходников
+поднимается на уровень выше, и весь вывод уезжает в `dist/src/`. pm2 запускает
+`dist/main.js`, не находит его и уходит в цикл перезапусков: стенд отвечает
+502, а двухфазный деплой останавливается на PHASE 1.
+
+Эта поломка случалась трижды — с `worker`, `voice-host` и `product-runner`.
+Проверка `tsc --noEmit -p tsconfig.json` её не показывает: это другой конфиг,
+и он ничего не выводит. Единственная проверка, которая ловит, —
+`npm run build` с последующим `ls dist/main.js`.
