@@ -22,6 +22,14 @@
       "**/src/**/*.spec.ts",
       "**/tests/**/*.test.js"
     ],
+    "testPathIgnorePatterns": [
+      "/node_modules/",
+      "/.worktrees/",
+      "<rootDir>/product-runner/",
+      "<rootDir>/voice-host/",
+      "<rootDir>/worker/",
+      "<rootDir>/relay-agent/"
+    ],
     "transform": {
       "^.+\\.ts$": "ts-jest"
     },
