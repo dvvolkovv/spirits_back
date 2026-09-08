@@ -50,7 +50,16 @@ function tone(freq, ms, rate) {
   return buf;
 }
 
-const browser = await chromium.launch({
+/**
+ * Постоянный профиль браузера.
+ *
+ * Нужен для входа в аккаунт Google: автоматизировать сам вход бессмысленно —
+ * Google его активно блокирует («этот браузер небезопасен»). Рабочий путь —
+ * войти ОДИН раз руками в этом профиле и потом переиспользовать его.
+ */
+const userDataDir = process.env.SPIKE_USER_DATA_DIR || '';
+
+const launchOpts = {
   headless: false,
   // НАСТОЯЩИЙ Google Chrome, а не Chromium от Playwright.
   //
@@ -75,14 +84,23 @@ const browser = await chromium.launch({
     '--autoplay-policy=no-user-gesture-required',
     '--window-size=1280,720',
   ],
-});
+};
+
+const browser = userDataDir ? null : await chromium.launch(launchOpts);
 
 try {
-  const ctx = await browser.newContext({
-    permissions: ['microphone'],
-    viewport: { width: 1280, height: 720 },
-  });
-  const page = await ctx.newPage();
+  const ctx = userDataDir
+    ? await chromium.launchPersistentContext(userDataDir, {
+        ...launchOpts,
+        permissions: ['microphone'],
+        viewport: { width: 1280, height: 720 },
+      })
+    : await browser.newContext({
+        permissions: ['microphone'],
+        viewport: { width: 1280, height: 720 },
+      });
+  if (userDataDir) console.log(`профиль: ${userDataDir}`);
+  const page = ctx.pages()[0] || (await ctx.newPage());
   page.on('console', (m) => console.log('  [страница]', m.text().slice(0, 160)));
 
   console.log(`открываю ${url}`);
@@ -118,23 +136,40 @@ try {
   // первое, что отвалится при очередном обновлении вёрстки.
   const nameField = page.locator('input[type="text"]').first();
   if (await nameField.count().catch(() => 0)) {
-    await nameField.fill(botName).catch(() => {});
-    console.log(`  имя введено: ${botName}`);
+    // Настоящими нажатиями, а не fill(): поле управляется фреймворком, и
+    // подстановка значения без событий клавиатуры оставляет кнопку входа
+    // неактивной. Проверяем результат, а не верим вызову.
+    await nameField.click().catch(() => {});
+    await nameField.pressSequentially(botName, { delay: 30 }).catch(() => {});
+    const got = await nameField.inputValue().catch(() => '');
+    console.log(got === botName ? `  имя введено: ${got}` : `  ИМЯ НЕ ДОЕХАЛО, в поле «${got}»`);
   } else {
     console.log('  поля имени нет — либо встреча требует аккаунт, либо вёрстка изменилась');
   }
 
-  const joinNames = [/ask to join/i, /join now/i, /попросить.*войти/i, /присоединиться/i, /^войти$/i];
+  // «Ask to join» первым: это гостевой путь. «Join now» показывают, когда
+  // вход разрешён напрямую, и он же бывает неактивен, пока не введено имя.
+  const joinNames = [/ask to join/i, /попросить.*войти/i, /join now/i, /присоединиться/i, /^войти$/i];
   let clicked = false;
   for (const re of joinNames) {
     const b = page.getByRole('button', { name: re }).first();
-    if (await b.count().catch(() => 0)) {
-      await b.click({ timeout: 5_000 }).catch(() => {});
-      console.log(`  нажал кнопку: ${re}`);
+    if (!(await b.count().catch(() => 0))) continue;
+    const enabled = await b.isEnabled().catch(() => false);
+    console.log(`  кнопка ${re}: ${enabled ? 'активна' : 'НЕАКТИВНА'}`);
+    if (!enabled) continue;
+    try {
+      await b.click({ timeout: 5_000 });
+      console.log(`  нажал: ${re}`);
       clicked = true;
       break;
+    } catch (e) {
+      // Ошибку клика НЕ глотаем: раньше она пряталась в catch, и по логу
+      // нельзя было понять, нажалась кнопка или Playwright отвалился.
+      console.log(`  клик по ${re} не удался: ${String(e).split(String.fromCharCode(10))[0]}`);
     }
   }
+  // Снимок сразу после клика, до ожиданий: переходное состояние живёт секунды.
+  await shot(page, '03-сразу-после-клика');
   if (!clicked) {
     console.log('  кнопку входа не нашёл. Кнопки на странице:');
     const names = await page.evaluate(
@@ -143,12 +178,12 @@ try {
     for (const n of names) console.log('    •', n);
   }
   await page.waitForTimeout(5_000);
-  await shot(page, '03-после-входа');
+  await shot(page, '04-через-5с');
 
   console.log('');
   console.log('ЖДУ ВПУСКА 60 секунд. Подтвердите вход в интерфейсе Meet.');
   await page.waitForTimeout(60_000);
-  await shot(page, '04-во-встрече');
+  await shot(page, '05-во-встрече');
 
   const play = spawn('pacat', ['--device=bot_mic_sink', '--format=s16le', `--rate=${RATE}`, '--channels=1']);
   play.stdin.write(tone(880, 15_000, RATE));
@@ -170,7 +205,7 @@ try {
   console.log('');
   console.log(`из встречи пришло ${(n / RATE).toFixed(1)} с звука, rms=${level.toFixed(4)}`);
   console.log(level > 0.001 ? 'звук встречи ДОХОДИТ до нас' : 'из встречи тишина — говорите в неё и повторите');
-  await shot(page, '05-финал');
+  await shot(page, '06-финал');
 } finally {
-  await browser.close();
+  await (userDataDir ? ctx?.close() : browser.close());
 }
