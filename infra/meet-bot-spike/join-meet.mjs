@@ -88,8 +88,13 @@ const launchOpts = {
 
 const browser = userDataDir ? null : await chromium.launch(launchOpts);
 
+// Объявлены ДО try: блок finally ниже их закрывает, а `const` внутри try в
+// finally не виден — на этом скрипт падал ReferenceError'ом в самом конце,
+// уже после успешной проверки (08.09.2026).
+let ctx = null;
+
 try {
-  const ctx = userDataDir
+  ctx = userDataDir
     ? await chromium.launchPersistentContext(userDataDir, {
         ...launchOpts,
         permissions: ['microphone'],
@@ -207,5 +212,10 @@ try {
   console.log(level > 0.001 ? 'звук встречи ДОХОДИТ до нас' : 'из встречи тишина — говорите в неё и повторите');
   await shot(page, '06-финал');
 } finally {
-  await (userDataDir ? ctx?.close() : browser.close());
+  // Закрываем то, что есть: при постоянном профиле browser равен null, при
+  // обычном запуске закрытие браузера всё равно закроет его контексты — так
+  // что порядок безопасен в обоих случаях. Ошибки уборки глушим: они не
+  // должны маскировать результат проверки, как это и вышло 08.09.2026.
+  try { await ctx?.close(); } catch {}
+  try { await browser?.close(); } catch {}
 }
