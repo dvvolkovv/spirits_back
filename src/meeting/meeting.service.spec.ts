@@ -41,6 +41,11 @@ describe('MeetingService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    // Attendee настроен: без этих переменных вход в Meet отказывает ещё до
+    // всякой логики — так и задумано, но тесты про саму логику должны
+    // работать в настроенном окружении.
+    process.env.ATTENDEE_BASE_URL = 'https://attendee.test';
+    process.env.ATTENDEE_API_KEY = 'k1';
     balance = 50_000;
     pg = { query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }) };
     calls = {
@@ -336,6 +341,26 @@ describe('MeetingService', () => {
       await svc.join('u1', 7, 'ABC234');
       expect(attendee.createBot).not.toHaveBeenCalled();
       expect(livekit.dispatchAgent).toHaveBeenCalledWith('room_ABC234', expect.any(Object));
+    });
+  });
+
+  describe('Attendee не настроен', () => {
+    it('вход в Meet отказывает и записи не создаёт', async () => {
+      // Без Attendee входить некуда. Отказ обязан прийти ДО INSERT: иначе
+      // строка осталась бы в dialing и заперла пользователю его же
+      // следующий вход до реапера.
+      delete process.env.ATTENDEE_BASE_URL;
+      withAgent();
+      await expect(svc.join('u1', 7, 'abc-defg-hij', 'meet')).rejects.toMatchObject({
+        response: expect.objectContaining({ reason: 'meet_unavailable' }),
+      });
+      expect(pg.query.mock.calls.some(([sql]: any) => /INSERT INTO voice_calls/.test(sql))).toBe(false);
+    });
+
+    it('свои комнаты и Taler ID не задеты', async () => {
+      delete process.env.ATTENDEE_API_KEY;
+      withAgent();
+      await expect(svc.join('u1', 7, 'ABC234')).resolves.toBeDefined();
     });
   });
 

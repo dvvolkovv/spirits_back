@@ -1,4 +1,4 @@
-import { AttendeeClient } from './attendee.client';
+import { AttendeeClient, attendeeConfigured } from './attendee.client';
 
 const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body }) as any;
 
@@ -10,6 +10,28 @@ describe('AttendeeClient', () => {
     process.env.ATTENDEE_WEBHOOK_URL = 'https://my.linkeon.io/webhook/meet/attendee';
   });
   afterEach(() => { global.fetch = realFetch; });
+
+  describe('attendeeConfigured', () => {
+    it('настроен, когда есть адрес и ключ', () => {
+      expect(attendeeConfigured()).toBe(true);
+    });
+
+    it('без адреса — не настроен', () => {
+      delete process.env.ATTENDEE_BASE_URL;
+      expect(attendeeConfigured()).toBe(false);
+    });
+
+    it('без ключа — не настроен', () => {
+      delete process.env.ATTENDEE_API_KEY;
+      expect(attendeeConfigured()).toBe(false);
+    });
+
+    it('пустая строка — тоже не настроен', () => {
+      // Пустая переменная в .env встречается чаще, чем отсутствующая.
+      process.env.ATTENDEE_BASE_URL = '';
+      expect(attendeeConfigured()).toBe(false);
+    });
+  });
 
   describe('createBot', () => {
     it('возвращает id бота', async () => {
