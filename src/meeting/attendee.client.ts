@@ -32,6 +32,22 @@ const TRIGGERS = [
   'participant_events.speech_start_stop',
 ];
 
+/**
+ * Настроен ли Attendee.
+ *
+ * Отдельной функцией, а не методом класса: проверку делает ещё и
+ * `chat.service.ts`, чтобы не показывать карточку встречи там, где входить
+ * некуда. Тащить туда зависимость ради двух переменных окружения незачем —
+ * файл и так на 140 КБ.
+ *
+ * Нужна потому, что без Attendee фича бесполезна, но не безобидна: карточка
+ * «Зайти» появлялась бы и всегда отказывала. Так выкатка становится
+ * изменением конфигурации, а не деплоем.
+ */
+export function attendeeConfigured(): boolean {
+  return !!process.env.ATTENDEE_BASE_URL && !!process.env.ATTENDEE_API_KEY;
+}
+
 export interface CreateBotParams {
   meetingUrl: string;
   botName: string;

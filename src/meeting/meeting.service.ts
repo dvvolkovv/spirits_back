@@ -6,7 +6,7 @@ import { VoiceCallService } from '../voice-call/voice-call.service';
 import { SPECIALIST_ROLES, SPECIALISTS } from '../voice-call/voice-call.types';
 import { RoomService } from './room.service';
 import { TalerIdRoomClient } from './talerid-room.client';
-import { AttendeeClient } from './attendee.client';
+import { AttendeeClient, attendeeConfigured } from './attendee.client';
 import { MeetingProvider } from './meeting-link';
 
 /** Провайдер встречи в voice_calls. Дальше сюда добавится 'zoom'. */
@@ -140,6 +140,13 @@ export class MeetingService {
     let title: string;
     let roomName: string;
     let external: { url: string; token: string } | undefined;
+
+    if (isMeet && !attendeeConfigured()) {
+      // Не настроен — входить некуда. Отказ ДО создания записи звонка:
+      // иначе строка осталась бы в dialing и заперла пользователю его же
+      // следующий вход до реапера.
+      throw new ConflictException({ message: 'meeting bot is not configured', reason: 'meet_unavailable' });
+    }
 
     if (isMeet) {
       // Потолок одновременных встреч Meet — глобальный, а не на пользователя.

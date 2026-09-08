@@ -13,6 +13,7 @@ import { LanguageService, LANGUAGE_REPLY_LINE, DEFAULT_LANGUAGE } from '../commo
 import { parseMeetingLink } from '../meeting/meeting-link';
 import { RoomService } from '../meeting/room.service';
 import { buildMeetingCard } from './meeting-card';
+import { attendeeConfigured } from '../meeting/attendee.client';
 import { TalerIdRoomClient } from '../meeting/talerid-room.client';
 import { RESPONSE_STYLE_RULE } from './response-style';
 import { BalanceContextService } from '../tokens/balance-context.service';
@@ -496,11 +497,14 @@ export class ChatService {
       // одинаково: нашли живую — показываем карточку, не нашли — это была
       // обычная ссылка в разговоре, идём обычным путём и не мешаем.
       const room = meetingLink.provider === 'meet'
-        // Проверять нечего: публичной ручки «существует ли встреча» у Meet
-        // нет. Карточку показываем сразу — цена ошибки невелика (кнопка
-        // приведёт к внятному отказу бота), а требовать проверки значит не
-        // показывать карточку никогда.
-        ? { code: meetingLink.code, title: 'Встреча Google Meet', active: true }
+        // Проверять существование встречи нечем: публичной ручки у Meet нет.
+        // Карточку показываем сразу — цена ошибки невелика, а требовать
+        // проверки значит не показывать карточку никогда.
+        //
+        // Но если Attendee не настроен, входить некуда вовсе, и карточка
+        // только обманывала бы: кнопка отказывала бы всегда. Тогда ссылка
+        // остаётся обычной ссылкой в разговоре, и ход идёт обычным путём.
+        ? (attendeeConfigured() ? { code: meetingLink.code, title: 'Встреча Google Meet', active: true } : null)
         : meetingLink.provider === 'talerid'
         ? await this.talerIdRooms
             ?.info(meetingLink.code)
