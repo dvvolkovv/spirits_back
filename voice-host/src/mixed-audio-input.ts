@@ -9,6 +9,7 @@ import {
   type Room,
 } from '@livekit/rtc-node';
 import { ReadableStream } from 'node:stream/web';
+import { createWriteStream } from 'node:fs';
 import { Mixer, SAMPLE_RATE, SAMPLES_PER_TICK, TICK_MS } from './mixer.js';
 
 /**
@@ -34,6 +35,19 @@ export class MixedRoomAudioInput extends voice.AudioInput {
   /** Сколько кадров реально пришло от участников — для диагностики. */
   private framesIn = 0;
   private ticks = 0;
+
+  /**
+   * Куда писать смикшированный поток. Пусто — не писать, и это обычный режим.
+   *
+   * Заведено 07.09.2026 под конкретный вопрос, на который иначе нет ответа:
+   * тихого участника ассистент не слышал, при том что тракт публикации звук
+   * доносит целым (запись с подписки распознаётся даже без усиления, на
+   * уровне 157), а микшер поднимает его в сведении выше громкого. Оставалось
+   * одно непросмотренное место — то, что микшер реально отдаёт в сессию.
+   * Слушать это надо ушами и распознаванием, а не по счётчикам.
+   */
+  private readonly dumpPath = process.env.VOICE_MIX_DUMP || '';
+  private dump?: import('node:fs').WriteStream;
 
   constructor(private readonly room: Room) {
     super();
@@ -98,9 +112,17 @@ export class MixedRoomAudioInput extends voice.AudioInput {
       this.mixer.remove(p.identity);
     });
 
+    if (this.dumpPath) {
+      this.dump = createWriteStream(this.dumpPath);
+      console.log(`[вход] пишу смикшированный поток в ${this.dumpPath} (PCM s16 ${SAMPLE_RATE} моно)`);
+    }
+
     this.ticker = setInterval(() => {
       if (this.closed) return;
-      this.push(new AudioFrame(this.mixer.tick(), SAMPLE_RATE, 1, SAMPLES_PER_TICK));
+      const mixed = this.mixer.tick();
+      // Тот же самый буфер, что уходит в сессию, — не пересчитанный заново.
+      if (this.dump) this.dump.write(Buffer.from(mixed.buffer, mixed.byteOffset, mixed.byteLength));
+      this.push(new AudioFrame(mixed, SAMPLE_RATE, 1, SAMPLES_PER_TICK));
       // Раз в пять секунд — сколько кадров пришло от людей. Без этой строки
       // отличить «никто не говорит» от «звук до нас не доходит» невозможно:
       // и то и другое выглядит как тишина. Три захода подряд я гадал именно
@@ -165,6 +187,7 @@ export class MixedRoomAudioInput extends voice.AudioInput {
 
   override async close(): Promise<void> {
     this.closed = true;
+    this.dump?.end();
     if (this.ticker) clearInterval(this.ticker);
     await super.close();
   }
