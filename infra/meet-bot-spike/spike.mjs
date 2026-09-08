@@ -53,16 +53,32 @@ const browser = await chromium.launch({
   // Именно headful под Xvfb. Настоящий headless не отдаёт звук в
   // аудиоустройства системы, а нам нужны именно они.
   headless: false,
-  executablePath: process.env.SPIKE_CHROMIUM || undefined,
+  // НАСТОЯЩИЙ Google Chrome, а не Chromium от Playwright.
+  //
+  // Проверено 08.09.2026: Meet отвергает Chromium от Playwright ещё на
+  // загрузке страницы — «You can't join this video call» с отсчётом до
+  // возврата на домашний экран, до всякого ввода имени. Причина в опознании
+  // браузера, а не в кодеках (H.264 и AAC у Playwright есть):
+  //
+  //   Chromium от Playwright:  brands пусто,                     webdriver true
+  //   настоящий Chrome:        Chromium | Not?A_Brand | Google Chrome, webdriver false
+  //
+  // Meet опознаёт поддерживаемые браузеры через User-Agent Client Hints, и
+  // пустой список брендов для него — неопознанный браузер.
+  executablePath: process.env.SPIKE_CHROME || '/usr/bin/google-chrome',
+  // Playwright по умолчанию добавляет --enable-automation, из-за которого
+  // navigator.webdriver === true. Без этого даже настоящий Chrome выглядит
+  // управляемым автоматикой.
+  ignoreDefaultArgs: ['--enable-automation'],
   args: [
     '--no-sandbox',
     '--disable-dev-shm-usage',
     '--disable-gpu',
+    '--disable-blink-features=AutomationControlled',
     // Разрешение на микрофон без диалога.
     '--use-fake-ui-for-media-stream',
     // НЕ ставим --use-fake-device-for-media-stream: он подменил бы наш
-    // виртуальный микрофон встроенным генератором тона, и проверка стала бы
-    // самообманом.
+    // виртуальный микрофон встроенным генератором тона.
     '--autoplay-policy=no-user-gesture-required',
     '--window-size=1280,720',
   ],
