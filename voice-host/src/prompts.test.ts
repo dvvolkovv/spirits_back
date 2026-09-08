@@ -57,6 +57,25 @@ describe('чат встречи', () => {
     assert.match(s, /не дублируй|не зачитывай/i);
   });
 
+  test('лента до прихода подаётся как справка, а не как обращения', () => {
+    // Ассистента зовут в середине встречи, и написанного раньше в data-канале
+    // быть не может. Но отвечать на закрытые вопросы он не должен.
+    const s = flat(meetingInstructions({
+      name: 'Роман', persona: '', preamble: '', specialists: SPECIALISTS, hasChat: true,
+      chatHistory: ['Дмитрий: смета на 200 квадратов', 'Анна: жду цифры'],
+    }));
+    assert.match(s, /смета на 200 квадратов/);
+    assert.match(s, /Анна: жду цифры/);
+    assert.match(s, /НЕ адресованы|не отвечай на них/i);
+  });
+
+  test('без ленты блока справки нет', () => {
+    const s = flat(meetingInstructions({
+      name: 'Роман', persona: '', preamble: '', specialists: SPECIALISTS, hasChat: true,
+    }));
+    assert.doesNotMatch(s, /ДО твоего прихода/);
+  });
+
   test('без чата про него в промпте ни слова', () => {
     // Чат есть только в чужих комнатах Taler ID; тула write_to_chat на своей
     // встрече нет вовсе. Рассказать модели про инструмент, которого ей не

@@ -22,7 +22,7 @@ import { Occupancy } from './occupancy.js';
 import { SpeakerLedger } from './speaker-ledger.js';
 import { MixedRoomAudioInput } from './mixed-audio-input.js';
 import { ExternalRoomAudioOutput } from './external-room-output.js';
-import { ExternalRoomChat } from './external-chat.js';
+import { ExternalRoomChat, type IncomingChat } from './external-chat.js';
 import { Room as ExternalRoom } from '@livekit/rtc-node';
 import {
   answerTo,
@@ -134,6 +134,8 @@ export default defineAgent({
     let foreign: ExternalRoom | null = null;
     let foreignOutput: ExternalRoomAudioOutput | null = null;
     let chat: ExternalRoomChat | null = null;
+    /** Лента чата на момент нашего входа. Уходит в промпт, не в разговор. */
+    let chatHistory: IncomingChat[] = [];
     if (isForeign) {
       foreign = new ExternalRoom();
       await foreign.connect(meta.externalUrl!, meta.externalToken!, {
@@ -151,6 +153,21 @@ export default defineAgent({
           `${agentName} · ассистент ${meta.ownerName || 'пользователя'}`,
         );
         console.log('[чат] канал комнаты подключён');
+
+        // Что написали ДО нашего прихода.
+        //
+        // Живой поток идёт из data-канала комнаты, но написанного раньше в нём
+        // быть не может по определению: ассистента зовут в середине встречи, и
+        // без этого запроса он не знает даже, что обсуждали письменно. Их
+        // лента отдаёт встречу целиком, если не передавать since.
+        //
+        // Читаем ДО session.start(): история должна попасть в инструкции, а не
+        // стать отдельным ходом — иначе Роман примется отвечать на сообщения,
+        // которые давно закрыты.
+        chatHistory = await chat.history();
+        if (chatHistory.length) {
+          console.log(`[чат] в ленте до нашего прихода: ${chatHistory.length} сообщ.`);
+        }
       }
     }
 
@@ -422,13 +439,19 @@ export default defineAgent({
                 'Написать текстом в чат встречи — сообщение увидят все участники. ' +
                 'Для того, что на слух не воспринимается: ссылки, адреса, номера, ' +
                 'короткие списки. Голосом скажи, что написал в чат, и не зачитывай ' +
-                'написанное вслух.',
+                'написанное вслух. Не длиннее 500 знаков — длинное обрежется.',
               parameters: z.object({
                 text: z.string().describe('Текст сообщения целиком, готовый к отправке'),
               }),
               execute: async ({ text }) => {
-                const ok = await chat!.send(text);
-                if (ok) {
+                const r = await chat!.send(text);
+                // Их потолок — 10 сообщений за 10 секунд. Это единственный
+                // отказ, после которого повтор осмыслен, поэтому модель должна
+                // отличать его от «не получилось».
+                if (r === 'rate_limited') {
+                  return { status: 'rejected', reason: 'too_fast', retry: 'через несколько секунд' };
+                }
+                if (r === 'sent') {
                   // Написанное — тоже участие в встрече, и оно обязано попасть
                   // в транскрипт. Промпт прямо велит отвечать текстом и НЕ
                   // зачитывать написанное вслух; без этой строки в резюме
@@ -437,8 +460,9 @@ export default defineAgent({
                   // ConversationItemAdded такое не подберёт: вызов тула не
                   // сообщение, и обработчик отсеивает его первым же условием.
                   transcript.push({ role: 'assistant', text: `[в чат] ${text}`, ts: Date.now() });
+                  return { status: 'sent' };
                 }
-                return ok ? { status: 'sent' } : { status: 'rejected', reason: 'chat_unavailable' };
+                return { status: 'rejected', reason: 'chat_unavailable' };
               },
             }),
           }
@@ -491,9 +515,9 @@ export default defineAgent({
         // выглядела бы как исполненное обещание.
         if (chat && msg.url) {
           const line = `Документ «${msg.title || 'без названия'}»: ${msg.url}`;
-          void chat.send(line).then((ok) => {
-            if (ok) transcript.push({ role: 'assistant', text: `[в чат] ${line}`, ts: Date.now() });
-            else console.error(`[чат] ссылка на документ «${msg.title}» не ушла`);
+          void chat.send(line).then((r) => {
+            if (r === 'sent') transcript.push({ role: 'assistant', text: `[в чат] ${line}`, ts: Date.now() });
+            else console.error(`[чат] ссылка на документ «${msg.title}» не ушла (${r})`);
           });
         }
         return;
@@ -885,6 +909,7 @@ export default defineAgent({
                 // Ровно то же условие, что и у тула: промпт и набор
                 // инструментов обязаны совпадать.
                 hasChat: !!chat,
+                chatHistory: chatHistory.map((m) => `${m.name}: ${m.text}`),
               })
             : callInstructions(meta.preamble, meta.specialists),
           tools,
