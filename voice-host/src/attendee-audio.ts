@@ -137,25 +137,22 @@ export class AttendeeAudioHub {
   /**
    * Адрес, по которому Attendee придёт за звуком.
    *
-   * Две формы, и обе нужны.
-   *
-   * Через nginx (прод): порт уезжает в ПУТЬ, `wss://host/attendee/8140`.
-   * Так потому, что TLS терминирует nginx — без него звук встречи шёл бы
-   * между двумя нашими хостами открытым текстом по публичной сети. Location
+   * Порт уезжает в ПУТЬ: `wss://host/attendee/8140`. Соответствующий location
    * с диапазоном портов в регулярке — в infra/attendee/nginx-attendee.conf.
    *
-   * Напрямую (`ATTENDEE_WS_DIRECT=1`, тестовый стенд): порт в АДРЕСЕ,
-   * `ws://127.0.0.1:8140`. На стенде Attendee и воркер живут на одной
-   * машине, наружу выходить незачем, а `test.linkeon.io` вообще закрыт
-   * Basic Auth — через него Attendee не постучался бы. Для прода этот режим
-   * не годится: открытый текст по публичной сети.
+   * TLS здесь не удобство, а условие работы: **Attendee требует `wss://` и
+   * проверяет это валидатором.** Проверено на живом сервисе 09.09.2026 —
+   * попытка отдать `ws://` отвергается с
+   * `websocket_settings.audio.url: URL must start with wss://`. То же для
+   * вебхуков: `does not match '^https://.*'`.
+   *
+   * Поэтому «прямого» режима с портом в адресе и открытым ws здесь нет: он
+   * был добавлен на неверном предположении, что на одной машине можно
+   * обойтись без nginx, и удалён, когда Attendee его отверг.
    */
   publicUrl(callId: string): string {
     const base = (process.env.ATTENDEE_WS_PUBLIC_BASE || 'wss://my.linkeon.io').replace(/\/+$/, '');
-    const q = `?callId=${encodeURIComponent(callId)}`;
-    return process.env.ATTENDEE_WS_DIRECT === '1'
-      ? `${base}:${this.port}/${q}`
-      : `${base}/attendee/${this.port}${q}`;
+    return `${base}/attendee/${this.port}?callId=${encodeURIComponent(callId)}`;
   }
 
   /** Дождаться подключения. `null` — не дождались за отведённое время. */

@@ -135,27 +135,19 @@ describe('AttendeeAudioHub', () => {
     } finally { hub.close(); }
   });
 
-  test('прямой режим кладёт порт в адрес, а не в путь', async () => {
-    // Тестовый стенд: Attendee и воркер на одной машине, идти через nginx
-    // незачем, а test.linkeon.io закрыт Basic Auth — Attendee в него не
-    // постучится. На проде наоборот: порт в пути, TLS терминирует nginx.
+  test('порт уезжает в путь: Attendee требует wss и nginx терминирует TLS', async () => {
+    // Открытый ws Attendee отвергает валидатором («URL must start with
+    // wss://»), проверено на живом сервисе. Значит форма адреса одна.
     const hub = new AttendeeAudioHub();
-    const savedBase = process.env.ATTENDEE_WS_PUBLIC_BASE;
-    const savedDirect = process.env.ATTENDEE_WS_DIRECT;
+    const saved = process.env.ATTENDEE_WS_PUBLIC_BASE;
     try {
       const port = await hub.listen('c1');
-      process.env.ATTENDEE_WS_PUBLIC_BASE = 'ws://127.0.0.1';
-      process.env.ATTENDEE_WS_DIRECT = '1';
-      assert.equal(hub.publicUrl('c1'), `ws://127.0.0.1:${port}/?callId=c1`);
-      delete process.env.ATTENDEE_WS_DIRECT;
-      process.env.ATTENDEE_WS_PUBLIC_BASE = 'wss://my.linkeon.io';
-      assert.equal(hub.publicUrl('c1'), `wss://my.linkeon.io/attendee/${port}?callId=c1`);
+      process.env.ATTENDEE_WS_PUBLIC_BASE = 'wss://test.linkeon.io';
+      assert.equal(hub.publicUrl('c1'), `wss://test.linkeon.io/attendee/${port}?callId=c1`);
     } finally {
       hub.close();
-      if (savedBase === undefined) delete process.env.ATTENDEE_WS_PUBLIC_BASE;
-      else process.env.ATTENDEE_WS_PUBLIC_BASE = savedBase;
-      if (savedDirect === undefined) delete process.env.ATTENDEE_WS_DIRECT;
-      else process.env.ATTENDEE_WS_DIRECT = savedDirect;
+      if (saved === undefined) delete process.env.ATTENDEE_WS_PUBLIC_BASE;
+      else process.env.ATTENDEE_WS_PUBLIC_BASE = saved;
     }
   });
 
