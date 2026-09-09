@@ -6,6 +6,7 @@ import { ChatService } from '../chat/chat.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import { LiveKitClient } from './livekit.client';
+import { AttendeeClient } from '../meeting/attendee.client';
 import {
   CompletePayload, CONSOLIDATE_SIDE_LIMIT, HOST_AGENT_ID, HOST_CATEGORY,
   SPECIALIST_ROLES, SPECIALISTS,
@@ -41,7 +42,33 @@ export class VoiceCallService {
     // звонок должен работать, просто Роман будет знать о собеседнике меньше.
     @Optional() private readonly neo4j?: Neo4jService,
     @Optional() private readonly businessProfile?: BusinessProfileService,
+    // Тоже необязательный: на стендах без Attendee встречи Meet просто
+    // недоступны, а звонки и свои комнаты работают как обычно.
+    @Optional() private readonly attendee?: AttendeeClient,
   ) {}
+
+  /**
+   * Убрать бота Attendee из чужой встречи.
+   *
+   * Зовётся на КАЖДОМ завершении звонка, а не только из `leave()`. Своими
+   * глазами 09.09.2026: ассистент вышел из встречи по правилам выхода, воркер
+   * завершился, а бот остался сидеть в переговорах владельца и одиннадцать раз
+   * постучался в уже закрытый порт (502 в его логе). Убрал его реапер — через
+   * несколько минут. Столько лишний участник в чужой встрече сидеть не должен.
+   *
+   * `null` от removeBot означает, что состояние бота НЕИЗВЕСТНО: колонку тогда
+   * не чистим, иначе навсегда забудем про бота, который, возможно, всё ещё в
+   * встрече. Такую строку добьёт реапер повторной попыткой.
+   */
+  async releaseBot(callId: string, botId?: string | null): Promise<void> {
+    if (!botId || !this.attendee) return;
+    const res = await this.attendee.removeBot(botId).catch(() => null);
+    if (res === null) {
+      this.logger.warn(`[bot] ${botId} call=${callId}: состояние неизвестно, оставляем реаперу`);
+      return;
+    }
+    await this.pg.query(`UPDATE voice_calls SET external_bot_id = NULL WHERE id = $1`, [callId]);
+  }
 
   /**
    * Контекст, с которым Роман входит в разговор: последние сообщения из чата
@@ -268,6 +295,11 @@ export class VoiceCallService {
       [durationSec, JSON.stringify(transcript), cost, payload.usage.model, tokens, callId],
     );
 
+    // Бот чужой площадки — сразу, не дожидаясь реапера: он лишний участник в
+    // переговорах человека. Не блокирует остальное завершение звонка (резюме,
+    // учёт, карточка) — недоступность Attendee не повод терять транскрипт.
+    void this.releaseBot(callId, call.external_bot_id).catch(() => {});
+
     // Списываем за разговор — по решению владельца 27.08.2026. Раньше здесь
     // стоял статус 'completed' с нулём: минуты считались, но не стоили ничего.
     //
@@ -363,10 +395,15 @@ export class VoiceCallService {
   }
 
   async fail(callId: string, reason: string): Promise<void> {
-    await this.pg.query(
-      `UPDATE voice_calls SET status = 'failed', ended_at = now(), summary = $1, cost_usd = 0 WHERE id = $2`,
+    const res = await this.pg.query(
+      `UPDATE voice_calls SET status = 'failed', ended_at = now(), summary = $1, cost_usd = 0
+        WHERE id = $2 RETURNING external_bot_id`,
       [`Звонок не состоялся: ${reason}`, callId],
     );
+    // Тот же довод, что в complete(): бот не должен пережить звонок. Сюда
+    // попадают и отказы входа — бот в этот момент может стучаться в комнату
+    // ожидания, и оставлять его стучаться незачем.
+    await this.releaseBot(callId, res.rows[0]?.external_bot_id).catch(() => {});
   }
 
   /**

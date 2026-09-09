@@ -1,7 +1,7 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
-import { AttendeeClient } from '../meeting/attendee.client';
+import { VoiceCallService } from './voice-call.service';
 import { LiveKitClient } from './livekit.client';
 import { JOB_TIMEOUT_MS } from './voice-call.types';
 
@@ -39,9 +39,12 @@ export class VoiceCallReaperService {
   constructor(
     private readonly pg: PgService,
     private readonly livekit: LiveKitClient,
-    // Опционально: без Attendee реапер обязан продолжать работать — он
-    // подбирает и обычные звонки, которым до Meet дела нет.
-    @Optional() private readonly attendee?: AttendeeClient,
+    // Убирает ботов не реапер, а сервис: то же правило нужно на каждом
+    // завершении звонка, а два места с одним правилом однажды разойдутся.
+    // Без Attendee реапер обязан работать как обычно — он подбирает и
+    // обычные звонки, которым до Meet дела нет; проверка настроенности
+    // внутри releaseBot.
+    private readonly calls: VoiceCallService,
   ) {}
 
   @Cron('0 */5 * * * *') // каждые 5 минут
@@ -129,12 +132,9 @@ export class VoiceCallReaperService {
    * забыть про бота, который, возможно, всё ещё сидит в встрече.
    */
   private async sweepBot(callId: string, botId: string): Promise<void> {
-    if (!this.attendee) return;
-    const res = await this.attendee.removeBot(botId).catch(() => null);
-    if (res === null) {
-      this.logger.warn(`[reaper] бот ${botId} call=${callId}: состояние неизвестно, повторим`);
-      return;
-    }
-    await this.pg.query(`UPDATE voice_calls SET external_bot_id = NULL WHERE id = $1`, [callId]);
+    // Делегируем сервису: та же логика нужна и на завершении звонка, а два
+    // места с одним правилом однажды разойдутся. Три исхода removeBot
+    // различаются там же.
+    await this.calls.releaseBot(callId, botId);
   }
 }

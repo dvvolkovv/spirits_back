@@ -1,3 +1,4 @@
+import { VoiceCallService } from './voice-call.service';
 import { VoiceCallReaperService } from './voice-call-reaper.service';
 
 describe('VoiceCallReaperService', () => {
@@ -31,7 +32,14 @@ describe('VoiceCallReaperService', () => {
   });
 
   function svc(withAttendee: any = attendee) {
-    return new VoiceCallReaperService(pg as any, livekit as any, withAttendee as any);
+    // Реапер зовёт настоящий VoiceCallService: правило «как убирать бота»
+    // живёт там, потому что нужно и на завершении звонка. Заглушки — только
+    // вокруг (pg, livekit, Attendee), поэтому проверки ниже по-прежнему
+    // проверяют поведение, а не факт делегирования.
+    const calls = new VoiceCallService(
+      pg as any, {} as any, livekit as any, undefined, undefined, withAttendee as any,
+    );
+    return new VoiceCallReaperService(pg as any, livekit as any, calls);
   }
 
   it('порог для встречи больше, чем для звонка', async () => {

@@ -413,3 +413,83 @@ describe('разговор наполняет профиль', () => {
     expect(seen.filter((s) => /UPDATE voice_calls SET transcript/i.test(s.sql))).toHaveLength(1);
   });
 });
+
+describe('бот чужой площадки не переживает звонок', () => {
+  /**
+   * Своими глазами 09.09.2026: ассистент вышел из встречи по правилам выхода,
+   * воркер завершился, а бот Attendee остался сидеть в переговорах владельца и
+   * одиннадцать раз постучался в уже закрытый порт. Убрал его реапер — через
+   * несколько минут. Лишний участник в чужой встрече столько сидеть не должен.
+   */
+  function deps(botId: string | null) {
+    const updates: string[] = [];
+    const pg = {
+      updates,
+      query: jest.fn(async (sql: string) => {
+        updates.push(sql);
+        if (/FROM voice_calls/i.test(sql)) {
+          return {
+            rows: [{
+              id: 'call-1', user_id: 'u1', room_name: 'room-1', status: 'active',
+              started_at: new Date(Date.now() - 60_000), external_bot_id: botId, transcript: [],
+            }],
+            rowCount: 1,
+          };
+        }
+        if (/UPDATE voice_calls SET status = 'failed'/i.test(sql)) {
+          return { rows: [{ external_bot_id: botId }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      }),
+    };
+    const chat = {
+      generateAgentReply: jest.fn(async () => 'резюме'),
+      consolidateAfterChatPublic: jest.fn(async () => {}),
+    };
+    const livekit = { send: jest.fn(async () => {}), closeRoom: jest.fn(async () => {}) };
+    const attendee = { removeBot: jest.fn(async () => true) };
+    const svc = new VoiceCallService(
+      pg as any, chat as any, livekit as any, undefined, undefined, attendee as any,
+    );
+    return { svc, pg, attendee };
+  }
+
+  const usage = { audioInputTokens: 10, audioOutputTokens: 10, model: 'gpt-realtime-2.1' };
+
+  it('completed убирает бота, не дожидаясь реапера', async () => {
+    const d = deps('bot_1');
+    await d.svc.complete('call-1', { transcript: [], usage } as any);
+    // Уборка не блокирует завершение: она уходит в void, поэтому даём
+    // микрозадачам провернуться.
+    await new Promise((r) => setImmediate(r));
+    expect(d.attendee.removeBot).toHaveBeenCalledWith('bot_1');
+    expect(d.pg.updates.some((sql) => /external_bot_id = NULL/i.test(sql))).toBe(true);
+  });
+
+  it('failed тоже убирает — бот может стучаться в комнату ожидания', async () => {
+    const d = deps('bot_2');
+    await d.svc.fail('call-1', 'звук встречи так и не подключился');
+    expect(d.attendee.removeBot).toHaveBeenCalledWith('bot_2');
+  });
+
+  it('без бота ничего не зовём', async () => {
+    const d = deps(null);
+    await d.svc.fail('call-1', 'причина');
+    expect(d.attendee.removeBot).not.toHaveBeenCalled();
+  });
+
+  it('неизвестное состояние бота оставляет запись реаперу', async () => {
+    // null от removeBot означает «не знаю»: обнулить колонку значило бы
+    // навсегда забыть про бота, который, возможно, всё ещё в встрече.
+    const d = deps('bot_3');
+    d.attendee.removeBot.mockResolvedValue(null as any);
+    await d.svc.fail('call-1', 'причина');
+    expect(d.pg.updates.some((sql) => /external_bot_id = NULL/i.test(sql))).toBe(false);
+  });
+
+  it('падение Attendee не роняет завершение звонка', async () => {
+    const d = deps('bot_4');
+    d.attendee.removeBot.mockRejectedValue(new Error('ECONNREFUSED'));
+    await expect(d.svc.fail('call-1', 'причина')).resolves.toBeUndefined();
+  });
+});
