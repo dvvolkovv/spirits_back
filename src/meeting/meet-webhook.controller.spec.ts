@@ -3,8 +3,11 @@ import { MeetWebhookController } from './meet-webhook.controller';
 import { canonicalJson } from './attendee-signature';
 import { createHmac } from 'crypto';
 
-const SECRET = 's1';
-const sign = (p: unknown) => createHmac('sha256', SECRET).update(canonicalJson(p), 'utf8').digest('base64');
+// Секрет — base64, как его отдаёт интерфейс Attendee; ключом HMAC служат
+// его декодированные байты.
+const SECRET = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
+const sign = (p: unknown) =>
+  createHmac('sha256', Buffer.from(SECRET, 'base64')).update(canonicalJson(p), 'utf8').digest('base64');
 
 describe('MeetWebhookController', () => {
   let livekit: { send: jest.Mock };
