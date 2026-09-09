@@ -1,4 +1,11 @@
-import { BadRequestException, ConflictException, Injectable, Logger } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { SecretsService } from './secrets.service';
@@ -43,14 +50,45 @@ const SECRET_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 // схемы «продукт = каталог на общей машине».
 const CHECKOUT_PATH = '/product';
 
+// Публичная зона продуктов. Проба идёт сюда, а не на 127.0.0.1: см. answers().
+const PUBLIC_ZONE = 'p.linkeon.io';
+
+// Проба существует ради адресов, которые НЕ отвечают, поэтому свой срок
+// обязателен: на дефолтах undici чёрная дыра держит соединение дольше, чем
+// длится оборот таймера, и следующий оборот наезжает на предыдущий.
+const PROBE_TIMEOUT_MS = 5000;
+
 @Injectable()
-export class ProvisioningService {
+export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(ProvisioningService.name);
+  private promoter?: NodeJS.Timeout;
+
+  /** Подменяется в тестах. */
+  private fetchFn: typeof fetch = (...args) => fetch(...args);
 
   constructor(
     private readonly pg: PgService,
     private readonly secrets: SecretsService,
   ) {}
+
+  /**
+   * Оборот в 30 секунд, а не в пять минут: заведение должно оживать на глазах
+   * у нажавшего кнопку, иначе рабочий продукт неотличим от зависшего.
+   */
+  onModuleInit() {
+    this.promoter = setInterval(() => {
+      this.promoteReady().catch((e) => this.logger.error(`promoteReady failed: ${e.message}`));
+      this.failStaleProvisioning().catch((e) =>
+        this.logger.error(`failStaleProvisioning failed: ${e.message}`),
+      );
+    }, 30 * 1000);
+    // unref, иначе таймер держит процесс и jest не завершается.
+    this.promoter.unref();
+  }
+
+  onModuleDestroy() {
+    if (this.promoter) clearInterval(this.promoter);
+  }
 
   /**
    * Заводит продукт в статусе provisioning и ставит задание агенту хоста.
@@ -297,5 +335,98 @@ export class ProvisioningService {
         WHERE id = (SELECT product_id FROM product_provision_jobs WHERE id = $1)`,
       [jobId, result.error ?? 'без причины'],
     );
+  }
+
+  /**
+   * Переводит в `running` только то, что доказало готовность.
+   *
+   * Спека куска 1 предупреждала: `provisioning` — тупик той же формы, какой
+   * был у `degraded`. Работа выдаётся только при `running`, снять статус
+   * некому, отказ молчаливый. Поэтому условие — наблюдаемое состояние, а не
+   * отчёт агента: completeJob намеренно не трогает статус продукта, потому
+   * что «я развернул» и «оно отвечает» — разные утверждения, и расходились
+   * они у нас уже дважды.
+   */
+  async promoteReady(): Promise<number> {
+    const r = await this.pg.query(
+      `SELECT id, slug, kind, runner_seen_at FROM products
+        WHERE status = 'provisioning' AND archived_at IS NULL`,
+    );
+    let promoted = 0;
+    for (const p of r.rows) {
+      // Раннер молчит — внутри контейнера некому принимать ходы, и продукт в
+      // running был бы витриной без начинки.
+      if (!p.runner_seen_at) continue;
+      try {
+        if (p.kind === 'site' && !(await this.answers(p.slug))) continue;
+        await this.pg.query(
+          `UPDATE products SET status = 'running', provision_error = NULL WHERE id = $1`,
+          [p.id],
+        );
+        promoted++;
+      } catch (e: any) {
+        // Именно по продукту, а не на весь оборот: один битый продукт иначе
+        // запирает в provisioning всю очередь — та самая форма молчаливого
+        // тупика, ради выхода из которой метод и написан.
+        this.logger.error(`продукт ${p.slug}: перевод в running сорвался (${e.message})`);
+      }
+    }
+    return promoted;
+  }
+
+  /**
+   * Проверка по ПУБЛИЧНОМУ адресу: до 127.0.0.1 на хосте бэкенд не дотянется,
+   * а заодно это подтверждает, что vhost заведён и TLS работает.
+   */
+  private async answers(slug: string): Promise<boolean> {
+    try {
+      const res = await this.fetchFn(`https://${slug}.${PUBLIC_ZONE}/health`, {
+        signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+      });
+      // Только 2xx. Редирект — это чаще всего заглушка регистратора или
+      // дефолтный vhost, то есть «домена ещё нет», а не «продукт работает».
+      return res.status >= 200 && res.status < 300;
+    } catch {
+      // ENOTFOUND, отказ TLS, срок пробы — нормальные состояния ещё не
+      // заведённого сайта. Непойманными они унесли бы весь оборот.
+      return false;
+    }
+  }
+
+  async failStaleProvisioning(): Promise<number> {
+    // Срок считается по ЗАДАНИЮ, а не по products.created_at. Измерено на
+    // живой базе: продукт недельной давности, которому нажали «повторить»,
+    // получает status='provisioning' в той же строке — и условие по
+    // created_at продукта истинно немедленно. Таймаут убивал бы повтор в тот
+    // же тик, до того как агент успеет забрать задание.
+    //
+    // Заодно снимается задание: без этого оно остаётся в running, частичный
+    // индекс product_provision_jobs_one_active держит продукт запертым, и
+    // кнопка «повторить» мертва навсегда. Проверено на живой базе — вставка
+    // второго задания падает с duplicate key.
+    //
+    // `p.status = 'provisioning'` — не декорация: зависшее задание бывает и у
+    // продукта, уже переведённого в running (повтор поверх работающего), и
+    // без сверки таймаут гасил бы рабочий сайт.
+    const r = await this.pg.query(
+      `WITH stale AS (
+         UPDATE product_provision_jobs
+            SET status = 'failed',
+                error = 'заведение не уложилось в 10 минут',
+                finished_at = now()
+          WHERE status IN ('queued','running')
+            AND COALESCE(started_at, created_at) < now() - interval '10 minutes'
+         RETURNING product_id)
+       UPDATE products p
+          SET status = 'failed',
+              provision_error = 'заведение не уложилось в 10 минут'
+         FROM stale
+        WHERE p.id = stale.product_id AND p.status = 'provisioning'
+       RETURNING p.slug`,
+    );
+    if (r.rows.length) {
+      this.logger.warn(`провижининг просрочен: ${r.rows.map((x: any) => x.slug).join(', ')}`);
+    }
+    return r.rows.length;
   }
 }
