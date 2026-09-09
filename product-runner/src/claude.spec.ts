@@ -115,3 +115,53 @@ describe('runClaude — настоящий child_process', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe('отказ модели не должен выглядеть успехом', () => {
+  // Найдено первым боевым запуском: при отказе авторизации CLI отдаёт
+  // subtype:"success" и is_error:true одновременно. Ход тогда закрывался как
+  // «Готово» — с списанием и без правок.
+  it('result с is_error → error, а не end', () => {
+    const t = new ClaudeTranslator();
+
+    const out = t.translate({
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      result: 'Not logged in · Please run /login',
+      usage: { input_tokens: 10, output_tokens: 5 },
+    });
+
+    expect(out).toEqual([{ type: 'error', message: 'Not logged in · Please run /login' }]);
+  });
+
+  it('result без is_error по-прежнему end', () => {
+    const t = new ClaudeTranslator();
+
+    const out = t.translate({ type: 'result', usage: { input_tokens: 3, output_tokens: 4 } });
+
+    expect(out).toEqual([{ type: 'end', usage: { input: 3, output: 4, total: 7 } }]);
+  });
+
+  it('нулевой код выхода не спасает ход, если CLI отчитался об ошибке', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'runner-fail-'));
+    const stub = path.join(dir, 'fake-claude');
+    // Ровно то, что делает настоящий CLI при отказе модели: пишет ошибку в
+    // поток и выходит нулём.
+    fs.writeFileSync(
+      stub,
+      '#!/bin/sh\nprintf \'{"type":"result","subtype":"success","is_error":true,"result":"Not logged in"}\\n\'\nexit 0\n',
+    );
+    fs.chmodSync(stub, 0o755);
+
+    const res = await runClaude({
+      claudeBin: stub,
+      cwd: dir,
+      prompt: 'правка',
+      timeoutMs: 10_000,
+      onEvents: () => {},
+    });
+
+    expect(res.ok).toBe(false);
+    expect(res.error).toBe('Not logged in');
+  });
+});

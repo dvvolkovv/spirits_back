@@ -69,6 +69,16 @@ export class ClaudeTranslator {
     if (event.type === 'result') {
       const input = Number(event.usage?.input_tokens ?? 0);
       const output = Number(event.usage?.output_tokens ?? 0);
+      // `is_error` приезжает вместе с `subtype: "success"` — по subtype судить
+      // нельзя. Проверено живьём на отказе авторизации: CLI отдаёт
+      // subtype=success, is_error=true, result="Not logged in".
+      //
+      // Без этой ветки отказ модели становится успешным ходом: токены списаны,
+      // правок нет, в истории «Готово». Отказ молчаливый — ни ошибки, ни строки
+      // в логе, и клиент видит только то, что ничего не изменилось.
+      if (event.is_error) {
+        return [{ type: 'error', message: String(event.result ?? 'ход завершился ошибкой') }];
+      }
       return [{ type: 'end', usage: { input, output, total: input + output } }];
     }
 
@@ -118,24 +128,38 @@ export async function runClaude(input: RunClaudeInput): Promise<{ ok: boolean; e
   if (input.sessionId) args.push('--resume', input.sessionId);
 
   return new Promise((resolve) => {
-    const child = spawn(input.claudeBin, args, { cwd: input.cwd });
+    // stdin закрыт намеренно. По умолчанию spawn даёт трубу, в которую никто не
+    // пишет, и CLI ждёт три секунды, после чего сыплет в stderr «no stdin data
+    // received». Этот шум потом уезжал клиенту вместо настоящей причины отказа.
+    const child = spawn(input.claudeBin, args, { cwd: input.cwd, stdio: ['ignore', 'pipe', 'pipe'] });
     const translator = new ClaudeTranslator();
     let stderr = '';
+    // Настоящая причина отказа приходит в stdout последним событием, а не в
+    // stderr. Держим её отдельно, чтобы показать клиенту её, а не тот мусор,
+    // что случайно оказался в stderr.
+    let failure = '';
 
     const timer = setTimeout(() => {
       child.kill('SIGTERM');
       resolve({ ok: false, error: `Ход не уложился в ${Math.round(input.timeoutMs / 60000)} минут` });
     }, input.timeoutMs);
 
-    child.stdout.on('data', (d) => input.onEvents(translateEvent(translator, d.toString())));
+    child.stdout.on('data', (d) => {
+      const events = translateEvent(translator, d.toString());
+      for (const e of events) if (e.type === 'error') failure = e.message;
+      input.onEvents(events);
+    });
     child.stderr.on('data', (d) => {
       stderr += d.toString();
     });
 
     child.on('close', (code) => {
       clearTimeout(timer);
-      if (code === 0) resolve({ ok: true });
-      else resolve({ ok: false, error: stderr.trim().slice(0, 2000) || `claude exited ${code}` });
+      // Ход считается упавшим и при ненулевом коде, и когда CLI отчитался об
+      // ошибке в потоке. Одного кода мало: при отказе модели CLI умеет
+      // завершаться нулём.
+      if (code === 0 && !failure) resolve({ ok: true });
+      else resolve({ ok: false, error: failure || stderr.trim().slice(0, 2000) || `claude exited ${code}` });
     });
 
     child.on('error', (e) => {
