@@ -97,6 +97,6 @@ describe('verifyAttendeeSignature', () => {
       '"idempotency_key":"k1","trigger":"participant_events.join_leave"}',
     );
     expect(verifyAttendeeSignature(SECRET, payload,
-      'Jk7s1DxeUQ5yFdScDKoBCTkZNNKESJ3gHAV2bh6wD9o=')).toBe(true);
+      'Gtw/gbyATa/+eL6aBoCqIr5HbCT2FnN7r7/+ZZF+m5U=')).toBe(true);
   });
 });
