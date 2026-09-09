@@ -414,6 +414,12 @@ describe('ProvisioningService.failStaleProvisioning', () => {
     for (const sql of [staleQuery(calls).sql, silentQuery(calls).sql]) {
       expect(sql).toMatch(/CASE[\s\S]*WHEN\s+p\.runner_seen_at\s*>\s*now\(\)\s*-/i);
       expect(sql).toMatch(/ELSE/i);
+      // Порог живости уезжает в SQL текстом, собранным из миллисекундной
+      // константы. Пересчёт в секунды — не формальность: 120000 секунд это
+      // 33 часа, и раннер, молчащий час, объявлялся бы «на связи». Сегодня
+      // цена ошибки — слово в карточке; первый же перенос константы в WHERE
+      // сделает ту же тысячекратную ошибку ошибкой СОСТОЯНИЯ.
+      expect(sql).toContain("interval '120 seconds'");
     }
     // Тексты в двух ветках CASE обязаны РАЗЛИЧАТЬСЯ, иначе CASE — декорация.
     //
@@ -422,12 +428,24 @@ describe('ProvisioningService.failStaleProvisioning', () => {
     // ложно-зелёной: кавычки в SQL спариваются как 1-я со 2-й, 3-я с 4-й, и
     // регулярка вырезала куски КОДА между литералами, а не сами литералы.
     // Мутация «сделать оба текста одинаковыми» её пережила.
-    for (const sql of [staleQuery(calls).sql, silentQuery(calls).sql]) {
-      const m = sql.match(/THEN\s+'([^']+)'\s*\n?\s*ELSE\s+'([^']+)'/);
-      expect(m).not.toBeNull();
-      expect(m![1]).not.toBe(m![2]);
-      expect(m![1].length).toBeGreaterThan(10);
-    }
+    //
+    // Одного «различаются» тоже мало: ПЕРЕСТАНОВКА веток проходила зелёной, а
+    // означает она ровно ту ложь, ради которой CASE и написан — живой раннер
+    // получал «срок заведения истёк», мёртвый «агент не отчитался». Поэтому
+    // ниже пришпилено НАПРАВЛЕНИЕ: THEN — ветка живого раннера.
+    const stale = staleQuery(calls).sql.match(/THEN\s+'([^']+)'\s*\n?\s*ELSE\s+'([^']+)'/);
+    expect(stale).not.toBeNull();
+    expect(stale![1]).not.toBe(stale![2]);
+    expect(stale![1].length).toBeGreaterThan(10);
+    expect(stale![1]).toMatch(/агент не отчитался/);
+    expect(stale![2]).toMatch(/срок заведения истёк/);
+
+    const silent = silentQuery(calls).sql.match(/THEN\s+'([^']+)'\s*\n?\s*ELSE\s+'([^']+)'/);
+    expect(silent).not.toBeNull();
+    expect(silent![1]).not.toBe(silent![2]);
+    expect(silent![1].length).toBeGreaterThan(10);
+    expect(silent![1]).toMatch(/раннер на связи/);
+    expect(silent![2]).toMatch(/раннер не выходит на связь/);
   });
 
   it('оба запроса таймаута уходят даже когда хоронить нечего', async () => {

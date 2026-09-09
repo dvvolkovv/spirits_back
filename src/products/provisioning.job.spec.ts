@@ -33,6 +33,27 @@ const sqlOf = (c: { sql: string }[]) => c.map((x) => x.sql).join('\n');
 const find = (c: { sql: string; params: any[] }[], needle: string) =>
   c.find((x) => x.sql.includes(needle))!;
 
+/**
+ * Отчёт агента — ОДИН оператор, поэтому обе записи лежат в одной строке SQL, и
+ * `find(calls, 'UPDATE products')` возвращает её же целиком. Запреты вида «в
+ * записи по продукту нет слова X» обязаны спрашивать СВОЙ кусок: замок
+ * `AND status = 'running'` в закрытии задания иначе краснит запрет,
+ * поставленный на запись по продукту, и блокирует верный код.
+ *
+ * Заодно это сторож самой формы: обе записи обязаны присутствовать и идти в
+ * порядке «сначала задание, потом продукт» — продукт берётся из CTE закрытия,
+ * а не наоборот.
+ */
+const partsOf = (sql: string) => {
+  const j = sql.indexOf('UPDATE product_provision_jobs');
+  const p = sql.indexOf('UPDATE products');
+  expect(j).toBeGreaterThanOrEqual(0);
+  expect(p).toBeGreaterThan(j);
+  return { job: sql.slice(j, p), product: sql.slice(p) };
+};
+const jobPart = (c: { sql: string }[]) => partsOf(find(c as any, 'UPDATE products').sql).job;
+const productPart = (c: { sql: string }[]) => partsOf(find(c as any, 'UPDATE products').sql).product;
+
 // Ключ из secrets.spec.ts: НЕоднородный намеренно, на 'a'.repeat(64) выживала
 // мутация «ключ из первой половины hex дважды».
 const KEY = '00112233445566778899aabbccddeeff0f1e2d3c4b5a69788796a5b4c3d2e1f0';
@@ -351,25 +372,68 @@ describe('claimJob: живой роундтрип через настоящий 
 });
 
 describe('ProvisioningService.completeJob', () => {
+  it('отказ пишет задание и продукт одним оператором', async () => {
+    // Два запроса без транзакции оставляли бы продукт в provisioning без
+    // причины при смерти процесса между ними: реаппер его не увидит (задание
+    // уже failed), promoteReady не переведёт (развёртывание сорвалось), retry
+    // требует status = 'failed' и вернёт 404. Продукт не спасает никто — тупик
+    // той же формы, о котором предупреждает спека куска 1. Частично его
+    // добирала вторая ветка таймаута, но с ЧУЖОЙ формулировкой: владелец видел
+    // «заведение не уложилось в 10 минут» там, где агент отчитался об отказе
+    // минуту назад.
+    //
+    // Транзакции здесь нет и не будет: BEGIN через пул в этом репозитории уже
+    // рапортовал об откате, которого не было (identity.resolveOrCreate).
+    const { svc, calls } = makeService();
+
+    await svc.completeJob('j-1', { ok: false, error: 'порт занят' });
+
+    const writes = calls.filter((c) => c.sql.includes('UPDATE'));
+    expect(writes).toHaveLength(1);
+    expect(writes[0].sql).toContain('WITH');
+    expect(writes[0].sql).toContain('product_provision_jobs');
+    expect(writes[0].sql).toContain('UPDATE products');
+    // `toContain('WITH')` в одиночку ложно-зелёный: слово встречается и в
+    // комментарии. Оператор обязан НАЧИНАТЬСЯ с CTE — как в claimJob.
+    expect(writes[0].sql).toMatch(/^\s*WITH\b/);
+  });
+
+  it('успех пишет задание и продукт одним оператором', async () => {
+    // Успешный путь мягче отказного, но не безобиден: продукт вылезет через
+    // promoteReady, а port останется NULL навсегда — хранится он только здесь,
+    // восстановить неоткуда.
+    const { svc, calls } = makeService();
+
+    await svc.completeJob('j-1', { ok: true, port: 8003 });
+
+    const writes = calls.filter((c) => c.sql.includes('UPDATE'));
+    expect(writes).toHaveLength(1);
+    expect(writes[0].sql).toContain('WITH');
+    expect(writes[0].sql).toContain('product_provision_jobs');
+    expect(writes[0].sql).toContain('UPDATE products');
+    expect(writes[0].sql).toMatch(/^\s*WITH\b/);
+  });
+
   it('успех НЕ переводит продукт в running сам по себе', async () => {
     // Выход из provisioning — по измеримому факту (heartbeat плюс публичный
     // 200), а не по отчёту агента. Иначе продукт объявляется рабочим, не
     // отвечая.
     //
-    // Слово 'running' запрещено ИМЕННО в запросе по продукту, а не во всём
-    // склеенном SQL: сторож `not.toContain('running')` по всему тексту
-    // краснел на верной правке `... WHERE id = $1 AND status = 'running'` в
-    // запросе по ЗАДАНИЮ — запрещал слово там, где имелся в виду перевод
-    // продукта, и блокировал починку.
+    // Слово 'running' запрещено ИМЕННО в КУСКЕ по продукту, а не во всём
+    // операторе: сторож `not.toContain('running')` по всему тексту краснел на
+    // верной правке `... WHERE id = $1 AND status = 'running'` в закрытии
+    // ЗАДАНИЯ — запрещал слово там, где имелся в виду перевод продукта, и
+    // блокировал починку. После свёртки в один оператор оба куска живут в
+    // одной строке, и разделение стало обязательным, а не осторожностью.
     const { svc, calls } = makeService();
 
     await svc.completeJob('j-1', { ok: true, port: 8003 });
 
-    const prod = find(calls, 'UPDATE products');
-    expect(prod.sql).not.toContain('running');
-    expect(prod.sql).not.toContain('status');
+    const prod = productPart(calls);
+    expect(prod).not.toContain('running');
+    expect(prod).not.toContain('status');
     // Старая причина отказа не подчищается: перезапишет следующая попытка.
-    expect(prod.sql).not.toContain('provision_error');
+    expect(prod).not.toContain('provision_error');
   });
 
   it('успех сохраняет порт, выбранный агентом', async () => {
@@ -378,7 +442,7 @@ describe('ProvisioningService.completeJob', () => {
     await svc.completeJob('j-1', { ok: true, port: 8003 });
 
     const prod = find(calls, 'UPDATE products');
-    expect(prod.sql).toContain('port');
+    expect(productPart(calls)).toContain('port');
     expect(prod.params).toEqual(['j-1', 8003]);
   });
 
@@ -397,7 +461,7 @@ describe('ProvisioningService.completeJob', () => {
     await svc.completeJob('j-1', { ok: true });
 
     const prod = find(calls, 'UPDATE products');
-    expect(prod.sql).toMatch(/port\s*=\s*COALESCE\(\s*\$2\s*,\s*port\s*\)/);
+    expect(productPart(calls)).toMatch(/port\s*=\s*COALESCE\(\s*\$2\s*,\s*port\s*\)/);
     expect(prod.params).toEqual(['j-1', null]);
   });
 
@@ -409,10 +473,12 @@ describe('ProvisioningService.completeJob', () => {
 
     await svc.completeJob('j-1', { ok: true, port: 8003 });
 
-    const job = find(calls, 'UPDATE product_provision_jobs');
-    expect(job.sql).toContain("status = 'done'");
-    expect(job.sql).toContain('finished_at');
-    expect(job.params).toEqual(['j-1']);
+    expect(jobPart(calls)).toContain("status = 'done'");
+    expect(jobPart(calls)).toContain('finished_at');
+    // Параметры у обеих записей теперь ОДНИ: оператор один. $1 — задание,
+    // $2 — порт, и порядок пришпилен, потому что перестановка на живой базе
+    // означала бы `id = 8003` (uuid против int) и отчёт в никуда.
+    expect(find(calls, 'UPDATE products').params).toEqual(['j-1', 8003]);
   });
 
   it('отказ пишет причину в продукт и валит задание', async () => {
@@ -420,19 +486,16 @@ describe('ProvisioningService.completeJob', () => {
 
     await svc.completeJob('j-1', { ok: false, error: 'порт занят' });
 
-    const sql = sqlOf(calls);
-    expect(sql).toContain('provision_error');
-    expect(sql).toContain("status = 'failed'");
-    // Обе строки выше есть в ОДНОМ запросе — UPDATE products SET status =
-    // 'failed', provision_error = $2. Пропажа UPDATE по заданиям проходила
-    // зелёной, а задание осталось бы в 'running' и навсегда заняло бы
-    // product_provision_jobs_one_active. Две записи сверяются раздельно.
-    const job = find(calls, 'UPDATE product_provision_jobs');
-    expect(job.sql).toContain("status = 'failed'");
-    expect(job.sql).toContain('finished_at');
-    expect(job.params).toEqual(['j-1', 'порт занят']);
-    const prod = find(calls, 'UPDATE products');
-    expect(prod.params).toEqual(['j-1', 'порт занят']);
+    // Куски сверяются РАЗДЕЛЬНО. Обе строки — provision_error и
+    // status = 'failed' — стоят в записи по продукту, поэтому проверка по
+    // склеенному SQL пропажу закрытия задания переживала: задание осталось бы
+    // в 'running' и навсегда заняло бы product_provision_jobs_one_active.
+    // После свёртки в один оператор склейка обесценилась окончательно.
+    expect(productPart(calls)).toContain('provision_error');
+    expect(productPart(calls)).toContain("status = 'failed'");
+    expect(jobPart(calls)).toContain("status = 'failed'");
+    expect(jobPart(calls)).toContain('finished_at');
+    expect(find(calls, 'UPDATE products').params).toEqual(['j-1', 'порт занят']);
   });
 
   it('причина отказа ложится в jobs.error, а не в соседнюю колонку', async () => {
@@ -444,7 +507,7 @@ describe('ProvisioningService.completeJob', () => {
 
     await svc.completeJob('j-1', { ok: false, error: 'порт занят' });
 
-    expect(find(calls, 'UPDATE product_provision_jobs').sql).toMatch(/\berror\s*=\s*\$2/);
+    expect(jobPart(calls)).toMatch(/\berror\s*=\s*\$2/);
   });
 
   it('отказ без причины всё равно оставляет след, а не NULL', async () => {
@@ -455,8 +518,12 @@ describe('ProvisioningService.completeJob', () => {
 
     await svc.completeJob('j-1', { ok: false });
 
+    // Оператор один, и $2 в нём тоже один: причина ложится сразу в обе
+    // колонки — jobs.error и products.provision_error. Разъехаться им теперь
+    // нечем, но пришпилен именно факт «не NULL».
     expect(find(calls, 'UPDATE products').params[1]).toBe('без причины');
-    expect(find(calls, 'UPDATE product_provision_jobs').params[1]).toBe('без причины');
+    expect(jobPart(calls)).toMatch(/\berror\s*=\s*\$2/);
+    expect(productPart(calls)).toMatch(/provision_error\s*=\s*\$2/);
   });
 
   it('отказ не трогает порт', async () => {
@@ -467,33 +534,55 @@ describe('ProvisioningService.completeJob', () => {
 
     await svc.completeJob('j-1', { ok: false, error: 'порт занят' });
 
-    expect(find(calls, 'UPDATE products').sql).not.toContain('port');
+    expect(productPart(calls)).not.toContain('port');
   });
 
-  it('продукт находится по заданию, а не по jobId в колонке id', async () => {
+  it('продукт находится ИЗ закрытого задания, а не отдельным подзапросом', async () => {
     // products.id и product_provision_jobs.id — оба uuid: WHERE id = $1 по
     // jobId типами сойдётся, обновит ноль строк и не пожалуется. Отчёт агента
     // пропал бы бесследно — ни порта, ни причины отказа.
+    //
+    // Соединение именно с CTE, а не самостоятельный
+    // `(SELECT product_id FROM product_provision_jobs WHERE id = $1)`: этот
+    // подзапрос находит продукт независимо от того, закрылось ли задание в
+    // этом же операторе, и повторный отчёт снова правил бы ЖИВОЙ продукт.
+    // Замок `rowCount` больше не стоит между записями — его роль исполняет
+    // пустой CTE.
     const { svc, calls } = makeService();
 
     await svc.completeJob('j-1', { ok: false, error: 'порт занят' });
 
-    expect(find(calls, 'UPDATE products').sql).toMatch(
-      /WHERE\s+id\s+=\s+\(\s*SELECT\s+product_id\s+FROM\s+product_provision_jobs/,
+    expect(productPart(calls)).toMatch(
+      /FROM\s+closed\s+WHERE\s+products\.id\s*=\s*closed\.product_id/,
     );
+    expect(productPart(calls)).not.toMatch(/SELECT\s+product_id\s+FROM\s+product_provision_jobs/);
   });
 
   it('успех и отказ трогают одну и ту же строку продукта одинаковым способом', async () => {
     // Симметрия: проверка выше сторожит только отказной путь, и подмена
-    // подзапроса на `WHERE id = $1` в успешном осталась бы незамеченной —
+    // соединения на `WHERE id = $1` в успешном осталась бы незамеченной —
     // порт не сохранился бы, а продукт так и не вышел бы из provisioning.
     const { svc, calls } = makeService();
 
     await svc.completeJob('j-1', { ok: true, port: 8003 });
 
-    expect(find(calls, 'UPDATE products').sql).toMatch(
-      /WHERE\s+id\s+=\s+\(\s*SELECT\s+product_id\s+FROM\s+product_provision_jobs/,
+    expect(productPart(calls)).toMatch(
+      /FROM\s+closed\s+WHERE\s+products\.id\s*=\s*closed\.product_id/,
     );
+    expect(productPart(calls)).not.toMatch(/SELECT\s+product_id\s+FROM\s+product_provision_jobs/);
+  });
+
+  it('оба пути возвращают product_id из закрытия задания', async () => {
+    // Без RETURNING соединять продукт не с чем: оператор просто не соберётся
+    // на живой базе, а здесь, где SQL не исполняется, пропажа была бы не
+    // видна ничем.
+    for (const result of [{ ok: true, port: 1 }, { ok: false, error: 'x' }]) {
+      const { svc, calls } = makeService();
+
+      await svc.completeJob('j-1', result);
+
+      expect(jobPart(calls)).toMatch(/RETURNING\s+product_id/);
+    }
   });
 });
 
@@ -508,23 +597,56 @@ describe('completeJob: повторный отчёт по уже закрыто�
   // сети воспроизводит сценарий без всякого злоумышленника — ретрай HTTP
   // штатен.
   //
-  // Замок — `AND status = 'running'`: закрытое задание обновит ноль строк, и
-  // по этому нулю запрос к продукту не выполняется вовсе.
+  // Замок — `AND status = 'running'`: закрытое задание обновит ноль строк.
+  // Раньше по этому нулю метод возвращался, не дойдя до ВТОРОГО запроса;
+  // теперь запись одна, и ноль строк означает пустой CTE, а пустой CTE не даёт
+  // соединению с продуктом ни одной строки. Замок стал встроенным — и заодно
+  // перестал зависеть от того, доживёт ли процесс до второго запроса.
 
   it('отказ по закрытому заданию не трогает продукт', async () => {
     const { svc, calls } = makeService({ rowCount: 0 });
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
 
     await svc.completeJob('j-1', { ok: false, error: 'таймаут' });
 
-    expect(sqlOf(calls)).not.toContain('UPDATE products');
+    // Проверка «второго запроса нет» обесценилась: запрос и был один. Теперь
+    // сторожится ФОРМА, которая делает продукт недостижимым при закрытом
+    // задании: замок в CTE плюс соединение продукта с этим CTE.
+    expect(calls).toHaveLength(1);
+    const { job, product } = partsOf(calls[0].sql);
+    expect(job).toMatch(/AND\s+status\s*=\s*'running'/);
+    expect(product).toMatch(/FROM\s+closed\s+WHERE\s+products\.id\s*=\s*closed\.product_id/);
+    // След в логе. Без него единственный признак того, что отчёт агента ушёл
+    // в никуда, — тишина: метод ничего не возвращает и не бросает.
+    expect(warn).toHaveBeenCalled();
+    expect(String(warn.mock.calls[0][0])).toContain('j-1');
   });
 
   it('успех по закрытому заданию не трогает продукт', async () => {
     const { svc, calls } = makeService({ rowCount: 0 });
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
 
     await svc.completeJob('j-1', { ok: true, port: 8003 });
 
-    expect(sqlOf(calls)).not.toContain('UPDATE products');
+    expect(calls).toHaveLength(1);
+    const { job, product } = partsOf(calls[0].sql);
+    expect(job).toMatch(/AND\s+status\s*=\s*'running'/);
+    expect(product).toMatch(/FROM\s+closed\s+WHERE\s+products\.id\s*=\s*closed\.product_id/);
+    expect(warn).toHaveBeenCalled();
+    expect(String(warn.mock.calls[0][0])).toContain('j-1');
+  });
+
+  it('удавшийся отчёт в лог не пишет', async () => {
+    // Обратная сторона предыдущих двух: предупреждение, выписываемое всегда,
+    // ничего не значит. Заведений много, тик частый, лог общий.
+    for (const result of [{ ok: true, port: 1 }, { ok: false, error: 'x' }]) {
+      const { svc } = makeService();
+      const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+
+      await svc.completeJob('j-1', result);
+
+      expect(warn).not.toHaveBeenCalled();
+    }
   });
 
   it('оба пути закрывают задание только из состояния running', async () => {
@@ -533,9 +655,7 @@ describe('completeJob: повторный отчёт по уже закрыто�
 
       await svc.completeJob('j-1', result);
 
-      expect(find(calls, 'UPDATE product_provision_jobs').sql).toMatch(
-        /AND\s+status\s*=\s*'running'/,
-      );
+      expect(jobPart(calls)).toMatch(/AND\s+status\s*=\s*'running'/);
     }
   });
 });

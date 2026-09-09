@@ -86,8 +86,38 @@ const HEARTBEAT_FRESH_MS = 2 * 60 * 1000;
 // неизменяемо.
 const PROVISION_DEADLINE_MIN = 10;
 const DEADLINE_SQL = `interval '${PROVISION_DEADLINE_MIN} minutes'`;
+// `/ 1000` — не косметика. Константа хранится в МИЛЛИСЕКУНДАХ (её читает
+// heartbeatFresh через Date.now()), а interval считает по названной единице:
+// `interval '120000 seconds'` — это 33 часа, и раннер, молчащий час,
+// объявляется «на связи». Сегодня цена ошибки мала — константа стоит только в
+// CASE, и врёт лишь СЛОВО в карточке. Держать её надо как класс, а не как
+// описку: первый же перенос порога в WHERE (отбор «живых» продуктов, условие
+// перевода) сделает ту же тысячекратную ошибку ошибкой СОСТОЯНИЯ. Единица
+// пришпилена тестом по готовой строке, а не по выражению.
 const HEARTBEAT_FRESH_SQL = `interval '${HEARTBEAT_FRESH_MS / 1000} seconds'`;
 
+/**
+ * ГОНКИ В ЭТОМ ФАЙЛЕ ЗАКРЫВАЕТ ФОРМА ЗАПРОСОВ, А НЕ МОДУЛЬ.
+ *
+ * Формулировка «гонки закрывают условия в записи» неточна и уже вводила в
+ * заблуждение. Проверено на живой базе двумя параллельными инстансами:
+ * закрывает их то, что КАЖДАЯ запись — один оператор со своими
+ * предусловиями. Состояние сверяется в тот же миг, когда меняется, и
+ * промежутка, в который его успевает поменять сосед, просто не существует —
+ * ни у claimJob (выдача плюс выпуск токена), ни у completeJob (закрытие
+ * задания плюс правка продукта), ни у promoteReady (перевод), ни у обеих
+ * веток таймаута.
+ *
+ * Это свойство ФОРМЫ, а не модуля, и верно оно ровно пока каждая запись
+ * остаётся одним оператором. Оно исчезнет в ту минуту, когда кто-нибудь
+ * разложит запись на «прочитать — подумать — записать», и исчезнет молча:
+ * тесты, сторожащие подстроки SQL, такую разборку переживут.
+ *
+ * Отговорка «у нас всё равно один процесс» не работает. Прод запущен в
+ * кластерном режиме; процесс сейчас один, но число инстансов нигде в
+ * репозитории не зафиксировано — параллельные обороты это одно `pm2 scale` от
+ * реальности, и никакого предупреждения при этом не будет.
+ */
 @Injectable()
 export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(ProvisioningService.name);
@@ -355,18 +385,31 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    * воспроизводит это без всякого злоумышленника, и HostGuard задачи 7 тут не
    * помощник: он подтверждает, что пришёл наш агент, а наш агент звать
    * completeJob вправе.
+   *
+   * ОДИН оператор на оба пути, как в claimJob. Двумя запросами на пуле замок
+   * жил в `rowCount` между ними и спасал только от повторного отчёта, но не от
+   * смерти процесса ПОСЛЕ первого запроса:
+   *   - отказ: задание уже failed, продукт остался в provisioning без причины.
+   *     Реаппер отбирает по заданию и такого задания не увидит, promoteReady
+   *     не переведёт (развёртывание сорвалось), retry требует
+   *     status = 'failed' и вернёт 404. Продукт не спасает никто — тупик той
+   *     же формы, о котором предупреждает спека куска 1. Частично его
+   *     добирала вторая ветка таймаута, но с ЧУЖОЙ формулировкой про срок:
+   *     владелец видел «не уложилось в 10 минут» там, где агент отчитался об
+   *     отказе минуту назад;
+   *   - успех мягче: продукт вылезет через promoteReady, но port останется
+   *     NULL навсегда — хранится он только здесь, восстановить неоткуда.
+   * Транзакции нет и не будет: BEGIN через пул в этом репозитории уже
+   * рапортовал об откате, которого не было (identity.resolveOrCreate).
+   *
+   * Замок стал ВСТРОЕННЫМ: закрытое задание даёт пустой CTE, а пустой CTE не
+   * даёт соединению с продуктом ни одной строки. Продукт берётся именно
+   * `FROM closed`, а не самостоятельным подзапросом по product_provision_jobs:
+   * подзапрос нашёл бы продукт независимо от того, закрылось ли задание, и
+   * дыра повторного отчёта открылась бы заново.
    */
   async completeJob(jobId: string, result: { ok: boolean; port?: number; error?: string }) {
     if (result.ok) {
-      const closed = await this.pg.query(
-        `UPDATE product_provision_jobs SET status = 'done', finished_at = now()
-          WHERE id = $1 AND status = 'running'`,
-        [jobId],
-      );
-      if (!closed.rowCount) {
-        this.logger.warn(`отчёт об успехе по незапущенному заданию ${jobId} — продукт не тронут`);
-        return;
-      }
       // Статус продукта здесь НЕ меняется. Перевод в running делает
       // promoteReady по измеримому факту (задача 5): отчёт агента говорит
       // «я развернул», а не «оно отвечает».
@@ -374,29 +417,38 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       // COALESCE, а не голое присваивание: отчёт об успехе без порта (бот его
       // не публикует) снёс бы порт уже работающего сайта. Хранится он только
       // здесь — восстановить неоткуда.
-      await this.pg.query(
-        `UPDATE products SET port = COALESCE($2, port)
-          WHERE id = (SELECT product_id FROM product_provision_jobs WHERE id = $1)`,
+      const r = await this.pg.query(
+        `WITH closed AS (
+            UPDATE product_provision_jobs
+               SET status = 'done', finished_at = now()
+             WHERE id = $1 AND status = 'running'
+            RETURNING product_id
+         )
+         UPDATE products SET port = COALESCE($2, port)
+           FROM closed WHERE products.id = closed.product_id`,
         [jobId, result.port ?? null],
       );
-      return;
-    }
-    const closed = await this.pg.query(
-      `UPDATE product_provision_jobs SET status = 'failed', error = $2, finished_at = now()
-        WHERE id = $1 AND status = 'running'`,
-      [jobId, result.error ?? 'без причины'],
-    );
-    if (!closed.rowCount) {
-      this.logger.warn(`отчёт об отказе по незапущенному заданию ${jobId} — продукт не тронут`);
+      if (!r.rowCount) {
+        this.logger.warn(`отчёт об успехе по незапущенному заданию ${jobId} — продукт не тронут`);
+      }
       return;
     }
     // Порт здесь не трогается намеренно: неудачная ПОВТОРНАЯ попытка снесла бы
     // порт уже работавшего продукта, а хранится он только тут.
-    await this.pg.query(
-      `UPDATE products SET status = 'failed', provision_error = $2
-        WHERE id = (SELECT product_id FROM product_provision_jobs WHERE id = $1)`,
+    const r = await this.pg.query(
+      `WITH closed AS (
+          UPDATE product_provision_jobs
+             SET status = 'failed', error = $2, finished_at = now()
+           WHERE id = $1 AND status = 'running'
+          RETURNING product_id
+       )
+       UPDATE products SET status = 'failed', provision_error = $2
+         FROM closed WHERE products.id = closed.product_id`,
       [jobId, result.error ?? 'без причины'],
     );
+    if (!r.rowCount) {
+      this.logger.warn(`отчёт об отказе по незапущенному заданию ${jobId} — продукт не тронут`);
+    }
   }
 
   /**
@@ -461,6 +513,11 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
         //     статус running.
         // Гонки с пользователем для второго исхода даже не нужно: раньше оба
         // метода звались из одного такта без await между собой.
+        //
+        // Закрывают их, однако, не сами по себе «условия в записи», а то, что
+        // запись — ОДИН оператор со своими предусловиями: см. доку класса.
+        // Разложи её на «прочитать — подумать — записать», и повторённые
+        // условия станут такой же декорацией, какой были условия выборки.
         const w = await this.pg.query(
           `UPDATE products SET status = 'running', provision_error = NULL
             WHERE id = $1 AND status = 'provisioning' AND archived_at IS NULL
@@ -573,6 +630,13 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                   THEN 'задание закрыто, раннер на связи, но публичный адрес не отвечает'
                 ELSE 'задание закрыто, продукт не ожил: раннер не выходит на связь'
               END
+        -- archived_at выводит строку из-под гейта СОВСЕМ: архивный продукт,
+        -- застрявший в provisioning с закрытым заданием, не переводится и не
+        -- хоронится — состояние без выхода. Сегодня оно недостижимо, потому
+        -- что products.archived_at не пишет ни одна строка кода; принятый в
+        -- репозитории приём (см. promoteReady и claimJob) выводит архивные
+        -- из-под обработки сам, и здесь он повторён однородности ради. Как
+        -- только архивация появится, этому случаю понадобится свой исход.
         WHERE p.status = 'provisioning' AND p.archived_at IS NULL
           AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
                            WHERE j.product_id = p.id AND j.status IN ('queued','running'))
