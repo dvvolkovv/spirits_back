@@ -21,8 +21,12 @@ export interface ProductRow {
   created_at: string;
 }
 
-// runner_token_hash сюда намеренно не входит: эти методы обслуживают
-// клиента, а хеш токена раннера ему не нужен ни в каком виде.
+// Список колонок перечислен явно, и двух из них здесь нет намеренно:
+// runner_token_hash — хеш токена доступа к клиентской VM, secrets_encrypted —
+// шифротекст секретов продукта. Эти методы обслуживают клиента, и ни то, ни
+// другое ему не нужно ни в каком виде. Заменить перечисление на SELECT *
+// нельзя: обе колонки уедут в ответ молча, и следующая секретная колонка тоже.
+// Сторож — products.access.spec.ts.
 const COLUMNS = `id, user_id, name, slug, status, host_ip, domain, repo_url,
                  checkout_path, build_cmd, restart_cmd, health_url,
                  runner_seen_at, claude_session_id, created_at`;

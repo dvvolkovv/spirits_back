@@ -61,6 +61,24 @@ async function migration002(): Promise<string> {
 }
 
 /**
+ * Значения именованного CHECK-словаря, отсортированные: сверка получается ровно
+ * про состав, а не про порядок перечисления.
+ *
+ * Имя ограничения в якоре обязательно: словарей по колонке status в файле два —
+ * у products и у очереди заданий, — и безымянный поиск подобрал бы чужой.
+ */
+function dictionary(sql: string, constraint: string, column: string): string[] {
+  const m = sql.match(
+    new RegExp(`ADD CONSTRAINT\\s+${constraint}\\s+CHECK\\s*\\(\\s*${column} IN \\(([^)]*)\\)`),
+  );
+  if (!m) throw new Error(`в миграции 002 нет CHECK-словаря ${constraint} по колонке ${column}`);
+  return m[1]
+    .split(',')
+    .map((v) => v.trim().replace(/'/g, ''))
+    .sort();
+}
+
+/**
  * Проверки ниже сверяют смысл SQL, а не упоминание имён: тип и модификаторы
  * колонки, словари CHECK, предикат частичного индекса, каскад внешнего ключа.
  * Живого Postgres в прогоне нет, поэтому семантика закреплена по тексту
@@ -88,16 +106,47 @@ describe('миграция 002', () => {
     );
   });
 
-  it('словарь форм продукта закрыт CHECK', async () => {
-    expect(await migration002()).toMatch(/CHECK\s*\(\s*kind\s+IN\s*\(\s*'site'\s*,\s*'bot'\s*\)\s*\)/);
+  it('DEFAULT у kind снимается сразу после заполнения старых строк', async () => {
+    // Оставленный DEFAULT означает, что INSERT, забывший kind, заводит бота
+    // как сайт — с публичным портом и vhost-ом наружу. Ровно поэтому в 001
+    // оставлен без DEFAULT status.
+    expect(await migration002()).toMatch(/ALTER COLUMN\s+kind\s+DROP DEFAULT/);
   });
 
-  it('CHECK на kind навешивается идемпотентно', async () => {
-    // ADD CONSTRAINT не знает IF NOT EXISTS: без перехвата duplicate_object
-    // повторный прогон миграции падал бы на уже существующем ограничении.
-    expect(await migration002()).toMatch(
-      /DO \$\$[\s\S]*ADD CONSTRAINT\s+products_kind_chk[\s\S]*EXCEPTION WHEN duplicate_object THEN NULL;\s*END \$\$/,
-    );
+  it('словарь форм продукта закрыт CHECK', async () => {
+    expect(dictionary(await migration002(), 'products_kind_chk', 'kind')).toEqual(['bot', 'site']);
+  });
+
+  it('словарь статусов продукта знает failed — иначе тупик в обработчике ошибки', async () => {
+    // Без 'failed' запись причины сорванного заведения падала бы ВНУТРИ
+    // обработчика ошибки: продукт навсегда застревал бы в 'provisioning'.
+    // Словарь сверяется целиком: identity/migrations/003 — про то, как
+    // дописывание одного значения теряет остальные.
+    expect(dictionary(await migration002(), 'products_status_check', 'status')).toEqual([
+      'archived',
+      'degraded',
+      'failed',
+      'provisioning',
+      'running',
+      'stopped',
+    ]);
+  });
+
+  it('каждое ограничение навешивается идемпотентно', async () => {
+    // ADD CONSTRAINT не знает IF NOT EXISTS: без снятия одноимённого
+    // ограничения повторный прогон миграции падал бы. DO/EXCEPTION
+    // duplicate_object тут не годится — он молча сохраняет СТАРОЕ определение.
+    const sql = await migration002();
+    const added = [...sql.matchAll(/ADD CONSTRAINT\s+(\w+)/g)].map((m) => m[1]);
+    expect(added.length).toBeGreaterThan(0);
+    for (const name of added) {
+      // Именно DROP перед ADD, а не где-нибудь в файле: иначе снятое
+      // ограничение вернулось бы позже собственной замены.
+      expect(sql.indexOf(`DROP CONSTRAINT IF EXISTS ${name};`)).toBeGreaterThan(-1);
+      expect(sql.indexOf(`DROP CONSTRAINT IF EXISTS ${name};`)).toBeLessThan(
+        sql.indexOf(`ADD CONSTRAINT ${name}`),
+      );
+    }
   });
 
   it('порт — целое число и необязателен: у бота его нет', async () => {

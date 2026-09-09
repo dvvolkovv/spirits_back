@@ -37,6 +37,26 @@ describe('ProductsService.list', () => {
   });
 });
 
+describe('колонки клиентской выдачи', () => {
+  it('не отдают ни хеш токена раннера, ни секреты продукта', async () => {
+    const { svc, calls } = makeService([ROW]);
+
+    await svc.list('79030169187');
+    await svc.getOwned('p-1', '79030169187');
+
+    expect(calls).toHaveLength(2);
+    for (const { sql } of calls) {
+      // Перечисление колонок, а не звёздочка. Проверка одних только
+      // not.toContain зеленела бы на SELECT *: имён секретных колонок в тексте
+      // запроса нет, а в ответ они уезжают.
+      expect(sql).toMatch(/SELECT\s+id,\s*user_id/);
+      expect(sql).not.toContain('*');
+      expect(sql).not.toContain('runner_token_hash');
+      expect(sql).not.toContain('secrets_encrypted');
+    }
+  });
+});
+
 describe('ProductsService.getOwned', () => {
   it('отдаёт продукт своему владельцу', async () => {
     const { svc } = makeService([ROW]);
