@@ -53,14 +53,33 @@ export function canonicalJson(value: unknown): string {
   return `{${body}}`;
 }
 
-/** Сравнение constant-time. Любой мусор — false, а не исключение. */
+/**
+ * Сравнение constant-time. Любой мусор — false, а не исключение.
+ *
+ * ⚠️ `secret` — это BASE64, а ключом HMAC служат его ДЕКОДИРОВАННЫЕ БАЙТЫ.
+ *
+ * Проверено на живом Attendee 09.09.2026. Секрет хранится как произвольные
+ * байты (`WebhookSecret._secret`), интерфейс отдаёт его в base64
+ * (`projects_views.py:1029`), а подписывает Attendee сырыми байтами
+ * (`sign_payload(payload, get_secret())` → `hmac.new(secret, …)`).
+ *
+ * Первая редакция передавала строку прямо в `createHmac`, то есть брала
+ * ключом сам base64-ТЕКСТ. Подпись не совпадала бы никогда: проверено
+ * численно, две подписи одного payload расходятся полностью. Последствие
+ * было бы не «иногда 401», а полное отсутствие присутствия во встрече —
+ * гейт по имени срывался бы в solo, и ассистент отвечал на каждую реплику.
+ *
+ * Золотой вектор ниже этого не поймал, потому что секрет там был обычной
+ * строкой с обеих сторон: он проверял канонизацию, а не обращение с ключом.
+ */
 export function verifyAttendeeSignature(
   secret: string,
   payload: unknown,
   signature: string,
 ): boolean {
   if (!signature || typeof signature !== 'string') return false;
-  const expected = createHmac('sha256', secret).update(canonicalJson(payload), 'utf8').digest('base64');
+  const key = Buffer.from(secret, 'base64');
+  const expected = createHmac('sha256', key).update(canonicalJson(payload), 'utf8').digest('base64');
   if (signature.length !== expected.length) return false;
   try {
     return timingSafeEqual(Buffer.from(signature, 'base64'), Buffer.from(expected, 'base64'));

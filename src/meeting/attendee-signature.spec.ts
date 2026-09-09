@@ -1,9 +1,10 @@
 import { canonicalJson, verifyAttendeeSignature } from './attendee-signature';
 import { createHmac } from 'crypto';
 
-const SECRET = 'test-secret';
+const SECRET = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
+// Ключ — декодированные байты base64-секрета, как это делает Attendee.
 const sign = (payload: unknown) =>
-  createHmac('sha256', SECRET).update(canonicalJson(payload), 'utf8').digest('base64');
+  createHmac('sha256', Buffer.from(SECRET, 'base64')).update(canonicalJson(payload), 'utf8').digest('base64');
 
 describe('canonicalJson', () => {
   it('сортирует ключи на всех уровнях', () => {
@@ -38,6 +39,18 @@ describe('verifyAttendeeSignature', () => {
     expect(verifyAttendeeSignature(SECRET, reordered, sign(payload))).toBe(true);
   });
 
+  it('ключ — БАЙТЫ секрета, а не его base64-текст', () => {
+    // Прямая проверка прежнего дефекта. Attendee подписывает декодированными
+    // байтами; если взять ключом сам base64-текст, подпись выходит другая, и
+    // ни один вебхук не прошёл бы проверку — а значит присутствие во встрече
+    // не приходило бы вовсе.
+    const payload = { a: 1 };
+    const wrong = createHmac('sha256', SECRET)
+      .update(canonicalJson(payload), 'utf8').digest('base64');
+    expect(verifyAttendeeSignature(SECRET, payload, wrong)).toBe(false);
+    expect(verifyAttendeeSignature(SECRET, payload, sign(payload))).toBe(true);
+  });
+
   it('отвергает чужую подпись', () => {
     expect(verifyAttendeeSignature(SECRET, payload, sign({ bot_id: 'other' }))).toBe(false);
   });
@@ -62,7 +75,7 @@ describe('verifyAttendeeSignature', () => {
     //
     //   canon = json.dumps(payload, sort_keys=True, ensure_ascii=False,
     //                      separators=(",", ":"))
-    //   base64(hmac.new(b'test-secret', canon.encode('utf-8'), sha256).digest())
+    //   base64(hmac.new(base64.b64decode(SECRET), canon.encode('utf-8'), sha256).digest())
     //
     // Payload — как настоящее событие participant_events.join_leave, с
     // кириллицей в имени и намеренно неотсортированными ключами.
@@ -83,7 +96,7 @@ describe('verifyAttendeeSignature', () => {
       '"participant_name":"Сергей","participant_uuid":"u1","timestamp_ms":1757222400000},' +
       '"idempotency_key":"k1","trigger":"participant_events.join_leave"}',
     );
-    expect(verifyAttendeeSignature('test-secret', payload,
+    expect(verifyAttendeeSignature(SECRET, payload,
       'Jk7s1DxeUQ5yFdScDKoBCTkZNNKESJ3gHAV2bh6wD9o=')).toBe(true);
   });
 });
