@@ -208,9 +208,20 @@ test.describe('my.linkeon.io smoke', () => {
         sessionStorage.setItem('selected_assistant', JSON.stringify({ id: 14, name: 'Райя', description: 'Human Design ридер' }));
       });
 
-      // Reload to re-init React state from sessionStorage
-      await p1.reload();
-      await p2.reload();
+      // Reload to re-init React state from sessionStorage.
+      //
+      // waitUntil обязателен: по умолчанию reload() ждёт событие 'load', то есть
+      // ВСЕ подресурсы, включая ~20 аватарок ассистентов. Их отдаёт Node-API, а не
+      // nginx: 12 штук параллельно — это 10с на проде и до 34с на test. Два
+      // контекста разом не укладывались в navigationTimeout 45000, и слой падал
+      // на любом коде — 09.09.2026 это трижды подряд объявило регрессией здоровый
+      // фронт и не пустило его на прод.
+      //
+      // Тест проверяет изоляцию sessionStorage между контекстами — картинки ему
+      // не нужны. Строки ниже и так ждут ровно 'domcontentloaded'; здесь тот же
+      // критерий, что и у goto() в соседних тестах этого файла.
+      await p1.reload({ waitUntil: 'domcontentloaded' });
+      await p2.reload({ waitUntil: 'domcontentloaded' });
       await p1.waitForLoadState('domcontentloaded');
       await p2.waitForLoadState('domcontentloaded');
 
