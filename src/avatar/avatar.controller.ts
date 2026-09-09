@@ -6,6 +6,31 @@ import { CurrentUser } from '../common/decorators/user.decorator';
 import * as multer from 'multer';
 import axios from 'axios';
 
+/**
+ * Кеш аватарок ассистентов в памяти процесса.
+ *
+ * До него getAgentAvatar ходил в MinIO по HTTP на КАЖДЫЙ запрос. Замер
+ * 09.09.2026: на проде одна картинка 0.8–3.1с, двенадцать параллельно — 10с; на
+ * test.linkeon.io те же двенадцать — 34с, из-за чего браузерный слой smoke не
+ * укладывался в navigationTimeout и трижды подряд объявил здоровый фронт
+ * регрессией.
+ *
+ * Набор ограничен и почти не меняется: ~20 ассистентов по 30–120 КБ, полтора
+ * мегабайта на всех. TTL час — аватарку меняют раз в месяцы, а лишний час
+ * старой картинки безопаснее, чем поход в MinIO на каждый показ списка.
+ *
+ * Кешируются ТОЛЬКО успешные ответы: провал MinIO должен пробоваться заново,
+ * иначе одна сетевая икота выключила бы аватарки на весь TTL.
+ */
+const AGENT_AVATAR_TTL_MS = 60 * 60 * 1000;
+const AGENT_AVATAR_MAX_ENTRIES = 100;
+const agentAvatarCache = new Map<string, { buf: Buffer; contentType: string; ts: number }>();
+
+/** Только для тестов: сбросить кеш между кейсами. */
+export function __resetAgentAvatarCache(): void {
+  agentAvatarCache.clear();
+}
+
 @Controller('')
 export class AvatarController {
   private upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
@@ -82,6 +107,15 @@ export class AvatarController {
 
   @Get('0cdacf32-7bfd-4888-b24f-3a6af3b5f99e/agent/avatar/:agentId')
   async getAgentAvatar(@Param('agentId') agentId: string, @Res() res: Response) {
+    // Кеш проверяем до похода в сервис: он лезет в БД за URL, а нам и это лишнее.
+    const cached = agentAvatarCache.get(agentId);
+    if (cached && Date.now() - cached.ts < AGENT_AVATAR_TTL_MS) {
+      res.setHeader('Content-Type', cached.contentType);
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      return res.send(cached.buf);
+    }
+    if (cached) agentAvatarCache.delete(agentId); // протух
+
     const url = await this.avatarService.getAgentAvatar(agentId);
     if (!url) return res.status(404).json({ error: 'No avatar' });
     // Проксируем байты изображения вместо 302-редиректа: кросс-ориджин клиенты
@@ -94,12 +128,21 @@ export class AvatarController {
       // Типы axios допускают boolean среди значений заголовка, а setHeader его
       // не принимает — сужаем явно, иначе сборка не проходит.
       const contentType = img.headers['content-type'];
-      res.setHeader(
-        'Content-Type',
-        typeof contentType === 'string' ? contentType : 'image/jpeg',
-      );
+      const resolvedType = typeof contentType === 'string' ? contentType : 'image/jpeg';
+      const buf = Buffer.from(img.data);
+
+      // Потолок держим простым FIFO: набор фиксирован (~20 ассистентов), до
+      // вытеснения дело в проде не доходит — это страховка от роста, а не
+      // алгоритм. Первый ключ Map — самый давно вставленный.
+      if (agentAvatarCache.size >= AGENT_AVATAR_MAX_ENTRIES) {
+        const oldest = agentAvatarCache.keys().next().value;
+        if (oldest !== undefined) agentAvatarCache.delete(oldest);
+      }
+      agentAvatarCache.set(agentId, { buf, contentType: resolvedType, ts: Date.now() });
+
+      res.setHeader('Content-Type', resolvedType);
       res.setHeader('Cache-Control', 'public, max-age=86400');
-      return res.send(Buffer.from(img.data));
+      return res.send(buf);
     } catch {
       return res.redirect(url); // fallback — если апстрим недоступен
     }
