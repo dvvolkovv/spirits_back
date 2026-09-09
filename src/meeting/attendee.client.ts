@@ -230,7 +230,7 @@ export class AttendeeClient {
       // Но 400 сам по себе НЕ значит «бот мёртв»: leave не разрешён и в
       // joining, и в комнате ожидания, а такой бот ещё может войти в встречу.
       // Поэтому спрашиваем состояние и убираем запись только на терминальном.
-      const st = await this.call(path);
+      const st = await this.call(path, { method: 'GET' });
       const state = st?.status === 200 ? st.data?.state : undefined;
       if (typeof state === 'string' && TERMINAL_BOT_STATES.has(state)) return false;
       return null;
