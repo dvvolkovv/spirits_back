@@ -69,10 +69,30 @@ describe('MeetWebhookController', () => {
     });
   });
 
-  it('не пустили во встречу — тоже fatal', async () => {
-    const p = hook('bot.state_change', { new_state: 'denied_entry', old_state: 'joining' });
+  it('встреча закончилась — тоже fatal', async () => {
+    const p = hook('bot.state_change', { new_state: 'ended', old_state: 'joined_recording' });
     await ctl.receive(sign(p), p as any);
     expect(livekit.send.mock.calls[0][1].fatal).toBe(true);
+  });
+
+  it('комната ожидания НЕ смертельна', async () => {
+    // waiting_room — это ожидание впуска, а не отказ. Считать его
+    // смертельным значило бы выходить ровно тогда, когда хозяин собирается
+    // нас впустить.
+    const p = hook('bot.state_change', { new_state: 'waiting_room', old_state: 'joining' });
+    await ctl.receive(sign(p), p as any);
+    expect(livekit.send.mock.calls[0][1]).toEqual({
+      v: 1, type: 'meet_bot_state', state: 'waiting_room', fatal: false,
+    });
+  });
+
+  it('промежуточные состояния входа не смертельны', async () => {
+    for (const st of ['joining', 'joined_not_recording', 'joined_recording', 'connecting']) {
+      livekit.send.mockClear();
+      const p = hook('bot.state_change', { new_state: st, old_state: 'ready' }, `k-${st}`);
+      await ctl.receive(sign(p), p as any);
+      expect(livekit.send.mock.calls[0][1].fatal).toBe(false);
+    }
   });
 
   it('обычное состояние бота не считается смертельным', async () => {

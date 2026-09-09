@@ -23,8 +23,30 @@ import { canonicalJson, verifyAttendeeSignature } from './attendee-signature';
  * до 30 раз впустую.
  */
 
-/** Состояния бота, после которых встречи не будет. */
-const FATAL_STATES = new Set(['fatal_error', 'denied_entry', 'removed_from_meeting', 'ended']);
+/**
+ * Состояния бота, после которых встречи не будет.
+ *
+ * Список сверен с исходниками Attendee 09.09.2026
+ * (`bots/models.py`, `BotStates._get_state_to_api_code_mapping`). Полный
+ * набор кодов: `ready`, `joining`, `joined_not_recording`,
+ * `joined_recording`, `joined_recording_paused`,
+ * `joined_recording_permission_denied`, `leaving`, `post_processing`,
+ * `fatal_error`, `waiting_room`, `ended`, `data_deleted`, `scheduled`,
+ * `staged`, `joining_breakout_room`, `leaving_breakout_room`, `connecting`,
+ * `connected`, `disconnecting`.
+ *
+ * ⚠️ Первая редакция содержала `denied_entry` и `removed_from_meeting` —
+ * таких состояний у Attendee НЕТ, они были выдуманы при планировании и
+ * уехали в код. Отказ во входе Attendee сообщает как `fatal_error`, а
+ * удаление из встречи — переходом в `ended`, так что поведение не страдало,
+ * но два элемента набора были мёртвым кодом, вводящим в заблуждение.
+ *
+ * `waiting_room` сюда НЕ входит: это не отказ, а ожидание впуска — то самое
+ * состояние, ради которого в карточке чата живёт плашка «ждём, пока
+ * впустят». Считать его смертельным значило бы выходить из встречи ровно
+ * тогда, когда хозяин собирается нас впустить.
+ */
+const FATAL_STATES = new Set(['fatal_error', 'ended', 'data_deleted']);
 
 /**
  * Сколько ключей идемпотентности держим.
