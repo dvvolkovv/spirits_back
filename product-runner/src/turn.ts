@@ -113,6 +113,8 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<void> {
     restartCmd: product.restartCmd,
     healthUrl: product.healthUrl,
     cwd: product.checkoutPath,
+    // Продукт обязан подтвердить, что поднялся ИМЕННО на этой правке.
+    expectedSha: shaAfter,
     // Отчёт о фазах: без него сборка выглядит для сборщика зависших молчанием,
     // и ход длиннее получаса снимут как мёртвый — а он жив.
     onPhase: (phase) => void api.sendEvents(turn.id, [{ type: 'item', content: `\n${phase}` }]),

@@ -54,11 +54,21 @@ ssh "$PRODUCTS_HOST" "
 PKG
   cat > server.js <<'SRV'
 const http = require('http');
+const { execSync } = require('child_process');
 const PORT = process.env.PORT || 3000;
+
+// sha вычисляется ОДИН РАЗ при старте и дальше не перечитывается.
+// Это не оптимизация: по нему раннер отличает «поднялся новый код» от
+// «на порту остался процесс прошлой версии». Читать на каждый запрос —
+// значит позволить сироте отдать свежий sha и подделать выкат.
+const SHA = (() => {
+  try { return execSync('git rev-parse HEAD', { cwd: __dirname }).toString().trim(); }
+  catch { return 'unknown'; }
+})();
 const page = '<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><title>Новый продукт</title></head>'
   + '<body><h1>Новый продукт</h1><p>Этот сайт правит ассистент Linkeon.</p></body></html>';
 http.createServer((req, res) => {
-  if (req.url === '/health') { res.writeHead(200, {'content-type':'application/json'}); return res.end(JSON.stringify({ok:true})); }
+  if (req.url === '/health') { res.writeHead(200, {'content-type':'application/json'}); return res.end(JSON.stringify({ok:true, sha:SHA})); }
   res.writeHead(200, {'content-type':'text/html; charset=utf-8'});
   res.end(page);
 }).listen(PORT);
@@ -71,15 +81,23 @@ SRV
 ## Где что
 - \`server.js\` — весь сайт, точка входа
 - Порт берётся из \`PORT\`, менять нельзя: снаружи на него смотрит nginx
-- \`/health\` отдаёт \`{\"ok\":true}\` — по нему проверяется, что правка не сломала сайт
+- \`/health\` отдаёт \`{\"ok\":true,\"sha\":\"<хеш коммита>\"}\` — по нему проверяется,
+  что поднялся именно новый код. Хеш считается один раз при старте процесса;
+  читать его на каждый запрос нельзя, иначе проверка перестаёт что-либо значить
 
 ## Как это работает
 Продукт живёт в контейнере под PM2, процесс называется \`product\`.
 После правки: \`npm run build\`, затем \`pm2 restart product\`.
 
 ## Что не трогать
-\`/health\` обязан отвечать 200 и JSON. Если он сломается, ход откатится
-автоматически, а правка потеряется.
+\`/health\` обязан отвечать 200, JSON и поле \`sha\`. Если он сломается или
+перестанет отдавать sha, ход откатится автоматически, а правка потеряется.
+
+## Чего не делать во время правки
+Не запускать сервер руками (\`node server.js\`, \`npm start\` в фоне). Процесс
+переживёт твой ход, займёт порт, и все последующие выкаты будут падать с
+EADDRINUSE — при этом сайт продолжит отвечать старым кодом. Перезапуском
+занимается раннер: \`pm2 restart product\`.
 DOC
   git init -q
   git config user.email 'assistant@linkeon.io'

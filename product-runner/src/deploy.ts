@@ -12,7 +12,11 @@ export type FetchFn = typeof fetch;
  * SPA-фолбэк отдаёт 200 с index.html на любой путь, включая несуществующий:
  * проверка по коду будет зелёной на мёртвом сервисе.
  */
-export async function checkHealth(url: string | null, fetchFn: FetchFn = fetch): Promise<boolean> {
+export async function checkHealth(
+  url: string | null,
+  fetchFn: FetchFn = fetch,
+  expectedSha?: string | null,
+): Promise<boolean> {
   if (!url) return true;
   try {
     const res = await fetchFn(url, { redirect: 'manual' } as any);
@@ -21,7 +25,29 @@ export async function checkHealth(url: string | null, fetchFn: FetchFn = fetch):
     if (contentType.includes('text/html')) return false;
     const body = await res.text();
     if (/<!doctype html|<html/i.test(body)) return false;
-    return true;
+    if (!expectedSha) return true;
+
+    // Сверка того, ЧТО ИМЕННО отвечает. Без неё проверка здоровья доказывает
+    // лишь «на порту кто-то живой» — и этого достаточно, чтобы выкат считался
+    // удачным, когда новый код не поднялся, а порт держит процесс от прошлой
+    // версии.
+    //
+    // Так и случилось дважды: pm2 в состоянии errored с 93 и 32 перезапусками,
+    // EADDRINUSE у новой копии, сайт отдаёт 200 со старого кода, ход помечен
+    // «Готово». Сироту оставлял то pm2 через оболочку, то сам агент, запустив
+    // сервер руками во время хода.
+    //
+    // Продукт обязан вычислять sha ОДИН РАЗ при старте процесса. Если читать
+    // его на каждый запрос, сирота прочитает свежий файл и подделает ответ —
+    // проверка снова станет бессмысленной.
+    let reported: unknown;
+    try {
+      reported = JSON.parse(body)?.sha;
+    } catch {
+      return false;
+    }
+    if (typeof reported !== 'string' || !reported) return false;
+    return reported.startsWith(expectedSha) || expectedSha.startsWith(reported);
   } catch {
     return false;
   }
@@ -31,6 +57,8 @@ export interface WaitHealthyOptions {
   timeoutMs?: number;
   probeEveryMs?: number;
   sleep?: (ms: number) => Promise<unknown>;
+  /** sha, который обязан отдавать поднявшийся продукт. */
+  expectedSha?: string | null;
 }
 
 /**
@@ -56,7 +84,7 @@ export async function waitHealthy(
 
   const attempts = Math.max(1, Math.ceil(timeoutMs / probeEveryMs));
   for (let i = 0; i < attempts; i++) {
-    if (await checkHealth(url, fetchFn)) return true;
+    if (await checkHealth(url, fetchFn, opts.expectedSha)) return true;
     if (i < attempts - 1) await wait(probeEveryMs);
   }
   return false;
@@ -77,6 +105,11 @@ export interface DeployInput {
   /** Как часто пробовать health-check внутри окна ожидания. */
   healthProbeEveryMs?: number;
   sleep?: (ms: number) => Promise<unknown>;
+  /**
+   * sha правки, который обязан отдавать поднявшийся продукт. Отличает
+   * «на порту кто-то живой» от «работает именно этот код».
+   */
+  expectedSha?: string | null;
 }
 
 export async function deploy(input: DeployInput): Promise<{ reverted: boolean }> {
@@ -111,6 +144,7 @@ export async function deploy(input: DeployInput): Promise<{ reverted: boolean }>
       timeoutMs: input.healthTimeoutMs,
       probeEveryMs: input.healthProbeEveryMs,
       sleep: input.sleep,
+      expectedSha: input.expectedSha,
     });
   } catch (e: any) {
     // Сборка или рестарт не отработали. Без отката коммит агента остаётся в

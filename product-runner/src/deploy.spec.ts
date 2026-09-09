@@ -317,3 +317,62 @@ describe('deploy', () => {
     expect(phases.some((p) => p.includes('Откат поднять не удалось'))).toBe(true);
   });
 });
+
+describe('health обязан доказывать, ЧТО именно отвечает', () => {
+  const resp = (body: string, type = 'application/json') =>
+    ({ status: 200, headers: { get: () => type }, text: async () => body }) as any;
+
+  it('чужой sha — не здоров (сирота от прошлой версии)', async () => {
+    // Ровно случившееся дважды: новый код падает с EADDRINUSE, порт держит
+    // процесс прошлой версии и бодро отвечает 200 с валидным JSON.
+    const fetchFn = (async () => resp('{"ok":true,"sha":"eb31cd6fe8462d47"}')) as any;
+
+    const ok = await checkHealth('http://x/health', fetchFn, '3b5daba981108517');
+
+    expect(ok).toBe(false);
+  });
+
+  it('свой sha — здоров', async () => {
+    const fetchFn = (async () => resp('{"ok":true,"sha":"3b5daba981108517722fd98bd21b172b877ed6c5"}')) as any;
+
+    const ok = await checkHealth('http://x/health', fetchFn, '3b5daba981108517722fd98bd21b172b877ed6c5');
+
+    expect(ok).toBe(true);
+  });
+
+  it('продукт не сообщает sha — не здоров, а не «сойдёт»', async () => {
+    // Молчание не доказывает ничего. Если бы отсутствие поля считалось нормой,
+    // достаточно было бы выкинуть его из ответа, чтобы вернуть прежнюю дыру.
+    const fetchFn = (async () => resp('{"ok":true}')) as any;
+
+    const ok = await checkHealth('http://x/health', fetchFn, '3b5daba');
+
+    expect(ok).toBe(false);
+  });
+
+  it('без ожидаемого sha проверка прежняя — по телу ответа', async () => {
+    const fetchFn = (async () => resp('{"ok":true}')) as any;
+
+    expect(await checkHealth('http://x/health', fetchFn)).toBe(true);
+  });
+
+  it('waitHealthy доносит ожидаемый sha до каждой пробы', async () => {
+    // Без проброса waitHealthy проверял бы здоровье вообще без sha, и вся
+    // защита существовала бы только в checkHealth, куда никто не заходит.
+    const seen: any[] = [];
+    const fetchFn = (async () => {
+      seen.push(1);
+      return resp('{"ok":true,"sha":"чужой"}');
+    }) as any;
+
+    const ok = await waitHealthy('http://x/health', fetchFn, {
+      timeoutMs: 30,
+      probeEveryMs: 10,
+      sleep: async () => {},
+      expectedSha: 'ожидаемый',
+    });
+
+    expect(ok).toBe(false);
+    expect(seen.length).toBeGreaterThan(1);
+  });
+});

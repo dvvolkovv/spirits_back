@@ -122,3 +122,33 @@ describe('executeTurn — служебный ход отката', () => {
     expect(payload.tokens ?? 0).toBe(0);
   });
 });
+
+describe('проводка ожидаемого sha в деплой', () => {
+  // Отдельный тест именно на связку. Сверка sha живёт в deploy.ts и покрыта
+  // там, но убрать одну строку в turn.ts — и защита отключена целиком, а все
+  // прочие тесты остаются зелёными. Проверено мутацией: без этого теста
+  // удаление проводки не роняло ни одного из 77.
+  it('deploy получает sha именно той правки, что закоммичена', async () => {
+    const d = makeDeps({ git: { commitAll: jest.fn(async () => 'sha-новой-правки') } });
+
+    await executeTurn({ turn: TURN, product: PRODUCT, config: {} as any, ...d } as any);
+
+    expect(d.deploy).toHaveBeenCalledWith(
+      expect.objectContaining({ expectedSha: 'sha-новой-правки' }),
+    );
+  });
+
+  it('служебный ход отката sha не сверяет', async () => {
+    // При откате дерево возвращается на прежний коммит, и продукт обязан
+    // подняться именно на нём. Ожидаемого sha «новой правки» здесь нет —
+    // передать сюда shaAfter значило бы уронить каждый откат.
+    const d = makeDeps();
+    const revertTurn = { ...TURN, revertToSha: 'sha-куда-возвращаемся' };
+
+    await executeTurn({ turn: revertTurn, product: PRODUCT, config: {} as any, ...d } as any);
+
+    expect(d.deploy).toHaveBeenCalledWith(
+      expect.objectContaining({ shaBefore: 'sha-куда-возвращаемся' }),
+    );
+  });
+});
