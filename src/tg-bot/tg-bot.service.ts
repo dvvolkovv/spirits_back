@@ -67,6 +67,19 @@ const WORKSPACE_MAX_BYTES = Number(process.env.TG_WORKSPACE_MAX_MB || 200) * 102
  */
 const TMA_URL = process.env.TMA_URL || 'https://my.linkeon.io/tma/';
 
+/**
+ * Сколько ждём остальные части альбома после очередной приехавшей.
+ *
+ * Telegram растягивает доставку альбома на сотни миллисекунд; 2.5 с покрывают
+ * это с запасом и при этом не превращаются в заметную задержку — ход с файлами
+ * всё равно идёт десятки секунд. Таймер сбрасывается на каждой новой части,
+ * поэтому окно считается от последней, а не от первой.
+ */
+const ALBUM_DEBOUNCE_MS = Number(process.env.TG_ALBUM_DEBOUNCE_MS || 2500);
+
+/** Потолок альбома в Telegram. Набрали столько — ждать больше нечего. */
+const ALBUM_MAX_PARTS = 10;
+
 @Injectable()
 export class TgBotService implements OnModuleInit {
   private readonly logger = new Logger(TgBotService.name);
@@ -74,6 +87,15 @@ export class TgBotService implements OnModuleInit {
   // не спамим если юзер пишет 10 сообщений подряд. In-memory, сбрасывается
   // при рестарте бэка, что приемлемо.
   private readonly lastBusyNoticeAt = new Map<number, number>();
+  /**
+   * Незакрытые альбомы: ключ — чат + media_group_id, значение — уже приехавшие
+   * части и таймер дебаунса. Подробности почему это нужно — над bufferAlbumPart.
+   *
+   * In-memory осознанно: linkeon-api живёт одним процессом, части одного альбома
+   * приходят в него же. Потеря буфера при рестарте равна потере хода — ровно то
+   * же, что уже делает advisory lock, когда бэк перезапускают посреди ответа.
+   */
+  private readonly albumBuffers = new Map<string, { parts: any[]; timer: NodeJS.Timeout }>();
 
   constructor(
     private readonly pg: PgService,
@@ -470,9 +492,68 @@ export class TgBotService implements OnModuleInit {
    * cfgIn передаёт личная ветка: там конфиг уже получен (и при необходимости
    * создан) через ensurePrivateConfig, второй поход в БД не нужен.
    */
+  /**
+   * Копим части альбома и отдаём их одним ходом.
+   *
+   * Telegram не присылает «несколько файлов» одним апдейтом: это N отдельных
+   * сообщений с общим media_group_id, каждое со своим файлом и только одно — с
+   * подписью. Контроллер отдаёт апдейты в работу параллельно, поэтому раньше
+   * первое сообщение забирало per-chat advisory lock и уходило в модель ровно с
+   * одним вложением, а остальные логировались как «busy, skipping» и оседали
+   * только в истории. Для пользователя это выглядело как «бот взял в работу
+   * один файл из пяти» (репорт владельца 09.09.2026).
+   */
+  private bufferAlbumPart(cfg: TgBotConfigRow, msg: any): void {
+    const key = `${msg.chat.id}:${msg.media_group_id}`;
+    const existing = this.albumBuffers.get(key);
+    if (existing) clearTimeout(existing.timer);
+    const parts = existing ? [...existing.parts, msg] : [msg];
+
+    const waitMs = parts.length >= ALBUM_MAX_PARTS ? 0 : ALBUM_DEBOUNCE_MS;
+    const timer = setTimeout(() => { void this.flushAlbum(key, cfg); }, waitMs);
+    // unref: незакрытый альбом не должен держать процесс при остановке.
+    timer.unref?.();
+    this.albumBuffers.set(key, { parts, timer });
+  }
+
+  /** Склеивает накопленные части альбома в одно сообщение и пускает его в ход. */
+  private async flushAlbum(key: string, cfg: TgBotConfigRow): Promise<void> {
+    const entry = this.albumBuffers.get(key);
+    if (!entry) return;
+    this.albumBuffers.delete(key);
+    clearTimeout(entry.timer);
+
+    // Апдейты приезжают параллельно и не обязательно по порядку. Сортировка по
+    // message_id возвращает порядок отправки — иначе «первая таблица» в подписи
+    // указывала бы на случайный файл.
+    const parts = [...entry.parts].sort((a, b) => (a.message_id ?? 0) - (b.message_id ?? 0));
+    const head = parts[0];
+    // Подпись Telegram кладёт ровно на одну часть альбома, и какая это часть —
+    // зависит от клиента. Берём первую непустую, а не head.caption: иначе ход
+    // уходит как «файл без подписи» и задача теряется.
+    const caption = parts
+      .map(p => String(p.caption ?? p.text ?? ''))
+      .find(t => t.trim()) ?? '';
+
+    this.logger.log(`album ${key}: ${parts.length} частей, подпись ${caption ? 'есть' : 'нет'}`);
+    try {
+      await this.handleChatMessage({ ...head, caption, text: undefined, albumParts: parts }, cfg);
+    } catch (e: any) {
+      // Ход стартует из таймера, наверху ловить некому.
+      this.logger.error(`album ${key} failed: ${e?.message || e}\n${e?.stack}`);
+    }
+  }
+
   private async handleChatMessage(msg: any, cfgIn?: TgBotConfigRow): Promise<void> {
     const cfg = cfgIn ?? (await this.configs.getActiveByTgChatId(msg.chat.id));
     if (!cfg) return;
+
+    // Часть альбома — не самостоятельный ход: копим и обрабатываем всё вместе.
+    // albumParts значит «это уже склейка», её пропускаем дальше.
+    if (msg.media_group_id && !msg.albumParts) {
+      this.bufferAlbumPart(cfg, msg);
+      return;
+    }
 
     const isVoice = !!(msg.voice || msg.audio);
     let workingText: string = msg.text ?? msg.caption ?? '';
@@ -518,7 +599,9 @@ export class TgBotService implements OnModuleInit {
 
     // Если есть файлы но текста нет — даём LLM плейсхолдер, иначе будет early return.
     if (!workingText && attachments.length > 0) {
-      workingText = '(юзер прислал файл без подписи — разбери и прокомментируй)';
+      workingText = attachments.length > 1
+        ? `(юзер прислал ${attachments.length} файлов без подписи — разбери ВСЕ и прокомментируй)`
+        : '(юзер прислал файл без подписи — разбери и прокомментируй)';
     }
     if (!workingText) return;
 
@@ -963,7 +1046,7 @@ export class TgBotService implements OnModuleInit {
    * Разделители пути и управляющие символы срезаем — имя приходит из Telegram,
    * то есть снаружи.
    */
-  private workspaceFileName(originalName: string | null, ext: string, fileId: string): string {
+  private workspaceFileName(originalName: string | null, ext: string, fileUid: string): string {
     const raw = (originalName ?? '').split(/[\\/]/).pop() ?? '';
     const cleaned = raw.replace(/[\x00-\x1f]/g, '').replace(/\s+/g, '_').trim();
     if (cleaned && cleaned !== '.' && cleaned !== '..') {
@@ -972,30 +1055,48 @@ export class TgBotService implements OnModuleInit {
       return cleaned.slice(0, 120 - e.length) + e;
     }
     const safeExt = ext.replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'bin';
-    return `tg-${fileId.slice(0, 16)}.${safeExt}`;
+    // file_unique_id, а не префикс file_id: у фотографий из одного альбома
+    // первые 16 символов file_id совпадают (общий заголовок), и все кадры
+    // писались в ОДИН файл, затирая друг друга. В прод-логе 08.09.2026 два
+    // разных кадра (59546 и 70838 байт) легли в tg-AgACAgIAAxkBAAID.jpg в одну
+    // секунду. У фото своего имени нет, так что развести их больше нечем.
+    const safeUid = fileUid.replace(/[^a-z0-9_-]/gi, '').slice(0, 24) || 'file';
+    return `tg-${safeUid}.${safeExt}`;
   }
 
-  /** Скачиваем фото/документ с Telegram в рабочую папку чата. */
+  /**
+   * Скачиваем фото/документы сообщения в рабочую папку чата.
+   *
+   * У альбома части уже склеены в `albumParts` (см. flushAlbum) — идём по всем,
+   * иначе в модель уедет только первый файл из отправленных.
+   */
   private async downloadIncomingAttachments(msg: any, destDir: string): Promise<string[]> {
     const paths: string[] = [];
-    // photo — массив размеров; берём самый большой (последний)
-    if (Array.isArray(msg.photo) && msg.photo.length > 0) {
-      const largest = msg.photo[msg.photo.length - 1];
-      const p = await this.downloadOneFile(largest.file_id, largest.file_size, 'jpg', destDir, null);
-      if (p) paths.push(p);
-    }
-    if (msg.document) {
-      const d = msg.document;
-      // расширение из mime или из имени файла
-      const ext = this.guessExtension(d.mime_type, d.file_name);
-      const p = await this.downloadOneFile(d.file_id, d.file_size, ext, destDir, d.file_name ?? null);
-      if (p) paths.push(p);
+    for (const part of (msg.albumParts as any[] | undefined) ?? [msg]) {
+      // photo — массив размеров; берём самый большой (последний)
+      if (Array.isArray(part.photo) && part.photo.length > 0) {
+        const largest = part.photo[part.photo.length - 1];
+        const p = await this.downloadOneFile(
+          largest.file_id, largest.file_unique_id, largest.file_size, 'jpg', destDir, null,
+        );
+        if (p) paths.push(p);
+      }
+      if (part.document) {
+        const d = part.document;
+        // расширение из mime или из имени файла
+        const ext = this.guessExtension(d.mime_type, d.file_name);
+        const p = await this.downloadOneFile(
+          d.file_id, d.file_unique_id, d.file_size, ext, destDir, d.file_name ?? null,
+        );
+        if (p) paths.push(p);
+      }
     }
     return paths;
   }
 
   private async downloadOneFile(
     fileId: string,
+    fileUniqueId: string | undefined,
     fileSize: number | undefined,
     ext: string,
     destDir: string,
@@ -1010,7 +1111,7 @@ export class TgBotService implements OnModuleInit {
     const buf = await this.grammy.downloadFile(file.file_path);
     // Одноимённый файл перезаписываем: прислать файл с тем же именем — это
     // «вот новая версия», а не «заведи второй».
-    const p = path.join(destDir, this.workspaceFileName(originalName, ext, fileId));
+    const p = path.join(destDir, this.workspaceFileName(originalName, ext, fileUniqueId || fileId));
     fs.writeFileSync(p, buf);
     this.logger.log(`attachment saved: ${p} (${buf.length} bytes)`);
     return p;
