@@ -32,6 +32,14 @@ export class SecretsService {
   }
 
   decrypt(box: Buffer): Record<string, string> {
+    // Обрезанная коробка и без этой проверки не расшифруется, но упадёт
+    // сообщением «Invalid authentication tag length: 8» — из него не читается,
+    // что в базе лежит обрезок. Проверка про диагностику, не про стойкость.
+    if (box.length <= IV_LEN + TAG_LEN) {
+      throw new Error(
+        `шифротекст короче ${IV_LEN + TAG_LEN + 1} байт: коробка повреждена или не того формата`,
+      );
+    }
     const iv = box.subarray(0, IV_LEN);
     const tag = box.subarray(IV_LEN, IV_LEN + TAG_LEN);
     const d = crypto.createDecipheriv('aes-256-gcm', this.key(), iv);

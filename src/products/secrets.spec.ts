@@ -11,6 +11,18 @@ describe('SecretsService', () => {
     expect(svc.decrypt(box)).toEqual({ BOT_TOKEN: '123:abc' });
   });
 
+  it('формат коробки закреплён: iv 12 байт, тег 16, дальше тело', () => {
+    // Правка любой из констант делает все уже лежащие в базе секреты
+    // нерасшифровываемыми, и без этой проверки ни один тест не заметит:
+    // шифрование и расшифровка поменяются согласованно и роундтрип пройдёт.
+    const svc = new SecretsService({ get: () => KEY } as any);
+    const payload = { A: '1' };
+
+    const box = svc.encrypt(payload);
+
+    expect(box.length).toBe(12 + 16 + Buffer.byteLength(JSON.stringify(payload), 'utf8'));
+  });
+
   it('два шифрования одного и того же дают разный шифротекст', () => {
     // Одинаковый шифротекст означал бы фиксированный iv: по базе стало бы
     // видно, у каких продуктов совпадают секреты.
@@ -48,6 +60,16 @@ describe('SecretsService', () => {
       box[i] ^= 0xff;
       expect(() => svc.decrypt(box)).toThrow();
     }
+  });
+
+  it('обрезанная коробка отвергается с внятной причиной', () => {
+    // Обрезок в bytea и без проверки не расшифруется, но сообщение будет
+    // «Invalid authentication tag length: 8» — измерено, причина по нему не
+    // читается. Проверка про диагностику: тихого пути тут и так нет.
+    const svc = new SecretsService({ get: () => KEY } as any);
+    const box = svc.encrypt({ A: '1' });
+
+    expect(() => svc.decrypt(box.subarray(0, 20))).toThrow(/повреждена или не того формата/);
   });
 
   it('без ключа в окружении шифрование отказывает громко', () => {
