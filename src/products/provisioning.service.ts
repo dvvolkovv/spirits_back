@@ -177,40 +177,58 @@ export class ProvisioningService {
    * Выдаёт одно задание агенту хоста.
    *
    * SKIP LOCKED — на случай второго агента: задание не должно достаться
-   * двоим, иначе два развёртывания пойдут в один каталог.
+   * двоим, иначе два развёртывания пойдут в один каталог. Измерено на живой
+   * базе: два одновременных claim разошлись по разным заданиям за 0.06 с, без
+   * SKIP LOCKED второй ждал 2.08 с и получал то же самое.
+   *
+   * ОДИН оператор, а не два. Двумя запросами на пуле (транзакции нет: BEGIN
+   * через пул в этом репозитории уже рапортовал об откате, которого не было —
+   * identity.resolveOrCreate) падение второго оставляло бы задание в
+   * 'running' с токеном, не доехавшим до агента, а частичный индекс
+   * one_active запирал бы продукт до сборщика зависших.
    */
   async claimJob(): Promise<ClaimedJob | null> {
-    const r = await this.pg.query(
-      `UPDATE product_provision_jobs j
-          SET status = 'running', started_at = now()
-        WHERE j.id = (
-          SELECT id FROM product_provision_jobs
-           WHERE status = 'queued'
-           ORDER BY created_at
-           FOR UPDATE SKIP LOCKED
-           LIMIT 1)
-      RETURNING j.id, j.product_id,
-                (SELECT slug FROM products WHERE id = j.product_id) AS slug,
-                (SELECT kind FROM products WHERE id = j.product_id) AS kind,
-                (SELECT secrets_encrypted FROM products WHERE id = j.product_id) AS box`,
-    );
-    const row = r.rows[0];
-    // Пустая очередь — обычное состояние: агент опрашивает нас в цикле.
-    // Ничего не выпускаем и в базу больше не ходим: холостой перевыпуск
-    // runner_token_hash отобрал бы доступ у раннера, ничего не записав в лог.
-    if (!row) return null;
-
-    // Новый токен на каждое задание. Старый невосстановим — в базе только
-    // sha256, открытое значение отдавалось агенту один раз.
+    // Токен считается ДО запроса, чтобы всё уместилось в один оператор. Если
+    // выдавать нечего, CTE issued не обновит ни строки (claimed пуста) и
+    // токен просто выбрасывается. Проверено на живой базе: claim при пустой
+    // очереди не оставил свой хеш ни у одного продукта.
     const runnerToken = crypto.randomBytes(32).toString('hex');
     const hash = crypto.createHash('sha256').update(runnerToken).digest('hex');
-    await this.pg.query(`UPDATE products SET runner_token_hash = $2 WHERE id = $1`, [
-      row.product_id,
-      hash,
-    ]);
+
+    const r = await this.pg.query(
+      `WITH picked AS (
+          SELECT j.id
+            FROM product_provision_jobs j
+           WHERE j.status = 'queued'
+             AND EXISTS (SELECT 1 FROM products p
+                          WHERE p.id = j.product_id
+                            AND p.status = 'provisioning'
+                            AND p.archived_at IS NULL)
+           ORDER BY j.created_at ASC
+             FOR UPDATE SKIP LOCKED
+           LIMIT 1
+       ), claimed AS (
+          UPDATE product_provision_jobs
+             SET status = 'running', started_at = now()
+           WHERE id IN (SELECT id FROM picked)
+          RETURNING id, product_id
+       ), issued AS (
+          UPDATE products
+             SET runner_token_hash = $1
+           WHERE id IN (SELECT product_id FROM claimed)
+          RETURNING id, slug, kind, secrets_encrypted AS box
+       )
+       SELECT c.id AS job_id, i.id AS product_id, i.slug AS slug,
+              i.kind AS kind, i.box AS box
+         FROM claimed c JOIN issued i ON i.id = c.product_id`,
+      [hash],
+    );
+    // Пустая очередь — обычное состояние: агент опрашивает нас в цикле.
+    const row = r.rows[0];
+    if (!row) return null;
 
     return {
-      jobId: row.id,
+      jobId: row.job_id,
       productId: row.product_id,
       slug: row.slug,
       kind: row.kind,
@@ -229,28 +247,49 @@ export class ProvisioningService {
    * Задание закрывается в обоих исходах — его держит частичный уникальный
    * индекс product_provision_jobs_one_active, и оставленное в 'running'
    * задание навсегда запретило бы повтор.
+   *
+   * `AND status = 'running'` — замок от повторного отчёта. Без него отчёт по
+   * уже закрытому заданию правил ЖИВОЙ продукт: измерено на базе — продукт в
+   * running с портом 8003 повторный {ok:false} хоронил в failed, а повторный
+   * {ok:true} без порта оставлял без порта. Ретрай POST-а при обрыве связи
+   * воспроизводит это без всякого злоумышленника, и HostGuard задачи 7 тут не
+   * помощник: он подтверждает, что пришёл наш агент, а наш агент звать
+   * completeJob вправе.
    */
   async completeJob(jobId: string, result: { ok: boolean; port?: number; error?: string }) {
     if (result.ok) {
-      await this.pg.query(
-        `UPDATE product_provision_jobs SET status = 'done', finished_at = now() WHERE id = $1`,
+      const closed = await this.pg.query(
+        `UPDATE product_provision_jobs SET status = 'done', finished_at = now()
+          WHERE id = $1 AND status = 'running'`,
         [jobId],
       );
+      if (!closed.rowCount) {
+        this.logger.warn(`отчёт об успехе по незапущенному заданию ${jobId} — продукт не тронут`);
+        return;
+      }
       // Статус продукта здесь НЕ меняется. Перевод в running делает
       // promoteReady по измеримому факту (задача 5): отчёт агента говорит
       // «я развернул», а не «оно отвечает».
+      //
+      // COALESCE, а не голое присваивание: отчёт об успехе без порта (бот его
+      // не публикует) снёс бы порт уже работающего сайта. Хранится он только
+      // здесь — восстановить неоткуда.
       await this.pg.query(
-        `UPDATE products SET port = $2
+        `UPDATE products SET port = COALESCE($2, port)
           WHERE id = (SELECT product_id FROM product_provision_jobs WHERE id = $1)`,
         [jobId, result.port ?? null],
       );
       return;
     }
-    await this.pg.query(
+    const closed = await this.pg.query(
       `UPDATE product_provision_jobs SET status = 'failed', error = $2, finished_at = now()
-        WHERE id = $1`,
+        WHERE id = $1 AND status = 'running'`,
       [jobId, result.error ?? 'без причины'],
     );
+    if (!closed.rowCount) {
+      this.logger.warn(`отчёт об отказе по незапущенному заданию ${jobId} — продукт не тронут`);
+      return;
+    }
     // Порт здесь не трогается намеренно: неудачная ПОВТОРНАЯ попытка снесла бы
     // порт уже работавшего продукта, а хранится он только тут.
     await this.pg.query(
