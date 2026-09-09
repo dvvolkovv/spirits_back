@@ -71,6 +71,7 @@ export class TurnsService implements OnModuleInit, OnModuleDestroy {
   onModuleInit() {
     this.reaper = setInterval(() => {
       this.reapStuck().catch((e) => this.logger.error(`reapStuck failed: ${e.message}`));
+      this.markStaleRunners().catch((e) => this.logger.error(`markStaleRunners failed: ${e.message}`));
     }, 5 * 60 * 1000);
     // unref, иначе таймер держит процесс и jest не завершается.
     this.reaper.unref();
@@ -121,6 +122,42 @@ export class TurnsService implements OnModuleInit, OnModuleDestroy {
     );
     if (r.rows.length) {
       this.logger.warn(`reapStuck: снято ${r.rows.length} зависших ходов`);
+    }
+    return r.rows.length;
+  }
+
+  /**
+   * Помечает `degraded` продукты, чей раннер перестал отмечаться.
+   *
+   * Без этого статус `degraded` был тупиком наоборот: `touchRunner` умел его
+   * снимать, а выставить его было некому — комментарий там ссылался на
+   * мониторинг, которого не существовало.
+   *
+   * Отказ здесь молчаливый и оттого опасный: сайт продукта продолжает
+   * отвечать, в кабинете всё зелёное, а задачи просто не забираются. Клиент
+   * отправляет правку и ждёт неизвестно чего. Видимым это делает только
+   * `runner_seen_at`, который писался, но никем не читался.
+   *
+   * Порог 5 минут при опросе раз в 35 секунд: раннер успевает промахнуться
+   * восьмикратно, прежде чем его объявят мёртвым. Короче ставить нельзя —
+   * одна потерянная сеть выдала бы ложную тревогу.
+   *
+   * Трогаем только `running`: `stopped` и `archived` — решение владельца, и
+   * мониторинг не вправе их переписывать.
+   */
+  async markStaleRunners(): Promise<number> {
+    const r = await this.pg.query(
+      `UPDATE products
+          SET status = 'degraded'
+        WHERE status = 'running'
+          AND runner_seen_at IS NOT NULL
+          AND runner_seen_at < now() - interval '5 minutes'
+        RETURNING slug`,
+    );
+    if (r.rows.length) {
+      this.logger.warn(
+        `раннер молчит дольше 5 минут: ${r.rows.map((x: any) => x.slug).join(', ')} — задачи не забираются`,
+      );
     }
     return r.rows.length;
   }

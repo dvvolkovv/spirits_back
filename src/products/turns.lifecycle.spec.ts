@@ -244,3 +244,46 @@ describe('TurnsService.history', () => {
     expect(calls[0].sql).toContain('revert_to_sha');
   });
 });
+
+describe('TurnsService.markStaleRunners', () => {
+  // До этого метода статус degraded был тупиком наоборот: touchRunner умел его
+  // снимать, а выставить было некому. Мёртвый раннер выглядел здоровым — сайт
+  // отвечает, кабинет зелёный, задачи просто не забираются.
+  it('помечает degraded только running и только по протухшему heartbeat', async () => {
+    const { svc, calls } = makeService();
+
+    await svc.markStaleRunners();
+
+    const sql = sqlOf(calls);
+    // Каждое утверждение отдельно: одно общее совпадение по куску SQL прошло бы
+    // и при снятом сторожe статуса, и при отсутствии порога.
+    expect(sql).toContain("SET status = 'degraded'");
+    expect(sql).toContain("status = 'running'");
+    expect(sql).toContain('runner_seen_at IS NOT NULL');
+    expect(sql).toContain("runner_seen_at < now() - interval '5 minutes'");
+  });
+
+  it('продукт, ни разу не отметившийся, мёртвым не считается', async () => {
+    // runner_seen_at IS NULL — это «раннер ещё не поднимался», а не «умер».
+    // Без этого условия каждый только что заведённый продукт немедленно
+    // уезжал бы в degraded и переставал получать работу.
+    const { svc, calls } = makeService();
+
+    await svc.markStaleRunners();
+
+    expect(sqlOf(calls)).toContain('runner_seen_at IS NOT NULL');
+  });
+
+  it('возвращает число помеченных', async () => {
+    const calls: any[] = [];
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        calls.push(sql);
+        return { rows: [{ slug: 'a' }, { slug: 'b' }], rowCount: 2 };
+      }),
+    };
+    const svc = new TurnsService(pg as any, {} as any);
+
+    expect(await svc.markStaleRunners()).toBe(2);
+  });
+});
