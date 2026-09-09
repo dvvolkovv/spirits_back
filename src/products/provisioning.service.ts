@@ -54,9 +54,39 @@ const CHECKOUT_PATH = '/product';
 const PUBLIC_ZONE = 'p.linkeon.io';
 
 // Проба существует ради адресов, которые НЕ отвечают, поэтому свой срок
-// обязателен: на дефолтах undici чёрная дыра держит соединение дольше, чем
-// длится оборот таймера, и следующий оборот наезжает на предыдущий.
+// обязателен: на дефолтах undici чёрная дыра держит соединение неопределённо
+// долго. Срок ограничивает ОДНУ пробу; от наложения оборотов защищает флаг
+// занятости в tick(), потому что продукты обходятся последовательно и семи
+// чёрных дыр хватает, чтобы перерасти период таймера.
 const PROBE_TIMEOUT_MS = 5000;
+
+/**
+ * За сколько отметка раннера протухает.
+ *
+ * `runner_seen_at IS NOT NULL` означает «когда-нибудь выходил на связь», а не
+ * «на связи». Разница смертельна ровно в штатном ходе повтора: claimJob
+ * поворачивает runner_token_hash, старый раннер после этого не может
+ * аутентифицироваться и отметку не двигает — а прошлое значение остаётся в
+ * строке навсегда. Измерено: отметка девятидневной давности плюс ответ 200 от
+ * старой версии сайта объявляли продукт рабочим, хотя новый раннер не
+ * поднялся и ходы уезжали в никого.
+ *
+ * Порог считан с раннера, а не выбран на глаз: POLL_INTERVAL_MS=3000,
+ * DEFAULT_POLL_TIMEOUT_MS=35000 (product-runner/src/config.ts), а сама запись
+ * отметки в turns.touchRunner загрублена до одного раза в 30 секунд. Худший
+ * случай живого раннера — около 70 секунд тишины, и там же прямо записано
+ * требование «порог обязан быть заметно больше 30 секунд». Две минуты дают
+ * запас почти вдвое и не дают продукту мигать между статусами.
+ */
+const HEARTBEAT_FRESH_MS = 2 * 60 * 1000;
+
+// Срок на всё заведение. Одно число на четыре запроса и обе формулировки
+// причины. В тексте «мин», а не «минут»: при смене числа русская форма
+// множественного числа поехала бы (2 минуты, 21 минута), а сокращение
+// неизменяемо.
+const PROVISION_DEADLINE_MIN = 10;
+const DEADLINE_SQL = `interval '${PROVISION_DEADLINE_MIN} minutes'`;
+const HEARTBEAT_FRESH_SQL = `interval '${HEARTBEAT_FRESH_MS / 1000} seconds'`;
 
 @Injectable()
 export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
@@ -77,13 +107,45 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    */
   onModuleInit() {
     this.promoter = setInterval(() => {
-      this.promoteReady().catch((e) => this.logger.error(`promoteReady failed: ${e.message}`));
-      this.failStaleProvisioning().catch((e) =>
-        this.logger.error(`failStaleProvisioning failed: ${e.message}`),
-      );
+      void this.tick();
     }, 30 * 1000);
     // unref, иначе таймер держит процесс и jest не завершается.
     this.promoter.unref();
+  }
+
+  /**
+   * Один оборот. Два метода идут ПОСЛЕДОВАТЕЛЬНО, и оборот не наезжает на
+   * предыдущий.
+   *
+   * Без await между ними таймаут работал параллельно пробе: пока promoteReady
+   * ждал ответа сайта, failStaleProvisioning хоронил тот же продукт, а
+   * вернувшаяся проба воскрешала его в running — причина затёрта, а в логе
+   * оставалось «провижининг просрочен» про продукт, который числится рабочим.
+   * Запись теперь сверяет состояние сама (см. promoteReady), но и порядок
+   * незачем оставлять случайным.
+   *
+   * Флаг занятости — потому что продукты обходятся последовательно, а каждая
+   * проба может занять до PROBE_TIMEOUT_MS: семи заводящихся сайтов с чёрной
+   * дырой в DNS хватает, чтобы оборот перерос период таймера.
+   */
+  private ticking = false;
+
+  private async tick(): Promise<void> {
+    if (this.ticking) {
+      this.logger.debug('оборот провижининга ещё идёт — пропускаю такт');
+      return;
+    }
+    this.ticking = true;
+    try {
+      await this.promoteReady().catch((e) =>
+        this.logger.error(`promoteReady failed: ${e.message}`),
+      );
+      await this.failStaleProvisioning().catch((e) =>
+        this.logger.error(`failStaleProvisioning failed: ${e.message}`),
+      );
+    } finally {
+      this.ticking = false;
+    }
   }
 
   onModuleDestroy() {
@@ -380,15 +442,37 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     let promoted = 0;
     for (const p of r.rows) {
       // Раннер молчит — внутри контейнера некому принимать ходы, и продукт в
-      // running был бы витриной без начинки.
-      if (!p.runner_seen_at) continue;
+      // running был бы витриной без начинки. Проверяется СВЕЖЕСТЬ отметки, а
+      // не её наличие: см. HEARTBEAT_FRESH_MS.
+      if (!this.heartbeatFresh(p.runner_seen_at)) continue;
       try {
         if (p.kind === 'site' && !(await this.answers(p.slug))) continue;
-        await this.pg.query(
-          `UPDATE products SET status = 'running', provision_error = NULL WHERE id = $1`,
+        // Условия отбора повторены В ЗАПИСИ. Выборка выше проверила их за
+        // 0–5 секунд до этой строки — ровно на длину пробы, и всё это время
+        // состояние продукта мог менять кто угодно. Измерено на PostgreSQL 16,
+        // три исхода незащищённой записи:
+        //   - «повторить» нажато во время пробы: продукт уезжает в running,
+        //     claimJob перестаёт видеть задание, через 10 минут таймаут
+        //     оставляет running и provision_error NULL. Тот самый тупик,
+        //     воспроизведённый поверх коммита, который его закрывал;
+        //   - таймаут похоронил продукт во время пробы: похороненный
+        //     воскресает в running, причина затёрта;
+        //   - продукт архивирован во время пробы: archived_at выставлен,
+        //     статус running.
+        // Гонки с пользователем для второго исхода даже не нужно: раньше оба
+        // метода звались из одного такта без await между собой.
+        const w = await this.pg.query(
+          `UPDATE products SET status = 'running', provision_error = NULL
+            WHERE id = $1 AND status = 'provisioning' AND archived_at IS NULL
+              AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
+                               WHERE j.product_id = products.id
+                                 AND j.status IN ('queued','running'))`,
           [p.id],
         );
-        promoted++;
+        // Счётчик от rowCount, а не безусловный: иначе метод рапортует о
+        // переводах, которых не было, и первый же признак того, что защита
+        // сработала, теряется.
+        promoted += w.rowCount ?? 0;
       } catch (e: any) {
         // Именно по продукту, а не на весь оборот: один битый продукт иначе
         // запирает в provisioning всю очередь — та самая форма молчаливого
@@ -397,6 +481,14 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       }
     }
     return promoted;
+  }
+
+  /** «На связи», а не «когда-нибудь выходил на связь». См. HEARTBEAT_FRESH_MS. */
+  private heartbeatFresh(seenAt: Date | string | null): boolean {
+    if (!seenAt) return false;
+    const ts = new Date(seenAt).getTime();
+    if (Number.isNaN(ts)) return false;
+    return Date.now() - ts <= HEARTBEAT_FRESH_MS;
   }
 
   /**
@@ -437,14 +529,22 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       `WITH stale AS (
          UPDATE product_provision_jobs
             SET status = 'failed',
-                error = 'заведение не уложилось в 10 минут',
+                error = 'срок заведения истёк (${PROVISION_DEADLINE_MIN} мин)',
                 finished_at = now()
           WHERE status IN ('queued','running')
-            AND COALESCE(started_at, created_at) < now() - interval '10 minutes'
+            AND COALESCE(started_at, created_at) < now() - ${DEADLINE_SQL}
          RETURNING product_id)
        UPDATE products p
           SET status = 'failed',
-              provision_error = 'заведение не уложилось в 10 минут'
+              -- Причина различается по тому, на связи ли раннер. Продукт,
+              -- который ОТВЕЧАЕТ, с надписью «не уложился в срок» — это
+              -- владелец, видящий рабочий сайт и текст про таймаут. Если
+              -- раннер жив, правда другая: агент не закрыл задание.
+              provision_error = CASE
+                WHEN p.runner_seen_at > now() - ${HEARTBEAT_FRESH_SQL}
+                  THEN 'агент не отчитался о завершении заведения (срок ${PROVISION_DEADLINE_MIN} мин)'
+                ELSE 'срок заведения истёк (${PROVISION_DEADLINE_MIN} мин)'
+              END
          FROM stale
         WHERE p.id = stale.product_id AND p.status = 'provisioning'
        RETURNING p.slug`,
@@ -468,13 +568,17 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     const silent = await this.pg.query(
       `UPDATE products p
           SET status = 'failed',
-              provision_error = 'заведение не уложилось в 10 минут: задание закрыто, продукт не ожил'
+              provision_error = CASE
+                WHEN p.runner_seen_at > now() - ${HEARTBEAT_FRESH_SQL}
+                  THEN 'задание закрыто, раннер на связи, но публичный адрес не отвечает'
+                ELSE 'задание закрыто, продукт не ожил: раннер не выходит на связь'
+              END
         WHERE p.status = 'provisioning' AND p.archived_at IS NULL
           AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
                            WHERE j.product_id = p.id AND j.status IN ('queued','running'))
           AND COALESCE((SELECT max(COALESCE(j.started_at, j.created_at))
                           FROM product_provision_jobs j WHERE j.product_id = p.id),
-                       p.created_at) < now() - interval '10 minutes'
+                       p.created_at) < now() - ${DEADLINE_SQL}
        RETURNING p.slug`,
     );
 

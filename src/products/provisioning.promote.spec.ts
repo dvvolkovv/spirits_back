@@ -19,7 +19,12 @@ type Call = { sql: string; params: any[] };
 function makeService(
   rows: any[],
   fetchImpl?: any,
-  over: { stale?: any[]; silent?: any[]; onUpdate?: (c: Call) => void } = {},
+  over: {
+    stale?: any[];
+    silent?: any[];
+    updateRowCount?: number;
+    onUpdate?: (c: Call) => void;
+  } = {},
 ) {
   const calls: Call[] = [];
   const pg = {
@@ -31,8 +36,9 @@ function makeService(
       over.onUpdate?.({ sql, params });
       // `over.silent` заполняют только тесты, зовущие failStaleProvisioning в
       // одиночку, — там UPDATE может быть только вторым запросом таймаута.
-      // Перевод в running возврата не читает вовсе.
-      return { rows: over.silent ?? [], rowCount: (over.silent ?? []).length };
+      // rowCount по умолчанию 1: перевод в running читает именно его, и
+      // подстановка нуля означала бы «запись никого не нашла».
+      return { rows: over.silent ?? [], rowCount: over.updateRowCount ?? 1 };
     }),
   };
   const svc = new ProvisioningService(pg as any, {} as any);
@@ -70,6 +76,44 @@ describe('ProvisioningService.promoteReady', () => {
     expect(promotions(calls)).toEqual([]);
   });
 
+  it('протухший heartbeat связью не считается', async () => {
+    // Штатный ход повтора: claimJob повернул runner_token_hash, старый раннер
+    // аутентифицироваться больше не может и отметку не двигает, а прошлое
+    // значение остаётся в строке навсегда. Старая версия сайта при этом
+    // отвечает 200. Измерено: продукт объявлялся рабочим, хотя новый раннер
+    // не поднялся и ходы уезжали в никого.
+    const { svc, calls } = makeService([
+      site({ runner_seen_at: new Date(Date.now() - 9 * 24 * 3600 * 1000) }),
+    ]);
+
+    await expect(svc.promoteReady()).resolves.toBe(0);
+
+    expect(promotions(calls)).toEqual([]);
+  });
+
+  it('heartbeat минутной давности ещё считается связью', async () => {
+    // Порог не может быть тесным: запись отметки в turns.touchRunner
+    // загрублена до одного раза в 30 секунд, long-poll держится до 35 секунд.
+    // Убивает порог в 30 секунд — с ним живой продукт мигал бы.
+    const { svc, calls } = makeService([site({ runner_seen_at: new Date(Date.now() - 60_000) })]);
+
+    await svc.promoteReady();
+
+    expect(promotions(calls)).toHaveLength(1);
+  });
+
+  it('heartbeat пятиминутной давности связью не считается', async () => {
+    // Убивает разболтанный порог (час, сутки): пять минут молчания — это уже
+    // мёртвый раннер, а не пауза между опросами.
+    const { svc, calls } = makeService([
+      site({ runner_seen_at: new Date(Date.now() - 5 * 60_000) }),
+    ]);
+
+    await svc.promoteReady();
+
+    expect(promotions(calls)).toEqual([]);
+  });
+
   it('сайт с heartbeat, но не отвечающий, не переводится', async () => {
     // Иначе продукт объявляется рабочим, не отвечая: ровно то, что мы
     // ловили сверкой sha в куске 1.
@@ -88,6 +132,35 @@ describe('ProvisioningService.promoteReady', () => {
     // Параметр пришпилен позиционно: подстановка слага вместо id или сдвиг
     // на $2 иначе прошли бы зелёными.
     expect(promotions(calls).map((c) => c.params)).toEqual([['p-1']]);
+  });
+
+  it('запись сверяет состояние сама, а не полагается на выборку', async () => {
+    // Между выборкой и записью проходит вся проба — до PROBE_TIMEOUT_MS, и
+    // всё это время состояние продукта может поменять кто угодно. Измерено на
+    // PostgreSQL 16, три исхода незащищённой записи: «повторить» во время
+    // пробы уводит продукт в running и задание не выдаётся уже никогда;
+    // таймаут во время пробы хоронит продукт, а вернувшаяся проба воскрешает
+    // его с затёртой причиной; архивация во время пробы даёт archived_at при
+    // статусе running.
+    const { svc, calls } = makeService([site()]);
+
+    await svc.promoteReady();
+
+    const sql = promotions(calls)[0].sql;
+    expect(sql).toMatch(/status\s*=\s*'provisioning'/);
+    expect(sql).toMatch(/archived_at\s+IS\s+NULL/i);
+    expect(sql).toMatch(/NOT\s+EXISTS/i);
+    expect(sql).toMatch(/j\.product_id\s*=\s*products\.id/);
+    expect(sql).toMatch(/j\.status\s+IN\s*\('queued','running'\)/);
+  });
+
+  it('не засчитывает перевод, которого не было', async () => {
+    // rowCount = 0 означает, что защита в записи сработала: состояние успело
+    // измениться. Безусловный promoted++ рапортовал бы об оживших продуктах,
+    // которых нет, и первый признак срабатывания защиты пропал бы.
+    const { svc } = makeService([site()], undefined, { updateRowCount: 0 });
+
+    await expect(svc.promoteReady()).resolves.toBe(0);
   });
 
   it('перевод снимает причину прошлого отказа', async () => {
@@ -317,6 +390,44 @@ describe('ProvisioningService.failStaleProvisioning', () => {
     expect(sql).toMatch(/max\(COALESCE\(j\.started_at,\s*j\.created_at\)\)/);
     expect(sql).toMatch(/interval\s*'10 minutes'/);
     expect(sql).toMatch(/archived_at\s+IS\s+NULL/i);
+    // Утверждение из первой ветки, перенесённое сюда: срок считается по
+    // заданию, а p.created_at — только фолбэк.
+    expect(sql).not.toMatch(/p\.created_at\s*</);
+    // И именно ВТОРЫМ операндом COALESCE. Перестановка местами — не описка:
+    // измерено, что с ней повтор девятидневного продукта хоронится через
+    // десять секунд после закрытия задания. Сам фолбэк снимать тоже нельзя —
+    // измерено, что без него продукт без задания не хоронится никогда
+    // (99 минут в provisioning).
+    expect(sql).toMatch(
+      /COALESCE\(\(SELECT max\(COALESCE\(j\.started_at,\s*j\.created_at\)\)[\s\S]*?\),\s*p\.created_at\)/,
+    );
+  });
+
+  it('причина отличает молчащий раннер от неотчитавшегося агента', async () => {
+    // Продукт, который ОТВЕЧАЕТ, с надписью «не уложился в срок» — это
+    // владелец, видящий рабочий сайт и текст про таймаут. Если раннер на
+    // связи, правда другая, и написать надо её.
+    const { svc, calls } = makeService([]);
+
+    await svc.failStaleProvisioning();
+
+    for (const sql of [staleQuery(calls).sql, silentQuery(calls).sql]) {
+      expect(sql).toMatch(/CASE[\s\S]*WHEN\s+p\.runner_seen_at\s*>\s*now\(\)\s*-/i);
+      expect(sql).toMatch(/ELSE/i);
+    }
+    // Тексты в двух ветках CASE обязаны РАЗЛИЧАТЬСЯ, иначе CASE — декорация.
+    //
+    // Достаются ИМЕННО операнды THEN и ELSE. Первая редакция этой проверки
+    // собирала все строки в кавычках регуляркой /'([^']{20,})'/g и была
+    // ложно-зелёной: кавычки в SQL спариваются как 1-я со 2-й, 3-я с 4-й, и
+    // регулярка вырезала куски КОДА между литералами, а не сами литералы.
+    // Мутация «сделать оба текста одинаковыми» её пережила.
+    for (const sql of [staleQuery(calls).sql, silentQuery(calls).sql]) {
+      const m = sql.match(/THEN\s+'([^']+)'\s*\n?\s*ELSE\s+'([^']+)'/);
+      expect(m).not.toBeNull();
+      expect(m![1]).not.toBe(m![2]);
+      expect(m![1].length).toBeGreaterThan(10);
+    }
   });
 
   it('оба запроса таймаута уходят даже когда хоронить нечего', async () => {
@@ -387,36 +498,83 @@ describe('проводка таймера', () => {
     jest.useRealTimers();
   });
 
-  it('таймер зовёт и перевод в running, и таймаут', () => {
+  /** Оборот асинхронный: между двумя методами стоит await. */
+  const flush = async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  };
+  const turn = async (n = 1) => {
+    for (let i = 0; i < n; i++) {
+      jest.advanceTimersByTime(30_000);
+      await flush();
+    }
+  };
+
+  it('таймер зовёт и перевод в running, и таймаут', async () => {
     svc.onModuleInit();
-    jest.advanceTimersByTime(30_000);
+    await turn();
 
     expect(promote).toHaveBeenCalled();
     expect(stale).toHaveBeenCalled();
   });
 
-  it('зовёт на каждом обороте, а не однажды', () => {
+  it('зовёт на каждом обороте, а не однажды', async () => {
     // Убивает «позвать один раз в onModuleInit»: заведение оживало бы только
     // у тех, кто успел к старту процесса.
     svc.onModuleInit();
-    jest.advanceTimersByTime(90_000);
+    await turn(3);
 
     expect(promote).toHaveBeenCalledTimes(3);
     expect(stale).toHaveBeenCalledTimes(3);
   });
 
-  it('оборот не чаще чем раз в 30 секунд', () => {
+  it('оборот не чаще чем раз в 30 секунд', async () => {
     // Убивает разгон интервала: проба ходит наружу по каждому сайту.
     svc.onModuleInit();
     jest.advanceTimersByTime(29_999);
+    await flush();
 
     expect(promote).not.toHaveBeenCalled();
   });
 
-  it('остановка гасит таймер', () => {
+  it('оборот не наезжает на предыдущий', async () => {
+    // PROBE_TIMEOUT_MS ограничивает ОДНУ пробу, а продукты обходятся
+    // последовательно: семи заводящихся сайтов с чёрной дырой в DNS хватает,
+    // чтобы оборот перерос период таймера. Здесь предыдущий оборот не
+    // завершён (микрозадачи не сливались), и такты обязаны пропускаться.
+    svc.onModuleInit();
+    jest.advanceTimersByTime(90_000);
+    await flush();
+
+    expect(promote).toHaveBeenCalledTimes(1);
+  });
+
+  it('после долгого оборота такты возобновляются', async () => {
+    // Обратная сторона флага занятости: если его забыть снять, таймер умрёт
+    // навсегда и молча — тупик той же формы, что и весь этот файл.
+    svc.onModuleInit();
+    jest.advanceTimersByTime(90_000);
+    await flush();
+    await turn();
+
+    expect(promote).toHaveBeenCalledTimes(2);
+  });
+
+  it('оборот возобновляется и после падения', async () => {
+    // Отпускать флаг обязан finally: без него первая же ошибка базы
+    // останавливала бы провижининг до перезапуска процесса.
+    promote.mockRejectedValue(new Error('pg down'));
+    jest.spyOn((svc as any).logger, 'error').mockImplementation(() => undefined);
+
+    svc.onModuleInit();
+    await turn(2);
+
+    expect(promote).toHaveBeenCalledTimes(2);
+  });
+
+  it('остановка гасит таймер', async () => {
     svc.onModuleInit();
     svc.onModuleDestroy();
-    jest.advanceTimersByTime(120_000);
+    await turn(4);
 
     expect(promote).not.toHaveBeenCalled();
   });
@@ -426,11 +584,31 @@ describe('проводка таймера', () => {
     const err = jest.spyOn((svc as any).logger, 'error').mockImplementation(() => undefined);
 
     svc.onModuleInit();
-    jest.advanceTimersByTime(30_000);
-    await Promise.resolve();
-    await Promise.resolve();
+    await turn();
 
     expect(stale).toHaveBeenCalled();
     expect(err).toHaveBeenCalled();
+  });
+
+  it('таймаут идёт ПОСЛЕ перевода, а не параллельно ему', async () => {
+    // Без await между ними таймаут работал одновременно с пробой: пока
+    // promoteReady ждал ответа сайта, failStaleProvisioning хоронил тот же
+    // продукт. Порядок незачем оставлять случайным.
+    const order: string[] = [];
+    promote.mockImplementation(async () => {
+      order.push('promote:start');
+      await Promise.resolve();
+      order.push('promote:end');
+      return 0;
+    });
+    stale.mockImplementation(async () => {
+      order.push('stale:start');
+      return 0;
+    });
+
+    svc.onModuleInit();
+    await turn();
+
+    expect(order).toEqual(['promote:start', 'promote:end', 'stale:start']);
   });
 });
