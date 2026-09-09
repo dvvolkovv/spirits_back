@@ -71,6 +71,15 @@ describe('AttendeeClient', () => {
       // Записи не храним: транскрипт ведём сами, а видео переговоров клиента
       // в чужом хранилище — лишняя утечка. По умолчанию Attendee пишет mp4.
       expect(body.recording_settings).toEqual({ format: 'none' });
+      // Правила выхода — наши. Дефолт Attendee «один в встрече 60 секунд →
+      // ухожу» 09.09.2026 оборвал живую встречу на 95-й секунде и назвал
+      // причину сам, вместо нас. Наш выход по опустевшей встрече идёт по
+      // событию, эти таймеры — запас.
+      expect(body.automatic_leave_settings).toEqual({
+        only_participant_in_meeting_timeout_seconds: 300,
+        silence_timeout_seconds: 1800,
+        max_uptime_seconds: 7500,
+      });
       expect(body.webhooks[0].triggers).toEqual([
         'bot.state_change',
         'participant_events.join_leave',
