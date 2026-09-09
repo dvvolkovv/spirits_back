@@ -348,9 +348,34 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    * они у нас уже дважды.
    */
   async promoteReady(): Promise<number> {
+    // NOT EXISTS — не осторожность, а замок. Измерено на PostgreSQL 16
+    // (promotescratch на тестовой ноде), сценарий «повторить» поверх
+    // РАБОТАЮЩЕГО сайта:
+    //   1. retry ставит продукту provisioning и кладёт задание в очередь;
+    //   2. ближайший тик видит живой heartbeat СТАРОГО раннера и ответ 200 от
+    //      СТАРОЙ версии сайта — и возвращает продукт в running;
+    //   3. claimJob требует p.status = 'provisioning', и задание после этого
+    //      не выдаётся никому и никогда (замерено: выборка выдачи пуста);
+    //   4. через десять минут таймаут хоронит задание, но продукт правит
+    //      только при p.status = 'provisioning' — а он running. Замерено:
+    //      RETURNING пуст, значит и строки в логе нет, provision_error NULL.
+    // Итог: кнопка нажата, ничего не произошло, ошибки нет нигде.
+    //
+    // Пока задание не закрыто, «отвечает» означает СТАРУЮ версию, а не
+    // результат заведения. Та же ошибка, что в куске 1, где health-check
+    // опрашивал осиротевший процесс от прошлой версии и объявлял выкат
+    // удачным.
+    //
+    // Первичное заведение это не ломает — замерено там же: продукт с
+    // заданием в done выборкой берётся. Порядок получается ровно нужный:
+    // агент отчитался -> задание закрыто -> ближайший тик увидел heartbeat и
+    // ответ -> перевод.
     const r = await this.pg.query(
       `SELECT id, slug, kind, runner_seen_at FROM products
-        WHERE status = 'provisioning' AND archived_at IS NULL`,
+        WHERE status = 'provisioning' AND archived_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
+                           WHERE j.product_id = products.id
+                             AND j.status IN ('queued','running'))`,
     );
     let promoted = 0;
     for (const p of r.rows) {
@@ -424,9 +449,39 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
         WHERE p.id = stale.product_id AND p.status = 'provisioning'
        RETURNING p.slug`,
     );
-    if (r.rows.length) {
-      this.logger.warn(`провижининг просрочен: ${r.rows.map((x: any) => x.slug).join(', ')}`);
+    // ВТОРАЯ ветка. Первая ходит по ЗАДАНИЯМ и потому не видит продукт, у
+    // которого задание уже ЗАКРЫТО, а сам он так и не ожил. Измерено на
+    // PostgreSQL 16: агент отчитался об успехе, адрес молчит (не выписан
+    // сертификат, vhost не тот, контейнер в перезапуске) — задание в done,
+    // под условие `status IN ('queued','running')` не попадает, продукт
+    // остаётся в provisioning НАВСЕГДА. Ровно тот тупик, ради выхода из
+    // которого написан этот файл, просто на шаг позже.
+    //
+    // Сюда же попадает продукт вообще без задания: create вставляет продукт и
+    // задание двумя операторами без транзакции (причина документирована
+    // там же), и смерть процесса между ними оставляет то же самое.
+    // COALESCE(..., p.created_at) — фолбэк ТОЛЬКО для этого случая; как
+    // только у продукта есть хоть одно задание, срок считается по нему.
+    // Измерено: повтор девятидневного продукта со свежим заданием не
+    // хоронится, продукт без заданий возрастом 99 минут — хоронится,
+    // только что созданный без задания — нет.
+    const silent = await this.pg.query(
+      `UPDATE products p
+          SET status = 'failed',
+              provision_error = 'заведение не уложилось в 10 минут: задание закрыто, продукт не ожил'
+        WHERE p.status = 'provisioning' AND p.archived_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
+                           WHERE j.product_id = p.id AND j.status IN ('queued','running'))
+          AND COALESCE((SELECT max(COALESCE(j.started_at, j.created_at))
+                          FROM product_provision_jobs j WHERE j.product_id = p.id),
+                       p.created_at) < now() - interval '10 minutes'
+       RETURNING p.slug`,
+    );
+
+    const slugs = [...r.rows, ...silent.rows].map((x: any) => x.slug);
+    if (slugs.length) {
+      this.logger.warn(`провижининг просрочен: ${slugs.join(', ')}`);
     }
-    return r.rows.length;
+    return slugs.length;
   }
 }

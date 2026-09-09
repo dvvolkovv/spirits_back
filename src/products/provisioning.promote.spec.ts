@@ -19,7 +19,7 @@ type Call = { sql: string; params: any[] };
 function makeService(
   rows: any[],
   fetchImpl?: any,
-  over: { stale?: any[]; onUpdate?: (c: Call) => void } = {},
+  over: { stale?: any[]; silent?: any[]; onUpdate?: (c: Call) => void } = {},
 ) {
   const calls: Call[] = [];
   const pg = {
@@ -29,7 +29,10 @@ function makeService(
       if (/^\s*WITH/i.test(sql))
         return { rows: over.stale ?? [], rowCount: (over.stale ?? []).length };
       over.onUpdate?.({ sql, params });
-      return { rows: [], rowCount: 1 };
+      // `over.silent` заполняют только тесты, зовущие failStaleProvisioning в
+      // одиночку, — там UPDATE может быть только вторым запросом таймаута.
+      // Перевод в running возврата не читает вовсе.
+      return { rows: over.silent ?? [], rowCount: (over.silent ?? []).length };
     }),
   };
   const svc = new ProvisioningService(pg as any, {} as any);
@@ -47,6 +50,8 @@ const promotions = (calls: Call[]) =>
 
 const scan = (calls: Call[]) => calls.find((c) => /^\s*SELECT/i.test(c.sql))!;
 const staleQuery = (calls: Call[]) => calls.find((c) => /^\s*WITH/i.test(c.sql))!;
+/** Вторая ветка таймаута: единственный UPDATE, когда зван только он. */
+const silentQuery = (calls: Call[]) => calls.find((c) => /^\s*UPDATE/i.test(c.sql))!;
 
 const site = (over: any = {}) => ({
   id: 'p-1',
@@ -184,6 +189,31 @@ describe('ProvisioningService.promoteReady', () => {
     expect(sql).toMatch(/archived_at\s+IS\s+NULL/i);
   });
 
+  it('продукт с незакрытым заданием не переводится, даже если отвечает', async () => {
+    // Повтор поверх работающего сайта: старый раннер шлёт heartbeat, старая
+    // версия отвечает 200. Перевод в running отнял бы у claimJob право выдать
+    // задание (там EXISTS по status='provisioning'), и повтор умер бы молча:
+    // кнопка нажата, ничего не произошло, ошибки нет.
+    //
+    // ГРАНИЦА: pg замокан, отбор строк здесь не исполняется — сторожится
+    // форма условия. Что оно действительно отсекает повтор и действительно
+    // пропускает первичное заведение с закрытым заданием, измерено на
+    // PostgreSQL 16 (promotescratch на тестовой ноде).
+    const { svc, calls } = makeService([]);
+
+    await svc.promoteReady();
+
+    const sql = scan(calls).sql;
+    expect(sql).toMatch(/NOT\s+EXISTS/i);
+    expect(sql).toMatch(/FROM\s+product_provision_jobs\s+j/i);
+    // Скоррелировано ИМЕННО с этим продуктом: без сверки product_id одно
+    // чужое активное задание запирало бы весь реестр.
+    expect(sql).toMatch(/j\.product_id\s*=\s*products\.id/);
+    // Именно незакрытые. Со списком done/failed выборка пустела бы навсегда,
+    // и в running не выходил бы уже никто.
+    expect(sql).toMatch(/j\.status\s+IN\s*\('queued','running'\)/);
+  });
+
   it('на пустой выборке ничего не пишет', async () => {
     const { svc, calls } = makeService([]);
 
@@ -263,6 +293,55 @@ describe('ProvisioningService.failStaleProvisioning', () => {
     await svc.failStaleProvisioning();
 
     expect(staleQuery(calls).sql).toMatch(/p\.status\s*=\s*'provisioning'/);
+  });
+
+  it('хоронит и продукт с ЗАКРЫТЫМ заданием, который так и не ожил', async () => {
+    // Первая ветка ходит по заданиям и такой продукт не видит: агент
+    // отчитался об успехе, задание в done, адрес молчит (сертификат не
+    // выписан, vhost не тот, контейнер в перезапуске) — и продукт остаётся в
+    // provisioning НАВСЕГДА. Тупик, ради выхода из которого написан файл,
+    // просто на шаг позже. Измерено на PostgreSQL 16.
+    const { svc, calls } = makeService([]);
+
+    await svc.failStaleProvisioning();
+
+    const sql = silentQuery(calls).sql;
+    expect(sql).toMatch(/UPDATE\s+products\s+p/i);
+    expect(sql).toMatch(/p\.status\s*=\s*'provisioning'/);
+    // Активное задание — не этот случай: им занимается первая ветка, а здесь
+    // такой продукт похоронили бы, не дав агенту доработать.
+    expect(sql).toMatch(/NOT\s+EXISTS/i);
+    expect(sql).toMatch(/j\.status\s+IN\s*\('queued','running'\)/);
+    // Срок по САМОМУ СВЕЖЕМУ заданию, иначе повтор старого продукта умирает
+    // из-за девятидневной давности первой попытки.
+    expect(sql).toMatch(/max\(COALESCE\(j\.started_at,\s*j\.created_at\)\)/);
+    expect(sql).toMatch(/interval\s*'10 minutes'/);
+    expect(sql).toMatch(/archived_at\s+IS\s+NULL/i);
+  });
+
+  it('оба запроса таймаута уходят даже когда хоронить нечего', async () => {
+    // Убивает «сделать вторую ветку по остаточному принципу»: если она
+    // вызывается только при непустой первой, продукт с закрытым заданием не
+    // будет похоронен никогда — первая ветка про него ничего не знает.
+    const { svc, calls } = makeService([]);
+
+    await svc.failStaleProvisioning();
+
+    expect(staleQuery(calls)).toBeDefined();
+    expect(silentQuery(calls)).toBeDefined();
+  });
+
+  it('считает похороненных обеими ветками', async () => {
+    const { svc } = makeService([], undefined, {
+      stale: [{ slug: 'a' }],
+      silent: [{ slug: 'c' }],
+    });
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+
+    await expect(svc.failStaleProvisioning()).resolves.toBe(2);
+
+    expect(warn.mock.calls[0][0]).toContain('a');
+    expect(warn.mock.calls[0][0]).toContain('c');
   });
 
   it('возвращает число похороненных и называет их в логе', async () => {
