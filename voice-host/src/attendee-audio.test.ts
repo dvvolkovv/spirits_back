@@ -135,6 +135,30 @@ describe('AttendeeAudioHub', () => {
     } finally { hub.close(); }
   });
 
+  test('прямой режим кладёт порт в адрес, а не в путь', async () => {
+    // Тестовый стенд: Attendee и воркер на одной машине, идти через nginx
+    // незачем, а test.linkeon.io закрыт Basic Auth — Attendee в него не
+    // постучится. На проде наоборот: порт в пути, TLS терминирует nginx.
+    const hub = new AttendeeAudioHub();
+    const savedBase = process.env.ATTENDEE_WS_PUBLIC_BASE;
+    const savedDirect = process.env.ATTENDEE_WS_DIRECT;
+    try {
+      const port = await hub.listen('c1');
+      process.env.ATTENDEE_WS_PUBLIC_BASE = 'ws://127.0.0.1';
+      process.env.ATTENDEE_WS_DIRECT = '1';
+      assert.equal(hub.publicUrl('c1'), `ws://127.0.0.1:${port}/?callId=c1`);
+      delete process.env.ATTENDEE_WS_DIRECT;
+      process.env.ATTENDEE_WS_PUBLIC_BASE = 'wss://my.linkeon.io';
+      assert.equal(hub.publicUrl('c1'), `wss://my.linkeon.io/attendee/${port}?callId=c1`);
+    } finally {
+      hub.close();
+      if (savedBase === undefined) delete process.env.ATTENDEE_WS_PUBLIC_BASE;
+      else process.env.ATTENDEE_WS_PUBLIC_BASE = savedBase;
+      if (savedDirect === undefined) delete process.env.ATTENDEE_WS_DIRECT;
+      else process.env.ATTENDEE_WS_DIRECT = savedDirect;
+    }
+  });
+
   test('второй хаб на ту же встречу честно отказывает, а не падает молча', async () => {
     // Потолок в одну одновременную встречу держится ровно этим: диапазон
     // сужен до одного порта, и второму хабу занять нечего. При потолке в
