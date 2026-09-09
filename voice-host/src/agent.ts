@@ -895,17 +895,30 @@ export default defineAgent({
         // «никто не говорит». Подписка ЗДЕСЬ, а не выше, потому что закрывать
         // до session.start() ещё нечего; хаб отдаёт уже случившуюся потерю
         // сразу при подписке.
+        /**
+         * Уйти из встречи по причине, не зависящей от состава.
+         *
+         * Разъединение комнаты здесь ОБЯЗАТЕЛЬНО, и одной session.close()
+         * мало: 09.09.2026 задание после обрыва звука прожило ещё
+         * четырнадцать минут — тикало тишиной и держало единственный порт под
+         * Meet, то есть запирало следующий вход, — и вышло только по вердикту
+         * `never_started`. А с исправленным составом вердикт был бы `stay`
+         * (люди-то во встрече остались), и задание висело бы до двухчасового
+         * потолка.
+         */
+        const abortMeet = async (log: string, reason: string): Promise<void> => {
+          console.log(`[meet] ${log}`);
+          await backend.failed(meta.callId, reason).catch(() => {});
+          try { await session.close(); } catch (e) { console.error('session.close()', e); }
+          try { await ctx.room.disconnect(); } catch (e) { console.error('room.disconnect()', e); }
+        };
         attendeeHub.onLost(() => {
-          console.log('[meet] звук Attendee потерян — закрываем сессию');
-          void backend.failed(meta.callId, 'звук встречи оборвался').catch(() => {});
-          void session.close().catch(() => {});
+          void abortMeet('звук Attendee потерян — уходим', 'звук встречи оборвался');
         });
         // Терминальное состояние бота: теперь есть что закрывать. До этой
         // строки его принимал раунд ожидания звука выше.
         onMeetFatal = (state) => {
-          console.log(`[meet] бот в состоянии ${state} — выходим`);
-          void backend.failed(meta.callId, `бот Attendee: ${state}`).catch(() => {});
-          void session.close().catch(() => {});
+          void abortMeet(`бот в состоянии ${state} — уходим`, `бот Attendee: ${state}`);
         };
         // Могло приехать, пока сессия стартовала.
         if (meetFatal) onMeetFatal(meetFatal);
