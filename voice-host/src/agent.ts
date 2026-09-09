@@ -199,7 +199,45 @@ export default defineAgent({
         try { await ctx.room.disconnect(); } catch {}
         return;
       }
-      attendeeWs = await attendeeHub.expect();
+      // Ждём звук, но НЕ только его: гонка с ранним сигналом о провале входа.
+      //
+      // Обработчик DataReceived регистрируется много ниже по файлу, а это
+      // ожидание висит здесь — то есть в окне, когда сообщение «бот не смог
+      // войти» важнее всего, слушать его ещё некому, и оно приходит в
+      // пустоту. Проверено на стенде 09.09.2026: Attendee доставил
+      // bot.state_change=fatal_error, ручка его приняла и отправила в
+      // комнату, а воркер всё равно висел все две минуты и потом сообщал
+      // «звук не подключился» вместо настоящей причины.
+      //
+      // Отдельный слушатель, а не перенос основного: основной завязан на
+      // session, а её здесь ещё нет.
+      let onFatal: ((state: string) => void) | null = null;
+      const fatalSignal = new Promise<string>((resolve) => {
+        onFatal = resolve;
+      });
+      const earlyFatal = (payload: Uint8Array, _p: any, _k: any, topic?: string) => {
+        if (topic !== TOPIC) return;
+        try {
+          const m = JSON.parse(new TextDecoder().decode(payload));
+          if (m?.v === 1 && m.type === 'meet_bot_state' && m.fatal) onFatal?.(String(m.state));
+        } catch { /* чужое сообщение — не наша забота */ }
+      };
+      ctx.room.on(RoomEvent.DataReceived, earlyFatal);
+      const outcome = await Promise.race([
+        attendeeHub.expect().then((ws) => ({ kind: 'ws' as const, ws })),
+        fatalSignal.then((state) => ({ kind: 'fatal' as const, state })),
+      ]);
+      ctx.room.off(RoomEvent.DataReceived, earlyFatal);
+
+      if (outcome.kind === 'fatal') {
+        // Бот не вошёл. Сообщаем НАСТОЯЩУЮ причину, а не таймаут звука.
+        console.log(`[meet] бот в состоянии ${outcome.state} до подключения звука — выходим`);
+        await backend.failed(meta.callId, `бот Attendee: ${outcome.state}`).catch(() => {});
+        attendeeHub.close();
+        try { await ctx.room.disconnect(); } catch {}
+        return;
+      }
+      attendeeWs = outcome.ws;
       if (!attendeeWs) {
         // Бот создан, но так и не подключился к нам — заявленные Attendee
         // ретраи (до 30 раз по 2с) и запуск Chrome не уложились в отведённое
