@@ -35,6 +35,8 @@ export class ProductsService implements OnModuleInit {
 
   async onModuleInit() {
     await this.applyMigration('001_products.sql');
+    // Строго после 001: 002 навешивает колонки на таблицу, которую создаёт 001.
+    await this.applyMigration('002_provisioning.sql');
   }
 
   async list(userId: string): Promise<ProductRow[]> {
