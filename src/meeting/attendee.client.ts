@@ -135,6 +135,14 @@ export class AttendeeClient {
           audio: { url: p.wsUrl, sample_rate: ATTENDEE_SAMPLE_RATE },
         },
         webhooks: [{ url: hook, triggers: TRIGGERS }],
+        // Записи не храним, и это не экономия, а решение о данных.
+        //
+        // По умолчанию Attendee пишет встречу в mp4 и грузит её в S3. Нам это
+        // не нужно дважды: транскрипт мы ведём сами (`voice_calls.transcript`,
+        // а `recording_url` в нашей схеме всегда NULL), а видеозапись
+        // переговоров клиента в чужом хранилище — лишняя утечка. Проверено по
+        // исходникам 09.09.2026: допустимы 'mp4', 'mp3' и 'none'.
+        recording_settings: { format: 'none' },
       }),
     });
     if (!r || r.status < 200 || r.status >= 300) return null;

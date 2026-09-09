@@ -68,6 +68,9 @@ describe('AttendeeClient', () => {
         url: 'wss://my.linkeon.io/attendee/8141?callId=c1',
         sample_rate: 24000,
       });
+      // Записи не храним: транскрипт ведём сами, а видео переговоров клиента
+      // в чужом хранилище — лишняя утечка. По умолчанию Attendee пишет mp4.
+      expect(body.recording_settings).toEqual({ format: 'none' });
       expect(body.webhooks[0].triggers).toEqual([
         'bot.state_change',
         'participant_events.join_leave',
