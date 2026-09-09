@@ -3,6 +3,10 @@ import { CurrentUser } from '../common/decorators/user.decorator';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { VoiceCallService } from '../voice-call/voice-call.service';
 import { MeetingService } from './meeting.service';
+import { MeetingProvider } from './meeting-link';
+
+/** Провайдеры, которые ручка принимает. Незнакомое значение — не linkeon. */
+const KNOWN_PROVIDERS = new Set<MeetingProvider>(['linkeon', 'talerid', 'meet']);
 
 @Controller('meeting')
 @UseGuards(JwtGuard)
@@ -20,15 +24,23 @@ export class MeetingController {
   @Post('join')
   async join(
     @CurrentUser() u: any,
-    @Body() body: { agentId: number; code: string; provider?: 'linkeon' | 'talerid' },
+    @Body() body: { agentId: number; code: string; provider?: MeetingProvider },
   ) {
+    // Провайдер сверяем со списком, а не тернарником.
+    //
+    // Прежняя редакция отправляла всё, что не 'talerid', в 'linkeon' — и
+    // встреча Meet уходила искать свою комнату с кодом вида abc-defg-hij,
+    // получая 404. Фича была недостижима через API, а тесты этого не видели:
+    // они зовут MeetingService напрямую, минуя контроллер. Поймано запуском
+    // на стенде 09.09.2026.
+    //
+    // Список, а не «всё неизвестное — linkeon»: следующий провайдер иначе
+    // молча уедет в свои комнаты, ровно как это случилось с Meet.
+    const provider: MeetingProvider = KNOWN_PROVIDERS.has(body?.provider as MeetingProvider)
+      ? (body!.provider as MeetingProvider)
+      : 'linkeon';
     // Имя владельца сервис берёт из профиля сам: в JWT его нет.
-    return this.meetings.join(
-      u.userId,
-      Number(body?.agentId),
-      String(body?.code || ''),
-      body?.provider === 'talerid' ? 'talerid' : 'linkeon',
-    );
+    return this.meetings.join(u.userId, Number(body?.agentId), String(body?.code || ''), provider);
   }
 
   @Post(':id/leave')
