@@ -263,12 +263,29 @@ export class ChatController {
       try { profileText = await this.neo4j.getProfileDescription(userId); } catch {}
     }
 
-    // Build message with profile context
-    let fullMessage = '';
-    if (profileText && profileText.trim()) {
-      fullMessage += `User profile:\n${profileText}\n\n`;
-    }
-    fullMessage += message || 'Проанализируй этот файл';
+    // «Чистый лист» — как в текстовом ходе (см. `chat`): у режима своя сессия на
+    // релее, и файл обязан уехать в неё же. Тело здесь multipart, поэтому флаг
+    // приезжает строкой, а не булевым.
+    const freshFlag = body.fresh === true || body.fresh === 'true';
+    const fresh = freshFlag && /^\d{6,}$/.test(String(body.freshTs || ''));
+    const freshSessionId = fresh
+      ? `${userId}_${assistantId}_fresh_${body.freshTs}`
+      : undefined;
+
+    // Ключ сессии, персона и хвост переписки — те же, что у текстового хода.
+    // Отдельная сборка здесь однажды уже разошлась с основной и на три недели
+    // увела вложения в собственную сессию (см. relay-session.ts).
+    const handoff = await this.chatService.buildUploadHandoff({
+      userId,
+      assistantId: String(assistantId),
+      profileText,
+      freshSessionId,
+      requestLang: typeof body.lang === 'string' ? body.lang : undefined,
+    });
+
+    // Профиль уехал в systemPrompt вместе с персоной — в тело реплики его
+    // больше не клеим: там он оседал копией на каждый ход с файлом.
+    const fullMessage = message || 'Проанализируй этот файл';
 
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
@@ -282,7 +299,13 @@ export class ChatController {
       fd.append('files', f.buffer, { filename: f.originalname, contentType: f.mimetype });
     }
     fd.append('message', fullMessage);
-    fd.append('sessionId', `${userId}_${assistantId}`);
+    fd.append('sessionId', handoff.sessionId);
+    // Релей всегда передаёт --system-prompt и без нашего поля подставляет свой
+    // «universal agent»: в общей с текстовым ходом сессии это подменяло бы
+    // персону на каждом ходе с файлом.
+    if (handoff.systemPrompt) fd.append('systemPrompt', handoff.systemPrompt);
+    // Вставится только при холодном старте сессии — в resumed история уже есть.
+    if (handoff.history) fd.append('history', handoff.history);
 
     // Set streaming headers
     res.status(200);
@@ -408,6 +431,7 @@ export class ChatController {
               durationMs: Date.now() - streamStartTime,
               turnFailed,
               failReason,
+              sessionIdOverride: freshSessionId,
             });
             // Обогащаем профиль (Neo4j) на основе явных самораскрытий/согласий пользователя.
             // Файловые загрузки раньше не вызывали consolidate — теперь учитываются.

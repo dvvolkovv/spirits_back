@@ -15,6 +15,7 @@ import { RoomService } from '../meeting/room.service';
 import { buildMeetingCard } from './meeting-card';
 import { TalerIdRoomClient } from '../meeting/talerid-room.client';
 import { RESPONSE_STYLE_RULE } from './response-style';
+import { relaySessionKey } from './relay-session';
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import axios from 'axios';
@@ -412,6 +413,227 @@ export class ChatService {
     return /Not logged in|Please run \/login|hit your (session|usage) limit|Invalid API key|Credit balance is too low|OAuth token (has )?expired/i.test(t);
   }
 
+  /**
+   * Ассистент по идентификатору из запроса. Вынесено из streamChat, чтобы ход с
+   * вложениями искал того же ассистента тем же способом: разойдись эти две
+   * выборки — и файл ушёл бы к другой персоне.
+   *
+   * Custom-agent ветка ("custom:<uuid>") проверяет владельца: чужим кастомным
+   * ассистентом воспользоваться нельзя.
+   */
+  private async resolveAgent(userId: string, assistantId: string): Promise<any | null> {
+    if (assistantId.startsWith('custom:')) {
+      const customId = assistantId.substring('custom:'.length);
+      const customRes = await this.pg.query(
+        `SELECT id, name, description, system_prompt FROM custom_agents
+          WHERE id = $1 AND owner_user_id = $2
+          LIMIT 1`,
+        [customId, userId],
+      );
+      if (customRes.rows[0]) {
+        // Shape matches the agents table row used downstream
+        return {
+          id: `custom:${customRes.rows[0].id}`,
+          name: customRes.rows[0].name,
+          display_name: customRes.rows[0].name,
+          description: customRes.rows[0].description || '',
+          system_prompt: customRes.rows[0].system_prompt || '',
+        };
+      }
+      // Orphaned / not owned — fall back to the platform default agent (Роман, id=1)
+      this.logger.warn(`custom agent ${customId} not found or not owned by ${userId}, falling back to default`);
+      // is_active обязателен: скрытый ассистент не должен становиться
+      // платформенным дефолтом. Точечные выборки по id/name ниже фильтр
+      // НЕ применяют сознательно — иначе у тех, кто уже разговаривает со
+      // скрытым ассистентом, чат перестал бы открываться.
+      const fallbackRes = await this.pg.query('SELECT * FROM agents WHERE is_active ORDER BY id LIMIT 1');
+      return fallbackRes.rows[0] || null;
+    }
+    const isNumeric = /^\d+$/.test(assistantId);
+    const agentRes = isNumeric
+      ? await this.pg.query('SELECT * FROM agents WHERE id = $1 LIMIT 1', [parseInt(assistantId, 10)])
+      : await this.pg.query('SELECT * FROM agents WHERE name = $1 LIMIT 1', [assistantId]);
+    return agentRes.rows[0] || null;
+  }
+
+  /**
+   * Стабильная часть промпта для релея: identity, персона из БД, коллеги,
+   * профиль, карточка бизнеса. Уезжает в `--system-prompt`, поэтому шлётся раз
+   * на сессию и кэшируется, а не переклеивается в каждую реплику.
+   *
+   * Общая для текстового хода и хода с вложениями: у них ОДНА сессия на релее,
+   * и разные системные промпты в ней означали бы, что ассистент меняет личность
+   * от того, приложил пользователь файл или нет.
+   */
+  private async buildRelayStablePrefix(opts: {
+    agentId: string;
+    agentName: string;
+    agentDescription?: string;
+    agentSystemPrompt?: string;
+    agentCategory?: string | null;
+    userId: string;
+    userLanguage: string;
+    profileText?: string;
+  }): Promise<string> {
+    const { agentId, agentName, userId, userLanguage } = opts;
+    const agentDescription = opts.agentDescription || '';
+    const agentSystemPrompt = opts.agentSystemPrompt || '';
+
+    // Identity prefix — remote agent (r.linkeon.io) defaults to Claude persona; force the persona we want.
+    let stablePrefix =
+      `СИСТЕМНАЯ ИНСТРУКЦИЯ (имеет приоритет над всеми остальными). ` +
+      `Ты ассистент по имени **${agentName}**${agentDescription ? ` — ${agentDescription}` : ''} на платформе LINKEON.IO. ` +
+      `Всегда представляйся именно как ${agentName}. Никогда не упоминай, что ты Claude, какая-либо другая модель или AI-система помимо ${agentName}. ` +
+      `Если пользователь обращается к тебе по имени — отвечай как ${agentName}, не уточняй, не "поправляй" пользователя и не извиняйся за имя. ` +
+      `Не добавляй P.S. о собственной идентичности. ` +
+      LanguageService.buildDirective(userLanguage) + `\n`;
+
+    // Inject persona-specific system prompt from DB so каждый ассистент (Оля, Михаил, ...)
+    // сохраняет свой характер, методики и стиль при работе через r.linkeon.io.
+    if (agentSystemPrompt && agentSystemPrompt.trim()) {
+      stablePrefix += `--- Персона и инструкции ассистента ${agentName} ---\n${agentSystemPrompt.trim()}\n\n`;
+    }
+
+    // Coworker awareness — каждый ассистент должен знать про остальных, чтобы
+    // суметь представить их пользователю и не делать вид, что новых коллег нет.
+    // Берём список из БД (включая Юлю-SMM-продюсера id=15).
+    try {
+      const coworkersRes = await this.pg.query(
+        `SELECT COALESCE(t.display_name, a.display_name, a.name) AS display_name,
+                COALESCE(t.description, a.description)           AS description
+           FROM agents a
+           LEFT JOIN agent_translations t
+                  ON t.entity_type = 'agent'
+                 AND t.entity_id   = a.id::text
+                 AND t.locale      = $2
+          WHERE a.id != $1 AND a.description IS NOT NULL
+          ORDER BY a.id`,
+        [Number(agentId), userLanguage],
+      );
+      if (coworkersRes.rows.length > 0) {
+        const lines = coworkersRes.rows
+          .map((a: any) => `• ${a.display_name} — ${a.description}`)
+          .join('\n');
+        stablePrefix +=
+          `--- Коллеги-ассистенты в Linkeon ---\n` +
+          `${lines}\n\n` +
+          `Если пользователь спрашивает про кого-то из них или просит сделать что-то по их специализации — расскажи про коллегу честно, без выдумок, и предложи переключиться на него.\n\n`;
+      }
+    } catch { /* non-fatal — продолжаем без блока коллег */ }
+
+    // Профиль и бизнес-карточка — в СТАБИЛЬНУЮ часть, к персоне.
+    //
+    // Они меняются, но не от хода к ходу: профиль пополняется консолидацией
+    // после разговоров, бизнес-карточка — при правках пользователя. В теле
+    // реплики они стоили до 6 КБ на КАЖДЫЙ ход у людей с наполненным графом
+    // (интересы, желания, убеждения) и оседали в истории отдельной копией.
+    //
+    // Класть их в --system-prompt безопасно: проверено 30.08.2026, что при
+    // --resume новый системный промпт ПРИМЕНЯЕТСЯ (сессия резюмилась с другим
+    // именем ассистента и модель отвечала новым). То есть обновлённый профиль
+    // доедет со следующим же ходом, а не застрянет до конца сессии.
+    //
+    // Цена: изменение профиля меняет системный промпт, то есть начало префикса,
+    // и один ход пройдёт по холодному кэшу. Это правильный размен — платим
+    // ровно тогда, когда профиль реально изменился, а не 44 раза подряд.
+    if (opts.profileText && opts.profileText.trim()) {
+      stablePrefix += `User profile:\n${opts.profileText}\n\n`;
+    }
+    // Бизнес-карточка: общее знание о деле пользователя для всех ассистентов.
+    // Полная у category='business', одна строка у остальных — решает сервис.
+    if (this.businessProfile) {
+      try {
+        const biz = await this.businessProfile.renderForPrompt(userId, opts.agentCategory);
+        if (biz) stablePrefix += biz + '\n\n';
+      } catch (e: any) {
+        this.logger.warn(`business profile injection failed: ${e?.message}`);
+      }
+    }
+
+    return stablePrefix;
+  }
+
+  /**
+   * Хвост переписки для релея. Вставляется ТОЛЬКО когда сессия стартует без
+   * --resume: в resumed-сессии история уже есть, и копия в теле реплики была бы
+   * её вторым дословным экземпляром (309k символов из 813k в замеренной сессии).
+   */
+  private renderHistoryBlock(recentHistory: { type: string; content: string }[]): string {
+    if (recentHistory.length === 0) return '';
+    // stripLeakedToolSyntax: заражённая история заставляет модель имитировать
+    // текстовый tool-синтаксис вместо реальных вызовов (см. инцидент 2026-07-10).
+    const historyLines = recentHistory
+      .slice(-6)
+      .map(m => `${m.type === 'user' ? 'User' : 'Assistant'}: ${this.stripLeakedToolSyntax(m.content)}`)
+      .join('\n');
+    return `Recent conversation context:\n${historyLines}\n\n`;
+  }
+
+  /**
+   * Всё, что ход с вложениями обязан сказать релею, чтобы попасть в ТОТ ЖЕ
+   * разговор, что и текстовый ход: ключ сессии, персона, хвост переписки.
+   *
+   * Отдельный метод, а не копия логики в контроллере: ровно из-за такой копии
+   * загрузка файлов три недели жила своей сессией (см. relay-session.ts).
+   */
+  async buildUploadHandoff(p: {
+    userId: string;
+    assistantId: string;
+    profileText?: string;
+    freshSessionId?: string;
+    // Подсказка языка из запроса — ровно та же, что у текстового хода. Без неё
+    // у пользователя с пустым языком в профиле ключи снова разъедутся: текст
+    // ушёл бы в `_en`, а файл — в `_ru` по умолчанию.
+    requestLang?: string;
+  }): Promise<{ sessionId: string; systemPrompt: string; history: string }> {
+    const { userId, assistantId, freshSessionId } = p;
+    const profileText = p.profileText || '';
+    const userLanguage = await this.language.resolveUserLanguage(userId, p.requestLang);
+    const sessionId = relaySessionKey(userId, assistantId, userLanguage, freshSessionId);
+
+    // Персона — best-effort: не нашли ассистента, отвалилась БД — ход с файлом
+    // всё равно должен состояться. Ключ сессии при этом уже правильный, то есть
+    // главное (файл виден дальше в разговоре) не зависит от этой ветки.
+    let systemPrompt = '';
+    try {
+      const agent = await this.resolveAgent(userId, assistantId);
+      if (agent) {
+        systemPrompt = await this.buildRelayStablePrefix({
+          agentId: String(agent.id),
+          agentName: agent.name,
+          agentDescription: agent.description || '',
+          agentSystemPrompt: agent.system_prompt || '',
+          agentCategory: agent.category,
+          userId,
+          userLanguage,
+          profileText,
+        });
+      }
+    } catch (e: any) {
+      this.logger.warn(`upload handoff: persona build failed for ${userId}_${assistantId}: ${e?.message}`);
+    }
+
+    let history = '';
+    try {
+      const histRes = await this.pg.query(
+        `SELECT sender_type, content FROM custom_chat_history
+         WHERE session_id = $1
+         ORDER BY created_at DESC LIMIT 10`,
+        [freshSessionId || `${userId}_${assistantId}`],
+      );
+      history = this.renderHistoryBlock(
+        histRes.rows.reverse().map((r: any) => ({
+          type: r.sender_type === 'human' ? 'user' : 'assistant',
+          content: r.content,
+        })),
+      );
+    } catch (e: any) {
+      this.logger.warn(`upload handoff: history build failed for ${userId}_${assistantId}: ${e?.message}`);
+    }
+
+    return { sessionId, systemPrompt, history };
+  }
+
   async streamChat(
     userId: string,
     message: string,
@@ -440,48 +662,11 @@ export class ChatService {
     probe: boolean = false,
   ): Promise<void> {
     // Get agent
-    // Custom-agent branch: "custom:<uuid>" references user-created agents.
-    // Owner-check is enforced — a user cannot use another user's custom agent.
-    let agent: any;
-    if (assistantId.startsWith('custom:')) {
-      const customId = assistantId.substring('custom:'.length);
-      const customRes = await this.pg.query(
-        `SELECT id, name, description, system_prompt FROM custom_agents
-          WHERE id = $1 AND owner_user_id = $2
-          LIMIT 1`,
-        [customId, userId],
-      );
-      if (customRes.rows[0]) {
-        // Shape matches the agents table row used downstream
-        agent = {
-          id: `custom:${customRes.rows[0].id}`,
-          name: customRes.rows[0].name,
-          display_name: customRes.rows[0].name,
-          description: customRes.rows[0].description || '',
-          system_prompt: customRes.rows[0].system_prompt || '',
-        };
-      } else {
-        // Orphaned / not owned — fall back to the platform default agent (Роман, id=1)
-        this.logger.warn(`custom agent ${customId} not found or not owned by ${userId}, falling back to default`);
-        // is_active обязателен: скрытый ассистент не должен становиться
-        // платформенным дефолтом. Точечные выборки по id/name ниже фильтр
-        // НЕ применяют сознательно — иначе у тех, кто уже разговаривает со
-        // скрытым ассистентом, чат перестал бы открываться.
-        const fallbackRes = await this.pg.query('SELECT * FROM agents WHERE is_active ORDER BY id LIMIT 1');
-        agent = fallbackRes.rows[0];
-      }
-    } else {
-      const isNumeric = /^\d+$/.test(assistantId);
-      const agentRes = isNumeric
-        ? await this.pg.query('SELECT * FROM agents WHERE id = $1 LIMIT 1', [parseInt(assistantId, 10)])
-        : await this.pg.query('SELECT * FROM agents WHERE name = $1 LIMIT 1', [assistantId]);
-      agent = agentRes.rows[0];
-    }
+    const agent = await this.resolveAgent(userId, assistantId);
     if (!agent) {
       res.status(404).json({ error: 'Agent not found' });
       return;
     }
-
     // Get chat history (individual rows: session_id, sender_type, content)
     // fresh: история и запись — в отдельной fresh-сессии из controller'а.
     const chatSessionId = fresh ? sessionId : `${userId}_${assistantId}`;
@@ -1041,50 +1226,15 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // блоков, ≈252k токенов. Контекст рос не от истории разговора, а от того,
     // что постоянный текст переклеивался в каждый ход отдельной копией.
     //
-    // Identity prefix — remote agent (r.linkeon.io) defaults to Claude persona; force the persona we want.
-    let stablePrefix =
-      `СИСТЕМНАЯ ИНСТРУКЦИЯ (имеет приоритет над всеми остальными). ` +
-      `Ты ассистент по имени **${agentName}**${agentDescription ? ` — ${agentDescription}` : ''} на платформе LINKEON.IO. ` +
-      `Всегда представляйся именно как ${agentName}. Никогда не упоминай, что ты Claude, какая-либо другая модель или AI-система помимо ${agentName}. ` +
-      `Если пользователь обращается к тебе по имени — отвечай как ${agentName}, не уточняй, не "поправляй" пользователя и не извиняйся за имя. ` +
-      `Не добавляй P.S. о собственной идентичности. ` +
-      LanguageService.buildDirective(userLanguage) + `\n`;
-
-    // Inject persona-specific system prompt from DB so каждый ассистент (Оля, Михаил, ...)
-    // сохраняет свой характер, методики и стиль при работе через r.linkeon.io.
-    if (agentSystemPrompt && agentSystemPrompt.trim()) {
-      stablePrefix += `--- Персона и инструкции ассистента ${agentName} ---\n${agentSystemPrompt.trim()}\n\n`;
-    }
+    // Identity, персона, коллеги, профиль, карточка бизнеса — общий сборщик с
+    // ходом, в котором пришли вложения: сессия на релее у них одна.
+    let stablePrefix = await this.buildRelayStablePrefix({
+      agentId, agentName, agentDescription, agentSystemPrompt, agentCategory,
+      userId, userLanguage, profileText,
+    });
 
     // Пер-ходовая часть. Пустая строка, а не identity-блок: тот уехал в stablePrefix.
     let contextPrefix = '';
-
-    // Coworker awareness — каждый ассистент должен знать про остальных, чтобы
-    // суметь представить их пользователю и не делать вид, что новых коллег нет.
-    // Берём список из БД (включая Юлю-SMM-продюсера id=15).
-    try {
-      const coworkersRes = await this.pg.query(
-        `SELECT COALESCE(t.display_name, a.display_name, a.name) AS display_name,
-                COALESCE(t.description, a.description)           AS description
-           FROM agents a
-           LEFT JOIN agent_translations t
-                  ON t.entity_type = 'agent'
-                 AND t.entity_id   = a.id::text
-                 AND t.locale      = $2
-          WHERE a.id != $1 AND a.description IS NOT NULL
-          ORDER BY a.id`,
-        [Number(agentId), userLanguage],
-      );
-      if (coworkersRes.rows.length > 0) {
-        const lines = coworkersRes.rows
-          .map((a: any) => `• ${a.display_name} — ${a.description}`)
-          .join('\n');
-        stablePrefix +=
-          `--- Коллеги-ассистенты в Linkeon ---\n` +
-          `${lines}\n\n` +
-          `Если пользователь спрашивает про кого-то из них или просит сделать что-то по их специализации — расскажи про коллегу честно, без выдумок, и предложи переключиться на него.\n\n`;
-      }
-    } catch { /* non-fatal — продолжаем без блока коллег */ }
 
     // Текущее время ГЛАЗАМИ ПОЛЬЗОВАТЕЛЯ. Без этого модель считает время по UTC
     // сервера: 11.08 пользовательница из ЯНАО (UTC+5) написала «я тебе в 19:44
@@ -1125,34 +1275,6 @@ ${LanguageService.buildDirective(userLanguage)}`;
       }
     }
 
-    // Профиль и бизнес-карточка — в СТАБИЛЬНУЮ часть, к персоне.
-    //
-    // Они меняются, но не от хода к ходу: профиль пополняется консолидацией
-    // после разговоров, бизнес-карточка — при правках пользователя. В теле
-    // реплики они стоили до 6 КБ на КАЖДЫЙ ход у людей с наполненным графом
-    // (интересы, желания, убеждения) и оседали в истории отдельной копией.
-    //
-    // Класть их в --system-prompt безопасно: проверено 30.08.2026, что при
-    // --resume новый системный промпт ПРИМЕНЯЕТСЯ (сессия резюмилась с другим
-    // именем ассистента и модель отвечала новым). То есть обновлённый профиль
-    // доедет со следующим же ходом, а не застрянет до конца сессии.
-    //
-    // Цена: изменение профиля меняет системный промпт, то есть начало префикса,
-    // и один ход пройдёт по холодному кэшу. Это правильный размен — платим
-    // ровно тогда, когда профиль реально изменился, а не 44 раза подряд.
-    if (profileText && profileText.trim()) {
-      stablePrefix += `User profile:\n${profileText}\n\n`;
-    }
-    // Бизнес-карточка: общее знание о деле пользователя для всех ассистентов.
-    // Полная у category='business', одна строка у остальных — решает сервис.
-    if (this.businessProfile) {
-      try {
-        const biz = await this.businessProfile.renderForPrompt(userId, agentCategory);
-        if (biz) stablePrefix += biz + '\n\n';
-      } catch (e: any) {
-        this.logger.warn(`business profile injection failed: ${e?.message}`);
-      }
-    }
     // Активные задачи пользователя (cross-agent) — топ-5 по релевантности
     // к текущей реплике. Юзер видит ассистентов как продолжающих контекст
     // незаконченных дел, а не отвечающих с нуля. fresh: чистый лист — не тянем.
@@ -1171,16 +1293,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // только когда стартует без --resume. При обычном resume Claude-сессия уже
     // содержит всю переписку, и этот блок был её вторым, дословным экземпляром —
     // 309k символов из 813k в замеренной сессии.
-    let historyBlock = '';
-    if (recentHistory.length > 0) {
-      // stripLeakedToolSyntax: заражённая история заставляет модель имитировать
-      // текстовый tool-синтаксис вместо реальных вызовов (см. инцидент 2026-07-10).
-      const historyLines = recentHistory
-        .slice(-6)
-        .map(m => `${m.type === 'user' ? 'User' : 'Assistant'}: ${this.stripLeakedToolSyntax(m.content)}`)
-        .join('\n');
-      historyBlock = `Recent conversation context:\n${historyLines}\n\n`;
-    }
+    const historyBlock = this.renderHistoryBlock(recentHistory);
 
     // Требование языка — ПОСЛЕ всех дописанных блоков, перед самой репликой.
     //
@@ -1397,9 +1510,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // сохраняется и показывается пользователю как была.
         fd.append(
           'sessionId',
-          fresh && freshSessionId
-            ? freshSessionId
-            : `${userId}_${assistantId}_${userLanguage}`,
+          relaySessionKey(userId, assistantId, userLanguage, fresh ? freshSessionId : undefined),
         );
 
         // Модель хода. Пинги мониторинга просят haiku: «ответь одним словом ок»
@@ -1903,7 +2014,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     fd.append(
       'sessionId',
       sessionIdOverride ||
-        `${userId}_${assistantId}_${await this.language.resolveUserLanguage(userId)}`,
+        relaySessionKey(userId, assistantId, await this.language.resolveUserLanguage(userId)),
     );
     const chunks: string[] = [];
     const usage: SdkUsageTotals = {
@@ -2161,6 +2272,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     durationMs: number;
     turnFailed?: boolean;
     failReason?: string;
+    // «Чистый лист»: ход с файлом обязан лечь в ту же историю, что и текстовый,
+    // иначе в fresh-чате его видно не будет, а всплывёт он в основном.
+    sessionIdOverride?: string;
   }): Promise<number> {
     let text = p.assistantMsg;
     let turnFailed = p.turnFailed === true;
@@ -2190,7 +2304,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
     await this.alertExpensiveTurn(p.userId, p.assistantId, charge, p.costUsd, textCost);
 
-    await this.saveChatHistory(p.userId, p.assistantId, p.userMsg, text, textCost);
+    await this.saveChatHistory(p.userId, p.assistantId, p.userMsg, text, textCost, p.sessionIdOverride);
     if (!turnFailed) {
       await this.addTokenTask(p.userId, 0, textCost, p.assistantId, {
         costUsd: Number(p.costUsd.toFixed(4)),
