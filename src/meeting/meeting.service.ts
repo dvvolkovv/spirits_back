@@ -284,6 +284,15 @@ export class MeetingService {
       this.logger.error(`[attachBot] call=${callId} не найден: ${e?.message}`);
       return { status: 'failed' };
     }
+    // Id бота держим в переменной шире try: если упадёт запись в базу, бот в
+    // встрече уже будет, а в базе его не будет — и реапер, ищущий по
+    // непустому external_bot_id, такого не найдёт никогда.
+    //
+    // Это НЕ гипотеза: ровно так и случилось на стенде 09.09.2026, когда
+    // миграция с колонкой ещё не была накатана. Бот создался, UPDATE упал,
+    // бот остался сиротой в чужом сервисе. Та же ловушка была в join(), там
+    // она закрыта раньше — а здесь метод отдельный, и защиты не было.
+    let botId: string | null = null;
     try {
       const ownerName = await this.resolveOwnerName(call.user_id);
       const agentRes = await this.pg.query(
@@ -306,10 +315,17 @@ export class MeetingService {
         await this.calls.fail(callId, 'meeting bot is unavailable');
         return { status: 'failed' };
       }
-      await this.pg.query(`UPDATE voice_calls SET external_bot_id = $1 WHERE id = $2`, [bot.botId, callId]);
+      botId = bot.botId;
+      await this.pg.query(`UPDATE voice_calls SET external_bot_id = $1 WHERE id = $2`, [botId, callId]);
       return { status: 'ok' };
     } catch (e: any) {
       this.logger.error(`[attachBot] call=${callId} упал: ${e?.message}`);
+      // Бот мог уже сидеть в встрече — убираем его по значению из памяти, а
+      // не по тому, что успело уехать в базу: упасть мог именно UPDATE.
+      if (botId) {
+        this.logger.warn(`[attachBot] убираю осиротевшего бота ${botId}`);
+        await this.attendee.removeBot(botId).catch(() => {});
+      }
       await this.calls.fail(callId, e?.message || 'attach bot failed').catch(() => {});
       return { status: 'failed' };
     }

@@ -344,6 +344,34 @@ describe('MeetingService', () => {
     });
   });
 
+  describe('attachBot: осиротевший бот', () => {
+    it('падение записи id — бот всё равно выводится', async () => {
+      // Не гипотеза: ровно так и случилось на стенде 09.09.2026, когда
+      // миграция с колонкой ещё не была накатана. Бот создался, UPDATE упал,
+      // и бот остался сиротой — реапер ищет по непустому external_bot_id и
+      // такого не найдёт никогда.
+      withAgent();
+      calls.load.mockResolvedValue({ id: 'c1', user_id: 'u1', agent_id: 7, external_room: 'abc-defg-hij' });
+      attendee.createBot.mockResolvedValue({ botId: 'bot_1' });
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('FROM agents')) return { rows: [agentRow] };
+        if (sql.includes('external_bot_id')) throw new Error('column does not exist');
+        if (sql.includes('ai_profiles_consolidated')) return { rows: [{ name: 'Дмитрий' }] };
+        return { rows: [], rowCount: 0 };
+      });
+      await expect(svc.attachBot('c1', 'wss://x/attendee/8140?callId=c1')).resolves.toEqual({ status: 'failed' });
+      expect(attendee.removeBot).toHaveBeenCalledWith('bot_1');
+    });
+
+    it('бот не создан — убирать нечего', async () => {
+      withAgent();
+      calls.load.mockResolvedValue({ id: 'c1', user_id: 'u1', agent_id: 7, external_room: 'abc-defg-hij' });
+      attendee.createBot.mockResolvedValue(null);
+      await expect(svc.attachBot('c1', 'wss://x')).resolves.toEqual({ status: 'failed' });
+      expect(attendee.removeBot).not.toHaveBeenCalled();
+    });
+  });
+
   describe('Attendee не настроен', () => {
     it('вход в Meet отказывает и записи не создаёт', async () => {
       // Без Attendee входить некуда. Отказ обязан прийти ДО INSERT: иначе
