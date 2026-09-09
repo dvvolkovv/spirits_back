@@ -57,7 +57,10 @@ async function migration002(): Promise<string> {
   if (!sql) {
     throw new Error('миграция 002 не применена: ни один запрос не заводит product_provision_jobs');
   }
-  return sql;
+  // Комментарии вырезаются: проверки ниже ищут подстроки, а закомментированный
+  // DROP CONSTRAINT зеленил бы сторож идемпотентности, оставаясь для Postgres
+  // отсутствующим.
+  return sql.replace(/--[^\n]*/g, '');
 }
 
 /**
