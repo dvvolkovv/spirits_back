@@ -51,7 +51,9 @@ describe('MeetingService', () => {
     calls = {
       buildPreamble: jest.fn().mockResolvedValue('Пользователь: привет'),
       load: jest.fn(),
-      fail: jest.fn(),
+      // Возвращает промис: код местами делает .catch() на результате, и
+      // голый jest.fn() ронял тест TypeError'ом вместо проверки поведения.
+      fail: jest.fn().mockResolvedValue(undefined),
       markInterruptedKeepingRoom: jest.fn(),
     };
     livekit = { dispatchAgent: jest.fn(), removeAgents: jest.fn(), ensureRoom: jest.fn() };
