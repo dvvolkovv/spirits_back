@@ -4,6 +4,7 @@ import {
 import { LiveKitClient } from '../voice-call/livekit.client';
 import { VoiceCallService } from '../voice-call/voice-call.service';
 import { canonicalJson, verifyAttendeeSignature } from './attendee-signature';
+import { TERMINAL_BOT_STATES } from './attendee.client';
 
 /**
  * Вебхуки Attendee.
@@ -45,8 +46,12 @@ import { canonicalJson, verifyAttendeeSignature } from './attendee-signature';
  * состояние, ради которого в карточке чата живёт плашка «ждём, пока
  * впустят». Считать его смертельным значило бы выходить из встречи ровно
  * тогда, когда хозяин собирается нас впустить.
+ *
+ * Сам набор живёт в attendee.client.ts: там он нужен, чтобы отличить «бота
+ * выводить уже некого» от «состояние неизвестно, повторим». Факт один и тот
+ * же, и два списка однажды разошлись бы.
  */
-const FATAL_STATES = new Set(['fatal_error', 'ended', 'data_deleted']);
+const FATAL_STATES = TERMINAL_BOT_STATES;
 
 /**
  * Сколько ключей идемпотентности держим.

@@ -165,6 +165,41 @@ describe('AttendeeClient', () => {
       await expect(new AttendeeClient().removeBot('bot_1')).resolves.toBe(true);
     });
 
+    it('400 на завершённом боте — выводить некого, а не «неизвестно»', async () => {
+      // Attendee отвечает на leave 400, а не 404: «Event leave_requested not
+      // allowed when bot is in state ended». Проверено на живом сервисе
+      // 09.09.2026. Прежняя редакция считала это неизвестным состоянием, и
+      // реапер перебирал три давно завершённых бота каждый тик, не очищая
+      // external_bot_id никогда.
+      const spy = jest.fn()
+        .mockResolvedValueOnce({ ok: false, status: 400, json: async () => ({ error: 'in state ended' }) })
+        .mockResolvedValueOnce(ok({ state: 'ended' }));
+      global.fetch = spy as any;
+      await expect(new AttendeeClient().removeBot('bot_1')).resolves.toBe(false);
+      // Состояние спрашиваем у самого Attendee, а не угадываем по тексту
+      // ошибки: формулировка чужая и меняется без предупреждения.
+      expect(spy.mock.calls[1][0]).toBe('https://attendee.test/api/v1/bots/bot_1');
+    });
+
+    it('400 на боте, который ещё стучится, — null: он может войти', async () => {
+      // leave не разрешён и в joining, и в комнате ожидания. Считать такой
+      // ответ «бота нет» значило бы забыть про Chrome, который вот-вот
+      // окажется в чужих переговорах.
+      const spy = jest.fn()
+        .mockResolvedValueOnce({ ok: false, status: 400, json: async () => ({ error: 'in state joining' }) })
+        .mockResolvedValueOnce(ok({ state: 'joining' }));
+      global.fetch = spy as any;
+      await expect(new AttendeeClient().removeBot('bot_1')).resolves.toBeNull();
+    });
+
+    it('400, а состояние узнать не удалось — null', async () => {
+      const spy = jest.fn()
+        .mockResolvedValueOnce({ ok: false, status: 400, json: async () => ({}) })
+        .mockRejectedValueOnce(new Error('ECONNREFUSED'));
+      global.fetch = spy as any;
+      await expect(new AttendeeClient().removeBot('bot_1')).resolves.toBeNull();
+    });
+
     it('id бота экранируется в пути', async () => {
       const spy = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({}) });
       global.fetch = spy as any;

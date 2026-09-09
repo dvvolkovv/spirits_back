@@ -20,6 +20,19 @@ const TIMEOUT_MS = 10_000;
 export const ATTENDEE_SAMPLE_RATE = 24_000;
 
 /**
+ * Состояния, из которых бот уже не вернётся.
+ *
+ * Один и тот же факт про бота нужен в двух местах, и держать два списка
+ * значило бы однажды их разойтись: здесь — «выводить уже некого» (Attendee
+ * отвечает на leave 400, и только по состоянию видно, мёртв бот или ещё
+ * стучится), в вебхуке — «встречи не будет».
+ *
+ * Набор — из `bots/models.py`, `BotStates`. `waiting_room` сюда НЕ входит:
+ * это ожидание впуска, а не отказ.
+ */
+export const TERMINAL_BOT_STATES = new Set(['fatal_error', 'ended', 'data_deleted']);
+
+/**
  * Что слушаем.
  *
  * `speech_start_stop` — не украшение: в LiveKit-комнате участников нет вовсе,
@@ -198,10 +211,30 @@ export class AttendeeClient {
    *             повторную попытку.
    */
   async removeBot(botId: string): Promise<boolean | null> {
-    const r = await this.call(`/api/v1/bots/${encodeURIComponent(botId)}/leave`, { method: 'POST' });
+    const path = `/api/v1/bots/${encodeURIComponent(botId)}`;
+    const r = await this.call(`${path}/leave`, { method: 'POST' });
     if (!r) return null;
     if (r.status === 404) return false;
     if (r.status >= 200 && r.status < 300) return true;
+    if (r.status === 400) {
+      // Attendee отвечает 400, а НЕ 404, когда выводить уже некого: «Event
+      // leave_requested not allowed when bot is in state ended. It is only
+      // allowed in these states: joined_recording, …». Проверено на стенде
+      // 09.09.2026 запросом к живому сервису.
+      //
+      // Прежняя редакция считала такой ответ «состояние неизвестно», и три
+      // давно завершённых бота реапер перебирал каждый тик, не очищая
+      // external_bot_id никогда. Хуже безобидного шума: настоящее «не знаю»
+      // в этом шуме терялось.
+      //
+      // Но 400 сам по себе НЕ значит «бот мёртв»: leave не разрешён и в
+      // joining, и в комнате ожидания, а такой бот ещё может войти в встречу.
+      // Поэтому спрашиваем состояние и убираем запись только на терминальном.
+      const st = await this.call(path);
+      const state = st?.status === 200 ? st.data?.state : undefined;
+      if (typeof state === 'string' && TERMINAL_BOT_STATES.has(state)) return false;
+      return null;
+    }
     return null;
   }
 }
