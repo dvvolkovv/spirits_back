@@ -18,7 +18,7 @@ import { z } from 'zod';
 import { backend, type TranscriptEntry } from './backend.js';
 import { PendingAnswers } from './pending.js';
 import { NameGate } from './name-gate.js';
-import { Occupancy } from './occupancy.js';
+import { Occupancy, MEET_EMPTY_GRACE_MS } from './occupancy.js';
 import { Presence } from './presence.js';
 import { MixedRoomAudioInput } from './mixed-audio-input.js';
 import { ExternalRoomAudioOutput } from './external-room-output.js';
@@ -110,7 +110,16 @@ export default defineAgent({
     let currentSpeaker: string | undefined;
 
     const gate = isMeeting ? new NameGate(agentName, FOLLOWUP_WINDOW_MS) : null;
-    const occupancy = isMeeting ? new Occupancy(Date.now()) : null;
+    /**
+     * Правила выхода. Для Meet — с выдержкой перед вердиктом «опустела»:
+     * состав там приезжает от Meet через Attendee и врёт (см.
+     * MEET_EMPTY_GRACE_MS).
+     *
+     * isMeet объявлен ниже, поэтому провайдер сверяется здесь напрямую.
+     */
+    const occupancy = isMeeting
+      ? new Occupancy(Date.now(), meta.provider === 'meet' ? MEET_EMPTY_GRACE_MS : 0)
+      : null;
 
     /**
      * Встреча на площадке без LiveKit (Meet через Attendee). Отличается от
@@ -189,6 +198,13 @@ export default defineAgent({
         if (msg.type === 'meet_speaking') {
           presence?.speech(msg.uuid, msg.name, msg.speaking);
           currentSpeaker = presence?.speaker;
+          if (msg.speaking) {
+            // Речь — доказательство присутствия, и оно сильнее вранья Meet о
+            // составе. Возвращаем человека и в правила выхода: без этого
+            // выдержка лишь отложила бы выход из живой встречи.
+            occupancy?.joined(msg.uuid);
+            syncFromPresence();
+          }
           return;
         }
         if (msg.type === 'meet_bot_state' && msg.fatal) {

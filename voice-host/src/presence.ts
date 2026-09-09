@@ -94,6 +94,12 @@ export class Presence {
   speech(uuid: string, name: string, speaking: boolean): void {
     if (this.isSelf(name)) return;
     if (speaking) {
+      // Говорящий заведомо ВО ВСТРЕЧЕ, и это единственный надёжный признак
+      // присутствия, который у нас есть. Meet может отдать сидящего человека
+      // со `status: 8`, Attendee переводит это в `leave` — и состав пустеет
+      // под живым разговором (живая встреча 09.09.2026). Речь возвращает
+      // человека обратно.
+      if (!this.people.has(uuid)) this.people.set(uuid, name);
       this.speakingUuid = uuid;
       this.speakingName = name;
       return;
