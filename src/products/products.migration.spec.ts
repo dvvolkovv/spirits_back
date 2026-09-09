@@ -42,6 +42,31 @@ describe('ProductsService.onModuleInit', () => {
   });
 });
 
+/**
+ * Текст миграции 002 отдельно от 001.
+ *
+ * Склейка обоих файлов для проверок непригодна: 001 содержит и
+ * `ON DELETE CASCADE`, и `status text NOT NULL DEFAULT 'queued'`, и
+ * `WHERE status IN ('queued', 'running')`. Проверка по склейке зеленела бы на
+ * тексте 001 даже если бы 002 растеряла все свои ограничения до единого.
+ */
+async function migration002(): Promise<string> {
+  const { svc, queries } = makeService();
+  await svc.onModuleInit();
+  const sql = queries.find((q) => q.includes('product_provision_jobs'));
+  if (!sql) {
+    throw new Error('миграция 002 не применена: ни один запрос не заводит product_provision_jobs');
+  }
+  return sql;
+}
+
+/**
+ * Проверки ниже сверяют смысл SQL, а не упоминание имён: тип и модификаторы
+ * колонки, словари CHECK, предикат частичного индекса, каскад внешнего ключа.
+ * Живого Postgres в прогоне нет, поэтому семантика закреплена по тексту
+ * миграции — и закреплена раздельно: каждое утверждение в своём тесте, чтобы
+ * снятый CHECK и снятый предикат индекса нельзя было спутать по красному.
+ */
 describe('миграция 002', () => {
   it('применяется вслед за 001', async () => {
     const applied: string[] = [];
@@ -55,17 +80,82 @@ describe('миграция 002', () => {
     expect(applied).toEqual(['001_products.sql', '002_provisioning.sql']);
   });
 
-  it('заводит форму продукта, порт, секреты и очередь заданий', async () => {
-    const { svc, queries } = makeService();
+  it('kind — обязательный текст со значением по умолчанию для старых строк', async () => {
+    // int вместо text или пропавший DEFAULT сломали бы существующие demo и
+    // shop2, заведённые до появления колонки.
+    expect(await migration002()).toMatch(
+      /ADD COLUMN IF NOT EXISTS\s+kind\s+text\s+NOT NULL\s+DEFAULT\s+'site'/,
+    );
+  });
 
-    await svc.onModuleInit();
+  it('словарь форм продукта закрыт CHECK', async () => {
+    expect(await migration002()).toMatch(/CHECK\s*\(\s*kind\s+IN\s*\(\s*'site'\s*,\s*'bot'\s*\)\s*\)/);
+  });
 
-    const sql = queries.join('\n');
-    expect(sql).toContain('ADD COLUMN IF NOT EXISTS kind');
-    expect(sql).toContain('ADD COLUMN IF NOT EXISTS port');
-    expect(sql).toContain('ADD COLUMN IF NOT EXISTS secrets_encrypted');
-    expect(sql).toContain('ADD COLUMN IF NOT EXISTS provision_error');
-    expect(sql).toContain('CREATE TABLE IF NOT EXISTS product_provision_jobs');
-    expect(sql).toContain('product_provision_jobs_one_active');
+  it('CHECK на kind навешивается идемпотентно', async () => {
+    // ADD CONSTRAINT не знает IF NOT EXISTS: без перехвата duplicate_object
+    // повторный прогон миграции падал бы на уже существующем ограничении.
+    expect(await migration002()).toMatch(
+      /DO \$\$[\s\S]*ADD CONSTRAINT\s+products_kind_chk[\s\S]*EXCEPTION WHEN duplicate_object THEN NULL;\s*END \$\$/,
+    );
+  });
+
+  it('порт — целое число и необязателен: у бота его нет', async () => {
+    expect(await migration002()).toMatch(/ADD COLUMN IF NOT EXISTS\s+port\s+int\s*;/);
+  });
+
+  it('секреты хранятся как bytea под шифротекст AES-GCM', async () => {
+    // text здесь означал бы перекодировку iv и тега, то есть порчу значения.
+    expect(await migration002()).toMatch(/ADD COLUMN IF NOT EXISTS\s+secrets_encrypted\s+bytea\s*;/);
+  });
+
+  it('причина сорванного заведения — текстовая колонка products', async () => {
+    expect(await migration002()).toMatch(/ADD COLUMN IF NOT EXISTS\s+provision_error\s+text\s*;/);
+  });
+
+  it('заводит очередь заданий', async () => {
+    expect(await migration002()).toMatch(/CREATE TABLE IF NOT EXISTS\s+product_provision_jobs/);
+  });
+
+  it('задание удаляется вместе со своим продуктом', async () => {
+    expect(await migration002()).toMatch(
+      /product_id\s+uuid\s+NOT NULL\s+REFERENCES\s+products\s*\(\s*id\s*\)\s+ON DELETE CASCADE/,
+    );
+  });
+
+  it('новое задание стартует в статусе queued', async () => {
+    expect(await migration002()).toMatch(/status\s+text\s+NOT NULL\s+DEFAULT\s+'queued'/);
+  });
+
+  it('словарь статусов задания закрыт CHECK', async () => {
+    // Не декорация: частичный индекс ниже считает продукт свободным при любом
+    // статусе вне ('queued','running'), поэтому словарь — часть замка.
+    expect(await migration002()).toMatch(
+      /CHECK\s*\(\s*status\s+IN\s*\(\s*'queued'\s*,\s*'running'\s*,\s*'done'\s*,\s*'failed'\s*\)\s*\)/,
+    );
+  });
+
+  it('задание несёт фазу, ошибку и отметки времени', async () => {
+    const sql = await migration002();
+    expect(sql).toMatch(/\bphase\s+text\b/);
+    expect(sql).toMatch(/\berror\s+text\b/);
+    expect(sql).toMatch(/created_at\s+timestamptz\s+NOT NULL\s+DEFAULT\s+now\(\)/);
+    expect(sql).toMatch(/started_at\s+timestamptz/);
+    expect(sql).toMatch(/finished_at\s+timestamptz/);
+  });
+
+  it('замок «одно активное задание» — уникальный индекс по продукту', async () => {
+    expect(await migration002()).toMatch(
+      /CREATE UNIQUE INDEX IF NOT EXISTS\s+product_provision_jobs_one_active\s+ON product_provision_jobs\s*\(\s*product_id\s*\)/,
+    );
+  });
+
+  it('замок ограничен активными статусами, а не всей историей продукта', async () => {
+    // Без предиката индекс означал бы «одно задание за всю жизнь продукта»:
+    // повторное заведение того же продукта навсегда отбивалось бы
+    // уникальностью. Имя индекса при этом остаётся прежним.
+    expect(await migration002()).toMatch(
+      /product_provision_jobs_one_active[\s\S]*?WHERE\s+status\s+IN\s*\(\s*'queued'\s*,\s*'running'\s*\)/,
+    );
   });
 });
