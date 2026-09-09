@@ -165,3 +165,49 @@ describe('отказ модели не должен выглядеть успе�
     expect(res.error).toBe('Not logged in');
   });
 });
+
+describe('запрет инструментов — не успех', () => {
+  // Первый боевой ход: агенту запретили Write, он прочитал файл и остановился.
+  // CLI отдал is_error=false, ход закрылся «Готово», списалось 620 токенов,
+  // правок ноль. Наблюдаемо только по совпадению sha — в потоке всё выглядело
+  // штатно.
+  it('permission_denials → error, даже когда is_error=false', () => {
+    const t = new ClaudeTranslator();
+
+    const out = t.translate({
+      type: 'result',
+      is_error: false,
+      permission_denials: [{ tool_name: 'Write' }, { tool_name: 'Write' }, { tool_name: 'Edit' }],
+      usage: { input_tokens: 8, output_tokens: 612 },
+    });
+
+    expect(out).toEqual([{ type: 'error', message: 'агенту запретили инструменты: Write, Edit' }]);
+  });
+
+  it('пустой список отказов успех не портит', () => {
+    const t = new ClaudeTranslator();
+
+    const out = t.translate({
+      type: 'result',
+      is_error: false,
+      permission_denials: [],
+      usage: { input_tokens: 1, output_tokens: 2 },
+    });
+
+    expect(out).toEqual([{ type: 'end', usage: { input: 1, output: 2, total: 3 } }]);
+  });
+
+  it('режим прав передаётся в CLI явно', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'runner-perm-'));
+    const argsFile = path.join(dir, 'args');
+    const stub = path.join(dir, 'fake-claude');
+    // Заглушка записывает полученные аргументы: без этого подмена режима прав
+    // на default прошла бы незамеченной — все прочие проверки её не видят.
+    fs.writeFileSync(stub, `#!/bin/sh\necho "$@" > ${argsFile}\nprintf '{"type":"result"}\\n'\n`);
+    fs.chmodSync(stub, 0o755);
+
+    await runClaude({ claudeBin: stub, cwd: dir, prompt: 'правка', timeoutMs: 10_000, onEvents: () => {} });
+
+    expect(fs.readFileSync(argsFile, 'utf8')).toContain('--permission-mode bypassPermissions');
+  });
+});

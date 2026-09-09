@@ -88,6 +88,20 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<void> {
   }
 
   const shaAfter = await git.commitAll(`linkeon: ${turn.prompt.slice(0, 60)}`);
+
+  // Ход без единой правки — не успех. Коммита нет, sha не сдвинулся, собирать и
+  // перезапускать нечего. Раньше такой ход закрывался «Готово» со списанием, и
+  // клиент видел в истории выполненную работу, которой не было.
+  if (shaAfter === shaBefore) {
+    await api.complete(turn.id, {
+      status: 'failed',
+      error: 'агент не внёс изменений в код продукта',
+      shaBefore,
+      tokens,
+    });
+    return;
+  }
+
   await git.push();
 
   await api.sendEvents(turn.id, [{ type: 'item', content: '\n\nСобираю и перезапускаю…' }]);

@@ -79,6 +79,14 @@ export class ClaudeTranslator {
       if (event.is_error) {
         return [{ type: 'error', message: String(event.result ?? 'ход завершился ошибкой') }];
       }
+      // Отказ по правам приходит при is_error=false: CLI считает ход
+      // состоявшимся, хотя агенту запретили менять файлы. Для нас это отказ —
+      // иначе ход закрывается «Готово», токены списаны, правок нет.
+      const denials = Array.isArray(event.permission_denials) ? event.permission_denials : [];
+      if (denials.length) {
+        const tools = [...new Set(denials.map((d: any) => String(d?.tool_name ?? '?')))].join(', ');
+        return [{ type: 'error', message: `агенту запретили инструменты: ${tools}` }];
+      }
       return [{ type: 'end', usage: { input, output, total: input + output } }];
     }
 
@@ -124,7 +132,21 @@ export interface RunClaudeInput {
  * что в git.ts для сообщения коммита, и здесь она важнее.
  */
 export async function runClaude(input: RunClaudeInput): Promise<{ ok: boolean; error?: string }> {
-  const args = ['-p', input.prompt, '--output-format', 'stream-json', '--verbose'];
+  // Без явного режима прав CLI работает в default и молча отклоняет Write и
+  // Edit: агент читает файлы, ничего не меняет и рапортует успех. Проверено
+  // живьём — первый боевой ход закрылся «Готово» со списанием и нулём правок.
+  //
+  // Границей безопасности здесь служит контейнер продукта, а не диалог
+  // подтверждений: подтверждать некому, ходы идут без человека.
+  const args = [
+    '-p',
+    input.prompt,
+    '--output-format',
+    'stream-json',
+    '--verbose',
+    '--permission-mode',
+    'bypassPermissions',
+  ];
   if (input.sessionId) args.push('--resume', input.sessionId);
 
   return new Promise((resolve) => {
