@@ -203,6 +203,34 @@ describe('ProvisioningService.create', () => {
     }
   });
 
+  it('хеш считается от 32 случайных байт и ни от чего другого', async () => {
+    // Перечисление известных значений закрывает только голое sha256 РОВНО от
+    // них. Измерено: sha256(productId + slug) и sha256('linkeon:' + productId)
+    // список переживают — а это ровно то, от чего проверка выше названа
+    // защищать: кто знает id продукта, тот проходит RunnerGuard. Переживает
+    // список и уменьшение энтропии до одного байта.
+    //
+    // Поэтому привязка идёт к самому источнику случайности, а не к перебору
+    // того, чем он НЕ является.
+    const spy = jest.spyOn(crypto, 'randomBytes');
+    try {
+      const { svc, calls } = makeService();
+
+      await svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: {} });
+
+      const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
+      const drawn = spy.mock.results.map((r) => r.value as Buffer).filter(Buffer.isBuffer);
+      // Ровно один розыгрыш: второй означал бы, что в хеш попало не то, что
+      // разыграно (или что часть случайности выброшена).
+      expect(drawn).toHaveLength(1);
+      expect(drawn[0]).toHaveLength(32);
+      expect(insert.params[7]).toBe(crypto.createHash('sha256').update(drawn[0]).digest('hex'));
+    } finally {
+      // claimJob тоже зовёт randomBytes; шпиона нельзя оставлять на модуле.
+      spy.mockRestore();
+    }
+  });
+
   it('хеш у каждого продукта свой', async () => {
     // Константа вместо randomBytes проходит и «не выводится из известного», и
     // проверку длины. А колонка UNIQUE: второе заведение падало бы на

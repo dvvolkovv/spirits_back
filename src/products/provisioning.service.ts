@@ -13,6 +13,19 @@ export interface CreateInput {
   secrets: Record<string, string>;
 }
 
+/**
+ * Задание, выданное агенту хоста. Единственное место, где открытый
+ * runner-токен вообще существует: агенту он отдаётся один раз, в теле ответа.
+ */
+export interface ClaimedJob {
+  jobId: string;
+  productId: string;
+  slug: string;
+  kind: ProductKind;
+  runnerToken: string;
+  secrets: Record<string, string>;
+}
+
 // Дефис только внутри. Регексп из плана (/^[a-z0-9-]{2,40}$/) пропускал '-rf'
 // и '--': слаг уезжает именем контейнера, каталогом на хосте и меткой домена,
 // а ведущий дефис в аргументе docker/nginx разбирается как флаг. Нижняя
@@ -158,5 +171,92 @@ export class ProvisioningService {
     }
 
     return { productId };
+  }
+
+  /**
+   * Выдаёт одно задание агенту хоста.
+   *
+   * SKIP LOCKED — на случай второго агента: задание не должно достаться
+   * двоим, иначе два развёртывания пойдут в один каталог.
+   */
+  async claimJob(): Promise<ClaimedJob | null> {
+    const r = await this.pg.query(
+      `UPDATE product_provision_jobs j
+          SET status = 'running', started_at = now()
+        WHERE j.id = (
+          SELECT id FROM product_provision_jobs
+           WHERE status = 'queued'
+           ORDER BY created_at
+           FOR UPDATE SKIP LOCKED
+           LIMIT 1)
+      RETURNING j.id, j.product_id,
+                (SELECT slug FROM products WHERE id = j.product_id) AS slug,
+                (SELECT kind FROM products WHERE id = j.product_id) AS kind,
+                (SELECT secrets_encrypted FROM products WHERE id = j.product_id) AS box`,
+    );
+    const row = r.rows[0];
+    // Пустая очередь — обычное состояние: агент опрашивает нас в цикле.
+    // Ничего не выпускаем и в базу больше не ходим: холостой перевыпуск
+    // runner_token_hash отобрал бы доступ у раннера, ничего не записав в лог.
+    if (!row) return null;
+
+    // Новый токен на каждое задание. Старый невосстановим — в базе только
+    // sha256, открытое значение отдавалось агенту один раз.
+    const runnerToken = crypto.randomBytes(32).toString('hex');
+    const hash = crypto.createHash('sha256').update(runnerToken).digest('hex');
+    await this.pg.query(`UPDATE products SET runner_token_hash = $2 WHERE id = $1`, [
+      row.product_id,
+      hash,
+    ]);
+
+    return {
+      jobId: row.id,
+      productId: row.product_id,
+      slug: row.slug,
+      kind: row.kind,
+      runnerToken,
+      // ДВА аргумента: коробка привязана к продукту через AAD. Признак
+      // «секретов нет» — NULL в secrets_encrypted (задача 3 кладёт именно
+      // его, а не коробку от {}), и читаться он обязан ДО вызова: decrypt на
+      // null — сырой TypeError.
+      secrets: row.box ? this.secrets.decrypt(row.box, row.product_id) : {},
+    };
+  }
+
+  /**
+   * Принимает отчёт агента о развёртывании.
+   *
+   * Задание закрывается в обоих исходах — его держит частичный уникальный
+   * индекс product_provision_jobs_one_active, и оставленное в 'running'
+   * задание навсегда запретило бы повтор.
+   */
+  async completeJob(jobId: string, result: { ok: boolean; port?: number; error?: string }) {
+    if (result.ok) {
+      await this.pg.query(
+        `UPDATE product_provision_jobs SET status = 'done', finished_at = now() WHERE id = $1`,
+        [jobId],
+      );
+      // Статус продукта здесь НЕ меняется. Перевод в running делает
+      // promoteReady по измеримому факту (задача 5): отчёт агента говорит
+      // «я развернул», а не «оно отвечает».
+      await this.pg.query(
+        `UPDATE products SET port = $2
+          WHERE id = (SELECT product_id FROM product_provision_jobs WHERE id = $1)`,
+        [jobId, result.port ?? null],
+      );
+      return;
+    }
+    await this.pg.query(
+      `UPDATE product_provision_jobs SET status = 'failed', error = $2, finished_at = now()
+        WHERE id = $1`,
+      [jobId, result.error ?? 'без причины'],
+    );
+    // Порт здесь не трогается намеренно: неудачная ПОВТОРНАЯ попытка снесла бы
+    // порт уже работавшего продукта, а хранится он только тут.
+    await this.pg.query(
+      `UPDATE products SET status = 'failed', provision_error = $2
+        WHERE id = (SELECT product_id FROM product_provision_jobs WHERE id = $1)`,
+      [jobId, result.error ?? 'без причины'],
+    );
   }
 }
