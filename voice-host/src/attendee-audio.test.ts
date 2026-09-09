@@ -20,37 +20,57 @@ import { AttendeeAudioHub, AttendeeAudioOutput, SAMPLE_RATE, SAMPLES_PER_TICK } 
  */
 if (!loggerOptions()) initializeLogger({ pretty: false });
 
-/** Минимальная заглушка ws: копит отправленное, слушателей не зовёт. */
-function fakeWs() {
+/**
+ * Минимальная заглушка хаба: копит отправленное, слушателей не зовёт.
+ *
+ * Вывод держит ХАБ, а не сокет: сокет сменится при переподключении Attendee, и
+ * знать об этом вывод не должен.
+ */
+function fakeHub(open = true) {
   const sent: any[] = [];
   return {
-    OPEN: 1, readyState: 1,
-    send: (s: string) => sent.push(JSON.parse(s)),
-    on: () => {},
+    send: (p: any) => { if (open) sent.push(p); return open; },
+    onMessage: () => {},
     sent,
   } as any;
+}
+
+/** Дождаться условия, не завязываясь на конкретные задержки сети. */
+async function until(cond: () => boolean, ms = 3_000): Promise<void> {
+  const t0 = Date.now();
+  while (!cond()) {
+    if (Date.now() - t0 > ms) throw new Error('условие так и не наступило');
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+/** Кусок звука в том виде, в каком его присылает Attendee. */
+function chunk(bytes = 960): string {
+  return JSON.stringify({
+    trigger: 'realtime_audio.mixed',
+    data: { chunk: Buffer.alloc(bytes).toString('base64'), sample_rate: 24_000 },
+  });
 }
 
 /** Кадр на 20 мс: 480 сэмплов при 24 кГц. */
 const frame = () => new AudioFrame(new Int16Array(SAMPLES_PER_TICK), SAMPLE_RATE, 1, SAMPLES_PER_TICK);
 
 describe('AttendeeAudioOutput', () => {
-  test('кадр уходит в ws правильным триггером и частотой', async () => {
-    const ws = fakeWs();
-    await new AttendeeAudioOutput(ws).captureFrame(frame());
-    assert.equal(ws.sent.length, 1);
-    assert.equal(ws.sent[0].trigger, 'realtime_audio.bot_output');
-    assert.equal(ws.sent[0].data.sample_rate, 24_000);
+  test('кадр уходит в хаб правильным триггером и частотой', async () => {
+    const hub = fakeHub();
+    await new AttendeeAudioOutput(hub).captureFrame(frame());
+    assert.equal(hub.sent.length, 1);
+    assert.equal(hub.sent[0].trigger, 'realtime_audio.bot_output');
+    assert.equal(hub.sent[0].data.sample_rate, 24_000);
     // 480 сэмплов PCM16 → 960 байт.
-    assert.equal(Buffer.from(ws.sent[0].data.chunk, 'base64').length, 960);
+    assert.equal(Buffer.from(hub.sent[0].data.chunk, 'base64').length, 960);
   });
 
   test('позиция сегмента считается В СЕКУНДАХ', async () => {
     // Главная проверка этого файла. Миллисекунды OpenAI отбивал командой
     // обрезки («Audio content of 34350ms is already shorter than 10799999ms»),
     // сегмент зависал, и ассистент выпадал из встречи посреди фразы.
-    const ws = fakeWs();
-    const out = new AttendeeAudioOutput(ws);
+    const out = new AttendeeAudioOutput(fakeHub());
     let finished: any;
     (out as any).onPlaybackFinished = (e: any) => { finished = e; };
     for (let i = 0; i < 50; i++) await out.captureFrame(frame()); // 50 × 20 мс = 1 с
@@ -61,8 +81,7 @@ describe('AttendeeAudioOutput', () => {
   });
 
   test('сегмент открывается ровно раз на серию кадров', async () => {
-    const ws = fakeWs();
-    const out = new AttendeeAudioOutput(ws);
+    const out = new AttendeeAudioOutput(fakeHub());
     let starts = 0;
     (out as any).onPlaybackStarted = () => { starts++; };
     await out.captureFrame(frame());
@@ -72,7 +91,7 @@ describe('AttendeeAudioOutput', () => {
 
   test('flush без кадров ничего не закрывает', () => {
     // Иначе сессия получила бы конец реплики, которой не было.
-    const out = new AttendeeAudioOutput(fakeWs());
+    const out = new AttendeeAudioOutput(fakeHub());
     let closed = 0;
     (out as any).onPlaybackFinished = () => { closed++; };
     out.flush();
@@ -80,7 +99,7 @@ describe('AttendeeAudioOutput', () => {
   });
 
   test('второй flush поверх закрытого сегмента не повторяет событие', async () => {
-    const out = new AttendeeAudioOutput(fakeWs());
+    const out = new AttendeeAudioOutput(fakeHub());
     let closed = 0;
     (out as any).onPlaybackFinished = () => { closed++; };
     await out.captureFrame(frame());
@@ -91,7 +110,7 @@ describe('AttendeeAudioOutput', () => {
 
   test('перебивание закрывает сегмент как прерванный', async () => {
     // Без этого сессия ждала бы конца реплики, которой уже не будет.
-    const out = new AttendeeAudioOutput(fakeWs());
+    const out = new AttendeeAudioOutput(fakeHub());
     let finished: any;
     (out as any).onPlaybackFinished = (e: any) => { finished = e; };
     await out.captureFrame(frame());
@@ -100,7 +119,7 @@ describe('AttendeeAudioOutput', () => {
   });
 
   test('следующий сегмент начинает счёт с нуля', async () => {
-    const out = new AttendeeAudioOutput(fakeWs());
+    const out = new AttendeeAudioOutput(fakeHub());
     const positions: number[] = [];
     (out as any).onPlaybackFinished = (e: any) => { positions.push(e.playbackPosition); };
     await out.captureFrame(frame());
@@ -112,12 +131,23 @@ describe('AttendeeAudioOutput', () => {
     assert.ok(positions[1] > positions[0], 'счётчик не обнулился между сегментами');
   });
 
-  test('закрытый ws кадры не роняют', async () => {
-    const ws = fakeWs();
-    ws.readyState = 3; // CLOSED
-    const out = new AttendeeAudioOutput(ws);
+  test('нет соединения — кадры в пустоту, но сегмент ведётся как обычно', async () => {
+    // Пара onPlaybackStarted/onPlaybackFinished обязана сойтись даже когда
+    // отправлять некуда: обрыв теперь не конец встречи, а ожидание возврата
+    // бота. Если сегмент не закрыть, сессия будет ждать конца реплики,
+    // которой уже не будет, и умолкнет навсегда — а бот к этому времени
+    // вернётся, и молчание останется необъяснимым.
+    const hub = fakeHub(false);
+    const out = new AttendeeAudioOutput(hub);
+    let starts = 0;
+    let finished: any;
+    (out as any).onPlaybackStarted = () => { starts++; };
+    (out as any).onPlaybackFinished = (e: any) => { finished = e; };
     await out.captureFrame(frame());
-    assert.equal(ws.sent.length, 0);
+    out.flush();
+    assert.equal(hub.sent.length, 0, 'отправлять было некуда');
+    assert.equal(starts, 1);
+    assert.ok(finished, 'сегмент обязан закрыться');
   });
 });
 
@@ -179,7 +209,7 @@ describe('AttendeeAudioHub', () => {
       const { WebSocket: Client } = await import('ws');
       const bad = new Client(`ws://127.0.0.1:${port}/?callId=ЧУЖОЙ`);
       await new Promise((r) => bad.on('close', r));
-      assert.equal(await waiting, null, 'чужое соединение не должно считаться нашим');
+      assert.equal(await waiting, false, 'чужое соединение не должно считаться нашим');
     } finally { hub.close(); }
   });
 
@@ -197,25 +227,134 @@ describe('AttendeeAudioHub', () => {
       // необработанным исключением уже ПОСЛЕ конца теста, а не просто
       // фейлит его.
       client.on('error', () => {});
-      const ws = await waiting;
-      assert.ok(ws, 'соединение должно быть получено');
-      // Оба конца закрываем явно: wss.close() у 'ws' не трогает уже
+      assert.equal(await waiting, true, 'соединение должно быть принято');
+      // Сокет наружу больше не отдаётся — им владеет хаб, и закрывает его
+      // тоже он. Оба конца закрываем явно: wss.close() у 'ws' не трогает уже
       // установленные соединения, а незакрытый сокет держит event loop —
       // без --test-force-exit процесс этого тестового файла зависает
       // навсегда, а не просто не проходит тест. Поймано по факту 07.09.2026:
       // осиротевший процесс tsx висел на ноде CI до ручного kill.
-      ws?.terminate();
     } finally {
       client?.terminate();
       hub.close();
     }
   });
 
-  test('не дождались — null по таймауту', async () => {
+  test('не дождались — false по таймауту', async () => {
     const hub = new AttendeeAudioHub();
     try {
       await hub.listen('c1');
-      assert.equal(await hub.expect(300), null);
+      assert.equal(await hub.expect(300), false);
     } finally { hub.close(); }
+  });
+
+  test('звук идёт наружу через хаб, а не через сокет', async () => {
+    const hub = new AttendeeAudioHub();
+    let client: any;
+    try {
+      const port = await hub.listen('c1');
+      const got: number[] = [];
+      hub.onMessage((m) => got.push(Buffer.from(m.data.chunk, 'base64').length));
+      const { WebSocket: Client } = await import('ws');
+      client = new Client(`ws://127.0.0.1:${port}/?callId=c1`);
+      client.on('error', () => {});
+      await hub.expect(5_000);
+      await new Promise((r) => client.on('open', r));
+      client.send(chunk(960));
+      client.send('{это не JSON');            // мусор не должен ронять приём
+      client.send(JSON.stringify({ trigger: 'realtime_audio.bot_output' })); // чужой триггер
+      client.send(chunk(480));
+      await until(() => got.length === 2);
+      assert.deepEqual(got, [960, 480]);
+    } finally {
+      client?.terminate();
+      hub.close();
+    }
+  });
+
+  test('ПЕРЕподключение принимается, и звук продолжает идти', async () => {
+    // Главная проверка этого файла. 09.09.2026 на живой встрече вебсокет
+    // оборвался на 95-й секунде, Attendee постучался снова — и получил
+    // отказ, потому что хаб отдавал соединение ровно один раз. Встреча
+    // оборвалась на середине разговора.
+    const hub = new AttendeeAudioHub(60_000);
+    let first: any;
+    let second: any;
+    try {
+      const port = await hub.listen('c1');
+      const got: number[] = [];
+      hub.onMessage((m) => got.push(Buffer.from(m.data.chunk, 'base64').length));
+      let lost = false;
+      hub.onLost(() => { lost = true; });
+      const { WebSocket: Client } = await import('ws');
+
+      first = new Client(`ws://127.0.0.1:${port}/?callId=c1`);
+      first.on('error', () => {});
+      await hub.expect(5_000);
+      await new Promise((r) => first.on('open', r));
+      first.send(chunk(960));
+      await until(() => got.length === 1);
+
+      first.close();
+      second = new Client(`ws://127.0.0.1:${port}/?callId=c1`);
+      second.on('error', () => {});
+      await new Promise((r) => second.on('open', r));
+      second.send(chunk(480));
+      await until(() => got.length === 2);
+      assert.deepEqual(got, [960, 480], 'звук после переподключения не дошёл');
+      assert.equal(lost, false, 'вернувшийся бот не повод считать звук потерянным');
+      assert.equal(hub.send({ trigger: 'realtime_audio.bot_output' }), true,
+        'вывод обязан писать в новое соединение');
+    } finally {
+      first?.terminate();
+      second?.terminate();
+      hub.close();
+    }
+  });
+
+  test('не вернулся за отведённое время — звук потерян', async () => {
+    const hub = new AttendeeAudioHub(80);
+    let client: any;
+    try {
+      const port = await hub.listen('c1');
+      let lost = 0;
+      hub.onLost(() => { lost++; });
+      const { WebSocket: Client } = await import('ws');
+      client = new Client(`ws://127.0.0.1:${port}/?callId=c1`);
+      client.on('error', () => {});
+      await hub.expect(5_000);
+      // Пока окно не вышло — звук ещё не потерян, и сессию закрывать рано.
+      client.close();
+      await until(() => hub.send({ x: 1 }) === false);
+      assert.equal(lost, 0, 'потеря объявлена, не дождавшись возврата');
+      await until(() => lost === 1);
+      assert.equal(lost, 1);
+    } finally {
+      client?.terminate();
+      hub.close();
+    }
+  });
+
+  test('уже потерянный звук отдаётся сразу при подписке', async () => {
+    // Обрыв может случиться в окне между ожиданием звука и стартом сессии, а
+    // подписаться раньше нельзя — закрывать ещё нечего. Без этого встреча
+    // висела бы до двухчасового потолка, тикая тишиной.
+    const hub = new AttendeeAudioHub(50);
+    let client: any;
+    try {
+      const port = await hub.listen('c1');
+      const { WebSocket: Client } = await import('ws');
+      client = new Client(`ws://127.0.0.1:${port}/?callId=c1`);
+      client.on('error', () => {});
+      await hub.expect(5_000);
+      client.close();
+      await new Promise((r) => setTimeout(r, 200));
+      let lost = false;
+      hub.onLost(() => { lost = true; });
+      assert.equal(lost, true);
+    } finally {
+      client?.terminate();
+      hub.close();
+    }
   });
 });

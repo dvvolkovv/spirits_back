@@ -15,7 +15,6 @@ import {
 import * as openai from '@livekit/agents-plugin-openai';
 import { RoomEvent } from '@livekit/rtc-node';
 import { z } from 'zod';
-import type { WebSocket } from 'ws';
 import { backend, type TranscriptEntry } from './backend.js';
 import { PendingAnswers } from './pending.js';
 import { NameGate } from './name-gate.js';
@@ -145,6 +144,60 @@ export default defineAgent({
     await ctx.connect();
 
     /**
+     * Состояние встречи Meet — с САМОГО НАЧАЛА.
+     *
+     * Обработчик регистрируется здесь, а не вместе с остальными сообщениями
+     * дата-канала ниже по файлу, и это не стилистика. Ниже он оказывается
+     * ПОСЛЕ ожидания звука, которое длится до двух минут, — а всё, что
+     * приезжает в это окно, самое важное: бота не пустили, бот вошёл, первый
+     * человек присоединился. На живой встрече 09.09.2026 в это окно уехали
+     * все события состава: Роман потом весь разговор считал, что во встрече
+     * никого, и `meetingFirstHuman` не дёрнулся — звонок остался `dialing` и
+     * запер владельцу следующий вход до реапера.
+     *
+     * Реакция на терминальное состояние бота меняется по ходу: до старта
+     * сессии её закрывать нечем, поэтому обработчик зовёт `onMeetFatal`, а тот
+     * подменяется. Само состояние ещё и запоминается — иначе сигнал,
+     * пришедший в момент старта сессии, снова потерялся бы.
+     */
+    let meetFatal: string | null = null;
+    let onMeetFatal: ((state: string) => void) | null = null;
+    if (isMeet) {
+      ctx.room.on(RoomEvent.DataReceived, (payload, _p: any, _k: any, topic?: string) => {
+        if (topic !== TOPIC) return;
+        let msg: any;
+        try { msg = JSON.parse(new TextDecoder().decode(payload)); } catch { return; }
+        if (msg?.v !== 1) return; // контракт версионирован — чужую версию не трогаем
+
+        if (msg.type === 'meet_participant') {
+          presence?.apply({ event: msg.event, uuid: msg.uuid, name: msg.name });
+          // occupancy ведёт участников множеством по ключу — отдаём ему uuid,
+          // а не имя: тёзки иначе схлопнулись бы в одного, и уход одного из
+          // них выглядел бы как уход обоих.
+          if (msg.event === 'join') occupancy?.joined(msg.uuid);
+          else occupancy?.left(msg.uuid);
+          syncFromPresence();
+          if (msg.event === 'join') {
+            // Отметка «встреча началась». Без неё voice_calls.status навсегда
+            // остаётся dialing и запирает пользователю следующий вход до
+            // реапера — то есть на 130 минут.
+            void backend.meetingFirstHuman(meta.callId).catch(() => {});
+          }
+          return;
+        }
+        if (msg.type === 'meet_speaking') {
+          presence?.speech(msg.uuid, msg.name, msg.speaking);
+          currentSpeaker = presence?.speaker;
+          return;
+        }
+        if (msg.type === 'meet_bot_state' && msg.fatal) {
+          meetFatal = String(msg.state);
+          onMeetFatal?.(meetFatal);
+        }
+      });
+    }
+
+    /**
      * Чужая комната. Наша при этом остаётся пустой и нужна ради job:
      * жизненный цикл, учёт и reaper завязаны на неё.
      */
@@ -174,7 +227,6 @@ export default defineAgent({
      * прежнего плана — сначала мы занимаем порт, потом просим бэкенд создать
      * бота с нашим адресом. Наоборот нельзя: бот подключался бы в никуда.
      */
-    let attendeeWs: WebSocket | null = null;
     let attendeeHub: AttendeeAudioHub | null = null;
     if (isMeet) {
       attendeeHub = new AttendeeAudioHub();
@@ -201,33 +253,24 @@ export default defineAgent({
       }
       // Ждём звук, но НЕ только его: гонка с ранним сигналом о провале входа.
       //
-      // Обработчик DataReceived регистрируется много ниже по файлу, а это
-      // ожидание висит здесь — то есть в окне, когда сообщение «бот не смог
-      // войти» важнее всего, слушать его ещё некому, и оно приходит в
-      // пустоту. Проверено на стенде 09.09.2026: Attendee доставил
+      // Ожидание длится до двух минут, и без гонки «бота не пустили» ждало бы
+      // их все. Проверено на стенде 09.09.2026: Attendee доставил
       // bot.state_change=fatal_error, ручка его приняла и отправила в
       // комнату, а воркер всё равно висел все две минуты и потом сообщал
       // «звук не подключился» вместо настоящей причины.
       //
-      // Отдельный слушатель, а не перенос основного: основной завязан на
-      // session, а её здесь ещё нет.
-      let onFatal: ((state: string) => void) | null = null;
+      // Сигнал берём у раннего обработчика выше — и вместе с уже
+      // запомненным: провал мог приехать в те доли секунды, что заняло
+      // создание бота.
       const fatalSignal = new Promise<string>((resolve) => {
-        onFatal = resolve;
+        onMeetFatal = resolve;
+        if (meetFatal) resolve(meetFatal);
       });
-      const earlyFatal = (payload: Uint8Array, _p: any, _k: any, topic?: string) => {
-        if (topic !== TOPIC) return;
-        try {
-          const m = JSON.parse(new TextDecoder().decode(payload));
-          if (m?.v === 1 && m.type === 'meet_bot_state' && m.fatal) onFatal?.(String(m.state));
-        } catch { /* чужое сообщение — не наша забота */ }
-      };
-      ctx.room.on(RoomEvent.DataReceived, earlyFatal);
       const outcome = await Promise.race([
-        attendeeHub.expect().then((ws) => ({ kind: 'ws' as const, ws })),
+        attendeeHub.expect().then((connected) => ({ kind: 'ws' as const, connected })),
         fatalSignal.then((state) => ({ kind: 'fatal' as const, state })),
       ]);
-      ctx.room.off(RoomEvent.DataReceived, earlyFatal);
+      onMeetFatal = null;
 
       if (outcome.kind === 'fatal') {
         // Бот не вошёл. Сообщаем НАСТОЯЩУЮ причину, а не таймаут звука.
@@ -237,8 +280,7 @@ export default defineAgent({
         try { await ctx.room.disconnect(); } catch {}
         return;
       }
-      attendeeWs = outcome.ws;
-      if (!attendeeWs) {
+      if (!outcome.connected) {
         // Бот создан, но так и не подключился к нам — заявленные Attendee
         // ретраи (до 30 раз по 2с) и запуск Chrome не уложились в отведённое
         // время. Закрываемся сразу и внятно, а не сидим в пустой комнате.
@@ -247,11 +289,10 @@ export default defineAgent({
         try { await ctx.room.disconnect(); } catch {}
         return;
       }
-      // Обрыв посреди встречи: без обработчика 'close' ассистент говорил бы
-      // в пустоту до двухчасового потолка, а вход тикал бы тишиной —
-      // неотличимо от «никто не говорит». Сама подписка — НИЖЕ, после
-      // session.start(): здесь, в точке получения attendeeWs, переменная
-      // session ещё не объявлена (см. отчёт по ревью 07.09.2026).
+      // Обрыв посреди встречи хаб переживает сам: сокет принадлежит ему, и
+      // вернувшийся бот подхватывает разговор незаметно для сессии. Наружу
+      // выходит только «не вернулся вовсе» — подписка на это ниже, после
+      // session.start(), потому что закрывать там будет уже что.
       console.log('[meet] звук Attendee на связи');
     }
 
@@ -487,34 +528,10 @@ export default defineAgent({
       }
       // specialist_pending предназначен фронту — игнорируем.
 
-      if (msg.type === 'meet_participant') {
-        presence?.apply({ event: msg.event, uuid: msg.uuid, name: msg.name });
-        // occupancy ведёт участников множеством по ключу — отдаём ему uuid,
-        // а не имя: тёзки иначе схлопнулись бы в одного, и уход одного из них
-        // выглядел бы как уход обоих.
-        if (msg.event === 'join') occupancy?.joined(msg.uuid);
-        else occupancy?.left(msg.uuid);
-        syncFromPresence();
-        if (msg.event === 'join') {
-          // Отметка «встреча началась». Без неё voice_calls.status навсегда
-          // остаётся dialing и запирает пользователю следующий вход до
-          // реапера — то есть на 130 минут.
-          void backend.meetingFirstHuman(meta.callId).catch(() => {});
-        }
-        return;
-      }
-      if (msg.type === 'meet_speaking') {
-        presence?.speech(msg.uuid, msg.name, msg.speaking);
-        currentSpeaker = presence?.speaker;
-        return;
-      }
-      if (msg.type === 'meet_bot_state' && msg.fatal) {
-        // Не пустили, выгнали или бот умер: встречи не будет.
-        console.log(`[meet] бот в состоянии ${msg.state} — выходим`);
-        void backend.failed(meta.callId, `бот Attendee: ${msg.state}`).catch(() => {});
-        void session.close().catch(() => {});
-        return;
-      }
+      // Сообщения meet_* разбирает СВОЙ обработчик, зарегистрированный сразу
+      // после ctx.connect(). Здесь их нет намеренно: этот обработчик
+      // появляется только после ожидания звука, и состав встречи, приехавший
+      // в это окно, терялся бы (живая встреча 09.09.2026).
     });
 
     // Свободен — это именно 'listening'/'idle'. Раньше здесь стояло
@@ -771,13 +788,10 @@ export default defineAgent({
       // останется висеть у них в списке.
       try { await foreignOutput?.close(); } catch {}
       try { await foreign?.disconnect(); } catch {}
-      // Закрываем только соединение: своей очереди звука у вывода нет, и
-      // метода close() у него, в отличие от ExternalRoomAudioOutput, тоже —
-      // публиковать и снимать дорожку здесь нечего.
-      try { attendeeWs?.close(); } catch {}
-      // Хаб теперь одноразовый, на задание, — держит занятый порт до сих
-      // пор, если не закрыть явно. Раньше close() не вызывался вовсе: хаб
-      // жил на уровне модуля и порт освобождать было незачем.
+      // Хаб закрывает и соединение, и слушающий порт: он их владелец. Своей
+      // очереди звука у вывода нет, и метода close() у него, в отличие от
+      // ExternalRoomAudioOutput, тоже — публиковать и снимать дорожку здесь
+      // нечего.
       attendeeHub?.close();
     });
 
@@ -792,11 +806,12 @@ export default defineAgent({
     // audioEnabled при этом трогать нельзя: с `false` условие выше не
     // сработает, а заодно заглушится весь аудиотракт.
     if (isMeeting) {
-      if (isMeet && attendeeWs) {
+      if (isMeet && attendeeHub) {
         // Meet: звук целиком в вебсокете, комнаты для него нет вовсе — ни
-        // своей, ни чужой.
-        session.input.audio = new AttendeeAudioInput(attendeeWs);
-        session.output.audio = new AttendeeAudioOutput(attendeeWs);
+        // своей, ни чужой. Оба конца держат ХАБ, а не сокет: сокет сменится
+        // при первом же переподключении Attendee.
+        session.input.audio = new AttendeeAudioInput(attendeeHub);
+        session.output.audio = new AttendeeAudioOutput(attendeeHub);
         console.log('[вход] звук Attendee подставлен до старта сессии');
       } else {
         // Оба конца — на ту комнату, где идёт разговор. Микшер принимает любую,
@@ -871,18 +886,29 @@ export default defineAgent({
         ...(isMeeting ? { inputOptions: { closeOnDisconnect: false } } : {}),
       });
 
-      if (isMeet && attendeeWs) {
-        // Подписка на обрыв — ЗДЕСЬ, а не в точке получения attendeeWs выше:
-        // там session ещё не была объявлена (session = new voice.AgentSession
-        // создаётся ниже по файлу, а старая последовательность ждала звук ещё
-        // до неё). Без этого обработчика ассистент говорил бы в пустоту до
+      if (isMeet && attendeeHub) {
+        // Звук потерян окончательно — то есть бот не вернулся за отведённые
+        // хабу полторы минуты. Сам обрыв сюда не доходит: он внутреннее дело
+        // хаба, иначе встреча кончалась бы на первом же сетевом чихе, как
+        // 09.09.2026. Без этой подписки ассистент говорил бы в пустоту до
         // двухчасового потолка, а вход тикал бы тишиной — неотличимо от
-        // «никто не говорит».
-        attendeeWs.on('close', () => {
-          console.log('[meet] звук Attendee оборвался — закрываем сессию');
+        // «никто не говорит». Подписка ЗДЕСЬ, а не выше, потому что закрывать
+        // до session.start() ещё нечего; хаб отдаёт уже случившуюся потерю
+        // сразу при подписке.
+        attendeeHub.onLost(() => {
+          console.log('[meet] звук Attendee потерян — закрываем сессию');
           void backend.failed(meta.callId, 'звук встречи оборвался').catch(() => {});
           void session.close().catch(() => {});
         });
+        // Терминальное состояние бота: теперь есть что закрывать. До этой
+        // строки его принимал раунд ожидания звука выше.
+        onMeetFatal = (state) => {
+          console.log(`[meet] бот в состоянии ${state} — выходим`);
+          void backend.failed(meta.callId, `бот Attendee: ${state}`).catch(() => {});
+          void session.close().catch(() => {});
+        };
+        // Могло приехать, пока сессия стартовала.
+        if (meetFatal) onMeetFatal(meetFatal);
       }
 
       // Первую фразу задаём явно, а не отдаём модели на импровизацию.

@@ -32,10 +32,35 @@ export const SAMPLES_PER_TICK = (SAMPLE_RATE * TICK_MS) / 1000; // 480
 export const CONNECT_TIMEOUT_MS = 120_000;
 
 /** Что Attendee присылает нам. */
-interface InboundAudio {
+export interface InboundAudio {
   trigger: 'realtime_audio.mixed';
   data: { chunk: string; sample_rate: number; timestamp_ms?: number };
 }
+
+/**
+ * Сколько ждём переподключения, прежде чем признать звук потерянным.
+ *
+ * Обрыв посреди встречи — не повод её заканчивать: Attendee ретраит до 30 раз
+ * с интервалом 2 с и обычно возвращается за секунды. Проверено вживую
+ * 09.09.2026 на встрече с владельцем: вебсокет оборвался на 95-й секунде,
+ * прежняя редакция сразу закрыла сессию — и оборвала живой разговор, хотя
+ * Attendee постучался снова через мгновение. Постучался и получил отказ
+ * («[attendee] соединение не для нас» в логе воркера): хаб отдавал соединение
+ * наружу ровно один раз и второе принять не мог.
+ *
+ * Полторы минуты покрывают его ретраи с запасом.
+ */
+export const RECONNECT_GRACE_MS = 90_000;
+
+/**
+ * Как часто пингуем Attendee.
+ *
+ * Причина того обрыва на 95-й секунде не установлена, и пинг здесь —
+ * страховка от посредника, закрывающего соединение по бездействию: звук ОТ
+ * Attendee идёт непрерывно, а наш конец молчит, пока ассистент не говорит, —
+ * а таймауты по бездействию обычно считают именно свою сторону.
+ */
+export const PING_INTERVAL_MS = 30_000;
 
 /**
  * Диапазон портов под приём звука. По умолчанию — ОДИН порт.
@@ -65,11 +90,32 @@ const PORT_MAX = Number(process.env.ATTENDEE_WS_PORT_MAX || 8140);
  *
  * Отсюда и порядок: порт узнаёт тот, кто им владеет, и сообщает бэкенду, а
  * бот создаётся уже после этого.
+ *
+ * Хаб — ВЛАДЕЛЕЦ сокета, а не выдаватель. Вход и выход сессии работают через
+ * него и о переподключении не знают. Прежняя редакция отдавала сокет наружу
+ * один раз, и обрыв означал конец встречи (см. RECONNECT_GRACE_MS).
  */
 export class AttendeeAudioHub {
   private wss?: WebSocketServer;
   private port = 0;
-  private claim?: (ws: WebSocket | null) => void;
+  private callId = '';
+  /** Текущее соединение. `null` — обрыв, ждём переподключения. */
+  private ws: WebSocket | null = null;
+  private onMsg: ((msg: InboundAudio) => void) | null = null;
+  private firstClaim: ((connected: boolean) => void) | null = null;
+  private onLostCb: (() => void) | null = null;
+  private grace?: ReturnType<typeof setTimeout>;
+  private pinger?: ReturnType<typeof setInterval>;
+  private lost = false;
+  private closed = false;
+  private reconnects = 0;
+
+  /**
+   * Окно ожидания возврата бота. Параметр — ради тестов: полторы минуты в
+   * юнит-тесте не подождёшь, а проверять переподключение обязательно нужно
+   * именно тестом. В проде значение одно и по умолчанию.
+   */
+  constructor(private readonly graceMs = RECONNECT_GRACE_MS) {}
 
   /**
    * Занять первый свободный порт диапазона.
@@ -79,6 +125,7 @@ export class AttendeeAudioHub {
    * диапазон.
    */
   async listen(callId: string): Promise<number> {
+    this.callId = callId;
     for (let p = PORT_MIN; p <= PORT_MAX; p++) {
       try {
         this.wss = await this.bind(p);
@@ -104,25 +151,82 @@ export class AttendeeAudioHub {
     // Node бросается синхронно там, где эмитится, и роняет весь процесс
     // задания — посреди живой встречи, без complete и без failed.
     this.wss.on('error', (e) => console.error('[attendee] ошибка сервера', e));
+    this.wss.on('connection', (ws, req) => this.adopt(ws, req.url ?? ''));
 
-    this.wss.on('connection', (ws, req) => {
-      const got = new URL(req.url ?? '', 'http://x').searchParams.get('callId') ?? '';
-      if (got !== callId || !this.claim) {
-        console.log(`[attendee] соединение не для нас: callId=${got}`);
-        ws.close();
-        return;
+    // Держим соединение живым. Интервал — с unref по тем же причинам, что и
+    // тикер входа: иначе задание не завершится и фреймворк убьёт его как
+    // «unresponsive» вместе с недоотправленным complete.
+    this.pinger = setInterval(() => {
+      if (this.ws && this.ws.readyState === this.ws.OPEN) {
+        try { this.ws.ping(); } catch { /* сокет умирает — 'close' разберётся */ }
       }
-      // Тот же довод, что и для сервера: без слушателя сетевой сбой на этом
-      // сокете уронит процесс.
-      ws.on('error', (e) => console.error('[attendee] ошибка сокета', e));
-      const claim = this.claim;
-      this.claim = undefined;
-      console.log(`[attendee] звук подключился, callId=${callId}, порт ${this.port}`);
-      claim(ws);
-    });
+    }, PING_INTERVAL_MS);
+    this.pinger.unref?.();
 
     console.log(`[attendee] жду звук на :${this.port}, callId=${callId}`);
     return this.port;
+  }
+
+  /**
+   * Принять соединение — первое или пришедшее на замену оборванному.
+   *
+   * Переподключение отсюда наружу не видно вовсе: наружу выходит только
+   * onLost(), то есть случай «бот так и не вернулся».
+   */
+  private adopt(ws: WebSocket, url: string): void {
+    const got = new URL(url, 'http://x').searchParams.get('callId') ?? '';
+    if (this.closed || this.lost || got !== this.callId) {
+      console.log(`[attendee] соединение не для нас: callId=${got}`);
+      ws.close();
+      return;
+    }
+    // Тот же довод, что и для сервера: без слушателя сетевой сбой на этом
+    // сокете уронит процесс.
+    ws.on('error', (e) => console.error('[attendee] ошибка сокета', e));
+
+    const again = this.ws !== null || this.grace !== undefined;
+    if (this.grace) {
+      clearTimeout(this.grace);
+      this.grace = undefined;
+    }
+    // Прежний сокет закрываем сами: Attendee мог открыть новый, не закрыв
+    // старый, и тогда звук шёл бы к нам в два потока — микшер сложил бы
+    // встречу саму с собой.
+    if (this.ws && this.ws !== ws) {
+      try { this.ws.close(); } catch { /* уже мёртв */ }
+    }
+    this.ws = ws;
+    if (again) this.reconnects++;
+
+    ws.on('message', (raw: any) => {
+      if (!this.onMsg) return;
+      let msg: InboundAudio;
+      try { msg = JSON.parse(raw.toString()); } catch { return; }
+      if (msg.trigger !== 'realtime_audio.mixed' || !msg.data?.chunk) return;
+      this.onMsg(msg);
+    });
+
+    ws.on('close', () => {
+      if (this.ws !== ws) return;   // закрылся уже заменённый сокет
+      this.ws = null;
+      if (this.closed) return;
+      console.log(`[attendee] звук оборвался, ждём возврата до ${this.graceMs / 1000}с`);
+      this.grace = setTimeout(() => {
+        this.grace = undefined;
+        this.lost = true;
+        console.log('[attendee] бот не вернулся — звук потерян');
+        this.onLostCb?.();
+      }, this.graceMs);
+      this.grace.unref?.();
+    });
+
+    console.log(
+      `[attendee] звук ${again ? `ПЕРЕподключился (${this.reconnects})` : 'подключился'}` +
+      `, callId=${this.callId}, порт ${this.port}`,
+    );
+    const claim = this.firstClaim;
+    this.firstClaim = null;
+    claim?.(true);
   }
 
   private bind(port: number): Promise<WebSocketServer> {
@@ -155,21 +259,62 @@ export class AttendeeAudioHub {
     return `${base}/attendee/${this.port}?callId=${encodeURIComponent(callId)}`;
   }
 
-  /** Дождаться подключения. `null` — не дождались за отведённое время. */
-  expect(timeoutMs = CONNECT_TIMEOUT_MS): Promise<WebSocket | null> {
+  /**
+   * Дождаться ПЕРВОГО подключения. `false` — не дождались за отведённое время.
+   *
+   * Дальше ждать нечего: обрывы и переподключения хаб переживает сам, и
+   * наружу выходит только onLost().
+   */
+  expect(timeoutMs = CONNECT_TIMEOUT_MS): Promise<boolean> {
+    if (this.ws) return Promise.resolve(true);
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
-        this.claim = undefined;
+        this.firstClaim = null;
         console.log(`[attendee] звук так и не подключился за ${timeoutMs / 1000}с`);
-        resolve(null);
+        resolve(false);
       }, timeoutMs);
       timer.unref?.();
-      this.claim = (ws) => { clearTimeout(timer); resolve(ws); };
+      this.firstClaim = (connected) => { clearTimeout(timer); resolve(connected); };
     });
   }
 
+  /**
+   * Звук потерян окончательно: оборвался и переподключения не случилось.
+   *
+   * Если это уже произошло до подписки — зовём сразу. Иначе сигнал терялся бы
+   * в окне между обрывом и стартом сессии, а встреча висела бы до
+   * двухчасового потолка, тикая тишиной.
+   */
+  onLost(cb: () => void): void {
+    this.onLostCb = cb;
+    if (this.lost) cb();
+  }
+
+  /** Подписка входа сессии на куски звука. Слушатель один — последний. */
+  onMessage(cb: (msg: InboundAudio) => void): void {
+    this.onMsg = cb;
+  }
+
+  /**
+   * Отправить кадр в текущее соединение.
+   *
+   * `false` — соединения нет (обрыв, ждём возврата). Кадр в этом случае
+   * роняется: очередь копить бессмысленно, к возвращению бота реплика уже
+   * потеряет смысл, а сессия ждёт от вывода потока в реальном времени.
+   */
+  send(payload: unknown): boolean {
+    if (!this.ws || this.ws.readyState !== this.ws.OPEN) return false;
+    this.ws.send(JSON.stringify(payload));
+    return true;
+  }
+
   close(): void {
+    this.closed = true;
+    if (this.grace) clearTimeout(this.grace);
+    if (this.pinger) clearInterval(this.pinger);
+    try { this.ws?.close(); } catch {}
     try { this.wss?.close(); } catch {}
+    this.ws = null;
     this.wss = undefined;
   }
 }
@@ -190,7 +335,7 @@ export class AttendeeAudioInput extends voice.AudioInput {
   private framesIn = 0;
   private ticks = 0;
 
-  constructor(private readonly ws: WebSocket) {
+  constructor(private readonly hub: AttendeeAudioHub) {
     super();
 
     const source = new ReadableStream<AudioFrame>({
@@ -203,10 +348,10 @@ export class AttendeeAudioInput extends voice.AudioInput {
     });
     this.multiStream.addInputStream(source);
 
-    this.ws.on('message', (raw: any) => {
-      let msg: InboundAudio;
-      try { msg = JSON.parse(raw.toString()); } catch { return; }
-      if (msg.trigger !== 'realtime_audio.mixed' || !msg.data?.chunk) return;
+    // Через хаб, а не через сокет: сокет меняется при переподключении, и
+    // вход не должен об этом знать.
+    this.hub.onMessage((msg) => {
+      if (this.closed) return;
       const buf = Buffer.from(msg.data.chunk, 'base64');
       // PCM16 little-endian. Копируем в свой буфер: Int16Array поверх чужого
       // Buffer живёт ровно до следующего сообщения ws.
@@ -256,14 +401,14 @@ export class AttendeeAudioOutput extends voice.AudioOutput {
   private pushedSec = 0;
   private interrupted = false;
   private frames = 0;
+  private dropped = 0;
 
-  constructor(private readonly ws: WebSocket) {
+  constructor(private readonly hub: AttendeeAudioHub) {
     super(SAMPLE_RATE);
   }
 
   async captureFrame(frame: AudioFrame): Promise<void> {
     await super.captureFrame(frame);
-    if (this.ws.readyState !== this.ws.OPEN) return;
     if (!this.segmentOpen) {
       this.segmentOpen = true;
       this.segment += 1;
@@ -272,10 +417,17 @@ export class AttendeeAudioOutput extends voice.AudioOutput {
     }
     const buf = Buffer.alloc(frame.data.length * 2);
     for (let i = 0; i < frame.data.length; i++) buf.writeInt16LE(frame.data[i], i * 2);
-    this.ws.send(JSON.stringify({
+    // Соединения может не быть — обрыв, ждём возврата бота. Кадр тогда
+    // роняем, но сегмент ведём как обычно: пара onPlaybackStarted /
+    // onPlaybackFinished обязана сойтись, иначе сессия будет ждать конца
+    // реплики, которой уже не будет, и умолкнет навсегда.
+    const sent = this.hub.send({
       trigger: 'realtime_audio.bot_output',
       data: { chunk: buf.toString('base64'), sample_rate: SAMPLE_RATE },
-    }));
+    });
+    if (!sent && ++this.dropped % 250 === 0) {
+      console.log(`[выход] кадров в пустоту: ${this.dropped} — звука нет`);
+    }
     this.pushedSec += frame.samplesPerChannel / SAMPLE_RATE;
     if (++this.frames % 250 === 0) console.log(`[выход] кадров ассистента: ${this.frames}`);
   }
