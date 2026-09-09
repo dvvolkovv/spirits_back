@@ -177,12 +177,21 @@ export class MeetWebhookController {
           name: String(d.participant_name ?? ''),
           speaking: d.event_type === 'speech_start',
         };
-      case 'bot.state_change':
+      case 'bot.state_change': {
+        // Код причины: `event_sub_type` точнее, `event_type` — если подтипа
+        // нет. Без него в базе оказывалось «бот Attendee: fatal_error», а
+        // настоящая причина («никто не ответил на просьбу впустить») лежала
+        // только в логах контейнера. Живой прогон 09.09.2026: payload несёт
+        // `event_type: could_not_join_meeting`,
+        // `event_sub_type: request_to_join_denied`.
+        const sub = String(d.event_sub_type ?? d.event_type ?? '');
         return {
           v: 1, type: 'meet_bot_state',
           state: String(d.new_state ?? ''),
           fatal: FATAL_STATES.has(String(d.new_state ?? '')),
+          ...(sub ? { sub } : {}),
         };
+      }
       default:
         return null;
     }

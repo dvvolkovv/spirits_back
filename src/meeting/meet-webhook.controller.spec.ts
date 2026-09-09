@@ -72,6 +72,32 @@ describe('MeetWebhookController', () => {
     });
   });
 
+  it('код причины доезжает до воркера', async () => {
+    // Без него в базе оказывалось «бот Attendee: fatal_error» и для «никто не
+    // нажал Впустить», и для упавшего Chrome. Живой прогон 09.09.2026: payload
+    // несёт event_type=could_not_join_meeting,
+    // event_sub_type=request_to_join_denied.
+    const p = hook('bot.state_change', {
+      new_state: 'fatal_error', old_state: 'joining',
+      event_type: 'could_not_join_meeting', event_sub_type: 'request_to_join_denied',
+    });
+    await ctl.receive(sign(p), p as any);
+    expect(livekit.send.mock.calls[0][1]).toEqual({
+      v: 1, type: 'meet_bot_state', state: 'fatal_error', fatal: true,
+      sub: 'request_to_join_denied',
+    });
+  });
+
+  it('без подтипа берётся тип события', async () => {
+    // event_sub_type у Attendee часто null — тогда единственная зацепка это
+    // event_type, и терять её нельзя.
+    const p = hook('bot.state_change', {
+      new_state: 'ended', old_state: 'leaving', event_type: 'left_meeting', event_sub_type: null,
+    });
+    await ctl.receive(sign(p), p as any);
+    expect(livekit.send.mock.calls[0][1].sub).toBe('left_meeting');
+  });
+
   it('встреча закончилась — тоже fatal', async () => {
     const p = hook('bot.state_change', { new_state: 'ended', old_state: 'joined_recording' });
     await ctl.receive(sign(p), p as any);

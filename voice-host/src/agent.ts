@@ -23,6 +23,7 @@ import { Presence } from './presence.js';
 import { MixedRoomAudioInput } from './mixed-audio-input.js';
 import { ExternalRoomAudioOutput } from './external-room-output.js';
 import { AttendeeAudioHub, AttendeeAudioInput, AttendeeAudioOutput } from './attendee-audio.js';
+import { botFailureReason } from './attendee-reason.js';
 import { Room as ExternalRoom } from '@livekit/rtc-node';
 import {
   answerTo,
@@ -157,7 +158,7 @@ export default defineAgent({
      *
      * Реакция на терминальное состояние бота меняется по ходу: до старта
      * сессии её закрывать нечем, поэтому обработчик зовёт `onMeetFatal`, а тот
-     * подменяется. Само состояние ещё и запоминается — иначе сигнал,
+     * подменяется. Готовая причина ещё и запоминается — иначе сигнал,
      * пришедший в момент старта сессии, снова потерялся бы.
      */
     let meetFatal: string | null = null;
@@ -191,7 +192,9 @@ export default defineAgent({
           return;
         }
         if (msg.type === 'meet_bot_state' && msg.fatal) {
-          meetFatal = String(msg.state);
+          // Причина, а не состояние: `fatal_error` одинаков и для «не
+          // впустили», и для упавшего Chrome, а строку видит человек.
+          meetFatal = botFailureReason(String(msg.state), msg.sub ? String(msg.sub) : undefined);
           onMeetFatal?.(meetFatal);
         }
       });
@@ -269,14 +272,14 @@ export default defineAgent({
       });
       const outcome = await Promise.race([
         attendeeHub.expect().then((connected) => ({ kind: 'ws' as const, connected })),
-        fatalSignal.then((state) => ({ kind: 'fatal' as const, state })),
+        fatalSignal.then((reason) => ({ kind: 'fatal' as const, reason })),
       ]);
       onMeetFatal = null;
 
       if (outcome.kind === 'fatal') {
         // Бот не вошёл. Сообщаем НАСТОЯЩУЮ причину, а не таймаут звука.
-        console.log(`[meet] бот в состоянии ${outcome.state} до подключения звука — выходим`);
-        await backend.failed(meta.callId, `бот Attendee: ${outcome.state}`).catch(() => {});
+        console.log(`[meet] встреча не состоялась: ${outcome.reason} — выходим`);
+        await backend.failed(meta.callId, outcome.reason).catch(() => {});
         attendeeHub.close();
         try { await ctx.room.disconnect(); } catch {}
         return;
@@ -918,8 +921,8 @@ export default defineAgent({
         });
         // Терминальное состояние бота: теперь есть что закрывать. До этой
         // строки его принимал раунд ожидания звука выше.
-        onMeetFatal = (state) => {
-          void abortMeet(`бот в состоянии ${state} — уходим`, `бот Attendee: ${state}`);
+        onMeetFatal = (reason) => {
+          void abortMeet(`встреча прервана: ${reason} — уходим`, reason);
         };
         // Могло приехать, пока сессия стартовала.
         if (meetFatal) onMeetFatal(meetFatal);

@@ -40,7 +40,11 @@ export type VoiceDataMessage =
    * Состояние бота Attendee. Воркеру нужно только «не пустили»: тогда встречи
    * не будет и сидеть в пустой комнате незачем.
    */
-  | { v: 1; type: 'meet_bot_state'; state: string; fatal: boolean };
+  // `sub` — код причины от Attendee (`event_sub_type`, иначе `event_type`):
+  // `request_to_join_denied`, `waiting_room_timeout_exceeded`,
+  // `meeting_not_found`… Без него состояние `fatal_error` не отличает «нас не
+  // впустили» от «бот сломался», а видит эту строку человек в чате.
+  | { v: 1; type: 'meet_bot_state'; state: string; fatal: boolean; sub?: string };
 
 /** Ответ на /internal/document. Как и ask, возвращается мгновенно. */
 export type DocumentResult =
