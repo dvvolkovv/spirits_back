@@ -1,4 +1,5 @@
 import 'reflect-metadata';
+import { ConflictException } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { ProvisioningService } from './provisioning.service';
 import { SecretsService } from './secrets.service';
@@ -12,6 +13,16 @@ function makeService(over: any = {}) {
       if (sql.includes('SELECT count(*)')) return { rows: [{ count: over.slugTaken ? '1' : '0' }] };
       if (sql.includes('INSERT INTO product_provision_jobs') && over.jobInsertFails) {
         throw Object.assign(new Error('деталь для лога'), { code: '23505' });
+      }
+      if (sql.includes('INSERT INTO products') && over.productInsertRace) {
+        // Имя ограничения снято с живой базы, а не выдумано: products_slug_key.
+        throw Object.assign(new Error('duplicate key value violates unique constraint'), {
+          code: '23505',
+          constraint: 'products_slug_key',
+        });
+      }
+      if (sql.includes('INSERT INTO products') && over.productInsertError) {
+        throw Object.assign(new Error('boom'), over.productInsertError);
       }
       if (sql.includes('INSERT INTO products')) return { rows: [{ id: 'p-1' }], rowCount: 1 };
       return { rows: [], rowCount: 1 };
@@ -47,14 +58,20 @@ describe('ProvisioningService.create', () => {
     expect(sqlOf(calls)).not.toContain('INSERT INTO products');
   });
 
-  it('в базу уходит хеш токена, а открытый возвращается вызывающему', async () => {
+  it('в базу уходит хеш, а живой токен наружу не выпускается вовсе', async () => {
+    // Тест плана требовал вернуть открытый токен. Возвращать его некуда:
+    // агенту токен отдаётся один раз в теле задания, и выпускает его заново
+    // claimJob (задача 4) на каждую выдачу. Выпущенный здесь токен
+    // RunnerGuard принял бы, вызывающий получил бы его в ответе и в лог — и
+    // через минуту токен обесценился бы. Живой креденшл, который никому не
+    // нужно показывать, не должен существовать.
     const { svc, calls } = makeService();
 
     const res = await svc.create({ userId: 'u-1', name: 'X', slug: 's', kind: 'site', secrets: {} });
 
+    expect(res).toEqual({ productId: expect.any(String) });
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
-    expect(insert.params).not.toContain(res.runnerToken);
-    expect(insert.params.some((p) => typeof p === 'string' && p.length === 64)).toBe(true);
+    expect(insert.params[7]).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it('секреты шифруются, а не кладутся как есть', async () => {
@@ -78,13 +95,25 @@ describe('ProvisioningService.create', () => {
   it('секреты шифруются ПОД ТЕМ ЖЕ id, что уходит в INSERT', async () => {
     // Иначе коробка не расшифруется никогда: AAD не совпадёт. Отказ был бы
     // отложенным — заведение прошло бы, а упало бы позже, при сборке задания.
+    //
+    // Сверка идёт с КОНКРЕТНЫМ id, а не через params.toContain(usedId), как
+    // было в первой редакции. toContain — принадлежность, а не позиция:
+    // слаг 'b' и userId 'u-1' тоже лежат в params, поэтому AAD от слага или
+    // от userId проходил зелёным. Измерено, мутации M1 и M2.
     const { svc, calls, secrets } = makeService();
 
-    await svc.create({ userId: 'u-1', name: 'Бот', slug: 'b', kind: 'bot', secrets: { BOT_TOKEN: 'т' } });
+    const res = await svc.create({
+      userId: 'u-1',
+      name: 'Бот',
+      slug: 'b',
+      kind: 'bot',
+      secrets: { BOT_TOKEN: 'т' },
+    });
 
     const usedId = (secrets.encrypt as jest.Mock).mock.calls[0][1];
+    expect(usedId).toBe(res.productId);
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
-    expect(insert.params).toContain(usedId);
+    expect(insert.params[0]).toBe(usedId);
   });
 
   // --- проверки сверх плана ---------------------------------------------
@@ -152,35 +181,43 @@ describe('ProvisioningService.create', () => {
       // Путь внутри контейнера продукта: раннер спавнит claude -p именно там.
       // Хостовый путь (наследие прежней схемы) увёл бы агента в чужой каталог.
       '/product',
-      crypto.createHash('sha256').update(res.runnerToken).digest('hex'),
+      expect.stringMatching(/^[0-9a-f]{64}$/),
       null,
     ]);
   });
 
-  it('в базу уходит sha256 ИМЕННО выданного токена', async () => {
-    // «Строка длиной 64» проходит и для самого токена (32 байта в hex — те же
-    // 64 символа), и для хеша чего угодно постороннего. Тогда RunnerGuard,
-    // сверяющий sha256 предъявленного токена, не нашёл бы продукт никогда, а
-    // раннер получал бы 401 без объяснения.
+  it('хеш не выводится из значений, которые вызывающий и так знает', async () => {
+    // RunnerGuard ищет продукт по sha256 ПРЕДЪЯВЛЕННОГО токена. Если в
+    // runner_token_hash лежит sha256 от productId (или от слага, имени,
+    // userId), то это значение и есть рабочий токен: кто знает id продукта —
+    // тот проходит охрану раннера. Проверка длины «64 hex» такую подмену не
+    // видит вовсе.
     const { svc, calls } = makeService();
 
     const res = await svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: {} });
 
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
-    expect(insert.params).toContain(crypto.createHash('sha256').update(res.runnerToken).digest('hex'));
+    const sha = (v: string) => crypto.createHash('sha256').update(v).digest('hex');
+    for (const known of [res.productId, 'site1', 'u-1', 'X', '/product', 'site']) {
+      expect(insert.params[7]).not.toBe(sha(known));
+    }
   });
 
-  it('токен у каждого продукта свой', async () => {
-    // Константа вместо randomBytes проходит и «не равен хешу», и проверку
-    // длины: один токен открывал бы доступ ко всем продуктам сразу.
+  it('хеш у каждого продукта свой', async () => {
+    // Константа вместо randomBytes проходит и «не выводится из известного», и
+    // проверку длины. А колонка UNIQUE: второе заведение падало бы на
+    // products_runner_token_hash_key — то есть заводился бы ровно один
+    // продукт на всю установку.
     const a = makeService();
     const b = makeService();
 
     const one = await a.svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: {} });
     const two = await b.svc.create({ userId: 'u-1', name: 'X', slug: 'site2', kind: 'site', secrets: {} });
 
-    expect(one.runnerToken).toMatch(/^[0-9a-f]{64}$/);
-    expect(two.runnerToken).not.toBe(one.runnerToken);
+    const hashOf = (c: { sql: string; params: any[] }[]) =>
+      c.find((x) => x.sql.includes('INSERT INTO products'))!.params[7];
+    expect(hashOf(a.calls)).toMatch(/^[0-9a-f]{64}$/);
+    expect(hashOf(b.calls)).not.toBe(hashOf(a.calls));
     expect(two.productId).not.toBe(one.productId);
   });
 
@@ -241,13 +278,20 @@ describe('ProvisioningService.create', () => {
     expect(calls).toEqual([]);
   });
 
-  it('слаг с дефисом по краям отвергается', async () => {
+  it('слаг вне алфавита и с дефисом по краям отвергается', async () => {
     // `-rf` первым аргументом docker/nginx разбирается как флаг, а метка
     // домена с дефисом по краям невалидна. Регексп из плана
     // /^[a-z0-9-]{2,40}$/ такое пропускает.
+    //
+    // Алфавит проверяется отдельно, потому что комментарий и текст ошибки
+    // обещают «строчные латинские, цифры и дефис», а измерение показало: без
+    // этих трёх случаев мутация, разрешающая `_`, `.` и заглавные, зелёная.
+    // Опаснее всех точка: `a.b` дало бы `a.b.p.linkeon.io`, а сертификат
+    // `*.p.linkeon.io` вторую метку не покрывает — TLS отвалился бы уже
+    // ПОСЛЕ развёртывания, то есть на успешно заведённом продукте.
     const { svc } = makeService();
 
-    for (const slug of ['-site', 'site-', '--']) {
+    for (const slug of ['-site', 'site-', '--', 'my_site', 'a.b', 'Site1']) {
       await expect(
         svc.create({ userId: 'u-1', name: 'X', slug, kind: 'site', secrets: {} }),
       ).rejects.toThrow(/дефис/i);
@@ -304,6 +348,73 @@ describe('ProvisioningService.create', () => {
       ).rejects.toThrow(/секрет/i);
 
       expect(sqlOf(calls)).not.toContain('INSERT INTO products');
+    }
+  });
+
+  it('секреты не переданы вовсе — заведение проходит, в базу идёт NULL', async () => {
+    // Guard `input.secrets ?? {}` без этой проверки не сторожился ничем:
+    // снятие обоих `?? {}` не роняло ни одного теста. Сервис лежит в exports
+    // модуля, и следующий вызывающий (не контроллер задачи 7, который подаёт
+    // `body.secrets ?? {}`) получил бы TypeError на Object.entries(undefined).
+    const { svc, calls, secrets } = makeService();
+
+    const res = await svc.create({
+      userId: 'u-1',
+      name: 'X',
+      slug: 'site1',
+      kind: 'site',
+      secrets: undefined as any,
+    });
+
+    expect(res.productId).toEqual(expect.any(String));
+    expect(secrets.encrypt).not.toHaveBeenCalled();
+    const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
+    expect(insert.params[8]).toBeNull();
+  });
+
+  it('многострочное значение секрета проходит: PEM-ключ законен', async () => {
+    // Решение, а не недосмотр: перенос строки внутри ЗНАЧЕНИЯ не запрещается,
+    // потому что приватный ключ в PEM — обычный секрет продукта. Запрет
+    // выглядел бы как ужесточение защиты, а на деле отрезал бы законный
+    // случай, и без этой проверки такое ужесточение прошло бы зелёным.
+    //
+    // Обратная сторона: инъекция `KEY=x\nOTHER=y` в env-файле остаётся
+    // возможной, и экранировать обязан тот, кто env собирает (задача 4) —
+    // либо отдавать секреты через -e/JSON, а не построчным файлом. Имена
+    // секретов перенос строки не пропускают (проверка выше).
+    const { svc, secrets } = makeService();
+    const pem = '-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----';
+
+    await svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: { KEY: pem } });
+
+    expect(secrets.encrypt).toHaveBeenCalledWith({ KEY: pem }, expect.any(String));
+  });
+
+  it('слаг, занятый в гонке между проверкой и вставкой, даёт 409, а не 500', async () => {
+    // Между SELECT count(*) и INSERT слаг может занять параллельный запрос.
+    // Продукта при этом не остаётся, но пользователь получал бы страницу
+    // ошибки вместо «слаг занят, выберите другой».
+    const { svc } = makeService({ productInsertRace: true });
+
+    await expect(
+      svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: {} }),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('прочие ошибки вставки продукта не выдаются за занятый слаг', async () => {
+    // Условие обязано быть узким, как в turns.service: безусловный
+    // ConflictException превратил бы падение базы, нарушение CHECK и
+    // столкновение по products_runner_token_hash_key в спокойное «слаг занят»
+    // без следа в логах — 4xx не попадает в отчёты об ошибках.
+    for (const err of [
+      { code: '23514' },
+      { code: '23505', constraint: 'products_runner_token_hash_key' },
+    ]) {
+      const { svc } = makeService({ productInsertError: err });
+
+      await expect(
+        svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: {} }),
+      ).rejects.not.toBeInstanceOf(ConflictException);
     }
   });
 

@@ -42,10 +42,9 @@ export class ProvisioningService {
   /**
    * Заводит продукт в статусе provisioning и ставит задание агенту хоста.
    *
-   * Открытый runner-токен возвращается вызывающему один раз: в базе только
-   * sha256, восстановить нечем.
+   * Живой runner-токен здесь НЕ выпускается — см. комментарий к hash ниже.
    */
-  async create(input: CreateInput): Promise<{ productId: string; runnerToken: string }> {
+  async create(input: CreateInput): Promise<{ productId: string }> {
     if (input.kind !== 'site' && input.kind !== 'bot') {
       throw new BadRequestException('неизвестная форма продукта');
     }
@@ -80,8 +79,20 @@ export class ProvisioningService {
     // (AAD), а значит он нужен ДО INSERT. Вариант «вставить, потом обновить»
     // дал бы окно, в котором продукт есть, а секретов нет.
     const productId = crypto.randomUUID();
-    const runnerToken = crypto.randomBytes(32).toString('hex');
-    const hash = crypto.createHash('sha256').update(runnerToken).digest('hex');
+    // runner_token_hash — NOT NULL UNIQUE, заполнить чем-то надо, но живой
+    // токен здесь выпускать незачем и вредно: доставить его некуда. Открытый
+    // токен отдаётся агенту ровно один раз, в теле задания, и выпускает его
+    // claimJob (задача 4) заново на каждую выдачу. Токен, материализованный
+    // здесь, RunnerGuard принял бы, вызывающий получил бы его в ответе и в
+    // лог — а через минуту он обесценился бы. Следующий читатель решил бы,
+    // что это и есть тот токен, который показывают пользователю.
+    //
+    // Хешируются случайные байты, строкой-токеном они не становятся ни на
+    // миг: прообраза не существует нигде, подбирать нечего. Именно случайные,
+    // а не productId или слаг: sha256 от известного значения означала бы, что
+    // это значение и есть рабочий токен — RunnerGuard сверяет предъявленное
+    // ровно так же.
+    const hash = crypto.createHash('sha256').update(crypto.randomBytes(32)).digest('hex');
     // NULL, а не коробка от {}: по нему задача 4 решает, звать ли decrypt.
     // decrypt(null) — сырой TypeError, поэтому признак «секретов нет» обязан
     // читаться до вызова.
@@ -89,21 +100,39 @@ export class ProvisioningService {
       ? this.secrets.encrypt(input.secrets, productId)
       : null;
 
-    await this.pg.query(
-      `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash, secrets_encrypted)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [
-        productId,
-        input.userId,
-        input.name,
-        input.slug,
-        input.kind,
-        'provisioning',
-        CHECKOUT_PATH,
-        hash,
-        box,
-      ],
-    );
+    try {
+      await this.pg.query(
+        `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash, secrets_encrypted)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          productId,
+          input.userId,
+          input.name,
+          input.slug,
+          input.kind,
+          'provisioning',
+          CHECKOUT_PATH,
+          hash,
+          box,
+        ],
+      );
+    } catch (e: any) {
+      // Гонка: между SELECT count(*) и этим INSERT слаг мог занять
+      // параллельный запрос. Продукта при этом не остаётся, страдает только
+      // код ответа — 500 вместо 409, то есть страница ошибки вместо «слаг
+      // занят, выберите другой».
+      //
+      // Условие узкое, как в turns.service: безусловный ConflictException
+      // превратил бы падение базы и нарушение CHECK в спокойное «слаг занят»
+      // без следа в логах. Второй UNIQUE на этой таблице —
+      // products_runner_token_hash_key: столкновение sha256 от 32 случайных
+      // байт означает не занятый слаг, а что-то, что обязано быть видно как
+      // 500. Имена ограничений сняты с живой базы.
+      if (e?.code === '23505' && e?.constraint === 'products_slug_key') {
+        throw new ConflictException('слаг уже занят');
+      }
+      throw e;
+    }
 
     try {
       await this.pg.query(
@@ -128,6 +157,6 @@ export class ProvisioningService {
       throw e;
     }
 
-    return { productId, runnerToken };
+    return { productId };
   }
 }
