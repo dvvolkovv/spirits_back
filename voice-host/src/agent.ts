@@ -175,6 +175,15 @@ export default defineAgent({
      */
     let meetFatal: string | null = null;
     let onMeetFatal: ((state: string) => void) | null = null;
+    /**
+     * Был ли во встрече хоть один человек.
+     *
+     * Отличает «встреча не состоялась» от «встречу закрыли»: во втором случае
+     * есть транскрипт, резюме и что списать, и метить такой звонок `failed`
+     * нельзя. Хозяин Zoom закрывает встречу для всех, бот уходит в `ended`, и
+     * это НОРМАЛЬНЫЙ конец разговора, а не отказ.
+     */
+    let sawHuman = false;
     if (isBridged) {
       ctx.room.on(RoomEvent.DataReceived, (payload, _p: any, _k: any, topic?: string) => {
         if (topic !== TOPIC) return;
@@ -191,6 +200,7 @@ export default defineAgent({
           else occupancy?.left(msg.uuid);
           syncFromPresence();
           if (msg.event === 'join') {
+            sawHuman = true;
             // Отметка «встреча началась». Без неё voice_calls.status навсегда
             // остаётся dialing и запирает пользователю следующий вход до
             // реапера — то есть на 130 минут.
@@ -205,6 +215,7 @@ export default defineAgent({
             // Речь — доказательство присутствия, и оно сильнее вранья Meet о
             // составе. Возвращаем человека и в правила выхода: без этого
             // выдержка лишь отложила бы выход из живой встречи.
+            sawHuman = true;
             occupancy?.joined(msg.uuid);
             syncFromPresence();
           }
@@ -941,7 +952,26 @@ export default defineAgent({
         // Терминальное состояние бота: теперь есть что закрывать. До этой
         // строки его принимал раунд ожидания звука выше.
         onMeetFatal = (reason) => {
-          void abortMeet(`встреча прервана: ${reason} — уходим`, reason);
+          if (sawHuman) {
+            // Встреча БЫЛА. Значит это её конец, а не отказ: хозяин закрыл
+            // встречу для всех (в Zoom это обычное дело), бота вывели или
+            // площадка отключилась. Помечать звонок `failed` нельзя — есть
+            // транскрипт, резюме и что списать, и штатное завершение сделает
+            // всё это само по закрытию сессии.
+            //
+            // Проверено живой встречей Zoom 10.09.2026: прежняя редакция
+            // успевала записать «Звонок не состоялся: бот Attendee: ended», и
+            // только пришедшее следом complete переписывало запись на
+            // completed. Повезло с порядком; не дожил бы воркер —
+            // состоявшийся разговор остался бы «не состоявшимся».
+            console.log(`[мост] встреча закончилась: ${reason}`);
+            void (async () => {
+              try { await session.close(); } catch (e) { console.error('session.close()', e); }
+              try { await ctx.room.disconnect(); } catch (e) { console.error('room.disconnect()', e); }
+            })();
+            return;
+          }
+          void abortMeet(`встреча не состоялась: ${reason} — уходим`, reason);
         };
         // Могло приехать, пока сессия стартовала.
         if (meetFatal) onMeetFatal(meetFatal);
