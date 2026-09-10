@@ -90,6 +90,6 @@ export const backend = {
    * есть смысл ждать подключения; на любой другой исход (в т.ч. сетевой сбой,
    * пойманный вызывающим через .catch) ждать уже незачем.
    */
-  meetBot: (callId: string, wsUrl: string) =>
-    post<{ status: 'ok' | 'failed' }>('meet-bot', { callId, wsUrl }).then((r) => r.status === 'ok'),
+  meetBot: (callId: string, agentIdentity: string) =>
+    post<{ status: 'ok' | 'failed' }>('meet-bot', { callId, agentIdentity }).then((r) => r.status === 'ok'),
 };

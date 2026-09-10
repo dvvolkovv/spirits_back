@@ -163,20 +163,6 @@ export class MeetWebhookController {
   private toDataMessage(body: AttendeeHook): Record<string, unknown> | null {
     const d = body.data || {};
     switch (body.trigger) {
-      case 'participant_events.join_leave':
-        return {
-          v: 1, type: 'meet_participant',
-          event: d.event_type === 'leave' ? 'leave' : 'join',
-          uuid: String(d.participant_uuid ?? ''),
-          name: String(d.participant_name ?? ''),
-        };
-      case 'participant_events.speech_start_stop':
-        return {
-          v: 1, type: 'meet_speaking',
-          uuid: String(d.participant_uuid ?? ''),
-          name: String(d.participant_name ?? ''),
-          speaking: d.event_type === 'speech_start',
-        };
       case 'bot.state_change': {
         // Код причины: `event_sub_type` точнее, `event_type` — если подтипа
         // нет. Без него в базе оказывалось «бот Attendee: fatal_error», а

@@ -294,7 +294,7 @@ describe('MeetingService', () => {
     it('зовёт воркера в свою пустую комнату', async () => {
       // Бота здесь больше НЕ создаём: порт под звук свой у каждого задания
       // (см. AttendeeAudioHub), и знает его только воркер. Бот создаётся
-      // позже, отдельной ручкой attachBot, когда воркер сообщит свой wsUrl.
+      // позже, отдельной ручкой attachBot, когда воркер сообщит личность.
       withAgent();
       const res = await svc.join('u1', 7, 'abc-defg-hij', 'meet');
       expect(attendee.createBot).not.toHaveBeenCalled();
@@ -537,8 +537,8 @@ describe('MeetingService', () => {
   describe('attachBot', () => {
     // Порт под звук свой у каждого задания, и знает его только воркер (см.
     // AttendeeAudioHub). Бот поэтому создаётся не в join(), а здесь — когда
-    // воркер сообщил бэкенду свой wsUrl отдельной ручкой.
-    const wsUrl = 'wss://my.linkeon.io/attendee/8141?callId=c1';
+    // воркер сообщил бэкенду свою личность в комнате отдельной ручкой.
+    const agentIdentity = 'agent-AJ_test';
 
     it('Zoom: адрес берётся из базы целиком, а мост просят о веб-адаптере', async () => {
       // Адрес не собрать из кода, а без sdk: "web" ассистент войдёт немым —
@@ -551,7 +551,7 @@ describe('MeetingService', () => {
         id: 'c1', agent_id: 7, user_id: 'u1',
         provider: 'zoom', external_room: '71077562785', external_url: url,
       });
-      await svc.attachBot('c1', wsUrl);
+      await svc.attachBot('c1', agentIdentity);
       expect(attendee.createBot).toHaveBeenCalledWith(
         expect.objectContaining({ meetingUrl: url, provider: 'zoom' }),
       );
@@ -560,7 +560,7 @@ describe('MeetingService', () => {
     it('успех: создаёт бота и запоминает его id', async () => {
       withAgent();
       calls.load.mockResolvedValue({ id: 'c1', agent_id: 7, user_id: 'u1', external_room: 'abc-defg-hij' });
-      const res = await svc.attachBot('c1', wsUrl);
+      const res = await svc.attachBot('c1', agentIdentity);
       expect(res).toEqual({ status: 'ok' });
       expect(attendee.createBot).toHaveBeenCalledWith({
         meetingUrl: 'https://meet.google.com/abc-defg-hij',
@@ -568,7 +568,10 @@ describe('MeetingService', () => {
         // видеть, кто к ним пришёл и от кого.
         botName: 'Андрей · ассистент Дмитрий',
         callId: 'c1',
-        wsUrl,
+        // Комната задания и есть комната синхронизации, а личность воркера —
+        // источник звука ассистента для моста.
+        roomName: 'room-1',
+        agentIdentity,
         provider: 'meet',
       });
       const upd = pg.query.mock.calls.find(([sql, args]: any) =>
@@ -581,14 +584,14 @@ describe('MeetingService', () => {
       withAgent();
       attendee.createBot.mockResolvedValue(null);
       calls.load.mockResolvedValue({ id: 'c1', agent_id: 7, user_id: 'u1', external_room: 'abc-defg-hij' });
-      const res = await svc.attachBot('c1', wsUrl);
+      const res = await svc.attachBot('c1', agentIdentity);
       expect(res).toEqual({ status: 'failed' });
       expect(calls.fail).toHaveBeenCalledWith('c1', expect.any(String));
     });
 
     it('звонок не найден — failed, к Attendee не ходим', async () => {
       calls.load.mockRejectedValue(new Error('call not found'));
-      const res = await svc.attachBot('нет-такого', wsUrl);
+      const res = await svc.attachBot('нет-такого', agentIdentity);
       expect(res).toEqual({ status: 'failed' });
       expect(attendee.createBot).not.toHaveBeenCalled();
     });
