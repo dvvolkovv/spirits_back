@@ -132,6 +132,32 @@ function linkeonReportMic(wantOn, found, seen) {
     } catch (e) { /* канал ещё не поднят — не повод ронять звук */ }
 }
 
+// Микрофон надо ДЕРЖАТЬ включённым, а не «включить».
+//
+// В вебсокетном режиме ensureMicOn() звался на каждый кусок звука — десять раз
+// в секунду, — и промах одного клика ничего не стоил. В режиме синхронизации с
+// комнатой LiveKit он зовётся ОДИН раз, когда прицепляется дорожка: промах
+// означает немого ассистента на всю встречу, без единой повторной попытки.
+// Ровно это и случилось на первой встрече Meet после переноса (10.09.2026):
+// в логе один LinkeonMicToggle с muted=true и больше ни строки.
+//
+// Сторож ищет кнопку «включить» раз в три секунды. Когда микрофон уже включён,
+// такой кнопки нет и клика не будет — поэтому сторож не может выключить
+// микрофон случайно. Останавливается по turnOffMic, чтобы не спорить с
+// собственным решением моста заглушить бота в тишине.
+let linkeonMicWatch = null;
+
+function linkeonKeepMicOn() {
+    if (linkeonMicWatch) return;
+    linkeonMicWatch = setInterval(() => {
+        const { el, seen } = linkeonFindMicButton(true);
+        if (el) {
+            linkeonReportMic(true, el, seen);
+            el.click();
+        }
+    }, 3000);
+}
+
 function turnOnMic() {
     const { el, seen } = linkeonFindMicButton(true);
     linkeonReportMic(true, el, seen);
@@ -140,9 +166,14 @@ function turnOnMic() {
     } else {
         console.log("Microphone button not found");
     }
+    linkeonKeepMicOn();
 }
 
 function turnOffMic() {
+    if (linkeonMicWatch) {
+        clearInterval(linkeonMicWatch);
+        linkeonMicWatch = null;
+    }
     const { el, seen } = linkeonFindMicButton(false);
     linkeonReportMic(false, el, seen);
     if (el) {
