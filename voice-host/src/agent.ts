@@ -70,9 +70,9 @@ export default defineAgent({
       // Чужая площадка. 'talerid' — разговор идёт не в нашей комнате, а в
       // комнате провайдера, куда мы входим участником по добытому токену.
       // 'meet' — площадка вне LiveKit вовсе: Google Meet через бота Attendee,
-      // звук ходит вебсокетом (см. isMeet ниже), externalUrl/externalToken ей
+      // звук ходит вебсокетом (см. isBridged ниже), externalUrl/externalToken ей
       // не нужны.
-      provider?: 'talerid' | 'meet';
+      provider?: 'talerid' | 'meet' | 'zoom';
       externalUrl?: string;
       externalToken?: string;
     };
@@ -115,18 +115,21 @@ export default defineAgent({
      * состав там приезжает от Meet через Attendee и врёт (см.
      * MEET_EMPTY_GRACE_MS).
      *
-     * isMeet объявлен ниже, поэтому провайдер сверяется здесь напрямую.
+     * isBridged объявлен ниже, поэтому провайдер сверяется здесь напрямую.
      */
     const occupancy = isMeeting
       ? new Occupancy(Date.now(), meta.provider === 'meet' ? MEET_EMPTY_GRACE_MS : 0)
       : null;
 
     /**
-     * Встреча на площадке без LiveKit (Meet через Attendee). Отличается от
-     * isForeign тем, что второй комнаты нет вовсе: звук идёт вебсокетом, а
-     * наша комната остаётся пустой и нужна только ради job и дата-канала.
+     * Встреча на площадке без LiveKit — через мост Attendee. Сегодня это
+     * Google Meet и Zoom: для воркера они не отличаются НИЧЕМ, звук у обеих
+     * ходит одним вебсокетом, поэтому здесь один флаг, а не два.
+     *
+     * Отличается от isForeign тем, что второй комнаты нет вовсе: наша
+     * остаётся пустой и нужна только ради job и дата-канала.
      */
-    const isMeet = isMeeting && meta.provider === 'meet';
+    const isBridged = isMeeting && (meta.provider === 'meet' || meta.provider === 'zoom');
 
     /**
      * Состав встречи Meet. В нашей комнате участников нет вовсе, поэтому
@@ -134,7 +137,7 @@ export default defineAgent({
      * Исключаем себя: бот Attendee сидит в встрече полноправным участником и
      * приходит в join_leave наравне с людьми.
      */
-    const presence = isMeet
+    const presence = isBridged
       ? new Presence(`${agentName} · ассистент ${meta.ownerName || 'пользователя'}`)
       : null;
 
@@ -172,7 +175,7 @@ export default defineAgent({
      */
     let meetFatal: string | null = null;
     let onMeetFatal: ((state: string) => void) | null = null;
-    if (isMeet) {
+    if (isBridged) {
       ctx.room.on(RoomEvent.DataReceived, (payload, _p: any, _k: any, topic?: string) => {
         if (topic !== TOPIC) return;
         let msg: any;
@@ -247,14 +250,14 @@ export default defineAgent({
      * бота с нашим адресом. Наоборот нельзя: бот подключался бы в никуда.
      */
     let attendeeHub: AttendeeAudioHub | null = null;
-    if (isMeet) {
+    if (isBridged) {
       attendeeHub = new AttendeeAudioHub();
       let wsUrl: string;
       try {
         await attendeeHub.listen(meta.callId);
         wsUrl = attendeeHub.publicUrl(meta.callId);
       } catch (e: any) {
-        console.error('[meet] порт под звук не занят', e);
+        console.error('[мост] порт под звук не занят', e);
         await backend.failed(meta.callId, `порт под звук не занят: ${e?.message}`).catch(() => {});
         attendeeHub.close();
         try { await ctx.room.disconnect(); } catch {}
@@ -265,7 +268,7 @@ export default defineAgent({
         // Бот не создан: сидеть в пустой комнате и тарифицировать Realtime
         // незачем. Бэкенд уже знает о неудаче (attachBot сам метит звонок
         // failed), повторять вызов здесь не нужно.
-        console.log('[meet] бот Attendee не создан');
+        console.log('[мост] бот Attendee не создан');
         attendeeHub.close();
         try { await ctx.room.disconnect(); } catch {}
         return;
@@ -294,7 +297,7 @@ export default defineAgent({
 
       if (outcome.kind === 'fatal') {
         // Бот не вошёл. Сообщаем НАСТОЯЩУЮ причину, а не таймаут звука.
-        console.log(`[meet] встреча не состоялась: ${outcome.reason} — выходим`);
+        console.log(`[мост] встреча не состоялась: ${outcome.reason} — выходим`);
         await backend.failed(meta.callId, outcome.reason).catch(() => {});
         attendeeHub.close();
         try { await ctx.room.disconnect(); } catch {}
@@ -313,7 +316,7 @@ export default defineAgent({
       // вернувшийся бот подхватывает разговор незаметно для сессии. Наружу
       // выходит только «не вернулся вовсе» — подписка на это ниже, после
       // session.start(), потому что закрывать там будет уже что.
-      console.log('[meet] звук Attendee на связи');
+      console.log('[мост] звук Attendee на связи');
     }
 
     if (isMeeting && !isForeign) {
@@ -630,7 +633,7 @@ export default defineAgent({
     // тик currentSpeaker затирался бы обратно в undefined, перетирая
     // значение, которое ведёт presence из вебхука meet_speaking (обработчик
     // meet_speaking в DataReceived выше). Находка ревью 07.09.2026.
-    if (isMeeting && !isMeet) {
+    if (isMeeting && !isBridged) {
       (foreign ?? ctx.room).on(RoomEvent.ActiveSpeakersChanged, (speakers: any[]) => {
         // Берём первого: при перебивании активных несколько, а реплика в
         // транскрипте одна. Разметка приблизительная, и здесь это видно прямо.
@@ -736,7 +739,7 @@ export default defineAgent({
      * принимаем сами.
      */
     if (occupancy) {
-      if (isMeet) {
+      if (isBridged) {
         // Состав приезжает вебхуками (обработчик meet_participant выше сам
         // ведёт occupancy.joined/left и зовёт syncFromPresence). Здесь только
         // начальная раздача: до первого события гейт обязан быть строгим,
@@ -779,7 +782,7 @@ export default defineAgent({
       }
 
       // Таймер вердикта общий для всех ветвей: verdict() читает только
-      // occupancy, а для isMeet его ведёт обработчик meet_participant выше.
+      // occupancy, а для isBridged его ведёт обработчик meet_participant выше.
       const watch = setInterval(() => {
         const verdict = occupancy.verdict(Date.now());
         if (verdict === 'stay') return;
@@ -826,7 +829,7 @@ export default defineAgent({
     // audioEnabled при этом трогать нельзя: с `false` условие выше не
     // сработает, а заодно заглушится весь аудиотракт.
     if (isMeeting) {
-      if (isMeet && attendeeHub) {
+      if (isBridged && attendeeHub) {
         // Meet: звук целиком в вебсокете, комнаты для него нет вовсе — ни
         // своей, ни чужой. Оба конца держат ХАБ, а не сокет: сокет сменится
         // при первом же переподключении Attendee.
@@ -888,7 +891,7 @@ export default defineAgent({
         // (agent_activity.js:1046-1052). Наша комната при этом всё равно
         // подключена через ctx.connect() выше — по ней идут job и дата-канал,
         // сессия просто о ней не знает.
-        ...(isMeet ? {} : { room: foreign ?? ctx.room }),
+        ...(isBridged ? {} : { room: foreign ?? ctx.room }),
         // closeOnDisconnect: false — иначе сессия закрывается, когда выйдет
         // тот участник, к которому RoomIO привязался первым, и встреча
         // обрывается всем остальным.
@@ -906,7 +909,7 @@ export default defineAgent({
         ...(isMeeting ? { inputOptions: { closeOnDisconnect: false } } : {}),
       });
 
-      if (isMeet && attendeeHub) {
+      if (isBridged && attendeeHub) {
         // Звук потерян окончательно — то есть бот не вернулся за отведённые
         // хабу полторы минуты. Сам обрыв сюда не доходит: он внутреннее дело
         // хаба, иначе встреча кончалась бы на первом же сетевом чихе, как
@@ -927,7 +930,7 @@ export default defineAgent({
          * потолка.
          */
         const abortMeet = async (log: string, reason: string): Promise<void> => {
-          console.log(`[meet] ${log}`);
+          console.log(`[мост] ${log}`);
           await backend.failed(meta.callId, reason).catch(() => {});
           try { await session.close(); } catch (e) { console.error('session.close()', e); }
           try { await ctx.room.disconnect(); } catch (e) { console.error('room.disconnect()', e); }

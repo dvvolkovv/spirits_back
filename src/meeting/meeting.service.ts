@@ -17,6 +17,22 @@ const PROVIDER_TALERID = 'talerid';
 const PROVIDER_MEET = 'meet';
 
 /**
+ * Zoom. Для нашего кода отличается от Meet ровно двумя вещами: адрес входа
+ * приходит целиком (из кода его не собрать) и мост надо просить о веб-адаптере
+ * (см. attendee.client.ts). Всё остальное — тот же путь через Attendee.
+ */
+const PROVIDER_ZOOM = 'zoom';
+
+/**
+ * Площадки, которые ходят через мост Attendee и потому делят один потолок.
+ *
+ * Потолок общий не по продуктовым причинам, а по физическим: порт под звук
+ * один (AttendeeAudioHub), и вторая встреча — всё равно какой площадки — не
+ * найдёт свободного.
+ */
+const BRIDGED_PROVIDERS = [PROVIDER_MEET, PROVIDER_ZOOM];
+
+/**
  * Сколько встреч Meet держим одновременно.
  *
  * Единица — не техническое ограничение нашего кода, а следствие режима
@@ -110,6 +126,11 @@ export class MeetingService {
     agentId: number,
     code: string,
     provider: MeetingProvider = 'linkeon',
+    /**
+     * Полный адрес входа. Обязателен для Zoom и не нужен остальным: у них он
+     * выводится из кода. Приходит уже нормализованным из meeting-link.ts.
+     */
+    url?: string,
   ): Promise<{ callId: string; title: string }> {
     const agentRes = await this.pg.query(
       `SELECT id, display_name, system_prompt, realtime_voice FROM agents WHERE id = $1 LIMIT 1`,
@@ -133,6 +154,9 @@ export class MeetingService {
 
     const isForeign = provider === 'talerid';
     const isMeet = provider === 'meet';
+    const isZoom = provider === 'zoom';
+    /** Площадка без LiveKit: звук ходит через мост Attendee. */
+    const isBridged = isMeet || isZoom;
     const callId = randomUUID();
 
     // Куда идёт ассистент и как называется комната — единственное, чем
@@ -141,15 +165,23 @@ export class MeetingService {
     let roomName: string;
     let external: { url: string; token: string } | undefined;
 
-    if (isMeet && !attendeeConfigured()) {
+    if (isBridged && !attendeeConfigured()) {
       // Не настроен — входить некуда. Отказ ДО создания записи звонка:
       // иначе строка осталась бы в dialing и заперла пользователю его же
       // следующий вход до реапера.
       throw new ConflictException({ message: 'meeting bot is not configured', reason: 'meet_unavailable' });
     }
 
-    if (isMeet) {
-      // Потолок одновременных встреч Meet — глобальный, а не на пользователя.
+    if (isZoom && !url) {
+      // Без адреса входить некуда: из числового id ссылку не собрать — нужен
+      // хост аккаунта и хеш пароля. Отказ ДО создания записи, по той же
+      // причине, что и отказ ненастроенного моста выше.
+      throw new ConflictException({ message: 'zoom join url is required', reason: 'zoom_url_required' });
+    }
+
+    if (isBridged) {
+      // Потолок одновременных встреч через мост — глобальный, а не на
+      // пользователя, и ОБЩИЙ для Meet и Zoom.
       //
       // В Celery-режиме Attendee боты в одном контейнере делят аудиоустройства,
       // и звук разных встреч может перетекать. Это утечка между переговорами
@@ -161,21 +193,26 @@ export class MeetingService {
       // переходом на изоляцию по поду, и тогда меняется в одном месте.
       const busy = await this.pg.query(
         `SELECT count(*)::int AS n FROM voice_calls
-          WHERE provider = $1 AND status IN ('dialing','active')`,
-        [PROVIDER_MEET],
+          WHERE provider = ANY($1) AND status IN ('dialing','active')`,
+        [BRIDGED_PROVIDERS],
       );
       if ((busy.rows[0]?.n ?? 0) >= MEET_CONCURRENCY_LIMIT) {
-        throw new ConflictException({ message: 'meet capacity reached', reason: 'meet_busy' });
+        // Причина остаётся `meet_busy` при занятости любой из площадок: этот
+        // ключ уже переведён во всех локалях фронта, а человеку важно не имя
+        // площадки, занявшей мост, а то, что мост занят.
+        throw new ConflictException({ message: 'meeting bridge capacity reached', reason: 'meet_busy' });
       }
 
       // За информацией о встрече идти некуда: публичной ручки «существует ли
       // такая встреча» у Meet нет. Значит и карточку мы показываем, не
       // проверив вход, и о неудаче узнаём из состояния бота уже после захода.
       // Название берём нейтральное — настоящего у нас нет.
-      title = 'Встреча Google Meet';
+      // Название нейтральное и по площадке: настоящего у нас нет ни там, ни
+      // там — публичной ручки «что за встреча» нет ни у Meet, ни у Zoom.
+      title = isZoom ? 'Встреча Zoom' : 'Встреча Google Meet';
       // По callId, а не по коду: одну встречу могут позвать дважды, а
       // room_name с уникальностью уже намучил (003_drop_room_name_unique).
-      roomName = `meet_${callId}`;
+      roomName = `${isZoom ? PROVIDER_ZOOM : PROVIDER_MEET}_${callId}`;
     } else if (isForeign) {
       const info = await this.talerIdRooms.info(code);
       if (!info || !info.isActive) throw new NotFoundException('room not found');
@@ -198,10 +235,15 @@ export class MeetingService {
     }
 
     await this.pg.query(
-      `INSERT INTO voice_calls (id, user_id, agent_id, room_name, status, provider, external_room)
-       VALUES ($1, $2, $3, $4, 'dialing', $5, $6)`,
+      `INSERT INTO voice_calls (id, user_id, agent_id, room_name, status, provider, external_room, external_url)
+       VALUES ($1, $2, $3, $4, 'dialing', $5, $6, $7)`,
       [callId, userId, agentId, roomName,
-       isMeet ? PROVIDER_MEET : isForeign ? PROVIDER_TALERID : PROVIDER, code],
+       isZoom ? PROVIDER_ZOOM : isMeet ? PROVIDER_MEET : isForeign ? PROVIDER_TALERID : PROVIDER,
+       code,
+       // Адрес храним отдельной колонкой, а не поверх external_room: там у
+       // всех остальных провайдеров лежит короткий код, и колонка с двумя
+       // смыслами однажды была бы прочитана не тем способом.
+       isZoom ? url : null],
     );
 
     try {
@@ -227,7 +269,7 @@ export class MeetingService {
       // Наша комната при внешней встрече пуста, и LiveKit удалил бы её через
       // пять минут по дефолтному empty_timeout — ассистента выбрасывало
       // ровно на 301-й секунде. Заводим заранее с запасом на всю встречу.
-      if (isForeign || isMeet) await this.livekit.ensureRoom(roomName, 2 * 60 * 60);
+      if (isForeign || isBridged) await this.livekit.ensureRoom(roomName, 2 * 60 * 60);
 
       await this.livekit.dispatchAgent(roomName, {
         callId,
@@ -241,7 +283,10 @@ export class MeetingService {
         // Внешняя комната: воркер повесит на неё вход и выход сессии.
         // Для своих встреч поля нет вовсе — поведение воркера не меняется.
         ...(external ? { provider: PROVIDER_TALERID, externalUrl: external.url, externalToken: external.token } : {}),
-        ...(isMeet ? { provider: PROVIDER_MEET } : {}),
+        // Воркеру важна не площадка, а то, что звук идёт через мост, — но
+        // провайдера передаём настоящий: он попадает в логи задания, и
+        // «meet» на встрече Zoom сбивал бы с толку при разборе.
+        ...(isBridged ? { provider: isZoom ? PROVIDER_ZOOM : PROVIDER_MEET } : {}),
         // Все специалисты, кроме самого ведущего: спрашивать себя незачем, а
         // предложение это сделать модель однажды примет всерьёз.
         specialists: Object.keys(SPECIALISTS)
@@ -302,11 +347,18 @@ export class MeetingService {
       // Тем же способом, что раньше в join(): участники должны видеть, кто к
       // ним пришёл и от кого.
       const botName = `${agentRes.rows[0]?.display_name || 'Ассистент'} · ассистент ${ownerName}`;
+      // Адрес входа: у Zoom он лежит в базе целиком, у Meet собирается из
+      // кода. `external_url` — единственный признак, по которому здесь
+      // отличается площадка, и он же страхует от рассинхрона с provider.
+      const meetingUrl = call.external_url
+        ? String(call.external_url)
+        : `https://meet.google.com/${call.external_room}`;
       const bot = await this.attendee.createBot({
-        meetingUrl: `https://meet.google.com/${call.external_room}`,
+        meetingUrl,
         botName,
         callId,
         wsUrl,
+        provider: call.provider === PROVIDER_ZOOM ? 'zoom' : 'meet',
       });
       if (!bot) {
         // Причина уже в логе клиента. Звонок помечаем failed сами: join()

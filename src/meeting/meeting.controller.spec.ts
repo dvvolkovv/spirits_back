@@ -33,17 +33,17 @@ describe('MeetingController', () => {
     it('meet передаётся как meet', async () => {
       // Главный тест этого файла: именно здесь фича и обрывалась.
       await ctl.join(user as any, { agentId: 12, code: 'abc-defg-hij', provider: 'meet' } as any);
-      expect(meetings.join).toHaveBeenCalledWith('u1', 12, 'abc-defg-hij', 'meet');
+      expect(meetings.join).toHaveBeenCalledWith('u1', 12, 'abc-defg-hij', 'meet', undefined);
     });
 
     it('talerid передаётся как talerid', async () => {
       await ctl.join(user as any, { agentId: 12, code: '36fc367a', provider: 'talerid' } as any);
-      expect(meetings.join).toHaveBeenCalledWith('u1', 12, '36fc367a', 'talerid');
+      expect(meetings.join).toHaveBeenCalledWith('u1', 12, '36fc367a', 'talerid', undefined);
     });
 
     it('без провайдера — своя комната', async () => {
       await ctl.join(user as any, { agentId: 12, code: 'ABC234' } as any);
-      expect(meetings.join).toHaveBeenCalledWith('u1', 12, 'ABC234', 'linkeon');
+      expect(meetings.join).toHaveBeenCalledWith('u1', 12, 'ABC234', 'linkeon', undefined);
     });
 
     it('незнакомый провайдер не проходит за свою комнату молча', async () => {
@@ -51,12 +51,27 @@ describe('MeetingController', () => {
       // провайдер уедет в свои комнаты так же незаметно, как это случилось
       // с Meet. Пока поведение — фолбэк, но зафиксировано осознанно.
       await ctl.join(user as any, { agentId: 12, code: 'x', provider: 'zoom' } as any);
-      expect(meetings.join).toHaveBeenCalledWith('u1', 12, 'x', 'linkeon');
+      expect(meetings.join).toHaveBeenCalledWith('u1', 12, 'x', 'linkeon', undefined);
+    });
+
+    it('адрес входа Zoom доезжает до сервиса', async () => {
+      // Из кода его не собрать: в ссылке хост аккаунта и хеш пароля. Не
+      // доехал — сервис откажет с zoom_url_required, и фича будет
+      // недостижима через API ровно так же, как когда-то Meet.
+      const url = 'https://us04web.zoom.us/j/71077562785?pwd=SECRET.1';
+      await ctl.join(user as any, { agentId: 12, code: '71077562785', provider: 'zoom', url } as any);
+      expect(meetings.join).toHaveBeenCalledWith('u1', 12, '71077562785', 'zoom', url);
+    });
+
+    it('пустой адрес не превращается в пустую строку', async () => {
+      // Сервис отличает «адреса нет» от «адрес пустой» только по undefined.
+      await ctl.join(user as any, { agentId: 12, code: 'abc-defg-hij', provider: 'meet', url: '' } as any);
+      expect(meetings.join).toHaveBeenCalledWith('u1', 12, 'abc-defg-hij', 'meet', undefined);
     });
 
     it('код и ассистент приводятся к типам', async () => {
       await ctl.join(user as any, { agentId: '12', code: 123, provider: 'meet' } as any);
-      expect(meetings.join).toHaveBeenCalledWith('u1', 12, '123', 'meet');
+      expect(meetings.join).toHaveBeenCalledWith('u1', 12, '123', 'meet', undefined);
     });
   });
 

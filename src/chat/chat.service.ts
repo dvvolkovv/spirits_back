@@ -496,7 +496,7 @@ export class ChatService {
       // Своя комната и чужая проверяются в разных местах, но ведут себя
       // одинаково: нашли живую — показываем карточку, не нашли — это была
       // обычная ссылка в разговоре, идём обычным путём и не мешаем.
-      const room = meetingLink.provider === 'meet'
+      const room = meetingLink.provider === 'meet' || meetingLink.provider === 'zoom'
         // Проверять существование встречи нечем: публичной ручки у Meet нет.
         // Карточку показываем сразу — цена ошибки невелика, а требовать
         // проверки значит не показывать карточку никогда.
@@ -504,7 +504,13 @@ export class ChatService {
         // Но если Attendee не настроен, входить некуда вовсе, и карточка
         // только обманывала бы: кнопка отказывала бы всегда. Тогда ссылка
         // остаётся обычной ссылкой в разговоре, и ход идёт обычным путём.
-        ? (attendeeConfigured() ? { code: meetingLink.code, title: 'Встреча Google Meet', active: true } : null)
+        ? (attendeeConfigured()
+            ? {
+                code: meetingLink.code,
+                title: meetingLink.provider === 'zoom' ? 'Встреча Zoom' : 'Встреча Google Meet',
+                active: true,
+              }
+            : null)
         : meetingLink.provider === 'talerid'
         ? await this.talerIdRooms
             ?.info(meetingLink.code)
@@ -529,7 +535,9 @@ export class ChatService {
            VALUES ($1, 'human', $2, $3, 'text')`,
           [chatSessionId, agent.id, message],
         );
-        const card = buildMeetingCard(room.code, room.title, meetingLink.provider);
+        // Адрес входа уезжает в карточку только у Zoom: у остальных площадок
+        // он выводится из кода, и дублировать его в теге незачем.
+        const card = buildMeetingCard(room.code, room.title, meetingLink.provider, meetingLink.url);
         await this.pg.query(
           `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
            VALUES ($1, 'ai', $2, $3, 'text', 0)`,

@@ -1,3 +1,5 @@
+import { MeetingProvider } from '../meeting/meeting-link';
+
 /** Длиннее в карточке не нужно — это заголовок, а не описание. */
 const MAX_TITLE = 200;
 
@@ -20,7 +22,8 @@ function clean(s: string): string {
 export function buildMeetingCard(
   code: string,
   title: string,
-  provider: 'linkeon' | 'talerid' | 'meet' = 'linkeon',
+  provider: MeetingProvider = 'linkeon',
+  url?: string,
 ): string {
   // Провайдер идёт ПЕРЕД кодом и только для чужих встреч.
   //
@@ -28,5 +31,22 @@ export function buildMeetingCard(
   // и менять формат задним числом значит сломать разбор старых сообщений на
   // фронте. Разбор чужих добавляется отдельной веткой, старая не трогается.
   const head = provider === 'linkeon' ? '' : `provider=${provider} `;
-  return `{{meeting_join: ${head}code=${code} title=${clean(title) || 'Встреча'}}}`;
+  // Адрес входа — только там, где его не собрать из кода (сейчас Zoom: в
+  // ссылке хост аккаунта и хеш пароля). Поле идёт ПОСЛЕ кода и ПЕРЕД
+  // заголовком: заголовок разбирается «до закрывающих скобок» и обязан быть
+  // последним, иначе съел бы всё остальное.
+  const tail = url ? `url=${safeUrl(url)} ` : '';
+  return `{{meeting_join: ${head}code=${code} ${tail}title=${clean(title) || 'Встреча'}}}`;
+}
+
+/**
+ * Адрес в теге не должен разваливать разбор.
+ *
+ * Пробелы и фигурные скобки в ссылке — признак того, что она собрана не нами
+ * (у нас она нормализована в meeting-link.ts). Такую лучше выбросить целиком,
+ * чем отдать фронту тег, который развалится на середине: карточка без адреса
+ * честно откажет при входе, а битый тег покажет мусор в ленте.
+ */
+function safeUrl(url: string): string {
+  return /[\s{}]/.test(url) ? '' : url;
 }

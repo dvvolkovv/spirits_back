@@ -394,6 +394,90 @@ describe('MeetingService', () => {
     });
   });
 
+  describe('встреча Zoom', () => {
+    const URL = 'https://us04web.zoom.us/j/71077562785?pwd=SECRET.1';
+
+    it('зовёт воркера в свою пустую комнату и передаёт настоящего провайдера', async () => {
+      // Провайдер в метаданных настоящий, а не «meet»: воркеру он безразличен
+      // (звук у обеих площадок ходит одним мостом), но попадает в логи
+      // задания, и «meet» на встрече Zoom сбивал бы с толку при разборе.
+      withAgent();
+      const res = await svc.join('u1', 7, '71077562785', 'zoom', URL);
+      expect(attendee.createBot).not.toHaveBeenCalled();
+      expect(livekit.dispatchAgent).toHaveBeenCalledWith(
+        `zoom_${res.callId}`,
+        expect.objectContaining({ mode: 'meeting', provider: 'zoom' }),
+      );
+    });
+
+    it('адрес входа сохраняется отдельной колонкой, код — в external_room', async () => {
+      // Колонка отдельная не из вкуса: в external_room у остальных площадок
+      // лежит короткий код, и колонка с двумя смыслами однажды была бы
+      // прочитана не тем способом.
+      withAgent();
+      await svc.join('u1', 7, '71077562785', 'zoom', URL);
+      const insert = pg.query.mock.calls.find(([sql]: any) => /INSERT INTO voice_calls/.test(sql));
+      expect(insert[0]).toMatch(/external_url/);
+      expect(insert[1]).toContain('zoom');
+      expect(insert[1]).toContain('71077562785');
+      expect(insert[1]).toContain(URL);
+    });
+
+    it('без адреса входа отказ ДО создания записи', async () => {
+      // Из числового id ссылку не собрать — нужен хост аккаунта и хеш пароля.
+      // Отказ до INSERT по той же причине, что и у ненастроенного моста:
+      // строка в dialing заперла бы пользователю следующий вход до реапера.
+      withAgent();
+      await expect(svc.join('u1', 7, '71077562785', 'zoom')).rejects.toMatchObject({
+        response: expect.objectContaining({ reason: 'zoom_url_required' }),
+      });
+      const insert = pg.query.mock.calls.find(([sql]: any) => /INSERT INTO voice_calls/.test(sql));
+      expect(insert).toBeUndefined();
+    });
+
+    it('комнату заводит заранее с запасом на всю встречу', async () => {
+      withAgent();
+      const res = await svc.join('u1', 7, '71077562785', 'zoom', URL);
+      expect(livekit.ensureRoom).toHaveBeenCalledWith(`zoom_${res.callId}`, 7200);
+    });
+
+    it('название нейтральное и по площадке', async () => {
+      withAgent();
+      const res = await svc.join('u1', 7, '71077562785', 'zoom', URL);
+      expect(res.title).toBe('Встреча Zoom');
+    });
+  });
+
+  describe('потолок моста общий для Meet и Zoom', () => {
+    it('встреча Zoom не пускается, пока мост занят встречей Meet', async () => {
+      // Потолок физический, а не продуктовый: порт под звук один, и вторая
+      // встреча — всё равно какой площадки — не найдёт свободного. Причина
+      // остаётся meet_busy: ключ уже переведён во всех локалях фронта, а
+      // человеку важно, что мост занят, а не кем именно.
+      withAgent();
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('FROM agents')) return { rows: [agentRow] };
+        if (sql.includes('SELECT tokens FROM ai_profiles_consolidated')) return { rows: [{ tokens: balance }] };
+        if (/count\(\*\)/.test(sql) && /provider = ANY/.test(sql)) return { rows: [{ n: 1 }] };
+        if (sql.includes('ai_profiles_consolidated')) return { rows: [{ name: 'Дмитрий' }] };
+        return { rows: [], rowCount: 0 };
+      });
+      await expect(
+        svc.join('u2', 7, '71077562785', 'zoom', 'https://us04web.zoom.us/j/71077562785?pwd=S.1'),
+      ).rejects.toMatchObject({ response: expect.objectContaining({ reason: 'meet_busy' }) });
+    });
+
+    it('счёт идёт по обеим площадкам, а не по одной', async () => {
+      // Запрос обязан спрашивать обе: считать только Meet значило бы пустить
+      // вторую встречу на занятый порт и получить невнятный отказ от воркера.
+      withAgent();
+      await svc.join('u1', 7, 'abc-defg-hij', 'meet');
+      const busy = pg.query.mock.calls.find(([sql]: any) => /count\(\*\)/.test(sql) && /provider/.test(sql));
+      expect(busy[0]).toMatch(/provider = ANY/);
+      expect(busy[1][0]).toEqual(['meet', 'zoom']);
+    });
+  });
+
   describe('потолок одновременных встреч Meet', () => {
     // Держится здесь, а не надеждой на то, что воркер не найдёт свободного
     // порта: диапазон сужен до одного порта (см. attendee-audio.ts), и без

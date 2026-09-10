@@ -87,6 +87,32 @@ describe('AttendeeClient', () => {
       ]);
     });
 
+    it('для Zoom обязателен веб-адаптер', async () => {
+      // Нативный адаптер — значение ПО УМОЛЧАНИЮ у моста, и он молча немой:
+      // принимает наш звук с SDKERR_SUCCESS и не отдаёт его во встречу
+      // (проверено подряд на одной живой встрече 10.09.2026). Забыть это поле
+      // значит выпустить ассистента во встречу немым, без единой ошибки.
+      const spy = jest.fn().mockResolvedValue(ok({ id: 'bot_1' }));
+      global.fetch = spy as any;
+      await new AttendeeClient().createBot({
+        meetingUrl: 'https://us04web.zoom.us/j/71077562785?pwd=SECRET.1',
+        botName: 'Роман', callId: 'c1', wsUrl: 'wss://my.linkeon.io/attendee/8140?callId=c1',
+        provider: 'zoom',
+      });
+      expect(JSON.parse(spy.mock.calls[0][1].body).zoom_settings).toEqual({ sdk: 'web' });
+    });
+
+    it('для Meet настроек Zoom нет вовсе', async () => {
+      const spy = jest.fn().mockResolvedValue(ok({ id: 'bot_1' }));
+      global.fetch = spy as any;
+      await new AttendeeClient().createBot({
+        meetingUrl: 'https://meet.google.com/abc-defg-hij',
+        botName: 'Роман', callId: 'c1', wsUrl: 'wss://my.linkeon.io/attendee/8140?callId=c1',
+        provider: 'meet',
+      });
+      expect(JSON.parse(spy.mock.calls[0][1].body).zoom_settings).toBeUndefined();
+    });
+
     it('HTTP-ошибка — null, а не исключение', async () => {
       global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 502 }) as any;
       await expect(new AttendeeClient().createBot({

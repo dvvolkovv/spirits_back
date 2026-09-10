@@ -6,7 +6,7 @@ import { MeetingService } from './meeting.service';
 import { MeetingProvider } from './meeting-link';
 
 /** Провайдеры, которые ручка принимает. Незнакомое значение — не linkeon. */
-const KNOWN_PROVIDERS = new Set<MeetingProvider>(['linkeon', 'talerid', 'meet']);
+const KNOWN_PROVIDERS = new Set<MeetingProvider>(['linkeon', 'talerid', 'meet', 'zoom']);
 
 @Controller('meeting')
 @UseGuards(JwtGuard)
@@ -24,7 +24,7 @@ export class MeetingController {
   @Post('join')
   async join(
     @CurrentUser() u: any,
-    @Body() body: { agentId: number; code: string; provider?: MeetingProvider },
+    @Body() body: { agentId: number; code: string; provider?: MeetingProvider; url?: string },
   ) {
     // Провайдер сверяем со списком, а не тернарником.
     //
@@ -39,8 +39,12 @@ export class MeetingController {
     const provider: MeetingProvider = KNOWN_PROVIDERS.has(body?.provider as MeetingProvider)
       ? (body!.provider as MeetingProvider)
       : 'linkeon';
+    // Адрес входа — только для площадок, где его не собрать из кода (Zoom).
+    // Строку не разбираем и не валидируем здесь: это забота сервиса, который
+    // и решает, обязателен ли адрес для этого провайдера.
+    const url = typeof body?.url === 'string' && body.url ? body.url : undefined;
     // Имя владельца сервис берёт из профиля сам: в JWT его нет.
-    return this.meetings.join(u.userId, Number(body?.agentId), String(body?.code || ''), provider);
+    return this.meetings.join(u.userId, Number(body?.agentId), String(body?.code || ''), provider, url);
   }
 
   @Post(':id/leave')
