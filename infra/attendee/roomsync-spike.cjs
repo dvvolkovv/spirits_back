@@ -18,7 +18,8 @@
  *      живую речь от тишины (та же мера, что в zoom-spike.cjs);
  *   3. доходит ли ДО встречи звук, который мы публикуем в комнату: скрипт
  *      публикует тон 440 Гц через двадцать секунд после старта;
- *   4. зеркалится ли чат встречи в дата-канал.
+ *   4. зеркалится ли чат встречи — он приходит текстовым потоком на топик
+ *      `lk.chat`, а не сообщением дата-канала.
  *
  * ЗАПУСК на стенде (комната создаётся сама, ссылка на встречу — аргумент):
  *
@@ -98,9 +99,25 @@ async function main() {
     console.log(`[комната] участник ушёл: ${p.identity}`);
   });
   room.on(RoomEvent.DataReceived, (payload, participant, _kind, topic) => {
-    // Чат встречи мост кладёт сюда же — смотрим, в каком виде.
     const text = new TextDecoder().decode(payload).slice(0, 300);
     console.log(`[данные] от ${participant?.identity || '—'} topic=${topic || '—'}: ${text}`);
+  });
+
+  // Чат встречи приезжает ТЕКСТОВЫМ ПОТОКОМ на топик `lk.chat`, а не
+  // сообщением дата-канала: мост зовёт `send_text(text, topic="lk.chat")` —
+  // это конвенция LiveKit, которую их же клиенты показывают как чат.
+  //
+  // Первая редакция спайка слушала только DataReceived и не увидела ни одного
+  // сообщения, хотя мост их поймал (десять упоминаний ChatMessage в его логе).
+  // Прогон 10.09.2026: вывод «чат не зеркалится» был неверным, и виноват был
+  // спайк, а не мост.
+  room.registerTextStreamHandler('lk.chat', async (reader, participantIdentity) => {
+    try {
+      const text = await reader.readAll();
+      console.log(`[чат] ${participantIdentity}: ${String(text).slice(0, 300)}`);
+    } catch (e) {
+      console.log(`[чат] не прочитался: ${e?.message}`);
+    }
   });
   room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
     console.log(`[дорожка] подписались: ${participant.identity} kind=${track.kind}`);
