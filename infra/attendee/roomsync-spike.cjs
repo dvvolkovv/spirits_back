@@ -111,10 +111,17 @@ async function main() {
   // сообщения, хотя мост их поймал (десять упоминаний ChatMessage в его логе).
   // Прогон 10.09.2026: вывод «чат не зеркалится» был неверным, и виноват был
   // спайк, а не мост.
-  room.registerTextStreamHandler('lk.chat', async (reader, participantIdentity) => {
+  room.registerTextStreamHandler('lk.chat', async (reader, participant) => {
     try {
       const text = await reader.readAll();
-      console.log(`[чат] ${participantIdentity}: ${String(text).slice(0, 300)}`);
+      // Второй аргумент — не строка, а сведения об участнике: на прогоне
+      // 10.09.2026 он напечатался как «[object Object]», и автор сообщения
+      // оказался неопознаваемым. Для продукта это существенно: Роману нужно
+      // знать, КТО спросил, чтобы ответить по имени.
+      const who = typeof participant === 'string'
+        ? participant
+        : participant?.identity ?? participant?.participantIdentity ?? JSON.stringify(participant);
+      console.log(`[чат] ${who}: ${String(text).slice(0, 300)}`);
     } catch (e) {
       console.log(`[чат] не прочитался: ${e?.message}`);
     }
