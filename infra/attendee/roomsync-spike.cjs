@@ -53,7 +53,8 @@ if (!LK_KEY || !LK_SECRET || !ATTENDEE_KEY) {
 const AGENT_IDENTITY = 'linkeon-agent';
 const ROOM = `roomsync-${Date.now()}`;
 const SAMPLE_RATE = 48_000;          // родная частота зеркалирования у моста
-const TONE_AFTER_MS = 20_000;
+/** Пауза между повторами тона: три попытки, чтобы не гонять встречу заново. */
+const TONE_REPEAT_MS = 20_000;
 const TONE_MS = 3_000;
 const TONE_HZ = 440;
 
@@ -171,7 +172,18 @@ async function main() {
   const botId = bot.data.id;
   console.log(`[bot] создан ${botId}, состояние ${bot.data.state}`);
 
-  setTimeout(() => void sendTone(source), TONE_AFTER_MS);
+  // Тон — ПО СОБЫТИЮ входа, а не по часам.
+  //
+  // Первая редакция публиковала его через двадцать секунд после старта, и на
+  // первом же прогоне (Teams, 10.09.2026) он ушёл в пустоту: бот входил
+  // пятьдесят пять секунд, а таймер сработал на двадцатой. Проверка
+  // обратного пути тогда просто не состоялась, и это выяснилось только по
+  // логу — худший вид непроверенной проверки.
+  //
+  // Повторяем несколько раз с паузой: человек может отвлечься, а спрашивать
+  // «слышно?» дешевле, чем гонять встречу заново.
+  let tonesLeft = 3;
+  let toneTimer = null;
 
   let last = '';
   const timer = setInterval(async () => {
@@ -180,6 +192,16 @@ async function main() {
     if (st !== last) {
       last = st;
       console.log(`[bot] состояние: ${st}`);
+      if (st === 'joined_recording' && !toneTimer) {
+        // Вошёл и слышит встречу — теперь есть смысл говорить.
+        void sendTone(source);
+        tonesLeft--;
+        toneTimer = setInterval(() => {
+          if (tonesLeft-- <= 0) { clearInterval(toneTimer); return; }
+          void sendTone(source);
+        }, TONE_REPEAT_MS);
+        toneTimer.unref?.();
+      }
       if (['ended', 'fatal_error', 'data_deleted'].includes(st)) {
         clearInterval(timer);
         summary();
