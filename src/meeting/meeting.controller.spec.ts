@@ -50,7 +50,11 @@ describe('MeetingController', () => {
       // Проверяем список, а не «всё неизвестное — linkeon»: иначе следующий
       // провайдер уедет в свои комнаты так же незаметно, как это случилось
       // с Meet. Пока поведение — фолбэк, но зафиксировано осознанно.
-      await ctl.join(user as any, { agentId: 12, code: 'x', provider: 'zoom' } as any);
+      //
+      // Пример намеренно взят из будущего: `teams` мост умеет, у нас его нет.
+      // Раньше здесь стоял `zoom` — и тест начал падать в тот день, когда
+      // zoom добавили в список, то есть сработал как задумано.
+      await ctl.join(user as any, { agentId: 12, code: 'x', provider: 'teams' } as any);
       expect(meetings.join).toHaveBeenCalledWith('u1', 12, 'x', 'linkeon', undefined);
     });
 

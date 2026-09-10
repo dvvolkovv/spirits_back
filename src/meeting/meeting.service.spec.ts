@@ -540,6 +540,23 @@ describe('MeetingService', () => {
     // воркер сообщил бэкенду свой wsUrl отдельной ручкой.
     const wsUrl = 'wss://my.linkeon.io/attendee/8141?callId=c1';
 
+    it('Zoom: адрес берётся из базы целиком, а мост просят о веб-адаптере', async () => {
+      // Адрес не собрать из кода, а без sdk: "web" ассистент войдёт немым —
+      // нативный адаптер это дефолт моста (проверено живой встречей
+      // 10.09.2026). Признак площадки здесь — колонка external_url плюс
+      // provider записи.
+      withAgent();
+      const url = 'https://us04web.zoom.us/j/71077562785?pwd=SECRET.1';
+      calls.load.mockResolvedValue({
+        id: 'c1', agent_id: 7, user_id: 'u1',
+        provider: 'zoom', external_room: '71077562785', external_url: url,
+      });
+      await svc.attachBot('c1', wsUrl);
+      expect(attendee.createBot).toHaveBeenCalledWith(
+        expect.objectContaining({ meetingUrl: url, provider: 'zoom' }),
+      );
+    });
+
     it('успех: создаёт бота и запоминает его id', async () => {
       withAgent();
       calls.load.mockResolvedValue({ id: 'c1', agent_id: 7, user_id: 'u1', external_room: 'abc-defg-hij' });
@@ -552,6 +569,7 @@ describe('MeetingService', () => {
         botName: 'Андрей · ассистент Дмитрий',
         callId: 'c1',
         wsUrl,
+        provider: 'meet',
       });
       const upd = pg.query.mock.calls.find(([sql, args]: any) =>
         /external_bot_id/.test(sql) && Array.isArray(args) && args.includes('bot_1'),
