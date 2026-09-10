@@ -559,7 +559,9 @@ describe('MeetingService', () => {
 
     it('успех: создаёт бота и запоминает его id', async () => {
       withAgent();
-      calls.load.mockResolvedValue({ id: 'c1', agent_id: 7, user_id: 'u1', external_room: 'abc-defg-hij' });
+      calls.load.mockResolvedValue({
+        id: 'c1', agent_id: 7, user_id: 'u1', external_room: 'abc-defg-hij', room_name: 'room-1',
+      });
       const res = await svc.attachBot('c1', agentIdentity);
       expect(res).toEqual({ status: 'ok' });
       expect(attendee.createBot).toHaveBeenCalledWith({
@@ -583,7 +585,9 @@ describe('MeetingService', () => {
     it('Attendee не создал бота — звонок помечается failed', async () => {
       withAgent();
       attendee.createBot.mockResolvedValue(null);
-      calls.load.mockResolvedValue({ id: 'c1', agent_id: 7, user_id: 'u1', external_room: 'abc-defg-hij' });
+      calls.load.mockResolvedValue({
+        id: 'c1', agent_id: 7, user_id: 'u1', external_room: 'abc-defg-hij', room_name: 'room-1',
+      });
       const res = await svc.attachBot('c1', agentIdentity);
       expect(res).toEqual({ status: 'failed' });
       expect(calls.fail).toHaveBeenCalledWith('c1', expect.any(String));
