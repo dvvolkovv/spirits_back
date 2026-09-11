@@ -130,6 +130,37 @@ describe('MeetWebhookController', () => {
     expect(livekit.send.mock.calls[0][1].fatal).toBe(false);
   });
 
+  it('сообщение чата уходит в комнату с автором и признаком «лично»', async () => {
+    // Чат — единственный канал, где ссылки и имена приходят точно, а не как
+    // их расслышала модель. Проверено на живой встрече 11.09.2026: текст
+    // приезжает дословно.
+    const p = hook('chat_messages.update', {
+      text: 'https://www.google.com/', sender_name: 'Владимир', sender_uuid: 'u1', to: 'everyone',
+    });
+    await ctl.receive(sign(p), p as any);
+    expect(livekit.send).toHaveBeenCalledWith('meet_c1', {
+      v: 1, type: 'meet_chat',
+      text: 'https://www.google.com/', sender: 'Владимир', uuid: 'u1', private: false,
+    });
+  });
+
+  it('личное сообщение боту помечается private', async () => {
+    // `only_bot` у моста — это прямая просьба ассистенту, а не реплика
+    // встречи: на такое он отвечает всегда, на общее — только по имени.
+    const p = hook('chat_messages.update', {
+      text: 'Роман, посмотри вот это', sender_name: 'Владимир', sender_uuid: 'u1', to: 'only_bot',
+    });
+    await ctl.receive(sign(p), p as any);
+    expect(livekit.send.mock.calls[0][1].private).toBe(true);
+  });
+
+  it('пустое сообщение в комнату не уходит', async () => {
+    // В контексте оно только мешает, а ответа вслух тем более не стоит.
+    const p = hook('chat_messages.update', { text: '   ', sender_name: 'Владимир', to: 'everyone' });
+    await ctl.receive(sign(p), p as any);
+    expect(livekit.send).not.toHaveBeenCalled();
+  });
+
   it('повтор по idempotency_key не дублируется', async () => {
     // Attendee ретраит настойчиво (до 30 раз), а дубль «вошёл» копил бы
     // участников в Presence на стороне воркера.

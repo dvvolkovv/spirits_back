@@ -17,7 +17,7 @@ import { RoomEvent } from '@livekit/rtc-node';
 import { z } from 'zod';
 import { backend, type TranscriptEntry } from './backend.js';
 import { PendingAnswers } from './pending.js';
-import { NameGate } from './name-gate.js';
+import { NameGate, addressedByName } from './name-gate.js';
 import { Occupancy, MEET_EMPTY_GRACE_MS } from './occupancy.js';
 import { Presence } from './presence.js';
 import { MixedRoomAudioInput } from './mixed-audio-input.js';
@@ -173,6 +173,37 @@ export default defineAgent({
      * подменяется. Готовая причина ещё и запоминается — иначе сигнал,
      * пришедший в момент старта сессии, снова потерялся бы.
      */
+    /**
+     * Агент сессии. Нужен ради чата встречи: его контекст пополняется молча,
+     * поэтому к экземпляру нужен доступ из обработчика дата-канала, который
+     * регистрируется ЗАДОЛГО до старта сессии.
+     */
+    let liveAgent: voice.Agent | null = null;
+
+    /**
+     * Сообщение чата — в контекст модели, без ответа вслух.
+     *
+     * Именно молча: если бы каждое сообщение шло через pushLine, ассистент
+     * заговаривал бы после каждой строчки в чате — на встрече это невыносимо.
+     * Зато когда его спросят голосом «что там за ссылка», он ответит точно:
+     * в чате ссылки и имена приходят посимвольно, а не как их расслышала
+     * модель.
+     */
+    const noteChat = async (who: string, text: string, priv: boolean): Promise<void> => {
+      if (!liveAgent) return;   // сессия ещё не стартовала — контекста нет
+      try {
+        const ctx = liveAgent.chatCtx.copy();
+        ctx.addMessage({
+          role: 'user',
+          content: `[чат встречи${priv ? ', лично ассистенту' : ''}] ${who}: ${text}`,
+        });
+        await liveAgent.updateChatCtx(ctx);
+      } catch (e) {
+        // Не повод рушить встречу: без одной строки чата разговор возможен.
+        console.error('[чат] в контекст не добавлено', e);
+      }
+    };
+
     let meetFatal: string | null = null;
     let onMeetFatal: ((state: string) => void) | null = null;
     /**
@@ -218,6 +249,33 @@ export default defineAgent({
             sawHuman = true;
             occupancy?.joined(msg.uuid);
             syncFromPresence();
+          }
+          return;
+        }
+        if (msg.type === 'meet_chat') {
+          const text = String(msg.text || '').trim();
+          if (!text) return;
+          const who = String(msg.sender || 'участник');
+          const priv = !!msg.private;
+          console.log(`[чат] ${who}${priv ? ' (лично)' : ''}: ${text.slice(0, 80)}`);
+          if (!liveAgent) {
+            // Сообщение пришло раньше старта сессии — класть его некуда, а
+            // pushLine ниже полез бы в ещё не созданную session. Пишем в лог
+            // и пропускаем: чат до входа людей во встречу — редкость, а
+            // копить его в буфере значит однажды выгрузить модели десяток
+            // строк разом.
+            console.log('[чат] сессии ещё нет — сообщение не в контексте');
+            return;
+          }
+          void noteChat(who, text, priv);
+          // Отвечаем вслух только когда обращаются: лично ассистенту или по
+          // имени. Правило то же, что для речи, и намеренно: человек не ждёт,
+          // что ассистент влезет в разговор из-за чужой строчки в чате.
+          if (priv || addressedByName(text, agentName)) {
+            pushLine(
+              `${INTERNAL_PREFIX}: ${who} написал ${priv ? 'лично тебе' : 'в чат встречи'}: ` +
+              `«${text}». Ответь вслух, коротко.]`,
+            );
           }
           return;
         }
@@ -870,19 +928,25 @@ export default defineAgent({
       }
     }
 
+    // Экземпляр агента держим в переменной, а не создаём прямо в start():
+    // через него пополняется контекст сообщениями чата встречи — молча, без
+    // ответа вслух (см. noteChat ниже).
+    const agentObj = new voice.Agent({
+      instructions: isMeeting
+        ? meetingInstructions({
+            name: agentName,
+            persona: meta.agentPersona || '',
+            preamble: meta.preamble,
+            specialists: meta.specialists,
+          })
+        : callInstructions(meta.preamble, meta.specialists),
+      tools,
+    });
+    liveAgent = agentObj;
+
     try {
       await session.start({
-        agent: new voice.Agent({
-          instructions: isMeeting
-            ? meetingInstructions({
-                name: agentName,
-                persona: meta.agentPersona || '',
-                preamble: meta.preamble,
-                specialists: meta.specialists,
-              })
-            : callInstructions(meta.preamble, meta.specialists),
-          tools,
-        }),
+        agent: agentObj,
         // Комната СЕССИИ — та, где идут люди.
         //
         // Здесь я ошибся на живой встрече 02.09.2026: подменил вход и выход на

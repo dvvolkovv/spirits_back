@@ -34,6 +34,15 @@ export type VoiceDataMessage =
    * `uuid` — ключ участника, `name` показываем в разметке говорящего.
    */
   | { v: 1; type: 'meet_participant'; event: 'join' | 'leave'; uuid: string; name: string }
+  /**
+   * Сообщение из чата встречи на площадке без LiveKit.
+   *
+   * Чат — единственный канал, где ссылки, названия и имена приходят точно, а
+   * не как их расслышала модель. `private` означает `to: only_bot` у моста:
+   * человек написал ЛИЧНО ассистенту, и это прямая просьба, а не реплика
+   * встречи.
+   */
+  | { v: 1; type: 'meet_chat'; text: string; sender: string; uuid: string; private: boolean }
   /** Кто говорит сейчас. Приближение — то же, что ActiveSpeakersChanged. */
   | { v: 1; type: 'meet_speaking'; uuid: string; name: string; speaking: boolean }
   /**

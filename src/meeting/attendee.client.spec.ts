@@ -84,6 +84,9 @@ describe('AttendeeClient', () => {
         'bot.state_change',
         'participant_events.join_leave',
         'participant_events.speech_start_stop',
+        // Чат встречи: ссылки и имена приходят туда точно, а на слух —
+        // как придётся.
+        'chat_messages.update',
       ]);
     });
 

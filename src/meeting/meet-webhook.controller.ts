@@ -177,6 +177,21 @@ export class MeetWebhookController {
           name: String(d.participant_name ?? ''),
           speaking: d.event_type === 'speech_start',
         };
+      case 'chat_messages.update': {
+        const text = String(d.text ?? '').trim();
+        // Пустое сообщение слать незачем: в контексте оно только мешает.
+        if (!text) return null;
+        return {
+          v: 1, type: 'meet_chat',
+          text,
+          sender: String(d.sender_name ?? 'участник'),
+          uuid: String(d.sender_uuid ?? ''),
+          // `only_bot` — это личное сообщение АССИСТЕНТУ, то есть прямая
+          // просьба, а не реплика встречи. Различать обязательно: на личное
+          // отвечаем всегда, общее по умолчанию только слушаем.
+          private: String(d.to ?? '') === 'only_bot',
+        };
+      }
       case 'bot.state_change': {
         // Код причины: `event_sub_type` точнее, `event_type` — если подтипа
         // нет. Без него в базе оказывалось «бот Attendee: fatal_error», а
