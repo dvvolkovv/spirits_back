@@ -111,9 +111,7 @@ describe('VoiceCallInternalController: доступ', () => {
     // Порт у каждого задания свой, и знает его только воркер (см.
     // AttendeeAudioHub) — эта ручка и есть тот момент, когда бэкенд узнаёт
     // адрес и может создать бота Attendee.
-    // Личность в комнате, а не адрес вебсокета: мост берёт у неё звук
-    // ассистента (см. attendee.client.ts, room_sync_settings).
-    const botBody = { callId: 'call-1', agentIdentity: 'agent-AJ_test' };
+    const botBody = { callId: 'call-1', wsUrl: 'wss://my.linkeon.io/attendee/8141?callId=call-1' };
     const botRaw = JSON.stringify(botBody);
 
     function makeMeetCtl() {
@@ -133,11 +131,13 @@ describe('VoiceCallInternalController: доступ', () => {
       expect(meetings.attachBot).not.toHaveBeenCalled();
     });
 
-    it('с верной подписью зовёт attachBot с callId и личностью воркера', async () => {
+    it('с верной подписью зовёт attachBot с callId и wsUrl воркера', async () => {
       const { ctl, meetings } = makeMeetCtl();
       const res = await ctl.meetBot(signBody(SECRET, botRaw), req(botRaw));
       expect(res).toEqual({ status: 'ok' });
-      expect(meetings.attachBot).toHaveBeenCalledWith('call-1', 'agent-AJ_test');
+      expect(meetings.attachBot).toHaveBeenCalledWith(
+        'call-1', 'wss://my.linkeon.io/attendee/8141?callId=call-1',
+      );
     });
 
     it('неудача attachBot возвращается ответом, а не исключением', async () => {

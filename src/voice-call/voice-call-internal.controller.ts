@@ -120,20 +120,19 @@ export class VoiceCallInternalController {
   }
 
   /**
-   * Воркер сообщил свою личность в комнате — создаём бота Attendee.
+   * Воркер сообщил адрес своего вебсокета — создаём бота Attendee.
    *
-   * Идентичность агенту назначает фреймворк, и знает её только сам воркер,
-   * поэтому бот создаётся здесь, а не в join(). У этой личности мост берёт
-   * звук ассистента для встречи. Ответ синхронный: воркеру нужно знать, есть
-   * ли смысл ждать участников.
+   * Порт у каждого задания свой, и знает его только воркер, поэтому бот
+   * создаётся здесь, а не в join(). Ответ синхронный: воркеру нужно знать,
+   * есть ли смысл ждать подключения.
    */
   @Post('meet-bot')
   async meetBot(
     @Headers('x-voice-signature') signature: string,
     @Req() req: Request,
   ): Promise<{ status: 'ok' | 'failed' }> {
-    const body = this.parseSigned<{ callId: string; agentIdentity: string }>(req, signature);
-    return this.meetings.attachBot(body.callId, body.agentIdentity);
+    const body = this.parseSigned<{ callId: string; wsUrl: string }>(req, signature);
+    return this.meetings.attachBot(body.callId, body.wsUrl);
   }
 
   @Post('failed')

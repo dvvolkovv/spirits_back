@@ -28,21 +28,40 @@ describe('MeetWebhookController', () => {
     idempotency_key: key, bot_id: 'b1', bot_metadata: { callId: 'c1' }, trigger, data,
   });
 
-  it('вебхуки состава и речи больше не наши — в комнату ничего не уходит', async () => {
-    // Раньше состав встречи приезжал вебхуками, потому что своя комната была
-    // пуста по замыслу. С синхронизацией участники сидят в этой самой
-    // комнате, и события даёт LiveKit — теми же событиями, что в своих
-    // комнатах. Подписку на эти триггеры мы сняли (см. TRIGGERS в
-    // attendee.client.ts), но мост мог отправить их по старой подписке
-    // существующего бота: тогда сообщение просто игнорируется.
-    for (const trigger of ['participant_events.join_leave', 'participant_events.speech_start_stop']) {
-      livekit.send.mockClear();
-      const p = hook(trigger, {
-        participant_name: 'Сергей', participant_uuid: 'u1', event_type: 'join',
-      }, `k-${trigger}`);
-      await ctl.receive(sign(p), p as any);
-      expect(livekit.send).not.toHaveBeenCalled();
-    }
+  it('вход участника уходит в комнату звонка', async () => {
+    const p = hook('participant_events.join_leave', {
+      participant_name: 'Сергей', participant_uuid: 'u1', event_type: 'join', timestamp_ms: 1,
+    });
+    await ctl.receive(sign(p), p as any);
+    expect(livekit.send).toHaveBeenCalledWith('meet_c1', {
+      v: 1, type: 'meet_participant', event: 'join', uuid: 'u1', name: 'Сергей',
+    });
+  });
+
+  it('выход участника тоже', async () => {
+    const p = hook('participant_events.join_leave', {
+      participant_name: 'Сергей', participant_uuid: 'u1', event_type: 'leave', timestamp_ms: 2,
+    });
+    await ctl.receive(sign(p), p as any);
+    expect(livekit.send.mock.calls[0][1].event).toBe('leave');
+  });
+
+  it('говорящий уходит отдельным событием', async () => {
+    const p = hook('participant_events.speech_start_stop', {
+      participant_name: 'Сергей', participant_uuid: 'u1', event_type: 'speech_start',
+    });
+    await ctl.receive(sign(p), p as any);
+    expect(livekit.send.mock.calls[0][1]).toEqual({
+      v: 1, type: 'meet_speaking', uuid: 'u1', name: 'Сергей', speaking: true,
+    });
+  });
+
+  it('замолчал — speaking false', async () => {
+    const p = hook('participant_events.speech_start_stop', {
+      participant_name: 'Сергей', participant_uuid: 'u1', event_type: 'speech_stop',
+    });
+    await ctl.receive(sign(p), p as any);
+    expect(livekit.send.mock.calls[0][1].speaking).toBe(false);
   });
 
   it('смертельное состояние бота помечается fatal', async () => {
@@ -112,17 +131,23 @@ describe('MeetWebhookController', () => {
   });
 
   it('повтор по idempotency_key не дублируется', async () => {
-    // Attendee ретраит настойчиво (до 30 раз), а дубль состояния бота
-    // означал бы второй выход из встречи по уже отработанной причине.
-    const p = hook('bot.state_change', { new_state: 'waiting_room', old_state: 'joining' });
+    // Attendee ретраит настойчиво (до 30 раз), а дубль «вошёл» копил бы
+    // участников в Presence на стороне воркера.
+    const p = hook('participant_events.join_leave', {
+      participant_name: 'Сергей', participant_uuid: 'u1', event_type: 'join', timestamp_ms: 1,
+    });
     await ctl.receive(sign(p), p as any);
     await ctl.receive(sign(p), p as any);
     expect(livekit.send).toHaveBeenCalledTimes(1);
   });
 
   it('разные события того же бота не глушат друг друга', async () => {
-    const a = hook('bot.state_change', { new_state: 'waiting_room', old_state: 'joining' }, 'k1');
-    const b = hook('bot.state_change', { new_state: 'joined_recording', old_state: 'waiting_room' }, 'k2');
+    const a = hook('participant_events.join_leave', {
+      participant_name: 'Сергей', participant_uuid: 'u1', event_type: 'join', timestamp_ms: 1,
+    }, 'k1');
+    const b = hook('participant_events.join_leave', {
+      participant_name: 'Дмитрий', participant_uuid: 'u2', event_type: 'join', timestamp_ms: 2,
+    }, 'k2');
     await ctl.receive(sign(a), a as any);
     await ctl.receive(sign(b), b as any);
     expect(livekit.send).toHaveBeenCalledTimes(2);
