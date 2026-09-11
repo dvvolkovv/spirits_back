@@ -76,6 +76,10 @@ HELPER = """
 // иначе, по комментарию авторов, звук пойдёт в колонки, — поэтому сначала
 // просим его создать.
 const linkeonRoutedTracks = new Set();
+// Ссылки на элемент вывода и узел графа: без них сборщик мусора уберёт их
+// вместе со звуком, и тишина вернётся через случайное время.
+const linkeonAudioSinks = new Set();
+const linkeonAudioNodes = new Set();
 
 async function linkeonRouteAudioToMic(mediaStream) {
   const mgr = window.botOutputManager;
@@ -95,13 +99,35 @@ async function linkeonRouteAudioToMic(mediaStream) {
     // в приостановленном графе дорожка молчит.
     if (ctx.state === 'suspended') await ctx.resume();
 
-    const src = ctx.createMediaStreamSource(new MediaStream([track]));
+    const only = new MediaStream([track]);
+
+    // Chrome не даёт удалённой дорожке WebRTC течь в WebAudio, пока поток
+    // никуда не выводится: узел создан, соединён, а сигнала в нём нет.
+    // Лечится тем, что поток дополнительно «проигрывается» элементом audio.
+    //
+    // Элемент ОБЯЗАН жить в ссылке: без неё сборщик мусора уберёт его вместе
+    // с выводом, и тишина вернётся через случайное время. Приглушаем: динамики
+    // бота нам не нужны, а незаглушённый вывод рискует вернуться во встречу
+    // эхом.
+    //
+    // Проверено живой встречей 10.09.2026: до этого LinkeonAudioToMic
+    // отчитывался ok:true при running-контексте, и звука всё равно не было —
+    // не хватало ровно этого шага.
+    const sink = new Audio();
+    sink.srcObject = only;
+    sink.muted = true;
+    linkeonAudioSinks.add(sink);
+    const played = sink.play().then(() => true).catch((e) => String(e && e.message || e));
+
+    const src = ctx.createMediaStreamSource(only);
     src.connect(gain);
     linkeonRoutedTracks.add(track.id);
+    linkeonAudioNodes.add(src);   // тот же довод: не дать собрать узел
     mgr.ensureMicOn?.();
 
     window.ws?.sendJson({
       type: 'LinkeonAudioToMic', ok: true, trackId: track.id, ctxState: ctx.state,
+      sinkPlay: await played,
     });
   } catch (e) {
     window.ws?.sendJson({ type: 'LinkeonAudioToMic', ok: false, reason: String(e && e.message || e) });
