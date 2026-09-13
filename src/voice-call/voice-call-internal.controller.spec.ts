@@ -118,7 +118,11 @@ describe('VoiceCallInternalController: доступ', () => {
       const jobs = { ask: jest.fn() };
       const calls = { load: jest.fn(), isActive: jest.fn(), complete: jest.fn(), fail: jest.fn() };
       const docs = { create: jest.fn() };
-      const meetings = { attachBot: jest.fn(async () => ({ status: 'ok' })), noteFirstHuman: jest.fn() };
+      const meetings = {
+        attachBot: jest.fn(async () => ({ status: 'ok' })),
+        noteFirstHuman: jest.fn(),
+        sendChatMessage: jest.fn(async () => true),
+      };
       return {
         ctl: new VoiceCallInternalController(jobs as any, calls as any, docs as any, meetings as any),
         meetings,
@@ -138,6 +142,25 @@ describe('VoiceCallInternalController: доступ', () => {
       expect(meetings.attachBot).toHaveBeenCalledWith(
         'call-1', 'wss://my.linkeon.io/attendee/8141?callId=call-1',
       );
+    });
+
+    it('сообщение в чат встречи тоже закрыто подписью', async () => {
+      const { ctl, meetings } = makeMeetCtl();
+      const raw = JSON.stringify({ callId: 'call-1', text: 'держите ссылку' });
+      await expect(ctl.meetingChat('' as any, req(raw))).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(meetings.sendChatMessage).not.toHaveBeenCalled();
+    });
+
+    it('сообщение в чат уходит и отвечает честным sent', async () => {
+      // Тул в воркере синхронный: по этому полю ассистент решает, говорить
+      // ли вслух «написал» или «написать не вышло».
+      const { ctl, meetings } = makeMeetCtl();
+      const raw = JSON.stringify({ callId: 'call-1', text: 'держите ссылку' });
+      expect(await ctl.meetingChat(signBody(SECRET, raw), req(raw))).toEqual({ sent: true });
+      expect(meetings.sendChatMessage).toHaveBeenCalledWith('call-1', 'держите ссылку');
+
+      meetings.sendChatMessage.mockResolvedValue(false);
+      expect(await ctl.meetingChat(signBody(SECRET, raw), req(raw))).toEqual({ sent: false });
     });
 
     it('неудача attachBot возвращается ответом, а не исключением', async () => {

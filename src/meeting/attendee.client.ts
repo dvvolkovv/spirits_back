@@ -30,7 +30,25 @@ export const ATTENDEE_SAMPLE_RATE = 24_000;
  * Набор — из `bots/models.py`, `BotStates`. `waiting_room` сюда НЕ входит:
  * это ожидание впуска, а не отказ.
  */
-export const TERMINAL_BOT_STATES = new Set(['fatal_error', 'ended', 'data_deleted']);
+export /**
+ * Привести текст к тому, что мост примет.
+ *
+ * Ограничения не наши, а его: сообщение до 10 000 знаков и **только символы
+ * BMP** — на эмодзи сериализатор Attendee отвечает 400 «Message cannot
+ * contain emojis or rare script characters». Модель про это не знает и рано
+ * или поздно поставит смайлик, поэтому режем здесь, а не надеемся на промпт.
+ *
+ * Суррогатные пары выбрасываем целиком: половина пары — это битый текст.
+ */
+export function chatSafe(text: string): string {
+  return Array.from(String(text ?? ''))
+    .filter((ch) => (ch.codePointAt(0) ?? 0) <= 0xffff)
+    .join('')
+    .trim()
+    .slice(0, 10_000);
+}
+
+const TERMINAL_BOT_STATES = new Set(['fatal_error', 'ended', 'data_deleted']);
 
 /**
  * Что слушаем.
@@ -234,6 +252,27 @@ export class AttendeeClient {
    *             встрече. Вызывающий обязан оставить запись реаперу на
    *             повторную попытку.
    */
+  /**
+   * Написать в общий чат встречи от имени бота.
+   *
+   * Только «всем»: личная переписка ассистента с участником — это отдельный
+   * продукт со своими ожиданиями (решение владельца 13.09.2026), а `to:
+   * specific_user` у моста требует ещё и uuid адресата.
+   *
+   * `false` — сообщение НЕ ушло, и ассистент обязан сказать об этом вслух, а
+   * не сделать вид, что написал. Отказ штатен: мост отвечает 400, пока бот не
+   * в состоянии, позволяющем отправку (например, ещё в комнате ожидания).
+   */
+  async sendChatMessage(botId: string, text: string): Promise<boolean> {
+    const message = chatSafe(text);
+    if (!message) return false;
+    const r = await this.call(`/api/v1/bots/${encodeURIComponent(botId)}/send_chat_message`, {
+      method: 'POST',
+      body: JSON.stringify({ to: 'everyone', message }),
+    });
+    return !!r && r.status >= 200 && r.status < 300;
+  }
+
   async removeBot(botId: string): Promise<boolean | null> {
     const path = `/api/v1/bots/${encodeURIComponent(botId)}`;
     const r = await this.call(`${path}/leave`, { method: 'POST' });

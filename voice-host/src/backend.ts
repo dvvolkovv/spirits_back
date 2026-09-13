@@ -28,6 +28,10 @@ const TIMEOUT_MS: Record<string, number> = {
   // на страницу Meet, а не запись строки. 2 секунды, как у ask/document,
   // здесь били бы по живым, но чуть медленным попыткам входа.
   'meet-bot': 15_000,
+  // Сообщение в чат встречи. Тул синхронный, разговор ждёт — значит ждать
+  // можно ровно столько, сколько терпимо молчание в живой встрече. Ручка
+  // только просит мост создать запрос на отправку.
+  'meeting-chat': 3_000,
 };
 
 async function post<T>(path: string, body: unknown): Promise<T> {
@@ -90,6 +94,13 @@ export const backend = {
    * есть смысл ждать подключения; на любой другой исход (в т.ч. сетевой сбой,
    * пойманный вызывающим через .catch) ждать уже незачем.
    */
+  /**
+   * Написать в чат встречи. `sent: false` — сообщение НЕ ушло.
+   *
+   * Ошибку не глотаем и здесь: вызывающий обязан сказать правду вслух.
+   */
+  meetingChat: (callId: string, text: string) =>
+    post<{ sent: boolean }>('meeting-chat', { callId, text }),
   meetBot: (callId: string, wsUrl: string) =>
     post<{ status: 'ok' | 'failed' }>('meet-bot', { callId, wsUrl }).then((r) => r.status === 'ok'),
 };

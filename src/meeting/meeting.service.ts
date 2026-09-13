@@ -384,6 +384,42 @@ export class MeetingService {
   }
 
   /**
+   * Написать в чат встречи от имени ассистента.
+   *
+   * Зовётся из воркера синхронно, внутри тула, поэтому ответ обязан быть
+   * честным и быстрым: `false` — не написали, и ассистент скажет об этом
+   * вслух. Молча проглотить отказ нельзя, иначе он пообещает «скинул ссылку»,
+   * а в чате будет пусто.
+   *
+   * Бот проверяется по записи звонка, а не приходит параметром: воркер знает
+   * только свой callId, и это правильно — id бота живёт на нашей стороне.
+   */
+  async sendChatMessage(callId: string, text: string): Promise<boolean> {
+    let call: any;
+    try {
+      call = await this.calls.load(callId);
+    } catch (e: any) {
+      this.logger.warn(`[чат] call=${callId} не найден: ${e?.message}`);
+      return false;
+    }
+    if (!BRIDGED_PROVIDERS.includes(call.provider)) {
+      // В своих комнатах и в Taler ID чат встречи не наш: там LiveKit, и
+      // писать надо было бы совсем другим способом.
+      this.logger.warn(`[чат] provider=${call.provider} — писать в чат нечем`);
+      return false;
+    }
+    const botId = call.external_bot_id;
+    if (!botId) {
+      // Бот уже убран (звонок завершается) или ещё не создан.
+      this.logger.warn(`[чат] call=${callId}: бота нет`);
+      return false;
+    }
+    const ok = await this.attendee.sendChatMessage(String(botId), text);
+    if (!ok) this.logger.warn(`[чат] мост не принял сообщение, call=${callId}`);
+    return ok;
+  }
+
+  /**
    * Во встрече появился первый живой участник.
    *
    * COALESCE обязателен: участники входят и выходят, и повторный вызов не

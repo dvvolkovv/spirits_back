@@ -157,6 +157,46 @@ describe('AttendeeClient', () => {
     });
   });
 
+  describe('sendChatMessage', () => {
+    it('пишет всем участникам', async () => {
+      const f = jest.fn().mockResolvedValue(ok({}));
+      global.fetch = f as any;
+      const r = await new AttendeeClient().sendChatMessage('bot_1', 'https://example.com/цена');
+      expect(r).toBe(true);
+      const [url, init] = f.mock.calls[0];
+      expect(url).toBe('https://attendee.test/api/v1/bots/bot_1/send_chat_message');
+      expect(JSON.parse(init.body)).toEqual({ to: 'everyone', message: 'https://example.com/цена' });
+    });
+
+    it('эмодзи вырезаются, а не ломают отправку', async () => {
+      // Сериализатор моста отвечает 400 «Message cannot contain emojis or rare
+      // script characters» на любой символ вне BMP. Модель про это не знает и
+      // рано или поздно поставит смайлик.
+      const f = jest.fn().mockResolvedValue(ok({}));
+      global.fetch = f as any;
+      await new AttendeeClient().sendChatMessage('bot_1', 'Готово 👍 держите ссылку');
+      expect(JSON.parse(f.mock.calls[0][1].body).message).toBe('Готово  держите ссылку');
+    });
+
+    it('пустое сообщение до моста не доходит', async () => {
+      const f = jest.fn();
+      global.fetch = f as any;
+      expect(await new AttendeeClient().sendChatMessage('bot_1', '   ')).toBe(false);
+      expect(f).not.toHaveBeenCalled();
+    });
+
+    it('отказ моста — честный false', async () => {
+      // 400 приходит штатно: бот ещё в комнате ожидания и писать не может.
+      global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 400, json: async () => ({}) }) as any;
+      expect(await new AttendeeClient().sendChatMessage('bot_1', 'привет')).toBe(false);
+    });
+
+    it('недоступный мост — тоже false, а не исключение', async () => {
+      global.fetch = jest.fn().mockRejectedValue(new Error('ECONNREFUSED')) as any;
+      expect(await new AttendeeClient().sendChatMessage('bot_1', 'привет')).toBe(false);
+    });
+  });
+
   describe('removeBot', () => {
     it('зовёт leave и говорит об успехе', async () => {
       const spy = jest.fn().mockResolvedValue(ok({}));

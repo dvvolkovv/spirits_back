@@ -70,6 +70,7 @@ describe('MeetingService', () => {
     attendee = {
       createBot: jest.fn().mockResolvedValue({ botId: 'bot_1' }),
       removeBot: jest.fn().mockResolvedValue(true),
+      sendChatMessage: jest.fn().mockResolvedValue(true),
     };
     svc = new MeetingService(pg as any, calls as any, livekit as any, rooms as any, talerIdRooms as any, attendee as any);
   });
@@ -209,6 +210,49 @@ describe('MeetingService', () => {
       calls.load.mockRejectedValue(new Error('call not found'));
       await svc.leave('нет-такого');
       expect(calls.markInterruptedKeepingRoom).toHaveBeenCalledWith('нет-такого');
+    });
+  });
+
+  describe('sendChatMessage', () => {
+    const bridged = (over: Record<string, unknown> = {}) =>
+      calls.load.mockResolvedValue({ id: 'c1', provider: 'meet', external_bot_id: 'bot_1', ...over });
+
+    it('пишет через бота этого звонка', async () => {
+      bridged();
+      expect(await svc.sendChatMessage('c1', 'держите ссылку')).toBe(true);
+      expect(attendee.sendChatMessage).toHaveBeenCalledWith('bot_1', 'держите ссылку');
+    });
+
+    it('в Zoom так же — площадка различается только в мосте', async () => {
+      bridged({ provider: 'zoom' });
+      expect(await svc.sendChatMessage('c1', 'привет')).toBe(true);
+    });
+
+    it('в своей комнате писать нечем — false и ни одного запроса', async () => {
+      // Там LiveKit, и чат встречи не наш: обещать отправку было бы враньём.
+      bridged({ provider: 'linkeon_room' });
+      expect(await svc.sendChatMessage('c1', 'привет')).toBe(false);
+      expect(attendee.sendChatMessage).not.toHaveBeenCalled();
+    });
+
+    it('бота уже нет — false, а не исключение', async () => {
+      // Штатный момент: звонок завершается, бот убран, а тул ещё в полёте.
+      bridged({ external_bot_id: null });
+      expect(await svc.sendChatMessage('c1', 'привет')).toBe(false);
+      expect(attendee.sendChatMessage).not.toHaveBeenCalled();
+    });
+
+    it('звонок не найден — false', async () => {
+      calls.load.mockRejectedValue(new Error('нет такого звонка'));
+      expect(await svc.sendChatMessage('c1', 'привет')).toBe(false);
+    });
+
+    it('отказ моста доезжает до вызывающего', async () => {
+      // Воркер по этому false скажет вслух «написать не вышло». Проглотить
+      // отказ значит пообещать сообщение, которого в чате нет.
+      bridged();
+      attendee.sendChatMessage.mockResolvedValue(false);
+      expect(await svc.sendChatMessage('c1', 'привет')).toBe(false);
     });
   });
 
