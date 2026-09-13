@@ -126,22 +126,26 @@ export class PersonasService implements OnModuleInit {
   private async computeOverview(): Promise<PersonasOverview> {
     const sql = `
       WITH
-      -- per-user message volume + category share
+      -- per-user message volume + category share.
+      -- Источник — custom_chat_history (реальный чат, тот же, что у воронки),
+      -- НЕ events.message_sent: этот event умер 2026-06-07 (переименован в
+      -- chat_message_sent, тоже мёртв), из-за чего персоны/retention были
+      -- заморожены на июне и retention_14d показывал 0 у всех. user_id — префикс
+      -- session_id ("<phone>_<assistantId>"), ассистент — колонка agent.
       msg AS (
         SELECT
-          e.user_id,
+          split_part(ch.session_id,'_',1) AS user_id,
           COUNT(*) AS total_msgs,
           SUM(CASE WHEN a.category = 'business' THEN 1 ELSE 0 END)::numeric AS biz_msgs,
           SUM(CASE WHEN a.category = 'personal' THEN 1 ELSE 0 END)::numeric AS per_msgs,
           SUM(CASE WHEN a.category = 'smm'      THEN 1 ELSE 0 END)::numeric AS smm_msgs,
-          MAX(e.ts) AS last_msg_ts
-        FROM events e
-        LEFT JOIN agents a ON a.id::text = (e.props->>'assistant_id')
-        WHERE e.name = 'message_sent'
-          AND e.user_id IS NOT NULL
-          AND e.user_id <> ALL($1::text[])
-          AND e.user_id NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
-        GROUP BY e.user_id
+          MAX(ch.created_at) AS last_msg_ts
+        FROM custom_chat_history ch
+        LEFT JOIN agents a ON a.id = ch.agent
+        WHERE ch.sender_type = 'human'
+          AND split_part(ch.session_id,'_',1) <> ALL($1::text[])
+          AND split_part(ch.session_id,'_',1) NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
+        GROUP BY split_part(ch.session_id,'_',1)
       ),
       gen AS (
         SELECT user_id, SUM(c) AS gen_count FROM (
@@ -191,21 +195,22 @@ export class PersonasService implements OnModuleInit {
     // Top assistants per persona — separate query for clarity
     const topSql = `
       WITH msg AS (
+        -- Источник — custom_chat_history (см. коммент в computeOverview): events
+        -- .message_sent мёртв с 2026-06-07, иначе топ-ассистенты были бы за июнь.
         SELECT
-          e.user_id,
-          (e.props->>'assistant_id') AS aid,
+          split_part(ch.session_id,'_',1) AS user_id,
+          ch.agent::text AS aid,
           a.name AS aname,
           a.display_name AS dname,
-          SUM(CASE WHEN a.category = 'business' THEN 1 ELSE 0 END) OVER (PARTITION BY e.user_id) AS biz,
-          SUM(CASE WHEN a.category = 'personal' THEN 1 ELSE 0 END) OVER (PARTITION BY e.user_id) AS per,
-          SUM(CASE WHEN a.category = 'smm'      THEN 1 ELSE 0 END) OVER (PARTITION BY e.user_id) AS smm,
-          COUNT(*) OVER (PARTITION BY e.user_id) AS total
-        FROM events e
-        LEFT JOIN agents a ON a.id::text = (e.props->>'assistant_id')
-        WHERE e.name = 'message_sent'
-          AND e.user_id IS NOT NULL
-          AND e.user_id <> ALL($1::text[])
-          AND e.user_id NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
+          SUM(CASE WHEN a.category = 'business' THEN 1 ELSE 0 END) OVER (PARTITION BY split_part(ch.session_id,'_',1)) AS biz,
+          SUM(CASE WHEN a.category = 'personal' THEN 1 ELSE 0 END) OVER (PARTITION BY split_part(ch.session_id,'_',1)) AS per,
+          SUM(CASE WHEN a.category = 'smm'      THEN 1 ELSE 0 END) OVER (PARTITION BY split_part(ch.session_id,'_',1)) AS smm,
+          COUNT(*) OVER (PARTITION BY split_part(ch.session_id,'_',1)) AS total
+        FROM custom_chat_history ch
+        LEFT JOIN agents a ON a.id = ch.agent
+        WHERE ch.sender_type = 'human'
+          AND split_part(ch.session_id,'_',1) <> ALL($1::text[])
+          AND split_part(ch.session_id,'_',1) NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
       ),
       gen AS (
         SELECT user_id, SUM(c) AS gen_count FROM (
@@ -366,15 +371,16 @@ export class PersonasService implements OnModuleInit {
     const sql = `
       WITH
       msg AS (
-        SELECT e.user_id, COUNT(*) AS total_msgs,
+        -- Источник — custom_chat_history (events.message_sent мёртв с 2026-06-07).
+        SELECT split_part(ch.session_id,'_',1) AS user_id, COUNT(*) AS total_msgs,
                SUM(CASE WHEN a.category='business' THEN 1 ELSE 0 END)::numeric AS biz_msgs,
                SUM(CASE WHEN a.category='personal' THEN 1 ELSE 0 END)::numeric AS per_msgs,
                SUM(CASE WHEN a.category='smm'      THEN 1 ELSE 0 END)::numeric AS smm_msgs
-          FROM events e LEFT JOIN agents a ON a.id::text = (e.props->>'assistant_id')
-         WHERE e.name='message_sent' AND e.user_id IS NOT NULL
-           AND e.user_id <> ALL($1::text[])
-           AND e.user_id NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
-         GROUP BY e.user_id
+          FROM custom_chat_history ch LEFT JOIN agents a ON a.id = ch.agent
+         WHERE ch.sender_type='human'
+           AND split_part(ch.session_id,'_',1) <> ALL($1::text[])
+           AND split_part(ch.session_id,'_',1) NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
+         GROUP BY split_part(ch.session_id,'_',1)
       ),
       gen AS (
         SELECT user_id, SUM(c) AS gen_count FROM (
@@ -442,15 +448,16 @@ export class PersonasService implements OnModuleInit {
     const sql = `
       WITH
       msg AS (
-        SELECT e.user_id, COUNT(*) AS total_msgs,
+        -- Источник — custom_chat_history (events.message_sent мёртв с 2026-06-07).
+        SELECT split_part(ch.session_id,'_',1) AS user_id, COUNT(*) AS total_msgs,
                SUM(CASE WHEN a.category='business' THEN 1 ELSE 0 END)::numeric AS biz_msgs,
                SUM(CASE WHEN a.category='personal' THEN 1 ELSE 0 END)::numeric AS per_msgs,
                SUM(CASE WHEN a.category='smm'      THEN 1 ELSE 0 END)::numeric AS smm_msgs
-          FROM events e LEFT JOIN agents a ON a.id::text = (e.props->>'assistant_id')
-         WHERE e.name='message_sent' AND e.user_id IS NOT NULL
-           AND e.user_id <> ALL($1::text[])
-           AND e.user_id NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
-         GROUP BY e.user_id
+          FROM custom_chat_history ch LEFT JOIN agents a ON a.id = ch.agent
+         WHERE ch.sender_type='human'
+           AND split_part(ch.session_id,'_',1) <> ALL($1::text[])
+           AND split_part(ch.session_id,'_',1) NOT IN (SELECT user_id FROM ai_profiles_consolidated WHERE isadmin = true)
+         GROUP BY split_part(ch.session_id,'_',1)
       ),
       gen AS (
         SELECT user_id, SUM(c) AS gen_count FROM (
