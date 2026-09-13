@@ -1,4 +1,5 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
 import { PgService } from '../../common/services/pg.service';
 
 /**
@@ -358,6 +359,20 @@ export class PersonasService implements OnModuleInit {
       error: row.error_message ?? null,
     };
     return { ...snap, lastRun };
+  }
+
+  // Ночной авто-пересчёт (05:00 UTC, после profile-compaction 04:00 и
+  // task-archiver 04:30). getLatest() отдаёт последний сохранённый снапшот и НЕ
+  // пересчитывает сам — без этого крона график «Персоны» тихо застывает на
+  // последнем ручном «Обновить». Пересчёт дешёвый (чистый SQL, 0 токенов).
+  @Cron('0 5 * * *')
+  async nightlyRecompute() {
+    try {
+      const o = await this.recompute(null, 'cron');
+      this.log.log(`personas nightly recompute: ${o.totalUsers} users`);
+    } catch (e: any) {
+      this.log.error(`personas nightly recompute failed: ${e?.message}`);
+    }
   }
 
   // Разбивка сессий (диалогов user×assistant из custom_chat_history) по персонам
