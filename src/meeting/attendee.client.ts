@@ -30,7 +30,9 @@ export const ATTENDEE_SAMPLE_RATE = 24_000;
  * Набор — из `bots/models.py`, `BotStates`. `waiting_room` сюда НЕ входит:
  * это ожидание впуска, а не отказ.
  */
-export /**
+export const TERMINAL_BOT_STATES = new Set(['fatal_error', 'ended', 'data_deleted']);
+
+/**
  * Привести текст к тому, что мост примет.
  *
  * Ограничения не наши, а его: сообщение до 10 000 знаков и **только символы
@@ -47,8 +49,6 @@ export function chatSafe(text: string): string {
     .trim()
     .slice(0, 10_000);
 }
-
-const TERMINAL_BOT_STATES = new Set(['fatal_error', 'ended', 'data_deleted']);
 
 /**
  * Что слушаем.
