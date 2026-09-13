@@ -216,16 +216,93 @@ export class VpmService implements OnModuleInit {
       snapshot.funnel = funnelMerged;
     } catch { /* silent */ }
 
+    // 5b. TRUE cohort retention (D1/D7/D30) + free→paid — из custom_chat_history
+    // (тот же надёжный источник, что воронка). Заменяет сломанный proxy
+    // personas.retention_14d (тот читал мёртвый events.message_sent и показывал 0
+    // у всех). «Вернулся к Dn» = написал сообщение в (first_chat, first_chat+n];
+    // знаменатель — только когорты, прожившие ≥n дней (иначе занижение).
+    try {
+      const cohort = await this.pg.query(
+        `WITH chat AS (
+           SELECT split_part(session_id,'_',1) AS uid, created_at::date AS d
+             FROM custom_chat_history
+            WHERE sender_type='human'
+              AND split_part(session_id,'_',1) <> ALL($1) AND split_part(session_id,'_',1) !~ $2
+         ),
+         firsts AS (SELECT uid, min(d) AS first_d FROM chat GROUP BY uid),
+         days AS (SELECT DISTINCT uid, d FROM chat)
+         SELECT
+           count(*) FILTER (WHERE first_d <= current_date-1)  AS elig_d1,
+           count(*) FILTER (WHERE first_d <= current_date-1  AND EXISTS (SELECT 1 FROM days x WHERE x.uid=f.uid AND x.d > f.first_d AND x.d <= f.first_d+1))  AS ret_d1,
+           count(*) FILTER (WHERE first_d <= current_date-7)  AS elig_d7,
+           count(*) FILTER (WHERE first_d <= current_date-7  AND EXISTS (SELECT 1 FROM days x WHERE x.uid=f.uid AND x.d > f.first_d AND x.d <= f.first_d+7))  AS ret_d7,
+           count(*) FILTER (WHERE first_d <= current_date-30) AS elig_d30,
+           count(*) FILTER (WHERE first_d <= current_date-30 AND EXISTS (SELECT 1 FROM days x WHERE x.uid=f.uid AND x.d > f.first_d AND x.d <= f.first_d+30)) AS ret_d30
+         FROM firsts f`,
+        [TEST_USERS, TEST_PATTERN],
+      );
+      const c = cohort.rows[0] || {};
+      const pct = (num: any, den: any) => {
+        const n = Number(num) || 0, d = Number(den) || 0;
+        return d > 0 ? Math.round((1000 * n) / d) / 10 : null;
+      };
+      snapshot.cohort_retention = {
+        d1_pct: pct(c.ret_d1, c.elig_d1),   d1_eligible: Number(c.elig_d1) || 0,
+        d7_pct: pct(c.ret_d7, c.elig_d7),   d7_eligible: Number(c.elig_d7) || 0,
+        d30_pct: pct(c.ret_d30, c.elig_d30), d30_eligible: Number(c.elig_d30) || 0,
+      };
+
+      // free→paid: доля юзеров с ≥1 успешным платежом + медианный день первой
+      // оплаты от первого чата. Показывает есть ли конверсионный потенциал у
+      // curious/mixed (avg_payment=0) — цель вместо «retention>0».
+      const mon = await this.pg.query(
+        `WITH chatters AS (
+           SELECT split_part(session_id,'_',1) AS uid, min(created_at) AS first_chat
+             FROM custom_chat_history
+            WHERE sender_type='human'
+              AND split_part(session_id,'_',1) <> ALL($1) AND split_part(session_id,'_',1) !~ $2
+            GROUP BY 1
+         ),
+         paid AS (
+           SELECT user_id, min(created_at) AS first_pay
+             FROM payments WHERE status='succeeded' GROUP BY 1
+         )
+         SELECT
+           count(*)::int                                              AS users,
+           count(p.user_id)::int                                      AS payers,
+           round(EXTRACT(EPOCH FROM percentile_cont(0.5) WITHIN GROUP (
+             ORDER BY (p.first_pay - c.first_chat)) FILTER (WHERE p.first_pay >= c.first_chat))/86400.0, 1) AS median_days_to_first_pay
+         FROM chatters c LEFT JOIN paid p ON p.user_id = c.uid`,
+        [TEST_USERS, TEST_PATTERN],
+      );
+      const m = mon.rows[0] || {};
+      const users = Number(m.users) || 0, payers = Number(m.payers) || 0;
+      snapshot.monetization_funnel = {
+        users, payers,
+        free_to_paid_pct: users > 0 ? Math.round((1000 * payers) / users) / 10 : null,
+        median_days_to_first_pay: m.median_days_to_first_pay != null ? Number(m.median_days_to_first_pay) : null,
+      };
+    } catch { /* silent */ }
+
     // 6. Referral funnel (acquisition channel health)
     try {
       const ref = await this.pg.query(
         `SELECT
            (SELECT COUNT(*) FROM referral_referees WHERE registered_at > now()-interval '7 days') AS referral_registrations_7d,
+           (SELECT COUNT(*) FROM referral_referees WHERE registered_at > now()-interval '30 days') AS referral_registrations_30d,
            (SELECT COUNT(*) FROM referral_referees)                                               AS referral_referees_total,
            (SELECT COUNT(*) FROM events WHERE name='referral_click' AND ts > now()-interval '7 days') AS referral_clicks_7d,
+           (SELECT COUNT(*) FROM events WHERE name='referral_click' AND ts > now()-interval '30 days') AS referral_clicks_30d,
            (SELECT COUNT(*) FROM referral_leaders WHERE is_active)                                 AS referral_active_leaders`,
       );
       snapshot.referral = ref.rows[0];
+      // click→reg rate за 30д — устойчивее шумного 7d-сравнения. Без него ВПМ
+      // ложно заключал «рефералка сломана» при 0 регистраций в конкретную неделю
+      // (регистрация лагает за кликом; недельная выборка однозначная). 30д-окно
+      // отражает реальную конверсию канала.
+      const rc30 = Number(ref.rows[0].referral_clicks_30d) || 0;
+      const rr30 = Number(ref.rows[0].referral_registrations_30d) || 0;
+      snapshot.referral.click_to_reg_rate_30d = rc30 > 0 ? Math.round((1000 * rr30) / rc30) / 10 : null;
       // Топ-3 точки касания по кликам за 7d (71afe7f7): какая из 5 механик
       // (dashboard_cta / notification_link / in_chat_share / profile_share /
       // manual_copy) реально даёт клики, а какие мертвы. touch встроен в ссылку
