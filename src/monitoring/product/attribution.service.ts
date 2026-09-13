@@ -111,14 +111,16 @@ export class AttributionService {
          )
          -- Источник: НАДЁЖНЫЙ signup_source (записан при регистрации) приоритетнее
          -- session-эвристики fs (она не доживает между визитами/доменами).
-         -- Источник без сигнала: легаси (рег. до запуска трекинга 2026-06-10) →
-         -- «до трекинга» (источник никогда не сохранялся), а не «Неизвестно».
-         -- Реальный пробел трекинга после 06-10 (если будет) остаётся 'unknown'.
+         -- Легаси (рег. до запуска трекинга 2026-06-10) → «до трекинга».
+         -- Пост-трекинг без сигнала = органика/прямой заход: getSource() на фронте
+         -- всегда даёт минимум 'direct', и проверка показала, что у таких юзеров
+         -- НЕТ ни одного события с source → это реальный direct, а не «unknown».
+         -- Согласовано с snapshot ВПМ registrations_by_source (NULL→'direct').
          SELECT CASE
                   WHEN COALESCE(NULLIF(r.signup_source,''), fs.source) IS NOT NULL
                     THEN COALESCE(NULLIF(r.signup_source,''), fs.source)
                   WHEN r.created_at < TIMESTAMP '2026-06-10' THEN 'до трекинга'
-                  ELSE 'unknown'
+                  ELSE 'direct'
                 END AS source,
                 COUNT(*)::int                                        AS registrations,
                 COUNT(*) FILTER (WHERE c.uid IS NOT NULL)::int       AS activated,

@@ -218,15 +218,20 @@ export class ChurnService {
        SELECT
          w.week,
          COUNT(*)::int                                                                AS signups,
+         -- «Вернулся к Dn» = КУМУЛЯТИВНО: любое сообщение в (signup+1д … signup+Nд].
+         -- Раньше окно было узким «ровно день 7±1 / 30±1» → почти везде 0% (юзер
+         -- редко пишет именно в тот 2-дневный интервал), что ложно выглядело как
+         -- нулевой retention. Кумулятивное «в течение N дней» — стандартное
+         -- когортное определение, согласовано с snapshot cohort_retention.
          COUNT(*) FILTER (WHERE EXISTS (
            SELECT 1 FROM custom_chat_history h
            WHERE split_part(h.session_id, '_', 1) = w.uid AND h.sender_type = 'human'
-             AND h.created_at BETWEEN w.signup_ts + interval '6 days' AND w.signup_ts + interval '8 days'
+             AND h.created_at BETWEEN w.signup_ts + interval '1 day' AND w.signup_ts + interval '7 days'
          ))::int                                                                       AS retained_d7,
          COUNT(*) FILTER (WHERE EXISTS (
            SELECT 1 FROM custom_chat_history h
            WHERE split_part(h.session_id, '_', 1) = w.uid AND h.sender_type = 'human'
-             AND h.created_at BETWEEN w.signup_ts + interval '29 days' AND w.signup_ts + interval '31 days'
+             AND h.created_at BETWEEN w.signup_ts + interval '1 day' AND w.signup_ts + interval '30 days'
          ))::int                                                                       AS retained_d30
        FROM weeks w
        GROUP BY w.week ORDER BY w.week DESC LIMIT 12`,
