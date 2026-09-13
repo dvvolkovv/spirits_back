@@ -241,32 +241,22 @@ export class VpmService implements OnModuleInit {
       }));
     } catch { /* silent */ }
 
-    // 6b. Registration channel attribution (backlog e6dd4d6f). The source is
-    // captured on the ANONYMOUS landing event (no user_id yet), so we link it
-    // to the registrant via session_id. Populates going forward as users land
-    // with the source-tracking client; historical regs show "unknown".
+    // 6b. Registration channel attribution (backlog e6dd4d6f). Source from the
+    // RELIABLE `signup_source` column — written at login from the first-touch
+    // value the client persists in localStorage (survives the anon→registration
+    // boundary). The previous approach reconstructed source from AUTHENTICATED
+    // sessions' events (joined by user_id), but the real utm/ref lives on the
+    // ANONYMOUS landing session (user_id NULL) — never linked, so every reg fell
+    // to "unknown" (the false "100% unknown source" that spawned VPM recs). NULL
+    // signup_source means a genuine direct/organic arrival (verified: such users
+    // have zero sourced events), so it maps to 'direct', not 'unknown'.
     try {
       const bySource = await this.pg.query(
-        `WITH regs AS (
-           SELECT user_id FROM ai_profiles_consolidated
-            WHERE created_at > now()-interval '30 days'
-              AND user_id <> ALL($1) AND user_id !~ $2
-         ),
-         sess AS (
-           SELECT DISTINCT e.session_id, e.user_id
-             FROM events e JOIN regs r ON r.user_id = e.user_id
-            WHERE e.session_id IS NOT NULL
-         ),
-         src AS (
-           SELECT DISTINCT ON (e.session_id) e.session_id, e.source
-             FROM events e
-            WHERE e.source IS NOT NULL AND e.source <> ''
-            ORDER BY e.session_id, e.ts ASC
-         )
-         SELECT COALESCE(src.source,'unknown') AS source, count(DISTINCT regs.user_id)::int AS registrations_30d
-           FROM regs
-           LEFT JOIN sess ON sess.user_id = regs.user_id
-           LEFT JOIN src  ON src.session_id = sess.session_id
+        `SELECT COALESCE(NULLIF(signup_source,''),'direct') AS source,
+                count(*)::int AS registrations_30d
+           FROM ai_profiles_consolidated
+          WHERE created_at > now()-interval '30 days'
+            AND user_id <> ALL($1) AND user_id !~ $2
           GROUP BY 1 ORDER BY 2 DESC`,
         [TEST_USERS, TEST_PATTERN],
       );
