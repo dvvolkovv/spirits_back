@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from './tg-grammy.client';
 import { MeetingService } from '../meeting/meeting.service';
@@ -22,9 +23,31 @@ import { parseMeetingLink, MeetingProvider } from '../meeting/meeting-link';
 /** Префикс callback_data. Лимит Telegram — 64 байта, коды заведомо короче. */
 const JOIN_PREFIX = 'meet:';
 
+/**
+ * Сколько помним адрес входа Zoom между показом кнопки и нажатием.
+ *
+ * Ссылка Zoom в кнопку НЕ ВЛЕЗАЕТ: лимит `callback_data` — 64 байта, а
+ * `us04web.zoom.us/j/76639009495?pwd=M4EgqtGM2T6198YvaNDbODPM5Rbf08.1` — уже
+ * семьдесят с лишним даже без схемы. Поэтому в кнопку уходит короткий токен, а
+ * адрес ждёт нажатия здесь.
+ *
+ * Полчаса: кнопку нажимают сразу или не нажимают вовсе. Хранение в памяти
+ * процесса выбрано сознательно — таблица ради двух полей и получаса жизни
+ * дороже, чем цена промаха: после перезапуска API кнопка ответит «пришли
+ * ссылку заново», и человек пришлёт. Тот же довод, по которому кеш isAdmin в
+ * JwtGuard живёт в памяти.
+ */
+const ZOOM_URL_TTL_MS = 30 * 60 * 1000;
+
+/** Потолок помнимых ссылок: защита от роста памяти на спаме ссылками. */
+const ZOOM_URL_LIMIT = 500;
+
 @Injectable()
 export class TgMeetingService {
   private readonly logger = new Logger(TgMeetingService.name);
+
+  /** token → адрес входа Zoom. См. ZOOM_URL_TTL_MS. */
+  private readonly zoomUrls = new Map<string, { url: string; at: number }>();
 
   constructor(
     private readonly pg: PgService,
@@ -33,6 +56,39 @@ export class TgMeetingService {
     private readonly rooms: RoomService,
     private readonly talerIdRooms: TalerIdRoomClient,
   ) {}
+
+  /**
+   * Запомнить адрес входа и вернуть токен для кнопки.
+   *
+   * Токен короткий и случайный: в `callback_data` вместе с префиксом и
+   * провайдером остаётся меньше пятидесяти байт, а угадывать его незачем —
+   * нажатие всё равно проверяется по владельцу чата.
+   */
+  private rememberZoomUrl(url: string): string {
+    const now = Date.now();
+    // Уборка на входе, а не по таймеру: таймер в сервисе Nest пришлось бы
+    // гасить в onModuleDestroy, а промахнуться в этом легко.
+    for (const [k, v] of this.zoomUrls) {
+      if (now - v.at > ZOOM_URL_TTL_MS) this.zoomUrls.delete(k);
+    }
+    while (this.zoomUrls.size >= ZOOM_URL_LIMIT) {
+      // Map хранит порядок вставки, поэтому первый ключ — самый старый.
+      const oldest = this.zoomUrls.keys().next().value;
+      if (oldest === undefined) break;
+      this.zoomUrls.delete(oldest);
+    }
+    const token = randomUUID().replace(/-/g, '').slice(0, 12);
+    this.zoomUrls.set(token, { url, at: now });
+    return token;
+  }
+
+  /** Достать адрес по токену. `undefined` — токен устарел или его не было. */
+  private takeZoomUrl(token: string): string | undefined {
+    const rec = this.zoomUrls.get(token);
+    if (!rec) return undefined;
+    this.zoomUrls.delete(token);
+    return Date.now() - rec.at > ZOOM_URL_TTL_MS ? undefined : rec.url;
+  }
 
   /**
    * Ассистент, который пойдёт во встречу.
@@ -74,7 +130,14 @@ export class TgMeetingService {
       parse_mode: 'HTML',
       reply_markup: {
         inline_keyboard: [[
-          { text: 'Зайти во встречу', callback_data: `${JOIN_PREFIX}${link.provider}:${link.code}` },
+          {
+            text: 'Зайти во встречу',
+            // У Zoom в кнопку уходит токен, а не код: по коду вход не собрать,
+            // а полная ссылка не влезает в лимит callback_data.
+            callback_data: link.provider === 'zoom' && link.url
+              ? `${JOIN_PREFIX}zoom:${this.rememberZoomUrl(link.url)}`
+              : `${JOIN_PREFIX}${link.provider}:${link.code}`,
+          },
         ]],
       },
     });
@@ -86,6 +149,10 @@ export class TgMeetingService {
     code: string,
   ): Promise<{ title: string } | null> {
     try {
+      // Мост: проверить существование встречи нечем — публичной ручки нет ни
+      // у Meet, ни у Zoom. Показываем приглашение сразу, как и в вебе.
+      if (provider === 'meet') return { title: 'Встреча Google Meet' };
+      if (provider === 'zoom') return { title: 'Встреча Zoom' };
       if (provider === 'talerid') {
         const r = await this.talerIdRooms.info(code);
         if (!r || !r.isActive || r.requiresPassword) return null;
@@ -106,6 +173,21 @@ export class TgMeetingService {
     const provider = (sep > 0 ? rest.slice(0, sep) : 'linkeon') as MeetingProvider;
     const code = sep > 0 ? rest.slice(sep + 1) : rest;
 
+    // У Zoom в кнопке лежит токен: разворачиваем его в адрес и восстанавливаем
+    // код из самого адреса — так код и адрес заведомо про одну встречу.
+    let url: string | undefined;
+    let joinCode = code;
+    if (provider === 'zoom') {
+      url = this.takeZoomUrl(code);
+      if (!url) {
+        await this.grammy.answerCallbackQuery(cb.id, {
+          text: 'Ссылка устарела — пришли её ещё раз.',
+        });
+        return;
+      }
+      joinCode = url.match(/\/(?:j|w)\/(\d+)/)?.[1] ?? code;
+    }
+
     const agent = await this.currentAgent(ownerId);
     if (!agent) {
       await this.grammy.answerCallbackQuery(cb.id, { text: 'Сначала выбери ассистента: /assistants' });
@@ -113,7 +195,7 @@ export class TgMeetingService {
     }
 
     try {
-      await this.meetings.join(ownerId, agent.id, code, provider);
+      await this.meetings.join(ownerId, agent.id, joinCode, provider, url);
       // Отвечаем на callback ДО отправки сообщения: Telegram гасит «часики» на
       // кнопке только по нему, а вход занимает несколько секунд.
       await this.grammy.answerCallbackQuery(cb.id, {});

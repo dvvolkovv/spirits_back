@@ -74,7 +74,53 @@ describe('чат встречи', () => {
       name: 'Роман', persona: '', preamble: '', specialists: SPECIALISTS, hasChat: true,
     }));
     assert.doesNotMatch(s, /ДО твоего прихода/);
+  
+  /**
+   * Читать чат модель умеет только инструментом: сообщения лежат в буфере
+   * воркера. Живая встреча 11.09.2026 показала, чем кончается умолчание о нём
+   * в промпте — на вопрос «что за ссылку я кинул в чат» ассистент послал
+   * коллеге задачу «проверь содержимое страницы по ссылке из чата», без самой
+   * ссылки. Инструмент был, но модель о нём не подумала.
+   */
+  test('чтение чата названо инструментом и объяснено, когда его звать', () => {
+    const s = flat(meetingInstructions({
+      name: 'Роман', persona: '', preamble: '', specialists: SPECIALISTS, hasChat: true,
+    }));
+    assert.match(s, /read_chat/);
+    assert.match(s, /что там за ссылка/);
+    assert.match(s, /не говори, что в чате ничего нет, не заглянув/i);
   });
+
+  test('ссылку коллеге передавать дословно', () => {
+    // Иначе повторится живой случай: вопрос ушёл специалисту как «ссылка из
+    // чата», и искать ему было нечего.
+    const s = flat(meetingInstructions({
+      name: 'Роман', persona: '', preamble: '', specialists: SPECIALISTS, hasChat: true,
+    }));
+    assert.match(s, /ДОСЛОВНО/);
+  });
+
+  test('писать в чат велено и без просьбы — когда в ответе ссылка', () => {
+    const s = flat(meetingInstructions({
+      name: 'Роман', persona: '', preamble: '', specialists: SPECIALISTS, hasChat: true,
+    }));
+    assert.match(s, /сам, без просьбы/);
+  });
+
+  test('отказ инструмента запрещено выдавать за отправку', () => {
+    const s = flat(meetingInstructions({
+      name: 'Роман', persona: '', preamble: '', specialists: SPECIALISTS, hasChat: true,
+    }));
+    assert.match(s, /status: rejected/);
+  });
+
+  test('без чата не упомянут и инструмент чтения', () => {
+    const s = flat(meetingInstructions({
+      name: 'Роман', persona: '', preamble: '', specialists: SPECIALISTS,
+    }));
+    assert.doesNotMatch(s, /read_chat/);
+  });
+});
 
   test('без чата про него в промпте ни слова', () => {
     // Чат есть только в чужих комнатах Taler ID; тула write_to_chat на своей
@@ -85,6 +131,7 @@ describe('чат встречи', () => {
     }));
     assert.doesNotMatch(s, /write_to_chat/);
     assert.doesNotMatch(s, /чат встречи/i);
+
   });
 });
 

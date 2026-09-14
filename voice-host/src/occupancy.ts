@@ -16,6 +16,26 @@ export const LOBBY_MS = 15 * 60 * 1000;
  */
 export const HARD_CAP_MS = 2 * 60 * 60 * 1000;
 
+/**
+ * Сколько ждём, прежде чем поверить, что встреча опустела.
+ *
+ * Для своих комнат — ноль: LiveKit о составе не врёт, и уходить надо сразу.
+ *
+ * Для Meet ноль оказался нельзя. Живая встреча 09.09.2026: владелец сидел во
+ * встрече, а Meet отдал его со `status: 8` («unknown» — этого кода нет даже в
+ * таблице статусов самого Attendee, где расписаны 1, 6 и 7). Attendee
+ * переводит любой статус кроме `in_meeting` в уход
+ * (`active = humanized_status == "in_meeting"`), прислал `leave`, состав стал
+ * нулевым — и ассистент вышел из живой встречи через пять секунд, на 229-й
+ * секунде разговора.
+ *
+ * Полторы минуты: меньше, чем 300 с автовыхода Attendee по одиночеству
+ * (значит причину выхода по-прежнему называем мы), и достаточно, чтобы
+ * переждать мигание статуса. Заодно `meet_speaking` возвращает человека в
+ * состав сразу: тот, кто говорит, заведомо во встрече.
+ */
+export const MEET_EMPTY_GRACE_MS = 90_000;
+
 export type Verdict =
   /** остаёмся в комнате */
   | 'stay'
@@ -40,8 +60,17 @@ export type Verdict =
 export class Occupancy {
   private readonly humans = new Set<string>();
   private everHadHuman = false;
+  /** С какого момента состав пуст. `null` — кто-то есть. */
+  private emptyAt: number | null = null;
 
-  constructor(private readonly startedAt: number) {}
+  /**
+   * `emptyGraceMs` — выдержка перед вердиктом «опустела». Ноль для своих
+   * комнат, MEET_EMPTY_GRACE_MS для Meet: там источник состава врёт.
+   */
+  constructor(
+    private readonly startedAt: number,
+    private readonly emptyGraceMs = 0,
+  ) {}
 
   joined(identity: string): void {
     this.humans.add(identity);
@@ -64,6 +93,18 @@ export class Occupancy {
     if (!this.everHadHuman) {
       return now - this.startedAt >= LOBBY_MS ? 'never_started' : 'stay';
     }
-    return this.humans.size === 0 ? 'empty' : 'stay';
+    if (this.humans.size > 0) {
+      this.emptyAt = null;
+      return 'stay';
+    }
+    if (this.emptyGraceMs <= 0) return 'empty';
+    // Отсчёт ведём здесь, а не в left(): время в этот класс приходит только
+    // параметром, и своих часов у него нет — ровно поэтому правила выхода
+    // проверяются тестами, а не двухчасовым сидением в реальной встрече.
+    if (this.emptyAt === null) {
+      this.emptyAt = now;
+      return 'stay';
+    }
+    return now - this.emptyAt >= this.emptyGraceMs ? 'empty' : 'stay';
   }
 }

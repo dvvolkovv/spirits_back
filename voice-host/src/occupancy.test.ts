@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { HARD_CAP_MS, LOBBY_MS, Occupancy } from './occupancy.js';
+import { HARD_CAP_MS, LOBBY_MS, MEET_EMPTY_GRACE_MS, Occupancy } from './occupancy.js';
 
 describe('Occupancy', () => {
   test('пустая комната сразу после входа — не повод выходить', () => {
@@ -88,5 +88,57 @@ describe('Occupancy', () => {
     const occ = new Occupancy(start);
     assert.equal(occ.verdict(start + LOBBY_MS - 1), 'stay');
     assert.equal(occ.verdict(start + LOBBY_MS + 1), 'never_started');
+  });
+});
+
+describe('выдержка перед вердиктом «опустела» (Meet)', () => {
+  // Живая встреча 09.09.2026: владелец сидел во встрече, а Meet отдал его со
+  // status: 8 («unknown»), Attendee перевёл это в leave — и ассистент вышел
+  // из живого разговора через пять секунд. Для своих комнат выдержки нет и
+  // быть не должно: LiveKit о составе не врёт.
+  const t0 = 1_000_000;
+
+  test('своя комната: опустела — выходим сразу', () => {
+    const o = new Occupancy(t0);
+    o.joined('a');
+    o.left('a');
+    assert.equal(o.verdict(t0 + 1_000), 'empty');
+  });
+
+  test('Meet: сразу не выходим', () => {
+    const o = new Occupancy(t0, MEET_EMPTY_GRACE_MS);
+    o.joined('a');
+    o.left('a');
+    assert.equal(o.verdict(t0 + 1_000), 'stay');
+  });
+
+  test('Meet: выходим, когда выдержка истекла', () => {
+    const o = new Occupancy(t0, MEET_EMPTY_GRACE_MS);
+    o.joined('a');
+    o.left('a');
+    assert.equal(o.verdict(t0 + 1_000), 'stay');
+    assert.equal(o.verdict(t0 + 1_000 + MEET_EMPTY_GRACE_MS), 'empty');
+  });
+
+  test('вернувшийся человек обнуляет выдержку', () => {
+    // Ровно то, что делает `meet_speaking`: заговорил — значит на месте.
+    const o = new Occupancy(t0, MEET_EMPTY_GRACE_MS);
+    o.joined('a');
+    o.left('a');
+    o.verdict(t0 + 1_000);
+    o.joined('a');
+    assert.equal(o.verdict(t0 + 2_000), 'stay');
+    o.left('a');
+    // Отсчёт начинается заново, а не продолжает прежний.
+    assert.equal(o.verdict(t0 + 3_000), 'stay');
+    assert.equal(o.verdict(t0 + 3_000 + MEET_EMPTY_GRACE_MS - 1), 'stay');
+    assert.equal(o.verdict(t0 + 3_000 + MEET_EMPTY_GRACE_MS), 'empty');
+  });
+
+  test('потолок длительности сильнее выдержки', () => {
+    const o = new Occupancy(t0, MEET_EMPTY_GRACE_MS);
+    o.joined('a');
+    o.left('a');
+    assert.equal(o.verdict(t0 + HARD_CAP_MS), 'hard_cap');
   });
 });

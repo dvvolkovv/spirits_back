@@ -35,4 +35,46 @@ describe('buildMeetingCard', () => {
     const card = buildMeetingCard('ABC234', 'а'.repeat(500));
     expect(card.length).toBeLessThan(300);
   });
+
+  it('карточка встречи Meet несёт провайдера и код', () => {
+    expect(buildMeetingCard('abc-defg-hij', 'Планёрка', 'meet'))
+      .toBe('{{meeting_join: provider=meet code=abc-defg-hij title=Планёрка}}');
+  });
+
+  it('своя карточка осталась байт в байт прежней', () => {
+    // В истории их накопилось, и менять формат задним числом значит сломать
+    // разбор старых сообщений на фронте.
+    expect(buildMeetingCard('ABC234', 'Планёрка')).toBe('{{meeting_join: code=ABC234 title=Планёрка}}');
+  });
+});
+
+describe('адрес входа в карточке (Zoom)', () => {
+  it('url идёт после кода и перед заголовком', () => {
+    // Порядок не косметика: заголовок читается «до закрывающих скобок», и
+    // стоя перед url он съел бы и его.
+    const card = buildMeetingCard(
+      '71077562785', 'Встреча Zoom', 'zoom',
+      'https://us04web.zoom.us/j/71077562785?pwd=SECRET.1',
+    );
+    expect(card).toBe(
+      '{{meeting_join: provider=zoom code=71077562785 ' +
+      'url=https://us04web.zoom.us/j/71077562785?pwd=SECRET.1 title=Встреча Zoom}}',
+    );
+  });
+
+  it('без адреса карточка остаётся прежней', () => {
+    // Формат своих и Meet-карточек обязан не измениться: в истории их уже
+    // накопилось, и разбор старых сообщений на фронте сломать нельзя.
+    expect(buildMeetingCard('abc-defg-hij', 'Встреча', 'meet'))
+      .toBe('{{meeting_join: provider=meet code=abc-defg-hij title=Встреча}}');
+    expect(buildMeetingCard('ABC234', 'Планёрка'))
+      .toBe('{{meeting_join: code=ABC234 title=Планёрка}}');
+  });
+
+  it('адрес с пробелом или скобкой выбрасывается целиком', () => {
+    // Битый тег в ленте хуже карточки без адреса: вторая честно откажет при
+    // входе, первый покажет мусор.
+    const card = buildMeetingCard('71077562785', 'Встреча Zoom', 'zoom', 'https://x/j/1 2');
+    expect(card).toBe('{{meeting_join: provider=zoom code=71077562785 url= title=Встреча Zoom}}');
+  });
 });

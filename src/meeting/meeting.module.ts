@@ -3,7 +3,9 @@ import { CommonModule } from '../common/common.module';
 import { VoiceCallModule } from '../voice-call/voice-call.module';
 import { MeetingController } from './meeting.controller';
 import { MeetingService } from './meeting.service';
+import { MeetWebhookController } from './meet-webhook.controller';
 import { RoomModule } from './room.module';
+import { AttendeeClient } from './attendee.client';
 
 /**
  * Присутствие ассистента во встрече.
@@ -20,8 +22,10 @@ import { RoomModule } from './room.module';
  */
 @Module({
   imports: [CommonModule, RoomModule, forwardRef(() => VoiceCallModule)],
-  controllers: [MeetingController],
-  providers: [MeetingService],
-  exports: [MeetingService],
+  controllers: [MeetingController, MeetWebhookController],
+  providers: [MeetingService, AttendeeClient],
+  // AttendeeClient экспортирован отдельно от MeetingService: его будет
+  // инжектить реапер из VoiceCallModule, чтобы подбирать забытых ботов.
+  exports: [MeetingService, AttendeeClient],
 })
 export class MeetingModule {}
