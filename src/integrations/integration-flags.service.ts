@@ -11,10 +11,20 @@ import { PgService } from '../common/services/pg.service';
  * таблице может не быть вовсе.
  */
 export const INTEGRATIONS = [
-  { key: 'meeting:talerid', title: 'Встречи Taler ID', note: 'Вход в чужую комнату Taler ID по ссылке' },
-  { key: 'meeting:meet', title: 'Встречи Google Meet', note: 'Вход ботом через мост Attendee' },
-  { key: 'meeting:zoom', title: 'Встречи Zoom', note: 'Вход ботом через мост Attendee, веб-адаптер' },
-  { key: 'meeting:teams', title: 'Встречи Microsoft Teams', note: 'Мост умеет, у нас не разведено' },
+  { key: 'meeting:talerid', title: 'Встречи Taler ID', note: 'Вход в чужую комнату Taler ID по ссылке', available: true },
+  { key: 'meeting:meet', title: 'Встречи Google Meet', note: 'Вход ботом через мост Attendee', available: true },
+  { key: 'meeting:zoom', title: 'Встречи Zoom', note: 'Вход ботом через мост Attendee, веб-адаптер', available: true },
+  {
+    key: 'meeting:teams',
+    title: 'Встречи Microsoft Teams',
+    note: 'Мост умеет, в продукте не разведено: ссылка не распознаётся, карточки не будет',
+    // Включить нельзя, и это важнее аккуратности списка. Переключатель,
+    // который включается и ничего не делает, — хуже его отсутствия: владелец
+    // 14.09.2026 включил Teams, отправил ссылку и получил от ассистента
+    // «подключиться не могу» вместо карточки. Строка остаётся, чтобы было
+    // видно, что площадка в планах, но рубильник у неё заперт.
+    available: false,
+  },
 ] as const;
 
 export type IntegrationKey = (typeof INTEGRATIONS)[number]['key'];
@@ -23,6 +33,8 @@ export interface IntegrationFlag {
   key: string;
   title: string;
   note: string;
+  /** Разведена ли интеграция в продукте. Недоступную нельзя включить. */
+  available: boolean;
   enabled: boolean;
   updatedAt?: string;
   updatedBy?: string;
@@ -85,6 +97,9 @@ export class IntegrationFlagsService implements OnModuleInit {
    * при сбое было бы хуже всего: ровно от этого таблица и заводилась.
    */
   async enabled(key: string): Promise<boolean> {
+    // Неразведённая интеграция выключена всегда, что бы ни лежало в базе.
+    const known = INTEGRATIONS.find((i) => i.key === key);
+    if (known && !known.available) return false;
     try {
       const flags = await this.all();
       return flags.get(key) === true;
@@ -106,7 +121,10 @@ export class IntegrationFlagsService implements OnModuleInit {
         key: i.key,
         title: i.title,
         note: i.note,
-        enabled: row?.enabled === true,
+        available: i.available,
+        // Недоступная интеграция показывается выключенной независимо от
+        // того, что лежит в базе: включить её мог кто-то до этой правки.
+        enabled: i.available && row?.enabled === true,
         updatedAt: row?.updated_at ? new Date(row.updated_at).toISOString() : undefined,
         updatedBy: row?.updated_by || undefined,
       };
@@ -121,8 +139,10 @@ export class IntegrationFlagsService implements OnModuleInit {
    * работает».
    */
   async set(key: string, enabled: boolean, actor?: string): Promise<IntegrationFlag[]> {
-    if (!INTEGRATIONS.some((i) => i.key === key)) {
-      throw new Error(`unknown integration: ${key}`);
+    const known = INTEGRATIONS.find((i) => i.key === key);
+    if (!known) throw new Error(`unknown integration: ${key}`);
+    if (!known.available && enabled) {
+      throw new Error(`integration is not implemented yet: ${key}`);
     }
     await this.pg.query(
       `INSERT INTO integration_flags (key, enabled, updated_at, updated_by)

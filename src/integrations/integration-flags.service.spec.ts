@@ -72,6 +72,18 @@ describe('IntegrationFlagsService', () => {
       expect(list.find((i) => i.key === 'meeting:zoom')).toMatchObject({ enabled: false });
     });
 
+    it('включённая в базе, но неразведённая показывается выключенной', async () => {
+      // Её мог включить кто-то до этой правки — список обязан говорить правду.
+      const { svc } = make([{ key: 'meeting:teams', enabled: true }]);
+      const teams = (await svc.list()).find((i) => i.key === 'meeting:teams');
+      expect(teams).toMatchObject({ available: false, enabled: false });
+    });
+
+    it('enabled у неразведённой всегда false', async () => {
+      const { svc } = make([{ key: 'meeting:teams', enabled: true }]);
+      expect(await svc.enabled('meeting:teams')).toBe(false);
+    });
+
     it('у каждой интеграции есть человеческое название', async () => {
       const { svc } = make([]);
       for (const i of await svc.list()) expect(i.title.length).toBeGreaterThan(0);
@@ -85,6 +97,21 @@ describe('IntegrationFlagsService', () => {
       const [sql, params] = pg.query.mock.calls[0];
       expect(sql).toContain('INSERT INTO integration_flags');
       expect(params).toEqual(['meeting:zoom', true, 'admin-7']);
+    });
+
+    it('неразведённую интеграцию включить нельзя', async () => {
+      // Переключатель, который включается и ничего не делает, хуже его
+      // отсутствия: владелец 14.09.2026 включил Teams, отправил ссылку и
+      // получил от ассистента «подключиться не могу» вместо карточки.
+      const { pg, svc } = make([]);
+      await expect(svc.set('meeting:teams', true)).rejects.toThrow(/not implemented/);
+      expect(pg.query).not.toHaveBeenCalled();
+    });
+
+    it('выключить неразведённую можно — уборка за прошлой редакцией', async () => {
+      const { pg, svc } = make([]);
+      await svc.set('meeting:teams', false);
+      expect(pg.query).toHaveBeenCalled();
     });
 
     it('неизвестный ключ отвергается', async () => {
