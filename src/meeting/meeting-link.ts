@@ -101,7 +101,7 @@ const TEAMS_JOIN_LINK_REGEX =
   /https?:\/\/teams\.microsoft\.com\/l\/meetup-join\/[^\s<>"']+/i;
 
 /** Откуда встреча. Свои комнаты и чужие ведут себя одинаково, но входы разные. */
-export type MeetingProvider = 'linkeon' | 'talerid' | 'meet' | 'zoom' | 'teams';
+export type MeetingProvider = 'linkeon' | 'talerid' | 'meet' | 'zoom' | 'teams' | 'telemost';
 
 export interface ParsedMeetingLink {
   provider: MeetingProvider;

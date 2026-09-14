@@ -20,6 +20,12 @@ export const INTEGRATIONS = [
     note: 'Вход ботом через мост Attendee: личные и корпоративные ссылки',
     available: true,
   },
+  {
+    key: 'meeting:telemost',
+    title: 'Встречи Яндекс Телемоста',
+    note: 'Вход ботом через мост: адаптер наш, у апстрима этой площадки нет',
+    available: true,
+  },
 ] as const;
 
 export type IntegrationKey = (typeof INTEGRATIONS)[number]['key'];

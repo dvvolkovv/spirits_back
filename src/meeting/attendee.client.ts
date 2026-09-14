@@ -105,7 +105,7 @@ export interface CreateBotParams {
    * По умолчанию `meet`: он был первым, и вызовы без этого поля должны
    * продолжать работать как раньше.
    */
-  provider?: 'meet' | 'zoom' | 'teams';
+  provider?: 'meet' | 'zoom' | 'teams' | 'telemost';
 }
 
 @Injectable()

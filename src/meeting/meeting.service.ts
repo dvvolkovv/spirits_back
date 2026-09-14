@@ -35,7 +35,10 @@ const PROVIDER_ZOOM = 'zoom';
 /** Microsoft Teams — третья площадка через мост. */
 const PROVIDER_TEAMS = 'teams';
 
-const BRIDGED_PROVIDERS = [PROVIDER_MEET, PROVIDER_ZOOM, PROVIDER_TEAMS];
+/** Яндекс Телемост — четвёртая площадка через мост, адаптер наш. */
+const PROVIDER_TELEMOST = 'telemost';
+
+const BRIDGED_PROVIDERS = [PROVIDER_MEET, PROVIDER_ZOOM, PROVIDER_TEAMS, PROVIDER_TELEMOST];
 
 /**
  * Сколько встреч Meet держим одновременно.
@@ -173,8 +176,9 @@ export class MeetingService {
     const isMeet = provider === 'meet';
     const isZoom = provider === 'zoom';
     const isTeams = provider === 'teams';
+    const isTelemost = provider === 'telemost';
     /** Площадка без LiveKit: звук ходит через мост Attendee. */
-    const isBridged = isMeet || isZoom || isTeams;
+    const isBridged = isMeet || isZoom || isTeams || isTelemost;
     const callId = randomUUID();
 
     // Куда идёт ассистент и как называется комната — единственное, чем
@@ -190,7 +194,7 @@ export class MeetingService {
       throw new ConflictException({ message: 'meeting bot is not configured', reason: 'meet_unavailable' });
     }
 
-    if ((isZoom || isTeams) && !url) {
+    if ((isZoom || isTeams || isTelemost) && !url) {
       // Без адреса входить некуда: из короткого кода ссылку не собрать. У
       // Zoom в ней хост аккаунта и хеш пароля, у Teams — пароль встречи, а у
       // корпоративных ссылок и вовсе весь опознаватель целиком. Отказ ДО
@@ -198,7 +202,7 @@ export class MeetingService {
       // выше.
       throw new ConflictException({
         message: 'join url is required',
-        reason: isZoom ? 'zoom_url_required' : 'teams_url_required',
+        reason: isZoom ? 'zoom_url_required' : isTelemost ? 'telemost_url_required' : 'teams_url_required',
       });
     }
 
@@ -232,10 +236,10 @@ export class MeetingService {
       // Название берём нейтральное — настоящего у нас нет.
       // Название нейтральное и по площадке: настоящего у нас нет ни там, ни
       // там — публичной ручки «что за встреча» нет ни у Meet, ни у Zoom.
-      title = isZoom ? 'Встреча Zoom' : isTeams ? 'Встреча Microsoft Teams' : 'Встреча Google Meet';
+      title = isZoom ? 'Встреча Zoom' : isTeams ? 'Встреча Microsoft Teams' : isTelemost ? 'Встреча в Телемосте' : 'Встреча Google Meet';
       // По callId, а не по коду: одну встречу могут позвать дважды, а
       // room_name с уникальностью уже намучил (003_drop_room_name_unique).
-      roomName = `${isZoom ? PROVIDER_ZOOM : isTeams ? PROVIDER_TEAMS : PROVIDER_MEET}_${callId}`;
+      roomName = `${isZoom ? PROVIDER_ZOOM : isTeams ? PROVIDER_TEAMS : isTelemost ? PROVIDER_TELEMOST : PROVIDER_MEET}_${callId}`;
     } else if (isForeign) {
       const info = await this.talerIdRooms.info(code);
       if (!info || !info.isActive) throw new NotFoundException('room not found');
@@ -261,12 +265,12 @@ export class MeetingService {
       `INSERT INTO voice_calls (id, user_id, agent_id, room_name, status, provider, external_room, external_url)
        VALUES ($1, $2, $3, $4, 'dialing', $5, $6, $7)`,
       [callId, userId, agentId, roomName,
-       isZoom ? PROVIDER_ZOOM : isTeams ? PROVIDER_TEAMS : isMeet ? PROVIDER_MEET : isForeign ? PROVIDER_TALERID : PROVIDER,
+       isZoom ? PROVIDER_ZOOM : isTeams ? PROVIDER_TEAMS : isTelemost ? PROVIDER_TELEMOST : isMeet ? PROVIDER_MEET : isForeign ? PROVIDER_TALERID : PROVIDER,
        code,
        // Адрес храним отдельной колонкой, а не поверх external_room: там у
        // всех остальных провайдеров лежит короткий код, и колонка с двумя
        // смыслами однажды была бы прочитана не тем способом.
-       isZoom || isTeams ? url : null],
+       isZoom || isTeams || isTelemost ? url : null],
     );
 
     try {
@@ -333,7 +337,7 @@ export class MeetingService {
         // провайдера передаём настоящий: он попадает в логи задания, и
         // «meet» на встрече Zoom сбивал бы с толку при разборе.
         ...(isBridged
-          ? { provider: isZoom ? PROVIDER_ZOOM : isTeams ? PROVIDER_TEAMS : PROVIDER_MEET }
+          ? { provider: isZoom ? PROVIDER_ZOOM : isTeams ? PROVIDER_TEAMS : isTelemost ? PROVIDER_TELEMOST : PROVIDER_MEET }
           : {}),
         // Все специалисты, кроме самого ведущего: спрашивать себя незачем, а
         // предложение это сделать модель однажды примет всерьёз.
@@ -407,7 +411,7 @@ export class MeetingService {
         callId,
         wsUrl,
         provider:
-          call.provider === PROVIDER_ZOOM ? 'zoom' : call.provider === PROVIDER_TEAMS ? 'teams' : 'meet',
+          call.provider === PROVIDER_ZOOM ? 'zoom' : call.provider === PROVIDER_TEAMS ? 'teams' : call.provider === PROVIDER_TELEMOST ? 'telemost' : 'meet',
       });
       if (!bot) {
         // Причина уже в логе клиента. Звонок помечаем failed сами: join()
