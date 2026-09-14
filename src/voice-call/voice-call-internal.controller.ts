@@ -119,6 +119,37 @@ export class VoiceCallInternalController {
     return { ok: true };
   }
 
+  /**
+   * Воркер сообщил адрес своего вебсокета — создаём бота Attendee.
+   *
+   * Порт у каждого задания свой, и знает его только воркер, поэтому бот
+   * создаётся здесь, а не в join(). Ответ синхронный: воркеру нужно знать,
+   * есть ли смысл ждать подключения.
+   */
+  @Post('meet-bot')
+  async meetBot(
+    @Headers('x-voice-signature') signature: string,
+    @Req() req: Request,
+  ): Promise<{ status: 'ok' | 'failed' }> {
+    const body = this.parseSigned<{ callId: string; wsUrl: string }>(req, signature);
+    return this.meetings.attachBot(body.callId, body.wsUrl);
+  }
+
+  /**
+   * Ассистент пишет в чат встречи.
+   *
+   * Ответ синхронный и честный: воркер держит тул, пока ручка не вернётся, и
+   * по `sent` решает, говорить ли вслух «написал» или «не получилось».
+   */
+  @Post('meeting-chat')
+  async meetingChat(
+    @Headers('x-voice-signature') signature: string,
+    @Req() req: Request,
+  ): Promise<{ sent: boolean }> {
+    const body = this.parseSigned<{ callId: string; text: string }>(req, signature);
+    return { sent: await this.meetings.sendChatMessage(body.callId, body.text) };
+  }
+
   @Post('failed')
   async failed(
     @Headers('x-voice-signature') signature: string,

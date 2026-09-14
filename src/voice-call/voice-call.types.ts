@@ -18,7 +18,42 @@ export type VoiceDataMessage =
   // что в документе, и не может ни сообщить о готовности, ни обсудить.
   | { v: 1; type: 'document_pending'; docId: string; title: string; specialist?: string }
   | { v: 1; type: 'document_ready'; docId: string; title: string; tokens: number; specialist?: string; text?: string; url?: string }
-  | { v: 1; type: 'document_failed'; docId: string; title: string; reason: 'timeout' | 'error'; specialist?: string };
+  | { v: 1; type: 'document_failed'; docId: string; title: string; reason: 'timeout' | 'error'; specialist?: string }
+  /**
+   * Состав участников встречи на площадке без LiveKit (Meet через Attendee).
+   *
+   * В нашей комнате при такой встрече участников нет вовсе, поэтому occupancy
+   * и гейт по имени в воркере остались бы без входных данных:
+   * `remoteParticipants.size` там всегда ноль. Из этого следовали три поломки
+   * разом — гейт срывался в solo и ассистент отвечал на каждую реплику
+   * встречи, `voice_calls.status` навсегда оставался `dialing` и запирал
+   * пользователю следующий вход, а правила выхода уводили ассистента из живой
+   * встречи через LOBBY_MS. Поэтому состав приезжает сюда вебхуками Attendee.
+   *
+   * Событие — дельта, а не снимок: Attendee присылает join/leave по одному.
+   * `uuid` — ключ участника, `name` показываем в разметке говорящего.
+   */
+  | { v: 1; type: 'meet_participant'; event: 'join' | 'leave'; uuid: string; name: string }
+  /**
+   * Сообщение из чата встречи на площадке без LiveKit.
+   *
+   * Чат — единственный канал, где ссылки, названия и имена приходят точно, а
+   * не как их расслышала модель. `private` означает `to: only_bot` у моста:
+   * человек написал ЛИЧНО ассистенту, и это прямая просьба, а не реплика
+   * встречи.
+   */
+  | { v: 1; type: 'meet_chat'; text: string; sender: string; uuid: string; private: boolean }
+  /** Кто говорит сейчас. Приближение — то же, что ActiveSpeakersChanged. */
+  | { v: 1; type: 'meet_speaking'; uuid: string; name: string; speaking: boolean }
+  /**
+   * Состояние бота Attendee. Воркеру нужно только «не пустили»: тогда встречи
+   * не будет и сидеть в пустой комнате незачем.
+   */
+  // `sub` — код причины от Attendee (`event_sub_type`, иначе `event_type`):
+  // `request_to_join_denied`, `waiting_room_timeout_exceeded`,
+  // `meeting_not_found`… Без него состояние `fatal_error` не отличает «нас не
+  // впустили» от «бот сломался», а видит эту строку человек в чате.
+  | { v: 1; type: 'meet_bot_state'; state: string; fatal: boolean; sub?: string };
 
 /** Ответ на /internal/document. Как и ask, возвращается мгновенно. */
 export type DocumentResult =

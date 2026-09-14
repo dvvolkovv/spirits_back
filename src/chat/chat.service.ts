@@ -13,6 +13,8 @@ import { LanguageService, LANGUAGE_REPLY_LINE, DEFAULT_LANGUAGE } from '../commo
 import { parseMeetingLink } from '../meeting/meeting-link';
 import { RoomService } from '../meeting/room.service';
 import { buildMeetingCard } from './meeting-card';
+import { attendeeConfigured } from '../meeting/attendee.client';
+import { IntegrationFlagsService } from '../integrations/integration-flags.service';
 import { TalerIdRoomClient } from '../meeting/talerid-room.client';
 import { RESPONSE_STYLE_RULE } from './response-style';
 import { relaySessionKey } from './relay-session';
@@ -281,6 +283,10 @@ export class ChatService {
     // Опционален по той же причине, что и rooms: ChatService поднимается и в
     // окружениях без встреч, а падать на старте из-за ненужного клиента незачем.
     @Optional() private readonly talerIdRooms?: TalerIdRoomClient,
+    // Тоже опционален: в окружении без модуля интеграций (тесты, урезанные
+    // сборки) отсутствие выключателей не должно ронять чат. Трактуется как
+    // «ограничений нет» — иначе тесты чата молча потеряли бы карточку.
+    @Optional() private readonly integrations?: IntegrationFlagsService,
   ) {}
 
   /**
@@ -677,10 +683,36 @@ export class ChatService {
     // Тот же приём, что у приветствия и у сообщения о нехватке токенов ниже.
     const meetingLink = this.rooms ? parseMeetingLink(message) : null;
     if (meetingLink) {
+      // Выключенная интеграция не показывает карточку вовсе: ссылка остаётся
+      // обычной ссылкой в разговоре. Кнопка, которая заведомо откажет, хуже
+      // её отсутствия — тот же довод, что и у комнаты под паролем ниже.
+      //
+      // Свои комнаты (`linkeon`) не интеграция и флага не имеют.
+      const allowed =
+        meetingLink.provider === 'linkeon' ||
+        !this.integrations ||
+        (await this.integrations.enabled(`meeting:${meetingLink.provider}`));
       // Своя комната и чужая проверяются в разных местах, но ведут себя
       // одинаково: нашли живую — показываем карточку, не нашли — это была
       // обычная ссылка в разговоре, идём обычным путём и не мешаем.
-      const room = meetingLink.provider === 'talerid'
+      const room = !allowed
+        ? null
+        : meetingLink.provider === 'meet' || meetingLink.provider === 'zoom'
+        // Проверять существование встречи нечем: публичной ручки у Meet нет.
+        // Карточку показываем сразу — цена ошибки невелика, а требовать
+        // проверки значит не показывать карточку никогда.
+        //
+        // Но если Attendee не настроен, входить некуда вовсе, и карточка
+        // только обманывала бы: кнопка отказывала бы всегда. Тогда ссылка
+        // остаётся обычной ссылкой в разговоре, и ход идёт обычным путём.
+        ? (attendeeConfigured()
+            ? {
+                code: meetingLink.code,
+                title: meetingLink.provider === 'zoom' ? 'Встреча Zoom' : 'Встреча Google Meet',
+                active: true,
+              }
+            : null)
+        : meetingLink.provider === 'talerid'
         ? await this.talerIdRooms
             ?.info(meetingLink.code)
             .then((r) => (r && r.isActive && !r.requiresPassword
@@ -704,7 +736,9 @@ export class ChatService {
            VALUES ($1, 'human', $2, $3, 'text')`,
           [chatSessionId, agent.id, message],
         );
-        const card = buildMeetingCard(room.code, room.title, meetingLink.provider);
+        // Адрес входа уезжает в карточку только у Zoom: у остальных площадок
+        // он выводится из кода, и дублировать его в теге незачем.
+        const card = buildMeetingCard(room.code, room.title, meetingLink.provider, meetingLink.url);
         await this.pg.query(
           `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
            VALUES ($1, 'ai', $2, $3, 'text', 0)`,
