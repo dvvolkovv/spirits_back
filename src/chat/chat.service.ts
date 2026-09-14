@@ -17,6 +17,7 @@ import { attendeeConfigured } from '../meeting/attendee.client';
 import { IntegrationFlagsService } from '../integrations/integration-flags.service';
 import { TalerIdRoomClient } from '../meeting/talerid-room.client';
 import { RESPONSE_STYLE_RULE } from './response-style';
+import { MEETING_HONESTY_RULE } from './meeting-honesty';
 import { relaySessionKey } from './relay-session';
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
@@ -903,6 +904,8 @@ export class ChatService {
 • Для коучинговых/психологических/нумерологических практик это правило тоже действует: сначала отражение/гипотеза/интерпретация/направление — и только потом, при необходимости, один открытый вопрос.
 • Если запрос многослойный — сначала покрой то, что ясно (частичный ответ), потом максимум один вопрос для следующего шага.
 
+${MEETING_HONESTY_RULE}
+
 ${RESPONSE_STYLE_RULE}
 ${LanguageService.buildDirective(userLanguage)}`;
 
@@ -1347,6 +1350,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // stablePrefix вместе с персоной: перенос в системный промпт вернёт их в
     // НАЧАЛО контекста, то есть ровно туда, откуда их пришлось убирать. Весят
     // они при этом гроши — 1847 символов на 44 хода в замеренной сессии.
+    contextPrefix += `${MEETING_HONESTY_RULE}\n\n`;
     contextPrefix += `${RESPONSE_STYLE_RULE}\n\n`;
 
     contextPrefix +=
@@ -2034,6 +2038,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     //
     // Пер-ходовая часть начинается здесь: всё, что выше, уехало в stablePrefix.
     let prefix = '';
+    prefix += `${MEETING_HONESTY_RULE}\n\n`;
     prefix += `${RESPONSE_STYLE_RULE}\n\n`;
     prefix +=
       `${LANGUAGE_REPLY_LINE[await this.language.resolveUserLanguage(userId)] || LANGUAGE_REPLY_LINE[DEFAULT_LANGUAGE]}\n\n`;
