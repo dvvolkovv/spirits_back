@@ -24,6 +24,14 @@ export const INTEGRATIONS = [
 
 export type IntegrationKey = (typeof INTEGRATIONS)[number]['key'];
 
+/** Описание интеграции. Отдельным типом — ради подстановки списка в тестах. */
+export interface IntegrationDef {
+  key: string;
+  title: string;
+  note: string;
+  available: boolean;
+}
+
 export interface IntegrationFlag {
   key: string;
   title: string;
@@ -57,7 +65,15 @@ export class IntegrationFlagsService implements OnModuleInit {
   private cache: Map<string, boolean> | null = null;
   private cachedAt = 0;
 
-  constructor(private readonly pg: PgService) {}
+  constructor(
+    private readonly pg: PgService,
+    /**
+     * Каталог интеграций. Подставляется только в тестах: правило «неразведённую
+     * включить нельзя» иначе невозможно проверить, когда разведены все, — а
+     * оно обязано пережить тот день, когда появится следующая площадка.
+     */
+    private readonly catalog: readonly IntegrationDef[] = INTEGRATIONS,
+  ) {}
 
   async onModuleInit() {
     // Миграции модуля — тем же способом, что в остальных модулях: из dist и
@@ -93,7 +109,7 @@ export class IntegrationFlagsService implements OnModuleInit {
    */
   async enabled(key: string): Promise<boolean> {
     // Неразведённая интеграция выключена всегда, что бы ни лежало в базе.
-    const known = INTEGRATIONS.find((i) => i.key === key);
+    const known = this.catalog.find((i) => i.key === key);
     if (known && !known.available) return false;
     try {
       const flags = await this.all();
@@ -110,7 +126,7 @@ export class IntegrationFlagsService implements OnModuleInit {
       `SELECT key, enabled, updated_at, updated_by FROM integration_flags`,
     );
     const rows = new Map<string, any>(res.rows.map((r: any) => [r.key, r]));
-    return INTEGRATIONS.map((i) => {
+    return this.catalog.map((i) => {
       const row = rows.get(i.key);
       return {
         key: i.key,
@@ -134,7 +150,7 @@ export class IntegrationFlagsService implements OnModuleInit {
    * работает».
    */
   async set(key: string, enabled: boolean, actor?: string): Promise<IntegrationFlag[]> {
-    const known = INTEGRATIONS.find((i) => i.key === key);
+    const known = this.catalog.find((i) => i.key === key);
     if (!known) throw new Error(`unknown integration: ${key}`);
     if (!known.available && enabled) {
       throw new Error(`integration is not implemented yet: ${key}`);

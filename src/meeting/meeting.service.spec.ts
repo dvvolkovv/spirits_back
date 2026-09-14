@@ -575,8 +575,10 @@ describe('MeetingService', () => {
       // в контейнере — площадка тут ни при чём.
       withAgent();
       pg.query.mockImplementation(async (sql: string) => {
-        if (/provider = ANY/.test(sql)) return { rows: [{ id: 'c-busy' }], rowCount: 1 };
-        if (/FROM agents/.test(sql)) return { rows: [{ id: 7, display_name: 'Роман' }] };
+        if (/FROM agents/.test(sql)) return { rows: [{ id: 7, display_name: 'Роман', system_prompt: '', realtime_voice: 'alloy' }] };
+        if (sql.includes('SELECT tokens FROM ai_profiles_consolidated')) return { rows: [{ tokens: 50_000 }] };
+        if (/count\(\*\)/.test(sql) && /provider = ANY/.test(sql)) return { rows: [{ n: 1 }] };
+        if (sql.includes('ai_profiles_consolidated')) return { rows: [{ name: 'Дмитрий' }] };
         return { rows: [], rowCount: 0 };
       });
       await expect(svc.join('u1', 7, '9334354666557', 'teams', URL)).rejects.toMatchObject({
@@ -648,7 +650,7 @@ describe('MeetingService', () => {
     });
   });
 
-  describe('потолок моста общий для Meet и Zoom', () => {
+  describe('потолок моста общий для всех его площадок', () => {
     it('встреча Zoom не пускается, пока мост занят встречей Meet', async () => {
       // Потолок физический, а не продуктовый: порт под звук один, и вторая
       // встреча — всё равно какой площадки — не найдёт свободного. Причина
@@ -667,14 +669,14 @@ describe('MeetingService', () => {
       ).rejects.toMatchObject({ response: expect.objectContaining({ reason: 'meet_busy' }) });
     });
 
-    it('счёт идёт по обеим площадкам, а не по одной', async () => {
-      // Запрос обязан спрашивать обе: считать только Meet значило бы пустить
+    it('счёт идёт по всем площадкам моста, а не по одной', async () => {
+      // Запрос обязан спрашивать все: считать только Meet значило бы пустить
       // вторую встречу на занятый порт и получить невнятный отказ от воркера.
       withAgent();
       await svc.join('u1', 7, 'abc-defg-hij', 'meet');
       const busy = pg.query.mock.calls.find(([sql]: any) => /count\(\*\)/.test(sql) && /provider/.test(sql));
       expect(busy[0]).toMatch(/provider = ANY/);
-      expect(busy[1][0]).toEqual(['meet', 'zoom']);
+      expect(busy[1][0]).toEqual(['meet', 'zoom', 'teams']);
     });
   });
 

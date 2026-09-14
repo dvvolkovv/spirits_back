@@ -6,10 +6,24 @@ import { IntegrationFlagsService, INTEGRATIONS } from './integration-flags.servi
  * неизвестный ключ.
  */
 describe('IntegrationFlagsService', () => {
-  const make = (rows: any[] = []) => {
+  const make = (rows: any[] = [], catalog?: any[]) => {
     const pg = { query: jest.fn().mockResolvedValue({ rows }) };
-    return { pg, svc: new IntegrationFlagsService(pg as any) };
+    return { pg, svc: new IntegrationFlagsService(pg as any, catalog) };
   };
+
+  /**
+   * Каталог с неразведённой площадкой.
+   *
+   * Подставляем, а не берём настоящую: сегодня разведены все, и правило
+   * «включить нельзя» проверять было бы не на чем. А пережить оно обязано тот
+   * день, когда появится следующая площадка, — 14.09.2026 владелец включил
+   * Teams, которого в коде ещё не было, отправил ссылку и получил от
+   * ассистента «подключиться не могу» вместо карточки.
+   */
+  const WITH_UNAVAILABLE = [
+    { key: 'meeting:meet', title: 'Meet', note: '', available: true },
+    { key: 'meeting:webex', title: 'Webex', note: 'в планах', available: false },
+  ];
 
   describe('enabled', () => {
     it('нет строки — выключено', async () => {
@@ -74,14 +88,14 @@ describe('IntegrationFlagsService', () => {
 
     it('включённая в базе, но неразведённая показывается выключенной', async () => {
       // Её мог включить кто-то до этой правки — список обязан говорить правду.
-      const { svc } = make([{ key: 'meeting:teams', enabled: true }]);
-      const teams = (await svc.list()).find((i) => i.key === 'meeting:teams');
-      expect(teams).toMatchObject({ available: false, enabled: false });
+      const { svc } = make([{ key: 'meeting:webex', enabled: true }], WITH_UNAVAILABLE);
+      const webex = (await svc.list()).find((i) => i.key === 'meeting:webex');
+      expect(webex).toMatchObject({ available: false, enabled: false });
     });
 
     it('enabled у неразведённой всегда false', async () => {
-      const { svc } = make([{ key: 'meeting:teams', enabled: true }]);
-      expect(await svc.enabled('meeting:teams')).toBe(false);
+      const { svc } = make([{ key: 'meeting:webex', enabled: true }], WITH_UNAVAILABLE);
+      expect(await svc.enabled('meeting:webex')).toBe(false);
     });
 
     it('у каждой интеграции есть человеческое название', async () => {
@@ -103,14 +117,14 @@ describe('IntegrationFlagsService', () => {
       // Переключатель, который включается и ничего не делает, хуже его
       // отсутствия: владелец 14.09.2026 включил Teams, отправил ссылку и
       // получил от ассистента «подключиться не могу» вместо карточки.
-      const { pg, svc } = make([]);
-      await expect(svc.set('meeting:teams', true)).rejects.toThrow(/not implemented/);
+      const { pg, svc } = make([], WITH_UNAVAILABLE);
+      await expect(svc.set('meeting:webex', true)).rejects.toThrow(/not implemented/);
       expect(pg.query).not.toHaveBeenCalled();
     });
 
     it('выключить неразведённую можно — уборка за прошлой редакцией', async () => {
-      const { pg, svc } = make([]);
-      await svc.set('meeting:teams', false);
+      const { pg, svc } = make([], WITH_UNAVAILABLE);
+      await svc.set('meeting:webex', false);
       expect(pg.query).toHaveBeenCalled();
     });
 
