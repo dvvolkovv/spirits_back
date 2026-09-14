@@ -87,9 +87,14 @@ describe('TalerIdRoomClient', () => {
         url: 'wss://api.talerid.io/livekit/',
       });
       // Имя уходит в теле — именно так они подписывают участника в списке.
+      // Вместе с ним — признак бота: по нему их комната не спрашивает у
+      // ассистента согласия на запись, которого он дать не может.
       const [, init] = f.mock.calls[0];
       expect(init.method).toBe('POST');
-      expect(JSON.parse(init.body)).toEqual({ name: 'Роман · ассистент Дмитрия' });
+      expect(JSON.parse(init.body)).toEqual({
+        name: 'Роман · ассистент Дмитрия',
+        bot: true,
+      });
     });
 
     it('адрес LiveKit следует за базой, а не прибит к боевому домену', async () => {
