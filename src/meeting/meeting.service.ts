@@ -7,6 +7,7 @@ import { SPECIALIST_ROLES, SPECIALISTS } from '../voice-call/voice-call.types';
 import { RoomService } from './room.service';
 import { TalerIdRoomClient } from './talerid-room.client';
 import { AttendeeClient, attendeeConfigured } from './attendee.client';
+import { IntegrationFlagsService } from '../integrations/integration-flags.service';
 import { MeetingProvider } from './meeting-link';
 
 /** Провайдер встречи в voice_calls. Дальше сюда добавится 'zoom'. */
@@ -60,6 +61,7 @@ export class MeetingService {
     private readonly rooms: RoomService,
     private readonly talerIdRooms: TalerIdRoomClient,
     private readonly attendee: AttendeeClient,
+    private readonly flags: IntegrationFlagsService,
   ) {}
 
   /**
@@ -132,6 +134,17 @@ export class MeetingService {
      */
     url?: string,
   ): Promise<{ callId: string; title: string }> {
+    // Интеграция выключена — входить нельзя, даже если ссылку раздобыли в
+    // обход карточки (телеграм-бот, прямой запрос к ручке). Проверка здесь,
+    // а не только там, где рисуется кнопка: выключатель обязан выключать, а
+    // не прятать. Свои комнаты (`linkeon`) — не интеграция, они наши.
+    if (provider !== 'linkeon' && !(await this.flags.enabled(`meeting:${provider}`))) {
+      throw new ConflictException({
+        message: 'meeting integration is disabled',
+        reason: 'provider_disabled',
+      });
+    }
+
     const agentRes = await this.pg.query(
       `SELECT id, display_name, system_prompt, realtime_voice FROM agents WHERE id = $1 LIMIT 1`,
       [agentId],

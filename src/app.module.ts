@@ -50,6 +50,7 @@ import { SpeechModule } from './speech/speech.module';
 import { TmaModule } from './tma/tma.module';
 import { VoiceCallModule } from './voice-call/voice-call.module';
 import { MeetingModule } from './meeting/meeting.module';
+import { IntegrationsModule } from './integrations/integrations.module';
 
 @Module({
   imports: [
@@ -104,6 +105,7 @@ import { MeetingModule } from './meeting/meeting.module';
     TmaModule,
     VoiceCallModule,
     MeetingModule,
+    IntegrationsModule,
   ],
 })
 export class AppModule {}

@@ -5,6 +5,7 @@ import { TgGrammyClient } from './tg-grammy.client';
 import { MeetingService } from '../meeting/meeting.service';
 import { RoomService } from '../meeting/room.service';
 import { TalerIdRoomClient } from '../meeting/talerid-room.client';
+import { IntegrationFlagsService } from '../integrations/integration-flags.service';
 import { parseMeetingLink, MeetingProvider } from '../meeting/meeting-link';
 
 /**
@@ -55,6 +56,7 @@ export class TgMeetingService {
     private readonly meetings: MeetingService,
     private readonly rooms: RoomService,
     private readonly talerIdRooms: TalerIdRoomClient,
+    private readonly flags: IntegrationFlagsService,
   ) {}
 
   /**
@@ -149,6 +151,14 @@ export class TgMeetingService {
     code: string,
   ): Promise<{ title: string } | null> {
     try {
+      // Выключенная интеграция не показывает кнопку вовсе.
+      //
+      // В вебе это делалось с самого начала, а здесь до 14.09.2026 была дыра:
+      // для Meet и Zoom кнопка отправлялась безусловно, и отказ прилетал уже
+      // после нажатия — из MeetingService.join. Свои комнаты не интеграция.
+      if (provider !== 'linkeon' && !(await this.flags.enabled(`meeting:${provider}`))) {
+        return null;
+      }
       // Мост: проверить существование встречи нечем — публичной ручки нет ни
       // у Meet, ни у Zoom. Показываем приглашение сразу, как и в вебе.
       if (provider === 'meet') return { title: 'Встреча Google Meet' };
