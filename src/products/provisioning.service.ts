@@ -123,8 +123,24 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(ProvisioningService.name);
   private promoter?: NodeJS.Timeout;
 
-  /** Подменяется в тестах. */
-  private fetchFn: typeof fetch = (...args) => fetch(...args);
+  /**
+   * Подменяется в тестах.
+   *
+   * НЕ `typeof fetch`. Во-первых, `(...args) => fetch(...args)` на этом типе не
+   * собирается вовсе: TS2556, «A spread argument must either have a tuple type
+   * or be passed to a rest parameter», — и `nest build` отдавал rc=1 на чистом
+   * дереве. Заметить это было нечем: ts-jest типы не проверяет (см. шапку
+   * provisioning.integration.spec.ts), а deploy.sh гонит
+   * `npm run build 2>&1 | tail -3` под `set -e` БЕЗ `pipefail`, поэтому код
+   * возврата берётся у `tail`, падение сборки глотается и `pm2 restart` уезжает
+   * на старом dist. Тем же механизмом уже терялась сборка воркера.
+   *
+   * Во-вторых, полный `typeof fetch` был обещанием, которого никто не
+   * выполняет: отсюда используется только `.status`, а заглушки в тестах
+   * отдают ровно `{ status }`.
+   */
+  private fetchFn: (url: string, init?: RequestInit) => Promise<{ status: number }> = (url, init) =>
+    fetch(url, init);
 
   constructor(
     private readonly pg: PgService,

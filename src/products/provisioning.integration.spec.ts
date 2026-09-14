@@ -1,3 +1,4 @@
+import { ConflictException } from '@nestjs/common';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -49,21 +50,48 @@ import { SecretsService } from './secrets.service';
  * пришпиливает это выражение регекспом целиком. Их поведенческие двойники,
  * которые регексп переживают, в списке выше (последние две строки).
  *
- * ПРО ПРИБОР. Сторож «заведомо невалидный TypeScript» в этом репозитории
- * бесполезен и молча зелен: tsconfig.json ставит isolatedModules, ts-jest
- * работает транспайлером и типы не проверяет ВООБЩЕ (измерено:
- * `const x: number = 'строка'` не краснит ни одного теста). Типы ловит только
- * `npx tsc --noEmit`, и гонять его надо отдельно. Рабочие сторожа — неразбор
- * исходника и заведомо сломанное поведение; первый, кстати, даёт
+ * ПРО ПРИБОР. Сторож «заведомо невалидный TypeScript» здесь бесполезен и
+ * молча зелен: tsconfig.json ставит isolatedModules, ts-jest работает
+ * транспайлером и типы не проверяет ВООБЩЕ (измерено: `const x: number =
+ * 'строка'` не краснит ни одного теста). Рабочие сторожа — неразбор исходника
+ * и заведомо сломанное поведение; первый, кстати, даёт
  * `Tests: 107 passed, 107 total` при 224 в чистом прогоне: строка полностью
  * зелёная, красное видно только в `Test Suites:` и в упавшем ИТОГЕ.
  *
- * ЧЕГО ЗДЕСЬ НЕТ. `FOR UPDATE SKIP LOCKED` этим файлом не измеряется:
- * каждый claim — ОДИН оператор, то есть транзакция длиной в себя самого, и
- * без SKIP LOCKED ожидающий получает лок на микросекунды, а потом EvalPlanQual
- * перечитывает строку, видит status='running' и всё равно уходит ни с чем.
- * Победитель ровно один в обоих случаях, и разницу во времени на такой длине
- * не измерить. Сторожем остаётся регексп в provisioning.job.spec.ts.
+ * ГДЕ ПРОВЕРЯЮТСЯ ТИПЫ. Гейт — `npx nest build` (он же `npm run build`, он же
+ * шаг деплоя), а НЕ `npx tsc --noEmit`. Разница не формальная:
+ *   - `tsc --noEmit` берёт tsconfig.json, то есть вместе со спеками, и на
+ *     чистом дереве даёт шесть ошибок, пять из них в спеках. Как гейт он
+ *     бесполезен — красный всегда, новая ошибка тонет в старых;
+ *   - `nest build` берёт tsconfig.build.json, где спеки исключены шаблоном
+ *     проверяет ровно прод-код.
+ * На этой задаче гейт был КРАСНЫМ: `typeof fetch` в provisioning.service.ts
+ * давал TS2556 и rc=1 (починено там же, см. комментарий у fetchFn). Деплой
+ * этого не замечал: `npm run build 2>&1 | tail -3` под `set -e` без `pipefail`
+ * отдаёт код возврата `tail`, а не сборки.
+ *
+ * КАК ГОНЯТЬ. База обязана быть ОДНОРАЗОВОЙ — beforeEach делает TRUNCATE и
+ * адрес не разбирает (см. гард на непустую базу в beforeAll):
+ *
+ *   sudo -u postgres psql -c "CREATE ROLE provint LOGIN PASSWORD 'provint';" \
+ *                        -c "CREATE DATABASE provint OWNER provint;"
+ *   PROVISIONING_PG_URL=postgres://provint:provint@127.0.0.1:5432/provint \
+ *     npx jest --testPathIgnorePatterns=/node_modules/ \
+ *              --testPathPattern='src/products/provisioning.integration'
+ *   sudo -u postgres psql -c "DROP DATABASE provint;" -c "DROP ROLE provint;"
+ *
+ * ЧЕГО ЗДЕСЬ НЕТ. `FOR UPDATE SKIP LOCKED` не измеряется ОДНОВРЕМЕННЫМИ
+ * claim — и это не придирка, а измерение: со снятым SKIP LOCKED пятёрка
+ * параллельных claim оставляет файл зелёным. Причина в том, что каждый claim —
+ * ОДИН оператор, то есть транзакция длиной в себя самого: ожидающий получает
+ * лок на микросекунды, потом EvalPlanQual перечитывает строку, видит
+ * status='running' и уходит ни с чем. Победитель ровно один в обоих случаях.
+ *
+ * Держит лок, однако, не обязательно наш же claim. Сценарий 4б берёт на строку
+ * задания ПОСТОРОННИЙ `SELECT ... FOR UPDATE` в отдельной транзакции и держит
+ * его две секунды. Измерено: со SKIP LOCKED claim возвращается за 10 мс с
+ * null, без него — ждёт 2004 мс и забирает задание. Детерминированно, без
+ * гонок.
  */
 
 // Без адреса базы файл пропускается целиком, чтобы обычный прогон не требовал
@@ -113,6 +141,21 @@ maybe('провижининг против живого Postgres', () => {
     for (const f of ['001_products.sql', '002_provisioning.sql']) {
       await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', f), 'utf8'));
     }
+    // ГАРД НА ЧУЖУЮ БАЗУ. beforeEach делает TRUNCATE и адрес не разбирает, а
+    // на той же тестовой ноде живёт база стенда test.linkeon.io, где эти три
+    // таблицы уже созданы: один PROVISIONING_PG_URL, скопированный не из той
+    // строки, стирает продукты и ходы стенда без единого вопроса. Сегодня цена
+    // нулевая (таблицы стенда пусты), но живые продукты там появятся, и тогда
+    // эта проверка будет единственным, что стоит между прогоном и стендом.
+    // Считается ДО первого TRUNCATE и только один раз — дальше таблицу
+    // наполняем мы сами.
+    const n = await pool.query('SELECT count(*) FROM products');
+    if (Number(n.rows[0].count) > 0) {
+      throw new Error(
+        'PROVISIONING_PG_URL указывает на НЕпустую базу — нужна одноразовая, ' +
+          'иначе TRUNCATE в beforeEach сотрёт чужие продукты (рецепт — в шапке файла)',
+      );
+    }
   });
 
   afterAll(async () => {
@@ -140,9 +183,7 @@ maybe('провижининг против живого Postgres', () => {
     createdAgo?: string;
     /** null — раннер не выходил на связь ни разу. */
     seenAgo?: string | null;
-    archived?: boolean;
     secrets?: Record<string, string> | null;
-    provisionError?: string | null;
   };
 
   async function product(o: Seed = {}) {
@@ -151,12 +192,11 @@ maybe('провижининг против живого Postgres', () => {
     const box = o.secrets ? secrets.encrypt(o.secrets, id) : null;
     await pool.query(
       `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path,
-                             runner_token_hash, secrets_encrypted, port, provision_error,
-                             runner_seen_at, created_at, archived_at)
-       VALUES ($1, 'u-1', 'продукт', $2, $3, $4, '/product', $5, $6, $7, $8,
-               CASE WHEN $9::text IS NULL THEN NULL ELSE now() - $9::interval END,
-               now() - $10::interval,
-               CASE WHEN $11::bool THEN now() ELSE NULL END)`,
+                             runner_token_hash, secrets_encrypted, port,
+                             runner_seen_at, created_at)
+       VALUES ($1, 'u-1', 'продукт', $2, $3, $4, '/product', $5, $6, $7,
+               CASE WHEN $8::text IS NULL THEN NULL ELSE now() - $8::interval END,
+               now() - $9::interval)`,
       [
         id,
         slug,
@@ -167,10 +207,8 @@ maybe('провижининг против живого Postgres', () => {
         crypto.randomBytes(32).toString('hex'),
         box,
         o.port ?? null,
-        o.provisionError ?? null,
         o.seenAgo ?? null,
         o.createdAgo ?? '1 second',
-        o.archived ?? false,
       ],
     );
     return { id, slug };
@@ -219,15 +257,15 @@ maybe('провижининг против живого Postgres', () => {
   async function bystander() {
     const p = await product({ slug: `bystander-${seq++}`, status: 'running', port: 9999 });
     await job(p.id, { status: 'done', startedAgo: '2 hours', finishedAgo: '2 hours' });
-    return p;
+    // Снимок ВСЕЙ строки, а не трёх интересных колонок: перечисление колонок
+    // проверяет ровно то, о чём автор уже подумал, и пропускает остальное.
+    // Живой пример — runner_token_hash: мутация, отдающая хеш не тому
+    // продукту, списком status/port/provision_error не ловится вообще.
+    return { ...p, row: await getProduct(p.id) };
   }
 
-  async function expectUntouched(p: { id: string }) {
-    const r = await getProduct(p.id);
-    expect(r.status).toBe('running');
-    expect(r.port).toBe(9999);
-    expect(r.provision_error).toBeNull();
-    expect(r.archived_at).toBeNull();
+  async function expectUntouched(p: { id: string; row: any }) {
+    expect(await getProduct(p.id)).toEqual(p.row);
   }
 
   // ═══════════════════════════ claimJob ═══════════════════════════
@@ -306,25 +344,23 @@ maybe('провижининг против живого Postgres', () => {
     expect(withHash.rows.map((r: any) => r.id).sort()).toEqual(made.map((p) => p.id).sort());
   });
 
-  it('4. пять ОДНОВРЕМЕННЫХ claim на одно задание дают ровно одного победителя', async () => {
+  it('4а. пять ОДНОВРЕМЕННЫХ claim на одно задание дают ровно одного победителя', async () => {
     // Задание, доставшееся двоим, означало бы два развёртывания в один
-    // каталог. Второй агент обязан уйти ни с чем, а не ждать и получить то же
-    // самое следом.
+    // каталог.
+    //
+    // ЭТОТ сценарий про SKIP LOCKED ничего не говорит — измерено: со снятым
+    // SKIP LOCKED он остаётся зелёным. Победитель тут один по другой причине
+    // (EvalPlanQual, см. шапку). Про SKIP LOCKED — 4б.
     const other = await bystander();
     const p = await product({ slug: 'race1' });
     const j = await job(p.id);
     const svc = makeSvc();
 
-    const started = Date.now();
     const claims = await Promise.all([0, 1, 2, 3, 4].map(() => svc.claimJob()));
-    const elapsed = Date.now() - started;
 
     const winners = claims.filter(Boolean);
     expect(winners).toHaveLength(1);
     expect(winners[0]!.jobId).toBe(j);
-    // Проигравшие уходят сразу, а не встают в очередь за победителем. Порог
-    // грубый намеренно: он ловит блокирующее ожидание, а не миллисекунды.
-    expect(elapsed).toBeLessThan(3000);
     expect((await getJob(j)).status).toBe('running');
     // Ровно ОДИН продукт получил новый хеш — и это хеш победителя.
     const withHash = await pool.query(
@@ -334,6 +370,58 @@ maybe('провижининг против живого Postgres', () => {
     expect(withHash.rows).toHaveLength(1);
     expect(withHash.rows[0].id).toBe(p.id);
     await expectUntouched(other);
+  });
+
+  it('4б. задание, залоченное ПОСТОРОННИМ, пропускается, а не ждёт его', async () => {
+    // Единственное место, где SKIP LOCKED вообще наблюдаем. Одновременными
+    // claim его не поймать (см. 4а и шапку), но лок держит не обязательно наш
+    // же claim: у соседнего инстанса это может быть административный запрос,
+    // ручной psql, долгая транзакция миграции.
+    //
+    // Измерено обеими сторонами: со `FOR UPDATE SKIP LOCKED` — 10 мс и null;
+    // с голым `FOR UPDATE` — 2004 мс ожидания и задание ЗАХВАЧЕНО, то есть
+    // выдача встаёт колом ровно на столько, сколько посторонний держит строку.
+    // Детерминированно и без гонок: держатель берёт лок ДО claim.
+    const p = await product({ slug: 'foreign-lock' });
+    const j = await job(p.id);
+
+    // СВОЁ соединение: лок живёт в транзакции, а не в пуле.
+    const holder = await pool.connect();
+    let released = false;
+    try {
+      await holder.query('BEGIN');
+      await holder.query('SELECT id FROM product_provision_jobs WHERE id = $1 FOR UPDATE', [j]);
+      // Отпускаем через 2 секунды и НЕ дожидаясь claim: если claim встанет в
+      // очередь за локом, он всё-таки дождётся — и тест увидит это по времени
+      // и по захваченному заданию, а не повиснет навсегда.
+      const unlock = new Promise<void>((r) =>
+        setTimeout(async () => {
+          await holder.query('ROLLBACK');
+          released = true;
+          r();
+        }, 2000),
+      );
+
+      const started = Date.now();
+      const claimed = await makeSvc().claimJob();
+      const elapsed = Date.now() - started;
+
+      expect(claimed).toBeNull();
+      // Ни времени ожидания, ни следов захвата: задание осталось в очереди и
+      // достанется следующему обороту, когда посторонний отпустит строку.
+      expect(elapsed).toBeLessThan(1000);
+      expect(released).toBe(false);
+      expect((await getJob(j)).status).toBe('queued');
+      expect((await getJob(j)).started_at).toBeNull();
+
+      await unlock;
+      // Отпущенное задание снова выдаётся — пропуск был временным, а не
+      // потерей задания.
+      expect((await makeSvc().claimJob())!.jobId).toBe(j);
+    } finally {
+      if (!released) await holder.query('ROLLBACK').catch(() => undefined);
+      holder.release();
+    }
   });
 
   it('5. claim на пустой очереди не оставляет свой хеш ни у одного продукта', async () => {
@@ -377,30 +465,37 @@ maybe('провижининг против живого Postgres', () => {
     expect((await getProduct(stale.id)).status).toBe('provisioning');
   });
 
-  it('7. состояние, поменявшееся РОВНО в окне пробы, перевод не переживает', async () => {
-    // Между выборкой и записью проходит вся проба — до PROBE_TIMEOUT_MS.
-    // Хук в fetchFn подменяет состояние ровно в этом окне, как это делает
-    // живой пользователь или соседний инстанс.
+  // Сценарий 7 — три ОТДЕЛЬНЫХ теста, а не три фазы в одном. Фазы прятали
+  // друг друга: падение первой уносило остальные, и по номеру «7» было не
+  // понять, какая из трёх защит снята. Общее у всех трёх — хук в fetchFn,
+  // подменяющий состояние РОВНО в окне пробы (между выборкой и записью
+  // проходит до PROBE_TIMEOUT_MS, и всё это время состояние меняет кто угодно).
+  // Отметка раннера везде СВЕЖАЯ: иначе promoteReady отсеет продукт ещё до
+  // пробы, хук не позовётся и «гонка» выродится в проверку heartbeat.
 
-    // (а) «повторить» нажато во время пробы: продукт остаётся в provisioning,
-    //     и задание по-прежнему выдаётся. Перевод в running отнял бы у
-    //     claimJob право выдать его — кнопка нажата, ничего не произошло.
+  it('7а. «повторить» нажато во время пробы — продукт не уезжает в running', async () => {
+    // Перевод в running отнял бы у claimJob право выдать задание (там EXISTS
+    // по p.status = 'provisioning'), и повтор умер бы молча: кнопка нажата,
+    // ничего не произошло, ошибки нет нигде.
     const a = await product({ slug: 'race-retry', seenAgo: '10 seconds' });
     let jid = '';
+
     await expect(
       makeSvc(async () => {
         jid = await job(a.id);
         return { status: 200 };
       }).promoteReady(),
     ).resolves.toBe(0);
-    expect((await getProduct(a.id)).status).toBe('provisioning');
-    expect((await makeSvc().claimJob())!.jobId).toBe(jid);
 
-    // (б) таймаут отработал во время пробы: похороненный не воскресает, и
-    //     причина не затирается.
-    await pool.query('TRUNCATE products, product_provision_jobs CASCADE');
-    // Отметка раннера СВЕЖАЯ: иначе promoteReady отсеет продукт ещё до пробы,
-    // хук не позовётся и «гонка» выродится в проверку heartbeat.
+    expect((await getProduct(a.id)).status).toBe('provisioning');
+    // Главное следствие: задание по-прежнему выдаётся.
+    expect((await makeSvc().claimJob())!.jobId).toBe(jid);
+  });
+
+  it('7б. таймаут отработал во время пробы — похороненный не воскресает', async () => {
+    // Иначе вернувшаяся проба поднимает продукт в running с затёртой
+    // причиной, а в логе остаётся «провижининг просрочен» про продукт,
+    // который числится рабочим.
     const b = await product({
       slug: 'race-timeout',
       seenAgo: '10 seconds',
@@ -409,26 +504,29 @@ maybe('провижининг против живого Postgres', () => {
     await job(b.id, { status: 'done', startedAgo: '99 minutes', finishedAgo: '98 minutes' });
     const killer = makeSvc();
     watchLog(killer);
+
     await expect(
       makeSvc(async () => {
         await killer.failStaleProvisioning();
         return { status: 200 };
       }).promoteReady(),
     ).resolves.toBe(0);
-    const afterB = await getProduct(b.id);
-    expect(afterB.status).toBe('failed');
-    expect(afterB.provision_error).toMatch(/раннер на связи/);
 
-    // (в) продукт архивирован во время пробы: archived_at при статусе running
-    //     — состояние, из которого нет выхода.
-    await pool.query('TRUNCATE products, product_provision_jobs CASCADE');
+    const after = await getProduct(b.id);
+    expect(after.status).toBe('failed');
+    expect(after.provision_error).toMatch(/раннер на связи/);
+  });
+
+  it('7в. продукт архивирован во время пробы — archived_at при running недостижим', async () => {
     const c = await product({ slug: 'race-archive', seenAgo: '10 seconds' });
+
     await expect(
       makeSvc(async () => {
         await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [c.id]);
         return { status: 200 };
       }).promoteReady(),
     ).resolves.toBe(0);
+
     expect((await getProduct(c.id)).status).toBe('provisioning');
   });
 
@@ -529,25 +627,26 @@ maybe('провижининг против живого Postgres', () => {
     expect((await getProduct(p.id)).provision_error).toBeNull();
   });
 
-  it('11. два инстанса не переводят и не хоронят один продукт дважды', async () => {
-    // Прод запущен в кластерном режиме. Число инстансов нигде не
-    // зафиксировано — параллельные обороты это одно `pm2 scale` от
-    // реальности, и предупреждения при этом не будет.
+  // Сценарий 11 — три ОТДЕЛЬНЫХ теста по той же причине, что и 7. Общая
+  // посылка: прод запущен в кластерном режиме, число инстансов нигде в
+  // репозитории не зафиксировано, и параллельные обороты — одно `pm2 scale` от
+  // реальности, без единого предупреждения.
 
-    // (а) одновременный промоут одного продукта: ровно один перевод.
+  it('11а. одновременный промоут одного продукта даёт ровно один перевод', async () => {
     const a = await product({ slug: 'two-promote', kind: 'bot', seenAgo: '10 seconds' });
-    const promotions = await Promise.all([
-      makeSvc().promoteReady(),
-      makeSvc().promoteReady(),
-    ]);
+
+    const promotions = await Promise.all([makeSvc().promoteReady(), makeSvc().promoteReady()]);
+
+    // Сумма, а не «оба по единице»: второй обязан увидеть rowCount 0 и не
+    // засчитать перевод, которого не было.
     expect(promotions.reduce((x, y) => x + y, 0)).toBe(1);
     expect((await getProduct(a.id)).status).toBe('running');
+  });
 
-    // (б) промоут с медленной пробой против таймаута: состояние согласовано.
-    //     Либо продукт переведён и причина снята, либо похоронен и причина
-    //     записана. «Running с текстом про таймаут» и «failed при promoted=1»
-    //     — обе лжи, которые здесь уже воспроизводились.
-    await pool.query('TRUNCATE products, product_provision_jobs CASCADE');
+  it('11б. промоут с медленной пробой против таймаута даёт согласованное состояние', async () => {
+    // Либо продукт переведён и причина снята, либо похоронен и причина
+    // записана. «Running с текстом про таймаут» и «failed при promoted = 1» —
+    // обе лжи, и обе здесь уже воспроизводились.
     const b = await product({ slug: 'two-race', createdAgo: '99 minutes', seenAgo: '10 seconds' });
     await job(b.id, { status: 'done', startedAgo: '99 minutes', finishedAgo: '98 minutes' });
     const slow = makeSvc(async () => {
@@ -557,45 +656,61 @@ maybe('провижининг против живого Postgres', () => {
     watchLog(slow);
     const killer = makeSvc();
     watchLog(killer);
+
     const [promoted, buried] = await Promise.all([
       slow.promoteReady(),
       killer.failStaleProvisioning(),
     ]);
-    const afterB = await getProduct(b.id);
+
+    const after = await getProduct(b.id);
     expect(promoted + buried).toBe(1);
     if (promoted === 1) {
-      expect(afterB.status).toBe('running');
-      expect(afterB.provision_error).toBeNull();
+      expect(after.status).toBe('running');
+      expect(after.provision_error).toBeNull();
     } else {
-      expect(afterB.status).toBe('failed');
-      expect(afterB.provision_error).toMatch(/раннер на связи/);
+      expect(after.status).toBe('failed');
+      expect(after.provision_error).toMatch(/раннер на связи/);
     }
+  });
 
-    // (в) два одновременных таймаута хоронят один раз.
-    await pool.query('TRUNCATE products, product_provision_jobs CASCADE');
+  it('11в. два одновременных таймаута хоронят один раз', async () => {
     const c = await product({ slug: 'two-bury', seenAgo: null });
     await job(c.id, { createdAgo: '99 minutes' });
     const s1 = makeSvc();
     const s2 = makeSvc();
     watchLog(s1);
     watchLog(s2);
+
     const buries = await Promise.all([s1.failStaleProvisioning(), s2.failStaleProvisioning()]);
+
     expect(buries.reduce((x, y) => x + y, 0)).toBe(1);
     expect((await getProduct(c.id)).status).toBe('failed');
   });
 
   // ═══════════════════════════ completeJob ═══════════════════════════
 
-  it('12. отчёт правит ТОЛЬКО свой продукт: посторонний реестр не трогается', async () => {
-    // САМЫЙ ДОРОГОЙ СЦЕНАРИЙ ФАЙЛА. `UPDATE products ... FROM closed` — это
-    // СОЕДИНЕНИЕ, а не поиск по ключу: убери условие соединения (или допиши
-    // `OR TRUE`), и один отчёт агента похоронит весь реестр. Регексп-сторож в
-    // job.spec `OR TRUE` переживает, а в базе с ОДНИМ продуктом оба варианта
-    // неотличимы — поэтому посторонние продукты обязаны лежать в фикстурах.
-    const one = await bystander();
-    const two = await bystander();
-    const idle = await product({ slug: 'untouched-provisioning', seenAgo: null });
+  /**
+   * САМЫЙ ДОРОГОЙ СЦЕНАРИЙ ФАЙЛА, поэтому он разложен на два пути.
+   *
+   * `UPDATE products ... FROM closed` — это СОЕДИНЕНИЕ, а не поиск по ключу:
+   * убери условие соединения (или допиши `OR TRUE`), и один отчёт агента
+   * похоронит весь реестр. Регексп-сторож в job.spec `OR TRUE` переживает, а в
+   * базе с ОДНИМ продуктом соединение по ключу и соединение по всему дают одну
+   * и ту же строку — поэтому посторонние продукты обязаны лежать в фикстурах.
+   *
+   * Пути портят реестр ПО-РАЗНОМУ: отказный — статусом и причиной, успешный —
+   * портом. Одной фазой их проверять нельзя, подмена в успешном осталась бы за
+   * первым падением.
+   */
+  const untouchedRegistry = async () => ({
+    one: await bystander(),
+    two: await bystander(),
+    idle: await product({ slug: `untouched-${seq++}`, seenAgo: null }),
+  });
 
+  it('12а. отказный отчёт правит ТОЛЬКО свой продукт', async () => {
+    const reg = await untouchedRegistry();
+    const idleBefore = await getProduct(reg.idle.id);
     const p = await product({ slug: 'report-fail', port: 7000 });
     const j = await job(p.id, { status: 'running', startedAgo: '1 minute' });
     const svc = makeSvc();
@@ -607,21 +722,29 @@ maybe('провижининг против живого Postgres', () => {
     expect((await getProduct(p.id)).provision_error).toBe('порт занят');
     expect((await getJob(j)).status).toBe('failed');
     expect(log.warn).not.toHaveBeenCalled();
-    await expectUntouched(one);
-    await expectUntouched(two);
-    // Незанятый продукт тоже не должен ни похорониться, ни получить порт.
-    const после = await getProduct(idle.id);
-    expect(после.status).toBe('provisioning');
-    expect(после.provision_error).toBeNull();
+    await expectUntouched(reg.one);
+    await expectUntouched(reg.two);
+    // Продукт в provisioning — отдельный случай: он под отчёт «подходит» по
+    // статусу, и соединение без условия хоронит именно его.
+    expect(await getProduct(reg.idle.id)).toEqual(idleBefore);
+  });
 
-    // Успешный путь портит реестр иначе — портом. Проверяется отдельно.
+  it('12б. успешный отчёт не раздаёт свой порт всему реестру', async () => {
+    const reg = await untouchedRegistry();
+    const idleBefore = await getProduct(reg.idle.id);
     const q = await product({ slug: 'report-ok' });
     const jq = await job(q.id, { status: 'running', startedAgo: '1 minute' });
+    const svc = makeSvc();
+    const log = watchLog(svc);
+
     await svc.completeJob(jq, { ok: true, port: 8003 });
+
     expect((await getProduct(q.id)).port).toBe(8003);
-    await expectUntouched(one);
-    await expectUntouched(two);
-    expect((await getProduct(idle.id)).port).toBeNull();
+    expect((await getJob(jq)).status).toBe('done');
+    expect(log.warn).not.toHaveBeenCalled();
+    await expectUntouched(reg.one);
+    await expectUntouched(reg.two);
+    expect(await getProduct(reg.idle.id)).toEqual(idleBefore);
   });
 
   it('13. повторный отчёт поверх ЖИВОГО продукта не меняет ни статус, ни порт, ни причину', async () => {
@@ -720,5 +843,159 @@ maybe('провижининг против живого Postgres', () => {
     expect(log.warn).toHaveBeenCalledTimes(1);
     expect((await getProduct(p.id)).port).toBe(8003);
     expect((await getJob(j)).status).toBe('done');
+  });
+
+  // ═══════════════ ограничения самой схемы и create() ═══════════════
+
+  it('17. частичный индекс one_active действительно запрещает второе задание', async () => {
+    // На этом индексе висит вся аргументация сценария 8 и половина
+    // комментариев в provisioning.service.ts: «зависшее задание снимается,
+    // иначе индекс запрещает повтор навсегда». До сих пор он не исполнялся
+    // НИГДЕ — сторожем был текстовой поиск по DDL в products.migration.spec.ts,
+    // то есть ровно тот жанр, против которого написан этот файл. Измерено:
+    // убери CREATE UNIQUE INDEX из 002_provisioning.sql — юнит краснеет
+    // текстовым сторожем, интеграционный остаётся зелёным.
+    const p = await product({ slug: 'one-active' });
+    await job(p.id, { createdAgo: '99 minutes' });
+
+    // Второе активное задание не проходит — и именно по имени, которое
+    // хардкодят обработчики ошибок.
+    const second = await pool
+      .query(`INSERT INTO product_provision_jobs (product_id, status) VALUES ($1, 'queued')`, [
+        p.id,
+      ])
+      .then(() => null)
+      .catch((e: any) => e);
+    expect(second).not.toBeNull();
+    expect(second.code).toBe('23505');
+    expect(second.constraint).toBe('product_provision_jobs_one_active');
+
+    // Закрытое заданием НЕ считается активным: после таймаута повтор проходит.
+    // Без этой половины тест узаконил бы индекс, из-под которого нет выхода.
+    const svc = makeSvc();
+    watchLog(svc);
+    await expect(svc.failStaleProvisioning()).resolves.toBe(1);
+
+    await expect(
+      pool.query(`INSERT INTO product_provision_jobs (product_id, status) VALUES ($1, 'queued')`, [
+        p.id,
+      ]),
+    ).resolves.toMatchObject({ rowCount: 1 });
+  });
+
+  // create() до сих пор не вызывался файлом НИ РАЗУ, и это стоило дорого:
+  // переименование UNIQUE на products.slug даёт зелёными ОБА прогона, а в
+  // проде занятый слаг начинает отдавать 500 (страница ошибки) вместо 409
+  // («слаг занят, выберите другой»). Имя ограничения рождается в PostgreSQL —
+  // мок такое проверить не может по устройству.
+
+  it('18а. заведение доезжает до базы целиком: продукт, задание и bytea', async () => {
+    // bytea записан КОДОМ, а не фикстурой: encrypt при заведении, INSERT и
+    // decrypt при выдаче сходятся только все вместе и только если AAD —
+    // тот самый productId, сгенерированный ДО вставки.
+    const svc = makeSvc();
+
+    const { productId } = await svc.create({
+      userId: 'u-1',
+      name: 'первый',
+      slug: 'taken-slug',
+      kind: 'bot',
+      secrets: { BOT_TOKEN: '123:abc' },
+    });
+
+    const row = await getProduct(productId);
+    expect(row.status).toBe('provisioning');
+    expect(row.kind).toBe('bot');
+    expect(row.checkout_path).toBe('/product');
+    expect(Buffer.isBuffer(row.secrets_encrypted)).toBe(true);
+    const j = await pool.query('SELECT status FROM product_provision_jobs WHERE product_id = $1', [
+      productId,
+    ]);
+    expect(j.rows).toEqual([{ status: 'queued' }]);
+    const claimed = await makeSvc().claimJob();
+    expect(claimed!.productId).toBe(productId);
+    expect(claimed!.secrets).toEqual({ BOT_TOKEN: '123:abc' });
+  });
+
+  it('18б. занятый слаг отбивается 409 ещё до выпуска токена', async () => {
+    const svc = makeSvc();
+    await svc.create({ userId: 'u-1', name: 'первый', slug: 'taken-slug', kind: 'site', secrets: {} });
+
+    const e = await svc
+      .create({ userId: 'u-2', name: 'второй', slug: 'taken-slug', kind: 'site', secrets: {} })
+      .then(() => null)
+      .catch((err: any) => err);
+
+    expect(e).toBeInstanceOf(ConflictException);
+    expect(e.getStatus()).toBe(409);
+    expect(String(e.message)).toMatch(/слаг/);
+    // Висячего продукта после отказа не остаётся.
+    const all = await pool.query('SELECT count(*) FROM products WHERE slug = $1', ['taken-slug']);
+    expect(Number(all.rows[0].count)).toBe(1);
+  });
+
+  it('18в. слаг, занятый ПОСЛЕ проверки, ловится по имени ограничения', async () => {
+    // Единственный путь, на котором проверяется захардкоженное
+    // `products_slug_key`. Проверка занятости в create() читает состояние ДО
+    // вставки, и соседний запрос успевает занять слаг между ними. Гонка здесь
+    // не случайная, а воспроизведённая точно: подмена происходит внутри
+    // ответа на тот самый SELECT count(*).
+    //
+    // Узость условия — не осторожность: безусловный ConflictException
+    // превратил бы падение базы и нарушение CHECK в спокойное «слаг занят» без
+    // следа в логах, поэтому ниже проверяется ещё и то, что ЧУЖОЕ нарушение
+    // 23505 наружу 409 не отдаёт.
+    let raced = false;
+    const racingPg = {
+      query: async (sql: string, params?: any[]) => {
+        const r = await pool.query(sql, params);
+        if (!raced && /SELECT count\(\*\) FROM products WHERE slug/.test(sql)) {
+          raced = true;
+          await product({ slug: params![0] });
+        }
+        return r;
+      },
+    };
+    const svc = new ProvisioningService(racingPg as any, secrets);
+
+    const e = await svc
+      .create({ userId: 'u-9', name: 'гонка', slug: 'raced-slug', kind: 'site', secrets: {} })
+      .then(() => null)
+      .catch((err: any) => err);
+
+    expect(raced).toBe(true);
+    expect(e).toBeInstanceOf(ConflictException);
+    expect(e.getStatus()).toBe(409);
+    // Ровно один продукт с этим слагом — тот, что занял его в гонке.
+    const all = await pool.query('SELECT count(*) FROM products WHERE slug = $1', ['raced-slug']);
+    expect(Number(all.rows[0].count)).toBe(1);
+  });
+
+  it('18г. чужое нарушение UNIQUE наружу 409 не отдаёт', async () => {
+    // Второй UNIQUE на этой таблице — products_runner_token_hash_key.
+    // Столкновение sha256 от 32 случайных байт означает не занятый слаг, а
+    // что-то, что обязано быть видно как 500. Безусловный catch эту разницу
+    // стирает, и падение базы выглядело бы как «выберите другой слаг».
+    const svc = makeSvc();
+    const fixed = crypto.createHash('sha256').update('константа').digest('hex');
+    const spy = jest.spyOn(crypto, 'createHash');
+    await pool.query(
+      `INSERT INTO products (user_id, name, slug, kind, status, checkout_path, runner_token_hash)
+       VALUES ('u-1', 'занял хеш', 'hash-taken', 'site', 'provisioning', '/product', $1)`,
+      [fixed],
+    );
+    spy.mockImplementation(
+      () => ({ update: () => ({ digest: () => fixed }) }) as any,
+    );
+
+    const e = await svc
+      .create({ userId: 'u-2', name: 'другой', slug: 'hash-clash', kind: 'site', secrets: {} })
+      .then(() => null)
+      .catch((err: any) => err);
+
+    expect(e).not.toBeNull();
+    expect(e).not.toBeInstanceOf(ConflictException);
+    expect(e.code).toBe('23505');
+    expect(e.constraint).toBe('products_runner_token_hash_key');
   });
 });
