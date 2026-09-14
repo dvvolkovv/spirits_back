@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, Optional, OnModuleInit } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
@@ -71,8 +71,16 @@ export class IntegrationFlagsService implements OnModuleInit {
      * Каталог интеграций. Подставляется только в тестах: правило «неразведённую
      * включить нельзя» иначе невозможно проверить, когда разведены все, — а
      * оно обязано пережить тот день, когда появится следующая площадка.
+     *
+     * `@Optional()` обязателен. Без него Nest видит в конструкторе второй
+     * параметр, пытается найти провайдера с типом Array и роняет приложение
+     * на старте: `Nest can't resolve dependencies of the
+     * IntegrationFlagsService (PgService, ?)`. Значение по умолчанию его при
+     * этом не спасает — он смотрит на метаданные типов, а не на код. Поймано
+     * выкаткой на стенд 14.09.2026: юнит-тесты создают сервис руками и о
+     * внедрении зависимостей не знают вовсе.
      */
-    private readonly catalog: readonly IntegrationDef[] = INTEGRATIONS,
+    @Optional() private readonly catalog: readonly IntegrationDef[] = INTEGRATIONS,
   ) {}
 
   async onModuleInit() {
