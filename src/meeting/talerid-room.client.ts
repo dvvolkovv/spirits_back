@@ -148,7 +148,15 @@ export class TalerIdRoomClient {
     const d = await this.call(`${encodeURIComponent(code)}/join`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: displayName }),
+      // `bot: true` — мы не человек, и согласия на запись у нас спрашивать
+      // нечего. Их веб-комната ждёт ответа от КАЖДОГО участника, а ассистент
+      // ответить не может: 14.09.2026 запись на сервер так и не началась,
+      // диалог провисел до конца встречи. По флагу их сервер кладёт в токен
+      // атрибут `bot=1`, и комната считает нас ботом, а не гостем.
+      //
+      // Поле безопасно и для их старой версии: тело разбирается по ключам,
+      // лишние игнорируются, — так что порядок выката любой.
+      body: JSON.stringify({ name: displayName, bot: true }),
     });
     if (!d || typeof d.token !== 'string' || !d.token) return null;
     return { token: d.token, roomName: String(d.roomName ?? ''), url: this.livekitUrl() };

@@ -70,10 +70,19 @@ export default defineAgent({
       agentPersona?: string;
       agentVoice?: string;
       ownerName?: string;
+      /**
+       * Готовая подпись «Роман · ассистент Дмитрия» — её собирает бэкенд.
+       *
+       * Именно ею ассистент назван в токене чужой комнаты, поэтому складывать
+       * её здесь вторым экземпляром шаблона нельзя: разъедутся молча. Поле
+       * может не приехать, если job поставил бэкенд прошлой версии, — тогда
+       * работает прежний шаблон (см. displayName ниже).
+       */
+      assistantDisplayName?: string;
       // Чужая площадка. 'talerid' — разговор идёт не в нашей комнате, а в
       // комнате провайдера, куда мы входим участником по добытому токену.
-      // 'meet' — площадка вне LiveKit вовсе: Google Meet через бота Attendee,
-      // звук ходит вебсокетом (см. isBridged ниже), externalUrl/externalToken ей
+      // 'meet' и 'zoom' — площадки вне LiveKit вовсе: вход ботом моста, звук
+      // ходит вебсокетом (см. isBridged ниже), externalUrl/externalToken им
       // не нужны.
       provider?: 'talerid' | 'meet' | 'zoom';
       externalUrl?: string;
@@ -89,6 +98,16 @@ export default defineAgent({
     /** Комната, в которой реально идёт разговор: своя или чужая. */
     const isForeign = isMeeting && !!meta.externalUrl && !!meta.externalToken;
     const agentName = meta.agentName || 'Роман';
+    /**
+     * Как ассистент подписан для людей: в списке участников и в чате комнаты.
+     *
+     * Фолбэк повторяет прежний шаблон дословно и нужен только на время выката:
+     * job, поставленный бэкендом старой версии, поля не содержит. Падеж имени
+     * владельца в нём тот же, что был, — чинить его здесь нечем, имя приходит
+     * из профиля именительным.
+     */
+    const displayName =
+      meta.assistantDisplayName || `${agentName} · ассистент ${meta.ownerName || 'пользователя'}`;
 
     /**
      * Встреча идёт на той же модели, что и звонок.
@@ -172,6 +191,26 @@ export default defineAgent({
       gate?.setSolo(presence.solo);
       console.log(`[гейт] участников: ${presence.count} → ${presence.solo ? 'наедине' : 'строгий гейт'}`);
     };
+
+    /**
+     * Вход и выход из режима слушателя — строкой в лог.
+     *
+     * Само по себе молчание в логе неразличимо: «в режиме слушателя»,
+     * «не расслышал имя» и «окно закрыто» выглядят одинаково. Решение гейта
+     * пишется на каждую реплику, а вот СМЕНА режима раньше не писалась вовсе —
+     * и разбор встречи 14.09.2026 начался с поиска момента, когда ассистент
+     * замолчал, по 311 одинаковым строкам silent.
+     */
+    let wasListening = false;
+    function noteListening(): void {
+      if (!gate || gate.listening === wasListening) return;
+      wasListening = gate.listening;
+      console.log(
+        wasListening
+          ? '[гейт] режим слушателя включён'
+          : '[гейт] режим слушателя снят — отвечаю, когда зовут по имени',
+      );
+    }
 
     await ctx.connect();
 
@@ -302,7 +341,7 @@ export default defineAgent({
               replyOrDefer({ userInput: `${INTERNAL_PREFIX}: ${answerToChat(who, text)}]` });
               break;
             case 'ack_listen':
-              replyOrDefer({ instructions: listenAck() });
+              replyOrDefer({ instructions: listenAck(agentName) });
               break;
             case 'ack_resume':
               replyOrDefer({ instructions: resumeAck() });
@@ -344,7 +383,7 @@ export default defineAgent({
           meta.externalToken!,
           // Имя ровно то же, под которым мы вошли в комнату: по нему же
           // отсеивается собственное эхо.
-          `${agentName} · ассистент ${meta.ownerName || 'пользователя'}`,
+          displayName,
         );
         console.log('[чат] канал комнаты подключён');
 
@@ -456,9 +495,7 @@ export default defineAgent({
       // 28.08.2026. Гостям имя выдаётся в токене, а ассистент подключается
       // через dispatch, где identity назначает фреймворк.
       try {
-        await ctx.room.localParticipant?.updateName(
-          `${agentName} · ассистент ${meta.ownerName || 'пользователя'}`,
-        );
+        await ctx.room.localParticipant?.updateName(displayName);
       } catch (e) {
         // Не повод рушить встречу: без имени неудобно, но разговор возможен.
         console.error('не удалось выставить имя ассистента', e);
@@ -944,6 +981,7 @@ export default defineAgent({
       // «Норман», но увидеть это можно было только по транскрипту после
       // окончания встречи.
       console.log(`[гейт] ${decision} ← «${textContent.slice(0, 80)}»`);
+      noteListening();
       switch (decision) {
         case 'respond':
           // Именно эта реплика, а не «разговор целиком»: иначе модель
@@ -951,7 +989,7 @@ export default defineAgent({
           replyOrDefer({ instructions: answerTo(textContent) });
           break;
         case 'ack_listen':
-          replyOrDefer({ instructions: listenAck() });
+          replyOrDefer({ instructions: listenAck(agentName) });
           break;
         case 'ack_resume':
           replyOrDefer({ instructions: resumeAck() });
@@ -1021,6 +1059,7 @@ export default defineAgent({
         // «нет гейта — отвечаем на всё» была бы самой опасной из возможных.
         const decision = gate!.decide(msg.text, Date.now(), msg.name);
         console.log(`[гейт/чат] ${decision} ← «${msg.text.slice(0, 80)}»`);
+        noteListening();
         switch (decision) {
           case 'respond':
             // userInput, а не instructions, и это не стилистика.
@@ -1038,7 +1077,7 @@ export default defineAgent({
             replyOrDefer({ userInput: `${INTERNAL_PREFIX}: ${answerToChat(msg.name, msg.text)}]` });
             break;
           case 'ack_listen':
-            replyOrDefer({ instructions: listenAck() });
+            replyOrDefer({ instructions: listenAck(agentName) });
             break;
           case 'ack_resume':
             replyOrDefer({ instructions: resumeAck() });
@@ -1260,22 +1299,19 @@ export default defineAgent({
     // сработает, а заодно заглушится весь аудиотракт.
     if (isMeeting) {
       if (isBridged && attendeeHub) {
-        // Meet: звук целиком в вебсокете, комнаты для него нет вовсе — ни
+        // Мост: звук целиком в вебсокете, комнаты для него нет вовсе — ни
         // своей, ни чужой. Оба конца держат ХАБ, а не сокет: сокет сменится
-        // при первом же переподключении Attendee.
+        // при первом же переподключении моста.
         session.input.audio = new AttendeeAudioInput(attendeeHub);
         session.output.audio = new AttendeeAudioOutput(attendeeHub);
-        console.log('[вход] звук Attendee подставлен до старта сессии');
+        console.log('[вход] звук моста подставлен до старта сессии');
       } else {
         // Оба конца — на ту комнату, где идёт разговор. Микшер принимает любую,
         // правок не потребовал.
         const stage = foreign ?? ctx.room;
         session.input.audio = new MixedRoomAudioInput(stage);
         if (foreign) {
-          foreignOutput = new ExternalRoomAudioOutput(
-            foreign,
-            `${agentName} · ассистент ${meta.ownerName || 'пользователя'}`,
-          );
+          foreignOutput = new ExternalRoomAudioOutput(foreign, displayName);
           session.output.audio = foreignOutput;
         }
         console.log(`[вход] микшер подставлен до старта сессии (${foreign ? 'чужая' : 'своя'} комната)`);
