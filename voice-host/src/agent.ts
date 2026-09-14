@@ -26,6 +26,7 @@ import { ExternalRoomAudioOutput } from './external-room-output.js';
 import { ExternalRoomChat, type IncomingChat, type SendResult } from './external-chat.js';
 import { AttendeeAudioHub, AttendeeAudioInput, AttendeeAudioOutput } from './attendee-audio.js';
 import { botFailureReason } from './attendee-reason.js';
+import { OwnChatEcho } from './chat-echo.js';
 import { Room as ExternalRoom } from '@livekit/rtc-node';
 import {
   answerTo,
@@ -254,6 +255,16 @@ export default defineAgent({
     const CHAT_BUFFER_LIMIT = 50;
 
     /**
+     * Своё эхо в чате моста.
+     *
+     * Мост отдаёт нам и те сообщения, что отправил сам по нашей просьбе. На
+     * встрече Teams 14.09.2026 ассистент ответил вслух на собственную реплику
+     * в чате. В комнатах Taler ID эхо отсекает ExternalRoomChat по своему
+     * clientMsgId; у моста такого опознавателя нет.
+     */
+    const chatEcho = new OwnChatEcho(displayName);
+
+    /**
      * Положить сообщение чата в буфер.
      *
      * Буфер один на оба транспорта — и на чат комнаты Taler ID, и на чат
@@ -317,6 +328,12 @@ export default defineAgent({
           if (!text) return;
           const who = String(msg.sender || 'участник');
           const priv = !!msg.private;
+          if (chatEcho.isOwn(who, text)) {
+            // Своё сообщение: оно уже в транскрипте (его кладёт тул) и уж
+            // точно не обращение к самому себе.
+            console.log(`[чат] своё эхо пропущено: ${text.slice(0, 60)}`);
+            return;
+          }
           console.log(`[чат] ${who}${priv ? ' (лично)' : ''}: ${text.slice(0, 80)}`);
           noteChat(who, text, priv);
           // Написанное — такое же участие во встрече, как сказанное вслух, и
@@ -821,6 +838,7 @@ export default defineAgent({
                         console.error('[чат] отправка не удалась', e?.message);
                         return 'failed' as SendResult;
                       });
+                if (r === 'sent') chatEcho.note(String(text));
                 console.log(`[чат] ${r === 'sent' ? 'отправлено' : `НЕ отправлено (${r})`}: ${String(text).slice(0, 80)}`);
                 // Потолок комнаты — 10 сообщений за 10 секунд. Это
                 // единственный отказ, после которого повтор осмыслен, поэтому
