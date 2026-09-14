@@ -13,6 +13,7 @@ describe('MeetingService', () => {
   let rooms: { info: jest.Mock };
   let talerIdRooms: { info: jest.Mock; join: jest.Mock; chatUrl: jest.Mock };
   let attendee: { createBot: jest.Mock; removeBot: jest.Mock; sendChatMessage: jest.Mock };
+  let flags: { enabled: jest.Mock };
   let svc: MeetingService;
 
   const agentRow = {
@@ -75,7 +76,11 @@ describe('MeetingService', () => {
       removeBot: jest.fn().mockResolvedValue(true),
       sendChatMessage: jest.fn().mockResolvedValue(true),
     };
-    svc = new MeetingService(pg as any, calls as any, livekit as any, rooms as any, talerIdRooms as any, attendee as any);
+    flags = { enabled: jest.fn().mockResolvedValue(true) };
+    svc = new MeetingService(
+      pg as any, calls as any, livekit as any, rooms as any,
+      talerIdRooms as any, attendee as any, flags as any,
+    );
   });
 
   describe('join', () => {
@@ -213,6 +218,43 @@ describe('MeetingService', () => {
       calls.load.mockRejectedValue(new Error('call not found'));
       await svc.leave('нет-такого');
       expect(calls.markInterruptedKeepingRoom).toHaveBeenCalledWith('нет-такого');
+    });
+  });
+
+  describe('выключатель интеграции', () => {
+    it('выключенная интеграция не пускает во встречу', async () => {
+      // Выключатель обязан выключать, а не прятать кнопку: ссылку могли
+      // раздобыть в обход карточки — из телеграм-бота или прямым запросом.
+      withAgent();
+      flags.enabled.mockResolvedValue(false);
+      await expect(svc.join('u1', 7, 'abc-defg-hij', 'meet')).rejects.toMatchObject({
+        response: { reason: 'provider_disabled' },
+      });
+      expect(attendee.createBot).not.toHaveBeenCalled();
+    });
+
+    it('отказ случается ДО списания и создания записи', async () => {
+      // Иначе выключенная интеграция оставляла бы строки в voice_calls и
+      // запирала пользователю следующий вход.
+      withAgent();
+      flags.enabled.mockResolvedValue(false);
+      await svc.join('u1', 7, '71077562785', 'zoom', 'https://us04web.zoom.us/j/71077562785').catch(() => {});
+      const inserts = pg.query.mock.calls.filter(([q]: [string]) => /INSERT INTO voice_calls/i.test(q));
+      expect(inserts).toHaveLength(0);
+    });
+
+    it('спрашивает флаг по имени площадки', async () => {
+      withAgent();
+      await svc.join('u1', 7, '36fc367a', 'talerid').catch(() => {});
+      expect(flags.enabled).toHaveBeenCalledWith('meeting:talerid');
+    });
+
+    it('свои комнаты флага не имеют и не спрашивают', async () => {
+      // Комнаты Linkeon — не интеграция: они наши, и выключать их этим
+      // рубильником было бы странно.
+      withAgent();
+      await svc.join('u1', 7, 'ABC234').catch(() => {});
+      expect(flags.enabled).not.toHaveBeenCalled();
     });
   });
 
