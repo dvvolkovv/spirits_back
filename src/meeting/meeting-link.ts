@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { isValidRoomCode } from './room-code';
 
 /**
@@ -72,8 +73,35 @@ const ZOOM_LINK_REGEX =
  */
 const ZOOM_KEEP_PARAMS = ['pwd', 'tk'];
 
+/**
+ * Ссылка на встречу Microsoft Teams, личная (Teams for home).
+ *
+ * `teams.live.com/meet/<id>` с необязательным `?p=<пароль>`. Id числовой и
+ * длиннее зумовского — в замерах 13 цифр (`9334354666557`), поэтому диапазон
+ * взят с запасом. Точка перед `live.com` внутри группы обязательна, иначе
+ * прошёл бы `notteams.live.com`.
+ */
+const TEAMS_LIVE_LINK_REGEX =
+  /https?:\/\/teams\.live\.com\/meet\/(\d{10,20})(\?[^\s<>"']*)?/i;
+
+/**
+ * Ссылка на встречу Teams, корпоративная.
+ *
+ * `teams.microsoft.com/l/meetup-join/19%3ameeting_…%40thread.v2/0?context=…`
+ * — короткого опознавателя в ней нет вовсе: идентичность встречи несёт весь
+ * адрес целиком, вместе с `context`, где лежат tenant и organizer. Поэтому
+ * ссылку не разбираем на части и не нормализуем: любой выброшенный параметр
+ * рискует стоить входа.
+ *
+ * Хост берём с необязательным поддоменом (`teams.microsoft.us` для
+ * гособлака сюда не попадает сознательно — это другая площадка со своим
+ * поведением, и проверить её нам не на чем).
+ */
+const TEAMS_JOIN_LINK_REGEX =
+  /https?:\/\/teams\.microsoft\.com\/l\/meetup-join\/[^\s<>"']+/i;
+
 /** Откуда встреча. Свои комнаты и чужие ведут себя одинаково, но входы разные. */
-export type MeetingProvider = 'linkeon' | 'talerid' | 'meet' | 'zoom';
+export type MeetingProvider = 'linkeon' | 'talerid' | 'meet' | 'zoom' | 'teams';
 
 export interface ParsedMeetingLink {
   provider: MeetingProvider;
@@ -110,10 +138,22 @@ function zoomJoinUrl(host: string, kind: string, id: string, query?: string): st
 }
 
 /**
+ * Опознаватель корпоративной встречи Teams — отпечаток адреса входа.
+ *
+ * Не для секретности, а ради формы: код уезжает в `external_room`, в карточку
+ * и в логи, и класть туда адрес с tenant, organizer и вложенным JSON нельзя.
+ * Шестнадцать знаков — столько же, сколько у кода Taler ID, и фронт такой
+ * формат уже разбирает.
+ */
+function teamsCode(url: string): string {
+  return createHash('sha256').update(url, 'utf8').digest('hex').slice(0, 16);
+}
+
+/**
  * Первая распознанная ссылка на встречу в тексте, или null.
  *
  * «Первая» здесь — это порядок проверки провайдеров (linkeon → talerid →
- * meet → zoom), а не позиция ссылки в тексте: при нескольких ссылках разных площадок
+ * meet → teams → zoom), а не позиция ссылки в тексте: при нескольких ссылках разных площадок
  * в одном сообщении побеждает не та, что стоит раньше по тексту, а та, чей
  * провайдер проверяется раньше. Выбор «побеждает первая по позиции» здесь
  * сознательно не сделан — это отдельное продуктовое решение, которого пока
@@ -151,6 +191,24 @@ export function parseMeetingLink(text: string): ParsedMeetingLink | null {
     // как попало. Он же уедет в external_room и в meeting_url для Attendee,
     // и расхождение регистра развело бы одну встречу на две записи.
     return { provider: 'meet', code: meet[1].toLowerCase() };
+  }
+
+  const teamsLive = TEAMS_LIVE_LINK_REGEX.exec(text);
+  if (teamsLive) {
+    const [full, id] = teamsLive;
+    // Код — числовой id: его человек видит в приглашении. Пароль (`?p=`)
+    // остаётся в url: без него в защищённую встречу не войти.
+    return { provider: 'teams', code: id, url: full };
+  }
+
+  const teamsJoin = TEAMS_JOIN_LINK_REGEX.exec(text);
+  if (teamsJoin) {
+    const url = teamsJoin[0];
+    // Короткого опознавателя у корпоративной ссылки нет, а `external_room`
+    // и карточка его требуют. Берём отпечаток адреса: он стабилен (одна и та
+    // же встреча даёт один код), влезает в шестнадцатеричный формат кода,
+    // который фронт уже умеет, и не тащит в базу tenant с organizer.
+    return { provider: 'teams', code: teamsCode(url), url };
   }
 
   const zoom = ZOOM_LINK_REGEX.exec(text);

@@ -181,6 +181,66 @@ describe('parseMeetingLink', () => {
       expect(parseMeetingLink('https://meet.google.com/abc-defg-hij')?.provider).toBe('meet');
     });
   });
+  describe('Microsoft Teams', () => {
+    const LIVE = 'https://teams.live.com/meet/9334354666557?p=lBZ4sXKpUY7bT0GzzM';
+    const CORP =
+      'https://teams.microsoft.com/l/meetup-join/19%3ameeting_NzQ3Yzk%40thread.v2/0' +
+      '?context=%7B%22Tid%22%3A%22a1b2%22%2C%22Oid%22%3A%22c3d4%22%7D';
+
+    it('личная ссылка: код — числовой id, адрес — ссылка целиком', () => {
+      // Пароль живёт в `?p=`, и потерять его значит потерять вход, поэтому
+      // адрес не нормализуется вовсе.
+      expect(parseMeetingLink(`присоединяйся ${LIVE}`)).toEqual({
+        provider: 'teams',
+        code: '9334354666557',
+        url: LIVE,
+      });
+    });
+
+    it('корпоративная ссылка: код — отпечаток адреса, адрес целиком', () => {
+      // Короткого опознавателя у неё нет: идентичность несёт весь адрес
+      // вместе с context, где tenant и organizer. Класть такое в
+      // external_room и в карточку нельзя — берём отпечаток.
+      const r = parseMeetingLink(`вот встреча ${CORP}`);
+      expect(r?.provider).toBe('teams');
+      expect(r?.url).toBe(CORP);
+      expect(r?.code).toMatch(/^[0-9a-f]{16}$/);
+    });
+
+    it('отпечаток устойчив: одна встреча — один код', () => {
+      // На нём держится сверка с записью звонка, и «случайный» код развёл бы
+      // одну встречу на две записи.
+      expect(parseMeetingLink(CORP)?.code).toBe(parseMeetingLink(CORP)?.code);
+    });
+
+    it('разные встречи — разные коды', () => {
+      const other = CORP.replace('NzQ3Yzk', 'ODg4ZmE');
+      expect(parseMeetingLink(CORP)?.code).not.toBe(parseMeetingLink(other)?.code);
+    });
+
+    it('чужой домен с teams.live.com внутри не проходит', () => {
+      // Тот же класс защиты, что у notmeet.google.com и notzoom.us.
+      expect(parseMeetingLink('https://notteams.live.com/meet/9334354666557')).toBeNull();
+      expect(parseMeetingLink('https://teams.live.com.evil.ru/meet/9334354666557')).toBeNull();
+      expect(parseMeetingLink('https://teams.microsoft.com.evil.ru/l/meetup-join/19%3ax')).toBeNull();
+    });
+
+    it('короткий id личной ссылки не проходит', () => {
+      expect(parseMeetingLink('https://teams.live.com/meet/12345')).toBeNull();
+    });
+
+    it('прочие пути Teams не считаются встречей', () => {
+      // Ссылка на канал или чат — не приглашение во встречу, и карточка на
+      // ней только мешала бы.
+      expect(parseMeetingLink('https://teams.microsoft.com/l/channel/19%3aabc/General')).toBeNull();
+      expect(parseMeetingLink('https://teams.live.com/dl/launcher')).toBeNull();
+    });
+
+    it('«созвонимся в тимсе» без ссылки — не встреча', () => {
+      expect(parseMeetingLink('давай созвонимся в тимсе завтра')).toBeNull();
+    });
+  });
+
   describe('Zoom', () => {
     const LINK = 'https://us04web.zoom.us/j/71077562785?pwd=Y5JwbnVqjs11slpbCOzBOI54zw8bAd.1';
 

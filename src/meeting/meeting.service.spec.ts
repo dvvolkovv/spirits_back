@@ -539,6 +539,61 @@ describe('MeetingService', () => {
     });
   });
 
+  describe('встреча Microsoft Teams', () => {
+    const URL = 'https://teams.live.com/meet/9334354666557?p=lBZ4sXKpUY7bT0GzzM';
+
+    it('идёт тем же мостом и передаёт настоящего провайдера', async () => {
+      withAgent();
+      const res = await svc.join('u1', 7, '9334354666557', 'teams', URL);
+      expect(livekit.dispatchAgent).toHaveBeenCalledWith(
+        `teams_${res.callId}`,
+        expect.objectContaining({ mode: 'meeting', provider: 'teams' }),
+      );
+    });
+
+    it('адрес входа сохраняется отдельной колонкой', async () => {
+      // У Teams он нужен даже больше, чем у Zoom: у корпоративной ссылки весь
+      // опознаватель — это адрес целиком.
+      withAgent();
+      await svc.join('u1', 7, '9334354666557', 'teams', URL);
+      const insert = pg.query.mock.calls.find(([sql]: any) => /INSERT INTO voice_calls/.test(sql));
+      expect(insert[1]).toContain('teams');
+      expect(insert[1]).toContain(URL);
+    });
+
+    it('без адреса входа отказ ДО создания записи', async () => {
+      withAgent();
+      await expect(svc.join('u1', 7, '9334354666557', 'teams')).rejects.toMatchObject({
+        response: expect.objectContaining({ reason: 'teams_url_required' }),
+      });
+      const insert = pg.query.mock.calls.find(([sql]: any) => /INSERT INTO voice_calls/.test(sql));
+      expect(insert).toBeUndefined();
+    });
+
+    it('делит общий потолок моста с Meet и Zoom', async () => {
+      // Потолок держится одним портом на задание и общими аудиоустройствами
+      // в контейнере — площадка тут ни при чём.
+      withAgent();
+      pg.query.mockImplementation(async (sql: string) => {
+        if (/provider = ANY/.test(sql)) return { rows: [{ id: 'c-busy' }], rowCount: 1 };
+        if (/FROM agents/.test(sql)) return { rows: [{ id: 7, display_name: 'Роман' }] };
+        return { rows: [], rowCount: 0 };
+      });
+      await expect(svc.join('u1', 7, '9334354666557', 'teams', URL)).rejects.toMatchObject({
+        response: expect.objectContaining({ reason: 'meet_busy' }),
+      });
+    });
+
+    it('выключенная интеграция не пускает', async () => {
+      withAgent();
+      flags.enabled.mockResolvedValue(false);
+      await expect(svc.join('u1', 7, '9334354666557', 'teams', URL)).rejects.toMatchObject({
+        response: expect.objectContaining({ reason: 'provider_disabled' }),
+      });
+      expect(flags.enabled).toHaveBeenCalledWith('meeting:teams');
+    });
+  });
+
   describe('встреча Zoom', () => {
     const URL = 'https://us04web.zoom.us/j/71077562785?pwd=SECRET.1';
 

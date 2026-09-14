@@ -697,7 +697,7 @@ export class ChatService {
       // обычная ссылка в разговоре, идём обычным путём и не мешаем.
       const room = !allowed
         ? null
-        : meetingLink.provider === 'meet' || meetingLink.provider === 'zoom'
+        : meetingLink.provider === 'meet' || meetingLink.provider === 'zoom' || meetingLink.provider === 'teams'
         // Проверять существование встречи нечем: публичной ручки у Meet нет.
         // Карточку показываем сразу — цена ошибки невелика, а требовать
         // проверки значит не показывать карточку никогда.
@@ -708,7 +708,12 @@ export class ChatService {
         ? (attendeeConfigured()
             ? {
                 code: meetingLink.code,
-                title: meetingLink.provider === 'zoom' ? 'Встреча Zoom' : 'Встреча Google Meet',
+                title:
+                  meetingLink.provider === 'zoom'
+                    ? 'Встреча Zoom'
+                    : meetingLink.provider === 'teams'
+                    ? 'Встреча Microsoft Teams'
+                    : 'Встреча Google Meet',
                 active: true,
               }
             : null)

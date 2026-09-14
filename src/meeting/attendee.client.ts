@@ -99,12 +99,13 @@ export interface CreateBotParams {
    */
   wsUrl: string;
   /**
-   * Площадка. Нужна ровно ради `zoom_settings` — см. createBot.
+   * Площадка. Нужна ради `zoom_settings` — см. createBot. Teams особых
+   * настроек не требует: мост сам распознаёт площадку по адресу встречи.
    *
    * По умолчанию `meet`: он был первым, и вызовы без этого поля должны
    * продолжать работать как раньше.
    */
-  provider?: 'meet' | 'zoom';
+  provider?: 'meet' | 'zoom' | 'teams';
 }
 
 @Injectable()

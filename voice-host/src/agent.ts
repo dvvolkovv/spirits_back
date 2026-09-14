@@ -84,7 +84,7 @@ export default defineAgent({
       // 'meet' и 'zoom' — площадки вне LiveKit вовсе: вход ботом моста, звук
       // ходит вебсокетом (см. isBridged ниже), externalUrl/externalToken им
       // не нужны.
-      provider?: 'talerid' | 'meet' | 'zoom';
+      provider?: 'talerid' | 'meet' | 'zoom' | 'teams';
       externalUrl?: string;
       externalToken?: string;
       /**
@@ -167,7 +167,8 @@ export default defineAgent({
      * Отличается от isForeign тем, что второй комнаты нет вовсе: наша
      * остаётся пустой и нужна только ради job и дата-канала.
      */
-    const isBridged = isMeeting && (meta.provider === 'meet' || meta.provider === 'zoom');
+    const isBridged =
+      isMeeting && (meta.provider === 'meet' || meta.provider === 'zoom' || meta.provider === 'teams');
 
     /**
      * Состав встречи Meet. В нашей комнате участников нет вовсе, поэтому

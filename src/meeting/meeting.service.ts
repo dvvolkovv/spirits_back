@@ -32,7 +32,10 @@ const PROVIDER_ZOOM = 'zoom';
  * один (AttendeeAudioHub), и вторая встреча — всё равно какой площадки — не
  * найдёт свободного.
  */
-const BRIDGED_PROVIDERS = [PROVIDER_MEET, PROVIDER_ZOOM];
+/** Microsoft Teams — третья площадка через мост. */
+const PROVIDER_TEAMS = 'teams';
+
+const BRIDGED_PROVIDERS = [PROVIDER_MEET, PROVIDER_ZOOM, PROVIDER_TEAMS];
 
 /**
  * Сколько встреч Meet держим одновременно.
@@ -169,8 +172,9 @@ export class MeetingService {
     const isForeign = provider === 'talerid';
     const isMeet = provider === 'meet';
     const isZoom = provider === 'zoom';
+    const isTeams = provider === 'teams';
     /** Площадка без LiveKit: звук ходит через мост Attendee. */
-    const isBridged = isMeet || isZoom;
+    const isBridged = isMeet || isZoom || isTeams;
     const callId = randomUUID();
 
     // Куда идёт ассистент и как называется комната — единственное, чем
@@ -186,11 +190,16 @@ export class MeetingService {
       throw new ConflictException({ message: 'meeting bot is not configured', reason: 'meet_unavailable' });
     }
 
-    if (isZoom && !url) {
-      // Без адреса входить некуда: из числового id ссылку не собрать — нужен
-      // хост аккаунта и хеш пароля. Отказ ДО создания записи, по той же
-      // причине, что и отказ ненастроенного моста выше.
-      throw new ConflictException({ message: 'zoom join url is required', reason: 'zoom_url_required' });
+    if ((isZoom || isTeams) && !url) {
+      // Без адреса входить некуда: из короткого кода ссылку не собрать. У
+      // Zoom в ней хост аккаунта и хеш пароля, у Teams — пароль встречи, а у
+      // корпоративных ссылок и вовсе весь опознаватель целиком. Отказ ДО
+      // создания записи, по той же причине, что и отказ ненастроенного моста
+      // выше.
+      throw new ConflictException({
+        message: 'join url is required',
+        reason: isZoom ? 'zoom_url_required' : 'teams_url_required',
+      });
     }
 
     if (isBridged) {
@@ -223,10 +232,10 @@ export class MeetingService {
       // Название берём нейтральное — настоящего у нас нет.
       // Название нейтральное и по площадке: настоящего у нас нет ни там, ни
       // там — публичной ручки «что за встреча» нет ни у Meet, ни у Zoom.
-      title = isZoom ? 'Встреча Zoom' : 'Встреча Google Meet';
+      title = isZoom ? 'Встреча Zoom' : isTeams ? 'Встреча Microsoft Teams' : 'Встреча Google Meet';
       // По callId, а не по коду: одну встречу могут позвать дважды, а
       // room_name с уникальностью уже намучил (003_drop_room_name_unique).
-      roomName = `${isZoom ? PROVIDER_ZOOM : PROVIDER_MEET}_${callId}`;
+      roomName = `${isZoom ? PROVIDER_ZOOM : isTeams ? PROVIDER_TEAMS : PROVIDER_MEET}_${callId}`;
     } else if (isForeign) {
       const info = await this.talerIdRooms.info(code);
       if (!info || !info.isActive) throw new NotFoundException('room not found');
@@ -252,12 +261,12 @@ export class MeetingService {
       `INSERT INTO voice_calls (id, user_id, agent_id, room_name, status, provider, external_room, external_url)
        VALUES ($1, $2, $3, $4, 'dialing', $5, $6, $7)`,
       [callId, userId, agentId, roomName,
-       isZoom ? PROVIDER_ZOOM : isMeet ? PROVIDER_MEET : isForeign ? PROVIDER_TALERID : PROVIDER,
+       isZoom ? PROVIDER_ZOOM : isTeams ? PROVIDER_TEAMS : isMeet ? PROVIDER_MEET : isForeign ? PROVIDER_TALERID : PROVIDER,
        code,
        // Адрес храним отдельной колонкой, а не поверх external_room: там у
        // всех остальных провайдеров лежит короткий код, и колонка с двумя
        // смыслами однажды была бы прочитана не тем способом.
-       isZoom ? url : null],
+       isZoom || isTeams ? url : null],
     );
 
     try {
@@ -323,7 +332,9 @@ export class MeetingService {
         // Воркеру важна не площадка, а то, что звук идёт через мост, — но
         // провайдера передаём настоящий: он попадает в логи задания, и
         // «meet» на встрече Zoom сбивал бы с толку при разборе.
-        ...(isBridged ? { provider: isZoom ? PROVIDER_ZOOM : PROVIDER_MEET } : {}),
+        ...(isBridged
+          ? { provider: isZoom ? PROVIDER_ZOOM : isTeams ? PROVIDER_TEAMS : PROVIDER_MEET }
+          : {}),
         // Все специалисты, кроме самого ведущего: спрашивать себя незачем, а
         // предложение это сделать модель однажды примет всерьёз.
         specialists: Object.keys(SPECIALISTS)
@@ -395,7 +406,8 @@ export class MeetingService {
         botName,
         callId,
         wsUrl,
-        provider: call.provider === PROVIDER_ZOOM ? 'zoom' : 'meet',
+        provider:
+          call.provider === PROVIDER_ZOOM ? 'zoom' : call.provider === PROVIDER_TEAMS ? 'teams' : 'meet',
       });
       if (!bot) {
         // Причина уже в логе клиента. Звонок помечаем failed сами: join()

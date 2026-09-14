@@ -6,7 +6,7 @@ import { MeetingService } from './meeting.service';
 import { MeetingProvider } from './meeting-link';
 
 /** Провайдеры, которые ручка принимает. Незнакомое значение — не linkeon. */
-const KNOWN_PROVIDERS = new Set<MeetingProvider>(['linkeon', 'talerid', 'meet', 'zoom']);
+const KNOWN_PROVIDERS = new Set<MeetingProvider>(['linkeon', 'talerid', 'meet', 'zoom', 'teams']);
 
 @Controller('meeting')
 @UseGuards(JwtGuard)
