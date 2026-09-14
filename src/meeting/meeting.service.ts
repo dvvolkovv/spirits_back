@@ -6,6 +6,7 @@ import { VoiceCallService } from '../voice-call/voice-call.service';
 import { SPECIALIST_ROLES, SPECIALISTS } from '../voice-call/voice-call.types';
 import { RoomService } from './room.service';
 import { TalerIdRoomClient } from './talerid-room.client';
+import { assistantSignature } from './assistant-signature';
 import { MeetingProvider } from './meeting-link';
 
 /** Провайдер встречи в voice_calls. Дальше сюда добавится 'zoom'. */
@@ -156,12 +157,16 @@ export class MeetingService {
     try {
       const preamble = await this.calls.buildPreamble(userId, agentId);
       const ownerName = await this.resolveOwnerName(userId);
+      // Подпись собирается ОДИН раз и здесь, а воркеру уезжает готовой: тем же
+      // текстом он назовётся в комнате и подпишет сообщения в её чате. Про
+      // падеж имени владельца — в assistant-signature.ts.
+      const assistantDisplayName = assistantSignature(agent.display_name, ownerName);
 
       if (isForeign) {
         // Токен берём здесь, а не выше: он живёт шесть часов, и отсчёт лучше
         // начинать как можно позже. Имя — то же, что мы показываем в своих
         // комнатах, чтобы участники Taler ID видели, кто к ним пришёл.
-        const t = await this.talerIdRooms.join(code, `${agent.display_name} · ассистент ${ownerName}`);
+        const t = await this.talerIdRooms.join(code, assistantDisplayName);
         if (!t) throw new NotFoundException('room not found');
         external = {
           url: t.url,
@@ -187,6 +192,7 @@ export class MeetingService {
         agentPersona: agent.system_prompt || '',
         agentVoice: agent.realtime_voice || undefined,
         ownerName,
+        assistantDisplayName,
         // Внешняя комната: воркер повесит на неё вход и выход сессии.
         // Для своих встреч поля нет вовсе — поведение воркера не меняется.
         ...(external
