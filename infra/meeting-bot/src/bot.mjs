@@ -203,10 +203,22 @@ export class MeetingBot {
       catch { return null; }
     };
 
+    /**
+     * Клик — сперва настоящий, при отказе скриптом.
+     *
+     * Телемост рисует экран до входа модальным окном, и обёртка этого окна
+     * перекрывает собственную кнопку «Подключиться»: Playwright проверяет, кто
+     * лежит сверху, и отказывается кликать (живой прогон 15.09.2026). Selenium
+     * такой проверки не делал — поэтому адаптер на Attendee входил без правок.
+     * Скриптовый клик до элемента доходит всегда; настоящий пробуем первым,
+     * потому что он честнее воспроизводит поведение человека.
+     */
     const click = async (selector, what, timeout = 10_000) => {
       const el = await waitFor(selector, timeout);
       if (!el) { this.log.info?.(`[${this.id}] ${what}: элемента нет, пропускаем`); return false; }
       try { await el.click({ timeout: 5_000 }); this.log.info?.(`[${this.id}] ${what}`); return true; }
+      catch (e) { this.log.info?.(`[${this.id}] ${what}: клик перехвачен, пробуем скриптом`); }
+      try { await el.evaluate((node) => node.click()); this.log.info?.(`[${this.id}] ${what} (скриптом)`); return true; }
       catch (e) { this.log.warn?.(`[${this.id}] ${what}: ${e?.message}`); return false; }
     };
 
@@ -233,8 +245,26 @@ export class MeetingBot {
       }
       await this.page.waitForTimeout(2_000);
     }
+    await this.snapshot('не впустили');
     await this.setState('fatal_error', { sub: 'request_to_join_denied' });
     await this.stop();
+  }
+
+  /**
+   * Снимок экрана бота.
+   *
+   * Отлаживать вход вслепую дорого: первая же осечка стоила нам прогона,
+   * который ничего не сказал, кроме «дальше тишина». Снимок кладём рядом с
+   * логом, ошибку глотаем — диагностика не повод рушить встречу.
+   */
+  async snapshot(why) {
+    const path = `/tmp/meeting-bot-${this.id}.png`;
+    try {
+      await this.page?.screenshot({ path, fullPage: false });
+      this.log.warn?.(`[${this.id}] ${why}: снимок экрана ${path}`);
+    } catch (e) {
+      this.log.warn?.(`[${this.id}] снимок не сделался: ${e?.message}`);
+    }
   }
 
   async stop() {
