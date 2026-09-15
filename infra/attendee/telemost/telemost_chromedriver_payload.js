@@ -236,13 +236,31 @@ class TelemostChatReader {
     this.started = false;
   }
 
-  /** Автор строки: у группы сообщений заголовок один, на первой строке. */
+  /**
+   * Автор строки.
+   *
+   * Две тонкости, обе видны в живом логе 15.09.2026:
+   *
+   * 1. Подряд идущие сообщения одного человека мессенджер группирует, и
+   *    заголовок с именем стоит только на ПЕРВОЙ строке группы. Соседей
+   *    перебирать мало — строки лежат в разных обёртках, поэтому идём по всему
+   *    списку строк назад от нашей. Иначе второе сообщение приезжало от
+   *    «участника» (так и было).
+   * 2. В заголовке рядом с именем живёт роль («Администратор»), и innerText
+   *    склеивает их в «Владимир К.Администратор». Роль отрезаем.
+   */
   authorFor(node) {
-    let row = node.closest('.yamb-message-row');
-    while (row) {
-      const name = row.querySelector('.yamb-message-user__name');
-      if (name && name.innerText.trim()) return name.innerText.trim();
-      row = row.previousElementSibling;
+    const row = node.closest('.yamb-message-row');
+    if (!row) return 'участник';
+    const rows = [...document.querySelectorAll('.yamb-message-row')];
+    for (let i = rows.indexOf(row); i >= 0; i--) {
+      const nameEl = rows[i].querySelector('.yamb-message-user__name');
+      if (!nameEl) continue;
+      const full = (nameEl.innerText || '').replace(/\s+/g, ' ').trim();
+      const roleEl = rows[i].querySelector('.yamb-message-user__additional-text');
+      const role = roleEl ? (roleEl.innerText || '').trim() : '';
+      const name = role && full.endsWith(role) ? full.slice(0, full.length - role.length).trim() : full;
+      if (name) return name;
     }
     return 'участник';
   }
@@ -261,6 +279,28 @@ class TelemostChatReader {
     this.started = true;
   }
 
+  /**
+   * Что читатель видит в своём кадре.
+   *
+   * Нужен, потому что «кадр запустился» и «сообщения нашлись» — разные вещи,
+   * а снаружи они выглядят одинаково: тишина. Раз в пять секунд, и только
+   * пока сообщений нет вовсе, — как только чат заработает, замер замолкает.
+   */
+  report() {
+    if (this.seen.size) return;
+    this.send({
+      debug: 'chat_frame_scan',
+      строк: document.querySelectorAll('.yamb-message-row').length,
+      текстов: document.querySelectorAll('.yamb-message-text').length,
+      спанов: document.querySelectorAll('.yamb-message-text span.text[id$="_c"]').length,
+      любыхСпанов: document.querySelectorAll('span.text').length,
+      кадров: window.frames.length,
+      теней: [...document.querySelectorAll('*')].filter((el) => el.shadowRoot).length,
+      длинаТекста: (document.body.innerText || '').length,
+      образец: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 120),
+    });
+  }
+
   start() {
     // Опрос, а не MutationObserver: мессенджер перерисовывает ленту целиком
     // при прокрутке, и наблюдатель давал бы шквал одинаковых событий. Раз в
@@ -268,6 +308,9 @@ class TelemostChatReader {
     setInterval(() => {
       try { this.tick(); } catch (e) { console.error('[телемост] чат не прочитался', e); }
     }, 1500);
+    setInterval(() => {
+      try { this.report(); } catch (e) { console.error('[телемост] замер не снялся', e); }
+    }, 5000);
   }
 }
 
@@ -334,7 +377,8 @@ if (location.host === 'yandex.ru' && location.pathname.startsWith('/chat')) {
     const d = ev.data;
     if (!d || d.source !== 'linkeon-telemost-chat') return;
     if (d.debug) {
-      ws.sendJson({ type: 'TelemostDebug', event: d.debug, url: d.url });
+      const { source, debug, ...rest } = d;
+      ws.sendJson({ type: 'TelemostDebug', event: debug, ...rest });
       return;
     }
     if (!d.text) return;
