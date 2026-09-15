@@ -74,7 +74,9 @@ const server = http.createServer(async (req, res) => {
     const platform = platformFor(meetingUrl);
     if (!platform) return json(res, 400, { error: 'unsupported meeting url' });
 
-    const id = `bot_${randomBytes(8).toString('hex')}`;
+    // Префикс `mb_` — не украшение: по нему клиент бэкенда понимает, куда
+    // слать `leave` и отправку в чат, зная один лишь идентификатор.
+    const id = `mb_${randomBytes(8).toString('hex')}`;
     const bot = new MeetingBot({
       id,
       meetingUrl,

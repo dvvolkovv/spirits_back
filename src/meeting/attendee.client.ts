@@ -117,21 +117,51 @@ export class AttendeeClient {
   }
 
   /**
+   * Куда идти: к чужому мосту или к нашему боту.
+   *
+   * Наш сервис (`infra/meeting-bot`) намеренно повторяет внешний контракт
+   * Attendee, поэтому весь этот клиент работает с обоими — разница только в
+   * адресе и ключе. Решение владельца 15.09.2026: Zoom и Телемост переносим к
+   * себе, Meet и Teams остаются на мосту, где их чинит апстрим.
+   *
+   * Выбираем по двум признакам, и оба нужны:
+   *
+   *   • при СОЗДАНИИ бота — по площадке: только она и известна;
+   *   • дальше — по префиксу id (`mb_`), потому что `removeBot` и отправка в
+   *     чат знают лишь идентификатор. Префикс наш сервис ставит сам.
+   *
+   * Не настроен наш сервис — всё идёт на мост, как раньше. Это и есть путь
+   * отката: убрать переменные, и переезд отменён.
+   */
+  private route(target?: string): { base: string; key: string } | null {
+    const ownBase = (process.env.MEETING_BOT_URL || '').replace(/\/+$/, '');
+    const ownKey = process.env.MEETING_BOT_API_KEY || '';
+    const own = !!ownBase && !!ownKey;
+    const ours = own && (target === 'telemost' || target === 'zoom' || target?.startsWith('mb_'));
+    if (ours) return { base: ownBase, key: ownKey };
+
+    const base = this.base();
+    const key = process.env.ATTENDEE_API_KEY || '';
+    if (!base || !key) return null;
+    return { base, key };
+  }
+
+  /**
    * Результат вызова: статус и разобранное тело.
    *
    * `null` означает «не дозвонились» — таймаут, сеть, отсутствующая настройка.
    * Это принципиально отличается от «сервис ответил, но отказал»: во втором
    * случае мы знаем состояние бота, в первом — нет.
    */
-  private async call(path: string, init: RequestInit): Promise<{ status: number; data: any } | null> {
-    const base = this.base();
-    const key = process.env.ATTENDEE_API_KEY;
-    // Без настроек молчим, а не бьёмся в пустой адрес: на стендах без Attendee
-    // встречи Meet просто недоступны, и это не повод падать.
-    if (!base || !key) {
-      this.logger.warn('attendee не настроен (ATTENDEE_BASE_URL / ATTENDEE_API_KEY)');
+  private async call(path: string, init: RequestInit, target?: string): Promise<{ status: number; data: any } | null> {
+    const route = this.route(target);
+    // Без настроек молчим, а не бьёмся в пустой адрес: на стендах без моста
+    // встречи просто недоступны, и это не повод падать.
+    if (!route) {
+      this.logger.warn('мост встреч не настроен (ATTENDEE_BASE_URL / ATTENDEE_API_KEY)');
       return null;
     }
+    const { base, key } = route;
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
     try {
@@ -229,7 +259,7 @@ export class AttendeeClient {
         // причём молча: ни ошибки, ни предупреждения не будет.
         ...(p.provider === 'zoom' ? { zoom_settings: { sdk: 'web' } } : {}),
       }),
-    });
+    }, p.provider);
     if (!r || r.status < 200 || r.status >= 300) return null;
     const id = r.data?.id;
     if (typeof id !== 'string' || !id) return null;
@@ -270,13 +300,13 @@ export class AttendeeClient {
     const r = await this.call(`/api/v1/bots/${encodeURIComponent(botId)}/send_chat_message`, {
       method: 'POST',
       body: JSON.stringify({ to: 'everyone', message }),
-    });
+    }, botId);
     return !!r && r.status >= 200 && r.status < 300;
   }
 
   async removeBot(botId: string): Promise<boolean | null> {
     const path = `/api/v1/bots/${encodeURIComponent(botId)}`;
-    const r = await this.call(`${path}/leave`, { method: 'POST' });
+    const r = await this.call(`${path}/leave`, { method: 'POST' }, botId);
     if (!r) return null;
     if (r.status === 404) return false;
     if (r.status >= 200 && r.status < 300) return true;
@@ -294,7 +324,7 @@ export class AttendeeClient {
       // Но 400 сам по себе НЕ значит «бот мёртв»: leave не разрешён и в
       // joining, и в комнате ожидания, а такой бот ещё может войти в встречу.
       // Поэтому спрашиваем состояние и убираем запись только на терминальном.
-      const st = await this.call(path, { method: 'GET' });
+      const st = await this.call(path, { method: 'GET' }, botId);
       const state = st?.status === 200 ? st.data?.state : undefined;
       if (typeof state === 'string' && TERMINAL_BOT_STATES.has(state)) return false;
       return null;
