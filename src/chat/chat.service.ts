@@ -698,7 +698,10 @@ export class ChatService {
       // обычная ссылка в разговоре, идём обычным путём и не мешаем.
       const room = !allowed
         ? null
-        : meetingLink.provider === 'meet' || meetingLink.provider === 'zoom' || meetingLink.provider === 'teams'
+        : meetingLink.provider === 'meet' ||
+          meetingLink.provider === 'zoom' ||
+          meetingLink.provider === 'teams' ||
+          meetingLink.provider === 'telemost'
         // Проверять существование встречи нечем: публичной ручки у Meet нет.
         // Карточку показываем сразу — цена ошибки невелика, а требовать
         // проверки значит не показывать карточку никогда.
@@ -714,6 +717,8 @@ export class ChatService {
                     ? 'Встреча Zoom'
                     : meetingLink.provider === 'teams'
                     ? 'Встреча Microsoft Teams'
+                    : meetingLink.provider === 'telemost'
+                    ? 'Встреча в Телемосте'
                     : 'Встреча Google Meet',
                 active: true,
               }

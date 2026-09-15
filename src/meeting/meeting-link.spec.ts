@@ -235,6 +235,37 @@ describe('parseMeetingLink', () => {
     });
   });
 
+  describe('Яндекс Телемост', () => {
+    it('код — номер встречи, адрес — канонический', () => {
+      // Параметры отбрасываем: мост всё равно приводит адрес к этой форме.
+      expect(parseMeetingLink('зайди на новую встречу https://telemost.yandex.ru/j/90382708766203')).toEqual({
+        provider: 'telemost',
+        code: '90382708766203',
+        url: 'https://telemost.yandex.ru/j/90382708766203',
+      });
+    });
+
+    it('параметры ссылки не уезжают в базу', () => {
+      expect(parseMeetingLink('https://telemost.yandex.ru/j/90382708766203?from=mail&utm_source=x')?.url)
+        .toBe('https://telemost.yandex.ru/j/90382708766203');
+    });
+
+    it('чужой домен с telemost.yandex.ru внутри не проходит', () => {
+      // Тот же класс защиты, что у notmeet.google.com и notzoom.us.
+      expect(parseMeetingLink('https://nottelemost.yandex.ru/j/90382708766203')).toBeNull();
+      expect(parseMeetingLink('https://telemost.yandex.ru.evil.ru/j/90382708766203')).toBeNull();
+    });
+
+    it('прочие страницы Телемоста встречей не считаются', () => {
+      expect(parseMeetingLink('https://telemost.yandex.ru/')).toBeNull();
+      expect(parseMeetingLink('https://telemost.yandex.ru/about')).toBeNull();
+    });
+
+    it('«созвонимся в телемосте» без ссылки — не встреча', () => {
+      expect(parseMeetingLink('давай созвонимся в телемосте после обеда')).toBeNull();
+    });
+  });
+
   describe('Microsoft Teams', () => {
     const LIVE = 'https://teams.live.com/meet/9334354666557?p=lBZ4sXKpUY7bT0GzzM';
     const CORP =

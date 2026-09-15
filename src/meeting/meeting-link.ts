@@ -130,6 +130,20 @@ const TEAMS_LIVE_LINK_REGEX =
 const TEAMS_JOIN_LINK_REGEX =
   /https?:\/\/teams\.microsoft\.com\/l\/meetup-join\/[^\s<>"']+/i;
 
+/**
+ * Ссылка на встречу Яндекс Телемоста.
+ *
+ * Хост точный, без поддоменов: у Телемоста их не бывает, а группа
+ * `(?:[a-z0-9-]+\.)?` пропустила бы `nottelemost.yandex.ru`. Путь строго
+ * `/j/<номер>` — прочие страницы Яндекса сюда не попадают.
+ *
+ * Номер длинный: в замерах 14 цифр (`90382708766203`), поэтому диапазон взят
+ * с запасом. Параметры ссылки отбрасываем: мост всё равно нормализует адрес
+ * до `https://telemost.yandex.ru/j/<номер>`, а тащить в базу метки перехода
+ * незачем.
+ */
+const TELEMOST_LINK_REGEX = /https?:\/\/telemost\.yandex\.ru\/j\/(\d{6,20})/i;
+
 /** Откуда встреча. Свои комнаты и чужие ведут себя одинаково, но входы разные. */
 export type MeetingProvider = 'linkeon' | 'talerid' | 'meet' | 'zoom' | 'teams' | 'telemost';
 
@@ -239,6 +253,14 @@ export function parseMeetingLink(text: string): ParsedMeetingLink | null {
     // же встреча даёт один код), влезает в шестнадцатеричный формат кода,
     // который фронт уже умеет, и не тащит в базу tenant с organizer.
     return { provider: 'teams', code: teamsCode(url), url };
+  }
+
+  const telemost = TELEMOST_LINK_REGEX.exec(text);
+  if (telemost) {
+    // Код — номер встречи: он же опознаватель для человека. Адрес собираем
+    // сами в канонической форме, потому что мост приводит его к ней же.
+    const id = telemost[1];
+    return { provider: 'telemost', code: id, url: `https://telemost.yandex.ru/j/${id}` };
   }
 
   const zoom = ZOOM_LINK_REGEX.exec(text);
