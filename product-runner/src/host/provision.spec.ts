@@ -909,3 +909,107 @@ describe('настоящие реализации для хоста', () => {
     expect(await hostDeps().waitPort(port, 100)).toBe(false);
   });
 });
+
+/**
+ * Добавлено проверкой задачи 9. Каждый случай здесь — мутация, пережившая
+ * исходную батарею: код её закрывает, а тест на неё отсутствовал, то есть
+ * защита держалась ни на чём и могла уехать первой же правкой.
+ */
+describe('дыры, оставшиеся незакрытыми тестом', () => {
+  // Мутация: SLUG_RE с флагом `m`. В JavaScript `$` без `m` не совпадает
+  // перед хвостовым переводом строки — на этом и держится отказ, но ни один
+  // тест этого не мерил. С флагом `m` слаг `kafe\n../../etc` проходит
+  // проверку целиком, а путь для удаления собирается из ВСЕЙ строки.
+  it.each(['kafe\n', 'kafe\n../../etc', '\nkafe', 'kafe\nrm'])(
+    'слаг с переводом строки (%j) отвергается: путь собирается из всей строки, а не из первой',
+    async (slug) => {
+      const h = new FakeHost();
+
+      await expect(provision(job({ slug }), deps(h))).rejects.toThrow(/слаг не годится/);
+
+      expect(h.calls).toHaveLength(0);
+      expect(h.removedDirs).toHaveLength(0);
+    },
+  );
+
+  // Та же мутация в SECRET_KEY_RE: с флагом `m` имя `OK\n-v /:/host -e Y`
+  // проходит по первой строке.
+  it.each(['OK\n', 'OK\n-v /:/host -e Y', '\nOK'])(
+    'имя секрета с переводом строки (%j) отвергается',
+    async (key) => {
+      const h = new FakeHost();
+
+      await expect(provision(job({ secrets: { [key]: 'v' } }), deps(h))).rejects.toThrow(/имя секрета/);
+      expect(h.calls).toHaveLength(0);
+    },
+  );
+
+  // Мутации: убрать PATH / NODE_OPTIONS / HOME / CLAUDE_BIN из RESERVED_ENV.
+  // Все четыре выжили. И это худшая половина списка: свои `-e` мы шлём
+  // последними, и для LINKEON_URL или RUNNER_TOKEN порядок — второй рубеж.
+  // Эти четыре мы не шлём вовсе, поэтому проверка имени у них ЕДИНСТВЕННАЯ
+  // защита, и клиентский `PATH=/tmp` или `NODE_OPTIONS=--require /tmp/x.js`
+  // подменяет то, чем раннер запускает продукт.
+  it.each(['PATH', 'NODE_OPTIONS', 'HOME', 'CLAUDE_BIN'])(
+    'секрет с именем %s отвергается: мы такого -e не шлём, перебить его нечем',
+    async (key) => {
+      const h = new FakeHost();
+
+      await expect(
+        provision(job({ secrets: { [key]: '/tmp/подмена' } }), deps(h)),
+      ).rejects.toThrow(/имя секрета занято/);
+      expect(h.containers.size).toBe(0);
+    },
+  );
+
+  it('нулевой байт в значении секрета — отказ до изменений на хосте', async () => {
+    // execFile отвергает его сам, но уже после того, как каталог создан и
+    // закоммичен: отказ пришёл бы через подчистку и с невнятным ERR_INVALID_ARG_VALUE.
+    await expect(
+      provision(job({ secrets: { BOT_TOKEN: 'aa\0bb' } }), deps(host)),
+    ).rejects.toThrow(/нулевой байт/);
+
+    expect(host.calls).toHaveLength(0);
+    expect(host.dirs.size).toBe(0);
+  });
+
+  it('подчистка не трогает vhost, которого не заводила', async () => {
+    // Мутация: снять `done.includes('vhost')`. У бота vhost не заводится
+    // вовсе, но конфиг с таким именем на хосте остаться мог — от прошлой
+    // жизни слага. Подчистка, снимающая чужой конфиг, уносит домен, к
+    // которому этот провижининг не притрагивался.
+    host.confFiles.set('bot-ulej', 9999);
+    host.liveVhosts.set('bot-ulej', 9999);
+    host.before = (argv) => {
+      if (argv[0] === 'docker' && argv[1] === 'run') throw new Error('нет места');
+    };
+
+    await expect(provision(job({ slug: 'bot-ulej', kind: 'bot' }), deps(host))).rejects.toThrow('нет места');
+
+    expect(host.ran('rm')).toHaveLength(0);
+    expect(host.ran('nginx')).toHaveLength(0);
+    expect(host.liveVhosts.get('bot-ulej')).toBe(9999);
+  });
+
+  it('образ — последний аргумент: всё, что после него, docker отдал бы контейнеру', async () => {
+    // Мутация: поставить образ перед флагами. Симулятор её переживает —
+    // он разбирает argv как набор флагов, а живой docker всё после образа
+    // считает командой контейнера: `-e RUNNER_TOKEN=…` стал бы аргументом
+    // процесса, переменной не стал бы, и продукт молча остался бы без токена.
+    await provision(job({ secrets: { BOT_TOKEN: 'тк' } }), deps(host));
+
+    const argv = host.calls.find((c) => c[0] === 'docker' && c[1] === 'run')!;
+    expect(argv[argv.length - 1]).toBe('linkeon-product:base');
+    expect(argv.indexOf('linkeon-product:base')).toBe(argv.length - 1);
+  });
+
+  it('контейнеру выставлены пределы памяти и CPU', async () => {
+    // Мутация: снять `--memory`/`--cpus`. Продукт клиента живёт на общей
+    // машине, и без предела один цикл в его коде уносит все остальные.
+    await provision(job(), deps(host));
+
+    const argv = host.calls.find((c) => c[0] === 'docker' && c[1] === 'run')!;
+    expect(argv).toContain('--memory=1g');
+    expect(argv).toContain('--cpus=1');
+  });
+});
