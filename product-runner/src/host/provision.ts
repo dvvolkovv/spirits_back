@@ -61,23 +61,54 @@
  * трогаем: пусть висит и держит порт, это строго безопаснее. По той же логике
  * каталог не удаляется, пока жив контейнер, смонтированный на него.
  *
- * ## `sleep 12` из скрипта
+ * ## `sleep 12` из скрипта, и почему опрос ПОРТА его не заменяет
  *
  * В скрипте между `docker run` и `product-vhost` стоит `sleep 12`. Он там не
  * «на всякий случай»: `docker run -d` возвращается, как только контейнер
  * создан, а внутри ещё должен отработать entrypoint, подняться pm2 и начать
- * слушать порт. vhost, заведённый раньше этого момента, ошибки не даёт — nginx
- * с `proxy_pass` на литеральный `127.0.0.1:PORT` перечитывает конфиг молча, —
- * и именно поэтому промах тихий: домен отдаёт 502, `promoteReady` не видит
+ * слушать приложение. vhost, заведённый раньше этого момента, ошибки не даёт —
+ * `proxy_pass` на литеральный `127.0.0.1:PORT` nginx принимает молча, — и
+ * именно поэтому промах тихий: домен отдаёт 502, `promoteReady` не видит
  * публичного 200, продукт висит в `provisioning` до таймаута и падает, хотя
- * контейнер живой. Таймер тут — заглушка вместо условия, и он врёт в обе
+ * контейнер живой. Таймер тут — заглушка вместо условия, и врёт он в обе
  * стороны: двенадцать секунд впустую в норме и мало на загруженном хосте.
- * Заменено ожиданием по факту — опросом порта до первого ответа, как
- * `waitHealthy` в `deploy.ts`. Не дождались за отведённое время — это отказ
- * провижининга с подчисткой, а не vhost вслепую.
+ *
+ * Заменено ожиданием по факту. **Но спрашивать порт нельзя**, и это не теория:
+ * порт хоста занимает `docker-proxy`, и занимает в момент `docker run` —
+ * задолго до того, как внутри контейнера что-нибудь поднимется. Замерено на
+ * живом докере с умолчаниями (`EnableUserlandProxy: true`):
+ *
+ *     docker run -d -p 127.0.0.1:18099:3000 redis:7-alpine sh -c 'sleep 60'
+ *     connect 127.0.0.1:18099 → CONNECT OK
+ *
+ * Внутри не слушает никто, а TCP-connect проходит. Первая редакция этого файла
+ * именно так и проверяла — и получался `sleep 0`, строго хуже заменённого
+ * `sleep 12`, с тем же тихим промахом. Поэтому `probe` спрашивает
+ * `GET /health` и требует 200 с полем `sha`, как `checkHealth` в `deploy.ts`:
+ * пустую трубу docker-proxy от поднявшегося продукта отличает только ответ
+ * самого приложения. Не дождались за отведённое время — отказ провижининга с
+ * подчисткой, а не vhost вслепую.
+ *
+ * ## Что проверено на живом хосте, а не предположено
+ *
+ * `product-vhost` (`/usr/local/bin/product-vhost` на хосте продуктов) прочитан
+ * целиком, а не угадан по имени: подчистка обязана снимать ровно тот файл,
+ * который он пишет, иначе отрапортует «на хосте чисто» при живом домене.
+ * Оттуда три факта, на которых стоит этот файл:
+ *
+ * - конфиг называется `/etc/nginx/sites-products/<slug>.conf` — то же имя,
+ *   которое удаляет `cleanup`;
+ * - перечитывает он `systemctl reload nginx`, и подчистка зовёт то же самое:
+ *   механизм, которым конфиг завели, — тот же, которым его снимают;
+ * - TLS берётся из общего `snippets/products-ssl.conf`, сертификат на каждый
+ *   продукт не выпускается. Значит `sleep 12` ждал именно приложение, а не
+ *   валидацию сертификата, — и ожидание по факту заменяет его полностью.
+ *
+ * Ещё оттуда: `nginx -t … && systemctl reload nginx` стоит ПОСЛЕ записи файла,
+ * то есть при отказе проверки конфиг уже лежит, а nginx ещё не перечитан.
+ * Ровно этот случай и разбирает подчистка.
  */
 import { execFile } from 'child_process';
-import { connect } from 'net';
 import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { promisify } from 'util';
@@ -146,6 +177,10 @@ const DEFAULTS = {
   vhostBin: 'product-vhost',
   nginxConfDir: '/etc/nginx/sites-products',
   waitPortTimeoutMs: 60_000,
+  /** Сколько ждать один ответ /health, прежде чем считать пробу неудачной. */
+  probeTimeoutMs: 2_000,
+  /** Пауза между пробами. */
+  probeEveryMs: 500,
 };
 
 export interface ProvisionJob {
@@ -278,7 +313,9 @@ async function cleanup(
       await deps.run(['rm', '-f', `${nginxConfDir}/${job.slug}.conf`]);
       // Файл убран, но vhost жив до перечитывания конфига — отказ reload
       // означает, что домен всё ещё смотрит на порт.
-      await deps.run(['nginx', '-s', 'reload']);
+      // Тем же механизмом, которым product-vhost конфиг заводил: он читан на
+      // хосте и делает `nginx -t … && systemctl reload nginx`.
+      await deps.run(['systemctl', 'reload', 'nginx']);
     } catch (e: any) {
       left.push(`vhost ${job.slug} (${e?.message ?? e})`);
       // Дальше не идём сознательно: снять сейчас контейнер — значит вернуть
@@ -400,7 +437,8 @@ export async function provision(job: ProvisionJob, deps: ProvisionDeps): Promise
       const timeoutMs = deps.waitPortTimeoutMs ?? DEFAULTS.waitPortTimeoutMs;
       if (!(await deps.waitPort(port, timeoutMs))) {
         throw new Error(
-          `продукт не занял порт ${port} за ${Math.round(timeoutMs / 1000)} с — vhost смотрел бы в пустоту`,
+          `продукт не ответил на http://127.0.0.1:${port}/health за ${Math.round(timeoutMs / 1000)} с`
+            + ' — vhost смотрел бы в пустоту',
         );
       }
       done.push('vhost');
@@ -482,7 +520,7 @@ export function hostDeps(overrides: Partial<ProvisionDeps> = {}): ProvisionDeps 
       for (;;) {
         if (await probe(port)) return true;
         if (Date.now() >= deadline) return false;
-        await new Promise((r) => setTimeout(r, 500));
+        await new Promise((r) => setTimeout(r, DEFAULTS.probeEveryMs));
       }
     },
   };
@@ -490,16 +528,56 @@ export function hostDeps(overrides: Partial<ProvisionDeps> = {}): ProvisionDeps 
   return deps;
 }
 
-function probe(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = connect({ port, host: '127.0.0.1' });
-    const finish = (ok: boolean) => {
-      socket.destroy();
-      resolve(ok);
-    };
-    socket.setTimeout(1000);
-    socket.once('connect', () => finish(true));
-    socket.once('timeout', () => finish(false));
-    socket.once('error', () => finish(false));
-  });
+/**
+ * Поднялся ли ПРОДУКТ на порту — не «принимает ли кто-нибудь соединение».
+ *
+ * Разница здесь не оттенок: порт держит docker-proxy с момента `docker run`, и
+ * TCP-connect проходит, когда внутри контейнера ещё пусто (см. шапку файла).
+ * Поэтому спрашиваем то единственное, что умеет ответить только само
+ * приложение: `/health` с 200 и полем `sha`.
+ *
+ * Признака ровно два, и оба обязаны быть: код 200 (продукт на прогреве и
+ * nginx отдают 502/503, и пускать на них домен нельзя) и разобранный JSON с
+ * непустым `sha` (иначе на порту что-то постороннее).
+ *
+ * Отдельных проверок на `text/html` и `<!doctype`, которые есть в
+ * `checkHealth`, здесь нет намеренно. Там они несут вес, потому что при
+ * отсутствии ожидаемого sha любой 2xx считается здоровьем, и SPA-фолбэк с
+ * index.html прошёл бы. Здесь требуется разбор JSON с полем `sha` — HTML этого
+ * не переживает ни с каким заголовком, так что обе проверки не могли бы
+ * изменить ни одного исхода. Мутация, снимающая их, и не краснела: это был
+ * эквивалентный мутант, то есть строки, которые нечем измерить и незачем
+ * держать. Проверено тестами «200 с HTML» и «HTML без content-type»: оба
+ * остаются красными на любом HTML-ответе.
+ *
+ * Значение `sha` НЕ сверяется с коммитом каркаса. При выкате такая сверка
+ * обязательна (`checkHealth` в `deploy.ts` ловит ею сироту, отвечающую старым
+ * кодом), но здесь чекаут только что создан и в нём ровно один коммит —
+ * сверять не с чем, а расхождение вычисления sha внутри контейнера стало бы
+ * ложным отказом, который снёс бы исправно поднявшийся продукт.
+ */
+async function probe(port: number): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DEFAULTS.probeTimeoutMs);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/health`, {
+      signal: controller.signal,
+      redirect: 'manual',
+    } as any);
+    if (res.status !== 200) return false;
+    const body = await res.text();
+    let sha: unknown;
+    try {
+      sha = JSON.parse(body)?.sha;
+    } catch {
+      return false;
+    }
+    return typeof sha === 'string' && sha.length > 0;
+  } catch {
+    // Соединение отвергнуто, оборвано или молчит дольше отведённого: с той
+    // стороны docker-proxy, а не продукт.
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
 }

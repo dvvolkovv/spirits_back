@@ -1,5 +1,6 @@
 import { execFile } from 'child_process';
 import { createServer } from 'net';
+import { createServer as createHttpServer } from 'http';
 import { mkdtemp, readFile, rm, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { tmpdir } from 'os';
@@ -32,7 +33,7 @@ class FakeHost {
   /** Живые контейнеры: имя → что с ним сделали. */
   containers = new Map<
     string,
-    { mount: string; publish?: string; env: Record<string, string>; image: string }
+    { mount: string; publish?: string; env: Record<string, string>; image: string; cmd: string[] }
   >();
   /** Файлы vhost в /etc/nginx/sites-products. */
   confFiles = new Map<string, number>();
@@ -85,7 +86,15 @@ class FakeHost {
         return '';
       }
       case 'nginx': {
+        // Живой product-vhost перечитывает конфиг через systemctl, но прямое
+        // `nginx -s reload` тоже перечитало бы: обе формы симулируются, чтобы
+        // тест на «подчистка ничего не перечитывала» ловил любую из них.
         if (rest.join(' ') !== '-s reload') throw new Error(`неожиданный вызов nginx: ${rest.join(' ')}`);
+        this.liveVhosts = new Map(this.confFiles);
+        return '';
+      }
+      case 'systemctl': {
+        if (rest.join(' ') !== 'reload nginx') throw new Error(`неожиданный systemctl: ${rest.join(' ')}`);
         this.liveVhosts = new Map(this.confFiles);
         return '';
       }
@@ -114,9 +123,16 @@ class FakeHost {
     let publish: string | undefined;
     let restart = '';
     const env: Record<string, string> = {};
+    const cmd: string[] = [];
 
     for (let i = 0; i < args.length; i++) {
       const a = args[i];
+      // Позиция образа — не формальность. Живой docker всё, что стоит ПОСЛЕ
+      // образа, отдаёт контейнеру командой: `-e RUNNER_TOKEN=…` после образа
+      // становится аргументом процесса, а переменной не становится вовсе —
+      // продукт молча остаётся без токена. Симулятор обязан разбирать argv так
+      // же, иначе «образ первым» выглядит рабочей командой.
+      if (image) { cmd.push(a); continue; }
       if (a === '-d') continue;
       if (a === '--name') { name = args[++i]; continue; }
       if (a === '--restart') { restart = args[++i]; continue; }
@@ -132,7 +148,6 @@ class FakeHost {
       }
       if (a.startsWith('--memory=') || a.startsWith('--cpus=')) continue;
       if (a.startsWith('-')) throw new Error(`docker run: неизвестный флаг ${a}`);
-      if (image) throw new Error(`docker run: два образа — ${image} и ${a}`);
       image = a;
     }
 
@@ -146,7 +161,7 @@ class FakeHost {
       const busy = [...this.containers.values()].some((c) => c.publish === publish);
       if (busy) throw new Error(`Bind for ${publish} failed: port is already allocated`);
     }
-    this.containers.set(name, { mount, publish, env, image });
+    this.containers.set(name, { mount, publish, env, image, cmd });
     return name;
   }
 
@@ -273,6 +288,18 @@ describe('форма продукта', () => {
     expect(bot.image).toBe(site.image);
     expect(bot.env).toEqual(site.env);
     expect(bot.mount).toBe('/srv/products/bot:/product');
+  });
+
+  it('контейнер стартует своим entrypoint, без команды поверх', async () => {
+    // Всё, что стоит после образа, docker отдаёт контейнеру командой и
+    // подменяет ею CMD образа — то есть /entrypoint.sh, который поднимает
+    // продукт и раннер. Пустая команда здесь означает «поднимается штатно».
+    await provision(job({ secrets: { BOT_TOKEN: 'тк' } }), deps(host));
+
+    const c = host.containers.get('kafe-ulej')!;
+    expect(c.cmd).toEqual([]);
+    expect(c.image).toBe('linkeon-product:base');
+    expect(c.env.RUNNER_TOKEN).toBe('ткн-раннера');
   });
 
   it('неизвестная форма продукта — отказ до единого изменения на хосте', async () => {
@@ -482,7 +509,7 @@ describe('слаг уже занят', () => {
   });
 
   it('контейнер с таким именем уже есть — отказ, и чужой контейнер жив', async () => {
-    host.containers.set('kafe-ulej', { mount: '/x:/product', env: {}, image: 'чужой' });
+    host.containers.set('kafe-ulej', { mount: '/x:/product', env: {}, image: 'чужой', cmd: [] });
 
     await expect(provision(job(), deps(host))).rejects.toThrow(/контейнер kafe-ulej уже есть/);
 
@@ -495,7 +522,7 @@ describe('слаг уже занят', () => {
     // docker run споткнётся и о него: имя занимают и остановленные.
     const calls: string[][] = [];
     const h = new FakeHost();
-    h.containers.set('kafe-ulej', { mount: '', env: {}, image: 'старый' });
+    h.containers.set('kafe-ulej', { mount: '', env: {}, image: 'старый', cmd: [] });
     const d = deps(h, { run: async (argv, o) => { calls.push(argv); return h.run(argv, o); } });
 
     await expect(provision(job(), d)).rejects.toThrow(/уже есть/);
@@ -599,7 +626,7 @@ describe('подчистка при отказе', () => {
         order.push('заведён vhost');
         throw new Error('не задался');
       }
-      if (argv[0] === 'nginx') order.push('снят vhost');
+      if (argv[0] === 'systemctl') order.push('снят vhost');
       if (argv[0] === 'docker' && argv[1] === 'rm') order.push('снят контейнер');
     };
 
@@ -619,7 +646,7 @@ describe('подчистка при отказе', () => {
     // Отказ reload — «до», а не «после»: конфиг не перечитан, значит домен всё
     // ещё обслуживается по старому, несмотря на удалённый файл.
     host.before = (argv) => {
-      if (argv[0] === 'nginx') throw new Error('nginx: [emerg] duplicate default server');
+      if (argv[0] === 'systemctl') throw new Error('nginx: [emerg] duplicate default server');
     };
 
     const err = await provision(job(), deps(host, { onPhase: (m) => phases.push(m) })).catch((e) => e);
@@ -706,7 +733,7 @@ describe('ожидание порта вместо sleep 12', () => {
   it('порт не поднялся — отказ с подчисткой, а не vhost вслепую', async () => {
     await expect(
       provision(job(), deps(host, { waitPort: async () => false, waitPortTimeoutMs: 45_000 })),
-    ).rejects.toThrow(/не занял порт 8001 за 45 с/);
+    ).rejects.toThrow(/не ответил на http:\/\/127\.0\.0\.1:8001\/health за 45 с/);
 
     expect(host.ran('product-vhost')).toHaveLength(0);
     expect(host.isClean('kafe-ulej')).toBe(true);
@@ -897,16 +924,137 @@ describe('настоящие реализации для хоста', () => {
     await expect(d.freePort()).rejects.toThrow(/свободных портов/);
   });
 
-  it('waitPort отвечает правдой про слушающий порт и ложью про закрытый', async () => {
-    const server = createServer();
-    const port: number = await new Promise((resolve) => {
-      server.listen(0, '127.0.0.1', () => resolve((server.address() as any).port));
+  /**
+   * Ожидание поднявшегося продукта проверяется НАСТОЯЩИМ HTTP, а не заглушкой.
+   *
+   * Прошлая редакция спрашивала TCP-connect и проверялась `createServer()` без
+   * обработчика соединений. Оба конца были одинаково пустые, тест сходился, и
+   * защита не работала: порт хоста занимает docker-proxy с момента `docker
+   * run`, так что connect проходит при пустом контейнере. Поэтому ниже каждый
+   * случай — отдельный вид «на порту кто-то есть, но продукта нет».
+   */
+  async function serve(
+    handler: (req: any, res: any) => void,
+  ): Promise<{ port: number; close: () => Promise<void> }> {
+    const server = createHttpServer(handler);
+    const port: number = await new Promise((resolve) =>
+      server.listen(0, '127.0.0.1', () => resolve((server.address() as any).port)),
+    );
+    return {
+      port,
+      close: () =>
+        new Promise<void>((resolve) => {
+          (server as any).closeAllConnections?.();
+          server.close(() => resolve());
+        }),
+    };
+  }
+
+  const health = (body: unknown) => (_req: any, res: any) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(body));
+  };
+
+  it('поднявшийся продукт — 200 с полем sha', async () => {
+    const s = await serve(health({ ok: true, sha: 'a1b2c3' }));
+
+    expect(await hostDeps().waitPort(s.port, 2000)).toBe(true);
+    await s.close();
+  });
+
+  it('порт принимает соединение и молчит — так выглядит docker-proxy при пустом контейнере', async () => {
+    // Ровно этим `createServer()` без обработчика прошлая редакция теста и
+    // зеленела. Теперь это случай «продукт не поднялся».
+    // Соединения запоминаем, чтобы разорвать их руками: net.Server, в отличие
+    // от http.Server, ждёт закрытия открытых соединений и без этого close()
+    // не вернётся никогда.
+    const accepted: import('net').Socket[] = [];
+    const server = createServer((socket) => accepted.push(socket));
+    const port: number = await new Promise((resolve) =>
+      server.listen(0, '127.0.0.1', () => resolve((server.address() as any).port)),
+    );
+
+    expect(await hostDeps().waitPort(port, 100)).toBe(false);
+    expect(accepted.length).toBeGreaterThan(0); // соединение приняли, ответа не дали
+
+    accepted.forEach((socket) => socket.destroy());
+    await new Promise((r) => server.close(() => r(null)));
+  });
+
+  it('200 без поля sha — на порту не наш продукт', async () => {
+    const s = await serve(health({ ok: true }));
+
+    expect(await hostDeps().waitPort(s.port, 100)).toBe(false);
+    await s.close();
+  });
+
+  it('503 на старте — ещё не поднялся', async () => {
+    const s = await serve((_req, res) => {
+      res.writeHead(503);
+      res.end('starting');
     });
 
-    expect(await hostDeps().waitPort(port, 2000)).toBe(true);
+    expect(await hostDeps().waitPort(s.port, 100)).toBe(false);
+    await s.close();
+  });
 
-    await new Promise((r) => server.close(r));
+  it('503 с полным телом health — код ответа решает, а не наличие sha', async () => {
+    // Продукт, который клиенту напишет ассистент, вполне может отдавать на
+    // прогреве 503 и уже знать свой sha. Пускать vhost на него нельзя: домен
+    // тут же начнёт отдавать 503 наружу.
+    const s = await serve((_req, res) => {
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, sha: 'a1b2c3' }));
+    });
+
+    expect(await hostDeps().waitPort(s.port, 100)).toBe(false);
+    await s.close();
+  });
+
+  it('HTML без content-type тоже не health: смотрим и на тело', async () => {
+    // Заголовок может быть каким угодно — text/plain, octet-stream, пусто.
+    // Единственное, на что тут можно опереться, это само тело.
+    const s = await serve((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('<!doctype html><html><body>заглушка хостинга</body></html>');
+    });
+
+    expect(await hostDeps().waitPort(s.port, 100)).toBe(false);
+    await s.close();
+  });
+
+  it('200 с HTML — это фолбэк, а не health', async () => {
+    // На доменах проекта SPA-фолбэк отдаёт 200 с index.html на любой путь.
+    const s = await serve((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end('<!doctype html><html><body>ok</body></html>');
+    });
+
+    expect(await hostDeps().waitPort(s.port, 100)).toBe(false);
+    await s.close();
+  });
+
+  it('закрытый порт — ложь', async () => {
+    const s = await serve(health({ ok: true, sha: 'a1' }));
+    const port = s.port;
+    await s.close();
+
     expect(await hostDeps().waitPort(port, 100)).toBe(false);
+  });
+
+  it('продукт, поднявшийся не сразу, дожидается — это ожидание, а не одна проба', async () => {
+    const readyAt = Date.now() + 700;
+    const s = await serve((_req, res) => {
+      if (Date.now() < readyAt) {
+        res.writeHead(503);
+        return res.end('starting');
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, sha: 'a1b2c3' }));
+    });
+
+    expect(await hostDeps().waitPort(s.port, 10_000)).toBe(true);
+    await s.close();
   });
 });
 
@@ -988,6 +1136,7 @@ describe('дыры, оставшиеся незакрытыми тестом', (
 
     expect(host.ran('rm')).toHaveLength(0);
     expect(host.ran('nginx')).toHaveLength(0);
+    expect(host.ran('systemctl')).toHaveLength(0);
     expect(host.liveVhosts.get('bot-ulej')).toBe(9999);
   });
 
@@ -1015,9 +1164,10 @@ describe('дыры, оставшиеся незакрытыми тестом', (
 });
 
 /**
- * ДЕФЕКТ, найденный проверкой задачи 9. Этот блок КРАСНЫЙ на текущем коде
- * намеренно — он показывает, что `waitPort` не измеряет того, ради чего его
- * завели.
+ * ДЕФЕКТ, найденный проверкой задачи 9. Блок заводился КРАСНЫМ и показывал,
+ * что `waitPort` не измеряет того, ради чего его завели. Дефект устранён —
+ * `probe` спрашивает `GET /health` и требует 200 с полем `sha`, — а тест
+ * остаётся сторожем: он краснеет на любом возврате к проверке сокета.
  *
  * Шапка provision.ts обещает: `sleep 12` заменён ожиданием по факту, «vhost
  * заводится только после того, как порт ответил». На деле `probe()` делает
@@ -1041,12 +1191,12 @@ describe('дыры, оставшиеся незакрытыми тестом', (
  * `createServer()` без обработчика соединений ведёт себя ровно как
  * docker-proxy с мёртвым бэкендом — принимает и молчит.
  *
- * Чинится не здесь, а в `probe`: спрашивать `GET http://127.0.0.1:PORT/health`
- * и требовать 200 с полем `sha`, как `checkHealth` в deploy.ts, на который
+ * Починено в `probe`: спрашивается `GET http://127.0.0.1:PORT/health` с
+ * требованием 200 и поля `sha`, как `checkHealth` в deploy.ts, на который
  * шапка и ссылается. Каркас сайта этот маршрут уже отдаёт.
  */
-describe('ДЕФЕКТ: waitPort не отличает поднявшийся продукт от docker-proxy', () => {
-  it('порт, который принимает соединение и тут же рвёт его, НЕ должен считаться поднявшимся', async () => {
+describe('waitPort отличает поднявшийся продукт от docker-proxy', () => {
+  it('порт, который принимает соединение и тут же рвёт его, не считается поднявшимся', async () => {
     const server = createServer((s) => s.destroy());
     const port: number = await new Promise((resolve) => {
       server.listen(0, '127.0.0.1', () => resolve((server.address() as any).port));
