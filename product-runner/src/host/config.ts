@@ -50,15 +50,39 @@ export const DEFAULT_POLL_INTERVAL_MS = 3_000;
  * no-op с предупреждением в лог, и повторный отчёт после обрыва связи там
  * прямо назван законным путём.
  *
- * Шесть попыток по 10 секунд — около минуты. Потолок выбран снизу перезапуском
- * API (`pm2 restart` — единицы секунд, выкат с прогревом — десятки), сверху
- * серверным сроком заведения в 10 минут: отчёт, приехавший после того, как
- * реаппер закрыл задание, уже никого не спасёт (тот же `AND status='running'`
- * сделает его no-op), а держать агента дольше вредно — пока он досылает, на
- * хосте не заводится ни один другой продукт.
+ * Шесть попыток и пять пауз по 10 секунд — в худшем случае ДО 110 СЕКУНД, а не
+ * «около минуты»: каждая попытка это ещё и свой requestTimeoutMs, и повисший
+ * запрос выбирает все десять секунд (6 × 10 запроса + 5 × 10 паузы). Всё это
+ * время агент не опрашивает очередь.
+ *
+ * Потолок выбран снизу перезапуском API (`pm2 restart` — единицы секунд, выкат
+ * с прогревом — десятки), сверху серверным сроком заведения в 10 минут: отчёт,
+ * приехавший после того, как реаппер закрыл задание, уже никого не спасёт (тот
+ * же `AND status='running'` сделает его no-op), а держать агента дольше
+ * вредно — пока он досылает, на хосте не заводится ни один другой продукт.
  */
 export const DEFAULT_REPORT_ATTEMPTS = 6;
 export const DEFAULT_REPORT_RETRY_MS = 10_000;
+
+/**
+ * ОБЩИЙ срок на всё развёртывание — вторая линия, а не первая.
+ *
+ * Первая линия — срок одной программы в `hostDeps.run` (DEFAULTS.runTimeoutMs
+ * в provision.ts): она снимает заклинивший `docker run`, после чего
+ * отрабатывает обычная подчистка и хост остаётся чистым. Здесь — то, чего
+ * первая линия закрыть не может: зависшая файловая операция, ошибка в самом
+ * `provision`, цепочка медленных, но не зависших шагов.
+ *
+ * По этому сроку отменять НЕЧЕГО: агент перестаёт ждать, но `provision`
+ * продолжает работать в фоне, подчистка не вызывалась, и состояние хоста
+ * неизвестно. Это прямо сказано в тексте отказа — иначе владелец прочитает
+ * «сорвалось» как «на хосте чисто» и упрётся в занятый слаг.
+ *
+ * Восемь минут: меньше серверного срока заведения в 10 минут (отчёт по
+ * закрытому заданию — no-op и ничего не изменит) и заметно больше суммы
+ * нормальных шагов, где самый долгий — ожидание ответа продукта в 60 секунд.
+ */
+export const DEFAULT_PROVISION_TIMEOUT_MS = 8 * 60 * 1000;
 
 export interface HostConfig {
   linkeonUrl: string;
@@ -69,10 +93,21 @@ export interface HostConfig {
   requestTimeoutMs: number;
   reportAttempts: number;
   reportRetryMs: number;
+  /**
+   * Необязательное поле с умолчанием в месте использования — ровно как
+   * pollTimeoutMs у раннера. Так конфиг, собранный где-то ещё (тест, чужой
+   * вызов), не остаётся БЕЗ срока: `?? DEFAULT_PROVISION_TIMEOUT_MS` в runJob
+   * действует и тогда, когда поля нет вовсе.
+   */
+  provisionTimeoutMs?: number;
 }
 
 function required(env: NodeJS.ProcessEnv, key: string): string {
   const value = env[key];
+  // `!value`, а не `value === undefined`: пустая строка в env-файле
+  // (`HOST_TOKEN=`) — это самый частый вид «задал, но не задал». Пропущенная
+  // сюда, она даёт вечный 401 без единой подсказки, потому что HostGuard
+  // отвергает пустой токен молча.
   if (!value) throw new Error(`${key} не задан — агент хоста не может стартовать`);
   return value;
 }
@@ -107,5 +142,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HostConfig {
     requestTimeoutMs: positiveNumber(env, 'REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS),
     reportAttempts: positiveNumber(env, 'REPORT_ATTEMPTS', DEFAULT_REPORT_ATTEMPTS),
     reportRetryMs: positiveNumber(env, 'REPORT_RETRY_MS', DEFAULT_REPORT_RETRY_MS),
+    provisionTimeoutMs: positiveNumber(env, 'PROVISION_TIMEOUT_MS', DEFAULT_PROVISION_TIMEOUT_MS),
   };
 }

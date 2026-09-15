@@ -181,6 +181,23 @@ const DEFAULTS = {
   probeTimeoutMs: 2_000,
   /** Пауза между пробами. */
   probeEveryMs: 500,
+  /**
+   * Срок ОДНОЙ программы. Довод тот же, что у таймаутов HTTP в api.ts: без
+   * срока заклинивший `docker run` (замерший dockerd, отвалившееся сетевое
+   * монтирование) вешает единственного агента машины навсегда — процесс жив,
+   * просто ничего не делает, продукты не заводятся, и в журнале при этом ни
+   * строки.
+   *
+   * Срок стоит ЗДЕСЬ, а не только общим сроком снаружи, по одной причине:
+   * снятый по сроку шаг — это обычный отказ шага, его ловит catch в
+   * `provision`, и хост подчищается ровно так же, как при любом другом отказе.
+   * Внешний срок отменить ничего не может и оставляет состояние хоста
+   * неизвестным.
+   *
+   * Пять минут — с запасом на `docker run` с вытягиванием образа по медленному
+   * каналу и заметно меньше серверного срока заведения в 10 минут.
+   */
+  runTimeoutMs: 300_000,
 };
 
 export interface ProvisionJob {
@@ -212,6 +229,8 @@ export interface ProvisionDeps {
   vhostBin?: string;
   nginxConfDir?: string;
   waitPortTimeoutMs?: number;
+  /** Срок одной программы. См. DEFAULTS.runTimeoutMs. */
+  runTimeoutMs?: number;
   /** Куда докладывать ход дела и, главное, что осталось на хосте после отказа. */
   onPhase?: (message: string) => void;
 }
@@ -474,11 +493,34 @@ export function hostDeps(overrides: Partial<ProvisionDeps> = {}): ProvisionDeps 
     // есть, шелла в цепочке нет.
     run: async (argv: string[], opts?: { cwd?: string }) => {
       const [bin, ...args] = argv;
-      const { stdout } = await execFileAsync(bin, args, {
-        cwd: opts?.cwd,
-        maxBuffer: 16 * 1024 * 1024,
-      });
-      return stdout;
+      // Срок читается из deps, а не из замыкания над DEFAULTS: hostDeps
+      // собирает объект и лишь затем накладывает overrides, и брать значение
+      // надо в момент ВЫЗОВА — иначе подмена в тестах и на стенде молча не
+      // действует (та же причина, по которой freePort зовёт deps.run).
+      const timeout = deps.runTimeoutMs ?? DEFAULTS.runTimeoutMs;
+      try {
+        const { stdout } = await execFileAsync(bin, args, {
+          cwd: opts?.cwd,
+          maxBuffer: 16 * 1024 * 1024,
+          timeout,
+          // SIGKILL, а не SIGTERM по умолчанию: снимаем мы именно ЗАКЛИНИВШИЙ
+          // шаг, а он по определению может не отреагировать на вежливый
+          // сигнал — и тогда срок не сработал бы вовсе.
+          killSignal: 'SIGKILL',
+        });
+        return stdout;
+      } catch (e: any) {
+        // Снятое по сроку отличается от «программа вернула ошибку» только
+        // полем killed: сообщение у обоих начинается с «Command failed». Без
+        // этой строки владелец читает в карточке отказ без причины там, где
+        // причина — зависший шаг.
+        if (e?.killed) {
+          throw new Error(
+            `${bin} не уложился в ${Math.round(timeout / 1000)} с и снят по сроку: ${e.message}`,
+          );
+        }
+        throw e;
+      }
     },
 
     writeFiles: async (dir: string, files: Record<string, string>) => {

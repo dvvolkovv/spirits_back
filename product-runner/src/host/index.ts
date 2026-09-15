@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { HostConfig, loadConfig } from './config';
+import { DEFAULT_PROVISION_TIMEOUT_MS, HostConfig, loadConfig } from './config';
 import { HostApi, HostJob, JobReport, PollOutcome } from './api';
 import { hostDeps, provision as provisionReal, ProvisionDeps } from './provision';
 
@@ -55,11 +55,22 @@ export interface HostDeps {
  *     назван законным путём («ретрай POST-а при обрыве связи выглядит именно
  *     так»). Бюджет досылки — см. DEFAULT_REPORT_ATTEMPTS.
  *
- * Если досылка не удалась и за минуту, лгать всё равно нечем: в журнал уходит
- * громкая строка со слагом, портом и jobId — всё, что нужно, чтобы закрыть
- * задание руками, — и агент идёт дальше. Ронять процесс здесь нельзя: на
- * машине он один, и пока он лежит, не заводится ни один продукт ни у одного
- * клиента.
+ * Если досылка не удалась и за отведённые ~110 секунд, лгать всё равно нечем:
+ * в журнал уходит громкая строка со слагом, портом и jobId — всё, что нужно,
+ * чтобы закрыть задание руками, — и агент идёт дальше. Ронять процесс здесь
+ * нельзя: на машине он один, и пока он лежит, не заводится ни один продукт ни
+ * у одного клиента. Чего эта громкая строка НЕ покрывает — сказано у `deliver`.
+ *
+ * ## Сроки
+ *
+ * У каждого HTTP-запроса срок свой (api.ts). У развёртывания их два: срок
+ * ОДНОЙ программы в `hostDeps.run` — после него отрабатывает обычная подчистка
+ * и хост остаётся чистым; и общий срок в `runJob` — последняя черта, после
+ * которой агент перестаёт ждать, но отменить уже ничего не может и говорит об
+ * этом прямо. Без сроков заклинивший `docker run` вешает единственного агента
+ * машины навсегда: сервер через 10 минут хоронит задание, владелец жмёт
+ * «повторить», новое задание ложится в очередь — и его никто не забирает, без
+ * единой строки в журнале.
  */
 
 /**
@@ -124,8 +135,36 @@ export async function tick(deps: HostDeps): Promise<void> {
  * срок — вместо настоящей причины, известной здесь и больше нигде.
  */
 export async function runJob(job: HostJob, deps: HostDeps): Promise<JobReport> {
+  const budget = deps.config.provisionTimeoutMs ?? DEFAULT_PROVISION_TIMEOUT_MS;
+  let timer: NodeJS.Timeout | undefined;
   try {
-    const { port } = await deps.provision(job);
+    const work = deps.provision(job);
+    // Отдельной страховки от unhandled rejection здесь НЕТ, и это проверено, а
+    // не предположено. Опасение было такое: гонку выиграл срок, брошенный
+    // провижининг падает позже, обработчика у него нет — и процесс умирает
+    // (Node >= 15), то есть срок, поставленный ради живучести агента, сам бы
+    // его и ронял. Страховка `work.catch(() => undefined)` тут стояла, но
+    // мутация, снимающая её, не покраснела НИЧЕМ: `Promise.race` подписывается
+    // на каждый элемент, и этой подписки достаточно — поздний отказ считается
+    // обработанным. Строка была мёртвой и убрана; свойство сторожит тест
+    // «отказ, пришедший после истечения срока, не роняет агента», который
+    // ловит событие unhandledRejection напрямую.
+    const { port } = await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new Error(
+                `провижининг не уложился в ${Math.round(budget / 1000)} с и брошен: `
+                  + 'состояние хоста НЕИЗВЕСТНО — подчистка не отрабатывала, '
+                  + 'слаг, порт и контейнер могут быть заняты, сверить руками',
+              ),
+            ),
+          budget,
+        );
+      }),
+    ]);
     // Ключ `port` кладётся только когда он есть. У бота публикации порта нет
     // вовсе, и `{ ok: true, port: undefined }` — не то же самое, что
     // `{ ok: true }`: первое читается в логе и в теле как «порт потерян».
@@ -133,6 +172,10 @@ export async function runJob(job: HostJob, deps: HostDeps): Promise<JobReport> {
     return port === undefined ? { ok: true } : { ok: true, port };
   } catch (e: any) {
     return { ok: false, error: describeFailure(e, job) };
+  } finally {
+    // Иначе каждый оборот оставляет восьмиминутный таймер: процесс не
+    // завершается по SIGTERM, а jest не выходит из прогона.
+    clearTimeout(timer);
   }
 }
 
@@ -154,8 +197,11 @@ function describeFailure(e: any, job: HostJob): string {
   return redact(text, job);
 }
 
+/** Что здесь считается секретом, если источник известен. */
+export type RedactSource = { runnerToken?: string; secrets?: Record<string, string> };
+
 /**
- * Вычищает секреты из текста, который уедет на сервер.
+ * Вычищает секреты из текста, который уедет на сервер и в журнал.
  *
  * Не перестраховка, а измеренный факт: `execFile` кладёт в `message` всю
  * командную строку целиком. Проверено (node 20):
@@ -164,31 +210,95 @@ function describeFailure(e: any, job: HostJob): string {
  *
  * То есть отказавший `docker run` отдаёт сообщение, где стоят подряд секреты
  * клиента, открытый `RUNNER_TOKEN` и — хуже всего — НАШ
- * `CLAUDE_CODE_OAUTH_TOKEN`, один на все продукты. Черновик отправлял это
- * `e.message` в `complete` как есть, а сервер кладёт причину в
- * `products.provision_error` и показывает её в карточке. Один неудачный
+ * `CLAUDE_CODE_OAUTH_TOKEN`, один на все продукты. Сервер кладёт причину в
+ * `products.provision_error` и показывает её в карточке: один неудачный
  * `docker run` — и токен подписки лежит в базе открытым текстом и на экране у
  * клиента.
  *
- * Правила два, и они дополняют друг друга:
+ * ## Почему один проход, а не два правила подряд
  *
- *  1. известные значения (токен раннера и секреты задания) вырезаются целиком —
- *     это ловит многострочные значения (приватный ключ в PEM) и появление
- *     значения где угодно в тексте, не только в argv. Короче восьми символов не
- *     трогаем: вырезание двухбуквенного значения превратило бы диагностику в
- *     кашу, а сам такой секрет всё равно закрыт правилом 2;
- *  2. всё после `-e ИМЯ=` в командной строке — это ловит то, чего мы здесь не
- *     знаем: токен Claude читается на хосте и в задании его нет.
+ * Правил по-прежнему два:
+ *
+ *  1. значение после `-e ИМЯ=` — ловит то, чего мы здесь не знаем: токен
+ *     Claude читается на хосте, и в задании его нет;
+ *  2. известные значения (токен раннера и секреты задания) — ловит то, чего не
+ *     берёт первое: многострочное значение (приватный ключ в PEM), значение с
+ *     пробелами (у `\S*` откусывается только первое слово) и появление
+ *     значения где угодно в тексте, не только в argv.
+ *
+ * Но оба сопоставляются с ИСХОДНЫМ текстом, а замена делается один раз в конце
+ * по объединённым отрезкам. Последовательное применение ломалось значением,
+ * которое задаёт КЛИЕНТ (значение секрета не проверяется ничем, кроме нулевого
+ * байта). Секрет со значением `-e CLAUDE_CODE_OAUTH_TOKEN=` вырезался правилом
+ * «известные значения» по всему тексту — в том числе из нашего собственного
+ * аргумента:
+ *
+ *     ... -e EVIL=-e CLAUDE_CODE_OAUTH_TOKEN= ... -e CLAUDE_CODE_OAUTH_TOKEN=sk-…
+ *     ... -e EVIL=***                         ... ***sk-…   ← правилу 1 нечего ловить
+ *
+ * и общий токен подписки уезжал в карточку клиента открытым текстом. Простая
+ * перестановка правил чинила бы этот случай и ломала соседний: после
+ * маскирования `-e K=a` значение `a b c d` уже не встречается в тексте
+ * целиком, и его хвост оставался бы снаружи.
+ *
+ * Один проход закрывает оба: ни одно правило не может убрать опору другого,
+ * потому что к моменту замены оба уже сопоставились с тем текстом, который
+ * приехал. Приёмом «подложить своё значение» это не ломается в принципе —
+ * подменять больше нечего.
+ *
+ * ## Порога длины нет
+ *
+ * Прежняя редакция не трогала значения короче восьми символов, обещая, что
+ * такой секрет «всё равно закрыт правилом про -e ИМЯ=». Неправда: `\S*` режет
+ * по первому пробелу, и значение `a b c d` маскировалось на одну восьмую.
+ * Порога больше нет — маскируется любое известное значение. Цена честная и
+ * названная: односимвольный секрет превратит сообщение в звёздочки и испортит
+ * диагностику. Это лучше утечки, а лечится не здесь: осмысленный нижний предел
+ * длины секрета — дело валидации в кабинете (products.dto.ts), где сегодня
+ * требуется лишь непустая строка.
  */
-export function redact(text: string, job: HostJob): string {
-  let out = text;
-  const known = [job.runnerToken, ...Object.values(job.secrets ?? {})];
-  for (const value of known) {
-    // split/join, а не RegExp: значение — произвольная строка, и `.` или `|`
-    // внутри неё превратили бы маску в шаблон, вырезающий чужой текст.
-    if (typeof value === 'string' && value.length >= 8) out = out.split(value).join('***');
+export function redact(text: string, job?: RedactSource): string {
+  const spans: Array<[number, number]> = [];
+
+  // Правило 1: значение после `-e ИМЯ=` / `--env ИМЯ=`.
+  const arg = /(?:^|\s)(?:-e|--env)\s+[A-Za-z_][A-Za-z0-9_]*=(\S*)/g;
+  for (let m = arg.exec(text); m; m = arg.exec(text)) {
+    const value = m[1];
+    // Пустое значение прятать нечего, а отрезок нулевой длины вставил бы
+    // звёздочки на ровном месте.
+    if (!value) continue;
+    const start = m.index + m[0].length - value.length;
+    spans.push([start, start + value.length]);
   }
-  return out.replace(/(^|\s)(-e|--env)(\s+)([A-Za-z_][A-Za-z0-9_]*)=\S*/g, '$1$2$3$4=***');
+
+  // Правило 2: известные значения целиком, где бы они ни стояли.
+  for (const value of [job?.runnerToken, ...Object.values(job?.secrets ?? {})]) {
+    if (typeof value !== 'string' || value === '') continue;
+    // indexOf, а не RegExp: значение — произвольная строка, и `.` или `|`
+    // внутри него превратили бы маску в шаблон, вырезающий чужой текст.
+    for (let i = text.indexOf(value); i !== -1; i = text.indexOf(value, i + value.length)) {
+      spans.push([i, i + value.length]);
+    }
+  }
+
+  if (!spans.length) return text;
+  spans.sort((a, b) => a[0] - b[0]);
+
+  let out = '';
+  let cursor = 0;
+  let [from, to] = spans[0];
+  for (const [s, e] of spans.slice(1)) {
+    // Пересекающиеся и соприкасающиеся отрезки склеиваются: иначе одно место
+    // маскируется дважды и в тексте появляется `******`.
+    if (s <= to) {
+      to = Math.max(to, e);
+      continue;
+    }
+    out += text.slice(cursor, from) + '***';
+    cursor = to;
+    [from, to] = [s, e];
+  }
+  return out + text.slice(cursor, from) + '***' + text.slice(to);
 }
 
 /**
@@ -201,6 +311,19 @@ export function redact(text: string, job: HostJob): string {
  * подменяемая зависимость, и единственная неперехваченная ошибка из неё
  * поднялась бы через tick в цикл и убила процесс агента. Снаружи это выглядит
  * как «продукты перестали заводиться», а в карточке — как истёкший срок.
+ *
+ * ## Чего эта страховка НЕ ловит
+ *
+ * «Доставлено» здесь означает «сервер ответил 2xx», а не «отчёт что-то
+ * изменил». Маршрут отвечает `{ ok: true }` и на ХОЛОСТОЙ отчёт: completeJob
+ * закрывает задание условием `AND status='running'`, и по заданию, которое уже
+ * снял реаппер, запись не делается вовсе — там лишь строка в лог сервера.
+ * Значит в самом неприятном сценарии (провижининг затянулся, задание закрыто по
+ * сроку, контейнер жив, продукт похоронен) агент считает отчёт доставленным и
+ * предупреждение про сверку хоста руками НЕ печатает. Изнутри агента это
+ * неисправимо: ответ сервера одинаков в обоих случаях. Закрывается только на
+ * стороне сервера — отдельным ответом на холостой отчёт; до тех пор страховка
+ * покрывает обрыв связи, но не опоздание.
  */
 export async function deliver(job: HostJob, report: JobReport, deps: HostDeps): Promise<boolean> {
   const wait = deps.sleep ?? sleep;
@@ -260,34 +383,68 @@ export async function loop(deps: HostDeps, keepGoing: () => boolean = () => true
  * на ПРОД с тестовым токеном раннера: контейнер живой, /health зелёный, домен
  * отвечает, а ходы не доезжают — отказ, который видно только по тому, что
  * продукт молчит.
+ *
+ * Фаза МАСКИРУЕТСЯ перед журналом. Хостовые шаги зовут `phase` в том числе с
+ * `e.message` от execFile («провижининг отменён, на хосте чисто: Command
+ * failed: docker run … -e CLAUDE_CODE_OAUTH_TOKEN=…»), то есть ровно с той
+ * строкой, которую для СЕРВЕРА чистит redact. Без маски заявление «в журнал —
+ * только слаг, форма и id» верно лишь на пути, где провижининг не отказал, а
+ * журнал хоста читается шире, чем карточка продукта.
+ *
+ * `job` необязателен: без него работает только правило про `-e ИМЯ=`, и этого
+ * достаточно, чтобы закрыть наш общий токен Claude. Со `job` закрываются и
+ * значения клиента, которые в argv не попали.
  */
 export function provisionOverrides(
   config: HostConfig,
   log: (message: string) => void = console.log,
+  job?: RedactSource,
 ): Partial<ProvisionDeps> {
   return {
     linkeonUrl: config.linkeonUrl,
-    onPhase: (message: string) => log(`[host] ${message}`),
+    onPhase: (message: string) => log(`[host] ${redact(message, job)}`),
   };
 }
 
-/** Боевая сборка зависимостей. В черновике плана её не было вовсе. */
-export function realDeps(config: HostConfig): HostDeps {
-  const log = (message: string) => console.log(message);
+/**
+ * Боевая сборка зависимостей. В черновике плана её не было вовсе.
+ *
+ * Части подменяемы не ради гибкости, а ради проверяемости: без этого
+ * единственное, что можно было утверждать о боевой сборке, — «это функция».
+ * Выброшенный отсюда `provisionOverrides` не краснел ничем, хотя его пропажа
+ * означает продукты тестового стенда, уехавшие за работой на прод.
+ */
+export interface RealDepsParts {
+  log?: (message: string) => void;
+  provision?: (job: HostJob, deps: ProvisionDeps) => Promise<{ port?: number }>;
+  buildDeps?: (overrides: Partial<ProvisionDeps>) => ProvisionDeps;
+}
+
+export function realDeps(config: HostConfig, parts: RealDepsParts = {}): HostDeps {
+  const log = parts.log ?? ((message: string) => console.log(message));
+  const run = parts.provision ?? provisionReal;
+  const build = parts.buildDeps ?? hostDeps;
   return {
     config,
     api: new HostApi(config),
-    provision: (job: HostJob) => provisionReal(job, hostDeps(provisionOverrides(config, log))),
+    // `job` уходит в маску фаз: у каждого задания свои секреты, и знать их
+    // может только этот вызов.
+    provision: (job: HostJob) =>
+      run(job, build(provisionOverrides(config, log, job))),
     log,
   };
 }
 
-export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> {
+export async function main(
+  env: NodeJS.ProcessEnv = process.env,
+  build: (config: HostConfig) => HostDeps = realDeps,
+  run: (deps: HostDeps) => Promise<void> = (deps) => loop(deps),
+): Promise<void> {
   const config = loadConfig(env);
   console.log(
     `[host] старт агента, Linkeon ${config.linkeonUrl}, опрос раз в ${config.pollIntervalMs} мс`,
   );
-  await loop(realDeps(config));
+  await run(build(config));
 }
 
 // Запускаем только когда файл исполняется напрямую: при импорте из теста

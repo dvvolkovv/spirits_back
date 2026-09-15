@@ -2,7 +2,17 @@ import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { AddressInfo } from 'net';
 import { HostApi, HostJob, JobReport, PollOutcome } from './api';
 import { DEFAULT_POLL_TIMEOUT_MS, HostConfig, loadConfig } from './config';
-import { HostDeps, deliver, loop, provisionOverrides, realDeps, redact, tick } from './index';
+import {
+  HostDeps,
+  deliver,
+  loop,
+  main,
+  provisionOverrides,
+  realDeps,
+  redact,
+  tick,
+} from './index';
+import { ProvisionDeps, hostDeps } from './provision';
 
 const JOB: HostJob = {
   jobId: 'j-1',
@@ -272,6 +282,28 @@ describe('HostApi против настоящего HTTP', () => {
     );
   });
 
+  it(
+    'отчёт живёт по своему сроку, а не по сроку опроса',
+    async () => {
+      // Сроки разные не случайно: опрос повторяется каждые три секунды и его
+      // потеря дёшева, а отчёт держит задание. Отчёт, унаследовавший срок
+      // опроса, на молчащем сервере задержал бы агента вшестеро дольше
+      // собственного бюджета досылки.
+      await withServer(
+        () => {
+          /* ответа не будет вовсе */
+        },
+        async (api) => {
+          const started = Date.now();
+          await expect(api.complete('j-1', { ok: true, port: 8003 })).resolves.toBe(false);
+          expect(Date.now() - started).toBeLessThan(1000);
+        },
+        { requestTimeoutMs: 150, pollTimeoutMs: 60_000 },
+      );
+    },
+    3000,
+  );
+
   it('отчёт: id задания не уводит POST на чужой маршрут', async () => {
     await withServer(
       (_req, res) => reply(res, 201, JSON.stringify({ ok: true })),
@@ -294,6 +326,14 @@ describe('loadConfig агента хоста', () => {
     // Иначе агент уходит в вечный 401, а снаружи это выглядит как «кнопка
     // Новый продукт не работает».
     expect(() => loadConfig({ LINKEON_URL: 'https://x' })).toThrow(/HOST_TOKEN/);
+  });
+
+  it('пустая переменная — это «не задана», а не «задана пустой»', () => {
+    // `HOST_TOKEN=` в env-файле — самый частый вид «задал, но не задал».
+    // Пропущенный сюда, он даёт вечный 401: HostGuard отвергает пустой токен
+    // молча.
+    expect(() => loadConfig({ ...base, HOST_TOKEN: '' })).toThrow(/HOST_TOKEN/);
+    expect(() => loadConfig({ ...base, LINKEON_URL: '' })).toThrow(/LINKEON_URL/);
   });
 
   it('хвостовой слеш срезается', () => {
@@ -379,6 +419,19 @@ describe('tick агента хоста', () => {
     const report = lastReport(complete);
     expect(report.ok).toBe(false);
     expect(report.ok === false && report.error).toContain('нет места на диске');
+  });
+
+  it('отказ без сообщения не уезжает пустой причиной', async () => {
+    // Сервер на пустую причину пишет в карточку «без причины», и владелец
+    // видит отказ без единого слова о том, что случилось.
+    const { deps, poll, provision, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: JOB });
+    provision.mockRejectedValue(new Error('   '));
+
+    await tick(deps);
+
+    const report = lastReport(complete);
+    expect(report.ok === false && report.error).toBe('провижининг отказал без сообщения');
   });
 
   it('остатки на хосте уезжают в отчёт и стоят ПЕРЕД сообщением', async () => {
@@ -562,6 +615,42 @@ describe('deliver', () => {
 });
 
 describe('redact', () => {
+  it('значение секрета, подобранное клиентом, не снимает маску с нашего токена', () => {
+    // Значение секрета не проверяется ничем, кроме нулевого байта, и приезжает
+    // от клиента через кабинет. Секрет со значением, равным префиксу НАШЕГО
+    // аргумента, вырезался бы у обоих вхождений — и правилу про `-e ИМЯ=`
+    // после этого нечего было бы сопоставлять. Оба правила смотрят в исходный
+    // текст, поэтому подменять больше нечего.
+    const oauth = 'sk-ant-oat01-НАСТОЯЩИЙ';
+    const evil = '-e CLAUDE_CODE_OAUTH_TOKEN=';
+
+    const out = redact(
+      `Command failed: docker run -e EVIL=${evil} -e CLAUDE_CODE_OAUTH_TOKEN=${oauth} image`,
+      { ...JOB, secrets: { EVIL: evil } },
+    );
+
+    expect(out).not.toContain(oauth);
+  });
+
+  it('значение с пробелами маскируется целиком, а не до первого пробела', () => {
+    // Правило про `-e ИМЯ=` режет по \S*. Порога длины у второго правила
+    // больше нет: раньше семисимвольное значение маскировалось на одну восьмую.
+    const secret = 'a b c d';
+
+    const out = redact(`Command failed: docker run -e K=${secret} image`, {
+      ...JOB,
+      secrets: { K: secret },
+    });
+
+    expect(out).not.toContain('b c d');
+  });
+
+  it('соседние отрезки склеиваются, а не множат звёздочки', () => {
+    const out = redact('run -e A=xyz image', { ...JOB, secrets: { A: 'xyz' } });
+
+    expect(out).toBe('run -e A=*** image');
+  });
+
   it('вырезает многострочное значение секрета целиком', () => {
     // -e ИМЯ=… обрезается по пробелу, а приватный ключ многострочный: второе
     // правило (известные значения) закрывает то, что не берёт первое.
@@ -635,20 +724,164 @@ describe('цикл', () => {
 });
 
 describe('боевые зависимости', () => {
-  it('продукты уезжают за работой в тот же Linkeon, что опрашивает агент', () => {
+  /** Собирает realDeps с подменёнными частями и ловит то, с чем позвали provision. */
+  function spyRealDeps(job: HostJob = JOB) {
+    const logs: string[] = [];
+    let captured: ProvisionDeps | undefined;
+    const deps = realDeps(CONFIG, {
+      log: (m) => logs.push(m),
+      buildDeps: (overrides) => overrides as ProvisionDeps,
+      provision: async (_job, d) => {
+        captured = d;
+        return { port: 8003 };
+      },
+    });
+    return { deps, logs, run: () => deps.provision(job), got: () => captured! };
+  }
+
+  it('продукты уезжают за работой в тот же Linkeon, что опрашивает агент', async () => {
     // Умолчание в provision.ts — https://my.linkeon.io. Без проброса агент на
     // тестовом стенде поднимал бы продукты, ходящие за задачами на ПРОД:
     // контейнер живой, health зелёный, ходы не доезжают.
-    expect(provisionOverrides(CONFIG).linkeonUrl).toBe(CONFIG.linkeonUrl);
+    //
+    // Проверяется на ТОЙ сборке, которая уходит в прод, а не на самом объекте
+    // настроек: выброшенный из realDeps provisionOverrides не краснел ничем.
+    const h = spyRealDeps();
+
+    await h.run();
+
+    expect(h.got().linkeonUrl).toBe(CONFIG.linkeonUrl);
   });
 
-  it('realDeps собирается и не зовёт ни docker, ни сеть при сборке', () => {
-    // В черновике realDeps() не был определён нигде — точка входа не
-    // существовала.
-    const deps = realDeps(CONFIG);
+  it('фаза печатается в журнал и печатается с маской', async () => {
+    // provision.ts зовёт phase() в том числе с e.message от execFile — той же
+    // командной строкой, которую для сервера чистит redact. Журнал хоста
+    // читается шире, чем карточка продукта.
+    const oauth = 'sk-ant-oat01-живойтокен';
+    const secret = 'секрет-клиента-целиком';
+    const h = spyRealDeps({ ...JOB, secrets: { BOT_TOKEN: secret } });
 
-    expect(deps.config).toBe(CONFIG);
-    expect(typeof deps.api.poll).toBe('function');
-    expect(typeof deps.provision).toBe('function');
+    await h.run();
+    h.got().onPhase!(
+      `провижининг отменён: Command failed: docker run -e CLAUDE_CODE_OAUTH_TOKEN=${oauth} `
+        + `-v /tmp:/product image, секрет ${secret}`,
+    );
+
+    const journal = h.logs.join('\n');
+    expect(journal).not.toContain(oauth);
+    expect(journal).not.toContain(secret);
+    // Но сама фаза в журнал попадает: маска не должна превращаться в тишину.
+    expect(journal).toContain('провижининг отменён');
+    expect(journal).toContain('/tmp:/product');
   });
+
+  it('main запускает цикл на боевых зависимостях', () => {
+    // Иначе точка входа стартует, печатает строку про старт и молча выходит:
+    // systemd видит успешное завершение, юнит остановлен, продукты не
+    // заводятся.
+    const started: HostDeps[] = [];
+    const built: HostConfig[] = [];
+
+    return main(
+      { LINKEON_URL: 'https://test.linkeon.io/', HOST_TOKEN: 'x'.repeat(64) },
+      (config) => {
+        built.push(config);
+        return makeDeps().deps;
+      },
+      async (deps) => {
+        started.push(deps);
+      },
+    ).then(() => {
+      expect(built).toHaveLength(1);
+      expect(built[0].linkeonUrl).toBe('https://test.linkeon.io');
+      expect(started).toHaveLength(1);
+    });
+  });
+});
+
+describe('сроки развёртывания', () => {
+  it('зависший провижининг заканчивается отказом, а не вечным ожиданием', async () => {
+    // Своего срока у provision не было вовсе: заклинивший docker run вешал
+    // единственного агента машины навсегда — сервер хоронит задание через 10
+    // минут, владелец жмёт «повторить», новое задание не забирает никто.
+    const { deps, poll, provision, complete } = makeDeps({ provisionTimeoutMs: 50 });
+    poll.mockResolvedValue({ ok: true, job: JOB });
+    provision.mockImplementation(() => new Promise<{ port?: number }>(() => {}));
+
+    await expect(tick(deps)).resolves.toBeUndefined();
+
+    const report = lastReport(complete);
+    expect(report.ok).toBe(false);
+    // Отменить по этому сроку нечего, и отчёт обязан сказать это прямо: иначе
+    // «сорвалось» читается как «на хосте чисто», а слаг и порт заняты.
+    expect(report.ok === false && report.error).toContain('НЕИЗВЕСТНО');
+  });
+
+  it('отказ, пришедший после истечения срока, не роняет агента', async () => {
+    // Промис провижининга остаётся в полёте: его позднее падение без
+    // обработчика убило бы процесс (Node >= 15) — то есть срок, поставленный
+    // ради живучести, сам бы её и рушил.
+    const { deps, poll, provision } = makeDeps({ provisionTimeoutMs: 20 });
+    poll.mockResolvedValue({ ok: true, job: JOB });
+    let boom: (e: Error) => void = () => {};
+    provision.mockImplementation(
+      () => new Promise<{ port?: number }>((_, reject) => {
+        boom = reject;
+      }),
+    );
+
+    const unhandled: unknown[] = [];
+    const listener = (e: unknown) => unhandled.push(e);
+    process.on('unhandledRejection', listener);
+    try {
+      await tick(deps);
+      boom(new Error('docker наконец отвалился'));
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', listener);
+    }
+  });
+
+  it('конфиг без срока получает умолчание, а не мгновенный срок', async () => {
+    // `deps.config.provisionTimeoutMs!` вместо `?? DEFAULT` выглядит невинно и
+    // означает setTimeout(undefined) — то есть ноль: КАЖДОЕ развёртывание
+    // отказывает по сроку, не начавшись.
+    const { deps, poll, provision, complete } = makeDeps();
+    expect(deps.config.provisionTimeoutMs).toBeUndefined();
+    poll.mockResolvedValue({ ok: true, job: JOB });
+    provision.mockImplementation(
+      () => new Promise<{ port?: number }>((resolve) => setTimeout(() => resolve({ port: 8003 }), 30)),
+    );
+
+    await tick(deps);
+
+    expect(lastReport(complete)).toEqual({ ok: true, port: 8003 });
+  });
+
+  it('уложившийся провижининг не оставляет за собой таймер', async () => {
+    // Восьмиминутный таймер на каждый оборот — процесс, не завершающийся по
+    // SIGTERM, и прогон jest, который не выходит. Считаются живые таймеры, а
+    // не вызовы clearTimeout: вызов мог быть и не тот.
+    jest.useFakeTimers();
+    try {
+      const { deps, poll } = makeDeps();
+      poll.mockResolvedValue({ ok: true, job: JOB });
+
+      await tick(deps);
+
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('заклинивший шаг снимается по сроку самим hostDeps.run', async () => {
+    // Первая линия срока: снятый шаг — обычный отказ шага, его ловит catch в
+    // provision, и хост подчищается как при любом другом отказе.
+    const deps = hostDeps({ runTimeoutMs: 200 });
+
+    await expect(deps.run(['sleep', '10'])).rejects.toThrow(/сроку/);
+  }, 5000);
 });
