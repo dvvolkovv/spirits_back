@@ -1,3 +1,4 @@
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { ProvisioningService } from './provisioning.service';
 import { SecretsService } from './secrets.service';
@@ -657,5 +658,146 @@ describe('completeJob: повторный отчёт по уже закрыто�
 
       expect(jobPart(calls)).toMatch(/AND\s+status\s*=\s*'running'/);
     }
+  });
+});
+
+/**
+ * ПОВТОР ЗАВЕДЕНИЯ — третий и последний писатель очереди заданий.
+ *
+ * Свой набор моков, а не общий makeService: там ответ выбирается по подстроке
+ * "SET status = 'running'", которой у повтора нет, и общий мок отдавал бы
+ * пустой результат на любой запрос — то есть все успешные сценарии ниже
+ * молча превращались бы в «продукт не найден».
+ */
+function makeRetry(over: { rows?: any[]; fail?: any } = {}) {
+  const calls: { sql: string; params: any[] }[] = [];
+  const pg = {
+    query: jest.fn(async (sql: string, params: any[] = []) => {
+      calls.push({ sql, params });
+      if (over.fail) throw over.fail;
+      const rows = over.rows ?? [{ product_id: 'p-1' }];
+      return { rows, rowCount: rows.length };
+    }),
+  };
+  return { svc: new ProvisioningService(pg as any, { decrypt: jest.fn() } as any), calls };
+}
+
+const pgError = (code: string, constraint?: string) =>
+  Object.assign(new Error('duplicate key value violates unique constraint'), { code, constraint });
+
+describe('ProvisioningService.retry', () => {
+  it('переводит продукт обратно в заведение и ставит задание ОДНИМ оператором', async () => {
+    const { svc, calls } = makeRetry();
+
+    await svc.retry('p-1', 'u-1');
+
+    // Счёт запросов — главное утверждение этого файла про повтор. Двумя
+    // операторами на пуле (транзакции нет: BEGIN через пул в этом
+    // репозитории уже рапортовал об откате, которого не было) смерть
+    // процесса между ними оставляет продукт в provisioning БЕЗ задания: он
+    // ждёт десять минут второй ветки таймаута и получает формулировку
+    // «задание закрыто, продукт не ожил» — неверную, раннер тут ни при чём.
+    expect(calls).toHaveLength(1);
+    const { sql, params } = calls[0];
+    // Порядок частей: сначала правка продукта в CTE, потом вставка задания
+    // ИЗ НЕЁ. Обратный порядок означал бы задание, поставленное продукту,
+    // которого правка не коснулась.
+    const u = sql.indexOf('UPDATE products');
+    const i = sql.indexOf('INSERT INTO product_provision_jobs');
+    expect(u).toBeGreaterThanOrEqual(0);
+    expect(i).toBeGreaterThan(u);
+    // Вставка кормится из CTE, а не из параметра: `VALUES ($1, 'queued')`
+    // рядом с UPDATE в CTE поставил бы задание даже тогда, когда правка
+    // продукта не нашла строки (чужой продукт, не в отказе, архивный) — и
+    // единственной защитой остался бы разбор пустого RETURNING уже после
+    // записи.
+    expect(sql.slice(i)).toMatch(/SELECT[\s\S]*FROM\s+resumed/);
+    expect(sql.slice(i)).not.toMatch(/VALUES\s*\(\s*\$/);
+    expect(sql).toMatch(/SET\s+status\s*=\s*'provisioning'/);
+    expect(params).toEqual(['p-1', 'u-1']);
+  });
+
+  it('чужой продукт не перезаводится', async () => {
+    const { svc, calls } = makeRetry();
+
+    await svc.retry('p-1', 'u-1');
+
+    // Владелец в WHERE, а не в проверке после выборки: разница между «нет
+    // такого» и «есть, но не твой» — это утечка существования чужих
+    // продуктов. Мок игнорирует sql и всегда отдаёт заданный rows, поэтому
+    // утверждение о параметрах фиксирует форму вызова, а не участие
+    // параметра в фильтрации: убери `AND user_id = $2`, оставив параметр, —
+    // и проверка params останется зелёной.
+    expect(calls[0].sql).toMatch(/user_id\s*=\s*\$2/);
+    expect(calls[0].params[1]).toBe('u-1');
+  });
+
+  it('повтор доступен только после отказа и только неархивному продукту', async () => {
+    const { svc, calls } = makeRetry();
+
+    await svc.retry('p-1', 'u-1');
+
+    // Без сверки состояния кнопка отправляла бы на повтор РАБОТАЮЩИЙ продукт:
+    // status уезжает в provisioning, ходы перестают выдаваться (claimNext
+    // отбирает только по running), а сайт при этом жив и отвечает.
+    expect(calls[0].sql).toMatch(/status\s*=\s*'failed'/);
+    expect(calls[0].sql).toMatch(/archived_at\s+IS\s+NULL/);
+  });
+
+  it('причина прошлого отказа переживает повтор', async () => {
+    const { svc, calls } = makeRetry();
+
+    await svc.retry('p-1', 'u-1');
+
+    // provision_error по замыслу не очищается автоматически (см.
+    // 002_provisioning.sql): пока новая попытка не закончилась, единственное,
+    // что известно о продукте, — почему сорвалась прошлая. Чистит его
+    // promoteReady при удачном переводе, перезаписывают completeJob и таймаут.
+    expect(calls[0].sql).not.toMatch(/provision_error\s*=\s*NULL/);
+  });
+
+  it('продукта нет, он чужой или не в отказе — 404, а не тихий успех', async () => {
+    const { svc } = makeRetry({ rows: [] });
+
+    await expect(svc.retry('p-1', 'u-1')).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('двойное нажатие даёт 409, а не 500', async () => {
+    const { svc } = makeRetry({ fail: pgError('23505', 'product_provision_jobs_one_active') });
+
+    // Частичный уникальный индекс one_active — это «заведение уже идёт», а не
+    // поломка. Наружу 500 означал бы страницу ошибки на втором клике.
+    const e = await svc
+      .retry('p-1', 'u-1')
+      .then(() => null)
+      .catch((err: any) => err);
+    expect(e).toBeInstanceOf(ConflictException);
+    expect(e.getStatus()).toBe(409);
+  });
+
+  it('чужое нарушение UNIQUE за «уже идёт» не выдаётся', async () => {
+    // Условие узкое, как в create: безусловный ConflictException превратил бы
+    // нарушение любого другого ограничения в спокойное «заведение уже идёт»
+    // без следа в логах. Имена ограничений сняты с живой базы.
+    const { svc } = makeRetry({ fail: pgError('23505', 'products_slug_key') });
+
+    const e = await svc
+      .retry('p-1', 'u-1')
+      .then(() => null)
+      .catch((err: any) => err);
+    expect(e).not.toBeInstanceOf(ConflictException);
+    expect(e.constraint).toBe('products_slug_key');
+  });
+
+  it('падение базы наружу не маскируется', async () => {
+    const { svc } = makeRetry({ fail: pgError('42P01') });
+
+    const e = await svc
+      .retry('p-1', 'u-1')
+      .then(() => null)
+      .catch((err: any) => err);
+    expect(e).not.toBeInstanceOf(ConflictException);
+    expect(e).not.toBeInstanceOf(NotFoundException);
+    expect(e.code).toBe('42P01');
   });
 });

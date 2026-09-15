@@ -5,6 +5,8 @@ import { CurrentUser } from '../common/decorators/user.decorator';
 import { ProductsService } from './products.service';
 import { TurnsService } from './turns.service';
 import { TurnEventsService } from './turn-events.service';
+import { ProvisioningService } from './provisioning.service';
+import { CreateProductDto } from './products.dto';
 
 @Controller('')
 @UseGuards(JwtGuard)
@@ -15,11 +17,43 @@ export class ProductsController {
     private readonly products: ProductsService,
     private readonly turns: TurnsService,
     private readonly turnEvents: TurnEventsService,
+    private readonly provisioning: ProvisioningService,
   ) {}
 
   @Get('products')
   async list(@CurrentUser() user: any, @Res() res: Response) {
     return res.status(200).json(await this.products.list(user.userId));
+  }
+
+  /**
+   * Кнопка «Новый продукт». Поля перечисляются ЯВНО, по той же причине, что и
+   * в chat(): ValidationPipe стоит с `whitelist: false`, лишнее из тела не
+   * срезается, и спред отдал бы любому авторизованному пользователю право
+   * завести продукт на чужой `userId`.
+   */
+  @Post('products')
+  async create(@CurrentUser() user: any, @Body() body: CreateProductDto) {
+    const r = await this.provisioning.create({
+      userId: user.userId,
+      name: body.name,
+      slug: body.slug,
+      kind: body.kind,
+      secrets: body.secrets ?? {},
+    });
+    // Наружу только id. Открытый токен раннера — ключ от чекаута продукта, он
+    // нужен агенту хоста, а не браузеру; `return r` отправил бы его в ответ и
+    // в логи прокси.
+    return { id: r.productId };
+  }
+
+  /**
+   * Кнопка «повторить» на карточке сорванного заведения. Владение и состояние
+   * проверяет сам сервис — одним оператором вместе с постановкой задания.
+   */
+  @Post('products/:id/retry')
+  async retry(@CurrentUser() user: any, @Param('id') id: string) {
+    await this.provisioning.retry(id, user.userId);
+    return { ok: true };
   }
 
   @Get('products/:id/turns')

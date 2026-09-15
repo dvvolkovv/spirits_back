@@ -1,4 +1,4 @@
-import { ConflictException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -997,5 +997,126 @@ maybe('провижининг против живого Postgres', () => {
     expect(e).not.toBeInstanceOf(ConflictException);
     expect(e.code).toBe('23505');
     expect(e.constraint).toBe('products_runner_token_hash_key');
+  });
+  // ═══════════════════════════ retry ═══════════════════════════
+
+  /** Сорванное заведение: продукт в failed с причиной и закрытым заданием. */
+  async function failedProduct(o: { slug?: string; reason?: string } = {}) {
+    const p = await product({ slug: o.slug ?? `failed-${seq++}`, status: 'failed' });
+    await pool.query('UPDATE products SET provision_error = $2 WHERE id = $1', [
+      p.id,
+      o.reason ?? 'срок заведения истёк (10 мин)',
+    ]);
+    await job(p.id, { status: 'failed', startedAgo: '20 minutes', finishedAgo: '10 minutes' });
+    return p;
+  }
+
+  const jobsOf = async (productId: string) =>
+    (
+      await pool.query(
+        'SELECT status FROM product_provision_jobs WHERE product_id = $1 ORDER BY created_at',
+        [productId],
+      )
+    ).rows.map((r: any) => r.status);
+
+  it('19а. повтор возвращает продукт в очередь, и задание сразу выдаётся агенту', async () => {
+    const other = await bystander();
+    const p = await failedProduct({ slug: 'retry-ok', reason: 'контейнер не собрался' });
+
+    await makeSvc().retry(p.id, 'u-1');
+
+    const row = await getProduct(p.id);
+    expect(row.status).toBe('provisioning');
+    // Причина прошлого отказа переживает повтор — см. 002_provisioning.sql.
+    // Чистит её promoteReady при удачном переводе, и только он.
+    expect(row.provision_error).toBe('контейнер не собрался');
+    // Старое задание осталось закрытым, новое встало в очередь.
+    expect(await jobsOf(p.id)).toEqual(['failed', 'queued']);
+
+    // Смычка со всем остальным конвейером: заведение, до которого агент не
+    // добирается, — это кнопка без последствий. Ровно тот тупик, из-за
+    // которого promoteReady проверяет отсутствие активного задания.
+    const claimed = await makeSvc().claimJob();
+    expect(claimed!.productId).toBe(p.id);
+    await expectUntouched(other);
+  });
+
+  it('19б. чужой продукт не перезаводится', async () => {
+    const p = await failedProduct({ slug: 'retry-alien' });
+    const before = await getProduct(p.id);
+
+    await expect(makeSvc().retry(p.id, 'u-чужой')).rejects.toBeInstanceOf(NotFoundException);
+
+    // Ни строки продукта, ни задания: снятое `user_id = $2` дало бы чужому
+    // пользователю право гонять заведение на чужом продукте.
+    expect(await getProduct(p.id)).toEqual(before);
+    expect(await jobsOf(p.id)).toEqual(['failed']);
+  });
+
+  it('19в. повтор не трогает продукт, который не в отказе', async () => {
+    // Работающий сайт, отправленный на повтор, перестаёт получать ходы
+    // (claimNext отбирает только по running) — а снаружи он жив и отвечает.
+    for (const status of ['running', 'provisioning', 'stopped']) {
+      const p = await product({ slug: `retry-${status}-${seq++}`, status });
+      const before = await getProduct(p.id);
+
+      await expect(makeSvc().retry(p.id, 'u-1')).rejects.toBeInstanceOf(NotFoundException);
+
+      expect(await getProduct(p.id)).toEqual(before);
+      expect(await jobsOf(p.id)).toEqual([]);
+    }
+  });
+
+  it('19г. архивный продукт из отказа не воскрешается', async () => {
+    const p = await failedProduct({ slug: 'retry-archived' });
+    await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [p.id]);
+    const before = await getProduct(p.id);
+
+    await expect(makeSvc().retry(p.id, 'u-1')).rejects.toBeInstanceOf(NotFoundException);
+
+    expect(await getProduct(p.id)).toEqual(before);
+    expect(await jobsOf(p.id)).toEqual(['failed']);
+  });
+
+  it('19д. конфликт по активному заданию НЕ оставляет продукт в provisioning', async () => {
+    // Главный сторож формы «один оператор». Двумя запросами на пуле
+    // (транзакции нет) UPDATE проходит, INSERT падает на частичном индексе —
+    // и продукт остаётся в provisioning БЕЗ активного задания... точнее, с
+    // чужим активным, которое ему уже не поможет: promoteReady ждёт закрытия
+    // задания, claimJob требует provisioning, а кнопка «повторить» мертва,
+    // потому что статус больше не failed. Одним оператором откатывается всё.
+    const p = await failedProduct({ slug: 'retry-conflict' });
+    await job(p.id, { status: 'running', startedAgo: '1 minute' });
+    const before = await getProduct(p.id);
+
+    const e = await makeSvc()
+      .retry(p.id, 'u-1')
+      .then(() => null)
+      .catch((err: any) => err);
+
+    expect(e).toBeInstanceOf(ConflictException);
+    expect(e.getStatus()).toBe(409);
+    expect(await getProduct(p.id)).toEqual(before);
+    expect(await jobsOf(p.id)).toEqual(['failed', 'running']);
+  });
+
+  it('19е. два ОДНОВРЕМЕННЫХ повтора дают ровно одно задание', async () => {
+    // Двойной клик по кнопке. Единственное требование — не два развёртывания
+    // в один каталог; каким именно отказом отбивается проигравший, значения
+    // не имеет, поэтому здесь сверяется состояние базы, а не код ответа.
+    const p = await failedProduct({ slug: 'retry-double' });
+
+    const outcomes = await Promise.all(
+      [makeSvc(), makeSvc()].map((svc) =>
+        svc
+          .retry(p.id, 'u-1')
+          .then(() => 'ok')
+          .catch((e: any) => e.constructor.name),
+      ),
+    );
+
+    expect(outcomes.filter((o) => o === 'ok')).toHaveLength(1);
+    expect(await jobsOf(p.id)).toEqual(['failed', 'queued']);
+    expect((await getProduct(p.id)).status).toBe('provisioning');
   });
 });

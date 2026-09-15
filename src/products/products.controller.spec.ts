@@ -1,4 +1,4 @@
-import { NotFoundException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import { ProductsController } from './products.controller';
 
 function makeRes() {
@@ -43,11 +43,19 @@ function makeController(events: any[]) {
       for (const e of events) yield e;
     }),
   };
+  // create отдаёт НЕ только productId намеренно: заведение выпускает больше,
+  // чем показывает, и маршрут обязан отбирать. Сегодня лишнего здесь нет, но
+  // тест обязан краснеть на `return r`, а не ждать, пока лишнее появится.
+  const provisioning = {
+    create: jest.fn(async () => ({ productId: 'p-новый', runnerToken: 'ТОКЕН-РАННЕРА' })),
+    retry: jest.fn(async () => undefined),
+  };
   return {
-    ctrl: new ProductsController(products as any, turns as any, turnEvents as any),
+    ctrl: new ProductsController(products as any, turns as any, turnEvents as any, provisioning as any),
     products,
     turns,
     turnEvents,
+    provisioning,
   };
 }
 
@@ -202,6 +210,101 @@ describe('ProductsController.revert', () => {
 
     expect(products.getOwned).toHaveBeenCalledWith('p-1', 'u-1');
     expect(turns.revert).toHaveBeenCalledWith({ productId: 'p-1', turnId: 't-1', userId: 'u-1' });
+  });
+});
+
+describe('ProductsController.create', () => {
+  it('заводит продукт от имени владельца токена', async () => {
+    const { ctrl, provisioning } = makeController([]);
+
+    await ctrl.create(user, {
+      name: 'Селянська',
+      slug: 'selyanska',
+      kind: 'site',
+      secrets: { BOT_TOKEN: '123:abc' },
+    } as any);
+
+    expect(provisioning.create).toHaveBeenCalledWith({
+      userId: 'u-1',
+      name: 'Селянська',
+      slug: 'selyanska',
+      kind: 'site',
+      secrets: { BOT_TOKEN: '123:abc' },
+    });
+  });
+
+  it('владелец берётся из токена, а не из тела', async () => {
+    // ValidationPipe стоит с whitelist: false, поэтому userId из тела доезжает
+    // до маршрута. Спред тела в create() отдал бы любому авторизованному
+    // пользователю право заводить продукты на чужой аккаунт — вместе с
+    // расходом его токенов и чужим слагом в публичной зоне.
+    const { ctrl, provisioning } = makeController([]);
+
+    await ctrl.create(user, {
+      name: 'Селянська',
+      slug: 'selyanska',
+      kind: 'site',
+      userId: 'u-чужой',
+    } as any);
+
+    expect(provisioning.create).toHaveBeenCalledWith(expect.objectContaining({ userId: 'u-1' }));
+  });
+
+  it('продукт без секретов заводится с пустым набором, а не с undefined', async () => {
+    // create перебирает Object.entries(secrets) и решает по длине, звать ли
+    // шифрование. undefined там разбирается только потому, что внутри стоит
+    // свой `?? {}` — маршрут не должен на это опираться.
+    const { ctrl, provisioning } = makeController([]);
+
+    await ctrl.create(user, { name: 'Сайт', slug: 'site-1', kind: 'site' } as any);
+
+    expect(provisioning.create).toHaveBeenCalledWith(expect.objectContaining({ secrets: {} }));
+  });
+
+  it('токен раннера в браузер не уезжает', async () => {
+    // Открытый токен раннера — ключ от чекаута продукта. Он нужен агенту
+    // хоста, а не браузеру: `return r` отдал бы его в ответе и в логи прокси.
+    const { ctrl } = makeController([]);
+
+    const res = await ctrl.create(user, { name: 'Сайт', slug: 'site-1', kind: 'site' } as any);
+
+    expect(res).toEqual({ id: 'p-новый' });
+    // Не только «поле не то»: ключ мог бы приехать под другим именем или
+    // вложенным.
+    expect(JSON.stringify(res)).not.toContain('ТОКЕН-РАННЕРА');
+    expect(Object.keys(res)).toEqual(['id']);
+  });
+
+  it('отказ заведения долетает до клиента, а не превращается в успех', async () => {
+    const { ctrl, provisioning } = makeController([]);
+    provisioning.create.mockRejectedValue(new ConflictException('слаг уже занят'));
+
+    await expect(
+      ctrl.create(user, { name: 'Сайт', slug: 'занят', kind: 'site' } as any),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+});
+
+describe('ProductsController.retry', () => {
+  it('повторяет заведение своего продукта', async () => {
+    const { ctrl, provisioning } = makeController([]);
+
+    const res = await ctrl.retry(user, 'p-1');
+
+    // Оба аргумента точно: владелец — второй, и подмена его местами с id
+    // прошла бы зелёной на любой проверке вида toHaveBeenCalled().
+    expect(provisioning.retry).toHaveBeenCalledWith('p-1', 'u-1');
+    expect(res).toEqual({ ok: true });
+  });
+
+  it('отказ повтора не превращается в ok: true', async () => {
+    // Чужой продукт и продукт не в состоянии отказа сервис отбивает
+    // NotFound-ом; проглоченный маршрутом, он стал бы «повторяем» на кнопке,
+    // после которой ничего не происходит.
+    const { ctrl, provisioning } = makeController([]);
+    provisioning.retry.mockRejectedValue(new NotFoundException('продукт не найден'));
+
+    await expect(ctrl.retry(user, 'p-чужой')).rejects.toBeInstanceOf(NotFoundException);
   });
 });
 
