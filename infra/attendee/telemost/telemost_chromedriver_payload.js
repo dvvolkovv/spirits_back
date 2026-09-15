@@ -141,54 +141,63 @@ class TelemostAudioMixer {
 /**
  * Состав участников.
  *
- * Телемост не даёт нам своего API, поэтому читаем список со страницы. Опрос
- * раз в две секунды: событий об уходе у нас нет, а держать правила выхода на
- * чём-то надо. Личности берём по видимому имени — это приближение, и при двух
- * тёзках они сольются в одного; лучше так, чем не знать состава вовсе.
+ * Имён у Телемоста в разметке НЕТ: плитки участников (`participant-video-
+ * placeholder`) пустые, подписи рисуются поверх видео. Разведка 15.09.2026
+ * это показала — первая редакция читала «всё, что похоже на участника», и
+ * приносила мусор: «Ваше имя на встрече» и склеенное «ГостьРоман · ассистент
+ * пользователя». На таком составе не работают ни гейт по имени, ни правила
+ * выхода.
+ *
+ * Зато есть ЧИСЛО: кнопка `participants-button` показывает количество. По нему
+ * и ведём состав — честно и без выдуманных имён. Люди получают безличные
+ * подписи «Участник N»: разметка говорящего у этой площадки всё равно не
+ * работает (событий речи адаптер не даёт), а числа хватает и правилам выхода,
+ * и гейту, который по числу решает, наедине ли ассистент.
+ *
+ * Себя в счётчике учитываем: бот — тоже участник, и Телемост считает его.
  */
 class TelemostParticipants {
   constructor(ws) {
     this.ws = ws;
-    this.current = new Map();
+    this.count = 0;
   }
 
+  /** Сколько участников показывает площадка, включая нас. Null — не прочиталось. */
   read() {
-    const names = new Set();
-    // Подписи под плитками участников. Берём по атрибуту, а не по классу:
-    // классы у Телемоста собраны сборщиком и меняются от выката к выкату.
-    for (const el of document.querySelectorAll('[data-testid*="participant"], [class*="participant"]')) {
-      const text = (el.innerText || '').trim().split('\n')[0];
-      if (text && text.length < 64) names.add(text);
-    }
-    return names;
+    const btn = document.querySelector('[data-testid="participants-button"]');
+    if (!btn) return null;
+    const m = (btn.innerText || '').match(/\d+/);
+    return m ? Number(m[0]) : null;
+  }
+
+  user(i) {
+    return {
+      deviceId: `telemost-participant-${i}`,
+      displayName: `Участник ${i}`,
+      fullName: `Участник ${i}`,
+      profile: '',
+      status: 'in_meeting',
+      humanized_status: 'in_meeting',
+      isCurrentUser: false,
+    };
   }
 
   tick() {
-    const names = this.read();
-    const seen = new Map();
-    for (const name of names) {
-      const id = `telemost-${name}`;
-      seen.set(id, {
-        deviceId: id,
-        displayName: name,
-        fullName: name,
-        profile: '',
-        status: 'in_meeting',
-        humanized_status: 'in_meeting',
-        isCurrentUser: name === window.telemostInitialData?.displayName,
-      });
-    }
+    const total = this.read();
+    if (total === null) return;
+    // Минус мы сами: мост считает людей, а бот в их число не входит.
+    const humans = Math.max(0, total - 1);
+    if (humans === this.count) return;
 
-    const newUsers = [...seen.values()].filter((u) => !this.current.has(u.deviceId));
-    const removedUsers = [...this.current.values()]
-      .filter((u) => !seen.has(u.deviceId))
-      .map((u) => ({ ...u, status: 'not_in_meeting', humanized_status: 'not_in_meeting' }));
-
-    if (newUsers.length || removedUsers.length) {
-      this.current = seen;
-      this.ws.sendJson({ type: 'UsersUpdate', newUsers, removedUsers, updatedUsers: [] });
-      console.log('[телемост] состав:', [...seen.values()].map((u) => u.displayName).join(', ') || 'пусто');
+    const newUsers = [];
+    const removedUsers = [];
+    for (let i = this.count + 1; i <= humans; i++) newUsers.push(this.user(i));
+    for (let i = humans + 1; i <= this.count; i++) {
+      removedUsers.push({ ...this.user(i), status: 'not_in_meeting', humanized_status: 'not_in_meeting' });
     }
+    this.count = humans;
+    this.ws.sendJson({ type: 'UsersUpdate', newUsers, removedUsers, updatedUsers: [] });
+    console.log('[телемост] людей во встрече:', humans);
   }
 
   start() {
