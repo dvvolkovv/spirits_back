@@ -37,6 +37,7 @@ import {
   meetingInstructions,
   meetingIntro,
   resumeAck,
+  farewell,
   transcriptionPrompt,
 } from './prompts.js';
 
@@ -686,7 +687,15 @@ export default defineAgent({
      * ответ на позапрошлый вопрос звучит невпопад. Именно так это и выглядело
      * в записи — ответ приходил к реплике, которая была минуту назад.
      */
-    const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
+    /**
+ * Сколько ждём, пока ассистент договорит прощание, прежде чем выйти.
+ *
+ * Пять секунд: две коротких фразы укладываются, а держать встречу дольше
+ * из-за собственного прощания нельзя — его уже попросили уйти.
+ */
+const FAREWELL_MS = 5_000;
+
+const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
 
     /**
      * Дать модели ход сейчас или отложить, если она говорит, думает или ещё
@@ -1048,10 +1057,42 @@ export default defineAgent({
         case 'ack_resume':
           replyOrDefer({ instructions: resumeAck() });
           break;
+        case 'leave':
+          leaveByRequest();
+          break;
         case 'silent':
           break;
       }
     });
+
+    /**
+     * Уйти по просьбе с встречи: попрощаться и выйти.
+     *
+     * Прощание обязательно, и не из вежливости: участники должны понять, что
+     * ассистент ушёл, а не замолчал. Разницу между «молчит» и «вышел» на слух
+     * иначе не уловить — на встрече 14.09.2026 люди сорок девять минут были
+     * уверены, что ассистент их не слышит, хотя он был рядом.
+     *
+     * Уходим ПОСЛЕ прощания, а не одновременно: `session.close()` обрывает
+     * незаконченную речь на полуслове. Ждём недолго — пять секунд хватает на
+     * две фразы, а держать встречу дольше из-за собственного прощания нельзя.
+     *
+     * Повторную просьбу игнорируем: «Роман, завершай» часто говорят дважды, и
+     * второй вызов обрывал бы прощание, начатое первым.
+     */
+    let leaving = false;
+    function leaveByRequest(): void {
+      if (leaving) return;
+      leaving = true;
+      console.log('[гейт] просьба уйти — прощаемся и выходим');
+      replySafe({ instructions: farewell() });
+      setTimeout(() => {
+        void (async () => {
+          try { await session.close(); } catch (e) { console.error('session.close()', e); }
+          try { await ctx.room.disconnect(); } catch (e) { console.error('room.disconnect()', e); }
+        })();
+      }, FAREWELL_MS).unref?.();
+    }
 
     // Разметка говорящего. LiveKit определяет активного сам — считать
     // громкость руками не нужно.
