@@ -121,6 +121,38 @@ describe('чат встречи', () => {
     assert.match(s, /status: rejected/);
   });
 
+  test('где писать нельзя — сказано прямо, и обещать отправку запрещено', () => {
+    // Телемост пускает в чат только вошедших под учётной записью: гостю там
+    // показывают «Войдите, чтобы написать сообщение». 15.09.2026 ассистент
+    // сказал, что написал, — сообщения не было.
+    const s = flat(meetingInstructions({
+      name: 'Роман', persona: '', preamble: '', specialists: SPECIALISTS,
+      hasChat: true, canWriteChat: false,
+    }));
+    assert.match(s, /писать в него не можешь/);
+    assert.match(s, /Никогда не говори, что написал или отправил/);
+    // Инструмента записи в таком промпте быть не должно вовсе.
+    assert.doesNotMatch(s, /write_to_chat/);
+  });
+
+  test('где писать можно — инструмент назван', () => {
+    const s = flat(meetingInstructions({
+      name: 'Роман', persona: '', preamble: '', specialists: SPECIALISTS,
+      hasChat: true, canWriteChat: true,
+    }));
+    assert.match(s, /write_to_chat/);
+  });
+
+  test('чтение объясняется в обоих случаях', () => {
+    for (const canWriteChat of [true, false]) {
+      const s = flat(meetingInstructions({
+        name: 'Роман', persona: '', preamble: '', specialists: SPECIALISTS,
+        hasChat: true, canWriteChat,
+      }));
+      assert.match(s, /read_chat/);
+    }
+  });
+
   test('без чата не упомянут и инструмент чтения', () => {
     const s = flat(meetingInstructions({
       name: 'Роман', persona: '', preamble: '', specialists: SPECIALISTS,

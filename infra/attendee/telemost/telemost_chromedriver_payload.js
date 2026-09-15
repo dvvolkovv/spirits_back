@@ -207,13 +207,89 @@ class TelemostParticipants {
   }
 }
 
+
+/**
+ * Чтение чата встречи.
+ *
+ * Чат у Телемоста — отдельный кадр Яндекс Мессенджера
+ * (`yandex.ru/chat?…&build=telemost`), а не часть страницы встречи. Наша
+ * нагрузка внедряется во ВСЕ кадры, поэтому читаем прямо там, а наружу отдаём
+ * через `postMessage` родителю: вебсокет к мосту держит только главный кадр,
+ * и заводить второй ради чата незачем.
+ *
+ * ПИСАТЬ НЕЛЬЗЯ. Гостю Телемост показывает вместо поля ввода кнопку «Войдите,
+ * чтобы написать сообщение» — для записи боту нужен аккаунт Яндекса. Поэтому
+ * здесь только чтение, а инструмент записи для этой площадки у ассистента
+ * снят: обещать то, чего нет, хуже, чем не уметь.
+ *
+ * Разметка разведана 15.09.2026 (`infra/attendee/chatdom2-probe.mjs`):
+ *   .yamb-message-row            — строка сообщения
+ *   .yamb-message-user__name     — автор (у подряд идущих сообщений он один
+ *                                  на группу, поэтому ищем назад по строкам)
+ *   .yamb-message-text span.text — текст, id вида `1789465432012070_c`
+ */
+class TelemostChatReader {
+  constructor(send) {
+    this.send = send;
+    this.seen = new Set();
+    // Первый проход читает ленту целиком — это история до нашего прихода.
+    this.started = false;
+  }
+
+  /** Автор строки: у группы сообщений заголовок один, на первой строке. */
+  authorFor(node) {
+    let row = node.closest('.yamb-message-row');
+    while (row) {
+      const name = row.querySelector('.yamb-message-user__name');
+      if (name && name.innerText.trim()) return name.innerText.trim();
+      row = row.previousElementSibling;
+    }
+    return 'участник';
+  }
+
+  tick() {
+    for (const span of document.querySelectorAll('.yamb-message-text span.text[id$="_c"]')) {
+      const id = span.id.replace(/_c$/, '');
+      if (this.seen.has(id)) continue;
+      const text = (span.innerText || '').replace(/\s+/g, ' ').trim();
+      if (!text) continue;
+      this.seen.add(id);
+      // Первый проход — это история до нашего прихода: помечаем, чтобы
+      // родитель не выдал её за новые сообщения встречи.
+      this.send({ id, text, author: this.authorFor(span), historic: !this.started });
+    }
+    this.started = true;
+  }
+
+  start() {
+    // Опрос, а не MutationObserver: мессенджер перерисовывает ленту целиком
+    // при прокрутке, и наблюдатель давал бы шквал одинаковых событий. Раз в
+    // полторы секунды хватает: чат на встрече — не поток.
+    setInterval(() => {
+      try { this.tick(); } catch (e) { console.error('[телемост] чат не прочитался', e); }
+    }, 1500);
+  }
+}
+
 // ── Сборка ────────────────────────────────────────────────────────────────
 //
 // Целиком под try/catch: исключение здесь оставило бы `window.ws`
 // неопределённым, и мост не смог бы ни принять звук, ни отдать его — со
 // стороны это выглядит как «бот пришёл и молчит», без единой строки о причине.
 
-try {
+// В кадре чата — только чтение и отправка родителю. Всё остальное (звук,
+// состав, микрофон) живёт в кадре встречи, и заводить его копию в мессенджере
+// значило бы поднять второй аудиограф и второй вебсокет впустую.
+if (location.host === 'yandex.ru' && location.pathname.startsWith('/chat')) {
+  try {
+    new TelemostChatReader((msg) => {
+      window.parent.postMessage({ source: 'linkeon-telemost-chat', ...msg }, '*');
+    }).start();
+    console.log('[телемост] чтение чата запущено');
+  } catch (e) {
+    console.error('[телемост] чтение чата не запустилось:', e);
+  }
+} else try {
   const ws = new TelemostWebSocketClient();
   window.ws = ws;
 
@@ -246,6 +322,41 @@ try {
   });
 
   new TelemostParticipants(ws).start();
+
+  // Сообщения из кадра чата. Автора регистрируем участником со статусом
+  // «не во встрече»: мост роняет сообщение, если участника нет в его списке
+  // (upsert_chat_message → get_participant), а «в встрече» раздуло бы состав
+  // и сломало правила выхода — join-события такой участник не порождает.
+  const chatAuthors = new Map();
+  window.addEventListener('message', (ev) => {
+    const d = ev.data;
+    if (!d || d.source !== 'linkeon-telemost-chat' || !d.text) return;
+    // Историю до нашего прихода не пересылаем: это не обращения к ассистенту.
+    if (d.historic) return;
+    const author = String(d.author || 'участник');
+    let uuid = chatAuthors.get(author);
+    if (!uuid) {
+      uuid = `telemost-chat-${chatAuthors.size + 1}`;
+      chatAuthors.set(author, uuid);
+      ws.sendJson({
+        type: 'UsersUpdate',
+        newUsers: [{
+          deviceId: uuid, displayName: author, fullName: author, profile: '',
+          status: 'not_in_meeting', humanized_status: 'not_in_meeting', isCurrentUser: false,
+        }],
+        removedUsers: [], updatedUsers: [],
+      });
+    }
+    ws.sendJson({
+      type: 'ChatMessage',
+      message_uuid: String(d.id),
+      participant_uuid: uuid,
+      timestamp: Math.floor(Date.now() / 1000),
+      text: String(d.text),
+    });
+    console.log('[телемост] чат:', author + ':', String(d.text).slice(0, 60));
+  });
+
   console.log('[телемост] нагрузка страницы установлена');
 } catch (e) {
   // До моста такое сообщение доедет только если ws успел подняться; если нет —
