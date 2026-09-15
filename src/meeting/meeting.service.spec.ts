@@ -676,7 +676,7 @@ describe('MeetingService', () => {
       await svc.join('u1', 7, 'abc-defg-hij', 'meet');
       const busy = pg.query.mock.calls.find(([sql]: any) => /count\(\*\)/.test(sql) && /provider/.test(sql));
       expect(busy[0]).toMatch(/provider = ANY/);
-      expect(busy[1][0]).toEqual(['meet', 'zoom', 'teams']);
+      expect(busy[1][0]).toEqual(['meet', 'zoom', 'teams', 'telemost']);
     });
   });
 
