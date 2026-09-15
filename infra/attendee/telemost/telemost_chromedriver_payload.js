@@ -282,9 +282,11 @@ class TelemostChatReader {
 // значило бы поднять второй аудиограф и второй вебсокет впустую.
 if (location.host === 'yandex.ru' && location.pathname.startsWith('/chat')) {
   try {
-    new TelemostChatReader((msg) => {
-      window.parent.postMessage({ source: 'linkeon-telemost-chat', ...msg }, '*');
-    }).start();
+    const send = (msg) => window.parent.postMessage({ source: 'linkeon-telemost-chat', ...msg }, '*');
+    new TelemostChatReader(send).start();
+    // Сигнал в лог моста через родителя: иначе «кадр не запустился» и «в чате
+    // пусто» выглядят одинаково. Ровно на этом мы потеряли заход 15.09.2026.
+    send({ debug: 'chat_frame_ready', url: location.host + location.pathname });
     console.log('[телемост] чтение чата запущено');
   } catch (e) {
     console.error('[телемост] чтение чата не запустилось:', e);
@@ -330,7 +332,12 @@ if (location.host === 'yandex.ru' && location.pathname.startsWith('/chat')) {
   const chatAuthors = new Map();
   window.addEventListener('message', (ev) => {
     const d = ev.data;
-    if (!d || d.source !== 'linkeon-telemost-chat' || !d.text) return;
+    if (!d || d.source !== 'linkeon-telemost-chat') return;
+    if (d.debug) {
+      ws.sendJson({ type: 'TelemostDebug', event: d.debug, url: d.url });
+      return;
+    }
+    if (!d.text) return;
     // Историю до нашего прихода не пересылаем: это не обращения к ассистенту.
     if (d.historic) return;
     const author = String(d.author || 'участник');

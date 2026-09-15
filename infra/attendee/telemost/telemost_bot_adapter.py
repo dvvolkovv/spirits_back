@@ -64,6 +64,22 @@ class TelemostBotAdapter(WebBotAdapter, TelemostUIMethods):
     def get_staged_bot_join_delay_seconds(self):
         return 5
 
+    def add_subclass_specific_chrome_options(self, options):
+        """Изоляция сайтов выключена — иначе не прочитать чат.
+
+        Чат Телемоста живёт в кадре `yandex.ru/chat`, а сама встреча — на
+        `telemost.yandex.ru`. При изоляции сайтов такой кадр уезжает в
+        ОТДЕЛЬНЫЙ процесс, и сценарий, который мост внедряет командой
+        `Page.addScriptToEvaluateOnNewDocument`, туда не попадает вовсе:
+        живой прогон 15.09.2026 дал ноль сообщений чата при исправно
+        читающемся составе.
+
+        Ослабление касается только браузера бота, который открывает
+        единственную страницу — встречу, куда его позвали. Чужих вкладок и
+        чужих сессий в нём нет.
+        """
+        options.add_argument("--disable-features=IsolateOrigins,site-per-process")
+
     def subclass_specific_use_disable_gpu_chrome_option(self):
         return True
 
