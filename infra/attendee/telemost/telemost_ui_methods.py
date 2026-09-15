@@ -168,6 +168,30 @@ class TelemostUIMethods:
         except Exception as e:
             logger.warning(f"Телемост: камеру выключить не вышло: {e}")
 
+    def open_chat_panel(self):
+        """Открыть панель чата и оставить открытой.
+
+        Без этого лента сообщений в кадре мессенджера просто не отрисована:
+        кадр есть, наш сценарий в нём работает (в логе `chat_frame_ready`), а
+        читать нечего. Живой прогон 15.09.2026 дал ровно такую картину.
+
+        Панель никому не мешает: экран бота не видит никто, запись мы не
+        ведём. Ошибку глотаем — без чтения чата встреча всё равно состоится.
+        """
+        button = self._find_optional(
+            '//*[@data-testid="chat-alt-button"]'
+            f' | {self._xpath_with_text("Чат")}',
+            timeout=10,
+        )
+        if button is None:
+            logger.info("Телемост: кнопки чата не нашлось — чат читать не будем")
+            return
+        try:
+            self.click_element(button, "open_chat")
+            logger.info("Телемост: панель чата открыта")
+        except Exception as e:
+            logger.warning(f"Телемост: панель чата не открылась: {e}")
+
     # ── Точка входа, которую зовёт мост ─────────────────────────────────────
 
     def attempt_to_join_meeting(self):
@@ -201,6 +225,7 @@ class TelemostUIMethods:
         self.turn_off_media_inputs()
         self.click_join_button()
         self.wait_until_in_meeting()
+        self.open_chat_panel()
         self.ready_to_show_bot_image()
 
     def click_leave_button(self):
