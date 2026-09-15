@@ -111,9 +111,17 @@ export const TELEMOST_PAYLOAD = `
     return stream;
   };
 
-  // Голос ассистента: сервис зовёт эту функцию с кусками PCM.
-  window.__botPlayPcm = (float32) => {
+  // Голос ассистента: сервис зовёт эту функцию с куском PCM16 в base64 — той
+  // самой строкой, что пришла от воркера. Разбирать её здесь дешевле, чем
+  // тащить через мост CDP массив чисел.
+  window.__botPlayPcm = (chunk) => {
     const c = ctx || (ensureMic(), ctx);
+    const raw = atob(chunk);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    const pcm = new Int16Array(bytes.buffer);
+    const float32 = new Float32Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) float32[i] = pcm[i] / 32768;
     const buf = c.createBuffer(1, float32.length, 24000);
     buf.getChannelData(0).set(float32);
     const src = c.createBufferSource();
@@ -128,16 +136,44 @@ export const TELEMOST_PAYLOAD = `
   };
 
   // Входящий звук: дорожки участников в один микс.
-  const mixCtx = new AudioContext({ sampleRate: 48000 });
+  //
+  // Контекст на 24 кГц — не вкус, а условие: столько объявляет наш протокол
+  // воркеру, и он читает куски именно так, не глядя на поле sample_rate.
+  // Первая редакция сводила на 48 кГц и отдавала под ярлыком 24 — ассистент
+  // слышал вдвое замедленную речь и почти ничего не разбирал (живая встреча
+  // 15.09.2026). У Attendee частоту приводил сам мост; своему боту делать это
+  // некому, а браузер пересчитает лучше нас — своим ресемплером и даром.
+  const mixCtx = new AudioContext({ sampleRate: 24000 });
   const mixDest = mixCtx.createMediaStreamDestination();
   const heard = new Set();
   let pumping = false;
+
+  const b64 = (pcm) => {
+    const bytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+    let s = '';
+    // По кускам: apply на всём массиве переполняет стек аргументов.
+    for (let i = 0; i < bytes.length; i += 8192) {
+      s += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+    }
+    return btoa(s);
+  };
 
   const startPump = () => {
     if (pumping) return;
     const track = mixDest.stream.getAudioTracks()[0];
     if (!track) return;
     pumping = true;
+
+    // Копим 40 мс и отдаём одной строкой.
+    //
+    // Наружу из страницы ведёт мост CDP, и каждый вызов стоит сериализации.
+    // Первая редакция гнала в него массив float на каждый кадр — около
+    // полумегабайта JSON в секунду; звук приходил рвано просто потому, что
+    // мост не успевал. PCM16 в base64 — в тридцать раз меньше.
+    const BATCH = 960;
+    let acc = new Int16Array(BATCH);
+    let filled = 0;
+
     const reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
     (async () => {
       while (true) {
@@ -146,7 +182,11 @@ export const TELEMOST_PAYLOAD = `
         try {
           const data = new Float32Array(value.numberOfFrames);
           value.copyTo(data, { planeIndex: 0 });
-          send('audio', Array.from(data));
+          for (let i = 0; i < data.length; i++) {
+            const v = Math.max(-1, Math.min(1, data[i]));
+            acc[filled++] = Math.round(v * 32767);
+            if (filled === BATCH) { send('audio', b64(acc)); filled = 0; }
+          }
         } catch (e) { console.error('[бот] кадр не разобрался', e); }
         finally { value.close(); }
       }

@@ -18,6 +18,9 @@ const SAMPLE_RATE = 24_000;
 /** Сколько ждём страницу и вход. */
 const PAGE_TIMEOUT_MS = 60_000;
 
+/** Пауза между входом во встречу и первым звуком: даём площадке разойтись. */
+const JOIN_SETTLE_MS = Number(process.env.BOT_JOIN_SETTLE_MS || 2_500);
+
 /** Сколько ждём впуска из комнаты ожидания, прежде чем сдаться с причиной. */
 const ADMIT_TIMEOUT_MS = Number(process.env.BOT_ADMIT_TIMEOUT_MS || 900_000);
 
@@ -78,28 +81,22 @@ export class MeetingBot {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (msg.trigger !== 'realtime_audio.bot_output' || !msg.data?.chunk) return;
-    const pcm = Buffer.from(msg.data.chunk, 'base64');
-    const floats = new Float32Array(pcm.length / 2);
-    for (let i = 0; i < floats.length; i++) floats[i] = pcm.readInt16LE(i * 2) / 32768;
+    // Строку отдаём страницу как есть: разбор PCM дешевле сделать там, чем
+    // гнать через мост CDP массив чисел.
     try {
-      await this.page?.evaluate((arr) => window.__botPlayPcm?.(Float32Array.from(arr)), Array.from(floats));
+      await this.page?.evaluate((chunk) => window.__botPlayPcm?.(chunk), msg.data.chunk);
     } catch (e) {
       // Страница могла уйти — это не повод рушить встречу.
       this.log.warn?.(`[${this.id}] голос не доиграл: ${e?.message}`);
     }
   }
 
-  /** Кадры участников — воркеру. */
-  sendAudio(floats) {
+  /** Звук встречи — воркеру. Страница уже отдала готовый PCM16 в base64. */
+  sendAudio(chunk) {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    const pcm = Buffer.alloc(floats.length * 2);
-    for (let i = 0; i < floats.length; i++) {
-      const v = Math.max(-1, Math.min(1, floats[i]));
-      pcm.writeInt16LE(Math.round(v * 32767), i * 2);
-    }
     this.ws.send(JSON.stringify({
       trigger: 'realtime_audio.mixed',
-      data: { chunk: pcm.toString('base64'), sample_rate: SAMPLE_RATE },
+      data: { chunk, sample_rate: SAMPLE_RATE },
     }));
   }
 
@@ -108,7 +105,7 @@ export class MeetingBot {
   async onPageEvent(type, data) {
     switch (type) {
       case 'audio':
-        this.sendAudio(Float32Array.from(data));
+        this.sendAudio(String(data));
         break;
 
       case 'participants': {
@@ -184,7 +181,6 @@ export class MeetingBot {
     await ctx.addInitScript(platform.payload);
     this.page = await ctx.newPage();
 
-    this.connectAudio();
     await this.page.goto(this.meetingUrl, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT_MS });
     await this.joinMeeting(platform.join);
   }
@@ -243,6 +239,15 @@ export class MeetingBot {
         this.log.info?.(`[${this.id}] мы во встрече`);
         await click(sel.chatButton, 'панель чата открыта');
         await this.setState('joined_recording');
+        // Только теперь зовём воркера.
+        //
+        // Воркер ждёт нашего вебсокета и с первым же байтом начинает
+        // приветствие. Пока мы подключались при создании бота, ассистент
+        // здоровался, стоя на экране входа, и человек слышал фразу с середины
+        // (живая встреча 15.09.2026). Пауза сверх того — на то, чтобы
+        // площадка донесла нашу дорожку до остальных.
+        await this.page.waitForTimeout(JOIN_SETTLE_MS);
+        this.connectAudio();
         return;
       }
       await this.page.waitForTimeout(2_000);
