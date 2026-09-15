@@ -181,6 +181,60 @@ describe('parseMeetingLink', () => {
       expect(parseMeetingLink('https://meet.google.com/abc-defg-hij')?.provider).toBe('meet');
     });
   });
+  describe('комната Taler ID на настроенном хосте', () => {
+    // Клиент комнат ходит по адресу из TALERID_BASE_URL: на проде это
+    // api.talerid.io, на стенде — их стейдж. Разбор ссылки знал только
+    // канонический хост, и встреча Taler ID на стенде была недостижима в
+    // принципе — 14.09.2026 модель на такую ссылку ответила, что «подключилась
+    // к комнате и ведёт запись», чего не было.
+    const OLD = process.env.TALERID_BASE_URL;
+    afterEach(() => {
+      if (OLD === undefined) delete process.env.TALERID_BASE_URL;
+      else process.env.TALERID_BASE_URL = OLD;
+    });
+
+    it('ссылка на стейдж узнаётся, когда он и настроен', () => {
+      process.env.TALERID_BASE_URL = 'https://staging.id.taler.tirol';
+      expect(parseMeetingLink('зайди https://staging.id.taler.tirol/room/3f29bc06')).toEqual({
+        provider: 'talerid', code: '3f29bc06',
+      });
+    });
+
+    it('без настройки та же ссылка не узнаётся', () => {
+      // Иначе карточка появлялась бы там, где входить некуда: клиент пошёл бы
+      // в другую среду и получил 404.
+      delete process.env.TALERID_BASE_URL;
+      expect(parseMeetingLink('https://staging.id.taler.tirol/room/3f29bc06')).toBeNull();
+    });
+
+    it('хост сверяется точно, без поддоменов', () => {
+      // Тот же класс защиты, что у notmeet.google.com и notzoom.us.
+      process.env.TALERID_BASE_URL = 'https://staging.id.taler.tirol';
+      expect(parseMeetingLink('https://notstaging.id.taler.tirol/room/3f29bc06')).toBeNull();
+      expect(parseMeetingLink('https://staging.id.taler.tirol.evil.ru/room/3f29bc06')).toBeNull();
+    });
+
+    it('канонический talerid.io узнаётся при любой настройке', () => {
+      process.env.TALERID_BASE_URL = 'https://staging.id.taler.tirol';
+      expect(parseMeetingLink('https://api.talerid.io/room/08518042')).toEqual({
+        provider: 'talerid', code: '08518042',
+      });
+    });
+
+    it('битый TALERID_BASE_URL ничего не ломает', () => {
+      process.env.TALERID_BASE_URL = 'не-адрес';
+      expect(parseMeetingLink('https://staging.id.taler.tirol/room/3f29bc06')).toBeNull();
+      expect(parseMeetingLink('https://talerid.io/room/3f29bc06')).toEqual({
+        provider: 'talerid', code: '3f29bc06',
+      });
+    });
+
+    it('регистр кода не трогается — их ручка сверяет строку точно', () => {
+      process.env.TALERID_BASE_URL = 'https://staging.id.taler.tirol';
+      expect(parseMeetingLink('https://staging.id.taler.tirol/room/3F29BC06')?.code).toBe('3F29BC06');
+    });
+  });
+
   describe('Microsoft Teams', () => {
     const LIVE = 'https://teams.live.com/meet/9334354666557?p=lBZ4sXKpUY7bT0GzzM';
     const CORP =

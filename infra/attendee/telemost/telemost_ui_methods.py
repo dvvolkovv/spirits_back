@@ -171,6 +171,23 @@ class TelemostUIMethods:
     # ── Точка входа, которую зовёт мост ─────────────────────────────────────
 
     def attempt_to_join_meeting(self):
+        # CSP страницы отключаем ДО перехода, иначе вебсокет нагрузки к мосту
+        # блокируется браузером и бот остаётся немым в обе стороны.
+        #
+        # У Телемоста заголовок строгий: `default-src 'none'` с точным списком
+        # доменов Яндекса. Наша нагрузка живёт в той же странице, и её
+        # `new WebSocket("ws://localhost:…")` под это правило не попадает —
+        # соединение не открывается вовсе, молча. Живой заход 14.09.2026: бот
+        # вошёл во встречу, панель на месте, а от страницы к мосту не приехало
+        # ни одного сообщения.
+        #
+        # Meet, Zoom и Teams обходятся без этого — их политика мягче.
+        try:
+            self.driver.execute_cdp_cmd("Page.setBypassCSP", {"enabled": True})
+            logger.info("Телемост: CSP страницы отключён для нагрузки")
+        except Exception as e:
+            logger.warning(f"Телемост: не удалось отключить CSP: {e}")
+
         self.driver.get(self.meeting_url)
         self.driver.execute_cdp_cmd(
             "Browser.grantPermissions",

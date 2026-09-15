@@ -27,6 +27,36 @@ const ROOM_LINK_REGEX = /https?:\/\/(?:[a-z0-9-]+\.)?linkeon\.io\/room\/([A-Za-z
 const TALERID_LINK_REGEX = /https?:\/\/(?:[a-z0-9-]+\.)?talerid\.io\/room\/([A-Fa-f0-9]{6,64})/i;
 
 /**
+ * Ссылка на комнату Taler ID на ТОМ хосте, который настроен у нас.
+ *
+ * Зачем вторая проверка. Клиент комнат ходит по адресу из `TALERID_BASE_URL`:
+ * на проде это `api.talerid.io`, на стенде — их стейдж `staging.id.taler.tirol`.
+ * Разбор ссылки при этом знал только канонический `talerid.io`, и на стенде
+ * встреча Taler ID была недостижима в принципе: ссылку не узнавали, карточку
+ * не показывали, а сообщение уходило в модель — 14.09.2026 она на такую
+ * ссылку ответила, что «подключилась к комнате и ведёт запись», чего не было.
+ *
+ * Хост сверяем ТОЧНО, без поддоменов: канонический `talerid.io` уже разобран
+ * регуляркой выше вместе со своими поддоменами, а настроенный адрес — это
+ * ровно один известный хост, и расширять его до «всё, что кончается на
+ * taler.tirol» значило бы открыть дверь `notstaging.id.taler.tirol`.
+ */
+function taleridLinkOnConfiguredHost(text: string): RegExpExecArray | null {
+  const base = process.env.TALERID_BASE_URL;
+  if (!base) return null;
+  let host: string;
+  try {
+    host = new URL(base).host.toLowerCase();
+  } catch {
+    return null;
+  }
+  // Канонический хост уже проверен выше — второй раз незачем.
+  if (host === 'talerid.io' || host.endsWith('.talerid.io')) return null;
+  const escaped = host.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`https?://${escaped}/room/([A-Fa-f0-9]{6,64})`, 'i').exec(text);
+}
+
+/**
  * Ссылка на встречу Google Meet.
  *
  * Хост точный, БЕЗ необязательного поддомена — в отличие от linkeon.io и
@@ -177,7 +207,7 @@ export function parseMeetingLink(text: string): ParsedMeetingLink | null {
     if (isValidRoomCode(code)) return { provider: 'linkeon', code };
   }
 
-  const foreign = TALERID_LINK_REGEX.exec(text);
+  const foreign = TALERID_LINK_REGEX.exec(text) || taleridLinkOnConfiguredHost(text);
   if (foreign) {
     // Регистр их кода не трогаем: он hex и приходит в ссылке как есть, а
     // ручка сверяет строку точно. Приведение к верхнему регистру, уместное

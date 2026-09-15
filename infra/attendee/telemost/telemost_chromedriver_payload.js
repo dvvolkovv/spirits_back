@@ -26,12 +26,25 @@ class TelemostWebSocketClient {
     this.ws = new WebSocket(url);
     this.ws.binaryType = 'arraybuffer';
     this.mediaSendingEnabled = false;
-    this.ws.onopen = () => console.log('[телемост] мост на связи');
+    this.ws.onopen = () => {
+      console.log('[телемост] мост на связи');
+      // Сигнал в лог моста: без него «страница молчит» и «страница не
+      // подключилась» выглядят одинаково, а это разные поломки.
+      this.sendJson({ type: 'TelemostDebug', event: 'ws_open', port: window.initialData.websocketPort });
+    };
     this.ws.onerror = (e) => console.error('[телемост] ошибка вебсокета', e);
     this.ws.onclose = () => console.log('[телемост] мост отключился');
   }
 
-  async enableMediaSending() { this.mediaSendingEnabled = true; }
+  async enableMediaSending() {
+    this.mediaSendingEnabled = true;
+    this.sendJson({
+      type: 'TelemostDebug',
+      event: 'media_enabled',
+      mixerStarted: !!window.telemostMixer?.started,
+      tracks: window.telemostMixer ? window.telemostMixer.tracks.size : -1,
+    });
+  }
 
   async disableMediaSending() {
     // Даём мосту дослать последние кадры: обрыв на полуслове режет последнюю
@@ -186,44 +199,50 @@ class TelemostParticipants {
 }
 
 // ── Сборка ────────────────────────────────────────────────────────────────
+//
+// Целиком под try/catch: исключение здесь оставило бы `window.ws`
+// неопределённым, и мост не смог бы ни принять звук, ни отдать его — со
+// стороны это выглядит как «бот пришёл и молчит», без единой строки о причине.
 
-const ws = new TelemostWebSocketClient();
-window.ws = ws;
+try {
+  const ws = new TelemostWebSocketClient();
+  window.ws = ws;
 
-const telemostMixer = new TelemostAudioMixer(ws);
-window.telemostMixer = telemostMixer;
+  const telemostMixer = new TelemostAudioMixer(ws);
+  window.telemostMixer = telemostMixer;
 
-(() => {
   const OrigPC = window.RTCPeerConnection;
   window.RTCPeerConnection = function (...args) {
     const pc = Reflect.construct(OrigPC, args);
     pc.addEventListener('track', (ev) => {
-      if (ev.track && ev.track.kind === 'audio') telemostMixer.addTrack(ev.track);
-    });
-    pc.addEventListener('connectionstatechange', () => {
-      if (pc.connectionState === 'failed') {
-        // Разрыв соединения — это конец встречи для нас, и молчать о нём
-        // нельзя: без этого задание висело бы до потолка длительности.
-        ws.sendJson({ type: 'MeetingStatusChange', change: 'meeting_ended' });
+      if (ev.track && ev.track.kind === 'audio') {
+        telemostMixer.addTrack(ev.track);
+        ws.sendJson({ type: 'TelemostDebug', event: 'incoming_track', tracks: telemostMixer.tracks.size });
       }
     });
     return pc;
   };
   window.RTCPeerConnection.prototype = OrigPC.prototype;
-})();
 
-// Микрофон бота. Общий BotOutputManager сам подменит getUserMedia; клики по
-// кнопке микрофона Телемосту не нужны (проверено спайком), поэтому колбэки
-// пустые — но объект создаём, иначе исходящий звук отправлять некому.
-window.botOutputManager = new BotOutputManager({
-  turnOnMic: () => {},
-  turnOffMic: () => {},
-  turnOnWebcam: () => {},
-  turnOffWebcam: () => {},
-  turnOnScreenshare: () => {},
-  turnOffScreenshare: () => {},
-});
+  // Микрофон бота. Общий BotOutputManager сам подменит getUserMedia; клики по
+  // кнопке микрофона Телемосту не нужны (проверено спайком), поэтому колбэки
+  // пустые — но объект создаём, иначе исходящий звук отправлять некому.
+  window.botOutputManager = new BotOutputManager({
+    turnOnMic: () => {},
+    turnOffMic: () => {},
+    turnOnWebcam: () => {},
+    turnOffWebcam: () => {},
+    turnOnScreenshare: () => {},
+    turnOffScreenshare: () => {},
+  });
 
-new TelemostParticipants(ws).start();
-
-console.log('[телемост] нагрузка страницы установлена');
+  new TelemostParticipants(ws).start();
+  console.log('[телемост] нагрузка страницы установлена');
+} catch (e) {
+  // До моста такое сообщение доедет только если ws успел подняться; если нет —
+  // останется хотя бы в консоли страницы и на снимке экрана.
+  console.error('[телемост] нагрузка НЕ установилась:', e);
+  try {
+    window.ws?.sendJson({ type: 'TelemostDebug', event: 'payload_failed', error: String(e && e.message || e) });
+  } catch (_) { /* канала нет — ничего не поделать */ }
+}
