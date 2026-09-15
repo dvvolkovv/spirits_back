@@ -208,18 +208,17 @@ export const TELEMOST_PAYLOAD = `
   window.RTCPeerConnection.prototype = OrigPC.prototype;
 
   // Состав: имён в разметке нет, есть счётчик на кнопке участников.
-  let lastCount = -1;
+  //
+  // Шлём КАЖДЫЙ раз, а не только при изменении: что из этого новость, решает
+  // сервис — он один знает, что бэкенд подтвердил.
   setInterval(() => {
     try {
       const btn = document.querySelector('[data-testid="participants-button"]');
       if (!btn) return;
       const m = (btn.innerText || '').match(/\\d+/);
       if (!m) return;
-      const total = Number(m[0]);
-      if (total === lastCount) return;
-      lastCount = total;
       // Минус мы сами: площадка считает и бота.
-      send('participants', { humans: Math.max(0, total - 1) });
+      send('participants', { humans: Math.max(0, Number(m[0]) - 1) });
     } catch (e) { console.error('[бот] состав не прочитался', e); }
   }, 2000);
 

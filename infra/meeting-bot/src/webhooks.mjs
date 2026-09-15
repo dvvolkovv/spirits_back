@@ -36,31 +36,51 @@ export function sign(payload, secretBase64) {
 }
 
 /**
- * Отправка события.
+ * Сколько ждём ответа и сколько раз пробуем.
+ *
+ * Пять секунд и одна попытка (первая редакция) не пережили живой встречи
+ * 15.09.2026: пока Chromium поднимал страницу и WebRTC, процессу не хватало
+ * процессорного времени, и два события — приход человека и «мы во встрече» —
+ * не дошли до nginx ВОВСЕ, то есть даже не успели уйти. Машина о четырёх
+ * ядрах, и рядом шли тесты; в час пик так же будет и на проде.
+ */
+const TIMEOUT_MS = 15_000;
+const ATTEMPTS = 2;
+
+/**
+ * Отправка события. `true` — бэкенд принял.
  *
  * Ошибки НЕ роняют встречу: вебхук — это уведомление, а не часть разговора.
  * Но и молчать о них нельзя — без состава и чата ассистент ведёт себя странно,
  * и в логе должно быть видно, почему.
  *
- * Повторов нет намеренно: события состава и чата ценны свежими, а очередь
- * повторов — это уже маленький брокер, которого мы тут заводить не хотим.
+ * Очереди повторов здесь по-прежнему нет: события ценны свежими, а очередь —
+ * это уже маленький брокер. Вторая попытка — другое: она страхует ровно от той
+ * заминки, из-за которой первая не успела начаться.
  */
 export async function send(url, secret, payload, log = console) {
-  if (!url) return;
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Webhook-Signature': sign(payload, secret || ''),
-      },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(5_000),
-    });
-    if (!res.ok) log.warn?.(`вебхук ${payload.trigger}: HTTP ${res.status}`);
-  } catch (e) {
-    log.warn?.(`вебхук ${payload.trigger} не ушёл: ${e?.message}`);
+  if (!url) return true;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-Webhook-Signature': sign(payload, secret || ''),
+  };
+  const body = JSON.stringify(payload);
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(TIMEOUT_MS) });
+      if (res.ok) return true;
+      // Отказ бэкенда повторять бессмысленно: подпись не та или события он не
+      // ждёт — со второго раза лучше не станет.
+      log.warn?.(`вебхук ${payload.trigger}: HTTP ${res.status}`);
+      return false;
+    } catch (e) {
+      const last = attempt === ATTEMPTS;
+      log.warn?.(`вебхук ${payload.trigger} не ушёл: ${e?.message}${last ? '' : ' — пробуем ещё раз'}`);
+      if (last) return false;
+      await new Promise((r) => setTimeout(r, 1_000));
+    }
   }
+  return false;
 }
 
 /** Тело события в форме, которую ждёт наш контроллер. */

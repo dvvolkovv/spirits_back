@@ -36,7 +36,9 @@ export class MeetingBot {
     this.page = null;
     this.ws = null;
     this.chatAuthors = new Map();
+    /** Людей во встрече ПО ПОДТВЕРЖДЁННЫМ событиям, а не по площадке. */
     this.humans = 0;
+    this.syncing = false;
     this.closed = false;
   }
 
@@ -108,16 +110,9 @@ export class MeetingBot {
         this.sendAudio(String(data));
         break;
 
-      case 'participants': {
-        // Состав отдаём событиями входа и ухода — их ждёт наш контроллер.
-        const humans = Number(data?.humans ?? 0);
-        if (humans === this.humans) break;
-        for (let i = this.humans + 1; i <= humans; i++) await this.participantEvent(i, 'join');
-        for (let i = humans + 1; i <= this.humans; i++) await this.participantEvent(i, 'leave');
-        this.humans = humans;
-        this.log.info?.(`[${this.id}] людей во встрече: ${humans}`);
+      case 'participants':
+        await this.syncParticipants(Number(data?.humans ?? 0));
         break;
-      }
 
       case 'chat': {
         const author = String(data?.author || 'участник');
@@ -146,8 +141,39 @@ export class MeetingBot {
     }
   }
 
+  /**
+   * Довести состав у бэкенда до того, что показывает площадка.
+   *
+   * Состав уходит наружу событиями входа и ухода — их ждёт наш контроллер, и
+   * другого способа рассказать о людях у нас нет. Но поток разниц по
+   * ненадёжному каналу расходится с правдой НАВСЕГДА: потерянный «пришёл» сам
+   * собой не повторится, и ассистент до конца встречи считает, что он наедине
+   * (живая встреча 15.09.2026 — ровно такой потерянный вебхук).
+   *
+   * Поэтому счётчик двигаем только за подтверждёнными событиями, а страница
+   * присылает состав каждые две секунды. Не дошло — на следующем тике
+   * попробуем снова, и расхождение зарастёт само.
+   */
+  async syncParticipants(target) {
+    if (this.syncing || target === this.humans) return;
+    this.syncing = true;
+    try {
+      while (this.humans < target) {
+        if (!(await this.participantEvent(this.humans + 1, 'join'))) return;
+        this.humans++;
+      }
+      while (this.humans > target) {
+        if (!(await this.participantEvent(this.humans, 'leave'))) return;
+        this.humans--;
+      }
+      this.log.info?.(`[${this.id}] людей во встрече: ${this.humans}`);
+    } finally {
+      this.syncing = false;
+    }
+  }
+
   async participantEvent(index, kind) {
-    await sendWebhook(this.webhookUrl, this.webhookSecret, event(this.id, this.metadata, 'participant_events.join_leave', {
+    return sendWebhook(this.webhookUrl, this.webhookSecret, event(this.id, this.metadata, 'participant_events.join_leave', {
       participant_name: `Участник ${index}`,
       participant_uuid: `participant-${index}`,
       event_type: kind,
