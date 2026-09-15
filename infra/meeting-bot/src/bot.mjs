@@ -1,0 +1,231 @@
+import { chromium } from 'playwright';
+import WebSocket from 'ws';
+import { TELEMOST_PAYLOAD, TELEMOST_JOIN } from './payload/telemost.mjs';
+import { event, send as sendWebhook } from './webhooks.mjs';
+
+/**
+ * Одна встреча — один бот: браузер, страница площадки, вебсокет к воркеру и
+ * вебхуки в бэкенд.
+ *
+ * Состояния повторяют Attendee (`joining`, `joined_recording`, `ended`,
+ * `fatal_error`): по ним уже написаны и наш контроллер вебхуков, и разбор
+ * причин в воркере. Менять их значило бы переписывать работающее ради вкуса.
+ */
+
+/** Частота звука в обе стороны. Родная для Realtime — ни одного ресемпла. */
+const SAMPLE_RATE = 24_000;
+
+/** Сколько ждём страницу и вход. */
+const PAGE_TIMEOUT_MS = 60_000;
+
+/** Сколько ждём впуска из комнаты ожидания, прежде чем сдаться с причиной. */
+const ADMIT_TIMEOUT_MS = Number(process.env.BOT_ADMIT_TIMEOUT_MS || 900_000);
+
+const PLATFORMS = {
+  telemost: { payload: TELEMOST_PAYLOAD, join: TELEMOST_JOIN, name: 'Телемост' },
+};
+
+export class MeetingBot {
+  constructor({ id, meetingUrl, displayName, platform, wsUrl, webhookUrl, webhookSecret, metadata, log = console }) {
+    Object.assign(this, { id, meetingUrl, displayName, platform, wsUrl, webhookUrl, webhookSecret, metadata, log });
+    this.state = 'ready';
+    this.browser = null;
+    this.page = null;
+    this.ws = null;
+    this.chatAuthors = new Map();
+    this.humans = 0;
+    this.closed = false;
+  }
+
+  /** Сообщить бэкенду о смене состояния. Форма — как у Attendee. */
+  async setState(state, { sub } = {}) {
+    if (this.state === state) return;
+    const old = this.state;
+    this.state = state;
+    this.log.info?.(`[${this.id}] состояние: ${old} → ${state}${sub ? ` (${sub})` : ''}`);
+    await sendWebhook(this.webhookUrl, this.webhookSecret, event(this.id, this.metadata, 'bot.state_change', {
+      new_state: state,
+      old_state: old,
+      ...(sub ? { event_type: sub, event_sub_type: null } : {}),
+    }), this.log);
+  }
+
+  // ── Звук ────────────────────────────────────────────────────────────────
+
+  /**
+   * Вебсокет к воркеру.
+   *
+   * Переподключаемся молча и настойчиво: обрыв посреди встречи — обычное дело,
+   * а воркер держит место за нами полторы минуты (см. `attendee-audio.ts`).
+   * Сдаёмся только вместе с самим ботом.
+   */
+  connectAudio() {
+    if (this.closed || !this.wsUrl) return;
+    const ws = new WebSocket(this.wsUrl);
+    this.ws = ws;
+    ws.on('open', () => this.log.info?.(`[${this.id}] звук: подключились к воркеру`));
+    ws.on('message', (raw) => this.playFromWorker(raw));
+    ws.on('error', (e) => this.log.warn?.(`[${this.id}] звук: ${e?.message}`));
+    ws.on('close', () => {
+      if (this.closed) return;
+      this.log.warn?.(`[${this.id}] звук: связь потеряна, переподключаемся`);
+      setTimeout(() => this.connectAudio(), 2_000);
+    });
+  }
+
+  /** Кусок голоса ассистента — в страницу. */
+  async playFromWorker(raw) {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    if (msg.trigger !== 'realtime_audio.bot_output' || !msg.data?.chunk) return;
+    const pcm = Buffer.from(msg.data.chunk, 'base64');
+    const floats = new Float32Array(pcm.length / 2);
+    for (let i = 0; i < floats.length; i++) floats[i] = pcm.readInt16LE(i * 2) / 32768;
+    try {
+      await this.page?.evaluate((arr) => window.__botPlayPcm?.(Float32Array.from(arr)), Array.from(floats));
+    } catch (e) {
+      // Страница могла уйти — это не повод рушить встречу.
+      this.log.warn?.(`[${this.id}] голос не доиграл: ${e?.message}`);
+    }
+  }
+
+  /** Кадры участников — воркеру. */
+  sendAudio(floats) {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    const pcm = Buffer.alloc(floats.length * 2);
+    for (let i = 0; i < floats.length; i++) {
+      const v = Math.max(-1, Math.min(1, floats[i]));
+      pcm.writeInt16LE(Math.round(v * 32767), i * 2);
+    }
+    this.ws.send(JSON.stringify({
+      trigger: 'realtime_audio.mixed',
+      data: { chunk: pcm.toString('base64'), sample_rate: SAMPLE_RATE },
+    }));
+  }
+
+  // ── События страницы ────────────────────────────────────────────────────
+
+  async onPageEvent(type, data) {
+    switch (type) {
+      case 'audio':
+        this.sendAudio(Float32Array.from(data));
+        break;
+
+      case 'participants': {
+        // Состав отдаём событиями входа и ухода — их ждёт наш контроллер.
+        const humans = Number(data?.humans ?? 0);
+        for (let i = this.humans + 1; i <= humans; i++) await this.participantEvent(i, 'join');
+        for (let i = humans + 1; i <= this.humans; i++) await this.participantEvent(i, 'leave');
+        this.humans = humans;
+        break;
+      }
+
+      case 'chat': {
+        const author = String(data?.author || 'участник');
+        if (!this.chatAuthors.has(author)) this.chatAuthors.set(author, `chat-${this.chatAuthors.size + 1}`);
+        await sendWebhook(this.webhookUrl, this.webhookSecret, event(this.id, this.metadata, 'chat_messages.update', {
+          text: String(data?.text || ''),
+          sender_name: author,
+          sender_uuid: this.chatAuthors.get(author),
+          to: 'everyone',
+          timestamp: Math.floor(Date.now() / 1000),
+        }), this.log);
+        this.log.info?.(`[${this.id}] чат: ${author}: ${String(data?.text || '').slice(0, 60)}`);
+        break;
+      }
+
+      case 'ready':
+        this.log.info?.(`[${this.id}] сценарий страницы в кадре ${data?.url}`);
+        break;
+
+      case 'tracks':
+        this.log.info?.(`[${this.id}] дорожек участников: ${data?.count}`);
+        break;
+
+      default:
+        break;
+    }
+  }
+
+  async participantEvent(index, kind) {
+    await sendWebhook(this.webhookUrl, this.webhookSecret, event(this.id, this.metadata, 'participant_events.join_leave', {
+      participant_name: `Участник ${index}`,
+      participant_uuid: `participant-${index}`,
+      event_type: kind,
+      timestamp_ms: Date.now(),
+    }), this.log);
+  }
+
+  // ── Жизненный цикл ──────────────────────────────────────────────────────
+
+  async start() {
+    const platform = PLATFORMS[this.platform];
+    if (!platform) throw new Error(`площадка ${this.platform} не поддержана`);
+
+    await this.setState('joining');
+    this.browser = await chromium.launch({
+      headless: false,
+      args: [
+        '--no-sandbox',
+        '--use-fake-ui-for-media-stream',
+        '--autoplay-policy=no-user-gesture-required',
+        '--disable-dev-shm-usage',
+        // Изоляция сайтов выключена намеренно: чат Телемоста живёт в кадре
+        // другого происхождения, и со включённой изоляцией наш сценарий туда
+        // не попадает вовсе. Браузер бота открывает единственную страницу —
+        // встречу, куда его позвали.
+        '--disable-features=IsolateOrigins,site-per-process',
+      ],
+    });
+    const ctx = await this.browser.newContext({ permissions: ['microphone', 'camera'], locale: 'ru-RU' });
+    await ctx.exposeFunction('__botSend', (type, data) => { void this.onPageEvent(type, data); });
+    await ctx.addInitScript(platform.payload);
+    this.page = await ctx.newPage();
+
+    this.connectAudio();
+    await this.page.goto(this.meetingUrl, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT_MS });
+    await this.joinMeeting(platform.join);
+  }
+
+  async joinMeeting(sel) {
+    const click = async (selector, what) => {
+      const el = this.page.locator(selector).first();
+      if (!(await el.count().catch(() => 0))) return false;
+      try { await el.click({ timeout: 5_000 }); this.log.info?.(`[${this.id}] ${what}`); return true; }
+      catch (e) { this.log.warn?.(`[${this.id}] ${what}: ${e?.message}`); return false; }
+    };
+
+    const name = this.page.locator(sel.nameInput).first();
+    if (await name.count().catch(() => 0)) {
+      await name.fill(this.displayName).catch(() => {});
+      this.log.info?.(`[${this.id}] имя введено`);
+    }
+    await click(sel.cameraOff, 'камера выключена');
+    await click(sel.joinButton, 'нажата кнопка входа');
+
+    // Ждём панель встречи. Пока её нет — мы либо в комнате ожидания, либо
+    // площадка ещё думает; отличить одно от другого со стороны бота нельзя,
+    // поэтому просто ждём до потолка и тогда называем причину.
+    const deadline = Date.now() + ADMIT_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (await this.page.locator(sel.inMeeting).first().count().catch(() => 0)) {
+        this.log.info?.(`[${this.id}] мы во встрече`);
+        await click(sel.chatButton, 'панель чата открыта');
+        await this.setState('joined_recording');
+        return;
+      }
+      await this.page.waitForTimeout(2_000);
+    }
+    await this.setState('fatal_error', { sub: 'request_to_join_denied' });
+    await this.stop();
+  }
+
+  async stop() {
+    if (this.closed) return;
+    this.closed = true;
+    try { await this.page?.locator(PLATFORMS[this.platform].join.leaveButton).first().click({ timeout: 3_000 }); } catch { /* уйдём закрытием браузера */ }
+    try { this.ws?.close(); } catch { /* уже закрыт */ }
+    try { await this.browser?.close(); } catch (e) { this.log.warn?.(`[${this.id}] браузер не закрылся: ${e?.message}`); }
+    if (this.state !== 'fatal_error') await this.setState('ended', { sub: 'left_meeting' });
+  }
+}
