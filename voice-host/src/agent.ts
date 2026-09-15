@@ -37,6 +37,7 @@ import {
   meetingInstructions,
   meetingIntro,
   resumeAck,
+  transcriptionPrompt,
 } from './prompts.js';
 
 const TOPIC = 'linkeon';
@@ -569,11 +570,18 @@ export default defineAgent({
         // правки сразу.
         //
         // Наличие поля в типах не означает поддержки конкретной моделью.
+        //
+        // prompt — подсказка, какое имя здесь ожидается. Без неё имя
+        // ассистента в шумном канале слетает примерно в половине случаев
+        // («Герман», «Норман»), и гейт, который сверяет текст, честно молчит
+        // на прямое обращение. Замер и проверка поля на живом API — в
+        // докстринге transcriptionPrompt().
         ...(isMeeting
           ? {
               inputAudioTranscription: {
                 model: process.env.VOICE_TRANSCRIBE_MODEL || 'gpt-4o-transcribe',
                 language: 'ru',
+                prompt: transcriptionPrompt(agentName),
               },
             }
           : {}),

@@ -1,6 +1,12 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { answerTo, answerToChat, callInstructions, meetingInstructions } from './prompts.js';
+import {
+  answerTo,
+  answerToChat,
+  callInstructions,
+  meetingInstructions,
+  transcriptionPrompt,
+} from './prompts.js';
 
 const SPECIALISTS = [
   { name: 'Алексей', role: 'юрист' },
@@ -175,5 +181,21 @@ describe('answerToChat', () => {
     const s = flat(answerToChat('Дмитрий', 'дай ссылку'));
     assert.match(s, /вслух|голос/i);
     assert.match(s, /write_to_chat/);
+  });
+});
+
+describe('transcriptionPrompt', () => {
+  test('называет имя ассистента — ради него подсказка и нужна', () => {
+    assert.match(transcriptionPrompt('Роман'), /Роман/);
+    assert.match(transcriptionPrompt('Шанкар'), /Шанкар/);
+  });
+
+  test('задаёт язык: подсказка едет в тот же блок, что и language', () => {
+    assert.match(transcriptionPrompt('Роман'), /русск/i);
+  });
+
+  test('короткая — это подсказка распознаванию, а не инструкция модели', () => {
+    // Длинный текст в этом поле уводит расшифровку в пересказ подсказки.
+    assert.ok(transcriptionPrompt('Роман').length < 150);
   });
 });
