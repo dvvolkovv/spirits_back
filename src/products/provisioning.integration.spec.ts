@@ -3,6 +3,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
+import { ProductsService } from './products.service';
 import { ProvisioningService } from './provisioning.service';
 import { SecretsService } from './secrets.service';
 
@@ -1135,5 +1136,32 @@ maybe('провижининг против живого Postgres', () => {
     expect(outcomes.filter((o) => o === 'ok')).toHaveLength(1);
     expect(await jobsOf(p.id)).toEqual(['failed', 'queued']);
     expect((await getProduct(p.id)).status).toBe('provisioning');
+  });
+
+  it('20. выдача клиенту несёт форму продукта и причину отказа', async () => {
+    // Колонки завела миграция 002, а перечисление в ProductsService про них не
+    // знало — и до кабинета они не доезжали: карточка отказа показывала
+    // «сервер не передал причину» при заполненной колонке в базе, а бот
+    // выглядел сайтом. На сервере это не ломало НИЧЕГО, и покраснеть было
+    // нечему: серверу обе колонки не нужны, нужны они только клиенту.
+    //
+    // Поэтому сценарий здесь, а не на заглушке pg: там проверялся бы текст
+    // запроса, то есть форма. Здесь спрашивается то, что клиент получит.
+    await failedProduct({ slug: 'vydacha-otkaz', reason: 'нет места на диске' });
+    await product({ slug: 'vydacha-bot', kind: 'bot', status: 'running' });
+
+    const rows = await new ProductsService(pg as any).list('u-1');
+    const bySlug = Object.fromEntries(rows.map((r) => [r.slug, r]));
+
+    expect(bySlug['vydacha-otkaz'].provision_error).toBe('нет места на диске');
+    expect(bySlug['vydacha-otkaz'].kind).toBe('site');
+    expect(bySlug['vydacha-bot'].kind).toBe('bot');
+
+    // Сторож секретов стоит рядом с новыми колонками нарочно: дописывать
+    // перечисление в следующий раз будут здесь же.
+    for (const row of rows) {
+      expect(Object.keys(row)).not.toContain('secrets_encrypted');
+      expect(Object.keys(row)).not.toContain('runner_token_hash');
+    }
   });
 });
