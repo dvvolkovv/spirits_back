@@ -188,20 +188,37 @@ export class MeetingBot {
   }
 
   async joinMeeting(sel) {
-    const click = async (selector, what) => {
+    /**
+     * Дождаться элемента, а не спросить о нём один раз.
+     *
+     * Первая редакция брала `count()` сразу после загрузки — и не находила
+     * ничего: страница встречи рисует экран входа уже после
+     * `domcontentloaded`, и в логе оставалось молчание вместо «имя введено».
+     * Ждём явно и недолго; не дождались — идём дальше, шаг может быть
+     * необязательным (камеры может не быть вовсе).
+     */
+    const waitFor = async (selector, timeout = 30_000) => {
       const el = this.page.locator(selector).first();
-      if (!(await el.count().catch(() => 0))) return false;
+      try { await el.waitFor({ state: 'visible', timeout }); return el; }
+      catch { return null; }
+    };
+
+    const click = async (selector, what, timeout = 10_000) => {
+      const el = await waitFor(selector, timeout);
+      if (!el) { this.log.info?.(`[${this.id}] ${what}: элемента нет, пропускаем`); return false; }
       try { await el.click({ timeout: 5_000 }); this.log.info?.(`[${this.id}] ${what}`); return true; }
       catch (e) { this.log.warn?.(`[${this.id}] ${what}: ${e?.message}`); return false; }
     };
 
-    const name = this.page.locator(sel.nameInput).first();
-    if (await name.count().catch(() => 0)) {
+    const name = await waitFor(sel.nameInput);
+    if (name) {
       await name.fill(this.displayName).catch(() => {});
       this.log.info?.(`[${this.id}] имя введено`);
+    } else {
+      this.log.warn?.(`[${this.id}] поля имени не дождались`);
     }
-    await click(sel.cameraOff, 'камера выключена');
-    await click(sel.joinButton, 'нажата кнопка входа');
+    await click(sel.cameraOff, 'камера выключена', 5_000);
+    await click(sel.joinButton, 'нажата кнопка входа', 30_000);
 
     // Ждём панель встречи. Пока её нет — мы либо в комнате ожидания, либо
     // площадка ещё думает; отличить одно от другого со стороны бота нельзя,
