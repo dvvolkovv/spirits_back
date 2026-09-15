@@ -15,6 +15,10 @@ const JOB = {
   jobId: 'j-1',
   productId: 'p-1',
   slug: 'selyanska',
+  // Имя и слаг РАЗНЫЕ намеренно: в каркас продукта уезжает именно имя, и
+  // маршрут, потерявший его по дороге, на совпадающих значениях был бы
+  // неотличим от исправного.
+  name: 'Селянська',
   kind: 'bot',
   runnerToken: 'a'.repeat(64),
   secrets: { BOT_TOKEN: '123:abc' },
@@ -89,6 +93,32 @@ describe('HostController.complete', () => {
       ok: false,
       error: 'сборка контейнера не прошла',
     });
+  });
+
+  it('длинная причина режется маршрутом, а не отбивается', async () => {
+    const { ctrl, prov } = makeCtrl();
+    const huge = 'docker build: '.padEnd(50_000, 'ы');
+
+    await ctrl.complete('j-1', { ok: false, error: huge } as any);
+
+    const sent = prov.completeJob.mock.calls[0][1].error;
+    expect(sent).toHaveLength(2000);
+    // Начало сохранено — именно там причина, а не в хвосте.
+    expect(sent.startsWith('docker build: ')).toBe(true);
+    // Хвост помечен: иначе по обрезанной строке не отличить «сообщение
+    // кончилось» от «мы его срезали».
+    expect(sent.endsWith('…')).toBe(true);
+  });
+
+  it('причина по границе потолка не трогается', async () => {
+    const { ctrl, prov } = makeCtrl();
+    const exact = 'э'.repeat(2000);
+
+    await ctrl.complete('j-1', { ok: false, error: exact } as any);
+
+    // Ровно на потолке подрезки быть не должно: иначе многоточие появляется у
+    // сообщений, которые целы, и диагностика врёт в другую сторону.
+    expect(prov.completeJob.mock.calls[0][1].error).toBe(exact);
   });
 
   it('лишние поля тела до сервиса не доезжают', async () => {

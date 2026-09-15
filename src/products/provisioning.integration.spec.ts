@@ -159,6 +159,14 @@ maybe('провижининг против живого Postgres', () => {
   });
 
   afterAll(async () => {
+    // ЗА СОБОЙ УБИРАЕМ. beforeAll требует ПУСТУЮ таблицу (гард на чужую базу),
+    // а фикстуры последнего сценария остаются в базе — то есть без этой
+    // уборки ВТОРОЙ прогон в той же одноразовой базе красный всегда, и красный
+    // целиком: падает beforeAll, а с ним все 33 теста. На первой же батарее
+    // мутаций это выглядело как идеальная ловля — прибор врал, а не сторожил.
+    await pool?.query(
+      'TRUNCATE products, product_provision_jobs, product_turns RESTART IDENTITY CASCADE',
+    );
     await pool?.end();
   });
 
@@ -176,6 +184,9 @@ maybe('провижининг против живого Postgres', () => {
 
   type Seed = {
     slug?: string;
+    /** По умолчанию своё у каждого продукта: имя не должно совпадать ни со
+     *  слагом, ни с именем соседа — иначе перепутанные строки неразличимы. */
+    name?: string;
     kind?: 'site' | 'bot';
     status?: string;
     port?: number | null;
@@ -189,12 +200,13 @@ maybe('провижининг против живого Postgres', () => {
   async function product(o: Seed = {}) {
     const id = crypto.randomUUID();
     const slug = o.slug ?? `p-${seq++}`;
+    const name = o.name ?? `имя ${slug}`;
     const box = o.secrets ? secrets.encrypt(o.secrets, id) : null;
     await pool.query(
       `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path,
                              runner_token_hash, secrets_encrypted, port,
                              runner_seen_at, created_at)
-       VALUES ($1, 'u-1', 'продукт', $2, $3, $4, '/product', $5, $6, $7,
+       VALUES ($1, 'u-1', $10, $2, $3, $4, '/product', $5, $6, $7,
                CASE WHEN $8::text IS NULL THEN NULL ELSE now() - $8::interval END,
                now() - $9::interval)`,
       [
@@ -209,9 +221,10 @@ maybe('провижининг против живого Postgres', () => {
         o.port ?? null,
         o.seenAgo ?? null,
         o.createdAgo ?? '1 second',
+        name,
       ],
     );
-    return { id, slug };
+    return { id, slug, name };
   }
 
   type JobSeed = {
@@ -288,6 +301,10 @@ maybe('провижининг против живого Postgres', () => {
       jobId: j,
       productId: p.id,
       slug: 'claim-one',
+      // Имя приезжает из НАСТОЯЩЕЙ колонки и отличается от слага: агент несёт
+      // его в каркас продукта, и забытая колонка в CTE issued дала бы
+      // undefined в заголовке сайта или в имени бота.
+      name: 'имя claim-one',
       kind: 'bot',
       runnerToken: expect.stringMatching(/^[0-9a-f]{64}$/),
       secrets: { BOT_TOKEN: '123:abc' },

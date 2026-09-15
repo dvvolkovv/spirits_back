@@ -11,6 +11,9 @@ const ROW = {
   job_id: 'j-1',
   product_id: 'p-1',
   slug: 's',
+  // Имя и слаг РАЗНЫЕ: в каркас продукта уезжает имя, и потеря алиаса или
+  // перестановка с слагом на одинаковых значениях была бы невидима.
+  name: 'Селянська',
   kind: 'site',
   box: Buffer.from('коробка'),
 };
@@ -306,10 +309,27 @@ describe('ProvisioningService.claimJob', () => {
       jobId: 'j-1',
       productId: 'p-1',
       slug: 's',
+      name: 'Селянська',
       kind: 'site',
       runnerToken: expect.stringMatching(/^[0-9a-f]{64}$/),
       secrets: { BOT_TOKEN: 'т' },
     });
+  });
+
+  it('имя продукта уезжает агенту вместе с заданием', async () => {
+    // Агенту нужно человеческое имя: оно идёт в каркас (заголовок страницы,
+    // имя бота), и слаг там не годится — 'my-shop' вместо «Мой магазин».
+    // Забытая колонка в CTE issued даёт name: undefined, а каркас с undefined
+    // виден только глазами и уже на готовом продукте.
+    const { svc, calls } = makeService();
+
+    const job = await svc.claimJob();
+
+    expect(job!.name).toBe('Селянська');
+    // Колонка обязана быть и в RETURNING правки продукта, и в финальной
+    // выборке: без первого её неоткуда взять, без второго она не доедет.
+    expect(calls[0].sql).toMatch(/RETURNING id, slug, name, kind/);
+    expect(calls[0].sql).toMatch(/i\.name AS name/);
   });
 
   it('продукт без секретов не роняет выдачу задания', async () => {

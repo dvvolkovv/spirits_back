@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { ConflictException } from '@nestjs/common';
+import { BadRequestException, ConflictException } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { ProvisioningService } from './provisioning.service';
 import { SecretsService } from './secrets.service';
@@ -362,6 +362,43 @@ describe('ProvisioningService.create', () => {
 
       expect(sqlOf(calls)).not.toContain('INSERT INTO products');
     }
+  });
+
+  it('секреты имеют потолок: число, длина имени и длина значения', async () => {
+    // Без потолков десять мегабайт уезжают в шифротекст, в строку продукта, в
+    // тело задания и дальше в окружение контейнера, где предел живёт уже в
+    // ядре хоста (ARG_MAX) — то есть отказ вылезает при ЗАПУСКЕ продукта, на
+    // чужой машине и без объяснения.
+    const cases: [string, Record<string, any>][] = [
+      ['число', Object.fromEntries(Array.from({ length: 65 }, (_, i) => [`K${i}`, 'v']))],
+      ['длина имени', { ['K'.repeat(65)]: 'v' }],
+      ['длина значения', { K: 'ы'.repeat(8193) }],
+    ];
+    for (const [, bad] of cases) {
+      const { svc, calls } = makeService();
+
+      await expect(
+        svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: bad }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      // Отбой ДО всякой записи: иначе продукт остался бы висеть без секретов.
+      expect(sqlOf(calls)).not.toContain('INSERT INTO products');
+    }
+  });
+
+  it('набор по самой границе потолков проходит', async () => {
+    // Обратная сторона: потолок, поставленный на единицу ниже нужного,
+    // отрезает законный случай — и без этой половины такое ужесточение
+    // прошло бы зелёным.
+    const { svc } = makeService();
+    const secrets = Object.fromEntries(Array.from({ length: 64 }, (_, i) => [`K${i}`, 'v']));
+    secrets['K0'] = 'ы'.repeat(8192);
+    secrets['K'.repeat(64)] = 'v';
+    delete secrets['K63'];
+
+    await expect(
+      svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets }),
+    ).resolves.toMatchObject({ productId: expect.any(String) });
   });
 
   it('имя секрета вне формы переменной окружения отвергается', async () => {

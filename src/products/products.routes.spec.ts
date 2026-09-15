@@ -1,8 +1,14 @@
 import 'reflect-metadata';
 import * as fs from 'fs';
 import * as path from 'path';
-import { BadRequestException, ValidationPipe } from '@nestjs/common';
-import { GUARDS_METADATA, MODULE_METADATA, PATH_METADATA, ROUTE_ARGS_METADATA } from '@nestjs/common/constants';
+import { BadRequestException, RequestMethod, ValidationPipe } from '@nestjs/common';
+import {
+  GUARDS_METADATA,
+  METHOD_METADATA,
+  MODULE_METADATA,
+  PATH_METADATA,
+  ROUTE_ARGS_METADATA,
+} from '@nestjs/common/constants';
 import { RouteParamtypes } from '@nestjs/common/enums/route-paramtypes.enum';
 import { ProductsController } from './products.controller';
 import { RunnerController } from './runner.controller';
@@ -43,11 +49,44 @@ function globalPrefix(): string {
 }
 
 /** Полный путь маршрута — тот самый, по которому в него стучатся снаружи. */
-function routeOf(ctrl: any, method: string): string {
+function pathOf(ctrl: any, method: string): string {
   const ctrlPath = Reflect.getMetadata(PATH_METADATA, ctrl) ?? '';
   const methodPath = Reflect.getMetadata(PATH_METADATA, ctrl.prototype[method]) ?? '';
   return `/${[globalPrefix(), ctrlPath, methodPath].join('/')}`.replace(/\/{2,}/g, '/');
 }
+
+/**
+ * Адрес ЦЕЛИКОМ, вместе с глаголом: «POST /webhook/products/host/poll».
+ *
+ * Глагол лежит под ДРУГИМ ключом метаданных (METHOD_METADATA), чем путь, и
+ * сторож, читающий только путь, переживает замену @Post на @Get целиком:
+ * измерено — все тесты зелёные, живой сервер отдаёт
+ * `404 Cannot POST /webhook/products/host/poll`. Поэтому глагол склеен с
+ * путём: адрес маршрута — это пара, и врозь они не сторожатся.
+ */
+function endpointOf(ctrl: any, method: string): string {
+  const verb = Reflect.getMetadata(METHOD_METADATA, ctrl.prototype[method]);
+  return `${RequestMethod[verb]} ${pathOf(ctrl, method)}`;
+}
+
+/** Все методы контроллера, объявленные маршрутами. */
+const routeMethodsOf = (ctrl: any): string[] =>
+  Object.getOwnPropertyNames(ctrl.prototype).filter(
+    (m) => m !== 'constructor' && Reflect.hasMetadata(PATH_METADATA, ctrl.prototype[m]),
+  );
+
+/** Имена, которые маршрут спрашивает у пути через @Param('…'). */
+function paramNamesOf(ctrl: any, method: string): string[] {
+  const args = Reflect.getMetadata(ROUTE_ARGS_METADATA, ctrl, method) ?? {};
+  return Object.keys(args)
+    .filter((k) => k.startsWith(`${RouteParamtypes.PARAM}:`))
+    .map((k) => args[k].data)
+    .sort();
+}
+
+/** Имена, которые путь на самом деле объявляет: `:id`, `:turnId`. */
+const placeholdersOf = (ctrl: any, method: string): string[] =>
+  [...pathOf(ctrl, method).matchAll(/:([A-Za-z0-9_]+)/g)].map((m) => m[1]).sort();
 
 /**
  * Тип, который Nest передаёт в ValidationPipe как metatype тела. Берётся из
@@ -135,21 +174,53 @@ describe('адреса маршрутов', () => {
     //
     // Адреса — контракт с ДРУГИМ репозиторием (product-runner, точка входа
     // host), поэтому сверяются с литералом, а не с выражением из тех же
-    // метаданных.
-    expect(routeOf(HostController, 'poll')).toBe('/webhook/products/host/poll');
-    expect(routeOf(HostController, 'complete')).toBe('/webhook/products/host/jobs/:id/complete');
+    // метаданных. Глагол — часть адреса: см. endpointOf.
+    expect(endpointOf(HostController, 'poll')).toBe('POST /webhook/products/host/poll');
+    expect(endpointOf(HostController, 'complete')).toBe(
+      'POST /webhook/products/host/jobs/:id/complete',
+    );
   });
 
   it('кнопки кабинета бьют туда же, куда ходит фронт', () => {
-    expect(routeOf(ProductsController, 'create')).toBe('/webhook/products');
-    expect(routeOf(ProductsController, 'retry')).toBe('/webhook/products/:id/retry');
+    expect(endpointOf(ProductsController, 'create')).toBe('POST /webhook/products');
+    expect(endpointOf(ProductsController, 'retry')).toBe('POST /webhook/products/:id/retry');
   });
 
   it('уже работающие маршруты соседей не переехали', () => {
-    // Живой контроль самого прибора: эти два адреса работают на проде, и если
-    // routeOf считает их неверно, все утверждения выше ничего не стоят.
-    expect(routeOf(RunnerController, 'poll')).toBe('/webhook/products/runner/poll');
-    expect(routeOf(ProductsController, 'chat')).toBe('/webhook/products/:id/chat');
+    // Живой контроль самого прибора: эти адреса работают на проде, и если
+    // endpointOf считает их неверно, все утверждения выше ничего не стоят.
+    // GET здесь заодно доказывает, что глагол действительно читается, а не
+    // подставляется одинаковым.
+    expect(endpointOf(RunnerController, 'poll')).toBe('POST /webhook/products/runner/poll');
+    expect(endpointOf(ProductsController, 'chat')).toBe('POST /webhook/products/:id/chat');
+    expect(endpointOf(ProductsController, 'list')).toBe('GET /webhook/products');
+  });
+
+  it('каждый :плейсхолдер пути спрашивается @Param-ом с тем же именем', () => {
+    // Имя в @Param('id') и имя в пути ':id' — два независимых литерала, и
+    // Nest их не сверяет. Разъехавшись, они дают `undefined` в аргументе
+    // маршрута: у агента отчёт уходит в `WHERE id = NULL` (ноль строк, ответ
+    // { ok: true }, задание висит в running до сборщика), у кнопки «повторить»
+    // — вечная 404. Оба случая полностью зелёные на юнит-тестах: те зовут
+    // ctrl.complete('j-1', body) позиционно и про имена не знают.
+    //
+    // Сверка идёт со САМИМ ПУТЁМ, а не со списком литералов: переименование
+    // ':id' в ':jobId' вместе с @Param остаётся законным, а разъезд — нет.
+    let checked = 0;
+    for (const ctrl of [ProductsController, RunnerController, HostController]) {
+      for (const method of routeMethodsOf(ctrl)) {
+        const where = `${ctrl.name}.${method}`;
+        expect({ where, params: paramNamesOf(ctrl, method) }).toEqual({
+          where,
+          params: placeholdersOf(ctrl, method),
+        });
+        checked += placeholdersOf(ctrl, method).length;
+      }
+    }
+    // Сторож самого цикла: пустой обход прошёл бы зелёным и ничего не значил.
+    // Сегодня плейсхолдеров шесть — chat, history, revert (два), retry,
+    // complete агента, events и complete раннера.
+    expect(checked).toBeGreaterThanOrEqual(6);
   });
 });
 
@@ -181,6 +252,29 @@ describe('тело отчёта агента', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 
+  it('дробный порт не проходит', async () => {
+    // @IsNumber вместо @IsInt проверки выше переживает целиком: 8003.5 и
+    // число, и в диапазоне. А уезжает оно в COALESCE($2, port) по колонке int
+    // и роняет запись 500-й внутри отчёта агента — тот же исход, что у
+    // строкового порта, и невидимый теми же тестами.
+    await expect(
+      through(HostController, 'complete', { ok: true, port: 8003.5 }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('длинная причина отказа НЕ отбивается: её режет сервер, а не труба', async () => {
+    // Потолок в валидаторе означал бы 400 в ответ агенту на честном отчёте
+    // (`docker build` со stderr — это тысячи символов). Агент отчёт в try не
+    // заворачивает: 400 всплыл бы из цикла опроса и убил бы процесс, а
+    // задание висело бы в running до сборщика зависших. Подрезка живёт в
+    // маршруте — см. тест про ERROR_MAX в host.controller.spec.ts.
+    const huge = 'у'.repeat(50_000);
+
+    const ok = await through(HostController, 'complete', { ok: false, error: huge });
+
+    expect((ok as any).error).toHaveLength(50_000);
+  });
+
   it('отчёт без ok не проходит', async () => {
     // Отсутствующий признак исхода — это не «успех по умолчанию»: без него
     // completeJob пошёл бы по ветке отказа и похоронил бы развёрнутый продукт.
@@ -206,6 +300,19 @@ describe('тело заведения продукта', () => {
     await expect(through(ProductsController, 'create', body({ name: '' }))).rejects.toBeInstanceOf(
       BadRequestException,
     );
+  });
+
+  it('имя из одних пробелов не проходит', async () => {
+    // @MinLength(1) считает пробелы символами, поэтому '   ' проходил бы, и в
+    // кабинете появлялся бы продукт с пустым именем — переименовать его нечем.
+    await expect(
+      through(ProductsController, 'create', body({ name: '   ' })),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('имя приезжает подрезанным по краям', async () => {
+    const ok = await through(ProductsController, 'create', body({ name: '  Селянська  ' }));
+    expect((ok as any).name).toBe('Селянська');
   });
 
   it('неизвестная форма продукта не проходит', async () => {

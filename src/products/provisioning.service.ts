@@ -29,6 +29,11 @@ export interface ClaimedJob {
   jobId: string;
   productId: string;
   slug: string;
+  // Человеческое имя продукта. Уезжает в каркас (заголовок страницы сайта,
+  // имя бота) — слаг там не годится: 'my-shop' вместо «Мой магазин».
+  // Агент берёт его из задания: другого способа узнать имя у него нет, а
+  // undefined в каркасе виден только глазами, уже на готовом продукте.
+  name: string;
   kind: ProductKind;
   runnerToken: string;
   secrets: Record<string, string>;
@@ -49,6 +54,20 @@ export const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
 // там либо теряются, либо подменяют соседнюю переменную — в зависимости от
 // того, как агент соберёт env-файл.
 const SECRET_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+// Потолки набора секретов. Без них десять мегабайт уезжают в шифротекст, в
+// строку продукта, в тело задания и дальше в env контейнера — ограничение на
+// размер окружения процесса живёт уже в ядре хоста (ARG_MAX), и упрётся в него
+// не наш код, а запуск продукта, то есть отказ будет виден на чужой машине и
+// без объяснения.
+//
+// 8 КиБ на значение — с запасом под приватный ключ в PEM (RSA-4096 около
+// 3.2 КиБ) и JSON сервис-аккаунта; 64 имени — с запасом под всё, что видели у
+// живых продуктов; 64 символа на имя — предел разумного для переменной
+// окружения.
+const SECRET_NAME_MAX = 64;
+const SECRET_VALUE_MAX = 8192;
+const SECRET_COUNT_MAX = 64;
 
 // Путь ВНУТРИ контейнера продукта, а не на хосте: раннер живёт внутри
 // контейнера (агент провижининга — снаружи), и чекаут там у всех продуктов
@@ -224,12 +243,24 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     // «провижининг сорвался» без причины. Пустая строка доезжает до
     // контейнера переменной без значения: бот читает это как «токена нет» и
     // не стартует, тоже молча.
-    for (const [name, value] of Object.entries(input.secrets ?? {})) {
+    const entries = Object.entries(input.secrets ?? {});
+    if (entries.length > SECRET_COUNT_MAX) {
+      throw new BadRequestException(`секретов больше ${SECRET_COUNT_MAX}`);
+    }
+    for (const [name, value] of entries) {
       if (!SECRET_NAME_RE.test(name)) {
         throw new BadRequestException(`имя секрета ${JSON.stringify(name)} не переменная окружения`);
       }
+      if (name.length > SECRET_NAME_MAX) {
+        throw new BadRequestException(`имя секрета длиннее ${SECRET_NAME_MAX} символов`);
+      }
       if (typeof value !== 'string' || value === '') {
         throw new BadRequestException(`секрет ${name}: значение должно быть непустой строкой`);
+      }
+      // Длина проверяется ПОСЛЕ типа: у не-строки .length либо отсутствует,
+      // либо означает что-то другое (у массива — число элементов).
+      if (value.length > SECRET_VALUE_MAX) {
+        throw new BadRequestException(`секрет ${name}: значение длиннее ${SECRET_VALUE_MAX} символов`);
       }
     }
 
@@ -368,10 +399,10 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
           UPDATE products
              SET runner_token_hash = $1
            WHERE id IN (SELECT product_id FROM claimed)
-          RETURNING id, slug, kind, secrets_encrypted AS box
+          RETURNING id, slug, name, kind, secrets_encrypted AS box
        )
        SELECT c.id AS job_id, i.id AS product_id, i.slug AS slug,
-              i.kind AS kind, i.box AS box
+              i.name AS name, i.kind AS kind, i.box AS box
          FROM claimed c JOIN issued i ON i.id = c.product_id`,
       [hash],
     );
@@ -383,6 +414,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       jobId: row.job_id,
       productId: row.product_id,
       slug: row.slug,
+      name: row.name,
       kind: row.kind,
       runnerToken,
       // ДВА аргумента: коробка привязана к продукту через AAD. Признак
