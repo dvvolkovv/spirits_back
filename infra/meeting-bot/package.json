@@ -6,7 +6,7 @@
   "description": "Свой бот для внешних встреч: Zoom и Яндекс Телемост",
   "scripts": {
     "start": "node src/server.mjs",
-    "test": "node --test test/"
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "playwright": "^1.60.0",
