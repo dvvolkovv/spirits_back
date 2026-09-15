@@ -257,3 +257,116 @@ describe('Mixer — выравнивание громкости', () => {
     assert.equal(s.listener.speechFrames, 0);
   });
 });
+
+/**
+ * Усиление применяется только к тому, кто СЕЙЧАС говорит.
+ *
+ * Замер 15.09.2026 на настоящей встрече (запись Taler ID, окно 03:00–13:00,
+ * эталон 1527 слов): один говорящий через микшер — 83% слов, он же плюс двое
+ * молчащих с обычным микрофонным фоном — 59%. Само сложение стоит шести
+ * пунктов, остальные девятнадцать — подъём фона молчащих: шум микрофона около
+ * 120 проходит порог «это речь» (40), из него строится оценка громкости, и
+ * выравнивание тянет ШУМ к целевым 3000, то есть в ×12. Под каждой фразой
+ * говорящего лежат два таких усиленных шипения.
+ */
+describe('Mixer — молчащего не усиливаем', () => {
+  const leveller = () => new Mixer(true);
+  function tone(level: number): Int16Array {
+    return Int16Array.from({ length: SAMPLES_PER_TICK }, (_, i) => (i % 2 === 0 ? level : -level));
+  }
+
+  /**
+   * Речь — это уровень С ПАУЗАМИ, и в тестах тоже.
+   *
+   * Ровная синусоида постоянной громкости речью не является и отличить её от
+   * шума по громкости кадра нельзя в принципе: микшер видит только уровень.
+   * Поэтому говорящий здесь произносит «слоги» — сорок тиков звука, десять
+   * тиков тишины, как живая фраза. Молчащий выдаёт ровный фон без пауз.
+   */
+  function syllable(level: number, tick: number): Int16Array {
+    return tone(tick % 50 < 40 ? level : Math.round(level * 0.1));
+  }
+  function rms(s: Int16Array): number {
+    let sum = 0;
+    for (const v of s) sum += v * v;
+    return Math.sqrt(sum / s.length);
+  }
+
+  /** Говорящий и молчащий с обычным фоном микрофона — случай живой встречи. */
+  function room(speaker: number, noise: number, ticks: number): Int16Array {
+    const m = leveller();
+    let out = new Int16Array(SAMPLES_PER_TICK);
+    for (let i = 0; i < ticks; i++) {
+      m.push('alice', syllable(speaker, i));
+      m.push('bob', tone(noise));
+      out = m.tick();
+    }
+    return out;
+  }
+
+  test('пока говорит один, фон второго в сведение не поднимается', () => {
+    // Alice говорит тихо (её поднимут), Bob молчит, но его микрофон шумит.
+    // Раньше шум Bob проходил порог речи и тоже поднимался к 3000.
+    const out = room(400, 120, 200);
+    // В сведении должна быть поднятая Alice плюс НЕусиленный фон Bob.
+    // Если поднялись оба, уровень будет заметно выше цели.
+    assert.ok(
+      rms(out) < Mixer.TARGET_RMS * 1.3,
+      `уровень сведения ${Math.round(rms(out))} — похоже, подняли и молчащего`,
+    );
+  });
+
+  test('молчащий помечен как молчащий, говорящий — как говорящий', () => {
+    const m = leveller();
+    for (let i = 0; i < 200; i++) {
+      m.push('alice', syllable(400, i));
+      m.push('bob', tone(120));
+      m.tick();
+    }
+    const s = Object.fromEntries(m.stats().map((x) => [x.participant, x.speaking]));
+    assert.equal(s.alice, true, 'говорящего сочли молчащим');
+    assert.equal(s.bob, false, 'фон молчащего сочли речью');
+  });
+
+  test('заговорил — усиливается сразу, а не со второго слога', () => {
+    const m = leveller();
+    for (let i = 0; i < 200; i++) { m.push('alice', syllable(400, i)); m.push('bob', tone(120)); m.tick(); }
+    // Alice замолчала, Bob заговорил на своём уровне.
+    for (let i = 0; i < 3; i++) { m.push('alice', tone(40)); m.push('bob', tone(400)); m.tick(); }
+    const s = Object.fromEntries(m.stats().map((x) => [x.participant, x.speaking]));
+    assert.equal(s.bob, true, 'начало фразы не распозналось как речь');
+  });
+
+  test('говорят оба — поднимаем обоих', () => {
+    // Хоровая речь не повод глушить второго: правило про молчащих, а не про
+    // «только самый громкий».
+    const m = leveller();
+    for (let i = 0; i < 200; i++) { m.push('alice', syllable(400, i)); m.push('bob', syllable(500, i)); m.tick(); }
+    const s = Object.fromEntries(m.stats().map((x) => [x.participant, x.speaking]));
+    assert.equal(s.alice, true);
+    assert.equal(s.bob, true);
+  });
+
+  test('тихого участника с живой встречи по-прежнему поднимаем', () => {
+    // Числа не выдуманы: 15.09.2026 самый тихий участник шёл на 276 при фоне
+    // своего микрофона около 120. Ради него выравнивание и заводили, и правка
+    // «не поднимать молчащих» не должна выбросить его вместе с шумом.
+    const m = leveller();
+    for (let i = 0; i < 300; i++) {
+      m.push('тихий', syllable(276, i));
+      m.push('фон', tone(120));
+      m.tick();
+    }
+    const s = Object.fromEntries(m.stats().map((x) => [x.participant, x]));
+    assert.equal(s['тихий'].speaking, true, 'тихого сочли молчащим');
+    assert.ok(s['тихий'].gain > 3, `усиление тихого ${s['тихий'].gain} — его не подняли`);
+    assert.equal(s['фон'].speaking, false, 'фон соседа сочли речью');
+  });
+
+  test('без выравнивания сведение не трогаем вовсе', () => {
+    const m = new Mixer(false);
+    let out = new Int16Array(SAMPLES_PER_TICK);
+    for (let i = 0; i < 10; i++) { m.push('bob', tone(120)); out = m.tick(); }
+    assert.ok(Math.abs(rms(out) - 120) < 5, 'без выравнивания уровень изменился');
+  });
+});

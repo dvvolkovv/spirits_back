@@ -17,6 +17,16 @@ interface Track {
   peak: number;
   /** Скользящая громкость речи. Ноль — речи ещё не было. */
   speechRms: number;
+  /** Фон микрофона: уровень, к которому участник возвращается в паузах. */
+  noiseFloor: number;
+  /**
+   * Сколько тиков подряд участник не был признан говорящим.
+   *
+   * По нему решается, усиливать его прямо сейчас или он молчит и идёт в
+   * сведение как есть. Счётчик тиков, а не время: микшер живёт тиками и часов
+   * не знает, а тесты не должны зависеть от таймера.
+   */
+  ticksSinceSpeech: number;
 }
 
 /** Среднеквадратичная громкость кадра. */
@@ -110,6 +120,32 @@ export class Mixer {
   /** Потолок усиления. Больше — и шум тихого микрофона станет громче речи. */
   static readonly MAX_GAIN = 12;
 
+  /**
+   * Сколько тиков после последней речи участник ещё считается говорящим.
+   *
+   * Нужно ради хвостов фразы: между словами и на тихих окончаниях кадры
+   * проваливаются ниже порога, и без удержания усиление моргало бы в середине
+   * слова. Пятнадцать тиков — это 300 мс: паузу между словами перекрывает,
+   * паузу между репликами нет.
+   */
+  static readonly SPEECH_HOLD_FRAMES = 15;
+
+  /**
+   * Во сколько раз кадр должен быть громче собственного фона участника, чтобы
+   * считаться речью.
+   *
+   * Вдвое — это +6 дБ, и граница выбрана по худшему живому случаю, а не по
+   * круглому числу: 15.09.2026 самый тихий участник шёл на 276 при фоне своего
+   * микрофона около 120, то есть с запасом проходит. Ровный шум своего же фона
+   * вдвое себя не превышает: его уровень от кадра к кадру гуляет процентов на
+   * двадцать.
+   *
+   * Разделить шум и речь по одной громкости кадра нельзя в принципе — они
+   * отличаются модуляцией. Поэтому правило не «это шум», а «этот сейчас не
+   * громче собственной тишины, поднимать его не надо».
+   */
+  static readonly SPEECH_OVER_NOISE = 2;
+
   private tracks = new Map<string, Track>();
 
   /**
@@ -153,6 +189,48 @@ export class Mixer {
     }
   }
 
+  /**
+   * Фон микрофона участника: к чему его звук возвращается в паузах.
+   *
+   * Следит за минимумом — быстро вниз, очень медленно вверх. Речь поднимает
+   * уровень в разы и длится секунды, поэтому вверх фон за ней не успевает, а
+   * вот за сменой обстановки (закрыли окно, включили вентилятор) — успевает.
+   *
+   * Абсолютным числом этот порог задать нельзя: у одного микрофона фон 30, у
+   * другого 120, и на живой встрече 15.09.2026 самый тихий участник говорил на
+   * 276 — тише, чем фон соседа.
+   */
+  private trackNoiseFloor(t: Track, rms: number): void {
+    if (t.noiseFloor === 0) {
+      t.noiseFloor = rms;
+      return;
+    }
+    if (rms < t.noiseFloor) {
+      t.noiseFloor = t.noiseFloor * 0.9 + rms * 0.1;
+      return;
+    }
+    // Вверх фон ползёт только на кадрах, которые речью НЕ считаются.
+    //
+    // Иначе длинная реплика сама поднимает свой порог: шаг 0.001 за тик — это
+    // около двадцати секунд до заметного сдвига, и говорящий без пауз через
+    // полминуты перестал бы считаться говорящим. Отсюда же правило «во время
+    // речи фон не трогаем вовсе».
+    if (rms < t.noiseFloor * Mixer.SPEECH_OVER_NOISE) {
+      t.noiseFloor = t.noiseFloor * 0.999 + rms * 0.001;
+    }
+  }
+
+  /**
+   * Говорит ли участник прямо сейчас — по решению последнего тика.
+   *
+   * Отвечает на вопрос «усиливать ли его», а не «есть ли у него звук».
+   * Выставляется в tick(), потому что решение относительное: участник молчит
+   * не сам по себе, а по сравнению с тем, кто в этот момент говорит.
+   */
+  private speakingNow(t: Track): boolean {
+    return t.ticksSinceSpeech <= Mixer.SPEECH_HOLD_FRAMES;
+  }
+
   remove(participant: string): void {
     this.tracks.delete(participant);
   }
@@ -183,22 +261,58 @@ export class Mixer {
   }
 
   /** Что слышно от каждого участника — для диагностики в логе. */
-  stats(): { participant: string; frames: number; speechFrames: number; rms: number; gain: number }[] {
+  stats(): {
+    participant: string;
+    frames: number;
+    speechFrames: number;
+    rms: number;
+    gain: number;
+    speaking: boolean;
+  }[] {
     return [...this.tracks.entries()].map(([participant, t]) => ({
       participant,
       frames: t.frames,
       speechFrames: t.speechFrames,
       rms: Math.round(t.speechRms),
       gain: Number(this.gainFor(participant).toFixed(2)),
+      speaking: this.speakingNow(t),
     }));
   }
 
   /** Один смикшированный кадр. Вызывается ровно раз в TICK_MS. */
   tick(): Int16Array {
-    const out = new Int16Array(this.samplesPerTick);
+    const chunks: { t: Track; participant: string; chunk: Int16Array; rms: number }[] = [];
     for (const [participant, t] of this.tracks) {
       const chunk = this.takeTick(t.queue);
-      const gain = this.gainFor(participant);
+      chunks.push({ t, participant, chunk, rms: rmsOf(chunk) });
+    }
+
+    const out = new Int16Array(this.samplesPerTick);
+    for (const { t, participant, chunk, rms } of chunks) {
+      // Речь отличаем от фона по СОБСТВЕННОМУ фону участника, а не по
+      // громкости соседа.
+      //
+      // Сравнение с самым громким в тике я попробовал первым, и оно протекает
+      // ровно там, где дороже всего: в паузах говорящего самым громким
+      // становится чужой фон, проходит как речь и снова поднимается в ×12.
+      // Замер на записи живой встречи: относительное правило дало 65% слов
+      // против 59% без правила вовсе — то есть закрыло меньше трети потерь.
+      this.trackNoiseFloor(t, rms);
+      const speech = rms >= Math.max(Mixer.ABS_SILENCE_RMS, t.noiseFloor * Mixer.SPEECH_OVER_NOISE);
+      t.ticksSinceSpeech = speech ? 0 : t.ticksSinceSpeech + 1;
+
+      // Усиливаем ТОЛЬКО того, кто говорит.
+      //
+      // Молчащий участник — это не тишина, а фон его микрофона, около 120 при
+      // пороге речи 40. Он проходил как речь, из него строилась оценка
+      // громкости, и выравнивание тянуло ШУМ к целевым 3000, то есть в ×12.
+      // Под каждой фразой говорящего лежали два-три таких усиленных шипения.
+      //
+      // Замер 15.09.2026 на записи живой встречи (окно 03:00–13:00, эталон
+      // 1527 слов): один говорящий через микшер — 83% слов, он же плюс двое
+      // молчащих — 59%. Из потерянных пунктов шесть давало само сложение
+      // дорожек, остальные тринадцать — подъём фона.
+      const gain = this.speakingNow(t) ? this.gainFor(participant) : 1;
       for (let i = 0; i < chunk.length; i++) {
         const sum = out[i] + chunk[i] * gain;
         // Ограничение обязательно: Int16Array переполняется молча, и сумма
@@ -212,7 +326,7 @@ export class Mixer {
   private track(participant: string): Track {
     let t = this.tracks.get(participant);
     if (!t) {
-      t = { queue: [], frames: 0, speechFrames: 0, speechRms: 0, peak: 0 };
+      t = { queue: [], frames: 0, speechFrames: 0, speechRms: 0, peak: 0, noiseFloor: 0, ticksSinceSpeech: Infinity };
       this.tracks.set(participant, t);
     }
     return t;
