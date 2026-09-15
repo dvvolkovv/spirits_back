@@ -114,9 +114,11 @@ export class MeetingBot {
       case 'participants': {
         // Состав отдаём событиями входа и ухода — их ждёт наш контроллер.
         const humans = Number(data?.humans ?? 0);
+        if (humans === this.humans) break;
         for (let i = this.humans + 1; i <= humans; i++) await this.participantEvent(i, 'join');
         for (let i = humans + 1; i <= this.humans; i++) await this.participantEvent(i, 'leave');
         this.humans = humans;
+        this.log.info?.(`[${this.id}] людей во встрече: ${humans}`);
         break;
       }
 
