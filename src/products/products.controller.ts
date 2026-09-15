@@ -6,7 +6,7 @@ import { ProductsService } from './products.service';
 import { TurnsService } from './turns.service';
 import { TurnEventsService } from './turn-events.service';
 import { ProvisioningService } from './provisioning.service';
-import { CreateProductDto } from './products.dto';
+import { assertUuid, CreateProductDto } from './products.dto';
 
 @Controller('')
 @UseGuards(JwtGuard)
@@ -52,12 +52,14 @@ export class ProductsController {
    */
   @Post('products/:id/retry')
   async retry(@CurrentUser() user: any, @Param('id') id: string) {
+    assertUuid(id, 'Product');
     await this.provisioning.retry(id, user.userId);
     return { ok: true };
   }
 
   @Get('products/:id/turns')
   async history(@CurrentUser() user: any, @Param('id') id: string, @Res() res: Response) {
+    assertUuid(id, 'Product');
     await this.products.getOwned(id, user.userId);
     return res.status(200).json(await this.turns.history(id, user.userId));
   }
@@ -80,6 +82,7 @@ export class ProductsController {
     @Req() req: Request,
     @Res() res: Response,
   ) {
+    assertUuid(id, 'Product');
     await this.products.getOwned(id, user.userId);
     const turn = await this.turns.enqueue({
       productId: id,
@@ -136,6 +139,10 @@ export class ProductsController {
     @Param('turnId') turnId: string,
     @Res() res: Response,
   ) {
+    assertUuid(id, 'Product');
+    // Оба параметра, а не только первый: turnId уезжает в такой же
+    // `WHERE id = $1` внутри revert().
+    assertUuid(turnId, 'Turn');
     await this.products.getOwned(id, user.userId);
     const turn = await this.turns.revert({ productId: id, turnId, userId: user.userId });
     return res.status(202).json(turn);

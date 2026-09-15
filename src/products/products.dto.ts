@@ -1,3 +1,4 @@
+import { NotFoundException } from '@nestjs/common';
 import { Transform } from 'class-transformer';
 import {
   IsBoolean,
@@ -31,6 +32,23 @@ import { SLUG_RE } from './provisioning.service';
  * метатип тела из метаданных САМОГО МАРШРУТА и гоняет через трубу,
  * собранную настройками из main.ts.
  */
+
+/**
+ * ПАРАМЕТРЫ ПУТИ — ТОЖЕ ВХОД, и приходят они из тех же чужих рук, что и тело.
+ *
+ * id продукта, хода и задания — uuid-колонки. Мусорная строка уезжает в
+ * `WHERE id = $1` и даёт 22P02, то есть 500-ку вместо честной 404: страница
+ * ошибки вместо «нет такого» и запись в логе, выглядящая как поломка базы.
+ * Образец приёма — src/speech/speech.controller.ts (там же и объяснение).
+ *
+ * Сообщение намеренно не отличает «не uuid» от «не найдено»: разница между
+ * ними — это подсказка о том, какие id существуют.
+ */
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function assertUuid(value: string, what: string): void {
+  if (!UUID_RE.test(value)) throw new NotFoundException(`${what} not found`);
+}
 
 /** Отчёт агента хоста о развёртывании. Приходит с чужой машины. */
 export class CompleteJobDto {

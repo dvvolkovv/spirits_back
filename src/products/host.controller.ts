@@ -1,6 +1,6 @@
 import { Body, Controller, Param, Post, UseGuards } from '@nestjs/common';
 import { HostGuard } from './host.guard';
-import { CompleteJobDto } from './products.dto';
+import { assertUuid, CompleteJobDto } from './products.dto';
 import { ProvisioningService } from './provisioning.service';
 
 /**
@@ -76,6 +76,11 @@ export class HostController {
    */
   @Post('products/host/jobs/:id/complete')
   async complete(@Param('id') id: string, @Body() body: CompleteJobDto) {
+    // Мусорный id даёт 22P02 в `WHERE id = $1`, то есть 500-ку вместо 404.
+    // Задание с ХОРОШИМ, но неизвестным id по-прежнему отвечает { ok: true } и
+    // пишет предупреждение (см. completeJob) — это отдельный, законный путь:
+    // повторный отчёт после обрыва связи выглядит именно так.
+    assertUuid(id, 'Job');
     await this.provisioning.completeJob(id, {
       ok: body.ok,
       port: body.port,

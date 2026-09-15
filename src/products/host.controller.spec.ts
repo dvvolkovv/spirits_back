@@ -1,3 +1,4 @@
+import { NotFoundException } from '@nestjs/common';
 import { HostController } from './host.controller';
 
 /**
@@ -11,9 +12,13 @@ import { HostController } from './host.controller';
 // Задание в том виде, в каком его собирает claimJob. Токен и секреты внутри не
 // декорация: другой доставки у них нет — открытый токен существует ровно один
 // раз, в теле этого ответа.
+// id задания — настоящий uuid: колонка uuid-овая, и маршрут отсекает мусор
+// до запроса (см. assertUuid).
+const J = '44444444-4444-4444-8444-444444444444';
+
 const JOB = {
-  jobId: 'j-1',
-  productId: 'p-1',
+  jobId: J,
+  productId: '77777777-7777-4777-8777-777777777777',
   slug: 'selyanska',
   // Имя и слаг РАЗНЫЕ намеренно: в каркас продукта уезжает именно имя, и
   // маршрут, потерявший его по дороге, на совпадающих значениях был бы
@@ -71,25 +76,51 @@ describe('HostController.poll', () => {
   });
 });
 
+describe('HostController — мусор в :id задания', () => {
+  it('мусорный id не уезжает в запрос', async () => {
+    // Мусорная строка в uuid-колонке даёт 22P02 — 500-ку вместо 404, плюс
+    // строку в логе, выглядящую как поломка базы.
+    const { ctrl, prov } = makeCtrl();
+
+    for (const bad of ['не-uuid', '', '44444444-4444-4444-8444']) {
+      await expect(ctrl.complete(bad, { ok: true } as any)).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+    }
+    expect(prov.completeJob).not.toHaveBeenCalled();
+  });
+
+  it('хороший, но неизвестный id остаётся законным путём', async () => {
+    // Отдельно от предыдущего: отчёт по УЖЕ ЗАКРЫТОМУ заданию — это штатный
+    // повтор после обрыва связи, и он обязан отвечать { ok: true }, а не 404.
+    // Сторож, отбивающий всё подряд, сломал бы именно этот путь.
+    const { ctrl, prov } = makeCtrl();
+    const unknown = '66666666-6666-4666-8666-666666666666';
+
+    await expect(ctrl.complete(unknown, { ok: true } as any)).resolves.toEqual({ ok: true });
+    expect(prov.completeJob).toHaveBeenCalledWith(unknown, { ok: true, port: undefined, error: undefined });
+  });
+});
+
 describe('HostController.complete', () => {
   it('передаёт порт и признак успеха', async () => {
     const { ctrl, prov } = makeCtrl();
 
-    const res = await ctrl.complete('j-1', { ok: true, port: 8003 } as any);
+    const res = await ctrl.complete(J, { ok: true, port: 8003 } as any);
 
-    expect(prov.completeJob).toHaveBeenCalledWith('j-1', { ok: true, port: 8003 });
+    expect(prov.completeJob).toHaveBeenCalledWith(J, { ok: true, port: 8003 });
     expect(res).toEqual({ ok: true });
   });
 
   it('причина отказа доезжает до сервиса', async () => {
     const { ctrl, prov } = makeCtrl();
 
-    await ctrl.complete('j-1', { ok: false, error: 'сборка контейнера не прошла' } as any);
+    await ctrl.complete(J, { ok: false, error: 'сборка контейнера не прошла' } as any);
 
     // Потерянная причина превращается в 'без причины' на карточке продукта:
     // completeJob подставляет её сам, когда error пуст. Владелец видит
     // сорванное заведение без единого слова о том, что случилось.
-    expect(prov.completeJob).toHaveBeenCalledWith('j-1', {
+    expect(prov.completeJob).toHaveBeenCalledWith(J, {
       ok: false,
       error: 'сборка контейнера не прошла',
     });
@@ -99,7 +130,7 @@ describe('HostController.complete', () => {
     const { ctrl, prov } = makeCtrl();
     const huge = 'docker build: '.padEnd(50_000, 'ы');
 
-    await ctrl.complete('j-1', { ok: false, error: huge } as any);
+    await ctrl.complete(J, { ok: false, error: huge } as any);
 
     const sent = prov.completeJob.mock.calls[0][1].error;
     expect(sent).toHaveLength(2000);
@@ -114,7 +145,7 @@ describe('HostController.complete', () => {
     const { ctrl, prov } = makeCtrl();
     const exact = 'э'.repeat(2000);
 
-    await ctrl.complete('j-1', { ok: false, error: exact } as any);
+    await ctrl.complete(J, { ok: false, error: exact } as any);
 
     // Ровно на потолке подрезки быть не должно: иначе многоточие появляется у
     // сообщений, которые целы, и диагностика врёт в другую сторону.
@@ -124,7 +155,7 @@ describe('HostController.complete', () => {
   it('лишние поля тела до сервиса не доезжают', async () => {
     const { ctrl, prov } = makeCtrl();
 
-    await ctrl.complete('j-1', {
+    await ctrl.complete(J, {
       ok: true,
       port: 8003,
       status: 'done',
@@ -136,15 +167,15 @@ describe('HostController.complete', () => {
     // Поэтому параметры собираются явным списком, как в RunnerController.
     // Утверждение точное (не objectContaining): спред тела иначе проходит
     // зелёным.
-    expect(prov.completeJob).toHaveBeenCalledWith('j-1', { ok: true, port: 8003 });
+    expect(prov.completeJob).toHaveBeenCalledWith(J, { ok: true, port: 8003 });
   });
 
   it('id задания берётся из URL, а не из тела', async () => {
     const { ctrl, prov } = makeCtrl();
 
-    await ctrl.complete('j-1', { ok: true, jobId: 'j-999' } as any);
+    await ctrl.complete(J, { ok: true, jobId: '55555555-5555-4555-8555-555555555555' } as any);
 
-    expect(prov.completeJob.mock.calls[0][0]).toBe('j-1');
+    expect(prov.completeJob.mock.calls[0][0]).toBe(J);
   });
 
   it('ok: true отдаётся только после того, как запись состоялась', async () => {
@@ -161,7 +192,7 @@ describe('HostController.complete', () => {
       }),
     });
 
-    const res = await ctrl.complete('j-1', { ok: true } as any);
+    const res = await ctrl.complete(J, { ok: true } as any);
 
     expect(written).toBe(true);
     expect(res).toEqual({ ok: true });
@@ -182,6 +213,6 @@ describe('HostController.complete', () => {
     // задание закрытым и уходит — а задание висит в running до сборщика
     // зависших, то есть десять минут, и заканчивается чужой формулировкой про
     // срок.
-    await expect(ctrl.complete('j-1', { ok: true } as any)).rejects.toBe(boom);
+    await expect(ctrl.complete(J, { ok: true } as any)).rejects.toBe(boom);
   });
 });
