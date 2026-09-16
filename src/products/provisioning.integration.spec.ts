@@ -5,6 +5,7 @@ import * as path from 'path';
 import { Pool } from 'pg';
 import { MIGRATIONS, ProductsService } from './products.service';
 import { ProvisioningService } from './provisioning.service';
+import { RentService } from './rent.service';
 import { SecretsService } from './secrets.service';
 
 /**
@@ -1480,5 +1481,368 @@ maybe('провижининг против живого Postgres', () => {
     await svc.touchHostAgent();
 
     expect(await svc.hostAgentLive()).toBe(true);
+  });
+
+  // ═════════════════════════ аренда: списание ═════════════════════════
+
+  /**
+   * ЗДЕСЬ ТРОГАЮТ ДЕНЬГИ, и заглушки про это не говорят ничего: мок отдаёт
+   * условленную строку при любом тексте запроса, а разница между «списали
+   * 50 000 и заняли месяц» и «списали 10 000, заняли месяц и обнулили баланс»
+   * видна только исполнением.
+   *
+   * Измерено обеими сторонами на живой базе (PostgreSQL 16, 16.09.2026) — вот
+   * что делает SQL, у которого достаток баланса прочитан подзапросом без
+   * замка, а списание прикрыто `GREATEST(0, …)`:
+   *
+   *   баланс 60 000, параллельная правка забирает 20 000 → аренда оставляет
+   *     ВЛАДЕЛЬЦУ НОЛЬ и засчитывает месяц (сценарий 30);
+   *   срок истёк три месяца назад → списывает по 50 000 на каждом обороте,
+   *     пока не догонит календарь, то есть копит долг там, где спека его
+   *     запрещает (сценарий 31).
+   *
+   * Оба исхода проходят мимо любого сторожа формы: текст запроса в них
+   * правильный.
+   */
+  describe('списание аренды', () => {
+    /**
+     * Баланс и учёт токенов живут ВНЕ модуля продуктов — их заводят чужие
+     * миграции, а сьют накатывает только `src/products/migrations`. Здесь
+     * заводится ровно тот минимум, который читает и пишет оператор списания, и
+     * снят он с прода буквально (`\d ai_profiles_consolidated`,
+     * `\d token_transactions`, `\dT+ transaction_type_enum`, 16.09.2026).
+     *
+     * Форма не косметика. На UNIQUE(user_id) держится однозначность строки
+     * баланса; на перечне значений enum — то, что 'consumed' вообще
+     * запишется. Выдуманная своя табличка (`user_id text PRIMARY KEY`, тип
+     * транзакции текстом) зеленела бы и на значении, которого на проде нет, —
+     * то есть сторожила бы ровно ничего.
+     */
+    beforeAll(async () => {
+      await pool.query(`DO $$ BEGIN
+         CREATE TYPE transaction_type_enum AS ENUM
+           ('purchase','consumed','bonus','refund','adjustment','coupon');
+       EXCEPTION WHEN duplicate_object THEN NULL; END $$`);
+      await pool.query(`CREATE TABLE IF NOT EXISTS ai_profiles_consolidated (
+         id serial PRIMARY KEY,
+         user_id text NOT NULL UNIQUE,
+         tokens bigint NOT NULL DEFAULT 0,
+         updated_at timestamptz DEFAULT now())`);
+      await pool.query(`CREATE TABLE IF NOT EXISTS token_transactions (
+         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+         user_id text NOT NULL,
+         transaction_type transaction_type_enum NOT NULL,
+         amount bigint NOT NULL,
+         balance_after bigint NOT NULL,
+         description text,
+         metadata jsonb,
+         created_at timestamptz DEFAULT now())`);
+    });
+
+    // Внешний beforeEach чистит продукты и задания, но не эти две таблицы: они
+    // заведены здесь и ему не известны. Оставленный баланс делает следующий
+    // сценарий зелёным на чужих деньгах — ровно так же, как это уже случилось
+    // с отметкой агента хоста.
+    beforeEach(() => pool.query('TRUNCATE ai_profiles_consolidated, token_transactions'));
+    afterAll(() => pool.query('TRUNCATE ai_profiles_consolidated, token_transactions'));
+
+    const rent = () => new RentService(pg as any);
+
+    async function setBalance(userId: string, tokens: number) {
+      await pool.query(
+        `INSERT INTO ai_profiles_consolidated (user_id, tokens) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET tokens = EXCLUDED.tokens`,
+        [userId, tokens],
+      );
+    }
+
+    /** −1, а не 0: «строки нет» и «ноль на балансе» — разные вещи (сценарий 29). */
+    const balanceOf = async (userId: string) =>
+      Number(
+        (await pool.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1', [userId]))
+          .rows[0]?.tokens ?? -1,
+      );
+
+    const ledgerOf = async (userId: string) =>
+      (
+        await pool.query('SELECT * FROM token_transactions WHERE user_id = $1 ORDER BY created_at', [
+          userId,
+        ])
+      ).rows;
+
+    /**
+     * Продукт с истёкшим сроком — ровно то состояние, в котором его находит
+     * сборщик. Срок урезается до миллисекунд намеренно: у timestamptz точность
+     * микросекундная, а Date в JS хранит миллисекунды, и сценарий 32, который
+     * возит срок туда-обратно через параметр, иначе краснел бы на округлении,
+     * а не на поведении.
+     */
+    async function due(o: { slug: string; status?: string; overdue?: string; userId?: string }) {
+      const p = await product({ slug: o.slug, status: o.status ?? 'running' });
+      await pool.query(
+        `UPDATE products
+            SET paid_until = date_trunc('milliseconds', now() - $2::interval),
+                user_id = COALESCE($3, user_id)
+          WHERE id = $1`,
+        [p.id, o.overdue ?? '1 day', o.userId ?? null],
+      );
+      return p;
+    }
+
+    const paidUntilOf = async (id: string) => new Date((await getProduct(id)).paid_until).getTime();
+
+    it('22. два ОДНОВРЕМЕННЫХ сборщика списывают аренду ровно один раз', async () => {
+      // Прод работает в кластере из двух процессов. Главный сценарий куска:
+      // наивная реализация снимет 100 000 и уедет на два месяца вперёд, а
+      // увидит это только владелец — в своём балансе.
+      const other = await bystander();
+      const p = await due({ slug: 'rent-race' });
+      await setBalance('u-1', 120_000);
+
+      const outcomes = await Promise.all([rent().chargeRent(p.id), rent().chargeRent(p.id)]);
+
+      expect(outcomes.filter(Boolean)).toHaveLength(1);
+      expect(await balanceOf('u-1')).toBe(70_000);
+      expect(await paidUntilOf(p.id)).toBeGreaterThan(Date.now());
+      // И в истории один расход, а не два: по ней владелец и проверяет.
+      expect(await ledgerOf('u-1')).toHaveLength(1);
+      await expectUntouched(other);
+    });
+
+    it('23. при нехватке баланса не списывается НИЧЕГО и период не двигается', async () => {
+      // Существующий deductTokens в этом месте забрал бы 30 000 из 50 000 и
+      // оставил ноль: денег взяли не сколько надо, продукт всё равно заснёт, а
+      // баланс обнулён. Здесь не должно уйти ни токена.
+      const p = await due({ slug: 'rent-poor' });
+      await setBalance('u-1', 30_000);
+      const before = await getProduct(p.id);
+
+      expect(await rent().chargeRent(p.id)).toBe(false);
+
+      expect(await balanceOf('u-1')).toBe(30_000);
+      expect((await getProduct(p.id)).paid_until).toEqual(before.paid_until);
+      expect(await ledgerOf('u-1')).toEqual([]);
+    });
+
+    it('24. неистёкший период не списывается', async () => {
+      const p = await product({ slug: 'rent-early', status: 'running' });
+      await pool.query(`UPDATE products SET paid_until = now() + interval '10 days' WHERE id = $1`, [
+        p.id,
+      ]);
+      await setBalance('u-1', 120_000);
+
+      expect(await rent().chargeRent(p.id)).toBe(false);
+      expect(await balanceOf('u-1')).toBe(120_000);
+    });
+
+    it('25. со спящего аренда не списывается', async () => {
+      // Спящий не копит долг — решение владельца, и держится оно ровно на
+      // условии по статусу. Иначе продукт, проспавший полгода, при первом же
+      // пополнении был бы обобран за полгода сна.
+      const p = await due({ slug: 'rent-asleep', status: 'sleeping', overdue: '2 months' });
+      await setBalance('u-1', 500_000);
+
+      expect(await rent().chargeRent(p.id)).toBe(false);
+      expect(await balanceOf('u-1')).toBe(500_000);
+    });
+
+    it('26. degraded платит наравне с running', async () => {
+      // Решение владельца, принятое после задачи 1: контейнер запущен, сайт
+      // отвечает, машина занята; нет связи с ассистентом — это наша поломка, а
+      // не основание не платить. На проде 16.09.2026 в degraded ЧЕТЫРЕ продукта
+      // из шести, то есть `status = 'running'` в предусловии обнулил бы выручку
+      // и не покраснел бы ни одним тестом про running.
+      const p = await due({ slug: 'rent-degraded', status: 'degraded' });
+      await setBalance('u-1', 120_000);
+
+      expect(await rent().chargeRent(p.id)).toBe(true);
+      expect(await balanceOf('u-1')).toBe(70_000);
+    });
+
+    it('27. ровно на границе баланса списание проходит', async () => {
+      // Сторож знака: `>` вместо `>=` отбил бы владельца, у которого ровно на
+      // месяц, и продукт заснул бы при достаточных деньгах.
+      const p = await due({ slug: 'rent-exact', overdue: '1 hour' });
+      await setBalance('u-1', 50_000);
+
+      expect(await rent().chargeRent(p.id)).toBe(true);
+      expect(await balanceOf('u-1')).toBe(0);
+    });
+
+    it('28. на токен меньше — отказ, и ни один токен не уходит', async () => {
+      // Вторая сторона той же границы. Без неё «проверку достатка убрали
+      // совсем» неотличимо от «проверка на месте»: баланс уехал бы в минус или
+      // в ноль, а сценарий 27 остался бы зелёным.
+      const p = await due({ slug: 'rent-almost' });
+      await setBalance('u-1', 49_999);
+
+      expect(await rent().chargeRent(p.id)).toBe(false);
+      expect(await balanceOf('u-1')).toBe(49_999);
+      expect(await paidUntilOf(p.id)).toBeLessThan(Date.now());
+    });
+
+    it('29. у владельца вовсе нет строки баланса — отказ без бесплатного месяца', async () => {
+      // Строку заводит регистрация, но в этом коде уже были пользователи без
+      // неё (её чинил ON CONFLICT DO NOTHING в identity.service). Опасность
+      // тут не в отказе, а в том, что период занимается ОТДЕЛЬНОЙ частью
+      // оператора: если она не смотрит на баланс, продукт получает месяц
+      // бесплатно и продолжает получать его каждый месяц.
+      const p = await due({ slug: 'rent-no-row' });
+      const before = await getProduct(p.id);
+
+      expect(await rent().chargeRent(p.id)).toBe(false);
+
+      expect((await getProduct(p.id)).paid_until).toEqual(before.paid_until);
+      // Строку баланса мы не заводим: у аренды нет причин создавать профиль.
+      expect(await balanceOf('u-1')).toBe(-1);
+    });
+
+    it('30. ход, забравший токены в тот же миг, не даёт частичного списания', async () => {
+      // САМАЯ ДОРОГАЯ ИЗ ОШИБОК ЭТОГО ФАЙЛА, и мимо заглушек она проходит
+      // целиком. Баланс читается в условии, а списывается записью — между ними
+      // помещается чужой коммит. Измерено: без `FOR UPDATE` в подзапросе
+      // достатка владелец с 60 000 и правкой на 20 000 остаётся с НУЛЁМ, и
+      // месяц ему при этом засчитан; с замком оператор ждёт чужой транзакции,
+      // перечитывает 40 000 и честно не делает ничего.
+      //
+      // Держатель берёт строку ДО списания и отпускает по таймеру — гонки в
+      // самом сценарии нет.
+      const p = await due({ slug: 'rent-vs-turn' });
+      await setBalance('u-1', 60_000);
+
+      const holder = await pool.connect();
+      let released = false;
+      try {
+        await holder.query('BEGIN');
+        await holder.query(
+          `UPDATE ai_profiles_consolidated SET tokens = tokens - 20000 WHERE user_id = 'u-1'`,
+        );
+        const unlock = new Promise<void>((r) =>
+          setTimeout(async () => {
+            await holder.query('COMMIT');
+            released = true;
+            r();
+          }, 800),
+        );
+
+        const started = Date.now();
+        const charged = await rent().chargeRent(p.id);
+        const elapsed = Date.now() - started;
+        await unlock;
+
+        expect(charged).toBe(false);
+        // Списание не проскочило мимо чужой транзакции по снимку, а дождалось
+        // её: без ожидания весь сценарий был бы про другое.
+        expect(elapsed).toBeGreaterThan(500);
+        expect(await balanceOf('u-1')).toBe(40_000);
+        expect(await paidUntilOf(p.id)).toBeLessThan(Date.now());
+        expect(await ledgerOf('u-1')).toEqual([]);
+      } finally {
+        if (!released) await holder.query('ROLLBACK').catch(() => undefined);
+        holder.release();
+      }
+    });
+
+    it('31. срок, истёкший три месяца назад, стоит один месяц, а не три', async () => {
+      // Спека: спящий долг не копит. Продукт возвращается из сна (или сборщик
+      // простоял) с давно истёкшим сроком, и `paid_until + 1 month` от него
+      // означает оплату периода, который УЖЕ ПРОШЁЛ: срок остаётся в прошлом,
+      // и следующий же оборот списывает снова — 150 000 за три дня вместо
+      // 50 000 за месяц. Измерено на живой базе именно так.
+      const p = await due({ slug: 'rent-stale', overdue: '3 months' });
+      await setBalance('u-1', 200_000);
+
+      expect(await rent().chargeRent(p.id)).toBe(true);
+      expect(await balanceOf('u-1')).toBe(150_000);
+
+      // Второй оборот сборщика подряд не находит, что списывать.
+      expect(await rent().chargeRent(p.id)).toBe(false);
+      expect(await balanceOf('u-1')).toBe(150_000);
+      const days = (await paidUntilOf(p.id) - Date.now()) / 86_400_000;
+      expect(days).toBeGreaterThan(27);
+      expect(days).toBeLessThan(32);
+    });
+
+    it('32. якорь даты не уезжает: месяц считается от занятого срока', async () => {
+      // Обратная сторона сценария 31. Лечение «считать месяц от now()» ровняет
+      // все случаи, но уводит дату списания вперёд на время запаздывания
+      // сборщика — до суток в месяц, то есть почти две недели бесплатного
+      // хостинга в год на каждый продукт.
+      const p = await due({ slug: 'rent-anchor', overdue: '2 days' });
+      await setBalance('u-1', 120_000);
+      const before = (await getProduct(p.id)).paid_until;
+
+      expect(await rent().chargeRent(p.id)).toBe(true);
+
+      // Сравнение считает Postgres: «месяц» здесь обязан значить ровно то же,
+      // что и в самом запросе, а не то же, что в арифметике JS.
+      const r = await pool.query(
+        `SELECT paid_until = $2::timestamptz + interval '1 month' AS exact
+           FROM products WHERE id = $1`,
+        [p.id, before],
+      );
+      expect(r.rows[0].exact).toBe(true);
+    });
+
+    it('33. списание видно в учёте токенов — тип, знак, остаток и продукт', async () => {
+      // Спека: отдельной таблицы расходов не заводим, аренда ложится в
+      // существующий учёт рядом с правками. Без строки владелец видит, как
+      // исчезли 50 000, и узнать за что не может ниоткуда: в кабинете история
+      // показывает только начисления, а расход по ходам приезжает из чата.
+      // Знак и тип — как у consume_user_tokens: админские отчёты берут по
+      // 'consumed' сумму ABS(SUM(amount)), и плюс вместо минуса тихо удвоил бы
+      // расход пользователя в сводке.
+      const p = await due({ slug: 'rent-ledger' });
+      await setBalance('u-1', 120_000);
+
+      expect(await rent().chargeRent(p.id)).toBe(true);
+
+      const [row] = await ledgerOf('u-1');
+      expect(row.transaction_type).toBe('consumed');
+      expect(Number(row.amount)).toBe(-50_000);
+      expect(Number(row.balance_after)).toBe(70_000);
+      expect(row.description).toContain('rent-ledger');
+      expect(row.metadata).toMatchObject({ kind: 'product_rent', product_id: p.id });
+    });
+
+    it('34. списание не трогает ни чужой продукт, ни чужой баланс', async () => {
+      // Соединение без условия (`... OR TRUE`) в этом файле уже ловили: один
+      // отчёт агента правил весь реестр. У списания цена такой правки — чужие
+      // деньги, поэтому рядом стоят и посторонний продукт того же владельца, и
+      // такой же просроченный продукт ДРУГОГО.
+      const other = await bystander();
+      const neighbour = await due({ slug: 'rent-neighbour', userId: 'u-2' });
+      await setBalance('u-2', 500_000);
+      const p = await due({ slug: 'rent-mine' });
+      await setBalance('u-1', 120_000);
+
+      expect(await rent().chargeRent(p.id)).toBe(true);
+
+      expect(await balanceOf('u-2')).toBe(500_000);
+      expect(await paidUntilOf(neighbour.id)).toBeLessThan(Date.now());
+      expect(await ledgerOf('u-2')).toEqual([]);
+      await expectUntouched(other);
+    });
+
+    it('35. денег ровно на один месяц при двух продуктах — платит один', async () => {
+      // Замок на строке баланса сериализует не только два сборщика на одном
+      // продукте, но и соседние продукты одного владельца: второй перечитывает
+      // остаток после первого и видит ноль. Без этого оба прошли бы проверку
+      // по одному и тому же снимку, и баланс ушёл бы в минус — ровно так один
+      // пользователь на этом проекте уже оказался на −7 363.
+      const a = await due({ slug: 'rent-two-a' });
+      const b = await due({ slug: 'rent-two-b' });
+      await setBalance('u-1', 50_000);
+
+      const outcomes = await Promise.all([rent().chargeRent(a.id), rent().chargeRent(b.id)]);
+
+      expect(outcomes.filter(Boolean)).toHaveLength(1);
+      expect(await balanceOf('u-1')).toBe(0);
+      const paid = await pool.query(
+        'SELECT count(*) FROM products WHERE id = ANY($1) AND paid_until > now()',
+        [[a.id, b.id]],
+      );
+      expect(Number(paid.rows[0].count)).toBe(1);
+    });
   });
 });
