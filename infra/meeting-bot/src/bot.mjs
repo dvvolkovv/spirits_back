@@ -167,7 +167,7 @@ export class MeetingBot {
         break;
 
       case 'mic':
-        this.log.info?.(`[${this.id}] микрофон ${data?.on ? 'включён' : 'включить не вышло'}`);
+        this.log.info?.(`[${this.id}] микрофон ${data?.on ? `включён (${data.how})` : 'включить не вышло'}`);
         break;
 
       case 'chat': {

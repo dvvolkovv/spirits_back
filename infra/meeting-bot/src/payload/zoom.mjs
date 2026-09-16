@@ -78,6 +78,18 @@ export const ZOOM_PAGE_JS = `
   ZoomMtg.preLoadWasm();
   ZoomMtg.prepareWebSDK();
 
+  // Показать корень SDK.
+  //
+  // prepareWebSDK создаёт #zmmtg-root скрытым, и без этой строки клиент
+  // рисуется «в никуда»: встреча идёт, а панели с кнопками нет. Микрофон
+  // включается именно кнопкой — программного способа у клиентского вида нет, —
+  // и первый живой заход 16.09.2026 кончился немым ботом ровно поэтому.
+  const showRoot = () => {
+    const root = document.getElementById('zmmtg-root');
+    if (root) root.style.display = 'block';
+  };
+  showRoot();
+
   /** Кто есть кто: id → имя. Имена Zoom отдаёт сам, выдумывать не нужно. */
   const people = new Map();
   let myId = null;
@@ -118,6 +130,7 @@ export const ZOOM_PAGE_JS = `
     disableZoomLogo: true,
     disablePreview: true,
     success: () => {
+      showRoot();
       ZoomMtg.join({
         signature: p.get('signature'),
         sdkKey: p.get('sdkKey'),
@@ -189,13 +202,25 @@ export const ZOOM_PAGE_JS = `
    * Пробуем несколько раз: панель появляется не сразу после входа.
    */
   function unmute() {
-    let left = 30;
+    let left = 40;
     const timer = setInterval(() => {
+      showRoot();
       const b =
         document.querySelector('button[aria-label="unmute my microphone"]') ||
         document.querySelector('div[aria-label="unmute my microphone"]');
-      if (b) { b.click(); clearInterval(timer); send('mic', { on: true }); return; }
-      if (--left <= 0) { clearInterval(timer); send('mic', { on: false }); }
+      if (b) { b.click(); clearInterval(timer); send('mic', { on: true, how: 'кнопкой' }); return; }
+      // Уже включён? Тогда на панели стоит обратная кнопка, и делать нечего.
+      if (document.querySelector('[aria-label="mute my microphone"]')) {
+        clearInterval(timer); send('mic', { on: true, how: 'уже был включён' }); return;
+      }
+      if (--left <= 0) {
+        clearInterval(timer);
+        // Последняя попытка — через API: в части сборок он есть, и хуже не
+        // сделает. Ответ всё равно скажем честно.
+        try {
+          ZoomMtg.mute({ userId: myId, mute: false, success: () => send('mic', { on: true, how: 'по API' }), error: () => send('mic', { on: false }) });
+        } catch (e) { send('mic', { on: false }); }
+      }
     }, 500);
   }
 
