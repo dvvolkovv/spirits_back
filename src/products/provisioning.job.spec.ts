@@ -821,3 +821,162 @@ describe('ProvisioningService.retry', () => {
     expect(e.code).toBe('42P01');
   });
 });
+
+/**
+ * Отметка о жизни агента хоста. ГРАНИЦА ТА ЖЕ: pg подменён, SQL не
+ * исполняется, здесь сторожится форма и поведение вокруг запроса. Что эти
+ * запросы делают на самом деле — в provisioning.integration.spec.ts.
+ */
+describe('ProvisioningService.touchHostAgent', () => {
+  function makeTouch(fail?: Error) {
+    const calls: string[] = [];
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        calls.push(sql);
+        if (fail) throw fail;
+        return { rows: [], rowCount: 1 };
+      }),
+    };
+    const svc = new ProvisioningService(pg as any, {} as any);
+    const error = jest.spyOn((svc as any).logger, 'error').mockImplementation(() => undefined);
+    return { svc, calls, error };
+  }
+
+  it('ставит отметку одной записью, без предварительного чтения', async () => {
+    const { svc, calls } = makeTouch();
+
+    await svc.touchHostAgent();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain('INSERT INTO product_host_agent');
+    expect(calls[0]).toContain('ON CONFLICT (id) DO UPDATE');
+  });
+
+  it('время берётся у базы, а не у процесса', async () => {
+    // Часы бэкенда и часы базы — разные часы, а свежесть считается вычитанием
+    // ИЗ now() базы (см. hostAgentLive). Отметка, записанная временем
+    // процесса, на разошедшихся часах даёт либо вечную тревогу, либо вечное
+    // спокойствие — и то и другое молча.
+    const { svc, calls } = makeTouch();
+
+    await svc.touchHostAgent();
+
+    expect(calls[0]).toContain('now()');
+    expect(calls[0]).not.toMatch(/\$\d/);
+  });
+
+  it('запись загрублена: отметка не переписывается на каждом опросе', async () => {
+    // Агент опрашивает раз в три секунды. Без условия это 28 800 записей в
+    // сутки в одну строку при разрешении, которое читателю не нужно.
+    const { svc, calls } = makeTouch();
+
+    await svc.touchHostAgent();
+
+    expect(calls[0]).toMatch(/WHERE product_host_agent\.seen_at < now\(\) - interval '30 seconds'/);
+  });
+
+  it('загрубление заметно меньше порога протухания', async () => {
+    // Свойство, а не число: загрубление, доросшее до порога, означает живого
+    // агента, протухающего между двумя своими же записями. Оба значения
+    // читаются из готовых строк SQL, поэтому тест краснеет и на правку порога.
+    const { svc, calls } = makeTouch();
+    const probe = new ProvisioningService({ query: jest.fn(async () => ({ rows: [{ live: true }] })) } as any, {} as any);
+
+    await svc.touchHostAgent();
+    await probe.hostAgentLive();
+
+    const gap = Number(calls[0].match(/seen_at < now\(\) - interval '(\d+) seconds'/)![1]);
+    const fresh = Number(
+      (probe as any).pg.query.mock.calls[0][0].match(
+        /seen_at > now\(\) - interval '(\d+) seconds'/,
+      )![1],
+    );
+    expect(gap).toBeLessThan(fresh / 2);
+  });
+
+  it('несостоявшаяся запись не роняет опрос, но попадает в лог', async () => {
+    // Маршрут, который зовёт отметку, — тот самый, которым агент забирает
+    // работу. Отказ записи обязан оставаться отказом записи: 500 в ответ на
+    // опрос уводит агента в тройную паузу и оставляет продукты незаведёнными,
+    // то есть отметка о жизни убивала бы ровно то, за чем следит.
+    const { svc, error } = makeTouch(new Error('нет такой таблицы'));
+
+    await expect(svc.touchHostAgent()).resolves.toBeUndefined();
+    // Молча проглоченный отказ означал бы вечную тревогу в кабинете без единой
+    // строки о причине.
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('нет такой таблицы'));
+  });
+});
+
+describe('ProvisioningService.hostAgentLive', () => {
+  function makeLive(live: any) {
+    const calls: string[] = [];
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        calls.push(sql);
+        return { rows: [{ live }], rowCount: 1 };
+      }),
+    };
+    return { svc: new ProvisioningService(pg as any, {} as any), calls };
+  }
+
+  it('спрашивает базу один раз', async () => {
+    // Двумя запросами агент успевает забрать задание МЕЖДУ ними: молчащая
+    // отметка сложилась бы с ещё не начатым заданием в «никто не забирает» при
+    // работающем агенте.
+    const { svc, calls } = makeLive(true);
+
+    await svc.hostAgentLive();
+
+    expect(calls).toHaveLength(1);
+  });
+
+  it('считает живым и по свежей отметке, и по взятому заданию', async () => {
+    const { svc, calls } = makeLive(true);
+
+    await svc.hostAgentLive();
+
+    // Второй этаж обязателен: пока агент разворачивает продукт, он не
+    // опрашивает — он работает, и отметка стоит до восьми минут.
+    expect(calls[0]).toContain('product_host_agent');
+    expect(calls[0]).toContain('product_provision_jobs');
+    expect(calls[0]).toContain("status = 'running'");
+    expect(calls[0]).toMatch(/EXISTS[\s\S]*\bOR\b[\s\S]*EXISTS/);
+  });
+
+  it('взятое задание считается свидетельством не дольше срока заведения', async () => {
+    // Агент, умерший посреди развёртывания, оставляет задание в 'running'.
+    // Без условия по сроку он числился бы живым вечно — и предупреждение не
+    // появилось бы никогда именно в том случае, ради которого написано.
+    const { svc, calls } = makeLive(true);
+
+    await svc.hostAgentLive();
+
+    expect(calls[0]).toMatch(/COALESCE\(started_at, created_at\) > now\(\) - interval '10 minutes'/);
+  });
+
+  it('порог свежести — тот же, которым файл меряет раннера', async () => {
+    const { svc, calls } = makeLive(true);
+
+    await svc.hostAgentLive();
+
+    // Второе число означало бы два разных ответа на один вопрос в одном файле.
+    expect(calls[0]).toContain("seen_at > now() - interval '120 seconds'");
+  });
+
+  it('вердикт берётся у базы, а не вычисляется из строки времени', async () => {
+    const { svc } = makeLive(false);
+
+    // База отдала false — значит false, без «ну строка же есть».
+    await expect(svc.hostAgentLive()).resolves.toBe(false);
+  });
+
+  it('невнятный ответ базы читается как молчание агента, а не как жизнь', async () => {
+    // `r.rows[0].live` без сверки с true вернул бы истину на любой непустой
+    // строке, в том числе на 'f' — так приезжает boolean, если кто-нибудь
+    // подставит текстовый каст. Тревога при этом исчезла бы навсегда.
+    const { svc } = makeLive('f');
+
+    await expect(svc.hostAgentLive()).resolves.toBe(false);
+  });
+});

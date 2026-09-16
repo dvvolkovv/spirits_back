@@ -10,25 +10,32 @@ export interface ProductRow {
   slug: string;
   status: string;
   kind: string;
-  host_ip: string | null;
   domain: string | null;
-  repo_url: string | null;
-  checkout_path: string;
-  build_cmd: string | null;
-  restart_cmd: string | null;
-  health_url: string | null;
   runner_seen_at: string | null;
-  claude_session_id: string | null;
   provision_error: string | null;
   created_at: string;
 }
 
-// Список колонок перечислен явно, и двух из них здесь нет намеренно:
-// runner_token_hash — хеш токена доступа к клиентской VM, secrets_encrypted —
-// шифротекст секретов продукта. Эти методы обслуживают клиента, и ни то, ни
-// другое ему не нужно ни в каком виде. Заменить перечисление на SELECT *
-// нельзя: обе колонки уедут в ответ молча, и следующая секретная колонка тоже.
-// Сторож — products.access.spec.ts.
+// Список колонок перечислен явно и собран ПО КАБИНЕТУ: здесь ровно те поля,
+// которые объявлены в `interface Product` фронта (spirits_front
+// src/services/productsApi.ts), плюс user_id.
+//
+// Двух колонок здесь нет по соображениям безопасности: runner_token_hash —
+// хеш токена доступа к клиентской VM, secrets_encrypted — шифротекст секретов
+// продукта. Эти методы обслуживают клиента, и ни то, ни другое ему не нужно ни
+// в каком виде. Заменить перечисление на SELECT * нельзя: обе колонки уедут в
+// ответ молча, и следующая секретная колонка тоже. Сторож —
+// products.access.spec.ts.
+//
+// Остальных нет по другой причине — они не секреты, но и не дело кабинета.
+// host_ip, checkout_path, build_cmd, restart_cmd, health_url, repo_url и
+// claude_session_id описывают, КАК продукт развёрнут на нашей машине: их читают
+// агент хоста и раннер внутри контейнера, каждый своим запросом
+// (runner.guard.ts перечисляет их отдельно и для себя). В браузере им делать
+// нечего — это внутренняя топология, которая через кабинет утекает в консоль,
+// в расширения и в снимок вкладки. Ровно тем же приёмом и по той же причине
+// собирает ответ create() в products.controller.ts.
+//
 // kind и provision_error перечислены здесь не для полноты: без них карточка
 // отказа в кабинете показывает «сервер не передал причину» при заполненной
 // колонке в базе, а бот выглядит сайтом. Колонки завела миграция 002, и
@@ -36,9 +43,12 @@ export interface ProductRow {
 // пропуск ничего не ломает на сервере и потому не виден ни одним его тестом.
 // port не перечислен намеренно: это порт на петле хоста, клиенту он не нужен
 // и в ответ уходить не должен.
-const COLUMNS = `id, user_id, name, slug, status, kind, host_ip, domain, repo_url,
-                 checkout_path, build_cmd, restart_cmd, health_url,
-                 runner_seen_at, claude_session_id, provision_error, created_at`;
+//
+// user_id остаётся, хотя фронт его не читает: это id самого спрашивающего
+// (WHERE user_id = $1), то есть не утечка, а подтверждение того, чьи продукты
+// приехали. На него же опирается сторож формы выборки в products.access.spec.ts.
+const COLUMNS = `id, user_id, name, slug, status, kind, domain,
+                 runner_seen_at, provision_error, created_at`;
 
 @Injectable()
 export class ProductsService implements OnModuleInit {
@@ -50,6 +60,11 @@ export class ProductsService implements OnModuleInit {
     await this.applyMigration('001_products.sql');
     // Строго после 001: 002 навешивает колонки на таблицу, которую создаёт 001.
     await this.applyMigration('002_provisioning.sql');
+    // 003 ни от кого не зависит (своя таблица, ни одного внешнего ключа), но
+    // едет последней: порядок файлов в этом списке — единственное, что
+    // описывает порядок схемы, и «независимая» миграция посередине читается
+    // как разрешение переставлять.
+    await this.applyMigration('003_host_agent.sql');
   }
 
   async list(userId: string): Promise<ProductRow[]> {

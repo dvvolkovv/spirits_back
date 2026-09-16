@@ -55,6 +55,61 @@ describe('колонки клиентской выдачи', () => {
       expect(sql).not.toContain('secrets_encrypted');
     }
   });
+
+  it('не отдают внутреннюю топологию машины продуктов', async () => {
+    // Не секреты — и потому уехали бы обратно в перечисление под предлогом
+    // «пусть будет, вдруг пригодится». Это адрес хоста, путь чекаута, команды
+    // сборки и перезапуска, адрес health и id сессии Claude: ими живут агент
+    // хоста и раннер внутри контейнера, каждый своим запросом (runner.guard.ts
+    // перечисляет их для себя отдельно). В браузере им делать нечего — через
+    // кабинет они утекают в консоль, в расширения и в снимок вкладки.
+    const { svc, calls } = makeService([ROW]);
+
+    await svc.list('79030169187');
+    await svc.getOwned('p-1', '79030169187');
+
+    expect(calls).toHaveLength(2);
+    for (const { sql } of calls) {
+      for (const column of [
+        'host_ip',
+        'checkout_path',
+        'build_cmd',
+        'restart_cmd',
+        'health_url',
+        'repo_url',
+        'claude_session_id',
+        // port не отдавался и раньше: это порт на петле хоста.
+        'port',
+      ]) {
+        expect(sql).not.toContain(column);
+      }
+    }
+  });
+
+  it('отдают ровно то, что читает кабинет', async () => {
+    // Список собран ПО ФРОНТУ: `interface Product` в
+    // spirits_front/src/services/productsApi.ts. Пропавшая отсюда колонка не
+    // ломает ни одного серверного теста — она молча превращается в пустое
+    // место на карточке (так уже было с provision_error и kind, см.
+    // комментарий над COLUMNS).
+    const { svc, calls } = makeService([ROW]);
+
+    await svc.list('79030169187');
+
+    for (const column of [
+      'id',
+      'name',
+      'slug',
+      'status',
+      'kind',
+      'domain',
+      'runner_seen_at',
+      'provision_error',
+      'created_at',
+    ]) {
+      expect(calls[0].sql).toContain(column);
+    }
+  });
 });
 
 describe('ProductsService.getOwned', () => {

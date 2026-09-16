@@ -30,12 +30,19 @@ const JOB = {
 };
 
 function makeCtrl(over: any = {}) {
+  const order: string[] = [];
   const prov = {
-    claimJob: jest.fn(async () => JOB),
+    claimJob: jest.fn(async () => {
+      order.push('claimJob');
+      return JOB;
+    }),
     completeJob: jest.fn(async () => undefined),
+    touchHostAgent: jest.fn(async () => {
+      order.push('touchHostAgent');
+    }),
     ...over,
   };
-  return { ctrl: new HostController(prov as any), prov };
+  return { ctrl: new HostController(prov as any), prov, order };
 }
 
 describe('HostController.poll', () => {
@@ -59,6 +66,57 @@ describe('HostController.poll', () => {
     // Агент опрашивает нас в цикле: пустая очередь — обычное состояние, а не
     // отказ. 500 в этом месте заливал бы лог агента на каждом обороте.
     await expect(ctrl.poll()).resolves.toEqual({ job: null });
+  });
+
+  it('опрос отмечает, что агент был на связи', async () => {
+    // Без этой отметки сервер не отличает живого агента от мёртвого: владелец
+    // десять минут смотрит на «Заводится…» и читает про истёкший срок, хотя
+    // срок ни при чём — забирать задание было некому.
+    const { ctrl, prov } = makeCtrl();
+
+    await ctrl.poll();
+
+    expect(prov.touchHostAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it('пустая очередь — тоже визит агента', async () => {
+    // Отметка о том, что агент ПРИХОДИЛ, не должна зависеть от того, нашлась
+    // ли ему работа: заданий не бывает сутками, и отметка «по выдаче» стояла
+    // бы всё это время — то есть тревога горела бы на исправной машине.
+    const { ctrl, prov } = makeCtrl({ claimJob: jest.fn(async () => null) });
+
+    await ctrl.poll();
+
+    expect(prov.touchHostAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it('отметка ставится ДО выдачи', async () => {
+    const { ctrl, order } = makeCtrl();
+
+    await ctrl.poll();
+
+    // Порядок не косметика: отказ базы на выдаче иначе уносит с собой и
+    // отметку, и кабинет показывает «агент не забирает задания» вместо
+    // настоящей причины — то есть указывает чинить исправную машину.
+    expect(order).toEqual(['touchHostAgent', 'claimJob']);
+  });
+
+  it('отметка дожидается записи, а не уезжает в фон', async () => {
+    // `void this.provisioning.touchHostAgent()` проходит все проверки выше:
+    // вызов состоялся, порядок соблюдён. А неперехваченный отказ из
+    // незавершённого промиса на Node 26 убивает процесс — и агент, чинящий
+    // отметку, ронял бы бэкенд.
+    let written = false;
+    const { ctrl } = makeCtrl({
+      touchHostAgent: jest.fn(async () => {
+        await new Promise((r) => setImmediate(r));
+        written = true;
+      }),
+    });
+
+    await ctrl.poll();
+
+    expect(written).toBe(true);
   });
 
   it('сорванная выдача не выглядит пустой очередью', async () => {

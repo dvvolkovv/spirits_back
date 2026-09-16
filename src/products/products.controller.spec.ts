@@ -49,6 +49,7 @@ function makeController(events: any[]) {
   const provisioning = {
     create: jest.fn(async () => ({ productId: 'p-новый', runnerToken: 'ТОКЕН-РАННЕРА' })),
     retry: jest.fn(async () => undefined),
+    hostAgentLive: jest.fn(async () => true),
   };
   return {
     ctrl: new ProductsController(products as any, turns as any, turnEvents as any, provisioning as any),
@@ -396,5 +397,81 @@ describe('ProductsController.history', () => {
     await ctrl.history(user, P, makeRes() as any);
 
     expect(turns.history).toHaveBeenCalledWith(P, 'u-1');
+  });
+});
+
+describe('ProductsController.list', () => {
+  it('тело остаётся массивом строк, а не конвертом', async () => {
+    // Кабинет читает ответ массивом (`Array.isArray(rows) ? rows : null` в
+    // productsApi.list) и на конверт отвечает «не удалось обновить список».
+    // Статика и API катятся одним скриптом, но открытая вкладка живёт своей
+    // жизнью сутками, поэтому конверт здесь — это сломанный кабинет у всех,
+    // кто не перезагрузился.
+    const { ctrl } = makeController([]);
+    const res = makeRes();
+
+    await ctrl.list(user, res as any);
+
+    expect(Array.isArray(res.json.mock.calls[0][0])).toBe(true);
+    expect(res.json.mock.calls[0][0]).toEqual([{ id: P, name: 'selyanska' }]);
+  });
+
+  it('живой агент хоста виден в ответе', async () => {
+    const { ctrl } = makeController([]);
+    const res = makeRes();
+
+    await ctrl.list(user, res as any);
+
+    expect(res.setHeader).toHaveBeenCalledWith('X-Host-Agent', 'live');
+  });
+
+  it('молчащий агент хоста виден в ответе', async () => {
+    // Без этого владелец узнаёт о мёртвом агенте только через десять минут и
+    // с неверной причиной — «срок заведения истёк».
+    const { ctrl, provisioning } = makeController([]);
+    provisioning.hostAgentLive.mockResolvedValueOnce(false);
+    const res = makeRes();
+
+    await ctrl.list(user, res as any);
+
+    expect(res.setHeader).toHaveBeenCalledWith('X-Host-Agent', 'silent');
+  });
+
+  it('заголовок уходит раньше тела', async () => {
+    // setHeader после res.json() в express бросает ERR_HTTP_HEADERS_SENT:
+    // заголовки уже отправлены. Перестановка двух строк местами ломает
+    // маршрут целиком, а не только вердикт.
+    const { ctrl } = makeController([]);
+    const res = makeRes();
+
+    await ctrl.list(user, res as any);
+
+    expect(res.setHeader.mock.invocationCallOrder[0]).toBeLessThan(
+      res.json.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('сорванная проверка агента не роняет список и не выдумывает тревогу', async () => {
+    // Вердикт — приписка к ответу, а не сам ответ. 500 вместо списка продуктов
+    // из-за недоступной отметки был бы платой большей, чем вся польза от неё,
+    // а «агент молчит», выведенное из СВОЕГО отказа, отправило бы владельца
+    // чинить исправную машину.
+    const { ctrl, provisioning } = makeController([]);
+    provisioning.hostAgentLive.mockRejectedValueOnce(new Error('нет такой таблицы'));
+    const res = makeRes();
+
+    await expect(ctrl.list(user, res as any)).resolves.not.toThrow();
+
+    expect(res.json).toHaveBeenCalledWith([{ id: P, name: 'selyanska' }]);
+    expect(res.setHeader).toHaveBeenCalledWith('X-Host-Agent', 'live');
+  });
+
+  it('список спрашивается за владельца токена', async () => {
+    const { ctrl, products } = makeController([]);
+    const res = makeRes();
+
+    await ctrl.list(user, res as any);
+
+    expect(products.list).toHaveBeenCalledWith('u-1');
   });
 });

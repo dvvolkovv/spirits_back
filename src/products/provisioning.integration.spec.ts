@@ -139,7 +139,7 @@ maybe('провижининг против живого Postgres', () => {
     } as any);
     // Схема накатывается ТЕМИ ЖЕ файлами, что и в проде. Переписанный руками
     // DDL разъехался бы с миграциями молча, и файл проверял бы выдуманную базу.
-    for (const f of ['001_products.sql', '002_provisioning.sql']) {
+    for (const f of ['001_products.sql', '002_provisioning.sql', '003_host_agent.sql']) {
       await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', f), 'utf8'));
     }
     // ГАРД НА ЧУЖУЮ БАЗУ. beforeEach делает TRUNCATE и адрес не разбирает, а
@@ -166,14 +166,17 @@ maybe('провижининг против живого Postgres', () => {
     // целиком: падает beforeAll, а с ним все 33 теста. На первой же батарее
     // мутаций это выглядело как идеальная ловля — прибор врал, а не сторожил.
     await pool?.query(
-      'TRUNCATE products, product_provision_jobs, product_turns RESTART IDENTITY CASCADE',
+      'TRUNCATE products, product_provision_jobs, product_turns, product_host_agent RESTART IDENTITY CASCADE',
     );
     await pool?.end();
   });
 
   beforeEach(async () => {
+    // product_host_agent — в том же списке: отметка о жизни агента переживает
+    // сценарий и молча делает следующий зелёным. Сценарий «отметки нет вовсе»
+    // (агента не пускают по токену) иначе проверял бы чужую отметку.
     await pool.query(
-      'TRUNCATE products, product_provision_jobs, product_turns RESTART IDENTITY CASCADE',
+      'TRUNCATE products, product_provision_jobs, product_turns, product_host_agent RESTART IDENTITY CASCADE',
     );
   });
 
@@ -1209,5 +1212,194 @@ maybe('провижининг против живого Postgres', () => {
       expect(Object.keys(row)).not.toContain('secrets_encrypted');
       expect(Object.keys(row)).not.toContain('runner_token_hash');
     }
+  });
+
+  it('20а. выдача клиенту не несёт внутреннюю топологию машины продуктов', async () => {
+    // Не секреты, но и не дело кабинета: адрес хоста, путь чекаута, команды
+    // сборки и перезапуска, адрес health и id сессии Claude. Их читают агент
+    // хоста и раннер внутри контейнера — каждый своим запросом. Сторож здесь,
+    // а не только на заглушке pg: проверка текста запроса переживает
+    // `SELECT *`, а эта — нет.
+    await product({ slug: 'vydacha-topologiya', status: 'running' });
+
+    const rows = await new ProductsService(pg as any).list('u-1');
+
+    expect(rows).toHaveLength(1);
+    for (const column of [
+      'host_ip',
+      'checkout_path',
+      'build_cmd',
+      'restart_cmd',
+      'health_url',
+      'repo_url',
+      'claude_session_id',
+      'port',
+    ]) {
+      expect(Object.keys(rows[0])).not.toContain(column);
+    }
+    // В обратную сторону: то, что рисует карточка, обязано приезжать. Один
+    // только запрет зеленел бы и на выдаче, где не осталось ничего.
+    expect(Object.keys(rows[0]).sort()).toEqual(
+      [
+        'created_at',
+        'domain',
+        'id',
+        'kind',
+        'name',
+        'provision_error',
+        'runner_seen_at',
+        'slug',
+        'status',
+        'user_id',
+      ].sort(),
+    );
+  });
+
+  // ═══════════════ отметка о жизни агента хоста ═══════════════
+
+  /** Отметка возрастом `ago`; null — отметки нет вовсе. */
+  async function hostSeen(ago: string | null) {
+    if (ago === null) return;
+    await pool.query(
+      `INSERT INTO product_host_agent (id, seen_at) VALUES (true, now() - $1::interval)
+       ON CONFLICT (id) DO UPDATE SET seen_at = EXCLUDED.seen_at`,
+      [ago],
+    );
+  }
+
+  const hostRows = async () =>
+    (await pool.query('SELECT id, seen_at FROM product_host_agent')).rows;
+
+  it('21. первый опрос агента заводит отметку', async () => {
+    expect(await hostRows()).toHaveLength(0);
+
+    await makeSvc().touchHostAgent();
+
+    const rows = await hostRows();
+    expect(rows).toHaveLength(1);
+    // Отметка — про «сейчас», а не про «когда-нибудь». Вставка временем
+    // процесса на разошедшихся часах дала бы либо вечную тревогу, либо вечное
+    // спокойствие; здесь сверяется, что значение пришло от часов БАЗЫ.
+    expect(Date.now() - new Date(rows[0].seen_at).getTime()).toBeLessThan(5_000);
+  });
+
+  it('21а. повторный опрос в пределах загрубления отметку не переписывает', async () => {
+    // Агент опрашивает раз в три секунды: без условия это 28 800 записей в
+    // сутки в одну строку.
+    await hostSeen('5 seconds');
+    const before = (await hostRows())[0].seen_at;
+
+    await makeSvc().touchHostAgent();
+
+    expect((await hostRows())[0].seen_at).toEqual(before);
+  });
+
+  it('21б. отметка старше загрубления двигается вперёд', async () => {
+    // Обратная сторона предыдущего: условие, ставшее безусловным запретом
+    // (например `< now() - interval '30 minutes'`), заморозило бы отметку
+    // живого агента и зажгло бы тревогу на исправной машине.
+    await hostSeen('40 seconds');
+    const before = (await hostRows())[0].seen_at;
+
+    await makeSvc().touchHostAgent();
+
+    const after = (await hostRows())[0].seen_at;
+    expect(new Date(after).getTime()).toBeGreaterThan(new Date(before).getTime());
+    expect(Date.now() - new Date(after).getTime()).toBeLessThan(5_000);
+  });
+
+  it('21в. второй строки в таблице не бывает', async () => {
+    // Единственность держит база (id boolean PRIMARY KEY CHECK (id)), а не
+    // аккуратность вызывающего: читатель берёт отметку без ORDER BY и без
+    // max(), и вторая строка означала бы, что иногда показывается
+    // позавчерашняя.
+    await makeSvc().touchHostAgent();
+    await hostSeen('1 hour');
+    await makeSvc().touchHostAgent();
+
+    expect(await hostRows()).toHaveLength(1);
+    await expect(
+      pool.query(`INSERT INTO product_host_agent (id, seen_at) VALUES (false, now())`),
+    ).rejects.toMatchObject({ code: '23514' });
+  });
+
+  it('21г. свежая отметка — агент на связи', async () => {
+    await hostSeen('10 seconds');
+
+    await expect(makeSvc().hostAgentLive()).resolves.toBe(true);
+  });
+
+  it('21д. отметки нет вовсе — агент не на связи', async () => {
+    // Так выглядит агент, которого не пускают по токену: юнит показывает
+    // active (running), ноль перезапусков, ошибок нет, а HostGuard отбивает
+    // каждый опрос — и до маршрута, а значит и до отметки, дело не доходит.
+    await bystander();
+
+    await expect(makeSvc().hostAgentLive()).resolves.toBe(false);
+  });
+
+  it('21е. отметка старше порога — агент не на связи', async () => {
+    await hostSeen('3 minutes');
+
+    await expect(makeSvc().hostAgentLive()).resolves.toBe(false);
+  });
+
+  it('21ж. молчание с заданием на руках — агент занят, а не мёртв', async () => {
+    // ГЛАВНЫЙ ЛОЖНОПОЛОЖИТЕЛЬНЫЙ. Пока агент разворачивает продукт, он НЕ
+    // опрашивает — он работает, до восьми минут по своему же сроку. Одной
+    // свежести отметки хватило бы, чтобы объявить его мёртвым посреди
+    // исправного заведения — то есть ровно в те десять минут, когда владелец
+    // смотрит на карточку.
+    const p = await product({ slug: 'agent-busy' });
+    await job(p.id, { status: 'running', createdAgo: '4 minutes', startedAgo: '4 minutes' });
+    await hostSeen('4 minutes');
+
+    await expect(makeSvc().hostAgentLive()).resolves.toBe(true);
+  });
+
+  it('21з. задание в очереди молчание не оправдывает', async () => {
+    // Ради этого случая всё и написано: задание стоит в 'queued', забрать его
+    // некому. Без различения статусов задания сюда попал бы тот же ответ, что
+    // и в предыдущем сценарии, и тревога не появилась бы никогда.
+    const p = await product({ slug: 'agent-dead-queued' });
+    await job(p.id, { status: 'queued', createdAgo: '4 minutes' });
+    await hostSeen('4 minutes');
+
+    await expect(makeSvc().hostAgentLive()).resolves.toBe(false);
+  });
+
+  it('21и. взятое задание оправдывает молчание не дольше срока заведения', async () => {
+    // Агент, умерший посреди развёртывания, оставляет задание в 'running'.
+    // Верхняя граница — условие по сроку в самом запросе, а не надежда на
+    // сборщика зависших: остановленный сборщик иначе делал бы мёртвого агента
+    // вечно живым.
+    const p = await product({ slug: 'agent-died-midway' });
+    await job(p.id, { status: 'running', createdAgo: '12 minutes', startedAgo: '11 minutes' });
+    await hostSeen('11 minutes');
+
+    await expect(makeSvc().hostAgentLive()).resolves.toBe(false);
+  });
+
+  it('21к. закрытые задания жизни не подтверждают', async () => {
+    // История заданий у продукта накапливается навсегда. Отбор без сверки
+    // статуса объявил бы агента живым по заданию двухчасовой давности — то
+    // есть навсегда, на любой машине, где хоть раз что-то заводили.
+    const p = await product({ slug: 'agent-done-history', status: 'running' });
+    await job(p.id, { status: 'done', createdAgo: '2 minutes', startedAgo: '2 minutes', finishedAgo: '1 minute' });
+    await job(p.id, { status: 'failed', createdAgo: '1 minute', startedAgo: '1 minute' });
+    await hostSeen('5 minutes');
+
+    await expect(makeSvc().hostAgentLive()).resolves.toBe(false);
+  });
+
+  it('21л. опрос агента и вердикт кабинета сходятся на живой базе', async () => {
+    // Сквозной стык: мёртвый агент -> тревога, пришедший агент -> тишина.
+    // Порознь обе половины зелены и при разъехавшихся именах таблицы.
+    const svc = makeSvc();
+    expect(await svc.hostAgentLive()).toBe(false);
+
+    await svc.touchHostAgent();
+
+    expect(await svc.hostAgentLive()).toBe(true);
   });
 });

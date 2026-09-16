@@ -65,6 +65,21 @@ async function migration002(): Promise<string> {
 }
 
 /**
+ * Текст миграции 003 — отдельно от 001 и 002 по той же причине, по какой 002
+ * отделена от 001: склейка зеленела бы на чужом тексте. `timestamptz NOT NULL`
+ * и `DEFAULT now()` есть в обоих соседних файлах.
+ */
+async function migration003(): Promise<string> {
+  const { svc, queries } = makeService();
+  await svc.onModuleInit();
+  const sql = queries.find((q) => q.includes('product_host_agent'));
+  if (!sql) {
+    throw new Error('миграция 003 не применена: ни один запрос не заводит product_host_agent');
+  }
+  return sql.replace(/\/\*[\s\S]*?\*\//g, '').replace(/--[^\n]*/g, '');
+}
+
+/**
  * Значения именованного CHECK-словаря, отсортированные: сверка получается ровно
  * про состав, а не про порядок перечисления.
  *
@@ -99,7 +114,13 @@ describe('миграция 002', () => {
     await svc.onModuleInit();
 
     // Порядок важен: 002 добавляет колонки в таблицу, которую создаёт 001.
-    expect(applied).toEqual(['001_products.sql', '002_provisioning.sql']);
+    // 003 своя таблица и ни от кого не зависит, но список файлов — это и есть
+    // описание схемы: пропавший из него файл не применяется вовсе.
+    expect(applied).toEqual([
+      '001_products.sql',
+      '002_provisioning.sql',
+      '003_host_agent.sql',
+    ]);
   });
 
   it('kind — обязательный текст со значением по умолчанию для старых строк', async () => {
@@ -210,5 +231,45 @@ describe('миграция 002', () => {
     expect(await migration002()).toMatch(
       /product_provision_jobs_one_active[\s\S]*?WHERE\s+status\s+IN\s*\(\s*'queued'\s*,\s*'running'\s*\)/,
     );
+  });
+});
+
+describe('миграция 003 — отметка о жизни агента хоста', () => {
+  it('заводит таблицу отметки', async () => {
+    expect(await migration003()).toMatch(/CREATE TABLE IF NOT EXISTS\s+product_host_agent/);
+  });
+
+  it('повторный прогон миграции не падает', async () => {
+    // Модуль накатывает схему на КАЖДОМ старте (onModuleInit), то есть при
+    // каждом `pm2 restart`. CREATE TABLE без IF NOT EXISTS уронил бы миграцию
+    // на втором запуске, а applyMigration такой отказ только пишет в лог —
+    // значит следующая миграция молча поехала бы на базу в неизвестном
+    // состоянии.
+    expect(await migration003()).toContain('IF NOT EXISTS');
+  });
+
+  it('строка в таблице может быть только одна', async () => {
+    // Ключ boolean плюс CHECK(id) — это и есть гарантия единственности:
+    // читатель берёт отметку без ORDER BY и без max(). Со снятым CHECK ключ
+    // пускает вторую строку с id = false, и запрос начинает брать одну из
+    // двух отметок наугад — то есть иногда показывать позавчерашнюю.
+    expect(await migration003()).toMatch(/id\s+boolean\s+PRIMARY KEY\s+DEFAULT\s+true\s+CHECK\s*\(\s*id\s*\)/);
+  });
+
+  it('отметка — обязательная метка времени с часовым поясом', async () => {
+    // timestamp без пояса складывался бы с now() по-разному в зависимости от
+    // TimeZone соединения: свежесть считается вычитанием, и молчание агента
+    // измерялось бы с ошибкой в часы. NULL здесь невозможен по смыслу: строка
+    // существует только затем, чтобы нести это значение.
+    expect(await migration003()).toMatch(/seen_at\s+timestamptz\s+NOT NULL\s+DEFAULT\s+now\(\)/);
+  });
+
+  it('реестра хостов не заводит', async () => {
+    // Таблица хостов отвергнута в спеке по YAGNI, триггер пересмотра назван —
+    // второй хост. Колонки вроде host_ip или name здесь означали бы, что
+    // реестр завели наполовину: писать в них некому, а читатель решит, что
+    // машин несколько.
+    const sql = await migration003();
+    expect(sql).not.toMatch(/host_ip|hostname|\bname\b/);
   });
 });
