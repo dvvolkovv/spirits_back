@@ -11,6 +11,7 @@ import { RunnerGuard } from './runner.guard';
 import { HostGuard } from './host.guard';
 import { SecretsService } from './secrets.service';
 import { ProvisioningService } from './provisioning.service';
+import { RentService } from './rent.service';
 
 @Module({
   imports: [CommonModule, MiscModule],
@@ -26,7 +27,12 @@ import { ProvisioningService } from './provisioning.service';
     HostGuard,
     SecretsService,
     ProvisioningService,
+    // Аренда. Своим провайдером, а не дописью в ProvisioningService: тот уже
+    // 900 строк и отвечает за заведение, а у аренды другой жизненный цикл.
+    // Включён здесь сразу: сервис, которого нет в модуле, не инжектируется
+    // никуда — а звать его будут и сборщик, и пополнение баланса.
+    RentService,
   ],
-  exports: [ProductsService, TurnsService, ProvisioningService],
+  exports: [ProductsService, TurnsService, ProvisioningService, RentService],
 })
 export class ProductsModule {}
