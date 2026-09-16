@@ -1,0 +1,158 @@
+import { HostConfig } from './config';
+import { ProvisionJob } from './provision';
+
+/**
+ * Задание в том виде, в каком его собирает `claimJob` на сервере.
+ *
+ * Наследование от ProvisionJob — не украшение: оно делает несовпадение полей
+ * ошибкой КОМПИЛЯЦИИ. Если сервер перестанет класть в задание `name` или
+ * `runnerToken`, а здесь это забудут, `provision(job, …)` не соберётся, вместо
+ * того чтобы уехать на хост с `undefined` в имени продукта и пустым токеном —
+ * ошибки такой формы видны только глазами и уже на готовом продукте.
+ */
+export interface HostJob extends ProvisionJob {
+  jobId: string;
+  productId: string;
+}
+
+/**
+ * Исход развёртывания в том виде, в каком его принимает `completeJob`.
+ *
+ * Именно союз, а не `{ ok: boolean; port?; error? }`: союз не даёт собрать
+ * отказ без причины (сервер напишет в карточку «без причины») и не даёт
+ * приложить причину к успеху.
+ */
+export type JobReport = { ok: true; port?: number } | { ok: false; error: string };
+
+/**
+ * Результат опроса. ТРИ исхода, а не два, и различает их тип, а не догадка на
+ * стороне вызывающего:
+ *
+ *   { ok: true,  job: null }  — очередь пуста. Обычное состояние.
+ *   { ok: true,  job }        — есть работа.
+ *   { ok: false, error }      — связи нет, токен не принят, тело не то.
+ *
+ * Форма выбрана против стыка, на котором эта задача спотыкалась на живом
+ * HTTP: маршрут отдаёт КОНВЕРТ `{ job }`, и `const job = await api.poll()` без
+ * разворота даёт объект, истинный ВСЕГДА — агент уезжает разворачивать пустоту
+ * и проваливает провижининг на задании без слага. С размеченным союзом такая
+ * ошибка не компилируется: до `.job` нельзя добраться, не сузив по `.ok`.
+ *
+ * Разделение «пусто» и «отказ» нужно ещё и для паузы: пустая очередь — это
+ * обычные три секунды, а отказ (в том числе неверный HOST_TOKEN, который
+ * молчит вечно) — пауза втрое длиннее, иначе агент бесконечно молотит 401.
+ */
+export type PollOutcome = { ok: true; job: HostJob | null } | { ok: false; error: string };
+
+/**
+ * HTTP-клиент агента хоста — единственная связь машины продуктов с Linkeon.
+ *
+ * Соединение всегда инициирует хост: ключей от машины продуктов у бэкенда нет,
+ * и это решение дизайна, а не недоделка.
+ *
+ * Как и у раннера, ни один метод не бросает. Падение процесса здесь дороже,
+ * чем там: агент один на всю машину, и пока он лежит, не заводится ни один
+ * продукт ни у одного клиента.
+ */
+export class HostApi {
+  constructor(
+    private readonly config: HostConfig,
+    private readonly fetchFn: typeof fetch = fetch,
+  ) {}
+
+  private url(path: string) {
+    return `${this.config.linkeonUrl}/webhook/${path}`;
+  }
+
+  private headers() {
+    return {
+      Authorization: `Bearer ${this.config.hostToken}`,
+      'Content-Type': 'application/json',
+    };
+  }
+
+  /**
+   * Таймаут обязателен: без него повисший запрос блокирует агента навсегда.
+   * Restart=always в systemd не спасает — процесс жив, просто ничего не
+   * делает, и кнопка «Новый продукт» перестаёт работать молча.
+   */
+  private async withTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await this.fetchFn(url, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async poll(): Promise<PollOutcome> {
+    try {
+      const res = await this.withTimeout(
+        this.url('products/host/poll'),
+        {
+          method: 'POST',
+          headers: this.headers(),
+          // Тело пустого объекта, а не отсутствующее: заголовок уже объявил
+          // JSON, и пустая полезная нагрузка при таком заголовке — ровно та
+          // комбинация, которую разборщики тел и прокси трактуют кто во что
+          // горазд (от `{}` до 400). Валидный `{}` снимает вопрос.
+          body: '{}',
+        },
+        this.config.pollTimeoutMs,
+      );
+      // `res.ok`, а НЕ `res.status === 200`. Оба маршрута агента — @Post, а
+      // Nest по умолчанию отвечает на @Post кодом 201. Сверка с 200 давала бы
+      // ложный отказ на каждом успешном опросе, и агент не забрал бы ни одного
+      // задания при полностью исправном сервере.
+      if (!res.ok) return { ok: false, error: `опрос отклонён: HTTP ${res.status}` };
+
+      const body: unknown = await res.json();
+      // Конверт проверяется НАЛИЧИЕМ ключа, а не истинностью значения.
+      // `body?.job ?? null` молча считал бы пустой очередью и ответ без
+      // конверта вообще — то есть исчезновение конверта на сервере выглядело
+      // бы как «заданий нет», а задания копились бы в очереди без единой
+      // строки в журнале. Отсутствие конверта — отказ, и отказ громкий.
+      if (!body || typeof body !== 'object' || Array.isArray(body) || !('job' in body)) {
+        return { ok: false, error: 'ответ опроса без конверта job' };
+      }
+      const job = (body as { job: HostJob | null }).job;
+      if (job === null || job === undefined) return { ok: true, job: null };
+
+      // Без jobId отчитаться невозможно НИКОГДА: id задания есть только здесь.
+      // Взяться за такое задание значит гарантированно оставить на хосте
+      // контейнер, о котором сервер не узнает. Отказываемся до первого
+      // действия — отказываться ещё нечем.
+      if (typeof job.jobId !== 'string' || !job.jobId) {
+        return { ok: false, error: 'задание без jobId — отчитаться о нём будет нечем' };
+      }
+      return { ok: true, job };
+    } catch (e: any) {
+      // Сеть легла, таймаут (в т.ч. наш собственный abort), DNS, тело не JSON.
+      return { ok: false, error: e?.message ? String(e.message) : String(e) };
+    }
+  }
+
+  /**
+   * Отчёт о развёртывании. Возвращает, ДОЕХАЛ ли он, — вызывающий обязан
+   * знать разницу: недоставленный отчёт об успехе означает живой контейнер,
+   * о котором сервер не знает, и это повод досылать, а не повод объявить
+   * отказ.
+   *
+   * jobId экранируется в пути по той же причине, что и turnId в раннере:
+   * значение приезжает по сети, а слэш или `..` в нём незаметно перенаправят
+   * POST на чужой маршрут.
+   */
+  async complete(jobId: string, report: JobReport): Promise<boolean> {
+    try {
+      const res = await this.withTimeout(
+        this.url(`products/host/jobs/${encodeURIComponent(jobId)}/complete`),
+        { method: 'POST', headers: this.headers(), body: JSON.stringify(report) },
+        this.config.requestTimeoutMs,
+      );
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+}

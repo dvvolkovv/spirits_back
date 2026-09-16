@@ -5,6 +5,8 @@ import { CurrentUser } from '../common/decorators/user.decorator';
 import { ProductsService } from './products.service';
 import { TurnsService } from './turns.service';
 import { TurnEventsService } from './turn-events.service';
+import { ProvisioningService } from './provisioning.service';
+import { assertUuid, CreateProductDto } from './products.dto';
 
 @Controller('')
 @UseGuards(JwtGuard)
@@ -15,6 +17,7 @@ export class ProductsController {
     private readonly products: ProductsService,
     private readonly turns: TurnsService,
     private readonly turnEvents: TurnEventsService,
+    private readonly provisioning: ProvisioningService,
   ) {}
 
   @Get('products')
@@ -22,8 +25,41 @@ export class ProductsController {
     return res.status(200).json(await this.products.list(user.userId));
   }
 
+  /**
+   * Кнопка «Новый продукт». Поля перечисляются ЯВНО, по той же причине, что и
+   * в chat(): ValidationPipe стоит с `whitelist: false`, лишнее из тела не
+   * срезается, и спред отдал бы любому авторизованному пользователю право
+   * завести продукт на чужой `userId`.
+   */
+  @Post('products')
+  async create(@CurrentUser() user: any, @Body() body: CreateProductDto) {
+    const r = await this.provisioning.create({
+      userId: user.userId,
+      name: body.name,
+      slug: body.slug,
+      kind: body.kind,
+      secrets: body.secrets ?? {},
+    });
+    // Наружу только id. Открытый токен раннера — ключ от чекаута продукта, он
+    // нужен агенту хоста, а не браузеру; `return r` отправил бы его в ответ и
+    // в логи прокси.
+    return { id: r.productId };
+  }
+
+  /**
+   * Кнопка «повторить» на карточке сорванного заведения. Владение и состояние
+   * проверяет сам сервис — одним оператором вместе с постановкой задания.
+   */
+  @Post('products/:id/retry')
+  async retry(@CurrentUser() user: any, @Param('id') id: string) {
+    assertUuid(id, 'Product');
+    await this.provisioning.retry(id, user.userId);
+    return { ok: true };
+  }
+
   @Get('products/:id/turns')
   async history(@CurrentUser() user: any, @Param('id') id: string, @Res() res: Response) {
+    assertUuid(id, 'Product');
     await this.products.getOwned(id, user.userId);
     return res.status(200).json(await this.turns.history(id, user.userId));
   }
@@ -46,6 +82,7 @@ export class ProductsController {
     @Req() req: Request,
     @Res() res: Response,
   ) {
+    assertUuid(id, 'Product');
     await this.products.getOwned(id, user.userId);
     const turn = await this.turns.enqueue({
       productId: id,
@@ -102,6 +139,10 @@ export class ProductsController {
     @Param('turnId') turnId: string,
     @Res() res: Response,
   ) {
+    assertUuid(id, 'Product');
+    // Оба параметра, а не только первый: turnId уезжает в такой же
+    // `WHERE id = $1` внутри revert().
+    assertUuid(turnId, 'Turn');
     await this.products.getOwned(id, user.userId);
     const turn = await this.turns.revert({ productId: id, turnId, userId: user.userId });
     return res.status(202).json(turn);

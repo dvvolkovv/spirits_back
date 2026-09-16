@@ -108,7 +108,7 @@ DOC
 ok "чекаут /srv/products/$SLUG создан"
 
 bold "[4/6] завожу в реестре на проде"
-OUT=$(ssh "$PROD_HOST" "cd ~/spirits_back && DATABASE_URL=\$(grep -E '^DATABASE_URL=' .env | cut -d= -f2- | tr -d '\"') bash scripts/products-register.sh '$USER_ID' '$NAME' '$SLUG' /product")
+OUT=$(ssh "$PROD_HOST" "cd ~/spirits_back && DATABASE_URL=\$(grep -E '^DATABASE_URL=' .env | cut -d= -f2- | tr -d '\"') bash scripts/products-register.sh '$USER_ID' '$NAME' '$SLUG' /product site")
 PRODUCT_ID=$(echo "$OUT" | head -1 | tr -d ' ')
 TOKEN=$(echo "$OUT" | grep '^RUNNER_TOKEN=' | cut -d= -f2)
 [[ -n "$TOKEN" ]] || die "токен не получен"

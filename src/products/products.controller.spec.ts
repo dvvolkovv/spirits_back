@@ -1,4 +1,4 @@
-import { NotFoundException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import { ProductsController } from './products.controller';
 
 function makeRes() {
@@ -30,11 +30,11 @@ function makeReq() {
 
 function makeController(events: any[]) {
   const products = {
-    list: jest.fn(async () => [{ id: 'p-1', name: 'selyanska' }]),
-    getOwned: jest.fn(async () => ({ id: 'p-1', name: 'selyanska' })),
+    list: jest.fn(async () => [{ id: P, name: 'selyanska' }]),
+    getOwned: jest.fn(async () => ({ id: P, name: 'selyanska' })),
   };
   const turns = {
-    enqueue: jest.fn(async () => ({ id: 't-1' })),
+    enqueue: jest.fn(async () => ({ id: T })),
     history: jest.fn(async () => []),
     revert: jest.fn(async () => ({ id: 't-revert' })),
   };
@@ -43,14 +43,27 @@ function makeController(events: any[]) {
       for (const e of events) yield e;
     }),
   };
+  // create отдаёт НЕ только productId намеренно: заведение выпускает больше,
+  // чем показывает, и маршрут обязан отбирать. Сегодня лишнего здесь нет, но
+  // тест обязан краснеть на `return r`, а не ждать, пока лишнее появится.
+  const provisioning = {
+    create: jest.fn(async () => ({ productId: 'p-новый', runnerToken: 'ТОКЕН-РАННЕРА' })),
+    retry: jest.fn(async () => undefined),
+  };
   return {
-    ctrl: new ProductsController(products as any, turns as any, turnEvents as any),
+    ctrl: new ProductsController(products as any, turns as any, turnEvents as any, provisioning as any),
     products,
     turns,
     turnEvents,
+    provisioning,
   };
 }
 
+// id продукта и хода — НАСТОЯЩИЕ uuid: колонки uuid-овые, маршруты отсекают
+// мусор до запроса (см. assertUuid), и фикстура вида 'p-1' проверяла бы путь,
+// которого на проде не бывает.
+const P = '11111111-1111-4111-8111-111111111111';
+const T = '22222222-2222-4222-8222-222222222222';
 const user = { userId: 'u-1' };
 
 describe('ProductsController.chat', () => {
@@ -62,7 +75,7 @@ describe('ProductsController.chat', () => {
     ]);
     const res = makeRes();
 
-    await ctrl.chat(user, 'p-1', { prompt: 'поправь футер' } as any, makeReq() as any, res as any);
+    await ctrl.chat(user, P, { prompt: 'поправь футер' } as any, makeReq() as any, res as any);
 
     expect(res.setHeader).toHaveBeenCalledWith('Content-Type', 'text/plain; charset=utf-8');
     // Без этого nginx придержит чанки и стриминг превратится в один ответ в конце.
@@ -74,9 +87,9 @@ describe('ProductsController.chat', () => {
   it('проверяет владение продуктом до постановки хода', async () => {
     const { ctrl, products, turns } = makeController([{ type: 'end' }]);
 
-    await ctrl.chat(user, 'p-1', { prompt: 'go' } as any, makeReq() as any, makeRes() as any);
+    await ctrl.chat(user, P, { prompt: 'go' } as any, makeReq() as any, makeRes() as any);
 
-    expect(products.getOwned).toHaveBeenCalledWith('p-1', 'u-1');
+    expect(products.getOwned).toHaveBeenCalledWith(P, 'u-1');
     expect(products.getOwned.mock.invocationCallOrder[0]).toBeLessThan(
       turns.enqueue.mock.invocationCallOrder[0],
     );
@@ -94,7 +107,7 @@ describe('ProductsController.chat', () => {
     products.getOwned.mockRejectedValue(new NotFoundException('Product not found'));
 
     await expect(
-      ctrl.chat(user, 'p-1', { prompt: 'go' } as any, makeReq() as any, makeRes() as any),
+      ctrl.chat(user, P, { prompt: 'go' } as any, makeReq() as any, makeRes() as any),
     ).rejects.toBeInstanceOf(NotFoundException);
     expect(turns.enqueue).not.toHaveBeenCalled();
   });
@@ -104,11 +117,11 @@ describe('ProductsController.chat', () => {
     // потока. Маршрут обязан передавать оба параметра.
     const { ctrl, turnEvents } = makeController([{ type: 'end' }]);
 
-    await ctrl.chat(user, 'p-1', { prompt: 'go' } as any, makeReq() as any, makeRes() as any);
+    await ctrl.chat(user, P, { prompt: 'go' } as any, makeReq() as any, makeRes() as any);
 
     // Третий аргумент — предикат отмены (см. readEvents в
     // turn-events.service.ts); в этом тесте важны только первые два.
-    expect(turnEvents.readEvents).toHaveBeenCalledWith('p-1', 't-1', expect.any(Function));
+    expect(turnEvents.readEvents).toHaveBeenCalledWith(P, T, expect.any(Function));
   });
 
   it('revertToSha из тела запроса не доезжает до enqueue', async () => {
@@ -121,7 +134,7 @@ describe('ProductsController.chat', () => {
 
     await ctrl.chat(
       user,
-      'p-1',
+      P,
       { prompt: 'go', revertToSha: 'deadbeef' } as any,
       makeReq() as any,
       makeRes() as any,
@@ -160,7 +173,7 @@ describe('ProductsController.chat', () => {
       return true;
     });
 
-    await ctrl.chat(user, 'p-1', { prompt: 'go' } as any, req as any, res as any);
+    await ctrl.chat(user, P, { prompt: 'go' } as any, req as any, res as any);
 
     const types = res.chunks.join('').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l).type);
     expect(types).toEqual(['begin']);
@@ -185,7 +198,7 @@ describe('ProductsController — привязка отмены', () => {
     }) as any;
 
     const req = makeReq();
-    await ctrl.chat(user, 'p-1', { prompt: 'go' } as any, req as any, makeRes() as any);
+    await ctrl.chat(user, P, { prompt: 'go' } as any, req as any, makeRes() as any);
     req.fireClose();
 
     expect(captured).toBeDefined();
@@ -198,10 +211,164 @@ describe('ProductsController.revert', () => {
     const { ctrl, products, turns } = makeController([]);
     const res = makeRes();
 
-    await ctrl.revert(user, 'p-1', 't-1', res as any);
+    await ctrl.revert(user, P, T, res as any);
 
-    expect(products.getOwned).toHaveBeenCalledWith('p-1', 'u-1');
-    expect(turns.revert).toHaveBeenCalledWith({ productId: 'p-1', turnId: 't-1', userId: 'u-1' });
+    expect(products.getOwned).toHaveBeenCalledWith(P, 'u-1');
+    expect(turns.revert).toHaveBeenCalledWith({ productId: P, turnId: T, userId: 'u-1' });
+  });
+});
+
+describe('ProductsController.create', () => {
+  it('заводит продукт от имени владельца токена', async () => {
+    const { ctrl, provisioning } = makeController([]);
+
+    await ctrl.create(user, {
+      name: 'Селянська',
+      slug: 'selyanska',
+      kind: 'site',
+      secrets: { BOT_TOKEN: '123:abc' },
+    } as any);
+
+    expect(provisioning.create).toHaveBeenCalledWith({
+      userId: 'u-1',
+      name: 'Селянська',
+      slug: 'selyanska',
+      kind: 'site',
+      secrets: { BOT_TOKEN: '123:abc' },
+    });
+  });
+
+  it('владелец берётся из токена, а не из тела', async () => {
+    // ValidationPipe стоит с whitelist: false, поэтому userId из тела доезжает
+    // до маршрута. Спред тела в create() отдал бы любому авторизованному
+    // пользователю право заводить продукты на чужой аккаунт — вместе с
+    // расходом его токенов и чужим слагом в публичной зоне.
+    const { ctrl, provisioning } = makeController([]);
+
+    await ctrl.create(user, {
+      name: 'Селянська',
+      slug: 'selyanska',
+      kind: 'site',
+      userId: 'u-чужой',
+    } as any);
+
+    expect(provisioning.create).toHaveBeenCalledWith(expect.objectContaining({ userId: 'u-1' }));
+  });
+
+  it('продукт без секретов заводится с пустым набором, а не с undefined', async () => {
+    // create перебирает Object.entries(secrets) и решает по длине, звать ли
+    // шифрование. undefined там разбирается только потому, что внутри стоит
+    // свой `?? {}` — маршрут не должен на это опираться.
+    const { ctrl, provisioning } = makeController([]);
+
+    await ctrl.create(user, { name: 'Сайт', slug: 'site-1', kind: 'site' } as any);
+
+    expect(provisioning.create).toHaveBeenCalledWith(expect.objectContaining({ secrets: {} }));
+  });
+
+  it('токен раннера в браузер не уезжает', async () => {
+    // Открытый токен раннера — ключ от чекаута продукта. Он нужен агенту
+    // хоста, а не браузеру: `return r` отдал бы его в ответе и в логи прокси.
+    const { ctrl } = makeController([]);
+
+    const res = await ctrl.create(user, { name: 'Сайт', slug: 'site-1', kind: 'site' } as any);
+
+    expect(res).toEqual({ id: 'p-новый' });
+    // Не только «поле не то»: ключ мог бы приехать под другим именем или
+    // вложенным.
+    expect(JSON.stringify(res)).not.toContain('ТОКЕН-РАННЕРА');
+    expect(Object.keys(res)).toEqual(['id']);
+  });
+
+  it('отказ заведения долетает до клиента, а не превращается в успех', async () => {
+    const { ctrl, provisioning } = makeController([]);
+    provisioning.create.mockRejectedValue(new ConflictException('слаг уже занят'));
+
+    await expect(
+      ctrl.create(user, { name: 'Сайт', slug: 'занят', kind: 'site' } as any),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+});
+
+describe('ProductsController.retry', () => {
+  it('повторяет заведение своего продукта', async () => {
+    const { ctrl, provisioning } = makeController([]);
+
+    const res = await ctrl.retry(user, P);
+
+    // Оба аргумента точно: владелец — второй, и подмена его местами с id
+    // прошла бы зелёной на любой проверке вида toHaveBeenCalled().
+    expect(provisioning.retry).toHaveBeenCalledWith(P, 'u-1');
+    expect(res).toEqual({ ok: true });
+  });
+
+  it('отказ повтора не превращается в ok: true', async () => {
+    // Чужой продукт и продукт не в состоянии отказа сервис отбивает
+    // NotFound-ом; проглоченный маршрутом, он стал бы «повторяем» на кнопке,
+    // после которой ничего не происходит.
+    const { ctrl, provisioning } = makeController([]);
+    provisioning.retry.mockRejectedValue(new NotFoundException('продукт не найден'));
+    const alien = '33333333-3333-4333-8333-333333333333';
+
+    await expect(ctrl.retry(user, alien)).rejects.toBeInstanceOf(NotFoundException);
+    // Чужой продукт обязан быть ВАЛИДНЫМ uuid: иначе отказ приходит от
+    // assertUuid, сервис не зовётся вовсе, и тест зеленеет по соседней
+    // причине, ничего не проверяя.
+    expect(provisioning.retry).toHaveBeenCalledWith(alien, 'u-1');
+  });
+});
+
+describe('ProductsController — мусор в :id', () => {
+  const junk = ['не-uuid', '../../etc/passwd', "1 OR 1=1", '', '11111111-1111-4111-8111'];
+
+  it('ни один клиентский маршрут не уносит мусорный id в базу', async () => {
+    // uuid-колонка отбивает мусорную строку ошибкой 22P02, то есть 500-кой:
+    // страница ошибки вместо честной 404 и строка в логе, выглядящая как
+    // поломка базы. Образец приёма — src/speech/speech.controller.ts.
+    for (const bad of junk) {
+      const { ctrl, products, turns, provisioning } = makeController([]);
+
+      await expect(ctrl.history(user, bad, makeRes() as any)).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      await expect(
+        ctrl.chat(user, bad, { prompt: 'go' } as any, makeReq() as any, makeRes() as any),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      await expect(ctrl.revert(user, bad, T, makeRes() as any)).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      await expect(ctrl.retry(user, bad)).rejects.toBeInstanceOf(NotFoundException);
+
+      // Отбой ДО запроса, а не после: иначе 404 приходит из базы, но 22P02
+      // туда уже съездил.
+      expect(products.getOwned).not.toHaveBeenCalled();
+      expect(turns.history).not.toHaveBeenCalled();
+      expect(turns.enqueue).not.toHaveBeenCalled();
+      expect(turns.revert).not.toHaveBeenCalled();
+      expect(provisioning.retry).not.toHaveBeenCalled();
+    }
+  });
+
+  it('мусорный turnId в откате отбивается так же, как productId', async () => {
+    // У revert параметров ДВА, и проверка только первого оставляла бы вторую
+    // половину дыры открытой: turnId уезжает в такой же WHERE id = $1.
+    const { ctrl, products, turns } = makeController([]);
+
+    await expect(ctrl.revert(user, P, 'не-uuid', makeRes() as any)).rejects.toBeInstanceOf(
+      NotFoundException,
+    );
+
+    expect(turns.revert).not.toHaveBeenCalled();
+    // Владение тоже не спрашивается: отбой раньше.
+    expect(products.getOwned).not.toHaveBeenCalled();
+  });
+
+  it('законный uuid проходит дальше', async () => {
+    // Обратная сторона: сторож, отбивающий ВСЁ, прошёл бы все проверки выше.
+    const { ctrl, provisioning } = makeController([]);
+
+    await expect(ctrl.retry(user, P)).resolves.toEqual({ ok: true });
+    expect(provisioning.retry).toHaveBeenCalledWith(P, 'u-1');
   });
 });
 
@@ -217,7 +384,7 @@ describe('ProductsController.history', () => {
     const { ctrl, products, turns } = makeController([]);
     products.getOwned.mockRejectedValue(new NotFoundException('Product not found'));
 
-    await expect(ctrl.history(user, 'p-1', makeRes() as any)).rejects.toBeInstanceOf(
+    await expect(ctrl.history(user, P, makeRes() as any)).rejects.toBeInstanceOf(
       NotFoundException,
     );
     expect(turns.history).not.toHaveBeenCalled();
@@ -226,8 +393,8 @@ describe('ProductsController.history', () => {
   it('своя история читается с владельцем в запросе', async () => {
     const { ctrl, turns } = makeController([]);
 
-    await ctrl.history(user, 'p-1', makeRes() as any);
+    await ctrl.history(user, P, makeRes() as any);
 
-    expect(turns.history).toHaveBeenCalledWith('p-1', 'u-1');
+    expect(turns.history).toHaveBeenCalledWith(P, 'u-1');
   });
 });

@@ -9,6 +9,7 @@ export interface ProductRow {
   name: string;
   slug: string;
   status: string;
+  kind: string;
   host_ip: string | null;
   domain: string | null;
   repo_url: string | null;
@@ -18,14 +19,26 @@ export interface ProductRow {
   health_url: string | null;
   runner_seen_at: string | null;
   claude_session_id: string | null;
+  provision_error: string | null;
   created_at: string;
 }
 
-// runner_token_hash сюда намеренно не входит: эти методы обслуживают
-// клиента, а хеш токена раннера ему не нужен ни в каком виде.
-const COLUMNS = `id, user_id, name, slug, status, host_ip, domain, repo_url,
+// Список колонок перечислен явно, и двух из них здесь нет намеренно:
+// runner_token_hash — хеш токена доступа к клиентской VM, secrets_encrypted —
+// шифротекст секретов продукта. Эти методы обслуживают клиента, и ни то, ни
+// другое ему не нужно ни в каком виде. Заменить перечисление на SELECT *
+// нельзя: обе колонки уедут в ответ молча, и следующая секретная колонка тоже.
+// Сторож — products.access.spec.ts.
+// kind и provision_error перечислены здесь не для полноты: без них карточка
+// отказа в кабинете показывает «сервер не передал причину» при заполненной
+// колонке в базе, а бот выглядит сайтом. Колонки завела миграция 002, и
+// перечисление — единственное место, которое надо было при этом дописать;
+// пропуск ничего не ломает на сервере и потому не виден ни одним его тестом.
+// port не перечислен намеренно: это порт на петле хоста, клиенту он не нужен
+// и в ответ уходить не должен.
+const COLUMNS = `id, user_id, name, slug, status, kind, host_ip, domain, repo_url,
                  checkout_path, build_cmd, restart_cmd, health_url,
-                 runner_seen_at, claude_session_id, created_at`;
+                 runner_seen_at, claude_session_id, provision_error, created_at`;
 
 @Injectable()
 export class ProductsService implements OnModuleInit {
@@ -35,6 +48,8 @@ export class ProductsService implements OnModuleInit {
 
   async onModuleInit() {
     await this.applyMigration('001_products.sql');
+    // Строго после 001: 002 навешивает колонки на таблицу, которую создаёт 001.
+    await this.applyMigration('002_provisioning.sql');
   }
 
   async list(userId: string): Promise<ProductRow[]> {
