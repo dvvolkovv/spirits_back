@@ -1,3 +1,4 @@
+import './env.mjs';
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { MeetingBot } from './bot.mjs';
