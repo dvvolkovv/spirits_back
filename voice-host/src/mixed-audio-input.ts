@@ -251,13 +251,23 @@ export class MixedRoomAudioInput extends voice.AudioInput {
           const { done, value } = await reader.read();
           if (done || this.closed) break;
           if (value) {
+            // КОПИЯ, а не вид на чужую память.
+            //
+            // `value.data` принадлежит SDK, и следующий кадр может лечь в тот
+            // же буфер. Мы же кладём массив в очередь микшера и держим его там
+            // до тика, а дамп пишем потоком, который отдаёт данные позже. В
+            // обоих случаях к моменту использования там оказывался уже другой
+            // звук: громкость, длительность и огибающая правильные, содержимое
+            // — каша. Синтетический стенд 16.09.2026: чистая фраза приходила
+            // неразборчивой ещё ДО сведения, и ни на одной частоте не читалась.
+            const data = new Int16Array(value.data);
             if (this.dumpPath) {
               let w = this.perTrackDumps.get(identity);
               if (!w) {
                 w = createWriteStream(`${this.dumpPath}.${identity}.pcm`);
                 this.perTrackDumps.set(identity, w);
               }
-              w.write(Buffer.from(value.data.buffer, value.data.byteOffset, value.data.byteLength));
+              w.write(Buffer.from(data.buffer, data.byteOffset, data.byteLength));
             }
             if (!this.geometryLogged.has(identity)) {
               this.geometryLogged.add(identity);
@@ -267,7 +277,7 @@ export class MixedRoomAudioInput extends voice.AudioInput {
               );
             }
             this.framesIn++;
-            this.mixer.push(identity, value.data);
+            this.mixer.push(identity, data);
           }
         }
       } catch (e) {
