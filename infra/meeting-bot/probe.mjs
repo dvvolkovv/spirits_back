@@ -27,8 +27,16 @@ if (!url) {
 
 const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
+// Не представляться автоматикой.
+//
+// Google Meet отказывает роботам ещё до экрана входа — «You can't join this
+// video call», без поля имени (проверено 16.09.2026). Playwright по умолчанию
+// объявляет себя: флаг `--enable-automation` и `navigator.webdriver`. У
+// Attendee ровно поэтому в списке стоит `--disable-blink-features=
+// AutomationControlled`.
 const browser = await chromium.launch({
   headless: false,
+  ignoreDefaultArgs: ['--enable-automation'],
   args: [
     '--no-sandbox',
     '--use-fake-ui-for-media-stream',
@@ -36,11 +44,16 @@ const browser = await chromium.launch({
     '--autoplay-policy=no-user-gesture-required',
     '--disable-dev-shm-usage',
     '--disable-features=IsolateOrigins,site-per-process',
+    '--disable-blink-features=AutomationControlled',
+    '--disable-extensions',
   ],
 });
 const ctx = await browser.newContext({
   permissions: ['microphone', 'camera'],
   locale: platform === 'meet' ? 'en-US' : 'ru-RU',
+});
+await ctx.addInitScript(() => {
+  try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) { /* уже переопределено */ }
 });
 const page = await ctx.newPage();
 page.on('console', (m) => {
