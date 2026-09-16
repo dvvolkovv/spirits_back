@@ -42,6 +42,8 @@ const PLATFORMS = {
     payload: meetPayload,
     join: MEET_JOIN,
     name: 'Google Meet',
+    channel: 'chrome',
+    humanize: true,
     // Тот же довод, что у Zoom: без устройств в списке площадка считает, что
     // микрофона нет. Meet на экране входа показывает выбранный — «Fake Default
     // Audio Input», — и это признак, что звук он у нас возьмёт.
@@ -294,6 +296,13 @@ export class MeetingBot {
     await this.setState('joining');
     this.browser = await chromium.launch({
       headless: false,
+      // Настоящий Chrome, если площадка просит.
+      //
+      // Meet различает браузеры: Chromium из Playwright он не пускает дальше
+      // экрана входа — стук до хозяина не доходит вовсе (16.09.2026). Attendee
+      // всё это время водил установленный Chrome, и разница оказалась в нём.
+      // Остальным площадкам Chromium годится, и лишней зависимости им не надо.
+      ...(platform.channel ? { channel: platform.channel } : {}),
       // Не представляться автоматикой.
       //
       // Google Meet отказывает роботам ДО экрана входа: «You can't join this
@@ -444,7 +453,18 @@ export class MeetingBot {
 
     const name = await waitFor(sel.nameInput);
     if (name) {
-      await name.fill(this.displayName).catch(() => {});
+      if (PLATFORMS[this.platform]?.humanize) {
+        // Набираем посимвольно, а не подставляем строку.
+        //
+        // Площадка, которая проверяет, человек ли пришёл, смотрит и на это:
+        // мгновенно возникшее в поле имя ввода за собой не оставляет. Тем же
+        // занят режим «humanized» у Attendee. Задержки небольшие — нам не надо
+        // притворяться медленным, надо не выглядеть подстановкой.
+        await name.click().catch(() => {});
+        await name.type(this.displayName, { delay: 80 }).catch(() => {});
+      } else {
+        await name.fill(this.displayName).catch(() => {});
+      }
       this.log.info?.(`[${this.id}] имя введено`);
     } else {
       this.log.warn?.(`[${this.id}] поля имени не дождались`);
