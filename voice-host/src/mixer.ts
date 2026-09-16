@@ -20,6 +20,14 @@ interface Track {
   /** Фон микрофона: уровень, к которому участник возвращается в паузах. */
   noiseFloor: number;
   /**
+   * Сколько кусков выброшено вытеснением очереди.
+   *
+   * Выброс — это дыра прямо посреди фразы: кадры приехали, но тикер не успел
+   * их забрать. На слух это щелчок, для распознавания — каша. Счётчик нужен,
+   * чтобы отличить «звук не дошёл» от «звук дошёл и был испорчен у нас».
+   */
+  dropped: number;
+  /**
    * Сколько тиков подряд участник не был признан говорящим.
    *
    * По нему решается, усиливать его прямо сейчас или он молчит и идёт в
@@ -181,7 +189,7 @@ export class Mixer {
     if (!samples.length) return;
     const t = this.track(participant);
     t.queue.push(samples);
-    while (this.countTicks(t.queue) > Mixer.MAX_BUFFERED_TICKS) t.queue.shift();
+    while (this.countTicks(t.queue) > Mixer.MAX_BUFFERED_TICKS) { t.queue.shift(); t.dropped++; }
     t.frames++;
     const rms = rmsOf(samples);
 
@@ -289,6 +297,8 @@ export class Mixer {
     speaking: boolean;
     /** Фон микрофона: от него считается порог речи. */
     floor: number;
+    /** Сколько кусков выброшено вытеснением очереди. */
+    dropped: number;
   }[] {
     return [...this.tracks.entries()].map(([participant, t]) => ({
       participant,
@@ -298,6 +308,7 @@ export class Mixer {
       gain: Number(this.gainFor(participant).toFixed(2)),
       speaking: this.speakingNow(t),
       floor: Math.round(t.noiseFloor),
+      dropped: t.dropped,
     }));
   }
 
@@ -348,7 +359,7 @@ export class Mixer {
   private track(participant: string): Track {
     let t = this.tracks.get(participant);
     if (!t) {
-      t = { queue: [], frames: 0, speechFrames: 0, speechRms: 0, peak: 0, noiseFloor: 0, ticksSinceSpeech: Infinity };
+      t = { queue: [], frames: 0, speechFrames: 0, speechRms: 0, peak: 0, noiseFloor: 0, dropped: 0, ticksSinceSpeech: Infinity };
       this.tracks.set(participant, t);
     }
     return t;

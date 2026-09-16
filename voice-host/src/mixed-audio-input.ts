@@ -190,6 +190,8 @@ export class MixedRoomAudioInput extends voice.AudioInput {
 
   /** Уже читаемые дорожки — чтобы не открыть два потока на одну. */
   private readonly attached = new Set<string>();
+  /** Про кого уже написали геометрию кадров — строка нужна один раз. */
+  private readonly geometryLogged = new Set<string>();
 
   private attach(track: RemoteTrack, identity: string): void {
     if (track.kind !== TrackKind.KIND_AUDIO) return;
@@ -209,6 +211,13 @@ export class MixedRoomAudioInput extends voice.AudioInput {
           const { done, value } = await reader.read();
           if (done || this.closed) break;
           if (value) {
+            if (!this.geometryLogged.has(identity)) {
+              this.geometryLogged.add(identity);
+              console.log(
+                `[вход] геометрия кадров ${identity}: ${value.samplesPerChannel} сэмплов, ` +
+                `${value.sampleRate} Гц, каналов ${value.channels}`,
+              );
+            }
             this.framesIn++;
             this.mixer.push(identity, value.data);
           }
