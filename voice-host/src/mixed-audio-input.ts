@@ -223,6 +223,15 @@ export class MixedRoomAudioInput extends voice.AudioInput {
   private readonly attached = new Set<string>();
   /** Про кого уже написали геометрию кадров — строка нужна один раз. */
   private readonly geometryLogged = new Set<string>();
+  /**
+   * Дамп на каждого участника ДО сведения.
+   *
+   * Разделяет два случая, которые снаружи выглядят одинаково: звук уже
+   * пришёл испорченным или мы портим его сами при сведении. 16.09.2026 без
+   * этого пришлось бы гадать: смикшированный поток оказался неразборчивым
+   * при здоровых громкости, длительности и отсутствии потерь.
+   */
+  private readonly perTrackDumps = new Map<string, import('node:fs').WriteStream>();
 
   private attach(track: RemoteTrack, identity: string): void {
     if (track.kind !== TrackKind.KIND_AUDIO) return;
@@ -242,6 +251,14 @@ export class MixedRoomAudioInput extends voice.AudioInput {
           const { done, value } = await reader.read();
           if (done || this.closed) break;
           if (value) {
+            if (this.dumpPath) {
+              let w = this.perTrackDumps.get(identity);
+              if (!w) {
+                w = createWriteStream(`${this.dumpPath}.${identity}.pcm`);
+                this.perTrackDumps.set(identity, w);
+              }
+              w.write(Buffer.from(value.data.buffer, value.data.byteOffset, value.data.byteLength));
+            }
             if (!this.geometryLogged.has(identity)) {
               this.geometryLogged.add(identity);
               console.log(
@@ -266,6 +283,7 @@ export class MixedRoomAudioInput extends voice.AudioInput {
   override async close(): Promise<void> {
     this.closed = true;
     this.dump?.end();
+    for (const w of this.perTrackDumps.values()) w.end();
     if (this.ticker) clearInterval(this.ticker);
     await super.close();
   }
