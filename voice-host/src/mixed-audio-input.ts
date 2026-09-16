@@ -37,6 +37,16 @@ export class MixedRoomAudioInput extends voice.AudioInput {
   private ticks = 0;
   /** Очередь кадров к сессии. Нужна только ради `desiredSize` в логе. */
   private queue: ReadableStreamDefaultController<AudioFrame> | null = null;
+  /**
+   * Кто считался говорящим на прошлом тике.
+   *
+   * Замер раз в пять секунд о решениях микшера не говорит ничего: реплика
+   * короче интервала, и в снимок попадают одни паузы. 16.09.2026 я на этом
+   * дважды сделал неверный вывод — сначала «никого не усиливаем», потом
+   * «фон обнуляется». Пишем СМЕНУ состояния, тогда в логе видно каждую
+   * реплику и её усиление.
+   */
+  private wasSpeaking = new Map<string, boolean>();
 
   /**
    * Куда писать смикшированный поток. Пусто — не писать, и это обычный режим.
@@ -129,6 +139,15 @@ export class MixedRoomAudioInput extends voice.AudioInput {
     this.ticker = setInterval(() => {
       if (this.closed) return;
       const mixed = this.mixer.tick();
+      for (const st of this.mixer.stats()) {
+        if (this.wasSpeaking.get(st.participant) === st.speaking) continue;
+        this.wasSpeaking.set(st.participant, st.speaking);
+        console.log(
+          st.speaking
+            ? `[вход] ${st.participant} заговорил — усиление ×${st.gain} (уровень ${st.rms}, фон ${st.floor})`
+            : `[вход] ${st.participant} замолчал`,
+        );
+      }
       // Тот же самый буфер, что уходит в сессию, — не пересчитанный заново.
       if (this.dump) this.dump.write(Buffer.from(mixed.buffer, mixed.byteOffset, mixed.byteLength));
       this.push(new AudioFrame(mixed, SAMPLE_RATE, 1, SAMPLES_PER_TICK));
