@@ -935,6 +935,52 @@ maybe('провижининг против живого Postgres', () => {
     expect(claimed!.secrets).toEqual({ BOT_TOKEN: '123:abc' });
   });
 
+  it('18в. заведение прописывает домен, адрес хоста и адрес проверки здоровья', async () => {
+    // НАЙДЕНО ЖИВОЙ ПРОВЕРКОЙ, тестами поймать было нечем. Ручной
+    // product-provision.sh три эти колонки заполнял, автозаведение — ни одну,
+    // и всё выглядело исправным: сайт поднялся, отдал 200 со сходящимся sha,
+    // встал в running.
+    //
+    // Ломалось в двух местах, и оба молчат:
+    //   domain      — кабинет рисует ссылку из него, пустой = владелец не
+    //                 может дойти до своего работающего сайта. promoteReady
+    //                 собирает адрес проверки из слага сам, поэтому переход
+    //                 в running проходил и ничего не сообщал.
+    //   health_url  — waitHealthy(null) возвращает ИСТИНУ («адреса нет,
+    //                 считаем здоровым»). У каждого автозаведённого продукта
+    //                 проверка после правки проходила всегда, и автооткат не
+    //                 мог сработать ни разу.
+    const svc = makeSvc();
+
+    const site = await svc.create({
+      userId: 'u-1',
+      name: 'сайт',
+      slug: 'polya-site',
+      kind: 'site',
+      secrets: {},
+    });
+    const bot = await svc.create({
+      userId: 'u-1',
+      name: 'бот',
+      slug: 'polya-bot',
+      kind: 'bot',
+      secrets: {},
+    });
+
+    const s = await getProduct(site.productId);
+    expect(s.domain).toBe('polya-site.p.linkeon.io');
+    expect(s.host_ip).toBe('139.59.210.42');
+    // Адрес внутри контейнера, а не порт на петле хоста: раннер живёт внутри
+    // и до 127.0.0.1:8003 хоста не дотянется.
+    expect(s.health_url).toBe('http://127.0.0.1:3000/health');
+
+    // У бота домена нет по форме, а не по недосмотру — он не принимает
+    // входящих соединений. Проверка здоровья ему нужна ровно так же.
+    const b = await getProduct(bot.productId);
+    expect(b.domain).toBeNull();
+    expect(b.health_url).toBe('http://127.0.0.1:3000/health');
+  });
+
   it('18б. занятый слаг отбивается 409 ещё до выпуска токена', async () => {
     const svc = makeSvc();
     await svc.create({ userId: 'u-1', name: 'первый', slug: 'taken-slug', kind: 'site', secrets: {} });

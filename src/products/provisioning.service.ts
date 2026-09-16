@@ -75,6 +75,29 @@ const SECRET_COUNT_MAX = 64;
 // схемы «продукт = каталог на общей машине».
 const CHECKOUT_PATH = '/product';
 
+// Три поля, которые ручной product-provision.sh прописывал в реестр, а
+// автозаведение не прописывало НИЧЕГО. Поймано живой проверкой: сайт
+// поднялся, ответил 200 со сходящимся sha, встал в running — и всё равно был
+// сломан в двух местах, невидимых ни одному тесту.
+//
+// domain: кабинет рисует ссылку на продукт именно из него. Пустой — сайт
+// работает, а владелец не может до него дойти. promoteReady собирает адрес
+// проверки из слага сам, поэтому переход в running проходил и молчал.
+//
+// health_url: ХУЖЕ. waitHealthy(null) возвращает true — «адреса нет, считаем
+// здоровым». То есть у каждого автозаведённого продукта проверка здоровья
+// после правки проходила ВСЕГДА, и автооткат не мог сработать ни разу. Это
+// ровно та защита, ради которой в куске 1 переделывали точку входа
+// контейнера. Ни один тест этого не видит: null здесь — законное значение,
+// а на сервере эти колонки не нужны вообще.
+//
+// Адрес — внутри контейнера: наружу порт продукта не публикуется у бота, а у
+// сайта публикуется на петлю хоста, куда раннер из своего контейнера не
+// дотянется.
+const HEALTH_URL = 'http://127.0.0.1:3000/health';
+const DOMAIN_SUFFIX = process.env.PRODUCTS_DOMAIN_SUFFIX || 'p.linkeon.io';
+const PRODUCTS_IP = process.env.PRODUCTS_HOST_IP || '139.59.210.42';
+
 // Публичная зона продуктов. Проба идёт сюда, а не на 127.0.0.1: см. answers().
 const PUBLIC_ZONE = 'p.linkeon.io';
 
@@ -298,8 +321,9 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
 
     try {
       await this.pg.query(
-        `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash, secrets_encrypted)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash,
+                               secrets_encrypted, domain, host_ip, health_url)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
         [
           productId,
           input.userId,
@@ -310,6 +334,11 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
           CHECKOUT_PATH,
           hash,
           box,
+          // У бота домена нет — это не «забыли заполнить», а его форма: он не
+          // принимает входящих соединений и живёт long polling'ом.
+          input.kind === 'site' ? `${input.slug}.${DOMAIN_SUFFIX}` : null,
+          PRODUCTS_IP,
+          HEALTH_URL,
         ],
       );
     } catch (e: any) {
