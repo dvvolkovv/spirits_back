@@ -9,5 +9,6 @@
     "skipLibCheck": true
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["src/**/*.spec.ts"]
+  "// exclude": "fake-host.ts — симулятор хоста для тестов. Имени без .spec мало: под include он попал бы в dist боевого агента. Типы его проверяет ts-jest, компилируя вместе со спеками.",
+  "exclude": ["src/**/*.spec.ts", "src/host/fake-host.ts"]
 }

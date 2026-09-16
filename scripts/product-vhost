@@ -1,0 +1,124 @@
+#!/bin/sh
+# product-vhost <slug> <порт|--asleep> — заводит vhost продукта на хосте продуктов.
+#
+#   product-vhost shop 8001     боевой режим: домен проксирует на контейнер
+#   product-vhost shop --asleep заглушка: продукт спит, аренда не оплачена
+#
+# ВЕРСИОНИРУЕТСЯ ЗДЕСЬ, СТАВИТСЯ НА ХОСТ РУКАМИ. До 16.09.2026 скрипт
+# существовал ТОЛЬКО в /usr/local/bin/product-vhost на 139.59.210.42 и не был
+# в репозитории ни в каком виде. Это ровно та форма, из-за которой в этом
+# проекте уже молча отставала копия file-agent на релее: правка на машине
+# видна одному человеку и теряется при пересоздании машины.
+#
+# Живая редакция прочитана целиком перед правкой (16.09.2026). Ниже —
+# построчно она же плюс --asleep. Расхождения с живой на момент снятия: нет.
+#
+# ЧТО ЗДЕСЬ ОПАСНО И ПОЧЕМУ НАПИСАНО ИМЕННО ТАК:
+#
+#   1. Конфиг пишется ДО `nginx -t`. Значит непонятый аргумент оставляет на
+#      диске битый файл, и падает после этого не только текущий вызов —
+#      падает `nginx -t` для ВСЕГО хоста: ни один другой продукт больше не
+#      перечитается, и продление сертификата тоже. Прежняя редакция на
+#      `product-vhost shop --asleep` подставила бы `--asleep` в proxy_pass и
+#      сделала бы ровно это. Поэтому аргумент разбирается ЯВНО и всё
+#      непонятое отбивается ДО первой записи.
+#   2. `set -eu` и позиционные `$1`/`$2` — без проверки пустой аргумент дал бы
+#      конфиг на server_name `.p.linkeon.io`, то есть домен второго уровня.
+#   3. TLS — из общего snippets/products-ssl.conf, сертификат на продукт не
+#      выпускается. Поэтому ожидание при заведении и пробуждении — это
+#      ожидание ПРИЛОЖЕНИЯ, а не сертификата.
+#
+# 503, А НЕ 502. Между погашенным контейнером и живым proxy_pass домен отдаёт
+# 502, и посетитель читает его как нашу поломку. Спящий продукт — не поломка,
+# а штатное состояние неоплаченного. Retry-After не ставим: когда владелец
+# пополнит баланс, неизвестно, а врать роботам сроком не нужно.
+set -eu
+
+S="${1:-}"
+P="${2:-}"
+
+# Форма слага — та же, что у SLUG_RE на сервере и у копии в агенте: строчная
+# латиница, цифры и дефис ВНУТРИ. Ведущий дефис отбивается отдельной веткой:
+# он законен для `case`, но в аргументе программы разбирается как флаг, а имя
+# отсюда уезжает и в имя файла конфига, и в server_name.
+case "$S" in
+  -* | *- ) echo "product-vhost: слаг не годится (дефис по краям): '$S'" >&2; exit 2 ;;
+  '' | *[!a-z0-9-]* ) echo "product-vhost: слаг не годится: '$S'" >&2; exit 2 ;;
+esac
+
+CONF="/etc/nginx/sites-products/$S.conf"
+ASLEEP_DIR="/usr/share/linkeon"
+ASLEEP_PAGE="$ASLEEP_DIR/asleep.html"
+
+if [ "$P" = "--asleep" ]; then
+  # Страница заводится здесь же: без неё nginx отдаст свой собственный 503 без
+  # единого слова о том, что делать. Перезаписывается при каждом вызове —
+  # тогда правка текста доезжает выкатом скрипта, а не отдельным ритуалом.
+  mkdir -p "$ASLEEP_DIR"
+  cat > "$ASLEEP_PAGE" <<'HTML'
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Продукт временно недоступен</title>
+<style>
+ body{font:16px/1.6 system-ui,sans-serif;margin:0;display:grid;place-items:center;
+      min-height:100vh;color:#1b1b1f;background:#f6f6f8;padding:24px}
+ main{max-width:34rem;text-align:center}
+ h1{font-size:1.4rem;margin:0 0 .6em}
+ p{margin:0 0 .6em;color:#4a4a55}
+</style></head>
+<body><main>
+ <h1>Продукт временно недоступен</h1>
+ <p>Сайт приостановлен владельцем. Данные и содержимое сохранены.</p>
+ <p>Если это ваш продукт — пополните баланс в личном кабинете Linkeon,
+    и он поднимется автоматически.</p>
+</main></body></html>
+HTML
+  cat > "$CONF" <<CONF
+server {
+  listen 80;
+  server_name $S.p.linkeon.io;
+  return 301 https://\$host\$request_uri;
+}
+server {
+  listen 443 ssl;
+  server_name $S.p.linkeon.io;
+  include snippets/products-ssl.conf;
+  location / {
+    return 503;
+    error_page 503 /asleep.html;
+  }
+  location = /asleep.html {
+    root $ASLEEP_DIR;
+    internal;
+  }
+}
+CONF
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx && echo "  vhost $S.p.linkeon.io → заглушка 503"
+  exit
+fi
+
+case "$P" in
+  '' | *[!0-9]* ) echo "product-vhost: второй аргумент — порт или --asleep, получено: '$P'" >&2; exit 2 ;;
+esac
+
+cat > "$CONF" <<CONF
+server {
+  listen 80;
+  server_name $S.p.linkeon.io;
+  return 301 https://\$host\$request_uri;
+}
+server {
+  listen 443 ssl;
+  server_name $S.p.linkeon.io;
+  include snippets/products-ssl.conf;
+  location / {
+    proxy_pass http://127.0.0.1:$P;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+  }
+}
+CONF
+nginx -t >/dev/null 2>&1 && systemctl reload nginx && echo "  vhost $S.p.linkeon.io → 127.0.0.1:$P"
