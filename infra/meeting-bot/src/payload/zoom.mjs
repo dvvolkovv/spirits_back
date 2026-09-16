@@ -84,7 +84,19 @@ export const ZOOM_PAGE_JS = `
 
   const nameOf = (data) => String(data.userName || data.displayName || data.name || 'участник');
 
+  const whoAmI = () => {
+    try {
+      ZoomMtg.getCurrentUser({
+        success: (r) => { myId = r?.result?.currentUser?.userId ?? null; },
+        error: () => {},
+      });
+    } catch (e) { /* ещё не во встрече */ }
+  };
+
   const publish = () => {
+    // Свой id спрашиваем, пока не ответят: сразу после входа SDK его ещё не
+    // знает, а без него бот считает участником самого себя.
+    if (myId === null) whoAmI();
     const list = [];
     for (const [id, name] of people) {
       if (String(id) === String(myId)) continue;   // себя в состав не пишем
@@ -113,12 +125,7 @@ export const ZOOM_PAGE_JS = `
         passWord: p.get('password') || '',
         userName: p.get('userName') || 'Ассистент',
         userEmail: '',
-        success: () => {
-          ZoomMtg.getCurrentUser({
-            success: (r) => { myId = r?.result?.currentUser?.userId ?? null; },
-            error: () => {},
-          });
-        },
+        success: () => { whoAmI(); send('sdk', { step: 'join принят' }); },
         error: (e) => send('join_failed', { reason: (e && (e.reason || e.errorCode)) || 'join error' }),
       });
     },
@@ -138,9 +145,16 @@ export const ZOOM_PAGE_JS = `
     }
   });
 
+  // Статусы встречи: 1 — подключаемся, 2 — подключены, 3 — отключены,
+  // 4 — переподключаемся. Пишем все: по ним видно, где именно нас потеряли.
   ZoomMtg.inMeetingServiceListener('onMeetingStatus', (data) => {
-    // 3 — встречу завершили или нас вывели.
+    send('sdk', { step: 'статус ' + (data && data.meetingStatus) });
     if (data && data.meetingStatus === 3) send('left', { reason: 'meeting_ended' });
+  });
+
+  // Уровни входа: 6 — комната ожидания, 13 — начали подключать звук.
+  ZoomMtg.inMeetingServiceListener('onJoinSpeed', (data) => {
+    if (data && (data.level === 6 || data.level === 13)) send('sdk', { step: 'вход, уровень ' + data.level });
   });
 
   ZoomMtg.inMeetingServiceListener('onUserJoin', (data) => {

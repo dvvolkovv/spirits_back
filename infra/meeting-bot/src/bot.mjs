@@ -150,6 +150,10 @@ export class MeetingBot {
         await this.stop();
         break;
 
+      case 'sdk':
+        this.log.info?.(`[${this.id}] Zoom: ${data?.step}`);
+        break;
+
       case 'mic':
         this.log.info?.(`[${this.id}] микрофон ${data?.on ? 'включён' : 'включить не вышло'}`);
         break;
@@ -267,6 +271,21 @@ export class MeetingBot {
     await ctx.exposeFunction('__botSend', (type, data) => { void this.onPageEvent(type, data); });
     await ctx.addInitScript(platform.payload);
     this.page = await ctx.newPage();
+
+    // Консоль страницы — в наш лог.
+    //
+    // У Zoom это единственный способ узнать, ПОЧЕМУ не пустили: код отказа SDK
+    // печатает в консоль и наружу через колбэки не отдаёт (тем же приёмом
+    // ловит его Attendee). Шумные уровни отбрасываем, иначе лог утонет в
+    // отладке самого SDK.
+    this.page.on('console', (m) => {
+      const t = m.type();
+      if (t !== 'error' && t !== 'warning') return;
+      const text = m.text().slice(0, 300);
+      if (/favicon|Download the React DevTools|deprecated/i.test(text)) return;
+      this.log.warn?.(`[${this.id}] страница: ${text}`);
+    });
+    this.page.on('pageerror', (e) => this.log.warn?.(`[${this.id}] страница упала: ${e?.message}`));
 
     if (platform.viaSdk) {
       await this.joinViaSdk();
