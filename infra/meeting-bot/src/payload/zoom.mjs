@@ -109,6 +109,8 @@ export const ZOOM_PAGE_JS = `
     } catch (e) { /* ещё не во встрече */ }
   };
 
+  const myName = p.get('userName') || '';
+
   const publish = () => {
     // В комнате ожидания состава нет: там мы одни и ничей приход не считается.
     if (!entered) return;
@@ -117,7 +119,15 @@ export const ZOOM_PAGE_JS = `
     if (myId === null) whoAmI();
     const list = [];
     for (const [id, name] of people) {
-      if (String(id) === String(myId)) continue;   // себя в состав не пишем
+      // Себя отсеиваем и по id, и по имени.
+      //
+      // Одного id мало: впуская из комнаты ожидания, Zoom заводит нас заново и
+      // на секунду показывает ДВУМЯ участниками с разными id (живой заход
+      // 16.09.2026) — бэкенд получал фантома, а гейт по имени считал, что
+      // ассистент не наедине. Совпадение имени тут надёжнее: имя бота своё, с
+      // пометкой «ассистент», и человека с таким же в комнате не будет.
+      if (String(id) === String(myId)) continue;
+      if (myName && name === myName) continue;
       list.push({ uuid: String(id), name });
     }
     send('participants', { people: list });
