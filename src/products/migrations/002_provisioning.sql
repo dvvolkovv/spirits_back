@@ -36,12 +36,34 @@ ALTER TABLE products ADD COLUMN IF NOT EXISTS provision_error text;
 -- 'provisioning', и повторная попытка не нашла бы его по status = 'failed'.
 -- Заведение выглядело бы вечным: ни ошибки, ни строки в логе.
 --
--- ВАЖНО: словарь перечислен ЦЕЛИКОМ, все шесть значений. См.
+-- ВАЖНО: словарь перечислен ЦЕЛИКОМ, все семь значений. См.
 -- identity/migrations/003_telegram_provider.sql: там дописывание одного
 -- значения уже потеряло 'apple' и сломало вход.
+--
+-- 'sleeping' заводит МИГРАЦИЯ 004, а стоит он здесь. Это не забытая строка и не
+-- опережение: модуль накатывает ВЕСЬ список при каждом старте API, и ЭТОТ файл
+-- едет первым — то есть навешивает свой словарь на живые данные заново, уже
+-- после того, как 004 научила продукты засыпать. Словарь `уже` живых данных —
+-- это ADD CONSTRAINT, падающий на существующей строке: весь файл (простой
+-- протокол = неявная транзакция) откатывается, applyMigration ловит отказ,
+-- пишет строку в лог и едет дальше. 002 становится мёртвой — молча, навсегда и
+-- вместе со всем, что в неё когда-нибудь допишут. Схема при этом выглядит
+-- исправной: её доводит до ума 004, идущая следом.
+--
+-- Измерено исполнением на PostgreSQL 16: продукт в 'sleeping' + повторная
+-- накатка 002 = `check constraint "products_status_check" of relation
+-- "products" is violated by some row`. Сторожат сценарий 20д
+-- (provisioning.integration.spec.ts) и «один именованный словарь — один состав
+-- во ВСЕХ миграциях» (products.migration.spec.ts).
+--
+-- ОТСЮДА ПРАВИЛО для следующих миграций: значение, дописанное в словарь
+-- поздним файлом, дописывается И во все ранние файлы, где тот же ИМЕНОВАННЫЙ
+-- словарь объявлен заново. Инлайновых CHECK из CREATE TABLE это не касается —
+-- CREATE TABLE стоит под IF NOT EXISTS и на живой базе не исполняется вовсе
+-- (потому словарь статусов в 001 и остался пятизначным).
 ALTER TABLE products DROP CONSTRAINT IF EXISTS products_status_check;
 ALTER TABLE products ADD CONSTRAINT products_status_check
-  CHECK (status IN ('provisioning','running','degraded','stopped','archived','failed'));
+  CHECK (status IN ('provisioning','running','degraded','stopped','archived','failed','sleeping'));
 
 CREATE TABLE IF NOT EXISTS product_provision_jobs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

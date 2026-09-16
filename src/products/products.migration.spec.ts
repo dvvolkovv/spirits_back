@@ -1,4 +1,6 @@
-import { ProductsService } from './products.service';
+import * as fs from 'fs';
+import * as path from 'path';
+import { MIGRATIONS, ProductsService } from './products.service';
 
 function makeService() {
   const queries: string[] = [];
@@ -114,6 +116,76 @@ function dictionary(sql: string, constraint: string, column: string, where = '00
 }
 
 /**
+ * Все ИМЕНОВАННЫЕ CHECK-словари из всех файлов схемы разом: имя ограничения →
+ * где объявлено и с каким составом.
+ *
+ * Файлы читаются с диска по MIGRATIONS, а не через makeService: проверка ниже —
+ * про отношение МЕЖДУ файлами, и она обязана видеть их все, а не тот один,
+ * который подобрал `find`.
+ *
+ * Инлайновые CHECK из `CREATE TABLE` сюда намеренно не попадают: CREATE TABLE
+ * стоит под IF NOT EXISTS и на существующей базе не исполняется вовсе, поэтому
+ * словарь внутри него на живые данные не навешивается. Отсюда и разница: в 001
+ * словарь статусов знает пять значений и это безвредно, а в 002 тот же словарь
+ * обязан быть актуальным — 002 навешивает его заново при каждом старте.
+ */
+function namedDictionaries(): Map<string, { file: string; values: string[] }[]> {
+  const out = new Map<string, { file: string; values: string[] }[]>();
+  for (const file of MIGRATIONS) {
+    const sql = fs
+      .readFileSync(path.join(__dirname, 'migrations', file), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/--[^\n]*/g, '');
+    for (const m of sql.matchAll(/ADD CONSTRAINT\s+(\w+)\s+CHECK\s*\(\s*\w+ IN \(([^)]*)\)/g)) {
+      const values = m[2]
+        .split(',')
+        .map((v) => v.trim().replace(/'/g, ''))
+        .sort();
+      out.set(m[1], [...(out.get(m[1]) ?? []), { file, values }]);
+    }
+  }
+  return out;
+}
+
+describe('словари CHECK сквозь весь список миграций', () => {
+  it('разбор словарей работает — иначе проверка ниже зеленела бы на пустоте', () => {
+    // Сторож прибора. Регексп, переставший что-либо находить, оставил бы
+    // следующий тест зелёным навсегда: цикл по пустой карте не делает ни одного
+    // утверждения.
+    expect([...namedDictionaries().keys()].sort()).toEqual([
+      'product_provision_jobs_kind_check',
+      'products_kind_chk',
+      'products_status_check',
+    ]);
+  });
+
+  it('один именованный словарь — один состав во ВСЕХ миграциях, где он объявлен', () => {
+    // Модуль накатывает ВЕСЬ список при каждом старте API, а не только новые
+    // файлы. Значит миграция, стоящая в списке раньше, навешивает свой словарь
+    // на данные, которые успела завести миграция, стоящая позже. Словарь `уже`
+    // живых данных — это ADD CONSTRAINT, падающий на существующей строке:
+    // applyMigration ловит отказ, пишет строку в лог и едет дальше, то есть
+    // ранняя миграция становится МЁРТВОЙ — молча и навсегда.
+    //
+    // Измерено на живом Postgres 16: продукт в 'sleeping' + повторная накатка
+    // 002 = `check constraint "products_status_check" of relation "products" is
+    // violated by some row`. Сценарий 20д в provisioning.integration.spec.ts
+    // ловит то же самое исполнением.
+    for (const [constraint, declared] of namedDictionaries()) {
+      if (declared.length < 2) continue;
+      const [first] = declared;
+      for (const d of declared.slice(1)) {
+        expect({ constraint, file: d.file, values: d.values }).toEqual({
+          constraint,
+          file: d.file,
+          values: first.values,
+        });
+      }
+    }
+  });
+});
+
+/**
  * Проверки ниже сверяют смысл SQL, а не упоминание имён: тип и модификаторы
  * колонки, словари CHECK, предикат частичного индекса, каскад внешнего ключа.
  * Живого Postgres в прогоне нет, поэтому семантика закреплена по тексту
@@ -171,12 +243,18 @@ describe('миграция 002', () => {
     // обработчика ошибки: продукт навсегда застревал бы в 'provisioning'.
     // Словарь сверяется целиком: identity/migrations/003 — про то, как
     // дописывание одного значения теряет остальные.
+    //
+    // 'sleeping' в списке 002, хотя заводит его 004: 002 едет ПЕРВОЙ при каждом
+    // старте API и навешивает свой словарь на живые данные заново. Словарь `уже`
+    // живых данных роняет ADD CONSTRAINT, и 002 замолкает навсегда. Подробности
+    // — в самом файле 002; исполнением это ловит сценарий 20д.
     expect(dictionary(await migration002(), 'products_status_check', 'status')).toEqual([
       'archived',
       'degraded',
       'failed',
       'provisioning',
       'running',
+      'sleeping',
       'stopped',
     ]);
   });
@@ -357,10 +435,20 @@ describe('миграция 004 — аренда', () => {
     // зелёным. Потерянное значение здесь — это `UPDATE products SET status =
     // '...'`, падающий на CHECK внутри своего обработчика (так уже было бы с
     // 'failed', см. 002).
-    const before = dictionary(await migration002(), 'products_status_check', 'status');
-    const after = dictionary(await migration004(), 'products_status_check', 'status', '004');
+    //
+    // Сверка на РАВЕНСТВО, а не на «002 плюс sleeping». Прежняя редакция этого
+    // теста требовала, чтобы 002 значения НЕ знала, — и тем закрепляла дефект:
+    // 002 едет первой при каждом старте API, её словарь навешивается на живые
+    // данные заново, и первый же уснувший продукт ронял ADD CONSTRAINT в ней.
+    // Оба файла объявляют один и тот же ИМЕНОВАННЫЙ словарь, значит состав у
+    // него обязан быть один. 004 при этом остаётся нужной: на базе, где 002
+    // накатилась ДО появления sleeping (прод на 16.09.2026), словарь расширяет
+    // именно она.
+    const inTwo = dictionary(await migration002(), 'products_status_check', 'status');
+    const inFour = dictionary(await migration004(), 'products_status_check', 'status', '004');
 
-    expect(after).toEqual([...before, 'sleeping'].sort());
+    expect(inFour).toEqual(inTwo);
+    expect(inFour).toContain('sleeping');
   });
 
   it('вид задания — обязательный текст, заведение по умолчанию', async () => {
