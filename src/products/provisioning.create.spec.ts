@@ -168,9 +168,10 @@ describe('ProvisioningService.create', () => {
 
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
     expect(insert.sql).toContain(
-      '(id, user_id, name, slug, kind, status, checkout_path, runner_token_hash, secrets_encrypted)',
+      '(id, user_id, name, slug, kind, status, checkout_path, runner_token_hash,\n' +
+        '                               secrets_encrypted, domain, host_ip, health_url)',
     );
-    expect(insert.sql).toContain('VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)');
+    expect(insert.sql).toContain('VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)');
     expect(insert.params).toEqual([
       res.productId,
       'u-1',
@@ -183,7 +184,29 @@ describe('ProvisioningService.create', () => {
       '/product',
       expect.stringMatching(/^[0-9a-f]{64}$/),
       null,
+      // Три последних колонки ручной product-provision.sh заполнял, а
+      // автозаведение не заполняло — поймано живой проверкой. Пустой domain
+      // прячет от владельца ссылку на его же работающий сайт, а пустой
+      // health_url ВЫКЛЮЧАЕТ автооткат: waitHealthy(null) возвращает истину.
+      // Поведение сторожит сценарий 18в интеграционного сьюта; здесь
+      // закреплена форма запроса — порядок значений ниоткуда больше не виден.
+      'site1.p.linkeon.io',
+      '139.59.210.42',
+      'http://127.0.0.1:3000/health',
     ]);
+  });
+
+  it('у бота домена нет, а адрес проверки здоровья есть', async () => {
+    // Бот не принимает входящих соединений: домен ему не нужен по форме, а не
+    // по недосмотру. Здоровье при этом проверяется так же, как у сайта, —
+    // иначе автооткат у ботов молча выключен.
+    const { svc, calls } = makeService();
+
+    await svc.create({ userId: 'u-1', name: 'Бот', slug: 'bot1', kind: 'bot', secrets: {} });
+
+    const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
+    expect(insert.params[9]).toBeNull();
+    expect(insert.params[11]).toBe('http://127.0.0.1:3000/health');
   });
 
   it('хеш не выводится из значений, которые вызывающий и так знает', async () => {
