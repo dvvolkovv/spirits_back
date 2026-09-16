@@ -1515,7 +1515,152 @@ maybe('провижининг против живого Postgres', () => {
     expect(await svc.hostAgentLive()).toBe(true);
   });
 
-  // ═════════════════════════ аренда: списание ═════════════════════════
+  // ═════════════════════════════ аренда ═════════════════════════════
+
+  /**
+   * Баланс и учёт токенов живут ВНЕ модуля продуктов — их заводят чужие
+   * миграции, а сьют накатывает только `src/products/migrations`. Здесь
+   * заводится ровно тот минимум, который читает и пишет оператор списания, и
+   * снят он с прода буквально (`\d ai_profiles_consolidated`,
+   * `\d token_transactions`, `\dT+ transaction_type_enum`, 16.09.2026).
+   *
+   * Форма не косметика. На UNIQUE(user_id) держится однозначность строки
+   * баланса; на перечне значений enum — то, что 'consumed' вообще запишется.
+   * Выдуманная своя табличка (`user_id text PRIMARY KEY`, тип транзакции
+   * текстом) зеленела бы и на значении, которого на проде нет, — то есть
+   * сторожила бы ровно ничего.
+   */
+  async function ensureBillingTables() {
+    await pool.query(`DO $$ BEGIN
+       CREATE TYPE transaction_type_enum AS ENUM
+         ('purchase','consumed','bonus','refund','adjustment','coupon');
+     EXCEPTION WHEN duplicate_object THEN NULL; END $$`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS ai_profiles_consolidated (
+       id serial PRIMARY KEY,
+       user_id text NOT NULL UNIQUE,
+       tokens bigint NOT NULL DEFAULT 0,
+       updated_at timestamptz DEFAULT now())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS token_transactions (
+       id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+       user_id text NOT NULL,
+       transaction_type transaction_type_enum NOT NULL,
+       amount bigint NOT NULL,
+       balance_after bigint NOT NULL,
+       description text,
+       metadata jsonb,
+       created_at timestamptz DEFAULT now())`);
+  }
+
+  const rent = () => new RentService(pg as any);
+
+  async function setBalance(userId: string, tokens: number) {
+    await pool.query(
+      `INSERT INTO ai_profiles_consolidated (user_id, tokens) VALUES ($1, $2)
+       ON CONFLICT (user_id) DO UPDATE SET tokens = EXCLUDED.tokens`,
+      [userId, tokens],
+    );
+  }
+
+  /** −1, а не 0: «строки нет» и «ноль на балансе» — разные вещи (сценарий 29). */
+  const balanceOf = async (userId: string) =>
+    Number(
+      (await pool.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1', [userId]))
+        .rows[0]?.tokens ?? -1,
+    );
+
+  const ledgerOf = async (userId: string) =>
+    (
+      await pool.query('SELECT * FROM token_transactions WHERE user_id = $1 ORDER BY created_at', [
+        userId,
+      ])
+    ).rows;
+
+  /**
+   * Продукт с истёкшим сроком — ровно то состояние, в котором его находит
+   * сборщик. Срок урезается до миллисекунд намеренно: у timestamptz точность
+   * микросекундная, а Date в JS хранит миллисекунды, и сценарий 32, который
+   * возит срок туда-обратно через параметр, иначе краснел бы на округлении, а
+   * не на поведении. Отрицательный `overdue` («-3 days») даёт срок в будущем.
+   */
+  async function due(o: { slug: string; status?: string; overdue?: string; userId?: string }) {
+    const p = await product({ slug: o.slug, status: o.status ?? 'running' });
+    await pool.query(
+      `UPDATE products
+          SET paid_until = date_trunc('milliseconds', now() - $2::interval),
+              user_id = COALESCE($3, user_id)
+        WHERE id = $1`,
+      [p.id, o.overdue ?? '1 day', o.userId ?? null],
+    );
+    return p;
+  }
+
+  const paidUntilOf = async (id: string) => new Date((await getProduct(id)).paid_until).getTime();
+
+  /**
+   * Ход продукта. `channel` и `prompt` обязательны на уровне схемы — вставка
+   * из плана (`id, product_id, user_id, status, created_at`) на живой базе
+   * падает на NOT NULL, то есть сценарий сна там не исполнялся ни разу.
+   *
+   * Три отметки времени раздельно: сон смотрит на МОЛЧАНИЕ
+   * (`last_progress_at`), а не на длительность, и отличить одно от другого
+   * можно только задав их порознь.
+   */
+  async function turn(
+    productId: string,
+    o: {
+      status?: string;
+      createdAgo?: string;
+      startedAgo?: string | null;
+      progressAgo?: string | null;
+    } = {},
+  ) {
+    await pool.query(
+      `INSERT INTO product_turns
+              (id, product_id, user_id, channel, prompt, status,
+               created_at, started_at, last_progress_at)
+       VALUES (gen_random_uuid(), $1, 'u-1', 'web', 'правь', $2,
+               now() - $3::interval,
+               CASE WHEN $4::text IS NULL THEN NULL ELSE now() - $4::interval END,
+               CASE WHEN $5::text IS NULL THEN NULL ELSE now() - $5::interval END)`,
+      [
+        productId,
+        o.status ?? 'running',
+        o.createdAgo ?? '1 minute',
+        o.startedAgo ?? null,
+        o.progressAgo ?? null,
+      ],
+    );
+  }
+
+  const jobKindsOf = async (productId: string) =>
+    (
+      await pool.query(
+        'SELECT kind FROM product_provision_jobs WHERE product_id = $1 ORDER BY created_at',
+        [productId],
+      )
+    ).rows.map((r: any) => r.kind);
+
+  /**
+   * Дождаться, пока n запросов ДЕЙСТВИТЕЛЬНО встанут на замок. Фиксированная
+   * пауза вместо этого либо ничего не гарантирует, либо удлиняет прогон на
+   * ровном месте, а сценарии 36 и 59 без этой гарантии проверяют не то, что
+   * написано в их названиях.
+   */
+  async function waitForLockWaiters(n: number) {
+    const until = Date.now() + 10_000;
+    for (;;) {
+      const r = await pool.query(
+        `SELECT count(*)::int AS n FROM pg_stat_activity
+          WHERE datname = current_database()
+            AND state = 'active' AND wait_event_type = 'Lock'`,
+      );
+      if (r.rows[0].n >= n) return;
+      if (Date.now() > until) {
+        throw new Error(`на замок встали ${r.rows[0].n} из ${n} — сценарий не воспроизвёлся`);
+      }
+      await new Promise((res) => setTimeout(res, 50));
+    }
+  }
 
   /**
    * ЗДЕСЬ ТРОГАЮТ ДЕНЬГИ, и заглушки про это не говорят ничего: мок отдаёт
@@ -1537,39 +1682,7 @@ maybe('провижининг против живого Postgres', () => {
    * правильный.
    */
   describe('списание аренды', () => {
-    /**
-     * Баланс и учёт токенов живут ВНЕ модуля продуктов — их заводят чужие
-     * миграции, а сьют накатывает только `src/products/migrations`. Здесь
-     * заводится ровно тот минимум, который читает и пишет оператор списания, и
-     * снят он с прода буквально (`\d ai_profiles_consolidated`,
-     * `\d token_transactions`, `\dT+ transaction_type_enum`, 16.09.2026).
-     *
-     * Форма не косметика. На UNIQUE(user_id) держится однозначность строки
-     * баланса; на перечне значений enum — то, что 'consumed' вообще
-     * запишется. Выдуманная своя табличка (`user_id text PRIMARY KEY`, тип
-     * транзакции текстом) зеленела бы и на значении, которого на проде нет, —
-     * то есть сторожила бы ровно ничего.
-     */
-    beforeAll(async () => {
-      await pool.query(`DO $$ BEGIN
-         CREATE TYPE transaction_type_enum AS ENUM
-           ('purchase','consumed','bonus','refund','adjustment','coupon');
-       EXCEPTION WHEN duplicate_object THEN NULL; END $$`);
-      await pool.query(`CREATE TABLE IF NOT EXISTS ai_profiles_consolidated (
-         id serial PRIMARY KEY,
-         user_id text NOT NULL UNIQUE,
-         tokens bigint NOT NULL DEFAULT 0,
-         updated_at timestamptz DEFAULT now())`);
-      await pool.query(`CREATE TABLE IF NOT EXISTS token_transactions (
-         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-         user_id text NOT NULL,
-         transaction_type transaction_type_enum NOT NULL,
-         amount bigint NOT NULL,
-         balance_after bigint NOT NULL,
-         description text,
-         metadata jsonb,
-         created_at timestamptz DEFAULT now())`);
-    });
+    beforeAll(ensureBillingTables);
 
     // Внешний beforeEach чистит продукты и задания, но не эти две таблицы: они
     // заведены здесь и ему не известны. Оставленный баланс делает следующий
@@ -1578,72 +1691,6 @@ maybe('провижининг против живого Postgres', () => {
     beforeEach(() => pool.query('TRUNCATE ai_profiles_consolidated, token_transactions'));
     afterAll(() => pool.query('TRUNCATE ai_profiles_consolidated, token_transactions'));
 
-    const rent = () => new RentService(pg as any);
-
-    async function setBalance(userId: string, tokens: number) {
-      await pool.query(
-        `INSERT INTO ai_profiles_consolidated (user_id, tokens) VALUES ($1, $2)
-         ON CONFLICT (user_id) DO UPDATE SET tokens = EXCLUDED.tokens`,
-        [userId, tokens],
-      );
-    }
-
-    /** −1, а не 0: «строки нет» и «ноль на балансе» — разные вещи (сценарий 29). */
-    const balanceOf = async (userId: string) =>
-      Number(
-        (await pool.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1', [userId]))
-          .rows[0]?.tokens ?? -1,
-      );
-
-    const ledgerOf = async (userId: string) =>
-      (
-        await pool.query('SELECT * FROM token_transactions WHERE user_id = $1 ORDER BY created_at', [
-          userId,
-        ])
-      ).rows;
-
-    /**
-     * Продукт с истёкшим сроком — ровно то состояние, в котором его находит
-     * сборщик. Срок урезается до миллисекунд намеренно: у timestamptz точность
-     * микросекундная, а Date в JS хранит миллисекунды, и сценарий 32, который
-     * возит срок туда-обратно через параметр, иначе краснел бы на округлении,
-     * а не на поведении.
-     */
-    async function due(o: { slug: string; status?: string; overdue?: string; userId?: string }) {
-      const p = await product({ slug: o.slug, status: o.status ?? 'running' });
-      await pool.query(
-        `UPDATE products
-            SET paid_until = date_trunc('milliseconds', now() - $2::interval),
-                user_id = COALESCE($3, user_id)
-          WHERE id = $1`,
-        [p.id, o.overdue ?? '1 day', o.userId ?? null],
-      );
-      return p;
-    }
-
-    const paidUntilOf = async (id: string) => new Date((await getProduct(id)).paid_until).getTime();
-
-    /**
-     * Дождаться, пока n запросов ДЕЙСТВИТЕЛЬНО встанут на замок. Фиксированная
-     * пауза вместо этого либо ничего не гарантирует, либо удлиняет прогон на
-     * ровном месте, а сценарий 36 без этой гарантии проверяет не то, что
-     * написано в его названии.
-     */
-    async function waitForLockWaiters(n: number) {
-      const until = Date.now() + 10_000;
-      for (;;) {
-        const r = await pool.query(
-          `SELECT count(*)::int AS n FROM pg_stat_activity
-            WHERE datname = current_database()
-              AND state = 'active' AND wait_event_type = 'Lock'`,
-        );
-        if (r.rows[0].n >= n) return;
-        if (Date.now() > until) {
-          throw new Error(`на замок встали ${r.rows[0].n} из ${n} — сценарий не воспроизвёлся`);
-        }
-        await new Promise((res) => setTimeout(res, 50));
-      }
-    }
 
     it('22. два ОДНОВРЕМЕННЫХ сборщика списывают аренду ровно один раз', async () => {
       // Прод работает в кластере из двух процессов. Главный сценарий куска:
@@ -1932,6 +1979,367 @@ maybe('провижининг против живого Postgres', () => {
         expect(outcomes.filter(Boolean)).toHaveLength(1);
         expect(await balanceOf('u-1')).toBe(70_000);
         expect(await ledgerOf('u-1')).toHaveLength(1);
+        expect(await paidUntilOf(p.id)).toBeGreaterThan(Date.now());
+      } finally {
+        if (!released) await holder.query('ROLLBACK').catch(() => undefined);
+        holder.release();
+      }
+    });
+
+    it('37. просрочка ПОЛТОРА МЕСЯЦА: месяц вперёд один раз, а не долг', async () => {
+      // ДЫРА, НАЙДЕННАЯ ПРОВЕРЯЮЩИМ. Сценарий 31 брал три месяца, 32 — двое
+      // суток, и промежуток «больше месяца, но меньше двух» не сторожил никто:
+      // мутант, сдвинувший границу в CASE с месяца на три, оставлял срок в
+      // прошлом и возвращал копящийся долг — второе списание за тот же
+      // календарный месяц на следующем обороте.
+      const p = await due({ slug: 'rent-45d', overdue: '45 days' });
+      await setBalance('u-1', 200_000);
+
+      expect(await rent().chargeRent(p.id)).toBe(true);
+      expect(await balanceOf('u-1')).toBe(150_000);
+      expect(await paidUntilOf(p.id)).toBeGreaterThan(Date.now());
+
+      expect(await rent().chargeRent(p.id)).toBe(false);
+      expect(await balanceOf('u-1')).toBe(150_000);
+    });
+
+    it('38. просрочка РОВНО месяц: срок тоже уезжает в будущее', async () => {
+      // Сама граница CASE. `paid_until + 1 month` здесь даёт ровно now() —
+      // то есть срок, который тут же снова считается истёкшим.
+      const p = await due({ slug: 'rent-30d', overdue: '1 month' });
+      await setBalance('u-1', 200_000);
+
+      expect(await rent().chargeRent(p.id)).toBe(true);
+      expect(await paidUntilOf(p.id)).toBeGreaterThan(Date.now());
+      expect(await rent().chargeRent(p.id)).toBe(false);
+      expect(await balanceOf('u-1')).toBe(150_000);
+    });
+
+    it('39. архивный продукт со статусом running не платит', async () => {
+      // Сторож на archived_at был ФОРМАЛЬНЫМ: проверял подстроку в тексте
+      // запроса и пропускал подмену условия на `(… OR archived_at <= now())`,
+      // при которой архивный платит вечно. Архивация идёт отдельным
+      // `SET archived_at = now()`, статус при этом остаётся прежним — такие
+      // строки на проде уже встречались.
+      const p = await due({ slug: 'rent-archived-running' });
+      await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [p.id]);
+      await setBalance('u-1', 500_000);
+
+      expect(await rent().chargeRent(p.id)).toBe(false);
+      expect(await balanceOf('u-1')).toBe(500_000);
+      expect(await ledgerOf('u-1')).toEqual([]);
+    });
+
+    it('40. статусы, которые НЕ платят: provisioning, stopped, failed, archived', async () => {
+      // Поведенческий сторож вместо подстроки в тексте: перечисление статусов
+      // в предикате можно подменить так, что текст останется похожим.
+      for (const st of ['provisioning', 'stopped', 'failed', 'archived']) {
+        await pool.query('TRUNCATE products, product_provision_jobs, product_turns CASCADE');
+        await pool.query('TRUNCATE ai_profiles_consolidated, token_transactions');
+        const p = await due({ slug: `rent-st-${st}`, status: st });
+        await setBalance('u-1', 500_000);
+
+        expect([st, await rent().chargeRent(p.id)]).toEqual([st, false]);
+        expect([st, await balanceOf('u-1')]).toEqual([st, 500_000]);
+      }
+    });
+
+    it('41. срок ещё не истёк на сутки — не списывается', async () => {
+      // Ближняя граница «рано платить». В сданной батарее она стояла на десяти
+      // сутках (сценарий 24), а сборщик ходит раз в сутки: льготный аванс
+      // длиной в неделю прошёл бы мимо всей батареи, а он означает списание за
+      // период, который ещё оплачен.
+      const p = await due({ slug: 'rent-tomorrow', overdue: '-1 day' });
+      await setBalance('u-1', 500_000);
+
+      expect(await rent().chargeRent(p.id)).toBe(false);
+      expect(await balanceOf('u-1')).toBe(500_000);
+      expect(await ledgerOf('u-1')).toEqual([]);
+    });
+  });
+
+  // ═══════════════════ аренда: сон и пробуждение ═══════════════════
+
+  /**
+   * Сон гасит контейнер, в котором прямо сейчас может писать код ассистент.
+   * Погашенный посреди хода контейнер убивает правку МОЛЧА: ни ошибки, ни
+   * строки в истории, ни списания — тот же дефект, из-за которого deploy.sh не
+   * рестартует API при живых ходах.
+   *
+   * Проверяется исполнением, а не текстом запроса: вставка хода из плана
+   * (`id, product_id, user_id, status, created_at`) на живой базе падает на
+   * NOT NULL у `channel` и `prompt`, то есть сценарий сна в плане не
+   * исполнялся ни разу.
+   */
+  describe('сон и пробуждение', () => {
+    beforeAll(ensureBillingTables);
+    beforeEach(() => pool.query('TRUNCATE ai_profiles_consolidated, token_transactions'));
+    afterAll(() => pool.query('TRUNCATE ai_profiles_consolidated, token_transactions'));
+
+    it('42. сон НЕ ставится, пока идёт ход', async () => {
+      // Главный сценарий задачи.
+      const p = await due({ slug: 'sleep-busy' });
+      await turn(p.id, { status: 'running', startedAgo: '5 minutes', progressAgo: '10 seconds' });
+
+      expect(await rent().requestSleep(p.id)).toBe(false);
+
+      expect(await jobsOf(p.id)).toEqual([]);
+      expect((await getProduct(p.id)).status).toBe('running');
+    });
+
+    it('43. ДОЛГИЙ, но живой ход сна не пускает: признак — молчание, а не длительность', async () => {
+      // «Идёт дольше потолка» — догадка о смерти: крупный рефакторинг со
+      // сборкой и тестами живёт часами. Предикат из плана (по created_at)
+      // погасил бы контейнер под работающим ассистентом — ровно то, ради чего
+      // вся задача.
+      const p = await due({ slug: 'sleep-long-alive' });
+      await turn(p.id, { status: 'running', createdAgo: '5 hours', startedAgo: '5 hours', progressAgo: '20 seconds' });
+
+      expect(await rent().requestSleep(p.id)).toBe(false);
+      expect(await jobsOf(p.id)).toEqual([]);
+    });
+
+    it('44. МОЛЧАЩИЙ дольше потолка ход продукт не держит', async () => {
+      // Потолок ожидания. Иначе зависший ход держит неоплаченный продукт
+      // запущенным, пока кто-нибудь не посмотрит в базу руками. Через
+      // несколько минут такой ход похоронит и уборщик зависших — потолок у
+      // них общий намеренно.
+      const p = await due({ slug: 'sleep-silent' });
+      await turn(p.id, { status: 'running', createdAgo: '2 hours', startedAgo: '2 hours', progressAgo: '45 minutes' });
+
+      expect(await rent().requestSleep(p.id)).toBe(true);
+      expect(await jobsOf(p.id)).toEqual(['queued']);
+      expect(await jobKindsOf(p.id)).toEqual(['sleep']);
+      expect((await getProduct(p.id)).status).toBe('sleeping');
+    });
+
+    it('45. ход, застрявший в очереди дольше потолка, продукт не держит', async () => {
+      // У очередного хода нет ни прогресса, ни начала: раннер за ним не
+      // пришёл. Уборщик зависших такие не трогает (он смотрит только
+      // running), поэтому без потолка по created_at продукт не уснёт никогда.
+      const p = await due({ slug: 'sleep-stuck-queued' });
+      await turn(p.id, { status: 'queued', createdAgo: '3 hours' });
+
+      expect(await rent().requestSleep(p.id)).toBe(true);
+      expect(await jobsOf(p.id)).toEqual(['queued']);
+    });
+
+    it('46. СВЕЖИЙ ход в очереди продукт держит', async () => {
+      // Обратная сторона 45: раннер заберёт его в ближайшие секунды, и гасить
+      // контейнер сейчас — то же самое, что гасить посреди работы.
+      const p = await due({ slug: 'sleep-fresh-queued' });
+      await turn(p.id, { status: 'queued', createdAgo: '10 seconds' });
+
+      expect(await rent().requestSleep(p.id)).toBe(false);
+      expect(await jobsOf(p.id)).toEqual([]);
+    });
+
+    it('47. закрытые ходы сну не мешают', async () => {
+      // История ходов копится навсегда. Отбор без сверки статуса запретил бы
+      // сон любому продукту, у которого хоть раз что-то правили.
+      const p = await due({ slug: 'sleep-history' });
+      await turn(p.id, { status: 'done', createdAgo: '5 minutes', startedAgo: '5 minutes', progressAgo: '1 minute' });
+      await turn(p.id, { status: 'failed', createdAgo: '2 minutes', startedAgo: '2 minutes' });
+
+      expect(await rent().requestSleep(p.id)).toBe(true);
+      expect(await jobsOf(p.id)).toEqual(['queued']);
+    });
+
+    it('48. ЗАВОДЯЩИЙСЯ продукт не помечается спящим без задания', async () => {
+      // ДЕФЕКТ ПЛАНА. Там статус менялся ПЕРВОЙ частью оператора, а задание
+      // ставилось второй с ON CONFLICT DO NOTHING — и при активном задании
+      // (идёт заведение) продукт оставался помеченным спящим БЕЗ задания на
+      // сон: аренду не платит, правок не принимает, контейнер работает, гасить
+      // его некому. Бесплатный хостинг, видимый только по выручке.
+      const p = await due({ slug: 'sleep-while-provisioning' });
+      await job(p.id, { status: 'running', startedAgo: '1 minute' });
+
+      expect(await rent().requestSleep(p.id)).toBe(false);
+
+      expect((await getProduct(p.id)).status).toBe('running');
+      expect((await getProduct(p.id)).sleep_reason).toBeNull();
+      expect(await jobsOf(p.id)).toEqual(['running']);
+    });
+
+    it('49. ОПЛАЧЕННЫЙ продукт не усыпляется', async () => {
+      // Прод работает в двух процессах: проигравший гонку сборщик получает от
+      // chargeRent false — не потому, что денег нет, а потому что сосед только
+      // что заплатил, — и идёт усыплять оплаченный продукт.
+      const p = await due({ slug: 'sleep-paid', overdue: '-10 days' });
+
+      expect(await rent().requestSleep(p.id)).toBe(false);
+      expect(await jobsOf(p.id)).toEqual([]);
+      expect((await getProduct(p.id)).status).toBe('running');
+    });
+
+    it('50. два ОДНОВРЕМЕННЫХ запроса сна дают одно задание', async () => {
+      const p = await due({ slug: 'sleep-double' });
+
+      const outcomes = await Promise.all([rent().requestSleep(p.id), rent().requestSleep(p.id)]);
+
+      expect(outcomes.filter(Boolean)).toHaveLength(1);
+      expect(await jobsOf(p.id)).toEqual(['queued']);
+    });
+
+    it('51. сон не трогает соседний продукт', async () => {
+      const other = await bystander();
+      const neighbour = await due({ slug: 'sleep-neighbour' });
+      const p = await due({ slug: 'sleep-mine' });
+
+      expect(await rent().requestSleep(p.id)).toBe(true);
+
+      expect((await getProduct(neighbour.id)).status).toBe('running');
+      expect(await jobsOf(neighbour.id)).toEqual([]);
+      await expectUntouched(other);
+    });
+
+    it('52. пробуждение ставится только спящим и только на сколько хватает денег', async () => {
+      // Хватает ровно на один месяц — значит просыпается ОДИН продукт, тот,
+      // что уснул раньше. Двадцать контейнеров, стартующих разом на одной
+      // машине, — отказ по памяти.
+      const first = await due({ slug: 'wake-first', status: 'sleeping', overdue: '10 days', userId: 'u-w' });
+      const second = await due({ slug: 'wake-second', status: 'sleeping', overdue: '2 days', userId: 'u-w' });
+      const awake = await due({ slug: 'wake-awake', overdue: '-5 days', userId: 'u-w' });
+      await setBalance('u-w', 50_000);
+
+      expect(await rent().wakeAffordable('u-w')).toBe(1);
+
+      expect(await jobKindsOf(first.id)).toEqual(['wake']);
+      expect(await jobsOf(second.id)).toEqual([]);
+      expect(await jobsOf(awake.id)).toEqual([]);
+    });
+
+    it('53. денег на два месяца — просыпаются двое из трёх', async () => {
+      const a = await due({ slug: 'wake-a', status: 'sleeping', overdue: '10 days', userId: 'u-w' });
+      const b = await due({ slug: 'wake-b', status: 'sleeping', overdue: '5 days', userId: 'u-w' });
+      const c = await due({ slug: 'wake-c', status: 'sleeping', overdue: '1 day', userId: 'u-w' });
+      await setBalance('u-w', 120_000);
+
+      expect(await rent().wakeAffordable('u-w')).toBe(2);
+
+      expect(await jobsOf(a.id)).toEqual(['queued']);
+      expect(await jobsOf(b.id)).toEqual(['queued']);
+      expect(await jobsOf(c.id)).toEqual([]);
+    });
+
+    it('54. пустой и отрицательный баланс не будят никого', async () => {
+      // На 2026-08-08 один пользователь был на −7 363: прямые UPDATE в чате
+      // уводили баланс в минус. Целочисленное деление отрицательного числа на
+      // цену аренды даёт отрицательное число мест — проверено, а не выведено.
+      const p = await due({ slug: 'wake-broke', status: 'sleeping', userId: 'u-w' });
+
+      await setBalance('u-w', 0);
+      expect(await rent().wakeAffordable('u-w')).toBe(0);
+
+      await setBalance('u-w', -7_363);
+      expect(await rent().wakeAffordable('u-w')).toBe(0);
+
+      await setBalance('u-w', 49_999);
+      expect(await rent().wakeAffordable('u-w')).toBe(0);
+      expect(await jobsOf(p.id)).toEqual([]);
+    });
+
+    it('55. продукт с активным заданием не получает второго и не съедает чужое место', async () => {
+      // Место в бюджете, потраченное на продукт, которому задание всё равно не
+      // поставится, тихо отнимает пробуждение у соседа. ON CONFLICT про это
+      // молчит: он лишь пропускает вставку.
+      const busy = await due({ slug: 'wake-busy', status: 'sleeping', overdue: '10 days', userId: 'u-w' });
+      const next = await due({ slug: 'wake-next', status: 'sleeping', overdue: '5 days', userId: 'u-w' });
+      await job(busy.id, { status: 'queued' });
+      await setBalance('u-w', 50_000);
+
+      expect(await rent().wakeAffordable('u-w')).toBe(1);
+
+      expect(await jobsOf(busy.id)).toEqual(['queued']);
+      expect(await jobKindsOf(busy.id)).toEqual(['provision']);
+      expect(await jobKindsOf(next.id)).toEqual(['wake']);
+    });
+
+    it('56. пробуждение будит только СВОИ продукты', async () => {
+      const mine = await due({ slug: 'wake-mine', status: 'sleeping', userId: 'u-w' });
+      const foreign = await due({ slug: 'wake-foreign', status: 'sleeping', userId: 'u-other' });
+      await setBalance('u-w', 500_000);
+      await setBalance('u-other', 500_000);
+
+      expect(await rent().wakeAffordable('u-w')).toBe(1);
+
+      expect(await jobsOf(mine.id)).toEqual(['queued']);
+      expect(await jobsOf(foreign.id)).toEqual([]);
+    });
+
+    it('57. оборот сборщика: богатому списывает, бедного усыпляет, оплаченного не трогает', async () => {
+      // Сквозной стык задач 2, 4 и 5 на живой базе. Порознь все три половины
+      // зелены и при разъехавшихся условиях отбора.
+      const rich = await due({ slug: 'tick-rich', userId: 'u-rich' });
+      const poor = await due({ slug: 'tick-poor', userId: 'u-poor' });
+      const paid = await due({ slug: 'tick-paid', overdue: '-3 days', userId: 'u-rich' });
+      await setBalance('u-rich', 120_000);
+      await setBalance('u-poor', 1_000);
+
+      await rent().tick();
+
+      expect(await balanceOf('u-rich')).toBe(70_000);
+      expect((await getProduct(rich.id)).status).toBe('running');
+      expect(await paidUntilOf(rich.id)).toBeGreaterThan(Date.now());
+
+      expect((await getProduct(poor.id)).status).toBe('sleeping');
+      expect((await getProduct(poor.id)).sleep_reason).toMatch(/токен/i);
+      expect(await jobKindsOf(poor.id)).toEqual(['sleep']);
+      expect(await balanceOf('u-poor')).toBe(1_000);
+
+      expect((await getProduct(paid.id)).status).toBe('running');
+      expect(await jobsOf(paid.id)).toEqual([]);
+    });
+
+    it('58. ДВА ОДНОВРЕМЕННЫХ оборота: списание одно, и никто не усыплён', async () => {
+      // Прод работает в кластере из двух процессов, и оба обходят один и тот
+      // же список должников. Проигравший получает от списания false — и без
+      // предусловия `paid_until <= now()` внутри сна усыпил бы ТОЛЬКО ЧТО
+      // ОПЛАЧЕННЫЙ продукт: владелец заплатил и тут же получил спящий продукт.
+      const p = await due({ slug: 'tick-race' });
+      await setBalance('u-1', 120_000);
+
+      await Promise.all([rent().tick(), rent().tick()]);
+
+      expect(await balanceOf('u-1')).toBe(70_000);
+      expect((await getProduct(p.id)).status).toBe('running');
+      expect(await jobsOf(p.id)).toEqual([]);
+      expect(await ledgerOf('u-1')).toHaveLength(1);
+    });
+
+    it('59. сон, начатый ДО чужого списания, не усыпляет оплаченный продукт', async () => {
+      // Единственное место, где замок на строке продукта в постановке сна
+      // действительно нужен: во всём остальном одно задание на продукт держит
+      // частичный уникальный индекс. Здесь два процесса кластера идут
+      // ВСТРЕЧНО — один списывает, другой усыпляет, — и без `FOR UPDATE` сон
+      // проверяет срок по снимку, взятому до чужого коммита: владелец платит и
+      // тут же получает спящий продукт.
+      //
+      // Порядок задаётся посторонним замком на строке продукта: списание
+      // встаёт в очередь первым, сон — вторым, очередь ожидающих в PostgreSQL
+      // обслуживается по порядку прихода.
+      const p = await due({ slug: 'sleep-vs-charge' });
+      await setBalance('u-1', 120_000);
+
+      const holder = await pool.connect();
+      let released = false;
+      try {
+        await holder.query('BEGIN');
+        await holder.query('SELECT id FROM products WHERE id = $1 FOR UPDATE', [p.id]);
+
+        const charging = rent().chargeRent(p.id);
+        await waitForLockWaiters(1);
+        const sleeping = rent().requestSleep(p.id);
+        await waitForLockWaiters(2);
+
+        await holder.query('COMMIT');
+        released = true;
+        const [charged, slept] = await Promise.all([charging, sleeping]);
+
+        expect(charged).toBe(true);
+        expect(slept).toBe(false);
+        expect((await getProduct(p.id)).status).toBe('running');
+        expect(await jobsOf(p.id)).toEqual([]);
         expect(await paidUntilOf(p.id)).toBeGreaterThan(Date.now());
       } finally {
         if (!released) await holder.query('ROLLBACK').catch(() => undefined);
