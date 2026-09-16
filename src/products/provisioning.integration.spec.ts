@@ -3,7 +3,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
-import { ProductsService } from './products.service';
+import { MIGRATIONS, ProductsService } from './products.service';
 import { ProvisioningService } from './provisioning.service';
 import { SecretsService } from './secrets.service';
 
@@ -137,9 +137,13 @@ maybe('провижининг против живого Postgres', () => {
     secrets = new SecretsService({
       get: (k: string) => (k === 'PRODUCT_SECRETS_KEY' ? KEY : undefined),
     } as any);
-    // Схема накатывается ТЕМИ ЖЕ файлами, что и в проде. Переписанный руками
-    // DDL разъехался бы с миграциями молча, и файл проверял бы выдуманную базу.
-    for (const f of ['001_products.sql', '002_provisioning.sql', '003_host_agent.sql']) {
+    // Схема накатывается ТЕМИ ЖЕ файлами и В ТОМ ЖЕ ПОРЯДКЕ, что и в проде —
+    // по общему списку MIGRATIONS, а не по своей копии. Переписанный руками DDL
+    // разъехался бы с миграциями молча, и файл проверял бы выдуманную базу;
+    // собственный список файлов расходился бы так же — забытая в нём новая
+    // миграция даёт «column does not exist» в сценарии, который к ней
+    // отношения не имеет.
+    for (const f of MIGRATIONS) {
       await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', f), 'utf8'));
     }
     // ГАРД НА ЧУЖУЮ БАЗУ. beforeEach делает TRUNCATE и адрес не разбирает, а
@@ -1246,13 +1250,88 @@ maybe('провижининг против живого Postgres', () => {
         'id',
         'kind',
         'name',
+        // Аренда (миграция 004): до какого числа оплачено и почему спит.
+        // Без них карточка показывает «остановлен» без объяснения, и владелец
+        // читает штатный сон как нашу поломку.
+        'paid_until',
         'provision_error',
         'runner_seen_at',
+        'sleep_reason',
         'slug',
         'status',
         'user_id',
       ].sort(),
     );
+  });
+
+  it('20б. заведённому продукту аренда оплачена на месяц вперёд', async () => {
+    // Первый месяц бесплатно — решение владельца, и держится оно ровно на
+    // DEFAULT у колонки: INSERT в provisioning.service.ts её не перечисляет.
+    // Сторож против «срок появится когда-нибудь потом»: с пустым paid_until
+    // продукт выпадает из отбора сборщика (`paid_until <= now()` на NULL даёт
+    // не-совпадение) и хостится бесплатно вечно, без единой строки в логе.
+    //
+    // Проверяется на живой базе, а не по тексту миграции: DEFAULT, не
+    // доехавший до базы, читается в файле совершенно так же, как доехавший.
+    await product({ slug: 'srok-oplaty', status: 'running' });
+
+    const [row] = await new ProductsService(pg as any).list('u-1');
+
+    const days = (new Date(row.paid_until).getTime() - Date.now()) / 86_400_000;
+    // Окно в сутки с запасом: месяц — календарный, в феврале он короче.
+    expect(days).toBeGreaterThan(27);
+    expect(days).toBeLessThan(32);
+  });
+
+  it('20в. повторная накатка миграций не сдвигает уже выданный срок', async () => {
+    // Модуль накатывает свою схему при КАЖДОМ старте API. Правка данных вида
+    // `UPDATE products SET paid_until = now() + interval '1 month'
+    //  WHERE paid_until IS NULL` выглядит разовой, но при живом продукте с
+    // истёкшим сроком (или при новом, у которого колонку не заполнили) она
+    // перевыдавала бы бесплатный месяц на каждом рестарте. Здесь проверяется
+    // ИСПОЛНЕНИЕМ: срок уводится в прошлое, файлы миграций накатываются заново,
+    // срок обязан остаться в прошлом.
+    const p = await product({ slug: 'povtor-migracii', status: 'running' });
+    await pool.query(`UPDATE products SET paid_until = now() - interval '5 days' WHERE id = $1`, [
+      p.id,
+    ]);
+
+    for (const f of MIGRATIONS) {
+      await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', f), 'utf8'));
+    }
+
+    const after = await pool.query('SELECT paid_until FROM products WHERE id = $1', [p.id]);
+    expect(new Date(after.rows[0].paid_until).getTime()).toBeLessThan(Date.now());
+  });
+
+  it('20г. продукт, заведённый ДО выката, получает срок самой накаткой', async () => {
+    // Случай demo и shop2 — единственный, ради которого в плане стояла
+    // отдельная правка данных. Она не нужна: `ADD COLUMN ... DEFAULT` в
+    // PostgreSQL проставляет существующим строкам значение, вычисленное в
+    // момент ALTER. Утверждение НЕ вычитывается из документации, а
+    // проверяется исполнением: поведение зависит от волатильности выражения
+    // по умолчанию, и «должно работать» здесь стоит ровно столько же, сколько
+    // «тесты зелёные» в куске 2 стоили против отключённого автоотката.
+    //
+    // База возвращается в состояние до 004 буквально: продукт заводится, когда
+    // колонки ещё нет.
+    await pool.query('ALTER TABLE products DROP COLUMN paid_until');
+    const rent = fs.readFileSync(path.join(__dirname, 'migrations', '004_rent.sql'), 'utf8');
+    try {
+      const p = await product({ slug: 'do-vykata', status: 'running' });
+
+      await pool.query(rent);
+
+      const r = await pool.query('SELECT paid_until FROM products WHERE id = $1', [p.id]);
+      const days = (new Date(r.rows[0].paid_until).getTime() - Date.now()) / 86_400_000;
+      expect(days).toBeGreaterThan(27);
+      expect(days).toBeLessThan(32);
+    } finally {
+      // Колонку возвращаем при любом исходе. Иначе все следующие сценарии
+      // падают на «column does not exist», и красным оказывается не то, что
+      // сломалось. Повторная накатка безопасна — этим же файлом и проверяется.
+      await pool.query(rent);
+    }
   });
 
   // ═══════════════ отметка о жизни агента хоста ═══════════════

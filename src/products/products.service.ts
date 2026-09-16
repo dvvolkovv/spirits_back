@@ -13,8 +13,33 @@ export interface ProductRow {
   domain: string | null;
   runner_seen_at: string | null;
   provision_error: string | null;
+  // До какого момента оплачена аренда. Без `| null`: колонка NOT NULL с
+  // DEFAULT (миграция 004), пустой она не бывает ни у одной строки.
+  paid_until: string;
+  // Почему спит. NULL — не спит либо причина не записана; см. 004 о том,
+  // почему это не пустая строка.
+  sleep_reason: string | null;
   created_at: string;
 }
+
+/**
+ * Файлы схемы модуля в порядке применения. ОДИН список на репозиторий: его
+ * читает и onModuleInit, и интеграционный сьют, который накатывает схему теми
+ * же файлами. Пока списков было два, они описывали схему в двух местах — и
+ * разошлись бы молча: сьют гоняет запросы по базе без новой колонки и падает с
+ * «column does not exist» там, где ошибка на самом деле в списке.
+ *
+ * Порядок — это и есть описание схемы. 002 навешивает колонки на таблицу,
+ * которую создаёт 001. 003 и 004 формально ни от кого не зависят (003 — своя
+ * таблица; 004 расширяет то, что завела 002), но едут по номерам: список,
+ * допускающий перестановку, перестанут читать как порядок.
+ */
+export const MIGRATIONS = [
+  '001_products.sql',
+  '002_provisioning.sql',
+  '003_host_agent.sql',
+  '004_rent.sql',
+] as const;
 
 // Список колонок перечислен явно и собран ПО КАБИНЕТУ: здесь ровно те поля,
 // которые объявлены в `interface Product` фронта (spirits_front
@@ -44,11 +69,16 @@ export interface ProductRow {
 // port не перечислен намеренно: это порт на петле хоста, клиенту он не нужен
 // и в ответ уходить не должен.
 //
+// paid_until и sleep_reason — аренда (миграция 004). Не топология и не секрет:
+// это ровно то, что карточка обязана показать владельцу вместо молчаливого
+// «остановлен» — до какого числа оплачено и почему продукт спит.
+//
 // user_id остаётся, хотя фронт его не читает: это id самого спрашивающего
 // (WHERE user_id = $1), то есть не утечка, а подтверждение того, чьи продукты
 // приехали. На него же опирается сторож формы выборки в products.access.spec.ts.
 const COLUMNS = `id, user_id, name, slug, status, kind, domain,
-                 runner_seen_at, provision_error, created_at`;
+                 runner_seen_at, provision_error, paid_until, sleep_reason,
+                 created_at`;
 
 @Injectable()
 export class ProductsService implements OnModuleInit {
@@ -57,14 +87,11 @@ export class ProductsService implements OnModuleInit {
   constructor(private readonly pg: PgService) {}
 
   async onModuleInit() {
-    await this.applyMigration('001_products.sql');
-    // Строго после 001: 002 навешивает колонки на таблицу, которую создаёт 001.
-    await this.applyMigration('002_provisioning.sql');
-    // 003 ни от кого не зависит (своя таблица, ни одного внешнего ключа), но
-    // едет последней: порядок файлов в этом списке — единственное, что
-    // описывает порядок схемы, и «независимая» миграция посередине читается
-    // как разрешение переставлять.
-    await this.applyMigration('003_host_agent.sql');
+    // Последовательно, а не Promise.all: порядок из MIGRATIONS — это и есть
+    // описание схемы (см. доку константы).
+    for (const file of MIGRATIONS) {
+      await this.applyMigration(file);
+    }
   }
 
   async list(userId: string): Promise<ProductRow[]> {

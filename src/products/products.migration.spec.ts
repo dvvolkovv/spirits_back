@@ -80,17 +80,33 @@ async function migration003(): Promise<string> {
 }
 
 /**
+ * Текст миграции 004 — отдельно от соседей по той же причине, по какой отделены
+ * 002 и 003. Якорь — `paid_until`: в 004 есть и `product_provision_jobs`, и
+ * `products_status_check`, то есть по ним `find` подобрал бы 002, применённую
+ * раньше.
+ */
+async function migration004(): Promise<string> {
+  const { svc, queries } = makeService();
+  await svc.onModuleInit();
+  const sql = queries.find((q) => q.includes('paid_until'));
+  if (!sql) {
+    throw new Error('миграция 004 не применена: ни один запрос не заводит paid_until');
+  }
+  return sql.replace(/\/\*[\s\S]*?\*\//g, '').replace(/--[^\n]*/g, '');
+}
+
+/**
  * Значения именованного CHECK-словаря, отсортированные: сверка получается ровно
  * про состав, а не про порядок перечисления.
  *
  * Имя ограничения в якоре обязательно: словарей по колонке status в файле два —
  * у products и у очереди заданий, — и безымянный поиск подобрал бы чужой.
  */
-function dictionary(sql: string, constraint: string, column: string): string[] {
+function dictionary(sql: string, constraint: string, column: string, where = '002'): string[] {
   const m = sql.match(
     new RegExp(`ADD CONSTRAINT\\s+${constraint}\\s+CHECK\\s*\\(\\s*${column} IN \\(([^)]*)\\)`),
   );
-  if (!m) throw new Error(`в миграции 002 нет CHECK-словаря ${constraint} по колонке ${column}`);
+  if (!m) throw new Error(`в миграции ${where} нет CHECK-словаря ${constraint} по колонке ${column}`);
   return m[1]
     .split(',')
     .map((v) => v.trim().replace(/'/g, ''))
@@ -116,10 +132,18 @@ describe('миграция 002', () => {
     // Порядок важен: 002 добавляет колонки в таблицу, которую создаёт 001.
     // 003 своя таблица и ни от кого не зависит, но список файлов — это и есть
     // описание схемы: пропавший из него файл не применяется вовсе.
+    //
+    // Литеральный массив, а не сверка с самой константой MIGRATIONS: сверка
+    // константы с собой зеленела бы при любом её содержимом, включая пустое.
+    // 004 идёт ПОСЛЕ 003, хотя зависит только от 002: нумерация перескакивает
+    // через 003 (он уже накачен на проде), и переставить их местами значило бы
+    // завести второй порядок — по зависимостям, — который разошёлся бы с
+    // номерами файлов при первой же следующей миграции.
     expect(applied).toEqual([
       '001_products.sql',
       '002_provisioning.sql',
       '003_host_agent.sql',
+      '004_rent.sql',
     ]);
   });
 
@@ -271,5 +295,152 @@ describe('миграция 003 — отметка о жизни агента х�
     // машин несколько.
     const sql = await migration003();
     expect(sql).not.toMatch(/host_ip|hostname|\bname\b/);
+  });
+});
+
+describe('миграция 004 — аренда', () => {
+  it('срок оплаты — обязательная метка времени с бесплатным первым месяцем', async () => {
+    // timestamptz, а не timestamp: срок сравнивается с now() в отборе
+    // сборщика, и без пояса сравнение зависело бы от TimeZone соединения —
+    // то есть от того, какой процесс кластера спросил.
+    //
+    // NOT NULL: NULL означал бы «срок неизвестен», а `paid_until <= now()` на
+    // NULL даёт не-совпадение — продукт молча хостился бы бесплатно и вечно.
+    //
+    // DEFAULT — это и есть «первый месяц бесплатно» из решений владельца, и
+    // одновременно заполнение существующих demo и shop2: ADD COLUMN проставит
+    // им значение, вычисленное в момент ALTER. INSERT в provisioning.service
+    // колонку не перечисляет, так что без DEFAULT новый продукт приезжал бы
+    // без срока вовсе.
+    expect(await migration004()).toMatch(
+      /ADD COLUMN IF NOT EXISTS\s+paid_until\s+timestamptz\s+NOT NULL\s+DEFAULT\s+now\(\)\s*\+\s*interval\s+'1 month'/,
+    );
+  });
+
+  it('бесплатный месяц не перевыдаётся: правки данных в файле нет', async () => {
+    // ГЛАВНЫЙ сторож файла. Модуль накатывает свои миграции сам, в
+    // onModuleInit, то есть при КАЖДОМ `pm2 restart`.
+    // `UPDATE products SET paid_until = now() + interval '1 month'
+    //  WHERE paid_until IS NULL` выглядит разовой правкой данных, но ею не
+    // является: любая строка с пустой колонкой получала бы новый бесплатный
+    // месяц от минуты рестарта. А пустой она была бы у каждого продукта,
+    // заведённого после выката, раз INSERT её не заполняет, — продукт
+    // бесконечно жил бы «в первом месяце». Заметно только по недосчитанной
+    // выручке.
+    expect(await migration004()).not.toMatch(/UPDATE\s+products\s+SET\s+paid_until/i);
+  });
+
+  it('причина сна — необязательный текст', async () => {
+    // Именно nullable. NOT NULL DEFAULT '' завёл бы третье состояние: пустая
+    // строка против «причины нет», а их этот код уже различал неправильно.
+    // `;` в якоре не украшение — он и запрещает приехавшие следом модификаторы.
+    expect(await migration004()).toMatch(/ADD COLUMN IF NOT EXISTS\s+sleep_reason\s+text\s*;/);
+  });
+
+  it('словарь статусов знает sleeping', async () => {
+    // Состав сверен с живой базой прода 16.09.2026 (`\d products`): там ровно
+    // шесть значений ниже без sleeping.
+    expect(dictionary(await migration004(), 'products_status_check', 'status', '004')).toEqual([
+      'archived',
+      'degraded',
+      'failed',
+      'provisioning',
+      'running',
+      'sleeping',
+      'stopped',
+    ]);
+  });
+
+  it('словарь статусов РАСШИРЕН, а не переписан: прежние значения на месте', async () => {
+    // Ожидание выводится из текста 002, а не пишется руками: список,
+    // продублированный в тесте, теряет значение вместе с миграцией и остаётся
+    // зелёным. Потерянное значение здесь — это `UPDATE products SET status =
+    // '...'`, падающий на CHECK внутри своего обработчика (так уже было бы с
+    // 'failed', см. 002).
+    const before = dictionary(await migration002(), 'products_status_check', 'status');
+    const after = dictionary(await migration004(), 'products_status_check', 'status', '004');
+
+    expect(after).toEqual([...before, 'sleeping'].sort());
+  });
+
+  it('вид задания — обязательный текст, заведение по умолчанию', async () => {
+    // Единственный существующий INSERT в очередь (provisioning.service.ts)
+    // вида не передаёт. Без DEFAULT постановка заданий сломалась бы в ту же
+    // секунду, а с NULL-ами вид пришлось бы домысливать в каждом читателе.
+    expect(await migration004()).toMatch(
+      /ADD COLUMN IF NOT EXISTS\s+kind\s+text\s+NOT NULL\s+DEFAULT\s+'provision'/,
+    );
+  });
+
+  it('DEFAULT у вида задания НЕ снимается — в отличие от products.kind', async () => {
+    // 002 снимает DEFAULT у products.kind сразу после заполнения старых строк,
+    // и это правильно там: забытый kind означал бы бота, выставленного наружу
+    // сайтом. Здесь наоборот — задание без вида это заведение, и повторить
+    // приём 002 значило бы сломать постановку заданий. Сторож от копирования
+    // соседней миграции по образцу.
+    expect(await migration004()).not.toMatch(/ALTER COLUMN\s+kind\s+DROP DEFAULT/);
+  });
+
+  it('словарь видов задания закрыт CHECK', async () => {
+    expect(
+      dictionary(await migration004(), 'product_provision_jobs_kind_check', 'kind', '004'),
+    ).toEqual(['provision', 'sleep', 'wake']);
+  });
+
+  it('каждое ограничение навешивается идемпотентно', async () => {
+    // Тот же сторож, что в 002: ADD CONSTRAINT не знает IF NOT EXISTS, и без
+    // снятия одноимённого повторный прогон падал бы — а applyMigration такой
+    // отказ только пишет в лог.
+    const sql = await migration004();
+    const added = [...sql.matchAll(/ADD CONSTRAINT\s+(\w+)/g)].map((m) => m[1]);
+    expect(added.length).toBeGreaterThan(0);
+    for (const name of added) {
+      expect(sql.indexOf(`DROP CONSTRAINT IF EXISTS ${name};`)).toBeGreaterThan(-1);
+      expect(sql.indexOf(`DROP CONSTRAINT IF EXISTS ${name};`)).toBeLessThan(
+        sql.indexOf(`ADD CONSTRAINT ${name}`),
+      );
+    }
+  });
+
+  it('ни одного неповторяемого оператора во всём файле', async () => {
+    // Сторож шире предыдущих двух: он красный на ЛЮБОМ новом операторе без
+    // защиты от повтора — правке данных, голом ALTER, CREATE без IF NOT
+    // EXISTS. Файл исполняется при каждом старте API, и цена незащищённого
+    // оператора здесь не «ошибка», а молчаливый отказ: applyMigration ловит
+    // исключение, пишет строку в лог и едет дальше.
+    const statements = (await migration004())
+      .split(';')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    expect(statements.length).toBeGreaterThan(0);
+    for (const s of statements) {
+      expect(s).toMatch(
+        /ADD COLUMN IF NOT EXISTS|DROP CONSTRAINT IF EXISTS|ADD CONSTRAINT|CREATE INDEX IF NOT EXISTS/,
+      );
+    }
+  });
+
+  it('индекс по сроку оплаты — частичный, мимо архивных', async () => {
+    // Сборщику нужен отбор «кому пора платить», пробуждению — «кого будить
+    // первым». Обоим подходит индекс по paid_until; архивные не платят
+    // никогда, и держать их в индексе незачем.
+    const sql = await migration004();
+    expect(sql).toMatch(
+      /CREATE INDEX IF NOT EXISTS\s+idx_products_paid_until\s+ON products\s*\(\s*paid_until\s*\)/,
+    );
+    expect(sql).toMatch(/idx_products_paid_until[\s\S]*?WHERE\s+archived_at IS NULL\s*;/);
+  });
+
+  it('предикат индекса не вшивает в себя статус', async () => {
+    // `AND status = 'running'` напрашивается, но набор платящих статусов не
+    // устоялся: на проде 16.09.2026 четыре продукта из шести в 'degraded'.
+    // Индекс, вшивший один статус, пришлось бы пересоздавать вместе с этим
+    // решением и до тех пор он не обслуживал бы выборку спящих для
+    // пробуждения. Запросу с более узким условием широкий предикат не мешает.
+    const index = (await migration004()).split(';').find((s) => s.includes('CREATE INDEX'));
+
+    expect(index).toBeDefined();
+    expect(index).not.toContain('status');
   });
 });
