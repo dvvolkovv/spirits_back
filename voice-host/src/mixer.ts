@@ -143,8 +143,17 @@ export class Mixer {
    * Разделить шум и речь по одной громкости кадра нельзя в принципе — они
    * отличаются модуляцией. Поэтому правило не «это шум», а «этот сейчас не
    * громче собственной тишины, поднимать его не надо».
+   *
+   * Порог снижен с двух до полутора 16.09.2026: на живой встрече ассистент
+   * слышал участника с десктопа и не слышал того же человека с телефона.
+   * У телефонного микрофона фон выше, речь превышает его слабее — и двойного
+   * запаса она не набирала. Тогда мобильный участник шёл в сумму без
+   * усиления, втрое тише соседа, и детектор речи его пропускал.
+   *
+   * Значение можно менять переменной окружения, не выкатывая воркер: правильную
+   * границу видно только по живым встречам, а каждый выкат рвёт сессию.
    */
-  static readonly SPEECH_OVER_NOISE = 2;
+  static readonly SPEECH_OVER_NOISE = Number(process.env.VOICE_SPEECH_OVER_NOISE || 1.5);
 
   private tracks = new Map<string, Track>();
 
@@ -268,6 +277,8 @@ export class Mixer {
     rms: number;
     gain: number;
     speaking: boolean;
+    /** Фон микрофона: от него считается порог речи. */
+    floor: number;
   }[] {
     return [...this.tracks.entries()].map(([participant, t]) => ({
       participant,
@@ -276,6 +287,7 @@ export class Mixer {
       rms: Math.round(t.speechRms),
       gain: Number(this.gainFor(participant).toFixed(2)),
       speaking: this.speakingNow(t),
+      floor: Math.round(t.noiseFloor),
     }));
   }
 

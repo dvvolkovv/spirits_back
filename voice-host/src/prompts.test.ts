@@ -6,6 +6,7 @@ import {
   callInstructions,
   meetingInstructions,
   transcriptionPrompt,
+  isTranscriptionEcho,
 } from './prompts.js';
 
 const SPECIALISTS = [
@@ -245,5 +246,27 @@ describe('transcriptionPrompt', () => {
   test('короткая — это подсказка распознаванию, а не инструкция модели', () => {
     // Длинный текст в этом поле уводит расшифровку в пересказ подсказки.
     assert.ok(transcriptionPrompt('Роман').length < 150);
+  });
+});
+
+describe('isTranscriptionEcho', () => {
+  test('ловит подсказку, вернувшуюся вместо реплики', () => {
+    assert.equal(isTranscriptionEcho(transcriptionPrompt('Роман'), 'Роман'), true);
+  });
+
+  test('ловит обрезанное эхо — именно так оно и приходит', () => {
+    // Живая встреча 16.09.2026: в гейт пришло «Рабочая встреча на русском
+    // языке.» и «Рабочая встреча на русском языке. Ассистента зовут Роман — к
+    // нему обращаются по ».
+    assert.equal(isTranscriptionEcho('Рабочая встреча на русском языке.', 'Роман'), true);
+    assert.equal(
+      isTranscriptionEcho('Рабочая встреча на русском языке. Ассистента зовут Роман — к нему обращаются по ', 'Роман'),
+      true,
+    );
+  });
+
+  test('живую речь не трогает, даже если в ней есть слово «встреча»', () => {
+    assert.equal(isTranscriptionEcho('Роман, вопрос к тебе по вчерашней встрече', 'Роман'), false);
+    assert.equal(isTranscriptionEcho('давайте начнём рабочую встречу', 'Роман'), false);
   });
 });

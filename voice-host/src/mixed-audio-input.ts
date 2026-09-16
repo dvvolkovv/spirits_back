@@ -35,6 +35,8 @@ export class MixedRoomAudioInput extends voice.AudioInput {
   /** Сколько кадров реально пришло от участников — для диагностики. */
   private framesIn = 0;
   private ticks = 0;
+  /** Очередь кадров к сессии. Нужна только ради `desiredSize` в логе. */
+  private queue: ReadableStreamDefaultController<AudioFrame> | null = null;
 
   /**
    * Куда писать смикшированный поток. Пусто — не писать, и это обычный режим.
@@ -54,6 +56,13 @@ export class MixedRoomAudioInput extends voice.AudioInput {
 
     const source = new ReadableStream<AudioFrame>({
       start: (controller) => {
+        // Держим ссылку на очередь: `desiredSize` уходит в минус ровно на
+        // столько кадров, сколько сессия не забрала. Это единственный способ
+        // увидеть, что модель перестала слушать: сам микшер при этом работает,
+        // дамп пишется, и снаружи всё выглядит здоровым. 16.09.2026 на этом
+        // ушёл день — ассистент оглох после переоткрытия сессии, а в логе не
+        // было ни строки.
+        this.queue = controller;
         this.push = (frame) => {
           if (this.closed) return;
           try {
@@ -137,9 +146,19 @@ export class MixedRoomAudioInput extends voice.AudioInput {
         // нужны громкость и доля речевых кадров у каждого.
         const per = this.mixer
           .stats()
-          .map((s) => `${s.participant}: кадров ${s.frames}, речь ${s.speechFrames}, ур. ${s.rms}, ×${s.gain}`)
+          .map(
+            (s) =>
+              `${s.participant}: кадров ${s.frames}, речь ${s.speechFrames}, ур. ${s.rms}, фон ${s.floor}, ` +
+              `${s.speaking ? `ГОВОРИТ ×${s.gain}` : 'молчит ×1'}`,
+          )
           .join(' | ');
-        console.log(`[вход] тиков: ${this.ticks}, кадров от участников: ${this.framesIn} — ${per}`);
+        // Отставание очереди — в кадрах. Ноль или около того значит, что
+        // сессия забирает звук в реальном времени; растущий минус — оглохла.
+        const behind = this.queue ? Math.max(0, -(this.queue.desiredSize ?? 0)) : 0;
+        console.log(
+          `[вход] тиков: ${this.ticks}, кадров от участников: ${this.framesIn}, ` +
+          `очередь к модели: ${behind} — ${per}`,
+        );
       }
     }, TICK_MS);
 
