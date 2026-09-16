@@ -1623,6 +1623,28 @@ maybe('провижининг против живого Postgres', () => {
 
     const paidUntilOf = async (id: string) => new Date((await getProduct(id)).paid_until).getTime();
 
+    /**
+     * Дождаться, пока n запросов ДЕЙСТВИТЕЛЬНО встанут на замок. Фиксированная
+     * пауза вместо этого либо ничего не гарантирует, либо удлиняет прогон на
+     * ровном месте, а сценарий 36 без этой гарантии проверяет не то, что
+     * написано в его названии.
+     */
+    async function waitForLockWaiters(n: number) {
+      const until = Date.now() + 10_000;
+      for (;;) {
+        const r = await pool.query(
+          `SELECT count(*)::int AS n FROM pg_stat_activity
+            WHERE datname = current_database()
+              AND state = 'active' AND wait_event_type = 'Lock'`,
+        );
+        if (r.rows[0].n >= n) return;
+        if (Date.now() > until) {
+          throw new Error(`на замок встали ${r.rows[0].n} из ${n} — сценарий не воспроизвёлся`);
+        }
+        await new Promise((res) => setTimeout(res, 50));
+      }
+    }
+
     it('22. два ОДНОВРЕМЕННЫХ сборщика списывают аренду ровно один раз', async () => {
       // Прод работает в кластере из двух процессов. Главный сценарий куска:
       // наивная реализация снимет 100 000 и уедет на два месяца вперёд, а
@@ -1875,6 +1897,46 @@ maybe('провижининг против живого Postgres', () => {
         [[a.id, b.id]],
       );
       expect(Number(paid.rows[0].count)).toBe(1);
+    });
+
+    it('36. два сборщика, взявшие снимок ДО чужого коммита, всё равно платят один раз', async () => {
+      // НАЙДЕНО МУТАЦИЕЙ. Сценарий 22 ловит двойное списание только если
+      // второй сборщик успел взять снимок до коммита первого, а это решает
+      // планировщик: на мутации «сначала списать, потом занять период» 22
+      // остался ЗЕЛЁНЫМ — второй запрос стартовал уже после чужого коммита и
+      // честно не нашёл, что списывать. Сама мутация при этом означает ровно
+      // то, чего боится спека: деньги сняты, период не занят, владелец платит
+      // дважды за один месяц.
+      //
+      // Здесь оба сборщика гарантированно встают на занятую строку баланса,
+      // то есть оба входят в дело до того, как хоть что-то произошло, и
+      // порядок частей оператора становится наблюдаемым: занять период
+      // ОБЯЗАНО быть предусловием списания, а не наоборот.
+      const p = await due({ slug: 'rent-race-held' });
+      await setBalance('u-1', 120_000);
+
+      const holder = await pool.connect();
+      let released = false;
+      try {
+        await holder.query('BEGIN');
+        await holder.query(
+          `SELECT tokens FROM ai_profiles_consolidated WHERE user_id = 'u-1' FOR UPDATE`,
+        );
+        const both = Promise.all([rent().chargeRent(p.id), rent().chargeRent(p.id)]);
+        await waitForLockWaiters(2);
+
+        await holder.query('COMMIT');
+        released = true;
+        const outcomes = await both;
+
+        expect(outcomes.filter(Boolean)).toHaveLength(1);
+        expect(await balanceOf('u-1')).toBe(70_000);
+        expect(await ledgerOf('u-1')).toHaveLength(1);
+        expect(await paidUntilOf(p.id)).toBeGreaterThan(Date.now());
+      } finally {
+        if (!released) await holder.query('ROLLBACK').catch(() => undefined);
+        holder.release();
+      }
     });
   });
 });
