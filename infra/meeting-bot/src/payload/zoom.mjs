@@ -93,6 +93,10 @@ export const ZOOM_PAGE_JS = `
   /** Кто есть кто: id → имя. Имена Zoom отдаёт сам, выдумывать не нужно. */
   const people = new Map();
   let myId = null;
+  /** Мы действительно во встрече, а не в прихожей. */
+  let entered = false;
+  /** Отложенное решение «встреча кончилась». См. onMeetingStatus. */
+  let leaving = null;
 
   const nameOf = (data) => String(data.userName || data.displayName || data.name || 'участник');
 
@@ -106,6 +110,8 @@ export const ZOOM_PAGE_JS = `
   };
 
   const publish = () => {
+    // В комнате ожидания состава нет: там мы одни и ничей приход не считается.
+    if (!entered) return;
     // Свой id спрашиваем, пока не ответят: сразу после входа SDK его ещё не
     // знает, а без него бот считает участником самого себя.
     if (myId === null) whoAmI();
@@ -153,16 +159,33 @@ export const ZOOM_PAGE_JS = `
   // Attendee, где он отработал на живых встречах.
   ZoomMtg.inMeetingServiceListener('onJoinSpeed', (data) => {
     if (data && data.level === 13) {
+      entered = true;
       unmute();
       send('joined', {});
+      publish();
     }
   });
 
   // Статусы встречи: 1 — подключаемся, 2 — подключены, 3 — отключены,
   // 4 — переподключаемся. Пишем все: по ним видно, где именно нас потеряли.
+  //
+  // Статус 3 НЕ означает «встреча кончилась», и принять его за конец стоило
+  // нам живого захода 16.09.2026: впуская из комнаты ожидания, Zoom рушит
+  // сессию и собирает заново («destroy SDK» в консоли, статус 3, следом снова
+  // 2). Бот уходил ровно в тот миг, когда его впустили, а человек видел
+  // вечное «Подключение».
+  //
+  // Поэтому ждём: вернулся статус 2 — значит это была пересборка. Не вернулся
+  // за пять секунд и мы уже были во встрече — значит и правда конец.
   ZoomMtg.inMeetingServiceListener('onMeetingStatus', (data) => {
-    send('sdk', { step: 'статус ' + (data && data.meetingStatus) });
-    if (data && data.meetingStatus === 3) send('left', { reason: 'meeting_ended' });
+    const st = data && data.meetingStatus;
+    send('sdk', { step: 'статус ' + st });
+    if (st === 2 && leaving) { clearTimeout(leaving); leaving = null; }
+    if (st !== 3 || leaving) return;
+    leaving = setTimeout(() => {
+      leaving = null;
+      if (entered) send('left', { reason: 'meeting_ended' });
+    }, 5000);
   });
 
   // Уровни входа: 6 — комната ожидания, 13 — начали подключать звук.
@@ -177,7 +200,11 @@ export const ZOOM_PAGE_JS = `
   });
 
   ZoomMtg.inMeetingServiceListener('onUserLeave', (data) => {
-    if (!data || !data.userId) return;
+    if (!data) return;
+    // reasonCode 1 — хозяин завершил встречу. Это конец без всяких «подождём»:
+    // пересобирать нечего.
+    if (data.reasonCode === 1) { send('left', { reason: 'host_ended_meeting' }); return; }
+    if (!data.userId) return;
     people.delete(data.userId);
     publish();
   });
