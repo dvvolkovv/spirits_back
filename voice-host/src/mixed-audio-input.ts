@@ -10,7 +10,30 @@ import {
 } from '@livekit/rtc-node';
 import { ReadableStream } from 'node:stream/web';
 import { createWriteStream } from 'node:fs';
-import { Mixer, SAMPLE_RATE, SAMPLES_PER_TICK, TICK_MS } from './mixer.js';
+import { Mixer, TICK_MS } from './mixer.js';
+
+/**
+ * Частота, на которой работает Realtime, — и единственная, на которой его
+ * можно кормить.
+ *
+ * Плагин OpenAI объявляет сессии `SAMPLE_RATE = 24000` и НЕ пересчитывает
+ * приходящие кадры: `resampleAudio(frame) { yield frame; }`. Штатный вход SDK
+ * поэтому сам приводит дорожки к 24 кГц (`resampleStream({ outputRate })`,
+ * умолчание `audioSampleRate: 24000`), а наш собственный вход отдавал 48 кГц
+ * — и API слушал наш звук как 24 кГц, то есть ВДВОЕ ЗАМЕДЛЕННЫМ, на октаву
+ * ниже.
+ *
+ * Отсюда всё, что мы ловили три дня: гул вместо согласных (переходов через
+ * ноль в семнадцать раз меньше, чем в исходнике), галлюцинации распознавания
+ * на случайных языках и «ассистент слышит одного через раз» — до текста
+ * доживало только то, что случайно выдерживало замедление. Синтетический
+ * стенд 16.09.2026: тот же звук, поданный в отдельную сессию с правильной
+ * частотой, распознаётся весь (7 реплик из 9), а живая сессия видела две.
+ */
+const INPUT_SAMPLE_RATE = 24_000;
+
+/** Сэмплов в тике на нашей частоте: 24000 × 20 мс. */
+const INPUT_SAMPLES_PER_TICK = (INPUT_SAMPLE_RATE * TICK_MS) / 1000;
 
 /**
  * Вход сессии, собранный из ВСЕХ участников комнаты.
@@ -28,7 +51,7 @@ import { Mixer, SAMPLE_RATE, SAMPLES_PER_TICK, TICK_MS } from './mixer.js';
  * подробно в mixer.ts.
  */
 export class MixedRoomAudioInput extends voice.AudioInput {
-  private mixer = new Mixer(true);
+  private mixer = new Mixer(true, INPUT_SAMPLES_PER_TICK);
   private ticker?: ReturnType<typeof setInterval>;
   private closed = false;
   private push: (frame: AudioFrame) => void = () => {};
@@ -133,7 +156,7 @@ export class MixedRoomAudioInput extends voice.AudioInput {
 
     if (this.dumpPath) {
       this.dump = createWriteStream(this.dumpPath);
-      console.log(`[вход] пишу смикшированный поток в ${this.dumpPath} (PCM s16 ${SAMPLE_RATE} моно)`);
+      console.log(`[вход] пишу смикшированный поток в ${this.dumpPath} (PCM s16 ${INPUT_SAMPLE_RATE} моно)`);
     }
 
     /**
@@ -171,7 +194,7 @@ export class MixedRoomAudioInput extends voice.AudioInput {
       }
       // Тот же самый буфер, что уходит в сессию, — не пересчитанный заново.
       if (this.dump) this.dump.write(Buffer.from(mixed.buffer, mixed.byteOffset, mixed.byteLength));
-      this.push(new AudioFrame(mixed, SAMPLE_RATE, 1, SAMPLES_PER_TICK));
+      this.push(new AudioFrame(mixed, INPUT_SAMPLE_RATE, 1, INPUT_SAMPLES_PER_TICK));
       // Раз в пять секунд — сколько кадров пришло от людей. Без этой строки
       // отличить «никто не говорит» от «звук до нас не доходит» невозможно:
       // и то и другое выглядит как тишина. Три захода подряд я гадал именно
@@ -245,7 +268,7 @@ export class MixedRoomAudioInput extends voice.AudioInput {
     this.attached.add(key);
     console.log(`[вход] читаю дорожку ${key}`);
     void (async () => {
-      const reader = new AudioStream(track, SAMPLE_RATE, 1).getReader();
+      const reader = new AudioStream(track, INPUT_SAMPLE_RATE, 1).getReader();
       try {
         for (;;) {
           const { done, value } = await reader.read();
