@@ -42,6 +42,10 @@ const PLATFORMS = {
     payload: meetPayload,
     join: MEET_JOIN,
     name: 'Google Meet',
+    // Тот же довод, что у Zoom: без устройств в списке площадка считает, что
+    // микрофона нет. Meet на экране входа показывает выбранный — «Fake Default
+    // Audio Input», — и это признак, что звук он у нас возьмёт.
+    chromeArgs: ['--use-fake-device-for-media-stream'],
     // Английский интерфейс — условие работы зацепок.
     //
     // Вход, чат и состав ищутся по подписям: «Ask to join», «Chat with
@@ -290,6 +294,17 @@ export class MeetingBot {
     await this.setState('joining');
     this.browser = await chromium.launch({
       headless: false,
+      // Не представляться автоматикой.
+      //
+      // Google Meet отказывает роботам ДО экрана входа: «You can't join this
+      // video call», поля имени нет вовсе, и отличить это от поломки входа по
+      // логу невозможно (16.09.2026 — час на разбор). Playwright объявляет себя
+      // сам: флаг `--enable-automation` и `navigator.webdriver`. Убираем и то,
+      // и другое — у Attendee ровно поэтому стоит тот же флаг блинка.
+      //
+      // Площадкам, где нас и так пускают, это не мешает: одно поведение на всех
+      // вместо ветки на каждую.
+      ignoreDefaultArgs: ['--enable-automation'],
       args: [
         '--no-sandbox',
         '--use-fake-ui-for-media-stream',
@@ -300,12 +315,18 @@ export class MeetingBot {
         // не попадает вовсе. Браузер бота открывает единственную страницу —
         // встречу, куда его позвали.
         '--disable-features=IsolateOrigins,site-per-process',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-extensions',
         ...(platform.chromeArgs || []),
       ],
     });
     const ctx = await this.browser.newContext({
       permissions: ['microphone', 'camera'],
       locale: platform.locale || 'ru-RU',
+    });
+    await ctx.addInitScript(() => {
+      // Вторая половина того же: флаг убран при запуске, свойство — здесь.
+      try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) { /* уже переопределено */ }
     });
     await ctx.exposeFunction('__botSend', (type, data) => { void this.onPageEvent(type, data); });
     // Площадке может понадобиться имя бота внутри страницы — тогда нагрузка
