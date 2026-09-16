@@ -37,7 +37,19 @@ const ADMIT_TIMEOUT_MS = Number(process.env.BOT_ADMIT_TIMEOUT_MS || 900_000);
  */
 const PLATFORMS = {
   telemost: { payload: TELEMOST_PAYLOAD, join: TELEMOST_JOIN, name: 'Телемост' },
-  zoom: { payload: ZOOM_PAYLOAD, name: 'Zoom', viaSdk: true },
+  zoom: {
+    payload: ZOOM_PAYLOAD,
+    name: 'Zoom',
+    viaSdk: true,
+    // Фальшивое устройство — не для звука, а для СПИСКА устройств.
+    //
+    // Звук мы всё равно подменяем перехватом getUserMedia. Но у контейнера нет
+    // ни одной звуковой карты, и `enumerateDevices()` возвращает пустоту —
+    // SDK решает, что микрофона нет, и не начинает подключать звук. А именно
+    // это и есть его признак входа во встречу (13-й уровень onJoinSpeed), без
+    // которого бот вечно ждёт впуска. Тот же флаг стоит у Attendee.
+    chromeArgs: ['--use-fake-device-for-media-stream'],
+  },
 };
 
 export class MeetingBot {
@@ -265,6 +277,7 @@ export class MeetingBot {
         // не попадает вовсе. Браузер бота открывает единственную страницу —
         // встречу, куда его позвали.
         '--disable-features=IsolateOrigins,site-per-process',
+        ...(platform.chromeArgs || []),
       ],
     });
     const ctx = await this.browser.newContext({ permissions: ['microphone', 'camera'], locale: 'ru-RU' });
