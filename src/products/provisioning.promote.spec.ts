@@ -174,6 +174,58 @@ describe('ProvisioningService.promoteReady', () => {
     expect(promotions(calls)[0].sql).toMatch(/provision_error\s*=\s*NULL/);
   });
 
+  it('перевод снимает и признак сна', async () => {
+    // Разбуженный продукт с надписью «не хватило токенов на аренду» в
+    // карточке — это работающий продукт, который до конца жизни объясняет,
+    // почему он не работает. Колонку переписывает только новое усыпление.
+    const { svc, calls } = makeService([site()]);
+
+    await svc.promoteReady();
+
+    expect(promotions(calls)[0].sql).toMatch(/sleep_reason\s*=\s*NULL/);
+  });
+
+  it('спящий берётся в отбор наравне с заводящимся', async () => {
+    // ДЫРА, КОТОРУЮ ЭТО ЗАКРЫВАЕТ. Отбор был только по 'provisioning', и
+    // разбуженный продукт в running не возвращался сам НИКОГДА: агент поднял
+    // контейнер, отчитался, задание закрылось — и продукт остался спящим.
+    // Аренду он не платит (списание берёт running/degraded), правок не
+    // принимает (turns.enqueue требует running), гасить его больше нечем —
+    // заданий на него нет. Контейнер живой, продукт мёртвый, ошибки нигде.
+    const { svc, calls } = makeService([site()]);
+
+    await svc.promoteReady();
+
+    for (const sql of [scan(calls).sql, promotions(calls)[0].sql]) {
+      expect(sql).toMatch(/status\s*=\s*'provisioning'\s*OR\s*\(\s*status\s*=\s*'sleeping'/);
+    }
+  });
+
+  it('спящего пускает только ПОСЛЕДНЕЕ задание — удавшееся пробуждение', async () => {
+    // Два отдельных сторожа, и оба нужны.
+    //
+    // Без условия вообще: спящий продукт, чей контейнер почему-то не погас
+    // (сон отказал, агент умер на полпути), даёт живой раннер и живой ответ —
+    // и сам возвращался бы в running, снова начиная платить аренду, которой
+    // не хватило. Продукт мигал бы между статусами с суточным периодом.
+    //
+    // Через EXISTS вместо «последнего»: `EXISTS (kind='wake' AND
+    // status='done')` истинен НАВСЕГДА после первого удачного пробуждения, и
+    // продукт, уснувший во второй раз, воскресал бы сам на ближайшем тике.
+    const { svc, calls } = makeService([site()]);
+
+    await svc.promoteReady();
+
+    for (const sql of [scan(calls).sql, promotions(calls)[0].sql]) {
+      expect(sql).toMatch(/j\.kind\s*=\s*'wake'\s+AND\s+j\.status\s*=\s*'done'/);
+      expect(sql).toMatch(/ORDER BY j\.created_at DESC[\s\S]*?LIMIT 1/);
+      expect(sql).not.toMatch(/EXISTS\s*\(\s*SELECT[\s\S]*?j\.kind\s*=\s*'wake'/);
+      // Трёхзначная логика: подзапрос без строк даёт NULL, а NULL в AND —
+      // это не «нет». Явный false вместо надежды на «сойдёт».
+      expect(sql).toMatch(/COALESCE\(\(/);
+    }
+  });
+
   it('проба идёт по публичному адресу продукта и со сроком', async () => {
     // ПУБЛИЧНЫЙ адрес, не 127.0.0.1: до петли на хосте бэкенд не дотянется, а
     // заодно ответ подтверждает, что vhost заведён и TLS работает.

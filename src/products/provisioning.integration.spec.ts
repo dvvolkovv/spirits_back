@@ -238,6 +238,15 @@ maybe('провижининг против живого Postgres', () => {
 
   type JobSeed = {
     status?: string;
+    /**
+     * Вид работы. ПО УМОЛЧАНИЮ НЕ ПЕРЕДАЁТСЯ ВОВСЕ — колонка не перечисляется
+     * в INSERT, и значение ставит DEFAULT базы. Это не экономия: единственный
+     * INSERT заведения (provisioning.service.ts) вида тоже не передаёт, и
+     * фикстура обязана воспроизводить именно его, иначе «задание без вида
+     * доезжает как заведение» проверялось бы на строке, в которую вид вписали
+     * руками.
+     */
+    kind?: 'provision' | 'sleep' | 'wake';
     createdAgo?: string;
     startedAgo?: string | null;
     finishedAgo?: string | null;
@@ -246,11 +255,16 @@ maybe('провижининг против живого Postgres', () => {
 
   async function job(productId: string, o: JobSeed = {}) {
     const id = crypto.randomUUID();
+    // Колонка kind ЛИБО перечислена, ЛИБО отсутствует в операторе — никакого
+    // COALESCE со строкой 'provision'. Подставленное умолчание доказывало бы
+    // подстановку в фикстуре, а не DEFAULT в схеме.
+    const kindCol = o.kind ? ', kind' : '';
+    const kindVal = o.kind ? ', $8' : '';
     await pool.query(
-      `INSERT INTO product_provision_jobs (id, product_id, status, error, created_at, started_at, finished_at)
+      `INSERT INTO product_provision_jobs (id, product_id, status, error, created_at, started_at, finished_at${kindCol})
        VALUES ($1, $2, $3, $4, now() - $5::interval,
                CASE WHEN $6::text IS NULL THEN NULL ELSE now() - $6::interval END,
-               CASE WHEN $7::text IS NULL THEN NULL ELSE now() - $7::interval END)`,
+               CASE WHEN $7::text IS NULL THEN NULL ELSE now() - $7::interval END${kindVal})`,
       [
         id,
         productId,
@@ -259,6 +273,7 @@ maybe('провижининг против живого Postgres', () => {
         o.createdAgo ?? '1 second',
         o.startedAgo ?? null,
         o.finishedAgo ?? null,
+        ...(o.kind ? [o.kind] : []),
       ],
     );
     return id;
@@ -315,6 +330,13 @@ maybe('провижининг против живого Postgres', () => {
       // undefined в заголовке сайта или в имени бота.
       name: 'имя claim-one',
       kind: 'bot',
+      // Вид ЗАДАНИЯ приезжает из базы. Колонка NOT NULL DEFAULT 'provision', а
+      // фикстура `job()` вида не передаёт — то есть это ещё и живая проверка
+      // того, что задание, поставленное БЕЗ вида (а других INSERT-ов у
+      // заведения нет), доезжает до агента как заведение. Мок такого не
+      // доказывает: он отдаёт ровно то, что в него положили.
+      jobKind: 'provision',
+      port: null,
       runnerToken: expect.stringMatching(/^[0-9a-f]{64}$/),
       secrets: { BOT_TOKEN: '123:abc' },
     });
@@ -324,7 +346,7 @@ maybe('провижининг против живого Postgres', () => {
     expect(after.status).toBe('running');
     expect(after.started_at).toBeInstanceOf(Date);
     // Хеш повернулся ИМЕННО у продукта выданного задания.
-    expect((await getProduct(p.id)).runner_token_hash).toBe(sha(claimed!.runnerToken));
+    expect((await getProduct(p.id)).runner_token_hash).toBe(sha(claimed!.runnerToken!));
     await expectUntouched(other);
   });
 
@@ -2345,6 +2367,316 @@ maybe('провижининг против живого Postgres', () => {
         if (!released) await holder.query('ROLLBACK').catch(() => undefined);
         holder.release();
       }
+    });
+  });
+  // ═══════════════════════════════════════════════════════════════════════
+  // ВИД ЗАДАНИЯ ДОЕЗЖАЕТ ДО АГЕНТА (задача 6)
+  //
+  // Всё в этом блоке меряется на ЖИВОМ SQL, и не для полноты. Три вещи здесь
+  // на моках не проверяются в принципе:
+  //   - `kind` есть у ОБЕИХ таблиц, и неуточнённая ссылка — ошибка
+  //     неоднозначности В РАНТАЙМЕ: мок SQL не исполняет и пропустит её;
+  //   - выдача задания сверяет статус продукта ПО ВИДУ задания, а мок отдаёт
+  //     свою строку независимо от условий;
+  //   - у сна и пробуждения CTE выпуска токена ПУСТ, и внутреннее соединение
+  //     с ним выбросило бы задание целиком — на моке этого не видно.
+  // ═══════════════════════════════════════════════════════════════════════
+  describe('вид задания', () => {
+    const asleep = (slug: string, o: { kind?: 'site' | 'bot'; seenAgo?: string | null } = {}) =>
+      product({ slug, status: 'sleeping', kind: o.kind ?? 'site', seenAgo: o.seenAgo ?? null });
+
+    it('60. задание сна выдаётся СПЯЩЕМУ продукту', async () => {
+      // ГЛАВНЫЙ СЦЕНАРИЙ БЛОКА. Прежнее условие выдачи было одно на всех —
+      // `p.status = 'provisioning'`, — а requestSleep одним оператором ставит
+      // задание и переводит продукт в 'sleeping'. Такое задание не
+      // выдавалось бы НИКОГДА: висит в очереди, one_active запирает продукт,
+      // через 10 минут его хоронит сборщик зависших. Кабинет показывает
+      // «спит», контейнер работает, аренда не платится, ошибки нет нигде.
+      const other = await bystander();
+      const p = await asleep('sleep-claim');
+      const j = await job(p.id, { kind: 'sleep' });
+
+      const claimed = await makeSvc().claimJob();
+
+      expect(claimed).not.toBeNull();
+      expect([claimed!.jobId, claimed!.jobKind, claimed!.slug]).toEqual([j, 'sleep', 'sleep-claim']);
+      expect((await getJob(j)).status).toBe('running');
+      await expectUntouched(other);
+    });
+
+    it('61. задание пробуждения выдаётся и приносит ПОРТ', async () => {
+      // Домен возвращают на тот же порт, с которого сняли. На хосте он живёт
+      // в остановленном контейнере, то есть знает его только сервер.
+      const p = await product({ slug: 'wake-claim', status: 'sleeping', port: 8007 });
+      await job(p.id, { kind: 'wake' });
+
+      const claimed = await makeSvc().claimJob();
+
+      expect([claimed!.jobKind, claimed!.port]).toEqual(['wake', 8007]);
+    });
+
+    it('62. сон и пробуждение НЕ поворачивают runner-токен', async () => {
+      // Раннер живёт ВНУТРИ контейнера: на пробуждении поднимается тот же
+      // процесс с тем же RUNNER_TOKEN в окружении. Повёрнутый хеш означал бы
+      // контейнер, который стартовал и не может аутентифицироваться, —
+      // «разбудили» в мёртвое состояние, лечится только пересозданием.
+      for (const kind of ['sleep', 'wake'] as const) {
+        await pool.query('TRUNCATE products, product_provision_jobs CASCADE');
+        const p = await asleep(`no-rotate-${kind}`);
+        const before = (await getProduct(p.id)).runner_token_hash;
+        await job(p.id, { kind });
+
+        const claimed = await makeSvc().claimJob();
+
+        expect(claimed!.jobKind).toBe(kind);
+        // Ключа нет вовсе, а не пустая строка.
+        expect('runnerToken' in claimed!).toBe(false);
+        expect((await getProduct(p.id)).runner_token_hash).toBe(before);
+      }
+    });
+
+    it('63. заведение СПЯЩЕМУ продукту не выдаётся', async () => {
+      // `status IN ('provisioning','sleeping')` вместо сверки в связке с видом
+      // выдал бы заведение уснувшему продукту: агент развернул бы каркас
+      // поверх живого каталога клиента и снёс бы его работу.
+      const p = await asleep('provision-to-sleeper');
+      await job(p.id, { kind: 'provision' });
+
+      expect(await makeSvc().claimJob()).toBeNull();
+    });
+
+    it('64. сон РАБОТАЮЩЕМУ продукту не выдаётся', async () => {
+      // Обратная половина той же связки. Сон ставится вместе с переводом в
+      // 'sleeping' одним оператором, поэтому такой строки штатно не бывает —
+      // но если она появится (правка руками, будущий код), гасить работающий
+      // продукт без пометки в базе нельзя: аренда с него продолжит списываться
+      // за погашенный контейнер.
+      const p = await product({ slug: 'sleep-to-runner', status: 'running' });
+      await job(p.id, { kind: 'sleep' });
+
+      expect(await makeSvc().claimJob()).toBeNull();
+    });
+
+    it('65. смешанная очередь разбирается с головы, и каждый вид доезжает своим', async () => {
+      // Сторож неоднозначности `kind` заодно: в запросе выдачи обе таблицы в
+      // области видимости, и неуточнённая ссылка даёт 42702 в рантайме — 500
+      // на КАЖДОМ опросе агента, то есть остановленную очередь целиком.
+      const a = await product({ slug: 'mix-prov', status: 'provisioning' });
+      const b = await asleep('mix-sleep', { kind: 'bot' });
+      const c = await asleep('mix-wake');
+      await job(a.id, { createdAgo: '3 minutes' });
+      await job(b.id, { kind: 'sleep', createdAgo: '2 minutes' });
+      await job(c.id, { kind: 'wake', createdAgo: '1 minute' });
+
+      const svc = makeSvc();
+      const got = [await svc.claimJob(), await svc.claimJob(), await svc.claimJob()];
+
+      expect(got.map((g) => [g!.slug, g!.jobKind, g!.kind])).toEqual([
+        ['mix-prov', 'provision', 'site'],
+        ['mix-sleep', 'sleep', 'bot'],
+        ['mix-wake', 'wake', 'site'],
+      ]);
+    });
+
+    it('66. отказ сна возвращает продукт в работу, а не хоронит его', async () => {
+      // Сорвавшийся сон значит, что контейнер НЕ погашен, то есть продукт
+      // работает. Безусловный 'failed' увёл бы его из 'sleeping' в статус,
+      // который не платит аренду (списание берёт running/degraded) и не
+      // усыпляется повторно (requestSleep берёт их же): бесплатный хостинг
+      // навсегда, видимый только по недосчитанной выручке. Плюс кнопка
+      // «повторить» на таком продукте ставит ЗАВЕДЕНИЕ поверх живого каталога.
+      const p = await asleep('sleep-failed');
+      await pool.query('UPDATE products SET sleep_reason = $2 WHERE id = $1', [p.id, 'нет токенов']);
+      const j = await job(p.id, { kind: 'sleep', status: 'running' });
+
+      await makeSvc().completeJob(j, { ok: false, error: 'docker stop не отработал' });
+
+      const row = await getProduct(p.id);
+      expect(row.status).toBe('degraded');
+      // Признак сна снят вместе со статусом: карточка работающего продукта не
+      // должна объяснять, что ему не хватило токенов.
+      expect(row.sleep_reason).toBeNull();
+      expect(row.provision_error).toBe('docker stop не отработал');
+      expect((await getJob(j)).status).toBe('failed');
+    });
+
+    it('67. отказ пробуждения оставляет продукт спящим', async () => {
+      // Это правда: продукт как спал, так и спит. Следующее пополнение
+      // поставит задание заново — wakeAffordable исключает только продукты с
+      // АКТИВНЫМ заданием, а это уже закрыто.
+      const p = await asleep('wake-failed');
+      await pool.query('UPDATE products SET sleep_reason = $2 WHERE id = $1', [p.id, 'нет токенов']);
+      const j = await job(p.id, { kind: 'wake', status: 'running' });
+
+      await makeSvc().completeJob(j, { ok: false, error: 'контейнер не ответил' });
+
+      const row = await getProduct(p.id);
+      expect([row.status, row.sleep_reason]).toEqual(['sleeping', 'нет токенов']);
+      expect(row.provision_error).toBe('контейнер не ответил');
+    });
+
+    it('68. отказ ЗАВЕДЕНИЯ по-прежнему хоронит продукт', async () => {
+      // Сторож на случай, если разбор по виду съест старое поведение: без
+      // 'failed' кнопка «повторить» (она требует именно его) умирает.
+      const p = await product({ slug: 'prov-failed', status: 'provisioning' });
+      const j = await job(p.id, { status: 'running' });
+
+      await makeSvc().completeJob(j, { ok: false, error: 'порт занят' });
+
+      expect((await getProduct(p.id)).status).toBe('failed');
+    });
+
+    it('69. удачный сон продукт не трогает', async () => {
+      const p = await asleep('sleep-ok');
+      const j = await job(p.id, { kind: 'sleep', status: 'running' });
+
+      await makeSvc().completeJob(j, { ok: true });
+
+      expect((await getProduct(p.id)).status).toBe('sleeping');
+      expect((await getJob(j)).status).toBe('done');
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // РАЗБУЖЕННЫЙ ВОЗВРАЩАЕТСЯ В РАБОТУ (задача 6, дыра на стыке)
+  // ═══════════════════════════════════════════════════════════════════════
+  describe('возврат разбуженного в работу', () => {
+    // Сквозной сценарий трогает баланс, а эти таблицы заводит не список
+    // миграций продуктов, и внешний beforeEach о них не знает.
+    beforeAll(ensureBillingTables);
+    beforeEach(() => pool.query('TRUNCATE ai_profiles_consolidated, token_transactions'));
+    afterAll(() => pool.query('TRUNCATE ai_profiles_consolidated, token_transactions'));
+
+    /** Спящий с живым раннером: контейнер поднят, отметка свежая. */
+    const woken = async (slug: string, o: { kind?: 'site' | 'bot' } = {}) => {
+      const p = await product({
+        slug,
+        status: 'sleeping',
+        kind: o.kind ?? 'site',
+        seenAgo: '10 seconds',
+      });
+      await pool.query('UPDATE products SET sleep_reason = $2 WHERE id = $1', [p.id, 'нет токенов']);
+      return p;
+    };
+
+    it('70. спящий с удавшимся пробуждением возвращается в running', async () => {
+      // ДЫРА НА СТЫКЕ. Без этого агент поднимал контейнер, отчитывался,
+      // задание закрывалось — и продукт оставался спящим навсегда: аренду не
+      // платит (списание берёт running/degraded), правок не принимает
+      // (turns.enqueue требует running), гасить его больше нечем — заданий
+      // нет. Контейнер живой, продукт мёртвый, ошибки нигде.
+      const p = await woken('back-to-work');
+      await job(p.id, { kind: 'wake', status: 'done', finishedAgo: '1 second' });
+
+      await expect(makeSvc().promoteReady()).resolves.toBe(1);
+
+      const row = await getProduct(p.id);
+      expect(row.status).toBe('running');
+      // Признак сна снят: иначе карточка работающего продукта до конца жизни
+      // объясняет, что ему не хватило токенов.
+      expect(row.sleep_reason).toBeNull();
+    });
+
+    it('71. просто спящий сам не просыпается, даже если отвечает', async () => {
+      // Спящий, чей контейнер почему-то не погас (сон отказал, агент умер на
+      // полпути), даёт живой раннер и живой ответ. Без условия на последнее
+      // задание он сам возвращался бы в running и снова начинал платить
+      // аренду, которой не хватило: продукт мигал бы между статусами с
+      // суточным периодом, и разобрать это можно было бы только по истории
+      // списаний.
+      const p = await woken('still-asleep');
+      await job(p.id, { kind: 'sleep', status: 'done', finishedAgo: '1 second' });
+
+      await expect(makeSvc().promoteReady()).resolves.toBe(0);
+
+      expect((await getProduct(p.id)).status).toBe('sleeping');
+    });
+
+    it('72. уснувший ПОСЛЕ пробуждения не воскресает', async () => {
+      // `EXISTS (kind='wake' AND status='done')` истинен НАВСЕГДА после
+      // первого удачного пробуждения — продукт, уснувший во второй раз,
+      // воскресал бы сам на ближайшем тике и получал бы бесплатный хостинг.
+      // Смотреть надо на ПОСЛЕДНЕЕ задание.
+      const p = await woken('asleep-again');
+      await job(p.id, { kind: 'wake', status: 'done', createdAgo: '2 hours' });
+      await job(p.id, { kind: 'sleep', status: 'done', createdAgo: '1 minute' });
+
+      await expect(makeSvc().promoteReady()).resolves.toBe(0);
+
+      expect((await getProduct(p.id)).status).toBe('sleeping');
+    });
+
+    it('73. пробуждение без ответа раннера переводом не считается', async () => {
+      // Тот же измеримый факт, что и при заведении: раннер живёт внутри
+      // контейнера. Молчит — значит контейнер не поднялся, и «разбудили» было
+      // бы тем же враньём, что «завели» без проверки.
+      const p = await product({ slug: 'wake-silent', status: 'sleeping', seenAgo: '9 days' });
+      await job(p.id, { kind: 'wake', status: 'done' });
+
+      await expect(makeSvc().promoteReady()).resolves.toBe(0);
+    });
+
+    it('74. пробуждённый сайт, который не отвечает, переводом не считается', async () => {
+      const p = await woken('wake-502');
+      await job(p.id, { kind: 'wake', status: 'done' });
+
+      const svc = makeSvc(async () => ({ status: 502 }));
+      await expect(svc.promoteReady()).resolves.toBe(0);
+
+      expect((await getProduct(p.id)).status).toBe('sleeping');
+    });
+
+    it('75. незакрытое задание пробуждения перевод не пускает', async () => {
+      // Пока задание в очереди или в работе, «отвечает» означает СТАРОЕ
+      // состояние, а не результат пробуждения. Та же защита, что у заведения.
+      const p = await woken('wake-in-flight');
+      await job(p.id, { kind: 'wake', status: 'running' });
+
+      await expect(makeSvc().promoteReady()).resolves.toBe(0);
+    });
+
+    it('76. весь путь: уснул по бедности, разбужен пополнением, снова платит', async () => {
+      // СКВОЗНОЙ СЦЕНАРИЙ КУСКА 3, от нехватки токенов до возобновлённого
+      // списания. Каждый стык здесь уже ломался по отдельности, и собранными
+      // они не проверялись ни разу.
+      const p = await due({ slug: 'full-circle' });
+      await setBalance('u-1', 10_000);
+      await pool.query(`UPDATE products SET runner_seen_at = now() WHERE id = $1`, [p.id]);
+
+      // 1. Оборот аренды: денег нет — ставится сон.
+      await rent().tick();
+      expect((await getProduct(p.id)).status).toBe('sleeping');
+      expect(await jobsOf(p.id)).toEqual(['queued']);
+
+      // 2. Агент забирает сон и отчитывается.
+      const svc = makeSvc();
+      const sleepJob = await svc.claimJob();
+      expect(sleepJob!.jobKind).toBe('sleep');
+      await svc.completeJob(sleepJob!.jobId, { ok: true });
+      expect((await getProduct(p.id)).status).toBe('sleeping');
+
+      // 3. Спящий аренду не платит и переводом не считается.
+      expect(await rent().chargeRent(p.id)).toBe(false);
+      expect(await svc.promoteReady()).toBe(0);
+
+      // 4. Пополнение ставит пробуждение.
+      await setBalance('u-1', 120_000);
+      expect(await rent().wakeAffordable('u-1')).toBe(1);
+
+      // 5. Агент будит и отчитывается; токен при этом НЕ повернулся.
+      const hashBefore = (await getProduct(p.id)).runner_token_hash;
+      const wakeJob = await svc.claimJob();
+      expect(wakeJob!.jobKind).toBe('wake');
+      expect((await getProduct(p.id)).runner_token_hash).toBe(hashBefore);
+      await svc.completeJob(wakeJob!.jobId, { ok: true });
+
+      // 6. Перевод по измеримому факту — и продукт снова платит.
+      await pool.query(`UPDATE products SET runner_seen_at = now() WHERE id = $1`, [p.id]);
+      expect(await svc.promoteReady()).toBe(1);
+      const row = await getProduct(p.id);
+      expect([row.status, row.sleep_reason]).toEqual(['running', null]);
+      expect(await rent().chargeRent(p.id)).toBe(true);
+      expect(await balanceOf('u-1')).toBe(70_000);
     });
   });
 });

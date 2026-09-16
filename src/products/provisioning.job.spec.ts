@@ -15,6 +15,14 @@ const ROW = {
   // перестановка с слагом на одинаковых значениях была бы невидима.
   name: 'Селянська',
   kind: 'site',
+  // Вид ЗАДАНИЯ, а не продукта: `kind` теперь есть у обеих таблиц, и значения
+  // взяты разные ('site' против 'provision') ровно затем, чтобы перепутанные
+  // местами колонки не проходили зелёными.
+  job_kind: 'provision',
+  port: null,
+  // Признак «токен выпущен» приезжает ИЗ БАЗЫ (i.id IS NOT NULL), а не
+  // выводится в коде из вида задания.
+  token_issued: true,
   box: Buffer.from('коробка'),
 };
 
@@ -205,7 +213,7 @@ describe('ProvisioningService.claimJob', () => {
     await svc.claimJob();
 
     expect(calls[0].sql).toMatch(
-      /UPDATE products\s+SET runner_token_hash = \$1\s+WHERE id IN \(SELECT product_id FROM claimed\)/,
+      /UPDATE products\s+SET runner_token_hash = \$1\s+WHERE id IN \(SELECT c\.product_id FROM claimed c WHERE c\.kind = 'provision'\)/,
     );
   });
 
@@ -216,8 +224,13 @@ describe('ProvisioningService.claimJob', () => {
     // secrets_encrypted, row.box становится undefined — и бот уезжает в
     // контейнер БЕЗ ТОКЕНА, молча, с успешным заведением.
     //
-    // `i.slug AS slug` избыточен синтаксически и намеренно оставлен: алиас
-    // выписан у всех пяти полей, чтобы сторож был однородным.
+    // `p.slug AS slug` избыточен синтаксически и намеренно оставлен: алиас
+    // выписан у всех полей, чтобы сторож был однородным.
+    //
+    // ДВА `kind` В ОДНОМ ЗАПРОСЕ. У задания это вид работы, у продукта —
+    // форма. Без разных алиасов (`c.kind AS job_kind` против `p.kind AS kind`)
+    // одно значение затирало бы другое в строке результата, и агент получал бы
+    // 'site' там, где ждёт 'provision'.
     const { svc, calls } = makeService();
 
     await svc.claimJob();
@@ -225,10 +238,14 @@ describe('ProvisioningService.claimJob', () => {
     const sql = calls[0].sql;
     expect(sql).toMatch(/secrets_encrypted AS box/);
     expect(sql).toMatch(/c\.id AS job_id/);
-    expect(sql).toMatch(/i\.id AS product_id/);
-    expect(sql).toMatch(/i\.slug AS slug/);
-    expect(sql).toMatch(/i\.kind AS kind/);
-    expect(sql).toMatch(/i\.box AS box/);
+    expect(sql).toMatch(/c\.kind AS job_kind/);
+    expect(sql).toMatch(/p\.id AS product_id/);
+    expect(sql).toMatch(/p\.slug AS slug/);
+    expect(sql).toMatch(/p\.name AS name/);
+    expect(sql).toMatch(/p\.kind AS kind/);
+    expect(sql).toMatch(/p\.port AS port/);
+    expect(sql).toMatch(/p\.secrets_encrypted AS box/);
+    expect(sql).toMatch(/\(i\.id IS NOT NULL\) AS token_issued/);
   });
 
   it('токен берётся из 32 случайных байт, а не выводится из данных задания', async () => {
@@ -311,6 +328,8 @@ describe('ProvisioningService.claimJob', () => {
       slug: 's',
       name: 'Селянська',
       kind: 'site',
+      jobKind: 'provision',
+      port: null,
       runnerToken: expect.stringMatching(/^[0-9a-f]{64}$/),
       secrets: { BOT_TOKEN: 'т' },
     });
@@ -326,10 +345,12 @@ describe('ProvisioningService.claimJob', () => {
     const job = await svc.claimJob();
 
     expect(job!.name).toBe('Селянська');
-    // Колонка обязана быть и в RETURNING правки продукта, и в финальной
-    // выборке: без первого её неоткуда взять, без второго она не доедет.
-    expect(calls[0].sql).toMatch(/RETURNING id, slug, name, kind/);
-    expect(calls[0].sql).toMatch(/i\.name AS name/);
+    // Поля продукта берутся ПРЯМО ИЗ products, а не из RETURNING правки
+    // токена: у сна и пробуждения токен не выпускается, тот CTE пуст, и
+    // внутреннее соединение с ним выбросило бы задание целиком — агент
+    // получил бы `{ job: null }` при непустой очереди.
+    expect(calls[0].sql).toMatch(/JOIN products p ON p\.id = c\.product_id/);
+    expect(calls[0].sql).toMatch(/p\.name AS name/);
   });
 
   it('продукт без секретов не роняет выдачу задания', async () => {
@@ -342,6 +363,111 @@ describe('ProvisioningService.claimJob', () => {
 
     expect(job!.secrets).toEqual({});
     expect(secrets.decrypt).not.toHaveBeenCalled();
+  });
+});
+
+describe('claimJob: вид задания', () => {
+  it('вид доезжает до агента', async () => {
+    // Без вида агент разворачивает продукт заново на задании «усыпить»:
+    // каталог занят, отказ, и владелец читает про занятый каталог вместо сна.
+    const { svc } = makeService({
+      claim: [{ ...ROW, job_kind: 'sleep', token_issued: false, port: 8003 }],
+    });
+
+    const job = await svc.claimJob();
+
+    expect(job!.jobKind).toBe('sleep');
+  });
+
+  it('вид ЗАДАНИЯ не подменяется формой ПРОДУКТА', async () => {
+    // `kind` есть у обеих таблиц. Неуточнённая ссылка (или потерянный алиас)
+    // кладёт в одно поле значение другого: агент получает 'site' там, где
+    // ждёт вид работы, и уезжает в ветку неизвестного вида на каждом задании.
+    const { svc } = makeService({
+      claim: [{ ...ROW, kind: 'bot', job_kind: 'wake', token_issued: false }],
+    });
+
+    const job = await svc.claimJob();
+
+    expect([job!.kind, job!.jobKind]).toEqual(['bot', 'wake']);
+  });
+
+  it('сон и пробуждение выдаются СПЯЩЕМУ, заведение — заводящемуся', async () => {
+    // ТУПИК, КОТОРЫЙ ЭТО ЗАКРЫВАЕТ. Прежнее условие было одно на всех —
+    // `p.status = 'provisioning'`, — а сон и пробуждение ставятся продукту в
+    // 'sleeping'. Такое задание не выдавалось бы НИКОГДА: висит в очереди,
+    // one_active запирает продукт, через 10 минут его хоронит сборщик
+    // зависших. Кабинет при этом показывает «спит», контейнер работает,
+    // аренда не платится, ошибки нет нигде.
+    //
+    // Условие сверяется В СВЯЗКЕ с видом, а не списком статусов: `status IN
+    // ('provisioning','sleeping')` выдал бы ЗАВЕДЕНИЕ спящему продукту, то
+    // есть развернул бы каркас поверх живого каталога клиента.
+    const { svc, calls } = makeService();
+
+    await svc.claimJob();
+
+    expect(calls[0].sql).toMatch(
+      /CASE j\.kind\s+WHEN 'provision' THEN p\.status = 'provisioning'\s+ELSE p\.status = 'sleeping'\s+END/,
+    );
+  });
+
+  it('на сне и пробуждении токен НЕ выпускается', async () => {
+    // Раннер живёт ВНУТРИ контейнера. На пробуждении поднимается тот же
+    // процесс с тем же RUNNER_TOKEN в окружении, и повёрнутый хеш означал бы
+    // контейнер, который стартовал и не может аутентифицироваться: «разбудили»
+    // в мёртвое состояние, лечится только пересозданием.
+    const { svc } = makeService({
+      claim: [{ ...ROW, job_kind: 'wake', token_issued: false }],
+    });
+
+    const job = await svc.claimJob();
+
+    // Ключа НЕТ, а не пустая строка: пустая строка — это третье состояние,
+    // которое дальше по коду читается как «токен есть, но пустой».
+    expect('runnerToken' in job!).toBe(false);
+  });
+
+  it('признак выпуска берётся из базы, а не выводится из вида в коде', async () => {
+    // Условие выпуска живёт в SQL (`WHERE c.kind = 'provision'`). Повтор этого
+    // условия в TypeScript дал бы два места, которые обязаны совпадать, и
+    // разъехались бы они молча: агент получил бы токен, которого в базе нет.
+    // Здесь вид «заведение», а база говорит «не выпускали» — верить надо базе.
+    const { svc } = makeService({ claim: [{ ...ROW, token_issued: false }] });
+
+    expect('runnerToken' in (await svc.claimJob())!).toBe(false);
+  });
+
+  it('сну и пробуждению секреты не расшифровываются', async () => {
+    // Контейнер уже собран, переменные окружения в нём. Расшифровка здесь
+    // гоняла бы секреты клиента по сети на каждое усыпление ни за чем.
+    const { svc, secrets } = makeService({
+      claim: [{ ...ROW, job_kind: 'sleep', token_issued: false }],
+    });
+
+    const job = await svc.claimJob();
+
+    expect(job!.secrets).toEqual({});
+    expect(secrets.decrypt).not.toHaveBeenCalled();
+  });
+
+  it('порт продукта уезжает агенту: пробуждать некуда без него', async () => {
+    // Домен возвращают на ТОТ ЖЕ порт, с которого сняли. Знает его только
+    // сервер: на хосте порт живёт в остановленном контейнере.
+    const { svc } = makeService({
+      claim: [{ ...ROW, job_kind: 'wake', token_issued: false, port: 8007 }],
+    });
+
+    expect((await svc.claimJob())!.port).toBe(8007);
+  });
+
+  it('у заведения порта нет, и это NULL, а не ноль', async () => {
+    // Порт при заведении ВЫБИРАЕТ агент. `Number(null)` — это 0, то есть
+    // «порт ноль»: наивное приведение превратило бы «порта нет» в законное
+    // значение, и wakeProduct пошёл бы ждать ответа на порту 0.
+    const { svc } = makeService();
+
+    expect((await svc.claimJob())!.port).toBeNull();
   });
 });
 
@@ -359,7 +485,9 @@ describe('claimJob: живой роундтрип через настоящий 
     const box = secrets.encrypt({ BOT_TOKEN: '123:abc' }, 'p-1');
     const { svc } = makeService({
       secrets,
-      claim: [{ job_id: 'j-1', product_id: 'p-1', slug: 's', kind: 'bot', box }],
+      claim: [
+        { job_id: 'j-1', product_id: 'p-1', slug: 's', kind: 'bot', job_kind: 'provision', box },
+      ],
     });
 
     const job = await svc.claimJob();
@@ -513,10 +641,43 @@ describe('ProvisioningService.completeJob', () => {
     // в 'running' и навсегда заняло бы product_provision_jobs_one_active.
     // После свёртки в один оператор склейка обесценилась окончательно.
     expect(productPart(calls)).toContain('provision_error');
-    expect(productPart(calls)).toContain("status = 'failed'");
+    // 'failed' ставится ТОЛЬКО заведению: со сном и пробуждением статус
+    // разный, поэтому он считается по виду задания, а не вписан константой.
+    expect(productPart(calls)).toMatch(/WHEN 'provision' THEN 'failed'/);
     expect(jobPart(calls)).toContain("status = 'failed'");
     expect(jobPart(calls)).toContain('finished_at');
     expect(find(calls, 'UPDATE products').params).toEqual(['j-1', 'порт занят']);
+  });
+
+  it('статус на отказе считается по виду задания, а не вписан константой', async () => {
+    // ДЫРА, КОТОРУЮ ЭТО ЗАКРЫВАЕТ. Безусловный 'failed' был верен, пока вид
+    // задания был один. Со сном он ломает три вещи сразу:
+    //
+    //   - сорвавшийся СОН значит «контейнер НЕ погашен», то есть продукт
+    //     работает. 'failed' увёл бы его из 'sleeping' в статус, который не
+    //     платит аренду (списание берёт running/degraded) и не усыпляется
+    //     повторно (requestSleep берёт их же) — бесплатный хостинг навсегда,
+    //     видимый только по недосчитанной выручке. Плюс кнопка «повторить»
+    //     на таком продукте ставит ЗАВЕДЕНИЕ поверх живого каталога клиента;
+    //   - сорвавшееся ПРОБУЖДЕНИЕ обязано оставить 'sleeping': продукт как
+    //     спал, так и спит, и следующее пополнение поставит задание заново;
+    //   - признак сна обязан сниматься вместе со статусом, иначе карточка
+    //     работающего продукта объясняет, что ему не хватило токенов.
+    const { svc, calls } = makeService();
+
+    await svc.completeJob('j-1', { ok: false, error: 'docker stop не отработал' });
+
+    const product = productPart(calls);
+    expect(product).toMatch(/WHEN 'provision' THEN 'failed'/);
+    expect(product).toMatch(/WHEN 'sleep' THEN 'degraded'/);
+    // У пробуждения своей ветки НЕТ — оно попадает в ELSE и сохраняет
+    // собственный статус. Явная ветка 'wake' здесь была бы лишним местом,
+    // которое обязано совпадать со словарём видов.
+    expect(product).toMatch(/ELSE products\.status/);
+    expect(product).toMatch(/sleep_reason = CASE closed\.kind\s+WHEN 'sleep' THEN NULL/);
+    // Вид берётся из ЗАКРЫТОГО задания, а не отдельным подзапросом: иначе
+    // повторный отчёт снова правил бы живой продукт.
+    expect(jobPart(calls)).toMatch(/RETURNING\s+product_id,\s*kind/);
   });
 
   it('причина отказа ложится в jobs.error, а не в соседнюю колонку', async () => {

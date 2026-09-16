@@ -22,6 +22,14 @@ export interface CreateInput {
 }
 
 /**
+ * Что агенту делать с продуктом. Словарь тот же, что в CHECK колонки
+ * `product_provision_jobs.kind` (004_rent.sql): разойдутся — сервер начнёт
+ * отдавать вид, которого агент не знает, и получит честный отказ на каждом
+ * задании.
+ */
+export type JobKind = 'provision' | 'sleep' | 'wake';
+
+/**
  * Задание, выданное агенту хоста. Единственное место, где открытый
  * runner-токен вообще существует: агенту он отдаётся один раз, в теле ответа.
  */
@@ -35,7 +43,36 @@ export interface ClaimedJob {
   // undefined в каркасе виден только глазами, уже на готовом продукте.
   name: string;
   kind: ProductKind;
-  runnerToken: string;
+  /**
+   * Вид работы. БЕЗ него агент разворачивает продукт заново на задании
+   * «усыпить»: упирается в занятый каталог, и владелец читает про каталог
+   * вместо сна.
+   *
+   * Поле обязательное, хотя колонка в базе имеет DEFAULT: значение берётся из
+   * строки задания, а не подставляется здесь. Подстановка `?? 'provision'` в
+   * коде была бы мёртвой (колонка NOT NULL DEFAULT 'provision') и при этом
+   * прятала бы настоящую поломку — потерянный алиас в SELECT.
+   */
+  jobKind: JobKind;
+  /**
+   * Порт продукта, как он записан в базе. Нужен ПРОБУЖДЕНИЮ: домен возвращают
+   * на тот же порт, с которого его сняли, а знает его только сервер.
+   *
+   * У заведения он NULL и обязан быть NULL: порт там ВЫБИРАЕТ агент (первый
+   * свободный на хосте) и присылает его обратно в отчёте.
+   */
+  port: number | null;
+  /**
+   * Открытый runner-токен. Есть ТОЛЬКО у заведения — и ключа нет вовсе, а не
+   * пустая строка, когда его не выпускали.
+   *
+   * Сон и пробуждение токен не поворачивают: раннер живёт ВНУТРИ контейнера, и
+   * после пробуждения тот же процесс обязан продолжить работать со старым
+   * токеном. Повёрнутый на пробуждении хеш означал бы контейнер, который
+   * поднялся и не может аутентифицироваться, — то есть продукт, который
+   * «разбудили» в мёртвое состояние.
+   */
+  runnerToken?: string;
   secrets: Record<string, string>;
 }
 
@@ -149,6 +186,38 @@ const HEARTBEAT_FRESH_SQL = `interval '${HEARTBEAT_FRESH_MS / 1000} seconds'`;
 // и turns.markProgress, и держаться оно обязано заметно ниже
 // HEARTBEAT_FRESH_MS — иначе живой агент протухает между двумя записями.
 const HOST_TOUCH_GAP_SQL = `interval '30 seconds'`;
+
+/**
+ * «Продукт просили разбудить, и агент доложил, что разбудил». Предикат по
+ * строке `products`, скоррелированный по `products.id`.
+ *
+ * Зачем он вообще нужен. `promoteReady` переводит в `running` по ИЗМЕРИМОМУ
+ * ФАКТУ — раннер на связи плюс публичный 200 — и брать статус `sleeping` в
+ * отбор без этого условия нельзя: спящий продукт, чей контейнер почему-то не
+ * погас (сон отказал, агент умер на полпути), тоже даёт живой раннер и живой
+ * ответ. Без предиката он самовольно возвращался бы в `running` и снова
+ * начинал платить аренду, которой не хватило, — продукт мигал бы между
+ * статусами с суточным периодом, и разобрать это можно было бы только по
+ * истории списаний.
+ *
+ * ПОСЛЕДНЕЕ задание, а не «было когда-нибудь». `EXISTS (… kind='wake' AND
+ * status='done')` истинен НАВСЕГДА после первого удачного пробуждения: продукт,
+ * уснувший во второй раз, немедленно воскресал бы сам. Здесь берётся ровно
+ * одна строка — самая свежая, — и она обязана быть удавшимся пробуждением.
+ *
+ * `COALESCE(…, false)`: у продукта может не быть ни одного задания (спящих
+ * таких не бывает, но подзапрос без строк даёт NULL, а NULL в AND — это не
+ * «нет»). Явный false вместо трёхзначной логики.
+ *
+ * `j.` перед каждой ссылкой — не стиль: `kind` есть и у products, и у
+ * product_provision_jobs, и обе таблицы здесь в области видимости.
+ */
+const WOKEN_SQL = `COALESCE((
+          SELECT j.kind = 'wake' AND j.status = 'done'
+            FROM product_provision_jobs j
+           WHERE j.product_id = products.id
+           ORDER BY j.created_at DESC, j.id DESC
+           LIMIT 1), false)`;
 
 /**
  * ГОНКИ В ЭТОМ ФАЙЛЕ ЗАКРЫВАЕТ ФОРМА ЗАПРОСОВ, А НЕ МОДУЛЬ.
@@ -404,6 +473,44 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    * identity.resolveOrCreate) падение второго оставляло бы задание в
    * 'running' с токеном, не доехавшим до агента, а частичный индекс
    * one_active запирал бы продукт до сборщика зависших.
+   *
+   * ## СТАТУС ПРОДУКТА СВЕРЯЕТСЯ ПО ВИДУ ЗАДАНИЯ
+   *
+   * Прежнее условие было одно на всех: `p.status = 'provisioning'`. Со сном
+   * это ТУПИК, и молчаливый. `requestSleep` одним оператором ставит задание и
+   * переводит продукт в `sleeping`; `wakeAffordable` ставит задание спящему.
+   * Ни в одном из двух случаев продукт не бывает в `provisioning` — значит
+   * выдача не находила бы такое задание НИКОГДА. Задание висит в очереди,
+   * частичный индекс one_active запирает продукт, через 10 минут его хоронит
+   * сборщик зависших, и всё это без единой строки о причине: кабинет
+   * показывает «спит», контейнер работает, аренда не платится.
+   *
+   * Поэтому вид задания и требуемый статус продукта проверяются ВМЕСТЕ, одним
+   * CASE: заведение забирают у `provisioning`, сон и пробуждение — у
+   * `sleeping`. Разделять на `status IN ('provisioning','sleeping')` нельзя:
+   * это выдало бы заведение спящему продукту (повтор поверх уснувшего снёс бы
+   * его каталог) и сон — заводящемуся.
+   *
+   * ## ТОКЕН ПОВОРАЧИВАЕТСЯ ТОЛЬКО НА ЗАВЕДЕНИИ
+   *
+   * `issued` берёт только `kind = 'provision'`. Раннер живёт ВНУТРИ
+   * контейнера: на пробуждении поднимается тот же процесс с тем же
+   * `RUNNER_TOKEN` в окружении, и повёрнутый хеш означал бы контейнер,
+   * который стартовал и не может аутентифицироваться. Снаружи это выглядит
+   * как «разбудили, а правки не принимает», и чинится только пересозданием.
+   *
+   * Из-за этого продукт больше нельзя читать из `issued`: у сна и пробуждения
+   * этот CTE пуст, и внутреннее соединение выбросило бы задание целиком —
+   * агент получил бы `{ job: null }` при непустой очереди. Поля берутся прямо
+   * из `products` (тот же снимок, `issued` их не меняет), а факт выпуска — из
+   * LEFT JOIN по `issued`.
+   *
+   * ## kind ЕСТЬ У ОБЕИХ ТАБЛИЦ
+   *
+   * У продукта это форма (сайт или бот), у задания — вид работы. В этом
+   * запросе обе таблицы в области видимости, поэтому каждая ссылка уточнена
+   * префиксом: неуточнённое `kind` здесь — ошибка неоднозначности в рантайме,
+   * то есть 500 на каждом опросе агента.
    */
   async claimJob(): Promise<ClaimedJob | null> {
     // Токен считается ДО запроса, чтобы всё уместилось в один оператор. Если
@@ -420,8 +527,11 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
            WHERE j.status = 'queued'
              AND EXISTS (SELECT 1 FROM products p
                           WHERE p.id = j.product_id
-                            AND p.status = 'provisioning'
-                            AND p.archived_at IS NULL)
+                            AND p.archived_at IS NULL
+                            AND CASE j.kind
+                                  WHEN 'provision' THEN p.status = 'provisioning'
+                                  ELSE p.status = 'sleeping'
+                                END)
            ORDER BY j.created_at ASC
              FOR UPDATE SKIP LOCKED
            LIMIT 1
@@ -429,34 +539,51 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
           UPDATE product_provision_jobs
              SET status = 'running', started_at = now()
            WHERE id IN (SELECT id FROM picked)
-          RETURNING id, product_id
+          RETURNING id, product_id, kind
        ), issued AS (
           UPDATE products
              SET runner_token_hash = $1
-           WHERE id IN (SELECT product_id FROM claimed)
-          RETURNING id, slug, name, kind, secrets_encrypted AS box
+           WHERE id IN (SELECT c.product_id FROM claimed c WHERE c.kind = 'provision')
+          RETURNING id
        )
-       SELECT c.id AS job_id, i.id AS product_id, i.slug AS slug,
-              i.name AS name, i.kind AS kind, i.box AS box
-         FROM claimed c JOIN issued i ON i.id = c.product_id`,
+       SELECT c.id AS job_id, c.kind AS job_kind, p.id AS product_id, p.slug AS slug,
+              p.name AS name, p.kind AS kind, p.port AS port, p.secrets_encrypted AS box,
+              (i.id IS NOT NULL) AS token_issued
+         FROM claimed c
+         JOIN products p ON p.id = c.product_id
+         LEFT JOIN issued i ON i.id = c.product_id`,
       [hash],
     );
     // Пустая очередь — обычное состояние: агент опрашивает нас в цикле.
     const row = r.rows[0];
     if (!row) return null;
 
+    const jobKind = row.job_kind as JobKind;
     return {
       jobId: row.job_id,
       productId: row.product_id,
       slug: row.slug,
       name: row.name,
       kind: row.kind,
-      runnerToken,
+      jobKind,
+      // Число, а не строка: `port` в PostgreSQL integer, драйвер отдаёт его
+      // числом, но Number(null) — это 0, и «порта нет» превратилось бы в
+      // «порт ноль».
+      port: row.port === null || row.port === undefined ? null : Number(row.port),
+      // Ключ КЛАДЁТСЯ ТОЛЬКО когда токен действительно выпущен, и признак
+      // берётся из базы (`token_issued`), а не из вида задания. Судить по
+      // виду значило бы обещать токен, которого могло не оказаться: условие
+      // выпуска живёт в SQL, и разъехаться эти два места обязаны молча.
+      ...(row.token_issued ? { runnerToken } : {}),
       // ДВА аргумента: коробка привязана к продукту через AAD. Признак
       // «секретов нет» — NULL в secrets_encrypted (задача 3 кладёт именно
       // его, а не коробку от {}), и читаться он обязан ДО вызова: decrypt на
       // null — сырой TypeError.
-      secrets: row.box ? this.secrets.decrypt(row.box, row.product_id) : {},
+      //
+      // Сну и пробуждению секреты не нужны вовсе: контейнер уже собран, и
+      // переменные окружения в нём. Расшифровывать их здесь значило бы гонять
+      // секреты клиента по сети на каждое усыпление ни за чем.
+      secrets: jobKind === 'provision' && row.box ? this.secrets.decrypt(row.box, row.product_id) : {},
     };
   }
 
@@ -524,14 +651,45 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     }
     // Порт здесь не трогается намеренно: неудачная ПОВТОРНАЯ попытка снесла бы
     // порт уже работавшего продукта, а хранится он только тут.
+    //
+    // СТАТУС ЗАВИСИТ ОТ ВИДА ЗАДАНИЯ, и безусловный 'failed' здесь был дырой:
+    //
+    //   - сорвавшееся ЗАВЕДЕНИЕ — это 'failed', как и было: продукта нет,
+    //     кнопка «повторить» требует именно этого статуса;
+    //   - сорвавшийся СОН значит, что контейнер НЕ погашен, то есть продукт
+    //     по-прежнему работает. 'failed' увёл бы его из 'sleeping' в статус,
+    //     который не платит аренду и не усыпляется повторно (requestSleep
+    //     берёт только running/degraded) — бесплатный хостинг навсегда, и
+    //     кнопка «повторить» на таком продукте поставила бы ЗАВЕДЕНИЕ поверх
+    //     живого каталога. Поэтому 'degraded': продукт работает, но с ним
+    //     что-то не так, ближайший оборот аренды попробует усыпить снова, а
+    //     причина видна в карточке. Признак сна снимается вместе со статусом —
+    //     иначе карточка показывала бы «не хватило токенов» у работающего;
+    //   - сорвавшееся ПРОБУЖДЕНИЕ оставляет 'sleeping', потому что это правда:
+    //     продукт как спал, так и спит. Следующее пополнение поставит задание
+    //     заново (wakeAffordable исключает только продукты с АКТИВНЫМ
+    //     заданием, а это уже закрыто).
+    //
+    // Причина пишется в карточку во всех трёх случаях: отказ, о котором никто
+    // не узнал, — худший из исходов.
     const r = await this.pg.query(
       `WITH closed AS (
           UPDATE product_provision_jobs
              SET status = 'failed', error = $2, finished_at = now()
            WHERE id = $1 AND status = 'running'
-          RETURNING product_id
+          RETURNING product_id, kind
        )
-       UPDATE products SET status = 'failed', provision_error = $2
+       UPDATE products
+          SET status = CASE closed.kind
+                         WHEN 'provision' THEN 'failed'
+                         WHEN 'sleep' THEN 'degraded'
+                         ELSE products.status
+                       END,
+              sleep_reason = CASE closed.kind
+                               WHEN 'sleep' THEN NULL
+                               ELSE products.sleep_reason
+                             END,
+              provision_error = $2
          FROM closed WHERE products.id = closed.product_id`,
       [jobId, result.error ?? 'без причины'],
     );
@@ -606,6 +764,30 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    * отчёт агента: completeJob намеренно не трогает статус продукта, потому
    * что «я развернул» и «оно отвечает» — разные утверждения, и расходились
    * они у нас уже дважды.
+   *
+   * ## РАЗБУЖЕННЫЙ ВОЗВРАЩАЕТСЯ В РАБОТУ ЗДЕСЬ ЖЕ, И ЭТО НЕ СЛУЧАЙНОЕ МЕСТО
+   *
+   * `sleeping` был тупиком ТОЙ ЖЕ ФОРМЫ, что `provisioning` и `degraded` до
+   * него: агент поднимал контейнер, отчитывался об успехе, задание
+   * закрывалось — и продукт оставался спящим. Аренду он не платит (списание
+   * берёт только running/degraded), правок не принимает (turns.enqueue
+   * требует running), гасить его больше нечем: заданий нет. Контейнер живой,
+   * продукт мёртвый, ошибки нигде.
+   *
+   * Чинить это в `completeJob` было НЕЛЬЗЯ. Там отчёт агента — «я запустил
+   * контейнер», а не «продукт отвечает»; ровно это различение решение спеки
+   * куска 2 и запрещает смешивать, и на нём уже дважды находились дефекты.
+   * Контейнер после `docker start` поднимается не мгновенно и может не
+   * подняться вовсе.
+   *
+   * Поэтому перевод остался ОДИН, здесь, и по тем же двум измеримым фактам:
+   * раннер на связи (он живёт внутри контейнера — молчит, значит контейнер не
+   * поднялся) плюс публичный 200 для сайта. Разница только в том, КОГО
+   * пускают в отбор: к `provisioning` добавился `sleeping`, у которого
+   * последнее задание — удавшееся пробуждение (см. WOKEN_SQL).
+   *
+   * `sleep_reason` снимается вместе со статусом. Иначе карточка работающего
+   * продукта до конца жизни объясняет, что ему не хватило токенов.
    */
   async promoteReady(): Promise<number> {
     // NOT EXISTS — не осторожность, а замок. Измерено на PostgreSQL 16
@@ -631,8 +813,10 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     // агент отчитался -> задание закрыто -> ближайший тик увидел heartbeat и
     // ответ -> перевод.
     const r = await this.pg.query(
-      `SELECT id, slug, kind, runner_seen_at FROM products
-        WHERE status = 'provisioning' AND archived_at IS NULL
+      `SELECT products.id, products.slug, products.kind, products.runner_seen_at
+         FROM products
+        WHERE archived_at IS NULL
+          AND (status = 'provisioning' OR (status = 'sleeping' AND ${WOKEN_SQL}))
           AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
                            WHERE j.product_id = products.id
                              AND j.status IN ('queued','running'))`,
@@ -665,8 +849,10 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
         // Разложи её на «прочитать — подумать — записать», и повторённые
         // условия станут такой же декорацией, какой были условия выборки.
         const w = await this.pg.query(
-          `UPDATE products SET status = 'running', provision_error = NULL
-            WHERE id = $1 AND status = 'provisioning' AND archived_at IS NULL
+          `UPDATE products
+              SET status = 'running', provision_error = NULL, sleep_reason = NULL
+            WHERE id = $1 AND archived_at IS NULL
+              AND (status = 'provisioning' OR (status = 'sleeping' AND ${WOKEN_SQL}))
               AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
                                WHERE j.product_id = products.id
                                  AND j.status IN ('queued','running'))`,
