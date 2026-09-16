@@ -8,7 +8,7 @@ import {
   type RemoteTrack,
   type Room,
 } from '@livekit/rtc-node';
-import { ReadableStream } from 'node:stream/web';
+import { ReadableStream, TransformStream } from 'node:stream/web';
 import { createWriteStream } from 'node:fs';
 import { Mixer, TICK_MS } from './mixer.js';
 
@@ -58,6 +58,8 @@ export class MixedRoomAudioInput extends voice.AudioInput {
   /** Сколько кадров реально пришло от участников — для диагностики. */
   private framesIn = 0;
   private ticks = 0;
+  /** Сколько кадров у нас реально забрала сессия. */
+  private framesTaken = 0;
   /** Очередь кадров к сессии. Нужна только ради `desiredSize` в логе. */
   private queue: ReadableStreamDefaultController<AudioFrame> | null = null;
   /**
@@ -106,7 +108,25 @@ export class MixedRoomAudioInput extends voice.AudioInput {
         };
       },
     });
-    this.multiStream.addInputStream(source);
+    /**
+     * Счётчик на границе «мы отдали — SDK забрал».
+     *
+     * Внутрь потока встроен проходной этап: его `transform` вызывается ровно
+     * тогда, когда потребитель вытягивает кадр. Сравнение с числом тиков
+     * отвечает на вопрос, который иначе не закрыть: доходят ли наши кадры до
+     * сессии вообще. 16.09.2026 стенд показал, что один и тот же звук в
+     * отдельной сессии даёт 7 реплик, а в живой — 2, при исправном тракте до
+     * самого входа.
+     */
+    const counted = source.pipeThrough(
+      new TransformStream<AudioFrame, AudioFrame>({
+        transform: (frame, controller) => {
+          this.framesTaken++;
+          controller.enqueue(frame);
+        },
+      }),
+    );
+    this.multiStream.addInputStream(counted);
 
     // ПОДПИСЫВАЕМСЯ САМИ — вот это и было главной поломкой.
     //
@@ -220,7 +240,7 @@ export class MixedRoomAudioInput extends voice.AudioInput {
         const behind = this.queue ? Math.max(0, -(this.queue.desiredSize ?? 0)) : 0;
         console.log(
           `[вход] тиков: ${this.ticks}, кадров от участников: ${this.framesIn}, ` +
-          `очередь к модели: ${behind}, отставание тиков: ${Math.max(0, Math.floor((Date.now() - startedAt) / TICK_MS) - emitted)} — ${per}`,
+          `забрала сессия: ${this.framesTaken}, очередь к модели: ${behind}, отставание тиков: ${Math.max(0, Math.floor((Date.now() - startedAt) / TICK_MS) - emitted)} — ${per}`,
         );
       }
     };
