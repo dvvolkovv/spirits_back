@@ -169,7 +169,11 @@ const START_SCRIPT_RE = /^[A-Za-z0-9._/-]+$/;
 /** Порт внутри контейнера. Снаружи он публикуется только у сайта. */
 const CONTAINER_PORT = 3000;
 
-const DEFAULTS = {
+// Экспортируется ради sleep.ts: имя программы vhost и срок ожидания порта
+// обязаны быть ОДНИ на заведение и на пробуждение. Две копии однажды
+// разошлись бы, и пробуждение звало бы не тот скрипт (или ждало не столько),
+// оставаясь при этом зелёным в обеих батареях.
+export const DEFAULTS = {
   productsDir: '/srv/products',
   image: 'linkeon-product:base',
   linkeonUrl: 'https://my.linkeon.io',
