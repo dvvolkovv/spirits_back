@@ -1,6 +1,9 @@
 import { chromium } from 'playwright';
 import WebSocket from 'ws';
 import { TELEMOST_PAYLOAD, TELEMOST_JOIN } from './payload/telemost.mjs';
+import { ZOOM_PAYLOAD } from './payload/zoom.mjs';
+import { zoomPageOrigin, zoomPageUrl } from './zoom-page.mjs';
+import { signZoomJoin, parseZoomUrl } from './zoom-jwt.mjs';
 import { event, send as sendWebhook } from './webhooks.mjs';
 
 /**
@@ -24,8 +27,17 @@ const JOIN_SETTLE_MS = Number(process.env.BOT_JOIN_SETTLE_MS || 2_500);
 /** Сколько ждём впуска из комнаты ожидания, прежде чем сдаться с причиной. */
 const ADMIT_TIMEOUT_MS = Number(process.env.BOT_ADMIT_TIMEOUT_MS || 900_000);
 
+/**
+ * Площадки и способ входа.
+ *
+ * Их ровно два, и разница принципиальная. В Телемост бот заходит как человек —
+ * глазами по вёрстке, потому что другого входа нет. У Zoom есть официальный
+ * Meeting SDK: там мы открываем СВОЮ страницу и зовём его API, а вёрстку не
+ * трогаем вовсе.
+ */
 const PLATFORMS = {
   telemost: { payload: TELEMOST_PAYLOAD, join: TELEMOST_JOIN, name: 'Телемост' },
+  zoom: { payload: ZOOM_PAYLOAD, name: 'Zoom', viaSdk: true },
 };
 
 export class MeetingBot {
@@ -36,9 +48,11 @@ export class MeetingBot {
     this.page = null;
     this.ws = null;
     this.chatAuthors = new Map();
-    /** Людей во встрече ПО ПОДТВЕРЖДЁННЫМ событиям, а не по площадке. */
-    this.humans = 0;
+    /** Кто во встрече ПО ПОДТВЕРЖДЁННЫМ событиям, а не по площадке: uuid → имя. */
+    this.people = new Map();
     this.syncing = false;
+    /** Разрешается, когда мы действительно вошли; отвергается — когда не вышло. */
+    this.entered = null;
     this.closed = false;
   }
 
@@ -110,8 +124,34 @@ export class MeetingBot {
         this.sendAudio(String(data));
         break;
 
-      case 'participants':
-        await this.syncParticipants(Number(data?.humans ?? 0));
+      case 'participants': {
+        // Телемост умеет только сосчитать людей — имён в его разметке нет.
+        // Zoom отдаёт имена, и их мы доносим до ассистента как есть.
+        const list = Array.isArray(data?.people)
+          ? data.people.map((x) => ({ uuid: String(x.uuid), name: String(x.name || 'участник') }))
+          : Array.from({ length: Number(data?.humans ?? 0) }, (_, i) => ({
+              uuid: `participant-${i + 1}`,
+              name: `Участник ${i + 1}`,
+            }));
+        await this.syncParticipants(list);
+        break;
+      }
+
+      case 'joined':
+        this.entered?.resolve();
+        break;
+
+      case 'join_failed':
+        this.entered?.reject(new Error(String(data?.reason || 'вход отклонён')));
+        break;
+
+      case 'left':
+        this.log.info?.(`[${this.id}] встреча закончилась: ${data?.reason || 'без причины'}`);
+        await this.stop();
+        break;
+
+      case 'mic':
+        this.log.info?.(`[${this.id}] микрофон ${data?.on ? 'включён' : 'включить не вышло'}`);
         break;
 
       case 'chat': {
@@ -154,31 +194,52 @@ export class MeetingBot {
    * присылает состав каждые две секунды. Не дошло — на следующем тике
    * попробуем снова, и расхождение зарастёт само.
    */
-  async syncParticipants(target) {
-    if (this.syncing || target === this.humans) return;
+  async syncParticipants(list) {
+    if (this.syncing) return;
+    const want = new Map(list.map((x) => [x.uuid, x.name]));
     this.syncing = true;
     try {
-      while (this.humans < target) {
-        if (!(await this.participantEvent(this.humans + 1, 'join'))) return;
-        this.humans++;
+      for (const [uuid, name] of want) {
+        if (this.people.has(uuid)) continue;
+        if (!(await this.participantEvent(uuid, name, 'join'))) return;
+        this.people.set(uuid, name);
+        this.log.info?.(`[${this.id}] пришёл: ${name} (всего ${this.people.size})`);
       }
-      while (this.humans > target) {
-        if (!(await this.participantEvent(this.humans, 'leave'))) return;
-        this.humans--;
+      for (const [uuid, name] of [...this.people]) {
+        if (want.has(uuid)) continue;
+        if (!(await this.participantEvent(uuid, name, 'leave'))) return;
+        this.people.delete(uuid);
+        this.log.info?.(`[${this.id}] ушёл: ${name} (всего ${this.people.size})`);
       }
-      this.log.info?.(`[${this.id}] людей во встрече: ${this.humans}`);
     } finally {
       this.syncing = false;
     }
   }
 
-  async participantEvent(index, kind) {
+  async participantEvent(uuid, name, kind) {
     return sendWebhook(this.webhookUrl, this.webhookSecret, event(this.id, this.metadata, 'participant_events.join_leave', {
-      participant_name: `Участник ${index}`,
-      participant_uuid: `participant-${index}`,
+      participant_name: name,
+      participant_uuid: uuid,
       event_type: kind,
       timestamp_ms: Date.now(),
     }), this.log);
+  }
+
+  /**
+   * Написать в общий чат встречи. `false` — площадка не приняла.
+   *
+   * Отказ штатен и важен: ассистент обязан сказать вслух, что написать не
+   * вышло, а не сделать вид, что написал. У Телемоста писать нечем вовсе —
+   * гостю площадка показывает «Войдите, чтобы написать сообщение».
+   */
+  async sendChat(text) {
+    if (!this.page || this.platform !== 'zoom') return false;
+    try {
+      return !!(await this.page.evaluate((t) => window.__botSendChat?.(t), String(text)));
+    } catch (e) {
+      this.log.warn?.(`[${this.id}] в чат не написалось: ${e?.message}`);
+      return false;
+    }
   }
 
   // ── Жизненный цикл ──────────────────────────────────────────────────────
@@ -207,8 +268,60 @@ export class MeetingBot {
     await ctx.addInitScript(platform.payload);
     this.page = await ctx.newPage();
 
+    if (platform.viaSdk) {
+      await this.joinViaSdk();
+      return;
+    }
     await this.page.goto(this.meetingUrl, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT_MS });
     await this.joinMeeting(platform.join);
+  }
+
+  /**
+   * Вход в Zoom: своя страница, подписанный JWT и события SDK.
+   *
+   * Ждём не вёрстку, а сигнал самой площадки. «Вошёл» тут — не «страница
+   * загрузилась»: статус connected приходит и в комнате ожидания, поэтому
+   * страница сообщает о входе только на 13-м уровне onJoinSpeed, когда Zoom
+   * начал подключать звук.
+   */
+  async joinViaSdk() {
+    const meeting = parseZoomUrl(this.meetingUrl);
+    if (!meeting) throw new Error('не разобрал ссылку Zoom');
+    const { signature, sdkKey } = signZoomJoin({
+      clientId: process.env.ZOOM_SDK_CLIENT_ID,
+      clientSecret: process.env.ZOOM_SDK_CLIENT_SECRET,
+      meetingNumber: meeting.meetingNumber,
+    });
+
+    const entered = new Promise((resolve, reject) => { this.entered = { resolve, reject }; });
+    const base = await zoomPageOrigin();
+    await this.page.goto(
+      zoomPageUrl(base, { signature, sdkKey, meetingNumber: meeting.meetingNumber, password: meeting.password, userName: this.displayName }),
+      { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT_MS },
+    );
+    this.log.info?.(`[${this.id}] Zoom: страница SDK открыта, встреча ${meeting.meetingNumber}`);
+
+    let timer;
+    const waited = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('во встречу так и не пустили')), ADMIT_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    try {
+      await Promise.race([entered, waited]);
+    } catch (e) {
+      await this.snapshot(e?.message || 'вход не удался');
+      await this.setState('fatal_error', { sub: 'request_to_join_denied' });
+      await this.stop();
+      return;
+    } finally {
+      clearTimeout(timer);
+      this.entered = null;
+    }
+
+    this.log.info?.(`[${this.id}] мы во встрече`);
+    await this.setState('joined_recording');
+    await this.page.waitForTimeout(JOIN_SETTLE_MS);
+    this.connectAudio();
   }
 
   async joinMeeting(sel) {
@@ -303,7 +416,10 @@ export class MeetingBot {
   async stop() {
     if (this.closed) return;
     this.closed = true;
-    try { await this.page?.locator(PLATFORMS[this.platform].join.leaveButton).first().click({ timeout: 3_000 }); } catch { /* уйдём закрытием браузера */ }
+    try {
+      if (PLATFORMS[this.platform]?.viaSdk) await this.page?.evaluate(() => window.__botLeave?.());
+      else await this.page?.locator(PLATFORMS[this.platform].join.leaveButton).first().click({ timeout: 3_000 });
+    } catch { /* уйдём закрытием браузера */ }
     try { this.ws?.close(); } catch { /* уже закрыт */ }
     try { await this.browser?.close(); } catch (e) { this.log.warn?.(`[${this.id}] браузер не закрылся: ${e?.message}`); }
     if (this.state !== 'fatal_error') await this.setState('ended', { sub: 'left_meeting' });

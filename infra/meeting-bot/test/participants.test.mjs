@@ -14,62 +14,84 @@ import { MeetingBot } from '../src/bot.mjs';
  * Бота заводим настоящего — конструктор ничего не запускает, — а наружу
  * подменяем ровно одну функцию: отправку события.
  */
-function botWith(log = { info() {}, warn() {} }) {
-  const bot = new MeetingBot({ id: 'тест', meetingUrl: 'x', displayName: 'Бот', platform: 'telemost', log });
+function botWith(platform = 'telemost') {
+  const bot = new MeetingBot({
+    id: 'тест',
+    meetingUrl: 'x',
+    displayName: 'Бот',
+    platform,
+    log: { info() {}, warn() {} },
+  });
   const sent = [];
   let deliver = true;
-  bot.participantEvent = async (index, kind) => {
+  bot.participantEvent = async (uuid, name, kind) => {
     if (!deliver) return false;
-    sent.push(`${kind}:${index}`);
+    sent.push(`${kind}:${name}`);
     return true;
   };
   return { bot, sent, fail: () => { deliver = false; }, heal: () => { deliver = true; } };
 }
 
-test('рост состава отдаётся событиями входа по одному', async () => {
+const people = (...names) => names.map((name, i) => ({ uuid: `u${i + 1}`, name }));
+
+test('пришедшие отдаются событиями входа с именами', async () => {
   const { bot, sent } = botWith();
-  await bot.syncParticipants(3);
-  assert.deepEqual(sent, ['join:1', 'join:2', 'join:3']);
-  assert.equal(bot.humans, 3);
+  await bot.syncParticipants(people('Аня', 'Борис'));
+  assert.deepEqual(sent, ['join:Аня', 'join:Борис']);
+  assert.equal(bot.people.size, 2);
 });
 
-test('повторное сообщение с тем же составом ничего не шлёт', async () => {
+test('повторный тот же состав ничего не шлёт', async () => {
   const { bot, sent } = botWith();
-  await bot.syncParticipants(2);
-  await bot.syncParticipants(2);
-  assert.deepEqual(sent, ['join:1', 'join:2']);
+  await bot.syncParticipants(people('Аня'));
+  await bot.syncParticipants(people('Аня'));
+  assert.deepEqual(sent, ['join:Аня']);
 });
 
-test('уход людей отдаётся событиями выхода', async () => {
+test('исчезнувший из списка отдаётся событием выхода', async () => {
   const { bot, sent } = botWith();
-  await bot.syncParticipants(3);
+  await bot.syncParticipants(people('Аня', 'Борис'));
   sent.length = 0;
-  await bot.syncParticipants(1);
-  assert.deepEqual(sent, ['leave:3', 'leave:2']);
-  assert.equal(bot.humans, 1);
+  await bot.syncParticipants([{ uuid: 'u1', name: 'Аня' }]);
+  assert.deepEqual(sent, ['leave:Борис']);
+  assert.equal(bot.people.size, 1);
 });
 
-test('не дошедшее событие не двигает счётчик, и следующий тик всё догоняет', async () => {
+test('не дошедшее событие не двигает состав, и следующий тик всё догоняет', async () => {
   const { bot, sent, fail, heal } = botWith();
   fail();
-  await bot.syncParticipants(2);
+  await bot.syncParticipants(people('Аня', 'Борис'));
   assert.deepEqual(sent, [], 'при обрыве наружу не ушло ничего');
-  assert.equal(bot.humans, 0, 'счётчик остался на подтверждённом значении');
+  assert.equal(bot.people.size, 0, 'состав остался на подтверждённом значении');
 
   heal();
-  await bot.syncParticipants(2);
-  assert.deepEqual(sent, ['join:1', 'join:2'], 'потерянное доехало на следующем тике');
-  assert.equal(bot.humans, 2);
+  await bot.syncParticipants(people('Аня', 'Борис'));
+  assert.deepEqual(sent, ['join:Аня', 'join:Борис'], 'потерянное доехало на следующем тике');
 });
 
-test('обрыв посреди серии оставляет счётчик на последнем подтверждённом', async () => {
+test('обрыв посреди серии оставляет состав на последнем подтверждённом', async () => {
   const { bot, sent, fail, heal } = botWith();
-  await bot.syncParticipants(1);
+  await bot.syncParticipants(people('Аня'));
   fail();
-  await bot.syncParticipants(4);
-  assert.equal(bot.humans, 1);
+  await bot.syncParticipants(people('Аня', 'Борис', 'Вера'));
+  assert.equal(bot.people.size, 1);
 
   heal();
-  await bot.syncParticipants(4);
-  assert.deepEqual(sent, ['join:1', 'join:2', 'join:3', 'join:4']);
+  await bot.syncParticipants(people('Аня', 'Борис', 'Вера'));
+  assert.deepEqual(sent, ['join:Аня', 'join:Борис', 'join:Вера']);
+});
+
+test('счётчик Телемоста превращается в безличных участников', async () => {
+  // У Телемоста имён в разметке нет вовсе — есть только число на кнопке.
+  // Выдумывать имена нельзя: на выдуманных не работает ни гейт по имени, ни
+  // правила выхода. Поэтому безличные подписи, но состав честный.
+  const { bot, sent } = botWith();
+  await bot.onPageEvent('participants', { humans: 2 });
+  assert.deepEqual(sent, ['join:Участник 1', 'join:Участник 2']);
+});
+
+test('имена Zoom доходят как есть', async () => {
+  const { bot, sent } = botWith('zoom');
+  await bot.onPageEvent('participants', { people: [{ uuid: '16778240', name: 'Дмитрий' }] });
+  assert.deepEqual(sent, ['join:Дмитрий']);
 });

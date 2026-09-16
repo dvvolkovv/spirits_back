@@ -25,6 +25,10 @@ const WEBHOOK_SECRET = process.env.MEETING_BOT_WEBHOOK_SECRET || process.env.ATT
 /** Какие адреса встреч мы понимаем. Прочие — не наша забота. */
 const PLATFORM_BY_URL = [
   [/https?:\/\/telemost\.yandex\.ru\/j\/\d{6,20}/i, 'telemost'],
+  // Точный `zoom.us` с необязательным поддоменом: без точки прошёл бы
+  // `notzoom.us`. Личные ссылки `/my/<имя>` не поддержаны — номера встречи в
+  // них нет, и SDK войти по ним не может.
+  [/https?:\/\/(?:[a-z0-9-]+\.)?zoom\.us\/(?:j|w)\/\d{9,12}/i, 'zoom'],
 ];
 
 const bots = new Map();
@@ -109,6 +113,18 @@ const server = http.createServer(async (req, res) => {
     await bot.stop().catch(() => {});
     bots.delete(bot.id);
     return json(res, 200, view(bot));
+  }
+
+  // POST /api/v1/bots/{id}/send_chat_message
+  if (req.method === 'POST' && parts.length === 5 && parts[3] && parts[4] === 'send_chat_message') {
+    const bot = bots.get(parts[3]);
+    if (!bot) return json(res, 404, { error: 'bot not found' });
+    const body = await readBody(req);
+    if (!body) return json(res, 400, { error: 'invalid json' });
+    const ok = await bot.sendChat(String(body.message || ''));
+    // Отказ отдаём кодом, а не полем: клиент бэкенда смотрит именно на статус,
+    // и ассистент по нему честно скажет, что написать не вышло.
+    return ok ? json(res, 200, { ok: true }) : json(res, 400, { error: 'chat not sent' });
   }
 
   // GET /api/v1/bots/{id}
