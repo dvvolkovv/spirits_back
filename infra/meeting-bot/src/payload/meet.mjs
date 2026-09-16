@@ -73,10 +73,26 @@ export const meetPayload = (displayName) => `
   let started = false;
   let probed = false;
 
-  const chatPanel = () =>
-    document.querySelector('div[aria-live="polite"][role="log"]') ||
-    document.querySelector('div[aria-live="polite"]') ||
-    document.querySelector('div[role="log"]');
+  const chatInput = () =>
+    document.querySelector('textarea[aria-label="Send a message"], textarea[aria-label*="message" i]');
+
+  /**
+   * Лента сообщений.
+   *
+   * Ищем её ОТ ПОЛЯ ВВОДА, а не по aria-live саму по себе: у Meet таких
+   * областей на странице несколько, и первая же холостая проверка 16.09.2026
+   * поймала не чат, а объявление «Returning to home screen in 60 seconds». На
+   * живой встрече так же поймались бы уведомления «такой-то присоединился».
+   *
+   * Поле ввода — надёжный признак: есть оно — панель чата открыта, нет — читать
+   * нечего, и пробовать незачем.
+   */
+  const chatPanel = () => {
+    const input = chatInput();
+    if (!input) return null;
+    const scope = input.closest('[role="complementary"], [role="region"], div[aria-label]') || document.body;
+    return scope.querySelector('[role="log"]') || scope.querySelector('[aria-live="polite"]') || scope;
+  };
 
   const readChat = () => {
     const panel = chatPanel();
