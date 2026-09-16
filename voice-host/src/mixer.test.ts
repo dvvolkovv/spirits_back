@@ -9,13 +9,13 @@ function frame(value: number, ticks = 1): Int16Array {
 
 describe('Mixer', () => {
   test('без участников отдаёт тишину нужной длины', () => {
-    const out = new Mixer().tick();
+    const out = new Mixer(false, SAMPLES_PER_TICK, 0).tick();
     assert.equal(out.length, SAMPLES_PER_TICK);
     assert.ok(out.every((v) => v === 0));
   });
 
   test('один участник проходит без изменений', () => {
-    const m = new Mixer();
+    const m = new Mixer(false, SAMPLES_PER_TICK, 0);
     m.push('alice', frame(100));
     const out = m.tick();
     assert.equal(out[0], 100);
@@ -23,35 +23,35 @@ describe('Mixer', () => {
   });
 
   test('двое складываются', () => {
-    const m = new Mixer();
+    const m = new Mixer(false, SAMPLES_PER_TICK, 0);
     m.push('alice', frame(100));
     m.push('bob', frame(50));
     assert.equal(m.tick()[0], 150);
   });
 
   test('сумма ограничивается сверху, а не переполняется', () => {
-    const m = new Mixer();
+    const m = new Mixer(false, SAMPLES_PER_TICK, 0);
     m.push('alice', frame(30000));
     m.push('bob', frame(30000));
     assert.equal(m.tick()[0], 32767);
   });
 
   test('и ограничивается снизу', () => {
-    const m = new Mixer();
+    const m = new Mixer(false, SAMPLES_PER_TICK, 0);
     m.push('alice', frame(-30000));
     m.push('bob', frame(-30000));
     assert.equal(m.tick()[0], -32768);
   });
 
   test('участник без данных не тормозит остальных', () => {
-    const m = new Mixer();
+    const m = new Mixer(false, SAMPLES_PER_TICK, 0);
     m.push('alice', frame(100));
     m.push('bob', new Int16Array(0));
     assert.equal(m.tick()[0], 100);
   });
 
   test('лишние сэмплы остаются на следующий тик', () => {
-    const m = new Mixer();
+    const m = new Mixer(false, SAMPLES_PER_TICK, 0);
     m.push('alice', frame(77, 2));
     assert.equal(m.tick()[0], 77);
     assert.equal(m.tick()[0], 77);
@@ -60,7 +60,7 @@ describe('Mixer', () => {
   });
 
   test('кадр короче тика дополняется тишиной', () => {
-    const m = new Mixer();
+    const m = new Mixer(false, SAMPLES_PER_TICK, 0);
     m.push('alice', Int16Array.from({ length: 10 }, () => 500));
     const out = m.tick();
     assert.equal(out.length, SAMPLES_PER_TICK);
@@ -70,7 +70,7 @@ describe('Mixer', () => {
   });
 
   test('несколько коротких кадров склеиваются в один тик', () => {
-    const m = new Mixer();
+    const m = new Mixer(false, SAMPLES_PER_TICK, 0);
     for (let i = 0; i < 4; i++) {
       m.push('alice', Int16Array.from({ length: SAMPLES_PER_TICK / 4 }, () => 200));
     }
@@ -80,14 +80,14 @@ describe('Mixer', () => {
   });
 
   test('ушедший участник перестаёт влиять на микс', () => {
-    const m = new Mixer();
+    const m = new Mixer(false, SAMPLES_PER_TICK, 0);
     m.push('alice', frame(100, 3));
     m.remove('alice');
     assert.equal(m.tick()[0], 0);
   });
 
   test('буфер не растёт бесконечно, если участник шлёт быстрее, чем мы читаем', () => {
-    const m = new Mixer();
+    const m = new Mixer(false, SAMPLES_PER_TICK, 0);
     for (let i = 0; i < 200; i++) m.push('alice', frame(100));
     assert.ok(
       m.bufferedTicks('alice') <= Mixer.MAX_BUFFERED_TICKS,
@@ -97,7 +97,7 @@ describe('Mixer', () => {
 
   test('переполнение буфера выбрасывает СТАРОЕ, а не свежее', () => {
     // Во встрече важна свежая речь: если копить, задержка только растёт.
-    const m = new Mixer();
+    const m = new Mixer(false, SAMPLES_PER_TICK, 0);
     for (let i = 0; i < 200; i++) m.push('alice', frame(1));
     m.push('alice', frame(777));
     // Вычерпываем буфер и проверяем, что свежий кадр в нём остался.
@@ -109,7 +109,7 @@ describe('Mixer', () => {
   });
 
   test('участники считаются раздельно', () => {
-    const m = new Mixer();
+    const m = new Mixer(false, SAMPLES_PER_TICK, 0);
     m.push('alice', frame(100, 2));
     m.push('bob', frame(50));
     assert.equal(m.tick()[0], 150);
@@ -120,17 +120,17 @@ describe('Mixer', () => {
   test('частота задаётся конструктором', () => {
     // 20 мс при 24 кГц — 480 сэмплов. Нужно для встреч Meet, где звук идёт
     // через Attendee на родной частоте Realtime.
-    const m = new Mixer(false, 480);
+    const m = new Mixer(false, 480, 0);
     assert.equal(m.tick().length, 480);
   });
 
   test('по умолчанию остаётся 48 кГц', () => {
     // Свои комнаты и Taler ID не должны заметить этой правки.
-    assert.equal(new Mixer().tick().length, 960);
+    assert.equal(new Mixer(false, SAMPLES_PER_TICK, 0).tick().length, 960);
   });
 
   test('потолок буфера считается в тиках новой частоты', () => {
-    const m = new Mixer(false, 480);
+    const m = new Mixer(false, 480, 0);
     for (let i = 0; i < 100; i++) m.push('u1', new Int16Array(480));
     assert.ok(m.bufferedTicks('u1') <= Mixer.MAX_BUFFERED_TICKS);
   });
@@ -138,7 +138,7 @@ describe('Mixer', () => {
   test('на новой частоте кадры собираются встык, без потери сэмплов', () => {
     // Куски от Attendee не кратны тику, и склейка через границу — то место,
     // где легко потерять хвост или сдвинуть поток по времени.
-    const m = new Mixer(false, 480);
+    const m = new Mixer(false, 480, 0);
     const chunk = new Int16Array(700).fill(1000);
     m.push('u1', chunk);
     const first = m.tick();
@@ -159,7 +159,7 @@ describe('Mixer', () => {
  */
 describe('Mixer — выравнивание громкости', () => {
   /** Микшер с включённым выравниванием — так его создаёт вход встречи. */
-  const leveller = () => new Mixer(true);
+  const leveller = () => new Mixer(true, SAMPLES_PER_TICK, 0);
   /** Кадр-«речь» заданного уровня: знакопеременный, чтобы RMS был равен |value|. */
   function speech(level: number, ticks = 1): Int16Array {
     return Int16Array.from({ length: SAMPLES_PER_TICK * ticks }, (_, i) =>
@@ -270,7 +270,7 @@ describe('Mixer — выравнивание громкости', () => {
  * говорящего лежат два таких усиленных шипения.
  */
 describe('Mixer — молчащего не усиливаем', () => {
-  const leveller = () => new Mixer(true);
+  const leveller = () => new Mixer(true, SAMPLES_PER_TICK, 0);
   function tone(level: number): Int16Array {
     return Int16Array.from({ length: SAMPLES_PER_TICK }, (_, i) => (i % 2 === 0 ? level : -level));
   }
@@ -407,9 +407,52 @@ describe('Mixer — молчащего не усиливаем', () => {
   });
 
   test('без выравнивания сведение не трогаем вовсе', () => {
-    const m = new Mixer(false);
+    const m = new Mixer(false, SAMPLES_PER_TICK, 0);
     let out = new Int16Array(SAMPLES_PER_TICK);
     for (let i = 0; i < 10; i++) { m.push('bob', tone(120)); out = m.tick(); }
     assert.ok(Math.abs(rms(out) - 120) < 5, 'без выравнивания уровень изменился');
+  });
+});
+
+/**
+ * Подкачка: кадры едут неровно, и тик, собранный наполовину, раньше добивался
+ * тишиной — дырка уезжала в середину слова. Синтетический стенд 16.09.2026:
+ * чистая фраза выходила из микшера неразборчивой при здоровой громкости.
+ */
+describe('Mixer — подкачка не рвёт слово', () => {
+  function tone(level: number, samples = SAMPLES_PER_TICK): Int16Array {
+    return Int16Array.from({ length: samples }, (_, i) => (i % 2 === 0 ? level : -level));
+  }
+  function rms(s: Int16Array): number {
+    let sum = 0;
+    for (const v of s) sum += v * v;
+    return Math.sqrt(sum / s.length);
+  }
+
+  test('полтика в очереди — отдаём тишину целиком, а не рваный тик', () => {
+    const m = new Mixer(false, SAMPLES_PER_TICK, 3);
+    m.push('боб', tone(5000, SAMPLES_PER_TICK / 2));
+    const out = m.tick();
+    assert.equal(rms(out), 0, 'отдали недобранный тик вместо тишины');
+    // Данные не потеряны — дождались запаса и отдали.
+    m.push('боб', tone(5000, SAMPLES_PER_TICK));
+    m.push('боб', tone(5000, SAMPLES_PER_TICK * 2));
+    assert.ok(rms(m.tick()) > 4000, 'после накопления запаса звук не пошёл');
+  });
+
+  test('недобор считается — по нему видно, рвём ли мы речь', () => {
+    const m = new Mixer(false, SAMPLES_PER_TICK, 3);
+    m.push('боб', tone(5000, SAMPLES_PER_TICK / 2));
+    m.tick();
+    assert.ok(m.stats()[0].underruns > 0, 'недобор не посчитан');
+  });
+
+  test('молчащего не ждём: пустая очередь — это не недобор', () => {
+    const m = new Mixer(false, SAMPLES_PER_TICK, 3);
+    m.push('боб', tone(5000, SAMPLES_PER_TICK * 4));
+    for (let i = 0; i < 4; i++) m.tick();
+    const было = m.stats()[0].underruns;
+    for (let i = 0; i < 10; i++) m.tick();
+    assert.equal(m.stats()[0].underruns, было, 'тишину молчащего сочли недобором');
   });
 });

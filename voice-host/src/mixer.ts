@@ -20,6 +20,24 @@ interface Track {
   /** Фон микрофона: уровень, к которому участник возвращается в паузах. */
   noiseFloor: number;
   /**
+   * Сколько тиков собраны не до конца — хвост добит тишиной.
+   *
+   * Это и есть порча речи: 10–20 мс тишины внутри слова. Громкость не
+   * страдает, разборчивость рассыпается. Считаем отдельно от выброса: там
+   * данные лишние, здесь их не хватило.
+   */
+  underruns: number;
+  /** Сколько тиков подряд очередь пуста — участник просто молчит. */
+  idleTicks: number;
+  /**
+   * Сколько тиков прошло с последнего пришедшего кадра.
+   *
+   * По нему отличаем «кадры ещё едут, подождём запаса» от «поток кончился,
+   * дожимаем хвост». Без этого хвост реплики застревал бы в очереди навсегда:
+   * запаса не наберётся, а отдавать мы отказываемся.
+   */
+  ticksSincePush: number;
+  /**
    * Сколько кусков выброшено вытеснением очереди.
    *
    * Выброс — это дыра прямо посреди фразы: кадры приехали, но тикер не успел
@@ -129,6 +147,22 @@ export class Mixer {
   static readonly MAX_GAIN = 12;
 
   /**
+   * Запас кадров, который копим, прежде чем начать отдавать участника.
+   *
+   * Кадры едут по сети неровно: 10-миллисекундный пакет может опоздать на
+   * пару миллисекунд, и тик собирается не до конца. Раньше недобор молча
+   * добивался тишиной — то есть в середину слова вставлялась дырка. На слух
+   * это щелчок, для распознавания — каша: синтетический стенд 16.09.2026
+   * показал, что чистая фраза «Роман, вопрос к тебе: сколько будет семью
+   * восемь?» выходит из микшера арабской галлюцинацией.
+   *
+   * Три тика — 60 мс задержки на весь разговор, этого не слышно, а дрожание
+   * такого размера перекрывается с запасом. Ноль возвращает прежнее
+   * поведение: держим переменной, чтобы сравнить на живой встрече без выката.
+   */
+  static readonly PREBUFFER_TICKS = Number(process.env.VOICE_PREBUFFER_TICKS ?? 3);
+
+  /**
    * Сколько тиков после последней речи участник ещё считается говорящим.
    *
    * Нужно ради хвостов фразы: между словами и на тихих окончаниях кадры
@@ -183,6 +217,11 @@ export class Mixer {
   constructor(
     private readonly levelling = false,
     private readonly samplesPerTick: number = SAMPLES_PER_TICK,
+    /**
+     * Запас кадров перед отдачей. По умолчанию — боевое значение; тесты на
+     * геометрию сведения ставят ноль, потому что проверяют сумму, а не время.
+     */
+    private readonly prebufferTicks: number = Mixer.PREBUFFER_TICKS,
   ) {}
 
   push(participant: string, samples: Int16Array): void {
@@ -191,6 +230,7 @@ export class Mixer {
     t.queue.push(samples);
     while (this.countTicks(t.queue) > Mixer.MAX_BUFFERED_TICKS) { t.queue.shift(); t.dropped++; }
     t.frames++;
+    t.ticksSincePush = 0;
     const rms = rmsOf(samples);
 
     // Огибающая: мгновенно вверх, медленно вниз (около секунды на затухание).
@@ -299,6 +339,8 @@ export class Mixer {
     floor: number;
     /** Сколько кусков выброшено вытеснением очереди. */
     dropped: number;
+    /** Сколько тиков собрано не до конца — дырки внутри слов. */
+    underruns: number;
   }[] {
     return [...this.tracks.entries()].map(([participant, t]) => ({
       participant,
@@ -309,6 +351,7 @@ export class Mixer {
       speaking: this.speakingNow(t),
       floor: Math.round(t.noiseFloor),
       dropped: t.dropped,
+      underruns: t.underruns,
     }));
   }
 
@@ -316,7 +359,20 @@ export class Mixer {
   tick(): Int16Array {
     const chunks: { t: Track; participant: string; chunk: Int16Array; rms: number }[] = [];
     for (const [participant, t] of this.tracks) {
-      const chunk = this.takeTick(t.queue);
+      // Подкачка: пока у живого участника не накопился запас, не трогаем его
+      // очередь вовсе. Иначе тик соберётся наполовину, хвост добьётся тишиной
+      // — и дырка уедет в середину слова. Ждём только того, кто уже звучит:
+      // молчащего ждать нечего, у него очередь пуста по определению.
+      t.ticksSincePush++;
+      const buffered = this.countTicks(t.queue);
+      // Ждём запаса, только пока кадры реально едут. Кончился поток — хвост
+      // дожимаем как есть, иначе он застрянет в очереди навсегда.
+      if (buffered > 0 && buffered < this.prebufferTicks && t.ticksSincePush <= 2) {
+        t.underruns++;
+        chunks.push({ t, participant, chunk: new Int16Array(this.samplesPerTick), rms: 0 });
+        continue;
+      }
+      const chunk = this.takeTick(t);
       chunks.push({ t, participant, chunk, rms: rmsOf(chunk) });
     }
 
@@ -359,7 +415,7 @@ export class Mixer {
   private track(participant: string): Track {
     let t = this.tracks.get(participant);
     if (!t) {
-      t = { queue: [], frames: 0, speechFrames: 0, speechRms: 0, peak: 0, noiseFloor: 0, dropped: 0, ticksSinceSpeech: Infinity };
+      t = { queue: [], frames: 0, speechFrames: 0, speechRms: 0, peak: 0, noiseFloor: 0, dropped: 0, underruns: 0, idleTicks: 0, ticksSincePush: 0, ticksSinceSpeech: Infinity };
       this.tracks.set(participant, t);
     }
     return t;
@@ -371,8 +427,16 @@ export class Mixer {
     return Math.ceil(n / this.samplesPerTick);
   }
 
-  /** Снять с очереди ровно тик; если данных меньше — сколько есть. */
-  private takeTick(queue: Int16Array[]): Int16Array {
+  /**
+   * Снять с очереди ровно тик.
+   *
+   * Если данных не хватает — раньше хвост просто добивался тишиной, и дырка
+   * уезжала в середину слова. Теперь недобор считается, а участнику с живой,
+   * но ещё не накопившейся очередью даётся тик тишины целиком: лучше ровная
+   * пауза, чем рваное слово. Разбирается это в tick(), здесь только сборка.
+   */
+  private takeTick(t: Track): Int16Array {
+    const queue = t.queue;
     const out = new Int16Array(this.samplesPerTick);
     let filled = 0;
     while (filled < this.samplesPerTick && queue.length) {
@@ -391,8 +455,14 @@ export class Mixer {
         filled += need;
       }
     }
-    // Длина всегда samplesPerTick: недобранный хвост остаётся тишиной. Тик
-    // обязан быть ровным, иначе поток в Realtime поедет по времени.
+    if (filled === 0) {
+      t.idleTicks++;
+    } else {
+      t.idleTicks = 0;
+      if (filled < this.samplesPerTick) t.underruns++;
+    }
+    // Длина всегда samplesPerTick: тик обязан быть ровным, иначе поток в
+    // Realtime поедет по времени.
     return out;
   }
 }

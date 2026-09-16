@@ -144,7 +144,8 @@ export class MixedRoomAudioInput extends voice.AudioInput {
         this.wasSpeaking.set(st.participant, st.speaking);
         console.log(
           st.speaking
-            ? `[вход] ${st.participant} заговорил — усиление ×${st.gain} (уровень ${st.rms}, фон ${st.floor})`
+            ? `[вход] ${st.participant} заговорил — усиление ×${st.gain} (уровень ${st.rms}, ` +
+              `фон ${st.floor}, выброшено кусков ${st.dropped})`
             : `[вход] ${st.participant} замолчал`,
         );
       }
