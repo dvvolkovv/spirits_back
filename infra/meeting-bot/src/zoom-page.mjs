@@ -39,6 +39,9 @@ export function zoomPageOrigin() {
     });
     server.once('error', reject);
     server.listen(0, '127.0.0.1', () => {
+      // Держать процесс живым — не его дело: сервер существует ради браузера,
+      // а браузер закрывается вместе с ботом.
+      server.unref?.();
       origin = `http://127.0.0.1:${server.address().port}`;
       resolve(origin);
     });
