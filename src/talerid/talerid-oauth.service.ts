@@ -47,6 +47,9 @@ function requestedScopes(): string[] {
 /** Skew buffer: treat a stored access token as expired this many ms before its
  * real expiry, so we never hand a caller a token that dies mid-flight. */
 const EXPIRY_SKEW_MS = 60_000;
+/** Кулдаун авто-восстановления «залипшего» error: не чаще одной переприводки раз в 30 мин на юзера,
+ *  чтобы стабильно-битый аккаунт не долбил partner-provision TalerID на каждой загрузке поверхности. */
+const RECOVERY_COOLDOWN_MS = 30 * 60_000;
 
 /**
  * Task 3 — glues TalerIdStoreService + TalerIdOauthClient into the token
@@ -165,7 +168,25 @@ export class TalerIdOauthService {
    */
   async getBackendAccessToken(userId: string): Promise<string | null> {
     const connection = await this.store.getConnection(userId);
-    if (!connection || connection.status !== 'connected') return null;
+    if (!connection) return null;
+
+    // Само-восстановление «залипшего» подключения. Раньше при status !== 'connected' метод сразу
+    // возвращал null, а self-heal (autoReprovision) вызывался ТОЛЬКО из doRefresh — ПОСЛЕ проверки на
+    // connected. Поэтому одна разовая смерть refresh-цепочки (TalerID ротирует/отзывает refresh)
+    // роняла подключение в 'error' НАВСЕГДА: и события, и задачи молча пропадали без ручного reconnect.
+    // Теперь 'error' лечим сами — переприводим через partner-secret, но с кулдауном по updated_at,
+    // чтобы стабильно-битый аккаунт не долбил TalerID на каждой загрузке поверхности. 'ambiguous' НЕ
+    // авто-лечим: там нужен выбор аккаунта пользователем (link-флоу).
+    if (connection.status !== 'connected') {
+      if (connection.status !== 'error') return null;
+      const updatedMs = connection.updatedAt ? connection.updatedAt.getTime() : 0;
+      if (Date.now() - updatedMs < RECOVERY_COOLDOWN_MS) return null;
+      const inFlightRecovery = this.refreshInFlight.get(userId);
+      if (inFlightRecovery) return inFlightRecovery;
+      const rp = this.autoReprovision(userId).finally(() => this.refreshInFlight.delete(userId));
+      this.refreshInFlight.set(userId, rp);
+      return rp;
+    }
 
     const fresh = await this.freshStoredAccess(userId);
     if (fresh) return fresh;

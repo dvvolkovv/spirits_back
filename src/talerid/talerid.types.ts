@@ -6,6 +6,8 @@ export interface TalerIdConnection {
   scopes: string;
   status: TalerIdConnectionStatus;
   accessExpiresAt?: Date;
+  /** Когда строку последний раз трогали — для кулдауна авто-восстановления «залипшего» error. */
+  updatedAt?: Date;
 }
 
 /** Task 2 — TalerIdOauthClient (partner-provision + refresh HTTP client). */

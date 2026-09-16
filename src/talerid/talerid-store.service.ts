@@ -91,7 +91,7 @@ export class TalerIdStoreService implements OnModuleInit {
 
   async getConnection(userId: string): Promise<TalerIdConnection | null> {
     const r = await this.pg.query(
-      `SELECT user_id, talerid_user_id, scopes, status, access_expires_at FROM talerid_connections WHERE user_id=$1`,
+      `SELECT user_id, talerid_user_id, scopes, status, access_expires_at, updated_at FROM talerid_connections WHERE user_id=$1`,
       [userId],
     );
     const row = r.rows[0];
@@ -102,6 +102,7 @@ export class TalerIdStoreService implements OnModuleInit {
       scopes: row.scopes,
       status: row.status,
       accessExpiresAt: row.access_expires_at ?? undefined,
+      updatedAt: row.updated_at ?? undefined,
     };
   }
 

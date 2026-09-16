@@ -243,8 +243,32 @@ export class TalerIdCalendarConnector {
       const from = start.toISOString().slice(0, 10);
       let to = end.toISOString().slice(0, 10);
       if (to <= from) to = new Date(new Date(`${from}T00:00:00Z`).getTime() + 86_400_000).toISOString().slice(0, 10);
-      const raw = await this.callTool(userId, 'list_tasks', { from, to, includeDone: true });
-      const rows = Array.isArray(raw) ? raw : Array.isArray(raw?.tasks) ? raw.tasks : [];
+      // РЕКУРРЕНТНЫЕ рутины (recurrence + occurrences — напр. ежедневный уход за лицом) TalerID отдаёт
+      // в list_schedule, а НЕ в list_tasks: последний вернёт лишь плоские инстансы без recurrence, и
+      // код разворота рутин ниже получит пустоту (рутины молча исчезают). Поэтому рутины читаем из
+      // list_schedule.tasks, а РАЗОВЫЕ дела — из list_tasks. Каждый вызов best-effort: падение одной
+      // половины не должно ронять другую. Если обе пусты — деградируем в [] (как раньше).
+      const [sched, flat] = await Promise.all([
+        this.callTool(userId, 'list_schedule', { from, to }).catch((e: any) => {
+          this.logger.debug(`talerid list_schedule degraded for user ${userId}: ${e?.message}`);
+          return null;
+        }),
+        this.callTool(userId, 'list_tasks', { from, to, includeDone: true }).catch((e: any) => {
+          this.logger.debug(`talerid list_tasks degraded for user ${userId}: ${e?.message}`);
+          return null;
+        }),
+      ]);
+      const schedTasks = Array.isArray(sched?.tasks) ? sched.tasks : [];
+      const flatRows = Array.isArray(flat) ? flat : Array.isArray(flat?.tasks) ? flat.tasks : [];
+      // Рутины — из schedule (в нём recurrence+occurrences). Из list_tasks берём только НЕрекуррентные
+      // разовые дела, и никогда uid, который schedule уже отдал рутиной (защита от дублей).
+      const routineUids = new Set(
+        schedTasks.filter((t: any) => t?.recurrence && Array.isArray(t?.occurrences)).map((t: any) => t.uid),
+      );
+      const rows = [
+        ...schedTasks,
+        ...flatRows.filter((t: any) => !t?.recurrence && !routineUids.has(t?.uid)),
+      ];
       const out: Task[] = [];
       const toMs = end.getTime();
       const today = this.localDay(now.getTime());

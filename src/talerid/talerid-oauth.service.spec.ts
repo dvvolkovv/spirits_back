@@ -207,6 +207,45 @@ describe('TalerIdOauthService', () => {
       expect(client.refresh).not.toHaveBeenCalled();
     });
 
+    // Регрессия 2026-09-16: «залипший» error больше не висит вечно — само-восстанавливается.
+    it('status=error + кулдаун прошёл → авто-reprovision, возвращает свежий access (self-heal)', async () => {
+      const store = makeStore({
+        getConnection: jest.fn().mockResolvedValue({
+          userId: 'user-1', taleridUserId: 'tid-1', scopes: 'mcp:calendar',
+          status: 'error', updatedAt: new Date(Date.now() - 31 * 60 * 1000),
+        }),
+      });
+      const client = makeClient({
+        provision: jest.fn().mockResolvedValue({
+          ok: true, taleridUserId: 'tid-1', accessToken: 'recovered-access',
+          refreshToken: 'ref-2', expiresIn: 900, scope: 'mcp:calendar',
+        }),
+      });
+      const service = new TalerIdOauthService(store, client, makePg({ phone: '79656445804' }));
+
+      const result = await service.getBackendAccessToken('user-1');
+
+      expect(result).toBe('recovered-access');
+      expect(client.provision).toHaveBeenCalledTimes(1);
+      expect(store.saveConnection).toHaveBeenCalledTimes(1);
+    });
+
+    it('status=error, но кулдаун НЕ прошёл → null, БЕЗ reprovision (не долбим TalerID)', async () => {
+      const store = makeStore({
+        getConnection: jest.fn().mockResolvedValue({
+          userId: 'user-1', taleridUserId: 'tid-1', scopes: 'mcp:calendar',
+          status: 'error', updatedAt: new Date(Date.now() - 60 * 1000),
+        }),
+      });
+      const client = makeClient();
+      const service = new TalerIdOauthService(store, client, makePg({ phone: '79656445804' }));
+
+      const result = await service.getBackendAccessToken('user-1');
+
+      expect(result).toBeNull();
+      expect(client.provision).not.toHaveBeenCalled();
+    });
+
     it('fresh stored access → returns it WITHOUT calling refresh', async () => {
       const farFuture = new Date(Date.now() + 10 * 60 * 1000);
       const store = makeStore({

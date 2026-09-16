@@ -8,6 +8,17 @@ describe('TalerIdCalendarConnector', () => {
     } as any;
   }
 
+  // Рутины TalerID отдаёт в list_schedule (recurrence+occurrences), разовые — в list_tasks.
+  // Мок разводит вызовы по имени инструмента.
+  function mockTasks(connector: TalerIdCalendarConnector, routines: any[], oneOff: any[] = []) {
+    jest.spyOn(connector as any, 'callTool').mockImplementation((...args: any[]) => {
+      const name = args[1];
+      if (name === 'list_schedule') return Promise.resolve({ events: [], tasks: routines });
+      if (name === 'list_tasks') return Promise.resolve(oneOff);
+      return Promise.resolve([]);
+    });
+  }
+
   describe('listTasks — время рутины из due, а не хардкод 09:00', () => {
     const from = new Date('2026-08-30T00:00:00Z');
     const to = new Date('2026-09-02T00:00:00Z');
@@ -15,7 +26,7 @@ describe('TalerIdCalendarConnector', () => {
 
     it('вечерняя рутина берёт время-суток из t.due (16:00Z=21:00), а не 09:00 (bug 2026-08-30)', async () => {
       const connector = new TalerIdCalendarConnector(makeOauth());
-      jest.spyOn(connector as any, 'callTool').mockResolvedValue([
+      mockTasks(connector, [
         {
           uid: 'routine-evening', title: 'Уход за лицом вечером',
           due: '2026-08-30T16:00:00.000Z', // 21:00 локально
@@ -30,7 +41,7 @@ describe('TalerIdCalendarConnector', () => {
 
     it('dueOverride конкретного вхождения имеет приоритет', async () => {
       const connector = new TalerIdCalendarConnector(makeOauth());
-      jest.spyOn(connector as any, 'callTool').mockResolvedValue([
+      mockTasks(connector, [
         {
           uid: 'r-ov', title: 'Рутина', due: '2026-08-30T16:00:00.000Z',
           recurrence: { freq: 'daily' },
@@ -43,12 +54,69 @@ describe('TalerIdCalendarConnector', () => {
 
     it('без t.due — fallback на 09:00 локально (04:00Z)', async () => {
       const connector = new TalerIdCalendarConnector(makeOauth());
-      jest.spyOn(connector as any, 'callTool').mockResolvedValue([
+      mockTasks(connector, [
         { uid: 'r-none', title: 'Рутина без времени', recurrence: { freq: 'daily' },
           occurrences: [{ occurrenceDate: '2026-08-30', status: 'pending' }] },
       ]);
       const tasks = await connector.listTasks('u1', from, to, now);
       expect(tasks.find((t) => t.uid === 'r-none')!.due).toBe('2026-08-30T04:00:00.000Z');
+    });
+  });
+
+  // Регрессия 2026-09-16: рекуррентные рутины ушли из list_tasks в list_schedule — если читать
+  // только list_tasks, ежедневный уход за лицом молча пропадает. Плюс разовые дела и дедуп.
+  describe('listTasks — source разделён: рутины из list_schedule, разовые из list_tasks', () => {
+    const from = new Date('2026-09-16T00:00:00Z');
+    const to = new Date('2026-09-18T00:00:00Z');
+    const now = new Date('2026-09-16T05:00:00Z');
+
+    it('рекуррентная рутина из list_schedule разворачивается в pending-вхождения (регрессия ухода за лицом)', async () => {
+      const connector = new TalerIdCalendarConnector(makeOauth());
+      mockTasks(connector, [
+        { uid: 'face-morning', title: 'Уход за лицом утром', due: '2026-09-16T02:30:00.000Z',
+          recurrence: { freq: 'daily' }, status: 'pending',
+          occurrences: [
+            { occurrenceDate: '2026-09-16', status: 'pending' },
+            { occurrenceDate: '2026-09-17', status: 'pending' },
+          ] },
+      ], []);
+      const tasks = await connector.listTasks('u1', from, to, now);
+      const face = tasks.filter((t) => t.uid === 'face-morning');
+      expect(face.length).toBe(2);
+      expect(face.every((t) => t.isRoutine && !t.done && t.source === 'talerid')).toBe(true);
+    });
+
+    it('разовое дело берётся из list_tasks', async () => {
+      const connector = new TalerIdCalendarConnector(makeOauth());
+      mockTasks(connector, [], [
+        { uid: 'oneoff-1', title: 'Купить SPF', status: 'pending', due: '2026-09-16T09:00:00.000Z' },
+      ]);
+      const tasks = await connector.listTasks('u1', from, to, now);
+      expect(tasks.find((t) => t.uid === 'oneoff-1')).toBeTruthy();
+    });
+
+    it('uid-рутина из list_schedule НЕ дублируется её плоским инстансом из list_tasks', async () => {
+      const connector = new TalerIdCalendarConnector(makeOauth());
+      mockTasks(connector, [
+        { uid: 'dup', title: 'Рутина', due: '2026-09-16T02:30:00.000Z', recurrence: { freq: 'daily' },
+          occurrences: [{ occurrenceDate: '2026-09-16', status: 'pending' }] },
+      ], [
+        // тот же uid как плоский recurrence-инстанс в list_tasks — должен быть отфильтрован
+        { uid: 'dup', title: 'Рутина', status: 'pending', recurrence: { freq: 'daily' }, due: '2026-09-16T02:30:00.000Z' },
+      ]);
+      const tasks = await connector.listTasks('u1', from, to, now);
+      expect(tasks.filter((t) => t.uid === 'dup').length).toBe(1);
+    });
+
+    it('падение list_schedule не роняет разовые из list_tasks (и наоборот)', async () => {
+      const connector = new TalerIdCalendarConnector(makeOauth());
+      jest.spyOn(connector as any, 'callTool').mockImplementation((...args: any[]) => {
+        const name = args[1];
+        if (name === 'list_schedule') return Promise.reject(new Error('mcp schedule down'));
+        return Promise.resolve([{ uid: 'survivor', title: 'Дело', status: 'pending', due: '2026-09-16T09:00:00.000Z' }]);
+      });
+      const tasks = await connector.listTasks('u1', from, to, now);
+      expect(tasks.find((t) => t.uid === 'survivor')).toBeTruthy();
     });
   });
 
