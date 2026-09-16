@@ -58,6 +58,21 @@ export interface ClaimedTurn {
   revert_to_sha: string | null;
 }
 
+/**
+ * Сколько ход может МОЛЧАТЬ, прежде чем считаться мёртвым. Отсюда его берут
+ * двое: сборщик зависших ходов ниже и постановка сна (`RentService`), которой
+ * нельзя гасить контейнер под живым ходом.
+ *
+ * Вынесено в константу не ради красоты: два потолка, выбранные порознь,
+ * разъезжаются молча, и продукт застревает между «ход уже похоронен» и «сон всё
+ * ещё его ждёт» — либо, что хуже, сон наступает под ходом, который здесь ещё
+ * считается живым.
+ *
+ * Про «молчит», а не «идёт долго» — см. докблок reapStuck: длительность это
+ * догадка о смерти, молчание — свидетельство.
+ */
+export const TURN_SILENCE_SQL = `interval '30 minutes'`;
+
 @Injectable()
 export class TurnsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TurnsService.name);
@@ -117,7 +132,10 @@ export class TurnsService implements OnModuleInit, OnModuleDestroy {
           --
           -- COALESCE на случай раннера, который ещё не прислал ни одного
           -- события.
-          AND COALESCE(last_progress_at, started_at) < now() - interval '30 minutes'
+          --
+          -- Потолок — общая константа: тот же срок читает постановка сна в
+          -- RentService, и разъехавшись, они дали бы сон под живым ходом.
+          AND COALESCE(last_progress_at, started_at) < now() - ${TURN_SILENCE_SQL}
         RETURNING id`,
     );
     if (r.rows.length) {

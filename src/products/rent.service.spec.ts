@@ -1,4 +1,5 @@
-import { RENT_TOKENS, RentService } from './rent.service';
+import { RENT_TOKENS, RentService, SLEEP_REASON_NO_TOKENS } from './rent.service';
+import { TURN_SILENCE_SQL } from './turns.service';
 
 /**
  * ФОРМА ЗАПРОСА СПИСАНИЯ. Поведение — в provisioning.integration.spec.ts:
@@ -200,5 +201,244 @@ describe('RentService.chargeRent — форма запроса', () => {
     pg.query.mockRejectedValueOnce(new Error('база моргнула') as never);
 
     await expect(svc.chargeRent('p-1')).rejects.toThrow('база моргнула');
+  });
+});
+
+/**
+ * СБОРЩИК И ЗАДАНИЯ СНА. Здесь опять форма и ветвление на заглушках; поведение
+ * против живой базы — сценарии 42–56 в provisioning.integration.spec.ts.
+ */
+
+/** Заглушка pg, разводящая запросы по их содержимому. */
+function makeDispatch(o: {
+  due?: any[];
+  charged?: boolean | ((id: string) => boolean);
+  sleepRows?: number;
+  fail?: (sql: string, params: any[]) => boolean;
+} = {}) {
+  const calls: { sql: string; params: any[] }[] = [];
+  const pg = {
+    query: jest.fn(async (sql: string, params: any[] = []) => {
+      calls.push({ sql, params });
+      if (o.fail?.(sql, params)) throw new Error('база моргнула');
+      if (sql.includes('SELECT id FROM products')) {
+        return { rows: o.due ?? [], rowCount: (o.due ?? []).length };
+      }
+      if (sql.includes('WITH claimed AS')) {
+        const ok =
+          typeof o.charged === 'function' ? o.charged(params[0]) : (o.charged ?? true);
+        const n = ok ? '1' : '0';
+        return { rows: [{ claimed: n, charged: n, logged: n }], rowCount: 1 };
+      }
+      if (sql.includes("'sleep'")) {
+        return { rows: [], rowCount: o.sleepRows ?? 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    }),
+  };
+  const svc = new RentService(pg as any);
+  const log = {
+    error: jest.spyOn((svc as any).logger, 'error').mockImplementation(() => undefined),
+    warn: jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined),
+  };
+  return { svc, pg, calls, log };
+}
+
+describe('RentService.tick — оборот сборщика', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('у кого хватило — списывает, у кого нет — усыпляет', async () => {
+    const { svc } = makeDispatch({
+      due: [{ id: 'rich' }, { id: 'poor' }],
+      charged: (id) => id === 'rich',
+    });
+    const sleep = jest.spyOn(svc, 'requestSleep').mockResolvedValue(true);
+
+    await svc.tick();
+
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith('poor');
+  });
+
+  it('падение на одном продукте не роняет обход остальных', async () => {
+    // Без этого один битый продукт останавливает списание у всех, и узнать об
+    // этом можно только по недосчитанной выручке.
+    const { svc, log, calls } = makeDispatch({
+      due: [{ id: 'a' }, { id: 'b' }],
+      fail: (sql, params) => sql.includes('WITH claimed AS') && params[0] === 'a',
+    });
+    const sleep = jest.spyOn(svc, 'requestSleep').mockResolvedValue(true);
+
+    await expect(svc.tick()).resolves.toBeUndefined();
+
+    // Второй продукт обойдён — попытка списания по нему дошла до базы.
+    expect(calls.some((c) => c.sql.includes('WITH claimed AS') && c.params[0] === 'b')).toBe(true);
+    // А упавший НЕ усыплён.
+    expect(sleep).not.toHaveBeenCalled();
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('продукта a'));
+  });
+
+  it('упавшее списание не превращается в сон', async () => {
+    // Главное свойство обхода. «Не списалось» ведёт ко сну, «база моргнула» —
+    // не должно: иначе одно моргание соединения усыпляет весь реестр, и каждый
+    // продукт придётся будить руками.
+    const { svc } = makeDispatch({
+      due: [{ id: 'a' }],
+      fail: (sql) => sql.includes('WITH claimed AS'),
+    });
+    const sleep = jest.spyOn(svc, 'requestSleep').mockResolvedValue(true);
+
+    await svc.tick();
+
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('обход отбирает только неоплаченных, живых и не архивных', async () => {
+    const { svc, calls } = makeDispatch({ due: [] });
+
+    await svc.tick();
+
+    expect(calls[0].sql).toContain('paid_until <= now()');
+    expect(calls[0].sql).toContain("status IN ('running','degraded')");
+    expect(calls[0].sql).toContain('archived_at IS NULL');
+    // Спящих в отборе нет: они не копят долг, и оборот не должен их трогать.
+    expect(calls[0].sql).not.toContain("'sleeping'");
+  });
+
+  it('оборот не падает наружу из таймера', async () => {
+    // onModuleInit зовёт оборот из setTimeout/setInterval: `void this.tick()`
+    // превратил бы любую ошибку в unhandled rejection, а он в этом процессе
+    // валит процесс целиком.
+    const { svc, log } = makeDispatch({ fail: () => true });
+
+    (svc as any).safeTick();
+    await new Promise((r) => setImmediate(r));
+
+    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/оборот аренды упал/));
+  });
+});
+
+describe('RentService.requestSleep — форма запроса', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  const sleepSql = async () => {
+    const { svc, calls } = makeDispatch();
+    await svc.requestSleep('p-1');
+    expect(calls).toHaveLength(1);
+    return calls[0];
+  };
+
+  it('сон ставится одним оператором', async () => {
+    await sleepSql();
+  });
+
+  it('ЗАДАНИЕ СТАВИТСЯ ДО СМЕНЫ СТАТУСА, а не наоборот', async () => {
+    // Дефект плана. `ON CONFLICT DO NOTHING` молча пропускает вставку, когда у
+    // продукта уже есть активное задание (идёт заведение), — и при обратном
+    // порядке продукт остаётся помеченным спящим без задания: аренду не
+    // платит, правок не принимает, а контейнер работает и гасить его некому.
+    const { sql } = await sleepSql();
+
+    expect(sql.indexOf('INSERT INTO product_provision_jobs')).toBeLessThan(
+      sql.indexOf("SET status = 'sleeping'"),
+    );
+    // И смена статуса привязана к вставленным строкам, а не к продукту.
+    expect(sql).toContain('FROM queued q');
+  });
+
+  it('оплаченный продукт не усыпляется', async () => {
+    // Прод в кластере из двух процессов: проигравший гонку получает от
+    // chargeRent false и идёт усыплять только что оплаченный продукт.
+    const { sql } = await sleepSql();
+
+    expect(sql).toContain('paid_until <= now()');
+  });
+
+  it('живой ход определяется молчанием, а потолок — общий с уборщиком зависших', async () => {
+    // По длительности — догадка о смерти: крупный рефакторинг со сборкой живёт
+    // дольше любого разумного потолка. По молчанию — свидетельство. Потолок
+    // берётся из константы turns.service: свой, выбранный заново, разъехался бы
+    // с уборщиком молча, и сон наступил бы под ходом, который тот считает живым.
+    const { sql } = await sleepSql();
+
+    expect(sql).toContain('COALESCE(t.last_progress_at, t.started_at, t.created_at)');
+    expect(sql).toContain(TURN_SILENCE_SQL);
+    expect(sql).toContain("t.status IN ('queued','running')");
+  });
+
+  it('строка продукта берётся под замок', async () => {
+    const { sql } = await sleepSql();
+
+    expect(sql).toContain('FOR UPDATE');
+  });
+
+  it('причина сна уезжает параметром и она человеческая', async () => {
+    const { params } = await sleepSql();
+
+    expect(params).toEqual(['p-1', SLEEP_REASON_NO_TOKENS]);
+    expect(SLEEP_REASON_NO_TOKENS).toMatch(/токен/i);
+  });
+
+  it('правда о постановке сна берётся из числа помеченных продуктов', async () => {
+    const { svc } = makeDispatch({ sleepRows: 0 });
+
+    expect(await svc.requestSleep('p-1')).toBe(false);
+  });
+});
+
+describe('RentService.wakeAffordable — форма запроса', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  const wakeSql = async () => {
+    const { svc, calls } = makeDispatch();
+    await svc.wakeAffordable('u-1');
+    expect(calls).toHaveLength(1);
+    return calls[0];
+  };
+
+  it('бюджет считается делением баланса на цену аренды', async () => {
+    const { sql, params } = await wakeSql();
+
+    expect(sql).toContain('/ $2 AS slots');
+    expect(params).toEqual(['u-1', RENT_TOKENS]);
+  });
+
+  it('будим по одному заданию на продукт и в порядке засыпания', async () => {
+    // Двадцать контейнеров, стартующих разом на одной машине, — отказ по
+    // памяти. Порядок — по сроку оплаты, то есть по очереди засыпания.
+    const { sql } = await wakeSql();
+
+    expect(sql).toContain('row_number() OVER (ORDER BY p.paid_until, p.id)');
+    expect(sql).toContain('pk.n <= b.slots');
+  });
+
+  it('продукты с активным заданием исключены явно, а не оставлены на ON CONFLICT', async () => {
+    // Иначе они занимают места в бюджете и тихо отнимают пробуждение у
+    // соседей: вставка их пропустит, а слот уже потрачен.
+    const { sql } = await wakeSql();
+
+    expect(sql).toContain("j.status IN ('queued','running')");
+    expect(sql).toContain('ON CONFLICT DO NOTHING');
+  });
+
+  it('будим только спящих и только своих', async () => {
+    const { sql } = await wakeSql();
+
+    expect(sql).toContain("p.status = 'sleeping'");
+    expect(sql).toContain('p.user_id = $1');
+    expect(sql).toContain('p.archived_at IS NULL');
+  });
+
+  it('ни одного неуточнённого kind: колонка есть у обеих таблиц', async () => {
+    // Ловушка миграции 004: `kind` теперь и у продукта (сайт или бот), и у
+    // задания (вид работы). Неуточнённое имя в запросе по обеим — ошибка
+    // неоднозначности в рантайме, то есть пробуждение, падающее уже на проде.
+    const { sql } = await wakeSql();
+
+    const bare = sql.match(/(?<![.\w])kind\b/g) ?? [];
+    // Единственное допустимое вхождение — список колонок INSERT, где таблица
+    // задана самим INSERT INTO.
+    expect(bare).toHaveLength(1);
+    expect(sql).toContain('INSERT INTO product_provision_jobs (product_id, kind, status)');
   });
 });
