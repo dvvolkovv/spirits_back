@@ -136,8 +136,28 @@ export class MixedRoomAudioInput extends voice.AudioInput {
       console.log(`[вход] пишу смикшированный поток в ${this.dumpPath} (PCM s16 ${SAMPLE_RATE} моно)`);
     }
 
-    this.ticker = setInterval(() => {
-      if (this.closed) return;
+    /**
+     * Тики отмеряются по ЧАСАМ, а не по срабатываниям таймера.
+     *
+     * setInterval(20) в Node срабатывает не через двадцать миллисекунд, а
+     * через двадцать с небольшим: сколько именно — зависит от загрузки петли
+     * событий. Отставание в один процент звучит безобидно, но оно копится:
+     * кадры от участников приходят в реальном времени, а забираем мы их чуть
+     * медленнее, очередь растёт, упирается в потолок в полсекунды — и дальше
+     * куски выбрасываются ПОСТОЯННО, прямо из середины слов.
+     *
+     * Живой замер 16.09.2026: 185 000 тиков за 3737 секунд разговора, то есть
+     * 3700 секунд звука — тридцать семь секунд потеряно. На стенде счётчик
+     * выброшенных кусков рос до полусотни за минуту, и чистая фраза выходила
+     * из микшера неразборчивой.
+     *
+     * Догоняем: сколько тиков должно было пройти по часам, столько и отдаём.
+     * Потолок в 25 тиков (полсекунды) — на случай, если процесс замер: вывалить
+     * в модель разом больше нельзя, у неё поедет разметка реплик.
+     */
+    const startedAt = Date.now();
+    let emitted = 0;
+    const emitOne = () => {
       const mixed = this.mixer.tick();
       for (const st of this.mixer.stats()) {
         if (this.wasSpeaking.get(st.participant) === st.speaking) continue;
@@ -177,8 +197,18 @@ export class MixedRoomAudioInput extends voice.AudioInput {
         const behind = this.queue ? Math.max(0, -(this.queue.desiredSize ?? 0)) : 0;
         console.log(
           `[вход] тиков: ${this.ticks}, кадров от участников: ${this.framesIn}, ` +
-          `очередь к модели: ${behind} — ${per}`,
+          `очередь к модели: ${behind}, отставание тиков: ${Math.max(0, Math.floor((Date.now() - startedAt) / TICK_MS) - emitted)} — ${per}`,
         );
+      }
+    };
+
+    this.ticker = setInterval(() => {
+      if (this.closed) return;
+      const due = Math.floor((Date.now() - startedAt) / TICK_MS) - emitted;
+      const n = Math.min(Math.max(due, 1), 25);
+      for (let i = 0; i < n; i++) {
+        emitted++;
+        emitOne();
       }
     }, TICK_MS);
 
