@@ -122,7 +122,9 @@ export class AttendeeClient {
    * Наш сервис (`infra/meeting-bot`) намеренно повторяет внешний контракт
    * Attendee, поэтому весь этот клиент работает с обоими — разница только в
    * адресе и ключе. Решение владельца 15.09.2026: Zoom и Телемост переносим к
-   * себе, Meet и Teams остаются на мосту, где их чинит апстрим.
+   * себе. 16.09.2026 решено убрать Attendee совсем — следом переехал Meet, на
+   * мосту остался один Teams, и он ждёт спайка на Azure Communication
+   * Services (`docs/superpowers/specs/2026-09-16-teams-acs-spike-design.md`).
    *
    * Выбираем по двум признакам, и оба нужны:
    *
@@ -137,7 +139,8 @@ export class AttendeeClient {
     const ownBase = (process.env.MEETING_BOT_URL || '').replace(/\/+$/, '');
     const ownKey = process.env.MEETING_BOT_API_KEY || '';
     const own = !!ownBase && !!ownKey;
-    const ours = own && (target === 'telemost' || target === 'zoom' || target?.startsWith('mb_'));
+    const OURS = new Set(['telemost', 'zoom', 'meet']);
+    const ours = own && (OURS.has(target || '') || !!target?.startsWith('mb_'));
     if (ours) return { base: ownBase, key: ownKey };
 
     const base = this.base();

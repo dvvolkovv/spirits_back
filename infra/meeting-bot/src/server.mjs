@@ -2,6 +2,7 @@ import './env.mjs';
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { MeetingBot } from './bot.mjs';
+import { platformFor } from './platform-url.mjs';
 
 /**
  * HTTP-обёртка над ботами.
@@ -23,14 +24,6 @@ const API_KEY = process.env.MEETING_BOT_API_KEY || '';
 /** Секрет подписи вебхуков — тот же, что проверяет бэкенд. */
 const WEBHOOK_SECRET = process.env.MEETING_BOT_WEBHOOK_SECRET || process.env.ATTENDEE_WEBHOOK_SECRET || '';
 
-/** Какие адреса встреч мы понимаем. Прочие — не наша забота. */
-const PLATFORM_BY_URL = [
-  [/https?:\/\/telemost\.yandex\.ru\/j\/\d{6,20}/i, 'telemost'],
-  // Точный `zoom.us` с необязательным поддоменом: без точки прошёл бы
-  // `notzoom.us`. Личные ссылки `/my/<имя>` не поддержаны — номера встречи в
-  // них нет, и SDK войти по ним не может.
-  [/https?:\/\/(?:[a-z0-9-]+\.)?zoom\.us\/(?:j|w)\/\d{9,12}/i, 'zoom'],
-];
 
 const bots = new Map();
 
@@ -38,11 +31,6 @@ const log = {
   info: (...a) => console.log(new Date().toISOString().slice(11, 19), ...a),
   warn: (...a) => console.warn(new Date().toISOString().slice(11, 19), ...a),
 };
-
-function platformFor(url) {
-  for (const [re, name] of PLATFORM_BY_URL) if (re.test(url || '')) return name;
-  return null;
-}
 
 function json(res, status, body) {
   const text = JSON.stringify(body);

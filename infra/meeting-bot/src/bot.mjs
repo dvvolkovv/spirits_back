@@ -2,6 +2,7 @@ import { chromium } from 'playwright';
 import WebSocket from 'ws';
 import { TELEMOST_PAYLOAD, TELEMOST_JOIN } from './payload/telemost.mjs';
 import { ZOOM_PAYLOAD } from './payload/zoom.mjs';
+import { meetPayload, MEET_JOIN } from './payload/meet.mjs';
 import { zoomPageOrigin, zoomPageUrl } from './zoom-page.mjs';
 import { signZoomJoin, parseZoomUrl } from './zoom-jwt.mjs';
 import { event, send as sendWebhook } from './webhooks.mjs';
@@ -37,6 +38,18 @@ const ADMIT_TIMEOUT_MS = Number(process.env.BOT_ADMIT_TIMEOUT_MS || 900_000);
  */
 const PLATFORMS = {
   telemost: { payload: TELEMOST_PAYLOAD, join: TELEMOST_JOIN, name: 'Телемост' },
+  meet: {
+    payload: meetPayload,
+    join: MEET_JOIN,
+    name: 'Google Meet',
+    // Английский интерфейс — условие работы зацепок.
+    //
+    // Вход, чат и состав ищутся по подписям: «Ask to join», «Chat with
+    // everyone», «People». С языком клиента они бы разъехались: бот, который
+    // ходит на встречи у нас, падал бы у клиента с другой локалью. Имя бота при
+    // этом остаётся русским — его вписываем мы сами.
+    locale: 'en-US',
+  },
   zoom: {
     payload: ZOOM_PAYLOAD,
     name: 'Zoom',
@@ -162,6 +175,13 @@ export class MeetingBot {
         await this.stop();
         break;
 
+      case 'chat_probe':
+        // Лента чата не нашлась ни одной зацепкой. Страница отдаёт кусок своей
+        // разметки — чтобы вторую редакцию селекторов писать по факту, а не по
+        // догадке. Приходит один раз за встречу.
+        this.log.warn?.(`[${this.id}] чат не разобрался, разметка панели: ${String(data?.html || '').slice(0, 1200)}`);
+        break;
+
       case 'sdk':
         this.log.info?.(`[${this.id}] Zoom: ${data?.step}`);
         break;
@@ -249,8 +269,11 @@ export class MeetingBot {
    * гостю площадка показывает «Войдите, чтобы написать сообщение».
    */
   async sendChat(text) {
-    if (!this.page || this.platform !== 'zoom') return false;
+    if (!this.page) return false;
     try {
+      // Умеет ли площадка писать, знает её сценарий страницы: у кого есть
+      // `__botSendChat` — тот и пишет. У Телемоста его нет вовсе, и отказ здесь
+      // штатный, а не поломка.
       return !!(await this.page.evaluate((t) => window.__botSendChat?.(t), String(text)));
     } catch (e) {
       this.log.warn?.(`[${this.id}] в чат не написалось: ${e?.message}`);
@@ -280,9 +303,16 @@ export class MeetingBot {
         ...(platform.chromeArgs || []),
       ],
     });
-    const ctx = await this.browser.newContext({ permissions: ['microphone', 'camera'], locale: 'ru-RU' });
+    const ctx = await this.browser.newContext({
+      permissions: ['microphone', 'camera'],
+      locale: platform.locale || 'ru-RU',
+    });
     await ctx.exposeFunction('__botSend', (type, data) => { void this.onPageEvent(type, data); });
-    await ctx.addInitScript(platform.payload);
+    // Площадке может понадобиться имя бота внутри страницы — тогда нагрузка
+    // приезжает функцией, а не строкой.
+    await ctx.addInitScript(
+      typeof platform.payload === 'function' ? platform.payload(this.displayName) : platform.payload,
+    );
     this.page = await ctx.newPage();
 
     // Консоль страницы — в наш лог.

@@ -276,4 +276,55 @@ describe('AttendeeClient', () => {
       expect(spy.mock.calls[0][0]).toBe('https://attendee.test/api/v1/bots/..%2F..%2Fadmin/leave');
     });
   });
+  describe('выбор моста', () => {
+    // Два моста за одним договором: чужой Attendee и наш meeting-bot. Ошибка
+    // здесь не видна ни в логе, ни на встрече — бот просто приходит не оттуда,
+    // и чинить его будут не там, где он сломан.
+    beforeEach(() => {
+      process.env.MEETING_BOT_URL = 'http://127.0.0.1:8180';
+      process.env.MEETING_BOT_API_KEY = 'mb-key';
+    });
+    afterEach(() => {
+      delete process.env.MEETING_BOT_URL;
+      delete process.env.MEETING_BOT_API_KEY;
+    });
+
+    const createFor = async (provider: string) => {
+      const spy = jest.fn().mockResolvedValue(ok({ id: 'x' }));
+      global.fetch = spy as any;
+      await new AttendeeClient().createBot({
+        meetingUrl: 'https://example.test/meeting',
+        botName: 'Роман',
+        callId: 'c1',
+        wsUrl: 'wss://my.linkeon.io/attendee/8140?callId=c1',
+        provider: provider as any,
+      });
+      return String(spy.mock.calls[0][0]);
+    };
+
+    it.each(['telemost', 'zoom', 'meet'])('%s идёт к нашему боту', async (provider) => {
+      expect(await createFor(provider)).toContain('http://127.0.0.1:8180');
+    });
+
+    it('teams остаётся на мосту', async () => {
+      // Последняя площадка на Attendee: ждёт спайка на Azure Communication
+      // Services. Пока она там, мост из инфраструктуры не убрать.
+      expect(await createFor('teams')).toContain('https://attendee.test');
+    });
+
+    it('по префиксу id наш бот узнаётся без площадки', async () => {
+      // removeBot и отправка в чат знают только идентификатор.
+      const spy = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({}) });
+      global.fetch = spy as any;
+      await new AttendeeClient().removeBot('mb_7ab17bc00334a720');
+      expect(String(spy.mock.calls[0][0])).toContain('http://127.0.0.1:8180');
+    });
+
+    it('без настроек нашего сервиса всё идёт на мост', async () => {
+      // Путь отката: убрать переменные — и переезд отменён.
+      delete process.env.MEETING_BOT_URL;
+      delete process.env.MEETING_BOT_API_KEY;
+      expect(await createFor('meet')).toContain('https://attendee.test');
+    });
+  });
 });
