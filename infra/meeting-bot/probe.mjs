@@ -134,6 +134,42 @@ if (platform === 'meet') {
   }
 }
 
+// Разведка ИЗНУТРИ встречи.
+//
+// Половина зацепок живёт только там: чат, участники, выход. Со стороны
+// прихожей их не увидеть, а заходить руками каждый раз — терять время. Со
+// второго аргумента `внутрь` разведчик входит сам и осматривается там.
+if (platform === 'meet' && process.argv.includes('внутрь')) {
+  const { MEET_JOIN } = await import('./src/payload/meet.mjs');
+  const join = page.locator(MEET_JOIN.joinButton).first();
+  if (await join.count()) {
+    await join.click().catch(() => {});
+    console.log('');
+    console.log('вошли, ждём панель встречи');
+    await page.locator(MEET_JOIN.inMeeting).first().waitFor({ state: 'visible', timeout: 60_000 }).catch(() => {});
+    await page.waitForTimeout(4000);
+
+    const inside = await page.evaluate(() => {
+      const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+      return [...document.querySelectorAll('button, [role="button"]')].slice(0, 40).map((e) => {
+        const label = e.getAttribute('aria-label') || '';
+        const text = clean(e.innerText).slice(0, 30);
+        if (!label && !text) return null;
+        return `${e.tagName.toLowerCase()} aria="${label}" текст="${text}"`;
+      }).filter(Boolean);
+    });
+    console.log('кнопки внутри встречи:');
+    for (const b of inside) console.log('  ', b);
+
+    console.log('наши зацепки внутри:');
+    for (const [name, sel] of Object.entries(MEET_JOIN)) {
+      let n = -1;
+      try { n = await page.locator(sel).count(); } catch (e) { n = -1; }
+      console.log(`   ${name}: ${n}`);
+    }
+  }
+}
+
 const shot = `/tmp/probe-${platform}.png`;
 await page.screenshot({ path: shot });
 console.log('\nснимок:', shot);
