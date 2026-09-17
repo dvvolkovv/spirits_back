@@ -1,5 +1,5 @@
-import { ConflictException } from '@nestjs/common';
-import { TurnsService } from './turns.service';
+import { ConflictException, HttpException, HttpStatus } from '@nestjs/common';
+import { SLEEPING_REFUSAL, TurnsService } from './turns.service';
 
 function makeService(
   opts: {
@@ -27,6 +27,10 @@ function makeService(
       }
       if (sql.includes('INSERT INTO product_turns')) {
         return { rows: [{ id: 't-1', status: 'queued' }] };
+      }
+      // Источник отката: revert() читает его, а потом идёт в тот же enqueue.
+      if (sql.includes('SELECT id, sha_before FROM product_turns')) {
+        return { rows: [{ id: 't-0', sha_before: 'deadbeef' }] };
       }
       return { rows: [] };
     }),
@@ -140,6 +144,100 @@ describe('TurnsService.enqueue', () => {
 
     // Ход = реальный запуск claude -p на VM, то есть живые деньги. Вставка не
     // должна происходить вовсе, а не «происходить и не тарифицироваться».
+    expect(calls.some((c) => c.sql.includes('INSERT INTO product_turns'))).toBe(false);
+  });
+});
+
+/**
+ * СПЯЩИЙ ПРОДУКТ. Общее условие `status !== 'running'` его и так не пропускает,
+ * поэтому первые два теста ниже — не про «отказ есть», а про то, ЧЕМ он
+ * отличается от отказа всем прочим неработающим. Разница не косметическая: сон
+ * снимается только пополнением баланса, и отказ, не назвавший этого, оставляет
+ * владельца пробовать снова до бесконечности.
+ *
+ * Чего эти тесты НЕ доказывают: что текст доезжает до экрана. На 17.09.2026 не
+ * доезжает — `apiClient.fetchStream` отдаёт null на любом не-2xx, теряя и код,
+ * и тело, а ProductChat подставляет вместо них свой `products.chat.busy`
+ * («Агент уже работает над предыдущим запросом»). Это относится и к
+ * существующему 402 «Недостаточно токенов». Чинится на фронте (задача 11).
+ */
+describe('TurnsService.enqueue — спящий продукт', () => {
+  const refusal = async (productStatus: string) => {
+    const { svc, calls, misc } = makeService({ productStatus });
+    const err = await svc
+      .enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'правь' })
+      .then(
+        () => null,
+        (e: any) => e,
+      );
+    expect(err).not.toBeNull();
+    return { err: err as HttpException, calls, misc };
+  };
+
+  it('спящему продукту правка не ставится', async () => {
+    // Молчаливая беда, ради которой проверка стоит ЯВНО. Ход, уехавший в
+    // очередь по погашенному контейнеру, не заберёт никто: claimNext требует
+    // p.status = 'running', а reapStuck хоронит только 'running'. Правка
+    // остаётся в 'queued' навсегда, держит замок product_turns_one_active — и
+    // владелец не получает ни ошибки, ни результата, ни следующей попытки.
+    const { err, calls } = await refusal('sleeping');
+
+    expect(err).toBeInstanceOf(HttpException);
+    expect(calls.some((c) => c.sql.includes('INSERT INTO product_turns'))).toBe(false);
+  });
+
+  it('текст отказа зовёт пополнить баланс, а не «попробуйте позже»', async () => {
+    const { err } = await refusal('sleeping');
+
+    expect(err.message).toMatch(/пополн/i);
+    // «Позже» здесь — прямая неправда: само оно не пройдёт никогда.
+    expect(err.message).not.toMatch(/позже|подожд/i);
+    // И про сам сон сказано, иначе владелец не поймёт, почему сайт не отвечает.
+    expect(err.message).toMatch(/спит/i);
+  });
+
+  it('отказ спящему — 402, тот же код, что у нулевого баланса', async () => {
+    // Кабинету нужен ОДИН признак «зови пополнение». 409 у него занят замком
+    // одного хода («агент занят») — самым частым источником 409 на этом
+    // маршруте, — и спящий продукт в этой ветке получил бы чужой текст.
+    const { err } = await refusal('sleeping');
+
+    expect(err.getStatus()).toBe(HttpStatus.PAYMENT_REQUIRED);
+    expect(err).not.toBeInstanceOf(ConflictException);
+  });
+
+  it('отказ спящему отличается от отказа заведомо нерабочему', async () => {
+    // `stopped` снял владелец, и снимается он кнопкой рядом; сон снимается
+    // только деньгами. Один текст на оба состояния врал бы в обе стороны.
+    const sleeping = await refusal('sleeping');
+    const stopped = await refusal('stopped');
+
+    expect(stopped.err).toBeInstanceOf(ConflictException);
+    expect(stopped.err.getStatus()).not.toBe(sleeping.err.getStatus());
+    expect(stopped.err.message).not.toBe(sleeping.err.message);
+    expect(stopped.err.message).not.toMatch(/пополн/i);
+  });
+
+  it('спящий отбивается ДО проверки баланса', async () => {
+    // У спящего владельца баланса нет почти наверняка — он потому и спит.
+    // Обратный порядок выдал бы ему общее «Недостаточно токенов» вместо
+    // объяснения, что именно спит и что произойдёт после пополнения.
+    const { err, misc } = await refusal('sleeping');
+
+    expect(misc.checkTokenBalance).not.toHaveBeenCalled();
+    expect(err.message).toBe(SLEEPING_REFUSAL);
+  });
+
+  it('откат на спящем продукте тоже не ставится', async () => {
+    // Второй вход в enqueue. Откат — это тот же запуск агента в контейнере,
+    // которого нет; отдельной проверки у него не будет и не должно быть, но
+    // без этого теста она может уехать в контроллер и потерять revert молча.
+    const { svc, calls } = makeService({ productStatus: 'sleeping' });
+
+    await expect(
+      svc.revert({ productId: 'p-1', turnId: 't-0', userId: 'u-1' }),
+    ).rejects.toMatchObject({ message: SLEEPING_REFUSAL });
+
     expect(calls.some((c) => c.sql.includes('INSERT INTO product_turns'))).toBe(false);
   });
 });
