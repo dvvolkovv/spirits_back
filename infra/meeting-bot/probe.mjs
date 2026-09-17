@@ -17,9 +17,20 @@
  * Второй параметр — площадка: от неё зависит локаль браузера (у Meet английская).
  */
 import { chromium } from 'playwright';
+import { cp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const url = process.argv[2];
 const platform = process.argv[3] || 'telemost';
+
+/**
+ * Профиль с выполненным входом — тот же, на котором работает бот.
+ *
+ * Под учётной записью площадка рисует ДРУГУЮ прихожую: имени не спрашивает,
+ * кнопки называются иначе. Разведывать надо ровно то, что увидит бот.
+ */
+const profile = process.env.PROBE_PROFILE_DIR || '';
 if (!url) {
   console.error('нужен адрес встречи');
   process.exit(1);
@@ -34,8 +45,9 @@ const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
 // объявляет себя: флаг `--enable-automation` и `navigator.webdriver`. У
 // Attendee ровно поэтому в списке стоит `--disable-blink-features=
 // AutomationControlled`.
-const browser = await chromium.launch({
+const launch = {
   headless: false,
+  ...(platform === 'meet' ? { channel: 'chrome' } : {}),
   ignoreDefaultArgs: ['--enable-automation'],
   args: [
     '--no-sandbox',
@@ -47,15 +59,28 @@ const browser = await chromium.launch({
     '--disable-blink-features=AutomationControlled',
     '--disable-extensions',
   ],
-});
-const ctx = await browser.newContext({
+};
+const context = {
   permissions: ['microphone', 'camera'],
   locale: platform === 'meet' ? 'en-US' : 'ru-RU',
-});
+};
+
+let browser = null;
+let copy = '';
+let ctx;
+if (profile) {
+  // На копии, как и бот: Chrome держит на профиле замок.
+  copy = join(tmpdir(), 'probe-profile-' + Date.now());
+  await cp(profile, copy, { recursive: true });
+  ctx = await chromium.launchPersistentContext(copy, { ...launch, ...context, viewport: null });
+} else {
+  browser = await chromium.launch(launch);
+  ctx = await browser.newContext(context);
+}
 await ctx.addInitScript(() => {
   try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) { /* уже переопределено */ }
 });
-const page = await ctx.newPage();
+const page = ctx.pages()[0] || (await ctx.newPage());
 page.on('console', (m) => {
   if (m.type() === 'error') console.log('  консоль:', m.text().slice(0, 160));
 });
@@ -94,4 +119,6 @@ const shot = `/tmp/probe-${platform}.png`;
 await page.screenshot({ path: shot });
 console.log('\nснимок:', shot);
 
-await browser.close();
+if (browser) await browser.close();
+else await ctx.close();
+if (copy) await rm(copy, { recursive: true, force: true });
