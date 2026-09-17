@@ -170,9 +170,22 @@ export const MEET_JOIN = {
   // Поля имени под учётной записью нет вовсе — имя берётся из аккаунта. Шаг
   // необязателен, и бот идёт дальше без него.
   nameInput: 'input[type="text"][aria-label="Your name"], input[type="text"][aria-label*="name" i], input[type="text"][aria-label*="мя" i]',
-  // Точное совпадение текста, а не вхождение: «Другие способы присоединиться»
-  // содержит ту же подпись и перехватил бы клик.
-  joinButton: 'button:text-is("Join now"), button:text-is("Ask to join"), button:text-is("Join anyway"), button:text-is("Присоединиться"), button:text-is("Попросить войти")',
+  /**
+   * Кнопка входа.
+   *
+   * Подпись лежит во вложенном `span`, а не в самой кнопке, — поэтому
+   * `button:text-is(...)` не находит НИЧЕГО, хотя кнопка на экране есть
+   * (живой заход 17.09.2026, проверка зацепок дала ноль). Attendee по той же
+   * причине берёт её как `//button[.//span[text()="Ask to join"]]`.
+   *
+   * Совпадение точное, а не вхождение: «Другие способы присоединиться»
+   * содержит ту же подпись и перехватил бы клик.
+   */
+  joinButton:
+    'button:has(span:text-is("Join now")), button:has(span:text-is("Ask to join")),' +
+    ' button:has(span:text-is("Join anyway")), button:has(span:text-is("Присоединиться")),' +
+    ' button:has(span:text-is("Попросить войти")),' +
+    ' button:text-is("Присоединиться"), button:text-is("Join now"), button:text-is("Ask to join")',
   cameraOff: '[aria-label*="Turn off camera" i], [aria-label*="Выключить камеру" i]',
   inMeeting: 'button[aria-label*="People" i], button[aria-label*="Люди" i], button[aria-label*="частник" i]',
   chatButton: 'button[aria-label*="Chat with everyone" i], button[aria-label*="Чат со всеми" i], button[aria-label*="Чат" i]',
