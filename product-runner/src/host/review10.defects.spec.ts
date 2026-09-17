@@ -110,6 +110,8 @@ describe('ДЕФЕКТ 3: у провижининга нет срока — за
         config: CONFIG,
         api: { poll, complete },
         provision: () => new Promise<{ port?: number }>(() => {}),
+        sleepProduct: async () => undefined,
+        wakeProduct: async () => undefined,
         log: () => {},
       };
 

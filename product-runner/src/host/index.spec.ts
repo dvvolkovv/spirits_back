@@ -4,6 +4,7 @@ import { HostApi, HostJob, JobReport, PollOutcome } from './api';
 import { DEFAULT_POLL_TIMEOUT_MS, HostConfig, loadConfig } from './config';
 import {
   HostDeps,
+  KNOWN_KINDS,
   deliver,
   loop,
   main,
@@ -12,7 +13,9 @@ import {
   redact,
   tick,
 } from './index';
-import { ProvisionDeps, hostDeps } from './provision';
+import { FakeHost, deps as fakeDeps } from './fake-host';
+import { ProvisionDeps, hostDeps, provision as provisionReal } from './provision';
+import { SleepJob } from './sleep';
 
 const JOB: HostJob = {
   jobId: 'j-1',
@@ -38,6 +41,8 @@ function makeDeps(config: Partial<HostConfig> = {}) {
   const poll = jest.fn(async (): Promise<PollOutcome> => ({ ok: true, job: null }));
   const complete = jest.fn(async (_jobId: string, _report: JobReport): Promise<boolean> => true);
   const provision = jest.fn(async (_job: HostJob): Promise<{ port?: number }> => ({ port: 8003 }));
+  const sleepProduct = jest.fn(async (_job: SleepJob): Promise<void> => undefined);
+  const wakeProduct = jest.fn(async (_job: SleepJob): Promise<void> => undefined);
   const sleepFn = jest.fn(async (_ms: number): Promise<unknown> => undefined);
   const logs: string[] = [];
 
@@ -45,12 +50,14 @@ function makeDeps(config: Partial<HostConfig> = {}) {
     config: { ...CONFIG, ...config },
     api: { poll, complete },
     provision,
+    sleepProduct,
+    wakeProduct,
     sleep: sleepFn,
     log: (message: string) => {
       logs.push(message);
     },
   };
-  return { deps, poll, complete, provision, sleep: sleepFn, logs };
+  return { deps, poll, complete, provision, sleepProduct, wakeProduct, sleep: sleepFn, logs };
 }
 
 /** Последний отчёт, доехавший до `complete`. */
@@ -796,6 +803,278 @@ describe('боевые зависимости', () => {
       expect(built[0].linkeonUrl).toBe('https://test.linkeon.io');
       expect(started).toHaveLength(1);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Вид задания.
+//
+// До этой задачи `tick` звал развёртывание безусловно. На задании «усыпить»
+// агент шёл заводить продукт заново, упирался в отсутствие токена раннера (а
+// был бы токен — в занятый каталог) и докладывал про это, а владелец читал
+// причину, не имеющую отношения ни к сну, ни к аренде.
+// ---------------------------------------------------------------------------
+
+const SLEEP_JOB: HostJob = { ...JOB, jobKind: 'sleep', port: 8003, runnerToken: '', secrets: {} };
+const WAKE_JOB: HostJob = { ...SLEEP_JOB, jobKind: 'wake' };
+
+describe('разбор вида задания', () => {
+  it('«усыпить» не разворачивает продукт заново', async () => {
+    const { deps, poll, provision, sleepProduct, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: SLEEP_JOB });
+
+    await tick(deps);
+
+    expect(provision).not.toHaveBeenCalled();
+    expect(sleepProduct).toHaveBeenCalledTimes(1);
+    expect(complete).toHaveBeenCalledWith('j-1', { ok: true });
+  });
+
+  it('«разбудить» поднимает продукт, а не заводит', async () => {
+    const { deps, poll, provision, wakeProduct, sleepProduct, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: WAKE_JOB });
+
+    await tick(deps);
+
+    expect(provision).not.toHaveBeenCalled();
+    expect(sleepProduct).not.toHaveBeenCalled();
+    expect(wakeProduct).toHaveBeenCalledTimes(1);
+    expect(complete).toHaveBeenCalledWith('j-1', { ok: true });
+  });
+
+  it('сон и пробуждение не путаются местами', async () => {
+    // Перепутанные, они дают ровно обратное действие: продукт, за который
+    // заплатили, гаснет, а неоплаченный поднимается и продолжает есть аренду.
+    const { deps, poll, sleepProduct, wakeProduct } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: SLEEP_JOB });
+
+    await tick(deps);
+
+    expect(wakeProduct).not.toHaveBeenCalled();
+    expect(sleepProduct).toHaveBeenCalledTimes(1);
+  });
+
+  it('хостовому шагу уезжают слаг, форма и порт — и больше ничего', async () => {
+    // Порт знает только сервер: после `docker stop` на хосте его взять
+    // неоткуда, а пробуждение обязано вернуть домен на ТОТ ЖЕ порт.
+    // Токена раннера и секретов у этих видов не бывает вовсе (claimJob их не
+    // присылает), и тащить их на хостовой шаг незачем.
+    const { deps, poll, wakeProduct } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: { ...WAKE_JOB, port: 8123 } });
+
+    await tick(deps);
+
+    const got = wakeProduct.mock.calls[0][0];
+    expect(got).toEqual({ slug: 'shop', kind: 'site', port: 8123 });
+    expect(Object.keys(got).sort()).toEqual(['kind', 'port', 'slug']);
+  });
+
+  it('задание без вида — это заведение, а не отказ', async () => {
+    // Сервер до куска 3 поля не слал вовсе, и заданий, кроме заведения, тогда
+    // не было. Отказ здесь означал бы агента, выкаченного раньше бэкенда и не
+    // заводящего ни одного продукта ни у одного клиента.
+    const { deps, poll, provision, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: JOB });
+    expect(JOB.jobKind).toBeUndefined();
+
+    await tick(deps);
+
+    expect(provision).toHaveBeenCalledTimes(1);
+    expect(complete).toHaveBeenCalledWith('j-1', { ok: true, port: 8003 });
+  });
+
+  it('неизвестный вид — отказ, а не тихое развёртывание', async () => {
+    // Сервер катается deploy.sh, агент ставится на машину продуктов руками:
+    // новый вид доедет сюда раньше, чем агент научится его исполнять. Отчёт об
+    // отказе честнее, чем каркас поверх работающего продукта.
+    const { deps, poll, provision, sleepProduct, wakeProduct, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: { ...JOB, jobKind: 'нечто' } });
+
+    await tick(deps);
+
+    expect(provision).not.toHaveBeenCalled();
+    expect(sleepProduct).not.toHaveBeenCalled();
+    expect(wakeProduct).not.toHaveBeenCalled();
+    const report = lastReport(complete);
+    expect(report.ok).toBe(false);
+  });
+
+  it('причина отказа называет вид и говорит, что на хосте не тронуто ничего', async () => {
+    // «Неизвестная ошибка» здесь заставила бы человека ехать на машину
+    // продуктов и сверять состояние руками — при том что состояние заведомо
+    // не менялось.
+    const { deps, poll, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: { ...JOB, jobKind: 'restart' } });
+
+    await tick(deps);
+
+    const report = lastReport(complete);
+    const text = report.ok === false ? report.error : '';
+    expect(text).toContain('restart');
+    expect(text).toMatch(/не тронуто/);
+    for (const kind of KNOWN_KINDS) expect(text).toContain(kind);
+  });
+
+  it('отказ сна докладывается, а не проглатывается', async () => {
+    // Проглоченный, он оставил бы задание в 'running' до сборщика зависших, а
+    // продукт — помеченным спящим при работающем контейнере: аренду не платит,
+    // гасить его больше нечем.
+    const { deps, poll, sleepProduct, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: SLEEP_JOB });
+    sleepProduct.mockRejectedValue(new Error('No such container: shop'));
+
+    await expect(tick(deps)).resolves.toBeUndefined();
+
+    const report = lastReport(complete);
+    expect(report.ok === false && report.error).toContain('No such container');
+  });
+
+  it('маскировка причины общая для всех видов, а не только для заведения', async () => {
+    // Хостовые шаги сна зовут те же программы через execFile, а он кладёт в
+    // message всю командную строку целиком. Отчёт уезжает в карточку продукта.
+    const oauth = 'sk-ant-oat01-живойтокен';
+    const { deps, poll, wakeProduct, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: WAKE_JOB });
+    wakeProduct.mockRejectedValue(
+      new Error(`Command failed: docker start shop -e CLAUDE_CODE_OAUTH_TOKEN=${oauth}`),
+    );
+
+    await tick(deps);
+
+    const report = lastReport(complete);
+    const text = report.ok === false ? report.error : '';
+    expect(text).not.toContain(oauth);
+    expect(text).toContain('docker start shop');
+  });
+
+  it('досылка отчёта общая для всех видов, а не только для заведения', async () => {
+    // Потерянный отчёт об удавшемся СНЕ страшнее потерянного отчёта о
+    // заведении: контейнер погашен, домен на заглушке, а сервер об этом не
+    // знает и через десять минут объявит сон сорвавшимся.
+    const { deps, poll, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: SLEEP_JOB });
+    complete.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+
+    await tick(deps);
+
+    expect(complete).toHaveBeenCalledTimes(2);
+    for (const [, report] of complete.mock.calls) expect(report).toEqual({ ok: true });
+  });
+
+  it('отчёт о сне не содержит ключа port', async () => {
+    // Порт сна не меняет, а `{ ok: true, port: undefined }` читается в логе и
+    // в теле как «порт потерян».
+    const { deps, poll, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: SLEEP_JOB });
+
+    await tick(deps);
+
+    expect(Object.keys(lastReport(complete))).toEqual(['ok']);
+  });
+
+  it('журнал называет вид работы, а не только слаг', async () => {
+    // Без вида строка журнала на сне и на заведении выглядит одинаково, и
+    // разобрать по машине продуктов, что агент делал с продуктом, нечем.
+    const { deps, poll, logs } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: SLEEP_JOB });
+
+    await tick(deps);
+
+    expect(logs.join('\n')).toContain('sleep');
+  });
+
+  it('зависший сон отказывает своей формулировкой, а не «провижинингом»', async () => {
+    // Общая формулировка на сне читается как заведение, которого никто не
+    // заказывал, и врёт про состояние хоста: подчистки у сна нет вовсе,
+    // зато контейнер мог остаться живым при уже поставленной заглушке.
+    const { deps, poll, sleepProduct, complete } = makeDeps({ provisionTimeoutMs: 50 });
+    poll.mockResolvedValue({ ok: true, job: SLEEP_JOB });
+    sleepProduct.mockImplementation(() => new Promise<void>(() => {}));
+
+    await tick(deps);
+
+    const report = lastReport(complete);
+    const text = report.ok === false ? report.error : '';
+    expect(text).toContain('усыпление');
+    expect(text).toContain('НЕИЗВЕСТНО');
+    expect(text).not.toContain('провижининг');
+  });
+});
+
+describe('боевые зависимости знают все три вида', () => {
+  /** Живой продукт на симуляторе хоста — тем же provision, что и на машине. */
+  async function seeded() {
+    const host = new FakeHost();
+    const { port } = await provisionReal(
+      { slug: 'shop', kind: 'site', name: 'Магазин', runnerToken: 'ткн', secrets: {} },
+      fakeDeps(host),
+    );
+    const deps = realDeps(CONFIG, {
+      log: () => {},
+      buildDeps: (over) => fakeDeps(host, over),
+    });
+    return { host, port, deps };
+  }
+
+  it('сон и пробуждение собраны настоящими шагами, а не заглушкой', async () => {
+    // Подмена частей здесь ровно для того, чтобы о боевой сборке можно было
+    // утверждать что-то кроме «это функция»: выброшенный из realDeps
+    // provisionOverrides не краснел ничем, хотя его пропажа означает продукты
+    // стенда, уехавшие за работой на прод.
+    const { host, port, deps } = await seeded();
+
+    await deps.sleepProduct({ slug: 'shop', kind: 'site', port });
+
+    expect(host.isRunning('shop')).toBe(false);
+    expect(host.containers.has('shop')).toBe(true);
+    expect(host.vhostMode('shop')).toBe('asleep');
+
+    await deps.wakeProduct({ slug: 'shop', kind: 'site', port });
+
+    expect(host.isRunning('shop')).toBe(true);
+    expect(host.vhostMode('shop')).toBe('live');
+  });
+
+  it('порт задания доезжает до пробуждения — без него домен возвращать некуда', async () => {
+    // Мутация «не класть порт в выжимку» иначе невидима: сон без порта
+    // работает, а пробуждение сайта без порта — отказ.
+    const { deps } = await seeded();
+
+    await expect(deps.wakeProduct({ slug: 'shop', kind: 'site' })).rejects.toThrow(/нет порта/);
+  });
+
+  it('сон и пробуждение получают те же настройки хоста, что и заведение', async () => {
+    // Сегодня ни один хостовой шаг сна в эти настройки не заглядывает:
+    // `vhostBin` и сроки берутся из DEFAULTS, а `linkeonUrl` нужен только
+    // заведению. Потерянная здесь сборка настроек не покраснела бы НИЧЕМ — до
+    // того дня, когда шагу сна впервые понадобится стенд вместо прода, и
+    // тогда спящий продукт стенда чинил бы домен на боевом хосте.
+    const captured: ProvisionDeps[] = [];
+    const deps = realDeps(CONFIG, {
+      log: () => {},
+      buildDeps: (over) => over as ProvisionDeps,
+      sleepProduct: async (_job, d) => {
+        captured.push(d);
+      },
+      wakeProduct: async (_job, d) => {
+        captured.push(d);
+      },
+    });
+
+    await deps.sleepProduct({ slug: 'shop', kind: 'site', port: 8003 });
+    await deps.wakeProduct({ slug: 'shop', kind: 'site', port: 8003 });
+
+    expect(captured.map((d) => d.linkeonUrl)).toEqual([CONFIG.linkeonUrl, CONFIG.linkeonUrl]);
+  });
+
+  it('боевая сборка не забывает ни один вид', () => {
+    // Пропущенный `wakeProduct` дал бы TypeError в рантайме — то есть продукт,
+    // который не удаётся разбудить, при полностью зелёном прогоне.
+    const deps = realDeps(CONFIG, { log: () => {} });
+
+    expect(typeof deps.provision).toBe('function');
+    expect(typeof deps.sleepProduct).toBe('function');
+    expect(typeof deps.wakeProduct).toBe('function');
   });
 });
 

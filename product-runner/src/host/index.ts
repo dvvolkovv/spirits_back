@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { DEFAULT_PROVISION_TIMEOUT_MS, HostConfig, loadConfig } from './config';
 import { HostApi, HostJob, JobReport, PollOutcome } from './api';
 import { hostDeps, provision as provisionReal, ProvisionDeps } from './provision';
+import { SleepJob, sleepProduct as sleepReal, wakeProduct as wakeReal } from './sleep';
 
 export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -14,6 +15,21 @@ export interface HostDeps {
   config: HostConfig;
   api: HostApiLike;
   provision: (job: HostJob) => Promise<{ port?: number }>;
+  /**
+   * Усыпить и разбудить. Имена НЕ `sleep` и `wake`, хотя виды задания зовутся
+   * так: `deps.sleep` в этом интерфейсе уже занят — это ПАУЗА между оборотами
+   * (`const wait = deps.sleep ?? sleep`). Хостовой шаг под тем же именем
+   * молча вытеснил бы паузу: агент перестал бы спать между опросами и
+   * превратился в горячий цикл по API и базе, а сам сон продукта получал бы
+   * число миллисекунд вместо задания.
+   *
+   * Обязательные, а не `?`. Необязательные дали бы `deps.sleepProduct!(job)` —
+   * то есть TypeError в рантайме у сборки зависимостей, забывшей их указать,
+   * вместо ошибки компиляции. Цена ошибки — продукт, который не удаётся ни
+   * усыпить, ни разбудить, при полностью зелёном прогоне.
+   */
+  sleepProduct: (job: SleepJob) => Promise<void>;
+  wakeProduct: (job: SleepJob) => Promise<void>;
   sleep?: (ms: number) => Promise<unknown>;
   log?: (message: string) => void;
 }
@@ -104,10 +120,14 @@ export async function tick(deps: HostDeps): Promise<void> {
   }
 
   const job = outcome.job;
-  // В лог — только слаг, форма и id задания. Ни само задание, ни `secrets`,
-  // ни `runnerToken` логировать нельзя: журнал хоста читается шире, чем
-  // карточка продукта.
-  log(`[host] задание ${job.jobId}: ${job.kind} ${job.slug}`);
+  // В лог — только вид работы, слаг, форма и id задания. Ни само задание, ни
+  // `secrets`, ни `runnerToken` логировать нельзя: журнал хоста читается шире,
+  // чем карточка продукта.
+  //
+  // Вид работы в строке обязателен: без него журнал машины продуктов на сне и
+  // на заведении выглядит ОДИНАКОВО («задание j-1: site shop»), и разобрать по
+  // нему, что агент вообще делал с продуктом, нельзя.
+  log(`[host] задание ${job.jobId}: ${kindOf(job)} ${job.kind} ${job.slug}`);
 
   const report = await runJob(job, deps);
   const delivered = await deliver(job, report, deps);
@@ -117,7 +137,7 @@ export async function tick(deps: HostDeps): Promise<void> {
     // строке, потому что порт хранится ТОЛЬКО в отчёте: восстановить его
     // серверу неоткуда.
     log(
-      `[host] ВНИМАНИЕ: отчёт по заданию ${job.jobId} (${job.slug}) не доставлен. `
+      `[host] ВНИМАНИЕ: отчёт по заданию ${job.jobId} (${kindOf(job)} ${job.slug}) не доставлен. `
         + `Исход: ${report.ok ? `успех, порт ${report.port ?? 'нет'}` : `отказ — ${report.error}`}. `
         + 'Сервер закроет задание по сроку, состояние на хосте надо сверить руками.',
     );
@@ -127,18 +147,121 @@ export async function tick(deps: HostDeps): Promise<void> {
   // задание уже забрано и в 'queued' не вернётся.
 }
 
+/** Виды работы, которые агент умеет исполнять. */
+export const KNOWN_KINDS = ['provision', 'sleep', 'wake'] as const;
+export type JobKind = (typeof KNOWN_KINDS)[number];
+
 /**
- * Развёртывание. НЕ бросает: исход — это всегда отчёт, в том числе отказ.
+ * Вид работы по заданию.
+ *
+ * ОТСУТСТВИЕ ПОЛЯ — ЭТО ЗАВЕДЕНИЕ, а присутствие незнакомого значения —
+ * отказ, и это не противоречие. Поле не слал только сервер, который вида не
+ * знал вовсе; у такого сервера все задания и были заведением, и отказ здесь
+ * означал бы агента, выкаченного раньше бэкенда и не заводящего ни одного
+ * продукта ни у одного клиента. Значение, которого мы не знаем, приходит от
+ * сервера, который виды знает, — это новый вид, а не заведение.
+ *
+ * Цена ошибки в эту сторону измерена, а не предположена: сон, прочитанный как
+ * заведение, упирается в `provision` ДО первого изменения на хосте — там нет
+ * токена раннера («в задании нет токена раннера»), а если бы был, дальше стоит
+ * проверка занятого каталога («уже занят — провижининг ничего не трогал»).
+ * То есть худший исход неверного умолчания — невнятная причина в карточке, а
+ * не каркас поверх живого чекаута клиента.
+ */
+export function kindOf(job: HostJob): string {
+  return job.jobKind ?? 'provision';
+}
+
+function isKnown(kind: string): kind is JobKind {
+  return (KNOWN_KINDS as readonly string[]).includes(kind);
+}
+
+/**
+ * Что агент делает по заданию — ОДНО место, где вид превращается в действие.
+ *
+ * Бросает на неизвестном виде, и бросает ДО первого обращения к хосту: отказ
+ * честнее, чем развёртывание поверх работающего продукта. Выкат нового вида
+ * раньше агента — обычный порядок вещей (сервер катается deploy.sh, агент
+ * ставится на машину продуктов руками), и молчаливое «раз не знаю — значит
+ * заведение» превратило бы такой выкат в снос клиентских продуктов.
+ *
+ * Сон и пробуждение получают ЯВНУЮ ВЫЖИМКУ задания, а не его целиком. Полный
+ * `job` подошёл бы структурно (SleepJob — его подмножество) и утащил бы на
+ * хостовой шаг `runnerToken` с секретами, которых у этих видов не бывает.
+ * Выжимка ещё и делает потерю порта видимой: без него пробуждение сайта
+ * отказывает, и отказывает в тесте.
+ */
+function workFor(job: HostJob, deps: HostDeps): Promise<{ port?: number }> {
+  const kind = kindOf(job);
+  if (!isKnown(kind)) {
+    throw new Error(
+      `неизвестный вид задания: ${JSON.stringify(kind)}. Агент умеет `
+        + `${KNOWN_KINDS.join(', ')} — эта работа сделана НЕ БЫЛА, на хосте ничего `
+        + 'не тронуто. Похоже, сервер новее агента на машине продуктов.',
+    );
+  }
+  if (kind === 'provision') return deps.provision(job);
+
+  const step: SleepJob = { slug: job.slug, kind: job.kind, port: job.port };
+  const run = kind === 'sleep' ? deps.sleepProduct : deps.wakeProduct;
+  // Порт в отчёт не кладётся намеренно: у сна и пробуждения он не меняется,
+  // а `{ ok: true, port: undefined }` читается в логе и в теле как «порт
+  // потерян» — см. ниже, там же про COALESCE на сервере.
+  return run(step).then(() => ({}));
+}
+
+/**
+ * Что именно не уложилось в срок — словами и в правильном роде.
+ *
+ * Общая формулировка «провижининг не уложился» на сне читалась бы как
+ * заведение, которого никто не заказывал, а состояние хоста у каждого вида
+ * своё: после брошенного сна контейнер, возможно, ещё жив, после брошенного
+ * пробуждения — возможно, уже поднят, но домен остался на заглушке.
+ */
+function overdue(kind: string, budgetMs: number): string {
+  const sec = Math.round(budgetMs / 1000);
+  switch (kind) {
+    case 'sleep':
+      return (
+        `усыпление не уложилось в ${sec} с и брошено: состояние хоста НЕИЗВЕСТНО — `
+        + 'контейнер мог остаться живым, а домен уже стоять на заглушке, сверить руками'
+      );
+    case 'wake':
+      return (
+        `пробуждение не уложилось в ${sec} с и брошено: состояние хоста НЕИЗВЕСТНО — `
+        + 'контейнер мог подняться, а домен остаться на заглушке, сверить руками'
+      );
+    default:
+      return (
+        `провижининг не уложился в ${sec} с и брошен: состояние хоста НЕИЗВЕСТНО — `
+        + 'подчистка не отрабатывала, слаг, порт и контейнер могут быть заняты, '
+        + 'сверить руками'
+      );
+  }
+}
+
+/**
+ * Работа по заданию — любого вида. НЕ бросает: исход — это всегда отчёт, в том
+ * числе отказ.
  *
  * Молчаливое проглатывание оставило бы задание в 'running' навсегда, а продукт
  * висел бы в 'provisioning' до реаппера с чужой формулировкой про истёкший
  * срок — вместо настоящей причины, известной здесь и больше нигде.
+ *
+ * РАЗБОР ВИДА СТОИТ ЗДЕСЬ, А НЕ В `tick`, и это не вкусовщина. План задачи 8
+ * предлагал развернуть его наверху, рядом с `api.complete` — ровно та форма,
+ * от которой этот файл ушёл (см. шапку): `complete` внутри того же `try`
+ * означает, что отказ ДОСТАВКИ превращает успешный сон в отчёт об отказе, и
+ * сервер по такому отчёту поднимает продукт обратно в `degraded` при
+ * погашенном контейнере. Вид задания разбирается там, где считается исход, —
+ * и тогда маскировка причины, срок и досылка отчёта достаются всем трём видам
+ * даром, потому что они не знают о видах вовсе.
  */
 export async function runJob(job: HostJob, deps: HostDeps): Promise<JobReport> {
   const budget = deps.config.provisionTimeoutMs ?? DEFAULT_PROVISION_TIMEOUT_MS;
   let timer: NodeJS.Timeout | undefined;
   try {
-    const work = deps.provision(job);
+    const work = workFor(job, deps);
     // Отдельной страховки от unhandled rejection здесь НЕТ, и это проверено, а
     // не предположено. Опасение было такое: гонку выиграл срок, брошенный
     // провижининг падает позже, обработчика у него нет — и процесс умирает
@@ -153,14 +276,7 @@ export async function runJob(job: HostJob, deps: HostDeps): Promise<JobReport> {
       work,
       new Promise<never>((_, reject) => {
         timer = setTimeout(
-          () =>
-            reject(
-              new Error(
-                `провижининг не уложился в ${Math.round(budget / 1000)} с и брошен: `
-                  + 'состояние хоста НЕИЗВЕСТНО — подчистка не отрабатывала, '
-                  + 'слаг, порт и контейнер могут быть заняты, сверить руками',
-              ),
-            ),
+          () => reject(new Error(overdue(kindOf(job), budget))),
           budget,
         );
       }),
@@ -417,12 +533,16 @@ export function provisionOverrides(
 export interface RealDepsParts {
   log?: (message: string) => void;
   provision?: (job: HostJob, deps: ProvisionDeps) => Promise<{ port?: number }>;
+  sleepProduct?: (job: SleepJob, deps: ProvisionDeps) => Promise<void>;
+  wakeProduct?: (job: SleepJob, deps: ProvisionDeps) => Promise<void>;
   buildDeps?: (overrides: Partial<ProvisionDeps>) => ProvisionDeps;
 }
 
 export function realDeps(config: HostConfig, parts: RealDepsParts = {}): HostDeps {
   const log = parts.log ?? ((message: string) => console.log(message));
   const run = parts.provision ?? provisionReal;
+  const doSleep = parts.sleepProduct ?? sleepReal;
+  const doWake = parts.wakeProduct ?? wakeReal;
   const build = parts.buildDeps ?? hostDeps;
   return {
     config,
@@ -431,6 +551,19 @@ export function realDeps(config: HostConfig, parts: RealDepsParts = {}): HostDep
     // может только этот вызов.
     provision: (job: HostJob) =>
       run(job, build(provisionOverrides(config, log, job))),
+    // Зависимости хоста строит ТОТ ЖЕ `build(provisionOverrides(...))`, что и у
+    // заведения, и это не копипаста. `hostDeps()` без наложения умолчаний
+    // собирается молча и работает: `vhostBin` и сроки берутся из DEFAULTS, а
+    // `linkeonUrl` сну с пробуждением не нужен вовсе — то есть потерянная здесь
+    // сборка настроек не покраснела бы НИЧЕМ до того дня, когда хостовому шагу
+    // впервые понадобится стенд вместо прода. Один и тот же вызов на все три
+    // вида — чтобы такого дня не было.
+    //
+    // Второго аргумента маски (`job`) здесь нет намеренно: у сна и пробуждения
+    // ни секретов, ни токена раннера не бывает (claimJob их не присылает), а
+    // ПРИЧИНА отказа маскируется не здесь, а в runJob — там задание целиком.
+    sleepProduct: (job: SleepJob) => doSleep(job, build(provisionOverrides(config, log))),
+    wakeProduct: (job: SleepJob) => doWake(job, build(provisionOverrides(config, log))),
     log,
   };
 }
