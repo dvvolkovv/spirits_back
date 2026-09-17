@@ -15,9 +15,11 @@ import { SEND_HELPER, AUDIO_PART } from './common.mjs';
  * о недокументированном формате ломаются МОЛЧА: Google переставит поле, и будет
  * не ошибка, а тишина. Вёрстка ломается заметно. Решение владельца 16.09.2026.
  *
- * Подписи в зацепках английские не по небрежности: браузер для Meet поднимается
- * с локалью en-US (см. `bot.mjs`), иначе бот, работающий у нас, падал бы у
- * клиента с другим языком интерфейса.
+ * Зацепки ДВУЯЗЫЧНЫЕ, и это не перестраховка. Локаль браузера мы ставим
+ * английскую, но под учётной записью Google берёт язык из НЕЁ: живой заход
+ * 17.09.2026 показал полностью русскую прихожую — «Присоединиться»,
+ * «Выключить камеру». Держать одну сторону значило бы ломаться от настройки в
+ * чужом профиле.
  */
 export const meetPayload = (displayName) => `
 (() => {
@@ -38,7 +40,10 @@ export const meetPayload = (displayName) => `
   // остаётся счётчик на кнопке. Счётчика хватает: гейт по имени решает по
   // числу, наедине ли ассистент, а имена — приятное дополнение.
   const readPeople = () => {
-    const list = document.querySelector('div[aria-label="Participants"][role="list"]');
+    const list =
+      document.querySelector('div[aria-label="Participants"][role="list"]') ||
+      document.querySelector('div[aria-label="Участники"][role="list"]') ||
+      document.querySelector('div[role="list"][aria-label*="частник"]');
     if (list) {
       const names = [];
       for (const item of list.querySelectorAll('div[role="listitem"]')) {
@@ -48,7 +53,9 @@ export const meetPayload = (displayName) => `
       }
       if (names.length) return { people: names.map((name, i) => ({ uuid: 'meet-' + name, name })) };
     }
-    const btn = document.querySelector('button[aria-label="People"], button[aria-label*="People" i]');
+    const btn = document.querySelector(
+      'button[aria-label="People"], button[aria-label*="People" i], button[aria-label*="Люди" i], button[aria-label*="частник" i]',
+    );
     const m = btn ? clean(btn.innerText).match(/\\d+/) : null;
     // Минус мы сами: площадка считает и бота.
     if (m) return { humans: Math.max(0, Number(m[0]) - 1) };
@@ -74,7 +81,10 @@ export const meetPayload = (displayName) => `
   let probed = false;
 
   const chatInput = () =>
-    document.querySelector('textarea[aria-label="Send a message"], textarea[aria-label*="message" i]');
+    document.querySelector(
+      'textarea[aria-label="Send a message"], textarea[aria-label*="message" i],' +
+      ' textarea[aria-label*="сообщение" i], textarea[aria-label*="Отправить" i]',
+    );
 
   /**
    * Лента сообщений.
@@ -139,7 +149,7 @@ export const meetPayload = (displayName) => `
 
   /** Написать в общий чат. Ровно так это делает и Attendee — у Meet другого способа нет. */
   window.__botSendChat = (text) => {
-    const input = document.querySelector('textarea[aria-label="Send a message"], textarea[aria-label*="message" i]');
+    const input = chatInput();
     if (!input) return false;
     input.focus();
     input.value = String(text);
@@ -157,10 +167,14 @@ export const meetPayload = (displayName) => `
  * у них нет вовсе (см. выше).
  */
 export const MEET_JOIN = {
-  nameInput: 'input[type="text"][aria-label="Your name"], input[type="text"][aria-label*="name" i]',
-  joinButton: 'button:has-text("Ask to join"), button:has-text("Join now"), button:has-text("Join anyway")',
-  cameraOff: 'button[aria-label*="camera" i][aria-label*="Turn off" i], div[aria-label*="Turn off camera" i]',
-  inMeeting: 'button[aria-label="People"], button[aria-label*="People" i]',
-  chatButton: 'button[aria-label="Chat with everyone"], button[aria-label*="Chat" i]',
-  leaveButton: 'button[aria-label="Leave call"], button[aria-label*="Leave" i]',
+  // Поля имени под учётной записью нет вовсе — имя берётся из аккаунта. Шаг
+  // необязателен, и бот идёт дальше без него.
+  nameInput: 'input[type="text"][aria-label="Your name"], input[type="text"][aria-label*="name" i], input[type="text"][aria-label*="мя" i]',
+  // Точное совпадение текста, а не вхождение: «Другие способы присоединиться»
+  // содержит ту же подпись и перехватил бы клик.
+  joinButton: 'button:text-is("Join now"), button:text-is("Ask to join"), button:text-is("Join anyway"), button:text-is("Присоединиться"), button:text-is("Попросить войти")',
+  cameraOff: '[aria-label*="Turn off camera" i], [aria-label*="Выключить камеру" i]',
+  inMeeting: 'button[aria-label*="People" i], button[aria-label*="Люди" i], button[aria-label*="частник" i]',
+  chatButton: 'button[aria-label*="Chat with everyone" i], button[aria-label*="Чат со всеми" i], button[aria-label*="Чат" i]',
+  leaveButton: 'button[aria-label*="Leave call" i], button[aria-label*="Выйти из" i], button[aria-label*="Покинуть" i]',
 };

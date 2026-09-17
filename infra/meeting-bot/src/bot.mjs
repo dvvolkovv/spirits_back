@@ -484,7 +484,13 @@ export class MeetingBot {
       catch (e) { this.log.warn?.(`[${this.id}] ${what}: ${e?.message}`); return false; }
     };
 
-    const name = await waitFor(sel.nameInput);
+    // Имени может не быть вовсе.
+    //
+    // Под учётной записью Google его не спрашивает — берёт из аккаунта, и
+    // ждать поле тридцать секунд незачем: экран входа к этому времени давно
+    // нарисован. Тот же вывод и у Attendee: «signed in bot, name input is not
+    // present — assuming we don't need to fill it out».
+    const name = await waitFor(sel.nameInput, 8_000);
     if (name) {
       await name.fill(this.displayName).catch(() => {});
       this.log.info?.(`[${this.id}] имя введено`);
