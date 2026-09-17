@@ -504,7 +504,21 @@ export class MeetingBot {
     // площадка ещё думает; отличить одно от другого со стороны бота нельзя,
     // поэтому просто ждём до потолка и тогда называем причину.
     const deadline = Date.now() + ADMIT_TIMEOUT_MS;
+    let announced = false;
     while (Date.now() < deadline) {
+      // Прихожая важнее признака входа.
+      //
+      // У Meet кнопки чата и выхода есть и там, поэтому сначала спрашиваем, не
+      // ждём ли мы впуска, и только потом верим признаку. Иначе бот объявляет
+      // себя вошедшим, стоя за дверью, — и воркер начинает говорить в пустоту.
+      const waiting = sel.waitingRoom
+        ? await this.page.locator(sel.waitingRoom).first().count().catch(() => 0)
+        : 0;
+      if (waiting) {
+        if (!announced) { this.log.info?.(`[${this.id}] ждём, пока впустят`); announced = true; }
+        await this.page.waitForTimeout(2_000);
+        continue;
+      }
       if (await this.page.locator(sel.inMeeting).first().count().catch(() => 0)) {
         this.log.info?.(`[${this.id}] мы во встрече`);
         await click(sel.chatButton, 'панель чата открыта');

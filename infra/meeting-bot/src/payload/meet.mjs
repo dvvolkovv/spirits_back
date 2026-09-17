@@ -187,7 +187,19 @@ export const MEET_JOIN = {
     ' button:has(span:text-is("Попросить войти")),' +
     ' button:text-is("Присоединиться"), button:text-is("Join now"), button:text-is("Ask to join")',
   cameraOff: '[aria-label*="Turn off camera" i], [aria-label*="Выключить камеру" i]',
-  inMeeting: 'button[aria-label*="People" i], button[aria-label*="Люди" i], button[aria-label*="частник" i]',
-  chatButton: 'button[aria-label*="Chat with everyone" i], button[aria-label*="Чат со всеми" i], button[aria-label*="Чат" i]',
-  leaveButton: 'button[aria-label*="Leave call" i], button[aria-label*="Выйти из" i], button[aria-label*="Покинуть" i]',
+  /**
+   * Мы внутри встречи, а не в прихожей.
+   *
+   * Кнопки чата и выхода есть и в комнате ожидания — первая редакция цеплялась
+   * за них и объявляла вход, пока бот ждал впуска (живой заход 17.09.2026).
+   * Поэтому признак двойной: кнопка выхода ЕСТЬ, а надписи про ожидание НЕТ.
+   *
+   * Регистр в русских подписях пишем как есть: флаг `i` у CSS кириллицу не
+   * сворачивает — `[aria-label*="Чат" i]` не находит «Начать чат со всеми»,
+   * проверено на живой странице.
+   */
+  inMeeting: 'button[aria-label*="Leave call" i], button[aria-label*="Покинуть"]',
+  waitingRoom: 'text=/Подождите, пока организатор|Asking to be let in|Waiting for the host|попросил разрешения/i',
+  chatButton: 'button[aria-label*="Chat with everyone" i], button[aria-label*="чат со всеми"]',
+  leaveButton: 'button[aria-label*="Leave call" i], button[aria-label*="Покинуть"]',
 };
