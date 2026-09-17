@@ -22,6 +22,7 @@ import { Occupancy, MEET_EMPTY_GRACE_MS } from './occupancy.js';
 import { SpeakerLedger } from './speaker-ledger.js';
 import { Presence } from './presence.js';
 import { MixedRoomAudioInput } from './mixed-audio-input.js';
+import { meetingInputOptions } from './session-options.js';
 import { ExternalRoomAudioOutput } from './external-room-output.js';
 import { ExternalRoomChat, type IncomingChat, type SendResult } from './external-chat.js';
 import { AttendeeAudioHub, AttendeeAudioInput, AttendeeAudioOutput } from './attendee-audio.js';
@@ -1416,15 +1417,12 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
     });
 
     // Свой вход выставляем ДО start() — это поддержанный фреймворком порядок.
+    // Присвоить ПОСЛЕ значит отдать поле в гонку с RoomIO, на которой
+    // ассистент трижды оставался глухим (27–28.08.2026).
     //
-    // agent_session.js:403 проверяет `input.audio` перед созданием RoomIO и,
-    // найдя его занятым, пишет в лог «input.audio is already set, ignoring..»
-    // и свой аудиовход не подключает. Если же присвоить ПОСЛЕ start(), RoomIO
-    // успевает поставить свой, и дальше идёт гонка за одно поле — именно на
-    // ней ассистент трижды оставался глухим (27–28.08.2026).
-    //
-    // audioEnabled при этом трогать нельзя: с `false` условие выше не
-    // сработает, а заодно заглушится весь аудиотракт.
+    // Но одного этого НЕ ХВАТАЕТ, и здесь была главная поломка встреч:
+    // подстановку обязан дополнять `audioEnabled: false` у session.start(),
+    // иначе RoomIO затрёт наш вход своим. Подробности — там же, у флага.
     if (isMeeting) {
       if (isBridged && attendeeHub) {
         // Мост: звук целиком в вебсокете, комнаты для него нет вовсе — ни
@@ -1495,21 +1493,11 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
         // подключена через ctx.connect() выше — по ней идут job и дата-канал,
         // сессия просто о ней не знает.
         ...(isBridged ? {} : { room: foreign ?? ctx.room }),
-        // closeOnDisconnect: false — иначе сессия закрывается, когда выйдет
-        // тот участник, к которому RoomIO привязался первым, и встреча
-        // обрывается всем остальным.
-        //
-        // audioEnabled НЕ трогаем. Здесь я уже ошибся один раз: выставил
-        // false, рассуждая, что так гашу штатный вход RoomIO и остаётся мой.
-        // На деле этот флаг глушит ВЕСЬ аудиотракт сессии — в типах SDK прямо
-        // сказано, что setAttached существует ради того, чтобы mute работал и
-        // для подменённых входов. Ассистент вошёл во встречу глухим: в логах
-        // ни одного onInputSpeechStarted за весь разговор. Живая встреча
-        // 27.08.2026.
-        //
-        // Штатный вход и не появится: input.audio выставлен выше, и RoomIO,
-        // найдя поле занятым, свой аудиовход не создаёт.
-        ...(isMeeting ? { inputOptions: { closeOnDisconnect: false } } : {}),
+        // Оба флага — про то, чтобы встречу слышал наш микшер и чтобы она не
+        // обрывалась на первом вышедшем. Обоснование целиком, вместе с
+        // замерами, — в session-options.ts: там же оно проверяется тестом по
+        // коду установленного SDK.
+        ...(isMeeting ? { inputOptions: meetingInputOptions() } : {}),
       });
 
       // С этого момента generateReply работает. До него в чужой комнате мы
