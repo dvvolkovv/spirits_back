@@ -9,7 +9,7 @@ import {
   type Room,
 } from '@livekit/rtc-node';
 import { ReadableStream, TransformStream } from 'node:stream/web';
-import { createWriteStream } from 'node:fs';
+import { createWriteStream, readFileSync } from 'node:fs';
 import { Mixer, TICK_MS } from './mixer.js';
 
 /**
@@ -86,6 +86,21 @@ export class MixedRoomAudioInput extends voice.AudioInput {
   private readonly dumpPath = process.env.VOICE_MIX_DUMP || '';
   private dump?: import('node:fs').WriteStream;
 
+  /**
+   * Файл вместо комнаты — только для разбора.
+   *
+   * Когда задан `VOICE_INPUT_FILE`, вход берёт звук из файла (PCM s16 24 кГц
+   * моно) и отдаёт его в сессию ровно так же, как речь участников. Это
+   * единственный способ развести две оставшиеся версии: «теряет наш тракт
+   * комнаты» и «теряет машинерия SDK» — при файле от эталонного клиента
+   * отличается только вторая.
+   *
+   * 17.09.2026: сессия забирает все наши кадры, плагин отправляет в API ровно
+   * реальное время, команд-разрушителей нет, а размечается 2 реплики из 9 —
+   * при том что тот же звук через собственный клиент даёт 7.
+   */
+  private readonly fromFile = process.env.VOICE_INPUT_FILE || '';
+
   constructor(private readonly room: Room) {
     super();
 
@@ -160,6 +175,20 @@ export class MixedRoomAudioInput extends voice.AudioInput {
         if (pub.track) this.attach(pub.track, p.identity);
       }
     };
+
+    if (this.fromFile) {
+      console.log(`[вход] РАЗБОРНЫЙ РЕЖИМ: звук из файла ${this.fromFile}, комната не слушается`);
+      const pcm = readFileSync(this.fromFile);
+      const all = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
+      let off = 0;
+      const feed = setInterval(() => {
+        if (this.closed || off >= all.length) return;
+        const chunk = new Int16Array(all.subarray(off, off + INPUT_SAMPLES_PER_TICK));
+        off += INPUT_SAMPLES_PER_TICK;
+        this.mixer.push('файл', chunk);
+      }, TICK_MS);
+      feed.unref?.();
+    }
 
     for (const p of this.room.remoteParticipants.values()) subscribe(p);
 
