@@ -1,4 +1,7 @@
 import { chromium } from 'playwright';
+import { cp, rm } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
+import { join } from 'node:path';
 import WebSocket from 'ws';
 import { TELEMOST_PAYLOAD, TELEMOST_JOIN } from './payload/telemost.mjs';
 import { ZOOM_PAYLOAD } from './payload/zoom.mjs';
@@ -43,7 +46,18 @@ const PLATFORMS = {
     join: MEET_JOIN,
     name: 'Google Meet',
     channel: 'chrome',
-    humanize: true,
+    /**
+     * Профиль с уже выполненным входом в аккаунт Google.
+     *
+     * Meet пускает анонимного бота только через проверку на человека, которую
+     * мы обходить не стали (решение владельца 16.09.2026). Вошедшему под
+     * учётной записью она не нужна вовсе — так же устроен и Attendee: при
+     * входе с аккаунтом он сам переключается в «робототехнический» режим.
+     *
+     * Профиль заводится один раз руками (`google-login.sh`), пароль при этом
+     * не попадает ни в .env, ни в код.
+     */
+    profile: process.env.MEET_PROFILE_DIR || join(homedir(), '.linkeon-meet-profile'),
     // Тот же довод, что у Zoom: без устройств в списке площадка считает, что
     // микрофона нет. Meet на экране входа показывает выбранный — «Fake Default
     // Audio Input», — и это признак, что звук он у нас возьмёт.
@@ -76,6 +90,9 @@ export class MeetingBot {
     Object.assign(this, { id, meetingUrl, displayName, platform, wsUrl, webhookUrl, webhookSecret, metadata, log });
     this.state = 'ready';
     this.browser = null;
+    this.ctx = null;
+    /** Временная копия профиля Chrome, если площадка ходит под аккаунтом. */
+    this.profileCopy = null;
     this.page = null;
     this.ws = null;
     this.chatAuthors = new Map();
@@ -294,7 +311,8 @@ export class MeetingBot {
     if (!platform) throw new Error(`площадка ${this.platform} не поддержана`);
 
     await this.setState('joining');
-    this.browser = await chromium.launch({
+    // Как поднимается браузер — общее для обоих случаев.
+    const launch = {
       headless: false,
       // Настоящий Chrome, если площадка просит.
       //
@@ -305,14 +323,10 @@ export class MeetingBot {
       ...(platform.channel ? { channel: platform.channel } : {}),
       // Не представляться автоматикой.
       //
-      // Google Meet отказывает роботам ДО экрана входа: «You can't join this
-      // video call», поля имени нет вовсе, и отличить это от поломки входа по
-      // логу невозможно (16.09.2026 — час на разбор). Playwright объявляет себя
-      // сам: флаг `--enable-automation` и `navigator.webdriver`. Убираем и то,
-      // и другое — у Attendee ровно поэтому стоит тот же флаг блинка.
-      //
-      // Площадкам, где нас и так пускают, это не мешает: одно поведение на всех
-      // вместо ветки на каждую.
+      // Playwright объявляет себя сам: флаг `--enable-automation` и свойство
+      // `navigator.webdriver`. Убираем и то, и другое — у Attendee ровно
+      // поэтому стоит тот же флаг блинка. Площадкам, где нас и так пускают,
+      // это не мешает: одно поведение на всех вместо ветки на каждую.
       ignoreDefaultArgs: ['--enable-automation'],
       args: [
         '--no-sandbox',
@@ -328,11 +342,28 @@ export class MeetingBot {
         '--disable-extensions',
         ...(platform.chromeArgs || []),
       ],
-    });
-    const ctx = await this.browser.newContext({
+    };
+    const context = {
       permissions: ['microphone', 'camera'],
       locale: platform.locale || 'ru-RU',
-    });
+    };
+
+    let ctx;
+    if (platform.profile) {
+      // Работаем на КОПИИ профиля, а не на нём самом.
+      //
+      // Chrome держит на профиле замок: второй бот с тем же каталогом не
+      // поднимется вовсе. А ещё встреча не должна портить то, что владелец
+      // заводил руками, — куки останутся такими же, какими он их оставил.
+      this.profileCopy = join(tmpdir(), `meeting-bot-${this.id}`);
+      await cp(platform.profile, this.profileCopy, { recursive: true });
+      ctx = await chromium.launchPersistentContext(this.profileCopy, { ...launch, ...context, viewport: null });
+    } else {
+      this.browser = await chromium.launch(launch);
+      ctx = await this.browser.newContext(context);
+    }
+    this.ctx = ctx;
+
     await ctx.addInitScript(() => {
       // Вторая половина того же: флаг убран при запуске, свойство — здесь.
       try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) { /* уже переопределено */ }
@@ -343,7 +374,9 @@ export class MeetingBot {
     await ctx.addInitScript(
       typeof platform.payload === 'function' ? platform.payload(this.displayName) : platform.payload,
     );
-    this.page = await ctx.newPage();
+    // У профильного запуска одна вкладка уже открыта — берём её, иначе пустая
+    // так и останется висеть рядом.
+    this.page = ctx.pages()[0] || (await ctx.newPage());
 
     // Консоль страницы — в наш лог.
     //
@@ -453,18 +486,7 @@ export class MeetingBot {
 
     const name = await waitFor(sel.nameInput);
     if (name) {
-      if (PLATFORMS[this.platform]?.humanize) {
-        // Набираем посимвольно, а не подставляем строку.
-        //
-        // Площадка, которая проверяет, человек ли пришёл, смотрит и на это:
-        // мгновенно возникшее в поле имя ввода за собой не оставляет. Тем же
-        // занят режим «humanized» у Attendee. Задержки небольшие — нам не надо
-        // притворяться медленным, надо не выглядеть подстановкой.
-        await name.click().catch(() => {});
-        await name.type(this.displayName, { delay: 80 }).catch(() => {});
-      } else {
-        await name.fill(this.displayName).catch(() => {});
-      }
+      await name.fill(this.displayName).catch(() => {});
       this.log.info?.(`[${this.id}] имя введено`);
     } else {
       this.log.warn?.(`[${this.id}] поля имени не дождались`);
@@ -524,7 +546,15 @@ export class MeetingBot {
       else await this.page?.locator(PLATFORMS[this.platform].join.leaveButton).first().click({ timeout: 3_000 });
     } catch { /* уйдём закрытием браузера */ }
     try { this.ws?.close(); } catch { /* уже закрыт */ }
-    try { await this.browser?.close(); } catch (e) { this.log.warn?.(`[${this.id}] браузер не закрылся: ${e?.message}`); }
+    try {
+      if (this.browser) await this.browser.close();
+      else await this.ctx?.close();
+    } catch (e) { this.log.warn?.(`[${this.id}] браузер не закрылся: ${e?.message}`); }
+    // Копию профиля убираем за собой: в ней куки живого аккаунта.
+    if (this.profileCopy) {
+      await rm(this.profileCopy, { recursive: true, force: true })
+        .catch((e) => this.log.warn?.(`[${this.id}] копия профиля осталась: ${e?.message}`));
+    }
     if (this.state !== 'fatal_error') await this.setState('ended', { sub: 'left_meeting' });
   }
 }
