@@ -158,6 +158,12 @@ export const meetPayload = (displayName) => `
     return true;
   };
 
+  /** Кусок живой ленты — для разбора зацепок по факту, а не по догадке. */
+  window.__botChatSample = () => {
+    const panel = chatPanel();
+    return panel ? panel.innerHTML.slice(0, 4000) : '';
+  };
+
   send('ready', { url: location.host + location.pathname });
 })();
 `;
