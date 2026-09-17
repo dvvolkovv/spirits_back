@@ -2679,4 +2679,142 @@ maybe('провижининг против живого Postgres', () => {
       expect(await balanceOf('u-1')).toBe(70_000);
     });
   });
+
+  /**
+   * ОБОРОТ ПРОБУЖДЕНИЯ — задача 10, «пополнение баланса будит спящие продукты».
+   *
+   * План звал позвать `wakeAffordable` из места зачисления токенов, считая, что
+   * оно одно плюс купон. Мест тринадцать, и три из них TypeScript не видит
+   * вовсе: обе реферальные выплаты пишут `ai_profiles_consolidated` прямым
+   * UPDATE, а `redeem_coupon` зовёт зачисление изнутри Postgres. Поэтому крюк
+   * повешен на СОСТОЯНИЕ, а не на событие, и сценарий 79 ниже — прибор именно
+   * для этого: он пополняет баланс так, как это делает реферальная программа,
+   * и требует, чтобы продукт всё равно проснулся.
+   *
+   * Форма запросов — в rent.service.spec.ts; здесь только то, что на заглушках
+   * ненаблюдаемо: чей продукт проснулся, на сколько хватило бюджета и сколько
+   * заданий встало в очередь.
+   */
+  describe('оборот пробуждения', () => {
+    beforeAll(ensureBillingTables);
+    beforeEach(() => pool.query('TRUNCATE ai_profiles_consolidated, token_transactions'));
+    afterAll(() => pool.query('TRUNCATE ai_profiles_consolidated, token_transactions'));
+
+    it('77. пополнение будит спящие продукты владельца', async () => {
+      // Главный сценарий задачи. Зачисление и пробуждение — РАЗНЫЕ операции:
+      // пополнение не ждёт, пока поднимутся контейнеры, а пробуждение не
+      // пропадает, если поднять их не удалось.
+      const p = await due({ slug: 'topup-wake', status: 'sleeping', userId: 'u-pay' });
+      await setBalance('u-pay', 0);
+
+      // Пока денег нет, оборот ходит вхолостую и ничего не ставит.
+      expect(await rent().wakeTick()).toBe(0);
+      expect(await jobsOf(p.id)).toEqual([]);
+
+      await setBalance('u-pay', 60_000);
+
+      expect(await rent().wakeTick()).toBe(1);
+      expect(await jobKindsOf(p.id)).toEqual(['wake']);
+      expect(await jobsOf(p.id)).toEqual(['queued']);
+      // Деньги здесь НЕ списываются: аренду возьмёт оборот сборщика, когда
+      // продукт вернётся в running. Списание сейчас означало бы оплату месяца
+      // за продукт, который может и не подняться.
+      expect(await balanceOf('u-pay')).toBe(60_000);
+    });
+
+    it('78. обход идёт по всем владельцам, и каждый со своим бюджетом', async () => {
+      // Один владелец без денег не должен задерживать пробуждение соседу.
+      // Богатому хватает на два месяца — просыпаются оба его продукта.
+      const richA = await due({
+        slug: 'sweep-rich-a',
+        status: 'sleeping',
+        overdue: '10 days',
+        userId: 'u-rich',
+      });
+      const richB = await due({
+        slug: 'sweep-rich-b',
+        status: 'sleeping',
+        overdue: '5 days',
+        userId: 'u-rich',
+      });
+      const poor = await due({ slug: 'sweep-poor', status: 'sleeping', userId: 'u-poor' });
+      await setBalance('u-rich', 120_000);
+      await setBalance('u-poor', 1_000);
+
+      expect(await rent().wakeTick()).toBe(2);
+
+      expect(await jobKindsOf(richA.id)).toEqual(['wake']);
+      expect(await jobKindsOf(richB.id)).toEqual(['wake']);
+      expect(await jobsOf(poor.id)).toEqual([]);
+    });
+
+    it('79. зачисление ПРЯМЫМ UPDATE (реферальная программа) тоже будит', async () => {
+      // ПРИБОР ДЛЯ ВЫБОРА КРЮКА. `referral.service.payoutTokens` и
+      // `referral.service.register` пишут баланс именно так — мимо
+      // `add_user_tokens`, мимо `token_transactions` и мимо любого события, на
+      // которое можно было бы подписаться. Вызов пробуждения, расставленный по
+      // местам зачисления, этих двух путей не закрыл бы, и продукт не проснулся
+      // бы никогда: владелец видел бы деньги на балансе и спящий продукт
+      // одновременно.
+      const p = await due({ slug: 'referral-wake', status: 'sleeping', userId: 'u-ref' });
+      await setBalance('u-ref', 0);
+
+      await pool.query(
+        `UPDATE ai_profiles_consolidated SET tokens = COALESCE(tokens,0) + $1 WHERE user_id = $2`,
+        [70_000, 'u-ref'],
+      );
+
+      expect(await rent().wakeTick()).toBe(1);
+      expect(await jobKindsOf(p.id)).toEqual(['wake']);
+      // И следа в учёте у этого пути нет — то есть отбор «кому зачислили» по
+      // token_transactions не нашёл бы его тоже.
+      expect(await ledgerOf('u-ref')).toEqual([]);
+    });
+
+    it('80. продукт, который уже будят, второго задания не получает', async () => {
+      // Оборот ходит раз в минуту, а пробуждение длится минутами: старт
+      // контейнера, сборка, health-check. Без исключения активных заданий
+      // каждый оборот ставил бы поверх ещё одно, и агент хоста поднимал бы один
+      // и тот же контейнер по кругу.
+      const p = await due({ slug: 'already-waking', status: 'sleeping', userId: 'u-again' });
+      await setBalance('u-again', 500_000);
+
+      expect(await rent().wakeTick()).toBe(1);
+      expect(await rent().wakeTick()).toBe(0);
+      expect(await rent().wakeTick()).toBe(0);
+
+      expect(await jobKindsOf(p.id)).toEqual(['wake']);
+    });
+
+    it('81. оборот не трогает ни бодрствующих, ни архивных', async () => {
+      // Отбор владельцев идёт по спящим, но бюджет считается по всем спящим
+      // продуктам владельца. Архивный, попавший в отбор, съел бы место в
+      // бюджете и отнял пробуждение у живого соседа: денег здесь ровно на один
+      // месяц, а архивный уснул раньше и стоял бы в очереди первым.
+      const other = await bystander();
+      const awake = await due({ slug: 'sweep-awake', userId: 'u-mix' });
+      const archived = await due({
+        slug: 'sweep-archived',
+        status: 'sleeping',
+        overdue: '20 days',
+        userId: 'u-mix',
+      });
+      await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [archived.id]);
+      const asleep = await due({
+        slug: 'sweep-asleep',
+        status: 'sleeping',
+        overdue: '1 day',
+        userId: 'u-mix',
+      });
+      await setBalance('u-mix', 50_000);
+
+      expect(await rent().wakeTick()).toBe(1);
+
+      expect(await jobKindsOf(asleep.id)).toEqual(['wake']);
+      expect(await jobsOf(awake.id)).toEqual([]);
+      expect(await jobsOf(archived.id)).toEqual([]);
+      expect((await getProduct(awake.id)).status).toBe('running');
+      await expectUntouched(other);
+    });
+  });
 });

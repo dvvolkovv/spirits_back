@@ -214,6 +214,8 @@ function makeDispatch(o: {
   due?: any[];
   charged?: boolean | ((id: string) => boolean);
   sleepRows?: number;
+  owners?: any[];
+  wakeRows?: number | ((userId: string) => number);
   fail?: (sql: string, params: any[]) => boolean;
 } = {}) {
   const calls: { sql: string; params: any[] }[] = [];
@@ -221,6 +223,13 @@ function makeDispatch(o: {
     query: jest.fn(async (sql: string, params: any[] = []) => {
       calls.push({ sql, params });
       if (o.fail?.(sql, params)) throw new Error('база моргнула');
+      if (sql.includes('SELECT DISTINCT user_id FROM products')) {
+        return { rows: o.owners ?? [], rowCount: (o.owners ?? []).length };
+      }
+      if (sql.includes("'wake'")) {
+        const n = typeof o.wakeRows === 'function' ? o.wakeRows(params[0]) : (o.wakeRows ?? 1);
+        return { rows: [], rowCount: n };
+      }
       if (sql.includes('SELECT id FROM products')) {
         return { rows: o.due ?? [], rowCount: (o.due ?? []).length };
       }
@@ -240,6 +249,7 @@ function makeDispatch(o: {
   const log = {
     error: jest.spyOn((svc as any).logger, 'error').mockImplementation(() => undefined),
     warn: jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined),
+    info: jest.spyOn((svc as any).logger, 'log').mockImplementation(() => undefined),
   };
   return { svc, pg, calls, log };
 }
@@ -440,5 +450,117 @@ describe('RentService.wakeAffordable — форма запроса', () => {
     // задана самим INSERT INTO.
     expect(bare).toHaveLength(1);
     expect(sql).toContain('INSERT INTO product_provision_jobs (product_id, kind, status)');
+  });
+});
+
+/**
+ * ОБОРОТ ПРОБУЖДЕНИЯ — та самая «точка зачисления токенов» из задачи 10.
+ *
+ * План звал повесить пробуждение на место зачисления, подразумевая, что оно
+ * одно. Мест тринадцать (перечень — в докблоке над `WAKE_TICK_MS`), и три из
+ * них TypeScript не видит вовсе: два реферальных пишут баланс прямым UPDATE, а
+ * `redeem_coupon` зовёт зачисление изнутри Postgres. Поэтому крюк повешен на
+ * СОСТОЯНИЕ («спит, а денег хватает»), и тесты ниже сторожат именно это
+ * свойство: отбор идёт по спящим продуктам, а не по следам пополнения.
+ *
+ * Поведение против живой базы — сценарии 65–69 в
+ * provisioning.integration.spec.ts; там же зачисление прямым UPDATE, которое
+ * событийный крюк не заметил бы.
+ */
+describe('RentService.wakeTick — оборот пробуждения', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('владельцы берутся из СПЯЩИХ продуктов, а не из следов пополнения', async () => {
+    // Отбор «кому только что зачислили» пришлось бы читать из
+    // token_transactions, куда два реферальных пути не пишут вовсе, — то есть
+    // он вернул бы ровно ту дыру, от которой уходили.
+    const { svc, calls } = makeDispatch({ owners: [] });
+
+    await svc.wakeTick();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].sql).toContain('SELECT DISTINCT user_id FROM products');
+    expect(calls[0].sql).toContain("status = 'sleeping'");
+    expect(calls[0].sql).toContain('archived_at IS NULL');
+    expect(calls[0].sql).not.toContain('token_transactions');
+  });
+
+  it('каждому владельцу свой оператор пробуждения и свой userId', async () => {
+    // Бюджет считается ПЕРСОНАЛЬНО (сколько месяцев владелец может оплатить).
+    // Один запрос на всех повторил бы эту арифметику вторым экземпляром, а два
+    // экземпляра одной арифметики расходятся молча.
+    const { svc } = makeDispatch({ owners: [{ user_id: 'u-1' }, { user_id: 'u-2' }] });
+    const wake = jest.spyOn(svc, 'wakeAffordable').mockResolvedValue(0);
+
+    await svc.wakeTick();
+
+    expect(wake.mock.calls).toEqual([['u-1'], ['u-2']]);
+  });
+
+  it('битый владелец не останавливает пробуждение остальным', async () => {
+    // Иначе один сломавшийся владелец держит спящими ВСЕ продукты в системе, и
+    // узнать об этом можно только по жалобе того, кто уже заплатил.
+    const { svc, log } = makeDispatch({ owners: [{ user_id: 'u-bad' }, { user_id: 'u-ok' }] });
+    const wake = jest
+      .spyOn(svc, 'wakeAffordable')
+      .mockImplementation(async (userId: string) => {
+        if (userId === 'u-bad') throw new Error('база моргнула');
+        return 2;
+      });
+
+    await expect(svc.wakeTick()).resolves.toBe(2);
+
+    expect(wake).toHaveBeenCalledWith('u-ok');
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('u-bad'));
+  });
+
+  it('возвращается число поставленных заданий, а не число владельцев', async () => {
+    const { svc } = makeDispatch({
+      owners: [{ user_id: 'u-1' }, { user_id: 'u-2' }],
+      wakeRows: (userId) => (userId === 'u-1' ? 3 : 0),
+    });
+
+    expect(await svc.wakeTick()).toBe(3);
+  });
+
+  it('холостой оборот молчит в логе', async () => {
+    // Оборот ходит раз в минуту. «Разбужено 0» каждую минуту — это шум, в
+    // котором тонет всё остальное, включая строки про упавших владельцев.
+    const { svc, log } = makeDispatch({ owners: [{ user_id: 'u-1' }], wakeRows: 0 });
+
+    await svc.wakeTick();
+
+    expect(log.info).not.toHaveBeenCalled();
+  });
+
+  it('оборот пробуждения не падает наружу из таймера', async () => {
+    // `void this.wakeTick()` превратил бы любую ошибку в unhandled rejection, а
+    // он в этом процессе валит процесс целиком.
+    const { svc, log } = makeDispatch({ fail: () => true });
+
+    (svc as any).safeWakeTick();
+    await new Promise((r) => setImmediate(r));
+
+    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/оборот пробуждения упал/));
+  });
+
+  it('таймеров ДВА: списание и пробуждение, и оба снимаются', async () => {
+    // Списание месячное и ходит раз в сутки; пробуждение обслуживает владельца,
+    // который только что заплатил. Сведённые в один таймер, они дают либо
+    // суточное ожидание после оплаты, либо ежеминутный обход списания.
+    // Оба unref — иначе таймер держит процесс, и jest не завершается.
+    const { svc } = makeDispatch();
+    const intervals = jest.spyOn(global, 'setInterval');
+
+    svc.onModuleInit();
+    const periods = intervals.mock.calls.map((c) => c[1]);
+    svc.onModuleDestroy();
+
+    expect(periods).toHaveLength(2);
+    expect(periods).toContain(24 * 60 * 60 * 1000);
+    expect(periods).toContain(60 * 1000);
+    // Пробуждение — минуты, а не часы: владелец, только что заплативший, не
+    // должен ждать оборота списания.
+    expect(Math.min(...(periods as number[]))).toBeLessThanOrEqual(5 * 60 * 1000);
   });
 });
