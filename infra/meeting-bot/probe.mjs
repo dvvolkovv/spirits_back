@@ -100,7 +100,10 @@ const dump = await page.evaluate(() => {
     buttons: take('button, [role="button"]', (e) => {
       const label = e.getAttribute('aria-label') || '';
       const text = clean(e.innerText).slice(0, 40);
-      return label || text ? `aria="${label}" текст="${text}"` : null;
+      // Тег и роль важны не меньше подписи: зацепка `button:...` не возьмёт
+      // `div[role="button"]`, и по логу это неотличимо от «кнопки нет».
+      const tag = e.tagName.toLowerCase() + (e.getAttribute('role') ? `[role=${e.getAttribute('role')}]` : '');
+      return label || text ? `${tag} aria="${label}" текст="${text}"` : null;
     }),
     frames: [...document.querySelectorAll('iframe')].map((f) => f.src).slice(0, 10),
   };
