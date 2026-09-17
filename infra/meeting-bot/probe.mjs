@@ -118,6 +118,22 @@ if (dump.frames.length) {
   for (const f of dump.frames) console.log('  ', f);
 }
 
+// Проверка НАШИХ зацепок на живой странице.
+//
+// Разметку посмотреть мало: зацепка может не взять элемент, который на экране
+// прекрасно виден, и по логу бота это неотличимо от «элемента нет». Поэтому
+// спрашиваем прямо — сколько ловит каждая.
+if (platform === 'meet') {
+  const { MEET_JOIN } = await import('./src/payload/meet.mjs');
+  console.log('');
+  console.log('наши зацепки:');
+  for (const [name, sel] of Object.entries(MEET_JOIN)) {
+    let n = -1;
+    try { n = await page.locator(sel).count(); } catch (e) { console.log(`   ${name}: ОШИБКА ${e.message.slice(0, 80)}`); continue; }
+    console.log(`   ${name}: ${n}`);
+  }
+}
+
 const shot = `/tmp/probe-${platform}.png`;
 await page.screenshot({ path: shot });
 console.log('\nснимок:', shot);
