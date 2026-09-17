@@ -161,6 +161,17 @@ if (platform === 'meet' && process.argv.includes('внутрь')) {
     console.log('кнопки внутри встречи:');
     for (const b of inside) console.log('  ', b);
 
+    // Панели Meet прячет до движения мыши, и кнопка участников в список кнопок
+    // может не попасть вовсе. Поэтому отдельно — все подписи для незрячих.
+    const labels = await page.evaluate(() =>
+      [...document.querySelectorAll('[aria-label]')]
+        .map((e) => e.getAttribute('aria-label'))
+        .filter((l) => l && l.length < 60)
+        .slice(0, 60),
+    );
+    console.log('все подписи:');
+    for (const l of labels) console.log('   •', l);
+
     console.log('наши зацепки внутри:');
     for (const [name, sel] of Object.entries(MEET_JOIN)) {
       let n = -1;
