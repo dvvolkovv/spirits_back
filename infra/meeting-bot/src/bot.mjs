@@ -284,6 +284,16 @@ export class MeetingBot {
     }), this.log);
   }
 
+  /** Образец разметки ленты чата — для отладки зацепок на живой встрече. */
+  async chatSample() {
+    try {
+      return String((await this.page?.evaluate(() => window.__botChatSample?.())) || '');
+    } catch (e) {
+      this.log.warn?.(`[${this.id}] образец чата не снялся: ${e?.message}`);
+      return '';
+    }
+  }
+
   /**
    * Написать в общий чат встречи. `false` — площадка не приняла.
    *
