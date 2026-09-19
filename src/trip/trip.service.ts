@@ -309,15 +309,18 @@ export class TripService implements OnModuleInit {
    *  «TalerID не отдаёт». Убрать после разбора. */
   async debugRawCalendar(userId: string): Promise<any> {
     const now = new Date();
-    const start = now;
     const end = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-    const from = start.toISOString().slice(0, 10);
     const to = end.toISOString().slice(0, 10);
-    const [raw, mappedEvents] = await Promise.all([
-      this.taleridCalendar.debugRaw(userId, from, to),
-      this.taleridCalendar.listEvents(userId, start, end),
+    // Текущее окно (как в проде): from = сегодня по UTC-дате.
+    const fromUtc = now.toISOString().slice(0, 10);
+    // Гипотеза TZ-границы: расширяем from на 2 дня назад — если так «сегодняшние» события,
+    // хранящиеся как локальная полночь (prev-UTC-day), появляются → баг в границе окна.
+    const fromWide = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const [rawUtc, rawWide] = await Promise.all([
+      this.taleridCalendar.debugRaw(userId, fromUtc, to),
+      this.taleridCalendar.debugRaw(userId, fromWide, to),
     ]);
-    return { now: now.toISOString(), window: { from, to }, raw, mappedEvents };
+    return { now: now.toISOString(), windowUtc: { from: fromUtc, to }, windowWide: { from: fromWide, to }, rawUtc, rawWide };
   }
 
   /**
