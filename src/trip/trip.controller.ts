@@ -13,6 +13,13 @@ export class TripController {
     return this.trip.getState(String(user.userId));
   }
 
+  // ⚠️ ВРЕМЕННАЯ ДИАГНОСТИКА (calendar widget bug 2026-09-19) — убрать после разбора.
+  @Get('_diag_raw')
+  @UseGuards(JwtGuard)
+  async diagRaw(@CurrentUser() user: any) {
+    return this.trip.debugRawCalendar(String(user.userId));
+  }
+
   @Post('action')
   @UseGuards(JwtGuard)
   async action(@CurrentUser() user: any, @Body() body: any) {

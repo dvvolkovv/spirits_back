@@ -304,6 +304,22 @@ export class TripService implements OnModuleInit {
     return state;
   }
 
+  /** ⚠️ ВРЕМЕННАЯ ДИАГНОСТИКА (calendar widget bug 2026-09-19). Сырой фид TalerID (до фильтра
+   *  notEnded) + смапленные события + текущее время — чтобы отделить «фильтр прячет прошедшие» от
+   *  «TalerID не отдаёт». Убрать после разбора. */
+  async debugRawCalendar(userId: string): Promise<any> {
+    const now = new Date();
+    const start = now;
+    const end = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const from = start.toISOString().slice(0, 10);
+    const to = end.toISOString().slice(0, 10);
+    const [raw, mappedEvents] = await Promise.all([
+      this.taleridCalendar.debugRaw(userId, from, to),
+      this.taleridCalendar.listEvents(userId, start, end),
+    ]);
+    return { now: now.toISOString(), window: { from, to }, raw, mappedEvents };
+  }
+
   /**
    * Ф3 «day framing» — генерация тёплой строки на утро/вечер [2026-08-05]: детерминированные
    * факты (buildMorningFacts/buildEveningFacts, T1) → хеш → если факты не менялись с последней

@@ -127,6 +127,18 @@ export class TalerIdCalendarConnector {
     }
   }
 
+  /** ⚠️ ВРЕМЕННАЯ ДИАГНОСТИКА (calendar widget bug 2026-09-19): сырой ответ MCP для окна [from,to] —
+   *  события/расписание/задачи как есть, чтобы увидеть фантомы (разворот повтора) и что реально
+   *  отдаёт TalerID. Убрать после разбора. */
+  async debugRaw(userId: string, from: string, to: string): Promise<any> {
+    const [events, schedule, tasks] = await Promise.all([
+      this.callTool(userId, 'list_calendar_events', { from, to }).catch((e: any) => ({ error: String(e?.message) })),
+      this.callTool(userId, 'list_schedule', { from, to }).catch((e: any) => ({ error: String(e?.message) })),
+      this.callTool(userId, 'list_tasks', { from, to, includeDone: true }).catch((e: any) => ({ error: String(e?.message) })),
+    ]);
+    return { from, to, events, schedule, tasks };
+  }
+
   async createEvent(userId: string, event: ProposedEvent): Promise<{ created: number; failed: number; ids: string[] }> {
     const occurrences = expandOccurrences({
       datetime: event.datetime,
