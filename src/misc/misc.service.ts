@@ -472,13 +472,32 @@ ${LanguageService.buildDirective(userLanguage)}`;
     } catch (e: any) {
       // Процедуры может не оказаться на старой базе. В минус всё равно не уходим.
       this.logger.warn(`consume_user_tokens недоступна (${e.message}) — списываю с полом`);
-      await this.pg.query(
-        `UPDATE ai_profiles_consolidated
-            SET tokens = GREATEST(0, tokens - $1), updated_at = now()
-          WHERE user_id = $2`,
-        [amount, userId],
+      // Запасной путь СО СТРОКОЙ В РЕЕСТРЕ. Вторая причина в шапке метода
+      // («процедура пишет в token_transactions, у прямых UPDATE записи не
+      // было») к этой ветке до 21.09.2026 не относилась: она списывала мимо
+      // реестра ровно так же, как тот UPDATE, от которого уходили.
+      const done = await this.pg.query(
+        `WITH before AS (
+            SELECT COALESCE(tokens, 0) AS tokens FROM ai_profiles_consolidated
+             WHERE user_id = $2 FOR UPDATE
+         ), charged AS (
+            UPDATE ai_profiles_consolidated
+               SET tokens = GREATEST(0, COALESCE(tokens, 0) - $1), updated_at = now()
+             WHERE user_id = $2
+            RETURNING tokens AS balance_after
+         )
+         INSERT INTO token_transactions
+                (user_id, transaction_type, amount, balance_after, description, metadata)
+         SELECT $2, 'consumed', -(before.tokens - charged.balance_after), charged.balance_after,
+                $3, jsonb_build_object('kind', 'fallback_direct_deduct')
+           FROM before, charged
+         RETURNING -amount AS used`,
+        [amount, userId, description ?? null],
       );
-      return amount;
+      // Сколько списалось НА САМОМ ДЕЛЕ: пол мог забрать меньше запрошенного,
+      // а прежняя редакция возвращала `amount` всегда — вызывающий считал
+      // услугу оплаченной целиком.
+      return Number(done.rows[0]?.used ?? 0);
     }
   }
 

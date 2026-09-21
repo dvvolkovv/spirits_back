@@ -60,15 +60,23 @@ describe('MiscService.deductTokens', () => {
     expect(await svc.deductTokens('u1', 5000)).toBe(700);
   });
 
-  it('если процедуры нет — запасной UPDATE обязан быть с полом', async () => {
+  it('если процедуры нет — запасной UPDATE обязан быть с полом и с записью в реестр', async () => {
+    // ЭТОТ ТЕСТ ДОКАЗЫВАЕТ ФОРМУ, А НЕ ПОВЕДЕНИЕ: pg здесь мок, SQL не
+    // исполняется, и одинаково зелёными выглядели бы «пол работает» и «пол
+    // написан, но запрос падает». Поведение той же ветки на живом Postgres —
+    // в tokens/fallback-deducts.integration.spec.ts (процедура физически
+    // удаляется из базы, дальше проверяются баланс, пол и строка реестра).
     const { svc, calls } = makeService({ procThrows: true });
     await svc.deductTokens('u1', 5000);
 
     const upd = updateCall(calls);
     expect(upd).toBeDefined();
-    expect(upd!.sql).toMatch(/GREATEST\(0, tokens - \$1\)/);
+    expect(upd!.sql).toMatch(/GREATEST\(0, COALESCE\(tokens, 0\) - \$1\)/);
     // Именно этого варианта быть не должно — он и уводил в минус.
     expect(upd!.sql).not.toMatch(/SET tokens = tokens - \$1/);
+    // До 21.09.2026 запасной путь списывал мимо реестра — ровно тот дефект,
+    // от которого уходили, оставленный в catch-ветке.
+    expect(upd!.sql).toMatch(/INSERT INTO token_transactions/);
   });
 
   it('нулевая и отрицательная сумма не трогают баланс', async () => {

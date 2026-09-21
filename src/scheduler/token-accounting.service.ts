@@ -104,11 +104,27 @@ export class TokenAccountingService {
               [task.user_id, tokensToDeduct, description, metadata],
             );
           } catch {
+            // Запасной путь СО СТРОКОЙ В РЕЕСТРЕ — см. тот же разбор в
+            // tg-billing.service.deduct. Голый UPDATE уводил списание мимо
+            // token_transactions, и задача выглядела выполненной, а в истории
+            // движений её не было. Сумма берётся из разницы «до/после»: пол
+            // может забрать меньше запрошенного.
             await this.pg.query(
-              `UPDATE ai_profiles_consolidated
-               SET tokens = GREATEST(0, tokens - $1), updated_at = now()
-               WHERE user_id = $2`,
-              [tokensToDeduct, task.user_id],
+              `WITH before AS (
+                  SELECT COALESCE(tokens, 0) AS tokens FROM ai_profiles_consolidated
+                   WHERE user_id = $2 FOR UPDATE
+               ), charged AS (
+                  UPDATE ai_profiles_consolidated
+                     SET tokens = GREATEST(0, COALESCE(tokens, 0) - $1), updated_at = now()
+                   WHERE user_id = $2
+                  RETURNING tokens AS balance_after
+               )
+               INSERT INTO token_transactions
+                      (user_id, transaction_type, amount, balance_after, description, metadata)
+               SELECT $2, 'consumed', -(before.tokens - charged.balance_after), charged.balance_after,
+                      $3, $4::jsonb
+                 FROM before, charged`,
+              [tokensToDeduct, task.user_id, description, metadata],
             );
           }
 
