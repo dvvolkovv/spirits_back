@@ -57,10 +57,25 @@ ALTER TABLE user_id ADD COLUMN IF NOT EXISTS welcome_bonus_at timestamptz;
 UPDATE user_id SET welcome_bonus_at = create_date WHERE welcome_bonus_at IS NULL;
 
 -- Backfill: existing users (с непустым internal_id) получают phone-identity
+--
+-- Условие «internal_id из одних цифр» обязательное. У телефонной регистрации
+-- internal_id — сам номер, но у email/OAuth это UUID, и без фильтра бэкфилл
+-- заводил им связку provider='phone' с provider_sub, равным их же UUID. Войти
+-- по такой нельзя ничем: normalize('phone') выкидывает всё, кроме цифр, и
+-- совпадения не будет никогда.
+--
+-- Файл переутверждается на КАЖДОМ старте, поэтому каждый новый email-аккаунт
+-- получал такую связку при ближайшем рестарте. К 21.09.2026 их накопилось 51.
+-- Вреда, кроме мусора, они пока не принесли, но unlinkMethod считает способы
+-- входа как count(*) > 1 и на этом основании разрешил бы email-юзеру отвязать
+-- свой единственный настоящий метод.
+--
+-- Уже созданные строки этот файл не удаляет: DELETE, идущий на каждом старте,
+-- — слишком тупой инструмент для чистки связок входа. Разовая уборка отдельно.
 INSERT INTO user_identities (user_id, provider, provider_sub, email_verified)
 SELECT internal_id, 'phone', internal_id, false
 FROM user_id
-WHERE internal_id IS NOT NULL AND internal_id != ''
+WHERE internal_id IS NOT NULL AND internal_id ~ '^[0-9]+$'
 ON CONFLICT (provider, provider_sub) DO NOTHING;
 
 -- Refresh-токен Apple. Хранится ради одного действия — отзыва доступа при

@@ -1,3 +1,5 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import { IdentityService } from './identity.service';
 
 /**
@@ -207,5 +209,26 @@ describe('mergeAccounts — баланс и история не должны с�
 
     expect(calls.some((s) => /add_user_tokens/i.test(s))).toBe(false);
     expect(calls.some((s) => /state = 'deleted'/i.test(s))).toBe(true);
+  });
+});
+
+describe('бэкфилл phone-связок не трогает email/OAuth аккаунты', () => {
+  const sql = fs.readFileSync(
+    path.join(__dirname, 'migrations', '001_identity_init.sql'),
+    'utf8',
+  );
+
+  it('вставляет только тем, у кого internal_id — номер', () => {
+    // Файл переутверждается на каждом старте: без фильтра каждый новый
+    // email-аккаунт получал связку provider='phone' со своим же UUID.
+    const backfill = sql
+      .replace(/--[^\n]*/g, '')
+      .split(/INSERT INTO user_identities/i)
+      .find((chunk) => /'phone'/.test(chunk) && /FROM user_id\b/.test(chunk));
+
+    // Ложно-зелёный был бы здесь бесплатным: не найдя блок, тест прошёл бы
+    // на пустом месте — ровно так уже промахивался тест про констрейнт.
+    expect(backfill).toBeDefined();
+    expect(backfill).toMatch(/internal_id\s*~\s*'\^\[0-9\]\+\$'/);
   });
 });
