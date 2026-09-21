@@ -1067,18 +1067,30 @@ export class BlogTopicService {
     return r.rows[0] ? rowToPost(r.rows[0]) : null;
   }
 
-  /** Темы для кейсов: какие ассистенты реально востребованы за неделю. */
-  async topAssistants(limit = 5): Promise<Array<{ agentId: string; turns: number }>> {
+  /**
+   * Темы для кейсов: какие ассистенты реально востребованы за неделю.
+   * Колонка в `custom_chat_history` называется `agent` (integer) и ведёт в
+   * `agents.id` — имя ассистента берём оттуда, иначе подсказка редактору
+   * выглядела бы как «ассистент 12». Считаем только реплики человека:
+   * ответы ассистента удвоили бы каждый ход.
+   */
+  async topAssistants(limit = 5): Promise<Array<{ agentId: string; agentName: string; turns: number }>> {
     const r = await this.pg.query(
-      `SELECT assistant_id AS agent_id, count(*)::int AS turns
-         FROM custom_chat_history
-        WHERE created_at > now() - interval '7 days'
-        GROUP BY assistant_id
+      `SELECT a.id::text AS agent_id,
+              coalesce(a.display_name, a.name) AS agent_name,
+              count(*)::int AS turns
+         FROM custom_chat_history h
+         JOIN agents a ON a.id = h.agent
+        WHERE h.created_at > now() - interval '7 days'
+          AND h.sender_type = 'human'
+        GROUP BY a.id, agent_name
         ORDER BY turns DESC
         LIMIT $1`,
       [limit],
     );
-    return r.rows.map((x: any) => ({ agentId: x.agent_id, turns: Number(x.turns) }));
+    return r.rows.map((x: any) => ({
+      agentId: x.agent_id, agentName: x.agent_name, turns: Number(x.turns),
+    }));
   }
 
   /** Заголовки последних постов — уходят редактору, чтобы он не повторялся. */
@@ -2471,8 +2483,8 @@ export class BlogCron {
       for (const a of await this.topics.topAssistants(3)) {
         await this.topics.addTopic({
           rubric: 'case', source: 'stats', sourceRef: `stats:${a.agentId}`,
-          topicKey: normalizeTopicKey(`кейс ${a.agentId} ${new Date().toISOString().slice(0, 10)}`),
-          topicHint: `На этой неделе чаще всего обращались к ассистенту ${a.agentId} (${a.turns} обращений). Придумай кейс по его профилю.`,
+          topicKey: normalizeTopicKey(`кейс ${a.agentName} ${new Date().toISOString().slice(0, 10)}`),
+          topicHint: `На этой неделе чаще всего обращались к ассистенту «${a.agentName}» (${a.turns} обращений). Придумай кейс по его профилю.`,
         });
       }
     } catch (e: any) {
