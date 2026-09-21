@@ -193,7 +193,23 @@ export class AuthController {
     if (!email) {
       return res.set(CORS).status(400).type('html').send('<html><body><h1>Ссылка устарела или уже использована</h1></body></html>');
     }
-    const { userId } = await this.identity.resolveOrCreate('email', { email });
+    const resolved = await this.identity.resolveOrCreate('email', { email });
+    if (resolved.status === 'link_required') {
+      const ticket = await this.identity.issueLinkTicket('email', { email }, resolved.candidateUserId);
+      if ((req.headers['accept'] || '').includes('application/json')) {
+        return res.set(CORS).status(409).json({
+          error: 'link_required',
+          phoneHint: resolved.phoneHint,
+          linkTicket: ticket,
+        });
+      }
+      // Прямой клик по ссылке из письма: уводим на экран фронта, который
+      // объяснит выбор. Отдать здесь токены нельзя — аккаунта ещё нет.
+      const base = (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '');
+      const qs = `ticket=${encodeURIComponent(ticket)}&hint=${encodeURIComponent(resolved.phoneHint)}`;
+      return res.set(CORS).redirect(302, `${base}/auth/link?${qs}`);
+    }
+    const { userId } = resolved;
     const tokens = {
       'access-token':  this.jwt.signAccess(userId),
       'refresh-token': this.jwt.signRefresh(userId),
@@ -337,7 +353,16 @@ location.replace('/chat');
       return res.set(CORS).status(200).json({ linked: true });
     }
 
-    const { userId } = await this.identity.resolveOrCreate('google', userInfo);
+    const resolved = await this.identity.resolveOrCreate('google', userInfo);
+    if (resolved.status === 'link_required') {
+      const ticket = await this.identity.issueLinkTicket('google', userInfo, resolved.candidateUserId);
+      return res.set(CORS).status(409).json({
+        error: 'link_required',
+        phoneHint: resolved.phoneHint,
+        linkTicket: ticket,
+      });
+    }
+    const { userId } = resolved;
     return res.set(CORS).status(200).json({
       'access-token':  this.jwt.signAccess(userId),
       'refresh-token': this.jwt.signRefresh(userId),
@@ -377,7 +402,16 @@ location.replace('/chat');
       return res.set(CORS).status(200).json({ linked: true });
     }
 
-    const { userId } = await this.identity.resolveOrCreate('yandex', userInfo);
+    const resolved = await this.identity.resolveOrCreate('yandex', userInfo);
+    if (resolved.status === 'link_required') {
+      const ticket = await this.identity.issueLinkTicket('yandex', userInfo, resolved.candidateUserId);
+      return res.set(CORS).status(409).json({
+        error: 'link_required',
+        phoneHint: resolved.phoneHint,
+        linkTicket: ticket,
+      });
+    }
+    const { userId } = resolved;
     return res.set(CORS).status(200).json({
       'access-token':  this.jwt.signAccess(userId),
       'refresh-token': this.jwt.signRefresh(userId),
@@ -446,7 +480,16 @@ location.replace('/chat');
       return res.set(CORS).status(200).json({ linked: true });
     }
 
-    const { userId, isNew } = await this.identity.resolveOrCreate('apple', userInfo);
+    const resolved = await this.identity.resolveOrCreate('apple', userInfo);
+    if (resolved.status === 'link_required') {
+      const ticket = await this.identity.issueLinkTicket('apple', userInfo, resolved.candidateUserId);
+      return res.set(CORS).status(409).json({
+        error: 'link_required',
+        phoneHint: resolved.phoneHint,
+        linkTicket: ticket,
+      });
+    }
+    const { userId, isNew } = resolved;
 
     // Обмен кода на refresh-токен — ради будущего отзыва при удалении
     // аккаунта: Apple требует этого, а по identityToken отозвать нельзя.
@@ -501,6 +544,45 @@ location.replace('/chat');
     await this.redis.del(`merge-token-${mergeToken}`);
     await this.identity.mergeAccounts(conflictUserId, targetUserId);
     return res.set(CORS).status(200).json({ merged: true });
+  }
+
+  /**
+   * Привязать почту/OAuth из билета к аккаунту, в который человек только что
+   * вошёл по SMS. Два доказательства сходятся здесь: билет подтверждает
+   * владение ящиком, JWT — владение аккаунтом.
+   */
+  @UseGuards(JwtGuard)
+  @Post('auth/link/attach')
+  async linkTicketAttach(@Body() body: { ticket?: string }, @Req() req: any, @Res() res: Response) {
+    const userId = req.user?.userId;
+    if (!userId) return res.set(CORS).status(401).json({ error: 'unauthorized' });
+
+    const t = await this.identity.consumeLinkTicket(body?.ticket);
+    if (!t) return res.set(CORS).status(400).json({ error: 'ticket expired or invalid' });
+
+    const r = await this.identity.linkMethod(userId, t.provider, t.data);
+    if (!r.ok) return res.set(CORS).status(409).json({ error: (r as any).reason });
+    return res.set(CORS).status(200).json({ ok: true });
+  }
+
+  /**
+   * Всё-таки завести новый аккаунт. Выход для того, кто потерял доступ к
+   * номеру: без него человек оказался бы заперт вне обоих аккаунтов.
+   */
+  @Post('auth/link/new')
+  async linkTicketNewAccount(@Body() body: { ticket?: string }, @Res() res: Response) {
+    const t = await this.identity.consumeLinkTicket(body?.ticket);
+    if (!t) return res.set(CORS).status(400).json({ error: 'ticket expired or invalid' });
+
+    const r = await this.identity.resolveOrCreate(t.provider, t.data, { forceNew: true });
+    if (r.status !== 'ok') {
+      this.logger.error(`link/new: resolveOrCreate вернул ${r.status} при forceNew`);
+      return res.set(CORS).status(500).json({ error: 'resolve failed' });
+    }
+    return res.set(CORS).status(200).json({
+      'access-token':  this.jwt.signAccess(r.userId),
+      'refresh-token': this.jwt.signRefresh(r.userId),
+    });
   }
 
   @UseGuards(JwtGuard)

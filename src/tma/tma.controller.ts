@@ -96,7 +96,12 @@ export class TmaController implements OnModuleInit {
       }
 
       stage = 'signup:resolveOrCreate';
-      const { userId } = await this.identity.resolveOrCreate('telegram', { sub });
+      // У telegram нет почты, значит и кандидата на привязку быть не может.
+      const resolved = await this.identity.resolveOrCreate('telegram', { sub });
+      if (resolved.status !== 'ok') {
+        throw new Error(`resolveOrCreate('telegram') вернул ${resolved.status}`);
+      }
+      const { userId } = resolved;
       stage = 'signup:tg_user_identities upsert';
       await this.pg.query(
         `INSERT INTO tg_user_identities (linkeon_user_id, tg_user_id, tg_username, tg_first_name)

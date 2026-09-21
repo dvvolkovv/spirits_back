@@ -98,12 +98,19 @@ export class TalerIdController {
       // Отказ на стороне провайдера — тоже конец входа, а не привязки:
       // возврат с `talerid_link` экран входа не понимает.
       if (error) return res.redirect(`${back}?talerid_login_error=1`);
-      const handoff = await this.login.completeLogin(state, code);
+      const result = await this.login.completeLogin(state, code);
+      // Вход остановлен: эта почта уже указана в аккаунте с телефонным входом.
+      // Уводим на экран выбора, а не в общий talerid_login_error — иначе
+      // человек увидит «ошибка входа» там, где ошибки нет.
+      if (result?.kind === 'link_required') {
+        const qs = `ticket=${encodeURIComponent(result.ticket)}&hint=${encodeURIComponent(result.phoneHint)}`;
+        return res.redirect(`${base}/auth/link?${qs}`);
+      }
       // Токены уезжают не в адресной строке, а одноразовым кодом: строка
       // осела бы в истории браузера и в логах прокси.
       return res.redirect(
-        handoff
-          ? `${back}?talerid_login=${encodeURIComponent(handoff)}`
+        result
+          ? `${back}?talerid_login=${encodeURIComponent(result.handoff)}`
           : `${back}?talerid_login_error=1`,
       );
     }
