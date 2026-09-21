@@ -4,6 +4,7 @@ import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { BlogSettingsService } from './blog-settings.service';
 import { BlogPost, canTransition, rowToPost } from './blog.types';
 import { buildCaption } from './blog-text';
+import { fetchImageBytes } from './blog-image.fetch';
 
 /**
  * Сколько раз пытаемся отдать пост в Telegram. Попытку считает захват
@@ -63,7 +64,15 @@ export class BlogPublisherService {
     const caption = buildCaption(post.title || '', post.body || '');
 
     try {
-      const msg: any = await this.tg.sendPhoto(Number(channelChatId), post.imageUrl, { caption });
+      // Картинку качаем сами и отдаём байтами: по ссылке Telegram её не
+      // забирает (см. `blog-image.fetch.ts`). Скачивание стоит внутри того же
+      // try, что и отправка, и намеренно ПОСЛЕ захвата: недоступное хранилище
+      // — такой же сорванный подход к каналу, как и отказ Telegram. Значит он
+      // тратит попытку, пишет причину в `last_error` и возвращает пост в
+      // очередь тем же путём. Качать до захвата означало бы бесконечные
+      // молчаливые ретраи без счётчика и без следа в админке.
+      const photo = await fetchImageBytes(post.imageUrl);
+      const msg: any = await this.tg.sendPhoto(Number(channelChatId), photo, { caption });
       const messageId = Number(msg.message_id);
       const url = buildPostUrl({ id: Number(msg.chat?.id ?? channelChatId), username: msg.chat?.username }, messageId);
 

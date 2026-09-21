@@ -1,4 +1,7 @@
+import axios from 'axios';
 import { BlogPublisherService, buildPostUrl } from './blog-publisher.service';
+
+jest.mock('axios');
 
 const post = (over: any = {}) => ({
   id: 'p1', rubric: 'case', source: 'stats', sourceRef: null, topicKey: 'k', topicHint: null,
@@ -21,6 +24,11 @@ describe('buildPostUrl', () => {
 });
 
 describe('BlogPublisherService.publish', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (axios.get as jest.Mock).mockResolvedValue({ data: Buffer.from('png-bytes') });
+  });
+
   it('захватывает пост и отправляет фото в канал', async () => {
     const pg = { query: jest.fn() };
     pg.query
@@ -99,6 +107,58 @@ describe('BlogPublisherService.publish', () => {
     const svc = new BlogPublisherService(pg as any, tg as any, settingsMock() as any);
 
     await svc.publish(post());
+    expect(pg.query.mock.calls[1][0]).toContain("status = 'failed'");
+  });
+
+  /**
+   * Ссылкой картинку отдавать нельзя: Telegram скачивает её своими серверами,
+   * а my.linkeon.io живёт за РФ-edge Selectel — фетчер Telegram до него не
+   * доходит и отвечает 400 «failed to get HTTP URL content». Тот же файл
+   * мультипартом принимается с первого раза (проверено на проде).
+   */
+  it('в канал уходят байты картинки, а не ссылка', async () => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValueOnce({ rows: [] });
+    const tg = { sendPhoto: jest.fn().mockResolvedValue({ message_id: 42, chat: { id: -1001234567890 } }) };
+    const svc = new BlogPublisherService(pg as any, tg as any, settingsMock() as any);
+
+    await svc.publish(post());
+
+    expect(axios.get).toHaveBeenCalledWith(
+      'https://minio/i.png',
+      expect.objectContaining({ responseType: 'arraybuffer' }),
+    );
+    const [chatId, photo] = tg.sendPhoto.mock.calls[0];
+    expect(chatId).toBe(-1001234567890);
+    expect(Buffer.isBuffer(photo)).toBe(true);
+    expect((photo as Buffer).toString()).toBe('png-bytes');
+  });
+
+  it('картинка не скачалась — в канал ничего не ушло, пост вернулся в очередь', async () => {
+    (axios.get as jest.Mock).mockRejectedValue(new Error('ECONNREFUSED'));
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow({ attempts: 1 })] }).mockResolvedValueOnce({ rows: [] });
+    const tg = { sendPhoto: jest.fn() };
+    const svc = new BlogPublisherService(pg as any, tg as any, settingsMock() as any);
+
+    const res = await svc.publish(post());
+
+    expect(res.ok).toBe(false);
+    expect(tg.sendPhoto).not.toHaveBeenCalled();
+    expect(pg.query.mock.calls[1][0]).toContain("status = 'approved'");
+    expect(pg.query.mock.calls[1][1][1]).toContain('ECONNREFUSED');
+  });
+
+  it('недоступная картинка на исчерпанных попытках роняет пост в failed', async () => {
+    (axios.get as jest.Mock).mockRejectedValue(new Error('ECONNREFUSED'));
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow({ attempts: 3 })] }).mockResolvedValueOnce({ rows: [] });
+    const tg = { sendPhoto: jest.fn() };
+    const svc = new BlogPublisherService(pg as any, tg as any, settingsMock() as any);
+
+    await svc.publish(post());
+
+    expect(tg.sendPhoto).not.toHaveBeenCalled();
     expect(pg.query.mock.calls[1][0]).toContain("status = 'failed'");
   });
 });
