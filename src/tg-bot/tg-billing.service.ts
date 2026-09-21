@@ -68,9 +68,31 @@ export class TgBillingService {
       await this.pg.query(`SELECT consume_user_tokens($1, $2, $3)`, [ownerUserId, tokens, 'tg-bot']);
     } catch (e: any) {
       this.logger.warn(`consume_user_tokens недоступна (${e.message}) — списываю с полом`);
+      // Запасной путь СО СТРОКОЙ В РЕЕСТРЕ. Раньше здесь стоял голый UPDATE:
+      // баланс падал, а в token_transactions не появлялось ничего — то самое
+      // расхождение, из-за которого «История» и прогноз расхода видят неполную
+      // картину. Списанное берётся не из $1, а из разницы «до/после»: пол
+      // GREATEST(0, …) может забрать меньше запрошенного, и записать в реестр
+      // запрошенное значило бы соврать на величину недобора.
+      //
+      // Одним оператором — иначе обрыв между UPDATE и INSERT воспроизводит ту
+      // же дыру. FOR UPDATE в `before` нужен, чтобы «до» и «после» читались
+      // вокруг одного и того же состояния строки при параллельном писателе.
       await this.pg.query(
-        `UPDATE ai_profiles_consolidated SET tokens = GREATEST(0, tokens - $1), updated_at = now()
-          WHERE user_id = $2`,
+        `WITH before AS (
+            SELECT COALESCE(tokens, 0) AS tokens FROM ai_profiles_consolidated
+             WHERE user_id = $2 FOR UPDATE
+         ), charged AS (
+            UPDATE ai_profiles_consolidated
+               SET tokens = GREATEST(0, COALESCE(tokens, 0) - $1), updated_at = now()
+             WHERE user_id = $2
+            RETURNING tokens AS balance_after
+         )
+         INSERT INTO token_transactions
+                (user_id, transaction_type, amount, balance_after, description, metadata)
+         SELECT $2, 'consumed', -(before.tokens - charged.balance_after), charged.balance_after,
+                'tg-bot', jsonb_build_object('kind', 'tg_bot_fallback_deduct')
+           FROM before, charged`,
         [tokens, ownerUserId],
       );
     }

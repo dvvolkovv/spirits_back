@@ -184,6 +184,49 @@ export class AuthController {
     return res.set(CORS).status(200).json({ sent: true });
   }
 
+  /**
+   * Подтверждение анкетной почты: адрес становится способом входа.
+   *
+   * Публичный, без JwtGuard, и это не упущение. Письмо открывают в почтовом
+   * клиенте на телефоне, а в Linkeon вошли в браузере на ноутбуке — требование
+   * JWT означало бы, что подтверждение работает только у тех, кто читает почту
+   * в том же браузере. Владение аккаунтом доказано раньше: userId лежит внутри
+   * одноразового токена, который мы сами положили в Redis, когда человек был
+   * авторизован (см. profile.controller → offerEmailAsLogin).
+   *
+   * В отличие от /auth/email/confirm этот эндпоинт НЕ впускает в аккаунт и
+   * токенов не выдаёт — он только добавляет способ входа.
+   */
+  @Get('auth/email/verify')
+  async emailVerify(@Query('token') token: string, @Res() res: Response) {
+    const page = (title: string, body: string) =>
+      `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head>` +
+      `<body style="font-family:system-ui;padding:40px;text-align:center">` +
+      `<h1 style="font-size:20px">${title}</h1><p style="color:#555">${body}</p></body></html>`;
+
+    // Проверка здесь, а не только в сервисе: эндпоинт публичный, и пустой
+    // параметр не должен доезжать до привязки даже при подменённом сервисе.
+    const data = token ? await this.email.consumeVerifyToken(token) : null;
+    if (!data) {
+      return res.set(CORS).status(400).type('html')
+        .send(page('Ссылка устарела', 'Она действует сутки и срабатывает один раз. Укажите почту заново — придёт новая.'));
+    }
+
+    const r = await this.identity.linkMethod(data.userId, 'email', { email: data.email });
+    if (!r.ok) {
+      const reason = (r as any).reason;
+      this.logger.warn(`email verify: linkMethod вернул ${reason} для ${data.userId}`);
+      const explain = reason === 'conflict'
+        ? 'Этот адрес уже стал входом в другой аккаунт. Войдите по нему или укажите другую почту.'
+        : 'Не удалось подтвердить адрес. Попробуйте указать почту заново.';
+      return res.set(CORS).status(409).type('html').send(page('Подтвердить не вышло', explain));
+    }
+
+    this.logger.log(`email verified as login: ${data.email} → ${data.userId}`);
+    return res.set(CORS).status(200).type('html')
+      .send(page('Почта подтверждена', 'Теперь в linkeon.io можно входить и по ней — аккаунт тот же, история и баланс на месте.'));
+  }
+
   @Get('auth/email/confirm')
   async emailConfirm(@Query('token') token: string, @Req() req: Request, @Res() res: Response) {
     if (!token) {

@@ -4,6 +4,7 @@ import { ProfileService } from './profile.service';
 import { Neo4jModule } from '../neo4j/neo4j.module';
 import { IdentityModule } from '../identity/identity.module';
 import { OAuthAppleService } from '../auth/oauth-apple.service';
+import { EmailService } from '../auth/email.service';
 
 @Module({
   imports: [Neo4jModule, IdentityModule],
@@ -13,7 +14,7 @@ import { OAuthAppleService } from '../auth/oauth-apple.service';
   // бы рискнуть круговой зависимостью — AuthModule сам тянет IdentityModule.
   // Сервис не хранит состояния между вызовами, кроме кеша публичных ключей
   // Apple, так что второй экземпляр ничего не ломает.
-  providers: [ProfileService, OAuthAppleService],
+  providers: [ProfileService, OAuthAppleService, EmailService],
   exports: [ProfileService],
 })
 export class ProfileModule {}

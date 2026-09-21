@@ -3,6 +3,11 @@ import { PgService } from '../common/services/pg.service';
 import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
 import { EventsService } from '../events/events.service';
 import axios from 'axios';
+import * as fs from 'fs';
+import * as path from 'path';
+
+/** Накатываются по порядку, при каждом старте, идемпотентным SQL. */
+const MIGRATIONS = ['001_user_id_to_text.sql', '002_backfill_offledger_accruals.sql'];
 
 // Двусторонний реф-бонус: приглашённому — стартовые токены при переходе по
 // ссылке (у пригласившего «сторона» = существующая комиссия с оплат).
@@ -28,6 +33,62 @@ const PAYOUT_MIN_RUB = 100;
 // на десятки рублей — каждая заявка обрабатывается руками.
 const WITHDRAW_MIN_RUB = 500;
 const WITHDRAW_METHODS = ['card', 'sbp'];
+
+// ═══ УЧЁТ РЕФЕРАЛЬНЫХ НАЧИСЛЕНИЙ ═══
+//
+// Оба начисления программы (бонус приглашённому и выплата комиссии токенами)
+// до 21.09.2026 шли прямым `UPDATE ... SET tokens = COALESCE(tokens,0) + $1` —
+// мимо add_user_tokens и мимо token_transactions. Баланс рос, а в реестре
+// движений следа не оставалось: «История пополнений» показывала пустоту,
+// админские отчёты недосчитывали начисленное, прогноз расхода считал медиану
+// по неполным данным. На проде так разошлись 320 000 токенов у 16 человек
+// (дозаливка — migrations/002).
+//
+// ПОЧЕМУ ТИП 'bonus', А НЕ НОВЫЙ 'referral'. transaction_type_enum — это enum в
+// базе, и новое значение требует ALTER TYPE на проде, где общий раннер
+// миграций застрял и не докатывает ничего. Пока значение не доехало бы до
+// фронта, история показывала бы реферальное начисление как «Правка»
+// (TopUpHistory.tsx подставляет adjustment на неизвестный тип). Реферальная
+// же специфика не теряется: она в metadata.kind — ровно как `product_rent` в
+// rent.service. Отчётам, которым нужно выделить программу, фильтровать по
+// `metadata->>'kind'`, а не по типу.
+const REFEREE_BONUS_KIND = 'referral_referee_bonus';
+const REFERRAL_PAYOUT_KIND = 'referral_payout';
+
+/** Соединение внутри уже открытой транзакции (PoolClient или PgService). */
+type Tx = { query(sql: string, params?: any[]): Promise<any> };
+
+/** Ответ add_user_tokens. Форма зафиксирована, её разбирают шесть модулей. */
+interface CreditResult {
+  success: boolean;
+  transaction_id: string;
+  previous_balance: number;
+  new_balance: number;
+  tokens_added: number;
+}
+
+/**
+ * Зачисление через хранимую процедуру: баланс под FOR UPDATE + строка в
+ * token_transactions, одним вызовом и в транзакции вызывающего.
+ *
+ * ВЫЗЫВАТЬ ТОЛЬКО ПОСЛЕ ПРОВЕРКИ, ЧТО СТРОКА ПРОФИЛЯ ЕСТЬ. Процедура на
+ * отсутствующем профиле не отказывает: возвращает success:true, баланс не
+ * меняет, а в реестр пишет — см. «чего сознательно не чиним» в
+ * tokens/migrations/001. Здесь это не лечится: заведение профиля из
+ * зачисления поменяло бы поведение всем девяти вызывающим.
+ */
+async function creditTokens(
+  tx: Tx,
+  opts: { userId: string; amount: number; description: string; metadata: Record<string, unknown> },
+): Promise<CreditResult> {
+  const r = await tx.query(
+    `SELECT add_user_tokens($1, $2, 'bonus'::transaction_type_enum, $3, $4::jsonb) AS res`,
+    [opts.userId, opts.amount, opts.description, JSON.stringify(opts.metadata)],
+  );
+  const raw = r.rows[0].res;
+  // node-pg отдаёт json объектом, но на старом драйвере — строкой.
+  return typeof raw === 'string' ? JSON.parse(raw) : raw;
+}
 
 // Авто-тиры комиссии L1: % растёт по числу ОПЛАТИВШИХ рефери (подтверждено
 // владельцем 2026-06-27). 0–4 → 10%, 5–14 → 12%, 15+ → 15%. Спец-сделки админа
@@ -98,6 +159,49 @@ export class ReferralService implements OnModuleInit {
       await this.pg.query(`ALTER TABLE referral_leaders ADD COLUMN IF NOT EXISTS payout_notified boolean NOT NULL DEFAULT false`);
     } catch (e: any) {
       this.logger.error(`referral_leaders.payout_notified migration failed: ${e.message}`);
+    }
+
+    // Файлы из migrations/ — СТРОГО ПОСЛЕ инлайнового DDL выше: 002 читает
+    // bonus_tokens и referral_token_payouts, которые заводятся там.
+    //
+    // До 21.09.2026 каталог не накатывал никто: 001 лежал в нём с момента
+    // написания, а на прод уезжал руками через psql. Файл в migrations/ сам по
+    // себе ничего не значит — накатка добавлена здесь тем же способом, каким
+    // это сделано в tokens и products (общий `npm run migrate` на проде
+    // застрял на base/001 и не докатывает ничего после него).
+    for (const f of MIGRATIONS) await this.applyMigration(f);
+  }
+
+  /**
+   * Идемпотентный SQL из migrations/. Два кандидата на путь: рядом с собранным
+   * js (dist) и в исходниках — `nest build` .sql в dist не кладёт, и второй
+   * путь единственный, по которому файл находится на проде.
+   *
+   * «Не нашёл» и «нашёл и не применил» различаются намеренно: первое — warn
+   * (dist без исходников), второе — error. Слить их значило бы спрятать
+   * сломанную миграцию за буднично выглядящим «skipping».
+   */
+  private async applyMigration(filename: string): Promise<void> {
+    const candidates = [
+      path.join(__dirname, 'migrations', filename),
+      path.join(__dirname, '..', '..', 'src', 'referral', 'migrations', filename),
+    ];
+    let found = false;
+    for (const p of [...new Set(candidates)]) {
+      if (!fs.existsSync(p)) continue;
+      found = true;
+      try {
+        await this.pg.query(fs.readFileSync(p, 'utf8'));
+        this.logger.log(`referral migration ${filename} applied from ${p}`);
+        return;
+      } catch (e: any) {
+        this.logger.error(`referral migration ${filename} failed (${p}): ${e.message}`);
+      }
+    }
+    if (found) {
+      this.logger.error(`referral migration ${filename} was found but did not apply on any candidate path`);
+    } else {
+      this.logger.warn(`referral migration ${filename} not found, skipping`);
     }
   }
 
@@ -271,24 +375,54 @@ export class ReferralService implements OnModuleInit {
       const tokens = Math.round(rub * PAYOUT_RATE_TOKENS_PER_RUB);
       const ids = unpaid.rows.map((r) => r.id);
 
-      const bal = await client.query(
-        'UPDATE ai_profiles_consolidated SET tokens = COALESCE(tokens,0) + $1 WHERE user_id = $2 RETURNING tokens',
-        [tokens, userId],
+      // ПРОВЕРКА ПРОФИЛЯ ДО ЗАЧИСЛЕНИЯ — и именно ради отказа. add_user_tokens
+      // на отсутствующей строке профиля отвечает success:true, баланс никуда не
+      // пишет (UPDATE не находит строку), а запись в token_transactions всё
+      // равно создаёт. Прямой UPDATE отличал этот случай сам — по пустому
+      // RETURNING; процедура его прячет. Без явной проверки вывод «удался» бы:
+      // комиссии ушли в paid_out, в реестре появилось начисление, а на балансе
+      // не прибавилось ничего — то есть вместо громкого отказа человек молча
+      // терял накопленное.
+      //
+      // FOR UPDATE, а не голый SELECT: замок держится до конца транзакции, и
+      // строка не может исчезнуть в зазоре между проверкой и процедурой.
+      // Процедура возьмёт тот же замок повторно — внутри своей же транзакции
+      // это бесплатно.
+      const profile = await client.query(
+        'SELECT 1 FROM ai_profiles_consolidated WHERE user_id = $1 FOR UPDATE',
+        [userId],
       );
-      if (!bal.rows[0]) {
+      if (!profile.rowCount) {
         await client.query('ROLLBACK');
         throw new BadRequestException('Профиль не найден для зачисления токенов');
       }
+
       await client.query('UPDATE referral_commissions SET paid_out = true WHERE id = ANY($1)', [ids]);
       await client.query('UPDATE referral_leaders SET payout_notified = false WHERE id = $1', [leaderId]);
-      await client.query(
+      // Журнал выплаты пишется ДО зачисления ради его id: он уезжает в metadata
+      // начисления и служит ключом, по которому дозаливка отличает уже учтённую
+      // выплату от неучтённой. Порядок внутри транзакции ничего не стоит.
+      const payout = await client.query(
         `INSERT INTO referral_token_payouts (leader_id, user_phone, rub, tokens, rate, commission_ids)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
         [leaderId, userId, rub, tokens, PAYOUT_RATE_TOKENS_PER_RUB, ids],
       );
+      const res = await creditTokens(client, {
+        userId,
+        amount: tokens,
+        description: `Реферальное вознаграждение: ${rub} ₽`,
+        metadata: {
+          kind: REFERRAL_PAYOUT_KIND,
+          payout_id: payout.rows[0].id,
+          leader_id: leaderId,
+          rub,
+          rate: PAYOUT_RATE_TOKENS_PER_RUB,
+          commission_ids: ids,
+        },
+      });
       await client.query('COMMIT');
       this.logger.log(`referral payout tokens: ${userId} ${rub}₽ → ${tokens} tokens`);
-      return { rub, tokens, newBalance: Number(bal.rows[0].tokens) || 0 };
+      return { rub, tokens, newBalance: Number(res.new_balance) || 0 };
     } catch (e) {
       try { await client.query('ROLLBACK'); } catch { /* ignore */ }
       throw e;
@@ -313,30 +447,65 @@ export class ReferralService implements OnModuleInit {
     );
     if (existing.rows.length) return { success: false, error: 'Already registered' };
 
-    const ins = await this.pg.query(
-      `INSERT INTO referral_referees (referee_phone, leader_id)
-       VALUES ($1, $2) ON CONFLICT (referee_phone) DO NOTHING RETURNING id`,
-      [userId, leader.rows[0].id],
-    );
-
-    // Двусторонний бонус: приглашённому — стартовые токены (один раз, только при
-    // новой записи referee → не фармится повторными запросами).
+    // Регистрация рефери и его бонус — В ОДНОЙ ТРАНЗАКЦИИ. Раньше это были три
+    // отдельных запроса на автокоммите: вставка referee, зачисление, отметка
+    // bonus_tokens. Идемпотентность бонуса держится на том, что вставка
+    // referee произошла ровно один раз (`RETURNING id`), но пережить отметку
+    // «бонус выдан» вставка была не обязана: обрыв между ними оставлял рефери
+    // с bonus_tokens = 0 и начисленными токенами — и повторить выдачу было уже
+    // нельзя (`Already registered`), и понять по журналу, выдали или нет, тоже.
     let bonusTokens = 0;
-    if (ins.rows.length) {
-      const bal = await this.pg.query(
-        'UPDATE ai_profiles_consolidated SET tokens = COALESCE(tokens,0) + $1 WHERE user_id = $2 RETURNING tokens',
-        [REFEREE_BONUS_TOKENS, userId],
+    let registered = false;
+    const client = await this.pg.getClient();
+    try {
+      await client.query('BEGIN');
+      const ins = await client.query(
+        `INSERT INTO referral_referees (referee_phone, leader_id)
+         VALUES ($1, $2) ON CONFLICT (referee_phone) DO NOTHING RETURNING id`,
+        [userId, leader.rows[0].id],
       );
-      if (bal.rows.length) {
-        bonusTokens = REFEREE_BONUS_TOKENS;
-        await this.pg.query('UPDATE referral_referees SET bonus_tokens = $1 WHERE referee_phone = $2', [bonusTokens, userId]);
-        this.events?.track('referral_referee_bonus', { userId, props: { tokens: bonusTokens, leader_id: leader.rows[0].id } });
-        this.logger.log(`referee bonus: ${userId} +${bonusTokens} tokens (leader ${leader.rows[0].id})`);
+      // Двусторонний бонус: приглашённому — стартовые токены (один раз, только при
+      // новой записи referee → не фармится повторными запросами).
+      if (ins.rows.length) {
+        registered = true;
+        // См. payoutTokens: процедура не отличает «профиля нет» от успеха, и
+        // без этой проверки bonus_tokens в журнале разошёлся бы с балансом.
+        const profile = await client.query(
+          'SELECT 1 FROM ai_profiles_consolidated WHERE user_id = $1 FOR UPDATE',
+          [userId],
+        );
+        if (profile.rowCount) {
+          await creditTokens(client, {
+            userId,
+            amount: REFEREE_BONUS_TOKENS,
+            description: 'Реферальный бонус за регистрацию по приглашению',
+            metadata: { kind: REFEREE_BONUS_KIND, leader_id: leader.rows[0].id, slug },
+          });
+          bonusTokens = REFEREE_BONUS_TOKENS;
+          await client.query('UPDATE referral_referees SET bonus_tokens = $1 WHERE referee_phone = $2', [bonusTokens, userId]);
+        }
       }
+      await client.query('COMMIT');
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+      throw e;
+    } finally {
+      client.release();
+    }
+
+    if (bonusTokens) {
+      this.events?.track('referral_referee_bonus', { userId, props: { tokens: bonusTokens, leader_id: leader.rows[0].id } });
+      this.logger.log(`referee bonus: ${userId} +${bonusTokens} tokens (leader ${leader.rows[0].id})`);
+    }
+    if (registered) {
       // Атрибуция (A): реферал = referral-источник. Пишем signup_source, если он
       // пуст ИЛИ direct/organic — НЕ затираем реальный внешний канал (utm/ref-site).
       // Иначе реферал, зашедший без ?ref в URL (через сохранённый slug), оставался
       // бы 'direct' и не атрибутировался как реферальный в воронке.
+      //
+      // Осознанно ВНЕ транзакции выше: запрос и раньше был best-effort
+      // (`.catch(() => {})`), и втягивать его внутрь значило бы дать промаху
+      // атрибуции право откатить выданный бонус.
       await this.pg.query(
         `UPDATE ai_profiles_consolidated SET signup_source = $2
            WHERE user_id = $1 AND (signup_source IS NULL OR signup_source IN ('direct','organic'))`,
