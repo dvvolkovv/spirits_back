@@ -97,7 +97,7 @@ describe('ProvisioningService.claimJob', () => {
   it('берёт задание атомарно и не отдаёт его второму агенту', async () => {
     const { svc, calls } = makeService();
 
-    await svc.claimJob();
+    await svc.claimJob('own');
 
     const sql = sqlOf(calls);
     expect(sql).toContain('FOR UPDATE');
@@ -119,7 +119,7 @@ describe('ProvisioningService.claimJob', () => {
     // SKIP LOCKED. Дизъюнкции в этом запросе нет нигде и быть не должно.
     const { svc, calls } = makeService();
 
-    await svc.claimJob();
+    await svc.claimJob('own');
 
     expect(calls[0].sql).not.toMatch(/\bOR\b/);
   });
@@ -131,7 +131,7 @@ describe('ProvisioningService.claimJob', () => {
     // DESC, поэтому направление сторожится отдельно.
     const { svc, calls } = makeService();
 
-    await svc.claimJob();
+    await svc.claimJob('own');
 
     expect(calls[0].sql).toMatch(/ORDER BY\s+j\.created_at\s+ASC/);
     expect(calls[0].sql).not.toMatch(/DESC/i);
@@ -144,11 +144,55 @@ describe('ProvisioningService.claimJob', () => {
     // благодаря этому условию.
     const { svc, calls } = makeService();
 
-    await svc.claimJob();
+    await svc.claimJob('own');
 
     expect(calls[0].sql).toMatch(/EXISTS\s*\(\s*SELECT 1 FROM products p/);
     expect(calls[0].sql).toMatch(/p\.status = 'provisioning'/);
     expect(calls[0].sql).toMatch(/p\.archived_at IS NULL/);
+  });
+
+  it('задание отбирается по МЕТКЕ МАШИНЫ, и метка уезжает вторым параметром', async () => {
+    // Сегодня без этого условия задание достаётся тому, кто первым спросил:
+    // продукт клиента разворачивается на машине владельца, где его каталога
+    // нет. Метка спрашивается у ПРОДУКТА — у задания своей колонки машины нет.
+    const { svc, calls } = makeService();
+
+    // Не 'own': на метке машины владельца зелёной прошла бы константа в
+    // запросе, которая пока была бы ещё и верной.
+    await svc.claimJob('clients');
+
+    expect(calls[0].sql).toMatch(/p\.host_id = \$2/);
+    expect(calls[0].params[1]).toBe('clients');
+  });
+
+  it('метка сверяется НАД разбором по виду задания, а не внутри него', async () => {
+    // Условие, уехавшее в ветку CASE `WHEN 'provision'`, проходит главный
+    // сценарий зелёным и выпускает на чужую машину сон и пробуждение: сон
+    // гасит там контейнер, которого нет, отчитывается отказом, а продукт
+    // остаётся работать неоплаченным. Поведенческий сторож — 46в на живой базе;
+    // здесь пришпилен порядок условий, потому что мок SQL не исполняет.
+    const { svc, calls } = makeService();
+
+    await svc.claimJob('own');
+
+    expect(calls[0].sql).toMatch(
+      /p\.archived_at IS NULL[\s\S]*?AND p\.host_id = \$2[\s\S]*?AND CASE j\.kind/,
+    );
+  });
+
+  it('выдача без метки машины падает ГРОМКО и до базы не доходит', async () => {
+    // `p.host_id = NULL` в SQL не равно ничему: claimJob без метки вернул бы
+    // «очередь пуста» на любой непустой очереди. Агент опрашивал бы нас вечно и
+    // молча не получал работы — ровно тот отказ без единого признака, ради
+    // которого написан весь кусок. Пустая строка и undefined проверяются обе:
+    // первая — забытый параметр в контроллере, вторая — снятый гвард.
+    for (const bad of ['', undefined as any, null as any]) {
+      const { svc, calls } = makeService();
+
+      await expect(svc.claimJob(bad)).rejects.toThrow(/метк/i);
+
+      expect(calls).toHaveLength(0);
+    }
   });
 
   it('выданное задание помечается начатым, а не только «running»', async () => {
@@ -160,7 +204,7 @@ describe('ProvisioningService.claimJob', () => {
     // продукт запертым. Отказ молчаливый — статус-то правильный.
     const { svc, calls } = makeService();
 
-    await svc.claimJob();
+    await svc.claimJob('own');
 
     expect(calls[0].sql).toMatch(/started_at\s*=\s*now\(\)/);
   });
@@ -173,7 +217,7 @@ describe('ProvisioningService.claimJob', () => {
     // Тот же класс, что resolveOrCreate в identity.
     const { svc, calls } = makeService();
 
-    await svc.claimJob();
+    await svc.claimJob('own');
 
     expect(calls).toHaveLength(1);
     expect(calls[0].sql).toMatch(/^\s*WITH\b/);
@@ -185,7 +229,7 @@ describe('ProvisioningService.claimJob', () => {
     // и отказ был бы молчаливым.
     const { svc, calls } = makeService();
 
-    const job = await svc.claimJob();
+    const job = await svc.claimJob('own');
 
     expect(job!.runnerToken).toMatch(/^[0-9a-f]{64}$/);
     expect(sqlOf(calls)).toContain('runner_token_hash');
@@ -195,8 +239,13 @@ describe('ProvisioningService.claimJob', () => {
     // RunnerGuard посчитал бы от него sha256 ещё раз и не нашёл продукт:
     // молчаливый отказ ровно того вида, который эта проверка обязана
     // предотвращать.
+    // Список ЦЕЛИКОМ, а не `params[0]`: порядок параметров — это связь с
+    // текстом запроса ($1 — хеш, $2 — метка машины), и перепутанные местами они
+    // дают сверку host_id с хешем токена, то есть пустую выдачу на любой
+    // очереди. Молча.
     expect(calls[0].params).toEqual([
       crypto.createHash('sha256').update(job!.runnerToken).digest('hex'),
+      'own',
     ]);
     // Открытый токен в базу не ложится ни при каком раскладе.
     expect(calls[0].params).not.toContain(job!.runnerToken);
@@ -210,7 +259,7 @@ describe('ProvisioningService.claimJob', () => {
     // выданного задания.
     const { svc, calls } = makeService();
 
-    await svc.claimJob();
+    await svc.claimJob('own');
 
     expect(calls[0].sql).toMatch(
       /UPDATE products\s+SET runner_token_hash = \$1\s+WHERE id IN \(SELECT c\.product_id FROM claimed c WHERE c\.kind = 'provision'\)/,
@@ -233,7 +282,7 @@ describe('ProvisioningService.claimJob', () => {
     // 'site' там, где ждёт 'provision'.
     const { svc, calls } = makeService();
 
-    await svc.claimJob();
+    await svc.claimJob('own');
 
     const sql = calls[0].sql;
     expect(sql).toMatch(/secrets_encrypted AS box/);
@@ -257,7 +306,7 @@ describe('ProvisioningService.claimJob', () => {
     try {
       const { svc } = makeService();
 
-      const job = await svc.claimJob();
+      const job = await svc.claimJob('own');
 
       const drawn = spy.mock.results.map((r) => r.value as Buffer).filter(Buffer.isBuffer);
       expect(drawn).toHaveLength(1);
@@ -272,8 +321,8 @@ describe('ProvisioningService.claimJob', () => {
     // Константа вместо случайных байт проходит и «64 hex», и сверку с sha256.
     // Один токен на все продукты означал бы, что раннер любого продукта
     // проходит охрану от имени соседнего.
-    const a = await makeService().svc.claimJob();
-    const b = await makeService().svc.claimJob();
+    const a = await makeService().svc.claimJob('own');
+    const b = await makeService().svc.claimJob('own');
 
     expect(a!.runnerToken).not.toBe(b!.runnerToken);
   });
@@ -281,7 +330,7 @@ describe('ProvisioningService.claimJob', () => {
   it('секреты отдаются расшифрованными', async () => {
     const { svc, secrets } = makeService();
 
-    const job = await svc.claimJob();
+    const job = await svc.claimJob('own');
 
     expect(secrets.decrypt).toHaveBeenCalled();
     expect(job!.secrets).toEqual({ BOT_TOKEN: 'т' });
@@ -294,7 +343,7 @@ describe('ProvisioningService.claimJob', () => {
   it('пустая очередь — не ошибка', async () => {
     const { svc } = makeService({ claim: [] });
 
-    expect(await svc.claimJob()).toBeNull();
+    expect(await svc.claimJob('own')).toBeNull();
   });
 
   it('на пустой очереди ничего не записывается', async () => {
@@ -307,7 +356,7 @@ describe('ProvisioningService.claimJob', () => {
     // трогаются.
     const { svc, calls, secrets } = makeService({ claim: [] });
 
-    await svc.claimJob();
+    await svc.claimJob('own');
 
     expect(calls).toHaveLength(1);
     expect(secrets.decrypt).not.toHaveBeenCalled();
@@ -320,7 +369,7 @@ describe('ProvisioningService.claimJob', () => {
     // заданию.
     const { svc } = makeService();
 
-    const job = await svc.claimJob();
+    const job = await svc.claimJob('own');
 
     expect(job).toEqual({
       jobId: 'j-1',
@@ -342,7 +391,7 @@ describe('ProvisioningService.claimJob', () => {
     // виден только глазами и уже на готовом продукте.
     const { svc, calls } = makeService();
 
-    const job = await svc.claimJob();
+    const job = await svc.claimJob('own');
 
     expect(job!.name).toBe('Селянська');
     // Поля продукта берутся ПРЯМО ИЗ products, а не из RETURNING правки
@@ -359,7 +408,7 @@ describe('ProvisioningService.claimJob', () => {
     // признак «секретов нет» обязан читаться ДО вызова.
     const { svc, secrets } = makeService({ claim: [{ ...ROW, box: null }] });
 
-    const job = await svc.claimJob();
+    const job = await svc.claimJob('own');
 
     expect(job!.secrets).toEqual({});
     expect(secrets.decrypt).not.toHaveBeenCalled();
@@ -374,7 +423,7 @@ describe('claimJob: вид задания', () => {
       claim: [{ ...ROW, job_kind: 'sleep', token_issued: false, port: 8003 }],
     });
 
-    const job = await svc.claimJob();
+    const job = await svc.claimJob('own');
 
     expect(job!.jobKind).toBe('sleep');
   });
@@ -387,7 +436,7 @@ describe('claimJob: вид задания', () => {
       claim: [{ ...ROW, kind: 'bot', job_kind: 'wake', token_issued: false }],
     });
 
-    const job = await svc.claimJob();
+    const job = await svc.claimJob('own');
 
     expect([job!.kind, job!.jobKind]).toEqual(['bot', 'wake']);
   });
@@ -405,7 +454,7 @@ describe('claimJob: вид задания', () => {
     // есть развернул бы каркас поверх живого каталога клиента.
     const { svc, calls } = makeService();
 
-    await svc.claimJob();
+    await svc.claimJob('own');
 
     expect(calls[0].sql).toMatch(
       /CASE j\.kind\s+WHEN 'provision' THEN p\.status = 'provisioning'\s+ELSE p\.status = 'sleeping'\s+END/,
@@ -421,7 +470,7 @@ describe('claimJob: вид задания', () => {
       claim: [{ ...ROW, job_kind: 'wake', token_issued: false }],
     });
 
-    const job = await svc.claimJob();
+    const job = await svc.claimJob('own');
 
     // Ключа НЕТ, а не пустая строка: пустая строка — это третье состояние,
     // которое дальше по коду читается как «токен есть, но пустой».
@@ -435,7 +484,7 @@ describe('claimJob: вид задания', () => {
     // Здесь вид «заведение», а база говорит «не выпускали» — верить надо базе.
     const { svc } = makeService({ claim: [{ ...ROW, token_issued: false }] });
 
-    expect('runnerToken' in (await svc.claimJob())!).toBe(false);
+    expect('runnerToken' in (await svc.claimJob('own'))!).toBe(false);
   });
 
   it('сну и пробуждению секреты не расшифровываются', async () => {
@@ -445,7 +494,7 @@ describe('claimJob: вид задания', () => {
       claim: [{ ...ROW, job_kind: 'sleep', token_issued: false }],
     });
 
-    const job = await svc.claimJob();
+    const job = await svc.claimJob('own');
 
     expect(job!.secrets).toEqual({});
     expect(secrets.decrypt).not.toHaveBeenCalled();
@@ -458,7 +507,7 @@ describe('claimJob: вид задания', () => {
       claim: [{ ...ROW, job_kind: 'wake', token_issued: false, port: 8007 }],
     });
 
-    expect((await svc.claimJob())!.port).toBe(8007);
+    expect((await svc.claimJob('own'))!.port).toBe(8007);
   });
 
   it('у заведения порта нет, и это NULL, а не ноль', async () => {
@@ -467,7 +516,7 @@ describe('claimJob: вид задания', () => {
     // значение, и wakeProduct пошёл бы ждать ответа на порту 0.
     const { svc } = makeService();
 
-    expect((await svc.claimJob())!.port).toBeNull();
+    expect((await svc.claimJob('own'))!.port).toBeNull();
   });
 });
 
@@ -490,7 +539,7 @@ describe('claimJob: живой роундтрип через настоящий 
       ],
     });
 
-    const job = await svc.claimJob();
+    const job = await svc.claimJob('own');
 
     expect(job!.secrets).toEqual({ BOT_TOKEN: '123:abc' });
   });
@@ -499,7 +548,7 @@ describe('claimJob: живой роундтрип через настоящий 
     // Настоящий сервис на NULL падает TypeError, мок — нет.
     const { svc } = makeService({ secrets: realSecrets(), claim: [{ ...ROW, box: null }] });
 
-    const job = await svc.claimJob();
+    const job = await svc.claimJob('own');
 
     expect(job!.secrets).toEqual({});
   });
@@ -516,7 +565,7 @@ describe('claimJob: живой роундтрип через настоящий 
       claim: [{ ...ROW, product_id: 'p-1', box: чужая }],
     });
 
-    await expect(svc.claimJob()).rejects.toThrow();
+    await expect(svc.claimJob('own')).rejects.toThrow();
   });
 });
 
