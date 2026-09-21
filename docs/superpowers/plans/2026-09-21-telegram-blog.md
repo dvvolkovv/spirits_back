@@ -2064,6 +2064,17 @@ describe('BlogApprovalService.handleCallback', () => {
     expect(pg.query.mock.calls[1][0]).toContain("status = 'drafting'");
   });
 
+  it('переход, запрещённый машиной состояний, не пишется в базу', async () => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow({ status: 'approved' })] });
+    const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+
+    await svc.handleCallback({ id: 'cb1', data: 'blog:ok:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
+
+    expect(pg.query).toHaveBeenCalledTimes(1);   // только чтение
+  });
+
   it('чужой callback игнорируется полностью', async () => {
     const pg = { query: jest.fn() };
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
@@ -2171,7 +2182,16 @@ export class BlogApprovalService {
 
     // Вторая панель управления — админка. Пост мог уехать дальше, пока
     // сообщение висело в личке; тогда кнопка не делает ничего.
-    if (post.status !== 'pending_review') {
+    //
+    // Проверка идёт через общую машину состояний, а не через сравнение с
+    // 'pending_review': иначе `canTransition` остаётся мёртвым кодом с
+    // зелёными тестами, который читается как гарантия «пост не выйдет минуя
+    // апрув» и не охраняет ни одного перехода.
+    const TARGET_STATUS: Record<typeof parsed.action, BlogStatus> = {
+      ok: 'approved', redo: 'drafting', no: 'rejected',
+    };
+    const target = TARGET_STATUS[parsed.action];
+    if (!canTransition(post.status, target)) {
       await this.tg.answerCallbackQuery(cb.id, { text: `Пост уже обработан: ${post.status}` });
       return true;
     }
@@ -2360,6 +2380,11 @@ git commit -m "feat(blog): роутинг кнопок и правок блог�
 **Files:**
 - Create: `src/blog/blog.cron.ts`
 - Test: `src/blog/blog.cron.spec.ts`
+
+> **Требование ко всем записям статуса в этой задаче:** переход должен
+> проходить через `canTransition` из `./blog.types`, как в
+> `BlogApprovalService`. Мёртвая машина состояний с зелёными тестами хуже
+> отсутствующей — она создаёт ложную уверенность. Проверяется мутацией.
 
 - [ ] **Step 1: Написать падающий тест**
 
@@ -2658,6 +2683,13 @@ git commit -m "feat(blog): расписание — темы, черновики
 **Files:**
 - Create: `src/blog/blog.controller.ts`
 - Test: `src/blog/blog.controller.spec.ts`
+
+> **Требование ко всем записям статуса в этой задаче:** переход должен
+> проходить через `canTransition` из `./blog.types`, как это сделано в
+> `BlogApprovalService`. Иначе машина состояний снова превращается в мёртвый
+> код с зелёными тестами, который читается как гарантия «пост не выйдет
+> минуя апрув» и ничего не охраняет. Проверяется мутацией: `canTransition`,
+> всегда возвращающий `true`, обязан покрасить хотя бы один тест.
 
 - [ ] **Step 1: Написать падающий тест**
 
