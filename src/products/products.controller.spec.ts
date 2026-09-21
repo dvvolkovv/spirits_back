@@ -49,7 +49,7 @@ function makeController(events: any[]) {
   const provisioning = {
     create: jest.fn(async () => ({ productId: 'p-новый', runnerToken: 'ТОКЕН-РАННЕРА' })),
     retry: jest.fn(async () => undefined),
-    hostAgentLive: jest.fn(async () => true),
+    hostAgentsLiveForUser: jest.fn(async () => true),
   };
   return {
     ctrl: new ProductsController(products as any, turns as any, turnEvents as any, provisioning as any),
@@ -425,11 +425,43 @@ describe('ProductsController.list', () => {
     expect(res.setHeader).toHaveBeenCalledWith('X-Host-Agent', 'live');
   });
 
+  it('вердикт спрашивается про машины ВЛАДЕЛЬЦА ТОКЕНА', async () => {
+    // С реестром «жив ли агент» и «дойдёт ли работа до МОЕЙ машины» — разные
+    // вопросы. Вердикт, собранный по хостингу вообще, молчит ровно там, где
+    // нужен: живой агент одной машины отвечает за мёртвого соседа, и продукт
+    // на умершей машине висит «Заводится…» при зелёном индикаторе.
+    const { ctrl, provisioning } = makeController([]);
+    const res = makeRes();
+
+    await ctrl.list(user, res as any);
+
+    expect(provisioning.hostAgentsLiveForUser).toHaveBeenCalledWith('u-1');
+  });
+
+  it('словарь заголовка — ровно live и silent', async () => {
+    // Кабинет сверяет значение со списком известных и читает ЛЮБОЕ другое как
+    // «сервер ничего не сказал», то есть ГАСИТ тревогу (productsApi.list).
+    // Подробность вида `silent:clients` — это молчаливое выключение
+    // предупреждения у всех, кто не перезагрузил вкладку.
+    const { ctrl, provisioning } = makeController([]);
+
+    for (const [live, expected] of [
+      [true, 'live'],
+      [false, 'silent'],
+    ] as const) {
+      provisioning.hostAgentsLiveForUser.mockResolvedValueOnce(live);
+      const res = makeRes();
+      await ctrl.list(user, res as any);
+      const [, value] = res.setHeader.mock.calls.find(([h]: any[]) => h === 'X-Host-Agent')!;
+      expect(value).toBe(expected);
+    }
+  });
+
   it('молчащий агент хоста виден в ответе', async () => {
     // Без этого владелец узнаёт о мёртвом агенте только через десять минут и
     // с неверной причиной — «срок заведения истёк».
     const { ctrl, provisioning } = makeController([]);
-    provisioning.hostAgentLive.mockResolvedValueOnce(false);
+    provisioning.hostAgentsLiveForUser.mockResolvedValueOnce(false);
     const res = makeRes();
 
     await ctrl.list(user, res as any);
@@ -457,7 +489,7 @@ describe('ProductsController.list', () => {
     // а «агент молчит», выведенное из СВОЕГО отказа, отправило бы владельца
     // чинить исправную машину.
     const { ctrl, provisioning } = makeController([]);
-    provisioning.hostAgentLive.mockRejectedValueOnce(new Error('нет такой таблицы'));
+    provisioning.hostAgentsLiveForUser.mockRejectedValueOnce(new Error('нет такой таблицы'));
     const res = makeRes();
 
     await expect(ctrl.list(user, res as any)).resolves.not.toThrow();

@@ -1039,10 +1039,10 @@ describe('ProvisioningService.retry', () => {
  */
 describe('ProvisioningService.touchHostAgent', () => {
   function makeTouch(fail?: Error) {
-    const calls: string[] = [];
+    const calls: { sql: string; params?: any[] }[] = [];
     const pg = {
-      query: jest.fn(async (sql: string) => {
-        calls.push(sql);
+      query: jest.fn(async (sql: string, params?: any[]) => {
+        calls.push({ sql, params });
         if (fail) throw fail;
         return { rows: [], rowCount: 1 };
       }),
@@ -1055,11 +1055,27 @@ describe('ProvisioningService.touchHostAgent', () => {
   it('ставит отметку одной записью, без предварительного чтения', async () => {
     const { svc, calls } = makeTouch();
 
-    await svc.touchHostAgent();
+    await svc.touchHostAgent('own');
 
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toContain('INSERT INTO product_host_agent');
-    expect(calls[0]).toContain('ON CONFLICT (id) DO UPDATE');
+    expect(calls[0].sql).toContain('INSERT INTO product_host_agent');
+    // Ключ конфликта — МАШИНА. `ON CONFLICT (id)` после 006 не существует
+    // вовсе (колонки нет), но его переживший вариант «конфликт по любой
+    // строке» означал бы одну отметку на всё — то есть ровно то, что 006
+    // разбирает.
+    expect(calls[0].sql).toContain('ON CONFLICT (host_id) DO UPDATE');
+  });
+
+  it('отметка пишется ТОЙ машине, что спросила', async () => {
+    // Метка приезжает параметром, а не подставляется в текст: подставленная,
+    // она уехала бы в pg_stat_statements отдельной строкой на каждую машину, а
+    // главное — открыла бы путь метке, собранной конкатенацией.
+    const { svc, calls } = makeTouch();
+
+    await svc.touchHostAgent('clients');
+
+    expect(calls[0].params).toEqual(['clients']);
+    expect(calls[0].sql).not.toContain('clients');
   });
 
   it('время берётся у базы, а не у процесса', async () => {
@@ -1069,10 +1085,14 @@ describe('ProvisioningService.touchHostAgent', () => {
     // спокойствие — и то и другое молча.
     const { svc, calls } = makeTouch();
 
-    await svc.touchHostAgent();
+    await svc.touchHostAgent('own');
 
-    expect(calls[0]).toContain('now()');
-    expect(calls[0]).not.toMatch(/\$\d/);
+    expect(calls[0].sql).toContain('now()');
+    // Параметр у запроса ровно один — метка машины; отметка времени в него не
+    // попадает. Прежняя форма проверки («параметров нет вовсе») с приездом
+    // метки перестала бы значить что-либо.
+    expect(calls[0].params).toHaveLength(1);
+    expect(calls[0].sql).not.toMatch(/\$2/);
   });
 
   it('запись загрублена: отметка не переписывается на каждом опросе', async () => {
@@ -1080,9 +1100,29 @@ describe('ProvisioningService.touchHostAgent', () => {
     // сутки в одну строку при разрешении, которое читателю не нужно.
     const { svc, calls } = makeTouch();
 
-    await svc.touchHostAgent();
+    await svc.touchHostAgent('own');
 
-    expect(calls[0]).toMatch(/WHERE product_host_agent\.seen_at < now\(\) - interval '30 seconds'/);
+    expect(calls[0].sql).toMatch(
+      /WHERE product_host_agent\.seen_at < now\(\) - interval '30 seconds'/,
+    );
+  });
+
+  it('загрубление считается по строке СВОЕЙ машины', async () => {
+    // Условие сверяется с отметкой строки, в которую попал ON CONFLICT, то
+    // есть со своей. Общее на всех загрубление означало бы, что опрос одной
+    // машины глушит запись соседней на полминуты: при двух машинах это не
+    // редкость, а постоянное состояние.
+    const { svc, calls } = makeTouch();
+
+    await svc.touchHostAgent('own');
+
+    const sql = calls[0].sql;
+    expect(sql.indexOf('ON CONFLICT (host_id)')).toBeLessThan(
+      sql.indexOf('product_host_agent.seen_at <'),
+    );
+    // Подзапроса по всей таблице в условии нет: он и был бы «общим
+    // загрублением», сколько бы строк в таблице ни лежало.
+    expect(sql).not.toMatch(/SELECT[\s\S]*FROM product_host_agent[\s\S]*WHERE/);
   });
 
   it('загрубление заметно меньше порога протухания', async () => {
@@ -1092,10 +1132,10 @@ describe('ProvisioningService.touchHostAgent', () => {
     const { svc, calls } = makeTouch();
     const probe = new ProvisioningService({ query: jest.fn(async () => ({ rows: [{ live: true }] })) } as any, {} as any);
 
-    await svc.touchHostAgent();
-    await probe.hostAgentLive();
+    await svc.touchHostAgent('own');
+    await probe.hostAgentLive('own');
 
-    const gap = Number(calls[0].match(/seen_at < now\(\) - interval '(\d+) seconds'/)![1]);
+    const gap = Number(calls[0].sql.match(/seen_at < now\(\) - interval '(\d+) seconds'/)![1]);
     const fresh = Number(
       (probe as any).pg.query.mock.calls[0][0].match(
         /seen_at > now\(\) - interval '(\d+) seconds'/,
@@ -1111,19 +1151,32 @@ describe('ProvisioningService.touchHostAgent', () => {
     // то есть отметка о жизни убивала бы ровно то, за чем следит.
     const { svc, error } = makeTouch(new Error('нет такой таблицы'));
 
-    await expect(svc.touchHostAgent()).resolves.toBeUndefined();
+    await expect(svc.touchHostAgent('own')).resolves.toBeUndefined();
     // Молча проглоченный отказ означал бы вечную тревогу в кабинете без единой
     // строки о причине.
     expect(error).toHaveBeenCalledWith(expect.stringContaining('нет такой таблицы'));
+  });
+
+  it('пустая метка отказывает в базе и оставляет строку в логе', async () => {
+    // Своего сторожа на пустую метку здесь нет — в отличие от claimJob, и
+    // разница в том, как выглядит промах. Пустая метка в выдаче даёт «очередь
+    // пуста» на непустой очереди, то есть штатный ответ; здесь она не проходит
+    // NOT NULL и внешний ключ, то есть отказывает громко сама.
+    const { svc, calls, error } = makeTouch(new Error('null value in column "host_id"'));
+
+    await expect(svc.touchHostAgent(undefined as any)).resolves.toBeUndefined();
+
+    expect(calls[0].params).toEqual([undefined]);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('host_id'));
   });
 });
 
 describe('ProvisioningService.hostAgentLive', () => {
   function makeLive(live: any) {
-    const calls: string[] = [];
+    const calls: { sql: string; params?: any[] }[] = [];
     const pg = {
-      query: jest.fn(async (sql: string) => {
-        calls.push(sql);
+      query: jest.fn(async (sql: string, params?: any[]) => {
+        calls.push({ sql, params });
         return { rows: [{ live }], rowCount: 1 };
       }),
     };
@@ -1136,7 +1189,7 @@ describe('ProvisioningService.hostAgentLive', () => {
     // работающем агенте.
     const { svc, calls } = makeLive(true);
 
-    await svc.hostAgentLive();
+    await svc.hostAgentLive('own');
 
     expect(calls).toHaveLength(1);
   });
@@ -1144,14 +1197,40 @@ describe('ProvisioningService.hostAgentLive', () => {
   it('считает живым и по свежей отметке, и по взятому заданию', async () => {
     const { svc, calls } = makeLive(true);
 
-    await svc.hostAgentLive();
+    await svc.hostAgentLive('own');
 
     // Второй этаж обязателен: пока агент разворачивает продукт, он не
     // опрашивает — он работает, и отметка стоит до восьми минут.
-    expect(calls[0]).toContain('product_host_agent');
-    expect(calls[0]).toContain('product_provision_jobs');
-    expect(calls[0]).toContain("status = 'running'");
-    expect(calls[0]).toMatch(/EXISTS[\s\S]*\bOR\b[\s\S]*EXISTS/);
+    expect(calls[0].sql).toContain('product_host_agent');
+    expect(calls[0].sql).toContain('product_provision_jobs');
+    expect(calls[0].sql).toContain("status = 'running'");
+    expect(calls[0].sql).toMatch(/EXISTS[\s\S]*\bOR\b[\s\S]*EXISTS/);
+  });
+
+  it('ОБА этажа спрашиваются про одну и ту же машину', async () => {
+    // Главная правка задачи 3б. Отметка ищется по метке машины, а задание
+    // находит машину через свой продукт — у задания своей колонки нет и не
+    // появилось. Второй этаж, оставшийся «по всем машинам», вернул бы общую
+    // отметку с другой стороны: одна занятая машина покрывала бы своим
+    // свидетельством все остальные.
+    const { svc, calls } = makeLive(true);
+
+    await svc.hostAgentLive('own');
+
+    const sql = calls[0].sql;
+    expect(sql).toMatch(/a\.host_id = \$1/);
+    expect(sql).toMatch(/p\.host_id = \$1/);
+    expect(sql).toMatch(/FROM products p\s+WHERE p\.id = product_provision_jobs\.product_id/);
+    expect(calls[0].params).toEqual(['own']);
+  });
+
+  it('метка уезжает параметром, а не подставляется в текст', async () => {
+    const { svc, calls } = makeLive(true);
+
+    await svc.hostAgentLive('clients');
+
+    expect(calls[0].params).toEqual(['clients']);
+    expect(calls[0].sql).not.toContain('clients');
   });
 
   it('взятое задание считается свидетельством не дольше срока заведения', async () => {
@@ -1160,25 +1239,27 @@ describe('ProvisioningService.hostAgentLive', () => {
     // появилось бы никогда именно в том случае, ради которого написано.
     const { svc, calls } = makeLive(true);
 
-    await svc.hostAgentLive();
+    await svc.hostAgentLive('own');
 
-    expect(calls[0]).toMatch(/COALESCE\(started_at, created_at\) > now\(\) - interval '10 minutes'/);
+    expect(calls[0].sql).toMatch(
+      /COALESCE\(started_at, created_at\) > now\(\) - interval '10 minutes'/,
+    );
   });
 
   it('порог свежести — тот же, которым файл меряет раннера', async () => {
     const { svc, calls } = makeLive(true);
 
-    await svc.hostAgentLive();
+    await svc.hostAgentLive('own');
 
     // Второе число означало бы два разных ответа на один вопрос в одном файле.
-    expect(calls[0]).toContain("seen_at > now() - interval '120 seconds'");
+    expect(calls[0].sql).toContain("seen_at > now() - interval '120 seconds'");
   });
 
   it('вердикт берётся у базы, а не вычисляется из строки времени', async () => {
     const { svc } = makeLive(false);
 
     // База отдала false — значит false, без «ну строка же есть».
-    await expect(svc.hostAgentLive()).resolves.toBe(false);
+    await expect(svc.hostAgentLive('own')).resolves.toBe(false);
   });
 
   it('невнятный ответ базы читается как молчание агента, а не как жизнь', async () => {
@@ -1187,6 +1268,85 @@ describe('ProvisioningService.hostAgentLive', () => {
     // подставит текстовый каст. Тревога при этом исчезла бы навсегда.
     const { svc } = makeLive('f');
 
-    await expect(svc.hostAgentLive()).resolves.toBe(false);
+    await expect(svc.hostAgentLive('own')).resolves.toBe(false);
+  });
+});
+
+describe('ProvisioningService.hostAgentsLiveForUser', () => {
+  function makeLive(live: any) {
+    const calls: { sql: string; params?: any[] }[] = [];
+    const pg = {
+      query: jest.fn(async (sql: string, params?: any[]) => {
+        calls.push({ sql, params });
+        return { rows: [{ live }], rowCount: 1 };
+      }),
+    };
+    return { svc: new ProvisioningService(pg as any, {} as any), calls };
+  }
+
+  it('спрашивает базу один раз', async () => {
+    // Три условия в одной выборке видят состояние на один и тот же now().
+    const { svc, calls } = makeLive(true);
+
+    await svc.hostAgentsLiveForUser('u-1');
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].params).toEqual(['u-1']);
+  });
+
+  it('вердикт собран ПО МАШИНАМ ВЛАДЕЛЬЦА, а не по агенту вообще', async () => {
+    const { svc, calls } = makeLive(true);
+
+    await svc.hostAgentsLiveForUser('u-1');
+
+    const sql = calls[0].sql;
+    // Машины отбираются через продукты владельца, а не просто перечисляются.
+    expect(sql).toMatch(/p\.user_id = \$1/);
+    expect(sql).toMatch(/p\.archived_at IS NULL/);
+    expect(sql).toMatch(/p\.host_id = h\.id/);
+  });
+
+  it('продукт без метки машины считается молчанием, а не порядком', async () => {
+    // Задания такого продукта не достанутся никому: `p.host_id = NULL` не
+    // равно ничему. Без этого условия кабинет отвечал бы «всё в порядке»
+    // ровно тому, чья работа не уедет никуда.
+    const { svc, calls } = makeLive(true);
+
+    await svc.hostAgentsLiveForUser('u-1');
+
+    expect(calls[0].sql).toMatch(/p\.host_id IS NULL/);
+  });
+
+  it('полностью лежащий хостинг виден и владельцу без продуктов', async () => {
+    // Первое условие: хоть одна машина реестра забирает задания. Без него
+    // владелец, у которого продуктов ещё нет, получал бы «всё в порядке» при
+    // мёртвом хостинге — то есть ровно перед первым нажатием «Новый продукт».
+    const { svc, calls } = makeLive(true);
+
+    await svc.hostAgentsLiveForUser('u-1');
+
+    expect(calls[0].sql).toMatch(/EXISTS \(SELECT 1 FROM product_hosts h WHERE \(/);
+  });
+
+  it('определение жизни — то же, которым меряется отдельная машина', async () => {
+    // Два списанных друг с друга куска SQL разошлись бы молча и в сторону
+    // зелёного. Сверяются готовые строки, а не намерение.
+    const { svc, calls } = makeLive(true);
+    const one = makeLive(true);
+
+    await svc.hostAgentsLiveForUser('u-1');
+    await one.svc.hostAgentLive('own');
+
+    const perHost = one.calls[0].sql
+      .replace(/^SELECT /, '')
+      .replace(/ AS live$/, '')
+      .replace(/\$1/g, 'h.id');
+    expect(calls[0].sql).toContain(perHost);
+  });
+
+  it('невнятный ответ базы читается как молчание, а не как жизнь', async () => {
+    const { svc } = makeLive('f');
+
+    await expect(svc.hostAgentsLiveForUser('u-1')).resolves.toBe(false);
   });
 });

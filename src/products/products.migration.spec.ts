@@ -55,7 +55,12 @@ describe('ProductsService.onModuleInit', () => {
     // необязательные.
     const client = { query: jest.fn(async () => ({ rows: [] })), release: jest.fn() };
     const pg = {
-      query: jest.fn(async () => {
+      query: jest.fn(async (sql: string) => {
+        // 006 тоже едет через пул и тоже обязательная, поэтому исправна здесь
+        // ровно как 005: иначе этот сценарий проверял бы не то, что заявляет —
+        // старт падал бы от ОБЯЗАТЕЛЬНОЙ миграции, а читался бы как «падает от
+        // необязательной». Отказ 006 проверяется своим сценарием ниже.
+        if (String(sql).includes('ALTER TABLE product_host_agent')) return { rows: [] };
         throw new Error('boom');
       }),
       getClient: jest.fn(async () => client),
@@ -81,6 +86,44 @@ describe('ProductsService.onModuleInit', () => {
     const pg = { query: jest.fn(async () => ({ rows: [] })), getClient: jest.fn(async () => client) };
 
     await expect(new ProductsService(pg as any).onModuleInit()).rejects.toThrow(/005_hosts\.sql/);
+  });
+
+  it('отказ 006 РОНЯЕТ старт, а не уходит в лог', async () => {
+    // Выдачу заданий 006 не трогает — ломается одна вещь, и ломается В СТОРОНУ
+    // ЗЕЛЁНОГО: все пути отказа проверки в кабинете отвечают «агент жив»
+    // нарочно, поэтому не применившаяся 006 даёт не «диагностики нет», а
+    // «индикатор зелёный всегда». Отличить это снаружи нечем — значит отказ
+    // обязан быть слышен здесь.
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        if (String(sql).includes('ALTER TABLE product_host_agent')) throw new Error('не та форма');
+        return { rows: [] };
+      }),
+      getClient: jest.fn(async () => ({ query: jest.fn(async () => ({ rows: [] })), release: jest.fn() })),
+    };
+
+    await expect(new ProductsService(pg as any).onModuleInit()).rejects.toThrow(
+      /006_host_agent_per_host\.sql/,
+    );
+  });
+
+  it('006 едет ПОСЛЕ 003 и 005 — она перестраивает их обеих', async () => {
+    // Список — это и есть описание схемы: 006 меняет ключ таблицы, которую
+    // заводит 003, и вешает внешний ключ на реестр, который заводит 005.
+    // Перестановка даёт отказ обязательной миграции, то есть невзлетевший API.
+    const applied: string[] = [];
+    const pg = { query: jest.fn(async () => ({ rows: [], rowCount: 0 })) };
+    const svc = new ProductsService(pg as any);
+    (svc as any).applyMigration = jest.fn(async (f: string) => void applied.push(f));
+
+    await svc.onModuleInit();
+
+    expect(applied.indexOf('006_host_agent_per_host.sql')).toBeGreaterThan(
+      applied.indexOf('003_host_agent.sql'),
+    );
+    expect(applied.indexOf('006_host_agent_per_host.sql')).toBeGreaterThan(
+      applied.indexOf('005_hosts.sql'),
+    );
   });
 
   it('005 везётся на ВЫДЕЛЕННОМ соединении в явной транзакции', async () => {
@@ -312,6 +355,7 @@ describe('миграция 002', () => {
       '003_host_agent.sql',
       '004_rent.sql',
       '005_hosts.sql',
+      '006_host_agent_per_host.sql',
     ]);
   });
 
@@ -800,5 +844,112 @@ describe('миграция 005 — реестр машин', () => {
       expect(s).toMatch(guards[i][0]);
       expect(s).toMatch(guards[i][1]);
     });
+  });
+});
+
+/**
+ * Текст миграции 006.
+ *
+ * Маркер поиска — `ALTER TABLE product_host_agent`, и он выбран не наугад:
+ * `product_host_agent` есть и в 003, а `product_hosts` — и в 005, и обе едут
+ * РАНЬШЕ. Поиск по любому из них отдал бы текст соседа, и весь блок ниже
+ * проверял бы не тот файл, оставаясь зелёным.
+ */
+async function migration006(): Promise<string> {
+  const { svc, queries } = makeService();
+  await svc.onModuleInit();
+  const sql = queries.find((q) => q.includes('ALTER TABLE product_host_agent'));
+  if (!sql) {
+    throw new Error('миграция 006 не применена: ни один запрос не перестраивает product_host_agent');
+  }
+  return sql.replace(/\/\*[\s\S]*?\*\//g, '').replace(/--[^\n]*/g, '');
+}
+
+describe('миграция 006 — отметка о жизни своя у каждой машины', () => {
+  it('маркер находит именно 006, а не 003 и не 005', async () => {
+    // Сторож прибора. Ошибись он файлом — проверки ниже зеленели бы на тексте
+    // соседа, а самый содержательный из них («один оператор») зеленел бы тем
+    // охотнее, чем меньше 006 похожа на то, что от неё ждут.
+    const sql = await migration006();
+    expect(sql).toContain('ADD COLUMN host_id');
+    expect(sql).not.toContain('CREATE TABLE IF NOT EXISTS product_host_agent');
+    expect(sql).not.toContain('CREATE TABLE IF NOT EXISTS product_hosts');
+  });
+
+  it('весь файл — ОДИН оператор под проверкой формы', async () => {
+    // Здесь меняется первичный ключ живой таблицы, а файл исполняется при
+    // КАЖДОМ старте API. «Идемпотентная» запись через DROP CONSTRAINT IF
+    // EXISTS + ADD PRIMARY KEY повтор переживает — и на каждом рестарте
+    // перестраивает ключ под ACCESS EXCLUSIVE, оставляя окно без уникального
+    // индекса, в котором ON CONFLICT (host_id) отказывает. Единственная форма,
+    // у которой повтор — настоящий no-op, это блок с проверкой формы.
+    const sts = statements(await migration006());
+
+    expect(sts).toHaveLength(1);
+    expect(sts[0]).toMatch(/^DO \$\$/);
+  });
+
+  it('признак «уже перестроена» — ЦЕЛЕВАЯ колонка, а не отсутствие исходной', async () => {
+    // Проверка «нет колонки id» истинна и у таблицы, которой ничего не делали,
+    // если 003 когда-нибудь перепишут: блок ушёл бы перестраивать пустое место.
+    const sql = await migration006();
+    expect(sql).toMatch(/attname = 'host_id'[\s\S]*?THEN\s+RETURN;/);
+  });
+
+  it('отсутствие таблицы — громкий отказ, а не тихий выход', async () => {
+    // 006 обязательная. Молчаливый выход здесь означал бы успешный старт API с
+    // отметкой, которую некуда писать, то есть индикатор, зеленеющий по
+    // своему же отказу.
+    const sql = await migration006();
+    expect(sql).toMatch(/to_regclass\('product_host_agent'\) IS NULL[\s\S]*?RAISE EXCEPTION/);
+  });
+
+  it('единственная строка достаётся own, и только если own есть в реестре', async () => {
+    // До реестра машина была одна, и 005 заводит её под меткой 'own' — это не
+    // догадка. А вот при пустом реестре (005 — безвредный no-op при
+    // незаполненном PRODUCT_HOST_TOKEN) приписывать отметку некому.
+    const sql = await migration006();
+    expect(sql).toMatch(
+      /UPDATE product_host_agent SET host_id = 'own'\s+WHERE EXISTS \(SELECT 1 FROM product_hosts WHERE id = 'own'\)/,
+    );
+    expect(sql).toMatch(/DELETE FROM product_host_agent WHERE host_id IS NULL/);
+  });
+
+  it('имя старого ключа не угадывается', async () => {
+    // `DROP CONSTRAINT IF EXISTS product_host_agent_pkey` промахнулся бы молча:
+    // не найдя имени, он не делает НИЧЕГО и не говорит об этом. DROP COLUMN
+    // уносит ключ с собой, а если бы не унёс — следующий ADD PRIMARY KEY
+    // отказал бы громко.
+    const sql = await migration006();
+    expect(sql).not.toMatch(/DROP CONSTRAINT/);
+    expect(sql).toMatch(/ALTER TABLE product_host_agent DROP COLUMN id/);
+  });
+
+  it('порядок операций: сначала заполнить и убрать, потом NOT NULL и ключ', async () => {
+    // SET NOT NULL на строке без метки отказал бы всем файлом, а файл
+    // обязательный — то есть API не взлетел бы.
+    const sql = await migration006();
+    const at = (re: RegExp) => sql.search(re);
+    expect(at(/ADD COLUMN host_id/)).toBeLessThan(at(/UPDATE product_host_agent/));
+    expect(at(/UPDATE product_host_agent/)).toBeLessThan(at(/DELETE FROM product_host_agent/));
+    expect(at(/DELETE FROM product_host_agent/)).toBeLessThan(at(/SET NOT NULL/));
+    expect(at(/SET NOT NULL/)).toBeLessThan(at(/ADD PRIMARY KEY \(host_id\)/));
+  });
+
+  it('единственность теперь на МАШИНУ', async () => {
+    const sql = await migration006();
+    expect(sql).toMatch(/ADD PRIMARY KEY \(host_id\)/);
+  });
+
+  it('внешний ключ отметки — с ON DELETE CASCADE, в отличие от ключа продукта', async () => {
+    // Продукт снос машины переживать обязан (у него код, история и владелец),
+    // отметка — нет: это производная от машины, живущая две минуты. Ключ без
+    // ON DELETE сделал бы снос машины невозможным, пока отметку не уберут
+    // руками, — то есть подтолкнул бы к `DELETE ... CASCADE` на самой машине,
+    // где под каскад попадут уже продукты.
+    const sql = await migration006();
+    expect(sql).toMatch(
+      /FOREIGN KEY \(host_id\) REFERENCES product_hosts\(id\) ON DELETE CASCADE/,
+    );
   });
 });

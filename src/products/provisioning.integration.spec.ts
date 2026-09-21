@@ -375,6 +375,10 @@ maybe('провижининг против живого Postgres', () => {
 
   const hosts = async () => (await pool.query('SELECT * FROM product_hosts ORDER BY id')).rows;
 
+  /** Текст файла миграции — тот же, что накатывает модуль при старте API. */
+  const migrationSql = (file: string) =>
+    fs.readFileSync(path.join(__dirname, 'migrations', file), 'utf8');
+
   const getProduct = async (id: string) =>
     (await pool.query('SELECT * FROM products WHERE id = $1', [id])).rows[0];
   const getJob = async (id: string) =>
@@ -1502,26 +1506,34 @@ maybe('провижининг против живого Postgres', () => {
 
   // ═══════════════ отметка о жизни агента хоста ═══════════════
 
-  /** Отметка возрастом `ago`; null — отметки нет вовсе. */
-  async function hostSeen(ago: string | null) {
+  /**
+   * Отметка машины `host` возрастом `ago`; null — отметки нет вовсе.
+   *
+   * Машина заводится в реестре по требованию: после 006 у отметки внешний ключ
+   * на product_hosts, и строка отметки без машины не вставляется вовсе.
+   */
+  async function hostSeen(ago: string | null, host = 'own') {
     if (ago === null) return;
+    await ensureHost(host);
     await pool.query(
-      `INSERT INTO product_host_agent (id, seen_at) VALUES (true, now() - $1::interval)
-       ON CONFLICT (id) DO UPDATE SET seen_at = EXCLUDED.seen_at`,
-      [ago],
+      `INSERT INTO product_host_agent (host_id, seen_at) VALUES ($2, now() - $1::interval)
+       ON CONFLICT (host_id) DO UPDATE SET seen_at = EXCLUDED.seen_at`,
+      [ago, host],
     );
   }
 
   const hostRows = async () =>
-    (await pool.query('SELECT id, seen_at FROM product_host_agent')).rows;
+    (await pool.query('SELECT host_id, seen_at FROM product_host_agent ORDER BY host_id')).rows;
 
   it('21. первый опрос агента заводит отметку', async () => {
+    await ensureHost('own');
     expect(await hostRows()).toHaveLength(0);
 
-    await makeSvc().touchHostAgent();
+    await makeSvc().touchHostAgent('own');
 
     const rows = await hostRows();
     expect(rows).toHaveLength(1);
+    expect(rows[0].host_id).toBe('own');
     // Отметка — про «сейчас», а не про «когда-нибудь». Вставка временем
     // процесса на разошедшихся часах дала бы либо вечную тревогу, либо вечное
     // спокойствие; здесь сверяется, что значение пришло от часов БАЗЫ.
@@ -1534,7 +1546,7 @@ maybe('провижининг против живого Postgres', () => {
     await hostSeen('5 seconds');
     const before = (await hostRows())[0].seen_at;
 
-    await makeSvc().touchHostAgent();
+    await makeSvc().touchHostAgent('own');
 
     expect((await hostRows())[0].seen_at).toEqual(before);
   });
@@ -1546,32 +1558,32 @@ maybe('провижининг против живого Postgres', () => {
     await hostSeen('40 seconds');
     const before = (await hostRows())[0].seen_at;
 
-    await makeSvc().touchHostAgent();
+    await makeSvc().touchHostAgent('own');
 
     const after = (await hostRows())[0].seen_at;
     expect(new Date(after).getTime()).toBeGreaterThan(new Date(before).getTime());
     expect(Date.now() - new Date(after).getTime()).toBeLessThan(5_000);
   });
 
-  it('21в. второй строки в таблице не бывает', async () => {
-    // Единственность держит база (id boolean PRIMARY KEY CHECK (id)), а не
-    // аккуратность вызывающего: читатель берёт отметку без ORDER BY и без
-    // max(), и вторая строка означала бы, что иногда показывается
-    // позавчерашняя.
-    await makeSvc().touchHostAgent();
+  it('21в. второй строки НА МАШИНУ не бывает', async () => {
+    // Единственность по-прежнему держит база, но теперь на машину
+    // (PRIMARY KEY (host_id), 006): читатель берёт отметку СВОЕЙ машины без
+    // ORDER BY и без max(), и вторая строка означала бы, что иногда
+    // показывается позавчерашняя.
+    await makeSvc().touchHostAgent('own');
     await hostSeen('1 hour');
-    await makeSvc().touchHostAgent();
+    await makeSvc().touchHostAgent('own');
 
     expect(await hostRows()).toHaveLength(1);
     await expect(
-      pool.query(`INSERT INTO product_host_agent (id, seen_at) VALUES (false, now())`),
-    ).rejects.toMatchObject({ code: '23514' });
+      pool.query(`INSERT INTO product_host_agent (host_id, seen_at) VALUES ('own', now())`),
+    ).rejects.toMatchObject({ code: '23505' });
   });
 
   it('21г. свежая отметка — агент на связи', async () => {
     await hostSeen('10 seconds');
 
-    await expect(makeSvc().hostAgentLive()).resolves.toBe(true);
+    await expect(makeSvc().hostAgentLive('own')).resolves.toBe(true);
   });
 
   it('21д. отметки нет вовсе — агент не на связи', async () => {
@@ -1580,13 +1592,13 @@ maybe('провижининг против живого Postgres', () => {
     // каждый опрос — и до маршрута, а значит и до отметки, дело не доходит.
     await bystander();
 
-    await expect(makeSvc().hostAgentLive()).resolves.toBe(false);
+    await expect(makeSvc().hostAgentLive('own')).resolves.toBe(false);
   });
 
   it('21е. отметка старше порога — агент не на связи', async () => {
     await hostSeen('3 minutes');
 
-    await expect(makeSvc().hostAgentLive()).resolves.toBe(false);
+    await expect(makeSvc().hostAgentLive('own')).resolves.toBe(false);
   });
 
   it('21ж. молчание с заданием на руках — агент занят, а не мёртв', async () => {
@@ -1599,7 +1611,7 @@ maybe('провижининг против живого Postgres', () => {
     await job(p.id, { status: 'running', createdAgo: '4 minutes', startedAgo: '4 minutes' });
     await hostSeen('4 minutes');
 
-    await expect(makeSvc().hostAgentLive()).resolves.toBe(true);
+    await expect(makeSvc().hostAgentLive('own')).resolves.toBe(true);
   });
 
   it('21з. задание в очереди молчание не оправдывает', async () => {
@@ -1610,7 +1622,7 @@ maybe('провижининг против живого Postgres', () => {
     await job(p.id, { status: 'queued', createdAgo: '4 minutes' });
     await hostSeen('4 minutes');
 
-    await expect(makeSvc().hostAgentLive()).resolves.toBe(false);
+    await expect(makeSvc().hostAgentLive('own')).resolves.toBe(false);
   });
 
   it('21и. взятое задание оправдывает молчание не дольше срока заведения', async () => {
@@ -1622,7 +1634,7 @@ maybe('провижининг против живого Postgres', () => {
     await job(p.id, { status: 'running', createdAgo: '12 minutes', startedAgo: '11 minutes' });
     await hostSeen('11 minutes');
 
-    await expect(makeSvc().hostAgentLive()).resolves.toBe(false);
+    await expect(makeSvc().hostAgentLive('own')).resolves.toBe(false);
   });
 
   it('21к. закрытые задания жизни не подтверждают', async () => {
@@ -1634,18 +1646,395 @@ maybe('провижининг против живого Postgres', () => {
     await job(p.id, { status: 'failed', createdAgo: '1 minute', startedAgo: '1 minute' });
     await hostSeen('5 minutes');
 
-    await expect(makeSvc().hostAgentLive()).resolves.toBe(false);
+    await expect(makeSvc().hostAgentLive('own')).resolves.toBe(false);
   });
 
   it('21л. опрос агента и вердикт кабинета сходятся на живой базе', async () => {
     // Сквозной стык: мёртвый агент -> тревога, пришедший агент -> тишина.
     // Порознь обе половины зелены и при разъехавшихся именах таблицы.
     const svc = makeSvc();
-    expect(await svc.hostAgentLive()).toBe(false);
+    await ensureHost('own');
+    expect(await svc.hostAgentLive('own')).toBe(false);
 
-    await svc.touchHostAgent();
+    await svc.touchHostAgent('own');
 
-    expect(await svc.hostAgentLive()).toBe(true);
+    expect(await svc.hostAgentLive('own')).toBe(true);
+  });
+
+  // ─────────── отметка своя у каждой машины (задача 3б) ───────────
+
+  it('47. живой агент не выдаёт за живого мёртвого соседа', async () => {
+    // ГЛАВНЫЙ СЦЕНАРИЙ ЗАДАЧИ. С общей отметкой обе машины считались бы живыми
+    // по опросу одной — и продукт на умершей машине висел бы «Заводится…»
+    // десять минут при зелёном индикаторе, заканчиваясь чужой формулировкой
+    // про истёкший срок.
+    await addHost({ id: 'clients' });
+    await ensureHost('own');
+    const svc = makeSvc();
+
+    await svc.touchHostAgent('own');
+
+    expect(await svc.hostAgentLive('own')).toBe(true);
+    expect(await svc.hostAgentLive('clients')).toBe(false);
+  });
+
+  it('47а. отметка соседа не оживляет молчащую машину', async () => {
+    // Обратное направление того же. Мутация «читаем первую строку таблицы»
+    // предыдущий сценарий проходит зелёной, если 'own' опрошена первой.
+    await addHost({ id: 'clients' });
+    const svc = makeSvc();
+
+    await svc.touchHostAgent('clients');
+
+    expect(await svc.hostAgentLive('clients')).toBe(true);
+    expect(await svc.hostAgentLive('own')).toBe(false);
+  });
+
+  it('47б. две машины пишут отметку в одну секунду — загрубление на машину', async () => {
+    // Загрубление записи (30 секунд) обязано считаться по СВОЕЙ строке. Общее
+    // на всех, оно означало бы, что опрос одной машины глушит запись соседней
+    // на полминуты: агент жив и опрашивает, а отметка стоит — то есть тревога
+    // на исправной машине, и при двух машинах это постоянное состояние.
+    //
+    // Обе отметки заведены СТАРЫМИ нарочно: на пустой таблице ON CONFLICT не
+    // срабатывает вовсе, и условие загрубления не исполняется ни в какой
+    // форме — сценарий был бы зелен и при общем на всех условии.
+    await addHost({ id: 'clients' });
+    await hostSeen('40 seconds', 'own');
+    await hostSeen('40 seconds', 'clients');
+    const svc = makeSvc();
+
+    // СТОРОЖ ПРИБОРА, и он не для красоты: фикстура, кладущая обе отметки в
+    // одну строку, оставляет сценарий зелёным. Вторая отметка тогда не
+    // конфликтует, а ВСТАВЛЯЕТСЯ, условие загрубления не исполняется вовсе — и
+    // проверка ниже меряет пустоту. Измерено мутацией «фикстура отметки
+    // игнорирует машину»: без этой строки она выживает.
+    expect((await hostRows()).map((r: any) => r.host_id)).toEqual(['clients', 'own']);
+
+    await svc.touchHostAgent('own');
+    await svc.touchHostAgent('clients');
+
+    const rows = await hostRows();
+    expect(rows.map((r: any) => r.host_id)).toEqual(['clients', 'own']);
+    // Сдвинулись ОБЕ, хотя между записями прошли миллисекунды: свежая отметка
+    // соседа не запрещает писать свою.
+    for (const r of rows) {
+      expect(Date.now() - new Date(r.seen_at).getTime()).toBeLessThan(5_000);
+    }
+    expect(await svc.hostAgentLive('own')).toBe(true);
+    expect(await svc.hostAgentLive('clients')).toBe(true);
+  });
+
+  it('48. занятость считается по заданиям СВОЕЙ машины', async () => {
+    // ВТОРАЯ ПОЛОВИНА ВЕРДИКТА. Задание соседа не делает молчащего агента
+    // живым — иначе одна занятая машина покрывает своим свидетельством все
+    // остальные, и общая отметка возвращается через второй этаж.
+    await addHost({ id: 'clients' });
+    await ensureHost('own');
+    const p = await product({ slug: 'mh-busy', status: 'provisioning', host: 'clients' });
+    await job(p.id, { status: 'running', createdAgo: '1 minute', startedAgo: '1 minute' });
+
+    expect(await makeSvc().hostAgentLive('clients')).toBe(true);
+    expect(await makeSvc().hostAgentLive('own')).toBe(false);
+  });
+
+  it('48а. задание продукта БЕЗ метки не оживляет никого', async () => {
+    // `p.host_id = NULL` не равно ничему, и это верно: задание такого продукта
+    // не достанется ни одной машине (46г). Свидетельством занятости оно быть
+    // не может — забрать его было некому.
+    await addHost({ id: 'clients' });
+    await ensureHost('own');
+    const p = await product({ slug: 'mh-busy-nohost', status: 'provisioning', host: null });
+    await job(p.id, { status: 'running', createdAgo: '1 minute', startedAgo: '1 minute' });
+
+    expect(await makeSvc().hostAgentLive('own')).toBe(false);
+    expect(await makeSvc().hostAgentLive('clients')).toBe(false);
+  });
+
+  it('48б. занятость СВОЕЙ машины не гасится молчанием соседа', async () => {
+    // Сторож против «жив, если жив каждый»: два этажа складываются по ИЛИ
+    // внутри одной машины, а машины между собой не складываются вовсе.
+    await addHost({ id: 'clients' });
+    const p = await product({ slug: 'mh-busy-own', status: 'provisioning', host: 'own' });
+    await job(p.id, { status: 'running', createdAgo: '2 minutes', startedAgo: '2 minutes' });
+    await hostSeen('5 minutes', 'own');
+
+    expect(await makeSvc().hostAgentLive('own')).toBe(true);
+    expect(await makeSvc().hostAgentLive('clients')).toBe(false);
+  });
+
+  /**
+   * Вернуть таблицу отметки в форму ДО 006 (одна строка на всё, `id boolean`),
+   * выполнить сценарий и восстановить форму при ЛЮБОМ исходе.
+   *
+   * Восстановление обязательно и делается сносом с пересборкой, а не обратной
+   * правкой: упавший на середине сценарий иначе оставил бы половинчатую схему,
+   * и красными стали бы все следующие — то есть красным оказалось бы не то, что
+   * сломалось (ровно тот приём, что в 20г).
+   */
+  async function withSharedHostAgentRow(seed: () => Promise<void>) {
+    await pool.query('DROP TABLE product_host_agent');
+    await pool.query(migrationSql('003_host_agent.sql'));
+    try {
+      await seed();
+      await pool.query(migrationSql('006_host_agent_per_host.sql'));
+    } finally {
+      const shape = await pool.query(
+        `SELECT attname FROM pg_attribute
+          WHERE attrelid = 'product_host_agent'::regclass AND attnum > 0 AND NOT attisdropped`,
+      );
+      if (!shape.rows.some((r: any) => r.attname === 'host_id')) {
+        await pool.query('DROP TABLE product_host_agent');
+        await pool.query(migrationSql('003_host_agent.sql'));
+        await pool.query(migrationSql('006_host_agent_per_host.sql'));
+      }
+    }
+  }
+
+  it('49. миграция 006 переносит общую отметку на машину own', async () => {
+    // Живой прод: отметка лежит одной строкой с куска 1, машина в реестре одна.
+    // Проверяется исполнением, а не по тексту файла: выброшенная отметка — это
+    // тревога в кабинете на две минуты после каждого выката, а приписанная
+    // наугад — ложь ровно того вида, который файл убирает.
+    await ensureHost('own');
+
+    await withSharedHostAgentRow(async () => {
+      await pool.query(`INSERT INTO product_host_agent (id, seen_at) VALUES (true, now())`);
+    });
+
+    expect((await hostRows()).map((r: any) => r.host_id)).toEqual(['own']);
+    expect(await makeSvc().hostAgentLive('own')).toBe(true);
+  });
+
+  it('49а. отметка без машины в реестре выбрасывается, а не приписывается наугад', async () => {
+    // Состояние достижимое: 005 нарочно безвредный no-op при незаполненном
+    // PRODUCT_HOST_TOKEN, реестр тогда пуст, а отметка от прошлых опросов
+    // лежит. Приписать её первой попавшейся машине значило бы объявить живой
+    // ту, которую никто не опрашивал.
+    await addHost({ id: 'clients' });
+
+    await withSharedHostAgentRow(async () => {
+      await pool.query(`INSERT INTO product_host_agent (id, seen_at) VALUES (true, now())`);
+    });
+
+    expect(await hostRows()).toEqual([]);
+    expect(await makeSvc().hostAgentLive('clients')).toBe(false);
+  });
+
+  it('49б. пустая таблица переживает перестройку так же', async () => {
+    // Свежая база и машина, которую ещё никто не опрашивал. Отдельный сценарий,
+    // потому что ветка UPDATE/DELETE здесь не исполняется вовсе, а отказать
+    // SET NOT NULL и ADD PRIMARY KEY на пустой таблице всё равно есть чему.
+    await ensureHost('own');
+
+    await withSharedHostAgentRow(async () => undefined);
+
+    expect(await hostRows()).toEqual([]);
+    await makeSvc().touchHostAgent('own');
+    expect((await hostRows()).map((r: any) => r.host_id)).toEqual(['own']);
+  });
+
+  it('49в. повторная накатка ВСЕГО СПИСКА ничего не ломает и не трогает отметок', async () => {
+    // Модуль накатывает весь список при КАЖДОМ старте API, и 003 стоит в нём
+    // РАНЬШЕ 006 — то есть на следующем старте старая форма таблицы приезжает
+    // снова. Проверяется исполнением: по тексту файлов этот спор не виден.
+    await ensureHost('own');
+    const svc = makeSvc();
+    await svc.touchHostAgent('own');
+    const before = await hostRows();
+
+    const refused: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      for (const f of MIGRATIONS) {
+        try {
+          await pool.query(migrationSql(f));
+        } catch (e: any) {
+          refused.push(`${f}: ${e.message}`);
+        }
+      }
+    }
+
+    expect(refused).toEqual([]);
+    expect(await hostRows()).toEqual(before);
+    expect(await svc.hostAgentLive('own')).toBe(true);
+  });
+
+  it('49г. повторная накатка не снимает первичный ключ даже на миг', async () => {
+    // Наивная запись (DROP CONSTRAINT IF EXISTS + ADD PRIMARY KEY) повтор
+    // ПЕРЕЖИВАЕТ — и в окне между двумя операторами уникального индекса нет,
+    // а ON CONFLICT (host_id) в это окно отказывает. Здесь проверяется, что
+    // повтор вообще ничего не перестраивает: ключ тот же, по имени и по oid.
+    await ensureHost('own');
+    const pk = async () =>
+      (
+        await pool.query(
+          `SELECT oid, conname, pg_get_constraintdef(oid) AS def FROM pg_constraint
+            WHERE conrelid = 'product_host_agent'::regclass AND contype = 'p'`,
+        )
+      ).rows;
+    const before = await pk();
+
+    await pool.query(migrationSql('006_host_agent_per_host.sql'));
+
+    expect(before).toHaveLength(1);
+    expect(before[0].def).toBe('PRIMARY KEY (host_id)');
+    expect(await pk()).toEqual(before);
+  });
+
+  it('49д. снос машины уносит её отметку, но не продукты соседа', async () => {
+    await addHost({ id: 'clients' });
+    await ensureHost('own');
+    const svc = makeSvc();
+    await svc.touchHostAgent('own');
+    await svc.touchHostAgent('clients');
+    const mine = await product({ slug: 'mh-stay', status: 'running', host: 'own' });
+
+    await pool.query(`DELETE FROM product_hosts WHERE id = 'clients'`);
+
+    expect((await hostRows()).map((r: any) => r.host_id)).toEqual(['own']);
+    expect(await getProduct(mine.id)).toBeTruthy();
+    // А машину С ПРОДУКТАМИ снести «заодно» нельзя: у products.host_id внешний
+    // ключ БЕЗ ON DELETE (005), и это разные решения, принятые по разным
+    // причинам. Сторож от «привёл каскады к единому виду».
+    await expect(pool.query(`DELETE FROM product_hosts WHERE id = 'own'`)).rejects.toMatchObject({
+      code: '23503',
+    });
+  });
+
+  // ──────── вердикт кабинета: машины ЭТОГО владельца (задача 3б) ────────
+
+  it('50. молчит машина владельца — кабинету тревога', async () => {
+    await addHost({ id: 'clients' });
+    const svc = makeSvc();
+    await svc.touchHostAgent('clients');
+    await product({ slug: 'mh-cab-own', status: 'running', host: 'own' });
+
+    expect(await svc.hostAgentsLiveForUser('u-1')).toBe(false);
+  });
+
+  it('50а. молчит ЧУЖАЯ машина — кабинет спокоен', async () => {
+    // Цена ошибки здесь несимметрична: ложная тревога учит не верить баннеру.
+    // Владелец, все продукты которого стоят на живой машине, про мёртвого
+    // соседа знать не обязан.
+    await addHost({ id: 'clients' });
+    await ensureHost('own');
+    const svc = makeSvc();
+    await svc.touchHostAgent('own');
+    await product({ slug: 'mh-cab-live', status: 'running', host: 'own' });
+
+    expect(await svc.hostAgentsLiveForUser('u-1')).toBe(true);
+  });
+
+  it('50б. чужой продукт на молчащей машине в мой вердикт не входит', async () => {
+    // Отбор машин идёт через продукты ВЛАДЕЛЬЦА. Соединение без user_id даёт
+    // тревогу у всех, стоит одному чужому продукту оказаться на мёртвой
+    // машине.
+    await addHost({ id: 'clients' });
+    await ensureHost('own');
+    const svc = makeSvc();
+    await svc.touchHostAgent('own');
+    const theirs = await product({ slug: 'mh-cab-alien', status: 'running', host: 'clients' });
+    await pool.query(`UPDATE products SET user_id = 'u-2' WHERE id = $1`, [theirs.id]);
+    await product({ slug: 'mh-cab-mine', status: 'running', host: 'own' });
+
+    expect(await svc.hostAgentsLiveForUser('u-1')).toBe(true);
+    expect(await svc.hostAgentsLiveForUser('u-2')).toBe(false);
+  });
+
+  it('50в. архивный продукт на молчащей машине тревоги не поднимает', async () => {
+    // Архивный не получает заданий никогда, и молчание его машины ни на что не
+    // влияет. Иначе тревога залипала бы навсегда — погасить её было бы нечем.
+    await addHost({ id: 'clients' });
+    await ensureHost('own');
+    const svc = makeSvc();
+    await svc.touchHostAgent('own');
+    const dead = await product({ slug: 'mh-cab-arch', status: 'running', host: 'clients' });
+    await pool.query(`UPDATE products SET archived_at = now() WHERE id = $1`, [dead.id]);
+    await product({ slug: 'mh-cab-alive', status: 'running', host: 'own' });
+
+    expect(await svc.hostAgentsLiveForUser('u-1')).toBe(true);
+  });
+
+  it('50г. спящий продукт на молчащей машине тревогу поднимает', async () => {
+    // Сон за неуплату и пробуждение после пополнения — тоже задания, и на
+    // молчащей машине их тоже никто не заберёт. Отбор «только заводящиеся»
+    // оставил бы владельца с продуктом, который не проснётся от пополнения, и
+    // без единого слова об этом.
+    await addHost({ id: 'clients' });
+    await ensureHost('own');
+    const svc = makeSvc();
+    await svc.touchHostAgent('own');
+    const p = await product({ slug: 'mh-cab-sleep', status: 'running', host: 'clients' });
+    await pool.query(`UPDATE products SET status = 'sleeping' WHERE id = $1`, [p.id]);
+
+    expect(await svc.hostAgentsLiveForUser('u-1')).toBe(false);
+  });
+
+  it('50д. продукт БЕЗ метки машины — тревога, а не «всё в порядке»', async () => {
+    // Его задания не достанутся никому и никогда (46г). До задачи 4 так
+    // выглядит каждый только что заведённый продукт, и кабинет обязан сказать
+    // это вслух, а не отвечать «всё хорошо» тому, чья работа не уедет никуда.
+    await ensureHost('own');
+    const svc = makeSvc();
+    await svc.touchHostAgent('own');
+    await product({ slug: 'mh-cab-nohost', status: 'provisioning', host: null });
+
+    expect(await svc.hostAgentsLiveForUser('u-1')).toBe(false);
+  });
+
+  it('50е. владелец без продуктов: лежит весь хостинг — тревога', async () => {
+    // Сказать это надо ДО первого нажатия «Новый продукт», когда продуктов ещё
+    // нет и отбор по ним пуст.
+    await addHost({ id: 'clients' });
+    await ensureHost('own');
+
+    expect(await makeSvc().hostAgentsLiveForUser('u-1')).toBe(false);
+  });
+
+  it('50ж. владелец без продуктов: жива хоть одна машина — тишина', async () => {
+    // Гадать, куда уедет СЛЕДУЮЩИЙ продукт, здесь нельзя: машину выбирает
+    // задача 4 по аудитории и свободным местам, и второе правило выбора
+    // разошлось бы с настоящим молча. Цена названа: владелец узнает о молчании
+    // своей машины следующей перечиткой кабинета, а не через десять минут.
+    await addHost({ id: 'clients' });
+    await ensureHost('own');
+    const svc = makeSvc();
+    await svc.touchHostAgent('own');
+
+    expect(await svc.hostAgentsLiveForUser('u-1')).toBe(true);
+  });
+
+  it('50з. пустой реестр — тревога, а не вакуумное «всё в порядке»', async () => {
+    // При пустом реестре гвард отбивает КАЖДОГО агента (задача 2), то есть
+    // забирать работу правда некому. Условие «хоть одна машина жива» отвечает
+    // здесь верно и без отдельной ветки.
+    expect(await hosts()).toEqual([]);
+
+    expect(await makeSvc().hostAgentsLiveForUser('u-1')).toBe(false);
+  });
+
+  it('50и. с ОДНОЙ машиной вердикт кабинета совпадает с вердиктом машины', async () => {
+    // Сторож обратной совместимости: пока машина одна, новый заголовок обязан
+    // отвечать ровно то же, что отвечал прежний. Иначе правка диагностики сама
+    // стала бы источником расхождения на проде, где машина пока одна.
+    const svc = makeSvc();
+    await product({ slug: 'mh-cab-compat', status: 'running', host: 'own' });
+
+    expect(await svc.hostAgentsLiveForUser('u-1')).toBe(await svc.hostAgentLive('own'));
+    await svc.touchHostAgent('own');
+    expect(await svc.hostAgentsLiveForUser('u-1')).toBe(await svc.hostAgentLive('own'));
+    expect(await svc.hostAgentLive('own')).toBe(true);
+  });
+
+  it('50к. занятая машина владельца тревоги не поднимает', async () => {
+    // Второй этаж работает и в кабинетном вердикте: пока агент разворачивает
+    // продукт, он не опрашивает — и без этого баннер загорался бы ровно в те
+    // десять минут, когда владелец смотрит на карточку.
+    const p = await product({ slug: 'mh-cab-busy', status: 'provisioning', host: 'own' });
+    await job(p.id, { status: 'running', createdAgo: '4 minutes', startedAgo: '4 minutes' });
+    await hostSeen('4 minutes', 'own');
+
+    expect(await makeSvc().hostAgentsLiveForUser('u-1')).toBe(true);
   });
 
   // ═════════════════════════════ аренда ═════════════════════════════
