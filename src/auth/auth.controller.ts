@@ -204,7 +204,9 @@ export class AuthController {
       `<body style="font-family:system-ui;padding:40px;text-align:center">` +
       `<h1 style="font-size:20px">${title}</h1><p style="color:#555">${body}</p></body></html>`;
 
-    const data = await this.email.consumeVerifyToken(token);
+    // Проверка здесь, а не только в сервисе: эндпоинт публичный, и пустой
+    // параметр не должен доезжать до привязки даже при подменённом сервисе.
+    const data = token ? await this.email.consumeVerifyToken(token) : null;
     if (!data) {
       return res.set(CORS).status(400).type('html')
         .send(page('Ссылка устарела', 'Она действует сутки и срабатывает один раз. Укажите почту заново — придёт новая.'));

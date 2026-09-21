@@ -98,7 +98,7 @@ export class ProfileController {
     }
 
     const result = await this.profileService.setEmail(user.userId, raw);
-    void this.offerEmailAsLogin(user.userId, normalized);
+    await this.offerEmailAsLogin(user.userId, normalized);
     return res.status(200).json(result);
   }
 
@@ -121,7 +121,12 @@ export class ProfileController {
       if (owner && owner.userId !== userId) return;
 
       const token = await this.email.generateVerifyToken(userId, email);
-      await this.email.sendVerifyEmail(email, token);
+      // Ждём всё, кроме самой отправки: проверки и запись в Redis быстрые и
+      // локальные, а SMTP — единственное здесь, что умеет висеть секундами и
+      // падать. Отрывать от ответа надо именно его, а не всю ветку.
+      void this.email.sendVerifyEmail(email, token).catch((e: any) =>
+        this.logger.warn(`письмо с подтверждением на ${email} не ушло: ${e?.message}`),
+      );
     } catch (e: any) {
       // Ровно то место, где глотать исключение правильно: ответ уже ушёл,
       // оплата продолжается, потеряно только письмо.
