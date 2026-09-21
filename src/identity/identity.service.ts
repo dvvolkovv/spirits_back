@@ -1,9 +1,11 @@
 import { Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
+import { RedisService } from '../common/services/redis.service';
 import { EventsService } from '../events/events.service';
-import type { Provider, ProviderData, Identity, ResolveResult } from './identity.types';
+import type { Provider, ProviderData, Identity, ResolveResult, ResolveOptions } from './identity.types';
 
 /**
  * Файлы схемы, переутверждаемые при каждом старте.
@@ -32,7 +34,42 @@ export class IdentityService implements OnModuleInit {
   constructor(
     @Optional() private readonly pg?: PgService,
     @Optional() private readonly events?: EventsService,
+    @Optional() private readonly redis?: RedisService,
   ) {}
+
+  /**
+   * Билет на незавершённый вход.
+   *
+   * Выдаётся, когда найден кандидат на привязку. Хранит уже доказанные данные
+   * провайдера, чтобы человеку не пришлось заново подтверждать почту, каким бы
+   * из двух выходов он ни воспользовался: войти по номеру и привязать или
+   * всё-таки завести новый аккаунт.
+   *
+   * Живёт здесь, а не в контроллере: через кандидата проходят и /auth/oauth/*,
+   * и talerid, у которого свой контроллер. Две копии формата билета разъехались
+   * бы при первой же правке.
+   *
+   * Одноразовый, 15 минут.
+   */
+  async issueLinkTicket(provider: Provider, data: any, candidateUserId: string): Promise<string> {
+    if (!this.redis) throw new Error('redis not configured');
+    const ticket = crypto.randomBytes(24).toString('base64url');
+    await this.redis.set(
+      `link-ticket-${ticket}`,
+      JSON.stringify({ provider, data, candidateUserId }),
+      900,
+    );
+    return ticket;
+  }
+
+  async consumeLinkTicket(ticket?: string): Promise<{ provider: Provider; data: any } | null> {
+    if (!this.redis || !ticket) return null;
+    const raw = await this.redis.get(`link-ticket-${ticket}`);
+    if (!raw) return null;
+    await this.redis.del(`link-ticket-${ticket}`);
+    const { provider, data } = JSON.parse(raw);
+    return { provider, data };
+  }
 
   async onModuleInit() {
     if (!this.pg) return;
@@ -85,7 +122,11 @@ export class IdentityService implements OnModuleInit {
     return { email: null, verified: false };
   }
 
-  async resolveOrCreate<P extends Provider>(provider: P, data: ProviderData<P>): Promise<ResolveResult> {
+  async resolveOrCreate<P extends Provider>(
+    provider: P,
+    data: ProviderData<P>,
+    opts: ResolveOptions = {},
+  ): Promise<ResolveResult> {
     if (!this.pg) throw new Error('pg not configured');
 
     const providerSub = this.normalize(provider, data);
@@ -103,7 +144,7 @@ export class IdentityService implements OnModuleInit {
         [provider, providerSub],
       );
       this.events?.track('auth_succeeded', { userId, props: { method: provider, is_new: false } });
-      return { userId, isNew: false, mergedExisting: false };
+      return { status: 'ok', userId, isNew: false, mergedExisting: false };
     }
 
     // 2) Merge by verified email (для email/google/yandex с подтверждённым email)
@@ -120,7 +161,34 @@ export class IdentityService implements OnModuleInit {
           [userId, provider, providerSub, email, verified],
         );
         this.events?.track('auth_succeeded', { userId, props: { method: provider, is_new: false, merged: true } });
-        return { userId, isNew: false, mergedExisting: true };
+        return { status: 'ok', userId, isNew: false, mergedExisting: true };
+      }
+    }
+
+    // 2.5) Почта известна аккаунту, но не как способ входа
+    //
+    // Шаг 2 смотрит только в user_identities. Почта, вписанная человеком в
+    // профиль (profile.setEmail → ai_profiles_consolidated.email), туда не
+    // попадает — и 19.09.2026 вход по magic link завёл victoria-337@mail.ru
+    // второй аккаунт с отдельным приветственным бонусом, при живом первом.
+    //
+    // Склеивать автоматически нельзя: профильный адрес никем не проверен.
+    // Владелец аккаунта может вписать туда чужую почту, и тогда её хозяин по
+    // своей же ссылке окажется внутри чужого аккаунта — а тот сохранит к нему
+    // доступ по номеру и прочитает всё, что там будет написано. Поэтому здесь
+    // мы только останавливаемся и просим подтвердить владение номером.
+    if (email && verified && !opts.forceNew) {
+      const candidate = await this.findLinkCandidate(email);
+      if (candidate) {
+        this.events?.track('auth_link_required', {
+          userId: candidate.userId,
+          props: { method: provider },
+        });
+        return {
+          status: 'link_required',
+          candidateUserId: candidate.userId,
+          phoneHint: this.maskPhone(candidate.phone),
+        };
       }
     }
 
@@ -171,11 +239,50 @@ export class IdentityService implements OnModuleInit {
       await this.pg.query(`COMMIT`);
       this.events?.track('signup_completed', { userId, props: { method: provider } });
       this.events?.track('auth_succeeded', { userId, props: { method: provider, is_new: true } });
-      return { userId, isNew: true, mergedExisting: false };
+      return { status: 'ok', userId, isNew: true, mergedExisting: false };
     } catch (e: any) {
       await this.pg.query(`ROLLBACK`);
       throw e;
     }
+  }
+
+  /**
+   * Активный аккаунт, у которого эта почта указана в профиле, но не заведена
+   * как способ входа.
+   *
+   * Требование «в аккаунт есть чем войти» обязательное. У всех email/OAuth
+   * аккаунтов есть фиктивная связка provider='phone' с provider_sub, равным
+   * их собственному UUID (бэкфилл в 001_identity_init.sql не отличал телефон
+   * от UUID и переутверждался на каждом старте). Войти по ней нельзя ничем,
+   * и отправить туда человека значило бы запереть его вне обоих аккаунтов —
+   * поэтому связка должна быть из одних цифр.
+   */
+  private async findLinkCandidate(email: string): Promise<{ userId: string; phone: string } | null> {
+    if (!this.pg) return null;
+    const res = await this.pg.query(
+      `SELECT u.internal_id, u.primary_phone
+         FROM user_id u
+         JOIN ai_profiles_consolidated a ON a.user_id = u.internal_id
+        WHERE lower(NULLIF(a.email, '')) = $1
+          AND u.state = 'active'
+          AND EXISTS (
+            SELECT 1 FROM user_identities i
+             WHERE i.user_id = u.internal_id
+               AND i.provider = 'phone'
+               AND i.provider_sub ~ '^[0-9]+$'
+          )
+        ORDER BY u.create_date
+        LIMIT 1`,
+      [email],
+    );
+    const row = res.rows[0];
+    return row ? { userId: row.internal_id, phone: row.primary_phone || row.internal_id } : null;
+  }
+
+  /** Номер без всего, кроме последних четырёх цифр: узнать свой можно, чужой — нет. */
+  private maskPhone(phone: string): string {
+    const digits = (phone || '').replace(/\D/g, '');
+    return digits.length >= 4 ? `···${digits.slice(-4)}` : '···';
   }
 
   private async issueWelcomeBonus(userId: string): Promise<void> {
@@ -218,8 +325,46 @@ export class IdentityService implements OnModuleInit {
     return { ok: true };
   }
 
+  /**
+   * Слить аккаунт conflictUserId в targetUserId.
+   *
+   * Баланс переносится ПЕРВЫМ и именно в таком порядке — сначала начисление на
+   * целевой, потом списание с исходного. Транзакции здесь нет по-настоящему:
+   * PgService раздаёт соединения из пула, и BEGIN/COMMIT отдельными query()
+   * могут уехать на разные соединения. Значит надо выбирать, куда падать при
+   * обрыве между шагами, — и падать следует в пользу человека: задвоенный
+   * баланс лучше сгоревшего.
+   *
+   * До 21.09.2026 перенос не делался вовсе: метод помечал аккаунт удалённым,
+   * оставляя на нём токены. На проде так осело 47 458 токенов на двух
+   * аккаунтах.
+   *
+   * История чатов НЕ переносится сознательно: session_id собран как
+   * `{userId}_{agentId}`, и перенос склеил бы два параллельных разговора с
+   * одним ассистентом в одну ленту вперемешку по времени.
+   */
   async mergeAccounts(conflictUserId: string, targetUserId: string): Promise<void> {
     if (!this.pg) throw new Error('pg not configured');
+
+    const bal = await this.pg.query(
+      `SELECT COALESCE(tokens, 0) AS tokens FROM ai_profiles_consolidated WHERE user_id = $1 FOR UPDATE`,
+      [conflictUserId],
+    );
+    const tokens = Number(bal.rows[0]?.tokens ?? 0);
+    if (tokens > 0) {
+      await this.pg.query(`SELECT add_user_tokens($1, $2, 'adjustment', $3, NULL)`, [
+        targetUserId,
+        tokens,
+        `Перенос остатка с объединённого аккаунта ${conflictUserId}`,
+      ]);
+      await this.pg.query(`SELECT add_user_tokens($1, $2, 'adjustment', $3, NULL)`, [
+        conflictUserId,
+        -tokens,
+        `Перенос остатка на основной аккаунт ${targetUserId}`,
+      ]);
+      this.logger.log(`merge: ${tokens} токенов ${conflictUserId} → ${targetUserId}`);
+    }
+
     await this.pg.query(
       `UPDATE user_identities SET user_id = $1 WHERE user_id = $2`,
       [targetUserId, conflictUserId],

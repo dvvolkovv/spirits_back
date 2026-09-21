@@ -177,7 +177,11 @@ export class AuthService {
     // IdentityService is the single point that emits signup_completed and
     // auth_succeeded — covers SMS, Google, Yandex, email magic-link. Here
     // we only emit the SMS-specific otp_verified.
-    const { userId, isNew } = await this.identity.resolveOrCreate('phone', { phone });
+    // Телефонный вход кандидата на привязку не порождает: link_required
+    // возвращается только для провайдеров с подтверждённой почтой.
+    const r = await this.identity.resolveOrCreate('phone', { phone });
+    if (r.status !== 'ok') throw new Error(`resolveOrCreate('phone') вернул ${r.status}`);
+    const { userId, isNew } = r;
 
     this.events?.track('otp_verified', { userId, sessionId: sid || null, source: src || null, props: { channel: 'sms' } });
 

@@ -33,8 +33,20 @@ export interface Identity {
   lastUsedAt: string | null;
 }
 
-export interface ResolveResult {
-  userId: string;
-  isNew: boolean;
-  mergedExisting: boolean;
+/**
+ * Union, а не один объект с необязательными полями, — намеренно: компилятор
+ * обязан ткнуть в каждый вход, который не обработал вариант link_required.
+ * Именно «молча пошли дальше по общему пути» и завело дубликат 19.09.2026.
+ */
+export type ResolveResult =
+  | { status: 'ok'; userId: string; isNew: boolean; mergedExisting: boolean }
+  | { status: 'link_required'; candidateUserId: string; phoneHint: string };
+
+export interface ResolveOptions {
+  /**
+   * Завести новый аккаунт, даже если найден кандидат на привязку.
+   * Нужен как выход для человека, потерявшего доступ к номеру: без него
+   * он окажется заперт вне обоих аккаунтов.
+   */
+  forceNew?: boolean;
 }

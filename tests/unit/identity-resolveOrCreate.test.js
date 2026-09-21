@@ -20,7 +20,7 @@ describe('IdentityService.resolveOrCreate', () => {
     ]);
     const svc = new IdentityService(pg);
     const out = await svc.resolveOrCreate('phone', { phone: '79030169187' });
-    expect(out).toEqual({ userId: 'u1', isNew: false, mergedExisting: false });
+    expect(out).toEqual({ status: 'ok', userId: 'u1', isNew: false, mergedExisting: false });
   });
 
   test('новый user — INSERT user_id, ai_profiles_consolidated, user_identities, welcome bonus', async () => {
@@ -49,7 +49,7 @@ describe('IdentityService.resolveOrCreate', () => {
     ]);
     const svc = new IdentityService(pg);
     const out = await svc.resolveOrCreate('google', { sub: 'g-123', email: 'foo@gmail.com', emailVerified: true });
-    expect(out).toEqual({ userId: 'EXISTING', isNew: false, mergedExisting: true });
+    expect(out).toEqual({ status: 'ok', userId: 'EXISTING', isNew: false, mergedExisting: true });
   });
 
   test('phone нормализуется (убираем +, скобки, пробелы)', async () => {
