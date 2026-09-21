@@ -236,6 +236,11 @@ describe('ProductsController.create', () => {
       slug: 'selyanska',
       kind: 'site',
       secrets: { BOT_TOKEN: '123:abc' },
+      // Признак администратора — часть каждого заведения, а не довесок: по
+      // нему выбирается машина. Обычный пользователь — false, а не
+      // отсутствие поля: `isAdmin` объявлен обязательным именно затем, чтобы
+      // забытый признак был ошибкой типов, а не тихой маршрутизацией.
+      isAdmin: false,
     });
   });
 
@@ -254,6 +259,55 @@ describe('ProductsController.create', () => {
     } as any);
 
     expect(provisioning.create).toHaveBeenCalledWith(expect.objectContaining({ userId: 'u-1' }));
+  });
+
+  it('признак администратора берётся у гварда, а не из тела запроса', async () => {
+    // Признак решает, на машины какой аудитории уедет продукт (кусок 4а).
+    // ValidationPipe стоит с whitelist: false, поэтому `isAdmin` из тела
+    // доезжает до маршрута насквозь — спред тела отдал бы любому желающему
+    // право поставить свой продукт рядом с боевыми.
+    const { ctrl, provisioning } = makeController([]);
+
+    await ctrl.create({ userId: 'u-1', isAdmin: false } as any, {
+      name: 'Сайт',
+      slug: 'site-1',
+      kind: 'site',
+      isAdmin: true,
+    } as any);
+
+    expect(provisioning.create).toHaveBeenCalledWith(expect.objectContaining({ isAdmin: false }));
+  });
+
+  it('признак администратора доезжает до заведения, когда он ЕСТЬ', async () => {
+    // Обратная половина: реализация, зашившая false, прошла бы тест выше
+    // зелёной и увела бы все продукты владельца на клиентские машины.
+    const { ctrl, provisioning } = makeController([]);
+
+    await ctrl.create({ userId: 'u-1', isAdmin: true } as any, {
+      name: 'Сайт',
+      slug: 'site-1',
+      kind: 'site',
+    } as any);
+
+    expect(provisioning.create).toHaveBeenCalledWith(expect.objectContaining({ isAdmin: true }));
+  });
+
+  it('правдоподобное не-true администратором не считается', async () => {
+    // `user` здесь `any` — из JwtGuard он приходит с настоящим boolean, но
+    // проверки типа на этом пути нет ни одной. Приведение к истинности сделало
+    // бы админом строку 'false'. Любое не-true уводит продукт на клиентскую
+    // машину, то есть в безопасную сторону.
+    for (const bad of ['true', 'false', 1, {}, [], undefined]) {
+      const { ctrl, provisioning } = makeController([]);
+
+      await ctrl.create({ userId: 'u-1', isAdmin: bad } as any, {
+        name: 'Сайт',
+        slug: 'site-1',
+        kind: 'site',
+      } as any);
+
+      expect(provisioning.create).toHaveBeenCalledWith(expect.objectContaining({ isAdmin: false }));
+    }
   });
 
   it('продукт без секретов заводится с пустым набором, а не с undefined', async () => {

@@ -3,6 +3,22 @@ import * as crypto from 'crypto';
 import { ProvisioningService } from './provisioning.service';
 import { SecretsService } from './secrets.service';
 
+/**
+ * Реестр машин, который БРОСАЕТ при обращении.
+ *
+ * Ни один метод в этом файле машину под новый продукт не выбирает — это дело
+ * одного только create(). Заглушка, отдающая правдоподобную машину, приняла бы
+ * молча правку, при которой выдача заданий или сон начинают спрашивать реестр
+ * на каждый оборот; такая заглушка «работает» ровно до прода. Отказ здесь
+ * громкий и адресный.
+ */
+const noHosts = () =>
+  ({
+    pickForNewProduct: jest.fn(() => {
+      throw new Error('выбор машины здесь не зовётся: он живёт только в create()');
+    }),
+  }) as any;
+
 // Строка, какой её отдаёт финальный SELECT: id задания и id продукта РАЗНЫЕ,
 // слаг и форма тоже — иначе перепутанные местами поля проходили бы зелёными.
 // Имена ключей — те, что заданы алиасами в запросе: потеря алиаса ломает
@@ -38,7 +54,7 @@ function makeService(over: any = {}) {
     }),
   };
   const secrets = over.secrets ?? { decrypt: jest.fn(() => ({ BOT_TOKEN: 'т' })) };
-  return { svc: new ProvisioningService(pg as any, secrets as any), calls, secrets };
+  return { svc: new ProvisioningService(pg as any, secrets as any, noHosts()), calls, secrets };
 }
 
 const sqlOf = (c: { sql: string }[]) => c.map((x) => x.sql).join('\n');
@@ -909,7 +925,7 @@ function makeRetry(over: { rows?: any[]; fail?: any } = {}) {
       return { rows, rowCount: rows.length };
     }),
   };
-  return { svc: new ProvisioningService(pg as any, { decrypt: jest.fn() } as any), calls };
+  return { svc: new ProvisioningService(pg as any, { decrypt: jest.fn() } as any, noHosts()), calls };
 }
 
 const pgError = (code: string, constraint?: string) =>
@@ -1047,7 +1063,7 @@ describe('ProvisioningService.touchHostAgent', () => {
         return { rows: [], rowCount: 1 };
       }),
     };
-    const svc = new ProvisioningService(pg as any, {} as any);
+    const svc = new ProvisioningService(pg as any, {} as any, noHosts());
     const error = jest.spyOn((svc as any).logger, 'error').mockImplementation(() => undefined);
     return { svc, calls, error };
   }
@@ -1130,7 +1146,7 @@ describe('ProvisioningService.touchHostAgent', () => {
     // агента, протухающего между двумя своими же записями. Оба значения
     // читаются из готовых строк SQL, поэтому тест краснеет и на правку порога.
     const { svc, calls } = makeTouch();
-    const probe = new ProvisioningService({ query: jest.fn(async () => ({ rows: [{ live: true }] })) } as any, {} as any);
+    const probe = new ProvisioningService({ query: jest.fn(async () => ({ rows: [{ live: true }] })) } as any, {} as any, noHosts());
 
     await svc.touchHostAgent('own');
     await probe.hostAgentLive('own');
@@ -1180,7 +1196,7 @@ describe('ProvisioningService.hostAgentLive', () => {
         return { rows: [{ live }], rowCount: 1 };
       }),
     };
-    return { svc: new ProvisioningService(pg as any, {} as any), calls };
+    return { svc: new ProvisioningService(pg as any, {} as any, noHosts()), calls };
   }
 
   it('спрашивает базу один раз', async () => {
@@ -1281,7 +1297,7 @@ describe('ProvisioningService.hostAgentsLiveForUser', () => {
         return { rows: [{ live }], rowCount: 1 };
       }),
     };
-    return { svc: new ProvisioningService(pg as any, {} as any), calls };
+    return { svc: new ProvisioningService(pg as any, {} as any, noHosts()), calls };
   }
 
   it('спрашивает базу один раз', async () => {

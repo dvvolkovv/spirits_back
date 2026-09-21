@@ -1,9 +1,16 @@
-import { ConflictException, Logger, NotFoundException, UnauthorizedException } from '@nestjs/common';
+import {
+  ConflictException,
+  Logger,
+  NotFoundException,
+  UnauthorizedException,
+  UnprocessableEntityException,
+} from '@nestjs/common';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
 import { HostGuard } from './host.guard';
+import { HostsService } from './hosts.service';
 import { MIGRATIONS, ProductsService } from './products.service';
 import { ProvisioningService } from './provisioning.service';
 import { RentService } from './rent.service';
@@ -121,8 +128,13 @@ maybe('провижининг против живого Postgres', () => {
   let pg: { query: (sql: string, params?: any[]) => Promise<any> };
   let secrets: SecretsService;
 
+  /**
+   * НАСТОЯЩИЙ HostsService на том же пуле, а не заглушка. Выбор машины — это
+   * один запрос, и всё, что в нём можно сломать (потолок в SQL, счёт по своей
+   * машине, ORDER BY, скалярные счётчики причин), заглушка не исполняет вовсе.
+   */
   const makeSvc = (probe?: (url: string, init?: any) => Promise<{ status: number }>) => {
-    const svc = new ProvisioningService(pg as any, secrets);
+    const svc = new ProvisioningService(pg as any, secrets, new HostsService(pg as any));
     (svc as any).fetchFn = probe ?? (async () => ({ status: 200 }));
     return svc;
   };
@@ -211,6 +223,21 @@ maybe('провижининг против живого Postgres', () => {
     seenAgo?: string | null;
     secrets?: Record<string, string> | null;
     /**
+     * ПУБЛИЧНЫЙ ДОМЕН. По умолчанию — слаг в зоне СВОЕЙ машины, ровно как его
+     * пишет create(); у бота NULL по форме.
+     *
+     * Умолчание здесь не удобство, а воспроизведение прода: проба promoteReady
+     * собирает адрес из `products.domain` (зона своя у каждой машины реестра,
+     * склеивать её из константы больше нельзя). Фикстура, оставлявшая домен
+     * пустым, описывала бы сайт, до которого не может дойти и владелец, —
+     * такой продукт не переводится в running вовсе, и половина сценариев
+     * проверяла бы этот отказ вместо того, ради чего написана.
+     *
+     * `null` — сайт БЕЗ домена: аномалия, которую надо было уметь описать
+     * (сценарий 51о).
+     */
+    domain?: string | null;
+    /**
      * МЕТКА МАШИНЫ. По умолчанию 'own', и машина заводится в реестре сама.
      *
      * Умолчание здесь не удобство, а воспроизведение прода: с куска 4а живой
@@ -235,6 +262,7 @@ maybe('провижининг против живого Postgres', () => {
    */
   const HOST_IPS = new Map<string, string>([['own', '139.59.210.42']]);
   let ensuredSeq = 0;
+  const suffixOf = (id: string) => (id === 'own' ? 'p.linkeon.io' : 'c.linkeon.io');
   async function ensureHost(id: string) {
     let ip = HOST_IPS.get(id);
     if (!ip) {
@@ -253,12 +281,12 @@ maybe('провижининг против живого Postgres', () => {
         id,
         `root@${ip}`,
         ip,
-        id === 'own' ? 'p.linkeon.io' : 'c.linkeon.io',
+        suffixOf(id),
         sha(`токен ${id}`),
         id === 'own' ? 'own' : 'clients',
       ],
     );
-    return { id, ip };
+    return { id, ip, suffix: suffixOf(id) };
   }
 
   async function product(o: Seed = {}) {
@@ -270,17 +298,26 @@ maybe('провижининг против живого Postgres', () => {
     // колонки заполняет один INSERT заведения, и сопоставление 005 по адресу
     // проверяется на продукте, у которого адрес есть.
     const host = o.host === null ? null : await ensureHost(o.host ?? 'own');
+    const kind = o.kind ?? 'site';
+    // Домен собирается из зоны ВЫБРАННОЙ машины — тем же правилом, что в
+    // create(). Продукт без машины домена не получает: собирать его не из чего.
+    const domain =
+      o.domain !== undefined
+        ? o.domain
+        : kind === 'site' && host
+          ? `${slug}.${host.suffix}`
+          : null;
     await pool.query(
       `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path,
                              runner_token_hash, secrets_encrypted, port,
-                             runner_seen_at, created_at, host_id, host_ip)
+                             runner_seen_at, created_at, host_id, host_ip, domain)
        VALUES ($1, 'u-1', $10, $2, $3, $4, '/product', $5, $6, $7,
                CASE WHEN $8::text IS NULL THEN NULL ELSE now() - $8::interval END,
-               now() - $9::interval, $11, $12)`,
+               now() - $9::interval, $11, $12, $13)`,
       [
         id,
         slug,
-        o.kind ?? 'site',
+        kind,
         o.status ?? 'provisioning',
         // Стартовый хеш у каждого продукта СВОЙ: колонка UNIQUE, а сценарии
         // ниже отличают «хеш повернулся» от «остался прежним».
@@ -292,9 +329,10 @@ maybe('провижининг против живого Postgres', () => {
         name,
         host?.id ?? null,
         host?.ip ?? null,
+        domain,
       ],
     );
-    return { id, slug, name };
+    return { id, slug, name, domain };
   }
 
   type JobSeed = {
@@ -1041,10 +1079,12 @@ maybe('провижининг против живого Postgres', () => {
     // bytea записан КОДОМ, а не фикстурой: encrypt при заведении, INSERT и
     // decrypt при выдаче сходятся только все вместе и только если AAD —
     // тот самый productId, сгенерированный ДО вставки.
+    await ensureHost('own');
     const svc = makeSvc();
 
     const { productId } = await svc.create({
       userId: 'u-1',
+      isAdmin: true,
       name: 'первый',
       slug: 'taken-slug',
       kind: 'bot',
@@ -1060,14 +1100,12 @@ maybe('провижининг против живого Postgres', () => {
       productId,
     ]);
     expect(j.rows).toEqual([{ status: 'queued' }]);
-    // МЕТКУ МАШИНЫ create() ЕЩЁ НЕ СТАВИТ — это задача 4. Без неё заведённый
-    // продукт не виден ни одному агенту: задание висит в очереди, через десять
-    // минут его хоронит сборщик зависших, и владелец читает про истёкший срок.
-    // Дыра названа прямо (сценарий 46г) и закрывается выбором машины при
-    // заведении; здесь метка ставится руками, чтобы сценарий проверял
-    // роундтрип секретов, а не отсутствие метки.
-    await ensureHost('own');
-    await pool.query(`UPDATE products SET host_id = 'own' WHERE id = $1`, [productId]);
+    // МЕТКУ МАШИНЫ СТАВИТ САМО ЗАВЕДЕНИЕ (задача 4). До неё продукт не был
+    // виден ни одному агенту: задание висело в очереди, через десять минут его
+    // хоронил сборщик зависших, и владелец читал про истёкший срок. Здесь это
+    // видно сквозным ходом — заведённый продукт немедленно достаётся агенту
+    // своей машины, без единой правки руками.
+    expect(row.host_id).toBe('own');
     const claimed = await makeSvc().claimJob('own');
     expect(claimed!.productId).toBe(productId);
     expect(claimed!.secrets).toEqual({ BOT_TOKEN: '123:abc' });
@@ -1088,10 +1126,12 @@ maybe('провижининг против живого Postgres', () => {
     //                 считаем здоровым»). У каждого автозаведённого продукта
     //                 проверка после правки проходила всегда, и автооткат не
     //                 мог сработать ни разу.
+    await ensureHost('own');
     const svc = makeSvc();
 
     const site = await svc.create({
       userId: 'u-1',
+      isAdmin: true,
       name: 'сайт',
       slug: 'polya-site',
       kind: 'site',
@@ -1099,6 +1139,7 @@ maybe('провижининг против живого Postgres', () => {
     });
     const bot = await svc.create({
       userId: 'u-1',
+      isAdmin: true,
       name: 'бот',
       slug: 'polya-bot',
       kind: 'bot',
@@ -1120,11 +1161,12 @@ maybe('провижининг против живого Postgres', () => {
   });
 
   it('18б. занятый слаг отбивается 409 ещё до выпуска токена', async () => {
+    await ensureHost('own');
     const svc = makeSvc();
-    await svc.create({ userId: 'u-1', name: 'первый', slug: 'taken-slug', kind: 'site', secrets: {} });
+    await svc.create({ userId: 'u-1', isAdmin: true, name: 'первый', slug: 'taken-slug', kind: 'site', secrets: {} });
 
     const e = await svc
-      .create({ userId: 'u-2', name: 'второй', slug: 'taken-slug', kind: 'site', secrets: {} })
+      .create({ userId: 'u-2', isAdmin: true, name: 'второй', slug: 'taken-slug', kind: 'site', secrets: {} })
       .then(() => null)
       .catch((err: any) => err);
 
@@ -1147,6 +1189,7 @@ maybe('провижининг против живого Postgres', () => {
     // превратил бы падение базы и нарушение CHECK в спокойное «слаг занят» без
     // следа в логах, поэтому ниже проверяется ещё и то, что ЧУЖОЕ нарушение
     // 23505 наружу 409 не отдаёт.
+    await ensureHost('own');
     let raced = false;
     const racingPg = {
       query: async (sql: string, params?: any[]) => {
@@ -1158,10 +1201,10 @@ maybe('провижининг против живого Postgres', () => {
         return r;
       },
     };
-    const svc = new ProvisioningService(racingPg as any, secrets);
+    const svc = new ProvisioningService(racingPg as any, secrets, new HostsService(racingPg as any));
 
     const e = await svc
-      .create({ userId: 'u-9', name: 'гонка', slug: 'raced-slug', kind: 'site', secrets: {} })
+      .create({ userId: 'u-9', isAdmin: true, name: 'гонка', slug: 'raced-slug', kind: 'site', secrets: {} })
       .then(() => null)
       .catch((err: any) => err);
 
@@ -1178,6 +1221,9 @@ maybe('провижининг против живого Postgres', () => {
     // Столкновение sha256 от 32 случайных байт означает не занятый слаг, а
     // что-то, что обязано быть видно как 500. Безусловный catch эту разницу
     // стирает, и падение базы выглядело бы как «выберите другой слаг».
+    // Машина заводится ДО подмены crypto: ensureHost считает sha256 токена
+    // настоящим createHash, а спай ниже подменяет его на константу.
+    await ensureHost('own');
     const svc = makeSvc();
     const fixed = crypto.createHash('sha256').update('константа').digest('hex');
     const spy = jest.spyOn(crypto, 'createHash');
@@ -1191,7 +1237,7 @@ maybe('провижининг против живого Postgres', () => {
     );
 
     const e = await svc
-      .create({ userId: 'u-2', name: 'другой', slug: 'hash-clash', kind: 'site', secrets: {} })
+      .create({ userId: 'u-2', isAdmin: true, name: 'другой', slug: 'hash-clash', kind: 'site', secrets: {} })
       .then(() => null)
       .catch((err: any) => err);
 
@@ -3792,6 +3838,362 @@ maybe('провижининг против живого Postgres', () => {
 
         expect([a!.slug, b!.slug]).toEqual(['mh-par-own', 'mh-par-cli']);
         expect(a!.jobId).not.toBe(b!.jobId);
+      });
+    });
+
+    // ───────────── выбор машины при заведении (задача 4) ─────────────
+
+    /**
+     * ДО ЭТОЙ ЗАДАЧИ create() МЕТКУ НЕ СТАВИЛ ВОВСЕ, и это была не мелочь:
+     * `p.host_id = NULL` в выдаче заданий не равно ничему, поэтому только что
+     * заведённый продукт не доставался ни одному агенту. Задание висело в
+     * очереди, через десять минут его хоронил сборщик зависших, и владелец
+     * читал чужую формулировку про истёкший срок (сценарий 46г).
+     *
+     * ПОЧЕМУ ПРОТИВ ЖИВОЙ БАЗЫ. Весь отбор — один запрос: потолок считается
+     * скалярным подзапросом, аудитория и accepts_new стоят в WHERE, причины
+     * отказа приезжают двумя счётчиками через LEFT JOIN к `(SELECT 1)`.
+     * Заглушка не исполняет ни одного из этих условий — на ней зелены и
+     * «потолок считает спящих», и реализация, считающая только работающих.
+     */
+    describe('выбор машины при заведении', () => {
+      const create = (o: { slug: string; isAdmin?: boolean; kind?: 'site' | 'bot' }) =>
+        makeSvc().create({
+          userId: o.isAdmin ? 'u-адм' : 'u-кли',
+          isAdmin: o.isAdmin ?? false,
+          name: `имя ${o.slug}`,
+          slug: o.slug,
+          kind: o.kind ?? 'site',
+          secrets: {},
+        });
+
+      /** Отказ, а не результат: `.rejects` не даёт посмотреть на код ответа. */
+      const refusedOn = (p: Promise<unknown>) => p.then(() => null, (e: any) => e);
+
+      it('51. продукт клиента уезжает на клиентскую машину, продукт админа — на свою', async () => {
+        // ГЛАВНЫЙ СЦЕНАРИЙ ЗАДАЧИ. Обе машины в реестре, обе с местом — выбор
+        // решает ТОЛЬКО аудитория. Реализация, берущая первую машину по
+        // порядку, поставила бы чужой продукт рядом с боевыми: 'clients' < 'own'
+        // лексикографически, то есть ORDER BY отдал бы её обоим.
+        await ensureHost('own');
+        await addHost({ id: 'clients' });
+
+        const cli = await create({ slug: 'mh-r1' });
+        const own = await create({ slug: 'mh-r2', isAdmin: true });
+
+        expect((await getProduct(cli.productId)).host_id).toBe('clients');
+        expect((await getProduct(own.productId)).host_id).toBe('own');
+      });
+
+      it('51а. домен и адрес берутся у ВЫБРАННОЙ машины, а не из константы', async () => {
+        // Константы адреса и зоны жили в provisioning.service.ts с
+        // умолчаниями 139.59.210.42 и p.linkeon.io. Оставленные «на всякий
+        // случай», они разошлись бы с реестром молча: продукт получил бы домен
+        // одной зоны, а адрес другой — сайт стоит на клиентской машине, домен
+        // выписан в зоне владельца, сертификата нет.
+        await ensureHost('own');
+        await addHost({ id: 'clients', ip: '10.0.0.77', suffix: 'c.linkeon.io' });
+
+        const r = await create({ slug: 'mh-zone' });
+
+        const row = await getProduct(r.productId);
+        expect(row.domain).toBe('mh-zone.c.linkeon.io');
+        expect(row.host_ip).toBe('10.0.0.77');
+        expect(row.host_id).toBe('clients');
+      });
+
+      it('51б. потолок считает СПЯЩИХ, но не архивных', async () => {
+        // Спящий контейнер остановлен и памяти не ест — считать его выглядит
+        // расточительным. Не считать ОПАСНЕЕ: двадцать спящих просыпаются от
+        // одного пополнения баланса, и машина, заполненная «по живым», ляжет.
+        // Архивный не занимает ничего: заданий он не получает никогда.
+        await addHost({ id: 'clients', capacity: 2 });
+        await product({ slug: 'mh-sleeping', status: 'sleeping', host: 'clients' });
+        const dead = await product({ slug: 'mh-archived', status: 'running', host: 'clients' });
+        await pool.query(`UPDATE products SET archived_at = now() WHERE id = $1`, [dead.id]);
+
+        // Второе место занимает спящий, третьего нет — архивный не считается,
+        // иначе этот вызов отбился бы тоже.
+        const r = await create({ slug: 'mh-cap1' });
+        expect((await getProduct(r.productId)).host_id).toBe('clients');
+
+        const e = await refusedOn(create({ slug: 'mh-cap2' }));
+        expect(e).toBeInstanceOf(UnprocessableEntityException);
+        expect(String(e.message)).toMatch(/мест/i);
+      });
+
+      it('51в. машина, не принимающая новые, пропускается — но свои продукты на ней остаются', async () => {
+        // accepts_new выводит машину из оборота, не трогая то, что на ней
+        // стоит: у неё остаются свои продукты и своя очередь заданий (45г).
+        await addHost({ id: 'clients', acceptsNew: false });
+        const old = await product({ slug: 'mh-old', host: 'clients' });
+
+        const e = await refusedOn(create({ slug: 'mh-closed' }));
+
+        expect(String(e.message)).toMatch(/мест/i);
+        expect((await getProduct(old.id)).host_id).toBe('clients');
+      });
+
+      it('51г. отказ не оставляет ни продукта, ни задания, ни занятого слага', async () => {
+        // Отказ идёт ДО выпуска токена и любой записи. Продукт, записанный «на
+        // всякий случай» без метки, занял бы слаг навсегда и не достался бы ни
+        // одному агенту.
+        await addHost({ id: 'clients', capacity: 1 });
+        await product({ slug: 'mh-occupied', host: 'clients' });
+
+        await refusedOn(create({ slug: 'mh-nowhere' }));
+
+        const left = await pool.query(`SELECT count(*) FROM products WHERE slug = 'mh-nowhere'`);
+        expect(Number(left.rows[0].count)).toBe(0);
+        const jobs = await pool.query('SELECT count(*) FROM product_provision_jobs');
+        expect(Number(jobs.rows[0].count)).toBe(0);
+      });
+
+      it('51д. пустой реестр отличим от переполнения: своя причина, своя строка в журнале', async () => {
+        // Состояние ДОСТИЖИМОЕ: 005 нарочно ничего не заводит при
+        // незаполненном PRODUCT_HOST_TOKEN (40в), и на свежем окружении реестр
+        // пуст. «Мест нет» отправило бы владельца добавлять вторую машину
+        // вместо того, чтобы дописать переменную.
+        const logged: string[] = [];
+        jest.spyOn(Logger.prototype, 'error').mockImplementation((m: any) => {
+          logged.push(String(m));
+        });
+
+        const e = await refusedOn(create({ slug: 'mh-empty', isAdmin: true }));
+
+        expect(e.getStatus()).toBe(422);
+        expect(String(e.message)).toMatch(/не настроен/i);
+        expect(logged.join('\n')).toMatch(/реестр машин пуст/);
+      });
+
+      it('51е. машин этой аудитории нет вовсе — тоже своя причина', async () => {
+        // СЕГОДНЯШНИЙ ПРОД: машина own есть, клиентской ещё нет (кусок 4б).
+        // Отдать клиенту машину владельца «раз уж другой нет» значило бы
+        // поставить чужой код рядом с боевыми продуктами — ровно та авария,
+        // ради которой машины и разделяют.
+        await ensureHost('own');
+        const logged: string[] = [];
+        jest.spyOn(Logger.prototype, 'error').mockImplementation((m: any) => {
+          logged.push(String(m));
+        });
+
+        const e = await refusedOn(create({ slug: 'mh-noaudience' }));
+
+        expect(String(e.message)).toMatch(/не открыт/i);
+        expect(logged.join('\n')).toMatch(/audience=clients/);
+        // На машине владельца ничего не появилось.
+        const n = await pool.query(`SELECT count(*) FROM products WHERE host_id = 'own'`);
+        expect(Number(n.rows[0].count)).toBe(0);
+      });
+
+      it('51ж. три причины отказа различимы между собой', async () => {
+        // Каждая проверка выше смотрит на свой регексп и потому зелена у
+        // реализации, отдающей один текст трижды.
+        const empty = await refusedOn(create({ slug: 'mh-t1', isAdmin: true }));
+        await ensureHost('own');
+        const wrongAudience = await refusedOn(create({ slug: 'mh-t2' }));
+        await addHost({ id: 'clients', capacity: 1 });
+        await product({ slug: 'mh-t-filler', host: 'clients' });
+        const full = await refusedOn(create({ slug: 'mh-t3' }));
+
+        const texts = [empty, wrongAudience, full].map((e) => String(e.message));
+        expect(new Set(texts).size).toBe(3);
+        for (const t of texts) expect(t).not.toMatch(/позже/i);
+      });
+
+      it('51з. потолок считает продукты СВОЕЙ машины, а не все подряд', async () => {
+        // `count(*) FROM products` без корреляции по машине — правка, которая
+        // выглядит упрощением и запирает пустую машину, как только соседняя
+        // набита. Своих продуктов здесь ноль, чужих — три.
+        await ensureHost('own');
+        await addHost({ id: 'clients', capacity: 2 });
+        for (const slug of ['mh-n1', 'mh-n2', 'mh-n3']) {
+          await product({ slug, host: 'own' });
+        }
+
+        const r = await create({ slug: 'mh-mine' });
+
+        expect((await getProduct(r.productId)).host_id).toBe('clients');
+      });
+
+      it('51и. заведённый продукт СРАЗУ достаётся агенту своей машины', async () => {
+        // СКВОЗНОЙ ХОД, ради которого написана задача. До неё метки не было, и
+        // заведение заканчивалось похоронами по таймауту при полностью
+        // исправном агенте.
+        await ensureHost('own');
+        await addHost({ id: 'clients' });
+
+        const r = await create({ slug: 'mh-e2e' });
+
+        expect(await makeSvc().claimJob('own')).toBeNull();
+        const claimed = await makeSvc().claimJob('clients');
+        expect(claimed!.productId).toBe(r.productId);
+        expect(claimed!.slug).toBe('mh-e2e');
+      });
+
+      it('51к. у бота домена нет, а машина и её адрес есть', async () => {
+        // Домена у бота нет по форме — он не принимает входящих соединений.
+        // Метка при этом нужна ему ровно так же: по ней решается, чей агент
+        // поднимет его контейнер.
+        await addHost({ id: 'clients', ip: '10.0.0.88', suffix: 'c.linkeon.io' });
+
+        const r = await create({ slug: 'mh-bot', kind: 'bot' });
+
+        const row = await getProduct(r.productId);
+        expect(row.domain).toBeNull();
+        expect(row.host_id).toBe('clients');
+        expect(row.host_ip).toBe('10.0.0.88');
+      });
+
+      it('51л. машины набиваются по порядку метки, а не наугад', async () => {
+        // ORDER BY h.id — детерминированный «набиваем по очереди».
+        // Балансировка сверх «есть место / нет места» из куска вынесена, но
+        // отсутствие ORDER BY означало бы порядок, который решает планировщик:
+        // он меняется от статистики таблицы, то есть однажды молча.
+        await addHost({ id: 'cli-a', capacity: 1 });
+        await addHost({ id: 'cli-b', capacity: 1 });
+
+        const first = await create({ slug: 'mh-fill1' });
+        const second = await create({ slug: 'mh-fill2' });
+
+        expect((await getProduct(first.productId)).host_id).toBe('cli-a');
+        expect((await getProduct(second.productId)).host_id).toBe('cli-b');
+      });
+
+      it('51м. потолок МЯГКИЙ под одновременными заявками — измерено, не закрыто', async () => {
+        // ИЗМЕРЕНИЕ, А НЕ ПОЖЕЛАНИЕ. Выбор и вставка — два разных оператора, а
+        // каждый запрос через пул сам себе транзакция: оба заведения видят
+        // снимок БЕЗ строки соседа и оба проходят последнее свободное место.
+        // Одним оператором это не чинится — `INSERT … SELECT` берёт тот же
+        // снимок, а FOR UPDATE лочит строку машины уже после вычисления
+        // условия. Настоящее закрытие — выделенное соединение и явная
+        // транзакция, где второй командой берётся НОВЫЙ снимок.
+        //
+        // Не сделано сознательно: сегодня заведение доступно только админам,
+        // то есть «одновременно» означает двух владельцев в одну миллисекунду,
+        // а перебор на единицу стоит ~90 МБ. ТРИГГЕР ПЕРЕСМОТРА — кусок 4б,
+        // где вкладка открывается всем: пятьдесят одновременных заявок кладут
+        // машину при потолке двадцать.
+        //
+        // Тест краснеет, когда предел ЗАКРОЮТ, — и тогда его надо читать, а не
+        // чинить: ограничение снято, комментарий устарел.
+        //
+        // ГОНКА ВОСПРОИЗВОДИТСЯ ТОЧНО, А НЕ ЛОВИТСЯ `Promise.all`. Первая
+        // редакция этого сценария просто пускала два заведения разом и была
+        // ФЛАКИ: измерено — один красный на ~27 полных прогонов. Причина в
+        // пуле: второму заведению может достаться ещё не открытое соединение,
+        // и его выборка машины уходит на сервер уже ПОСЛЕ вставки первого,
+        // то есть видит занятое место и честно отбивается. Сценарий,
+        // проходящий по настроению, хуже отсутствующего — поэтому здесь стоит
+        // барьер: оба выбора машины обязаны СНЯТЬ СНИМОК, и только потом любое
+        // из заведений идёт дальше. Тот же приём, что у 18в.
+        await addHost({ id: 'clients', capacity: 1 });
+        let picked = 0;
+        let openGate: () => void = () => undefined;
+        const gate = new Promise<void>((r) => (openGate = r));
+        const gatedPg = {
+          query: async (sql: string, params?: any[]) => {
+            const r = await pool.query(sql, params);
+            if (/FROM product_hosts/.test(sql)) {
+              if (++picked === 2) openGate();
+              await gate;
+            }
+            return r;
+          },
+        };
+        const raced = () =>
+          new ProvisioningService(gatedPg as any, secrets, new HostsService(gatedPg as any));
+
+        const both = await Promise.all([
+          refusedOn(
+            raced().create({
+              userId: 'u-кли',
+              isAdmin: false,
+              name: 'гонка 1',
+              slug: 'mh-race1',
+              kind: 'site',
+              secrets: {},
+            }),
+          ),
+          refusedOn(
+            raced().create({
+              userId: 'u-кли',
+              isAdmin: false,
+              name: 'гонка 2',
+              slug: 'mh-race2',
+              kind: 'site',
+              secrets: {},
+            }),
+          ),
+        ]);
+
+        expect(picked).toBe(2);
+
+        const placed = await pool.query(
+          `SELECT count(*) FROM products WHERE host_id = 'clients' AND archived_at IS NULL`,
+        );
+        expect(Number(placed.rows[0].count)).toBe(2);
+        expect(both.every((e) => e === null)).toBe(true);
+      });
+
+      it('51н. проба перевода в running идёт в зону ВЫБРАННОЙ машины', async () => {
+        // PUBLIC_ZONE был третьей константой и собирал адрес из слага:
+        // продукт клиентской машины проверялся бы по адресу в зоне владельца —
+        // ответа нет никогда, и через десять минут сборщик зависших хоронит
+        // исправный сайт.
+        await addHost({ id: 'clients', suffix: 'c.linkeon.io' });
+        const asked: string[] = [];
+        const svc = makeSvc(async (url: string) => {
+          asked.push(url);
+          return { status: 200 };
+        });
+
+        const r = await svc.create({
+          userId: 'u-кли',
+          isAdmin: false,
+          name: 'зона',
+          slug: 'mh-probe',
+          kind: 'site',
+          secrets: {},
+        });
+        // Заведение закрыто, раннер на связи — остаётся проба.
+        await pool.query(
+          `UPDATE product_provision_jobs SET status = 'done', finished_at = now() WHERE product_id = $1`,
+          [r.productId],
+        );
+        await pool.query(`UPDATE products SET runner_seen_at = now() WHERE id = $1`, [r.productId]);
+
+        await svc.promoteReady();
+
+        expect(asked).toEqual(['https://mh-probe.c.linkeon.io/health']);
+        expect((await getProduct(r.productId)).status).toBe('running');
+      });
+
+      it('51о. сайт БЕЗ домена в running не уезжает и говорит об этом', async () => {
+        // Раньше адрес пробы собирался из слага и константы зоны, поэтому
+        // пустой domain был невидим: проба уходила по угаданному адресу и
+        // проходила. Такие строки на проде есть — заведённые до того, как
+        // автозаведение научилось заполнять domain.
+        //
+        // Угадывать больше нечего (зона своя у каждой машины), да и незачем:
+        // продукт без домена сломан и с другой стороны — ссылку в кабинете
+        // рисуют из той же колонки.
+        const p = await product({ slug: 'mh-nodomain', domain: null, seenAgo: '5 seconds' });
+        const logged: string[] = [];
+        jest.spyOn(Logger.prototype, 'error').mockImplementation((m: any) => {
+          logged.push(String(m));
+        });
+        const asked: string[] = [];
+        const svc = makeSvc(async (url: string) => {
+          asked.push(url);
+          return { status: 200 };
+        });
+
+        await expect(svc.promoteReady()).resolves.toBe(0);
+
+        expect(asked).toEqual([]);
+        expect((await getProduct(p.id)).status).toBe('provisioning');
+        expect(logged.join('\n')).toMatch(/mh-nodomain[\s\S]*пустой domain/);
       });
     });
   });

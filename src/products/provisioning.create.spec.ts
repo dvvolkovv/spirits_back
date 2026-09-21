@@ -1,12 +1,31 @@
 import 'reflect-metadata';
-import { BadRequestException, ConflictException } from '@nestjs/common';
+import { BadRequestException, ConflictException, UnprocessableEntityException } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { ProvisioningService } from './provisioning.service';
 import { SecretsService } from './secrets.service';
 import { ProductsModule } from './products.module';
 
+/**
+ * Реестр машин. Отдаёт РАЗНЫЕ машины разным аудиториям и разные значения в
+ * каждом поле: заглушка с одной машиной на всех зеленела бы и на реализации,
+ * которая признак администратора не передаёт вовсе.
+ *
+ * Адрес, зона и метка не выводятся друг из друга — перепутанные местами поля
+ * иначе неотличимы, а стоят они дорого: домен одной машины с адресом другой.
+ */
+const HOSTS: Record<string, any> = {
+  own: { id: 'own', publicIp: '139.59.210.42', domainSuffix: 'p.linkeon.io' },
+  clients: { id: 'clients', publicIp: '10.1.2.3', domainSuffix: 'c.linkeon.io' },
+};
+
 function makeService(over: any = {}) {
   const calls: { sql: string; params: any[] }[] = [];
+  const hosts = {
+    pickForNewProduct: jest.fn(async (isAdmin: boolean) => {
+      if (over.noRoom) throw new UnprocessableEntityException('мест нет');
+      return HOSTS[isAdmin === true ? 'own' : 'clients'];
+    }),
+  };
   const pg = {
     query: jest.fn(async (sql: string, params: any[] = []) => {
       calls.push({ sql, params });
@@ -29,7 +48,12 @@ function makeService(over: any = {}) {
     }),
   };
   const secrets = { encrypt: jest.fn(() => Buffer.from('шифр')) };
-  return { svc: new ProvisioningService(pg as any, secrets as any), calls, secrets };
+  return {
+    svc: new ProvisioningService(pg as any, secrets as any, hosts as any),
+    calls,
+    secrets,
+    hosts,
+  };
 }
 
 const sqlOf = (c: { sql: string }[]) => c.map((x) => x.sql).join('\n');
@@ -38,7 +62,7 @@ describe('ProvisioningService.create', () => {
   it('заводит продукт в статусе provisioning и ставит задание', async () => {
     const { svc, calls } = makeService();
 
-    await svc.create({ userId: 'u-1', name: 'Сайт', slug: 'site1', kind: 'site', secrets: {} });
+    await svc.create({ userId: 'u-1', isAdmin: false, name: 'Сайт', slug: 'site1', kind: 'site', secrets: {} });
 
     expect(sqlOf(calls)).toContain('INSERT INTO products');
     expect(sqlOf(calls)).toContain('INSERT INTO product_provision_jobs');
@@ -52,7 +76,7 @@ describe('ProvisioningService.create', () => {
     const { svc, calls } = makeService({ slugTaken: true });
 
     await expect(
-      svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: {} }),
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site1', kind: 'site', secrets: {} }),
     ).rejects.toThrow(/слаг/i);
 
     expect(sqlOf(calls)).not.toContain('INSERT INTO products');
@@ -67,7 +91,7 @@ describe('ProvisioningService.create', () => {
     // нужно показывать, не должен существовать.
     const { svc, calls } = makeService();
 
-    const res = await svc.create({ userId: 'u-1', name: 'X', slug: 's', kind: 'site', secrets: {} });
+    const res = await svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 's', kind: 'site', secrets: {} });
 
     expect(res).toEqual({ productId: expect.any(String) });
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
@@ -77,7 +101,7 @@ describe('ProvisioningService.create', () => {
   it('секреты шифруются, а не кладутся как есть', async () => {
     const { svc, calls, secrets } = makeService();
 
-    await svc.create({ userId: 'u-1', name: 'Бот', slug: 'b', kind: 'bot', secrets: { BOT_TOKEN: 'т' } });
+    await svc.create({ userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'b', kind: 'bot', secrets: { BOT_TOKEN: 'т' } });
 
     expect(secrets.encrypt).toHaveBeenCalledWith({ BOT_TOKEN: 'т' }, expect.any(String));
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
@@ -88,7 +112,7 @@ describe('ProvisioningService.create', () => {
     const { svc } = makeService();
 
     await expect(
-      svc.create({ userId: 'u-1', name: 'X', slug: 's', kind: 'вирус' as any, secrets: {} }),
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 's', kind: 'вирус' as any, secrets: {} }),
     ).rejects.toThrow(/форма/i);
   });
 
@@ -104,6 +128,7 @@ describe('ProvisioningService.create', () => {
 
     const res = await svc.create({
       userId: 'u-1',
+      isAdmin: false,
       name: 'Бот',
       slug: 'b',
       kind: 'bot',
@@ -128,7 +153,7 @@ describe('ProvisioningService.create', () => {
     // секреты уехали бы в базу открытым текстом при зелёном тесте.
     const { svc, calls, secrets } = makeService();
 
-    await svc.create({ userId: 'u-1', name: 'Бот', slug: 'bot1', kind: 'bot', secrets: { BOT_TOKEN: 'т' } });
+    await svc.create({ userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'bot1', kind: 'bot', secrets: { BOT_TOKEN: 'т' } });
 
     const box = (secrets.encrypt as jest.Mock).mock.results[0].value;
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
@@ -142,7 +167,7 @@ describe('ProvisioningService.create', () => {
     // уехал бы пустой набор переменных вместо честного «их не задавали».
     const { svc, calls, secrets } = makeService();
 
-    await svc.create({ userId: 'u-1', name: 'Сайт', slug: 'site2', kind: 'site', secrets: {} });
+    await svc.create({ userId: 'u-1', isAdmin: false, name: 'Сайт', slug: 'site2', kind: 'site', secrets: {} });
 
     expect(secrets.encrypt).not.toHaveBeenCalled();
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
@@ -160,6 +185,7 @@ describe('ProvisioningService.create', () => {
 
     const res = await svc.create({
       userId: 'u-1',
+      isAdmin: false,
       name: 'Сайт',
       slug: 'site1',
       kind: 'site',
@@ -169,9 +195,9 @@ describe('ProvisioningService.create', () => {
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
     expect(insert.sql).toContain(
       '(id, user_id, name, slug, kind, status, checkout_path, runner_token_hash,\n' +
-        '                               secrets_encrypted, domain, host_ip, health_url)',
+        '                               secrets_encrypted, domain, host_ip, health_url, host_id)',
     );
-    expect(insert.sql).toContain('VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)');
+    expect(insert.sql).toContain('VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)');
     expect(insert.params).toEqual([
       res.productId,
       'u-1',
@@ -184,16 +210,105 @@ describe('ProvisioningService.create', () => {
       '/product',
       expect.stringMatching(/^[0-9a-f]{64}$/),
       null,
-      // Три последних колонки ручной product-provision.sh заполнял, а
-      // автозаведение не заполняло — поймано живой проверкой. Пустой domain
-      // прячет от владельца ссылку на его же работающий сайт, а пустой
-      // health_url ВЫКЛЮЧАЕТ автооткат: waitHealthy(null) возвращает истину.
-      // Поведение сторожит сценарий 18в интеграционного сьюта; здесь
-      // закреплена форма запроса — порядок значений ниоткуда больше не виден.
-      'site1.p.linkeon.io',
+      // Три колонки ручной product-provision.sh заполнял, а автозаведение не
+      // заполняло — поймано живой проверкой. Пустой domain прячет от владельца
+      // ссылку на его же работающий сайт, а пустой health_url ВЫКЛЮЧАЕТ
+      // автооткат: waitHealthy(null) возвращает истину. Поведение сторожит
+      // сценарий 18в интеграционного сьюта; здесь закреплена форма запроса —
+      // порядок значений ниоткуда больше не виден.
+      //
+      // Домен и адрес — у ВЫБРАННОЙ машины: заведение от имени обычного
+      // пользователя уезжает на clients, то есть в зону c.linkeon.io и на
+      // 10.1.2.3. Константы, стоявшие здесь до куска 4а, дали бы
+      // 'site1.p.linkeon.io' и '139.59.210.42' независимо от машины.
+      'site1.c.linkeon.io',
+      '10.1.2.3',
+      'http://127.0.0.1:3000/health',
+      // МЕТКА МАШИНЫ, тринадцатой колонкой. Без неё продукт не виден выдаче
+      // заданий вовсе (`p.host_id = NULL` не равно ничему): задание висит в
+      // очереди, через десять минут его хоронит сборщик зависших, и владелец
+      // читает про истёкший срок.
+      'clients',
+    ]);
+  });
+
+  // --- выбор машины (кусок 4а, задача 4) --------------------------------
+
+  it('продукт админа уезжает на свою машину, продукт клиента — на клиентскую', async () => {
+    // ГЛАВНОЕ ПОВЕДЕНИЕ ЗАДАЧИ, и видно его в трёх колонках сразу: метка,
+    // домен и адрес обязаны приехать от ОДНОЙ машины.
+    const admin = makeService();
+    const client = makeService();
+
+    await admin.svc.create({ userId: 'u-1', isAdmin: true, name: 'X', slug: 's1', kind: 'site', secrets: {} });
+    await client.svc.create({ userId: 'u-2', isAdmin: false, name: 'X', slug: 's2', kind: 'site', secrets: {} });
+
+    const params = (c: typeof admin) =>
+      c.calls.find((x) => x.sql.includes('INSERT INTO products'))!.params;
+    expect(params(admin).slice(9)).toEqual([
+      's1.p.linkeon.io',
       '139.59.210.42',
       'http://127.0.0.1:3000/health',
+      'own',
     ]);
+    expect(params(client).slice(9)).toEqual([
+      's2.c.linkeon.io',
+      '10.1.2.3',
+      'http://127.0.0.1:3000/health',
+      'clients',
+    ]);
+  });
+
+  it('признак администратора доезжает до выбора машины как есть', async () => {
+    // Реализация, зовущая pickForNewProduct() без аргумента, получила бы
+    // undefined — то есть clients — и прошла бы предыдущий тест наполовину
+    // зелёной (клиентская половина сошлась бы).
+    const { svc, hosts } = makeService();
+
+    await svc.create({ userId: 'u-1', isAdmin: true, name: 'X', slug: 's', kind: 'site', secrets: {} });
+
+    expect(hosts.pickForNewProduct).toHaveBeenCalledTimes(1);
+    expect(hosts.pickForNewProduct).toHaveBeenCalledWith(true);
+  });
+
+  it('машина выбирается ДО проверки слага: «мест нет» чинится не переименованием', async () => {
+    // Порядок осознанный. Скажи мы сначала про занятый слаг — человек
+    // переименует продукт, нажмёт снова и только тогда узнает, что заводить
+    // его некуда. Обратный порядок ничего не стоит: обе проверки идут до
+    // выпуска токена и любой записи.
+    const { svc, calls } = makeService({ noRoom: true, slugTaken: true });
+
+    // Слаг ЗАКОННЫЙ по форме: кириллица отбилась бы ещё раньше, проверкой
+    // формы, и тест проверял бы не тот порядок.
+    await expect(
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'taken', kind: 'site', secrets: {} }),
+    ).rejects.toBeInstanceOf(UnprocessableEntityException);
+
+    expect(calls).toEqual([]);
+  });
+
+  it('отказ выбора машины не оставляет ни продукта, ни задания', async () => {
+    // Отказ ДО всякой записи. Продукт, записанный «на всякий случай» без
+    // метки, занял бы слаг и не достался бы ни одному агенту.
+    const { svc, calls } = makeService({ noRoom: true });
+
+    await expect(
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 's', kind: 'site', secrets: {} }),
+    ).rejects.toThrow(/мест/i);
+
+    expect(sqlOf(calls)).not.toContain('INSERT INTO');
+  });
+
+  it('форма продукта проверяется ДО похода в реестр', async () => {
+    // Кривой слаг не должен стоить запроса к базе — и не должен занимать место
+    // в рассуждении о том, почему отказали.
+    const { svc, hosts } = makeService();
+
+    await expect(
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'Мой Сайт!', kind: 'site', secrets: {} }),
+    ).rejects.toThrow(/дефис/i);
+
+    expect(hosts.pickForNewProduct).not.toHaveBeenCalled();
   });
 
   it('у бота домена нет, а адрес проверки здоровья есть', async () => {
@@ -202,11 +317,15 @@ describe('ProvisioningService.create', () => {
     // иначе автооткат у ботов молча выключен.
     const { svc, calls } = makeService();
 
-    await svc.create({ userId: 'u-1', name: 'Бот', slug: 'bot1', kind: 'bot', secrets: {} });
+    await svc.create({ userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'bot1', kind: 'bot', secrets: {} });
 
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
     expect(insert.params[9]).toBeNull();
     expect(insert.params[11]).toBe('http://127.0.0.1:3000/health');
+    // Метка машины боту нужна ровно так же, как сайту: по ней выдача заданий
+    // решает, чей агент поднимет его контейнер. Домена нет — машина есть.
+    expect(insert.params[12]).toBe('clients');
+    expect(insert.params[10]).toBe('10.1.2.3');
   });
 
   it('хеш не выводится из значений, которые вызывающий и так знает', async () => {
@@ -217,7 +336,7 @@ describe('ProvisioningService.create', () => {
     // видит вовсе.
     const { svc, calls } = makeService();
 
-    const res = await svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: {} });
+    const res = await svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site1', kind: 'site', secrets: {} });
 
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
     const sha = (v: string) => crypto.createHash('sha256').update(v).digest('hex');
@@ -239,7 +358,7 @@ describe('ProvisioningService.create', () => {
     try {
       const { svc, calls } = makeService();
 
-      await svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: {} });
+      await svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site1', kind: 'site', secrets: {} });
 
       const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
       const drawn = spy.mock.results.map((r) => r.value as Buffer).filter(Buffer.isBuffer);
@@ -262,8 +381,8 @@ describe('ProvisioningService.create', () => {
     const a = makeService();
     const b = makeService();
 
-    const one = await a.svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: {} });
-    const two = await b.svc.create({ userId: 'u-1', name: 'X', slug: 'site2', kind: 'site', secrets: {} });
+    const one = await a.svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site1', kind: 'site', secrets: {} });
+    const two = await b.svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site2', kind: 'site', secrets: {} });
 
     const hashOf = (c: { sql: string; params: any[] }[]) =>
       c.find((x) => x.sql.includes('INSERT INTO products'))!.params[7];
@@ -278,7 +397,7 @@ describe('ProvisioningService.create', () => {
     // другим — и коробка не расшифровалась бы никогда.
     const { svc, calls } = makeService();
 
-    const res = await svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: {} });
+    const res = await svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site1', kind: 'site', secrets: {} });
 
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
     expect(insert.params).toContain(res.productId);
@@ -291,7 +410,7 @@ describe('ProvisioningService.create', () => {
     // моке проходит молча.
     const { svc, calls } = makeService();
 
-    const res = await svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: {} });
+    const res = await svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site1', kind: 'site', secrets: {} });
 
     const iProduct = calls.findIndex((c) => c.sql.includes('INSERT INTO products'));
     const iJob = calls.findIndex((c) => c.sql.includes('INSERT INTO product_provision_jobs'));
@@ -308,7 +427,7 @@ describe('ProvisioningService.create', () => {
     // проверка и должна предотвращать.
     const { svc, calls } = makeService();
 
-    await svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: {} });
+    await svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site1', kind: 'site', secrets: {} });
 
     const check = calls.find((c) => c.sql.includes('SELECT count(*)'))!;
     expect(check.sql).toContain('FROM products');
@@ -323,7 +442,7 @@ describe('ProvisioningService.create', () => {
     const { svc, calls } = makeService();
 
     await expect(
-      svc.create({ userId: 'u-1', name: 'X', slug: 'Мой Сайт!', kind: 'site', secrets: {} }),
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'Мой Сайт!', kind: 'site', secrets: {} }),
     ).rejects.toThrow(/дефис/i);
 
     expect(calls).toEqual([]);
@@ -344,7 +463,7 @@ describe('ProvisioningService.create', () => {
 
     for (const slug of ['-site', 'site-', '--', 'my_site', 'a.b', 'Site1']) {
       await expect(
-        svc.create({ userId: 'u-1', name: 'X', slug, kind: 'site', secrets: {} }),
+        svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug, kind: 'site', secrets: {} }),
       ).rejects.toThrow(/дефис/i);
     }
   });
@@ -353,7 +472,7 @@ describe('ProvisioningService.create', () => {
     const { svc } = makeService();
 
     await expect(
-      svc.create({ userId: 'u-1', name: 'X', slug: 'a'.repeat(41), kind: 'site', secrets: {} }),
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'a'.repeat(41), kind: 'site', secrets: {} }),
     ).rejects.toThrow(/дефис/i);
   });
 
@@ -363,7 +482,7 @@ describe('ProvisioningService.create', () => {
     for (const kind of ['site', 'bot'] as const) {
       const { svc, calls } = makeService();
 
-      await svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind, secrets: {} });
+      await svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site1', kind, secrets: {} });
 
       const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
       expect(insert.params).toContain(kind);
@@ -380,7 +499,7 @@ describe('ProvisioningService.create', () => {
       const { svc, calls } = makeService();
 
       await expect(
-        svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: bad as any }),
+        svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site1', kind: 'site', secrets: bad as any }),
       ).rejects.toThrow(/секрет/i);
 
       expect(sqlOf(calls)).not.toContain('INSERT INTO products');
@@ -401,7 +520,7 @@ describe('ProvisioningService.create', () => {
       const { svc, calls } = makeService();
 
       await expect(
-        svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: bad }),
+        svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site1', kind: 'site', secrets: bad }),
       ).rejects.toBeInstanceOf(BadRequestException);
 
       // Отбой ДО всякой записи: иначе продукт остался бы висеть без секретов.
@@ -420,7 +539,7 @@ describe('ProvisioningService.create', () => {
     delete secrets['K63'];
 
     await expect(
-      svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets }),
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site1', kind: 'site', secrets }),
     ).resolves.toMatchObject({ productId: expect.any(String) });
   });
 
@@ -432,7 +551,7 @@ describe('ProvisioningService.create', () => {
       const { svc, calls } = makeService();
 
       await expect(
-        svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: bad }),
+        svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site1', kind: 'site', secrets: bad }),
       ).rejects.toThrow(/секрет/i);
 
       expect(sqlOf(calls)).not.toContain('INSERT INTO products');
@@ -448,6 +567,7 @@ describe('ProvisioningService.create', () => {
 
     const res = await svc.create({
       userId: 'u-1',
+      isAdmin: false,
       name: 'X',
       slug: 'site1',
       kind: 'site',
@@ -473,7 +593,7 @@ describe('ProvisioningService.create', () => {
     const { svc, secrets } = makeService();
     const pem = '-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----';
 
-    await svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: { KEY: pem } });
+    await svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site1', kind: 'site', secrets: { KEY: pem } });
 
     expect(secrets.encrypt).toHaveBeenCalledWith({ KEY: pem }, expect.any(String));
   });
@@ -485,7 +605,7 @@ describe('ProvisioningService.create', () => {
     const { svc } = makeService({ productInsertRace: true });
 
     await expect(
-      svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: {} }),
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site1', kind: 'site', secrets: {} }),
     ).rejects.toBeInstanceOf(ConflictException);
   });
 
@@ -501,7 +621,7 @@ describe('ProvisioningService.create', () => {
       const { svc } = makeService({ productInsertError: err });
 
       await expect(
-        svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: {} }),
+        svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site1', kind: 'site', secrets: {} }),
       ).rejects.not.toBeInstanceOf(ConflictException);
     }
   });
@@ -515,7 +635,7 @@ describe('ProvisioningService.create', () => {
     const { svc, calls } = makeService({ jobInsertFails: true });
 
     await expect(
-      svc.create({ userId: 'u-1', name: 'X', slug: 'site1', kind: 'site', secrets: {} }),
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site1', kind: 'site', secrets: {} }),
     ).rejects.toThrow();
 
     const fix = calls.find((c) => c.sql.includes('UPDATE products'))!;

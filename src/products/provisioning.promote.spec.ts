@@ -41,7 +41,15 @@ function makeService(
       return { rows: over.silent ?? [], rowCount: over.updateRowCount ?? 1 };
     }),
   };
-  const svc = new ProvisioningService(pg as any, {} as any);
+  // Реестр машин БРОСАЕТ при обращении: перевод в running и сборщик зависших
+  // машину не выбирают — это дело одного только create(). Правдоподобная
+  // заглушка молча приняла бы запрос к реестру на каждом обороте таймера.
+  const hosts = {
+    pickForNewProduct: jest.fn(() => {
+      throw new Error('выбор машины здесь не зовётся: он живёт только в create()');
+    }),
+  };
+  const svc = new ProvisioningService(pg as any, {} as any, hosts as any);
   (svc as any).fetchFn = fetchImpl ?? (async () => ({ status: 200 }));
   return { svc, calls, pg };
 }
@@ -59,10 +67,18 @@ const staleQuery = (calls: Call[]) => calls.find((c) => /^\s*WITH/i.test(c.sql))
 /** Вторая ветка таймаута: единственный UPDATE, когда зван только он. */
 const silentQuery = (calls: Call[]) => calls.find((c) => /^\s*UPDATE/i.test(c.sql))!;
 
+/**
+ * ДОМЕН И СЛАГ РАЗНЫЕ, и не выводятся один из другого. Проба собирает адрес из
+ * `products.domain`, а не из слага плюс зона: зона своя у каждой машины
+ * реестра, и склейка проверяла бы продукт клиентской машины по адресу в зоне
+ * владельца. На фикстуре вида `slug: 's', domain: 's.p.linkeon.io'` обе
+ * реализации неотличимы — поэтому домен здесь в чужой зоне.
+ */
 const site = (over: any = {}) => ({
   id: 'p-1',
   slug: 's',
   kind: 'site',
+  domain: 's.c.linkeon.io',
   runner_seen_at: new Date(),
   ...over,
 });
@@ -229,13 +245,19 @@ describe('ProvisioningService.promoteReady', () => {
   it('проба идёт по публичному адресу продукта и со сроком', async () => {
     // ПУБЛИЧНЫЙ адрес, не 127.0.0.1: до петли на хосте бэкенд не дотянется, а
     // заодно ответ подтверждает, что vhost заведён и TLS работает.
+    //
+    // АДРЕС БЕРЁТСЯ ИЗ products.domain ЦЕЛИКОМ. Слаг здесь нарочно не сходится
+    // с доменом: склейка «слаг плюс зона из константы» дала бы
+    // `selyanska.p.linkeon.io`, то есть проверку продукта по адресу чужой
+    // машины — ответа нет никогда, и через десять минут сборщик зависших
+    // хоронит исправный сайт.
     const probe = jest.fn(async () => ({ status: 200 }));
-    const { svc } = makeService([site({ slug: 'selyanska' })], probe);
+    const { svc } = makeService([site({ slug: 'selyanska', domain: 'selyanska.c.linkeon.io' })], probe);
 
     await svc.promoteReady();
 
     expect(probe).toHaveBeenCalledTimes(1);
-    expect(probe.mock.calls[0][0]).toBe('https://selyanska.p.linkeon.io/health');
+    expect(probe.mock.calls[0][0]).toBe('https://selyanska.c.linkeon.io/health');
     // Проба существует ради НЕотвечающих адресов: без своего срока чёрная
     // дыра держит тик на дефолтах undici, и следующий тик наезжает на этот.
     expect((probe.mock.calls[0] as any[])[1]?.signal).toBeDefined();
@@ -292,7 +314,9 @@ describe('ProvisioningService.promoteReady', () => {
   it('боту публичный адрес не проверяется — его нет', async () => {
     const probe = jest.fn(async () => ({ status: 404 }));
     const { svc, calls } = makeService(
-      [{ id: 'p-2', slug: 'b', kind: 'bot', runner_seen_at: new Date() }],
+      // domain у бота NULL по форме, а не по недосмотру: входящих соединений
+      // он не принимает. Ветка «сайт без домена» его касаться не должна.
+      [{ id: 'p-2', slug: 'b', kind: 'bot', domain: null, runner_seen_at: new Date() }],
       probe,
     );
 
@@ -300,6 +324,47 @@ describe('ProvisioningService.promoteReady', () => {
 
     expect(probe).not.toHaveBeenCalled();
     expect(promotions(calls).map((c) => c.params)).toEqual([['p-2']]);
+  });
+
+  it('выборка забирает domain: без него пробу собирать не из чего', async () => {
+    // Колонка, пропавшая из перечисления, не ломает ни одного запроса — она
+    // приезжает undefined, и КАЖДЫЙ сайт становится «сайтом без домена». То
+    // есть переводов не будет вовсе, а в логе будет ошибка про пустую колонку,
+    // которая в базе заполнена.
+    const { svc, calls } = makeService([]);
+
+    await svc.promoteReady();
+
+    expect(scan(calls).sql).toContain('products.domain');
+  });
+
+  it('сайт без домена не переводится, не опрашивается и оставляет строку в логе', async () => {
+    // Адрес пробы больше не угадывается из слага: зона своя у каждой машины.
+    // Пустой domain означает продукт, до которого не может дойти и владелец —
+    // ссылку в кабинете рисуют из той же колонки. Молчаливый пропуск отправил
+    // бы его читать через десять минут про истёкший срок.
+    const probe = jest.fn(async () => ({ status: 200 }));
+    const { svc, calls } = makeService([site({ domain: null })], probe);
+    const err = jest.spyOn((svc as any).logger, 'error').mockImplementation(() => undefined);
+
+    await expect(svc.promoteReady()).resolves.toBe(0);
+
+    expect(probe).not.toHaveBeenCalled();
+    expect(promotions(calls)).toEqual([]);
+    expect(err.mock.calls.map(String).join('\n')).toMatch(/пустой domain/);
+  });
+
+  it('пустая строка в domain — то же самое, а не адрес https:///health', async () => {
+    // `if (!p.domain)` против `if (p.domain === null)`: пустая строка собрала
+    // бы `https:///health`, а это не отказ DNS, а мгновенный TypeError внутри
+    // fetch — то есть пойманное молчание вместо строки о причине.
+    const probe = jest.fn(async () => ({ status: 200 }));
+    const { svc } = makeService([site({ domain: '' })], probe);
+    jest.spyOn((svc as any).logger, 'error').mockImplementation(() => undefined);
+
+    await svc.promoteReady();
+
+    expect(probe).not.toHaveBeenCalled();
   });
 
   it('выборка ограничена заводящимися и неархивными', async () => {
