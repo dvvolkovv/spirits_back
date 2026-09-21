@@ -12,6 +12,9 @@ describe('обычный текст в личном чате', () => {
   const grammy = { sendMessage: jest.fn() };
 
   const pg = { query: jest.fn() };
+  // Блог на каждом приватном тексте сначала спрашивают «это правка черновика?».
+  // Здесь он всегда отвечает «нет» — проверяем как раз обычный путь.
+  const blog = { handleCallback: jest.fn(), handleReplyEdit: jest.fn(async () => false) };
   const svc = new TgBotService(
     pg as any,
     identity as any,
@@ -25,10 +28,12 @@ describe('обычный текст в личном чате', () => {
     grammy as any,
     {} as any, // misc
     {} as any, // video
+    blog as any,
   );
 
   beforeEach(() => {
     jest.resetAllMocks();
+    blog.handleReplyEdit.mockResolvedValue(false);
     pg.query.mockResolvedValue({ rows: [{ preferred_agent: 'Кира' }] });
     (svc as any).handleChatMessage = jest.fn();
     (svc as any).handleDmCommand = jest.fn();

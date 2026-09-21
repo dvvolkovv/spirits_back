@@ -372,7 +372,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * Returns the public URL — same URL works for both browsers (via nginx /smm-media/)
    * and the worker (no presign needed, bucket is public-read).
    */
-  private async uploadAssetImage(buffer: Buffer, ext: string): Promise<string> {
+  // public: блог собирает баннер из этих кирпичей напрямую, минуя биллинг —
+  // у него нет пользователя, с которого списывать токены.
+  async uploadAssetImage(buffer: Buffer, ext: string): Promise<string> {
     const contentType = ext === 'png' ? 'image/png'
       : ext === 'webp' ? 'image/webp'
       : 'image/jpeg';
@@ -566,7 +568,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * повтор того же промпта обычно проходит, поэтому здесь именно ретрай, а не
    * сообщение «измените промпт».
    */
-  private async generateRawImage(
+  async generateRawImage(
     prompt: string,
     aspectRatio: string,
     quality?: string,
