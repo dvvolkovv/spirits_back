@@ -23,7 +23,7 @@
 #      сделала бы ровно это. Поэтому аргумент разбирается ЯВНО и всё
 #      непонятое отбивается ДО первой записи.
 #   2. `set -eu` и позиционные `$1`/`$2` — без проверки пустой аргумент дал бы
-#      конфиг на server_name `.p.linkeon.io`, то есть домен второго уровня.
+#      конфиг на server_name `.<зона>`, то есть домен второго уровня.
 #   3. TLS — из общего snippets/products-ssl.conf, сертификат на продукт не
 #      выпускается. Поэтому ожидание при заведении и пробуждении — это
 #      ожидание ПРИЛОЖЕНИЯ, а не сертификата.
@@ -33,6 +33,22 @@
 # а штатное состояние неоплаченного. Retry-After не ставим: когда владелец
 # пополнит баланс, неизвестно, а врать роботам сроком не нужно.
 set -eu
+
+# ЗОНА ДОМЕНОВ ЭТОЙ МАШИНЫ. Строка одна, и она же — единственное, чем копии
+# скрипта на разных машинах отличаются друг от друга.
+#
+# Зона перестала быть общей вместе с реестром машин (кусок 4а): у каждой строки
+# product_hosts своя `domain_suffix`, и сервер пишет продукту домен ИМЕННО из
+# неё (products.domain). Зашитая здесь `p.linkeon.io` на второй машине разошлась
+# бы с сервером МОЛЧА: сервер выписал бы продукту домен своей зоны, vhost встал
+# бы на server_name чужой, проба promoteReady не нашла бы сайт никогда, и через
+# десять минут сборщик зависших похоронил бы исправный продукт «по сроку».
+#
+# Поэтому значение сюда подставляет PHASE 4 deploy.sh — по строке реестра той
+# машины, на которую ставит, и только в эту строку (подстановка обязана быть
+# ровно одна, иначе фаза отказывается ставить). Ручной запуск скрипта из
+# репозитория берёт зону машины владельца — ту, что была зашита раньше.
+ZONE=p.linkeon.io
 
 S="${1:-}"
 P="${2:-}"
@@ -77,12 +93,12 @@ HTML
   cat > "$CONF" <<CONF
 server {
   listen 80;
-  server_name $S.p.linkeon.io;
+  server_name $S.$ZONE;
   return 301 https://\$host\$request_uri;
 }
 server {
   listen 443 ssl;
-  server_name $S.p.linkeon.io;
+  server_name $S.$ZONE;
   include snippets/products-ssl.conf;
   location / {
     return 503;
@@ -94,7 +110,7 @@ server {
   }
 }
 CONF
-  nginx -t >/dev/null 2>&1 && systemctl reload nginx && echo "  vhost $S.p.linkeon.io → заглушка 503"
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx && echo "  vhost $S.$ZONE → заглушка 503"
   exit
 fi
 
@@ -105,12 +121,12 @@ esac
 cat > "$CONF" <<CONF
 server {
   listen 80;
-  server_name $S.p.linkeon.io;
+  server_name $S.$ZONE;
   return 301 https://\$host\$request_uri;
 }
 server {
   listen 443 ssl;
-  server_name $S.p.linkeon.io;
+  server_name $S.$ZONE;
   include snippets/products-ssl.conf;
   location / {
     proxy_pass http://127.0.0.1:$P;
@@ -121,4 +137,4 @@ server {
   }
 }
 CONF
-nginx -t >/dev/null 2>&1 && systemctl reload nginx && echo "  vhost $S.p.linkeon.io → 127.0.0.1:$P"
+nginx -t >/dev/null 2>&1 && systemctl reload nginx && echo "  vhost $S.$ZONE → 127.0.0.1:$P"
