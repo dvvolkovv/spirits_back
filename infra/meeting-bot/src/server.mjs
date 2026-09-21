@@ -116,6 +116,17 @@ const server = http.createServer(async (req, res) => {
     return ok ? json(res, 200, { ok: true }) : json(res, 400, { error: 'chat not sent' });
   }
 
+  // GET /api/v1/bots/{id}/chat-sample — кусок разметки ленты чата.
+  //
+  // Не часть договора с бэкендом, а инструмент отладки: разметку площадок
+  // приходится разбирать на живых встречах, и вытащить её из работающего бота
+  // дешевле, чем заходить рядом вторым браузером.
+  if (req.method === 'GET' && parts.length === 5 && parts[3] && parts[4] === 'chat-sample') {
+    const bot = bots.get(parts[3]);
+    if (!bot) return json(res, 404, { error: 'bot not found' });
+    return json(res, 200, { html: await bot.chatSample() });
+  }
+
   // GET /api/v1/bots/{id}
   if (req.method === 'GET' && parts.length === 4 && parts[3]) {
     const bot = bots.get(parts[3]);

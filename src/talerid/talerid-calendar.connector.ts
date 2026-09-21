@@ -260,14 +260,17 @@ export class TalerIdCalendarConnector {
       ]);
       const schedTasks = Array.isArray(sched?.tasks) ? sched.tasks : [];
       const flatRows = Array.isArray(flat) ? flat : Array.isArray(flat?.tasks) ? flat.tasks : [];
-      // Рутины — из schedule (в нём recurrence+occurrences). Из list_tasks берём только НЕрекуррентные
-      // разовые дела, и никогда uid, который schedule уже отдал рутиной (защита от дублей).
-      const routineUids = new Set(
-        schedTasks.filter((t: any) => t?.recurrence && Array.isArray(t?.occurrences)).map((t: any) => t.uid),
+      // Рутины — из schedule (в нём recurrence+occurrences). ⚠️ list_schedule отдаёт НЕ ТОЛЬКО
+      // рутины, но и РАЗОВЫЕ дела (напр. «заполнить паспорт»), и те же разовые есть в list_tasks →
+      // дедуп ТОЛЬКО по recurring-uid плодил дубль одноразовой задачи (owner 2026-09-20). Поэтому
+      // из list_tasks берём НЕрекуррентные дела, uid которых ещё НЕ отдал schedule (любой, не только
+      // рутинный).
+      const schedUids = new Set(
+        schedTasks.map((t: any) => t?.uid).filter((u: any) => !!u),
       );
       const rows = [
         ...schedTasks,
-        ...flatRows.filter((t: any) => !t?.recurrence && !routineUids.has(t?.uid)),
+        ...flatRows.filter((t: any) => !t?.recurrence && !schedUids.has(t?.uid)),
       ];
       const out: Task[] = [];
       const toMs = end.getTime();

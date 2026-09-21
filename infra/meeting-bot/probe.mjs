@@ -17,9 +17,20 @@
  * Второй параметр — площадка: от неё зависит локаль браузера (у Meet английская).
  */
 import { chromium } from 'playwright';
+import { cp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const url = process.argv[2];
 const platform = process.argv[3] || 'telemost';
+
+/**
+ * Профиль с выполненным входом — тот же, на котором работает бот.
+ *
+ * Под учётной записью площадка рисует ДРУГУЮ прихожую: имени не спрашивает,
+ * кнопки называются иначе. Разведывать надо ровно то, что увидит бот.
+ */
+const profile = process.env.PROBE_PROFILE_DIR || '';
 if (!url) {
   console.error('нужен адрес встречи');
   process.exit(1);
@@ -34,8 +45,9 @@ const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
 // объявляет себя: флаг `--enable-automation` и `navigator.webdriver`. У
 // Attendee ровно поэтому в списке стоит `--disable-blink-features=
 // AutomationControlled`.
-const browser = await chromium.launch({
+const launch = {
   headless: false,
+  ...(platform === 'meet' ? { channel: 'chrome' } : {}),
   ignoreDefaultArgs: ['--enable-automation'],
   args: [
     '--no-sandbox',
@@ -47,15 +59,28 @@ const browser = await chromium.launch({
     '--disable-blink-features=AutomationControlled',
     '--disable-extensions',
   ],
-});
-const ctx = await browser.newContext({
+};
+const context = {
   permissions: ['microphone', 'camera'],
   locale: platform === 'meet' ? 'en-US' : 'ru-RU',
-});
+};
+
+let browser = null;
+let copy = '';
+let ctx;
+if (profile) {
+  // На копии, как и бот: Chrome держит на профиле замок.
+  copy = join(tmpdir(), 'probe-profile-' + Date.now());
+  await cp(profile, copy, { recursive: true });
+  ctx = await chromium.launchPersistentContext(copy, { ...launch, ...context, viewport: null });
+} else {
+  browser = await chromium.launch(launch);
+  ctx = await browser.newContext(context);
+}
 await ctx.addInitScript(() => {
   try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) { /* уже переопределено */ }
 });
-const page = await ctx.newPage();
+const page = ctx.pages()[0] || (await ctx.newPage());
 page.on('console', (m) => {
   if (m.type() === 'error') console.log('  консоль:', m.text().slice(0, 160));
 });
@@ -75,7 +100,10 @@ const dump = await page.evaluate(() => {
     buttons: take('button, [role="button"]', (e) => {
       const label = e.getAttribute('aria-label') || '';
       const text = clean(e.innerText).slice(0, 40);
-      return label || text ? `aria="${label}" текст="${text}"` : null;
+      // Тег и роль важны не меньше подписи: зацепка `button:...` не возьмёт
+      // `div[role="button"]`, и по логу это неотличимо от «кнопки нет».
+      const tag = e.tagName.toLowerCase() + (e.getAttribute('role') ? `[role=${e.getAttribute('role')}]` : '');
+      return label || text ? `${tag} aria="${label}" текст="${text}"` : null;
     }),
     frames: [...document.querySelectorAll('iframe')].map((f) => f.src).slice(0, 10),
   };
@@ -90,8 +118,73 @@ if (dump.frames.length) {
   for (const f of dump.frames) console.log('  ', f);
 }
 
+// Проверка НАШИХ зацепок на живой странице.
+//
+// Разметку посмотреть мало: зацепка может не взять элемент, который на экране
+// прекрасно виден, и по логу бота это неотличимо от «элемента нет». Поэтому
+// спрашиваем прямо — сколько ловит каждая.
+if (platform === 'meet') {
+  const { MEET_JOIN } = await import('./src/payload/meet.mjs');
+  console.log('');
+  console.log('наши зацепки:');
+  for (const [name, sel] of Object.entries(MEET_JOIN)) {
+    let n = -1;
+    try { n = await page.locator(sel).count(); } catch (e) { console.log(`   ${name}: ОШИБКА ${e.message.slice(0, 80)}`); continue; }
+    console.log(`   ${name}: ${n}`);
+  }
+}
+
+// Разведка ИЗНУТРИ встречи.
+//
+// Половина зацепок живёт только там: чат, участники, выход. Со стороны
+// прихожей их не увидеть, а заходить руками каждый раз — терять время. Со
+// второго аргумента `внутрь` разведчик входит сам и осматривается там.
+if (platform === 'meet' && process.argv.includes('внутрь')) {
+  const { MEET_JOIN } = await import('./src/payload/meet.mjs');
+  const join = page.locator(MEET_JOIN.joinButton).first();
+  if (await join.count()) {
+    await join.click().catch(() => {});
+    console.log('');
+    console.log('вошли, ждём панель встречи');
+    await page.locator(MEET_JOIN.inMeeting).first().waitFor({ state: 'visible', timeout: 60_000 }).catch(() => {});
+    await page.waitForTimeout(4000);
+
+    const inside = await page.evaluate(() => {
+      const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+      return [...document.querySelectorAll('button, [role="button"]')].slice(0, 40).map((e) => {
+        const label = e.getAttribute('aria-label') || '';
+        const text = clean(e.innerText).slice(0, 30);
+        if (!label && !text) return null;
+        return `${e.tagName.toLowerCase()} aria="${label}" текст="${text}"`;
+      }).filter(Boolean);
+    });
+    console.log('кнопки внутри встречи:');
+    for (const b of inside) console.log('  ', b);
+
+    // Панели Meet прячет до движения мыши, и кнопка участников в список кнопок
+    // может не попасть вовсе. Поэтому отдельно — все подписи для незрячих.
+    const labels = await page.evaluate(() =>
+      [...document.querySelectorAll('[aria-label]')]
+        .map((e) => e.getAttribute('aria-label'))
+        .filter((l) => l && l.length < 60)
+        .slice(0, 60),
+    );
+    console.log('все подписи:');
+    for (const l of labels) console.log('   •', l);
+
+    console.log('наши зацепки внутри:');
+    for (const [name, sel] of Object.entries(MEET_JOIN)) {
+      let n = -1;
+      try { n = await page.locator(sel).count(); } catch (e) { n = -1; }
+      console.log(`   ${name}: ${n}`);
+    }
+  }
+}
+
 const shot = `/tmp/probe-${platform}.png`;
 await page.screenshot({ path: shot });
 console.log('\nснимок:', shot);
 
-await browser.close();
+if (browser) await browser.close();
+else await ctx.close();
+if (copy) await rm(copy, { recursive: true, force: true });

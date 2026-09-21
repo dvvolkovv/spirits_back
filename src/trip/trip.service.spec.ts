@@ -16,6 +16,21 @@ describe('computeCopilotState', () => {
     expect(s.reminders.find((r) => r.id === 't1')?.done).toBe(false);
   });
 
+  it('дубль задачи (один uid из разных источников) схлопывается; вхождения рутины по дням — нет', () => {
+    const s = computeCopilotState({
+      tasks: [
+        { uid: 'lk-passport', title: 'заполнить паспорт', due: '2026-07-19T14:00:00', done: false, source: 'talerid' },
+        { uid: 'lk-passport', title: 'заполнить паспорт', due: '2026-07-19T14:00:00', done: false, source: 'talerid' }, // дубль
+        { uid: 'r1', title: 'уход', done: false, source: 'talerid', occurrenceDate: '2026-07-19' },
+        { uid: 'r1', title: 'уход', done: false, source: 'talerid', occurrenceDate: '2026-07-20' }, // рутина: другой день
+      ],
+      events: [],
+      now,
+    });
+    expect((s.tasks ?? []).filter((t) => t.uid === 'lk-passport').length).toBe(1); // дубль схлопнут
+    expect((s.tasks ?? []).filter((t) => t.uid === 'r1').length).toBe(2);          // вхождения сохранены
+  });
+
   it('выполненные задачи не в headline', () => {
     const s = computeCopilotState({
       tasks: [task('t1', 'Готово', '2026-07-20T09:00:00', true)],

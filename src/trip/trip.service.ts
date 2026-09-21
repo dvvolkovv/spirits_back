@@ -63,7 +63,18 @@ export function computeCopilotState(input: {
   now: Date;
   horizonHours?: number;
 }): CoPilotState {
-  const { tasks, events, now } = input;
+  const { events, now } = input;
+  // Финальный дедуп-барьер задач (defense-in-depth, как mergeEvents для событий): один и тот же
+  // uid может прийти из нескольких источников/слияний (list_schedule↔list_tasks, linkeon↔talerid,
+  // vtodo) — без барьера дубль долетает до виджета (bug «паспорт» 2026-09-20). Ключ включает
+  // occurrenceDate, чтобы поштучные вхождения рутины (один uid, разные дни) НЕ схлопнулись.
+  const seenTaskKeys = new Set<string>();
+  const tasks = input.tasks.filter((t) => {
+    const key = `${t.uid}|${t.occurrenceDate ?? ''}`;
+    if (seenTaskKeys.has(key)) return false;
+    seenTaskKeys.add(key);
+    return true;
+  });
   // Горизонт «твой сегодня» = СЕГОДНЯ + ЗАВТРА целиком (календарные дни Asia/Yekaterinburg),
   // послезавтра НЕ показываем. Явный horizonHours (тесты/спец-режимы) → старое скользящее now+Nч.
   const localDayStr = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Yekaterinburg' }).format(now);

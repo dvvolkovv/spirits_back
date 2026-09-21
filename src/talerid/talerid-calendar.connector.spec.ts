@@ -108,6 +108,18 @@ describe('TalerIdCalendarConnector', () => {
       expect(tasks.filter((t) => t.uid === 'dup').length).toBe(1);
     });
 
+    it('РАЗОВОЕ дело, попавшее и в list_schedule, и в list_tasks, НЕ дублируется (bug паспорт 2026-09-20)', async () => {
+      const connector = new TalerIdCalendarConnector(makeOauth());
+      // list_schedule отдаёт не только рутины, но и разовую задачу; та же — в list_tasks.
+      mockTasks(connector, [
+        { uid: 'lk-passport', title: 'заполнить паспорт', status: 'pending', due: '2026-09-16T04:00:00.000Z' },
+      ], [
+        { uid: 'lk-passport', title: 'заполнить паспорт', status: 'pending', due: '2026-09-16T04:00:00.000Z' },
+      ]);
+      const tasks = await connector.listTasks('u1', from, to, now);
+      expect(tasks.filter((t) => t.uid === 'lk-passport').length).toBe(1);
+    });
+
     it('падение list_schedule не роняет разовые из list_tasks (и наоборот)', async () => {
       const connector = new TalerIdCalendarConnector(makeOauth());
       jest.spyOn(connector as any, 'callTool').mockImplementation((...args: any[]) => {
