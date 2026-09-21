@@ -8,6 +8,22 @@ import { BlogPost, BlogRubric, BlogSource, rowToPost } from './blog.types';
  */
 export const DEDUP_WINDOW_DAYS = 90;
 
+/**
+ * Через столько минут пост в `drafting` считается брошенным и снова попадает
+ * в работу. Туда он приезжает двумя разными путями, и оба без этого порога
+ * кончаются вечно висящей карточкой:
+ *
+ *  1. владелец нажал «Переписать» — в личке бота или в админке. Статус
+ *     выставлен намеренно, и бот честно обещает «перепишу к следующему тику»;
+ *  2. процесс умер посреди подготовки черновика: `prepareDrafts` переводит
+ *     пост в `drafting` ДО похода к редактору и за картинкой, так что падение
+ *     на любом из них оставляет сироту.
+ *
+ * Порог нужен, чтобы не отобрать черновик у живой подготовки: редактор плюс
+ * генерация картинки — это десятки секунд, а на ретраях картинки и минуты.
+ */
+export const STALE_DRAFTING_MINUTES = 15;
+
 export function normalizeTopicKey(raw: string): string {
   return String(raw || '')
     .toLowerCase()
@@ -60,13 +76,20 @@ export class BlogTopicService {
   /**
    * Следующая тема в работу. Новость всегда вытесняет кейс — новости
    * скоропортящиеся, кейс полежит.
+   *
+   * Кроме свежих идей забирает и брошенные черновики: `drafting` не
+   * подхватывал никто, поэтому и «Переписать», и падение процесса посреди
+   * подготовки оставляли пост висеть навсегда. Порог по `updated_at`
+   * распространяется только на `drafting` — идею ждать незачем.
    */
   async takeNextIdea(): Promise<BlogPost | null> {
     const r = await this.pg.query(
       `SELECT * FROM blog_post
         WHERE status = 'idea'
+           OR (status = 'drafting' AND updated_at < now() - ($1 || ' minutes')::interval)
         ORDER BY (rubric = 'news') DESC, created_at ASC
         LIMIT 1`,
+      [STALE_DRAFTING_MINUTES],
     );
     return r.rows[0] ? rowToPost(r.rows[0]) : null;
   }

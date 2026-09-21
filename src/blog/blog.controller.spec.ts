@@ -32,6 +32,18 @@ describe('BlogController', () => {
     expect(r.status).toHaveBeenCalledWith(200);
   });
 
+  // Сорвавшаяся публикация требует внимания — ей место в очереди. Если failed
+  // попадёт в обе выборки, вкладка покажет один и тот же пост дважды.
+  it('failed виден в очереди и не двоится в архиве', async () => {
+    const d = deps(); const r = res();
+    const c = make(d);
+    await c.action({ action: 'list' }, r);
+    await c.action({ action: 'archive' }, r);
+    const [listSql, archiveSql] = d.pg.query.mock.calls.map((x: any[]) => String(x[0]));
+    expect(listSql).not.toContain('failed');
+    expect(archiveSql).not.toContain('failed');
+  });
+
   it('add_topic заводит ручную тему с источником manual', async () => {
     const d = deps(); const r = res();
     await make(d).action({ action: 'add_topic', rubric: 'case', topic: 'про аренду' }, r);

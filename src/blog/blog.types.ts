@@ -36,7 +36,14 @@ export interface BlogPost {
  */
 export const ALLOWED_TRANSITIONS: Record<BlogStatus, BlogStatus[]> = {
   idea:           ['drafting', 'rejected'],
-  drafting:       ['pending_review', 'failed'],
+  // Петля `drafting → drafting` — это перезапуск черновика, а не новый
+  // переход: сюда приходят и кнопка «Переписать» (пост уже в `drafting`), и
+  // крон, подобравший черновик, осиротевший после падения процесса. Без неё
+  // такой пост не пропускает собственная охрана `prepareDrafts`, и обещание
+  // «перепишу к следующему тику» не наступает никогда. Апрув петля не
+  // обходит: она никуда не продвигает, а `drafting → approved` по-прежнему
+  // запрещён.
+  drafting:       ['drafting', 'pending_review', 'failed'],
   pending_review: ['approved', 'drafting', 'rejected'],
   approved:       ['publishing', 'drafting', 'rejected'],
   // `approved` здесь — это возврат на повторную попытку отправки, а не

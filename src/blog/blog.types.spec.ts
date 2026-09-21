@@ -37,6 +37,18 @@ describe('canTransition', () => {
     expect(canTransition('rejected', 'drafting')).toBe(false);
   });
 
+  // Перезапуск черновика — это переход drafting → drafting: и кнопка
+  // «Переписать», и подбор осиротевшего черновика кроном приходят именно
+  // сюда. Петля ничего не продвигает и апрув не обходит.
+  it('drafting → drafting разрешён: перезапуск черновика', () => {
+    expect(canTransition('drafting', 'drafting')).toBe(true);
+  });
+
+  it('петля на drafting не открывает дорогу мимо апрува', () => {
+    expect(canTransition('drafting', 'approved')).toBe(false);
+    expect(canTransition('drafting', 'published')).toBe(false);
+  });
+
   it('failed → drafting разрешён: отказ можно перезапустить руками', () => {
     expect(canTransition('failed', 'drafting')).toBe(true);
   });

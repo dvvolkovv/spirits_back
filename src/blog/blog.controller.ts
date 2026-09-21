@@ -60,9 +60,13 @@ export class BlogController {
       }
 
       case 'archive': {
+        // `failed` здесь намеренно нет: сорвавшийся пост требует внимания, и
+        // место ему в очереди, где его видно и можно перезапустить. В архиве
+        // он бы ещё и задвоился — `list` отдаёт всё, кроме published и
+        // rejected.
         const r = await this.pg.query(
           `SELECT * FROM blog_post
-            WHERE status IN ('published','rejected','failed')
+            WHERE status IN ('published','rejected')
             ORDER BY coalesce(published_at, updated_at) DESC LIMIT 100`,
         );
         return res.status(200).json(r.rows.map(rowToPost));

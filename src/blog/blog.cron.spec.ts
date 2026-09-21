@@ -61,6 +61,23 @@ describe('BlogCron.prepareDrafts', () => {
     expect(d.editor.draft).not.toHaveBeenCalled();
   });
 
+  // Обещание «перепишу к следующему тику» должно наступать. Пост в drafting
+  // попадает двумя путями: владелец нажал «Переписать» (личка или админка) и
+  // процесс умер посреди подготовки черновика. Проверка сквозная намеренно:
+  // одной выборки в takeNextIdea мало — машина состояний по дороге тоже
+  // обязана пропустить перезапуск, иначе пост молча зависнет навсегда.
+  it('зависший drafting доезжает до апрува, а не остаётся висеть', async () => {
+    const d = deps();
+    d.topics.takeNextIdea.mockResolvedValue({ id: 'p1', rubric: 'case', topicKey: 'k', topicHint: null, status: 'drafting' });
+    d.editor.draft.mockResolvedValue({ title: 'З', body: 'Т', imagePrompt: 'сцена' });
+    d.images.render.mockResolvedValue('https://minio/i.png');
+
+    await make(d).prepareDrafts();
+
+    expect(d.editor.draft).toHaveBeenCalled();
+    expect(d.approval.sendForReview).toHaveBeenCalled();
+  });
+
   // Гонка: пока идея лежала в очереди, её статус увели из админки. Запись
   // статуса обязана пройти машину состояний, а не «ну мы же выбрали по
   // status = 'idea'». Мутация canTransition → true роняет этот тест.
