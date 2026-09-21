@@ -3510,13 +3510,11 @@ git commit -m "feat(blog): вкладка управления блогом в �
 |---|---|
 | `ru.json` | `"blog": "Блог",` |
 | `en.json` | `"blog": "Blog",` |
-| `de.json` | `"blog": "Blog",` |
-| `es.json` | `"blog": "Blog",` |
-| `fr.json` | `"blog": "Blog",` |
 | `pt.json` | `"blog": "Blog",` |
-| `zh.json` | `"blog": "博客",` |
 
-Локалей семь, а не две — в `CLAUDE.md` указаны только `ru` и `en`, но в `src/i18n/locales/` лежат ещё `de`, `es`, `fr`, `pt`, `zh`. Пропущенный ключ даёт в интерфейсе сырой `admin.tabs.blog`.
+**Только эти три.** В `de`, `es`, `fr`, `zh` секции `admin` нет вовсе, и заводить её ради одного ключа не нужно: в `scripts/check-locales.mjs` записана явная политика `UNTRANSLATED_PREFIXES = ['admin.']` — админка не локализуется, ключи `admin.*` живут в `ru.json`, а `FALLBACK_CHAIN = ['en','ru']` подставит английский ярлык. Одинокая переведённая вкладка среди английских соседей выглядела бы недоделкой, а не заботой.
+
+Обязательный ключ — только в `ru.json`: он источник правды, и его отсутствие ловит `pnpm check-keys`.
 
 - [ ] **Step 2: Врезка в `AdminPage.tsx` — четыре места**
 
@@ -3560,16 +3558,15 @@ Expected: без ошибок
 Run: `pnpm vitest run src/components/admin/`
 Expected: зелено, включая соседние тесты админки
 
-- [ ] **Step 4: Проверить, что ключ есть везде**
+- [ ] **Step 4: Проверить ключ и гейты**
 
 ```bash
-for f in src/i18n/locales/*.json; do
-  printf '%s: ' "$f"
-  node -e "const j=require('./$f'); console.log(j.admin?.tabs?.blog ?? 'НЕТ КЛЮЧА')"
-done
+pnpm check-locales && pnpm check-keys
 ```
 
-Expected: семь строк, ни одной с «НЕТ КЛЮЧА».
+Expected: оба зелёные. `check-locales` не потребует ключ в `de/es/fr/zh` — их спасает исключение `admin.`; `check-keys` проверит, что ключ есть в `ru.json`.
+
+Убедись, что гейт не пустой: временно убери `blog` из `ru.json` и проверь, что `check-keys` краснеет с указанием `admin.tabs.blog ← src/pages/AdminPage.tsx`. Верни обратно.
 
 - [ ] **Step 5: Коммит**
 
