@@ -80,6 +80,45 @@ export const meetPayload = (displayName) => `
   let started = false;
   let probed = false;
 
+  /**
+   * Что мы сами написали в чат.
+   *
+   * Своё сообщение возвращается нам же обычным входящим, и ассистент отвечает
+   * на собственную реплику (живая встреча 21.09.2026: написал ссылку — и сам
+   * же её прочитал). В воркере страж на это есть, но он сверяет ТЕКСТ, а мы
+   * отдаём наружу всё содержимое узла — с именем автора и временем, — и
+   * сверка не сходится.
+   *
+   * Поэтому отсекаем здесь, у источника: помним отправленное две минуты и
+   * пропускаем всё, что его содержит. Долго помнить нельзя — человек вправе
+   * повторить фразу ассистента дословно, и это уже его реплика.
+   */
+  const ourOwn = [];
+  const isOurs = (text) => {
+    const now = Date.now();
+    while (ourOwn.length && now - ourOwn[0].at > 120000) ourOwn.shift();
+    const t = text.toLowerCase();
+    return ourOwn.some((o) => t === o.text || t.includes(o.text));
+  };
+
+  /**
+   * Недавно отданное наружу — против двойного чтения.
+   *
+   * Узлы ленты вложены друг в друга, и одно сообщение попадается двумя
+   * разными строками: «Иван 17:45 привет» и «привет». Одного набора
+   * идентификаторов мало — строки-то разные. Сравниваем по вхождению в
+   * небольшом окне: за восемь секунд дважды одно и то же — это оно.
+   */
+  const recent = [];
+  const isRepeat = (text) => {
+    const now = Date.now();
+    while (recent.length && now - recent[0].at > 8000) recent.shift();
+    const t = text.toLowerCase();
+    if (recent.some((r) => t === r.text || t.includes(r.text) || r.text.includes(t))) return true;
+    recent.push({ at: now, text: t });
+    return false;
+  };
+
   const chatInput = () =>
     document.querySelector(
       'textarea[aria-label="Send a message"], textarea[aria-label*="message" i],' +
@@ -127,7 +166,13 @@ export const meetPayload = (displayName) => `
         if (cand && cand.length < 60) author = cand;
       }
       if (!author) author = clean(node.getAttribute('data-sender-name')) || 'участник';
-      if (author === myName) continue;   // своё же сообщение читать обратно незачем
+      // Своё сообщение читать обратно незачем. Автора проверяем трижды: по
+      // имени бота, по подписи «Вы», которой Meet метит собственные реплики, и
+      // по тексту — на случай, когда имя в ленте своё, а у бота другое (под
+      // учётной записью оно берётся из профиля Google).
+      if (author === myName || /^(Вы|You)/.test(author)) continue;
+      if (isOurs(text)) continue;
+      if (isRepeat(text)) continue;
       send('chat', { id, text, author });
     }
     return found;
@@ -155,6 +200,7 @@ export const meetPayload = (displayName) => `
     input.value = String(text);
     input.dispatchEvent(new Event('input', { bubbles: true }));
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+    ourOwn.push({ at: Date.now(), text: String(text).replace(/\s+/g, ' ').trim().toLowerCase() });
     return true;
   };
 
