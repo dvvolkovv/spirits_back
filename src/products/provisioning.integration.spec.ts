@@ -171,7 +171,7 @@ maybe('провижининг против живого Postgres', () => {
     // целиком: падает beforeAll, а с ним все 33 теста. На первой же батарее
     // мутаций это выглядело как идеальная ловля — прибор врал, а не сторожил.
     await pool?.query(
-      'TRUNCATE products, product_provision_jobs, product_turns, product_host_agent RESTART IDENTITY CASCADE',
+      'TRUNCATE products, product_provision_jobs, product_turns, product_host_agent, product_hosts RESTART IDENTITY CASCADE',
     );
     await pool?.end();
   });
@@ -180,8 +180,13 @@ maybe('провижининг против живого Postgres', () => {
     // product_host_agent — в том же списке: отметка о жизни агента переживает
     // сценарий и молча делает следующий зелёным. Сценарий «отметки нет вовсе»
     // (агента не пускают по токену) иначе проверял бы чужую отметку.
+    //
+    // product_hosts — по той же причине и с той же ценой: реестр машин
+    // переживает сценарий, а «машина own заводится» проверялось бы на машине,
+    // заведённой соседом. Обе таблицы в ОДНОМ операторе — products ссылается на
+    // product_hosts, и порознь TRUNCATE отобьётся внешним ключом.
     await pool.query(
-      'TRUNCATE products, product_provision_jobs, product_turns, product_host_agent RESTART IDENTITY CASCADE',
+      'TRUNCATE products, product_provision_jobs, product_turns, product_host_agent, product_hosts RESTART IDENTITY CASCADE',
     );
   });
 
@@ -278,6 +283,41 @@ maybe('провижининг против живого Postgres', () => {
     );
     return id;
   }
+
+  /**
+   * МАШИНА В РЕЕСТРЕ. На верхнем уровне, а не внутри своего describe: с куска
+   * 4а живой продукт без машины — аномалия, и 005 на нём отказывает нарочно,
+   * поэтому машина нужна и сценариям про рестарт API.
+   */
+  let hostSeq = 2;
+  const addHost = (o: {
+    id: string;
+    ip?: string;
+    hash?: string;
+    capacity?: number;
+    audience?: string;
+    suffix?: string;
+    acceptsNew?: boolean;
+  }) => {
+    const ip = o.ip ?? `10.0.0.${hostSeq++}`;
+    return pool.query(
+      `INSERT INTO product_hosts (id, ssh_target, public_ip, domain_suffix,
+                                  agent_token_hash, capacity, accepts_new, audience)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        o.id,
+        `root@${ip}`,
+        ip,
+        o.suffix ?? 'c.linkeon.io',
+        o.hash ?? sha(o.id),
+        o.capacity ?? 20,
+        o.acceptsNew ?? true,
+        o.audience ?? 'clients',
+      ],
+    );
+  };
+
+  const hosts = async () => (await pool.query('SELECT * FROM product_hosts ORDER BY id')).rows;
 
   const getProduct = async (id: string) =>
     (await pool.query('SELECT * FROM products WHERE id = $1', [id])).rows[0];
@@ -1318,6 +1358,13 @@ maybe('провижининг против живого Postgres', () => {
     await pool.query(`UPDATE products SET paid_until = now() - interval '5 days' WHERE id = $1`, [
       p.id,
     ]);
+    // С куска 4а рестарт накатывает ещё и 005, а она нарочно отказывает на
+    // живом продукте, чей адрес не сошёлся ни с одной машиной реестра. Живой
+    // продукт без машины — аномалия: create() пишет host_ip тем же INSERT-ом,
+    // а фикстура здесь адреса не заполняет. Без этих двух строк сценарий про
+    // срок оплаты проверял бы базу, которой на проде не бывает.
+    await addHost({ id: 'own', ip: '139.59.210.42', audience: 'own' });
+    await pool.query(`UPDATE products SET host_ip = '139.59.210.42' WHERE id = $1`, [p.id]);
 
     for (const f of MIGRATIONS) {
       await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', f), 'utf8'));
@@ -1373,6 +1420,11 @@ maybe('провижининг против живого Postgres', () => {
     // оба файла по отдельности безупречны и идемпотентны.
     const p = await product({ slug: 'restart-asleep', status: 'running' });
     await pool.query(`UPDATE products SET status = 'sleeping' WHERE id = $1`, [p.id]);
+    // Машина и адрес — по той же причине, что в 20в: с куска 4а рестарт
+    // прогоняет ещё и 005, отказывающую на продукте без машины. Спящий продукт
+    // на проде стоит на машине, как и всякий другой.
+    await addHost({ id: 'own', ip: '139.59.210.42', audience: 'own' });
+    await pool.query(`UPDATE products SET host_ip = '139.59.210.42' WHERE id = $1`, [p.id]);
 
     const refused: string[] = [];
     for (const f of MIGRATIONS) {
@@ -2815,6 +2867,217 @@ maybe('провижининг против живого Postgres', () => {
       expect(await jobsOf(archived.id)).toEqual([]);
       expect((await getProduct(awake.id)).status).toBe('running');
       await expectUntouched(other);
+    });
+  });
+
+  // ═════════════════════ реестр машин (миграция 005) ═════════════════════
+
+  describe('реестр машин', () => {
+    /**
+     * Накатить схему ТЕМ ЖЕ кодом, которым её накатывает прод, — а не «прочитать
+     * файл и выполнить». Половина 005 живёт именно в ProductsService: параметр
+     * сессии с хешем токена, выделенное соединение и явная транзакция. Накатка
+     * файла через пул этой половины не воспроизводит вовсе — и проходила бы
+     * зелёной ровно в том случае, ради которого всё и написано.
+     *
+     * Ошибки логгера глушатся: отказ 005 здесь ожидаемый результат сценария, а
+     * не поломка прогона.
+     */
+    const migrate = async (token: string | null) => {
+      const before = process.env.PRODUCT_HOST_TOKEN;
+      if (token === null) delete process.env.PRODUCT_HOST_TOKEN;
+      else process.env.PRODUCT_HOST_TOKEN = token;
+      const svc = new ProductsService({
+        query: (sql: string, params?: any[]) => pool.query(sql, params),
+        getClient: () => pool.connect(),
+      } as any);
+      jest.spyOn((svc as any).logger, 'error').mockImplementation(() => undefined);
+      try {
+        return await svc.onModuleInit();
+      } finally {
+        if (before === undefined) delete process.env.PRODUCT_HOST_TOKEN;
+        else process.env.PRODUCT_HOST_TOKEN = before;
+      }
+    };
+
+    /** Токен машины. Неоднородный: на 'a'.repeat(n) выживает половина мутаций хеша. */
+    const TOKEN = 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90';
+
+    it('40. машина own заводится ХЕШЕМ токена из окружения, продукт получает метку', async () => {
+      const mine = await product({ slug: 'mh-existing' });
+      const gone = await product({ slug: 'mh-gone' });
+      await pool.query(`UPDATE products SET host_ip = '139.59.210.42' WHERE id = $1`, [mine.id]);
+      await pool.query(
+        `UPDATE products SET host_ip = '10.0.0.99', archived_at = now() WHERE id = $1`,
+        [gone.id],
+      );
+
+      await migrate(TOKEN);
+
+      expect(await hosts()).toEqual([
+        {
+          id: 'own',
+          ssh_target: 'root@139.59.210.42',
+          public_ip: '139.59.210.42',
+          domain_suffix: 'p.linkeon.io',
+          agent_token_hash: sha(TOKEN),
+          capacity: 20,
+          accepts_new: true,
+          audience: 'own',
+          created_at: expect.any(Date),
+        },
+      ]);
+      expect((await getProduct(mine.id)).host_id).toBe('own');
+      // Архивный с чужим адресом метки не получает и накатку не роняет.
+      expect((await getProduct(gone.id)).host_id).toBeNull();
+    });
+
+    it('40а. в реестре лежит ХЕШ, а токена нет ни в каком виде', async () => {
+      // Открытый токен в базе означал бы, что её дамп даёт право заводить
+      // продукты на любой машине. Тот же приём, что у runner-токена продукта.
+      await migrate(TOKEN);
+
+      const [row] = await hosts();
+      expect(row.agent_token_hash).toBe(sha(TOKEN));
+      expect(JSON.stringify(row)).not.toContain(TOKEN);
+    });
+
+    it('40б. параметр сессии ДОЕЗЖАЕТ до файла: хеш не от пустой строки', async () => {
+      // Главная ловушка задачи. set_config(..., true) через пул живёт до конца
+      // своего запроса, и следующий читает ПУСТУЮ СТРОКУ, а не ошибку: миграция
+      // применилась бы успешно, записав sha256(''), и агент с настоящим токеном
+      // молча перестал бы получать работу. Измерено на PostgreSQL 16.14.
+      await migrate(TOKEN);
+
+      const [row] = await hosts();
+      expect(row.agent_token_hash).not.toBe(sha(''));
+    });
+
+    it('40в. без PRODUCT_HOST_TOKEN машина не заводится вовсе', async () => {
+      // Не заводится — лучше, чем заводится с хешем пустой строки: такую машину
+      // не узнает ни один агент, а отличить её от настоящей в реестре нельзя.
+      await migrate(null);
+
+      expect(await hosts()).toEqual([]);
+    });
+
+    it('41. несопоставленный ЖИВОЙ продукт РОНЯЕТ накатку, а не получает метку по умолчанию', async () => {
+      // Продукт с чужой меткой получает задания на машину, где его каталога
+      // нет: заведение начнётся заново поверх пустого места. Отказ — громкий, и
+      // он роняет старт API: 005 объявлена обязательной.
+      const p = await product({ slug: 'mh-orphan' });
+      await pool.query(`UPDATE products SET host_ip = '10.0.0.99' WHERE id = $1`, [p.id]);
+
+      await expect(migrate(TOKEN)).rejects.toThrow(/не сошёлся/);
+
+      expect((await getProduct(p.id)).host_id).toBeNull();
+      // Откат ПОЛНЫЙ: отказ не оставляет половину миграции — машины own в
+      // реестре нет, хотя её вставка стоит в файле выше проверки.
+      expect(await hosts()).toEqual([]);
+    });
+
+    it('41а. продукт БЕЗ адреса роняет накатку так же: пустой host_ip — не «любая машина»', async () => {
+      // Фикстура host_ip не заполняет вовсе — ровно как строка, заведённая до
+      // появления колонки. NULL не равен ничему, в том числе адресу машины.
+      await product({ slug: 'mh-noip' });
+
+      await expect(migrate(TOKEN)).rejects.toThrow(/mh-noip \(host_ip пуст\)/);
+    });
+
+    it('41б. отказ называет ВСЕ несопоставленные продукты поимённо и адресом без маски', async () => {
+      // Счётчик «у N продуктов» отправляет оператора искать их запросом. Имена
+      // в сообщении — это разница между «понял за минуту» и «полез в базу».
+      // Адрес печатается host(), а не ::text: inet печатает себя с маской, и
+      // «10.0.0.98/32» оператор не найдёт ни в одном конфиге.
+      const a = await product({ slug: 'mh-o1' });
+      const b = await product({ slug: 'mh-o2' });
+      await pool.query(`UPDATE products SET host_ip = '10.0.0.98' WHERE id = ANY($1)`, [[a.id, b.id]]);
+
+      await expect(migrate(TOKEN)).rejects.toThrow(
+        /mh-o1 \(host_ip 10\.0\.0\.98\), mh-o2 \(host_ip 10\.0\.0\.98\)$/,
+      );
+    });
+
+    it('41в. архивный несопоставленный накатку не роняет', async () => {
+      // Архивный продукт не получает заданий никогда — сопоставлять его не с
+      // чем и незачем.
+      const p = await product({ slug: 'mh-archived' });
+      await pool.query(
+        `UPDATE products SET host_ip = '10.0.0.99', archived_at = now() WHERE id = $1`,
+        [p.id],
+      );
+
+      await expect(migrate(TOKEN)).resolves.toBeUndefined();
+
+      expect((await getProduct(p.id)).host_id).toBeNull();
+    });
+
+    it('42. повторная накатка ничего не меняет', async () => {
+      // Модуль накатывает ВЕСЬ список при каждом старте API, то есть при каждом
+      // pm2 restart.
+      const p = await product({ slug: 'mh-twice' });
+      await pool.query(`UPDATE products SET host_ip = '139.59.210.42' WHERE id = $1`, [p.id]);
+      await migrate(TOKEN);
+      const hostsBefore = await hosts();
+      const productBefore = await getProduct(p.id);
+      expect(hostsBefore).toHaveLength(1);
+
+      await migrate(TOKEN);
+      await migrate(TOKEN);
+
+      expect(await hosts()).toEqual(hostsBefore);
+      expect(await getProduct(p.id)).toEqual(productBefore);
+    });
+
+    it('42а. заведённую машину миграция НЕ переписывает: источник правды — реестр, а не окружение', async () => {
+      // После выката PRODUCT_HOST_TOKEN из окружения бэкенда удаляется:
+      // оставленный, он был бы вторым способом пройти гвард. Значит и поворот
+      // токена делается правкой реестра, а не правкой .env — иначе выходило бы
+      // два источника правды, расходящихся молча.
+      await migrate(TOKEN);
+
+      await migrate('b'.repeat(64));
+
+      expect((await hosts())[0].agent_token_hash).toBe(sha(TOKEN));
+    });
+
+    it('43. потолок обязан быть положительным', async () => {
+      // Нулевой потолок — это машина, на которую ничего не заведёшь, и отказ
+      // «мест нет» вместо внятной ошибки конфигурации.
+      await expect(addHost({ id: 'zero', capacity: 0 })).rejects.toThrow(/capacity/);
+    });
+
+    it('44. двух машин с одним адресом не бывает', async () => {
+      // Сопоставление продуктов — это UPDATE ... FROM, то есть соединение. Две
+      // машины с одним адресом дали бы продукту метку ОДНОЙ ИЗ НИХ наугад: без
+      // ошибки, без строки в логе и без способа заметить.
+      await addHost({ id: 'a', ip: '10.0.0.5' });
+
+      await expect(addHost({ id: 'b', ip: '10.0.0.5' })).rejects.toThrow(/public_ip/);
+    });
+
+    it('44а. двух машин с одним хешем токена не бывает', async () => {
+      // Гвард берёт машину по хешу без ORDER BY — как RunnerGuard берёт продукт
+      // по runner_token_hash. Без уникальности совпадение отдаёт произвольную
+      // машину, то есть чужие задания.
+      await addHost({ id: 'a', hash: 'h-один' });
+
+      await expect(addHost({ id: 'b', hash: 'h-один' })).rejects.toThrow(/agent_token_hash/);
+    });
+
+    it('44б. аудитория закрыта словарём', async () => {
+      await expect(addHost({ id: 'x', audience: 'всякие' })).rejects.toThrow(/audience/);
+    });
+
+    it('44в. машину нельзя снести из-под её продуктов', async () => {
+      // ON DELETE SET NULL означал бы продукты без машины, молча выпавшие из
+      // выдачи заданий; CASCADE — снос реестра продуктов вместе со строкой
+      // машины.
+      await addHost({ id: 'a', ip: '10.0.0.5' });
+      const p = await product({ slug: 'mh-fk' });
+      await pool.query(`UPDATE products SET host_id = 'a' WHERE id = $1`, [p.id]);
+
+      await expect(pool.query(`DELETE FROM product_hosts WHERE id = 'a'`)).rejects.toThrow(/host_id/);
     });
   });
 });

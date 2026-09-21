@@ -1,4 +1,5 @@
 import { Injectable, Logger, NotFoundException, OnModuleInit } from '@nestjs/common';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
@@ -39,7 +40,39 @@ export const MIGRATIONS = [
   '002_provisioning.sql',
   '003_host_agent.sql',
   '004_rent.sql',
+  '005_hosts.sql',
 ] as const;
+
+/**
+ * Миграции, чей отказ обязан РОНЯТЬ СТАРТ, а не уходить строкой в лог.
+ *
+ * Обычное поведение applyMigration — «записал отказ и поехал дальше», и оно
+ * осознанное: схема продуктов не должна ронять чат, оплаты и вход. Но 005
+ * заводит то, БЕЗ ЧЕГО ОСТАЛЬНОЙ МОДУЛЬ НЕВЕРЕН: гвард агента превращает токен
+ * в метку машины запросом к product_hosts, выдача заданий фильтрует по
+ * products.host_id. Молча не применившаяся 005 — это не «одна недостающая
+ * колонка», а 500 на каждый опрос агента: ни одного заведения, ни одного сна,
+ * ни одного пробуждения — и ни одной строки о причине.
+ *
+ * Сюда же попадает вторая половина той же мысли: 005 отказывает НАРОЧНО, когда
+ * продукт не сопоставился с машиной по адресу. Отказ, уходящий в лог, оставил
+ * бы этот случай незамеченным — а именно ради того, чтобы его заметили, он и
+ * написан.
+ *
+ * Цена названа честно: единственная ситуация, в которой 005 роняет старт на
+ * живых данных, — живой продукт, чьего адреса нет в реестре. Продолжать в ней
+ * значит выдавать заданиям чужую машину или терять продукт из выдачи молча.
+ */
+const FATAL_MIGRATIONS: ReadonlySet<string> = new Set<string>(['005_hosts.sql']);
+
+/**
+ * Имя параметра сессии, которым 005 получает хеш токена агента машины `own`.
+ *
+ * Именно хеш, а не токен: digest() живёт в pgcrypto, а на проде 21.09.2026
+ * стоят только citext и plpgsql — считать sha256 внутри SQL там нечем.
+ * Побочно это и лучше: в Postgres не уезжает даже то, что можно предъявить.
+ */
+const OWN_HOST_TOKEN_GUC = 'linkeon.own_host_token_sha256';
 
 // Список колонок перечислен явно и собран ПО КАБИНЕТУ: здесь ровно те поля,
 // которые объявлены в `interface Product` фронта (spirits_front
@@ -134,14 +167,20 @@ export class ProductsService implements OnModuleInit {
       path.join(__dirname, '..', '..', 'src', 'products', 'migrations', filename),
     ];
     let found = false;
+    let lastError: Error | null = null;
     for (const p of [...new Set(candidates)]) {
       if (!fs.existsSync(p)) continue;
       found = true;
       try {
-        await this.pg.query(fs.readFileSync(p, 'utf8'));
+        await this.runMigration(filename, fs.readFileSync(p, 'utf8'));
         this.logger.log(`products migration ${filename} applied from ${p}`);
         return;
       } catch (e: any) {
+        // Ошибка запоминается, а не только печатается: у обязательной миграции
+        // она обязана доехать до того, кто читает падение старта. «Не
+        // применилась» без причины отправляет оператора искать её в логах
+        // Postgres.
+        lastError = e;
         this.logger.error(`products migration ${filename} failed (${p}): ${e.message}`);
       }
     }
@@ -150,5 +189,87 @@ export class ProductsService implements OnModuleInit {
     } else {
       this.logger.warn(`products migration ${filename} not found, skipping`);
     }
+    if (FATAL_MIGRATIONS.has(filename)) {
+      // Бросается ПОСЛЕ перебора всех путей, а не внутри цикла: второй путь
+      // (через src) — это тот, по которому миграции применяются на проде, и
+      // отказ на первом не должен мешать ему отработать.
+      throw new Error(
+        `products migration ${filename} обязательна и не применилась: ` +
+          (lastError?.message ?? 'файл не найден ни по одному из путей'),
+      );
+    }
+  }
+
+  /**
+   * Применить текст миграции. Обычные едут через пул одним запросом, как и
+   * прежде; тем, кому нужен параметр сессии, отводится ВЫДЕЛЕННОЕ соединение и
+   * ЯВНАЯ транзакция.
+   *
+   * Без выделенного соединения это не работает, и не работает ТИХО. Измерено на
+   * PostgreSQL 16.14 через настоящий pg.Pool:
+   *
+   *   set_config('linkeon.x', 'секрет', true) отдельным pool.query(), затем
+   *   current_setting('linkeon.x') следующим pool.query()  →  ПУСТАЯ СТРОКА.
+   *
+   * Не ошибка — пустая строка: параметр живёт до конца транзакции, а через пул
+   * каждый запрос сам себе транзакция; имя же в сессии остаётся заведённым,
+   * поэтому строгий current_setting не жалуется, а отдаёт сброшенное значение.
+   * Миграция, считающая по такому значению хеш токена, применилась бы успешно и
+   * записала бы в реестр хеш пустой строки.
+   *
+   * Сессионный вариант (is_local = false) чинит это лишь на глаз: тот же
+   * замер показывает значение на СВОЁМ соединении и NULL на соседнем, стоит
+   * пулу быть занятым. То есть зелено в тестах и наугад в проде — плюс токен,
+   * оставшийся в состоянии соединения, которое пул отдаст следующему запросу.
+   *
+   * Параметром запроса в сам INSERT токен тоже не подставить: в файле несколько
+   * операторов, а с параметрами драйвер уходит в расширенный протокол, где это
+   * `cannot insert multiple commands into a prepared statement` (измерено там
+   * же).
+   */
+  private async runMigration(filename: string, sql: string) {
+    const settings = this.sessionSettings(filename);
+    if (!settings.length) {
+      await this.pg.query(sql);
+      return;
+    }
+
+    const client = await this.pg.getClient();
+    try {
+      // BEGIN первым: set_config(..., true) вне явной транзакции сбросится
+      // ровно в тот момент, когда закончится его собственный запрос.
+      await client.query('BEGIN');
+      for (const [name, value] of settings) {
+        await client.query('SELECT set_config($1, $2, true)', [name, value]);
+      }
+      await client.query(sql);
+      await client.query('COMMIT');
+    } catch (e) {
+      // Откат своей ошибкой не заслоняет исходную: соединение всё равно
+      // возвращается в пул, а причина отказа нужна вызывающему.
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Параметры сессии, нужные конкретному файлу миграции. */
+  private sessionSettings(filename: string): [string, string][] {
+    if (filename !== '005_hosts.sql') return [];
+
+    const token = process.env.PRODUCT_HOST_TOKEN ?? '';
+    if (!token) {
+      // Не бросаем здесь сами: пустой токен — это состояние окружения, а не
+      // сломанная схема, и ронять им чат с оплатами незачем. На живых данных
+      // 005 всё равно откажет — сопоставлять продукты будет не с чем, — а на
+      // пустой базе (тесты, свежее окружение) отсутствие машины безвредно.
+      this.logger.error(
+        'PRODUCT_HOST_TOKEN не задан: машина own в реестр не попадёт, ' +
+          'и агент хоста не получит ни одного задания',
+      );
+      return [[OWN_HOST_TOKEN_GUC, '']];
+    }
+    return [[OWN_HOST_TOKEN_GUC, crypto.createHash('sha256').update(token).digest('hex')]];
   }
 }
