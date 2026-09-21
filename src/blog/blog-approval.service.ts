@@ -6,6 +6,7 @@ import { BlogPost, BlogStatus, canTransition, rowToPost } from './blog.types';
 import { parseBlogCallback, buildBlogKeyboard } from './blog-callback';
 import { buildCaption } from './blog-text';
 import { nextSlotAfter } from './blog-slots';
+import { fetchImageBytes } from './blog-image.fetch';
 
 @Injectable()
 export class BlogApprovalService {
@@ -17,13 +18,37 @@ export class BlogApprovalService {
     private readonly settings: BlogSettingsService,
   ) {}
 
-  /** Показать черновик владельцу и запомнить координаты сообщения. */
+  /**
+   * Показать черновик владельцу и запомнить координаты сообщения.
+   *
+   * Картинку шлём байтами: по ссылке Telegram её не забирает (см.
+   * `blog-image.fetch.ts`).
+   */
   async sendForReview(post: BlogPost, chatId: number): Promise<void> {
     const caption = buildCaption(post.title || '', post.body || '');
-    const msg: any = await this.tg.sendPhoto(chatId, post.imageUrl!, {
-      caption,
-      reply_markup: buildBlogKeyboard(post.id),
-    });
+    const keyboard = buildBlogKeyboard(post.id);
+
+    let msg: any;
+    try {
+      const photo = await fetchImageBytes(post.imageUrl!);
+      msg = await this.tg.sendPhoto(chatId, photo, { caption, reply_markup: keyboard });
+    } catch (e: any) {
+      // Картинка недоступна — но текст черновика уже стоил похода к редактору,
+      // а файл лежит в MinIO и никуда не делся. Ронять из-за этого весь пост
+      // в `failed` (так было до 21.09.2026, и владелец видел только невнятное
+      // «черновик не собрался») значит выбросить готовую работу из-за
+      // пятисекундной недоступности хранилища.
+      //
+      // Полезнее показать черновик текстом и теми же кнопками: владелец
+      // прочтёт пост и решит сам — «Переписать» заодно перерисует картинку,
+      // «Опубликовать» отправит в канал, где байты качаются заново и к тому
+      // моменту хранилище может уже отвечать. В тексте ошибки есть ссылка на
+      // файл, так что картинку можно открыть глазами прямо из сообщения.
+      this.logger.warn(`черновик ${post.id}: ${e.message} — показываю текстом без картинки`);
+      const note = `\n\n⚠️ Картинку приложить не удалось: ${String(e.message).slice(0, 300)}`;
+      msg = await this.tg.sendMessage(chatId, `${caption}${note}`, { reply_markup: keyboard });
+    }
+
     await this.pg.query(
       `UPDATE blog_post
           SET status = 'pending_review', review_chat_id = $2, review_message_id = $3, updated_at = now()
