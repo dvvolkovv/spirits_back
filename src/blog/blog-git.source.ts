@@ -22,9 +22,21 @@ export function parseGitLog(stdout: string): GitCommit[] {
 
 const NOISE = /^(chore|docs|test|tests|ci|build|refactor|style|perf)[(:]/i;
 
+/**
+ * Служебные префиксы коммита, по которым текст неинформативен сам по себе:
+ * - `Merge `/`fixup! `/`squash! ` — технический довесок к другому коммиту,
+ *   самостоятельной новости не несёт;
+ * - `Revert "` — особый случай: подстрока внутри (`feat(...)`) выглядит как
+ *   обычная фича, но это ровно противоположность новости — фичу откатили.
+ *   Если такой коммит попадёт в дайджест, владелец месяц спустя не вспомнит,
+ *   что одобрял отмену, и подтвердит пост об уже несуществующей фиче —
+ *   а отменить прочитанный пост в канале нельзя.
+ */
+const SKIP_PREFIXES = ['Merge ', 'Revert "', 'fixup! ', 'squash! '];
+
 export function filterUserFacing(commits: GitCommit[]): GitCommit[] {
   return commits.filter((c) => {
-    if (c.subject.startsWith('Merge ')) return false;
+    if (SKIP_PREFIXES.some((p) => c.subject.startsWith(p))) return false;
     return !NOISE.test(c.subject);
   });
 }
