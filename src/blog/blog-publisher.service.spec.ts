@@ -42,6 +42,19 @@ describe('BlogPublisherService.publish', () => {
     const res = await svc.publish(post());
     expect(res.ok).toBe(false);
     expect(tg.sendPhoto).not.toHaveBeenCalled();
+    const claimSql = pg.query.mock.calls[0][0] as string;
+    expect(claimSql).toContain("status = 'approved'");
+  });
+
+  it('пост без картинки не захватывается и не публикуется — иначе сгорят все три попытки', async () => {
+    const pg = { query: jest.fn() };
+    const tg = { sendPhoto: jest.fn() };
+    const svc = new BlogPublisherService(pg as any, tg as any, settingsMock() as any);
+
+    const res = await svc.publish(post({ imageUrl: null }));
+    expect(res.ok).toBe(false);
+    expect(pg.query).not.toHaveBeenCalled();
+    expect(tg.sendPhoto).not.toHaveBeenCalled();
   });
 
   it('канал не настроен — не захватываем и не публикуем', async () => {

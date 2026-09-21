@@ -34,6 +34,10 @@ export class BlogPublisherService {
       this.logger.warn('канал не настроен — публикация пропущена');
       return { ok: false, error: 'канал не настроен' };
     }
+    if (!post.imageUrl) {
+      this.logger.warn(`пост ${post.id} без картинки — публикация пропущена`);
+      return { ok: false, error: 'у поста нет картинки' };
+    }
 
     // Атомарный захват: выигрывает ровно один вызов. Без этого два тика крона
     // или ретрай после таймаута дают в канал два одинаковых поста.
@@ -52,7 +56,7 @@ export class BlogPublisherService {
     const caption = buildCaption(post.title || '', post.body || '');
 
     try {
-      const msg: any = await this.tg.sendPhoto(Number(channelChatId), post.imageUrl!, { caption });
+      const msg: any = await this.tg.sendPhoto(Number(channelChatId), post.imageUrl, { caption });
       const messageId = Number(msg.message_id);
       const url = buildPostUrl({ id: Number(msg.chat?.id ?? channelChatId), username: msg.chat?.username }, messageId);
 
