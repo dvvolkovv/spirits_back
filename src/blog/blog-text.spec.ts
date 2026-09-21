@@ -28,4 +28,12 @@ describe('buildCaption', () => {
   it('заголовок без тела не падает', () => {
     expect(buildCaption('Только заголовок', '')).toBe('Только заголовок');
   });
+
+  it('реалистичная проза обрезается по концу предложения, а не посреди фразы', () => {
+    const body = Array(30).fill('Человек приходит с конкретной задачей и получает разбор по шагам.').join(' ');
+    const caption = buildCaption('Заголовок', body);
+    expect(caption.length).toBeLessThanOrEqual(CAPTION_LIMIT);
+    expect(caption.endsWith('.')).toBe(true);
+    expect(caption.endsWith('…')).toBe(false);
+  });
 });

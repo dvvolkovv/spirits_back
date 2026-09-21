@@ -12,8 +12,15 @@ export function buildCaption(title: string, body: string): string {
 
   const cut = full.slice(0, CAPTION_LIMIT);
 
-  // Режем по границе слова — никогда не рвём слово пополам. Если в тексте
-  // вообще нет пробела в пределах лимита, режем жёстко символ в символ.
+  // Сначала ищем конец последнего целого предложения в пределах отреза —
+  // подпись, оборванная на середине фразы, читается как баг вёрстки, а не
+  // как тизер.
+  const sentenceEnd = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('! '), cut.lastIndexOf('? '));
+  if (sentenceEnd > 0) return cut.slice(0, sentenceEnd + 1).trim();
+
+  // Границы предложения нет вовсе — режем по границе слова, никогда не
+  // разрывая слово пополам. Если в тексте нет и пробела в пределах лимита,
+  // режем жёстко символ в символ.
   const wordEnd = cut.lastIndexOf(' ');
   const safe = (wordEnd > 0 ? cut.slice(0, wordEnd) : cut.slice(0, CAPTION_LIMIT - 1)).trim();
 
