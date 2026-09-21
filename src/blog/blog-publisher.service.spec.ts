@@ -69,9 +69,9 @@ describe('BlogPublisherService.publish', () => {
     expect(tg.sendPhoto).not.toHaveBeenCalled();
   });
 
-  it('отказ Telegram переводит пост в failed с причиной', async () => {
+  it('отказ Telegram записывает причину', async () => {
     const pg = { query: jest.fn() };
-    pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValueOnce({ rows: [] });
+    pg.query.mockResolvedValueOnce({ rows: [rawRow({ attempts: 3 })] }).mockResolvedValueOnce({ rows: [] });
     const tg = { sendPhoto: jest.fn().mockRejectedValue(new Error('CHAT_WRITE_FORBIDDEN')) };
     const svc = new BlogPublisherService(pg as any, tg as any, settingsMock() as any);
 
@@ -81,13 +81,34 @@ describe('BlogPublisherService.publish', () => {
     expect(lastSql).toContain("status = 'failed'");
     expect(pg.query.mock.calls[1][1]).toContain('CHAT_WRITE_FORBIDDEN');
   });
+
+  it('первая неудача Telegram возвращает пост в approved для повторной попытки', async () => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow({ attempts: 1 })] }).mockResolvedValueOnce({ rows: [] });
+    const tg = { sendPhoto: jest.fn().mockRejectedValue(new Error('ETIMEDOUT')) };
+    const svc = new BlogPublisherService(pg as any, tg as any, settingsMock() as any);
+
+    await svc.publish(post());
+    expect(pg.query.mock.calls[1][0]).toContain("status = 'approved'");
+  });
+
+  it('третья неудача подряд переводит пост в failed окончательно', async () => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow({ attempts: 3 })] }).mockResolvedValueOnce({ rows: [] });
+    const tg = { sendPhoto: jest.fn().mockRejectedValue(new Error('ETIMEDOUT')) };
+    const svc = new BlogPublisherService(pg as any, tg as any, settingsMock() as any);
+
+    await svc.publish(post());
+    expect(pg.query.mock.calls[1][0]).toContain("status = 'failed'");
+  });
 });
 
-function rawRow() {
+function rawRow(over: any = {}) {
   return {
     id: 'p1', rubric: 'case', source: 'stats', source_ref: null, topic_key: 'k', topic_hint: null,
     lang: 'ru', title: 'Заголовок', body: 'Текст', image_prompt: null, image_url: 'https://minio/i.png',
     status: 'publishing', slot_at: null, published_at: null, review_chat_id: null, review_message_id: null,
     tg_message_id: null, tg_url: null, attempts: 1, last_error: null, created_at: '', updated_at: '',
+    ...over,
   };
 }

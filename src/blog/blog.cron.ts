@@ -4,17 +4,27 @@ import { PgService } from '../common/services/pg.service';
 import { BlogTopicService, normalizeTopicKey } from './blog-topic.service';
 import { BlogEditorService } from './blog-editor.service';
 import { BlogImageService } from './blog-image.service';
-import { BlogPublisherService } from './blog-publisher.service';
+import { BlogPublisherService, MAX_PUBLISH_ATTEMPTS } from './blog-publisher.service';
 import { BlogApprovalService } from './blog-approval.service';
 import { BlogSettingsService } from './blog-settings.service';
 import { BlogGitSource } from './blog-git.source';
 import { ALLOWED_TRANSITIONS, BlogStatus, canTransition, rowToPost } from './blog.types';
 import { nextSlotAfter, STALE_NEWS_DAYS } from './blog-slots';
 
-const MAX_PUBLISH_ATTEMPTS = 3;
-
 /** Напоминание уходит, когда до слота осталось меньше этого. */
 const REMIND_WINDOW_MINUTES = 60;
+
+/**
+ * Через сколько минут пост в `publishing` считается зависшим.
+ *
+ * Захват `approved → publishing` и ответ Telegram разделяет одна отправка
+ * фото — это секунды, в худшем случае десятки секунд на медленном аплоаде.
+ * Десять минут заведомо больше любого живого аплоада, поэтому пост, который
+ * столько висит в `publishing`, — не медленный, а осиротевший: процесс умер
+ * между захватом и ответом. Порог намеренно вдвое больше тика публикации
+ * (5 минут), чтобы сторож не отобрал пост у ещё работающей отправки.
+ */
+export const STUCK_PUBLISHING_MINUTES = 10;
 
 /**
  * Статусы, из которых переход в `target` легален — по той же машине
@@ -160,6 +170,36 @@ export class BlogCron {
     );
     for (const row of r.rows) {
       await this.publisher.publish(rowToPost(row));
+    }
+  }
+
+  /**
+   * Каждые 5 минут: сторож зависших. Пост, захваченный под публикацию и
+   * осиротевший (процесс умер между захватом и ответом Telegram), сам собой
+   * из `publishing` не выйдет — его не выберет ни один запрос.
+   *
+   * Источник перехода здесь жёстко один — `publishing`, и это не лень:
+   * взять список статусов «откуда можно в approved» значило бы подхватить
+   * заодно и `pending_review`, то есть одобрить пост за владельца.
+   */
+  @Cron('*/5 * * * *')
+  async rearmStuck(): Promise<void> {
+    if (!this.enabled()) return;
+    if (!canTransition('publishing', 'approved')) {
+      this.logger.error('машина состояний запрещает publishing → approved — сторож зависших выключен');
+      return;
+    }
+
+    const r = await this.pg.query(
+      `UPDATE blog_post
+          SET status = 'approved', updated_at = now()
+        WHERE status = 'publishing'
+          AND updated_at < now() - ($1 || ' minutes')::interval
+        RETURNING id`,
+      [STUCK_PUBLISHING_MINUTES],
+    );
+    if (r.rows.length) {
+      this.logger.warn(`перевзведено зависших в publishing: ${r.rows.length} (${r.rows.map((x: any) => x.id).join(', ')})`);
     }
   }
 

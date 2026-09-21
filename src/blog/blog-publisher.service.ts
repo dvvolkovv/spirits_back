@@ -2,8 +2,14 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { BlogSettingsService } from './blog-settings.service';
-import { BlogPost } from './blog.types';
+import { BlogPost, canTransition, rowToPost } from './blog.types';
 import { buildCaption } from './blog-text';
+
+/**
+ * Сколько раз пытаемся отдать пост в Telegram. Попытку считает захват
+ * (`attempts + 1`), поэтому счётчик переживает рестарт процесса.
+ */
+export const MAX_PUBLISH_ATTEMPTS = 3;
 
 export interface PublishResult {
   ok: boolean;
@@ -52,6 +58,7 @@ export class BlogPublisherService {
       this.logger.log(`пост ${post.id} уже захвачен другим вызовом — пропускаю`);
       return { ok: false, error: 'уже публикуется' };
     }
+    const claimed = rowToPost(claim.rows[0]);
 
     const caption = buildCaption(post.title || '', post.body || '');
 
@@ -70,11 +77,26 @@ export class BlogPublisherService {
       this.logger.log(`пост ${post.id} опубликован: ${url}`);
       return { ok: true, tgMessageId: messageId, tgUrl: url };
     } catch (e: any) {
+      // Пока попытки не исчерпаны, возвращаем пост в `approved`: следующий
+      // тик крона возьмёт его снова. В `failed` ронять нельзя — оттуда
+      // возврата нет, и один таймаут Telegram означал бы отменённый пост.
+      const exhausted = claimed.attempts >= MAX_PUBLISH_ATTEMPTS;
+      const target = exhausted ? 'failed' : 'approved';
+      if (!canTransition(claimed.status, target)) {
+        this.logger.error(`пост ${post.id}: переход ${claimed.status} → ${target} запрещён, статус не трогаю`);
+        return { ok: false, error: e.message };
+      }
       await this.pg.query(
-        `UPDATE blog_post SET status = 'failed', last_error = $2, updated_at = now() WHERE id = $1`,
+        exhausted
+          ? `UPDATE blog_post SET status = 'failed', last_error = $2, updated_at = now() WHERE id = $1`
+          : `UPDATE blog_post SET status = 'approved', last_error = $2, updated_at = now() WHERE id = $1`,
         [post.id, String(e.message).slice(0, 500)],
       );
-      this.logger.error(`публикация ${post.id} сорвалась: ${e.message}`);
+      this.logger.error(
+        exhausted
+          ? `публикация ${post.id} сорвалась окончательно (${claimed.attempts} попытки): ${e.message}`
+          : `публикация ${post.id} сорвалась (попытка ${claimed.attempts} из ${MAX_PUBLISH_ATTEMPTS}), вернул в очередь: ${e.message}`,
+      );
       return { ok: false, error: e.message };
     }
   }

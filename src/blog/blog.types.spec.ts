@@ -14,6 +14,16 @@ describe('canTransition', () => {
     expect(canTransition('publishing', 'published')).toBe(true);
   });
 
+  it('publishing → approved разрешён: возврат на повторную попытку отправки', () => {
+    expect(canTransition('publishing', 'approved')).toBe(true);
+  });
+
+  it('в approved нельзя попасть из drafting или failed — только человек одобряет', () => {
+    expect(canTransition('drafting', 'approved')).toBe(false);
+    expect(canTransition('failed', 'approved')).toBe(false);
+    expect(canTransition('idea', 'approved')).toBe(false);
+  });
+
   it('idea → published запрещён: пост не может выйти минуя апрув', () => {
     expect(canTransition('idea', 'published')).toBe(false);
   });

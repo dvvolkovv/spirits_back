@@ -1,4 +1,4 @@
-import { BlogCron } from './blog.cron';
+import { BlogCron, STUCK_PUBLISHING_MINUTES } from './blog.cron';
 
 const deps = () => ({
   pg: { query: jest.fn().mockResolvedValue({ rows: [] }) },
@@ -90,6 +90,31 @@ describe('BlogCron.publishDue', () => {
     expect(sql).toContain("status = 'approved'");
     expect(sql).toContain('slot_at <= now()');
     expect(d.publisher.publish).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('BlogCron.rearmStuck', () => {
+  const OLD = process.env.BLOG_ENABLED;
+  afterEach(() => { process.env.BLOG_ENABLED = OLD; });
+
+  it('возвращает в approved только publishing, зависшие дольше порога', async () => {
+    process.env.BLOG_ENABLED = 'true';
+    const d = deps();
+    await make(d).rearmStuck();
+
+    const [sql, params] = d.pg.query.mock.calls[0];
+    expect(String(sql)).toContain("status = 'publishing'");
+    expect(String(sql)).toContain("SET status = 'approved'");
+    // Без порога по времени сторож отобрал бы пост у живой отправки.
+    expect(String(sql)).toContain('updated_at <');
+    expect(params).toContain(STUCK_PUBLISHING_MINUTES);
+  });
+
+  it('при выключенном BLOG_ENABLED не ходит в базу', async () => {
+    process.env.BLOG_ENABLED = '';
+    const d = deps();
+    await make(d).rearmStuck();
+    expect(d.pg.query).not.toHaveBeenCalled();
   });
 });
 

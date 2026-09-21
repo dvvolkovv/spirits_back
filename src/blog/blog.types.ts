@@ -39,7 +39,14 @@ export const ALLOWED_TRANSITIONS: Record<BlogStatus, BlogStatus[]> = {
   drafting:       ['pending_review', 'failed'],
   pending_review: ['approved', 'drafting', 'rejected'],
   approved:       ['publishing', 'drafting', 'rejected'],
-  publishing:     ['published', 'failed'],
+  // `approved` здесь — это возврат на повторную попытку отправки, а не
+  // повторный апрув: Telegram отвалился по таймауту, пост ждёт следующего
+  // тика крона. Переход безопасен именно потому, что в `publishing` нельзя
+  // попасть ниоткуда, кроме `approved`, — то есть человек этот пост уже
+  // одобрил. Разрешать возврат из `failed` нельзя: туда попадают и
+  // черновики со стадии `drafting`, и такой переход открыл бы дорогу
+  // «черновик → approved → в канал» мимо человека.
+  publishing:     ['published', 'approved', 'failed'],
   published:      [],
   rejected:       [],
   failed:         ['drafting', 'rejected'],
