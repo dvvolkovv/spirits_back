@@ -1,5 +1,5 @@
-import { Body, Controller, Param, Post, UseGuards } from '@nestjs/common';
-import { HostGuard } from './host.guard';
+import { Body, Controller, Param, Post, Req, UseGuards } from '@nestjs/common';
+import { HostAgentRequest, HostGuard } from './host.guard';
 import { assertUuid, CompleteJobDto } from './products.dto';
 import { ProvisioningService } from './provisioning.service';
 
@@ -62,7 +62,7 @@ export class HostController {
    * в теле этого ответа, и потерять их по дороге нельзя.
    */
   @Post('products/host/poll')
-  async poll() {
+  async poll(@Req() req: HostAgentRequest) {
     // Отметка о жизни агента ставится ДО выдачи и НЕЗАВИСИМО от неё: факт «наш
     // агент пришёл и предъявил токен» состоялся здесь, что бы дальше ни
     // ответила очередь. Поставленная после claimJob, она пропадала бы ровно в
@@ -71,8 +71,20 @@ export class HostController {
     //
     // touchHostAgent не бросает (см. там же): сломанная отметка не имеет права
     // останавливать очередь.
-    await this.provisioning.touchHostAgent();
-    return { job: await this.provisioning.claimJob() };
+    //
+    // ОТМЕТКА СВОЯ У КАЖДОЙ МАШИНЫ (006), и метка уезжает в неё ИЗ ЗАПРОСА —
+    // из того же места и по той же причине, что и в выдачу ниже. Общей она была
+    // by design 003, пока машина была одна; с двумя опрос ЖИВОГО агента
+    // поднимал её за обоих, и продукт на умершей машине висел «Заводится…»
+    // десять минут при зелёном индикаторе — то есть отметка врала ровно той
+    // диагностикой, которую заменяла.
+    await this.provisioning.touchHostAgent(req.hostId);
+    // МЕТКА БЕРЁТСЯ ИЗ ЗАПРОСА, КУДА ЕЁ ПОЛОЖИЛ ГВАРД, и ниоткуда больше.
+    // Взятая из тела (`body.hostId`), она была бы заявлением агента о себе, то
+    // есть правом одной строчкой в запросе забрать чужие задания вместе с
+    // расшифрованными секретами чужих продуктов. Тело сюда не приезжает вовсе —
+    // @Body() у этого маршрута нет.
+    return { job: await this.provisioning.claimJob(req.hostId) };
   }
 
   /**

@@ -29,6 +29,12 @@ const JOB = {
   secrets: { BOT_TOKEN: '123:abc' },
 };
 
+/**
+ * Запрос в том виде, в каком его отдаёт HostGuard: метка машины лежит НА
+ * ЗАПРОСЕ, потому что выведена из предъявленного токена (см. HostAgentRequest).
+ */
+const REQ = { hostId: 'own' };
+
 function makeCtrl(over: any = {}) {
   const order: string[] = [];
   const prov = {
@@ -49,7 +55,7 @@ describe('HostController.poll', () => {
   it('отдаёт задание целиком — вместе с токеном и секретами', async () => {
     const { ctrl } = makeCtrl();
 
-    const res = await ctrl.poll();
+    const res = await ctrl.poll(REQ);
 
     // Точное равенство, а не toMatchObject: маршрут, пересобравший задание
     // явным списком полей (как это верно сделано у раннера), потерял бы здесь
@@ -65,7 +71,7 @@ describe('HostController.poll', () => {
 
     // Агент опрашивает нас в цикле: пустая очередь — обычное состояние, а не
     // отказ. 500 в этом месте заливал бы лог агента на каждом обороте.
-    await expect(ctrl.poll()).resolves.toEqual({ job: null });
+    await expect(ctrl.poll(REQ)).resolves.toEqual({ job: null });
   });
 
   it('опрос отмечает, что агент был на связи', async () => {
@@ -74,9 +80,32 @@ describe('HostController.poll', () => {
     // срок ни при чём — забирать задание было некому.
     const { ctrl, prov } = makeCtrl();
 
-    await ctrl.poll();
+    await ctrl.poll(REQ);
 
     expect(prov.touchHostAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it('отметка ставится ТОЙ машине, что спросила', async () => {
+    // Метка берётся ИЗ ЗАПРОСА, куда её положил гвард, — из того же места, что
+    // и у выдачи. Отметка без метки (одна на всё) была бы отметкой о том, что
+    // жив «агент вообще»: опрос одной машины поднимал бы её за обоих, и
+    // кабинет объявлял бы живым мёртвого соседа.
+    const { ctrl, prov } = makeCtrl();
+
+    await ctrl.poll({ hostId: 'clients' });
+
+    expect(prov.touchHostAgent).toHaveBeenCalledWith('clients');
+  });
+
+  it('метка отметки и метка выдачи — ОДНА И ТА ЖЕ', async () => {
+    // Разъехавшись, они дают самый неприятный вид лжи: задание уезжает на одну
+    // машину, а живой числится другая. Сверяются фактические аргументы, а не
+    // намерение.
+    const { ctrl, prov } = makeCtrl();
+
+    await ctrl.poll({ hostId: 'clients' });
+
+    expect(prov.touchHostAgent.mock.calls[0]).toEqual(prov.claimJob.mock.calls[0]);
   });
 
   it('пустая очередь — тоже визит агента', async () => {
@@ -85,7 +114,7 @@ describe('HostController.poll', () => {
     // бы всё это время — то есть тревога горела бы на исправной машине.
     const { ctrl, prov } = makeCtrl({ claimJob: jest.fn(async () => null) });
 
-    await ctrl.poll();
+    await ctrl.poll(REQ);
 
     expect(prov.touchHostAgent).toHaveBeenCalledTimes(1);
   });
@@ -93,7 +122,7 @@ describe('HostController.poll', () => {
   it('отметка ставится ДО выдачи', async () => {
     const { ctrl, order } = makeCtrl();
 
-    await ctrl.poll();
+    await ctrl.poll(REQ);
 
     // Порядок не косметика: отказ базы на выдаче иначе уносит с собой и
     // отметку, и кабинет показывает «агент не забирает задания» вместо
@@ -114,7 +143,7 @@ describe('HostController.poll', () => {
       }),
     });
 
-    await ctrl.poll();
+    await ctrl.poll(REQ);
 
     expect(written).toBe(true);
   });
@@ -130,7 +159,44 @@ describe('HostController.poll', () => {
     // try/catch с `return { job: null }` здесь означал бы, что упавшая база
     // неотличима от «работы нет»: агент крутит опрос, задания стоят в очереди,
     // в логе пусто. Ошибка обязана долетать до агента.
-    await expect(ctrl.poll()).rejects.toBe(boom);
+    await expect(ctrl.poll(REQ)).rejects.toBe(boom);
+  });
+
+  it('метка машины доезжает из запроса до выдачи — и метка ТОЙ машины, что спросила', async () => {
+    // Две разные метки в одном сценарии намеренно. С одной зелёным проходит
+    // самая правдоподобная мутация — константа ('own') в маршруте: пока машина
+    // была одна, она и была верным ответом, и заметили бы её только на второй.
+    const { ctrl, prov } = makeCtrl();
+
+    await ctrl.poll({ hostId: 'own' });
+    await ctrl.poll({ hostId: 'clients' });
+
+    expect(prov.claimJob.mock.calls).toEqual([['own'], ['clients']]);
+  });
+
+  it('метка берётся из ЗАПРОСА, а не из тела', async () => {
+    // Метку выводит гвард из предъявленного токена. Взятая из тела, она была бы
+    // заявлением агента о себе: одна строчка в запросе — и агент машины
+    // клиентов забирает задания владельца вместе с расшифрованными секретами
+    // его продуктов.
+    const { ctrl, prov } = makeCtrl();
+
+    await ctrl.poll({ hostId: 'own', body: { hostId: 'clients' }, query: { hostId: 'clients' } } as any);
+
+    expect(prov.claimJob).toHaveBeenCalledWith('own');
+  });
+
+  it('метка не досочиняется маршрутом, когда её нет', async () => {
+    // Гвард либо кладёт метку, либо не пускает вовсе, — но подстановка
+    // умолчания здесь (`req.hostId ?? 'own'`) пережила бы снятый гвард и увела
+    // бы задания на машину владельца молча. Наружу обязано уехать то, что на
+    // запросе; отсутствие метки останавливает выдачу в claimJob (там же —
+    // почему громко, а не пустой очередью).
+    const { ctrl, prov } = makeCtrl();
+
+    await ctrl.poll({} as any);
+
+    expect(prov.claimJob).toHaveBeenCalledWith(undefined);
   });
 });
 

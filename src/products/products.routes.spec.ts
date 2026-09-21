@@ -181,6 +181,23 @@ describe('адреса маршрутов', () => {
     );
   });
 
+  it('опрос агента берёт ВЕСЬ ЗАПРОС, и ничего кроме', () => {
+    // Метку машины кладёт на запрос HostGuard, и добраться до неё можно только
+    // через @Req(). Юнит-тесты маршрута зовут `ctrl.poll({ hostId: 'own' })`
+    // напрямую и про декоратор не знают вовсе: снятый @Req остаётся там зелёным
+    // и ломается на живом сервере — Nest передаст undefined, и опрос агента
+    // станет 500-кой на каждом обороте.
+    //
+    // Вторая половина — «и ничего кроме»: @Body() у этого маршрута быть не
+    // должно. Метка, взятая из тела, была бы заявлением агента о себе, то есть
+    // правом одной строчкой в запросе забрать чужие задания вместе с
+    // расшифрованными секретами чужих продуктов.
+    const args = Reflect.getMetadata(ROUTE_ARGS_METADATA, HostController, 'poll') ?? {};
+    expect(Object.keys(args).map((k) => Number(k.split(':')[0]))).toEqual([
+      RouteParamtypes.REQUEST,
+    ]);
+  });
+
   it('кнопки кабинета бьют туда же, куда ходит фронт', () => {
     expect(endpointOf(ProductsController, 'create')).toBe('POST /webhook/products');
     expect(endpointOf(ProductsController, 'retry')).toBe('POST /webhook/products/:id/retry');

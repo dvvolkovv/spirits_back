@@ -49,7 +49,7 @@ function makeController(events: any[]) {
   const provisioning = {
     create: jest.fn(async () => ({ productId: 'p-новый', runnerToken: 'ТОКЕН-РАННЕРА' })),
     retry: jest.fn(async () => undefined),
-    hostAgentLive: jest.fn(async () => true),
+    hostAgentsLiveForUser: jest.fn(async () => true),
   };
   return {
     ctrl: new ProductsController(products as any, turns as any, turnEvents as any, provisioning as any),
@@ -236,6 +236,11 @@ describe('ProductsController.create', () => {
       slug: 'selyanska',
       kind: 'site',
       secrets: { BOT_TOKEN: '123:abc' },
+      // Признак администратора — часть каждого заведения, а не довесок: по
+      // нему выбирается машина. Обычный пользователь — false, а не
+      // отсутствие поля: `isAdmin` объявлен обязательным именно затем, чтобы
+      // забытый признак был ошибкой типов, а не тихой маршрутизацией.
+      isAdmin: false,
     });
   });
 
@@ -254,6 +259,55 @@ describe('ProductsController.create', () => {
     } as any);
 
     expect(provisioning.create).toHaveBeenCalledWith(expect.objectContaining({ userId: 'u-1' }));
+  });
+
+  it('признак администратора берётся у гварда, а не из тела запроса', async () => {
+    // Признак решает, на машины какой аудитории уедет продукт (кусок 4а).
+    // ValidationPipe стоит с whitelist: false, поэтому `isAdmin` из тела
+    // доезжает до маршрута насквозь — спред тела отдал бы любому желающему
+    // право поставить свой продукт рядом с боевыми.
+    const { ctrl, provisioning } = makeController([]);
+
+    await ctrl.create({ userId: 'u-1', isAdmin: false } as any, {
+      name: 'Сайт',
+      slug: 'site-1',
+      kind: 'site',
+      isAdmin: true,
+    } as any);
+
+    expect(provisioning.create).toHaveBeenCalledWith(expect.objectContaining({ isAdmin: false }));
+  });
+
+  it('признак администратора доезжает до заведения, когда он ЕСТЬ', async () => {
+    // Обратная половина: реализация, зашившая false, прошла бы тест выше
+    // зелёной и увела бы все продукты владельца на клиентские машины.
+    const { ctrl, provisioning } = makeController([]);
+
+    await ctrl.create({ userId: 'u-1', isAdmin: true } as any, {
+      name: 'Сайт',
+      slug: 'site-1',
+      kind: 'site',
+    } as any);
+
+    expect(provisioning.create).toHaveBeenCalledWith(expect.objectContaining({ isAdmin: true }));
+  });
+
+  it('правдоподобное не-true администратором не считается', async () => {
+    // `user` здесь `any` — из JwtGuard он приходит с настоящим boolean, но
+    // проверки типа на этом пути нет ни одной. Приведение к истинности сделало
+    // бы админом строку 'false'. Любое не-true уводит продукт на клиентскую
+    // машину, то есть в безопасную сторону.
+    for (const bad of ['true', 'false', 1, {}, [], undefined]) {
+      const { ctrl, provisioning } = makeController([]);
+
+      await ctrl.create({ userId: 'u-1', isAdmin: bad } as any, {
+        name: 'Сайт',
+        slug: 'site-1',
+        kind: 'site',
+      } as any);
+
+      expect(provisioning.create).toHaveBeenCalledWith(expect.objectContaining({ isAdmin: false }));
+    }
   });
 
   it('продукт без секретов заводится с пустым набором, а не с undefined', async () => {
@@ -425,11 +479,43 @@ describe('ProductsController.list', () => {
     expect(res.setHeader).toHaveBeenCalledWith('X-Host-Agent', 'live');
   });
 
+  it('вердикт спрашивается про машины ВЛАДЕЛЬЦА ТОКЕНА', async () => {
+    // С реестром «жив ли агент» и «дойдёт ли работа до МОЕЙ машины» — разные
+    // вопросы. Вердикт, собранный по хостингу вообще, молчит ровно там, где
+    // нужен: живой агент одной машины отвечает за мёртвого соседа, и продукт
+    // на умершей машине висит «Заводится…» при зелёном индикаторе.
+    const { ctrl, provisioning } = makeController([]);
+    const res = makeRes();
+
+    await ctrl.list(user, res as any);
+
+    expect(provisioning.hostAgentsLiveForUser).toHaveBeenCalledWith('u-1');
+  });
+
+  it('словарь заголовка — ровно live и silent', async () => {
+    // Кабинет сверяет значение со списком известных и читает ЛЮБОЕ другое как
+    // «сервер ничего не сказал», то есть ГАСИТ тревогу (productsApi.list).
+    // Подробность вида `silent:clients` — это молчаливое выключение
+    // предупреждения у всех, кто не перезагрузил вкладку.
+    const { ctrl, provisioning } = makeController([]);
+
+    for (const [live, expected] of [
+      [true, 'live'],
+      [false, 'silent'],
+    ] as const) {
+      provisioning.hostAgentsLiveForUser.mockResolvedValueOnce(live);
+      const res = makeRes();
+      await ctrl.list(user, res as any);
+      const [, value] = res.setHeader.mock.calls.find(([h]: any[]) => h === 'X-Host-Agent')!;
+      expect(value).toBe(expected);
+    }
+  });
+
   it('молчащий агент хоста виден в ответе', async () => {
     // Без этого владелец узнаёт о мёртвом агенте только через десять минут и
     // с неверной причиной — «срок заведения истёк».
     const { ctrl, provisioning } = makeController([]);
-    provisioning.hostAgentLive.mockResolvedValueOnce(false);
+    provisioning.hostAgentsLiveForUser.mockResolvedValueOnce(false);
     const res = makeRes();
 
     await ctrl.list(user, res as any);
@@ -457,7 +543,7 @@ describe('ProductsController.list', () => {
     // а «агент молчит», выведенное из СВОЕГО отказа, отправило бы владельца
     // чинить исправную машину.
     const { ctrl, provisioning } = makeController([]);
-    provisioning.hostAgentLive.mockRejectedValueOnce(new Error('нет такой таблицы'));
+    provisioning.hostAgentsLiveForUser.mockRejectedValueOnce(new Error('нет такой таблицы'));
     const res = makeRes();
 
     await expect(ctrl.list(user, res as any)).resolves.not.toThrow();
