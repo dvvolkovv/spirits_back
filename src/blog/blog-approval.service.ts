@@ -32,6 +32,22 @@ export class BlogApprovalService {
     );
   }
 
+  /**
+   * Служебное сообщение владельцу (крон сообщает о сорвавшемся черновике и
+   * напоминает про слот). Отдельный метод, чтобы соседние сервисы не лезли
+   * в приватный tg-клиент этого сервиса.
+   *
+   * Ошибку отправки глотаем осознанно: уведомление — не причина ронять тик
+   * крона, который его отправлял.
+   */
+  async notify(chatId: number, text: string): Promise<void> {
+    try {
+      await this.tg.sendMessage(chatId, text);
+    } catch (e: any) {
+      this.logger.warn(`не смог уведомить ${chatId}: ${e.message}`);
+    }
+  }
+
   /** @returns true, если callback наш и обработан */
   async handleCallback(cb: any): Promise<boolean> {
     const parsed = parseBlogCallback(String(cb?.data || ''));
