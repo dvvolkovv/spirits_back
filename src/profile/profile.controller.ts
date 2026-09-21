@@ -120,6 +120,8 @@ export class ProfileController {
       const owner = await this.identity.findIdentityByEmail(email);
       if (owner && owner.userId !== userId) return;
 
+      if (await this.email.verifyAlreadyOffered(userId, email)) return;
+
       const token = await this.email.generateVerifyToken(userId, email);
       // Ждём всё, кроме самой отправки: проверки и запись в Redis быстрые и
       // локальные, а SMTP — единственное здесь, что умеет висеть секундами и

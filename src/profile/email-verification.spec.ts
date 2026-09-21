@@ -28,6 +28,7 @@ function makeController(over: any = {}) {
   const profileService = { setEmail: jest.fn().mockResolvedValue({ success: true }), ...over.profileService };
   const email = {
     isTempmail: jest.fn().mockReturnValue(false),
+    verifyAlreadyOffered: jest.fn().mockResolvedValue(false),
     generateVerifyToken: jest.fn().mockResolvedValue('vtok'),
     sendVerifyEmail: jest.fn().mockResolvedValue(undefined),
     ...over.email,
@@ -76,6 +77,20 @@ describe('POST /webhook/set-email — почта из формы оплаты', 
     // выглядело бы как приглашение зайти в чужой аккаунт.
     const { ctrl, email } = makeController({
       identity: { findIdentityByEmail: jest.fn().mockResolvedValue({ userId: 'someone-else' }) },
+    });
+    const res = mockRes();
+
+    await ctrl.setEmail({ userId: 'u-1' }, { email: 'buyer@mail.ru' }, res);
+
+    expect(res._status).toBe(200);
+    expect(email.sendVerifyEmail).not.toHaveBeenCalled();
+  });
+
+  it('не шлёт второе письмо, пока прежняя ссылка жива', async () => {
+    // Подтверждение цепляется к оплате, а оплату повторяют: без этого три
+    // покупки подряд до подтверждения дали бы три одинаковых письма.
+    const { ctrl, email } = makeController({
+      email: { verifyAlreadyOffered: jest.fn().mockResolvedValue(true) },
     });
     const res = mockRes();
 
