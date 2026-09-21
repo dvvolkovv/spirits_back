@@ -118,4 +118,26 @@ describe('BlogTopicService.takeNextIdea', () => {
     await svc.takeNextIdea();
     expect(String(pg.query.mock.calls[0][0])).toContain("(rubric = 'news') DESC");
   });
+
+  it('запрошенная перезапись берётся сразу: у неё уже есть текст от прошлой генерации', async () => {
+    const pg = pgMock();
+    pg.query.mockResolvedValueOnce({ rows: [] });
+    const svc = new BlogTopicService(pg as any);
+    await svc.takeNextIdea();
+    const sql = String(pg.query.mock.calls[0][0]).replace(/\s+/g, ' ');
+    // Проверка на title намеренно должна лежать ВНУТРИ ветки status =
+    // 'drafting', а не отдельным условием верхнего уровня — иначе она
+    // зацепит title IS NOT NULL у постов в любом статусе, включая уже
+    // опубликованные (у них title тоже не пустой).
+    expect(sql).toMatch(/status = 'drafting' AND \(title IS NOT NULL OR updated_at/);
+  });
+
+  it('осиротевший черновик без текста по-прежнему ждёт порог', async () => {
+    const pg = pgMock();
+    pg.query.mockResolvedValueOnce({ rows: [] });
+    const svc = new BlogTopicService(pg as any);
+    await svc.takeNextIdea();
+    const sql = String(pg.query.mock.calls[0][0]).replace(/\s+/g, ' ');
+    expect(sql).toMatch(/title IS NOT NULL OR updated_at < now\(\) - \(\$1 \|\| ' minutes'\)::interval\)\)/);
+  });
 });
