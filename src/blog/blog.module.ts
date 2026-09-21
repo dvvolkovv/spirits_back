@@ -1,28 +1,48 @@
 import { Module, forwardRef } from '@nestjs/common';
 import { CommonModule } from '../common/common.module';
+import { MiscModule } from '../misc/misc.module';
 import { TgBotModule } from '../tg-bot/tg-bot.module';
+import { BlogController } from './blog.controller';
 import { BlogSettingsService } from './blog-settings.service';
+import { BlogTopicService } from './blog-topic.service';
+import { BlogGitSource } from './blog-git.source';
+import { BlogRelayClient } from './blog-relay.client';
+import { BlogEditorService } from './blog-editor.service';
+import { BlogImageService } from './blog-image.service';
+import { BlogPublisherService } from './blog-publisher.service';
 import { BlogApprovalService } from './blog-approval.service';
+import { BlogCron } from './blog.cron';
 
 /**
- * Минимальная сборка модуля блога: ровно то, что нужно врезке в tg-бота.
+ * Полная сборка модуля блога.
  *
- * Бот зависит от BlogApprovalService, значит граф модулей должен сходиться уже
- * сейчас, иначе приложение просто не поднимется («доделаем в следующей
- * задаче» для DI не работает). Кроном, контроллером и остальными сервисами
- * блога модуль дополняется отдельно — здесь их намеренно нет, они ещё не
- * написаны.
+ * Кольцо BlogModule ↔ TgBotModule (блогу нужен TgGrammyClient для публикации
+ * и апрува, боту — BlogApprovalService для кнопок под черновиком) разорвано
+ * forwardRef с обеих сторон. Снимешь forwardRef здесь или там — Nest не
+ * соберёт граф и приложение не поднимется.
  *
- * Кольцо BlogModule ↔ TgBotModule (блогу нужен TgGrammyClient, боту —
- * BlogApprovalService) разорвано forwardRef с обеих сторон.
+ * MiscModule — ради MiscService: генерация картинки к посту идёт через него.
  *
- * В app.module.ts модуль намеренно не подключён: в граф он попадает через
- * импорт из TgBotModule, а собственных контроллеров и таймеров у него пока
- * нет — подключать отдельно нечего.
+ * ScheduleModule здесь намеренно НЕ импортируется: `ScheduleModule.forRoot()`
+ * подключён глобально в app.module.ts и через DiscoveryService обходит
+ * провайдеры всего приложения, так что @Cron в BlogCron заводится сам. Это
+ * принятый в проекте способ — SchedulerModule со своими четырьмя кронами
+ * тоже ничего не импортирует.
  */
 @Module({
-  imports: [CommonModule, forwardRef(() => TgBotModule)],
-  providers: [BlogSettingsService, BlogApprovalService],
+  imports: [CommonModule, MiscModule, forwardRef(() => TgBotModule)],
+  controllers: [BlogController],
+  providers: [
+    BlogSettingsService,
+    BlogTopicService,
+    BlogGitSource,
+    BlogRelayClient,
+    BlogEditorService,
+    BlogImageService,
+    BlogPublisherService,
+    BlogApprovalService,
+    BlogCron,
+  ],
   exports: [BlogApprovalService],
 })
 export class BlogModule {}
