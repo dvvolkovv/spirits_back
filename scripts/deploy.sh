@@ -25,6 +25,23 @@
 #                        (работает и для PHASE 3 — проверить лендинг, не катая)
 #   WITH_LANDING=1     — добавить PHASE 3: лендинг linkeon.io (land_linkeon)
 #   LANDING_ONLY=1     — ТОЛЬКО лендинг, без backend/frontend и без my.linkeon.io
+#
+#   SKIP_PRODUCTS_HOST=1   — пропустить PHASE 4 (хостовые части продуктов).
+#                        PHASE 4 входит в выкат ПО УМОЛЧАНИЮ — ровно потому,
+#                        что раньше не входила и молча отставала.
+#   PRODUCTS_HOST_ONLY=1   — ТОЛЬКО PHASE 4 (повтор после того, как агент
+#                        освободился; см. «занятый агент» в шапке фазы).
+#   PRODUCTS_HOST=цель     — ssh-цель машины продуктов (default
+#                        root@139.59.210.42, то же имя переменной, что у
+#                        scripts/product-provision.sh и product-backup-setup.sh).
+#   PRODUCTS_HOST_CHECK_ONLY=1 — фаза только СМОТРИТ и докладывает расхождение,
+#                        на машину не пишет ничего. SMOKE_ONLY=1 включает этот
+#                        режим сам (SMOKE_ONLY означает «не катить»).
+#   PRODUCTS_HOST_WAIT_SECONDS=N — сколько ждать, пока агент хоста освободится
+#                        (default 900). Сторож занятости НЕ продавливается.
+#   PRODUCTS_HOST_WATCH_SECONDS=N — окно наблюдения за опросами живого агента,
+#                        когда переустанавливать нечего (default 20).
+#
 #   NO_ROLLBACK=1      — отключить авто-rollback на проде при smoke failure
 #                        (по умолчанию: если PHASE 2 smoke красный — откат
 #                         back+front к pre-deploy SHA, restart сервисов)
@@ -64,6 +81,18 @@
 #     появится стенд — сюда добавится фаза test;
 #   * nginx отдаёт dist/ ПРЯМО из чекаута ($PROD_LAND_PATH/dist), так что
 #     сборка на месте и есть выкат — отдельного rsync в served-папку нет.
+#
+# PHASE 4 (хостовые части продуктов) — почему НОМЕР 4, а идёт ДО третьей.
+#   Порядок в main: 1 (test) → 2 (prod) → 4 (products host) → 3 (landing).
+#   Номер отражает время появления, а не место в очереди, и переименовывать
+#   PHASE 3 нельзя: на это имя ссылаются LANDING_ONLY, раннбуки и заметки.
+#   Место же выбрано по делу: лендинг — посторонний продукт в чужом
+#   репозитории, и ставить от него в зависимость выкат машины продуктов
+#   значило бы завести НОВЫЙ способ молча не выкатиться (красный смоук
+#   лендинга уводит скрипт в exit 3 и пропустил бы фазу 4 целиком). В обычном
+#   прогоне лендинга нет вовсе, и порядок читается как 1 → 2 → 4.
+#   Подробности «что это, почему после прода и почему её падение не откатывает
+#   my.linkeon.io» — в шапке run_products_host_phase.
 
 set -uo pipefail
 
@@ -85,6 +114,10 @@ LOCAL_FRONT_DIR="${LOCAL_FRONT_DIR:-$(dirname "$_BACK_DIR_DEFAULT")/spirits_fron
 LOCAL_LAND_DIR="${LOCAL_LAND_DIR:-$(dirname "$_BACK_DIR_DEFAULT")/land_linkeon}"
 PROD_LAND_PATH="${PROD_LAND_PATH:-/home/dvolkov/land_linkeon}"
 LAND_BASE_URL="${LAND_BASE_URL:-https://linkeon.io}"
+# Машина продуктов (PHASE 4). Имя переменной то же, что у соседних скриптов
+# (scripts/product-provision.sh, scripts/product-backup-setup.sh), чтобы
+# переопределение работало одинаково везде.
+PRODUCTS_HOST="${PRODUCTS_HOST:-root@139.59.210.42}"
 
 bold()  { printf "\033[1m%s\033[0m\n" "$1"; }
 green() { printf "\033[32m%s\033[0m\n" "$1"; }
@@ -1119,20 +1152,615 @@ run_phase() {
   fi
 }
 
+# ── PHASE 4: хостовые части продуктов ─────────────────────────────────────────
+#
+# Продукты Linkeon (сайты и телеграм-боты клиентов) живут НЕ на my.linkeon.io, а
+# на отдельной машине $PRODUCTS_HOST — контейнер на продукт. Две части системы
+# стоят именно там и до 21.09.2026 в конвейер не входили вовсе:
+#
+#   1. АГЕНТ ХОСТА (linkeon-host-agent) — забирает задания у my.linkeon.io и
+#      исполняет их на машине: заводит продукт, усыпляет, будит. Ставится
+#      scripts/product-host-agent-install.sh;
+#   2. product-vhost — скрипт, которым заводится домен продукта в nginx.
+#      Версионируется в scripts/product-vhost, живёт в /usr/local/bin на хосте.
+#
+# Чем это кончилось в день выката аренды продуктов (20–21.09.2026):
+#
+#   * сервер уехал вперёд, агент остался со старым кодом, получил незнакомый
+#     вид задания (sleep/wake) и ОТКАЗАЛСЯ. Отказ был честный и ДО изменений на
+#     хосте — повезло;
+#   * product-vhost существовал ТОЛЬКО на машине и не версионировался. Живая
+#     редакция не знала флага `--asleep` и приняла его за номер порта, записав
+#     `proxy_pass http://127.0.0.1:--asleep`. Конфиг там пишется ДО `nginx -t`,
+#     поэтому на диске остался битый файл, и `nginx -t` перестал проходить
+#     ЦЕЛИКОМ: перезагрузи кто-нибудь nginx или машину — demo и shop2 (два
+#     боевых продукта) не поднялись бы. Починено руками, причина осталась.
+#
+# Тесты этот класс не ловят и не поймают: в репозитории всё верно, расходится
+# машина. Лечится только выкатом — поэтому фаза входит в деплой ПО УМОЛЧАНИЮ.
+#
+# ── ПОЧЕМУ ПОСЛЕ ПРОДА И ПОСЛЕ ЕГО СМОКА ──────────────────────────────────────
+#
+# Сервер и агент договариваются по ВИДУ ЗАДАНИЯ. Известно измеренное:
+# сервер новее агента даёт ЧЕСТНЫЙ ОТКАЗ до изменений на хосте (так и вышло
+# 20.09). Обратный порядок — агент новее сервера — не проверен ничем, а
+# проверять его на машине с двумя боевыми продуктами незачем. Отсюда оба
+# требования:
+#
+#   * не раньше выката прода — иначе новый агент против старого сервера;
+#   * не раньше ЗЕЛЁНОГО смока прода — красный смок откатывает бэк к
+#     pre-deploy SHA (rollback_phase), и агент, переставленный до смока,
+#     оказался бы ровно в этом непроверенном положении «агент новее сервера»,
+#     причём уже после отката, то есть надолго.
+#
+# Инвариант проверяется не «по построению», а ЯВНО: prod HEAD обязан совпасть с
+# локальным HEAD (ensure_host_agent, шаг 2). Это единственная проверка, которая
+# переживает любой набор флагов — FRONT_ONLY, PRODUCTS_HOST_ONLY, чужой деплой
+# в соседней сессии, — и она же не даёт откатить агента назад, если прод вдруг
+# новее нас.
+#
+# ── ПОЧЕМУ ПАДЕНИЕ ФАЗЫ НЕ ОТКАТЫВАЕТ my.linkeon.io ───────────────────────────
+#
+# К моменту фазы 4 прод выкачен и его смок зелёный. Машина продуктов —
+# ОТДЕЛЬНАЯ, и её недоступность не делает my.linkeon.io хуже: откатывать
+# зелёный прод из-за чужой машины значило бы менять одну аварию на две. Плюс
+# известный случай: 21.09 откат на проде запустился от ОБРЫВА СВЯЗИ у
+# оператора, а не от кода — привязывать к сетевой достижимости ещё и прод
+# нельзя тем более.
+#
+# Поэтому фаза НИКОГДА не зовёт rollback_phase. Но и молчать нельзя — молчание
+# и есть диагноз этой задачи: фаза возвращает ненулевой код, скрипт выходит с
+# exit 4 и НЕ печатает «ALL PHASES GREEN». Прод при этом остаётся выкаченным и
+# рабочим, а оператор видит ровно то, что не доехало, и чем это повторить
+# (PRODUCTS_HOST_ONLY=1).
+
+# sha256 локального файла. На маке нет sha256sum, на серверах нет shasum —
+# deploy.sh запускают и оттуда, и оттуда.
+sha256_local() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# Возвращает 0, если на машине продуктов нечего чинить в product-vhost, иначе 1.
+#
+# ЧТО ЗДЕСЬ ПРОВЕРЯЕТСЯ И ПОЧЕМУ ИМЕННО ТАК.
+#
+# `nginx -t` на хосте гоняется ВСЕГДА, даже когда скрипт совпал до байта. Это
+# та самая проверка, которая 21.09 была красной, и красной она может стать без
+# нашего участия — от чужой правки, от продукта, заведённого руками. Дешевле
+# узнать об этом на выкате, чем на перезагрузке машины.
+#
+# Валидность кандидата доказывается ДО подмены живого файла и тремя разными
+# способами, потому что одного мало:
+#   * `sh -n` — разбирается ли он вообще;
+#   * три пробы с заведомо НЕПОНЯТЫМ аргументом обязаны вернуть ровно 2. Это
+#     ровно тот дефект, что случился: старая редакция непонятый `--asleep`
+#     дотаскивала до `proxy_pass`. Проба ловит его как поведение, а не как
+#     текст;
+#   * снимок /etc/nginx/sites-products ДО и ПОСЛЕ проб. Непонятый аргумент
+#     обязан отбиваться ДО первой записи, и это проверяется прямо: каталог
+#     обязан остаться байт в байт. Если кандидат всё же написал — файл
+#     удаляется, nginx приводится в чувство, установка отменяется.
+# Слаг проб — `deploy-selfcheck`, заведомо не продукт: пиши кандидат в каталог,
+# он не заденет ни demo, ни shop2.
+#
+# Подмена — атомарным mv временного файла ИЗ ТОГО ЖЕ каталога (тот же приём и
+# по той же причине, что в ensure_tma_nginx_block: rename(2) атомарен только в
+# пределах ФС, и читатель видит либо старый файл целиком, либо новый).
+#
+# Чего здесь НАМЕРЕННО нет — машины восстановления уровня ensure_tma_nginx_block.
+# Разница по существу: product-vhost НЕ ЧИТАЕТСЯ nginx'ом. Половинчатая копия
+# на диске не роняет ни один домен сама по себе — она проявится только при
+# следующем заведении/усыплении продукта. Бэкап снимается, sha после подмены
+# сверяется, этого для такой цены достаточно.
+ensure_product_vhost() {
+  local src="$LOCAL_BACK_DIR/scripts/product-vhost"
+  bold "[хост 1/2] product-vhost на $PRODUCTS_HOST"
+
+  if [[ ! -f "$src" ]]; then
+    red "  ✗ в репозитории нет $src — выкатывать нечего"
+    return 1
+  fi
+  local want
+  want=$(sha256_local "$src")
+
+  local state
+  state=$(ssh_remote "
+    set -uo pipefail
+    if $PH_SUDO nginx -t >/dev/null 2>&1; then echo NGINX=ok; else echo NGINX=red; fi
+    if [ -f /usr/local/bin/product-vhost ]; then
+      echo SUM=\$($PH_SUDO sha256sum /usr/local/bin/product-vhost | cut -d' ' -f1)
+    else
+      echo SUM=НЕТ_ФАЙЛА
+    fi
+  ") || { red "  ✗ не смог опросить $PRODUCTS_HOST"; return 1; }
+
+  local nginx_state have
+  nginx_state=$(sed -n 's/^NGINX=//p' <<<"$state" | tail -1)
+  have=$(sed -n 's/^SUM=//p' <<<"$state" | tail -1)
+
+  if [[ "$nginx_state" != "ok" ]]; then
+    red "  ✗ nginx -t на машине продуктов КРАСНЫЙ — там два боевых домена, и"
+    red "    перезагрузка nginx или машины сейчас их не поднимет. Чинить ПЕРВЫМ делом:"
+    red "    ssh $PRODUCTS_HOST 'nginx -t'"
+    return 1
+  fi
+  green "  ✓ nginx -t на машине продуктов зелёный"
+
+  if [[ "$have" == "$want" ]]; then
+    green "  ✓ product-vhost совпадает с репозиторием (sha ${want:0:12}) — ставить нечего"
+    return 0
+  fi
+
+  red "  ! product-vhost на машине РАЗОШЁЛСЯ с репозиторием"
+  echo "      машина: ${have:0:12}   репозиторий: ${want:0:12}"
+  if [[ -n "${PH_CHECK_ONLY:-}" ]]; then
+    red "  ✗ режим проверки (PRODUCTS_HOST_CHECK_ONLY/SMOKE_ONLY) — не пишу ничего"
+    return 1
+  fi
+
+  # base64 — в самом аргументе команды, а не через stdin: ssh_remote ретраит
+  # команду при обрыве связи (код 255), и pipe из локальной переменной на
+  # повторной попытке был бы уже пуст. \r вычищаем — BSD/macOS base64
+  # заворачивает вывод CRLF, и одинокие \r валят GNU `base64 -d` на Ubuntu.
+  local b64
+  b64=$(base64 < "$src" | tr -d '\r\n')
+
+  local out
+  out=$(ssh_remote "
+    set -uo pipefail
+    SLUG=deploy-selfcheck
+    SNAPDIR=/etc/nginx/sites-products
+    LIST=\$(mktemp -d)
+    trap 'rm -rf \"\$LIST\"' EXIT
+    snap()  { $PH_SUDO find \"\$SNAPDIR\" -type f -exec sha256sum {} + 2>/dev/null | sort | sha256sum | cut -d' ' -f1; }
+    files() { $PH_SUDO find \"\$SNAPDIR\" -type f 2>/dev/null | sort; }
+    BEFORE=\$(snap)
+    files > \"\$LIST/before\"
+
+    TMP=\$($PH_SUDO mktemp /usr/local/bin/.product-vhost.XXXXXX) || { echo PVHOST:NO_TMP; exit 0; }
+    printf '%s' '$b64' | base64 -d | $PH_SUDO tee \"\$TMP\" >/dev/null
+    $PH_SUDO chown root:root \"\$TMP\"
+    $PH_SUDO chmod 755 \"\$TMP\"
+
+    if ! $PH_SUDO sh -n \"\$TMP\"; then
+      $PH_SUDO rm -f \"\$TMP\"; echo PVHOST:PARSE_FAIL; exit 0
+    fi
+
+    BAD=''
+    rc=0; $PH_SUDO sh \"\$TMP\"                >/dev/null 2>&1 || rc=\$?
+    [ \"\$rc\" = 2 ] || BAD=\"\$BAD пустой-слаг(rc=\$rc)\"
+    rc=0; $PH_SUDO sh \"\$TMP\" \"\$SLUG\" --sleep >/dev/null 2>&1 || rc=\$?
+    [ \"\$rc\" = 2 ] || BAD=\"\$BAD непонятый-флаг(rc=\$rc)\"
+    rc=0; $PH_SUDO sh \"\$TMP\" -evil 8001     >/dev/null 2>&1 || rc=\$?
+    [ \"\$rc\" = 2 ] || BAD=\"\$BAD слаг-с-дефисом(rc=\$rc)\"
+
+    if [ \"\$(snap)\" != \"\$BEFORE\" ]; then
+      # Кандидат написал конфиг на аргументе, который обязан был отбить. Это и
+      # есть дефект 21.09; подчищаем за ним и приводим nginx в чувство.
+      #
+      # Убираем ВСЁ, что появилось за пробы, а не только \$SLUG.conf: у пробы с
+      # пустым слагом имя конфига получается '.conf', у пробы с ведущим дефисом
+      # — '-evil.conf'. Кандидат, который пишет до разбора аргументов, оставил
+      # бы их все, и уже СЛЕДУЮЩИЙ 'nginx -t' на машине с demo и shop2 стал бы
+      # красным — от нашей же проверки. Список снят ДО проб, удаляем строго
+      # разницу: чужие файлы (те самые demo.conf и shop2.conf) не трогаются в
+      # принципе. Переписать существующий конфиг пробы не могут — имя берётся
+      # из слага, а ни один из трёх слагов не совпадает с продуктом.
+      files > \"\$LIST/after\"
+      comm -13 \"\$LIST/before\" \"\$LIST/after\" | while IFS= read -r f; do
+        [ -n \"\$f\" ] && $PH_SUDO rm -f \"\$f\"
+      done
+      $PH_SUDO nginx -t >/dev/null 2>&1 && $PH_SUDO systemctl reload nginx >/dev/null 2>&1
+      if [ \"\$(snap)\" != \"\$BEFORE\" ]; then
+        BAD=\"\$BAD ПИСАЛ-В-sites-products-И-УБРАТЬ-НЕ-УДАЛОСЬ\"
+      else
+        BAD=\"\$BAD ПИСАЛ-В-sites-products-на-непонятом-аргументе(убрано)\"
+      fi
+    fi
+
+    if [ -n \"\$BAD\" ]; then
+      $PH_SUDO rm -f \"\$TMP\"
+      echo \"  ! пробы кандидата:\$BAD\"
+      echo PVHOST:PROBE_FAIL; exit 0
+    fi
+
+    $PH_SUDO mkdir -p /var/backups/linkeon
+    if [ -f /usr/local/bin/product-vhost ]; then
+      $PH_SUDO cp -p /usr/local/bin/product-vhost \"/var/backups/linkeon/product-vhost.\$(date +%Y%m%d%H%M%S)\" || true
+    fi
+    $PH_SUDO mv \"\$TMP\" /usr/local/bin/product-vhost || { echo PVHOST:MV_FAIL; exit 0; }
+
+    GOT=\$($PH_SUDO sha256sum /usr/local/bin/product-vhost | cut -d' ' -f1)
+    if [ \"\$GOT\" != '$want' ]; then echo \"PVHOST:SUM_MISMATCH \$GOT\"; exit 0; fi
+    if ! $PH_SUDO nginx -t >/dev/null 2>&1; then echo PVHOST:POST_RED; exit 0; fi
+    echo PVHOST:OK
+  ") || { red "  ✗ не смог положить product-vhost на $PRODUCTS_HOST"; return 1; }
+
+  grep -v '^PVHOST:' <<<"$out"
+  case "$(grep -o '^PVHOST:[A-Z_]*' <<<"$out" | tail -1)" in
+    PVHOST:OK)
+      green "  ✓ product-vhost обновлён (sha ${want:0:12}), пробы пройдены, nginx -t зелёный"
+      return 0 ;;
+    PVHOST:PARSE_FAIL)
+      red "  ✗ product-vhost ИЗ РЕПОЗИТОРИЯ не разбирается sh -n — живой файл не тронут"; return 1 ;;
+    PVHOST:PROBE_FAIL)
+      red "  ✗ product-vhost из репозитория не отбивает непонятый аргумент ДО записи — живой файл не тронут"
+      red "    Это ровно дефект 21.09.2026. Чинить scripts/product-vhost, а не машину"; return 1 ;;
+    PVHOST:SUM_MISMATCH)
+      red "  ✗ после подмены sha не совпала — бэкап в /var/backups/linkeon, разбираться руками"; return 1 ;;
+    PVHOST:POST_RED)
+      red "  ✗ nginx -t покраснел ПОСЛЕ подмены product-vhost. Сам скрипт nginx не читает,"
+      red "    значит красным стало что-то ещё — смотреть ssh $PRODUCTS_HOST 'nginx -t'"; return 1 ;;
+    *)
+      red "  ✗ выкат product-vhost не подтвердился — вывод выше"; return 1 ;;
+  esac
+}
+
+# Ждём, пока агент хоста не перестанет брать задания.
+#
+# Сторож занятости в product-host-agent-install.sh НЕ ПРОДАВЛИВАЕТСЯ (FORCE=1
+# здесь запрещён). Он написан ровно против той аварии, которой стоит бояться:
+# переустановка сносит dist из-под живого процесса, а restart убивает его
+# `docker run` вместе с control-group — подчистка не отрабатывает, и на хосте
+# остаётся полусозданный продукт. В конвейере сторож будет срабатывать часто
+# (агент берёт sleep/wake задания пачками), поэтому конвейер не давит его, а
+# ЖДЁТ — это единственный способ и не сломать продукт, и не оставить агента
+# вечно отстающим.
+#
+# Предикат — дословно тот же, что у сторожа (строки `[host] задание ` за
+# последние 10 минут = серверный PROVISION_DEADLINE_MIN). Иначе «я вижу
+# свободно» и «сторож видит занято» разошлись бы, и ожидание кончалось бы
+# отказом установщика.
+#
+# Окно в 10 минут означает, что «свободно» наступает лишь через 10 минут после
+# ПОСЛЕДНЕГО задания. Умолчание 900 с покрывает одно задание с запасом.
+wait_host_agent_idle() {
+  local max="${PRODUCTS_HOST_WAIT_SECONDS:-900}" waited=0 step=30 busy
+  while :; do
+    busy=$(ssh_remote "
+      set -uo pipefail
+      $PH_SUDO journalctl -u linkeon-host-agent --since '-10 min' -o cat 2>/dev/null \
+        | grep -c '\[host\] задание ' || true
+    " | tail -1 | tr -d '[:space:]')
+    [[ "$busy" =~ ^[0-9]+$ ]] || busy=""
+    if [[ "$busy" == "0" ]]; then
+      [[ $waited -gt 0 ]] && green "  ✓ агент освободился через ${waited}s"
+      return 0
+    fi
+    if [[ -z "$busy" ]]; then
+      red "  ✗ не смог прочитать журнал агента — занятость неизвестна, переустанавливать нельзя"
+      return 1
+    fi
+    if (( waited >= max )); then
+      red "  ✗ агент всё ещё берёт задания ($busy шт. за 10 мин) спустя ${waited}s"
+      return 1
+    fi
+    echo "  агент занят ($busy заданий за 10 мин) — жду ${step}s (${waited}/${max}s)"
+    sleep "$step"
+    waited=$(( waited + step ))
+  done
+}
+
+# Возвращает 0, если агент хоста в порядке (или приведён в порядок), иначе 1.
+ensure_host_agent() {
+  bold "[хост 2/2] агент хоста на $PRODUCTS_HOST"
+
+  # 1. Рабочее дерево обязано быть чистым. Установщик раскладывает агента
+  #    RSYNC'ом ИЗ РАБОЧЕГО ДЕРЕВА, а не из коммита: незакоммиченная правка
+  #    уехала бы на машину продуктов, а сервер работал бы по коммиту. docs/
+  #    исключены по той же причине, что и в push_local_repo — туда ничего не
+  #    выкатывается, а параллельные сессии пишут туда спеки прямо сейчас.
+  local dirty
+  dirty="$(git -C "$LOCAL_BACK_DIR" status --porcelain 2>/dev/null | grep -vE '^.. docs/' || true)"
+  if [[ -n "$dirty" ]]; then
+    red "  ✗ в $LOCAL_BACK_DIR есть незакоммиченные правки — агент ставится rsync'ом из рабочего дерева,"
+    red "    они уехали бы на машину продуктов мимо коммита, который крутится на сервере"
+    echo "$dirty" | head -10
+    return 1
+  fi
+
+  # 2. ИНВАРИАНТ ПОРЯДКА, явной проверкой. Сервер обязан быть на том же
+  #    коммите, что и код, который мы сейчас положим агенту. Сервер новее
+  #    агента — измеренный честный отказ; агент новее сервера — не проверено
+  #    ничем. Несовпадение в любую сторону = не трогаем агента.
+  local local_sha prod_sha
+  local_sha=$(git -C "$LOCAL_BACK_DIR" rev-parse HEAD 2>/dev/null | tr -d '[:space:]')
+  prod_sha=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 "$PROD_HOST" \
+               "cd ${PROD_BACK_PATH:-/home/dvolkov/spirits_back} && git rev-parse HEAD" 2>/dev/null \
+             | tail -1 | tr -d '[:space:]')
+  if [[ ! "$prod_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    red "  ✗ не смог прочитать HEAD бэкенда на проде — порядок «сервер раньше агента» не подтверждён, агента не трогаю"
+    return 1
+  fi
+  if [[ "$local_sha" != "$prod_sha" ]]; then
+    red "  ✗ прод на ${prod_sha:0:8}, а агенту достался бы ${local_sha:0:8} — не совпало, агента не трогаю"
+    red "    Сервер новее агента — это честный отказ задания (проверено 20.09.2026)."
+    red "    Агент новее сервера не проверен ничем, и проверять это на машине с боевыми продуктами незачем."
+    red "    Обычно значит: бэкенд в этом прогоне не выкатывался (FRONT_ONLY/SMOKE_ONLY) либо прод уехал чужим деплоем."
+    return 1
+  fi
+  green "  ✓ прод и агент пойдут с одного коммита ${local_sha:0:8}"
+
+  # 3. Нужна ли переустановка. Сравнение — ПО СОДЕРЖИМОМУ (rsync --checksum),
+  #    а не по времени: git checkout переставляет mtime у всего дерева, и
+  #    сравнение по времени объявляло бы «разошлось» после каждого
+  #    переключения ветки. Флаги и исключения — дословно как у установщика,
+  #    иначе «я вижу совпало» и «установщик копирует» разошлись бы.
+  #    Первый символ строки itemize: '.' — менять содержимое не нужно (разница
+  #    только в атрибутах), всё прочее ('>', 'c', '<') — настоящая передача.
+  local pending
+  pending=$(rsync -az --checksum --dry-run --itemize-changes \
+              --exclude node_modules --exclude .git --exclude .env --exclude dist \
+              "$LOCAL_BACK_DIR/product-runner/" "$PRODUCTS_HOST:/opt/linkeon-host-agent/" 2>/dev/null \
+            | grep -vE '^\.' || true)
+
+  # 4. Состояние машины: собран ли dist из ТЕХ ЖЕ исходников и крутится ли
+  #    процесс, запущенный ПОСЛЕ сборки. Совпадения исходников мало: сборка
+  #    могла упасть (тогда dist старше исходников), а переустановка — не дойти
+  #    до restart (тогда процесс старше dist). И то и другое снаружи выглядит
+  #    как «агент стоит свежий».
+  local hs
+  hs=$(ssh_remote "
+    set -uo pipefail
+    D=/opt/linkeon-host-agent
+    echo ACTIVE=\$($PH_SUDO systemctl is-active linkeon-host-agent 2>/dev/null)
+    echo ENABLED=\$($PH_SUDO systemctl is-enabled linkeon-host-agent 2>/dev/null)
+    echo PID=\$($PH_SUDO systemctl show -p MainPID --value linkeon-host-agent 2>/dev/null)
+    echo NRESTARTS=\$($PH_SUDO systemctl show -p NRestarts --value linkeon-host-agent 2>/dev/null)
+    T=\$($PH_SUDO systemctl show -p ActiveEnterTimestamp --value linkeon-host-agent 2>/dev/null)
+    if [ -n \"\$T\" ]; then echo UNIT_START=\$(date -d \"\$T\" +%s 2>/dev/null || echo 0); else echo UNIT_START=0; fi
+    if [ -f \$D/dist/host/index.js ]; then echo DIST=\$($PH_SUDO stat -c %Y \$D/dist/host/index.js); else echo DIST=0; fi
+    echo SRC=\$($PH_SUDO find \$D -path \$D/node_modules -prune -o -path \$D/dist -prune -o -type f -printf '%T@\n' 2>/dev/null \
+                 | sort -n | tail -1 | cut -d. -f1)
+  ") || { red "  ✗ не смог опросить агента на $PRODUCTS_HOST"; return 1; }
+
+  local active enabled pid nrestarts unit_start dist_mtime src_mtime
+  active=$(sed -n 's/^ACTIVE=//p'    <<<"$hs" | tail -1)
+  enabled=$(sed -n 's/^ENABLED=//p'  <<<"$hs" | tail -1)
+  pid=$(sed -n 's/^PID=//p'          <<<"$hs" | tail -1)
+  nrestarts=$(sed -n 's/^NRESTARTS=//p' <<<"$hs" | tail -1)
+  unit_start=$(sed -n 's/^UNIT_START=//p' <<<"$hs" | tail -1)
+  dist_mtime=$(sed -n 's/^DIST=//p'  <<<"$hs" | tail -1)
+  src_mtime=$(sed -n 's/^SRC=//p'    <<<"$hs" | tail -1)
+  [[ "$unit_start" =~ ^[0-9]+$ ]] || unit_start=0
+  [[ "$dist_mtime" =~ ^[0-9]+$ ]] || dist_mtime=0
+  [[ "$src_mtime"  =~ ^[0-9]+$ ]] || src_mtime=0
+
+  # Допуск 300 с: rsync -a привозит на машину ЛОКАЛЬНЫЕ mtime, и секундный
+  # перекос часов между маком и хостом не должен читаться как «сборка
+  # отстала». Настоящее отставание (упавшая сборка) измеряется часами.
+  local reasons=""
+  [[ -n "$pending" ]]                         && reasons="$reasons исходники"
+  (( dist_mtime == 0 ))                       && reasons="$reasons нет-dist"
+  (( dist_mtime > 0 && src_mtime > dist_mtime + 300 )) && reasons="$reasons сборка-старее-исходников"
+  (( dist_mtime > 0 && unit_start > 0 && unit_start + 300 < dist_mtime )) && reasons="$reasons процесс-старее-сборки"
+  [[ "$active" != "active" ]]                 && reasons="$reasons юнит-не-active"
+  # `active` без процесса — не придирка: именно так выглядит юнит, чей
+  # ExecStart указывает в никуда (203/EXEC), пока systemd поднимает его раз в
+  # пять секунд. См. StartLimitBurst в linkeon-host-agent.service.
+  [[ -z "$pid" || "$pid" == "0" ]]            && reasons="$reasons нет-процесса"
+  # NRestarts НЕ повод переустанавливать: единичный давний перезапуск ничего
+  # не говорит о текущем коде, а переустановка ради него — это лишний рестарт
+  # агента на каждом деплое. Но сказать о нём надо: это единственный внешний
+  # признак «агент не может стартовать» (процесс всегда «только что жив»).
+  [[ "$nrestarts" =~ ^[0-9]+$ ]] && (( nrestarts > 0 )) \
+    && bold "  ⚠ агент перезапускался $nrestarts раз с момента старта юнита — посмотреть journalctl не лишнее"
+
+  if [[ -z "$reasons" ]]; then
+    green "  ✓ код агента совпадает с репозиторием, dist собран из него, процесс запущен после сборки"
+    [[ "$enabled" == "enabled" ]] || red "  ! юнит НЕ в автозагрузке (is-enabled=$enabled) — перезагрузку машины не переживёт"
+    host_agent_watch || return 1
+    return 0
+  fi
+
+  red "  ! агент хоста требует переустановки:$reasons"
+  [[ -n "$pending" ]] && { echo "      что разошлось (rsync --checksum):"; head -20 <<<"$pending" | sed 's/^/        /'; }
+  if [[ -n "${PH_CHECK_ONLY:-}" ]]; then
+    red "  ✗ режим проверки (PRODUCTS_HOST_CHECK_ONLY/SMOKE_ONLY) — не переустанавливаю"
+    return 1
+  fi
+
+  # Сироты прошлых выкатов: rsync идёт БЕЗ --delete (с ним на этом проекте уже
+  # сносили .env), поэтому файл, удалённый из репозитория, останется на
+  # машине. Для агента это не поломка — лишний .ts просто соберётся в dist и
+  # никем не будет импортирован, — но знать о нём надо, молчание здесь и есть
+  # то, как сироты зеленят проверку.
+  local orphans
+  orphans=$(ssh_remote "
+    set -uo pipefail
+    cd /opt/linkeon-host-agent 2>/dev/null || exit 0
+    $PH_SUDO find . -path ./node_modules -prune -o -path ./dist -prune -o -path ./.git -prune -o -type f -print 2>/dev/null \
+      | sed 's|^\./||' | sort
+  ") || orphans=""
+  if [[ -n "$orphans" ]]; then
+    local here extra
+    here=$( (cd "$LOCAL_BACK_DIR/product-runner" && find . -path ./node_modules -prune -o -path ./dist -prune -o -type f -print) \
+            | sed 's|^\./||' | sort )
+    extra=$(comm -23 <(printf '%s\n' "$orphans") <(printf '%s\n' "$here") | grep -v '^\.env$' || true)
+    [[ -n "$extra" ]] && { red "  ! на машине есть файлы, которых нет в репозитории (rsync без --delete их не уберёт):"; head -10 <<<"$extra" | sed 's/^/        /'; }
+  fi
+
+  bold "  жду, пока агент освободится (сторож занятости НЕ продавливается)"
+  if ! wait_host_agent_idle; then
+    red "  ✗ агент занят — переустановку НЕ делаю."
+    red "    FORCE=1 здесь запрещён: он сносит dist из-под живого процесса, а restart убивает"
+    red "    его docker run вместе с control-group — подчистка не отработает, и на хосте"
+    red "    останется полусозданный продукт."
+    red "    Прод выкачен и зелёный; агент остался на прежнем коде — это ЧЕСТНЫЙ ОТКАЗ заданий,"
+    red "    а не тихая поломка. Повторить, когда освободится:"
+    red "      PRODUCTS_HOST_ONLY=1 bash $LOCAL_BACK_DIR/scripts/deploy.sh"
+    red "    Посмотреть, чем он занят:  ssh $PRODUCTS_HOST 'journalctl -u linkeon-host-agent -f'"
+    return 1
+  fi
+
+  # Саму установку делает штатный установщик — он уже умеет всё, что здесь
+  # пришлось бы повторить (поиск node/npm, проверка конфига и формы токена,
+  # сборка, подстановка юнита) и ДОКАЗЫВАЕТ, что агент работает, а не просто
+  # active. Второго способа ставить агента заводить нельзя: разошлись бы.
+  #
+  # FORCE НЕ ПЕРЕДАЁМ. Его собственный сторож перепроверит занятость ещё раз,
+  # уже вплотную к первому изменению, — это и закрывает гонку между нашим
+  # «свободно» и его стартом. Отказ на этом месте безвреден: сторож стоит ДО
+  # первого изменения на машине.
+  bold "  ставлю агента: scripts/product-host-agent-install.sh $PRODUCTS_HOST"
+  if ! bash "$LOCAL_BACK_DIR/scripts/product-host-agent-install.sh" "$PRODUCTS_HOST"; then
+    red "  ✗ установка агента не удалась (вывод установщика выше)"
+    red "    Если это отказ сторожа занятости — агент успел взять задание, пока мы шли сюда."
+    red "    Ничего на машине при таком отказе не изменено. Повторить: PRODUCTS_HOST_ONLY=1"
+    return 1
+  fi
+  green "  ✓ агент хоста переустановлен и доказан установщиком"
+  return 0
+}
+
+# Наблюдение за ЖИВЫМ агентом, когда переустанавливать нечего.
+#
+# Агент при исправной работе не печатает НИЧЕГО: строка появляется только на
+# взятом задании и на неудачном опросе. Поэтому «жив» здесь — это не
+# `is-active` (у вечно перезапускающегося процесса он тоже зелёный), а окно
+# тишины при живом PID.
+#
+# Порог не «ноль неудачных опросов»: опрос раз в 3 с, и одиночный 502 от
+# прода — наблюдавшийся транзиент, а не поломка. Красным считается только
+# «почти всё окно мимо»: на 20 с приходится ~6 опросов, 5 и больше неудач
+# означают, что агента не пускают вовсе (чаще всего HOST_TOKEN разошёлся с
+# PRODUCT_HOST_TOKEN бэкенда).
+host_agent_watch() {
+  local win="${PRODUCTS_HOST_WATCH_SECONDS:-20}"
+  echo "      наблюдаю за опросами агента ${win}s…"
+  local since
+  since=$(ssh_remote "date +%s" 2>/dev/null | tail -1 | tr -d '[:space:]')
+  [[ "$since" =~ ^[0-9]+$ ]] || { red "  ✗ не смог снять время на машине продуктов"; return 1; }
+  sleep "$win"
+
+  local obs fails pid_after
+  obs=$(ssh_remote "
+    set -uo pipefail
+    echo PID=\$($PH_SUDO systemctl show -p MainPID --value linkeon-host-agent 2>/dev/null)
+    echo FAILS=\$($PH_SUDO journalctl -u linkeon-host-agent --since \"@$since\" -o cat 2>/dev/null | grep -c 'опрос не удался' || true)
+    # '|| true' здесь ОБЯЗАТЕЛЕН, и это не перестраховка: в блоке действует
+    # pipefail, grep без совпадений возвращает 1, и статус последней команды
+    # становится статусом всего ssh. ИМЕННО ЗДОРОВЫЙ агент не печатает ничего
+    # — то есть без этой заглушки проверка валилась бы «не смог прочитать
+    # журнал» ровно тогда, когда всё в порядке (поймано на живом хосте).
+    $PH_SUDO journalctl -u linkeon-host-agent --since \"@$since\" -o cat 2>/dev/null | grep 'опрос не удался' | tail -3 || true
+  ") || { red "  ✗ не смог прочитать журнал агента"; return 1; }
+
+  pid_after=$(sed -n 's/^PID=//p' <<<"$obs" | tail -1)
+  fails=$(sed -n 's/^FAILS=//p' <<<"$obs" | tail -1)
+  [[ "$fails" =~ ^[0-9]+$ ]] || fails=0
+
+  if [[ -z "$pid_after" || "$pid_after" == "0" ]]; then
+    red "  ✗ у агента нет живого процесса (MainPID=$pid_after)"
+    return 1
+  fi
+  if (( fails >= 5 )); then
+    grep 'опрос не удался' <<<"$obs" | tail -3 | sed 's/^/      /' >&2
+    red "  ✗ агент не может опросить Linkeon: $fails неудач за ${win}s."
+    red "    HTTP 401 здесь означает, что HOST_TOKEN разошёлся с PRODUCT_HOST_TOKEN бэкенда."
+    red "    Снаружи это выглядит как «кнопка Новый продукт не работает»."
+    return 1
+  fi
+  if (( fails > 0 )); then
+    grep 'опрос не удался' <<<"$obs" | tail -3 | sed 's/^/      /'
+    bold "  ⚠ $fails неудачных опросов за ${win}s — похоже на транзиент, но проверить стоит"
+    return 0
+  fi
+  green "  ✓ агент жив (pid $pid_after) и за ${win}s ни одного неудачного опроса"
+  return 0
+}
+
+run_products_host_phase() {
+  ENV_NAME=products-host
+  HOST="$PRODUCTS_HOST"
+  # PATH_EXPORT уходит в `export PATH=$(echo …):…` внутри ssh_remote. Здесь
+  # это те же каталоги, что прописаны в PATH юнита агента: гарантируют, что
+  # product-vhost, nginx и systemctl найдутся.
+  PATH_EXPORT='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+  export ENV_NAME HOST PATH_EXPORT
+
+  # SMOKE_ONLY по смыслу — «не катить, только проверить». Для этой фазы это
+  # означает режим наблюдателя: расхождение находим и докладываем, на машину
+  # не пишем ничего.
+  PH_CHECK_ONLY="${PRODUCTS_HOST_CHECK_ONLY:-${SMOKE_ONLY:-}}"
+
+  # Достижимость — ОТДЕЛЬНОЙ командой с BatchMode=yes, а не первым же
+  # ssh_remote: у ssh_remote BatchMode нет (на проде и тесте ключи заведомо
+  # есть), и без ключа он завис бы на приглашении пароля посреди деплоя.
+  local ruid
+  if ! ruid=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+                  "$PRODUCTS_HOST" 'id -u' 2>/dev/null); then
+    red "  ✗ машина продуктов $PRODUCTS_HOST недоступна по ssh"
+    red "    my.linkeon.io выкачен и зелёный — откатывать его из-за ЧУЖОЙ машины не буду."
+    red "    Не доехали: агент хоста и product-vhost. Пока они отстают, задания либо"
+    red "    отклоняются честно (сервер новее агента), либо не приходят вовсе."
+    red "    Повторить только эту фазу:  PRODUCTS_HOST_ONLY=1 bash $LOCAL_BACK_DIR/scripts/deploy.sh"
+    return 1
+  fi
+  ruid=$(tail -1 <<<"$ruid" | tr -d '[:space:]')
+  # На хост продуктов ходим root'ом, на стенде — обычным пользователем с
+  # NOPASSWD sudo. Логика та же, что в product-host-agent-install.sh.
+  if [[ "$ruid" == "0" ]]; then PH_SUDO=""; else PH_SUDO="sudo -n"; fi
+  export PH_SUDO PH_CHECK_ONLY
+  green "  ✓ $PRODUCTS_HOST доступен (uid=$ruid)${PH_CHECK_ONLY:+, режим проверки — на машину не пишу}"
+
+  # Обе части считаем независимо и докладываем обе: узнать о расхождении в
+  # product-vhost только потому, что агент оказался занят, — это ровно тот
+  # способ молча не выкатиться, ради которого фаза и написана.
+  local fails=0
+  ensure_product_vhost || fails=$(( fails + 1 ))
+  ensure_host_agent    || fails=$(( fails + 1 ))
+
+  if (( fails == 0 )); then
+    green "  ✓ PHASE 4 GREEN — машина продуктов синхронна с репозиторием"
+    return 0
+  fi
+  red "  ✗ PHASE 4 FAILED — $fails из 2 частей не сошлись (подробности выше)"
+  red "    my.linkeon.io НЕ откатывается: он выкачен, зелёный и к этой машине отношения не имеет"
+  return 1
+}
+
 # ── main ──
-if [[ -z "${PROD_ONLY:-}" && -z "${LANDING_ONLY:-}" ]]; then
+if [[ -z "${PROD_ONLY:-}" && -z "${LANDING_ONLY:-}" && -z "${PRODUCTS_HOST_ONLY:-}" ]]; then
   bold "════════════ PHASE 1: TEST ════════════"
   run_phase test || { red "TEST phase failed — НЕ КАЧУ НА ПРОД"; exit 1; }
 fi
 
-if [[ -z "${TEST_ONLY:-}" && -z "${LANDING_ONLY:-}" ]]; then
+if [[ -z "${TEST_ONLY:-}" && -z "${LANDING_ONLY:-}" && -z "${PRODUCTS_HOST_ONLY:-}" ]]; then
   bold "════════════ PHASE 2: PROD ════════════"
   run_phase prod || exit 2
+fi
+
+# PHASE 4 стоит ЗДЕСЬ, между второй и третьей, и это не опечатка — см. шапку
+# файла: номер отражает время появления, а место выбрано так, чтобы выкат
+# машины продуктов не зависел от постороннего лендинга (его красный смок
+# уводит скрипт в exit 3 и пропустил бы эту фазу молча).
+#
+# TEST_ONLY/LANDING_ONLY исключены: в этих прогонах прод не выкатывался, а
+# ставить агента новее сервера нельзя (ensure_host_agent всё равно отказал бы
+# на сверке SHA — здесь мы просто не тратим на это ssh).
+if [[ -z "${TEST_ONLY:-}" && -z "${LANDING_ONLY:-}" && -z "${SKIP_PRODUCTS_HOST:-}" ]]; then
+  bold "════════════ PHASE 4: PRODUCTS HOST ════════════"
+  # Ненулевой код НЕ откатывает my.linkeon.io и не отменяет уже сделанное:
+  # прод к этому моменту выкачен и зелёный, а лежит СОСЕДНЯЯ машина. Падение
+  # лишь снимает «ALL PHASES GREEN» и называет, что именно не доехало.
+  run_products_host_phase || PRODUCTS_HOST_RC=4
 fi
 
 if [[ -n "${LANDING_ONLY:-}" || -n "${WITH_LANDING:-}" ]]; then
   bold "════════════ PHASE 3: LANDING ════════════"
   run_landing_phase || exit 3
+fi
+
+# Код фазы 4 отдаём в самом конце, а не сразу: лендинг (если его просили) —
+# посторонний продукт, и недоступная машина продуктов не повод его не катить.
+if [[ -n "${PRODUCTS_HOST_RC:-}" ]]; then
+  red "════════════════════════════════════════════════════════════════════"
+  red "  ✗ PHASE 4 (PRODUCTS HOST) не прошла — остальные фазы выкачены"
+  red "    Повторить только её:  PRODUCTS_HOST_ONLY=1 bash $LOCAL_BACK_DIR/scripts/deploy.sh"
+  red "════════════════════════════════════════════════════════════════════"
+  exit "$PRODUCTS_HOST_RC"
 fi
 
 green "════════════════════════════════════════════════════════════════════"
