@@ -33,6 +33,24 @@ export interface BacklogComment {
 const ALLOWED_STATUSES: BacklogStatus[] = ['proposed', 'approved', 'in_progress', 'waiting', 'done', 'rejected'];
 const ALLOWED_COMPLEXITY: BacklogComplexity[] = ['low', 'medium', 'high'];
 
+/**
+ * Тема для блога рождается ровно на переходе в done — не на каждом
+ * сохранении итема, который уже done, иначе канал получит один и тот же
+ * анонс столько раз, сколько владелец правил карточку.
+ */
+export function shouldCreateBlogTopic(prev: string | undefined, next: string): boolean {
+  return !!prev && prev !== 'done' && next === 'done';
+}
+
+export function blogTopicFromBacklog(id: string, title: string, analysisMd: string) {
+  const analysis = String(analysisMd || '').trim().slice(0, 500);
+  return {
+    sourceRef: `backlog:${id}`,
+    topicKey: String(title || '').toLowerCase().replace(/[^\p{L}\p{N}\s-]/gu, '').trim().replace(/\s+/g, '-'),
+    topicHint: analysis ? `${title}\n\n${analysis}` : title,
+  };
+}
+
 @Injectable()
 export class BacklogService implements OnModuleInit {
   private readonly logger = new Logger(BacklogService.name);
@@ -293,6 +311,31 @@ export class BacklogService implements OnModuleInit {
         this.logger.log(`Notified ticket ${prev.from_ticket_id} of backlog ${id} completion`);
       } catch (e: any) {
         this.logger.warn(`Failed to notify ticket ${prev.from_ticket_id}: ${e.message}`);
+      }
+    }
+
+    // Новая тема для блога. Пишем напрямую в blog_post по той же причине,
+    // по которой выше пишем прямо в support_messages: модульная зависимость
+    // backlog → blog здесь лишняя.
+    //
+    // WHERE NOT EXISTS по source_ref — защита от повторного анонса, если итем
+    // вернут в работу и снова закроют. Обычная дедупликация по topic_key тут
+    // не сработает: у неё окно 90 дней, а бэклог-итем может пережить и больше.
+    if (shouldCreateBlogTopic(prev?.status, updated.status)) {
+      try {
+        const topic = blogTopicFromBacklog(id, updated.title, updated.analysis_md);
+        await this.pg.query(
+          `INSERT INTO blog_post (rubric, source, source_ref, topic_key, topic_hint, status)
+           SELECT 'news', 'backlog', $1, $2, $3, 'idea'
+            WHERE NOT EXISTS (
+              SELECT 1 FROM blog_post WHERE source_ref = $1
+            )`,
+          [topic.sourceRef, topic.topicKey, topic.topicHint],
+        );
+        this.logger.log(`Blog topic queued for backlog ${id}`);
+      } catch (e: any) {
+        // Блог не должен ронять закрытие задачи в бэклоге.
+        this.logger.warn(`Failed to queue blog topic for backlog ${id}: ${e.message}`);
       }
     }
 
