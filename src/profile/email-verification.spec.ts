@@ -114,7 +114,10 @@ describe('POST /webhook/set-email — почта из формы оплаты', 
     expect(profileService.setEmail).toHaveBeenCalled();
   });
 
-  it('одноразовая почта не сохраняется и письма не получает', async () => {
+  it('одноразовая почта сохраняется для чека, но входом не предлагается', async () => {
+    // Способ входа, который завтра исчезнет, — это запертый аккаунт. Но рвать
+    // из-за этого ОПЛАТУ нельзя: раньше такие адреса проходили, и отказ в
+    // продаже — решение владельца, а не побочный эффект правки.
     const { ctrl, profileService, email } = makeController({
       email: { isTempmail: jest.fn().mockReturnValue(true) },
     });
@@ -122,8 +125,8 @@ describe('POST /webhook/set-email — почта из формы оплаты', 
 
     await ctrl.setEmail({ userId: 'u-1' }, { email: 'x@tempmail.dev' }, res);
 
-    expect(res._status).toBe(400);
-    expect(profileService.setEmail).not.toHaveBeenCalled();
+    expect(res._status).toBe(200);
+    expect(profileService.setEmail).toHaveBeenCalled();
     expect(email.sendVerifyEmail).not.toHaveBeenCalled();
   });
 

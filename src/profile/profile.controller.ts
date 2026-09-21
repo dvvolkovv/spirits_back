@@ -93,9 +93,6 @@ export class ProfileController {
     if (!normalized || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalized)) {
       return res.status(400).json({ error: 'invalid email' });
     }
-    if (this.email?.isTempmail(normalized)) {
-      return res.status(400).json({ error: 'tempmail_blocked' });
-    }
 
     const result = await this.profileService.setEmail(user.userId, raw);
     await this.offerEmailAsLogin(user.userId, normalized);
@@ -119,6 +116,12 @@ export class ProfileController {
 
       const owner = await this.identity.findIdentityByEmail(email);
       if (owner && owner.userId !== userId) return;
+
+      // Одноразовый ящик сохраняем (чек ему всё равно нужен), но входом не
+      // предлагаем: способ входа, который завтра исчезнет, — это запертый
+      // аккаунт. Покупку при этом НЕ рвём: раньше такие адреса проходили, и
+      // отказать в продаже — решение владельца, а не побочный эффект правки.
+      if (this.email.isTempmail(email)) return;
 
       if (await this.email.verifyAlreadyOffered(userId, email)) return;
 
