@@ -479,8 +479,18 @@ describe('buildCaption', () => {
   it('заголовок без тела не падает', () => {
     expect(buildCaption('Только заголовок', '')).toBe('Только заголовок');
   });
+
+  it('реалистичная проза обрезается по концу предложения, а не посреди фразы', () => {
+    const body = Array(30).fill('Человек приходит с конкретной задачей и получает разбор по шагам.').join(' ');
+    const caption = buildCaption('Заголовок', body);
+    expect(caption.length).toBeLessThanOrEqual(CAPTION_LIMIT);
+    expect(caption.endsWith('.')).toBe(true);
+    expect(caption.endsWith('…')).toBe(false);
+  });
 });
 ```
+
+Последний тест обязателен. Без него проходит и реализация, которая границу предложения вообще не ищет, — она режет по последнему пробелу и обрывает обычный пост на середине фразы.
 
 - [ ] **Step 2: Запустить тест и убедиться, что падает**
 
@@ -507,13 +517,18 @@ export function buildCaption(title: string, body: string): string {
   const cut = full.slice(0, CAPTION_LIMIT);
 
   // Сначала пробуем закончить на границе предложения — обрыв на середине
-  // мысли читается как баг, а не как тизер.
+  // мысли читается как баг, а не как тизер. Порога «не ближе половины
+  // лимита» здесь быть не должно: если весь остаток текста — один
+  // неразрывный кусок, единственная осмысленная точка обрыва может стоять
+  // и на двадцатом символе.
   const sentenceEnd = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('! '), cut.lastIndexOf('? '));
-  if (sentenceEnd > CAPTION_LIMIT * 0.5) return cut.slice(0, sentenceEnd + 1).trim();
+  if (sentenceEnd > 0) return cut.slice(0, sentenceEnd + 1).trim();
 
+  // Границы предложения нет вовсе — режем по слову. Многоточие не нужно,
+  // если обрез и так пришёлся на терминальную пунктуацию.
   const wordEnd = cut.lastIndexOf(' ');
-  const safe = wordEnd > 0 ? cut.slice(0, wordEnd) : cut.slice(0, CAPTION_LIMIT - 1);
-  return `${safe.trim()}…`;
+  const safe = (wordEnd > 0 ? cut.slice(0, wordEnd) : cut.slice(0, CAPTION_LIMIT - 1)).trim();
+  return /[.!?]$/.test(safe) ? safe : `${safe}…`;
 }
 ```
 
