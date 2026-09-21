@@ -55,6 +55,19 @@ describe('BlogApprovalService.handleCallback', () => {
     expect(pg.query.mock.calls[1][0]).toContain("status = 'drafting'");
   });
 
+  it('переход, запрещённый машиной состояний, не пишется в базу', async () => {
+    const pg = { query: jest.fn() };
+    // Пост в approved: кнопка «Опубликовать» из старого сообщения пытается
+    // увести его в approved повторно — машина такого перехода не знает.
+    pg.query.mockResolvedValueOnce({ rows: [rawRow({ status: 'approved' })] });
+    const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+
+    await svc.handleCallback({ id: 'cb1', data: 'blog:ok:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
+
+    expect(pg.query).toHaveBeenCalledTimes(1);   // только чтение
+  });
+
   it('чужой callback игнорируется полностью', async () => {
     const pg = { query: jest.fn() };
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };

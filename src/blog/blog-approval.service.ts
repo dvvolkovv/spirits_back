@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { BlogSettingsService } from './blog-settings.service';
-import { BlogPost, rowToPost } from './blog.types';
+import { BlogPost, BlogStatus, canTransition, rowToPost } from './blog.types';
 import { parseBlogCallback, buildBlogKeyboard } from './blog-callback';
 import { buildCaption } from './blog-text';
 import { nextSlotAfter } from './blog-slots';
@@ -44,9 +44,18 @@ export class BlogApprovalService {
     }
     const post = rowToPost(r.rows[0]);
 
-    // Вторая панель управления — админка. Пост мог уехать дальше, пока
-    // сообщение висело в личке; тогда кнопка не делает ничего.
-    if (post.status !== 'pending_review') {
+    // Целевой статус для каждой кнопки — фиксированный, а не то, что решает
+    // текущий код. Легальность перехода из фактического статуса поста
+    // (который мог уехать дальше, пока сообщение висело в личке — вторая
+    // панель управления, админка, тоже пишет в этот же post) проверяет
+    // единая машина состояний, а не повторная ручная проверка здесь.
+    const TARGET_STATUS: Record<typeof parsed.action, BlogStatus> = {
+      ok: 'approved',
+      redo: 'drafting',
+      no: 'rejected',
+    };
+    const target = TARGET_STATUS[parsed.action];
+    if (!canTransition(post.status, target)) {
       await this.tg.answerCallbackQuery(cb.id, { text: `Пост уже обработан: ${post.status}` });
       return true;
     }
