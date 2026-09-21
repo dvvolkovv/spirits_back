@@ -37,7 +37,7 @@ function pgWithProfileEmailOwner(opts: { loginable?: boolean } = {}) {
     if (/FROM user_identities WHERE provider/i.test(sql)) return { rows: [] };
     if (/FROM user_identities WHERE email/i.test(sql)) return { rows: [] };
     // поиск кандидата по профильной почте
-    if (/ai_profiles_consolidated/i.test(sql) && /link_candidate/i.test(sql)) {
+    if (/JOIN ai_profiles_consolidated/i.test(sql)) {
       return loginable
         ? { rows: [{ internal_id: '79275527425', primary_phone: '79275527425' }] }
         : { rows: [] };
@@ -122,7 +122,7 @@ describe('resolveOrCreate — кандидат на привязку вмест�
 
     expect(r).toMatchObject({ status: 'ok', userId: 'u-1', isNew: false });
     // Кандидата даже не искали — вход состоялся на первом шаге.
-    expect(pg.queries.some((q) => /link_candidate/i.test(q.sql))).toBe(false);
+    expect(pg.queries.some((q) => /JOIN ai_profiles_consolidated/i.test(q.sql))).toBe(false);
   });
 
   it('телефонный вход кандидата не ищет', async () => {
@@ -132,7 +132,7 @@ describe('resolveOrCreate — кандидат на привязку вмест�
     const r = await svc.resolveOrCreate('phone', { phone: '79991112233' });
 
     expect(r.status).toBe('ok');
-    expect(pg.queries.some((q) => /link_candidate/i.test(q.sql))).toBe(false);
+    expect(pg.queries.some((q) => /JOIN ai_profiles_consolidated/i.test(q.sql))).toBe(false);
   });
 
   it('telegram кандидата не ищет — почты у него нет', async () => {
@@ -142,7 +142,7 @@ describe('resolveOrCreate — кандидат на привязку вмест�
     const r = await svc.resolveOrCreate('telegram', { sub: '42' });
 
     expect(r.status).toBe('ok');
-    expect(pg.queries.some((q) => /link_candidate/i.test(q.sql))).toBe(false);
+    expect(pg.queries.some((q) => /JOIN ai_profiles_consolidated/i.test(q.sql))).toBe(false);
   });
 
   it('неподтверждённая почта провайдера кандидата не ищет', async () => {
@@ -158,7 +158,7 @@ describe('resolveOrCreate — кандидат на привязку вмест�
     });
 
     expect(r.status).toBe('ok');
-    expect(pg.queries.some((q) => /link_candidate/i.test(q.sql))).toBe(false);
+    expect(pg.queries.some((q) => /JOIN ai_profiles_consolidated/i.test(q.sql))).toBe(false);
   });
 });
 
@@ -180,8 +180,11 @@ describe('mergeAccounts — баланс и история не должны с�
 
     const addCalls = calls.filter((c) => /add_user_tokens/i.test(c.sql));
     expect(addCalls).toHaveLength(2);
-    expect(addCalls[0].params).toEqual(expect.arrayContaining(['orphan-1', -8897]));
-    expect(addCalls[1].params).toEqual(expect.arrayContaining(['target-1', 8897]));
+    // Целевой аккаунт пополняется ПЕРВЫМ: настоящей транзакции здесь нет
+    // (BEGIN/COMMIT через пул уезжают на разные соединения), поэтому обрыв
+    // между шагами должен задваивать баланс, а не сжигать его.
+    expect(addCalls[0].params).toEqual(expect.arrayContaining(['target-1', 8897]));
+    expect(addCalls[1].params).toEqual(expect.arrayContaining(['orphan-1', -8897]));
 
     // Порядок важен: пометить deleted раньше переноса — потерять баланс.
     const deletedAt = calls.findIndex((c) => /state = 'deleted'/i.test(c.sql));

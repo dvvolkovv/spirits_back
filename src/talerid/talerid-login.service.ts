@@ -45,6 +45,16 @@ interface LoginState {
  * уже зарегистрированы у провайдера, и заводить рядом второго значило бы
  * держать две регистрации ради одного и того же обмена.
  */
+/**
+ * Вход мог не завершиться выдачей токенов: почта из Taler ID бывает указана
+ * в профиле аккаунта, куда человек ходит по номеру. Тогда вместо handoff
+ * возвращается билет на привязку — см. IdentityService.issueLinkTicket.
+ */
+export type CompleteLoginResult =
+  | { kind: 'handoff'; handoff: string }
+  | { kind: 'link_required'; ticket: string; phoneHint: string }
+  | null;
+
 @Injectable()
 export class TalerIdLoginService {
   private readonly logger = new Logger(TalerIdLoginService.name);
@@ -118,7 +128,7 @@ export class TalerIdLoginService {
    * передачи сессии. Возвращает null, если что-то не сошлось — контроллер
    * отправит человека обратно с понятной пометкой.
    */
-  async completeLogin(state: string, code: string): Promise<string | null> {
+  async completeLogin(state: string, code: string): Promise<CompleteLoginResult> {
     const key = TalerIdLoginService.KEY(state);
     const raw = await this.redis.get(key);
     if (!raw) {
@@ -144,7 +154,15 @@ export class TalerIdLoginService {
       return null;
     }
 
-    const { userId } = await this.identity.resolveOrCreate('talerid', userInfo);
+    const resolved = await this.identity.resolveOrCreate('talerid', userInfo);
+    if (resolved.status === 'link_required') {
+      // Почта из Taler ID уже указана в профиле аккаунта с телефонным входом.
+      // Заводить второй аккаунт нельзя — отдаём билет, экран /auth/link
+      // предложит войти по номеру и привязать либо создать новый.
+      const ticket = await this.identity.issueLinkTicket('talerid', userInfo, resolved.candidateUserId);
+      return { kind: 'link_required' as const, ticket, phoneHint: resolved.phoneHint };
+    }
+    const { userId } = resolved;
 
     const handoff = genState();
     await this.redis.set(
@@ -156,7 +174,7 @@ export class TalerIdLoginService {
       TalerIdLoginService.HANDOFF_TTL_S,
     );
     this.logger.log(`talerid login: user ${userId} signed in`);
-    return handoff;
+    return { kind: 'handoff' as const, handoff };
   }
 
   /** Обменять одноразовый код на токены. Второй раз тот же код не сработает. */
