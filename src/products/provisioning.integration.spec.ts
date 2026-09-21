@@ -1,8 +1,9 @@
-import { ConflictException, NotFoundException } from '@nestjs/common';
+import { ConflictException, Logger, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
+import { HostGuard } from './host.guard';
 import { MIGRATIONS, ProductsService } from './products.service';
 import { ProvisioningService } from './provisioning.service';
 import { RentService } from './rent.service';
@@ -3078,6 +3079,115 @@ maybe('провижининг против живого Postgres', () => {
       await pool.query(`UPDATE products SET host_id = 'a' WHERE id = $1`, [p.id]);
 
       await expect(pool.query(`DELETE FROM product_hosts WHERE id = 'a'`)).rejects.toThrow(/host_id/);
+    });
+
+    // ───────────────────── гвард агента (задача 2) ─────────────────────
+
+    describe('гвард агента', () => {
+      /**
+       * Гвард против ЖИВОЙ базы, а не против заглушки. Заглушка в
+       * host.guard.spec.ts SQL не исполняет: опечатка в имени колонки,
+       * скалярный подзапрос вместо соединения, `count(*)`, приезжающий строкой,
+       * — всё это проходит там зелёным. Здесь запрос исполняет PostgreSQL.
+       */
+      const guard = () => new HostGuard(pg as any);
+      const ctx = (req: unknown) => ({ switchToHttp: () => ({ getRequest: () => req }) }) as any;
+      const asks = (token: string): any => ({ headers: { authorization: `Bearer ${token}` } });
+
+      /**
+       * Токены машин. Берутся как sha256 от строки — не ради криптографии, а
+       * ради ФОРМЫ: ровно 64 печатных ASCII-символа, то есть в точности то, что
+       * даёт `openssl rand -hex 32` и что гвард обязан принять. Кириллическую
+       * строку он отобьёт по форме, и весь набор стал бы проверять не то.
+       */
+      const OWN_TOKEN = sha('машина владельца');
+      const CLIENTS_TOKEN = sha('машина клиентов');
+
+      let logged: string[];
+
+      beforeEach(() => {
+        logged = [];
+        const collect = (m: any) => {
+          logged.push(String(m));
+        };
+        jest.spyOn(Logger.prototype, 'warn').mockImplementation(collect);
+        jest.spyOn(Logger.prototype, 'error').mockImplementation(collect);
+      });
+
+      afterEach(() => jest.restoreAllMocks());
+
+      it('45. токен превращается в метку ТОЙ машины, которой он выдан', async () => {
+        // Ради этого написан весь кусок: сегодня токен один на всех, и задание
+        // достаётся тому, кто первым спросил.
+        expect(OWN_TOKEN).toMatch(/^[0-9a-f]{64}$/);
+        await addHost({ id: 'own', hash: sha(OWN_TOKEN), ip: '139.59.210.42', audience: 'own' });
+        await addHost({ id: 'clients', hash: sha(CLIENTS_TOKEN) });
+        const mine = asks(OWN_TOKEN);
+        const theirs = asks(CLIENTS_TOKEN);
+
+        await expect(guard().canActivate(ctx(mine))).resolves.toBe(true);
+        await expect(guard().canActivate(ctx(theirs))).resolves.toBe(true);
+
+        expect(mine.hostId).toBe('own');
+        expect(theirs.hostId).toBe('clients');
+      });
+
+      it('45а. хеш гварда сходится с хешем, который положила в реестр миграция', async () => {
+        // СТЫК ДВУХ ЗАДАЧ, и разойтись ему проще всего. Хеш машины own считает
+        // Node в products.service (pgcrypto на проде нет), а сверяет его гвард —
+        // другим вызовом в другом файле. Разная кодировка (utf8 против latin1),
+        // разный регистр hex, лишний trim — и реестр правильный, гвард
+        // исправный, а машина владельца молча не получает ни одного задания.
+        await migrate(TOKEN);
+        const req = asks(TOKEN);
+
+        await expect(guard().canActivate(ctx(req))).resolves.toBe(true);
+
+        expect(req.hostId).toBe('own');
+      });
+
+      it('45б. чужой токен — отказ, метки нет, в журнале строка', async () => {
+        // Строка обязательна: снаружи такой агент выглядит исправным — юнит
+        // active, перезапусков нет, ошибок нет (сценарий 21д).
+        await addHost({ id: 'own', hash: sha(OWN_TOKEN), audience: 'own' });
+        const req = asks(CLIENTS_TOKEN);
+
+        await expect(guard().canActivate(ctx(req))).rejects.toThrow(UnauthorizedException);
+
+        expect(req.hostId).toBeUndefined();
+        expect(logged).toHaveLength(1);
+        expect(logged[0]).toMatch(/неизвестн/i);
+        expect(logged[0]).not.toContain(CLIENTS_TOKEN);
+      });
+
+      it('45в. пустой реестр докладывает о себе отдельно: счётчик едет из базы СТРОКОЙ', async () => {
+        // count(*) приезжает из node-pg строкой — bigint не влезает в number.
+        // Сравнение `total === 0` было бы ложным всегда, и пустой реестр
+        // выглядел бы как чужой токен: оператор ушёл бы чинить конфиг машины,
+        // который в порядке. Состояние достижимое — см. 40в.
+        expect(await hosts()).toEqual([]);
+
+        await expect(guard().canActivate(ctx(asks(OWN_TOKEN)))).rejects.toThrow(
+          /host registry not configured/,
+        );
+
+        expect(logged).toHaveLength(1);
+        expect(logged[0]).toMatch(/реестр машин пуст/);
+      });
+
+      it('45г. машина, закрытая для НОВЫХ продуктов, свои задания забирать не перестаёт', async () => {
+        // accepts_new — про размещение нового продукта, а не про вход. Машина,
+        // выведенная из набора под новые, продолжает обслуживать уже стоящие на
+        // ней: их надо будить, усыплять и править. Гвард, дописавший себе
+        // `AND accepts_new`, остановил бы это молча — и заметили бы по
+        // недосчитанной выручке.
+        await addHost({ id: 'full', hash: sha(OWN_TOKEN), acceptsNew: false });
+        const req = asks(OWN_TOKEN);
+
+        await expect(guard().canActivate(ctx(req))).resolves.toBe(true);
+
+        expect(req.hostId).toBe('full');
+      });
     });
   });
 });
