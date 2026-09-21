@@ -73,7 +73,9 @@ describe('TalerIdLoginService', () => {
     });
 
     const { authorizeUrl } = await svc.startLogin();
-    const handoff = await svc.completeLogin(stateFrom(authorizeUrl), 'code-xyz');
+    const result = await svc.completeLogin(stateFrom(authorizeUrl), 'code-xyz');
+    expect(result?.kind).toBe('handoff');
+    const handoff = result?.kind === 'handoff' ? result.handoff : null;
     expect(handoff).toBeTruthy();
 
     expect(seen).toHaveLength(1);
@@ -90,7 +92,8 @@ describe('TalerIdLoginService', () => {
   it('код передачи срабатывает один раз', async () => {
     const { svc } = makeService();
     const { authorizeUrl } = await svc.startLogin();
-    const handoff = await svc.completeLogin(stateFrom(authorizeUrl), 'code-xyz');
+    const result = await svc.completeLogin(stateFrom(authorizeUrl), 'code-xyz');
+    const handoff = result?.kind === 'handoff' ? result.handoff : null;
 
     expect(await svc.redeemHandoff(handoff!)).toBeTruthy();
     // Повторный обмен не должен выдавать вторую сессию.

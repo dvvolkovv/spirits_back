@@ -51,7 +51,7 @@ describe('POST /webhook/tma/auth', () => {
   });
 
   it('с intent=signup заводит аккаунт и отдаёт пару токенов', async () => {
-    identity.resolveOrCreate.mockResolvedValue({ userId: 'u-new', isNew: true, mergedExisting: false });
+    identity.resolveOrCreate.mockResolvedValue({ status: 'ok', userId: 'u-new', isNew: true, mergedExisting: false });
     const res = mockRes();
     await ctrl.auth({ initData: freshInitData(), intent: 'signup' }, res);
     expect(identity.resolveOrCreate).toHaveBeenCalledWith('telegram', { sub: '42' });

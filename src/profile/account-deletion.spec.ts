@@ -137,13 +137,23 @@ describe('удаление аккаунта', () => {
   let identity: IdentityService;
   let neo4j: any;
 
+/**
+ * resolveOrCreate отдаёт union: у него есть вариант link_required, когда
+ * почта указана в профиле чужого аккаунта. В этих сценариях база пустая,
+ * кандидата взяться неоткуда — но разворачивать результат надо явно.
+ */
+function ok<T extends { status: string }>(r: T): Extract<T, { status: 'ok' }> {
+  if (r.status !== 'ok') throw new Error(`ожидался ok, получен ${r.status}`);
+  return r as Extract<T, { status: 'ok' }>;
+}
+
   beforeEach(() => {
     db = new FakeDb();
     ({ profile, identity, neo4j } = makeServices(db));
   });
 
   it('обрывает связки входа — по старой почте аккаунт больше не находится', async () => {
-    const { userId } = await identity.resolveOrCreate('email', { email: 'gone@example.com' });
+    const { userId } = ok(await identity.resolveOrCreate('email', { email: 'gone@example.com' }));
     expect(await identity.findIdentityByEmail('gone@example.com')).toEqual({ userId });
 
     await profile.deleteProfile(userId);
@@ -152,7 +162,7 @@ describe('удаление аккаунта', () => {
   });
 
   it('гасит пароль — старый больше не годится', async () => {
-    const { userId } = await identity.resolveOrCreate('email', { email: 'pw@example.com' });
+    const { userId } = ok(await identity.resolveOrCreate('email', { email: 'pw@example.com' }));
     await identity.setUserPasswordHash(userId, 'хеш-старого-пароля');
     expect(await identity.getUserPasswordHash(userId)).toBe('хеш-старого-пароля');
 
@@ -162,16 +172,16 @@ describe('удаление аккаунта', () => {
   });
 
   it('стирает граф профиля — иначе личные данные переживают удаление', async () => {
-    const { userId } = await identity.resolveOrCreate('email', { email: 'graph@example.com' });
+    const { userId } = ok(await identity.resolveOrCreate('email', { email: 'graph@example.com' }));
     await profile.deleteProfile(userId);
     expect(neo4j.deleteUserGraph).toHaveBeenCalledWith(userId);
   });
 
   it('повторный вход тем же провайдером НЕ возвращает прежний аккаунт', async () => {
-    const first = await identity.resolveOrCreate('email', { email: 'again@example.com' });
+    const first = ok(await identity.resolveOrCreate('email', { email: 'again@example.com' }));
     await profile.deleteProfile(first.userId);
 
-    const second = await identity.resolveOrCreate('email', { email: 'again@example.com' });
+    const second = ok(await identity.resolveOrCreate('email', { email: 'again@example.com' }));
 
     expect(second.isNew).toBe(true);
     expect(second.userId).not.toBe(first.userId);
@@ -181,11 +191,11 @@ describe('удаление аккаунта', () => {
     // У телефонного входа internal_id — сам номер, и перерегистрация
     // неизбежно попадает в ту же строку. Она обязана стать активной, иначе
     // человек войдёт в аккаунт с состоянием deleted.
-    const first = await identity.resolveOrCreate('phone', { phone: '79990000001' });
+    const first = ok(await identity.resolveOrCreate('phone', { phone: '79990000001' }));
     await profile.deleteProfile(first.userId);
     expect(db.users.get(first.userId).state).toBe('deleted');
 
-    const second = await identity.resolveOrCreate('phone', { phone: '79990000001' });
+    const second = ok(await identity.resolveOrCreate('phone', { phone: '79990000001' }));
 
     expect(second.userId).toBe(first.userId);
     expect(db.users.get(first.userId).state).toBe('active');
