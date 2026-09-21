@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleInit, forwardRef } from '@nestjs/common';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -15,6 +15,7 @@ import { TgCommandsService } from './tg-commands.service';
 import { TgGrammyClient } from './tg-grammy.client';
 import { MiscService } from '../misc/misc.service';
 import { VideoService } from '../video/video.service';
+import { BlogApprovalService } from '../blog/blog-approval.service';
 
 // Лимит размера файла, который мы готовы скачать с Telegram и передать в Claude.
 // Telegram сам отдаёт через Bot API до 20 МБ; больше — нужен MTProto, не наш кейс.
@@ -80,6 +81,18 @@ const ALBUM_DEBOUNCE_MS = Number(process.env.TG_ALBUM_DEBOUNCE_MS || 2500);
 /** Потолок альбома в Telegram. Набрали столько — ждать больше нечего. */
 const ALBUM_MAX_PARTS = 10;
 
+/**
+ * Кнопки блога приходят тем же вебхуком, что и кнопки ассистентов.
+ *
+ * Отдельная функция, а не строчка внутри роутера: порядок веток в
+ * handleCallbackQuery — единственное, что отделяет нажатие владельца блога от
+ * молчаливого `return` по непривязанному аккаунту, и его надо уметь проверять
+ * тестом, не поднимая весь сервис.
+ */
+export function shouldRouteToBlog(data?: string): boolean {
+  return String(data || '').startsWith('blog:');
+}
+
 @Injectable()
 export class TgBotService implements OnModuleInit {
   private readonly logger = new Logger(TgBotService.name);
@@ -110,6 +123,10 @@ export class TgBotService implements OnModuleInit {
     private readonly grammy: TgGrammyClient,
     private readonly misc: MiscService,
     private readonly video: VideoService,
+    // Блог зовёт TgGrammyClient, а бот — блог: кольцо модулей рвётся forwardRef
+    // с обеих сторон (вторая половина — в blog.module.ts).
+    @Inject(forwardRef(() => BlogApprovalService))
+    private readonly blogApproval: BlogApprovalService,
   ) {}
 
   async onModuleInit() {
@@ -219,6 +236,13 @@ export class TgBotService implements OnModuleInit {
     //
     // Ветка стоит ПОСЛЕ проверки на '/' — иначе команды уехали бы в ассистента.
     if (chatType === 'private') {
+      // Реплай на черновик блога — это правка поста, а не реплика ассистенту.
+      // Стоит до проверки привязки по той же причине, что и ветка кнопок:
+      // владелец блога опознаётся по координатам сообщения-черновика.
+      // handleReplyEdit возвращает false на всё чужое, и тогда текст идёт
+      // обычным путём — перехватить лишнее значит сломать людям чат.
+      if (await this.blogApproval.handleReplyEdit(msg)) return;
+
       const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
       if (!ownerId) {
         await this.replyUnlinked(
@@ -284,6 +308,15 @@ export class TgBotService implements OnModuleInit {
 
   private async handleCallbackQuery(cb: any): Promise<void> {
     const data = String(cb.data || '');
+
+    // Ветка блога стоит ПЕРВОЙ и до проверки привязки: владелец блога
+    // определяется не через связку ассистентов, и `if (!ownerId) return`
+    // ниже молча проглотил бы нажатие «Опубликовать».
+    if (shouldRouteToBlog(data)) {
+      await this.blogApproval.handleCallback(cb);
+      return;
+    }
+
     const ownerId = await this.identity.getLinkeonIdByTgUserId(cb.from.id);
     if (!ownerId) return;
 

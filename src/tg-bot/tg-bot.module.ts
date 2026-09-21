@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { TgBotController } from './tg-bot.controller';
 import { TgBotConfigController } from './tg-bot-config.controller';
 import { TgBotService } from './tg-bot.service';
@@ -18,9 +18,12 @@ import { MiscModule } from '../misc/misc.module';
 import { VideoModule } from '../video/video.module';
 import { MeetingModule } from '../meeting/meeting.module';
 import { RoomModule } from '../meeting/room.module';
+import { BlogModule } from '../blog/blog.module';
 
 @Module({
-  imports: [AgentsModule, CommonModule, MiscModule, VideoModule, MeetingModule, RoomModule],
+  // forwardRef на BlogModule — вторая половина разрыва кольца: блог берёт
+  // отсюда TgGrammyClient, бот оттуда — BlogApprovalService.
+  imports: [AgentsModule, CommonModule, MiscModule, VideoModule, MeetingModule, RoomModule, forwardRef(() => BlogModule)],
   controllers: [TgBotController, TgBotConfigController],
   providers: [
     TgBotService, TgGrammyClient, TgIdentityService, TgConfigService,
