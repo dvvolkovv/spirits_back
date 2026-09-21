@@ -248,7 +248,7 @@ describe('TalerIdController', () => {
     it('мобильный вход возвращается в приложение', async () => {
       const login = makeLogin({
         peekLogin: jest.fn().mockResolvedValue({ mobile: true }),
-        completeLogin: jest.fn().mockResolvedValue('handoff-1'),
+        completeLogin: jest.fn().mockResolvedValue({ kind: 'handoff', handoff: 'handoff-1' }),
       });
       const res = makeRes();
 
@@ -260,13 +260,34 @@ describe('TalerIdController', () => {
     it('веб-вход по-прежнему возвращается на страницу', async () => {
       const login = makeLogin({
         peekLogin: jest.fn().mockResolvedValue({ mobile: false }),
-        completeLogin: jest.fn().mockResolvedValue('handoff-2'),
+        completeLogin: jest.fn().mockResolvedValue({ kind: 'handoff', handoff: 'handoff-2' }),
       });
       const res = makeRes();
 
       await makeController(login).oauthCallback('code-1', 'state-1', undefined as any, res);
 
       expect(res.redirected).toBe('https://my.linkeon.io/?talerid_login=handoff-2');
+    });
+
+    // Вход остановлен, потому что эта почта уже указана в профиле аккаунта с
+    // телефонным входом. Это НЕ ошибка входа: увести в talerid_login_error
+    // значило бы показать «не получилось» там, где человеку надо выбрать.
+    it('кандидат на привязку уводит на экран выбора, а не в ошибку', async () => {
+      const login = makeLogin({
+        peekLogin: jest.fn().mockResolvedValue({ mobile: false }),
+        completeLogin: jest.fn().mockResolvedValue({
+          kind: 'link_required',
+          ticket: 'tkt-1',
+          phoneHint: '···7425',
+        }),
+      });
+      const res = makeRes();
+
+      await makeController(login).oauthCallback('code-1', 'state-1', undefined as any, res);
+
+      expect(res.redirected).toContain('/auth/link?');
+      expect(res.redirected).toContain('ticket=tkt-1');
+      expect(res.redirected).not.toContain('talerid_login_error');
     });
 
     it('несостоявшийся обмен уводит мобильного в приложение, а не в браузер', async () => {
