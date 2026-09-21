@@ -1227,7 +1227,7 @@ const NOISE = /^(chore|docs|test|tests|ci|build|refactor|style|perf)[(:]/i;
  * не должна уехать в канал как новая — владелец, одобривший её выкат месяц
  * назад, вряд ли вспомнит про откат и пропустит такой черновик.
  */
-const SERVICE_PREFIXES = ['Merge ', 'Revert ', 'fixup! ', 'squash! '];
+const SERVICE_PREFIXES = ['Merge ', 'Revert "', 'fixup! ', 'squash! '];
 
 export function filterUserFacing(commits: GitCommit[]): GitCommit[] {
   return commits.filter((c) => {
@@ -1832,6 +1832,20 @@ describe('BlogPublisherService.publish', () => {
     const res = await svc.publish(post());
     expect(res.ok).toBe(false);
     expect(tg.sendPhoto).not.toHaveBeenCalled();
+    // Без этой строки тест проходит даже если убрать условие статуса из
+    // захвата: моки отдают заданные rows независимо от текста SQL.
+    expect(pg.query.mock.calls[0][0] as string).toContain("status = 'approved'");
+  });
+
+  it('пост без картинки не захватывается и не публикуется — иначе сгорят все три попытки', async () => {
+    const pg = { query: jest.fn() };
+    const tg = { sendPhoto: jest.fn() };
+    const svc = new BlogPublisherService(pg as any, tg as any, settingsMock() as any);
+
+    const res = await svc.publish(post({ imageUrl: null }));
+    expect(res.ok).toBe(false);
+    expect(pg.query).not.toHaveBeenCalled();
+    expect(tg.sendPhoto).not.toHaveBeenCalled();
   });
 
   it('канал не настроен — не захватываем и не публикуем', async () => {
@@ -1914,6 +1928,15 @@ export class BlogPublisherService {
     if (!channelChatId) {
       this.logger.warn('канал не настроен — публикация пропущена');
       return { ok: false, error: 'канал не настроен' };
+    }
+
+    // Проверка ДО захвата. Иначе пост уходит в publishing, падает внутри
+    // grammy невнятным TypeError, и крон сжигает на этом все три попытки —
+    // причём last_error не скажет разбирающему очереди ничего о том, что
+    // дело всего лишь в отсутствующей картинке.
+    if (!post.imageUrl) {
+      this.logger.warn(`пост ${post.id} без картинки — публикация пропущена`);
+      return { ok: false, error: 'у поста нет картинки' };
     }
 
     // Атомарный захват: выигрывает ровно один вызов. Без этого два тика крона
