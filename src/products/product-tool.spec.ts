@@ -2,7 +2,7 @@ import { Pool } from 'pg';
 import * as fs from 'fs';
 import * as path from 'path';
 import { MIGRATIONS } from './products.service';
-import { ProductToolService } from './product-tool.service';
+import { ProductToolService, describeTurn } from './product-tool.service';
 
 const PG = process.env.PROVISIONING_PG_URL;
 const maybe = PG ? describe : describe.skip;
@@ -132,5 +132,66 @@ maybe('инструмент продуктов против живого Postgre
       const svc = new ProductToolService(pg as any, {} as any);
       expect(await svc.resolve(OWNER, '   ')).toEqual([]);
     });
+  });
+});
+
+describe('разбор исхода хода', () => {
+  it('done — сделано, с расходом', () => {
+    const d = describeTurn({ id: 't1', status: 'done', result: 'Добавил раздел', error: null, tokens_spent: 4200 });
+    expect(d.outcome).toBe('done');
+    expect(d.ok).toBe(true);
+    expect(d.tokensSpent).toBe(4200);
+  });
+
+  // Главная опасность работы. ok:false — не украшение: контроллер MCP
+  // выставляет isError по !ok, то есть модель видит откат как неуспех, а не
+  // как результат с грустным текстом, который легко пересказать «готово».
+  it('reverted — ОТКАТ, и это НЕ успех', () => {
+    const d = describeTurn({ id: 't2', status: 'reverted', result: null, error: 'health check failed', tokens_spent: 0 });
+    expect(d.outcome).toBe('reverted');
+    expect(d.ok).toBe(false);
+  });
+
+  it('failed — не сделано', () => {
+    const d = describeTurn({ id: 't3', status: 'failed', result: null, error: 'build error', tokens_spent: 0 });
+    expect(d.outcome).toBe('failed');
+    expect(d.ok).toBe(false);
+  });
+
+  it('три конца различимы между собой', () => {
+    const outs = ['done', 'reverted', 'failed'].map((s) =>
+      describeTurn({ id: 'x', status: s, result: null, error: null, tokens_spent: 0 }).outcome,
+    );
+    expect(new Set(outs).size).toBe(3);
+  });
+
+  // «Не дошло» — это ход, который продукт не забрал. Отдельно от running:
+  // running значит «работают», queued значит «никто не взял», и это разные
+  // новости для человека.
+  it('queued и running — разные незаконченные состояния', () => {
+    expect(describeTurn({ id: 'x', status: 'queued', result: null, error: null, tokens_spent: 0 }).outcome).toBe('queued');
+    expect(describeTurn({ id: 'x', status: 'running', result: null, error: null, tokens_spent: 0 }).outcome).toBe('running');
+  });
+
+  it('незаконченный ход не объявляется ни успехом, ни провалом', () => {
+    for (const s of ['queued', 'running']) {
+      const d = describeTurn({ id: 'x', status: s, result: null, error: null, tokens_spent: 0 });
+      expect(d.ok).toBe(true);
+      expect(d.finished).toBe(false);
+    }
+  });
+
+  it('законченные помечены finished', () => {
+    for (const s of ['done', 'reverted', 'failed']) {
+      expect(describeTurn({ id: 'x', status: s, result: null, error: null, tokens_spent: 0 }).finished).toBe(true);
+    }
+  });
+
+  // count(*) и bigint приезжают из node-pg СТРОКОЙ. Без явного Number()
+  // расход склеился бы строкой при сложении, а '0' прошёл бы как истинный.
+  it('расход приходит строкой из драйвера и становится числом', () => {
+    const d = describeTurn({ id: 'x', status: 'done', result: null, error: null, tokens_spent: '4200' as any });
+    expect(d.tokensSpent).toBe(4200);
+    expect(typeof d.tokensSpent).toBe('number');
   });
 });
