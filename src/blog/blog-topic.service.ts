@@ -39,6 +39,20 @@ export interface AddTopicInput {
   topicKey: string;
   topicHint?: string;
   sourceRef?: string;
+  /**
+   * Тема с таким `sourceRef` заводится ровно один раз — навсегда и без
+   * оглядки на статус.
+   *
+   * Нужно там, где `sourceRef` сам по себе описывает неповторимое событие
+   * («тема `meeting-bot`, неделя 2026-W38»). Обычной дедупликации по
+   * `topic_key` для этого мало: она нарочно пропускает отклонённые темы,
+   * поэтому повторный прогон крона воскресил бы ровно тот анонс, который
+   * владелец только что отправил в мусор.
+   *
+   * Флаг, а не безусловная проверка: у кейсов `sourceRef` — это ассистент
+   * (`stats:12`), и такое событие обязано повторяться из месяца в месяц.
+   */
+  onceBySourceRef?: boolean;
 }
 
 @Injectable()
@@ -50,6 +64,20 @@ export class BlogTopicService {
   /** @returns созданный пост-идею или null, если тема отбракована дедупликацией */
   async addTopic(input: AddTopicInput): Promise<BlogPost | null> {
     const key = normalizeTopicKey(input.topicKey);
+
+    // Проверка по source_ref идёт ПЕРЕД дедупликацией по ключу и намеренно
+    // не смотрит ни на статус, ни на окно: событие с таким ключом уже
+    // случилось, второго такого же не будет.
+    if (input.onceBySourceRef && input.sourceRef) {
+      const seen = await this.pg.query(
+        `SELECT id FROM blog_post WHERE source_ref = $1 LIMIT 1`,
+        [input.sourceRef],
+      );
+      if (seen.rows.length) {
+        this.logger.log(`тема "${input.sourceRef}" пропущена: уже заводилась`);
+        return null;
+      }
+    }
 
     // Отклонённые темы из проверки исключены намеренно: если владелец отправил
     // пост в мусор, тема не «занята» — её можно попробовать заново.

@@ -7,7 +7,7 @@ import { BlogImageService } from './blog-image.service';
 import { BlogPublisherService, MAX_PUBLISH_ATTEMPTS } from './blog-publisher.service';
 import { BlogApprovalService } from './blog-approval.service';
 import { BlogSettingsService } from './blog-settings.service';
-import { BlogGitSource } from './blog-git.source';
+import { BlogNewsService } from './blog-news.service';
 import { ALLOWED_TRANSITIONS, BlogStatus, canTransition, rowToPost } from './blog.types';
 import { nextSlotAfter, STALE_NEWS_DAYS } from './blog-slots';
 
@@ -47,7 +47,7 @@ export class BlogCron {
     private readonly publisher: BlogPublisherService,
     private readonly approval: BlogApprovalService,
     private readonly settings: BlogSettingsService,
-    private readonly git: BlogGitSource,
+    private readonly news: BlogNewsService,
   ) {}
 
   /**
@@ -63,17 +63,34 @@ export class BlogCron {
     return raw ? Number(raw) : null;
   }
 
-  /** Воскресенье 09:00 МСК. Порядок важен: сначала темы, потом черновик к понедельнику. */
+  /**
+   * Воскресенье 09:00 МСК. Порядок важен: сначала темы, потом черновик к
+   * понедельнику.
+   *
+   * Новость заводится на ТЕМУ недели, а не на коммит: коммит новостью быть
+   * не может — фича размазана по десяткам коммитов, и «тема на коммит»
+   * давала на проде ~30 тем в неделю, ни одна из которых не годилась для
+   * канала. Отбор живёт в `BlogNewsService`; нормальный исход недели —
+   * пустой список.
+   *
+   * Новости и кейсы разведены по разным try намеренно: отбор новостей ходит
+   * в релей, а тот отваливается регулярно. Общий catch унёс бы вместе с
+   * новостями и кейсы, которым релей не нужен, и канал остался бы вообще без
+   * тем на неделю.
+   */
   @Cron('0 6 * * 0')
   async refillTopics(): Promise<void> {
     if (!this.enabled()) return;
+
     try {
-      for (const c of await this.git.weeklyCommits()) {
-        await this.topics.addTopic({
-          rubric: 'news', source: 'git', sourceRef: `commit:${c.sha}`,
-          topicKey: normalizeTopicKey(c.subject), topicHint: c.subject,
-        });
+      for (const topic of await this.news.weeklyTopics()) {
+        await this.topics.addTopic(topic);
       }
+    } catch (e: any) {
+      this.logger.error(`отбор новостей недели сорвался: ${e.message}`);
+    }
+
+    try {
       for (const a of await this.topics.topAssistants(3)) {
         await this.topics.addTopic({
           rubric: 'case', source: 'stats', sourceRef: `stats:${a.agentId}`,
@@ -82,7 +99,7 @@ export class BlogCron {
         });
       }
     } catch (e: any) {
-      this.logger.error(`пополнение тем сорвалось: ${e.message}`);
+      this.logger.error(`пополнение кейсов сорвалось: ${e.message}`);
     }
   }
 

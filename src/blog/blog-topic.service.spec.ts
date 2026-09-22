@@ -52,6 +52,53 @@ describe('BlogTopicService.addTopic', () => {
   });
 });
 
+describe('BlogTopicService.addTopic с onceBySourceRef', () => {
+  const newsTopic = (over: any = {}) => ({
+    rubric: 'news' as const, source: 'git' as const, topicKey: 'meeting-bot-2026-w38',
+    sourceRef: 'git:2026-W38:meeting-bot', onceBySourceRef: true, ...over,
+  });
+
+  it('тема с уже виденным sourceRef не заводится второй раз', async () => {
+    const pg = pgMock();
+    pg.query.mockResolvedValueOnce({ rows: [{ id: 'old' }] });
+    const svc = new BlogTopicService(pg as any);
+    expect(await svc.addTopic(newsTopic())).toBeNull();
+    expect(pg.query).toHaveBeenCalledTimes(1);
+  });
+
+  it('проверка по sourceRef идёт без оглядки на статус: отклонённый анонс недели не воскресает', async () => {
+    const pg = pgMock();
+    pg.query.mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [{ id: 'x', rubric: 'news', source: 'git', topic_key: 'k', status: 'idea', attempts: 0 }] });
+    const svc = new BlogTopicService(pg as any);
+    await svc.addTopic(newsTopic());
+
+    const [sql, params] = pg.query.mock.calls[0];
+    expect(String(sql)).toContain('source_ref = $1');
+    expect(String(sql)).not.toContain('rejected');
+    expect(params).toContain('git:2026-W38:meeting-bot');
+  });
+
+  it('без флага sourceRef не проверяется — кейсы по одному ассистенту повторяются по-прежнему', async () => {
+    const pg = pgMock();
+    pg.query.mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [{ id: 'x', rubric: 'case', source: 'stats', topic_key: 'k', status: 'idea', attempts: 0 }] });
+    const svc = new BlogTopicService(pg as any);
+    await svc.addTopic({ rubric: 'case', source: 'stats', topicKey: 'кейс', sourceRef: 'stats:12' });
+
+    expect(pg.query).toHaveBeenCalledTimes(2);
+    expect(String(pg.query.mock.calls[0][0])).not.toContain('source_ref');
+  });
+
+  it('флаг без sourceRef ничего не ломает: остаётся обычная дедупликация по ключу', async () => {
+    const pg = pgMock();
+    pg.query.mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [{ id: 'x', rubric: 'news', source: 'git', topic_key: 'k', status: 'idea', attempts: 0 }] });
+    const svc = new BlogTopicService(pg as any);
+    await svc.addTopic({ rubric: 'news', source: 'git', topicKey: 'к', onceBySourceRef: true });
+
+    expect(pg.query).toHaveBeenCalledTimes(2);
+    expect(String(pg.query.mock.calls[0][0])).toContain('topic_key = $1');
+  });
+});
+
 describe('BlogTopicService.takeNextIdea', () => {
   const draftingRow = (over: any = {}) => ({
     id: 'p1', rubric: 'case', source: 'stats', topic_key: 'k', status: 'drafting', attempts: 0, ...over,

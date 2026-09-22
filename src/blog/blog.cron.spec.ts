@@ -8,10 +8,10 @@ const deps = () => ({
   publisher: { publish: jest.fn() },
   approval: { sendForReview: jest.fn(), notify: jest.fn() },
   settings: { get: jest.fn().mockResolvedValue({ channelChatId: '-100', slotDays: [1, 3, 5], slotHourMsk: 10, imageStyle: '' }) },
-  git: { weeklyCommits: jest.fn().mockResolvedValue([]) },
+  news: { weeklyTopics: jest.fn().mockResolvedValue([]) },
 });
 
-const make = (d: any) => new BlogCron(d.pg, d.topics, d.editor, d.images, d.publisher, d.approval, d.settings, d.git);
+const make = (d: any) => new BlogCron(d.pg, d.topics, d.editor, d.images, d.publisher, d.approval, d.settings, d.news);
 
 describe('BlogCron при выключенном флаге', () => {
   const OLD = process.env.BLOG_ENABLED;
@@ -24,6 +24,59 @@ describe('BlogCron при выключенном флаге', () => {
     await make(d).publishDue();
     expect(d.topics.takeNextIdea).not.toHaveBeenCalled();
     expect(d.publisher.publish).not.toHaveBeenCalled();
+  });
+});
+
+describe('BlogCron.refillTopics', () => {
+  beforeEach(() => { process.env.BLOG_ENABLED = 'true'; });
+
+  const newsCalls = (d: any) => d.topics.addTopic.mock.calls
+    .map((c: any) => c[0]).filter((t: any) => t.rubric === 'news');
+  const caseCalls = (d: any) => d.topics.addTopic.mock.calls
+    .map((c: any) => c[0]).filter((t: any) => t.rubric === 'case');
+
+  it('заводит по теме недели, а не по коммиту', async () => {
+    const d = deps();
+    // Сервис уже отобрал: одна тема на всю неделю из двух десятков коммитов.
+    d.news.weeklyTopics.mockResolvedValue([{
+      rubric: 'news', source: 'git', sourceRef: 'git:2026-W38:meeting-bot',
+      topicKey: 'meeting-bot-2026-w38', topicHint: 'Встречу можно записать', onceBySourceRef: true,
+    }]);
+
+    await make(d).refillTopics();
+
+    expect(newsCalls(d)).toHaveLength(1);
+    expect(newsCalls(d)[0].sourceRef).toBe('git:2026-W38:meeting-bot');
+    expect(newsCalls(d)[0].onceBySourceRef).toBe(true);
+  });
+
+  it('неделя без новостей — ни одной записи, и это не ошибка', async () => {
+    const d = deps();
+    d.news.weeklyTopics.mockResolvedValue([]);
+
+    await make(d).refillTopics();
+
+    expect(newsCalls(d)).toHaveLength(0);
+  });
+
+  it('отбор новостей сорвался — кейсы всё равно заводятся', async () => {
+    // Отбор ходит в релей, а тот отваливается регулярно. Общий catch на весь
+    // метод съел бы вместе с новостями и кейсы, которым релей не нужен.
+    const d = deps();
+    d.news.weeklyTopics.mockRejectedValue(new Error('релей молчит'));
+    d.topics.topAssistants.mockResolvedValue([{ agentId: '12', agentName: 'Юрист', turns: 40 }]);
+
+    await make(d).refillTopics();
+
+    expect(caseCalls(d)).toHaveLength(1);
+  });
+
+  it('при выключенном BLOG_ENABLED отбор не запускается', async () => {
+    process.env.BLOG_ENABLED = '';
+    const d = deps();
+    await make(d).refillTopics();
+    expect(d.news.weeklyTopics).not.toHaveBeenCalled();
+    expect(d.topics.addTopic).not.toHaveBeenCalled();
   });
 });
 
