@@ -7,6 +7,7 @@ import { parseBlogCallback, buildBlogKeyboard } from './blog-callback';
 import { buildCaption } from './blog-text';
 import { nextSlotAfter } from './blog-slots';
 import { fetchImageBytes } from './blog-image.fetch';
+import { formatSlotWhen } from './blog-slot-format';
 
 @Injectable()
 export class BlogApprovalService {
@@ -103,12 +104,22 @@ export class BlogApprovalService {
 
     if (parsed.action === 'ok') {
       const { slotDays, slotHourMsk } = await this.settings.get();
-      const slot = nextSlotAfter(new Date(), slotDays, slotHourMsk);
+      const now = new Date();
+      const slot = nextSlotAfter(now, slotDays, slotHourMsk);
       await this.pg.query(
         `UPDATE blog_post SET status = 'approved', slot_at = $2, updated_at = now() WHERE id = $1`,
         [post.id, slot.toISOString()],
       );
-      await this.tg.answerCallbackQuery(cb.id, { text: 'Одобрено' });
+
+      // Всплывашка живёт секунды и легко пропускается, поэтому та же дата
+      // следом дублируется обычным сообщением через notify() — оно остаётся
+      // в истории чата. chatId берём из самого callback (как handleReplyEdit
+      // берёт его из msg), а не из post.reviewChatId: это тот чат, где
+      // реально нажали кнопку, без лишнего похода мыслью к БД.
+      const when = formatSlotWhen(slot, now);
+      const text = `Одобрено. Опубликую ${when}.`;
+      await this.tg.answerCallbackQuery(cb.id, { text });
+      await this.notify(Number(cb?.message?.chat?.id), text);
       return true;
     }
 
