@@ -58,10 +58,6 @@ const PLATFORMS = {
      * не попадает ни в .env, ни в код.
      */
     profile: process.env.MEET_PROFILE_DIR || join(homedir(), '.linkeon-meet-profile'),
-    // Тот же довод, что у Zoom: без устройств в списке площадка считает, что
-    // микрофона нет. Meet на экране входа показывает выбранный — «Fake Default
-    // Audio Input», — и это признак, что звук он у нас возьмёт.
-    chromeArgs: ['--use-fake-device-for-media-stream'],
     // Английский интерфейс — условие работы зацепок.
     //
     // Вход, чат и состав ищутся по подписям: «Ask to join», «Chat with
@@ -74,14 +70,6 @@ const PLATFORMS = {
     payload: ZOOM_PAYLOAD,
     name: 'Zoom',
     viaSdk: true,
-    // Фальшивое устройство — не для звука, а для СПИСКА устройств.
-    //
-    // Звук мы всё равно подменяем перехватом getUserMedia. Но у контейнера нет
-    // ни одной звуковой карты, и `enumerateDevices()` возвращает пустоту —
-    // SDK решает, что микрофона нет, и не начинает подключать звук. А именно
-    // это и есть его признак входа во встречу (13-й уровень onJoinSpeed), без
-    // которого бот вечно ждёт впуска. Тот же флаг стоит у Attendee.
-    chromeArgs: ['--use-fake-device-for-media-stream'],
   },
 };
 
@@ -274,6 +262,12 @@ export class MeetingBot {
         this.log.info?.(`[${this.id}] сценарий страницы в кадре ${data?.url}`);
         break;
 
+      case 'level':
+        // Ноль — значит во встрече тишина ИЛИ звук до нас не доходит; всё,
+        // что выше, доказывает, что тракт живой.
+        this.log.info?.(`[${this.id}] громкость входящего: ${data?.peak}%`);
+        break;
+
       case 'tracks':
         this.log.info?.(`[${this.id}] дорожек участников: ${data?.count}`);
         break;
@@ -393,6 +387,14 @@ export class MeetingBot {
         '--disable-features=IsolateOrigins,site-per-process',
         '--disable-blink-features=AutomationControlled',
         '--disable-extensions',
+        // Фальшивое устройство — не ради звука, а ради СПИСКА устройств.
+        //
+        // Звук мы подменяем перехватом getUserMedia. Но в контейнере нет ни
+        // одной звуковой карты, `enumerateDevices()` пуст, и площадка, не найдя
+        // микрофона, просто не просит его — перехватывать становится нечего.
+        // Так вёл себя Zoom, и так же повёл себя новый Телемост: бот пришёл,
+        // но ни разу не спросил микрофон и остался немым (22.09.2026).
+        '--use-fake-device-for-media-stream',
         ...(platform.chromeArgs || []),
       ],
     };

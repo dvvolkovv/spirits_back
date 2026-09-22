@@ -136,6 +136,8 @@ export const AUDIO_PART = `
     const BATCH = 960;
     const acc = new Int16Array(BATCH);
     let filled = 0;
+    let frames = 0;
+    let peak = 0;
 
     const reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
     (async () => {
@@ -147,9 +149,16 @@ export const AUDIO_PART = `
           value.copyTo(data, { planeIndex: 0 });
           for (let i = 0; i < data.length; i++) {
             const v = Math.max(-1, Math.min(1, data[i]));
+            if (v > peak) peak = v;
             acc[filled++] = Math.round(v * 32767);
             if (filled === BATCH) { send('audio', b64(acc)); filled = 0; }
           }
+          // Раз в пять секунд — насколько громко было.
+          //
+          // Без этого «никто не говорит» и «звук до нас не доходит» выглядят
+          // в логе одинаково: куски идут в обоих случаях, потому что поток
+          // непрерывен. На Телемосте это стоило нам двух заходов вслепую.
+          if (++frames % 125 === 0) { send('level', { peak: Math.round(peak * 100) }); peak = 0; }
         } catch (e) { console.error('[бот] кадр не разобрался', e); }
         finally { value.close(); }
       }
