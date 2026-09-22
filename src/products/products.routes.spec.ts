@@ -15,6 +15,7 @@ import { RunnerController } from './runner.controller';
 import { HostController } from './host.controller';
 import { ProductsModule } from './products.module';
 import { JwtGuard } from '../common/guards/jwt.guard';
+import { AdminGuard } from '../common/guards/admin.guard';
 import { RunnerGuard } from './runner.guard';
 import { HostGuard } from './host.guard';
 
@@ -34,6 +35,17 @@ import { HostGuard } from './host.guard';
  * зелёными.
  */
 const guardsOf = (ctrl: any) => Reflect.getMetadata(GUARDS_METADATA, ctrl) ?? [];
+
+/**
+ * Гварды, действующие НА МЕТОД: с класса плюс свои. Прочитать только класс
+ * здесь мало — у продуктов контроллер один на всех, и административные
+ * маршруты закрываются вторым гвардом поштучно (образец — common/guards/
+ * admin-routes.spec.ts, откуда взята и эта функция).
+ */
+const guardsFor = (ctrl: any, method: string): unknown[] => [
+  ...(Reflect.getMetadata(GUARDS_METADATA, ctrl) ?? []),
+  ...(Reflect.getMetadata(GUARDS_METADATA, ctrl.prototype[method]) ?? []),
+];
 
 const mainSrc = () => fs.readFileSync(path.join(__dirname, '..', 'main.ts'), 'utf8');
 
@@ -132,6 +144,35 @@ describe('охрана маршрутов products', () => {
     expect(guardsOf(ProductsController)).toContain(JwtGuard);
   });
 
+  it('маршруты гашения закрыты AdminGuard, а не одной проверкой в теле метода', () => {
+    // РЕГРЕССИЯ ПО ОБРАЗЦУ РЕАЛЬНОЙ ДЫРЫ (28.07.2026, admin-routes.spec.ts): у
+    // 13 маршрутов AdminController стоял только JwtGuard, то есть проверялось
+    // «залогинен», а роль — нет. Проверка внутри тела метода от этой дыры не
+    // отличается НИЧЕМ снаружи: сторожа обходят маршруты по метаданным
+    // гвардов и про тело не знают.
+    //
+    // Гашение — самое дорогое действие модуля: оно останавливает чужой
+    // работающий бизнес и убивает идущую правку.
+    for (const method of ['block', 'unblock']) {
+      expect(guardsFor(ProductsController, method)).toContain(AdminGuard);
+      // JwtGuard тоже обязателен, и он с класса: AdminGuard читает
+      // `request.user`, которого без JwtGuard нет вовсе — гвард отказал бы
+      // всем подряд, а на пустом `user?.userId` это выглядело бы как «просто
+      // не пускает».
+      expect(guardsFor(ProductsController, method)).toContain(JwtGuard);
+    }
+  });
+
+  it('AdminGuard стоит ПОШТУЧНО и не закрывает кабинет', () => {
+    // Обратная половина. Тот же AdminGuard, поднятый на класс, — это не
+    // «строже», а выключенный кабинет: список, заведение, чат и история
+    // перестанут работать у всех, кроме администраторов. Прогон при этом
+    // остаётся зелёным везде, кроме этой строки.
+    for (const method of ['list', 'create', 'chat', 'history', 'retry', 'revert']) {
+      expect(guardsFor(ProductsController, method)).not.toContain(AdminGuard);
+    }
+  });
+
   it('маршруты раннера закрыты RunnerGuard и НЕ пускают по JWT пользователя', () => {
     const guards = guardsOf(RunnerController);
     expect(guards).toContain(RunnerGuard);
@@ -201,6 +242,30 @@ describe('адреса маршрутов', () => {
   it('кнопки кабинета бьют туда же, куда ходит фронт', () => {
     expect(endpointOf(ProductsController, 'create')).toBe('POST /webhook/products');
     expect(endpointOf(ProductsController, 'retry')).toBe('POST /webhook/products/:id/retry');
+  });
+
+  it('гашение и снятие стоят по своим адресам и не съедают друг друга', () => {
+    // Адрес здесь — не формальность: кнопки у этих маршрутов нет вовсе (общего
+    // списка продуктов у администратора нет, решение владельца от 21.09.2026),
+    // и зовут их руками по жалобе. Переехавший адрес не обнаружит никто, кроме
+    // человека, которому в этот момент нужно погасить чужой сайт.
+    expect(endpointOf(ProductsController, 'block')).toBe('POST /webhook/products/block');
+    expect(endpointOf(ProductsController, 'unblock')).toBe('POST /webhook/products/unblock');
+  });
+
+  it('ни один маршрут кабинета не занимает двухсегментный POST products/<что-то>', () => {
+    // Nest разбирает маршруты В ПОРЯДКЕ ОБЪЯВЛЕНИЯ. `@Post('products/:id')`,
+    // появившись выше, молча съел бы оба адреса гашения: запрос уехал бы в
+    // чужой обработчик с `id = 'block'`, а весь прогон остался бы зелёным —
+    // юнит-тесты зовут методы напрямую, мимо маршрутизатора.
+    //
+    // Сторожится не порядок (его в метаданных нет), а САМО СУЩЕСТВОВАНИЕ
+    // такого маршрута: пока его нет, столкнуться не с чем.
+    const shaped = routeMethodsOf(ProductsController)
+      .map((m) => ({ m, path: pathOf(ProductsController, m) }))
+      .filter(({ path }) => /^\/webhook\/products\/[^/]+$/.test(path) && path.includes(':'));
+
+    expect(shaped).toEqual([]);
   });
 
   it('уже работающие маршруты соседей не переехали', () => {

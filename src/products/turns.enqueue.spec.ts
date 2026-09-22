@@ -1,5 +1,5 @@
 import { ConflictException, HttpException, HttpStatus } from '@nestjs/common';
-import { SLEEPING_REFUSAL, TurnsService } from './turns.service';
+import { BLOCKED_REFUSAL, SLEEPING_REFUSAL, TurnsService } from './turns.service';
 
 function makeService(
   opts: {
@@ -237,6 +237,115 @@ describe('TurnsService.enqueue — спящий продукт', () => {
     await expect(
       svc.revert({ productId: 'p-1', turnId: 't-0', userId: 'u-1' }),
     ).rejects.toMatchObject({ message: SLEEPING_REFUSAL });
+
+    expect(calls.some((c) => c.sql.includes('INSERT INTO product_turns'))).toBe(false);
+  });
+});
+
+/**
+ * БЛОКИРОВАННЫЙ ПРОДУКТ (кусок 4б).
+ *
+ * Ни один тест здесь не про «отказ есть» — общая ветка `status !== 'running'`
+ * отбивает блокированного и без единой новой строки, и тест «правка не
+ * ставится» был бы зелёным на ПУСТОЙ реализации. Проверяется ровно то, чего
+ * общая ветка не даёт: владелец узнаёт, что продукт остановлен РЕШЕНИЕМ
+ * АДМИНИСТРАТОРА, а не сломался.
+ *
+ * Отсюда же и место проверки: поставленная НИЖЕ общей, она становится мёртвым
+ * кодом — и «отказ» остаётся, и дефект полностью молчаливый.
+ */
+describe('TurnsService.enqueue — блокированный продукт', () => {
+  const refusal = async (productStatus: string) => {
+    const { svc, calls, misc } = makeService({ productStatus });
+    const err = await svc
+      .enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'правь' })
+      .then(
+        () => null,
+        (e: any) => e,
+      );
+    expect(err).not.toBeNull();
+    return { err: err as HttpException, calls, misc };
+  };
+
+  it('блокированному правка не ставится', async () => {
+    const { err, calls } = await refusal('blocked');
+
+    expect(err).toBeInstanceOf(HttpException);
+    expect(calls.some((c) => c.sql.includes('INSERT INTO product_turns'))).toBe(false);
+  });
+
+  it('отказ называет администратора, а не «сейчас недоступен»', async () => {
+    // ГЛАВНЫЙ ТЕСТ ЗАДАЧИ. Общий текст отправляет владельца искать поломку у
+    // себя: он проверит домен, перезагрузит вкладку, поставит правку ещё раз —
+    // и так до тех пор, пока не напишет нам сам. Причина при этом известна и
+    // лежит в базе.
+    const { err } = await refusal('blocked');
+
+    expect(err.message).toMatch(/администратор/i);
+    expect(err.message).toBe(BLOCKED_REFUSAL);
+  });
+
+  it('текст отказа отличается от текста ЛЮБОГО другого нерабочего статуса', async () => {
+    // Сторож МЕСТА проверки: ветка, уехавшая под общую, отдаёт здесь ровно
+    // «Продукт сейчас недоступен для правок» — тот же текст, что у 'stopped'.
+    // Сверка с соседями, а не с литералом, ловит и вторую правку того же
+    // класса: общий текст, переписанный со словом «администратор» внутри.
+    // Тогда про администратора узнают заодно владельцы 'stopped' и 'failed',
+    // и это враньё в обратную сторону.
+    const blocked = await refusal('blocked');
+    const stopped = await refusal('stopped');
+    const failed = await refusal('failed');
+
+    expect(blocked.err.message).not.toBe(stopped.err.message);
+    expect(blocked.err.message).not.toBe(failed.err.message);
+    expect(blocked.err.message).not.toMatch(/недоступен для правок/i);
+    // И у соседей текст остался прежним: новая ветка не должна была забрать
+    // себе всё подряд.
+    expect(stopped.err.message).toBe('Продукт сейчас недоступен для правок');
+  });
+
+  it('отказ блокированному — 409, а не 402', async () => {
+    // 402 в кабинете зажигает кнопку пополнения
+    // (`setNeedsTopUp(started.status === 402)` в ProductChat.tsx). На
+    // блокированном продукте это кнопка, которая берёт деньги и не меняет
+    // ничего: пополнение будит спящего, но не снимает решение администратора.
+    //
+    // 409 кабинет показывает ТЕКСТОМ СЕРВЕРА (`p.message || 'агент занят'`) —
+    // то есть именно объяснением выше.
+    const { err } = await refusal('blocked');
+
+    expect(err.getStatus()).toBe(HttpStatus.CONFLICT);
+    expect(err).toBeInstanceOf(ConflictException);
+  });
+
+  it('и про пополнение сказано, что оно не поможет', async () => {
+    // Соседнее нерабочее состояние (сон) снимается деньгами, и это
+    // единственное, что владелец про остановленный продукт уже знает. Не
+    // сказать здесь «деньги не помогут» значит собрать оплату за то, что от
+    // оплаты не изменится.
+    const { err } = await refusal('blocked');
+
+    expect(err.message).toMatch(/пополнени[ей].{0,20}не поможет/i);
+  });
+
+  it('блокированный отбивается ДО проверки баланса', async () => {
+    // Баланса у владельца может не быть — и обратный порядок выдал бы ему
+    // «Недостаточно токенов» на продукт, который не заработает ни от каких
+    // токенов.
+    const { misc } = await refusal('blocked');
+
+    expect(misc.checkTokenBalance).not.toHaveBeenCalled();
+  });
+
+  it('откат на блокированном продукте тоже не ставится', async () => {
+    // Второй вход в enqueue — тот же, что у сна. Откат гоняет агента в
+    // контейнере, которого нет, и мимо этой проверки он уехал бы, окажись она
+    // в контроллере.
+    const { svc, calls } = makeService({ productStatus: 'blocked' });
+
+    await expect(
+      svc.revert({ productId: 'p-1', turnId: 't-0', userId: 'u-1' }),
+    ).rejects.toMatchObject({ message: BLOCKED_REFUSAL });
 
     expect(calls.some((c) => c.sql.includes('INSERT INTO product_turns'))).toBe(false);
   });

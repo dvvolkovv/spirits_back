@@ -1,11 +1,24 @@
-import { Body, Controller, Get, Logger, Param, Post, Req, Res, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  ForbiddenException,
+  Get,
+  Logger,
+  Param,
+  Post,
+  Req,
+  Res,
+  UseGuards,
+} from '@nestjs/common';
 import { Request, Response } from 'express';
 import { JwtGuard } from '../common/guards/jwt.guard';
+import { AdminGuard } from '../common/guards/admin.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { ProductsService } from './products.service';
 import { TurnsService } from './turns.service';
 import { TurnEventsService } from './turn-events.service';
 import { ProvisioningService } from './provisioning.service';
+import { BlockService } from './block.service';
 import { assertUuid, CreateProductDto } from './products.dto';
 
 @Controller('')
@@ -18,6 +31,7 @@ export class ProductsController {
     private readonly turns: TurnsService,
     private readonly turnEvents: TurnEventsService,
     private readonly provisioning: ProvisioningService,
+    private readonly blocks: BlockService,
   ) {}
 
   /**
@@ -123,6 +137,97 @@ export class ProductsController {
     // нужен агенту хоста, а не браузеру; `return r` отправил бы его в ответ и
     // в логи прокси.
     return { id: r.productId };
+  }
+
+  /**
+   * ПРИЗНАК АДМИНИСТРАТОРА — У ГВАРДА, И БОЛЬШЕ НИГДЕ. Ровно то же правило,
+   * что у `create()` выше, и по той же причине: `request.user` кладёт JwtGuard,
+   * читая `ai_profiles_consolidated.isadmin`, а ValidationPipe стоит с
+   * `whitelist: false` — то есть `{"isAdmin": true}` в ТЕЛЕ доезжает до
+   * маршрута насквозь и было бы правом погасить любой чужой продукт одной
+   * строчкой в запросе.
+   *
+   * `=== true`, а не приведение к истинности: `user` здесь `any`, значение
+   * доезжает без единой проверки типа, и строка `'false'` — истина. У
+   * `create()` цена такой ошибки — продукт не на той машине; здесь — погашенный
+   * чужой бизнес.
+   */
+  private assertAdmin(user: any): void {
+    if (user?.isAdmin !== true) throw new ForbiddenException('Нет доступа');
+  }
+
+  /**
+   * ГАШЕНИЕ ПРОДУКТА ПО ЖАЛОБЕ. Администратор присылает ОДНО поле — домен,
+   * слаг или идентификатор; разбирает его сервер (см. `BlockService.lookup`).
+   *
+   * ## ЗАЩИЩАЕТ ГВАРД, А НЕ ОДНА СТРОКА В ТЕЛЕ МЕТОДА
+   *
+   * `@UseGuards(AdminGuard)` — тот же способ, которым закрыты все прочие
+   * административные поверхности этого репозитория (admin, agents, vmm, blog,
+   * backlog, integrations), и это не симметрия ради симметрии:
+   *
+   *   - проверка в теле метода не видна СНАРУЖИ. Сторож
+   *     `common/guards/admin-routes.spec.ts` обходит маршруты по метаданным
+   *     гвардов и про тело метода не знает ничего; дыра, которую он однажды
+   *     нашёл (13 маршрутов AdminController с одним JwtGuard), выглядела
+   *     ровно так же — «проверка же есть»;
+   *   - гвард отбивает ДО разбора тела и до всякого обращения к сервису;
+   *   - AdminGuard читает `isadmin` из базы СВЕЖИМ запросом, а `req.user`
+   *     несёт значение из кеша JwtGuard на 60 секунд. Снятые права начинают
+   *     действовать сразу, а не через минуту.
+   *
+   * Проверка в теле при этом ОСТАЁТСЯ, и не как перестраховка: два рубежа
+   * краснеют в разных прогонах. Снятый декоратор ловит
+   * `products.routes.spec.ts` (юнит-тесты маршрута зовут метод напрямую и
+   * гвардов не исполняют вовсе), снятую строку — юнит-тесты маршрута
+   * (метаданные гвардов от неё не меняются). Каждый рубеж поодиночке
+   * снимается одной правкой при зелёном прогоне соседа.
+   *
+   * ## ТЕЛО БЕЗ DTO — РЕШЕНИЕ, А НЕ ЗАБЫВЧИВОСТЬ
+   *
+   * `@Body()` с литеральным типом даёт ValidationPipe metatype `Object`, на
+   * котором она не проверяет ничего (см. `bodyMetatype` в
+   * products.routes.spec.ts). Здесь это допустимо ровно потому, что оба поля
+   * проверяет сам сервис и проверяет СТРОГО: не-строка и пустая строка — это
+   * 400 с объяснением (`lookup`, «за что гасим»), а не 500 из глубины
+   * запроса. DTO дал бы второе место, где живёт та же проверка, и первое
+   * расхождение между ними прошло бы незамеченным.
+   *
+   * ## ЧТО В ОТВЕТЕ
+   *
+   * Не `{ ok: true }`. Искали по строке из жалобы — значит в ответе обязано
+   * быть, ЧТО именно погашено: слаг, идентификатор, чем разобран ключ, каким
+   * был статус и сколько чужих идущих правок при этом убито. Разбор — у
+   * `BlockResult`.
+   *
+   * ## ПОЧЕМУ ЭТИ ДВА МАРШРУТА ОБЪЯВЛЕНЫ ВЫШЕ ВСЕХ `products/:id/...`
+   *
+   * Сегодня двухсегментного `POST products/:id` в контроллере нет, и
+   * столкнуться не с чем. Но Nest разбирает маршруты В ПОРЯДКЕ ОБЪЯВЛЕНИЯ, и
+   * такой маршрут, появившись выше, молча съел бы `products/block`: гашение
+   * уехало бы в чужой обработчик с `id = 'block'`, а прогон остался бы
+   * зелёным — юнит-тесты зовут методы напрямую, мимо маршрутизатора.
+   */
+  @Post('products/block')
+  @UseGuards(AdminGuard)
+  async block(@CurrentUser() user: any, @Body() body: { key: string; reason: string }) {
+    this.assertAdmin(user);
+    return this.blocks.block(body?.key, body?.reason);
+  }
+
+  /**
+   * Снятие блокировки. Отдельный маршрут, а не флаг в теле гашения: «погасить»
+   * и «вернуть» — разные решения с разными последствиями, и опечатка в
+   * значении флага не должна превращать одно в другое.
+   *
+   * Причины здесь нет намеренно: снятие стирает `block_reason` (см.
+   * `BlockService.unblock`), и писать туда нечего.
+   */
+  @Post('products/unblock')
+  @UseGuards(AdminGuard)
+  async unblock(@CurrentUser() user: any, @Body() body: { key: string }) {
+    this.assertAdmin(user);
+    return this.blocks.unblock(body?.key);
   }
 
   /**

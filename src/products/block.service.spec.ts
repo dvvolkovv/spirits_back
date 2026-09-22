@@ -92,6 +92,61 @@ describe('BlockService', () => {
     expect(pg.query).not.toHaveBeenCalled();
   });
 
+  it('ключ НЕ строкой отбивается здесь — DTO у маршрута нет', async () => {
+    // Маршруты гашения принимают тело без DTO: ValidationPipe с литеральным
+    // типом `@Body()` не проверяет ничего (см. bodyMetatype в
+    // products.routes.spec.ts), а `whitelist: false` ничего не срезает. То
+    // есть `{"key": {"toString": …}}` и `{"key": ["a"]}` приезжают сюда как
+    // есть — и обязаны стать понятным 400, а не 500 из глубины запроса или,
+    // хуже, склейкой массива в 'a,b' по дороге в SQL.
+    //
+    // Пока эта проверка здесь одна, второго места с теми же правилами нет и
+    // расходиться нечему. Уберёшь её — придётся заводить DTO.
+    const { svc, pg } = makeService();
+    for (const key of [{}, ['shop'], 42, null, undefined, true]) {
+      await expect(svc.block(key as any, 'нарушение')).rejects.toThrow(BadRequestException);
+      await expect(svc.unblock(key as any)).rejects.toThrow(BadRequestException);
+    }
+    expect(pg.query).not.toHaveBeenCalled();
+  });
+
+  it('гашение и снятие рассказывают, ЧТО нашлось по присланной строке', async () => {
+    // Администратор ищет по домену из жалобы и обязан увидеть, какой продукт
+    // под ним оказался: домены строятся из слагов, и соседний живой продукт
+    // отличается от нужного одним символом. `killedTurns` — единственный
+    // способ узнать, что под гашением умерла чужая ИДУЩАЯ правка.
+    const { svc } = makeService([
+      { id: 'p-1', slug: 'shop', status: 'running', archived: false, queued: '1',
+        killed_jobs: '2', killed_turns: '1' },
+    ]);
+
+    await expect(svc.block('shop.c.linkeon.io', 'нарушение')).resolves.toEqual({
+      id: 'p-1',
+      slug: 'shop',
+      wasStatus: 'running',
+      by: 'домену',
+      killedJobs: 2,
+      killedTurns: 1,
+    });
+  });
+
+  it('числа в ответе — числа, а не строки из драйвера', async () => {
+    // count() в PostgreSQL — bigint, и драйвер отдаёт его СТРОКОЙ. Без
+    // приведения наружу уезжает {"killedTurns":"0"}, и проверка вида
+    // `if (r.killedTurns)` у читателя истинна на нуле: администратор увидит
+    // «оборвана чужая правка» там, где не оборвано ничего.
+    const { svc } = makeService([
+      { id: 'p-1', slug: 'shop', status: 'blocked', archived: false, queued: '1',
+        killed_jobs: '0', killed_turns: '0' },
+    ]);
+
+    const r = await svc.block('shop', 'нарушение');
+
+    expect(typeof r.killedJobs).toBe('number');
+    expect(typeof r.killedTurns).toBe('number');
+    expect(r.killedTurns).toBe(0);
+  });
+
   it('причина записывается обрезанной, а не как пришла', async () => {
     const { svc, calls } = makeService();
     await svc.block('shop', '  нарушение  ');

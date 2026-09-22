@@ -1,4 +1,4 @@
-import { ConflictException, NotFoundException } from '@nestjs/common';
+import { ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { ProductsController } from './products.controller';
 
 function makeRes() {
@@ -51,12 +51,32 @@ function makeController(events: any[]) {
     retry: jest.fn(async () => undefined),
     hostAgentsLiveForUser: jest.fn(async () => true),
   };
+  // Гашение отдаёт НЕ `{ ok: true }`: маршрут обязан пересказать
+  // администратору, ЧТО именно нашлось по присланной строке (см. BlockResult).
+  const blocks = {
+    block: jest.fn(async () => ({
+      id: P,
+      slug: 'shop',
+      wasStatus: 'running',
+      by: 'домену',
+      killedJobs: 0,
+      killedTurns: 1,
+    })),
+    unblock: jest.fn(async () => ({ id: P, slug: 'shop', by: 'слагу', killedJobs: 1 })),
+  };
   return {
-    ctrl: new ProductsController(products as any, turns as any, turnEvents as any, provisioning as any),
+    ctrl: new ProductsController(
+      products as any,
+      turns as any,
+      turnEvents as any,
+      provisioning as any,
+      blocks as any,
+    ),
     products,
     turns,
     turnEvents,
     provisioning,
+    blocks,
   };
 }
 
@@ -559,5 +579,129 @@ describe('ProductsController.list', () => {
     await ctrl.list(user, res as any);
 
     expect(products.list).toHaveBeenCalledWith('u-1');
+  });
+});
+
+/**
+ * МАРШРУТЫ ГАШЕНИЯ.
+ *
+ * ЧЕГО ЭТОТ ФАЙЛ НЕ ПРОВЕРЯЕТ: гвардов. Здесь методы зовутся НАПРЯМУЮ, минуя
+ * Nest, и `@UseGuards(AdminGuard)` не исполняется вовсе — снятый декоратор
+ * оставит всё ниже зелёным. Второй рубеж сторожит products.routes.spec.ts по
+ * метаданным, и это разделение намеренное: каждый из двух рубежей снимается
+ * одной правкой, невидимой для прогона соседа.
+ *
+ * Здесь же — проверка в теле метода: откуда берётся признак администратора и
+ * что считается истиной.
+ */
+describe('ProductsController.block / unblock', () => {
+  const admin = { userId: 'u-админ', isAdmin: true };
+  const KEY = { key: 'shop.p.linkeon.io', reason: 'мошенничество' };
+
+  it('обычный пользователь не гасит, и сервис не зовётся вовсе', async () => {
+    // «Не зовётся» — половина утверждения, без которой тест ничего не стоит:
+    // отказ ПОСЛЕ вызова сервиса выглядел бы точно так же, а продукт был бы
+    // уже погашен.
+    const { ctrl, blocks } = makeController([]);
+
+    await expect(ctrl.block({ userId: 'u-1', isAdmin: false }, KEY)).rejects.toBeInstanceOf(
+      ForbiddenException,
+    );
+
+    expect(blocks.block).not.toHaveBeenCalled();
+  });
+
+  it('администратором делает ровно `true`, а не всё, что похоже на правду', async () => {
+    // `user` здесь `any`: значение доезжает из JwtGuard без единой проверки
+    // типа. Приведение к истинности сделало бы администратором СТРОКУ 'false'
+    // — самую вероятную форму, в какой признак приезжает из чужого хранилища.
+    const { ctrl, blocks } = makeController([]);
+
+    for (const isAdmin of ['false', 'true', 1, {}, 'admin', null, undefined]) {
+      await expect(ctrl.block({ userId: 'u-1', isAdmin } as any, KEY)).rejects.toBeInstanceOf(
+        ForbiddenException,
+      );
+      await expect(ctrl.unblock({ userId: 'u-1', isAdmin } as any, KEY)).rejects.toBeInstanceOf(
+        ForbiddenException,
+      );
+    }
+
+    expect(blocks.block).not.toHaveBeenCalled();
+    expect(blocks.unblock).not.toHaveBeenCalled();
+  });
+
+  it('пользователя нет вовсе — тоже отказ, а не падение', async () => {
+    // Маршрут закрыт JwtGuard, то есть `undefined` сюда не приходит. Но цена
+    // ошибки несимметрична: `user.isAdmin` на undefined — это TypeError, то
+    // есть 500, и ровно в этом случае отказ обязан остаться отказом.
+    const { ctrl } = makeController([]);
+
+    await expect(ctrl.block(undefined as any, KEY)).rejects.toBeInstanceOf(ForbiddenException);
+  });
+
+  it('признак администратора В ТЕЛЕ не даёт ничего', async () => {
+    // ValidationPipe стоит с `whitelist: false`, DTO у этого маршрута нет —
+    // лишние поля тела доезжают до метода как есть. Спред тела или чтение
+    // `body.isAdmin` здесь было бы правом погасить любой чужой продукт одной
+    // строчкой в запросе.
+    const { ctrl, blocks } = makeController([]);
+
+    await expect(
+      ctrl.block({ userId: 'u-1', isAdmin: false }, { ...KEY, isAdmin: true } as any),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+
+    expect(blocks.block).not.toHaveBeenCalled();
+  });
+
+  it('администратор гасит: ключ и причина уезжают в сервис в том же порядке', async () => {
+    const { ctrl, blocks } = makeController([]);
+
+    await ctrl.block(admin, KEY);
+
+    // Переставленные местами аргументы дали бы отказ «не сказано, за что
+    // гасим» на любом запросе — но только на живом сервере: здесь сервис
+    // подменён и молча примет любой порядок.
+    expect(blocks.block).toHaveBeenCalledWith('shop.p.linkeon.io', 'мошенничество');
+  });
+
+  it('ответ называет, ЧТО именно погашено, а не «ok»', async () => {
+    // Искали по строке из жалобы. `{ ok: true }` не отвечает ни на один
+    // вопрос администратора: какой продукт оказался под этим доменом, был ли
+    // он вообще живым и не оборвал ли я кому-то идущую правку.
+    const { ctrl } = makeController([]);
+
+    const out: any = await ctrl.block(admin, KEY);
+
+    expect(out).toMatchObject({
+      slug: 'shop',
+      by: 'домену',
+      wasStatus: 'running',
+      killedTurns: 1,
+    });
+    expect(out.ok).toBeUndefined();
+  });
+
+  it('снятие блокировки закрыто тем же рубежом и отвечает тем же', async () => {
+    const { ctrl, blocks } = makeController([]);
+
+    await expect(ctrl.unblock({ userId: 'u-1', isAdmin: false }, { key: 'shop' })).rejects.toBeInstanceOf(
+      ForbiddenException,
+    );
+    expect(blocks.unblock).not.toHaveBeenCalled();
+
+    await expect(ctrl.unblock(admin, { key: 'shop' })).resolves.toMatchObject({ slug: 'shop' });
+    expect(blocks.unblock).toHaveBeenCalledWith('shop');
+  });
+
+  it('отказ в правах — 403, а не «не найден»', async () => {
+    // Тот же код, которым отвечает AdminGuard: снаружи неразличимо, какой из
+    // двух рубежей сработал, и это правильно — рубежи про одно и то же.
+    // 404 здесь означал бы, что чужой продукт «не существует», то есть
+    // превращал бы отказ в правах в подсказку о наличии продукта.
+    const { ctrl } = makeController([]);
+
+    const err: any = await ctrl.block({ userId: 'u-1' }, KEY).catch((e) => e);
+
+    expect(err.getStatus()).toBe(403);
   });
 });

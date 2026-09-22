@@ -22,6 +22,7 @@ import { MIGRATIONS, ProductsService } from './products.service';
 import { ProvisioningService } from './provisioning.service';
 import { RentService } from './rent.service';
 import { SecretsService } from './secrets.service';
+import { BLOCKED_REFUSAL, SLEEPING_REFUSAL, TurnsService } from './turns.service';
 
 /**
  * ЕДИНСТВЕННЫЙ ФАЙЛ В ЭТОМ КАТАЛОГЕ, ГДЕ SQL ИСПОЛНЯЕТСЯ.
@@ -4400,6 +4401,62 @@ maybe('провижининг против живого Postgres', () => {
       await pool.query(`UPDATE products SET runner_seen_at = now() WHERE id = $1`, [p.id]);
       expect(await prov.promoteReady()).toBe(0);
       expect((await getProduct(p.id)).status).toBe('blocked');
+    });
+
+    // ───────── чужое место: отказ правке блокированного ─────────
+
+    /**
+     * Настоящий TurnsService поверх той же базы. Баланс подменён нарочно
+     * «денег хватает»: проверка баланса стоит ПОСЛЕ проверки статуса, и
+     * честный нулевой баланс отдавал бы здесь свой отказ независимо от того,
+     * работает проверка блокировки или нет.
+     */
+    const turnsSvc = () =>
+      new TurnsService(pg as any, { checkTokenBalance: async () => ({ ok: true }) } as any);
+
+    it('104. после гашения правка владельца отбивается текстом ПРО АДМИНИСТРАТОРА', async () => {
+      // ДВЕ ПОЛОВИНЫ ОТКАЗА ЖИВУТ В РАЗНЫХ ФАЙЛАХ и связаны одним строковым
+      // литералом: block() пишет в products.status слово 'blocked', а
+      // TurnsService.enqueue сверяет прочитанное с ним же. На заглушке pg эта
+      // связь не проверяется ВОВСЕ — юнит-тест сам кладёт статус в ответ мока,
+      // — и расхождение вида 'blocked_by_admin' осталось бы зелёным по обе
+      // стороны. Владелец при этом получал бы общее «Продукт сейчас недоступен
+      // для правок» и шёл искать поломку у себя.
+      const p = await product({ slug: 'ss-refuse', status: 'running' });
+      const svc = blocks();
+      quiet(svc);
+      await svc.block('ss-refuse', 'нарушение');
+
+      const err: any = await turnsSvc()
+        .enqueue({ productId: p.id, userId: 'u-1', channel: 'web', prompt: 'правь' })
+        .catch((e) => e);
+
+      expect(err.message).toBe(BLOCKED_REFUSAL);
+      expect(err.getStatus()).toBe(409);
+      // И ход в очередь не встал. Встав, он висел бы там навсегда: claimNext
+      // требует 'running', сборщик зависших хоронит только 'running', а замок
+      // product_turns_one_active не пустил бы следующий.
+      expect(await turnsOf(p.id)).toEqual([]);
+    });
+
+    it('104а. после снятия блокировки отказ снова про ДЕНЬГИ, а не про администратора', async () => {
+      // Обратная половина, и заодно сторож того, что снятие меняет СТАТУС, а
+      // не только стирает причину. Продукт возвращается в 'sleeping' (почему
+      // не сразу в 'running' — в докблоке unblock), значит владелец обязан
+      // получить отказ про баланс: «остановлен администратором» здесь уже
+      // неправда, и владелец ждал бы решения, которое давно принято.
+      const p = await product({ slug: 'ss-refuse-back', status: 'running' });
+      const svc = blocks();
+      quiet(svc);
+      await svc.block('ss-refuse-back', 'нарушение');
+      await svc.unblock('ss-refuse-back');
+
+      const err: any = await turnsSvc()
+        .enqueue({ productId: p.id, userId: 'u-1', channel: 'web', prompt: 'правь' })
+        .catch((e) => e);
+
+      expect(err.message).toBe(SLEEPING_REFUSAL);
+      expect(err.getStatus()).toBe(402);
     });
   });
 

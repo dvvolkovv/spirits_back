@@ -27,6 +27,49 @@ export const TURN_KILLED_BY_BLOCK = 'Продукт остановлен адм�
 export const JOB_KILLED_BY_UNBLOCK = 'снято снятием блокировки';
 
 /**
+ * ЧТО ГАШЕНИЕ РАССКАЗЫВАЕТ ВЫЗВАВШЕМУ. Ровно то же, что уходит в журнал, — но
+ * журнал читают потом и не те: администратор жмёт кнопку и получает ответ.
+ *
+ * Зачем это наружу, а не `void` с `{ ok: true }` в маршруте:
+ *
+ *   - `slug` и `id` — потому что искали по ДОМЕНУ. Администратор прислал
+ *     строку из жалобы и обязан увидеть, какой продукт под ней оказался:
+ *     домены строятся из слагов, и «shop2.p.linkeon.io» вместо
+ *     «shop.p.linkeon.io» — это соседний живой продукт, а не опечатка в
+ *     пустоту;
+ *   - `by` — чем ключ разобран. Тот же ответ на вопрос «почему нашлось
+ *     именно это»;
+ *   - `wasStatus` — что было ДО. 'sleeping' здесь означает «контейнер и так
+ *     был погашен», 'running' — «погасили работающий»;
+ *   - `killedTurns` — единственный способ узнать, что под гашением умерла
+ *     ЧУЖАЯ ИДУЩАЯ ПРАВКА. Это осознанный размен (см. докблок класса), но
+ *     размен молчаливый: владелец увидит оборванный ход, а администратор без
+ *     этого числа не узнает, что он его оборвал.
+ */
+export interface BlockResult {
+  id: string;
+  slug: string;
+  /** Статус ДО гашения. */
+  wasStatus: string;
+  /** Чем разобран ключ: «домену», «слагу» или «идентификатору». */
+  by: string;
+  killedJobs: number;
+  killedTurns: number;
+}
+
+/**
+ * То же у снятия. `killedTurns` здесь нет и быть не может: у блокированного
+ * продукта идущих ходов не бывает — их убило гашение, а новые не ставятся
+ * (BLOCKED_REFUSAL в turns.service.ts).
+ */
+export interface UnblockResult {
+  id: string;
+  slug: string;
+  by: string;
+  killedJobs: number;
+}
+
+/**
  * ГАШЕНИЕ ПРОДУКТА АДМИНИСТРАТОРОМ И СНЯТИЕ БЛОКИРОВКИ.
  *
  * Своим сервисом, а не дописью в ProvisioningService (тот уже за 1300 строк и
@@ -231,7 +274,7 @@ export class BlockService {
    * 'archived' был бы затёрт на 'blocked' — единственный след архивации в
    * колонке status пропал бы.
    */
-  async block(rawKey: string, rawReason: string): Promise<void> {
+  async block(rawKey: string, rawReason: string): Promise<BlockResult> {
     const l = this.lookup(rawKey);
     const reason = typeof rawReason === 'string' ? rawReason.trim() : '';
     // ПРИЧИНА ОБЯЗАТЕЛЬНА, и это не формальность. Общего списка продуктов у
@@ -352,6 +395,19 @@ export class BlockService {
       `гашение ${row.slug} (по ${l.by} «${l.key}»): был ${row.status}, причина «${reason}», ` +
         `снято заданий ${row.killed_jobs}, убито ходов ${row.killed_turns}`,
     );
+
+    // Числа приводятся ЯВНО: count() в PostgreSQL — bigint, а драйвер отдаёт
+    // bigint строкой (иначе потерял бы точность за 2^53). Без Number() наружу
+    // уезжает {"killedTurns":"1"}, и проверка вида `if (r.killedTurns)` у
+    // читателя истинна на строке '0'.
+    return {
+      id: row.id,
+      slug: row.slug,
+      wasStatus: row.status,
+      by: l.by,
+      killedJobs: Number(row.killed_jobs),
+      killedTurns: Number(row.killed_turns),
+    };
   }
 
   /**
@@ -390,7 +446,7 @@ export class BlockService {
    * 'sleeping', агент заберёт СТАРОЕ задание 'sleep' и погасит контейнер.
    * Снятие блокировки выглядело бы сработавшим и не делало бы ничего.
    */
-  async unblock(rawKey: string): Promise<void> {
+  async unblock(rawKey: string): Promise<UnblockResult> {
     const l = this.lookup(rawKey);
 
     const r = await this.pg
@@ -475,5 +531,12 @@ export class BlockService {
       `снятие блокировки ${row.slug} (по ${l.by} «${l.key}»): снято заданий ${row.killed_jobs}, ` +
         'поставлено пробуждение',
     );
+
+    return {
+      id: row.id,
+      slug: row.slug,
+      by: l.by,
+      killedJobs: Number(row.killed_jobs),
+    };
   }
 }
