@@ -45,9 +45,15 @@ ALTER TABLE products ADD COLUMN IF NOT EXISTS sleep_reason text;
 -- DROP + ADD, а не DO/EXCEPTION duplicate_object: перехват дубля молча
 -- сохраняет СТАРОЕ определение, и правка словаря не доезжает до баз, где
 -- ограничение уже есть. Тот же приём, что в 002.
+--
+-- 'blocked' в этом списке заводит МИГРАЦИЯ 007 (гашение администратором), и
+-- дописан он сюда по правилу из 002: именованный словарь объявлен в трёх файлах
+-- — 002, 004 и 007, — и состав у него обязан быть один. Файл, отставший от
+-- соседей, отказывает на первой же живой строке с новым значением и замолкает
+-- навсегда.
 ALTER TABLE products DROP CONSTRAINT IF EXISTS products_status_check;
 ALTER TABLE products ADD CONSTRAINT products_status_check
-  CHECK (status IN ('provisioning','running','degraded','stopped','archived','failed','sleeping'));
+  CHECK (status IN ('provisioning','running','degraded','stopped','archived','failed','sleeping','blocked'));
 
 -- ВИД ЗАДАНИЯ. Сегодня вид один и подразумевается; со сном их три.
 --

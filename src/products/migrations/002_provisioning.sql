@@ -61,9 +61,14 @@ ALTER TABLE products ADD COLUMN IF NOT EXISTS provision_error text;
 -- словарь объявлен заново. Инлайновых CHECK из CREATE TABLE это не касается —
 -- CREATE TABLE стоит под IF NOT EXISTS и на живой базе не исполняется вовсе
 -- (потому словарь статусов в 001 и остался пятизначным).
+--
+-- 'blocked' заводит МИГРАЦИЯ 007 и стоит он здесь по ровно той же причине, что
+-- и 'sleeping': блокированный продукт — штатное состояние (администратор
+-- погасил недопустимый сайт), и на его строке семизначный словарь уронил бы
+-- этот файл на первом же рестарте API. Сторож исполнением — сценарий 20е.
 ALTER TABLE products DROP CONSTRAINT IF EXISTS products_status_check;
 ALTER TABLE products ADD CONSTRAINT products_status_check
-  CHECK (status IN ('provisioning','running','degraded','stopped','archived','failed','sleeping'));
+  CHECK (status IN ('provisioning','running','degraded','stopped','archived','failed','sleeping','blocked'));
 
 CREATE TABLE IF NOT EXISTS product_provision_jobs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

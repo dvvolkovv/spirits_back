@@ -356,6 +356,7 @@ describe('миграция 002', () => {
       '004_rent.sql',
       '005_hosts.sql',
       '006_host_agent_per_host.sql',
+      '007_selfservice.sql',
     ]);
   });
 
@@ -388,8 +389,13 @@ describe('миграция 002', () => {
     // старте API и навешивает свой словарь на живые данные заново. Словарь `уже`
     // живых данных роняет ADD CONSTRAINT, и 002 замолкает навсегда. Подробности
     // — в самом файле 002; исполнением это ловит сценарий 20д.
+    //
+    // 'blocked' здесь по той же причине и заводит его 007: гашение
+    // администратором — штатное состояние, и на его строке отставший словарь
+    // 002 уронил бы весь файл. Исполнением ловит сценарий 20е.
     expect(dictionary(await migration002(), 'products_status_check', 'status')).toEqual([
       'archived',
+      'blocked',
       'degraded',
       'failed',
       'provisioning',
@@ -557,9 +563,11 @@ describe('миграция 004 — аренда', () => {
 
   it('словарь статусов знает sleeping', async () => {
     // Состав сверен с живой базой прода 16.09.2026 (`\d products`): там ровно
-    // шесть значений ниже без sleeping.
+    // шесть значений ниже без sleeping. 'blocked' добавлен 22.09.2026 вместе с
+    // 007 — и добавлен ВО ВСЕ ТРИ файла, где этот именованный словарь объявлен.
     expect(dictionary(await migration004(), 'products_status_check', 'status', '004')).toEqual([
       'archived',
+      'blocked',
       'degraded',
       'failed',
       'provisioning',
@@ -951,5 +959,151 @@ describe('миграция 006 — отметка о жизни своя у ка
     expect(sql).toMatch(
       /FOREIGN KEY \(host_id\) REFERENCES product_hosts\(id\) ON DELETE CASCADE/,
     );
+  });
+});
+
+/**
+ * Текст миграции 007 — отдельно от соседей по той же причине, по какой отделены
+ * 002..006: склейка зеленела бы на чужом тексте. Якорь — `product_user_limits`:
+ * `products_status_check` есть ещё и в 002, и в 004, а обе едут РАНЬШЕ, то есть
+ * поиск по словарю отдал бы текст соседа и весь блок ниже проверял бы не тот
+ * файл, оставаясь зелёным.
+ */
+async function migration007(): Promise<string> {
+  const { svc, queries } = makeService();
+  await svc.onModuleInit();
+  const sql = queries.find((q) => q.includes('product_user_limits'));
+  if (!sql) {
+    throw new Error('миграция 007 не применена: ни один запрос не заводит product_user_limits');
+  }
+  return sql.replace(/\/\*[\s\S]*?\*\//g, '').replace(/--[^\n]*/g, '');
+}
+
+describe('миграция 007 — блокировка и потолок на аккаунт', () => {
+  it('маркер находит именно 007, а не 002 и не 004', async () => {
+    // Сторож прибора. Ошибись он файлом — проверка словаря ниже зеленела бы на
+    // тексте 002, который тот же словарь объявляет с тем же составом, и 007
+    // могла бы потерять его целиком незамеченной.
+    const sql = await migration007();
+    expect(sql).toContain('CREATE TABLE IF NOT EXISTS product_user_limits');
+    expect(sql).not.toContain('paid_until');
+    expect(sql).not.toContain('product_provision_jobs');
+  });
+
+  it('словарь статусов знает blocked', async () => {
+    // Состав сверяется ЦЕЛИКОМ, а не «содержит blocked»: identity/migrations/003
+    // — про то, как дописывание одного значения теряет остальные (там потерялся
+    // 'apple' и сломался вход).
+    expect(dictionary(await migration007(), 'products_status_check', 'status', '007')).toEqual([
+      'archived',
+      'blocked',
+      'degraded',
+      'failed',
+      'provisioning',
+      'running',
+      'sleeping',
+      'stopped',
+    ]);
+  });
+
+  it('blocked знают ВСЕ файлы, где словарь объявлен, а не только 007', async () => {
+    // СТОРОЖ КЛАССА, а не случая, и он сильнее соседнего «один состав во всех
+    // миграциях»: тот сверяет объявления между собой и остался бы зелёным, если
+    // бы blocked не было НИ В ОДНОМ. Здесь проверяется и число объявлений, и
+    // наличие значения в каждом.
+    //
+    // Цена пропуска измерена в куске 3 на 'sleeping': файл, отставший от
+    // соседей, отказывает на первой же живой строке с новым значением, отказ
+    // уходит строкой в лог (applyMigration ловит и едет дальше), и файл
+    // становится мёртвым молча, навсегда и вместе со всем, что в него потом
+    // допишут.
+    const declared = namedDictionaries().get('products_status_check');
+    // Число, а не `toBeGreaterThan(1)`: новый файл, объявивший словарь и
+    // забывший значение, обязан краснить здесь, а не проходить как «ну, больше
+    // одного же».
+    expect(declared?.map((d) => d.file)).toEqual([
+      '002_provisioning.sql',
+      '004_rent.sql',
+      '007_selfservice.sql',
+    ]);
+    for (const d of declared!) {
+      expect({ file: d.file, blocked: d.values.includes('blocked') }).toEqual({
+        file: d.file,
+        blocked: true,
+      });
+    }
+  });
+
+  it('за что погашен — необязательный текст на продукте', async () => {
+    // Именно nullable, по образцу sleep_reason (004): NOT NULL DEFAULT '' завёл
+    // бы третье состояние — пустую строку против «причины нет».
+    // `;` в якоре не украшение: он запрещает приехавшие следом модификаторы.
+    expect(await migration007()).toMatch(/ADD COLUMN IF NOT EXISTS\s+block_reason\s+text\s*;/);
+  });
+
+  it('причина блокировки — СВОЯ колонка, а не sleep_reason', async () => {
+    // Гашение ставит задание вида 'sleep', а путь отказа такого задания
+    // (completeJob) обнуляет sleep_reason:
+    // `sleep_reason = CASE closed.kind WHEN 'sleep' THEN NULL ELSE ... END`.
+    // Причина блокировки, сложенная туда, стиралась бы ровно тогда, когда
+    // гашение сорвалось, — то есть там, где объяснение нужнее всего. Этот файл
+    // колонку сна не трогает вовсе.
+    expect(await migration007()).not.toContain('sleep_reason');
+  });
+
+  it('потолок на аккаунт — своя таблица модуля', async () => {
+    expect(await migration007()).toMatch(/CREATE TABLE IF NOT EXISTS\s+product_user_limits/);
+  });
+
+  it('ключ таблицы — владелец, и он text', async () => {
+    // text, а не varchar: у OAuth/email-пользователей идентификатор — UUID на
+    // 36 символов. PRIMARY KEY, а не индекс: потолок читается подзапросом без
+    // ORDER BY, и вторая строка давала бы потолок наугад.
+    expect(await migration007()).toMatch(/user_id\s+text\s+PRIMARY KEY/);
+  });
+
+  it('потолок обязан быть положительным', async () => {
+    // Без CHECK строка с нулём означала бы аккаунт, которому нельзя ничего, —
+    // запрет, неотличимый для владельца от обычного отказа по потолку.
+    expect(await migration007()).toMatch(
+      /max_products\s+int\s+NOT NULL\s+CHECK\s*\(\s*max_products\s*>\s*0\s*\)/,
+    );
+  });
+
+  it('умолчание НЕ копируется в строку: строк заводится ноль', async () => {
+    // Строка появляется только у тех, кому потолок подняли. INSERT в этом файле
+    // — это либо копия умолчания в каждый аккаунт (тогда правка умолчания
+    // превращается в правку данных), либо повторяемая при каждом старте API
+    // правка данных, то есть ловушка 004 с бесплатным месяцем.
+    expect(await migration007()).not.toMatch(/INSERT\s+INTO\s+product_user_limits/i);
+    expect(await migration007()).not.toMatch(/UPDATE\s+product_user_limits/i);
+  });
+
+  it('каждое ограничение навешивается идемпотентно', async () => {
+    // Тот же сторож, что в 002 и 004: ADD CONSTRAINT не знает IF NOT EXISTS, и
+    // без снятия одноимённого повторный прогон падал бы — а applyMigration
+    // такой отказ только пишет в лог.
+    const sql = await migration007();
+    const added = [...sql.matchAll(/ADD CONSTRAINT\s+(\w+)/g)].map((m) => m[1]);
+    expect(added.length).toBeGreaterThan(0);
+    for (const name of added) {
+      expect(sql.indexOf(`DROP CONSTRAINT IF EXISTS ${name};`)).toBeGreaterThan(-1);
+      expect(sql.indexOf(`DROP CONSTRAINT IF EXISTS ${name};`)).toBeLessThan(
+        sql.indexOf(`ADD CONSTRAINT ${name}`),
+      );
+    }
+  });
+
+  it('ни одного неповторяемого оператора во всём файле', async () => {
+    // Файл исполняется при КАЖДОМ старте API, и цена незащищённого оператора
+    // здесь не «ошибка», а молчаливый отказ: applyMigration ловит исключение,
+    // пишет строку в лог и едет дальше.
+    const list = statements(await migration007());
+    expect(list.length).toBeGreaterThan(0);
+    for (const s of list) {
+      expect(s).toMatch(
+        /ADD COLUMN IF NOT EXISTS|DROP CONSTRAINT IF EXISTS|ADD CONSTRAINT|CREATE TABLE IF NOT EXISTS|CREATE INDEX IF NOT EXISTS/,
+      );
+    }
   });
 });

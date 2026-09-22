@@ -184,7 +184,7 @@ maybe('провижининг против живого Postgres', () => {
     // целиком: падает beforeAll, а с ним все 33 теста. На первой же батарее
     // мутаций это выглядело как идеальная ловля — прибор врал, а не сторожил.
     await pool?.query(
-      'TRUNCATE products, product_provision_jobs, product_turns, product_host_agent, product_hosts RESTART IDENTITY CASCADE',
+      'TRUNCATE products, product_provision_jobs, product_turns, product_host_agent, product_hosts, product_user_limits RESTART IDENTITY CASCADE',
     );
     await pool?.end();
   });
@@ -198,8 +198,14 @@ maybe('провижининг против живого Postgres', () => {
     // переживает сценарий, а «машина own заводится» проверялось бы на машине,
     // заведённой соседом. Обе таблицы в ОДНОМ операторе — products ссылается на
     // product_hosts, и порознь TRUNCATE отобьётся внешним ключом.
+    //
+    // product_user_limits — третья того же рода и добавлена ВМЕСТЕ с таблицей,
+    // а не после первой неприятности: поднятый потолок переживал бы сценарий, и
+    // соседний «третий продукт отбивается» зеленел бы (или краснел) на чужом
+    // исключении. Внешнего ключа у неё нет, в CASCADE она попадает просто как
+    // член списка.
     await pool.query(
-      'TRUNCATE products, product_provision_jobs, product_turns, product_host_agent, product_hosts RESTART IDENTITY CASCADE',
+      'TRUNCATE products, product_provision_jobs, product_turns, product_host_agent, product_hosts, product_user_limits RESTART IDENTITY CASCADE',
     );
   });
 
@@ -1422,6 +1428,11 @@ maybe('провижининг против живого Postgres', () => {
     // только запрет зеленел бы и на выдаче, где не осталось ничего.
     expect(Object.keys(rows[0]).sort()).toEqual(
       [
+        // Гашение администратором (миграция 007). По той же причине, что и
+        // sleep_reason: статус 'blocked' сам по себе владельцу не объясняет
+        // ничего, а общего списка продуктов у администратора нет — спросить
+        // владельцу больше негде.
+        'block_reason',
         'created_at',
         'domain',
         'id',
@@ -1548,6 +1559,94 @@ maybe('провижининг против живого Postgres', () => {
     // И продукт после рестарта по-прежнему спит: откатившаяся 002 не должна
     // была ни разбудить его, ни оставить таблицу без словаря.
     expect((await getProduct(p.id)).status).toBe('sleeping');
+  });
+
+  it('20е. рестарт API при БЛОКИРОВАННОМ продукте не отбивает ни одной миграции', async () => {
+    // ТОТ ЖЕ КЛАСС, ЧТО 20д, И ТА ЖЕ ЦЕНА. Блокировка — штатное состояние
+    // (администратор погасил недопустимый сайт, и продукт живёт так, пока
+    // разбираются), а накатка схемы при каждом старте API прогоняет ВЕСЬ список,
+    // включая 002 и 004: обе навешивают ИМЕНОВАННЫЙ словарь статусов на живые
+    // строки заново. Файл, отставший от 007, падает на строке блокированного
+    // продукта, целиком откатывается, applyMigration пишет строку в лог и едет
+    // дальше — и становится мёртвым молча, навсегда.
+    //
+    // Проверяется ИСПОЛНЕНИЕМ: по тексту каждый файл в отдельности безупречен и
+    // идемпотентен, отношение МЕЖДУ файлами в нём не видно.
+    //
+    // Сам UPDATE ниже — тоже утверждение, а не подготовка: словарь без 'blocked'
+    // отобьёт его, и сценарий покраснеет на строке, где ставится статус.
+    const p = await product({ slug: 'restart-blocked', status: 'running' });
+    await pool.query(
+      `UPDATE products SET status = 'blocked', block_reason = 'жалоба на содержимое' WHERE id = $1`,
+      [p.id],
+    );
+
+    const refused: string[] = [];
+    for (const f of MIGRATIONS) {
+      try {
+        await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', f), 'utf8'));
+      } catch (e: any) {
+        refused.push(`${f}: ${e.message}`);
+      }
+    }
+
+    expect(refused).toEqual([]);
+    // Рестарт не воскрешает погашенного и не теряет причину: владелец обязан
+    // видеть в карточке, за что именно продукт остановлен, а не голое
+    // «остановлен».
+    const after = await getProduct(p.id);
+    expect(after.status).toBe('blocked');
+    expect(after.block_reason).toBe('жалоба на содержимое');
+  });
+
+  it('20ж. поднятый потолок аккаунта переживает повторную накатку', async () => {
+    // Ловушка 004 с бесплатным месяцем, только с другой стороны. Файл
+    // исполняется при КАЖДОМ старте API, и `CREATE TABLE IF NOT EXISTS` обязан
+    // быть в нём ЕДИНСТВЕННЫМ, что касается этой таблицы: INSERT умолчания или
+    // UPDATE «приведём к норме» сбрасывали бы поднятый вручную потолок на
+    // каждом рестарте — молча, и заметно только по отказу заведения у человека,
+    // которому потолок подняли месяц назад.
+    await pool.query(
+      `INSERT INTO product_user_limits (user_id, max_products, note)
+       VALUES ('u-щедрый', 5, 'по просьбе владельца 22.09')`,
+    );
+
+    for (const f of MIGRATIONS) {
+      await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', f), 'utf8'));
+    }
+
+    const rows = (await pool.query('SELECT * FROM product_user_limits ORDER BY user_id')).rows;
+    // И ровно одна строка: повторный CREATE TABLE не заводит дубль, а сама
+    // накатка не добавляет строк никому.
+    expect(rows).toHaveLength(1);
+    expect(Number(rows[0].max_products)).toBe(5);
+    expect(rows[0].note).toBe('по просьбе владельца 22.09');
+  });
+
+  it('20з. потолок аккаунта не бывает нулевым', async () => {
+    // Ноль означал бы аккаунт, которому нельзя ничего, — запрет, неотличимый
+    // для владельца от обычного отказа по потолку. Запрещать продукты — дело
+    // статуса blocked, который называет причину вслух. Проверяется на живой
+    // базе: CHECK, не доехавший до неё, читается в файле так же, как доехавший.
+    await expect(
+      pool.query(`INSERT INTO product_user_limits (user_id, max_products) VALUES ('u-ноль', 0)`),
+    ).rejects.toThrow(/max_products/);
+    await expect(
+      pool.query(`INSERT INTO product_user_limits (user_id, max_products) VALUES ('u-минус', -1)`),
+    ).rejects.toThrow(/max_products/);
+  });
+
+  it('20и. потолок аккаунта — ОДНА строка на владельца', async () => {
+    // Потолок читается подзапросом без ORDER BY и без max(): вторая строка на
+    // того же владельца означала бы потолок, выбираемый наугад. Единственность
+    // держит база, а не аккуратность того, кто заводит исключение руками.
+    await pool.query(
+      `INSERT INTO product_user_limits (user_id, max_products) VALUES ('u-дубль', 5)`,
+    );
+
+    await expect(
+      pool.query(`INSERT INTO product_user_limits (user_id, max_products) VALUES ('u-дубль', 9)`),
+    ).rejects.toThrow(/product_user_limits_pkey/);
   });
 
   // ═══════════════ отметка о жизни агента хоста ═══════════════
@@ -3361,6 +3460,139 @@ maybe('провижининг против живого Postgres', () => {
       expect(await jobsOf(archived.id)).toEqual([]);
       expect((await getProduct(awake.id)).status).toBe('running');
       await expectUntouched(other);
+    });
+  });
+
+  // ═══════════ блокированный продукт против аренды и будильника ═══════════
+
+  /**
+   * ГЛАВНОЕ, РАДИ ЧЕГО ГАШЕНИЕ СДЕЛАНО ОТДЕЛЬНЫМ СТАТУСОМ, А НЕ ПРИЧИНОЙ СНА.
+   *
+   * Утверждение куска — «блокированный выпадает из аренды и будильника САМ
+   * СОБОЙ, потому что те отбирают по конкретным статусам». Утверждение
+   * правдоподобное и потому опасное: оно держится на ОТСУТСТВИИ значения в
+   * чужих фильтрах, а отсутствие возвращается незаметно — достаточно, чтобы
+   * кто-нибудь однажды расширил `IN ('running','degraded')` или написал «всё,
+   * кроме архивных».
+   *
+   * Проверяется здесь, в куске со схемой, а не рядом с гашением: гашения ещё
+   * нет, а свойство уже есть, и появиться оно обязано ВМЕСТЕ со статусом.
+   * Исполнением, а не по тексту: фильтр читается в файле совершенно одинаково
+   * и до, и после такой правки.
+   */
+  describe('блокированный вне денег', () => {
+    beforeAll(ensureBillingTables);
+    beforeEach(() => pool.query('TRUNCATE ai_profiles_consolidated, token_transactions'));
+    afterAll(() => pool.query('TRUNCATE ai_profiles_consolidated, token_transactions'));
+
+    it('82. с блокированного аренда не списывается, даже когда срок истёк и деньги есть', async () => {
+      // Худший исход: администратор погасил продукт, а с владельца каждый месяц
+      // продолжают брать 50 000 за остановленный контейнер. Увидит это владелец
+      // в своём балансе, а узнаем мы от него.
+      //
+      // ЧТО ИМЕННО СТОРОЖИТ — измерено мутациями, а не выведено. Денег между
+      // блокированным продуктом и балансом два слоя: отбор `tick` и предусловие
+      // `chargeRent`. Здесь проверяется ИСХОД, то есть оба разом, и цена этого
+      // названа честно: мутация ОДНОГО только отбора (`tick` берёт и
+      // блокированных) оставляет сценарий зелёным — второй слой отбивает
+      // списание. Её ловит форма запроса («обход отбирает только неоплаченных,
+      // живых и не архивных»), а внутренний слой — сценарий 83.
+      const other = await bystander();
+      const p = await due({ slug: 'blk-rent', overdue: '1 day' });
+      await pool.query(`UPDATE products SET status = 'blocked' WHERE id = $1`, [p.id]);
+      await setBalance('u-1', 500_000);
+
+      await rent().tick();
+
+      expect(await balanceOf('u-1')).toBe(500_000);
+      expect(await ledgerOf('u-1')).toEqual([]);
+      // И статус не тронут: сборщик не усыпляет блокированного «заодно» —
+      // requestSleep берёт только running/degraded.
+      expect((await getProduct(p.id)).status).toBe('blocked');
+      expect(await jobsOf(p.id)).toEqual([]);
+      await expectUntouched(other);
+    });
+
+    it('83. chargeRent, позванный по блокированному НАПРЯМУЮ, тоже ничего не берёт', async () => {
+      // Отбор `tick` и предусловие `chargeRent` — два РАЗНЫХ места с одним и
+      // тем же списком статусов. Сценарий 82 проверяет первое: сними условие у
+      // chargeRent, и он останется зелёным, потому что до chargeRent дело не
+      // дойдёт. Прод работает в кластере, и второй процесс зовёт chargeRent по
+      // продукту, который первый отобрал секунду назад.
+      const p = await due({ slug: 'blk-charge', overdue: '1 day' });
+      await pool.query(`UPDATE products SET status = 'blocked' WHERE id = $1`, [p.id]);
+      await setBalance('u-1', 500_000);
+
+      await expect(rent().chargeRent(p.id)).resolves.toBe(false);
+
+      expect(await balanceOf('u-1')).toBe(500_000);
+    });
+
+    it('84. пополнение НЕ будит блокированного, а спящего рядом будит', async () => {
+      // ГЛАВНЫЙ СЦЕНАРИЙ КУСКА. Ровно это делало бы гашение причиной сна
+      // бессмысленным: wakeAffordable отбирает по статусу 'sleeping' и ставит
+      // задание пробуждения каждому, на кого хватает баланса. Спящий рядом — не
+      // украшение: без него сценарий зеленел бы и при будильнике, который не
+      // будит ВООБЩЕ никого.
+      const asleep = await due({ slug: 'blk-asleep', status: 'sleeping', overdue: '2 days' });
+      const blocked = await due({ slug: 'blk-blocked', overdue: '1 day' });
+      await pool.query(`UPDATE products SET status = 'blocked' WHERE id = $1`, [blocked.id]);
+      await setBalance('u-1', 500_000);
+
+      expect(await rent().wakeTick()).toBe(1);
+
+      expect(await jobKindsOf(asleep.id)).toEqual(['wake']);
+      expect(await jobsOf(blocked.id)).toEqual([]);
+      expect((await getProduct(blocked.id)).status).toBe('blocked');
+    });
+
+    it('85. владельцу ОДНОГО только блокированного продукта пробуждать нечего', async () => {
+      // Случай, которого нет в 84: у владельца НЕТ ни одного спящего продукта,
+      // то есть будильнику не за что зацепиться вовсе. На проде это самый
+      // частый вид блокированного аккаунта — один продукт, и тот погашен.
+      //
+      // ЧЕГО ЭТОТ СЦЕНАРИЙ НЕ СТОРОЖИТ — измерено мутациями, а не выведено.
+      // Будильник двухэтажный: `wakeTick` собирает владельцев, `wakeAffordable`
+      // отбирает продукты. Мутация ВНЕШНЕГО этажа (wakeTick собирает и
+      // владельцев блокированных) оставляет сценарий зелёным — внутренний
+      // этаж всё равно не находит, что будить, и ответ по-прежнему 0. Её ловит
+      // форма запроса («владельцы берутся из СПЯЩИХ продуктов, а не из следов
+      // пополнения»); внутренний этаж сторожит сценарий 84.
+      const blocked = await due({ slug: 'blk-alone', overdue: '1 day', userId: 'u-один' });
+      await pool.query(`UPDATE products SET status = 'blocked' WHERE id = $1`, [blocked.id]);
+      await setBalance('u-один', 500_000);
+
+      expect(await rent().wakeTick()).toBe(0);
+
+      expect(await jobsOf(blocked.id)).toEqual([]);
+    });
+
+    it('86. блокированный ЗАНИМАЕТ место на машине — до архивации, а не до гашения', async () => {
+      // Потолок машины считает всё, кроме архивных. Вычти из него блокированных
+      // — и погашенный продукт освободил бы место, которое по-прежнему занимают
+      // его каталог, контейнер и запись домена: машина набрала бы продуктов
+      // сверх ёмкости, а снятие блокировки подняло бы их все разом.
+      const p = await product({ slug: 'blk-slot', host: 'clients', status: 'running' });
+      await pool.query(`UPDATE products SET status = 'blocked' WHERE id = $1`, [p.id]);
+      await pool.query(`UPDATE product_hosts SET capacity = 1 WHERE id = 'clients'`);
+
+      await expect(
+        makeSvc().create({
+          userId: 'u-кли',
+          isAdmin: false,
+          name: 'второй',
+          slug: 'blk-slot-2',
+          kind: 'site',
+          secrets: {},
+        }),
+        // Текст именно про МЕСТА: пустой реестр и отсутствие машины нужной
+        // аудитории отвечают своими, и голый rejects.toThrow() зеленел бы на
+        // любом из них — в том числе на «column does not exist».
+      ).rejects.toThrow(/Свободных мест/);
+      // Заодно: отбитое заведение не оставило после себя ни строки продукта.
+      expect(
+        (await pool.query(`SELECT count(*) FROM products WHERE slug = 'blk-slot-2'`)).rows[0].count,
+      ).toBe('0');
     });
   });
 
