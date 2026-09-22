@@ -25,6 +25,7 @@ import axios from 'axios';
 import { Request, Response } from 'express';
 import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
 import { sendTelegramAlert } from '../common/telegram-alert';
+import { RELAY_TURN_BUDGET_MS } from '../common/relay-budget';
 // Agent server at r.linkeon.io (remote Claude Code)
 
 /** Файл в папке сессии, как его отдаёт relay (`GET /session/:sid/files`). */
@@ -1583,7 +1584,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
         const agentRes = await axios.post(`${AGENT_URL}/chat`, fd, {
           headers: fd.getHeaders(),
           responseType: 'stream',
-          timeout: 600000, // 10 min
+          timeout: RELAY_TURN_BUDGET_MS,
         });
 
         await new Promise<void>((resolve, reject) => {
