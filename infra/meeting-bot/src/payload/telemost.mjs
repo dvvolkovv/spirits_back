@@ -96,6 +96,21 @@ export const TELEMOST_PAYLOAD = `
     send('chat', { id: String(d.id), text: String(d.text), author: String(d.author || 'участник') });
   });
 
+  /**
+   * Кусок живой ленты чата — для разбора зацепок по факту.
+   *
+   * В новом Телемосте отдельного кадра мессенджера больше нет: чат встроен в
+   * саму страницу встречи, и прежний читатель, ждавший кадр yandex.ru/chat,
+   * не запускается вовсе. Что там за разметка — знает только живая встреча.
+   */
+  window.__botChatSample = () => {
+    const el = document.querySelector(
+      '[class*="yamb-message-list"], [class*="message-list"], [data-testid*="message-list"],' +
+      ' [class*="yamb-message"], [data-testid*="chat-panel"], [data-testid*="chat"]',
+    );
+    return el ? el.outerHTML.slice(0, 4000) : '';
+  };
+
   send('ready', { url: location.host + location.pathname });
 })();
 `;
