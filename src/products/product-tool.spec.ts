@@ -16,15 +16,28 @@ maybe('инструмент продуктов против живого Postgre
   const OWNER = '79030169187';
   const ALIEN = '70000000000';
 
-  /** Заводит продукт напрямую в базе: провижининг здесь не проверяется. */
+  /**
+   * Заводит продукт напрямую в базе: провижининг здесь не проверяется.
+   *
+   * `checkout_path` и `runner_token_hash` заполняются мусором не для вида:
+   * в 001 они NOT NULL И БЕЗ DEFAULT, поэтому INSERT без них не проходит
+   * вовсе — падает вся девятка, ещё не дойдя до поиска. У хеша вдобавок
+   * UNIQUE, так что значение выводится из слага (слаг тоже уникален) —
+   * константа развалила бы второй INSERT в тестах на два продукта.
+   */
   const mkProduct = async (o: {
     user?: string; name: string; slug: string; domain?: string | null;
     kind?: string; status?: string;
   }) => {
     const r = await pool.query(
-      `INSERT INTO products (user_id, name, slug, domain, kind, status)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-      [o.user ?? OWNER, o.name, o.slug, o.domain ?? null, o.kind ?? 'site', o.status ?? 'running'],
+      `INSERT INTO products (user_id, name, slug, domain, kind, status,
+                             checkout_path, runner_token_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+      [
+        o.user ?? OWNER, o.name, o.slug, o.domain ?? null,
+        o.kind ?? 'site', o.status ?? 'running',
+        `/srv/${o.slug}`, `hash-${o.slug}`,
+      ],
     );
     return r.rows[0].id as string;
   };
