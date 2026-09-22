@@ -95,3 +95,22 @@ test('имена Zoom доходят как есть', async () => {
   await bot.onPageEvent('participants', { people: [{ uuid: '16778240', name: 'Дмитрий' }] });
   assert.deepEqual(sent, ['join:Дмитрий']);
 });
+
+test('одно сообщение чата отдаётся один раз, даже если пришло из двух кадров', async () => {
+  // Сценарий работает во всех кадрах страницы, а новый Телемост держит ленту
+  // сразу в двух — в боковой панели и в самой встрече. Идентификаторы у кадров
+  // свои, поэтому сверяем по автору и тексту.
+  const { bot } = botWith();
+  const sent = [];
+  bot.webhookUrl = '';   // вебхуки наружу не шлём, важен сам факт обработки
+  bot.log = { info: (m) => sent.push(String(m)), warn() {} };
+
+  await bot.onPageEvent('chat', { id: 'a1', text: 'Привет Роман!', author: 'Владимир К.' });
+  await bot.onPageEvent('chat', { id: 'b2', text: 'Привет Роман!', author: 'Владимир К.' });
+  assert.equal(sent.filter((l) => l.includes('чат:')).length, 1);
+
+  // Через четверть минуты то же сообщение — уже новая реплика человека.
+  bot.chatSeen.set('Владимир К.::Привет Роман!', Date.now() - 20_000);
+  await bot.onPageEvent('chat', { id: 'c3', text: 'Привет Роман!', author: 'Владимир К.' });
+  assert.equal(sent.filter((l) => l.includes('чат:')).length, 2);
+});

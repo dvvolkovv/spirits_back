@@ -96,6 +96,8 @@ export class MeetingBot {
     this.page = null;
     this.ws = null;
     this.chatAuthors = new Map();
+    /** Недавно отданные сообщения — против повтора из соседнего кадра. */
+    this.chatSeen = new Map();
     /** Кто во встрече ПО ПОДТВЕРЖДЁННЫМ событиям, а не по площадке: uuid → имя. */
     this.people = new Map();
     this.syncing = false;
@@ -215,6 +217,18 @@ export class MeetingBot {
 
       case 'chat': {
         const author = String(data?.author || 'участник');
+        // Одно сообщение — одно событие.
+        //
+        // Сценарий работает во ВСЕХ кадрах страницы, а новый Телемост держит
+        // ленту сразу в двух: в боковой панели оболочки и в самой встрече.
+        // Каждая отдаёт сообщение своим чередом, и ассистент читает его дважды
+        // (живая встреча 22.09.2026). Ключ — автор и текст: идентификаторы у
+        // разных кадров свои.
+        const key = `${author}::${String(data?.text || '').trim()}`;
+        const now = Date.now();
+        for (const [k, at] of this.chatSeen) if (now - at > 15_000) this.chatSeen.delete(k);
+        if (this.chatSeen.has(key)) break;
+        this.chatSeen.set(key, now);
         if (!this.chatAuthors.has(author)) this.chatAuthors.set(author, `chat-${this.chatAuthors.size + 1}`);
         await sendWebhook(this.webhookUrl, this.webhookSecret, event(this.id, this.metadata, 'chat_messages.update', {
           text: String(data?.text || ''),
