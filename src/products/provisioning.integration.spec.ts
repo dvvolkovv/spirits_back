@@ -11,6 +11,7 @@ import * as path from 'path';
 import { Pool } from 'pg';
 import { HostGuard } from './host.guard';
 import { HostsService } from './hosts.service';
+import { DEFAULT_MAX_PRODUCTS, LimitsService } from './limits.service';
 import { MIGRATIONS, ProductsService } from './products.service';
 import { ProvisioningService } from './provisioning.service';
 import { RentService } from './rent.service';
@@ -129,12 +130,15 @@ maybe('провижининг против живого Postgres', () => {
   let secrets: SecretsService;
 
   /**
-   * НАСТОЯЩИЙ HostsService на том же пуле, а не заглушка. Выбор машины — это
-   * один запрос, и всё, что в нём можно сломать (потолок в SQL, счёт по своей
-   * машине, ORDER BY, скалярные счётчики причин), заглушка не исполняет вовсе.
+   * НАСТОЯЩИЕ HostsService и LimitsService на том же пуле, а не заглушки.
+   * Выбор машины и предел аккаунта — по одному запросу каждый, и всё, что в них
+   * можно сломать (потолок в SQL, счёт по своей машине, ORDER BY, скалярные
+   * счётчики причин, COALESCE умолчания, отбор по archived_at), заглушка не
+   * исполняет вовсе. Заглушка предела, отдающая «можно» на любой вход, сделала
+   * бы каждый сценарий ниже зелёным при полностью отсутствующей реализации.
    */
   const makeSvc = (probe?: (url: string, init?: any) => Promise<{ status: number }>) => {
-    const svc = new ProvisioningService(pg as any, secrets, new HostsService(pg as any));
+    const svc = new ProvisioningService(pg as any, secrets, new HostsService(pg as any), new LimitsService(pg as any));
     (svc as any).fetchFn = probe ?? (async () => ({ status: 200 }));
     return svc;
   };
@@ -217,6 +221,15 @@ maybe('провижининг против живого Postgres', () => {
 
   type Seed = {
     slug?: string;
+    /**
+     * Владелец. По умолчанию 'u-1' — тот же, что был вписан в фикстуру
+     * константой до появления предела на аккаунт.
+     *
+     * Поле заведено ради сценариев 87–95: предел считает продукты ОДНОГО
+     * владельца, и «сосед не занимает моё место» на фикстуре с одним
+     * захардкоженным владельцем не выражается вовсе.
+     */
+    userId?: string;
     /** По умолчанию своё у каждого продукта: имя не должно совпадать ни со
      *  слагом, ни с именем соседа — иначе перепутанные строки неразличимы. */
     name?: string;
@@ -317,7 +330,7 @@ maybe('провижининг против живого Postgres', () => {
       `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path,
                              runner_token_hash, secrets_encrypted, port,
                              runner_seen_at, created_at, host_id, host_ip, domain)
-       VALUES ($1, 'u-1', $10, $2, $3, $4, '/product', $5, $6, $7,
+       VALUES ($1, $14, $10, $2, $3, $4, '/product', $5, $6, $7,
                CASE WHEN $8::text IS NULL THEN NULL ELSE now() - $8::interval END,
                now() - $9::interval, $11, $12, $13)`,
       [
@@ -336,6 +349,7 @@ maybe('провижининг против живого Postgres', () => {
         host?.id ?? null,
         host?.ip ?? null,
         domain,
+        o.userId ?? 'u-1',
       ],
     );
     return { id, slug, name, domain };
@@ -1207,7 +1221,7 @@ maybe('провижининг против живого Postgres', () => {
         return r;
       },
     };
-    const svc = new ProvisioningService(racingPg as any, secrets, new HostsService(racingPg as any));
+    const svc = new ProvisioningService(racingPg as any, secrets, new HostsService(racingPg as any), new LimitsService(racingPg as any));
 
     const e = await svc
       .create({ userId: 'u-9', isAdmin: true, name: 'гонка', slug: 'raced-slug', kind: 'site', secrets: {} })
@@ -3596,6 +3610,306 @@ maybe('провижининг против живого Postgres', () => {
     });
   });
 
+  // ═════════════ предел числа продуктов на аккаунт (кусок 4б) ═════════════
+  //
+  // Весь блок — против ЖИВОЙ базы, и это не перестраховка. Всё, чем предел
+  // держится, живёт в одном операторе: COALESCE умолчания, отбор по владельцу,
+  // отбор по archived_at и само сравнение. Заглушка pg не исполняет ни одного
+  // из них, то есть юнит-прогон одинаково зелен и на работающем пределе, и на
+  // реализации, отдающей «можно» на любой вход.
+
+  describe('предел продуктов на аккаунт', () => {
+    /**
+     * Заведение от имени КОНКРЕТНОГО владельца. Умолчание — не админ: предел
+     * считается именно для них, а вкладка куском 4б открывается всем.
+     */
+    const create = (o: { slug: string; userId?: string; isAdmin?: boolean }) =>
+      makeSvc().create({
+        userId: o.userId ?? 'u-кли',
+        isAdmin: o.isAdmin ?? false,
+        name: `имя ${o.slug}`,
+        slug: o.slug,
+        kind: 'site',
+        secrets: {},
+      });
+
+    /** Отказ, а не результат: `.rejects` не даёт посмотреть на код ответа. */
+    const refusedOn = (p: Promise<unknown>) => p.then(() => null, (e: any) => e);
+
+    /** Поднять предел конкретному аккаунту — ровно так, как это делается руками. */
+    const raise = (userId: string, max: number) =>
+      pool.query(
+        `INSERT INTO product_user_limits (user_id, max_products, note)
+         VALUES ($1, $2, 'по просьбе')`,
+        [userId, max],
+      );
+
+    const liveOf = async (userId: string) =>
+      Number(
+        (
+          await pool.query(
+            `SELECT count(*) FROM products WHERE user_id = $1 AND archived_at IS NULL`,
+            [userId],
+          )
+        ).rows[0].count,
+      );
+
+    it('87. третий продукт отбивается пределом аккаунта: 422 и текст, который кабинет покажет', async () => {
+      // ГЛАВНЫЙ СЦЕНАРИЙ ЗАДАЧИ. Места на машине ЕСТЬ — двадцать, занято два.
+      // Без предела третий завёлся бы, и один человек забрал бы всю клиентскую
+      // машину бесплатно: первый месяц аренды не стоит ничего.
+      await addHost({ id: 'clients', capacity: 20 });
+      await create({ slug: 'ss-a' });
+      await create({ slug: 'ss-b' });
+
+      const e = await refusedOn(create({ slug: 'ss-c' }));
+
+      // Код разбирает КАБИНЕТ: на 409 он показывает «Этот адрес уже занят», а
+      // весь пятисотый диапазон глушит своим текстом. 422 — единственный, в
+      // котором владелец прочитает НАШУ формулировку.
+      expect(e).toBeInstanceOf(UnprocessableEntityException);
+      expect(e.getStatus()).toBe(422);
+      // Текст называет и предел, и действие. Действие существует: архивации в
+      // продукте нет ни кнопки, ни маршрута, ни строки кода, поэтому советовать
+      // её нельзя, а «попробуйте позже» — прямая неправда, само не пройдёт.
+      expect(String(e.message)).toMatch(/Предел — 2 продукта/);
+      expect(String(e.message)).toMatch(/напишите нам/i);
+      expect(String(e.message)).not.toMatch(/позже|архив/i);
+      // И причина СВОЯ: про места на машинах здесь ни слова — они свободны.
+      expect(String(e.message)).not.toMatch(/мест/i);
+
+      // Отказ не оставляет ни строки, ни занятого слага, ни лишнего задания:
+      // два задания — ровно от двух удавшихся заведений.
+      expect(await liveOf('u-кли')).toBe(2);
+      expect(
+        Number((await pool.query(`SELECT count(*) FROM products WHERE slug = 'ss-c'`)).rows[0].count),
+      ).toBe(0);
+      expect(
+        Number((await pool.query('SELECT count(*) FROM product_provision_jobs')).rows[0].count),
+      ).toBe(2);
+    });
+
+    it('88. предел считает спящих и блокированных, но не архивных', async () => {
+      // Место занято до АРХИВАЦИИ, а не до остановки: у спящего остаются
+      // каталог, контейнер и запись домена, и просыпается он от одного
+      // пополнения баланса. Не считать спящих — значит позволить накопить
+      // продуктов сверх предела и поднять их все разом.
+      await addHost({ id: 'clients', capacity: 20 });
+      const a = await create({ slug: 'ss-sl' });
+      const b = await create({ slug: 'ss-bl' });
+      await pool.query(`UPDATE products SET status = 'sleeping' WHERE id = $1`, [a.productId]);
+      await pool.query(`UPDATE products SET status = 'blocked'  WHERE id = $1`, [b.productId]);
+
+      expect(String((await refusedOn(create({ slug: 'ss-c2' }))).message)).toMatch(/Предел/);
+
+      // Архивация — единственное, что освобождает место.
+      await pool.query(`UPDATE products SET archived_at = now() WHERE id = $1`, [a.productId]);
+      const ok = await create({ slug: 'ss-c3' });
+      expect((await getProduct(ok.productId)).host_id).toBe('clients');
+    });
+
+    it('89. поднятый предел действует ТОЛЬКО своему аккаунту, и число в отказе едет из строки', async () => {
+      // «Больше — по просьбе, отдельному человеку» (решение владельца).
+      // Реализация с одним пределом на всех прошла бы сценарий 87 зелёной.
+      await addHost({ id: 'clients', capacity: 20 });
+      await raise('u-щедрый', 5);
+
+      for (const s of ['ss-r1', 'ss-r2', 'ss-r3', 'ss-r4', 'ss-r5']) {
+        await create({ slug: s, userId: 'u-щедрый' });
+      }
+      expect(await liveOf('u-щедрый')).toBe(5);
+
+      // Шестой отбивается ЕГО числом, а не умолчанием: текст, в котором стоит
+      // двойка, означал бы предел, прочитанный не из строки исключения.
+      const his = await refusedOn(create({ slug: 'ss-r6', userId: 'u-щедрый' }));
+      expect(String(his.message)).toMatch(/Предел — 5 продуктов/);
+
+      // А соседу — по-прежнему два: исключение не расползается на аккаунты.
+      await create({ slug: 'ss-n1', userId: 'u-сосед' });
+      await create({ slug: 'ss-n2', userId: 'u-сосед' });
+      const neighbour = await refusedOn(create({ slug: 'ss-n3', userId: 'u-сосед' }));
+      expect(String(neighbour.message)).toMatch(/Предел — 2 продукта/);
+    });
+
+    it('90. предел спрашивается РАНЬШЕ машины: причина не подменяется чужой', async () => {
+      // Машин нет вовсе — реестр пуст (состояние достижимое: 005 ничего не
+      // заводит при незаполненном PRODUCT_HOST_TOKEN). Владелец двух продуктов
+      // обязан услышать про СВОЙ предел, а не про хостинг: первое лечится
+      // письмом нам, второе — нашей машиной, и ждать его бессмысленно.
+      await product({ slug: 'ss-o1', userId: 'u-кли', status: 'running', host: null, domain: null });
+      await product({ slug: 'ss-o2', userId: 'u-кли', status: 'running', host: null, domain: null });
+
+      const e = await refusedOn(create({ slug: 'ss-o3' }));
+
+      expect(String(e.message)).toMatch(/Предел — 2 продукта/);
+      // Ни одна из трёх причин реестра сюда не доезжает.
+      expect(String(e.message)).not.toMatch(/не настроен|мест|аудитор/i);
+    });
+
+    it('91. предел считает продукты ЭТОГО владельца, а не все подряд', async () => {
+      // `count(*) FROM products` без условия по владельцу выглядит упрощением и
+      // запирает всех разом, как только двое завели по продукту. Своих
+      // продуктов здесь ноль, чужих — три.
+      await addHost({ id: 'clients', capacity: 20 });
+      for (const s of ['ss-x1', 'ss-x2', 'ss-x3']) {
+        await product({ slug: s, userId: 'u-сосед', host: 'clients' });
+      }
+
+      const r = await create({ slug: 'ss-mine', userId: 'u-кли' });
+
+      expect((await getProduct(r.productId)).host_id).toBe('clients');
+    });
+
+    it('92. счёт и предел сравниваются ЧИСЛАМИ: девять разрешённых против десяти заведённых', async () => {
+      // ДЕВЯТЬ И ДЕСЯТЬ ВЫБРАНЫ НАРОЧНО. Лексикографически '10' < '9', то есть
+      // сравнение строк ответило бы «место есть» — и предел молча перестал бы
+      // работать у всех, кому его подняли выше девяти.
+      //
+      // ПРИБОР, ОБЪЯСНЯЮЩИЙ, ПОЧЕМУ СРАВНЕНИЕ ЖИВЁТ В SQL: типы в выдаче
+      // РАЗНЫЕ. count(*) — bigint, и node-pg отдаёт его строкой; max_products —
+      // int4, и он приезжает числом. На этом расхождении JS-сравнение работает
+      // СЛУЧАЙНО (строка приводится к числу), и мутация «убрать Number()»
+      // зелена — то есть щель есть, а сторожа у неё в JS быть не может. В SQL
+      // типы точные, и щели не остаётся.
+      await addHost({ id: 'clients', capacity: 20 });
+      await raise('u-кли', 9);
+      for (let i = 1; i <= 10; i++) {
+        await product({ slug: `ss-num${i}`, userId: 'u-кли', host: 'clients' });
+      }
+
+      const e = await refusedOn(create({ slug: 'ss-num11' }));
+      expect(String(e.message)).toMatch(/Предел — 9 продуктов/);
+
+      const types = await pool.query(
+        `SELECT (SELECT count(*) FROM products WHERE user_id = 'u-кли') AS used,
+                (SELECT max_products FROM product_user_limits WHERE user_id = 'u-кли') AS allowed`,
+      );
+      expect(typeof types.rows[0].used).toBe('string');
+      expect(typeof types.rows[0].allowed).toBe('number');
+    });
+
+    it('93. администратора предел аккаунта не держит, а потолок СВОЕЙ машины — держит', async () => {
+      // Предел бережёт клиентскую машину и бесплатный месяц, а продукты
+      // администратора туда не попадают вовсе — они уезжают на машины
+      // аудитории own. Цена обратного решения снята с прода 22.09.2026: у
+      // аккаунта владельца РОВНО ДВА живых продукта (demo и shop2), то есть
+      // предел, распространённый на администратора, запер бы владельца в день
+      // выката — на его собственной машине с восемнадцатью свободными местами.
+      //
+      // Вторая половина сценария обязательна: без неё «админ не считается»
+      // было бы зелено и у реализации, которая админу не проверяет ВООБЩЕ
+      // ничего. Админ ограничен — просто другим числом и по другому поводу.
+      await ensureHost('own');
+      for (const s of ['ss-adm1', 'ss-adm2', 'ss-adm3']) {
+        await create({ slug: s, userId: 'u-адм', isAdmin: true });
+      }
+      expect(await liveOf('u-адм')).toBe(3);
+
+      await pool.query(`UPDATE product_hosts SET capacity = 3 WHERE id = 'own'`);
+      const e = await refusedOn(create({ slug: 'ss-adm4', userId: 'u-адм', isAdmin: true }));
+      expect(String(e.message)).toMatch(/мест/i);
+      expect(String(e.message)).not.toMatch(/Предел —/);
+    });
+
+    it('94. умолчание живёт КОНСТАНТОЙ кода, а не строкой в таблице', async () => {
+      // Таблица исключений остаётся ПУСТОЙ у обычного аккаунта: строка
+      // умолчания, дописанная «для порядка», превратила бы правку константы в
+      // правку данных всех аккаунтов сразу, а заведённые до неё молча остались
+      // бы на старом числе.
+      await addHost({ id: 'clients', capacity: 20 });
+      for (let i = 0; i < DEFAULT_MAX_PRODUCTS; i++) {
+        await create({ slug: `ss-def${i}` });
+      }
+
+      const e = await refusedOn(create({ slug: 'ss-def-over' }));
+      expect(String(e.message)).toContain(`Предел — ${DEFAULT_MAX_PRODUCTS} `);
+      expect(
+        Number((await pool.query('SELECT count(*) FROM product_user_limits')).rows[0].count),
+      ).toBe(0);
+    });
+
+    it('95. предел аккаунта МЯГКИЙ под одновременными заявками — измерено, не закрыто', async () => {
+      // ИЗМЕРЕНИЕ, А НЕ ПОЖЕЛАНИЕ, И ЦЕНА ЗДЕСЬ НА ПОРЯДОК БОЛЬШЕ ТОЙ, ЧТО
+      // НАЗВАНА В СПЕКЕ. Спека говорит «третий продукт вместо двух».
+      //
+      // Снято на этой же ноде (PostgreSQL 16, один аккаунт, предел 2, потолок
+      // машины снят, два прогона). Заявки пущены Promise.all БЕЗ барьера —
+      // то есть так, как их пустил бы curl в цикле:
+      //
+      //     заявок в залпе   2    3    5   10   20   50
+      //     завелось         2    2    3  5–7 10–15 30–31
+      //
+      // Отбивается примерно половина, остальные проходят. «Третий продукт
+      // вместо двух» верно только для залпа из трёх. Клиентская машина
+      // рассчитана на двадцать продуктов — один аккаунт забирает её ЦЕЛИКОМ
+      // одним залпом, то есть предел не останавливает ровно тот сценарий,
+      // ради которого заведён. От честной ошибки он бережёт, от намеренной —
+      // нет.
+      //
+      // Причина: проверка и вставка это два оператора, а каждый запрос через
+      // пул сам себе транзакция — заявки видят снимок без чужих строк.
+      // Сценарий ниже воспроизводит предельный случай детерминированно: пять
+      // из пяти.
+      //
+      // Одним оператором не чинится: `INSERT … SELECT` берёт тот же снимок, а
+      // FOR UPDATE лочит строку после вычисления условия. Настоящее закрытие —
+      // advisory-лок на владельца (PgService.tryAdvisoryLock, выделенное
+      // соединение) вокруг проверки и вставки. Не сделано в этой задаче
+      // сознательно: вставка продукта — самая сложная запись модуля, а закрытие
+      // предела аккаунта заодно закрывает и сценарий 51м, то есть это своя
+      // задача со своей батареей.
+      //
+      // Тест краснеет, когда предел ЗАКРОЮТ, — и тогда его надо читать, а не
+      // чинить: ограничение снято, комментарий устарел.
+      //
+      // ГОНКА ВОСПРОИЗВОДИТСЯ ТОЧНО, А НЕ ЛОВИТСЯ `Promise.all` — барьером, как
+      // в 51м: все пять проверок предела обязаны СНЯТЬ СНИМОК, и только потом
+      // любое из заведений идёт дальше. Иначе сценарий проходил бы по
+      // настроению пула.
+      await addHost({ id: 'clients', capacity: 20 });
+      const BURST = 5;
+      let checked = 0;
+      let openGate: () => void = () => undefined;
+      const gate = new Promise<void>((r) => (openGate = r));
+      const gatedPg = {
+        query: async (sql: string, params?: any[]) => {
+          const r = await pool.query(sql, params);
+          if (/FROM product_user_limits/.test(sql)) {
+            if (++checked === BURST) openGate();
+            await gate;
+          }
+          return r;
+        },
+      };
+      const raced = () =>
+        new ProvisioningService(
+          gatedPg as any,
+          secrets,
+          new HostsService(gatedPg as any),
+          new LimitsService(gatedPg as any),
+        );
+
+      const all = await Promise.all(
+        Array.from({ length: BURST }, (_, i) =>
+          refusedOn(
+            raced().create({
+              userId: 'u-кли',
+              isAdmin: false,
+              name: `гонка ${i}`,
+              slug: `ss-race${i}`,
+              kind: 'site',
+              secrets: {},
+            }),
+          ),
+        ),
+      );
+
+      expect(checked).toBe(BURST);
+      expect(all.every((e) => e === null)).toBe(true);
+      expect(await liveOf('u-кли')).toBe(BURST);
+    });
+  });
+
   // ═════════════════════ реестр машин (миграция 005) ═════════════════════
 
   describe('реестр машин', () => {
@@ -4334,7 +4648,7 @@ maybe('провижининг против живого Postgres', () => {
           },
         };
         const raced = () =>
-          new ProvisioningService(gatedPg as any, secrets, new HostsService(gatedPg as any));
+          new ProvisioningService(gatedPg as any, secrets, new HostsService(gatedPg as any), new LimitsService(gatedPg as any));
 
         const both = await Promise.all([
           refusedOn(

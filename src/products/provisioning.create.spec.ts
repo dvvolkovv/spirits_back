@@ -1,6 +1,7 @@
 import 'reflect-metadata';
 import { BadRequestException, ConflictException, UnprocessableEntityException } from '@nestjs/common';
 import * as crypto from 'crypto';
+import { LimitsService } from './limits.service';
 import { ProvisioningService } from './provisioning.service';
 import { SecretsService } from './secrets.service';
 import { ProductsModule } from './products.module';
@@ -48,11 +49,21 @@ function makeService(over: any = {}) {
     }),
   };
   const secrets = { encrypt: jest.fn(() => Buffer.from('шифр')) };
+  // Предел аккаунта. Своим сервисом, а не веткой в заглушке pg: запрос предела
+  // и запрос занятости слага оба начинаются с `SELECT count(*)`, и одна ветка
+  // на двоих отвечала бы за оба — то есть «слаг занят» и «мест на аккаунте
+  // нет» стали бы одним и тем же состоянием заглушки.
+  const limits = {
+    assertCanCreate: jest.fn(async () => {
+      if (over.overLimit) throw new UnprocessableEntityException('предел аккаунта');
+    }),
+  };
   return {
-    svc: new ProvisioningService(pg as any, secrets as any, hosts as any),
+    svc: new ProvisioningService(pg as any, secrets as any, hosts as any, limits as any),
     calls,
     secrets,
     hosts,
+    limits,
   };
 }
 
@@ -285,6 +296,52 @@ describe('ProvisioningService.create', () => {
     ).rejects.toBeInstanceOf(UnprocessableEntityException);
 
     expect(calls).toEqual([]);
+  });
+
+  it('предел аккаунта спрашивается ДО машины и ДО слага, и признак админа едет как есть', async () => {
+    // Порядок: «у вас уже два продукта» не чинится ни переименованием, ни
+    // ожиданием, поэтому звучит первым. Стой он после выбора машины — на
+    // забитой машине владелец двух продуктов услышал бы про нехватку мест и
+    // стал бы ждать (поведение сторожит сценарий 90 на живой базе).
+    //
+    // Признак администратора передаётся ТУДА ЖЕ, откуда его берёт выбор
+    // машины: два понятия «свой пользователь» означали бы предел, считаемый по
+    // одному правилу, и машину, выбранную по другому.
+    const { svc, calls, hosts, limits } = makeService({ overLimit: true, noRoom: true, slugTaken: true });
+
+    await expect(
+      svc.create({ userId: 'u-7', isAdmin: false, name: 'X', slug: 'taken', kind: 'site', secrets: {} }),
+    ).rejects.toThrow(/предел/i);
+
+    expect(limits.assertCanCreate).toHaveBeenCalledWith('u-7', false);
+    expect(hosts.pickForNewProduct).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+  });
+
+  it('предел аккаунта спрашивают на КАЖДОМ заведении, и признак админа доезжает истинным', async () => {
+    // Заглушка, зовущая предел один раз на сервис (мемоизация «этому уже
+    // можно»), прошла бы тест выше зелёной. И обратная сторона: `isAdmin`
+    // обязан доехать НЕ приведённым к ложному — иначе админ отбивался бы
+    // пределом, которого для него нет.
+    const { svc, limits } = makeService();
+
+    await svc.create({ userId: 'u-a', isAdmin: true, name: 'X', slug: 's1', kind: 'site', secrets: {} });
+    await svc.create({ userId: 'u-a', isAdmin: true, name: 'X', slug: 's2', kind: 'site', secrets: {} });
+
+    expect(limits.assertCanCreate).toHaveBeenCalledTimes(2);
+    expect(limits.assertCanCreate).toHaveBeenLastCalledWith('u-a', true);
+  });
+
+  it('кривая форма продукта до предела аккаунта не доходит', async () => {
+    // Разбор формы в базу не ходит вовсе, а слаг проверяет ещё и труба
+    // валидации: запрашивать предел ради заведомо невалидного тела незачем.
+    const { svc, limits } = makeService();
+
+    await expect(
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'Мой Сайт!', kind: 'site', secrets: {} }),
+    ).rejects.toThrow(/дефис/i);
+
+    expect(limits.assertCanCreate).not.toHaveBeenCalled();
   });
 
   it('отказ выбора машины не оставляет ни продукта, ни задания', async () => {
@@ -660,5 +717,12 @@ describe('регистрация в ProductsModule', () => {
     // SecretsService — зависимость ProvisioningService. Без него в списке
     // модуль не соберётся вовсе.
     expect(providers).toContain(SecretsService);
+  });
+
+  it('LimitsService объявлен провайдером', () => {
+    // Зависимость ProvisioningService, как и SecretsService: забытая в списке
+    // роняет подъём всего модуля — то есть API не стартует. Громко, но найти
+    // это проще по тесту, чем по строке Nest в логе pm2.
+    expect(providers).toContain(LimitsService);
   });
 });

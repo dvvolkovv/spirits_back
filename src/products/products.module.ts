@@ -12,6 +12,7 @@ import { HostGuard } from './host.guard';
 import { SecretsService } from './secrets.service';
 import { ProvisioningService } from './provisioning.service';
 import { HostsService } from './hosts.service';
+import { LimitsService } from './limits.service';
 import { RentService } from './rent.service';
 
 @Module({
@@ -33,6 +34,12 @@ import { RentService } from './rent.service';
     // вопрос «куда уедет новый продукт» задаёт только заведение, и второго
     // места, где он задаётся, быть не должно.
     HostsService,
+    // Предел числа продуктов на аккаунт. Здесь по той же причине, что и
+    // реестр машин: без него ProvisioningService не инжектируется вовсе, и
+    // падение это ГРОМКОЕ — Nest не поднимет модуль. Наружу не
+    // экспортируется: вопрос «можно ли этому аккаунту ещё один» задаёт только
+    // заведение, и второго места, где он задаётся, быть не должно.
+    LimitsService,
     // Аренда. Своим провайдером, а не дописью в ProvisioningService: тот уже
     // 900 строк и отвечает за заведение, а у аренды другой жизненный цикл.
     // Включён здесь сразу: сервис, которого нет в модуле, не инжектируется

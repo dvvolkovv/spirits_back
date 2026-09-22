@@ -49,7 +49,14 @@ function makeService(
       throw new Error('выбор машины здесь не зовётся: он живёт только в create()');
     }),
   };
-  const svc = new ProvisioningService(pg as any, {} as any, hosts as any);
+  // Предел аккаунта — по тому же правилу и с той же ценой: перевод в running и
+  // сборщик зависших его не спрашивают.
+  const limits = {
+    assertCanCreate: jest.fn(() => {
+      throw new Error('предел аккаунта здесь не спрашивают: он живёт только в create()');
+    }),
+  };
+  const svc = new ProvisioningService(pg as any, {} as any, hosts as any, limits as any);
   (svc as any).fetchFn = fetchImpl ?? (async () => ({ status: 200 }));
   return { svc, calls, pg };
 }
