@@ -98,6 +98,8 @@ export class MeetingBot {
     this.chatAuthors = new Map();
     /** Недавно отданные сообщения — против повтора из соседнего кадра. */
     this.chatSeen = new Map();
+    /** Кадр, в котором живёт аудиограф, отданный площадке. */
+    this.audioFrame = null;
     /** Кто во встрече ПО ПОДТВЕРЖДЁННЫМ событиям, а не по площадке: uuid → имя. */
     this.people = new Map();
     this.syncing = false;
@@ -142,6 +144,32 @@ export class MeetingBot {
     });
   }
 
+  /**
+   * Кадр, который отдал площадке микрофон.
+   *
+   * Голос ассистента надо проигрывать именно туда: сценарий живёт во всех
+   * кадрах, но аудиограф, подключённый к встрече, только один. На новом
+   * Телемосте встреча сидит в дочернем кадре, и речь, отданная в главный
+   * документ, не слышал никто (22.09.2026).
+   *
+   * Найденный кадр помним: кадры при перезагрузке страницы меняются, поэтому
+   * забываем его, как только он перестаёт отвечать.
+   */
+  async micFrame() {
+    const alive = async (f) => !!(await f.evaluate(() => !!window.__botMicServed).catch(() => false));
+    if (this.audioFrame && (await alive(this.audioFrame))) return this.audioFrame;
+    for (const f of this.page?.frames() || []) {
+      if (await alive(f)) {
+        this.audioFrame = f;
+        this.log.info?.(`[${this.id}] голос идёт в кадр ${f.url().slice(0, 60)}`);
+        return f;
+      }
+    }
+    // Не нашли — играем в главный документ: на площадках без кадров это он и
+    // есть, и поведение прежнее.
+    return this.page?.mainFrame();
+  }
+
   /** Кусок голоса ассистента — в страницу. */
   async playFromWorker(raw) {
     let msg;
@@ -150,7 +178,8 @@ export class MeetingBot {
     // Строку отдаём страницу как есть: разбор PCM дешевле сделать там, чем
     // гнать через мост CDP массив чисел.
     try {
-      await this.page?.evaluate((chunk) => window.__botPlayPcm?.(chunk), msg.data.chunk);
+      const frame = await this.micFrame();
+      await frame?.evaluate((chunk) => window.__botPlayPcm?.(chunk), msg.data.chunk);
     } catch (e) {
       // Страница могла уйти — это не повод рушить встречу.
       this.log.warn?.(`[${this.id}] голос не доиграл: ${e?.message}`);
