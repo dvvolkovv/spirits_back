@@ -227,6 +227,12 @@ maybe('инструмент продуктов против живого Postgre
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
       await mkProduct({ name: 'Магазин книг', slug: 'books' });
       const svc = new ProductToolService(pg as any, realTurns());
+      // Потолок в ноль не ради скорости зелёного прогона — ради ВНЯТНОСТИ
+      // красного. Измерено: со снятой веткой уточнения тест уходит в боевое
+      // ожидание (150 с), умирает на таймауте jest в 60 с и рапортует
+      // «timeout» вместо «поставлен ход, которого быть не должно». Сюда
+      // ожидание не доходит вовсе, если ветка на месте.
+      (svc as any).waitMs = 0;
       const out: any = await svc.execute(OWNER, { action: 'edit', product: 'магазин', prompt: 'что-нибудь' });
       expect(out.ok).toBe(false);
       expect(out.reason).toBe('ambiguous');
