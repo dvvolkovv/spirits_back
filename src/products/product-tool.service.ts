@@ -125,6 +125,7 @@ export class ProductToolService {
     const action = String(input?.action ?? '').trim();
     if (action === 'list') return this.list(userId);
     if (action === 'edit') return this.edit(userId, input);
+    if (action === 'status') return this.status(userId, input);
     return {
       ok: false,
       reason: 'bad_action',
@@ -267,5 +268,53 @@ export class ProductToolService {
       [turnId],
     );
     return describeTurn(r.rows[0]);
+  }
+
+  /**
+   * Владелец в WHERE обоих запросов, включая поиск по turnId: без этого
+   * ассистент читал бы исход чужой правки, зная только её идентификатор.
+   *
+   * Разбор исхода — общий `describeTurn`, тот же, что у `edit`. Свой разбор
+   * здесь разъехался бы с тамошним, и «готово» после отката стало бы вопросом
+   * того, каким путём ассистент узнал о ходе.
+   */
+  private async status(userId: string, input: any) {
+    const turnId = String(input?.turnId ?? '').trim();
+    if (turnId) {
+      const r = await this.pg.query(
+        `SELECT t.id, t.status, t.result, t.error, t.tokens_spent
+           FROM product_turns t
+           JOIN products p ON p.id = t.product_id
+          WHERE t.id = $1 AND p.user_id = $2 AND p.archived_at IS NULL`,
+        [turnId, userId],
+      );
+      if (!r.rows[0]) {
+        return { ok: false, reason: 'not_found', say: 'Такой правки у пользователя нет.' };
+      }
+      return describeTurn(r.rows[0]);
+    }
+
+    const matches = await this.resolve(userId, String(input?.product ?? ''));
+    if (matches.length > 1) {
+      return { ok: false, reason: 'ambiguous', matches,
+        say: 'Под это описание подходит несколько продуктов. Спроси, про какой именно рассказать.' };
+    }
+    if (matches.length === 0) {
+      return { ok: false, reason: 'not_found', say: 'Такого продукта у пользователя нет.' };
+    }
+
+    const r = await this.pg.query(
+      `SELECT id, status, result, error, tokens_spent
+         FROM product_turns
+        WHERE product_id = $1 AND user_id = $2
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [matches[0].id, userId],
+    );
+    if (!r.rows[0]) {
+      return { ok: false, reason: 'no_turns', product: matches[0],
+        say: 'У этого продукта ещё не было ни одной правки.' };
+    }
+    return { ...describeTurn(r.rows[0]), product: matches[0] };
   }
 }
