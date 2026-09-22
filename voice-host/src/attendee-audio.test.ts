@@ -1,6 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { AudioFrame } from '@livekit/rtc-node';
+import WebSocket from 'ws';
 import { initializeLogger, loggerOptions } from '@livekit/agents';
 import { AttendeeAudioHub, AttendeeAudioOutput, SAMPLE_RATE, SAMPLES_PER_TICK } from './attendee-audio.js';
 
@@ -356,5 +357,33 @@ describe('AttendeeAudioHub', () => {
       client?.terminate();
       hub.close();
     }
+  });
+});
+
+describe('освобождение порта', () => {
+  test('потеряв бота, хаб отпускает порт сам', async () => {
+    // Порт под звук ОДИН на весь воркер, и пока он занят, следующая встреча
+    // получает отказ. Прежде закрытие висело на завершении процесса задания —
+    // а он живёт ещё долго после конца разговора: 22.09.2026 владелец не смог
+    // позвать ассистента трижды подряд, хотя встреча давно закончилась.
+    const hub = new AttendeeAudioHub(20);   // короткое окно возврата ради теста
+    let lost = false;
+    try {
+      const port = await hub.listen('c1');
+      hub.onLost(() => { lost = true; });
+
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/?callId=c1`);
+      await new Promise((r) => ws.on('open', r));
+      ws.close();
+
+      await new Promise((r) => setTimeout(r, 120));
+      assert.ok(lost, 'о потере бота обязаны сообщить');
+
+      // Порт свободен: второй хаб занимает его без отказа.
+      const next = new AttendeeAudioHub();
+      try {
+        assert.equal(await next.listen('c2'), port, 'порт не освободился');
+      } finally { next.close(); }
+    } finally { hub.close(); }
   });
 });
