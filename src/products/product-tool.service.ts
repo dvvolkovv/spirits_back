@@ -114,4 +114,48 @@ export class ProductToolService {
     );
     return r.rows;
   }
+
+  /**
+   * Единственный вход инструмента. Владелец — ПЕРВЫМ аргументом и приезжает из
+   * проверенной подписи токена (см. точку /mcp/products), а не из поля
+   * запроса: инструменту продуктов аргумента `userId` не дано вовсе.
+   */
+  async execute(userId: string, input: any): Promise<any> {
+    const action = String(input?.action ?? '').trim();
+    if (action === 'list') return this.list(userId);
+    return {
+      ok: false,
+      reason: 'bad_action',
+      say: 'Неизвестное действие. Доступны: list (показать продукты), edit (поставить правку), status (узнать исход правки).',
+    };
+  }
+
+  private async list(userId: string) {
+    const products = await this.pg
+      .query(
+        `SELECT id, name, slug, domain, kind, status
+           FROM products
+          WHERE user_id = $1 AND archived_at IS NULL
+          ORDER BY created_at DESC`,
+        [userId],
+      )
+      .then((r) => r.rows as ProductMatch[]);
+
+    if (!products.length) {
+      return {
+        ok: true,
+        products,
+        say: 'У пользователя нет ни одного продукта. Завести продукт ты не можешь — это делается кнопкой ' +
+             'в кабинете, вкладка «Продукты».',
+      };
+    }
+    const hasBot = products.some((p) => p.kind === 'bot');
+    return {
+      ok: true,
+      products,
+      say:
+        'Продукты пользователя. Правку ставь действием edit, назвав продукт именем.' +
+        (hasBot ? ' У бота домена нет вовсе — это нормально, а не поломка: адрес есть только у сайтов.' : ''),
+    };
+  }
 }
