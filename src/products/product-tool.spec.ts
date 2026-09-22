@@ -353,6 +353,99 @@ maybe('инструмент продуктов против живого Postgre
       expect(out.say).toMatch(/status/);
     });
   });
+
+  describe('действие status', () => {
+    it('по продукту отдаёт исход последнего хода', async () => {
+      const id = await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      await pool.query(
+        `INSERT INTO product_turns (product_id, user_id, channel, prompt, status, result, tokens_spent, finished_at)
+         VALUES ($1, $2, 'web', 'правка', 'done', 'Готово', 4200, now())`,
+        [id, OWNER],
+      );
+      const svc = new ProductToolService(pg as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'status', product: 'цветов' });
+      expect(out.outcome).toBe('done');
+      expect(out.tokensSpent).toBe(4200);
+    });
+
+    it('откат в истории остаётся откатом', async () => {
+      const id = await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      await pool.query(
+        `INSERT INTO product_turns (product_id, user_id, channel, prompt, status, error, finished_at)
+         VALUES ($1, $2, 'web', 'правка', 'reverted', 'health check failed', now())`,
+        [id, OWNER],
+      );
+      const svc = new ProductToolService(pg as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'status', product: 'цветов' });
+      expect(out.outcome).toBe('reverted');
+      expect(out.ok).toBe(false);
+    });
+
+    it('берёт САМЫЙ СВЕЖИЙ ход, а не первый попавшийся', async () => {
+      const id = await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      await pool.query(
+        `INSERT INTO product_turns (product_id, user_id, channel, prompt, status, finished_at, created_at)
+         VALUES ($1, $2, 'web', 'старая', 'done', now() - interval '2 hour', now() - interval '2 hour')`,
+        [id, OWNER],
+      );
+      await pool.query(
+        `INSERT INTO product_turns (product_id, user_id, channel, prompt, status, error, finished_at, created_at)
+         VALUES ($1, $2, 'web', 'свежая', 'failed', 'build error', now(), now())`,
+        [id, OWNER],
+      );
+      const svc = new ProductToolService(pg as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'status', product: 'цветов' });
+      expect(out.outcome).toBe('failed');
+    });
+
+    it('по идентификатору хода — тот самый ход', async () => {
+      const id = await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      const t = await pool.query(
+        `INSERT INTO product_turns (product_id, user_id, channel, prompt, status, finished_at)
+         VALUES ($1, $2, 'web', 'старая', 'done', now()) RETURNING id`,
+        [id, OWNER],
+      );
+      await pool.query(
+        `INSERT INTO product_turns (product_id, user_id, channel, prompt, status, error, finished_at)
+         VALUES ($1, $2, 'web', 'свежая', 'failed', 'build error', now())`,
+        [id, OWNER],
+      );
+      const svc = new ProductToolService(pg as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'status', turnId: t.rows[0].id });
+      expect(out.outcome).toBe('done');
+    });
+
+    it('чужой ход по его идентификатору не отдаётся', async () => {
+      const alien = await mkProduct({ user: ALIEN, name: 'Чужой', slug: 'alien' });
+      const t = await pool.query(
+        `INSERT INTO product_turns (product_id, user_id, channel, prompt, status, finished_at)
+         VALUES ($1, $2, 'web', 'чужая', 'done', now()) RETURNING id`,
+        [alien, ALIEN],
+      );
+      const svc = new ProductToolService(pg as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'status', turnId: t.rows[0].id });
+      expect(out.ok).toBe(false);
+      expect(out.reason).toBe('not_found');
+    });
+
+    it('ходов не было — так и сказано', async () => {
+      await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      const svc = new ProductToolService(pg as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'status', product: 'цветов' });
+      expect(out.reason).toBe('no_turns');
+      expect(out.say).toMatch(/не было|ни одной/i);
+    });
+
+    it('неоднозначное имя — уточняет, а не выбирает', async () => {
+      await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      await mkProduct({ name: 'Магазин книг', slug: 'books' });
+      const svc = new ProductToolService(pg as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'status', product: 'магазин' });
+      expect(out.ok).toBe(false);
+      expect(out.reason).toBe('ambiguous');
+      expect(out.matches).toHaveLength(2);
+    });
+  });
 });
 
 describe('разбор исхода хода', () => {
