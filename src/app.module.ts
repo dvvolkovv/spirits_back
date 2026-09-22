@@ -47,6 +47,7 @@ import { NotesModule } from './notes/notes.module';
 import { AskModule } from './ask/ask.module';
 import { CalendarModule } from './calendar/calendar.module';
 import { TalerIdModule } from './talerid/talerid.module';
+import { ZoomModule } from './zoom/zoom.module';
 import { SpeechModule } from './speech/speech.module';
 import { TmaModule } from './tma/tma.module';
 import { VoiceCallModule } from './voice-call/voice-call.module';
@@ -103,6 +104,7 @@ import { IntegrationsModule } from './integrations/integrations.module';
     AskModule,
     CalendarModule,
     TalerIdModule,
+    ZoomModule,
     SpeechModule,
     TmaModule,
     VoiceCallModule,

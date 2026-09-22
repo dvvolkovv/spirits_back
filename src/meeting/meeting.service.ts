@@ -1,4 +1,4 @@
-import { ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { ConflictException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { LiveKitClient } from '../voice-call/livekit.client';
@@ -9,8 +9,9 @@ import { TalerIdRoomClient } from './talerid-room.client';
 import { AttendeeClient, attendeeConfigured } from './attendee.client';
 import { IntegrationFlagsService } from '../integrations/integration-flags.service';
 import { assistantSignature } from './assistant-signature';
-import { MeetingProvider } from './meeting-link';
+import { MeetingProvider, zoomMeetingNumber } from './meeting-link';
 import { alertMeetingFailure } from './meeting-alert';
+import { ZoomOauthService } from '../zoom/zoom-oauth.service';
 
 /** Провайдер встречи в voice_calls. Дальше сюда добавится 'zoom'. */
 const PROVIDER = 'linkeon_room';
@@ -70,6 +71,10 @@ export class MeetingService {
     private readonly talerIdRooms: TalerIdRoomClient,
     private readonly attendee: AttendeeClient,
     private readonly flags: IntegrationFlagsService,
+    // @Optional: подключение Zoom — отдельный модуль, и во множестве юнит-тестов
+    // сервис собирают вручную без него. Нет его — работаем как раньше, входом
+    // во встречи своего аккаунта.
+    @Optional() private readonly zoom?: ZoomOauthService,
   ) {}
 
   /**
@@ -423,11 +428,27 @@ export class MeetingService {
       const meetingUrl = call.external_url
         ? String(call.external_url)
         : `https://meet.google.com/${call.external_room}`;
+      // Токен входа для Zoom — от имени того, кто позвал ассистента.
+      //
+      // Без него ассистент заперт во встречах нашего же аккаунта (правило Zoom
+      // с 2 марта 2026). Токен выдаётся только если человек подключил свой
+      // аккаунт Zoom; не подключил — идём как раньше и выясним это по отказу
+      // площадки, а не молчанием здесь.
+      let obfToken: string | undefined;
+      if (call.provider === PROVIDER_ZOOM && this.zoom) {
+        const number = zoomMeetingNumber(call.external_url || meetingUrl);
+        if (number) {
+          obfToken = (await this.zoom.obfToken(call.user_id, number).catch(() => null)) || undefined;
+          if (!obfToken) this.logger.warn(`[attachBot] call=${callId} нет токена Zoom — вход только в свой аккаунт`);
+        }
+      }
+
       const bot = await this.attendee.createBot({
         meetingUrl,
         botName,
         callId,
         wsUrl,
+        obfToken,
         provider:
           call.provider === PROVIDER_ZOOM ? 'zoom' : call.provider === PROVIDER_TEAMS ? 'teams' : call.provider === PROVIDER_TELEMOST ? 'telemost' : 'meet',
       });

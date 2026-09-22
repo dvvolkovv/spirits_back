@@ -274,3 +274,14 @@ export function parseMeetingLink(text: string): ParsedMeetingLink | null {
 
   return null;
 }
+
+/**
+ * Номер встречи Zoom из ссылки.
+ *
+ * Нужен для токена On-Behalf-Of: Zoom выдаёт его на конкретную встречу
+ * (`meeting_id`), а у нас в базе лежит адрес входа целиком.
+ */
+export function zoomMeetingNumber(url: string): string | null {
+  const m = ZOOM_LINK_REGEX.exec(String(url || ''));
+  return m ? m[3] : null;
+}

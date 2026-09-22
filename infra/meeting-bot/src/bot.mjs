@@ -74,8 +74,8 @@ const PLATFORMS = {
 };
 
 export class MeetingBot {
-  constructor({ id, meetingUrl, displayName, platform, wsUrl, webhookUrl, webhookSecret, metadata, log = console }) {
-    Object.assign(this, { id, meetingUrl, displayName, platform, wsUrl, webhookUrl, webhookSecret, metadata, log });
+  constructor({ id, meetingUrl, displayName, platform, wsUrl, webhookUrl, webhookSecret, metadata, obfToken, log = console }) {
+    Object.assign(this, { id, meetingUrl, displayName, platform, wsUrl, webhookUrl, webhookSecret, metadata, obfToken, log });
     this.state = 'ready';
     this.browser = null;
     this.ctx = null;
@@ -479,7 +479,14 @@ export class MeetingBot {
     const entered = new Promise((resolve, reject) => { this.entered = { resolve, reject }; });
     const base = await zoomPageOrigin();
     await this.page.goto(
-      zoomPageUrl(base, { signature, sdkKey, meetingNumber: meeting.meetingNumber, password: meeting.password, userName: this.displayName }),
+      zoomPageUrl(base, {
+        signature,
+        sdkKey,
+        meetingNumber: meeting.meetingNumber,
+        password: meeting.password,
+        userName: this.displayName,
+        obfToken: this.obfToken,
+      }),
       { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT_MS },
     );
     this.log.info?.(`[${this.id}] Zoom: страница SDK открыта, встреча ${meeting.meetingNumber}`);

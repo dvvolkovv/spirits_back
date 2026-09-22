@@ -59,3 +59,24 @@ test('чужой хост и личная ссылка — не Zoom', () => {
   assert.equal(parseZoomUrl('https://notzoom.us/j/123456789'), null);
   assert.equal(parseZoomUrl('https://zoom.us/my/roman'), null);
 });
+
+test('токен входа уезжает в адрес страницы', async () => {
+  // С 2 марта 2026 без него не войти во встречу чужого аккаунта, а забыть его
+  // по дороге легко: он проходит через бэкенд, сервис, адрес и SDK.
+  const { zoomPageUrl } = await import('../src/zoom-page.mjs');
+  const q = new URL(zoomPageUrl('http://x', {
+    signature: 'подпись', sdkKey: 'ключ', meetingNumber: '76639252685',
+    password: '', userName: 'Роман', obfToken: 'обф-токен',
+  })).searchParams;
+  assert.equal(q.get('obfToken'), 'обф-токен');
+});
+
+test('без токена адрес всё равно собирается', async () => {
+  // Человек мог не подключать свой Zoom — тогда идём во встречи нашего
+  // аккаунта, как до новых правил, а не падаем на сборке адреса.
+  const { zoomPageUrl } = await import('../src/zoom-page.mjs');
+  const q = new URL(zoomPageUrl('http://x', {
+    signature: 'п', sdkKey: 'к', meetingNumber: '1', password: '', userName: 'Р',
+  })).searchParams;
+  assert.equal(q.get('obfToken'), '');
+});

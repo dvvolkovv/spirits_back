@@ -6,6 +6,7 @@ import { MeetingService } from './meeting.service';
 import { MeetWebhookController } from './meet-webhook.controller';
 import { RoomModule } from './room.module';
 import { AttendeeClient } from './attendee.client';
+import { ZoomModule } from '../zoom/zoom.module';
 
 /**
  * Присутствие ассистента во встрече.
@@ -21,7 +22,7 @@ import { AttendeeClient } from './attendee.client';
  * с обеих сторон.
  */
 @Module({
-  imports: [CommonModule, RoomModule, forwardRef(() => VoiceCallModule)],
+  imports: [CommonModule, RoomModule, ZoomModule, forwardRef(() => VoiceCallModule)],
   controllers: [MeetingController, MeetWebhookController],
   providers: [MeetingService, AttendeeClient],
   // AttendeeClient экспортирован отдельно от MeetingService: его будет
