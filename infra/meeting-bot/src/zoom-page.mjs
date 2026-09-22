@@ -49,7 +49,16 @@ export function zoomPageOrigin() {
 }
 
 /** Адрес страницы для конкретного входа. */
-export function zoomPageUrl(base, { signature, sdkKey, meetingNumber, password, userName }) {
-  const p = new URLSearchParams({ signature, sdkKey, meetingNumber, password: password || '', userName });
+export function zoomPageUrl(base, { signature, sdkKey, meetingNumber, password, userName, obfToken }) {
+  const p = new URLSearchParams({
+    signature,
+    sdkKey,
+    meetingNumber,
+    password: password || '',
+    userName,
+    // Токен On-Behalf-Of, если бэкенд его добыл. Пустой — значит идём во
+    // встречу своего аккаунта, как до правил Zoom от 2 марта 2026.
+    obfToken: obfToken || '',
+  });
   return `${base}/?${p.toString()}`;
 }

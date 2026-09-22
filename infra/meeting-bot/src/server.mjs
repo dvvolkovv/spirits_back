@@ -79,6 +79,8 @@ const server = http.createServer(async (req, res) => {
       webhookUrl: body.webhooks?.[0]?.url || '',
       webhookSecret: WEBHOOK_SECRET,
       metadata: body.metadata ?? null,
+      // Токен входа Zoom от бэкенда: одноразовый, живёт ровно до входа.
+      obfToken: body.zoom_settings?.obf_token || '',
       log,
     });
     bots.set(id, bot);

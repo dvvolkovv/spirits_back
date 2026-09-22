@@ -139,25 +139,51 @@ export const ZOOM_PAGE_JS = `
   // список сходится сам: сервис сверит его с тем, что подтвердил бэкенд.
   setInterval(publish, 2000);
 
+  /**
+   * Вход во встречу — с повторами.
+   *
+   * Zoom выдаёт нам токен от имени человека, который авторизовал приложение, и
+   * пускает по нему ТОЛЬКО когда этот человек уже в комнате. Пока он не вошёл,
+   * площадка отвечает отказом — это нормальный ход событий, а не поломка: тот
+   * же приём (ожидание с повторами) есть и у Attendee, где на этот случай
+   * заведена отдельная причина «авторизовавший пользователь не во встрече».
+   *
+   * Поэтому отказ входа не объявляем сразу, а пробуем снова, пока бота не
+   * выведут по общему таймауту ожидания.
+   */
+  const RETRY_MS = 15000;
+  let attempt = 0;
+
+  const tryJoin = () => {
+    attempt++;
+    ZoomMtg.join({
+      signature: p.get('signature'),
+      sdkKey: p.get('sdkKey'),
+      meetingNumber: p.get('meetingNumber'),
+      passWord: p.get('password') || '',
+      userName: p.get('userName') || 'Ассистент',
+      userEmail: '',
+      // Токен On-Behalf-Of: без него с 2 марта 2026 во встречу чужого аккаунта
+      // не войти вовсе. Пустая строка означает «его нам не дали» — тогда
+      // остаётся вход во встречи своего аккаунта, как раньше.
+      obfToken: p.get('obfToken') || '',
+      success: () => { whoAmI(); send('sdk', { step: 'join принят' }); },
+      error: (e) => {
+        const reason = (e && (e.reason || e.errorCode)) || 'join error';
+        send('sdk', { step: 'вход отклонён (' + attempt + '): ' + reason });
+        // Повторяем, пока не вошли: скорее всего ждём того, кто нас позвал.
+        if (!entered) setTimeout(tryJoin, RETRY_MS);
+      },
+    });
+  };
+
   ZoomMtg.init({
     leaveUrl: 'https://zoom.us',
     patchJsMedia: true,
     leaveOnPageUnload: true,
     disableZoomLogo: true,
     disablePreview: true,
-    success: () => {
-      showRoot();
-      ZoomMtg.join({
-        signature: p.get('signature'),
-        sdkKey: p.get('sdkKey'),
-        meetingNumber: p.get('meetingNumber'),
-        passWord: p.get('password') || '',
-        userName: p.get('userName') || 'Ассистент',
-        userEmail: '',
-        success: () => { whoAmI(); send('sdk', { step: 'join принят' }); },
-        error: (e) => send('join_failed', { reason: (e && (e.reason || e.errorCode)) || 'join error' }),
-      });
-    },
+    success: () => { showRoot(); tryJoin(); },
     error: (e) => send('join_failed', { reason: (e && (e.reason || e.message)) || 'init error' }),
   });
 
