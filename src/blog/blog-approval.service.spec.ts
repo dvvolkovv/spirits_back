@@ -96,7 +96,19 @@ describe('BlogApprovalService.sendForReview', () => {
 });
 
 describe('BlogApprovalService.handleCallback', () => {
-  it('одобрение переводит пост в approved и назначает слот', async () => {
+  /**
+   * Слот считается от «сейчас», поэтому дата в тексте детерминирована только
+   * при зафиксированном времени — иначе тест то и дело переезжал бы между
+   * «сегодня»/«завтра»/днём недели в зависимости от того, когда его гоняют.
+   */
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('одобрение переводит пост в approved, назначает слот и называет дату/время публикации во всплывашке', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-09-21T05:00:00Z'));   // пн, 08:00 МСК — слот пн 10:00 МСК ещё не прошёл
+
     const pg = { query: jest.fn() };
     pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
@@ -108,6 +120,55 @@ describe('BlogApprovalService.handleCallback', () => {
     const sql = pg.query.mock.calls[1][0] as string;
     expect(sql).toContain("status = 'approved'");
     expect(sql).toContain('slot_at');
+
+    // слот в тот же московский день, что и «сейчас» → «сегодня», а не день недели
+    expect(tg.answerCallbackQuery).toHaveBeenCalledWith('cb1', expect.objectContaining({
+      text: expect.stringContaining('сегодня в 10:00 МСК'),
+    }));
+  });
+
+  /**
+   * Всплывашка живёт секунды и легко пропускается — та же дата обязана
+   * задержаться в истории чата отдельным сообщением через notify().
+   */
+  it('следом в личку уходит отдельное сообщение с той же датой публикации', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-09-22T12:00:00Z'));   // вт, 15:00 МСК — ближайший слот ср 10:00 МСК → «завтра»
+
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
+    const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
+    const settings = { get: jest.fn().mockResolvedValue({ channelChatId: '-100', slotDays: [1, 3, 5], slotHourMsk: 10, imageStyle: '' }) };
+    const svc = new BlogApprovalService(pg as any, tg as any, settings as any);
+
+    await svc.handleCallback({ id: 'cb1', data: 'blog:ok:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
+
+    // chatId — из самого callback (тот чат, где нажали кнопку)
+    expect(tg.sendMessage).toHaveBeenCalledWith(77, expect.stringContaining('завтра в 10:00 МСК'));
+    // и то же сообщение, что ушло во всплывашку — дата не должна разъехаться между ними
+    const popupText = tg.answerCallbackQuery.mock.calls[0][1].text as string;
+    const chatText = tg.sendMessage.mock.calls[0][1] as string;
+    expect(chatText).toBe(popupText);
+  });
+
+  /** Telegram отвергает текст всплывашки answerCallbackQuery длиннее 200 символов. */
+  it('текст всплывашки укладывается в 200-символьный лимит Telegram даже для самого длинного дня недели', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-09-21T05:00:00Z'));
+
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
+    const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
+    // «воскресенье» — самое длинное название дня недели; единственный слот в неделе,
+    // чтобы гарантированно получить именно его, а не «сегодня»/«завтра».
+    const settings = { get: jest.fn().mockResolvedValue({ channelChatId: '-100', slotDays: [7], slotHourMsk: 10, imageStyle: '' }) };
+    const svc = new BlogApprovalService(pg as any, tg as any, settings as any);
+
+    await svc.handleCallback({ id: 'cb1', data: 'blog:ok:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
+
+    const text = tg.answerCallbackQuery.mock.calls[0][1].text as string;
+    expect(text).toContain('воскресенье');
+    expect(text.length).toBeLessThanOrEqual(200);
   });
 
   it('устаревшая кнопка по уже опубликованному посту ничего не меняет', async () => {
