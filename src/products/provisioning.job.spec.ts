@@ -483,8 +483,31 @@ describe('claimJob: вид задания', () => {
     await svc.claimJob('own');
 
     expect(calls[0].sql).toMatch(
-      /CASE j\.kind\s+WHEN 'provision' THEN p\.status = 'provisioning'\s+ELSE p\.status = 'sleeping'\s+END/,
+      /CASE j\.kind\s+WHEN 'provision' THEN p\.status = 'provisioning'\s+WHEN 'sleep' THEN p\.status IN \('sleeping','blocked'\)\s+ELSE p\.status = 'sleeping'\s+END/,
     );
+  });
+
+  it('у сна и пробуждения РАЗНЫЕ статусы: блокированного гасим, но не будим', async () => {
+    // Гашение администратором (кусок 4б) ставит задание вида 'sleep', оставляя
+    // продукт в 'blocked'. Отсюда соблазн расширить ОБЩУЮ ветку до
+    // `p.status IN ('sleeping','blocked')` — и это дыра: у блокированного
+    // продукта штатно бывает невыполненное 'wake' (спал за неуплату, владелец
+    // пополнил, будильник поставил задание, и тут пришло гашение). Общая ветка
+    // отдала бы его агенту, и контейнер поднялся бы обратно через секунды
+    // после решения администратора.
+    //
+    // Сторож ФОРМЫ, а не исполнения: обе редакции читаются в файле почти
+    // одинаково, а поведенческий сторож на живой базе — сценарий 99.
+    const { svc, calls } = makeService();
+
+    await svc.claimJob('own');
+
+    const sql = calls[0].sql;
+    // 'sleep' — единственный вид со своей веткой про 'blocked'.
+    expect(sql).toMatch(/WHEN 'sleep' THEN p\.status IN \('sleeping','blocked'\)/);
+    // ELSE (то есть 'wake') остаётся узким: 'blocked' в нём быть не должно.
+    expect(sql).toMatch(/ELSE p\.status = 'sleeping'/);
+    expect(sql).not.toMatch(/ELSE p\.status IN \([^)]*blocked/);
   });
 
   it('на сне и пробуждении токен НЕ выпускается', async () => {
@@ -744,15 +767,38 @@ describe('ProvisioningService.completeJob', () => {
 
     const product = productPart(calls);
     expect(product).toMatch(/WHEN 'provision' THEN 'failed'/);
-    expect(product).toMatch(/WHEN 'sleep' THEN 'degraded'/);
+    expect(product).toMatch(/WHEN 'sleep' THEN\s+CASE WHEN products\.status = 'blocked' THEN 'blocked' ELSE 'degraded' END/);
     // У пробуждения своей ветки НЕТ — оно попадает в ELSE и сохраняет
     // собственный статус. Явная ветка 'wake' здесь была бы лишним местом,
     // которое обязано совпадать со словарём видов.
     expect(product).toMatch(/ELSE products\.status/);
-    expect(product).toMatch(/sleep_reason = CASE closed\.kind\s+WHEN 'sleep' THEN NULL/);
+    expect(product).toMatch(/sleep_reason = CASE closed\.kind\s+WHEN 'sleep' THEN/);
     // Вид берётся из ЗАКРЫТОГО задания, а не отдельным подзапросом: иначе
     // повторный отчёт снова правил бы живой продукт.
     expect(jobPart(calls)).toMatch(/RETURNING\s+product_id,\s*kind/);
+  });
+
+  it('отказ сна НЕ снимает блокировку и не стирает причину сна у блокированного', async () => {
+    // ЧУЖОЕ МЕСТО, БЕЗ КОТОРОГО ГАШЕНИЕ ОТМЕНЯЕТСЯ СОБСТВЕННЫМ СБОЕМ. Гашение
+    // администратором (кусок 4б) ставит задание того же вида 'sleep', оставляя
+    // продукт в 'blocked'. Разбор по виду статус продукта не спрашивал вовсе,
+    // то есть ЛЮБОЙ сорвавшийся сон уводил блокированный продукт в 'degraded'
+    // — статус, который платит аренду и принимает правки. Решение
+    // администратора снималось бы отказом docker stop, молча.
+    //
+    // Сторож ФОРМЫ; поведенческий на живой базе — сценарий 103.
+    const { svc, calls } = makeService();
+
+    await svc.completeJob('j-1', { ok: false, error: 'docker stop не отработал' });
+
+    const product = productPart(calls);
+    // Статус блокированного сохраняется...
+    expect(product).toMatch(/CASE WHEN products\.status = 'blocked' THEN 'blocked' ELSE 'degraded' END/);
+    // ...и признак сна у него тоже: продукт мог спать за неуплату ДО гашения,
+    // и снятие блокировки вернёт его в 'sleeping' — уже без объяснения.
+    expect(product).toMatch(
+      /CASE WHEN products\.status = 'blocked'\s+THEN products\.sleep_reason ELSE NULL END/,
+    );
   });
 
   it('причина отказа ложится в jobs.error, а не в соседнюю колонку', async () => {

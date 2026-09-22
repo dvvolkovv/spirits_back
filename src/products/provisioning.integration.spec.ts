@@ -9,6 +9,12 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
+import {
+  BlockService,
+  JOB_KILLED_BY_BLOCK,
+  JOB_KILLED_BY_UNBLOCK,
+  TURN_KILLED_BY_BLOCK,
+} from './block.service';
 import { HostGuard } from './host.guard';
 import { HostsService } from './hosts.service';
 import { DEFAULT_MAX_PRODUCTS, LimitsService } from './limits.service';
@@ -3907,6 +3913,493 @@ maybe('провижининг против живого Postgres', () => {
       expect(checked).toBe(BURST);
       expect(all.every((e) => e === null)).toBe(true);
       expect(await liveOf('u-кли')).toBe(BURST);
+    });
+  });
+
+  // ═══════ гашение администратором и снятие блокировки (кусок 4б) ═══════
+  //
+  // Весь блок — против ЖИВОЙ базы, и это не перестраховка, а необходимость.
+  // Гашение целиком живёт в ОДНОМ операторе, и всё, чем оно держится, —
+  // исполняемое: частичный уникальный индекс product_provision_jobs_one_active
+  // (снять старое задание и поставить новое одной командой — НЕ то же самое,
+  // что просто поставить), порядок частей WITH, замок FOR UPDATE, условие
+  // единственности совпадения. Заглушка pg не исполняет ни одного из них, то
+  // есть юнит-прогон одинаково зелен и на работающем гашении, и на операторе,
+  // который падает с 23505 на каждом продукте с активным заданием (мутация
+  // M14: снятая ссылка на killed_jobs краснит здесь шесть сценариев и ноль
+  // где-либо ещё).
+  //
+  // НУМЕРАЦИЯ. План предлагал сценарии 66–70 — эти номера в файле ЗАНЯТЫ с
+  // куска 3 (отказ сна, отказ пробуждения, отказ заведения, удачный сон).
+  // Дублирующиеся имена jest принимает молча, и разбирать потом, который из
+  // двух «66» упал, пришлось бы по строкам стека.
+
+  describe('гашение администратором', () => {
+    const blocks = () => new BlockService(pg as any);
+
+    /** Ходы продукта: статус и причина, в порядке появления. */
+    const turnsOf = async (productId: string) =>
+      (
+        await pool.query(
+          'SELECT status, error FROM product_turns WHERE product_id = $1 ORDER BY created_at',
+          [productId],
+        )
+      ).rows;
+
+    /** Задания продукта целиком: вид, статус, причина. */
+    const jobRowsOf = async (productId: string) =>
+      (
+        await pool.query(
+          'SELECT kind, status, error FROM product_provision_jobs WHERE product_id = $1 ORDER BY created_at',
+          [productId],
+        )
+      ).rows;
+
+    /** Гашение пишет строку в журнал на каждое решение — глушим её. */
+    const quiet = (svc: BlockService) =>
+      jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+
+    // ─────────────────────── как находим продукт ───────────────────────
+
+    it('96. гашение по домену, слагу и id находит ОДИН И ТОТ ЖЕ продукт', async () => {
+      // Три способа — один результат. Без этого сценария любой из трёх мог бы
+      // молча не находить ничего: отказ «не найден» выглядит одинаково и когда
+      // ключ разобран неверно, и когда продукта действительно нет.
+      const other = await bystander();
+      const p = await product({ slug: 'ss-find', kind: 'site', status: 'running' });
+
+      for (const key of [p.domain!, 'ss-find', p.id]) {
+        await pool.query(
+          `UPDATE products SET status = 'running', block_reason = NULL WHERE id = $1`,
+          [p.id],
+        );
+        const svc = blocks();
+        quiet(svc);
+        await svc.block(key, `нарушение по ключу ${key}`);
+
+        const row = await getProduct(p.id);
+        expect([row.status, row.block_reason]).toEqual(['blocked', `нарушение по ключу ${key}`]);
+      }
+      // И трижды подряд: повторное гашение снимает прошлое задание и ставит
+      // новое, а не падает на уникальном индексе. Активное задание ровно одно.
+      expect(await jobRowsOf(p.id)).toEqual([
+        { kind: 'sleep', status: 'failed', error: JOB_KILLED_BY_BLOCK },
+        { kind: 'sleep', status: 'failed', error: JOB_KILLED_BY_BLOCK },
+        { kind: 'sleep', status: 'queued', error: null },
+      ]);
+      await expectUntouched(other);
+    });
+
+    it('96а. ключ из жалобы приводится к нижнему регистру', async () => {
+      // Жалоба приходит текстом от человека, и «Shop.C.Linkeon.io» в ней —
+      // обычное дело. Приведение умеет превратить «не найдено» в «найдено
+      // единственное верное» и не умеет превратить одно совпадение в другое:
+      // слаги (SLUG_RE) и домены лежат в базе только строчными.
+      const p = await product({ slug: 'ss-case', status: 'running' });
+
+      const svc = blocks();
+      quiet(svc);
+      await svc.block('  SS-CASE.P.Linkeon.IO  ', 'нарушение');
+
+      expect((await getProduct(p.id)).status).toBe('blocked');
+    });
+
+    it('97. не нашли — отказ, а не запасной поиск по другому полю', async () => {
+      // ГЛАВНОЕ ПРАВИЛО РАЗБОРА. Слаг одного продукта совпадает с НАЧАЛОМ
+      // домена другого ровно потому, что домен из слага и строится. Молчаливый
+      // поиск «сначала по домену, потом по слагу» однажды погасил бы не тот
+      // продукт — и узнали бы мы об этом от владельца.
+      const victim = await product({ slug: 'ss-neighbour', status: 'running' });
+
+      // Ключ с точкой — только домен. Такого домена нет, хотя слаг есть.
+      await expect(blocks().block('ss-neighbour.example.org', 'проба')).rejects.toThrow(
+        /не найден по домену/i,
+      );
+      // Ключ без точки — только слаг. Такого слага нет, хотя домен есть.
+      await expect(blocks().block('ss-neighbourplinkeonio', 'проба')).rejects.toThrow(
+        /не найден по слагу/i,
+      );
+      // И сосед цел: отказ ничего не тронул.
+      expect((await getProduct(victim.id)).status).toBe('running');
+    });
+
+    it('97а. отказ по домену подсказывает, что у бота домена нет вовсе', async () => {
+      // У бота `create()` домена не пишет, то есть бот по домену не находится
+      // НИКОГДА и ни при какой опечатке. Администратор, не знающий этого,
+      // будет перебирать написания домена, которого не существует.
+      const bot = await product({ slug: 'ss-bot', kind: 'bot', status: 'running' });
+      expect((await getProduct(bot.id)).domain).toBeNull();
+
+      await expect(blocks().block('ss-bot.c.linkeon.io', 'проба')).rejects.toThrow(
+        /у бота домена нет/i,
+      );
+      // А по слагу тот же бот гасится.
+      const svc = blocks();
+      quiet(svc);
+      await svc.block('ss-bot', 'нарушение');
+      expect((await getProduct(bot.id)).status).toBe('blocked');
+    });
+
+    it('97б. пустой ключ и пустая причина отбиваются до всякого запроса', async () => {
+      // Причина — ЕДИНСТВЕННОЕ, из чего владелец узнает, что случилось с его
+      // продуктом: общего списка у администратора нет, уведомлений кусок 4б не
+      // делает. Пустая строка дала бы погашенный продукт без единого слова.
+      const p = await product({ slug: 'ss-empty', status: 'running' });
+
+      await expect(blocks().block('   ', 'нарушение')).rejects.toThrow(/что гасить/i);
+      await expect(blocks().block('ss-empty', '   ')).rejects.toThrow(/за что гасим/i);
+
+      expect((await getProduct(p.id)).status).toBe('running');
+      expect(await jobsOf(p.id)).toEqual([]);
+    });
+
+    it('97в. два продукта с одним доменом — отказ, и НИ ОДИН не тронут', async () => {
+      // У products.slug есть UNIQUE, у products.id — первичный ключ, а у
+      // products.domain НЕ ТО НИ ДРУГОЕ (проверено по всем семи миграциям).
+      // Сегодня домены не повторяются, потому что строятся из уникального
+      // слага, — но держится это на соглашении, а не на базе. Две строки с
+      // одним доменом, и гашение по жалобе на один продукт погасило бы
+      // заодно соседний.
+      const a = await product({ slug: 'ss-dup-a', status: 'running' });
+      const b = await product({ slug: 'ss-dup-b', status: 'running' });
+      await pool.query(`UPDATE products SET domain = 'ss-dup.p.linkeon.io' WHERE id IN ($1,$2)`, [
+        a.id,
+        b.id,
+      ]);
+
+      await expect(blocks().block('ss-dup.p.linkeon.io', 'нарушение')).rejects.toThrow(
+        /найден не один продукт/i,
+      );
+
+      for (const p of [a, b]) {
+        const row = await getProduct(p.id);
+        expect([row.status, row.block_reason]).toEqual(['running', null]);
+        expect(await jobsOf(p.id)).toEqual([]);
+      }
+    });
+
+    // ───────────────────────── механика гашения ─────────────────────────
+
+    it('98. блокировка НЕ ждёт идущий ход и закрывает его причиной', async () => {
+      // ЕДИНСТВЕННОЕ МЕСТО, ГДЕ БЛОКИРОВКА ВЕДЁТ СЕБЯ НЕ КАК СОН. Сон за
+      // неуплату ждёт завершения хода: погашенный посреди правки контейнер
+      // убивает её молча. Блокировку ставят, когда на домене недопустимое, и
+      // тридцать минут ждать нельзя — идущий ход умирает, осознанный размен.
+      //
+      // Ход при этом ЗАКРЫВАЕТСЯ здесь же: оставленный в 'running', он висел бы
+      // до срока сборщика зависших, всё это время владелец видел бы
+      // «выполняется» у погашенного продукта, а замок product_turns_one_active
+      // не пускал бы следующий ход.
+      //
+      // СВЕРКА С СОСЕДОМ обязательна: без неё сценарий зеленел бы и на
+      // реализации, которая просто не умеет ждать ничего.
+      const p = await product({ slug: 'ss-busy', status: 'running' });
+      await turn(p.id, { status: 'running', progressAgo: '5 seconds' });
+
+      const svc = blocks();
+      quiet(svc);
+      await svc.block('ss-busy', 'нарушение');
+
+      expect((await getProduct(p.id)).status).toBe('blocked');
+      expect(await turnsOf(p.id)).toEqual([{ status: 'failed', error: TURN_KILLED_BY_BLOCK }]);
+      // Слово «администратор» в причине обязательное: без него владелец читает
+      // обычный отказ раннера и идёт искать поломку у себя.
+      expect((await turnsOf(p.id))[0].error).toMatch(/администратор/i);
+
+      // Сон на том же живом ходе задание бы НЕ поставил.
+      const sleeper = await due({ slug: 'ss-busy-sleeper', overdue: '1 day' });
+      await turn(sleeper.id, { status: 'running', progressAgo: '5 seconds' });
+      expect(await rent().requestSleep(sleeper.id)).toBe(false);
+    });
+
+    it('98а. ход, который раннер ещё не забрал, закрывается тоже', async () => {
+      // 'queued' наравне с 'running': такой ход всё равно держит замок
+      // product_turns_one_active и всё равно уехал бы в контейнер, если бы
+      // гашение сорвалось. Отдельным сценарием, потому что отбор по одному
+      // только 'running' читается совершенно так же.
+      const p = await product({ slug: 'ss-queued-turn', status: 'running' });
+      await turn(p.id, { status: 'queued', startedAgo: null, progressAgo: null });
+
+      const svc = blocks();
+      quiet(svc);
+      await svc.block('ss-queued-turn', 'нарушение');
+
+      expect((await turnsOf(p.id))[0].status).toBe('failed');
+    });
+
+    it('98б. чужие ходы и задания гашение не трогает', async () => {
+      // Соединение без условия (`... OR TRUE`) регексп переживает, а одно
+      // гашение похоронило бы ходы и задания всего реестра.
+      const other = await product({ slug: 'ss-innocent', status: 'running' });
+      await turn(other.id, { status: 'running', progressAgo: '5 seconds' });
+      await job(other.id, { kind: 'wake', status: 'queued' });
+      await product({ slug: 'ss-guilty', status: 'running' });
+
+      const svc = blocks();
+      quiet(svc);
+      await svc.block('ss-guilty', 'нарушение');
+
+      expect((await turnsOf(other.id))[0].status).toBe('running');
+      expect(await jobRowsOf(other.id)).toEqual([{ kind: 'wake', status: 'queued', error: null }]);
+      expect((await getProduct(other.id)).status).toBe('running');
+    });
+
+    it('99. блокировка снимает невыполненное пробуждение, а агенту достаётся ГАШЕНИЕ', async () => {
+      // ПОРЯДОК, КОТОРЫЙ ЛОМАЕТ: продукт спал за неуплату, владелец пополнил,
+      // будильник поставил 'wake' — и в этот момент администратор гасит.
+      //
+      // ПРОВЕРЯЕТСЯ ИМЕННО ВЫДАЧА, а не отсутствие выдачи. Прежняя редакция
+      // этого сценария требовала `expect(await makeSvc().claimJob('own'))
+      // .toBeNull()` и была зелёной РОВНО при сломанной реализации, где
+      // claimJob не отдаёт блокированному ничего: и пробуждение не уезжает, и
+      // гашение тоже — контейнер работает, домен отдаёт то, за что погасили, а
+      // через десять минут сборщик зависших закрывает задание чужой
+      // формулировкой про срок заведения.
+      //
+      // Заодно сторож частичного уникального индекса: снять старое задание и
+      // поставить новое ОДНОЙ командой — не то же самое, что поставить. Части
+      // WITH исполняются «одновременно», и вставка, исполненная раньше снятия,
+      // падает с 23505 (измерено на PostgreSQL 16). Порядок закреплён ссылкой
+      // на killed_jobs; сними её — этот сценарий краснеет.
+      const p = await product({ slug: 'ss-waking', status: 'sleeping' });
+      await job(p.id, { kind: 'wake', status: 'queued' });
+
+      const svc = blocks();
+      quiet(svc);
+      await svc.block('ss-waking', 'нарушение');
+
+      expect(await jobRowsOf(p.id)).toEqual([
+        { kind: 'wake', status: 'failed', error: JOB_KILLED_BY_BLOCK },
+        { kind: 'sleep', status: 'queued', error: null },
+      ]);
+
+      const taken = await makeSvc().claimJob('own');
+      expect([taken?.jobKind, taken?.slug]).toEqual(['sleep', 'ss-waking']);
+      // Токен раннера на гашении не выпускается — контейнер уже собран.
+      expect(taken!.runnerToken).toBeUndefined();
+    });
+
+    it('99а. пробуждение БЛОКИРОВАННОМУ не выдаётся, даже если задание уцелело', async () => {
+      // ВТОРОЙ РУБЕЖ, а не дубль сценария 99. Снятие пробуждения в block() —
+      // одно место, и оно перестанет работать молча. Соблазнительная редакция
+      // чужого условия — расширить ОБЩУЮ ветку выдачи до
+      // `p.status IN ('sleeping','blocked')` — делает то снятие ЕДИНСТВЕННЫМ,
+      // что стоит между решением администратора и агентом, который поднимет
+      // контейнер обратно через секунды.
+      const p = await product({ slug: 'ss-blocked-wake', status: 'running' });
+      await pool.query(`UPDATE products SET status = 'blocked' WHERE id = $1`, [p.id]);
+      await job(p.id, { kind: 'wake', status: 'queued' });
+
+      expect(await makeSvc().claimJob('own')).toBeNull();
+      // Задание осталось в очереди — его не забрали и не «выбросили».
+      expect(await jobsOf(p.id)).toEqual(['queued']);
+    });
+
+    it('99б. гашение блокированного повторяется, а не падает на индексе', async () => {
+      // ЕДИНСТВЕННЫЙ ПУТЬ ПОЧИНКИ. Гашение может оставить продукт в 'blocked'
+      // без задания — ровно об этом громкий отказ в block(). Лечится повтором
+      // того же действия, и значит повтор обязан работать НА БЛОКИРОВАННОМ, у
+      // которого уже висит собственное задание на гашение.
+      const p = await product({ slug: 'ss-again', status: 'running' });
+      const svc = blocks();
+      quiet(svc);
+
+      await svc.block('ss-again', 'первая причина');
+      await svc.block('ss-again', 'вторая причина');
+
+      const row = await getProduct(p.id);
+      expect([row.status, row.block_reason]).toEqual(['blocked', 'вторая причина']);
+      expect(await jobRowsOf(p.id)).toEqual([
+        { kind: 'sleep', status: 'failed', error: JOB_KILLED_BY_BLOCK },
+        { kind: 'sleep', status: 'queued', error: null },
+      ]);
+    });
+
+    it('99в. причина сна переживает гашение', async () => {
+      // Продукт спал за неуплату до блокировки. Стёртая причина оставила бы
+      // владельца со спящим продуктом без объяснения — после снятия
+      // блокировки, которое возвращает его ровно в 'sleeping'.
+      const p = await product({ slug: 'ss-keep-reason', status: 'sleeping' });
+      await pool.query(`UPDATE products SET sleep_reason = 'нет токенов' WHERE id = $1`, [p.id]);
+
+      const svc = blocks();
+      quiet(svc);
+      await svc.block('ss-keep-reason', 'нарушение');
+
+      const row = await getProduct(p.id);
+      expect([row.status, row.sleep_reason, row.block_reason]).toEqual([
+        'blocked',
+        'нет токенов',
+        'нарушение',
+      ]);
+    });
+
+    it('100. гашение АРХИВНОГО — отказ своим текстом, и продукт не тронут', async () => {
+      // ГАСИТЬ АРХИВНЫЙ НЕЛЬЗЯ НЕ ИЗ АККУРАТНОСТИ. claimJob выдаёт задания
+      // только по `archived_at IS NULL`: задание на гашение архивного не
+      // досталось бы агенту НИКОГДА и навсегда заняло бы one_active — сборщик
+      // зависших разбирает только продукты в 'provisioning'. Плюс статус
+      // 'archived' был бы затёрт на 'blocked'.
+      //
+      // И ОТКАЗ ИМЕННО СВОЙ, а не «не найден»: `archived_at IS NULL`,
+      // поставленный в ПОИСК, превратил бы архивный продукт в ненайденный, и
+      // администратор пошёл бы искать опечатку в домене, которого нет.
+      const p = await product({ slug: 'ss-archived', status: 'archived' });
+      await pool.query(`UPDATE products SET archived_at = now() WHERE id = $1`, [p.id]);
+      const before = await getProduct(p.id);
+
+      await expect(blocks().block('ss-archived', 'нарушение')).rejects.toThrow(/в архиве/i);
+      await expect(blocks().block('ss-archived', 'нарушение')).rejects.not.toThrow(/не найден/i);
+
+      expect(await getProduct(p.id)).toEqual(before);
+      expect(await jobsOf(p.id)).toEqual([]);
+    });
+
+    // ───────────────────────── снятие блокировки ─────────────────────────
+
+    it('101. снятие возвращает в sleeping и ставит пробуждение — но НЕ в running', async () => {
+      // 'running' здесь ставить нельзя: перевод в работу делает promoteReady по
+      // измеримому факту (раннер на связи и публичный адрес отдал 200).
+      // Объявленный рабочим продукт, контейнер которого ещё не начали
+      // поднимать, начал бы принимать ходы и платить аренду.
+      const other = await bystander();
+      const p = await product({ slug: 'ss-unblock', status: 'running' });
+      const svc = blocks();
+      quiet(svc);
+      await svc.block('ss-unblock', 'нарушение');
+
+      await svc.unblock('ss-unblock');
+
+      const row = await getProduct(p.id);
+      expect([row.status, row.block_reason]).toEqual(['sleeping', null]);
+      expect(await jobRowsOf(p.id)).toEqual([
+        { kind: 'sleep', status: 'failed', error: JOB_KILLED_BY_UNBLOCK },
+        { kind: 'wake', status: 'queued', error: null },
+      ]);
+      await expectUntouched(other);
+    });
+
+    it('101а. снятие снимает невыполненное ГАШЕНИЕ — иначе агент погасит следом', async () => {
+      // У блокированного продукта штатно висит НАШЕ ЖЕ задание на гашение —
+      // агент мог до него не дойти. Оставь его, и пробуждение по частичному
+      // уникальному индексу не встанет вовсе, продукт уедет в 'sleeping', а
+      // агент заберёт старое 'sleep' и погасит контейнер. Снятие блокировки
+      // выглядело бы сработавшим и не делало бы ничего.
+      await product({ slug: 'ss-unblock-race', status: 'running' });
+      const svc = blocks();
+      quiet(svc);
+      await svc.block('ss-unblock-race', 'нарушение');
+      await svc.unblock('ss-unblock-race');
+
+      const taken = await makeSvc().claimJob('own');
+
+      expect([taken?.jobKind, taken?.slug]).toEqual(['wake', 'ss-unblock-race']);
+      // И второго задания в очереди нет: старое гашение снято, а не отложено.
+      expect(await makeSvc().claimJob('own')).toBeNull();
+    });
+
+    it('101б. разбуженный снятием доезжает до running обычным путём', async () => {
+      // Путь отсюда до 'running' уже существует и проверен куском 3. Сторож
+      // стыка: promoteReady переводит разбуженного по ПОСЛЕДНЕМУ заданию
+      // (kind='wake' и status='done'), и снятое гашение, оставшееся последним,
+      // этот перевод сорвало бы.
+      const p = await product({ slug: 'ss-unblock-run', status: 'running', seenAgo: '5 seconds' });
+      const svc = blocks();
+      quiet(svc);
+      await svc.block('ss-unblock-run', 'нарушение');
+      await svc.unblock('ss-unblock-run');
+
+      const prov = makeSvc();
+      const taken = await prov.claimJob('own');
+      await prov.completeJob(taken!.jobId, { ok: true });
+      await pool.query(`UPDATE products SET runner_seen_at = now() WHERE id = $1`, [p.id]);
+
+      expect(await prov.promoteReady()).toBe(1);
+      expect((await getProduct(p.id)).status).toBe('running');
+    });
+
+    it('101в. снятие с НЕ блокированного — свой отказ, а не «не найден»', async () => {
+      // Продукт есть, ключ верный. «Не найден» отправил бы администратора
+      // искать опечатку там, где её нет, а настоящая причина — «кто-то уже
+      // снял» или «погасить так и не вышло» — осталась бы неназванной.
+      const p = await product({ slug: 'ss-not-blocked', status: 'running' });
+
+      await expect(blocks().unblock('ss-not-blocked')).rejects.toThrow(/не блокирован/i);
+
+      expect((await getProduct(p.id)).status).toBe('running');
+      expect(await jobsOf(p.id)).toEqual([]);
+    });
+
+    it('101г. снятия по несуществующему ключу и с архивного — свои отказы', async () => {
+      const p = await product({ slug: 'ss-unblock-arch', status: 'blocked' });
+      await pool.query(`UPDATE products SET archived_at = now() WHERE id = $1`, [p.id]);
+      const before = await getProduct(p.id);
+
+      await expect(blocks().unblock('неттакого')).rejects.toThrow(/не найден по слагу/i);
+      await expect(blocks().unblock('ss-unblock-arch')).rejects.toThrow(/в архиве/i);
+
+      expect(await getProduct(p.id)).toEqual(before);
+    });
+
+    // ───────── чужое место: отказ сна не снимает блокировку ─────────
+
+    it('103. отказ гашения ОСТАВЛЯЕТ продукт блокированным', async () => {
+      // ЧУЖОЕ МЕСТО, БЕЗ КОТОРОГО ГАШЕНИЕ ОТМЕНЯЕТСЯ СОБСТВЕННЫМ СБОЕМ.
+      // completeJob переводил продукт по ВИДУ задания (`WHEN 'sleep' THEN
+      // 'degraded'`), не глядя на его нынешний статус. Гашение ставит задание
+      // того же вида — значит любой сорвавшийся docker stop возвращал бы
+      // блокированный продукт в 'degraded', то есть в статус, который ПЛАТИТ
+      // АРЕНДУ и ПРИНИМАЕТ ПРАВКИ. Решение администратора снималось бы молча.
+      const p = await product({ slug: 'ss-fail-sleep', status: 'sleeping' });
+      await pool.query(`UPDATE products SET sleep_reason = 'нет токенов' WHERE id = $1`, [p.id]);
+      const svc = blocks();
+      quiet(svc);
+      await svc.block('ss-fail-sleep', 'нарушение');
+      const taken = await makeSvc().claimJob('own');
+
+      await makeSvc().completeJob(taken!.jobId, { ok: false, error: 'docker stop не отработал' });
+
+      const row = await getProduct(p.id);
+      expect(row.status).toBe('blocked');
+      expect(row.block_reason).toBe('нарушение');
+      // И причина сна цела: обнуление тоже сидело в ветке 'sleep'.
+      expect(row.sleep_reason).toBe('нет токенов');
+      // Причина отказа видна — иначе разбираться было бы не по чему.
+      expect(row.provision_error).toBe('docker stop не отработал');
+    });
+
+    it('103а. отказ сна у НЕ блокированного по-прежнему даёт degraded', async () => {
+      // Обратная половина: исключение для блокированного не должно съесть
+      // старое поведение. Без этого сценария мутация «всегда оставлять статус»
+      // прошла бы зелёной здесь и покраснела бы только в куске 3.
+      const p = await product({ slug: 'ss-fail-plain', status: 'sleeping' });
+      await pool.query(`UPDATE products SET sleep_reason = 'нет токенов' WHERE id = $1`, [p.id]);
+      const j = await job(p.id, { kind: 'sleep', status: 'running' });
+
+      await makeSvc().completeJob(j, { ok: false, error: 'docker stop не отработал' });
+
+      const row = await getProduct(p.id);
+      expect([row.status, row.sleep_reason]).toEqual(['degraded', null]);
+    });
+
+    it('103б. удачное гашение оставляет продукт блокированным', async () => {
+      // Отчёт об успехе статуса не трогает вовсе — и это ровно то, что нужно:
+      // promoteReady блокированных не выбирает, так что 'blocked' стоит до
+      // решения администратора.
+      const p = await product({ slug: 'ss-ok-sleep', status: 'running', seenAgo: '5 seconds' });
+      const svc = blocks();
+      quiet(svc);
+      await svc.block('ss-ok-sleep', 'нарушение');
+      const prov = makeSvc();
+      const taken = await prov.claimJob('own');
+
+      await prov.completeJob(taken!.jobId, { ok: true });
+
+      expect((await getProduct(p.id)).status).toBe('blocked');
+      // И сборщик перевода в работу его не подберёт даже при живом раннере.
+      await pool.query(`UPDATE products SET runner_seen_at = now() WHERE id = $1`, [p.id]);
+      expect(await prov.promoteReady()).toBe(0);
+      expect((await getProduct(p.id)).status).toBe('blocked');
     });
   });
 

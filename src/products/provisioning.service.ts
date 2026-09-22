@@ -698,8 +698,32 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                             -- не досталось бы никому (сторож — 46а: чужое
                             -- остаётся 'queued').
                             AND p.host_id = $2
+                            -- ВЕТКА НА КАЖДЫЙ ВИД, а не «сон и пробуждение
+                            -- заодно»: у гашения администратором (кусок 4б)
+                            -- продукт стоит в 'blocked', и два вида работы
+                            -- относятся к этому статусу ПРОТИВОПОЛОЖНО.
+                            --
+                            --   'sleep' блокированному выдать ОБЯЗАНЫ: гашение
+                            --     ставит именно такое задание, оставляя
+                            --     продукт в 'blocked'. Без этой ветки оно не
+                            --     досталось бы агенту никогда — контейнер
+                            --     работал бы дальше, домен отдавал бы то, за
+                            --     что продукт погасили, а через десять минут
+                            --     сборщик зависших закрыл бы задание чужой
+                            --     формулировкой про срок заведения;
+                            --   'wake' блокированному выдавать НЕЛЬЗЯ. Такое
+                            --     задание у него бывает: продукт спал за
+                            --     неуплату, владелец пополнил, будильник
+                            --     поставил пробуждение — и в этот момент
+                            --     пришло гашение. BlockService снимает его
+                            --     первым делом, но общий IN-список
+                            --     ('sleeping','blocked') на оба вида сделал
+                            --     бы то снятие ЕДИНСТВЕННЫМ, что стоит между
+                            --     решением администратора и агентом, который
+                            --     поднимет контейнер обратно через секунды.
                             AND CASE j.kind
                                   WHEN 'provision' THEN p.status = 'provisioning'
+                                  WHEN 'sleep' THEN p.status IN ('sleeping','blocked')
                                   ELSE p.status = 'sleeping'
                                 END)
            ORDER BY j.created_at ASC
@@ -851,6 +875,23 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     //
     // Причина пишется в карточку во всех трёх случаях: отказ, о котором никто
     // не узнал, — худший из исходов.
+    //
+    // БЛОКИРОВАННЫЙ ПРОДУКТ — ИСКЛЮЧЕНИЕ ИЗ ВЕТКИ СНА, и без него гашение
+    // отменялось бы собственным сбоем. Гашение администратором (кусок 4б)
+    // ставит задание того же вида 'sleep', оставляя продукт в 'blocked'.
+    // Разбор по виду задания статус продукта не спрашивал вовсе, то есть любой
+    // сорвавшийся сон уводил блокированный продукт в 'degraded' — а это
+    // статус, который ПЛАТИТ АРЕНДУ (списание берёт running/degraded) и
+    // ПРИНИМАЕТ ПРАВКИ. Решение администратора снималось бы отказом docker
+    // stop, молча и без единой строки о том, что блокировка исчезла.
+    //
+    // Остаться в 'blocked' — это ещё и правда: контейнер не погашен, но
+    // продукт по-прежнему запрещён, и ближайший claimJob отдаст агенту новое
+    // задание на гашение, как только администратор повторит.
+    //
+    // sleep_reason у блокированного по той же причине НЕ обнуляется: продукт
+    // мог спать за неуплату до гашения, и снятие блокировки вернёт его в
+    // 'sleeping' — уже без объяснения, почему он спит.
     const r = await this.pg.query(
       `WITH closed AS (
           UPDATE product_provision_jobs
@@ -861,11 +902,14 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
        UPDATE products
           SET status = CASE closed.kind
                          WHEN 'provision' THEN 'failed'
-                         WHEN 'sleep' THEN 'degraded'
+                         WHEN 'sleep' THEN
+                           CASE WHEN products.status = 'blocked' THEN 'blocked' ELSE 'degraded' END
                          ELSE products.status
                        END,
               sleep_reason = CASE closed.kind
-                               WHEN 'sleep' THEN NULL
+                               WHEN 'sleep' THEN
+                                 CASE WHEN products.status = 'blocked'
+                                      THEN products.sleep_reason ELSE NULL END
                                ELSE products.sleep_reason
                              END,
               provision_error = $2

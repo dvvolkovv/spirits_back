@@ -14,6 +14,7 @@ import { ProvisioningService } from './provisioning.service';
 import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
 import { RentService } from './rent.service';
+import { BlockService } from './block.service';
 
 @Module({
   imports: [CommonModule, MiscModule],
@@ -45,6 +46,13 @@ import { RentService } from './rent.service';
     // Включён здесь сразу: сервис, которого нет в модуле, не инжектируется
     // никуда — а звать его будут и сборщик, и пополнение баланса.
     RentService,
+    // Гашение продукта администратором и снятие блокировки. Здесь по той же
+    // причине, что реестр машин и предел аккаунта: маршруты гашения живут в
+    // ProductsController, а контроллер с незарегистрированной зависимостью
+    // Nest не поднимает вовсе — падение ГРОМКОЕ. Наружу не экспортируется:
+    // гасит продукт только администратор через свой маршрут, и второго места,
+    // откуда это делается, быть не должно.
+    BlockService,
   ],
   exports: [ProductsService, TurnsService, ProvisioningService, RentService],
 })
