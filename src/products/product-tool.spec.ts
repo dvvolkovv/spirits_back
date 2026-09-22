@@ -133,6 +133,60 @@ maybe('инструмент продуктов против живого Postgre
       expect(await svc.resolve(OWNER, '   ')).toEqual([]);
     });
   });
+
+  describe('действие list', () => {
+    it('показывает свои продукты с адресом и состоянием', async () => {
+      await mkProduct({ name: 'Магазин цветов', slug: 'flowers', domain: 'flowers.p.linkeon.io' });
+      const svc = new ProductToolService(pg as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'list' });
+      expect(out.ok).toBe(true);
+      expect(out.products).toHaveLength(1);
+      expect(out.products[0]).toMatchObject({
+        name: 'Магазин цветов', domain: 'flowers.p.linkeon.io', status: 'running', kind: 'site',
+      });
+    });
+
+    it('чужих продуктов не видно', async () => {
+      await mkProduct({ user: ALIEN, name: 'Чужой магазин', slug: 'alien' });
+      const svc = new ProductToolService(pg as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'list' });
+      expect(out.products).toEqual([]);
+    });
+
+    // У бота домена нет вовсе: create() пишет domain только сайтам. Подсказка
+    // обязана это учитывать, иначе ассистент скажет «адрес не указан» как про
+    // поломку.
+    it('у бота домена нет, и это сказано словами', async () => {
+      await mkProduct({ name: 'Бот поддержки', slug: 'supbot', kind: 'bot', domain: null });
+      const svc = new ProductToolService(pg as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'list' });
+      expect(out.products[0].domain).toBeNull();
+      expect(out.say).toMatch(/бот/i);
+    });
+
+    it('пустой список — это не ошибка', async () => {
+      const svc = new ProductToolService(pg as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'list' });
+      expect(out.ok).toBe(true);
+      expect(out.products).toEqual([]);
+      expect(out.say).toMatch(/нет|ни одного/i);
+    });
+
+    it('архивированные не показываются', async () => {
+      const id = await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [id]);
+      const svc = new ProductToolService(pg as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'list' });
+      expect(out.products).toEqual([]);
+    });
+
+    it('неизвестное действие — отказ, а не молчание', async () => {
+      const svc = new ProductToolService(pg as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'delete' });
+      expect(out.ok).toBe(false);
+      expect(out.reason).toBe('bad_action');
+    });
+  });
 });
 
 describe('разбор исхода хода', () => {
