@@ -58,10 +58,6 @@ const PLATFORMS = {
      * не попадает ни в .env, ни в код.
      */
     profile: process.env.MEET_PROFILE_DIR || join(homedir(), '.linkeon-meet-profile'),
-    // Тот же довод, что у Zoom: без устройств в списке площадка считает, что
-    // микрофона нет. Meet на экране входа показывает выбранный — «Fake Default
-    // Audio Input», — и это признак, что звук он у нас возьмёт.
-    chromeArgs: ['--use-fake-device-for-media-stream'],
     // Английский интерфейс — условие работы зацепок.
     //
     // Вход, чат и состав ищутся по подписям: «Ask to join», «Chat with
@@ -74,14 +70,6 @@ const PLATFORMS = {
     payload: ZOOM_PAYLOAD,
     name: 'Zoom',
     viaSdk: true,
-    // Фальшивое устройство — не для звука, а для СПИСКА устройств.
-    //
-    // Звук мы всё равно подменяем перехватом getUserMedia. Но у контейнера нет
-    // ни одной звуковой карты, и `enumerateDevices()` возвращает пустоту —
-    // SDK решает, что микрофона нет, и не начинает подключать звук. А именно
-    // это и есть его признак входа во встречу (13-й уровень onJoinSpeed), без
-    // которого бот вечно ждёт впуска. Тот же флаг стоит у Attendee.
-    chromeArgs: ['--use-fake-device-for-media-stream'],
   },
 };
 
@@ -98,6 +86,8 @@ export class MeetingBot {
     this.chatAuthors = new Map();
     /** Недавно отданные сообщения — против повтора из соседнего кадра. */
     this.chatSeen = new Map();
+    /** Кадр, в котором живёт аудиограф, отданный площадке. */
+    this.audioFrame = null;
     /** Кто во встрече ПО ПОДТВЕРЖДЁННЫМ событиям, а не по площадке: uuid → имя. */
     this.people = new Map();
     this.syncing = false;
@@ -142,6 +132,32 @@ export class MeetingBot {
     });
   }
 
+  /**
+   * Кадр, который отдал площадке микрофон.
+   *
+   * Голос ассистента надо проигрывать именно туда: сценарий живёт во всех
+   * кадрах, но аудиограф, подключённый к встрече, только один. На новом
+   * Телемосте встреча сидит в дочернем кадре, и речь, отданная в главный
+   * документ, не слышал никто (22.09.2026).
+   *
+   * Найденный кадр помним: кадры при перезагрузке страницы меняются, поэтому
+   * забываем его, как только он перестаёт отвечать.
+   */
+  async micFrame() {
+    const alive = async (f) => !!(await f.evaluate(() => !!window.__botMicServed).catch(() => false));
+    if (this.audioFrame && (await alive(this.audioFrame))) return this.audioFrame;
+    for (const f of this.page?.frames() || []) {
+      if (await alive(f)) {
+        this.audioFrame = f;
+        this.log.info?.(`[${this.id}] голос идёт в кадр ${f.url().slice(0, 60)}`);
+        return f;
+      }
+    }
+    // Не нашли — играем в главный документ: на площадках без кадров это он и
+    // есть, и поведение прежнее.
+    return this.page?.mainFrame();
+  }
+
   /** Кусок голоса ассистента — в страницу. */
   async playFromWorker(raw) {
     let msg;
@@ -150,7 +166,8 @@ export class MeetingBot {
     // Строку отдаём страницу как есть: разбор PCM дешевле сделать там, чем
     // гнать через мост CDP массив чисел.
     try {
-      await this.page?.evaluate((chunk) => window.__botPlayPcm?.(chunk), msg.data.chunk);
+      const frame = await this.micFrame();
+      await frame?.evaluate((chunk) => window.__botPlayPcm?.(chunk), msg.data.chunk);
     } catch (e) {
       // Страница могла уйти — это не повод рушить встречу.
       this.log.warn?.(`[${this.id}] голос не доиграл: ${e?.message}`);
@@ -243,6 +260,12 @@ export class MeetingBot {
 
       case 'ready':
         this.log.info?.(`[${this.id}] сценарий страницы в кадре ${data?.url}`);
+        break;
+
+      case 'level':
+        // Ноль — значит во встрече тишина ИЛИ звук до нас не доходит; всё,
+        // что выше, доказывает, что тракт живой.
+        this.log.info?.(`[${this.id}] громкость входящего: ${data?.peak}%`);
         break;
 
       case 'tracks':
@@ -364,6 +387,14 @@ export class MeetingBot {
         '--disable-features=IsolateOrigins,site-per-process',
         '--disable-blink-features=AutomationControlled',
         '--disable-extensions',
+        // Фальшивое устройство — не ради звука, а ради СПИСКА устройств.
+        //
+        // Звук мы подменяем перехватом getUserMedia. Но в контейнере нет ни
+        // одной звуковой карты, `enumerateDevices()` пуст, и площадка, не найдя
+        // микрофона, просто не просит его — перехватывать становится нечего.
+        // Так вёл себя Zoom, и так же повёл себя новый Телемост: бот пришёл,
+        // но ни разу не спросил микрофон и остался немым (22.09.2026).
+        '--use-fake-device-for-media-stream',
         ...(platform.chromeArgs || []),
       ],
     };

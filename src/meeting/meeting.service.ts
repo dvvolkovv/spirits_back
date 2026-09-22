@@ -10,6 +10,7 @@ import { AttendeeClient, attendeeConfigured } from './attendee.client';
 import { IntegrationFlagsService } from '../integrations/integration-flags.service';
 import { assistantSignature } from './assistant-signature';
 import { MeetingProvider } from './meeting-link';
+import { alertMeetingFailure } from './meeting-alert';
 
 /** Провайдер встречи в voice_calls. Дальше сюда добавится 'zoom'. */
 const PROVIDER = 'linkeon_room';
@@ -191,6 +192,16 @@ export class MeetingService {
       // Не настроен — входить некуда. Отказ ДО создания записи звонка:
       // иначе строка осталась бы в dialing и заперла пользователю его же
       // следующий вход до реапера.
+      // Дежурному чату это важно: интеграция включена в админке, а войти
+      // нечем — значит не доехали настройки, и узнавать об этом от человека
+      // хуже, чем от себя.
+      void alertMeetingFailure({
+        stage: 'проверка настроек',
+        provider,
+        reason: 'мост встреч не настроен: нет адреса или ключа',
+        userId,
+        room: code,
+      });
       throw new ConflictException({ message: 'meeting bot is not configured', reason: 'meet_unavailable' });
     }
 
@@ -227,6 +238,13 @@ export class MeetingService {
         // Причина остаётся `meet_busy` при занятости любой из площадок: этот
         // ключ уже переведён во всех локалях фронта, а человеку важно не имя
         // площадки, занявшей мост, а то, что мост занят.
+        void alertMeetingFailure({
+          stage: 'потолок встреч',
+          provider,
+          reason: `одновременных встреч через мост: ${busy.rows[0]?.n ?? 0} при потолке ${MEET_CONCURRENCY_LIMIT}`,
+          userId,
+          room: code,
+        });
         throw new ConflictException({ message: 'meeting bridge capacity reached', reason: 'meet_busy' });
       }
 

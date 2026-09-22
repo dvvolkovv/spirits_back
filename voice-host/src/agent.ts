@@ -1528,6 +1528,10 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
           console.log(`[мост] ${log}`);
           await backend.failed(meta.callId, reason).catch(() => {});
           try { await session.close(); } catch (e) { console.error('session.close()', e); }
+          // Порт отпускаем здесь, а не на завершении процесса: процесс задания
+          // живёт ещё долго после конца разговора, а порт под звук один на весь
+          // воркер — занятый, он не даёт начать следующую встречу.
+          attendeeHub?.close();
           try { await ctx.room.disconnect(); } catch (e) { console.error('room.disconnect()', e); }
         };
         attendeeHub.onLost(() => {
@@ -1551,6 +1555,7 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
             console.log(`[мост] встреча закончилась: ${reason}`);
             void (async () => {
               try { await session.close(); } catch (e) { console.error('session.close()', e); }
+              attendeeHub?.close();
               try { await ctx.room.disconnect(); } catch (e) { console.error('room.disconnect()', e); }
             })();
             return;

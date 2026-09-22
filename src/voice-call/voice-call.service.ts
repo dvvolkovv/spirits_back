@@ -1,4 +1,5 @@
 import { Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
+import { alertMeetingFailure } from '../meeting/meeting-alert';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { CASH_TOKENS_PER_USD } from '../common/billing-rates';
@@ -427,9 +428,27 @@ export class VoiceCallService {
   async fail(callId: string, reason: string): Promise<void> {
     const res = await this.pg.query(
       `UPDATE voice_calls SET status = 'failed', ended_at = now(), summary = $1, cost_usd = 0
-        WHERE id = $2 RETURNING external_bot_id`,
+        WHERE id = $2 RETURNING external_bot_id, provider, user_id, external_room`,
       [`Звонок не состоялся: ${reason}`, callId],
     );
+    // Сюда сходятся ВСЕ поздние отказы: занятый порт под звук, не созданный
+    // бот, не пущенная площадка, не подключившийся звук. Человек в этот момент
+    // видит только то, что ассистент не пришёл, а причина остаётся в логах
+    // трёх разных процессов — поэтому дежурный чат узнаёт о ней отсюда.
+    //
+    // Свои звонки один на один не тревожат: там отказ виден сразу и не связан
+    // с интеграциями.
+    const row = res.rows[0];
+    if (row && row.provider && row.provider !== 'linkeon') {
+      void alertMeetingFailure({
+        stage: 'встреча',
+        provider: row.provider,
+        reason,
+        callId,
+        userId: row.user_id,
+        room: row.external_room,
+      });
+    }
     // Тот же довод, что в complete(): бот не должен пережить звонок. Сюда
     // попадают и отказы входа — бот в этот момент может стучаться в комнату
     // ожидания, и оставлять его стучаться незачем.

@@ -1,4 +1,4 @@
-import { Body, Controller, ForbiddenException, Param, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, ForbiddenException, Get, Param, Post, UseGuards } from '@nestjs/common';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { VoiceCallService } from '../voice-call/voice-call.service';
@@ -45,6 +45,25 @@ export class MeetingController {
     const url = typeof body?.url === 'string' && body.url ? body.url : undefined;
     // Имя владельца сервис берёт из профиля сам: в JWT его нет.
     return this.meetings.join(u.userId, Number(body?.agentId), String(body?.code || ''), provider, url);
+  }
+
+  /**
+   * Чем кончился вход.
+   *
+   * Нужна потому, что успешный ответ `join` ещё ничего не обещает: бот идёт на
+   * встречу секунды и минуты, и сорваться может уже после ответа — занятый
+   * порт под звук, сменившаяся вёрстка площадки, отказ во входе. До этой ручки
+   * интерфейс показывал «ассистент на встрече» в любом случае, и человек ждал
+   * того, кто не придёт (замечание владельца 22.09.2026).
+   *
+   * Отдаём только состояние: подробности — дело дежурного чата, человеку от
+   * них пользы нет.
+   */
+  @Get(':id/status')
+  async status(@CurrentUser() u: any, @Param('id') id: string) {
+    const call = await this.calls.load(id);
+    if (call.user_id !== u.userId) throw new ForbiddenException('not your meeting');
+    return { status: call.status };
   }
 
   @Post(':id/leave')
