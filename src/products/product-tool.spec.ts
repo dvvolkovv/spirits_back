@@ -3,6 +3,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { MIGRATIONS } from './products.service';
 import { ProductToolService, describeTurn } from './product-tool.service';
+import { TurnsService, SLEEPING_REFUSAL, BLOCKED_REFUSAL } from './turns.service';
+import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
 
 const PG = process.env.PROVISIONING_PG_URL;
 const maybe = PG ? describe : describe.skip;
@@ -185,6 +187,164 @@ maybe('инструмент продуктов против живого Postgre
       const out: any = await svc.execute(OWNER, { action: 'delete' });
       expect(out.ok).toBe(false);
       expect(out.reason).toBe('bad_action');
+    });
+  });
+
+  describe('действие edit', () => {
+    /** Настоящий TurnsService на том же пуле: заглушка не исполняет предусловия. */
+    const realTurns = (balanceOk = true) =>
+      new TurnsService(pg as any, {
+        checkTokenBalance: async () => ({ ok: balanceOk }),
+        deductTokens: async (_u: string, n: number) => n,
+      } as any);
+
+    it('потолок ожидания взят из общей константы, а не выбран свой', () => {
+      const svc = new ProductToolService(pg as any, {} as any);
+      expect((svc as any).waitMs).toBe(PRODUCT_TOOL_WAIT_MS);
+    });
+
+    it('ставит ровно ОДИН ход', async () => {
+      await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      const svc = new ProductToolService(pg as any, realTurns());
+      (svc as any).waitMs = 0; // не ждём исхода — здесь проверяется постановка
+      const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'Добавь раздел «О нас»' });
+      expect(out.turnId).toBeTruthy();
+      const n = await pool.query('SELECT count(*) FROM product_turns');
+      expect(Number(n.rows[0].count)).toBe(1);
+    });
+
+    it('текст правки доезжает до хода дословно', async () => {
+      await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      const svc = new ProductToolService(pg as any, realTurns());
+      (svc as any).waitMs = 0;
+      await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'Добавь раздел «О нас»' });
+      const r = await pool.query('SELECT prompt, channel FROM product_turns');
+      expect(r.rows[0].prompt).toBe('Добавь раздел «О нас»');
+      expect(r.rows[0].channel).toBe('web');
+    });
+
+    it('два магазина на «магазин» — УТОЧНЯЕТ, а не выбирает', async () => {
+      await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      await mkProduct({ name: 'Магазин книг', slug: 'books' });
+      const svc = new ProductToolService(pg as any, realTurns());
+      const out: any = await svc.execute(OWNER, { action: 'edit', product: 'магазин', prompt: 'что-нибудь' });
+      expect(out.ok).toBe(false);
+      expect(out.reason).toBe('ambiguous');
+      expect(out.matches).toHaveLength(2);
+      const n = await pool.query('SELECT count(*) FROM product_turns');
+      expect(Number(n.rows[0].count)).toBe(0); // ход НЕ поставлен
+    });
+
+    it('не нашли — отказ со списком того, что есть', async () => {
+      await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      const svc = new ProductToolService(pg as any, realTurns());
+      const out: any = await svc.execute(OWNER, { action: 'edit', product: 'кофейня', prompt: 'что-нибудь' });
+      expect(out.ok).toBe(false);
+      expect(out.reason).toBe('not_found');
+      expect(out.products).toHaveLength(1);
+    });
+
+    it('чужой продукт по его идентификатору — не найден', async () => {
+      const alien = await mkProduct({ user: ALIEN, name: 'Чужой магазин', slug: 'alien' });
+      const svc = new ProductToolService(pg as any, realTurns());
+      const out: any = await svc.execute(OWNER, { action: 'edit', product: alien, prompt: 'сломай' });
+      expect(out.reason).toBe('not_found');
+      const n = await pool.query('SELECT count(*) FROM product_turns');
+      expect(Number(n.rows[0].count)).toBe(0);
+    });
+
+    it('без текста правки ход не ставится', async () => {
+      await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      const svc = new ProductToolService(pg as any, realTurns());
+      const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: '  ' });
+      expect(out.ok).toBe(false);
+      expect(out.reason).toBe('no_prompt');
+      const n = await pool.query('SELECT count(*) FROM product_turns');
+      expect(Number(n.rows[0].count)).toBe(0);
+    });
+
+    it('спящий — отказ С предложением пополнить', async () => {
+      await mkProduct({ name: 'Магазин цветов', slug: 'flowers', status: 'sleeping' });
+      const svc = new ProductToolService(pg as any, realTurns());
+      const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'правка' });
+      expect(out.ok).toBe(false);
+      expect(out.reason).toBe('sleeping');
+      expect(out.canTopUp).toBe(true);
+      expect(out.say).toContain(SLEEPING_REFUSAL);
+    });
+
+    it('погашенный — отказ БЕЗ предложения пополнить', async () => {
+      await mkProduct({ name: 'Магазин цветов', slug: 'flowers', status: 'blocked' });
+      const svc = new ProductToolService(pg as any, realTurns());
+      const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'правка' });
+      expect(out.ok).toBe(false);
+      expect(out.reason).toBe('blocked');
+      expect(out.canTopUp).toBe(false);
+      expect(out.say).toContain(BLOCKED_REFUSAL);
+    });
+
+    it('спящий и погашенный различимы по признаку пополнения', async () => {
+      await mkProduct({ name: 'Спящий', slug: 'a', status: 'sleeping' });
+      await mkProduct({ name: 'Погашенный', slug: 'b', status: 'blocked' });
+      const svc = new ProductToolService(pg as any, realTurns());
+      const s: any = await svc.execute(OWNER, { action: 'edit', product: 'спящий', prompt: 'x' });
+      const b: any = await svc.execute(OWNER, { action: 'edit', product: 'погашенный', prompt: 'x' });
+      expect(s.reason).not.toBe(b.reason);
+      expect(s.canTopUp).not.toBe(b.canTopUp);
+    });
+
+    it('нет токенов — свой отказ, не слитый со спящим', async () => {
+      await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      const svc = new ProductToolService(pg as any, realTurns(false));
+      const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'правка' });
+      expect(out.ok).toBe(false);
+      expect(out.reason).toBe('no_tokens');
+      expect(out.canTopUp).toBe(true);
+    });
+
+    it('агент уже занят — отказ, второй ход не ставится', async () => {
+      const id = await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      await pool.query(
+        `INSERT INTO product_turns (product_id, user_id, channel, prompt, status)
+         VALUES ($1, $2, 'web', 'первая', 'running')`,
+        [id, OWNER],
+      );
+      const svc = new ProductToolService(pg as any, realTurns());
+      const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'вторая' });
+      expect(out.ok).toBe(false);
+      expect(out.reason).toBe('busy');
+      const n = await pool.query('SELECT count(*) FROM product_turns');
+      expect(Number(n.rows[0].count)).toBe(1);
+    });
+
+    it('дождался конца — отдаёт исход хода, а не «поставлено»', async () => {
+      const id = await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      const svc = new ProductToolService(pg as any, realTurns());
+      (svc as any).waitMs = 4_000;
+      (svc as any).pollMs = 100;
+      // Пока инструмент ждёт, «раннер» дописывает ход как откат.
+      setTimeout(() => {
+        pool.query(
+          `UPDATE product_turns SET status = 'reverted', error = 'health check failed', finished_at = now()
+            WHERE product_id = $1`,
+          [id],
+        );
+      }, 300);
+      const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'правка' });
+      expect(out.outcome).toBe('reverted');
+      expect(out.ok).toBe(false);
+    });
+
+    it('не дождался — честное «идёт» с идентификатором хода', async () => {
+      await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      const svc = new ProductToolService(pg as any, realTurns());
+      (svc as any).waitMs = 300;
+      (svc as any).pollMs = 100;
+      const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'правка' });
+      expect(out.finished).toBe(false);
+      expect(out.outcome).toBe('queued');
+      expect(out.turnId).toBeTruthy();
+      expect(out.say).toMatch(/status/);
     });
   });
 });
