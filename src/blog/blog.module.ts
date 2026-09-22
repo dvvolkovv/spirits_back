@@ -6,6 +6,7 @@ import { BlogController } from './blog.controller';
 import { BlogSettingsService } from './blog-settings.service';
 import { BlogTopicService } from './blog-topic.service';
 import { BlogGitSource } from './blog-git.source';
+import { BlogNewsService } from './blog-news.service';
 import { BlogRelayClient } from './blog-relay.client';
 import { BlogEditorService } from './blog-editor.service';
 import { BlogImageService } from './blog-image.service';
@@ -36,6 +37,7 @@ import { BlogCron } from './blog.cron';
     BlogSettingsService,
     BlogTopicService,
     BlogGitSource,
+    BlogNewsService,
     BlogRelayClient,
     BlogEditorService,
     BlogImageService,

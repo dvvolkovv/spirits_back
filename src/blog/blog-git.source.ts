@@ -20,7 +20,14 @@ export function parseGitLog(stdout: string): GitCommit[] {
     .filter((c) => c.sha && c.subject);
 }
 
-const NOISE = /^(chore|docs|test|tests|ci|build|refactor|style|perf)[(:]/i;
+/**
+ * Служебные типы коммита: работа настоящая, но читателю канала невидимая.
+ *
+ * `plan` и `spec` попали сюда не сразу, и это стоило нам недели ложных
+ * новостей: правки плана и дизайн-спеки шли в очередь наравне с фичами,
+ * потому что в списке был только `docs`.
+ */
+const NOISE = /^(chore|docs|test|tests|ci|build|refactor|style|perf|plan|spec)[(:]/i;
 
 /**
  * Служебные префиксы коммита, по которым текст неинформативен сам по себе:

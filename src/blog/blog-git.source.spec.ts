@@ -42,4 +42,16 @@ describe('filterUserFacing', () => {
       .map((subject, i) => ({ sha: String(i), subject }));
     expect(filterUserFacing(noise)).toHaveLength(0);
   });
+
+  // На проде правки плана и спеки проходили как новости: префиксов plan и
+  // spec в списке шума не было, и `plan(blog): задача 3б` выглядел как фича.
+  it('plan и spec отбрасываются: правка документа — не новость', () => {
+    const noise = ['plan: задача 3б', 'spec(blog): дизайн куска 4а', 'plan(products): шесть задач']
+      .map((subject, i) => ({ sha: String(i), subject }));
+    expect(filterUserFacing(noise)).toHaveLength(0);
+  });
+
+  it('слово, начинающееся на spec, фичу не съедает', () => {
+    expect(filterUserFacing([{ sha: 'a', subject: 'feat(chat): special-режим' }])).toHaveLength(1);
+  });
 });
