@@ -110,6 +110,9 @@ export const TELEMOST_PAYLOAD = `
  * без единого поля и уходит ни с чем.
  */
 export const TELEMOST_JOIN = {
+  // Экран встречи живёт в дочернем кадре внутри оболочки Яндекс 360 — там и
+  // поле имени, и кнопка входа. В главном документе их нет вовсе.
+  frame: /\/private-join\//,
   // Окно приветствия закрываем ПЕРВЫМ делом. Зацепки по testid, а не по
   // подписи: подпись у такого окна меняется от выката к выкату.
   dismiss: '[data-testid="telemost-3-onboarding-confirm"], [data-testid="telemost-3-onboarding-close"]',

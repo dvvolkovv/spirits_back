@@ -459,6 +459,32 @@ export class MeetingBot {
     this.connectAudio();
   }
 
+  /**
+   * Где искать элементы входа — на странице или в её кадре.
+   *
+   * Новый Телемост держит экран встречи в дочернем кадре `/private-join/…`
+   * внутри оболочки Яндекс 360, а зацепки Playwright по умолчанию смотрят
+   * только в главный документ. Со стороны это неотличимо от «кнопки нет»:
+   * страница есть, элементы видны глазами, а бот их не находит (22.09.2026).
+   *
+   * Кадр ищем КАЖДЫЙ раз заново: он появляется не сразу и может смениться.
+   */
+  scope(sel) {
+    if (!sel?.frame) return this.page;
+    return this.page.frames().find((f) => sel.frame.test(f.url())) || this.page;
+  }
+
+  /** Дождаться появления кадра встречи. `false` — не дождались. */
+  async waitForFrame(sel, timeout = 30_000) {
+    if (!sel?.frame) return true;
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      if (this.page.frames().some((f) => sel.frame.test(f.url()))) return true;
+      await this.page.waitForTimeout(500);
+    }
+    return false;
+  }
+
   async joinMeeting(sel) {
     /**
      * Дождаться элемента, а не спросить о нём один раз.
@@ -469,8 +495,12 @@ export class MeetingBot {
      * Ждём явно и недолго; не дождались — идём дальше, шаг может быть
      * необязательным (камеры может не быть вовсе).
      */
+    if (!(await this.waitForFrame(sel))) {
+      this.log.warn?.(`[${this.id}] кадра встречи не дождались — работаем со страницей`);
+    }
+
     const waitFor = async (selector, timeout = 30_000) => {
-      const el = this.page.locator(selector).first();
+      const el = this.scope(sel).locator(selector).first();
       try { await el.waitFor({ state: 'visible', timeout }); return el; }
       catch { return null; }
     };
@@ -530,14 +560,14 @@ export class MeetingBot {
       // ждём ли мы впуска, и только потом верим признаку. Иначе бот объявляет
       // себя вошедшим, стоя за дверью, — и воркер начинает говорить в пустоту.
       const waiting = sel.waitingRoom
-        ? await this.page.locator(sel.waitingRoom).first().count().catch(() => 0)
+        ? await this.scope(sel).locator(sel.waitingRoom).first().count().catch(() => 0)
         : 0;
       if (waiting) {
         if (!announced) { this.log.info?.(`[${this.id}] ждём, пока впустят`); announced = true; }
         await this.page.waitForTimeout(2_000);
         continue;
       }
-      if (await this.page.locator(sel.inMeeting).first().count().catch(() => 0)) {
+      if (await this.scope(sel).locator(sel.inMeeting).first().count().catch(() => 0)) {
         this.log.info?.(`[${this.id}] мы во встрече`);
         await click(sel.chatButton, 'панель чата открыта');
         await this.setState('joined_recording');
@@ -581,7 +611,10 @@ export class MeetingBot {
     this.closed = true;
     try {
       if (PLATFORMS[this.platform]?.viaSdk) await this.page?.evaluate(() => window.__botLeave?.());
-      else await this.page?.locator(PLATFORMS[this.platform].join.leaveButton).first().click({ timeout: 3_000 });
+      else {
+        const join = PLATFORMS[this.platform].join;
+        await this.scope(join).locator(join.leaveButton).first().click({ timeout: 3_000 });
+      }
     } catch { /* уйдём закрытием браузера */ }
     try { this.ws?.close(); } catch { /* уже закрыт */ }
     try {
