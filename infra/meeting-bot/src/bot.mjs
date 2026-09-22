@@ -398,7 +398,10 @@ export class MeetingBot {
       const t = m.type();
       if (t !== 'error' && t !== 'warning') return;
       const text = m.text().slice(0, 300);
-      if (/favicon|Download the React DevTools|deprecated/i.test(text)) return;
+      // Шум площадок в лог не пускаем: он тонет в нём сам и топит остальное.
+      // Новый Телемост сыплет предупреждениями о предзагрузке по три штуки
+      // каждые несколько секунд — из-за них не видно ни состава, ни чата.
+      if (/favicon|Download the React DevTools|deprecated|preloaded using link preload|Unrecognized feature|does not match the recipient window/i.test(text)) return;
       this.log.warn?.(`[${this.id}] страница: ${text}`);
     });
     this.page.on('pageerror', (e) => this.log.warn?.(`[${this.id}] страница упала: ${e?.message}`));
