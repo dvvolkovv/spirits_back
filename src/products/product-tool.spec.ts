@@ -186,23 +186,29 @@ maybe('инструмент продуктов против живого Postgre
     // «первый» в его фразе обязан быть самым свежим, а не тем, что Postgres
     // вернул из кучи. Без ORDER BY порядок не определён вовсе.
     //
-    // Продуктов ПЯТЬ, а не два, сознательно: на двух строках Postgres может
-    // отдать их в нужном порядке и без сортировки, и тест зеленел бы при
-    // снятой защите. Проверено мутацией — со снятым ORDER BY краснеет.
+    // ПОРЯДОК ВСТАВКИ НАРОЧНО НЕ СОВПАДАЕТ С ХРОНОЛОГИЧЕСКИМ. Первая редакция
+    // этого теста вставляла продукты по возрастанию created_at и была ЛОЖНЫМ
+    // сторожем: измерено пробником — со снятым ORDER BY база вернула ровно тот
+    // же порядок, что и с ним (4,3,2,1,0), потому что физический порядок кучи
+    // случайно совпал с нужным. Тест зеленел при полностью снятой защите.
+    //
+    // Здесь вставка идёт вперемешку (2,0,4,1,3), поэтому ни физический порядок,
+    // ни обратный ему на ответ не похожи, и сортировку подменить нечем.
     it('свежие продукты идут первыми', async () => {
-      const ids: string[] = [];
-      for (let i = 0; i < 5; i++) {
-        const id = await mkProduct({ name: `Магазин ${i}`, slug: `shop${i}` });
-        await pool.query(
-          `UPDATE products SET created_at = now() - ($2 || ' hour')::interval WHERE id = $1`,
-          [id, String(5 - i)],
+      const byAge: Record<number, string> = {};
+      // Часы «назад»: индекс 0 — самый старый, 4 — самый свежий.
+      for (const i of [2, 0, 4, 1, 3]) {
+        const r = await pool.query(
+          `INSERT INTO products (user_id, name, slug, kind, status, checkout_path, runner_token_hash, created_at)
+           VALUES ($1, $2, $3, 'site', 'running', $4, $5, now() - ($6 || ' hour')::interval)
+           RETURNING id`,
+          [OWNER, `Магазин ${i}`, `shop${i}`, `/srv/shop${i}`, `hash-shop${i}`, String(5 - i)],
         );
-        ids.push(id);
+        byAge[i] = r.rows[0].id;
       }
       const svc = new ProductToolService(pg as any, {} as any);
       const out: any = await svc.execute(OWNER, { action: 'list' });
-      // ids[0] самый старый (−5 ч), ids[4] самый свежий (−1 ч).
-      expect(out.products.map((p: any) => p.id)).toEqual([...ids].reverse());
+      expect(out.products.map((p: any) => p.id)).toEqual([4, 3, 2, 1, 0].map((i) => byAge[i]));
     });
 
     it('неизвестное действие — отказ, а не молчание', async () => {
