@@ -15,6 +15,7 @@ import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
 import { RentService } from './rent.service';
 import { BlockService } from './block.service';
+import { ProductToolService } from './product-tool.service';
 
 @Module({
   imports: [CommonModule, MiscModule],
@@ -53,7 +54,10 @@ import { BlockService } from './block.service';
     // гасит продукт только администратор через свой маршрут, и второго места,
     // откуда это делается, быть не должно.
     BlockService,
+    // Инструмент ассистента. Экспортируется наружу: его зовёт точка
+    // /mcp/products, живущая в McpModule.
+    ProductToolService,
   ],
-  exports: [ProductsService, TurnsService, ProvisioningService, RentService],
+  exports: [ProductsService, TurnsService, ProvisioningService, RentService, ProductToolService],
 })
 export class ProductsModule {}
