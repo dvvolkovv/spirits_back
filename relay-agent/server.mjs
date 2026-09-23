@@ -308,6 +308,31 @@ const TALERID_PROMPT = `
   инструмента не выдавай за успех и не показывай пользователю служебный текст ошибки — объясни по-человечески.
 `;
 
+// ── Agent-direct продукты пользователя (сайты и телеграм-боты) ───────────────
+// Имя инструмента складывается как mcp__<ключ сервера в конфиге>__<имя тула>:
+// ключ `products` (им заводится сервер в конфиге ниже) и имя `manage_product` из
+// контракта MCP-сервера. Разойдутся — белый список не совпадёт с реальностью,
+// и отказ будет молчаливым.
+const PRODUCTS_TOOLS = "mcp__products__manage_product";
+
+// Явная оговорка к правилу «только mcp__linkeon__*» из SYSTEM_PROMPT — без неё
+// ассистент видит инструмент и не зовёт его, считая запрещённым. Ровно такая же
+// оговорка стоит у TalerID.
+const PRODUCTS_PROMPT = `
+
+ПРОДУКТЫ ПОЛЬЗОВАТЕЛЯ (сайты и телеграм-боты, размещённые в Линкеоне).
+Тебе доступен инструмент mcp__products__manage_product. Это ЯВНОЕ исключение к правилу «только mcp__linkeon__*».
+НЕ передавай в него userId/телефон — их там нет: сервер уже знает, чей это разговор.
+- { action: "list" } — показать продукты пользователя.
+- { action: "edit", product: "<как пользователь назвал>", prompt: "<что сделать, подробно>" } — поставить правку.
+- { action: "status", product или turnId } — узнать, чем кончилась правка.
+Если пользователь просит что-то изменить на его сайте или в его боте — это ЭТОТ инструмент, а не Bash/Write.
+У тебя нет доступа к файлам его продукта: правку исполняет ассистент внутри продукта.
+ГЛАВНОЕ: outcome="reverted" значит ОТКАТ — правка НЕ применена, код вернули как было. Никогда не называй это
+«готово» или «сделал». outcome="failed" — тоже не успех. Успех только outcome="done".
+Если вернулось reason="ambiguous" — СПРОСИ, какой продукт править, и вызови снова. Не выбирай сам.
+`;
+
 app.post("/chat", upload.array("files", 10), (req, res) => {
   const { message, sessionId: reqSessionId } = req.body;
   // Модель хода. По умолчанию "default" (рекомендуемая CLI — сейчас Opus 5).
@@ -426,41 +451,62 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
     walkBefore(outDir, "");
   }
 
-  // Per-request TalerID injection: default to linkeon-only; if the backend passed
-  // a per-user token + MCP url, write a per-session MCP config (linkeon + talerid)
-  // and widen allowedTools + system prompt to the notes/messages tools. Cleaned up
-  // when the request finishes (see finally below). Falls back safely on any error.
+  // Per-request injection дополнительных MCP-серверов: по умолчанию только
+  // linkeon; если бэкенд передал пер-юзерный токен + MCP url, пишем пер-сессионный
+  // конфиг и расширяем allowedTools + системный промпт. Постояльцев двое —
+  // talerid (заметки/сообщения/почта) и products (сайты и телеграм-боты
+  // пользователя). Временный файл убирается по завершении запроса (см. finally
+  // ниже). Любая осечка — безопасный откат к базовому конфигу.
   let mcpConfigPath = BASE_MCP_PATH;
   let allowedTools = "Bash(*),Read(*),Write(*),Edit(*),Glob(*),Grep(*),WebSearch(*),WebFetch(*),mcp__linkeon__generate_image,mcp__linkeon__edit_image,mcp__linkeon__compose_image,mcp__linkeon__upscale_image,mcp__linkeon__generate_video,mcp__linkeon__generate_banner,mcp__linkeon__manage_routine,mcp__linkeon__propose_calendar_event,mcp__linkeon__generate_speech,mcp__linkeon__read_calendar";
   let systemPrompt = SYSTEM_PROMPT;
-  let taleridMcpPath = null;
+  let sessionMcpPath = null;
   // Set when the agent uses a TalerID *write* tool this request. The transient
   // whole-turn retry below re-runs the turn, which would double-execute a write —
   // create_note dedups by title server-side, but send_message does NOT, so a retry
   // could double-send a message. When a write happened, we do NOT retry.
   let taleridWriteUsed = false;
   const TALERID_WRITE_RE = /mcp__talerid__(create_note|update_note|delete_note|send_message|send_mail)/;
+
+  // Пер-сессионный MCP-конфиг собирается ОДИН на всех постояльцев и пишется
+  // ОДИН раз. Два блока, каждый со своим файлом и своим переприсваиванием
+  // mcpConfigPath, оставили бы в живых только последний — молча: конфиг
+  // валиден, инструментов половина.
   const _taleridToken = req.body.talerid_token;
   const _taleridMcpUrl = req.body.talerid_mcp_url;
-  if (_taleridToken && _taleridMcpUrl && /^https:\/\//.test(_taleridMcpUrl)) {
+  const _productsToken = req.body.products_token;
+  const _productsMcpUrl = req.body.products_mcp_url;
+  const wantTalerid = !!(_taleridToken && _taleridMcpUrl && /^https:\/\//.test(_taleridMcpUrl));
+  const wantProducts = !!(_productsToken && _productsMcpUrl && /^https:\/\//.test(_productsMcpUrl));
+
+  if (wantTalerid || wantProducts) {
     try {
       const base = JSON.parse(fs.readFileSync(BASE_MCP_PATH, "utf8"));
-      base.mcpServers.talerid = { type: "http", url: _taleridMcpUrl, headers: { Authorization: "Bearer " + _taleridToken } };
-      taleridMcpPath = path.join(UPLOAD_DIR, fsKey + "-talerid-mcp.json");
-      fs.writeFileSync(taleridMcpPath, JSON.stringify(base), { mode: 0o600 });
-      mcpConfigPath = taleridMcpPath;
-      allowedTools += "," + TALERID_TOOLS;
-      systemPrompt = SYSTEM_PROMPT + TALERID_PROMPT;
+      if (wantTalerid) {
+        base.mcpServers.talerid = { type: "http", url: _taleridMcpUrl, headers: { Authorization: "Bearer " + _taleridToken } };
+      }
+      if (wantProducts) {
+        base.mcpServers.products = { type: "http", url: _productsMcpUrl, headers: { Authorization: "Bearer " + _productsToken } };
+      }
+      sessionMcpPath = path.join(UPLOAD_DIR, fsKey + "-session-mcp.json");
+      fs.writeFileSync(sessionMcpPath, JSON.stringify(base), { mode: 0o600 });
+      mcpConfigPath = sessionMcpPath;
+      if (wantTalerid) { allowedTools += "," + TALERID_TOOLS; systemPrompt += TALERID_PROMPT; }
+      if (wantProducts) { allowedTools += "," + PRODUCTS_TOOLS; systemPrompt += PRODUCTS_PROMPT; }
     } catch (e) {
-      taleridMcpPath = null;
+      // Любая осечка — назад к базовому конфигу целиком. Половина конфига
+      // хуже, чем его отсутствие: инструмент в белом списке при отсутствующем
+      // сервере даёт ассистенту «инструмент не отвечает» вместо честного «не
+      // умею».
+      sessionMcpPath = null;
       mcpConfigPath = BASE_MCP_PATH;
-      allowedTools = allowedTools.split("," + TALERID_TOOLS)[0];
+      allowedTools = allowedTools.split("," + TALERID_TOOLS)[0].split("," + PRODUCTS_TOOLS)[0];
       systemPrompt = SYSTEM_PROMPT;
     }
   }
 
-  // Персона ассистента приезжает от бэкенда и клеится ЗДЕСЬ, после талеридной
-  // ветки: та переприсваивает systemPrompt целиком в обеих своих ветках, и
+  // Персона ассистента приезжает от бэкенда и клеится ЗДЕСЬ, после блока
+  // постояльцев: его catch-ветка переприсваивает systemPrompt целиком, и
   // приклей мы персону раньше — она бы там потерялась. Пустое поле (старый
   // бэкенд) оставляет поведение ровно прежним.
   if (reqSystemPrompt) systemPrompt += "\n\n" + reqSystemPrompt;
@@ -890,8 +936,10 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       res.end();
     }
   })().catch(() => { stopHeartbeat(); }).finally(() => {
-    // Remove the per-session TalerID MCP config (it holds the user's Bearer token).
-    if (taleridMcpPath) { try { fs.unlinkSync(taleridMcpPath); } catch {} }
+    // Remove the per-session MCP config (it holds the user's Bearer tokens —
+    // talerid и/или products). Файл ОДИН на всех постояльцев: уборка по старому
+    // talerid-специфичному имени оставляла бы токены на диске в открытом виде.
+    if (sessionMcpPath) { try { fs.unlinkSync(sessionMcpPath); } catch {} }
   });
 });
 
