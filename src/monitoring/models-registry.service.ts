@@ -37,8 +37,14 @@ export interface ExpectedModel {
 const EXPECTED: ExpectedModel[] = [
   // ---- Claude (Anthropic) — via local `claude` CLI on prod (Max OAuth) ----
   { provider: 'Anthropic',  model: 'claude-haiku-4-5',  kind: 'text', purpose: 'Профиль из чата, суммаризация тикетов, авто-задачи', caller: 'common/ClaudeCliService → neo4j.consolidateFromChat, support, backlog.createFromTicket', via: 'CLI subscription' },
-  { provider: 'Anthropic',  model: 'claude-sonnet-4-6', kind: 'text', purpose: 'Виртуальный продакт-менеджер: генерация продуктовых рекомендаций', caller: 'common/ClaudeCliService → vpm.generate', via: 'CLI subscription' },
-  { provider: 'Anthropic',  model: 'claude-opus-4-7',   kind: 'text', purpose: 'Резерв для самых тяжёлых reasoning-задач (сейчас не зовётся регулярно)', caller: 'common/ClaudeCliService → manual / future', via: 'CLI subscription' },
+  // Чат: с 23.09.2026 модель названа явно (common/chat-model.ts), поэтому в
+  // events она приезжает под своим id, а не как 'default'. Строку держать в
+  // синхроне с CHAT_MODEL — иначе каждый ход чата подсветится как «rogue».
+  { provider: 'Anthropic',  model: 'claude-opus-5-5',   kind: 'text', purpose: 'Пользовательский чат: веб (все ассистенты кроме Маши, через релей), TG-боты, Маша', caller: 'chat.service streamUniversalAgent / Маша, tg-router → ClaudeCliService', via: 'CLI subscription' },
+  // ВПМ и маркетолог просят 'default' — рекомендуемую CLI. В events это
+  // разрешается в конкретный id, сейчас тот же claude-opus-5-5, но при упоре в
+  // недельный лимит там законно появится Sonnet: это автодаунгрейд, не дрейф.
+  { provider: 'Anthropic',  model: 'claude-sonnet-5',   kind: 'text', purpose: 'Автодаунгрейд с default при исчерпании лимита подписки (ВПМ, маркетолог)', caller: 'common/ClaudeCliService → vpm.generate, vmm.generate', via: 'CLI subscription' },
 
   // ---- Anthropic API direct — fallback path / SDK calls ----
   { provider: 'Anthropic',  model: 'claude-haiku-4-5-20251001', kind: 'text', purpose: 'Anthropic SDK fallback при недоступности CLI/OAuth', caller: 'chat.service streamChat fallback path', via: 'API key' },

@@ -25,6 +25,7 @@ import { BusinessProfileService } from '../business-profile/business-profile.ser
 import axios from 'axios';
 import { Request, Response } from 'express';
 import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
+import { CHAT_MODEL, PROBE_MODEL } from '../common/chat-model';
 import { sendTelegramAlert } from '../common/telegram-alert';
 import { RELAY_TURN_BUDGET_MS } from '../common/relay-budget';
 // Agent server at r.linkeon.io (remote Claude Code)
@@ -1024,11 +1025,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
     try {
       const r = await this.claudeCli.textWithCost(fullPrompt, {
         system: systemPrompt,
-        // 'default' — рекомендуемая модель CLI (сейчас Opus 5, при исчерпании
-        // лимита подписки сам даунгрейдится). Биллинг юзеру идёт от costUsd.
+        // Модель Маши — общая с остальным чатом, см. common/chat-model.ts
+        // (там же цена решения: пин не даунгрейдится при исчерпании лимита, и
+        // как откатиться через env без выката). Биллинг юзеру идёт от costUsd.
         // Пинг мониторинга уходит на haiku: проверяется живость пути, а не
         // качество ответа, и разница в цене хода — порядок.
-        model: probe ? 'haiku' : 'default',
+        model: probe ? PROBE_MODEL : CHAT_MODEL,
         timeoutMs: 90_000,
       });
       rawText = r.text || '';
@@ -1566,9 +1568,15 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // Модель хода. Пинги мониторинга просят haiku: «ответь одним словом ок»
         // не требует Opus, а обвязка Claude Code (системный промпт CLI +
         // определения MCP-тулов, ~47k токенов) грузится независимо от содержания
-        // хода и на Opus стоит ~$0.20 против ~$0.02 на haiku. Поле необязательное:
-        // релей без поддержки `model` его просто игнорирует и остаётся на default.
-        if (probe) fd.append('model', 'haiku');
+        // хода и на Opus стоит ~$0.20 против ~$0.02 на haiku.
+        //
+        // Боевые ходы с 23.09.2026 называют модель явно (common/chat-model.ts),
+        // а не полагаются на 'default' релея. Поле по-прежнему необязательное и
+        // деградирует безопасно в обе стороны: старый релей его игнорирует, а
+        // релей с белым списком, где нашего значения ещё нет, подставит свой
+        // 'default'. В обоих случаях ход проходит — просто пин не действует,
+        // и узнать об этом можно только по modelUsage, не по ошибке.
+        fd.append('model', probe ? PROBE_MODEL : CHAT_MODEL);
 
         // Agent-direct TalerID: when the user connected the TalerID ecosystem, hand
         // the file-agent a full-scope access token + the MCP base URL of the env we

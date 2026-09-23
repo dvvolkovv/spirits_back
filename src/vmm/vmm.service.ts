@@ -335,7 +335,10 @@ export class VmmService implements OnModuleInit {
     let errorMessage: string | null = null;
     try {
       const r = await this.claude.textWithCost(prompt, {
-        model: 'claude-sonnet-4-6',
+        // 'default' — та же модель и та же причина, что у симметричного ВПМ
+        // (vpm.service): с 23.09.2026 это claude-opus-5-5, а автодаунгрейд на
+        // Sonnet при исчерпании лимита сохраняется, потому что прогон фоновый.
+        model: 'default',
         timeoutMs: 360_000,
       });
       text = r.text;

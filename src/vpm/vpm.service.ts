@@ -438,7 +438,15 @@ export class VpmService implements OnModuleInit {
     let errorMessage: string | null = null;
     try {
       const r = await this.claude.textWithCost(prompt, {
-        model: 'claude-sonnet-4-6',
+        // 'default' — рекомендуемая модель CLI (с 23.09.2026, после обновления
+        // бинаря до 2.1.280, это claude-opus-5-5). Решение владельца: ВПМ должен
+        // думать тем же, чем чат, а не отставать на поколение.
+        //
+        // Здесь именно 'default', а НЕ прибитый id (в отличие от чата, где
+        // владелец сознательно выбрал пин): рекомендации владельцу генерируются
+        // фоном и редко, поэтому автодаунгрейд на Sonnet при упоре в недельный
+        // лимит лучше, чем упавший прогон.
+        model: 'default',
         // Occasional reasoning run, not a hot path. Headroom over observed
         // latency (now much lower once the CLI stopped auto-loading the 40KB
         // project CLAUDE.md — see ClaudeCliService — but keep margin).

@@ -4,6 +4,7 @@ import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { ClaudeCliService, ClaudeCliProgressEvent } from '../common/services/claude-cli.service';
+import { CHAT_MODEL } from '../common/chat-model';
 import { AgentsService } from '../agents/agents.service';
 import { TgGrammyClient } from './tg-grammy.client';
 import { TgConfigService, TgBotConfigRow } from './tg-config.service';
@@ -436,20 +437,21 @@ ${systemPrompt}`;
         : WEB_TOOLS;
 
     // Та же модель, что и в вебе. Веб уводит всех ассистентов кроме Маши на
-    // relay r.linkeon.io, где claude крутится на рекомендованной моделью CLI
-    // (сейчас Opus 5). Здесь путь локальный, и Sonnet стоял просто потому, что
-    // TG-ветку с Phase 4 строили на своём CLI-вызове — из-за этого один и тот
-    // же ассистент в телеге отвечал заметно слабее, чем в вебе.
+    // relay r.linkeon.io; здесь путь локальный, и Sonnet стоял просто потому,
+    // что TG-ветку с Phase 4 строили на своём CLI-вызове — из-за этого один и
+    // тот же ассистент в телеге отвечал заметно слабее, чем в вебе.
     //
-    // 'default', а не 'claude-opus-5': default сам даунгрейдится при исчерпании
-    // лимита подписки, хардкод — падает, и бот молча замолкает.
+    // Значение общее для всех трёх путей чата — common/chat-model.ts. Там же
+    // разобрано, почему с 23.09.2026 это прибитый id, а не 'default': пин НЕ
+    // даунгрейдится, и при исчерпании лимита подписки бот молча замолкает.
+    // Это принятый владельцем размен, а не недосмотр; откат — через env.
     //
     // Цена: тяжёлые агентные ходы (сгенерировать договор, собрать финмодель)
     // стоили 30-65k токенов владельца ещё на Sonnet. Опус их умножает, поэтому
     // в tg-bot.service рядом со списанием стоит алерт на дорогой ход.
     const { text, costUsd } = await this.claudeCli.textWithCost(userPrompt, {
       system: systemWithCtx,
-      model: 'default',
+      model: CHAT_MODEL,
       timeoutMs: 0,
       attachments: attachmentPaths?.length ? attachmentPaths : undefined,
       onProgress,
