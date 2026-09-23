@@ -45,7 +45,7 @@ function makeHarness(opts: { answer: string; costUsd: number | null; usage?: Rec
 
   const svc = new ChatService(
     pg as any,
-    null as any, null as any, null as any, null as any, null as any, null as any,
+    null as any, null as any, null as any, null as any,
     language as any,
     undefined /* balanceCtx */,
     undefined, undefined, undefined,

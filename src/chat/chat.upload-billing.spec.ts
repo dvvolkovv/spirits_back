@@ -66,7 +66,7 @@ function makePg(balance = 1_000_000): Pg {
 function makeService(pg: Pg): ChatService {
   const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
   return new ChatService(
-    pg as any, null as any, null as any, null as any, null as any, null as any,
+    pg as any, null as any, null as any, null as any,
     null as any, language as any, undefined, undefined, undefined, undefined,
   );
 }

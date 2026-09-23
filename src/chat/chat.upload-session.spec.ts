@@ -91,7 +91,7 @@ function makeService(pg: Pg, lang = 'ru'): ChatService {
   // запроса — подстраховка на случай, когда язык туда ещё не доехал.
   const language = { resolveUserLanguage: jest.fn(async (_u: string, hint?: string) => hint || lang) };
   return new ChatService(
-    pg as any, null as any, null as any, null as any, null as any, null as any,
+    pg as any, null as any, null as any, null as any,
     null as any, language as any, undefined, undefined, undefined, undefined,
   );
 }

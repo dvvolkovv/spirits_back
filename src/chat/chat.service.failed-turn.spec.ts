@@ -39,7 +39,7 @@ function makeService() {
   const tracked: { name: string; props: any }[] = [];
   const events = { track: jest.fn((name: string, p: any) => tracked.push({ name, props: p.props })) };
   const svc = new ChatService(
-    pg as any, null as any, null as any, null as any, null as any,
+    pg as any, null as any, null as any,
     null as any, null as any, language as any, undefined /* balanceCtx */,
     undefined, events as any, undefined,
   );
