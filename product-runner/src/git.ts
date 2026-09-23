@@ -55,10 +55,19 @@ export class Git {
     await this.run(['reset', '--hard', sha]);
   }
 
-  /** У продукта может не быть remote — это нормально, ход не должен падать. */
+  /**
+   * У продукта может не быть remote — это нормально, ход не должен падать.
+   *
+   * `push origin HEAD`, а не голый `push`. Голый требует upstream-привязки, а
+   * её нет: product-backup-setup.sh привязывает remote и делает
+   * `push --all origin`, что привязки НЕ создаёт. Измерено на проде
+   * 23.09.2026 — ход падал с «The current branch master has no upstream
+   * branch» у ОБОИХ продуктов с резервной копией, и правился только тот, у
+   * кого копии нет.
+   */
   async push(): Promise<void> {
     const remotes = (await this.run(['remote'])).trim();
     if (!remotes) return;
-    await this.run(['push']);
+    await this.run(['push', 'origin', 'HEAD']);
   }
 }

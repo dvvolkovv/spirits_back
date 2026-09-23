@@ -102,8 +102,6 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<void> {
     return;
   }
 
-  await git.push();
-
   await api.sendEvents(turn.id, [{ type: 'item', content: '\n\nСобираю и перезапускаю…' }]);
 
   const result = await deploy({
@@ -119,6 +117,35 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<void> {
     // и ход длиннее получаса снимут как мёртвый — а он жив.
     onPhase: (phase) => void api.sendEvents(turn.id, [{ type: 'item', content: `\n${phase}` }]),
   });
+
+  // Резервная копия — последним шагом и без права уронить ход.
+  //
+  // Раньше push стоял сразу после коммита, до сборки. Его падение обрывало ход
+  // ДО проверки здоровья и автоотката: продукт оставался жить изменённым, а
+  // клиенту докладывали «failed», то есть «ничего не изменилось» о сайте,
+  // который изменился. Так и вышло на проде 23.09.2026.
+  //
+  // Здесь правка уже собрана, проверена здоровьем и работает. Объявить такой
+  // ход упавшим значит соврать клиенту, что его работа не применена. Но и
+  // проглотить отказ молча нельзя: копия — единственный второй экземпляр кода
+  // клиента, и её потеря обязана быть видимой, а не тихой.
+  //
+  // На откате не пушим вовсе: дерево вернулось на прежний коммит, посылать в
+  // резерв нечего.
+  if (!result.reverted) {
+    try {
+      await git.push();
+    } catch (e: any) {
+      const message = e?.message ?? String(e);
+      console.error(`[runner] ход ${turn.id}: резервная копия не обновлена: ${message}`);
+      await api.sendEvents(turn.id, [
+        {
+          type: 'item',
+          content: `\nПравка применена и работает, но резервную копию обновить не удалось: ${message}`,
+        },
+      ]);
+    }
+  }
 
   await api.complete(turn.id, {
     status: result.reverted ? 'reverted' : 'done',
