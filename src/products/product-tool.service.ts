@@ -118,7 +118,7 @@ export class ProductToolService {
 
   /**
    * Единственный вход инструмента. Владелец — ПЕРВЫМ аргументом и приезжает из
-   * проверенной подписи токена (см. точку /mcp/products), а не из поля
+   * проверенной подписи токена (см. точку /webhook/mcp/products), а не из поля
    * запроса: инструменту продуктов аргумента `userId` не дано вовсе.
    */
   async execute(userId: string, input: any): Promise<any> {

@@ -1,4 +1,8 @@
-import { UnauthorizedException } from '@nestjs/common';
+import 'reflect-metadata';
+import * as fs from 'fs';
+import * as path from 'path';
+import { UnauthorizedException, RequestMethod } from '@nestjs/common';
+import { METHOD_METADATA, PATH_METADATA } from '@nestjs/common/constants';
 import * as jwt from 'jsonwebtoken';
 import { ProductsMcpController } from './products-mcp.controller';
 import { signProductToolToken } from '../products/product-tool.token';
@@ -71,5 +75,50 @@ describe('точка /mcp/products', () => {
     const tools = ctrl.listTools();
     expect(tools).toHaveLength(1);
     expect(Object.keys((tools[0] as any).inputSchema.properties)).not.toContain('userId');
+  });
+});
+
+/**
+ * АДРЕС ТОЧКИ ЗАВИСИТ ОТ ДВУХ ФАЙЛОВ СРАЗУ, и ни один из них по отдельности
+ * правды не говорит.
+ *
+ * В main.ts стоит `setGlobalPrefix('webhook', { exclude: [{ path: 'mcp' }] })`.
+ * Исключение написано как ТОЧНЫЙ путь `mcp`, а не как префикс `mcp/(.*)`,
+ * поэтому из-под глобального префикса выходит только сама `/mcp` — а подпуть
+ * `/mcp/products` остаётся под ним и живёт по адресу `/webhook/mcp/products`.
+ *
+ * Измерено живым приложением: `POST /mcp/products` отдаёт 404, `POST
+ * /webhook/mcp/products` — 200 со списком инструментов.
+ *
+ * Почему адрес оставлен таким, а не «починен» правкой main.ts: на проде
+ * nginx проксирует `location /mcp` префиксом, а на тестовом стенде такого
+ * блока НЕТ ВОВСЕ — там `/mcp/products` ушёл бы в SPA-фолбэк и вернул 200 с
+ * HTML. Зелёная проверка при неработающей точке — ровно тот тихий отказ,
+ * которым этот проект уже наелся. `/webhook/*` работает на обеих средах
+ * сегодня и ничего в nginx не требует.
+ *
+ * Цена разъезда молчаливая с обеих сторон: релей запущен со
+ * `--strict-mcp-config`, недоступный сервер он просто не поднимет, и ассистент
+ * скажет «не умею» — без ошибки в логе и без красного теста.
+ */
+describe('адрес точки', () => {
+  const mainSrc = () => fs.readFileSync(path.join(__dirname, '../main.ts'), 'utf8');
+
+  it('точка стоит ровно там, куда настроен релей', () => {
+    const ctrlPath = Reflect.getMetadata(PATH_METADATA, ProductsMcpController) ?? '';
+    const methodPath = Reflect.getMetadata(PATH_METADATA, ProductsMcpController.prototype.post) ?? '';
+    const verb = Reflect.getMetadata(METHOD_METADATA, ProductsMcpController.prototype.post);
+    const full = `/${['webhook', ctrlPath, methodPath].join('/')}`.replace(/\/{2,}/g, '/').replace(/\/$/, '');
+    // Глагол склеен с путём: он лежит под ДРУГИМ ключом метаданных, и сторож,
+    // читающий только путь, переживает замену @Post на @Get целиком.
+    expect(`${RequestMethod[verb]} ${full}`).toBe('POST /webhook/mcp/products');
+  });
+
+  it('исключение в main.ts не расширено до подпутей', () => {
+    const src = mainSrc();
+    // Появление `mcp/(.*)` или `mcp/*` в списке исключений УВОДИТ точку на
+    // /mcp/products — то есть на адрес, которого нет в nginx тестового стенда.
+    expect(src).toMatch(/exclude:\s*\[\s*\{\s*path:\s*'mcp'/);
+    expect(src).not.toMatch(/path:\s*'mcp\/[^']*'/);
   });
 });

@@ -55,7 +55,7 @@ import { ProductToolService } from './product-tool.service';
     // откуда это делается, быть не должно.
     BlockService,
     // Инструмент ассистента. Экспортируется наружу: его зовёт точка
-    // /mcp/products, живущая в McpModule.
+    // /webhook/mcp/products, живущая в McpModule.
     ProductToolService,
   ],
   exports: [ProductsService, TurnsService, ProvisioningService, RentService, ProductToolService],
