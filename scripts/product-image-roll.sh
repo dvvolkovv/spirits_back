@@ -584,7 +584,7 @@ fi
 # контейнер оказывается «уже свежим» и весь путь пересоздания не проверяется.
 if [[ -n "$REHEARSE" && -z "$DRY_RUN" ]]; then
   bold "      завожу одноразовый контейнер «${REHEARSE}»"
-  SETUP=$(remote "$(rs "SUDO=$(shq "$SUDO"); NAME=$(shq "$REHEARSE"); NEWIMG=$(shq "$NEW_ID"); URL=$(shq "$REHEARSE_LINKEON_URL"); PFROM=$(shq "$REHEARSE_PORT_FROM"); PTO=$(shq "$REHEARSE_PORT_TO"); REPO=$(shq "$IMAGE_REPO"); ROOT=$(shq "$REHEARSE_DIR_ROOT")" <<'EOS'
+  SETUP=$(remote "$(rs "SUDO=$(shq "$SUDO"); NAME=$(shq "$REHEARSE"); NEWIMG=$(shq "$NEW_ID"); NEWTAG=$(shq "$IMAGE_TAG"); URL=$(shq "$REHEARSE_LINKEON_URL"); PFROM=$(shq "$REHEARSE_PORT_FROM"); PTO=$(shq "$REHEARSE_PORT_TO"); REPO=$(shq "$IMAGE_REPO"); ROOT=$(shq "$REHEARSE_DIR_ROOT")" <<'EOS'
 set -u
 D="$ROOT/$NAME"
 [ -e "$D" ] && { echo "SETUP_ERR каталог $D уже существует"; exit 0; }
@@ -628,7 +628,12 @@ $SUDO chown -R 1000:1000 "$D"
 
 # Заведомо ОТЛИЧНЫЙ образ: тот же FROM плюс метка. Так контейнер гарантированно
 # отстаёт, и пересоздание проверяется целиком.
-printf 'FROM %s\nLABEL io.linkeon.rehearsal="1"\n' "$NEWIMG" \
+#
+# FROM берёт МЕТКУ, а не идентификатор: идентификаторы здесь укорочены до 12
+# символов (`sha256:8ddbcabec6b5`), и docker такую ссылку во FROM не принимает —
+# измерено, сборка отказывала, а репетиция объявляла «не смог собрать
+# производный образ» и не начиналась вовсе.
+printf 'FROM %s\nLABEL io.linkeon.rehearsal="1"\n' "$NEWTAG" \
   | $SUDO docker build -q -t "$REPO:rehearse-stale" - >/dev/null 2>&1 \
   || { echo "SETUP_ERR не смог собрать производный образ для репетиции"; exit 0; }
 
