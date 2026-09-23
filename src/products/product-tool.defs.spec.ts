@@ -48,4 +48,12 @@ describe('определение инструмента продуктов', () 
       expect(tool().description).toContain(a);
     }
   });
+
+  // outcome и reason — поля РАЗНЫХ веток ответа и вместе не приходят. Без
+  // явного предупреждения модель ищет outcome в отказе и пересказывает отказ
+  // как исход хода.
+  it('описание разводит outcome и reason', () => {
+    expect(tool().description).toMatch(/НИКОГДА не приходят вместе/);
+    expect(tool().description).toMatch(/Не ищи outcome в отказе/);
+  });
 });
