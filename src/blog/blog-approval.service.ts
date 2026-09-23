@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { BlogSettingsService } from './blog-settings.service';
-import { BlogPost, BlogStatus, canTransition, rowToPost } from './blog.types';
+import { BlogPost, BlogStatus, appendEditorNote, canTransition, rowToPost } from './blog.types';
 import { parseBlogCallback, buildBlogKeyboard } from './blog-callback';
 import { buildCaption } from './blog-text';
 import { nextSlotAfter } from './blog-slots';
@@ -124,14 +124,20 @@ export class BlogApprovalService {
     }
 
     if (parsed.action === 'no') {
+      // `rejected` терминален — замечания к этому посту больше некому читать.
+      // В архиве админки они висели бы незакрытыми претензиями к тексту,
+      // которого уже не будет.
       await this.pg.query(
-        `UPDATE blog_post SET status = 'rejected', updated_at = now() WHERE id = $1`,
+        `UPDATE blog_post SET status = 'rejected', editor_notes = '{}'::text[], updated_at = now() WHERE id = $1`,
         [post.id],
       );
       await this.tg.answerCallbackQuery(cb.id, { text: 'В мусор' });
       return true;
     }
 
+    // «Переписать» — это и есть переработка, ради которой замечания копились.
+    // Стереть их здесь значило бы попросить редактора переписать пост, не
+    // сказав ему, что было не так.
     await this.pg.query(
       `UPDATE blog_post SET status = 'drafting', updated_at = now() WHERE id = $1`,
       [post.id],
@@ -141,9 +147,20 @@ export class BlogApprovalService {
   }
 
   /**
-   * Правка текста реплаем.
-   * @returns true, если сообщение — правка черновика. false означает «это не
-   * наше», и вызывающий код обязан пустить текст обычным путём к ассистенту.
+   * Замечание к черновику реплаем.
+   *
+   * Присланный текст — это то, что НАДО ПОПРАВИТЬ, а не готовый пост. Раньше
+   * он ложился прямо в `body`, и чтобы исправить одну фразу, владелец должен
+   * был написать весь пост за редактора — смысл проверки был ровно обратный:
+   * сказать, что не так, и получить переписанный вариант.
+   *
+   * Замечание накапливается (см. `appendEditorNote`), пост уходит в
+   * `drafting`, и следующий тик `prepareDrafts` отдаёт его редактору вместе
+   * со всеми замечаниями.
+   *
+   * @returns true, если сообщение — замечание к черновику. false означает
+   * «это не наше», и вызывающий код обязан пустить текст обычным путём к
+   * ассистенту.
    */
   async handleReplyEdit(msg: any): Promise<boolean> {
     const replyTo = msg?.reply_to_message?.message_id;
@@ -159,11 +176,27 @@ export class BlogApprovalService {
     if (!r.rows.length) return false;
 
     const post = rowToPost(r.rows[0]);
+    const chatId = Number(msg.chat.id);
+
+    // Между выборкой и записью статус могли увести из админки или соседней
+    // кнопкой. Решает та же машина состояний, что и везде, а не то, что
+    // запрос отбирал по status = 'pending_review'.
+    //
+    // Возвращаем при этом true: сообщение опознано как реплай на НАШ
+    // черновик, и пустить его дальше значит отправить текст замечания в чат
+    // с ассистентом. Владельцу отвечаем, почему замечание не принято.
+    if (!canTransition(post.status, 'drafting')) {
+      this.logger.warn(`замечание к ${post.id}: переход ${post.status} → drafting запрещён`);
+      await this.tg.sendMessage(chatId, `Замечание не принял: пост уже в статусе ${post.status}.`);
+      return true;
+    }
+
     await this.pg.query(
-      `UPDATE blog_post SET body = $2, updated_at = now() WHERE id = $1`,
-      [post.id, text],
+      `UPDATE blog_post SET editor_notes = $2::text[], status = 'drafting', updated_at = now()
+        WHERE id = $1`,
+      [post.id, appendEditorNote(post.editorNotes, text)],
     );
-    await this.tg.sendMessage(Number(msg.chat.id), 'Текст заменил. Жми «Опубликовать», когда готов.');
+    await this.tg.sendMessage(chatId, 'Принял замечание — перепишу пост и пришлю заново.');
     return true;
   }
 }

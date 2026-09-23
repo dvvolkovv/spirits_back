@@ -188,6 +188,30 @@ describe('BlogCron.rearmStuck', () => {
   });
 });
 
+/**
+ * Расписание — это поведение, а не украшение: после замечания владелец ждёт
+ * ровно один тик этого крана. На часовом расписании «перепишу» означало бы
+ * «через час», и владелец за это время успевал отправить пост в мусор.
+ */
+describe('расписание BlogCron', () => {
+  const { SCHEDULE_CRON_OPTIONS } = require('@nestjs/schedule/dist/schedule.constants');
+  const cronOf = (method: string) =>
+    Reflect.getMetadata(SCHEDULE_CRON_OPTIONS, (BlogCron.prototype as any)[method])?.cronTime;
+
+  it('переработка подхватывается каждые 5 минут, а не раз в час', () => {
+    expect(cronOf('prepareDrafts')).toBe('*/5 * * * *');
+  });
+
+  /**
+   * Напоминание остаётся часовым намеренно: его окно — час до слота
+   * (REMIND_WINDOW_MINUTES), и на пятиминутном тике владелец получил бы
+   * двенадцать одинаковых сообщений подряд.
+   */
+  it('напоминание о слоте осталось часовым', () => {
+    expect(cronOf('remindPending')).toBe('0 * * * *');
+  });
+});
+
 describe('BlogCron.dropStaleNews', () => {
   beforeEach(() => { process.env.BLOG_ENABLED = 'true'; });
 
@@ -204,5 +228,12 @@ describe('BlogCron.dropStaleNews', () => {
     expect(from).toContain('idea');
     expect(from).not.toContain('published');
     expect(from).not.toContain('rejected');
+  });
+
+  /** Протухшая новость уезжает в тот же терминальный статус, что и «в мусор». */
+  it('заодно стирает замечания — пост отправлен в мусор', async () => {
+    const d = deps();
+    await make(d).dropStaleNews();
+    expect(String(d.pg.query.mock.calls[0][0])).toContain("editor_notes = '{}'");
   });
 });

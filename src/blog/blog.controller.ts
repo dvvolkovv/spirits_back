@@ -127,8 +127,11 @@ export class BlogController {
       case 'reject': {
         const post = await this.load(String(data.id));
         this.assertTransition(post, 'rejected');
+        // Тот же терминальный статус, что и кнопка «В мусор» в личке, — и те
+        // же последствия для замечаний. Панелей управления постом две, и
+        // вторая не должна вести себя иначе первой.
         const r = await this.pg.query(
-          `UPDATE blog_post SET status = 'rejected', updated_at = now()
+          `UPDATE blog_post SET status = 'rejected', editor_notes = '{}'::text[], updated_at = now()
             WHERE id = $1 AND status = $2`,
           [post.id, post.status],
         );
