@@ -138,7 +138,58 @@ export class FakeHost {
       return '';
     }
     if (sub === 'stop' || sub === 'start') return this.dockerStopStart(sub, args);
+    if (sub === 'inspect') return this.dockerInspect(args);
     throw new Error(`docker ${sub}: неизвестная подкоманда`);
+  }
+
+  /**
+   * `docker inspect --format <шаблон> <имя>` — ровно та форма, которой
+   * пробуждение спрашивает у контейнера его собственный порт.
+   *
+   * ГЛАВНОЕ СВОЙСТВО, И ОНО ИЗМЕРЕНО НА ЖИВОМ DOCKER (29.8.0, 23.09.2026), а не
+   * предположено: у ОСТАНОВЛЕННОГО контейнера `.NetworkSettings.Ports` — пустой
+   * объект `{}`, а `.HostConfig.PortBindings` держит `127.0.0.1:18999` как
+   * держал. Сетевая песочница при остановке разбирается, запрошенная публикация
+   * — нет.
+   *
+   * Для пробуждения это и есть вся разница между работающей починкой и мёртвой:
+   * задание `wake` приходит к контейнеру, который СПИТ. Симулятор, отдающий порт
+   * по обоим полям одинаково, зеленил бы реализацию, которая на машине продуктов
+   * не восстановила бы ни одного порта.
+   *
+   * Голый `index` по отсутствующему отображению docker не прощает: на
+   * остановленном контейнере
+   * `{{ (index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort }}` не
+   * печатает пустую строку, а падает с «index of untyped nil» и rc=1 (тоже
+   * замерено). Форма с `{{with}}` на том же месте отдаёт пустую строку и rc=0.
+   * Симулятор воспроизводит обе.
+   */
+  private dockerInspect(args: string[]): string {
+    const [flag, format, name, ...extra] = args;
+    if (flag !== '--format' || !format || !name || extra.length) {
+      throw new Error(`docker inspect: симулятор знает только --format <шаблон> <имя>: ${args.join(' ')}`);
+    }
+    // Живой docker на несуществующем объекте отвечает именно так и rc=1.
+    if (!this.containers.has(name)) throw new Error(`Error: No such object: ${name}`);
+
+    const fromBindings = format.includes('.HostConfig.PortBindings');
+    const fromNetwork = format.includes('.NetworkSettings.Ports');
+    if (!fromBindings && !fromNetwork) {
+      throw new Error(`docker inspect: симулятор не знает шаблона ${format}`);
+    }
+
+    const publish = this.containers.get(name)!.publish;
+    // '127.0.0.1:8001:3000' → '8001'. У бота публикации нет вовсе.
+    const bound = publish ? publish.split(':')[1] : '';
+    const visible = fromBindings ? bound : this.stopped.has(name) ? '' : bound;
+    if (visible) return `${visible}\n`;
+    if (!format.includes('{{with')) {
+      throw new Error(
+        `template parsing error: template: :1:4: executing "" at <index (index ...) 0>: `
+          + 'error calling index: index of untyped nil',
+      );
+    }
+    return '\n';
   }
 
   /**

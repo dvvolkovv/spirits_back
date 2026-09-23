@@ -103,6 +103,55 @@ describe('контейнеры', () => {
   });
 });
 
+describe('docker inspect: где у остановленного контейнера лежит порт', () => {
+  const BINDINGS = '{{with index .HostConfig.PortBindings "3000/tcp"}}{{(index . 0).HostPort}}{{end}}';
+  const NETWORK = '{{with index .NetworkSettings.Ports "3000/tcp"}}{{(index . 0).HostPort}}{{end}}';
+  const inspect = (format: string, name: string) =>
+    host.run(['docker', 'inspect', '--format', format, name]);
+
+  it('PortBindings переживает остановку, NetworkSettings.Ports — нет', async () => {
+    // ИЗМЕРЕНО НА ЖИВОМ DOCKER 29.8.0 (23.09.2026), а не выведено из общих
+    // соображений: у остановленного контейнера `.NetworkSettings.Ports` пуст
+    // (`{}`), а `.HostConfig.PortBindings` держит публикацию.
+    //
+    // Пробуждение спрашивает порт у контейнера, который СПИТ. Симулятор,
+    // отдающий его по обоим полям одинаково, зеленил бы восстановление, которое
+    // на машине продуктов не подняло бы ни одного продукта.
+    await run('a', 8001);
+    expect([await inspect(BINDINGS, 'a'), await inspect(NETWORK, 'a')].map((s) => s.trim())).toEqual(
+      ['8001', '8001'],
+    );
+
+    await host.run(['docker', 'stop', 'a']);
+
+    expect((await inspect(BINDINGS, 'a')).trim()).toBe('8001');
+    expect((await inspect(NETWORK, 'a')).trim()).toBe('');
+  });
+
+  it('контейнер без публикации порта отдаёт пустую строку, а не выдумку', async () => {
+    // Это бот: у него порта нет вовсе, и «не знаю» обязано отличаться от числа.
+    await run('bot');
+
+    expect((await inspect(BINDINGS, 'bot')).trim()).toBe('');
+  });
+
+  it('голый index падает там, где {{with}} отдаёт пустую строку', async () => {
+    // Тоже замерено: `{{ (index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort }}`
+    // на остановленном контейнере не печатает пустоту, а валится с
+    // «index of untyped nil» и rc=1 — то есть execFile бросает.
+    await run('a', 8001);
+    await host.run(['docker', 'stop', 'a']);
+
+    await expect(
+      inspect('{{ (index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort }}', 'a'),
+    ).rejects.toThrow(/untyped nil/);
+  });
+
+  it('несуществующий контейнер — отказ, а не пустая строка', async () => {
+    await expect(inspect(BINDINGS, 'net')).rejects.toThrow(/No such object/);
+  });
+});
+
 describe('vhost', () => {
   it('порт даёт боевой режим, --asleep — заглушку', async () => {
     await host.run(['product-vhost', 'shop', '8001']);

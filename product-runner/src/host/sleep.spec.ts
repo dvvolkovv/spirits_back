@@ -204,21 +204,98 @@ describe('пробуждение продукта', () => {
     expect(seen).toEqual(['docker start', 'waitPort', 'product-vhost']);
   });
 
-  it('сайт без порта — отказ ДО подъёма контейнера', async () => {
-    // Поднять контейнер, зная, что дождаться его нечем, — значит оставить
-    // хост в состоянии «работает, но домен на заглушке» и отчитаться об
-    // отказе. Хуже, чем не начинать.
+  it('сайт без порта: порт восстанавливается у контейнера', async () => {
+    // ЖИВОЙ ДЕФЕКТ ПРОДА (замерено 23.09.2026). Продукты, заведённые до
+    // появления колонки `port`, хранят в реестре NULL: `demo` и `shop2` от
+    // 09.09. Погашенный такой продукт не поднимался НИКОГДА — задание `wake`
+    // падало «нет порта» каждую минуту, сайт отдавал 503, и кнопка снятия
+    // блокировки была односторонней.
+    //
+    // Порт при этом никуда не девался: публикация задаётся при `docker run` и
+    // `docker start` её не меняет, то есть контейнер знает её сам.
+    await seed('pervy');
+    const port = await asleep('vtoroy');
+    expect(port).toBe(8002);
+    const waitPort = jest.fn(async () => true);
+
+    await wakeProduct({ slug: 'vtoroy', kind: 'site', port: null }, deps(host, { waitPort }));
+
+    expect(waitPort).toHaveBeenCalledWith(8002, expect.any(Number));
+    // Проверяется именно ВОПРОС КОНТЕЙНЕРУ, а не совпадение числа: `freePort`
+    // считает порт спящего свободным (см. fake-host) и вернул бы здесь те же
+    // 8002 — то есть «выбрать заново» выглядело бы рабочим на симуляторе и
+    // отдавало бы домен на порт, где никто не слушает, на машине продуктов.
+    expect(host.ran('docker').map((c) => c[1])).toEqual(['inspect', 'start']);
+    expect(host.isRunning('vtoroy')).toBe(true);
+    expect(host.vhostMode('vtoroy')).toBe('live');
+    expect(host.liveVhosts.get('vtoroy')).toBe(8002);
+  });
+
+  it('восстановленный порт уезжает наружу — иначе реестр не вылечится', async () => {
+    // Сервер лечит строку продукта отчётом: `completeJob` делает
+    // `UPDATE products SET port = COALESCE($2, port)`. Молча поднятый продукт с
+    // NULL в реестре проснулся бы ровно один раз — до следующего гашения.
+    await seed('pervy');
+    await asleep('vtoroy');
+
+    await expect(
+      wakeProduct({ slug: 'vtoroy', kind: 'site', port: null }, deps(host)),
+    ).resolves.toEqual({ port: 8002 });
+  });
+
+  it('сайт С портом: у контейнера ничего не спрашивают, порт наружу не едет', async () => {
+    // Порт задания — истина реестра, и лишний `docker inspect` на каждом
+    // пробуждении не нужен. А порт в отчёте — это НОВОСТЬ для сервера; там,
+    // где новостей нет, `{ ok: true, port: … }` читается в журнале как
+    // «порт откуда-то взялся».
+    const port = await asleep('shop');
+
+    await expect(
+      wakeProduct({ slug: 'shop', kind: 'site', port }, deps(host)),
+    ).resolves.toEqual({});
+
+    expect(host.ran('docker').map((c) => c[1])).toEqual(['start']);
+  });
+
+  it('контейнер не назвал порта — прежний отказ, и docker start НЕ звался', async () => {
+    // Выдумать порт нельзя. Контейнер всё равно поднимется на СВОЁМ старом, а
+    // домен уехал бы на порт, где никто не слушает: громкий отказ превратился
+    // бы в тихий, который видно только по молчащему сайту.
     await asleep('shop');
 
     await expect(
-      wakeProduct({ slug: 'shop', kind: 'site', port: null }, deps(host)),
+      wakeProduct(
+        { slug: 'shop', kind: 'site', port: null },
+        deps(host, {
+          // Команда уходит на хост как обычно (и попадает в host.calls),
+          // подменяется только ВЫДАЧА: так проверяется и то, что старта не
+          // было, а не только то, что отказ случился.
+          run: async (argv, opts) => {
+            const out = await host.run(argv, opts);
+            return argv[1] === 'inspect' ? 'не-порт\n' : out;
+          },
+        }),
+      ),
     ).rejects.toThrow(/нет порта/);
 
     expect(host.isRunning('shop')).toBe(false);
-    expect(host.calls).toHaveLength(0);
+    expect(host.ran('docker').map((c) => c[1])).toEqual(['inspect']);
   });
 
-  it('бот просыпается без порта, домена и ожидания', async () => {
+  it('контейнера нет вовсе — отказ про порт, а не «No such container» от старта', async () => {
+    // `docker inspect` тут БРОСАЕТ, и это не повод поднимать контейнер вслепую:
+    // дождаться его всё равно будет нечем.
+    await expect(
+      wakeProduct({ slug: 'net-takogo', kind: 'site', port: null }, deps(host)),
+    ).rejects.toThrow(/нет порта/);
+
+    expect(host.ran('docker').map((c) => c[1])).toEqual(['inspect']);
+  });
+
+  it('бот просыпается без порта, домена и ожидания — и без вопросов контейнеру', async () => {
+    // У бота публикации порта нет вовсе, спрашивать нечего: `docker inspect`
+    // отдал бы пустую строку, а восстановление превратилось бы в отказ там,
+    // где отказывать не за что.
     await asleep('bot', 'bot');
     const waitPort = jest.fn(async () => true);
 
@@ -227,6 +304,7 @@ describe('пробуждение продукта', () => {
     expect(host.isRunning('bot')).toBe(true);
     expect(waitPort).not.toHaveBeenCalled();
     expect(host.ran('product-vhost')).toHaveLength(0);
+    expect(host.ran('docker').map((c) => c[1])).toEqual(['start']);
   });
 
   it('слаг проверяется и здесь, до единой команды', async () => {
