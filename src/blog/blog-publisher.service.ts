@@ -76,10 +76,15 @@ export class BlogPublisherService {
       const messageId = Number(msg.message_id);
       const url = buildPostUrl({ id: Number(msg.chat?.id ?? channelChatId), username: msg.chat?.username }, messageId);
 
+      // `editor_notes` чистятся только здесь, на успехе: пост вышел, и
+      // претензии к его черновикам закрыты. В ветке ниже их трогать нельзя —
+      // сорвавшаяся отправка возвращает пост в очередь, и правки владельца
+      // ему ещё понадобятся.
       await this.pg.query(
         `UPDATE blog_post
             SET status = 'published', published_at = now(),
-                tg_message_id = $2, tg_url = $3, last_error = NULL, updated_at = now()
+                tg_message_id = $2, tg_url = $3, last_error = NULL,
+                editor_notes = '{}'::text[], updated_at = now()
           WHERE id = $1`,
         [post.id, messageId, url],
       );

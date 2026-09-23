@@ -17,6 +17,17 @@ export interface BlogPost {
   imagePrompt: string | null;
   imageUrl: string | null;
   status: BlogStatus;
+  /**
+   * Замечания владельца к черновику, от самого раннего к самому свежему.
+   * Пустой список — нормальное состояние: пост, к которому претензий не было.
+   */
+  editorNotes: string[];
+  /**
+   * Когда черновик взяли в работу. Пусто — «готов к работе прямо сейчас»,
+   * именно по этому признаку `takeNextIdea` отбирает посты, а `prepareDrafts`
+   * их захватывает.
+   */
+  draftingStartedAt: string | null;
   slotAt: string | null;
   publishedAt: string | null;
   reviewChatId: number | null;
@@ -63,6 +74,46 @@ export function canTransition(from: BlogStatus, to: BlogStatus): boolean {
   return (ALLOWED_TRANSITIONS[from] || []).includes(to);
 }
 
+/**
+ * Сколько замечаний держим на посту.
+ *
+ * Каждое уходит в сообщение редактору целиком, рядом с правилами рубрики и
+ * списком прошлых заголовков. Бесконечный список утопил бы в себе и то, и
+ * другое — а пост, к которому шестой раз есть претензия, лечится не шестым
+ * замечанием, а кнопкой «В мусор».
+ *
+ * Пять — это пять кругов переработки, каждый из которых стоит тика крона,
+ * похода к релею и генерации картинки. Живой владелец даёт два-три.
+ */
+export const MAX_EDITOR_NOTES = 5;
+
+/**
+ * Длина одного замечания. Сам пост — не длиннее 900 символов (подпись к
+ * картинке в Telegram), так что замечание на 600 — это уже подробный разбор.
+ * Всё, что длиннее, — не замечание, а переписанный пост, присланный реплаем;
+ * ровно от этого способа правки мы и уходим.
+ *
+ * Обрезаем с конца: суть замечания владелец пишет в первой фразе.
+ */
+export const MAX_EDITOR_NOTE_LEN = 600;
+
+/**
+ * Замечание в конец списка. Накопление — смысл всей конструкции: второе
+ * замечание владелец пишет, глядя на второй черновик, но первое от этого не
+ * перестаёт действовать, и затирать его значит чинить одно и ломать другое
+ * по кругу.
+ *
+ * Сверх предела уходит САМОЕ СТАРОЕ. Выбросить пришедшее сейчас значило бы
+ * молча проигнорировать владельца в ответ на его же сообщение; старое
+ * замечание, если оно всё ещё не выполнено, вернётся следующим реплаем.
+ */
+export function appendEditorNote(notes: string[] | null | undefined, note: string): string[] {
+  const text = String(note ?? '').trim().slice(0, MAX_EDITOR_NOTE_LEN);
+  const kept = Array.isArray(notes) ? notes : [];
+  if (!text) return kept;
+  return [...kept, text].slice(-MAX_EDITOR_NOTES);
+}
+
 const num = (v: any): number | null => (v === null || v === undefined ? null : Number(v));
 
 export function rowToPost(row: any): BlogPost {
@@ -79,6 +130,11 @@ export function rowToPost(row: any): BlogPost {
     imagePrompt: row.image_prompt ?? null,
     imageUrl: row.image_url ?? null,
     status: row.status,
+    // Пост, заведённый до миграции 002, колонки не имеет вовсе. Пустой список
+    // здесь — не «на всякий случай»: без него редактор получил бы
+    // `undefined.length` и черновик падал бы в failed на ровном месте.
+    editorNotes: Array.isArray(row.editor_notes) ? row.editor_notes : [],
+    draftingStartedAt: row.drafting_started_at ?? null,
     slotAt: row.slot_at ?? null,
     publishedAt: row.published_at ?? null,
     reviewChatId: num(row.review_chat_id),

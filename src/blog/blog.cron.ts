@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
-import { BlogTopicService, normalizeTopicKey } from './blog-topic.service';
+import { BlogTopicService, normalizeTopicKey, STALE_DRAFTING_MINUTES } from './blog-topic.service';
 import { BlogEditorService } from './blog-editor.service';
 import { BlogImageService } from './blog-image.service';
 import { BlogPublisherService, MAX_PUBLISH_ATTEMPTS } from './blog-publisher.service';
@@ -103,8 +103,21 @@ export class BlogCron {
     }
   }
 
-  /** Каждый час: если ближайший слот ничем не обеспечен — готовим черновик. */
-  @Cron('0 * * * *')
+  /**
+   * Каждые 5 минут: если ближайший слот ничем не обеспечен — готовим черновик.
+   *
+   * Пять минут, а не час, потому что это же расписание обслуживает
+   * переработку: владелец прислал замечание реплаем, бот ответил «перепишу» —
+   * и на часовом тике это обещание наступало бы в среднем через полчаса, а в
+   * худшем случае через час. За это время проще отправить пост в мусор, чем
+   * дождаться исправленного.
+   *
+   * Лишней работы учащение не даёт: в устойчивом состоянии пост стоит в
+   * `pending_review` или `approved`, и проверка ниже выходит первым же
+   * запросом. См. разбор гонки в отчёте — в `drafting` эта охрана не
+   * заглядывает намеренно (иначе не подхватывалась бы сама переработка).
+   */
+  @Cron('*/5 * * * *')
   async prepareDrafts(): Promise<void> {
     if (!this.enabled()) return;
 
@@ -124,11 +137,32 @@ export class BlogCron {
       return;
     }
 
-    await this.pg.query(
-      `UPDATE blog_post SET status = 'drafting', updated_at = now()
-        WHERE id = $1 AND status = ANY($2::text[])`,
-      [idea.id, sourcesFor('drafting')],
+    // Атомарный захват — тем же приёмом, что и у паблишера: UPDATE с условием
+    // и RETURNING, выигрывает ровно один вызов.
+    //
+    // Статуса для захвата не хватает: у переработки его смены нет вовсе (пост
+    // после замечания уже в `drafting`), поэтому захват идёт по отметке
+    // `drafting_started_at`. Условие «пусто ИЛИ протухло» — это ровно та же
+    // пара случаев, по которой отбирал `takeNextIdea`, но здесь она решает
+    // спор двух тиков, а не отбирает кандидата.
+    //
+    // Замок в памяти процесса здесь не годится: `linkeon-api` поднят в
+    // cluster_mode, и первый же `pm2 scale linkeon-api 2` развёл бы тики по
+    // процессам, ничего не сообщив; крон вдобавок иногда дёргают отдельным
+    // процессом руками.
+    const claim = await this.pg.query(
+      `UPDATE blog_post
+          SET status = 'drafting', drafting_started_at = now(), updated_at = now()
+        WHERE id = $1
+          AND status = ANY($2::text[])
+          AND (drafting_started_at IS NULL
+               OR drafting_started_at < now() - ($3 || ' minutes')::interval)
+        RETURNING id`,
+      [idea.id, sourcesFor('drafting'), STALE_DRAFTING_MINUTES],
     );
+    // Пусто — пост забрал другой тик. Это штатная гонка, а не сбой: ни ошибки
+    // в лог, ни сообщения владельцу, иначе каждый второй тик писал бы панику.
+    if (!claim.rows.length) return;
 
     try {
       const draft = await this.editor.draft(idea);
@@ -226,7 +260,8 @@ export class BlogCron {
     if (!this.enabled()) return;
     const r = await this.pg.query(
       `UPDATE blog_post
-          SET status = 'rejected', last_error = 'протухла', updated_at = now()
+          SET status = 'rejected', last_error = 'протухла',
+              editor_notes = '{}'::text[], updated_at = now()
         WHERE rubric = 'news'
           AND status = ANY($1::text[])
           AND created_at < now() - ($2 || ' days')::interval

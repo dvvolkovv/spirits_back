@@ -127,8 +127,11 @@ export class BlogController {
       case 'reject': {
         const post = await this.load(String(data.id));
         this.assertTransition(post, 'rejected');
+        // Тот же терминальный статус, что и кнопка «В мусор» в личке, — и те
+        // же последствия для замечаний. Панелей управления постом две, и
+        // вторая не должна вести себя иначе первой.
         const r = await this.pg.query(
-          `UPDATE blog_post SET status = 'rejected', updated_at = now()
+          `UPDATE blog_post SET status = 'rejected', editor_notes = '{}'::text[], updated_at = now()
             WHERE id = $1 AND status = $2`,
           [post.id, post.status],
         );
@@ -139,8 +142,11 @@ export class BlogController {
       case 'redraft': {
         const post = await this.load(String(data.id));
         this.assertTransition(post, 'drafting');
+        // Та же переработка, что и кнопка «Переписать» в личке, — и так же
+        // гасит отметку захвата: пустая означает «готов к работе прямо
+        // сейчас». Замечания при этом сохраняются: они редактору ещё нужны.
         const r = await this.pg.query(
-          `UPDATE blog_post SET status = 'drafting', updated_at = now()
+          `UPDATE blog_post SET status = 'drafting', drafting_started_at = NULL, updated_at = now()
             WHERE id = $1 AND status = $2`,
           [post.id, post.status],
         );

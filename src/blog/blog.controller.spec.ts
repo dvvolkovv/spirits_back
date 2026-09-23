@@ -73,6 +73,34 @@ describe('BlogController', () => {
     expect(d.pg.query.mock.calls[1][0]).toContain("status = 'approved'");
   });
 
+  /**
+   * Панелей управления постом две, и вторая не должна уметь меньше первой:
+   * «в мусор» из админки — тот же терминальный статус, что и кнопка в личке.
+   */
+  it('reject из админки стирает замечания, как и кнопка «в мусор» в личке', async () => {
+    const d = deps(); const r = res();
+    await make(d).action({ action: 'reject', id: 'p1' }, r);
+    expect(String(d.pg.query.mock.calls[1][0])).toContain("editor_notes = '{}'");
+  });
+
+  /** redraft — переработка, а не финал: замечания редактору ещё нужны. */
+  it('redraft из админки замечания сохраняет', async () => {
+    const d = deps(); const r = res();
+    await make(d).action({ action: 'redraft', id: 'p1' }, r);
+    expect(String(d.pg.query.mock.calls[1][0])).not.toContain('editor_notes');
+  });
+
+  /**
+   * Вторая панель отправляет на переработку ровно так же, как первая: пустая
+   * отметка означает «готов к работе прямо сейчас». Без этого пост из админки
+   * ждал бы протухания порога, а из личка — нет.
+   */
+  it('redraft из админки освобождает пост под захват', async () => {
+    const d = deps(); const r = res();
+    await make(d).action({ action: 'redraft', id: 'p1' }, r);
+    expect(String(d.pg.query.mock.calls[1][0])).toMatch(/drafting_started_at = NULL/i);
+  });
+
   it('неизвестное действие — 400', async () => {
     const d = deps(); const r = res();
     await make(d).action({ action: 'взорви_всё' }, r);

@@ -42,6 +42,34 @@ describe('BlogPublisherService.publish', () => {
     expect(tg.sendPhoto).toHaveBeenCalledTimes(1);
   });
 
+  /**
+   * `published` — терминальный статус: замечания к этому посту больше никто
+   * не прочтёт, а в архиве админки они висели бы как незакрытые претензии к
+   * уже вышедшему тексту.
+   */
+  it('опубликованный пост остаётся без замечаний', async () => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValueOnce({ rows: [] });
+    const tg = { sendPhoto: jest.fn().mockResolvedValue({ message_id: 42, chat: { id: -1001234567890 } }) };
+    const svc = new BlogPublisherService(pg as any, tg as any, settingsMock() as any);
+
+    await svc.publish(post());
+
+    expect(String(pg.query.mock.calls[1][0])).toContain("editor_notes = '{}'");
+  });
+
+  /** Сорвавшаяся отправка — не повод терять правки: пост ещё вернётся в очередь. */
+  it('сорвавшаяся публикация замечания не трогает', async () => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow({ attempts: 1 })] }).mockResolvedValueOnce({ rows: [] });
+    const tg = { sendPhoto: jest.fn().mockRejectedValue(new Error('ETIMEDOUT')) };
+    const svc = new BlogPublisherService(pg as any, tg as any, settingsMock() as any);
+
+    await svc.publish(post());
+
+    expect(String(pg.query.mock.calls[1][0])).not.toContain('editor_notes');
+  });
+
   it('проигравший захват не отправляет ничего — защита от двойной публикации', async () => {
     const pg = { query: jest.fn().mockResolvedValueOnce({ rows: [] }) };
     const tg = { sendPhoto: jest.fn() };

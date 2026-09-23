@@ -203,6 +203,48 @@ describe('BlogApprovalService.handleCallback', () => {
     expect(pg.query.mock.calls[1][0]).toContain("status = 'drafting'");
   });
 
+  /**
+   * Отметка о начале работы гасится там же, где пост отправляют на
+   * переработку: пустая отметка означает «готов к работе прямо сейчас».
+   * Не погасить её значит заставить владельца ждать протухания порога, то
+   * есть до пятнадцати минут вместо одного тика.
+   */
+  it('«переписать» освобождает пост под захват — отметка гасится', async () => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
+    const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+
+    await svc.handleCallback({ id: 'cb1', data: 'blog:redo:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
+    expect(String(pg.query.mock.calls[1][0])).toMatch(/drafting_started_at = NULL/i);
+  });
+
+  /**
+   * «Переписать» — это и есть переработка, ради которой замечания собирали.
+   * Стереть их здесь значит попросить редактора переписать пост, не сказав
+   * ему, что было не так.
+   */
+  it('«переписать» замечания НЕ стирает — редактор пишет с их учётом', async () => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow({ editor_notes: ['объясни, что такое продукт'] })] }).mockResolvedValue({ rows: [] });
+    const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+
+    await svc.handleCallback({ id: 'cb1', data: 'blog:redo:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
+    expect(String(pg.query.mock.calls[1][0])).not.toContain('editor_notes');
+  });
+
+  /** Мусор — терминальный статус: замечания к нему больше никто не прочтёт. */
+  it('«в мусор» заодно стирает замечания', async () => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow({ editor_notes: ['объясни'] })] }).mockResolvedValue({ rows: [] });
+    const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+
+    await svc.handleCallback({ id: 'cb1', data: 'blog:no:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
+    expect(String(pg.query.mock.calls[1][0])).toContain("editor_notes = '{}'");
+  });
+
   it('переход, запрещённый машиной состояний, не пишется в базу', async () => {
     const pg = { query: jest.fn() };
     // Пост в approved: кнопка «Опубликовать» из старого сообщения пытается
@@ -227,20 +269,105 @@ describe('BlogApprovalService.handleCallback', () => {
   });
 });
 
+/**
+ * Реплай — это ЗАМЕЧАНИЕ редактору, а не готовый текст поста.
+ *
+ * Раньше присланный текст ложился прямо в `body`: чтобы поправить одну фразу,
+ * владелец должен был написать весь пост за редактора. Смысл кнопки был
+ * обратный — сказать, что не так, и получить переписанный вариант.
+ */
 describe('BlogApprovalService.handleReplyEdit', () => {
-  it('реплай на черновик заменяет текст поста', async () => {
+  const reply = (over: any = {}) => ({
+    chat: { id: 77 }, text: 'читатель не знает, что такое продукт',
+    reply_to_message: { message_id: 12 }, ...over,
+  });
+
+  it('реплай сохраняется замечанием, а не подменяет текст поста', async () => {
     const pg = { query: jest.fn() };
     pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
 
-    const handled = await svc.handleReplyEdit({
-      chat: { id: 77 }, text: 'Исправленный текст',
-      reply_to_message: { message_id: 12 },
-    });
+    const handled = await svc.handleReplyEdit(reply());
 
     expect(handled).toBe(true);
-    expect(pg.query.mock.calls[1][1]).toContain('Исправленный текст');
+    const [sql, params] = pg.query.mock.calls[1];
+    expect(String(sql)).toContain('editor_notes');
+    expect(String(sql)).not.toMatch(/\bbody\s*=/);
+    expect(params[1]).toEqual(['читатель не знает, что такое продукт']);
+  });
+
+  it('пост уходит на переработку, а не остаётся ждать кнопки «Опубликовать»', async () => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
+    const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+
+    await svc.handleReplyEdit(reply());
+
+    expect(String(pg.query.mock.calls[1][0])).toContain("status = 'drafting'");
+  });
+
+  /** Иначе замечание ждало бы протухания порога, а не ближайшего тика. */
+  it('замечание освобождает пост под захват — отметка гасится', async () => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
+    const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+
+    await svc.handleReplyEdit(reply());
+
+    expect(String(pg.query.mock.calls[1][0])).toMatch(/drafting_started_at = NULL/i);
+  });
+
+  /**
+   * Второе замечание владелец пишет, глядя на второй черновик, — но первое от
+   * этого не перестаёт действовать. Затирать его значит чинить одно и ломать
+   * другое по кругу.
+   */
+  it('второе замечание накапливается поверх первого', async () => {
+    const pg = { query: jest.fn() };
+    pg.query
+      .mockResolvedValueOnce({ rows: [rawRow({ editor_notes: ['объясни, что такое продукт'] })] })
+      .mockResolvedValue({ rows: [] });
+    const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+
+    await svc.handleReplyEdit(reply({ text: 'и короче' }));
+
+    expect(pg.query.mock.calls[1][1][1]).toEqual(['объясни, что такое продукт', 'и короче']);
+  });
+
+  it('бот обещает переписать, а не отчитывается о замене текста', async () => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
+    const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+
+    await svc.handleReplyEdit(reply());
+
+    const text = String(tg.sendMessage.mock.calls[0][1]);
+    expect(text).toMatch(/перепиш/i);
+    expect(text).not.toMatch(/замен/i);
+  });
+
+  /**
+   * Та же машина состояний, что у кнопок и крона. Мутация `canTransition →
+   * true` этот тест не ловит — ловит обратная: если разрешение перестанет
+   * спрашиваться, замечание запишется в пост, который уже уехал в канал.
+   */
+  it('переход, запрещённый машиной состояний, в базу не пишется', async () => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow({ status: 'published' })] }).mockResolvedValue({ rows: [] });
+    const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+
+    const handled = await svc.handleReplyEdit(reply());
+
+    // Сообщение всё равно наше — пускать его ассистенту нельзя.
+    expect(handled).toBe(true);
+    expect(pg.query).toHaveBeenCalledTimes(1);          // только чтение
+    expect(tg.sendMessage).toHaveBeenCalled();          // и владелец узнал, почему
   });
 
   it('реплай на чужое сообщение не перехватывается — текст уйдёт ассистенту', async () => {
