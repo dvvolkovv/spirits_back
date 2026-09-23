@@ -22,6 +22,12 @@ export interface BlogPost {
    * Пустой список — нормальное состояние: пост, к которому претензий не было.
    */
   editorNotes: string[];
+  /**
+   * Когда черновик взяли в работу. Пусто — «готов к работе прямо сейчас»,
+   * именно по этому признаку `takeNextIdea` отбирает посты, а `prepareDrafts`
+   * их захватывает.
+   */
+  draftingStartedAt: string | null;
   slotAt: string | null;
   publishedAt: string | null;
   reviewChatId: number | null;
@@ -128,6 +134,7 @@ export function rowToPost(row: any): BlogPost {
     // здесь — не «на всякий случай»: без него редактор получил бы
     // `undefined.length` и черновик падал бы в failed на ровном месте.
     editorNotes: Array.isArray(row.editor_notes) ? row.editor_notes : [],
+    draftingStartedAt: row.drafting_started_at ?? null,
     slotAt: row.slot_at ?? null,
     publishedAt: row.published_at ?? null,
     reviewChatId: num(row.review_chat_id),

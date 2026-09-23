@@ -138,8 +138,13 @@ export class BlogApprovalService {
     // «Переписать» — это и есть переработка, ради которой замечания копились.
     // Стереть их здесь значило бы попросить редактора переписать пост, не
     // сказав ему, что было не так.
+    //
+    // Отметку захвата, наоборот, гасим: пустая означает «готов к работе прямо
+    // сейчас». Иначе пост ждал бы протухания порога — до пятнадцати минут
+    // вместо ближайшего тика.
     await this.pg.query(
-      `UPDATE blog_post SET status = 'drafting', updated_at = now() WHERE id = $1`,
+      `UPDATE blog_post SET status = 'drafting', drafting_started_at = NULL, updated_at = now()
+        WHERE id = $1`,
       [post.id],
     );
     await this.tg.answerCallbackQuery(cb.id, { text: 'Перепишу к следующему тику' });
@@ -191,8 +196,12 @@ export class BlogApprovalService {
       return true;
     }
 
+    // `drafting_started_at = NULL` — пост свободен под захват прямо сейчас,
+    // ждать протухания порога замечанию незачем.
     await this.pg.query(
-      `UPDATE blog_post SET editor_notes = $2::text[], status = 'drafting', updated_at = now()
+      `UPDATE blog_post
+          SET editor_notes = $2::text[], status = 'drafting',
+              drafting_started_at = NULL, updated_at = now()
         WHERE id = $1`,
       [post.id, appendEditorNote(post.editorNotes, text)],
     );

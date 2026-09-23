@@ -144,7 +144,38 @@ describe('BlogTopicService.takeNextIdea', () => {
     const svc = new BlogTopicService(pg as any);
     await svc.takeNextIdea();
     const sql = pg.query.mock.calls[0][0] as string;
-    expect(sql).toMatch(/updated_at|interval/);
+    expect(sql).toMatch(/drafting_started_at|interval/);
+  });
+
+  /**
+   * Раньше «черновик уже в работе» опознавалось косвенной уликой — заполненным
+   * заголовком. Улика врала ровно там, где это дороже всего: у переработки
+   * заголовок остаётся от прошлой генерации, так что пост считался готовым к
+   * работе всё время, пока его и писали. Теперь есть прямая отметка о начале
+   * работы, и порог применяется к ней — по своему прямому смыслу «взяли и
+   * бросили».
+   */
+  it('готовность к работе определяется отметкой о начале, а не заполненным заголовком', async () => {
+    const pg = pgMock();
+    pg.query.mockResolvedValueOnce({ rows: [] });
+    const svc = new BlogTopicService(pg as any);
+
+    await svc.takeNextIdea();
+
+    const sql = String(pg.query.mock.calls[0][0]).replace(/\s+/g, ' ');
+    expect(sql).toContain('drafting_started_at IS NULL');
+    expect(sql).not.toContain('title IS NOT NULL');
+  });
+
+  it('порог применяется к отметке о начале работы', async () => {
+    const pg = pgMock();
+    pg.query.mockResolvedValueOnce({ rows: [] });
+    const svc = new BlogTopicService(pg as any);
+
+    await svc.takeNextIdea();
+
+    const sql = String(pg.query.mock.calls[0][0]).replace(/\s+/g, ' ');
+    expect(sql).toMatch(/drafting_started_at < now\(\)/);
   });
 
   it('порог не распространяется на idea: свежая идея берётся сразу', async () => {
@@ -166,25 +197,25 @@ describe('BlogTopicService.takeNextIdea', () => {
     expect(String(pg.query.mock.calls[0][0])).toContain("(rubric = 'news') DESC");
   });
 
-  it('запрошенная перезапись берётся сразу: у неё уже есть текст от прошлой генерации', async () => {
+  it('запрошенная перезапись берётся сразу: отправивший её погасил отметку', async () => {
     const pg = pgMock();
     pg.query.mockResolvedValueOnce({ rows: [] });
     const svc = new BlogTopicService(pg as any);
     await svc.takeNextIdea();
     const sql = String(pg.query.mock.calls[0][0]).replace(/\s+/g, ' ');
-    // Проверка на title намеренно должна лежать ВНУТРИ ветки status =
-    // 'drafting', а не отдельным условием верхнего уровня — иначе она
-    // зацепит title IS NOT NULL у постов в любом статусе, включая уже
-    // опубликованные (у них title тоже не пустой).
-    expect(sql).toMatch(/status = 'drafting' AND \(title IS NOT NULL OR updated_at/);
+    // Условие на отметку намеренно лежит ВНУТРИ ветки status = 'drafting', а
+    // не отдельным условием верхнего уровня. Наверху `drafting_started_at IS
+    // NULL` было бы истиной для всего, что до черновика не доходило, —
+    // включая отклонённые посты, и крон воскрешал бы отправленное в мусор.
+    expect(sql).toMatch(/status = 'drafting' AND \(drafting_started_at IS NULL OR drafting_started_at/);
   });
 
-  it('осиротевший черновик без текста по-прежнему ждёт порог', async () => {
+  it('брошенный после захвата черновик по-прежнему ждёт порог', async () => {
     const pg = pgMock();
     pg.query.mockResolvedValueOnce({ rows: [] });
     const svc = new BlogTopicService(pg as any);
     await svc.takeNextIdea();
     const sql = String(pg.query.mock.calls[0][0]).replace(/\s+/g, ' ');
-    expect(sql).toMatch(/title IS NOT NULL OR updated_at < now\(\) - \(\$1 \|\| ' minutes'\)::interval\)\)/);
+    expect(sql).toMatch(/drafting_started_at < now\(\) - \(\$1 \|\| ' minutes'\)::interval\)\)/);
   });
 });

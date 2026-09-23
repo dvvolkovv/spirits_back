@@ -204,6 +204,22 @@ describe('BlogApprovalService.handleCallback', () => {
   });
 
   /**
+   * Отметка о начале работы гасится там же, где пост отправляют на
+   * переработку: пустая отметка означает «готов к работе прямо сейчас».
+   * Не погасить её значит заставить владельца ждать протухания порога, то
+   * есть до пятнадцати минут вместо одного тика.
+   */
+  it('«переписать» освобождает пост под захват — отметка гасится', async () => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
+    const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+
+    await svc.handleCallback({ id: 'cb1', data: 'blog:redo:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
+    expect(String(pg.query.mock.calls[1][0])).toMatch(/drafting_started_at = NULL/i);
+  });
+
+  /**
    * «Переписать» — это и есть переработка, ради которой замечания собирали.
    * Стереть их здесь значит попросить редактора переписать пост, не сказав
    * ему, что было не так.
@@ -290,6 +306,18 @@ describe('BlogApprovalService.handleReplyEdit', () => {
     await svc.handleReplyEdit(reply());
 
     expect(String(pg.query.mock.calls[1][0])).toContain("status = 'drafting'");
+  });
+
+  /** Иначе замечание ждало бы протухания порога, а не ближайшего тика. */
+  it('замечание освобождает пост под захват — отметка гасится', async () => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
+    const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+
+    await svc.handleReplyEdit(reply());
+
+    expect(String(pg.query.mock.calls[1][0])).toMatch(/drafting_started_at = NULL/i);
   });
 
   /**

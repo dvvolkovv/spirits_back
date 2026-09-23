@@ -83,6 +83,12 @@ describe('rowToPost', () => {
     expect(post.editorNotes).toEqual(['первое', 'второе']);
   });
 
+  it('читает отметку о начале работы над черновиком', () => {
+    const at = '2026-09-23T10:00:00.000Z';
+    expect(rowToPost({ id: 'a', status: 'drafting', attempts: 0, drafting_started_at: at }).draftingStartedAt).toBe(at);
+    expect(rowToPost({ id: 'a', status: 'idea', attempts: 0 }).draftingStartedAt).toBeNull();
+  });
+
   /**
    * Пост, заведённый до миграции, колонки не имеет вовсе. Если бы сюда
    * приезжал undefined, редактор получал бы `undefined.length` на ровном
@@ -102,10 +108,25 @@ describe('rowToPost', () => {
  * будут вечно теряться без единой ошибки в логе.
  */
 describe('миграция 002', () => {
-  const sql = fs.readFileSync(path.join(__dirname, 'migrations', '002_editor_note.sql'), 'utf8');
+  const sql = fs.readFileSync(
+    path.join(__dirname, 'migrations', '002_editor_notes_and_draft_claim.sql'), 'utf8',
+  );
 
   it('добавляет ровно ту колонку, которую читает rowToPost', () => {
     expect(sql).toMatch(/ADD COLUMN IF NOT EXISTS\s+editor_notes/i);
+  });
+
+  it('заводит отметку о начале работы над черновиком', () => {
+    expect(sql).toMatch(/ADD COLUMN IF NOT EXISTS\s+drafting_started_at/i);
+  });
+
+  /**
+   * Пустая отметка = «готов к работе». Поставь сюда DEFAULT now() — и все
+   * существующие черновики разом окажутся «в работе», а канал замолчит до
+   * протухания порога.
+   */
+  it('отметка по умолчанию пустая', () => {
+    expect(sql).toMatch(/drafting_started_at\s+timestamptz\s*;/i);
   });
 
   it('повторный прогон не ломается — ALTER идёт через IF NOT EXISTS', () => {

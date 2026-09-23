@@ -90,6 +90,17 @@ describe('BlogController', () => {
     expect(String(d.pg.query.mock.calls[1][0])).not.toContain('editor_notes');
   });
 
+  /**
+   * Вторая панель отправляет на переработку ровно так же, как первая: пустая
+   * отметка означает «готов к работе прямо сейчас». Без этого пост из админки
+   * ждал бы протухания порога, а из личка — нет.
+   */
+  it('redraft из админки освобождает пост под захват', async () => {
+    const d = deps(); const r = res();
+    await make(d).action({ action: 'redraft', id: 'p1' }, r);
+    expect(String(d.pg.query.mock.calls[1][0])).toMatch(/drafting_started_at = NULL/i);
+  });
+
   it('неизвестное действие — 400', async () => {
     const d = deps(); const r = res();
     await make(d).action({ action: 'взорви_всё' }, r);

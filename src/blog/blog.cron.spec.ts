@@ -1,7 +1,16 @@
+import { Logger } from '@nestjs/common';
 import { BlogCron, STUCK_PUBLISHING_MINUTES } from './blog.cron';
+import { STALE_DRAFTING_MINUTES } from './blog-topic.service';
 
 const deps = () => ({
-  pg: { query: jest.fn().mockResolvedValue({ rows: [] }) },
+  // Захват черновика (`UPDATE ... RETURNING`) по умолчанию удаётся: пустой
+  // результат означал бы «пост забрал другой тик», и тогда prepareDrafts
+  // молча выходит — все его тесты мерили бы тишину вместо работы.
+  pg: {
+    query: jest.fn(async (sql: string) => (
+      /RETURNING/.test(String(sql)) ? { rows: [{ id: 'p1' }] } : { rows: [] }
+    )),
+  },
   topics: { takeNextIdea: jest.fn().mockResolvedValue(null), addTopic: jest.fn(), topAssistants: jest.fn().mockResolvedValue([]), recentTitles: jest.fn().mockResolvedValue([]) },
   editor: { draft: jest.fn() },
   images: { render: jest.fn() },
@@ -143,6 +152,135 @@ describe('BlogCron.prepareDrafts', () => {
     expect(d.editor.draft).not.toHaveBeenCalled();
     const sqls = d.pg.query.mock.calls.map((c: any) => String(c[0]));
     expect(sqls.some((s) => s.includes("status = 'drafting'"))).toBe(false);
+  });
+});
+
+/**
+ * Гонка двух тиков `prepareDrafts`.
+ *
+ * Черновик захватывается В БАЗЕ, а не замком в памяти процесса: `linkeon-api`
+ * поднят в cluster_mode, и первый же `pm2 scale linkeon-api 2` разнёс бы тики
+ * по процессам, ничего не сообщив; крон вдобавок иногда дёргают отдельным
+ * процессом руками. Замок в памяти дал бы ложное чувство защиты и спрятал бы
+ * настоящую гонку от этого теста.
+ *
+ * Сам дефект: у переработки нет смены статуса — пост после замечания уже в
+ * `drafting`, — поэтому захватывать было нечем. Второй тик брал ТОТ ЖЕ пост,
+ * пока первый висел на релее: два похода к релею, две картинки и два
+ * одинаковых черновика в личке у владельца. На часовом расписании окно не
+ * достигалось, на пятиминутном достигается всякий раз, когда релей думает
+ * дольше пяти минут.
+ */
+describe('BlogCron.prepareDrafts — гонка двух тиков', () => {
+  beforeEach(() => { process.env.BLOG_ENABLED = 'true'; process.env.BLOG_APPROVER_TG_ID = '77'; });
+  afterEach(() => { jest.restoreAllMocks(); });
+
+  /**
+   * Postgres в миниатюре: одна строка и атомарный UPDATE.
+   *
+   * Условие захвата НЕ зашито в заглушку — она смотрит, несёт ли его сам
+   * запрос. Иначе заглушка сторожила бы строку вместо кода, и тест зеленел бы
+   * на захвате без всякого условия.
+   */
+  const claimingPg = (over: any = {}) => {
+    const state: any = { id: 'p1', status: 'drafting', drafting_started_at: null, ...over };
+    return {
+      state,
+      query: jest.fn(async (sql: string) => {
+        const s = String(sql).replace(/\s+/g, ' ');
+        if (/count\(\*\)/.test(s)) return { rows: [{ n: 0 }] };
+
+        if (/RETURNING/.test(s) && /drafting_started_at = now\(\)/.test(s)) {
+          const guarded = /drafting_started_at IS NULL/.test(s);
+          const free = state.drafting_started_at === null;
+          if (guarded && !free) return { rows: [] };      // проиграл гонку
+          state.drafting_started_at = new Date();
+          state.status = 'drafting';
+          return { rows: [{ id: state.id }] };
+        }
+        return { rows: [] };
+      }),
+    };
+  };
+
+  /** Пост после замечания: уже `drafting`, текст прошлой генерации на месте. */
+  const redone = () => ({
+    id: 'p1', rubric: 'case', topicKey: 'k', topicHint: null, status: 'drafting',
+    title: 'Старый заголовок', body: 'Старый текст', editorNotes: ['объясни, что такое продукт'],
+  });
+
+  const racingDeps = () => {
+    const d = deps();
+    const pg = claimingPg();
+    d.pg = pg as any;
+    // Оба тика успели увидеть пост выборкой: SELECT не атомарен, и в этом
+    // вся суть — развести их обязан именно захват.
+    d.topics.takeNextIdea.mockResolvedValue(redone());
+    d.images.render.mockResolvedValue('https://minio/i.png');
+    return d;
+  };
+
+  /** Два тика внахлёст: второй приходит, пока первый висит на релее. */
+  const runOverlapping = async (d: any) => {
+    let release: any;
+    d.editor.draft.mockReturnValue(new Promise((r) => {
+      release = () => r({ title: 'Новый', body: 'Новый текст', imagePrompt: 'сцена' });
+    }));
+
+    const cron = make(d);
+    const first = cron.prepareDrafts();
+    await new Promise((r) => setImmediate(r));
+    const second = cron.prepareDrafts();
+    await new Promise((r) => setImmediate(r));
+    release();
+    await Promise.all([first, second]);
+  };
+
+  it('редактора просят переписать пост один раз, а не дважды', async () => {
+    const d = racingDeps();
+    await runOverlapping(d);
+    expect(d.editor.draft).toHaveBeenCalledTimes(1);
+  });
+
+  it('владелец получает один черновик, а не два одинаковых', async () => {
+    const d = racingDeps();
+    await runOverlapping(d);
+    expect(d.approval.sendForReview).toHaveBeenCalledTimes(1);
+  });
+
+  it('картинка рисуется один раз — второй заход стоил бы денег', async () => {
+    const d = racingDeps();
+    await runOverlapping(d);
+    expect(d.images.render).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Проигранный захват — штатная гонка, а не сбой: ни ошибки в лог, ни
+   * сообщения владельцу. Иначе каждый второй тик писал бы в лог панику.
+   */
+  it('проигравший тик молчит — это гонка, а не сбой', async () => {
+    const err = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const d = racingDeps();
+
+    await runOverlapping(d);
+
+    expect(err).not.toHaveBeenCalled();
+    expect(d.approval.notify).not.toHaveBeenCalled();
+  });
+
+  it('захват требует, чтобы отметка была пуста или протухла', async () => {
+    const d = racingDeps();
+    await runOverlapping(d);
+
+    const claim = d.pg.query.mock.calls
+      .map((c: any) => String(c[0]).replace(/\s+/g, ' '))
+      .find((s: string) => /RETURNING/.test(s) && /drafting_started_at = now\(\)/.test(s));
+
+    expect(claim).toBeDefined();
+    expect(claim).toMatch(/drafting_started_at IS NULL/);
+    // Порог — параметром, а не литералом в тексте запроса.
+    const params = d.pg.query.mock.calls.find((c: any) => /RETURNING/.test(String(c[0])))?.[1];
+    expect(params).toContain(STALE_DRAFTING_MINUTES);
   });
 });
 
