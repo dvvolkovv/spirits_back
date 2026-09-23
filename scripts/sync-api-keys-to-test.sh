@@ -205,7 +205,6 @@ if [[ "${NO_RESTART:-}" != "1" ]]; then
     export NVM_DIR=\"\$HOME/.nvm\"
     [ -s \"\$NVM_DIR/nvm.sh\" ] && . \"\$NVM_DIR/nvm.sh\"
     pm2 restart linkeon-api 2>/dev/null || true
-    pm2 restart linkeon-smm-worker 2>/dev/null || true
     pm2 list
   "'
 fi

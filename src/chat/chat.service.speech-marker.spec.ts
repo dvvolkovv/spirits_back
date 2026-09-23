@@ -127,8 +127,6 @@ function makeHarness(opts: { deltas: string[]; clips: ClipSpec[]; userId?: strin
     null as any,      // neo4j
     null as any,      // kling
     null as any,      // tools
-    null as any,      // smmProducerTools
-    null as any,      // claudeAgent
     null as any,      // claudeCli
     language as any,  // language
     undefined,        // balanceCtx

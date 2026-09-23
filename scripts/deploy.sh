@@ -251,14 +251,7 @@ rollback_backend() {
     npm ci --no-audit --no-fund 2>&1 | tail -3
     npm run build 2>&1 | tail -3
     pm2 restart linkeon-api 2>&1 | tail -2
-    if [ -d worker ]; then
-      cd worker
-      npm ci --no-audit --no-fund 2>&1 | tail -3
-      npm run build 2>&1 | tail -3
-      pm2 restart linkeon-smm-worker 2>&1 | tail -2
-      cd ..
-    fi
-    # Голосовой воркер: свой package.json и своя сборка, как у SMM-воркера.
+    # Голосовой воркер: свой package.json и своя сборка, отдельно от основной.
     # Без этого блока правки voice-host/* не доезжают до живого процесса.
     # Статус проверяем явно, а не через '| tail': в этом блоке действует
     # set -e БЕЗ pipefail, поэтому статус берётся от tail и всегда нулевой —
@@ -374,22 +367,7 @@ warm_chat_path() {
       -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
       -d "{\"chatInput\":\"deploy warmup\",\"assistant\":\"12\",\"fresh\":true,\"freshTs\":\"$fts\",\"probe\":true}" >/dev/null 2>&1 || true
   done
-  # Юля/smm_producer (id=15) — ОТДЕЛЬНЫЙ тяжёлый путь (Claude Agent SDK + in-process
-  # MCP tools, ветка по agent.name в chat.service), не покрытый прогревом Романа.
-  # Холодный первый вызов медленный (>20с) → browser-smoke julia-creator.spec.js
-  # падает И его churn роняет соседние render-тесты (per-tab). Root-cause 2026-06-26
-  # (backlog ad11a003): warm = зелёно 7/7, cold-after-restart = красно. Будим заранее.
-  #
-  # Здесь fresh есть, а probe НЕТ — намеренно. Путь Юли идёт через
-  # claudeAgent.streamSmmProducer (Claude Agent SDK + MCP-тулы), а не через
-  # общую ветку, где probe переключает модель на haiku; как probe ведёт себя
-  # в SDK-пути, не проверено, а смысл этого прогрева — разбудить именно
-  # тяжёлую обвязку. Изоляции сессии достаточно: она не даёт накопиться той
-  # самой постоянной сессии, из-за которой прогрев Романа стоил $5.
-  curl -s ${ca[@]+${ca[@]+"${ca[@]}"}} -m 90 -X POST "$base/webhook/soulmate/chat" \
-    -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
-    -d "{\"chatInput\":\"deploy warmup\",\"assistant\":\"15\",\"fresh\":true,\"freshTs\":\"$fts\"}" >/dev/null 2>&1 || true
-  green "  ✓ chat+browser+smm paths warmed ($base)"
+  green "  ✓ chat+browser paths warmed ($base)"
 }
 
 # Ждём, пока на среде не останется чат-ходов в полёте.
@@ -482,16 +460,7 @@ deploy_backend() {
     npm ci --no-audit --no-fund 2>&1 | tail -3
     npm run build 2>&1 | tail -3
     pm2 restart linkeon-api 2>&1 | tail -2
-    # SMM worker shares the repo but has its own package.json + tsc build.
-    # Without this block changes to worker/* never reach the running PM2 process.
-    if [ -d worker ]; then
-      cd worker
-      npm ci --no-audit --no-fund 2>&1 | tail -3
-      npm run build 2>&1 | tail -3
-      pm2 restart linkeon-smm-worker 2>&1 | tail -2
-      cd ..
-    fi
-    # Голосовой воркер: свой package.json и своя сборка, как у SMM-воркера.
+    # Голосовой воркер: свой package.json и своя сборка, отдельно от основной.
     # Без этого блока правки voice-host/* не доезжают до живого процесса.
     # Статус проверяем явно, а не через '| tail': в этом блоке действует
     # set -e БЕЗ pipefail, поэтому статус берётся от tail и всегда нулевой —

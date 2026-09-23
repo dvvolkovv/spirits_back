@@ -114,19 +114,11 @@ const ALLOWED: Record<string, { writes: number; why: string }> = {
  * меньшую — красит сторож. Уменьшилось (долг закрыли) — строку удалить.
  */
 const KNOWN_DEBT: Record<string, { writes: number; what: string }> = {
-  'chat/claude-agent.service.ts': {
-    writes: 1,
-    what:
-      'Основной биллинг SMM-агента: списывает прямым UPDATE и пишет строку в ' +
-      'token_consumption_tasks (ради админской статистики), но НЕ в ' +
-      'token_transactions. Расход этого пути в «Истории» и в прогнозе не виден.',
-  },
-  'smm/scenarios/scenarios.controller.ts': {
-    writes: 1,
-    what:
-      'Списание за перегенерацию сценария: прямой UPDATE плюс правка ' +
-      'tokens_used в custom_chat_history. В реестре движений нет.',
-  },
+  // Две строки отсюда закрыты 23.09.2026 сносом SMM: биллинг SMM-агента
+  // (chat/claude-agent.service.ts) и списание за перегенерацию сценария
+  // (smm/scenarios/scenarios.controller.ts). Долг закрыт не выплатой, а
+  // удалением должника — оба пути больше не существуют. Список сокращён по
+  // правилу из шапки: «уменьшилось — строку удалить».
   'profile/profile.service.ts': {
     writes: 1,
     what:
@@ -340,12 +332,10 @@ describe('Поиск обходов', () => {
     expect(missedByOld.sort()).toEqual(
       [
         'base/migrations/001_core_schema.sql',
-        'chat/claude-agent.service.ts',
         'misc/misc.service.ts',
         'products/rent.service.ts',
         'profile/profile.service.ts',
         'scheduler/token-accounting.service.ts',
-        'smm/scenarios/scenarios.controller.ts',
         'tg-bot/tg-billing.service.ts',
         'tokens/migrations/001_add_user_tokens_lock.sql',
       ].sort(),

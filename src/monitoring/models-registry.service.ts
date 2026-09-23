@@ -66,8 +66,13 @@ const EXPECTED: ExpectedModel[] = [
   { provider: 'Google',     model: 'veo-3.1-generate-preview', kind: 'video', purpose: 'Veo 3.1 — генерация видео (9:16/16:9, talking-head, длинные ролики concat). Стоимость — оценка (см. VEO_EST_USD_PER_CALL)', caller: 'video.createJob (model=veo-3.1) → veo.generate', via: 'API key' },
 
   // ---- TTS (audio) ----
-  { provider: 'ElevenLabs',     model: 'eleven_multilingual_v2', kind: 'audio', purpose: 'TTS для голосов hero/lawyer/coach/psy в SMM-пайпе', caller: 'smm-worker → ElevenLabs API', via: 'API key' },
-  { provider: 'Yandex SpeechKit', model: 'yandexcloud-tts-v1',  kind: 'audio', purpose: 'TTS fallback для SMM-видео когда ElevenLabs не нужен', caller: 'smm-worker → speech.synthesize', via: 'API key' },
+  // Строка eleven_multilingual_v2 удалена 23.09.2026 вместе с разделом SMM: эту
+  // модель звал только smm-worker (голоса hero/lawyer/coach/psy в видео-пайпе).
+  // ElevenLabs у нас остался, но другой моделью — eleven_multilingual_sts_v2,
+  // это voice-avatar (клон голоса и конверсия), она живёт своей строкой ниже по
+  // мере надобности. Если в events снова появится eleven_multilingual_v2 —
+  // значит, где-то ожил путь, которого быть не должно.
+  { provider: 'Yandex SpeechKit', model: 'yandexcloud-tts-v1',  kind: 'audio', purpose: 'TTS: озвучка в чате, календарные напоминания, дорожка для видео', caller: 'misc/speech.synthesize, calendar, video.createJob', via: 'API key' },
 ];
 
 // Veo не логирует стоимость в событии veo_call, поэтому оцениваем расход как

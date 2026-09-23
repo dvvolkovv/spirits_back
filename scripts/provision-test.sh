@@ -496,18 +496,6 @@ else
   pm2 start dist/main.js --name linkeon-api --time
 fi
 
-if [ -d worker ]; then
-  cd worker
-  npm ci --no-audit --no-fund 2>&1 | tail -3
-  npm run build 2>&1 | tail -3
-  if pm2 describe linkeon-smm-worker >/dev/null 2>&1; then
-    pm2 restart linkeon-smm-worker
-  else
-    pm2 start dist/index.js --name linkeon-smm-worker --time
-  fi
-  cd ..
-fi
-
 cd ~/spirits_front_src
 pnpm install --frozen-lockfile --ignore-scripts 2>&1 | tail -3
 pnpm build 2>&1 | tail -3

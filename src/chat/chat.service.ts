@@ -3,8 +3,6 @@ import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { KlingService } from '../misc/kling.service';
 import { ChatToolsService } from './chat-tools';
-import { SmmProducerToolsService } from '../smm/producer/smm-producer-tools.service';
-import { ClaudeAgentService } from './claude-agent.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { TasksService } from '../tasks/tasks.service';
 import { EventsService } from '../events/events.service';
@@ -274,8 +272,6 @@ export class ChatService {
     @Optional() private readonly neo4j: Neo4jService,
     @Optional() private readonly kling: KlingService,
     private readonly tools: ChatToolsService,
-    private readonly smmProducerTools: SmmProducerToolsService,
-    private readonly claudeAgent: ClaudeAgentService,
     private readonly claudeCli: ClaudeCliService,
     private readonly language: LanguageService,
     private readonly balanceCtx: BalanceContextService,
@@ -506,7 +502,8 @@ export class ChatService {
 
     // Coworker awareness — каждый ассистент должен знать про остальных, чтобы
     // суметь представить их пользователю и не делать вид, что новых коллег нет.
-    // Берём список из БД (включая Юлю-SMM-продюсера id=15).
+    // Берём список из БД: фильтр по is_active, поэтому выключенные
+    // ассистенты коллегами не представляются.
     try {
       const coworkersRes = await this.pg.query(
         `SELECT COALESCE(t.display_name, a.display_name, a.name) AS display_name,
@@ -810,43 +807,6 @@ export class ChatService {
       storeBuild,
     });
 
-    // Route SMM-Producer agent to its dedicated Claude Agent SDK path (Plan 4e).
-    // Uses OAuth via ~/.claude/.credentials.json — no ANTHROPIC_API_KEY needed.
-    // Multi-turn handled via session resume (stored in profile_data.smm_sdk_session_id).
-    if (agent?.name === 'smm_producer') {
-      // Set streaming headers
-      res.status(200);
-      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-      res.setHeader('Transfer-Encoding', 'chunked');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('X-Accel-Buffering', 'no');
-      res.setHeader('Access-Control-Allow-Origin', '*');
-
-      // Persist the user message to chat history (so it shows up on history reload).
-      await this.pg.query(
-        `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
-         VALUES ($1, 'human', $2, $3, 'text')`,
-        [chatSessionId, agent.id, message],
-      );
-
-      const adminRes = await this.pg.query(
-        `SELECT isadmin FROM ai_profiles_consolidated WHERE user_id = $1`,
-        [userId],
-      );
-      const isAdmin = Boolean(adminRes.rows[0]?.isadmin);
-      const ctx = { userId, isAdmin, balanceBlock };
-      try {
-        await this.claudeAgent.streamSmmProducer(ctx, message, chatSessionId, agent.id, res, agent.category, fresh);
-      } catch (err: any) {
-        this.logger.error(`SMM streaming failed: ${err.message}`);
-        // Best-effort error event; res may already be ended.
-        try {
-          res.write(JSON.stringify({ type: 'error', message: err.message }) + '\n');
-          res.end();
-        } catch {}
-      }
-      return;
-    }
 
     // Все агенты кроме Маши идут через streamUniversalAgent → r.linkeon.io
     // (MCP image/video tools, code execution). Маша остаётся локально потому
@@ -864,8 +824,8 @@ export class ChatService {
     }
 
     // Build system prompt with platform context + profile.
-    // Use display_name (e.g. Юлия) instead of internal name (smm_producer) so the
-    // assistant introduces coworkers with their human-friendly names.
+    // Use display_name instead of the internal name so the assistant introduces
+    // coworkers with their human-friendly names.
     // Объявляем до запроса коллег: имена и описания тянем уже на языке
     // пользователя, иначе ассистент предложит переключиться на «Машу»
     // кириллицей посреди испанского ответа.

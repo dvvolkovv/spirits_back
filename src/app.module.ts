@@ -22,7 +22,6 @@ import { PeerModule } from './peer/peer.module';
 import { SupportModule } from './support/support.module';
 import { ContactsModule } from './contacts/contacts.module';
 import { McpModule } from './mcp/mcp.module';
-import { SmmModule } from './smm/smm.module';
 import { TasksModule } from './tasks/tasks.module';
 import { BusinessProfileModule } from './business-profile/business-profile.module';
 import { IdentityModule } from './identity/identity.module';
@@ -79,7 +78,6 @@ import { IntegrationsModule } from './integrations/integrations.module';
     SupportModule,
     ContactsModule,
     McpModule,
-    SmmModule,
     TasksModule,
     BusinessProfileModule,
     IdentityModule,

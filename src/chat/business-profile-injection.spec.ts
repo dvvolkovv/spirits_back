@@ -9,14 +9,14 @@ import * as path from 'path';
  * риск задачи: код при этом работает, просто часть ассистентов слепа.
  * Поэтому проверяем текстом файла.
  *
+ * ИСТОРИЯ, КОТОРУЮ СТОИТ ПОМНИТЬ. До 2026-08-25 здесь проверялся только
+ * chat.service.ts, и тест не увидел четвёртый путь сборки промпта — SMM-продюсер
+ * (Юля), уходивший в отдельную ветку раньше streamUniversalAgent. Юля молчала
+ * про бизнес-карточку, а тест был зелёным. Сам путь удалён 23.09.2026 вместе с
+ * разделом SMM, и проверки на него убраны — но урок остаётся: текстовый сторож
+ * видит ровно те файлы, которые в нём перечислены.
+ *
  * ЧТО ЭТОТ ТЕСТ НЕ ПОКРЫВАЕТ (важно помнить при следующей правке промпта):
- * — До 2026-08-25 здесь проверялся только chat.service.ts, и он не увидел
- *   четвёртый путь — SMM-продюсер (Юля, agent.name='smm_producer'), который
- *   уходит в отдельную ветку РАНЬШЕ streamUniversalAgent и собирает system
- *   prompt в claude-agent.service.ts через Claude Agent SDK. Юля молчала
- *   про бизнес-карточку, а этот тест был зелёным. Теперь claude-agent.service.ts
- *   тоже проверяется явно (см. ниже) — но он проверяется ТЕМ ЖЕ текстовым
- *   способом и с теми же ограничениями.
  * — Это текстовый grep по конкретным двум файлам, а не семантический анализ
  *   потока данных. Он не проверяет, что renderForPrompt/extractFromTurn
  *   реально достижимы из runtime-пути (например, если вызов окажется в
@@ -29,7 +29,6 @@ import * as path from 'path';
  */
 describe('инъекция бизнес-карточки в сборку промпта', () => {
   const src = fs.readFileSync(path.join(__dirname, 'chat.service.ts'), 'utf8');
-  const claudeAgentSrc = fs.readFileSync(path.join(__dirname, 'claude-agent.service.ts'), 'utf8');
 
   it('профиль пользователя подставляется ровно в трёх местах', () => {
     const matches = src.match(/User profile:|--- Профиль пользователя ---/g) || [];
@@ -49,17 +48,5 @@ describe('инъекция бизнес-карточки в сборку про�
     const tasks = (src.match(/tasksService\.extractFromTurn\(/g) || []).length;
     const business = (src.match(/businessProfile\.extractFromTurn\(/g) || []).length;
     expect(business).toBe(tasks);
-  });
-
-  it('четвёртый путь (Юля/smm_producer) тоже рендерит карточку — claude-agent.service.ts', () => {
-    expect(claudeAgentSrc).toMatch(/businessProfile\??\.renderForPrompt\(/);
-  });
-
-  it('четвёртый путь (Юля/smm_producer) тоже зовёт извлечение фактов — claude-agent.service.ts', () => {
-    expect(claudeAgentSrc).toMatch(/businessProfile\??\.extractFromTurn\(/);
-  });
-
-  it('вызов streamSmmProducer передаёт category и fresh дальше в claude-agent.service.ts', () => {
-    expect(src).toMatch(/streamSmmProducer\([^)]*agent\.category[^)]*fresh[^)]*\)/);
   });
 });

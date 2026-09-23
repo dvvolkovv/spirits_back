@@ -55,8 +55,6 @@ const TICK_MS = 24 * 60 * 60 * 1000;
  *     support.service.performRefund              (возврат поддержки)
  *     support.service.performRerun               (возврат за повтор)
  *     video.service.failAndRefund                (возврат за видео, ~18 мест зовут его)
- *     smm-billing.service.refund                 (возврат SMM)
- *     smm-premium-generation.service.refund      (возврат SMM за премиум-генерацию)
  *
  *   через `add_user_tokens`, но ИЗ САМОГО POSTGRES, мимо всего TypeScript:
  *     public.redeem_coupon(...)  — SECURITY DEFINER, вызывается снаружи (psql,

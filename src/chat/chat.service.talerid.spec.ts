@@ -13,8 +13,6 @@ function makeService(oauth: any): ChatService {
     null as any, // neo4j
     null as any, // kling
     null as any, // tools
-    null as any, // smmProducerTools
-    null as any, // claudeAgent
     null as any, // claudeCli
     null as any, // language — добавлен в конструктор позже, из-за чего все
                  // последующие аргументы съезжали и oauth попадал в слот events

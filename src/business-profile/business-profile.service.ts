@@ -158,9 +158,9 @@ export class BusinessProfileService {
     // бизнес) → missingFields (ещё один SELECT) → LLM-вызов (самое дорогое).
     if (shouldSkipBusinessExtraction(userMessage)) return;
 
-    // Спека требует category='business'; мест вызова уже четыре (три в
-    // chat.service.ts + SMM-путь Юли), и одно из них однажды уже забыли
-    // прогейтить. Проверка внутри сервиса работает для всех вызовов, включая
+    // Спека требует category='business'; мест вызова три, все в
+    // chat.service.ts, и одно из них однажды уже забыли прогейтить.
+    // (Четвёртым был SMM-путь Юли — удалён 23.09.2026 вместе с разделом.) Проверка внутри сервиса работает для всех вызовов, включая
     // будущие, — её нельзя пропустить по невнимательности на месте вызова.
     const category = await this.categoryFor(agentId);
     if (category !== 'business') return;
