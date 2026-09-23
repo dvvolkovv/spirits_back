@@ -29,7 +29,12 @@ export interface HostDeps {
    * усыпить, ни разбудить, при полностью зелёном прогоне.
    */
   sleepProduct: (job: SleepJob) => Promise<void>;
-  wakeProduct: (job: SleepJob) => Promise<void>;
+  /**
+   * Пробуждение, в отличие от сна, ОТВЕЧАЕТ портом — но только тем, которого в
+   * задании не было и который пришлось узнать у контейнера (см. wakeProduct).
+   * Этим портом сервер лечит строку реестра, потерявшую его.
+   */
+  wakeProduct: (job: SleepJob) => Promise<{ port?: number }>;
   sleep?: (ms: number) => Promise<unknown>;
   log?: (message: string) => void;
 }
@@ -203,11 +208,20 @@ function workFor(job: HostJob, deps: HostDeps): Promise<{ port?: number }> {
   if (kind === 'provision') return deps.provision(job);
 
   const step: SleepJob = { slug: job.slug, kind: job.kind, port: job.port };
-  const run = kind === 'sleep' ? deps.sleepProduct : deps.wakeProduct;
-  // Порт в отчёт не кладётся намеренно: у сна и пробуждения он не меняется,
-  // а `{ ok: true, port: undefined }` читается в логе и в теле как «порт
+  // У СНА порт в отчёт не кладётся намеренно: сон его не меняет, а
+  // `{ ok: true, port: undefined }` читается в логе и в теле как «порт
   // потерян» — см. ниже, там же про COALESCE на сервере.
-  return run(step).then(() => ({}));
+  if (kind === 'sleep') return deps.sleepProduct(step).then(() => ({}));
+
+  // У ПРОБУЖДЕНИЯ — исключение, и оно исходному доводу не противоречит. Довод
+  // был про то, что сообщать НЕЧЕГО: порт у этих видов не меняется. У
+  // пробуждения он может именно ПОЯВИТЬСЯ: продукты, заведённые до колонки
+  // `port`, хранят в реестре NULL, и такой продукт до сих пор не просыпался
+  // вовсе (живой дефект прода 23.09.2026). Порт для них узнаётся у самого
+  // контейнера, и вот он — новость, без которой реестр не вылечится:
+  // `completeJob` пишет `port = COALESCE($2, port)`. Когда сообщать нечего,
+  // `wakeProduct` по-прежнему отвечает `{}` — и отчёт по-прежнему без ключа.
+  return deps.wakeProduct(step);
 }
 
 /**
@@ -534,7 +548,7 @@ export interface RealDepsParts {
   log?: (message: string) => void;
   provision?: (job: HostJob, deps: ProvisionDeps) => Promise<{ port?: number }>;
   sleepProduct?: (job: SleepJob, deps: ProvisionDeps) => Promise<void>;
-  wakeProduct?: (job: SleepJob, deps: ProvisionDeps) => Promise<void>;
+  wakeProduct?: (job: SleepJob, deps: ProvisionDeps) => Promise<{ port?: number }>;
   buildDeps?: (overrides: Partial<ProvisionDeps>) => ProvisionDeps;
 }
 

@@ -42,7 +42,9 @@ function makeDeps(config: Partial<HostConfig> = {}) {
   const complete = jest.fn(async (_jobId: string, _report: JobReport): Promise<boolean> => true);
   const provision = jest.fn(async (_job: HostJob): Promise<{ port?: number }> => ({ port: 8003 }));
   const sleepProduct = jest.fn(async (_job: SleepJob): Promise<void> => undefined);
-  const wakeProduct = jest.fn(async (_job: SleepJob): Promise<void> => undefined);
+  // Пустой объект, а не undefined: пробуждение отвечает портом, когда его
+  // пришлось узнать у контейнера, и `{}` — это «узнавать не пришлось».
+  const wakeProduct = jest.fn(async (_job: SleepJob): Promise<{ port?: number }> => ({}));
   const sleepFn = jest.fn(async (_ms: number): Promise<unknown> => undefined);
   const logs: string[] = [];
 
@@ -1112,6 +1114,7 @@ describe('боевые зависимости знают все три вида'
       },
       wakeProduct: async (_job, d) => {
         captured.push(d);
+        return {};
       },
     });
 

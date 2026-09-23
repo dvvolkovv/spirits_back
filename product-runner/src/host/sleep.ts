@@ -50,7 +50,7 @@
  * руками. Чинится это в `freePort` — спрашивать надо `HostConfig.PortBindings`
  * у всех контейнеров, включая остановленные, — и сюда не относится.
  */
-import { DEFAULTS, ProvisionDeps, SLUG_RE } from './provision';
+import { CONTAINER_PORT, DEFAULTS, ProvisionDeps, SLUG_RE } from './provision';
 import { ProductKind } from './skeleton';
 
 /**
@@ -100,38 +100,126 @@ export async function sleepProduct(job: SleepJob, deps: ProvisionDeps): Promise<
 }
 
 /**
+ * Порт, на который контейнер УЖЕ привязан, — по данным самого docker.
+ *
+ * ## Почему порт спрашивают у контейнера, а не выбирают заново
+ *
+ * Публикация задаётся один раз, при `docker run`, и `docker start` её не
+ * меняет. То есть у остановленного контейнера есть ровно один порт, на котором
+ * он поднимется, и никакой другой выбор на это не влияет: выбранный заново
+ * свободный порт дал бы домен, смотрящий туда, где никто не слушает, —
+ * ГРОМКИЙ отказ превратился бы в ТИХИЙ, видимый только по молчащему сайту.
+ * Мимо этого не проходит и `freePort`: он спрашивает `docker ps` без `-a`,
+ * поэтому порт спящего продукта считает свободным и с удовольствием вернул бы
+ * его же — совпадение, на которое нельзя опираться.
+ *
+ * ## Почему `HostConfig.PortBindings`, а не `NetworkSettings.Ports`
+ *
+ * ЗАМЕРЕНО на живом docker 29.8.0 (23.09.2026), а не выведено: у
+ * ОСТАНОВЛЕННОГО контейнера `.NetworkSettings.Ports` — пустой объект `{}`
+ * (сетевая песочница при остановке разбирается), а `.HostConfig.PortBindings`
+ * держит `127.0.0.1:18999` как держал. Пробуждение приходит к контейнеру,
+ * который СПИТ, поэтому спрашивать надо второе: первое не вернуло бы ни одного
+ * порта ни разу, и починка была бы мёртвой с первого дня.
+ *
+ * Шаблон с `{{with}}`, а не голый `index`: на отсутствующем отображении (бот
+ * порта не публикует вовсе) голый `index` не печатает пустоту, а валится с
+ * «index of untyped nil» и rc=1 — тоже замерено.
+ */
+async function boundPort(job: SleepJob, deps: ProvisionDeps): Promise<number | undefined> {
+  const format =
+    `{{with index .HostConfig.PortBindings "${CONTAINER_PORT}/tcp"}}`
+    + '{{(index . 0).HostPort}}{{end}}';
+
+  let out: string;
+  try {
+    out = await deps.run(['docker', 'inspect', '--format', format, job.slug]);
+  } catch {
+    // Контейнера нет, docker не ответил, шаблон не разобрался — для нас это
+    // одно и то же: порт не узнан. Сообщение отсюда наружу не тащится
+    // намеренно: причина отказа пробуждения формулируется одна и та же и
+    // ровно одним местом — ниже.
+    return undefined;
+  }
+
+  const port = Number(out.trim());
+  // Пустая выдача даёт 0, мусор — NaN, и ни то, ни другое портом не считается.
+  // Выдумать порт нельзя (см. шапку этой функции), поэтому «не узнал» обязано
+  // отличаться от числа.
+  return Number.isInteger(port) && port > 0 && port < 65536 ? port : undefined;
+}
+
+/**
  * Разбудить: поднять контейнер, дождаться ответа, вернуть домен.
  *
  * Отказ на любом шаге — исключение, а не тихий успех. Сервер на нём оставит
  * продукт спящим и напишет причину в карточку (completeJob разбирает вид
  * задания), а домен останется на честной заглушке.
+ *
+ * ## Возвращает порт — но ТОЛЬКО восстановленный
+ *
+ * ЖИВОЙ ДЕФЕКТ ПРОДА (замерено 23.09.2026). Продукты, заведённые до появления
+ * колонки `port`, хранят в реестре NULL (`demo`, `shop2` от 09.09). Погашенный
+ * такой продукт не поднимался НИКОГДА: задание `wake` падало «нет порта»
+ * каждую минуту, сайт отдавал 503, и кнопка снятия блокировки оказалась
+ * односторонней — узнать об этом можно было только нажав.
+ *
+ * Поэтому порт, узнанный у контейнера, уезжает в отчёт: `completeJob` делает
+ * `UPDATE products SET port = COALESCE($2, port)`, то есть непустой порт в
+ * отчёте лечит строку реестра, и следующее гашение уже обратимо. Молча поднятый
+ * продукт проснулся бы ровно один раз.
+ *
+ * Порт, ПРИЕХАВШИЙ В ЗАДАНИИ, наружу не возвращается: серверу он не новость
+ * (COALESCE запишет то же самое), а `{ ok: true, port: … }` там, где ничего не
+ * менялось, читается в журнале и в теле как «порт откуда-то взялся». Это не
+ * противоречит соседнему доводу у сна: у сна порт не меняется НИКОГДА, а у
+ * пробуждения он может именно появиться — и тогда молчать о нём нельзя.
  */
-export async function wakeProduct(job: SleepJob, deps: ProvisionDeps): Promise<void> {
+export async function wakeProduct(job: SleepJob, deps: ProvisionDeps): Promise<{ port?: number }> {
   assertSlug(job.slug);
   assertKind(job.kind);
+
+  let port = job.kind === 'site' ? job.port ?? undefined : undefined;
+  /** Порт, которого в задании не было. Только он — новость для сервера. */
+  let recovered: number | undefined;
+
+  if (job.kind === 'site' && !port) {
+    recovered = await boundPort(job, deps);
+    port = recovered;
+    if (port !== undefined) {
+      // В журнал хоста: реестр лечится отчётом, и по этой строке видно, что
+      // именно вылечило продукт, который до сих пор не просыпался.
+      deps.onPhase?.(`у сайта ${job.slug} не было порта в задании — взят у контейнера: ${port}`);
+    }
+  }
 
   // Порт проверяется ДО `docker start`: поднимать контейнер, зная, что
   // дождаться его будет нечем, — значит оставить хост в состоянии «работает,
   // но домен на заглушке», и отчитаться об отказе. Хуже, чем не начинать.
-  if (job.kind === 'site' && !job.port) {
-    throw new Error(`у сайта ${job.slug} нет порта — возвращать домен некуда`);
+  if (job.kind === 'site' && !port) {
+    throw new Error(
+      `у сайта ${job.slug} нет порта — возвращать домен некуда: в задании порта нет, `
+        + 'и контейнер своей публикации не назвал',
+    );
   }
 
   await deps.run(['docker', 'start', job.slug]);
 
-  if (job.kind !== 'site') return;
+  if (job.kind !== 'site') return {};
 
   // Опрос ПО ФАКТУ, тот же, что при заведении. Голый TCP-connect здесь
   // бесполезен: порт хоста занимает docker-proxy с момента старта контейнера,
   // и проверка проходила бы, пока внутри не поднялось ничего (замерено в
   // provision.ts). deps.waitPort спрашивает /health и требует 200.
   const timeoutMs = deps.waitPortTimeoutMs ?? DEFAULTS.waitPortTimeoutMs;
-  if (!(await deps.waitPort(job.port as number, timeoutMs))) {
+  if (!(await deps.waitPort(port as number, timeoutMs))) {
     throw new Error(
-      `${job.slug} не ответил на порту ${job.port} за ${Math.round(timeoutMs / 1000)} с `
+      `${job.slug} не ответил на порту ${port} за ${Math.round(timeoutMs / 1000)} с `
         + 'после пробуждения — домен оставлен на заглушке',
     );
   }
 
-  await deps.run([deps.vhostBin ?? DEFAULTS.vhostBin, job.slug, String(job.port)]);
+  await deps.run([deps.vhostBin ?? DEFAULTS.vhostBin, job.slug, String(port)]);
+
+  return recovered === undefined ? {} : { port: recovered };
 }
