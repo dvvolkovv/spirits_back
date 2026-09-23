@@ -19,6 +19,7 @@ import { TalerIdRoomClient } from '../meeting/talerid-room.client';
 import { RESPONSE_STYLE_RULE } from './response-style';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
 import { relaySessionKey } from './relay-session';
+import { productsRelayFields } from './products-relay-fields';
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import axios from 'axios';
@@ -1580,6 +1581,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
           fd.append('talerid_token', tid.token);
           fd.append('talerid_mcp_url', tid.mcpUrl);
         }
+
+        // Инструмент продуктов. В отличие от MCP-инструментов на общей точке,
+        // владелец едет ПОДПИСЬЮ в заголовке, а не подсказкой в промпте:
+        // телефоном в аргументе правились бы чужие сайты.
+        const pf = productsRelayFields(userId);
+        fd.append('products_token', pf.products_token);
+        fd.append('products_mcp_url', pf.products_mcp_url);
 
         const agentRes = await axios.post(`${AGENT_URL}/chat`, fd, {
           headers: fd.getHeaders(),
