@@ -1,0 +1,1277 @@
+#!/usr/bin/env bash
+# Пересобирает образ среды продукта на машине продуктов и пересоздаёт те
+# контейнеры, которые работают на устаревшем образе.
+#
+# Использование:
+#   scripts/product-image-roll.sh [<ssh-цель>]
+#   scripts/product-image-roll.sh root@139.59.210.42
+#   DRY_RUN=1 scripts/product-image-roll.sh root@139.59.210.42
+#   REHEARSE=roll-rehearsal scripts/product-image-roll.sh root@139.59.210.42
+#
+# Переменные:
+#   DRY_RUN=1          напечатать план и НЕ ДЕЛАТЬ НИЧЕГО: ни сборки, ни
+#                      остановки. Единственные команды на машине — inspect/ps
+#   REHEARSE=<имя>     прогнать весь путь на ОДНОРАЗОВОМ контейнере вместо
+#                      клиентских и убрать его за собой
+#   SOURCE_SHA=<sha>   коммит-источник. Умолчание — HEAD бэкенда на проде.
+#                      deploy.sh передаёт сюда тот же коммит, что и агенту
+#   SKIP_AGENT_IDLE_WAIT=1   не ждать, пока агент хоста освободится
+#   HTTP_WAIT_SECONDS / HEARTBEAT_WAIT_SECONDS   окна проверок после пересоздания
+#   SSH_CMD=<чем ходить>     точка подмены: скрипт нечем проверить иначе —
+#                      машины продуктов на тестовом стенде нет
+#
+# Коды возврата:
+#   0  сделано всё
+#   1  красный: проверка не прошла либо отказ до действий
+#   3  ничего не сломано, но сделано НЕ ВСЁ (кого пропустили — в итоге)
+#
+# ── КАКУЮ БЕДУ ЭТО РЕШАЕТ ─────────────────────────────────────────────────────
+#
+# Раннер продукта (product-runner) запечён в образ linkeon-product:base. Образ
+# собран руками 09.09.2026 и НЕ КАТИЛСЯ НИЧЕМ: deploy.sh только проверял, что он
+# существует (product-host-agent-install.sh:156). Контейнеры крутились с того же
+# дня. Значит любая починка раннера до продуктов НЕ ДОЕЗЖАЛА: правка в
+# репозитории, зелёные тесты, выкаченный бэкенд — и ни одного изменения внутри
+# контейнера клиента. Это уже стоило живого дефекта: раннер падал на `git push`,
+# правка ассистентом не работала ни на одном продукте, а починка в репозитории
+# ничего не меняла.
+#
+# Агент хоста (linkeon-host-agent) выкатывается PHASE 4 деплоя и раскладывает
+# ИСХОДНИКИ раннера в /opt/linkeon-host-agent — их же и собирает Dockerfile.
+# То есть код на машине уже свежий; не пересобран только образ и не пересозданы
+# контейнеры. Этим и занят этот скрипт.
+#
+# ── ПОЧЕМУ МЕТКА ОБРАЗА — ЭТО КОММИТ ──────────────────────────────────────────
+#
+# Образ собирается как linkeon-product:<sha12>, и только потом на него
+# переставляется linkeon-product:base. Метка контейнера тогда И ЕСТЬ
+# доказательство, из какого коммита его раннер: `docker inspect` отвечает на
+# вопрос «какой код внутри» без сверки с чем бы то ни было. Тот же приём, что у
+# токена машины (он и есть её личность) и у источника выката в PHASE 4 (он и
+# есть прод-коммит). Единая метка `base` этим свойством не обладает вовсе:
+# «base» на двух машинах — это два разных образа, и отличить их нечем.
+#
+# Чтобы метка не ВРАЛА, исходники раннера на машине сверяются с этим коммитом
+# по содержимому (тот же набор путей, что копирует Dockerfile). Метка, которой
+# нельзя верить, хуже отсутствующей: по ней перестанут проверять.
+#
+# ── ПОЧЕМУ ПЕРЕСОЗДАНИЕ ЧИТАЕТ НАСТРОЙКИ С ЖИВОГО КОНТЕЙНЕРА ──────────────────
+#
+# Собрать `docker run` заново, «как в product-provision.sh», нельзя. В
+# контейнере лежит RUNNER_TOKEN, и его НЕГДЕ ВЗЯТЬ ВТОРОЙ РАЗ: сервер хранит
+# только sha256 (см. шапку product-runner/src/host/sleep.ts — ровно поэтому сон
+# сделан через `docker stop`, а не `docker rm`). Потеряв токен, продукт теряет
+# способность принимать правки навсегда, и заметно это станет не сразу. Рядом с
+# токеном так же молча теряются порт, привязка каталога и лимиты.
+#
+# Поэтому настройки СНИМАЮТСЯ С ЖИВОГО КОНТЕЙНЕРА ДО его удаления:
+#   * порт — из .HostConfig.PortBindings, а НЕ из .NetworkSettings.Ports:
+#     у остановленного контейнера второе ПУСТО (измерено, не выведено);
+#   * привязка каталога — из .Mounts;
+#   * переменные окружения — из .Config.Env ЗА ВЫЧЕТОМ тех, что пришли из
+#     образа, С КОТОРОГО КОНТЕЙНЕР ЗАПУЩЕН. Вернуть переменные образа обратно
+#     флагом -e нельзя: изменись значение по умолчанию в новом образе, старое
+#     молча победило бы новое, и образ перестал бы что-либо значить.
+#
+# Старый контейнер не удаляется, а ПЕРЕИМЕНОВЫВАЕТСЯ (<имя>__pre_<sha12>) и
+# живёт до тех пор, пока новый не доказал, что поднялся. Это единственная копия
+# токена: `docker rm` + оборванный ssh (а здесь они рвутся пачками) = продукт
+# без раннера и без способа его вернуть.
+#
+# ── ПОЧЕМУ ЖИВОЙ ХОД — СТОП-СИГНАЛ ────────────────────────────────────────────
+#
+# Продукт может прямо сейчас выполнять правку (ход в статусе queued/running).
+# `docker stop` посреди хода убивает работу МОЛЧА: пользователь не получит ни
+# ошибки, ни строки в истории, ход останется висеть 'running' до сборщика
+# зависших, а потраченные токены уже списаны. Поэтому перед КАЖДЫМ контейнером
+# спрашивается база прода — тем же способом, каким её спрашивает deploy.sh
+# (запрос целиком исполняется на проде, DATABASE_URL прод не покидает).
+# Занятый продукт ПРОПУСКАЕТСЯ, называется вслух и попадает в итоговый список,
+# а прогон считается выполненным НЕ ПОЛНОСТЬЮ (ненулевой код возврата).
+#
+# ── ЧЕГО СКРИПТ НЕ ДЕЛАЕТ ─────────────────────────────────────────────────────
+#
+#   * НЕ трогает остановленные контейнеры. Остановленный контейнер продукта —
+#     это, скорее всего, СПЯЩИЙ продукт (сон = `docker stop`). Пересоздание
+#     подняло бы его, то есть разбудило бы неоплаченный продукт; а порт спящего
+#     мог уже достаться соседу (известная дыра в freePort, см. sleep.ts), и
+#     тогда `docker run` отказал бы, когда контейнер уже удалён. Спящие
+#     называются в итоге и догоняются следующим прогоном после пробуждения;
+#   * НЕ заводит и НЕ удаляет продукты, НЕ трогает nginx, НЕ ставит агента
+#     хоста — это соседние скрипты;
+#   * НЕ ходит на несколько машин: одна машина за прогон (обход реестра —
+#     дело PHASE 4 в deploy.sh);
+#   * НЕ двигает `base`, если хоть одна проверка покраснела: новые продукты
+#     тогда продолжат заводиться на последнем образе, который доказал, что
+#     работает.
+
+set -euo pipefail
+
+# ── настройки ────────────────────────────────────────────────────────────────
+# Умолчания — как у соседних product-*.sh.
+PROD_HOST="${PROD_HOST:-dvolkov@212.113.106.202}"
+PRODUCTS_HOST="${PRODUCTS_HOST:-root@139.59.210.42}"
+PROD_BACK_PATH="${PROD_BACK_PATH:-/home/dvolkov/spirits_back}"
+
+AGENT_DIR="${AGENT_DIR:-/opt/linkeon-host-agent}"
+IMAGE_REPO="${IMAGE_REPO:-linkeon-product}"
+IMAGE_BASE_TAG="${IMAGE_BASE_TAG:-base}"
+
+DRY_RUN="${DRY_RUN:-}"
+REHEARSE="${REHEARSE:-}"
+SOURCE_SHA="${SOURCE_SHA:-}"
+
+# Сколько ждать, пока агент хоста перестанет брать задания. Тот же предикат и
+# то же умолчание, что у wait_host_agent_idle в deploy.sh: агент посреди
+# provision/sleep/wake зовёт docker по тем же именам контейнеров, и гонка с ним
+# кончается отказом клиентского задания.
+AGENT_IDLE_WAIT_SECONDS="${AGENT_IDLE_WAIT_SECONDS:-900}"
+SKIP_AGENT_IDLE_WAIT="${SKIP_AGENT_IDLE_WAIT:-}"
+
+# Ждать ответа сайта после пересоздания. pm2 поднимает продукт внутри
+# контейнера, и на медленной машине это десятки секунд.
+HTTP_WAIT_SECONDS="${HTTP_WAIT_SECONDS:-90}"
+
+# Ждать сдвига heartbeat. Порог НЕ взят с потолка: touchRunner (turns.service.ts)
+# пишет runner_seen_at УСЛОВНО — не чаще раза в 30 секунд. То есть первый же
+# опрос воскресшего раннера отметку может и не сдвинуть, и окно меньше минуты
+# давало бы ложный красный на исправном продукте.
+HEARTBEAT_WAIT_SECONDS="${HEARTBEAT_WAIT_SECONDS:-180}"
+
+# Точка подмены для прогонов без живых машин: SSH_CMD=echo печатает команды
+# вместо того, чтобы их выполнять. Скрипт нечем проверить иначе — машины
+# продуктов на тестовом стенде нет.
+SSH_CMD="${SSH_CMD:-ssh}"
+
+# Репетиция ходит по заведомо мёртвому адресу, а не на my.linkeon.io: у
+# одноразового контейнера токен случайный, и настоящий адрес он засыпал бы
+# 401-ми в логах прода и в мониторинге.
+REHEARSE_LINKEON_URL="${REHEARSE_LINKEON_URL:-http://127.0.0.1:9}"
+# Диапазон НЕ 8001-8099: там живут продукты (freePort в provision.ts), и
+# репетиция не должна отбирать порт у заводящегося продукта.
+REHEARSE_PORT_FROM="${REHEARSE_PORT_FROM:-18000}"
+REHEARSE_PORT_TO="${REHEARSE_PORT_TO:-18099}"
+# Каталог только для репетиции. Вынесен в переменную не «для гибкости», а
+# чтобы сам скрипт можно было прогнать против подставной машины: настоящий
+# /srv/products заводится root'ом и на маке недоступен.
+REHEARSE_DIR_ROOT="${REHEARSE_DIR_ROOT:-/srv/products}"
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Пути, которые копирует product-runner/docker/Dockerfile. Ими же и только ими
+# собирается контекст сборки, и их же сверяем с коммитом: что проверено — то и
+# уехало в образ.
+CTX_PATHS="package.json package-lock.json tsconfig.json src docker"
+
+# ── печать ───────────────────────────────────────────────────────────────────
+bold() { printf "\033[1m%s\033[0m\n" "$1"; }
+ok()   { printf "\033[32m  ✓ %s\033[0m\n" "$1"; }
+warn() { printf "\033[33m  ! %s\033[0m\n" "$1"; }
+red()  { printf "\033[31m  ✗ %s\033[0m\n" "$1" >&2; }
+die()  { red "$1"; exit 1; }
+plan() { printf "\033[36m  → %s\033[0m\n" "$1"; }
+
+# ⚠ Переменная вплотную перед нелатинским символом — только в фигурных скобках:
+# bash 3.2 (это /bin/bash на маке) приклеивает к имени переменной первый байт
+# следующего многобайтового символа. Та же оговорка, что в deploy.sh.
+
+# ── аргументы ────────────────────────────────────────────────────────────────
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  # До первого раздела «── …», а не по номеру строки: фиксированный диапазон
+  # молча обрезает справку, как только в шапку добавят строку.
+  sed -n '2,/^# ── /p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+TARGET="${1:-$PRODUCTS_HOST}"
+[[ "$TARGET" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$ ]] \
+  || die "ssh-цель «${TARGET}» не похожа на user@host"
+
+if [[ -n "$REHEARSE" ]]; then
+  [[ "$REHEARSE" =~ ^[a-z0-9][a-z0-9-]{1,30}$ ]] \
+    || die "REHEARSE=${REHEARSE}: имя репетиционного контейнера — строчные латинские, цифры и дефис (2-31 символ)"
+fi
+
+# ── общие утилиты ────────────────────────────────────────────────────────────
+
+# sha256 локального файла. На маке нет sha256sum, на серверах нет shasum —
+# скрипт запускают и оттуда, и оттуда. Приём из deploy.sh.
+sha256_local() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# Одинарные кавычки для значения, уезжающего в удалённый скрипт прелюдией.
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# Сборка удалённого скрипта: прелюдия с подставленными значениями + тело из
+# heredoc, которое НЕ проходит раскрытие ни локальным шеллом, ни удалённым.
+rs() { printf '%s\n%s\n' "$1" "$(cat)"; }
+
+# Запуск скрипта на машине. Тело едет base64 В АРГУМЕНТЕ команды, а не через
+# stdin: при обрыве связи (код 255) команда повторяется, и pipe из локальной
+# переменной на второй попытке был бы уже пуст. Тот же приём и по той же
+# причине — в ensure_product_vhost в deploy.sh.
+#
+# ⚠ ПОВТОР БЕЗОПАСЕН НЕ САМ ПО СЕБЕ: удалённые скрипты здесь либо только
+# читают, либо написаны ПОВТОРНО ВХОДИМЫМИ (do_recreate начинается с разбора,
+# в какой точке он находится). Оборванный ssh на середине пересоздания — не
+# гипотеза: соединения рвутся пачками.
+ssh_to() {
+  local host="$1" script="$2" b64 attempt rc
+  b64=$(printf '%s' "$script" | base64 | tr -d '\r\n')
+  for attempt in 1 2 3; do
+    # shellcheck disable=SC2086  # SSH_CMD — точка подмены, допускает флаги
+    $SSH_CMD -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+             -o ConnectTimeout=20 -o ServerAliveInterval=15 \
+             "$host" "printf %s '$b64' | base64 -d | bash -s"
+    rc=$?
+    [[ $rc -ne 255 ]] && return $rc
+    printf "  ! связь с %s оборвалась (255) — повтор %s/3\n" "$host" "$attempt" >&2
+    sleep $(( attempt * 3 ))
+  done
+  return 255
+}
+
+remote()      { ssh_to "$TARGET" "$1"; }
+remote_prod() { ssh_to "$PROD_HOST" "$1"; }
+
+# ── запрос к базе прода ──────────────────────────────────────────────────────
+#
+# СПОСОБ ВЗЯТ У deploy.sh (ph_registry_probe), а не придуман заново, и не ради
+# единообразия:
+#   * запрос целиком исполняется НА ПРОДЕ — строка DATABASE_URL прод не
+#     покидает и не проходит второго раскрытия удалённым шеллом (`$` в пароле
+#     превратился бы в пустоту, пробел — в разрыв команды);
+#   * маркеры BEGIN/END — против баннера, MOTD и предупреждений ssh: без них
+#     первая строка чужого вывода приехала бы данными;
+#   * разделитель полей `-tA` по умолчанию `|` — он не может быть законным ни в
+#     слаге, ни в виде продукта, ни в числе.
+# Диагностика уходит в stderr: stdout этой функции — канал ДАННЫХ, и
+# напечатанное туда попало бы в переменную вместо экрана.
+prod_sql() {
+  local sql="$1" sql64 script raw body rc endline
+  sql64=$(printf '%s' "$sql" | base64 | tr -d '\r\n')
+  script=$(rs "BACK=$(shq "$PROD_BACK_PATH"); SQL64=$(shq "$sql64")" <<'EOS'
+set -u
+cd "$BACK" 2>/dev/null || { echo "SQL_ERR каталога бэкенда $BACK на проде нет"; exit 0; }
+[ -f .env ] || { echo "SQL_ERR $BACK/.env на проде нет"; exit 0; }
+DB=$(sed -n 's/^DATABASE_URL=//p' .env | head -1)
+[ -n "$DB" ] || { echo "SQL_ERR в $BACK/.env нет DATABASE_URL"; exit 0; }
+command -v psql >/dev/null 2>&1 || { echo "SQL_ERR psql на проде не найден"; exit 0; }
+echo SQL_BEGIN
+printf %s "$SQL64" | base64 -d | psql "$DB" -tAX -f - 2>&1
+echo "SQL_END rc=$?"
+EOS
+)
+  if ! raw=$(remote_prod "$script" 2>&1); then
+    red "запрос к базе прода не отправился: $PROD_HOST недоступен"
+    return 1
+  fi
+  if grep -q '^SQL_ERR' <<<"$raw"; then
+    red "спросить базу прода не удалось: $(grep -m1 '^SQL_ERR' <<<"$raw" | sed 's/^SQL_ERR //')"
+    return 1
+  fi
+  # `|| endline=""` ОБЯЗАТЕЛЕН: здесь действует pipefail, и grep без совпадений
+  # отдаёт 1 всему конвейеру. Без заглушки errexit убивал бы скрипт молча ровно
+  # в том случае, ради которого ветка ниже и написана, — когда маркера нет.
+  endline=$(grep -o 'SQL_END rc=[0-9]*' <<<"$raw" | tail -1) || endline=""
+  if ! grep -q '^SQL_BEGIN$' <<<"$raw" || [[ -z "$endline" ]]; then
+    red "база прода не ответила целиком"
+    [[ -n "$raw" ]] && tail -5 <<<"$raw" | sed 's/^/        /' >&2
+    return 1
+  fi
+  rc="${endline##*rc=}"
+  body=$(sed -n '/^SQL_BEGIN$/,/^SQL_END /p' <<<"$raw" | sed '1d;$d')
+  if [[ "$rc" != "0" ]]; then
+    red "psql на проде вернул rc=$rc"
+    [[ -n "$body" ]] && tail -5 <<<"$body" | sed 's/^/        /' >&2
+    return 1
+  fi
+  printf '%s\n' "$body"
+  return 0
+}
+
+# ── итоговые накопители ──────────────────────────────────────────────────────
+# Всё, что пропущено или не сделано, обязано быть названо В КОНЦЕ, а не только
+# в середине вывода: молчание про пропуск и есть тот тихий отказ, ради которого
+# написан весь скрипт.
+DONE_LIST=""      # пересоздано и проверено
+SKIP_BUSY=""      # пропущено из-за живого хода
+SKIP_STOPPED=""   # пропущено: контейнер остановлен (скорее всего спит)
+SKIP_UNKNOWN=""   # пропущено: контейнер не опознан как продукт
+SKIP_NOTREACHED="" # до них не дошли: прогон остановился раньше
+FRESH_LIST=""     # уже на свежем образе — не тронуто
+MAYBE_KILLED=""   # ход появился/остался сразу после гашения — мог быть оборван
+FAILED_NAME=""    # на чём прогон остановился
+BASE_MOVED="нет"
+add() { eval "$1=\"\${$1}\${$1:+, }\$2\""; }
+
+# ═════════════════════════════════════════════════════════════════════════════
+bold "[1/8] машина"
+# ═════════════════════════════════════════════════════════════════════════════
+RUID=""
+# shellcheck disable=SC2086
+if ! RUID=$($SSH_CMD -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=20 "$TARGET" 'id -u' 2>/dev/null | tail -1 | tr -d '[:space:]'); then
+  die "не могу зайти по ssh на $TARGET"
+fi
+# Форма uid проверяется, а не принимается на веру: баннер, MOTD или
+# предупреждение ssh приезжают в тот же поток, и нечисловой «uid» означал бы,
+# что дальше мы так же примем за данные чужой текст. Молча при этом выбралось
+# бы `sudo -n` на root-машине, и все проверки покраснели бы непонятно почему.
+[[ "$RUID" =~ ^[0-9]+$ ]] || die "на $TARGET вместо uid вернулось «${RUID}» — это не ответ машины, а чужой вывод в том же потоке"
+# На хост продуктов ходим root'ом, на стенде — обычным пользователем с
+# NOPASSWD sudo. Логика та же, что в product-host-agent-install.sh.
+if [[ "$RUID" == "0" ]]; then SUDO=""; else SUDO="sudo -n"; fi
+ok "$TARGET, uid=${RUID:-?}${DRY_RUN:+, СУХОЙ ПРОГОН — на машину ничего не пишу}"
+
+HOSTCHK=$(remote "$(rs "SUDO=$(shq "$SUDO"); DIR=$(shq "$AGENT_DIR")" <<'EOS'
+set -u
+miss=""
+for c in docker curl; do command -v "$c" >/dev/null 2>&1 || miss="$miss $c"; done
+[ -d "$DIR" ] || miss="$miss $DIR"
+$SUDO docker info >/dev/null 2>&1 || miss="$miss docker-недоступен"
+echo "MISS=${miss# }"
+EOS
+)") || die "не смог опросить $TARGET"
+MISS=$(sed -n 's/^MISS=//p' <<<"$HOSTCHK" | tail -1)
+[[ -z "$MISS" ]] || die "на машине нет:$MISS — собирать образ нечем.
+      Исходники раннера раскладывает scripts/product-host-agent-install.sh"
+ok "docker и исходники раннера в $AGENT_DIR на месте"
+
+# ═════════════════════════════════════════════════════════════════════════════
+bold "[2/8] коммит-источник: метка образа обязана быть правдой"
+# ═════════════════════════════════════════════════════════════════════════════
+# Умолчание — HEAD БЭКЕНДА НА ПРОДЕ, ровно как resolve_prod_source в deploy.sh:
+# агент хоста (а с ним и исходники раннера) выкатывается именно оттуда, и
+# спрашивать «какой код на машине» надо у того же источника.
+if [[ -z "$SOURCE_SHA" ]]; then
+  # shellcheck disable=SC2086
+  SOURCE_SHA=$($SSH_CMD -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 \
+                 "$PROD_HOST" "cd $PROD_BACK_PATH && git rev-parse HEAD" 2>/dev/null \
+               | tail -1 | tr -d '[:space:]') || SOURCE_SHA=""
+  [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+    || die "не смог прочитать HEAD бэкенда на проде ($PROD_HOST) — из какого коммита раннер, неизвестно.
+      Метку образа тогда не на чем основать. Можно задать явно: SOURCE_SHA=<40 hex>"
+fi
+[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || die "SOURCE_SHA=$SOURCE_SHA — нужно 40 hex"
+SHA12="${SOURCE_SHA:0:12}"
+IMAGE_TAG="$IMAGE_REPO:$SHA12"
+
+git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1 \
+  || die "$REPO_DIR не похож на git-репозиторий — сверить исходники машины не с чем"
+if ! git -C "$REPO_DIR" cat-file -e "${SOURCE_SHA}^{commit}" 2>/dev/null; then
+  echo "      коммита $SHA12 нет локально — тяну из origin"
+  git -C "$REPO_DIR" fetch --quiet origin 2>/dev/null || true
+fi
+git -C "$REPO_DIR" cat-file -e "${SOURCE_SHA}^{commit}" 2>/dev/null \
+  || die "коммита $SOURCE_SHA нет ни локально, ни в origin — прочитать его исходники неоткуда"
+ok "коммит $SHA12, метка образа будет $IMAGE_TAG"
+
+# Выкладка коммита — tar'ом из базы объектов: рабочее дерево (ни наше, ни
+# чужое), индекс и ветки не участвуют. Значит шаг безопасен для параллельных
+# сессий в этом же репозитории, а они тут норма.
+SRC_TMP=$(mktemp -d "${TMPDIR:-/tmp}/linkeon-roll.XXXXXX") || die "не смог создать временный каталог"
+trap 'rm -rf "$SRC_TMP"' EXIT
+git -C "$REPO_DIR" archive --format=tar "$SOURCE_SHA" product-runner 2>/dev/null | tar -xf - -C "$SRC_TMP" \
+  || die "в коммите $SHA12 нет product-runner/ — собирать нечего"
+[[ -f "$SRC_TMP/product-runner/docker/Dockerfile" ]] \
+  || die "в коммите $SHA12 нет product-runner/docker/Dockerfile"
+
+# Манифест: sha256 по каждому файлу из путей, которые копирует Dockerfile.
+# Сравнение ПО СОДЕРЖИМОМУ, а не по времени: rsync установщика привозит чужие
+# mtime, и сравнение по времени объявляло бы расхождение после каждого выката.
+# shellcheck disable=SC2086  # CTX_PATHS — список путей, разбиение намеренное
+local_manifest() (
+  cd "$1"
+  find $CTX_PATHS -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do
+    printf '%s  %s\n' "$(sha256_local "$f")" "$f"
+  done
+)
+WANT_MANIFEST=$(local_manifest "$SRC_TMP/product-runner")
+[[ -n "$WANT_MANIFEST" ]] || die "в выкладке коммита $SHA12 нет ни одного файла из «${CTX_PATHS}»"
+
+HAVE_MANIFEST=$(remote "$(rs "SUDO=$(shq "$SUDO"); DIR=$(shq "$AGENT_DIR"); PATHS=$(shq "$CTX_PATHS")" <<'EOS'
+set -u
+cd "$DIR" || exit 1
+# shellcheck disable=SC2086
+find $PATHS -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do
+  printf '%s  %s\n' "$($SUDO sha256sum "$f" | cut -d' ' -f1)" "$f"
+done
+EOS
+)") || die "не смог прочитать исходники раннера на машине"
+
+if [[ "$WANT_MANIFEST" != "$HAVE_MANIFEST" ]]; then
+  red "исходники раннера в $AGENT_DIR РАЗОШЛИСЬ с коммитом $SHA12"
+  echo "      различия (слева коммит, справа машина):" >&2
+  diff <(printf '%s\n' "$WANT_MANIFEST") <(printf '%s\n' "$HAVE_MANIFEST") \
+    | grep -E '^[<>]' | head -20 | sed 's/^/        /' >&2 || true
+  die "собрать из них образ с меткой $SHA12 значило бы ВЫПИСАТЬ МЕТКЕ ЛОЖЬ: контейнер
+      утверждал бы, что в нём код этого коммита, а в нём был бы чужой.
+      Лечится раскладкой агента из того же коммита:
+        AGENT_SRC=<выкладка $SHA12>/product-runner bash $REPO_DIR/scripts/product-host-agent-install.sh $TARGET
+      либо обычным прогоном deploy.sh (PHASE 4 делает это сама)."
+fi
+ok "исходники раннера на машине совпадают с коммитом $SHA12 по содержимому"
+
+# ═════════════════════════════════════════════════════════════════════════════
+bold "[3/8] что сейчас на машине"
+# ═════════════════════════════════════════════════════════════════════════════
+# Отбор кандидатов идёт по .Config.Image (имя, ЗАПИСАННОЕ ПРИ ЗАПУСКЕ), а не по
+# тому, что печатает `docker ps`: после переезда метки `base` на новый образ
+# `docker ps` у старых контейнеров показывает уже идентификатор, и фильтр по
+# имени образа перестал бы их находить — ровно тех, ради которых всё написано.
+STATE=$(remote "$(rs "SUDO=$(shq "$SUDO"); REPO=$(shq "$IMAGE_REPO"); BASETAG=$(shq "$IMAGE_BASE_TAG")" <<'EOS'
+set -u
+echo "BASE=$($SUDO docker image inspect "$REPO:$BASETAG" --format '{{.Id}}' 2>/dev/null || echo НЕТ)"
+$SUDO docker ps -a --format '{{.Names}}' | while IFS= read -r n; do
+  [ -n "$n" ] || continue
+  $SUDO docker inspect "$n" --format \
+    "CT|$n|{{.State.Status}}|{{.Image}}|{{.Config.Image}}|{{.HostConfig.NetworkMode}}|{{.HostConfig.Privileged}}" 2>/dev/null || true
+done
+EOS
+)") || die "не смог перечислить контейнеры на $TARGET"
+
+BASE_ID=$(sed -n 's/^BASE=//p' <<<"$STATE" | tail -1)
+CONTAINERS=$(grep '^CT|' <<<"$STATE" || true)
+[[ -n "$CONTAINERS" ]] || warn "на машине нет ни одного контейнера"
+echo "      $IMAGE_REPO:$IMAGE_BASE_TAG сейчас = ${BASE_ID:0:19}"
+while IFS='|' read -r _ n st img cfgimg net priv; do
+  [[ -n "$n" ]] || continue
+  printf '        %-16s %-8s %-19s (запущен из %s)\n' "$n" "$st" "${img:0:19}" "$cfgimg"
+done <<<"$CONTAINERS"
+
+# ═════════════════════════════════════════════════════════════════════════════
+bold "[4/8] реестр продуктов на проде"
+# ═════════════════════════════════════════════════════════════════════════════
+# Одним запросом — каталог: вид продукта (у бота нет опубликованного порта, и
+# проверять его HTTP нечем), отметка живости и СЧЁТЧИК АКТИВНЫХ ХОДОВ для плана.
+# Перед самим гашением счётчик перечитывается заново: между планом и действием
+# проходят минуты, и ход может начаться ровно в них.
+CATALOG=$(prod_sql "SELECT p.slug, p.kind, p.status,
+       coalesce(extract(epoch from p.runner_seen_at)::bigint::text, '0'),
+       (SELECT count(*) FROM product_turns t
+         WHERE t.product_id = p.id AND t.status IN ('queued','running'))
+  FROM products p
+ WHERE p.archived_at IS NULL
+ ORDER BY p.slug") || die "реестр продуктов прочитать не удалось — без него нельзя узнать,
+      не идёт ли у продукта правка прямо сейчас. Ни один контейнер не тронут."
+ok "продуктов в реестре (не архивных): $(grep -c . <<<"$CATALOG" || true)"
+
+cat_field() { # cat_field <slug> <номер поля 2..5>
+  awk -F'|' -v s="$1" -v n="$2" '$1 == s { print $n; found=1 } END { if (!found) print "" }' <<<"$CATALOG"
+}
+
+# Свежий вопрос про один продукт — ровно перед тем, как его гасить.
+active_turns() { # active_turns <slug> → число, либо пусто при отказе
+  local out
+  out=$(prod_sql "SELECT (SELECT count(*) FROM product_turns t
+                           WHERE t.product_id = p.id AND t.status IN ('queued','running'))
+                    FROM products p WHERE p.slug = '$1' AND p.archived_at IS NULL") || return 1
+  printf '%s' "$(tr -d '[:space:]' <<<"$out")"
+}
+heartbeat_of() { # heartbeat_of <slug> → epoch, '0' если не отмечался
+  local out
+  out=$(prod_sql "SELECT coalesce(extract(epoch from runner_seen_at)::bigint::text,'0')
+                    FROM products WHERE slug = '$1' AND archived_at IS NULL") || return 1
+  printf '%s' "$(tr -d '[:space:]' <<<"$out")"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+bold "[5/8] репетиция / отбор контейнеров"
+# ═════════════════════════════════════════════════════════════════════════════
+REHEARSE_PORT=""
+if [[ -n "$REHEARSE" ]]; then
+  # Одноразовый контейнер ВМЕСТО клиентских: без него скрипт нечем проверить —
+  # машины продуктов на тестовом стенде нет, а репетировать на demo и shop2
+  # значит репетировать на клиентах.
+  if [[ -n "$(cat_field "$REHEARSE" 2)" ]]; then
+    die "REHEARSE=${REHEARSE} — это слаг ЖИВОГО продукта. Репетиция затёрла бы его контейнер."
+  fi
+  if grep -q "^CT|$REHEARSE|" <<<"$CONTAINERS"; then
+    die "контейнер «${REHEARSE}» на машине уже есть — репетиция заводит свой и убирает за собой.
+      Если это мусор прошлой репетиции: ssh $TARGET '${SUDO:+sudo }docker rm -f $REHEARSE'"
+  fi
+fi
+
+# ── кандидаты ────────────────────────────────────────────────────────────────
+# Кандидат — контейнер, запущенный из образа $IMAGE_REPO:*. В режиме репетиции
+# кандидат ровно один и клиентских среди них нет вовсе.
+CANDIDATES=""
+while IFS='|' read -r _ n st img cfgimg net priv; do
+  [[ -n "$n" ]] || continue
+  if [[ -n "$REHEARSE" ]]; then
+    [[ "$n" == "$REHEARSE" ]] || continue
+  else
+    [[ "$cfgimg" == "$IMAGE_REPO:"* ]] || continue
+  fi
+  CANDIDATES="$CANDIDATES$n|$st|$img|$net|$priv"$'\n'
+done <<<"$CONTAINERS"
+
+# ═════════════════════════════════════════════════════════════════════════════
+bold "[6/8] сборка образа $IMAGE_TAG"
+# ═════════════════════════════════════════════════════════════════════════════
+# Контекст сборки — ВРЕМЕННАЯ КОПИЯ ровно тех путей, что копирует Dockerfile, а
+# не $AGENT_DIR целиком. Две причины, обе измеренные: в каталоге лежат
+# node_modules и dist (101 MiB на 22.09.2026), которые уехали бы в демон ни за
+# чем; и случайный файл, оставшийся от прошлой установки (rsync идёт без
+# --delete), не может попасть в образ, метка которого утверждает, что в нём
+# содержимое коммита.
+NEW_ID=""
+if [[ -n "$DRY_RUN" ]]; then
+  EXIST=$(remote "$(rs "SUDO=$(shq "$SUDO"); TAG=$(shq "$IMAGE_TAG")" <<'EOS'
+set -u
+$SUDO docker image inspect "$TAG" --format '{{.Id}}' 2>/dev/null || echo НЕТ
+EOS
+)") || die "не смог спросить про образ"
+  EXIST=$(tail -1 <<<"$EXIST")
+  plan "собрал бы $IMAGE_TAG из $AGENT_DIR ($CTX_PATHS) и переставил бы на него $IMAGE_REPO:$IMAGE_BASE_TAG"
+  if [[ "$EXIST" != "НЕТ" ]]; then
+    NEW_ID="$EXIST"
+    plan "образ $IMAGE_TAG на машине УЖЕ ЕСТЬ: ${NEW_ID:0:19} — отставшими считаю всё, что не на нём"
+  else
+    plan "образа $IMAGE_TAG на машине ещё нет: его идентификатор заранее неизвестен."
+    plan "  Если сборка даст тот же идентификатор, что у контейнеров сейчас, — не будет тронут НИКТО."
+  fi
+else
+  if [[ -n "$REHEARSE" ]]; then bold "      (репетиция: образ собирается по-настоящему)"; fi
+  BUILD=$(remote "$(rs "SUDO=$(shq "$SUDO"); DIR=$(shq "$AGENT_DIR"); TAG=$(shq "$IMAGE_TAG"); PATHS=$(shq "$CTX_PATHS")" <<'EOS'
+set -u
+CTX=$(mktemp -d /tmp/linkeon-img.XXXXXX) || { echo "BUILD_ERR нет временного каталога"; exit 0; }
+trap 'rm -rf "$CTX"' EXIT
+cd "$DIR" || { echo "BUILD_ERR нет $DIR"; exit 0; }
+# shellcheck disable=SC2086
+$SUDO cp -a $PATHS "$CTX/" 2>/dev/null || { echo "BUILD_ERR не смог собрать контекст из «${PATHS}»"; exit 0; }
+[ -f "$CTX/docker/Dockerfile" ] || { echo "BUILD_ERR в контексте нет docker/Dockerfile"; exit 0; }
+echo BUILD_BEGIN
+# Сборка НЕ глушится: её вывод — единственное, по чему разбирают отказ. Код
+# возврата берётся у самой сборки, а не у `tail`, — `| tail` уже глотал
+# падение сборки на этом проекте, и выкат ехал дальше как ни в чём не бывало.
+$SUDO docker build -f "$CTX/docker/Dockerfile" -t "$TAG" "$CTX" 2>&1
+echo "BUILD_END rc=$?"
+EOS
+)") || die "сборка образа не запустилась на $TARGET"
+  if grep -q '^BUILD_ERR' <<<"$BUILD"; then
+    die "контекст сборки не собрался: $(grep -m1 '^BUILD_ERR' <<<"$BUILD" | sed 's/^BUILD_ERR //')"
+  fi
+  # См. оговорку про pipefail у endline в prod_sql: без заглушки пропавший
+  # маркер (оборванный ssh) убивал бы скрипт вместо того, чтобы сказать об этом.
+  BRC=$(grep -o 'BUILD_END rc=[0-9]*' <<<"$BUILD" | tail -1) || BRC=""
+  BRC="${BRC##*rc=}"
+  if [[ "$BRC" != "0" ]]; then
+    sed -n '/^BUILD_BEGIN$/,/^BUILD_END /p' <<<"$BUILD" | tail -25 | sed 's/^/        /' >&2 || true
+    if [[ -n "$BRC" ]]; then
+      die "docker build вернул rc=$BRC — образ не собран, ни один контейнер не тронут"
+    fi
+    die "маркер конца сборки не приехал (связь оборвалась посреди вывода) — образ считаю несобранным, ни один контейнер не тронут"
+  fi
+  NEW_ID=$(remote "$(rs "SUDO=$(shq "$SUDO"); TAG=$(shq "$IMAGE_TAG")" <<'EOS'
+set -u
+$SUDO docker image inspect "$TAG" --format '{{.Id}}' 2>/dev/null || echo НЕТ
+EOS
+)") || die "не смог прочитать идентификатор собранного образа"
+  NEW_ID=$(tail -1 <<<"$NEW_ID")
+  [[ "$NEW_ID" == sha256:* ]] || die "после сборки образа $IMAGE_TAG нет — docker build отчитался успехом впустую"
+  ok "собран $IMAGE_TAG = ${NEW_ID:0:19}"
+  if [[ "$NEW_ID" == "$BASE_ID" ]]; then
+    ok "идентификатор совпал с нынешним $IMAGE_REPO:$IMAGE_BASE_TAG — образ не изменился"
+  fi
+fi
+
+# Репетиционный контейнер заводится ПОСЛЕ сборки и намеренно НА ДРУГОМ ОБРАЗЕ —
+# производном от свежего (тот же FROM плюс метка). Иначе репетиция не
+# репетирует: если исходники не менялись, сборка даёт тот же идентификатор,
+# контейнер оказывается «уже свежим» и весь путь пересоздания не проверяется.
+if [[ -n "$REHEARSE" && -z "$DRY_RUN" ]]; then
+  bold "      завожу одноразовый контейнер «${REHEARSE}»"
+  SETUP=$(remote "$(rs "SUDO=$(shq "$SUDO"); NAME=$(shq "$REHEARSE"); NEWIMG=$(shq "$NEW_ID"); URL=$(shq "$REHEARSE_LINKEON_URL"); PFROM=$(shq "$REHEARSE_PORT_FROM"); PTO=$(shq "$REHEARSE_PORT_TO"); REPO=$(shq "$IMAGE_REPO"); ROOT=$(shq "$REHEARSE_DIR_ROOT")" <<'EOS'
+set -u
+D="$ROOT/$NAME"
+[ -e "$D" ] && { echo "SETUP_ERR каталог $D уже существует"; exit 0; }
+# Порт ищется среди ВСЕХ контейнеров, включая остановленные (у остановленного
+# .NetworkSettings.Ports пуст, поэтому спрашиваем .HostConfig.PortBindings), и
+# сверх того у слушающих сокетов.
+busy=$($SUDO docker ps -a --format '{{.Names}}' | while IFS= read -r c; do
+         $SUDO docker inspect "$c" --format '{{range $p, $bs := .HostConfig.PortBindings}}{{range $b := $bs}}{{$b.HostPort}}{{println}}{{end}}{{end}}' 2>/dev/null
+       done; ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://')
+PORT=""
+p="$PFROM"
+while [ "$p" -le "$PTO" ]; do
+  if ! printf '%s\n' "$busy" | grep -qx "$p"; then PORT="$p"; break; fi
+  p=$((p+1))
+done
+[ -n "$PORT" ] && [ -n "${PORT#0}" ] || { echo "SETUP_ERR свободного порта в $PFROM-$PTO нет"; exit 0; }
+
+$SUDO mkdir -p "$D" || { echo "SETUP_ERR не смог создать $D"; exit 0; }
+$SUDO tee "$D/package.json" >/dev/null <<PKG
+{ "name": "$NAME", "version": "1.0.0", "private": true,
+  "scripts": { "start": "node server.js", "build": "echo nothing to build" } }
+PKG
+$SUDO tee "$D/server.js" >/dev/null <<'SRV'
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  if (req.url === '/health') { res.writeHead(200, {'content-type':'application/json'}); return res.end('{"ok":true,"sha":"rehearsal"}'); }
+  res.writeHead(200, {'content-type':'text/plain; charset=utf-8'});
+  res.end('linkeon rehearsal container');
+}).listen(PORT);
+SRV
+# entrypoint.sh отказывается стартовать без .git в /product — репетиция обязана
+# пройти тот же путь, что и продукт.
+$SUDO git init -q "$D" \
+  && $SUDO git -C "$D" config user.email 'rehearsal@linkeon.io' \
+  && $SUDO git -C "$D" config user.name 'Linkeon Rehearsal' \
+  && $SUDO git -C "$D" add -A \
+  && $SUDO git -C "$D" commit -qm 'репетиционный каркас' \
+  || { echo "SETUP_ERR не смог сделать чекаут в $D"; exit 0; }
+$SUDO chown -R 1000:1000 "$D"
+
+# Заведомо ОТЛИЧНЫЙ образ: тот же FROM плюс метка. Так контейнер гарантированно
+# отстаёт, и пересоздание проверяется целиком.
+printf 'FROM %s\nLABEL io.linkeon.rehearsal="1"\n' "$NEWIMG" \
+  | $SUDO docker build -q -t "$REPO:rehearse-stale" - >/dev/null 2>&1 \
+  || { echo "SETUP_ERR не смог собрать производный образ для репетиции"; exit 0; }
+
+# Токен случайный: он никуда не подойдёт, раннер будет честно не опознан. Это и
+# есть репетиция МЕХАНИКИ, а не связи с сервером.
+$SUDO docker run -d --name "$NAME" --restart unless-stopped \
+  -v "$D:/product" \
+  -p "127.0.0.1:$PORT:3000" \
+  -e "LINKEON_URL=$URL" \
+  -e "RUNNER_TOKEN=rehearsal-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" \
+  -e CLAUDE_CODE_OAUTH_TOKEN=rehearsal-not-a-real-token \
+  -e PRODUCT_START_SCRIPT=server.js -e PORT=3000 \
+  --memory=1g --cpus=1 "$REPO:rehearse-stale" >/dev/null \
+  || { echo "SETUP_ERR docker run репетиционного контейнера отказал"; exit 0; }
+echo "SETUP_OK port=$PORT"
+EOS
+)") || die "репетиционный контейнер завести не удалось"
+  if ! grep -q '^SETUP_OK' <<<"$SETUP"; then
+    red "$(grep -m1 '^SETUP_ERR' <<<"$SETUP" | sed 's/^SETUP_ERR //')"
+    die "репетиция не началась — клиентские контейнеры не тронуты"
+  fi
+  REHEARSE_PORT=$(sed -n 's/^SETUP_OK port=//p' <<<"$SETUP" | tail -1)
+  ok "репетиционный контейнер «${REHEARSE}» поднят на порту $REHEARSE_PORT из $IMAGE_REPO:rehearse-stale"
+  # Пересобираем список: новый контейнер появился уже после опроса.
+  CANDIDATES=$(remote "$(rs "SUDO=$(shq "$SUDO"); NAME=$(shq "$REHEARSE")" <<'EOS'
+set -u
+$SUDO docker inspect "$NAME" --format \
+  "$NAME|{{.State.Status}}|{{.Image}}|{{.HostConfig.NetworkMode}}|{{.HostConfig.Privileged}}" 2>/dev/null
+EOS
+)") || die "репетиционный контейнер не опрашивается"
+fi
+
+# ── уборка за репетицией ─────────────────────────────────────────────────────
+rehearse_cleanup() {
+  [[ -n "$REHEARSE" && -z "$DRY_RUN" ]] || return 0
+  bold "      убираю за репетицией"
+  local out
+  out=$(remote "$(rs "SUDO=$(shq "$SUDO"); NAME=$(shq "$REHEARSE"); REPO=$(shq "$IMAGE_REPO"); ROOT=$(shq "$REHEARSE_DIR_ROOT")" <<'EOS'
+set -u
+$SUDO docker rm -f "$NAME" >/dev/null 2>&1 || true
+$SUDO docker ps -a --format '{{.Names}}' | grep "^${NAME}__pre_" | while IFS= read -r c; do
+  $SUDO docker rm -f "$c" >/dev/null 2>&1 || true
+done
+$SUDO docker image rm -f "$REPO:rehearse-stale" >/dev/null 2>&1 || true
+$SUDO rm -rf "$ROOT/$NAME"
+echo CLEAN_OK
+EOS
+)" 2>/dev/null) || out=""
+  if [[ "$out" == *CLEAN_OK* ]]; then
+    ok "репетиционный контейнер, каталог и производный образ убраны"
+  else
+    warn "уборка за репетицией НЕ подтвердилась — проверить и убрать руками:"
+    warn "  ssh $TARGET '${SUDO:+sudo }docker rm -f $REHEARSE; ${SUDO:+sudo }rm -rf $REHEARSE_DIR_ROOT/$REHEARSE'"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+bold "[7/8] кто отстал"
+# ═════════════════════════════════════════════════════════════════════════════
+# ── СТРАХОВОЧНЫЕ КОНТЕЙНЕРЫ ПРОШЛЫХ ЗАХОДОВ ──────────────────────────────────
+#
+# <имя>__pre_<sha> остаётся на машине, когда прошлый заход оборвался между
+# переименованием и запуском (ssh здесь рвётся пачками). В этот момент продукт
+# ЛЕЖИТ: контейнера под его собственным именем нет вовсе.
+#
+# Разбирать это ОБЯЗАТЕЛЬНО здесь, а не только внутри do_recreate. Без разбора
+# повторный прогон видел бы лишь остановленный контейнер с незнакомым именем,
+# относил бы его к «спящим продуктам» и шёл мимо — а клиентский продукт так и
+# оставался бы лежать, причём молча. Поймано подставной машиной.
+RESUME=""
+ORPHAN_BACKUPS=""
+while IFS='|' read -r n st img net priv; do
+  [[ -n "$n" ]] || continue
+  case "$n" in *__pre_*) ;; *) continue ;; esac
+  base="${n%%__pre_*}"
+  if grep -q "^CT|$base|" <<<"$CONTAINERS"; then
+    warn "мусор прошлого захода: страховочный $n при живом $base — уберётся при пересоздании"
+    continue
+  fi
+  if [[ "$n" == "${base}__pre_$SHA12" ]]; then
+    warn "$base ЛЕЖИТ: прошлый заход оборвался между переименованием и запуском — доделываю"
+    RESUME="$RESUME$base|$img"$'\n'
+  else
+    # Страховка от ДРУГОГО коммита: её имя мы не построим, и подставлять
+    # наугад чужой контейнер под именем продукта нельзя.
+    add ORPHAN_BACKUPS "$n (продукт $base НЕ ЗАПУЩЕН)"
+  fi
+done <<<"$CANDIDATES"
+
+STALE=""
+while IFS='|' read -r n st img net priv; do
+  [[ -n "$n" ]] || continue
+  # Страховочные разобраны выше и в общий отбор не попадают.
+  case "$n" in *__pre_*) continue ;; esac
+  if [[ "$st" != "running" ]]; then
+    # Остановленный контейнер продукта — это, скорее всего, СПЯЩИЙ продукт.
+    # Поднять его пересозданием значило бы разбудить неоплаченный продукт, а
+    # его порт мог уже достаться соседу (дыра freePort, см. sleep.ts) — тогда
+    # docker run отказал бы, когда контейнер уже удалён.
+    add SKIP_STOPPED "$n ($st)"
+    continue
+  fi
+  if [[ "$net" != "bridge" && "$net" != "default" ]]; then
+    add SKIP_UNKNOWN "$n (сеть $net — воспроизвести не умею)"
+    continue
+  fi
+  if [[ "$priv" == "true" ]]; then
+    add SKIP_UNKNOWN "$n (privileged — воспроизвести не умею)"
+    continue
+  fi
+  if [[ -n "$NEW_ID" && "$img" == "$NEW_ID" ]]; then
+    add FRESH_LIST "$n"
+    continue
+  fi
+  STALE="$STALE$n|$img"$'\n'
+done <<<"$CANDIDATES"
+
+# Недоделанные заходы идут в ту же очередь: do_recreate сам увидит, что
+# контейнера под именем продукта нет, возьмёт настройки со страховочного и
+# доведёт дело до запуска.
+STALE=$(grep -v '^[[:space:]]*$' <<<"$STALE$RESUME" || true)
+if [[ -z "$STALE" ]]; then
+  if [[ -n "$NEW_ID" ]]; then
+    ok "отставших контейнеров нет — все работают на ${NEW_ID:0:19}"
+  else
+    plan "отставших не назову: идентификатор будущего образа неизвестен (см. выше)"
+  fi
+else
+  while IFS='|' read -r n img; do
+    [[ -n "$n" ]] || continue
+    busy=$(cat_field "$n" 5); kind=$(cat_field "$n" 2)
+    if [[ -z "$kind" && "$n" != "$REHEARSE" ]]; then
+      echo "        $n — ОТСТАЛ (${img:0:19}), но в реестре продуктов его нет"
+    else
+      echo "        $n — ОТСТАЛ (${img:0:19}), вид ${kind:-репетиция}, активных ходов ${busy:-0}"
+    fi
+  done <<<"$STALE"
+fi
+
+if [[ -n "$DRY_RUN" ]]; then
+  echo
+  bold "СУХОЙ ПРОГОН — план (ничего не сделано, ни сборки, ни остановки)"
+  plan "собрать $IMAGE_TAG из $AGENT_DIR и переставить на него $IMAGE_REPO:$IMAGE_BASE_TAG"
+  if [[ -n "$REHEARSE" ]]; then
+    plan "завести одноразовый контейнер «${REHEARSE}» ($REHEARSE_DIR_ROOT/$REHEARSE, порт из $REHEARSE_PORT_FROM-$REHEARSE_PORT_TO), прокатить его и убрать"
+  fi
+  if [[ -z "$STALE" ]]; then
+    plan "пересоздавать: НИКОГО"
+  else
+    while IFS='|' read -r n img; do
+      [[ -n "$n" ]] || continue
+      busy=$(cat_field "$n" 5); kind=$(cat_field "$n" 2)
+      if [[ -z "$kind" && "$n" != "$REHEARSE" ]]; then
+        plan "ПРОПУСТИЛ БЫ $n — в реестре продуктов его нет, спросить про живой ход не у кого"
+      elif [[ -n "$busy" && "$busy" != "0" ]]; then
+        plan "ПРОПУСТИЛ БЫ $n — активных ходов $busy (правка идёт прямо сейчас)"
+      else
+        plan "пересоздал бы $n: ${img:0:19} → ${NEW_ID:0:19}${NEW_ID:-(идентификатор будет известен после сборки)}"
+        CAP=$(remote "$(rs "SUDO=$(shq "$SUDO"); NAME=$(shq "$n")" <<'EOS'
+set -u
+IMG=$($SUDO docker inspect "$NAME" --format '{{.Image}}')
+$SUDO docker inspect "$NAME" --format '{{range $p, $bs := .HostConfig.PortBindings}}{{range $b := $bs}}PORT={{if $b.HostIp}}{{$b.HostIp}}:{{end}}{{$b.HostPort}}:{{$p}}{{println}}{{end}}{{end}}'
+$SUDO docker inspect "$NAME" --format '{{range .Mounts}}{{if eq .Type "bind"}}MOUNT={{.Source}}:{{.Destination}}{{if not .RW}}:ro{{end}}{{println}}{{end}}{{end}}'
+echo "LIMITS=memory=$($SUDO docker inspect "$NAME" --format '{{.HostConfig.Memory}}') nanocpus=$($SUDO docker inspect "$NAME" --format '{{.HostConfig.NanoCpus}}') restart=$($SUDO docker inspect "$NAME" --format '{{.HostConfig.RestartPolicy.Name}}')"
+# Имена переменных, которые поедут обратно флагом -e. ЗНАЧЕНИЯ НЕ ПЕЧАТАЮТСЯ:
+# среди них RUNNER_TOKEN и CLAUDE_CODE_OAUTH_TOKEN, и сухому прогону незачем
+# раскладывать их по журналам оператора.
+$SUDO docker inspect "$NAME" --format '{{range .Config.Env}}{{println .}}{{end}}' > /tmp/.roll.env.$$
+$SUDO docker inspect "$IMG" --format '{{range .Config.Env}}{{println .}}{{end}}' > /tmp/.roll.img.$$
+echo "ENVOWN=$(grep -Fxv -f /tmp/.roll.img.$$ /tmp/.roll.env.$$ | sed 's/=.*//' | tr '\n' ' ')"
+echo "ENVFROMIMAGE=$(grep -Fx -f /tmp/.roll.img.$$ /tmp/.roll.env.$$ | sed 's/=.*//' | tr '\n' ' ')"
+rm -f /tmp/.roll.env.$$ /tmp/.roll.img.$$
+EOS
+)") || CAP=""
+        sed 's/^/            /' <<<"$CAP"
+      fi
+    done <<<"$STALE"
+  fi
+  # Пропуски печатаются и в сухом прогоне: сухой прогон затем и нужен, чтобы
+  # увидеть их ЗАРАНЕЕ, а не после того, как машина уже тронута.
+  [[ -n "$ORPHAN_BACKUPS" ]] && red "ПРОДУКТ ЛЕЖИТ, страховка от ДРУГОГО коммита (руками): $ORPHAN_BACKUPS"
+  [[ -n "$SKIP_STOPPED" ]] && plan "НЕ ТРОНУЛ БЫ (контейнер остановлен, скорее всего продукт спит): $SKIP_STOPPED"
+  [[ -n "$SKIP_UNKNOWN" ]] && plan "НЕ ТРОНУЛ БЫ (непонятное устройство контейнера): $SKIP_UNKNOWN"
+  [[ -n "$FRESH_LIST" ]]   && plan "уже на свежем образе, не тронул бы: $FRESH_LIST"
+  echo
+  bold "сухой прогон закончен: на машине ничего не изменено"
+  exit 0
+fi
+
+# ── агент хоста не должен работать параллельно ───────────────────────────────
+# Предикат ДОСЛОВНО тот же, что у сторожа занятости в
+# product-host-agent-install.sh и у wait_host_agent_idle в deploy.sh: строки
+# «[host] задание » за последние 10 минут (серверный PROVISION_DEADLINE_MIN).
+# Разойдись предикаты — «я вижу свободно» и «агент видит занято» означали бы,
+# что мы переименовываем контейнер под его же docker stop.
+if [[ -z "$SKIP_AGENT_IDLE_WAIT" && -n "$STALE" ]]; then
+  bold "      жду, пока агент хоста освободится"
+  waited=0
+  while :; do
+    busy=$(remote "$(rs "SUDO=$(shq "$SUDO")" <<'EOS'
+set -u
+$SUDO systemctl is-active --quiet linkeon-host-agent 2>/dev/null || { echo 0; exit 0; }
+$SUDO journalctl -u linkeon-host-agent --since '-10 min' -o cat 2>/dev/null | grep -c '\[host\] задание ' || true
+EOS
+)" | tail -1 | tr -d '[:space:]') || busy=""
+    [[ "$busy" =~ ^[0-9]+$ ]] || busy=""
+    if [[ "$busy" == "0" ]]; then
+      [[ $waited -gt 0 ]] && ok "агент освободился через ${waited}s"
+      break
+    fi
+    [[ -n "$busy" ]] || die "журнал агента не читается — занятость неизвестна, пересоздавать нельзя"
+    (( waited >= AGENT_IDLE_WAIT_SECONDS )) && die "агент хоста всё ещё берёт задания ($busy шт. за 10 мин) спустя ${waited}s.
+      Он зовёт docker по тем же именам контейнеров (provision/sleep/wake) — гонка с ним
+      кончится отказом клиентского задания. Повторить позже либо SKIP_AGENT_IDLE_WAIT=1."
+    echo "      агент занят ($busy заданий за 10 мин) — жду 30s (${waited}/${AGENT_IDLE_WAIT_SECONDS}s)"
+    sleep 30
+    waited=$(( waited + 30 ))
+  done
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+bold "[8/8] пересоздание"
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Пересоздание ОДНОГО контейнера. Скрипт ПОВТОРНО ВХОДИМ: начинается с разбора,
+# в какой точке он находится, — оборванный на середине ssh (код 255) повторяется
+# вызывающей стороной, и второй заход не должен ни удвоить работу, ни потерять
+# токен.
+do_recreate() { # do_recreate <имя> ; печатает RECREATE:<состояние>
+  local name="$1"
+  # NEWIMG (идентификатор) и NEWTAG (метка) — РАЗНЫЕ вещи, и обе нужны.
+  # Сверяем отставание по ИДЕНТИФИКАТОРУ: метку можно передвинуть, и тогда она
+  # соврала бы. А ЗАПУСКАЕМ ПО МЕТКЕ, и это не косметика: docker записывает
+  # аргумент запуска в .Config.Image, по которому здесь отбираются кандидаты.
+  # Запущенный по идентификатору контейнер выпадал бы из отбора НАВСЕГДА —
+  # следующий выкат считал бы его «не нашим» и молча не трогал, пока раннер
+  # внутри устаревает. Поймано подставной машиной на втором прогоне подряд.
+  remote "$(rs "SUDO=$(shq "$SUDO"); NAME=$(shq "$name"); NEWIMG=$(shq "$NEW_ID"); NEWTAG=$(shq "$IMAGE_TAG"); PRE=$(shq "${name}__pre_$SHA12")" <<'EOS'
+set -u
+have() { $SUDO docker inspect "$1" >/dev/null 2>&1; }
+imgof() { $SUDO docker inspect "$1" --format '{{.Image}}' 2>/dev/null; }
+
+if have "$NAME" && [ "$(imgof "$NAME")" = "$NEWIMG" ]; then
+  # Уже на свежем образе. Возможно, прошлый заход дошёл до конца, но не успел
+  # убрать страховочный контейнер.
+  if have "$PRE"; then $SUDO docker rm -f "$PRE" >/dev/null 2>&1 || true; fi
+  echo RECREATE:ALREADY; exit 0
+fi
+if have "$NAME" && have "$PRE"; then
+  echo RECREATE:AMBIGUOUS; exit 0
+fi
+
+SRC="$NAME"
+if ! have "$NAME"; then
+  if have "$PRE"; then SRC="$PRE"; else echo RECREATE:GONE; exit 0; fi
+fi
+
+# ── СНИМАЕМ НАСТРОЙКИ ДО ЛЮБОГО РАЗРУШЕНИЯ ───────────────────────────────────
+SRCIMG=$(imgof "$SRC")
+[ -n "$SRCIMG" ] || { echo RECREATE:NO_SRC_IMAGE; exit 0; }
+
+T=$(mktemp -d /tmp/linkeon-roll-cap.XXXXXX) || { echo RECREATE:NO_TMP; exit 0; }
+trap 'rm -rf "$T"' EXIT
+
+# Порт — из .HostConfig.PortBindings. .NetworkSettings.Ports у ОСТАНОВЛЕННОГО
+# контейнера ПУСТ (измерено), а мы читаем в том числе после stop на повторном
+# заходе — оттуда порт молча не приехал бы вовсе.
+$SUDO docker inspect "$SRC" --format '{{range $p, $bs := .HostConfig.PortBindings}}{{range $b := $bs}}{{if $b.HostIp}}{{$b.HostIp}}:{{end}}{{$b.HostPort}}:{{$p}}{{println}}{{end}}{{end}}' \
+  | grep -v '^[[:space:]]*$' > "$T/ports" || true
+$SUDO docker inspect "$SRC" --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}:{{.Destination}}{{if not .RW}}:ro{{end}}{{println}}{{end}}{{end}}' \
+  | grep -v '^[[:space:]]*$' > "$T/mounts" || true
+# Привязок в контейнере ровно столько, сколько мы сумели прочитать. Расхождение
+# означает том или монтирование, которое мы воспроизвести не умеем, — и его
+# потеря была бы молчаливой.
+# `grep -c ''`, а НЕ `wc -l`: BSD-шный wc печатает число с ведущими пробелами,
+# и сравнение строк «1» против «       1» объявляло бы непонятным монтирование
+# у совершенно обычного контейнера. Поймано подставной машиной на маке.
+NM=$($SUDO docker inspect "$SRC" --format '{{len .Mounts}}')
+[ "$NM" = "$(grep -c '' "$T/mounts")" ] || { echo RECREATE:MOUNTS_UNSUPPORTED; exit 0; }
+
+# Переменные: контейнерные МИНУС пришедшие из ТОГО ОБРАЗА, С КОТОРОГО КОНТЕЙНЕР
+# ЗАПУЩЕН (не из нового!). Вернуть образные обратно значило бы законсервировать
+# старое значение по умолчанию поверх нового.
+$SUDO docker inspect "$SRC" --format '{{range .Config.Env}}{{println .}}{{end}}' > "$T/env.all"
+NE=$($SUDO docker inspect "$SRC" --format '{{len .Config.Env}}')
+[ "$NE" = "$(grep -c '' "$T/env.all")" ] || { echo RECREATE:ENV_UNREADABLE; exit 0; }
+$SUDO docker inspect "$SRCIMG" --format '{{range .Config.Env}}{{println .}}{{end}}' > "$T/env.img" 2>/dev/null \
+  || { echo RECREATE:OLD_IMAGE_GONE; exit 0; }
+grep -Fxv -f "$T/env.img" "$T/env.all" > "$T/env.own" || true
+
+# Без этих двух раннер не стартует вовсе (loadConfig в product-runner/src/config.ts).
+# Проверяем ДО остановки: потерянный RUNNER_TOKEN не восстановить ничем —
+# сервер хранит только его sha256.
+grep -q '^RUNNER_TOKEN=..*' "$T/env.own" || { echo RECREATE:NO_TOKEN; exit 0; }
+grep -q '^LINKEON_URL=..*' "$T/env.own" || { echo RECREATE:NO_URL; exit 0; }
+
+MEM=$($SUDO docker inspect "$SRC" --format '{{.HostConfig.Memory}}')
+NANO=$($SUDO docker inspect "$SRC" --format '{{.HostConfig.NanoCpus}}')
+RESTART=$($SUDO docker inspect "$SRC" --format '{{.HostConfig.RestartPolicy.Name}}')
+
+# ── РАЗРУШАЮЩАЯ ЧАСТЬ ────────────────────────────────────────────────────────
+if [ "$SRC" = "$NAME" ]; then
+  $SUDO docker stop "$NAME" >/dev/null 2>&1 || { echo RECREATE:STOP_FAILED; exit 0; }
+  # ПЕРЕИМЕНОВАНИЕ, А НЕ УДАЛЕНИЕ: старый контейнер — единственная копия
+  # RUNNER_TOKEN. Пока новый не доказал, что жив, его нельзя терять.
+  $SUDO docker rename "$NAME" "$PRE" || { $SUDO docker start "$NAME" >/dev/null 2>&1 || true; echo RECREATE:RENAME_FAILED; exit 0; }
+  SRC="$PRE"
+fi
+
+set -- docker run -d --name "$NAME"
+[ -n "$RESTART" ] && [ "$RESTART" != "no" ] && set -- "$@" --restart "$RESTART"
+while IFS= read -r m; do [ -n "$m" ] && set -- "$@" -v "$m"; done < "$T/mounts"
+while IFS= read -r p; do [ -n "$p" ] && set -- "$@" -p "$p"; done < "$T/ports"
+while IFS= read -r e; do [ -n "$e" ] && set -- "$@" -e "$e"; done < "$T/env.own"
+[ "$MEM" != "0" ] && set -- "$@" --memory="$MEM"
+[ "$NANO" != "0" ] && set -- "$@" --cpus="$(awk -v n="$NANO" 'BEGIN{printf "%.3f", n/1000000000}')"
+set -- "$@" "$NEWTAG"
+
+if ! $SUDO "$@" >/dev/null 2>"$T/runerr"; then
+  echo "RECREATE:RUN_FAILED $(tr '\n' ' ' < "$T/runerr" | cut -c1-300)"
+  exit 0
+fi
+echo RECREATE:RUN
+EOS
+)"
+}
+
+# Возврат к прежнему контейнеру: новый убираем, страховочный переименовываем
+# обратно и поднимаем. Продукт при этом остаётся на СТАРОМ раннере — то есть
+# отставшим, но живым. Это лучший исход при непрошедшей проверке.
+do_restore() { # do_restore <имя>
+  remote "$(rs "SUDO=$(shq "$SUDO"); NAME=$(shq "$1"); PRE=$(shq "${1}__pre_$SHA12")" <<'EOS'
+set -u
+have() { $SUDO docker inspect "$1" >/dev/null 2>&1; }
+have "$PRE" || { echo RESTORE:NO_BACKUP; exit 0; }
+if have "$NAME"; then $SUDO docker rm -f "$NAME" >/dev/null 2>&1 || { echo RESTORE:RM_FAILED; exit 0; }; fi
+$SUDO docker rename "$PRE" "$NAME" || { echo RESTORE:RENAME_FAILED; exit 0; }
+$SUDO docker start "$NAME" >/dev/null 2>&1 || { echo RESTORE:START_FAILED; exit 0; }
+sleep 3
+[ "$($SUDO docker inspect "$NAME" --format '{{.State.Status}}')" = running ] \
+  && echo RESTORE:OK || echo RESTORE:NOT_RUNNING
+EOS
+)"
+}
+
+drop_backup() { # drop_backup <имя>
+  remote "$(rs "SUDO=$(shq "$SUDO"); PRE=$(shq "${1}__pre_$SHA12")" <<'EOS'
+set -u
+$SUDO docker rm -f "$PRE" >/dev/null 2>&1 || true
+echo DROP_OK
+EOS
+)" >/dev/null 2>&1 || true
+}
+
+# ── проверки «вернулся живым», а не «команда вернула ноль» ───────────────────
+verify_running() { # verify_running <имя>
+  local out
+  out=$(remote "$(rs "SUDO=$(shq "$SUDO"); NAME=$(shq "$1")" <<'EOS'
+set -u
+sleep 5
+echo "STATUS=$($SUDO docker inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null)"
+echo "EXIT=$($SUDO docker inspect "$NAME" --format '{{.State.ExitCode}}' 2>/dev/null)"
+echo "RESTARTING=$($SUDO docker inspect "$NAME" --format '{{.State.Restarting}}' 2>/dev/null)"
+EOS
+)") || { red "не смог опросить контейнер $1"; return 1; }
+  local st; st=$(sed -n 's/^STATUS=//p' <<<"$out" | tail -1)
+  if [[ "$st" != "running" ]]; then
+    red "контейнер $1 не в состоянии running (сейчас «${st:-?}», exit $(sed -n 's/^EXIT=//p' <<<"$out" | tail -1))"
+    return 1
+  fi
+  ok "контейнер $1: running"
+  return 0
+}
+
+verify_http() { # verify_http <имя> <порт-хоста>
+  local out code
+  out=$(remote "$(rs "SUDO=$(shq "$SUDO"); PORT=$(shq "$2"); MAX=$(shq "$HTTP_WAIT_SECONDS")" <<'EOS'
+set -u
+w=0
+while [ "$w" -lt "$MAX" ]; do
+  c=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "http://127.0.0.1:$PORT/" 2>/dev/null || echo 000)
+  if [ "$c" = "200" ]; then echo "HTTP=200 after=${w}s"; exit 0; fi
+  sleep 5; w=$((w+5))
+done
+echo "HTTP=$c after=${w}s"
+EOS
+)") || { red "не смог проверить сайт $1"; return 1; }
+  code=$(sed -n 's/^HTTP=\([0-9]*\).*/\1/p' <<<"$out" | tail -1)
+  if [[ "$code" != "200" ]]; then
+    red "сайт $1 на порту $2 отвечает «${code:-нет ответа}», а не 200 (ждал ${HTTP_WAIT_SECONDS}s)"
+    return 1
+  fi
+  ok "сайт $1 отвечает 200 ($(sed -n 's/.*after=//p' <<<"$out" | tail -1))"
+  return 0
+}
+
+verify_heartbeat() { # verify_heartbeat <слаг> <отметка-до>
+  local before="$2" waited=0 now
+  while (( waited < HEARTBEAT_WAIT_SECONDS )); do
+    now=$(heartbeat_of "$1") || { red "не смог спросить прод про heartbeat $1"; return 1; }
+    if [[ "$now" =~ ^[0-9]+$ ]] && (( now > before )); then
+      ok "раннер $1 достучался до Linkeon (heartbeat сдвинулся на $(( now - before ))s, ждал ${waited}s)"
+      return 0
+    fi
+    sleep 15; waited=$(( waited + 15 ))
+  done
+  red "раннер $1 за ${HEARTBEAT_WAIT_SECONDS}s не отметился на проде (heartbeat как был $before).
+      Продукт не будет получать правки: снаружи это «ассистент молчит»."
+  return 1
+}
+
+# ── обход отставших ──────────────────────────────────────────────────────────
+STOPPED_HARD=""
+if [[ -n "$STALE" ]]; then
+  while IFS='|' read -r name oldimg; do
+    [[ -n "$name" ]] || continue
+    [[ -n "$STOPPED_HARD" ]] && { add SKIP_NOTREACHED "$name"; continue; }
+
+    bold "──────── $name: ${oldimg:0:19} → ${NEW_ID:0:19} ────────"
+    kind=$(cat_field "$name" 2)
+    is_rehearsal=""; [[ "$name" == "$REHEARSE" ]] && is_rehearsal=1
+
+    # ── ЖИВОЙ ХОД — СТОП-СИГНАЛ. Спрашиваем ВПЛОТНУЮ к гашению, а не по плану,
+    #    снятому минуты назад.
+    hb_before=0
+    if [[ -n "$is_rehearsal" ]]; then
+      warn "репетиция: в реестре продуктов её нет — проверки живого хода и heartbeat неприменимы"
+    else
+      if [[ -z "$kind" ]]; then
+        warn "$name: контейнер запущен из $IMAGE_REPO, но продукта с таким слагом в реестре нет"
+        red "пропускаю: спросить, не идёт ли у него правка, НЕ У КОГО — гасить вслепую нельзя"
+        add SKIP_UNKNOWN "$name (нет в реестре продуктов)"
+        continue
+      fi
+      busy=$(active_turns "$name") || { red "не смог спросить прод про ходы $name"; FAILED_NAME="$name"; STOPPED_HARD=1; continue; }
+      if [[ ! "$busy" =~ ^[0-9]+$ ]]; then
+        red "$name: прод не ответил числом активных ходов («${busy}») — гасить вслепую нельзя"
+        add SKIP_BUSY "$name (ответ прода не разобран)"
+        continue
+      fi
+      if (( busy > 0 )); then
+        warn "$name: активных ходов $busy — продукт ПРЯМО СЕЙЧАС выполняет правку"
+        warn "  пропускаю: docker stop убил бы её молча, без ошибки и без строки в истории"
+        add SKIP_BUSY "$name ($busy ход(а) в работе)"
+        continue
+      fi
+      ok "$name: активных ходов нет"
+      hb_before=$(heartbeat_of "$name") || { red "не смог снять heartbeat $name"; FAILED_NAME="$name"; STOPPED_HARD=1; continue; }
+      [[ "$hb_before" =~ ^[0-9]+$ ]] || hb_before=0
+    fi
+
+    # ── пересоздание
+    out=$(do_recreate "$name") || { red "$name: пересоздание не отправилось на машину"; FAILED_NAME="$name"; STOPPED_HARD=1; continue; }
+    # `|| verdict=""` — см. оговорку про pipefail в prod_sql: без неё ветка `*)`
+    # («пересоздание не подтвердилось») не отработала бы НИКОГДА.
+    verdict=$(grep -o '^RECREATE:[A-Z_]*' <<<"$out" | tail -1) || verdict=""
+    case "$verdict" in
+      RECREATE:RUN)      ok "$name: пересоздан из ${NEW_ID:0:19}" ;;
+      RECREATE:ALREADY)  ok "$name: уже на свежем образе — не тронут"; add FRESH_LIST "$name"; continue ;;
+      RECREATE:GONE)     warn "$name: контейнера на машине больше нет"; add SKIP_UNKNOWN "$name (исчез между опросом и действием)"; continue ;;
+      RECREATE:AMBIGUOUS)
+        red "$name: на машине есть И «${name}», И «${name}__pre_${SHA12}» — разобрать, что из них живое, автоматически нельзя"
+        red "  Ничего не тронуто. Смотреть: ssh $TARGET '${SUDO:+sudo }docker ps -a | grep $name'"
+        FAILED_NAME="$name"; STOPPED_HARD=1; continue ;;
+      RECREATE:NO_TOKEN)
+        red "$name: в переменных контейнера нет RUNNER_TOKEN — ПРОПУСКАЮ, контейнер не тронут."
+        red "  Пересоздать его без токена нельзя: сервер хранит только sha256, взять второй раз негде."
+        add SKIP_UNKNOWN "$name (нет RUNNER_TOKEN)"; continue ;;
+      RECREATE:NO_URL)
+        red "$name: в переменных контейнера нет LINKEON_URL — контейнер не тронут"
+        add SKIP_UNKNOWN "$name (нет LINKEON_URL)"; continue ;;
+      RECREATE:MOUNTS_UNSUPPORTED)
+        red "$name: у контейнера есть монтирование, которое я не умею воспроизвести (том вместо bind) — не тронут"
+        add SKIP_UNKNOWN "$name (непонятное монтирование)"; continue ;;
+      RECREATE:ENV_UNREADABLE)
+        red "$name: переменные окружения прочитались не полностью (значение с переводом строки?) — не тронут"
+        add SKIP_UNKNOWN "$name (переменные не разобраны)"; continue ;;
+      RECREATE:OLD_IMAGE_GONE)
+        red "$name: образа, с которого он запущен, на машине больше нет — отделить его переменные от собственных нечем"
+        add SKIP_UNKNOWN "$name (старый образ удалён)"; continue ;;
+      RECREATE:NO_SRC_IMAGE|RECREATE:NO_TMP)
+        red "$name: не смог снять настройки с живого контейнера — не тронут"
+        add SKIP_UNKNOWN "$name (настройки не сняты)"; continue ;;
+      RECREATE:STOP_FAILED)
+        red "$name: docker stop отказал — контейнер не тронут"
+        FAILED_NAME="$name"; STOPPED_HARD=1; continue ;;
+      RECREATE:RENAME_FAILED)
+        red "$name: docker rename отказал; контейнер возвращён в работу под своим именем"
+        FAILED_NAME="$name"; STOPPED_HARD=1; continue ;;
+      RECREATE:RUN_FAILED)
+        red "$name: docker run отказал: $(sed -n 's/^RECREATE:RUN_FAILED //p' <<<"$out" | tail -1)"
+        bold "  возвращаю прежний контейнер"
+        r=$(do_restore "$name") || r="RESTORE:SSH_FAILED"
+        printf '        %s\n' "$r"
+        if [[ "$r" == *RESTORE:OK* ]]; then
+          warn "$name вернулся на СТАРЫЙ образ — живой, но отставший"
+        else
+          red "$name ВЕРНУТЬ НЕ УДАЛОСЬ — разбираться руками, страховочный контейнер: ${name}__pre_$SHA12"
+        fi
+        FAILED_NAME="$name"; STOPPED_HARD=1; continue ;;
+      *)
+        red "$name: пересоздание не подтвердилось, вывод машины:"; sed 's/^/        /' <<<"$out" >&2
+        FAILED_NAME="$name"; STOPPED_HARD=1; continue ;;
+    esac
+
+    # ── ход, появившийся ровно в окне гашения. Он остался бы висеть 'running' до
+    #    сборщика зависших, а пользователь не увидел бы ни ошибки, ни ответа.
+    if [[ -z "$is_rehearsal" ]]; then
+      after=$(active_turns "$name" 2>/dev/null || echo "")
+      if [[ "$after" =~ ^[0-9]+$ ]] && (( after > 0 )); then
+        warn "$name: сразу после гашения у продукта числится активный ход — он мог быть оборван"
+        add MAYBE_KILLED "$name"
+      fi
+    fi
+
+    # ── проверки
+    bad=""
+    verify_running "$name" || bad=1
+    if [[ -z "$bad" ]]; then
+      port=$(remote "$(rs "SUDO=$(shq "$SUDO"); NAME=$(shq "$name")" <<'EOS'
+set -u
+$SUDO docker inspect "$NAME" --format '{{range $p, $bs := .HostConfig.PortBindings}}{{range $b := $bs}}{{$b.HostPort}}{{println}}{{end}}{{end}}' 2>/dev/null | grep -v '^$' | head -1
+EOS
+)" | tail -1 | tr -d '[:space:]') || port=""
+      if [[ "$kind" == "site" || ( -n "$is_rehearsal" && -n "$port" ) ]]; then
+        if [[ -z "$port" ]]; then
+          red "$name: вид продукта «site», но опубликованного порта нет — доказать, что сайт вернулся, нечем"
+          bad=1
+        else
+          verify_http "$name" "$port" || bad=1
+        fi
+      elif [[ "$kind" == "bot" ]]; then
+        echo "      бот: опубликованного порта у него нет, проверка HTTP неприменима"
+      fi
+    fi
+    if [[ -z "$bad" && -z "$is_rehearsal" ]]; then
+      verify_heartbeat "$name" "$hb_before" || bad=1
+    fi
+
+    if [[ -n "$bad" ]]; then
+      bold "  возвращаю прежний контейнер"
+      r=$(do_restore "$name") || r="RESTORE:SSH_FAILED"
+      printf '        %s\n' "$r"
+      if [[ "$r" == *RESTORE:OK* ]]; then
+        warn "$name вернулся на СТАРЫЙ образ — живой, но отставший"
+      else
+        red "$name ВЕРНУТЬ НЕ УДАЛОСЬ. Страховочный контейнер: ${name}__pre_$SHA12 — разбираться руками:"
+        red "  ssh $TARGET '${SUDO:+sudo }docker ps -a | grep $name'"
+      fi
+      red "проверки не прошли — дальше НЕ ИДУ: остальные отставшие не тронуты"
+      FAILED_NAME="$name"; STOPPED_HARD=1; continue
+    fi
+
+    drop_backup "$name"
+    add DONE_LIST "$name"
+  done <<<"$STALE"
+fi
+
+# ── переезд метки base ───────────────────────────────────────────────────────
+# `base` — это образ, на котором заводятся НОВЫЕ продукты (provision.ts:186).
+# Двигаем его ТОЛЬКО если ни одна проверка не покраснела: покрасневшая —
+# единственное имеющееся свидетельство, что образ плох, и новые продукты не
+# должны на него попадать. Пропуски (занятый продукт, спящий контейнер) образ
+# ничем не порочат и переезду не мешают.
+if [[ -z "$STOPPED_HARD" ]]; then
+  MV=$(remote "$(rs "SUDO=$(shq "$SUDO"); TAG=$(shq "$IMAGE_TAG"); BASE=$(shq "$IMAGE_REPO:$IMAGE_BASE_TAG")" <<'EOS'
+set -u
+$SUDO docker tag "$TAG" "$BASE" && echo "TAG_OK $($SUDO docker image inspect "$BASE" --format '{{.Id}}')" || echo TAG_FAILED
+EOS
+)") || MV="TAG_FAILED"
+  if grep -q '^TAG_OK' <<<"$MV"; then
+    BASE_MOVED="да → $IMAGE_TAG"
+    ok "$IMAGE_REPO:$IMAGE_BASE_TAG теперь указывает на $IMAGE_TAG — новые продукты заводятся на нём"
+  else
+    red "не смог переставить метку $IMAGE_REPO:$IMAGE_BASE_TAG — новые продукты продолжат заводиться на прежнем образе"
+    BASE_MOVED="НЕТ (docker tag отказал)"
+  fi
+else
+  BASE_MOVED="НЕТ (прогон красный — новые продукты остаются на прежнем образе)"
+  warn "$IMAGE_REPO:$IMAGE_BASE_TAG НЕ переставлен: проверки покраснели"
+fi
+
+rehearse_cleanup
+
+# ═════════════════════════════════════════════════════════════════════════════
+echo
+bold "════════════════════════ ИТОГ ════════════════════════"
+echo "  машина:            $TARGET"
+echo "  коммит-источник:   $SHA12"
+echo "  образ:             $IMAGE_TAG = ${NEW_ID:0:19}"
+echo "  метка $IMAGE_REPO:$IMAGE_BASE_TAG: $BASE_MOVED"
+echo "  пересоздано:       ${DONE_LIST:-—}"
+echo "  уже было свежим:   ${FRESH_LIST:-—}"
+
+INCOMPLETE=""
+if [[ -n "$SKIP_BUSY" ]]; then
+  INCOMPLETE=1
+  warn "ПРОПУЩЕНО из-за живого хода: $SKIP_BUSY"
+  echo "      Эти продукты остались на СТАРОМ раннере. Повторить, когда правка закончится:"
+  echo "        bash $REPO_DIR/scripts/product-image-roll.sh $TARGET"
+fi
+if [[ -n "$SKIP_STOPPED" ]]; then
+  INCOMPLETE=1
+  warn "ПРОПУЩЕНО (контейнер остановлен, скорее всего продукт спит): $SKIP_STOPPED"
+  echo "      Спящий контейнер не пересоздаётся намеренно: это разбудило бы неоплаченный"
+  echo "      продукт, а его порт мог уже достаться соседу. Догонять после пробуждения."
+fi
+if [[ -n "$SKIP_UNKNOWN" ]]; then
+  INCOMPLETE=1
+  warn "ПРОПУЩЕНО (не опознано как продукт либо непонятное устройство): $SKIP_UNKNOWN"
+fi
+if [[ -n "$ORPHAN_BACKUPS" ]]; then
+  INCOMPLETE=1
+  red "ПРОДУКТ ЛЕЖИТ, а страховка осталась от ДРУГОГО коммита: $ORPHAN_BACKUPS"
+  echo "      Это остаток оборвавшегося захода прошлого выката. Поднять руками:" >&2
+  echo "        ssh $TARGET '${SUDO:+sudo }docker rename <страховка> <имя продукта> && ${SUDO:+sudo }docker start <имя продукта>'" >&2
+fi
+if [[ -n "$MAYBE_KILLED" ]]; then
+  INCOMPLETE=1
+  red "МОГ БЫТЬ ОБОРВАН ХОД: $MAYBE_KILLED"
+  echo "      Ход начался в окне между вопросом к базе и docker stop. Он останется" >&2
+  echo "      'running' до сборщика зависших; пользователю стоит повторить запрос." >&2
+fi
+
+if [[ -n "$STOPPED_HARD" ]]; then
+  echo
+  [[ -n "$SKIP_NOTREACHED" ]] && red "НЕ ДОШЛИ (прогон остановлен раньше): $SKIP_NOTREACHED"
+  red "ПРОГОН КРАСНЫЙ — остановился на «${FAILED_NAME}», остальные отставшие НЕ ТРОНУТЫ"
+  red "  Метка $IMAGE_REPO:$IMAGE_BASE_TAG не переставлена: новые продукты заводятся на прежнем образе."
+  exit 1
+fi
+if [[ -n "$INCOMPLETE" ]]; then
+  echo
+  warn "ПРОГОН ВЫПОЛНЕН НЕ ПОЛНОСТЬЮ — см. списки выше. Ничего не сломано."
+  exit 3
+fi
+echo
+if [[ -n "$REHEARSE" ]]; then
+  ok "РЕПЕТИЦИЯ ПРОЙДЕНА: весь путь отработал на одноразовом контейнере"
+  warn "клиентские контейнеры НЕ ТРОГАЛИСЬ — они по-прежнему на прежнем образе."
+  warn "метка $IMAGE_REPO:$IMAGE_BASE_TAG при этом ПЕРЕСТАВЛЕНА: новые продукты пойдут уже с $IMAGE_TAG."
+  warn "Чтобы догнать клиентов, нужен обычный прогон: bash $REPO_DIR/scripts/product-image-roll.sh $TARGET"
+  exit 0
+fi
+ok "ПРОГОН ВЫПОЛНЕН ПОЛНОСТЬЮ: все контейнеры машины работают на $IMAGE_TAG"
+exit 0
