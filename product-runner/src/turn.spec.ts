@@ -19,6 +19,14 @@ function makeDeps(over: any = {}) {
   return { git, api, runClaude, deploy };
 }
 
+/** Весь текст, который ход отправил клиенту, одной строкой. */
+function eventTexts(api: any): string {
+  return api.sendEvents.mock.calls
+    .flatMap(([, events]: [string, any[]]) => events ?? [])
+    .map((e: any) => e.content ?? e.message ?? '')
+    .join('\n');
+}
+
 const PRODUCT = {
   checkoutPath: '/srv/app',
   buildCmd: 'npm run build',
@@ -150,5 +158,70 @@ describe('проводка ожидаемого sha в деплой', () => {
     expect(d.deploy).toHaveBeenCalledWith(
       expect.objectContaining({ shaBefore: 'sha-куда-возвращаемся' }),
     );
+  });
+});
+
+describe('резервная копия (git push) — место в ходе и цена отказа', () => {
+  const failingPush = () =>
+    makeDeps({
+      git: {
+        push: jest.fn(async () => {
+          throw new Error('fatal: The current branch master has no upstream branch.');
+        }),
+      },
+    });
+
+  it('копия делается ПОСЛЕ сборки и проверки здоровья', async () => {
+    // Измерено на проде 23.09.2026: push стоял перед deploy, упал на
+    // отсутствующем upstream — и ход оборвался ДО сборки. Сайт demo при этом
+    // уже жил изменённым (заголовок сменился), проверка здоровья не
+    // выполнялась вовсе, автооткат не выполнялся, а клиенту сказали «на сайте
+    // всё осталось как было». Порядок здесь — не вкусовщина, а условие того,
+    // что отказ копии вообще безопасно пережить.
+    const d = makeDeps();
+
+    await executeTurn({ turn: TURN, product: PRODUCT, config: {} as any, ...d } as any);
+
+    expect(d.git.push).toHaveBeenCalled();
+    expect(d.deploy.mock.invocationCallOrder[0]).toBeLessThan(d.git.push.mock.invocationCallOrder[0]);
+  });
+
+  it('на откате копия не делается вовсе', async () => {
+    // Откат вернул дерево на прежний коммит — копировать нечего, а отправить
+    // в резерв откаченное состояние значит записать туда «правку», которой
+    // в живом продукте уже нет.
+    const d = makeDeps({ deploy: jest.fn(async () => ({ reverted: true })) });
+
+    await executeTurn({ turn: TURN, product: PRODUCT, config: {} as any, ...d } as any);
+
+    expect(d.git.push).not.toHaveBeenCalled();
+  });
+
+  it('отказ копии не роняет ход: правка уже применена и проверена', async () => {
+    const d = failingPush();
+
+    // resolves, а не голый await: если push снова начнёт ронять ход, тест
+    // обязан покраснеть утверждением, а не аварией теста.
+    await expect(
+      executeTurn({ turn: TURN, product: PRODUCT, config: {} as any, ...d } as any),
+    ).resolves.toBeUndefined();
+
+    // Сайт живёт новой правкой. Сказать «failed» значит соврать клиенту, что
+    // ничего не изменилось.
+    expect(d.api.complete).toHaveBeenCalledWith('t-1', expect.objectContaining({ status: 'done' }));
+  });
+
+  it('отказ копии виден клиенту строкой события', async () => {
+    const d = failingPush();
+
+    // Падение хода здесь гасим намеренно: этот тест меряет ровно одно —
+    // видимость отказа. Про статус хода отвечает тест выше.
+    await executeTurn({ turn: TURN, product: PRODUCT, config: {} as any, ...d } as any).catch(
+      () => undefined,
+    );
+
+    // Проглотить молча нельзя: копии нет, а узнать об этом неоткуда — ровно
+    // так теряется единственный экземпляр кода клиента.
+    expect(eventTexts(d.api)).toMatch(/резервн/i);
   });
 });

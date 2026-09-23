@@ -100,4 +100,18 @@ describe('Git.push', () => {
 
     expect(runs.some((r) => r[0] === 'push')).toBe(true);
   });
+
+  it('пушит `push origin HEAD`, а не голый `push`', async () => {
+    // Форма важна, а тест выше её не различает. Голый `push` требует
+    // upstream-привязки, и её нет: product-backup-setup.sh делает
+    // `push --all origin`, что привязки НЕ создаёт. Измерено на проде
+    // 23.09.2026 — ход падал на «The current branch master has no upstream
+    // branch» у ОБОИХ продуктов с резервной копией, а правился только тот,
+    // у кого копии нет вовсе.
+    const { git, runs } = makeGit({ remote: 'origin\n' });
+
+    await git.push();
+
+    expect(runs).toContainEqual(['push', 'origin', 'HEAD']);
+  });
 });
