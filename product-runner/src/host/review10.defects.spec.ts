@@ -111,7 +111,9 @@ describe('ДЕФЕКТ 3: у провижининга нет срока — за
         api: { poll, complete },
         provision: () => new Promise<{ port?: number }>(() => {}),
         sleepProduct: async () => undefined,
-        wakeProduct: async () => undefined,
+        // Пробуждение отвечает портом, когда его пришлось узнать у контейнера;
+        // здесь узнавать нечего, и `{}` — это «сообщать нечего».
+        wakeProduct: async () => ({}),
         log: () => {},
       };
 
