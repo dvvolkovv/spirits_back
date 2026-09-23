@@ -182,6 +182,29 @@ maybe('инструмент продуктов против живого Postgre
       expect(out.products).toEqual([]);
     });
 
+    // Порядок — часть ответа: ассистент пересказывает список как есть, и
+    // «первый» в его фразе обязан быть самым свежим, а не тем, что Postgres
+    // вернул из кучи. Без ORDER BY порядок не определён вовсе.
+    //
+    // Продуктов ПЯТЬ, а не два, сознательно: на двух строках Postgres может
+    // отдать их в нужном порядке и без сортировки, и тест зеленел бы при
+    // снятой защите. Проверено мутацией — со снятым ORDER BY краснеет.
+    it('свежие продукты идут первыми', async () => {
+      const ids: string[] = [];
+      for (let i = 0; i < 5; i++) {
+        const id = await mkProduct({ name: `Магазин ${i}`, slug: `shop${i}` });
+        await pool.query(
+          `UPDATE products SET created_at = now() - ($2 || ' hour')::interval WHERE id = $1`,
+          [id, String(5 - i)],
+        );
+        ids.push(id);
+      }
+      const svc = new ProductToolService(pg as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'list' });
+      // ids[0] самый старый (−5 ч), ids[4] самый свежий (−1 ч).
+      expect(out.products.map((p: any) => p.id)).toEqual([...ids].reverse());
+    });
+
     it('неизвестное действие — отказ, а не молчание', async () => {
       const svc = new ProductToolService(pg as any, {} as any);
       const out: any = await svc.execute(OWNER, { action: 'delete' });
@@ -262,6 +285,11 @@ maybe('инструмент продуктов против живого Postgre
     it('без текста правки ход не ставится', async () => {
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
       const svc = new ProductToolService(pg as any, realTurns());
+      // Потолок в ноль — ради ВНЯТНОСТИ красного, тем же приёмом, что в тесте
+      // про уточнение. Измерено: со снятым .trim() ход ставится, тест уходит в
+      // боевое ожидание (150 с) и умирает на таймауте jest в 60 с, рапортуя
+      // «Exceeded timeout» вместо «поставлен ход, которого быть не должно».
+      (svc as any).waitMs = 0;
       const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: '  ' });
       expect(out.ok).toBe(false);
       expect(out.reason).toBe('no_prompt');
