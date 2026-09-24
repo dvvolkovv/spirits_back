@@ -19,9 +19,17 @@ RUN npx tsc -p tsconfig.json
 # --- образ среды продукта ---
 FROM node:22-bookworm-slim
 
+# procps (ps) нужен pm2, а не людям. pm2 7 гасит процесс своим TreeKill, и тот
+# зовёт `ps -e -o pid=,ppid=`. Без ps spawn падает с ENOENT, обратный вызов
+# срабатывает дважды (на 'error' и на 'close'), и `pm2 restart` запускает продукт
+# ДВАЖДЫ: одна копия занимает порт и выпадает из учёта pm2, вторая крутится в
+# EADDRINUSE до errored. Сирота отдаёт сайт мимо pm2 и переживает и перезапуск, и
+# откат. Так было на demo 23.09.2026 (откаченная правка осталась на сайте); на
+# пробе 24.09.2026 без procps сирота появлялась на КАЖДОМ рестарте живого
+# продукта — от агента и от раннера одинаково, с procps — ни разу.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      git ca-certificates curl tini python3 build-essential \
+      git ca-certificates curl tini python3 build-essential procps \
  && rm -rf /var/lib/apt/lists/*
 
 # PM2 управляет продуктом, claude — правит его код.
