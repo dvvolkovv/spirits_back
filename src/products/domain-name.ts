@@ -75,7 +75,14 @@ export function normalizeDomain(raw: unknown): NormalizeResult {
   if (ascii.length > 253 || !ascii.split('.').every((label) => LABEL.test(label))) return refuse('bad_form');
 
   if (ascii === OUR_ZONE || ascii.endsWith(`.${OUR_ZONE}`)) return refuse('our_zone');
-  const info = parse(ascii);
+  // Регистрационные зоны FAITID (spb.ru, msk.ru, com.ru и другие) лежат в
+  // PRIVATE-разделе публичного списка суффиксов, а не в ICANN-разделе; tldts
+  // по умолчанию PRIVATE не читает (allowPrivateDomains: false). Без опции
+  // firm.spb.ru считался бы поддоменом зоны spb.ru: получил бы CNAME на
+  // корне ЧУЖОЙ настоящей зоны (запрещено стандартом) и не получил бы www.
+  // Побочный эффект: приватные суффиксы вида github.io тоже становятся
+  // границей зоны — безвредно, DNS там пользователь всё равно не настраивает.
+  const info = parse(ascii, { allowPrivateDomains: true });
   if (info.isIp) return refuse('ip');
   if (!info.domain || !info.publicSuffix || !info.domainWithoutSuffix) return refuse('bad_form');
 
