@@ -121,39 +121,105 @@ maybe('миграция 008: свой домен', () => {
     // намерение задания 'domain' агент читает по domain/names, и оба
     // инварианта здесь защищают ровно это чтение от рассинхрона с реальностью.
 
-    it('домен приводится к нижнему регистру: индекс занятости сравнивает байты', async () => {
-      const id = await mkProduct('shop');
-      await expect(
-        pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'A.ru', '{A.ru}', 'lk')`, [id]),
-      ).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_domain_lower' });
+    describe('форма домена (product_domains_domain_form)', () => {
+      it('верхний регистр не проходит форму', async () => {
+        const id = await mkProduct('shop');
+        await expect(
+          pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'A.ru', '{A.ru}', 'lk')`, [id]),
+        ).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_domain_form' });
+      });
+
+      it('точка на конце (FQDN-нотация) не проходит форму', async () => {
+        const id = await mkProduct('shop');
+        await expect(
+          pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'a.ru.', '{a.ru.}', 'lk')`, [id]),
+        ).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_domain_form' });
+      });
+
+      it('юникод-домен не проходит форму: обязан приезжать в punycode', async () => {
+        const id = await mkProduct('shop');
+        await expect(
+          pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'пример.рф', '{пример.рф}', 'lk')`, [id]),
+        ).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_domain_form' });
+      });
+
+      it('punycode-домен проходит форму', async () => {
+        const id = await mkProduct('shop');
+        await expect(
+          pool.query(
+            `INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'xn--e1afmkfd.xn--p1ai', '{xn--e1afmkfd.xn--p1ai}', 'lk')`,
+            [id],
+          ),
+        ).resolves.toBeDefined();
+      });
+
+      it('поддомен третьего уровня проходит форму', async () => {
+        const id = await mkProduct('shop');
+        await expect(
+          pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'shop.a.ru', '{shop.a.ru}', 'lk')`, [id]),
+        ).resolves.toBeDefined();
+      });
     });
 
-    it('пустой names — не задание на привязку, а мусор в схеме', async () => {
-      const id = await mkProduct('shop');
-      await expect(
-        pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'a.ru', '{}', 'lk')`, [id]),
-      ).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_names_shape' });
-    });
+    describe('форма names (product_domains_names_shape)', () => {
+      it('пустой names — не задание на привязку, а мусор в схеме', async () => {
+        const id = await mkProduct('shop');
+        await expect(
+          pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'a.ru', '{}', 'lk')`, [id]),
+        ).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_names_shape' });
+      });
 
-    it('первое имя обязано совпадать с доменом — иначе агент выпустит сертификат не на тот домен', async () => {
-      const id = await mkProduct('shop');
-      await expect(
-        pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'a.ru', '{b.ru}', 'lk')`, [id]),
-      ).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_names_shape' });
-    });
+      it('первое имя обязано совпадать с доменом — иначе агент выпустит сертификат не на тот домен', async () => {
+        const id = await mkProduct('shop');
+        await expect(
+          pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'a.ru', '{b.ru}', 'lk')`, [id]),
+        ).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_names_shape' });
+      });
 
-    it('второе имя — только www от того же домена, а не произвольный поддомен', async () => {
-      const id = await mkProduct('shop');
-      await expect(
-        pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'a.ru', '{a.ru,x.a.ru}', 'lk')`, [id]),
-      ).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_names_shape' });
-    });
+      it('второе имя — только www от того же домена, а не произвольный поддомен', async () => {
+        const id = await mkProduct('shop');
+        await expect(
+          pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'a.ru', '{a.ru,x.a.ru}', 'lk')`, [id]),
+        ).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_names_shape' });
+      });
 
-    it('корень плюс www — валидная форма и проходит оба инварианта', async () => {
-      const id = await mkProduct('shop');
-      await expect(
-        pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'a.ru', '{a.ru,www.a.ru}', 'lk')`, [id]),
-      ).resolves.toBeDefined();
+      it('корень плюс www — валидная форма и проходит оба инварианта', async () => {
+        const id = await mkProduct('shop');
+        await expect(
+          pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'a.ru', '{a.ru,www.a.ru}', 'lk')`, [id]),
+        ).resolves.toBeDefined();
+      });
+
+      // Дыра NULL: у CHECK НЕИЗВЕСТНО — это проход, а `=` с NULL-элементом
+      // всегда даёт NULL. Четыре разных способа получить такой NULL, ни один
+      // не должен проходить.
+      it('явный NULL первым элементом', async () => {
+        const id = await mkProduct('shop');
+        await expect(
+          pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'a.ru', '{NULL}', 'lk')`, [id]),
+        ).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_names_shape' });
+      });
+
+      it('явный NULL вторым элементом', async () => {
+        const id = await mkProduct('shop');
+        await expect(
+          pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'a.ru', '{a.ru,NULL}', 'lk')`, [id]),
+        ).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_names_shape' });
+      });
+
+      it('двумерный массив: names[1] без второго индекса читается как NULL', async () => {
+        const id = await mkProduct('shop');
+        await expect(
+          pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'a.ru', '{{a.ru}}', 'lk')`, [id]),
+        ).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_names_shape' });
+      });
+
+      it('нижняя граница не 1: names[1] вне диапазона, тоже NULL', async () => {
+        const id = await mkProduct('shop');
+        await expect(
+          pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'a.ru', '[2:2]={a.ru}', 'lk')`, [id]),
+        ).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_names_shape' });
+      });
     });
   });
 });
