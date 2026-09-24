@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   ForbiddenException,
   Get,
   Logger,
@@ -19,6 +20,7 @@ import { TurnsService } from './turns.service';
 import { TurnEventsService } from './turn-events.service';
 import { ProvisioningService } from './provisioning.service';
 import { BlockService } from './block.service';
+import { DomainsService } from './domains.service';
 import { assertUuid, CreateProductDto } from './products.dto';
 
 @Controller('')
@@ -32,6 +34,7 @@ export class ProductsController {
     private readonly turnEvents: TurnEventsService,
     private readonly provisioning: ProvisioningService,
     private readonly blocks: BlockService,
+    private readonly domains: DomainsService,
   ) {}
 
   /**
@@ -239,6 +242,36 @@ export class ProductsController {
     assertUuid(id, 'Product');
     await this.provisioning.retry(id, user.userId);
     return { ok: true };
+  }
+
+  /**
+   * Свой домен продукта. Владелец — из токена (`@CurrentUser`), продукт ищется
+   * с `user_id` в WHERE внутри сервиса. Тело — только `{ domain }`: поле
+   * userId в нём ничего не значит. Отказы сервиса приходят с кодом причины
+   * (`reason`) — по нему кабинет переводит ошибку.
+   */
+  @Get('products/:id/domain')
+  async getDomain(@CurrentUser() user: any, @Param('id') id: string) {
+    assertUuid(id, 'Product');
+    return { domain: await this.domains.get(user.userId, id) };
+  }
+
+  @Post('products/:id/domain')
+  async attachDomain(@CurrentUser() user: any, @Param('id') id: string, @Body() body: { domain?: string }) {
+    assertUuid(id, 'Product');
+    return { domain: await this.domains.attach(user.userId, id, body?.domain) };
+  }
+
+  @Post('products/:id/domain/check')
+  async checkDomain(@CurrentUser() user: any, @Param('id') id: string) {
+    assertUuid(id, 'Product');
+    return { domain: await this.domains.check(user.userId, id) };
+  }
+
+  @Delete('products/:id/domain')
+  async detachDomain(@CurrentUser() user: any, @Param('id') id: string) {
+    assertUuid(id, 'Product');
+    return this.domains.detach(user.userId, id);
   }
 
   @Get('products/:id/turns')

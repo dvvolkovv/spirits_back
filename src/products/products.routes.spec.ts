@@ -244,6 +244,15 @@ describe('адреса маршрутов', () => {
     expect(endpointOf(ProductsController, 'retry')).toBe('POST /webhook/products/:id/retry');
   });
 
+  it('ручки своего домена стоят по адресам, которые зовёт кабинет', () => {
+    // Адреса — контракт с ДРУГИМ репозиторием (spirits_front, productsApi.ts),
+    // поэтому сверяются с литералом.
+    expect(endpointOf(ProductsController, 'getDomain')).toBe('GET /webhook/products/:id/domain');
+    expect(endpointOf(ProductsController, 'attachDomain')).toBe('POST /webhook/products/:id/domain');
+    expect(endpointOf(ProductsController, 'checkDomain')).toBe('POST /webhook/products/:id/domain/check');
+    expect(endpointOf(ProductsController, 'detachDomain')).toBe('DELETE /webhook/products/:id/domain');
+  });
+
   it('гашение и снятие стоят по своим адресам и не съедают друг друга', () => {
     // Адрес здесь — не формальность: кнопки у этих маршрутов нет вовсе (общего
     // списка продуктов у администратора нет, решение владельца от 21.09.2026),
