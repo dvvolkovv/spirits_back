@@ -3,7 +3,7 @@ import * as crypto from 'crypto';
 import { domainToUnicode } from 'url';
 import { PgService } from '../common/services/pg.service';
 import { DomainRefusal, normalizeDomain, registrableZone, relativeName } from './domain-name';
-import { checkDns, DnsResolver, publicResolver, RecordCheck, TXT_LABEL } from './domain-dns';
+import { checkDns, DnsResolver, probeResolver, publicResolver, RecordCheck, TXT_LABEL } from './domain-dns';
 
 export type DomainStatus = 'awaiting_dns' | 'issuing' | 'active' | 'failed' | 'removing';
 
@@ -106,12 +106,26 @@ export const CHECK_THROTTLE_S = 30;
 /** Повторных выпусков после отказа в час. Предел Let's Encrypt — 5 неудач в час на имя. */
 export const RETRIES_PER_HOUR = 3;
 /**
- * Заданий domain у продукта за час, после которых выпуск ждёт. Защищает
- * учётную запись Let's Encrypt от цикла «привязал → выпустил → отвязал →
- * привязал»: недельный предел дублей сертификата на один набор имён — 5.
- * Считаются и задания отвязки: цикл из них и состоит.
+ * Заданий domain у продукта за час, после которых выпуск ждёт. Предел
+ * бережёт частоту заказов по учётной записи Let's Encrypt машины — она одна
+ * на все продукты машины, и её пределы делят все, — и не даёт одному
+ * продукту гонять выпуски циклом «привязал → выпустил → отвязал →
+ * привязал». Считаются и задания отвязки: цикл из них и состоит.
+ *
+ * От недельного предела дублей сертификата (5 на один набор имён) он НЕ
+ * защищает: 6 заданий в час — это до 3 выпусков в час, и неделя выбирается
+ * за ~2 часа. Но дубли бьют только по именам самого пользователя, чужие
+ * продукты они не задевают.
+ *
+ * Считается по product_provision_jobs без своего индекса: таблица заданий
+ * маленькая. Вырастет — понадобится индекс (product_id, created_at).
  */
 export const DOMAIN_JOBS_PER_HOUR = 6;
+/**
+ * Заведомо живое имя для контрольного запроса резолвера (probeResolver) —
+ * наш собственный домен.
+ */
+export const RESOLVER_PROBE_NAME = 'linkeon.io';
 
 /**
  * Окно повторов открыто: прошлое окно старше часа (тогда оно начнётся
@@ -245,8 +259,12 @@ interface CheckRun {
   row: DomainRow | null;
   /** Исход выпуска; null — выпуск не просился (DNS не готов, в строке проверка свежее, заявку сменили). */
   issue: IssueOutcome | null;
-  /** Коды сбоя, если резолвер упал на КАЖДОЙ записи (DNS не ответил вовсе), иначе null. */
-  resolverDown: string | null;
+  /**
+   * Коды сбоя, если сбой на КАЖДОЙ записи, иначе null. Чей это сбой — зоны
+   * пользователя или нашего резолвера — отсюда не видно: различает
+   * контрольный запрос оборота (checkPending).
+   */
+  allFailed: string | null;
 }
 
 type Tick = 'pending' | 'orphans';
@@ -660,7 +678,7 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
       const dns = await checkDns({ domain: row.domain, names: row.names, token: row.token, hostIp: p.host_ip }, this.resolver);
       return { started: at, result: dns };
     });
-    const resolverDown = result.records.every((c) => c.error)
+    const allFailed = result.records.every((c) => c.error)
       ? [...new Set(result.records.map((c) => c.error))].join(',')
       : null;
     const saved = await this.pg.query(
@@ -673,7 +691,7 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
       // Заявки нет или она другая — null. Та же заявка — значит, в ней уже
       // лежит проверка, стартовавшая позже нашей: отвечаем ею, без выпуска.
       const cur = await this.rowOf(row.product_id);
-      return { row: cur?.token === row.token ? cur : null, issue: null, resolverDown };
+      return { row: cur?.token === row.token ? cur : null, issue: null, allFailed };
     }
     const expected = row.status;
     let issue: IssueOutcome | null = null;
@@ -681,7 +699,7 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
       issue = await this.tryIssue(row.product_id, row.token, expected);
     }
     const fresh = await this.rowOf(row.product_id);
-    return { row: fresh?.token === row.token ? fresh : null, issue, resolverDown };
+    return { row: fresh?.token === row.token ? fresh : null, issue, allFailed };
   }
 
   /**
@@ -788,9 +806,13 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
    * лог, оборот идёт дальше; null от runCheck (заявку за это время сменили) —
    * пропуск. Остановка модуля (stopped) — следующую заявку воркеры не берут.
    *
-   * В обычной работе оборот молчит. Одна сводная строка — если резолвер не
-   * ответил ни одной заявке оборота: признак, что с машины недоступны
-   * 1.1.1.1 и 8.8.8.8, а не того, что DNS у всех разом не готов.
+   * В обычной работе оборот молчит. Сбой у всех заявок оборота — ещё не наш
+   * сбой: SERVFAIL значит, что резолвер ответил, а битая — зона
+   * пользователя, ETIMEOUT бывает от мёртвого сервера его зоны; одна такая
+   * заявка писала бы строку на каждом обороте до семи суток. Поэтому тогда —
+   * ОДИН контрольный запрос через тот же резолвер к заведомо живому имени
+   * (RESOLVER_PROBE_NAME), и сводная строка — только если не ответил и он:
+   * это и есть наш сетевой сбой, с машины недоступны 1.1.1.1 и 8.8.8.8.
    *
    * Возвращает, сколько заявок взято в оборот.
    */
@@ -812,8 +834,8 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
     const rows: any[] = r.rows;
     let taken = 0;
     let checked = 0;
-    const down = new Set<string>();
-    let downCount = 0;
+    const codes = new Set<string>();
+    let failedAll = 0;
     const worker = async () => {
       while (!this.stopped && taken < rows.length) {
         const row = rows[taken++];
@@ -829,9 +851,9 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
         try {
           const run = await this.runCheck(row, p);
           checked++;
-          if (run.resolverDown) {
-            downCount++;
-            down.add(run.resolverDown);
+          if (run.allFailed) {
+            failedAll++;
+            codes.add(run.allFailed);
           }
         } catch (e: any) {
           this.logger.warn(`проверка DNS ${row.domain}: ${e?.message ?? e}`);
@@ -839,11 +861,14 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
       }
     };
     await Promise.all(Array.from({ length: Math.min(PENDING_PARALLEL, rows.length) }, worker));
-    if (checked > 0 && downCount === checked) {
-      this.logger.warn(
-        `проверка DNS: резолвер не ответил ни одной из ${checked} заявок оборота (${[...down].join('; ')}) — ` +
-          `с машины недоступны 1.1.1.1 и 8.8.8.8?`,
-      );
+    if (checked > 0 && failedAll === checked) {
+      const probe = await probeResolver(this.resolver, RESOLVER_PROBE_NAME);
+      if (probe) {
+        this.logger.warn(
+          `проверка DNS: сбой у всех ${checked} заявок оборота (${[...codes].join('; ')}), и контрольный запрос ` +
+            `${RESOLVER_PROBE_NAME} без ответа (${probe}) — с машины недоступны 1.1.1.1 и 8.8.8.8`,
+        );
+      }
     }
     return taken;
   }

@@ -3,7 +3,7 @@ import { Pool } from 'pg';
 import * as fs from 'fs';
 import * as path from 'path';
 import { MIGRATIONS } from './products.service';
-import { DOMAIN_TICK_MS, DomainsService, RECONCILE_TICK_MS } from './domains.service';
+import { DOMAIN_TICK_MS, DomainsService, RECONCILE_TICK_MS, RESOLVER_PROBE_NAME } from './domains.service';
 import { DnsResolver, TXT_LABEL } from './domain-dns';
 
 const PG = process.env.PROVISIONING_PG_URL;
@@ -1407,10 +1407,48 @@ maybe('свой домен: сервис против живого Postgres', ()
       expect(warn).toHaveBeenCalledWith(expect.stringMatching(/bad\.ru.*обрыв соединения/));
     });
 
-    // Резолвер не ответил НИ ОДНОЙ заявке — это не «DNS у всех не готов», а
-    // недоступные с машины 1.1.1.1/8.8.8.8. Одна сводная строка за оборот; в
-    // обычной работе — тишина.
-    it('в обычной работе оборот молчит; резолвер не ответил никому — одна сводная строка', async () => {
+    const failWith = (code: string) => () => Promise.reject(Object.assign(new Error(code), { code }));
+    /** Резолвер, у которого контрольное имя `probe` отвечает по-своему, а все прочие имена — `rest`. */
+    const withProbe = (probe: () => Promise<string[]>, rest: (n: string) => Promise<any>, counter: { probes: number }) => ({
+      resolve4: (n: string) => {
+        if (n !== RESOLVER_PROBE_NAME) return rest(n);
+        counter.probes++;
+        return probe();
+      },
+      resolve6: rest,
+      resolveTxt: rest,
+    });
+
+    // Сбой проверки у всех заявок ещё не значит, что недоступен наш резолвер:
+    // SERVFAIL — ответ резолвера про битую зону пользователя, ETIMEOUT бывает
+    // от мёртвого сервера его зоны. Без контрольного запроса одна такая
+    // заявка писала бы «недоступны 1.1.1.1 и 8.8.8.8» на каждом обороте до
+    // семи суток (E5 ревью).
+    it('сбой у всех заявок, а контрольный запрос отвечает, — зоны пользователей, не наш сбой: оборот молчит', async () => {
+      for (let i = 0; i < 2; i++) {
+        const id = await mkProduct({ slug: `shop${i}` });
+        await putDomain(id, 'awaiting_dns', { domain: `d${i}.ru`, token: `lk-${i}` });
+      }
+      const s = svc();
+      const warn = jest.spyOn((s as any).logger, 'warn').mockImplementation(() => undefined);
+      const counter = { probes: 0 };
+      // d0.ru — зона отвечает SERVFAIL на всё, d1.ru — сервер зоны мёртв.
+      (s as any).resolver = withProbe(
+        () => Promise.resolve(['185.4.75.22']),
+        (n: string) => (n.endsWith('d0.ru') ? failWith('ESERVFAIL')() : failWith('ETIMEOUT')()),
+        counter,
+      );
+      for (let pass = 1; pass <= 2; pass++) {
+        await expect(s.checkPending()).resolves.toBe(2);
+        expect(warn).not.toHaveBeenCalled();
+        expect(counter.probes).toBe(pass); // один контрольный запрос на оборот
+      }
+    });
+
+    // Не ответил и контрольный запрос — это уже наш сетевой сбой: одна
+    // сводная строка за оборот. В обычной работе — тишина и ни одного
+    // контрольного запроса.
+    it('в обычной работе оборот молчит; не ответил и контрольный запрос — ровно одна сводная строка', async () => {
       for (let i = 0; i < 3; i++) {
         const id = await mkProduct({ slug: `shop${i}` });
         await putDomain(id, 'awaiting_dns', { domain: `d${i}.ru`, token: `lk-${i}` });
@@ -1418,23 +1456,31 @@ maybe('свой домен: сервис против живого Postgres', ()
       const s = svc();
       const warn = jest.spyOn((s as any).logger, 'warn').mockImplementation(() => undefined);
       const log = jest.spyOn((s as any).logger, 'log').mockImplementation(() => undefined);
+      const probe = jest.spyOn(dns, 'resolve4');
       await expect(s.checkPending()).resolves.toBe(3); // записей нет — это ответ, а не сбой
       expect(warn).not.toHaveBeenCalled();
       expect(log).not.toHaveBeenCalled();
+      expect(probe).not.toHaveBeenCalledWith(RESOLVER_PROBE_NAME);
 
-      const timeout = () => Promise.reject(Object.assign(new Error('ETIMEOUT'), { code: 'ETIMEOUT' }));
-      (s as any).resolver = { resolve4: timeout, resolve6: timeout, resolveTxt: timeout };
+      const counter = { probes: 0 };
+      const timeout = failWith('ETIMEOUT');
+      (s as any).resolver = withProbe(timeout, timeout, counter);
       await expect(s.checkPending()).resolves.toBe(3);
+      expect(counter.probes).toBe(1);
       expect(warn).toHaveBeenCalledTimes(1);
-      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/ни одной из 3 .*ETIMEOUT/));
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringMatching(new RegExp(`у всех 3 заявок.*ETIMEOUT.*${RESOLVER_PROBE_NAME.replace('.', '\\.')} без ответа \\(ETIMEOUT\\)`)),
+      );
 
-      // Хоть одна заявка получила ответ — резолвер жив, сводной строки нет.
-      (s as any).resolver = {
-        resolve4: timeout,
-        resolve6: timeout,
-        resolveTxt: (n: string) => (n === `${TXT_LABEL}.d0.ru` ? Promise.resolve([['x']]) : timeout()),
-      };
+      // Хоть одна заявка получила ответ — резолвер жив: ни контрольного
+      // запроса, ни сводной строки.
+      (s as any).resolver = withProbe(
+        timeout,
+        (n: string) => (n === `${TXT_LABEL}.d0.ru` ? Promise.resolve([['x']]) : timeout()),
+        counter,
+      );
       await expect(s.checkPending()).resolves.toBe(3);
+      expect(counter.probes).toBe(1);
       expect(warn).toHaveBeenCalledTimes(1);
     });
 
