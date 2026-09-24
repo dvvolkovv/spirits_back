@@ -17,8 +17,10 @@ export const OUR_ZONE = 'linkeon.io';
 export const MAX_NAME_LENGTH = 100;
 
 /**
- * Потолок числа меток — как maxLabels у Let's Encrypt/Boulder. Сертификат на
- * домен глубже 10 меток не выпустится никогда, а такая глубина на практике —
+ * Потолок числа меток КАЖДОГО имени, включая www, — как maxLabels у Let's
+ * Encrypt/Boulder: он проверяет каждое имя заявки на сертификат, а www у
+ * корня — такое же имя заявки, на метку глубже самого домена. Сертификат на
+ * имя глубже 10 меток не выпустится никогда, а такая глубина на практике —
  * почти всегда опечатка (лишняя точка, вставленный кусок пути), а не
  * настоящий домен.
  */
@@ -91,13 +93,15 @@ export function normalizeDomain(raw: unknown): NormalizeResult {
   let s = input.trim();
   if (!s) return refuse('empty');
 
-  // toLowerCase() здесь не нужен и вреден: UTS46 внутри domainToASCII сам
-  // приводит регистр по правилам IDNA (полное case-folding), а наш lower ДО
-  // него — по правилам JS (простое case-mapping), и эти два шага расходятся
-  // не на экзотике: 'STRAẞE.de' с нашим lower даёт xn--strae-oqa.de (ß
-  // сохраняется), а без lower — как в браузере и в Node — 'strasse.de' (ß
-  // корректно разворачивается в ss). Регистронезависимость шагов до
-  // domainToASCII не страдает: isIP к регистру безразличен, схема — через /i.
+  // toLowerCase() здесь не нужен и вреден. UTS46 внутри domainToASCII
+  // применяет свёртку регистра (case folding — по таблице отображений IDNA),
+  // а toLowerCase() — это приведение к нижнему регистру (lowercase mapping,
+  // правила JS). Операции разные и расходятся не на экзотике: заглавная ẞ при
+  // приведении к нижнему регистру становится ß, а при свёртке — ss. Поэтому
+  // 'STRAẞE.de' с нашим lower даёт xn--strae-oqa.de (ß доезжает до punycode),
+  // а без lower — как в браузере и в Node — 'strasse.de'. Регистронезависимость
+  // шагов до domainToASCII не страдает: isIP к регистру безразличен, схема —
+  // через /i.
   s = s.replace(/^(?:[a-z][a-z0-9+.-]*:)?\/\//i, ''); // схема (в т.ч. протокол-относительная //)
   s = s.split(/[/?#]/)[0]; // путь, запрос, якорь
 
@@ -129,7 +133,9 @@ export function normalizeDomain(raw: unknown): NormalizeResult {
   // поэтому отбиваем сразу, а не после потерянного шага DNS-проверки.
   if (labels.some((l) => l.slice(2, 4) === '--' && !l.startsWith('xn--'))) return refuse('bad_form');
 
-  if (ascii.length > 253 || labels.length > MAX_LABELS) return refuse('too_long');
+  // Число меток здесь не считается — только в конце, по КАЖДОМУ имени
+  // (см. MAX_LABELS): у корня www на метку глубже самого домена.
+  if (ascii.length > 253) return refuse('too_long');
 
   // Дальше — по человекочитаемой (юникодной) форме меток. Пунктуация/символы
   // и смешение кириллицы с латиницей внутри одной метки успешно кодируются
@@ -168,7 +174,10 @@ export function normalizeDomain(raw: unknown): NormalizeResult {
   if (domain.startsWith('www.') && domain.slice(4) === info.domain) domain = info.domain;
   const apex = domain === info.domain;
   const names = apex ? [domain, `www.${domain}`] : [domain];
-  if (names.some((n) => n.length > MAX_NAME_LENGTH)) return refuse('too_long');
+  // Оба потолка — на каждом имени, а не на вводе: сертификат и конфиг nginx
+  // получают именно names, и www у корня длиннее домена на 4 знака и глубже
+  // на одну метку.
+  if (names.some((n) => n.length > MAX_NAME_LENGTH || n.split('.').length > MAX_LABELS)) return refuse('too_long');
   return { ok: true, domain, zone: info.domain, apex, names };
 }
 

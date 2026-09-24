@@ -95,6 +95,14 @@ describe('проверка DNS своего домена', () => {
     }
   });
 
+  // Ветка сбоя у TXT своя (current урезается sanitizeTxtCurrent, а при сбое
+  // обязан остаться пустым) — одного теста на A/AAAA для неё мало.
+  it('сбой резолвера на TXT — не ok, названная ошибка, current пуст', async () => {
+    const r = await checkDns(INPUT, { ...fake(READY), resolveTxt: failWith('ESERVFAIL') });
+    expect(r.ok).toBe(false);
+    expect(r.records[0]).toMatchObject({ type: 'TXT', ok: false, error: 'ESERVFAIL', current: [] });
+  });
+
   it('TXT отсутствует как NXDOMAIN — «нет записи», а не ошибка', async () => {
     const resolver: DnsResolver = { ...fake(READY), resolveTxt: failWith('ENOTFOUND') };
     const r = await checkDns(INPUT, resolver);
@@ -145,5 +153,26 @@ describe('проверка DNS своего домена', () => {
 
   it('пустой names — программная ошибка вызывающего', async () => {
     await expect(checkDns({ domain: 'x.ru', names: [], token: 't', hostIp: IP }, fake({}))).rejects.toThrow();
+  });
+
+  // Страж параллельности. Последовательные запросы при молчащих серверах
+  // складывают таймауты: 5 запросов × (2 сервера × 3000 мс) ≈ 30 с на одну
+  // проверку, а привязка ждёт её синхронно. По результату это не видно —
+  // записи те же, — поэтому считается число запросов в полёте одновременно.
+  it('все запросы идут параллельно — все пять в полёте разом', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const slow = <T,>(v: T) => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      return new Promise<T>((r) => setTimeout(() => { inFlight--; r(v); }, 5));
+    };
+    const r = await checkDns(INPUT, {
+      resolveTxt: () => slow([['lk-abc']]),
+      resolve4: () => slow([IP]),
+      resolve6: () => slow([] as string[]),
+    });
+    expect(r.ok).toBe(true);
+    expect(peak).toBe(5);
   });
 });
