@@ -1,11 +1,11 @@
-export type BlogCallbackAction = 'ok' | 'redo' | 'no';
+export type BlogCallbackAction = 'ok' | 'redo' | 'no' | 'note';
 
 export interface BlogCallback {
   action: BlogCallbackAction;
   postId: string;
 }
 
-const ACTIONS: BlogCallbackAction[] = ['ok', 'redo', 'no'];
+const ACTIONS: BlogCallbackAction[] = ['ok', 'redo', 'no', 'note'];
 
 export function parseBlogCallback(data: string): BlogCallback | null {
   const parts = String(data || '').split(':');
@@ -15,14 +15,24 @@ export function parseBlogCallback(data: string): BlogCallback | null {
   return { action, postId: parts[2] };
 }
 
+/**
+ * Два ряда по две кнопки: четыре в один ряд на телефоне сжимаются до
+ * обрезков подписей. Сверху — что делать с этим текстом, снизу — переделать
+ * целиком или выбросить.
+ */
 export function buildBlogKeyboard(postId: string): {
   inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
 } {
   return {
-    inline_keyboard: [[
-      { text: '✅ Опубликовать', callback_data: `blog:ok:${postId}` },
-      { text: '🔄 Переписать',  callback_data: `blog:redo:${postId}` },
-      { text: '🗑 В мусор',      callback_data: `blog:no:${postId}` },
-    ]],
+    inline_keyboard: [
+      [
+        { text: '✅ Опубликовать', callback_data: `blog:ok:${postId}` },
+        { text: '✍️ Замечание',   callback_data: `blog:note:${postId}` },
+      ],
+      [
+        { text: '🔄 Переписать',  callback_data: `blog:redo:${postId}` },
+        { text: '🗑 В мусор',      callback_data: `blog:no:${postId}` },
+      ],
+    ],
   };
 }

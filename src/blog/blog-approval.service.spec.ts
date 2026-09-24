@@ -270,6 +270,126 @@ describe('BlogApprovalService.handleCallback', () => {
 });
 
 /**
+ * «✍️ Замечание». Владелец получил черновик и не понял, как оставить
+ * замечание: кнопки не было, а в сообщении не сказано, что надо ответить на
+ * него. Написанное отдельным сообщением, а не ответом, уходило ассистенту.
+ *
+ * Кнопка присылает приглашение, у которого Telegram сам открывает поле
+ * ответа (ForceReply). Это не переход статуса, машина состояний тут ни при
+ * чём, но приглашать имеет смысл только к посту на проверке: у остальных
+ * замечание всё равно не принять.
+ */
+describe('BlogApprovalService.handleCallback — «Замечание»', () => {
+  const noteCb = (over: any = {}) => ({
+    id: 'cb1', data: 'blog:note:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 }, ...over,
+  });
+
+  const make = (row: any) => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [row] }).mockResolvedValue({ rows: [] });
+    const tg = {
+      answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(),
+      sendMessage: jest.fn().mockResolvedValue({ message_id: 55 }),
+    };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    return { pg, tg, svc };
+  };
+
+  it('присылает приглашение ответом на черновик — с заголовком поста и открытым полем ответа', async () => {
+    const { tg, svc } = make(rawRow({ title: 'Как мы считаем токены' }));
+
+    expect(await svc.handleCallback(noteCb())).toBe(true);
+
+    expect(tg.sendMessage).toHaveBeenCalledTimes(1);
+    const [chatId, text, options] = tg.sendMessage.mock.calls[0];
+    expect(chatId).toBe(77);
+    expect(text).toContain('«Как мы считаем токены»');     // к какому посту
+    expect(text).toMatch(/ответом на это сообщение/);      // и что делать, если поле само не открылось
+    expect(options.reply_parameters).toEqual(expect.objectContaining({ message_id: 12 }));
+    expect(options.reply_markup).toEqual({ force_reply: true, input_field_placeholder: 'Что поправить?' });
+  });
+
+  /**
+   * Ответ владельца ссылается на ПРИГЛАШЕНИЕ, а не на черновик. Не запомни
+   * его id — ответ не узнается и уйдёт ассистенту: кнопка сделала бы хуже,
+   * чем было без неё.
+   */
+  it('id приглашения запоминается на посте', async () => {
+    const { pg, svc } = make(rawRow());
+
+    await svc.handleCallback(noteCb());
+
+    const writes = pg.query.mock.calls.slice(1);
+    expect(writes).toHaveLength(1);
+    expect(String(writes[0][0])).toContain('note_prompt_ids');
+    expect(writes[0][1]).toEqual(expect.arrayContaining(['p1', 55]));
+  });
+
+  it('статус нажатие не трогает — пост по-прежнему ждёт решения', async () => {
+    const { pg, svc } = make(rawRow());
+
+    await svc.handleCallback(noteCb());
+
+    // Запись обязана БЫТЬ — иначе цикл ниже прошёл бы зелёным по пустому списку.
+    const writes = pg.query.mock.calls.slice(1);
+    expect(writes.length).toBeGreaterThan(0);
+    for (const [sql] of writes) {
+      expect(String(sql)).not.toMatch(/\bstatus\b/);
+    }
+  });
+
+  it('часики на кнопке гасятся', async () => {
+    const { tg, svc } = make(rawRow());
+
+    await svc.handleCallback(noteCb());
+
+    expect(tg.answerCallbackQuery).toHaveBeenCalledTimes(1);
+    expect(tg.answerCallbackQuery.mock.calls[0][0]).toBe('cb1');
+  });
+
+  it.each(['drafting', 'approved', 'publishing', 'published', 'rejected', 'failed'])(
+    'пост в %s — «пост уже обработан», приглашения нет',
+    async (status) => {
+      const { pg, tg, svc } = make(rawRow({ status }));
+
+      expect(await svc.handleCallback(noteCb())).toBe(true);
+
+      expect(tg.sendMessage).not.toHaveBeenCalled();
+      expect(pg.query).toHaveBeenCalledTimes(1);      // только чтение
+      expect(tg.answerCallbackQuery).toHaveBeenCalledWith('cb1', { text: `Пост уже обработан: ${status}` });
+    },
+  );
+
+  /**
+   * Ответ узнаётся по паре «чат проверки + id приглашения». Приглашение в
+   * другом чате опознать было бы не по чему, и ответ на него ушёл бы
+   * ассистенту. Лучше не приглашать вовсе.
+   */
+  it('нажатие не в том чате, где пост на проверке, приглашения не присылает', async () => {
+    const { pg, tg, svc } = make(rawRow({ review_chat_id: '77' }));
+
+    await svc.handleCallback(noteCb({ message: { chat: { id: 78 }, message_id: 12 } }));
+
+    expect(tg.sendMessage).not.toHaveBeenCalled();
+    expect(pg.query).toHaveBeenCalledTimes(1);
+    expect(tg.answerCallbackQuery).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Под прошлым вариантом черновика кнопки остаются. Замечание ляжет на
+   * АКТУАЛЬНЫЙ вариант — его и цитирует приглашение, чтобы было видно, к
+   * какому тексту оно относится.
+   */
+  it('нажатие под прошлым вариантом — приглашение цитирует актуальный черновик', async () => {
+    const { tg, svc } = make(rawRow({ review_message_id: '20' }));
+
+    await svc.handleCallback(noteCb({ message: { chat: { id: 77 }, message_id: 12 } }));
+
+    expect(tg.sendMessage.mock.calls[0][2].reply_parameters.message_id).toBe(20);
+  });
+});
+
+/**
  * Реплай — это ЗАМЕЧАНИЕ редактору, а не готовый текст поста.
  *
  * Раньше присланный текст ложился прямо в `body`: чтобы поправить одну фразу,
@@ -370,6 +490,62 @@ describe('BlogApprovalService.handleReplyEdit', () => {
     expect(tg.sendMessage).toHaveBeenCalled();          // и владелец узнал, почему
   });
 
+  /**
+   * Ответ на НАШЕ сообщение — забота блога в любом статусе поста. Раньше
+   * поиск отбирал только pending_review, и замечание к переписываемому или
+   * уже опубликованному посту уходило ассистенту: владелец писал редактору,
+   * а отвечал психолог.
+   */
+  it.each([
+    ['drafting', /переписывается/],
+    ['approved', /одобрен/],
+    ['publishing', /уходит в канал/],
+    ['published', /опубликован/],
+    ['rejected', /мусор/],
+    ['failed', /не собрался/],
+  ])('пост в %s: замечание не принято, владелец узнаёт почему, ассистенту не уходит', async (status, why) => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow({ status })] }).mockResolvedValue({ rows: [] });
+    const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+
+    expect(await svc.handleReplyEdit(reply())).toBe(true);
+
+    expect(pg.query).toHaveBeenCalledTimes(1);          // только чтение
+    const text = String(tg.sendMessage.mock.calls[0][1]);
+    expect(text).toMatch(why as RegExp);
+    expect(text).not.toMatch(/Принял/);
+  });
+
+  /**
+   * Поле ответа, которое открывает кнопка, — то же поле, где микрофон.
+   * Голосовое без текста раньше считалось «не нашим» и уходило ассистенту
+   * вместе с надиктованным замечанием. Теперь блог просит текст — и просит
+   * приглашением, чтобы и ответ на эту просьбу узнался своим.
+   */
+  it('голосовой ответ на черновик ассистенту не уходит — блог просит текстом', async () => {
+    const pg = { query: jest.fn() };
+    pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
+    const tg = {
+      answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(),
+      sendMessage: jest.fn().mockResolvedValue({ message_id: 61 }),
+    };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+
+    const handled = await svc.handleReplyEdit({
+      chat: { id: 77 }, message_id: 60, voice: { file_id: 'v1', duration: 4 }, reply_to_message: { message_id: 12 },
+    });
+
+    expect(handled).toBe(true);
+    const [chatId, text, options] = tg.sendMessage.mock.calls[0];
+    expect(chatId).toBe(77);
+    expect(text).toMatch(/текстом/);
+    expect(options.reply_markup).toEqual(expect.objectContaining({ force_reply: true }));
+    const writes = pg.query.mock.calls.slice(1).map((c: any[]) => String(c[0]));
+    expect(writes.some((sql) => /editor_notes/.test(sql))).toBe(false);   // замечания нет — писать нечего
+    expect(writes.some((sql) => /note_prompt_ids/.test(sql))).toBe(true);  // просьба — такое же приглашение
+  });
+
   it('реплай на чужое сообщение не перехватывается — текст уйдёт ассистенту', async () => {
     const pg = { query: jest.fn().mockResolvedValueOnce({ rows: [] }) };
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
@@ -389,5 +565,111 @@ describe('BlogApprovalService.handleReplyEdit', () => {
     const handled = await svc.handleReplyEdit({ chat: { id: 77 }, text: 'Привет' });
     expect(handled).toBe(false);
     expect(pg.query).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Путь целиком: кнопка → приглашение → ответ владельца.
+ *
+ * Заглушка — Postgres в миниатюре, как у гонки захвата в blog.cron.spec.ts:
+ * условия она читает из САМОГО запроса, а не зашивает в себя. Узнаёт ли
+ * поиск приглашения, отсекает ли он пост по статусу, дописывает ли запись
+ * id к списку или затирает его — решает текст запроса. Иначе заглушка
+ * сторожила бы строку вместо кода, и три теста ниже зеленели бы ровно на тех
+ * дефектах, от которых стерегут. Незнакомый запрос — ошибка: за SQL, которого
+ * она не понимает, заглушка не ручается.
+ *
+ * Сам SQL здесь не исполняется. Арифметика предела, `ANY` по bigint[] и
+ * одновременные нажатия проверяются против живого Postgres — в
+ * blog-approval.integration.spec.ts.
+ */
+describe('кнопка → приглашение → ответ (Postgres в миниатюре)', () => {
+  const miniPg = (over: any = {}) => {
+    const row: any = rawRow({ editor_notes: [], note_prompt_ids: [], ...over });
+    const query = jest.fn(async (sql: string, params: any[] = []) => {
+      const s = String(sql).replace(/\s+/g, ' ').trim();
+
+      if (/^SELECT \* FROM blog_post WHERE id = \$1$/.test(s)) {
+        return { rows: params[0] === row.id ? [{ ...row }] : [] };
+      }
+
+      if (/^SELECT \* FROM blog_post WHERE review_chat_id = \$1\b/.test(s)) {
+        const [chat, msg] = params.map(Number);
+        const byDraft = /review_message_id = \$2/.test(s) && Number(row.review_message_id) === msg;
+        const byPrompt = /\$2 = ANY\(note_prompt_ids\)/.test(s) && row.note_prompt_ids.map(Number).includes(msg);
+        const status = s.match(/status = '(\w+)'/);
+        const found = Number(row.review_chat_id) === chat && (byDraft || byPrompt) && (!status || row.status === status[1]);
+        return { rows: found ? [{ ...row }] : [] };
+      }
+
+      if (/^UPDATE blog_post SET note_prompt_ids = /.test(s)) {
+        const appends = /note_prompt_ids \|\| \$2/.test(s);
+        row.note_prompt_ids = appends ? [...row.note_prompt_ids, params[1]] : [params[1]];
+        return { rows: [] };
+      }
+
+      if (/^UPDATE blog_post SET editor_notes = \$2::text\[\], status = 'drafting'/.test(s)) {
+        row.editor_notes = params[1];
+        row.status = 'drafting';
+        return { rows: [] };
+      }
+
+      throw new Error(`заглушка не знает запроса: ${s}`);
+    });
+    return { row, query };
+  };
+
+  const setup = (over: any = {}) => {
+    const pg = miniPg(over);
+    const sent: Array<{ id: number; text: string }> = [];
+    let nextId = 100;
+    const tg = {
+      answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(),
+      sendMessage: jest.fn(async (_chatId: number, text: string) => {
+        const id = nextId++;
+        sent.push({ id, text });
+        return { message_id: id };
+      }),
+    };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const press = () => svc.handleCallback({
+      id: 'cb', data: 'blog:note:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 },
+    });
+    const answer = (replyTo: number, text = 'короче и без канцелярита') => svc.handleReplyEdit({
+      chat: { id: 77 }, message_id: 500, text, reply_to_message: { message_id: replyTo },
+    });
+    return { pg, sent, press, answer };
+  };
+
+  it('ответ на приглашение принят как замечание', async () => {
+    const { pg, sent, press, answer } = setup();
+    await press();
+    const [prompt] = sent.map((m) => m.id);
+
+    expect(await answer(prompt)).toBe(true);
+
+    expect(pg.row.editor_notes).toEqual(['короче и без канцелярита']);
+    expect(pg.row.status).toBe('drafting');
+  });
+
+  it('ответ на первое из двух приглашений тоже принят', async () => {
+    const { pg, sent, press, answer } = setup();
+    await press();
+    await press();
+    const [first, second] = sent.map((m) => m.id);
+    expect(second).not.toBe(first);
+
+    expect(await answer(first)).toBe(true);
+
+    expect(pg.row.editor_notes).toEqual(['короче и без канцелярита']);
+  });
+
+  it('ответ на переписываемый черновик не уходит ассистенту', async () => {
+    const { pg, sent, answer } = setup({ status: 'drafting', editor_notes: ['объясни, что такое продукт'] });
+
+    expect(await answer(12, 'и ещё короче')).toBe(true);
+
+    expect(pg.row.editor_notes).toEqual(['объясни, что такое продукт']);   // не дописано
+    expect(sent[0].text).toMatch(/переписывается/);
   });
 });
