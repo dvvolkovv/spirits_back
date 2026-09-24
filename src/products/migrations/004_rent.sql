@@ -71,9 +71,11 @@ ALTER TABLE products ADD CONSTRAINT products_status_check
 -- `kind` в таком запросе — ошибка неоднозначности в рантайме. Существующий
 -- claimJob уточняет везде (проверено), новые — обязаны тоже.
 ALTER TABLE product_provision_jobs ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'provision';
+-- 'domain' — вид из 008_domains.sql. Вписан и сюда: 004 исполняется при каждом
+-- старте и навешивает словарь на уже живые задания (см. 008).
 ALTER TABLE product_provision_jobs DROP CONSTRAINT IF EXISTS product_provision_jobs_kind_check;
 ALTER TABLE product_provision_jobs ADD CONSTRAINT product_provision_jobs_kind_check
-  CHECK (kind IN ('provision','sleep','wake'));
+  CHECK (kind IN ('provision','sleep','wake','domain'));
 
 -- ОТБОР ПО СРОКУ ОПЛАТЫ: сборщику — «кому пора платить», пробуждению — «кого
 -- будить первым» (спящие в порядке засыпания).

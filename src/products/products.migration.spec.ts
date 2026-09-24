@@ -618,9 +618,12 @@ describe('миграция 004 — аренда', () => {
   });
 
   it('словарь видов задания закрыт CHECK', async () => {
+    // 'domain' добавлен 008_domains.sql (свой домен продукта) и по правилу
+    // из 002 дописан И сюда: 004 едет раньше 008 при каждом старте API и
+    // навешивает словарь на уже живые задания заново.
     expect(
       dictionary(await migration004(), 'product_provision_jobs_kind_check', 'kind', '004'),
-    ).toEqual(['provision', 'sleep', 'wake']);
+    ).toEqual(['domain', 'provision', 'sleep', 'wake']);
   });
 
   it('каждое ограничение навешивается идемпотентно', async () => {
