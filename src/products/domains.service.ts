@@ -22,7 +22,8 @@ export type DomainErrorReason = 'taken' | 'orphan_issuing' | 'orphan_removing' |
  *   taken   — домен в тот же миг занял другой продукт: заявка в failed;
  *   refused — продукт не в том статусе (погашен, не заведён, в архиве);
  *   none    — заявки с этим кодом в ожидаемом статусе уже нет;
- *   limited — из failed, но окно повторов исчерпано.
+ *   limited — исчерпан предел: окно повторов (из failed) или заданий domain
+ *             у продукта за час.
  */
 export type IssueOutcome = 'queued' | 'busy' | 'taken' | 'refused' | 'none' | 'limited';
 
@@ -67,8 +68,9 @@ export type DomainRefusalCode =
   | 'removing' // домен отвязывается — привязка (любого домена) после окончания
   | 'busy'
   | 'changed' // заявку отвязали или заменили, пока с ней работали (проверка DNS шла до ~7 с)
-  | 'throttled' // «Проверить сейчас» чаще CHECK_THROTTLE_S (задача 5, 429)
-  | 'retries'; // больше RETRIES_PER_HOUR повторных выпусков в час (задача 5, 429)
+  | 'throttled' // проверка чаще раза в CHECK_THROTTLE_S (429)
+  | 'retries' // предел выпусков: RETRIES_PER_HOUR повторов или DOMAIN_JOBS_PER_HOUR заданий в час (429)
+  | 'detach_pending'; // отвязка не завершилась — «Проверить снова» выпустил бы домен заново
 
 /**
  * Каждый отказ сервиса — с телом `{ statusCode, message, reason }`. Nest
@@ -92,10 +94,24 @@ export const PENDING_DAYS = 7;
 export const PENDING_BATCH = 50;
 /** Сколько из них проверяются одновременно: 50 подряд по ~7 с — это минуты. */
 export const PENDING_PARALLEL = 5;
-/** «Проверить сейчас» — не чаще. Это только DNS, Let's Encrypt не трогается. */
+/**
+ * Проверок DNS одновременно на процесс — всех сразу: привязка, кнопка,
+ * фоновый оборот (сервис — одиночка Nest). Лишние ждут своей очереди, а не
+ * падают: без предела сотня кнопок разом — это сотня проверок по пять
+ * запросов к 1.1.1.1/8.8.8.8 с прод-сервера.
+ */
+export const DNS_PARALLEL = 8;
+/** «Проверить сейчас» и «Проверить снова» — не чаще. Это только DNS, Let's Encrypt не трогается. */
 export const CHECK_THROTTLE_S = 30;
 /** Повторных выпусков после отказа в час. Предел Let's Encrypt — 5 неудач в час на имя. */
 export const RETRIES_PER_HOUR = 3;
+/**
+ * Заданий domain у продукта за час, после которых выпуск ждёт. Защищает
+ * учётную запись Let's Encrypt от цикла «привязал → выпустил → отвязал →
+ * привязал»: недельный предел дублей сертификата на один набор имён — 5.
+ * Считаются и задания отвязки: цикл из них и состоит.
+ */
+export const DOMAIN_JOBS_PER_HOUR = 6;
 
 /**
  * Окно повторов открыто: прошлое окно старше часа (тогда оно начнётся
@@ -105,6 +121,21 @@ export const RETRIES_PER_HOUR = 3;
  * с RETRIES_PER_HOUR.
  */
 const retryWindowOpen = (limit: string) => `(attempts_since < now() - interval '1 hour' OR attempts < ${limit})`;
+
+/**
+ * У продукта $1 за последний час меньше `limit` заданий domain. `limit` —
+ * плейсхолдер параметра с DOMAIN_JOBS_PER_HOUR.
+ */
+const domainJobsLeft = (limit: string) => `((SELECT count(*) FROM product_provision_jobs j
+                  WHERE j.product_id = $1 AND j.kind = 'domain'
+                    AND j.created_at > now() - interval '1 hour') < ${limit})`;
+
+/**
+ * Отказ после НЕЗАВЕРШЁННОЙ отвязки: «Проверить снова» здесь выпустил бы
+ * домен заново, а человек его отвязывал. Путь один — «Отвязать» ещё раз.
+ */
+const DETACH_PENDING: DomainErrorReason[] = ['orphan_removing', 'remove_failed'];
+const DETACH_PENDING_SQL = `(${DETACH_PENDING.map((r) => `'${r}'`).join(',')})`;
 
 /**
  * Статусы продукта, при которых домен можно ВЫПУСКАТЬ. Погашенный сюда не
@@ -118,10 +149,14 @@ const ISSUABLE_SQL = `(${ISSUABLE.map((s) => `'${s}'`).join(',')})`;
 const TAKEN = 'Этот домен уже привязан к другому продукту.';
 const BLOCKED = 'Продукт остановлен администратором — привязать домен нельзя.';
 const BLOCKED_ISSUE = 'Продукт остановлен администратором — выпуск сертификата невозможен.';
+const NOT_READY_ISSUE = 'Продукт сейчас не работает — выпустить сертификат можно, когда он заработает.';
 const NO_DOMAIN = 'У продукта нет своего домена.';
 const CHANGED = 'Заявку на домен изменили, пока шла проверка DNS, — обновите страницу и повторите.';
 const THROTTLED = 'Проверяли только что — подождите полминуты.';
-const RETRIES = 'Три попытки выпуска за час уже были — Let’s Encrypt не любит частых повторов. Попробуйте через час.';
+const RETRIES =
+  'Попыток выпуска за последний час уже слишком много — Let’s Encrypt не любит частых повторов. Попробуйте через час.';
+const DETACH_PENDING_TEXT = 'Отвязка не завершилась — нажмите «Отвязать» ещё раз.';
+const BUSY_ISSUE = 'У продукта сейчас идёт другое задание — повторите через минуту.';
 const BUSY = 'У продукта сейчас идёт другое задание — отвяжите через минуту.';
 const ISSUING = 'Идёт выпуск сертификата — отвязать можно, когда он закончится (обычно меньше минуты).';
 const REMOVING = 'Домен отвязывается — дождитесь окончания, обычно меньше минуты.';
@@ -132,6 +167,41 @@ export const ORPHAN_REMOVING =
 
 /** Домен в тексте для человека: `пример.рф`, а не `xn--e1afmkfd.xn--p1ai`. */
 const readable = (domain: string) => domainToUnicode(domain) || domain;
+
+/**
+ * Оператор с постановкой задания откатился ЦЕЛИКОМ, потому что у продукта в
+ * тот же миг встало другое задание. Два пути:
+ *   - 23505 по единственному активному заданию (product_provision_jobs_one_active):
+ *     встречная вставка (сон, пробуждение) прошла мимо NOT EXISTS;
+ *   - 40P01, взаимоблокировка с гашением: проверка внешнего ключа нашего
+ *     задания берёт KEY SHARE на строку продукта уже ПОСЛЕ записи в
+ *     one_active, а гашение и снятие блокировки берут эту строку FOR UPDATE
+ *     первым делом и затем вставляют своё задание — каждый ждёт другого.
+ * Для вызывающего это «занято», а не сбой: перехода не было вовсе.
+ */
+const lostToRivalJob = (e: any) =>
+  (e?.code === '23505' && e.constraint === 'product_provision_jobs_one_active') || e?.code === '40P01';
+
+/** Счётный семафор: не больше `free` разом, остальные ждут очереди — по порядку прихода. */
+class Semaphore {
+  private queue: (() => void)[] = [];
+
+  constructor(private free: number) {}
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.free > 0) this.free--;
+    else await new Promise<void>((resolve) => this.queue.push(resolve));
+    try {
+      return await fn();
+    } finally {
+      // Место — прямо следующему в очереди, мимо счётчика: иначе его успел
+      // бы перехватить только что пришедший.
+      const next = this.queue.shift();
+      if (next) next();
+      else this.free++;
+    }
+  }
+}
 
 interface OwnedProduct {
   id: string;
@@ -158,6 +228,27 @@ interface DomainRow {
   attempts_since: string;
 }
 
+/** Строка заявки с приговором кнопке — по часам базы (см. flagged). */
+interface FlaggedRow extends DomainRow {
+  throttled: boolean;
+  spent: boolean;
+}
+
+/** Строка, забронированная кнопкой: `started` — момент брони, он же старт проверки. */
+interface HeldRow extends DomainRow {
+  started: string;
+}
+
+/** Итог одной проверки DNS заявки (runCheck). */
+interface CheckRun {
+  /** Строка заявки после проверки; null — заявку за это время убрали или заменили. */
+  row: DomainRow | null;
+  /** Исход выпуска; null — выпуск не просился (DNS не готов, в строке проверка свежее, заявку сменили). */
+  issue: IssueOutcome | null;
+  /** Коды сбоя, если резолвер упал на КАЖДОЙ записи (DNS не ответил вовсе), иначе null. */
+  resolverDown: string | null;
+}
+
 type Tick = 'pending' | 'orphans';
 
 @Injectable()
@@ -165,13 +256,18 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(DomainsService.name);
   /** Поле, а не аргумент конструктора: Nest внедряет только провайдеры, а тесты подменяют резолвер. */
   private resolver: DnsResolver = publicResolver();
+  /** Предел одновременных проверок DNS на процесс (DNS_PARALLEL). */
+  private readonly dnsGate = new Semaphore(DNS_PARALLEL);
   private timers: NodeJS.Timeout[] = [];
   /** У каждого оборота свой флаг: медленная проверка DNS не должна придерживать сверку сирот. */
   private ticking: Record<Tick, boolean> = { pending: false, orphans: false };
+  /** Модуль останавливают: новые обороты не начинаются, идущий не берёт следующих заявок. */
+  private stopped = false;
 
   constructor(private readonly pg: PgService) {}
 
   onModuleInit() {
+    this.stopped = false;
     // unref, иначе таймер держит процесс и jest не завершается.
     const every = (ms: number, tick: Tick) => {
       const t = setInterval(() => void this.safeTick(tick), ms);
@@ -183,6 +279,7 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
   }
 
   onModuleDestroy() {
+    this.stopped = true;
     for (const t of this.timers) clearInterval(t);
     this.timers = [];
   }
@@ -300,11 +397,13 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
       return this.answerExisting(other, n.domain, p);
     }
 
-    const checked = await this.runCheck(created, p);
+    // Исход выпуска привязке не важен: не вышло сейчас — выпустит фоновый
+    // оборот, а состояние покажет строка.
+    const run = await this.runCheck(created, p);
     // Показать здесь строку продукта значило бы выдать чужую заявку за эту:
     // ответ на привязку a.ru с доменом b.ru.
-    if (!checked) throw refusal(HttpStatus.CONFLICT, 'changed', CHANGED);
-    return this.view(checked, p);
+    if (!run.row) throw refusal(HttpStatus.CONFLICT, 'changed', CHANGED);
+    return this.view(run.row, p);
   }
 
   /**
@@ -364,19 +463,18 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
       );
       if (r.rows[0].queued === 1) return { removed: 'queued' };
     } catch (e: any) {
-      if (e?.code !== '23505') throw e;
-      if (e.constraint === 'product_domains_occupied') {
+      if (e?.code === '23505' && e.constraint === 'product_domains_occupied') {
         // Перевод failed → removing упёрся в индекс занятых: домен уже держит
         // другой продукт, и в removing эту заявку не пустить. Удалить строку
         // голым DELETE тоже нельзя: failed бывает и после отказа выпуска
         // (Let's Encrypt, агент) или снятого задания — у такой заявки на
         // машине могли остаться блоки порта 80, а то и сертификат.
         if (await this.dropOccupiedFailed(productId)) return { removed: 'now' };
-      } else if (e.constraint !== 'product_provision_jobs_one_active') {
+      } else if (!lostToRivalJob(e)) {
         throw e;
       }
-      // product_provision_jobs_one_active: встречное задание (сон,
-      // пробуждение) встало мимо NOT EXISTS, оператор откатился целиком.
+      // Иначе встречное задание (сон, пробуждение, гашение) — оператор
+      // откатился целиком, решает свежее состояние ниже.
     }
     // Своё действие не состоялось — кто-то успел раньше. Ответ — по свежему
     // состоянию, а не «занято» наугад: вторая отвязка той же строки — это не
@@ -399,7 +497,7 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
    * безвредно. Двумя операторами строка могла бы уйти без задания.
    *
    * true — строка удалена и задание стоит. false — у продукта идёт другое
-   * задание (видимое — NOT EXISTS, встречное — 23505 one_active, и тогда
+   * задание (видимое — NOT EXISTS; встречное — lostToRivalJob, и тогда
    * оператор откатился целиком): строка на месте, ответ решает перечитывание.
    */
   private async dropOccupiedFailed(productId: string): Promise<boolean> {
@@ -421,7 +519,7 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
       );
       return r.rows[0].queued === 1;
     } catch (e: any) {
-      if (e?.code === '23505' && e.constraint === 'product_provision_jobs_one_active') return false;
+      if (lostToRivalJob(e)) return false;
       throw e;
     }
   }
@@ -430,11 +528,55 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
    * «Проверить сейчас» (awaiting_dns) и «Проверить снова» (failed). В прочих
    * состояниях проверять нечего — ответ по строке.
    *
-   * Частота и окно повторов — по часам базы (см. retryWindowOpen): оператор
-   * выпуска считает окно так же, и расходиться им не на чем.
+   * Пауза между проверками — БРОНЬ одним оператором до DNS (hold), а не
+   * чтение checked_at: десять нажатий разом прочли бы одну и ту же старую
+   * отметку и пустили бы десять проверок. Бронь берётся при всех условиях
+   * кнопки сразу (статус, пауза, незавершённая отвязка, окно повторов) и
+   * держит тот же код заявки; не взялась — отказ разбирается по свежей строке.
+   * Все сроки — по часам базы, как и в операторе выпуска.
+   *
+   * Исход выпуска у повтора (failed) отвечается честно: «занято», предел,
+   * погашен — иначе 200 со старой ошибкой, а фоновый оборот failed не
+   * повторяет. У ждущей заявки (awaiting_dns) 200: не вышло сейчас — оборот
+   * повторит; кроме предела — его оборот тоже упрётся в час.
    */
   async check(userId: string, productId: string): Promise<DomainView> {
     const p = await this.owned(userId, productId);
+    const row = await this.flagged(productId);
+    if (!row) throw refusal(HttpStatus.NOT_FOUND, 'no_domain', NO_DOMAIN);
+    if (row.status !== 'awaiting_dns' && row.status !== 'failed') return this.view(row, p);
+    // Погашенному выпуск запрещён (см. ISSUABLE) — и DNS незачем трогать.
+    if (p.status === 'blocked') throw refusal(HttpStatus.CONFLICT, 'blocked', BLOCKED_ISSUE);
+    const early = this.cannotCheck(row);
+    if (early) throw early;
+
+    const held = await this.hold(row);
+    if (!held) {
+      const cur = await this.flagged(productId);
+      if (!cur || cur.token !== row.token) throw refusal(HttpStatus.CONFLICT, 'changed', CHANGED);
+      // Заявка ушла дальше (выпуск её уже взял) — проверять нечего, ответ по строке.
+      if (cur.status !== 'awaiting_dns' && cur.status !== 'failed') return this.view(cur, p);
+      throw this.cannotCheck(cur) ?? refusal(HttpStatus.TOO_MANY_REQUESTS, 'throttled', THROTTLED);
+    }
+
+    const run = await this.runCheck(held, p, held.started);
+    // Заявку отвязали или заменили, пока шла проверка: новая строка в ответе
+    // выдала бы себя за проверенную.
+    if (!run.row) throw refusal(HttpStatus.CONFLICT, 'changed', CHANGED);
+    if (run.issue === 'limited') throw refusal(HttpStatus.TOO_MANY_REQUESTS, 'retries', RETRIES);
+    if (held.status === 'failed' && run.issue === 'busy') throw refusal(HttpStatus.CONFLICT, 'busy', BUSY_ISSUE);
+    if (held.status === 'failed' && run.issue === 'refused') {
+      // Продукт за время проверки перестал годиться для выпуска — по его
+      // свежему статусу и отказ.
+      const now = await this.owned(userId, productId);
+      if (now.status === 'blocked') throw refusal(HttpStatus.CONFLICT, 'blocked', BLOCKED_ISSUE);
+      throw refusal(HttpStatus.CONFLICT, 'not_ready', NOT_READY_ISSUE);
+    }
+    return this.view(run.row, p);
+  }
+
+  /** Строка заявки с приговором кнопке: пауза не вышла (throttled), окно повторов исчерпано (spent). */
+  private async flagged(productId: string): Promise<FlaggedRow | null> {
     const r = await this.pg.query(
       `SELECT d.*,
               COALESCE(d.checked_at > now() - make_interval(secs => $2), false) AS throttled,
@@ -443,21 +585,36 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
         WHERE d.product_id = $1`,
       [productId, CHECK_THROTTLE_S, RETRIES_PER_HOUR],
     );
-    const row: (DomainRow & { throttled: boolean; spent: boolean }) | undefined = r.rows[0];
-    if (!row) throw refusal(HttpStatus.NOT_FOUND, 'no_domain', NO_DOMAIN);
-    if (row.status !== 'awaiting_dns' && row.status !== 'failed') return this.view(row, p);
-    // Погашенному выпуск запрещён (см. ISSUABLE) — и DNS незачем трогать.
-    if (p.status === 'blocked') throw refusal(HttpStatus.CONFLICT, 'blocked', BLOCKED_ISSUE);
-    if (row.status === 'awaiting_dns' && row.throttled) {
-      throw refusal(HttpStatus.TOO_MANY_REQUESTS, 'throttled', THROTTLED);
-    }
-    if (row.status === 'failed' && row.spent) throw refusal(HttpStatus.TOO_MANY_REQUESTS, 'retries', RETRIES);
+    return r.rows[0] ?? null;
+  }
 
-    const checked = await this.runCheck(row, p);
-    // Заявку отвязали или заменили, пока шла проверка: новая строка в ответе
-    // выдала бы себя за проверенную.
-    if (!checked) throw refusal(HttpStatus.CONFLICT, 'changed', CHANGED);
-    return this.view(checked, p);
+  /** Почему кнопку нажимать рано или незачем; null — можно проверять. */
+  private cannotCheck(row: FlaggedRow): HttpException | null {
+    if (row.status === 'failed' && DETACH_PENDING.includes(row.error_reason)) {
+      return refusal(HttpStatus.CONFLICT, 'detach_pending', DETACH_PENDING_TEXT);
+    }
+    if (row.status === 'failed' && row.spent) return refusal(HttpStatus.TOO_MANY_REQUESTS, 'retries', RETRIES);
+    if (row.throttled) return refusal(HttpStatus.TOO_MANY_REQUESTS, 'throttled', THROTTLED);
+    return null;
+  }
+
+  /**
+   * Бронь кнопки: отметка checked_at ставится ДО проверки DNS, одним
+   * оператором и при всех условиях cannotCheck сразу — из десятка нажатий
+   * разом её получает ровно одно. Адрес — код заявки: бронь не ложится на
+   * заявку, заведённую вместо прочитанной. null — брони нет.
+   */
+  private async hold(row: DomainRow): Promise<HeldRow | null> {
+    const r = await this.pg.query(
+      `UPDATE product_domains SET checked_at = clock_timestamp()
+        WHERE product_id = $1 AND token = $2 AND status IN ('awaiting_dns','failed')
+          AND (checked_at IS NULL OR checked_at <= clock_timestamp() - make_interval(secs => $3))
+          AND (status = 'awaiting_dns'
+               OR (${retryWindowOpen('$4')} AND COALESCE(error_reason, '') NOT IN ${DETACH_PENDING_SQL}))
+       RETURNING *, checked_at::text AS started`,
+      [row.product_id, row.token, CHECK_THROTTLE_S, RETRIES_PER_HOUR],
+    );
+    return r.rows[0] ?? null;
   }
 
   /**
@@ -476,24 +633,36 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
    * Две проверки ОДНОЙ заявки тоже расходятся по времени (кнопка и фоновый
    * оборот, два процесса кластера): та, что стартовала раньше, а ответила
    * позже, несёт более старое состояние DNS. Поэтому checked_at — момент
-   * СТАРТА проверки по часам базы, и результат пишется, только если в строке
-   * не лежит проверка, стартовавшая позже. Иначе остаётся свежий результат, а
-   * выпуск по старому не просится.
+   * СТАРТА проверки по часам базы (у кнопки — момент брони, `heldAt`), и
+   * результат пишется, только если в строке не лежит проверка, стартовавшая
+   * позже. Иначе остаётся свежий результат, а выпуск по старому не просится.
+   *
+   * Сама проверка — под общим пределом DNS_PARALLEL на процесс: лишние ждут
+   * очереди.
    *
    * Выпуск просится только из статуса, прочитанного вызывающим (awaiting_dns
    * или failed), и оператор выпуска сверяет его сам: фоновый оборот берёт
    * только awaiting_dns и отказавшую заявку не перевыпустит даже в гонке —
-   * иначе он обходил бы предел повторов.
+   * иначе он обходил бы предел повторов. Исход выпуска — наружу: кнопке он
+   * нужен для честного ответа.
    *
-   * null — заявку за время проверки убрали или заменили: результат никуда не
-   * записан, выпуск не просился. Вызывающий обязан это разобрать (attach и
-   * check — 409 changed, фоновый оборот — пропустить).
+   * row: null — заявку за время проверки убрали или заменили: результат
+   * никуда не записан, выпуск не просился. Вызывающий обязан это разобрать
+   * (attach и check — 409 changed, фоновый оборот — пропустить).
    */
-  private async runCheck(row: DomainRow, p: OwnedProduct): Promise<DomainRow | null> {
-    // Текстом, а не Date: node-postgres режет timestamptz до миллисекунд, и
-    // две проверки внутри одной миллисекунды сравнялись бы.
-    const started: string = (await this.pg.query(`SELECT clock_timestamp()::text AS t`)).rows[0].t;
-    const result = await checkDns({ domain: row.domain, names: row.names, token: row.token, hostIp: p.host_ip }, this.resolver);
+  private async runCheck(row: DomainRow, p: OwnedProduct, heldAt?: string): Promise<CheckRun> {
+    const { started, result } = await this.dnsGate.run(async () => {
+      // Без брони момент старта берётся уже в очереди: ожидание места
+      // проверкой не считается. Текстом, а не Date: node-postgres режет
+      // timestamptz до миллисекунд, и две проверки внутри одной миллисекунды
+      // сравнялись бы.
+      const at: string = heldAt ?? (await this.pg.query(`SELECT clock_timestamp()::text AS t`)).rows[0].t;
+      const dns = await checkDns({ domain: row.domain, names: row.names, token: row.token, hostIp: p.host_ip }, this.resolver);
+      return { started: at, result: dns };
+    });
+    const resolverDown = result.records.every((c) => c.error)
+      ? [...new Set(result.records.map((c) => c.error))].join(',')
+      : null;
     const saved = await this.pg.query(
       `UPDATE product_domains SET check_result = $2::jsonb, checked_at = $4::timestamptz
         WHERE product_id = $1 AND token = $3
@@ -504,21 +673,22 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
       // Заявки нет или она другая — null. Та же заявка — значит, в ней уже
       // лежит проверка, стартовавшая позже нашей: отвечаем ею, без выпуска.
       const cur = await this.rowOf(row.product_id);
-      return cur?.token === row.token ? cur : null;
+      return { row: cur?.token === row.token ? cur : null, issue: null, resolverDown };
     }
     const expected = row.status;
+    let issue: IssueOutcome | null = null;
     if (result.ok && (expected === 'awaiting_dns' || expected === 'failed')) {
-      await this.tryIssue(row.product_id, row.token, expected);
+      issue = await this.tryIssue(row.product_id, row.token, expected);
     }
     const fresh = await this.rowOf(row.product_id);
-    return fresh?.token === row.token ? fresh : null;
+    return { row: fresh?.token === row.token ? fresh : null, issue, resolverDown };
   }
 
   /**
    * Перевод ЗАЯВКИ в выпуск и постановка задания агенту — ОДИН оператор. Два
    * шага оставили бы домен в issuing без задания навсегда, если между ними у
    * продукта встанет сон или пробуждение: встречная вставка роняет весь
-   * оператор, и перевод откатывается вместе с ней.
+   * оператор, и перевод откатывается вместе с ней (lostToRivalJob — busy).
    *
    * Адрес — заявка, а не продукт: (product_id, token) и статус, который
    * вызывающий прочитал. Между проверкой DNS и выпуском заявку могут отвязать
@@ -527,16 +697,17 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
    * даёт фоновому обороту (он спрашивает из awaiting_dns) перевыпустить
    * отказавшую заявку мимо предела повторов.
    *
-   * Из failed счётчик повторов растёт, а исчерпанное окно (retryWindowOpen)
-   * перехода не пускает — 'limited'. Обычный путь отбивает его раньше, в
-   * check(); здесь страховка на гонку. Через час окно начинается заново.
+   * Пределы — в самом операторе, 'limited': окно повторов из failed
+   * (retryWindowOpen; обычный путь отбивает его раньше, в check(), здесь
+   * страховка на гонку) и DOMAIN_JOBS_PER_HOUR заданий domain у продукта за
+   * час — из любого статуса.
    *
    * Исход — см. IssueOutcome. Флаги итогового SELECT смотрят в снимок
    * оператора, а UPDATE, дождавшись чужой блокировки строки, перечитывает её
    * свежей. Заявка, которую в тот же миг перевёл встречный оператор, выглядит
    * в снимке ждущей, хотя UPDATE её уже не взял, — и это 'none', а не
-   * 'limited': 'limited' — только когда окно в снимке действительно
-   * исчерпано.
+   * 'limited': 'limited' — только когда предел в снимке действительно
+   * исчерпан.
    */
   async tryIssue(productId: string, token: string, expected: 'awaiting_dns' | 'failed'): Promise<IssueOutcome> {
     try {
@@ -551,52 +722,59 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
                                          THEN now() ELSE attempts_since END
              WHERE product_id = $1 AND token = $2 AND status = $3
                AND ($3::text = 'awaiting_dns' OR ${retryWindowOpen('$4')})
+               AND ${domainJobsLeft('$5')}
                AND EXISTS (SELECT 1 FROM products p
                             WHERE p.id = $1 AND p.archived_at IS NULL AND p.status IN ${ISSUABLE_SQL})
                AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
                                 WHERE j.product_id = $1 AND j.status IN ('queued','running'))
-            RETURNING product_id
+            RETURNING product_id, domain
          ), q AS (
             INSERT INTO product_provision_jobs (product_id, kind, status)
             SELECT product_id, 'domain', 'queued' FROM d
             RETURNING product_id
          )
          SELECT (SELECT count(*) FROM q)::int AS queued,
+                (SELECT domain FROM d) AS domain,
                 EXISTS (SELECT 1 FROM product_domains
                          WHERE product_id = $1 AND token = $2 AND status = $3) AS waiting,
                 EXISTS (SELECT 1 FROM products p
                          WHERE p.id = $1 AND p.archived_at IS NULL AND p.status IN ${ISSUABLE_SQL}) AS issuable,
                 EXISTS (SELECT 1 FROM product_provision_jobs j
                          WHERE j.product_id = $1 AND j.status IN ('queued','running')) AS job_active,
-                EXISTS (SELECT 1 FROM product_domains
-                         WHERE product_id = $1 AND token = $2 AND status = 'failed' AND $3::text = 'failed'
-                           AND NOT ${retryWindowOpen('$4')}) AS spent`,
-        [productId, token, expected, RETRIES_PER_HOUR],
+                (EXISTS (SELECT 1 FROM product_domains
+                          WHERE product_id = $1 AND token = $2 AND status = 'failed' AND $3::text = 'failed'
+                            AND NOT ${retryWindowOpen('$4')})
+                 OR NOT ${domainJobsLeft('$5')}) AS spent`,
+        [productId, token, expected, RETRIES_PER_HOUR, DOMAIN_JOBS_PER_HOUR],
       );
-      const { queued, waiting, issuable, job_active, spent } = r.rows[0];
-      if (queued === 1) return 'queued';
+      const { queued, domain, waiting, issuable, job_active, spent } = r.rows[0];
+      if (queued === 1) {
+        this.logger.log(`свой домен ${domain}: выпуск сертификата поставлен (продукт ${productId})`);
+        return 'queued';
+      }
       if (!waiting) return 'none';
       if (!issuable) return 'refused';
       if (job_active) return 'busy';
       if (spent) return 'limited';
       return 'none'; // заявку в тот же миг перевёл встречный оператор — см. докблок
     } catch (e: any) {
-      if (e?.code !== '23505') throw e;
-      if (e.constraint === 'product_domains_occupied') {
+      if (e?.code === '23505' && e.constraint === 'product_domains_occupied') {
         // Домен в тот же миг ушёл в выпуск у другого продукта — индекс
         // занятых доменов не пустил эту заявку. Адрес тот же, (product_id,
         // token): отказ ложится только на неё, а не на заявку, которую
-        // успели завести вместо неё.
-        await this.pg.query(
+        // успели завести вместо неё, — тогда это 'none'.
+        const t = await this.pg.query(
           `UPDATE product_domains SET status = 'failed', error = $3, error_reason = 'taken'
-            WHERE product_id = $1 AND token = $2 AND status IN ('awaiting_dns','failed')`,
+            WHERE product_id = $1 AND token = $2 AND status IN ('awaiting_dns','failed')
+           RETURNING domain`,
           [productId, token, TAKEN],
         );
+        if (!t.rows[0]) return 'none';
+        this.logger.warn(`свой домен ${t.rows[0].domain}: в тот же миг занят другим продуктом — заявка продукта ${productId} в failed (taken)`);
         return 'taken';
       }
-      // Задание вставилось мимо NOT EXISTS (встречный сон, пробуждение) —
-      // оператор откатился целиком, перехода не было. Это busy, а не сбой.
-      return 'busy';
+      if (lostToRivalJob(e)) return 'busy';
+      throw e;
     }
   }
 
@@ -604,13 +782,20 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
    * Фоновый оборот: заявки в awaiting_dns не старше PENDING_DAYS у продуктов,
    * которым можно выпускать (погашенных не берёт), сначала давно не
    * проверенные. Только awaiting_dns: повтор после отказа — кнопкой, с
-   * пределом в час.
+   * пределом в час. Брони кнопки оборот не делает: у него своя очерёдность.
    *
    * По PENDING_PARALLEL заявок разом: проверка одной — до ~7 с. Сбой одной — в
    * лог, оборот идёт дальше; null от runCheck (заявку за это время сменили) —
-   * пропуск. Возвращает, сколько заявок взято в оборот.
+   * пропуск. Остановка модуля (stopped) — следующую заявку воркеры не берут.
+   *
+   * В обычной работе оборот молчит. Одна сводная строка — если резолвер не
+   * ответил ни одной заявке оборота: признак, что с машины недоступны
+   * 1.1.1.1 и 8.8.8.8, а не того, что DNS у всех разом не готов.
+   *
+   * Возвращает, сколько заявок взято в оборот.
    */
   async checkPending(): Promise<number> {
+    if (this.stopped) return 0;
     const r = await this.pg.query(
       `SELECT d.*, p.slug, p.kind, p.status AS product_status, p.domain AS product_address,
               host(h.public_ip) AS host_ip, h.domain_suffix
@@ -625,10 +810,13 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
       [PENDING_DAYS, PENDING_BATCH],
     );
     const rows: any[] = r.rows;
-    let next = 0;
+    let taken = 0;
+    let checked = 0;
+    const down = new Set<string>();
+    let downCount = 0;
     const worker = async () => {
-      while (next < rows.length) {
-        const row = rows[next++];
+      while (!this.stopped && taken < rows.length) {
+        const row = rows[taken++];
         const p: OwnedProduct = {
           id: row.product_id,
           slug: row.slug,
@@ -639,23 +827,37 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
           domain_suffix: row.domain_suffix,
         };
         try {
-          await this.runCheck(row, p);
+          const run = await this.runCheck(row, p);
+          checked++;
+          if (run.resolverDown) {
+            downCount++;
+            down.add(run.resolverDown);
+          }
         } catch (e: any) {
           this.logger.warn(`проверка DNS ${row.domain}: ${e?.message ?? e}`);
         }
       }
     };
     await Promise.all(Array.from({ length: Math.min(PENDING_PARALLEL, rows.length) }, worker));
-    return rows.length;
+    if (checked > 0 && downCount === checked) {
+      this.logger.warn(
+        `проверка DNS: резолвер не ответил ни одной из ${checked} заявок оборота (${[...down].join('; ')}) — ` +
+          `с машины недоступны 1.1.1.1 и 8.8.8.8?`,
+      );
+    }
+    return taken;
   }
 
   /**
    * Сироты: строки в issuing и removing, у продукта которых нет активного
-   * задания. Законно так не бывает — оба перехода делаются одним оператором
-   * вместе с заданием, и закрывает их тоже один оператор (приём отчёта,
-   * задача 6). Значит, задание сняли снаружи: гашение и снятие блокировки
-   * снимают активное задание ЛЮБОГО вида (block.service.ts, killed_jobs),
-   * сборщик зависших — тоже (failStaleProvisioning). Без сверки строка
+   * задания ИМЕННО вида domain. Законная такая строка его всегда имеет: оба
+   * перехода делаются одним оператором вместе с заданием, а единственное
+   * активное задание продукта (one_active) другого вида рядом с ним не
+   * пустит; закрывает их тоже один оператор (приём отчёта, задача 6).
+   * Значит, задание сняли снаружи: гашение и снятие блокировки снимают
+   * активное задание ЛЮБОГО вида (block.service.ts, killed_jobs), сборщик
+   * зависших — тоже (failStaleProvisioning). По любому виду сирота ждала бы,
+   * пока кончится сон, который гашение тут же ставит. Без сверки строка
    * осталась бы в issuing навсегда: отвязать нельзя, индекс держит домен.
    *
    * В failed, а не повторная постановка: повтор крутился бы вечно там, где
@@ -671,7 +873,8 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
               error_reason = CASE d.status WHEN 'removing' THEN 'orphan_removing' ELSE 'orphan_issuing' END
         WHERE d.status IN ('issuing','removing')
           AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
-                           WHERE j.product_id = d.product_id AND j.status IN ('queued','running'))
+                           WHERE j.product_id = d.product_id AND j.kind = 'domain'
+                             AND j.status IN ('queued','running'))
        RETURNING d.product_id, d.domain, d.error_reason`,
       [ORPHAN_REMOVING, ORPHAN_ISSUING],
     );
@@ -691,7 +894,7 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
    * медленная проверка не придерживает. Сбой — в лог, не в процесс.
    */
   private async safeTick(tick: Tick) {
-    if (this.ticking[tick]) return;
+    if (this.stopped || this.ticking[tick]) return;
     this.ticking[tick] = true;
     try {
       if (tick === 'pending') await this.checkPending();
