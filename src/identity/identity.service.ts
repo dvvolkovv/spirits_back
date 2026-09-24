@@ -343,36 +343,61 @@ export class IdentityService implements OnModuleInit {
    * `{userId}_{agentId}`, и перенос склеил бы два параллельных разговора с
    * одним ассистентом в одну ленту вперемешку по времени.
    */
-  async mergeAccounts(conflictUserId: string, targetUserId: string): Promise<void> {
+  async mergeAccounts(conflictUserId: string, targetUserId: string): Promise<{ survivorUserId: string; loserUserId: string }> {
     if (!this.pg) throw new Error('pg not configured');
 
+    // Выживает СТАРШИЙ аккаунт (по user_id.create_date): в нём обычно больше
+    // накопленного. При равных/неизвестных датах выживает targetUserId — тот,
+    // под которым человек сейчас залогинен, чтобы зря не менять сессию. Если
+    // выжил не target, контроллер выдаст свежий JWT на survivor.
+    const dates = await this.pg.query(
+      `SELECT internal_id, create_date FROM user_id WHERE internal_id = ANY($1)`,
+      [[conflictUserId, targetUserId]],
+    );
+    const at = (id: string) => {
+      const r = dates.rows.find((x: any) => x.internal_id === id);
+      return r?.create_date ? new Date(r.create_date).getTime() : null;
+    };
+    const dc = at(conflictUserId);
+    const dt = at(targetUserId);
+    const survivorUserId =
+      dc != null && dt != null && dc !== dt ? (dc < dt ? conflictUserId : targetUserId) : targetUserId;
+    const loserUserId = survivorUserId === conflictUserId ? targetUserId : conflictUserId;
+    if (survivorUserId === loserUserId) return { survivorUserId, loserUserId };
+
+    // Баланс: сначала начисление на survivor, потом списание с loser — порядок
+    // «падать в пользу человека» (задвоенный баланс лучше сгоревшего), т.к.
+    // PgService раздаёт соединения из пула и настоящей транзакции здесь нет.
+    // Историю чата НЕ переносим сознательно: session_id = `{userId}_{agentId}`,
+    // перенос склеил бы два параллельных разговора с одним ассистентом.
     const bal = await this.pg.query(
       `SELECT COALESCE(tokens, 0) AS tokens FROM ai_profiles_consolidated WHERE user_id = $1 FOR UPDATE`,
-      [conflictUserId],
+      [loserUserId],
     );
     const tokens = Number(bal.rows[0]?.tokens ?? 0);
     if (tokens > 0) {
       await this.pg.query(`SELECT add_user_tokens($1, $2, 'adjustment', $3, NULL)`, [
-        targetUserId,
+        survivorUserId,
         tokens,
-        `Перенос остатка с объединённого аккаунта ${conflictUserId}`,
+        `Перенос остатка с объединённого аккаунта ${loserUserId}`,
       ]);
       await this.pg.query(`SELECT add_user_tokens($1, $2, 'adjustment', $3, NULL)`, [
-        conflictUserId,
+        loserUserId,
         -tokens,
-        `Перенос остатка на основной аккаунт ${targetUserId}`,
+        `Перенос остатка на основной аккаунт ${survivorUserId}`,
       ]);
-      this.logger.log(`merge: ${tokens} токенов ${conflictUserId} → ${targetUserId}`);
+      this.logger.log(`merge: ${tokens} токенов ${loserUserId} → ${survivorUserId}`);
     }
 
     await this.pg.query(
       `UPDATE user_identities SET user_id = $1 WHERE user_id = $2`,
-      [targetUserId, conflictUserId],
+      [survivorUserId, loserUserId],
     );
     await this.pg.query(
       `UPDATE user_id SET state = 'deleted', update_date = now() WHERE internal_id = $1`,
-      [conflictUserId],
+      [loserUserId],
     );
+    return { survivorUserId, loserUserId };
   }
 
   /**

@@ -388,7 +388,7 @@ location.replace('/chat');
         if (rFail.reason === 'conflict' && rFail.conflictUserId) {
           const mergeToken = require('crypto').randomBytes(24).toString('base64url');
           const conflictTokens = await this.identity.getTokenBalance(rFail.conflictUserId);
-          await this.redis.set(`merge-token-${mergeToken}`, JSON.stringify({ targetUserId: stateData.userId, conflictUserId: rFail.conflictUserId }), 300);
+          await this.redis.set(`merge-token-${mergeToken}`, JSON.stringify({ targetUserId: stateData.userId, conflictUserId: rFail.conflictUserId }), 1800);
           return res.set(CORS).status(409).json({ error: 'conflict', mergeToken, conflictTokens });
         }
         return res.set(CORS).status(409).json({ error: 'conflict' });
@@ -437,7 +437,7 @@ location.replace('/chat');
         if (rFail.reason === 'conflict' && rFail.conflictUserId) {
           const mergeToken = require('crypto').randomBytes(24).toString('base64url');
           const conflictTokens = await this.identity.getTokenBalance(rFail.conflictUserId);
-          await this.redis.set(`merge-token-${mergeToken}`, JSON.stringify({ targetUserId: stateData.userId, conflictUserId: rFail.conflictUserId }), 300);
+          await this.redis.set(`merge-token-${mergeToken}`, JSON.stringify({ targetUserId: stateData.userId, conflictUserId: rFail.conflictUserId }), 1800);
           return res.set(CORS).status(409).json({ error: 'conflict', mergeToken, conflictTokens });
         }
         return res.set(CORS).status(409).json({ error: 'conflict' });
@@ -514,7 +514,7 @@ location.replace('/chat');
           await this.redis.set(
             `merge-token-${mergeToken}`,
             JSON.stringify({ targetUserId: userId, conflictUserId: rFail.conflictUserId }),
-            300,
+            1800,
           );
           return res.set(CORS).status(409).json({ error: 'conflict', mergeToken, conflictTokens });
         }
@@ -585,7 +585,18 @@ location.replace('/chat');
     if (storedTarget !== targetUserId) return res.set(CORS).status(403).json({ error: 'token mismatch' });
 
     await this.redis.del(`merge-token-${mergeToken}`);
-    await this.identity.mergeAccounts(conflictUserId, targetUserId);
+    const { survivorUserId } = await this.identity.mergeAccounts(conflictUserId, targetUserId);
+
+    // Выживает старший аккаунт. Если это не тот, под которым юзер залогинен, его
+    // текущий JWT указывает на удалённый аккаунт — выдаём свежую пару на
+    // survivor, фронт её подменит.
+    if (survivorUserId !== targetUserId) {
+      return res.set(CORS).status(200).json({
+        merged: true,
+        'access-token': this.jwt.signAccess(survivorUserId),
+        'refresh-token': this.jwt.signRefresh(survivorUserId),
+      });
+    }
     return res.set(CORS).status(200).json({ merged: true });
   }
 
