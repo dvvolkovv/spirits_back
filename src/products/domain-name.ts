@@ -181,6 +181,16 @@ export function normalizeDomain(raw: unknown): NormalizeResult {
   return { ok: true, domain, zone: info.domain, apex, names };
 }
 
+/**
+ * Зона регистратора для УЖЕ сохранённого домена — прямым разбором списка
+ * суффиксов (тем же, что в normalizeDomain), без повторной нормализации: её
+ * правила могут ужесточиться, а инструкция у привязанного домена должна
+ * остаться прежней.
+ */
+export function registrableZone(domain: string): string {
+  return parse(domain, { allowPrivateDomains: true }).domain ?? domain;
+}
+
 /** Имя записи так, как его вводят в панели регистратора: относительно зоны. */
 export function relativeName(fqdn: string, zone: string): string {
   if (fqdn === zone) return '@';

@@ -1,4 +1,4 @@
-import { MAX_INPUT_LENGTH, MAX_LABELS, MAX_NAME_LENGTH, normalizeDomain, relativeName } from './domain-name';
+import { MAX_INPUT_LENGTH, MAX_LABELS, MAX_NAME_LENGTH, normalizeDomain, registrableZone, relativeName } from './domain-name';
 
 // strictNullChecks выключен в tsconfig.json (build-конфиг его наследует) —
 // на !r.ok TS не сужает union NormalizeResult (r.reason/r.say/r.domain дальше
@@ -210,6 +210,17 @@ describe('нормализация своего домена', () => {
     if (r.ok === false) expect(r.say).toMatch(/IP/);
   });
 
+  // Инструкцию для регистратора сервис строит от СОХРАНЁННОГО домена, а не
+  // повторной нормализацией: правила нормализатора могут ужесточиться, а
+  // записи у привязанного домена обязаны остаться прежними.
+  it('зона регистратора сохранённого домена — прямым разбором списка суффиксов', () => {
+    expect(registrableZone('dmitryvolkov.ru')).toBe('dmitryvolkov.ru');
+    expect(registrableZone('shop.dmitryvolkov.ru')).toBe('dmitryvolkov.ru');
+    expect(registrableZone('firm.spb.ru')).toBe('firm.spb.ru'); // PRIVATE-зона FAITID, а не поддомен spb.ru
+    expect(registrableZone('shop.site.co.uk')).toBe('site.co.uk');
+    expect(registrableZone('xn--e1afmkfd.xn--p1ai')).toBe('xn--e1afmkfd.xn--p1ai');
+  });
+
   it('относительное имя записи — от зоны регистратора', () => {
     expect(relativeName('dmitryvolkov.ru', 'dmitryvolkov.ru')).toBe('@');
     expect(relativeName('www.dmitryvolkov.ru', 'dmitryvolkov.ru')).toBe('www');
@@ -265,6 +276,9 @@ describe('контракт: любой ok-результат — валидна�
     if (r.ok === false) throw new Error(`ждали ok для ${raw}, получили ${r.reason}: ${r.say}`);
     expect(r.domain).toMatch(/^[a-z0-9-]+(\.[a-z0-9-]+)+$/);
     expect(r.names[0]).toBe(r.domain);
+    // Зона, от которой сервис считает записи для регистратора (по сохранённому
+    // домену), — та же, что увидела нормализация.
+    expect(registrableZone(r.domain)).toBe(r.zone);
     expect([1, 2]).toContain(r.names.length);
     if (r.names.length === 2) expect(r.names[1]).toBe(`www.${r.domain}`);
     for (const n of r.names) {
