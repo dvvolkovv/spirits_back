@@ -303,6 +303,9 @@ describe('продукт под pm2 (PRODUCT_START_SCRIPT): перезапуск
     await executeTurn({ turn: revertTurn, product: SELF_SERVICE, config: PM2, ...d, freeProductPort } as any);
 
     const { freePort } = d.deploy.mock.calls[0][0];
+    // Утверждением, а не TypeError на вызове: без уборки откат обязан краснеть
+    // понятной строкой.
+    expect(typeof freePort).toBe('function');
     await freePort(jest.fn());
     expect(freeProductPort).toHaveBeenCalledWith(expect.objectContaining({ healthUrl: 'http://127.0.0.1:3000/health' }));
   });
