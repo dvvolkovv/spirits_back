@@ -159,6 +159,19 @@ maybe('миграция 008: свой домен', () => {
           pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'shop.a.ru', '{shop.a.ru}', 'lk')`, [id]),
         ).resolves.toBeDefined();
       });
+
+      // Страж на якорь ^: `~` в Postgres ищет совпадение где угодно в строке,
+      // а не обязательно с начала. Без ^ подстрока 'a.ru' внутри '.a.ru' сама
+      // по себе форму проходит, и мусорный домен с пустой первой меткой
+      // проскочил бы CHECK. Существующие тесты этого не ловят: 'A.ru' невалиден
+      // и без ^ (перед единственной точкой только заглавная 'A', в класс
+      // [a-z0-9-] не входящая) — нужен именно ведущий разделитель, а не регистр.
+      it('точка перед доменом не проходит форму (без ^ подстрока после неё прошла бы)', async () => {
+        const id = await mkProduct('shop');
+        await expect(
+          pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, '.a.ru', '{.a.ru}', 'lk')`, [id]),
+        ).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_domain_form' });
+      });
     });
 
     describe('форма names (product_domains_names_shape)', () => {
