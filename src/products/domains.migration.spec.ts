@@ -108,6 +108,46 @@ maybe('миграция 008: свой домен', () => {
     ).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_status_check' });
   });
 
+  // Код причины ошибки — ключ перевода в кабинете; текст — для ассистента.
+  describe('причина ошибки (error_reason)', () => {
+    const put = (id: string, error: string | null, reason: string | null) =>
+      pool.query(
+        `INSERT INTO product_domains (product_id, domain, names, token, status, error, error_reason)
+         VALUES ($1, 'a.ru', '{a.ru}', 'lk', 'failed', $2, $3)`,
+        [id, error, reason],
+      );
+
+    it('все пять кодов принимаются', async () => {
+      for (const reason of ['taken', 'orphan_issuing', 'orphan_removing', 'issue_failed', 'remove_failed']) {
+        const id = await mkProduct(`shop-${reason.replace('_', '-')}`);
+        await expect(put(id, 'текст', reason)).resolves.toBeDefined();
+      }
+    });
+
+    // Текст задан, чтобы пара сошлась и отказ был именно словаря.
+    it('неизвестный код — отказ словаря', async () => {
+      const id = await mkProduct('shop');
+      await expect(put(id, 'текст', 'weird')).rejects.toMatchObject({
+        code: '23514', constraint: 'product_domains_error_reason_check',
+      });
+    });
+
+    it('текст без кода — отказ пары: кабинету нечего переводить', async () => {
+      const id = await mkProduct('shop');
+      await expect(put(id, 'текст', null)).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_error_pair' });
+    });
+
+    it('код без текста — отказ пары: ассистенту нечего сказать', async () => {
+      const id = await mkProduct('shop');
+      await expect(put(id, null, 'taken')).rejects.toMatchObject({ code: '23514', constraint: 'product_domains_error_pair' });
+    });
+
+    it('без ошибки — оба пусты', async () => {
+      const id = await mkProduct('shop');
+      await expect(put(id, null, null)).resolves.toBeDefined();
+    });
+  });
+
   it('удаление продукта уносит его домен', async () => {
     const id = await mkProduct('shop');
     await pool.query(`INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'a.ru', '{a.ru}', 'lk')`, [id]);

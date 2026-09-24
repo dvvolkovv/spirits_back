@@ -46,6 +46,14 @@ CREATE TABLE IF NOT EXISTS product_domains (
   status         text NOT NULL DEFAULT 'awaiting_dns'
                  CHECK (status IN ('awaiting_dns','issuing','active','failed','removing')),
   error          text,
+  -- Машинный код причины error: по нему кабинет переводит ошибку на язык
+  -- пользователя, а сам error — русский текст для ассистента и запасной показ
+  -- (у отказа Let's Encrypt там дословная строка агента, перевести её нечем).
+  -- taken — домен в тот же миг занял другой продукт; orphan_issuing и
+  -- orphan_removing — задание выпуска или отвязки сняли снаружи (гашение,
+  -- снятие блокировки, сборщик зависших); issue_failed и remove_failed —
+  -- отказ, о котором отчитался агент.
+  error_reason   text,
   check_result   jsonb,
   checked_at     timestamptz,
   attempts       int NOT NULL DEFAULT 0,
@@ -81,7 +89,19 @@ CREATE TABLE IF NOT EXISTS product_domains (
     cardinality(names) BETWEEN 1 AND 2
     AND names[1] IS NOT DISTINCT FROM domain
     AND (cardinality(names) = 1 OR names[2] IS NOT DISTINCT FROM 'www.' || domain)
-  )
+  ),
+
+  -- Словарь причин закрыт здесь же, инлайново, как и словарь состояний:
+  -- неизвестный код кабинет показал бы сырым ключом перевода. Новый код — это
+  -- новая миграция, а не правка этой строки (см. шапку файла).
+  CONSTRAINT product_domains_error_reason_check CHECK (
+    error_reason IN ('taken','orphan_issuing','orphan_removing','issue_failed','remove_failed')
+  ),
+
+  -- Текст и код — парой: оба заданы или оба пусты. Текст без кода кабинет не
+  -- переведёт, код без текста ассистенту нечего сказать; а запись, забывшая
+  -- одно из двух, падает здесь, а не всплывает пустой ошибкой в кабинете.
+  CONSTRAINT product_domains_error_pair CHECK ((error IS NULL) = (error_reason IS NULL))
 );
 
 -- Уникальность ТОЛЬКО среди занятых доменов. Заявок в awaiting_dns на один
