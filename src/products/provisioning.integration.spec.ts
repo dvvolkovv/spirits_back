@@ -504,6 +504,11 @@ maybe('провижининг против живого Postgres', () => {
       port: null,
       runnerToken: expect.stringMatching(/^[0-9a-f]{64}$/),
       secrets: { BOT_TOKEN: '123:abc' },
+      // Расширение контракта (свой домен): имена приезжают в каждом задании —
+      // у продукта без своего домена пустым списком; режим у заводящегося —
+      // прокси. Поведение обоих полей — в domains.jobs.spec.ts.
+      customNames: [],
+      vhostMode: 'proxy',
     });
     expect(Buffer.isBuffer((await getProduct(p.id)).secrets_encrypted)).toBe(true);
 

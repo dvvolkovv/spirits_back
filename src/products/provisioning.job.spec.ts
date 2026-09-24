@@ -155,12 +155,20 @@ describe('ProvisioningService.claimJob', () => {
     // за всеми, кто пришёл после, и при непрерывном потоке не дожидается
     // никогда. Проверка на присутствие `ORDER BY created_at` совпадает и с
     // DESC, поэтому направление сторожится отдельно.
+    //
+    // Запрет DESC — на ОТБОР очереди (CTE picked), а не на весь оператор:
+    // режим конфига для задания domain (vhost_mode в итоговом SELECT)
+    // спрашивает «последнее задание» продукта, и DESC там законен и
+    // обязателен (см. wokenSql).
     const { svc, calls } = makeService();
 
     await svc.claimJob('own');
 
-    expect(calls[0].sql).toMatch(/ORDER BY\s+j\.created_at\s+ASC/);
-    expect(calls[0].sql).not.toMatch(/DESC/i);
+    const end = calls[0].sql.indexOf('claimed AS');
+    expect(end).toBeGreaterThan(0);
+    const picked = calls[0].sql.slice(0, end);
+    expect(picked).toMatch(/ORDER BY\s+j\.created_at\s+ASC/);
+    expect(picked).not.toMatch(/DESC/i);
   });
 
   it('задание похороненного или архивного продукта не выдаётся', async () => {
@@ -407,6 +415,10 @@ describe('ProvisioningService.claimJob', () => {
       port: null,
       runnerToken: expect.stringMatching(/^[0-9a-f]{64}$/),
       secrets: { BOT_TOKEN: 'т' },
+      // Расширение контракта (свой домен): имена и режим конфига приезжают в
+      // каждом задании. У строки без своих колонок — пустой список и прокси.
+      customNames: [],
+      vhostMode: 'proxy',
     });
   });
 
@@ -478,12 +490,16 @@ describe('claimJob: вид задания', () => {
     // Условие сверяется В СВЯЗКЕ с видом, а не списком статусов: `status IN
     // ('provisioning','sleeping')` выдал бы ЗАВЕДЕНИЕ спящему продукту, то
     // есть развернул бы каркас поверх живого каталога клиента.
+    //
+    // У задания domain (свой домен) ветка своя, и перед ней в SQL стоит
+    // комментарий — отсюда допуск строк `--` между ветками. Поведенческий
+    // сторож этой ветки — domains.jobs.spec.ts.
     const { svc, calls } = makeService();
 
     await svc.claimJob('own');
 
     expect(calls[0].sql).toMatch(
-      /CASE j\.kind\s+WHEN 'provision' THEN p\.status = 'provisioning'\s+WHEN 'sleep' THEN p\.status IN \('sleeping','blocked'\)\s+ELSE p\.status = 'sleeping'\s+END/,
+      /CASE j\.kind\s+WHEN 'provision' THEN p\.status = 'provisioning'\s+WHEN 'sleep' THEN p\.status IN \('sleeping','blocked'\)\s+(?:--[^\n]*\n\s*)*WHEN 'domain' THEN p\.status IN \('running','degraded','sleeping','blocked'\)\s+ELSE p\.status = 'sleeping'\s+END/,
     );
   });
 
@@ -503,7 +519,8 @@ describe('claimJob: вид задания', () => {
     await svc.claimJob('own');
 
     const sql = calls[0].sql;
-    // 'sleep' — единственный вид со своей веткой про 'blocked'.
+    // Из сна и пробуждения своя ветка про 'blocked' — только у 'sleep'
+    // ('domain' пускает погашенного ради отвязки, см. claimJob).
     expect(sql).toMatch(/WHEN 'sleep' THEN p\.status IN \('sleeping','blocked'\)/);
     // ELSE (то есть 'wake') остаётся узким: 'blocked' в нём быть не должно.
     expect(sql).toMatch(/ELSE p\.status = 'sleeping'/);
@@ -915,8 +932,13 @@ describe('completeJob: повторный отчёт по уже закрыто�
     // Проверка «второго запроса нет» обесценилась: запрос и был один. Теперь
     // сторожится ФОРМА, которая делает продукт недостижимым при закрытом
     // задании: замок в CTE плюс соединение продукта с этим CTE.
-    expect(calls).toHaveLength(1);
-    const { job, product } = partsOf(calls[0].sql);
+    //
+    // Запись ровно одна; перед ней стоит только ЧТЕНИЕ вида задания (отчёт по
+    // своему домену разбирается отдельно, см. completeDomainJob), поэтому
+    // считаются записи, а не все запросы.
+    const writes = calls.filter((c) => c.sql.includes('UPDATE'));
+    expect(writes).toHaveLength(1);
+    const { job, product } = partsOf(writes[0].sql);
     expect(job).toMatch(/AND\s+status\s*=\s*'running'/);
     expect(product).toMatch(/FROM\s+closed\s+WHERE\s+products\.id\s*=\s*closed\.product_id/);
     // След в логе. Без него единственный признак того, что отчёт агента ушёл
@@ -931,8 +953,9 @@ describe('completeJob: повторный отчёт по уже закрыто�
 
     await svc.completeJob('j-1', { ok: true, port: 8003 });
 
-    expect(calls).toHaveLength(1);
-    const { job, product } = partsOf(calls[0].sql);
+    const writes = calls.filter((c) => c.sql.includes('UPDATE'));
+    expect(writes).toHaveLength(1);
+    const { job, product } = partsOf(writes[0].sql);
     expect(job).toMatch(/AND\s+status\s*=\s*'running'/);
     expect(product).toMatch(/FROM\s+closed\s+WHERE\s+products\.id\s*=\s*closed\.product_id/);
     expect(warn).toHaveBeenCalled();
