@@ -27,6 +27,13 @@ export interface RunnerConfig {
   pollTimeoutMs: number;
   /** Таймаут обычных запросов (sendEvents, complete). См. DEFAULT_REQUEST_TIMEOUT_MS. */
   requestTimeoutMs: number;
+  /**
+   * Точка входа продукта для pm2 (`PRODUCT_START_SCRIPT` из docker run). Задана —
+   * значит entrypoint.sh поднял продукт под pm2 с именем `product`, и раннер
+   * знает, как его перезапустить и кто законно держит его порт. null — продукт
+   * не под pm2, и раннер ни того ни другого не знает.
+   */
+  productStartScript: string | null;
 }
 
 function required(env: NodeJS.ProcessEnv, key: string): string {
@@ -52,5 +59,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     claudeBin: env.CLAUDE_BIN ?? '/usr/bin/claude',
     pollTimeoutMs: Number(env.POLL_TIMEOUT_MS ?? DEFAULT_POLL_TIMEOUT_MS),
     requestTimeoutMs: Number(env.REQUEST_TIMEOUT_MS ?? DEFAULT_REQUEST_TIMEOUT_MS),
+    productStartScript: env.PRODUCT_START_SCRIPT || null,
   };
 }

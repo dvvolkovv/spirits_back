@@ -26,6 +26,10 @@ fi
 # Поймано живьём: ход с заведомо падающим require закрылся как «Готово», pm2
 # показывал errored и 93 перезапуска, а сайт отдавал 200 со старого процесса.
 # Автооткат при такой раскладке не срабатывает никогда.
+#
+# Имя `product` — контракт с раннером (PM2_APP в src/orphans.ts): при пустом
+# restart_cmd он сам зовёт `pm2 restart product`, а перед каждым перезапуском
+# спрашивает `pm2 pid product`, кто законно держит порт продукта.
 if [ -n "${PRODUCT_START_SCRIPT:-}" ]; then
   cd "$CHECKOUT_PATH"
   pm2 start "$PRODUCT_START_SCRIPT" --name product --time || {

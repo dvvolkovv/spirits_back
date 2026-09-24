@@ -2,7 +2,8 @@ import { RunnerConfig } from './config';
 import { LinkeonApi, PollResult } from './api';
 import { Git } from './git';
 import { NDJsonEvent, runClaude as runClaudeReal } from './claude';
-import { deploy as deployReal } from './deploy';
+import { deploy as deployReal, DeployInput } from './deploy';
+import { freeProductPort as freeProductPortReal, PM2_RESTART_CMD } from './orphans';
 
 export interface ExecuteTurnInput {
   turn: NonNullable<PollResult['turn']>;
@@ -12,6 +13,43 @@ export interface ExecuteTurnInput {
   api: LinkeonApi;
   runClaude?: typeof runClaudeReal;
   deploy?: typeof deployReal;
+  freeProductPort?: typeof freeProductPortReal;
+}
+
+/**
+ * Как поднимать продукт: общее для обычного хода и служебного отката.
+ *
+ * Продукт под pm2 (задан PRODUCT_START_SCRIPT) раннер умеет перезапустить сам и
+ * знает, кто законно держит его порт. Отсюда две вещи:
+ *
+ * - Пустой restart_cmd заменяется на `pm2 restart product`. Самообслуживание
+ *   заводит продукты с NULL в build_cmd и restart_cmd (реестр 22.09.2026,
+ *   dmitryvolkov) — и раннер после правки не перезапускал ничего. Проверка
+ *   здоровья тогда сверяла sha новой правки со СТАРЫМ процессом, и ход
+ *   откатывался всегда, если только агент сам не перезапустил pm2 после своего
+ *   коммита. build_cmd не подставляется: сборки у каркаса нет, а выдуманная
+ *   команда на продукте без скрипта build роняла бы каждый ход.
+ * - Перед каждым перезапуском порт освобождается от процессов вне pm2.
+ *
+ * Не под pm2 — раннер не знает ни команды, ни законного держателя, и не
+ * трогает ни того ни другого.
+ */
+function productRuntime(
+  product: PollResult['product'],
+  config: RunnerConfig,
+  freeProductPort: typeof freeProductPortReal,
+): Pick<DeployInput, 'buildCmd' | 'restartCmd' | 'healthUrl' | 'cwd' | 'freePort'> {
+  const underPm2 = Boolean(config.productStartScript);
+  const restartCmd = product.restartCmd?.trim() ? product.restartCmd : underPm2 ? PM2_RESTART_CMD : null;
+  return {
+    buildCmd: product.buildCmd,
+    restartCmd,
+    healthUrl: product.healthUrl,
+    cwd: product.checkoutPath,
+    freePort: underPm2
+      ? (report) => freeProductPort({ healthUrl: product.healthUrl, onPhase: report })
+      : undefined,
+  };
 }
 
 /**
@@ -22,6 +60,7 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<void> {
   const { turn, product, git, api } = input;
   const runClaude = input.runClaude ?? runClaudeReal;
   const deploy = input.deploy ?? deployReal;
+  const runtime = productRuntime(product, input.config, input.freeProductPort ?? freeProductPortReal);
 
   // Чужие ручные правки коммитятся ДО снятия точки возврата: иначе sha_before
   // укажет на состояние без них, и откат их уничтожит.
@@ -40,10 +79,7 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<void> {
     await deploy({
       git,
       shaBefore: target,
-      buildCmd: product.buildCmd,
-      restartCmd: product.restartCmd,
-      healthUrl: product.healthUrl,
-      cwd: product.checkoutPath,
+      ...runtime,
     });
     await api.sendEvents(turn.id, [{ type: 'end' }]);
     await api.complete(turn.id, { status: 'reverted', shaBefore: target });
@@ -107,10 +143,7 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<void> {
   const result = await deploy({
     git,
     shaBefore,
-    buildCmd: product.buildCmd,
-    restartCmd: product.restartCmd,
-    healthUrl: product.healthUrl,
-    cwd: product.checkoutPath,
+    ...runtime,
     // Продукт обязан подтвердить, что поднялся ИМЕННО на этой правке.
     expectedSha: shaAfter,
     // Отчёт о фазах: без него сборка выглядит для сборщика зависших молчанием,
