@@ -43,14 +43,47 @@ maybe('свой домен: сервис против живого Postgres', ()
     return s;
   };
 
-  const mkProduct = async (o: { slug: string; user?: string; kind?: string; status?: string }) => {
+  const mkProduct = async (o: { slug: string; user?: string; kind?: string; status?: string; domain?: string | null }) => {
     const r = await pool.query(
       `INSERT INTO products (user_id, name, slug, kind, status, checkout_path, runner_token_hash, host_id, port, domain)
        VALUES ($1, $2, $2, $3, $4, $5, $6, 'own', 8001, $7) RETURNING id`,
       [o.user ?? OWNER, o.slug, o.kind ?? 'site', o.status ?? 'running', `/srv/${o.slug}`, `hash-${o.slug}`,
-       (o.kind ?? 'site') === 'site' ? `${o.slug}.p.linkeon.io` : null],
+       o.domain !== undefined ? o.domain : (o.kind ?? 'site') === 'site' ? `${o.slug}.p.linkeon.io` : null],
     );
     return r.rows[0].id as string;
+  };
+
+  /**
+   * Обёртка pg для гонок: запросы по шаблону ждут, пока их не соберётся n, и
+   * уходят в базу разом. Не дождались за 5 с — отпускает всех: пусть решают
+   * утверждения теста, а не таймаут jest.
+   */
+  const barrierOn = (re: RegExp, n = 2) => {
+    let arrived = 0;
+    let release!: () => void;
+    const all = new Promise<void>((r) => (release = r));
+    const timer = setTimeout(() => release(), 5_000);
+    return {
+      query: async (sql: string, params?: any[]) => {
+        if (re.test(sql)) {
+          if (++arrived === n) {
+            clearTimeout(timer);
+            release();
+          }
+          await all;
+        }
+        return pool.query(sql, params);
+      },
+    };
+  };
+
+  /** Опрос условия (не сон вслепую): короткая пауза между заходами, потолок 10 с. */
+  const until = async (cond: () => Promise<boolean>) => {
+    const deadline = Date.now() + 10_000;
+    while (!(await cond())) {
+      if (Date.now() > deadline) throw new Error('условие не наступило за 10 с');
+      await new Promise((r) => setTimeout(r, 10));
+    }
   };
   const row = async (productId: string) =>
     (await pool.query(`SELECT * FROM product_domains WHERE product_id = $1`, [productId])).rows[0];
@@ -181,9 +214,9 @@ maybe('свой домен: сервис против живого Postgres', ()
 
     it('повторная привязка того же домена — тот же ответ, код не меняется', async () => {
       const id = await mkProduct({ slug: 'shop' });
-      await svc().attach(OWNER, id, 'a.ru');
+      const first = await svc().attach(OWNER, id, 'a.ru');
       const token = (await row(id)).token;
-      await svc().attach(OWNER, id, 'https://A.RU/');
+      await expect(svc().attach(OWNER, id, 'https://A.RU/')).resolves.toEqual(first);
       expect((await row(id)).token).toBe(token);
     });
 
@@ -191,6 +224,68 @@ maybe('свой домен: сервис против живого Postgres', ()
       const id = await mkProduct({ slug: 'shop' });
       await svc().attach(OWNER, id, 'a.ru');
       await expect(svc().attach(OWNER, id, 'b.ru')).rejects.toMatchObject({ status: 409, response: { reason: 'has_domain' } });
+    });
+
+    // Отвязка уже идёт: «сначала отвяжите» было бы неправдой, а 200 со
+    // строкой в removing — обещанием домена, который вот-вот снимут.
+    it('пока домен отвязывается — любая привязка 409 removing', async () => {
+      const id = await mkProduct({ slug: 'shop' });
+      await putDomain(id, 'removing');
+      const removing = { status: 409, response: { reason: 'removing' } };
+      await expect(svc().attach(OWNER, id, 'a.ru')).rejects.toMatchObject(removing);
+      await expect(svc().attach(OWNER, id, 'b.ru')).rejects.toMatchObject(removing);
+    });
+
+    // Спека: заявок в awaiting_dns на один домен сколько угодно — домен
+    // достаётся той, чей TXT первым появится в DNS. Считай занятость и по
+    // ждущим/отказанным, любой мог бы забронировать чужой домен впрок.
+    it('чужие заявки awaiting_dns и failed на тот же домен не мешают', async () => {
+      const mine = await mkProduct({ slug: 'mine' });
+      const t1 = await mkProduct({ slug: 't1', user: ALIEN });
+      const t2 = await mkProduct({ slug: 't2', user: ALIEN });
+      await putDomain(t1, 'awaiting_dns', { token: 'lk-1' });
+      await putDomain(t2, 'failed', { token: 'lk-2', error: 'x' });
+      await expect(svc().attach(OWNER, mine, 'a.ru')).resolves.toMatchObject({ status: 'awaiting_dns' });
+    });
+
+    // Обе прошли проверку «строки нет» и вставляют разом: без ON CONFLICT
+    // вторая получила бы 500 (23505 product_domains_pkey).
+    it('две привязки разных доменов разом — одна проходит, другая has_domain, строка одна', async () => {
+      const id = await mkProduct({ slug: 'shop' });
+      const s = svc(barrierOn(/^\s*INSERT INTO product_domains/));
+      const results = await Promise.allSettled([s.attach(OWNER, id, 'a.ru'), s.attach(OWNER, id, 'b.ru')]);
+      const ok = results.filter((r) => r.status === 'fulfilled') as PromiseFulfilledResult<any>[];
+      const refused = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
+      expect(ok).toHaveLength(1);
+      expect(refused).toHaveLength(1);
+      expect(refused[0].reason).toMatchObject({ status: 409, response: { reason: 'has_domain' } });
+      const rows = (await pool.query(`SELECT domain FROM product_domains WHERE product_id = $1`, [id])).rows;
+      expect(rows).toEqual([{ domain: ok[0].value.domain }]);
+    });
+
+    // Проигравший в ON CONFLICT не гоняет свою проверку DNS: её гоняет тот,
+    // кто завёл строку, а проигравшему достаётся ответ по этой строке.
+    it('две привязки одного домена разом — DNS проверяет только та, что завела строку', async () => {
+      const id = await mkProduct({ slug: 'shop' });
+      const txt = jest.spyOn(dns, 'resolveTxt');
+      const s = svc(barrierOn(/^\s*INSERT INTO product_domains/));
+      const results = await Promise.allSettled([s.attach(OWNER, id, 'a.ru'), s.attach(OWNER, id, 'a.ru')]);
+      expect(results.map((r) => r.status)).toEqual(['fulfilled', 'fulfilled']);
+      expect(results.map((r: any) => r.value.domain)).toEqual(['a.ru', 'a.ru']);
+      expect(txt).toHaveBeenCalledTimes(1);
+    });
+
+    // Адрес платформы — products.domain: из него кабинет рисует ссылку и по
+    // нему заведение проверяет /health. Склейка слага с зоной машины — только
+    // запасной путь, если адреса вдруг нет.
+    it('цель CNAME — адрес продукта из products.domain', async () => {
+      const id = await mkProduct({ slug: 'shop', domain: 'shop-legacy.p.linkeon.io' });
+      const v = await svc().attach(OWNER, id, 'shop.dmitryvolkov.ru');
+      expect(v.records[1]).toMatchObject({ type: 'CNAME', value: 'shop-legacy.p.linkeon.io' });
+
+      const bare = await mkProduct({ slug: 'bare', domain: null });
+      const vb = await svc().attach(OWNER, bare, 'bare.dmitryvolkov.ru');
+      expect(vb.records[1]).toMatchObject({ type: 'CNAME', value: 'bare.p.linkeon.io' });
     });
 
     it('домен, работающий у другого продукта, — отказ', async () => {
@@ -294,6 +389,18 @@ maybe('свой домен: сервис против живого Postgres', ()
       const alien = await mkProduct({ slug: 'alien', user: ALIEN });
       await expect(svc().get(OWNER, alien)).rejects.toMatchObject({ status: 404, response: { reason: 'not_found' } });
     });
+
+    it('архивный продукт — привязка, состояние и отвязка не находят его', async () => {
+      const id = await mkProduct({ slug: 'shop' });
+      await putDomain(id, 'active');
+      await pool.query(`UPDATE products SET archived_at = now() WHERE id = $1`, [id]);
+      const notFound = { status: 404, response: { reason: 'not_found' } };
+      await expect(svc().attach(OWNER, id, 'b.ru')).rejects.toMatchObject(notFound);
+      await expect(svc().get(OWNER, id)).rejects.toMatchObject(notFound);
+      await expect(svc().detach(OWNER, id)).rejects.toMatchObject(notFound);
+      expect((await row(id)).status).toBe('active');
+      expect(await jobs(id)).toEqual([]);
+    });
   });
 
   describe('отвязка', () => {
@@ -326,6 +433,22 @@ maybe('свой домен: сервис против живого Postgres', ()
     it('без своего домена — не найден, со своей причиной', async () => {
       const id = await mkProduct({ slug: 'shop' });
       await expect(svc().detach(OWNER, id)).rejects.toMatchObject({ status: 404, response: { reason: 'no_domain' } });
+    });
+
+    it('чужой продукт — отвязать нельзя', async () => {
+      const alien = await mkProduct({ slug: 'alien', user: ALIEN });
+      await putDomain(alien, 'active');
+      await expect(svc().detach(OWNER, alien)).rejects.toMatchObject({ status: 404, response: { reason: 'not_found' } });
+      expect((await row(alien)).status).toBe('active');
+      expect(await jobs(alien)).toEqual([]);
+    });
+
+    it('из removing — «поставлена», второго задания нет', async () => {
+      const id = await mkProduct({ slug: 'shop' });
+      await putDomain(id, 'removing');
+      await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'domain', 'queued')`, [id]);
+      await expect(svc().detach(OWNER, id)).resolves.toEqual({ removed: 'queued' });
+      expect(await jobs(id)).toEqual([{ kind: 'domain', status: 'queued' }]);
     });
 
     it('из active — removing и задание domain, одним оператором', async () => {
@@ -365,8 +488,57 @@ maybe('свой домен: сервис против живого Postgres', ()
       expect((await row(id)).status).toBe('active');
     });
 
-    // Отказ «домен занят другим продуктом»: у этой заявки на машине ничего нет,
-    // а перевод в removing упёрся бы в индекс занятых доменов.
+    // Встречное задание: пробуждение вставила чужая, ещё не закоммиченная
+    // транзакция — NOT EXISTS его не видит, и отвязка упирается в
+    // единственное активное задание продукта (23505 one_active). Это
+    // «занято», а не «домен держит другой продукт»: удалить здесь строку
+    // failed значило бы оставить на машине блоки порта 80 без задания отвязки.
+    it('встречное задание во время отвязки failed — 409 busy, строка на месте', async () => {
+      const id = await mkProduct({ slug: 'shop' });
+      await putDomain(id, 'failed', { error: 'x' });
+      const other = await pool.connect();
+      let open = false;
+      try {
+        await other.query('BEGIN');
+        open = true;
+        await other.query(`INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'wake', 'queued')`, [id]);
+        const pending = svc().detach(OWNER, id);
+        pending.catch(() => undefined); // отказ разбирает expect ниже
+        // Отвязка обязана встать на блокировке уникального индекса заданий.
+        await until(async () =>
+          (await pool.query(
+            `SELECT 1 FROM pg_stat_activity
+              WHERE datname = current_database() AND pid <> pg_backend_pid()
+                AND wait_event_type = 'Lock' AND query LIKE 'WITH d AS%'`,
+          )).rows.length > 0,
+        );
+        await other.query('COMMIT');
+        open = false;
+        await expect(pending).rejects.toMatchObject({ status: 409, response: { reason: 'busy' } });
+        expect((await row(id)).status).toBe('failed');
+      } finally {
+        if (open) await other.query('ROLLBACK').catch(() => undefined);
+        other.release();
+      }
+    });
+
+    // Вторая отвязка той же строки — не «другое задание»: отвязку уже
+    // поставила первая, и правдивый ответ обеим — «поставлена».
+    it('две отвязки разом — обе «поставлена», задание одно', async () => {
+      const id = await mkProduct({ slug: 'shop' });
+      await putDomain(id, 'active');
+      const s = svc(barrierOn(/^\s*WITH d AS/));
+      const results = await Promise.allSettled([s.detach(OWNER, id), s.detach(OWNER, id)]);
+      expect(results).toEqual([
+        { status: 'fulfilled', value: { removed: 'queued' } },
+        { status: 'fulfilled', value: { removed: 'queued' } },
+      ]);
+      expect((await row(id)).status).toBe('removing');
+      expect(await jobs(id)).toEqual([{ kind: 'domain', status: 'queued' }]);
+    });
+
+    // Отказ taken — «домен занят другим продуктом»: эта заявка до машины не
+    // доходила, а перевод в removing упёрся бы в индекс занятых доменов.
     it('failed из-за занятого домена — строка удаляется сразу', async () => {
       const mine = await mkProduct({ slug: 'mine' });
       const theirs = await mkProduct({ slug: 'theirs', user: ALIEN });

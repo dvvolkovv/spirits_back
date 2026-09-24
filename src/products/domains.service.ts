@@ -42,6 +42,7 @@ export type DomainRefusalCode =
   | 'taken'
   | 'no_domain'
   | 'issuing'
+  | 'removing' // домен отвязывается — привязка (любого домена) после окончания
   | 'busy'
   | 'changed' // заявку отвязали или заменили, пока с ней работали (проверка DNS шла до ~7 с)
   | 'throttled' // «Проверить сейчас» чаще CHECK_THROTTLE_S (задача 5, 429)
@@ -76,6 +77,8 @@ const ISSUABLE_SQL = `(${ISSUABLE.map((s) => `'${s}'`).join(',')})`;
 const TAKEN = 'Этот домен уже привязан к другому продукту.';
 const BLOCKED = 'Продукт остановлен администратором — привязать домен нельзя.';
 const BUSY = 'У продукта сейчас идёт другое задание — отвяжите через минуту.';
+const ISSUING = 'Идёт выпуск сертификата — отвязать можно, когда он закончится (обычно меньше минуты).';
+const REMOVING = 'Домен отвязывается — дождитесь окончания, обычно меньше минуты.';
 export const ORPHAN_ISSUING =
   'Выпуск прерван: задание снято (продукт остановлен или машина не ответила вовремя). Нажмите «Проверить снова».';
 export const ORPHAN_REMOVING =
@@ -89,6 +92,8 @@ interface OwnedProduct {
   slug: string;
   kind: string;
   status: string;
+  /** Адрес продукта на платформе (products.domain) — цель CNAME. */
+  domain: string | null;
   host_ip: string;
   domain_suffix: string;
 }
@@ -132,7 +137,7 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
    */
   private async owned(userId: string, productId: string): Promise<OwnedProduct> {
     const r = await this.pg.query(
-      `SELECT p.id, p.slug, p.kind, p.status, host(h.public_ip) AS host_ip, h.domain_suffix
+      `SELECT p.id, p.slug, p.kind, p.status, p.domain, host(h.public_ip) AS host_ip, h.domain_suffix
          FROM products p
          JOIN product_hosts h ON h.id = p.host_id
         WHERE p.id = $1 AND p.user_id = $2 AND p.archived_at IS NULL`,
@@ -154,6 +159,10 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
     // зоне.
     const zone = registrableZone(row.domain);
     const txtFqdn = `${TXT_LABEL}.${row.domain}`;
+    // Адрес продукта — products.domain: источник правды адреса платформы (из
+    // него кабинет рисует ссылку, по нему заведение проверяет /health).
+    // Склейка слага с зоной машины — только если адреса почему-то нет.
+    const target = p.domain || `${p.slug}.${p.domain_suffix}`;
     const out: DomainRecordToSet[] = [{ type: 'TXT', name: relativeName(txtFqdn, zone), fqdn: txtFqdn, value: row.token }];
     for (const fqdn of row.names) {
       // У корня CNAME запрещён стандартом — только A. Остальные имена — CNAME
@@ -161,7 +170,7 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
       out.push(
         fqdn === zone
           ? { type: 'A', name: '@', fqdn, value: p.host_ip }
-          : { type: 'CNAME', name: relativeName(fqdn, zone), fqdn, value: `${p.slug}.${p.domain_suffix}` },
+          : { type: 'CNAME', name: relativeName(fqdn, zone), fqdn, value: target },
       );
     }
     return out;
@@ -202,10 +211,7 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
     }
 
     const existing = await this.rowOf(productId);
-    if (existing) {
-      if (existing.domain === n.domain) return this.view(existing, p);
-      throw this.hasDomain(existing);
-    }
+    if (existing) return this.answerExisting(existing, n.domain, p);
 
     const busy = await this.pg.query(
       `SELECT 1 FROM product_domains
@@ -223,16 +229,20 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
       [productId, n.domain, n.names, token],
     );
 
-    // Пусто — строку продукта успела завести параллельная привязка: её домен
-    // может быть и другим.
-    const row: DomainRow | null = ins.rows[0] ?? (await this.rowOf(productId));
-    if (!row) {
-      // ...а параллельная отвязка — уже снять её.
-      throw refusal(HttpStatus.CONFLICT, 'changed', 'Заявку на домен в ту же секунду сняли — обновите страницу и повторите.');
+    const created: DomainRow | undefined = ins.rows[0];
+    if (!created) {
+      // Строку продукта в ту же секунду завела параллельная привязка. Проверку
+      // DNS гоняет она — тот, кто строку завёл; здесь только ответ по этой
+      // строке, как если бы она была до нас.
+      const other = await this.rowOf(productId);
+      if (!other) {
+        // ...а параллельная отвязка — уже и снять её.
+        throw refusal(HttpStatus.CONFLICT, 'changed', 'Заявку на домен в ту же секунду сняли — обновите страницу и повторите.');
+      }
+      return this.answerExisting(other, n.domain, p);
     }
-    if (row.domain !== n.domain) throw this.hasDomain(row);
 
-    const checked = await this.runCheck(row, p);
+    const checked = await this.runCheck(created, p);
     if (!checked) {
       // Показать здесь строку продукта значило бы выдать чужую заявку за эту:
       // ответ на привязку a.ru с доменом b.ru.
@@ -245,12 +255,23 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
     return this.view(checked, p);
   }
 
-  private hasDomain(row: DomainRow) {
-    return refusal(
-      HttpStatus.CONFLICT,
-      'has_domain',
-      `У продукта уже есть свой домен ${readable(row.domain)} — сначала отвяжите его.`,
-    );
+  /**
+   * Привязка при уже существующей строке продукта. Пока идёт отвязка —
+   * отказ для ЛЮБОГО домена: «сначала отвяжите» было бы неправдой (уже
+   * отвязывается), а 200 со строкой в removing — обещанием домена, который
+   * вот-вот снимут. Тот же домен — ответ по строке без новой проверки,
+   * другой — у продукта уже есть свой.
+   */
+  private answerExisting(existing: DomainRow, domain: string, p: OwnedProduct): DomainView {
+    if (existing.status === 'removing') throw refusal(HttpStatus.CONFLICT, 'removing', REMOVING);
+    if (existing.domain !== domain) {
+      throw refusal(
+        HttpStatus.CONFLICT,
+        'has_domain',
+        `У продукта уже есть свой домен ${readable(existing.domain)} — сначала отвяжите его.`,
+      );
+    }
+    return this.view(existing, p);
   }
 
   async detach(userId: string, productId: string): Promise<{ removed: 'now' | 'queued' }> {
@@ -270,13 +291,7 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
       row = await this.rowOf(productId);
       if (!row) return { removed: 'now' };
     }
-    if (row.status === 'issuing') {
-      throw refusal(
-        HttpStatus.CONFLICT,
-        'issuing',
-        'Идёт выпуск сертификата — отвязать можно, когда он закончится (обычно меньше минуты).',
-      );
-    }
+    if (row.status === 'issuing') throw refusal(HttpStatus.CONFLICT, 'issuing', ISSUING);
     if (row.status === 'removing') return { removed: 'queued' };
 
     try {
@@ -299,17 +314,34 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
     } catch (e: any) {
       if (e?.code !== '23505') throw e;
       if (e.constraint === 'product_domains_occupied') {
-        // Домен держит другой продукт: эта заявка до машины не доходила.
+        // Перевод failed → removing упёрся в индекс занятых: домен уже держит
+        // другой продукт. Сюда попадает failed после отказа taken — тогда
+        // заявка до машины не доходила, и удалить строку можно сразу. Но и
+        // failed после отказа выпуска (Let's Encrypt, агент), если домен
+        // потом занял другой продукт: у такой заявки на машине могли
+        // остаться блоки порта 80, а удаление строки снимает её без задания
+        // отвязки.
+        // TODO(Task 5): с error_reason удалять напрямую только при
+        // error_reason = 'taken'; для отказа выпуска нужна отвязка на машине
+        // без перевода в removing (индекс занятых её не пустит).
         const del = await this.pg.query(
           `DELETE FROM product_domains WHERE product_id = $1 AND status = 'failed'`,
           [productId],
         );
         if (del.rowCount === 1) return { removed: 'now' };
+      } else if (e.constraint !== 'product_provision_jobs_one_active') {
+        throw e;
       }
-      // Остальное 23505 — единственное активное задание продукта
-      // (product_provision_jobs_one_active): сон или пробуждение встали
-      // мимо NOT EXISTS, оператор откатился целиком, строка не тронута.
+      // product_provision_jobs_one_active: встречное задание (сон,
+      // пробуждение) встало мимо NOT EXISTS, оператор откатился целиком.
     }
+    // Своё действие не состоялось — кто-то успел раньше. Ответ — по свежему
+    // состоянию, а не «занято» наугад: вторая отвязка той же строки — это не
+    // «другое задание», а отвязка, уже поставленная первой.
+    const cur = await this.rowOf(productId);
+    if (!cur) return { removed: 'now' };
+    if (cur.status === 'removing') return { removed: 'queued' };
+    if (cur.status === 'issuing') throw refusal(HttpStatus.CONFLICT, 'issuing', ISSUING);
     throw refusal(HttpStatus.CONFLICT, 'busy', BUSY);
   }
 
