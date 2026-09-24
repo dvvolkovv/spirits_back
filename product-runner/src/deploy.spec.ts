@@ -376,3 +376,134 @@ describe('health обязан доказывать, ЧТО именно отве
     expect(seen.length).toBeGreaterThan(1);
   });
 });
+
+describe('порт продукта освобождается перед КАЖДЫМ перезапуском', () => {
+  // Замерено 23.09.2026 на demo и воспроизведено 24.09.2026 на пробе: порт
+  // держала копия продукта, которую pm2 уже не вёл. pm2 после этого только
+  // крутил свою копию в EADDRINUSE до errored, а сирота отдавала сайт —
+  // включая правку, которую ход откатил. Ни рестарт, ни откат её не снимали:
+  // pm2 о ней не знает.
+  const unhealthy = jest.fn(async () => response({ status: 500, contentType: 'text/plain', body: 'x' }));
+  const noSleep = async () => undefined;
+
+  it('в ходе: сборка → освобождение порта → перезапуск', async () => {
+    const log: string[] = [];
+    const healthy = jest.fn(async () => response({ status: 200, contentType: 'application/json', body: '{}' }));
+
+    await deploy({
+      git: { resetHard: jest.fn(async () => undefined) } as any,
+      shaBefore: 'aaa111',
+      buildCmd: 'npm run build',
+      restartCmd: 'pm2 restart product',
+      healthUrl: 'http://127.0.0.1:3000/health',
+      shell: async (cmd: string) => {
+        log.push(cmd);
+      },
+      freePort: async () => {
+        log.push('освободить порт');
+      },
+      fetchFn: healthy as any,
+    });
+
+    expect(log).toEqual(['npm run build', 'освободить порт', 'pm2 restart product']);
+  });
+
+  it('в откате — тоже: откаченное поднимается на свободный порт', async () => {
+    // Именно здесь сирота и пережила ход demo: откат вернул файлы, но pm2
+    // поднимал откаченное в занятый порт, и сайт продолжал отдавать правку.
+    const log: string[] = [];
+
+    await deploy({
+      git: {
+        resetHard: jest.fn(async () => {
+          log.push('reset');
+        }),
+      } as any,
+      shaBefore: 'aaa111',
+      buildCmd: 'npm run build',
+      restartCmd: 'pm2 restart product',
+      healthUrl: 'http://127.0.0.1:3000/health',
+      shell: async (cmd: string) => {
+        log.push(cmd);
+      },
+      freePort: async () => {
+        log.push('освободить порт');
+      },
+      fetchFn: unhealthy as any,
+      sleep: noSleep,
+    });
+
+    expect(log).toEqual([
+      'npm run build',
+      'освободить порт',
+      'pm2 restart product',
+      'reset',
+      'npm run build',
+      'освободить порт',
+      'pm2 restart product',
+    ]);
+  });
+
+  it('отказ освобождения не отменяет перезапуск и виден в фазах', async () => {
+    const log: string[] = [];
+    const phases: string[] = [];
+    const healthy = jest.fn(async () => response({ status: 200, contentType: 'application/json', body: '{}' }));
+
+    const result = await deploy({
+      git: { resetHard: jest.fn(async () => undefined) } as any,
+      shaBefore: 'aaa111',
+      buildCmd: null,
+      restartCmd: 'pm2 restart product',
+      healthUrl: 'http://127.0.0.1:3000/health',
+      shell: async (cmd: string) => {
+        log.push(cmd);
+      },
+      freePort: async () => {
+        throw new Error('/proc недоступен');
+      },
+      fetchFn: healthy as any,
+      onPhase: (p) => phases.push(p),
+    });
+
+    // Проверка здоровья остаётся последним судьёй: сломанная уборка не должна
+    // превращать здоровый выкат в откат.
+    expect(log).toEqual(['pm2 restart product']);
+    expect(result.reverted).toBe(false);
+    expect(phases.join('\n')).toMatch(/\/proc недоступен/);
+  });
+
+  it('сообщения уборки идут в фазы с меткой шага', async () => {
+    const phases: string[] = [];
+
+    await deploy({
+      git: { resetHard: jest.fn(async () => undefined) } as any,
+      shaBefore: 'aaa111',
+      buildCmd: null,
+      restartCmd: 'pm2 restart product',
+      healthUrl: null,
+      shell: async () => undefined,
+      freePort: async (report) => report('порт 3000 держала копия вне pm2 (pid 131) — остановлена'),
+      onPhase: (p) => phases.push(p),
+    });
+
+    expect(phases).toContain('Правка: порт 3000 держала копия вне pm2 (pid 131) — остановлена');
+  });
+
+  it('без команды перезапуска порт не трогается: поднимать после было бы некому', async () => {
+    const freePort = jest.fn(async () => undefined);
+
+    await deploy({
+      git: { resetHard: jest.fn(async () => undefined) } as any,
+      shaBefore: 'aaa111',
+      buildCmd: 'npm run build',
+      restartCmd: null,
+      healthUrl: 'http://127.0.0.1:3000/health',
+      shell: async () => undefined,
+      freePort,
+      fetchFn: unhealthy as any,
+      sleep: noSleep,
+    });
+
+    expect(freePort).not.toHaveBeenCalled();
+  });
+});

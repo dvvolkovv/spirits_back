@@ -110,6 +110,7 @@ export interface DeployInput {
    * «на порту кто-то живой» от «работает именно этот код».
    */
   expectedSha?: string | null;
+  freePort?: (report: (message: string) => void) => Promise<void>;
 }
 
 export async function deploy(input: DeployInput): Promise<{ reverted: boolean }> {

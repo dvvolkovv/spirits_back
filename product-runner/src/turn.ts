@@ -12,6 +12,7 @@ export interface ExecuteTurnInput {
   api: LinkeonApi;
   runClaude?: typeof runClaudeReal;
   deploy?: typeof deployReal;
+  freeProductPort?: (input: { healthUrl: string | null; onPhase?: (m: string) => void }) => Promise<void>;
 }
 
 /**

@@ -46,4 +46,18 @@ describe('loadConfig', () => {
     // выполненной и не оплаченной.
     expect(cfg.turnTimeoutMs).toBeLessThan(30 * 60 * 1000);
   });
+
+  it('PRODUCT_START_SCRIPT — признак продукта под pm2', () => {
+    // Его задаёт docker run (provision.ts, product-provision.sh), и по нему же
+    // entrypoint.sh поднимает продукт под pm2. Раннер наследует окружение
+    // entrypoint и узнаёт отсюда, что перезапуск — это pm2.
+    const cfg = loadConfig({ ...BASE, PRODUCT_START_SCRIPT: 'server.js' } as any);
+
+    expect(cfg.productStartScript).toBe('server.js');
+  });
+
+  it('без PRODUCT_START_SCRIPT продукт не считается живущим под pm2', () => {
+    expect(loadConfig({ ...BASE } as any).productStartScript).toBeNull();
+    expect(loadConfig({ ...BASE, PRODUCT_START_SCRIPT: '' } as any).productStartScript).toBeNull();
+  });
 });

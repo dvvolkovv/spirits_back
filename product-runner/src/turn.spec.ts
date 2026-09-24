@@ -225,3 +225,94 @@ describe('резервная копия (git push) — место в ходе и
     expect(eventTexts(d.api)).toMatch(/резервн/i);
   });
 });
+
+describe('продукт под pm2 (PRODUCT_START_SCRIPT): перезапуск и порт', () => {
+  // Контейнер продукта поднимает entrypoint.sh: `pm2 start $PRODUCT_START_SCRIPT
+  // --name product`. Раз переменная задана — продукт живёт под pm2 с этим
+  // именем, и раннеру известно, как его перезапустить.
+  const PM2 = { productStartScript: 'server.js' } as any;
+  const NO_PM2 = { productStartScript: null } as any;
+  // Реестр 22.09.2026: у продукта, заведённого самообслуживанием, build_cmd и
+  // restart_cmd — NULL.
+  const SELF_SERVICE = { ...PRODUCT, buildCmd: null, restartCmd: null, healthUrl: 'http://127.0.0.1:3000/health' };
+  const revertTurn = { ...TURN, id: 't-3', revertToSha: 'aaa111' };
+
+  it('restart_cmd пуст — раннер перезапускает pm2 сам', async () => {
+    // Без перезапуска правка проверялась против СТАРОГО процесса: sha не
+    // сходился, и ход откатывался всегда — если только агент сам не
+    // догадывался перезапустить pm2 после своего коммита.
+    const d = makeDeps();
+
+    await executeTurn({ turn: TURN, product: SELF_SERVICE, config: PM2, ...d } as any);
+
+    expect(d.deploy).toHaveBeenCalledWith(expect.objectContaining({ restartCmd: 'pm2 restart product' }));
+  });
+
+  it('так же и в служебном ходе отката', async () => {
+    const d = makeDeps();
+
+    await executeTurn({ turn: revertTurn, product: SELF_SERVICE, config: PM2, ...d } as any);
+
+    expect(d.deploy).toHaveBeenCalledWith(expect.objectContaining({ restartCmd: 'pm2 restart product' }));
+  });
+
+  it('restart_cmd из одних пробелов — тоже пуст', async () => {
+    const d = makeDeps();
+
+    await executeTurn({ turn: TURN, product: { ...SELF_SERVICE, restartCmd: '  ' }, config: PM2, ...d } as any);
+
+    expect(d.deploy).toHaveBeenCalledWith(expect.objectContaining({ restartCmd: 'pm2 restart product' }));
+  });
+
+  it('restart_cmd из реестра не подменяется', async () => {
+    const d = makeDeps();
+
+    await executeTurn({ turn: TURN, product: { ...SELF_SERVICE, restartCmd: 'pm2 reload product' }, config: PM2, ...d } as any);
+
+    expect(d.deploy).toHaveBeenCalledWith(expect.objectContaining({ restartCmd: 'pm2 reload product' }));
+  });
+
+  it('продукт не под pm2 — пустой restart_cmd так и остаётся пустым', async () => {
+    // Раннер не знает, как перезапускать то, что запущено не им.
+    const d = makeDeps();
+
+    await executeTurn({ turn: TURN, product: SELF_SERVICE, config: NO_PM2, ...d } as any);
+
+    expect(d.deploy).toHaveBeenCalledWith(expect.objectContaining({ restartCmd: null }));
+  });
+
+  it('деплою передаётся освобождение порта, и оно смотрит в health_url продукта', async () => {
+    const d = makeDeps();
+    const freeProductPort = jest.fn(async (_input: any) => undefined);
+
+    await executeTurn({ turn: TURN, product: SELF_SERVICE, config: PM2, ...d, freeProductPort } as any);
+
+    const { freePort } = d.deploy.mock.calls[0][0];
+    expect(typeof freePort).toBe('function');
+    const report = jest.fn();
+    await freePort(report);
+    expect(freeProductPort).toHaveBeenCalledWith(
+      expect.objectContaining({ healthUrl: 'http://127.0.0.1:3000/health', onPhase: report }),
+    );
+  });
+
+  it('и в служебном ходе отката', async () => {
+    const d = makeDeps();
+    const freeProductPort = jest.fn(async (_input: any) => undefined);
+
+    await executeTurn({ turn: revertTurn, product: SELF_SERVICE, config: PM2, ...d, freeProductPort } as any);
+
+    const { freePort } = d.deploy.mock.calls[0][0];
+    await freePort(jest.fn());
+    expect(freeProductPort).toHaveBeenCalledWith(expect.objectContaining({ healthUrl: 'http://127.0.0.1:3000/health' }));
+  });
+
+  it('продукт не под pm2 — порт не трогается вовсе', async () => {
+    // Без pm2 неизвестно, какой процесс на порту законный: снимать некого.
+    const d = makeDeps();
+
+    await executeTurn({ turn: TURN, product: SELF_SERVICE, config: NO_PM2, ...d } as any);
+
+    expect(d.deploy.mock.calls[0][0].freePort).toBeUndefined();
+  });
+});

@@ -27,6 +27,7 @@ export interface RunnerConfig {
   pollTimeoutMs: number;
   /** Таймаут обычных запросов (sendEvents, complete). См. DEFAULT_REQUEST_TIMEOUT_MS. */
   requestTimeoutMs: number;
+  productStartScript: string | null;
 }
 
 function required(env: NodeJS.ProcessEnv, key: string): string {
@@ -52,5 +53,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     claudeBin: env.CLAUDE_BIN ?? '/usr/bin/claude',
     pollTimeoutMs: Number(env.POLL_TIMEOUT_MS ?? DEFAULT_POLL_TIMEOUT_MS),
     requestTimeoutMs: Number(env.REQUEST_TIMEOUT_MS ?? DEFAULT_REQUEST_TIMEOUT_MS),
+    productStartScript: null,
   };
 }
