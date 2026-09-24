@@ -2,12 +2,42 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { BlogSettingsService } from './blog-settings.service';
-import { BlogPost, BlogStatus, appendEditorNote, canTransition, rowToPost } from './blog.types';
-import { parseBlogCallback, buildBlogKeyboard } from './blog-callback';
+import { BlogPost, BlogStatus, MAX_NOTE_PROMPTS, appendEditorNote, canTransition, rowToPost } from './blog.types';
+import { BlogCallbackAction, parseBlogCallback, buildBlogKeyboard } from './blog-callback';
 import { buildCaption } from './blog-text';
 import { nextSlotAfter } from './blog-slots';
 import { fetchImageBytes } from './blog-image.fetch';
 import { formatSlotWhen } from './blog-slot-format';
+
+/** Подсказка в открытом поле ответа. Telegram принимает 1–64 символа. */
+const NOTE_PLACEHOLDER = 'Что поправить?';
+
+/**
+ * Почему замечание сейчас не принять — по статусу поста.
+ *
+ * Отказ всё равно лучше молчания: ответ на наше сообщение блог забирает себе
+ * в любом статусе (иначе текст ушёл бы ассистенту), и владелец должен понять,
+ * куда делось его замечание. Где есть выход — кнопка под черновиком — он
+ * назван прямо.
+ */
+const NOTE_REFUSALS: Partial<Record<BlogStatus, string>> = {
+  drafting: 'Черновик сейчас переписывается — дождитесь нового варианта и напишите замечание к нему.',
+  approved: 'Пост уже одобрен и ждёт публикации — замечание не принял. Вернуть его на переработку можно кнопкой «🔄 Переписать» под черновиком.',
+  publishing: 'Пост прямо сейчас уходит в канал — замечание не принял.',
+  published: 'Пост уже опубликован — замечание не принял.',
+  rejected: 'Пост отправлен в мусор — замечание не принял.',
+  failed: 'Черновик этого поста не собрался — замечание не принял. Перезапустить его можно кнопкой «🔄 Переписать» под черновиком.',
+};
+
+function noteRefusal(status: BlogStatus): string {
+  return NOTE_REFUSALS[status] ?? `Замечание не принял: пост в статусе ${status}.`;
+}
+
+/** « «Заголовок»» для вставки после слова «пост» в любом падеже — или пусто. */
+function quotedTitle(post: BlogPost): string {
+  const title = (post.title || '').trim();
+  return title ? ` «${title}»` : '';
+}
 
 @Injectable()
 export class BlogApprovalService {
@@ -86,12 +116,19 @@ export class BlogApprovalService {
     }
     const post = rowToPost(r.rows[0]);
 
+    // «Замечание» — не переход статуса: пост остаётся ждать решения, а само
+    // замечание придёт следующим сообщением. В машину состояний ему незачем.
+    if (parsed.action === 'note') {
+      await this.promptForNote(post, cb);
+      return true;
+    }
+
     // Целевой статус для каждой кнопки — фиксированный, а не то, что решает
     // текущий код. Легальность перехода из фактического статуса поста
     // (который мог уехать дальше, пока сообщение висело в личке — вторая
     // панель управления, админка, тоже пишет в этот же post) проверяет
     // единая машина состояний, а не повторная ручная проверка здесь.
-    const TARGET_STATUS: Record<typeof parsed.action, BlogStatus> = {
+    const TARGET_STATUS: Record<Exclude<BlogCallbackAction, 'note'>, BlogStatus> = {
       ok: 'approved',
       redo: 'drafting',
       no: 'rejected',
@@ -152,6 +189,79 @@ export class BlogApprovalService {
   }
 
   /**
+   * Кнопка «✍️ Замечание»: приглашение с открытым полем ответа.
+   *
+   * Владелец получил черновик и не понял, как оставить замечание: кнопки не
+   * было, а в сообщении не сказано, что надо ответить на него. Написанное
+   * отдельным сообщением, а не ответом, уходило ассистенту.
+   *
+   * Приглашать имеет смысл только к посту на проверке — у остальных
+   * замечание всё равно не принять, и ответ «пост уже обработан» здесь тот
+   * же, что у остальных кнопок.
+   */
+  private async promptForNote(post: BlogPost, cb: any): Promise<void> {
+    if (post.status !== 'pending_review') {
+      await this.tg.answerCallbackQuery(cb.id, { text: `Пост уже обработан: ${post.status}` });
+      return;
+    }
+
+    // Ответ на приглашение узнаётся по паре «чат проверки + id приглашения».
+    // Приглашение в другом чате (кнопки остаются и под черновиками, ушедшими
+    // прежнему проверяющему) опознать было бы не по чему, и ответ на него ушёл
+    // бы ассистенту — хуже, чем не приглашать вовсе.
+    const chatId = Number(cb?.message?.chat?.id);
+    if (chatId !== post.reviewChatId) {
+      await this.tg.answerCallbackQuery(cb.id, { text: 'Этот черновик на проверке в другом чате' });
+      return;
+    }
+
+    // Цитируем АКТУАЛЬНЫЙ черновик, а не обязательно тот, под которым нажали:
+    // кнопки остаются и под прошлыми вариантами, а замечание ляжет на текущий.
+    await this.sendNotePrompt(
+      post,
+      chatId,
+      `Что поправить в посте${quotedTitle(post)}? Напишите ответом на это сообщение.`,
+      post.reviewMessageId,
+    );
+    await this.tg.answerCallbackQuery(cb.id);
+  }
+
+  /**
+   * Приглашение к замечанию: сообщение, у которого Telegram сам открывает
+   * поле ответа (ForceReply), и чей id запоминается на посте — ответ владельца
+   * ссылается на приглашение, а не на черновик.
+   *
+   * Ответ на сообщение — `reply_parameters`: в установленном grammy 1.43.0
+   * (@grammyjs/types 3.27.3) `reply_to_message_id` помечен устаревшим, а
+   * `allow_sending_without_reply` есть только внутри `reply_parameters`. Без
+   * него удалённый черновик ронял бы и приглашение, хотя заголовок в тексте и
+   * так говорит, к какому посту оно относится.
+   *
+   * id дописывается в самом UPDATE, а не чтением-изменением-записью в коде:
+   * двойное касание кнопки — это два обработчика, прочитавших пост раньше,
+   * чем любой из них записал id, и одно приглашение из двух пропало бы, а
+   * ответ на него ушёл бы ассистенту. Сверх `MAX_NOTE_PROMPTS` срез
+   * отбрасывает самые старые.
+   *
+   * updated_at не трогаем намеренно: по нему админка ловит правку из соседней
+   * вкладки (409), а запомнить приглашение — не правка поста. Условия на
+   * статус в UPDATE тоже нет: если пост за это время ушёл дальше, приглашение
+   * уже отправлено, и ответ на него всё равно должен узнаться своим.
+   */
+  private async sendNotePrompt(post: BlogPost, chatId: number, text: string, replyTo: number | null): Promise<void> {
+    const prompt = await this.tg.sendMessage(chatId, text, {
+      ...(replyTo ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {}),
+      reply_markup: { force_reply: true, input_field_placeholder: NOTE_PLACEHOLDER },
+    });
+    await this.pg.query(
+      `UPDATE blog_post
+          SET note_prompt_ids = (note_prompt_ids || $2::bigint)[greatest(cardinality(note_prompt_ids) + 2 - $3, 1):]
+        WHERE id = $1`,
+      [post.id, Number(prompt.message_id), MAX_NOTE_PROMPTS],
+    );
+  }
+
+  /**
    * Замечание к черновику реплаем.
    *
    * Присланный текст — это то, что НАДО ПОПРАВИТЬ, а не готовый пост. Раньше
@@ -163,36 +273,56 @@ export class BlogApprovalService {
    * `drafting`, и следующий тик `prepareDrafts` отдаёт его редактору вместе
    * со всеми замечаниями.
    *
-   * @returns true, если сообщение — замечание к черновику. false означает
-   * «это не наше», и вызывающий код обязан пустить текст обычным путём к
-   * ассистенту.
+   * «Наше» сообщение — черновик поста или приглашение к замечанию (кнопка
+   * «✍️ Замечание») в этом чате, И В ЛЮБОМ СТАТУСЕ поста. Раньше поиск
+   * отбирал только `pending_review`, и ответ на черновик, который уже
+   * переписывается или опубликован, уходил ассистенту: замечание к посту
+   * читал психолог. Теперь статус решает, что ответить владельцу, а не кому
+   * достанется его текст.
+   *
+   * @returns true, если сообщение — ответ на наше сообщение (замечание
+   * принято или владельцу объяснено, почему нет). false означает «это не
+   * наше», и вызывающий код обязан пустить текст обычным путём к ассистенту.
    */
   async handleReplyEdit(msg: any): Promise<boolean> {
-    const replyTo = msg?.reply_to_message?.message_id;
-    const text = String(msg?.text || '').trim();
-    if (!replyTo || !text) return false;
+    const chatId = Number(msg?.chat?.id);
+    const replyTo = Number(msg?.reply_to_message?.message_id);
+    if (!chatId || !replyTo) return false;
 
+    // id сообщений в Telegram свои у каждого чата — поэтому сверяем только
+    // внутри чата проверки. Статуса в условии нет намеренно, см. выше.
     const r = await this.pg.query(
       `SELECT * FROM blog_post
-        WHERE review_chat_id = $1 AND review_message_id = $2 AND status = 'pending_review'
+        WHERE review_chat_id = $1
+          AND (review_message_id = $2 OR $2 = ANY(note_prompt_ids))
         LIMIT 1`,
-      [Number(msg.chat.id), Number(replyTo)],
+      [chatId, replyTo],
     );
     if (!r.rows.length) return false;
 
     const post = rowToPost(r.rows[0]);
-    const chatId = Number(msg.chat.id);
 
-    // Между выборкой и записью статус могли увести из админки или соседней
-    // кнопкой. Решает та же машина состояний, что и везде, а не то, что
-    // запрос отбирал по status = 'pending_review'.
-    //
-    // Возвращаем при этом true: сообщение опознано как реплай на НАШ
-    // черновик, и пустить его дальше значит отправить текст замечания в чат
-    // с ассистентом. Владельцу отвечаем, почему замечание не принято.
-    if (!canTransition(post.status, 'drafting')) {
-      this.logger.warn(`замечание к ${post.id}: переход ${post.status} → drafting запрещён`);
-      await this.tg.sendMessage(chatId, `Замечание не принял: пост уже в статусе ${post.status}.`);
+    // Замечание принимает только пост на проверке. Машину состояний
+    // спрашиваем всё равно — запись статуса везде идёт через неё.
+    if (post.status !== 'pending_review' || !canTransition(post.status, 'drafting')) {
+      this.logger.log(`замечание к ${post.id} не принято: пост в статусе ${post.status}`);
+      await this.tg.sendMessage(chatId, noteRefusal(post.status));
+      return true;
+    }
+
+    // Голосовое, фото, стикер — ответ наш, но замечания в нём нет. Поле
+    // ответа, которое открывает кнопка, — то же поле, где микрофон, так что
+    // надиктовать замечание голосом естественно; раньше такой ответ уходил
+    // ассистенту. Просим текстом — и просим приглашением, чтобы ответ на
+    // саму просьбу тоже узнался своим.
+    const text = String(msg?.text || '').trim();
+    if (!text) {
+      await this.sendNotePrompt(
+        post,
+        chatId,
+        `Замечание к посту${quotedTitle(post)} принимаю только текстом — напишите его ответом на это сообщение.`,
+        Number(msg?.message_id) || null,
+      );
       return true;
     }
 

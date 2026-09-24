@@ -99,6 +99,21 @@ describe('rowToPost', () => {
     expect(rowToPost({ id: 'a', status: 'idea', attempts: 0 }).editorNotes).toEqual([]);
     expect(rowToPost({ id: 'a', status: 'idea', attempts: 0, editor_notes: null }).editorNotes).toEqual([]);
   });
+
+  /**
+   * node-pg отдаёт bigint строками — и bigint[] тоже, поэлементно. Сравнение
+   * `'13' === 13` молча ложно, так что id приглашений обязаны приезжать
+   * числами, как и `reviewMessageId`.
+   */
+  it('читает id приглашений к замечанию числами, а не строками', () => {
+    const post = rowToPost({ id: 'a', status: 'pending_review', attempts: 0, note_prompt_ids: ['13', '14'] });
+    expect(post.notePromptIds).toEqual([13, 14]);
+  });
+
+  it('строка без колонки приглашений даёт пустой список', () => {
+    expect(rowToPost({ id: 'a', status: 'idea', attempts: 0 }).notePromptIds).toEqual([]);
+    expect(rowToPost({ id: 'a', status: 'idea', attempts: 0, note_prompt_ids: null }).notePromptIds).toEqual([]);
+  });
 });
 
 /**
@@ -136,6 +151,30 @@ describe('миграция 002', () => {
   /** Без DEFAULT старые строки дали бы NULL, и каждый append начинался бы с null. */
   it('колонка не пустая по умолчанию', () => {
     expect(sql).toMatch(/DEFAULT\s+'\{\}'/i);
+  });
+});
+
+/**
+ * Тот же контракт «колонка в миграции ↔ поле в rowToPost», что и у 002.
+ * Разъедутся имена — `row.note_prompt_ids` окажется undefined, ни одно
+ * приглашение не узнается, и ответы на них молча уйдут ассистенту.
+ */
+describe('миграция 003', () => {
+  // Читается в каждом тесте, а не при сборе describe: без файла краснеют
+  // именно эти проверки, а не весь спек разом.
+  const sql = () => fs.readFileSync(path.join(__dirname, 'migrations', '003_note_prompts.sql'), 'utf8');
+
+  it('добавляет ровно ту колонку, которую читает rowToPost', () => {
+    expect(sql()).toMatch(/ADD COLUMN IF NOT EXISTS\s+note_prompt_ids\s/i);
+  });
+
+  /** Одно значение затиралось бы вторым нажатием, и ответ на первое приглашение ушёл бы ассистенту. */
+  it('колонка — массив, а не одно значение', () => {
+    expect(sql()).toMatch(/note_prompt_ids\s+\w+\[\]/i);
+  });
+
+  it('колонка не пустая по умолчанию', () => {
+    expect(sql()).toMatch(/note_prompt_ids[^;]*NOT NULL DEFAULT\s+'\{\}'/i);
   });
 });
 
