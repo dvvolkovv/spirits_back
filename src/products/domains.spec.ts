@@ -200,6 +200,89 @@ maybe('свой домен: сервис против живого Postgres', ()
       await expect(svc().attach(OWNER, mine, 'a.ru')).rejects.toMatchObject({ status: 409, response: { reason: 'taken' } });
       expect(await row(mine)).toBeUndefined();
     });
+
+    // Обход проверки владения. Проверка DNS длится до ~7 с, и длительность
+    // держит владелец проверяемого домена. Пока a.ru проверяется, заявку
+    // отвязывают и заводят b.ru; «всё зелёное» от a.ru, записанное по одному
+    // product_id, легло бы в строку b.ru, и выпуск стартовал бы для b.ru, чей
+    // TXT в DNS не появлялся ни разу. Результат принадлежит заявке (её коду).
+    it('заявку сменили, пока шла проверка DNS, — результат старой не ложится на новую', async () => {
+      const id = await mkProduct({ slug: 'shop' });
+      const IP = '139.59.210.42';
+      const A_NAMES = ['a.ru', 'www.a.ru'];
+      let open!: () => void;
+      const gate = new Promise<void>((r) => (open = r));
+      let started!: () => void;
+      const inFlight = new Promise<void>((r) => (started = r));
+      // DNS a.ru полностью готов — TXT с кодом ИМЕННО этой заявки, A на
+      // машину, AAAA нет, — но отвечает только по сигналу теста, как
+      // медленный сервер владельца. Остальные имена — обычный подменный DNS,
+      // мгновенно (у b.ru пусто).
+      const resolver: DnsResolver = {
+        resolveTxt: async (n) => {
+          if (n !== `${TXT_LABEL}.a.ru`) return dns.resolveTxt(n);
+          const token = (await row(id)).token; // код заявки a.ru, пока она в базе
+          started(); // к этому моменту checkDns уже запустил и A/AAAA a.ru
+          await gate;
+          return [[token]];
+        },
+        resolve4: async (n) => {
+          if (!A_NAMES.includes(n)) return dns.resolve4(n);
+          await gate;
+          return [IP];
+        },
+        resolve6: async (n) => {
+          if (A_NAMES.includes(n)) await gate;
+          return dns.resolve6(n);
+        },
+      };
+      const s = new DomainsService(pg as any);
+      (s as any).resolver = resolver;
+      const issue = jest.spyOn(s, 'tryIssue');
+
+      const pending = s.attach(OWNER, id, 'a.ru');
+      pending.catch(() => undefined); // отказ разбирает expect ниже; до него он не «необработанный»
+      await inFlight; // заявка a.ru заведена, её проверка в полёте
+
+      await expect(s.detach(OWNER, id)).resolves.toEqual({ removed: 'now' });
+      const vb = await s.attach(OWNER, id, 'b.ru'); // своя проверка b.ru кончается сразу: DNS пуст
+      expect(vb.status).toBe('awaiting_dns');
+      const tokenB = (await row(id)).token;
+
+      open();
+      await expect(pending).rejects.toMatchObject({ status: 409, response: { reason: 'changed' } });
+
+      const r = await row(id);
+      expect(r).toMatchObject({ domain: 'b.ru', status: 'awaiting_dns', token: tokenB });
+      // Результат в строке — проверки b.ru, а не «всё зелёное» от a.ru.
+      expect(r.check_result.records.map((c: any) => `${c.type} ${c.name}`)).toEqual([
+        'TXT _linkeon.b.ru', 'A b.ru', 'AAAA b.ru', 'A www.b.ru', 'AAAA www.b.ru',
+      ]);
+      expect(r.check_result.records[0]).toMatchObject({ ok: false, want: tokenB });
+      // Выпуск по результату чужой заявки не просится вовсе.
+      expect(issue).not.toHaveBeenCalled();
+      expect(await jobs(id)).toEqual([]);
+    });
+
+    // Второе окно той же гонки — между записью результата и чтением строки
+    // для ответа: показать её значило бы ответить на привязку a.ru доменом b.ru.
+    it('заявку сменили сразу после записи результата — ответ не выдаёт новую за проверенную', async () => {
+      const id = await mkProduct({ slug: 'shop' });
+      let swapped = false;
+      const racing = {
+        query: async (sql: string, params?: any[]) => {
+          const res = await pool.query(sql, params);
+          if (!swapped && /^\s*UPDATE product_domains SET check_result/.test(sql)) {
+            swapped = true;
+            await pool.query(`DELETE FROM product_domains WHERE product_id = $1`, [id]);
+            await putDomain(id, 'awaiting_dns', { domain: 'b.ru', token: 'lk-b' });
+          }
+          return res;
+        },
+      };
+      await expect(svc(racing).attach(OWNER, id, 'a.ru')).rejects.toMatchObject({ status: 409, response: { reason: 'changed' } });
+      expect(await row(id)).toMatchObject({ domain: 'b.ru', token: 'lk-b', check_result: null });
+    });
   });
 
   describe('состояние', () => {

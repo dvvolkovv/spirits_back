@@ -43,6 +43,7 @@ export type DomainRefusalCode =
   | 'no_domain'
   | 'issuing'
   | 'busy'
+  | 'changed' // заявку отвязали или заменили, пока с ней работали (проверка DNS шла до ~7 с)
   | 'throttled' // «Проверить сейчас» чаще CHECK_THROTTLE_S (задача 5, 429)
   | 'retries'; // больше RETRIES_PER_HOUR повторных выпусков в час (задача 5, 429)
 
@@ -227,10 +228,21 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
     const row: DomainRow | null = ins.rows[0] ?? (await this.rowOf(productId));
     if (!row) {
       // ...а параллельная отвязка — уже снять её.
-      throw refusal(HttpStatus.CONFLICT, 'busy', 'Заявку на домен в ту же секунду сняли — привяжите домен ещё раз.');
+      throw refusal(HttpStatus.CONFLICT, 'changed', 'Заявку на домен в ту же секунду сняли — обновите страницу и повторите.');
     }
     if (row.domain !== n.domain) throw this.hasDomain(row);
-    return this.view(await this.runCheck(row, p), p);
+
+    const checked = await this.runCheck(row, p);
+    if (!checked) {
+      // Показать здесь строку продукта значило бы выдать чужую заявку за эту:
+      // ответ на привязку a.ru с доменом b.ru.
+      throw refusal(
+        HttpStatus.CONFLICT,
+        'changed',
+        'Заявку на домен изменили, пока шла проверка DNS, — обновите страницу и повторите.',
+      );
+    }
+    return this.view(checked, p);
   }
 
   private hasDomain(row: DomainRow) {
@@ -302,22 +314,47 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Проверка DNS и сохранение результата. Ошибку Let's Encrypt (`error`) не
-   * трогает. Если строку за время проверки отвязали, отдаёт ту, что была:
-   * привязка случилась раньше отвязки.
+   * Проверка DNS ЗАЯВКИ и сохранение результата. Ошибку Let's Encrypt
+   * (`error`) не трогает.
+   *
+   * Результат принадлежит заявке — её коду в TXT, — а не продукту. Проверка
+   * длится до ~7 с, и длительность держит владелец проверяемого домена: его
+   * сервер может отвечать ровно столько, сколько нужно. Если за это время
+   * заявку отвязали и завели другую (другой домен или тот же с новым кодом),
+   * запись по одному product_id положила бы «всё зелёное» от старой заявки в
+   * строку новой, а выпуск стартовал бы для домена, чей TXT в DNS не появлялся
+   * ни разу, — обход проверки владения. Поэтому и запись, и выпуск адресуются
+   * парой (product_id, token).
+   *
+   * null — заявку за время проверки убрали или заменили: результат никуда не
+   * записан, выпуск не просился. Вызывающий обязан это разобрать (attach —
+   * 409 changed; задача 5: check — так же, фоновый оборот — пропустить).
    */
-  private async runCheck(row: DomainRow, p: OwnedProduct): Promise<DomainRow> {
+  private async runCheck(row: DomainRow, p: OwnedProduct): Promise<DomainRow | null> {
     const result = await checkDns({ domain: row.domain, names: row.names, token: row.token, hostIp: p.host_ip }, this.resolver);
-    await this.pg.query(
-      `UPDATE product_domains SET check_result = $2::jsonb, checked_at = now() WHERE product_id = $1`,
-      [row.product_id, JSON.stringify({ records: result.records })],
+    const saved = await this.pg.query(
+      `UPDATE product_domains SET check_result = $2::jsonb, checked_at = now()
+        WHERE product_id = $1 AND token = $3`,
+      [row.product_id, JSON.stringify({ records: result.records }), row.token],
     );
-    if (result.ok) await this.tryIssue(row.product_id);
-    return (await this.rowOf(row.product_id)) ?? row;
+    if (saved.rowCount === 0) return null;
+    if (result.ok) await this.tryIssue(row.product_id, row.token);
+    const fresh = await this.rowOf(row.product_id);
+    return fresh?.token === row.token ? fresh : null;
   }
 
-  // Задача 5 заменяет обе заглушки и добавляет check, checkPending, reconcileOrphans.
-  async tryIssue(_productId: string): Promise<'queued' | 'busy' | 'taken' | 'refused' | 'none'> {
+  /**
+   * ЗАГЛУШКА до задачи 5 (она же заменит safeTick и добавит check,
+   * checkPending, reconcileOrphans).
+   *
+   * Токен — часть адреса, а не довесок: задача 5 обязана переводить в выпуск
+   * строку `WHERE product_id = $1 AND token = $2` (в UPDATE внутри того же
+   * оператора, что ставит задание). Между записью результата в runCheck и
+   * выпуском заявку тоже могут отвязать и завести новую — вызов со старым
+   * токеном обязан кончиться 'none' и НЕ переводить новую заявку: её TXT в
+   * DNS мог не появиться ни разу.
+   */
+  async tryIssue(_productId: string, _token: string): Promise<'queued' | 'busy' | 'taken' | 'refused' | 'none'> {
     return 'none';
   }
 
