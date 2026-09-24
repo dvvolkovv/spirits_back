@@ -1460,6 +1460,15 @@ maybe('провижининг против живого Postgres', () => {
         // владельцу больше негде.
         'block_reason',
         'created_at',
+        // Свой домен (миграция 008, Task 8): custom_domain — подзапрос к
+        // product_domains в COLUMNS, только для статуса active;
+        // custom_domain_unicode — читаемая форма для кириллических доменов,
+        // считана в JS поверх него (ProductsService.withDomainUnicode). Оба
+        // ключа присутствуют в объекте всегда, даже когда своего домена нет
+        // (значение — null), поэтому оба перечислены здесь, а не только в
+        // положительном сценарии.
+        'custom_domain',
+        'custom_domain_unicode',
         'domain',
         'id',
         'kind',

@@ -2,7 +2,7 @@ import { HttpException } from '@nestjs/common';
 import { Pool } from 'pg';
 import * as fs from 'fs';
 import * as path from 'path';
-import { MIGRATIONS } from './products.service';
+import { MIGRATIONS, ProductsService } from './products.service';
 import { DOMAIN_TICK_MS, DomainsService, RECONCILE_TICK_MS, RESOLVER_PROBE_NAME } from './domains.service';
 import { DnsResolver, TXT_LABEL } from './domain-dns';
 
@@ -1662,6 +1662,41 @@ maybe('свой домен: сервис против живого Postgres', ()
         every.mockRestore();
         stop.mockRestore();
       }
+    });
+  });
+
+  // Кабинет строит главную ссылку карточки продукта из этой колонки — но
+  // только когда домен РАБОТАЕТ: привязка в процессе ссылкой становиться не
+  // должна (DNS мог ещё не сойтись, а человек — ошибиться адресом). Список
+  // отдаёт ProductsService, а не DomainsService: колонка — подзапрос к
+  // products в COLUMNS (products.service.ts).
+  describe('список продуктов кабинета', () => {
+    it('отдаёт работающий свой домен и только работающий', async () => {
+      const live = await mkProduct({ slug: 'live' });
+      const wait = await mkProduct({ slug: 'wait' });
+      await putDomain(live, 'active', { domain: 'live.ru' });
+      await putDomain(wait, 'awaiting_dns', { domain: 'wait.ru' });
+      const rows = await new ProductsService(pg as any).list(OWNER);
+      const by = Object.fromEntries(rows.map((r: any) => [r.slug, r.custom_domain]));
+      expect(by).toEqual({ live: 'live.ru', wait: null });
+    });
+
+    // Кабинет показывает кириллический домен читаемым (`пример.рф`), а не
+    // punycode — браузер сам его не переводит. custom_domain остаётся ASCII:
+    // это то, что реально лежит в DNS и годится для ссылки.
+    it('рядом с ASCII отдаёт читаемую форму (custom_domain_unicode), и только у работающего', async () => {
+      const live = await mkProduct({ slug: 'live-idn' });
+      const wait = await mkProduct({ slug: 'wait-idn' });
+      await putDomain(live, 'active', { domain: 'xn--e1afmkfd.xn--p1ai' });
+      await putDomain(wait, 'awaiting_dns', { domain: 'w.ru' });
+      const rows = await new ProductsService(pg as any).list(OWNER);
+      const by = Object.fromEntries(
+        rows.map((r: any) => [r.slug, { ascii: r.custom_domain, unicode: r.custom_domain_unicode }]),
+      );
+      expect(by).toEqual({
+        'live-idn': { ascii: 'xn--e1afmkfd.xn--p1ai', unicode: 'пример.рф' },
+        'wait-idn': { ascii: null, unicode: null },
+      });
     });
   });
 });

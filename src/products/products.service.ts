@@ -2,6 +2,7 @@ import { Injectable, Logger, NotFoundException, OnModuleInit } from '@nestjs/com
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { domainToUnicode } from 'url';
 import { PgService } from '../common/services/pg.service';
 
 export interface ProductRow {
@@ -24,6 +25,15 @@ export interface ProductRow {
   // `sleep_reason`: путь отказа задания сна обнуляет ту — см. 007.
   block_reason: string | null;
   created_at: string;
+  // Свой домен продукта (миграция 008) в punycode/ASCII — как в DNS и в
+  // ссылке. NULL, пока домен не в состоянии active (заявка ждёт DNS, в
+  // выпуске, отказала или отвязывается) — см. COLUMNS.
+  custom_domain: string | null;
+  // Та же форма для глаз человека (`пример.рф`) — считается в JS после
+  // выборки (list/getOwned), в Postgres нет IDN-функций. NULL ровно тогда,
+  // когда NULL и custom_domain: браузер сам punycode в юникод не переводит,
+  // и без этого поля кабинет показал бы кириллический домен латиницей.
+  custom_domain_unicode: string | null;
 }
 
 /**
@@ -181,9 +191,16 @@ const OWN_HOST_TOKEN_GUC = 'linkeon.own_host_token_sha256';
 // user_id остаётся, хотя фронт его не читает: это id самого спрашивающего
 // (WHERE user_id = $1), то есть не утечка, а подтверждение того, чьи продукты
 // приехали. На него же опирается сторож формы выборки в products.access.spec.ts.
+//
+// custom_domain — свой домен продукта (миграция 008), ТОЛЬКО в состоянии
+// active: кабинет делает его главной ссылкой карточки, и привязка в процессе
+// ссылкой становиться не должна. Подзапрос, а не JOIN: у продукта не больше
+// одной строки домена, а выборка остаётся «SELECT … FROM products».
 const COLUMNS = `id, user_id, name, slug, status, kind, domain,
                  runner_seen_at, provision_error, paid_until, sleep_reason,
-                 block_reason, created_at`;
+                 block_reason, created_at,
+                 (SELECT d.domain FROM product_domains d
+                   WHERE d.product_id = products.id AND d.status = 'active') AS custom_domain`;
 
 @Injectable()
 export class ProductsService implements OnModuleInit {
@@ -199,6 +216,17 @@ export class ProductsService implements OnModuleInit {
     }
   }
 
+  /**
+   * custom_domain из COLUMNS — punycode/ASCII, годится для ссылки и для
+   * сравнения. custom_domain_unicode — та же форма для глаз человека
+   * (`пример.рф`): считается здесь, в JS, а не в SQL — в Postgres нет
+   * IDN-функций (см. runMigration про pgcrypto/citext на проде), а браузер
+   * сам punycode в юникод не переводит.
+   */
+  private withDomainUnicode(row: ProductRow): ProductRow {
+    return { ...row, custom_domain_unicode: row.custom_domain ? domainToUnicode(row.custom_domain) : null };
+  }
+
   async list(userId: string): Promise<ProductRow[]> {
     const r = await this.pg.query(
       `SELECT ${COLUMNS} FROM products
@@ -206,7 +234,7 @@ export class ProductsService implements OnModuleInit {
         ORDER BY created_at DESC`,
       [userId],
     );
-    return r.rows;
+    return r.rows.map((row: ProductRow) => this.withDomainUnicode(row));
   }
 
   /**
@@ -220,7 +248,7 @@ export class ProductsService implements OnModuleInit {
       [id, userId],
     );
     if (!r.rows[0]) throw new NotFoundException('Product not found');
-    return r.rows[0];
+    return this.withDomainUnicode(r.rows[0]);
   }
 
   /**
