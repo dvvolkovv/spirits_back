@@ -49,18 +49,20 @@ describe('ProductsService.onModuleInit', () => {
   });
 
   it('не падает, если применение НЕобязательной миграции бросает ошибку', async () => {
-    // 001..004 едут через пул: их отказ по-прежнему только пишется в лог.
-    // Схема продуктов не должна ронять чат, оплаты и вход. 005 едет по
-    // выделенному соединению — здесь оно исправно, то есть падают ровно
-    // необязательные.
+    // 001..004 и 007 едут через пул: их отказ по-прежнему только пишется в
+    // лог. Схема продуктов не должна ронять чат, оплаты и вход. 005 едет по
+    // выделенному соединению — здесь оно исправно; 006 и 008 обязательные и
+    // тоже исправны здесь — то есть падают ровно необязательные.
     const client = { query: jest.fn(async () => ({ rows: [] })), release: jest.fn() };
     const pg = {
       query: jest.fn(async (sql: string) => {
-        // 006 тоже едет через пул и тоже обязательная, поэтому исправна здесь
-        // ровно как 005: иначе этот сценарий проверял бы не то, что заявляет —
-        // старт падал бы от ОБЯЗАТЕЛЬНОЙ миграции, а читался бы как «падает от
-        // необязательной». Отказ 006 проверяется своим сценарием ниже.
+        // 006 и 008 тоже едут через пул и тоже обязательные, поэтому исправны
+        // здесь ровно как 005: иначе этот сценарий проверял бы не то, что
+        // заявляет — старт падал бы от ОБЯЗАТЕЛЬНОЙ миграции, а читался бы как
+        // «падает от необязательной». Их отказ проверяется своими сценариями
+        // ниже.
         if (String(sql).includes('ALTER TABLE product_host_agent')) return { rows: [] };
+        if (String(sql).includes('CREATE TABLE IF NOT EXISTS product_domains')) return { rows: [] };
         throw new Error('boom');
       }),
       getClient: jest.fn(async () => client),
@@ -105,6 +107,24 @@ describe('ProductsService.onModuleInit', () => {
     await expect(new ProductsService(pg as any).onModuleInit()).rejects.toThrow(
       /006_host_agent_per_host\.sql/,
     );
+  });
+
+  it('отказ 008 РОНЯЕТ старт, а не уходит в лог', async () => {
+    // 008 обязательная превентивно (см. FATAL_MIGRATIONS): с Task 6 плана её
+    // таблицу читает claimJob при выдаче задания ЛЮБОГО вида любому продукту,
+    // с Task 8 — список продуктов кабинета. Отказ, уходящий строкой в лог, дал
+    // бы 42P01 на каждом опросе агента и 500 на списке кабинета уже после
+    // выката тех задач — а deploy.sh jest не гоняет, и прод-smoke продукты не
+    // трогает, то есть test и smoke были бы зелёными, пока модуль лежит.
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        if (String(sql).includes('CREATE TABLE IF NOT EXISTS product_domains')) throw new Error('не взлетело');
+        return { rows: [] };
+      }),
+      getClient: jest.fn(async () => ({ query: jest.fn(async () => ({ rows: [] })), release: jest.fn() })),
+    };
+
+    await expect(new ProductsService(pg as any).onModuleInit()).rejects.toThrow(/008_domains\.sql/);
   });
 
   it('006 едет ПОСЛЕ 003 и 005 — она перестраивает их обеих', async () => {
@@ -1109,5 +1129,47 @@ describe('миграция 007 — блокировка и потолок на �
         /ADD COLUMN IF NOT EXISTS|DROP CONSTRAINT IF EXISTS|ADD CONSTRAINT|CREATE TABLE IF NOT EXISTS|CREATE INDEX IF NOT EXISTS/,
       );
     }
+  });
+});
+
+/**
+ * Текст миграции 008 — отдельно от соседей по той же причине, по какой
+ * отделены 002..007: склейка зеленела бы на чужом тексте. Якорь —
+ * `product_domains`: ни один более ранний файл этого слова не знает.
+ */
+async function migration008(): Promise<string> {
+  const { svc, queries } = makeService();
+  await svc.onModuleInit();
+  const sql = queries.find((q) => q.includes('product_domains'));
+  if (!sql) {
+    throw new Error('миграция 008 не применена: ни один запрос не заводит product_domains');
+  }
+  return sql.replace(/\/\*[\s\S]*?\*\//g, '').replace(/--[^\n]*/g, '');
+}
+
+describe('миграция 008 — свой домен продукта: обязательный файл без перевешиваемых словарей', () => {
+  it('весь файл — CREATE ... IF NOT EXISTS, ни одного ALTER TABLE / DROP / ADD CONSTRAINT', async () => {
+    // 008 в FATAL_MIGRATIONS (products.service.ts). У ОБЯЗАТЕЛЬНОЙ миграции
+    // перевешиваемый на каждом старте именованный словарь — это забытый в
+    // другом файле будущий вид задания, роняющий старт всего API; тот же
+    // приём, что у 005 с инлайновым словарём audience (см. «словарь аудитории
+    // ИНЛАЙНОВЫЙ…» выше). Вид 'domain' закрыт словарём 004 — она едет раньше
+    // 008 в том же старте и уже его знает, поэтому в 008 повторного ADD
+    // CONSTRAINT product_provision_jobs_kind_check нет.
+    const sql = await migration008();
+    const list = sql
+      .split(';')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    expect(list.length).toBeGreaterThan(0);
+    for (const s of list) {
+      expect(s).toMatch(
+        /^CREATE TABLE IF NOT EXISTS product_domains\b|^CREATE UNIQUE INDEX IF NOT EXISTS product_domains_occupied\b/,
+      );
+    }
+    expect(sql).not.toMatch(/ADD CONSTRAINT/);
+    expect(sql).not.toMatch(/ALTER TABLE/);
+    expect(sql).not.toMatch(/DROP/);
   });
 });
