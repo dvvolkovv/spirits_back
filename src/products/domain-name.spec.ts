@@ -1,8 +1,9 @@
-import { MAX_NAME_LENGTH, normalizeDomain, relativeName } from './domain-name';
+import { MAX_INPUT_LENGTH, MAX_LABELS, MAX_NAME_LENGTH, normalizeDomain, relativeName } from './domain-name';
 
-// strictNullChecks выключен в проекте (tsconfig.build.json) — на !r.ok TS не
-// сужает union NormalizeResult (r.reason/r.say/r.domain дальше дают TS2339),
-// а на явном сравнении с литералом r.ok === false/true сужает как положено.
+// strictNullChecks выключен в tsconfig.json (build-конфиг его наследует) —
+// на !r.ok TS не сужает union NormalizeResult (r.reason/r.say/r.domain дальше
+// дают TS2339), а на явном сравнении с литералом r.ok === false/true сужает
+// как положено.
 const ok = (raw: string) => {
   const r = normalizeDomain(raw);
   if (r.ok === false) throw new Error(`ждали ok для ${raw}, получили ${r.reason}`);
@@ -36,6 +37,19 @@ describe('нормализация своего домена', () => {
     expect(ok('https://Www.DmitryVolkov.RU:443/path?x=1#top').domain).toBe('dmitryvolkov.ru');
     expect(ok('dmitryvolkov.ru.').domain).toBe('dmitryvolkov.ru');
     expect(ok('  DMITRYVOLKOV.RU  ').domain).toBe('dmitryvolkov.ru');
+
+    // Протокол-относительный префикс (без схемы, просто //) и схема любым
+    // регистром — обе формы встречаются, когда домен копируют из адресной
+    // строки браузера или из HTML-атрибута.
+    expect(ok('//dmitryvolkov.ru').domain).toBe('dmitryvolkov.ru');
+    expect(ok('HTTPS://DmitryVolkov.RU').domain).toBe('dmitryvolkov.ru');
+
+    // toLowerCase() до domainToASCII здесь НЕ нужен: своим lower мы бы сами
+    // испортили UTS46-приведение регистра. 'ẞ' (заглавная эсцет) с нашим lower
+    // даёт 'ß', а domainToASCII без lower разворачивает её в 'ss' — как в
+    // браузере, — только если МЫ САМИ не привели строку к нижнему регистру
+    // заранее другим способом.
+    expect(ok('STRAẞE.de').domain).toBe('strasse.de');
   });
 
   // Корень определяется по списку публичных суффиксов, а не «две метки»:
@@ -96,6 +110,55 @@ describe('нормализация своего домена', () => {
     expect(refused('under_score.ru')).toBe('bad_form');
   });
 
+  // R-LDH (RFC 5891 §4.2.3.1): дефис в 3-4 позиции метки зарезервирован под
+  // ACE-префикс xn--. Let's Encrypt/Boulder такие имена отбивает
+  // (errInvalidRLDH) — сертификат для них не выпустится никогда.
+  it('дефис в 3-4 позиции метки — не xn-- — отбивается', () => {
+    expect(refused('ab--cd.ru')).toBe('bad_form');
+    expect(refused('shop.ab--cd.example.ru')).toBe('bad_form');
+    // xn-- — легитимный ACE-префикс, а не нарушение RLDH.
+    expect(ok('пример.рф').domain).toBe('xn--e1afmkfd.xn--p1ai');
+  });
+
+  // Типографские тире/апострофы и подобная пунктуация успешно кодируются
+  // punycode'ом (ACE-строка синтаксически валидна и проходит все проверки
+  // формы), но настоящего домена с такими метками не бывает — почти всегда
+  // это автозамена текстового редактора или мобильной клавиатуры.
+  it('пунктуация в юникодной форме метки отбивается', () => {
+    expect(refused('dmitry–volkov.ru')).toBe('bad_form'); // en dash U+2013
+    expect(refused('dmitry’s.ru')).toBe('bad_form'); // «умный» апостроф U+2019
+
+    // Полноширинный дефис U+FF0D — domainToASCII сам разворачивает его в
+    // обычный ASCII-дефис ДО нашей проверки пунктуации, дефис из проверки
+    // осознанно исключён (иначе обычные имена с дефисом сами не проходили бы).
+    expect(ok('dmitry－volkov.ru').domain).toBe('dmitry-volkov.ru');
+  });
+
+  // Самая вероятная причина смешения латиницы с кириллицей в одной метке —
+  // сбитая раскладка клавиатуры: кириллическая «о» неотличима глазом от
+  // латинской, но кодируется в другой punycode, и TXT-запись для проверки
+  // владения таким доменом не найдётся никогда — а настоящая зона пользователя
+  // тем временем получит записи, которые ничего не подтверждают.
+  it('латиница и кириллица в одной метке — mixed_script', () => {
+    expect(refused('dmitryvolkоv.ru')).toBe('mixed_script'); // кириллическая "о" (U+043E)
+    // Чисто кириллический домен — не смешение: обе метки одного письма.
+    expect(ok('магазин.пример.рф').apex).toBe(false);
+    // Латиница с диакритикой — тоже не смешение: ü входит в Script=Latin.
+    expect(ok('münchen.de').apex).toBe(true);
+  });
+
+  // Зона обязана быть настоящей (ICANN или PRIVATE), а не «последняя метка —
+  // наверное суффикс»: это поведение tldts по умолчанию для нераспознанной
+  // зоны, иначе dmitryvolkov.ruu или опечатка в зоне проходили бы как валидный
+  // домен, хотя сертификат для них не выпустится никогда.
+  it('несуществующая доменная зона — unknown_tld', () => {
+    expect(refused('dmitryvolkov.rf')).toBe('unknown_tld'); // не 'рф' и не реальный TLD
+    expect(refused('dmitryvolkov.ruu')).toBe('unknown_tld'); // опечатка в зоне
+    expect(refused('site.local')).toBe('unknown_tld'); // спец-использование, не публичная зона
+    expect(ok('site.spb.ru').apex).toBe(true); // PRIVATE — настоящая зона
+    expect(ok('site.co.uk').apex).toBe(true); // ICANN — настоящая зона
+  });
+
   // Замер на nginx 1.24 машин продуктов: длинное имя роняет `nginx -t` всей
   // машины. Потолок — на каждое имя, включая www.
   it('имя длиннее потолка отбивается, ровно потолок — нет', () => {
@@ -124,6 +187,22 @@ describe('нормализация своего домена', () => {
     expect(`www.${domain96}`.length).toBe(MAX_NAME_LENGTH);
   });
 
+  // Boulder (Let's Encrypt) maxLabels = 10 — сертификат для домена глубже не
+  // выпустится никогда.
+  it('больше 10 меток отбивается, ровно 10 — нет', () => {
+    expect(refused('a.b.c.d.e.f.g.h.i.j.ru')).toBe('too_long'); // 11 меток
+    expect(ok('a.b.c.d.e.f.g.h.i.ru').names).toEqual(['a.b.c.d.e.f.g.h.i.ru']); // 10 меток
+  });
+
+  // Проверяем ПРИЧИНУ отказа, а не время выполнения: синхронный код jest не
+  // прервёт, зависший тест просто упёрся бы в общий таймаут раннера, а не
+  // указал бы, что именно сломалось. JSON-лимит бэка — 50 МБ, а нормализатор
+  // зовётся ДО проверки владельца домена — без потолка на сырой ввод один
+  // запрос любого пользователя нагрузил бы API квадратичной регуляркой.
+  it('сверхдлинный сырой ввод отбивается потолком, а не регуляркой', () => {
+    expect(refused('.'.repeat(100_000) + 'x')).toBe('too_long');
+  });
+
   it('у отказа есть человеческий текст', () => {
     const r = normalizeDomain('1.2.3.4');
     expect(r.ok).toBe(false);
@@ -134,5 +213,65 @@ describe('нормализация своего домена', () => {
     expect(relativeName('dmitryvolkov.ru', 'dmitryvolkov.ru')).toBe('@');
     expect(relativeName('www.dmitryvolkov.ru', 'dmitryvolkov.ru')).toBe('www');
     expect(relativeName('_linkeon.shop.dmitryvolkov.ru', 'dmitryvolkov.ru')).toBe('_linkeon.shop');
+  });
+
+  // fqdn вне зоны раньше молча отдавал '' — тихая порча DNS-записи (запись
+  // создалась бы с пустым/корневым именем не в той зоне). Теперь — исключение,
+  // чтобы вызывающий код (Task 4) не мог создать запись не в той зоне молча.
+  it('fqdn вне зоны — исключение, а не тихое пустое имя', () => {
+    expect(() => relativeName('a.ru', 'b.ru')).toThrow();
+    // 'ab.ru' оканчивается БУКВАМИ зоны 'b.ru', но не отделена точкой — это
+    // не поддомен 'b.ru', а другой домен, которому просто не повезло с именем.
+    expect(() => relativeName('ab.ru', 'b.ru')).toThrow();
+  });
+});
+
+describe('контракт: любой ok-результат — валидная привязываемая форма', () => {
+  // ~30 разнообразных входов, которые обязаны дать ok: регистры, схемы (в т.ч.
+  // протокол-относительная и нестандартная), порты, путь/запрос/якорь, IDN
+  // (кириллица, диакритика), www-корни, поддомены на разной глубине, co.uk и
+  // spb.ru (суффикс из нескольких меток — ICANN и PRIVATE), уже готовый
+  // punycode, цифровые и дефисные метки, глубина ровно на потолке меток.
+  //
+  // Для КАЖДОГО ok-результата держат остальные части фичи (Task 4 — запись
+  // DNS/сертификата, Task 9 — поиск продукта ассистентом): форма domain
+  // совпадает с ограничением БД product_domains_domain_form (миграция 008),
+  // names[0] — это и есть domain, www — вторым элементом и только у корня, и
+  // оба потолка (знаки, метки) держатся на КАЖДОМ имени, а не только на домене
+  // (см. тест про *.ck выше — с одним доменом эта проверка бы не поймала).
+  const corpus = [
+    'dmitryvolkov.ru', 'shop.dmitryvolkov.ru', 'www.dmitryvolkov.ru',
+    'DMITRYVOLKOV.RU', 'https://dmitryvolkov.ru', 'http://dmitryvolkov.ru:8080/path',
+    'ftp://dmitryvolkov.ru', 'dmitryvolkov.ru#section', 'dmitryvolkov.ru?x=1',
+    'dmitryvolkov.ru.', '  dmitryvolkov.ru  ',
+    'site.co.uk', 'shop.site.co.uk', 'site.spb.ru', 'firm.spb.ru',
+    'xn--e1afmkfd.xn--p1ai', 'пример.рф', 'münchen.de', 'магазин.пример.рф',
+    '123.ru', 'a1b2.ru', '3dprint.ru', 'shop-online.ru',
+    'a.b.c.dmitryvolkov.ru', 'a.b.c.d.e.f.g.h.i.ru',
+    'evil-linkeon.io', 'site.com', 'shop.example.com',
+    'my-shop.spb.ru', 'sub.my-shop.spb.ru', 'localhost.ru',
+    'shop.dmitryvolkov.ru:8443',
+  ];
+
+  it.each(corpus)('инварианты для %s', (raw) => {
+    const r = normalizeDomain(raw);
+    if (r.ok === false) throw new Error(`ждали ok для ${raw}, получили ${r.reason}: ${r.say}`);
+    expect(r.domain).toMatch(/^[a-z0-9-]+(\.[a-z0-9-]+)+$/);
+    expect(r.names[0]).toBe(r.domain);
+    expect([1, 2]).toContain(r.names.length);
+    if (r.names.length === 2) expect(r.names[1]).toBe(`www.${r.domain}`);
+    for (const n of r.names) {
+      expect(n.length).toBeLessThanOrEqual(MAX_NAME_LENGTH);
+      expect(n.split('.').length).toBeLessThanOrEqual(MAX_LABELS);
+    }
+  });
+
+  // www у НЕ-корня — буквальная метка поддомена, а не «www-псевдоним корня»:
+  // срезать её значило бы привязать продукту www.shop.example.com вместо
+  // shop.example.com, который попросил пользователь, — чужое доменное имя.
+  it('www.<не-корень> не срезается: остаётся поддоменом, одно имя', () => {
+    expect(ok('www.shop.example.com')).toMatchObject({
+      domain: 'www.shop.example.com', apex: false, names: ['www.shop.example.com'],
+    });
   });
 });
