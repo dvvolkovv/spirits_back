@@ -55,6 +55,13 @@ export class FakeHost {
    * из конфига уходит. Пустой список — «своих имён нет».
    */
   vhostDomains = new Map<string, string[]>();
+  /** Сертификаты certbot по имени (`--cert-name`). */
+  certs = new Set<string>();
+  /**
+   * Текст отказа `certbot certonly`, заданный тестом, или null — выпуск проходит.
+   * Отказ бросается ДО выпуска: сертификата после него нет, как у живого certbot.
+   */
+  certbotFails: string | null = null;
   /** Всё, что запускалось, в порядке запуска. */
   calls: string[][] = [];
   removedDirs: string[] = [];
@@ -117,6 +124,8 @@ export class FakeHost {
         this.vhostDomains.set(slug, names);
         return '';
       }
+      case 'certbot':
+        return this.certbot(rest);
       case 'rm': {
         // Подчистка конфига vhost — единственное место, где остался rm.
         if (rest[0] !== '-f') throw new Error(`неожиданные флаги rm: ${rest.join(' ')}`);
@@ -252,6 +261,30 @@ export class FakeHost {
       if (c.publish === publish) return true;
     }
     return false;
+  }
+
+  /**
+   * certbot в той форме, в какой его зовёт задание domain: `certonly` (выпуск
+   * или расширение по `--cert-name`) и `delete`. Живой `certbot delete` по
+   * отсутствующему имени отвечает «No certificate found with name …» и rc=1 —
+   * на этом тексте отвязка отличает повтор от настоящего отказа.
+   */
+  private certbot(rest: string[]): string {
+    const [sub, ...args] = rest;
+    const at = args.indexOf('--cert-name');
+    const name = at >= 0 ? args[at + 1] : undefined;
+    if (!name) throw new Error(`certbot ${sub}: без --cert-name`);
+    if (sub === 'certonly') {
+      if (this.certbotFails !== null) throw new Error(this.certbotFails);
+      this.certs.add(name);
+      return '';
+    }
+    if (sub === 'delete') {
+      if (!this.certs.has(name)) throw new Error(`No certificate found with name ${name}`);
+      this.certs.delete(name);
+      return '';
+    }
+    throw new Error(`certbot ${sub}: симулятор знает только certonly и delete`);
   }
 
   /** Есть ли контейнер и запущен ли он. */

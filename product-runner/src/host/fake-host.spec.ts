@@ -211,3 +211,35 @@ describe('vhost', () => {
     await expect(host.run(['product-vhost', 'shop', '--asleep', '--name', 'a.ru'])).rejects.toThrow(/хвост/);
   });
 });
+
+describe('certbot', () => {
+  const certonly = (name: string, ...domains: string[]) =>
+    host.run(['certbot', 'certonly', '--webroot', '-w', '/var/www/linkeon-acme', '--cert-name', name,
+      '--non-interactive', '--agree-tos', '--keep-until-expiring', '--expand',
+      ...domains.flatMap((d) => ['-d', d])]);
+
+  it('certonly выпускает сертификат, delete снимает', async () => {
+    await certonly('linkeon-shop', 'a.ru');
+    expect(host.certs.has('linkeon-shop')).toBe(true);
+
+    await host.run(['certbot', 'delete', '--cert-name', 'linkeon-shop', '--non-interactive']);
+    expect(host.certs.has('linkeon-shop')).toBe(false);
+  });
+
+  it('отказ выпуска — текстом, заданным тестом, и сертификата нет', async () => {
+    host.certbotFails = 'Type: unauthorized';
+
+    await expect(certonly('linkeon-shop', 'a.ru')).rejects.toThrow('Type: unauthorized');
+    expect(host.certs.size).toBe(0);
+  });
+
+  it('delete несуществующего — отказ «No certificate found», как у живого certbot', async () => {
+    await expect(
+      host.run(['certbot', 'delete', '--cert-name', 'linkeon-net', '--non-interactive']),
+    ).rejects.toThrow(/No certificate found with name linkeon-net/);
+  });
+
+  it('прочие подкоманды — отказ', async () => {
+    await expect(host.run(['certbot', 'renew'])).rejects.toThrow(/certbot/);
+  });
+});
