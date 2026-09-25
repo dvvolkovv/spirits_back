@@ -155,6 +155,21 @@ describe('ClaudeCliService argv: вложения', () => {
     expect(fs.existsSync(cwdAtSpawn!)).toBe(false);
   });
 
+  it('с вложениями и без явного allowedTools: --allowedTools "" (голый Read одобрял бы ЛЮБОЙ путь)', async () => {
+    spawnMock.mockImplementation(() => fakeProc(OK_JSON));
+    const svc = new ClaudeCliService();
+    await svc.text('разбери файл', { attachments: [attach] });
+
+    const args = lastArgs();
+    const i = args.indexOf('--allowedTools');
+    expect(i).toBeGreaterThanOrEqual(0);
+    // Ровно пустая строка отдельным argv-элементом — никакого авто-одобрения Read.
+    expect(args[i + 1]).toBe('');
+    // При этом Read ДОСТУПЕН (--tools Read): внутри одноразового cwd он в -p идёт
+    // без подтверждения, а наружу — упирается в запрос и отклоняется.
+    expect(flagValue(args, '--tools')).toBe('Read');
+  });
+
   it('обезвреживает @-путь в тексте caller-а, но НАШУ ссылку на вложение сохраняет', async () => {
     let promptAtSpawn = '';
     spawnMock.mockImplementation((_bin: string, args: string[]) => {
