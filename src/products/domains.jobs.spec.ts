@@ -369,6 +369,32 @@ maybe('задание domain: выдача агенту и приём отчёт
     });
   });
 
+  // Отказ агента — вывод certbot целиком, и длина его ничем не ограничена,
+  // кроме общего потолка приёма отчёта (ERROR_MAX в host.controller.ts, 2000).
+  // Строка домена уезжает в кабинет и ассистенту — ей свой потолок.
+  it('длинный отказ подрезается до 1000 знаков с многоточием — и в задании, и в строке домена', async () => {
+    const id = await mkProduct('shop');
+    await domain(id, 'issuing');
+    const jobId = await job(id, 'domain');
+    await prov.claimJob('own');
+    await report(jobId, { ok: false, error: 'certbot: ' + 'ш'.repeat(5000) });
+    const j = await jobRow(jobId);
+    expect(j.error).toHaveLength(1000);
+    expect(j.error.endsWith('…')).toBe(true);
+    expect(j.error.startsWith('certbot: ')).toBe(true);
+    expect((await domainRow()).error).toBe(j.error);
+  });
+
+  it('отказ ровно в 1000 знаков не подрезается', async () => {
+    const id = await mkProduct('shop');
+    await domain(id, 'issuing');
+    const jobId = await job(id, 'domain');
+    await prov.claimJob('own');
+    const exact = 'э'.repeat(1000);
+    await report(jobId, { ok: false, error: exact });
+    expect((await jobRow(jobId)).error).toBe(exact);
+  });
+
   // Живой дефект, который сторожит этот тест: «последнее задание» видело бы
   // domain вместо пробуждения, и проснувшийся продукт навсегда оставался бы
   // «спящим» с работающим контейнером.

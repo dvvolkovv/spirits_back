@@ -216,6 +216,16 @@ const HEARTBEAT_FRESH_MS = 2 * 60 * 1000;
 // причины. В тексте «мин», а не «минут»: при смене числа русская форма
 // множественного числа поехала бы (2 минуты, 21 минута), а сокращение
 // неизменяемо.
+/**
+ * Потолок причины отказа задания domain — строже общего ERROR_MAX приёма
+ * отчёта (host.controller.ts, 2000): туда уезжает вывод certbot, а из строки
+ * домена текст идёт в кабинет и ассистенту, в каждый ответ о домене. Подрезка
+ * с многоточием — по тому же правилу, что у ERROR_MAX: по обрезанной строке
+ * видно, что её срезали. Остальные виды заданий не трогаются: их причина
+ * ложится в карточку продукта со своими ожиданиями длины.
+ */
+export const DOMAIN_ERROR_MAX = 1000;
+
 const PROVISION_DEADLINE_MIN = 10;
 const DEADLINE_SQL = `interval '${PROVISION_DEADLINE_MIN} minutes'`;
 // `/ 1000` — не косметика. Константа хранится в МИЛЛИСЕКУНДАХ (её читает
@@ -1017,7 +1027,8 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    * тот случай, о котором шапка provisioning.integration.spec.ts.
    */
   private async completeDomainJob(jobId: string, result: { ok: boolean; error?: string }) {
-    const error = result.error ?? 'без причины';
+    const raw = result.error ?? 'без причины';
+    const error = raw.length > DOMAIN_ERROR_MAX ? `${raw.slice(0, DOMAIN_ERROR_MAX - 1)}…` : raw;
     const outdated = !result.ok && error.startsWith(AGENT_OUTDATED_MARKER);
     const r = await this.pg.query(
       `WITH closed AS (
