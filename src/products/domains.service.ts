@@ -21,13 +21,20 @@ export type DomainStatus = 'awaiting_dns' | 'issuing' | 'active' | 'failed' | 'r
  * старее сервера и задания domain не знает (см. AGENT_OUTDATED_MARKER в
  * domain-name.ts).
  */
-export type DomainErrorReason =
-  | 'taken'
-  | 'orphan_issuing'
-  | 'orphan_removing'
-  | 'issue_failed'
-  | 'remove_failed'
-  | 'agent_outdated';
+export const DOMAIN_ERROR_REASONS = [
+  'taken',
+  'orphan_issuing',
+  'orphan_removing',
+  'issue_failed',
+  'remove_failed',
+  'agent_outdated',
+] as const;
+/**
+ * Тип — из списка, а не наоборот: список нужен и в работе (тексты ассистенту
+ * по каждой причине, product-tool.service.ts), и в тесте сверки со словарём
+ * 008. Две копии разошлись бы молча.
+ */
+export type DomainErrorReason = (typeof DOMAIN_ERROR_REASONS)[number];
 
 /**
  * Маркер отказа устаревшего агента (см. AGENT_OUTDATED_MARKER в domain-name.ts)
