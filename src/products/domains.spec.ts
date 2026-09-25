@@ -814,6 +814,29 @@ maybe('свой домен: сервис против живого Postgres', ()
       expect(await jobs(id)).toEqual([{ kind: 'domain', status: 'queued' }]);
     });
 
+    // A-записи уже смотрят на нашу машину (общий IP), но в TXT — чужой код:
+    // владение доменом не доказано. Ни привязка, ни кнопка, ни фоновый оборот
+    // выпуск не просят — иначе любой занял бы домен, направленный на машину
+    // другим.
+    it('чужой TXT — выпуска нет: A на нашу машину, заявка остаётся в awaiting_dns', async () => {
+      const id = await mkProduct({ slug: 'shop' });
+      dns.zone[`${TXT_LABEL}.a.ru`] = { TXT: [['lk-0123456789abcdef0123456789abcdef']] };
+      dns.zone['a.ru'] = { A: ['139.59.210.42'] };
+      dns.zone['www.a.ru'] = { A: ['139.59.210.42'] };
+      const s = svc();
+      const v = await s.attach(OWNER, id, 'a.ru');
+      expect(v.status).toBe('awaiting_dns');
+      expect(v.check?.map((c) => [c.type, c.ok])).toEqual([
+        ['TXT', false], ['A', true], ['AAAA', true], ['A', true], ['AAAA', true],
+      ]);
+      await pool.query(`UPDATE product_domains SET checked_at = now() - interval '1 hour' WHERE product_id = $1`, [id]);
+      await expect(s.check(OWNER, id)).resolves.toMatchObject({ status: 'awaiting_dns' });
+      await pool.query(`UPDATE product_domains SET checked_at = now() - interval '1 hour' WHERE product_id = $1`, [id]);
+      await expect(s.checkPending()).resolves.toBe(1);
+      expect((await row(id)).status).toBe('awaiting_dns');
+      expect(await jobs(id)).toEqual([]);
+    });
+
     // Между записью результата и выпуском заявку отвязали и завели новую.
     // Выпуск, спрошенный кодом старой, обязан кончиться 'none' и не тронуть
     // новую: её TXT в DNS мог не появиться ни разу — обход проверки владения.

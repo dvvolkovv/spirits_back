@@ -393,6 +393,22 @@ maybe('задание domain: выдача агенту и приём отчёт
       expect(await domainRow()).toMatchObject({ status: 'failed', error_reason: 'issue_failed' });
     });
 
+    // То же правило — у предела заданий domain в час (domainJobsLeft, LIKE по
+    // тексту отказа в задании): отказ с маркером в середине — настоящий отказ
+    // Let's Encrypt, и в счёт он идёт. Иначе страница пользователя с этой
+    // фразой снимала бы с него предел заказов по учётной записи машины.
+    it('маркер не в начале текста задания — такие задания в предел domain в час идут', async () => {
+      const id = await mkProduct('shop');
+      await domain(id, 'awaiting_dns');
+      const quoted = `Invalid response from http://a.ru/.well-known/acme-challenge/x: "${OUTDATED}"`;
+      for (let i = 0; i < 6; i++) {
+        const jobId = await job(id, 'domain', 'failed');
+        await pool.query(`UPDATE product_provision_jobs SET error = $2, finished_at = now() WHERE id = $1`, [jobId, quoted]);
+      }
+      await expect(domains.tryIssue(id, 'lk', 'awaiting_dns')).resolves.toBe('limited');
+      expect(await domainRow()).toMatchObject({ status: 'awaiting_dns' });
+    });
+
     it('такие отказы не расходуют ни окно повторов, ни задания domain в час', async () => {
       const id = await mkProduct('shop');
       await domain(id, 'issuing');

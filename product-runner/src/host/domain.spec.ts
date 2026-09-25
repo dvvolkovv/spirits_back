@@ -151,7 +151,9 @@ describe('мелочи привязки', () => {
 
     expect(vhostCalls()[0]).toEqual(['product-vhost', 'shop', '8001', '--domain', 'www.a.ru', '--domain', 'a.ru']);
     const certbot = host.calls.find((c) => c[0] === 'certbot')!;
-    expect(certbot.slice(-4)).toEqual(['-d', 'www.a.ru', '-d', 'a.ru']);
+    // Весь хвост после флагов, а не последние четыре: при повторах в `-d`
+    // хвост из четырёх совпал бы и со строкой, где имена идут дважды.
+    expect(certbot.slice(certbot.indexOf('--expand') + 1)).toEqual(['-d', 'www.a.ru', '-d', 'a.ru']);
   });
 });
 
