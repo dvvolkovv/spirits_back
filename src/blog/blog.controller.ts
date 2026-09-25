@@ -16,7 +16,28 @@ import { BlogTopicService, normalizeTopicKey } from './blog-topic.service';
 import { BlogSettingsService } from './blog-settings.service';
 import { BlogImageService } from './blog-image.service';
 import { BlogPost, BlogStatus, canTransition, rowToPost } from './blog.types';
-import { nextSlotAfter } from './blog-slots';
+import { NoFreeSlotError, upcomingSlots } from './blog-slots';
+import { ApprovedSlot, SlotHolder, approveIntoFreeSlot, isSlotConflict, slotHolderAt, slotHolders } from './blog-slot-claim';
+import { formatSlotWhen } from './blog-slot-format';
+
+/** `free_slots`: сколько ближайших слотов отдаём, если не просили, и больше скольких не отдаём. */
+export const FREE_SLOTS_DEFAULT = 6;
+export const FREE_SLOTS_MAX = 20;
+
+const STALE_POST = 'пост изменился в другом месте — обнови страницу';
+
+/** Та же версия поста? Сравнение по моменту, а не по написанию строки. Не прислали — проверять нечего. */
+function sameVersion(current: any, sent?: any): boolean {
+  if (!sent) return true;
+  return new Date(current).getTime() === new Date(sent).getTime();
+}
+
+/** `count` из запроса: по умолчанию 6, не больше 20; мусор — как не передан. */
+function freeSlotsCount(raw: any): number {
+  const n = Math.floor(Number(raw));
+  if (raw === undefined || raw === null || raw === '' || !Number.isFinite(n) || n < 1) return FREE_SLOTS_DEFAULT;
+  return Math.min(n, FREE_SLOTS_MAX);
+}
 
 /**
  * Действия в одном POST — тот же стиль, что у admin/backlog и admin/coupons.
@@ -32,7 +53,17 @@ import { nextSlotAfter } from './blog-slots';
  *     состояний, что и кнопки в личке, и крон. Без этого админка стала бы
  *     дырой в обход апрува: `redraft` вернул бы в работу опубликованный пост,
  *     а `BlogApprovalService.sendForReview` пишет `pending_review` вообще без
- *     проверки перехода, так что дальше он снова доехал бы до канала.
+ *     проверки перехода, так что дальше он снова доехал бы до канала;
+ *  3. один пост на слот: `approve` без времени ставит в ближайший свободный
+ *     слот тем же путём, что и кнопка в личке, а явное время (`approve` со
+ *     `slotAt`, `reschedule`) в занятый слот не пишется — 409 slot_taken.
+ *     Гарантию даёт уникальный индекс (004_one_post_per_slot.sql), код лишь
+ *     не лезет туда, куда индекс всё равно не пустит.
+ *
+ * Отказы новых действий (`free_slots`, `reschedule`) и слотовые отказы
+ * `approve` несут машинную причину в `error` ('slot_taken',
+ * 'version_conflict', 'bad_request') — по ней фронт выбирает реакцию. Прежние
+ * 409 остались в конверте Nest по умолчанию (`error: 'Conflict'`).
  */
 @Controller('')
 export class BlogController {
@@ -112,15 +143,66 @@ export class BlogController {
         const post = await this.load(String(data.id));
         this.assertTransition(post, 'approved');
 
-        const { slotDays, slotHourMsk } = await this.settings.get();
-        const slot = data.slotAt ? this.parseSlot(data.slotAt) : nextSlotAfter(new Date(), slotDays, slotHourMsk);
+        if (data.slotAt) {
+          // Явный слот — выбор владельца: в занятый молча не переставляем на
+          // соседний, а отказываем и называем, чем он занят.
+          const slot = this.parseSlot(data.slotAt);
+          const r = await this.writeIntoSlot(post.id, slot, () => this.pg.query(
+            `UPDATE blog_post SET status = 'approved', slot_at = $2, updated_at = now()
+              WHERE id = $1 AND status = $3`,
+            [post.id, slot.toISOString(), post.status],
+          ));
+          this.assertApplied(r);
+        } else {
+          // Ближайший СВОБОДНЫЙ слот — тем же путём, что и кнопка в личке.
+          let approved: ApprovedSlot | null;
+          try {
+            approved = await approveIntoFreeSlot(this.pg, post.id, post.status, await this.settings.get());
+          } catch (e: any) {
+            if (e instanceof NoFreeSlotError) throw this.conflict('slot_taken', `не одобрил: ${e.message}`);
+            throw e;
+          }
+          if (!approved) this.assertApplied({ rowCount: 0 });
+        }
+        return res.status(200).json(await this.load(post.id));
+      }
 
-        const r = await this.pg.query(
-          `UPDATE blog_post SET status = 'approved', slot_at = $2, updated_at = now()
-            WHERE id = $1 AND status = $3`,
-          [post.id, slot.toISOString(), post.status],
-        );
-        this.assertApplied(r);
+      case 'free_slots': {
+        // Ближайшие слоты расписания, начиная со следующего, и чем каждый
+        // занят. Занят — это пост в approved/publishing ровно на этом
+        // slot_at; пост, поставленный не в слот расписания, здесь не виден.
+        const count = freeSlotsCount(data.count);
+        const { slotDays, slotHourMsk } = await this.settings.get();
+        const now = new Date();
+        const holders = new Map((await slotHolders(this.pg, now)).map((h) => [h.slotAt.getTime(), h]));
+        return res.status(200).json(upcomingSlots(now, slotDays, slotHourMsk, count).map((slot) => {
+          const h = holders.get(slot.getTime());
+          return { slotAt: slot.toISOString(), takenBy: h ? { id: h.id, title: h.title } : null };
+        }));
+      }
+
+      case 'reschedule': {
+        // Меняет только slot_at одобренного поста. Статус не трогает и в
+        // машину состояний не ходит: пост был одобрен и одобренным остаётся.
+        // Время любое, не обязательно слот расписания; один пост на момент
+        // держит уникальный индекс.
+        const slot = this.parseFutureSlot(data.slotAt);
+        if (!data.id) throw this.badRequest('не указан пост');
+        const post = await this.load(String(data.id));
+        if (!sameVersion(post.updatedAt, data.updatedAt)) throw this.conflict('version_conflict', STALE_POST);
+        if (post.status !== 'approved') {
+          throw this.badRequest(`перенести можно только одобренный пост, а этот в статусе ${post.status}`);
+        }
+
+        // Условие на статус — на случай, если между чтением и записью пост
+        // забрал паблишер (approved → publishing): переносить уходящий в
+        // канал пост поздно, и это «изменился в другом месте», а не успех.
+        const r = await this.writeIntoSlot(post.id, slot, () => this.pg.query(
+          `UPDATE blog_post SET slot_at = $2, updated_at = now()
+            WHERE id = $1 AND status = 'approved'`,
+          [post.id, slot.toISOString()],
+        ));
+        if (r.rowCount === 0) throw this.conflict('version_conflict', STALE_POST);
         return res.status(200).json(await this.load(post.id));
       }
 
@@ -204,10 +286,7 @@ export class BlogController {
 
   /** Вторая вкладка админки не должна молча затирать правку первой. */
   private assertVersion(current: string, sent?: string): void {
-    if (!sent) return;
-    if (new Date(current).getTime() !== new Date(sent).getTime()) {
-      throw new ConflictException('пост изменился в другом месте — обнови страницу');
-    }
+    if (!sameVersion(current, sent)) throw new ConflictException(STALE_POST);
   }
 
   /** `new Date('чушь').toISOString()` бросает RangeError и превращается в 500. */
@@ -215,5 +294,58 @@ export class BlogController {
     const d = new Date(raw);
     if (Number.isNaN(d.getTime())) throw new BadRequestException(`не разобрал дату слота: ${raw}`);
     return d;
+  }
+
+  /** Время переноса: разбирается и ещё не наступило. `new Date(null)` — это 1970 год, а не «не передано». */
+  private parseFutureSlot(raw: any): Date {
+    const d = raw === undefined || raw === null || raw === '' ? new Date(NaN) : new Date(raw);
+    if (Number.isNaN(d.getTime())) throw this.badRequest(`не разобрал время слота: ${raw}`);
+    if (d.getTime() <= Date.now()) throw this.badRequest(`время слота уже прошло: ${d.toISOString()}`);
+    return d;
+  }
+
+  /**
+   * Записать пост в конкретный слот, выбранный владельцем. Занятый слот — это
+   * отказ 409 slot_taken, а не молчаливый перенос на соседний.
+   *
+   * Проверка перед записью нужна, чтобы назвать в отказе пост, который слот
+   * держит. Гарантию же даёт индекс: между проверкой и записью слот могли
+   * занять из личка-бота, соседней вкладки или другого процесса, и тогда 23505
+   * превращается в тот же 409, а не в 500.
+   */
+  private async writeIntoSlot(
+    postId: string,
+    slot: Date,
+    write: () => Promise<{ rowCount?: number | null }>,
+  ): Promise<{ rowCount?: number | null }> {
+    const holder = await slotHolderAt(this.pg, slot);
+    if (holder && holder.id !== postId) throw this.slotTaken(slot, holder);
+    try {
+      return await write();
+    } catch (e: any) {
+      if (!isSlotConflict(e)) throw e;
+      throw this.slotTaken(slot, await slotHolderAt(this.pg, slot));
+    }
+  }
+
+  private slotTaken(slot: Date, holder: SlotHolder | null): ConflictException {
+    const who = holder?.title ? `постом «${holder.title}»` : 'другим постом';
+    return this.conflict('slot_taken', `слот ${formatSlotWhen(slot, new Date())} уже занят ${who}`);
+  }
+
+  /**
+   * 409 с машинной причиной в `error` — контракт с фронтовой вкладкой: по
+   * нему она отличает «слот занят» (выбрать другой) от «пост изменился»
+   * (перезагрузить). Конверт тот же, что у отказов Nest в остальных
+   * действиях (`statusCode`, `message`, `error`), только в `error` вместо
+   * общего 'Conflict' стоит причина.
+   */
+  private conflict(error: 'slot_taken' | 'version_conflict', message: string): ConflictException {
+    return new ConflictException({ statusCode: 409, error, message });
+  }
+
+  /** 400 в том же конверте, что и `conflict`: причина в `error`, текст в `message`. */
+  private badRequest(message: string): BadRequestException {
+    return new BadRequestException({ statusCode: 400, error: 'bad_request', message });
   }
 }

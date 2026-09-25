@@ -9,7 +9,8 @@ import { BlogApprovalService } from './blog-approval.service';
 import { BlogSettingsService } from './blog-settings.service';
 import { BlogNewsService } from './blog-news.service';
 import { ALLOWED_TRANSITIONS, BlogStatus, canTransition, rowToPost } from './blog.types';
-import { nextSlotAfter, STALE_NEWS_DAYS } from './blog-slots';
+import { NoFreeSlotError, nextFreeSlotAfter, STALE_NEWS_DAYS } from './blog-slots';
+import { slotHolders } from './blog-slot-claim';
 
 /** Напоминание уходит, когда до слота осталось меньше этого. */
 const REMIND_WINDOW_MINUTES = 60;
@@ -104,7 +105,8 @@ export class BlogCron {
   }
 
   /**
-   * Каждые 5 минут: если ближайший слот ничем не обеспечен — готовим черновик.
+   * Каждые 5 минут: если владельцу нечего решать и никто не пишет черновик —
+   * готовим следующий.
    *
    * Пять минут, а не час, потому что это же расписание обслуживает
    * переработку: владелец прислал замечание реплаем, бот ответил «перепишу» —
@@ -112,19 +114,50 @@ export class BlogCron {
    * худшем случае через час. За это время проще отправить пост в мусор, чем
    * дождаться исправленного.
    *
-   * Лишней работы учащение не даёт: в устойчивом состоянии пост стоит в
-   * `pending_review` или `approved`, и проверка ниже выходит первым же
-   * запросом. См. разбор гонки в отчёте — в `drafting` эта охрана не
-   * заглядывает намеренно (иначе не подхватывалась бы сама переработка).
+   * Очередь держат двое:
+   *
+   *  - пост в `pending_review` — владелец ещё не решил, и второй черновик
+   *    только завалил бы его;
+   *  - черновик, который пишется ПРЯМО СЕЙЧАС: `drafting` со свежей отметкой
+   *    `drafting_started_at`. Без него тик, пришедший, пока релей думает
+   *    дольше пяти минут, начинал бы следующую тему параллельно.
+   *
+   * `approved` очередь НЕ держит. Одобренный пост уже решён и просто ждёт
+   * слота; раньше он держал всё: кейс, одобренный в пятницу на понедельник,
+   * не давал начать срочную новость до понедельника. Два одобренных сразу
+   * теперь норма — поэтому слот при одобрении считается ближайшим свободным
+   * (см. `approveIntoFreeSlot`), а не ближайшим вообще.
+   *
+   * Условие на `drafting` — ровно отрицание того, по которому пост берут в
+   * работу (`takeNextIdea` и захват ниже: «отметки нет ИЛИ она протухла»),
+   * с тем же порогом `STALE_DRAFTING_MINUTES`. Поэтому любой пост в
+   * `drafting` либо держит очередь, либо сам может быть взят — третьего нет,
+   * и дедлока тоже:
+   *
+   *  - пустая отметка — запрошенная переработка («Переписать», замечание),
+   *    она ждёт, чтобы её взяли. Сочти её охрана занятой — переработка
+   *    заблокировала бы сама себя навсегда;
+   *  - протухшая отметка — черновик взяли и бросили; его подбирает
+   *    `takeNextIdea`, держать очередь ему незачем;
+   *  - свежая отметка — живая подготовка, и она сама кончится: черновик уйдёт
+   *    на проверку, в `failed`, или отметка протухнет, если процесс умер.
+   *
+   * Лишней работы учащение тика не даёт: в устойчивом состоянии пост стоит
+   * на проверке, и охрана выходит первым же запросом.
    */
   @Cron('*/5 * * * *')
   async prepareDrafts(): Promise<void> {
     if (!this.enabled()) return;
 
-    const pending = await this.pg.query(
-      `SELECT count(*)::int AS n FROM blog_post WHERE status IN ('pending_review','approved')`,
+    const busy = await this.pg.query(
+      `SELECT count(*)::int AS n FROM blog_post
+        WHERE status = 'pending_review'
+           OR (status = 'drafting'
+               AND drafting_started_at IS NOT NULL
+               AND drafting_started_at >= now() - ($1 || ' minutes')::interval)`,
+      [STALE_DRAFTING_MINUTES],
     );
-    if (Number(pending.rows[0]?.n || 0) > 0) return;
+    if (Number(busy.rows[0]?.n || 0) > 0) return;
 
     const idea = await this.topics.takeNextIdea();
     if (!idea) return;
@@ -271,7 +304,15 @@ export class BlogCron {
     if (r.rows.length) this.logger.log(`выброшено протухших новостей: ${r.rows.length}`);
   }
 
-  /** За час до слота — напоминание, если решения нет. Молчание не публикует. */
+  /**
+   * За час до слота — напоминание, если решения нет. Молчание не публикует.
+   *
+   * Слот — тот, который пост получит, если одобрить его сейчас, то есть
+   * ближайший СВОБОДНЫЙ. Раньше он совпадал с ближайшим вообще: одобренный
+   * пост держал очередь, и поста на проверке рядом с ним не было. Теперь
+   * напоминание про слот, уже занятый одобренным постом, врало бы — «без
+   * апрува слот пропустим», а он не пропадёт.
+   */
   @Cron('0 * * * *')
   async remindPending(): Promise<void> {
     if (!this.enabled()) return;
@@ -284,8 +325,15 @@ export class BlogCron {
     );
     if (!r.rows.length) return;
 
-    const slot = nextSlotAfter(new Date(), slotDays, slotHourMsk);
-    const minutesLeft = Math.round((slot.getTime() - Date.now()) / 60000);
+    const now = new Date();
+    let slot: Date;
+    try {
+      slot = nextFreeSlotAfter(now, slotDays, slotHourMsk, (await slotHolders(this.pg, now)).map((h) => h.slotAt));
+    } catch (e: any) {
+      if (e instanceof NoFreeSlotError) return;   // напоминать не о чем — свободного слота нет
+      throw e;
+    }
+    const minutesLeft = Math.round((slot.getTime() - now.getTime()) / 60000);
     if (minutesLeft > REMIND_WINDOW_MINUTES || minutesLeft < 0) return;
 
     await this.approval.notify(

@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { BlogApprovalService } from './blog-approval.service';
 import { buildBlogKeyboard } from './blog-callback';
+import { upcomingSlots, FREE_SLOT_SEARCH_LIMIT } from './blog-slots';
 
 jest.mock('axios');
 
@@ -117,7 +118,9 @@ describe('BlogApprovalService.handleCallback', () => {
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:ok:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
 
-    const sql = pg.query.mock.calls[1][0] as string;
+    // Запись ищем по содержанию, а не по номеру вызова: перед ней теперь идёт
+    // чтение занятых слотов.
+    const sql = pg.query.mock.calls.map((c: any[]) => String(c[0])).find((s: string) => /^\s*UPDATE blog_post/.test(s));
     expect(sql).toContain("status = 'approved'");
     expect(sql).toContain('slot_at');
 
@@ -266,6 +269,195 @@ describe('BlogApprovalService.handleCallback', () => {
     const handled = await svc.handleCallback({ id: 'cb1', data: 'agent:xyz', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
     expect(handled).toBe(false);
     expect(pg.query).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * «Опубликовать» ставит пост в ближайший СВОБОДНЫЙ слот.
+ *
+ * Пока одобренный пост держал очередь черновиков, два одобренных
+ * одновременно не возникали, и «ближайший слот вообще» (`nextSlotAfter`)
+ * совпадал со свободным. Без блокировки два поста получили бы один слот и
+ * вышли бы в канал одновременно.
+ *
+ * Код, прочитав «свободно», ничего не гарантирует: владелец жмёт кнопку, пока
+ * в админке одобряют другой пост, а API поднят в cluster_mode. Последний рубеж
+ * — частичный уникальный индекс (004_one_post_per_slot.sql); проигравший гонку
+ * получает 23505 и берёт следующий свободный слот.
+ */
+describe('BlogApprovalService.handleCallback — «Опубликовать» и занятые слоты', () => {
+  afterEach(() => { jest.useRealTimers(); });
+
+  // пн 2026-09-21, 08:00 МСК: ближайший слот — сегодня 10:00 МСК
+  const MON_MORNING = '2026-09-21T05:00:00Z';
+  const MON = '2026-09-21T07:00:00.000Z';
+  const WED = '2026-09-23T07:00:00.000Z';
+
+  const iso = (v: any) => (v ? new Date(v).toISOString() : null);
+
+  /**
+   * Postgres в миниатюре: посты и частичный уникальный индекс на `slot_at`
+   * среди `approved`/`publishing` — как в 004_one_post_per_slot.sql. Индекс в
+   * заглушке играет роль базы, а не кода: код обязан сам выбрать свободный
+   * слот, а индекс — последний рубеж, по которому ретрай узнаёт гонку.
+   *
+   * Условие на статус в записи одобрения заглушка берёт из самого запроса:
+   * без него запись проходит, как прошла бы в Postgres. Незнакомый запрос —
+   * ошибка.
+   *
+   * `hold(pattern, n)` придерживает первые n запросов по образцу, пока не
+   * придут все n: окно гонки открывается явно, а не по воле планировщика.
+   */
+  const slotPg = (posts: any[]) => {
+    const rows: any[] = posts.map((p) => rawRow({ editor_notes: [], note_prompt_ids: [], ...p }));
+    let gate: { pattern: RegExp; n: number; parked: Array<() => void> } | null = null;
+    const passGate = async (s: string) => {
+      const g = gate;
+      if (!g || !g.pattern.test(s)) return;
+      await new Promise<void>((resolve) => {
+        g.parked.push(resolve);
+        if (g.parked.length >= g.n) {
+          gate = null;
+          g.parked.forEach((go) => go());
+        }
+      });
+    };
+
+    const query = jest.fn(async (sql: string, params: any[] = []) => {
+      const s = String(sql).replace(/\s+/g, ' ').trim();
+      await passGate(s);
+
+      if (/^SELECT \* FROM blog_post WHERE id = \$1$/.test(s)) {
+        const r = rows.find((x) => x.id === params[0]);
+        return { rows: r ? [{ ...r }] : [] };
+      }
+
+      if (/^SELECT id, title, slot_at FROM blog_post WHERE status = ANY\(\$1::text\[\]\) AND slot_at > \$2\b/.test(s)) {
+        const after = new Date(params[1]).getTime();
+        return {
+          rows: rows
+            .filter((r) => params[0].includes(r.status) && r.slot_at && new Date(r.slot_at).getTime() > after)
+            .map((r) => ({ id: r.id, title: r.title, slot_at: new Date(r.slot_at) })),
+        };
+      }
+
+      if (/^UPDATE blog_post SET status = 'approved', slot_at = \$2\b/.test(s)) {
+        const r = rows.find((x) => x.id === params[0]);
+        const statusGuard = /\bAND status = \$3\b/.test(s);
+        if (!r || (statusGuard && r.status !== params[2])) return { rows: [], rowCount: 0 };
+        const clash = rows.find((x) => x !== r && ['approved', 'publishing'].includes(x.status)
+          && iso(x.slot_at) === iso(params[1]));
+        if (clash) {
+          throw Object.assign(new Error('duplicate key value violates unique constraint "uq_blog_post_slot"'), {
+            code: '23505', constraint: 'uq_blog_post_slot',
+          });
+        }
+        r.status = 'approved';
+        r.slot_at = new Date(params[1]);
+        return { rows: [], rowCount: 1 };
+      }
+
+      throw new Error(`заглушка не знает запроса: ${s}`);
+    });
+
+    return {
+      rows,
+      query,
+      row: (id: string) => rows.find((x) => x.id === id),
+      hold: (pattern: RegExp, n: number) => { gate = { pattern, n, parked: [] }; },
+    };
+  };
+
+  const setup = (posts: any[], now = MON_MORNING) => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] });
+    jest.setSystemTime(new Date(now));
+    const pg = slotPg(posts);
+    const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
+    const settings = { get: jest.fn().mockResolvedValue({ channelChatId: '-100', slotDays: [1, 3, 5], slotHourMsk: 10, imageStyle: '' }) };
+    const svc = new BlogApprovalService(pg as any, tg as any, settings as any);
+    const ok = (id: string) => svc.handleCallback({
+      id: `cb-${id}`, data: `blog:ok:${id}`, from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 },
+    });
+    const popups = () => tg.answerCallbackQuery.mock.calls.map((c: any[]) => String(c[1]?.text ?? ''));
+    return { pg, tg, ok, popups };
+  };
+
+  it('два одобрения подряд — два разных слота, и каждый назван владельцу', async () => {
+    const { pg, ok, popups } = setup([{ id: 'p1' }, { id: 'p2' }]);
+
+    await ok('p1');
+    await ok('p2');
+
+    expect(pg.row('p1')).toMatchObject({ status: 'approved' });
+    expect(pg.row('p2')).toMatchObject({ status: 'approved' });
+    expect(iso(pg.row('p1').slot_at)).toBe(MON);
+    expect(iso(pg.row('p2').slot_at)).toBe(WED);
+    expect(popups()).toEqual([
+      'Одобрено. Опубликую сегодня в 10:00 МСК.',
+      'Одобрено. Опубликую в среду, 23 сентября, в 10:00 МСК.',
+    ]);
+  });
+
+  it('ближайший слот занят — «Опубликую …» называет свободный, а не занятый', async () => {
+    const { pg, tg, ok, popups } = setup([
+      { id: 'case', status: 'approved', title: 'Кейс', slot_at: new Date(MON) },
+      { id: 'news' },
+    ]);
+
+    await ok('news');
+
+    expect(iso(pg.row('news').slot_at)).toBe(WED);
+    expect(popups()[0]).toBe('Одобрено. Опубликую в среду, 23 сентября, в 10:00 МСК.');
+    expect(tg.sendMessage).toHaveBeenCalledWith(77, popups()[0]);
+    expect(iso(pg.row('case').slot_at)).toBe(MON);     // чужой слот не тронут
+  });
+
+  /**
+   * Оба одобрения прочли «понедельник свободен» раньше, чем любое записало.
+   * Индекс пускает одного; второй получает 23505 и обязан взять следующий
+   * свободный слот, а не упасть.
+   */
+  it('гонка двух одобрений — проигравший берёт следующий свободный слот, а не падает', async () => {
+    const { pg, ok } = setup([{ id: 'p1' }, { id: 'p2' }]);
+    pg.hold(/^SELECT id, title, slot_at FROM blog_post/, 2);
+
+    await Promise.all([ok('p1'), ok('p2')]);
+
+    expect(pg.row('p1').status).toBe('approved');
+    expect(pg.row('p2').status).toBe('approved');
+    expect([iso(pg.row('p1').slot_at), iso(pg.row('p2').slot_at)].sort()).toEqual([MON, WED]);
+  });
+
+  /**
+   * Двойное касание: оба обработчика прочли пост на проверке. Первый ставит
+   * его в понедельник; второй видит понедельник занятым (самим этим постом) и
+   * без условия на статус переставил бы пост в среду — владельцу пришли бы
+   * две разные даты.
+   */
+  it('двойное касание «Опубликовать» — одно одобрение, слот не переезжает', async () => {
+    const { pg, tg, ok, popups } = setup([{ id: 'p1' }]);
+    pg.hold(/^SELECT \* FROM blog_post WHERE id/, 2);
+
+    await Promise.all([ok('p1'), ok('p1')]);
+
+    expect(iso(pg.row('p1').slot_at)).toBe(MON);
+    expect(popups().filter((t) => t.startsWith('Одобрено'))).toHaveLength(1);
+    expect(popups().filter((t) => /уже обработан/.test(t))).toHaveLength(1);
+    expect(tg.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('свободного слота нет — пост остаётся на проверке, владелец узнаёт почему', async () => {
+    const taken = upcomingSlots(new Date(MON_MORNING), [1, 3, 5], 10, FREE_SLOT_SEARCH_LIMIT)
+      .map((slot: Date, i: number) => ({ id: `a${i}`, status: 'approved', slot_at: slot }));
+    const { pg, ok, popups } = setup([...taken, { id: 'p1' }]);
+
+    expect(await ok('p1')).toBe(true);
+
+    expect(pg.row('p1').status).toBe('pending_review');
+    expect(popups()[0]).toMatch(/слот/);
+    expect(popups()[0]).not.toMatch(/Одобрено/);
+    expect(popups()[0].length).toBeLessThanOrEqual(200);
+    expect(pg.query.mock.calls.some((c: any[]) => /^\s*UPDATE/.test(String(c[0])))).toBe(false);
   });
 });
 

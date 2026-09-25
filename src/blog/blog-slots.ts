@@ -24,6 +24,71 @@ export function nextSlotAfter(from: Date, days: number[], hourMsk: number): Date
   throw new Error('blog: не нашёл слот за две недели вперёд');
 }
 
+/**
+ * Сколько слотов расписания вперёд просматривает поиск свободного.
+ *
+ * Шестьдесят — это двадцать недель при трёх слотах в неделю и больше года при
+ * одном. Одобренных постов наперёд у живого канала — единицы, так что до
+ * предела поиск доходит, только если что-то сломалось; тогда лучше внятно
+ * отказать, чем перебирать расписание до бесконечности.
+ */
+export const FREE_SLOT_SEARCH_LIMIT = 60;
+
+/** Свободного слота нет: ближайшие заняты или его раз за разом уводили в гонке. */
+export class NoFreeSlotError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NoFreeSlotError';
+  }
+}
+
+/** Ближайшие `count` слотов расписания подряд, первый — строго после `from`. */
+export function upcomingSlots(from: Date, days: number[], hourMsk: number, count: number): Date[] {
+  const slots: Date[] = [];
+  let cursor = from;
+  for (let i = 0; i < count; i++) {
+    cursor = nextSlotAfter(cursor, days, hourMsk);
+    slots.push(cursor);
+  }
+  return slots;
+}
+
+/**
+ * Ближайший СВОБОДНЫЙ слот строго после `from`.
+ *
+ * Пока одобренный пост держал очередь черновиков, «ближайший слот вообще»
+ * совпадал со свободным: второго одобренного рядом быть не могло. Без этой
+ * блокировки два поста получили бы один слот и вышли бы одновременно.
+ *
+ * Занятость сверяется по моменту времени, а не по написанию: `slot_at`
+ * приходит из базы объектом Date, а от фронта — строкой в любом поясе. Пост,
+ * поставленный не в слот расписания (10:05 вместо 10:00), слот расписания не
+ * занимает — «занят» значит «тот же `slot_at`».
+ *
+ * @param taken моменты, которые уже держат другие посты
+ * @throws NoFreeSlotError, если свободного нет в пределах `limit` слотов
+ */
+export function nextFreeSlotAfter(
+  from: Date,
+  days: number[],
+  hourMsk: number,
+  taken: Iterable<Date | string | number>,
+  limit = FREE_SLOT_SEARCH_LIMIT,
+): Date {
+  const busy = new Set<number>();
+  for (const t of taken) {
+    if (t === null || t === undefined) continue;
+    busy.add(new Date(t).getTime());
+  }
+
+  let cursor = from;
+  for (let i = 0; i < limit; i++) {
+    cursor = nextSlotAfter(cursor, days, hourMsk);
+    if (!busy.has(cursor.getTime())) return cursor;
+  }
+  throw new NoFreeSlotError(`все ${limit} ближайших слотов расписания заняты`);
+}
+
 export function isStaleNews(createdAt: Date, now: Date): boolean {
   return now.getTime() - createdAt.getTime() > STALE_NEWS_DAYS * 86400_000;
 }
