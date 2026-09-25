@@ -89,7 +89,8 @@ export interface ClaimedJob {
   runnerToken?: string;
   secrets: Record<string, string>;
   /**
-   * Свои имена продукта (product_domains в issuing или active). Приезжают в
+   * Свои имена продукта (product_domains в active, а в issuing — только при
+   * живом задании domain, см. claimJob). Приезжают в
    * КАЖДОМ задании: любая перегенерация конфига строит его из того, что
    * прислал сервер, и потерять домен не может. У отвязки (removing) и у
    * задания-уборки (строки домена нет) — пусто: агент понимает намерение
@@ -810,8 +811,23 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
               -- для задания domain. Само выдаваемое задание domain режим не
               -- сбивает: wokenSql пропускает этот вид, и «проснулся» решает
               -- последнее задание другого вида.
+              --
+              -- issuing — только пока жива заявка: есть задание domain в
+              -- queued/running (выдаваемое сейчас тоже; снимок CTE видит его
+              -- ещё в queued). Без живого задания issuing — будущая сирота:
+              -- гашение сняло стоявшее в очереди задание domain, а сон выдан
+              -- раньше, чем сверка сирот переведёт строку в failed. Отдай сон
+              -- её имена — они остались бы в конфиге погашенного продукта, и
+              -- после переезда домена к соседу на той же машине nginx отдавал
+              -- бы первый блок с этим server_name.
               , COALESCE((SELECT d.names FROM product_domains d
-                           WHERE d.product_id = p.id AND d.status IN ('issuing','active')), '{}') AS custom_names
+                           WHERE d.product_id = p.id
+                             AND (d.status = 'active'
+                                  OR (d.status = 'issuing'
+                                      AND (c.kind = 'domain'
+                                           OR EXISTS (SELECT 1 FROM product_provision_jobs dj
+                                                       WHERE dj.product_id = p.id AND dj.kind = 'domain'
+                                                         AND dj.status IN ('queued','running')))))), '{}') AS custom_names
               , CASE WHEN p.status = 'blocked' THEN 'asleep'
                      WHEN p.status = 'sleeping' AND NOT ${wokenSql('p.id')} THEN 'asleep'
                      ELSE 'proxy' END AS vhost_mode

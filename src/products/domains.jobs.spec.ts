@@ -143,6 +143,35 @@ maybe('задание domain: выдача агенту и приём отчёт
     expect(await prov.claimJob('own')).toMatchObject({ customNames: [] });
   });
 
+  // Заявка в issuing без живого задания domain — будущая сирота: гашение сняло
+  // стоявшее в очереди задание, сон выдан раньше, чем сверка сирот (раз в
+  // минуту) перевела строку в failed. Отдай сон её имена — они остались бы в
+  // конфиге погашенного продукта, и после переезда домена к соседу на той же
+  // машине nginx отдавал бы первый блок с этим server_name.
+  describe('заявка в issuing — только при живом задании domain', () => {
+    it('сон погашенного без задания domain имён заявки не несёт', async () => {
+      const id = await mkProduct('shop', 'blocked');
+      await domain(id, 'issuing');
+      await job(id, 'domain', 'failed', '1 minute');
+      await job(id, 'sleep');
+      expect(await prov.claimJob('own')).toMatchObject({ jobKind: 'sleep', customNames: [] });
+    });
+
+    it('само выдаваемое задание domain несёт имена заявки', async () => {
+      const id = await mkProduct('shop', 'blocked');
+      await domain(id, 'issuing');
+      await job(id, 'domain');
+      expect(await prov.claimJob('own')).toMatchObject({ jobKind: 'domain', customNames: ['a.ru', 'www.a.ru'] });
+    });
+
+    it('работающий домен сон несёт всегда', async () => {
+      const id = await mkProduct('shop', 'blocked');
+      await domain(id, 'active');
+      await job(id, 'sleep');
+      expect(await prov.claimJob('own')).toMatchObject({ jobKind: 'sleep', customNames: ['a.ru', 'www.a.ru'] });
+    });
+  });
+
   it('успех привязки: issuing → active без ошибки, продукт не тронут', async () => {
     const id = await mkProduct('shop');
     await domain(id, 'issuing');
