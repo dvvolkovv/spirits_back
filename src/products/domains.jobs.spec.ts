@@ -247,6 +247,54 @@ maybe('задание domain: выдача агенту и приём отчёт
     });
   });
 
+  // Уборка стоит в очереди, а человек тем временем привязал НОВЫЙ домен:
+  // строка в awaiting_dns появилась у продукта уже после удаления старой.
+  // Отчёт уборки обязан закрыть только задание — ни успех, ни отказ не
+  // вправе ни активировать новую заявку (её TXT никто не проверял), ни
+  // пометить её отказом, ни удалить.
+  describe('уборка после отвязки при занятом домене и новая заявка', () => {
+    const arrange = async () => {
+      const mine = await mkProduct('shop');
+      const other = await mkProduct('rival');
+      await pool.query(
+        `INSERT INTO product_domains (product_id, domain, names, token, status, error, error_reason)
+         VALUES ($1, 'a.ru', '{a.ru}', 'lk-old', 'failed', 'занят', 'taken'),
+                ($2, 'a.ru', '{a.ru}', 'lk-rival', 'active', NULL, NULL)`,
+        [mine, other],
+      );
+      // Настоящая отвязка: перевод в removing упирается в индекс занятых,
+      // строка удаляется и ставится задание-уборка (dropOccupiedFailed).
+      await expect(domains.detach(OWNER, mine)).resolves.toEqual({ removed: 'now' });
+      await pool.query(
+        `INSERT INTO product_domains (product_id, domain, names, token) VALUES ($1, 'b.ru', '{b.ru,www.b.ru}', 'lk-new')`,
+        [mine],
+      );
+      const claimed = await prov.claimJob('own');
+      expect(claimed).toMatchObject({ jobKind: 'domain', customNames: [] });
+      return { mine, jobId: claimed!.jobId };
+    };
+    const fresh = async (productId: string) =>
+      (await pool.query(
+        `SELECT domain, token, status, error, error_reason, activated_at FROM product_domains WHERE product_id = $1`,
+        [productId],
+      )).rows;
+    const untouched = [{ domain: 'b.ru', token: 'lk-new', status: 'awaiting_dns', error: null, error_reason: null, activated_at: null }];
+
+    it('успех уборки новую заявку не трогает', async () => {
+      const { mine, jobId } = await arrange();
+      await report(jobId, { ok: true });
+      expect(await jobRow(jobId)).toEqual({ status: 'done', error: null });
+      expect(await fresh(mine)).toEqual(untouched);
+    });
+
+    it('отказ уборки новую заявку не трогает', async () => {
+      const { mine, jobId } = await arrange();
+      await report(jobId, { ok: false, error: 'nginx -t failed' });
+      expect(await jobRow(jobId)).toEqual({ status: 'failed', error: 'nginx -t failed' });
+      expect(await fresh(mine)).toEqual(untouched);
+    });
+  });
+
   // Сверка сирот (DomainsService.reconcileOrphans) считает сиротой строку в
   // issuing или removing, у продукта которой нет активного задания domain.
   // Закрытие задания и перевод строки — один оператор, поэтому после отчёта
