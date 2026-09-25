@@ -22,6 +22,10 @@
  * сервера нет (customNames — только issuing/active), и ближайший сон всё
  * равно переписал бы конфиг без них.
  *
+ * Отказ ВТОРОГО конфига (сертификат уже выпущен) откатывается так же: скрипт
+ * вернул бы первую версию со своими именами на порту 80. Отказ ПЕРВОГО не
+ * откатывается — прежний конфиг на место кладёт сам product-vhost.
+ *
  * ## Отвязка: сначала конфиг, потом сертификат
  *
  * Обратный порядок оставил бы конфиг, ссылающийся на удалённые файлы
@@ -77,19 +81,50 @@ const CERTBOT_KEY_LINE = /^\s*(Domain|Type|Detail|Hint):/;
  * certbot пишет отчёт об отказе в stderr. stdout подклеивается, если он
  * есть и в сообщение не попал, — на случай версии certbot, пишущей иначе.
  */
-export function condenseCertbot(e: any): string {
+export function condenseCertbot(e: any, max = CERTBOT_DETAIL_MAX): string {
   const message = e?.message ? String(e.message) : String(e);
   const stdout = typeof e?.stdout === 'string' ? e.stdout.trim() : '';
   const source = stdout && !message.includes(stdout) ? `${message}\n${stdout}` : message;
 
   const keys = source.split('\n').filter((line) => CERTBOT_KEY_LINE.test(line)).map((line) => line.trim());
-  const text = (keys.length ? keys.join('\n') : source).trim();
-  // Хвост, а не голова: у certbot важное в конце (см. шапку).
-  return text.length > CERTBOT_DETAIL_MAX ? `…${text.slice(-CERTBOT_DETAIL_MAX)}` : text;
+  if (keys.length) {
+    // Не влезает — выбрасываются ЦЕЛЫЕ строки, от наименее ценной: Hint
+    // (общий совет), Domain (имя есть и в Detail), Type. Detail — что ответил
+    // сервер пользователя — уходит последним: подрезанный хвостом, он терял бы
+    // ровно начало, где сказано, по какому адресу и что пришло.
+    for (const drop of [[], ['Hint'], ['Hint', 'Domain'], ['Hint', 'Domain', 'Type']]) {
+      const kept = keys.filter((line) => !drop.some((k) => line.startsWith(`${k}:`)));
+      const text = kept.join('\n');
+      if (kept.length && text.length <= max) return text;
+    }
+    const detail = keys.filter((line) => line.startsWith('Detail:')).join('\n') || keys.join('\n');
+    return `${detail.slice(0, max)}…`;
+  }
+  const text = source.trim();
+  // Без ключевых строк — хвост, а не голова: у certbot важное в конце (см. шапку).
+  return text.length > max ? `…${text.slice(-max)}` : text;
 }
 
-/** Хвост чужого сообщения для остатка — короткий, чтобы голова причины не уехала за 1000. */
-const tail = (e: any, max = 300): string => {
+/**
+ * Замок certbot: плановое продление (certbot.timer) держит его, и второй
+ * запуск отвечает «Another instance of Certbot is already running». Это не
+ * отказ Let's Encrypt и не ошибка пользователя — причина своя и узнаваемая,
+ * без простыни certbot, чтобы человек понял: нажать ещё раз через минуту.
+ */
+const CERTBOT_BUSY = /Another instance of Certbot is already running/i;
+export const CERTBOT_BUSY_REASON = 'certbot занят плановым продлением — повторите через минуту';
+
+/** Полный текст отказа программы: message и, если есть, stdout. */
+const fullText = (e: any): string =>
+  `${e?.message ?? e ?? ''}\n${typeof e?.stdout === 'string' ? e.stdout : ''}`;
+
+/** Длина префикса «НА ХОСТЕ ОСТАЛОСЬ: » и перевода строки в describeFailure (index.ts). */
+const LEFTOVERS_FRAME = 'НА ХОСТЕ ОСТАЛОСЬ: \n'.length;
+/** Голова причины, которую хранит сервер (DOMAIN_ERROR_MAX), с запасом на многоточие. */
+const SERVER_HEAD = 980;
+
+/** Хвост чужого сообщения — короткий, чтобы голова причины не уехала за 1000. */
+const tail = (e: any, max: number): string => {
   const text = (e?.message ? String(e.message) : String(e)).trim();
   return text.length > max ? `…${text.slice(-max)}` : text;
 };
@@ -105,7 +140,10 @@ export async function applyDomain(job: DomainJob, deps: ProvisionDeps): Promise<
   if (job.kind !== 'site') {
     throw new Error(`свой домен бывает только у сайта, а форма продукта ${JSON.stringify(job.kind)}`);
   }
-  const names = Array.isArray(job.customNames) ? job.customNames : [];
+  // Повторы — вон, порядок — как прислал сервер: повтор в `server_name`
+  // nginx прощает предупреждением, а в `-d` certbot — нет, и лишняя пара в
+  // argv только съедает голову причины.
+  const names = [...new Set(Array.isArray(job.customNames) ? job.customNames : [])];
 
   let target: number | '--asleep';
   if (job.vhostMode === 'asleep') {
@@ -132,15 +170,26 @@ export async function applyDomain(job: DomainJob, deps: ProvisionDeps): Promise<
     try {
       await deps.run(['certbot', 'delete', '--cert-name', cert, '--non-interactive']);
     } catch (e: any) {
-      const text = `${e?.message ?? ''}\n${typeof e?.stdout === 'string' ? e.stdout : ''}`;
+      const text = fullText(e);
       if (/No certificate found/i.test(text)) return;
+      if (CERTBOT_BUSY.test(text)) throw new Error(CERTBOT_BUSY_REASON);
       throw new Error(`certbot не удалил сертификат ${cert}: ${condenseCertbot(e)}`);
     }
     return;
   }
 
   // Привязка.
-  await deps.run(withNames);
+  //
+  // Первый конфиг. Отказ здесь НЕ откатывается: product-vhost сам кладёт
+  // прежний конфиг обратно байт в байт, когда `nginx -t` красный (exit 1), и
+  // отказывает до записи на плохих аргументах (exit 2). Приставка своя — сырое
+  // «Command failed: product-vhost …» в карточке не говорит, что случилось.
+  try {
+    await deps.run(withNames);
+  } catch (e: any) {
+    throw new Error(`конфиг своего домена не встал: ${tail(e, 600)}`);
+  }
+
   try {
     await deps.run([
       'certbot', 'certonly', '--webroot', '-w', ACME_WEBROOT, '--cert-name', cert,
@@ -148,18 +197,64 @@ export async function applyDomain(job: DomainJob, deps: ProvisionDeps): Promise<
       ...names.flatMap((name) => ['-d', name]),
     ]);
   } catch (e: any) {
-    const failure = new Error(`certbot не выпустил сертификат: ${condenseCertbot(e)}`);
-    try {
-      await deps.run(withoutNames);
-    } catch (rollback: any) {
-      // Остаток уезжает ВПЕРЕДИ причины (describeFailure в index.ts): имена
-      // открыты по HTTP без сертификата, и чинить это едет человек.
-      (failure as any).leftovers = [
-        `свои имена ${names.join(', ')} в конфиге nginx продукта ${job.slug} без сертификата — `
-          + `откат конфига не удался: ${tail(rollback)}`,
-      ];
-    }
-    throw failure;
+    const left = await rollback(deps, withoutNames, names, job.slug);
+    if (CERTBOT_BUSY.test(fullText(e))) throw withLeftovers(new Error(CERTBOT_BUSY_REASON), left);
+    // Бюджет выжимки — то, что осталось от головы сервера после остатка:
+    // остаток стоит ВПЕРЕДИ причины и иначе вытолкнул бы Detail за 1000.
+    const prefix = 'certbot не выпустил сертификат: ';
+    const budget = left
+      ? Math.max(200, SERVER_HEAD - LEFTOVERS_FRAME - left.length - prefix.length)
+      : CERTBOT_DETAIL_MAX;
+    throw withLeftovers(new Error(`${prefix}${condenseCertbot(e, budget)}`), left);
   }
-  await deps.run(withNames);
+
+  // Второй конфиг — тот же вызов, но сертификат уже на диске, и скрипт
+  // дописывает 443. Красный `nginx -t` здесь скрипт откатывает к ПЕРВОЙ
+  // версии — порт 80 со своими именами, — а сервер пометит заявку отказавшей:
+  // имена жили бы на машине молча. Поэтому откат к набору без имён — как при
+  // отказе certbot.
+  //
+  // Выпущенный сертификат НЕ удаляется: он безвреден (на него не ссылается ни
+  // один конфиг), а следующий выпуск по тому же `--cert-name` с
+  // `--keep-until-expiring` возьмёт его без похода в Let's Encrypt — то есть
+  // не потратит лимит выпусков на домен. Удаление было бы ещё одним шагом,
+  // способным отказать посреди отказа.
+  try {
+    await deps.run(withNames);
+  } catch (e: any) {
+    const left = await rollback(deps, withoutNames, names, job.slug);
+    throw withLeftovers(new Error(`конфиг с сертификатом не встал: ${tail(e, 500)}`), left);
+  }
+}
+
+/**
+ * Откат конфига к набору без своих имён. Возвращает текст остатка, если откат
+ * не удался, иначе undefined.
+ *
+ * Остаток КОРОТКИЙ и не перечисляет имена: он уезжает ВПЕРЕДИ причины
+ * (describeFailure в index.ts), и два имени по 100 знаков плюс длинный хвост
+ * ошибки вытолкнули бы строку Detail certbot за голову в 1000 знаков, которую
+ * хранит сервер. Число имён и первое — достаточно, чтобы найти конфиг.
+ */
+async function rollback(
+  deps: ProvisionDeps,
+  withoutNames: string[],
+  names: string[],
+  slug: string,
+): Promise<string | undefined> {
+  try {
+    await deps.run(withoutNames);
+    return undefined;
+  } catch (e: any) {
+    const which = names.length > 1 ? `${names[0]} и ещё ${names.length - 1}` : names[0];
+    return (
+      `свои имена (${which}) остались в конфиге nginx продукта ${slug} — `
+      + `откат конфига не удался: ${tail(e, 150)}`
+    );
+  }
+}
+
+function withLeftovers(error: Error, left: string | undefined): Error {
+  if (left) (error as any).leftovers = [left];
+  return error;
 }

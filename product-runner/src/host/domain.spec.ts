@@ -86,6 +86,75 @@ describe('привязка своего домена', () => {
   });
 });
 
+describe('отказ product-vhost по ходу привязки', () => {
+  it('первый конфиг не встал — certbot не зовётся, отката нет, причина со своей приставкой', async () => {
+    // product-vhost сам возвращает прежний конфиг байт в байт, когда `nginx -t`
+    // красный (exit 1), — откатывать агенту нечего, а второй вызов поверх
+    // только повторил бы тот же отказ.
+    host.before = (argv) => {
+      if (argv[0] === 'product-vhost') throw new Error('Command failed: product-vhost shop 8001 --domain a.ru\nnginx: [emerg] test failed');
+    };
+
+    await expect(applyDomain(job(), deps(host))).rejects.toThrow(/^конфиг своего домена не встал: .*emerg/s);
+
+    expect(host.ran('certbot')).toHaveLength(0);
+    expect(vhostCalls()).toHaveLength(1);
+  });
+
+  it('конфиг с сертификатом не встал — откат без своих имён, причина со своей приставкой', async () => {
+    // Скрипт вернул бы первую версию — порт 80 со своими именами, — а сервер
+    // пометит заявку отказавшей: имена остались бы жить на машине молча.
+    let vhosts = 0;
+    host.before = (argv) => {
+      if (argv[0] === 'product-vhost' && ++vhosts === 2) throw new Error('Command failed: product-vhost\nssl emerg');
+    };
+
+    await expect(applyDomain(job(), deps(host))).rejects.toThrow(/^конфиг с сертификатом не встал: .*ssl emerg/s);
+
+    expect(kinds()).toEqual([
+      'product-vhost 8001 --domain a.ru',
+      'certbot certonly',
+      'product-vhost 8001 --domain a.ru',
+      'product-vhost 8001',
+    ]);
+    expect(host.vhostDomains.get('shop')).toEqual([]);
+    // Выпущенный сертификат оставлен: безвреден, а следующий выпуск его же
+    // возьмёт (--cert-name, --keep-until-expiring) без лишнего похода в LE.
+    expect(host.certs.has('linkeon-shop')).toBe(true);
+  });
+
+  it('и откат не встал — остаток впереди причины', async () => {
+    let vhosts = 0;
+    host.before = (argv) => {
+      if (argv[0] === 'product-vhost' && ++vhosts >= 2) throw new Error(`отказ ${vhosts}`);
+    };
+
+    const err: any = await applyDomain(job(), deps(host)).catch((e) => e);
+
+    expect(err.message).toMatch(/^конфиг с сертификатом не встал: отказ 2/);
+    expect(err.leftovers.join(' ')).toMatch(/a\.ru.*откат конфига не удался: отказ 3/s);
+  });
+});
+
+describe('мелочи привязки', () => {
+  it('certbot занят плановым продлением — узнаваемая причина, откат выполнен', async () => {
+    host.certbotFails = 'Command failed: certbot certonly\nAnother instance of Certbot is already running.';
+
+    await expect(applyDomain(job(), deps(host))).rejects.toThrow(
+      /^certbot занят плановым продлением — повторите через минуту/,
+    );
+    expect(host.vhostDomains.get('shop')).toEqual([]);
+  });
+
+  it('повторённые имена уезжают один раз, порядок сохранён', async () => {
+    await applyDomain(job({ customNames: ['www.a.ru', 'a.ru', 'www.a.ru', 'a.ru'] }), deps(host));
+
+    expect(vhostCalls()[0]).toEqual(['product-vhost', 'shop', '8001', '--domain', 'www.a.ru', '--domain', 'a.ru']);
+    const certbot = host.calls.find((c) => c[0] === 'certbot')!;
+    expect(certbot.slice(-4)).toEqual(['-d', 'www.a.ru', '-d', 'a.ru']);
+  });
+});
+
 describe('отвязка своего домена', () => {
   it('сначала конфиг без имён, потом удаление сертификата', async () => {
     // Обратный порядок оставил бы конфиг, ссылающийся на удалённые файлы
@@ -235,6 +304,32 @@ describe('причина отказа задания domain', () => {
     expect(error).toMatch(/^certbot не выпустил сертификат: /);
     expect(error.length).toBeLessThan(1000);
     expect(error.endsWith('ПОСЛЕДНЯЯ СТРОКА')).toBe(true);
+  });
+
+  it('неудавшийся откат с длинными именами не выталкивает Detail за голову в 1000 знаков', async () => {
+    const long1 = `${'a'.repeat(48)}.${'b'.repeat(48)}.ru`;
+    const long2 = `${'c'.repeat(48)}.${'d'.repeat(48)}.ru`;
+    const detail = `Detail: 1.2.3.4: Invalid response from http://${long1}/.well-known/acme-challenge/${'x'.repeat(43)}: 404: \"<html><head><title>404 Not Found</title></head><body>${'<p>страница не найдена</p>'.repeat(10)}\"`;
+    host.certbotFails = [
+      ...Array.from({ length: 40 }, (_, i) => `шум ${i} `.repeat(10)),
+      `  Domain: ${long1}`,
+      '  Type:   unauthorized',
+      detail,
+      `Hint: ${'подсказка '.repeat(20)}`,
+    ].join('\n');
+    let vhosts = 0;
+    host.before = (argv) => {
+      if (argv[0] === 'product-vhost' && ++vhosts === 2) throw new Error(`nginx -t: ${'ошибка '.repeat(200)}`);
+    };
+
+    const report = await runJob({ ...DOMAIN_JOB, customNames: [long1, long2] }, hostDepsWithRealDomain());
+
+    const head = (report as { error: string }).error.slice(0, 1000);
+    expect(head).toMatch(/^НА ХОСТЕ ОСТАЛОСЬ: /);
+    // Строка Detail — ЦЕЛИКОМ: обрезанная на полуслове, она теряет ровно ту
+    // часть (что ответил сервер пользователя), ради которой её несли.
+    expect(head).toContain(detail);
+    expect(head).toContain('certbot не выпустил сертификат: ');
   });
 
   it('при неудавшемся откате причина начинается с остатка, а не с текста certbot', async () => {
