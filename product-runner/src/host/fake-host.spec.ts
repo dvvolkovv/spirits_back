@@ -188,4 +188,26 @@ describe('vhost', () => {
   it('домена нет вовсе — это не заглушка и не боевой режим', async () => {
     expect(host.vhostMode('nikogo')).toBeUndefined();
   });
+
+  it('свои имена запоминаются по каждому вызову — и в прокси, и в заглушке', async () => {
+    // Каждый вызов ПЕРЕПИСЫВАЕТ конфиг целиком: имена, не приехавшие в этом
+    // вызове, из конфига уходят. Ровно на этом стоят проверки «сон не потерял
+    // домен», поэтому симулятор обязан помнить последний набор, а не копить.
+    await host.run(['product-vhost', 'shop', '8001', '--domain', 'a.ru', '--domain', 'www.a.ru']);
+    expect(host.vhostDomains.get('shop')).toEqual(['a.ru', 'www.a.ru']);
+
+    await host.run(['product-vhost', 'shop', '--asleep', '--domain', 'a.ru']);
+    expect([host.vhostMode('shop'), host.vhostDomains.get('shop')]).toEqual(['asleep', ['a.ru']]);
+
+    await host.run(['product-vhost', 'shop', '8001']);
+    expect(host.vhostDomains.get('shop')).toEqual([]);
+  });
+
+  it('непонятный хвост после цели — отказ, а не молча проглоченный аргумент', async () => {
+    // Хвост, который симулятор пропустил бы, живой скрипт тоже должен был бы
+    // понять — иначе батарея зеленит форму вызова, на которой скрипт падает.
+    await expect(host.run(['product-vhost', 'shop', '8001', 'a.ru'])).rejects.toThrow(/хвост/);
+    await expect(host.run(['product-vhost', 'shop', '8001', '--domain'])).rejects.toThrow(/хвост/);
+    await expect(host.run(['product-vhost', 'shop', '--asleep', '--name', 'a.ru'])).rejects.toThrow(/хвост/);
+  });
 });

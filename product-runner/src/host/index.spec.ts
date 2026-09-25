@@ -868,8 +868,23 @@ describe('разбор вида задания', () => {
     await tick(deps);
 
     const got = wakeProduct.mock.calls[0][0];
-    expect(got).toEqual({ slug: 'shop', kind: 'site', port: 8123 });
-    expect(Object.keys(got).sort()).toEqual(['kind', 'port', 'slug']);
+    // Свои имена — тоже в выжимке: без них пробуждение переписало бы конфиг
+    // без домена клиента. Задание без поля (сервер старше агента) даёт пустой
+    // список, а не undefined — хостовой шаг не гадает.
+    expect(got).toEqual({ slug: 'shop', kind: 'site', port: 8123, customNames: [] });
+    expect(Object.keys(got).sort()).toEqual(['customNames', 'kind', 'port', 'slug']);
+  });
+
+  it('свои имена задания доезжают до сна и до пробуждения', async () => {
+    const { deps, poll, sleepProduct, wakeProduct } = makeDeps();
+    poll.mockResolvedValueOnce({ ok: true, job: { ...SLEEP_JOB, customNames: ['a.ru'] } });
+    poll.mockResolvedValueOnce({ ok: true, job: { ...WAKE_JOB, customNames: ['a.ru', 'www.a.ru'] } });
+
+    await tick(deps);
+    await tick(deps);
+
+    expect(sleepProduct.mock.calls[0][0].customNames).toEqual(['a.ru']);
+    expect(wakeProduct.mock.calls[0][0].customNames).toEqual(['a.ru', 'www.a.ru']);
   });
 
   it('задание без вида — это заведение, а не отказ', async () => {

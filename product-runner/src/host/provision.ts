@@ -113,6 +113,7 @@ import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { promisify } from 'util';
 import { ProductKind, skeletonFor } from './skeleton';
+import { assertDomainName, vhostArgv } from './vhost';
 
 const execFileAsync = promisify(execFile);
 
@@ -218,6 +219,12 @@ export interface ProvisionJob {
   name: string;
   runnerToken: string;
   secrets: Record<string, string>;
+  /**
+   * Свои имена продукта. Сервер кладёт их в КАЖДОЕ задание: повтор заведения
+   * поверх продукта с живым своим доменом без них переписал бы конфиг и снял
+   * бы домен клиента. Необязательное — сервер старше агента поля не шлёт.
+   */
+  customNames?: string[];
 }
 
 /** Запуск программы БЕЗ шелла. Возвращает stdout. */
@@ -414,6 +421,10 @@ export async function provision(job: ProvisionJob, deps: ProvisionDeps): Promise
     throw new Error('в задании нет токена раннера — продукт не получит ни одной задачи');
   }
   const secrets = validateSecrets(job.secrets);
+  // Имена проверяются здесь же, до первого изменения: иначе мусорное имя
+  // всплыло бы только на product-vhost — после `docker run`, ценой подчистки
+  // исправного контейнера.
+  for (const name of job.customNames ?? []) assertDomainName(name);
 
   const files = skeletonFor(job.kind, job.name, job.slug);
   if (!(START_SCRIPT in files) || !START_SCRIPT_RE.test(START_SCRIPT)) {
@@ -473,7 +484,7 @@ export async function provision(job: ProvisionJob, deps: ProvisionDeps): Promise
         );
       }
       done.push('vhost');
-      await deps.run([deps.vhostBin ?? DEFAULTS.vhostBin, job.slug, String(port)]);
+      await deps.run(vhostArgv(deps.vhostBin ?? DEFAULTS.vhostBin, job.slug, port, job.customNames ?? []));
       phase(`vhost ${job.slug} на порт ${port} заведён`);
     }
 

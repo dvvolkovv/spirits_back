@@ -125,6 +125,61 @@ describe('сон продукта', () => {
   });
 });
 
+describe('свои имена продукта во сне и пробуждении', () => {
+  // Каждый вызов product-vhost ПЕРЕПИСЫВАЕТ конфиг целиком. Сон, забывший
+  // имена, снял бы свой домен клиента ровно в тот момент, когда продукт уснул:
+  // заглушка ляжет только на p.linkeon.io, а свой домен начнёт отдавать чужой
+  // сервер по умолчанию. Пробуждение без имён не вернёт домен вовсе.
+  it('заглушка сна ложится и на свои имена', async () => {
+    await seed('shop');
+
+    await sleepProduct({ slug: 'shop', kind: 'site', customNames: ['a.ru', 'www.a.ru'] }, deps(host));
+
+    expect(host.vhostMode('shop')).toBe('asleep');
+    expect(host.vhostDomains.get('shop')).toEqual(['a.ru', 'www.a.ru']);
+    expect(host.ran('product-vhost').at(-1)).toEqual([
+      'product-vhost', 'shop', '--asleep', '--domain', 'a.ru', '--domain', 'www.a.ru',
+    ]);
+  });
+
+  it('пробуждение возвращает прокси вместе со своими именами', async () => {
+    const port = await seed('shop');
+    await sleepProduct({ slug: 'shop', kind: 'site', customNames: ['a.ru'] }, deps(host));
+
+    await wakeProduct({ slug: 'shop', kind: 'site', port, customNames: ['a.ru'] }, deps(host));
+
+    expect([host.vhostMode('shop'), host.vhostDomains.get('shop')]).toEqual(['live', ['a.ru']]);
+    expect(host.ran('product-vhost').at(-1)).toEqual(['product-vhost', 'shop', String(port), '--domain', 'a.ru']);
+  });
+
+  it('мусорное имя — отказ сна ДО гашения контейнера', async () => {
+    // Отказ после `docker stop` оставил бы продукт погашенным при живом
+    // конфиге прокси — ровно тот 502, от которого заведена заглушка.
+    await seed('shop');
+    host.calls.length = 0;
+
+    await expect(
+      sleepProduct({ slug: 'shop', kind: 'site', customNames: ['a.ru; rm -rf /'] }, deps(host)),
+    ).rejects.toThrow(/имя домена/);
+
+    expect(host.calls).toHaveLength(0);
+    expect(host.isRunning('shop')).toBe(true);
+  });
+
+  it('мусорное имя — отказ пробуждения ДО подъёма контейнера', async () => {
+    const port = await seed('shop');
+    await sleepProduct({ slug: 'shop', kind: 'site' }, deps(host));
+    host.calls.length = 0;
+
+    await expect(
+      wakeProduct({ slug: 'shop', kind: 'site', port, customNames: ['A.RU'] }, deps(host)),
+    ).rejects.toThrow(/имя домена/);
+
+    expect(host.calls).toHaveLength(0);
+    expect(host.isRunning('shop')).toBe(false);
+  });
+});
+
 describe('пробуждение продукта', () => {
   /** Заведён и усыплён — ровно то состояние, в котором приходит задание wake. */
   async function asleep(slug: string, kind: 'site' | 'bot' = 'site') {

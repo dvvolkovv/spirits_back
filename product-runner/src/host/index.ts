@@ -207,7 +207,9 @@ function workFor(job: HostJob, deps: HostDeps): Promise<{ port?: number }> {
   }
   if (kind === 'provision') return deps.provision(job);
 
-  const step: SleepJob = { slug: job.slug, kind: job.kind, port: job.port };
+  // Свои имена — в выжимке обязательно: сон и пробуждение переписывают
+  // конфиг целиком, и без имён домен клиента слетел бы на первом же сне.
+  const step: SleepJob = { slug: job.slug, kind: job.kind, port: job.port, customNames: job.customNames ?? [] };
   // У СНА порт в отчёт не кладётся намеренно: сон его не меняет, а
   // `{ ok: true, port: undefined }` читается в логе и в теле как «порт
   // потерян» — см. ниже, там же про COALESCE на сервере.

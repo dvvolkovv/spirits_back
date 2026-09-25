@@ -51,6 +51,10 @@ export interface HostJob extends ProvisionJob {
    * У заведения он `null`: там порт выбирает агент и присылает его в отчёте.
    */
   port?: number | null;
+  /** Свои имена продукта. Приезжают в каждом задании; у отвязки — пусто. */
+  customNames?: string[];
+  /** Режим конфига для задания domain: прокси или заглушка. Вычисляет сервер. */
+  vhostMode?: 'proxy' | 'asleep';
 }
 
 /**

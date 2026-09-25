@@ -96,6 +96,32 @@ describe('форма продукта', () => {
   });
 });
 
+describe('свои имена продукта при заведении', () => {
+  it('имена из задания доезжают до product-vhost', async () => {
+    // Повтор заведения поверх продукта с живым своим доменом (выпуск прошёл,
+    // заведение повторяют) без имён переписал бы конфиг и снял бы домен.
+    const res = await provision(job({ customNames: ['a.ru', 'www.a.ru'] }), deps(host));
+
+    expect(host.ran('product-vhost')).toEqual([
+      ['product-vhost', 'kafe-ulej', String(res.port), '--domain', 'a.ru', '--domain', 'www.a.ru'],
+    ]);
+    expect(host.vhostDomains.get('kafe-ulej')).toEqual(['a.ru', 'www.a.ru']);
+  });
+
+  it('без имён — прежняя форма вызова', async () => {
+    const res = await provision(job(), deps(host));
+
+    expect(host.ran('product-vhost')).toEqual([['product-vhost', 'kafe-ulej', String(res.port)]]);
+  });
+
+  it('мусорное имя — отказ до единого изменения на хосте', async () => {
+    await expect(provision(job({ customNames: ['a.ru/x'] }), deps(host))).rejects.toThrow(/имя домена/);
+
+    expect(host.writtenDirs).toHaveLength(0);
+    expect(host.ran('docker').filter((c) => c[1] === 'run')).toHaveLength(0);
+  });
+});
+
 describe('секреты клиента', () => {
   it('секреты уезжают в контейнер переменными окружения', async () => {
     await provision(job({ secrets: { BOT_TOKEN: 'тк', API_KEY: 'к2' } }), deps(host));
