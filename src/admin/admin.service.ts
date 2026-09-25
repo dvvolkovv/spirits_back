@@ -8,6 +8,26 @@ import { PgService } from '../common/services/pg.service';
 import { sendTelegramAlert } from '../common/telegram-alert';
 import { callFlags, countUserTurns } from './callFlags';
 
+/** Вкладка раздела «Звонки»: звонки из приложения, встречи на площадках или всё. */
+export type CallKind = 'call' | 'meeting' | 'all';
+
+/** Фильтры раздела «Звонки», как они приходят из query-параметров. */
+export interface CallsQuery {
+  days?: number;
+  kind?: string;
+  provider?: string | null;
+  includeTest?: boolean;
+  limit?: number;
+}
+
+/** Те же фильтры после разбора: вкладка известна, площадка проверена. */
+export interface CallsFilter {
+  days: number;
+  kind: CallKind;
+  provider: string | null;
+  includeTest: boolean;
+}
+
 @Injectable()
 export class AdminService implements OnModuleInit {
   private readonly logger = new Logger(AdminService.name);
@@ -1527,10 +1547,66 @@ export class AdminService implements OnModuleInit {
     };
   }
 
-  // --- Голосовые звонки ---
+  // --- Голосовые звонки и встречи ---
+
+  /** Звонок из приложения. Всё остальное в voice_calls — встречи на площадках. */
+  private static readonly CALL_PROVIDER = 'linkeon';
 
   /**
-   * Звонки в разрезе пользователей: сколько звонили и сколько за это списано.
+   * Образец идентификатора площадки. В SQL площадка и так уходит параметром;
+   * образец нужен, чтобы в ответ не вернулась произвольная строка, выданная
+   * за выбранную площадку.
+   */
+  private static readonly PROVIDER_RE = /^[a-z0-9_]{1,32}$/;
+
+  /**
+   * Фильтры раздела «Звонки» из query-параметров.
+   *
+   * Незнакомый kind схлопывается в 'call', а не снимает фильтр: иначе
+   * произвольный ?kind= молча подмешал бы встречи в звонки. Проверка живёт
+   * здесь одна — в контроллере она разъехалась бы при добавлении площадки.
+   */
+  private static callsFilter(opts: CallsQuery): CallsFilter {
+    const kind: CallKind = opts.kind === 'meeting' || opts.kind === 'all' ? opts.kind : 'call';
+    const provider =
+      typeof opts.provider === 'string' && AdminService.PROVIDER_RE.test(opts.provider)
+        ? opts.provider
+        : null;
+    return {
+      days: Math.min(Math.max(opts.days ?? 30, 1), 365),
+      kind,
+      provider,
+      includeTest: !!opts.includeTest,
+    };
+  }
+
+  /**
+   * Условие выборки сессий — одно на таблицу, итоги, разбивку по площадкам и
+   * ленту. Разъехавшись, они показали бы разные наборы, и сумма колонок не
+   * сошлась бы с итогом.
+   *
+   * Встречи — «всё, кроме звонка из приложения», а не перечень площадок:
+   * новая площадка попадёт во встречи без правки этого места.
+   *
+   * withProvider=false — для разбивки по площадкам: выбранная площадка не
+   * должна прятать остальные кнопки, иначе к ним не вернуться.
+   */
+  private static callsWhere(f: CallsFilter, withProvider = true): { where: string; params: any[] } {
+    const params: any[] = [f.days];
+    const parts = [`c.started_at >= now() - $1 * interval '1 day'`];
+    if (f.kind === 'call') parts.push(`c.provider = '${AdminService.CALL_PROVIDER}'`);
+    if (f.kind === 'meeting') parts.push(`c.provider <> '${AdminService.CALL_PROVIDER}'`);
+    if (withProvider && f.provider) {
+      params.push(f.provider);
+      parts.push(`c.provider = $${params.length}`);
+    }
+    parts.push(AdminService.testFilter('c.user_id', f.includeTest));
+    return { where: parts.join(' AND '), params };
+  }
+
+  /**
+   * Звонки и встречи в разрезе пользователей: сколько их было и сколько за
+   * это списано.
    *
    * Списаний два, и лежат они в разных таблицах: voice_calls.tokens_charged —
    * минуты разговора, voice_call_jobs.tokens_used — каждый вопрос ведущего
@@ -1539,31 +1615,13 @@ export class AdminService implements OnModuleInit {
    * а по одной общей цифре этого не видно.
    *
    * Встречи и звонки живут в одной таблице и различаются только provider, так
-   * что без фильтра получасовая встреча считалась бы звонком. По умолчанию
-   * отдаём звонки — раздел про них; встречи доступны через kind.
+   * что без фильтра получасовая встреча считалась бы звонком. kind выбирает
+   * вкладку, provider — площадку внутри неё; byProvider кормит кнопки площадок.
    */
-  async getCallsByUser(
-    opts: { days?: number; kind?: 'call' | 'meeting' | 'all'; limit?: number } = {},
-  ) {
-    const days = Math.min(Math.max(opts.days ?? 30, 1), 365);
+  async getCallsByUser(opts: CallsQuery = {}) {
+    const f = AdminService.callsFilter(opts);
     const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
-    // Незнакомое значение схлопывается в 'call', а не снимает фильтр: иначе
-    // произвольный ?kind= молча подмешал бы встречи в раздел звонков.
-    const kind: 'call' | 'meeting' | 'all' =
-      opts.kind === 'meeting' || opts.kind === 'all' ? opts.kind : 'call';
-
-    const providerFilter =
-      kind === 'all'
-        ? 'true'
-        : `c.provider = '${kind === 'meeting' ? 'linkeon_room' : 'linkeon'}'`;
-
-    // Общий предикат выборки. Держим одной строкой, чтобы таблица и итоги
-    // считались ровно по одному набору звонков: разъехавшись, они дали бы
-    // сумму колонок, не сходящуюся с итогом внизу.
-    const where = `
-      c.started_at >= now() - $1 * interval '1 day'
-      AND ${providerFilter}
-      AND ${AdminService.excludeTest('c.user_id')}`;
+    const { where, params } = AdminService.callsWhere(f);
 
     // Консультации подтягиваем коррелированным подзапросом по call_id, а не
     // отдельным JOIN по user_id: иначе в выборку звонков приехали бы вопросы,
@@ -1591,7 +1649,7 @@ export class AdminService implements OnModuleInit {
        ORDER BY (COALESCE(SUM(c.tokens_charged), 0) + COALESCE(SUM(${consultSum}), 0)) DESC,
                 calls DESC, c.user_id ASC
        LIMIT ${limit}`,
-      [days],
+      params,
     );
 
     // Итоги считаем отдельным запросом, а не суммой строк: строки обрезаны
@@ -1606,16 +1664,30 @@ export class AdminService implements OnModuleInit {
          COALESCE(SUM(${consultSum}), 0)::bigint AS tokens_consult
        FROM voice_calls c
        WHERE ${where}`,
-      [days],
+      params,
     );
     const tot = totalsRes.rows[0] || {};
+
+    // Сессии по площадкам — для кнопок фильтра на «Встречах». Считаются без
+    // условия по выбранной площадке: иначе остальные кнопки пропали бы.
+    const byProv = AdminService.callsWhere(f, false);
+    const byProviderRes = await this.pg.query(
+      `SELECT c.provider, COUNT(*)::int AS sessions
+         FROM voice_calls c
+        WHERE ${byProv.where}
+        GROUP BY c.provider
+        ORDER BY sessions DESC, c.provider ASC`,
+      byProv.params,
+    );
 
     const tokensCall = Number(tot.tokens_call) || 0;
     const tokensConsult = Number(tot.tokens_consult) || 0;
 
     return {
-      days,
-      kind,
+      days: f.days,
+      kind: f.kind,
+      provider: f.provider,
+      include_test: f.includeTest,
       byUser: rowsRes.rows.map((r: any) => {
         const call = Number(r.tokens_call) || 0;
         const consult = Number(r.tokens_consult) || 0;
@@ -1638,6 +1710,10 @@ export class AdminService implements OnModuleInit {
         tokens_consult: tokensConsult,
         tokens_total: tokensCall + tokensConsult,
       },
+      byProvider: byProviderRes.rows.map((r: any) => ({
+        provider: String(r.provider),
+        sessions: Number(r.sessions) || 0,
+      })),
     };
   }
 
