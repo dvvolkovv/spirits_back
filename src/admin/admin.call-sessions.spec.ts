@@ -73,6 +73,7 @@ describe('AdminService.getCallSessions', () => {
   it('сорвавшаяся встреча помечена сбоем', async () => {
     const res = await service(makePg([TELEMOST_FAILED], 1)).getCallSessions({ kind: 'meeting' });
     expect(res.sessions[0].flags).toEqual(['failed']);
+    expect(res.sessions[0]).toMatchObject({ duration_sec: null, model: null, user_turns: 0, tokens_total: 0 });
   });
 
   it('лента и её total считаются по одному условию', async () => {
@@ -118,5 +119,23 @@ describe('AdminService.getCallSessions', () => {
     const feed = pg.calls.find(([s]) => FEED_Q.test(s))!;
     expect(feed[0]).toMatch(/LEFT JOIN agents a ON a\.id = c\.agent_id/);
     expect(feed[0]).toMatch(/call_id = c\.id/);
+    // Имя — как ассистента слышат на встрече (display_name), а не внутреннее.
+    expect(feed[0]).toMatch(/COALESCE\(a\.display_name, a\.name\) AS agent_name/);
+  });
+
+  it('лента и карточка отдают одну и ту же форму сессии', async () => {
+    // Карточку человека и ленту рисует один компонент фронта. Точный список
+    // ключей держит заодно и то, чего в ответе быть не должно: расшифровки,
+    // адреса встречи (у Zoom в нём хеш пароля), tokens_charged под старым именем.
+    const row = { ...ZOOM_OK, agent_name: undefined };
+    const feed = (await service(makePg([row], 1)).getCallSessions({})).sessions[0];
+    const card = (await service({ query: async () => ({ rows: [row] }) }).getUserCalls('79236230446')).calls[0];
+
+    expect(card).toEqual(feed);
+    expect(Object.keys(feed).sort()).toEqual([
+      'agent_name', 'consults', 'duration_sec', 'flags', 'id', 'model', 'provider', 'started_at',
+      'status', 'summary', 'tokens_call', 'tokens_consult', 'tokens_total', 'user_id', 'user_turns',
+    ]);
+    expect(feed.agent_name).toBeNull();
   });
 });
