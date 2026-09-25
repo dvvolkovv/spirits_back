@@ -2,6 +2,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { spawn } from 'child_process';
 import * as os from 'os';
+import * as fs from 'fs';
+import * as path from 'path';
 import { PgService } from './pg.service';
 
 export interface ClaudeCliProgressEvent {
@@ -26,10 +28,18 @@ export interface ClaudeCliOptions {
   /** Рабочая директория Claude. По умолчанию os.tmpdir(). Для агентных
    *  сценариев (Bash/Write/Edit) передавай изолированный sandbox-dir. */
   cwd?: string;
-  /** Полностью переопределяет --allowedTools. По умолчанию: 'Read' если есть
-   *  attachments, иначе ''. Передавай явный список (например 'Bash,Write,Read,Edit')
-   *  для агентного режима. */
+  /** Полностью переопределяет --allowedTools (это АВТО-ОДОБРЕНИЕ, а не набор
+   *  доступного). По умолчанию: 'Read' если есть attachments, иначе ''.
+   *  Передавай явный список для агентного режима. */
   allowedTools?: string;
+  /** ДОСТУПНЫЙ набор встроенных тулов → CLI-флаг `--tools`. Именно он решает,
+   *  что модель ВООБЩЕ может вызвать (в отличие от allowedTools, который лишь
+   *  снимает запрос на подтверждение уже доступного).
+   *  По умолчанию (caller не передал ни tools, ни attachments): '' — все
+   *  встроенные тулы выключены. При наличии attachments и без явного tools: 'Read'.
+   *  Передавай явный список (например 'Read,WebSearch,WebFetch') для нужного режима;
+   *  'default' у CLI означает «все тулы» — использовать осознанно. */
+  tools?: string;
 }
 
 @Injectable()
@@ -75,29 +85,101 @@ export class ClaudeCliService {
   }
 
   private async runRaw(prompt: string, opts: ClaudeCliOptions): Promise<{ text: string; costUsd: number }> {
+    // Одноразовый каталог под копии вложений (создаётся только когда он нужен —
+    // см. ниже). Снимается в finally, чтобы не копить чужие файлы в tmp.
+    let perCallTmpDir: string | null = null;
+    try {
+      return await this.spawnClaude(prompt, opts, (dir) => { perCallTmpDir = dir; });
+    } finally {
+      if (perCallTmpDir) {
+        try { fs.rmSync(perCallTmpDir, { recursive: true, force: true }); }
+        catch (e: any) { this.logger.warn(`per-call tmp cleanup failed (${perCallTmpDir}): ${e.message}`); }
+      }
+    }
+  }
+
+  private spawnClaude(
+    prompt: string,
+    opts: ClaudeCliOptions,
+    registerTmpDir: (dir: string) => void,
+  ): Promise<{ text: string; costUsd: number }> {
     const model = opts.model ?? 'claude-haiku-4-5';
     const timeoutMs = opts.timeoutMs ?? 60_000;
     const streaming = !!opts.onProgress;
 
     const hasAttachments = (opts.attachments?.length ?? 0) > 0;
 
+    // ── cwd и ссылки на вложения ──────────────────────────────────────────
+    // Безопасность (25.09.2026): вложения раньше подставлялись в промпт как
+    // @<АБСОЛЮТНЫЙ путь>. CLI разворачивает @-упоминания на этапе сборки промпта
+    // (инлайнит содержимое файла) — без cwd-ограничения; для наших же файлов это
+    // норма, но абсолютный путь мы дальше не эмитим сами. Если caller НЕ задал
+    // cwd — Read не должен дотянуться никуда, кроме вложений: заводим одноразовый
+    // per-call каталог, копируем туда вложения и ссылаемся по ОТНОСИТЕЛЬНОМУ
+    // имени. Если cwd задан (агентный/sandbox-режим), вложения там же — ссылаемся
+    // относительно cwd.
+    let spawnCwd: string;
+    let refNames: string[] = [];
+    if (hasAttachments && !opts.cwd) {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-cli-'));
+      registerTmpDir(tmpDir);
+      spawnCwd = tmpDir;
+      const used = new Set<string>();
+      for (const src of opts.attachments!) {
+        let base = path.basename(src) || 'file';
+        // Разводим коллизии имён: два вложения с одинаковым basename не должны
+        // затирать друг друга в одноразовом каталоге.
+        if (used.has(base)) {
+          const ext = path.extname(base);
+          base = `${path.basename(base, ext)}-${used.size}${ext}`;
+        }
+        used.add(base);
+        try {
+          fs.copyFileSync(src, path.join(tmpDir, base));
+          refNames.push(base);
+        } catch (e: any) {
+          this.logger.warn(`attachment copy failed (${src}): ${e.message}`);
+        }
+      }
+    } else {
+      // Neutral cwd by default: backend runs in /home/dvolkov/spirits_back, whose
+      // ~40KB CLAUDE.md the CLI would auto-discover and prepend to EVERY one-shot
+      // prompt — irrelevant context that inflated input and tripled VPM latency.
+      // Caller may override cwd для агентного sandbox-режима.
+      spawnCwd = opts.cwd ?? os.tmpdir();
+      if (hasAttachments) {
+        // cwd задан caller-ом (вложения уже внутри него): ссылаемся относительно
+        // cwd, если файл действительно там; иначе — абсолютным путём как раньше
+        // (в наших флоу этого не случается, вложения лежат в sandbox=cwd).
+        refNames = opts.attachments!.map((p) => {
+          const rel = path.relative(spawnCwd, p);
+          return rel && !rel.startsWith('..') && !path.isAbsolute(rel) ? rel : p;
+        });
+      }
+    }
+
     // Compose final prompt: system + user (claude -p has no separate --system arg).
-    // Если есть attachments — добавляем @<path> ссылки в конец user-блока, Claude
-    // подтянет их через Read tool.
     let userBlock = prompt;
-    if (hasAttachments) {
-      const refs = opts.attachments!.map(p => `@${p}`).join(' ');
+    if (hasAttachments && refNames.length) {
+      const refs = refNames.map(r => `@${r}`).join(' ');
       userBlock = `${prompt}\n\nПриложенные файлы: ${refs}`;
     }
     const fullPrompt = opts.system
       ? `${opts.system}\n\n---\n\nUSER REQUEST:\n${userBlock}`
       : userBlock;
 
-    // С attachments нужен Read tool, чтобы CLI смог открыть файлы из @<path>.
-    // Без attachments — пустой allowedTools полностью отключает built-in тулы.
-    // Если caller передал явный allowedTools — используем его (агентный режим).
+    // --allowedTools — это АВТО-ОДОБРЕНИЕ уже доступного. Дефолт как раньше.
     const allowedTools = opts.allowedTools !== undefined
       ? opts.allowedTools
+      : (hasAttachments ? 'Read' : '');
+
+    // --tools — ДОСТУПНЫЙ набор встроенных тулов. Ключевая защита: без явного
+    // значения и без вложений отдаём '' — все встроенные тулы выключены (иначе
+    // CLI даёт полный набор Claude Code, и «безобидный» Bash вроде echo
+    // выполняется в -p без подтверждения). При вложениях без явного tools — 'Read',
+    // чтобы CLI мог открыть присланный файл, и не более того.
+    const tools = opts.tools !== undefined
+      ? opts.tools
       : (hasAttachments ? 'Read' : '');
 
     const args = [
@@ -106,6 +188,9 @@ export class ClaudeCliService {
       '--model', model,
       '--output-format', streaming ? 'stream-json' : 'json',
       '--allowedTools', allowedTools,
+      // Пустая строка обязана уйти отдельным argv-элементом '' (spawn так и
+      // делает — не через шелл): '--tools' '' = «встроенных тулов нет».
+      '--tools', tools,
       '--strict-mcp-config',         // load NO MCP servers (none passed) — these
                                      // one-shot calls use no tools; skipping MCP
                                      // startup avoids stalls in the pm2 env.
@@ -113,13 +198,6 @@ export class ClaudeCliService {
     // stream-json требует --verbose, иначе CLI отвергает комбинацию.
     if (streaming) args.push('--verbose');
 
-    // Spawn from a neutral cwd: the backend runs in /home/dvolkov/spirits_back,
-    // whose ~40KB CLAUDE.md the CLI would auto-discover and prepend to EVERY
-    // one-shot prompt — irrelevant context that inflated input and tripled
-    // VPM-generation latency (82s standalone vs ~226s from the service). These
-    // calls always carry their own full prompt, so no project context is needed.
-    // Caller may override cwd для агентного sandbox-режима.
-    const spawnCwd = opts.cwd ?? os.tmpdir();
     return new Promise<{ text: string; costUsd: number }>((resolve, reject) => {
       const proc = spawn(this.claudeBin, args, { stdio: ['ignore', 'pipe', 'pipe'], cwd: spawnCwd });
       let stdout = '';

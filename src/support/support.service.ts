@@ -3,6 +3,7 @@ import {
 } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { PgService } from '../common/services/pg.service';
@@ -302,7 +303,25 @@ export class SupportService implements OnModuleInit {
           model: 'claude-haiku-4-5',
           systemPrompt,
           mcpServers: { 'support-tools': mcp },
-          permissionMode: 'bypassPermissions',
+          // Безопасность (25.09.2026). Тикет-агенту нужны ТОЛЬКО MCP-тулы
+          // support-tools (get_user_context, refund_tokens, escalate…), но не
+          // встроенные Bash/Read/Write. Раньше стоял bypassPermissions без
+          // tools: SDK при этом отдаёт модели весь набор Claude Code, и текст
+          // пользователя из тикета мог довести её до чтения ~/spirits_back/.env
+          // (процесс API идёт под владельцем этого файла).
+          //   • `tools: []` убирает ВСТРОЕННЫЕ тулы, при этом MCP-тулы остаются
+          //     (проверено пробой: INIT_TOOLS = ['mcp__support-tools__…'], Bash
+          //     отсутствует, хендлеры вызываются).
+          //   • bypassPermissions заменён на `dontAsk` + точечный allowedTools по
+          //     имени сервера: без интерактивного одобрения в -p всё, что не в
+          //     списке, отклоняется (проверено: при dontAsk без allowedTools
+          //     даже MCP-тул не выполняется). Так, даже если кто-то по ошибке
+          //     вернёт встроенный тул в `tools`, выполнить его не дадут —
+          //     bypassPermissions такой страховки не давал.
+          tools: [],
+          permissionMode: 'dontAsk',
+          allowedTools: ['mcp__support-tools'],
+          cwd: os.tmpdir(),
           settingSources: [],
           maxTurns: LIMITS.AI_MAX_TURNS,
         } as any,

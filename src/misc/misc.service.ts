@@ -6,6 +6,7 @@ import { StorageService } from '../common/services/storage.service';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import axios from 'axios';
+import * as os from 'os';
 import { Response } from 'express';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { renderBannerOverlay, BannerPosition, BannerTheme } from './banner-overlay';
@@ -973,6 +974,18 @@ ${LanguageService.buildDirective(userLanguage)}`;
         options: {
           model: 'claude-haiku-4-5',
           systemPrompt,
+          // Безопасность (25.09.2026): здесь нужен чистый текстовый вывод, тулы
+          // не используются вовсе. Раньше стоял bypassPermissions без указания
+          // tools — при таком сочетании SDK отдаёт модели ПОЛНЫЙ набор Claude
+          // Code (Bash, Read, Write, WebFetch…), и userMessage (поисковый
+          // запрос/данные для сравнения профилей) мог заставить её прочитать
+          // ~/spirits_back/.env: процесс API идёт под пользователем, владеющим
+          // этим файлом. `tools: []` убирает встроенные тулы целиком (проверено
+          // пробой: INIT_TOOLS []), после чего bypassPermissions разрешать
+          // нечего. cwd тоже уводим в нейтральный tmp — не в каталог бэкенда с
+          // .env и его 40KB CLAUDE.md.
+          tools: [],
+          cwd: os.tmpdir(),
           permissionMode: 'bypassPermissions',
           settingSources: [],
           includePartialMessages: true,
