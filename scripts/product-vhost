@@ -123,7 +123,21 @@ while [ $# -gt 0 ]; do
       if [ "${#D}" -gt 100 ]; then
         echo "product-vhost: домен длиннее 100 знаков: '$D'" >&2; exit 2
       fi
-      DOMAINS="$DOMAINS $D"
+      # Адрес платформы своим доменом не бывает: `$S.$ZONE` дал бы в этом же
+      # файле второй server с тем же именем, а чужой `x.$ZONE` — перехват
+      # адреса соседнего продукта (nginx лишь предупредит «conflicting server
+      # name» и молча оставит первый). Сервер такие имена отбивает и сам
+      # (normalizeDomain: our_zone) — здесь то же на стороне машины.
+      case "$D" in
+        "$ZONE" | *".$ZONE" )
+          echo "product-vhost: домен в зоне платформы ($ZONE) своим не бывает: '$D'" >&2; exit 2 ;;
+      esac
+      # Повтор имени — не ошибка, но и не второй блок: два server с одним
+      # server_name nginx тоже лишь предупреждает и берёт первый.
+      case " $DOMAINS " in
+        *" $D "*) ;;
+        *) DOMAINS="$DOMAINS $D" ;;
+      esac
       shift 2
       ;;
     *) echo "product-vhost: непонятный аргумент: '$1'" >&2; exit 2 ;;
@@ -198,10 +212,55 @@ if [ -n "$DOMAINS" ]; then
 HTML
 fi
 
+# ЗАПИСЬ — через временный файл и mv, а не `> "$CONF"` поверх живого.
+# Прямая запись сначала обрезает живой файл: ошибка записи (диск полон) или
+# SIGKILL по таймауту агента между записью и `nginx -t` оставляли бы в
+# sites-products обрывок `server {` — красный `nginx -t` ВСЕЙ машины, откат
+# каждого следующего вызова для каждого продукта, и nginx, который после
+# перезапуска не поднимет ничего. mv в пределах каталога атомарен: живой файл
+# всегда либо прежний целиком, либо новый целиком.
+#
+# Временные имена — с точки в начале и без `.conf` на конце: nginx включает
+# sites-products/*.conf, и такие файлы он не читает.
+#
 # Прежний файл — в сторону, в mktemp, а НЕ рядом: всё, что лежит в
 # sites-products и кончается на .conf, nginx читает как конфиг, и копия рядом
 # дала бы дубли server_name.
+NEW="$CONF_DIR/.$S.conf.new"
+RB="$CONF_DIR/.$S.conf.rb"
 PREV=""
+# fresh — живой файл не тронут; installed — новый на месте, но не проверен;
+# settled — итог принят (зелёный или уже откачен).
+STATE=fresh
+
+restore() {
+  if [ -n "$PREV" ]; then
+    cp "$PREV" "$RB" && mv -f "$RB" "$CONF"
+  else
+    rm -f "$CONF"
+  fi
+}
+
+# Любой выход, кроме принятого итога, — прерывание (ошибка записи под set -e,
+# INT/TERM от агента): непроверенный новый файл уступает место прежнему.
+# SIGKILL не ловится ничем, но после mv на месте лежит целый файл, а не обрывок.
+on_exit() {
+  rc=$?
+  trap - EXIT
+  set +e
+  if [ "$STATE" = installed ] && ! restore; then
+    # Вернуть не вышло — единственную копию прежнего не выбрасываем.
+    echo "product-vhost: прежний конфиг $S вернуть не удалось, он лежит в ${PREV:-(нового продукта — удалить $CONF)}" >&2
+    PREV=""
+  fi
+  rm -f "$NEW" "$RB"
+  if [ -n "$PREV" ]; then rm -f "$PREV"; fi
+  exit "$rc"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 if [ -f "$CONF" ]; then
   PREV=$(mktemp)
   cp "$CONF" "$PREV"
@@ -236,6 +295,10 @@ server {
   ssl_certificate     $CERT/fullchain.pem;
   ssl_certificate_key $CERT/privkey.pem;
   ssl_protocols TLSv1.2 TLSv1.3;
+  # Размер зоны ОБЯЗАН совпадать с snippets/products-ssl.conf машины (там —
+  # shared:SSL:10m, сверено на обеих машинах 25.09.2026): одна зона с двумя
+  # размерами — «conflicts with already declared size», и каждая запись
+  # своего домена с сертификатом откатывалась бы.
   ssl_session_cache shared:SSL:10m;
 $BODY
 }
@@ -258,19 +321,21 @@ server {
 CONF
     fi
   done
-} > "$CONF"
+} > "$NEW"
 
-if "$NGINX" -t >/dev/null 2>&1; then
-  if [ -n "$PREV" ]; then rm -f "$PREV"; fi
+STATE=installed
+mv -f "$NEW" "$CONF"
+
+# `nginx -t` проверяет ВСЮ машину, а не один этот файл: причина красного может
+# лежать в соседнем конфиге. Поэтому в отчёт — его собственные строки.
+if NGT=$("$NGINX" -t 2>&1); then
+  STATE=settled
   $RELOAD
   echo "  vhost $S.$ZONE → $WHAT${DOMAINS:+ (+$DOMAINS)}"
 else
-  if [ -n "$PREV" ]; then
-    cat "$PREV" > "$CONF"
-    rm -f "$PREV"
-  else
-    rm -f "$CONF"
-  fi
-  echo "product-vhost: новый конфиг $S не прошёл nginx -t — прежний возвращён, nginx не перечитан" >&2
+  restore
+  STATE=settled
+  echo "product-vhost: новый конфиг $S не прошёл nginx -t машины — прежний возвращён, nginx не перечитан; причина:" >&2
+  printf '%s\n' "$NGT" | head -5 >&2
   exit 1
 fi

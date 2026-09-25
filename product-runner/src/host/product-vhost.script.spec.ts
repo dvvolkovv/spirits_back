@@ -21,6 +21,8 @@ interface Sandbox {
   confs: () => string[];
   cert: (slug: string) => void;
   bucket: (size: number | null) => void;
+  /** Подменить команду `nginx -t` (путь к исполняемому файлу). */
+  nginx: (bin: string) => void;
 }
 
 // Песочницы убираются после каждого теста: иначе каждый прогон оставлял бы в
@@ -73,7 +75,7 @@ function sandbox(realNginx: boolean): Sandbox {
     '',
   ].join('\n'));
   bucket(null); // как на машинах до PHASE 4 этой задачи: корзина по умолчанию, 64
-  const env = {
+  const env = () => ({
     ...process.env,
     PV_CONF_DIR: path.join(root, 'conf'),
     PV_LE_LIVE: path.join(root, 'live'),
@@ -81,12 +83,13 @@ function sandbox(realNginx: boolean): Sandbox {
     PV_ASLEEP_DIR: path.join(root, 'share'),
     PV_NGINX: nginxBin,
     PV_RELOAD: 'true',
-  };
+  });
   return {
     root,
     bucket,
+    nginx: (bin) => { nginxBin = bin; },
     run: (...args) => {
-      const r = spawnSync('sh', [SCRIPT, ...args], { env, encoding: 'utf8' });
+      const r = spawnSync('sh', [SCRIPT, ...args], { env: env(), encoding: 'utf8' });
       return { status: r.status, out: `${r.stdout}${r.stderr}` };
     },
     conf: (slug) => fs.readFileSync(path.join(root, 'conf', `${slug}.conf`), 'utf8'),
@@ -162,6 +165,20 @@ const LONG = `${'a'.repeat(55)}.com`; // 59 знаков: больше 46, ме�
     expect(s.confs()).toEqual([]);
   });
 
+  // `nginx -t` проверяет всю машину: причина красного может быть у соседа, и
+  // отчёт обязан её назвать, а не винить этот продукт.
+  it('красный nginx -t из-за соседнего конфига: откат, в отчёте — строка nginx про соседа', () => {
+    const s = sandbox(true);
+    expect(s.run('shop', '8001')).toMatchObject({ status: 0 });
+    const before = s.conf('shop');
+    fs.writeFileSync(path.join(s.root, 'conf', 'zz-broken.conf'), 'garbage;\n');
+    const r = s.run('shop', '8001', '--domain', 'a.ru');
+    expect(r.status).toBe(1);
+    expect(r.out).toMatch(/не прошёл nginx -t машины/);
+    expect(r.out).toMatch(/unknown directive "garbage" in \S*zz-broken\.conf/);
+    expect(s.conf('shop')).toBe(before);
+  });
+
   // Замер, ради которого PHASE 4 ставит корзину 128: при 64 не заводится
   // даже продукт со слагом из 34 знаков (34 + «.p.linkeon.io» = 47).
   it('корзина 64 не держит слаг из 34 знаков, корзина 128 держит и его, и длинный домен', () => {
@@ -199,6 +216,23 @@ describe('product-vhost: разбор аргументов', () => {
     const s = sandbox(false);
     expect(s.run('shop', '8001', '--domain').status).toBe(2);
     expect(s.run('shop', '8001', '--foo', 'a.ru').status).toBe(2);
+    expect(s.confs()).toEqual([]);
+  });
+
+    it('повтор имени — один блок, порядок прихода сохраняется', () => {
+    const s = sandbox(false);
+    expect(s.run('shop', '8001', '--domain', 'a.ru', '--domain', 'www.a.ru', '--domain', 'a.ru').status).toBe(0);
+    const c = s.conf('shop');
+    expect(count(c, /server_name a\.ru;/)).toBe(1);
+    expect(count(c, /server_name www\.a\.ru;/)).toBe(1);
+    expect(c.indexOf('server_name a.ru;')).toBeLessThan(c.indexOf('server_name www.a.ru;'));
+  });
+
+  it('имя в зоне платформы — отказ: свой адрес, адрес соседа, сама зона', () => {
+    const s = sandbox(false);
+    for (const bad of ['shop.p.linkeon.io', 'other.p.linkeon.io', 'p.linkeon.io']) {
+      expect({ bad, status: s.run('shop', '8001', '--domain', bad).status }).toEqual({ bad, status: 2 });
+    }
     expect(s.confs()).toEqual([]);
   });
 
@@ -284,5 +318,61 @@ describe('vhostArgv агента и product-vhost согласны об имен
     expect(agentOk(name)).toBe(false);
     const s = sandbox(false);
     expect(s.run('shop', '8001', '--domain', name).status).toBe(0);
+  });
+});
+
+/**
+ * Запись конфига не должна оставлять обрывок в sites-products: обрывок
+ * `server {` роняет `nginx -t` всей машины. Новый файл пишется рядом под
+ * временным именем и встаёт на место mv; прерывание до принятого итога
+ * возвращает прежний.
+ */
+describe('product-vhost: прерванная запись не оставляет обрывка', () => {
+  const HAVE_DEV_FULL = fs.existsSync('/dev/full');
+
+  // Диск полон: временный файл — ссылка на /dev/full, запись падает на cat.
+  (HAVE_DEV_FULL ? it : it.skip)('ошибка записи: прежний файл байт в байт, ни одного лишнего файла, выход ненулевой', () => {
+    const s = sandbox(false);
+    expect(s.run('shop', '8001')).toMatchObject({ status: 0 });
+    const before = s.conf('shop');
+    fs.symlinkSync('/dev/full', path.join(s.root, 'conf', '.shop.conf.new'));
+    const r = s.run('shop', '8001', '--domain', 'a.ru');
+    expect(r.status).not.toBe(0);
+    expect(s.conf('shop')).toBe(before);
+    expect(s.confs()).toEqual(['shop.conf']);
+  });
+
+  (HAVE_DEV_FULL ? it : it.skip)('ошибка записи у нового продукта: не остаётся ничего', () => {
+    const s = sandbox(false);
+    fs.symlinkSync('/dev/full', path.join(s.root, 'conf', '.fresh.conf.new'));
+    expect(s.run('fresh', '8002', '--domain', 'a.ru').status).not.toBe(0);
+    expect(s.confs()).toEqual([]);
+  });
+
+  // Таймаут агента: TERM приходит, пока идёт `nginx -t` — новый файл уже на
+  // месте, но не проверен. Он обязан уступить место прежнему.
+  it('TERM во время nginx -t: прежний файл возвращается, временных нет', () => {
+    const s = sandbox(false);
+    expect(s.run('shop', '8001')).toMatchObject({ status: 0 });
+    const before = s.conf('shop');
+    const killer = path.join(s.root, 'nginx-kill');
+    // Бьёт TERM'ом только процессы самого скрипта (сам шелл и его подоболочку),
+    // но не jest: у того в командной строке нет scripts/product-vhost.
+    fs.writeFileSync(killer, [
+      '#!/bin/sh',
+      'p=$PPID',
+      'for i in 1 2; do',
+      '  case "$(ps -o args= -p "$p")" in *scripts/product-vhost*) kill -TERM "$p" ;; esac',
+      '  p=$(ps -o ppid= -p "$p" | tr -d " ")',
+      'done',
+      'sleep 1',
+      'exit 0',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    s.nginx(killer);
+    const r = s.run('shop', '8001', '--domain', 'a.ru');
+    expect(r.status).not.toBe(0);
+    expect(s.conf('shop')).toBe(before);
+    expect(s.confs()).toEqual(['shop.conf']);
   });
 });
