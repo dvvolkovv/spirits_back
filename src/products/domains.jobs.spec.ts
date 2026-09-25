@@ -402,6 +402,17 @@ maybe('задание domain: выдача агенту и приём отчёт
       expect((await pool.query(`SELECT attempts FROM product_domains`)).rows[0].attempts).toBe(0);
     });
 
+    // Сервер знает вид задания — и узнаёт только отказ именно на domain:
+    // «неизвестный вид задания: "sleep"» на задании domain — не наш случай.
+    it('маркер — с видом задания: чужой вид в тексте — обычный отказ', async () => {
+      const id = await mkProduct('shop');
+      await domain(id, 'issuing');
+      const jobId = await job(id, 'domain');
+      await prov.claimJob('own');
+      await report(jobId, { ok: false, error: OUTDATED.replace('"domain"', '"sleep"') });
+      expect(await domainRow()).toMatchObject({ error_reason: 'issue_failed' });
+    });
+
     // Обратная сторона: обычный отказ окно повторов расходует, как и раньше.
     it('обычный отказ — счётчик повторов растёт, после трёх повторов limited', async () => {
       const id = await mkProduct('shop');

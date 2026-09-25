@@ -1,7 +1,14 @@
 import { HttpException, HttpStatus, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PgService } from '../common/services/pg.service';
-import { DomainRefusal, normalizeDomain, readableDomain, registrableZone, relativeName } from './domain-name';
+import {
+  AGENT_OUTDATED_MARKER,
+  DomainRefusal,
+  normalizeDomain,
+  readableDomain,
+  registrableZone,
+  relativeName,
+} from './domain-name';
 import { checkDns, DnsResolver, probeResolver, publicResolver, RecordCheck, TXT_LABEL } from './domain-dns';
 
 export type DomainStatus = 'awaiting_dns' | 'issuing' | 'active' | 'failed' | 'removing';
@@ -11,7 +18,8 @@ export type DomainStatus = 'awaiting_dns' | 'issuing' | 'active' | 'failed' | 'r
  * taken — домен занял другой продукт; orphan_* — задание выпуска или отвязки
  * сняли снаружи; issue_failed / remove_failed — отказ, о котором отчитался
  * агент (их пишет приём отчёта, задача 6); agent_outdated — агент машины
- * старее сервера и задания domain не знает (см. AGENT_OUTDATED_MARKER).
+ * старее сервера и задания domain не знает (см. AGENT_OUTDATED_MARKER в
+ * domain-name.ts).
  */
 export type DomainErrorReason =
   | 'taken'
@@ -22,27 +30,10 @@ export type DomainErrorReason =
   | 'agent_outdated';
 
 /**
- * Начало ЗАМОРОЖЕННОЙ формулировки отказа уже выкаченных агентов на
- * неизвестный им вид задания (product-runner/src/host/index.ts, workFor:
- * «неизвестный вид задания: "domain". Агент умеет …»). Агент ставится на
- * машины продуктов PHASE 4 отдельно от сервера, и сервер, выкаченный раньше
- * агента (или PHASE 4, молча не доехавшая), получает на КАЖДОЕ задание domain
- * именно этот отказ. Let's Encrypt тут ни при чём — на хосте ничего не
- * тронуто, — поэтому такой отказ пишется кодом agent_outdated и не
- * расходует пределы пользователя (окно повторов и задания domain в час):
- * иначе каждая готовая заявка сгорала бы как «сертификат не выпущен» и
- * запирала кнопку на час.
- *
- * Строку в агенте менять нельзя: её уже произносят агенты на машинах, и
- * узнавать их сервер обязан по ней. Сверяется только НАЧАЛО текста: в
- * середину эта фраза попадает из чужих рук — Let's Encrypt цитирует в отказе
- * ответ сервера пользователя, и такая страница иначе выводила бы его отказы
- * из-под пределов. Начало отказа агент пишет сам (describeFailure: сообщение
- * без префикса, когда хвостов на хосте нет, а у неизвестного вида их нет —
- * отказ до первого обращения к хосту).
+ * Маркер отказа устаревшего агента (см. AGENT_OUTDATED_MARKER в domain-name.ts)
+ * как SQL-шаблон LIKE: в нём нет ни `%`, ни `_`, ни одинарных кавычек —
+ * экранировать нечего (двойные кавычки вокруг "domain" для LIKE не особые).
  */
-export const AGENT_OUTDATED_MARKER = 'неизвестный вид задания:';
-/** Тот же маркер как SQL-шаблон LIKE: в нём нет ни `%`, ни `_`, ни кавычек — экранировать нечего. */
 const AGENT_OUTDATED_LIKE = `'${AGENT_OUTDATED_MARKER}%'`;
 
 /**
