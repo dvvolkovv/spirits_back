@@ -1087,8 +1087,14 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                  -- без особого случая agent_outdated в каждом. attempts_since
                  -- не трогается: начало окна — момент, когда его открыли, и
                  -- возврат этого не отменяет. Выпуск из awaiting_dns попытку не
-                 -- списывал, но у такой заявки attempts ещё 0 — GREATEST держит
-                 -- ноль. Отвязка попыток не списывает — её строка не тронута.
+                 -- списывал, и у такой заявки attempts ещё 0 — GREATEST держит
+                 -- ноль, счётчик не уходит в минус. Но ПОТЕРЯ здесь есть: первый
+                 -- выпуск бесплатен (не из failed), и если он ушёл устаревшему
+                 -- агенту, бесплатная попытка сгорела без Let's Encrypt — до
+                 -- 'limited' человек получит 3 настоящих обращения к Let's
+                 -- Encrypt вместо 4. Сторона безопасная (пределы LE не ближе),
+                 -- потому оставлено. Отвязка попыток не списывает — её строка
+                 -- не тронута (условие d.status = 'issuing').
                  attempts = CASE WHEN d.status = 'issuing' AND $4::boolean
                                  THEN GREATEST(d.attempts - 1, 0) ELSE d.attempts END
             FROM closed WHERE NOT $2::boolean AND d.product_id = closed.product_id AND d.status IN ('issuing','removing')

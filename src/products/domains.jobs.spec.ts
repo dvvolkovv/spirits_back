@@ -369,10 +369,15 @@ maybe('задание domain: выдача агенту и приём отчёт
     it('отказ отвязки — по-прежнему remove_failed: «Проверить снова» не выпускает отвязываемый домен', async () => {
       const id = await mkProduct('shop');
       await domain(id, 'removing');
+      // Попытки выпуска у строки есть — иначе возврат (GREATEST от нуля) не
+      // был бы виден. Отвязка их не списывала и возвращать ей нечего:
+      // сторож условия d.status = 'issuing' у возврата в приёме отчёта.
+      await pool.query(`UPDATE product_domains SET attempts = 2`);
       const jobId = await job(id, 'domain');
       await prov.claimJob('own');
       await report(jobId, { ok: false, error: OUTDATED });
       expect(await domainRow()).toMatchObject({ status: 'failed', error_reason: 'remove_failed' });
+      expect((await pool.query(`SELECT attempts FROM product_domains`)).rows[0].attempts).toBe(2);
     });
 
     // Маркер — только в НАЧАЛЕ текста. В середину он попадает из чужих рук:
