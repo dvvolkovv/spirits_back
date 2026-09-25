@@ -27,6 +27,23 @@ describe('ручки своего домена', () => {
     expect(domains.get).not.toHaveBeenCalled();
   });
 
+  // Как у остальных маршрутов продукта (products.controller.spec.ts, «мусор
+  // в :id»): uuid-колонка отбила бы мусор ошибкой 22P02, то есть 500-кой, —
+  // поэтому отбой 404 ДО сервиса, на каждой из четырёх ручек.
+  it('мусорный id отбивается 404 на всех четырёх ручках, сервис не зовётся', async () => {
+    for (const bad of ['не-uuid', '../../etc/passwd', '1 OR 1=1', '', '11111111-1111-4111-8111']) {
+      const { ctrl, domains } = make();
+      await expect(ctrl.getDomain(user, bad)).rejects.toBeInstanceOf(NotFoundException);
+      await expect(ctrl.attachDomain(user, bad, { domain: 'a.ru' })).rejects.toBeInstanceOf(NotFoundException);
+      await expect(ctrl.checkDomain(user, bad)).rejects.toBeInstanceOf(NotFoundException);
+      await expect(ctrl.detachDomain(user, bad)).rejects.toBeInstanceOf(NotFoundException);
+      expect(domains.get).not.toHaveBeenCalled();
+      expect(domains.attach).not.toHaveBeenCalled();
+      expect(domains.check).not.toHaveBeenCalled();
+      expect(domains.detach).not.toHaveBeenCalled();
+    }
+  });
+
   it('ответы в конверте { domain }', async () => {
     const { ctrl } = make();
     await expect(ctrl.getDomain(user, ID)).resolves.toEqual({ domain: null });
