@@ -72,9 +72,9 @@ describe('callFlags', () => {
       .toEqual(['failed']);
   });
 
-  it('идущая сессия не считается ни молчанием, ни коротким звонком', () => {
-    // Длительности до завершения нет, а расшифровку voice-host дописывает по
-    // ходу (VoiceCallService.progress) — пометки по ней врали бы.
+  it('идущая сессия не считается молчанием', () => {
+    // Расшифровку voice-host дописывает по ходу (VoiceCallService.progress),
+    // и «почти молчал» по недописанному разговору врало бы.
     expect(callFlags({ status: 'active', duration_sec: null, transcript: реплики(1) }))
       .toEqual(['live']);
     expect(callFlags({ status: 'dialing', duration_sec: null, transcript: null }))
