@@ -233,12 +233,21 @@ PREV=""
 # settled — итог принят (зелёный или уже откачен).
 STATE=fresh
 
+# Права — 644 явно: копия прежнего лежит в mktemp (600), и cp переносит их на
+# возвращённый конфиг — после первого же отката файл продукта остался бы 600.
 restore() {
   if [ -n "$PREV" ]; then
-    cp "$PREV" "$RB" && mv -f "$RB" "$CONF"
+    cp "$PREV" "$RB" && chmod 644 "$RB" && mv -f "$RB" "$CONF"
   else
     rm -f "$CONF"
   fi
+}
+
+# Куда смотреть, когда откат не удался. Прежний конфиг — единственная копия,
+# поэтому после этого сообщения PREV обнуляется и on_exit его не удаляет.
+unrestored() {
+  echo "product-vhost: прежний конфиг $S вернуть не удалось, он лежит в ${PREV:-(нового продукта — удалить $CONF)}" >&2
+  PREV=""
 }
 
 # Любой выход, кроме принятого итога, — прерывание (ошибка записи под set -e,
@@ -250,8 +259,7 @@ on_exit() {
   set +e
   if [ "$STATE" = installed ] && ! restore; then
     # Вернуть не вышло — единственную копию прежнего не выбрасываем.
-    echo "product-vhost: прежний конфиг $S вернуть не удалось, он лежит в ${PREV:-(нового продукта — удалить $CONF)}" >&2
-    PREV=""
+    unrestored
   fi
   rm -f "$NEW" "$RB"
   if [ -n "$PREV" ]; then rm -f "$PREV"; fi
@@ -322,6 +330,9 @@ CONF
     fi
   done
 } > "$NEW"
+# Права нового файла не зависят от маски того, кто вызвал: под umask 077
+# конфиг вышел бы 600, под 002 — 664.
+chmod 644 "$NEW"
 
 STATE=installed
 mv -f "$NEW" "$CONF"
@@ -333,9 +344,17 @@ if NGT=$("$NGINX" -t 2>&1); then
   $RELOAD
   echo "  vhost $S.$ZONE → $WHAT${DOMAINS:+ (+$DOMAINS)}"
 else
-  restore
+  # Не голый `restore`: под set -e его отказ завершил бы скрипт раньше, чем
+  # прозвучит причина nginx, — а чинить надо именно её.
+  RESTORE_FAILED=""
+  restore || RESTORE_FAILED=1
   STATE=settled
-  echo "product-vhost: новый конфиг $S не прошёл nginx -t машины — прежний возвращён, nginx не перечитан; причина:" >&2
+  if [ -z "$RESTORE_FAILED" ]; then
+    echo "product-vhost: новый конфиг $S не прошёл nginx -t машины — прежний возвращён, nginx не перечитан; причина:" >&2
+  else
+    echo "product-vhost: новый конфиг $S не прошёл nginx -t машины, и прежний вернуть не удалось — nginx не перечитан; причина:" >&2
+  fi
   printf '%s\n' "$NGT" | head -5 >&2
+  if [ -n "$RESTORE_FAILED" ]; then unrestored; fi
   exit 1
 fi

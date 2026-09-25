@@ -23,6 +23,10 @@ interface Sandbox {
   bucket: (size: number | null) => void;
   /** Подменить команду `nginx -t` (путь к исполняемому файлу). */
   nginx: (bin: string) => void;
+  /** Запускать скрипт под этой маской (строка для `umask`), null — как у jest. */
+  umask: (mask: string | null) => void;
+  /** Права файла конфига продукта (младшие девять бит). */
+  mode: (slug: string) => number;
 }
 
 // Песочницы убираются после каждого теста: иначе каждый прогон оставлял бы в
@@ -37,6 +41,7 @@ function sandbox(realNginx: boolean): Sandbox {
   roots.push(root);
   for (const d of ['conf', 'live', 'acme', 'share', 'snippets', 'tmp', 'shadow']) fs.mkdirSync(path.join(root, d));
   let nginxBin = 'true';
+  let umask: string | null = null;
   if (realNginx) {
     const gen = spawnSync('openssl', [
       'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=probe',
@@ -83,13 +88,18 @@ function sandbox(realNginx: boolean): Sandbox {
     PV_ASLEEP_DIR: path.join(root, 'share'),
     PV_NGINX: nginxBin,
     PV_RELOAD: 'true',
+    // mktemp скрипта (копия прежнего конфига) — внутрь песочницы: её убирает afterEach.
+    TMPDIR: path.join(root, 'tmp'),
   });
   return {
     root,
     bucket,
     nginx: (bin) => { nginxBin = bin; },
+    umask: (mask) => { umask = mask; },
+    mode: (slug) => fs.statSync(path.join(root, 'conf', `${slug}.conf`)).mode & 0o777,
     run: (...args) => {
-      const r = spawnSync('sh', [SCRIPT, ...args], { env: env(), encoding: 'utf8' });
+      const argv = umask === null ? [SCRIPT, ...args] : ['-c', `umask ${umask}; exec sh "$0" "$@"`, SCRIPT, ...args];
+      const r = spawnSync('sh', argv, { env: env(), encoding: 'utf8' });
       return { status: r.status, out: `${r.stdout}${r.stderr}` };
     },
     conf: (slug) => fs.readFileSync(path.join(root, 'conf', `${slug}.conf`), 'utf8'),
@@ -219,7 +229,7 @@ describe('product-vhost: разбор аргументов', () => {
     expect(s.confs()).toEqual([]);
   });
 
-    it('повтор имени — один блок, порядок прихода сохраняется', () => {
+  it('повтор имени — один блок, порядок прихода сохраняется', () => {
     const s = sandbox(false);
     expect(s.run('shop', '8001', '--domain', 'a.ru', '--domain', 'www.a.ru', '--domain', 'a.ru').status).toBe(0);
     const c = s.conf('shop');
@@ -374,5 +384,82 @@ describe('product-vhost: прерванная запись не оставляе
     expect(r.status).not.toBe(0);
     expect(s.conf('shop')).toBe(before);
     expect(s.confs()).toEqual(['shop.conf']);
+  });
+});
+
+/**
+ * Красный `nginx -t` с откатом, который сам не удался. Причину nginx отчёт
+ * обязан назвать и тогда: без неё владелец машины видит лишь «не вернули», а
+ * чинить надо то, из-за чего проверка покраснела. Откат ломается без root так:
+ * подставной `nginx -t` называет причину и делает каталог конфигов только для
+ * чтения — ни копия прежнего, ни удаление нового туда уже не ложатся.
+ */
+describe('product-vhost: откат не удался', () => {
+  const REASON = 'nginx: [emerg] причина-проба in /etc/nginx/sites-products/zz.conf:1';
+  const lockingNginx = (s: Sandbox) => {
+    const bin = path.join(s.root, 'nginx-lock');
+    fs.writeFileSync(bin, [
+      '#!/bin/sh',
+      `echo '${REASON}' >&2`,
+      `chmod 555 "${path.join(s.root, 'conf')}"`,
+      'exit 1',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    s.nginx(bin);
+  };
+  const unlock = (s: Sandbox) => fs.chmodSync(path.join(s.root, 'conf'), 0o755);
+
+  it('прежний продукт: в отчёте причина nginx и где лежит прежний конфиг, выход 1', () => {
+    const s = sandbox(false);
+    expect(s.run('shop', '8001')).toMatchObject({ status: 0 });
+    const before = s.conf('shop');
+    lockingNginx(s);
+    let r: { status: number | null; out: string };
+    try { r = s.run('shop', '8001', '--domain', 'a.ru'); } finally { unlock(s); }
+    expect(r.status).toBe(1);
+    expect(r.out).toContain(REASON);
+    const kept = /лежит в (\S+)/.exec(r.out);
+    expect(kept).not.toBeNull();
+    expect(fs.readFileSync(kept?.[1] ?? '', 'utf8')).toBe(before);
+  });
+
+  it('новый продукт: в отчёте причина nginx и какой файл удалить, выход 1', () => {
+    const s = sandbox(false);
+    lockingNginx(s);
+    let r: { status: number | null; out: string };
+    try { r = s.run('fresh', '8002', '--domain', 'a.ru'); } finally { unlock(s); }
+    expect(r.status).toBe(1);
+    expect(r.out).toContain(REASON);
+    expect(r.out).toContain(`удалить ${path.join(s.root, 'conf', 'fresh.conf')}`);
+  });
+});
+
+/**
+ * Права конфига — 644 при любой маске и после отката. Прежний файл
+ * возвращается из копии mktemp (600), и без явного chmod после первого же
+ * отката конфиг продукта оставался бы 600 навсегда.
+ */
+describe('product-vhost: права конфига', () => {
+  const failingNginx = (s: Sandbox) => {
+    const bin = path.join(s.root, 'nginx-red');
+    fs.writeFileSync(bin, "#!/bin/sh\necho 'nginx: [emerg] красный' >&2\nexit 1\n", { mode: 0o755 });
+    s.nginx(bin);
+  };
+
+  it('свежая запись под маской 077 — 644', () => {
+    const s = sandbox(false);
+    s.umask('077');
+    expect(s.run('shop', '8001')).toMatchObject({ status: 0 });
+    expect(s.mode('shop').toString(8)).toBe('644');
+  });
+
+  it('после красного nginx -t и отката — 644', () => {
+    const s = sandbox(false);
+    expect(s.run('shop', '8001')).toMatchObject({ status: 0 });
+    const before = s.conf('shop');
+    failingNginx(s);
+    expect(s.run('shop', '8001', '--domain', 'a.ru').status).toBe(1);
+    expect(s.conf('shop')).toBe(before);
+    expect(s.mode('shop').toString(8)).toBe('644');
   });
 });
