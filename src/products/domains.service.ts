@@ -1,8 +1,7 @@
 import { HttpException, HttpStatus, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import * as crypto from 'crypto';
-import { domainToUnicode } from 'url';
 import { PgService } from '../common/services/pg.service';
-import { DomainRefusal, normalizeDomain, registrableZone, relativeName } from './domain-name';
+import { DomainRefusal, normalizeDomain, readableDomain, registrableZone, relativeName } from './domain-name';
 import { checkDns, DnsResolver, probeResolver, publicResolver, RecordCheck, TXT_LABEL } from './domain-dns';
 
 export type DomainStatus = 'awaiting_dns' | 'issuing' | 'active' | 'failed' | 'removing';
@@ -217,9 +216,6 @@ export const ORPHAN_ISSUING =
 export const ORPHAN_REMOVING =
   'Отвязка прервана: задание снято (продукт остановлен или машина не ответила вовремя). Отвяжите домен ещё раз.';
 
-/** Домен в тексте для человека: `пример.рф`, а не `xn--e1afmkfd.xn--p1ai`. */
-const readable = (domain: string) => domainToUnicode(domain) || domain;
-
 /**
  * Оператор с постановкой задания откатился ЦЕЛИКОМ, потому что у продукта в
  * тот же миг встало другое задание. Два пути:
@@ -389,7 +385,7 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
   private view(row: DomainRow, p: OwnedProduct): DomainView {
     return {
       domain: row.domain,
-      domainUnicode: readable(row.domain),
+      domainUnicode: readableDomain(row.domain),
       names: row.names,
       status: row.status,
       error: row.error,
@@ -475,7 +471,7 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
       throw refusal(
         HttpStatus.CONFLICT,
         'has_domain',
-        `У продукта уже есть свой домен ${readable(existing.domain)} — сначала отвяжите его.`,
+        `У продукта уже есть свой домен ${readableDomain(existing.domain)} — сначала отвяжите его.`,
       );
     }
     return this.view(existing, p);

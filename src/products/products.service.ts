@@ -2,7 +2,7 @@ import { Injectable, Logger, NotFoundException, OnModuleInit } from '@nestjs/com
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import { domainToUnicode } from 'url';
+import { readableDomain } from './domain-name';
 import { PgService } from '../common/services/pg.service';
 
 export interface ProductRow {
@@ -221,10 +221,11 @@ export class ProductsService implements OnModuleInit {
    * сравнения. custom_domain_unicode — та же форма для глаз человека
    * (`пример.рф`): считается здесь, в JS, а не в SQL — в Postgres нет
    * IDN-функций (см. runMigration про pgcrypto/citext на проде), а браузер
-   * сам punycode в юникод не переводит.
+   * сам punycode в юникод не переводит. Перевод — readableDomain, тот же,
+   * что в текстах сервиса доменов: битый punycode даёт ASCII, а не ''.
    */
   private withDomainUnicode(row: ProductRow): ProductRow {
-    return { ...row, custom_domain_unicode: row.custom_domain ? domainToUnicode(row.custom_domain) : null };
+    return { ...row, custom_domain_unicode: row.custom_domain ? readableDomain(row.custom_domain) : null };
   }
 
   async list(userId: string): Promise<ProductRow[]> {

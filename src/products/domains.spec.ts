@@ -1673,12 +1673,46 @@ maybe('свой домен: сервис против живого Postgres', ()
   describe('список продуктов кабинета', () => {
     it('отдаёт работающий свой домен и только работающий', async () => {
       const live = await mkProduct({ slug: 'live' });
-      const wait = await mkProduct({ slug: 'wait' });
       await putDomain(live, 'active', { domain: 'live.ru' });
-      await putDomain(wait, 'awaiting_dns', { domain: 'wait.ru' });
+      // Каждое НЕработающее состояние — своим продуктом и своим доменом:
+      // issuing и removing держат индекс занятых. failed — с парой «текст —
+      // код», как его оставляет отказ.
+      const others: Record<string, { status: string; extra?: { error: string } }> = {
+        wait: { status: 'awaiting_dns' },
+        issue: { status: 'issuing' },
+        fail: { status: 'failed', extra: { error: 'LE отказал' } },
+        drop: { status: 'removing' },
+      };
+      for (const [slug, o] of Object.entries(others)) {
+        const id = await mkProduct({ slug });
+        await putDomain(id, o.status, { domain: `${slug}.ru`, ...(o.extra ?? {}) });
+      }
       const rows = await new ProductsService(pg as any).list(OWNER);
-      const by = Object.fromEntries(rows.map((r: any) => [r.slug, r.custom_domain]));
-      expect(by).toEqual({ live: 'live.ru', wait: null });
+      const by = Object.fromEntries(rows.map((r: any) => [r.slug, [r.custom_domain, r.custom_domain_unicode]]));
+      expect(by).toEqual({
+        live: ['live.ru', 'live.ru'], wait: [null, null], issue: [null, null], fail: [null, null], drop: [null, null],
+      });
+    });
+
+    // Карточка продукта (getOwned) — та же выборка, что и список: читаемая
+    // форма обязана приезжать и в неё, иначе карточка покажет punycode.
+    it('карточка продукта (getOwned) тоже отдаёт читаемую форму', async () => {
+      const id = await mkProduct({ slug: 'card' });
+      await putDomain(id, 'active', { domain: 'xn--e1afmkfd.xn--p1ai' });
+      await expect(new ProductsService(pg as any).getOwned(id, OWNER)).resolves.toMatchObject({
+        custom_domain: 'xn--e1afmkfd.xn--p1ai', custom_domain_unicode: 'пример.рф',
+      });
+    });
+
+    // Битый punycode форму 008 проходит (это ASCII), а domainToUnicode на нём
+    // отдаёт пустую строку. Пустая строка в custom_domain_unicode — это
+    // карточка без адреса; вместо неё — ASCII, как в тексте ответов сервиса.
+    it('битый punycode — читаемая форма падает обратно на ASCII, а не в пустую строку', async () => {
+      const id = await mkProduct({ slug: 'broken' });
+      await putDomain(id, 'active', { domain: 'xn--zz.ru' });
+      const products = new ProductsService(pg as any);
+      expect((await products.list(OWNER))[0]).toMatchObject({ custom_domain: 'xn--zz.ru', custom_domain_unicode: 'xn--zz.ru' });
+      expect(await products.getOwned(id, OWNER)).toMatchObject({ custom_domain_unicode: 'xn--zz.ru' });
     });
 
     // Кабинет показывает кириллический домен читаемым (`пример.рф`), а не

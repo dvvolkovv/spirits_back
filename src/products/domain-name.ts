@@ -191,6 +191,18 @@ export function registrableZone(domain: string): string {
   return parse(domain, { allowPrivateDomains: true }).domain ?? domain;
 }
 
+/**
+ * Домен для глаз человека: `пример.рф`, а не `xn--e1afmkfd.xn--p1ai`. ОДНА
+ * функция на все показы — тексты DomainsService и custom_domain_unicode в
+ * выборке продуктов: две копии уже расходились (одна падала на ASCII, другая
+ * отдавала пустую строку). Битый punycode (`xn--zz.ru`) форму 008 проходит —
+ * это ASCII, — а domainToUnicode на нём отдаёт '', поэтому запасной ответ —
+ * сам ASCII: пустая строка в карточке — это продукт без адреса.
+ */
+export function readableDomain(domain: string): string {
+  return domainToUnicode(domain) || domain;
+}
+
 /** Имя записи так, как его вводят в панели регистратора: относительно зоны. */
 export function relativeName(fqdn: string, zone: string): string {
   if (fqdn === zone) return '@';

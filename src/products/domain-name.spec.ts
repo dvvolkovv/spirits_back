@@ -1,4 +1,12 @@
-import { MAX_INPUT_LENGTH, MAX_LABELS, MAX_NAME_LENGTH, normalizeDomain, registrableZone, relativeName } from './domain-name';
+import {
+  MAX_INPUT_LENGTH,
+  MAX_LABELS,
+  MAX_NAME_LENGTH,
+  normalizeDomain,
+  readableDomain,
+  registrableZone,
+  relativeName,
+} from './domain-name';
 
 // strictNullChecks выключен в tsconfig.json (build-конфиг его наследует) —
 // на !r.ok TS не сужает union NormalizeResult (r.reason/r.say/r.domain дальше
@@ -294,5 +302,22 @@ describe('контракт: любой ok-результат — валидна�
     expect(ok('www.shop.example.com')).toMatchObject({
       domain: 'www.shop.example.com', apex: false, names: ['www.shop.example.com'],
     });
+  });
+});
+
+// Одна функция на все места, где домен показывают человеку (тексты сервиса
+// доменов и custom_domain_unicode в выборке продуктов): две копии уже
+// разошлись однажды — одна падала на ASCII, другая отдавала пустую строку.
+describe('читаемая форма домена', () => {
+  it('punycode — в юникод', () => {
+    expect(readableDomain('xn--e1afmkfd.xn--p1ai')).toBe('пример.рф');
+  });
+
+  it('латинский — как есть', () => {
+    expect(readableDomain('a.ru')).toBe('a.ru');
+  });
+
+  it('битый punycode — ASCII, а не пустая строка', () => {
+    expect(readableDomain('xn--zz.ru')).toBe('xn--zz.ru');
   });
 });
