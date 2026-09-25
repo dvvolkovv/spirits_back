@@ -2,7 +2,7 @@ import { HttpException, Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
 import { TurnsService, SLEEPING_REFUSAL, BLOCKED_REFUSAL } from './turns.service';
-import { DomainErrorReason, DomainRecordToSet, DomainStatus, DomainsService, DomainView } from './domains.service';
+import { DomainErrorReason, DomainRecordToSet, DomainRefusalCode, DomainStatus, DomainsService, DomainView } from './domains.service';
 import { normalizeDomain, readableDomain } from './domain-name';
 
 /** Продукт глазами ассистента: без внутренностей, только то, что можно назвать вслух. */
@@ -155,11 +155,23 @@ export const DOMAIN_FAILED_SAY: Record<DomainErrorReason, string> = {
  * Здесь замена на путь инструмента. Тест разбирает исходник сервиса и
  * требует замену для каждого отказа с формулировкой кабинета.
  */
-export const DOMAIN_REFUSAL_SAY: Record<string, string> = {
+export const DOMAIN_REFUSAL_SAY: Partial<Record<DomainRefusalCode, string>> = {
   detach_pending: 'Прошлая отвязка не завершилась — отвяжи ещё раз (remove: true), проверять не нужно.',
   changed:
     'Состояние домена только что изменилось — запроси его заново (action="domain" без флагов) и действуй по нему.',
 };
+
+/**
+ * Замена для чата по reason из тела отказа — только среди СВОИХ ключей:
+ * `DOMAIN_REFUSAL_SAY['constructor']` без этой проверки достал бы из
+ * прототипа функцию, и в say уехала бы она вместо текста. Object.hasOwn — из
+ * ES2022, а сборка на ES2021.
+ */
+function refusalSay(reason: string): string | undefined {
+  return Object.prototype.hasOwnProperty.call(DOMAIN_REFUSAL_SAY, reason)
+    ? DOMAIN_REFUSAL_SAY[reason as DomainRefusalCode]
+    : undefined;
+}
 
 /** Флаг инструмента: true или строка 'true' — модели присылают и так. */
 const flag = (v: unknown) => v === true || v === 'true';
@@ -458,7 +470,15 @@ export class ProductToolService {
           say: removed === 'now' ? 'Домен отвязан.' : 'Отвязка поставлена — займёт до минуты.' };
       }
       let view: DomainView | null;
-      if (flag(input?.check)) view = await this.checkOrAttach(userId, product.id, raw);
+      if (flag(input?.check)) {
+        const other = raw ? await this.otherDomain(userId, product.id, raw) : null;
+        if (other) {
+          return { ok: false, reason: 'has_domain', product,
+            say: `У продукта уже есть свой домен ${other} — проверять названный не буду. Если нужен другой, ` +
+              `сначала отвяжи ${other} (remove: true), потом привяжи новый.` };
+        }
+        view = await this.checkOrAttach(userId, product.id, raw);
+      }
       else if (raw) view = await this.domains.attach(userId, product.id, raw);
       else view = await this.domains.get(userId, product.id);
       return { ok: true, product, domain: view ? domainForAssistant(view) : null, say: domainSay(view) };
@@ -470,9 +490,28 @@ export class ProductToolService {
         ok: false,
         reason,
         product,
-        say: DOMAIN_REFUSAL_SAY[reason] ?? (typeof body?.message === 'string' ? body.message : e.message),
+        say: refusalSay(reason) ?? (typeof body?.message === 'string' ? body.message : e.message),
       };
     }
+  }
+
+  /**
+   * check с доменом при заявке на ДРУГОЙ домен: проверить молча заявку значило
+   * бы пересказать состояние чужого имени как ответ про названное. Возвращает
+   * читаемую форму имени заявки, если названное с ним расходится; иначе null.
+   *
+   * Сравнение — после normalizeDomain: «DmitryVolkov.RU » и dmitryvolkov.ru —
+   * одно имя. Не прошедшее нормализацию имя здесь не судится (null): без
+   * заявки его отобьёт привязка, при заявке проверяется она, как и раньше.
+   * Отвязывающуюся заявку пропускаем — «сначала отвяжи» было бы неправдой, а
+   * отказ removing скажет сама проверка.
+   */
+  private async otherDomain(userId: string, productId: string, raw: string): Promise<string | null> {
+    const n = normalizeDomain(raw);
+    if (n.ok === false) return null;
+    const existing = await this.domains.get(userId, productId);
+    if (!existing || existing.status === 'removing' || existing.domain === n.domain) return null;
+    return existing.domainUnicode;
   }
 
   private async checkOrAttach(userId: string, productId: string, raw: string): Promise<DomainView> {

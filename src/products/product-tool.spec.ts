@@ -710,6 +710,31 @@ maybe('инструмент продуктов против живого Postgre
       expect(await checkedAt(id)).not.toBeNull();
     });
 
+    // Проверка с доменом, отличным от заявки, молча проверяла бы заявку: ассистент
+    // пересказал бы состояние чужого имени как ответ про названное.
+    it('check с другим доменом при живой заявке — has_domain с именем заявки, ничего не проверено', async () => {
+      const id = await site();
+      await pool.query(
+        `INSERT INTO product_domains (product_id, domain, names, token, status)
+         VALUES ($1, 'xn--d1acufc.xn--p1ai', '{xn--d1acufc.xn--p1ai,www.xn--d1acufc.xn--p1ai}', 'lk-x', 'awaiting_dns')`,
+        [id],
+      );
+      const out: any = await tool().execute(OWNER, { action: 'domain', product: 'мой сайт', domain: 'other.ru', check: true });
+      expect(out).toMatchObject({ ok: false, reason: 'has_domain' });
+      expect(out.say).toMatch(/домен\.рф/);
+      expect(out.say).toMatch(/remove: true/);
+      expect(out.say).not.toMatch(/нажмите|страниц|кнопк/i);
+      expect(await checkedAt(id)).toBeNull();
+    });
+
+    it('check с тем же доменом в другом написании — проверяет заявку', async () => {
+      const id = await site();
+      await putDomain(id, 'awaiting_dns');
+      const out: any = await tool().execute(OWNER, { action: 'domain', product: 'мой сайт', domain: ' DmitryVolkov.RU ', check: true });
+      expect(out.ok).toBe(true);
+      expect(await checkedAt(id)).not.toBeNull();
+    });
+
     it("флаги строкой 'true' — как true", async () => {
       const id = await site();
       await putDomain(id, 'awaiting_dns');

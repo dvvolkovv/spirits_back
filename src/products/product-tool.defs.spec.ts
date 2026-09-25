@@ -172,8 +172,10 @@ describe('отказы сервиса доменов в чате', () => {
     for (const m of src.matchAll(/(?:export )?const ([A-Z_]+) =\s*'([^']*)'/g)) consts[m[1]] = m[2];
     const uiReasons = new Set<string>();
     let seen = 0;
-    for (const m of src.matchAll(/refusal\(HttpStatus\.\w+,\s*'(\w+)',\s*('([^']*)'|[A-Z_]+)\)/g)) {
-      const text = m[3] ?? consts[m[2]];
+    // Текст — строкой, шаблонной строкой (has_domain подставляет имя) или
+    // константой; вызов бывает и многострочным, с запятой после текста.
+    for (const m of src.matchAll(/refusal\(\s*HttpStatus\.\w+,\s*'(\w+)',\s*('([^']*)'|`([^`]*)`|[A-Z_]+),?\s*\)/g)) {
+      const text = m[3] ?? m[4] ?? consts[m[2]];
       if (text === undefined) continue;
       seen++;
       if (UI.test(text)) uiReasons.add(m[1]);
@@ -181,8 +183,24 @@ describe('отказы сервиса доменов в чате', () => {
     expect(seen).toBeGreaterThan(10); // разбор не отвалился молча
     expect([...uiReasons].sort()).toEqual(expect.arrayContaining(['changed', 'detach_pending']));
     for (const r of uiReasons) {
-      expect(DOMAIN_REFUSAL_SAY[r]).toBeTruthy();
-      expect(DOMAIN_REFUSAL_SAY[r]).not.toMatch(UI);
+      const say = (DOMAIN_REFUSAL_SAY as Record<string, string>)[r];
+      expect(say).toBeTruthy();
+      expect(say).not.toMatch(UI);
+    }
+  });
+
+  // Замены ищутся только среди своих ключей: reason приходит из тела отказа,
+  // и 'constructor' иначе достал бы из прототипа функцию вместо текста.
+  it('reason из прототипа объекта — текст сервиса, а не находка в прототипе', async () => {
+    const pg = { query: async () => ({ rows: [{ id: 'p1', name: 'Сайт', slug: 's', domain: null, kind: 'site', status: 'running' }] }) };
+    for (const reason of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+      const domains: any = {
+        get: async () => {
+          throw new HttpException({ statusCode: 409, message: 'Текст сервиса.', reason }, 409);
+        },
+      };
+      const out: any = await new ProductToolService(pg as any, {} as any, domains).execute('u', { action: 'domain', product: 'сайт' });
+      expect({ reason, say: out.say }).toEqual({ reason, say: 'Текст сервиса.' });
     }
   });
 
