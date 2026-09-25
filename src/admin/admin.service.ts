@@ -1592,7 +1592,7 @@ export class AdminService implements OnModuleInit {
    *
    * Площадка сужает любую вкладку: kind=call вместе с provider=zoom честно
    * даёт пустой набор. Разбивка по площадкам строится тем же условием без
-   * площади — callsWhere({ ...f, provider: null }): выбранная площадка не
+   * площадки — callsWhere({ ...f, provider: null }): выбранная площадка не
    * должна прятать остальные кнопки, иначе к ним не вернуться.
    */
   private static callsWhere(f: CallsFilter): { where: string; params: any[] } {
