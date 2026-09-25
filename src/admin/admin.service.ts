@@ -1555,9 +1555,11 @@ export class AdminService implements OnModuleInit {
   /**
    * Образец идентификатора площадки. В SQL площадка и так уходит параметром;
    * образец нужен, чтобы в ответ не вернулась произвольная строка, выданная
-   * за выбранную площадку.
+   * за выбранную площадку. Шире, чем нынешние id: кнопки площадок строятся
+   * по данным, и id, не прошедший образец, выглядел бы выбранным, ничего не
+   * фильтруя.
    */
-  private static readonly PROVIDER_RE = /^[a-z0-9_]{1,32}$/;
+  private static readonly PROVIDER_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 
   /**
    * Фильтры раздела «Звонки» из query-параметров.
@@ -1573,7 +1575,7 @@ export class AdminService implements OnModuleInit {
         ? opts.provider
         : null;
     return {
-      days: Math.min(Math.max(opts.days ?? 30, 1), 365),
+      days: Math.min(Math.max(Number.isFinite(opts.days) ? (opts.days as number) : 30, 1), 365),
       kind,
       provider,
       includeTest: !!opts.includeTest,
@@ -1588,15 +1590,17 @@ export class AdminService implements OnModuleInit {
    * Встречи — «всё, кроме звонка из приложения», а не перечень площадок:
    * новая площадка попадёт во встречи без правки этого места.
    *
-   * withProvider=false — для разбивки по площадкам: выбранная площадка не
+   * Площадка сужает любую вкладку: kind=call вместе с provider=zoom честно
+   * даёт пустой набор. Разбивка по площадкам строится тем же условием без
+   * площади — callsWhere({ ...f, provider: null }): выбранная площадка не
    * должна прятать остальные кнопки, иначе к ним не вернуться.
    */
-  private static callsWhere(f: CallsFilter, withProvider = true): { where: string; params: any[] } {
+  private static callsWhere(f: CallsFilter): { where: string; params: any[] } {
     const params: any[] = [f.days];
     const parts = [`c.started_at >= now() - $1 * interval '1 day'`];
     if (f.kind === 'call') parts.push(`c.provider = '${AdminService.CALL_PROVIDER}'`);
     if (f.kind === 'meeting') parts.push(`c.provider <> '${AdminService.CALL_PROVIDER}'`);
-    if (withProvider && f.provider) {
+    if (f.provider) {
       params.push(f.provider);
       parts.push(`c.provider = $${params.length}`);
     }
@@ -1670,7 +1674,7 @@ export class AdminService implements OnModuleInit {
 
     // Сессии по площадкам — для кнопок фильтра на «Встречах». Считаются без
     // условия по выбранной площадке: иначе остальные кнопки пропали бы.
-    const byProv = AdminService.callsWhere(f, false);
+    const byProv = AdminService.callsWhere({ ...f, provider: null });
     const byProviderRes = await this.pg.query(
       `SELECT c.provider, COUNT(*)::int AS sessions
          FROM voice_calls c

@@ -124,7 +124,7 @@ describe('AdminService.getCallsByUser', () => {
     const res = await service(pg).getCallsByUser({ kind: 'all' });
 
     expect(res.kind).toBe('all');
-    expect(pg.sql()).not.toMatch(/c\.provider =/);
+    expect(pg.sql()).not.toMatch(/c\.provider (=|<>)/);
   });
 
   it('консультации берутся только по звонкам той же выборки', async () => {
@@ -198,6 +198,22 @@ describe('AdminService.getCallsByUser', () => {
       { provider: 'talerid', sessions: 43 },
       { provider: 'zoom', sessions: 2 },
     ]);
+  });
+
+  it('таблица, итоги и разбивка считаются по одному условию', async () => {
+    // Разъехавшись, они дали бы сумму строк, не сходящуюся с итогом, и
+    // кнопки площадок с числами, которых нет в таблице.
+    const whereOf = (sql: string) =>
+      sql.match(/FROM voice_calls c WHERE (.*?)(?: GROUP BY .*)?$/)?.[1];
+    const pg = makePg([ROW], TOTALS);
+    await service(pg).getCallsByUser({ kind: 'meeting', provider: 'zoom' });
+    const q = (re: RegExp) => pg.calls.find(([s]: [string]) => re.test(s));
+    const [rows, totals, byProv] = [q(ROWS_Q), q(TOTALS_Q), q(BY_PROVIDER_Q)];
+
+    expect(whereOf(rows[0])).toMatch(/c\.user_id <> ALL/);
+    expect(whereOf(totals[0])).toBe(whereOf(rows[0]));
+    expect(totals[1]).toEqual(rows[1]);
+    expect(whereOf(byProv[0])).toBe(whereOf(rows[0])!.replace(' AND c.provider = $2', ''));
   });
 
   it('период ограничен сверху и снизу', async () => {
