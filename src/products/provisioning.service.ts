@@ -822,12 +822,18 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
               -- бы первый блок с этим server_name.
               , COALESCE((SELECT d.names FROM product_domains d
                            WHERE d.product_id = p.id
-                             AND (d.status = 'active'
-                                  OR (d.status = 'issuing'
-                                      AND (c.kind = 'domain'
-                                           OR EXISTS (SELECT 1 FROM product_provision_jobs dj
-                                                       WHERE dj.product_id = p.id AND dj.kind = 'domain'
-                                                         AND dj.status IN ('queued','running')))))), '{}') AS custom_names
+                             -- CASE, а не дизъюнкция: её в этом запросе нет
+                             -- нигде (сторож — «очередь читается ТОЛЬКО по queued»).
+                             AND CASE d.status
+                                   WHEN 'active' THEN true
+                                   WHEN 'issuing' THEN
+                                     CASE WHEN c.kind = 'domain' THEN true
+                                          ELSE EXISTS (SELECT 1 FROM product_provision_jobs dj
+                                                        WHERE dj.product_id = p.id AND dj.kind = 'domain'
+                                                          AND dj.status IN ('queued','running'))
+                                     END
+                                   ELSE false
+                                 END), '{}') AS custom_names
               , CASE WHEN p.status = 'blocked' THEN 'asleep'
                      WHEN p.status = 'sleeping' AND NOT ${wokenSql('p.id')} THEN 'asleep'
                      ELSE 'proxy' END AS vhost_mode
