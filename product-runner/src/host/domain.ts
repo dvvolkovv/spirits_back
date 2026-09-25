@@ -45,7 +45,7 @@
  */
 import { DEFAULTS, ProvisionDeps, SLUG_RE } from './provision';
 import { ProductKind } from './skeleton';
-import { vhostArgv } from './vhost';
+import { uniqueNames, vhostArgv } from './vhost';
 
 /** Общий webroot ACME-вызовов на машине продуктов. Тот же путь — в product-vhost. */
 export const ACME_WEBROOT = '/var/www/linkeon-acme';
@@ -140,10 +140,10 @@ export async function applyDomain(job: DomainJob, deps: ProvisionDeps): Promise<
   if (job.kind !== 'site') {
     throw new Error(`свой домен бывает только у сайта, а форма продукта ${JSON.stringify(job.kind)}`);
   }
-  // Повторы — вон, порядок — как прислал сервер: повтор в `server_name`
-  // nginx прощает предупреждением, а в `-d` certbot — нет, и лишняя пара в
-  // argv только съедает голову причины.
-  const names = [...new Set(Array.isArray(job.customNames) ? job.customNames : [])];
+  // Повторы — вон, порядок — как прислал сервер: vhostArgv их убирает и сам,
+  // но этот же список уходит в `-d` certbot, а там повтор — отказ, и лишняя
+  // пара в argv только съедает голову причины.
+  const names = uniqueNames(Array.isArray(job.customNames) ? job.customNames : []);
 
   let target: number | '--asleep';
   if (job.vhostMode === 'asleep') {

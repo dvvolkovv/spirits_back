@@ -28,15 +28,25 @@ export function assertDomainName(name: string): void {
 }
 
 /**
+ * Имена без повторов, порядок — первого появления. Одно место на агента:
+ * повтор в `server_name` nginx прощает предупреждением, в `-d` certbot — нет.
+ * vhostArgv зовёт её сам; задание domain — ещё и для строки certbot.
+ */
+export function uniqueNames(names: string[]): string[] {
+  return [...new Set(names)];
+}
+
+/**
  * argv вызова product-vhost: `<bin> <slug> <порт|--asleep> [--domain <имя>]…`.
  *
  * Имена проверяются ВСЕ до возврата: один мусорный элемент — отказ всей
  * строки, а не пропуск имени. Пропуск молча выпустил бы конфиг без домена с
- * тем же зелёным отчётом.
+ * тем же зелёным отчётом. Повторы уходят здесь же (uniqueNames) — для всех
+ * мест вызова сразу, а не только для задания domain.
  */
 export function vhostArgv(bin: string, slug: string, target: number | '--asleep', names: string[] = []): string[] {
   const argv = [bin, slug, String(target)];
-  for (const name of names) {
+  for (const name of uniqueNames(names)) {
     assertDomainName(name);
     argv.push('--domain', name);
   }
