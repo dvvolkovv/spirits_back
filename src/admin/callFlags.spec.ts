@@ -57,4 +57,27 @@ describe('callFlags', () => {
     expect(callFlags({ status: 'completed', duration_sec: 5, transcript: [] }).sort())
       .toEqual(['short', 'silent']);
   });
+
+  it('сорвавшаяся встреча — «сбой», а не «человек молчал»', () => {
+    // Бот не вошёл во встречу: реплик и длительности нет. Причина лежит в
+    // саммари («Звонок не состоялся: …»), а «молчал» увело бы разбор не туда.
+    expect(callFlags({ status: 'failed', duration_sec: null, transcript: null }))
+      .toEqual(['failed']);
+  });
+
+  it('обрыв посреди разговора — тоже только «сбой»', () => {
+    // Стенд, 22.09.2026: звук Телемоста оборвался на 161-й секунде после
+    // восьми реплик. Строка без пометок выдала бы его за нормальный разговор.
+    expect(callFlags({ status: 'failed', duration_sec: 161, transcript: реплики(8) }))
+      .toEqual(['failed']);
+  });
+
+  it('идущая сессия не считается ни молчанием, ни коротким звонком', () => {
+    // Длительности до завершения нет, а расшифровку voice-host дописывает по
+    // ходу (VoiceCallService.progress) — пометки по ней врали бы.
+    expect(callFlags({ status: 'active', duration_sec: null, transcript: реплики(1) }))
+      .toEqual(['live']);
+    expect(callFlags({ status: 'dialing', duration_sec: null, transcript: null }))
+      .toEqual(['live']);
+  });
 });
