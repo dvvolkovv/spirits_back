@@ -1481,7 +1481,14 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       `WITH stale AS (
          UPDATE product_provision_jobs
             SET status = 'failed',
-                error = 'срок заведения истёк (${PROVISION_DEADLINE_MIN} мин)',
+                -- Причина — по виду задания: сборщик снимает задания любого
+                -- вида, а «срок заведения» у задания своего домена (выпуск или
+                -- отвязка) — неправда, заведения там не было. Остальные виды
+                -- сохраняют прежний текст.
+                error = CASE kind
+                          WHEN 'domain' THEN 'срок задания своего домена истёк (${PROVISION_DEADLINE_MIN} мин)'
+                          ELSE 'срок заведения истёк (${PROVISION_DEADLINE_MIN} мин)'
+                        END,
                 finished_at = now()
           WHERE status IN ('queued','running')
             AND COALESCE(started_at, created_at) < now() - ${DEADLINE_SQL}

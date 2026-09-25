@@ -395,6 +395,21 @@ maybe('задание domain: выдача агенту и приём отчёт
     expect((await jobRow(jobId)).error).toBe(exact);
   });
 
+  // Сборщик зависших снимает задание ЛЮБОГО вида и пишет в него причину.
+  // «Срок заведения» у задания своего домена — неправда: заведения не было.
+  it('сборщик зависших пишет заданию domain свою причину, а не «срок заведения»', async () => {
+    const id = await mkProduct('shop');
+    await domain(id, 'issuing');
+    const jobId = await job(id, 'domain', 'running', '11 minutes');
+    await pool.query(`UPDATE product_provision_jobs SET started_at = created_at WHERE id = $1`, [jobId]);
+    await prov.failStaleProvisioning();
+    const j = await jobRow(jobId);
+    expect(j.status).toBe('failed');
+    expect(j.error).toBe('срок задания своего домена истёк (10 мин)');
+    // Продукт работает — сборщик его не трогает.
+    expect(await productRow()).toEqual({ status: 'running', provision_error: null });
+  });
+
   // Живой дефект, который сторожит этот тест: «последнее задание» видело бы
   // domain вместо пробуждения, и проснувшийся продукт навсегда оставался бы
   // «спящим» с работающим контейнером.
