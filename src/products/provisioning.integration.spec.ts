@@ -504,6 +504,11 @@ maybe('провижининг против живого Postgres', () => {
       port: null,
       runnerToken: expect.stringMatching(/^[0-9a-f]{64}$/),
       secrets: { BOT_TOKEN: '123:abc' },
+      // Расширение контракта (свой домен): имена приезжают в каждом задании —
+      // у продукта без своего домена пустым списком; режим у заводящегося —
+      // прокси. Поведение обоих полей — в domains.jobs.spec.ts.
+      customNames: [],
+      vhostMode: 'proxy',
     });
     expect(Buffer.isBuffer((await getProduct(p.id)).secrets_encrypted)).toBe(true);
 
@@ -1455,6 +1460,15 @@ maybe('провижининг против живого Postgres', () => {
         // владельцу больше негде.
         'block_reason',
         'created_at',
+        // Свой домен (миграция 008, Task 8): custom_domain — подзапрос к
+        // product_domains в COLUMNS, только для статуса active;
+        // custom_domain_unicode — читаемая форма для кириллических доменов,
+        // считана в JS поверх него (ProductsService.withDomainUnicode). Оба
+        // ключа присутствуют в объекте всегда, даже когда своего домена нет
+        // (значение — null), поэтому оба перечислены здесь, а не только в
+        // положительном сценарии.
+        'custom_domain',
+        'custom_domain_unicode',
         'domain',
         'id',
         'kind',

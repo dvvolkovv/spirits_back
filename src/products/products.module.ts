@@ -16,6 +16,7 @@ import { LimitsService } from './limits.service';
 import { RentService } from './rent.service';
 import { BlockService } from './block.service';
 import { ProductToolService } from './product-tool.service';
+import { DomainsService } from './domains.service';
 
 @Module({
   imports: [CommonModule, MiscModule],
@@ -57,7 +58,14 @@ import { ProductToolService } from './product-tool.service';
     // Инструмент ассистента. Экспортируется наружу: его зовёт точка
     // /webhook/mcp/products, живущая в McpModule.
     ProductToolService,
+    // Свой домен продукта (миграция 008) — привязка, отвязка, проверка DNS и
+    // фоновые обороты (ждущие заявки, сверка сирот). Без регистрации здесь
+    // ProductsController не поднимается вовсе: DomainsService — его
+    // конструкторская зависимость (Task 7), а Nest не запускает контроллер с
+    // незарегистрированным провайдером — падение старта ГРОМКОЕ, по тому же
+    // принципу, что и у HostsService/LimitsService/BlockService выше.
+    DomainsService,
   ],
-  exports: [ProductsService, TurnsService, ProvisioningService, RentService, ProductToolService],
+  exports: [ProductsService, TurnsService, ProvisioningService, RentService, ProductToolService, DomainsService],
 })
 export class ProductsModule {}

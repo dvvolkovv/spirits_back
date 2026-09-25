@@ -5,6 +5,10 @@ import { LimitsService } from './limits.service';
 import { ProvisioningService } from './provisioning.service';
 import { SecretsService } from './secrets.service';
 import { ProductsModule } from './products.module';
+import { ConfigService } from '@nestjs/config';
+import { PgService } from '../common/services/pg.service';
+import { DomainsService } from './domains.service';
+import { ProductsController } from './products.controller';
 
 /**
  * Реестр машин. Отдаёт РАЗНЫЕ машины разным аудиториям и разные значения в
@@ -724,5 +728,41 @@ describe('регистрация в ProductsModule', () => {
     // роняет подъём всего модуля — то есть API не стартует. Громко, но найти
     // это проще по тесту, чем по строке Nest в логе pm2.
     expect(providers).toContain(LimitsService);
+  });
+
+  it('DomainsService объявлен провайдером и экспортируется', () => {
+    // Конструкторская зависимость ProductsController: без неё в списке не
+    // поднимается контроллер, то есть весь API. Экспорт — для инструмента
+    // ассистента, живущего в другом модуле.
+    expect(providers).toContain(DomainsService);
+    expect(Reflect.getMetadata('exports', ProductsModule) ?? []).toContain(DomainsService);
+  });
+
+  // Сборка DI без Nest: @nestjs/testing в зависимостях нет, а поднимать
+  // настоящий модуль значило бы подключаться к Redis и Postgres. Вместо этого
+  // — то же правило, по которому Nest резолвит конструктор: каждая
+  // зависимость каждого провайдера и контроллера модуля обязана быть его
+  // провайдером, экспортом импортированного модуля или глобальным
+  // ConfigService (ConfigModule.forRoot({ isGlobal: true }) в AppModule).
+  // Забытая регистрация здесь краснеет именем класса, а не падением pm2 на проде.
+  it('каждая конструкторская зависимость модуля резолвится', () => {
+    const imported = ((Reflect.getMetadata('imports', ProductsModule) ?? []) as any[]).flatMap(
+      (m) => (Reflect.getMetadata('exports', m) ?? []) as any[],
+    );
+    const known = new Set<any>([...providers, ...imported, ConfigService]);
+    const controllers = (Reflect.getMetadata('controllers', ProductsModule) ?? []) as any[];
+    const unresolved: string[] = [];
+    for (const cls of [...providers, ...controllers]) {
+      const deps = (Reflect.getMetadata('design:paramtypes', cls) ?? []) as any[];
+      for (const [i, dep] of deps.entries()) {
+        // undefined — тип, стёртый при компиляции (интерфейс, `import type`):
+        // Nest его тоже не резолвит, и это такая же поломка.
+        if (!known.has(dep)) unresolved.push(`${cls.name}[${i}] → ${dep?.name ?? String(dep)}`);
+      }
+    }
+    expect(unresolved).toEqual([]);
+    // Проверка не пустышка: у контроллера и сервиса доменов зависимости есть.
+    expect(Reflect.getMetadata('design:paramtypes', ProductsController)).toContain(DomainsService);
+    expect(Reflect.getMetadata('design:paramtypes', DomainsService)).toEqual([PgService]);
   });
 });

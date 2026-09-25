@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PgService } from '../common/services/pg.service';
+import { AGENT_OUTDATED_MARKER } from './domain-name';
 import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
 import { SecretsService } from './secrets.service';
@@ -38,7 +39,7 @@ export interface CreateInput {
  * отдавать вид, которого агент не знает, и получит честный отказ на каждом
  * задании.
  */
-export type JobKind = 'provision' | 'sleep' | 'wake';
+export type JobKind = 'provision' | 'sleep' | 'wake' | 'domain';
 
 /**
  * Задание, выданное агенту хоста. Единственное место, где открытый
@@ -67,7 +68,9 @@ export interface ClaimedJob {
   jobKind: JobKind;
   /**
    * Порт продукта, как он записан в базе. Нужен ПРОБУЖДЕНИЮ: домен возвращают
-   * на тот же порт, с которого его сняли, а знает его только сервер.
+   * на тот же порт, с которого его сняли, а знает его только сервер. Ровно
+   * так же он нужен заданию domain: конфиг своих имён в режиме прокси ведёт
+   * на этот порт.
    *
    * У заведения он NULL и обязан быть NULL: порт там ВЫБИРАЕТ агент (первый
    * свободный на хосте) и присылает его обратно в отчёте.
@@ -85,6 +88,27 @@ export interface ClaimedJob {
    */
   runnerToken?: string;
   secrets: Record<string, string>;
+  /**
+   * Свои имена продукта (product_domains в active, а в issuing — только при
+   * живом задании domain, см. claimJob). Приезжают в
+   * КАЖДОМ задании: любая перегенерация конфига строит его из того, что
+   * прислал сервер, и потерять домен не может. У отвязки (removing) и у
+   * задания-уборки (строки домена нет) — пусто: агент понимает намерение
+   * задания domain именно по пустоте списка.
+   *
+   * Отказавшей заявки (failed — например, orphan_issuing после потерянного
+   * отчёта) здесь тоже нет, хотя сертификат на машине мог остаться: ближайший
+   * сон или пробуждение перегенерирует конфиг без своих имён, и домен
+   * вернётся только после «Проверить снова». Так задумано — в конфиге живут
+   * лишь имена, чей выпуск сервер считает состоявшимся или идущим.
+   */
+  customNames: string[];
+  /**
+   * Режим конфига для задания domain. Вычисляет сервер: агенту нечем узнать
+   * статус продукта. Спящий, но уже проснувшийся (пробуждение сделано,
+   * promoteReady ещё не перевёл) — прокси: его конфиг уже прокси.
+   */
+  vhostMode: 'proxy' | 'asleep';
 }
 
 // Дефис только внутри. Регексп из плана (/^[a-z0-9-]{2,40}$/) пропускал '-rf'
@@ -199,6 +223,27 @@ const HEARTBEAT_FRESH_MS = 2 * 60 * 1000;
 // причины. В тексте «мин», а не «минут»: при смене числа русская форма
 // множественного числа поехала бы (2 минуты, 21 минута), а сокращение
 // неизменяемо.
+/**
+ * Потолок причины отказа задания domain — строже общего ERROR_MAX приёма
+ * отчёта (host.controller.ts, 2000): туда уезжает вывод certbot, а из строки
+ * домена текст идёт в кабинет и ассистенту, в каждый ответ о домене. Подрезка
+ * с многоточием — по тому же правилу, что у ERROR_MAX: по обрезанной строке
+ * видно, что её срезали. Остальные виды заданий не трогаются: их причина
+ * ложится в карточку продукта со своими ожиданиями длины.
+ */
+export const DOMAIN_ERROR_MAX = 1000;
+
+/**
+ * Подрезка до DOMAIN_ERROR_MAX по КОДОВЫМ ТОЧКАМ, а не по UTF-16: `slice`
+ * разрезал бы эмодзи на границе пополам, и в базу уехала бы одинокая
+ * половина суррогатной пары (node-postgres превращает её в U+FFFD). Длина
+ * text в PostgreSQL тоже в символах — счёт совпадает с базой.
+ */
+const clipDomainError = (text: string): string => {
+  const points = Array.from(text);
+  return points.length > DOMAIN_ERROR_MAX ? `${points.slice(0, DOMAIN_ERROR_MAX - 1).join('')}…` : text;
+};
+
 const PROVISION_DEADLINE_MIN = 10;
 const DEADLINE_SQL = `interval '${PROVISION_DEADLINE_MIN} minutes'`;
 // `/ 1000` — не косметика. Константа хранится в МИЛЛИСЕКУНДАХ (её читает
@@ -281,13 +326,21 @@ const hostAgentLiveSql = (hostRef: string) => `(
  *
  * `j.` перед каждой ссылкой — не стиль: `kind` есть и у products, и у
  * product_provision_jobs, и обе таблицы здесь в области видимости.
+ *
+ * ЗАДАНИЯ `domain` В «ПОСЛЕДНЕЕ» НЕ ВХОДЯТ. Свой домен не меняет ни сна, ни
+ * бодрствования продукта, а без этой оговорки задание domain, вставшее между
+ * пробуждением и переводом в running, заслонило бы пробуждение: продукт
+ * остался бы «спящим» с работающим контейнером. `productRef` — ссылка на
+ * строку products в том запросе, куда предикат подставляется.
  */
-const WOKEN_SQL = `COALESCE((
+const wokenSql = (productRef: string) => `COALESCE((
           SELECT j.kind = 'wake' AND j.status = 'done'
             FROM product_provision_jobs j
-           WHERE j.product_id = products.id
+           WHERE j.product_id = ${productRef}
+             AND j.kind <> 'domain'
            ORDER BY j.created_at DESC, j.id DESC
            LIMIT 1), false)`;
+const WOKEN_SQL = wokenSql('products.id');
 
 /**
  * ГОНКИ В ЭТОМ ФАЙЛЕ ЗАКРЫВАЕТ ФОРМА ЗАПРОСОВ, А НЕ МОДУЛЬ.
@@ -618,6 +671,10 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    * это выдало бы заведение спящему продукту (повтор поверх уснувшего снёс бы
    * его каталог) и сон — заводящемуся.
    *
+   * Свой домен (`domain`) — у любого заведённого: работающего, спящего и
+   * погашенного. Режим его конфига (прокси или заглушка) и имена считает этот
+   * же оператор — см. ClaimedJob.customNames и vhostMode.
+   *
    * ## ТОКЕН ПОВОРАЧИВАЕТСЯ ТОЛЬКО НА ЗАВЕДЕНИИ
    *
    * `issued` берёт только `kind = 'provision'`. Раннер живёт ВНУТРИ
@@ -648,8 +705,8 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    * начинается заново поверх пустого места.
    *
    * УСЛОВИЕ СТОИТ РЯДОМ С `archived_at IS NULL`, А НЕ ВНУТРИ `CASE` по виду
-   * задания. Машина у продукта одна на все три вида работы, и фильтр обязан
-   * действовать на все три одинаково. Условие, уехавшее в ветку `provision`,
+   * задания. Машина у продукта одна на все виды работы, и фильтр обязан
+   * действовать на все одинаково. Условие, уехавшее в ветку `provision`,
    * прошло бы главный сценарий зелёным и пустило бы на чужую машину сон и
    * пробуждение: сон гасил бы там контейнер, которого нет, и возвращал отказ, а
    * продукт остался бы работать неоплаченным (сценарий 46в).
@@ -724,6 +781,13 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                             AND CASE j.kind
                                   WHEN 'provision' THEN p.status = 'provisioning'
                                   WHEN 'sleep' THEN p.status IN ('sleeping','blocked')
+                                  -- Своя ветка ОБЯЗАТЕЛЬНА: без неё 'domain'
+                                  -- попал бы в ELSE и выдавался бы только
+                                  -- спящим — у работающего висел бы вечно.
+                                  -- 'blocked' — ради отвязки: убрать свой домен
+                                  -- у погашенного можно, выпустить нельзя
+                                  -- (это сторожит DomainsService.tryIssue).
+                                  WHEN 'domain' THEN p.status IN ('running','degraded','sleeping','blocked')
                                   ELSE p.status = 'sleeping'
                                 END)
            ORDER BY j.created_at ASC
@@ -743,6 +807,36 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
        SELECT c.id AS job_id, c.kind AS job_kind, p.id AS product_id, p.slug AS slug,
               p.name AS name, p.kind AS kind, p.port AS port, p.secrets_encrypted AS box,
               (i.id IS NOT NULL) AS token_issued
+              -- Имена — в каждом задании (см. ClaimedJob.customNames), режим —
+              -- для задания domain. Само выдаваемое задание domain режим не
+              -- сбивает: wokenSql пропускает этот вид, и «проснулся» решает
+              -- последнее задание другого вида.
+              --
+              -- issuing — только пока жива заявка: есть задание domain в
+              -- queued/running (выдаваемое сейчас тоже; снимок CTE видит его
+              -- ещё в queued). Без живого задания issuing — будущая сирота:
+              -- гашение сняло стоявшее в очереди задание domain, а сон выдан
+              -- раньше, чем сверка сирот переведёт строку в failed. Отдай сон
+              -- её имена — они остались бы в конфиге погашенного продукта, и
+              -- после переезда домена к соседу на той же машине nginx отдавал
+              -- бы первый блок с этим server_name.
+              , COALESCE((SELECT d.names FROM product_domains d
+                           WHERE d.product_id = p.id
+                             -- CASE, а не дизъюнкция: её в этом запросе нет
+                             -- нигде (сторож — «очередь читается ТОЛЬКО по queued»).
+                             AND CASE d.status
+                                   WHEN 'active' THEN true
+                                   WHEN 'issuing' THEN
+                                     CASE WHEN c.kind = 'domain' THEN true
+                                          ELSE EXISTS (SELECT 1 FROM product_provision_jobs dj
+                                                        WHERE dj.product_id = p.id AND dj.kind = 'domain'
+                                                          AND dj.status IN ('queued','running'))
+                                     END
+                                   ELSE false
+                                 END), '{}') AS custom_names
+              , CASE WHEN p.status = 'blocked' THEN 'asleep'
+                     WHEN p.status = 'sleeping' AND NOT ${wokenSql('p.id')} THEN 'asleep'
+                     ELSE 'proxy' END AS vhost_mode
          FROM claimed c
          JOIN products p ON p.id = c.product_id
          LEFT JOIN issued i ON i.id = c.product_id`,
@@ -787,6 +881,8 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       // переменные окружения в нём. Расшифровывать их здесь значило бы гонять
       // секреты клиента по сети на каждое усыпление ни за чем.
       secrets: jobKind === 'provision' && row.box ? this.secrets.decrypt(row.box, row.product_id) : {},
+      customNames: Array.isArray(row.custom_names) ? row.custom_names : [],
+      vhostMode: row.vhost_mode === 'asleep' ? 'asleep' : 'proxy',
     };
   }
 
@@ -828,6 +924,13 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    * дыра повторного отчёта открылась бы заново.
    */
   async completeJob(jobId: string, result: { ok: boolean; port?: number; error?: string }) {
+    // Отчёт по своему домену разбирается отдельно: общий путь ниже пишет
+    // provision_error в продукт при ЛЮБОМ отказе, и отказ Let's Encrypt
+    // выглядел бы в карточке как «ошибка заведения». Вид задания неизменен,
+    // так что отдельное чтение гонки не открывает.
+    const kindRow = await this.pg.query(`SELECT kind FROM product_provision_jobs WHERE id = $1`, [jobId]);
+    if (kindRow.rows[0]?.kind === 'domain') return this.completeDomainJob(jobId, result);
+
     if (result.ok) {
       // Статус продукта здесь НЕ меняется. Перевод в running делает
       // promoteReady по измеримому факту (задача 5): отчёт агента говорит
@@ -919,6 +1022,110 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     if (!r.rowCount) {
       this.logger.warn(`отчёт об отказе по незапущенному заданию ${jobId} — продукт не тронут`);
     }
+  }
+
+  /**
+   * Намерение задания domain — в состоянии строки домена: issuing (привязка)
+   * или removing (отвязка); у задания-уборки строки нет вовсе. Оба перехода
+   * делаются одним оператором вместе с постановкой задания, так что состояние
+   * не может расходиться с заданием. Продукт не трогается ни при успехе, ни
+   * при отказе.
+   *
+   * Замок тот же, что у completeJob: `status = 'running'`. Задание, снятое
+   * гашением или сборщиком, отчётом не закрывается — его строку домена
+   * переводит в failed сверка сирот (DomainsService.reconcileOrphans).
+   *
+   * Закрытие задания и перевод строки — ОДИН оператор, и сверке сирот это
+   * обещано: сиротой она считает строку в issuing или removing без активного
+   * задания domain. Двумя операторами смерть процесса между ними оставила бы
+   * ровно такую строку, и сверка затёрла бы честный отказ агента своим
+   * «выпуск прерван».
+   *
+   * ТЕКСТ И КОД ОШИБКИ — ПАРОЙ, в обе стороны: успех снимает оба, отказ ставит
+   * оба (issue_failed, remove_failed или agent_outdated). Иначе ограничение
+   * product_domains_error_pair откатило бы весь оператор, закрытие задания
+   * вместе с ним: задание висело бы в running до сборщика зависших, а
+   * дословная строка Let's Encrypt пропала бы — сверка сирот написала бы
+   * вместо неё свою.
+   *
+   * Задание-уборка (строки нет) ни одной строки домена не находит: закрывается
+   * только само задание, причина отказа остаётся в нём.
+   *
+   * Отказ устаревшего агента (текст начинается с AGENT_OUTDATED_MARKER) — код
+   * agent_outdated вместо issue_failed: это не отказ Let's Encrypt, и пределы
+   * пользователя он не расходует (см. маркер): попытку, списанную tryIssue в
+   * начале этого выпуска, оператор возвращает. Решается в JS, параметром $4,
+   * а не LIKE в SQL: так правило «только начало текста» живёт в одном
+   * выражении с маркером. Отвязка остаётся remove_failed и с таким отказом:
+   * код незавершённой отвязки держит «Проверить снова» (detach_pending), а
+   * agent_outdated его бы снял — и кнопка выпустила бы домен, который
+   * человек отвязывал.
+   *
+   * На `activated`, `removed` и `refused` итоговый SELECT не ссылается, и это
+   * не мёртвый код: изменяющий CTE PostgreSQL исполняет всегда и до конца, со
+   * ссылкой или без. Выбрасывается только НЕссылаемый SELECT в WITH — ровно
+   * тот случай, о котором шапка provisioning.integration.spec.ts.
+   */
+  private async completeDomainJob(jobId: string, result: { ok: boolean; error?: string }) {
+    const raw = result.error ?? 'без причины';
+    const error = clipDomainError(raw);
+    // Пометка отвязки дописывается ДО подрезки: потолок держит итоговая
+    // строка домена, а не только текст агента.
+    const detachError = clipDomainError(`отвязка не удалась: ${raw}`);
+    const outdated = !result.ok && raw.startsWith(AGENT_OUTDATED_MARKER);
+    const r = await this.pg.query(
+      `WITH closed AS (
+          UPDATE product_provision_jobs
+             SET status = CASE WHEN $2::boolean THEN 'done' ELSE 'failed' END,
+                 error = CASE WHEN $2::boolean THEN NULL ELSE $3::text END,
+                 finished_at = now()
+           WHERE id = $1 AND status = 'running' AND kind = 'domain'
+          RETURNING product_id
+       ), activated AS (
+          UPDATE product_domains d
+             SET status = 'active', error = NULL, error_reason = NULL, activated_at = now()
+            FROM closed WHERE $2::boolean AND d.product_id = closed.product_id AND d.status = 'issuing'
+          RETURNING d.product_id
+       ), removed AS (
+          -- removed и refused целятся в ОДНУ строку в removing, и разводит их
+          -- только исход отчёта: здесь условие «успех» ($2), в refused — его
+          -- отрицание. Порядок CTE не защита — снятое отсюда $2 живая база не
+          -- ловит (UPDATE в refused случайно берёт строку раньше), а отказ
+          -- отвязки удалял бы строку. Сторож — форма, provisioning.job.spec.ts.
+          DELETE FROM product_domains d USING closed
+           WHERE $2::boolean AND d.product_id = closed.product_id AND d.status = 'removing'
+          RETURNING d.product_id
+       ), refused AS (
+          UPDATE product_domains d
+             SET status = 'failed',
+                 error = CASE WHEN d.status = 'removing' THEN $5::text ELSE $3::text END,
+                 error_reason = CASE WHEN d.status = 'removing' THEN 'remove_failed'
+                                     WHEN $4::boolean THEN 'agent_outdated'
+                                     ELSE 'issue_failed' END,
+                 -- Возврат попытки, списанной tryIssue в начале этого выпуска:
+                 -- до Let's Encrypt он не дошёл. Так attempts — это число
+                 -- повторов окна, ДОШЕДШИХ до Let's Encrypt, и все три места
+                 -- проверки окна (tryIssue, hold, flagged) остаются как есть —
+                 -- без особого случая agent_outdated в каждом. attempts_since
+                 -- не трогается: начало окна — момент, когда его открыли, и
+                 -- возврат этого не отменяет. Выпуск из awaiting_dns попытку не
+                 -- списывал, и у такой заявки attempts ещё 0 — GREATEST держит
+                 -- ноль, счётчик не уходит в минус. Но ПОТЕРЯ здесь есть: первый
+                 -- выпуск бесплатен (не из failed), и если он ушёл устаревшему
+                 -- агенту, бесплатная попытка сгорела без Let's Encrypt — до
+                 -- 'limited' человек получит 3 настоящих обращения к Let's
+                 -- Encrypt вместо 4. Сторона безопасная (пределы LE не ближе),
+                 -- потому оставлено. Отвязка попыток не списывает — её строка
+                 -- не тронута (условие d.status = 'issuing').
+                 attempts = CASE WHEN d.status = 'issuing' AND $4::boolean
+                                 THEN GREATEST(d.attempts - 1, 0) ELSE d.attempts END
+            FROM closed WHERE NOT $2::boolean AND d.product_id = closed.product_id AND d.status IN ('issuing','removing')
+          RETURNING d.product_id
+       )
+       SELECT (SELECT count(*) FROM closed)::int AS closed`,
+      [jobId, result.ok, error, outdated, detachError],
+    );
+    if (!r.rows[0].closed) this.logger.warn(`отчёт по незапущенному заданию domain ${jobId} — домен не тронут`);
   }
 
   /**
@@ -1334,7 +1541,14 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       `WITH stale AS (
          UPDATE product_provision_jobs
             SET status = 'failed',
-                error = 'срок заведения истёк (${PROVISION_DEADLINE_MIN} мин)',
+                -- Причина — по виду задания: сборщик снимает задания любого
+                -- вида, а «срок заведения» у задания своего домена (выпуск или
+                -- отвязка) — неправда, заведения там не было. Остальные виды
+                -- сохраняют прежний текст.
+                error = CASE kind
+                          WHEN 'domain' THEN 'срок задания своего домена истёк (${PROVISION_DEADLINE_MIN} мин)'
+                          ELSE 'срок заведения истёк (${PROVISION_DEADLINE_MIN} мин)'
+                        END,
                 finished_at = now()
           WHERE status IN ('queued','running')
             AND COALESCE(started_at, created_at) < now() - ${DEADLINE_SQL}

@@ -557,7 +557,11 @@ describe('ProvisioningService.failStaleProvisioning', () => {
     // означает она ровно ту ложь, ради которой CASE и написан — живой раннер
     // получал «срок заведения истёк», мёртвый «агент не отчитался». Поэтому
     // ниже пришпилено НАПРАВЛЕНИЕ: THEN — ветка живого раннера.
-    const stale = staleQuery(calls).sql.match(/THEN\s+'([^']+)'\s*\n?\s*ELSE\s+'([^']+)'/);
+    //
+    // Ищется ПОСЛЕ provision_error: выше, в снятии задания, стоит свой CASE
+    // (причина по виду задания — у задания domain она своя), и первое
+    // совпадение THEN … ELSE пришлось бы на него.
+    const stale = staleQuery(calls).sql.split('provision_error')[1].match(/THEN\s+'([^']+)'\s*\n?\s*ELSE\s+'([^']+)'/);
     expect(stale).not.toBeNull();
     expect(stale![1]).not.toBe(stale![2]);
     expect(stale![1].length).toBeGreaterThan(10);

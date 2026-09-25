@@ -14,7 +14,7 @@ export interface HostJob extends ProvisionJob {
   jobId: string;
   productId: string;
   /**
-   * Вид работы: `provision`, `sleep` или `wake` (JobKind в
+   * Вид работы: `provision`, `sleep`, `wake` или `domain` (JobKind в
    * provisioning.service.ts). Тип здесь намеренно ШИРЕ союза — поле приезжает
    * по сети и не проверяется ничем, а объявленный союз означал бы «другого не
    * бывает» и однажды позволил бы выбросить ветку неизвестного вида как
@@ -51,6 +51,10 @@ export interface HostJob extends ProvisionJob {
    * У заведения он `null`: там порт выбирает агент и присылает его в отчёте.
    */
   port?: number | null;
+  /** Свои имена продукта. Приезжают в каждом задании; у отвязки — пусто. */
+  customNames?: string[];
+  /** Режим конфига для задания domain: прокси или заглушка. Вычисляет сервер. */
+  vhostMode?: 'proxy' | 'asleep';
 }
 
 /**

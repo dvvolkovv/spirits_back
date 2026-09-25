@@ -1,7 +1,9 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { HttpException, Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
 import { TurnsService, SLEEPING_REFUSAL, BLOCKED_REFUSAL } from './turns.service';
+import { DomainErrorReason, DomainRecordToSet, DomainRefusalCode, DomainStatus, DomainsService, DomainView } from './domains.service';
+import { normalizeDomain, readableDomain } from './domain-name';
 
 /** Продукт глазами ассистента: без внутренностей, только то, что можно назвать вслух. */
 export interface ProductMatch {
@@ -11,6 +13,14 @@ export interface ProductMatch {
   domain: string | null;
   kind: string;
   status: string;
+}
+
+/** Строка `list`: продукт плюс его свой домен, если он есть. */
+export interface ProductListRow extends ProductMatch {
+  custom_domain: string | null;
+  /** Тот же домен для глаз человека (readableDomain): его ассистент и называет. */
+  custom_domain_unicode: string | null;
+  custom_domain_status: DomainStatus | null;
 }
 
 /** Строка хода, как её отдаёт product_turns. */
@@ -74,6 +84,139 @@ export function describeTurn(row: TurnRowLike): TurnOutcome {
   }
 }
 
+/**
+ * Свой домен в ответе инструмента. Из DomainView уходит всё, что писали НЕ
+ * мы:
+ *   - `error` — сырой текст отказа агента (certbot цитирует ответ сервера
+ *     пользователя, бывает длинным) — вместо него текст по `errorReason`
+ *     (DOMAIN_FAILED_SAY);
+ *   - у проверки `current` — что сейчас лежит в DNS: TXT пишет владелец ЧУЖОГО
+ *     домена, и это прямой канал prompt-injection в контекст модели; `error` —
+ *     код резолвера, ассистенту без пользы. Остаётся тип, имя и «сходится ли».
+ * Записи (`records`) — наши целиком: код заявки, IP машины, адрес продукта.
+ */
+export interface DomainForAssistant {
+  domain: string;
+  domainUnicode: string;
+  names: string[];
+  status: DomainStatus;
+  errorReason: DomainErrorReason | null;
+  checkedAt: string | null;
+  check: { type: string; name: string; ok: boolean }[] | null;
+  records: DomainRecordToSet[];
+}
+
+export function domainForAssistant(v: DomainView): DomainForAssistant {
+  return {
+    domain: v.domain,
+    domainUnicode: v.domainUnicode,
+    names: v.names,
+    status: v.status,
+    errorReason: v.errorReason,
+    checkedAt: v.checkedAt,
+    check: v.check ? v.check.map((c) => ({ type: c.type, name: c.name, ok: c.ok })) : null,
+    records: v.records,
+  };
+}
+
+const NOT_WORKING = ' Не говори, что домен работает.';
+
+/**
+ * Что сказать про отказавшую заявку — по коду причины, а не по `error`
+ * (сырой текст агента, см. domainForAssistant). Record по типу: новая причина
+ * без текста не скомпилируется, а тест сверяет список со словарём 008.
+ */
+export const DOMAIN_FAILED_SAY: Record<DomainErrorReason, string> = {
+  issue_failed:
+    'Сертификат не выпустился: Let\'s Encrypt не смог проверить домен. Частые причины — остались старые A/AAAA-записи ' +
+    'или DNS ещё не разошёлся. Можно проверить снова.' + NOT_WORKING,
+  agent_outdated:
+    'Временный сбой на стороне платформы, попытка не засчитана. Предложи проверить снова чуть позже.' + NOT_WORKING,
+  // taken пишет выпуск, когда тот же домен в тот же миг ушёл в выпуск у
+  // ДРУГОГО продукта (любого владельца) — чей он, пользователю не говорим.
+  taken:
+    'Этот домен уже привязан к другому продукту, и сертификат для этого не выпустится. Если тот продукт тоже ' +
+    'пользователя — пусть сначала отвяжет домен там; иначе нужен другой домен. Эту заявку можно отвязать.' + NOT_WORKING,
+  orphan_issuing:
+    'Выпуск сертификата прервался: задание сняли (продукт остановлен или машина не ответила вовремя). ' +
+    'Можно проверить снова.' + NOT_WORKING,
+  // Обе причины отвязки — «Проверить снова» здесь выпустил бы домен заново
+  // (DETACH_PENDING в domains.service.ts): путь один — отвязать ещё раз.
+  orphan_removing:
+    'Отвязка прервалась: задание сняли (продукт остановлен или машина не ответила вовремя). ' +
+    'Отвяжи домен ещё раз (remove: true); проверять снова не нужно.',
+  remove_failed:
+    'Отвязка не удалась на стороне платформы. Отвяжи домен ещё раз (remove: true); проверять снова не нужно.',
+};
+
+/**
+ * Отказы DomainsService, чей `message` написан для кабинета («нажмите
+ * «Отвязать»», «обновите страницу») — в чате ни кнопок, ни страницы нет.
+ * Здесь замена на путь инструмента. Тест разбирает исходник сервиса и
+ * требует замену для каждого отказа с формулировкой кабинета.
+ */
+export const DOMAIN_REFUSAL_SAY: Partial<Record<DomainRefusalCode, string>> = {
+  detach_pending: 'Прошлая отвязка не завершилась — отвяжи ещё раз (remove: true), проверять не нужно.',
+  changed:
+    'Состояние домена только что изменилось — запроси его заново (action="domain" без флагов) и действуй по нему.',
+};
+
+/**
+ * Замена для чата по reason из тела отказа — только среди СВОИХ ключей:
+ * `DOMAIN_REFUSAL_SAY['constructor']` без этой проверки достал бы из
+ * прототипа функцию, и в say уехала бы она вместо текста. Object.hasOwn — из
+ * ES2022, а сборка на ES2021.
+ */
+function refusalSay(reason: string): string | undefined {
+  return Object.prototype.hasOwnProperty.call(DOMAIN_REFUSAL_SAY, reason)
+    ? DOMAIN_REFUSAL_SAY[reason as DomainRefusalCode]
+    : undefined;
+}
+
+/** Флаг инструмента: true или строка 'true' — модели присылают и так. */
+const flag = (v: unknown) => v === true || v === 'true';
+
+/** Что не сходится в последней проверке DNS — по нашим именам, без чужих значений. */
+function mismatches(v: DomainView): string {
+  const bad = (v.check ?? []).filter((c) => !c.ok);
+  if (!bad.length) return '';
+  const what = bad.map((c) =>
+    c.type === 'TXT' ? `нет TXT с кодом у ${c.name}`
+      : c.type === 'AAAA' ? `у ${c.name} есть AAAA — удалить`
+      : `A у ${c.name} не та или её нет`,
+  );
+  return ` По последней проверке не сходится: ${what.join('; ')}.`;
+}
+
+/**
+ * Единственное место, где состояние своего домена становится новостью.
+ * «Домен работает» — ТОЛЬКО у active: пересказ ждущей заявки как готовой —
+ * та же ложь, что «готово» после отката правки.
+ */
+export function domainSay(v: DomainView | null): string {
+  if (!v) return 'Своего домена у продукта нет.';
+  switch (v.status) {
+    case 'active':
+      return v.domainUnicode !== v.domain
+        ? `Домен работает: https://${v.domainUnicode} (в DNS и у регистратора — ${v.domain}).`
+        : `Домен работает: https://${v.domain}`;
+    case 'issuing':
+      return 'DNS в порядке, сертификат выпускается — обычно меньше минуты. Пока не говори, что домен работает.';
+    case 'failed':
+      return (v.errorReason && DOMAIN_FAILED_SAY[v.errorReason]) || 'Выпуск не удался. Можно проверить снова.' + NOT_WORKING;
+    case 'removing':
+      return 'Домен отвязывается.';
+    default:
+      return (
+        'Домен ждёт изменения DNS. Назови пользователю записи ДОСЛОВНО из records (тип, имя, значение) и скажи ' +
+        'удалить у этих имён остальные A-записи и ВСЕ AAAA — иначе сертификат не выпустится. Изменения DNS ' +
+        'расходятся от 15 минут до суток, платформа проверяет сама первые дни после заявки; если прошло много ' +
+        'времени — проверь сейчас (check: true). Это бесплатно. Не говори, что домен уже подключён.' +
+        mismatches(v)
+      );
+  }
+}
+
 @Injectable()
 export class ProductToolService {
   private readonly logger = new Logger(ProductToolService.name);
@@ -81,12 +224,17 @@ export class ProductToolService {
   constructor(
     private readonly pg: PgService,
     private readonly turns: TurnsService,
+    private readonly domains: DomainsService,
   ) {}
 
   /**
    * Нестрогий поиск по имени плюс точные совпадения по слагу, домену и
    * идентификатору: последние три ассистент мог взять из `list` в том же
-   * разговоре.
+   * разговоре. И по своему домену продукта — любой заявке, в любом статусе:
+   * человек называет сайт тем адресом, который купил. Запрос приводится той
+   * же normalizeDomain, что и привязка (схема, путь, регистр, www, punycode);
+   * не домен по её меркам (имя, слаг, наша зона) — сравнения по своему домену
+   * нет вовсе.
    *
    * Строгий разбор из BlockService.lookup() переиспользовать НЕЛЬЗЯ: он
    * отвечает «не найден» на «магазин цветов» при двух живых магазинах. Там
@@ -102,6 +250,8 @@ export class ProductToolService {
     // '%' и '_' — служебные символы LIKE. Без экранирования «100%» совпадает со
     // всем подряд, и ассистент получает «неоднозначно» там, где совпадение одно.
     const like = `%${raw.replace(/([\\%_])/g, '\\$1')}%`;
+    const n = normalizeDomain(raw);
+    const own = n.ok === true ? n.domain : null;
     const r = await this.pg.query(
       `SELECT id, name, slug, domain, kind, status
          FROM products
@@ -109,9 +259,10 @@ export class ProductToolService {
           AND ( id::text = $2
              OR lower(slug) = $2
              OR lower(domain) = $2
-             OR lower(name) LIKE $3 )
+             OR lower(name) LIKE $3
+             OR EXISTS (SELECT 1 FROM product_domains d WHERE d.product_id = products.id AND d.domain = $4) )
         ORDER BY created_at DESC`,
-      [userId, raw, like],
+      [userId, raw, like, own],
     );
     return r.rows;
   }
@@ -126,23 +277,33 @@ export class ProductToolService {
     if (action === 'list') return this.list(userId);
     if (action === 'edit') return this.edit(userId, input);
     if (action === 'status') return this.status(userId, input);
+    if (action === 'domain') return this.domain(userId, input);
     return {
       ok: false,
       reason: 'bad_action',
-      say: 'Неизвестное действие. Доступны: list (показать продукты), edit (поставить правку), status (узнать исход правки).',
+      say: 'Неизвестное действие. Доступны: list (показать продукты), edit (поставить правку), ' +
+           'status (узнать исход правки), domain (свой домен сайта).',
     };
   }
 
   private async list(userId: string) {
+    // Строка своего домена — одна на продукт (PK product_id), JOIN не множит.
     const products = await this.pg
       .query(
-        `SELECT id, name, slug, domain, kind, status
-           FROM products
-          WHERE user_id = $1 AND archived_at IS NULL
-          ORDER BY created_at DESC`,
+        `SELECT p.id, p.name, p.slug, p.domain, p.kind, p.status,
+                d.domain AS custom_domain, d.status AS custom_domain_status
+           FROM products p
+           LEFT JOIN product_domains d ON d.product_id = p.id
+          WHERE p.user_id = $1 AND p.archived_at IS NULL
+          ORDER BY p.created_at DESC`,
         [userId],
       )
-      .then((r) => r.rows as ProductMatch[]);
+      .then((r) =>
+        (r.rows as ProductListRow[]).map((p) => ({
+          ...p,
+          custom_domain_unicode: p.custom_domain ? readableDomain(p.custom_domain) : null,
+        })),
+      );
 
     if (!products.length) {
       return {
@@ -271,6 +432,99 @@ export class ProductToolService {
   }
 
   /**
+   * Свой домен сайта. Продукт — тем же нестрогим поиском, что у edit; дальше
+   * всё решает DomainsService (владелец, статусы, пределы, гонки) — здесь
+   * только выбор его метода и пересказ.
+   *
+   * Порядок флагов: remove, затем check, затем domain, иначе состояние.
+   * Отвязка — первой: «отвязать» с доменом в придачу не должно превратиться
+   * в привязку. check раньше domain: привязка того же домена при живой заявке
+   * DNS не перепроверяет (answerExisting), а просили именно проверку. Заявки
+   * нет вовсе (no_domain) и домен назван — это привязка: она и проверяет.
+   *
+   * Отказ сервиса — HttpException с телом { message, reason }: reason уходит
+   * машинным кодом, message — текстом, кроме формулировок кабинета
+   * (DOMAIN_REFUSAL_SAY). Прочие ошибки — наверх: это сбой, а не ответ.
+   */
+  private async domain(userId: string, input: any) {
+    const matches = await this.resolve(userId, String(input?.product ?? ''));
+    if (matches.length > 1) {
+      return { ok: false, reason: 'ambiguous', matches,
+        say: 'Под это описание подходит несколько продуктов. СПРОСИ, к какому привязывать домен.' };
+    }
+    if (matches.length === 0) {
+      return { ok: false, reason: 'not_found', say: 'Такого продукта у пользователя нет.' };
+    }
+    const product = matches[0];
+    // Не строка (число, объект) — не домен: молча отдать состояние значило бы
+    // сделать вид, что привязка прошла.
+    if (input?.domain != null && typeof input.domain !== 'string') {
+      return { ok: false, reason: 'bad_form', product,
+        say: 'Домен передан не строкой. Повтори вызов с доменом строкой, например "mysite.ru".' };
+    }
+    const raw = typeof input?.domain === 'string' ? input.domain.trim() : '';
+    try {
+      if (flag(input?.remove)) {
+        const { removed } = await this.domains.detach(userId, product.id);
+        return { ok: true, product, removed,
+          say: removed === 'now' ? 'Домен отвязан.' : 'Отвязка поставлена — займёт до минуты.' };
+      }
+      let view: DomainView | null;
+      if (flag(input?.check)) {
+        const other = raw ? await this.otherDomain(userId, product.id, raw) : null;
+        if (other) {
+          return { ok: false, reason: 'has_domain', product,
+            say: `У продукта уже есть свой домен ${other} — проверять названный не буду. Если нужен другой, ` +
+              `сначала отвяжи ${other} (remove: true), потом привяжи новый.` };
+        }
+        view = await this.checkOrAttach(userId, product.id, raw);
+      }
+      else if (raw) view = await this.domains.attach(userId, product.id, raw);
+      else view = await this.domains.get(userId, product.id);
+      return { ok: true, product, domain: view ? domainForAssistant(view) : null, say: domainSay(view) };
+    } catch (e: any) {
+      if (!(e instanceof HttpException)) throw e;
+      const body: any = e.getResponse();
+      const reason = typeof body?.reason === 'string' ? body.reason : 'refused';
+      return {
+        ok: false,
+        reason,
+        product,
+        say: refusalSay(reason) ?? (typeof body?.message === 'string' ? body.message : e.message),
+      };
+    }
+  }
+
+  /**
+   * check с доменом при заявке на ДРУГОЙ домен: проверить молча заявку значило
+   * бы пересказать состояние чужого имени как ответ про названное. Возвращает
+   * читаемую форму имени заявки, если названное с ним расходится; иначе null.
+   *
+   * Сравнение — после normalizeDomain: «DmitryVolkov.RU » и dmitryvolkov.ru —
+   * одно имя. Не прошедшее нормализацию имя здесь не судится (null): без
+   * заявки его отобьёт привязка, при заявке проверяется она, как и раньше.
+   * Отвязывающуюся заявку пропускаем — «сначала отвяжи» было бы неправдой, а
+   * отказ removing скажет сама проверка.
+   */
+  private async otherDomain(userId: string, productId: string, raw: string): Promise<string | null> {
+    const n = normalizeDomain(raw);
+    if (n.ok === false) return null;
+    const existing = await this.domains.get(userId, productId);
+    if (!existing || existing.status === 'removing' || existing.domain === n.domain) return null;
+    return existing.domainUnicode;
+  }
+
+  private async checkOrAttach(userId: string, productId: string, raw: string): Promise<DomainView> {
+    try {
+      return await this.domains.check(userId, productId);
+    } catch (e: any) {
+      const reason = e instanceof HttpException ? (e.getResponse() as any)?.reason : null;
+      if (reason === 'no_domain' && raw) return this.domains.attach(userId, productId, raw);
+      throw e;
+    }
+  }
+
+  /**
    * Владелец в WHERE обоих запросов, включая поиск по turnId: без этого
    * ассистент читал бы исход чужой правки, зная только её идентификатор.
    *
@@ -322,7 +576,7 @@ export class ProductToolService {
 export const PRODUCT_TOOL_NAME = 'manage_product';
 
 /**
- * Один инструмент с перечислением действий, по образцу manage_routine. Три
+ * Один инструмент с перечислением действий, по образцу manage_routine. Четыре
  * отдельных имени с пересекающимися описаниями модель путает чаще.
  *
  * Аргумента userId здесь нет и быть не должно: владелец приезжает из подписи
@@ -339,6 +593,12 @@ export const PRODUCT_TOOLS = [
       '• action="edit" — поставить правку: product (как пользователь назвал продукт) + prompt (что именно сделать, ' +
       'своими словами и подробно — правку исполняет ассистент внутри продукта, он видит только его файлы).\n' +
       '• action="status" — узнать, чем кончилась правка: product или turnId.\n' +
+      '• action="domain" — свой домен сайта: { product, domain } — привязать; { product } — узнать состояние; ' +
+      '{ product, check: true } — проверить DNS сейчас; { product, remove: true } — отвязать. Вернутся records — ' +
+      'записи для регистратора: называй их ДОСЛОВНО (тип, имя, значение), не пересказывая, и обязательно скажи ' +
+      'удалить у этих имён остальные A-записи и ВСЕ AAAA. Не говори «домен работает», пока domain.status не ' +
+      '"active". Свой домен бесплатный, входит в аренду. Бывает только у сайта, один на продукт. В list у продукта ' +
+      'видно custom_domain и custom_domain_status; подробности и что делать — action="domain".\n' +
       'ДВА РАЗНЫХ ПОЛЯ В ОТВЕТЕ, и они НИКОГДА не приходят вместе. Если правку приняли в работу — придёт ' +
       'outcome (чем кончился ход). Если правку не приняли вовсе — придёт reason (почему отказали), и никакого ' +
       'outcome не будет. Не ищи outcome в отказе и не выдавай отказ за исход.\n' +
@@ -362,7 +622,7 @@ export const PRODUCT_TOOLS = [
     input_schema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'edit', 'status'] },
+        action: { type: 'string', enum: ['list', 'edit', 'status', 'domain'] },
         product: {
           type: 'string',
           description: 'Как пользователь назвал продукт: имя («магазин цветов»), слаг или домен. Для edit обязательно.',
@@ -374,6 +634,19 @@ export const PRODUCT_TOOLS = [
         turnId: {
           type: 'string',
           description: 'Идентификатор правки из прошлого вызова edit. Для status вместо product.',
+        },
+        domain: {
+          type: 'string',
+          description: 'Свой домен пользователя для action="domain" (например, "mysite.ru"). Без него — узнать состояние.',
+        },
+        remove: {
+          type: 'boolean',
+          description: 'Для action="domain": true — отвязать свой домен.',
+        },
+        check: {
+          type: 'boolean',
+          description:
+            'Для action="domain": true — проверить DNS сейчас (после того как пользователь поменял записи или после отказа выпуска).',
         },
       },
       required: ['action'],

@@ -55,7 +55,8 @@ ALTER TABLE products DROP CONSTRAINT IF EXISTS products_status_check;
 ALTER TABLE products ADD CONSTRAINT products_status_check
   CHECK (status IN ('provisioning','running','degraded','stopped','archived','failed','sleeping','blocked'));
 
--- ВИД ЗАДАНИЯ. Сегодня вид один и подразумевается; со сном их три.
+-- ВИД ЗАДАНИЯ. Сегодня вид один и подразумевается; со сном их три, а со
+-- своим доменом (008_domains.sql) — четыре.
 --
 -- DEFAULT здесь ОСТАЁТСЯ — в отличие от products.kind, у которого 002 его
 -- снимает следующей же строкой. Разница не в стиле: у продукта забытый kind
@@ -71,9 +72,12 @@ ALTER TABLE products ADD CONSTRAINT products_status_check
 -- `kind` в таком запросе — ошибка неоднозначности в рантайме. Существующий
 -- claimJob уточняет везде (проверено), новые — обязаны тоже.
 ALTER TABLE product_provision_jobs ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'provision';
+-- 'domain' — вид из 008_domains.sql (свой домен). Словарь объявлен ТОЛЬКО
+-- здесь: 004 исполняется при каждом старте раньше 008, а обязательная 008
+-- перевешиваемых словарей не содержит (см. её шапку).
 ALTER TABLE product_provision_jobs DROP CONSTRAINT IF EXISTS product_provision_jobs_kind_check;
 ALTER TABLE product_provision_jobs ADD CONSTRAINT product_provision_jobs_kind_check
-  CHECK (kind IN ('provision','sleep','wake'));
+  CHECK (kind IN ('provision','sleep','wake','domain'));
 
 -- ОТБОР ПО СРОКУ ОПЛАТЫ: сборщику — «кому пора платить», пробуждению — «кого
 -- будить первым» (спящие в порядке засыпания).

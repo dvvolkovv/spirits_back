@@ -49,6 +49,19 @@ export class FakeHost {
    * лежит 0 — «проксировать некуда».
    */
   vhostModes = new Map<string, 'live' | 'asleep'>();
+  /**
+   * Свои имена в конфиге продукта — ПОСЛЕДНИЙ набор, а не накопленный: живой
+   * product-vhost переписывает конфиг целиком, и имя, не приехавшее в вызове,
+   * из конфига уходит. Пустой список — «своих имён нет».
+   */
+  vhostDomains = new Map<string, string[]>();
+  /** Сертификаты certbot по имени (`--cert-name`). */
+  certs = new Set<string>();
+  /**
+   * Текст отказа `certbot certonly`, заданный тестом, или null — выпуск проходит.
+   * Отказ бросается ДО выпуска: сертификата после него нет, как у живого certbot.
+   */
+  certbotFails: string | null = null;
   /** Всё, что запускалось, в порядке запуска. */
   calls: string[][] = [];
   removedDirs: string[] = [];
@@ -81,7 +94,17 @@ export class FakeHost {
       case 'chown':
         return '';
       case 'product-vhost': {
-        const [slug, arg] = rest;
+        const [slug, arg, ...tail] = rest;
+        // Хвост — только пары `--domain <имя>`. Всё прочее живой скрипт не
+        // поймёт, и симулятор, проглотивший хвост, зеленил бы форму вызова,
+        // на которой скрипт падает.
+        const names: string[] = [];
+        for (let i = 0; i < tail.length; i += 2) {
+          if (tail[i] !== '--domain' || !tail[i + 1]) {
+            throw new Error(`product-vhost: непонятный хвост: ${tail.join(' ')}`);
+          }
+          names.push(tail[i + 1]);
+        }
         // Живой скрипт — `sh -eu` с `S="$1"; P="$2"`, и конфиг он пишет ДО
         // `nginx -t`. Флаг он обязан разбирать сам: `product-vhost shop
         // --asleep` на прежней редакции подставил бы `--asleep` в
@@ -91,14 +114,18 @@ export class FakeHost {
           this.confFiles.set(slug, 0);
           this.liveVhosts.set(slug, 0);
           this.vhostModes.set(slug, 'asleep');
+          this.vhostDomains.set(slug, names);
           return '';
         }
         if (!/^\d+$/.test(arg ?? '')) throw new Error(`product-vhost: порт не число: ${arg}`);
         this.confFiles.set(slug, Number(arg));
         this.liveVhosts.set(slug, Number(arg));
         this.vhostModes.set(slug, 'live');
+        this.vhostDomains.set(slug, names);
         return '';
       }
+      case 'certbot':
+        return this.certbot(rest);
       case 'rm': {
         // Подчистка конфига vhost — единственное место, где остался rm.
         if (rest[0] !== '-f') throw new Error(`неожиданные флаги rm: ${rest.join(' ')}`);
@@ -106,6 +133,7 @@ export class FakeHost {
         if (!m) throw new Error(`rm по неожиданному пути: ${rest[1]}`);
         this.confFiles.delete(m[1]);
         this.vhostModes.delete(m[1]);
+        this.vhostDomains.delete(m[1]);
         return '';
       }
       case 'nginx': {
@@ -233,6 +261,30 @@ export class FakeHost {
       if (c.publish === publish) return true;
     }
     return false;
+  }
+
+  /**
+   * certbot в той форме, в какой его зовёт задание domain: `certonly` (выпуск
+   * или расширение по `--cert-name`) и `delete`. Живой `certbot delete` по
+   * отсутствующему имени отвечает «No certificate found with name …» и rc=1 —
+   * на этом тексте отвязка отличает повтор от настоящего отказа.
+   */
+  private certbot(rest: string[]): string {
+    const [sub, ...args] = rest;
+    const at = args.indexOf('--cert-name');
+    const name = at >= 0 ? args[at + 1] : undefined;
+    if (!name) throw new Error(`certbot ${sub}: без --cert-name`);
+    if (sub === 'certonly') {
+      if (this.certbotFails !== null) throw new Error(this.certbotFails);
+      this.certs.add(name);
+      return '';
+    }
+    if (sub === 'delete') {
+      if (!this.certs.has(name)) throw new Error(`No certificate found with name ${name}`);
+      this.certs.delete(name);
+      return '';
+    }
+    throw new Error(`certbot ${sub}: симулятор знает только certonly и delete`);
   }
 
   /** Есть ли контейнер и запущен ли он. */

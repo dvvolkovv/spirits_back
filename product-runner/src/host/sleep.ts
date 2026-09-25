@@ -52,6 +52,7 @@
  */
 import { CONTAINER_PORT, DEFAULTS, ProvisionDeps, SLUG_RE } from './provision';
 import { ProductKind } from './skeleton';
+import { vhostArgv } from './vhost';
 
 /**
  * Задание сна или пробуждения в том виде, в каком оно приезжает с сервера.
@@ -66,6 +67,12 @@ export interface SleepJob {
   kind: ProductKind;
   /** Порт сайта. У бота его нет, у сайта обязан быть при пробуждении. */
   port?: number | null;
+  /**
+   * Свои имена продукта: заглушка и возврат прокси обязаны лечь и на них.
+   * Каждый вызов product-vhost переписывает конфиг ЦЕЛИКОМ, и сон без имён
+   * снял бы домен клиента ровно в момент засыпания.
+   */
+  customNames?: string[];
 }
 
 /** Проверка слага — своя, хотя он и проверен на сервере. См. шапку provision.ts. */
@@ -92,8 +99,9 @@ export async function sleepProduct(job: SleepJob, deps: ProvisionDeps): Promise<
   assertKind(job.kind);
 
   if (job.kind === 'site') {
-    // ДО гашения: см. «Порядок шагов» в шапке.
-    await deps.run([deps.vhostBin ?? DEFAULTS.vhostBin, job.slug, '--asleep']);
+    // ДО гашения: см. «Порядок шагов» в шапке. Строка собирается тоже до
+    // него: мусорное имя обязано отказать, пока контейнер ещё жив.
+    await deps.run(vhostArgv(deps.vhostBin ?? DEFAULTS.vhostBin, job.slug, '--asleep', job.customNames ?? []));
   }
   // Именно stop: контейнер обязан остаться. См. шапку.
   await deps.run(['docker', 'stop', job.slug]);
@@ -203,9 +211,17 @@ export async function wakeProduct(job: SleepJob, deps: ProvisionDeps): Promise<{
     );
   }
 
+  // Строка возврата домена собирается ДО `docker start`: мусорное имя обязано
+  // отказать, пока на хосте ничего не тронуто, а не после подъёма контейнера
+  // с доменом, оставшимся на заглушке.
+  const back =
+    job.kind === 'site'
+      ? vhostArgv(deps.vhostBin ?? DEFAULTS.vhostBin, job.slug, port as number, job.customNames ?? [])
+      : undefined;
+
   await deps.run(['docker', 'start', job.slug]);
 
-  if (job.kind !== 'site') return {};
+  if (!back) return {};
 
   // Опрос ПО ФАКТУ, тот же, что при заведении. Голый TCP-connect здесь
   // бесполезен: порт хоста занимает docker-proxy с момента старта контейнера,
@@ -219,7 +235,7 @@ export async function wakeProduct(job: SleepJob, deps: ProvisionDeps): Promise<{
     );
   }
 
-  await deps.run([deps.vhostBin ?? DEFAULTS.vhostBin, job.slug, String(port)]);
+  await deps.run(back);
 
   return recovered === undefined ? {} : { port: recovered };
 }

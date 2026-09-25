@@ -16,6 +16,7 @@ import {
 import { FakeHost, deps as fakeDeps } from './fake-host';
 import { ProvisionDeps, hostDeps, provision as provisionReal } from './provision';
 import { SleepJob } from './sleep';
+import { DomainJob } from './domain';
 
 const JOB: HostJob = {
   jobId: 'j-1',
@@ -45,6 +46,7 @@ function makeDeps(config: Partial<HostConfig> = {}) {
   // Пустой объект, а не undefined: пробуждение отвечает портом, когда его
   // пришлось узнать у контейнера, и `{}` — это «узнавать не пришлось».
   const wakeProduct = jest.fn(async (_job: SleepJob): Promise<{ port?: number }> => ({}));
+  const domain = jest.fn(async (_job: DomainJob): Promise<void> => undefined);
   const sleepFn = jest.fn(async (_ms: number): Promise<unknown> => undefined);
   const logs: string[] = [];
 
@@ -54,12 +56,13 @@ function makeDeps(config: Partial<HostConfig> = {}) {
     provision,
     sleepProduct,
     wakeProduct,
+    domain,
     sleep: sleepFn,
     log: (message: string) => {
       logs.push(message);
     },
   };
-  return { deps, poll, complete, provision, sleepProduct, wakeProduct, sleep: sleepFn, logs };
+  return { deps, poll, complete, provision, sleepProduct, wakeProduct, domain, sleep: sleepFn, logs };
 }
 
 /** Последний отчёт, доехавший до `complete`. */
@@ -868,8 +871,77 @@ describe('разбор вида задания', () => {
     await tick(deps);
 
     const got = wakeProduct.mock.calls[0][0];
-    expect(got).toEqual({ slug: 'shop', kind: 'site', port: 8123 });
-    expect(Object.keys(got).sort()).toEqual(['kind', 'port', 'slug']);
+    // Свои имена — тоже в выжимке: без них пробуждение переписало бы конфиг
+    // без домена клиента. Задание без поля (сервер старше агента) даёт пустой
+    // список, а не undefined — хостовой шаг не гадает.
+    expect(got).toEqual({ slug: 'shop', kind: 'site', port: 8123, customNames: [] });
+    expect(Object.keys(got).sort()).toEqual(['customNames', 'kind', 'port', 'slug']);
+  });
+
+  it('свои имена задания доезжают до сна и до пробуждения', async () => {
+    const { deps, poll, sleepProduct, wakeProduct } = makeDeps();
+    poll.mockResolvedValueOnce({ ok: true, job: { ...SLEEP_JOB, customNames: ['a.ru'] } });
+    poll.mockResolvedValueOnce({ ok: true, job: { ...WAKE_JOB, customNames: ['a.ru', 'www.a.ru'] } });
+
+    await tick(deps);
+    await tick(deps);
+
+    expect(sleepProduct.mock.calls[0][0].customNames).toEqual(['a.ru']);
+    expect(wakeProduct.mock.calls[0][0].customNames).toEqual(['a.ru', 'www.a.ru']);
+  });
+
+  it('задание domain уходит в deps.domain ВЫЖИМКОЙ, отчёт — без порта', async () => {
+    // Токен раннера и секреты тащить на хостовой шаг незачем: у задания
+    // domain сервер их не присылает, а у выжимки их нет по построению. Порт в
+    // отчёт не кладётся — домен порта не меняет, и `{ ok: true, port }` на
+    // сервере читался бы как новость (COALESCE).
+    const { deps, poll, provision, sleepProduct, wakeProduct, domain, complete } = makeDeps();
+    poll.mockResolvedValue({
+      ok: true,
+      job: {
+        ...JOB, jobKind: 'domain', port: 8001, customNames: ['a.ru'], vhostMode: 'proxy',
+        secrets: { KEY: 'секрет' },
+      },
+    });
+
+    await tick(deps);
+
+    expect(provision).not.toHaveBeenCalled();
+    expect(sleepProduct).not.toHaveBeenCalled();
+    expect(wakeProduct).not.toHaveBeenCalled();
+    expect(domain).toHaveBeenCalledTimes(1);
+    const got = domain.mock.calls[0][0];
+    expect(got).toEqual({ slug: 'shop', kind: 'site', port: 8001, customNames: ['a.ru'], vhostMode: 'proxy' });
+    expect(Object.keys(got).sort()).toEqual(['customNames', 'kind', 'port', 'slug', 'vhostMode']);
+    expect(complete).toHaveBeenCalledWith('j-1', { ok: true });
+  });
+
+  it('задание domain без имён — отвязка, имена уезжают пустым списком', async () => {
+    const { deps, poll, domain } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: { ...JOB, jobKind: 'domain', port: 8001, vhostMode: 'asleep' } });
+
+    await tick(deps);
+
+    expect(domain.mock.calls[0][0].customNames).toEqual([]);
+    expect(domain.mock.calls[0][0].vhostMode).toBe('asleep');
+  });
+
+  it('domain — известный вид: отказа «неизвестный вид» у него не бывает', async () => {
+    // Сервер по началу этого текста решает «агент устарел» и возвращает
+    // попытку выпуска. Агент, знающий domain, так отвечать не имеет права.
+    expect(KNOWN_KINDS).toContain('domain');
+  });
+
+  it('брошенное по сроку задание domain — своими словами', async () => {
+    const { deps, poll, domain, complete } = makeDeps({ provisionTimeoutMs: 50 });
+    poll.mockResolvedValue({ ok: true, job: { ...JOB, jobKind: 'domain', port: 8001, customNames: ['a.ru'] } });
+    domain.mockImplementation(() => new Promise<void>(() => {}));
+
+    await tick(deps);
+
+    const report = lastReport(complete);
+    expect(report.ok).toBe(false);
+    expect((report as { error: string }).error).toMatch(/задание своего домена не уложилось.*certbot certificates/s);
   });
 
   it('задание без вида — это заведение, а не отказ', async () => {
@@ -1133,6 +1205,22 @@ describe('боевые зависимости знают все три вида'
     expect(typeof deps.provision).toBe('function');
     expect(typeof deps.sleepProduct).toBe('function');
     expect(typeof deps.wakeProduct).toBe('function');
+    expect(typeof deps.domain).toBe('function');
+  });
+
+  it('задание domain получает те же настройки хоста, что и заведение', async () => {
+    const captured: ProvisionDeps[] = [];
+    const deps = realDeps(CONFIG, {
+      log: () => {},
+      buildDeps: (over) => over as ProvisionDeps,
+      domain: async (_job, d) => {
+        captured.push(d);
+      },
+    });
+
+    await deps.domain({ slug: 'shop', kind: 'site', port: 8003, customNames: ['a.ru'], vhostMode: 'proxy' });
+
+    expect(captured.map((d) => d.linkeonUrl)).toEqual([CONFIG.linkeonUrl]);
   });
 });
 

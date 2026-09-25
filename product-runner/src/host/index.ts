@@ -3,6 +3,7 @@ import { DEFAULT_PROVISION_TIMEOUT_MS, HostConfig, loadConfig } from './config';
 import { HostApi, HostJob, JobReport, PollOutcome } from './api';
 import { hostDeps, provision as provisionReal, ProvisionDeps } from './provision';
 import { SleepJob, sleepProduct as sleepReal, wakeProduct as wakeReal } from './sleep';
+import { DomainJob, applyDomain } from './domain';
 
 export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -35,6 +36,13 @@ export interface HostDeps {
    * Этим портом сервер лечит строку реестра, потерявшую его.
    */
   wakeProduct: (job: SleepJob) => Promise<{ port?: number }>;
+  /**
+   * Задание своего домена: привязка (выпуск по HTTP-01) или отвязка. Порта в
+   * ответе нет — домен порта не меняет. Обязательное по той же причине, что
+   * сон и пробуждение: забытое в сборке, оно было бы TypeError в рантайме на
+   * каждом выпуске при зелёном прогоне.
+   */
+  domain: (job: DomainJob) => Promise<void>;
   sleep?: (ms: number) => Promise<unknown>;
   log?: (message: string) => void;
 }
@@ -153,7 +161,7 @@ export async function tick(deps: HostDeps): Promise<void> {
 }
 
 /** Виды работы, которые агент умеет исполнять. */
-export const KNOWN_KINDS = ['provision', 'sleep', 'wake'] as const;
+export const KNOWN_KINDS = ['provision', 'sleep', 'wake', 'domain'] as const;
 export type JobKind = (typeof KNOWN_KINDS)[number];
 
 /**
@@ -207,7 +215,25 @@ function workFor(job: HostJob, deps: HostDeps): Promise<{ port?: number }> {
   }
   if (kind === 'provision') return deps.provision(job);
 
-  const step: SleepJob = { slug: job.slug, kind: job.kind, port: job.port };
+  // Своему домену — тоже выжимка: ни токена, ни секретов. Порт в отчёт не
+  // кладётся (домен его не меняет, а `{ ok: true, port }` сервер прочёл бы как
+  // новость). Имена без поля — пустой список, то есть отвязка: так сервер и
+  // шлёт отвязку.
+  if (kind === 'domain') {
+    return deps
+      .domain({
+        slug: job.slug,
+        kind: job.kind,
+        port: job.port,
+        customNames: job.customNames ?? [],
+        vhostMode: job.vhostMode,
+      })
+      .then(() => ({}));
+  }
+
+  // Свои имена — в выжимке обязательно: сон и пробуждение переписывают
+  // конфиг целиком, и без имён домен клиента слетел бы на первом же сне.
+  const step: SleepJob = { slug: job.slug, kind: job.kind, port: job.port, customNames: job.customNames ?? [] };
   // У СНА порт в отчёт не кладётся намеренно: сон его не меняет, а
   // `{ ok: true, port: undefined }` читается в логе и в теле как «порт
   // потерян» — см. ниже, там же про COALESCE на сервере.
@@ -244,6 +270,11 @@ function overdue(kind: string, budgetMs: number): string {
       return (
         `пробуждение не уложилось в ${sec} с и брошено: состояние хоста НЕИЗВЕСТНО — `
         + 'контейнер мог подняться, а домен остаться на заглушке, сверить руками'
+      );
+    case 'domain':
+      return (
+        `задание своего домена не уложилось в ${sec} с и брошено: состояние хоста НЕИЗВЕСТНО — `
+        + 'конфиг и сертификат могли остаться частично, сверить `nginx -t` и `certbot certificates`'
       );
     default:
       return (
@@ -549,6 +580,7 @@ export interface RealDepsParts {
   provision?: (job: HostJob, deps: ProvisionDeps) => Promise<{ port?: number }>;
   sleepProduct?: (job: SleepJob, deps: ProvisionDeps) => Promise<void>;
   wakeProduct?: (job: SleepJob, deps: ProvisionDeps) => Promise<{ port?: number }>;
+  domain?: (job: DomainJob, deps: ProvisionDeps) => Promise<void>;
   buildDeps?: (overrides: Partial<ProvisionDeps>) => ProvisionDeps;
 }
 
@@ -557,6 +589,7 @@ export function realDeps(config: HostConfig, parts: RealDepsParts = {}): HostDep
   const run = parts.provision ?? provisionReal;
   const doSleep = parts.sleepProduct ?? sleepReal;
   const doWake = parts.wakeProduct ?? wakeReal;
+  const doDomain = parts.domain ?? applyDomain;
   const build = parts.buildDeps ?? hostDeps;
   return {
     config,
@@ -578,6 +611,7 @@ export function realDeps(config: HostConfig, parts: RealDepsParts = {}): HostDep
     // ПРИЧИНА отказа маскируется не здесь, а в runJob — там задание целиком.
     sleepProduct: (job: SleepJob) => doSleep(job, build(provisionOverrides(config, log))),
     wakeProduct: (job: SleepJob) => doWake(job, build(provisionOverrides(config, log))),
+    domain: (job: DomainJob) => doDomain(job, build(provisionOverrides(config, log))),
     log,
   };
 }

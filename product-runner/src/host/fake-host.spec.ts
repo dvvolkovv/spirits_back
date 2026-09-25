@@ -188,4 +188,58 @@ describe('vhost', () => {
   it('домена нет вовсе — это не заглушка и не боевой режим', async () => {
     expect(host.vhostMode('nikogo')).toBeUndefined();
   });
+
+  it('свои имена запоминаются по каждому вызову — и в прокси, и в заглушке', async () => {
+    // Каждый вызов ПЕРЕПИСЫВАЕТ конфиг целиком: имена, не приехавшие в этом
+    // вызове, из конфига уходят. Ровно на этом стоят проверки «сон не потерял
+    // домен», поэтому симулятор обязан помнить последний набор, а не копить.
+    await host.run(['product-vhost', 'shop', '8001', '--domain', 'a.ru', '--domain', 'www.a.ru']);
+    expect(host.vhostDomains.get('shop')).toEqual(['a.ru', 'www.a.ru']);
+
+    await host.run(['product-vhost', 'shop', '--asleep', '--domain', 'a.ru']);
+    expect([host.vhostMode('shop'), host.vhostDomains.get('shop')]).toEqual(['asleep', ['a.ru']]);
+
+    await host.run(['product-vhost', 'shop', '8001']);
+    expect(host.vhostDomains.get('shop')).toEqual([]);
+  });
+
+  it('непонятный хвост после цели — отказ, а не молча проглоченный аргумент', async () => {
+    // Хвост, который симулятор пропустил бы, живой скрипт тоже должен был бы
+    // понять — иначе батарея зеленит форму вызова, на которой скрипт падает.
+    await expect(host.run(['product-vhost', 'shop', '8001', 'a.ru'])).rejects.toThrow(/хвост/);
+    await expect(host.run(['product-vhost', 'shop', '8001', '--domain'])).rejects.toThrow(/хвост/);
+    await expect(host.run(['product-vhost', 'shop', '--asleep', '--name', 'a.ru'])).rejects.toThrow(/хвост/);
+  });
+});
+
+describe('certbot', () => {
+  const certonly = (name: string, ...domains: string[]) =>
+    host.run(['certbot', 'certonly', '--webroot', '-w', '/var/www/linkeon-acme', '--cert-name', name,
+      '--non-interactive', '--agree-tos', '--keep-until-expiring', '--expand',
+      ...domains.flatMap((d) => ['-d', d])]);
+
+  it('certonly выпускает сертификат, delete снимает', async () => {
+    await certonly('linkeon-shop', 'a.ru');
+    expect(host.certs.has('linkeon-shop')).toBe(true);
+
+    await host.run(['certbot', 'delete', '--cert-name', 'linkeon-shop', '--non-interactive']);
+    expect(host.certs.has('linkeon-shop')).toBe(false);
+  });
+
+  it('отказ выпуска — текстом, заданным тестом, и сертификата нет', async () => {
+    host.certbotFails = 'Type: unauthorized';
+
+    await expect(certonly('linkeon-shop', 'a.ru')).rejects.toThrow('Type: unauthorized');
+    expect(host.certs.size).toBe(0);
+  });
+
+  it('delete несуществующего — отказ «No certificate found», как у живого certbot', async () => {
+    await expect(
+      host.run(['certbot', 'delete', '--cert-name', 'linkeon-net', '--non-interactive']),
+    ).rejects.toThrow(/No certificate found with name linkeon-net/);
+  });
+
+  it('прочие подкоманды — отказ', async () => {
+    await expect(host.run(['certbot', 'renew'])).rejects.toThrow(/certbot/);
+  });
 });

@@ -119,9 +119,32 @@ describe('колонки клиентской выдачи', () => {
       // причины, потому что сервер её не отдаёт.
       'block_reason',
       'created_at',
+      // Свой домен (миграция 008), только работающий: «https://<домен>»
+      // становится главной ссылкой карточки. Привязка в процессе ссылкой не
+      // становится — сервер отдаёт NULL.
+      'custom_domain',
     ]) {
       expect(calls[0].sql).toContain(column);
     }
+  });
+});
+
+describe('своя ссылка кабинета (custom_domain_unicode)', () => {
+  // custom_domain из COLUMNS приезжает в punycode/ASCII — то, что реально
+  // лежит в DNS и годится для ссылки. Читаемую форму для кириллических
+  // доменов (`пример.рф`) считает сам сервис в JS уже после выборки: в
+  // Postgres нет IDN-функций (см. products.service.ts). Мок здесь подделывает
+  // уже готовую строку из базы — сторож не про SQL, а про маппинг после него.
+  it('добавляет читаемую форму рядом с ASCII и null там, где своего домена нет', async () => {
+    const { svc } = makeService([
+      { ...ROW, custom_domain: 'xn--e1afmkfd.xn--p1ai' },
+      { ...ROW, id: 'p-2', slug: 'other', custom_domain: null },
+    ]);
+
+    const rows = await svc.list('79030169187');
+
+    expect(rows[0]).toMatchObject({ custom_domain: 'xn--e1afmkfd.xn--p1ai', custom_domain_unicode: 'пример.рф' });
+    expect(rows[1]).toMatchObject({ custom_domain: null, custom_domain_unicode: null });
   });
 });
 
