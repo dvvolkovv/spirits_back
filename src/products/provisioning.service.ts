@@ -232,6 +232,17 @@ const HEARTBEAT_FRESH_MS = 2 * 60 * 1000;
  */
 export const DOMAIN_ERROR_MAX = 1000;
 
+/**
+ * Подрезка до DOMAIN_ERROR_MAX по КОДОВЫМ ТОЧКАМ, а не по UTF-16: `slice`
+ * разрезал бы эмодзи на границе пополам, и в базу уехала бы одинокая
+ * половина суррогатной пары (node-postgres превращает её в U+FFFD). Длина
+ * text в PostgreSQL тоже в символах — счёт совпадает с базой.
+ */
+const clipDomainError = (text: string): string => {
+  const points = Array.from(text);
+  return points.length > DOMAIN_ERROR_MAX ? `${points.slice(0, DOMAIN_ERROR_MAX - 1).join('')}…` : text;
+};
+
 const PROVISION_DEADLINE_MIN = 10;
 const DEADLINE_SQL = `interval '${PROVISION_DEADLINE_MIN} minutes'`;
 // `/ 1000` — не косметика. Константа хранится в МИЛЛИСЕКУНДАХ (её читает
@@ -1035,8 +1046,11 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    */
   private async completeDomainJob(jobId: string, result: { ok: boolean; error?: string }) {
     const raw = result.error ?? 'без причины';
-    const error = raw.length > DOMAIN_ERROR_MAX ? `${raw.slice(0, DOMAIN_ERROR_MAX - 1)}…` : raw;
-    const outdated = !result.ok && error.startsWith(AGENT_OUTDATED_MARKER);
+    const error = clipDomainError(raw);
+    // Пометка отвязки дописывается ДО подрезки: потолок держит итоговая
+    // строка домена, а не только текст агента.
+    const detachError = clipDomainError(`отвязка не удалась: ${raw}`);
+    const outdated = !result.ok && raw.startsWith(AGENT_OUTDATED_MARKER);
     const r = await this.pg.query(
       `WITH closed AS (
           UPDATE product_provision_jobs
@@ -1062,7 +1076,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
        ), refused AS (
           UPDATE product_domains d
              SET status = 'failed',
-                 error = CASE WHEN d.status = 'removing' THEN 'отвязка не удалась: ' || $3::text ELSE $3::text END,
+                 error = CASE WHEN d.status = 'removing' THEN $5::text ELSE $3::text END,
                  error_reason = CASE WHEN d.status = 'removing' THEN 'remove_failed'
                                      WHEN $4::boolean THEN 'agent_outdated'
                                      ELSE 'issue_failed' END,
@@ -1081,7 +1095,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
           RETURNING d.product_id
        )
        SELECT (SELECT count(*) FROM closed)::int AS closed`,
-      [jobId, result.ok, error, outdated],
+      [jobId, result.ok, error, outdated, detachError],
     );
     if (!r.rows[0].closed) this.logger.warn(`отчёт по незапущенному заданию domain ${jobId} — домен не тронут`);
   }

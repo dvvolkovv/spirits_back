@@ -476,6 +476,33 @@ maybe('задание domain: выдача агенту и приём отчёт
     expect((await domainRow()).error).toBe(j.error);
   });
 
+  // Пометка отвязки дописывается к тексту агента — потолок держит итоговая
+  // строка домена, а не только текст до пометки.
+  it('длинный отказ отвязки: строка домена — не длиннее 1000 знаков вместе с пометкой', async () => {
+    const id = await mkProduct('shop');
+    await domain(id, 'removing');
+    const jobId = await job(id, 'domain');
+    await prov.claimJob('own');
+    await report(jobId, { ok: false, error: 'ш'.repeat(5000) });
+    const { error } = await domainRow();
+    expect(error).toHaveLength(1000);
+    expect(error.startsWith('отвязка не удалась: ')).toBe(true);
+    expect(error.endsWith('…')).toBe(true);
+  });
+
+  // Подрезка по кодовым точкам: по UTF-16 она разрезала бы эмодзи на
+  // границе пополам, и в базу уехала бы одинокая половина пары.
+  it('эмодзи на границе подрезки не разрезается пополам', async () => {
+    const id = await mkProduct('shop');
+    await domain(id, 'issuing');
+    const jobId = await job(id, 'domain');
+    await prov.claimJob('own');
+    await report(jobId, { ok: false, error: 'x'.repeat(998) + '😀' + 'y'.repeat(10) });
+    const want = 'x'.repeat(998) + '😀' + '…';
+    expect((await jobRow(jobId)).error).toBe(want);
+    expect((await domainRow()).error).toBe(want);
+  });
+
   it('отказ ровно в 1000 знаков не подрезается', async () => {
     const id = await mkProduct('shop');
     await domain(id, 'issuing');
