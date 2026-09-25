@@ -5,6 +5,7 @@ import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from './pg.service';
+import { neutralizeAtMentions, stripWordJoiner } from '../agent-guards';
 
 export interface ClaudeCliProgressEvent {
   kind: 'tool_use';
@@ -159,13 +160,21 @@ export class ClaudeCliService {
     }
 
     // Compose final prompt: system + user (claude -p has no separate --system arg).
-    let userBlock = prompt;
+    //
+    // Безопасность: обезвреживаем @-упоминания в тексте от caller-а (и prompt, и
+    // system) ДО того, как допишем СВОИ ссылки на вложения. Наши `@<имя>` идут
+    // после нейтрализации и остаются живыми — CLI их развернёт и подтянет файл.
+    // Без этого `@/home/dvolkov/spirits_back/.env` в реплике пользователя
+    // инлайнился бы в промпт мимо всех ограничений тулов.
+    const safePrompt = neutralizeAtMentions(prompt);
+    let userBlock = safePrompt;
     if (hasAttachments && refNames.length) {
       const refs = refNames.map(r => `@${r}`).join(' ');
-      userBlock = `${prompt}\n\nПриложенные файлы: ${refs}`;
+      userBlock = `${safePrompt}\n\nПриложенные файлы: ${refs}`;
     }
-    const fullPrompt = opts.system
-      ? `${opts.system}\n\n---\n\nUSER REQUEST:\n${userBlock}`
+    const safeSystem = opts.system ? neutralizeAtMentions(opts.system) : opts.system;
+    const fullPrompt = safeSystem
+      ? `${safeSystem}\n\n---\n\nUSER REQUEST:\n${userBlock}`
       : userBlock;
 
     // --allowedTools — это АВТО-ОДОБРЕНИЕ уже доступного. Дефолт как раньше.
@@ -275,7 +284,9 @@ export class ClaudeCliService {
             durationMs: streamDurationMs,
             ok: true,
           });
-          resolve({ text: streamResultText, costUsd: streamCostUsd });
+          // stripWordJoiner на выходе: U+2060, которым мы обезвреживали
+          // @-упоминания во входе, не должен доехать до пользователя.
+          resolve({ text: stripWordJoiner(streamResultText), costUsd: streamCostUsd });
           return;
         }
 
@@ -301,7 +312,7 @@ export class ClaudeCliService {
             reject(new Error(`claude CLI error: ${json.result ?? 'unknown'}`));
             return;
           }
-          const text: string = json.result ?? '';
+          const text: string = stripWordJoiner(json.result ?? '');
           const costUsd: number = typeof json.total_cost_usd === 'number' ? json.total_cost_usd : 0;
           if (costUsd) {
             this.logger.debug(`claude CLI cost: $${costUsd.toFixed(4)}, ${json.duration_ms}ms`);

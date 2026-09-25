@@ -12,7 +12,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { query } from '@anthropic-ai/claude-agent-sdk';
-import { makeReadWithinDirGuard } from '../common/agent-guards';
+import { makeReadWithinDirGuard, neutralizeAtMentions, stripWordJoiner } from '../common/agent-guards';
 import { decodeMultipartFilename } from '../common/utils/multipart-filename';
 import { TEST_USERS } from '../common/test-users';
 
@@ -496,9 +496,12 @@ export class ChatController {
       await fsp.writeFile(filePath, file.buffer);
 
       let collected = '';
+      // safeName уже очищен от не-[\w.\-], @ в нём быть не может; обезвреживание
+      // @-упоминаний здесь — защита на будущее и единый инвариант для всех
+      // SDK-вызовов (см. статический сторож).
       for await (const event of query({
-        prompt: `Прочитай файл ${safeName} инструментом Read, указав ровно относительное имя "${safeName}" (файл лежит в текущей рабочей директории; НЕ добавляй ведущий слэш и не придумывай другой путь), и извлеки профиль пользователя. Верни ТОЛЬКО JSON без markdown-обёрток:
-{"name":"Имя","family_name":"Фамилия","profile":["факты"],"values":["ценности"],"skills":["навыки"],"beliefs":["убеждения"],"desires":["желания"],"interests":["интересы"],"search":["что ищет"]}`,
+        prompt: neutralizeAtMentions(`Прочитай файл ${safeName} инструментом Read, указав ровно относительное имя "${safeName}" (файл лежит в текущей рабочей директории; НЕ добавляй ведущий слэш и не придумывай другой путь), и извлеки профиль пользователя. Верни ТОЛЬКО JSON без markdown-обёрток:
+{"name":"Имя","family_name":"Фамилия","profile":["факты"],"values":["ценности"],"skills":["навыки"],"beliefs":["убеждения"],"desires":["желания"],"interests":["интересы"],"search":["что ищет"]}`),
         options: {
           model: 'claude-haiku-4-5',
           cwd,
@@ -528,7 +531,7 @@ export class ChatController {
         }
       }
 
-      let text = collected.trim();
+      let text = stripWordJoiner(collected).trim();
       if (text.includes('```')) {
         text = text.replace(/^[\s\S]*?```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
       }

@@ -124,6 +124,18 @@ describe('lockdown: SDK query() всегда с явным tools:', () => {
     expect(offenders).toEqual([]);
   });
 
+  it('каждый файл с SDK query() ссылается на neutralizeAtMentions (@-упоминания обезврежены)', () => {
+    const offenders: string[] = [];
+    for (const f of files) {
+      const src = fs.readFileSync(f, 'utf8');
+      const clean = stripComments(src);
+      if (!importsSdkQuery(clean)) continue;
+      // Файл вызывает SDK query → обязан обезвреживать @-упоминания во вводе.
+      if (!/\bneutralizeAtMentions\b/.test(clean)) offenders.push(path.relative(SRC_ROOT, f));
+    }
+    expect(offenders).toEqual([]);
+  });
+
   it('во всём src нет claudeCli.text/textWithCost с литеральным Bash|Write|Edit в allowedTools', () => {
     const offenders: string[] = [];
     for (const f of files) {

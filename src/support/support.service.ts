@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
+import { neutralizeAtMentions, stripWordJoiner } from '../common/agent-guards';
 import { z } from 'zod';
 import { PgService } from '../common/services/pg.service';
 import {
@@ -298,10 +299,14 @@ export class SupportService implements OnModuleInit {
 
     try {
       for await (const event of query({
-        prompt,
+        // Обезвреживаем @-упоминания в тексте тикета (недоверенный ввод) и в
+        // системном промпте: `@/…/.env` иначе инлайнится в промпт мимо tools.
+        // Промпт начинается с метки роли ("USER:"/"ASSISTANT:"), а не с сырого
+        // ввода, поэтому ведущий `/` как slash-команда здесь не грозит.
+        prompt: neutralizeAtMentions(prompt),
         options: {
           model: 'claude-haiku-4-5',
-          systemPrompt,
+          systemPrompt: neutralizeAtMentions(systemPrompt),
           mcpServers: { 'support-tools': mcp },
           // Безопасность (25.09.2026). Тикет-агенту нужны ТОЛЬКО MCP-тулы
           // support-tools (get_user_context, refund_tokens, escalate…), но не
@@ -348,7 +353,8 @@ export class SupportService implements OnModuleInit {
       return;
     }
 
-    finalText = finalText.trim();
+    // Снимаем U+2060 из ответа модели, чтобы joiner не доехал до пользователя.
+    finalText = stripWordJoiner(finalText).trim();
     if (!finalText) {
       finalText = escalated
         ? 'Передал вопрос команде. С вами свяжутся отсюда в этом же чате, как только разберутся.'
