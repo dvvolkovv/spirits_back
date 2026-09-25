@@ -1,7 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
-import { BlogTopicService, normalizeTopicKey, STALE_DRAFTING_MINUTES } from './blog-topic.service';
+import {
+  BlogTopicService, caseTopicHint, hasClearProfile, normalizeTopicKey, STALE_DRAFTING_MINUTES,
+} from './blog-topic.service';
 import { BlogEditorService } from './blog-editor.service';
 import { BlogImageService } from './blog-image.service';
 import { BlogPublisherService, MAX_PUBLISH_ATTEMPTS } from './blog-publisher.service';
@@ -93,10 +95,17 @@ export class BlogCron {
 
     try {
       for (const a of await this.topics.topAssistants(3)) {
+        // Запрос уже отсекает ассистентов без профиля; здесь — последний
+        // рубеж: подсказка без профиля и есть тот кейс о выдуманном
+        // ассистенте, ради которого всё затевалось.
+        if (!hasClearProfile(a.description)) {
+          this.logger.warn(`кейс про «${a.agentName}» не заведён: нет внятного профиля в agents.description`);
+          continue;
+        }
         await this.topics.addTopic({
           rubric: 'case', source: 'stats', sourceRef: `stats:${a.agentId}`,
           topicKey: normalizeTopicKey(`кейс ${a.agentName} ${new Date().toISOString().slice(0, 10)}`),
-          topicHint: `На этой неделе чаще всего обращались к ассистенту «${a.agentName}» (${a.turns} обращений). Придумай кейс по его профилю.`,
+          topicHint: caseTopicHint(a),
         });
       }
     } catch (e: any) {

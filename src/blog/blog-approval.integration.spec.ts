@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { Pool } from 'pg';
+import { Client, Pool } from 'pg';
 import { BlogApprovalService } from './blog-approval.service';
 import { BlogPublisherService } from './blog-publisher.service';
 import { BlogTopicService, STALE_DRAFTING_MINUTES } from './blog-topic.service';
@@ -653,5 +653,145 @@ maybe('Очередь черновиков против живого Postgres', 
   it('брошенный черновик (отметка старше порога) не держит очередь — его берут заново', async () => {
     const abandoned = await insert('drafting', 'case', STALE_DRAFTING_MINUTES + 1);
     expect(await tick()).toEqual([abandoned]);
+  });
+});
+
+/**
+ * Темы кейсов — на настоящем SQL: кто попадает в топ ассистентов недели.
+ *
+ * Всё, что решает выборка, решает запрос: чьи реплики считаются (тестовые
+ * аккаунты отсекаются по префиксу session_id, и в этом участвует регулярка),
+ * кто вообще кандидат (профиль в agents.description, is_active). Заглушка в
+ * blog-topic.service.spec.ts видит только текст запроса.
+ *
+ * Таблицы `agents` и `custom_chat_history` — ВРЕМЕННЫЕ, на отдельном
+ * соединении: временная схема ищется первой, так что запрос сервиса видит
+ * именно их, а постоянные таблицы (если BLOG_PG_URL вдруг смотрит не туда) не
+ * тронуты ни записью, ни TRUNCATE. Гард на чужую базу всё равно зовётся —
+ * тем же порядком, что у соседних блоков.
+ */
+maybe('Темы кейсов против живого Postgres', () => {
+  jest.setTimeout(60_000);
+
+  let pool: Pool;
+  let db: Client;
+  let ours = false;   // гард пропустил базу — только тогда её можно трогать
+
+  const KIRA = { id: 22, name: 'Кира', description: 'Дизайнер — логотипы, фирменный стиль, макеты, баннеры и презентации' };
+  const OLYA = { id: 2, name: 'Оля', description: 'Психолог и фасилитатор самоисследования — состояния, отношения, выгорание' };
+  const LAWYER = { id: 10, name: 'Алексей', description: 'Юрист — право, договоры, оферта, согласия, риски и требования регуляторов' };
+  const MISHA = { id: 1, name: 'Миша', description: 'Коуч по стандартам ICF — цели, решения, работа с собственными ограничениями' };
+  const ROMAN = { id: 12, name: 'Роман', description: null as string | null };   // профиля нет
+  const LIANA = { id: 13, name: 'Лиана', description: '   ' };                    // пробелы — тоже не профиль
+  const ANNA = { id: 9, name: 'Анна', description: 'Бухгалтер' };                  // ярлык, а не профиль
+  const YULIA = {                                                                 // снята с продукта 06.09.2026
+    id: 15, name: 'Юлия', description: 'SMM-продюсер — сценарии коротких роликов, контент для соцсетей', active: false,
+  };
+
+  const REAL_PHONE = '79161234567';
+  const REAL_PHONE_2 = '79261112233';
+  const REAL_PHONE_3 = '79035550011';                            // 790355…, не маска 790300xxxxx
+  const REAL_UUID = '3f2b8c1e-9d4a-4e6b-8f0c-2a7d5e1b9c34';      // вход по почте/OAuth: userId = UUID
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: PG, max: 1 });
+    await prepareDisposableDb(pool);
+    ours = true;
+
+    db = new Client({ connectionString: PG });
+    await db.connect();
+    await db.query(`
+      CREATE TEMP TABLE agents (
+        id integer NOT NULL, name text, system_prompt text, description text,
+        category varchar DEFAULT 'business', display_name text,
+        is_active boolean NOT NULL DEFAULT true
+      )`);
+    await db.query(`
+      CREATE TEMP TABLE custom_chat_history (
+        id serial, session_id text NOT NULL, sender_type varchar(10) NOT NULL,
+        agent integer, content text NOT NULL,
+        created_at timestamptz DEFAULT CURRENT_TIMESTAMP,
+        message_type varchar(20) NOT NULL DEFAULT 'text', tokens_used integer DEFAULT 0
+      )`);
+  });
+
+  afterAll(async () => {
+    await db?.end();     // временные таблицы уходят вместе с соединением
+    await pool?.end();
+  });
+
+  beforeEach(async () => {
+    if (!ours) throw new Error('база не прошла гард — не трогаю');
+    await db.query('TRUNCATE pg_temp.agents, pg_temp.custom_chat_history');
+    for (const a of [KIRA, OLYA, LAWYER, MISHA, ROMAN, LIANA, ANNA, YULIA]) {
+      await db.query(
+        `INSERT INTO pg_temp.agents (id, name, display_name, description, is_active) VALUES ($1, $2, $2, $3, $4)`,
+        [a.id, a.name, a.description, (a as any).active ?? true],
+      );
+    }
+  });
+
+  /** `n` реплик в сессию `session`; `daysAgo` — насколько давно. */
+  const say = async (session: string, agent: number, n: number, sender = 'human', daysAgo = 1) => {
+    await db.query(
+      `INSERT INTO pg_temp.custom_chat_history (session_id, sender_type, agent, content, created_at)
+       SELECT $1, $2, $3, 'реплика', now() - make_interval(days => $4) FROM generate_series(1, $5)`,
+      [session, sender, agent, daysAgo, n],
+    );
+  };
+
+  const top = (limit = 5) =>
+    new BlogTopicService({ query: (sql: string, params?: any[]) => db.query(sql, params) } as any).topAssistants(limit);
+
+  it('считаются живые реплики людей за неделю; тестовые аккаунты, ответы ассистента и старое — нет', async () => {
+    // Кира: живые люди — по телефону, по почте (UUID) и в «чистом листе».
+    await say(`${REAL_PHONE}_22`, 22, 3);
+    await say(`${REAL_UUID}_22`, 22, 2);
+    await say(`${REAL_PHONE}_22_fresh_1758000000000`, 22, 1);
+    await say(`${REAL_PHONE}_22`, 22, 100, 'human', 8);      // за окном недели
+    // Оля: четыре реплики человека и ответы ассистента, которые не в счёт.
+    await say(`${REAL_PHONE_2}_2`, 2, 4);
+    await say(`${REAL_PHONE_2}_2`, 2, 10, 'ai');
+    // Юрист: одна живая реплика и гора тестовых — со всех тестовых аккаунтов.
+    await say(`${REAL_PHONE_3}_10`, 10, 1);
+    await say('70000000000_10', 10, 50);
+    await say('79030169187_10', 10, 30);
+    await say('79169403771_10', 10, 15);
+    await say('79656445804_10', 10, 20);
+    await say('79656445804_10_fresh_1758000000000', 10, 5);
+    await say('79030012345_10', 10, 10);                     // маска нагрузочных 790300xxxxx
+    // Миша: только тестовые — живого спроса нет вовсе.
+    await say('70000000000_1', 1, 40);
+
+    expect(await top()).toEqual([
+      { agentId: '22', agentName: 'Кира', description: KIRA.description, turns: 6 },
+      { agentId: '2', agentName: 'Оля', description: OLYA.description, turns: 4 },
+      { agentId: '10', agentName: 'Алексей', description: LAWYER.description, turns: 1 },
+    ]);
+  });
+
+  it('ассистент без внятного профиля не кандидат, сколько бы к нему ни писали', async () => {
+    await say(`${REAL_PHONE}_12`, 12, 500);     // Роман: описания нет
+    await say(`${REAL_PHONE}_13`, 13, 300);     // Лиана: одни пробелы
+    await say(`${REAL_PHONE}_9`, 9, 200);       // Анна: ярлык «Бухгалтер»
+    await say(`${REAL_PHONE_2}_22`, 22, 2);
+
+    expect((await top()).map((a) => a.agentName)).toEqual(['Кира']);
+  });
+
+  it('снятый с продукта ассистент не кандидат: история у него живая, а читатель его не найдёт', async () => {
+    await say(`${REAL_PHONE}_15`, 15, 200);     // Юлия: is_active = false
+    await say(`${REAL_PHONE_2}_2`, 2, 3);
+
+    expect((await top()).map((a) => a.agentName)).toEqual(['Оля']);
+  });
+
+  it('limit режет уже отфильтрованный список, порядок — по живым репликам', async () => {
+    await say(`${REAL_PHONE}_12`, 12, 500);     // без профиля — не занимает места в топе
+    await say(`${REAL_PHONE}_22`, 22, 5);
+    await say(`${REAL_PHONE}_2`, 2, 4);
+    await say(`${REAL_PHONE}_10`, 10, 3);
+
+    expect((await top(2)).map((a) => a.agentName)).toEqual(['Кира', 'Оля']);
   });
 });

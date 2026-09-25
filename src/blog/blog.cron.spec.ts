@@ -1,6 +1,9 @@
 import { Logger } from '@nestjs/common';
 import { BlogCron, STUCK_PUBLISHING_MINUTES } from './blog.cron';
 import { BlogTopicService, STALE_DRAFTING_MINUTES } from './blog-topic.service';
+import { BlogEditorService } from './blog-editor.service';
+
+const LAWYER_PROFILE = 'Юрист — право, договоры, оферта, согласия, риски и требования регуляторов';
 
 const deps = () => ({
   // Захват черновика (`UPDATE ... RETURNING`) по умолчанию удаётся: пустой
@@ -73,11 +76,70 @@ describe('BlogCron.refillTopics', () => {
     // метод съел бы вместе с новостями и кейсы, которым релей не нужен.
     const d = deps();
     d.news.weeklyTopics.mockRejectedValue(new Error('релей молчит'));
-    d.topics.topAssistants.mockResolvedValue([{ agentId: '12', agentName: 'Юрист', turns: 40 }]);
+    d.topics.topAssistants.mockResolvedValue([{ agentId: '10', agentName: 'Алексей', description: LAWYER_PROFILE, turns: 40 }]);
 
     await make(d).refillTopics();
 
     expect(caseCalls(d)).toHaveLength(1);
+  });
+
+  /**
+   * На проде подсказка была «На этой неделе чаще всего обращались к
+   * ассистенту «Кира» (44 обращений). Придумай кейс по его профилю» — без
+   * профиля. Редактор выдумал Кире-дизайнеру кейс про планирование и тревогу
+   * и пересказал в посте статистику: «На этой неделе чаще всего писали Кире».
+   */
+  describe('подсказка кейса', () => {
+    const KIRA = {
+      agentId: '22', agentName: 'Кира',
+      description: 'Дизайнер — логотипы, фирменный стиль, макеты, баннеры и презентации',
+      turns: 44,
+    };
+
+    const hintFor = async (a: any): Promise<string> => {
+      const d = deps();
+      d.topics.topAssistants.mockResolvedValue([a]);
+      await make(d).refillTopics();
+      expect(caseCalls(d)).toHaveLength(1);
+      return String(caseCalls(d)[0].topicHint);
+    };
+
+    it('несёт профиль ассистента — имя и описание из agents', async () => {
+      const hint = await hintFor(KIRA);
+      expect(hint).toContain('Кира');
+      expect(hint).toContain('Дизайнер — логотипы, фирменный стиль, макеты, баннеры и презентации');
+    });
+
+    it('не несёт статистики: ни числа обращений, ни «чаще всего» — редактор перескажет их в посте', async () => {
+      const hint = await hintFor(KIRA);
+      expect(hint).not.toContain('44');
+      expect(hint).not.toMatch(/обращ/i);
+      expect(hint).not.toMatch(/чаще/i);
+      expect(hint).not.toMatch(/популярн|востребован|на этой неделе/i);
+    });
+
+    it('ассистент без внятного описания в темы не попадает — лучше кейсом меньше, чем кейс о выдуманном', async () => {
+      const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      const d = deps();
+      d.topics.topAssistants.mockResolvedValue([
+        { agentId: '12', agentName: 'Роман', description: null, turns: 900 },
+        { agentId: '13', agentName: 'Лиана', description: '   ', turns: 300 },
+        { agentId: '10', agentName: 'Алексей', description: 'Юрист', turns: 200 },   // ярлык, а не профиль
+        KIRA,
+      ]);
+
+      let logged = '';
+      try {
+        await make(d).refillTopics();
+        logged = warn.mock.calls.map((c) => String(c[0])).join('\n');
+      } finally {
+        warn.mockRestore();   // сбрасывает и mock.calls — поэтому лог снят выше
+      }
+
+      expect(caseCalls(d).map((t: any) => t.sourceRef)).toEqual(['stats:22']);
+      // Пропуск не молчаливый: в логе видно, про кого кейса нет и почему.
+      expect(logged).toMatch(/Роман[\s\S]*Лиана[\s\S]*Алексей/);
+    });
   });
 
   it('при выключенном BLOG_ENABLED отбор не запускается', async () => {
@@ -115,6 +177,30 @@ describe('BlogCron.prepareDrafts', () => {
     expect(d.images.render).not.toHaveBeenCalled();
     const sqls = d.pg.query.mock.calls.map((c: any) => String(c[0]));
     expect(sqls.some((s) => s.includes("status = 'failed'"))).toBe(true);
+  });
+
+  /**
+   * Кейсы про Романа и Лиану упали на проде с «не нашёл JSON в ответе
+   * редактора», а сырой ответ не сохранился нигде — причину пришлось угадывать.
+   * Редактор здесь настоящий, подменён только релей.
+   */
+  it('ответ редактора не разобрался — в last_error видно, что он написал вместо поста', async () => {
+    const d = deps();
+    d.topics.takeNextIdea.mockResolvedValue({ id: 'p1', rubric: 'case', topicKey: 'k', topicHint: null, status: 'idea', editorNotes: [] });
+    const reply = 'Уточните, пожалуйста:\nкто такая Лиана и чем она занимается?';
+    (d as any).editor = new BlogEditorService(
+      { ask: jest.fn().mockResolvedValue(reply) } as any,
+      { recentTitles: jest.fn().mockResolvedValue([]) } as any,
+    );
+
+    await make(d).prepareDrafts();
+
+    const failed = d.pg.query.mock.calls.find((c: any) => String(c[0]).includes("status = 'failed'"));
+    const lastError = String(failed[1][1]);
+    expect(lastError).toMatch(/не нашёл JSON/i);
+    // В админке это одна строка: перенос из ответа схлопнут в пробел.
+    expect(lastError).toContain('Уточните, пожалуйста: кто такая Лиана и чем она занимается?');
+    expect(lastError).not.toMatch(/\n/);
   });
 
   it('без идей в очереди тихо выходит', async () => {

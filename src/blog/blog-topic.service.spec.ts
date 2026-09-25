@@ -1,6 +1,9 @@
 import {
   BlogTopicService, normalizeTopicKey, DEDUP_WINDOW_DAYS, STALE_DRAFTING_MINUTES,
+  MIN_PROFILE_CHARS, hasClearProfile,
 } from './blog-topic.service';
+import { TEST_USERS, TEST_USER_PATTERN } from '../common/test-users';
+import { AdminService } from '../admin/admin.service';
 
 const pgMock = () => ({ query: jest.fn() });
 
@@ -217,5 +220,93 @@ describe('BlogTopicService.takeNextIdea', () => {
     await svc.takeNextIdea();
     const sql = String(pg.query.mock.calls[0][0]).replace(/\s+/g, ' ');
     expect(sql).toMatch(/drafting_started_at < now\(\) - \(\$1 \|\| ' minutes'\)::interval\)\)/);
+  });
+});
+
+/**
+ * Темы кейсов из статистики.
+ *
+ * На проде подсказка редактору была «чаще всего обращались к ассистенту
+ * «Кира» (44 обращений), придумай кейс по его профилю» — а профиля в ней не
+ * было. Редактор выдумал Кире профиль (планирование и тревога вместо
+ * дизайна), пересказал в посте внутреннюю статистику, а на Романе и Лиане не
+ * собрал пост вовсе. Сама статистика при этом была перекошена тестами: Роман
+ * с тысячей обращений — это прогоны владельца и мониторинга.
+ *
+ * SQL здесь не исполняется (pg подменён) — проверяется, ЧТО уходит в запрос.
+ * Исполняется он в blog-approval.integration.spec.ts, блок «Темы кейсов».
+ */
+describe('BlogTopicService.topAssistants', () => {
+  const KIRA_ROW = {
+    agent_id: '22',
+    agent_name: 'Кира',
+    description: 'Дизайнер — логотипы, фирменный стиль, макеты, баннеры и презентации',
+    turns: 44,
+  };
+
+  const run = async (rows: any[] = [KIRA_ROW]) => {
+    const pg = pgMock();
+    pg.query.mockResolvedValueOnce({ rows });
+    const out = await new BlogTopicService(pg as any).topAssistants(3);
+    const [sql, params] = pg.query.mock.calls[0];
+    return { out, sql: String(sql).replace(/\s+/g, ' '), params: params as any[] };
+  };
+
+  it('отдаёт вместе с именем описание ассистента — профиль, по которому пишется кейс', async () => {
+    const { out } = await run();
+    expect(out[0]).toEqual(expect.objectContaining({
+      agentId: '22',
+      agentName: 'Кира',
+      description: 'Дизайнер — логотипы, фирменный стиль, макеты, баннеры и презентации',
+    }));
+  });
+
+  it('профиль — это agents.description, и без внятного описания ассистент в выборку не попадает', async () => {
+    const { sql, params } = await run();
+    expect(sql).toMatch(/char_length\(btrim\(coalesce\(a\.description, ''\)[^)]*\)\) >= \$\d/);
+    expect(params).toContain(MIN_PROFILE_CHARS);
+  });
+
+  it('снятый с продукта ассистент (is_active = false) в выборку не попадает', async () => {
+    const { sql } = await run();
+    expect(sql).toMatch(/AND a\.is_active\b/);
+  });
+
+  /**
+   * Пользователь в `custom_chat_history` — префикс `session_id` до первого
+   * подчёркивания: `{userId}_{assistantId}` или `{userId}_{assistantId}_fresh_{ts}`.
+   * Так же его достаёт админка (сегменты возврата) и остальная аналитика.
+   */
+  it('реплики тестовых аккаунтов не считаются: пользователь — префикс session_id', async () => {
+    const { sql, params } = await run();
+    expect(sql).toMatch(/split_part\(h\.session_id, '_', 1\) <> ALL\(\$\d+::text\[\]\)/);
+    expect(sql).toMatch(/split_part\(h\.session_id, '_', 1\) !~ \$\d+/);
+    // Тот же объект списка, а не копия с теми же номерами: копия разъедется
+    // с оригиналом молча, при первой же правке одного из них.
+    expect(params).toContain(TEST_USERS);
+    expect(params).toContain(TEST_USER_PATTERN);
+  });
+
+  it('тестовые аккаунты — ровно те, что прячет админка: у неё тот же список, а не копия', () => {
+    expect((AdminService as any).TEST_USERS).toBe(TEST_USERS);
+    expect((AdminService as any).TEST_PATTERN).toBe(TEST_USER_PATTERN);
+  });
+});
+
+describe('hasClearProfile', () => {
+  it('описание, по которому видно, кто это и что умеет, — профиль', () => {
+    expect(hasClearProfile('Дизайнер — логотипы, фирменный стиль, макеты, баннеры и презентации')).toBe(true);
+  });
+
+  it('пустое, пробельное и отсутствующее описание — не профиль', () => {
+    expect(hasClearProfile(null)).toBe(false);
+    expect(hasClearProfile(undefined)).toBe(false);
+    expect(hasClearProfile('')).toBe(false);
+    expect(hasClearProfile(' \n\t ')).toBe(false);
+  });
+
+  it('ярлык из одного слова — не профиль: что ассистент умеет, из него не видно', () => {
+    expect(hasClearProfile('Юрист')).toBe(false);
+    expect(hasClearProfile('  Психолог  ')).toBe(false);
   });
 });

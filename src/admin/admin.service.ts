@@ -6,6 +6,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
 import { sendTelegramAlert } from '../common/telegram-alert';
+import { TEST_USERS as SHARED_TEST_USERS, TEST_USER_PATTERN } from '../common/test-users';
 import { callFlags, countUserTurns } from './callFlags';
 
 @Injectable()
@@ -410,8 +411,11 @@ export class AdminService implements OnModuleInit {
   private static readonly RETENTION_COOLDOWN_DAYS = 14;
   private static readonly ACTIVATION_CAMPAIGN = 'activation_nudge_v1';
   private static readonly ACTIVATION_COOLDOWN_DAYS = 14;
-  private static readonly TEST_USERS = ['70000000000', '79030169187', '79169403771', '79656445804'];
-  private static readonly TEST_PATTERN = '^790300[0-9]{5}$';
+  // Список — общий, из common/test-users.ts, а не своя копия: по нему же темы
+  // кейсов блога отсекают тестовые аккаунты (BlogTopicService.topAssistants).
+  // Копия с теми же номерами разошлась бы с ним молча, при первой же правке.
+  private static readonly TEST_USERS = SHARED_TEST_USERS;
+  private static readonly TEST_PATTERN = TEST_USER_PATTERN;
 
   // Предикат «не тестовый пользователь» для агрегатов «управления». `col` —
   // колонка с телефоном (user_id). Константы инлайнятся (статичные, без
