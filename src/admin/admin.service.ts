@@ -1722,33 +1722,108 @@ export class AdminService implements OnModuleInit {
   }
 
   /**
-   * Звонки одного человека для карточки в админке.
+   * Колонки сессии — общие у ленты и карточки человека, чтобы оба места
+   * получали одну форму. Расшифровка читается ради пометок и в ответ не уходит
+   * (см. toCallSession). Консультации — подзапросами по call_id, а не JOIN по
+   * user_id: иначе к звонку приехали бы вопросы, заданные тем же человеком на
+   * встрече.
+   */
+  private static readonly SESSION_COLUMNS = `
+    c.id, c.user_id, c.provider, a.name AS agent_name,
+    c.started_at, c.duration_sec, c.status, c.model, c.summary, c.transcript,
+    c.tokens_charged,
+    (SELECT COALESCE(SUM(j.tokens_used), 0) FROM voice_call_jobs j WHERE j.call_id = c.id)::bigint AS tokens_consult,
+    (SELECT COUNT(*) FROM voice_call_jobs j WHERE j.call_id = c.id)::int AS consults`;
+
+  /**
+   * Строка voice_calls → сессия для админки.
    *
-   * Расшифровку СЮДА не кладём: на проде 49 расшифровок весят заметно больше
-   * остального ответа, а открывают их по одной. Пометки считаем здесь же,
-   * чтобы интерфейс не тянул диалоги ради подсчёта реплик.
+   * Расшифровку отрезаем: на проде она весит больше всего остального ответа,
+   * а открывают её по одной. Пометки считаем здесь же, чтобы интерфейс не
+   * тянул диалоги ради подсчёта реплик.
+   */
+  private static toCallSession(r: any) {
+    const call = Number(r.tokens_charged) || 0;
+    const consult = Number(r.tokens_consult) || 0;
+    return {
+      id: r.id,
+      user_id: r.user_id,
+      provider: r.provider,
+      agent_name: r.agent_name ?? null,
+      started_at: r.started_at,
+      duration_sec: r.duration_sec ?? null,
+      status: r.status,
+      model: r.model ?? null,
+      summary: r.summary ?? null,
+      tokens_call: call,
+      tokens_consult: consult,
+      tokens_total: call + consult,
+      consults: Number(r.consults) || 0,
+      flags: callFlags(r),
+      user_turns: countUserTurns(r.transcript),
+    };
+  }
+
+  /**
+   * Лента раздела «Звонки»: по строке на звонок или встречу, новые сверху.
    *
-   * Тестовые аккаунты не исключаем — в отличие от агрегата в разделе: сюда
-   * приходят по конкретному user_id, и если открыли карточку тестового
-   * аккаунта, значит его и хотят посмотреть.
+   * Условие то же, что у таблицы (callsWhere), total — отдельным запросом по
+   * нему же: «показано 50 из 131» не должно расходиться с итогом над таблицей.
+   * «Показать ещё» на фронте перезапрашивает первые N+50 целиком, а не
+   * страницу по курсору: сессий сотни, и так пришедшая за это время новая
+   * сессия не задваивает строку.
+   */
+  async getCallSessions(opts: CallsQuery = {}) {
+    const f = AdminService.callsFilter(opts);
+    const asked = Number.isFinite(opts.limit) ? Math.trunc(opts.limit as number) : 50;
+    const limit = Math.min(Math.max(asked, 1), 500);
+    const { where, params } = AdminService.callsWhere(f);
+
+    const rowsRes = await this.pg.query(
+      `SELECT ${AdminService.SESSION_COLUMNS}
+         FROM voice_calls c
+         LEFT JOIN agents a ON a.id = c.agent_id
+        WHERE ${where}
+        ORDER BY c.started_at DESC, c.id DESC
+        LIMIT ${limit}`,
+      params,
+    );
+    const totalRes = await this.pg.query(
+      `SELECT COUNT(*)::int AS total FROM voice_calls c WHERE ${where}`,
+      params,
+    );
+
+    return {
+      days: f.days,
+      kind: f.kind,
+      provider: f.provider,
+      include_test: f.includeTest,
+      total: Number(totalRes.rows[0]?.total) || 0,
+      limit,
+      sessions: rowsRes.rows.map((r: any) => AdminService.toCallSession(r)),
+    };
+  }
+
+  /**
+   * Звонки и встречи одного человека — для его карточки в админке. Форма
+   * сессии та же, что у ленты раздела: карточку и ленту рисует один компонент.
+   *
+   * Тестовые аккаунты не исключаем — в отличие от раздела: сюда приходят по
+   * конкретному user_id, и если открыли карточку тестового аккаунта, значит
+   * его и хотят посмотреть.
    */
   async getUserCalls(userId: string, opts: { limit?: number } = {}) {
     const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
     const res = await this.pg.query(
-      `SELECT c.id, c.started_at, c.ended_at, c.duration_sec, c.status,
-              c.tokens_charged, c.model, c.provider, c.summary, c.transcript
+      `SELECT ${AdminService.SESSION_COLUMNS}
          FROM voice_calls c
+         LEFT JOIN agents a ON a.id = c.agent_id
         WHERE c.user_id = $1
         ORDER BY c.started_at DESC
         LIMIT $2`,
       [userId, limit],
     );
-
-    const calls = res.rows.map((r: any) => {
-      const { transcript, ...rest } = r;
-      return { ...rest, flags: callFlags(r), user_turns: countUserTurns(transcript) };
-    });
-    return { userId, calls };
+    return { userId, calls: res.rows.map((r: any) => AdminService.toCallSession(r)) };
   }
 
   /** Расшифровка одного звонка — по клику из списка. */
