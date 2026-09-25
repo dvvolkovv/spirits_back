@@ -72,27 +72,27 @@ maybe('инструмент продуктов против живого Postgre
   describe('поиск продукта', () => {
     it('находит по куску имени', async () => {
       const id = await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       const m = await svc.resolve(OWNER, 'цветов');
       expect(m.map((p) => p.id)).toEqual([id]);
     });
 
     it('находит по слагу и по домену', async () => {
       const id = await mkProduct({ name: 'Магазин цветов', slug: 'flowers', domain: 'flowers.p.linkeon.io' });
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       expect((await svc.resolve(OWNER, 'flowers')).map((p) => p.id)).toEqual([id]);
       expect((await svc.resolve(OWNER, 'flowers.p.linkeon.io')).map((p) => p.id)).toEqual([id]);
     });
 
     it('находит по идентификатору', async () => {
       const id = await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       expect((await svc.resolve(OWNER, id)).map((p) => p.id)).toEqual([id]);
     });
 
     it('регистр не имеет значения', async () => {
       const id = await mkProduct({ name: 'Магазин Цветов', slug: 'flowers' });
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       expect((await svc.resolve(OWNER, 'МАГАЗИН')).map((p) => p.id)).toEqual([id]);
     });
 
@@ -100,14 +100,14 @@ maybe('инструмент продуктов против живого Postgre
     it('отдаёт ВСЕ совпадения, а не первое', async () => {
       const a = await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
       const b = await mkProduct({ name: 'Магазин книг', slug: 'books' });
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       const m = await svc.resolve(OWNER, 'магазин');
       expect(m.map((p) => p.id).sort()).toEqual([a, b].sort());
     });
 
     it('чужие продукты не находятся ничем — ни именем, ни идентификатором', async () => {
       const alien = await mkProduct({ user: ALIEN, name: 'Магазин цветов', slug: 'flowers' });
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       expect(await svc.resolve(OWNER, 'магазин')).toEqual([]);
       expect(await svc.resolve(OWNER, alien)).toEqual([]);
       expect(await svc.resolve(OWNER, 'flowers')).toEqual([]);
@@ -116,7 +116,7 @@ maybe('инструмент продуктов против живого Postgre
     it('архивированные не находятся', async () => {
       const id = await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
       await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [id]);
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       expect(await svc.resolve(OWNER, 'магазин')).toEqual([]);
     });
 
@@ -126,14 +126,14 @@ maybe('инструмент продуктов против живого Postgre
     it('проценты и подчёркивания в запросе — обычные символы', async () => {
       await mkProduct({ name: 'Скидки 100% на всё', slug: 'sale' });
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       expect((await svc.resolve(OWNER, '100%')).map((p) => p.name)).toEqual(['Скидки 100% на всё']);
       expect(await svc.resolve(OWNER, 'м_газин')).toEqual([]);
     });
 
     it('пустой запрос не ищет ничего', async () => {
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       expect(await svc.resolve(OWNER, '   ')).toEqual([]);
     });
   });
@@ -141,7 +141,7 @@ maybe('инструмент продуктов против живого Postgre
   describe('действие list', () => {
     it('показывает свои продукты с адресом и состоянием', async () => {
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers', domain: 'flowers.p.linkeon.io' });
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       const out: any = await svc.execute(OWNER, { action: 'list' });
       expect(out.ok).toBe(true);
       expect(out.products).toHaveLength(1);
@@ -152,7 +152,7 @@ maybe('инструмент продуктов против живого Postgre
 
     it('чужих продуктов не видно', async () => {
       await mkProduct({ user: ALIEN, name: 'Чужой магазин', slug: 'alien' });
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       const out: any = await svc.execute(OWNER, { action: 'list' });
       expect(out.products).toEqual([]);
     });
@@ -162,14 +162,14 @@ maybe('инструмент продуктов против живого Postgre
     // поломку.
     it('у бота домена нет, и это сказано словами', async () => {
       await mkProduct({ name: 'Бот поддержки', slug: 'supbot', kind: 'bot', domain: null });
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       const out: any = await svc.execute(OWNER, { action: 'list' });
       expect(out.products[0].domain).toBeNull();
       expect(out.say).toMatch(/бот/i);
     });
 
     it('пустой список — это не ошибка', async () => {
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       const out: any = await svc.execute(OWNER, { action: 'list' });
       expect(out.ok).toBe(true);
       expect(out.products).toEqual([]);
@@ -179,7 +179,7 @@ maybe('инструмент продуктов против живого Postgre
     it('архивированные не показываются', async () => {
       const id = await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
       await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [id]);
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       const out: any = await svc.execute(OWNER, { action: 'list' });
       expect(out.products).toEqual([]);
     });
@@ -211,13 +211,13 @@ maybe('инструмент продуктов против живого Postgre
         );
         byAge[i] = r.rows[0].id;
       }
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       const out: any = await svc.execute(OWNER, { action: 'list' });
       expect(out.products.map((p: any) => p.id)).toEqual([4, 3, 2, 1, 0].map((i) => byAge[i]));
     });
 
     it('неизвестное действие — отказ, а не молчание', async () => {
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       const out: any = await svc.execute(OWNER, { action: 'delete' });
       expect(out.ok).toBe(false);
       expect(out.reason).toBe('bad_action');
@@ -233,13 +233,13 @@ maybe('инструмент продуктов против живого Postgre
       } as any);
 
     it('потолок ожидания взят из общей константы, а не выбран свой', () => {
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       expect((svc as any).waitMs).toBe(PRODUCT_TOOL_WAIT_MS);
     });
 
     it('ставит ровно ОДИН ход', async () => {
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
-      const svc = new ProductToolService(pg as any, realTurns());
+      const svc = new ProductToolService(pg as any, realTurns(), {} as any);
       (svc as any).waitMs = 0; // не ждём исхода — здесь проверяется постановка
       const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'Добавь раздел «О нас»' });
       expect(out.turnId).toBeTruthy();
@@ -249,7 +249,7 @@ maybe('инструмент продуктов против живого Postgre
 
     it('текст правки доезжает до хода дословно', async () => {
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
-      const svc = new ProductToolService(pg as any, realTurns());
+      const svc = new ProductToolService(pg as any, realTurns(), {} as any);
       (svc as any).waitMs = 0;
       await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'Добавь раздел «О нас»' });
       const r = await pool.query('SELECT prompt, channel FROM product_turns');
@@ -260,7 +260,7 @@ maybe('инструмент продуктов против живого Postgre
     it('два магазина на «магазин» — УТОЧНЯЕТ, а не выбирает', async () => {
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
       await mkProduct({ name: 'Магазин книг', slug: 'books' });
-      const svc = new ProductToolService(pg as any, realTurns());
+      const svc = new ProductToolService(pg as any, realTurns(), {} as any);
       // Потолок в ноль не ради скорости зелёного прогона — ради ВНЯТНОСТИ
       // красного. Измерено: со снятой веткой уточнения тест уходит в боевое
       // ожидание (150 с), умирает на таймауте jest в 60 с и рапортует
@@ -277,7 +277,7 @@ maybe('инструмент продуктов против живого Postgre
 
     it('не нашли — отказ со списком того, что есть', async () => {
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
-      const svc = new ProductToolService(pg as any, realTurns());
+      const svc = new ProductToolService(pg as any, realTurns(), {} as any);
       const out: any = await svc.execute(OWNER, { action: 'edit', product: 'кофейня', prompt: 'что-нибудь' });
       expect(out.ok).toBe(false);
       expect(out.reason).toBe('not_found');
@@ -286,7 +286,7 @@ maybe('инструмент продуктов против живого Postgre
 
     it('чужой продукт по его идентификатору — не найден', async () => {
       const alien = await mkProduct({ user: ALIEN, name: 'Чужой магазин', slug: 'alien' });
-      const svc = new ProductToolService(pg as any, realTurns());
+      const svc = new ProductToolService(pg as any, realTurns(), {} as any);
       const out: any = await svc.execute(OWNER, { action: 'edit', product: alien, prompt: 'сломай' });
       expect(out.reason).toBe('not_found');
       const n = await pool.query('SELECT count(*) FROM product_turns');
@@ -295,7 +295,7 @@ maybe('инструмент продуктов против живого Postgre
 
     it('без текста правки ход не ставится', async () => {
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
-      const svc = new ProductToolService(pg as any, realTurns());
+      const svc = new ProductToolService(pg as any, realTurns(), {} as any);
       // Потолок в ноль — ради ВНЯТНОСТИ красного, тем же приёмом, что в тесте
       // про уточнение. Измерено: со снятым .trim() ход ставится, тест уходит в
       // боевое ожидание (150 с) и умирает на таймауте jest в 60 с, рапортуя
@@ -310,7 +310,7 @@ maybe('инструмент продуктов против живого Postgre
 
     it('спящий — отказ С предложением пополнить', async () => {
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers', status: 'sleeping' });
-      const svc = new ProductToolService(pg as any, realTurns());
+      const svc = new ProductToolService(pg as any, realTurns(), {} as any);
       const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'правка' });
       expect(out.ok).toBe(false);
       expect(out.reason).toBe('sleeping');
@@ -320,7 +320,7 @@ maybe('инструмент продуктов против живого Postgre
 
     it('погашенный — отказ БЕЗ предложения пополнить', async () => {
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers', status: 'blocked' });
-      const svc = new ProductToolService(pg as any, realTurns());
+      const svc = new ProductToolService(pg as any, realTurns(), {} as any);
       const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'правка' });
       expect(out.ok).toBe(false);
       expect(out.reason).toBe('blocked');
@@ -331,7 +331,7 @@ maybe('инструмент продуктов против живого Postgre
     it('спящий и погашенный различимы по признаку пополнения', async () => {
       await mkProduct({ name: 'Спящий', slug: 'a', status: 'sleeping' });
       await mkProduct({ name: 'Погашенный', slug: 'b', status: 'blocked' });
-      const svc = new ProductToolService(pg as any, realTurns());
+      const svc = new ProductToolService(pg as any, realTurns(), {} as any);
       const s: any = await svc.execute(OWNER, { action: 'edit', product: 'спящий', prompt: 'x' });
       const b: any = await svc.execute(OWNER, { action: 'edit', product: 'погашенный', prompt: 'x' });
       expect(s.reason).not.toBe(b.reason);
@@ -340,7 +340,7 @@ maybe('инструмент продуктов против живого Postgre
 
     it('нет токенов — свой отказ, не слитый со спящим', async () => {
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
-      const svc = new ProductToolService(pg as any, realTurns(false));
+      const svc = new ProductToolService(pg as any, realTurns(false), {} as any);
       const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'правка' });
       expect(out.ok).toBe(false);
       expect(out.reason).toBe('no_tokens');
@@ -354,7 +354,7 @@ maybe('инструмент продуктов против живого Postgre
          VALUES ($1, $2, 'web', 'первая', 'running')`,
         [id, OWNER],
       );
-      const svc = new ProductToolService(pg as any, realTurns());
+      const svc = new ProductToolService(pg as any, realTurns(), {} as any);
       const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'вторая' });
       expect(out.ok).toBe(false);
       expect(out.reason).toBe('busy');
@@ -364,7 +364,7 @@ maybe('инструмент продуктов против живого Postgre
 
     it('дождался конца — отдаёт исход хода, а не «поставлено»', async () => {
       const id = await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
-      const svc = new ProductToolService(pg as any, realTurns());
+      const svc = new ProductToolService(pg as any, realTurns(), {} as any);
       (svc as any).waitMs = 4_000;
       (svc as any).pollMs = 100;
       // Пока инструмент ждёт, «раннер» дописывает ход как откат.
@@ -382,7 +382,7 @@ maybe('инструмент продуктов против живого Postgre
 
     it('не дождался — честное «идёт» с идентификатором хода', async () => {
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
-      const svc = new ProductToolService(pg as any, realTurns());
+      const svc = new ProductToolService(pg as any, realTurns(), {} as any);
       (svc as any).waitMs = 300;
       (svc as any).pollMs = 100;
       const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'правка' });
@@ -401,7 +401,7 @@ maybe('инструмент продуктов против живого Postgre
          VALUES ($1, $2, 'web', 'правка', 'done', 'Готово', 4200, now())`,
         [id, OWNER],
       );
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       const out: any = await svc.execute(OWNER, { action: 'status', product: 'цветов' });
       expect(out.outcome).toBe('done');
       expect(out.tokensSpent).toBe(4200);
@@ -414,7 +414,7 @@ maybe('инструмент продуктов против живого Postgre
          VALUES ($1, $2, 'web', 'правка', 'reverted', 'health check failed', now())`,
         [id, OWNER],
       );
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       const out: any = await svc.execute(OWNER, { action: 'status', product: 'цветов' });
       expect(out.outcome).toBe('reverted');
       expect(out.ok).toBe(false);
@@ -432,7 +432,7 @@ maybe('инструмент продуктов против живого Postgre
          VALUES ($1, $2, 'web', 'свежая', 'failed', 'build error', now(), now())`,
         [id, OWNER],
       );
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       const out: any = await svc.execute(OWNER, { action: 'status', product: 'цветов' });
       expect(out.outcome).toBe('failed');
     });
@@ -449,7 +449,7 @@ maybe('инструмент продуктов против живого Postgre
          VALUES ($1, $2, 'web', 'свежая', 'failed', 'build error', now())`,
         [id, OWNER],
       );
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       const out: any = await svc.execute(OWNER, { action: 'status', turnId: t.rows[0].id });
       expect(out.outcome).toBe('done');
     });
@@ -461,7 +461,7 @@ maybe('инструмент продуктов против живого Postgre
          VALUES ($1, $2, 'web', 'чужая', 'done', now()) RETURNING id`,
         [alien, ALIEN],
       );
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       const out: any = await svc.execute(OWNER, { action: 'status', turnId: t.rows[0].id });
       expect(out.ok).toBe(false);
       expect(out.reason).toBe('not_found');
@@ -469,7 +469,7 @@ maybe('инструмент продуктов против живого Postgre
 
     it('ходов не было — так и сказано', async () => {
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       const out: any = await svc.execute(OWNER, { action: 'status', product: 'цветов' });
       expect(out.reason).toBe('no_turns');
       expect(out.say).toMatch(/не было|ни одной/i);
@@ -478,7 +478,7 @@ maybe('инструмент продуктов против живого Postgre
     it('неоднозначное имя — уточняет, а не выбирает', async () => {
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
       await mkProduct({ name: 'Магазин книг', slug: 'books' });
-      const svc = new ProductToolService(pg as any, {} as any);
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
       const out: any = await svc.execute(OWNER, { action: 'status', product: 'магазин' });
       expect(out.ok).toBe(false);
       expect(out.reason).toBe('ambiguous');
@@ -656,7 +656,85 @@ maybe('инструмент продуктов против живого Postgre
       const id = await site();
       await putDomain(id, 'active');
       const out: any = await tool().execute(OWNER, { action: 'list' });
-      expect(out.products[0]).toMatchObject({ custom_domain: 'dmitryvolkov.ru', custom_domain_status: 'active' });
+      expect(out.products[0]).toMatchObject({
+        custom_domain: 'dmitryvolkov.ru', custom_domain_unicode: 'dmitryvolkov.ru', custom_domain_status: 'active',
+      });
+    });
+
+    it('list: у юникодного своего домена — читаемая форма', async () => {
+      const id = await site();
+      await pool.query(
+        `INSERT INTO product_domains (product_id, domain, names, token, status)
+         VALUES ($1, 'xn--e1afmkfd.xn--p1ai', '{xn--e1afmkfd.xn--p1ai,www.xn--e1afmkfd.xn--p1ai}', 'lk-x', 'active')`,
+        [id],
+      );
+      const out: any = await tool().execute(OWNER, { action: 'list' });
+      expect(out.products[0].custom_domain_unicode).toBe('пример.рф');
+    });
+
+    const count = async () => (await pool.query('SELECT count(*) FROM product_domains')).rows[0].count;
+    const checkedAt = async (id: string) =>
+      (await pool.query('SELECT checked_at FROM product_domains WHERE product_id = $1', [id])).rows[0]?.checked_at;
+
+    // Порядок флагов: remove сильнее domain — «отвязать» с доменом в придачу
+    // не превращается в привязку.
+    it('remove вместе с domain — отвязывает и ничего не привязывает', async () => {
+      const id = await site();
+      await putDomain(id, 'awaiting_dns');
+      const out: any = await tool().execute(OWNER, { action: 'domain', product: 'мой сайт', domain: 'other.ru', remove: true });
+      expect(out).toMatchObject({ ok: true, removed: 'now' });
+      expect(await count()).toBe('0');
+    });
+
+    it('remove вместе с domain без заявки — no_domain, и ничего не привязано', async () => {
+      await site();
+      const out: any = await tool().execute(OWNER, { action: 'domain', product: 'мой сайт', domain: 'other.ru', remove: true });
+      expect(out).toMatchObject({ ok: false, reason: 'no_domain' });
+      expect(await count()).toBe('0');
+    });
+
+    it('check вместе с domain при живой заявке — проверяет, а не привязывает заново', async () => {
+      const id = await site();
+      await putDomain(id, 'awaiting_dns');
+      const out: any = await tool().execute(OWNER, { action: 'domain', product: 'мой сайт', domain: 'dmitryvolkov.ru', check: true });
+      expect(out.ok).toBe(true);
+      expect(await checkedAt(id)).not.toBeNull();
+      expect((await pool.query('SELECT token FROM product_domains')).rows[0].token).toBe('lk-x');
+    });
+
+    it('check вместе с domain без заявки — привязывает', async () => {
+      const id = await site();
+      const out: any = await tool().execute(OWNER, { action: 'domain', product: 'мой сайт', domain: 'dmitryvolkov.ru', check: true });
+      expect(out.ok).toBe(true);
+      expect(out.domain.status).toBe('awaiting_dns');
+      expect(await checkedAt(id)).not.toBeNull();
+    });
+
+    it("флаги строкой 'true' — как true", async () => {
+      const id = await site();
+      await putDomain(id, 'awaiting_dns');
+      const c: any = await tool().execute(OWNER, { action: 'domain', product: 'мой сайт', check: 'true' });
+      expect(c.ok).toBe(true);
+      expect(await checkedAt(id)).not.toBeNull();
+      const r: any = await tool().execute(OWNER, { action: 'domain', product: 'мой сайт', remove: 'true' });
+      expect(r).toMatchObject({ ok: true, removed: 'now' });
+    });
+
+    it('domain не строкой — отказ bad_form, а не молчаливый запрос состояния', async () => {
+      await site();
+      const out: any = await tool().execute(OWNER, { action: 'domain', product: 'мой сайт', domain: 42 });
+      expect(out).toMatchObject({ ok: false, reason: 'bad_form' });
+      expect(out.say).toBeTruthy();
+      expect(await count()).toBe('0');
+    });
+
+    it('незавершённая отвязка — текст для чата, без кнопок кабинета', async () => {
+      const id = await site();
+      await putDomain(id, 'failed', 'remove_failed');
+      const out: any = await tool().execute(OWNER, { action: 'domain', product: 'мой сайт', check: true });
+      expect(out).toMatchObject({ ok: false, reason: 'detach_pending' });
+      expect(out.say).toMatch(/remove: true/);
+      expect(out.say).not.toMatch(/нажмите|страниц|кнопк/i);
     });
   });
 });

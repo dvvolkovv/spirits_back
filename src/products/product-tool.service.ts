@@ -3,7 +3,7 @@ import { PgService } from '../common/services/pg.service';
 import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
 import { TurnsService, SLEEPING_REFUSAL, BLOCKED_REFUSAL } from './turns.service';
 import { DomainErrorReason, DomainRecordToSet, DomainStatus, DomainsService, DomainView } from './domains.service';
-import { normalizeDomain } from './domain-name';
+import { normalizeDomain, readableDomain } from './domain-name';
 
 /** Продукт глазами ассистента: без внутренностей, только то, что можно назвать вслух. */
 export interface ProductMatch {
@@ -18,6 +18,8 @@ export interface ProductMatch {
 /** Строка `list`: продукт плюс его свой домен, если он есть. */
 export interface ProductListRow extends ProductMatch {
   custom_domain: string | null;
+  /** Тот же домен для глаз человека (readableDomain): его ассистент и называет. */
+  custom_domain_unicode: string | null;
   custom_domain_status: DomainStatus | null;
 }
 
@@ -147,6 +149,21 @@ export const DOMAIN_FAILED_SAY: Record<DomainErrorReason, string> = {
     'Отвязка не удалась на стороне платформы. Отвяжи домен ещё раз (remove: true); проверять снова не нужно.',
 };
 
+/**
+ * Отказы DomainsService, чей `message` написан для кабинета («нажмите
+ * «Отвязать»», «обновите страницу») — в чате ни кнопок, ни страницы нет.
+ * Здесь замена на путь инструмента. Тест разбирает исходник сервиса и
+ * требует замену для каждого отказа с формулировкой кабинета.
+ */
+export const DOMAIN_REFUSAL_SAY: Record<string, string> = {
+  detach_pending: 'Прошлая отвязка не завершилась — отвяжи ещё раз (remove: true), проверять не нужно.',
+  changed:
+    'Состояние домена только что изменилось — запроси его заново (action="domain" без флагов) и действуй по нему.',
+};
+
+/** Флаг инструмента: true или строка 'true' — модели присылают и так. */
+const flag = (v: unknown) => v === true || v === 'true';
+
 /** Что не сходится в последней проверке DNS — по нашим именам, без чужих значений. */
 function mismatches(v: DomainView): string {
   const bad = (v.check ?? []).filter((c) => !c.ok);
@@ -181,7 +198,8 @@ export function domainSay(v: DomainView | null): string {
       return (
         'Домен ждёт изменения DNS. Назови пользователю записи ДОСЛОВНО из records (тип, имя, значение) и скажи ' +
         'удалить у этих имён остальные A-записи и ВСЕ AAAA — иначе сертификат не выпустится. Изменения DNS ' +
-        'расходятся от 15 минут до суток, платформа проверяет сама. Это бесплатно. Не говори, что домен уже подключён.' +
+        'расходятся от 15 минут до суток, платформа проверяет сама первые дни после заявки; если прошло много ' +
+        'времени — проверь сейчас (check: true). Это бесплатно. Не говори, что домен уже подключён.' +
         mismatches(v)
       );
   }
@@ -268,7 +286,12 @@ export class ProductToolService {
           ORDER BY p.created_at DESC`,
         [userId],
       )
-      .then((r) => r.rows as ProductListRow[]);
+      .then((r) =>
+        (r.rows as ProductListRow[]).map((p) => ({
+          ...p,
+          custom_domain_unicode: p.custom_domain ? readableDomain(p.custom_domain) : null,
+        })),
+      );
 
     if (!products.length) {
       return {
@@ -404,11 +427,12 @@ export class ProductToolService {
    * Порядок флагов: remove, затем check, затем domain, иначе состояние.
    * Отвязка — первой: «отвязать» с доменом в придачу не должно превратиться
    * в привязку. check раньше domain: привязка того же домена при живой заявке
-   * DNS не перепроверяет (answerExisting), а просили именно проверку.
+   * DNS не перепроверяет (answerExisting), а просили именно проверку. Заявки
+   * нет вовсе (no_domain) и домен назван — это привязка: она и проверяет.
    *
    * Отказ сервиса — HttpException с телом { message, reason }: reason уходит
-   * машинным кодом, message — текстом. Прочие ошибки — наверх: это сбой, а
-   * не ответ.
+   * машинным кодом, message — текстом, кроме формулировок кабинета
+   * (DOMAIN_REFUSAL_SAY). Прочие ошибки — наверх: это сбой, а не ответ.
    */
   private async domain(userId: string, input: any) {
     const matches = await this.resolve(userId, String(input?.product ?? ''));
@@ -420,27 +444,44 @@ export class ProductToolService {
       return { ok: false, reason: 'not_found', say: 'Такого продукта у пользователя нет.' };
     }
     const product = matches[0];
+    // Не строка (число, объект) — не домен: молча отдать состояние значило бы
+    // сделать вид, что привязка прошла.
+    if (input?.domain != null && typeof input.domain !== 'string') {
+      return { ok: false, reason: 'bad_form', product,
+        say: 'Домен передан не строкой. Повтори вызов с доменом строкой, например "mysite.ru".' };
+    }
     const raw = typeof input?.domain === 'string' ? input.domain.trim() : '';
     try {
-      if (input?.remove === true) {
+      if (flag(input?.remove)) {
         const { removed } = await this.domains.detach(userId, product.id);
         return { ok: true, product, removed,
           say: removed === 'now' ? 'Домен отвязан.' : 'Отвязка поставлена — займёт до минуты.' };
       }
       let view: DomainView | null;
-      if (input?.check === true) view = await this.domains.check(userId, product.id);
+      if (flag(input?.check)) view = await this.checkOrAttach(userId, product.id, raw);
       else if (raw) view = await this.domains.attach(userId, product.id, raw);
       else view = await this.domains.get(userId, product.id);
       return { ok: true, product, domain: view ? domainForAssistant(view) : null, say: domainSay(view) };
     } catch (e: any) {
       if (!(e instanceof HttpException)) throw e;
       const body: any = e.getResponse();
+      const reason = typeof body?.reason === 'string' ? body.reason : 'refused';
       return {
         ok: false,
-        reason: typeof body?.reason === 'string' ? body.reason : 'refused',
+        reason,
         product,
-        say: typeof body?.message === 'string' ? body.message : e.message,
+        say: DOMAIN_REFUSAL_SAY[reason] ?? (typeof body?.message === 'string' ? body.message : e.message),
       };
+    }
+  }
+
+  private async checkOrAttach(userId: string, productId: string, raw: string): Promise<DomainView> {
+    try {
+      return await this.domains.check(userId, productId);
+    } catch (e: any) {
+      const reason = e instanceof HttpException ? (e.getResponse() as any)?.reason : null;
+      if (reason === 'no_domain' && raw) return this.domains.attach(userId, productId, raw);
+      throw e;
     }
   }
 
@@ -517,7 +558,8 @@ export const PRODUCT_TOOLS = [
       '{ product, check: true } — проверить DNS сейчас; { product, remove: true } — отвязать. Вернутся records — ' +
       'записи для регистратора: называй их ДОСЛОВНО (тип, имя, значение), не пересказывая, и обязательно скажи ' +
       'удалить у этих имён остальные A-записи и ВСЕ AAAA. Не говори «домен работает», пока domain.status не ' +
-      '"active". Свой домен бесплатный, входит в аренду. Бывает только у сайта, один на продукт.\n' +
+      '"active". Свой домен бесплатный, входит в аренду. Бывает только у сайта, один на продукт. В list у продукта ' +
+      'видно custom_domain и custom_domain_status; подробности и что делать — action="domain".\n' +
       'ДВА РАЗНЫХ ПОЛЯ В ОТВЕТЕ, и они НИКОГДА не приходят вместе. Если правку приняли в работу — придёт ' +
       'outcome (чем кончился ход). Если правку не приняли вовсе — придёт reason (почему отказали), и никакого ' +
       'outcome не будет. Не ищи outcome в отказе и не выдавай отказ за исход.\n' +

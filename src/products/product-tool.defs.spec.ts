@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { PRODUCT_TOOLS, PRODUCT_TOOL_NAME, domainForAssistant, domainSay, DOMAIN_FAILED_SAY } from './product-tool.service';
+import { HttpException } from '@nestjs/common';
+import { PRODUCT_TOOLS, PRODUCT_TOOL_NAME, ProductToolService, domainForAssistant, domainSay, DOMAIN_FAILED_SAY, DOMAIN_REFUSAL_SAY } from './product-tool.service';
 import { DOMAIN_ERROR_REASONS, DomainView } from './domains.service';
 
 describe('определение инструмента продуктов', () => {
@@ -139,5 +140,63 @@ describe('свой домен глазами ассистента', () => {
     expect(out.records).toHaveLength(1);
     expect(out.errorReason).toBe('issue_failed');
     expect(out).not.toHaveProperty('error');
+  });
+});
+
+describe('отказы сервиса доменов в чате', () => {
+  const UI = /нажмите|страниц|кнопк/i;
+
+  it('отвязка не предлагает проверять снова', () => {
+    for (const r of ['orphan_removing', 'remove_failed'] as const) {
+      expect(DOMAIN_FAILED_SAY[r]).not.toMatch(/проверить снова|check/i);
+    }
+  });
+
+  it('ждущая заявка: платформа проверяет не вечно — предложено проверить сейчас', () => {
+    const say = domainSay({
+      domain: 'a.ru', domainUnicode: 'a.ru', names: ['a.ru'], status: 'awaiting_dns', error: null,
+      errorReason: null, checkedAt: null, check: null, records: [],
+    });
+    expect(say).toMatch(/check: true/);
+  });
+
+  /**
+   * Каждый отказ DomainsService, чей текст — строка или константа с
+   * формулировкой кабинета (кнопки, страница), обязан иметь замену для
+   * чата. Разбор исходника, а не список руками: новый отказ с «нажмите»
+   * иначе проехал бы в ассистента молча.
+   */
+  it('у каждого отказа с формулировкой кабинета есть замена для чата', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'domains.service.ts'), 'utf8');
+    const consts: Record<string, string> = {};
+    for (const m of src.matchAll(/(?:export )?const ([A-Z_]+) =\s*'([^']*)'/g)) consts[m[1]] = m[2];
+    const uiReasons = new Set<string>();
+    let seen = 0;
+    for (const m of src.matchAll(/refusal\(HttpStatus\.\w+,\s*'(\w+)',\s*('([^']*)'|[A-Z_]+)\)/g)) {
+      const text = m[3] ?? consts[m[2]];
+      if (text === undefined) continue;
+      seen++;
+      if (UI.test(text)) uiReasons.add(m[1]);
+    }
+    expect(seen).toBeGreaterThan(10); // разбор не отвалился молча
+    expect([...uiReasons].sort()).toEqual(expect.arrayContaining(['changed', 'detach_pending']));
+    for (const r of uiReasons) {
+      expect(DOMAIN_REFUSAL_SAY[r]).toBeTruthy();
+      expect(DOMAIN_REFUSAL_SAY[r]).not.toMatch(UI);
+    }
+  });
+
+  it('инструмент подменяет текст кабинета своим', async () => {
+    const pg = { query: async () => ({ rows: [{ id: 'p1', name: 'Сайт', slug: 's', domain: null, kind: 'site', status: 'running' }] }) };
+    for (const reason of ['changed', 'detach_pending']) {
+      const domains: any = {
+        get: async () => {
+          throw new HttpException({ statusCode: 409, message: 'Сбой — нажмите кнопку и обновите страницу.', reason }, 409);
+        },
+      };
+      const out: any = await new ProductToolService(pg as any, {} as any, domains).execute('u', { action: 'domain', product: 'сайт' });
+      expect(out).toMatchObject({ ok: false, reason });
+      expect(out.say).not.toMatch(UI);
+    }
   });
 });
