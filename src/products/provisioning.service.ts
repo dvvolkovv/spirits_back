@@ -1020,7 +1020,8 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    *
    * Отказ устаревшего агента (текст начинается с AGENT_OUTDATED_MARKER) — код
    * agent_outdated вместо issue_failed: это не отказ Let's Encrypt, и пределы
-   * пользователя он не расходует (см. маркер). Решается в JS, параметром $4,
+   * пользователя он не расходует (см. маркер): попытку, списанную tryIssue в
+   * начале этого выпуска, оператор возвращает. Решается в JS, параметром $4,
    * а не LIKE в SQL: так правило «только начало текста» живёт в одном
    * выражении с маркером. Отвязка остаётся remove_failed и с таким отказом:
    * код незавершённой отвязки держит «Проверить снова» (detach_pending), а
@@ -1064,7 +1065,18 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                  error = CASE WHEN d.status = 'removing' THEN 'отвязка не удалась: ' || $3::text ELSE $3::text END,
                  error_reason = CASE WHEN d.status = 'removing' THEN 'remove_failed'
                                      WHEN $4::boolean THEN 'agent_outdated'
-                                     ELSE 'issue_failed' END
+                                     ELSE 'issue_failed' END,
+                 -- Возврат попытки, списанной tryIssue в начале этого выпуска:
+                 -- до Let's Encrypt он не дошёл. Так attempts — это число
+                 -- повторов окна, ДОШЕДШИХ до Let's Encrypt, и все три места
+                 -- проверки окна (tryIssue, hold, flagged) остаются как есть —
+                 -- без особого случая agent_outdated в каждом. attempts_since
+                 -- не трогается: начало окна — момент, когда его открыли, и
+                 -- возврат этого не отменяет. Выпуск из awaiting_dns попытку не
+                 -- списывал, но у такой заявки attempts ещё 0 — GREATEST держит
+                 -- ноль. Отвязка попыток не списывает — её строка не тронута.
+                 attempts = CASE WHEN d.status = 'issuing' AND $4::boolean
+                                 THEN GREATEST(d.attempts - 1, 0) ELSE d.attempts END
             FROM closed WHERE NOT $2::boolean AND d.product_id = closed.product_id AND d.status IN ('issuing','removing')
           RETURNING d.product_id
        )

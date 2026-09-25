@@ -758,15 +758,14 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
         `WITH d AS (
             UPDATE product_domains
                SET status = 'issuing', error = NULL, error_reason = NULL,
-                   -- Повтор после отказа устаревшего агента (agent_outdated)
-                   -- окна повторов не расходует: Let's Encrypt тот выпуск не
-                   -- видел. error_reason здесь — СТАРОЕ значение строки: все
-                   -- выражения SET читают строку до обновления.
-                   attempts = CASE WHEN status <> 'failed' OR error_reason = 'agent_outdated' THEN attempts
+                   -- Попытка списывается здесь, в начале повтора, при ЛЮБОЙ
+                   -- прошлой причине: чей будет отказ, ясно только в отчёте.
+                   -- Повтор, ушедший устаревшему агенту, возвращает её при
+                   -- приёме отчёта (completeDomainJob, agent_outdated).
+                   attempts = CASE WHEN status <> 'failed' THEN attempts
                                    WHEN attempts_since < now() - interval '1 hour' THEN 1
                                    ELSE attempts + 1 END,
-                   attempts_since = CASE WHEN status = 'failed' AND error_reason IS DISTINCT FROM 'agent_outdated'
-                                              AND attempts_since < now() - interval '1 hour'
+                   attempts_since = CASE WHEN status = 'failed' AND attempts_since < now() - interval '1 hour'
                                          THEN now() ELSE attempts_since END
              WHERE product_id = $1 AND token = $2 AND status = $3
                AND ($3::text = 'awaiting_dns' OR ${retryWindowOpen('$4')})

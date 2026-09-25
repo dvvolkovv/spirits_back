@@ -399,7 +399,39 @@ maybe('задание domain: выдача агенту и приём отчёт
         await report(claimed!.jobId, { ok: false, error: OUTDATED });
         await expect(domains.tryIssue(id, 'lk', 'failed')).resolves.toBe('queued');
       }
+      // Идущий повтор попытку уже списал (tryIssue), и она вернётся с его
+      // отчётом — ноль после отчёта, а не до.
+      const last = await prov.claimJob('own');
+      await report(last!.jobId, { ok: false, error: OUTDATED });
       expect((await pool.query(`SELECT attempts FROM product_domains`)).rows[0].attempts).toBe(0);
+    });
+
+    // Попытка списывается В НАЧАЛЕ повтора (tryIssue), а чей это был отказ,
+    // становится ясно только в отчёте. Три отказа Let's Encrypt, затем
+    // четвёртый повтор, который ушёл устаревшему агенту: списанная за него
+    // попытка обязана вернуться — иначе кабинет скажет «повторы исчерпаны»
+    // при причине «агент устарел». А пределы Let's Encrypt после этого
+    // по-прежнему кусаются: следующий настоящий отказ окно закрывает.
+    it('три отказа Let’s Encrypt, затем устаревший агент — повтор проходит, а следующий настоящий отказ упирается в предел', async () => {
+      const id = await mkProduct('shop');
+      await domain(id, 'issuing');
+      await job(id, 'domain');
+      const fail = async (error: string) => {
+        const claimed = await prov.claimJob('own');
+        await report(claimed!.jobId, { ok: false, error });
+      };
+      const LE = 'Challenge failed for domain a.ru';
+      await fail(LE);
+      for (let i = 0; i < 3; i++) {
+        await expect(domains.tryIssue(id, 'lk', 'failed')).resolves.toBe('queued');
+        await fail(i < 2 ? LE : OUTDATED);
+      }
+      expect((await pool.query(`SELECT attempts, error_reason FROM product_domains`)).rows[0]).toEqual({
+        attempts: 2, error_reason: 'agent_outdated',
+      });
+      await expect(domains.tryIssue(id, 'lk', 'failed')).resolves.toBe('queued');
+      await fail(LE);
+      await expect(domains.tryIssue(id, 'lk', 'failed')).resolves.toBe('limited');
     });
 
     // Сервер знает вид задания — и узнаёт только отказ именно на domain:
