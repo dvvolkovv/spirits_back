@@ -987,6 +987,62 @@ describe('completeJob: повторный отчёт по уже закрыто�
 });
 
 /**
+ * Отчёт по заданию domain (completeDomainJob). Мок отвечает на чтение вида
+ * задания 'domain' — иначе completeJob ушёл бы общим путём. Здесь только
+ * форма: сам оператор исполняется на живой базе в domains.jobs.spec.ts.
+ */
+describe('completeJob: задание domain — форма оператора', () => {
+  const makeDomain = () => {
+    const calls: { sql: string; params: any[] }[] = [];
+    const pg = {
+      query: jest.fn(async (sql: string, params: any[] = []) => {
+        calls.push({ sql, params });
+        if (sql.includes('SELECT kind FROM product_provision_jobs')) return { rows: [{ kind: 'domain' }], rowCount: 1 };
+        return { rows: [{ closed: 1 }], rowCount: 1 };
+      }),
+    };
+    return { svc: new ProvisioningService(pg as any, { decrypt: jest.fn() } as any, noHosts(), noLimits()), calls };
+  };
+  /** Тело CTE `name` — от `name AS (` до начала следующего CTE или итогового SELECT. */
+  const cte = (sql: string, name: string, next: string) => {
+    const from = sql.indexOf(`${name} AS (`);
+    const to = sql.indexOf(next, from);
+    expect(from).toBeGreaterThanOrEqual(0);
+    expect(to).toBeGreaterThan(from);
+    return sql.slice(from, to);
+  };
+
+  // Закрытие задания и перевод строки домена — один оператор: сверке сирот
+  // это обещано (см. докблок completeDomainJob). Два оператора — и смерть
+  // процесса между ними оставляла бы сироту с затёртым отказом агента.
+  it('после чтения вида — ровно один оператор, и он начинается с WITH', async () => {
+    for (const result of [{ ok: true }, { ok: false, error: 'x' }]) {
+      const { svc, calls } = makeDomain();
+      await svc.completeJob('j-1', result);
+      expect(calls).toHaveLength(2);
+      expect(calls[1].sql).toMatch(/^\s*WITH\b/);
+    }
+  });
+
+  // removed (DELETE) и refused (UPDATE) целятся в одну и ту же строку в
+  // removing; развести их может только $2 — исход отчёта. Порядок CTE тут не
+  // защита: снимите $2 из removed — и отказ отвязки удалял бы строку, а на
+  // живой базе это сейчас не краснит ничто, потому что UPDATE в refused
+  // случайно берёт строку раньше. Стережётся формой.
+  it('removed идёт только на успехе, refused — только на отказе', async () => {
+    const { svc, calls } = makeDomain();
+    await svc.completeJob('j-1', { ok: false, error: 'x' });
+    const sql = calls[1].sql;
+    const removed = cte(sql, 'removed', 'refused AS (');
+    const refused = cte(sql, 'refused', 'SELECT (SELECT count(*) FROM closed)');
+    expect(removed).toMatch(/WHERE\s+\$2::boolean\s+AND/);
+    expect(removed).not.toMatch(/NOT\s+\$2::boolean/);
+    expect(refused).toMatch(/WHERE\s+NOT\s+\$2::boolean\s+AND/);
+    expect(cte(sql, 'activated', 'removed AS (')).toMatch(/WHERE\s+\$2::boolean\s+AND/);
+  });
+});
+
+/**
  * ПОВТОР ЗАВЕДЕНИЯ — третий и последний писатель очереди заданий.
  *
  * Свой набор моков, а не общий makeService: там ответ выбирается по подстроке

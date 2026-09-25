@@ -1033,6 +1033,11 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
             FROM closed WHERE $2::boolean AND d.product_id = closed.product_id AND d.status = 'issuing'
           RETURNING d.product_id
        ), removed AS (
+          -- removed и refused целятся в ОДНУ строку в removing, и разводит их
+          -- только исход отчёта: здесь условие «успех» ($2), в refused — его
+          -- отрицание. Порядок CTE не защита — снятое отсюда $2 живая база не
+          -- ловит (UPDATE в refused случайно берёт строку раньше), а отказ
+          -- отвязки удалял бы строку. Сторож — форма, provisioning.job.spec.ts.
           DELETE FROM product_domains d USING closed
            WHERE $2::boolean AND d.product_id = closed.product_id AND d.status = 'removing'
           RETURNING d.product_id
