@@ -6,8 +6,10 @@ import { StorageService } from '../common/services/storage.service';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import axios from 'axios';
+import * as os from 'os';
 import { Response } from 'express';
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { neutralizeAtMentions, stripWordJoiner } from '../common/agent-guards';
 import { renderBannerOverlay, BannerPosition, BannerTheme } from './banner-overlay';
 
 const ASSETS_BUCKET = 'linkeon-assets';
@@ -969,10 +971,27 @@ ${LanguageService.buildDirective(userLanguage)}`;
     try {
       const chunks: string[] = [];
       for await (const event of query({
-        prompt: userMessage,
+        // Безопасность: (1) обезвреживаем @-упоминания в НЕДОВЕРЕННОМ тексте
+        // (поисковый запрос/данные профилей) — иначе `@/…/.env` инлайнится в
+        // промпт мимо tools; (2) промпт НЕ должен начинаться с пользовательского
+        // текста — ведущий `/` мог бы уйти как slash-команда, поэтому первой
+        // строкой ставим фиксированную метку.
+        prompt: `Запрос пользователя:\n${neutralizeAtMentions(userMessage)}`,
         options: {
           model: 'claude-haiku-4-5',
-          systemPrompt,
+          systemPrompt: neutralizeAtMentions(systemPrompt),
+          // Безопасность (25.09.2026): здесь нужен чистый текстовый вывод, тулы
+          // не используются вовсе. Раньше стоял bypassPermissions без указания
+          // tools — при таком сочетании SDK отдаёт модели ПОЛНЫЙ набор Claude
+          // Code (Bash, Read, Write, WebFetch…), и userMessage (поисковый
+          // запрос/данные для сравнения профилей) мог заставить её прочитать
+          // ~/spirits_back/.env: процесс API идёт под пользователем, владеющим
+          // этим файлом. `tools: []` убирает встроенные тулы целиком (проверено
+          // пробой: INIT_TOOLS []), после чего bypassPermissions разрешать
+          // нечего. cwd тоже уводим в нейтральный tmp — не в каталог бэкенда с
+          // .env и его 40KB CLAUDE.md.
+          tools: [],
+          cwd: os.tmpdir(),
           permissionMode: 'bypassPermissions',
           settingSources: [],
           includePartialMessages: true,
@@ -984,7 +1003,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
           const inner = (event as any).event;
           if (inner?.type === 'content_block_delta' && inner.delta?.type === 'text_delta'
               && typeof inner.delta.text === 'string') {
-            const text = inner.delta.text;
+            // Снимаем U+2060 на выходе: joiner из входной нейтрализации не должен
+            // доехать до пользователя (одиночный кодепоинт не рвётся на границе
+            // дельт — SDK отдаёт уже декодированные строки).
+            const text = stripWordJoiner(inner.delta.text);
             chunks.push(text);
             res.write(JSON.stringify({ type: 'item', content: text }) + '\n');
           }

@@ -12,6 +12,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { makeReadWithinDirGuard, neutralizeAtMentions, stripWordJoiner } from '../common/agent-guards';
 import { decodeMultipartFilename } from '../common/utils/multipart-filename';
 import { TEST_USERS } from '../common/test-users';
 
@@ -495,14 +496,31 @@ export class ChatController {
       await fsp.writeFile(filePath, file.buffer);
 
       let collected = '';
+      // safeName уже очищен от не-[\w.\-], @ в нём быть не может; обезвреживание
+      // @-упоминаний здесь — защита на будущее и единый инвариант для всех
+      // SDK-вызовов (см. статический сторож).
       for await (const event of query({
-        prompt: `Прочитай файл ${safeName} (он в текущей директории) и извлеки профиль пользователя. Верни ТОЛЬКО JSON без markdown-обёрток:
-{"name":"Имя","family_name":"Фамилия","profile":["факты"],"values":["ценности"],"skills":["навыки"],"beliefs":["убеждения"],"desires":["желания"],"interests":["интересы"],"search":["что ищет"]}`,
+        prompt: neutralizeAtMentions(`Прочитай файл ${safeName} инструментом Read, указав ровно относительное имя "${safeName}" (файл лежит в текущей рабочей директории; НЕ добавляй ведущий слэш и не придумывай другой путь), и извлеки профиль пользователя. Верни ТОЛЬКО JSON без markdown-обёрток:
+{"name":"Имя","family_name":"Фамилия","profile":["факты"],"values":["ценности"],"skills":["навыки"],"beliefs":["убеждения"],"desires":["желания"],"interests":["интересы"],"search":["что ищет"]}`),
         options: {
           model: 'claude-haiku-4-5',
           cwd,
-          allowedTools: ['Read'],
-          permissionMode: 'bypassPermissions',
+          // Безопасность (25.09.2026). Содержимое файла — НЕДОВЕРЕННОЕ: результат
+          // разбора уходит в профиль пользователя, поэтому инструкция внутри
+          // файла может попытаться увести модель на чтение чужого пути. Раньше
+          // стоял bypassPermissions — он снимает ВСЕ проверки, и хотя тут только
+          // Read, модель могла прочитать ~/spirits_back/.env (процесс API идёт
+          // под владельцем .env). Теперь:
+          //   • `tools: ['Read']` — единственный доступный тул (нужен, чтобы SDK
+          //     нативно открыл PDF/картинку);
+          //   • `permissionMode: 'default'` вместо bypass — на каждый Read зовётся
+          //     canUseTool;
+          //   • страж makeReadWithinDirGuard(cwd) пускает Read ТОЛЬКО по путям,
+          //     чей realpath внутри одноразового cwd (симлинк наружу и
+          //     несуществующий путь — отказ). cwd за пределами каталога бэкенда.
+          tools: ['Read'],
+          permissionMode: 'default',
+          canUseTool: makeReadWithinDirGuard(cwd),
           settingSources: [],
         } as any,
       })) {
@@ -513,7 +531,7 @@ export class ChatController {
         }
       }
 
-      let text = collected.trim();
+      let text = stripWordJoiner(collected).trim();
       if (text.includes('```')) {
         text = text.replace(/^[\s\S]*?```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
       }
