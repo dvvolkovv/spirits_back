@@ -1,5 +1,6 @@
 import 'reflect-metadata';
-import { PATH_METADATA, METHOD_METADATA } from '@nestjs/common/constants';
+import { PATH_METADATA, METHOD_METADATA, ROUTE_ARGS_METADATA } from '@nestjs/common/constants';
+import { RouteParamtypes } from '@nestjs/common/enums/route-paramtypes.enum';
 import { RequestMethod } from '@nestjs/common';
 import { AdminController } from './admin.controller';
 
@@ -20,6 +21,31 @@ function fakeRes() {
   return r;
 }
 
+/** Ключи query-параметров, которые маршрут читает через @Query('…'). */
+function queryNamesOf(method: string): string[] {
+  const args = Reflect.getMetadata(ROUTE_ARGS_METADATA, AdminController, method) ?? {};
+  return Object.keys(args)
+    .filter((k) => k.startsWith(`${RouteParamtypes.QUERY}:`))
+    .map((k) => args[k].data)
+    .sort();
+}
+
+/**
+ * Вызвать маршрут так, как это делает Nest: аргументы берутся по именам из
+ * @Query('…'), а не по позиции. Позиционный вызов не заметил бы опечатки в
+ * имени ключа — а includeTest в запросе и include_test в ответе здесь рядом.
+ */
+function viaRoute(ctrl: any, method: string, query: Record<string, string | undefined>, res: any) {
+  const meta = Reflect.getMetadata(ROUTE_ARGS_METADATA, AdminController, method) ?? {};
+  const args: unknown[] = [];
+  for (const [key, { index, data }] of Object.entries<any>(meta)) {
+    const type = Number(key.split(':')[0]);
+    if (type === RouteParamtypes.QUERY) args[index] = query[data];
+    if (type === RouteParamtypes.RESPONSE) args[index] = res;
+  }
+  return ctrl[method](...args);
+}
+
 describe('AdminController: звонки и встречи', () => {
   it('лента объявлена как GET admin/calls/sessions', () => {
     const handler = AdminController.prototype.callSessions;
@@ -31,7 +57,7 @@ describe('AdminController: звонки и встречи', () => {
     const svc = { getCallSessions: jest.fn().mockResolvedValue({ sessions: [] }) };
     const ctrl = new AdminController(svc as any, {} as any);
     const res = fakeRes();
-    await ctrl.callSessions('90', 'meeting', 'zoom', '1', '100', res);
+    await viaRoute(ctrl, 'callSessions', { days: '90', kind: 'meeting', provider: 'zoom', includeTest: '1', limit: '100' }, res);
 
     expect(svc.getCallSessions).toHaveBeenCalledWith({
       days: 90, kind: 'meeting', provider: 'zoom', includeTest: true, limit: 100,
@@ -43,7 +69,7 @@ describe('AdminController: звонки и встречи', () => {
   it('таблица принимает площадку и тестовые', async () => {
     const svc = { getCallsByUser: jest.fn().mockResolvedValue({}) };
     const ctrl = new AdminController(svc as any, {} as any);
-    await ctrl.callsByUser('30', 'meeting', 'talerid', '1', undefined, fakeRes());
+    await viaRoute(ctrl, 'callsByUser', { days: '30', kind: 'meeting', provider: 'talerid', includeTest: '1' }, fakeRes());
 
     expect(svc.getCallsByUser).toHaveBeenCalledWith({
       days: 30, kind: 'meeting', provider: 'talerid', includeTest: true, limit: undefined,
@@ -53,8 +79,15 @@ describe('AdminController: звонки и встречи', () => {
   it('без includeTest тестовые не включаются', async () => {
     const svc = { getCallSessions: jest.fn().mockResolvedValue({}) };
     const ctrl = new AdminController(svc as any, {} as any);
-    await ctrl.callSessions(undefined, undefined, undefined, undefined, undefined, fakeRes());
+    await viaRoute(ctrl, 'callSessions', {}, fakeRes());
 
     expect(svc.getCallSessions).toHaveBeenCalledWith(expect.objectContaining({ includeTest: false }));
+  });
+
+  it('таблица и лента читают одни и те же query-параметры', () => {
+    // Обе ручки — один набор фильтров раздела: параметр, добавленный в одну
+    // и забытый в другой, развёл бы таблицу и ленту.
+    expect(queryNamesOf('callSessions')).toEqual(['days', 'includeTest', 'kind', 'limit', 'provider']);
+    expect(queryNamesOf('callsByUser')).toEqual(queryNamesOf('callSessions'));
   });
 });
