@@ -1643,6 +1643,7 @@ ph_render_vhost() {
 # сверяется, этого для такой цены достаточно.
 ensure_product_vhost() {
   local base="$PH_SRC_DIR/scripts/product-vhost"
+  PH_VHOST_WHY=""
   bold "[машина $PH_ID 2/5] product-vhost на $PH_TARGET (зона $PH_ZONE)"
 
   if [[ ! -f "$base" ]]; then
@@ -1674,6 +1675,9 @@ ensure_product_vhost() {
   have=$(sed -n 's/^SUM=//p' <<<"$state" | tail -1)
 
   if [[ "$nginx_state" != "ok" ]]; then
+    # Для products_host_one: красный здесь — не «скрипт не поставился», и агенту
+    # важно, какая редакция product-vhost на машине сейчас.
+    if [[ "$have" == "$want" ]]; then PH_VHOST_WHY=nginx_red_current; else PH_VHOST_WHY=nginx_red_stale; fi
     red "  ✗ nginx -t на машине продуктов КРАСНЫЙ — там два боевых домена, и"
     red "    перезагрузка nginx или машины сейчас их не поднимет. Чинить ПЕРВЫМ делом:"
     red "    ssh $PH_TARGET 'nginx -t'"
@@ -1897,7 +1901,12 @@ ensure_nginx_domains() {
     # Хук: временный файл рядом (mktemp даёт 600 — certbot его не исполнит),
     # sh -n, и только потом на место.
     HT=\$($PH_SUDO mktemp /etc/letsencrypt/renewal-hooks/deploy/.linkeon-reload-nginx.XXXXXX) || { echo NGD:NO_TMP; exit 0; }
-    printf '%s' '$hook_b64' | base64 -d | $PH_SUDO tee \"\$HT\" >/dev/null
+    # Запись проверяется: пустой или недописанный хук (диск полон, обрыв
+    # base64) не должен встать на место, даже если sh -n его пропустит —
+    # пустой файл sh -n проходит.
+    if ! printf '%s' '$hook_b64' | base64 -d | $PH_SUDO tee \"\$HT\" >/dev/null || ! $PH_SUDO test -s \"\$HT\"; then
+      $PH_SUDO rm -f \"\$HT\"; echo NGD:WRITE_FAIL; exit 0
+    fi
     if ! $PH_SUDO sh -n \"\$HT\"; then $PH_SUDO rm -f \"\$HT\"; echo NGD:HOOK_PARSE; exit 0; fi
     $PH_SUDO chown root:root \"\$HT\"
     $PH_SUDO chmod 755 \"\$HT\"
@@ -1906,14 +1915,22 @@ ensure_nginx_domains() {
     # nginx -t ДО записи: красный не от нас — так и сказать, ничего не писать.
     if ! $PH_SUDO nginx -t >/dev/null 2>&1; then ngt; echo NGD:PRE_RED; exit 0; fi
 
-    PREV=\$(mktemp)
-    if $PH_SUDO test -f $conf_dst; then $PH_SUDO cat $conf_dst > \"\$PREV\"; HAD=1; else HAD=0; fi
-    printf '%s' '$conf_b64' | base64 -d | $PH_SUDO tee $conf_dst >/dev/null
+    PREV=\$(mktemp) || { echo NGD:TMP_FAIL; exit 0; }
+    if $PH_SUDO test -f $conf_dst; then
+      $PH_SUDO cat $conf_dst > \"\$PREV\" || { rm -f \"\$PREV\"; echo NGD:TMP_FAIL; exit 0; }
+      HAD=1
+    else
+      HAD=0
+    fi
+    restore_conf() { if [ \"\$HAD\" = 1 ]; then $PH_SUDO tee $conf_dst < \"\$PREV\" >/dev/null; else $PH_SUDO rm -f $conf_dst; fi; }
+    if ! printf '%s' '$conf_b64' | base64 -d | $PH_SUDO tee $conf_dst >/dev/null || ! $PH_SUDO test -s $conf_dst; then
+      restore_conf; rm -f \"\$PREV\"; echo NGD:WRITE_FAIL; exit 0
+    fi
     if $PH_SUDO nginx -t >/dev/null 2>&1; then
       if $PH_SUDO systemctl reload nginx; then echo NGD:OK; else echo NGD:RELOAD_FAIL; fi
     else
       ngt
-      if [ \"\$HAD\" = 1 ]; then $PH_SUDO tee $conf_dst < \"\$PREV\" >/dev/null; else $PH_SUDO rm -f $conf_dst; fi
+      restore_conf
       echo NGD:NGINX_RED
     fi
     rm -f \"\$PREV\"
@@ -1931,6 +1948,12 @@ ensure_nginx_domains() {
       red "  ✗ с новой корзиной nginx -t красный — прежнее состояние возвращено, nginx не перечитан."
       red "    Если в выводе «directive is duplicate» — корзина уже задана в nginx.conf машины:"
       [[ -n "$ngt_lines" ]] && echo "$ngt_lines"
+      return 1 ;;
+    NGD:WRITE_FAIL)
+      red "  ✗ запись файла на машине не удалась (диск полон? обрыв?) — хук не поставлен либо конфиг корзины возвращён как был"
+      return 1 ;;
+    NGD:TMP_FAIL)
+      red "  ✗ не смог сохранить прежний конфиг корзины во временный файл — ничего не писал"
       return 1 ;;
     NGD:HOOK_PARSE)
       red "  ✗ хук продления не разобрался sh -n на машине — не поставлен, временный файл убран"
@@ -2337,24 +2360,42 @@ products_host_one() {
   local fails=0 vhost_ok=1
   ph_check_identity    || fails=$(( fails + 1 ))
   ensure_product_vhost || { fails=$(( fails + 1 )); vhost_ok=0; }
-  ensure_nginx_domains || fails=$(( fails + 1 ))
-  # Агент (четвёртая часть) идёт ТОЛЬКО за зелёным product-vhost: агент зовёт
-  # его с `--domain`, а старая редакция скрипта этого флага не знает — ровно
-  # авария 21.09.2026 с `--asleep`. Пара «агент + product-vhost» обязана
-  # стоять из одного коммита, поэтому при красном product-vhost агент не
-  # ставится (и считается несошедшимся). В режиме проверки на машину не пишет
-  # ни одна часть — там агент сверяется как обычно, чтобы отчёт был полным.
+  if ! ensure_nginx_domains; then
+    fails=$(( fails + 1 ))
+    # Агента это не останавливает (с корзиной 64 ничего не ломается — длинное
+    # имя просто откатывает product-vhost), но клиент увидит отказ.
+    red "  ! пока корзина 128 не стоит, свои домены длиннее 46 знаков (и слаги от 34)"
+    red "    на этой машине не заведутся: product-vhost откатит конфиг, задание domain упадёт"
+  fi
+  # Агент (четвёртая часть) идёт ТОЛЬКО за product-vhost из того же коммита:
+  # агент зовёт его с `--domain`, а старая редакция скрипта этого флага не
+  # знает — ровно авария 21.09.2026 с `--asleep`. Поэтому при красном
+  # product-vhost агент не ставится (и считается несошедшимся). Исключение —
+  # часть 2/5 красна ТОЛЬКО из-за nginx -t машины, а скрипт на ней уже из
+  # прод-коммита: пара согласована, агент и образ nginx не трогают
+  # (product-image-roll.sh сохраняет порты и vhost не переписывает), и
+  # выкат идёт как шёл до этой проверки. В режиме проверки на машину не
+  # пишет ни одна часть — там агент сверяется как обычно.
   #
   # Пятая часть идёт ТОЛЬКО за зелёной четвёртой: образ собирается из тех
   # исходников, которые кладёт на машину установщик агента. Красный агент
   # означает, что на машине лежит не тот код, и выкат образа отказал бы вторым
   # подряд отказом, указывающим на причину этажом выше.
-  if (( ! vhost_ok )) && [[ -z "${PH_CHECK_ONLY:-}" ]]; then
+  if (( ! vhost_ok )) && [[ "${PH_VHOST_WHY:-}" == nginx_red_current ]]; then
+    bold "  (часть 2/5 красна из-за nginx -t машины, но product-vhost на ней уже из прод-коммита — агент ставится)"
+  fi
+  if (( ! vhost_ok )) && [[ -z "${PH_CHECK_ONLY:-}" && "${PH_VHOST_WHY:-}" != nginx_red_current ]]; then
     fails=$(( fails + 1 ))
     bold "[машина $PH_ID 4/5] агент хоста на $PH_TARGET"
-    red "  ✗ агента не трогаю: product-vhost на машине не обновился, а новый агент зовёт"
-    red "    его с флагами, которых старый скрипт не знает. Образ среды — тоже нет:"
-    red "    исходники раннера на машину кладёт установщик агента"
+    if [[ "${PH_VHOST_WHY:-}" == nginx_red_stale ]]; then
+      red "  ✗ агента не трогаю: nginx -t машины красный (не от выката — см. часть 2/5), поэтому"
+      red "    product-vhost не обновлялся, и на машине его СТАРАЯ редакция. Новый агент звал бы её"
+      red "    с флагами, которых она не знает. Сначала починить nginx, потом повторить фазу."
+    else
+      red "  ✗ агента не трогаю: product-vhost на машине не обновился, а новый агент зовёт"
+      red "    его с флагами, которых старый скрипт не знает."
+    fi
+    red "    Образ среды — тоже нет: исходники раннера на машину кладёт установщик агента"
   elif ensure_host_agent; then
     ensure_product_image || fails=$(( fails + 1 ))
   else
