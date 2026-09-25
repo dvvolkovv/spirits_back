@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PgService } from '../common/services/pg.service';
+import { AGENT_OUTDATED_MARKER } from './domains.service';
 import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
 import { SecretsService } from './secrets.service';
@@ -992,7 +993,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    * «выпуск прерван».
    *
    * ТЕКСТ И КОД ОШИБКИ — ПАРОЙ, в обе стороны: успех снимает оба, отказ ставит
-   * оба (issue_failed или remove_failed). Иначе ограничение
+   * оба (issue_failed, remove_failed или agent_outdated). Иначе ограничение
    * product_domains_error_pair откатило бы весь оператор, закрытие задания
    * вместе с ним: задание висело бы в running до сборщика зависших, а
    * дословная строка Let's Encrypt пропала бы — сверка сирот написала бы
@@ -1001,12 +1002,23 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    * Задание-уборка (строки нет) ни одной строки домена не находит: закрывается
    * только само задание, причина отказа остаётся в нём.
    *
+   * Отказ устаревшего агента (текст начинается с AGENT_OUTDATED_MARKER) — код
+   * agent_outdated вместо issue_failed: это не отказ Let's Encrypt, и пределы
+   * пользователя он не расходует (см. маркер). Решается в JS, параметром $4,
+   * а не LIKE в SQL: так правило «только начало текста» живёт в одном
+   * выражении с маркером. Отвязка остаётся remove_failed и с таким отказом:
+   * код незавершённой отвязки держит «Проверить снова» (detach_pending), а
+   * agent_outdated его бы снял — и кнопка выпустила бы домен, который
+   * человек отвязывал.
+   *
    * На `activated`, `removed` и `refused` итоговый SELECT не ссылается, и это
    * не мёртвый код: изменяющий CTE PostgreSQL исполняет всегда и до конца, со
    * ссылкой или без. Выбрасывается только НЕссылаемый SELECT в WITH — ровно
    * тот случай, о котором шапка provisioning.integration.spec.ts.
    */
   private async completeDomainJob(jobId: string, result: { ok: boolean; error?: string }) {
+    const error = result.error ?? 'без причины';
+    const outdated = !result.ok && error.startsWith(AGENT_OUTDATED_MARKER);
     const r = await this.pg.query(
       `WITH closed AS (
           UPDATE product_provision_jobs
@@ -1028,12 +1040,14 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
           UPDATE product_domains d
              SET status = 'failed',
                  error = CASE WHEN d.status = 'removing' THEN 'отвязка не удалась: ' || $3::text ELSE $3::text END,
-                 error_reason = CASE WHEN d.status = 'removing' THEN 'remove_failed' ELSE 'issue_failed' END
+                 error_reason = CASE WHEN d.status = 'removing' THEN 'remove_failed'
+                                     WHEN $4::boolean THEN 'agent_outdated'
+                                     ELSE 'issue_failed' END
             FROM closed WHERE NOT $2::boolean AND d.product_id = closed.product_id AND d.status IN ('issuing','removing')
           RETURNING d.product_id
        )
        SELECT (SELECT count(*) FROM closed)::int AS closed`,
-      [jobId, result.ok, result.error ?? 'без причины'],
+      [jobId, result.ok, error, outdated],
     );
     if (!r.rows[0].closed) this.logger.warn(`отчёт по незапущенному заданию domain ${jobId} — домен не тронут`);
   }

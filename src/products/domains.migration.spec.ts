@@ -117,8 +117,8 @@ maybe('миграция 008: свой домен', () => {
         [id, error, reason],
       );
 
-    it('все пять кодов принимаются', async () => {
-      for (const reason of ['taken', 'orphan_issuing', 'orphan_removing', 'issue_failed', 'remove_failed']) {
+    it('все шесть кодов принимаются', async () => {
+      for (const reason of ['taken', 'orphan_issuing', 'orphan_removing', 'issue_failed', 'remove_failed', 'agent_outdated']) {
         const id = await mkProduct(`shop-${reason.replace('_', '-')}`);
         await expect(put(id, 'текст', reason)).resolves.toBeDefined();
       }

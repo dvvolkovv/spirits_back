@@ -53,7 +53,9 @@ CREATE TABLE IF NOT EXISTS product_domains (
   -- taken — домен в тот же миг занял другой продукт; orphan_issuing и
   -- orphan_removing — задание выпуска или отвязки сняли снаружи (гашение,
   -- снятие блокировки, сборщик зависших); issue_failed и remove_failed —
-  -- отказ, о котором отчитался агент.
+  -- отказ, о котором отчитался агент; agent_outdated — агент машины старее
+  -- сервера и задания domain не знает (AGENT_OUTDATED_MARKER в
+  -- domains.service.ts): отказ не Let's Encrypt, пределов он не расходует.
   error_reason   text,
   check_result   jsonb,
   checked_at     timestamptz,
@@ -100,7 +102,7 @@ CREATE TABLE IF NOT EXISTS product_domains (
   -- неизвестный код кабинет показал бы сырым ключом перевода. Новый код — это
   -- новая миграция, а не правка этой строки (см. шапку файла).
   CONSTRAINT product_domains_error_reason_check CHECK (
-    error_reason IN ('taken','orphan_issuing','orphan_removing','issue_failed','remove_failed')
+    error_reason IN ('taken','orphan_issuing','orphan_removing','issue_failed','remove_failed','agent_outdated')
   ),
 
   -- Текст и код — парой: оба заданы или оба пусты. Текст без кода кабинет не

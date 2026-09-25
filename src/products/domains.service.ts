@@ -11,9 +11,40 @@ export type DomainStatus = 'awaiting_dns' | 'issuing' | 'active' | 'failed' | 'r
  * Машинный код причины `error` (колонка error_reason, словарь закрыт в 008):
  * taken — домен занял другой продукт; orphan_* — задание выпуска или отвязки
  * сняли снаружи; issue_failed / remove_failed — отказ, о котором отчитался
- * агент (их пишет приём отчёта, задача 6).
+ * агент (их пишет приём отчёта, задача 6); agent_outdated — агент машины
+ * старее сервера и задания domain не знает (см. AGENT_OUTDATED_MARKER).
  */
-export type DomainErrorReason = 'taken' | 'orphan_issuing' | 'orphan_removing' | 'issue_failed' | 'remove_failed';
+export type DomainErrorReason =
+  | 'taken'
+  | 'orphan_issuing'
+  | 'orphan_removing'
+  | 'issue_failed'
+  | 'remove_failed'
+  | 'agent_outdated';
+
+/**
+ * Начало ЗАМОРОЖЕННОЙ формулировки отказа уже выкаченных агентов на
+ * неизвестный им вид задания (product-runner/src/host/index.ts, workFor:
+ * «неизвестный вид задания: "domain". Агент умеет …»). Агент ставится на
+ * машины продуктов PHASE 4 отдельно от сервера, и сервер, выкаченный раньше
+ * агента (или PHASE 4, молча не доехавшая), получает на КАЖДОЕ задание domain
+ * именно этот отказ. Let's Encrypt тут ни при чём — на хосте ничего не
+ * тронуто, — поэтому такой отказ пишется кодом agent_outdated и не
+ * расходует пределы пользователя (окно повторов и задания domain в час):
+ * иначе каждая готовая заявка сгорала бы как «сертификат не выпущен» и
+ * запирала кнопку на час.
+ *
+ * Строку в агенте менять нельзя: её уже произносят агенты на машинах, и
+ * узнавать их сервер обязан по ней. Сверяется только НАЧАЛО текста: в
+ * середину эта фраза попадает из чужих рук — Let's Encrypt цитирует в отказе
+ * ответ сервера пользователя, и такая страница иначе выводила бы его отказы
+ * из-под пределов. Начало отказа агент пишет сам (describeFailure: сообщение
+ * без префикса, когда хвостов на хосте нет, а у неизвестного вида их нет —
+ * отказ до первого обращения к хосту).
+ */
+export const AGENT_OUTDATED_MARKER = 'неизвестный вид задания:';
+/** Тот же маркер как SQL-шаблон LIKE: в нём нет ни `%`, ни `_`, ни кавычек — экранировать нечего. */
+const AGENT_OUTDATED_LIKE = `'${AGENT_OUTDATED_MARKER}%'`;
 
 /**
  * Чем кончилась попытка перевести заявку в выпуск (см. tryIssue):
@@ -139,10 +170,17 @@ const retryWindowOpen = (limit: string) => `(attempts_since < now() - interval '
 /**
  * У продукта $1 за последний час меньше `limit` заданий domain. `limit` —
  * плейсхолдер параметра с DOMAIN_JOBS_PER_HOUR.
+ *
+ * Задания, на которые устаревший агент ответил «неизвестный вид задания»
+ * (AGENT_OUTDATED_MARKER), не в счёт: Let's Encrypt они не трогали, а виноват
+ * в них наш выкат, не пользователь. Узнаются по тексту отказа в самом
+ * задании — отдельной колонки у product_provision_jobs нет, а 008 таблицу
+ * заданий не меняет (только CREATE … IF NOT EXISTS, см. её шапку).
  */
 const domainJobsLeft = (limit: string) => `((SELECT count(*) FROM product_provision_jobs j
                   WHERE j.product_id = $1 AND j.kind = 'domain'
-                    AND j.created_at > now() - interval '1 hour') < ${limit})`;
+                    AND j.created_at > now() - interval '1 hour'
+                    AND NOT (j.status = 'failed' AND COALESCE(j.error, '') LIKE ${AGENT_OUTDATED_LIKE})) < ${limit})`;
 
 /**
  * Отказ после НЕЗАВЕРШЁННОЙ отвязки: «Проверить снова» здесь выпустил бы
@@ -733,10 +771,15 @@ export class DomainsService implements OnModuleInit, OnModuleDestroy {
         `WITH d AS (
             UPDATE product_domains
                SET status = 'issuing', error = NULL, error_reason = NULL,
-                   attempts = CASE WHEN status <> 'failed' THEN attempts
+                   -- Повтор после отказа устаревшего агента (agent_outdated)
+                   -- окна повторов не расходует: Let's Encrypt тот выпуск не
+                   -- видел. error_reason здесь — СТАРОЕ значение строки: все
+                   -- выражения SET читают строку до обновления.
+                   attempts = CASE WHEN status <> 'failed' OR error_reason = 'agent_outdated' THEN attempts
                                    WHEN attempts_since < now() - interval '1 hour' THEN 1
                                    ELSE attempts + 1 END,
-                   attempts_since = CASE WHEN status = 'failed' AND attempts_since < now() - interval '1 hour'
+                   attempts_since = CASE WHEN status = 'failed' AND error_reason IS DISTINCT FROM 'agent_outdated'
+                                              AND attempts_since < now() - interval '1 hour'
                                          THEN now() ELSE attempts_since END
              WHERE product_id = $1 AND token = $2 AND status = $3
                AND ($3::text = 'awaiting_dns' OR ${retryWindowOpen('$4')})

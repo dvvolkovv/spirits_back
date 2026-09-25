@@ -292,6 +292,83 @@ maybe('задание domain: выдача агенту и приём отчёт
     expect(String(warn.mock.calls[0][0])).toContain(jobId);
   });
 
+  // Сервер выкачен раньше агента (или PHASE 4 молча не доехала): выпущенный
+  // агент задания domain не знает и отказывает дословной строкой workFor.
+  // Отказ Let's Encrypt здесь ни при чём — и пределы пользователя (повторы в
+  // час, задания domain в час) такой отказ расходовать не должен: иначе
+  // каждая готовая заявка сгорала бы как «сертификат не выпущен» и запирала
+  // кнопку на час.
+  describe('агент старее сервера: неизвестный вид задания', () => {
+    // Дословно так отвечает выпущенный агент (product-runner/src/host/index.ts, workFor).
+    const OUTDATED =
+      'неизвестный вид задания: "domain". Агент умеет provision, sleep, wake — эта работа сделана НЕ БЫЛА, '
+      + 'на хосте ничего не тронуто. Похоже, сервер новее агента на машине продуктов.';
+
+    it('отказ выпуска — failed с кодом agent_outdated, а не issue_failed', async () => {
+      const id = await mkProduct('shop');
+      await domain(id, 'issuing');
+      const jobId = await job(id, 'domain');
+      await prov.claimJob('own');
+      await report(jobId, { ok: false, error: OUTDATED });
+      expect(await domainRow()).toEqual({ status: 'failed', error: OUTDATED, error_reason: 'agent_outdated' });
+      expect(await jobRow(jobId)).toEqual({ status: 'failed', error: OUTDATED });
+      expect(await productRow()).toEqual({ status: 'running', provision_error: null });
+    });
+
+    // Отвязку устаревший агент тоже не сделал — и «Проверить снова» после неё
+    // обязан отбиваться как после любой незавершённой отвязки (detach_pending):
+    // иначе кнопка выпустила бы домен, который человек отвязывал.
+    it('отказ отвязки — по-прежнему remove_failed: «Проверить снова» не выпускает отвязываемый домен', async () => {
+      const id = await mkProduct('shop');
+      await domain(id, 'removing');
+      const jobId = await job(id, 'domain');
+      await prov.claimJob('own');
+      await report(jobId, { ok: false, error: OUTDATED });
+      expect(await domainRow()).toMatchObject({ status: 'failed', error_reason: 'remove_failed' });
+    });
+
+    // Маркер — только в НАЧАЛЕ текста. В середину он попадает из чужих рук:
+    // Let's Encrypt цитирует в отказе ответ сервера пользователя, и страница
+    // с этой фразой иначе выводила бы его отказы из-под пределов.
+    it('маркер не в начале текста — обычный отказ issue_failed', async () => {
+      const id = await mkProduct('shop');
+      await domain(id, 'issuing');
+      const jobId = await job(id, 'domain');
+      await prov.claimJob('own');
+      const quoted = `Invalid response from http://a.ru/.well-known/acme-challenge/x: "${OUTDATED}"`;
+      await report(jobId, { ok: false, error: quoted });
+      expect(await domainRow()).toMatchObject({ status: 'failed', error_reason: 'issue_failed' });
+    });
+
+    it('такие отказы не расходуют ни окно повторов, ни задания domain в час', async () => {
+      const id = await mkProduct('shop');
+      await domain(id, 'issuing');
+      await job(id, 'domain');
+      // Больше и RETRIES_PER_HOUR (3), и DOMAIN_JOBS_PER_HOUR (6).
+      for (let i = 0; i < 8; i++) {
+        const claimed = await prov.claimJob('own');
+        expect(claimed).toMatchObject({ jobKind: 'domain' });
+        await report(claimed!.jobId, { ok: false, error: OUTDATED });
+        await expect(domains.tryIssue(id, 'lk', 'failed')).resolves.toBe('queued');
+      }
+      expect((await pool.query(`SELECT attempts FROM product_domains`)).rows[0].attempts).toBe(0);
+    });
+
+    // Обратная сторона: обычный отказ окно повторов расходует, как и раньше.
+    it('обычный отказ — счётчик повторов растёт, после трёх повторов limited', async () => {
+      const id = await mkProduct('shop');
+      await domain(id, 'issuing');
+      await job(id, 'domain');
+      const outcomes: string[] = [];
+      for (let i = 0; i < 4; i++) {
+        const claimed = await prov.claimJob('own');
+        await report(claimed!.jobId, { ok: false, error: 'Challenge failed for domain a.ru' });
+        outcomes.push(await domains.tryIssue(id, 'lk', 'failed'));
+      }
+      expect(outcomes).toEqual(['queued', 'queued', 'queued', 'limited']);
+    });
+  });
+
   // Живой дефект, который сторожит этот тест: «последнее задание» видело бы
   // domain вместо пробуждения, и проснувшийся продукт навсегда оставался бы
   // «спящим» с работающим контейнером.
