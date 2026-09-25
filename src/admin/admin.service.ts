@@ -1562,6 +1562,16 @@ export class AdminService implements OnModuleInit {
   private static readonly PROVIDER_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 
   /**
+   * Лимит выдачи из query-параметра: нечисло — значение по умолчанию, дробь
+   * отбрасывается, остальное прижимается к 1…max. NaN или 50.5 в LIMIT — это
+   * ошибка Postgres, а не пустой ответ.
+   */
+  private static clampLimit(v: number | undefined, def: number, max: number): number {
+    const n = Number.isFinite(v) ? Math.trunc(v as number) : def;
+    return Math.min(Math.max(n, 1), max);
+  }
+
+  /**
    * Фильтры раздела «Звонки» из query-параметров.
    *
    * Незнакомый kind схлопывается в 'call', а не снимает фильтр: иначе
@@ -1624,7 +1634,7 @@ export class AdminService implements OnModuleInit {
    */
   async getCallsByUser(opts: CallsQuery = {}) {
     const f = AdminService.callsFilter(opts);
-    const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
+    const limit = AdminService.clampLimit(opts.limit, 100, 500);
     const { where, params } = AdminService.callsWhere(f);
 
     // Консультации подтягиваем коррелированным подзапросом по call_id, а не
@@ -1726,14 +1736,18 @@ export class AdminService implements OnModuleInit {
    * получали одну форму. Расшифровка читается ради пометок и в ответ не уходит
    * (см. toCallSession). Консультации — подзапросами по call_id, а не JOIN по
    * user_id: иначе к звонку приехали бы вопросы, заданные тем же человеком на
-   * встрече.
+   * встрече. Имя ассистента — display_name, как он представляется на встрече,
+   * с откатом на внутреннее name.
    */
   private static readonly SESSION_COLUMNS = `
-    c.id, c.user_id, c.provider, a.name AS agent_name,
+    c.id, c.user_id, c.provider, COALESCE(a.display_name, a.name) AS agent_name,
     c.started_at, c.duration_sec, c.status, c.model, c.summary, c.transcript,
     c.tokens_charged,
     (SELECT COALESCE(SUM(j.tokens_used), 0) FROM voice_call_jobs j WHERE j.call_id = c.id)::bigint AS tokens_consult,
     (SELECT COUNT(*) FROM voice_call_jobs j WHERE j.call_id = c.id)::int AS consults`;
+
+  /** Откуда берётся сессия. Псевдоним a в SESSION_COLUMNS определяется этим JOIN. */
+  private static readonly SESSION_FROM = 'voice_calls c LEFT JOIN agents a ON a.id = c.agent_id';
 
   /**
    * Строка voice_calls → сессия для админки.
@@ -1775,14 +1789,12 @@ export class AdminService implements OnModuleInit {
    */
   async getCallSessions(opts: CallsQuery = {}) {
     const f = AdminService.callsFilter(opts);
-    const asked = Number.isFinite(opts.limit) ? Math.trunc(opts.limit as number) : 50;
-    const limit = Math.min(Math.max(asked, 1), 500);
+    const limit = AdminService.clampLimit(opts.limit, 50, 500);
     const { where, params } = AdminService.callsWhere(f);
 
     const rowsRes = await this.pg.query(
       `SELECT ${AdminService.SESSION_COLUMNS}
-         FROM voice_calls c
-         LEFT JOIN agents a ON a.id = c.agent_id
+         FROM ${AdminService.SESSION_FROM}
         WHERE ${where}
         ORDER BY c.started_at DESC, c.id DESC
         LIMIT ${limit}`,
@@ -1813,13 +1825,12 @@ export class AdminService implements OnModuleInit {
    * его и хотят посмотреть.
    */
   async getUserCalls(userId: string, opts: { limit?: number } = {}) {
-    const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
+    const limit = AdminService.clampLimit(opts.limit, 50, 200);
     const res = await this.pg.query(
       `SELECT ${AdminService.SESSION_COLUMNS}
-         FROM voice_calls c
-         LEFT JOIN agents a ON a.id = c.agent_id
+         FROM ${AdminService.SESSION_FROM}
         WHERE c.user_id = $1
-        ORDER BY c.started_at DESC
+        ORDER BY c.started_at DESC, c.id DESC
         LIMIT $2`,
       [userId, limit],
     );
