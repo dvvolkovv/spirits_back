@@ -5,7 +5,14 @@ export interface TranscriptTurn {
   text?: string;
 }
 
-export type CallFlag = 'interrupted' | 'silent' | 'nearly_silent' | 'short';
+export type CallFlag = 'interrupted' | 'failed' | 'live' | 'silent' | 'nearly_silent' | 'short';
+
+/**
+ * Статусы идущей сессии. Длительности у неё ещё нет, а расшифровку voice-host
+ * дописывает по ходу (VoiceCallService.progress), так что «молчал» и
+ * «короткий» считались бы по недописанному разговору.
+ */
+const LIVE_STATUSES = new Set(['dialing', 'active']);
 
 /** Меньше этого — «короткий»: на проде средний состоявшийся звонок 237 секунд. */
 export const SHORT_CALL_SEC = 30;
@@ -38,6 +45,12 @@ export function callFlags(call: {
   // и остальные пометки посчитались бы как «молчал и короткий», что неверно:
   // человек не молчал, разговор просто не начался.
   if (call.status === 'interrupted') return ['interrupted'];
+
+  // Сорвавшаяся встреча: бот не вошёл или оборвался звук. Реплик может не
+  // быть вовсе, но человек при этом не молчал — причина лежит в саммари
+  // («Звонок не состоялся: …»).
+  if (call.status === 'failed') return ['failed'];
+  if (call.status && LIVE_STATUSES.has(call.status)) return ['live'];
 
   const flags: CallFlag[] = [];
   const turns = countUserTurns(call.transcript);
