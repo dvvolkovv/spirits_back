@@ -40,6 +40,26 @@ describe('getUserCalls', () => {
     expect(sql).not.toContain('OR 1=1');
     expect(params).toContain("' OR 1=1 --");
   });
+
+  it('отдаёт ту же форму сессии, что и лента раздела', async () => {
+    pg.query.mockResolvedValue({
+      rows: [{
+        id: 'c-9', user_id: '79030169187', provider: 'talerid', agent_name: 'Роман',
+        started_at: '2026-09-21T11:00:00Z', duration_sec: 712, status: 'completed',
+        model: 'gpt-realtime', summary: 'Итоги встречи', transcript: [],
+        tokens_charged: 7200, tokens_consult: '1100', consults: 2,
+      }],
+    });
+
+    const r = await svc.getUserCalls('79030169187');
+    const [sql] = pg.query.mock.calls[0];
+
+    expect(sql).toMatch(/LEFT JOIN agents a ON a\.id = c\.agent_id/);
+    expect(r.calls[0]).toMatchObject({
+      provider: 'talerid', agent_name: 'Роман',
+      tokens_call: 7200, tokens_consult: 1100, tokens_total: 8300, consults: 2,
+    });
+  });
 });
 
 describe('getCallTranscript', () => {
