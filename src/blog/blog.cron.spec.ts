@@ -1,6 +1,6 @@
 import { Logger } from '@nestjs/common';
 import { BlogCron, STUCK_PUBLISHING_MINUTES } from './blog.cron';
-import { STALE_DRAFTING_MINUTES } from './blog-topic.service';
+import { BlogTopicService, STALE_DRAFTING_MINUTES } from './blog-topic.service';
 
 const deps = () => ({
   // Захват черновика (`UPDATE ... RETURNING`) по умолчанию удаётся: пустой
@@ -150,8 +150,10 @@ describe('BlogCron.prepareDrafts', () => {
     await make(d).prepareDrafts();
 
     expect(d.editor.draft).not.toHaveBeenCalled();
-    const sqls = d.pg.query.mock.calls.map((c: any) => String(c[0]));
-    expect(sqls.some((s) => s.includes("status = 'drafting'"))).toBe(false);
+    // Только записи: охрана очереди сама ЧИТАЕТ `status = 'drafting'` (живой
+    // черновик держит очередь), а стеречь здесь надо запись статуса.
+    const writes = d.pg.query.mock.calls.map((c: any) => String(c[0])).filter((s: string) => /^\s*UPDATE/.test(s));
+    expect(writes.some((s) => s.includes("status = 'drafting'"))).toBe(false);
   });
 });
 
@@ -281,6 +283,231 @@ describe('BlogCron.prepareDrafts — гонка двух тиков', () => {
     // Порог — параметром, а не литералом в тексте запроса.
     const params = d.pg.query.mock.calls.find((c: any) => /RETURNING/.test(String(c[0])))?.[1];
     expect(params).toContain(STALE_DRAFTING_MINUTES);
+  });
+});
+
+/**
+ * Что держит очередь черновиков.
+ *
+ * Раньше новый черновик не начинался, пока был хоть один пост в
+ * `pending_review` ИЛИ `approved`. Одобренный пост уже решён и просто ждёт
+ * слота, но держал всю очередь: владелец одобрил кейс в пятницу со слотом на
+ * понедельник — срочная новость о запуске встала бы в работу только в
+ * понедельник. Готовить посты наперёд было невозможно.
+ *
+ * Держат очередь теперь двое: пост на проверке (владелец ещё не решил — не
+ * заваливаем его вторым черновиком) и черновик, который пишется прямо сейчас
+ * (свежая `drafting_started_at`).
+ *
+ * Ловушка — дедлок. `drafting` с ПУСТОЙ отметкой — это запрошенная
+ * переработка, которая ждёт, чтобы её взяли; сочти её охрана занятой — она
+ * заблокирует сама себя, и переработка не случится никогда. Протухшая
+ * отметка — брошенный черновик, его подбирает `takeNextIdea`, и держать
+ * очередь он тоже не должен.
+ */
+describe('BlogCron.prepareDrafts — что держит очередь', () => {
+  beforeEach(() => { process.env.BLOG_ENABLED = 'true'; process.env.BLOG_APPROVER_TG_ID = '77'; });
+
+  type Row = { id: string; status: string; rubric: string; mark: number | null; created: number };
+
+  /**
+   * WHERE из запроса — в JS-предикат над строкой.
+   *
+   * Условия НЕ зашиты в заглушку: она исполняет то, что написано в самом
+   * запросе. Поэтому мутация условия — вернуть в охрану `approved`, счесть
+   * занятой пустую отметку — меняет и ответ заглушки, и тест краснеет по
+   * делу, а не по совпадению строк. Перевод понимает ровно те конструкции, из
+   * которых собраны условия очереди; всё, что не перевелось, — ошибка: за SQL,
+   * которого она не понимает, заглушка не ручается.
+   */
+  const sqlWhere = (where: string, params: any[], now: number): ((r: Row) => boolean) => {
+    const param = (n: string) => params[Number(n) - 1];
+    const cutoff = (n: string) => now - Number(param(n)) * 60_000;
+    const js = where
+      .replace(/drafting_started_at IS NOT NULL/g, '(r.mark !== null)')
+      .replace(/drafting_started_at IS NULL/g, '(r.mark === null)')
+      .replace(
+        /drafting_started_at (>=|<=|<|>) now\(\) - \(\$(\d+) \|\| ' minutes'\)::interval/g,
+        (_m, op, n) => `(r.mark !== null && r.mark ${op} ${cutoff(n)})`,
+      )
+      .replace(/\bid = \$(\d+)/g, (_m, n) => `(r.id === ${JSON.stringify(param(n))})`)
+      .replace(/status IN \(([^)]*)\)/g, (_m, list) => `[${list}].includes(r.status)`)
+      .replace(/status = ANY\(\$(\d+)::text\[\]\)/g, (_m, n) => `${JSON.stringify(param(n))}.includes(r.status)`)
+      .replace(/status = ('[a-z_]+')/g, (_m, s) => `(r.status === ${s})`)
+      .replace(/\bAND\b/g, '&&')
+      .replace(/\bOR\b/g, '||')
+      .replace(/\bNOT\b/g, '!');
+    const leftover = js
+      .replace(/r\.(status|mark|id)|null|includes|'[\w-]+'|"[\w-]+"|\d+/g, '')
+      .replace(/===|!==|>=|<=|&&|\|\||[<>!()[\],.\s]/g, '');
+    if (leftover) throw new Error(`заглушка не понимает условия «${where}»: не перевелось «${leftover}»`);
+    return new Function('r', `return ${js};`) as (r: Row) => boolean;
+  };
+
+  /**
+   * Postgres в миниатюре для конвейера черновиков: охрана очереди, выборка
+   * `takeNextIdea` (настоящая, не мок) и захват — все три исполняют свои
+   * условия над строками.
+   */
+  const queuePg = (rows: Array<Partial<Row> & { id: string; status: string }>) => {
+    const now = Date.now();
+    const state: Row[] = rows.map((r, i) => ({ rubric: 'case', mark: null, created: i, ...r }));
+    const seen: string[] = [];
+    const query = jest.fn(async (sql: string, params: any[] = []) => {
+      const s = String(sql).replace(/\s+/g, ' ').trim();
+
+      let m = s.match(/^SELECT count\(\*\)::int AS n FROM blog_post WHERE (.+)$/);
+      if (m) {
+        seen.push('guard');
+        return { rows: [{ n: state.filter(sqlWhere(m[1], params, now)).length }] };
+      }
+
+      m = s.match(/^SELECT \* FROM blog_post WHERE (.+) ORDER BY \(rubric = 'news'\) DESC, created_at ASC LIMIT 1$/);
+      if (m) {
+        seen.push('take');
+        const hit = state.filter(sqlWhere(m[1], params, now))
+          .sort((a, b) => Number(b.rubric === 'news') - Number(a.rubric === 'news') || a.created - b.created)[0];
+        return {
+          rows: hit ? [{
+            id: hit.id, rubric: hit.rubric, source: 'manual', topic_key: 'k', status: hit.status, attempts: 0,
+            drafting_started_at: hit.mark === null ? null : new Date(hit.mark),
+          }] : [],
+        };
+      }
+
+      m = s.match(/^UPDATE blog_post SET status = 'drafting', drafting_started_at = now\(\), updated_at = now\(\) WHERE (.+) RETURNING id$/);
+      if (m) {
+        seen.push('claim');
+        const hit = state.find(sqlWhere(m[1], params, now));
+        if (!hit) return { rows: [] };
+        hit.status = 'drafting';
+        hit.mark = now;
+        return { rows: [{ id: hit.id }] };
+      }
+
+      if (/^UPDATE blog_post SET/.test(s)) return { rows: [] };   // текст черновика, failed
+      throw new Error(`заглушка не знает запроса: ${s}`);
+    });
+    return { state, seen, query, minutesAgo: (min: number) => now - min * 60_000 };
+  };
+
+  const run = async (rows: Array<Partial<Row> & { id: string; status: string }>, mutate?: (pg: any) => void) => {
+    const d = deps();
+    const pg = queuePg(rows);
+    mutate?.(pg);
+    d.pg = pg as any;
+    d.topics = new BlogTopicService(pg as any) as any;
+    d.editor.draft.mockResolvedValue({ title: 'З', body: 'Т', imagePrompt: 'сцена' });
+    d.images.render.mockResolvedValue('https://minio/i.png');
+    await make(d).prepareDrafts();
+    return { d, pg, drafted: d.editor.draft.mock.calls.map((c: any[]) => c[0].id) };
+  };
+
+  it('одобренный пост не держит очередь: следующая тема идёт в работу', async () => {
+    const { drafted } = await run([
+      { id: 'approved-case', status: 'approved' },
+      { id: 'urgent-news', status: 'idea', rubric: 'news' },
+    ]);
+    expect(drafted).toEqual(['urgent-news']);
+  });
+
+  it('пост в publishing тоже не держит очередь', async () => {
+    const { drafted } = await run([
+      { id: 'going-out', status: 'publishing' },
+      { id: 'next', status: 'idea' },
+    ]);
+    expect(drafted).toEqual(['next']);
+  });
+
+  it('пост на проверке держит очередь — второй черновик владельцу не шлём', async () => {
+    const { drafted, pg } = await run([
+      { id: 'on-review', status: 'pending_review' },
+      { id: 'next', status: 'idea' },
+    ]);
+    expect(drafted).toEqual([]);
+    expect(pg.seen).toEqual(['guard']);
+  });
+
+  it('черновик, который пишется прямо сейчас, держит очередь', async () => {
+    const { drafted, pg } = await run([
+      { id: 'being-written', status: 'drafting' },
+      { id: 'next', status: 'idea' },
+    ], (p) => { p.state[0].mark = p.minutesAgo(1); });
+    expect(drafted).toEqual([]);
+    expect(pg.seen).toEqual(['guard']);
+  });
+
+  /**
+   * Главный сторож от дедлока. «Переписать» и замечание гасят отметку —
+   * пустая означает «готов к работе прямо сейчас». Охрана, которая сочтёт
+   * такой пост занятым, заблокирует его же переработку навсегда.
+   */
+  it('запрошенная переработка (drafting с пустой отметкой) не блокирует сама себя', async () => {
+    const { drafted } = await run([{ id: 'redo', status: 'drafting' }]);
+    expect(drafted).toEqual(['redo']);
+  });
+
+  it('брошенный черновик (протухшая отметка) не держит очередь — его подбирают заново', async () => {
+    const { drafted } = await run(
+      [{ id: 'abandoned', status: 'drafting' }],
+      (p) => { p.state[0].mark = p.minutesAgo(STALE_DRAFTING_MINUTES + 1); },
+    );
+    expect(drafted).toEqual(['abandoned']);
+  });
+
+  it('порог свежести в охране — тот же STALE_DRAFTING_MINUTES, параметром', async () => {
+    const { pg } = await run([{ id: 'next', status: 'idea' }]);
+    const guard = pg.query.mock.calls.find((c: any[]) => /count\(\*\)/.test(String(c[0])));
+    expect(guard?.[1]).toEqual([STALE_DRAFTING_MINUTES]);
+  });
+});
+
+/**
+ * Напоминание «через час слот, а пост без решения» имеет смысл только про
+ * слот, который пост получит, если его одобрить сейчас, — ближайший
+ * СВОБОДНЫЙ. Раньше свободный и ближайший совпадали: одобренный пост держал
+ * очередь, и рядом с ним поста на проверке не было. Теперь они живут вместе,
+ * и напоминание про слот, который уже занят одобренным постом, врало бы
+ * («без апрува слот пропустим» — не пропустим, он занят).
+ */
+describe('BlogCron.remindPending', () => {
+  beforeEach(() => { process.env.BLOG_ENABLED = 'true'; process.env.BLOG_APPROVER_TG_ID = '77'; });
+  afterEach(() => { jest.useRealTimers(); });
+
+  const MON_SLOT = '2026-09-21T07:00:00.000Z';   // пн 10:00 МСК
+
+  const remindPg = (holders: Array<{ id: string; title: string; slot_at: Date; status: string }>) => ({
+    query: jest.fn(async (sql: string, params: any[] = []) => {
+      const s = String(sql).replace(/\s+/g, ' ').trim();
+      if (/status = 'pending_review'/.test(s)) return { rows: [{ id: 'p1', title: 'Черновик без решения' }] };
+      const m = s.match(/^SELECT id, title, slot_at FROM blog_post WHERE status = ANY\(\$1::text\[\]\) AND slot_at > \$2/);
+      if (m) {
+        const after = new Date(params[1]).getTime();
+        return { rows: holders.filter((h) => params[0].includes(h.status) && h.slot_at.getTime() > after) };
+      }
+      throw new Error(`заглушка не знает запроса: ${s}`);
+    }),
+  });
+
+  const runAt = async (iso: string, holders: any[]) => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date(iso));
+    const d = deps();
+    d.pg = remindPg(holders) as any;
+    await make(d).remindPending();
+    return d;
+  };
+
+  it('свободный слот через полчаса — напоминание уходит', async () => {
+    const d = await runAt('2026-09-21T06:30:00Z', []);
+    expect(d.approval.notify).toHaveBeenCalledWith(77, expect.stringContaining('Черновик без решения'));
+  });
+
+  it('ближайший слот занят одобренным постом — напоминания нет', async () => {
+    const d = await runAt('2026-09-21T06:30:00Z', [
+      { id: 'a1', title: 'Кейс', slot_at: new Date(MON_SLOT), status: 'approved' },
+    ]);
+    expect(d.approval.notify).not.toHaveBeenCalled();
   });
 });
 

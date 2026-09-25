@@ -5,7 +5,8 @@ import { BlogSettingsService } from './blog-settings.service';
 import { BlogPost, BlogStatus, MAX_NOTE_PROMPTS, appendEditorNote, canTransition, rowToPost } from './blog.types';
 import { BlogCallbackAction, parseBlogCallback, buildBlogKeyboard } from './blog-callback';
 import { buildCaption } from './blog-text';
-import { nextSlotAfter } from './blog-slots';
+import { NoFreeSlotError } from './blog-slots';
+import { ApprovedSlot, approveIntoFreeSlot } from './blog-slot-claim';
 import { fetchImageBytes } from './blog-image.fetch';
 import { formatSlotWhen } from './blog-slot-format';
 
@@ -140,23 +141,42 @@ export class BlogApprovalService {
     }
 
     if (parsed.action === 'ok') {
-      const { slotDays, slotHourMsk } = await this.settings.get();
-      const now = new Date();
-      const slot = nextSlotAfter(now, slotDays, slotHourMsk);
-      await this.pg.query(
-        `UPDATE blog_post SET status = 'approved', slot_at = $2, updated_at = now() WHERE id = $1`,
-        [post.id, slot.toISOString()],
-      );
+      // Слот — ближайший СВОБОДНЫЙ, а не ближайший вообще: одобренный пост
+      // больше не держит очередь, и рядом с ним бывают другие одобренные.
+      // Гонку с админкой и соседним процессом держит уникальный индекс, а
+      // ретрай на нём живёт в approveIntoFreeSlot.
+      const chatId = Number(cb?.message?.chat?.id);
+      let approved: ApprovedSlot | null;
+      try {
+        approved = await approveIntoFreeSlot(this.pg, post.id, post.status, await this.settings.get());
+      } catch (e: any) {
+        if (!(e instanceof NoFreeSlotError)) throw e;
+        // Пост остаётся на проверке, и владелец должен узнать почему, а не
+        // смотреть на крутящиеся часики на кнопке.
+        this.logger.warn(`пост ${post.id} не одобрен: ${e.message}`);
+        const refusal = `Не одобрил: ${e.message}.`;
+        await this.tg.answerCallbackQuery(cb.id, { text: refusal });
+        await this.notify(chatId, `Блог: пост${quotedTitle(post)} не одобрен — ${e.message}.`);
+        return true;
+      }
+      if (!approved) {
+        // Между чтением и записью пост ушёл из статуса, в котором его
+        // одобряли: второе касание той же кнопки или решение из админки.
+        await this.tg.answerCallbackQuery(cb.id, { text: 'Пост уже обработан' });
+        return true;
+      }
 
       // Всплывашка живёт секунды и легко пропускается, поэтому та же дата
       // следом дублируется обычным сообщением через notify() — оно остаётся
       // в истории чата. chatId берём из самого callback (как handleReplyEdit
       // берёт его из msg), а не из post.reviewChatId: это тот чат, где
       // реально нажали кнопку, без лишнего похода мыслью к БД.
-      const when = formatSlotWhen(slot, now);
+      //
+      // Дата — того слота, который реально записан, после всех ретраев.
+      const when = formatSlotWhen(approved.slot, approved.now);
       const text = `Одобрено. Опубликую ${when}.`;
       await this.tg.answerCallbackQuery(cb.id, { text });
-      await this.notify(Number(cb?.message?.chat?.id), text);
+      await this.notify(chatId, text);
       return true;
     }
 
