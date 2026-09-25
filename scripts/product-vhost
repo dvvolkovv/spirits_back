@@ -1,8 +1,11 @@
 #!/bin/sh
-# product-vhost <slug> <порт|--asleep> — заводит vhost продукта на хосте продуктов.
+# product-vhost <slug> <порт|--asleep> [--domain <имя>]... — заводит vhost
+# продукта на хосте продуктов.
 #
-#   product-vhost shop 8001     боевой режим: домен проксирует на контейнер
-#   product-vhost shop --asleep заглушка: продукт спит, аренда не оплачена
+#   product-vhost shop 8001                     боевой режим: домен проксирует на контейнер
+#   product-vhost shop --asleep                 заглушка: продукт спит, аренда не оплачена
+#   product-vhost shop 8001 --domain a.ru --domain www.a.ru
+#                                               то же плюс свои домены продукта
 #
 # ВЕРСИОНИРУЕТСЯ ЗДЕСЬ, СТАВИТСЯ НА ХОСТ РУКАМИ. До 16.09.2026 скрипт
 # существовал ТОЛЬКО в /usr/local/bin/product-vhost на 139.59.210.42 и не был
@@ -15,24 +18,50 @@
 #
 # ЧТО ЗДЕСЬ ОПАСНО И ПОЧЕМУ НАПИСАНО ИМЕННО ТАК:
 #
-#   1. Конфиг пишется ДО `nginx -t`. Значит непонятый аргумент оставляет на
-#      диске битый файл, и падает после этого не только текущий вызов —
-#      падает `nginx -t` для ВСЕГО хоста: ни один другой продукт больше не
-#      перечитается, и продление сертификата тоже. Прежняя редакция на
-#      `product-vhost shop --asleep` подставила бы `--asleep` в proxy_pass и
-#      сделала бы ровно это. Поэтому аргумент разбирается ЯВНО и всё
-#      непонятое отбивается ДО первой записи.
+#   1. Битый файл в sites-products роняет `nginx -t` для ВСЕГО хоста: ни один
+#      другой продукт больше не перечитается, и продление сертификата тоже.
+#      Прежняя редакция на `product-vhost shop --asleep` подставила бы
+#      `--asleep` в proxy_pass и сделала бы ровно это. Поэтому, во-первых, все
+#      аргументы разбираются ЯВНО и всё непонятое отбивается ДО первой записи,
+#      а во-вторых (с 24.09.2026) новый конфиг, не прошедший `nginx -t`,
+#      ОТКАТЫВАЕТСЯ: прежний файл возвращается на место, а нового продукта
+#      файла не остаётся вовсе. Скрипт никогда не оставляет машину с
+#      конфигом, который не проходит проверку.
 #   2. `set -eu` и позиционные `$1`/`$2` — без проверки пустой аргумент дал бы
 #      конфиг на server_name `.<зона>`, то есть домен второго уровня.
-#   3. TLS — из общего snippets/products-ssl.conf, сертификат на продукт не
-#      выпускается. Поэтому ожидание при заведении и пробуждении — это
-#      ожидание ПРИЛОЖЕНИЯ, а не сертификата.
+#   3. TLS основного адреса — из общего snippets/products-ssl.conf, сертификат
+#      на продукт не выпускается. Поэтому ожидание при заведении и пробуждении —
+#      это ожидание ПРИЛОЖЕНИЯ, а не сертификата.
 #
 # 503, А НЕ 502. Между погашенным контейнером и живым proxy_pass домен отдаёт
 # 502, и посетитель читает его как нашу поломку. Спящий продукт — не поломка,
 # а штатное состояние неоплаченного. Retry-After не ставим: когда владелец
 # пополнит баланс, неизвестно, а врать роботам сроком не нужно.
+#
+# СВОИ ДОМЕНЫ (24.09.2026, спека custom-domain). `--domain <имя>` можно
+# передать несколько раз. Каждое имя получает блоки в ЭТОМ ЖЕ файле: порт 80
+# с путём /.well-known/acme-challenge/ (Let's Encrypt, HTTP-01) и, если
+# сертификат linkeon-<слаг> уже на диске, порт 443 с ним и с тем же телом,
+# что у основного адреса. Поэтому заглушки «спит» и «остановлен» ложатся на
+# свой домен сами: скрипт переписывает весь файл при каждом переходе.
+#
+# Блок 443 своего имени пишется ТОЛЬКО при наличии файла сертификата: ссылка
+# на отсутствующий файл роняет `nginx -t`. Путь для Let's Encrypt остаётся и
+# при готовом сертификате — без него не пройдёт продление.
+#
+# ДЛИНА ИМЕНИ — НЕ БОЛЬШЕ 100 ЗНАКОВ. Замерено 24.09.2026 на nginx 1.24 при
+# корзине server_names_hash_bucket_size по умолчанию (64): имя от 47 знаков
+# роняет `nginx -t` всей машины. PHASE 4 ставит корзину 128 (потолок — 110
+# знаков), 100 — с запасом.
+#
+# PV_* — пути и команды для теста (product-vhost.script.spec.ts). На машине
+# не задаются.
 set -eu
+
+# Диапазоны `[a-z]` в `case` — по байтам, а не по локали: в UTF-8-локали у
+# части оболочек `[a-z]` ловит и заглавные.
+LC_ALL=C
+export LC_ALL
 
 # ЗОНА ДОМЕНОВ ЭТОЙ МАШИНЫ. Строка одна, и она же — единственное, чем копии
 # скрипта на разных машинах отличаются друг от друга.
@@ -50,6 +79,13 @@ set -eu
 # репозитория берёт зону машины владельца — ту, что была зашита раньше.
 ZONE=p.linkeon.io
 
+CONF_DIR="${PV_CONF_DIR:-/etc/nginx/sites-products}"
+LE_LIVE="${PV_LE_LIVE:-/etc/letsencrypt/live}"
+ACME_ROOT="${PV_ACME_ROOT:-/var/www/linkeon-acme}"
+ASLEEP_DIR="${PV_ASLEEP_DIR:-/usr/share/linkeon}"
+NGINX="${PV_NGINX:-nginx}"
+RELOAD="${PV_RELOAD:-systemctl reload nginx}"
+
 S="${1:-}"
 P="${2:-}"
 
@@ -62,16 +98,48 @@ case "$S" in
   '' | *[!a-z0-9-]* ) echo "product-vhost: слаг не годится: '$S'" >&2; exit 2 ;;
 esac
 
-CONF="/etc/nginx/sites-products/$S.conf"
-ASLEEP_DIR="/usr/share/linkeon"
-ASLEEP_PAGE="$ASLEEP_DIR/asleep.html"
+case "$P" in
+  --asleep) ;;
+  '' | *[!0-9]* ) echo "product-vhost: второй аргумент — порт или --asleep, получено: '$P'" >&2; exit 2 ;;
+esac
+
+if [ $# -ge 2 ]; then shift 2; else shift $#; fi
+
+# Свои имена. Форма — та же, что у vhostArgv в агенте: метки [a-z0-9-], минимум
+# две, без дефиса по краям и без пустых меток. Разбираются ДО первой записи.
+DOMAINS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --domain)
+      D="${2:-}"
+      case "$D" in
+        '' | .* | *. | *..* | -* | *-.* | *.-* | *- | *[!a-z0-9.-]* )
+          echo "product-vhost: домен не годится: '$D'" >&2; exit 2 ;;
+      esac
+      case "$D" in
+        *.*) ;;
+        *) echo "product-vhost: домен без зоны: '$D'" >&2; exit 2 ;;
+      esac
+      if [ "${#D}" -gt 100 ]; then
+        echo "product-vhost: домен длиннее 100 знаков: '$D'" >&2; exit 2
+      fi
+      DOMAINS="$DOMAINS $D"
+      shift 2
+      ;;
+    *) echo "product-vhost: непонятный аргумент: '$1'" >&2; exit 2 ;;
+  esac
+done
+
+CONF="$CONF_DIR/$S.conf"
+CERT="$LE_LIVE/linkeon-$S"
+
+mkdir -p "$ASLEEP_DIR"
 
 if [ "$P" = "--asleep" ]; then
   # Страница заводится здесь же: без неё nginx отдаст свой собственный 503 без
   # единого слова о том, что делать. Перезаписывается при каждом вызове —
   # тогда правка текста доезжает выкатом скрипта, а не отдельным ритуалом.
-  mkdir -p "$ASLEEP_DIR"
-  cat > "$ASLEEP_PAGE" <<'HTML'
+  cat > "$ASLEEP_DIR/asleep.html" <<'HTML'
 <!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -90,35 +158,57 @@ if [ "$P" = "--asleep" ]; then
     и он поднимется автоматически.</p>
 </main></body></html>
 HTML
-  cat > "$CONF" <<CONF
-server {
-  listen 80;
-  server_name $S.$ZONE;
-  return 301 https://\$host\$request_uri;
-}
-server {
-  listen 443 ssl;
-  server_name $S.$ZONE;
-  include snippets/products-ssl.conf;
-  location / {
+  BODY="  location / {
     return 503;
     error_page 503 /asleep.html;
   }
   location = /asleep.html {
     root $ASLEEP_DIR;
     internal;
-  }
-}
-CONF
-  nginx -t >/dev/null 2>&1 && systemctl reload nginx && echo "  vhost $S.$ZONE → заглушка 503"
-  exit
+  }"
+  WHAT="заглушка 503"
+else
+  BODY="  location / {
+    proxy_pass http://127.0.0.1:$P;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+  }"
+  WHAT="127.0.0.1:$P"
 fi
 
-case "$P" in
-  '' | *[!0-9]* ) echo "product-vhost: второй аргумент — порт или --asleep, получено: '$P'" >&2; exit 2 ;;
-esac
+if [ -n "$DOMAINS" ]; then
+  cat > "$ASLEEP_DIR/connecting.html" <<'HTML'
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Домен подключается</title>
+<style>
+ body{font:16px/1.6 system-ui,sans-serif;margin:0;display:grid;place-items:center;
+      min-height:100vh;color:#1b1b1f;background:#f6f6f8;padding:24px}
+ main{max-width:34rem;text-align:center}
+ h1{font-size:1.4rem;margin:0 0 .6em}
+ p{margin:0;color:#4a4a55}
+</style></head>
+<body><main>
+ <h1>Домен подключается</h1>
+ <p>Выпускаем сертификат. Обычно это занимает меньше минуты.</p>
+</main></body></html>
+HTML
+fi
 
-cat > "$CONF" <<CONF
+# Прежний файл — в сторону, в mktemp, а НЕ рядом: всё, что лежит в
+# sites-products и кончается на .conf, nginx читает как конфиг, и копия рядом
+# дала бы дубли server_name.
+PREV=""
+if [ -f "$CONF" ]; then
+  PREV=$(mktemp)
+  cp "$CONF" "$PREV"
+fi
+
+{
+  cat <<CONF
 server {
   listen 80;
   server_name $S.$ZONE;
@@ -128,13 +218,59 @@ server {
   listen 443 ssl;
   server_name $S.$ZONE;
   include snippets/products-ssl.conf;
+$BODY
+}
+CONF
+  for D in $DOMAINS; do
+    if [ -f "$CERT/fullchain.pem" ]; then
+      cat <<CONF
+server {
+  listen 80;
+  server_name $D;
+  location /.well-known/acme-challenge/ { root $ACME_ROOT; }
+  location / { return 301 https://\$host\$request_uri; }
+}
+server {
+  listen 443 ssl;
+  server_name $D;
+  ssl_certificate     $CERT/fullchain.pem;
+  ssl_certificate_key $CERT/privkey.pem;
+  ssl_protocols TLSv1.2 TLSv1.3;
+  ssl_session_cache shared:SSL:10m;
+$BODY
+}
+CONF
+    else
+      cat <<CONF
+server {
+  listen 80;
+  server_name $D;
+  location /.well-known/acme-challenge/ { root $ACME_ROOT; }
   location / {
-    proxy_pass http://127.0.0.1:$P;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
+    return 503;
+    error_page 503 /connecting.html;
+  }
+  location = /connecting.html {
+    root $ASLEEP_DIR;
+    internal;
   }
 }
 CONF
-nginx -t >/dev/null 2>&1 && systemctl reload nginx && echo "  vhost $S.$ZONE → 127.0.0.1:$P"
+    fi
+  done
+} > "$CONF"
+
+if "$NGINX" -t >/dev/null 2>&1; then
+  if [ -n "$PREV" ]; then rm -f "$PREV"; fi
+  $RELOAD
+  echo "  vhost $S.$ZONE → $WHAT${DOMAINS:+ (+$DOMAINS)}"
+else
+  if [ -n "$PREV" ]; then
+    cat "$PREV" > "$CONF"
+    rm -f "$PREV"
+  else
+    rm -f "$CONF"
+  fi
+  echo "product-vhost: новый конфиг $S не прошёл nginx -t — прежний возвращён, nginx не перечитан" >&2
+  exit 1
+fi
