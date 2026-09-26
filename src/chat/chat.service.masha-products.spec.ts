@@ -138,3 +138,170 @@ describe('Маша в вебе: инструмент продуктов', () => 
     expect(events[events.length - 1].type).toBe('end');
   });
 });
+
+// ─── ход Маши в полёте: пинги и учёт живых ходов ────────────────────────────
+
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  let reject!: (e: any) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+/** Прокрутить микрозадачи и настоящие setImmediate, пока условие не станет true. */
+async function until(cond: () => boolean) {
+  for (let i = 0; i < 200 && !cond(); i++) await new Promise((r) => setImmediate(r));
+  if (!cond()) throw new Error('условие так и не выполнилось');
+}
+
+/**
+ * Ход Маши с инструментом идёт минутами: правка ждёт исхода до 2.5 мин внутри
+ * вызова инструмента. Раньше между `begin` и ответом не уходило ничего —
+ * Flutter-клиент (Dio receiveTimeout 60 с) рвал такой ход ошибкой. И ход не
+ * считался живым: deploy.sh ждёт /chat/active-streams только по пути релея, и
+ * рестарт посреди хода Маши убивал ответ, а правка продукта тихо доезжала.
+ */
+describe('Маша: ход в полёте', () => {
+  const OLD_SECRET = process.env.JWT_SECRET;
+  const OLD_DS = process.env.DEEPSEEK_API_KEY;
+  beforeAll(() => {
+    process.env.JWT_SECRET = 'test-secret-for-product-tool';
+    delete process.env.DEEPSEEK_API_KEY;
+  });
+  afterAll(() => {
+    process.env.JWT_SECRET = OLD_SECRET;
+    if (OLD_DS === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = OLD_DS;
+  });
+  afterEach(() => jest.useRealTimers());
+
+  function slowMasha() {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] });
+    const cli = deferred<{ text: string; costUsd: number }>();
+    const { svc, claudeCli } = makeService();
+    claudeCli.textWithCost.mockImplementation(() => cli.promise);
+    const { res, writes } = makeRes();
+    const run = svc.streamChat(USER, 'Поправь заголовок на сайте', '3', `${USER}_3`, 'Имя: Дмитрий', res);
+    const events = () => writes.map((w) => JSON.parse(w));
+    return { svc, claudeCli, res, writes, run, cli, events };
+  }
+
+  it('пока CLI думает, клиенту раз в ~20 с уходит ping — той же формы, что у релея', async () => {
+    const { claudeCli, run, cli, events } = slowMasha();
+    await until(() => claudeCli.textWithCost.mock.calls.length === 1);
+
+    jest.advanceTimersByTime(41_000);
+    const pings = events().filter((e) => e.type === 'ping');
+    expect(pings).toHaveLength(2);
+    // Ровно {"type":"ping"}: без content/text/delta веб и Flutter его пропускают.
+    expect(pings[0]).toEqual({ type: 'ping' });
+
+    cli.resolve({ text: 'Готово.', costUsd: 0.01 });
+    await run;
+    // После ответа пингов больше нет, и порядок событий цел.
+    jest.advanceTimersByTime(60_000);
+    expect(events().map((e) => e.type)).toEqual(['begin', 'ping', 'ping', 'item', 'end']);
+  });
+
+  it('ход считается живым, пока идёт, и перестаёт — когда ответ ушёл', async () => {
+    const { svc, claudeCli, run, cli } = slowMasha();
+    await until(() => claudeCli.textWithCost.mock.calls.length === 1);
+    expect(svc.getActiveStreamCount()).toBe(1);
+    expect(svc.getActiveTurn(USER, '3').active).toBe(true);
+
+    cli.resolve({ text: 'Готово.', costUsd: 0.01 });
+    await run;
+    expect(svc.getActiveStreamCount()).toBe(0);
+    expect(svc.getActiveTurn(USER, '3').active).toBe(false);
+  });
+
+  it('CLI упал — счётчики сняты, клиент получил ответ-заглушку', async () => {
+    const { svc, claudeCli, run, cli, events } = slowMasha();
+    await until(() => claudeCli.textWithCost.mock.calls.length === 1);
+    cli.reject(new Error('claude CLI exited with code 1: boom'));
+    await run;
+    expect(svc.getActiveStreamCount()).toBe(0);
+    expect(svc.getActiveTurn(USER, '3').active).toBe(false);
+    expect(events().map((e) => e.type)).toEqual(['begin', 'item', 'end']);
+  });
+
+  it('CLI упёрся в таймаут — счётчики сняты', async () => {
+    const { svc, claudeCli, run, cli } = slowMasha();
+    await until(() => claudeCli.textWithCost.mock.calls.length === 1);
+    cli.reject(new Error('claude CLI timeout after 600000ms'));
+    await run;
+    expect(svc.getActiveStreamCount()).toBe(0);
+    expect(svc.getActiveTurn(USER, '3').active).toBe(false);
+  });
+
+  it('упала сама отправка ответа — счётчики всё равно сняты, пинги остановлены', async () => {
+    const { svc, claudeCli, res, run, cli, writes } = slowMasha();
+    await until(() => claudeCli.textWithCost.mock.calls.length === 1);
+    res.write.mockImplementation((s: string) => {
+      if (s.includes('"type":"item"')) throw new Error('socket closed');
+      writes.push(s);
+      return true;
+    });
+    cli.resolve({ text: 'Готово.', costUsd: 0.01 });
+    await expect(run).rejects.toThrow('socket closed');
+    expect(svc.getActiveStreamCount()).toBe(0);
+    expect(svc.getActiveTurn(USER, '3').active).toBe(false);
+    const before = writes.length;
+    jest.advanceTimersByTime(60_000);
+    expect(writes.length).toBe(before);
+  });
+});
+
+// ─── метафорическая карта и ход с продуктом ─────────────────────────────────
+
+/**
+ * Карта подмешивается по регулярке (`/карт/i` в ответе), а в разговоре о
+ * сайте «картинку», «карточку товара», «карту сайта» говорят постоянно —
+ * к отчёту о правке прилетала бы случайная метафорическая карта (и ещё
+ * менялся бы game_sessions). Ход, где звали инструмент продуктов, карту не
+ * получает; обычная просьба о карте работает как раньше.
+ */
+describe('Маша: метафорическая карта не цепляется к ходу с продуктом', () => {
+  const OLD_SECRET = process.env.JWT_SECRET;
+  const OLD_DS = process.env.DEEPSEEK_API_KEY;
+  beforeAll(() => {
+    process.env.JWT_SECRET = 'test-secret-for-product-tool';
+    delete process.env.DEEPSEEK_API_KEY;
+  });
+  afterAll(() => {
+    process.env.JWT_SECRET = OLD_SECRET;
+    if (OLD_DS === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = OLD_DS;
+  });
+
+  const CARD_URL = 'https://images.linkeon.io/cards/card-7.jpg';
+
+  async function runWith(impl: (prompt: string, opts: any) => Promise<{ text: string; costUsd: number }>) {
+    const { svc, claudeCli } = makeService();
+    claudeCli.textWithCost.mockImplementation(impl);
+    const cardSpy = jest.spyOn(svc as any, 'getRandomMetaphorCard').mockResolvedValue(CARD_URL);
+    const { res, writes } = makeRes();
+    await svc.streamChat(USER, 'сообщение', '3', `${USER}_3`, 'Имя: Дмитрий', res);
+    await new Promise((r) => setImmediate(r));
+    const item = writes.map((w) => JSON.parse(w)).find((e) => e.type === 'item');
+    return { claudeCli, cardSpy, item };
+  }
+
+  it('CLI Маши зовётся с onProgress — иначе вызов инструмента не увидеть', async () => {
+    const { claudeCli } = await runWith(async () => ({ text: 'Привет.', costUsd: 0.01 }));
+    expect(typeof claudeCli.textWithCost.mock.calls[0][1].onProgress).toBe('function');
+  });
+
+  it('звали инструмент продуктов, в ответе «картинку» — карты нет, game_sessions не трогаем', async () => {
+    const { cardSpy, item } = await runWith(async (_p, opts) => {
+      opts.onProgress?.({ kind: 'tool_use', name: 'mcp__products__manage_product' });
+      return { text: 'Готово: поменяла картинку и карточку товара на главной вашего сайта.', costUsd: 0.01 };
+    });
+    expect(cardSpy).not.toHaveBeenCalled();
+    expect(item.content).not.toContain('Метафорическая карта');
+  });
+
+  it('без инструмента просьба о карте работает как раньше', async () => {
+    const { cardSpy, item } = await runWith(async () => ({ text: 'Вот карта для тебя. Что ты видишь?', costUsd: 0.01 }));
+    expect(cardSpy).toHaveBeenCalled();
+    expect(item.content).toContain(`![Метафорическая карта](${CARD_URL})`);
+  });
+});
