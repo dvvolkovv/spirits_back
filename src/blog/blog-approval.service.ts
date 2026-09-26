@@ -9,9 +9,16 @@ import { NoFreeSlotError } from './blog-slots';
 import { ApprovedSlot, approveIntoFreeSlot } from './blog-slot-claim';
 import { fetchImageBytes } from './blog-image.fetch';
 import { formatSlotWhen } from './blog-slot-format';
+import { QueueShift, formatQueueShift, leaveQueue } from './blog-queue';
 
 /** Подсказка в открытом поле ответа. Telegram принимает 1–64 символа. */
 const NOTE_PLACEHOLDER = 'Что поправить?';
+
+/** Чат владельца (BLOG_APPROVER_TG_ID): туда приходят черновики и служебные сообщения блога. */
+export function approverChatId(): number | null {
+  const raw = process.env.BLOG_APPROVER_TG_ID;
+  return raw ? Number(raw) : null;
+}
 
 /**
  * Почему замечание сейчас не принять — по статусу поста.
@@ -81,12 +88,23 @@ export class BlogApprovalService {
       msg = await this.tg.sendMessage(chatId, `${caption}${note}`, { reply_markup: keyboard });
     }
 
-    await this.pg.query(
-      `UPDATE blog_post
-          SET status = 'pending_review', review_chat_id = $2, review_message_id = $3, updated_at = now()
-        WHERE id = $1`,
-      [post.id, chatId, Number(msg.message_id)],
-    );
+    // Запись — через leaveQueue, хотя в штатном ходе пост здесь в `drafting`.
+    // Нештатный: черновик пишется дольше STALE_DRAFTING_MINUTES, его подбирает
+    // второй тик; первый тем временем показывает свой вариант, владелец его
+    // одобряет — и поздний второй возвращает уже одобренный пост на проверку
+    // со своим, никем не одобренным текстом. Возврат на проверку оставлен:
+    // одобрять надо то, что уйдёт в канал. Но пост при этом ушёл из очереди
+    // раньше слота — и очередь сдвигается тем же правилом, что везде.
+    const out = await leaveQueue(this.pg, post.id, async (tx) => {
+      await tx.query(
+        `UPDATE blog_post
+            SET status = 'pending_review', review_chat_id = $2, review_message_id = $3, updated_at = now()
+          WHERE id = $1`,
+        [post.id, chatId, Number(msg.message_id)],
+      );
+      return true;
+    });
+    await this.notifyQueueShift(out.shifted, chatId);
   }
 
   /**
@@ -103,6 +121,25 @@ export class BlogApprovalService {
     } catch (e: any) {
       this.logger.warn(`не смог уведомить ${chatId}: ${e.message}`);
     }
+  }
+
+  /**
+   * Очередь сдвинулась — владельцу одно сообщение со всеми переездами. В
+   * личке остались устаревшие «Опубликую в среду…», и без этого о новой дате
+   * он узнал бы, только открыв админку. Без переездов — без сообщения.
+   *
+   * @param chatId чат, где владелец только что действовал (кнопка в личке);
+   *        без него — BLOG_APPROVER_TG_ID, куда приходят черновики
+   */
+  async notifyQueueShift(shifted: QueueShift[], chatId?: number | null): Promise<void> {
+    const text = formatQueueShift(shifted, new Date());
+    if (!text) return;
+    const to = chatId || approverChatId();
+    if (!to) {
+      this.logger.warn(`очередь сдвинулась, но BLOG_APPROVER_TG_ID не задан — сообщить некому: ${text}`);
+      return;
+    }
+    await this.notify(to, text);
   }
 
   /** @returns true, если callback наш и обработан */
@@ -180,31 +217,40 @@ export class BlogApprovalService {
       return true;
     }
 
-    if (parsed.action === 'no') {
-      // `rejected` терминален — замечания к этому посту больше некому читать.
-      // В архиве админки они висели бы незакрытыми претензиями к тексту,
-      // которого уже не будет.
-      await this.pg.query(
-        `UPDATE blog_post SET status = 'rejected', editor_notes = '{}'::text[], updated_at = now() WHERE id = $1`,
-        [post.id],
+    // «В мусор» и «Переписать» уводят пост из очереди, если он одобрен, — и
+    // тогда следующие встают на его слот (leaveQueue), как и из админки.
+    // Переход перепроверяется под блокировкой: пока сообщение висело в личке,
+    // пост мог уехать дальше, и запись без условия увела бы, например,
+    // `publishing` в мусор.
+    const trash = parsed.action === 'no';
+    const out = await leaveQueue(this.pg, post.id, async (tx, locked) => {
+      if (!canTransition(locked.status, target)) return false;
+      const r = await tx.query(
+        trash
+          // `rejected` терминален — замечания к этому посту больше некому
+          // читать. В архиве админки они висели бы незакрытыми претензиями к
+          // тексту, которого уже не будет.
+          ? `UPDATE blog_post SET status = 'rejected', editor_notes = '{}'::text[], updated_at = now()
+              WHERE id = $1 AND status = $2`
+          // «Переписать» — это и есть переработка, ради которой замечания
+          // копились. Стереть их здесь значило бы попросить редактора
+          // переписать пост, не сказав ему, что было не так.
+          //
+          // Отметку захвата, наоборот, гасим: пустая означает «готов к работе
+          // прямо сейчас». Иначе пост ждал бы протухания порога — до
+          // пятнадцати минут вместо ближайшего тика.
+          : `UPDATE blog_post SET status = 'drafting', drafting_started_at = NULL, updated_at = now()
+              WHERE id = $1 AND status = $2`,
+        [locked.id, locked.status],
       );
-      await this.tg.answerCallbackQuery(cb.id, { text: 'В мусор' });
+      return r.rowCount !== 0;
+    });
+    if (!out.applied) {
+      await this.tg.answerCallbackQuery(cb.id, { text: `Пост уже обработан: ${out.before?.status ?? 'не найден'}` });
       return true;
     }
-
-    // «Переписать» — это и есть переработка, ради которой замечания копились.
-    // Стереть их здесь значило бы попросить редактора переписать пост, не
-    // сказав ему, что было не так.
-    //
-    // Отметку захвата, наоборот, гасим: пустая означает «готов к работе прямо
-    // сейчас». Иначе пост ждал бы протухания порога — до пятнадцати минут
-    // вместо ближайшего тика.
-    await this.pg.query(
-      `UPDATE blog_post SET status = 'drafting', drafting_started_at = NULL, updated_at = now()
-        WHERE id = $1`,
-      [post.id],
-    );
-    await this.tg.answerCallbackQuery(cb.id, { text: 'Перепишу к следующему тику' });
+    await this.tg.answerCallbackQuery(cb.id, { text: trash ? 'В мусор' : 'Перепишу к следующему тику' });
+    await this.notifyQueueShift(out.shifted, Number(cb?.message?.chat?.id));
     return true;
   }
 
@@ -348,13 +394,26 @@ export class BlogApprovalService {
 
     // `drafting_started_at = NULL` — пост свободен под захват прямо сейчас,
     // ждать протухания порога замечанию незачем.
-    await this.pg.query(
+    //
+    // Условие на статус — в самой записи. Между чтением выше и этой записью
+    // пост могли одобрить из админки; запись без условия увела бы одобренный
+    // пост на переработку мимо очереди (слот освободился бы без сдвига), хотя
+    // владелец уже решил. Замечание принимает только пост на проверке — и
+    // проверяется это атомарно, здесь.
+    const w = await this.pg.query(
       `UPDATE blog_post
           SET editor_notes = $2::text[], status = 'drafting',
               drafting_started_at = NULL, updated_at = now()
-        WHERE id = $1`,
+        WHERE id = $1 AND status = 'pending_review'`,
       [post.id, appendEditorNote(post.editorNotes, text)],
     );
+    if (w.rowCount === 0) {
+      const now = await this.pg.query(`SELECT status FROM blog_post WHERE id = $1`, [post.id]);
+      const status: BlogStatus = now.rows[0]?.status ?? post.status;
+      this.logger.log(`замечание к ${post.id} не принято: пост ушёл в ${status} раньше записи`);
+      await this.tg.sendMessage(chatId, noteRefusal(status));
+      return true;
+    }
     await this.tg.sendMessage(chatId, 'Принял замечание — перепишу пост и пришлю заново.');
     return true;
   }

@@ -16,14 +16,31 @@ const rawRow = (over: any = {}) => ({
   created_at: '2026-09-21T10:00:00.000Z', updated_at: '2026-09-21T10:00:00.000Z', ...over,
 });
 
+/**
+ * Уход из очереди и одобрение идут транзакцией на выделенном соединении
+ * (PgService.getClient). Его запросы попадают в `pg.query` — тот, что стоит
+ * там в момент вызова: тесты подменяют его целиком.
+ */
+const txPg = (query: jest.Mock) => {
+  const pg: any = { query };
+  pg.getClient = jest.fn(async () => ({ query: (sql: string, params?: any[]) => pg.query(sql, params), release: jest.fn() }));
+  return pg;
+};
+
 const deps = () => ({
-  pg: { query: jest.fn().mockResolvedValue({ rows: [rawRow()] }) },
+  pg: txPg(jest.fn().mockResolvedValue({ rows: [rawRow()] })),
   topics: { addTopic: jest.fn().mockResolvedValue({ id: 'new' }) },
   settings: { get: jest.fn().mockResolvedValue({ channelChatId: '-100', slotDays: [1, 3, 5], slotHourMsk: 10, imageStyle: '' }), update: jest.fn().mockResolvedValue({}) },
   images: { render: jest.fn().mockResolvedValue('https://minio/new.png') },
+  publisher: { publish: jest.fn().mockResolvedValue({ ok: true }) },
+  approval: { notifyQueueShift: jest.fn() },
 });
 
-const make = (d: any) => new BlogController(d.pg, d.topics, d.settings, d.images);
+const make = (d: any) => new BlogController(d.pg, d.topics, d.settings, d.images, d.publisher, d.approval);
+
+/** Записи в том порядке, в каком ушли в базу, — ищем по содержанию, а не по номеру вызова. */
+const updates = (pg: any): string[] =>
+  pg.query.mock.calls.map((c: any[]) => String(c[0])).filter((s: string) => /^\s*UPDATE blog_post/.test(s));
 
 describe('BlogController', () => {
   it('list отдаёт очередь', async () => {
@@ -80,17 +97,23 @@ describe('BlogController', () => {
    * Панелей управления постом две, и вторая не должна уметь меньше первой:
    * «в мусор» из админки — тот же терминальный статус, что и кнопка в личке.
    */
+  // reject и redraft пишут через leaveQueue: перед записью — BEGIN и чтение
+  // поста под блокировкой, поэтому запись ищется по содержанию.
+
   it('reject из админки стирает замечания, как и кнопка «в мусор» в личке', async () => {
     const d = deps(); const r = res();
     await make(d).action({ action: 'reject', id: 'p1' }, r);
-    expect(String(d.pg.query.mock.calls[1][0])).toContain("editor_notes = '{}'");
+    expect(updates(d.pg)[0]).toContain("editor_notes = '{}'");
   });
 
   /** redraft — переработка, а не финал: замечания редактору ещё нужны. */
   it('redraft из админки замечания сохраняет', async () => {
     const d = deps(); const r = res();
     await make(d).action({ action: 'redraft', id: 'p1' }, r);
-    expect(String(d.pg.query.mock.calls[1][0])).not.toContain('editor_notes');
+    // Запись обязана БЫТЬ — иначе «не содержит» прошло бы на пустом месте. Рядом
+    // идёт ещё снятие слота (leaveQueue), поэтому ищем именно переработку.
+    expect(updates(d.pg).filter((s) => /status = 'drafting'/.test(s))).toHaveLength(1);
+    expect(updates(d.pg).some((s) => /editor_notes/.test(s))).toBe(false);
   });
 
   /**
@@ -101,7 +124,7 @@ describe('BlogController', () => {
   it('redraft из админки освобождает пост под захват', async () => {
     const d = deps(); const r = res();
     await make(d).action({ action: 'redraft', id: 'p1' }, r);
-    expect(String(d.pg.query.mock.calls[1][0])).toMatch(/drafting_started_at = NULL/i);
+    expect(updates(d.pg)[0]).toMatch(/drafting_started_at = NULL/i);
   });
 
   it('неизвестное действие — 400', async () => {
@@ -218,6 +241,10 @@ describe('BlogController — слоты', () => {
       const s = String(sql).replace(/\s+/g, ' ').trim();
       await passGate(s);
 
+      // Одобрение — транзакция. Откатывать здесь нечего: 23505 бросается до
+      // изменения строки, а других сбоев заглушка не делает.
+      if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(s)) return { rows: [] };
+
       if (/^SELECT \* FROM blog_post WHERE id = \$1$/.test(s)) {
         const r = rows.find((x) => x.id === params[0]);
         return { rows: r ? [{ ...r }] : [] };
@@ -257,6 +284,7 @@ describe('BlogController — слоты', () => {
 
     return {
       rows, query, hooks,
+      getClient: jest.fn(async () => ({ query, release: jest.fn() })),
       row: (id: string) => rows.find((x) => x.id === id),
       hold: (pattern: RegExp, n: number) => { gate = { pattern, n, parked: [] }; },
     };

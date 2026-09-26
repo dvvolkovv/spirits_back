@@ -15,10 +15,13 @@ import { PgService } from '../common/services/pg.service';
 import { BlogTopicService, normalizeTopicKey } from './blog-topic.service';
 import { BlogSettingsService } from './blog-settings.service';
 import { BlogImageService } from './blog-image.service';
+import { BlogPublisherService } from './blog-publisher.service';
+import { BlogApprovalService } from './blog-approval.service';
 import { BlogPost, BlogStatus, canTransition, rowToPost } from './blog.types';
 import { NoFreeSlotError, upcomingSlots } from './blog-slots';
 import { ApprovedSlot, SlotHolder, approveIntoFreeSlot, isSlotConflict, slotHolderAt, slotHolders } from './blog-slot-claim';
 import { formatSlotWhen } from './blog-slot-format';
+import { LeaveOutcome, leaveQueue, shiftToJson } from './blog-queue';
 
 /** `free_slots`: сколько ближайших слотов отдаём, если не просили, и больше скольких не отдаём. */
 export const FREE_SLOTS_DEFAULT = 6;
@@ -58,10 +61,14 @@ function freeSlotsCount(raw: any): number {
  *     слот тем же путём, что и кнопка в личке, а явное время (`approve` со
  *     `slotAt`, `reschedule`) в занятый слот не пишется — 409 slot_taken.
  *     Гарантию даёт уникальный индекс (004_one_post_per_slot.sql), код лишь
- *     не лезет туда, куда индекс всё равно не пустит.
+ *     не лезет туда, куда индекс всё равно не пустит;
+ *  4. очередь без дыр: одобренный пост, ушедший раньше своего слота
+ *     (`publish_now`, `reject`, `redraft`), уходит через leaveQueue, и
+ *     следующие встают на его слот — тем же путём, что кнопки в личке и крон.
+ *     `reschedule` очередь не двигает: это выбор слота владельцем.
  *
- * Отказы новых действий (`free_slots`, `reschedule`) и слотовые отказы
- * `approve` несут машинную причину в `error` ('slot_taken',
+ * Отказы новых действий (`free_slots`, `reschedule`, `publish_now`) и
+ * слотовые отказы `approve` несут машинную причину в `error` ('slot_taken',
  * 'version_conflict', 'bad_request') — по ней фронт выбирает реакцию. Прежние
  * 409 остались в конверте Nest по умолчанию (`error: 'Conflict'`).
  */
@@ -72,6 +79,8 @@ export class BlogController {
     private readonly topics: BlogTopicService,
     private readonly settings: BlogSettingsService,
     private readonly images: BlogImageService,
+    private readonly publisher: BlogPublisherService,
+    private readonly approval: BlogApprovalService,
   ) {}
 
   @Post('admin/blog')
@@ -207,33 +216,97 @@ export class BlogController {
       }
 
       case 'reject': {
-        const post = await this.load(String(data.id));
-        this.assertTransition(post, 'rejected');
         // Тот же терминальный статус, что и кнопка «В мусор» в личке, — и те
-        // же последствия для замечаний. Панелей управления постом две, и
-        // вторая не должна вести себя иначе первой.
-        const r = await this.pg.query(
-          `UPDATE blog_post SET status = 'rejected', editor_notes = '{}'::text[], updated_at = now()
-            WHERE id = $1 AND status = $2`,
-          [post.id, post.status],
-        );
-        this.assertApplied(r);
+        // же последствия для замечаний и для очереди. Панелей управления
+        // постом две, и вторая не должна вести себя иначе первой.
+        const out = await leaveQueue(this.pg, String(data.id), async (tx, post) => {
+          this.assertTransition(post, 'rejected');
+          const r = await tx.query(
+            `UPDATE blog_post SET status = 'rejected', editor_notes = '{}'::text[], updated_at = now()
+              WHERE id = $1 AND status = $2`,
+            [post.id, post.status],
+          );
+          return r.rowCount !== 0;
+        });
+        const post = this.left(out, data.id);
+        await this.approval.notifyQueueShift(out.shifted);
         return res.status(200).json(await this.load(post.id));
       }
 
       case 'redraft': {
-        const post = await this.load(String(data.id));
-        this.assertTransition(post, 'drafting');
         // Та же переработка, что и кнопка «Переписать» в личке, — и так же
         // гасит отметку захвата: пустая означает «готов к работе прямо
         // сейчас». Замечания при этом сохраняются: они редактору ещё нужны.
-        const r = await this.pg.query(
-          `UPDATE blog_post SET status = 'drafting', drafting_started_at = NULL, updated_at = now()
-            WHERE id = $1 AND status = $2`,
-          [post.id, post.status],
-        );
-        this.assertApplied(r);
+        const out = await leaveQueue(this.pg, String(data.id), async (tx, post) => {
+          this.assertTransition(post, 'drafting');
+          const r = await tx.query(
+            `UPDATE blog_post SET status = 'drafting', drafting_started_at = NULL, updated_at = now()
+              WHERE id = $1 AND status = $2`,
+            [post.id, post.status],
+          );
+          return r.rowCount !== 0;
+        });
+        const post = this.left(out, data.id);
+        await this.approval.notifyQueueShift(out.shifted);
         return res.status(200).json(await this.load(post.id));
+      }
+
+      case 'publish_now': {
+        // Контракт зафиксирован для фронта: 200 { post, shifted }; 409
+        // version_conflict; 400 bad_request. `post.status === 'published'` —
+        // вышел; `approved` с `lastError` — Telegram не принял, пост выйдет
+        // ближайшим тиком publishDue.
+        const id = data.id === undefined || data.id === null ? '' : String(data.id).trim();
+        if (!id) throw this.badRequest('не указан пост');
+        // Без канала паблишер откажет ДО захвата, не записав причины: пост
+        // висел бы в approved со слотом «сейчас» и без lastError, а очередь
+        // была бы уже сдвинута. Отказываем раньше, чем что-либо тронуто.
+        const { channelChatId } = await this.settings.get();
+        if (!channelChatId) throw this.badRequest('канал не настроен — публиковать некуда');
+
+        let out: LeaveOutcome;
+        try {
+          out = await leaveQueue(this.pg, id, async (tx, post) => {
+            if (!sameVersion(post.updatedAt, data.updatedAt)) throw this.conflict('version_conflict', STALE_POST);
+            if (post.status !== 'approved' && post.status !== 'pending_review') {
+              throw this.badRequest(
+                `опубликовать сейчас можно одобренный пост или пост на проверке, а этот в статусе ${post.status}`,
+              );
+            }
+            // Пост на проверке — «одобрить и сразу выпустить»: в approved по
+            // той же машине состояний, что у кнопки в личке. Слота у него нет —
+            // сдвигать нечего.
+            if (post.status !== 'approved' && !canTransition(post.status, 'approved')) {
+              throw this.badRequest(`нельзя ${post.status} → approved`);
+            }
+            // Та же причина, что с каналом: без картинки паблишер откажет до захвата.
+            if (!post.imageUrl) throw this.badRequest('у поста нет картинки — в канал уходит только пост с картинкой');
+
+            // Слот «сейчас»: пост перестаёт держать свой слот, очередь
+            // сдвигается от него (leaveQueue), а сорвись отправка — ближайший
+            // тик publishDue подхватит пост как наступивший.
+            const r = await tx.query(
+              `UPDATE blog_post SET status = 'approved', slot_at = now(), updated_at = now()
+                WHERE id = $1 AND status = $2`,
+              [post.id, post.status],
+            );
+            return r.rowCount !== 0;
+          });
+        } catch (e: any) {
+          // id не uuid — Postgres отвечает 22P02. Для фронта это такой же
+          // негодный запрос, как пустой id, а не 500.
+          if (e?.code === '22P02') throw this.badRequest(`не разобрал id поста: ${id}`);
+          throw e;
+        }
+        if (!out.before) throw this.badRequest(`пост ${id} не найден`);
+        if (!out.applied) throw this.conflict('version_conflict', STALE_POST);
+        await this.approval.notifyQueueShift(out.shifted);
+
+        // Захват approved → publishing — в паблишере, атомарный, как у крона.
+        // Проиграй он тику publishDue, пост всё равно уйдёт в канал ровно
+        // один раз, и ответ покажет его таким, какой он есть.
+        await this.publisher.publish(await this.load(id));
+        return res.status(200).json({ post: await this.load(id), shifted: out.shifted.map(shiftToJson) });
       }
 
       case 'get_settings':
@@ -256,6 +329,17 @@ export class BlogController {
     const r = await this.pg.query(`SELECT * FROM blog_post WHERE id = $1`, [id]);
     if (!r.rows.length) throw new NotFoundException(`пост ${id} не найден`);
     return rowToPost(r.rows[0]);
+  }
+
+  /**
+   * Итог leaveQueue для действий, чей ответ — сам пост (`reject`, `redraft`):
+   * те же отказы, что были у них до очереди. Нет поста — 404, запись не
+   * прошла — 409.
+   */
+  private left(out: LeaveOutcome, id: any): BlogPost {
+    if (!out.before) throw new NotFoundException(`пост ${id} не найден`);
+    this.assertApplied({ rowCount: out.applied ? 1 : 0 });
+    return out.before;
   }
 
   /**
