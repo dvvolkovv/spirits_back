@@ -528,12 +528,16 @@ export async function safeGet(url: string, opts: SafeGetOptions): Promise<SafeRe
       return { status, headers: respHeaders, data, finalUrl };
     }
   } catch (e: any) {
-    if (ctl.signal.aborted && !isUnsafeUrlError(e)) throw ctl.signal.reason;
-    if (isUnsafeUrlError(e) && !(e instanceof UnsafeUrlError)) {
+    // Без type guard'ов: на `any` они сужают тип до never, и tsc это ловит,
+    // а ts-jest (isolatedModules) — нет.
+    const err: any = e;
+    if (err instanceof UnsafeUrlError) throw err;
+    if (err?.code === 'UNSAFE_URL' || err?.cause?.code === 'UNSAFE_URL') {
       // axios оборачивает ошибку Agent'а в AxiosError — отдаём исходную.
-      throw e.cause instanceof UnsafeUrlError ? e.cause : new UnsafeUrlError(REASON_INTERNAL);
+      throw err.cause instanceof UnsafeUrlError ? err.cause : new UnsafeUrlError(REASON_INTERNAL);
     }
-    throw e;
+    if (ctl.signal.aborted) throw ctl.signal.reason;
+    throw err;
   } finally {
     if (!timerOwnedByStream) clearTimeout(timer);
   }
