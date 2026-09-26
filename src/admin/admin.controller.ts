@@ -223,23 +223,53 @@ export class AdminController {
     return res.status(200).json(stats);
   }
 
-  // --- Голосовые звонки ---
+  // --- Голосовые звонки и встречи ---
 
   @Get('admin/calls')
   async callsByUser(
     @Query('days') days: string | undefined,
     @Query('kind') kind: string | undefined,
+    @Query('provider') provider: string | undefined,
+    @Query('includeTest') includeTest: string | undefined,
     @Query('limit') limit: string | undefined,
     @Res() res: Response,
   ) {
-    // kind не валидируем здесь: сервис сам схлопывает незнакомое значение в
-    // 'call'. Проверка в двух местах разъехалась бы при добавлении провайдера.
+    // kind и provider не валидируем здесь: сервис сам схлопывает незнакомое
+    // значение. Проверка в двух местах разъехалась бы при добавлении площадки.
     const stats = await this.adminService.getCallsByUser({
       days: days ? parseInt(days, 10) || undefined : undefined,
-      kind: kind as 'call' | 'meeting' | 'all' | undefined,
+      kind,
+      provider,
+      includeTest: AdminController.isTruthy(includeTest),
       limit: limit ? parseInt(limit, 10) || undefined : undefined,
     });
     return res.status(200).json(stats);
+  }
+
+  /**
+   * Лента сессий раздела: звонки и встречи всех площадок строками, новые
+   * сверху. Фильтры те же, что у таблицы выше, — разбирает их сервис.
+   *
+   * Путь литеральный: будущий `admin/calls/:id` (одна сессия) должен
+   * объявляться ПОСЛЕ этого маршрута, иначе заберёт `/sessions` себе.
+   */
+  @Get('admin/calls/sessions')
+  async callSessions(
+    @Query('days') days: string | undefined,
+    @Query('kind') kind: string | undefined,
+    @Query('provider') provider: string | undefined,
+    @Query('includeTest') includeTest: string | undefined,
+    @Query('limit') limit: string | undefined,
+    @Res() res: Response,
+  ) {
+    const data = await this.adminService.getCallSessions({
+      days: days ? parseInt(days, 10) || undefined : undefined,
+      kind,
+      provider,
+      includeTest: AdminController.isTruthy(includeTest),
+      limit: limit ? parseInt(limit, 10) || undefined : undefined,
+    });
+    return res.status(200).json(data);
   }
 
   /**

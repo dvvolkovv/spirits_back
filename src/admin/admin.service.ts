@@ -9,6 +9,26 @@ import { sendTelegramAlert } from '../common/telegram-alert';
 import { TEST_USERS as SHARED_TEST_USERS, TEST_USER_PATTERN } from '../common/test-users';
 import { callFlags, countUserTurns } from './callFlags';
 
+/** Вкладка раздела «Звонки»: звонки из приложения, встречи на площадках или всё. */
+export type CallKind = 'call' | 'meeting' | 'all';
+
+/** Фильтры раздела «Звонки», как они приходят из query-параметров. */
+export interface CallsQuery {
+  days?: number;
+  kind?: string;
+  provider?: string | null;
+  includeTest?: boolean;
+  limit?: number;
+}
+
+/** Те же фильтры после разбора: вкладка известна, площадка проверена. */
+export interface CallsFilter {
+  days: number;
+  kind: CallKind;
+  provider: string | null;
+  includeTest: boolean;
+}
+
 @Injectable()
 export class AdminService implements OnModuleInit {
   private readonly logger = new Logger(AdminService.name);
@@ -1531,10 +1551,80 @@ export class AdminService implements OnModuleInit {
     };
   }
 
-  // --- Голосовые звонки ---
+  // --- Голосовые звонки и встречи ---
+
+  /** Звонок из приложения. Всё остальное в voice_calls — встречи на площадках. */
+  private static readonly CALL_PROVIDER = 'linkeon';
 
   /**
-   * Звонки в разрезе пользователей: сколько звонили и сколько за это списано.
+   * Образец идентификатора площадки. В SQL площадка и так уходит параметром;
+   * образец нужен, чтобы в ответ не вернулась произвольная строка, выданная
+   * за выбранную площадку. Шире, чем нынешние id: кнопки площадок строятся
+   * по данным, и id, не прошедший образец, выглядел бы выбранным, ничего не
+   * фильтруя.
+   */
+  private static readonly PROVIDER_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+
+  /**
+   * Лимит выдачи из query-параметра: нечисло — значение по умолчанию, дробь
+   * отбрасывается, остальное прижимается к 1…max. NaN или 50.5 в LIMIT — это
+   * ошибка Postgres, а не пустой ответ.
+   */
+  private static clampLimit(v: number | undefined, def: number, max: number): number {
+    const n = Number.isFinite(v) ? Math.trunc(v as number) : def;
+    return Math.min(Math.max(n, 1), max);
+  }
+
+  /**
+   * Фильтры раздела «Звонки» из query-параметров.
+   *
+   * Незнакомый kind схлопывается в 'call', а не снимает фильтр: иначе
+   * произвольный ?kind= молча подмешал бы встречи в звонки. Проверка живёт
+   * здесь одна — в контроллере она разъехалась бы при добавлении площадки.
+   */
+  private static callsFilter(opts: CallsQuery): CallsFilter {
+    const kind: CallKind = opts.kind === 'meeting' || opts.kind === 'all' ? opts.kind : 'call';
+    const provider =
+      typeof opts.provider === 'string' && AdminService.PROVIDER_RE.test(opts.provider)
+        ? opts.provider
+        : null;
+    return {
+      days: Math.min(Math.max(Number.isFinite(opts.days) ? (opts.days as number) : 30, 1), 365),
+      kind,
+      provider,
+      includeTest: !!opts.includeTest,
+    };
+  }
+
+  /**
+   * Условие выборки сессий — одно на таблицу, итоги, разбивку по площадкам и
+   * ленту. Разъехавшись, они показали бы разные наборы, и сумма колонок не
+   * сошлась бы с итогом.
+   *
+   * Встречи — «всё, кроме звонка из приложения», а не перечень площадок:
+   * новая площадка попадёт во встречи без правки этого места.
+   *
+   * Площадка сужает любую вкладку: kind=call вместе с provider=zoom честно
+   * даёт пустой набор. Разбивка по площадкам строится тем же условием без
+   * площадки — callsWhere({ ...f, provider: null }): выбранная площадка не
+   * должна прятать остальные кнопки, иначе к ним не вернуться.
+   */
+  private static callsWhere(f: CallsFilter): { where: string; params: any[] } {
+    const params: any[] = [f.days];
+    const parts = [`c.started_at >= now() - $1 * interval '1 day'`];
+    if (f.kind === 'call') parts.push(`c.provider = '${AdminService.CALL_PROVIDER}'`);
+    if (f.kind === 'meeting') parts.push(`c.provider <> '${AdminService.CALL_PROVIDER}'`);
+    if (f.provider) {
+      params.push(f.provider);
+      parts.push(`c.provider = $${params.length}`);
+    }
+    parts.push(AdminService.testFilter('c.user_id', f.includeTest));
+    return { where: parts.join(' AND '), params };
+  }
+
+  /**
+   * Звонки и встречи в разрезе пользователей: сколько их было и сколько за
+   * это списано.
    *
    * Списаний два, и лежат они в разных таблицах: voice_calls.tokens_charged —
    * минуты разговора, voice_call_jobs.tokens_used — каждый вопрос ведущего
@@ -1543,31 +1633,13 @@ export class AdminService implements OnModuleInit {
    * а по одной общей цифре этого не видно.
    *
    * Встречи и звонки живут в одной таблице и различаются только provider, так
-   * что без фильтра получасовая встреча считалась бы звонком. По умолчанию
-   * отдаём звонки — раздел про них; встречи доступны через kind.
+   * что без фильтра получасовая встреча считалась бы звонком. kind выбирает
+   * вкладку, provider — площадку внутри неё; byProvider кормит кнопки площадок.
    */
-  async getCallsByUser(
-    opts: { days?: number; kind?: 'call' | 'meeting' | 'all'; limit?: number } = {},
-  ) {
-    const days = Math.min(Math.max(opts.days ?? 30, 1), 365);
-    const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
-    // Незнакомое значение схлопывается в 'call', а не снимает фильтр: иначе
-    // произвольный ?kind= молча подмешал бы встречи в раздел звонков.
-    const kind: 'call' | 'meeting' | 'all' =
-      opts.kind === 'meeting' || opts.kind === 'all' ? opts.kind : 'call';
-
-    const providerFilter =
-      kind === 'all'
-        ? 'true'
-        : `c.provider = '${kind === 'meeting' ? 'linkeon_room' : 'linkeon'}'`;
-
-    // Общий предикат выборки. Держим одной строкой, чтобы таблица и итоги
-    // считались ровно по одному набору звонков: разъехавшись, они дали бы
-    // сумму колонок, не сходящуюся с итогом внизу.
-    const where = `
-      c.started_at >= now() - $1 * interval '1 day'
-      AND ${providerFilter}
-      AND ${AdminService.excludeTest('c.user_id')}`;
+  async getCallsByUser(opts: CallsQuery = {}) {
+    const f = AdminService.callsFilter(opts);
+    const limit = AdminService.clampLimit(opts.limit, 100, 500);
+    const { where, params } = AdminService.callsWhere(f);
 
     // Консультации подтягиваем коррелированным подзапросом по call_id, а не
     // отдельным JOIN по user_id: иначе в выборку звонков приехали бы вопросы,
@@ -1595,7 +1667,7 @@ export class AdminService implements OnModuleInit {
        ORDER BY (COALESCE(SUM(c.tokens_charged), 0) + COALESCE(SUM(${consultSum}), 0)) DESC,
                 calls DESC, c.user_id ASC
        LIMIT ${limit}`,
-      [days],
+      params,
     );
 
     // Итоги считаем отдельным запросом, а не суммой строк: строки обрезаны
@@ -1610,16 +1682,30 @@ export class AdminService implements OnModuleInit {
          COALESCE(SUM(${consultSum}), 0)::bigint AS tokens_consult
        FROM voice_calls c
        WHERE ${where}`,
-      [days],
+      params,
     );
     const tot = totalsRes.rows[0] || {};
+
+    // Сессии по площадкам — для кнопок фильтра на «Встречах». Считаются без
+    // условия по выбранной площадке: иначе остальные кнопки пропали бы.
+    const byProv = AdminService.callsWhere({ ...f, provider: null });
+    const byProviderRes = await this.pg.query(
+      `SELECT c.provider, COUNT(*)::int AS sessions
+         FROM voice_calls c
+        WHERE ${byProv.where}
+        GROUP BY c.provider
+        ORDER BY sessions DESC, c.provider ASC`,
+      byProv.params,
+    );
 
     const tokensCall = Number(tot.tokens_call) || 0;
     const tokensConsult = Number(tot.tokens_consult) || 0;
 
     return {
-      days,
-      kind,
+      days: f.days,
+      kind: f.kind,
+      provider: f.provider,
+      include_test: f.includeTest,
       byUser: rowsRes.rows.map((r: any) => {
         const call = Number(r.tokens_call) || 0;
         const consult = Number(r.tokens_consult) || 0;
@@ -1642,37 +1728,117 @@ export class AdminService implements OnModuleInit {
         tokens_consult: tokensConsult,
         tokens_total: tokensCall + tokensConsult,
       },
+      byProvider: byProviderRes.rows.map((r: any) => ({
+        provider: String(r.provider),
+        sessions: Number(r.sessions) || 0,
+      })),
     };
   }
 
   /**
-   * Звонки одного человека для карточки в админке.
+   * Колонки сессии — общие у ленты и карточки человека, чтобы оба места
+   * получали одну форму. Расшифровка читается ради пометок и в ответ не уходит
+   * (см. toCallSession). Консультации — подзапросами по call_id, а не JOIN по
+   * user_id: иначе к звонку приехали бы вопросы, заданные тем же человеком на
+   * встрече. Имя ассистента — display_name, как он представляется на встрече,
+   * с откатом на внутреннее name.
+   */
+  private static readonly SESSION_COLUMNS = `
+    c.id, c.user_id, c.provider, COALESCE(a.display_name, a.name) AS agent_name,
+    c.started_at, c.duration_sec, c.status, c.model, c.summary, c.transcript,
+    c.tokens_charged,
+    (SELECT COALESCE(SUM(j.tokens_used), 0) FROM voice_call_jobs j WHERE j.call_id = c.id)::bigint AS tokens_consult,
+    (SELECT COUNT(*) FROM voice_call_jobs j WHERE j.call_id = c.id)::int AS consults`;
+
+  /** Откуда берётся сессия. Псевдоним a в SESSION_COLUMNS определяется этим JOIN. */
+  private static readonly SESSION_FROM = 'voice_calls c LEFT JOIN agents a ON a.id = c.agent_id';
+
+  /**
+   * Строка voice_calls → сессия для админки.
    *
-   * Расшифровку СЮДА не кладём: на проде 49 расшифровок весят заметно больше
-   * остального ответа, а открывают их по одной. Пометки считаем здесь же,
-   * чтобы интерфейс не тянул диалоги ради подсчёта реплик.
+   * Расшифровку отрезаем: на проде она весит больше всего остального ответа,
+   * а открывают её по одной. Пометки считаем здесь же, чтобы интерфейс не
+   * тянул диалоги ради подсчёта реплик.
+   */
+  private static toCallSession(r: any) {
+    const call = Number(r.tokens_charged) || 0;
+    const consult = Number(r.tokens_consult) || 0;
+    return {
+      id: r.id,
+      user_id: r.user_id,
+      provider: r.provider,
+      agent_name: r.agent_name ?? null,
+      started_at: r.started_at,
+      duration_sec: r.duration_sec ?? null,
+      status: r.status,
+      model: r.model ?? null,
+      summary: r.summary ?? null,
+      tokens_call: call,
+      tokens_consult: consult,
+      tokens_total: call + consult,
+      consults: Number(r.consults) || 0,
+      flags: callFlags(r),
+      user_turns: countUserTurns(r.transcript),
+    };
+  }
+
+  /**
+   * Лента раздела «Звонки»: по строке на звонок или встречу, новые сверху.
    *
-   * Тестовые аккаунты не исключаем — в отличие от агрегата в разделе: сюда
-   * приходят по конкретному user_id, и если открыли карточку тестового
-   * аккаунта, значит его и хотят посмотреть.
+   * Условие то же, что у таблицы (callsWhere), total — отдельным запросом по
+   * нему же: «показано 50 из 131» не должно расходиться с итогом над таблицей.
+   * «Показать ещё» на фронте перезапрашивает первые N+50 целиком, а не
+   * страницу по курсору: сессий сотни, и так пришедшая за это время новая
+   * сессия не задваивает строку.
+   */
+  async getCallSessions(opts: CallsQuery = {}) {
+    const f = AdminService.callsFilter(opts);
+    const limit = AdminService.clampLimit(opts.limit, 50, 500);
+    const { where, params } = AdminService.callsWhere(f);
+
+    const rowsRes = await this.pg.query(
+      `SELECT ${AdminService.SESSION_COLUMNS}
+         FROM ${AdminService.SESSION_FROM}
+        WHERE ${where}
+        ORDER BY c.started_at DESC, c.id DESC
+        LIMIT ${limit}`,
+      params,
+    );
+    const totalRes = await this.pg.query(
+      `SELECT COUNT(*)::int AS total FROM voice_calls c WHERE ${where}`,
+      params,
+    );
+
+    return {
+      days: f.days,
+      kind: f.kind,
+      provider: f.provider,
+      include_test: f.includeTest,
+      total: Number(totalRes.rows[0]?.total) || 0,
+      limit,
+      sessions: rowsRes.rows.map((r: any) => AdminService.toCallSession(r)),
+    };
+  }
+
+  /**
+   * Звонки и встречи одного человека — для его карточки в админке. Форма
+   * сессии та же, что у ленты раздела: карточку и ленту рисует один компонент.
+   *
+   * Тестовые аккаунты не исключаем — в отличие от раздела: сюда приходят по
+   * конкретному user_id, и если открыли карточку тестового аккаунта, значит
+   * его и хотят посмотреть.
    */
   async getUserCalls(userId: string, opts: { limit?: number } = {}) {
-    const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
+    const limit = AdminService.clampLimit(opts.limit, 50, 200);
     const res = await this.pg.query(
-      `SELECT c.id, c.started_at, c.ended_at, c.duration_sec, c.status,
-              c.tokens_charged, c.model, c.provider, c.summary, c.transcript
-         FROM voice_calls c
+      `SELECT ${AdminService.SESSION_COLUMNS}
+         FROM ${AdminService.SESSION_FROM}
         WHERE c.user_id = $1
-        ORDER BY c.started_at DESC
+        ORDER BY c.started_at DESC, c.id DESC
         LIMIT $2`,
       [userId, limit],
     );
-
-    const calls = res.rows.map((r: any) => {
-      const { transcript, ...rest } = r;
-      return { ...rest, flags: callFlags(r), user_turns: countUserTurns(transcript) };
-    });
-    return { userId, calls };
+    return { userId, calls: res.rows.map((r: any) => AdminService.toCallSession(r)) };
   }
 
   /** Расшифровка одного звонка — по клику из списка. */

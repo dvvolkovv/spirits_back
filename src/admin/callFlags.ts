@@ -5,7 +5,15 @@ export interface TranscriptTurn {
   text?: string;
 }
 
-export type CallFlag = 'interrupted' | 'silent' | 'nearly_silent' | 'short';
+export type CallFlag = 'interrupted' | 'failed' | 'live' | 'silent' | 'nearly_silent' | 'short';
+
+/**
+ * Статусы идущей сессии. Расшифровку voice-host дописывает по ходу
+ * (VoiceCallService.progress), так что «молчал» и «почти молчал» считались бы
+ * по недописанному разговору. Это пометка состояния, а не проблемы, — поэтому
+ * в интерфейсе она нейтральная.
+ */
+const LIVE_STATUSES = new Set(['dialing', 'active']);
 
 /** Меньше этого — «короткий»: на проде средний состоявшийся звонок 237 секунд. */
 export const SHORT_CALL_SEC = 30;
@@ -34,10 +42,19 @@ export function callFlags(call: {
   duration_sec?: number | null;
   transcript?: unknown;
 }): CallFlag[] {
-  // Прерванный — отдельный случай: у него нет ни длительности, ни расшифровки,
-  // и остальные пометки посчитались бы как «молчал и короткий», что неверно:
-  // человек не молчал, разговор просто не начался.
+  // Прерванный — отдельный случай: длительности у него нет, а расшифровка, если
+  // и есть, оборвана (voice-host пишет её по ходу — на стенде 25.09.2026 у 7 из 11
+  // прерванных встреч она есть). «Молчал» по ней был бы неверен: пометка
+  // должна говорить, что разговор оборвался.
   if (call.status === 'interrupted') return ['interrupted'];
+
+  // Сорвавшаяся сессия: бот не вошёл, не подключился звук, оборвалась связь.
+  // Реплик может не быть вовсе, но человек при этом не молчал. Причина — в
+  // саммари («Звонок не состоялся: …», «Вход во встречу не состоялся: …»).
+  // Если сбой пришёл раньше штатного завершения, complete() перепишет и
+  // статус, и саммари: такая сессия останется completed с обычными пометками.
+  if (call.status === 'failed') return ['failed'];
+  if (call.status && LIVE_STATUSES.has(call.status)) return ['live'];
 
   const flags: CallFlag[] = [];
   const turns = countUserTurns(call.transcript);
