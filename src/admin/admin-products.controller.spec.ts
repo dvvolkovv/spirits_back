@@ -217,6 +217,16 @@ describe('AdminProductsController: охрана на настоящем марш
     );
   });
 
+  it('администратор получает карточку, период доезжает из строки запроса', async () => {
+    const card = { periodDays: 7, product: { id: ID }, domain: null, turns: [], jobs: [] };
+    svc.card.mockResolvedValue(card);
+
+    const res = await get(`${base}/admin/products/${ID}?periodDays=7`, bearer(ADMIN));
+
+    expect(res).toEqual({ status: 200, body: card });
+    expect(svc.card).toHaveBeenCalledWith(ID, { periodDays: 7 });
+  });
+
   it('администратор: не-uuid и неизвестный продукт — 404', async () => {
     expect((await get(`${base}/admin/products/shop`, bearer(ADMIN))).status).toBe(404);
     expect((await get(`${base}/admin/products/${ID}`, bearer(ADMIN))).status).toBe(404);

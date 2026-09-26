@@ -623,6 +623,9 @@ maybe('админка «Сайты и боты»: сервис против жи
       const card = await svc().card(id);
       const [inList] = (await svc().list({})).products;
 
+      // Форма ответа — договор с фронтом: ровно эти ключи верхнего уровня.
+      expect(Object.keys(card).sort()).toEqual(['domain', 'jobs', 'periodDays', 'product', 'turns']);
+      expect(card.periodDays).toBe(30);
       expect(card.product).toEqual(inList);
       const d = (await pool.query(`SELECT checked_at FROM product_domains WHERE product_id = $1`, [id])).rows[0];
       expect(card.domain).toEqual({
@@ -724,6 +727,29 @@ maybe('админка «Сайты и боты»: сервис против жи
       expect((await svc().card(archived)).product).toMatchObject({ id: archived, slug: 'arch' });
       expect((await svc().card(archived)).product.archivedAt).not.toBeNull();
       expect((await svc().card(test)).product).toMatchObject({ id: test, owner: { userId: '79030169187' } });
+    });
+
+    it('период — как у списка: по умолчанию 30, прижимается, счётчики продукта — за него', async () => {
+      const id = await mkProduct({ slug: 'periodic' });
+      await mkTurn(id, { ago: '2 days', tokens: 100 });
+      await mkTurn(id, { ago: '10 days', tokens: 1000 });
+      await mkTurn(id, { ago: '45 days', tokens: 10000 });
+
+      const at = async (periodDays?: number) => {
+        const c = await svc().card(id, { periodDays });
+        return [c.periodDays, c.product.turnsInPeriod, c.product.tokensInPeriod];
+      };
+      expect(await at()).toEqual([30, 2, 1100]);
+      expect(await at(7)).toEqual([7, 1, 100]);
+      expect(await at(90)).toEqual([90, 3, 11100]);
+      expect(await at(1000)).toEqual([365, 3, 11100]);
+      expect((await at(0))[0]).toBe(1);
+      expect((await at(NaN))[0]).toBe(30);
+      expect((await at(7.9))[0]).toBe(7);
+
+      // Карточка за период — та же строка, что список за тот же период.
+      const [inList] = (await svc().list({ periodDays: 7 })).products;
+      expect((await svc().card(id, { periodDays: 7 })).product).toEqual(inList);
     });
 
     it('неизвестный продукт — null', async () => {
