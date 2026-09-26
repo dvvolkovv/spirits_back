@@ -87,4 +87,10 @@ describe('токен инструмента продуктов', () => {
     const p: any = jwt.decode(signProductToolToken('79030169187', 'telegram'));
     expect(p.exp - p.iat).toBe(2 * 60 * 60);
   });
+
+  // Срок берётся по каналу; незнакомый канал без проверки дал бы expiresIn
+  // undefined — то есть токен без срока вовсе.
+  it('незнакомый канал при выпуске — отказ, а не вечный токен', () => {
+    expect(() => signProductToolToken('79030169187', 'sms' as any)).toThrow(/канал/i);
+  });
 });
