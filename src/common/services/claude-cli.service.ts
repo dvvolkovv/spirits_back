@@ -1,5 +1,5 @@
 // src/common/services/claude-cli.service.ts
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { spawn } from 'child_process';
 import * as os from 'os';
 import * as fs from 'fs';
@@ -11,6 +11,35 @@ export interface ClaudeCliProgressEvent {
   kind: 'tool_use';
   name: string;
 }
+
+/** HTTP MCP-сервер в формате конфига CLI (--mcp-config). */
+export interface ClaudeCliMcpHttpServer {
+  type: 'http';
+  url: string;
+  headers?: Record<string, string>;
+  /** Потолок одного вызова инструмента, мс (схема CLI 2.1.280: перекрывает
+   *  MCP_TOOL_TIMEOUT, меньше 1000 игнорируется, прогресс его не продлевает). */
+  timeout?: number;
+}
+
+/** Префикс одноразового каталога с конфигом MCP (в нём токены). */
+const MCP_CONFIG_DIR_PREFIX = 'claude-mcp-';
+
+/**
+ * Постоянный пустой cwd вызовов с MCP без своего cwd (Маша). Один на все
+ * вызовы: CLI заводит в ~/.claude/projects папку проекта на каждый новый cwd,
+ * и одноразовый каталог на ход давал бы тысячи папок в сутки. Мы в него не
+ * пишем и не удаляем его; уборка брошенных конфигов его не трогает.
+ */
+const EMPTY_CWD_NAME = 'linkeon-claude-empty';
+
+/**
+ * Сколько живёт брошенный конфиг MCP до уборки при старте сервиса. Час — с
+ * запасом дольше хода Маши (10 мин) и срока веб-токена (30 мин). Ход бота
+ * может идти дольше, но CLI читает конфиг один раз на старте — снятый позже
+ * файл ему уже не нужен.
+ */
+const MCP_CONFIG_STALE_MS = 60 * 60 * 1000;
 
 export interface ClaudeCliOptions {
   /** System prompt prepended to user message. Concatenated with prompt via SYSTEM marker. */
@@ -43,10 +72,19 @@ export interface ClaudeCliOptions {
    *  Передавай явный список (например 'Read,WebSearch,WebFetch') для нужного режима;
    *  'default' у CLI означает «все тулы» — использовать осознанно. */
   tools?: string;
+  /** MCP-серверы на ЭТОТ вызов (ключ — имя сервера: инструменты придут как
+   *  mcp__<ключ>__<имя>). Пишутся в одноразовый файл конфига с правами 0600 —
+   *  заголовки несут токены, в argv им нельзя (аргументы процесса видит `ps`);
+   *  файл снимается после вызова. --strict-mcp-config остаётся: кроме
+   *  переданных, серверов нет.
+   *  Автоодобрения сервис НЕ добавляет: имена нужных MCP-инструментов caller
+   *  кладёт в allowedTools сам — без этого в -p вызов отклоняется
+   *  («...you haven't granted it yet»). */
+  mcpServers?: Record<string, ClaudeCliMcpHttpServer>;
 }
 
 @Injectable()
-export class ClaudeCliService {
+export class ClaudeCliService implements OnModuleInit {
   private readonly logger = new Logger(ClaudeCliService.name);
   private readonly claudeBin = process.env.CLAUDE_BIN ?? '/usr/bin/claude';
 
@@ -55,6 +93,102 @@ export class ClaudeCliService {
   // CommonModule — injecting EventsService here creates a module cycle.
   // The DB schema is identical (events table), so direct insert is equivalent.
   constructor(private readonly pg?: PgService) {}
+
+  /**
+   * Конфиг вызова с токеном снимается в finally, но процесс, убитый посреди
+   * хода (рестарт, OOM, kill -9), finally не выполняет — файл с живым токеном
+   * остался бы в tmp. При старте сервиса такие каталоги старше часа снимаются.
+   * Сбой уборки старт не роняет.
+   */
+  onModuleInit(): void {
+    try {
+      const removed = ClaudeCliService.sweepStaleMcpConfigDirs(this.tmpRoot(), MCP_CONFIG_STALE_MS);
+      if (removed.length) this.logger.log(`removed ${removed.length} stale MCP config dir(s)`);
+    } catch (e: any) {
+      this.logger.warn(`stale MCP config sweep failed: ${e?.message}`);
+    }
+  }
+
+  /**
+   * Снимает в root каталоги claude-mcp-XXXXXX старше maxAgeMs (по mtime —
+   * каталог создаётся с файлом и больше не меняется). Только настоящие
+   * каталоги: симлинк с тем же именем и обычный файл не трогаются (lstat).
+   * Отдаёт снятые пути. Статический — чтобы проверяться на своём корне.
+   */
+  static sweepStaleMcpConfigDirs(root: string, maxAgeMs: number, now: number = Date.now()): string[] {
+    let names: string[];
+    try { names = fs.readdirSync(root); } catch { return []; }
+    const removed: string[] = [];
+    for (const name of names) {
+      // Постоянный пустой cwd — не конфиг и не мусор, сколько бы ему ни было
+      // лет. Префикс его и так не ловит; явная проверка — на случай, если
+      // префикс когда-нибудь расширят.
+      if (name === EMPTY_CWD_NAME) continue;
+      if (!name.startsWith(MCP_CONFIG_DIR_PREFIX)) continue;
+      const full = path.join(root, name);
+      try {
+        const st = fs.lstatSync(full);
+        if (!st.isDirectory() || now - st.mtimeMs <= maxAgeMs) continue;
+        fs.rmSync(full, { recursive: true, force: true });
+        removed.push(full);
+      } catch { /* исчез между readdir и lstat, чужие права — не наше */ }
+    }
+    return removed;
+  }
+
+  /**
+   * Корень временных каталогов вызова. Метод, а не прямой os.tmpdir(), — ради
+   * тестов: у теста в jest своя копия process.env, и TMPDIR из неё до
+   * os.tmpdir() не доходит.
+   */
+  private tmpRoot(): string {
+    return os.tmpdir();
+  }
+
+  /**
+   * cwd вызова с MCP, когда caller не дал своего (Маша): постоянный пустой
+   * <tmpdir>/linkeon-claude-empty. Каталог конфига с токеном — отдельный,
+   * на вызов (writeMcpConfig), и лежит рядом, а не внутри.
+   *
+   * Не годится (см. emptyCwdProblem) — вызов идёт в одноразовый claude-cwd-*,
+   * который снимается после вызова, а в лог уходит причина: ход не должен
+   * зависеть от чужого каталога в общем tmp.
+   */
+  private mcpNeutralCwd(registerTmpDir: (dir: string) => void): string {
+    const dir = path.join(this.tmpRoot(), EMPTY_CWD_NAME);
+    const problem = ClaudeCliService.emptyCwdProblem(dir);
+    if (!problem) return dir;
+    this.logger.warn(`${dir}: ${problem} — вызов идёт в одноразовый каталог`);
+    const tmp = fs.mkdtempSync(path.join(this.tmpRoot(), 'claude-cwd-'));
+    registerTmpDir(tmp);
+    return tmp;
+  }
+
+  /**
+   * null — каталог годится в cwd; иначе — чем не годится. При первом
+   * обращении создаёт его (mkdir -p, 0700).
+   *
+   * Tmp общий для всех пользователей машины, а из cwd CLI сам подхватывает
+   * CLAUDE.md и .claude/settings.json (в них бывают хуки). Поэтому каталог
+   * обязан быть настоящим (lstat: симлинк — не каталог, даже если ведёт на
+   * каталог), нашим, закрытым на запись для других и пустым.
+   */
+  private static emptyCwdProblem(dir: string): string | null {
+    try {
+      // Существующий каталог (и симлинк на каталог) mkdir -p пропускает молча,
+      // файл на этом месте даёт EEXIST — уйдёт в catch.
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const st = fs.lstatSync(dir);
+      if (!st.isDirectory()) return 'не каталог (или симлинк)';
+      const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+      if (uid !== undefined && st.uid !== uid) return `чужой владелец (uid ${st.uid})`;
+      if (st.mode & 0o022) return `запись открыта не только владельцу (${(st.mode & 0o777).toString(8)})`;
+      if (fs.readdirSync(dir).length > 0) return 'не пуст';
+      return null;
+    } catch (e: any) {
+      return `недоступен: ${e?.message}`;
+    }
+  }
 
   private trackCallEvent(opts: { costUsd: number; model: string; durationMs: number; ok: boolean }) {
     if (!this.pg) return;
@@ -88,17 +222,41 @@ export class ClaudeCliService {
   }
 
   private async runRaw(prompt: string, opts: ClaudeCliOptions): Promise<{ text: string; costUsd: number }> {
-    // Одноразовый каталог под копии вложений (создаётся только когда он нужен —
-    // см. ниже). Снимается в finally, чтобы не копить чужие файлы в tmp.
-    let perCallTmpDir: string | null = null;
+    // Одноразовые каталоги вызова (создаются только когда нужны — см. ниже):
+    // копии вложений и конфиг MCP с токенами. Снимаются в finally — и на успехе,
+    // и на падении, и по таймауту, — чтобы не копить в tmp ни чужих файлов, ни
+    // живых токенов.
+    const perCallTmpDirs: string[] = [];
     try {
-      return await this.spawnClaude(prompt, opts, (dir) => { perCallTmpDir = dir; });
+      return await this.spawnClaude(prompt, opts, (dir) => { perCallTmpDirs.push(dir); });
     } finally {
-      if (perCallTmpDir) {
-        try { fs.rmSync(perCallTmpDir, { recursive: true, force: true }); }
-        catch (e: any) { this.logger.warn(`per-call tmp cleanup failed (${perCallTmpDir}): ${e.message}`); }
+      for (const dir of perCallTmpDirs) {
+        try { fs.rmSync(dir, { recursive: true, force: true }); }
+        catch (e: any) { this.logger.warn(`per-call tmp cleanup failed (${dir}): ${e.message}`); }
       }
     }
+  }
+
+  /**
+   * Конфиг MCP на один вызов: свой каталог (mkdtemp, 0700) под os.tmpdir() и
+   * файл 0600 в нём. Каталог регистрируется ДО записи, чтобы снялся и при
+   * сбое самой записи.
+   *
+   * Не в cwd вызова: в агентном режиме (рабочая папка чата Telegram) модель
+   * читает файлы cwd тулом Read, а в одноразовом каталоге вложений — тоже.
+   * Отдельный каталог лежит рядом с ними, а не внутри. Нейтральным cwd вызову
+   * с MCP служит не сам os.tmpdir() (каталог конфига оказался бы внутри), а
+   * постоянный пустой linkeon-claude-empty — см. mcpNeutralCwd.
+   */
+  private writeMcpConfig(
+    servers: Record<string, ClaudeCliMcpHttpServer>,
+    registerTmpDir: (dir: string) => void,
+  ): string {
+    const dir = fs.mkdtempSync(path.join(this.tmpRoot(), MCP_CONFIG_DIR_PREFIX));
+    registerTmpDir(dir);
+    const file = path.join(dir, 'mcp.json');
+    fs.writeFileSync(file, JSON.stringify({ mcpServers: servers }), { mode: 0o600 });
+    return file;
   }
 
   private spawnClaude(
@@ -111,6 +269,7 @@ export class ClaudeCliService {
     const streaming = !!opts.onProgress;
 
     const hasAttachments = (opts.attachments?.length ?? 0) > 0;
+    const hasMcp = !!opts.mcpServers && Object.keys(opts.mcpServers).length > 0;
 
     // ── cwd и ссылки на вложения ──────────────────────────────────────────
     // Безопасность (25.09.2026): вложения раньше подставлялись в промпт как
@@ -124,7 +283,7 @@ export class ClaudeCliService {
     let spawnCwd: string;
     let refNames: string[] = [];
     if (hasAttachments && !opts.cwd) {
-      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-cli-'));
+      const tmpDir = fs.mkdtempSync(path.join(this.tmpRoot(), 'claude-cli-'));
       registerTmpDir(tmpDir);
       spawnCwd = tmpDir;
       const used = new Set<string>();
@@ -149,7 +308,17 @@ export class ClaudeCliService {
       // ~40KB CLAUDE.md the CLI would auto-discover and prepend to EVERY one-shot
       // prompt — irrelevant context that inflated input and tripled VPM latency.
       // Caller may override cwd для агентного sandbox-режима.
-      spawnCwd = opts.cwd ?? os.tmpdir();
+      //
+      // Вызов с MCP (Маша) получает не сам os.tmpdir(), а постоянный пустой
+      // каталог (mcpNeutralCwd): каталог конфига с токеном лежит рядом, а не
+      // внутри cwd, при любом наборе тулов.
+      if (opts.cwd) {
+        spawnCwd = opts.cwd;
+      } else if (hasMcp) {
+        spawnCwd = this.mcpNeutralCwd(registerTmpDir);
+      } else {
+        spawnCwd = this.tmpRoot();
+      }
       if (hasAttachments) {
         // cwd задан caller-ом (вложения уже внутри него): ссылаемся относительно
         // cwd, если файл действительно там; иначе — абсолютным путём как раньше
@@ -196,6 +365,16 @@ export class ClaudeCliService {
       ? opts.tools
       : (hasAttachments ? 'Read' : '');
 
+    // MCP-серверы вызова — только файлом (токены в заголовках), см. writeMcpConfig.
+    //
+    // --tools и MCP (проба на CLI 2.1.280, 26.09.2026): `--tools` задаёт ТОЛЬКО
+    // встроенный набор. С `--tools ""` и `--mcp-config` в init.tools остаётся
+    // ровно mcp__products__manage_product, вызов проходит — отдельного флага
+    // для MCP не нужно, и встроенные тулы остаются выключенными. Но без имени
+    // инструмента в --allowedTools вызов в -p отклоняется (permission_denials),
+    // поэтому имя кладёт в allowedTools caller.
+    const mcpConfigPath = hasMcp ? this.writeMcpConfig(opts.mcpServers!, registerTmpDir) : null;
+
     const args = [
       '-p',
       fullPrompt,
@@ -205,10 +384,15 @@ export class ClaudeCliService {
       // Пустая строка обязана уйти отдельным argv-элементом '' (spawn так и
       // делает — не через шелл): '--tools' '' = «встроенных тулов нет».
       '--tools', tools,
-      '--strict-mcp-config',         // load NO MCP servers (none passed) — these
-                                     // one-shot calls use no tools; skipping MCP
-                                     // startup avoids stalls in the pm2 env.
     ];
+    // --mcp-config вариадический: следом обязан идти флаг, а не позиционный
+    // аргумент, иначе CLI примет его за второй конфиг. Поэтому — перед
+    // --strict-mcp-config. В argv — только путь, токены остаются в файле.
+    if (mcpConfigPath) args.push('--mcp-config', mcpConfigPath);
+    // Всегда: никаких MCP-серверов, кроме переданных в --mcp-config (без него —
+    // ни одного). Разовым вызовам без MCP это ещё и экономит старт серверов,
+    // который подвисал в окружении pm2.
+    args.push('--strict-mcp-config');
     // stream-json требует --verbose, иначе CLI отвергает комбинацию.
     if (streaming) args.push('--verbose');
 
