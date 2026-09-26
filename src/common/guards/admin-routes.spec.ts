@@ -1,6 +1,7 @@
 import 'reflect-metadata';
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { AdminController } from '../../admin/admin.controller';
+import { AdminProductsController } from '../../admin/admin-products.controller';
 import { AgentsController } from '../../agents/agents.controller';
 import { AdminGuard } from './admin.guard';
 import { JwtGuard } from './jwt.guard';
@@ -53,6 +54,25 @@ describe('Защита админских маршрутов', () => {
 
     it.each(methods)('%s требует JwtGuard', (method) => {
       expect(guardsFor(AdminController, method)).toContain(JwtGuard);
+    });
+  });
+
+  // «Сайты и боты» — сводка продуктов ВСЕХ пользователей: владельцы, их почта,
+  // адреса машин, тексты правок. Свой контроллер, а не методы AdminController,
+  // поэтому и свой блок: обход выше его методов не видит.
+  describe('AdminProductsController', () => {
+    const methods = methodsOf(AdminProductsController);
+
+    it('имеет маршруты (иначе тест ничего не проверяет)', () => {
+      expect(methods.length).toBeGreaterThan(0);
+    });
+
+    it.each(methods)('%s закрыт AdminGuard', (method) => {
+      expect(guardsFor(AdminProductsController, method)).toContain(AdminGuard);
+    });
+
+    it.each(methods)('%s требует JwtGuard', (method) => {
+      expect(guardsFor(AdminProductsController, method)).toContain(JwtGuard);
     });
   });
 
