@@ -388,7 +388,9 @@ describe('ClaudeCliService argv: MCP-серверы на вызов', () => {
         mcpServers: servers(),
       });
       expect(seen.cwd).toBe(cwd);
-      const rel = path.relative(fs.realpathSync(cwd), fs.realpathSync(path.dirname(seen.cfgPath!)));
+      // Оба пути построены от одного os.tmpdir() — сравнимы без realpath (каталог
+      // конфига к этому моменту уже снят, realpath на нём упал бы).
+      const rel = path.relative(cwd, path.dirname(seen.cfgPath!));
       expect(rel.startsWith('..')).toBe(true);
       // И ничего из конфига не осталось в папке caller-а.
       expect(fs.readdirSync(cwd)).toEqual([]);
