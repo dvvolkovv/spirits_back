@@ -130,6 +130,62 @@ function collectionIdComparator(a: string, b: string): number {
   return a.localeCompare(b);
 }
 
+/**
+ * Развернуть список распарсенных VEVENT (node-ical) в CalEvent[] по окну [start, end).
+ *
+ * Ключевой момент — ИЗМЕНЁННЫЕ ВХОЖДЕНИЯ (RECURRENCE-ID override): когда пользователь переносит или
+ * правит одно вхождение повторяющегося события, сервер отдаёт master (с RRULE) ПЛЮС отдельный VEVENT
+ * с `RECURRENCE-ID`, который называет исходное вхождение, заменяемое им. Разворот master ОБЯЗАН
+ * пропустить это вхождение — иначе событие показывается дважды: раз в исходное время (из RRULE) и раз
+ * в перенесённое (из override). Именно это давало «футбол дважды» (13:30 перенос + 14:00 из RRULE).
+ * EXDATE тоже пропускаются. Функция чистая (без сети) — покрыта юнит-тестом.
+ */
+export function expandCalDavEvents(vevents: any[], start: Date, end: Date): CalEvent[] {
+  // uid → множество исходных времён вхождений, у которых есть override (по RECURRENCE-ID).
+  const overridden = new Map<string, Set<number>>();
+  for (const ev of vevents) {
+    if (ev.recurrenceid) {
+      const t = new Date(ev.recurrenceid).getTime();
+      if (!overridden.has(ev.uid)) overridden.set(ev.uid, new Set());
+      overridden.get(ev.uid)!.add(t);
+    }
+  }
+  const out: CalEvent[] = [];
+  for (const ev of vevents) {
+    const title = String(ev.summary || '').trim() || 'Событие';
+    const startMs = new Date(ev.start).getTime();
+    const durationMs = ev.end ? new Date(ev.end).getTime() - startMs : 3_600_000;
+    if (ev.rrule) {
+      // ПОВТОРЯЮЩЕЕСЯ: у master-VEVENT DTSTART обычно В ПРОШЛОМ (напр. еженедельный синк с
+      // февраля). Фильтровать по нему = выкинуть КАЖДУЮ повторяющуюся встречу (это и был баг
+      // «календарь пуст»). Разворачиваем rrule и берём вхождения, попадающие в окно.
+      let occurrences: Date[] = [];
+      try { occurrences = ev.rrule.between(start, end, true); } catch { occurrences = []; }
+      const exdates = ev.exdate
+        ? new Set<number>(Object.keys(ev.exdate).map((x: string) => new Date(ev.exdate[x]).getTime()))
+        : new Set<number>();
+      const ovr = overridden.get(ev.uid);
+      for (const occ of occurrences) {
+        const occMs = occ.getTime();
+        if (exdates.has(occMs)) continue;
+        if (ovr && ovr.has(occMs)) continue; // заменено изменённым вхождением — оно эмитится отдельно
+        out.push({ at: new Date(occMs).toISOString(), title, source: 'yandex', uid: `${ev.uid}-${occMs}`, end: new Date(occMs + durationMs).toISOString() });
+      }
+    } else {
+      const s = new Date(startMs);
+      if (s >= start && s < end) {
+        // Изменённое вхождение (RECURRENCE-ID): стабильный uid по ИСХОДНОМУ времени вхождения —
+        // так оно уникально в рамках серии и переживает повторный перенос. Обычное разовое → ev.uid.
+        const uid = ev.recurrenceid ? `${ev.uid}-${new Date(ev.recurrenceid).getTime()}` : ev.uid;
+        const item: CalEvent = { at: s.toISOString(), title, source: 'yandex', uid };
+        if (ev.end) item.end = new Date(ev.end).toISOString();
+        out.push(item);
+      }
+    }
+  }
+  return out;
+}
+
 export class YandexCalDavConnector implements CalendarConnector {
   private calendarHomeUrl(creds: CalendarCreds): string {
     return `${creds.baseUrl.replace(/\/$/, '')}/calendars/${encodeURIComponent(creds.username)}/`;
@@ -329,40 +385,15 @@ export class YandexCalDavConnector implements CalendarConnector {
     } as any);
     if (res.status !== 207) return [];
     const xml = await res.text();
-    const out: CalEvent[] = [];
+    const vevents: any[] = [];
     for (const m of xml.matchAll(/BEGIN:VEVENT[\s\S]*?END:VEVENT/g)) {
       const parsed: any = ical.parseICS(`BEGIN:VCALENDAR\n${m[0]}\nEND:VCALENDAR`);
       for (const k of Object.keys(parsed)) {
         const ev = parsed[k];
-        if (ev?.type !== 'VEVENT' || !ev.start) continue;
-        const title = String(ev.summary || '').trim() || 'Событие';
-        const startMs = new Date(ev.start).getTime();
-        const durationMs = ev.end ? new Date(ev.end).getTime() - startMs : 3_600_000;
-        if (ev.rrule) {
-          // ПОВТОРЯЮЩЕЕСЯ: у master-VEVENT DTSTART обычно В ПРОШЛОМ (напр. еженедельный синк с
-          // февраля). Фильтровать по нему = выкинуть КАЖДУЮ повторяющуюся встречу (это и был баг
-          // «календарь пуст»). Разворачиваем rrule и берём вхождения, попадающие в окно.
-          let occurrences: Date[] = [];
-          try { occurrences = ev.rrule.between(start, end, true); } catch { occurrences = []; }
-          const exdates = ev.exdate
-            ? new Set(Object.keys(ev.exdate).map((x: string) => new Date(ev.exdate[x]).getTime()))
-            : new Set<number>();
-          for (const occ of occurrences) {
-            const occMs = occ.getTime();
-            if (exdates.has(occMs)) continue;
-            out.push({ at: new Date(occMs).toISOString(), title, source: 'yandex', uid: `${ev.uid}-${occMs}`, end: new Date(occMs + durationMs).toISOString() });
-          }
-        } else {
-          const s = new Date(startMs);
-          if (s >= start && s < end) {
-            const item: CalEvent = { at: s.toISOString(), title, source: 'yandex', uid: ev.uid };
-            if (ev.end) item.end = new Date(ev.end).toISOString();
-            out.push(item);
-          }
-        }
+        if (ev?.type === 'VEVENT' && ev.start) vevents.push(ev);
       }
     }
-    return out;
+    return expandCalDavEvents(vevents, start, end);
   }
 
   /**
