@@ -209,3 +209,220 @@ describe('ClaudeCliService argv: вложения', () => {
     fs.rmSync(cwd, { recursive: true, force: true });
   });
 });
+
+/**
+ * MCP-СЕРВЕРЫ НА ОДИН ВЫЗОВ (инструмент продуктов для Маши и Telegram-бота).
+ *
+ * Токен сервера — ключ к продуктам пользователя. Он обязан жить только в файле
+ * конфига с правами 0600 и только на время вызова:
+ *   • не в argv — аргументы процесса видит `ps` любого пользователя машины;
+ *   • не в cwd caller-а — там модель читает файлы тулом Read (рабочая папка
+ *     чата в Telegram), и токен уехал бы в контекст, а оттуда в ответ;
+ *   • не дольше вызова — ни на успехе, ни на падении, ни по таймауту.
+ * --strict-mcp-config остаётся всегда: кроме переданного — никаких серверов.
+ */
+describe('ClaudeCliService argv: MCP-серверы на вызов', () => {
+  const TOKEN = 'product-tool-token-7c1f-SECRET';
+  const servers = () => ({
+    products: {
+      type: 'http' as const,
+      url: 'http://127.0.0.1:3001/webhook/mcp/products',
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    },
+  });
+
+  /** Процесс, который не завершается сам: для проверки таймаута. */
+  function hangingProc() {
+    const proc: any = {
+      stdout: { on: () => {} },
+      stderr: { on: () => {} },
+      on: () => {},
+      kill: jest.fn(),
+    };
+    return proc;
+  }
+
+  /** Снимок конфига в момент запуска CLI: путь, права, содержимое, argv, cwd. */
+  function captureAtSpawn(makeProc: () => any = () => fakeProc(OK_JSON)) {
+    const seen: {
+      args: string[]; cwd: string; cfgPath?: string; mode?: number; dirMode?: number; body?: any;
+    } = { args: [], cwd: '' };
+    spawnMock.mockImplementation((_bin: string, args: string[], opts: any) => {
+      seen.args = args;
+      seen.cwd = opts.cwd;
+      const p = flagValue(args, '--mcp-config');
+      seen.cfgPath = p;
+      if (p && fs.existsSync(p)) {
+        seen.mode = fs.statSync(p).mode & 0o777;
+        seen.dirMode = fs.statSync(path.dirname(p)).mode & 0o777;
+        seen.body = JSON.parse(fs.readFileSync(p, 'utf8'));
+      }
+      return makeProc();
+    });
+    return seen;
+  }
+
+  it('без mcpServers — ни --mcp-config, ни файла: поведение прежнее', async () => {
+    const seen = captureAtSpawn();
+    await new ClaudeCliService().text('привет');
+    expect(seen.args).not.toContain('--mcp-config');
+    expect(seen.args).toContain('--strict-mcp-config');
+  });
+
+  it('пустой mcpServers ({}) — то же, что его отсутствие', async () => {
+    const seen = captureAtSpawn();
+    await new ClaudeCliService().text('привет', { mcpServers: {} });
+    expect(seen.args).not.toContain('--mcp-config');
+  });
+
+  it('--mcp-config ведёт на файл { mcpServers } с правами 0600 во временном каталоге', async () => {
+    const seen = captureAtSpawn();
+    await new ClaudeCliService().text('покажи продукты', {
+      mcpServers: servers(),
+      allowedTools: 'mcp__products__manage_product',
+    });
+
+    expect(seen.cfgPath).toBeTruthy();
+    // Одноразовый каталог под os.tmpdir(), не каталог бэкенда.
+    expect(seen.cfgPath!.startsWith(os.tmpdir() + path.sep)).toBe(true);
+    // Файл существовал к запуску CLI и читается только владельцем процесса.
+    expect(seen.mode).toBe(0o600);
+    expect(seen.dirMode).toBe(0o700);
+    // Содержимое — ровно переданные серверы под ключом mcpServers.
+    expect(seen.body).toEqual({ mcpServers: servers() });
+  });
+
+  it('--strict-mcp-config сохраняется и при переданных серверах', async () => {
+    const seen = captureAtSpawn();
+    await new ClaudeCliService().text('покажи продукты', { mcpServers: servers() });
+    expect(seen.args).toContain('--strict-mcp-config');
+    // Значение --mcp-config — ровно один путь: следом идёт флаг, а не ещё один
+    // элемент (флаг вариадический и съел бы следующий позиционный аргумент).
+    const i = seen.args.indexOf('--mcp-config');
+    expect(seen.args[i + 2] === undefined || seen.args[i + 2].startsWith('--')).toBe(true);
+  });
+
+  it('токен не попадает в argv ни одним элементом', async () => {
+    const seen = captureAtSpawn();
+    await new ClaudeCliService().text('покажи продукты', {
+      system: 'ты Маша',
+      mcpServers: servers(),
+      allowedTools: 'mcp__products__manage_product',
+    });
+    expect(seen.args.length).toBeGreaterThan(0);
+    for (const a of seen.args) expect(a).not.toContain(TOKEN);
+    // А в файле — есть: иначе проверка выше была бы пустой.
+    expect(JSON.stringify(seen.body)).toContain(TOKEN);
+  });
+
+  it('встроенные тулы остаются выключены (--tools ""), allowedTools — как передал caller', async () => {
+    // Проба на CLI 2.1.280 (26.09.2026): `--tools ""` режет только встроенный
+    // набор, MCP-инструмент из --mcp-config остаётся доступен. Поэтому набор
+    // встроенных не трогаем, а имя MCP-инструмента caller кладёт в allowedTools.
+    const seen = captureAtSpawn();
+    await new ClaudeCliService().text('покажи продукты', {
+      mcpServers: servers(),
+      allowedTools: 'mcp__products__manage_product',
+    });
+    const i = seen.args.indexOf('--tools');
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(seen.args[i + 1]).toBe('');
+    expect(flagValue(seen.args, '--allowedTools')).toBe('mcp__products__manage_product');
+  });
+
+  it('файл и каталог удаляются после успешного вызова', async () => {
+    const seen = captureAtSpawn();
+    await new ClaudeCliService().text('покажи продукты', { mcpServers: servers() });
+    expect(seen.cfgPath).toBeTruthy();
+    expect(fs.existsSync(seen.cfgPath!)).toBe(false);
+    expect(fs.existsSync(path.dirname(seen.cfgPath!))).toBe(false);
+  });
+
+  it('файл и каталог удаляются и при падении CLI', async () => {
+    const seen = captureAtSpawn(() => fakeProc('boom-not-json', 1));
+    await expect(new ClaudeCliService().text('покажи продукты', { mcpServers: servers() })).rejects.toThrow();
+    expect(seen.cfgPath).toBeTruthy();
+    expect(fs.existsSync(seen.cfgPath!)).toBe(false);
+    expect(fs.existsSync(path.dirname(seen.cfgPath!))).toBe(false);
+  });
+
+  it('файл и каталог удаляются и по таймауту', async () => {
+    let proc: any;
+    const seen = captureAtSpawn(() => (proc = hangingProc()));
+    await expect(
+      new ClaudeCliService().text('покажи продукты', { mcpServers: servers(), timeoutMs: 20 }),
+    ).rejects.toThrow(/timeout/);
+    expect(proc.kill).toHaveBeenCalled();
+    expect(seen.cfgPath).toBeTruthy();
+    expect(fs.existsSync(seen.cfgPath!)).toBe(false);
+    expect(fs.existsSync(path.dirname(seen.cfgPath!))).toBe(false);
+  });
+
+  it('файл и каталог удаляются, если CLI не запустился вовсе', async () => {
+    const seen = { cfgPath: '' };
+    spawnMock.mockImplementation((_bin: string, args: string[]) => {
+      seen.cfgPath = flagValue(args, '--mcp-config') || '';
+      const on: Record<string, (...a: any[]) => void> = {};
+      const proc: any = {
+        stdout: { on: () => {} },
+        stderr: { on: () => {} },
+        on: (e: string, cb: any) => { on[e] = cb; },
+        kill: () => {},
+      };
+      setImmediate(() => on['error']?.(new Error('spawn ENOENT')));
+      return proc;
+    });
+    await expect(new ClaudeCliService().text('x', { mcpServers: servers() })).rejects.toThrow(/spawn error/);
+    expect(seen.cfgPath).toBeTruthy();
+    expect(fs.existsSync(seen.cfgPath)).toBe(false);
+  });
+
+  it('файл не лежит в рабочей папке caller-а (там модель читает файлы тулом Read)', async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'sandbox-'));
+    try {
+      const seen = captureAtSpawn();
+      await new ClaudeCliService().text('покажи продукты', {
+        cwd,
+        tools: 'Read,WebSearch,WebFetch',
+        allowedTools: 'WebSearch,WebFetch,mcp__products__manage_product',
+        mcpServers: servers(),
+      });
+      expect(seen.cwd).toBe(cwd);
+      const rel = path.relative(fs.realpathSync(cwd), fs.realpathSync(path.dirname(seen.cfgPath!)));
+      expect(rel.startsWith('..')).toBe(true);
+      // И ничего из конфига не осталось в папке caller-а.
+      expect(fs.readdirSync(cwd)).toEqual([]);
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('файл не лежит в одноразовом cwd вложений', async () => {
+    const srcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'attach-src-'));
+    const attach = path.join(srcDir, 'photo.jpg');
+    fs.writeFileSync(attach, 'jpg');
+    try {
+      const seen = captureAtSpawn();
+      await new ClaudeCliService().text('что на фото', { attachments: [attach], mcpServers: servers() });
+      expect(path.basename(seen.cwd)).toMatch(/^claude-cli-/);
+      expect(path.dirname(seen.cfgPath!)).not.toBe(seen.cwd);
+      const rel = path.relative(seen.cwd, seen.cfgPath!);
+      expect(rel.startsWith('..')).toBe(true);
+    } finally {
+      fs.rmSync(srcDir, { recursive: true, force: true });
+    }
+  });
+
+  it('в stream-режиме (onProgress, как в Telegram) конфиг тоже передаётся и снимается', async () => {
+    const streamOk = JSON.stringify({ type: 'result', result: 'ок', total_cost_usd: 0.001, duration_ms: 5 }) + '\n';
+    const seen = captureAtSpawn(() => fakeProc(streamOk));
+    const r = await new ClaudeCliService().textWithCost('покажи продукты', {
+      mcpServers: servers(),
+      onProgress: () => {},
+    });
+    expect(r.text).toBe('ок');
+    expect(seen.body).toEqual({ mcpServers: servers() });
+    expect(seen.args).toContain('--verbose');
+    expect(fs.existsSync(seen.cfgPath!)).toBe(false);
+  });
+});
