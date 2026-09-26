@@ -17,7 +17,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { PRODUCT_TOOLS, ProductToolService } from '../products/product-tool.service';
-import { verifyProductToolToken } from '../products/product-tool.token';
+import { ProductToolClaims, verifyProductToolToken } from '../products/product-tool.token';
 
 /**
  * Отдельная точка, а не ветка в /mcp, СОЗНАТЕЛЬНО.
@@ -45,8 +45,8 @@ export class ProductsMcpController {
 
   constructor(private readonly tool: ProductToolService) {}
 
-  /** Владелец из Bearer. Бросает — значит звать инструмент нечем. */
-  private owner(authHeader?: string): string {
+  /** Владелец и канал из Bearer. Бросает — значит звать инструмент нечем. */
+  private owner(authHeader?: string): ProductToolClaims {
     const raw = (authHeader || '').replace(/^Bearer\s+/i, '').trim();
     if (!raw) throw new UnauthorizedException('Нет токена');
     try {
@@ -67,12 +67,13 @@ export class ProductsMcpController {
 
   /** Вынесено из makeServer по той же причине: здесь живёт разбор владельца. */
   async callTool(authHeader: string | undefined, args: any) {
-    const userId = this.owner(authHeader);
+    const { userId, channel } = this.owner(authHeader);
     // userId из запроса выбрасывается ЯВНО, а не игнорируется по невнимательности:
     // поле могло бы приехать и перекрыть владельца при любой будущей правке
-    // execute(), которая начнёт заглядывать в input.
-    const { userId: _drop, ...input } = args ?? {};
-    return this.tool.execute(userId, input);
+    // execute(), которая начнёт заглядывать в input. channel — туда же: канал
+    // хода (web/telegram) несёт подпись токена, а не поле, которое пишет модель.
+    const { userId: _drop, channel: _dropChannel, ...input } = args ?? {};
+    return this.tool.execute(userId, input, channel);
   }
 
   private makeServer(authHeader?: string): Server {

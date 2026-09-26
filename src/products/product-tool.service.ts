@@ -4,6 +4,7 @@ import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
 import { TurnsService, SLEEPING_REFUSAL, BLOCKED_REFUSAL } from './turns.service';
 import { DomainErrorReason, DomainRecordToSet, DomainRefusalCode, DomainStatus, DomainsService, DomainView } from './domains.service';
 import { normalizeDomain, readableDomain } from './domain-name';
+import { ProductToolChannel } from './product-tool.token';
 
 /** Продукт глазами ассистента: без внутренностей, только то, что можно назвать вслух. */
 export interface ProductMatch {
@@ -271,11 +272,15 @@ export class ProductToolService {
    * Единственный вход инструмента. Владелец — ПЕРВЫМ аргументом и приезжает из
    * проверенной подписи токена (см. точку /webhook/mcp/products), а не из поля
    * запроса: инструменту продуктов аргумента `userId` не дано вовсе.
+   *
+   * Канал (web/telegram) — оттуда же, из подписи: он ложится в
+   * product_turns.channel у правки. По умолчанию web — так было до появления
+   * канала, и так ставит правки релей веб-ассистентов.
    */
-  async execute(userId: string, input: any): Promise<any> {
+  async execute(userId: string, input: any, channel: ProductToolChannel = 'web'): Promise<any> {
     const action = String(input?.action ?? '').trim();
     if (action === 'list') return this.list(userId);
-    if (action === 'edit') return this.edit(userId, input);
+    if (action === 'edit') return this.edit(userId, input, channel);
     if (action === 'status') return this.status(userId, input);
     if (action === 'domain') return this.domain(userId, input);
     return {
@@ -331,7 +336,7 @@ export class ProductToolService {
   private waitMs = PRODUCT_TOOL_WAIT_MS;
   private pollMs = 2_000;
 
-  private async edit(userId: string, input: any) {
+  private async edit(userId: string, input: any, channel: ProductToolChannel) {
     const prompt = String(input?.prompt ?? '').trim();
     if (!prompt) {
       return { ok: false, reason: 'no_prompt', say: 'Не сказано, что именно править. Спроси у пользователя и повтори вызов.' };
@@ -364,7 +369,7 @@ export class ProductToolService {
     const product = matches[0];
     let turnId: string;
     try {
-      const turn = await this.turns.enqueue({ productId: product.id, userId, channel: 'web', prompt });
+      const turn = await this.turns.enqueue({ productId: product.id, userId, channel, prompt });
       turnId = turn.id;
     } catch (e: any) {
       return this.refusal(e, product);
