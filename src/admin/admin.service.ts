@@ -29,6 +29,32 @@ export interface CallsFilter {
   includeTest: boolean;
 }
 
+/**
+ * Предикат «не тестовый пользователь» для агрегатов «управления». `col` —
+ * колонка с user_id (телефон либо UUID; UUID под фильтр не попадает никогда).
+ * Константы инлайнятся (статичные, без инъекции) — чтобы не сдвигать
+ * позиционные $-параметры в многочисленных запросах. Тот же фильтр, что в
+ * economy.service (VPM). Задача b60ab28b.
+ *
+ * Вынесен из AdminService наружу ради второго потребителя — раздела «Сайты и
+ * боты» (admin-products.service.ts). Список и маска — общие, из
+ * common/test-users.ts: своя копия в новом сервисе разошлась бы с ними молча.
+ */
+export function excludeTestUsersSql(col: string): string {
+  const arr = SHARED_TEST_USERS.map((u) => `'${u}'`).join(', ');
+  return `${col} <> ALL(ARRAY[${arr}]::text[]) AND ${col} !~ '${TEST_USER_PATTERN}'`;
+}
+
+/**
+ * Тот же предикат, но опциональный: `true` вместо фильтра, когда тестовые
+ * аккаунты просят показать. Отдельной функцией, чтобы условие «включаем/не
+ * включаем» не расползлось строковой склейкой по вызовам — иначе первый же
+ * пропущенный `WHERE` даст выручку с тестовых.
+ */
+export function testUsersFilterSql(col: string, includeTest?: boolean): string {
+  return includeTest ? 'true' : excludeTestUsersSql(col);
+}
+
 @Injectable()
 export class AdminService implements OnModuleInit {
   private readonly logger = new Logger(AdminService.name);
@@ -437,21 +463,16 @@ export class AdminService implements OnModuleInit {
   private static readonly TEST_USERS = SHARED_TEST_USERS;
   private static readonly TEST_PATTERN = TEST_USER_PATTERN;
 
-  // Предикат «не тестовый пользователь» для агрегатов «управления». `col` —
-  // колонка с телефоном (user_id). Константы инлайнятся (статичные, без
-  // инъекции) — чтобы не сдвигать позиционные $-параметры в многочисленных
-  // запросах. Тот же фильтр, что в economy.service (VPM). Задача b60ab28b.
+  // Предикат «не тестовый пользователь» — см. excludeTestUsersSql в начале
+  // файла. Методы остаются ради десятков вызовов ниже, но строят ровно его:
+  // сторож — test-users-filter.spec.ts.
   private static excludeTest(col: string): string {
-    const arr = AdminService.TEST_USERS.map((u) => `'${u}'`).join(', ');
-    return `${col} <> ALL(ARRAY[${arr}]::text[]) AND ${col} !~ '${AdminService.TEST_PATTERN}'`;
+    return excludeTestUsersSql(col);
   }
 
-  // Тот же предикат, но опциональный: `WHERE true` вместо фильтра, когда
-  // тестовые аккаунты просят показать. Пишется отдельным методом, чтобы
-  // условие «включаем/не включаем» не расползлось строковой склейкой по
-  // вызовам — иначе первый же пропущенный `WHERE` даст выручку с тестовых.
+  // Опциональный вариант того же предиката — см. testUsersFilterSql.
   private static testFilter(col: string, includeTest?: boolean): string {
-    return includeTest ? 'true' : AdminService.excludeTest(col);
+    return testUsersFilterSql(col, includeTest);
   }
 
   // Тот же предикат в JS — чтобы помечать строки в выдаче. Без пометки
