@@ -21,8 +21,18 @@ export interface ProductToolClaims {
   channel: ProductToolChannel;
 }
 
-/** Заметно дольше бюджета хода (10 мин) и заметно короче суток. */
-const TTL_SECONDS = 30 * 60;
+/**
+ * Сколько живёт токен — по каналу.
+ *   • web: заметно дольше бюджета хода (10 мин) и заметно короче суток.
+ *   • telegram: у хода бота таймаута нет вовсе (tg-router: timeoutMs 0 —
+ *     прогресс виден статусом в чате), и 30 минут оборвали бы доступ к
+ *     продуктам посреди долгого хода. 2 часа — дольше любого разумного хода
+ *     бота и всё так же заметно короче суток.
+ */
+const TTL_SECONDS: Record<ProductToolChannel, number> = {
+  web: 30 * 60,
+  telegram: 2 * 60 * 60,
+};
 
 function secret(): string {
   return process.env.JWT_SECRET || 'default_secret_change_me';
@@ -38,7 +48,10 @@ function secret(): string {
  * разбираются токены, выпущенные до появления канала.
  */
 export function signProductToolToken(userId: string, channel: ProductToolChannel = 'web'): string {
-  return jwt.sign({ userId, type: PRODUCT_TOOL_TOKEN_TYPE, channel }, secret(), { expiresIn: TTL_SECONDS });
+  // Незнакомый канал — отказ: без срока jwt.sign выпустил бы вечный токен.
+  const ttl = TTL_SECONDS[channel];
+  if (!ttl) throw new Error(`Неизвестный канал: ${channel}`);
+  return jwt.sign({ userId, type: PRODUCT_TOOL_TOKEN_TYPE, channel }, secret(), { expiresIn: ttl });
 }
 
 /**

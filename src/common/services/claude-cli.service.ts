@@ -1,5 +1,5 @@
 // src/common/services/claude-cli.service.ts
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { spawn } from 'child_process';
 import * as os from 'os';
 import * as fs from 'fs';
@@ -17,7 +17,21 @@ export interface ClaudeCliMcpHttpServer {
   type: 'http';
   url: string;
   headers?: Record<string, string>;
+  /** Потолок одного вызова инструмента, мс (схема CLI 2.1.280: перекрывает
+   *  MCP_TOOL_TIMEOUT, меньше 1000 игнорируется, прогресс его не продлевает). */
+  timeout?: number;
 }
+
+/** Префикс одноразового каталога с конфигом MCP (в нём токены). */
+const MCP_CONFIG_DIR_PREFIX = 'claude-mcp-';
+
+/**
+ * Сколько живёт брошенный конфиг MCP до уборки при старте сервиса. Час — с
+ * запасом дольше хода Маши (10 мин) и срока веб-токена (30 мин). Ход бота
+ * может идти дольше, но CLI читает конфиг один раз на старте — снятый позже
+ * файл ему уже не нужен.
+ */
+const MCP_CONFIG_STALE_MS = 60 * 60 * 1000;
 
 export interface ClaudeCliOptions {
   /** System prompt prepended to user message. Concatenated with prompt via SYSTEM marker. */
@@ -62,7 +76,7 @@ export interface ClaudeCliOptions {
 }
 
 @Injectable()
-export class ClaudeCliService {
+export class ClaudeCliService implements OnModuleInit {
   private readonly logger = new Logger(ClaudeCliService.name);
   private readonly claudeBin = process.env.CLAUDE_BIN ?? '/usr/bin/claude';
 
@@ -71,6 +85,44 @@ export class ClaudeCliService {
   // CommonModule — injecting EventsService here creates a module cycle.
   // The DB schema is identical (events table), so direct insert is equivalent.
   constructor(private readonly pg?: PgService) {}
+
+  /**
+   * Конфиг вызова с токеном снимается в finally, но процесс, убитый посреди
+   * хода (рестарт, OOM, kill -9), finally не выполняет — файл с живым токеном
+   * остался бы в tmp. При старте сервиса такие каталоги старше часа снимаются.
+   * Сбой уборки старт не роняет.
+   */
+  onModuleInit(): void {
+    try {
+      const removed = ClaudeCliService.sweepStaleMcpConfigDirs(os.tmpdir(), MCP_CONFIG_STALE_MS);
+      if (removed.length) this.logger.log(`removed ${removed.length} stale MCP config dir(s)`);
+    } catch (e: any) {
+      this.logger.warn(`stale MCP config sweep failed: ${e?.message}`);
+    }
+  }
+
+  /**
+   * Снимает в root каталоги claude-mcp-XXXXXX старше maxAgeMs (по mtime —
+   * каталог создаётся с файлом и больше не меняется). Только настоящие
+   * каталоги: симлинк с тем же именем и обычный файл не трогаются (lstat).
+   * Отдаёт снятые пути. Статический — чтобы проверяться на своём корне.
+   */
+  static sweepStaleMcpConfigDirs(root: string, maxAgeMs: number, now: number = Date.now()): string[] {
+    let names: string[];
+    try { names = fs.readdirSync(root); } catch { return []; }
+    const removed: string[] = [];
+    for (const name of names) {
+      if (!name.startsWith(MCP_CONFIG_DIR_PREFIX)) continue;
+      const full = path.join(root, name);
+      try {
+        const st = fs.lstatSync(full);
+        if (!st.isDirectory() || now - st.mtimeMs <= maxAgeMs) continue;
+        fs.rmSync(full, { recursive: true, force: true });
+        removed.push(full);
+      } catch { /* исчез между readdir и lstat, чужие права — не наше */ }
+    }
+    return removed;
+  }
 
   private trackCallEvent(opts: { costUsd: number; model: string; durationMs: number; ok: boolean }) {
     if (!this.pg) return;
@@ -126,16 +178,15 @@ export class ClaudeCliService {
    *
    * Не в cwd вызова: в агентном режиме (рабочая папка чата Telegram) модель
    * читает файлы cwd тулом Read, а в одноразовом каталоге вложений — тоже.
-   * Отдельный каталог лежит рядом с ними, а не внутри. При нейтральном cwd
-   * (сам os.tmpdir(), caller не дал ни cwd, ни вложений) каталог формально
-   * внутри cwd, но файлового тула там нет: встроенные тулы по умолчанию
-   * выключены (--tools '').
+   * Отдельный каталог лежит рядом с ними, а не внутри. Нейтральным cwd вызову
+   * с MCP служит не сам os.tmpdir() (каталог конфига оказался бы внутри), а
+   * свой пустой claude-cwd-XXXXXX — см. spawnClaude.
    */
   private writeMcpConfig(
     servers: Record<string, ClaudeCliMcpHttpServer>,
     registerTmpDir: (dir: string) => void,
   ): string {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-mcp-'));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), MCP_CONFIG_DIR_PREFIX));
     registerTmpDir(dir);
     const file = path.join(dir, 'mcp.json');
     fs.writeFileSync(file, JSON.stringify({ mcpServers: servers }), { mode: 0o600 });
@@ -152,6 +203,7 @@ export class ClaudeCliService {
     const streaming = !!opts.onProgress;
 
     const hasAttachments = (opts.attachments?.length ?? 0) > 0;
+    const hasMcp = !!opts.mcpServers && Object.keys(opts.mcpServers).length > 0;
 
     // ── cwd и ссылки на вложения ──────────────────────────────────────────
     // Безопасность (25.09.2026): вложения раньше подставлялись в промпт как
@@ -190,7 +242,18 @@ export class ClaudeCliService {
       // ~40KB CLAUDE.md the CLI would auto-discover and prepend to EVERY one-shot
       // prompt — irrelevant context that inflated input and tripled VPM latency.
       // Caller may override cwd для агентного sandbox-режима.
-      spawnCwd = opts.cwd ?? os.tmpdir();
+      //
+      // Вызов с MCP (Маша) получает не сам os.tmpdir(), а свой пустой
+      // одноразовый каталог: каталог конфига с токеном лежит рядом, а не внутри
+      // cwd, при любом наборе тулов. Снимается в finally, как и остальные.
+      if (opts.cwd) {
+        spawnCwd = opts.cwd;
+      } else if (hasMcp) {
+        spawnCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-cwd-'));
+        registerTmpDir(spawnCwd);
+      } else {
+        spawnCwd = os.tmpdir();
+      }
       if (hasAttachments) {
         // cwd задан caller-ом (вложения уже внутри него): ссылаемся относительно
         // cwd, если файл действительно там; иначе — абсолютным путём как раньше
@@ -245,7 +308,6 @@ export class ClaudeCliService {
     // для MCP не нужно, и встроенные тулы остаются выключенными. Но без имени
     // инструмента в --allowedTools вызов в -p отклоняется (permission_denials),
     // поэтому имя кладёт в allowedTools caller.
-    const hasMcp = !!opts.mcpServers && Object.keys(opts.mcpServers).length > 0;
     const mcpConfigPath = hasMcp ? this.writeMcpConfig(opts.mcpServers!, registerTmpDir) : null;
 
     const args = [
