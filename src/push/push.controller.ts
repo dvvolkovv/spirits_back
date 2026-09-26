@@ -3,6 +3,7 @@ import { Response } from 'express';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { PushService } from './push.service';
+import { isUnsafeUrlError } from '../common/net/safe-fetch';
 
 @Controller('push')
 export class PushController {
@@ -17,7 +18,13 @@ export class PushController {
   @Post('subscribe')
   @UseGuards(JwtGuard)
   async subscribe(@CurrentUser() user: any, @Body() body: any, @Res() res: Response) {
-    await this.push.subscribe(user.userId, body?.subscription || body);
+    try {
+      await this.push.subscribe(user.userId, body?.subscription || body);
+    } catch (e: any) {
+      // Endpoint во внутреннюю сеть и прочий мусор — 400 с причиной, а не 500.
+      if (isUnsafeUrlError(e)) return res.status(400).json({ ok: false, error: e.message });
+      throw e;
+    }
     return res.json({ ok: true });
   }
 

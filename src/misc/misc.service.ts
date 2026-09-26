@@ -11,6 +11,7 @@ import { Response } from 'express';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { neutralizeAtMentions, stripWordJoiner } from '../common/agent-guards';
 import { renderBannerOverlay, BannerPosition, BannerTheme } from './banner-overlay';
+import { fetchMediaBytes } from '../common/net/own-media';
 
 const ASSETS_BUCKET = 'linkeon-assets';
 
@@ -682,32 +683,27 @@ ${LanguageService.buildDirective(userLanguage)}`;
     }
   }
 
-  /** Resolve `/static/generated/xxx.png` | absolute URL | data: URL → { b64, mime }. */
+  /**
+   * Resolve `/static/…` | absolute URL | data: URL → { b64, mime }.
+   *
+   * Ссылку выбирает человек (POST /imageedit и соседи) или модель (инструменты
+   * чата, маркеры TG-бота), поэтому качаем через fetchMediaBytes: свой
+   * /static/ и свой MinIO читаются напрямую, чужое — с защитой от SSRF
+   * (внутренние адреса, редиректы туда, DNS rebinding). Раньше `/static/…`
+   * склеивался в путь без проверки, и `/static/generated/../../…` читал любой
+   * файл сервера.
+   */
   private async fetchImageAsBase64(srcUrl: string): Promise<{ b64: string; mime: string }> {
-    const path = require('path');
-    const fs = require('fs');
-
     if (srcUrl.startsWith('data:')) {
       const m = srcUrl.match(/^data:([^;]+);base64,(.+)$/);
       if (!m) throw new Error('Invalid data URL');
       return { mime: m[1], b64: m[2] };
     }
 
-    if (srcUrl.startsWith('/static/generated/')) {
-      const filename = srcUrl.replace('/static/generated/', '').split('?')[0];
-      const filePath = path.join(process.cwd(), 'public', 'generated', filename);
-      if (!fs.existsSync(filePath)) throw new Error('Source image not found on server');
-      const buf = fs.readFileSync(filePath);
-      const mime = filename.endsWith('.jpg') || filename.endsWith('.jpeg') ? 'image/jpeg' : 'image/png';
-      return { b64: buf.toString('base64'), mime };
-    }
-
-    // External URL — fetch (limit 8 MB)
-    const resp = await axios.get(srcUrl, { responseType: 'arraybuffer', timeout: 30000, maxContentLength: 8 * 1024 * 1024 });
-    const buf = Buffer.from(resp.data);
-    const mime = (String(resp.headers['content-type'] || 'image/png')).split(';')[0].trim();
+    const media = await fetchMediaBytes(srcUrl, { maxBytes: 8 * 1024 * 1024, timeoutMs: 30000, allowHttp: true });
+    const mime = (media.contentType || 'image/png').split(';')[0].trim();
     if (!mime.startsWith('image/')) throw new Error('URL did not return an image');
-    return { b64: buf.toString('base64'), mime };
+    return { b64: media.data.toString('base64'), mime };
   }
 
   /** Edit existing image using Nano Banana 2 (std) or Pro (hd). Same token cost as generate. */

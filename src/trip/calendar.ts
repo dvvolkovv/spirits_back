@@ -6,6 +6,7 @@
  * кривой ICS не должны ронять состояние поездки.
  */
 import * as ical from 'node-ical';
+import { safeGet } from '../common/net/safe-fetch';
 
 export interface CalEvent {
   /** ISO-инстант начала события (UTC). */
@@ -123,8 +124,25 @@ export function eventsFromIcs(icsText: string, source: string, start: Date, end:
 }
 
 /**
+ * Потолок ICS-ленты. Опубликованный календарь за несколько лет — единицы МБ;
+ * больше — это уже не календарь, а попытка занять память процесса.
+ */
+export const ICS_MAX_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Политика ссылок на ICS: http допустим (webcal и старые публикации), порт
+ * любой (свои календарные серверы), но внутренние адреса — никогда. Редиректов
+ * чуть больше обычного: публикации Outlook/iCloud ходят через пару прыжков.
+ */
+export const ICS_FETCH_POLICY = { allowHttp: true, allowAnyPort: true, maxRedirects: 5 } as const;
+
+/**
  * Тянет несколько ICS-URL (best-effort, таймаут 8с каждый) и собирает события окна.
  * Возвращает отсортированный по времени список; недоступные источники молча пропускает.
+ *
+ * Ссылки ввёл пользователь (trip_calendars), поэтому только через safeGet:
+ * глобальный fetch сам шёл по редиректам и резолвил имя заново, то есть
+ * сохранённая «календарная» ссылка могла вести в Redis или MinIO прод-машины.
  */
 export async function fetchCalendarEvents(
   sources: CalendarSource[],
@@ -134,10 +152,8 @@ export async function fetchCalendarEvents(
   const all: CalEvent[] = [];
   for (const { url, source } of sources) {
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-      if (!res.ok) continue;
-      const text = await res.text();
-      all.push(...eventsFromIcs(text, source, start, end));
+      const res = await safeGet(url, { ...ICS_FETCH_POLICY, timeoutMs: 8000, maxBytes: ICS_MAX_BYTES, responseType: 'text' });
+      all.push(...eventsFromIcs(res.data, source, start, end));
     } catch {
       /* best-effort: unreachable calendar must not break trip state */
     }

@@ -5,6 +5,10 @@ import * as jwt from 'jsonwebtoken';
 import axios from 'axios';
 import * as webpush from 'web-push';
 import { PgService } from '../common/services/pg.service';
+import { assertPublicUrl, checkUrlSyntax, isUnsafeUrlError, pinnedAgent, PublicTarget } from '../common/net/safe-fetch';
+
+/** Срок на одну web-push отправку: чужой endpoint не должен держать цикл по подпискам. */
+const PUSH_TIMEOUT_MS = 15_000;
 
 // Web Push transport (Слой 1 low-friction Android). Хранит подписки устройств,
 // шлёт уведомления через VAPID. Переиспользуемо: рутинные пуши (Слой 3),
@@ -131,8 +135,16 @@ export class PushService implements OnModuleInit {
     }
   }
 
+  /**
+   * Endpoint подписки присылает браузер — то есть, по сути, кто угодно с
+   * токеном: POST /push/subscribe принимает любую строку. На неё сервер потом
+   * сам шлёт POST, так что это та же SSRF-точка, только вслепую. Здесь
+   * отбиваем очевидное без сети (только https, стандартный порт, не
+   * внутренний адрес/имя); полная проверка с DNS — в момент отправки.
+   */
   async subscribe(userId: string, sub: { endpoint: string; keys: Record<string, string> }): Promise<void> {
     if (!this.pg || !sub?.endpoint || !sub?.keys) return;
+    checkUrlSyntax(String(sub.endpoint));
     await this.pg.query(
       `INSERT INTO push_subscriptions (user_id, endpoint, keys, platform) VALUES ($1, $2, $3, 'web')
        ON CONFLICT (endpoint) DO UPDATE SET user_id = $1, keys = $3, platform = 'web'`,
@@ -177,8 +189,29 @@ export class PushService implements OnModuleInit {
       }
       // Web Push (VAPID).
       if (!this.configured) continue;
+      // Адрес проверяется на каждой отправке, а соединение пиннится на
+      // проверенные IP: подписки, сохранённые до проверки при подписке, и
+      // DNS, сменившийся после неё, иначе прошли бы мимо.
+      let target: PublicTarget;
       try {
-        await webpush.sendNotification({ endpoint: s.endpoint, keys: s.keys } as any, JSON.stringify(payload));
+        target = await assertPublicUrl(String(s.endpoint));
+      } catch (e: any) {
+        if (isUnsafeUrlError(e)) {
+          await this.pg.query(`DELETE FROM push_subscriptions WHERE endpoint = $1`, [s.endpoint]).catch(() => {});
+          this.logger.warn(`pruned unsafe push endpoint for ${userId}: ${e.message}`);
+        } else {
+          this.logger.warn(`push endpoint unresolvable for ${userId}: ${e.message}`);
+        }
+        continue;
+      }
+      try {
+        await webpush.sendNotification(
+          // Отдаём уже разобранный WHATWG-адрес: web-push разбирает его старым
+          // url.parse, и на канонической записи разборщики не расходятся.
+          { endpoint: target.url.href, keys: s.keys } as any,
+          JSON.stringify(payload),
+          { agent: pinnedAgent('https:', target.hostname, target.addresses) as any, timeout: PUSH_TIMEOUT_MS },
+        );
         ok++;
       } catch (e: any) {
         const code = e?.statusCode;

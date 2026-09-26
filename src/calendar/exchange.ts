@@ -12,7 +12,9 @@ import { writeFile, unlink } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
+import { isIP } from 'net';
 import { CalEvent } from './calendar.types';
+import { assertPublicUrl, PublicTarget } from '../common/net/safe-fetch';
 
 const execFileP = promisify(execFile);
 
@@ -31,6 +33,20 @@ function decodeXml(s: string): string {
 // Экранируем для curl-config («user = "…"»): внутри кавычек значимы \ и ".
 function cfgEscape(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+/**
+ * Адрес Exchange: только https, порт любой — on-prem серверы бывают на
+ * нестандартных, — но во внутреннюю сеть нельзя.
+ */
+export const EXCHANGE_URL_POLICY = { allowAnyPort: true } as const;
+
+/** `--resolve host:port:ip[,ip]` на проверенные адреса. Для IP-литерала не нужен: curl и так идёт туда. */
+export function curlResolveArgs(target: PublicTarget): string[] {
+  if (isIP(target.hostname)) return [];
+  const port = target.url.port || '443';
+  const addrs = target.addresses.map((a) => (a.family === 6 ? `[${a.address}]` : a.address)).join(',');
+  return ['--resolve', `${target.hostname}:${port}:${addrs}`];
 }
 
 export class ExchangeEwsConnector {
@@ -55,7 +71,14 @@ export class ExchangeEwsConnector {
   }
 
   // curl --ntlm; креды кладём в 600-конфиг во временный файл (не в argv), удаляем в finally.
+  //
+  // Сервер ввёл пользователь, поэтому адрес проверяется как любая чужая
+  // ссылка (assertPublicUrl: внутренние адреса, localhost, DNS), а curl
+  // пиннится на проверенные IP через --resolve — сам он в DNS не ходит, и
+  // подмена ответа DNS между проверкой и запросом ничего не даёт. --proto
+  // запрещает всё, кроме https; прокси из окружения не используется.
   private async post(creds: ExchangeCreds, soap: string, timeoutSec: number): Promise<string> {
+    const target = await assertPublicUrl(this.ewsUrl(creds), EXCHANGE_URL_POLICY);
     const cfg = join(tmpdir(), `.ews-${randomUUID()}.cfg`);
     await writeFile(cfg, `user = "${cfgEscape(creds.username)}:${cfgEscape(creds.password)}"\n`, { mode: 0o600 });
     try {
@@ -63,8 +86,10 @@ export class ExchangeEwsConnector {
         'curl',
         [
           '--ntlm', '-K', cfg, '-s', '--show-error', '--fail-with-body',
+          '--proto', '=https', '--noproxy', '*',
+          ...curlResolveArgs(target),
           '--max-time', String(timeoutSec),
-          '-X', 'POST', this.ewsUrl(creds),
+          '-X', 'POST', target.url.href,
           '-H', 'Content-Type: text/xml; charset=utf-8',
           '--data', soap,
         ],
