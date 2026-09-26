@@ -51,10 +51,12 @@ describe('ClaudeCliService: уборка брошенных конфигов MCP
     fs.writeFileSync(file, 'x');
     age(file, 2 * HOUR);
 
-    // Симлинк с нашим именем — не каталог: не удаляем ни его, ни цель.
+    // Симлинк с нашим именем — не каталог: не удаляем ни его, ни цель. Цель
+    // тоже старая — иначе stat вместо lstat прошёл бы проверку незамеченным.
     const target = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-sweep-target-'));
     extra.push(target);
     fs.writeFileSync(path.join(target, 'keep.txt'), 'keep');
+    age(target, 2 * HOUR);
     const link = path.join(root, 'claude-mcp-link');
     fs.symlinkSync(target, link);
     age(link, 2 * HOUR, true);
