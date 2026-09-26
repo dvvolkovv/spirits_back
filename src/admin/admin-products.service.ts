@@ -110,6 +110,8 @@ export interface AdminProductJob {
 }
 
 export interface AdminProductCard {
+  /** За какой период посчитаны turnsInPeriod/tokensInPeriod продукта — уже прижатый. */
+  periodDays: number;
   product: AdminProductRow;
   domain: AdminProductDomain | null;
   turns: AdminProductTurn[];
@@ -368,6 +370,10 @@ export class AdminProductsService {
    * конкретному продукту — из списка с включёнными флагами или по ссылке, — и
    * архивный или тестовый продукт здесь тот самый, который хотят посмотреть.
    *
+   * Период — тот же, что у списка, и прижимается так же; в ответе — уже
+   * прижатый, как и у списка: интерфейс подписывает счётчики тем, что
+   * посчитано, а не тем, что просили.
+   *
    * null — продукта нет; 404 из этого делает контроллер. id проверен им же
    * (assertUuid): мусор в `p.id = $2` — это 22P02 и 500, а не «не найдено».
    */
@@ -413,6 +419,7 @@ export class AdminProductsService {
 
     const d = domainRes.rows[0];
     return {
+      periodDays,
       product: AdminProductsService.toRow(r.rows[0]),
       domain: d
         ? {
