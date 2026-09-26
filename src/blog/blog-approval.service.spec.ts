@@ -257,9 +257,11 @@ describe('BlogApprovalService.handleCallback', () => {
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:redo:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
-    // Запись обязана БЫТЬ — иначе «не содержит» прошло бы на пустом месте.
-    expect(updates(pg)).toHaveLength(1);
-    expect(String(updates(pg)[0][0])).not.toContain('editor_notes');
+    // Запись обязана БЫТЬ — иначе «не содержит» прошло бы на пустом месте. Рядом
+    // идёт ещё снятие слота (leaveQueue), поэтому ищем именно переработку.
+    const rework = updates(pg).filter((c) => /status = 'drafting'/.test(String(c[0])));
+    expect(rework).toHaveLength(1);
+    expect(updates(pg).some((c) => /editor_notes/.test(String(c[0])))).toBe(false);
   });
 
   /** Мусор — терминальный статус: замечания к нему больше никто не прочтёт. */

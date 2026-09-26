@@ -110,9 +110,10 @@ describe('BlogController', () => {
   it('redraft из админки замечания сохраняет', async () => {
     const d = deps(); const r = res();
     await make(d).action({ action: 'redraft', id: 'p1' }, r);
-    // Запись обязана БЫТЬ — иначе «не содержит» прошло бы на пустом месте.
-    expect(updates(d.pg)).toHaveLength(1);
-    expect(updates(d.pg)[0]).not.toContain('editor_notes');
+    // Запись обязана БЫТЬ — иначе «не содержит» прошло бы на пустом месте. Рядом
+    // идёт ещё снятие слота (leaveQueue), поэтому ищем именно переработку.
+    expect(updates(d.pg).filter((s) => /status = 'drafting'/.test(s))).toHaveLength(1);
+    expect(updates(d.pg).some((s) => /editor_notes/.test(s))).toBe(false);
   });
 
   /**

@@ -849,10 +849,13 @@ maybe('Очередь без дыр против живого Postgres', () => {
   // --- каждый путь ухода ---
 
   type World = ReturnType<typeof make>;
-  it.each<[string, (w: World, id: string) => Promise<void>]>([
+  // Третье поле — остаётся ли у ушедшего поста слот: только у publish_now
+  // («сейчас» — история выхода); переработка, мусор и возврат на проверку
+  // слот снимают.
+  it.each<[string, (w: World, id: string) => Promise<void>, boolean?]>([
     ['админка: publish_now', async (w, id) => {
       expect((await adminCall(w.admin, { action: 'publish_now', id })).status).toBe(200);
-    }],
+    }, true],
     ['админка: reject', async (w, id) => {
       expect((await adminCall(w.admin, { action: 'reject', id })).status).toBe(200);
     }],
@@ -865,7 +868,7 @@ maybe('Очередь без дыр против живого Postgres', () => {
     ['поздний второй черновик (sendForReview)', async (w, id) => {
       await w.bot.sendForReview({ ...rowToPost(await load(id)), status: 'drafting' }, CHAT);
     }],
-  ])('%s — Продукты встают на слот Киры, владелец узнаёт', async (_path, act) => {
+  ])('%s — Продукты встают на слот Киры, владелец узнаёт', async (_path, act, keepsSlot = false) => {
     const w = make();
     const [s0, s1] = next(2);
     // Кира — ещё и протухшая новость: так один и тот же набор годится крону.
@@ -875,10 +878,46 @@ maybe('Очередь без дыр против живого Postgres', () => {
     await act(w, kira);
 
     expect((await load(kira)).status).not.toBe('approved');
+    expect((await load(kira)).slot_at === null).toBe(!keepsSlot);
     expect(await slotOf(products)).toBe(s0);
     const notes = w.tg.sent.filter((m) => /Очередь сдвинулась/.test(m.text));
     expect(notes).toHaveLength(1);
     expect(notes[0].text).toContain('«Продукты» — теперь');
+  });
+
+  // --- ушедший пост не держит ложный слот ---
+
+  it('одобренный пост на пн ушёл на переработку — slot_at IS NULL, пн у следующего', async () => {
+    const { admin } = make();
+    const [s0, s1] = next(2);
+    const kira = await insert('approved', { slotAt: s0, title: 'Кира' });
+    const products = await insert('approved', { slotAt: s1, title: 'Продукты' });
+
+    expect((await adminCall(admin, { action: 'redraft', id: kira })).status).toBe(200);
+
+    const free = await pool.query(`SELECT slot_at IS NULL AS free FROM blog_post WHERE id = $1`, [kira]);
+    expect(free.rows[0].free).toBe(true);
+    expect(await slotOf(products)).toBe(s0);
+  });
+
+  /**
+   * Очередь админки сортируется по слоту (`slot_at NULLS LAST`). Со старым
+   * слотом переработанный пост стоял среди запланированных — впереди того,
+   * кто этот слот уже занял. Без слота он после них.
+   */
+  it('в очереди админки переработанный пост — без слота и после запланированных', async () => {
+    const { admin } = make();
+    const [s0, s1] = next(2);
+    const kira = await insert('approved', { slotAt: s0, title: 'Кира' });
+    const products = await insert('approved', { slotAt: s1, title: 'Продукты' });
+    expect((await adminCall(admin, { action: 'redraft', id: kira })).status).toBe(200);
+
+    const list = await adminCall(admin, { action: 'list' });
+
+    expect(list.body.map((p: any) => [p.id, p.status, iso(p.slotAt)])).toEqual([
+      [products, 'approved', s0],
+      [kira, 'drafting', null],
+    ]);
   });
 
   it('ручной перенос очередь НЕ сдвигает', async () => {

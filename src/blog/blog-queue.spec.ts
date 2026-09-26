@@ -404,6 +404,7 @@ describe('сдвиг очереди — правила', () => {
     expect(applied).toBe(true);
     expect(shifted).toEqual([]);
     expect([pg.slot('products'), pg.slot('case')]).toEqual([MON, WED]);
+    expect(pg.slot('redo')).toBeNull();   // и чужой ему слот с него снят
   });
 
   it('запись не прошла — очередь стоит', async () => {
@@ -477,7 +478,8 @@ describe('каждый путь ухода из очереди сдвигает 
     const r = await w.call({ action: 'reject', id: 'kira' });
 
     expect(r.status).toBe(200);
-    expect(r.body).toMatchObject({ id: 'kira', status: 'rejected' });
+    expect(r.body).toMatchObject({ id: 'kira', status: 'rejected', slotAt: null });
+    expect(w.pg.slot('kira')).toBeNull();
     expect(w.pg.slot('products')).toBe(MON);
   });
 
@@ -487,7 +489,8 @@ describe('каждый путь ухода из очереди сдвигает 
     const r = await w.call({ action: 'redraft', id: 'kira' });
 
     expect(r.status).toBe(200);
-    expect(r.body).toMatchObject({ id: 'kira', status: 'drafting' });
+    expect(r.body).toMatchObject({ id: 'kira', status: 'drafting', slotAt: null });
+    expect(w.pg.slot('kira')).toBeNull();
     expect(w.pg.slot('products')).toBe(MON);
   });
 
@@ -498,6 +501,7 @@ describe('каждый путь ухода из очереди сдвигает 
 
     expect(r.status).toBe(200);
     expect(w.pg.row('kira').status).toBe('published');
+    expect(w.pg.slot('kira')).toBe(SAT);   // слот «сейчас» — история выхода
     expect(w.pg.slot('products')).toBe(MON);
   });
 
@@ -507,6 +511,7 @@ describe('каждый путь ухода из очереди сдвигает 
     await w.press('no', 'kira');
 
     expect(w.pg.row('kira').status).toBe('rejected');
+    expect(w.pg.slot('kira')).toBeNull();
     expect(w.pg.slot('products')).toBe(MON);
   });
 
@@ -516,6 +521,7 @@ describe('каждый путь ухода из очереди сдвигает 
     await w.press('redo', 'kira');
 
     expect(w.pg.row('kira').status).toBe('drafting');
+    expect(w.pg.slot('kira')).toBeNull();
     expect(w.pg.slot('products')).toBe(MON);
   });
 
@@ -524,7 +530,7 @@ describe('каждый путь ухода из очереди сдвигает 
 
     await w.cron.dropStaleNews();
 
-    expect(w.pg.row('kira')).toMatchObject({ status: 'rejected', last_error: 'протухла' });
+    expect(w.pg.row('kira')).toMatchObject({ status: 'rejected', last_error: 'протухла', slot_at: null });
     expect(w.pg.slot('products')).toBe(MON);
   });
 
@@ -542,6 +548,7 @@ describe('каждый путь ухода из очереди сдвигает 
     await w.approval.sendForReview(stale, APPROVER);
 
     expect(w.pg.row('kira').status).toBe('pending_review');
+    expect(w.pg.slot('kira')).toBeNull();
     expect(w.pg.slot('products')).toBe(MON);
   });
 
@@ -553,6 +560,68 @@ describe('каждый путь ухода из очереди сдвигает 
     expect(r.status).toBe(200);
     expect(w.pg.slot('kira')).toBe(FRI);
     expect(w.pg.slot('products')).toBe(WED);
+  });
+});
+
+/**
+ * Ушедший из очереди пост не держит ложный слот.
+ *
+ * Очередь сдвигается при каждом уходе, так что старый `slot_at` ушедшего
+ * поста почти всегда совпадает со слотом, который уже занял следующий. В
+ * админке у черновика висело бы «слот пн 28.09», которого у него нет, — а
+ * владелец решает, что выйдет в понедельник, глядя на эти подписи. Слот
+ * появится заново при следующем одобрении (ближайший свободный).
+ *
+ * Слот остаётся там, где он что-то значит: у `publish_now` — «сейчас», на нём
+ * держится ретрай; у опубликованного — история выхода.
+ */
+describe('ушедший из очереди пост не держит ложный слот', () => {
+  it('одобренный пост на пн ушёл на переработку — слота у него нет, пн у следующего', async () => {
+    const w = world([
+      { id: 'kira', title: 'Кира', status: 'approved', slot_at: MON },
+      { id: 'products', title: 'Продукты', status: 'approved', slot_at: WED },
+    ]);
+
+    await w.call({ action: 'redraft', id: 'kira' });
+
+    expect(w.pg.row('kira').slot_at).toBeNull();
+    expect(w.pg.slot('products')).toBe(MON);
+  });
+
+  it('переработанный пост при новом одобрении получает свободный слот, а не старый', async () => {
+    const w = world([
+      { id: 'kira', title: 'Кира', status: 'approved', slot_at: MON },
+      { id: 'products', title: 'Продукты', status: 'approved', slot_at: WED },
+    ]);
+    await w.call({ action: 'redraft', id: 'kira' });
+    Object.assign(w.pg.row('kira'), { status: 'pending_review' });   // черновик переписан и показан снова
+
+    await w.press('ok', 'kira');
+
+    expect(w.pg.slot('products')).toBe(MON);
+    expect(w.pg.slot('kira')).toBe(WED);
+  });
+
+  it('publish_now, который Telegram не принял, держит слот «сейчас» — на нём ретрай', async () => {
+    const w = world([
+      { id: 'kira', title: 'Кира', status: 'approved', slot_at: MON },
+      { id: 'products', title: 'Продукты', status: 'approved', slot_at: WED },
+    ]);
+    w.tg.sendPhoto.mockRejectedValueOnce(new Error('ETIMEDOUT'));
+
+    await w.call({ action: 'publish_now', id: 'kira' });
+
+    expect(w.pg.row('kira').status).toBe('approved');
+    expect(w.pg.slot('kira')).toBe(SAT);
+  });
+
+  it('опубликованный в свой слот пост хранит слот — это история', async () => {
+    const w = world([{ id: 'kira', title: 'Кира', status: 'approved', slot_at: FRI_PAST }]);
+
+    await w.cron.publishDue();
+
+    expect(w.pg.row('kira').status).toBe('published');
+    expect(w.pg.slot('kira')).toBe(FRI_PAST);
   });
 });
 

@@ -1,6 +1,18 @@
-import { BlogPost, rowToPost } from './blog.types';
+import { BlogPost, BlogStatus, rowToPost } from './blog.types';
 import { SLOT_HOLDING_STATUSES, SlotQueryable, TxSource, inTransaction } from './blog-slot-claim';
 import { formatSlotWhen } from './blog-slot-format';
+
+/**
+ * Статусы, в которых у поста слота нет и быть не может: в очереди он не стоит
+ * и в канал не выходил. Слот у такого поста — ложный: очередь при уходе
+ * сдвигается, и его старый слот тут же занимает следующий пост, а админка
+ * подписала бы черновик «слот пн 28.09», который принадлежит другому.
+ *
+ * Слот остаётся там, где он что-то значит: у `approved` и `publishing` — это
+ * очередь (у publish_now — «сейчас», на нём держится ретрай), у `published`
+ * и `failed` — история: когда пост вышел или должен был выйти.
+ */
+export const SLOTLESS_STATUSES: readonly BlogStatus[] = ['idea', 'drafting', 'pending_review', 'rejected'];
 
 /**
  * Очередь без дыр — решение владельца.
@@ -92,10 +104,11 @@ export async function shiftQueueAfter(tx: SlotQueryable, freed: Date): Promise<Q
  * Пост уходит из очереди: одна транзакция на уход и сдвиг.
  *
  * Пост берётся под блокировку, `apply` пишет уход (статус, слот — что нужно
- * пути) и возвращает, прошла ли запись. Если пост был `approved`, держал слот
- * и после записи его больше не держит — очередь сдвигается от этого слота
- * (`shiftQueueAfter`) в той же транзакции. Ошибка где угодно — откат всего,
- * включая уход.
+ * пути) и возвращает, прошла ли запись. Оказался пост там, где слота нет
+ * (`SLOTLESS_STATUSES`), — `slot_at` снимается. Если пост был `approved`,
+ * держал слот и после записи его больше не держит — очередь сдвигается от
+ * этого слота (`shiftQueueAfter`). Всё в одной транзакции; ошибка где
+ * угодно — откат всего, включая уход.
  *
  * Блокировка поста — ещё и перепроверка: `apply` видит пост таким, какой он
  * есть сейчас, а не каким его прочли до нажатия кнопки. Решение «можно ли
@@ -131,7 +144,18 @@ export async function leaveQueue(
 
     const before = rowToPost(r.rows[0]);
     const applied = await apply(tx, before);
-    if (!applied || before.status !== 'approved' || !before.slotAt) return { before, applied, shifted: [] };
+    if (!applied) return { before, applied, shifted: [] };
+
+    // Ушёл туда, где слота нет (переработка, мусор, возврат на проверку), —
+    // слот снимается здесь, в той же транзакции, а не в каждом из путей:
+    // правило одно на все. Новый слот пост получит при следующем одобрении —
+    // ближайший свободный, а не свой старый.
+    await tx.query(
+      `UPDATE blog_post SET slot_at = NULL
+        WHERE id = $1 AND slot_at IS NOT NULL AND status = ANY($2::text[])`,
+      [postId, SLOTLESS_STATUSES],
+    );
+    if (before.status !== 'approved' || !before.slotAt) return { before, applied, shifted: [] };
 
     // Держит ли пост свой слот после записи. Уход в другой статус освобождает
     // его, как и новый слот у publish_now; правка, не тронувшая слот, — нет.
