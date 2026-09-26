@@ -97,6 +97,12 @@ export interface SafeFetchDeps {
   resolve(hostname: string): Promise<ResolvedAddress[]>;
   /** true — ходить на адрес нельзя. */
   isBlocked(ip: string): boolean;
+  /**
+   * Срок на DNS в assertPublicUrl. safeGet и так ограничен общим сроком, но
+   * push и Exchange зовут assertPublicUrl напрямую, а медленный резолвер чужого
+   * имени иначе держал бы их на таймаутах ОС (у push — на каждой подписке цикла).
+   */
+  dnsTimeoutMs: number;
 }
 
 async function systemResolve(hostname: string): Promise<ResolvedAddress[]> {
@@ -149,7 +155,7 @@ function defaultIsBlocked(ip: string): boolean {
   return extraBlockedCidrs().some((cidr) => ipInCidr(ip, cidr));
 }
 
-const defaultDeps: SafeFetchDeps = { resolve: systemResolve, isBlocked: defaultIsBlocked };
+const defaultDeps: SafeFetchDeps = { resolve: systemResolve, isBlocked: defaultIsBlocked, dnsTimeoutMs: 10_000 };
 let deps: SafeFetchDeps = defaultDeps;
 
 /** Только для тестов: подменить DNS и классификатор адресов. null — вернуть настоящие. Сбрасывает кеши. */
@@ -222,10 +228,18 @@ export async function assertPublicUrl(raw: string, policy: UrlPolicy = {}): Prom
   if (fam) return { url, hostname, addresses: [{ address: hostname, family: fam === 6 ? 6 : 4 }] };
 
   let addresses: ResolvedAddress[];
+  let timer: NodeJS.Timeout | undefined;
   try {
-    addresses = await deps.resolve(hostname);
+    addresses = await Promise.race([
+      deps.resolve(hostname),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(Object.assign(new Error('DNS не ответил'), { code: 'ETIMEOUT' })), deps.dnsTimeoutMs);
+      }),
+    ]);
   } catch (e: any) {
     throw dnsError(hostname, e);
+  } finally {
+    clearTimeout(timer);
   }
   if (!addresses || addresses.length === 0) throw dnsError(hostname);
   if (addresses.some((a) => deps.isBlocked(a.address))) throw new UnsafeUrlError(REASON_INTERNAL);

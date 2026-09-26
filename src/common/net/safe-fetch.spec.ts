@@ -174,6 +174,15 @@ describe('assertPublicUrl — DNS', () => {
     expect(err.message).toMatch(/не найден/);
   });
 
+  it('медленный DNS не держит вызывающего дольше срока', async () => {
+    __setSafeFetchDepsForTests({ resolve: () => new Promise(() => { /* не ответит никогда */ }), dnsTimeoutMs: 50 });
+    const t0 = Date.now();
+    const err = await assertPublicUrl('https://slow-dns.example/').catch((e) => e);
+    expect(err.code).toBe('ETIMEOUT');
+    expect(isUnsafeUrlError(err)).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
   it('пустой ответ DNS — тоже «не найден»', async () => {
     __setSafeFetchDepsForTests({ resolve: async () => [] });
     await expect(assertPublicUrl('https://empty.example/')).rejects.toMatchObject({ code: 'ENOTFOUND' });

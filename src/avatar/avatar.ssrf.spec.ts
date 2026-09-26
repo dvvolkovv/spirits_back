@@ -110,7 +110,10 @@ describe('GET /avatar: внешний адрес', () => {
     let srv: http.Server;
     let contentType = 'image/png';
     beforeEach(async () => {
-      srv = http.createServer((req, res) => { res.setHeader('Content-Type', contentType); res.end('avatar-bytes'); });
+      srv = http.createServer((req, res) => {
+        if (contentType) res.setHeader('Content-Type', contentType);
+        res.end('avatar-bytes');
+      });
       await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
       process.env.MINIO_PUBLIC_URL = 'https://my.linkeon.io/smm-media';
       process.env.MINIO_ENDPOINT = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
@@ -125,6 +128,25 @@ describe('GET /avatar: внешний адрес', () => {
       expect(Buffer.from(res.body).toString()).toBe('avatar-bytes');
       expect(res.headers['Content-Type']).toBe('image/png');
       expect(res.headers['X-Content-Type-Options']).toBe('nosniff');
+    });
+
+    it('тип не сообщили — отдаётся как JPEG, как и раньше', async () => {
+      contentType = '';
+      const { ctrl } = ctrlFor('https://my.linkeon.io/smm-media/linkeon-assets/avatars/users/u-1.jpg');
+      const res = makeRes();
+      await ctrl.getAvatar(user, res as any);
+      expect(Buffer.from(res.body).toString()).toBe('avatar-bytes');
+      expect(res.headers['Content-Type']).toBe('image/jpeg');
+      expect(res.headers['X-Content-Type-Options']).toBe('nosniff');
+    });
+
+    it('SVG — не аватар: документ со скриптами с нашего origin не отдаём', async () => {
+      contentType = 'image/svg+xml';
+      const { ctrl } = ctrlFor('https://my.linkeon.io/smm-media/linkeon-assets/avatars/users/u-1.png');
+      const res = makeRes();
+      await ctrl.getAvatar(user, res as any);
+      expect(res.statusCode).toBe(204);
+      expect(res.body).toBeNull();
     });
 
     it('не картинка — не аватар (свой origin не отдаёт чужой HTML)', async () => {

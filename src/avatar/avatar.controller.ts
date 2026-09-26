@@ -83,10 +83,12 @@ export class AvatarController {
     // (кросс-ориджин + Authorization = префлайт, redirect за ним не следуется).
     try {
       const img = await fetchMediaBytes(avatar.url, { maxBytes: AVATAR_MAX_BYTES, timeoutMs: 15000, allowHttp: true });
-      const contentType = img.contentType.split(';')[0].trim().toLowerCase();
-      // Не картинка — не аватар: иначе ручка отдавала бы с нашего origin
-      // любой документ под любым типом.
-      if (!contentType.startsWith('image/')) return res.status(204).end();
+      // Тип не сообщили — как и раньше, считаем JPEG (с nosniff браузер его не
+      // перетолкует). Не картинка — не аватар: иначе ручка отдавала бы с
+      // нашего origin любой документ. SVG — тоже нет: это документ со
+      // скриптами, и nosniff его не обезвреживает.
+      const contentType = (img.contentType.split(';')[0].trim() || 'image/jpeg').toLowerCase();
+      if (!contentType.startsWith('image/') || contentType.includes('svg')) return res.status(204).end();
       res.setHeader('Content-Type', contentType);
       res.setHeader('X-Content-Type-Options', 'nosniff');
       res.setHeader('Cache-Control', 'private, max-age=3600');
