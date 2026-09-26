@@ -7,7 +7,40 @@ describe('токен инструмента продуктов', () => {
   afterAll(() => { process.env.JWT_SECRET = OLD; });
 
   it('свой токен разбирается обратно в того же владельца', () => {
-    expect(verifyProductToolToken(signProductToolToken('79030169187'))).toBe('79030169187');
+    expect(verifyProductToolToken(signProductToolToken('79030169187')).userId).toBe('79030169187');
+  });
+
+  // Канал хода — часть подписи, как и владелец: правка из Telegram должна лечь
+  // в product_turns с channel='telegram', и подменить его запросом нельзя.
+  it('канал по умолчанию — web', () => {
+    expect(verifyProductToolToken(signProductToolToken('79030169187'))).toEqual({
+      userId: '79030169187',
+      channel: 'web',
+    });
+  });
+
+  it('токен Telegram разбирается с каналом telegram', () => {
+    expect(verifyProductToolToken(signProductToolToken('79030169187', 'telegram'))).toEqual({
+      userId: '79030169187',
+      channel: 'telegram',
+    });
+  });
+
+  // Обратная совместимость: токены, выпущенные до появления канала (живые на
+  // релее до 30 минут после выката), обязаны работать дальше — это веб.
+  it('токен без канала (выпущенный до правки) разбирается как web', () => {
+    const legacy = jwt.sign({ userId: '79030169187', type: PRODUCT_TOOL_TOKEN_TYPE }, process.env.JWT_SECRET!);
+    expect(verifyProductToolToken(legacy)).toEqual({ userId: '79030169187', channel: 'web' });
+  });
+
+  // Незнакомый канал подписать можем только мы сами, то есть это ошибка в коде.
+  // Молча записать его «вебом» — значит соврать в истории правок.
+  it('незнакомый канал — отказ, а не молчаливый web', () => {
+    const odd = jwt.sign(
+      { userId: '79030169187', type: PRODUCT_TOOL_TOKEN_TYPE, channel: 'sms' },
+      process.env.JWT_SECRET!,
+    );
+    expect(() => verifyProductToolToken(odd)).toThrow(/канал/i);
   });
 
   it('чужая подпись отвергается', () => {

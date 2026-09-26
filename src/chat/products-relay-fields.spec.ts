@@ -19,7 +19,7 @@ describe('поля инструмента продуктов для релея',
 
   it('токен разбирается обратно в того же пользователя', () => {
     const f = productsRelayFields('79030169187');
-    expect(verifyProductToolToken(f.products_token)).toBe('79030169187');
+    expect(verifyProductToolToken(f.products_token)).toEqual({ userId: '79030169187', channel: 'web' });
   });
 
   it('адрес точки — https и ведёт на /webhook/mcp/products', () => {
@@ -52,6 +52,6 @@ describe('поля инструмента продуктов для релея',
     const a = productsRelayFields('79030169187').products_token;
     const b = productsRelayFields('70000000000').products_token;
     expect(a).not.toBe(b);
-    expect(verifyProductToolToken(b)).toBe('70000000000');
+    expect(verifyProductToolToken(b).userId).toBe('70000000000');
   });
 });

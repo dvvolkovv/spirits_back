@@ -15,7 +15,10 @@ describe('точка /mcp/products', () => {
   const make = () => {
     const calls: any[] = [];
     const tool = {
-      execute: jest.fn(async (userId: string, input: any) => { calls.push({ userId, input }); return { ok: true }; }),
+      execute: jest.fn(async (userId: string, input: any, channel?: string) => {
+        calls.push({ userId, input, channel });
+        return { ok: true };
+      }),
     };
     return { ctrl: new ProductsMcpController(tool as any), calls, tool };
   };
@@ -34,6 +37,38 @@ describe('точка /mcp/products', () => {
     await ctrl.callTool(`Bearer ${signProductToolToken('79030169187')}`, { action: 'list', userId: '70000000000' });
     expect(calls[0].userId).toBe('79030169187');
     expect(calls[0].input.userId).toBeUndefined();
+  });
+
+  // Канал хода (web/telegram) — из подписи, как и владелец. Правка из
+  // Telegram ложится в product_turns с channel='telegram', из веба — 'web'.
+  it('канал берётся ИЗ ТОКЕНА: telegram', async () => {
+    const { ctrl, calls } = make();
+    await ctrl.callTool(`Bearer ${signProductToolToken('79030169187', 'telegram')}`, { action: 'list' });
+    expect(calls[0].channel).toBe('telegram');
+  });
+
+  it('веб-токен даёт канал web', async () => {
+    const { ctrl, calls } = make();
+    await ctrl.callTool(`Bearer ${signProductToolToken('79030169187', 'web')}`, { action: 'list' });
+    expect(calls[0].channel).toBe('web');
+  });
+
+  // Токены релея, выпущенные до появления канала, живут до 30 минут после
+  // выката — они обязаны работать и значить «веб».
+  it('токен без канала (релей до правки) — канал web', async () => {
+    const { ctrl, calls } = make();
+    const legacy = jwt.sign({ userId: '79030169187', type: 'product-tool' }, process.env.JWT_SECRET!);
+    await ctrl.callTool(`Bearer ${legacy}`, { action: 'list' });
+    expect(calls[0].userId).toBe('79030169187');
+    expect(calls[0].channel).toBe('web');
+  });
+
+  // Тот же приём, что с userId: поле пишет модель, и значить оно не должно ничего.
+  it('поле channel в запросе не меняет канал и не доезжает до инструмента', async () => {
+    const { ctrl, calls } = make();
+    await ctrl.callTool(`Bearer ${signProductToolToken('79030169187', 'web')}`, { action: 'list', channel: 'telegram' });
+    expect(calls[0].channel).toBe('web');
+    expect(calls[0].input.channel).toBeUndefined();
   });
 
   it('без токена — отказ, инструмент не зовётся', async () => {
