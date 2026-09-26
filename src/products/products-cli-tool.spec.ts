@@ -6,6 +6,7 @@ import { productsCliMcp, PRODUCTS_CLI_TOOL_NAME } from './products-cli-tool';
 import { verifyProductToolToken } from './product-tool.token';
 import { PRODUCT_TOOL_NAME } from './product-tool.service';
 import { ProductsMcpController } from '../mcp/products-mcp.controller';
+import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
 
 /**
  * Инструмент продуктов для ЛОКАЛЬНОГО claude CLI (Маша в вебе, Telegram-бот):
@@ -84,6 +85,18 @@ describe('инструмент продуктов для локального CL
     expect(PRODUCTS_CLI_TOOL_NAME).toBe(r.toolName);
   });
 
+  // CLI 2.1.280 знает у http-сервера поле `timeout` — потолок одного вызова
+  // инструмента, мс (перекрывает MCP_TOOL_TIMEOUT; меньше 1000 игнорируется).
+  // Проба 26.09.2026: с timeout 20000 вызов, ждавший 75 с, оборван «timed out
+  // after 20s»; без поля тот же вызов дождался. Потолок — страховка от
+  // зависшего бэкенда: у хода бота своего таймаута нет вовсе.
+  it('у сервера задан потолок вызова — дольше ожидания правки и не меньше 180 с', () => {
+    const t = (productsCliMcp('79030169187', 'web').mcpServers.products as any).timeout;
+    expect(typeof t).toBe('number');
+    expect(t).toBeGreaterThan(PRODUCT_TOOL_WAIT_MS);
+    expect(t).toBeGreaterThanOrEqual(180_000);
+  });
+
   describe('блок системного промпта', () => {
     const block = () => productsCliMcp('79030169187', 'web').promptBlock;
 
@@ -104,6 +117,16 @@ describe('инструмент продуктов для локального CL
       expect(b).toMatch(/"active"/);
       expect(b).toMatch(/ambiguous/);
       expect(b).toMatch(/СПРОСИ/);
+    });
+
+    // Поле say есть в КАЖДОМ ответе инструмента — это то, что сказать
+    // пользователю. Правило — общее, а не только у доменов.
+    it('правило «следуй полю say» — общее, отдельной строкой', () => {
+      const general = block()
+        .split('\n')
+        .filter((l) => /поле say/i.test(l) && !/action: "domain"|Записи DNS/.test(l));
+      expect(general.length).toBeGreaterThanOrEqual(1);
+      expect(general[0]).toMatch(/каждый ответ/i);
     });
 
     it('запрещает передавать userId/телефон', () => {

@@ -74,4 +74,17 @@ describe('токен инструмента продуктов', () => {
     const p: any = jwt.decode(signProductToolToken('79030169187'));
     expect((p.exp - p.iat) * 1000).toBeGreaterThan(600_000);
   });
+
+  it('веб-токен — 30 минут, как и был', () => {
+    const p: any = jwt.decode(signProductToolToken('79030169187', 'web'));
+    expect(p.exp - p.iat).toBe(30 * 60);
+  });
+
+  // У хода Telegram-бота таймаута нет (tg-router: timeoutMs 0 — прогресс виден
+  // статусом в чате). 30 минут оборвали бы доступ к продуктам посреди долгого
+  // хода; 2 часа — дольше любого разумного хода бота и заметно короче суток.
+  it('токен Telegram — 2 часа', () => {
+    const p: any = jwt.decode(signProductToolToken('79030169187', 'telegram'));
+    expect(p.exp - p.iat).toBe(2 * 60 * 60);
+  });
 });

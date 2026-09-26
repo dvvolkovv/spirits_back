@@ -246,10 +246,15 @@ describe('ClaudeCliService argv: MCP-серверы на вызов', () => {
   function captureAtSpawn(makeProc: () => any = () => fakeProc(OK_JSON)) {
     const seen: {
       args: string[]; cwd: string; cfgPath?: string; mode?: number; dirMode?: number; body?: any;
+      cwdEntries?: string[] | null;
     } = { args: [], cwd: '' };
     spawnMock.mockImplementation((_bin: string, args: string[], opts: any) => {
       seen.args = args;
       seen.cwd = opts.cwd;
+      // Содержимое одноразового cwd — только для него: листать весь os.tmpdir() незачем.
+      seen.cwdEntries = opts.cwd && path.basename(opts.cwd).startsWith('claude-cwd-') && fs.existsSync(opts.cwd)
+        ? fs.readdirSync(opts.cwd)
+        : null;
       const p = flagValue(args, '--mcp-config');
       seen.cfgPath = p;
       if (p && fs.existsSync(p)) {
@@ -413,6 +418,33 @@ describe('ClaudeCliService argv: MCP-серверы на вызов', () => {
     } finally {
       fs.rmSync(srcDir, { recursive: true, force: true });
     }
+  });
+
+  // Нейтральный cwd по умолчанию — сам os.tmpdir(), и каталог конфига лежал бы
+  // формально внутри него. Вызов с MCP без cwd и вложений (Маша) получает свой
+  // пустой одноразовый каталог: конфиг — рядом с ним, а не внутри.
+  it('MCP без cwd и вложений: CLI в своём пустом одноразовом каталоге, конфиг не внутри, всё снято', async () => {
+    const seen = captureAtSpawn();
+    await new ClaudeCliService().text('покажи продукты', { mcpServers: servers() });
+    expect(seen.cwd).not.toBe(os.tmpdir());
+    expect(path.basename(seen.cwd)).toMatch(/^claude-cwd-/);
+    expect(seen.cwd.startsWith(os.tmpdir() + path.sep)).toBe(true);
+    expect(seen.cwdEntries).toEqual([]);
+    expect(path.relative(seen.cwd, seen.cfgPath!).startsWith('..')).toBe(true);
+    expect(fs.existsSync(seen.cwd)).toBe(false);
+  });
+
+  it('MCP без cwd: одноразовый cwd снимается и при падении CLI', async () => {
+    const seen = captureAtSpawn(() => fakeProc('boom-not-json', 1));
+    await expect(new ClaudeCliService().text('покажи продукты', { mcpServers: servers() })).rejects.toThrow();
+    expect(path.basename(seen.cwd)).toMatch(/^claude-cwd-/);
+    expect(fs.existsSync(seen.cwd)).toBe(false);
+  });
+
+  it('без MCP нейтральный cwd прежний — os.tmpdir()', async () => {
+    const seen = captureAtSpawn();
+    await new ClaudeCliService().text('привет');
+    expect(seen.cwd).toBe(os.tmpdir());
   });
 
   it('в stream-режиме (onProgress, как в Telegram) конфиг тоже передаётся и снимается', async () => {
