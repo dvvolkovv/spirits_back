@@ -990,100 +990,140 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // по loopback, токен этого пользователя с каналом web — правки ложатся в
     // product_turns с channel='web'. Токен уходит в файл конфига 0600, не в argv.
     const products = productsCliMcp(userId, 'web');
+    // Звали ли в этом ходе инструмент продуктов — от этого зависит карта ниже.
+    let usedProductsTool = false;
 
+    // Ход в полёте — тот же учёт, что у пути релея: deploy.sh перед рестартом
+    // ждёт /chat/active-streams до нуля, фронт спрашивает /chat/active-turn.
+    // С инструментом ход Маши идёт минутами (правка ждёт исхода внутри вызова),
+    // и рестарт посреди него убивал бы ответ, а правка продукта тихо доезжала
+    // бы сама. Инкремент — внутри try, декремент — в finally: парные при любом
+    // исходе.
+    const turnKey = `${userId}_${assistantId}`;
+    let ping: NodeJS.Timeout | null = null;
     try {
-      const r = await this.claudeCli.textWithCost(fullPrompt, {
-        // Блок про продукты — только в этом вызове, не в systemPrompt: тот же
-        // systemPrompt уходит в приветствие DeepSeek, которое инструмент позвать
-        // не может. Встаёт ДО волатильной части и хвоста языка: требование языка
-        // обязано остаться последней строкой (см. replyLanguageTail выше), а
-        // блок написан по-русски.
-        system: stableSystemPrompt + `\n\n${products.promptBlock}` + volatileSystemPrompt + replyLanguageTail,
-        // Модель Маши — общая с остальным чатом, см. common/chat-model.ts
-        // (там же цена решения: пин не даунгрейдится при исчерпании лимита, и
-        // как откатиться через env без выката). Биллинг юзеру идёт от costUsd.
-        // Пинг мониторинга уходит на haiku: проверяется живость пути, а не
-        // качество ответа, и разница в цене хода — порядок.
-        model: probe ? PROBE_MODEL : CHAT_MODEL,
-        // Бюджет хода — общий с релеем. Правка ждёт исхода внутри вызова
-        // инструмента до PRODUCT_TOOL_WAIT_MS (2.5 мин) и может позвать его
-        // повторно; прежние 90 с убивали бы CLI посреди ожидания — правка уже
-        // поставлена и идёт, а Маша отвечает «временные проблемы со связью».
-        // Потолок ожидания выведен из этой же константы (relay-budget.ts),
-        // поэтому разъехаться они не могут.
-        timeoutMs: RELAY_TURN_BUDGET_MS,
-        mcpServers: products.mcpServers,
-        // Автоодобрение — ровно инструмент продуктов. Встроенные тулы у Маши
-        // по-прежнему выключены (tools не задан → `--tools ""`).
-        allowedTools: products.toolName,
-      });
-      rawText = r.text || '';
-      // Курс общий со всеми путями, которые едят ёмкость подписки Claude —
-      // см. common/billing-rates.ts. Кладём всё в outputTokens (split
-      // input/output здесь не информативен — берём суммарную стоимость).
-      outputTokens = Math.ceil(r.costUsd * SEAT_TOKENS_PER_USD);
-      costUsd = r.costUsd;
-      this.logger.log(`Маша claude CLI: cost=$${r.costUsd.toFixed(4)} tokens=${outputTokens}`);
-    } catch (e: any) {
-      this.logger.error(`Маша claude CLI error: ${e.message}`);
-      rawText = 'Извините, временные проблемы со связью. Попробуйте ещё раз через минуту.';
-    }
+      this.activeStreams++;
+      this.activeTurns.set(turnKey, turnStartedAt);
+      // Пока думает CLI, клиенту не уходит ничего до самого ответа — а это минуты.
+      // Flutter-клиент (Dio receiveTimeout 60 с) рвал такой ход ошибкой. Пинг —
+      // той же формы, что у релея: {"type":"ping"} без content/text/delta, его
+      // пропускают и веб (ChatInterface), и Flutter (parseChatChunk).
+      const PING_MS = 20_000;
+      ping = setInterval(() => {
+        try { res.write(JSON.stringify({ type: 'ping' }) + '\n'); } catch { /* клиент ушёл — ход доводим */ }
+      }, PING_MS);
 
-    // Clean and post-process the full response
-    let fullText = this.stripToolTags(rawText);
-
-    // Маша иногда говорит «вот карта», «вытяни карту» — backend ловит regex'ом
-    // и подвешивает реальную карту из metaphor_cards (postgres). LLM сама про
-    // URL не знает, она просто описывает образ.
-    const cardPattern = /(?:get_metaphor_card|images\.linkeon\.io|image_url|вот.*карт|первая карта|следующая карта|покажу.*карт|новая карта|вытяни.*карт|твоя карта|вот она|карту для тебя|достаю карту|тяну карту|открываю карту|Что ты видишь на этой карте|Какие чувства.*вызывает)/i;
-    const cardMatch = cardPattern.test(rawText) || /карт/i.test(rawText);
-    if (cardMatch) {
       try {
-        const cardUrl = await this.getRandomMetaphorCard(userId);
-        if (cardUrl) {
-          fullText = `${fullText.trim()}\n\n![Метафорическая карта](${cardUrl})`;
-        }
-      } catch (e: any) {
-        this.logger.error(`Metaphor card error: ${e.message}`);
-      }
-    }
-
-    const tokensUsed = inputTokens + outputTokens;
-    res.write(JSON.stringify({ type: 'item', content: fullText }) + '\n');
-    res.write(JSON.stringify({ type: 'end', content: fullText, usage: { input: inputTokens, output: outputTokens, total: tokensUsed } }) + '\n');
-    res.end();
-
-    // Async: save to DB and consolidate profile after response sent
-    setImmediate(async () => {
-      try {
-        const tokensUsed = inputTokens + outputTokens;
-        await this.saveChatHistory(userId, String(assistantId), message, fullText, tokensUsed, fresh ? chatSessionId : undefined);
-        await this.addTokenTask(userId, inputTokens, outputTokens, String(agent.id), {
-          costUsd: Number(costUsd.toFixed(4)),
-          source: 'cost', // у этого пути сырого usage нет — только total_cost_usd от CLI
-          durationMs: Date.now() - turnStartedAt,
-          replyChars: fullText.length,
+        const r = await this.claudeCli.textWithCost(fullPrompt, {
+          // Блок про продукты — только в этом вызове, не в systemPrompt: тот же
+          // systemPrompt уходит в приветствие DeepSeek, которое инструмент позвать
+          // не может. Встаёт ДО волатильной части и хвоста языка: требование языка
+          // обязано остаться последней строкой (см. replyLanguageTail выше), а
+          // блок написан по-русски.
+          system: stableSystemPrompt + `\n\n${products.promptBlock}` + volatileSystemPrompt + replyLanguageTail,
+          // Модель Маши — общая с остальным чатом, см. common/chat-model.ts
+          // (там же цена решения: пин не даунгрейдится при исчерпании лимита, и
+          // как откатиться через env без выката). Биллинг юзеру идёт от costUsd.
+          // Пинг мониторинга уходит на haiku: проверяется живость пути, а не
+          // качество ответа, и разница в цене хода — порядок.
+          model: probe ? PROBE_MODEL : CHAT_MODEL,
+          // Бюджет хода — общий с релеем. Правка ждёт исхода внутри вызова
+          // инструмента до PRODUCT_TOOL_WAIT_MS (2.5 мин) и может позвать его
+          // повторно; прежние 90 с убивали бы CLI посреди ожидания — правка уже
+          // поставлена и идёт, а Маша отвечает «временные проблемы со связью».
+          // Потолок ожидания выведен из этой же константы (relay-budget.ts),
+          // поэтому разъехаться они не могут.
+          timeoutMs: RELAY_TURN_BUDGET_MS,
+          mcpServers: products.mcpServers,
+          // Автоодобрение — ровно инструмент продуктов. Встроенные тулы у Маши
+          // по-прежнему выключены (tools не задан → `--tools ""`).
+          allowedTools: products.toolName,
+          // onProgress переводит CLI в stream-json: только так видно, звали ли
+          // инструмент продуктов в этом ходе (итог в формате json этого не несёт).
+          onProgress: (ev) => {
+            if (ev.kind === 'tool_use' && ev.name === products.toolName) usedProductsTool = true;
+          },
         });
-        // Extract profile entities from conversation — работает и в fresh-режиме:
-        // «чистый лист» не тянет прошлый контекст, но профиль формирует.
-        if (this.neo4j) {
-          await this.neo4j.consolidateFromChat(userId, String(assistantId), message, fullText);
-        }
-        // Operational task memory (cross-agent). В fresh-режиме выключено:
-        // чистый лист не должен порождать боковых задач.
-        if (this.tasksService && !fresh) {
-          try { await this.tasksService.extractFromTurn(userId, String(assistantId), message, fullText); } catch {}
-        }
-        // Бизнес-карточка наполняется тем же поводом, что и задачи, но своим
-        // вызовом: у извлечения задач нет тестов, и подселять к нему вторую
-        // задачу — значит не заметить его просадку.
-        if (this.businessProfile && !fresh) {
-          try { await this.businessProfile.extractFromTurn(userId, String(assistantId), message, fullText); } catch {}
-        }
-      } catch (e) {
-        this.logger.error(`Post-chat save error: ${e.message}`);
+        rawText = r.text || '';
+        // Курс общий со всеми путями, которые едят ёмкость подписки Claude —
+        // см. common/billing-rates.ts. Кладём всё в outputTokens (split
+        // input/output здесь не информативен — берём суммарную стоимость).
+        outputTokens = Math.ceil(r.costUsd * SEAT_TOKENS_PER_USD);
+        costUsd = r.costUsd;
+        this.logger.log(`Маша claude CLI: cost=$${r.costUsd.toFixed(4)} tokens=${outputTokens}`);
+      } catch (e: any) {
+        this.logger.error(`Маша claude CLI error: ${e.message}`);
+        rawText = 'Извините, временные проблемы со связью. Попробуйте ещё раз через минуту.';
       }
-    });
+      // Ответ готов — дальше пишем его сами, пинги больше не нужны.
+      clearInterval(ping);
+      ping = null;
+
+      // Clean and post-process the full response
+      let fullText = this.stripToolTags(rawText);
+
+      // Маша иногда говорит «вот карта», «вытяни карту» — backend ловит regex'ом
+      // и подвешивает реальную карту из metaphor_cards (postgres). LLM сама про
+      // URL не знает, она просто описывает образ.
+      //
+      // Ход, где звали инструмент продуктов, карту не получает: в разговоре о
+      // сайте «картинку», «карточку товара», «карту сайта» говорят постоянно, и
+      // широкое /карт/ цепляло бы к отчёту о правке случайную карту (попутно
+      // меняя game_sessions в getRandomMetaphorCard).
+      const cardPattern = /(?:get_metaphor_card|images\.linkeon\.io|image_url|вот.*карт|первая карта|следующая карта|покажу.*карт|новая карта|вытяни.*карт|твоя карта|вот она|карту для тебя|достаю карту|тяну карту|открываю карту|Что ты видишь на этой карте|Какие чувства.*вызывает)/i;
+      const cardMatch = !usedProductsTool && (cardPattern.test(rawText) || /карт/i.test(rawText));
+      if (cardMatch) {
+        try {
+          const cardUrl = await this.getRandomMetaphorCard(userId);
+          if (cardUrl) {
+            fullText = `${fullText.trim()}\n\n![Метафорическая карта](${cardUrl})`;
+          }
+        } catch (e: any) {
+          this.logger.error(`Metaphor card error: ${e.message}`);
+        }
+      }
+
+      const tokensUsed = inputTokens + outputTokens;
+      res.write(JSON.stringify({ type: 'item', content: fullText }) + '\n');
+      res.write(JSON.stringify({ type: 'end', content: fullText, usage: { input: inputTokens, output: outputTokens, total: tokensUsed } }) + '\n');
+      res.end();
+
+      // Async: save to DB and consolidate profile after response sent
+      setImmediate(async () => {
+        try {
+          const tokensUsed = inputTokens + outputTokens;
+          await this.saveChatHistory(userId, String(assistantId), message, fullText, tokensUsed, fresh ? chatSessionId : undefined);
+          await this.addTokenTask(userId, inputTokens, outputTokens, String(agent.id), {
+            costUsd: Number(costUsd.toFixed(4)),
+            source: 'cost', // у этого пути сырого usage нет — только total_cost_usd от CLI
+            durationMs: Date.now() - turnStartedAt,
+            replyChars: fullText.length,
+          });
+          // Extract profile entities from conversation — работает и в fresh-режиме:
+          // «чистый лист» не тянет прошлый контекст, но профиль формирует.
+          if (this.neo4j) {
+            await this.neo4j.consolidateFromChat(userId, String(assistantId), message, fullText);
+          }
+          // Operational task memory (cross-agent). В fresh-режиме выключено:
+          // чистый лист не должен порождать боковых задач.
+          if (this.tasksService && !fresh) {
+            try { await this.tasksService.extractFromTurn(userId, String(assistantId), message, fullText); } catch {}
+          }
+          // Бизнес-карточка наполняется тем же поводом, что и задачи, но своим
+          // вызовом: у извлечения задач нет тестов, и подселять к нему вторую
+          // задачу — значит не заметить его просадку.
+          if (this.businessProfile && !fresh) {
+            try { await this.businessProfile.extractFromTurn(userId, String(assistantId), message, fullText); } catch {}
+          }
+        } catch (e) {
+          this.logger.error(`Post-chat save error: ${e.message}`);
+        }
+      });
+    } finally {
+      if (ping) clearInterval(ping);
+      this.activeStreams--;
+      this.activeTurns.delete(turnKey);
+    }
   }
 
   /**
