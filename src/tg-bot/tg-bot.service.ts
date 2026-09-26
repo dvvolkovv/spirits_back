@@ -811,20 +811,7 @@ export class TgBotService implements OnModuleInit {
         }
       };
 
-      const labelFor = (toolName: string): string => {
-        if (toolName === 'Read') return '📄 Читаю файл...';
-        if (toolName === 'Write') return '✏️ Пишу файл...';
-        if (toolName === 'Edit') return '✏️ Редактирую файл...';
-        if (toolName === 'Bash') return '⚙️ Выполняю команду...';
-        if (toolName === 'Glob') return '🔍 Ищу файлы...';
-        if (toolName === 'Grep') return '🔍 Ищу в файлах...';
-        if (toolName === 'WebSearch') return '🌐 Ищу в интернете...';
-        if (toolName === 'WebFetch') return '🌐 Открываю страницу...';
-        if (/generate_image|edit_image|compose_image/i.test(toolName)) return '🎨 Готовлю картинку...';
-        if (/upscale_image/i.test(toolName)) return '✨ Улучшаю картинку...';
-        if (/generate_video|video/i.test(toolName)) return '🎬 Запускаю генерацию видео...';
-        return `⚙️ ${toolName}...`;
-      };
+      const labelFor = TgBotService.toolStatusLabel;
 
       const ownerRes = await this.pg.query(
         `SELECT profile_data->>'name' AS first_name FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
@@ -832,11 +819,16 @@ export class TgBotService implements OnModuleInit {
       );
       const ownerFirstName = ownerRes.rows[0]?.first_name ?? 'Linkeon-пользователь';
 
+      // Инструмент продуктов владельца — только ему и только в чате, где кроме
+      // него никто не писал (см. productsOwnerForTurn). Считается ПОСЛЕ
+      // persistUserMessage: текущее сообщение уже в истории и тоже учтено.
+      const productsOwnerId = await this.productsOwnerForTurn(cfg, msg);
+
       let reply: { text: string; costUsd: number };
       try {
         reply = await this.router.generateReply(cfg, ownerFirstName, attachments, (ev) => {
           if (ev.kind === 'tool_use') editStatus(labelFor(ev.name)).catch(() => {});
-        }, workspace ?? undefined);
+        }, workspace ?? undefined, { productsOwnerId });
       } catch (e: any) {
         // Не вылетаем тихо — пишем юзеру в статус и оставляем след в БД.
         await this.recordTurnFailure(cfg, msg.chat.id, statusMsgId, e);
@@ -981,6 +973,58 @@ export class TgBotService implements OnModuleInit {
     return text.length <= TgBotService.VOICE_CAPTION_LIMIT
       ? { caption: text, needsSeparateText: false }
       : { needsSeparateText: true };
+  }
+
+  /**
+   * Подпись статус-сообщения, пока идёт вызов инструмента. Статическая и без
+   * `this` — чтобы проверяться тестом, не поднимая ход целиком.
+   */
+  static toolStatusLabel(toolName: string): string {
+    if (/mcp__products__/.test(toolName)) return '🛠 Работаю с продуктом...';
+    if (toolName === 'Read') return '📄 Читаю файл...';
+    if (toolName === 'Write') return '✏️ Пишу файл...';
+    if (toolName === 'Edit') return '✏️ Редактирую файл...';
+    if (toolName === 'Bash') return '⚙️ Выполняю команду...';
+    if (toolName === 'Glob') return '🔍 Ищу файлы...';
+    if (toolName === 'Grep') return '🔍 Ищу в файлах...';
+    if (toolName === 'WebSearch') return '🌐 Ищу в интернете...';
+    if (toolName === 'WebFetch') return '🌐 Открываю страницу...';
+    if (/generate_image|edit_image|compose_image/i.test(toolName)) return '🎨 Готовлю картинку...';
+    if (/upscale_image/i.test(toolName)) return '✨ Улучшаю картинку...';
+    if (/generate_video|video/i.test(toolName)) return '🎬 Запускаю генерацию видео...';
+    return `⚙️ ${toolName}...`;
+  }
+
+  /**
+   * Чьи продукты может править этот ход — или ничьи (undefined).
+   *
+   * Решение владельца (26.09.2026): инструмент продуктов есть в ходе, ТОЛЬКО
+   * если
+   *   1) текущее сообщение написал сам владелец бота — его Telegram привязан к
+   *      тому же аккаунту Linkeon, что владеет конфигом (tg_user_identities
+   *      1:1), и
+   *   2) в этом чате за всю историю не писал никто, кроме него
+   *      (router.onlySpeakerIs; текущее сообщение к этому моменту сохранено).
+   * Личка проходит сама собой. Хоть одна чужая реплика — и в этом чате
+   * инструмента больше нет: чужой текст в истории мог бы править продукты
+   * владельца его же руками. «В группе» здесь не критерий: сольная группа
+   * владельца проходит, людная личка невозможна.
+   *
+   * Любой сбой — «ничьи»: без инструмента бот работает как раньше, а выдать
+   * его по ошибке нельзя.
+   */
+  private async productsOwnerForTurn(cfg: TgBotConfigRow, msg: any): Promise<string | undefined> {
+    const senderTgId = msg?.from?.id;
+    if (!cfg?.owner_user_id || typeof senderTgId !== 'number') return undefined;
+    try {
+      const senderLinkeonId = await this.identity.getLinkeonIdByTgUserId(senderTgId);
+      if (!senderLinkeonId || senderLinkeonId !== cfg.owner_user_id) return undefined;
+      if (!(await this.router.onlySpeakerIs(cfg, senderTgId))) return undefined;
+      return cfg.owner_user_id;
+    } catch (e: any) {
+      this.logger.warn(`products tool gate failed in chat ${msg?.chat?.id}: ${e?.message}`);
+      return undefined;
+    }
   }
 
   /**

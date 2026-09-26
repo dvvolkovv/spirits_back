@@ -9,6 +9,7 @@ import { AgentsService } from '../agents/agents.service';
 import { TgGrammyClient } from './tg-grammy.client';
 import { TgConfigService, TgBotConfigRow } from './tg-config.service';
 import { isPrivateConfig } from './tg-chat-kind';
+import { productsCliMcp } from '../products/products-cli-tool';
 
 /**
  * Дефолтный ассистент для лички, когда preferred_agent пуст или указывает на
@@ -68,6 +69,35 @@ export class TgRouterService {
       [cfg.tg_chat_id],
     );
     return Number(r.rows[0]?.n ?? 0) <= 1;
+  }
+
+  /**
+   * Писал ли в этом чате хоть раз кто-нибудь, КРОМЕ tgUserId. Нужен гейту
+   * инструмента продуктов (tg-bot.service, productsOwnerForTurn): решение
+   * владельца — инструмент есть, только пока в чате не писал никто, кроме
+   * владельца.
+   *
+   * Выборка та же, что у isSoloChat (весь чат по tg_chat_id, через все его
+   * конфиги, только реплики людей), но строже в двух местах:
+   *   • единственный писавший обязан быть ИМЕННО этим человеком, а не просто
+   *     «кто-то один»; его сообщений нет вовсе (текущее не сохранилось) — «нет»;
+   *   • строка без tg_user_id считается чужой: автор неизвестен, а выдать
+   *     инструмент по ошибке нельзя.
+   * То же честное ограничение, что у isSoloChat: молчаливого читателя, который
+   * ни разу не написал, эта проверка не видит.
+   */
+  async onlySpeakerIs(cfg: TgBotConfigRow, tgUserId: number): Promise<boolean> {
+    if (!cfg.tg_chat_id) return false;
+    const r = await this.pg.query(
+      `SELECT count(*) FILTER (WHERE tg_user_id IS DISTINCT FROM $2) AS others,
+              count(*) FILTER (WHERE tg_user_id = $2)               AS mine
+         FROM tg_bot_messages
+        WHERE tg_chat_id = $1 AND role = 'user'`,
+      [cfg.tg_chat_id, tgUserId],
+    );
+    const others = Number(r.rows[0]?.others ?? 1);
+    const mine = Number(r.rows[0]?.mine ?? 0);
+    return others === 0 && mine >= 1;
   }
 
   /**
@@ -354,8 +384,16 @@ ${recent}
     attachmentPaths?: string[],
     onProgress?: (event: ClaudeCliProgressEvent) => void,
     sandboxDir?: string,
+    // productsOwnerId — чьи продукты может править этот ход. Задаёт ТОЛЬКО
+    // tg-bot.service, и только когда пишет сам владелец и в чате никто другой
+    // не писал (productsOwnerForTurn). Не задан — ход ровно прежний.
+    opts: { productsOwnerId?: string } = {},
   ): Promise<{ text: string; costUsd: number }> {
     const { systemPrompt } = await this.resolveSystemPrompt(cfg);
+    // Инструмент продуктов владельца (сайты и боты в Линкеоне): тот же
+    // /webhook/mcp/products, что у веба, по loopback; токен с каналом telegram —
+    // правка ляжет в product_turns с channel='telegram'.
+    const products = opts.productsOwnerId ? productsCliMcp(opts.productsOwnerId, 'telegram') : null;
     const history = await this.loadHistory(cfg.id);
     const ownerProfile = await this.loadOwnerProfile(cfg);
 
@@ -409,8 +447,12 @@ ${workspaceFiles.map(f => `  • ${f}`).join('\n')}
 ${ownerProfile}
 Пользуйся этим молча: не переспрашивай то, что здесь есть, и не зачитывай этот список вслух.` : '';
 
+    // Блок про продукты — рядом с остальными возможностями и только там, где
+    // инструмент реально выдан: обещать его без инструмента нельзя.
+    const productsBlock = products ? `\n\n${products.promptBlock}` : '';
+
     const systemWithCtx = `Ты в Telegram-группе. Владелец бота, который платит за твою работу: ${ownerFirstName}. Текущая дата/время: ${new Date().toISOString()}.
-${ioInstructions}${profileBlock}
+${ioInstructions}${productsBlock}${profileBlock}
 
 ${systemPrompt}`;
 
@@ -449,7 +491,10 @@ ${systemPrompt}`;
     // sandboxDir claude-cli.service сам изолирует вложения в одноразовый cwd).
     const needsRead = !!sandboxDir || !!attachmentPaths?.length;
     const tools = needsRead ? `Read,${WEB_TOOLS}` : WEB_TOOLS;
-    const allowedTools = WEB_TOOLS;
+    // Инструмент продуктов — только автоодобрением: `--tools` задаёт встроенный
+    // набор и MCP не режет (проба CLI 2.1.280), а без имени в allowedTools вызов
+    // в -p отклоняется.
+    const allowedTools = products ? `${WEB_TOOLS},${products.toolName}` : WEB_TOOLS;
 
     // Та же модель, что и в вебе. Веб уводит всех ассистентов кроме Маши на
     // relay r.linkeon.io; здесь путь локальный, и Sonnet стоял просто потому,
@@ -473,6 +518,9 @@ ${systemPrompt}`;
       cwd: sandboxDir,
       tools,
       allowedTools,
+      // Токен владельца — в файл конфига 0600 вне рабочей папки чата: Read этой
+      // папки до него не дотянется (claude-cli.service, writeMcpConfig).
+      ...(products ? { mcpServers: products.mcpServers } : {}),
     });
 
     return { text: text.trim() || '...', costUsd };

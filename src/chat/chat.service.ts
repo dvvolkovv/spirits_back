@@ -18,6 +18,7 @@ import { RESPONSE_STYLE_RULE } from './response-style';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
+import { productsCliMcp } from '../products/products-cli-tool';
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import axios from 'axios';
@@ -912,10 +913,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // читает язык последних строк как образец, и Роман снова начал отвечать
     // по-русски аккаунту с language=en, хотя директива на месте. Дублируем
     // короткую строку в самый конец: она короткая и кэш префикса не ломает.
-    const systemPrompt =
-      stableSystemPrompt +
-      volatileSystemPrompt +
+    const replyLanguageTail =
       `\n\n${LANGUAGE_REPLY_LINE[userLanguage] || LANGUAGE_REPLY_LINE[DEFAULT_LANGUAGE]}\n`;
+    const systemPrompt = stableSystemPrompt + volatileSystemPrompt + replyLanguageTail;
 
     // Build messages array
     const llmMessages: { role: 'user' | 'assistant'; content: string }[] = [];
@@ -965,7 +965,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
     // Маша-only путь (agent.id === 3): остальные агенты выше уже ушли в streamUniversalAgent.
     // Один вызов ClaudeCli (OAuth), потом post-processing для инжекта метафорической карты,
-    // потом single 'item' + 'end' событие. Без streaming, без CHAT_TOOLS — Маша их не звала.
+    // потом single 'item' + 'end' событие. Без streaming и без CHAT_TOOLS; из инструментов —
+    // только продукты пользователя (MCP, см. ниже).
     res.write(JSON.stringify({ type: 'begin' }) + '\n');
 
     let inputTokens = 0;
@@ -982,16 +983,39 @@ ${LanguageService.buildDirective(userLanguage)}`;
       .join('\n\n');
     const fullPrompt = priorTurns ? `${priorTurns}\n\nUSER: ${message}` : `USER: ${message}`;
 
+    // Инструмент продуктов пользователя — сайты и боты, размещённые в Линкеоне.
+    // Решение владельца (26.09.2026): у Маши в вебе он есть ВСЕГДА — пользователь
+    // веба владеет своими продуктами. Веб-ассистенты получают его через релей
+    // (productsRelayFields), Маша — локальным CLI: тот же /webhook/mcp/products
+    // по loopback, токен этого пользователя с каналом web — правки ложатся в
+    // product_turns с channel='web'. Токен уходит в файл конфига 0600, не в argv.
+    const products = productsCliMcp(userId, 'web');
+
     try {
       const r = await this.claudeCli.textWithCost(fullPrompt, {
-        system: systemPrompt,
+        // Блок про продукты — только в этом вызове, не в systemPrompt: тот же
+        // systemPrompt уходит в приветствие DeepSeek, которое инструмент позвать
+        // не может. Встаёт ДО волатильной части и хвоста языка: требование языка
+        // обязано остаться последней строкой (см. replyLanguageTail выше), а
+        // блок написан по-русски.
+        system: stableSystemPrompt + `\n\n${products.promptBlock}` + volatileSystemPrompt + replyLanguageTail,
         // Модель Маши — общая с остальным чатом, см. common/chat-model.ts
         // (там же цена решения: пин не даунгрейдится при исчерпании лимита, и
         // как откатиться через env без выката). Биллинг юзеру идёт от costUsd.
         // Пинг мониторинга уходит на haiku: проверяется живость пути, а не
         // качество ответа, и разница в цене хода — порядок.
         model: probe ? PROBE_MODEL : CHAT_MODEL,
-        timeoutMs: 90_000,
+        // Бюджет хода — общий с релеем. Правка ждёт исхода внутри вызова
+        // инструмента до PRODUCT_TOOL_WAIT_MS (2.5 мин) и может позвать его
+        // повторно; прежние 90 с убивали бы CLI посреди ожидания — правка уже
+        // поставлена и идёт, а Маша отвечает «временные проблемы со связью».
+        // Потолок ожидания выведен из этой же константы (relay-budget.ts),
+        // поэтому разъехаться они не могут.
+        timeoutMs: RELAY_TURN_BUDGET_MS,
+        mcpServers: products.mcpServers,
+        // Автоодобрение — ровно инструмент продуктов. Встроенные тулы у Маши
+        // по-прежнему выключены (tools не задан → `--tools ""`).
+        allowedTools: products.toolName,
       });
       rawText = r.text || '';
       // Курс общий со всеми путями, которые едят ёмкость подписки Claude —
