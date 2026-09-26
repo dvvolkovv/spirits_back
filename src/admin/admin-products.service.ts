@@ -78,6 +78,15 @@ export interface AdminProductRow {
   tokensInPeriod: number;
 }
 
+/** Ответ списка. */
+export interface AdminProductsList {
+  /** За какой период посчитаны счётчики — уже прижатый. */
+  periodDays: number;
+  /** Подходящих продуктов больше PRODUCTS_CAP: показаны первые по порядку, остальные — поиском и фильтрами. */
+  truncated: boolean;
+  products: AdminProductRow[];
+}
+
 export interface AdminProductDomain {
   domain: string;
   domainUnicode: string;
@@ -326,7 +335,7 @@ export class AdminProductsService {
    * (молчащие в конце), дальше новые выше; id — чтобы порядок не плясал между
    * обновлениями страницы.
    */
-  async list(opts: AdminProductsQuery = {}): Promise<{ periodDays: number; products: AdminProductRow[] }> {
+  async list(opts: AdminProductsQuery = {}): Promise<AdminProductsList> {
     const periodDays = AdminProductsService.periodDays(opts.periodDays);
     const params: any[] = [periodDays];
     const where = [testUsersFilterSql('p.user_id', opts.includeTest)];
@@ -353,16 +362,24 @@ export class AdminProductsService {
     // Порядок — дважды, и оба нужны. Внутренний решает, КАКИЕ строки попадут
     // в выдачу; внешний — в каком порядке они уйдут: соединение с подзапросом
     // порядок строк не гарантирует.
+    //
+    // На строку больше потолка: лишняя — признак того, что подходящих больше,
+    // чем показано. Отдельный count(*) по тем же условиям удвоил бы цену
+    // запроса ради числа, которое интерфейсу не нужно, — ему нужно «не всё».
     const inner = `${BASE_SQL}
       WHERE ${where.join(' AND ')}
       ORDER BY ${LAST_ACTIVITY} DESC NULLS LAST, p.created_at DESC, p.id DESC
-      LIMIT ${PRODUCTS_CAP}`;
+      LIMIT ${PRODUCTS_CAP + 1}`;
     const r = await this.pg.query(
       `${withPeriod(inner)}
         ORDER BY r.last_activity_at DESC NULLS LAST, r.created_at DESC, r.id DESC`,
       params,
     );
-    return { periodDays, products: r.rows.map((row: any) => AdminProductsService.toRow(row)) };
+    return {
+      periodDays,
+      truncated: r.rows.length > PRODUCTS_CAP,
+      products: r.rows.slice(0, PRODUCTS_CAP).map((row: any) => AdminProductsService.toRow(row)),
+    };
   }
 
   /**
@@ -375,7 +392,7 @@ export class AdminProductsService {
    * посчитано, а не тем, что просили.
    *
    * null — продукта нет; 404 из этого делает контроллер. id проверен им же
-   * (assertUuid): мусор в `p.id = $2` — это 22P02 и 500, а не «не найдено».
+   * (UUID_RE): мусор в `p.id = $2` — это 22P02 и 500, а не «не найдено».
    */
   async card(id: string, opts: { periodDays?: number } = {}): Promise<AdminProductCard | null> {
     const periodDays = AdminProductsService.periodDays(opts.periodDays);

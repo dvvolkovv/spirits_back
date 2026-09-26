@@ -380,7 +380,7 @@ cd ~/Downloads/spirits_back/tests && node runner.js  # api (32) + e2e (18) = 50
 - `POST /webhook/admin/coupons` — CRUD купонов `{action: list|create|update|delete}`
 - `GET /webhook/admin/referral/stats` — полная статистика рефералов (summary + leaders)
 - `POST /webhook/admin/referral` — управление рефералами `{action: create|toggle|mark_paid|mark_all_paid}`
-- `GET /webhook/admin/products?q=&status=&kind=&periodDays=&includeTest=&includeArchived=` — «Сайты и боты»: продукты всех пользователей с владельцем, машиной, своим доменом и счётчиками ходов/токенов за период; архивные и тестовые — только по флагам (`AdminProductsService`)
+- `GET /webhook/admin/products?q=&status=&kind=&periodDays=&includeTest=&includeArchived=` — «Сайты и боты»: продукты всех пользователей с владельцем, машиной, своим доменом и счётчиками ходов/токенов за период; архивные и тестовые — только по флагам; не больше 500 строк, `truncated: true` — подходящих больше (`AdminProductsService`)
 - `GET /webhook/admin/products/:id?periodDays=` — карточка продукта (архивного и тестового тоже): `periodDays` (прижатый, как у списка), строка продукта за этот период, свой домен, последние 50 ходов (тексты обрезаны до 2000 знаков), 20 заданий. Гашение и снятие — прежние `POST /webhook/products/block|unblock {key}`
 
 ### Мониторинг Telegram-бота

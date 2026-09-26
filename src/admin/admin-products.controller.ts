@@ -1,11 +1,17 @@
 import { Controller, Get, NotFoundException, Param, Query, UseGuards } from '@nestjs/common';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
-import { assertUuid } from '../products/products.dto';
+import { UUID_RE } from '../products/products.dto';
 import { AdminProductsService } from './admin-products.service';
 
 /** Флаг из query-строки. Всё, кроме явного «да», считаем выключенным. */
 const isTruthy = (v: string | undefined): boolean => v === '1' || v === 'true';
+
+/**
+ * Одна формулировка на «не uuid» и «нет такого»: разница между ними —
+ * подсказка о том, какие id существуют (тот же довод, что у assertUuid).
+ */
+const NOT_FOUND = 'Продукт не найден';
 
 /** Число из query-строки; мусор — NaN, его сервис заменяет умолчанием. */
 const toInt = (v: string | undefined): number | undefined => (v ? parseInt(v, 10) : undefined);
@@ -54,14 +60,15 @@ export class AdminProductsController {
    * тоже открываются. Период необязателен и нужен, чтобы счётчики карточки
    * совпадали со строкой списка, из которой в неё пришли.
    *
-   * Не-uuid и неизвестный id — одинаковая 404 (assertUuid): разница между ними
-   * — подсказка о том, какие id существуют.
+   * Не-uuid и неизвестный id — одинаковая 404 (NOT_FOUND). Форма id — тем же
+   * UUID_RE, что у assertUuid, но без него самого: тот отвечает по-английски,
+   * а раздел — по-русски, и обе ветки обязаны совпадать дословно.
    */
   @Get('admin/products/:id')
   async productCard(@Param('id') id: string, @Query('periodDays') periodDays: string | undefined) {
-    assertUuid(id, 'Product');
+    if (!UUID_RE.test(id)) throw new NotFoundException(NOT_FOUND);
     const card = await this.products.card(id, { periodDays: toInt(periodDays) });
-    if (!card) throw new NotFoundException('Product not found');
+    if (!card) throw new NotFoundException(NOT_FOUND);
     return card;
   }
 }
