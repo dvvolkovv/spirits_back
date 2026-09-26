@@ -582,7 +582,7 @@ maybe('админка «Сайты и боты»: сервис против жи
       expect(ids(await svc().list({}))).toEqual([turnNow, seenHour, turnDay, newSilent, oldSilent]);
     });
 
-    it(`выдача обрезана на ${PRODUCTS_CAP} строк — по тому же порядку`, async () => {
+    it(`выдача обрезана на ${PRODUCTS_CAP} строк — отбираются первые по тому же порядку`, async () => {
       await pool.query(
         `INSERT INTO products (user_id, name, slug, kind, status, checkout_path, runner_token_hash, created_at)
          SELECT $1, 'bulk ' || g, 'bulk' || g, 'bot', 'running', '/srv/bulk' || g, 'hash-bulk' || g,
@@ -592,10 +592,12 @@ maybe('админка «Сайты и боты»: сервис против жи
       );
       // Самый старый, но единственный живой — обязан попасть в выдачу первым.
       const active = await mkProduct({ slug: 'active', created: '100 days', seen: '1 minute' });
+      // Молчащий, но самый новый — вторым: за край отсекаются старые молчащие.
+      const fresh = await mkProduct({ slug: 'fresh', kind: 'bot', created: '1 minute' });
 
       const res = await svc().list({});
       expect(res.products).toHaveLength(PRODUCTS_CAP);
-      expect(res.products[0].id).toBe(active);
+      expect(res.products.slice(0, 2).map((r) => r.id)).toEqual([active, fresh]);
     });
   });
 
@@ -660,10 +662,16 @@ maybe('админка «Сайты и боты»: сервис против жи
 
     it('без своего домена — domain: null, без ходов и заданий — пустые списки', async () => {
       const id = await mkProduct({ slug: 'bare' });
+      // У соседа домен есть: карточка обязана не подхватить чужую строку.
+      const neighbour = await mkProduct({ slug: 'neighbour' });
+      await mkDomain(neighbour, 'neighbour.ru', 'active');
+
       const card = await svc().card(id);
       expect(card.domain).toBeNull();
+      expect(card.product.customDomain).toBeNull();
       expect(card.turns).toEqual([]);
       expect(card.jobs).toEqual([]);
+      expect((await svc().card(neighbour)).domain).toMatchObject({ domain: 'neighbour.ru', status: 'active' });
     });
 
     it(`тексты хода обрезаны до ${TEXT_CAP} знаков с многоточием, короткие — как есть`, async () => {
