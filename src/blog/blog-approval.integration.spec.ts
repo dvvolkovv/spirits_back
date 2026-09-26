@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import axios from 'axios';
 import { Client, Pool } from 'pg';
 import { BlogApprovalService } from './blog-approval.service';
 import { BlogPublisherService } from './blog-publisher.service';
@@ -9,6 +10,10 @@ import { BlogCron } from './blog.cron';
 import { upcomingSlots } from './blog-slots';
 import { SLOT_INDEX } from './blog-slot-claim';
 import { MAX_NOTE_PROMPTS, rowToPost } from './blog.types';
+
+// Картинку к посту паблишер качает сам (blog-image.fetch.ts). Здесь сеть не
+// нужна: блоки ниже, которым публикация должна удаться, отдают байты отсюда.
+jest.mock('axios');
 
 /**
  * «✍️ Замечание» → приглашение → ответ владельца — против живого Postgres.
@@ -48,11 +53,13 @@ import { MAX_NOTE_PROMPTS, rowToPost } from './blog.types';
  *
  * Без BLOG_PG_URL файл пропускается целиком (skipped), а не зеленеет.
  *
- * Там же, ниже, — «один пост на слот» и очередь черновиков: частичный
- * уникальный индекс, ретрай одобрения на 23505 и условие охраны очереди
- * заглушка не воспроизведёт, они проверяются только здесь. Все блоки — в
- * одном файле намеренно: jest гоняет файлы параллельно, и второй файл на той
- * же базе стирал бы TRUNCATE-ом строки этого посреди теста.
+ * Там же, ниже, — «один пост на слот», очередь черновиков и сдвиг очереди
+ * публикаций («очередь без дыр»): частичный уникальный индекс, ретрай
+ * одобрения на 23505, условие охраны очереди, порядок записей сдвига и
+ * блокировки строк заглушка не воспроизведёт, они проверяются только здесь.
+ * Все блоки — в одном файле намеренно: jest гоняет файлы параллельно, и
+ * второй файл на той же базе стирал бы TRUNCATE-ом строки этого посреди
+ * теста.
  */
 
 const PG = process.env.BLOG_PG_URL;
@@ -304,28 +311,66 @@ const SCHEDULE = { channelChatId: '-100', slotDays: [1, 3, 5], slotHourMsk: 10, 
 const iso = (v: any): string | null => (v ? new Date(v).toISOString() : null);
 
 /**
- * pg для сервисов: настоящий пул плюс `hold(pattern, n)` — первые n запросов
- * по образцу ждут друг друга и уходят в базу вместе. Окно гонки открывается
- * явно, а не по воле планировщика.
+ * pg для сервисов: настоящий пул плюс два способа открыть окно гонки явно, а
+ * не по воле планировщика:
+ *
+ *  - `hold(pattern, n)` — первые n запросов по образцу ждут друг друга и уходят
+ *    в базу вместе;
+ *  - `pause(pattern)` — первый запрос по образцу встаёт и ждёт `release()`;
+ *    `reached` сообщает, что он пришёл.
+ *
+ * `getClient()` — выделенное соединение под транзакцию, как у PgService; его
+ * запросы проходят те же ворота.
  */
 function gatedPg(pool: Pool) {
   let gate: { pattern: RegExp; n: number; parked: Array<() => void> } | null = null;
+  const pauses: Array<{ pattern: RegExp; reached: () => void; go: Promise<void> }> = [];
+
+  const pass = async (sql: string) => {
+    const s = String(sql).replace(/\s+/g, ' ').trim();
+    const g = gate;
+    if (g && g.pattern.test(s)) {
+      await new Promise<void>((resolve) => {
+        g.parked.push(resolve);
+        if (g.parked.length >= g.n) {
+          gate = null;
+          g.parked.forEach((go) => go());
+        }
+      });
+    }
+    const i = pauses.findIndex((p) => p.pattern.test(s));
+    if (i >= 0) {
+      const [p] = pauses.splice(i, 1);
+      p.reached();
+      await p.go;
+    }
+  };
+
   return {
     hold(pattern: RegExp, n: number) {
       gate = { pattern, n, parked: [] };
     },
+    pause(pattern: RegExp): { reached: Promise<void>; release: () => void } {
+      let reached!: () => void;
+      let release!: () => void;
+      const arrived = new Promise<void>((resolve) => { reached = resolve; });
+      const go = new Promise<void>((resolve) => { release = resolve; });
+      pauses.push({ pattern, reached, go });
+      return { reached: arrived, release };
+    },
     async query(sql: string, params?: any[]) {
-      const g = gate;
-      if (g && g.pattern.test(String(sql).replace(/\s+/g, ' ').trim())) {
-        await new Promise<void>((resolve) => {
-          g.parked.push(resolve);
-          if (g.parked.length >= g.n) {
-            gate = null;
-            g.parked.forEach((go) => go());
-          }
-        });
-      }
+      await pass(sql);
       return pool.query(sql, params);
+    },
+    async getClient() {
+      const client = await pool.connect();
+      return {
+        query: async (sql: string, params?: any[]) => {
+          await pass(sql);
+          return client.query(sql, params);
+        },
+        release: (err?: any) => client.release(err),
+      };
     },
   };
 }
@@ -396,7 +441,10 @@ maybe('Один пост на слот против живого Postgres', () =
     const pg = gatedPg(pool);
     const tg = fakeTg();
     const bot = new BlogApprovalService(pg as any, tg as any, settings);
-    const admin = new BlogController(pg as any, { addTopic: jest.fn() } as any, settings, { render: jest.fn() } as any);
+    const publisher = new BlogPublisherService(pg as any, tg as any, settings);
+    const admin = new BlogController(
+      pg as any, { addTopic: jest.fn() } as any, settings, { render: jest.fn() } as any, publisher, bot,
+    );
     const press = (id: string) => bot.handleCallback({
       id: `cb-${id}`, data: `blog:ok:${id}`, from: { id: CHAT }, message: { chat: { id: CHAT }, message_id: DRAFT },
     });
@@ -653,6 +701,372 @@ maybe('Очередь черновиков против живого Postgres', 
   it('брошенный черновик (отметка старше порога) не держит очередь — его берут заново', async () => {
     const abandoned = await insert('drafting', 'case', STALE_DRAFTING_MINUTES + 1);
     expect(await tick()).toEqual([abandoned]);
+  });
+});
+
+/**
+ * Очередь без дыр — против живого Postgres.
+ *
+ * Одобренный пост ушёл из очереди раньше своего слота (опубликован сейчас,
+ * отправлен в мусор или на переработку) — каждый следующий одобренный встаёт
+ * на слот предыдущего. Здесь то, чего заглушка в blog-queue.spec.ts не
+ * воспроизведёт в принципе:
+ *
+ *  - порядок записей против настоящего неотложенного уникального индекса:
+ *    каждый шаг целится в только что освободившийся слот, и 23505 нет;
+ *  - блокировки строк: два ухода одновременно, уход и одобрение
+ *    одновременно, publish_now и тик публикации одновременно;
+ *  - пути, которые могли бы увести одобренный пост мимо очереди, закрыты
+ *    условиями в самих запросах.
+ */
+maybe('Очередь без дыр против живого Postgres', () => {
+  jest.setTimeout(60_000);
+
+  let pool: Pool;
+  const settings = { get: async () => ({ ...SCHEDULE }), update: jest.fn() } as any;
+  const OLD = { enabled: process.env.BLOG_ENABLED, approver: process.env.BLOG_APPROVER_TG_ID };
+  let ours = false;   // гард пропустил базу — только тогда её можно чистить
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: PG, max: 8 });
+    await prepareDisposableDb(pool);
+    ours = true;
+    process.env.BLOG_ENABLED = 'true';
+    process.env.BLOG_APPROVER_TG_ID = String(CHAT);
+  });
+
+  afterAll(async () => {
+    restoreEnv('BLOG_ENABLED', OLD.enabled);
+    restoreEnv('BLOG_APPROVER_TG_ID', OLD.approver);
+    if (ours) await pool.query('TRUNCATE blog_post');
+    await pool?.end();
+  });
+
+  beforeEach(async () => {
+    if (!ours) throw new Error('база не прошла гард — не трогаю');
+    await pool.query('TRUNCATE blog_post');
+    (axios.get as jest.Mock).mockResolvedValue({ data: Buffer.from('png-bytes') });
+  });
+
+  const insert = async (
+    status: string,
+    over: { title?: string; slotAt?: any; rubric?: string; createdDaysAgo?: number; imageUrl?: string | null } = {},
+  ): Promise<string> => {
+    const r = await pool.query(
+      `INSERT INTO blog_post (rubric, source, topic_key, title, body, status, slot_at, image_url,
+                              review_chat_id, review_message_id, created_at)
+       VALUES ($1, 'manual', 'k', $2, 'Текст', $3, $4, $5, $6, $7, now() - make_interval(days => $8::int))
+       RETURNING id`,
+      [
+        over.rubric ?? 'case', over.title ?? 'Пост', status, over.slotAt ?? null,
+        over.imageUrl === undefined ? 'https://minio/i.png' : over.imageUrl, CHAT, DRAFT, over.createdDaysAgo ?? 0,
+      ],
+    );
+    return r.rows[0].id;
+  };
+
+  const load = async (id: string) => (await pool.query('SELECT * FROM blog_post WHERE id = $1', [id])).rows[0];
+  const slotOf = async (id: string) => iso((await load(id)).slot_at);
+
+  /** Ближайшие n слотов расписания от «сейчас». */
+  const next = (n: number) => upcomingSlots(new Date(), SCHEDULE.slotDays, SCHEDULE.slotHourMsk, n).map((d) => d.toISOString());
+
+  /** Сколько запросов этой базы прямо сейчас ждут чужую блокировку. */
+  const lockWaits = async (): Promise<number> => (await pool.query(
+    `SELECT count(*)::int AS n FROM pg_stat_activity
+      WHERE datname = current_database() AND wait_event_type = 'Lock'`,
+  )).rows[0].n;
+
+  const waitUntil = async (cond: () => Promise<boolean>, ms = 5000): Promise<void> => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (await cond()) return;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  };
+
+  const make = () => {
+    const pg = gatedPg(pool);
+    const tg = fakeTg();
+    tg.sendPhoto.mockImplementation(async (chatId: number) => ({ message_id: 42, chat: { id: chatId, username: 'linkeon_blog' } }));
+    const bot = new BlogApprovalService(pg as any, tg as any, settings);
+    const publisher = new BlogPublisherService(pg as any, tg as any, settings);
+    const admin = new BlogController(
+      pg as any, { addTopic: jest.fn() } as any, settings, { render: jest.fn() } as any, publisher, bot,
+    );
+    const cron = new BlogCron(pg as any, {} as any, {} as any, {} as any, publisher, bot, settings, {} as any);
+    const press = (action: string, id: string) => bot.handleCallback({
+      id: `cb-${action}-${id}`, data: `blog:${action}:${id}`, from: { id: CHAT }, message: { chat: { id: CHAT }, message_id: DRAFT },
+    });
+    return { pg, tg, bot, publisher, admin, cron, press };
+  };
+
+  // --- само правило ---
+
+  /**
+   * Четыре поста: каждый шаг сдвига целится в слот, который только что
+   * освободил предыдущий. Пиши записи в обратном порядке — первая же
+   * упёрлась бы в индекс (23505), потому что соседний пост ещё держит слот.
+   */
+  it('каждый следующий встаёт на слот предыдущего — индекс не спотыкается', async () => {
+    const { admin } = make();
+    const [s0, s1, s2, s3] = next(4);
+    const kira = await insert('approved', { slotAt: s0, title: 'Кира' });
+    const products = await insert('approved', { slotAt: s1, title: 'Продукты' });
+    const kase = await insert('approved', { slotAt: s2, title: 'Кейс' });
+    const news = await insert('approved', { slotAt: s3, title: 'Новость' });
+
+    expect((await adminCall(admin, { action: 'reject', id: kira })).status).toBe(200);
+
+    expect([await slotOf(products), await slotOf(kase), await slotOf(news)]).toEqual([s0, s1, s2]);
+  });
+
+  it('слот уже наступил — никто не сдвигается', async () => {
+    const { admin } = make();
+    const [s0] = next(1);
+    const late = await insert('approved', { slotAt: new Date(Date.now() - 60_000).toISOString() });
+    const products = await insert('approved', { slotAt: s0 });
+
+    expect((await adminCall(admin, { action: 'reject', id: late })).status).toBe(200);
+
+    expect(await slotOf(products)).toBe(s0);
+  });
+
+  it('пост в publishing не трогается', async () => {
+    const { admin } = make();
+    const [s0, s1, s2] = next(3);
+    const kira = await insert('approved', { slotAt: s0 });
+    const going = await insert('publishing', { slotAt: s1 });
+    const products = await insert('approved', { slotAt: s2 });
+
+    expect((await adminCall(admin, { action: 'reject', id: kira })).status).toBe(200);
+
+    expect(await slotOf(products)).toBe(s0);
+    expect(await slotOf(going)).toBe(s1);
+    expect((await load(going)).status).toBe('publishing');
+  });
+
+  // --- каждый путь ухода ---
+
+  type World = ReturnType<typeof make>;
+  it.each<[string, (w: World, id: string) => Promise<void>]>([
+    ['админка: publish_now', async (w, id) => {
+      expect((await adminCall(w.admin, { action: 'publish_now', id })).status).toBe(200);
+    }],
+    ['админка: reject', async (w, id) => {
+      expect((await adminCall(w.admin, { action: 'reject', id })).status).toBe(200);
+    }],
+    ['админка: redraft', async (w, id) => {
+      expect((await adminCall(w.admin, { action: 'redraft', id })).status).toBe(200);
+    }],
+    ['личка: «В мусор»', async (w, id) => { await w.press('no', id); }],
+    ['личка: «Переписать»', async (w, id) => { await w.press('redo', id); }],
+    ['крон: dropStaleNews', async (w) => { await w.cron.dropStaleNews(); }],
+    ['поздний второй черновик (sendForReview)', async (w, id) => {
+      await w.bot.sendForReview({ ...rowToPost(await load(id)), status: 'drafting' }, CHAT);
+    }],
+  ])('%s — Продукты встают на слот Киры, владелец узнаёт', async (_path, act) => {
+    const w = make();
+    const [s0, s1] = next(2);
+    // Кира — ещё и протухшая новость: так один и тот же набор годится крону.
+    const kira = await insert('approved', { slotAt: s0, title: 'Кира', rubric: 'news', createdDaysAgo: 30 });
+    const products = await insert('approved', { slotAt: s1, title: 'Продукты' });
+
+    await act(w, kira);
+
+    expect((await load(kira)).status).not.toBe('approved');
+    expect(await slotOf(products)).toBe(s0);
+    const notes = w.tg.sent.filter((m) => /Очередь сдвинулась/.test(m.text));
+    expect(notes).toHaveLength(1);
+    expect(notes[0].text).toContain('«Продукты» — теперь');
+  });
+
+  it('ручной перенос очередь НЕ сдвигает', async () => {
+    const { admin } = make();
+    const [s0, s1, s2] = next(3);
+    const kira = await insert('approved', { slotAt: s0 });
+    const products = await insert('approved', { slotAt: s1 });
+
+    expect((await adminCall(admin, { action: 'reschedule', id: kira, slotAt: s2 })).status).toBe(200);
+
+    expect(await slotOf(kira)).toBe(s2);
+    expect(await slotOf(products)).toBe(s1);
+  });
+
+  // --- publish_now ---
+
+  it('publish_now: Telegram не принял — approved с last_error, очередь сдвинута, ближайший тик публикует', async () => {
+    const w = make();
+    const [s0, s1] = next(2);
+    const kira = await insert('approved', { slotAt: s0, title: 'Кира' });
+    const products = await insert('approved', { slotAt: s1, title: 'Продукты' });
+    w.tg.sendPhoto.mockRejectedValueOnce(new Error('ETIMEDOUT'));
+
+    const r = await adminCall(w.admin, { action: 'publish_now', id: kira });
+
+    expect(r.status).toBe(200);
+    expect(r.body.post).toMatchObject({ id: kira, status: 'approved' });
+    expect(r.body.post.lastError).toContain('ETIMEDOUT');
+    expect(r.body.shifted).toEqual([{ id: products, title: 'Продукты', from: s1, to: s0 }]);
+    expect(await slotOf(products)).toBe(s0);
+
+    await w.cron.publishDue();
+
+    expect((await load(kira)).status).toBe('published');
+    expect((await load(products)).status).toBe('approved');
+  });
+
+  it('publish_now поста на проверке: одобрен и вышел, очередь не тронута', async () => {
+    const w = make();
+    const [s0] = next(1);
+    const draft = await insert('pending_review', { title: 'Черновик' });
+    const products = await insert('approved', { slotAt: s0 });
+
+    const r = await adminCall(w.admin, { action: 'publish_now', id: draft });
+
+    expect(r.status).toBe(200);
+    expect(r.body.post).toMatchObject({ id: draft, status: 'published', tgUrl: 'https://t.me/linkeon_blog/42' });
+    expect(r.body.shifted).toEqual([]);
+    expect(await slotOf(products)).toBe(s0);
+  });
+
+  it('publish_now с мусорным id — 400, а не 500', async () => {
+    const { admin } = make();
+    const r = await adminCall(admin, { action: 'publish_now', id: 'не-uuid' });
+    expect(r).toMatchObject({ status: 400, body: { error: 'bad_request' } });
+  });
+
+  // --- мимо очереди из approved не уйти ---
+
+  it('паблишер не берёт пост, чей слот ещё не наступил', async () => {
+    const w = make();
+    const [s0] = next(1);
+    const kira = await insert('approved', { slotAt: s0 });
+
+    const result = await w.publisher.publish(rowToPost(await load(kira)));
+
+    expect(result.ok).toBe(false);
+    expect((await load(kira)).status).toBe('approved');
+    expect(w.tg.sendPhoto).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Выборка `takeNextIdea` и захват не атомарны: пока между ними проходили
+   * миллисекунды, пост могли одобрить. Захват не должен увести одобренный пост
+   * в работу — владелец его уже одобрил, а слот освободился бы мимо очереди.
+   */
+  it('захват черновика не уводит одобренный пост, даже если выборка видела его черновиком', async () => {
+    const w = make();
+    const [s0, s1] = next(2);
+    const kira = await insert('approved', { slotAt: s0 });
+    const products = await insert('approved', { slotAt: s1 });
+    const seen = { ...rowToPost(await load(kira)), status: 'drafting' as const };
+    const editor = { draft: jest.fn() };
+    const cron = new BlogCron(
+      w.pg as any, { takeNextIdea: jest.fn(async () => seen) } as any, editor as any, { render: jest.fn() } as any,
+      w.publisher, w.bot, settings, {} as any,
+    );
+
+    await cron.prepareDrafts();
+
+    expect((await load(kira)).status).toBe('approved');
+    expect(editor.draft).not.toHaveBeenCalled();
+    expect(await slotOf(products)).toBe(s1);
+  });
+
+  it('замечание не уводит пост, одобренный между чтением и записью', async () => {
+    const w = make();
+    const [s0] = next(1);
+    const kira = await insert('pending_review', { title: 'Кира' });
+    const write = w.pg.pause(/^UPDATE blog_post SET editor_notes = /);
+
+    const replying = w.bot.handleReplyEdit({
+      chat: { id: CHAT, type: 'private' }, message_id: 9000, text: 'короче', reply_to_message: { message_id: DRAFT },
+    });
+    await write.reached;
+    await pool.query(`UPDATE blog_post SET status = 'approved', slot_at = $2 WHERE id = $1`, [kira, s0]);
+    write.release();
+
+    expect(await replying).toBe(true);
+    const row = await load(kira);
+    expect(row.status).toBe('approved');
+    expect(row.editor_notes).toEqual([]);
+    expect(w.tg.sent[w.tg.sent.length - 1].text).toMatch(/одобрен/);
+  });
+
+  // --- гонки ---
+
+  /**
+   * Два ухода сразу: оба заняли свой пост и дошли до сдвига. Первый упрётся в
+   * блокировку второго ушедшего поста и дождётся его коммита — и увидит
+   * очередь уже сдвинутой вторым.
+   */
+  it('два ухода одновременно — очередь сходится без дыр, без 23505 и без взаимоблокировки', async () => {
+    const { pg, admin } = make();
+    const [s0, s1, s2, s3] = next(4);
+    const a = await insert('approved', { slotAt: s0, title: 'А' });
+    const b = await insert('approved', { slotAt: s1, title: 'Б' });
+    const c = await insert('approved', { slotAt: s2, title: 'В' });
+    const d = await insert('approved', { slotAt: s3, title: 'Г' });
+    pg.hold(/^SELECT id, title, slot_at FROM blog_post WHERE status = 'approved' AND slot_at > /, 2);
+
+    const results = await Promise.all([
+      adminCall(admin, { action: 'reject', id: a }),
+      adminCall(admin, { action: 'reject', id: c }),
+    ]);
+
+    expect(results.map((x) => x.status)).toEqual([200, 200]);
+    expect([await slotOf(b), await slotOf(d)]).toEqual([s0, s1]);
+  });
+
+  /**
+   * Одобрение прочло очередь, пока сдвиг не закоммичен, — и выбрало бы слот
+   * за хвостом очереди, оставив после сдвига дыру. Одобрение берёт очередь под
+   * блокировку (FOR UPDATE), упирается в пост, который сдвиг уже держит, и
+   * дожидается его коммита — а тогда видит очередь уже сдвинутой.
+   */
+  it('уход и одобрение одновременно — одобренный встаёт в освободившуюся очередь, дыры нет', async () => {
+    const { pg, admin, press } = make();
+    const [s0, s1] = next(2);
+    const kira = await insert('approved', { slotAt: s0, title: 'Кира' });
+    const products = await insert('approved', { slotAt: s1, title: 'Продукты' });
+    const fresh = await insert('pending_review', { title: 'Свежий' });
+
+    // Сдвиг занял очередь и стоит перед первой записью.
+    const shift = pg.pause(/^UPDATE blog_post SET slot_at = \$2, updated_at = now\(\) WHERE id = \$1$/);
+    const leaving = adminCall(admin, { action: 'reject', id: kira });
+    await shift.reached;
+
+    let approved = false;
+    const approving = press('ok', fresh).then(() => { approved = true; });
+    await waitUntil(async () => approved || (await lockWaits()) > 0);
+    shift.release();
+    await Promise.all([leaving, approving]);
+
+    expect(await slotOf(products)).toBe(s0);
+    expect(await slotOf(fresh)).toBe(s1);
+  });
+
+  it('publish_now и тик публикации одновременно — в канал пост уходит один раз', async () => {
+    const w = make();
+    const [s0, s1] = next(2);
+    const kira = await insert('approved', { slotAt: s0, title: 'Кира' });
+    const products = await insert('approved', { slotAt: s1, title: 'Продукты' });
+
+    // publish_now освободил слот и сдвинул очередь, но встал перед захватом —
+    // тик крона видит пост со слотом «сейчас» и забирает его первым.
+    const claim = w.pg.pause(/^UPDATE blog_post SET status = 'publishing'/);
+    const now = adminCall(w.admin, { action: 'publish_now', id: kira });
+    await claim.reached;
+    await w.cron.publishDue();
+    claim.release();
+    const r = await now;
+
+    expect(r.status).toBe(200);
+    expect(r.body.post.status).toBe('published');
+    expect(w.tg.sendPhoto).toHaveBeenCalledTimes(1);
+    expect(await slotOf(products)).toBe(s0);
+    expect((await load(products)).status).toBe('approved');
   });
 });
 

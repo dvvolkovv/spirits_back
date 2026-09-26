@@ -7,12 +7,13 @@ import {
 import { BlogEditorService } from './blog-editor.service';
 import { BlogImageService } from './blog-image.service';
 import { BlogPublisherService, MAX_PUBLISH_ATTEMPTS } from './blog-publisher.service';
-import { BlogApprovalService } from './blog-approval.service';
+import { BlogApprovalService, approverChatId } from './blog-approval.service';
 import { BlogSettingsService } from './blog-settings.service';
 import { BlogNewsService } from './blog-news.service';
 import { ALLOWED_TRANSITIONS, BlogStatus, canTransition, rowToPost } from './blog.types';
 import { NoFreeSlotError, nextFreeSlotAfter, STALE_NEWS_DAYS } from './blog-slots';
-import { slotHolders } from './blog-slot-claim';
+import { SLOT_HOLDING_STATUSES, slotHolders } from './blog-slot-claim';
+import { QueueShift, leaveQueue, mergeShifts } from './blog-queue';
 
 /** Напоминание уходит, когда до слота осталось меньше этого. */
 const REMIND_WINDOW_MINUTES = 60;
@@ -36,6 +37,15 @@ export const STUCK_PUBLISHING_MINUTES = 10;
  */
 function sourcesFor(target: BlogStatus): BlogStatus[] {
   return (Object.keys(ALLOWED_TRANSITIONS) as BlogStatus[]).filter((from) => canTransition(from, target));
+}
+
+/**
+ * Статусы без слота. Пост, который держит слот, уходит из очереди только
+ * через leaveQueue — иначе следующие не встанут на его место. Общие запросы
+ * крона такой пост не трогают вовсе.
+ */
+function withoutSlot(statuses: BlogStatus[]): BlogStatus[] {
+  return statuses.filter((s) => !SLOT_HOLDING_STATUSES.includes(s));
 }
 
 @Injectable()
@@ -62,8 +72,7 @@ export class BlogCron {
   }
 
   private approverChatId(): number | null {
-    const raw = process.env.BLOG_APPROVER_TG_ID;
-    return raw ? Number(raw) : null;
+    return approverChatId();
   }
 
   /**
@@ -192,6 +201,12 @@ export class BlogCron {
     // cluster_mode, и первый же `pm2 scale linkeon-api 2` развёл бы тики по
     // процессам, ничего не сообщив; крон вдобавок иногда дёргают отдельным
     // процессом руками.
+    //
+    // Посты со слотом захват не берёт (`withoutSlot`). Машина состояний
+    // пускает approved → drafting — это «Переписать», — но захват идёт по
+    // выборке, прочитанной раньше: пост, который она видела черновиком, к
+    // этой записи мог стать одобренным. Увести его в работу значило бы
+    // отменить решение владельца и освободить слот мимо сдвига очереди.
     const claim = await this.pg.query(
       `UPDATE blog_post
           SET status = 'drafting', drafting_started_at = now(), updated_at = now()
@@ -200,7 +215,7 @@ export class BlogCron {
           AND (drafting_started_at IS NULL
                OR drafting_started_at < now() - ($3 || ' minutes')::interval)
         RETURNING id`,
-      [idea.id, sourcesFor('drafting'), STALE_DRAFTING_MINUTES],
+      [idea.id, withoutSlot(sourcesFor('drafting')), STALE_DRAFTING_MINUTES],
     );
     // Пусто — пост забрал другой тик. Это штатная гонка, а не сбой: ни ошибки
     // в лог, ни сообщения владельцу, иначе каждый второй тик писал бы панику.
@@ -296,10 +311,19 @@ export class BlogCron {
     }
   }
 
-  /** Раз в сутки: протухшие новости в мусор. */
+  /**
+   * Раз в сутки: протухшие новости в мусор.
+   *
+   * Посты без слота — одним общим запросом. Одобренная новость держит слот:
+   * она уходит по одной через leaveQueue, и следующие встают на её слот —
+   * так же, как при «В мусор» из лички. Порядок — с поздних слотов: так
+   * выброшенная новость не успевает сама переехать раньше, чем дойдёт её
+   * очередь. Владельцу — одна сводка, где посты оказались в итоге.
+   */
   @Cron('0 4 * * *')
   async dropStaleNews(): Promise<void> {
     if (!this.enabled()) return;
+    const sources = sourcesFor('rejected');
     const r = await this.pg.query(
       `UPDATE blog_post
           SET status = 'rejected', last_error = 'протухла',
@@ -308,9 +332,39 @@ export class BlogCron {
           AND status = ANY($1::text[])
           AND created_at < now() - ($2 || ' days')::interval
         RETURNING id`,
-      [sourcesFor('rejected'), STALE_NEWS_DAYS],
+      [withoutSlot(sources), STALE_NEWS_DAYS],
     );
-    if (r.rows.length) this.logger.log(`выброшено протухших новостей: ${r.rows.length}`);
+    const dropped: string[] = r.rows.map((x: any) => x.id);
+
+    const held = await this.pg.query(
+      `SELECT id FROM blog_post
+        WHERE rubric = 'news'
+          AND status = ANY($1::text[])
+          AND created_at < now() - ($2 || ' days')::interval
+        ORDER BY slot_at DESC NULLS LAST`,
+      [sources.filter((s) => SLOT_HOLDING_STATUSES.includes(s)), STALE_NEWS_DAYS],
+    );
+    const shifts: QueueShift[][] = [];
+    for (const { id } of held.rows) {
+      const out = await leaveQueue(this.pg, id, async (tx, post) => {
+        if (post.rubric !== 'news' || !canTransition(post.status, 'rejected')) return false;
+        const w = await tx.query(
+          `UPDATE blog_post
+              SET status = 'rejected', last_error = 'протухла',
+                  editor_notes = '{}'::text[], updated_at = now()
+            WHERE id = $1 AND status = $2`,
+          [post.id, post.status],
+        );
+        return w.rowCount !== 0;
+      });
+      if (!out.applied) continue;
+      dropped.push(id);
+      shifts.push(out.shifted);
+    }
+
+    if (dropped.length) this.logger.log(`выброшено протухших новостей: ${dropped.length}`);
+    const merged = mergeShifts(shifts, dropped);
+    if (merged.length) await this.approval.notifyQueueShift(merged);
   }
 
   /**

@@ -22,6 +22,19 @@ const draft = (over: any = {}) => ({
 });
 
 /**
+ * Соединение под транзакцию, как у PgService.getClient(): уход из очереди и
+ * одобрение идут транзакцией. Запросы соединения попадают в тот же
+ * `pg.query`, так что журнал вызовов один на всё.
+ */
+const withTx = <T extends { query: jest.Mock }>(pg: T) => Object.assign(pg, {
+  getClient: jest.fn(async () => ({ query: (sql: string, params?: any[]) => pg.query(sql, params), release: jest.fn() })),
+});
+
+/** Записи в том порядке, в каком ушли в базу, — ищем по содержанию, а не по номеру вызова. */
+const updates = (pg: { query: jest.Mock }): any[][] =>
+  pg.query.mock.calls.filter((c: any[]) => /^\s*UPDATE blog_post/.test(String(c[0])));
+
+/**
  * Telegram не скачивает картинку по нашей ссылке: my.linkeon.io за РФ-edge
  * Selectel, фетчер Telegram до него не доходит и отвечает 400 «failed to get
  * HTTP URL content». Проверено на проде: тот же файл мультипартом принимается.
@@ -32,8 +45,13 @@ describe('BlogApprovalService.sendForReview', () => {
     (axios.get as jest.Mock).mockResolvedValue({ data: Buffer.from('png-bytes') });
   });
 
+  /** Запись идёт через leaveQueue: пост под блокировкой — тот, что пишется сейчас. */
+  const reviewPg = () => withTx({
+    query: jest.fn(async (sql: string) => (/FOR UPDATE/.test(String(sql)) ? { rows: [rawRow({ status: 'drafting' })] } : { rows: [] })),
+  });
+
   it('черновик уходит владельцу байтами, а не ссылкой', async () => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = reviewPg();
     const tg = { sendPhoto: jest.fn().mockResolvedValue({ message_id: 55 }), sendMessage: jest.fn() };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
 
@@ -50,14 +68,15 @@ describe('BlogApprovalService.sendForReview', () => {
   });
 
   it('координаты сообщения запоминаются — иначе правка реплаем не найдёт пост', async () => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = reviewPg();
     const tg = { sendPhoto: jest.fn().mockResolvedValue({ message_id: 55 }), sendMessage: jest.fn() };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
 
     await svc.sendForReview(draft() as any, 77);
 
-    expect(pg.query.mock.calls[0][0]).toContain("status = 'pending_review'");
-    expect(pg.query.mock.calls[0][1]).toEqual(['p1', 77, 55]);
+    const [sql, params] = updates(pg)[0];
+    expect(sql).toContain("status = 'pending_review'");
+    expect(params).toEqual(['p1', 77, 55]);
   });
 
   /**
@@ -69,7 +88,7 @@ describe('BlogApprovalService.sendForReview', () => {
    */
   it('картинка не скачалась — черновик всё равно приходит владельцу, текстом с кнопками', async () => {
     (axios.get as jest.Mock).mockRejectedValue(new Error('ECONNREFUSED'));
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = reviewPg();
     const tg = { sendPhoto: jest.fn(), sendMessage: jest.fn().mockResolvedValue({ message_id: 56 }) };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
 
@@ -82,12 +101,12 @@ describe('BlogApprovalService.sendForReview', () => {
     expect(text).toContain('ECONNREFUSED');           // и причина, по которой он без картинки
     expect(options.reply_markup).toEqual(buildBlogKeyboard('p1'));
     // Кнопки привязаны к тому сообщению, которое реально ушло.
-    expect(pg.query.mock.calls[0][1]).toEqual(['p1', 77, 56]);
+    expect(updates(pg)[0][1]).toEqual(['p1', 77, 56]);
   });
 
   it('если и текст не ушёл — ошибка наверх, пост не числится показанным', async () => {
     (axios.get as jest.Mock).mockRejectedValue(new Error('ECONNREFUSED'));
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = reviewPg();
     const tg = { sendPhoto: jest.fn(), sendMessage: jest.fn().mockRejectedValue(new Error('bot was blocked')) };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
 
@@ -110,7 +129,7 @@ describe('BlogApprovalService.handleCallback', () => {
     jest.useFakeTimers();
     jest.setSystemTime(new Date('2026-09-21T05:00:00Z'));   // пн, 08:00 МСК — слот пн 10:00 МСК ещё не прошёл
 
-    const pg = { query: jest.fn() };
+    const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const settings = { get: jest.fn().mockResolvedValue({ channelChatId: '-100', slotDays: [1, 3, 5], slotHourMsk: 10, imageStyle: '' }) };
@@ -138,7 +157,7 @@ describe('BlogApprovalService.handleCallback', () => {
     jest.useFakeTimers();
     jest.setSystemTime(new Date('2026-09-22T12:00:00Z'));   // вт, 15:00 МСК — ближайший слот ср 10:00 МСК → «завтра»
 
-    const pg = { query: jest.fn() };
+    const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const settings = { get: jest.fn().mockResolvedValue({ channelChatId: '-100', slotDays: [1, 3, 5], slotHourMsk: 10, imageStyle: '' }) };
@@ -159,7 +178,7 @@ describe('BlogApprovalService.handleCallback', () => {
     jest.useFakeTimers();
     jest.setSystemTime(new Date('2026-09-21T05:00:00Z'));
 
-    const pg = { query: jest.fn() };
+    const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     // «воскресенье» — самое длинное название дня недели; единственный слот в неделе,
@@ -186,24 +205,28 @@ describe('BlogApprovalService.handleCallback', () => {
     expect(tg.answerCallbackQuery).toHaveBeenCalledWith('cb1', expect.objectContaining({ text: expect.stringMatching(/уже/i) }));
   });
 
+  // Кнопки «в мусор» и «переписать» пишут через leaveQueue: пост читается
+  // ещё раз, под блокировкой, — поэтому заглушка отдаёт его на любое чтение,
+  // а запись ищется по содержанию, а не по номеру вызова.
+
   it('«в мусор» переводит в rejected', async () => {
-    const pg = { query: jest.fn() };
-    pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
+    const pg = withTx({ query: jest.fn() });
+    pg.query.mockResolvedValue({ rows: [rawRow()] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:no:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
-    expect(pg.query.mock.calls[1][0]).toContain("status = 'rejected'");
+    expect(updates(pg)[0][0]).toContain("status = 'rejected'");
   });
 
   it('«переписать» возвращает в drafting', async () => {
-    const pg = { query: jest.fn() };
-    pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
+    const pg = withTx({ query: jest.fn() });
+    pg.query.mockResolvedValue({ rows: [rawRow()] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:redo:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
-    expect(pg.query.mock.calls[1][0]).toContain("status = 'drafting'");
+    expect(updates(pg)[0][0]).toContain("status = 'drafting'");
   });
 
   /**
@@ -213,13 +236,13 @@ describe('BlogApprovalService.handleCallback', () => {
    * есть до пятнадцати минут вместо одного тика.
    */
   it('«переписать» освобождает пост под захват — отметка гасится', async () => {
-    const pg = { query: jest.fn() };
-    pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
+    const pg = withTx({ query: jest.fn() });
+    pg.query.mockResolvedValue({ rows: [rawRow()] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:redo:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
-    expect(String(pg.query.mock.calls[1][0])).toMatch(/drafting_started_at = NULL/i);
+    expect(String(updates(pg)[0][0])).toMatch(/drafting_started_at = NULL/i);
   });
 
   /**
@@ -228,28 +251,30 @@ describe('BlogApprovalService.handleCallback', () => {
    * ему, что было не так.
    */
   it('«переписать» замечания НЕ стирает — редактор пишет с их учётом', async () => {
-    const pg = { query: jest.fn() };
-    pg.query.mockResolvedValueOnce({ rows: [rawRow({ editor_notes: ['объясни, что такое продукт'] })] }).mockResolvedValue({ rows: [] });
+    const pg = withTx({ query: jest.fn() });
+    pg.query.mockResolvedValue({ rows: [rawRow({ editor_notes: ['объясни, что такое продукт'] })] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:redo:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
-    expect(String(pg.query.mock.calls[1][0])).not.toContain('editor_notes');
+    // Запись обязана БЫТЬ — иначе «не содержит» прошло бы на пустом месте.
+    expect(updates(pg)).toHaveLength(1);
+    expect(String(updates(pg)[0][0])).not.toContain('editor_notes');
   });
 
   /** Мусор — терминальный статус: замечания к нему больше никто не прочтёт. */
   it('«в мусор» заодно стирает замечания', async () => {
-    const pg = { query: jest.fn() };
-    pg.query.mockResolvedValueOnce({ rows: [rawRow({ editor_notes: ['объясни'] })] }).mockResolvedValue({ rows: [] });
+    const pg = withTx({ query: jest.fn() });
+    pg.query.mockResolvedValue({ rows: [rawRow({ editor_notes: ['объясни'] })] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:no:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
-    expect(String(pg.query.mock.calls[1][0])).toContain("editor_notes = '{}'");
+    expect(String(updates(pg)[0][0])).toContain("editor_notes = '{}'");
   });
 
   it('переход, запрещённый машиной состояний, не пишется в базу', async () => {
-    const pg = { query: jest.fn() };
+    const pg = withTx({ query: jest.fn() });
     // Пост в approved: кнопка «Опубликовать» из старого сообщения пытается
     // увести его в approved повторно — машина такого перехода не знает.
     pg.query.mockResolvedValueOnce({ rows: [rawRow({ status: 'approved' })] });
@@ -262,7 +287,7 @@ describe('BlogApprovalService.handleCallback', () => {
   });
 
   it('чужой callback игнорируется полностью', async () => {
-    const pg = { query: jest.fn() };
+    const pg = withTx({ query: jest.fn() });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
 
@@ -327,6 +352,10 @@ describe('BlogApprovalService.handleCallback — «Опубликовать» и
       const s = String(sql).replace(/\s+/g, ' ').trim();
       await passGate(s);
 
+      // Одобрение — транзакция. Откатывать здесь нечего: 23505 бросается до
+      // изменения строки, а других сбоев заглушка не делает.
+      if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(s)) return { rows: [] };
+
       if (/^SELECT \* FROM blog_post WHERE id = \$1$/.test(s)) {
         const r = rows.find((x) => x.id === params[0]);
         return { rows: r ? [{ ...r }] : [] };
@@ -363,6 +392,7 @@ describe('BlogApprovalService.handleCallback — «Опубликовать» и
     return {
       rows,
       query,
+      getClient: jest.fn(async () => ({ query, release: jest.fn() })),
       row: (id: string) => rows.find((x) => x.id === id),
       hold: (pattern: RegExp, n: number) => { gate = { pattern, n, parked: [] }; },
     };
@@ -477,7 +507,7 @@ describe('BlogApprovalService.handleCallback — «Замечание»', () => 
   });
 
   const make = (row: any) => {
-    const pg = { query: jest.fn() };
+    const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [row] }).mockResolvedValue({ rows: [] });
     const tg = {
       answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(),
@@ -595,7 +625,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
   });
 
   it('реплай сохраняется замечанием, а не подменяет текст поста', async () => {
-    const pg = { query: jest.fn() };
+    const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
@@ -610,7 +640,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
   });
 
   it('пост уходит на переработку, а не остаётся ждать кнопки «Опубликовать»', async () => {
-    const pg = { query: jest.fn() };
+    const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
@@ -622,7 +652,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
 
   /** Иначе замечание ждало бы протухания порога, а не ближайшего тика. */
   it('замечание освобождает пост под захват — отметка гасится', async () => {
-    const pg = { query: jest.fn() };
+    const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
@@ -638,7 +668,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
    * другое по кругу.
    */
   it('второе замечание накапливается поверх первого', async () => {
-    const pg = { query: jest.fn() };
+    const pg = withTx({ query: jest.fn() });
     pg.query
       .mockResolvedValueOnce({ rows: [rawRow({ editor_notes: ['объясни, что такое продукт'] })] })
       .mockResolvedValue({ rows: [] });
@@ -651,7 +681,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
   });
 
   it('бот обещает переписать, а не отчитывается о замене текста', async () => {
-    const pg = { query: jest.fn() };
+    const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
@@ -669,7 +699,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
    * спрашиваться, замечание запишется в пост, который уже уехал в канал.
    */
   it('переход, запрещённый машиной состояний, в базу не пишется', async () => {
-    const pg = { query: jest.fn() };
+    const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [rawRow({ status: 'published' })] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
@@ -696,7 +726,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
     ['rejected', /мусор/],
     ['failed', /не собрался/],
   ])('пост в %s: замечание не принято, владелец узнаёт почему, ассистенту не уходит', async (status, why) => {
-    const pg = { query: jest.fn() };
+    const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [rawRow({ status })] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
@@ -716,7 +746,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
    * приглашением, чтобы и ответ на эту просьбу узнался своим.
    */
   it('голосовой ответ на черновик ассистенту не уходит — блог просит текстом', async () => {
-    const pg = { query: jest.fn() };
+    const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
     const tg = {
       answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(),
@@ -750,7 +780,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
   });
 
   it('обычное сообщение без реплая не перехватывается', async () => {
-    const pg = { query: jest.fn() };
+    const pg = withTx({ query: jest.fn() });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
 

@@ -31,6 +31,40 @@ export interface SlotQueryable {
   query(sql: string, params?: any[]): Promise<{ rows: any[]; rowCount?: number | null }>;
 }
 
+/** Выделенное соединение под транзакцию — то, что отдаёт PgService.getClient(). */
+export interface TxClient extends SlotQueryable {
+  release(err?: any): void;
+}
+
+export interface TxSource {
+  getClient(): Promise<TxClient>;
+}
+
+/**
+ * Выполнить `work` в одной транзакции на выделенном соединении.
+ *
+ * Именно на выделенном: BEGIN через пул (`pg.query('BEGIN')`) уехал бы на
+ * одно соединение, а записи — на другие, и «откат» ничего бы не откатывал.
+ * Ошибка внутри — ROLLBACK и та же ошибка наверх. Соединение, на котором не
+ * прошёл даже ROLLBACK, в пул не возвращается: состояние его сессии
+ * неизвестно.
+ */
+export async function inTransaction<T>(pg: TxSource, work: (tx: SlotQueryable) => Promise<T>): Promise<T> {
+  const client = await pg.getClient();
+  let broken = false;
+  try {
+    await client.query('BEGIN');
+    const result = await work(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (e) {
+    broken = await client.query('ROLLBACK').then(() => false, () => true);
+    throw e;
+  } finally {
+    client.release(broken);
+  }
+}
+
 /** Пост, который держит слот. */
 export interface SlotHolder {
   id: string;
@@ -49,12 +83,18 @@ export function isSlotConflict(e: any): boolean {
 
 const toHolder = (row: any): SlotHolder => ({ id: row.id, title: row.title ?? null, slotAt: new Date(row.slot_at) });
 
-/** Посты, которые держат слоты строго после `after`, по порядку слотов. */
-export async function slotHolders(pg: SlotQueryable, after: Date): Promise<SlotHolder[]> {
+/**
+ * Посты, которые держат слоты строго после `after`, по порядку слотов.
+ *
+ * `lock` — взять их под блокировку до конца транзакции (только внутри
+ * `inTransaction`). Так одобрение не читает очередь, которую прямо сейчас
+ * сдвигают: см. `approveIntoFreeSlot`.
+ */
+export async function slotHolders(pg: SlotQueryable, after: Date, { lock = false } = {}): Promise<SlotHolder[]> {
   const r = await pg.query(
     `SELECT id, title, slot_at FROM blog_post
       WHERE status = ANY($1::text[]) AND slot_at > $2
-      ORDER BY slot_at`,
+      ORDER BY slot_at${lock ? ' FOR UPDATE' : ''}`,
     [SLOT_HOLDING_STATUSES, after.toISOString()],
   );
   return r.rows.filter((row) => row.slot_at).map(toHolder);
@@ -90,32 +130,44 @@ export interface ApprovedSlot {
  * увидел бы слот занятым этим же постом и переставил бы его на следующий, а
  * владельцу пришли бы две разные даты. С условием его запись не проходит.
  *
+ * Очередь читается под блокировкой (FOR UPDATE), в одной транзакции с
+ * записью. Это против гонки со сдвигом очереди (`leaveQueue`): без блокировки
+ * одобрение прочло бы очередь до коммита сдвига — «понедельник у Киры, среда у
+ * Продуктов, свободна пятница» — и встало бы в пятницу, а сдвиг тем временем
+ * перенёс бы Продукты на понедельник: среда осталась бы дырой. С блокировкой
+ * одобрение упирается в пост, который сдвиг уже держит, дожидается его
+ * коммита и читает очередь уже сдвинутой. Слот, который сейчас свободен,
+ * блокировкой строк не удержать — его по-прежнему держит уникальный индекс.
+ *
  * @returns слот — или null, если пост успел уйти из `fromStatus` (его
  *          одобрили или изменили в другом месте)
  * @throws NoFreeSlotError — свободного слота нет или его увели
  *         `MAX_SLOT_ATTEMPTS` раз подряд
  */
 export async function approveIntoFreeSlot(
-  pg: SlotQueryable,
+  pg: TxSource,
   postId: string,
   fromStatus: BlogStatus,
   schedule: Schedule,
   clock: () => Date = () => new Date(),
 ): Promise<ApprovedSlot | null> {
   for (let attempt = 1; attempt <= MAX_SLOT_ATTEMPTS; attempt++) {
-    const now = clock();
-    const taken = (await slotHolders(pg, now)).map((h) => h.slotAt);
-    const slot = nextFreeSlotAfter(now, schedule.slotDays, schedule.slotHourMsk, taken);
     try {
-      const r = await pg.query(
-        `UPDATE blog_post SET status = 'approved', slot_at = $2, updated_at = now()
-          WHERE id = $1 AND status = $3`,
-        [postId, slot.toISOString(), fromStatus],
-      );
-      return r.rowCount === 0 ? null : { slot, now };
+      return await inTransaction(pg, async (tx) => {
+        const now = clock();
+        const taken = (await slotHolders(tx, now, { lock: true })).map((h) => h.slotAt);
+        const slot = nextFreeSlotAfter(now, schedule.slotDays, schedule.slotHourMsk, taken);
+        const r = await tx.query(
+          `UPDATE blog_post SET status = 'approved', slot_at = $2, updated_at = now()
+            WHERE id = $1 AND status = $3`,
+          [postId, slot.toISOString(), fromStatus],
+        );
+        return r.rowCount === 0 ? null : { slot, now };
+      });
     } catch (e: any) {
       if (!isSlotConflict(e)) throw e;
-      // Слот заняли между чтением и записью — следующий круг прочтёт его занятым.
+      // Слот заняли между чтением и записью — следующий круг, уже новой
+      // транзакцией, прочтёт его занятым.
     }
   }
   throw new NoFreeSlotError(`слот ${MAX_SLOT_ATTEMPTS} раз подряд занимали одновременно с нами — попробуйте ещё раз`);

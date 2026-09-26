@@ -48,16 +48,23 @@ export class BlogPublisherService {
 
     // Атомарный захват: выигрывает ровно один вызов. Без этого два тика крона
     // или ретрай после таймаута дают в канал два одинаковых поста.
+    //
+    // `slot_at <= now()` — берём только пост, чей слот наступил. Раньше слота
+    // пост уходит из очереди одним путём — через leaveQueue: publish_now
+    // сначала ставит ему слот «сейчас» и сдвигает очередь. Захвати паблишер
+    // пост с будущим слотом (например, перенесённый между выборкой
+    // publishDue и этим захватом), слот освободился бы мимо сдвига, а пост
+    // вышел бы раньше срока, который ему только что назначили.
     const claim = await this.pg.query(
       `UPDATE blog_post
           SET status = 'publishing', attempts = attempts + 1, updated_at = now()
-        WHERE id = $1 AND status = 'approved'
+        WHERE id = $1 AND status = 'approved' AND slot_at <= now()
         RETURNING *`,
       [post.id],
     );
     if (!claim.rows.length) {
-      this.logger.log(`пост ${post.id} уже захвачен другим вызовом — пропускаю`);
-      return { ok: false, error: 'уже публикуется' };
+      this.logger.log(`пост ${post.id} не захвачен: его уже публикует другой вызов или слот ещё не наступил — пропускаю`);
+      return { ok: false, error: 'уже публикуется или слот ещё не наступил' };
     }
     const claimed = rowToPost(claim.rows[0]);
 
