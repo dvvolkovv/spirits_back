@@ -2,7 +2,6 @@ import { Inject, Injectable, Logger, OnModuleInit, forwardRef } from '@nestjs/co
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
 import { TgIdentityService, TgIdentityConflictError } from './tg-identity.service';
 import { TgClaimService } from './tg-claim.service';
@@ -16,6 +15,7 @@ import { TgGrammyClient } from './tg-grammy.client';
 import { MiscService } from '../misc/misc.service';
 import { VideoService } from '../video/video.service';
 import { BlogApprovalService } from '../blog/blog-approval.service';
+import { fetchMediaBytes } from '../common/net/own-media';
 
 // Лимит размера файла, который мы готовы скачать с Telegram и передать в Claude.
 // Telegram сам отдаёт через Bot API до 20 МБ; больше — нужен MTProto, не наш кейс.
@@ -895,18 +895,7 @@ export class TgBotService implements OnModuleInit {
         await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend);
       }
 
-      // Отправляем каждый attachment-маркер отдельным сообщением. Ошибка по
-      // конкретному файлу не валит остальные — логируем и продолжаем.
-      for (const m of markers.slice(0, 3)) {
-        try {
-          await this.dispatchOutgoingMarker(cfg, msg, m);
-        } catch (e: any) {
-          this.logger.warn(`outgoing marker (${m.kind}) failed in chat ${msg.chat.id}: ${e.message}`);
-          try {
-            await this.grammy.sendMessage(msg.chat.id, `(не удалось приложить ${m.kind}: ${e.message})`);
-          } catch { /* ignore */ }
-        }
-      }
+      await this.deliverOutgoingMarkers(cfg, msg, markers);
 
       // Артефакты из песочницы Claude (PDF/DOCX/XLSX/etc.) — каждый отдельным
       // документом. Лимит уже наложен в scanSandboxOutputs (5 файлов max).
@@ -1298,15 +1287,32 @@ export class TgBotService implements OnModuleInit {
    * content», и человек увидел молчание вместо картинки.
    *
    * Тот же приём уже применён к маркеру file ниже.
+   *
+   * Ссылка здесь наша (её вернул генератор), и fetchMediaBytes читает её из
+   * своего MinIO напрямую — без круга через прокси Selectel.
    */
   private async sendPhotoFromUrl(chatId: number, url: string, options: any): Promise<void> {
-    if (!/^https?:\/\//i.test(url)) throw new Error('url картинки должен быть http(s)');
-    const resp = await axios.get(url, {
-      responseType: 'arraybuffer',
-      timeout: 30_000,
-      maxContentLength: MAX_ATTACHMENT_BYTES,
-    });
-    await this.grammy.sendPhoto(chatId, Buffer.from(resp.data), options);
+    const media = await fetchMediaBytes(url, { maxBytes: MAX_ATTACHMENT_BYTES, timeoutMs: 30_000, allowHttp: true });
+    await this.grammy.sendPhoto(chatId, media.data, options);
+  }
+
+  /**
+   * Отправляем каждый attachment-маркер отдельным сообщением. Ошибка по
+   * конкретному файлу не валит остальные и не роняет ход — логируем, коротко
+   * пишем в чат и продолжаем. Сюда же приходит отказ по ссылке во внутреннюю
+   * сеть (UnsafeUrlError): его сообщение рассчитано на человека.
+   */
+  private async deliverOutgoingMarkers(cfg: TgBotConfigRow, msg: any, markers: OutgoingMarker[]): Promise<void> {
+    for (const m of markers.slice(0, 3)) {
+      try {
+        await this.dispatchOutgoingMarker(cfg, msg, m);
+      } catch (e: any) {
+        this.logger.warn(`outgoing marker (${m.kind}) failed in chat ${msg.chat.id}: ${e.message}`);
+        try {
+          await this.grammy.sendMessage(msg.chat.id, `(не удалось приложить ${m.kind}: ${e.message})`);
+        } catch { /* ignore */ }
+      }
+    }
   }
 
   /** Отправляет один маркер: генерим картинку или скачиваем по URL → шлём в чат. */
@@ -1380,11 +1386,16 @@ export class TgBotService implements OnModuleInit {
       return;
     }
     // file: качаем сами и шлём как document, чтобы Telegram не ограничивал
-    // по размеру изображения (для картинок лучше отдельный {{image:…}})
+    // по размеру изображения (для картинок лучше отдельный {{image:…}}).
+    //
+    // Ссылку пишет МОДЕЛЬ, а её можно уговорить текстом из чата — и скачанные
+    // байты уходят прямо в чат. Поэтому только fetchMediaBytes: внутренние
+    // адреса (Redis, MinIO, сам API, метаданные облака) и редиректы на них
+    // отбиваются до запроса. Отказ бросается как обычная ошибка, и цикл
+    // маркеров выше коротко пишет в чат, что файл не приложен.
     this.grammy.sendChatAction(msg.chat.id, 'upload_document').catch(() => {});
-    if (!/^https?:\/\//i.test(m.url)) throw new Error('url должен быть https');
-    const resp = await axios.get(m.url, { responseType: 'arraybuffer', timeout: 30_000, maxContentLength: MAX_ATTACHMENT_BYTES });
-    const buf = Buffer.from(resp.data);
+    const media = await fetchMediaBytes(m.url, { maxBytes: MAX_ATTACHMENT_BYTES, timeoutMs: 30_000, allowHttp: true });
+    const buf = media.data;
     const name = m.name || m.url.split('/').pop() || 'file.bin';
     await this.grammy.sendDocument(msg.chat.id, buf, name, {
       reply_to_message_id: msg.message_id,

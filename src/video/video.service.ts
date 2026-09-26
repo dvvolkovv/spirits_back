@@ -16,6 +16,8 @@ import {
   isVeoModel, veoTier, computeVeoQuote, computeVeoConcatQuote, computeOwnVoiceSurcharge,
 } from './video.dto';
 import { VoiceAvatarService } from '../voice-avatar/voice-avatar.service';
+import { assertFetchableMedia, fetchMediaBytes } from '../common/net/own-media';
+import { isUnsafeUrlError } from '../common/net/safe-fetch';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, CreateBucketCommand, PutBucketPolicyCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import axios from 'axios';
@@ -1136,15 +1138,14 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     return out;
   }
 
+  // Ссылки на фото приходят от человека или модели (sourceImageUrl[s]) —
+  // качаем через fetchMediaBytes: своё (/static/, наш MinIO) напрямую, чужое —
+  // с защитой от SSRF. Относительные '/…' он сам достраивает до нашего сайта.
   private async fetchPortraitB64(url: string): Promise<{ b64: string; mime: string } | null> {
     try {
-      let u = url;
-      if (u.startsWith('/')) {
-        u = (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '') + u;
-      }
-      const resp = await axios.get(u, { responseType: 'arraybuffer', timeout: 30000, maxContentLength: 12 * 1024 * 1024 });
-      const mime = (resp.headers['content-type'] as string) || 'image/jpeg';
-      return { b64: Buffer.from(resp.data).toString('base64'), mime };
+      const media = await fetchMediaBytes(url, { maxBytes: 12 * 1024 * 1024, timeoutMs: 30000, allowHttp: true });
+      const mime = media.contentType || 'image/jpeg';
+      return { b64: media.data.toString('base64'), mime };
     } catch (e: any) {
       this.logger.warn(`Veo portrait fetch failed: ${e.message}`);
       return null;
@@ -1376,6 +1377,17 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     ).filter(Boolean).slice(0, 3).map(toAbs);
     if (mode === 'image2video' && refUrls.length === 0) {
       throw new BadRequestException('image2video requires sourceImageUrl(s)');
+    }
+    // Фото качаем мы сами (fetchPortraitB64), поэтому ссылку во внутреннюю
+    // сеть отбиваем ДО списания: при скачивании она всё равно не пройдёт, но
+    // молча — и человек заплатил бы за ролик без своего лица. Сетевые сбои
+    // здесь не повод отказывать: фото пропустится, как и раньше.
+    for (const u of refUrls) {
+      try {
+        await assertFetchableMedia(u, { allowHttp: true });
+      } catch (e: any) {
+        if (isUnsafeUrlError(e)) throw new BadRequestException(e.message);
+      }
     }
     const imgUrlAbsolute: string | null = refUrls[0] ?? null;
 

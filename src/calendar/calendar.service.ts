@@ -5,9 +5,10 @@ import { PgService } from '../common/services/pg.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { YandexCalDavConnector } from './caldav';
 import { CalEvent, CalendarCreds, ProposedEvent, ProposedTask, Task } from './calendar.types';
-import { fetchCalendarEvents } from '../trip/calendar'; // read-only ICS sources (T6)
+import { fetchCalendarEvents, ICS_FETCH_POLICY, ICS_MAX_BYTES } from '../trip/calendar'; // read-only ICS sources (T6)
+import { assertPublicUrl, isUnsafeUrlError, safeGet } from '../common/net/safe-fetch';
 import { encryptSecret, decryptSecret } from './crypto';
-import { ExchangeEwsConnector, ExchangeCreds } from './exchange';
+import { ExchangeEwsConnector, ExchangeCreds, EXCHANGE_URL_POLICY } from './exchange';
 import { expandOccurrences, Recurrence } from './recurrence';
 import { LinkeonTasksService } from './linkeon-tasks.service';
 import { TalerIdStoreService } from '../talerid/talerid-store.service';
@@ -315,6 +316,14 @@ export class CalendarService {
     domain = (domain || '').trim();
     login = (login || '').trim();
     if (!server || !login || !password) return { ok: false, error: 'Нужны сервер, логин и пароль' };
+    // Адрес во внутреннюю сеть exchange.test() и так не пропустит, но ответит
+    // «проверь логин и пароль» — а дело не в них. Называем причину прямо.
+    try {
+      await assertPublicUrl(`https://${server}/`, EXCHANGE_URL_POLICY);
+    } catch (e: any) {
+      if (isUnsafeUrlError(e)) return { ok: false, error: `Адрес сервера не подходит: ${e.message.replace(/^ссылка не принята: /, '')}` };
+      // DNS и прочие сетевые сбои покажет test() ниже тем же путём, что и раньше.
+    }
     const username = domain ? `${login}@${domain}` : login;
     const ok = await this.exchange.test({ server, username, password });
     if (!ok) return { ok: false, error: 'Не удалось войти — проверь домен, логин и пароль' };
@@ -351,12 +360,18 @@ export class CalendarService {
     let u = (url || '').trim();
     if (u.toLowerCase().startsWith('webcal://')) u = 'https://' + u.slice('webcal://'.length);
     if (!/^https?:\/\//i.test(u)) return { ok: false, error: 'Нужна ссылка вида https://… (или webcal://…)' };
+    // Ссылку ввёл человек, и сервер идёт по ней сам — только через safeGet:
+    // внутренние адреса, редиректы на них и DNS rebinding отбиваются до запроса.
+    // Отказ по безопасности называем прямо: «проверь адрес» тут не поможет.
     let text = '';
     try {
-      const res = await fetch(u, { signal: AbortSignal.timeout(8000) } as any);
-      if (!res.ok) return { ok: false, error: `Ссылка недоступна (код ${res.status})` };
-      text = await res.text();
-    } catch {
+      const res = await safeGet(u, {
+        ...ICS_FETCH_POLICY, timeoutMs: 8000, maxBytes: ICS_MAX_BYTES, responseType: 'text', validateStatus: () => true,
+      });
+      if (res.status < 200 || res.status >= 300) return { ok: false, error: `Ссылка недоступна (код ${res.status})` };
+      text = res.data;
+    } catch (e: any) {
+      if (isUnsafeUrlError(e)) return { ok: false, error: `Ссылка не подходит: ${e.message.replace(/^ссылка не принята: /, '')}` };
       return { ok: false, error: 'Не удалось открыть ссылку — проверь адрес' };
     }
     if (!text.includes('BEGIN:VCALENDAR')) return { ok: false, error: 'По ссылке не календарь (нет данных iCalendar)' };

@@ -1,7 +1,7 @@
-import axios from 'axios';
+import { fetchMediaBytes } from '../common/net/own-media';
 import { TgBotService } from './tg-bot.service';
 
-jest.mock('axios');
+jest.mock('../common/net/own-media');
 
 /**
  * Telegram не может скачать наши ссылки: my.linkeon.io живёт за РФ-edge
@@ -27,7 +27,9 @@ describe('отправка картинки в Telegram', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    (axios.get as jest.Mock).mockResolvedValue({ data: Buffer.from('picture-bytes') });
+    (fetchMediaBytes as jest.Mock).mockResolvedValue({
+      data: Buffer.from('picture-bytes'), contentType: 'image/png', finalUrl: 'https://my.linkeon.io/smm-media/cat.png',
+    });
   });
 
   it('картинка уходит байтами, а не ссылкой', async () => {
@@ -35,12 +37,14 @@ describe('отправка картинки в Telegram', () => {
 
     await (svc as any).dispatchOutgoingMarker(cfg, msg, { kind: 'image', prompt: 'котик в космосе' });
 
-    expect(axios.get).toHaveBeenCalledWith(
+    // Качает fetchMediaBytes — свой MinIO он читает изнутри, чужое проверяет на SSRF.
+    expect(fetchMediaBytes).toHaveBeenCalledWith(
       'https://my.linkeon.io/smm-media/cat.png',
-      expect.objectContaining({ responseType: 'arraybuffer' }),
+      expect.objectContaining({ maxBytes: expect.any(Number), timeoutMs: expect.any(Number) }),
     );
     const [, photo] = grammy.sendPhoto.mock.calls[0];
     expect(Buffer.isBuffer(photo)).toBe(true);
+    expect(photo.toString()).toBe('picture-bytes');
   });
 
   it('правка картинки — тоже байтами', async () => {

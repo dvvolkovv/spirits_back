@@ -5,6 +5,8 @@ import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import * as multer from 'multer';
 import axios from 'axios';
+import { fetchMediaBytes, ownStaticPath, OwnStaticFile } from '../common/net/own-media';
+import { isUnsafeUrlError } from '../common/net/safe-fetch';
 
 /**
  * Кеш аватарок ассистентов в памяти процесса.
@@ -26,6 +28,16 @@ const AGENT_AVATAR_TTL_MS = 60 * 60 * 1000;
 const AGENT_AVATAR_MAX_ENTRIES = 100;
 const agentAvatarCache = new Map<string, { buf: Buffer; contentType: string; ts: number }>();
 
+/** Потолок проксируемого аватара: загрузка режется на 5 МБ, берём с запасом. */
+const AVATAR_MAX_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Id ассистента для пути в MinIO. Express раскодирует %2F в параметре, и без
+ * проверки `..%2F..%2Fwebhook%2F…` превращал фиксированный путь аватарки в
+ * запрос сервера к произвольному адресу своего же домена.
+ */
+const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,100}$/;
+
 /** Только для тестов: сбросить кеш между кейсами. */
 export function __resetAgentAvatarCache(): void {
   agentAvatarCache.clear();
@@ -37,33 +49,53 @@ export class AvatarController {
 
   constructor(private readonly avatarService: AvatarService) {}
 
+  /**
+   * Аватар текущего пользователя.
+   *
+   * `profile_data.avatar_url` пишет сам пользователь: POST /profile-update
+   * вливает в profile_data любые ключи. Поэтому ссылка здесь недоверенная:
+   *   • `/static/…` раньше склеивался в путь без проверки, и
+   *     `/static/../../../etc/passwd` отдавал любой файл сервера;
+   *   • внешний адрес проксировался как есть — `http://127.0.0.1:9000/…`
+   *     возвращал человеку ответ внутреннего сервиса.
+   * Теперь свой /static/ читается только внутри public/, а чужое — через
+   * защиту от SSRF, и отдаём только то, что сервер назвал картинкой.
+   */
   @Get('avatar')
   @UseGuards(JwtGuard)
   async getAvatar(@CurrentUser() user: any, @Res() res: Response) {
     const avatar = await this.avatarService.getAvatar(user.userId);
     if (!avatar) return res.status(204).end();
 
-    // If local file, serve it directly as binary
+    // Локальный файл отдаём как файл, но только изнутри public/.
     if (avatar.url.startsWith('/static/')) {
-      const path = require('path');
-      const filePath = path.join(process.cwd(), 'public', avatar.url.replace('/static/', ''));
-      return res.sendFile(filePath);
+      let own: OwnStaticFile | null = null;
+      try {
+        own = ownStaticPath(avatar.url);
+      } catch {
+        own = null;
+      }
+      if (!own) return res.status(204).end();
+      return res.sendFile(own.file);
     }
 
-    // If remote URL — проксируем байты (не redirect): см. коммент в getAgentAvatar
+    // Внешний адрес — проксируем байты (не redirect): см. коммент в getAgentAvatar
     // (кросс-ориджин + Authorization = префлайт, redirect за ним не следуется).
     try {
-      const img = await axios.get(avatar.url, { responseType: 'arraybuffer', timeout: 15000 });
-      // Типы axios допускают boolean среди значений заголовка, а setHeader его
-      // не принимает — сужаем явно, иначе сборка не проходит.
-      const contentType = img.headers['content-type'];
-      res.setHeader(
-        'Content-Type',
-        typeof contentType === 'string' ? contentType : 'image/jpeg',
-      );
+      const img = await fetchMediaBytes(avatar.url, { maxBytes: AVATAR_MAX_BYTES, timeoutMs: 15000, allowHttp: true });
+      // Тип не сообщили — как и раньше, считаем JPEG (с nosniff браузер его не
+      // перетолкует). Не картинка — не аватар: иначе ручка отдавала бы с
+      // нашего origin любой документ. SVG — тоже нет: это документ со
+      // скриптами, и nosniff его не обезвреживает.
+      const contentType = (img.contentType.split(';')[0].trim() || 'image/jpeg').toLowerCase();
+      if (!contentType.startsWith('image/') || contentType.includes('svg')) return res.status(204).end();
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('X-Content-Type-Options', 'nosniff');
       res.setHeader('Cache-Control', 'private, max-age=3600');
-      return res.send(Buffer.from(img.data));
-    } catch {
+      return res.send(img.data);
+    } catch (e) {
+      // Ссылку во внутреннюю сеть не качаем и браузер туда не отправляем.
+      if (isUnsafeUrlError(e)) return res.status(204).end();
       return res.redirect(avatar.url);
     }
   }
@@ -107,6 +139,7 @@ export class AvatarController {
 
   @Get('0cdacf32-7bfd-4888-b24f-3a6af3b5f99e/agent/avatar/:agentId')
   async getAgentAvatar(@Param('agentId') agentId: string, @Res() res: Response) {
+    if (!AGENT_ID_RE.test(String(agentId ?? ''))) return res.status(404).json({ error: 'No avatar' });
     // Кеш проверяем до похода в сервис: он лезет в БД за URL, а нам и это лишнее.
     const cached = agentAvatarCache.get(agentId);
     if (cached && Date.now() - cached.ts < AGENT_AVATAR_TTL_MS) {
