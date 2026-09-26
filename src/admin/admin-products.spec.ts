@@ -31,7 +31,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
 import { MIGRATIONS } from '../products/products.service';
-import { AdminProductsService, PRODUCTS_CAP, TEXT_CAP } from './admin-products.service';
+import { AdminProductsService } from './admin-products.service';
 
 const PG = process.env.PROVISIONING_PG_URL;
 const maybe = PG ? describe : describe.skip;
@@ -42,6 +42,11 @@ const WIPE =
 
 maybe('админка «Сайты и боты»: сервис против живого Postgres', () => {
   jest.setTimeout(60_000);
+
+  // Числа договора с фронтом — литералами, а не импортом констант сервиса:
+  // иначе правка константы молча сдвинула бы и проверку.
+  const PRODUCTS_CAP = 500;
+  const TEXT_CAP = 2000;
 
   let pool: Pool;
   let pg: { query: (sql: string, params?: any[]) => Promise<any> };
