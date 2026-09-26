@@ -1,0 +1,22 @@
+# AppArmor-профиль для /usr/bin/bwrap.
+#
+# Зачем: на Ubuntu 24.04 включён apparmor_restrict_unprivileged_userns=1, и
+# непривилегированный bwrap падает на «setting up uid map: Permission denied» —
+# ядро запрещает создание user namespace без профиля, разрешающего userns.
+# Проверено на стенде dv@85.192.61.231: до профиля unpriv bwrap падал, после —
+# работает и от dv, и от relay-isolated.
+#
+# flags=(unconfined): саму изоляцию строит bwrap (mount/pid/ipc/uts ns + bind-
+# набор), а apparmor здесь лишь снимает запрет на userns для этого пути; иначе
+# пришлось бы описывать полную политику для всего, что запускает агент.
+#
+# Установка: скопировать в /etc/apparmor.d/bwrap и `apparmor_parser -r`.
+# Это делает provision-relay-isolation.sh.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}

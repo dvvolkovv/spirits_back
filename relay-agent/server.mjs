@@ -1,7 +1,7 @@
 import express from "express";
 import multer from "multer";
 import cors from "cors";
-import { randomUUID } from "crypto";
+import { randomUUID, createHash } from "crypto";
 import fs from "fs";
 import path from "path";
 import { spawn, execSync } from "child_process";
@@ -127,7 +127,7 @@ function loadSessionMap() {
     // Транскрипт мог быть удалён (ротация, чистка диска) — тогда --resume
     // упадёт «No conversation found» на ПЕРВОМ же сообщении пользователя.
     // Дешевле отбросить запись сейчас, чем ронять ход потом.
-    if (!fs.existsSync(sessionJsonlPath(claudeSid))) { dropped++; continue; }
+    if (!fs.existsSync(sessionJsonlPath(claudeSid, sid))) { dropped++; continue; }
     sessionMap.set(sid, claudeSid);
     restored++;
   }
@@ -186,7 +186,41 @@ for (const sig of ["SIGTERM", "SIGINT"]) {
 // и языковые утечки. При превышении порога начинаем свежую Claude-сессию,
 // передав хвост диалога в промпт для непрерывности.
 const SESSION_ROTATE_BYTES = 4 * 1024 * 1024;
-const sessionJsonlPath = (claudeSid) => "/home/dv/.claude/projects/-tmp/" + claudeSid + ".jsonl";
+
+// ── Изоляция веб-хода (bubblewrap + отдельный OS-пользователь + nft egress) ────
+// Включается флагом RELAY_SANDBOX=1 БЕЗ отката кода: при выключенном флаге ничего
+// ниже не задействуется и spawn идёт ровно как раньше — «claude» от dv.
+// Обвязку на хосте (пользователь relay-isolated, apparmor-профиль для bwrap,
+// nft-правила egress, обёртку, креденшел) ставит идемпотентный
+// relay-agent/provision-relay-isolation.sh — там же RUNBOOK и обоснование.
+const RELAY_SANDBOX = process.env.RELAY_SANDBOX === "1";
+const SANDBOX_WRAPPER = process.env.RELAY_SANDBOX_WRAPPER || "/opt/relay-isolation/turn-sandbox.sh";
+const SANDBOX_USER = process.env.RELAY_SANDBOX_USER || "relay-isolated";
+// Где изолированный claude держит транскрипты: пер-сессионно, чтобы работал
+// --resume и чтобы ходы не видели транскрипты друг друга. Значение обязано
+// совпадать со STATE_DIR в turn-sandbox.sh.
+const SANDBOX_STATE_DIR = process.env.RELAY_SANDBOX_STATE_DIR || "/var/lib/relay-isolation";
+// Детерминированный ключ сессии для пути на диске. Без случайного фолбэка (в
+// отличие от sessionFsKey): иначе каталог транскрипта менялся бы между ходами и
+// --resume не находил бы файл. Санитизация та же — слэши и «..» наружу не выйдут.
+function sandboxSessionKey(sid) {
+  const s = String(sid).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 64);
+  return (s && s !== "." && s !== "..")
+    ? s
+    : "s_" + createHash("sha1").update(String(sid)).digest("hex").slice(0, 32);
+}
+
+// Путь к транскрипту claude-сессии. Без песочницы — как раньше, в доме dv (sid
+// игнорируется, строка байт-в-байт прежняя). В песочнице транскрипт лежит
+// пер-сессионно в STATE_DIR: его пишет claude от изолированного пользователя,
+// релей-от-dv читает stat/размер по группе relay-iso. ВАЖНО: claude форсит 0600
+// на самом .jsonl, поэтому чтение СОДЕРЖИМОГО (extractTailDialogue) под
+// песочницей недоступно и мягко деградирует к пустому хвосту — на непрерывность
+// это влияет только в момент ротации, где подхватывается history от бэкенда.
+const sessionJsonlPath = (claudeSid, sid) =>
+  (RELAY_SANDBOX && sid !== undefined)
+    ? path.join(SANDBOX_STATE_DIR, "sessions", sandboxSessionKey(sid), ".claude/projects/-tmp", claudeSid + ".jsonl")
+    : "/home/dv/.claude/projects/-tmp/" + claudeSid + ".jsonl";
 
 // Поднимаем карту сессий с диска. Строго ЗДЕСЬ, а не выше: loadSessionMap
 // проверяет наличие транскриптов через sessionJsonlPath, а он объявлен const —
@@ -220,9 +254,9 @@ const rotateDue = new Set();
 // Хвост увеличен вдвое (было 30×1500). Он состоит только из текстовых реплик,
 // то есть ~30k токенов против сотен тысяч у самой сессии: платить за него
 // дешевле, чем за отказ ротировать. Ранняя ротация перестаёт быть жертвой.
-function extractTailDialogue(claudeSid, maxMsgs = 60, maxCharsPerMsg = 2000) {
+function extractTailDialogue(claudeSid, sid, maxMsgs = 60, maxCharsPerMsg = 2000) {
   try {
-    const lines = fs.readFileSync(sessionJsonlPath(claudeSid), "utf8").split("\n");
+    const lines = fs.readFileSync(sessionJsonlPath(claudeSid, sid), "utf8").split("\n");
     const msgs = [];
     for (let i = lines.length - 1; i >= 0 && msgs.length < maxMsgs; i--) {
       const line = lines[i].trim();
@@ -638,7 +672,28 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         try { prev.child.kill("SIGKILL"); } catch {}
       }
 
-      const child = spawn("claude", runArgs, {
+      // Флаг off → ровно прежний вызов: spawn("claude", runArgs, …) от dv.
+      // Флаг on → ход исполняет обёртка turn-sandbox.sh через sudo:
+      //   sudo → root → синхронизация креда, пер-сессионный ~/.claude, chgrp
+      //   папки вывода → setpriv до relay-isolated → bwrap (unpriv userns) →
+      //   claude. Промпт по-прежнему уходит в stdin, stream-json приходит из
+      //   stdout — sudo пробрасывает оба; nft skuid ловит сокеты изолированного
+      //   uid (проверено на стенде). Пер-ходовые пути (вывод, MCP-конфиг,
+      //   загрузки) передаём обёртке — она монтирует их внутрь: вывод rw
+      //   (утекает на хост для /files/), MCP-конфиг и загрузки ro.
+      const spawnCmd = RELAY_SANDBOX ? "sudo" : "claude";
+      const spawnArgs = RELAY_SANDBOX
+        ? [
+            "-n", SANDBOX_WRAPPER,
+            "--user", SANDBOX_USER,
+            "--key", sandboxSessionKey(sessionId),
+            "--out", outDir,
+            ...(mcpConfigPath ? ["--mcp", mcpConfigPath] : []),
+            ...renamedFiles.flatMap((f) => ["--upload", f.path]),
+            "--", ...runArgs,
+          ]
+        : runArgs;
+      const child = spawn(spawnCmd, spawnArgs, {
         cwd: "/tmp",
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env, MCP_TIMEOUT: "120000", MCP_TOOL_TIMEOUT: "600000", PATH: process.env.PATH + ":/home/dv/agent-env/bin:/home/dv/.bun/bin" },
@@ -807,14 +862,14 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
     if (useResume) {
       try {
         const claudeSid = sessionMap.get(sessionId);
-        const st = fs.statSync(sessionJsonlPath(claudeSid));
+        const st = fs.statSync(sessionJsonlPath(claudeSid, sessionId));
         // Два повода. Основной — контекст прошлого хода перевалил порог
         // (пометка стоит в rotateDue). Запасной — размер файла: он работает,
         // когда usage не пришёл вовсе, и страхует от разрастания вслепую.
         const dueByContext = rotateDue.has(sessionId);
         if (st.size > SESSION_ROTATE_BYTES || dueByContext) {
           rotateDue.delete(sessionId);
-          const tail = extractTailDialogue(claudeSid);
+          const tail = extractTailDialogue(claudeSid, sessionId);
           forgetSession(sessionId);
           useResume = false;
           if (tail) {

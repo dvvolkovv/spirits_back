@@ -1,0 +1,53 @@
+# nftables: egress-фильтр по uid для изолированного пользователя веб-хода.
+#
+# Отдельная таблица `inet relay_isolation` — АДДИТИВНА и не трогает существующие
+# таблицы релея (напр. фильтр с allowlist на 3033/входящие). Удаляется одной
+# командой:  nft delete table inet relay_isolation
+#
+# Идиома add/delete/define делает файл идемпотентно перезагружаемым через
+# `nft -f` (не требуется flush ruleset, чужие таблицы целы).
+#
+# Политика (решение владельца): изолированному ходу можно наружу КУДА УГОДНО,
+# нельзя только: loopback, RFC1918 (10/8, 172.16/12, 192.168/16), CGNAT
+# (100.64/10), link-local (169.254/16) + метадата (169.254.169.254 входит),
+# и IPv6-эквиваленты (::1, fc00::/7, fe80::/10). MCP-инструменты ходят на
+# ПУБЛИЧНЫЙ my.linkeon.io (212.113.106.202) по HTTPS — это внешний адрес, не
+# блокируется. DNS: см. ниже.
+#
+# КАЖДОЕ правило скоупнуто на `skuid "relay-isolated"` — трафик всех остальных
+# пользователей и системы падает в policy accept и НЕ затрагивается. Имя uid
+# резолвится nft в число при загрузке (пользователь должен уже существовать).
+#
+# skuid ловит сокеты процесса ДАЖЕ внутри bwrap (unshared userns), потому что
+# bwrap запускается ОТ имени relay-isolated (real uid сохраняется на хосте) —
+# проверено счётчиками на стенде: ходы из-под bwrap инкрементили drop-правила.
+
+add table inet relay_isolation
+delete table inet relay_isolation
+table inet relay_isolation {
+  chain output {
+    type filter hook output priority filter; policy accept;
+
+    # DNS-исключение: если хост резолвит через systemd-resolved stub
+    # (127.0.0.53), разрешаем только его и только :53. На хостах с публичным
+    # resolv.conf (как стенд) это правило простаивает — DNS уходит наружу и
+    # проходит по общему accept. Песочница дополнительно монтирует свой
+    # resolv.conf на 1.1.1.1/8.8.8.8 (см. turn-sandbox.sh), так что имена
+    # резолвятся в любом случае.
+    meta skuid "relay-isolated" ip daddr 127.0.0.53 udp dport 53 counter accept
+    meta skuid "relay-isolated" ip daddr 127.0.0.53 tcp dport 53 counter accept
+
+    # Заблокированные диапазоны — только для изолированного uid.
+    meta skuid "relay-isolated" ip  daddr 127.0.0.0/8     counter drop
+    meta skuid "relay-isolated" ip  daddr 10.0.0.0/8      counter drop
+    meta skuid "relay-isolated" ip  daddr 172.16.0.0/12   counter drop
+    meta skuid "relay-isolated" ip  daddr 192.168.0.0/16  counter drop
+    meta skuid "relay-isolated" ip  daddr 100.64.0.0/10   counter drop
+    meta skuid "relay-isolated" ip  daddr 169.254.0.0/16  counter drop
+    meta skuid "relay-isolated" ip6 daddr ::1             counter drop
+    meta skuid "relay-isolated" ip6 daddr fc00::/7        counter drop
+    meta skuid "relay-isolated" ip6 daddr fe80::/10       counter drop
+
+    # Всё остальное (внешние адреса, DNS наружу) — policy accept.
+  }
+}
