@@ -420,27 +420,6 @@ describe('ClaudeCliService argv: MCP-серверы на вызов', () => {
     }
   });
 
-  // Нейтральный cwd по умолчанию — сам os.tmpdir(), и каталог конфига лежал бы
-  // формально внутри него. Вызов с MCP без cwd и вложений (Маша) получает свой
-  // пустой одноразовый каталог: конфиг — рядом с ним, а не внутри.
-  it('MCP без cwd и вложений: CLI в своём пустом одноразовом каталоге, конфиг не внутри, всё снято', async () => {
-    const seen = captureAtSpawn();
-    await new ClaudeCliService().text('покажи продукты', { mcpServers: servers() });
-    expect(seen.cwd).not.toBe(os.tmpdir());
-    expect(path.basename(seen.cwd)).toMatch(/^claude-cwd-/);
-    expect(seen.cwd.startsWith(os.tmpdir() + path.sep)).toBe(true);
-    expect(seen.cwdEntries).toEqual([]);
-    expect(path.relative(seen.cwd, seen.cfgPath!).startsWith('..')).toBe(true);
-    expect(fs.existsSync(seen.cwd)).toBe(false);
-  });
-
-  it('MCP без cwd: одноразовый cwd снимается и при падении CLI', async () => {
-    const seen = captureAtSpawn(() => fakeProc('boom-not-json', 1));
-    await expect(new ClaudeCliService().text('покажи продукты', { mcpServers: servers() })).rejects.toThrow();
-    expect(path.basename(seen.cwd)).toMatch(/^claude-cwd-/);
-    expect(fs.existsSync(seen.cwd)).toBe(false);
-  });
-
   it('без MCP нейтральный cwd прежний — os.tmpdir()', async () => {
     const seen = captureAtSpawn();
     await new ClaudeCliService().text('привет');
@@ -458,5 +437,166 @@ describe('ClaudeCliService argv: MCP-серверы на вызов', () => {
     expect(seen.body).toEqual({ mcpServers: servers() });
     expect(seen.args).toContain('--verbose');
     expect(fs.existsSync(seen.cfgPath!)).toBe(false);
+  });
+});
+
+/**
+ * ПОСТОЯННЫЙ ПУСТОЙ CWD ДЛЯ ВЫЗОВОВ С MCP БЕЗ CWD (Маша).
+ *
+ * Нейтральный cwd по умолчанию — сам os.tmpdir(), и каталог конфига с токеном
+ * лежал бы формально внутри него. Одноразовый cwd на каждый вызов закрывал
+ * это, но CLI заводит в ~/.claude/projects папку проекта на КАЖДЫЙ новый cwd —
+ * тысячи папок в сутки на проде. Поэтому cwd один и постоянный:
+ * <tmpdir>/linkeon-claude-empty, 0700, наш, пустой; мы в него не пишем и не
+ * удаляем его. Не годится (симлинк, не каталог, чужой, открыт на запись, не
+ * пуст) — берём одноразовый claude-cwd-* и снимаем его после вызова.
+ * Каталог токенов — отдельно и по-прежнему на вызов.
+ *
+ * os.tmpdir() читает TMPDIR на каждом вызове: здесь он смотрит в свой корень,
+ * чтобы не трогать настоящий <tmpdir>/linkeon-claude-empty, которым может
+ * пользоваться живой сервис на той же машине.
+ */
+describe('ClaudeCliService: постоянный пустой cwd для вызовов с MCP', () => {
+  const TOKEN = 'product-tool-token-9d2e-SECRET';
+  const servers = () => ({
+    products: {
+      type: 'http' as const,
+      url: 'http://127.0.0.1:3001/webhook/mcp/products',
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    },
+  });
+
+  let root: string;
+  let prevTmp: string | undefined;
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cwd-spec-root-'));
+    prevTmp = process.env.TMPDIR;
+    process.env.TMPDIR = root;
+  });
+  afterEach(() => {
+    if (prevTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = prevTmp;
+    fs.rmSync(root, { recursive: true, force: true });
+    jest.restoreAllMocks();
+  });
+
+  const EMPTY = () => path.join(root, 'linkeon-claude-empty');
+  const perCallCwds = () => fs.readdirSync(root).filter((n) => n.startsWith('claude-cwd-'));
+
+  function capture(makeProc: () => any = () => fakeProc(OK_JSON)) {
+    const seen: Array<{ cwd: string; cfgPath: string; cfgMode: number; cwdEntries: string[]; perCall: string[] }> = [];
+    spawnMock.mockImplementation((_bin: string, args: string[], opts: any) => {
+      const cfgPath = flagValue(args, '--mcp-config') || '';
+      seen.push({
+        cwd: opts.cwd,
+        cfgPath,
+        cfgMode: cfgPath && fs.existsSync(cfgPath) ? fs.statSync(cfgPath).mode & 0o777 : -1,
+        cwdEntries: fs.existsSync(opts.cwd) ? fs.readdirSync(opts.cwd) : [],
+        perCall: perCallCwds(),
+      });
+      return makeProc();
+    });
+    return seen;
+  }
+
+  it('CLI идёт в <tmpdir>/linkeon-claude-empty: каталог переживает вызов, остаётся пустым, 0700', async () => {
+    const seen = capture();
+    await new ClaudeCliService().text('покажи продукты', { mcpServers: servers() });
+    expect(seen[0].cwd).toBe(EMPTY());
+    expect(seen[0].cwdEntries).toEqual([]);
+    expect(fs.lstatSync(EMPTY()).isDirectory()).toBe(true);
+    expect(fs.statSync(EMPTY()).mode & 0o777).toBe(0o700);
+    expect(fs.readdirSync(EMPTY())).toEqual([]);
+  });
+
+  it('один и тот же каталог на все вызовы — одноразовых claude-cwd-* не заводится', async () => {
+    const seen = capture();
+    const svc = new ClaudeCliService();
+    await svc.text('раз', { mcpServers: servers() });
+    await svc.text('два', { mcpServers: servers() });
+    expect(seen.map((x) => x.cwd)).toEqual([EMPTY(), EMPTY()]);
+    expect(seen.every((x) => x.perCall.length === 0)).toBe(true);
+    expect(perCallCwds()).toEqual([]);
+  });
+
+  it('каталог токенов — отдельный и на вызов: claude-mcp-*, 0600, не внутри cwd, снят после', async () => {
+    const seen = capture();
+    await new ClaudeCliService().text('покажи продукты', { mcpServers: servers() });
+    const cfgDir = path.dirname(seen[0].cfgPath);
+    expect(path.basename(cfgDir)).toMatch(/^claude-mcp-/);
+    expect(path.dirname(cfgDir)).toBe(root);
+    expect(seen[0].cfgMode).toBe(0o600);
+    expect(path.relative(seen[0].cwd, seen[0].cfgPath).startsWith('..')).toBe(true);
+    expect(fs.existsSync(cfgDir)).toBe(false);
+    expect(fs.existsSync(EMPTY())).toBe(true);
+  });
+
+  it('падение CLI: постоянный каталог остаётся, токен снят', async () => {
+    const seen = capture(() => fakeProc('boom-not-json', 1));
+    await expect(new ClaudeCliService().text('x', { mcpServers: servers() })).rejects.toThrow();
+    expect(seen[0].cwd).toBe(EMPTY());
+    expect(fs.existsSync(EMPTY())).toBe(true);
+    expect(fs.existsSync(path.dirname(seen[0].cfgPath))).toBe(false);
+  });
+
+  /** Запасной путь: одноразовый claude-cwd-*, пустой на старте, снят после вызова. */
+  async function expectFallback() {
+    const seen = capture();
+    await new ClaudeCliService().text('покажи продукты', { mcpServers: servers() });
+    expect(seen[0].cwd).not.toBe(EMPTY());
+    expect(path.basename(seen[0].cwd)).toMatch(/^claude-cwd-/);
+    expect(seen[0].cwdEntries).toEqual([]);
+    expect(fs.existsSync(seen[0].cwd)).toBe(false);
+    return seen[0];
+  }
+
+  it('на месте каталога симлинк — запасной одноразовый cwd; симлинк и его цель не тронуты', async () => {
+    const target = fs.mkdtempSync(path.join(root, 'elsewhere-'));
+    fs.writeFileSync(path.join(target, 'CLAUDE.md'), 'подброшено');
+    fs.symlinkSync(target, EMPTY());
+    await expectFallback();
+    expect(fs.lstatSync(EMPTY()).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(path.join(target, 'CLAUDE.md'), 'utf8')).toBe('подброшено');
+  });
+
+  it('на месте каталога обычный файл — запасной одноразовый cwd, файл не тронут', async () => {
+    fs.writeFileSync(EMPTY(), 'не каталог');
+    await expectFallback();
+    expect(fs.readFileSync(EMPTY(), 'utf8')).toBe('не каталог');
+  });
+
+  it('каталог чужой (другой владелец) — запасной одноразовый cwd', async () => {
+    fs.mkdirSync(EMPTY(), { mode: 0o700 });
+    const realLstat = fs.lstatSync;
+    jest.spyOn(fs, 'lstatSync').mockImplementation(((p: any, ...rest: any[]) => {
+      const st: any = (realLstat as any)(p, ...rest);
+      if (String(p) !== EMPTY()) return st;
+      const fake = Object.create(Object.getPrototypeOf(st));
+      Object.assign(fake, st, { uid: st.uid + 1 });
+      return fake;
+    }) as any);
+    await expectFallback();
+  });
+
+  it('каталог открыт на запись группе/всем — запасной одноразовый cwd', async () => {
+    fs.mkdirSync(EMPTY());
+    fs.chmodSync(EMPTY(), 0o777);
+    await expectFallback();
+  });
+
+  // Из cwd CLI сам подхватывает CLAUDE.md и .claude/settings.json (в них бывают
+  // хуки). Непустой «пустой» каталог — не тот, за который мы его держим.
+  it('каталог не пуст — запасной одноразовый cwd, содержимое не тронуто', async () => {
+    fs.mkdirSync(EMPTY(), { mode: 0o700 });
+    fs.writeFileSync(path.join(EMPTY(), 'CLAUDE.md'), 'подброшено');
+    await expectFallback();
+    expect(fs.readdirSync(EMPTY())).toEqual(['CLAUDE.md']);
+  });
+
+  it('без MCP постоянный каталог не заводится вовсе', async () => {
+    const seen = capture();
+    await new ClaudeCliService().text('привет');
+    expect(seen[0].cwd).toBe(root);
+    expect(fs.existsSync(EMPTY())).toBe(false);
   });
 });

@@ -72,6 +72,19 @@ describe('ClaudeCliService: уборка брошенных конфигов MCP
     expect(fs.existsSync(path.join(target, 'keep.txt'))).toBe(true);
   });
 
+  // Постоянный пустой cwd вызовов с MCP живёт рядом с каталогами токенов, но
+  // уборке не подлежит никогда — сколько бы ему ни было лет.
+  it('постоянный пустой cwd linkeon-claude-empty не трогает никогда', () => {
+    const keep = path.join(root, 'linkeon-claude-empty');
+    fs.mkdirSync(keep);
+    age(keep, 48 * HOUR);
+    const stale = path.join(root, 'claude-mcp-old2');
+    fs.mkdirSync(stale);
+    age(stale, 2 * HOUR);
+    expect(ClaudeCliService.sweepStaleMcpConfigDirs(root, HOUR)).toEqual([stale]);
+    expect(fs.existsSync(keep)).toBe(true);
+  });
+
   it('несуществующий корень — не падает и ничего не снимает', () => {
     expect(ClaudeCliService.sweepStaleMcpConfigDirs(path.join(root, 'nope'), HOUR)).toEqual([]);
   });
