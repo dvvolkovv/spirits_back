@@ -452,9 +452,10 @@ describe('ClaudeCliService argv: MCP-серверы на вызов', () => {
  * пуст) — берём одноразовый claude-cwd-* и снимаем его после вызова.
  * Каталог токенов — отдельно и по-прежнему на вызов.
  *
- * os.tmpdir() читает TMPDIR на каждом вызове: здесь он смотрит в свой корень,
- * чтобы не трогать настоящий <tmpdir>/linkeon-claude-empty, которым может
- * пользоваться живой сервис на той же машине.
+ * Корень подменяется у экземпляра (tmpRoot), чтобы не трогать настоящий
+ * <tmpdir>/linkeon-claude-empty, которым может пользоваться живой сервис на
+ * той же машине. Через TMPDIR нельзя: у теста в jest своя копия process.env,
+ * и до настоящего os.tmpdir() она не доходит.
  */
 describe('ClaudeCliService: постоянный пустой cwd для вызовов с MCP', () => {
   const TOKEN = 'product-tool-token-9d2e-SECRET';
@@ -467,18 +468,18 @@ describe('ClaudeCliService: постоянный пустой cwd для выз�
   });
 
   let root: string;
-  let prevTmp: string | undefined;
-  beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cwd-spec-root-'));
-    prevTmp = process.env.TMPDIR;
-    process.env.TMPDIR = root;
-  });
+  beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'cwd-spec-root-')); });
   afterEach(() => {
-    if (prevTmp === undefined) delete process.env.TMPDIR;
-    else process.env.TMPDIR = prevTmp;
     fs.rmSync(root, { recursive: true, force: true });
     jest.restoreAllMocks();
   });
+
+  /** Сервис, у которого корень временных каталогов — свой корень теста. */
+  const svcIn = () => {
+    const svc = new ClaudeCliService();
+    (svc as any).tmpRoot = () => root;
+    return svc;
+  };
 
   const EMPTY = () => path.join(root, 'linkeon-claude-empty');
   const perCallCwds = () => fs.readdirSync(root).filter((n) => n.startsWith('claude-cwd-'));
@@ -501,7 +502,7 @@ describe('ClaudeCliService: постоянный пустой cwd для выз�
 
   it('CLI идёт в <tmpdir>/linkeon-claude-empty: каталог переживает вызов, остаётся пустым, 0700', async () => {
     const seen = capture();
-    await new ClaudeCliService().text('покажи продукты', { mcpServers: servers() });
+    await svcIn().text('покажи продукты', { mcpServers: servers() });
     expect(seen[0].cwd).toBe(EMPTY());
     expect(seen[0].cwdEntries).toEqual([]);
     expect(fs.lstatSync(EMPTY()).isDirectory()).toBe(true);
@@ -511,7 +512,7 @@ describe('ClaudeCliService: постоянный пустой cwd для выз�
 
   it('один и тот же каталог на все вызовы — одноразовых claude-cwd-* не заводится', async () => {
     const seen = capture();
-    const svc = new ClaudeCliService();
+    const svc = svcIn();
     await svc.text('раз', { mcpServers: servers() });
     await svc.text('два', { mcpServers: servers() });
     expect(seen.map((x) => x.cwd)).toEqual([EMPTY(), EMPTY()]);
@@ -521,7 +522,7 @@ describe('ClaudeCliService: постоянный пустой cwd для выз�
 
   it('каталог токенов — отдельный и на вызов: claude-mcp-*, 0600, не внутри cwd, снят после', async () => {
     const seen = capture();
-    await new ClaudeCliService().text('покажи продукты', { mcpServers: servers() });
+    await svcIn().text('покажи продукты', { mcpServers: servers() });
     const cfgDir = path.dirname(seen[0].cfgPath);
     expect(path.basename(cfgDir)).toMatch(/^claude-mcp-/);
     expect(path.dirname(cfgDir)).toBe(root);
@@ -533,7 +534,7 @@ describe('ClaudeCliService: постоянный пустой cwd для выз�
 
   it('падение CLI: постоянный каталог остаётся, токен снят', async () => {
     const seen = capture(() => fakeProc('boom-not-json', 1));
-    await expect(new ClaudeCliService().text('x', { mcpServers: servers() })).rejects.toThrow();
+    await expect(svcIn().text('x', { mcpServers: servers() })).rejects.toThrow();
     expect(seen[0].cwd).toBe(EMPTY());
     expect(fs.existsSync(EMPTY())).toBe(true);
     expect(fs.existsSync(path.dirname(seen[0].cfgPath))).toBe(false);
@@ -542,9 +543,10 @@ describe('ClaudeCliService: постоянный пустой cwd для выз�
   /** Запасной путь: одноразовый claude-cwd-*, пустой на старте, снят после вызова. */
   async function expectFallback() {
     const seen = capture();
-    await new ClaudeCliService().text('покажи продукты', { mcpServers: servers() });
+    await svcIn().text('покажи продукты', { mcpServers: servers() });
     expect(seen[0].cwd).not.toBe(EMPTY());
     expect(path.basename(seen[0].cwd)).toMatch(/^claude-cwd-/);
+    expect(path.dirname(seen[0].cwd)).toBe(root);
     expect(seen[0].cwdEntries).toEqual([]);
     expect(fs.existsSync(seen[0].cwd)).toBe(false);
     return seen[0];
@@ -595,7 +597,7 @@ describe('ClaudeCliService: постоянный пустой cwd для выз�
 
   it('без MCP постоянный каталог не заводится вовсе', async () => {
     const seen = capture();
-    await new ClaudeCliService().text('привет');
+    await svcIn().text('привет');
     expect(seen[0].cwd).toBe(root);
     expect(fs.existsSync(EMPTY())).toBe(false);
   });
