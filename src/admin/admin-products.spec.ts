@@ -263,6 +263,7 @@ maybe('админка «Сайты и боты»: сервис против жи
       const db = await productRow(id);
       expect(res).toEqual({
         periodDays: 30,
+        truncated: false,
         products: [
           {
             id,
@@ -598,6 +599,28 @@ maybe('админка «Сайты и боты»: сервис против жи
       const res = await svc().list({});
       expect(res.products).toHaveLength(PRODUCTS_CAP);
       expect(res.products.slice(0, 2).map((r) => r.id)).toEqual([active, fresh]);
+      // Признак обрезки: без него интерфейс не знает, что показано не всё.
+      expect(res.truncated).toBe(true);
+    });
+
+    it(`ровно ${PRODUCTS_CAP} подходящих — не обрезано; фильтр, сузивший выдачу, снимает признак`, async () => {
+      await pool.query(
+        `INSERT INTO products (user_id, name, slug, kind, status, checkout_path, runner_token_hash, created_at)
+         SELECT $1, 'bulk ' || g, 'bulk' || g, 'bot', 'running', '/srv/bulk' || g, 'hash-bulk' || g,
+                now() - interval '1 hour'
+           FROM generate_series(1, $2::int) g`,
+        [OWNER, PRODUCTS_CAP],
+      );
+
+      const exact = await svc().list({});
+      expect(exact.products).toHaveLength(PRODUCTS_CAP);
+      expect(exact.truncated).toBe(false);
+
+      const site = await mkProduct({ slug: 'lonely', kind: 'site' });
+      expect((await svc().list({})).truncated).toBe(true);
+      const narrowed = await svc().list({ kind: 'site' });
+      expect(narrowed.products.map((r) => r.id)).toEqual([site]);
+      expect(narrowed.truncated).toBe(false);
     });
   });
 

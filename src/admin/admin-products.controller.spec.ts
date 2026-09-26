@@ -124,7 +124,9 @@ describe('AdminProductsController: карточка', () => {
     const svc = { card: jest.fn() };
     const ctrl = new AdminProductsController(svc as any);
 
-    await expect(viaRoute(ctrl, 'productCard', {}, { id: 'shop' })).rejects.toBeInstanceOf(NotFoundException);
+    const e = await viaRoute(ctrl, 'productCard', {}, { id: 'shop' }).catch((x: any) => x);
+    expect(e).toBeInstanceOf(NotFoundException);
+    expect(e.message).toBe('Продукт не найден');
     expect(svc.card).not.toHaveBeenCalled();
   });
 
@@ -135,6 +137,7 @@ describe('AdminProductsController: карточка', () => {
     const unknown = await viaRoute(ctrl, 'productCard', {}, { id: ID }).catch((e: any) => e);
     const garbage = await viaRoute(ctrl, 'productCard', {}, { id: 'x' }).catch((e: any) => e);
     expect(unknown).toBeInstanceOf(NotFoundException);
+    expect(unknown.message).toBe('Продукт не найден');
     expect(unknown.message).toBe(garbage.message);
   });
 });
@@ -227,8 +230,14 @@ describe('AdminProductsController: охрана на настоящем марш
     expect(svc.card).toHaveBeenCalledWith(ID, { periodDays: 7 });
   });
 
-  it('администратор: не-uuid и неизвестный продукт — 404', async () => {
-    expect((await get(`${base}/admin/products/shop`, bearer(ADMIN))).status).toBe(404);
-    expect((await get(`${base}/admin/products/${ID}`, bearer(ADMIN))).status).toBe(404);
+  it('администратор: не-uuid и неизвестный продукт — одинаковая 404 по-русски', async () => {
+    const garbage = await get(`${base}/admin/products/shop`, bearer(ADMIN));
+    const unknown = await get(`${base}/admin/products/${ID}`, bearer(ADMIN));
+
+    expect(garbage.status).toBe(404);
+    expect(unknown.status).toBe(404);
+    expect(garbage.body.message).toBe('Продукт не найден');
+    // Тело целиком одинаковое: разница — подсказка о том, какие id существуют.
+    expect(unknown.body).toEqual(garbage.body);
   });
 });
