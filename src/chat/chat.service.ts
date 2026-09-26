@@ -1000,6 +1000,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // бы сама. Инкремент — внутри try, декремент — в finally: парные при любом
     // исходе.
     const turnKey = `${userId}_${assistantId}`;
+    // Пинги снимаются в finally. Пинг, успевший уйти между ответом CLI и item
+    // (пока подбирается карта), клиенты пропускают; после end таймер не
+    // вклинится — запись end и finally идут синхронно.
     let ping: NodeJS.Timeout | null = null;
     try {
       this.activeStreams++;
@@ -1055,9 +1058,6 @@ ${LanguageService.buildDirective(userLanguage)}`;
         this.logger.error(`Маша claude CLI error: ${e.message}`);
         rawText = 'Извините, временные проблемы со связью. Попробуйте ещё раз через минуту.';
       }
-      // Ответ готов — дальше пишем его сами, пинги больше не нужны.
-      clearInterval(ping);
-      ping = null;
 
       // Clean and post-process the full response
       let fullText = this.stripToolTags(rawText);
