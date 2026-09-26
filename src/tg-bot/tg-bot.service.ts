@@ -642,6 +642,9 @@ export class TgBotService implements OnModuleInit {
     // 10 минут, чтобы юзеры с пустым балансом не думали, что бот молча умер.
     const preBalance = await this.billing.getBalance(cfg.owner_user_id);
     if (preBalance <= 0) {
+      // Ход не состоится, и сообщение в историю не попадёт — файл тоже не
+      // должен остаться в папке чата (см. discardAttachments).
+      this.discardAttachments(attachments);
       const ZERO_BALANCE_COOLDOWN_MS = 10 * 60 * 1000;
       const recent = await this.billing.recentlyNotifiedZeroBalance(cfg.id, ZERO_BALANCE_COOLDOWN_MS);
       if (!recent) {
@@ -668,7 +671,10 @@ export class TgBotService implements OnModuleInit {
         const handled = await this.meetings.tryHandleLink(
           msg.chat.id, workingText, cfg.owner_user_id,
         );
-        if (handled) return;
+        if (handled) {
+          this.discardAttachments(attachments);
+          return;
+        }
       } catch (e: any) {
         // Не повод глушить сообщение: не получилось показать приглашение —
         // пусть ассистент ответит как обычно.
@@ -822,13 +828,13 @@ export class TgBotService implements OnModuleInit {
       // Инструмент продуктов владельца — только ему и только в чате, где кроме
       // него никто не писал (см. productsOwnerForTurn). Считается ПОСЛЕ
       // persistUserMessage: текущее сообщение уже в истории и тоже учтено.
-      const productsOwnerId = await this.productsOwnerForTurn(cfg, msg);
+      const productsOwner = await this.productsOwnerForTurn(cfg, msg);
 
       let reply: { text: string; costUsd: number };
       try {
         reply = await this.router.generateReply(cfg, ownerFirstName, attachments, (ev) => {
           if (ev.kind === 'tool_use') editStatus(labelFor(ev.name)).catch(() => {});
-        }, workspace ?? undefined, { productsOwnerId });
+        }, workspace ?? undefined, { productsOwner });
       } catch (e: any) {
         // Не вылетаем тихо — пишем юзеру в статус и оставляем след в БД.
         await this.recordTurnFailure(cfg, msg.chat.id, statusMsgId, e);
@@ -976,6 +982,33 @@ export class TgBotService implements OnModuleInit {
   }
 
   /**
+   * Пересланное ли сообщение — хоть одна его часть (у альбома — любая).
+   * forward_origin — поле Bot API 7+, forward_* — прежние, их Telegram ещё
+   * шлёт; is_automatic_forward — пост канала, продублированный в обсуждение.
+   */
+  static isForwarded(msg: any): boolean {
+    const parts: any[] = [msg, ...((msg?.albumParts as any[] | undefined) ?? [])];
+    return parts.some((p) =>
+      !!p && !!(p.forward_origin || p.forward_from || p.forward_from_chat ||
+        p.forward_sender_name || p.forward_date || p.is_automatic_forward),
+    );
+  }
+
+  /**
+   * Файлы, скачанные для хода, который не состоялся: выходы до
+   * persistUserMessage (нулевой баланс, ссылка на встречу). Оставленный файл
+   * увидел бы следующий ход — в списке папки и через Read, — а проверка «кто
+   * писал в чате» (tg_bot_messages) о его авторе не знала бы: чужой файл
+   * доехал бы до модели владельца мимо гейта инструмента продуктов.
+   */
+  private discardAttachments(paths: string[]): void {
+    for (const p of paths) {
+      try { fs.rmSync(p, { force: true }); }
+      catch (e: any) { this.logger.warn(`discard attachment failed (${p}): ${e.message}`); }
+    }
+  }
+
+  /**
    * Подпись статус-сообщения, пока идёт вызов инструмента. Статическая и без
    * `this` — чтобы проверяться тестом, не поднимая ход целиком.
    */
@@ -1002,25 +1035,34 @@ export class TgBotService implements OnModuleInit {
    * если
    *   1) текущее сообщение написал сам владелец бота — его Telegram привязан к
    *      тому же аккаунту Linkeon, что владеет конфигом (tg_user_identities
-   *      1:1), и
-   *   2) в этом чате за всю историю не писал никто, кроме него
-   *      (router.onlySpeakerIs; текущее сообщение к этому моменту сохранено).
-   * Личка проходит сама собой. Хоть одна чужая реплика — и в этом чате
-   * инструмента больше нет: чужой текст в истории мог бы править продукты
-   * владельца его же руками. «В группе» здесь не критерий: сольная группа
-   * владельца проходит, людная личка невозможна.
+   *      1:1), — и написал сам: пересланное сообщение написал кто-то другой,
+   *      даже если переслал владелец;
+   *   2) ни в этом чате, ни в истории этого конфига за всё время не писал
+   *      никто, кроме него (router.onlySpeakerIs; текущее сообщение к этому
+   *      моменту сохранено).
+   * Личка проходит сама собой. Хоть одна чужая реплика — и инструмента здесь
+   * больше нет: чужой текст в истории мог бы править продукты владельца его
+   * же руками. «В группе» здесь не критерий: сольная группа владельца
+   * проходит, людная личка невозможна.
+   *
+   * Отдаёт и TG-id владельца: generateReply сверяет по нему снимок истории,
+   * который уйдёт в модель (вторая линия — против гонки с чужой репликой).
    *
    * Любой сбой — «ничьи»: без инструмента бот работает как раньше, а выдать
    * его по ошибке нельзя.
    */
-  private async productsOwnerForTurn(cfg: TgBotConfigRow, msg: any): Promise<string | undefined> {
+  private async productsOwnerForTurn(
+    cfg: TgBotConfigRow,
+    msg: any,
+  ): Promise<{ linkeonId: string; tgUserId: number } | undefined> {
     const senderTgId = msg?.from?.id;
     if (!cfg?.owner_user_id || typeof senderTgId !== 'number') return undefined;
+    if (TgBotService.isForwarded(msg)) return undefined;
     try {
       const senderLinkeonId = await this.identity.getLinkeonIdByTgUserId(senderTgId);
       if (!senderLinkeonId || senderLinkeonId !== cfg.owner_user_id) return undefined;
       if (!(await this.router.onlySpeakerIs(cfg, senderTgId))) return undefined;
-      return cfg.owner_user_id;
+      return { linkeonId: cfg.owner_user_id, tgUserId: senderTgId };
     } catch (e: any) {
       this.logger.warn(`products tool gate failed in chat ${msg?.chat?.id}: ${e?.message}`);
       return undefined;

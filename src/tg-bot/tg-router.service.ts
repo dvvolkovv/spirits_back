@@ -72,28 +72,34 @@ export class TgRouterService {
   }
 
   /**
-   * Писал ли в этом чате хоть раз кто-нибудь, КРОМЕ tgUserId. Нужен гейту
-   * инструмента продуктов (tg-bot.service, productsOwnerForTurn): решение
-   * владельца — инструмент есть, только пока в чате не писал никто, кроме
-   * владельца.
+   * Писал ли хоть раз кто-нибудь, КРОМЕ tgUserId, — в этом чате ИЛИ в этом
+   * конфиге. Нужен гейту инструмента продуктов (tg-bot.service,
+   * productsOwnerForTurn): решение владельца — инструмент есть, только пока
+   * никто, кроме владельца, не писал.
    *
-   * Выборка та же, что у isSoloChat (весь чат по tg_chat_id, через все его
-   * конфиги, только реплики людей), но строже в двух местах:
+   * Смотрим на то же, что видит модель. История хода грузится по config_id
+   * (loadHistory), а reissueClaim переносит конфиг в другой чат с тем же id:
+   * реплики чужого из прошлой группы едут в промпт, хотя в новом чате писал
+   * только владелец. Поэтому — и конфиг (всё, что попадёт в историю), и чат
+   * (всё, что здесь писали при прошлых конфигах), за всё время.
+   *
+   * Строже isSoloChat в двух местах:
    *   • единственный писавший обязан быть ИМЕННО этим человеком, а не просто
    *     «кто-то один»; его сообщений нет вовсе (текущее не сохранилось) — «нет»;
    *   • строка без tg_user_id считается чужой: автор неизвестен, а выдать
    *     инструмент по ошибке нельзя.
    * То же честное ограничение, что у isSoloChat: молчаливого читателя, который
-   * ни разу не написал, эта проверка не видит.
+   * ни разу не написал, эта проверка не видит. SQL исполняется против живой
+   * базы в tg-router.only-speaker.integration.spec.ts.
    */
   async onlySpeakerIs(cfg: TgBotConfigRow, tgUserId: number): Promise<boolean> {
     if (!cfg.tg_chat_id) return false;
     const r = await this.pg.query(
-      `SELECT count(*) FILTER (WHERE tg_user_id IS DISTINCT FROM $2) AS others,
-              count(*) FILTER (WHERE tg_user_id = $2)               AS mine
+      `SELECT count(*) FILTER (WHERE tg_user_id IS DISTINCT FROM $3) AS others,
+              count(*) FILTER (WHERE tg_user_id = $3)               AS mine
          FROM tg_bot_messages
-        WHERE tg_chat_id = $1 AND role = 'user'`,
-      [cfg.tg_chat_id, tgUserId],
+        WHERE (config_id = $1 OR tg_chat_id = $2) AND role = 'user'`,
+      [cfg.id, cfg.tg_chat_id, tgUserId],
     );
     const others = Number(r.rows[0]?.others ?? 1);
     const mine = Number(r.rows[0]?.mine ?? 0);
@@ -357,10 +363,17 @@ ${recent}
   /**
    * Последние 20 сообщений группы. Формат для prompt: chronological строки
    * "USER [Vasya]: ..." / "ASSISTANT: ...".
+   *
+   * tgUserId — автор реплики (bigint из node-pg, строкой; у ответов бота —
+   * null). В промпт он не идёт: по нему generateReply проверяет, что в снимке,
+   * который увидит модель, нет чужих реплик, прежде чем выдать инструмент
+   * продуктов.
    */
-  private async loadHistory(configId: string): Promise<Array<{ role: 'user' | 'assistant'; content: string }>> {
+  private async loadHistory(
+    configId: string,
+  ): Promise<Array<{ role: 'user' | 'assistant'; content: string; tgUserId: string | null }>> {
     const r = await this.pg.query(
-      `SELECT role, tg_user_name, content
+      `SELECT role, tg_user_id, tg_user_name, content
          FROM tg_bot_messages
         WHERE config_id = $1 AND role IN ('user','assistant')
         ORDER BY created_at DESC
@@ -371,7 +384,22 @@ ${recent}
     return rows.map((row: any) => ({
       role: row.role === 'assistant' ? 'assistant' : 'user',
       content: row.role === 'user' ? `[${row.tg_user_name || 'user'}]: ${row.content}` : row.content,
+      tgUserId: row.tg_user_id === null || row.tg_user_id === undefined ? null : String(row.tg_user_id),
     }));
+  }
+
+  /**
+   * Все реплики людей в снимке истории — владельца (и хотя бы одна есть).
+   * Снимок — ровно то, что уйдёт в модель, поэтому проверка закрывает и гонку:
+   * между запросом гейта и загрузкой истории в чат может прийти чужая реплика
+   * (её сохраняет и ветка «занято»).
+   */
+  private historyIsOwnersOnly(
+    history: Array<{ role: 'user' | 'assistant'; tgUserId: string | null }>,
+    ownerTgUserId: number,
+  ): boolean {
+    const humans = history.filter((m) => m.role === 'user');
+    return humans.length > 0 && humans.every((m) => m.tgUserId !== null && m.tgUserId === String(ownerTgUserId));
   }
 
   /**
@@ -384,17 +412,27 @@ ${recent}
     attachmentPaths?: string[],
     onProgress?: (event: ClaudeCliProgressEvent) => void,
     sandboxDir?: string,
-    // productsOwnerId — чьи продукты может править этот ход. Задаёт ТОЛЬКО
-    // tg-bot.service, и только когда пишет сам владелец и в чате никто другой
-    // не писал (productsOwnerForTurn). Не задан — ход ровно прежний.
-    opts: { productsOwnerId?: string } = {},
+    // productsOwner — чьи продукты может править этот ход и его Telegram-id.
+    // Задаёт ТОЛЬКО tg-bot.service, и только когда пишет сам владелец и никто
+    // другой не писал (productsOwnerForTurn). Не задан — ход ровно прежний.
+    opts: { productsOwner?: { linkeonId: string; tgUserId: number } } = {},
   ): Promise<{ text: string; costUsd: number }> {
     const { systemPrompt } = await this.resolveSystemPrompt(cfg);
+    const history = await this.loadHistory(cfg.id);
     // Инструмент продуктов владельца (сайты и боты в Линкеоне): тот же
     // /webhook/mcp/products, что у веба, по loopback; токен с каналом telegram —
-    // правка ляжет в product_turns с channel='telegram'.
-    const products = opts.productsOwnerId ? productsCliMcp(opts.productsOwnerId, 'telegram') : null;
-    const history = await this.loadHistory(cfg.id);
+    // правка ляжет в product_turns с channel='telegram'. Вторая линия после
+    // гейта: снимок истории, который увидит модель, обязан быть только
+    // владельца — иначе инструмента нет.
+    const owner = opts.productsOwner;
+    let products: ReturnType<typeof productsCliMcp> | null = null;
+    if (owner) {
+      if (this.historyIsOwnersOnly(history, owner.tgUserId)) {
+        products = productsCliMcp(owner.linkeonId, 'telegram');
+      } else {
+        this.logger.warn(`products tool withheld in config ${cfg.id}: history snapshot has a non-owner line`);
+      }
+    }
     const ownerProfile = await this.loadOwnerProfile(cfg);
 
     // Что уже лежит в рабочей папке чата. Без этого списка модель не знает, что
