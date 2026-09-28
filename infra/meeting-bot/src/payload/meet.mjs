@@ -52,8 +52,7 @@ export const meetPayload = (displayName) => `
       for (const t of tiles) {
         const id = t.getAttribute('data-participant-id');
         if (!id || seen.has(id)) continue;
-        const name = clean((t.innerText || '').split('
-')[0]);
+        const name = clean((t.innerText || '').split('\n')[0]);
         // Себя в состав не пишем: площадка считает и нас.
         if (name && name === myName) continue;
         seen.set(id, name || 'участник');
