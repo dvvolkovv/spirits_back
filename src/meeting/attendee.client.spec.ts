@@ -1,4 +1,4 @@
-import { AttendeeClient, attendeeConfigured } from './attendee.client';
+import { AttendeeClient, attendeeConfigured, bridgeConfigured } from './attendee.client';
 
 const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body }) as any;
 
@@ -325,6 +325,52 @@ describe('AttendeeClient', () => {
       delete process.env.MEETING_BOT_URL;
       delete process.env.MEETING_BOT_API_KEY;
       expect(await createFor('meet')).toContain('https://attendee.test');
+    });
+  });
+  describe('есть ли мост для площадки', () => {
+    // Прод 28.09.2026: Attendee там нет вовсе, свой сервис настроен и работает,
+    // а карточка входа не появлялась — проверка спрашивала «настроен ли
+    // Attendee», хотя Телемост, Zoom и Meet ходят уже не через него. Ссылка
+    // оставалась обычной ссылкой, и ассистент честно отвечал, что зайти не
+    // может.
+    beforeEach(() => {
+      delete process.env.ATTENDEE_BASE_URL;
+      delete process.env.ATTENDEE_API_KEY;
+      delete process.env.MEETING_BOT_URL;
+      delete process.env.MEETING_BOT_API_KEY;
+    });
+
+    const ourBot = () => {
+      process.env.MEETING_BOT_URL = 'http://46.101.255.44:8180';
+      process.env.MEETING_BOT_API_KEY = 'ключ';
+    };
+    const bridge = () => {
+      process.env.ATTENDEE_BASE_URL = 'https://attendee.test';
+      process.env.ATTENDEE_API_KEY = 'k1';
+    };
+
+    it.each(['telemost', 'zoom', 'meet'])('%s: хватает своего сервиса, без моста', (p) => {
+      ourBot();
+      expect(bridgeConfigured(p)).toBe(true);
+    });
+
+    it('teams: своего сервиса мало — его ведёт мост', () => {
+      ourBot();
+      expect(bridgeConfigured('teams')).toBe(false);
+      bridge();
+      expect(bridgeConfigured('teams')).toBe(true);
+    });
+
+    it('наши площадки работают и через мост, если своего сервиса нет', () => {
+      // Путь отката: убрали переменные своего сервиса — всё едет на мост, как
+      // раньше, и карточка обязана остаться.
+      bridge();
+      expect(bridgeConfigured('telemost')).toBe(true);
+    });
+
+    it('без обоих мостов входить некуда', () => {
+      expect(bridgeConfigured('telemost')).toBe(false);
+      expect(bridgeConfigured('teams')).toBe(false);
     });
   });
 });

@@ -11,7 +11,7 @@ import { LanguageService, LANGUAGE_REPLY_LINE, DEFAULT_LANGUAGE } from '../commo
 import { parseMeetingLink } from '../meeting/meeting-link';
 import { RoomService } from '../meeting/room.service';
 import { buildMeetingCard } from './meeting-card';
-import { attendeeConfigured } from '../meeting/attendee.client';
+import { bridgeConfigured } from '../meeting/attendee.client';
 import { IntegrationFlagsService } from '../integrations/integration-flags.service';
 import { TalerIdRoomClient } from '../meeting/talerid-room.client';
 import { RESPONSE_STYLE_RULE } from './response-style';
@@ -707,10 +707,12 @@ export class ChatService {
         // Карточку показываем сразу — цена ошибки невелика, а требовать
         // проверки значит не показывать карточку никогда.
         //
-        // Но если Attendee не настроен, входить некуда вовсе, и карточка
-        // только обманывала бы: кнопка отказывала бы всегда. Тогда ссылка
-        // остаётся обычной ссылкой в разговоре, и ход идёт обычным путём.
-        ? (attendeeConfigured()
+        // Но если моста для этой площадки нет, входить некуда вовсе, и
+        // карточка только обманывала бы: кнопка отказывала бы всегда. Тогда
+        // ссылка остаётся обычной ссылкой в разговоре, и ход идёт обычным
+        // путём. Спрашиваем ПРО ПЛОЩАДКУ: Телемост, Zoom и Meet ведёт свой
+        // сервис, Teams — мост, и «настроен ли Attendee» тут уже не ответ.
+        ? (bridgeConfigured(meetingLink.provider)
             ? {
                 code: meetingLink.code,
                 title:

@@ -84,6 +84,37 @@ export function attendeeConfigured(): boolean {
   return !!process.env.ATTENDEE_BASE_URL && !!process.env.ATTENDEE_API_KEY;
 }
 
+/** Настроен ли НАШ сервис ботов. */
+export function meetingBotConfigured(): boolean {
+  return !!process.env.MEETING_BOT_URL && !!process.env.MEETING_BOT_API_KEY;
+}
+
+/**
+ * Есть ли куда вести бота НА ЭТУ площадку.
+ *
+ * Прежде спрашивали только про Attendee — и это было верно, пока мост был
+ * один. Теперь Телемост, Zoom и Meet ходят через свой сервис, а на мосту
+ * остался один Teams. Прод 28.09.2026 показал цену старой проверки: Attendee
+ * там нет вовсе, свой сервис настроен и работает, а карточка входа не
+ * появлялась — ссылка на Телемост оставалась обычной ссылкой, и ассистент
+ * честно отвечал, что зайти не может.
+ *
+ * Список площадок — тот же, что в `route()`: одна таблица на маршрутизацию и
+ * на проверку, иначе они разъедутся ровно так же.
+ */
+export function bridgeConfigured(provider?: string): boolean {
+  if (OUR_PROVIDERS.has(provider || '')) return meetingBotConfigured() || attendeeConfigured();
+  return attendeeConfigured();
+}
+
+/**
+ * Площадки, которые ведёт НАШ сервис. Остальные — на мосту.
+ *
+ * Объявлено здесь, рядом с проверкой и маршрутизацией: разъехавшись, они дают
+ * ровно ту ошибку, ради которой эта функция и появилась.
+ */
+const OUR_PROVIDERS = new Set(['telemost', 'zoom', 'meet']);
+
 export interface CreateBotParams {
   meetingUrl: string;
   botName: string;
@@ -151,8 +182,7 @@ export class AttendeeClient {
     const ownBase = (process.env.MEETING_BOT_URL || '').replace(/\/+$/, '');
     const ownKey = process.env.MEETING_BOT_API_KEY || '';
     const own = !!ownBase && !!ownKey;
-    const OURS = new Set(['telemost', 'zoom', 'meet']);
-    const ours = own && (OURS.has(target || '') || !!target?.startsWith('mb_'));
+    const ours = own && (OUR_PROVIDERS.has(target || '') || !!target?.startsWith('mb_'));
     if (ours) return { base: ownBase, key: ownKey };
 
     const base = this.base();

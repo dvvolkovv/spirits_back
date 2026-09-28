@@ -6,7 +6,7 @@ import { VoiceCallService } from '../voice-call/voice-call.service';
 import { SPECIALIST_ROLES, SPECIALISTS } from '../voice-call/voice-call.types';
 import { RoomService } from './room.service';
 import { TalerIdRoomClient } from './talerid-room.client';
-import { AttendeeClient, attendeeConfigured } from './attendee.client';
+import { AttendeeClient, bridgeConfigured } from './attendee.client';
 import { IntegrationFlagsService } from '../integrations/integration-flags.service';
 import { assistantSignature } from './assistant-signature';
 import { MeetingProvider, zoomMeetingNumber } from './meeting-link';
@@ -193,7 +193,7 @@ export class MeetingService {
     let roomName: string;
     let external: { url: string; token: string; chatUrl?: string } | undefined;
 
-    if (isBridged && !attendeeConfigured()) {
+    if (isBridged && !bridgeConfigured(provider)) {
       // Не настроен — входить некуда. Отказ ДО создания записи звонка:
       // иначе строка осталась бы в dialing и заперла пользователю его же
       // следующий вход до реапера.
