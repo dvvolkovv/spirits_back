@@ -40,6 +40,27 @@ export const meetPayload = (displayName) => `
   // остаётся счётчик на кнопке. Счётчика хватает: гейт по имени решает по
   // числу, наедине ли ассистент, а имена — приятное дополнение.
   const readPeople = () => {
+    // Плитки участников — главный источник.
+    //
+    // Кнопки «Участники» в интерфейсе Meet больше нет: её убрали в «Инструменты
+    // встречи», а боковая панель у нас занята чатом (панель одна на всё). Зато
+    // каждая плитка помечена data-participant-id — это и устойчивее счётчика,
+    // и даёт настоящие имена вместо безличных «Участник N».
+    const tiles = [...document.querySelectorAll('[data-participant-id]')];
+    if (tiles.length) {
+      const seen = new Map();
+      for (const t of tiles) {
+        const id = t.getAttribute('data-participant-id');
+        if (!id || seen.has(id)) continue;
+        const name = clean((t.innerText || '').split('
+')[0]);
+        // Себя в состав не пишем: площадка считает и нас.
+        if (name && name === myName) continue;
+        seen.set(id, name || 'участник');
+      }
+      if (seen.size) return { people: [...seen].map(([uuid, name]) => ({ uuid, name })) };
+    }
+
     const list =
       document.querySelector('div[aria-label="Participants"][role="list"]') ||
       document.querySelector('div[aria-label="Участники"][role="list"]') ||
