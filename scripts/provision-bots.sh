@@ -40,12 +40,14 @@ ssh_bots 'sudo bash -s' <<'REMOTE'
 set -eo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-# xvfb — экран для браузера; xdotool и xclip тут НЕ нужны (ими мы не пользуемся),
-# fonts-liberation и шрифты — иначе страницы площадок рисуются квадратами, и
-# зацепки по тексту перестают совпадать.
+# xvfb — экран для браузера; шрифты — иначе страницы площадок рисуются
+# квадратами, и зацепки по тексту перестают совпадать; x11vnc — чтобы владелец
+# мог один раз войти в аккаунт Google руками (google-login.sh): без этого входа
+# Meet бота не пускает.
 apt-get install -y -qq \
   xvfb fonts-liberation fonts-noto-color-emoji fonts-dejavu-core \
-  ca-certificates curl gnupg git rsync
+  ca-certificates curl gnupg git rsync \
+  x11vnc
 REMOTE
 
 bold "[2/6] Google Chrome"
