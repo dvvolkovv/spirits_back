@@ -529,6 +529,35 @@ export class MeetingBot {
     return this.page.frames().find((f) => sel.frame.test(f.url())) || this.page;
   }
 
+  /**
+   * Убирать преграды, пока не появится кадр встречи. `true` — кадр есть.
+   *
+   * Площадка вправе показать поверх входа что угодно — ознакомление, выбор
+   * «в браузере или в приложении», баннер, — и показать не сразу. Клик здесь с
+   * запасным путём через скрипт: такие окна как раз и перехватывают настоящий
+   * клик своей обёрткой.
+   */
+  async clearBlockers(sel, timeout = 40_000) {
+    if (!sel?.frame) return true;
+    const deadline = Date.now() + timeout;
+    const clicked = new Set();
+    while (Date.now() < deadline) {
+      if (this.page.frames().some((f) => sel.frame.test(f.url()))) return true;
+      for (const selector of [].concat(sel.dismiss || [])) {
+        if (clicked.has(selector)) continue;
+        const el = this.page.locator(selector).first();
+        if (!(await el.isVisible().catch(() => false))) continue;
+        try { await el.click({ timeout: 3_000 }); }
+        catch { await el.evaluate((n) => n.click()).catch(() => {}); }
+        clicked.add(selector);
+        this.log.info?.(`[${this.id}] убрали преграду со страницы`);
+        await this.page.waitForTimeout(1_500);
+      }
+      await this.page.waitForTimeout(1_000);
+    }
+    return this.page.frames().some((f) => sel.frame.test(f.url()));
+  }
+
   /** Дождаться появления кадра встречи. `false` — не дождались. */
   async waitForFrame(sel, timeout = 30_000) {
     if (!sel?.frame) return true;
@@ -552,21 +581,16 @@ export class MeetingBot {
      */
     // Сначала убираем то, что стоит на пути, и только потом ждём кадр.
     //
-    // Порядок не косметический: у Телемоста кадр встречи не создаётся, пока
-    // человек не выбрал «Продолжить в браузере», — и прежняя редакция честно
-    // ждала кадр тридцать секунд, а убирала преграды уже после (прод
-    // 28.09.2026). Ищем их на самой странице: они живут в оболочке, а не в
-    // кадре, которого ещё нет.
-    for (const selector of [].concat(sel.dismiss || [])) {
-      const el = this.page.locator(selector).first();
-      if (!(await el.count().catch(() => 0))) continue;
-      try { await el.click({ timeout: 4_000 }); }
-      catch { await el.evaluate((n) => n.click()).catch(() => {}); }
-      this.log.info?.(`[${this.id}] убрали преграду со страницы`);
-      await this.page.waitForTimeout(1_500);
-    }
-
-    if (!(await this.waitForFrame(sel))) {
+    // Порядок не косметический: у Телемоста кадр встречи не создаётся, пока не
+    // выбрано «Продолжить в браузере». Прежняя редакция ждала кадр тридцать
+    // секунд и убирала преграды уже после; следующая убирала их сразу — и не
+    // находила, потому что страница их ещё не нарисовала (прод 28.09.2026,
+    // оба раза).
+    //
+    // Поэтому не «проверить и идти дальше», а НАСТОЙЧИВО: каждую секунду
+    // смотрим, не появилось ли что-то из списка, и уходим, как только виден
+    // кадр встречи. Преграды приходят не разом и не в одном порядке.
+    if (!(await this.clearBlockers(sel))) {
       this.log.warn?.(`[${this.id}] кадра встречи не дождались — работаем со страницей`);
     }
 
