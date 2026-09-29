@@ -1758,7 +1758,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Шаги работы (activity) под эту гарантию не подпадают: неудавшийся
       // прогон мог успеть прислать свои шаги ДО того, как понял, что поток
       // пуст, а повтор пришлёт свои — итог видимый, но не ломающий: веб
-      // схлопывает подряд идущие одинаковые шаги в один.
+      // покажет повтор счётчиком («×2») или второй строкой, ответ не страдает.
       if (chunks.length === 0 && !clientDisconnected) {
         this.logger.warn(`empty stream from r.linkeon for ${userId}_${assistantId} — self-heal retry`);
         this.events?.track('chat_quality', {
