@@ -241,7 +241,11 @@ describe('buildUploadHandoff: системный промпт загрузки �
     await new Promise((r) => setImmediate(r));
     await new Promise((r) => setImmediate(r));
 
-    const f = fieldsOf(post.mock.calls[0][1]);
+    // mock.calls копится за ВСЕ тесты файла (в этом describe нет
+    // clearAllMocks — он живёт только в describe выше) — берём СВОЙ, то есть
+    // последний, вызов, а не [0].
+    const lastCall = post.mock.calls[post.mock.calls.length - 1];
+    const f = fieldsOf(lastCall[1]);
     const handoff = await svc.buildUploadHandoff({ userId: PHONE, assistantId: '12', ask: true });
     expect(f.systemPrompt).toBe(handoff.systemPrompt);
   });
