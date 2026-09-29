@@ -15,7 +15,9 @@ export interface ClientUi {
   ask: boolean;
 }
 
-export const NO_CLIENT_UI: ClientUi = { activity: false, ask: false };
+// Заморожен: общий объект-константа, случайная мутация по ссылке не должна
+// расползаться на другие места, где она возвращается напрямую.
+export const NO_CLIENT_UI: Readonly<ClientUi> = Object.freeze({ activity: false, ask: false });
 
 export function parseClientUi(raw: unknown): ClientUi {
   let v: unknown = raw;

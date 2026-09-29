@@ -64,6 +64,13 @@ const BY_NAME: Record<string, ActivityKind> = {
 const DETAIL_MAX = 80;
 const UPLOAD_DIR = '/tmp/agent-uploads/';
 const OUTPUT_DIR = '/tmp/agent-output/';
+// relay-agent/paths.mjs: SESSION_KEY_MAX — ключ сессии на диске релея обрезан
+// до этой длины (sessionFsKey/uploadFileName). Здесь то же число нужно, чтобы
+// правильно вычислить и срезать префикс у длинного relaySessionId.
+const RELAY_FS_KEY_MAX = 48;
+// Релей-фолбэк, когда основное имя не легло на диск: `<ключ>_<randomUUID>.ext`
+// (relay-agent/paths.mjs, fallbackFileName). Случайный UUID — не имя файла.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Поле аргументов. input обрезан релеем — целиком он часто не разбирается. */
 function inputField(raw: unknown, key: string): string | undefined {
@@ -89,13 +96,30 @@ function cleanDetail(s: string | undefined, userId: string): string | undefined 
   const one = s.replace(/\s+/g, ' ').trim();
   if (!one) return undefined;
   if (userId && one.includes(userId)) return undefined;
+  // Телефон пользователя приходит в детали в любом форматировании (пробелы,
+  // дефисы, +7 вместо 7) — сверяем только цифры, по последним 10 (сам номер
+  // без кода страны). userId-UUID под это правило не подпадает (в нём мало
+  // подряд идущих цифр без букв), для него остаётся точное совпадение
+  // подстроки выше.
+  const userDigits = userId ? userId.replace(/\D/g, '') : '';
+  if (userDigits.length >= 10) {
+    const last10 = userDigits.slice(-10);
+    const detailDigits = one.replace(/\D/g, '');
+    if (detailDigits.includes(last10)) return undefined;
+  }
   return one.length > DETAIL_MAX ? `${one.slice(0, DETAIL_MAX - 1)}…` : one;
 }
 
 function hostOf(url: string | undefined): string | undefined {
   if (!url) return undefined;
   try {
-    return new URL(url).hostname.replace(/^www\./, '') || undefined;
+    const host = new URL(url).hostname.replace(/^www\./, '');
+    if (!host) return undefined;
+    if (host === 'localhost') return undefined;
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return undefined; // IPv4-литерал
+    if (host.includes(':')) return undefined; // IPv6-литерал ([::1] — new URL() отдаёт хост с квадратными скобками)
+    if (!host.includes('.')) return undefined; // без точки — не похоже на публичный домен
+    return host;
   } catch {
     return undefined;
   }
@@ -106,15 +130,23 @@ function fileName(filePath: string, who: ActivityOwner): string | undefined {
   let base = filePath.slice(filePath.lastIndexOf('/') + 1);
   if (filePath.startsWith(UPLOAD_DIR)) {
     // Релей кладёт загрузку как `<ключ сессии>_<имя>` и меняет всё, кроме
-    // [a-zA-Z0-9._-], на «_» (relay-agent/paths.mjs, uploadFileName).
+    // [a-zA-Z0-9._-], на «_», а сам ключ обрезает до RELAY_FS_KEY_MAX символов
+    // (relay-agent/paths.mjs, sessionFsKey/uploadFileName) — здесь та же обрезка,
+    // иначе у длинного relaySessionId префикс не совпадёт и имя не отрежется.
     if (who.relaySessionId) {
-      const prefix = `${who.relaySessionId.replace(/[^a-zA-Z0-9._-]/g, '_')}_`;
+      const fsKey = who.relaySessionId.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, RELAY_FS_KEY_MAX);
+      const prefix = `${fsKey}_`;
       if (base.startsWith(prefix)) base = base.slice(prefix.length);
     }
+    const stem = base.replace(/\.[^.]*$/, '');
     // Кириллическое имя после релея — строка подчёркиваний («выписка.pdf» →
     // «_______.pdf»). Человеку оно ничего не скажет: лучше шаг без имени.
-    const stem = base.replace(/\.[^.]*$/, '');
+    // Та же проверка молча прячет и редкие латинские имена вроде
+    // «my__notes.pdf» — здесь приватность важнее точности.
     if (!/[a-zA-Z0-9]/.test(stem) || /__/.test(stem)) return undefined;
+    // Фолбэк-имя релея, когда основное не легло на диск (см. UUID_RE выше) —
+    // случайный UUID тоже не показываем как имя.
+    if (UUID_RE.test(stem)) return undefined;
   }
   return cleanDetail(base, who.userId);
 }
