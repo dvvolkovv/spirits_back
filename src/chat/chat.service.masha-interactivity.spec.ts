@@ -40,7 +40,7 @@ function makeService() {
   return { svc, claudeCli };
 }
 
-async function runMasha(ui?: { activity: boolean; ask: boolean }) {
+async function runMasha(ui?: { activity: boolean; ask: boolean }, resOverrides?: Record<string, unknown>) {
   const { svc, claudeCli } = makeService();
   const writes: any[] = [];
   const res: any = {
@@ -49,6 +49,7 @@ async function runMasha(ui?: { activity: boolean; ask: boolean }) {
     write: jest.fn((s: string) => { writes.push(JSON.parse(s)); return true; }),
     end: jest.fn(),
     json: jest.fn(),
+    ...resOverrides,
   };
   await svc.streamChat(USER, 'поправь заголовок', '3', `${USER}_3`, '', res,
     undefined, false, undefined, undefined, false, false, ui);
@@ -88,5 +89,10 @@ describe('Маша: шаги работы и карточки', () => {
   it('без ui.ask правила нет', async () => {
     const { opts } = await runMasha(undefined);
     expect(String(opts.system)).not.toContain('УТОЧНЯЮЩИЕ ВОПРОСЫ');
+  });
+
+  it('res уже закрыт (таймаут CLI убил процесс, но onProgress ещё зовётся) — шаг не пишем', async () => {
+    const { writes } = await runMasha({ activity: true, ask: false }, { writableEnded: true });
+    expect(writes.some((w) => w.type === 'activity')).toBe(false);
   });
 });
