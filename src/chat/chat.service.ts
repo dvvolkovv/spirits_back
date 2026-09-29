@@ -1041,7 +1041,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // не может. Встаёт ДО волатильной части и хвоста языка: требование языка
           // обязано остаться последней строкой (см. replyLanguageTail выше), а
           // блок написан по-русски.
-          system: stableSystemPrompt + `\n\n${products.promptBlock}` + volatileSystemPrompt + replyLanguageTail,
+          // Правило карточек — только клиенту, который их рисует; до хвоста
+          // языка, который обязан остаться последним.
+          system: stableSystemPrompt + `\n\n${products.promptBlock}` +
+            (ui.ask ? `\n\n${ASK_RULE}` : '') + volatileSystemPrompt + replyLanguageTail,
           // Модель Маши — общая с остальным чатом, см. common/chat-model.ts
           // (там же цена решения: пин не даунгрейдится при исчерпании лимита, и
           // как откатиться через env без выката). Биллинг юзеру идёт от costUsd.
@@ -1063,6 +1066,14 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // инструмент продуктов в этом ходе (итог в формате json этого не несёт).
           onProgress: (ev) => {
             if (ev.kind === 'tool_use' && ev.name === products.toolName) usedProductsTool = true;
+            // Шаг работы для клиента, который его рисует. Аргументов onProgress
+            // не отдаёт — хватает имени: у Маши из инструментов только продукты.
+            if (ui.activity && ev.kind === 'tool_use') {
+              const step = toActivity(ev.name, '', { userId });
+              if (step) {
+                try { res.write(JSON.stringify(step) + '\n'); } catch { /* клиент ушёл — ход доводим */ }
+              }
+            }
           },
         });
         rawText = r.text || '';
