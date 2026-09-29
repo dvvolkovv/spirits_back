@@ -16,6 +16,9 @@ import { IntegrationFlagsService } from '../integrations/integration-flags.servi
 import { TalerIdRoomClient } from '../meeting/talerid-room.client';
 import { RESPONSE_STYLE_RULE } from './response-style';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
+import { ClientUi, NO_CLIENT_UI } from './client-ui';
+import { toActivity } from './activity-map';
+import { ASK_RULE } from './ask-rule';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
 import { productsCliMcp } from '../products/products-cli-tool';
@@ -481,6 +484,8 @@ export class ChatService {
     userId: string;
     userLanguage: string;
     profileText?: string;
+    /** Клиент рисует карточки вопросов (см. client-ui.ts, ask-rule.ts). */
+    ask?: boolean;
   }): Promise<string> {
     const { agentId, agentName, userId, userLanguage } = opts;
     const agentDescription = opts.agentDescription || '';
@@ -558,6 +563,10 @@ export class ChatService {
       }
     }
 
+    // Правило карточек — сюда, в системный промпт, а не в реплику: релей
+    // резюмит сессию, и реплики в ней копятся (см. ask-rule.ts).
+    if (opts.ask) stablePrefix += `${ASK_RULE}\n\n`;
+
     return stablePrefix;
   }
 
@@ -593,6 +602,9 @@ export class ChatService {
     // у пользователя с пустым языком в профиле ключи снова разъедутся: текст
     // ушёл бы в `_en`, а файл — в `_ru` по умолчанию.
     requestLang?: string;
+    // Клиент рисует карточки вопросов. Сессия у загрузки и текста одна, и
+    // системный промпт обязан совпадать — иначе правило то есть, то нет.
+    ask?: boolean;
   }): Promise<{ sessionId: string; systemPrompt: string; history: string }> {
     const { userId, assistantId, freshSessionId } = p;
     const profileText = p.profileText || '';
@@ -615,6 +627,7 @@ export class ChatService {
           userId,
           userLanguage,
           profileText,
+          ask: p.ask,
         });
       }
     } catch (e: any) {
@@ -668,6 +681,9 @@ export class ChatService {
     // Пинг мониторинга, а не живой пользователь: ход уходит на дешёвую модель.
     // Разрешён только тестовым аккаунтам — проверка в chat.controller.ts.
     probe: boolean = false,
+    // Что умеет клиент: шаги работы и карточки вопросов (см. client-ui.ts).
+    // Не прислал — не умеет: мобилка и старый веб получают ход как раньше.
+    ui: ClientUi = NO_CLIENT_UI,
   ): Promise<void> {
     // Get agent
     const agent = await this.resolveAgent(userId, assistantId);
@@ -822,7 +838,7 @@ export class ChatService {
         recentHistory, profileText, res,
         agent.name, agent.description || '', agent.system_prompt || '',
         req, fresh, chatSessionId, requestLang, clientTz, balanceBlock,
-        agent.category, probe,
+        agent.category, probe, ui,
       );
     }
 
@@ -1212,6 +1228,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // ~47k контекста, что и настоящая консультация. Флаг приходит только от
     // тестовых аккаунтов — см. chat.controller.ts.
     probe: boolean = false,
+    // Шаги работы и карточки вопросов — см. streamChat.
+    ui: ClientUi = NO_CLIENT_UI,
   ): Promise<void> {
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
@@ -1307,7 +1325,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // ходом, в котором пришли вложения: сессия на релее у них одна.
     let stablePrefix = await this.buildRelayStablePrefix({
       agentId, agentName, agentDescription, agentSystemPrompt, agentCategory,
-      userId, userLanguage, profileText,
+      userId, userLanguage, profileText, ask: ui.ask,
     });
 
     // Пер-ходовая часть. Пустая строка, а не identity-блок: тот уехал в stablePrefix.
@@ -1558,6 +1576,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
       this.activeTurns.set(`${userId}_${assistantId}`, streamStartTime);
       // Один вызов upstream r.linkeon: парсит SSE, пушит в chunks и стримит
       // 'item' клиенту. Вынесено в замыкание ради self-heal ретрая пустого потока.
+      // Ключ сессии релея: и в запросе, и для шагов работы — релей кладёт
+      // загрузки под именем «<ключ>_<файл>», и префикс надо срезать.
+      const relaySid = relaySessionKey(userId, assistantId, userLanguage, fresh ? freshSessionId : undefined);
       const callUpstreamOnce = async (): Promise<void> => {
         const FormData = require('form-data');
         const fd = new FormData();
@@ -1586,10 +1607,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // Цена: при смене языка ассистент забывает прежний разговор. Это
         // честнее, чем отвечать не на том языке, а история в нашей БД
         // сохраняется и показывается пользователю как была.
-        fd.append(
-          'sessionId',
-          relaySessionKey(userId, assistantId, userLanguage, fresh ? freshSessionId : undefined),
-        );
+        fd.append('sessionId', relaySid);
 
         // Модель хода. Пинги мониторинга просят haiku: «ответь одним словом ок»
         // не требует Opus, а обвязка Claude Code (системный промпт CLI +
@@ -1657,6 +1675,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
                     // «Вношу группу А.» и тишину, а потом слал «?».
                     chunks.push(ev.text);
                     safeWrite({ type: 'item', content: ev.text });
+                  } else if (ev.type === 'tool') {
+                    // Шаг работы для клиента, который его рисует (activity-map.ts).
+                    // В chunks не идёт: к тексту ответа отношения не имеет.
+                    if (ui.activity) {
+                      const step = toActivity(ev.tool, ev.input, { userId, relaySessionId: relaySid });
+                      if (step) safeWrite(step);
+                    }
                   } else if (ev.type === 'result' && ev.text) {
                     if (chunks.length === 0) {
                       chunks.push(ev.text);
