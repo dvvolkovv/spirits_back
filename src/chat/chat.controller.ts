@@ -15,6 +15,8 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { makeReadWithinDirGuard, neutralizeAtMentions, stripWordJoiner } from '../common/agent-guards';
 import { decodeMultipartFilename } from '../common/utils/multipart-filename';
 import { TEST_USERS } from '../common/test-users';
+import { parseClientUi } from './client-ui';
+import { toActivity } from './activity-map';
 
 /**
  * Потолок загрузки, ОДИН на всю цепочку. Раньше каждое звено держало свой, и
@@ -140,6 +142,8 @@ export class ChatController {
     // придётся с жалобой «ассистент поглупел», у которой нет следа ни в логах,
     // ни в промпте.
     const probe = body.probe === true && TEST_USERS.includes(userId);
+    // Что умеет клиент — шаги работы и карточки вопросов (client-ui.ts).
+    const ui = parseClientUi(body.ui);
     const startedAt = Date.now();
     try {
       await this.chatService.streamChat(
@@ -155,6 +159,7 @@ export class ChatController {
         clientTz,
         storeBuild,
         probe,
+        ui,
       );
       this.events?.track('response_received', {
         userId,
@@ -276,12 +281,16 @@ export class ChatController {
     // Ключ сессии, персона и хвост переписки — те же, что у текстового хода.
     // Отдельная сборка здесь однажды уже разошлась с основной и на три недели
     // увела вложения в собственную сессию (см. relay-session.ts).
+    // Что умеет клиент (client-ui.ts). Тело multipart — ui приезжает строкой.
+    const ui = parseClientUi(body.ui);
+
     const handoff = await this.chatService.buildUploadHandoff({
       userId,
       assistantId: String(assistantId),
       profileText,
       freshSessionId,
       requestLang: typeof body.lang === 'string' ? body.lang : undefined,
+      ask: ui.ask,
     });
 
     // Профиль уехал в systemPrompt вместе с персоной — в тело реплики его
@@ -362,6 +371,13 @@ export class ChatController {
                 // `result` ниже (тот дублировал бы уже отданный текст).
                 chunks.push(ev.text);
                 safeWrite({ type: 'item', content: ev.text });
+              } else if (ev.type === 'tool') {
+                // Шаг работы (activity-map.ts): чтение большого PDF — ровно то
+                // место, где человек дольше всего смотрит на пустой пузырь.
+                if (ui.activity) {
+                  const step = toActivity(ev.tool, ev.input, { userId, relaySessionId: handoff.sessionId });
+                  if (step) safeWrite(step);
+                }
               } else if (ev.type === 'result' && ev.text && chunks.length === 0) {
                 chunks.push(ev.text);
                 safeWrite({ type: 'item', content: ev.text });
