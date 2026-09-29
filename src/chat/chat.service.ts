@@ -565,6 +565,12 @@ export class ChatService {
 
     // Правило карточек — сюда, в системный промпт, а не в реплику: релей
     // резюмит сессию, и реплики в ней копятся (см. ask-rule.ts).
+    //
+    // Ключ сессии на релее общий у веба и мобилки (relay-session.ts), а
+    // правило добавляет только веб. Значит, при переключении клиента одного
+    // пользователя между вебом и мобилкой системный промпт меняется — один
+    // ход после переключения идёт по холодному кэшу релея. Осознанный
+    // размен: платим кэшем ровно за переключение, а не постоянно.
     if (opts.ask) stablePrefix += `${ASK_RULE}\n\n`;
 
     return stablePrefix;
@@ -1068,7 +1074,14 @@ ${LanguageService.buildDirective(userLanguage)}`;
             if (ev.kind === 'tool_use' && ev.name === products.toolName) usedProductsTool = true;
             // Шаг работы для клиента, который его рисует. Аргументов onProgress
             // не отдаёт — хватает имени: у Маши из инструментов только продукты.
-            if (ui.activity && ev.kind === 'tool_use') {
+            // Для новых инструментов понадобится input — onProgress его не отдаёт.
+            //
+            // writableEnded: claude CLI при таймауте убивает процесс SIGTERM'ом,
+            // но обработчик stdout продолжает разбирать буфер и звать onProgress
+            // ПОСЛЕ того, как res уже закрыт (ход завершился ответом об ошибке).
+            // res.write после res.end() кидает асинхронную 'error' на res, а не
+            // синхронное исключение — try/catch здесь её не поймает.
+            if (ui.activity && ev.kind === 'tool_use' && !res.writableEnded) {
               const step = toActivity(ev.name, '', { userId });
               if (step) {
                 try { res.write(JSON.stringify(step) + '\n'); } catch { /* клиент ушёл — ход доводим */ }
@@ -1741,6 +1754,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // клиент ещё на связи — тихо повторяем upstream ОДИН раз, прежде чем отдать
       // юзеру пустоту. Безопасно: при пустом chunks клиенту ещё не ушло ни одного
       // 'item' (дублей не будет). Инцидент/находка 2026-07-12.
+      //
+      // Шаги работы (activity) под эту гарантию не подпадают: неудавшийся
+      // прогон мог успеть прислать свои шаги ДО того, как понял, что поток
+      // пуст, а повтор пришлёт свои — итог видимый, но не ломающий: веб
+      // схлопывает подряд идущие одинаковые шаги в один.
       if (chunks.length === 0 && !clientDisconnected) {
         this.logger.warn(`empty stream from r.linkeon for ${userId}_${assistantId} — self-heal retry`);
         this.events?.track('chat_quality', {
