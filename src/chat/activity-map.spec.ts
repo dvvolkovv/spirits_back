@@ -46,7 +46,45 @@ describe('toActivity — что видит человек вместо трёх 
 
   it('UUID пользователя с почтовым входом тоже не уходит наружу', () => {
     const a = toActivity('Read', json({ file_path: `/tmp/agent-uploads/${UUID}_5_report.pdf` }), { userId: UUID });
-    expect(JSON.stringify(a)).not.toContain(UUID);
+    expect(a).toEqual({ type: 'activity', kind: 'read_upload' });
+  });
+
+  it('ключ сессии релея обрезается до 48 символов (relay-agent/paths.mjs, SESSION_KEY_MAX) — из имени файла длинный ключ целиком не собрать', () => {
+    const longSession = `${UUID}_123456789_ru_fresh_start_of_a_very_long_relay_session_key`;
+    expect(longSession.length).toBeGreaterThan(48);
+    const fsKey = longSession.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 48);
+    const who = { userId: PHONE, relaySessionId: longSession };
+    const a = toActivity('Read', json({ file_path: `/tmp/agent-uploads/${fsKey}_report.pdf` }), who);
+    expect(a).toEqual({ type: 'activity', kind: 'read_upload', detail: 'report.pdf' });
+    expect(JSON.stringify(a)).not.toContain(longSession);
+  });
+
+  it('релей-фолбэк «<ключ>_<uuid>», когда основное имя не легло на диск — тоже без имени', () => {
+    const fallbackUuid = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
+    expect(toActivity('Read', json({ file_path: `/tmp/agent-uploads/${PHONE}_12_ru_${fallbackUuid}.pdf` }), WHO))
+      .toEqual({ type: 'activity', kind: 'read_upload' });
+  });
+
+  it('Edit — тоже запись, имя видно из результатов', () => {
+    expect(toActivity('Edit', json({ file_path: `/tmp/agent-output/${WHO.relaySessionId}/report.docx` }), WHO))
+      .toEqual({ type: 'activity', kind: 'write_file', detail: 'report.docx' });
+  });
+
+  it('чтение результата — имя видно', () => {
+    expect(toActivity('Read', json({ file_path: `/tmp/agent-output/${WHO.relaySessionId}/summary.txt` }), WHO))
+      .toEqual({ type: 'activity', kind: 'read_file', detail: 'summary.txt' });
+  });
+
+  it('телефон пользователя в человеческом форматировании тоже не уходит наружу', () => {
+    expect(toActivity('WebSearch', json({ query: 'кто звонил с +7 903 016-91-87 вчера' }), WHO))
+      .toEqual({ type: 'activity', kind: 'web_search' });
+  });
+
+  it('внутренние хосты и IP-адреса не показываем', () => {
+    expect(toActivity('WebFetch', json({ url: 'http://127.0.0.1:3033/x' }), WHO))
+      .toEqual({ type: 'activity', kind: 'web_fetch' });
+    expect(toActivity('WebFetch', json({ url: 'http://localhost/x' }), WHO))
+      .toEqual({ type: 'activity', kind: 'web_fetch' });
   });
 
   it('пути вне папок загрузок и результатов — без имени', () => {
