@@ -132,6 +132,58 @@ describe('streamUniversalAgent: шаги работы и правило карт
     expect(f.systemPrompt).not.toContain('УТОЧНЯЮЩИЕ ВОПРОСЫ');
     expect(f.message).not.toContain('УТОЧНЯЮЩИЕ ВОПРОСЫ');
   });
+
+  it('self-heal: первый прогон пустой (только шаг, без текста) — молчаливый повтор, ответ — от второго', async () => {
+    const written: any[] = [];
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        if (/AS spent/.test(sql)) return { rows: [{ spent: 0 }] };
+        return { rows: [] };
+      }),
+    };
+    const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
+    const svc = new ChatService(
+      pg as any, null as any, null as any, null as any, null as any,
+      language as any, undefined, undefined, undefined, undefined,
+    );
+    const post = axios.post as jest.Mock;
+    // Первый прогон: только шаг работы, ни delta/notice/result — self-heal
+    // (chat.service.ts) видит chunks.length === 0 и тихо повторяет upstream.
+    // Второй SSE-поток должен быть СВОЕЙ Readable — общий Readable нельзя
+    // прочитать дважды.
+    post
+      .mockResolvedValueOnce({
+        data: sseStream([
+          { type: 'tool', tool: 'WebSearch', input: '{"query":"офис Казань"}' },
+          { type: 'done' },
+        ]),
+      })
+      .mockResolvedValueOnce({
+        data: sseStream([
+          { type: 'delta', text: 'Вот итог после повтора.' },
+          { type: 'done' },
+        ]),
+      });
+    const res: any = {
+      status: jest.fn(),
+      setHeader: jest.fn(),
+      write: jest.fn((l: string) => { written.push(JSON.parse(l)); return true; }),
+      end: jest.fn(),
+    };
+    await (svc as any).streamUniversalAgent(
+      PHONE, 'найди офис', '12', '12', [], '', res, 'Роман', '', '', undefined, false,
+      undefined, undefined, undefined, undefined, undefined, false, { activity: true, ask: false },
+    );
+    // Ретрай ждёт реальные 800мс (chat.service.ts) перед повторным вызовом —
+    // await streamUniversalAgent сам стоит внутри этого ожидания и не
+    // возвращается раньше.
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    expect(post).toHaveBeenCalledTimes(2);
+    const text = written.filter((w) => w.type === 'item').map((w) => w.content).join('');
+    expect(text).toBe('Вот итог после повтора.');
+  }, 10_000);
 });
 
 describe('buildUploadHandoff: системный промпт загрузки совпадает с текстовым ходом', () => {
@@ -153,5 +205,44 @@ describe('buildUploadHandoff: системный промпт загрузки �
     const without = await svc.buildUploadHandoff({ userId: PHONE, assistantId: '12' });
     expect(withAsk.systemPrompt).toContain(ASK_RULE);
     expect(without.systemPrompt).not.toContain('УТОЧНЯЮЩИЕ ВОПРОСЫ');
+  });
+
+  it('системный промпт текстового хода (релей) и хода загрузки для одного агента совпадают побайтово', async () => {
+    // Один и тот же агент (id=12, «Роман», пустые description/system_prompt) —
+    // и для resolveAgent внутри buildUploadHandoff, и для параметров, с которыми
+    // controller вызывает streamUniversalAgent у текстового хода (там имя,
+    // описание и промпт агента уже переданы параметрами, а не читаются заново).
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        if (/AS spent/.test(sql)) return { rows: [{ spent: 0 }] };
+        if (/FROM agents WHERE id/.test(sql)) {
+          return { rows: [{ id: 12, name: 'Роман', description: '', system_prompt: '', category: 'business', is_active: true }] };
+        }
+        return { rows: [] };
+      }),
+    };
+    const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
+    const svc = new ChatService(
+      pg as any, null as any, null as any, null as any, null as any,
+      language as any, undefined, undefined, undefined, undefined,
+    );
+    const post = axios.post as jest.Mock;
+    post.mockResolvedValue({ data: sseStream(EVENTS) });
+    const res: any = {
+      status: jest.fn(),
+      setHeader: jest.fn(),
+      write: jest.fn(() => true),
+      end: jest.fn(),
+    };
+    await (svc as any).streamUniversalAgent(
+      PHONE, 'найди офис', '12', '12', [], '', res, 'Роман', '', '', undefined, false,
+      undefined, undefined, undefined, undefined, undefined, false, { activity: false, ask: true },
+    );
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    const f = fieldsOf(post.mock.calls[0][1]);
+    const handoff = await svc.buildUploadHandoff({ userId: PHONE, assistantId: '12', ask: true });
+    expect(f.systemPrompt).toBe(handoff.systemPrompt);
   });
 });

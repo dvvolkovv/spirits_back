@@ -17,6 +17,20 @@ function sseStream(events: any[]): Readable {
   return s;
 }
 
+/** Поля multipart-запроса к релею (см. chat.service.interactivity.spec.ts). */
+function fieldsOf(fd: any): Record<string, string> {
+  const boundary = fd.getBoundary();
+  const raw = fd.getBuffer().toString('utf8');
+  const out: Record<string, string> = {};
+  for (const part of raw.split(`--${boundary}`)) {
+    const name = /name="([^"]+)"/.exec(part);
+    const head = part.indexOf('\r\n\r\n');
+    if (!name || head < 0) continue;
+    out[name[1]] = part.slice(head + 4).replace(/\r\n$/, '');
+  }
+  return out;
+}
+
 function makeRes() {
   const written: any[] = [];
   return {
@@ -87,7 +101,7 @@ describe('upload-and-chat: шаги работы и правило карточ�
     } as any, res);
     for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
     const fd: any = (post.mock.calls[0] as any[])[1];
-    return { written: res.written, systemPrompt: fd.getBuffer().toString('utf8') };
+    return { written: res.written, fields: fieldsOf(fd) };
   };
 
   it('клиент прислал ui строкой — шаг чтения файла уходит', async () => {
@@ -96,14 +110,15 @@ describe('upload-and-chat: шаги работы и правило карточ�
       .toEqual([{ type: 'activity', kind: 'read_upload', detail: 'egrul.pdf' }]);
   });
 
-  it('с ui.ask системный промпт загрузки содержит правило карточек', async () => {
-    const { systemPrompt } = await upload({ ui: '{"activity":true,"ask":true}' });
-    expect(systemPrompt).toContain('УТОЧНЯЮЩИЕ ВОПРОСЫ');
+  it('с ui.ask правило карточек — в systemPrompt загрузки, не в message', async () => {
+    const { fields } = await upload({ ui: '{"activity":true,"ask":true}' });
+    expect(fields.systemPrompt).toContain('УТОЧНЯЮЩИЕ ВОПРОСЫ');
+    expect(fields.message).not.toContain('УТОЧНЯЮЩИЕ ВОПРОСЫ');
   });
 
   it('без ui — ни шагов, ни правила', async () => {
-    const { written, systemPrompt } = await upload({});
+    const { written, fields } = await upload({});
     expect(written.some((w: any) => w.type === 'activity')).toBe(false);
-    expect(systemPrompt).not.toContain('УТОЧНЯЮЩИЕ ВОПРОСЫ');
+    expect(fields.systemPrompt).not.toContain('УТОЧНЯЮЩИЕ ВОПРОСЫ');
   });
 });
