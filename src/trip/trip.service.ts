@@ -151,7 +151,11 @@ export function computeCopilotState(input: {
       text: `${fmt.format(new Date(e.at)).replace(/,/g, '')} — ${e.title}${conflict ? ' (пересечение)' : ''}`,
       tone: conflict ? 'warn' : undefined,
     });
-    eventsOut.push({ at: e.at, end: e.end, title: e.title, conflict, uid: e.uid, source: e.source });
+    eventsOut.push({
+      at: e.at, end: e.end, title: e.title, conflict, uid: e.uid, source: e.source,
+      // деталь для просмотра в лаунчере [2026-09-30]
+      description: e.description, location: e.location, meetingUrl: e.meetingUrl,
+    });
   });
 
   const tasksOut: NonNullable<CoPilotState['tasks']> = zoneTasks.map((t) => ({
@@ -165,6 +169,8 @@ export function computeCopilotState(input: {
     overdue: Boolean(!isDone(t) && t.due && parse(t.due) < now.getTime()),
     doneAt: t.doneAt,
     source: t.source,
+    // деталь для просмотра в лаунчере [2026-09-30]
+    note: t.note, meetingUrl: t.meetingUrl,
   }));
 
   const reminders = tasks.map((t) => ({ id: t.uid, text: t.title, when: t.due ?? '', critical: false, done: isDone(t) }));

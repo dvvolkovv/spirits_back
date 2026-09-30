@@ -38,7 +38,9 @@ export interface CoPilotState {
    * форматированный текст) — чтобы лаунчер мог РАНЖИРОВАТЬ и показывать «ближайшую встречу»
    * по времени [784fd182]. Отсортированы по времени начала. Старые потребители поле игнорируют.
    */
-  events?: { at: string; end?: string; title: string; conflict: boolean; uid?: string; source?: string }[];
+  events?: { at: string; end?: string; title: string; conflict: boolean; uid?: string; source?: string;
+    // деталь для просмотра в лаунчере [2026-09-30]
+    description?: string; location?: string; meetingUrl?: string }[];
   /**
    * Модель «твой сегодня» [2026-08-01]. Две зоны: `events` (по времени, в горизонте) и `tasks`
    * (дела/рутины к выполнению — сегодня + просроченные, висят пока не закрыты). `next` — «Дальше»:
@@ -56,6 +58,9 @@ export interface CoPilotState {
     overdue?: boolean;
     doneAt?: string;
     source?: string;
+    // деталь для просмотра в лаунчере [2026-09-30]
+    note?: string;
+    meetingUrl?: string;
   }[];
   next?: { at: string; title: string };
   horizonHours?: number;

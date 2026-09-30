@@ -67,6 +67,24 @@ it('EXDATE по-прежнему исключает вхождение', () => {
   expect(out.filter((e) => /футбол/i.test(e.title))).toHaveLength(0);
 });
 
+it('вытаскивает DESCRIPTION/LOCATION + распознаёт meeting-ссылку', () => {
+  const withDetail = [
+    'BEGIN:VEVENT',
+    'UID:call@yandex.ru',
+    'SUMMARY:Созвон по проекту',
+    'DTSTART:20260926T120000Z',
+    'DTEND:20260926T130000Z',
+    'LOCATION:Zoom',
+    'DESCRIPTION:Повестка: демо и планы. Подключиться https://us02web.zoom.us/j/999',
+    'END:VEVENT',
+  ].join('\n');
+  const out = expandCalDavEvents(parseBlocks([withDetail]), WIN_START, WIN_END);
+  expect(out).toHaveLength(1);
+  expect(out[0].location).toBe('Zoom');
+  expect(out[0].description).toContain('Повестка');
+  expect(out[0].meetingUrl).toBe('https://us02web.zoom.us/j/999');
+});
+
 it('разовое (не повторяющееся) событие сохраняет плоский uid', () => {
   const single = [
     'BEGIN:VEVENT',

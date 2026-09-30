@@ -6,6 +6,10 @@ export interface CalEvent {
   title: string;
   source: string;    // 'yandex' | 'corp' | ...
   uid?: string;
+  // --- деталь для просмотра в лаунчере без ухода в приложение [2026-09-30] ---
+  description?: string; // текст/повестка события (без обрезки)
+  location?: string;    // место (может содержать и ссылку)
+  meetingUrl?: string;  // распознанная ссылка на встречу (Zoom/Meet/Teams/Telemost/…)
 }
 
 export interface ProposedEvent {
@@ -30,6 +34,8 @@ export interface Task {
   isRoutine?: boolean;    // явный флаг (стор Линкеона выставляет при разворачивании серии)
   occurrenceDate?: string;// YYYY-MM-DD: за какой день эта отметка (рутина)
   doneAt?: string;        // ISO: когда закрыто (сервер ставит; для «сделано сегодня» + аналитики)
+  note?: string;          // описание/заметка дела — для просмотра детали в лаунчере [2026-09-30]
+  meetingUrl?: string;    // ссылка из заметки, если есть
 }
 
 export interface ProposedTask {

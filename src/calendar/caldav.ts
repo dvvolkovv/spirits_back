@@ -1,6 +1,7 @@
 import * as ical from 'node-ical';
 import { randomUUID } from 'crypto';
 import { CalendarConnector, CalendarCreds, CalEvent, ProposedEvent, ProposedTask, Task } from './calendar.types';
+import { detectMeetingUrl, normDetail } from './meeting-url';
 
 export const YANDEX_CALDAV_BASE = 'https://caldav.yandex.ru';
 const TZID = 'Asia/Yekaterinburg';
@@ -155,6 +156,14 @@ export function expandCalDavEvents(vevents: any[], start: Date, end: Date): CalE
     const title = String(ev.summary || '').trim() || 'Событие';
     const startMs = new Date(ev.start).getTime();
     const durationMs = ev.end ? new Date(ev.end).getTime() - startMs : 3_600_000;
+    // Деталь для просмотра в лаунчере: DESCRIPTION/LOCATION/URL из ICS + распознанная meeting-ссылка.
+    const description = normDetail(ev.description);
+    const location = normDetail(ev.location);
+    const meetingUrl = detectMeetingUrl(description, location, typeof ev.url === 'string' ? ev.url : undefined);
+    const detail: Partial<CalEvent> = {};
+    if (description) detail.description = description;
+    if (location) detail.location = location;
+    if (meetingUrl) detail.meetingUrl = meetingUrl;
     if (ev.rrule) {
       // ПОВТОРЯЮЩЕЕСЯ: у master-VEVENT DTSTART обычно В ПРОШЛОМ (напр. еженедельный синк с
       // февраля). Фильтровать по нему = выкинуть КАЖДУЮ повторяющуюся встречу (это и был баг
@@ -169,7 +178,7 @@ export function expandCalDavEvents(vevents: any[], start: Date, end: Date): CalE
         const occMs = occ.getTime();
         if (exdates.has(occMs)) continue;
         if (ovr && ovr.has(occMs)) continue; // заменено изменённым вхождением — оно эмитится отдельно
-        out.push({ at: new Date(occMs).toISOString(), title, source: 'yandex', uid: `${ev.uid}-${occMs}`, end: new Date(occMs + durationMs).toISOString() });
+        out.push({ at: new Date(occMs).toISOString(), title, source: 'yandex', uid: `${ev.uid}-${occMs}`, end: new Date(occMs + durationMs).toISOString(), ...detail });
       }
     } else {
       const s = new Date(startMs);
@@ -177,7 +186,7 @@ export function expandCalDavEvents(vevents: any[], start: Date, end: Date): CalE
         // Изменённое вхождение (RECURRENCE-ID): стабильный uid по ИСХОДНОМУ времени вхождения —
         // так оно уникально в рамках серии и переживает повторный перенос. Обычное разовое → ev.uid.
         const uid = ev.recurrenceid ? `${ev.uid}-${new Date(ev.recurrenceid).getTime()}` : ev.uid;
-        const item: CalEvent = { at: s.toISOString(), title, source: 'yandex', uid };
+        const item: CalEvent = { at: s.toISOString(), title, source: 'yandex', uid, ...detail };
         if (ev.end) item.end = new Date(ev.end).toISOString();
         out.push(item);
       }
