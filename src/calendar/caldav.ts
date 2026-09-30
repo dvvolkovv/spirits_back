@@ -1,7 +1,7 @@
 import * as ical from 'node-ical';
 import { randomUUID } from 'crypto';
 import { CalendarConnector, CalendarCreds, CalEvent, ProposedEvent, ProposedTask, Task } from './calendar.types';
-import { detectMeetingUrl, normDetail } from './meeting-url';
+import { detectMeetingUrl, pickMeetingUrl, normDetail } from './meeting-url';
 
 export const YANDEX_CALDAV_BASE = 'https://caldav.yandex.ru';
 const TZID = 'Asia/Yekaterinburg';
@@ -159,7 +159,8 @@ export function expandCalDavEvents(vevents: any[], start: Date, end: Date): CalE
     // Деталь для просмотра в лаунчере: DESCRIPTION/LOCATION/URL из ICS + распознанная meeting-ссылка.
     const description = normDetail(ev.description);
     const location = normDetail(ev.location);
-    const meetingUrl = detectMeetingUrl(description, location, typeof ev.url === 'string' ? ev.url : undefined);
+    const meetingUrl = pickMeetingUrl(description, location)
+      ?? (typeof ev.url === 'string' ? detectMeetingUrl(ev.url) : undefined);
     const detail: Partial<CalEvent> = {};
     if (description) detail.description = description;
     if (location) detail.location = location;

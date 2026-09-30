@@ -1,4 +1,4 @@
-import { detectMeetingUrl, normDetail } from './meeting-url';
+import { detectMeetingUrl, pickMeetingUrl, normDetail } from './meeting-url';
 
 describe('detectMeetingUrl', () => {
   it('находит Zoom / Meet / Teams / Telemost / Whereby', () => {
@@ -20,6 +20,27 @@ describe('detectMeetingUrl', () => {
   it('нераспознанный/посторонний URL не возвращает (только известные провайдеры)', () => {
     expect(detectMeetingUrl('док: https://docs.example.com/agenda')).toBeUndefined();
     expect(detectMeetingUrl('', null, undefined)).toBeUndefined();
+  });
+});
+
+describe('detectMeetingUrl — РФ-провайдеры', () => {
+  it('Dion / ktalk / SberJazz', () => {
+    expect(detectMeetingUrl('Созвон https://dion.vc/event/dmitryt')).toBe('https://dion.vc/event/dmitryt');
+    expect(detectMeetingUrl('https://ktalk.ru/abc123')).toBe('https://ktalk.ru/abc123');
+    expect(detectMeetingUrl('https://jazz.sber.ru/xyz')).toBe('https://jazz.sber.ru/xyz');
+  });
+});
+
+describe('pickMeetingUrl', () => {
+  it('известный провайдер в описании', () => {
+    expect(pickMeetingUrl('Подключиться https://us02web.zoom.us/j/1', 'каб. 3')).toBe('https://us02web.zoom.us/j/1');
+  });
+  it('место = голая ссылка → берём её (частый Outlook/Dion паттерн)', () => {
+    expect(pickMeetingUrl(undefined, 'https://dion.vc/event/dmitryt')).toBe('https://dion.vc/event/dmitryt');
+    expect(pickMeetingUrl('обсудим статус', 'https://corp.example/join/xyz')).toBe('https://corp.example/join/xyz');
+  });
+  it('место = обычный текст → ничего', () => {
+    expect(pickMeetingUrl('повестка', 'Переговорка 2')).toBeUndefined();
   });
 });
 

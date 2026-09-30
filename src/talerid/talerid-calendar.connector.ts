@@ -4,7 +4,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { TalerIdOauthService } from './talerid-oauth.service';
 import { expandOccurrences, Recurrence } from '../calendar/recurrence';
 import { CalEvent, ProposedEvent, Task } from '../calendar/calendar.types';
-import { detectMeetingUrl, normDetail } from '../calendar/meeting-url';
+import { detectMeetingUrl, pickMeetingUrl, normDetail } from '../calendar/meeting-url';
 
 const TZID = 'Asia/Yekaterinburg';
 const OFFSET = '+05:00'; // Asia/Yekaterinburg, no DST — mirrors src/calendar/{recurrence,caldav}.ts
@@ -124,7 +124,7 @@ export class TalerIdCalendarConnector {
         const location = normDetail(ev.location);
         if (description) item.description = description;
         if (location) item.location = location;
-        const meetingUrl = detectMeetingUrl(description, location);
+        const meetingUrl = pickMeetingUrl(description, location);
         if (meetingUrl) item.meetingUrl = meetingUrl;
         out.push(item);
       }

@@ -14,7 +14,7 @@ import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { isIP } from 'net';
 import { CalEvent } from './calendar.types';
-import { detectMeetingUrl, normDetail } from './meeting-url';
+import { pickMeetingUrl, normDetail } from './meeting-url';
 import { assertPublicUrl, PublicTarget } from '../common/net/safe-fetch';
 
 const execFileP = promisify(execFile);
@@ -147,7 +147,7 @@ export class ExchangeEwsConnector {
       const bodyRaw = (it.match(/<t:Body[^>]*>([\s\S]*?)<\/t:Body>/) || [])[1];
       const location = normDetail(loc ? decodeXml(loc) : undefined);
       const description = normDetail(bodyRaw ? stripHtml(decodeXml(bodyRaw)) : undefined);
-      const meetingUrl = detectMeetingUrl(description, location);
+      const meetingUrl = pickMeetingUrl(description, location);
       const item: CalEvent = {
         at: sd.toISOString(),
         end: ed && !isNaN(ed.getTime()) ? ed.toISOString() : sd.toISOString(),
