@@ -14,6 +14,7 @@ import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { isIP } from 'net';
 import { CalEvent } from './calendar.types';
+import { detectMeetingUrl, normDetail } from './meeting-url';
 import { assertPublicUrl, PublicTarget } from '../common/net/safe-fetch';
 
 const execFileP = promisify(execFile);
@@ -28,6 +29,16 @@ function decodeXml(s: string): string {
   return s
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'").replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+}
+
+// Тело события в EWS приходит HTML — снимаем теги в читаемый текст (для показа описания в лаунчере).
+function stripHtml(html: string): string {
+  return html
+    .replace(/<\s*(br|\/p|\/div|\/li|tr)[^>]*>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 // Экранируем для curl-config («user = "…"»): внутри кавычек значимы \ и ".
@@ -63,6 +74,8 @@ export class ExchangeEwsConnector {
       '<soap:Body><FindItem xmlns="http://schemas.microsoft.com/exchange/services/2006/messages" Traversal="Shallow">' +
       '<ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties>' +
       '<t:FieldURI FieldURI="item:Subject"/><t:FieldURI FieldURI="calendar:Start"/><t:FieldURI FieldURI="calendar:End"/>' +
+      // деталь для просмотра в лаунчере [2026-09-30]: место + тело (в нём обычно ссылка на встречу Teams/Zoom)
+      '<t:FieldURI FieldURI="calendar:Location"/><t:FieldURI FieldURI="item:Body"/>' +
       '</t:AdditionalProperties></ItemShape>' +
       `<CalendarView MaxEntriesReturned="200" StartDate="${start.toISOString()}" EndDate="${end.toISOString()}"/>` +
       '<ParentFolderIds><t:DistinguishedFolderId Id="calendar"/></ParentFolderIds>' +
@@ -129,12 +142,22 @@ export class ExchangeEwsConnector {
       const sd = new Date(s);
       if (isNaN(sd.getTime())) continue;
       const ed = e ? new Date(e) : null;
-      out.push({
+      // Деталь [2026-09-30]: место + тело (снять HTML) → описание + ссылка на встречу.
+      const loc = (it.match(/<t:Location>([\s\S]*?)<\/t:Location>/) || [])[1];
+      const bodyRaw = (it.match(/<t:Body[^>]*>([\s\S]*?)<\/t:Body>/) || [])[1];
+      const location = normDetail(loc ? decodeXml(loc) : undefined);
+      const description = normDetail(bodyRaw ? stripHtml(decodeXml(bodyRaw)) : undefined);
+      const meetingUrl = detectMeetingUrl(description, location);
+      const item: CalEvent = {
         at: sd.toISOString(),
         end: ed && !isNaN(ed.getTime()) ? ed.toISOString() : sd.toISOString(),
         title: decodeXml(subj).trim() || '(без темы)',
         source: 'outlook',
-      });
+      };
+      if (description) item.description = description;
+      if (location) item.location = location;
+      if (meetingUrl) item.meetingUrl = meetingUrl;
+      out.push(item);
     }
     return out;
   }

@@ -4,6 +4,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { TalerIdOauthService } from './talerid-oauth.service';
 import { expandOccurrences, Recurrence } from '../calendar/recurrence';
 import { CalEvent, ProposedEvent, Task } from '../calendar/calendar.types';
+import { detectMeetingUrl, normDetail } from '../calendar/meeting-url';
 
 const TZID = 'Asia/Yekaterinburg';
 const OFFSET = '+05:00'; // Asia/Yekaterinburg, no DST — mirrors src/calendar/{recurrence,caldav}.ts
@@ -118,6 +119,13 @@ export class TalerIdCalendarConnector {
           const endMs = new Date(ev.endAt).getTime();
           if (!Number.isNaN(endMs)) item.end = new Date(endMs).toISOString();
         }
+        // Деталь для просмотра в лаунчере [2026-09-30].
+        const description = normDetail(ev.description ?? ev.note);
+        const location = normDetail(ev.location);
+        if (description) item.description = description;
+        if (location) item.location = location;
+        const meetingUrl = detectMeetingUrl(description, location);
+        if (meetingUrl) item.meetingUrl = meetingUrl;
         out.push(item);
       }
       return out;
@@ -279,6 +287,13 @@ export class TalerIdCalendarConnector {
         if (!t?.uid) continue;
         const title = String(t.title || '').trim() || 'Дело';
         const deadline = t.deadline ? new Date(t.deadline).toISOString() : undefined;
+        // Деталь для просмотра в лаунчере [2026-09-30]: заметка дела + ссылка из неё.
+        const note = normDetail(t.note ?? t.description);
+        const meetingUrl = detectMeetingUrl(note);
+        const detail: Partial<Task> = {
+          ...(note ? { note } : {}),
+          ...(meetingUrl ? { meetingUrl } : {}),
+        };
         if (t.recurrence && Array.isArray(t.occurrences)) {
           // Рутина: поштучные вхождения; прошедшие дни не тащим (сброс каждый день), skipped прячем,
           // done показываем только сегодня (приглушённо), pending — висит.
@@ -295,10 +310,10 @@ export class TalerIdCalendarConnector {
             if (Number.isNaN(instant.getTime()) || instant.getTime() > toMs) continue;
             if (st === 'done') {
               if (occDate === today) {
-                out.push({ uid: t.uid, title, due: instant.toISOString(), done: true, status: 'done', isRoutine: true, occurrenceDate: occDate, doneAt: o?.doneAt ? new Date(o.doneAt).toISOString() : instant.toISOString(), source: 'talerid' });
+                out.push({ uid: t.uid, title, due: instant.toISOString(), done: true, status: 'done', isRoutine: true, occurrenceDate: occDate, doneAt: o?.doneAt ? new Date(o.doneAt).toISOString() : instant.toISOString(), source: 'talerid', ...detail });
               }
             } else {
-              out.push({ uid: t.uid, title, due: instant.toISOString(), deadline, done: false, status: 'pending', isRoutine: true, occurrenceDate: occDate, source: 'talerid' });
+              out.push({ uid: t.uid, title, due: instant.toISOString(), deadline, done: false, status: 'pending', isRoutine: true, occurrenceDate: occDate, source: 'talerid', ...detail });
             }
           }
         } else {
@@ -307,10 +322,10 @@ export class TalerIdCalendarConnector {
           const due = t.due ? new Date(t.due).toISOString() : undefined;
           if (done) {
             if (t.doneAt && this.localDay(new Date(t.doneAt).getTime()) === today) {
-              out.push({ uid: t.uid, title, due, deadline, done: true, status: 'done', doneAt: new Date(t.doneAt).toISOString(), source: 'talerid' });
+              out.push({ uid: t.uid, title, due, deadline, done: true, status: 'done', doneAt: new Date(t.doneAt).toISOString(), source: 'talerid', ...detail });
             }
           } else if (t.status !== 'dropped' && (!due || new Date(due).getTime() <= toMs)) {
-            out.push({ uid: t.uid, title, due, deadline, done: false, status: 'pending', source: 'talerid' });
+            out.push({ uid: t.uid, title, due, deadline, done: false, status: 'pending', source: 'talerid', ...detail });
           }
         }
       }
