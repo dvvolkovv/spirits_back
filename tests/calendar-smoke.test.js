@@ -21,6 +21,7 @@
  *   TEST_PHONE   default 70000000000 (clean test account — no calendar connected)
  */
 const axios = require('axios');
+const { debugHeaders } = require('./debug-secret');
 
 const BASE_URL = process.env.BASE_URL || 'https://my.linkeon.io';
 const TEST_PHONE = process.env.TEST_PHONE || '70000000000';
@@ -37,7 +38,7 @@ const http = axios.create({
 async function loginWithOtp(phone) {
   await http.get(`/webhook/${SMS_WH}/sms/${phone}`);
   await new Promise((r) => setTimeout(r, 1000));
-  const codeResp = await http.get(`/webhook/debug/sms-code/${phone}`);
+  const codeResp = await http.get(`/webhook/debug/sms-code/${phone}`, { headers: debugHeaders() });
   if (!codeResp.data?.code) throw new Error(`no OTP code: ${JSON.stringify(codeResp.data)}`);
   const resp = await http.get(`/webhook/${CHECK_WH}/check-code/${phone}/${codeResp.data.code}`);
   if (!resp.data?.['access-token']) throw new Error(`login failed: ${JSON.stringify(resp.data)}`);

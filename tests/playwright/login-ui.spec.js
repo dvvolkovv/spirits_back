@@ -6,6 +6,7 @@
 // незамеченным. Здесь интерфейс проходится по-настоящему.
 const { test, expect } = require('@playwright/test');
 const axios = require('axios');
+const { debugHeaders } = require('../debug-secret');
 
 // Адрес СТРАНИЦЫ задаётся playwright.config.js через BASE_URL (не SMOKE_BASE_URL).
 // Для локального прогона: pnpm build && pnpm preview --port 4173, затем
@@ -58,7 +59,7 @@ async function applyBasicAuth(page) {
 
 /** Свежий код из Redis. На тестовые номера реальная SMS не уходит by design. */
 async function debugCode() {
-  const r = await axios.get(`${API_BASE}/webhook/debug/sms-code/${TEST_PHONE}`);
+  const r = await axios.get(`${API_BASE}/webhook/debug/sms-code/${TEST_PHONE}`, { headers: debugHeaders() });
   return r.data.code;
 }
 

@@ -7,13 +7,15 @@ set -euo pipefail
 BASE_URL=${BASE_URL:-https://b.linkeon.io}
 PHONE=${TEST_PHONE:-70000000000}
 BASE="$BASE_URL/webhook"
+# /webhook/debug/* открываются только заголовком X-Debug-Secret.
+: "${DEBUG_SECRET:?задай DEBUG_SECRET (лежит в .env сервера: /home/dvolkov/spirits_back/.env на проде, /home/dv/spirits_back/.env на test)}"
 
 echo "[video.e2e] BASE_URL=$BASE_URL PHONE=$PHONE"
 
 # -------- 1. Login (matches referral.e2e.sh login() function verbatim) --------
 curl -s "$BASE/898c938d-f094-455c-86af-969617e62f7a/sms/$PHONE" > /dev/null
 sleep 0.5
-CODE=$(curl -s "$BASE/debug/sms-code/$PHONE" | python3 -c "import sys,json; print(json.load(sys.stdin)['code'])")
+CODE=$(curl -s -H @<(printf 'X-Debug-Secret: %s\n' "$DEBUG_SECRET") "$BASE/debug/sms-code/$PHONE" | python3 -c "import sys,json; print(json.load(sys.stdin)['code'])")
 JWT=$(curl -s "$BASE/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/$PHONE/$CODE" | python3 -c "import sys,json; print(json.load(sys.stdin)['access-token'])")
 
 if [ -z "$JWT" ] || [ "$JWT" = "None" ]; then

@@ -17,13 +17,14 @@
  */
 const { test, expect } = require('@playwright/test');
 const axios = require('axios');
+const { debugHeaders } = require('../debug-secret');
 
 const BASE = process.env.BASE_URL || 'https://my.linkeon.io';
 const ADMIN_PHONE = process.env.ADMIN_PHONE || '79030169187';
 
 async function getJwtFor(phone) {
   await axios.get(`${BASE}/webhook/898c938d-f094-455c-86af-969617e62f7a/sms/${phone}`);
-  const codeRes = await axios.get(`${BASE}/webhook/debug/sms-code/${phone}`);
+  const codeRes = await axios.get(`${BASE}/webhook/debug/sms-code/${phone}`, { headers: debugHeaders() });
   const loginRes = await axios.get(
     `${BASE}/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/${phone}/${codeRes.data.code}`,
   );

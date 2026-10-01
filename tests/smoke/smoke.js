@@ -6,6 +6,8 @@
  *   1.  /webhook/agents reachable, returns ≥13 agents including Райя
  *   2.  SMS send endpoint accepts test phone
  *   3.  Debug OTP returns code (proves DEBUG_SMS_CODES=true, env intact)
+ *   3b. Debug-ручки закрыты: без X-Debug-Secret и с неверным — 404 JSON
+ *       (tests/smoke/debug-lock.js)
  *   4.  SMS body contains @my.linkeon.io WebOTP marker (Redis raw read)
  *   5.  check-code returns JWT tokens for the OTP we just got
  *   6.  /webhook/profile returns the test user data with valid JWT
@@ -24,10 +26,14 @@
  * Environment:
  *   BASE_URL       default https://my.linkeon.io
  *   TEST_PHONE     default 70000000000
+ *   DEBUG_SECRET   обязателен: заголовок X-Debug-Secret для /webhook/debug/*
+ *                  (лежит в .env бэкенда на сервере; deploy.sh передаёт сам)
  *   PG_HOST/PORT/etc — optional, only needed if running DB checks
  *                     directly. If not set, SSH-via-helper is used.
  */
 const axios = require('axios');
+const { debugHeaders, DEBUG_SECRET_HINT } = require('../debug-secret');
+const { probeDebugLock } = require('./debug-lock');
 const { execSync } = require('child_process');
 
 const BASE_URL = process.env.BASE_URL || 'https://my.linkeon.io';
@@ -82,6 +88,13 @@ async function step(name, fn) {
 }
 
 (async () => {
+  // Без секрета все шаги со входом краснеют вразнобой и с невнятными ошибками
+  // (debug-ручки отвечают 404). Одна понятная строка вместо этого.
+  if (!process.env.DEBUG_SECRET) {
+    console.error(`✗ ${DEBUG_SECRET_HINT}`);
+    process.exit(1);
+  }
+
   console.log('═'.repeat(70));
   console.log(`SMOKE TESTS — ${BASE_URL}`);
   console.log(`Test account: ${TEST_PHONE}`);
@@ -116,12 +129,28 @@ async function step(name, fn) {
 
   // -- 3. Debug OTP returns code ----------------------------------------
   await step('debug OTP endpoint returns code', async () => {
-    const r = await axios.get(`${BASE_URL}/webhook/debug/sms-code/${TEST_PHONE}`, { timeout: 5000 });
+    const r = await axios.get(`${BASE_URL}/webhook/debug/sms-code/${TEST_PHONE}`, { timeout: 5000, headers: debugHeaders() });
     if (r.status !== 200) throw new Error(`status ${r.status}`);
     const code = r.data?.code;
     if (!code || !/^\d{4,6}$/.test(code)) throw new Error(`unexpected code: ${JSON.stringify(r.data)}`);
     otpCode = code;
     return `code=${code}`;
+  });
+
+  // -- 3b. Замок debug-ручек ---------------------------------------------
+  //
+  // Шаг 3 зеленеет и на коде без замка, поэтому отказ проверяется отдельно:
+  // три ручки без заголовка и с неверным заголовком той же длины → 404 JSON.
+  // Стоит здесь намеренно: код в Redis уже есть, и ручка без замка отдала бы
+  // его с 200. Подробности — tests/smoke/debug-lock.js.
+  await step('debug-ручки закрыты без X-Debug-Secret и с неверным', async () => {
+    const problems = await probeDebugLock({
+      baseUrl: BASE_URL,
+      secret: process.env.DEBUG_SECRET,
+      phone: TEST_PHONE,
+    });
+    if (problems.length) throw new Error(problems.join('; '));
+    return '3 ручки × 2 варианта → 404 JSON';
   });
 
   // -- 4. (WebOTP marker is in the source code; we don't query SMS bodies
@@ -154,6 +183,7 @@ async function step(name, fn) {
       );
       const d = await axios.get(`${BASE_URL}/webhook/debug/sms-code/${TEST_PHONE}`, {
         timeout: 5000,
+        headers: debugHeaders(),
         validateStatus: () => true,
       });
       return d.data?.code;
@@ -245,7 +275,7 @@ async function step(name, fn) {
   await step('admin management stats endpoints return 200', async () => {
     const ADM = '79030169187';
     await axios.get(`${BASE_URL}/webhook/898c938d-f094-455c-86af-969617e62f7a/sms/${ADM}`, { timeout: 8000 });
-    const codeRes = await axios.get(`${BASE_URL}/webhook/debug/sms-code/${ADM}`, { timeout: 5000 });
+    const codeRes = await axios.get(`${BASE_URL}/webhook/debug/sms-code/${ADM}`, { timeout: 5000, headers: debugHeaders() });
     const loginRes = await axios.get(`${BASE_URL}/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/${ADM}/${codeRes.data.code}`, { timeout: 8000 });
     const ajwt = loginRes.data['access-token'];
     if (!ajwt) throw new Error('no admin JWT');
@@ -276,7 +306,7 @@ async function step(name, fn) {
   await step('lifecycle outreach: preview + confirm-gate', async () => {
     const ADM = '79030169187';
     await axios.get(`${BASE_URL}/webhook/898c938d-f094-455c-86af-969617e62f7a/sms/${ADM}`, { timeout: 8000 });
-    const codeRes = await axios.get(`${BASE_URL}/webhook/debug/sms-code/${ADM}`, { timeout: 5000 });
+    const codeRes = await axios.get(`${BASE_URL}/webhook/debug/sms-code/${ADM}`, { timeout: 5000, headers: debugHeaders() });
     const loginRes = await axios.get(`${BASE_URL}/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/${ADM}/${codeRes.data.code}`, { timeout: 8000 });
     const ajwt = loginRes.data['access-token'];
     const H = { headers: { Authorization: `Bearer ${ajwt}`, 'Content-Type': 'application/json' }, timeout: 12000 };
@@ -300,7 +330,7 @@ async function step(name, fn) {
   await step('funnel monotonic + excludes test users', async () => {
     const ADM = '79030169187';
     await axios.get(`${BASE_URL}/webhook/898c938d-f094-455c-86af-969617e62f7a/sms/${ADM}`, { timeout: 8000 });
-    const codeRes = await axios.get(`${BASE_URL}/webhook/debug/sms-code/${ADM}`, { timeout: 5000 });
+    const codeRes = await axios.get(`${BASE_URL}/webhook/debug/sms-code/${ADM}`, { timeout: 5000, headers: debugHeaders() });
     const loginRes = await axios.get(`${BASE_URL}/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/${ADM}/${codeRes.data.code}`, { timeout: 8000 });
     const ajwt = loginRes.data['access-token'];
     const to = new Date(); const from = new Date(to.getTime() - 30 * 864e5);
@@ -324,7 +354,8 @@ async function step(name, fn) {
   // -- 6b. Top up the test account so the token-consuming steps below (TTS,
   // chat streaming) never red the smoke merely because a prior run drained the
   // balance (~5000 tokens/run). debug/add-tokens is gated by DEBUG_SMS_CODES +
-  // the test-phone whitelist, so it's a no-op safety on any non-debug env.
+  // X-Debug-Secret + the test-phone whitelist, so it's a no-op safety on any
+  // non-debug env.
   // NON-FATAL by design: a failed top-up must not itself fail the smoke — worst
   // case the consuming steps run on whatever balance exists, as before. (02b48d89)
   await step('top up test balance (avoid dry-run false-fail)', async () => {
@@ -333,7 +364,7 @@ async function step(name, fn) {
     const r = await axios.post(
       `${BASE_URL}/webhook/debug/add-tokens/${TEST_PHONE}/${TOPUP}`,
       {},
-      { timeout: 10000, validateStatus: () => true },
+      { timeout: 10000, validateStatus: () => true, headers: debugHeaders() },
     );
     if (r.status !== 200) {
       return `SKIP (status ${r.status}) — consuming steps run on existing balance`;

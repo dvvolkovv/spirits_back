@@ -369,6 +369,137 @@ sync_test_basic_auth() {
     || red   "  ! htpasswd sync failed (smoke may still 401)"
 }
 
+# ── Секрет debug-ручек (/webhook/debug/*) ─────────────────────────────────────
+#
+# С 01.10.2026 ручки debug/sms-code, debug/email-token и debug/add-tokens
+# работают только с заголовком X-Debug-Secret, равным DEBUG_SECRET из .env
+# бэкенда (src/auth/debug-access.ts). Без секрета они отвечают 404, а на них
+# держатся smoke (debug OTP → вход) и warm_chat_path. Репозиторий публичный,
+# поэтому секрет живёт ТОЛЬКО в .env сервера — сюда он приезжает по ssh.
+#
+# ensure_debug_secret зовётся в КАЖДОЙ фазе (test, prod) ДО рестарта API:
+#   1. Строки DEBUG_SECRET= в $BACK_PATH/.env нет — дописываем сгенерированную
+#      на самом сервере (openssl rand -hex 32). Только дозапись в конец файла
+#      (>>): остальные строки, владелец и права файла не меняются. Под flock —
+#      два параллельных выката не допишут два разных секрета.
+#      При SMOKE_ONLY=1 ничего не дописываем (режим «не катить, только
+#      проверить»): строки нет — фаза останавливается с подсказкой.
+#   2. Читаем секрет с сервера в переменную DEBUG_SECRET этого скрипта — БЕЗ
+#      export: smoke/run.sh получает его явно в своей команде, warm_chat_path
+#      читает переменную оболочки. Экспорт отдал бы секрет прода всем
+#      следующим процессам скрипта (фаза 4, лендинг), которым он не нужен.
+#
+# Строка есть, но значение короче 32 знаков (в т.ч. пустое) или с пробелами и
+# непечатными знаками — НЕ правим: так ручки выключают осознанно или ошибаются
+# руками, и угадывать нельзя. Фаза останавливается ДО любых изменений на
+# сервере с подсказкой.
+#
+# Секрет не печатается: ssh возвращает его только в stdout, который сразу
+# уходит в переменную; диагностика при отказе показывается без строки значения.
+#
+# Удалённый скрипт — отдельной функцией, а не heredoc'ом внутри $( … ): bash 3.2
+# на маке спотыкается о кавычки в heredoc внутри подстановки (см. ph_registry_probe).
+debug_secret_probe() {
+  cat <<'EOS'
+set -u
+# Байтовая локаль: [:graph:] ниже — ровно печатные ASCII, а ${#v} — длина в байтах.
+export LC_ALL=C
+f="$BACK/.env"
+[ -f "$f" ] || { echo "DS_ERR файла $f нет"; exit 0; }
+# Замок от параллельного выката: иначе оба увидят «строки нет» и допишут каждый
+# своё, а смоук одного из них уедет с чужим, перекрытым значением. Не дождались
+# замка — останавливаемся, а не идём дальше без него.
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"/tmp/.linkeon-debug-secret-$(id -u).lock" \
+    || { echo "DS_ERR lock: не открыть файл замка в /tmp"; exit 0; }
+  flock -w 30 9 \
+    || { echo "DS_ERR lock: замок не взят за 30 с — идёт параллельный выкат? Повтори позже"; exit 0; }
+fi
+re='^[[:space:]]*(export[[:space:]]+)?DEBUG_SECRET='
+if ! grep -qE "$re" "$f"; then
+  if [ "${DS_READONLY:-}" = 1 ]; then
+    echo "DS_ERR строки DEBUG_SECRET нет в $f, а SMOKE_ONLY=1 на сервер не пишет. Запусти выкат без SMOKE_ONLY (строку допишет ensure_debug_secret) или добавь её руками: DEBUG_SECRET=<openssl rand -hex 32>, затем pm2 restart API"
+    exit 0
+  fi
+  [ -w "$f" ] || { echo "DS_ERR $f не доступен на запись"; exit 0; }
+  s=$(openssl rand -hex 32 2>/dev/null) || s=
+  [ "${#s}" -ge 64 ] || s=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  [ "${#s}" -ge 64 ] || { echo "DS_ERR не удалось сгенерировать секрет"; exit 0; }
+  # Файл без перевода строки в конце склеил бы нашу строку с последней.
+  if [ -s "$f" ] && [ -n "$(tail -c1 "$f")" ]; then printf '\n' >> "$f"; fi
+  printf 'DEBUG_SECRET=%s\n' "$s" >> "$f" || { echo "DS_ERR дозапись в $f не удалась"; exit 0; }
+  echo DS_ADDED
+fi
+# Последнее вхождение — как у dotenv (последнее перекрывает предыдущие).
+v=$(sed -nE "s/${re}//p" "$f" | tail -1 | tr -d '\r')
+case "$v" in
+  \"*) v=${v#\"}; v=${v%%\"*} ;;
+  \'*) v=${v#\'}; v=${v%%\'*} ;;
+  *)   v=${v%%[[:space:]]#*}; v=$(printf '%s' "$v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//') ;;
+esac
+[ "${#v}" -ge 32 ] || { echo "DS_SHORT len=${#v}"; exit 0; }
+# Значение уходит в HTTP-заголовок и в env смоука: пробел, табуляция, кириллица
+# или управляющий знак там ломаются по-разному и невнятно. Само значение не печатаем.
+case "$v" in
+  *[![:graph:]]*) echo "DS_BAD значение DEBUG_SECRET (длина ${#v}) содержит пробел или недопустимые знаки — допустимы только печатные ASCII без пробелов (проще всего openssl rand -hex 32)"; exit 0 ;;
+esac
+echo "DS_VALUE=$v"
+EOS
+}
+
+ensure_debug_secret() {
+  bold "[debug-secret] DEBUG_SECRET в $BACK_PATH/.env ($ENV_NAME)"
+  unset DEBUG_SECRET
+  local raw rc attempt val ro=
+  [[ -n "${SMOKE_ONLY:-}" ]] && ro=1
+  # Свой повтор вместо ssh_remote: скрипт идёт через stdin, а ssh_remote шлёт
+  # команду строкой. Повтор безопасен — дозапись идёт только при отсутствии строки.
+  for attempt in 1 2 3; do
+    raw=$(debug_secret_probe | ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=20 "$HOST" "BACK='$BACK_PATH' DS_READONLY='$ro' bash -s" 2>&1)
+    rc=$?
+    [[ $rc -ne 255 ]] && break
+    echo "  ! ssh to ${ENV_NAME} dropped (code 255) — retry $attempt/3" >&2
+    sleep $((attempt * 3))
+  done
+  val=$(sed -n 's/^DS_VALUE=//p' <<<"$raw" | tail -1)
+  if [[ -n "$val" && ${#val} -ge 32 && "$val" != *[[:space:]]* ]]; then
+    if grep -q '^DS_ADDED$' <<<"$raw"; then
+      green "  ✓ строки не было — дописан новый DEBUG_SECRET (64 hex) в конец $BACK_PATH/.env"
+      if [[ -n "${FRONT_ONLY:-}" ]]; then
+        yellow "  ⚠ API в этой фазе не перезапускается (FRONT_ONLY): бэкенд с замком увидит секрет только после рестарта"
+      fi
+    else
+      green "  ✓ DEBUG_SECRET на месте (длина ${#val})"
+    fi
+    # Без export — см. шапку блока.
+    DEBUG_SECRET="$val"
+    return 0
+  fi
+  if grep -q '^DS_SHORT' <<<"$raw"; then
+    red "  ✗ в $BACK_PATH/.env ($ENV_NAME) строка DEBUG_SECRET есть, но значение короче 32 знаков ($(grep -m1 '^DS_SHORT' <<<"$raw" | sed 's/^DS_SHORT //'))"
+    red "    Скрипт её не трогает. Удали строку (тогда deploy.sh допишет новую) или задай секрет ≥32 знаков руками."
+  elif grep -q '^DS_BAD' <<<"$raw"; then
+    red "  ✗ в $BACK_PATH/.env ($ENV_NAME): $(grep -m1 '^DS_BAD' <<<"$raw" | sed 's/^DS_BAD //')"
+    red "    Скрипт её не трогает. Удали строку (тогда deploy.sh допишет новую) или исправь значение руками."
+  elif grep -q '^DS_ERR' <<<"$raw"; then
+    red "  ✗ DEBUG_SECRET ($ENV_NAME): $(grep -m1 '^DS_ERR' <<<"$raw" | sed 's/^DS_ERR //')"
+  elif [[ $rc -eq 0 ]]; then
+    red "  ✗ DEBUG_SECRET ($ENV_NAME): проверка на $HOST отработала, но не вернула ни секрета, ни причины"
+    [[ -n "$raw" ]] && { echo "      что вернулось:"; grep -v '^DS_VALUE=' <<<"$raw" | tail -5 | sed 's/^/        /'; }
+  else
+    red "  ✗ DEBUG_SECRET ($ENV_NAME): $HOST не ответил (ssh rc=$rc)"
+    [[ -n "$raw" ]] && { echo "      что вернулось:"; grep -v '^DS_VALUE=' <<<"$raw" | tail -5 | sed 's/^/        /'; }
+  fi
+  red "    Без секрета smoke не войдёт (debug-ручки отвечают 404) — фаза остановлена до изменений на сервере."
+  return 1
+}
+
+# Заголовок X-Debug-Secret для curl — через файл-подстановку, а не аргументом:
+# так секрет не светится в списке процессов. Пример:
+#   curl -H @<(debug_secret_header) "$base/webhook/debug/sms-code/$phone"
+debug_secret_header() { printf 'X-Debug-Secret: %s\n' "${DEBUG_SECRET:-}"; }
+
 # Прогрев chat-пути перед smoke (см. вызов в run_phase). После pm2 restart связь
 # linkeon-api ↔ r.linkeon.io холодная: первый chat-вызов медленный/падает, ответ
 # не успевает сохраниться → smoke-чек custom_chat_history видит 0 строк и валит
@@ -378,8 +509,10 @@ warm_chat_path() {
   local base="$1" auth="$2"
   local ca=(); [[ -n "$auth" ]] && ca=(-u "$auth")
   local phone=70000000000 code tok
+  # debug/sms-code открывается только заголовком X-Debug-Secret (см. ensure_debug_secret).
+  [[ -z "${DEBUG_SECRET:-}" ]] && { yellow "  ⚠ прогрев пропущен: DEBUG_SECRET не получен"; return 0; }
   curl -s ${ca[@]+${ca[@]+"${ca[@]}"}} -m 15 "$base/webhook/898c938d-f094-455c-86af-969617e62f7a/sms/$phone" >/dev/null 2>&1 || return 0
-  code=$(curl -s ${ca[@]+${ca[@]+"${ca[@]}"}} -m 15 "$base/webhook/debug/sms-code/$phone" | grep -oE '[0-9]{4,6}' | head -1)
+  code=$(curl -s ${ca[@]+${ca[@]+"${ca[@]}"}} -m 15 -H @<(debug_secret_header) "$base/webhook/debug/sms-code/$phone" | grep -oE '[0-9]{4,6}' | head -1)
   [[ -z "$code" ]] && return 0
   tok=$(curl -s ${ca[@]+${ca[@]+"${ca[@]}"}} -m 15 "$base/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/$phone/$code" \
         | sed -n 's/.*"access-token":"\([^"]*\)".*/\1/p')
@@ -1123,6 +1256,10 @@ run_phase() {
   # проверки ложно краснеют, а красный prod-smoke откатывает здоровый релиз (см. функцию).
   preflight_vantage
 
+  # Секрет debug-ручек — ДО рестарта API (дописать, если нет) и ДО smoke
+  # (прочитать). Отказ — до любых изменений на сервере, см. функцию.
+  ensure_debug_secret || return 1
+
   if [[ -z "${SMOKE_ONLY:-}" ]]; then
     # Capture pre-deploy state on prod (по умолчанию) для авто-rollback'а
     # при smoke failure. NO_ROLLBACK=1 отключает.
@@ -1166,7 +1303,8 @@ run_phase() {
         # inside the same blip and false-fails. SMOKE_RETRY_GAP overrides.
         sleep "${SMOKE_RETRY_GAP:-20}"
       fi
-      if BASE_URL="$BASE_URL" BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" PG_DSN="$PG_DSN" bash smoke/run.sh; then
+      if BASE_URL="$BASE_URL" BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" PG_DSN="$PG_DSN" \
+         DEBUG_SECRET="${DEBUG_SECRET:-}" bash smoke/run.sh; then
         smoke_ok=1; break
       fi
     done

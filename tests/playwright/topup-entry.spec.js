@@ -1,6 +1,7 @@
 // @ts-check
 const { test, expect } = require('@playwright/test');
 const axios = require('axios');
+const { debugHeaders } = require('../debug-secret');
 
 /**
  * Вход в форму пополнения токенов.
@@ -31,7 +32,7 @@ const TEST_PHONE = process.env.TEST_PHONE || '70000000000';
 
 async function getJwt() {
   await axios.get(`${API_BASE}/webhook/898c938d-f094-455c-86af-969617e62f7a/sms/${TEST_PHONE}`);
-  const codeRes = await axios.get(`${API_BASE}/webhook/debug/sms-code/${TEST_PHONE}`);
+  const codeRes = await axios.get(`${API_BASE}/webhook/debug/sms-code/${TEST_PHONE}`, { headers: debugHeaders() });
   const loginRes = await axios.get(
     `${API_BASE}/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/${TEST_PHONE}/${codeRes.data.code}`,
   );

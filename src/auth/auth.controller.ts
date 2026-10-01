@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Post, Param, Query, Req, Res, HttpStatus, Logger, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Post, Param, Query, Req, Res, HttpStatus, Logger, OnModuleInit, UseGuards } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
 import { EmailService } from './email.service';
@@ -12,6 +12,14 @@ import { RedisService } from '../common/services/redis.service';
 import { DevicesService } from '../devices/devices.service';
 import { PgService } from '../common/services/pg.service';
 import { verifyInitData } from '../tma/init-data';
+import { DEBUG_SECRET_HEADER, isDebugConfigured, isDebugRequestAllowed, isTestEmail } from './debug-access';
+
+/**
+ * Ответ check-code, когда лимит попыток исчерпан и код погашен (sms-code.ts).
+ * Подстрока «Code not found» — для уже выложенного веб-клиента: по ней он
+ * говорит человеку «Код не найден. Запросите новый код».
+ */
+export const TOO_MANY_ATTEMPTS_ERROR = 'Too many attempts. Code not found, request a new code';
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -20,7 +28,7 @@ const CORS = {
 };
 
 @Controller('')
-export class AuthController {
+export class AuthController implements OnModuleInit {
   private readonly logger = new Logger(AuthController.name);
 
   constructor(
@@ -35,6 +43,14 @@ export class AuthController {
     private readonly devices: DevicesService,
     private readonly pg: PgService,
   ) {}
+
+  onModuleInit() {
+    // Флаг включён, а секрета нет — ручки молча отвечают 404, и смоук краснеет
+    // без объяснений. Одна строка в логе на старте экономит поиск причины.
+    if (process.env.DEBUG_SMS_CODES === 'true' && !isDebugConfigured()) {
+      this.logger.warn('DEBUG_SMS_CODES=true, но DEBUG_SECRET не задан или короче 32 знаков — debug-ручки выключены');
+    }
+  }
 
   // SMS OTP request — UUID hardcoded to match frontend
   @Get('898c938d-f094-455c-86af-969617e62f7a/sms/:phone')
@@ -69,13 +85,19 @@ export class AuthController {
     @Req() req: Request,
     @Res() res: Response,
   ) {
-    const tokens = await this.authService.checkCode(phone, code, sid, src);
-    if (!tokens) {
+    const result = await this.authService.checkCode(phone, code, sid, src);
+    if (result.status === 'too_many_attempts') {
+      // Тот же 401, что у неверного кода: мобилка разбирает отказ по статусу.
+      // Текст отличим, а «Code not found» в нём веб-клиент показывает как
+      // «Код не найден. Запросите новый код» — ровно то, что теперь нужно.
+      return res.set(CORS).status(401).json({ error: TOO_MANY_ATTEMPTS_ERROR, reason: 'too_many_attempts' });
+    }
+    if (result.status !== 'ok') {
       return res.set(CORS).status(401).json({ error: 'Invalid or expired code' });
     }
     // У телефонной регистрации внутренний идентификатор — сам номер.
     void this.devices.record(phone, req.headers['user-agent']);
-    return res.set(CORS).status(200).json(tokens);
+    return res.set(CORS).status(200).json(result.tokens);
   }
 
   // Refresh token
@@ -97,12 +119,15 @@ export class AuthController {
     return res.status(200).json(tokens);
   }
 
-  // Debug endpoint — returns SMS code from Redis (only when DEBUG_SMS_CODES=true)
+  // ── Debug-ручки (/webhook/debug/*) ──────────────────────────────────────
+  // Работают только при DEBUG_SMS_CODES=true, непустом DEBUG_SECRET (≥32 знаков)
+  // и совпадающем заголовке X-Debug-Secret; иначе — 404, будто ручки нет.
+  // Почему так и где взять секрет — src/auth/debug-access.ts и CLAUDE.md.
+
+  /** Код входа из Redis для номера из белого списка. */
   @Get('debug/sms-code/:phone')
-  async debugSmsCode(@Param('phone') phone: string, @Res() res: Response) {
-    if (process.env.DEBUG_SMS_CODES !== 'true') {
-      return res.status(404).json({ error: 'Not found' });
-    }
+  async debugSmsCode(@Param('phone') phone: string, @Req() req: Request, @Res() res: Response) {
+    if (!this.debugAllowed(req)) return this.debugNotFound(res);
     if (!this.isTestPhone(phone)) {
       return res.status(403).json({ error: 'Phone not in whitelist' });
     }
@@ -111,12 +136,14 @@ export class AuthController {
     return res.status(200).json({ code });
   }
 
+  /** Активный токен ссылки входа для тестовой почты (см. isTestEmail). */
   @Get('debug/email-token/:email')
-  async debugEmailToken(@Param('email') email: string, @Res() res: Response) {
-    if (process.env.DEBUG_SMS_CODES !== 'true') {
-      return res.status(404).json({ error: 'not enabled' });
-    }
+  async debugEmailToken(@Param('email') email: string, @Req() req: Request, @Res() res: Response) {
+    if (!this.debugAllowed(req)) return this.debugNotFound(res);
     const normalized = email.trim().toLowerCase();
+    if (!isTestEmail(normalized)) {
+      return res.status(403).json({ error: 'Email not in whitelist' });
+    }
     // Search active ml-* tokens for this email
     const allKeys = await this.redis.keys('ml-*');
     for (const key of allKeys) {
@@ -137,11 +164,10 @@ export class AuthController {
   async debugAddTokens(
     @Param('phone') phone: string,
     @Param('amount') amount: string,
+    @Req() req: Request,
     @Res() res: Response,
   ) {
-    if (process.env.DEBUG_SMS_CODES !== 'true') {
-      return res.status(404).json({ error: 'Not found' });
-    }
+    if (!this.debugAllowed(req)) return this.debugNotFound(res);
     if (!this.isTestPhone(phone)) {
       return res.status(403).json({ error: 'Phone not in whitelist' });
     }
@@ -657,10 +683,10 @@ location.replace('/chat');
     const code = body?.code;
     if (!phone || !code) return res.set(CORS).status(400).json({ error: 'missing phone/code' });
 
-    // Validate SMS code (same logic as login)
-    const stored = await this.redis.get(`sc-${phone}`);
-    if (!stored || stored !== code) return res.set(CORS).status(401).json({ error: 'invalid code' });
-    await this.redis.del(`sc-${phone}`);
+    // Та же проверка, что при входе, с тем же лимитом попыток (sms-code.ts).
+    const check = await this.authService.verifySmsCode(phone, code);
+    if (check === 'too_many_attempts') return res.set(CORS).status(401).json({ error: 'too many attempts' });
+    if (check !== 'ok') return res.set(CORS).status(401).json({ error: 'invalid code' });
 
     const r = await this.identity.linkMethod(userId, 'phone', { phone });
     if (!r.ok) return res.set(CORS).status(409).json({ error: (r as any).reason });
@@ -727,9 +753,22 @@ location.replace('/chat');
     return res.set(CORS).status(200).json({ ok: true });
   }
 
+  /** Пускать ли запрос к debug-ручке: флаг, секрет и заголовок X-Debug-Secret. */
+  private debugAllowed(req: Request): boolean {
+    return isDebugRequestAllowed(req.headers[DEBUG_SECRET_HEADER]);
+  }
+
+  /** Отказ debug-ручки неотличим от отсутствия маршрута: наружу не видно, что она есть. */
+  private debugNotFound(res: Response) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+
   /**
-   * Whitelist тестовых телефонов для всех debug-эндпоинтов.
+   * Whitelist тестовых телефонов для debug-ручек sms-code и add-tokens.
    * Фиксированный список + pattern для динамических referral-аккаунтов.
+   *
+   * Дополнительное ограничение поверх секрета X-Debug-Secret (debugAllowed
+   * выше): без секрета ручки отвечают 404 для любого номера.
    */
   private isTestPhone(phone: string): boolean {
     // 79656445804 — number Claude uses to authorize its dev/test API calls.

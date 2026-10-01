@@ -17,6 +17,8 @@
  * «всегда отвечает по-русски». Он же возвращает тестовый аккаунт в исходное
  * состояние.
  */
+import debugSecret from './debug-secret.js';
+
 const BASE = process.env.BASE_URL || 'https://my.linkeon.io';
 const PHONE = process.env.TEST_PHONE || '70000000000';
 const SMS_WH = '898c938d-f094-455c-86af-969617e62f7a';
@@ -36,7 +38,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function login() {
   await fetch(`${BASE}/webhook/${SMS_WH}/sms/${PHONE}`);
   await sleep(1200);
-  const code = await (await fetch(`${BASE}/webhook/debug/sms-code/${PHONE}`)).json();
+  const code = await (await fetch(`${BASE}/webhook/debug/sms-code/${PHONE}`, {
+    headers: debugSecret.debugHeaders(),
+  })).json();
   if (!code.code) throw new Error('нет debug-кода: ' + JSON.stringify(code));
   const r = await (await fetch(`${BASE}/webhook/${CHECK_WH}/check-code/${PHONE}/${code.code}`)).json();
   if (!r['access-token']) throw new Error('логин не прошёл: ' + JSON.stringify(r));

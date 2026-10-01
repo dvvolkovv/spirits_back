@@ -5,6 +5,8 @@ import { JwtService } from '../common/services/jwt.service';
 import { IdentityService } from '../identity/identity.service';
 import { EventsService } from '../events/events.service';
 import axios from 'axios';
+import { randomInt } from 'crypto';
+import { SMS_CODE_TTL_SECONDS, smsAttemptsKey, smsCodeKey, verifySmsCode, SmsCodeCheck } from './sms-code';
 
 // Чисто служебные номера: при DEBUG_SMS_CODES=true НИКОГДА не шлём реальную SMS
 // (код доступен через /webhook/debug/sms-code). Это smoke/мониторинг/playwright
@@ -20,6 +22,10 @@ const PURE_TEST_PATTERN = /^790300\d{5}$/;
 // (инцидент 2026-07-10). Код всё равно кладётся в Redis для debug-эндпоинта.
 const DEV_DUAL_PHONES = ['79656445804'];
 
+export type CheckCodeResult =
+  | { status: 'ok'; tokens: { 'access-token': string; 'refresh-token': string; 'is-new-user': boolean } }
+  | { status: 'invalid' | 'too_many_attempts' };
+
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
@@ -34,7 +40,7 @@ export class AuthService {
 
   async requestSmsCode(phone: string, sid?: string | null, src?: string | null, opts?: { suppressSms?: boolean; lang?: string | null }): Promise<{ status: string }> {
     // Check if code already exists in Redis
-    const existing = await this.redis.get(`sc-${phone}`);
+    const existing = await this.redis.get(smsCodeKey(phone));
     if (existing) {
       this.logger.log(`Code already exists for ${phone}, skipping resend`);
       return { status: 'exists' };
@@ -50,11 +56,14 @@ export class AuthService {
       return { status: 'blocked' };
     }
 
-    // Generate 6-digit code
-    const code = String(Math.floor(100000 + Math.random() * 900000));
+    // Шестизначный код из криптостойкого генератора: Math.random для кода
+    // входа не годится.
+    const code = String(randomInt(100000, 1000000));
 
-    // Store in Redis with 5 min TTL
-    await this.redis.set(`sc-${phone}`, code, 300);
+    // Новый код — новый счётчик неверных попыток (см. sms-code.ts). Счётчик
+    // сбрасываем до записи кода: пока кода нет, попытки не считаются.
+    await this.redis.del(smsAttemptsKey(phone));
+    await this.redis.set(smsCodeKey(phone), code, SMS_CODE_TTL_SECONDS);
 
     // Решаем, глушить ли реальную SMS. Только при DEBUG_SMS_CODES=true:
     //  • чисто служебные номера — всегда глушим (код в Redis);
@@ -167,12 +176,17 @@ export class AuthService {
     }
   }
 
-  async checkCode(phone: string, code: string, sid?: string | null, src?: string | null): Promise<{ 'access-token': string; 'refresh-token': string; 'is-new-user': boolean } | null> {
-    const stored = await this.redis.get(`sc-${phone}`);
-    if (!stored) return null; // expired
-    if (stored !== code) return null; // wrong code
+  /**
+   * Сверить код из SMS (вход и привязка телефона). Лимит неверных попыток и
+   * погашение кода — в sms-code.ts.
+   */
+  async verifySmsCode(phone: string, code: string): Promise<SmsCodeCheck> {
+    return verifySmsCode(this.redis, phone, code);
+  }
 
-    await this.redis.del(`sc-${phone}`);
+  async checkCode(phone: string, code: string, sid?: string | null, src?: string | null): Promise<CheckCodeResult> {
+    const check = await this.verifySmsCode(phone, code);
+    if (check !== 'ok') return { status: check };
 
     // IdentityService is the single point that emits signup_completed and
     // auth_succeeded — covers SMS, Google, Yandex, email magic-link. Here
@@ -186,16 +200,19 @@ export class AuthService {
     this.events?.track('otp_verified', { userId, sessionId: sid || null, source: src || null, props: { channel: 'sms' } });
 
     return {
-      'access-token': this.jwtSvc.signAccess(userId),
-      'refresh-token': this.jwtSvc.signRefresh(userId),
-      // Для фронта: фиксируем регистрацию в VK-пикселе (goal=registration)
-      // только для НОВОГО пользователя, не на каждый вход.
-      'is-new-user': isNew,
+      status: 'ok',
+      tokens: {
+        'access-token': this.jwtSvc.signAccess(userId),
+        'refresh-token': this.jwtSvc.signRefresh(userId),
+        // Для фронта: фиксируем регистрацию в VK-пикселе (goal=registration)
+        // только для НОВОГО пользователя, не на каждый вход.
+        'is-new-user': isNew,
+      },
     };
   }
 
   async getDebugCode(phone: string): Promise<string | null> {
-    return this.redis.get(`sc-${phone}`);
+    return this.redis.get(smsCodeKey(phone));
   }
 
   /**

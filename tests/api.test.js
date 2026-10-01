@@ -374,9 +374,28 @@ module.exports = {
     assertStatus(resp, 401, 403);
   },
 
-  'GET /webhook/debug/email-token/:email — when DEBUG_SMS_CODES=false → 404': async () => {
-    // We can't verify true case without mutating env. Verify 404 with non-existent email.
+  // Debug-ручки открываются только заголовком X-Debug-Secret (src/auth/debug-access.ts).
+  // Без него или с неверным — 404, будто ручки нет. Секрет здесь не нужен:
+  // проверяется именно то, что видит посторонний.
+  'GET /webhook/debug/email-token/:email — без X-Debug-Secret → 404': async () => {
     const resp = await http.get('/webhook/debug/email-token/nonexistent-' + Date.now() + '@example.com');
+    assertStatus(resp, 404);
+  },
+
+  'GET /webhook/debug/sms-code/:phone — без X-Debug-Secret → 404': async () => {
+    const resp = await http.get('/webhook/debug/sms-code/79030169187');
+    assertStatus(resp, 404);
+  },
+
+  'GET /webhook/debug/sms-code/:phone — неверный X-Debug-Secret (любой длины) → 404': async () => {
+    for (const wrong of ['x', 'x'.repeat(64), 'x'.repeat(200)]) {
+      const resp = await http.get('/webhook/debug/sms-code/70000000000', { headers: { 'X-Debug-Secret': wrong } });
+      assertStatus(resp, 404);
+    }
+  },
+
+  'POST /webhook/debug/add-tokens — без X-Debug-Secret → 404': async () => {
+    const resp = await http.post('/webhook/debug/add-tokens/70000000000/1');
     assertStatus(resp, 404);
   },
 

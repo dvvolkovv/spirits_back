@@ -5,6 +5,7 @@
 
 const axios = require('axios');
 const config = require('./config');
+const { debugHeaders } = require('./debug-secret');
 
 const BASE = config.BASE_URL;
 const TEST_PHONE = config.TEST_PHONE || '79169403771';
@@ -26,7 +27,7 @@ function headers() {
 async function loginWithOtp() {
   await http.get(`/webhook/${SMS_WH}/sms/${TEST_PHONE}`);
   await new Promise(r => setTimeout(r, 1000));
-  const codeResp = await http.get(`/webhook/debug/sms-code/${TEST_PHONE}`);
+  const codeResp = await http.get(`/webhook/debug/sms-code/${TEST_PHONE}`, { headers: debugHeaders() });
   if (!codeResp.data.code) throw new Error(`No code: ${JSON.stringify(codeResp.data)}`);
   const resp = await http.get(`/webhook/${CHECK_WH}/check-code/${TEST_PHONE}/${codeResp.data.code}`);
   if (!resp.data['access-token']) throw new Error(`Login failed: ${JSON.stringify(resp.data)}`);
@@ -43,7 +44,8 @@ async function loginWithMagicLink(email) {
 
   // 2. Get token via debug endpoint
   await new Promise(r => setTimeout(r, 500));
-  const tokenResp = await http.get(`/webhook/debug/email-token/${encodeURIComponent(email)}`);
+  const tokenResp = await http.get(`/webhook/debug/email-token/${encodeURIComponent(email)}`,
+    { headers: debugHeaders() });
   if (!tokenResp.data?.token) throw new Error(`no debug token: ${JSON.stringify(tokenResp.data)}`);
 
   // 3. Confirm with Accept: application/json (else backend returns HTML)

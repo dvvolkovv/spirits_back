@@ -127,7 +127,7 @@ bash ~/Downloads/spirits_back/scripts/deploy.sh
 
 ### Тестовый сервер
 
-`test.linkeon.io` (`dv@85.192.61.231`, Ubuntu 24.04). Полный зеркальный стек: PostgreSQL/Redis/Neo4j/MinIO. SMS Aero и YooKassa отключены через пустые env. `DEBUG_SMS_CODES=true`. Доступ закрыт Basic Auth на уровне Nginx.
+`test.linkeon.io` (`dv@85.192.61.231`, Ubuntu 24.04). Полный зеркальный стек: PostgreSQL/Redis/Neo4j/MinIO. SMS Aero и YooKassa отключены через пустые env. `DEBUG_SMS_CODES=true` + свой `DEBUG_SECRET` (не равен продовому). Доступ закрыт Basic Auth на уровне Nginx.
 
 **Bootstrap (один раз):** `bash scripts/provision-test.sh`. Скрипт идемпотентный, можно перезапускать. Креды генерятся и складываются в `scripts/test-server.env.local` (gitignored).
 
@@ -237,6 +237,22 @@ ssh dvolkov@212.113.106.202 "tar xzf /tmp/agent-avatars.tar.gz -C /home/dvolkov/
 DEBUG_SMS_CODES=true — код можно получить через `GET /webhook/debug/sms-code/:phone`
 (все три номера в whitelist `isTestPhone` в `auth.controller.ts`).
 
+> 🔒 **С 01.10.2026 debug-ручки (`/webhook/debug/sms-code`, `/debug/email-token`, `/debug/add-tokens`) требуют заголовок `X-Debug-Secret`.**
+> Работают только при `DEBUG_SMS_CODES=true` + `DEBUG_SECRET` (≥32 знаков) в `.env` бэкенда + совпавшем заголовке; иначе — 404, как будто ручки нет. Без `DEBUG_SECRET` ручки выключены. Код — `src/auth/debug-access.ts`.
+> Секрет лежит **только в `.env` сервера** — в репозиторий (он публичный), в доки и в коммиты его не класть. У прода и теста секреты **разные**. `deploy.sh` сам дописывает строку, если её нет (`ensure_debug_secret`), и передаёт секрет смоуку.
+> **Секрет не печатать (`echo`, `cat .env`, лог, отчёт) и не экспортировать** — только в переменную оболочки и явно в команду, которой он нужен. **Для экспериментов брать секрет test, не prod**; прод — только когда проверяется сам прод.
+> ```bash
+> # test.linkeon.io — для экспериментов
+> DEBUG_SECRET=$(ssh dv@85.192.61.231 "sed -n 's/^DEBUG_SECRET=//p' /home/dv/spirits_back/.env")
+> curl -s -H @<(printf 'X-Debug-Secret: %s\n' "$DEBUG_SECRET") https://test.linkeon.io/webhook/debug/sms-code/70000000000
+> # тесту — явно в его команду, без export
+> DEBUG_SECRET="$DEBUG_SECRET" BASE_URL=https://test.linkeon.io node tests/smoke/smoke.js
+> # прод — тем же способом, путь /home/dvolkov/spirits_back/.env на dvolkov@212.113.106.202
+> ```
+> Тесты (`tests/smoke`, `tests/playwright`, `tests/*.e2e.*`) берут секрет из `DEBUG_SECRET` через `tests/debug-secret.js` и без него падают с подсказкой. `debug/email-token` отвечает только для тестовых почт (`*@example.com`, `claude.*@linkeon.io`). Смоук отдельно проверяет, что без заголовка и с неверным ручки отвечают 404 (`tests/smoke/debug-lock.js`).
+>
+> 🔢 **Код из SMS — не больше 5 попыток** (`src/auth/sms-code.ts`): счётчик `sc-att-<phone>` живёт столько же, сколько код (300 с); пятая неверная попытка гасит код (`check-code` отвечает 401 «Too many attempts. Code not found, request a new code»), нужен новый запрос SMS. Тот же лимит — у привязки телефона. Тесты входят верным кодом с первой попытки и лимита не касаются.
+
 > ⚠️ **`79656445804` — «двойной» номер: это ЛИЧНЫЙ телефон владельца И dev/test-номер Claude.**
 > С 2026-07-10 обычный вход с телефона на него шлёт **реальную SMS** (иначе владелец не мог войти). Поэтому Claude в своей SMS-церемонии ОБЯЗАН глушить реальную SMS флагом **`?nosms=1`**:
 > `GET /webhook/898c938d-.../sms/79656445804?nosms=1` → код по-прежнему в Redis (`/webhook/debug/sms-code/79656445804`).
@@ -285,7 +301,7 @@ reconnect), поэтому одиночный прогон иногда даёт
 **Слой 2 — API + DB smoke** ([tests/smoke/smoke.js](tests/smoke/smoke.js))
 9 критических путей против `https://my.linkeon.io`:
 1. `/webhook/agents` отдаёт 14 ассистентов, Райя на месте
-2. SMS-send + debug-OTP + check-code → JWT (доказывает что `DEBUG_SMS_CODES=true`)
+2. SMS-send + debug-OTP + check-code → JWT (доказывает что `DEBUG_SMS_CODES=true` и `DEBUG_SECRET` на месте; смоуку нужен env `DEBUG_SECRET`); debug-ручки без заголовка и с неверным — 404 JSON (`debug-lock.js`)
 3. `/webhook/profile` и `/webhook/user/tokens/` с JWT
 4. `/webhook/soulmate/chat` стримит ответ (покрывает `streamUniversalAgent` → r.linkeon.io)
 5. `custom_chat_history` получил свежие строки (покрывает `saveChatHistory` в `setImmediate`) — DB-чек через SSH+psql
@@ -335,7 +351,7 @@ cd ~/Downloads/spirits_back/tests && node runner.js  # api (32) + e2e (18) = 50
 - `GET /webhook/{uuid}/sms/:phone` — запрос SMS кода
 - `GET /webhook/{uuid}/check-code/:phone/:code` — проверка кода, возврат JWT
 - `POST /webhook/auth/refresh` — обновление JWT
-- `GET /webhook/debug/sms-code/:phone` — debug: получить код из Redis
+- `GET /webhook/debug/sms-code/:phone` — debug: получить код из Redis (только с заголовком `X-Debug-Secret`, см. «Тестовые аккаунты»)
 
 ### Profile
 - `GET /webhook/profile` — профиль с данными из Neo4j (values, beliefs, desires, intents, interests, skills)
@@ -422,6 +438,7 @@ assistant-строки», а это ложная тревога на каждо�
 - `SMSAERO_LOGIN` / `SMSAERO_API_KEY` — SMS Aero
 - `YOOKASSA_SHOP_ID` / `YOOKASSA_SECRET_KEY` — YooKassa
 - `DEBUG_SMS_CODES=true` — debug endpoint для SMS кодов
+- `DEBUG_SECRET` — секрет заголовка `X-Debug-Secret` для `/webhook/debug/*` (≥32 знаков; без него debug-ручки выключены; дописывается `deploy.sh`)
 - `SMTP_HOST=185.4.75.22` / `SMTP_PORT=2525` — email (exim4 relay, `ssh root@185.4.75.22`)
 
 ## SMTP (email magic-link)

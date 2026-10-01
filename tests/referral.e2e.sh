@@ -1,11 +1,13 @@
 #!/bin/bash
 BASE="http://localhost:3001/webhook"
+# /webhook/debug/* открываются только заголовком X-Debug-Secret.
+: "${DEBUG_SECRET:?задай DEBUG_SECRET (лежит в .env сервера: /home/dvolkov/spirits_back/.env на проде, /home/dv/spirits_back/.env на test)}"
 
 login() {
   local phone=$1
   curl -s "$BASE/898c938d-f094-455c-86af-969617e62f7a/sms/$phone" > /dev/null
   sleep 0.5
-  local code=$(curl -s "$BASE/debug/sms-code/$phone" | python3 -c "import sys,json; print(json.load(sys.stdin)['code'])")
+  local code=$(curl -s -H @<(printf 'X-Debug-Secret: %s\n' "$DEBUG_SECRET") "$BASE/debug/sms-code/$phone" | python3 -c "import sys,json; print(json.load(sys.stdin)['code'])")
   curl -s "$BASE/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/$phone/$code" | python3 -c "import sys,json; print(json.load(sys.stdin)['access-token'])"
 }
 

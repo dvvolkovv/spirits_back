@@ -6,6 +6,8 @@
 # Env: BASE_URL (default https://my.linkeon.io), TEST_PHONE (default 70000000000)
 #      BASIC_AUTH (optional, user:pass for Basic Auth on test server)
 #      SSH_TARGET (optional, override SSH host for DB-check, default dvolkov@212.113.106.202)
+#      DEBUG_SECRET (обязателен для слоёв api/browser: заголовок X-Debug-Secret для
+#      /webhook/debug/*; лежит в .env бэкенда на сервере, deploy.sh передаёт его сам)
 
 set -uo pipefail
 
