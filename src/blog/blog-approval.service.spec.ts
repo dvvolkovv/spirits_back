@@ -936,10 +936,11 @@ describe('handleCaseCommand: реальный кейс командой в ли�
   });
 
   it('чужой /case — не наш: ни темы, ни ответа от блога', async () => {
-    const { svc, tg, topics } = setup();
+    const { svc, tg, topics, pg } = setup();
     expect(await svc.handleCaseCommand(dm(`/case ${STORY}`, 42))).toBe(false);
     expect(topics.addTopic).not.toHaveBeenCalled();
     expect(tg.sendMessage).not.toHaveBeenCalled();
+    expect(pg.query).not.toHaveBeenCalled();
   });
 
   it('без BLOG_APPROVER_TG_ID команда ничья', async () => {
@@ -950,9 +951,14 @@ describe('handleCaseCommand: реальный кейс командой в ли�
   });
 
   it('другие команды и обычный текст — не наши', async () => {
-    const { svc } = setup();
+    const { svc, pg, tg, topics } = setup();
     expect(await svc.handleCaseCommand(dm('/help'))).toBe(false);
     expect(await svc.handleCaseCommand(dm(STORY))).toBe(false);
+    // Бот зовёт handleCaseCommand первой строкой на КАЖДУЮ команду в личке
+    // (handleDmCommand): чужим командам — ни базы, ни Telegram.
+    expect(pg.query).not.toHaveBeenCalled();
+    expect(topics.addTopic).not.toHaveBeenCalled();
+    expect(tg.sendMessage).not.toHaveBeenCalled();
   });
 
   it('пустая и короткая история — объяснение, как писать, тема не заводится', async () => {
