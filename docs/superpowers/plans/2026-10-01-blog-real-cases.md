@@ -1259,6 +1259,16 @@ describe('handleCaseCommand: реальный кейс командой в ли�
     expect(await svc.handleCaseCommand(dm(`/case ${STORY}`))).toBe(true);
     expect(tg.sendMessage).toHaveBeenCalledWith(OWNER, expect.stringContaining('connection refused'));
   });
+
+  // Бот получает правки сообщений (edited_message) тем же путём, что и новые.
+  // Исправленный текст — другой хеш: правка опечатки завела бы второй кейс, и
+  // первым в работу ушёл бы старый текст — вместе с тем, что владелец убрал.
+  it('правка сообщения с /case не заводит второй кейс — владельцу объяснено, как поправить', async () => {
+    const { svc, tg, topics } = setup();
+    expect(await svc.handleCaseCommand({ ...dm(`/case ${STORY}`), edit_date: 1727790000 })).toBe(true);
+    expect(topics.addTopic).not.toHaveBeenCalled();
+    expect(tg.sendMessage).toHaveBeenCalledWith(OWNER, expect.stringMatching(/замечани/));
+  });
 });
 ```
 
@@ -1321,6 +1331,21 @@ import { REAL_CASE_DUPLICATE, caseCommandStory, prepareRealCase } from './blog-r
     if (!owner || Number(msg?.from?.id) !== owner) return false;
 
     const chatId = Number(msg?.chat?.id) || owner;
+
+    // Правка уже отправленного сообщения приходит тем же путём (edited_message).
+    // Исправленный текст — другой хеш, дедупликация его не узнает: правка
+    // опечатки завела бы второй кейс, и первым в работу ушёл бы старый текст.
+    // Факты реального кейса правятся замечанием к черновику — для него
+    // замечание тоже материал (REAL_CASE в blog-editor.prompt.ts).
+    if (msg?.edit_date) {
+      await this.notify(
+        chatId,
+        'Правку сообщения не применяю: кейс уже заведён по первому тексту. ' +
+          'Поправить факты можно замечанием к черновику, когда он придёт, — для реального кейса замечание тоже материал.',
+      );
+      return true;
+    }
+
     const prep = prepareRealCase(story);
     if (prep.ok === false) {
       await this.notify(
@@ -1458,7 +1483,7 @@ Expected: PASS, число падений не больше точки отсч�
 
 - [ ] **Шаг 1: Падающий тест**
 
-В `src/components/admin/blogStatus.test.ts` в импорт из `'./blogStatus'` добавить `rubricLabel,` и `REAL_CASE_MAX_CHARS,`, а в конец файла — тесты:
+В `src/components/admin/blogStatus.test.ts` в импорт из `'./blogStatus'` добавить `rubricLabel,`, `REAL_CASE_MAX_CHARS,` и `realCaseChars,`, а в конец файла — тесты:
 
 ```ts
 describe('rubricLabel', () => {
@@ -1472,9 +1497,16 @@ describe('rubricLabel', () => {
   });
 });
 
-describe('REAL_CASE_MAX_CHARS', () => {
-  it('совпадает с пределом бэка (blog-real-case.ts)', () => {
+describe('REAL_CASE_MAX_CHARS и realCaseChars', () => {
+  it('предел совпадает с бэком (blog-real-case.ts)', () => {
     expect(REAL_CASE_MAX_CHARS).toBe(4000);
+  });
+
+  // Бэк считает символы, а не UTF-16, и обрезает пробелы по краям — счётчик в
+  // форме обязан считать так же, иначе кнопка пускала бы то, что бэк отклонит.
+  it('считает символы без пробелов по краям, эмодзи — за один', () => {
+    expect(realCaseChars('  абв\n')).toBe(3);
+    expect(realCaseChars('😀')).toBe(1);
   });
 });
 ```
@@ -1507,10 +1539,18 @@ export function rubricLabel(post: { rubric: string; source: string }): string {
 
 /**
  * Предел длины истории реального кейса — копия бэка (`REAL_CASE_MAX_CHARS` в
- * `src/blog/blog-real-case.ts`). Бэк меряет символами, а `maxLength` поля —
- * UTF-16, то есть строже: поле не пропустит того, что бэк отклонил бы.
+ * `src/blog/blog-real-case.ts`).
+ *
+ * Полем он не навязывается: `maxLength` молча режет вставленный текст, и у
+ * истории пропал бы конец — чаще всего финал, ради которого кейс и пишется.
+ * Форма вместо этого показывает счётчик и не даёт отправить лишнее.
  */
 export const REAL_CASE_MAX_CHARS = 4000;
+
+/** Длина истории так, как её меряет бэк: символы, а не UTF-16, без пробелов по краям. */
+export function realCaseChars(text: string): number {
+  return Array.from(text.trim()).length;
+}
 ```
 
 - [ ] **Шаг 4: Закоммитить и убедиться, что зелёный**
@@ -1601,6 +1641,20 @@ describe('реальный кейс', () => {
 
     expect(q('blog-rubric-p1')?.textContent).toBe('Кейс · stats');
   });
+
+  // maxLength молча режет вставку — у истории пропал бы финал. Вместо него
+  // счётчик и неактивная кнопка: лишнее не уходит, но и не теряется.
+  it('длинная история не обрезается: счётчик краснеет, кнопка неактивна', async () => {
+    setup();
+    await mount();
+    await choose('blog-new-rubric', 'real');
+    await type('blog-new-topic', 'а'.repeat(4001));
+
+    expect((q('blog-new-topic') as HTMLTextAreaElement).value).toHaveLength(4001);
+    expect(q('blog-new-topic')!.hasAttribute('maxlength')).toBe(false);
+    expect(q('blog-real-case-count')!.textContent).toContain('4001 / 4000');
+    expect((q('blog-add-topic') as HTMLButtonElement).disabled).toBe(true);
+  });
 });
 ```
 
@@ -1614,11 +1668,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ~/.cache/blog-real-cases/ci-front.sh src/components/admin/AdminBlogView.test.tsx
 ```
 
-Expected: FAIL у четырёх из пяти новых тестов: нет пункта `real` (поле остаётся `INPUT`), `kind` не уходит, у подписи нет `data-testid`. «Обычная тема уходит как раньше» зелёный уже сейчас — он сторожит старое поведение.
+Expected: FAIL у пяти из шести новых тестов: нет пункта `real` (поле остаётся `INPUT`), `kind` не уходит, у подписи нет `data-testid`, нет счётчика. «Обычная тема уходит как раньше» зелёный уже сейчас — он сторожит старое поведение.
 
 - [ ] **Шаг 3: Реализация в `src/components/admin/AdminBlogView.tsx`**
 
-3a. В импорт из `'./blogStatus'` добавить `rubricLabel,` и `REAL_CASE_MAX_CHARS,`.
+3a. В импорт из `'./blogStatus'` добавить `rubricLabel,`, `REAL_CASE_MAX_CHARS,` и `realCaseChars,`.
 
 3b. После `interface BlogSettings { … }` добавить:
 
@@ -1654,21 +1708,32 @@ const toNewTopicKind = (v: string): NewTopicKind => (v === 'news' || v === 'real
       : { action: 'add_topic', rubric: newRubric, topic };
     if (await act(payload)) setNewTopic('');
   };
+
+  // Сверх предела история не уходит: бэк её отклонит, а резать её мы не
+  // станем — пропал бы финал.
+  const realCaseTooLong = newRubric === 'real' && realCaseChars(newTopic) > REAL_CASE_MAX_CHARS;
 ```
 
 3e. В форме над очередью (`{screen === 'queue' && (`) заменить `<input data-testid="blog-new-topic" … />` и `<select data-testid="blog-new-rubric" …>…</select>` на:
 
 ```tsx
           {newRubric === 'real' ? (
-            <textarea
-              data-testid="blog-new-topic"
-              value={newTopic}
-              onChange={(e) => setNewTopic(e.target.value)}
-              rows={6}
-              maxLength={REAL_CASE_MAX_CHARS}
-              placeholder="Кто рассказывает, что случилось, что сделал ассистент, чем кончилось, в чём суть"
-              className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-forest-500"
-            />
+            <div className="w-full">
+              <textarea
+                data-testid="blog-new-topic"
+                value={newTopic}
+                onChange={(e) => setNewTopic(e.target.value)}
+                rows={6}
+                placeholder="Кто рассказывает, что случилось, что сделал ассистент, чем кончилось, в чём суть"
+                className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-forest-500"
+              />
+              <div
+                data-testid="blog-real-case-count"
+                className={clsx('text-xs text-right', realCaseTooLong ? 'text-red-600' : 'text-gray-500')}
+              >
+                {realCaseChars(newTopic)} / {REAL_CASE_MAX_CHARS}
+              </div>
+            </div>
           ) : (
             <input
               data-testid="blog-new-topic"
@@ -1690,7 +1755,7 @@ const toNewTopicKind = (v: string): NewTopicKind => (v === 'news' || v === 'real
           </select>
 ```
 
-Кнопку `blog-add-topic` не трогать.
+У кнопки `blog-add-topic` заменить `disabled={!newTopic.trim() || busy}` на `disabled={!newTopic.trim() || busy || realCaseTooLong}`; остальное в ней не трогать.
 
 3f. Заменить подпись поста в списке:
 
