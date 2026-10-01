@@ -52,9 +52,15 @@ describe('prepareRealCase', () => {
   // Админка шлёт JSON до 50 МБ: считать символы такого тела — сотни мегабайт
   // в процессе, который обслуживает живые чаты. Заведомо длинное отсекается раньше.
   it('заведомо длинное тело отклоняется без подсчёта символов', () => {
-    const prep = prepareRealCase('а'.repeat(REAL_CASE_MAX_CHARS * 3));
-    expect(prep.ok).toBe(false);
-    if (prep.ok === false) expect(prep.reason).toContain(String(REAL_CASE_MAX_CHARS));
+    const spy = jest.spyOn(Array, 'from');
+    try {
+      const prep = prepareRealCase('а'.repeat(REAL_CASE_MAX_CHARS * 3));
+      expect(spy).not.toHaveBeenCalled();
+      expect(prep.ok).toBe(false);
+      if (prep.ok === false) expect(prep.reason).toContain(String(REAL_CASE_MAX_CHARS));
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('отказ на повтор называет то же окно, что у дедупликации', () => {
@@ -117,6 +123,7 @@ describe('caseCommandStory', () => {
   it('имя бота без истории — пустая история; одинокая @ — не команда', () => {
     expect(caseCommandStory('/case@LinkeonAgentBot')).toBe('');
     expect(caseCommandStory('/case@')).toBeNull();
+    expect(caseCommandStory('/case@bot,История')).toBe(',История');
   });
 
   // Telegram подсвечивает «/case» командой и в «/case: …», и в «/case«…»» —
