@@ -1368,9 +1368,25 @@ maybe('Реальный кейс против живого Postgres', () => {
 
       await svc.handleCaseCommand(msg(10, story('Роман прочитал полис КАСКО целиком.')));
       await svc.handleCaseCommand(msg(10, story('Роман прочитал полис КАСКО целиком, все правила.'), true));
+
+      // Барьер: обе вставки ждут, пока оба вызова не прочтут source_ref, — так
+      // гонка воспроизводится всегда, а не когда повезёт со временем.
+      let reads = 0;
+      let release!: () => void;
+      const bothRead = new Promise<void>((r) => { release = r; });
+      const racing = {
+        query: async (sql: string, params?: any[]) => {
+          const s = String(sql);
+          if (/SELECT\s+id\s+FROM\s+blog_post\s+WHERE\s+source_ref\s*=\s*\$1/.test(s) && ++reads === 2) release();
+          if (/INSERT INTO blog_post/.test(s)) await bothRead;
+          return pool.query(sql, params);
+        },
+      } as any;
+      const racingSvc = new BlogApprovalService(racing, tg as any, { get: jest.fn() } as any, new BlogTopicService(racing));
+
       await Promise.all([
-        svc.handleCaseCommand(msg(11, story('Роман разобрал ответ налоговой.'))),
-        svc.handleCaseCommand(msg(11, story('Роман разобрал ответ налоговой и бланки.'), true)),
+        racingSvc.handleCaseCommand(msg(11, story('Роман разобрал ответ налоговой.'))),
+        racingSvc.handleCaseCommand(msg(11, story('Роман разобрал ответ налоговой и бланки.'), true)),
       ]);
 
       const r = await pool.query(`SELECT source_ref, count(*)::int AS n FROM blog_post GROUP BY source_ref ORDER BY source_ref`);
