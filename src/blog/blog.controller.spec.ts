@@ -207,8 +207,9 @@ describe('BlogController', () => {
 
     it('короткая история — 400 с объяснением, тема не заводится', async () => {
       const d = deps(); const r = res();
-      await expect(make(d).action({ action: 'add_topic', kind: 'real', topic: 'кейс про налоговую' }, r))
-        .rejects.toThrow(/хотя бы 40 знаков/);
+      const call = make(d).action({ action: 'add_topic', kind: 'real', topic: 'кейс про налоговую' }, r);
+      await expect(call).rejects.toBeInstanceOf(BadRequestException);
+      await expect(call).rejects.toThrow(/хотя бы 40 знаков/);
       expect(d.topics.addTopic).not.toHaveBeenCalled();
     });
 
@@ -217,6 +218,15 @@ describe('BlogController', () => {
       d.topics.addTopic.mockResolvedValueOnce(null);
       await make(d).action({ action: 'add_topic', kind: 'real', topic: STORY }, r);
       expect(r.json).toHaveBeenCalledWith({ skipped: 'такую историю уже заводили за последние 90 дней' });
+    });
+
+    // Опечатка в kind («Real») молча увела бы реальную историю в выдуманный кейс —
+    // ровно то, от чего вся затея. Незнакомый kind — 400, а не прежний путь.
+    it('незнакомый kind — 400, тема не заводится', async () => {
+      const d = deps(); const r = res();
+      await expect(make(d).action({ action: 'add_topic', kind: 'Real', topic: STORY }, r))
+        .rejects.toBeInstanceOf(BadRequestException);
+      expect(d.topics.addTopic).not.toHaveBeenCalled();
     });
   });
 });

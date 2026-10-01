@@ -66,6 +66,17 @@ describe('prepareRealCase', () => {
   it('отказ на повтор называет то же окно, что у дедупликации', () => {
     expect(REAL_CASE_DUPLICATE).toBe(`такую историю уже заводили за последние ${DEDUP_WINDOW_DAYS} дней`);
   });
+
+  // Массив склеился бы через запятую и прошёл бы проверку — текст владельца
+  // молча переиначен; объект с не-функцией в toString ронял бы 500. Не строка —
+  // отказ, а не догадка, что имелось в виду.
+  it('не строка — отказ, а не склейка', () => {
+    for (const raw of [['Рассказчик — Дмитрий, основатель Linkeon.', 'Роман прочитал полис КАСКО целиком.'], { toString: 1 }, 42]) {
+      const prep = prepareRealCase(raw);
+      expect(prep.ok).toBe(false);
+      if (prep.ok === false) expect(prep.reason).toMatch(/текстом/);
+    }
+  });
 });
 
 describe('realCaseTopicKey', () => {
