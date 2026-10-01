@@ -47,6 +47,12 @@ export type RealCasePrep =
  * один знак, а не два.
  */
 export function prepareRealCase(raw: unknown): RealCasePrep {
+  // Не строка — не история: массив склеился бы через запятую и прошёл бы
+  // проверку, а объект с кривым toString ронял бы запрос. null и undefined —
+  // это «ничего не прислали», им отвечает отказ про длину ниже.
+  if (raw !== null && raw !== undefined && typeof raw !== 'string') {
+    return { ok: false, reason: 'история должна быть текстом' };
+  }
   const story = String(raw ?? '').trim();
   // Сверх двух пределов в UTF-16 текст заведомо длиннее предела и в символах
   // (символ — не больше двух единиц UTF-16). Считать символы такого тела —
