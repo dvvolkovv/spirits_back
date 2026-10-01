@@ -1248,3 +1248,53 @@ maybe('Темы кейсов против живого Postgres', () => {
     expect((await top(2)).map((a) => a.agentName)).toEqual(['Кира', 'Оля']);
   });
 });
+
+/**
+ * Реальный кейс (005_real_case_source.sql): история владельца — это пост
+ * рубрики case с источником real. Проверка источника в базе — CHECK, и
+ * заглушка его не воспроизведёт.
+ */
+maybe('Реальный кейс против живого Postgres', () => {
+  jest.setTimeout(60_000);
+
+  let pool: Pool;
+  let ours = false;
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: PG, max: 2 });
+    await prepareDisposableDb(pool);
+    ours = true;
+  });
+
+  afterAll(async () => {
+    if (ours) await pool.query('TRUNCATE blog_post');
+    await pool?.end();
+  });
+
+  beforeEach(async () => {
+    await pool.query('TRUNCATE blog_post');
+  });
+
+  it('пост с источником real база принимает', async () => {
+    await pool.query(
+      `INSERT INTO blog_post (rubric, source, topic_key, topic_hint)
+       VALUES ('case', 'real', 'реальный-кейс-0123456789ab', 'история')`,
+    );
+    const r = await pool.query(`SELECT count(*)::int AS n FROM blog_post WHERE source = 'real'`);
+    expect(r.rows[0].n).toBe(1);
+  });
+
+  it('неизвестный источник база по-прежнему не пускает', async () => {
+    await expect(pool.query(
+      `INSERT INTO blog_post (rubric, source, topic_key) VALUES ('case', 'bogus', 'k')`,
+    )).rejects.toThrow(/blog_post_source_check/);
+  });
+
+  // prepareDisposableDb катит все миграции в каждом блоке файла заново —
+  // повторный прогон для неё штатный путь, а не краевой случай.
+  it('миграция переживает повторный прогон', async () => {
+    const sql = fs.readFileSync(path.join(__dirname, 'migrations', '005_real_case_source.sql'), 'utf8');
+    await pool.query(sql);
+    await pool.query(sql);
+  });
+});
