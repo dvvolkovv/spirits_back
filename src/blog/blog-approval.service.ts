@@ -10,9 +10,24 @@ import { ApprovedSlot, approveIntoFreeSlot } from './blog-slot-claim';
 import { fetchImageBytes } from './blog-image.fetch';
 import { formatSlotWhen } from './blog-slot-format';
 import { QueueShift, formatQueueShift, leaveQueue } from './blog-queue';
+import { BlogTopicService } from './blog-topic.service';
+import { REAL_CASE_DUPLICATE, caseCommandStory, prepareRealCase } from './blog-real-case';
 
 /** Подсказка в открытом поле ответа. Telegram принимает 1–64 символа. */
 const NOTE_PLACEHOLDER = 'Что поправить?';
+
+/** Ответ на принятый `/case`. */
+const CASE_ACCEPTED = 'Принял реальный кейс. Черновик пришлю сюда, когда до него дойдёт очередь.';
+
+/**
+ * Ответ на правку сообщения, по которому кейс уже заведён. Факты реального
+ * кейса правятся замечанием к черновику — для него замечание тоже материал
+ * (REAL_CASE в blog-editor.prompt.ts).
+ */
+const CASE_EDIT_IGNORED =
+  'Правку сообщения не применяю: кейс по нему уже заведён. ' +
+  'Поправить факты можно замечанием к черновику, когда он придёт, — для реального кейса замечание тоже материал. ' +
+  'Если черновик по нему уже отклонён — пришлите /case новым сообщением.';
 
 /** Чат владельца (BLOG_APPROVER_TG_ID): туда приходят черновики и служебные сообщения блога. */
 export function approverChatId(): number | null {
@@ -55,6 +70,8 @@ export class BlogApprovalService {
     private readonly pg: PgService,
     private readonly tg: TgGrammyClient,
     private readonly settings: BlogSettingsService,
+    // Заводить реальный кейс командой `/case` (см. handleCaseCommand).
+    private readonly topics: BlogTopicService,
   ) {}
 
   /**
@@ -325,6 +342,58 @@ export class BlogApprovalService {
         WHERE id = $1`,
       [post.id, Number(prompt.message_id), MAX_NOTE_PROMPTS],
     );
+  }
+
+  /**
+   * `/case <история>` в личке — реальный кейс в блог (blog-real-case.ts).
+   *
+   * Команда владельца блога и только его: чужой `/case` — не наш (false), и
+   * бот отвечает на него как на любую неизвестную команду, как и до появления
+   * этой. Владелец — тот же `BLOG_APPROVER_TG_ID`, которому приходят
+   * черновики: команда заводит только тему, а в канал пост без его решения
+   * всё равно не уйдёт.
+   *
+   * Ответ владельцу — всегда, и через `notify`: Telegram, не принявший ответ,
+   * не повод ронять обработку команды, а молчание после команды — повод
+   * прислать её второй раз.
+   *
+   * @returns true, если это команда владельца (кейс заведён или владельцу
+   *          объяснено, почему нет)
+   */
+  async handleCaseCommand(msg: any): Promise<boolean> {
+    const story = caseCommandStory(msg?.text);
+    if (story === null) return false;
+    const owner = approverChatId();
+    if (!owner || Number(msg?.from?.id) !== owner) return false;
+
+    const chatId = Number(msg?.chat?.id) || owner;
+    const prep = prepareRealCase(story);
+    if (prep.ok === false) {
+      await this.notify(
+        chatId,
+        `Не завёл: ${prep.reason}.\n\nКак писать: /case и следом история — можно в несколько строк.`,
+      );
+      return true;
+    }
+
+    // Одно сообщение — не больше одного кейса. Правка уже отправленного
+    // сообщения (edited_message) приходит тем же путём, что и новое, а
+    // исправленный текст — другой хеш: без ключа по сообщению правка опечатки
+    // завела бы второй кейс, и первым в работу ушёл бы старый текст. С ключом
+    // правка принятого /case не заводит ничего, а правка отклонённого
+    // (коротко, длинно, сбой) заводит кейс по исправленному тексту.
+    // Без id сообщения ключа нет: «tg:<чат>:NaN» склеил бы все такие сообщения.
+    const messageId = Number(msg?.message_id);
+    const once = messageId > 0 ? { sourceRef: `tg:${chatId}:${messageId}`, onceBySourceRef: true } : {};
+
+    try {
+      const post = await this.topics.addTopic({ ...prep.topic, ...once });
+      await this.notify(chatId, post ? CASE_ACCEPTED : msg?.edit_date ? CASE_EDIT_IGNORED : `Не завёл: ${REAL_CASE_DUPLICATE}.`);
+    } catch (e: any) {
+      this.logger.error(`реальный кейс не заведён: ${e.message}`);
+      await this.notify(chatId, `Не завёл реальный кейс: ${e.message}`);
+    }
+    return true;
   }
 
   /**
