@@ -477,7 +477,10 @@ describe('BlogCron.prepareDrafts — что держит очередь', () => 
         return { rows: [{ n: state.filter(sqlWhere(m[1], params, now)).length }] };
       }
 
-      m = s.match(/^SELECT \* FROM blog_post WHERE (.+) ORDER BY \(rubric = 'news'\) DESC, created_at ASC LIMIT 1$/);
+      // ORDER BY — буквальное зеркало текста из takeNextIdea, не разбор условия
+      // через sqlWhere: после Task 5 (реальный кейс сразу за новостями) в
+      // запросе появился тай-брейк по source, и зеркало синхронизировано с ним.
+      m = s.match(/^SELECT \* FROM blog_post WHERE (.+) ORDER BY \(rubric = 'news'\) DESC, \(source = 'real'\) DESC, created_at ASC LIMIT 1$/);
       if (m) {
         seen.push('take');
         const hit = state.filter(sqlWhere(m[1], params, now))
