@@ -932,7 +932,11 @@ describe('handleCaseCommand: реальный кейс командой в ли�
       rubric: 'case', source: 'real', topicHint: STORY,
       sourceRef: `tg:${OWNER}:501`, onceBySourceRef: true,
     }));
-    expect(tg.sendMessage).toHaveBeenCalledWith(OWNER, expect.stringContaining('Принял реальный кейс'));
+    const [, text] = tg.sendMessage.mock.calls[0];
+    expect(text).toContain('Принял реальный кейс');
+    expect(text).toContain(`${Array.from(STORY).length} знаков`);
+    expect(text).toContain('кончается на «');
+    expect(text).not.toContain('разрезал');
   });
 
   it('чужой /case — не наш: ни темы, ни ответа от блога', async () => {
@@ -975,9 +979,32 @@ describe('handleCaseCommand: реальный кейс командой в ли�
   });
 
   it('повтор — владелец узнаёт, что такую историю уже заводили', async () => {
-    const { svc, tg } = setup(jest.fn().mockResolvedValue(null));
+    const { svc, tg } = setup(jest.fn().mockResolvedValue(null), []);
     await svc.handleCaseCommand(dm(`/case ${STORY}`));
     expect(tg.sendMessage).toHaveBeenCalledWith(OWNER, expect.stringContaining('уже заводили'));
+  });
+
+  // Telegram режет длинные сообщения, и первая часть проходит проверку длины:
+  // владелец должен увидеть, на чём история оборвалась.
+  it('длинная принятая история — ответ с концом и предупреждением про разрез', async () => {
+    const { svc, tg } = setup();
+    const long = `Рассказчик — Дмитрий, основатель Linkeon. ${'а'.repeat(3100)} Чем кончилось.`;
+    await svc.handleCaseCommand(dm(`/case ${long}`));
+    const [, text] = tg.sendMessage.mock.calls[0];
+    expect(text).toContain('Чем кончилось.»');
+    expect(text).toMatch(/разрезал/);
+    expect(text).toMatch(/через админку/);
+  });
+
+  // Повторная доставка того же сообщения (или проигравший оригинал в паре с
+  // правкой): кейс по этому сообщению есть, и «такую историю уже заводили»
+  // было бы неправдой о причине.
+  it('повтор того же сообщения без правки — «по этому сообщению кейс уже заведён»', async () => {
+    const { svc, tg } = setup(jest.fn().mockResolvedValue(null), [{ x: 1 }]);
+    await svc.handleCaseCommand(dm(`/case ${STORY}`));
+    const [, text] = tg.sendMessage.mock.calls[0];
+    expect(text).toMatch(/По этому сообщению кейс уже заведён/);
+    expect(text).not.toMatch(/уже заводили/);
   });
 
   it('сбой базы — владельцу причина, а не молчание', async () => {
