@@ -939,7 +939,9 @@ Expected: PASS, 13 тестов.
 
 **Files:**
 - Modify: `src/blog/blog-topic.service.ts` (метод `takeNextIdea` и комментарий над ним)
-- Test: `src/blog/blog-topic.service.spec.ts`, `src/blog/blog-approval.integration.spec.ts`
+- Test: `src/blog/blog-topic.service.spec.ts`, `src/blog/blog-approval.integration.spec.ts`, `src/blog/blog.cron.spec.ts`
+
+> По ходу исполнения (ревью) порядок стал другим: `ORDER BY (rubric = 'news') DESC, (status = 'drafting') DESC, (source = 'real') DESC, created_at ASC`. Черновик, уже взятый в работу (запрошенная перезапись или брошенный), идёт раньше реального кейса: владельцу уже ответили «перепишу к следующему тику». Заглушка Postgres в `blog.cron.spec.ts` узнаёт запрос по тексту ORDER BY — она синхронизирована и сортирует по тем же ключам; добавлены тесты на FIFO реальных кейсов и на переработку раньше реального кейса (живой и через крон).
 
 - [ ] **Шаг 1: Падающие тесты**
 
