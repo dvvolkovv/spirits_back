@@ -1349,4 +1349,37 @@ maybe('Реальный кейс против живого Postgres', () => {
     const topics = new BlogTopicService({ query: (sql: string, params?: any[]) => pool.query(sql, params) } as any);
     expect((await topics.takeNextIdea())?.topicKey).toBe('переработка');
   });
+
+  // Вся цепочка на живой базе: команда, тема, ключ по сообщению. Правка
+  // принятого /case не заводит второй кейс, а одновременная пара — сообщение и
+  // его правка пачкой после рестарта — тоже: её разводит уникальный индекс.
+  it('/case: правка принятого и одновременная пара дают один кейс', async () => {
+    const OWNER = 37948399;
+    const old = process.env.BLOG_APPROVER_TG_ID;
+    process.env.BLOG_APPROVER_TG_ID = String(OWNER);
+    try {
+      const db = { query: (sql: string, params?: any[]) => pool.query(sql, params) } as any;
+      const tg = { sendMessage: jest.fn().mockResolvedValue({ message_id: 1 }) };
+      const svc = new BlogApprovalService(db, tg as any, { get: jest.fn() } as any, new BlogTopicService(db));
+      const msg = (id: number, text: string, edit = false) => ({
+        text, message_id: id, from: { id: OWNER }, chat: { id: OWNER, type: 'private' }, ...(edit ? { edit_date: 1 } : {}),
+      });
+      const story = (s: string) => `/case Рассказчик — Дмитрий, основатель Linkeon. ${s}`;
+
+      await svc.handleCaseCommand(msg(10, story('Роман прочитал полис КАСКО целиком.')));
+      await svc.handleCaseCommand(msg(10, story('Роман прочитал полис КАСКО целиком, все правила.'), true));
+      await Promise.all([
+        svc.handleCaseCommand(msg(11, story('Роман разобрал ответ налоговой.'))),
+        svc.handleCaseCommand(msg(11, story('Роман разобрал ответ налоговой и бланки.'), true)),
+      ]);
+
+      const r = await pool.query(`SELECT source_ref, count(*)::int AS n FROM blog_post GROUP BY source_ref ORDER BY source_ref`);
+      expect(r.rows).toEqual([
+        { source_ref: `tg:${OWNER}:10`, n: 1 },
+        { source_ref: `tg:${OWNER}:11`, n: 1 },
+      ]);
+    } finally {
+      if (old === undefined) delete process.env.BLOG_APPROVER_TG_ID; else process.env.BLOG_APPROVER_TG_ID = old;
+    }
+  });
 });

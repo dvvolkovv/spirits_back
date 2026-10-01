@@ -914,11 +914,12 @@ describe('handleCaseCommand: реальный кейс командой в ли�
     else process.env.BLOG_APPROVER_TG_ID = OLD;
   });
 
-  const setup = (addTopic: jest.Mock = jest.fn().mockResolvedValue({ id: 'new' })) => {
+  const setup = (addTopic: jest.Mock = jest.fn().mockResolvedValue({ id: 'new' }), refRows: any[] = [{ x: 1 }]) => {
     const tg = { sendMessage: jest.fn().mockResolvedValue({ message_id: 1 }) };
     const topics = { addTopic };
-    const svc = new BlogApprovalService({ query: jest.fn() } as any, tg as any, { get: jest.fn() } as any, topics as any);
-    return { svc, tg, topics };
+    const pg = { query: jest.fn().mockResolvedValue({ rows: refRows }) };
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, topics as any);
+    return { svc, tg, topics, pg };
   };
   const dm = (text: string, from = OWNER) => ({
     text, message_id: 501, from: { id: from }, chat: { id: from, type: 'private' },
@@ -1008,5 +1009,31 @@ describe('handleCaseCommand: реальный кейс командой в ли�
     const topic = topics.addTopic.mock.calls[0][0];
     expect(topic.sourceRef).toBeUndefined();
     expect(topic.onceBySourceRef).toBeFalsy();
+  });
+
+  // Сообщение отклонили («коротко»), а правкой в нём оказалась история, уже
+  // заведённая другим сообщением: по ЭТОМУ сообщению кейса нет, и ответ
+  // «кейс по нему уже заведён» был бы неправдой — это обычный повтор.
+  it('правка, совпавшая с чужой историей, — ответ про повтор, а не «по нему уже заведён»', async () => {
+    const { svc, tg } = setup(jest.fn().mockResolvedValue(null), []);
+    await svc.handleCaseCommand({ ...dm(`/case ${STORY}`), edit_date: 1727790000 });
+    const [, text] = tg.sendMessage.mock.calls[0];
+    expect(text).toMatch(/уже заводили/);
+    expect(text).not.toMatch(/уже заведён/);
+  });
+
+  it('не личный чат — не наше, даже от владельца', async () => {
+    const { svc, topics } = setup();
+    expect(await svc.handleCaseCommand({ ...dm(`/case ${STORY}`), chat: { id: -100, type: 'group' } })).toBe(false);
+    expect(topics.addTopic).not.toHaveBeenCalled();
+  });
+
+  // У пересланного сообщения from — тот, кто переслал: посторонний не выдаст
+  // себя за владельца, переслав его /case.
+  it('пересланный посторонним /case владельца — не наш', async () => {
+    const { svc, topics } = setup();
+    const forwarded = { ...dm(`/case ${STORY}`, 42), forward_origin: { type: 'user', sender_user: { id: OWNER } } };
+    expect(await svc.handleCaseCommand(forwarded)).toBe(false);
+    expect(topics.addTopic).not.toHaveBeenCalled();
   });
 });
