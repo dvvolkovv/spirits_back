@@ -1788,12 +1788,14 @@ Expected: `Tests: N failed` (N ≥ 5: «промпт реального кейс
 
 - [ ] **Шаг 1: Test (стенд на ноде, база приложения из живого чекаута — только чтение `.env`)**
 
+Миграция и запись о ней идут одним вызовом `psql --single-transaction`, как в `scripts/migrate.ts`. Две отдельные команды записали бы 005 как накатанную и тогда, когда сам накат откатился по таймауту.
+
 ```bash
-ssh dv@85.192.61.231 'cd ~/spirits_back && U=$(grep -E "^DATABASE_URL=" .env | head -1 | cut -d= -f2- | tr -d "\"'"'"'"); PGOPTIONS="-c lock_timeout=5s" psql "$U" -X -v ON_ERROR_STOP=1 --single-transaction -f -' < ~/Downloads/spirits_back/.worktrees/blog-real-cases/src/blog/migrations/005_real_case_source.sql
-printf "%s\n" "INSERT INTO schema_migrations (filename) VALUES ('blog/005_real_case_source.sql') ON CONFLICT DO NOTHING;" "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'blog_post'::regclass AND contype = 'c' ORDER BY conname;" | ssh dv@85.192.61.231 'cd ~/spirits_back && U=$(grep -E "^DATABASE_URL=" .env | head -1 | cut -d= -f2- | tr -d "\"'"'"'"); psql "$U" -X -v ON_ERROR_STOP=1 -At -f -'
+{ cat ~/Downloads/spirits_back/.worktrees/blog-real-cases/src/blog/migrations/005_real_case_source.sql; echo "INSERT INTO schema_migrations (filename) VALUES ('blog/005_real_case_source.sql') ON CONFLICT DO NOTHING;"; } | ssh dv@85.192.61.231 'cd ~/spirits_back && U=$(grep -E "^DATABASE_URL=" .env | head -1 | cut -d= -f2- | tr -d "\"'"'"'"); PGOPTIONS="-c lock_timeout=5s" psql "$U" -X -v ON_ERROR_STOP=1 --single-transaction -f -'
+echo "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'blog_post'::regclass AND contype = 'c' ORDER BY conname;" | ssh dv@85.192.61.231 'cd ~/spirits_back && U=$(grep -E "^DATABASE_URL=" .env | head -1 | cut -d= -f2- | tr -d "\"'"'"'"); psql "$U" -X -v ON_ERROR_STOP=1 -At -f -'
 ```
 
-Expected: `ALTER TABLE` ×2; затем `INSERT 0 1` и ровно три строки ограничений:
+Expected: `ALTER TABLE` ×2 и `INSERT 0 1` (на повторе — `INSERT 0 0`); затем ровно три строки ограничений:
 - `blog_post_rubric_check`;
 - `blog_post_source_check` — `CHECK ((source = ANY (ARRAY['backlog'::text, 'git'::text, 'stats'::text, 'manual'::text, 'real'::text])))`;
 - `blog_post_status_check`.
