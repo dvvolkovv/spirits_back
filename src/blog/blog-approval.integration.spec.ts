@@ -1309,4 +1309,24 @@ maybe('Реальный кейс против живого Postgres', () => {
     expect(c.rows.map((x: any) => x.conname)).toEqual(['blog_post_source_check']);
     expect(c.rows[0].def).toContain("'real'");
   });
+
+  // Порядок — дело ORDER BY в живой базе: заглушка вернула бы что подложили.
+  it('очередь тем: новость, потом реальный кейс, потом синтетический — даже более старый', async () => {
+    const add = (rubric: string, source: string, key: string, minutesAgo: number) => pool.query(
+      `INSERT INTO blog_post (rubric, source, topic_key, created_at)
+       VALUES ($1, $2, $3, now() - ($4 || ' minutes')::interval)`,
+      [rubric, source, key, minutesAgo],
+    );
+    await add('case', 'stats', 'синтетика', 30);
+    await add('case', 'real', 'реальный', 20);
+    await add('news', 'git', 'новость', 10);
+
+    const topics = new BlogTopicService({ query: (sql: string, params?: any[]) => pool.query(sql, params) } as any);
+
+    expect((await topics.takeNextIdea())?.topicKey).toBe('новость');
+    await pool.query(`DELETE FROM blog_post WHERE topic_key = 'новость'`);
+    expect((await topics.takeNextIdea())?.topicKey).toBe('реальный');
+    await pool.query(`DELETE FROM blog_post WHERE topic_key = 'реальный'`);
+    expect((await topics.takeNextIdea())?.topicKey).toBe('синтетика');
+  });
 });

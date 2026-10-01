@@ -200,6 +200,15 @@ describe('BlogTopicService.takeNextIdea', () => {
     expect(String(pg.query.mock.calls[0][0])).toContain("(rubric = 'news') DESC");
   });
 
+  it('реальный кейс идёт сразу после новостей — раньше синтетических кейсов', async () => {
+    const pg = pgMock();
+    pg.query.mockResolvedValueOnce({ rows: [] });
+    const svc = new BlogTopicService(pg as any);
+    await svc.takeNextIdea();
+    const sql = String(pg.query.mock.calls[0][0]).replace(/\s+/g, ' ');
+    expect(sql).toContain("ORDER BY (rubric = 'news') DESC, (source = 'real') DESC, created_at ASC");
+  });
+
   it('запрошенная перезапись берётся сразу: отправивший её погасил отметку', async () => {
     const pg = pgMock();
     pg.query.mockResolvedValueOnce({ rows: [] });
