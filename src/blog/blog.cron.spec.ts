@@ -423,7 +423,7 @@ describe('BlogCron.prepareDrafts — гонка двух тиков', () => {
 describe('BlogCron.prepareDrafts — что держит очередь', () => {
   beforeEach(() => { process.env.BLOG_ENABLED = 'true'; process.env.BLOG_APPROVER_TG_ID = '77'; });
 
-  type Row = { id: string; status: string; rubric: string; mark: number | null; created: number };
+  type Row = { id: string; status: string; rubric: string; source: string; mark: number | null; created: number };
 
   /**
    * WHERE из запроса — в JS-предикат над строкой.
@@ -466,7 +466,7 @@ describe('BlogCron.prepareDrafts — что держит очередь', () => 
    */
   const queuePg = (rows: Array<Partial<Row> & { id: string; status: string }>) => {
     const now = Date.now();
-    const state: Row[] = rows.map((r, i) => ({ rubric: 'case', mark: null, created: i, ...r }));
+    const state: Row[] = rows.map((r, i) => ({ rubric: 'case', source: 'stats', mark: null, created: i, ...r }));
     const seen: string[] = [];
     const query = jest.fn(async (sql: string, params: any[] = []) => {
       const s = String(sql).replace(/\s+/g, ' ').trim();
@@ -577,6 +577,24 @@ describe('BlogCron.prepareDrafts — что держит очередь', () => 
     const { pg } = await run([{ id: 'next', status: 'idea' }]);
     const guard = pg.query.mock.calls.find((c: any[]) => /count\(\*\)/.test(String(c[0])));
     expect(guard?.[1]).toEqual([STALE_DRAFTING_MINUTES]);
+  });
+
+  // Бот уже ответил «перепишу к следующему тику» — следующим тиком должен
+  // прийти переписанный пост, а не новая тема, даже реальная.
+  it('запрошенная переработка идёт раньше реального кейса', async () => {
+    const { drafted } = await run([
+      { id: 'redo', status: 'drafting' },
+      { id: 'real-idea', status: 'idea', source: 'real' },
+    ]);
+    expect(drafted).toEqual(['redo']);
+  });
+
+  it('реальный кейс идёт раньше синтетического, даже более старого', async () => {
+    const { drafted } = await run([
+      { id: 'synthetic', status: 'idea' },
+      { id: 'real-idea', status: 'idea', source: 'real' },
+    ]);
+    expect(drafted).toEqual(['real-idea']);
   });
 });
 

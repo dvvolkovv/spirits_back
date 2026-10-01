@@ -1311,22 +1311,41 @@ maybe('Реальный кейс против живого Postgres', () => {
   });
 
   // Порядок — дело ORDER BY в живой базе: заглушка вернула бы что подложили.
-  it('очередь тем: новость, потом реальный кейс, потом синтетический — даже более старый', async () => {
+  it('очередь тем: новость, потом реальные кейсы по давности, потом синтетический — даже более старый', async () => {
     const add = (rubric: string, source: string, key: string, minutesAgo: number) => pool.query(
       `INSERT INTO blog_post (rubric, source, topic_key, created_at)
        VALUES ($1, $2, $3, now() - ($4 || ' minutes')::interval)`,
       [rubric, source, key, minutesAgo],
     );
     await add('case', 'stats', 'синтетика', 30);
-    await add('case', 'real', 'реальный', 20);
+    await add('case', 'real', 'реальный-старый', 25);
+    await add('case', 'real', 'реальный-новый', 20);
     await add('news', 'git', 'новость', 10);
 
     const topics = new BlogTopicService({ query: (sql: string, params?: any[]) => pool.query(sql, params) } as any);
 
     expect((await topics.takeNextIdea())?.topicKey).toBe('новость');
     await pool.query(`DELETE FROM blog_post WHERE topic_key = 'новость'`);
-    expect((await topics.takeNextIdea())?.topicKey).toBe('реальный');
-    await pool.query(`DELETE FROM blog_post WHERE topic_key = 'реальный'`);
+    expect((await topics.takeNextIdea())?.topicKey).toBe('реальный-старый');
+    await pool.query(`DELETE FROM blog_post WHERE topic_key = 'реальный-старый'`);
+    expect((await topics.takeNextIdea())?.topicKey).toBe('реальный-новый');
+    await pool.query(`DELETE FROM blog_post WHERE topic_key = 'реальный-новый'`);
     expect((await topics.takeNextIdea())?.topicKey).toBe('синтетика');
+  });
+
+  // Бот уже ответил владельцу «перепишу к следующему тику»: запрошенная
+  // переработка (drafting с пустой отметкой) идёт раньше любой новой темы,
+  // кроме новости, — даже раньше реального кейса.
+  it('запрошенная переработка идёт раньше реального кейса', async () => {
+    await pool.query(
+      `INSERT INTO blog_post (rubric, source, topic_key, status, created_at)
+       VALUES ('case', 'stats', 'переработка', 'drafting', now() - interval '1 day')`,
+    );
+    await pool.query(
+      `INSERT INTO blog_post (rubric, source, topic_key, created_at)
+       VALUES ('case', 'real', 'реальный', now() - interval '5 minutes')`,
+    );
+    const topics = new BlogTopicService({ query: (sql: string, params?: any[]) => pool.query(sql, params) } as any);
+    expect((await topics.takeNextIdea())?.topicKey).toBe('переработка');
   });
 });
