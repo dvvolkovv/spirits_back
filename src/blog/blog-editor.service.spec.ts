@@ -386,4 +386,29 @@ describe('BlogEditorService', () => {
 
     expect(String(relay.ask.mock.calls[0][1])).not.toMatch(/главного редактора/i);
   });
+
+  it('реальный кейс уходит редактору с правилами реального кейса и материалом', async () => {
+    const relay = relayMock('{"title":"З","body":"Т","imagePrompt":"с"}');
+    const svc = new BlogEditorService(relay as any, topicsMock() as any);
+
+    await svc.draft({
+      ...POST, source: 'real', topicKey: 'реальный-кейс-0123456789ab',
+      topicHint: 'Рассказчик — Дмитрий, основатель Linkeon.', editorNotes: [],
+    });
+
+    const [systemPrompt, message] = relay.ask.mock.calls[0];
+    expect(String(systemPrompt)).toMatch(/РЕАЛЬНЫЙ КЕЙС/);
+    expect(String(message)).toContain('Материал реального кейса');
+  });
+
+  it('кейс из статистики по-прежнему пишется выдумкой', async () => {
+    const relay = relayMock('{"title":"З","body":"Т","imagePrompt":"с"}');
+    const svc = new BlogEditorService(relay as any, topicsMock() as any);
+
+    await svc.draft({ ...POST, source: 'stats', editorNotes: [] });
+
+    const systemPrompt = String(relay.ask.mock.calls[0][0]).replace(/\s+/g, ' ');
+    expect(systemPrompt).not.toMatch(/РЕАЛЬНЫЙ КЕЙС/);
+    expect(systemPrompt).toMatch(/История вымышленная/);
+  });
 });

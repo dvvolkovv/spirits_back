@@ -203,6 +203,33 @@ describe('BlogCron.prepareDrafts', () => {
     expect(lastError).not.toMatch(/\n/);
   });
 
+  /**
+   * Реальный кейс без материала — не повод сочинять: редактор отказывает ещё
+   * до релея, пост уходит в failed с причиной, владелец узнаёт об этом в личке.
+   * Редактор настоящий, подменён только релей — так проверяется и место
+   * вызова: сервис обязан передать в промпт вид поста, а не только рубрику.
+   */
+  it('реальный кейс без материала — failed с причиной, до релея дело не доходит', async () => {
+    const d = deps();
+    d.topics.takeNextIdea.mockResolvedValue({
+      id: 'p1', rubric: 'case', source: 'real', topicKey: 'реальный-кейс-0123456789ab',
+      topicHint: null, status: 'idea', editorNotes: [],
+    });
+    const ask = jest.fn();
+    (d as any).editor = new BlogEditorService(
+      { ask } as any,
+      { recentTitles: jest.fn().mockResolvedValue([]) } as any,
+    );
+
+    await make(d).prepareDrafts();
+
+    expect(ask).not.toHaveBeenCalled();
+    expect(d.images.render).not.toHaveBeenCalled();
+    const failed = d.pg.query.mock.calls.find((c: any) => String(c[0]).includes("status = 'failed'"));
+    expect(String(failed[1][1])).toMatch(/нет материала/);
+    expect(d.approval.notify).toHaveBeenCalledWith(77, expect.stringMatching(/нет материала/));
+  });
+
   it('без идей в очереди тихо выходит', async () => {
     const d = deps();
     await make(d).prepareDrafts();
