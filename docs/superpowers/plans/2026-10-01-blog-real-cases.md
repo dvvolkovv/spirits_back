@@ -1894,7 +1894,7 @@ Expected: `Tests: N failed` (N ≥ 5: «промпт реального кейс
 
 ```bash
 { cat ~/Downloads/spirits_back/.worktrees/blog-real-cases/src/blog/migrations/005_real_case_source.sql; echo "INSERT INTO schema_migrations (filename) VALUES ('blog/005_real_case_source.sql') ON CONFLICT DO NOTHING;"; } | ssh dv@85.192.61.231 'cd ~/spirits_back && U=$(grep -E "^DATABASE_URL=" .env | head -1 | cut -d= -f2- | tr -d "\"'"'"'"); PGOPTIONS="-c lock_timeout=5s" psql "$U" -X -v ON_ERROR_STOP=1 --single-transaction -f -'
-echo "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'blog_post'::regclass AND contype = 'c' ORDER BY conname;" | ssh dv@85.192.61.231 'cd ~/spirits_back && U=$(grep -E "^DATABASE_URL=" .env | head -1 | cut -d= -f2- | tr -d "\"'"'"'"); psql "$U" -X -v ON_ERROR_STOP=1 -At -f -'
+printf "%s\n" "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'blog_post'::regclass AND contype = 'c' ORDER BY conname;" "SELECT indexdef FROM pg_indexes WHERE tablename = 'blog_post' AND indexname = 'blog_post_tg_source_ref_uniq';" | ssh dv@85.192.61.231 'cd ~/spirits_back && U=$(grep -E "^DATABASE_URL=" .env | head -1 | cut -d= -f2- | tr -d "\"'"'"'"); psql "$U" -X -v ON_ERROR_STOP=1 -At -f -'
 ```
 
 Expected: `ALTER TABLE` ×2 и `INSERT 0 1` (на повторе — `INSERT 0 0`); затем ровно три строки ограничений:
@@ -1903,6 +1903,8 @@ Expected: `ALTER TABLE` ×2 и `INSERT 0 1` (на повторе — `INSERT 0 0
 - `blog_post_status_check`.
 
 Четыре строки или вторая проверка по `source` означают, что старое ограничение звалось иначе и осталось на месте. Тогда — стоп, разбираться.
+
+Последней строкой — определение индекса `blog_post_tg_source_ref_uniq` (уникальный, частичный `WHERE source_ref LIKE 'tg:%'`): он держит «одно сообщение Telegram — не больше одного кейса» и при одновременной доставке апдейтов. Нет строки — миграция накатилась не целиком.
 
 Отказ `canceling statement due to lock timeout` — не ошибка миграции: кто-то держит таблицу. Повторить через несколько минут.
 
