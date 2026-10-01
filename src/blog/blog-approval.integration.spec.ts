@@ -1275,12 +1275,15 @@ maybe('Реальный кейс против живого Postgres', () => {
     await pool.query('TRUNCATE blog_post');
   });
 
-  it('пост с источником real база принимает', async () => {
+  // Все допустимые источники, а не только новый: перепись CHECK с опечаткой в
+  // старом значении иначе прошла бы тесты, а темы из бэклога пропадали бы
+  // молча — backlog.service ловит ошибку вставки и пишет только warn.
+  it.each(['backlog', 'git', 'stats', 'manual', 'real'])('источник %s база принимает', async (source) => {
     await pool.query(
-      `INSERT INTO blog_post (rubric, source, topic_key, topic_hint)
-       VALUES ('case', 'real', 'реальный-кейс-0123456789ab', 'история')`,
+      `INSERT INTO blog_post (rubric, source, topic_key) VALUES ('case', $1, 'k')`,
+      [source],
     );
-    const r = await pool.query(`SELECT count(*)::int AS n FROM blog_post WHERE source = 'real'`);
+    const r = await pool.query(`SELECT count(*)::int AS n FROM blog_post WHERE source = $1`, [source]);
     expect(r.rows[0].n).toBe(1);
   });
 
@@ -1296,5 +1299,14 @@ maybe('Реальный кейс против живого Postgres', () => {
     const sql = fs.readFileSync(path.join(__dirname, 'migrations', '005_real_case_source.sql'), 'utf8');
     await pool.query(sql);
     await pool.query(sql);
+
+    // Повтор не должен ни плодить второе ограничение, ни терять единственное.
+    const c = await pool.query(
+      `SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint
+        WHERE conrelid = 'blog_post'::regclass AND contype = 'c'
+          AND pg_get_constraintdef(oid) LIKE '%source%'`,
+    );
+    expect(c.rows.map((x: any) => x.conname)).toEqual(['blog_post_source_check']);
+    expect(c.rows[0].def).toContain("'real'");
   });
 });
