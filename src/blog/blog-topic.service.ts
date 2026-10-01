@@ -108,6 +108,14 @@ export interface AddTopicInput {
   onceBySourceRef?: boolean;
 }
 
+/**
+ * Имя из 005_real_case_source.sql — уникальный частичный индекс на
+ * `source_ref` (только `tg:...`), который держит «одно сообщение Telegram —
+ * не больше одного кейса» под конкурентной доставкой апдейтов, там, где
+ * проверка выше (read-then-insert) не держит: см. addTopic.
+ */
+export const TG_SOURCE_REF_INDEX = 'blog_post_tg_source_ref_uniq';
+
 @Injectable()
 export class BlogTopicService {
   private readonly logger = new Logger(BlogTopicService.name);
@@ -147,12 +155,28 @@ export class BlogTopicService {
       return null;
     }
 
-    const r = await this.pg.query(
-      `INSERT INTO blog_post (rubric, source, source_ref, topic_key, topic_hint, status)
-       VALUES ($1, $2, $3, $4, $5, 'idea') RETURNING *`,
-      [input.rubric, input.source, input.sourceRef ?? null, key, input.topicHint ?? null],
-    );
-    return rowToPost(r.rows[0]);
+    try {
+      const r = await this.pg.query(
+        `INSERT INTO blog_post (rubric, source, source_ref, topic_key, topic_hint, status)
+         VALUES ($1, $2, $3, $4, $5, 'idea') RETURNING *`,
+        [input.rubric, input.source, input.sourceRef ?? null, key, input.topicHint ?? null],
+      );
+      return rowToPost(r.rows[0]);
+    } catch (e: any) {
+      // Проверка source_ref выше и эта вставка — два запроса, и под
+      // конкуренцией (вебхук разбирает апдейты через setImmediate, а после
+      // рестарта их очередь прилетает пачкой) между ними есть окно: два
+      // запроса с одним sourceRef проходят проверку одновременно, и только
+      // уникальный индекс TG_SOURCE_REF_INDEX ловит проигравшую вставку. Для
+      // вызывающего это то же самое «уже заводилась», что и ранний выход по
+      // SELECT, — не ошибка. Любое другое нарушение (другой констрейнт, не
+      // связанный с этим индексом) — не наш случай, пробрасываем как есть.
+      if (e?.code === '23505' && e?.constraint === TG_SOURCE_REF_INDEX) {
+        this.logger.log(`тема "${input.sourceRef}" пропущена: уже заводилась (одновременно)`);
+        return null;
+      }
+      throw e;
+    }
   }
 
   /**

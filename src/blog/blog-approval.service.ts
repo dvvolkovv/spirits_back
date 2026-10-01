@@ -363,6 +363,8 @@ export class BlogApprovalService {
   async handleCaseCommand(msg: any): Promise<boolean> {
     const story = caseCommandStory(msg?.text);
     if (story === null) return false;
+    // Команда личная: в группе /case не наш, даже от владельца.
+    if (msg?.chat?.type !== 'private') return false;
     const owner = approverChatId();
     if (!owner || Number(msg?.from?.id) !== owner) return false;
 
@@ -388,12 +390,38 @@ export class BlogApprovalService {
 
     try {
       const post = await this.topics.addTopic({ ...prep.topic, ...once });
-      await this.notify(chatId, post ? CASE_ACCEPTED : msg?.edit_date ? CASE_EDIT_IGNORED : `Не завёл: ${REAL_CASE_DUPLICATE}.`);
+      await this.notify(chatId, await this.caseReply(post, msg, once));
     } catch (e: any) {
-      this.logger.error(`реальный кейс не заведён: ${e.message}`);
-      await this.notify(chatId, `Не завёл реальный кейс: ${e.message}`);
+      const why = String(e?.message ?? e);
+      this.logger.error(`реальный кейс не заведён: ${why}`);
+      await this.notify(chatId, `Не завёл реальный кейс: ${why}`);
     }
     return true;
+  }
+
+  /**
+   * Ответ владельцу после `addTopic`.
+   *
+   * `null` из `addTopic` значит двое разное, и ответ должен говорить правду о
+   * том, какое из двух случилось, а не только сам факт null:
+   *  - «по этому сообщению кейс уже есть» — правка уже принятого /case
+   *    (сообщение заводило кейс раньше, тем же sourceRef);
+   *  - «такая история уже заведена другим сообщением» — обычный повтор по
+   *    тексту (topic_key), в том числе правка, которая случайно совпала с
+   *    чужой историей. Для него прежний «по нему уже заведён» был бы
+   *    неправдой: ПО ЭТОМУ сообщению кейса не было.
+   *
+   * Различить их можно только спросив базу: сам `addTopic` после `null` не
+   * говорит, по какой причине. Запрос — на том же source_ref, которым только
+   * что промахнулась вставка.
+   */
+  private async caseReply(post: BlogPost | null, msg: any, once: { sourceRef?: string }): Promise<string> {
+    if (post) return CASE_ACCEPTED;
+    if (msg?.edit_date && once.sourceRef) {
+      const seen = await this.pg.query(`SELECT 1 FROM blog_post WHERE source_ref = $1 LIMIT 1`, [once.sourceRef]);
+      if (seen.rows.length) return CASE_EDIT_IGNORED;
+    }
+    return `Не завёл: ${REAL_CASE_DUPLICATE}.`;
   }
 
   /**
