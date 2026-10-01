@@ -1780,14 +1780,27 @@ Expected: `Tests: N failed` (N ≥ 5: «промпт реального кейс
 
 **Выполняет основная сессия, не сабагент. Прод — только после OK владельца.** Миграция только расширяет допустимое, старый код с ней совместим, поэтому катится до выката кода. Раннер миграций на проде сломан, а `deploy.sh` миграции не катает — отсюда ручной `psql` с записью в `schema_migrations`.
 
+**Почему `lock_timeout`.** DROP/ADD CHECK берут ACCESS EXCLUSIVE. Если накат совпадёт с долгим держателем блокировки — например, с ночным `pg_dump`, — ALTER встанет за ним в очередь и до конца дампа заблокирует любой запрос к `blog_post`: тики крона, админку, кнопки в личке. С таймаутом в 5 секунд накат просто откажет, и его можно повторить позже.
+
+**Почему проверяются все CHECK таблицы, а не одно по имени.** Если исходное ограничение на какой-то базе называется иначе, `DROP … IF EXISTS` молча ничего не снимет, а ADD добавит второе. Старое продолжит отклонять `real`, а проверка по имени покажет новое определение и будет зелёной.
+
+**Стенд:** в его `schema_migrations` нет ни одной строки `blog/%`, хотя объекты 001–004 на месте. Отсутствие записи там не значит «не накатано»; строка 005 станет единственной записью блога.
+
 - [ ] **Шаг 1: Test (стенд на ноде, база приложения из живого чекаута — только чтение `.env`)**
 
 ```bash
-ssh dv@85.192.61.231 'cd ~/spirits_back && U=$(grep -E "^DATABASE_URL=" .env | head -1 | cut -d= -f2- | tr -d "\"'"'"'"); psql "$U" -X -v ON_ERROR_STOP=1 --single-transaction -f -' < ~/Downloads/spirits_back/.worktrees/blog-real-cases/src/blog/migrations/005_real_case_source.sql
-printf "%s\n" "INSERT INTO schema_migrations (filename) VALUES ('blog/005_real_case_source.sql') ON CONFLICT DO NOTHING;" "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'blog_post_source_check';" | ssh dv@85.192.61.231 'cd ~/spirits_back && U=$(grep -E "^DATABASE_URL=" .env | head -1 | cut -d= -f2- | tr -d "\"'"'"'"); psql "$U" -X -v ON_ERROR_STOP=1 -At -f -'
+ssh dv@85.192.61.231 'cd ~/spirits_back && U=$(grep -E "^DATABASE_URL=" .env | head -1 | cut -d= -f2- | tr -d "\"'"'"'"); PGOPTIONS="-c lock_timeout=5s" psql "$U" -X -v ON_ERROR_STOP=1 --single-transaction -f -' < ~/Downloads/spirits_back/.worktrees/blog-real-cases/src/blog/migrations/005_real_case_source.sql
+printf "%s\n" "INSERT INTO schema_migrations (filename) VALUES ('blog/005_real_case_source.sql') ON CONFLICT DO NOTHING;" "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'blog_post'::regclass AND contype = 'c' ORDER BY conname;" | ssh dv@85.192.61.231 'cd ~/spirits_back && U=$(grep -E "^DATABASE_URL=" .env | head -1 | cut -d= -f2- | tr -d "\"'"'"'"); psql "$U" -X -v ON_ERROR_STOP=1 -At -f -'
 ```
 
-Expected: `ALTER TABLE` ×2; затем `INSERT 0 1` и `CHECK ((source = ANY (ARRAY['backlog'::text, 'git'::text, 'stats'::text, 'manual'::text, 'real'::text])))`.
+Expected: `ALTER TABLE` ×2; затем `INSERT 0 1` и ровно три строки ограничений:
+- `blog_post_rubric_check`;
+- `blog_post_source_check` — `CHECK ((source = ANY (ARRAY['backlog'::text, 'git'::text, 'stats'::text, 'manual'::text, 'real'::text])))`;
+- `blog_post_status_check`.
+
+Четыре строки или вторая проверка по `source` означают, что старое ограничение звалось иначе и осталось на месте. Тогда — стоп, разбираться.
+
+Отказ `canceling statement due to lock timeout` — не ошибка миграции: кто-то держит таблицу. Повторить через несколько минут.
 
 - [ ] **Шаг 2: Prod — те же две команды с хостом `dvolkov@212.113.106.202`.** Перед этим спросить владельца. Expected — тот же.
 
