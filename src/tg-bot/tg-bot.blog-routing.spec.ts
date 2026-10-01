@@ -110,21 +110,16 @@ describe('роутинг блога в живом обработчике', () =>
     expect((svc as any).handleChatMessage).toHaveBeenCalled();
   });
 
-  it('команда реплаем остаётся командой, блог её не видит', async () => {
-    identity.getLinkeonIdByTgUserId.mockResolvedValue('u-1');
-    blog.handleReplyEdit.mockResolvedValue(false);
-    (svc as any).handleDmCommand = jest.fn();
-
-    await (svc as any).handleMessage({ ...replyMsg(), text: '/balance' });
-
-    expect((svc as any).handleDmCommand).toHaveBeenCalled();
-    expect(blog.handleReplyEdit).not.toHaveBeenCalled();
-  });
-
   /**
    * `/case` — команда владельца блога. Блог смотрит её ПЕРВЫМ, до разбора
    * команд: тот переводит текст в нижний регистр и режет по пробелу, а
    * историю нужно взять целиком.
+   *
+   * Важно: эти два теста стоят ДО «команда реплаем остаётся командой» ниже —
+   * тот тест навсегда подменяет (svc as any).handleDmCommand на jest.fn() на
+   * общем для всего describe экземпляре svc (без восстановления), и любой
+   * тест после него, зовущий handleDmCommand напрямую, бьётся об этот обрубок,
+   * а не настоящий метод — проверено прогоном.
    */
   it('/case владельца забирает блог — ответа про неизвестную команду нет', async () => {
     blog.handleCaseCommand.mockResolvedValue(true);
@@ -142,5 +137,16 @@ describe('роутинг блога в живом обработчике', () =>
     await (svc as any).handleDmCommand({ chat: { id: 42, type: 'private' }, from: { id: 42 }, text: '/case история' });
 
     expect(grammy.sendMessage).toHaveBeenCalledWith(42, expect.stringContaining('Не знаю такой команды'));
+  });
+
+  it('команда реплаем остаётся командой, блог её не видит', async () => {
+    identity.getLinkeonIdByTgUserId.mockResolvedValue('u-1');
+    blog.handleReplyEdit.mockResolvedValue(false);
+    (svc as any).handleDmCommand = jest.fn();
+
+    await (svc as any).handleMessage({ ...replyMsg(), text: '/balance' });
+
+    expect((svc as any).handleDmCommand).toHaveBeenCalled();
+    expect(blog.handleReplyEdit).not.toHaveBeenCalled();
   });
 });
