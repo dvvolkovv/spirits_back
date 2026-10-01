@@ -56,6 +56,13 @@
 #   NO_ROLLBACK=1      — отключить авто-rollback на проде при smoke failure
 #                        (по умолчанию: если PHASE 2 smoke красный — откат
 #                         back+front к pre-deploy SHA, restart сервисов)
+#   VANTAGE_OK=1       — пропустить preflight-проверку маршрута до $BASE_URL.
+#                        Preflight существует потому, что внешние проверки
+#                        (health-wait, smoke) идут через РФ-edge: с машины без
+#                        маршрута туда они краснеют на ЖИВОМ проде, а красный
+#                        prod-smoke ОТКАТЫВАЕТ здоровый релиз. Ставь только
+#                        осознанно — например, когда поднимаешь лежащий прод.
+#   APP_PORT=N         — порт бэкенда на хосте для health-wait/preflight (3001).
 #   STREAM_DRAIN_SECONDS=N — сколько ждать завершения живых чат-ходов перед
 #                        рестартом (default 1800). Рестарт посреди стрима
 #                        убивает ответ молча — см. wait_for_streams_drain.
@@ -135,9 +142,10 @@ LAND_BASE_URL="${LAND_BASE_URL:-https://linkeon.io}"
 # реестра».
 PRODUCTS_HOST="${PRODUCTS_HOST:-}"
 
-bold()  { printf "\033[1m%s\033[0m\n" "$1"; }
-green() { printf "\033[32m%s\033[0m\n" "$1"; }
-red()   { printf "\033[31m%s\033[0m\n" "$1"; }
+bold()   { printf "\033[1m%s\033[0m\n" "$1"; }
+green()  { printf "\033[32m%s\033[0m\n" "$1"; }
+red()    { printf "\033[31m%s\033[0m\n" "$1"; }
+yellow() { printf "\033[33m%s\033[0m\n" "$1"; }
 
 # ⚠ ПЕРЕМЕННАЯ ВПЛОТНУЮ ПЕРЕД НЕЛАТИНСКИМ СИМВОЛОМ — ТОЛЬКО В ФИГУРНЫХ СКОБКАХ.
 #
@@ -172,6 +180,37 @@ ssh_remote() {
     sleep $((attempt * 3))
   done
   return 255
+}
+
+# Проверка ВАНТАЖА — до того, как что-либо тронуто на сервере.
+#
+# Зачем [инцидент 2026-09-30]: health-wait и smoke бьют $BASE_URL СНАРУЖИ, а прод стоит за
+# РФ-edge (Selectel). Если маршрут С ЭТОЙ МАШИНЫ до edge сломан — а так бывает: egress
+# 185.4.75.22 (общий VPN) Selectel не маршрутизирует обратно — curl отдаёт 000 на ЖИВОМ
+# проде. Последствия были бы тихие и дорогие: health-wait валит фазу УЖЕ ПОСЛЕ рестарта,
+# а красный prod-smoke ещё и АВТО-ОТКАТЫВАЕТ совершенно здоровый релиз.
+#
+# Поэтому различаем «лежит прод» и «лежит мой маршрут»: если снаружи мёртво, а бэкенд на
+# самом хосте отвечает 200 — виноват вантаж, и деплоить отсюда нельзя.
+preflight_vantage() {
+  [[ -n "${VANTAGE_OK:-}" ]] && { yellow "[preflight] вантаж не проверяю (VANTAGE_OK=1)"; return 0; }
+  bold "[preflight] вантаж → $BASE_URL"
+  local ext loc
+  ext=$(curl -s -m 12 ${BASIC_AUTH:+-u "$BASIC_AUTH"} -o /dev/null -w "%{http_code}" "${BASE_URL}/webhook/agents" 2>/dev/null) || ext="${ext:-000}"
+  if [[ "$ext" == "200" ]]; then green "  ✓ $BASE_URL доступен с этой машины"; return 0; fi
+
+  loc=$(ssh_remote "curl -s -m 8 -o /dev/null -w '%{http_code}' http://127.0.0.1:${APP_PORT:-3001}/webhook/agents || echo 0" 2>/dev/null | tail -1 | tr -d '[:space:]\r')
+  if [[ "$loc" == "200" ]]; then
+    red "  ✗ снаружи $BASE_URL = $ext, НО бэкенд на хосте отвечает 200."
+    red "    Значит сломан МАРШРУТ С ЭТОЙ МАШИНЫ, а не прод (проверь свой egress: curl ifconfig.me)."
+    red "    Деплоить отсюда опасно: health-wait и smoke покраснеют ложно, а красный prod-smoke ОТКАТИТ здоровый релиз."
+    red "    Деплой с машины, у которой есть маршрут до edge, либо почини маршрут."
+    red "    Осознанно и под свою ответственность: VANTAGE_OK=1 NO_ROLLBACK=1 SKIP_SMOKE=1 bash scripts/deploy.sh"
+    exit 1
+  fi
+  red "  ✗ снаружи $BASE_URL = $ext И бэкенд на хосте = $loc — похоже, прод реально лежит."
+  red "    Если ты деплоишь ИМЕННО чтобы его поднять — VANTAGE_OK=1 bash scripts/deploy.sh"
+  exit 1
 }
 
 push_local_repo() {
@@ -491,18 +530,24 @@ deploy_backend() {
   # generous, env-tunable window instead. Waiting longer only delays detecting a REAL
   # crash — it never turns a broken backend green — so the tradeoff favours the higher bound.
   local max_wait="${HEALTH_WAIT_SECONDS:-90}"
-  for (( i=1; i<=max_wait; i++ )); do
-    code=$(curl -s ${BASIC_AUTH:+-u "$BASIC_AUTH"} -o /dev/null -w "%{http_code}" "${BASE_URL}/webhook/agents" || echo "0")
-    if [[ "$code" == "200" ]]; then
-      green "  ✓ /webhook/agents = 200 after ${i}s"
-      return 0
-    fi
-    if (( i == max_wait )); then
-      red "  ✗ backend didn't come up within ${max_wait}s (last $code)"
-      exit 1
-    fi
-    sleep 1
-  done
+  # Опрашиваем бэкенд НА САМОМ ХОСТЕ (127.0.0.1), а не внешний домен [инцидент 2026-09-30]:
+  # внешний путь идёт через РФ-edge, и с машины без маршрута до него curl даёт 000 на ЖИВОМ
+  # бэкенде — фаза падала ложно уже ПОСЛЕ рестарта прода. Здоровье бэкенда определяет сам
+  # бэкенд. Цикл крутим на удалённой стороне: один ssh вместо max_wait подключений.
+  local probe
+  probe=$(ssh_remote "for i in \$(seq 1 $max_wait); do c=\$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:${APP_PORT:-3001}/webhook/agents || echo 0); [ \"\$c\" = 200 ] && { echo \"OK \$i\"; exit 0; }; sleep 1; done; echo \"FAIL \$c\"; exit 1" 2>/dev/null | tail -1 | tr -d '[:space:]\r')
+  if [[ "$probe" == OK* ]]; then
+    green "  ✓ backend на хосте отвечает 200 (через ${probe#OK}s)"
+  else
+    red "  ✗ backend не поднялся за ${max_wait}s (последний код: ${probe#FAIL})"
+    exit 1
+  fi
+  # Внешний путь — информативно: он уже проверен preflight_vantage и не должен валить фазу
+  # из-за маршрута, когда сам бэкенд заведомо жив.
+  local ext
+  ext=$(curl -s -m 12 ${BASIC_AUTH:+-u "$BASIC_AUTH"} -o /dev/null -w "%{http_code}" "${BASE_URL}/webhook/agents" 2>/dev/null) || ext="${ext:-000}"
+  if [[ "$ext" == "200" ]]; then green "  ✓ снаружи ${BASE_URL} = 200"
+  else yellow "  ⚠ снаружи ${BASE_URL} = $ext при живом бэкенде — маршрут/edge с этой машины"; fi
 }
 
 deploy_frontend() {
@@ -1073,6 +1118,10 @@ run_phase() {
   # BACK_ONLY=1), переменная должна остаться пустой — это сигнал для
   # smoke_frontend_tma деградировать к слабой проверке.
   unset EXPECTED_TMA_BUNDLE
+
+  # Маршрут до $BASE_URL проверяем ДО любых изменений: с заблокированного вантажа внешние
+  # проверки ложно краснеют, а красный prod-smoke откатывает здоровый релиз (см. функцию).
+  preflight_vantage
 
   if [[ -z "${SMOKE_ONLY:-}" ]]; then
     # Capture pre-deploy state on prod (по умолчанию) для авто-rollback'а
