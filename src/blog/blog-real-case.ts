@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { DEDUP_WINDOW_DAYS } from './blog-topic.service';
 import type { AddTopicInput } from './blog-topic.service';
 
 /**
@@ -25,8 +26,12 @@ export const REAL_CASE_MIN_CHARS = 40;
  */
 export const REAL_CASE_MAX_CHARS = 4000;
 
-/** Отказ на повтор той же истории — один на админку и бота. */
-export const REAL_CASE_DUPLICATE = 'такую историю уже заводили за последние 90 дней';
+/**
+ * Отказ на повтор той же истории — один на админку и бота.
+ *
+ * Окно — то же, что у дедупликации addTopic.
+ */
+export const REAL_CASE_DUPLICATE = `такую историю уже заводили за последние ${DEDUP_WINDOW_DAYS} дней`;
 
 export type RealCasePrep =
   | { ok: true; topic: AddTopicInput }
@@ -43,12 +48,16 @@ export type RealCasePrep =
  */
 export function prepareRealCase(raw: unknown): RealCasePrep {
   const story = String(raw ?? '').trim();
-  const chars = Array.from(story).length;
+  // Сверх двух пределов в UTF-16 текст заведомо длиннее предела и в символах
+  // (символ — не больше двух единиц UTF-16). Считать символы такого тела —
+  // сотни мегабайт на 50-мегабайтном JSON из админки, в процессе с живыми
+  // чатами; число в отказе тогда — в единицах UTF-16, оно и так заведомо больше.
+  const chars = story.length > 2 * REAL_CASE_MAX_CHARS ? story.length : Array.from(story).length;
   if (chars < REAL_CASE_MIN_CHARS) {
     return {
       ok: false,
       reason: `история слишком короткая: нужно хотя бы ${REAL_CASE_MIN_CHARS} знаков — ` +
-        'кто рассказывает, что случилось, что сделал ассистент, чем кончилось',
+        'кто рассказывает, что случилось, что сделал ассистент, чем кончилось и в чём суть',
     };
   }
   if (chars > REAL_CASE_MAX_CHARS) {
@@ -85,10 +94,14 @@ export function realCaseTopicKey(story: string): string {
  * текст в нижний регистр и режет его по пробелу — история приехала бы
  * строчными буквами и одним словом. Переносы строк сохраняются.
  *
+ * Команда кончается там же, где её видит Telegram, — на первом символе вне
+ * [A-Za-z0-9_]: «/case: …» и «/case«…»» — наши, «/cases» и «/case_x» — чужие.
+ * Тире в разделители не входит: реплика в истории начинается с «—».
+ *
  * @returns текст после команды (пустая строка, если его нет) или null, если
  *          сообщение — не эта команда
  */
 export function caseCommandStory(text: unknown): string | null {
-  const m = String(text ?? '').match(/^\/case(?:@\S+)?(?:\s+([\s\S]*))?$/i);
-  return m ? (m[1] ?? '').trim() : null;
+  const m = String(text ?? '').match(/^\/case(?:@\w+)?(?![\w@])[\s:]*([\s\S]*)$/i);
+  return m ? m[1].trim() : null;
 }
