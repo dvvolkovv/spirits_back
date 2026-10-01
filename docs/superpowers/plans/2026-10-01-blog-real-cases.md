@@ -1690,6 +1690,18 @@ describe('реальный кейс', () => {
     expect(q('blog-real-case-count')!.textContent).toContain('4001 / 4000');
     expect((q('blog-add-topic') as HTMLButtonElement).disabled).toBe(true);
   });
+
+  // История, вставленная в режиме обычной темы, ушла бы выдуманным кейсом: поле
+  // срежет абзацы, а правила кейса перескажут её вымыслом. Подсказка — до отправки.
+  it('длинный текст в режиме «Кейс» — подсказка выбрать «Реальный кейс»', async () => {
+    setup();
+    await mount();
+    await type('blog-new-topic', 'а'.repeat(250));
+    expect(q('blog-story-hint')?.textContent).toContain('Реальный кейс');
+
+    await choose('blog-new-rubric', 'real');
+    expect(q('blog-story-hint')).toBeNull();
+  });
 });
 ```
 
@@ -1703,7 +1715,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ~/.cache/blog-real-cases/ci-front.sh src/components/admin/AdminBlogView.test.tsx
 ```
 
-Expected: FAIL у пяти из шести новых тестов: нет пункта `real` (поле остаётся `INPUT`), `kind` не уходит, у подписи нет `data-testid`, нет счётчика. «Обычная тема уходит как раньше» зелёный уже сейчас — он сторожит старое поведение.
+Expected: FAIL у шести из семи новых тестов: нет пункта `real` (поле остаётся `INPUT`), `kind` не уходит, у подписи нет `data-testid`, нет счётчика, нет подсказки. «Обычная тема уходит как раньше» зелёный уже сейчас — он сторожит старое поведение.
 
 - [ ] **Шаг 3: Реализация в `src/components/admin/AdminBlogView.tsx`**
 
@@ -1716,6 +1728,9 @@ Expected: FAIL у пяти из шести новых тестов: нет пу�
 type NewTopicKind = 'news' | 'case' | 'real';
 
 const toNewTopicKind = (v: string): NewTopicKind => (v === 'news' || v === 'real' ? v : 'case');
+
+/** Длиннее — уже не тема одной строкой, а, скорее всего, вставленная история. */
+const STORY_HINT_CHARS = 200;
 ```
 
 3c. Заменить строку состояния:
@@ -1744,9 +1759,15 @@ const toNewTopicKind = (v: string): NewTopicKind => (v === 'news' || v === 'real
     if (await act(payload)) setNewTopic('');
   };
 
+  // Длина истории — один раз за рендер: ею живут и счётчик, и кнопка.
+  const realCaseLen = newRubric === 'real' ? realCaseChars(newTopic) : 0;
   // Сверх предела история не уходит: бэк её отклонит, а резать её мы не
   // станем — пропал бы финал.
-  const realCaseTooLong = newRubric === 'real' && realCaseChars(newTopic) > REAL_CASE_MAX_CHARS;
+  const realCaseTooLong = realCaseLen > REAL_CASE_MAX_CHARS;
+  // Длинный текст в режиме обычной темы почти наверняка история, вставленная
+  // не туда: однострочное поле срежет абзацы, а правила выдуманного кейса
+  // перескажут её вымыслом. Не запрещаем — подсказываем.
+  const looksLikeStory = newRubric !== 'real' && newTopic.trim().length > STORY_HINT_CHARS;
 ```
 
 3e. В форме над очередью (`{screen === 'queue' && (`) заменить `<input data-testid="blog-new-topic" … />` и `<select data-testid="blog-new-rubric" …>…</select>` на:
@@ -1766,7 +1787,7 @@ const toNewTopicKind = (v: string): NewTopicKind => (v === 'news' || v === 'real
                 data-testid="blog-real-case-count"
                 className={clsx('text-xs text-right', realCaseTooLong ? 'text-red-600' : 'text-gray-500')}
               >
-                {realCaseChars(newTopic)} / {REAL_CASE_MAX_CHARS}
+                {realCaseLen} / {REAL_CASE_MAX_CHARS}
               </div>
             </div>
           ) : (
@@ -1788,6 +1809,11 @@ const toNewTopicKind = (v: string): NewTopicKind => (v === 'news' || v === 'real
             <option value="real">Реальный кейс</option>
             <option value="news">Новинка</option>
           </select>
+          {looksLikeStory && (
+            <div data-testid="blog-story-hint" className="w-full text-xs text-amber-800">
+              Похоже на историю. Для реального кейса выберите «Реальный кейс» — иначе редактор перескажет её выдумкой.
+            </div>
+          )}
 ```
 
 У кнопки `blog-add-topic` заменить `disabled={!newTopic.trim() || busy}` на `disabled={!newTopic.trim() || busy || realCaseTooLong}`; остальное в ней не трогать.
@@ -1806,6 +1832,18 @@ const toNewTopicKind = (v: string): NewTopicKind => (v === 'news' || v === 'real
                       <span data-testid={`blog-rubric-${p.id}`} className="text-xs text-gray-500">
                         {rubricLabel(p)}
                       </span>
+```
+
+3g. Текст темы у поста без заголовка (карточка идеи) — с абзацами и не выше шести строк: у реального кейса там вся история, до 4000 знаков. Заменить:
+
+```tsx
+                      <div className="text-sm text-gray-700">{p.topicHint || p.topicKey}</div>
+```
+
+на:
+
+```tsx
+                      <div className="text-sm text-gray-700 whitespace-pre-wrap line-clamp-6">{p.topicHint || p.topicKey}</div>
 ```
 
 - [ ] **Шаг 4: Закоммитить и убедиться, что зелёный весь админ-каталог**
