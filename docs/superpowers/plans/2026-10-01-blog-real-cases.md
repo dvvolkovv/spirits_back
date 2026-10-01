@@ -1205,14 +1205,17 @@ describe('handleCaseCommand: реальный кейс командой в ли�
     const svc = new BlogApprovalService({ query: jest.fn() } as any, tg as any, { get: jest.fn() } as any, topics as any);
     return { svc, tg, topics };
   };
-  const dm = (text: string, from = OWNER) => ({ text, from: { id: from }, chat: { id: from, type: 'private' } });
+  const dm = (text: string, from = OWNER) => ({
+    text, message_id: 501, from: { id: from }, chat: { id: from, type: 'private' },
+  });
 
-  it('владелец заводит кейс: источник real, история как написана', async () => {
+  it('владелец заводит кейс: источник real, история как написана, одно сообщение — один кейс', async () => {
     const { svc, tg, topics } = setup();
     expect(await svc.handleCaseCommand(dm(`/case ${STORY}`))).toBe(true);
-    expect(topics.addTopic).toHaveBeenCalledWith(
-      expect.objectContaining({ rubric: 'case', source: 'real', topicHint: STORY }),
-    );
+    expect(topics.addTopic).toHaveBeenCalledWith(expect.objectContaining({
+      rubric: 'case', source: 'real', topicHint: STORY,
+      sourceRef: `tg:${OWNER}:501`, onceBySourceRef: true,
+    }));
     expect(tg.sendMessage).toHaveBeenCalledWith(OWNER, expect.stringContaining('Принял реальный кейс'));
   });
 
@@ -1261,13 +1264,35 @@ describe('handleCaseCommand: реальный кейс командой в ли�
   });
 
   // Бот получает правки сообщений (edited_message) тем же путём, что и новые.
-  // Исправленный текст — другой хеш: правка опечатки завела бы второй кейс, и
-  // первым в работу ушёл бы старый текст — вместе с тем, что владелец убрал.
-  it('правка сообщения с /case не заводит второй кейс — владельцу объяснено, как поправить', async () => {
-    const { svc, tg, topics } = setup();
+  // Исправленный текст — другой хеш, и без ключа по сообщению правка опечатки
+  // завела бы второй кейс, а первым в работу ушёл бы старый текст. С ключом
+  // addTopic такую правку не заводит (вернёт null) — и ответ про неё свой.
+  it('правка уже принятого /case — второго кейса нет, поправить предложено замечанием', async () => {
+    const { svc, tg, topics } = setup(jest.fn().mockResolvedValue(null));
     expect(await svc.handleCaseCommand({ ...dm(`/case ${STORY}`), edit_date: 1727790000 })).toBe(true);
-    expect(topics.addTopic).not.toHaveBeenCalled();
-    expect(tg.sendMessage).toHaveBeenCalledWith(OWNER, expect.stringMatching(/замечани/));
+    expect(topics.addTopic).toHaveBeenCalledWith(expect.objectContaining({ sourceRef: `tg:${OWNER}:501`, onceBySourceRef: true }));
+    const [, text] = tg.sendMessage.mock.calls[0];
+    expect(text).toMatch(/уже заведён/);
+    expect(text).toMatch(/замечани/);
+  });
+
+  // Править сообщение естественно как раз после отказа («слишком коротко»,
+  // забытый /case, сбой базы): по нему кейса нет, и исправленный текст его заводит.
+  it('правка отклонённого /case заводит кейс по исправленному тексту', async () => {
+    const { svc, tg } = setup();
+    expect(await svc.handleCaseCommand({ ...dm(`/case ${STORY}`), edit_date: 1727790000 })).toBe(true);
+    expect(tg.sendMessage).toHaveBeenCalledWith(OWNER, expect.stringContaining('Принял реальный кейс'));
+  });
+
+  // Без id сообщения ключ «tg:<чат>:NaN» был бы общим у всех таких сообщений,
+  // и после первого кейса любые следующие считались бы повтором.
+  it('сообщение без id — без ключа по сообщению', async () => {
+    const { svc, topics } = setup();
+    const { message_id, ...noId } = dm(`/case ${STORY}`);
+    await svc.handleCaseCommand(noId);
+    const topic = topics.addTopic.mock.calls[0][0];
+    expect(topic.sourceRef).toBeUndefined();
+    expect(topic.onceBySourceRef).toBeFalsy();
   });
 });
 ```
@@ -1291,6 +1316,23 @@ Expected: FAIL только у нового `describe` — `svc.handleCaseComman
 ```ts
 import { BlogTopicService } from './blog-topic.service';
 import { REAL_CASE_DUPLICATE, caseCommandStory, prepareRealCase } from './blog-real-case';
+```
+
+После строки `const NOTE_PLACEHOLDER = 'Что поправить?';` добавить:
+
+```ts
+
+/** Ответ на принятый `/case`. */
+const CASE_ACCEPTED = 'Принял реальный кейс. Черновик пришлю сюда, когда до него дойдёт очередь.';
+
+/**
+ * Ответ на правку сообщения, по которому кейс уже заведён. Факты реального
+ * кейса правятся замечанием к черновику — для него замечание тоже материал
+ * (REAL_CASE в blog-editor.prompt.ts).
+ */
+const CASE_EDIT_IGNORED =
+  'Правку сообщения не применяю: кейс по нему уже заведён. ' +
+  'Поправить факты можно замечанием к черновику, когда он придёт, — для реального кейса замечание тоже материал.';
 ```
 
 Конструктор заменить на:
@@ -1331,21 +1373,6 @@ import { REAL_CASE_DUPLICATE, caseCommandStory, prepareRealCase } from './blog-r
     if (!owner || Number(msg?.from?.id) !== owner) return false;
 
     const chatId = Number(msg?.chat?.id) || owner;
-
-    // Правка уже отправленного сообщения приходит тем же путём (edited_message).
-    // Исправленный текст — другой хеш, дедупликация его не узнает: правка
-    // опечатки завела бы второй кейс, и первым в работу ушёл бы старый текст.
-    // Факты реального кейса правятся замечанием к черновику — для него
-    // замечание тоже материал (REAL_CASE в blog-editor.prompt.ts).
-    if (msg?.edit_date) {
-      await this.notify(
-        chatId,
-        'Правку сообщения не применяю: кейс уже заведён по первому тексту. ' +
-          'Поправить факты можно замечанием к черновику, когда он придёт, — для реального кейса замечание тоже материал.',
-      );
-      return true;
-    }
-
     const prep = prepareRealCase(story);
     if (prep.ok === false) {
       await this.notify(
@@ -1355,14 +1382,19 @@ import { REAL_CASE_DUPLICATE, caseCommandStory, prepareRealCase } from './blog-r
       return true;
     }
 
+    // Одно сообщение — не больше одного кейса. Правка уже отправленного
+    // сообщения (edited_message) приходит тем же путём, что и новое, а
+    // исправленный текст — другой хеш: без ключа по сообщению правка опечатки
+    // завела бы второй кейс, и первым в работу ушёл бы старый текст. С ключом
+    // правка принятого /case не заводит ничего, а правка отклонённого
+    // (коротко, длинно, сбой) заводит кейс по исправленному тексту.
+    // Без id сообщения ключа нет: «tg:<чат>:NaN» склеил бы все такие сообщения.
+    const messageId = Number(msg?.message_id);
+    const once = messageId > 0 ? { sourceRef: `tg:${chatId}:${messageId}`, onceBySourceRef: true } : {};
+
     try {
-      const post = await this.topics.addTopic(prep.topic);
-      await this.notify(
-        chatId,
-        post
-          ? 'Принял реальный кейс. Черновик пришлю сюда, когда до него дойдёт очередь.'
-          : `Не завёл: ${REAL_CASE_DUPLICATE}.`,
-      );
+      const post = await this.topics.addTopic({ ...prep.topic, ...once });
+      await this.notify(chatId, post ? CASE_ACCEPTED : msg?.edit_date ? CASE_EDIT_IGNORED : `Не завёл: ${REAL_CASE_DUPLICATE}.`);
     } catch (e: any) {
       this.logger.error(`реальный кейс не заведён: ${e.message}`);
       await this.notify(chatId, `Не завёл реальный кейс: ${e.message}`);
