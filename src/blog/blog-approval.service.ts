@@ -16,8 +16,24 @@ import { REAL_CASE_DUPLICATE, caseCommandStory, prepareRealCase } from './blog-r
 /** Подсказка в открытом поле ответа. Telegram принимает 1–64 символа. */
 const NOTE_PLACEHOLDER = 'Что поправить?';
 
-/** Ответ на принятый `/case`. */
-const CASE_ACCEPTED = 'Принял реальный кейс. Черновик пришлю сюда, когда до него дойдёт очередь.';
+/** Длиннее — Telegram мог разрезать сообщение, и до нас дошла только первая часть. */
+const CASE_SPLIT_RISK_CHARS = 3000;
+
+/**
+ * Ответ на принятый `/case`: длина и последние слова — чтобы владелец увидел,
+ * дошла ли история до конца. Telegram Desktop режет сообщения длиннее 4096
+ * знаков по абзацу во второй половине лимита, и первая часть проходит проверку
+ * длины: без этого кейс без финала заводился бы молча.
+ */
+function caseAccepted(story: string): string {
+  const chars = Array.from(story);
+  const tail = chars.slice(-60).join('').replace(/\s+/g, ' ').trim();
+  const ending = chars.length > 60 ? `…${tail}` : tail;
+  const warn = chars.length > CASE_SPLIT_RISK_CHARS
+    ? ' Если это не конец истории — Telegram разрезал сообщение: длинную историю лучше завести через админку.'
+    : '';
+  return `Принял реальный кейс: ${chars.length} знаков, кончается на «${ending}».${warn} Черновик пришлю сюда, когда до него дойдёт очередь.`;
+}
 
 /**
  * Ответ на правку сообщения, по которому кейс уже заведён. Факты реального
@@ -28,6 +44,9 @@ const CASE_EDIT_IGNORED =
   'Правку сообщения не применяю: кейс по нему уже заведён. ' +
   'Поправить факты можно замечанием к черновику, когда он придёт, — для реального кейса замечание тоже материал. ' +
   'Если черновик по нему уже отклонён — пришлите /case новым сообщением.';
+
+/** Повторная доставка того же сообщения: кейс по нему уже заведён. */
+const CASE_ALREADY_FROM_MESSAGE = 'По этому сообщению кейс уже заведён — второй раз не завожу.';
 
 /** Чат владельца (BLOG_APPROVER_TG_ID): туда приходят черновики и служебные сообщения блога. */
 export function approverChatId(): number | null {
@@ -397,7 +416,7 @@ export class BlogApprovalService {
 
     try {
       const post = await this.topics.addTopic({ ...prep.topic, ...once });
-      await this.notify(chatId, await this.caseReply(post, msg, once));
+      await this.notify(chatId, await this.caseReply(post, msg, once, prep.topic.topicHint));
     } catch (e: any) {
       const why = String(e?.message ?? e);
       this.logger.error(`реальный кейс не заведён: ${why}`);
@@ -411,8 +430,9 @@ export class BlogApprovalService {
    *
    * `null` из `addTopic` значит двое разное, и ответ должен говорить правду о
    * том, какое из двух случилось, а не только сам факт null:
-   *  - «по этому сообщению кейс уже есть» — правка уже принятого /case
-   *    (сообщение заводило кейс раньше, тем же sourceRef);
+   *  - «по этому сообщению кейс уже есть» — повторная доставка того же
+   *    сообщения (Telegram иногда присылает его второй раз) или правка уже
+   *    принятого /case (сообщение заводило кейс раньше, тем же sourceRef);
    *  - «такая история уже заведена другим сообщением» — обычный повтор по
    *    тексту (topic_key), в том числе правка, которая случайно совпала с
    *    чужой историей. Для него прежний «по нему уже заведён» был бы
@@ -420,13 +440,16 @@ export class BlogApprovalService {
    *
    * Различить их можно только спросив базу: сам `addTopic` после `null` не
    * говорит, по какой причине. Запрос — на том же source_ref, которым только
-   * что промахнулась вставка.
+   * что промахнулась вставка, и идёт всегда (а не только при edit_date):
+   * Telegram может продублировать и исходное сообщение, и в гонке после
+   * рестарта правка может обработаться раньше оригинала — тогда у
+   * «оригинала» формально нет edit_date, но кейс по этому сообщению уже есть.
    */
-  private async caseReply(post: BlogPost | null, msg: any, once: { sourceRef?: string }): Promise<string> {
-    if (post) return CASE_ACCEPTED;
-    if (msg?.edit_date && once.sourceRef) {
+  private async caseReply(post: BlogPost | null, msg: any, once: { sourceRef?: string }, story: string): Promise<string> {
+    if (post) return caseAccepted(story);
+    if (once.sourceRef) {
       const seen = await this.pg.query(`SELECT 1 FROM blog_post WHERE source_ref = $1 LIMIT 1`, [once.sourceRef]);
-      if (seen.rows.length) return CASE_EDIT_IGNORED;
+      if (seen.rows.length) return msg?.edit_date ? CASE_EDIT_IGNORED : CASE_ALREADY_FROM_MESSAGE;
     }
     return `Не завёл: ${REAL_CASE_DUPLICATE}.`;
   }
