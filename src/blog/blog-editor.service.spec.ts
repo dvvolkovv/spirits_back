@@ -399,6 +399,8 @@ describe('BlogEditorService', () => {
     const [systemPrompt, message] = relay.ask.mock.calls[0];
     expect(String(systemPrompt)).toMatch(/РЕАЛЬНЫЙ КЕЙС/);
     expect(String(message)).toContain('Материал реального кейса');
+    // Материал и есть весь пост: до релея обязан доехать сам текст, а не только заголовок блока.
+    expect(String(message)).toContain('Рассказчик — Дмитрий, основатель Linkeon.');
   });
 
   it('кейс из статистики по-прежнему пишется выдумкой', async () => {
@@ -410,5 +412,18 @@ describe('BlogEditorService', () => {
     const systemPrompt = String(relay.ask.mock.calls[0][0]).replace(/\s+/g, ' ');
     expect(systemPrompt).not.toMatch(/РЕАЛЬНЫЙ КЕЙС/);
     expect(systemPrompt).toMatch(/История вымышленная/);
+  });
+
+  // Рубрика в вызове editorKind тоже на счету: без неё новость молча получила
+  // бы правила выдуманного кейса — «Придумай короткую узнаваемую историю».
+  it('новость по-прежнему пишется по правилам новости', async () => {
+    const relay = relayMock('{"title":"З","body":"Т","imagePrompt":"с"}');
+    const svc = new BlogEditorService(relay as any, topicsMock() as any);
+
+    await svc.draft({ ...POST, rubric: 'news', source: 'git', editorNotes: [] });
+
+    const systemPrompt = String(relay.ask.mock.calls[0][0]);
+    expect(systemPrompt).toMatch(/Рубрика: НОВИНКА/);
+    expect(systemPrompt).not.toMatch(/Рубрика: КЕЙС|РЕАЛЬНЫЙ КЕЙС/);
   });
 });

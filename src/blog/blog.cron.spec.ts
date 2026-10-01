@@ -207,7 +207,8 @@ describe('BlogCron.prepareDrafts', () => {
    * Реальный кейс без материала — не повод сочинять: редактор отказывает ещё
    * до релея, пост уходит в failed с причиной, владелец узнаёт об этом в личке.
    * Редактор настоящий, подменён только релей — так проверяется и место
-   * вызова: сервис обязан передать в промпт вид поста, а не только рубрику.
+   * вызова: сервис обязан передать вид поста в сообщение редактору. Системный
+   * промпт стережёт blog-editor.service.spec.
    */
   it('реальный кейс без материала — failed с причиной, до релея дело не доходит', async () => {
     const d = deps();
@@ -226,6 +227,7 @@ describe('BlogCron.prepareDrafts', () => {
     expect(ask).not.toHaveBeenCalled();
     expect(d.images.render).not.toHaveBeenCalled();
     const failed = d.pg.query.mock.calls.find((c: any) => String(c[0]).includes("status = 'failed'"));
+    expect(failed).toBeDefined();
     expect(String(failed[1][1])).toMatch(/нет материала/);
     expect(d.approval.notify).toHaveBeenCalledWith(77, expect.stringMatching(/нет материала/));
   });
