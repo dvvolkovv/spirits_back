@@ -4,7 +4,7 @@ import axios from 'axios';
 import { Client, Pool } from 'pg';
 import { BlogApprovalService } from './blog-approval.service';
 import { BlogPublisherService } from './blog-publisher.service';
-import { BlogTopicService, STALE_DRAFTING_MINUTES } from './blog-topic.service';
+import { BlogTopicService, STALE_DRAFTING_MINUTES, TG_SOURCE_REF_INDEX } from './blog-topic.service';
 import { BlogController } from './blog.controller';
 import { BlogCron } from './blog.cron';
 import { upcomingSlots } from './blog-slots';
@@ -1388,7 +1388,8 @@ maybe('Реальный кейс против живого Postgres', () => {
           return r;
         },
       } as any;
-      const racingSvc = new BlogApprovalService(racing, tg as any, { get: jest.fn() } as any, new BlogTopicService(racing));
+      const racingTg = { sendMessage: jest.fn().mockResolvedValue({ message_id: 2 }) };
+      const racingSvc = new BlogApprovalService(racing, racingTg as any, { get: jest.fn() } as any, new BlogTopicService(racing));
 
       await Promise.all([
         racingSvc.handleCaseCommand(msg(11, story('Роман разобрал ответ налоговой.'))),
@@ -1400,6 +1401,19 @@ maybe('Реальный кейс против живого Postgres', () => {
         { source_ref: `tg:${OWNER}:10`, n: 1 },
         { source_ref: `tg:${OWNER}:11`, n: 1 },
       ]);
+
+      // Проигравший не должен узнать об ошибке базы: addTopic ловит именно
+      // этот индекс по имени (TG_SOURCE_REF_INDEX) и отвечает как на обычный
+      // повтор. Если индекс в базе переименуют, а константу не поправят,
+      // catch перестанет совпадать, ошибка уйдёт наверх, и владелец увидит
+      // «Не завёл реальный кейс: duplicate key…» — проверка ниже это ловит.
+      for (const [, text] of racingTg.sendMessage.mock.calls) expect(String(text)).not.toMatch(/^Не завёл реальный кейс/);
+
+      // Имя в константе должно совпадать с именем индекса в базе — иначе
+      // проверка выше прошла бы случайно (гонка не воспроизвелась) и ничего
+      // бы не поймала.
+      const idx = await pool.query('SELECT 1 FROM pg_indexes WHERE indexname = $1', [TG_SOURCE_REF_INDEX]);
+      expect(idx.rows).toHaveLength(1);
     } finally {
       if (old === undefined) delete process.env.BLOG_APPROVER_TG_ID; else process.env.BLOG_APPROVER_TG_ID = old;
     }
