@@ -1897,7 +1897,7 @@ Expected: `Tests: N failed` (N ≥ 5: «промпт реального кейс
 printf "%s\n" "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'blog_post'::regclass AND contype = 'c' ORDER BY conname;" "SELECT indexdef FROM pg_indexes WHERE tablename = 'blog_post' AND indexname = 'blog_post_tg_source_ref_uniq';" | ssh dv@85.192.61.231 'cd ~/spirits_back && U=$(grep -E "^DATABASE_URL=" .env | head -1 | cut -d= -f2- | tr -d "\"'"'"'"); psql "$U" -X -v ON_ERROR_STOP=1 -At -f -'
 ```
 
-Expected: `ALTER TABLE` ×2 и `INSERT 0 1` (на повторе — `INSERT 0 0`); затем ровно три строки ограничений:
+Expected: `ALTER TABLE` ×2, `CREATE INDEX` и `INSERT 0 1` (на повторе — `INSERT 0 0`, а индекс — notice «already exists, skipping»); затем ровно три строки ограничений:
 - `blog_post_rubric_check`;
 - `blog_post_source_check` — `CHECK ((source = ANY (ARRAY['backlog'::text, 'git'::text, 'stats'::text, 'manual'::text, 'real'::text])))`;
 - `blog_post_status_check`.
