@@ -33,7 +33,7 @@ describe('роутинг блога в живом обработчике', () =>
   const configs = { ensurePrivateConfig: jest.fn(), getActiveByTgChatId: jest.fn() };
   const commands = { handleAgentCallback: jest.fn(), handleLanguageCallback: jest.fn(), handleAssistants: jest.fn() };
   const grammy = { sendMessage: jest.fn() };
-  const blog = { handleCallback: jest.fn(), handleReplyEdit: jest.fn() };
+  const blog = { handleCallback: jest.fn(), handleReplyEdit: jest.fn(), handleCaseCommand: jest.fn() };
   const pg = { query: jest.fn() };
 
   const svc = new TgBotService(
@@ -119,5 +119,28 @@ describe('роутинг блога в живом обработчике', () =>
 
     expect((svc as any).handleDmCommand).toHaveBeenCalled();
     expect(blog.handleReplyEdit).not.toHaveBeenCalled();
+  });
+
+  /**
+   * `/case` — команда владельца блога. Блог смотрит её ПЕРВЫМ, до разбора
+   * команд: тот переводит текст в нижний регистр и режет по пробелу, а
+   * историю нужно взять целиком.
+   */
+  it('/case владельца забирает блог — ответа про неизвестную команду нет', async () => {
+    blog.handleCaseCommand.mockResolvedValue(true);
+    const msg = { chat: { id: 37948399, type: 'private' }, from: { id: 37948399 }, text: '/case Дмитрий рассказывает' };
+
+    await (svc as any).handleDmCommand(msg);
+
+    expect(blog.handleCaseCommand).toHaveBeenCalledWith(msg);
+    expect(grammy.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('чужой /case блог не берёт — бот отвечает как на неизвестную команду, как раньше', async () => {
+    blog.handleCaseCommand.mockResolvedValue(false);
+
+    await (svc as any).handleDmCommand({ chat: { id: 42, type: 'private' }, from: { id: 42 }, text: '/case история' });
+
+    expect(grammy.sendMessage).toHaveBeenCalledWith(42, expect.stringContaining('Не знаю такой команды'));
   });
 });
