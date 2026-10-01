@@ -22,6 +22,7 @@ import { NoFreeSlotError, upcomingSlots } from './blog-slots';
 import { ApprovedSlot, SlotHolder, approveIntoFreeSlot, isSlotConflict, slotHolderAt, slotHolders } from './blog-slot-claim';
 import { formatSlotWhen } from './blog-slot-format';
 import { LeaveOutcome, leaveQueue, shiftToJson } from './blog-queue';
+import { REAL_CASE_DUPLICATE, prepareRealCase } from './blog-real-case';
 
 /** `free_slots`: сколько ближайших слотов отдаём, если не просили, и больше скольких не отдаём. */
 export const FREE_SLOTS_DEFAULT = 6;
@@ -113,6 +114,24 @@ export class BlogController {
       }
 
       case 'add_topic': {
+        // Незнакомый kind — ошибка, а не прежний путь: опечатка («Real») молча
+        // увела бы реальную историю в выдуманный кейс.
+        if (data.kind !== undefined && data.kind !== 'real') {
+          throw new BadRequestException(`неизвестный вид темы: ${data.kind}`);
+        }
+
+        // Реальный кейс — история целиком, а не тема одной строкой: свои
+        // границы длины и свой ключ (blog-real-case.ts). Рубрику из запроса
+        // не читаем — реальный кейс всегда кейс.
+        if (data.kind === 'real') {
+          const prep = prepareRealCase(data.topic);
+          // `=== false`, а не `!prep.ok`: в бэке strictNullChecks выключен,
+          // и отрицание союз не сужает — `prep.reason` не скомпилировался бы.
+          if (prep.ok === false) throw new BadRequestException(prep.reason);
+          const post = await this.topics.addTopic(prep.topic);
+          return res.status(200).json(post ?? { skipped: REAL_CASE_DUPLICATE });
+        }
+
         // Пустая тема дала бы идею с пустым topic_key, а он участвует в
         // дедупликации: первая же такая запись заблокировала бы все
         // следующие «пустые» темы на 90 дней.

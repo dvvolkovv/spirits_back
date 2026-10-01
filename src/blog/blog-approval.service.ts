@@ -10,9 +10,43 @@ import { ApprovedSlot, approveIntoFreeSlot } from './blog-slot-claim';
 import { fetchImageBytes } from './blog-image.fetch';
 import { formatSlotWhen } from './blog-slot-format';
 import { QueueShift, formatQueueShift, leaveQueue } from './blog-queue';
+import { BlogTopicService } from './blog-topic.service';
+import { REAL_CASE_DUPLICATE, caseCommandStory, prepareRealCase } from './blog-real-case';
 
 /** Подсказка в открытом поле ответа. Telegram принимает 1–64 символа. */
 const NOTE_PLACEHOLDER = 'Что поправить?';
+
+/** Длиннее — Telegram мог разрезать сообщение, и до нас дошла только первая часть. */
+const CASE_SPLIT_RISK_CHARS = 3000;
+
+/**
+ * Ответ на принятый `/case`: длина и последние слова — чтобы владелец увидел,
+ * дошла ли история до конца. Telegram Desktop режет сообщения длиннее 4096
+ * знаков по абзацу во второй половине лимита, и первая часть проходит проверку
+ * длины: без этого кейс без финала заводился бы молча.
+ */
+function caseAccepted(story: string): string {
+  const chars = Array.from(story);
+  const tail = chars.slice(-60).join('').replace(/\s+/g, ' ').trim();
+  const ending = chars.length > 60 ? `…${tail}` : tail;
+  const warn = chars.length > CASE_SPLIT_RISK_CHARS
+    ? ' Если это не конец истории — Telegram разрезал сообщение: длинную историю лучше завести через админку.'
+    : '';
+  return `Принял реальный кейс: ${chars.length} знаков, кончается на «${ending}».${warn} Черновик пришлю сюда, когда до него дойдёт очередь.`;
+}
+
+/**
+ * Ответ на правку сообщения, по которому кейс уже заведён. Факты реального
+ * кейса правятся замечанием к черновику — для него замечание тоже материал
+ * (REAL_CASE в blog-editor.prompt.ts).
+ */
+const CASE_EDIT_IGNORED =
+  'Правку сообщения не применяю: кейс по нему уже заведён. ' +
+  'Поправить факты можно замечанием к черновику, когда он придёт, — для реального кейса замечание тоже материал. ' +
+  'Если черновик по нему уже отклонён — пришлите /case новым сообщением.';
+
+/** Повторная доставка того же сообщения: кейс по нему уже заведён. */
+const CASE_ALREADY_FROM_MESSAGE = 'По этому сообщению кейс уже заведён — второй раз не завожу.';
 
 /** Чат владельца (BLOG_APPROVER_TG_ID): туда приходят черновики и служебные сообщения блога. */
 export function approverChatId(): number | null {
@@ -55,6 +89,8 @@ export class BlogApprovalService {
     private readonly pg: PgService,
     private readonly tg: TgGrammyClient,
     private readonly settings: BlogSettingsService,
+    // Заводить реальный кейс командой `/case` (см. handleCaseCommand).
+    private readonly topics: BlogTopicService,
   ) {}
 
   /**
@@ -325,6 +361,97 @@ export class BlogApprovalService {
         WHERE id = $1`,
       [post.id, Number(prompt.message_id), MAX_NOTE_PROMPTS],
     );
+  }
+
+  /**
+   * `/case <история>` в личке — реальный кейс в блог (blog-real-case.ts).
+   *
+   * Команда владельца блога и только его: чужой `/case` — не наш (false), и
+   * бот отвечает на него как на любую неизвестную команду, как и до появления
+   * этой. Владелец — тот же `BLOG_APPROVER_TG_ID`, которому приходят
+   * черновики: команда заводит только тему, а в канал пост без его решения
+   * всё равно не уйдёт.
+   *
+   * Ответ владельцу — всегда, и через `notify`: Telegram, не принявший ответ,
+   * не повод ронять обработку команды, а молчание после команды — повод
+   * прислать её второй раз.
+   *
+   * Зовётся на каждую команду в личке: до решения «моё / не моё» — никакого
+   * ввода-вывода.
+   *
+   * @returns true, если это команда владельца (кейс заведён или владельцу
+   *          объяснено, почему нет)
+   */
+  async handleCaseCommand(msg: any): Promise<boolean> {
+    const story = caseCommandStory(msg?.text);
+    if (story === null) return false;
+    // Команда личная: в группе /case не наш, даже от владельца.
+    if (msg?.chat?.type !== 'private') return false;
+    const owner = approverChatId();
+    if (!owner || Number(msg?.from?.id) !== owner) return false;
+
+    const chatId = Number(msg?.chat?.id) || owner;
+    const prep = prepareRealCase(story);
+    if (prep.ok === false) {
+      // Telegram Desktop режет сообщения длиннее 4096 знаков по границе
+      // абзаца во второй половине лимита: первая часть длинной истории может
+      // пройти проверку (40..4000 знаков) и завести кейс без её конца.
+      await this.notify(
+        chatId,
+        `Не завёл: ${prep.reason}.\n\nКак писать: /case и следом история — можно в несколько строк. ` +
+          'Длинную историю (больше ~3000 знаков) лучше завести через админку: Telegram режет длинные сообщения на части.',
+      );
+      return true;
+    }
+
+    // Одно сообщение — не больше одного кейса. Правка уже отправленного
+    // сообщения (edited_message) приходит тем же путём, что и новое, а
+    // исправленный текст — другой хеш: без ключа по сообщению правка опечатки
+    // завела бы второй кейс, и первым в работу ушёл бы старый текст. С ключом
+    // правка принятого /case не заводит ничего, а правка отклонённого
+    // (коротко, длинно, сбой) заводит кейс по исправленному тексту.
+    // Без id сообщения ключа нет: «tg:<чат>:NaN» склеил бы все такие сообщения.
+    const messageId = Number(msg?.message_id);
+    const once = messageId > 0 ? { sourceRef: `tg:${chatId}:${messageId}`, onceBySourceRef: true } : {};
+
+    try {
+      const post = await this.topics.addTopic({ ...prep.topic, ...once });
+      await this.notify(chatId, await this.caseReply(post, msg, once, prep.topic.topicHint));
+    } catch (e: any) {
+      const why = String(e?.message ?? e);
+      this.logger.error(`реальный кейс не заведён: ${why}`);
+      await this.notify(chatId, `Не завёл реальный кейс: ${why}`);
+    }
+    return true;
+  }
+
+  /**
+   * Ответ владельцу после `addTopic`.
+   *
+   * `null` из `addTopic` значит двое разное, и ответ должен говорить правду о
+   * том, какое из двух случилось, а не только сам факт null:
+   *  - «по этому сообщению кейс уже есть» — повторная доставка того же
+   *    сообщения (Telegram иногда присылает его второй раз) или правка уже
+   *    принятого /case (сообщение заводило кейс раньше, тем же sourceRef);
+   *  - «такая история уже заведена другим сообщением» — обычный повтор по
+   *    тексту (topic_key), в том числе правка, которая случайно совпала с
+   *    чужой историей. Для него прежний «по нему уже заведён» был бы
+   *    неправдой: ПО ЭТОМУ сообщению кейса не было.
+   *
+   * Различить их можно только спросив базу: сам `addTopic` после `null` не
+   * говорит, по какой причине. Запрос — на том же source_ref, которым только
+   * что промахнулась вставка, и идёт всегда (а не только при edit_date):
+   * Telegram может продублировать и исходное сообщение, и в гонке после
+   * рестарта правка может обработаться раньше оригинала — тогда у
+   * «оригинала» формально нет edit_date, но кейс по этому сообщению уже есть.
+   */
+  private async caseReply(post: BlogPost | null, msg: any, once: { sourceRef?: string }, story: string): Promise<string> {
+    if (post) return caseAccepted(story);
+    if (once.sourceRef) {
+      const seen = await this.pg.query(`SELECT 1 FROM blog_post WHERE source_ref = $1 LIMIT 1`, [once.sourceRef]);
+      if (seen.rows.length) return msg?.edit_date ? CASE_EDIT_IGNORED : CASE_ALREADY_FROM_MESSAGE;
+    }
+    return `Не завёл: ${REAL_CASE_DUPLICATE}.`;
   }
 
   /**

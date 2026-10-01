@@ -203,6 +203,35 @@ describe('BlogCron.prepareDrafts', () => {
     expect(lastError).not.toMatch(/\n/);
   });
 
+  /**
+   * Реальный кейс без материала — не повод сочинять: редактор отказывает ещё
+   * до релея, пост уходит в failed с причиной, владелец узнаёт об этом в личке.
+   * Редактор настоящий, подменён только релей — так проверяется и место
+   * вызова: сервис обязан передать вид поста в сообщение редактору. Системный
+   * промпт стережёт blog-editor.service.spec.
+   */
+  it('реальный кейс без материала — failed с причиной, до релея дело не доходит', async () => {
+    const d = deps();
+    d.topics.takeNextIdea.mockResolvedValue({
+      id: 'p1', rubric: 'case', source: 'real', topicKey: 'реальный-кейс-0123456789ab',
+      topicHint: null, status: 'idea', editorNotes: [],
+    });
+    const ask = jest.fn();
+    (d as any).editor = new BlogEditorService(
+      { ask } as any,
+      { recentTitles: jest.fn().mockResolvedValue([]) } as any,
+    );
+
+    await make(d).prepareDrafts();
+
+    expect(ask).not.toHaveBeenCalled();
+    expect(d.images.render).not.toHaveBeenCalled();
+    const failed: any = d.pg.query.mock.calls.find((c: any) => String(c[0]).includes("status = 'failed'"));
+    expect(failed).toBeDefined();
+    expect(String(failed[1][1])).toMatch(/нет материала/);
+    expect(d.approval.notify).toHaveBeenCalledWith(77, expect.stringMatching(/нет материала/));
+  });
+
   it('без идей в очереди тихо выходит', async () => {
     const d = deps();
     await make(d).prepareDrafts();
@@ -394,7 +423,7 @@ describe('BlogCron.prepareDrafts — гонка двух тиков', () => {
 describe('BlogCron.prepareDrafts — что держит очередь', () => {
   beforeEach(() => { process.env.BLOG_ENABLED = 'true'; process.env.BLOG_APPROVER_TG_ID = '77'; });
 
-  type Row = { id: string; status: string; rubric: string; mark: number | null; created: number };
+  type Row = { id: string; status: string; rubric: string; source: string; mark: number | null; created: number };
 
   /**
    * WHERE из запроса — в JS-предикат над строкой.
@@ -437,7 +466,7 @@ describe('BlogCron.prepareDrafts — что держит очередь', () => 
    */
   const queuePg = (rows: Array<Partial<Row> & { id: string; status: string }>) => {
     const now = Date.now();
-    const state: Row[] = rows.map((r, i) => ({ rubric: 'case', mark: null, created: i, ...r }));
+    const state: Row[] = rows.map((r, i) => ({ rubric: 'case', source: 'stats', mark: null, created: i, ...r }));
     const seen: string[] = [];
     const query = jest.fn(async (sql: string, params: any[] = []) => {
       const s = String(sql).replace(/\s+/g, ' ').trim();
@@ -448,14 +477,21 @@ describe('BlogCron.prepareDrafts — что держит очередь', () => 
         return { rows: [{ n: state.filter(sqlWhere(m[1], params, now)).length }] };
       }
 
-      m = s.match(/^SELECT \* FROM blog_post WHERE (.+) ORDER BY \(rubric = 'news'\) DESC, created_at ASC LIMIT 1$/);
+      // ORDER BY — буквальное зеркало текста из takeNextIdea, не разбор условия
+      // через sqlWhere; сортировка ниже повторяет его по тем же ключам:
+      // новость, черновик в работе, реальный кейс, давность.
+      m = s.match(/^SELECT \* FROM blog_post WHERE (.+) ORDER BY \(rubric = 'news'\) DESC, \(status = 'drafting'\) DESC, \(source = 'real'\) DESC, created_at ASC LIMIT 1$/);
       if (m) {
         seen.push('take');
         const hit = state.filter(sqlWhere(m[1], params, now))
-          .sort((a, b) => Number(b.rubric === 'news') - Number(a.rubric === 'news') || a.created - b.created)[0];
+          .sort((a, b) =>
+            Number(b.rubric === 'news') - Number(a.rubric === 'news')
+            || Number(b.status === 'drafting') - Number(a.status === 'drafting')
+            || Number(b.source === 'real') - Number(a.source === 'real')
+            || a.created - b.created)[0];
         return {
           rows: hit ? [{
-            id: hit.id, rubric: hit.rubric, source: 'manual', topic_key: 'k', status: hit.status, attempts: 0,
+            id: hit.id, rubric: hit.rubric, source: hit.source, topic_key: 'k', status: hit.status, attempts: 0,
             drafting_started_at: hit.mark === null ? null : new Date(hit.mark),
           }] : [],
         };
@@ -545,6 +581,25 @@ describe('BlogCron.prepareDrafts — что держит очередь', () => 
     const { pg } = await run([{ id: 'next', status: 'idea' }]);
     const guard = pg.query.mock.calls.find((c: any[]) => /count\(\*\)/.test(String(c[0])));
     expect(guard?.[1]).toEqual([STALE_DRAFTING_MINUTES]);
+  });
+
+  // Бот уже ответил «перепишу к следующему тику» — следующим тиком должен
+  // прийти переписанный пост, а не новая тема, даже реальная. Реальная идея
+  // здесь старше переработки — иначе тест прошёл бы и на одной давности.
+  it('запрошенная переработка идёт раньше реального кейса', async () => {
+    const { drafted } = await run([
+      { id: 'real-idea', status: 'idea', source: 'real' },
+      { id: 'redo', status: 'drafting' },
+    ]);
+    expect(drafted).toEqual(['redo']);
+  });
+
+  it('реальный кейс идёт раньше синтетического, даже более старого', async () => {
+    const { drafted } = await run([
+      { id: 'synthetic', status: 'idea' },
+      { id: 'real-idea', status: 'idea', source: 'real' },
+    ]);
+    expect(drafted).toEqual(['real-idea']);
   });
 });
 

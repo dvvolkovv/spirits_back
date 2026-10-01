@@ -100,6 +100,29 @@ describe('BlogTopicService.addTopic с onceBySourceRef', () => {
     expect(pg.query).toHaveBeenCalledTimes(2);
     expect(String(pg.query.mock.calls[0][0])).toContain('topic_key = $1');
   });
+
+  // Проверка source_ref и вставка — два запроса; одновременную пару (сообщение
+  // и его правка пачкой после рестарта) разводит уникальный индекс, и
+  // проигравшая вставка — это «уже заводилась», а не ошибка.
+  it('проигравшая гонку вставка по тому же сообщению — null, а не ошибка', async () => {
+    const pg = pgMock();
+    pg.query
+      .mockResolvedValueOnce({ rows: [] })   // source_ref ещё не видели
+      .mockResolvedValueOnce({ rows: [] })   // дубля по ключу нет
+      .mockRejectedValueOnce(Object.assign(new Error('duplicate key'), { code: '23505', constraint: 'blog_post_tg_source_ref_uniq' }));
+    const svc = new BlogTopicService(pg as any);
+    await expect(svc.addTopic({ rubric: 'case', source: 'real', topicKey: 'k', sourceRef: 'tg:1:2', onceBySourceRef: true })).resolves.toBeNull();
+  });
+
+  it('другие нарушения уникальности не глотаются', async () => {
+    const pg = pgMock();
+    pg.query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockRejectedValueOnce(Object.assign(new Error('duplicate key'), { code: '23505', constraint: 'something_else' }));
+    const svc = new BlogTopicService(pg as any);
+    await expect(svc.addTopic({ rubric: 'case', source: 'real', topicKey: 'k', sourceRef: 'tg:1:2', onceBySourceRef: true })).rejects.toThrow(/duplicate key/);
+  });
 });
 
 describe('BlogTopicService.takeNextIdea', () => {
@@ -198,6 +221,15 @@ describe('BlogTopicService.takeNextIdea', () => {
     const svc = new BlogTopicService(pg as any);
     await svc.takeNextIdea();
     expect(String(pg.query.mock.calls[0][0])).toContain("(rubric = 'news') DESC");
+  });
+
+  it('порядок: новость, затем черновик в работе, затем реальный кейс, затем остальное по давности', async () => {
+    const pg = pgMock();
+    pg.query.mockResolvedValueOnce({ rows: [] });
+    const svc = new BlogTopicService(pg as any);
+    await svc.takeNextIdea();
+    const sql = String(pg.query.mock.calls[0][0]).replace(/\s+/g, ' ');
+    expect(sql).toContain("ORDER BY (rubric = 'news') DESC, (status = 'drafting') DESC, (source = 'real') DESC, created_at ASC");
   });
 
   it('запрошенная перезапись берётся сразу: отправивший её погасил отметку', async () => {

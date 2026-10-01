@@ -340,6 +340,13 @@ export class TgBotService implements OnModuleInit {
   }
 
   private async handleDmCommand(msg: any): Promise<void> {
+    // `/case <история>` — реальный кейс в блог, команда владельца блога. Стоит
+    // первой: разбор ниже переводит текст в нижний регистр и режет по пробелу,
+    // а историю надо взять целиком и как написана. Чужой `/case` блог не берёт
+    // (false) — он доходит до ответа про неизвестную команду, как и до
+    // появления этой. В /help и в меню команд её нет намеренно.
+    if (await this.blogApproval.handleCaseCommand(msg)) return;
+
     const text = msg.text.toLowerCase().trim();
     const cmd = text.split('@')[0].split(' ')[0];
 

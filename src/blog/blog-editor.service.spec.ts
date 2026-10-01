@@ -1,5 +1,5 @@
 import { BlogEditorService } from './blog-editor.service';
-import { buildEditorMessage, buildEditorPrompt } from './blog-editor.prompt';
+import { buildEditorMessage, buildEditorPrompt, editorKind } from './blog-editor.prompt';
 
 const relayMock = (reply: string) => ({ ask: jest.fn().mockResolvedValue(reply) });
 const topicsMock = () => ({ recentTitles: jest.fn().mockResolvedValue(['Старый пост']) });
@@ -120,8 +120,8 @@ describe('промпт кейса', () => {
 describe('ответ редактора — всегда JSON', () => {
   const flat = (s: string) => s.replace(/\s+/g, ' ');
 
-  it.each(['news', 'case'] as const)('%s: всегда JSON, без встречных вопросов; мало данных — короче', (rubric) => {
-    const p = flat(buildEditorPrompt(rubric, []));
+  it.each(['news', 'case', 'real'] as const)('%s: всегда JSON, без встречных вопросов; мало данных — короче', (kind) => {
+    const p = flat(buildEditorPrompt(kind, []));
     expect(p).toMatch(/всегда JSON/i);
     expect(p).toMatch(/никаких встречных вопросов/i);
     expect(p).toMatch(/данных мало — пиши короче, по тому, что есть/i);
@@ -162,6 +162,192 @@ describe('buildEditorMessage', () => {
   it('порядок замечаний сохраняется — от раннего к свежему', () => {
     const m = buildEditorMessage('k', null, ['ПЕРВОЕ', 'ВТОРОЕ']);
     expect(m.indexOf('ПЕРВОЕ')).toBeLessThan(m.indexOf('ВТОРОЕ'));
+  });
+});
+
+/**
+ * Реальный кейс — правда, а не выдумка: владелец приносит историю, и редактор
+ * обязан её пересказать, а не сочинить новую. Прежний промпт знал только
+ * выдумку, и реальная история владельца превратилась бы в очередную «Лену».
+ */
+describe('промпт реального кейса', () => {
+  const flat = (s: string) => s.replace(/\s+/g, ' ');
+  const REAL = () => flat(buildEditorPrompt('real', ['Как мы рисовали логотип']));
+
+  it('отличается от промптов новости и выдуманного кейса', () => {
+    expect(buildEditorPrompt('real', [])).not.toBe(buildEditorPrompt('case', []));
+    expect(buildEditorPrompt('real', [])).not.toBe(buildEditorPrompt('news', []));
+  });
+
+  it('не велит выдумывать и запрещает помечать историю придуманной', () => {
+    const p = REAL();
+    expect(p).not.toMatch(/вымышлен/i);
+    expect(p).not.toMatch(/придумай/i);
+    expect(p).toMatch(/не пиши, что история придумана/i);
+  });
+
+  it('пишет только по материалу и не додумывает', () => {
+    const p = REAL();
+    expect(p).toMatch(/только то, что есть в материале/i);
+    expect(p).toMatch(/не добавляй деталей, чисел, сроков/i);
+  });
+
+  it('герой и рассказчик — как в материале, и уже из первого абзаца видно, чья это история', () => {
+    const p = REAL();
+    expect(p).toMatch(/ровно как в материале/i);
+    expect(p).toMatch(/из первого абзаца/i);
+  });
+
+  it('строит пост вокруг сути, если она названа', () => {
+    expect(REAL()).toMatch(/строй пост вокруг/i);
+  });
+
+  it('не переносит персональные данные и не называет чужие организации', () => {
+    const p = REAL();
+    expect(p).toMatch(/ИНН/);
+    expect(p).toMatch(/даже если они есть в материале/i);
+    expect(p).toMatch(/по названию не называй никого/i);
+    expect(p).toMatch(/номера счетов/i);
+    expect(p).toMatch(/госномер/i);
+  });
+
+  it('не обобщает до обещания', () => {
+    expect(REAL()).toMatch(/не обобщай до обещания/i);
+  });
+
+  it('статистику и популярность запрещает, как и выдуманный кейс', () => {
+    expect(REAL()).toMatch(/никогда не упоминай статистику/i);
+  });
+
+  it('не дописывает финал за героя', () => {
+    expect(REAL()).toMatch(/не дописывай финал/i);
+  });
+
+  // Роман — универсальный ассистент, а первые истории — про налоги и страховку:
+  // без запрета редактор назвал бы его юристом — ложный факт в посте «из жизни».
+  it('не даёт ассистенту специальности сверх материала', () => {
+    expect(REAL()).toMatch(/не давай ему специальности/i);
+    expect(REAL()).toMatch(/о linkeon пиши не больше/i);
+  });
+
+  // Замечание владельца к реальному кейсу чаще всего и есть факт («не так было…»).
+  it('правка главного редактора — тоже материал', () => {
+    expect(REAL()).toMatch(/правка главного редактора[^.]*тоже материал/i);
+  });
+
+  it('при сокращении оставляет главное и ничего не добавляет', () => {
+    const p = REAL();
+    expect(p).toMatch(/сокращай, а не пересказывай всё подряд/i);
+    expect(p).toMatch(/выбрасывать можно, добавлять нельзя/i);
+  });
+
+  it('если материал молчит о лице рассказа — третье лицо', () => {
+    expect(REAL()).toMatch(/пиши от третьего лица/i);
+  });
+
+  it('суть строит пост, даже если похожая мысль в канале уже была', () => {
+    expect(REAL()).toMatch(/даже если похожая мысль уже была в канале/i);
+  });
+
+  // Рядом с подписью «Дмитрий, основатель Linkeon» сгенерированный человек
+  // выглядел бы как его фото — та же подмена выдуманного реальным.
+  it('правила касаются и заголовка, а на картинке нет узнаваемого героя', () => {
+    const p = REAL();
+    expect(p).toMatch(/касается и заголовка/i);
+    expect(p).toMatch(/не рисуй героя узнаваемым человеком/i);
+  });
+
+  // Если материал героя не называет, правило «чья она» толкало бы модель
+  // придумать имя.
+  it('чья история — только если материал это называет', () => {
+    expect(REAL()).toMatch(/если материал это называет/i);
+  });
+
+  it('«объясни продукт с нуля» для реального кейса — одна фраза', () => {
+    expect(REAL()).toMatch(/для реального кейса это одна фраза/i);
+  });
+});
+
+describe('buildEditorPrompt — незнакомый kind', () => {
+  it('незнакомый kind — выдуманный кейс, а не «undefined» в тексте промпта', () => {
+    const p = buildEditorPrompt('bogus' as any, []);
+    expect(p).toContain('Рубрика: КЕЙС');
+    expect(p).not.toContain('undefined');
+  });
+});
+
+/**
+ * Правило «не ссылайся на реальных пользователей» жило в общем блоке — то есть
+ * и в промпте реального кейса, где оно спорило бы с самой задачей.
+ */
+describe('правило про реальных пользователей', () => {
+  const flat = (s: string) => s.replace(/\s+/g, ' ');
+
+  it.each(['news', 'case'] as const)('%s: по-прежнему запрещает ссылаться на реальных пользователей', (kind) => {
+    expect(flat(buildEditorPrompt(kind, []))).toMatch(/не ссылайся на реальных пользователей/i);
+  });
+
+  it('real: такого запрета нет — история и есть реальная', () => {
+    expect(flat(buildEditorPrompt('real', []))).not.toMatch(/не ссылайся на реальных пользователей/i);
+  });
+
+  it.each(['news', 'case', 'real'] as const)('%s: выдуманное за реальное не выдавать', (kind) => {
+    expect(flat(buildEditorPrompt(kind, []))).toMatch(/не выдавай выдуманное за реальное/i);
+  });
+});
+
+describe('editorKind', () => {
+  it('новость — новость, откуда бы она ни пришла', () => {
+    expect(editorKind('news', 'git')).toBe('news');
+    expect(editorKind('news', 'manual')).toBe('news');
+    expect(editorKind('news', 'real')).toBe('news');
+  });
+
+  it('кейс с источником real — реальный кейс', () => {
+    expect(editorKind('case', 'real')).toBe('real');
+  });
+
+  it('прочие кейсы — выдуманные, как и раньше', () => {
+    expect(editorKind('case', 'stats')).toBe('case');
+    expect(editorKind('case', 'manual')).toBe('case');
+  });
+
+  // Старые строки и моки без source — выдуманный кейс, как было до реальных.
+  it('кейс без источника — выдуманный', () => {
+    expect(editorKind('case', undefined as any)).toBe('case');
+  });
+});
+
+describe('buildEditorMessage для реального кейса', () => {
+  const STORY = 'Рассказчик — Дмитрий, основатель Linkeon. Роман разобрал полис КАСКО.';
+  const KEY = 'реальный-кейс-0123456789ab';
+
+  it('материал подан как материал, а не как подсказка', () => {
+    const m = buildEditorMessage(KEY, STORY, [], 'real');
+    expect(m).toContain('Материал реального кейса');
+    expect(m).toContain(STORY);
+    expect(m).not.toMatch(/Подсказка от источника/);
+  });
+
+  it('хеш-ключ темы редактору не показывается — он ни о чём не говорит', () => {
+    expect(buildEditorMessage(KEY, STORY, [], 'real')).not.toContain('0123456789ab');
+  });
+
+  it('замечания владельца доезжают и до реального кейса', () => {
+    const m = buildEditorMessage(KEY, STORY, ['короче'], 'real');
+    expect(m).toContain('короче');
+    expect(m.replace(/\s+/g, ' ')).toMatch(/главного редактора/i);
+  });
+
+  it('без kind — прежнее поведение', () => {
+    expect(buildEditorMessage('аренда', 'про аренду', [])).toContain('Подсказка от источника: про аренду');
+  });
+
+  // COMMON велит отвечать постом «в любом случае» — без материала это приказ
+  // сочинить реальную историю из ничего. Пусть пост уйдёт в failed с причиной.
+  it('реальный кейс без материала — ошибка, а не пост из ничего', () => {
+    expect(() => buildEditorMessage(KEY, null, [], 'real')).toThrow(/нет материала/);
+    expect(() => buildEditorMessage(KEY, '   ', [], 'real')).toThrow(/нет материала/);
   });
 });
 
@@ -209,5 +395,45 @@ describe('BlogEditorService', () => {
     await svc.draft({ ...POST, editorNotes: [] });
 
     expect(String(relay.ask.mock.calls[0][1])).not.toMatch(/главного редактора/i);
+  });
+
+  it('реальный кейс уходит редактору с правилами реального кейса и материалом', async () => {
+    const relay = relayMock('{"title":"З","body":"Т","imagePrompt":"с"}');
+    const svc = new BlogEditorService(relay as any, topicsMock() as any);
+
+    await svc.draft({
+      ...POST, source: 'real', topicKey: 'реальный-кейс-0123456789ab',
+      topicHint: 'Рассказчик — Дмитрий, основатель Linkeon.', editorNotes: [],
+    });
+
+    const [systemPrompt, message] = relay.ask.mock.calls[0];
+    expect(String(systemPrompt)).toMatch(/РЕАЛЬНЫЙ КЕЙС/);
+    expect(String(message)).toContain('Материал реального кейса');
+    // Материал и есть весь пост: до релея обязан доехать сам текст, а не только заголовок блока.
+    expect(String(message)).toContain('Рассказчик — Дмитрий, основатель Linkeon.');
+  });
+
+  it('кейс из статистики по-прежнему пишется выдумкой', async () => {
+    const relay = relayMock('{"title":"З","body":"Т","imagePrompt":"с"}');
+    const svc = new BlogEditorService(relay as any, topicsMock() as any);
+
+    await svc.draft({ ...POST, source: 'stats', editorNotes: [] });
+
+    const systemPrompt = String(relay.ask.mock.calls[0][0]).replace(/\s+/g, ' ');
+    expect(systemPrompt).not.toMatch(/РЕАЛЬНЫЙ КЕЙС/);
+    expect(systemPrompt).toMatch(/История вымышленная/);
+  });
+
+  // Рубрика в вызове editorKind тоже на счету: без неё новость молча получила
+  // бы правила выдуманного кейса — «Придумай короткую узнаваемую историю».
+  it('новость по-прежнему пишется по правилам новости', async () => {
+    const relay = relayMock('{"title":"З","body":"Т","imagePrompt":"с"}');
+    const svc = new BlogEditorService(relay as any, topicsMock() as any);
+
+    await svc.draft({ ...POST, rubric: 'news', source: 'git', editorNotes: [] });
+
+    const systemPrompt = String(relay.ask.mock.calls[0][0]);
+    expect(systemPrompt).toMatch(/Рубрика: НОВИНКА/);
+    expect(systemPrompt).not.toMatch(/Рубрика: КЕЙС|РЕАЛЬНЫЙ КЕЙС/);
   });
 });

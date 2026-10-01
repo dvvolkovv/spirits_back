@@ -185,6 +185,50 @@ describe('BlogController', () => {
       .rejects.toBeInstanceOf(BadRequestException);
     expect(d.topics.addTopic).not.toHaveBeenCalled();
   });
+
+  describe('add_topic: реальный кейс', () => {
+    const STORY = 'Рассказчик — Дмитрий, основатель Linkeon. Роман прочитал полис КАСКО целиком.';
+
+    it('заводит тему источника real: материал целиком, ключ по хешу', async () => {
+      const d = deps(); const r = res();
+      await make(d).action({ action: 'add_topic', kind: 'real', topic: `  ${STORY}  ` }, r);
+      expect(d.topics.addTopic).toHaveBeenCalledWith({
+        rubric: 'case', source: 'real', topicHint: STORY,
+        topicKey: expect.stringMatching(/^реальный-кейс-[0-9a-f]{12}$/),
+      });
+      expect(r.status).toHaveBeenCalledWith(200);
+    });
+
+    it('рубрику из запроса не слушает: реальный кейс всегда кейс', async () => {
+      const d = deps(); const r = res();
+      await make(d).action({ action: 'add_topic', kind: 'real', rubric: 'news', topic: STORY }, r);
+      expect(d.topics.addTopic).toHaveBeenCalledWith(expect.objectContaining({ rubric: 'case', source: 'real' }));
+    });
+
+    it('короткая история — 400 с объяснением, тема не заводится', async () => {
+      const d = deps(); const r = res();
+      const call = make(d).action({ action: 'add_topic', kind: 'real', topic: 'кейс про налоговую' }, r);
+      await expect(call).rejects.toBeInstanceOf(BadRequestException);
+      await expect(call).rejects.toThrow(/хотя бы 40 знаков/);
+      expect(d.topics.addTopic).not.toHaveBeenCalled();
+    });
+
+    it('повтор той же истории — 200 со skipped, как у обычной темы', async () => {
+      const d = deps(); const r = res();
+      d.topics.addTopic.mockResolvedValueOnce(null);
+      await make(d).action({ action: 'add_topic', kind: 'real', topic: STORY }, r);
+      expect(r.json).toHaveBeenCalledWith({ skipped: 'такую историю уже заводили за последние 90 дней' });
+    });
+
+    // Опечатка в kind («Real») молча увела бы реальную историю в выдуманный кейс —
+    // ровно то, от чего вся затея. Незнакомый kind — 400, а не прежний путь.
+    it('незнакомый kind — 400, тема не заводится', async () => {
+      const d = deps(); const r = res();
+      await expect(make(d).action({ action: 'add_topic', kind: 'Real', topic: STORY }, r))
+        .rejects.toBeInstanceOf(BadRequestException);
+      expect(d.topics.addTopic).not.toHaveBeenCalled();
+    });
+  });
 });
 
 /**

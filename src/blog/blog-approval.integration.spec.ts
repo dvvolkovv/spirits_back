@@ -4,7 +4,7 @@ import axios from 'axios';
 import { Client, Pool } from 'pg';
 import { BlogApprovalService } from './blog-approval.service';
 import { BlogPublisherService } from './blog-publisher.service';
-import { BlogTopicService, STALE_DRAFTING_MINUTES } from './blog-topic.service';
+import { BlogTopicService, STALE_DRAFTING_MINUTES, TG_SOURCE_REF_INDEX } from './blog-topic.service';
 import { BlogController } from './blog.controller';
 import { BlogCron } from './blog.cron';
 import { upcomingSlots } from './blog-slots';
@@ -157,6 +157,7 @@ maybe('Замечание к посту против живого Postgres', () 
       { query: (sql: string, params?: any[]) => pool.query(sql, params) } as any,
       tg as any,
       { get: jest.fn() } as any,
+      {} as any, // topics — замечаниям не нужен
     );
   });
 
@@ -440,7 +441,7 @@ maybe('Один пост на слот против живого Postgres', () =
   const make = () => {
     const pg = gatedPg(pool);
     const tg = fakeTg();
-    const bot = new BlogApprovalService(pg as any, tg as any, settings);
+    const bot = new BlogApprovalService(pg as any, tg as any, settings, {} as any);
     const publisher = new BlogPublisherService(pg as any, tg as any, settings);
     const admin = new BlogController(
       pg as any, { addTopic: jest.fn() } as any, settings, { render: jest.fn() } as any, publisher, bot,
@@ -789,7 +790,7 @@ maybe('Очередь без дыр против живого Postgres', () => {
     const pg = gatedPg(pool);
     const tg = fakeTg();
     tg.sendPhoto.mockImplementation(async (chatId: number) => ({ message_id: 42, chat: { id: chatId, username: 'linkeon_blog' } }));
-    const bot = new BlogApprovalService(pg as any, tg as any, settings);
+    const bot = new BlogApprovalService(pg as any, tg as any, settings, {} as any);
     const publisher = new BlogPublisherService(pg as any, tg as any, settings);
     const admin = new BlogController(
       pg as any, { addTopic: jest.fn() } as any, settings, { render: jest.fn() } as any, publisher, bot,
@@ -1246,5 +1247,175 @@ maybe('Темы кейсов против живого Postgres', () => {
     await say(`${REAL_PHONE}_10`, 10, 3);
 
     expect((await top(2)).map((a) => a.agentName)).toEqual(['Кира', 'Оля']);
+  });
+});
+
+/**
+ * Реальный кейс (005_real_case_source.sql): история владельца — это пост
+ * рубрики case с источником real. Проверка источника в базе — CHECK, и
+ * заглушка его не воспроизведёт.
+ */
+maybe('Реальный кейс против живого Postgres', () => {
+  jest.setTimeout(60_000);
+
+  let pool: Pool;
+  let ours = false;
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: PG, max: 2 });
+    await prepareDisposableDb(pool);
+    ours = true;
+  });
+
+  afterAll(async () => {
+    if (ours) await pool.query('TRUNCATE blog_post');
+    await pool?.end();
+  });
+
+  beforeEach(async () => {
+    await pool.query('TRUNCATE blog_post');
+  });
+
+  // Все допустимые источники, а не только новый: перепись CHECK с опечаткой в
+  // старом значении иначе прошла бы тесты, а темы из бэклога пропадали бы
+  // молча — backlog.service ловит ошибку вставки и пишет только warn.
+  it.each(['backlog', 'git', 'stats', 'manual', 'real'])('источник %s база принимает', async (source) => {
+    await pool.query(
+      `INSERT INTO blog_post (rubric, source, topic_key) VALUES ('case', $1, 'k')`,
+      [source],
+    );
+    const r = await pool.query(`SELECT count(*)::int AS n FROM blog_post WHERE source = $1`, [source]);
+    expect(r.rows[0].n).toBe(1);
+  });
+
+  it('неизвестный источник база по-прежнему не пускает', async () => {
+    await expect(pool.query(
+      `INSERT INTO blog_post (rubric, source, topic_key) VALUES ('case', 'bogus', 'k')`,
+    )).rejects.toThrow(/blog_post_source_check/);
+  });
+
+  // prepareDisposableDb катит все миграции в каждом блоке файла заново —
+  // повторный прогон для неё штатный путь, а не краевой случай.
+  it('миграция переживает повторный прогон', async () => {
+    const sql = fs.readFileSync(path.join(__dirname, 'migrations', '005_real_case_source.sql'), 'utf8');
+    await pool.query(sql);
+    await pool.query(sql);
+
+    // Повтор не должен ни плодить второе ограничение, ни терять единственное.
+    const c = await pool.query(
+      `SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint
+        WHERE conrelid = 'blog_post'::regclass AND contype = 'c'
+          AND pg_get_constraintdef(oid) LIKE '%source%'`,
+    );
+    expect(c.rows.map((x: any) => x.conname)).toEqual(['blog_post_source_check']);
+    expect(c.rows[0].def).toContain("'real'");
+  });
+
+  // Порядок — дело ORDER BY в живой базе: заглушка вернула бы что подложили.
+  it('очередь тем: новость, потом реальные кейсы по давности, потом синтетический — даже более старый', async () => {
+    const add = (rubric: string, source: string, key: string, minutesAgo: number) => pool.query(
+      `INSERT INTO blog_post (rubric, source, topic_key, created_at)
+       VALUES ($1, $2, $3, now() - ($4 || ' minutes')::interval)`,
+      [rubric, source, key, minutesAgo],
+    );
+    await add('case', 'stats', 'синтетика', 30);
+    await add('case', 'real', 'реальный-старый', 25);
+    await add('case', 'real', 'реальный-новый', 20);
+    await add('news', 'git', 'новость', 10);
+
+    const topics = new BlogTopicService({ query: (sql: string, params?: any[]) => pool.query(sql, params) } as any);
+
+    expect((await topics.takeNextIdea())?.topicKey).toBe('новость');
+    await pool.query(`DELETE FROM blog_post WHERE topic_key = 'новость'`);
+    expect((await topics.takeNextIdea())?.topicKey).toBe('реальный-старый');
+    await pool.query(`DELETE FROM blog_post WHERE topic_key = 'реальный-старый'`);
+    expect((await topics.takeNextIdea())?.topicKey).toBe('реальный-новый');
+    await pool.query(`DELETE FROM blog_post WHERE topic_key = 'реальный-новый'`);
+    expect((await topics.takeNextIdea())?.topicKey).toBe('синтетика');
+  });
+
+  // Бот уже ответил владельцу «перепишу к следующему тику»: запрошенная
+  // переработка (drafting с пустой отметкой) идёт раньше любой новой темы,
+  // кроме новости, — даже раньше реального кейса.
+  it('запрошенная переработка идёт раньше реального кейса', async () => {
+    await pool.query(
+      `INSERT INTO blog_post (rubric, source, topic_key, status, created_at)
+       VALUES ('case', 'stats', 'переработка', 'drafting', now() - interval '1 day')`,
+    );
+    await pool.query(
+      `INSERT INTO blog_post (rubric, source, topic_key, created_at)
+       VALUES ('case', 'real', 'реальный', now() - interval '5 minutes')`,
+    );
+    const topics = new BlogTopicService({ query: (sql: string, params?: any[]) => pool.query(sql, params) } as any);
+    expect((await topics.takeNextIdea())?.topicKey).toBe('переработка');
+  });
+
+  // Вся цепочка на живой базе: команда, тема, ключ по сообщению. Правка
+  // принятого /case не заводит второй кейс, а одновременная пара — сообщение и
+  // его правка пачкой после рестарта — тоже: её разводит уникальный индекс.
+  it('/case: правка принятого и одновременная пара дают один кейс', async () => {
+    const OWNER = 37948399;
+    const old = process.env.BLOG_APPROVER_TG_ID;
+    process.env.BLOG_APPROVER_TG_ID = String(OWNER);
+    try {
+      const db = { query: (sql: string, params?: any[]) => pool.query(sql, params) } as any;
+      const tg = { sendMessage: jest.fn().mockResolvedValue({ message_id: 1 }) };
+      const svc = new BlogApprovalService(db, tg as any, { get: jest.fn() } as any, new BlogTopicService(db));
+      const msg = (id: number, text: string, edit = false) => ({
+        text, message_id: id, from: { id: OWNER }, chat: { id: OWNER, type: 'private' }, ...(edit ? { edit_date: 1 } : {}),
+      });
+      const story = (s: string) => `/case Рассказчик — Дмитрий, основатель Linkeon. ${s}`;
+
+      await svc.handleCaseCommand(msg(10, story('Роман прочитал полис КАСКО целиком.')));
+      await svc.handleCaseCommand(msg(10, story('Роман прочитал полис КАСКО целиком, все правила.'), true));
+
+      // Барьер: обе вставки ждут, пока оба вызова не прочтут source_ref, — так
+      // гонка воспроизводится всегда, а не когда повезёт со временем. Считаем
+      // по ЗАВЕРШЕНИЮ SELECT, а не по его отправке: второй вызов может ждать
+      // второе соединение пула, и пока оно устанавливается, первый успевает
+      // дойти до INSERT — «отправлены оба» тогда перестаёт означать
+      // «прочитаны оба раньше первой записи».
+      let reads = 0;
+      let release!: () => void;
+      const bothRead = new Promise<void>((r) => { release = r; });
+      const racing = {
+        query: async (sql: string, params?: any[]) => {
+          const s = String(sql);
+          const isSelRef = /SELECT\s+id\s+FROM\s+blog_post\s+WHERE\s+source_ref\s*=\s*\$1/.test(s);
+          if (/INSERT INTO blog_post/.test(s)) await bothRead;
+          const r = await pool.query(sql, params);
+          if (isSelRef && ++reads === 2) release();
+          return r;
+        },
+      } as any;
+      const racingTg = { sendMessage: jest.fn().mockResolvedValue({ message_id: 2 }) };
+      const racingSvc = new BlogApprovalService(racing, racingTg as any, { get: jest.fn() } as any, new BlogTopicService(racing));
+
+      await Promise.all([
+        racingSvc.handleCaseCommand(msg(11, story('Роман разобрал ответ налоговой.'))),
+        racingSvc.handleCaseCommand(msg(11, story('Роман разобрал ответ налоговой и бланки.'), true)),
+      ]);
+
+      const r = await pool.query(`SELECT source_ref, count(*)::int AS n FROM blog_post GROUP BY source_ref ORDER BY source_ref`);
+      expect(r.rows).toEqual([
+        { source_ref: `tg:${OWNER}:10`, n: 1 },
+        { source_ref: `tg:${OWNER}:11`, n: 1 },
+      ]);
+
+      // Проигравший не должен узнать об ошибке базы: addTopic ловит именно
+      // этот индекс по имени (TG_SOURCE_REF_INDEX) и отвечает как на обычный
+      // повтор. Если индекс в базе переименуют, а константу не поправят,
+      // catch перестанет совпадать, ошибка уйдёт наверх, и владелец увидит
+      // «Не завёл реальный кейс: duplicate key…» — проверка ниже это ловит.
+      for (const [, text] of racingTg.sendMessage.mock.calls) expect(String(text)).not.toMatch(/^Не завёл реальный кейс/);
+
+      // Имя в константе должно совпадать с именем индекса в базе — иначе
+      // проверка выше прошла бы случайно (гонка не воспроизвелась) и ничего
+      // бы не поймала.
+      const idx = await pool.query('SELECT 1 FROM pg_indexes WHERE indexname = $1', [TG_SOURCE_REF_INDEX]);
+      expect(idx.rows).toHaveLength(1);
+    } finally {
+      if (old === undefined) delete process.env.BLOG_APPROVER_TG_ID; else process.env.BLOG_APPROVER_TG_ID = old;
+    }
   });
 });
