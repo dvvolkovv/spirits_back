@@ -53,7 +53,7 @@ describe('BlogApprovalService.sendForReview', () => {
   it('черновик уходит владельцу байтами, а не ссылкой', async () => {
     const pg = reviewPg();
     const tg = { sendPhoto: jest.fn().mockResolvedValue({ message_id: 55 }), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     await svc.sendForReview(draft() as any, 77);
 
@@ -70,7 +70,7 @@ describe('BlogApprovalService.sendForReview', () => {
   it('координаты сообщения запоминаются — иначе правка реплаем не найдёт пост', async () => {
     const pg = reviewPg();
     const tg = { sendPhoto: jest.fn().mockResolvedValue({ message_id: 55 }), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     await svc.sendForReview(draft() as any, 77);
 
@@ -90,7 +90,7 @@ describe('BlogApprovalService.sendForReview', () => {
     (axios.get as jest.Mock).mockRejectedValue(new Error('ECONNREFUSED'));
     const pg = reviewPg();
     const tg = { sendPhoto: jest.fn(), sendMessage: jest.fn().mockResolvedValue({ message_id: 56 }) };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     await svc.sendForReview(draft() as any, 77);
 
@@ -108,7 +108,7 @@ describe('BlogApprovalService.sendForReview', () => {
     (axios.get as jest.Mock).mockRejectedValue(new Error('ECONNREFUSED'));
     const pg = reviewPg();
     const tg = { sendPhoto: jest.fn(), sendMessage: jest.fn().mockRejectedValue(new Error('bot was blocked')) };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     await expect(svc.sendForReview(draft() as any, 77)).rejects.toThrow('bot was blocked');
     expect(pg.query).not.toHaveBeenCalled();
@@ -133,7 +133,7 @@ describe('BlogApprovalService.handleCallback', () => {
     pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const settings = { get: jest.fn().mockResolvedValue({ channelChatId: '-100', slotDays: [1, 3, 5], slotHourMsk: 10, imageStyle: '' }) };
-    const svc = new BlogApprovalService(pg as any, tg as any, settings as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, settings as any, {} as any);
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:ok:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
 
@@ -161,7 +161,7 @@ describe('BlogApprovalService.handleCallback', () => {
     pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const settings = { get: jest.fn().mockResolvedValue({ channelChatId: '-100', slotDays: [1, 3, 5], slotHourMsk: 10, imageStyle: '' }) };
-    const svc = new BlogApprovalService(pg as any, tg as any, settings as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, settings as any, {} as any);
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:ok:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
 
@@ -184,7 +184,7 @@ describe('BlogApprovalService.handleCallback', () => {
     // «воскресенье» — самое длинное название дня недели; единственный слот в неделе,
     // чтобы гарантированно получить именно его, а не «сегодня»/«завтра».
     const settings = { get: jest.fn().mockResolvedValue({ channelChatId: '-100', slotDays: [7], slotHourMsk: 10, imageStyle: '' }) };
-    const svc = new BlogApprovalService(pg as any, tg as any, settings as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, settings as any, {} as any);
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:ok:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
 
@@ -197,7 +197,7 @@ describe('BlogApprovalService.handleCallback', () => {
     const pg = { query: jest.fn().mockResolvedValueOnce({ rows: [rawRow({ status: 'published' })] }) };
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const settings = { get: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, settings as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, settings as any, {} as any);
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:ok:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
 
@@ -213,7 +213,7 @@ describe('BlogApprovalService.handleCallback', () => {
     const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValue({ rows: [rawRow()] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:no:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
     expect(updates(pg)[0][0]).toContain("status = 'rejected'");
@@ -223,7 +223,7 @@ describe('BlogApprovalService.handleCallback', () => {
     const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValue({ rows: [rawRow()] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:redo:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
     expect(updates(pg)[0][0]).toContain("status = 'drafting'");
@@ -239,7 +239,7 @@ describe('BlogApprovalService.handleCallback', () => {
     const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValue({ rows: [rawRow()] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:redo:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
     expect(String(updates(pg)[0][0])).toMatch(/drafting_started_at = NULL/i);
@@ -254,7 +254,7 @@ describe('BlogApprovalService.handleCallback', () => {
     const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValue({ rows: [rawRow({ editor_notes: ['объясни, что такое продукт'] })] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:redo:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
     // Запись обязана БЫТЬ — иначе «не содержит» прошло бы на пустом месте. Рядом
@@ -269,7 +269,7 @@ describe('BlogApprovalService.handleCallback', () => {
     const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValue({ rows: [rawRow({ editor_notes: ['объясни'] })] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:no:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
     expect(String(updates(pg)[0][0])).toContain("editor_notes = '{}'");
@@ -281,7 +281,7 @@ describe('BlogApprovalService.handleCallback', () => {
     // увести его в approved повторно — машина такого перехода не знает.
     pg.query.mockResolvedValueOnce({ rows: [rawRow({ status: 'approved' })] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     await svc.handleCallback({ id: 'cb1', data: 'blog:ok:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
 
@@ -291,7 +291,7 @@ describe('BlogApprovalService.handleCallback', () => {
   it('чужой callback игнорируется полностью', async () => {
     const pg = withTx({ query: jest.fn() });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     const handled = await svc.handleCallback({ id: 'cb1', data: 'agent:xyz', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 } });
     expect(handled).toBe(false);
@@ -406,7 +406,7 @@ describe('BlogApprovalService.handleCallback — «Опубликовать» и
     const pg = slotPg(posts);
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
     const settings = { get: jest.fn().mockResolvedValue({ channelChatId: '-100', slotDays: [1, 3, 5], slotHourMsk: 10, imageStyle: '' }) };
-    const svc = new BlogApprovalService(pg as any, tg as any, settings as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, settings as any, {} as any);
     const ok = (id: string) => svc.handleCallback({
       id: `cb-${id}`, data: `blog:ok:${id}`, from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 },
     });
@@ -515,7 +515,7 @@ describe('BlogApprovalService.handleCallback — «Замечание»', () => 
       answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(),
       sendMessage: jest.fn().mockResolvedValue({ message_id: 55 }),
     };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
     return { pg, tg, svc };
   };
 
@@ -630,7 +630,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
     const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     const handled = await svc.handleReplyEdit(reply());
 
@@ -645,7 +645,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
     const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     await svc.handleReplyEdit(reply());
 
@@ -657,7 +657,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
     const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     await svc.handleReplyEdit(reply());
 
@@ -675,7 +675,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
       .mockResolvedValueOnce({ rows: [rawRow({ editor_notes: ['объясни, что такое продукт'] })] })
       .mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     await svc.handleReplyEdit(reply({ text: 'и короче' }));
 
@@ -686,7 +686,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
     const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [rawRow()] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     await svc.handleReplyEdit(reply());
 
@@ -704,7 +704,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
     const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [rawRow({ status: 'published' })] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     const handled = await svc.handleReplyEdit(reply());
 
@@ -731,7 +731,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
     const pg = withTx({ query: jest.fn() });
     pg.query.mockResolvedValueOnce({ rows: [rawRow({ status })] }).mockResolvedValue({ rows: [] });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     expect(await svc.handleReplyEdit(reply())).toBe(true);
 
@@ -754,7 +754,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
       answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(),
       sendMessage: jest.fn().mockResolvedValue({ message_id: 61 }),
     };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     const handled = await svc.handleReplyEdit({
       chat: { id: 77 }, message_id: 60, voice: { file_id: 'v1', duration: 4 }, reply_to_message: { message_id: 12 },
@@ -773,7 +773,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
   it('реплай на чужое сообщение не перехватывается — текст уйдёт ассистенту', async () => {
     const pg = { query: jest.fn().mockResolvedValueOnce({ rows: [] }) };
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     const handled = await svc.handleReplyEdit({
       chat: { id: 77 }, text: 'Привет', reply_to_message: { message_id: 999 },
@@ -784,7 +784,7 @@ describe('BlogApprovalService.handleReplyEdit', () => {
   it('обычное сообщение без реплая не перехватывается', async () => {
     const pg = withTx({ query: jest.fn() });
     const tg = { answerCallbackQuery: jest.fn(), editMessageText: jest.fn(), sendPhoto: jest.fn(), sendMessage: jest.fn() };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
 
     const handled = await svc.handleReplyEdit({ chat: { id: 77 }, text: 'Привет' });
     expect(handled).toBe(false);
@@ -855,7 +855,7 @@ describe('кнопка → приглашение → ответ (Postgres в м
         return { message_id: id };
       }),
     };
-    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any);
+    const svc = new BlogApprovalService(pg as any, tg as any, { get: jest.fn() } as any, {} as any);
     const press = () => svc.handleCallback({
       id: 'cb', data: 'blog:note:p1', from: { id: 77 }, message: { chat: { id: 77 }, message_id: 12 },
     });
@@ -895,5 +895,118 @@ describe('кнопка → приглашение → ответ (Postgres в м
 
     expect(pg.row.editor_notes).toEqual(['объясни, что такое продукт']);   // не дописано
     expect(sent[0].text).toMatch(/переписывается/);
+  });
+});
+
+/**
+ * `/case <история>` в личке — реальный кейс в блог. Команда владельца блога и
+ * только его: чужой `/case` блог не трогает, и бот отвечает на него как на
+ * любую неизвестную команду.
+ */
+describe('handleCaseCommand: реальный кейс командой в личке', () => {
+  const OWNER = 37948399;
+  const STORY = 'Рассказчик — Дмитрий, основатель Linkeon. Роман прочитал полис КАСКО целиком.';
+  const OLD = process.env.BLOG_APPROVER_TG_ID;
+
+  beforeEach(() => { process.env.BLOG_APPROVER_TG_ID = String(OWNER); });
+  afterEach(() => {
+    if (OLD === undefined) delete process.env.BLOG_APPROVER_TG_ID;
+    else process.env.BLOG_APPROVER_TG_ID = OLD;
+  });
+
+  const setup = (addTopic: jest.Mock = jest.fn().mockResolvedValue({ id: 'new' })) => {
+    const tg = { sendMessage: jest.fn().mockResolvedValue({ message_id: 1 }) };
+    const topics = { addTopic };
+    const svc = new BlogApprovalService({ query: jest.fn() } as any, tg as any, { get: jest.fn() } as any, topics as any);
+    return { svc, tg, topics };
+  };
+  const dm = (text: string, from = OWNER) => ({
+    text, message_id: 501, from: { id: from }, chat: { id: from, type: 'private' },
+  });
+
+  it('владелец заводит кейс: источник real, история как написана, одно сообщение — один кейс', async () => {
+    const { svc, tg, topics } = setup();
+    expect(await svc.handleCaseCommand(dm(`/case ${STORY}`))).toBe(true);
+    expect(topics.addTopic).toHaveBeenCalledWith(expect.objectContaining({
+      rubric: 'case', source: 'real', topicHint: STORY,
+      sourceRef: `tg:${OWNER}:501`, onceBySourceRef: true,
+    }));
+    expect(tg.sendMessage).toHaveBeenCalledWith(OWNER, expect.stringContaining('Принял реальный кейс'));
+  });
+
+  it('чужой /case — не наш: ни темы, ни ответа от блога', async () => {
+    const { svc, tg, topics } = setup();
+    expect(await svc.handleCaseCommand(dm(`/case ${STORY}`, 42))).toBe(false);
+    expect(topics.addTopic).not.toHaveBeenCalled();
+    expect(tg.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('без BLOG_APPROVER_TG_ID команда ничья', async () => {
+    delete process.env.BLOG_APPROVER_TG_ID;
+    const { svc, topics } = setup();
+    expect(await svc.handleCaseCommand(dm(`/case ${STORY}`))).toBe(false);
+    expect(topics.addTopic).not.toHaveBeenCalled();
+  });
+
+  it('другие команды и обычный текст — не наши', async () => {
+    const { svc } = setup();
+    expect(await svc.handleCaseCommand(dm('/help'))).toBe(false);
+    expect(await svc.handleCaseCommand(dm(STORY))).toBe(false);
+  });
+
+  it('пустая и короткая история — объяснение, как писать, тема не заводится', async () => {
+    const { svc, tg, topics } = setup();
+    expect(await svc.handleCaseCommand(dm('/case'))).toBe(true);
+    expect(await svc.handleCaseCommand(dm('/case кейс про налоговую'))).toBe(true);
+    expect(topics.addTopic).not.toHaveBeenCalled();
+    expect(tg.sendMessage).toHaveBeenCalledTimes(2);
+    for (const [, text] of tg.sendMessage.mock.calls) {
+      expect(text).toMatch(/\/case/);
+      expect(text).toMatch(/40 знаков/);
+    }
+  });
+
+  it('повтор — владелец узнаёт, что такую историю уже заводили', async () => {
+    const { svc, tg } = setup(jest.fn().mockResolvedValue(null));
+    await svc.handleCaseCommand(dm(`/case ${STORY}`));
+    expect(tg.sendMessage).toHaveBeenCalledWith(OWNER, expect.stringContaining('уже заводили'));
+  });
+
+  it('сбой базы — владельцу причина, а не молчание', async () => {
+    const { svc, tg } = setup(jest.fn().mockRejectedValue(new Error('connection refused')));
+    expect(await svc.handleCaseCommand(dm(`/case ${STORY}`))).toBe(true);
+    expect(tg.sendMessage).toHaveBeenCalledWith(OWNER, expect.stringContaining('connection refused'));
+  });
+
+  // Бот получает правки сообщений (edited_message) тем же путём, что и новые.
+  // Исправленный текст — другой хеш, и без ключа по сообщению правка опечатки
+  // завела бы второй кейс, а первым в работу ушёл бы старый текст. С ключом
+  // addTopic такую правку не заводит (вернёт null) — и ответ про неё свой.
+  it('правка уже принятого /case — второго кейса нет, поправить предложено замечанием', async () => {
+    const { svc, tg, topics } = setup(jest.fn().mockResolvedValue(null));
+    expect(await svc.handleCaseCommand({ ...dm(`/case ${STORY}`), edit_date: 1727790000 })).toBe(true);
+    expect(topics.addTopic).toHaveBeenCalledWith(expect.objectContaining({ sourceRef: `tg:${OWNER}:501`, onceBySourceRef: true }));
+    const [, text] = tg.sendMessage.mock.calls[0];
+    expect(text).toMatch(/уже заведён/);
+    expect(text).toMatch(/замечани/);
+  });
+
+  // Править сообщение естественно как раз после отказа («слишком коротко»,
+  // забытый /case, сбой базы): по нему кейса нет, и исправленный текст его заводит.
+  it('правка отклонённого /case заводит кейс по исправленному тексту', async () => {
+    const { svc, tg } = setup();
+    expect(await svc.handleCaseCommand({ ...dm(`/case ${STORY}`), edit_date: 1727790000 })).toBe(true);
+    expect(tg.sendMessage).toHaveBeenCalledWith(OWNER, expect.stringContaining('Принял реальный кейс'));
+  });
+
+  // Без id сообщения ключ «tg:<чат>:NaN» был бы общим у всех таких сообщений,
+  // и после первого кейса любые следующие считались бы повтором.
+  it('сообщение без id — без ключа по сообщению', async () => {
+    const { svc, topics } = setup();
+    const { message_id, ...noId } = dm(`/case ${STORY}`);
+    await svc.handleCaseCommand(noId);
+    const topic = topics.addTopic.mock.calls[0][0];
+    expect(topic.sourceRef).toBeUndefined();
+    expect(topic.onceBySourceRef).toBeFalsy();
   });
 });

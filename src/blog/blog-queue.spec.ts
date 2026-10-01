@@ -259,7 +259,7 @@ function world(seed: Row[], settingsOver: Partial<typeof SETTINGS> = {}) {
   const pg = blogPg(seed);
   const tg = fakeTg();
   const settings = { get: jest.fn(async () => ({ ...SETTINGS, ...settingsOver })), update: jest.fn() };
-  const approval = new BlogApprovalService(pg as any, tg as any, settings as any);
+  const approval = new BlogApprovalService(pg as any, tg as any, settings as any, {} as any);
   const publisher = new BlogPublisherService(pg as any, tg as any, settings as any);
   const admin = new BlogController(
     pg as any, { addTopic: jest.fn() } as any, settings as any, { render: jest.fn() } as any, publisher, approval,

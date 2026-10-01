@@ -157,6 +157,7 @@ maybe('Замечание к посту против живого Postgres', () 
       { query: (sql: string, params?: any[]) => pool.query(sql, params) } as any,
       tg as any,
       { get: jest.fn() } as any,
+      {} as any, // topics — замечаниям не нужен
     );
   });
 
@@ -440,7 +441,7 @@ maybe('Один пост на слот против живого Postgres', () =
   const make = () => {
     const pg = gatedPg(pool);
     const tg = fakeTg();
-    const bot = new BlogApprovalService(pg as any, tg as any, settings);
+    const bot = new BlogApprovalService(pg as any, tg as any, settings, {} as any);
     const publisher = new BlogPublisherService(pg as any, tg as any, settings);
     const admin = new BlogController(
       pg as any, { addTopic: jest.fn() } as any, settings, { render: jest.fn() } as any, publisher, bot,
@@ -789,7 +790,7 @@ maybe('Очередь без дыр против живого Postgres', () => {
     const pg = gatedPg(pool);
     const tg = fakeTg();
     tg.sendPhoto.mockImplementation(async (chatId: number) => ({ message_id: 42, chat: { id: chatId, username: 'linkeon_blog' } }));
-    const bot = new BlogApprovalService(pg as any, tg as any, settings);
+    const bot = new BlogApprovalService(pg as any, tg as any, settings, {} as any);
     const publisher = new BlogPublisherService(pg as any, tg as any, settings);
     const admin = new BlogController(
       pg as any, { addTopic: jest.fn() } as any, settings, { render: jest.fn() } as any, publisher, bot,
