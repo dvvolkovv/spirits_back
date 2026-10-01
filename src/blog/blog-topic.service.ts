@@ -157,7 +157,9 @@ export class BlogTopicService {
 
   /**
    * Следующая тема в работу. Новость всегда вытесняет кейс — новости
-   * скоропортящиеся, кейс полежит.
+   * скоропортящиеся, кейс полежит. Реальный кейс идёт сразу за новостями:
+   * историю владелец принёс сам, и ждать за неделей синтетических кейсов ей
+   * незачем.
    *
    * Для `drafting` вопрос один: занят черновик прямо сейчас или нет. Отвечает
    * на него `drafting_started_at`:
@@ -184,7 +186,7 @@ export class BlogTopicService {
            OR (status = 'drafting'
                AND (drafting_started_at IS NULL
                     OR drafting_started_at < now() - ($1 || ' minutes')::interval))
-        ORDER BY (rubric = 'news') DESC, created_at ASC
+        ORDER BY (rubric = 'news') DESC, (source = 'real') DESC, created_at ASC
         LIMIT 1`,
       [STALE_DRAFTING_MINUTES],
     );
