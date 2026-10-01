@@ -1,5 +1,6 @@
 export type BlogRubric = 'news' | 'case';
-export type BlogSource = 'backlog' | 'git' | 'stats' | 'manual';
+/** `real` — реальный кейс: историю принёс владелец, редактор её только пересказывает. */
+export type BlogSource = 'backlog' | 'git' | 'stats' | 'manual' | 'real';
 export type BlogStatus =
   | 'idea' | 'drafting' | 'pending_review' | 'approved'
   | 'publishing' | 'published' | 'rejected' | 'failed';
