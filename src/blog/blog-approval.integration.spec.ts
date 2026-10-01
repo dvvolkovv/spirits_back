@@ -1370,16 +1370,22 @@ maybe('Реальный кейс против живого Postgres', () => {
       await svc.handleCaseCommand(msg(10, story('Роман прочитал полис КАСКО целиком, все правила.'), true));
 
       // Барьер: обе вставки ждут, пока оба вызова не прочтут source_ref, — так
-      // гонка воспроизводится всегда, а не когда повезёт со временем.
+      // гонка воспроизводится всегда, а не когда повезёт со временем. Считаем
+      // по ЗАВЕРШЕНИЮ SELECT, а не по его отправке: второй вызов может ждать
+      // второе соединение пула, и пока оно устанавливается, первый успевает
+      // дойти до INSERT — «отправлены оба» тогда перестаёт означать
+      // «прочитаны оба раньше первой записи».
       let reads = 0;
       let release!: () => void;
       const bothRead = new Promise<void>((r) => { release = r; });
       const racing = {
         query: async (sql: string, params?: any[]) => {
           const s = String(sql);
-          if (/SELECT\s+id\s+FROM\s+blog_post\s+WHERE\s+source_ref\s*=\s*\$1/.test(s) && ++reads === 2) release();
+          const isSelRef = /SELECT\s+id\s+FROM\s+blog_post\s+WHERE\s+source_ref\s*=\s*\$1/.test(s);
           if (/INSERT INTO blog_post/.test(s)) await bothRead;
-          return pool.query(sql, params);
+          const r = await pool.query(sql, params);
+          if (isSelRef && ++reads === 2) release();
+          return r;
         },
       } as any;
       const racingSvc = new BlogApprovalService(racing, tg as any, { get: jest.fn() } as any, new BlogTopicService(racing));
