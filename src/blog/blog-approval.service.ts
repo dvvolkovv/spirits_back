@@ -371,9 +371,13 @@ export class BlogApprovalService {
     const chatId = Number(msg?.chat?.id) || owner;
     const prep = prepareRealCase(story);
     if (prep.ok === false) {
+      // Telegram Desktop режет сообщения длиннее 4096 знаков по границе
+      // абзаца во второй половине лимита: первая часть длинной истории может
+      // пройти проверку (40..4000 знаков) и завести кейс без её конца.
       await this.notify(
         chatId,
-        `Не завёл: ${prep.reason}.\n\nКак писать: /case и следом история — можно в несколько строк.`,
+        `Не завёл: ${prep.reason}.\n\nКак писать: /case и следом история — можно в несколько строк. ` +
+          'Длинную историю (больше ~3000 знаков) лучше завести через админку: Telegram режет длинные сообщения на части.',
       );
       return true;
     }

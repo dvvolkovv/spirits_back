@@ -964,6 +964,7 @@ describe('handleCaseCommand: реальный кейс командой в ли�
     for (const [, text] of tg.sendMessage.mock.calls) {
       expect(text).toMatch(/\/case/);
       expect(text).toMatch(/40 знаков/);
+      expect(text).toMatch(/через админку/);
     }
   });
 
