@@ -1,4 +1,7 @@
-import { Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, OnModuleInit, Optional } from '@nestjs/common';
+import * as fs from 'fs';
+import * as path from 'path';
+import { ContextService } from '../context/context.service';
 import { alertMeetingFailure } from '../meeting/meeting-alert';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
@@ -36,11 +39,16 @@ function ratesFor(model: string | undefined): { in: number; cachedIn: number; ou
   return /mini/i.test(model || '') ? AUDIO_RATES_USD_PER_1M.mini : AUDIO_RATES_USD_PER_1M.flagship;
 }
 
+/** Откуда начат звонок. От этого зависят состав контекста и срок хранения транскрипта. */
+export type CallOrigin = 'launcher' | 'web';
+
+// Бюджеты старой сборки преамбулы. Живут только ради buildPreambleLegacy —
+// действующие лимиты описаны посекционно в src/context/context.types.ts.
 const PREAMBLE_MSG_LIMIT = 20;
 const PREAMBLE_CHAR_LIMIT = 1800;
 
 @Injectable()
-export class VoiceCallService {
+export class VoiceCallService implements OnModuleInit {
   private readonly logger = new Logger(VoiceCallService.name);
 
   constructor(
@@ -54,7 +62,28 @@ export class VoiceCallService {
     // Тоже необязательный: на стендах без Attendee встречи Meet просто
     // недоступны, а звонки и свои комнаты работают как обычно.
     @Optional() private readonly attendee?: AttendeeClient,
+    // Сборщик контекста. Необязательный по той же причине, что и остальные:
+    // без него разговор состоится, просто Роман будет знать меньше.
+    @Optional() private readonly context?: ContextService,
   ) {}
+
+  async onModuleInit(): Promise<void> {
+    // Миграция применяется тем же способом, что в TasksService: путь из dist
+    // и путь из исходников, чтобы работало и в сборке, и в ts-node.
+    const candidates = [
+      path.join(__dirname, 'migrations', '003_voice_call_origin.sql'),
+      path.join(__dirname, '..', '..', 'src', 'voice-call', 'migrations', '003_voice_call_origin.sql'),
+    ];
+    for (const p of candidates) {
+      try {
+        if (!fs.existsSync(p)) continue;
+        await this.pg.query(fs.readFileSync(p, 'utf8'));
+        return;
+      } catch (e: any) {
+        this.logger.warn(`миграция origin не применилась (${p}): ${e?.message}`);
+      }
+    }
+  }
 
   /**
    * Убрать бота Attendee из чужой встречи.
@@ -92,7 +121,34 @@ export class VoiceCallService {
    *
    * Берём с конца, пока укладываемся в бюджет: свежие реплики важнее старых.
    */
-  async buildPreamble(userId: string, agentId: number = HOST_AGENT_ID): Promise<string> {
+  async buildPreamble(
+    userId: string,
+    agentId: number = HOST_AGENT_ID,
+    origin: CallOrigin = 'launcher',
+    device?: string,
+  ): Promise<string> {
+    // Контекст собирает ContextService — общий для всех облачных поверхностей.
+    // Раньше он собирался прямо здесь, из профиля и переписки, и в нём не было
+    // ни времени, ни календаря, ни задач: человек смотрел на локскрин со
+    // встречей в 14:00, звонил, и Роман про неё не знал. Теперь состав и
+    // бюджеты описаны в одном месте (src/context/context.types.ts).
+    if (this.context) {
+      const built = await this.context.build(
+        userId,
+        origin === 'web' ? 'voice-web' : 'voice-launcher',
+        { agentId, device },
+      );
+      return built.text;
+    }
+    return this.buildPreambleLegacy(userId, agentId);
+  }
+
+  /**
+   * Старая сборка — только на случай, когда ContextService не поднят
+   * (стенды без модуля, юнит-тесты смежных сервисов). Удалить, когда на
+   * ContextService переедут чат и Telegram.
+   */
+  private async buildPreambleLegacy(userId: string, agentId: number = HOST_AGENT_ID): Promise<string> {
     // Профиль собеседника — то же, что получают текстовые ассистенты.
     //
     // До 27.08.2026 Роман его не видел ВОВСЕ: в инструкцию шла только
@@ -156,7 +212,11 @@ export class VoiceCallService {
     return parts.join('\n\n');
   }
 
-  async start(userId: string): Promise<{ callId: string; roomName: string; token: string; wsUrl: string }> {
+  async start(
+    userId: string,
+    origin: CallOrigin = 'launcher',
+    device?: string,
+  ): Promise<{ callId: string; roomName: string; token: string; wsUrl: string }> {
     // Один активный звонок на пользователя. Минута разговора стоит реальных
     // денег, а без этого N вкладок (или цикл curl) дали бы N комнат и N
     // оплачиваемых Realtime-сессий. Но НЕ блокируем 409-м навсегда: при грязном
@@ -181,13 +241,14 @@ export class VoiceCallService {
     const roomName = `voice_${callId}`;
 
     await this.pg.query(
-      `INSERT INTO voice_calls (id, user_id, agent_id, room_name, status) VALUES ($1, $2, $3, $4, 'dialing')`,
-      [callId, userId, HOST_AGENT_ID, roomName],
+      `INSERT INTO voice_calls (id, user_id, agent_id, room_name, status, origin)
+       VALUES ($1, $2, $3, $4, 'dialing', $5)`,
+      [callId, userId, HOST_AGENT_ID, roomName, origin],
     );
 
     const [token, preamble] = await Promise.all([
       this.livekit.userToken(roomName, `user_${userId}`),
-      this.buildPreamble(userId),
+      this.buildPreamble(userId, HOST_AGENT_ID, origin, device),
     ]);
 
     await this.livekit.dispatchAgent(roomName, {

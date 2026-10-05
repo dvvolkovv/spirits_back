@@ -1,4 +1,4 @@
-import { Controller, ForbiddenException, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, ForbiddenException, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { VoiceCallService } from './voice-call.service';
@@ -15,8 +15,13 @@ export class VoiceCallController {
    * Анонимный звонок до входа — отдельный путь (Ф2), не здесь.
    */
   @Post('start')
-  async start(@CurrentUser() u: any) {
-    return this.calls.start(u.userId);
+  async start(@CurrentUser() u: any, @Body() body?: any) {
+    // Откуда звонят. Веб и компаньон лаунчера дёргают ОДНУ ручку и до этого
+    // были неотличимы — а состав контекста и срок хранения транскрипта у них
+    // разные. Отсутствие метки трактуем как 'launcher': старые версии
+    // компаньона её не пришлют, а они как раз лаунчерные.
+    const origin = body?.origin === 'web' ? 'web' : 'launcher';
+    return this.calls.start(String(u.userId), origin, body?.device);
   }
 
   @Post(':id/end')

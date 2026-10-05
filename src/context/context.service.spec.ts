@@ -1,0 +1,78 @@
+import { ContextService } from './context.service';
+import { TOTAL_BUDGET } from './context.types';
+
+const pgEmpty = () => ({ query: jest.fn().mockResolvedValue({ rows: [] }) }) as any;
+
+describe('ContextService', () => {
+  it('не вытесняет now и режет низкоранговые секции по общему бюджету', async () => {
+    const svc = new ContextService(pgEmpty());
+    jest.spyOn(svc as any, 'sectionNow').mockResolvedValue('СЕЙЧАС');
+    jest.spyOn(svc as any, 'sectionToday').mockResolvedValue('Т'.repeat(TOTAL_BUDGET));
+    jest.spyOn(svc as any, 'sectionHistory').mockResolvedValue('И'.repeat(TOTAL_BUDGET));
+
+    const out = await svc.build('u1', 'voice-launcher');
+
+    expect(out.text).toContain('СЕЙЧАС');
+    expect(out.sections.find((s) => s.name === 'now')!.dropped).toBe(false);
+    expect(out.sections.some((s) => s.dropped)).toBe(true);
+    expect(out.text.length).toBeLessThanOrEqual(TOTAL_BUDGET + 64);
+  });
+
+  it('секция device не собирается для веб-звонка: у веба нет устройства', async () => {
+    const svc = new ContextService(pgEmpty());
+    jest.spyOn(svc as any, 'sectionNow').mockResolvedValue('СЕЙЧАС');
+
+    const out = await svc.build('u1', 'voice-web', { device: 'ЛИЧНОЕ-С-ТЕЛЕФОНА' });
+
+    expect(out.text).not.toContain('ЛИЧНОЕ-С-ТЕЛЕФОНА');
+    expect(out.sections.some((s) => s.name === 'device')).toBe(false);
+  });
+
+  it('выжимка с устройства идёт ВЫШЕ облачного профиля (правило приоритета)', async () => {
+    const svc = new ContextService(pgEmpty());
+    jest.spyOn(svc as any, 'sectionCloudProfile').mockResolvedValue('ОБЛАЧНЫЙ-ПРОФИЛЬ');
+
+    const out = await svc.build('u1', 'voice-launcher', { device: 'С-УСТРОЙСТВА' });
+
+    expect(out.text.indexOf('С-УСТРОЙСТВА')).toBeLessThan(out.text.indexOf('ОБЛАЧНЫЙ-ПРОФИЛЬ'));
+  });
+
+  it('упавший источник не роняет сборку — звонок дороже секции', async () => {
+    const svc = new ContextService(pgEmpty());
+    jest.spyOn(svc as any, 'sectionNow').mockResolvedValue('СЕЙЧАС');
+    jest.spyOn(svc as any, 'sectionToday').mockRejectedValue(new Error('Neo4j прилёг'));
+
+    const out = await svc.build('u1', 'voice-launcher');
+
+    expect(out.text).toContain('СЕЙЧАС');
+    expect(out.sections.some((s) => s.name === 'today')).toBe(false);
+  });
+
+  it('время берётся из пояса клиента, мусорный пояс не роняет', async () => {
+    const svc = new ContextService(pgEmpty());
+
+    const good = await (svc as any).sectionNow('Europe/Lisbon');
+    expect(good).toContain('Europe/Lisbon');
+
+    const bad = await (svc as any).sectionNow('; DROP TABLE');
+    expect(bad).toContain('Asia/Yekaterinburg');
+  });
+
+  it('день собирается из состояния лаунчера и несёт отметку снимка', async () => {
+    const trip = {
+      getState: jest.fn().mockResolvedValue({
+        headline: '',
+        contextLines: [],
+        events: [{ at: '2026-10-05T14:00:00+05:00', title: 'Разбор макетов', conflict: false }],
+        tasks: [{ uid: 't1', title: 'Оплатить интернет', status: 'pending' }],
+      }),
+    } as any;
+    const svc = new ContextService(pgEmpty(), trip);
+
+    const text = await (svc as any).sectionToday('u1');
+
+    expect(text).toContain('14:00 — Разбор макетов');
+    expect(text).toContain('дело: Оплатить интернет');
+    expect(text).toContain('данные на');
+  });
+});

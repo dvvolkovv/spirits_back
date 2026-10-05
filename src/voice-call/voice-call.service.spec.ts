@@ -553,3 +553,53 @@ describe('бот чужой площадки не переживает звон�
     await expect(d.svc.fail('call-1', 'причина')).resolves.toBeUndefined();
   });
 });
+
+describe('VoiceCallService + ContextService', () => {
+  const { ContextService } = require('../context/context.service');
+
+  it('преамбула собирается через ContextService и несёт время и день', async () => {
+    const d = makeDeps([{ sender_type: 'human', content: 'привет' }]);
+    const trip = {
+      getState: jest.fn().mockResolvedValue({
+        headline: '', contextLines: [],
+        events: [{ at: '2026-10-05T14:00:00+05:00', title: 'Разбор макетов', conflict: false }],
+        tasks: [],
+      }),
+    };
+    const ctx = new ContextService(d.pg as any, trip as any);
+    const svc = new VoiceCallService(
+      d.pg as any, d.chat as any, d.livekit as any,
+      undefined, undefined, undefined, ctx as any,
+    );
+
+    const p = await svc.buildPreamble('u1');
+
+    expect(p).toContain('Разбор макетов');   // то, ради чего всё затевалось
+    expect(p).toContain('--- Сейчас ---');   // времени у звонка не было вовсе
+    expect(p).toContain('привет');           // история не потерялась
+  });
+
+  it('веб-звонку секция device не достаётся даже если её передали', async () => {
+    const d = makeDeps([]);
+    const ctx = new ContextService(d.pg as any);
+    const svc = new VoiceCallService(
+      d.pg as any, d.chat as any, d.livekit as any,
+      undefined, undefined, undefined, ctx as any,
+    );
+
+    const p = await svc.buildPreamble('u1', 12, 'web', 'ЛИЧНОЕ-С-ТЕЛЕФОНА');
+
+    expect(p).not.toContain('ЛИЧНОЕ-С-ТЕЛЕФОНА');
+  });
+
+  it('start пишет origin в voice_calls', async () => {
+    const d = makeDeps([]);
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+
+    await svc.start('u1', 'web');
+
+    const ins = d.pg.query.mock.calls.find((c: any[]) => /INSERT INTO voice_calls/i.test(c[0]));
+    expect(ins).toBeTruthy();
+    expect(ins[1]).toContain('web');
+  });
+});
