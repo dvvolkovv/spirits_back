@@ -11,13 +11,13 @@ describe('VoiceCallController.start', () => {
   it('any logged-in user (not just admin) can start a call → delegates to the service', async () => {
     const { ctrl, calls } = make();
     const res = await ctrl.start({ userId: 'u1', isAdmin: false });
-    expect(calls.start).toHaveBeenCalledWith('u1');
+    expect(calls.start).toHaveBeenCalledWith('u1', 'launcher', undefined);
     expect(res).toMatchObject({ callId: 'c1', token: 't' });
   });
 
   it('admin also works (no regression)', async () => {
     const { ctrl, calls } = make();
     await ctrl.start({ userId: 'admin1', isAdmin: true });
-    expect(calls.start).toHaveBeenCalledWith('admin1');
+    expect(calls.start).toHaveBeenCalledWith('admin1', 'launcher', undefined);
   });
 });

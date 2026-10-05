@@ -4,18 +4,24 @@ import { TOTAL_BUDGET } from './context.types';
 const pgEmpty = () => ({ query: jest.fn().mockResolvedValue({ rows: [] }) }) as any;
 
 describe('ContextService', () => {
-  it('не вытесняет now и режет низкоранговые секции по общему бюджету', async () => {
+  it('при переполнении общего бюджета вытесняется самая низкоранговая секция', async () => {
+    // Сумма посекционных потолков (6770) больше общего (6000), поэтому
+    // вытеснение включается только когда секции набиты почти под завязку.
+    // Режется history: разговор её восстановит, а пропущенную встречу — нет.
     const svc = new ContextService(pgEmpty());
+    const big = (n: number) => 'х'.repeat(n);
     jest.spyOn(svc as any, 'sectionNow').mockResolvedValue('СЕЙЧАС');
-    jest.spyOn(svc as any, 'sectionToday').mockResolvedValue('Т'.repeat(TOTAL_BUDGET));
-    jest.spyOn(svc as any, 'sectionHistory').mockResolvedValue('И'.repeat(TOTAL_BUDGET));
+    jest.spyOn(svc as any, 'sectionToday').mockResolvedValue(big(2000));
+    jest.spyOn(svc as any, 'sectionCloudProfile').mockResolvedValue(big(2000));
+    jest.spyOn(svc as any, 'sectionBusiness').mockResolvedValue(big(2000));
+    jest.spyOn(svc as any, 'sectionHistory').mockResolvedValue(big(2000));
 
-    const out = await svc.build('u1', 'voice-launcher');
+    const out = await svc.build('u1', 'voice-launcher', { device: big(2000) });
 
     expect(out.text).toContain('СЕЙЧАС');
     expect(out.sections.find((s) => s.name === 'now')!.dropped).toBe(false);
-    expect(out.sections.some((s) => s.dropped)).toBe(true);
-    expect(out.text.length).toBeLessThanOrEqual(TOTAL_BUDGET + 64);
+    expect(out.sections.find((s) => s.name === 'history')!.dropped).toBe(true);
+    expect(out.text.length).toBeLessThanOrEqual(TOTAL_BUDGET);
   });
 
   it('секция device не собирается для веб-звонка: у веба нет устройства', async () => {
