@@ -53,6 +53,14 @@ describe('splitForSpeech', () => {
     expect(chunks[0].endsWith('»')).toBe(true);
   });
 
+  it('китайский текст режется по 。！？ — пробела после знака там не бывает', () => {
+    const text = '这是一个用于测试的句子。'.repeat(500); // 6000 знаков, ни одного пробела
+    const chunks = splitForSpeech(text, 4000);
+    expect(chunks[0].endsWith('。')).toBe(true);
+    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(4000);
+    expect(squash(chunks.join(''))).toBe(squash(text));
+  });
+
   it('предложение длиннее лимита режется по пробелу', () => {
     const text = 'слово '.repeat(500).trim();
     const chunks = splitForSpeech(text, 2000);

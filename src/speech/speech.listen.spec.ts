@@ -1,49 +1,92 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { SpeechService, LISTEN_MAX_CHARS, mapLimit } from './speech.service';
+import { SpeechService, LISTEN_MAX_CHARS, mapLimit, cacheKeyFor } from './speech.service';
 
 /**
  * Таблицы модуля создаются при старте API: `npm run migrate` на проде
- * застревает на base/001 и до speech/ не доходит.
+ * застревает на base/001 и до speech/ не доходит. Учёт — в той же
+ * schema_migrations, что ведёт scripts/migrate.ts: на test и проде speech/001
+ * в ней уже записан (проверено 06.10.2026).
  */
 describe('SpeechService.onModuleInit — таблицы модуля при старте', () => {
   const firstLine = (sql: string) => sql.trim().split('\n')[0];
 
-  function makeInit(failOn?: RegExp) {
+  function makeInit(opts: { recorded?: string[]; failOn?: RegExp } = {}) {
+    const recorded = new Set(opts.recorded ?? []);
     const calls: string[] = [];
     const client = {
-      query: jest.fn(async (sql: string) => {
+      query: jest.fn(async (sql: string, params: any[] = []) => {
         calls.push(firstLine(sql));
-        if (failOn && failOn.test(sql)) throw new Error('lock timeout');
+        if (opts.failOn && opts.failOn.test(sql)) throw new Error('lock timeout');
+        if (/SELECT 1 FROM schema_migrations/.test(sql)) return { rows: recorded.has(params[0]) ? [{}] : [] };
+        if (/INSERT INTO schema_migrations/.test(sql)) {
+          recorded.add(params[0]);
+          return { rows: [] };
+        }
         return { rows: [] };
       }),
       release: jest.fn(),
     };
-    const pg: any = { query: jest.fn(), getClient: jest.fn(async () => client) };
+    const pg: any = {
+      query: jest.fn(async (sql: string) => {
+        calls.push(firstLine(sql));
+        return { rows: [] };
+      }),
+      getClient: jest.fn(async () => client),
+    };
     const svc = new SpeechService(pg, {} as any, {} as any, {} as any);
-    return { svc, calls, client, pg };
+    return { svc, calls, client, recorded };
   }
 
-  it('применяет миграции модуля по порядку, каждую своей транзакцией с lock_timeout', async () => {
-    const { svc, calls, client } = makeInit();
+  it('таблица учёта создаётся, если её нет, — той же схемой, что в scripts/migrate.ts', async () => {
+    const { svc, calls } = makeInit();
     await svc.onModuleInit();
-    expect(calls).toEqual([
-      'BEGIN', "SET LOCAL lock_timeout = '3s'", '-- 001_speech_clips.sql', 'COMMIT',
-      'BEGIN', "SET LOCAL lock_timeout = '3s'", '-- 002_speech_listens.sql', 'COMMIT',
+    expect(calls[0]).toMatch(/^CREATE TABLE IF NOT EXISTS schema_migrations/);
+  });
+
+  it('на чистой базе применяет все файлы модуля по порядку и записывает их', async () => {
+    const { svc, calls, recorded } = makeInit();
+    await svc.onModuleInit();
+    expect(calls.filter((c) => c.startsWith('-- '))).toEqual(['-- 001_speech_clips.sql', '-- 002_speech_listens.sql']);
+    expect([...recorded].sort()).toEqual(['speech/001_speech_clips.sql', 'speech/002_speech_listens.sql']);
+  });
+
+  it('записанное не катает повторно — ALTER из 001 не берёт блокировку на каждом старте', async () => {
+    const { svc, calls } = makeInit({ recorded: ['speech/001_speech_clips.sql'] });
+    await svc.onModuleInit();
+    expect(calls).not.toContain('-- 001_speech_clips.sql');
+    expect(calls).toContain('-- 002_speech_listens.sql');
+  });
+
+  it('каждый файл — своей транзакцией с lock_timeout, запись о нём — в той же транзакции', async () => {
+    const { svc, calls, client } = makeInit({ recorded: ['speech/001_speech_clips.sql'] });
+    await svc.onModuleInit();
+    const i = calls.indexOf('-- 002_speech_listens.sql');
+    expect(calls.slice(i - 3, i + 3)).toEqual([
+      'BEGIN',
+      "SET LOCAL lock_timeout = '3s'",
+      'SELECT 1 FROM schema_migrations WHERE filename = $1',
+      '-- 002_speech_listens.sql',
+      'INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING',
+      'COMMIT',
     ]);
     expect(client.release).toHaveBeenCalledTimes(2);
   });
 
-  it('сбой одной миграции не роняет старт и не мешает следующей', async () => {
-    const { svc, calls, client } = makeInit(/ALTER TABLE speech_clips/);
+  it('сбой одной миграции не роняет старт, не записывается и не мешает следующей', async () => {
+    const { svc, calls, client, recorded } = makeInit({ failOn: /ALTER TABLE speech_clips/ });
     await expect(svc.onModuleInit()).resolves.toBeUndefined();
     expect(calls).toContain('ROLLBACK');
-    expect(calls).toContain('-- 002_speech_listens.sql');
+    expect(recorded.has('speech/001_speech_clips.sql')).toBe(false);
+    expect(recorded.has('speech/002_speech_listens.sql')).toBe(true);
     expect(client.release).toHaveBeenCalledTimes(2);
   });
 
   it('нет соединения с базой — старт не падает', async () => {
-    const pg: any = { query: jest.fn(), getClient: jest.fn(async () => { throw new Error('ECONNREFUSED'); }) };
+    const pg: any = {
+      query: jest.fn(async () => { throw new Error('ECONNREFUSED'); }),
+      getClient: jest.fn(async () => { throw new Error('ECONNREFUSED'); }),
+    };
     const svc = new SpeechService(pg, {} as any, {} as any, {} as any);
     await expect(svc.onModuleInit()).resolves.toBeUndefined();
   });
@@ -58,76 +101,112 @@ describe('SpeechService.onModuleInit — таблицы модуля при ст
 });
 
 /**
- * Заглушки без сети и БД. Баланс — настоящее изменяемое состояние, UPDATE
- * ведёт себя как Postgres: условие `AND tokens >= $1` берётся ИЗ ТЕКСТА
- * запроса. INSERT уважает уникальность (user_id, cache_key) — как ON CONFLICT
- * DO NOTHING на боевом индексе.
+ * Заглушки без сети и БД, но с транзакциями — как у Postgres:
+ *  - строка speech_listens, вставленная в транзакции, видна остальным только
+ *    после COMMIT, а ROLLBACK её стирает;
+ *  - вставка с тем же ключом из другой транзакции ЖДЁТ исхода первой (так
+ *    ведёт себя уникальный индекс): закоммитила — конфликт, откатила — вставка
+ *    проходит;
+ *  - списание проверяет условие `AND tokens >= $1` ИЗ ТЕКСТА запроса, а
+ *    ROLLBACK возвращает деньги; реестр и счётчик списаний — только по COMMIT.
  */
 function makeService(overrides: any = {}) {
   const state = {
     balance: overrides.balance ?? 100000,
     profile: overrides.profile ?? { preferred_agent: 'Роман', profile_data: {} },
+    failDebit: false as boolean,
   };
   const rows: { listens: any[] } = { listens: [] };
+  const pendingKeys = new Map<string, Promise<void>>();
   const deduct = jest.fn();
-  const deleted = jest.fn();
   const touched = jest.fn();
   const ledger: any[] = [];
   const sqlLog: string[] = [];
   let seq = 0;
 
-  const pg: any = {
-    query: jest.fn(async (sql: string, params: any[] = []) => {
-      sqlLog.push(sql);
-      if (/UPDATE speech_listens SET last_used_at/.test(sql)) {
-        touched(params[0]);
-        return { rows: [], rowCount: 1 };
-      }
-      if (/UPDATE ai_profiles_consolidated SET tokens = tokens - \$1/.test(sql)) {
-        const [amount, uid] = params;
-        if (/tokens >= \$1/.test(sql) && state.balance < amount) return { rows: [] };
-        state.balance -= amount;
+  type Tx = { pending: any[]; undo: Array<() => void>; onCommit: Array<() => void>; keys: string[]; done: Promise<void> };
+
+  const handle = async (sql: string, params: any[], tx: Tx | null): Promise<any> => {
+    sqlLog.push(sql);
+    if (/UPDATE speech_listens SET last_used_at/.test(sql)) {
+      touched(params[0]);
+      return { rows: [], rowCount: 1 };
+    }
+    if (/UPDATE ai_profiles_consolidated SET tokens = tokens - \$1/.test(sql)) {
+      if (state.failDebit) throw new Error('Connection terminated unexpectedly');
+      const [amount, uid] = params;
+      if (/tokens >= \$1/.test(sql) && state.balance < amount) return { rows: [] };
+      state.balance -= amount;
+      if (tx) {
+        tx.undo.push(() => { state.balance += amount; });
+        tx.onCommit.push(() => deduct(uid, amount));
+      } else {
         deduct(uid, amount);
-        return { rows: [{ tokens: state.balance }] };
       }
-      if (/DELETE FROM speech_listens/.test(sql)) {
-        const [id, uid] = params;
-        rows.listens = rows.listens.filter((r) => !(r.id === id && r.user_id === uid));
-        deleted(id, uid);
+      return { rows: [{ tokens: state.balance }] };
+    }
+    if (/INSERT INTO speech_listens/.test(sql)) {
+      // Колонки — ИЗ ТЕКСТА запроса: заглушка не знает схему заранее и
+      // уронит тест, если сервис перестанет что-то писать.
+      const cols = String(sql.match(/INSERT INTO speech_listens \(([^)]*)\)/)?.[1] ?? '')
+        .split(',').map((c) => c.trim());
+      const row: any = {};
+      cols.forEach((c, i) => { row[c] = params[i]; });
+      const key = `${row.user_id}|${row.cache_key}`;
+      while (pendingKeys.has(key) && pendingKeys.get(key) !== tx?.done) await pendingKeys.get(key);
+      if (rows.listens.some((r) => r.user_id === row.user_id && r.cache_key === row.cache_key)) {
         return { rows: [] };
       }
-      if (/INSERT INTO speech_listens/.test(sql)) {
-        // Колонки — ИЗ ТЕКСТА запроса: заглушка не знает схему заранее и
-        // уронит тест, если сервис перестанет что-то писать.
-        const cols = String(sql.match(/INSERT INTO speech_listens \(([^)]*)\)/)?.[1] ?? '')
-          .split(',').map((c) => c.trim());
-        const row: any = {};
-        cols.forEach((c, i) => { row[c] = params[i]; });
-        if (rows.listens.some((r) => r.user_id === row.user_id && r.cache_key === row.cache_key)) {
-          return { rows: [] };
-        }
-        row.id = `listen-${++seq}`;
-        row.parts = JSON.parse(row.parts); // jsonb pg отдаёт уже разобранным
+      row.id = `listen-${++seq}`;
+      row.parts = JSON.parse(row.parts); // jsonb pg отдаёт уже разобранным
+      if (tx) {
+        tx.pending.push(row);
+        tx.keys.push(key);
+        pendingKeys.set(key, tx.done);
+      } else {
         rows.listens.push(row);
-        return { rows: [{ id: row.id }] };
       }
-      if (/FROM speech_listens/.test(sql)) {
-        const hit = rows.listens.find((r) => r.user_id === params[0] && r.cache_key === params[1]);
-        return { rows: hit ? [hit] : [] };
-      }
-      if (/preferred_agent/.test(sql)) return { rows: [state.profile] };
-      if (/SELECT tokens/.test(sql)) return { rows: [{ tokens: state.balance }] };
-      return { rows: [] };
-    }),
+      return { rows: [{ id: row.id }] };
+    }
+    if (/FROM speech_listens/.test(sql)) {
+      const hit = rows.listens.find((r) => r.user_id === params[0] && r.cache_key === params[1]);
+      return { rows: hit ? [hit] : [] };
+    }
+    if (/preferred_agent/.test(sql)) return { rows: [state.profile] };
+    if (/SELECT tokens/.test(sql)) return { rows: [{ tokens: state.balance }] };
+    return { rows: [] };
+  };
+
+  const pg: any = {
+    query: jest.fn(async (sql: string, params: any[] = []) => handle(sql, params, null)),
     async getClient() {
+      let finish!: () => void;
+      const tx: Tx = { pending: [], undo: [], onCommit: [], keys: [], done: new Promise<void>((r) => { finish = r; }) };
+      const txLedger: any[] = [];
+      const end = () => {
+        for (const k of tx.keys) pendingKeys.delete(k);
+        finish();
+      };
       return {
         query: async (sql: string, params: any[] = []) => {
-          if (/^\s*(BEGIN|COMMIT|ROLLBACK)/i.test(sql)) return { rows: [] };
-          if (/INSERT INTO token_transactions/i.test(sql)) {
-            ledger.push({ sql: sql.replace(/\s+/g, ' ').trim(), params });
+          if (/^\s*BEGIN/i.test(sql)) return { rows: [] };
+          if (/^\s*COMMIT/i.test(sql)) {
+            rows.listens.push(...tx.pending);
+            ledger.push(...txLedger);
+            tx.onCommit.forEach((f) => f());
+            end();
             return { rows: [] };
           }
-          return pg.query(sql, params);
+          if (/^\s*ROLLBACK/i.test(sql)) {
+            tx.undo.reverse().forEach((f) => f());
+            end();
+            return { rows: [] };
+          }
+          if (/INSERT INTO token_transactions/i.test(sql)) {
+            txLedger.push({ sql: sql.replace(/\s+/g, ' ').trim(), params });
+            return { rows: [] };
+          }
+          return handle(sql, params, tx);
         },
         release: () => {},
       };
@@ -142,10 +221,11 @@ function makeService(overrides: any = {}) {
   // какой кусок в какой файл ушёл.
   const synth = jest.fn(async (_provider: string, chunk: string, _voice: string) => Buffer.from(chunk));
   (svc as any).synthesizeWith = synth;
-  return { svc, pg, storage, synth, deduct, deleted, touched, ledger, rows, state, redis, sqlLog };
+  return { svc, pg, storage, synth, deduct, touched, ledger, rows, state, redis, sqlLog };
 }
 
 const squash = (s: string) => s.replace(/\s+/g, '');
+const KEY_RE = (i: number) => new RegExp(`^audio/listen/[0-9a-f]{64}-[0-9a-f]{16}-${i}\\.mp3$`);
 
 describe('SpeechService.listen — свежий синтез', () => {
   it('короткий ответ: один кусок голосом ассистента, списание по тарифу', async () => {
@@ -185,8 +265,19 @@ describe('SpeechService.listen — свежий синтез', () => {
     expect(bodies).toHaveLength(3);
     expect(squash(bodies.join(' '))).toBe(squash(text));
     const keys = storage.upload.mock.calls.map((c: any[]) => c[0].key);
-    keys.forEach((k: string, i: number) => expect(k).toMatch(new RegExp(`^audio/listen/[0-9a-f]{64}-${i}\\.mp3$`)));
+    keys.forEach((k: string, i: number) => expect(k).toMatch(KEY_RE(i)));
     expect(r.parts).toEqual(keys.map((k: string) => `https://minio.test/linkeon-assets/${k}`));
+  });
+
+  it('адрес куска не вычисляется из текста: у каждого синтеза своя случайная часть', async () => {
+    // Иначе звук, за который списание не прошло (баланс ушёл за время
+    // синтеза), лежал бы по адресу sha256(текст голос язык) и доставался даром.
+    const { svc, storage } = makeService();
+    await svc.listen('u1', { text: 'Привет' });
+    await svc.listen('u2', { text: 'Привет' });
+    const [a, b] = storage.upload.mock.calls.map((c: any[]) => c[0].key);
+    expect(a).not.toBe(b);
+    expect(a).not.toBe(`audio/listen/${cacheKeyFor('Привет', 'zahar', 'ru')}-0.mp3`);
   });
 
   it('не больше трёх запросов к провайдеру одновременно', async () => {
@@ -247,6 +338,16 @@ describe('SpeechService.listen — кэш', () => {
     expect(again).toMatchObject({ ok: true, cached: true, tokensSpent: 0 });
   });
 
+  it('повтор из кэша не тратит лимит частоты — провайдера он не трогает', async () => {
+    const { svc, redis } = makeService();
+    await svc.listen('u1', { text: 'Привет' });
+    redis.incr.mockResolvedValue(21);
+    const again: any = await svc.listen('u1', { text: 'Привет' });
+    expect(again).toMatchObject({ ok: true, cached: true });
+    const fresh: any = await svc.listen('u1', { text: 'Новый ответ' });
+    expect(fresh).toEqual({ ok: false, error: 'rate_limited', retryAfterSec: 60 });
+  });
+
   it('другой ассистент — другой голос — новый синтез', async () => {
     const { svc, synth } = makeService();
     await svc.listen('u1', { text: 'Привет', assistant: 'Роман' });
@@ -272,6 +373,25 @@ describe('SpeechService.listen — кэш', () => {
     expect(a.ok && b.ok).toBe(true);
     expect(deduct).toHaveBeenCalledTimes(1);
     expect([a.tokensSpent, b.tokensSpent].sort((x: number, y: number) => x - y)).toEqual([0, 1000]);
+    expect(b.parts).toEqual(a.parts);
+  });
+
+  it('победитель гонки не смог заплатить — проигравший не получает его звук даром', async () => {
+    // Прежде строка кэша ложилась до списания: параллельный запрос видел её,
+    // отдавал звук как «уже оплаченный», а победитель следом проваливал
+    // списание и строку удалял. Звук уходил бесплатно.
+    const { svc, synth, state, deduct, rows } = makeService({ balance: 1000 });
+    synth.mockImplementation(async (_p: string, chunk: string) => {
+      state.balance = 0; // параллельная трата, пока шёл синтез
+      return Buffer.from(chunk);
+    });
+    const results: any[] = await Promise.all([
+      svc.listen('u1', { text: 'Привет' }),
+      svc.listen('u1', { text: 'Привет' }),
+    ]);
+    expect(results.map((r) => r.error)).toEqual(['insufficient_tokens', 'insufficient_tokens']);
+    expect(deduct).not.toHaveBeenCalled();
+    expect(rows.listens).toHaveLength(0);
   });
 });
 
@@ -360,8 +480,8 @@ describe('SpeechService.listen — отказы', () => {
     expect(synth).not.toHaveBeenCalled();
   });
 
-  it('баланс ушёл за время синтеза — строка снята, денег не взято, повтор не бесплатен', async () => {
-    const { svc, state, synth, deduct, deleted, rows } = makeService({ balance: 1000 });
+  it('баланс ушёл за время синтеза — строки нет, денег не взято, повтор не бесплатен', async () => {
+    const { svc, state, synth, deduct, rows, sqlLog } = makeService({ balance: 1000 });
     synth.mockImplementation(async (_p: string, chunk: string) => {
       state.balance = 0; // параллельная трата, пока шёл синтез
       return Buffer.from(chunk);
@@ -369,11 +489,28 @@ describe('SpeechService.listen — отказы', () => {
     const r: any = await svc.listen('u1', { text: 'Привет' });
     expect(r).toEqual({ ok: false, error: 'insufficient_tokens', balance: 0, required: 1000 });
     expect(deduct).not.toHaveBeenCalled();
-    expect(deleted).toHaveBeenCalledTimes(1);
     expect(rows.listens).toHaveLength(0);
+    // Строку убирает откат транзакции, а не отдельный DELETE после факта.
+    expect(sqlLog.some((s) => /DELETE FROM speech_listens/.test(s))).toBe(false);
 
     const retry: any = await svc.listen('u1', { text: 'Привет' });
     expect(retry.ok).toBe(false);
+  });
+
+  it('сбой самого списания — строки нет, ошибка наружу, повтор снова платный', async () => {
+    // Прежде строка кэша оставалась после падения списания (обрыв соединения,
+    // таймаут пула) — и все следующие нажатия отдавали звук бесплатно.
+    const { svc, state, synth, deduct, rows } = makeService();
+    state.failDebit = true;
+    await expect(svc.listen('u1', { text: 'Привет' })).rejects.toThrow(/Connection terminated/);
+    expect(rows.listens).toHaveLength(0);
+    expect(deduct).not.toHaveBeenCalled();
+
+    state.failDebit = false;
+    const again: any = await svc.listen('u1', { text: 'Привет' });
+    expect(again).toMatchObject({ ok: true, cached: false, tokensSpent: 1000 });
+    expect(synth).toHaveBeenCalledTimes(2);
+    expect(deduct).toHaveBeenCalledTimes(1);
   });
 });
 
