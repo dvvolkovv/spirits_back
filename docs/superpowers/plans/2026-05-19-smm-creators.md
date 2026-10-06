@@ -49,7 +49,7 @@ CREATE TRIGGER smm_creator_updated_at BEFORE UPDATE ON smm_creator_campaign
 
 ```bash
 cat ~/Downloads/spirits_back/src/smm/migrations/007_creator_campaign.sql | \
-  ssh dvolkov@212.113.106.202 'PGPASSWORD=linkeon_pass_2026 psql -h localhost -p 5433 -U linkeon -d linkeon'
+  ssh dvolkov@212.113.106.202 'PGPASSWORD=<пароль из .env> psql -h localhost -p 5433 -U linkeon -d linkeon'
 ```
 
 Expected: `ALTER TABLE`, `UPDATE 5` (or however many existing campaigns), `CREATE TABLE`, trigger create.

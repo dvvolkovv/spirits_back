@@ -101,7 +101,7 @@ CREATE INDEX IF NOT EXISTS idx_premium_gen_video
 
 ```bash
 cd /Users/dmitry/Downloads/spirits_back
-PGPASSWORD=linkeon_pass_2026 psql -h localhost -p 5433 -U linkeon -d linkeon \
+PGPASSWORD=<пароль из .env> psql -h localhost -p 5433 -U linkeon -d linkeon \
   -f src/smm/migrations/011_premium_mode.sql
 ```
 
@@ -110,7 +110,7 @@ Expected: `ALTER TABLE`, `CREATE TABLE`, `CREATE INDEX` без ошибок.
 - [ ] **Step 3: Smoke-проверка схемы**
 
 ```bash
-PGPASSWORD=linkeon_pass_2026 psql -h localhost -p 5433 -U linkeon -d linkeon -c "\
+PGPASSWORD=<пароль из .env> psql -h localhost -p 5433 -U linkeon -d linkeon -c "\
   SELECT column_name, data_type FROM information_schema.columns \
    WHERE table_name = 'smm_scenario' AND column_name IN ('premium_genre','kling_scene_count'); \
   \\dt smm_premium_generation"
@@ -121,7 +121,7 @@ Expected: 2 строки колонок + таблица существует.
 - [ ] **Step 4: Применить на prod**
 
 ```bash
-ssh dvolkov@212.113.106.202 'PGPASSWORD=linkeon_pass_2026 psql -h localhost -p 5433 -U linkeon -d linkeon' \
+ssh dvolkov@212.113.106.202 'PGPASSWORD=<пароль из .env> psql -h localhost -p 5433 -U linkeon -d linkeon' \
   < src/smm/migrations/011_premium_mode.sql
 ```
 
@@ -1822,7 +1822,7 @@ Expected: «Summary: all green» в логе deploy-скрипта.
 
 ```bash
 # проверить миграция применилась
-ssh dvolkov@212.113.106.202 'PGPASSWORD=linkeon_pass_2026 psql -h localhost -p 5433 -U linkeon -d linkeon -c "\\d smm_premium_generation"'
+ssh dvolkov@212.113.106.202 'PGPASSWORD=<пароль из .env> psql -h localhost -p 5433 -U linkeon -d linkeon -c "\\d smm_premium_generation"'
 ```
 
 Expected: таблица описана.

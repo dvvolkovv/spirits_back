@@ -205,8 +205,9 @@ rsync -az "dvolkov@212.113.106.202:$LATEST" ~/Downloads/spirits_backups/$(date -
 **PostgreSQL `linkeon`**:
 ```bash
 scp linkeon.sql.gz dvolkov@212.113.106.202:/tmp/
-ssh dvolkov@212.113.106.202 "gunzip -c /tmp/linkeon.sql.gz | PGPASSWORD=linkeon_pass_2026 psql -h localhost -p 5433 -U linkeon -d linkeon"
+ssh dvolkov@212.113.106.202 'gunzip -c /tmp/linkeon.sql.gz | psql "$(sed -n "s/^DATABASE_URL=//p" ~/spirits_back/.env | tail -n 1)"'
 ```
+Строка подключения (`localhost:5433`, пользователь и БД `linkeon`) берётся из `DATABASE_URL` в `.env` на сервере — поэтому `.env` восстанавливается первым. Пароля базы в репозитории нет намеренно: репозиторий публичный.
 Дамп с `--clean --if-exists` — DROP'ит существующие таблицы перед INSERT'ом, так что чистая накатка поверх работает.
 
 **Neo4j**:
@@ -304,7 +305,7 @@ reconnect), поэтому одиночный прогон иногда даёт
 2. SMS-send + debug-OTP + check-code → JWT (доказывает что `DEBUG_SMS_CODES=true` и `DEBUG_SECRET` на месте; смоуку нужен env `DEBUG_SECRET`); debug-ручки без заголовка и с неверным — 404 JSON (`debug-lock.js`)
 3. `/webhook/profile` и `/webhook/user/tokens/` с JWT
 4. `/webhook/soulmate/chat` стримит ответ (покрывает `streamUniversalAgent` → r.linkeon.io)
-5. `custom_chat_history` получил свежие строки (покрывает `saveChatHistory` в `setImmediate`) — DB-чек через SSH+psql
+5. `custom_chat_history` получил свежие строки (покрывает `saveChatHistory` в `setImmediate`) — DB-чек через SSH+psql; строку подключения он берёт на сервере, из `DATABASE_URL` в `.env` бэкенда ([tests/smoke/db-psql.js](tests/smoke/db-psql.js)), так что смена пароля базы смоук не ломает
 6. Аватар Райи отдаётся (image/jpeg)
 
 **Слой 3 — Playwright** ([tests/playwright/smoke.spec.js](tests/playwright/smoke.spec.js))

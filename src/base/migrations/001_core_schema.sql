@@ -6,7 +6,7 @@
 -- версию от 2026-05-21 которая пропускала ai_profiles_consolidated и др.
 --
 -- Регенерация (когда схема прода меняется):
---   ssh dvolkov@212.113.106.202 'PGPASSWORD=linkeon_pass_2026 pg_dump \
+--   ssh dvolkov@212.113.106.202 'PGPASSWORD=<пароль из .env> pg_dump \
 --     -h 127.0.0.1 -p 5433 -U linkeon -d linkeon \
 --     --schema-only --no-owner --no-privileges' \
 --     > src/base/migrations/001_core_schema.sql
