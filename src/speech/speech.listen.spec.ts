@@ -115,6 +115,8 @@ function makeService(overrides: any = {}) {
     balance: overrides.balance ?? 100000,
     profile: overrides.profile ?? { preferred_agent: 'Роман', profile_data: {} },
     failDebit: false as boolean,
+    // Сбой COMMIT транзакции, в которой лежит строка кэша (обрыв соединения).
+    failCommit: false as boolean,
   };
   const rows: { listens: any[] } = { listens: [] };
   const pendingKeys = new Map<string, Promise<void>>();
@@ -191,6 +193,7 @@ function makeService(overrides: any = {}) {
         query: async (sql: string, params: any[] = []) => {
           if (/^\s*BEGIN/i.test(sql)) return { rows: [] };
           if (/^\s*COMMIT/i.test(sql)) {
+            if (state.failCommit && tx.pending.length > 0) throw new Error('Connection terminated unexpectedly');
             rows.listens.push(...tx.pending);
             ledger.push(...txLedger);
             tx.onCommit.forEach((f) => f());
@@ -511,6 +514,19 @@ describe('SpeechService.listen — отказы', () => {
     expect(again).toMatchObject({ ok: true, cached: false, tokensSpent: 1000 });
     expect(synth).toHaveBeenCalledTimes(2);
     expect(deduct).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('SpeechService.listen — сбой фиксации', () => {
+  it('COMMIT не прошёл — деньги не списаны и строки нет: списание и строка в одной транзакции', async () => {
+    // Списание отдельной транзакцией здесь бы уже зафиксировалось: деньги
+    // ушли, а звука в кэше нет — следующее нажатие взяло бы их снова.
+    const { svc, state, deduct, rows } = makeService({ balance: 5000 });
+    state.failCommit = true;
+    await expect(svc.listen('u1', { text: 'Привет' })).rejects.toThrow(/Connection terminated/);
+    expect(deduct).not.toHaveBeenCalled();
+    expect(state.balance).toBe(5000);
+    expect(rows.listens).toHaveLength(0);
   });
 });
 
