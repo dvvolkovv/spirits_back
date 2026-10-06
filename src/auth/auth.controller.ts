@@ -81,6 +81,8 @@ export class AuthController implements OnModuleInit {
     if (result.status === 'blocked') {
       return res.set(CORS).status(403).send('User blocked');
     }
+    // sent, exists и suppressed (новому номеру закрыт общий потолок SMS)
+    // отвечают одинаково: по разнице нельзя узнать, зарегистрирован ли номер.
     return res.set(CORS).status(200).send('SMS sent');
   }
 

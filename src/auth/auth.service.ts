@@ -7,7 +7,9 @@ import { EventsService } from '../events/events.service';
 import axios from 'axios';
 import { randomInt } from 'crypto';
 import { SMS_CODE_TTL_SECONDS, smsAttemptsKey, smsCodeKey, verifySmsCode, SmsCodeCheck } from './sms-code';
-import { isSharedScope, isSmsPhone, maskPhone, smsLimitsFromEnv, SmsLimits, SmsLimitScope, SmsQuotaVerdict, takeSmsQuota } from './sms-limits';
+import { isSmsPhone, maskPhone, SharedLimitHit, smsLimitsFromEnv, SmsLimits, SmsLimitScope, takeSmsQuota } from './sms-limits';
+import { firstInWindow, humanLeft, opensAtMsk } from './limit-alert';
+import { sendTelegramAlert } from '../common/telegram-alert';
 
 // Чисто служебные номера: при DEBUG_SMS_CODES=true НИКОГДА не шлём реальную SMS
 // (код доступен через /webhook/debug/sms-code). Это smoke/мониторинг/playwright
@@ -32,8 +34,38 @@ function aeroSkipList(): string[] {
   return (process.env.SMS_AERO_SKIP_PHONES || '').split(',').map(s => s.trim()).filter(Boolean);
 }
 
+/**
+ * Состояние аккаунта и «известен ли номер» — одним запросом.
+ *
+ * Известный — есть аккаунт с этим основным телефоном или телефонный способ
+ * входа (UNIQUE(provider, provider_sub) — точечный поиск). Такие номера
+ * считаются в своём общем счётчике (sms-limits.ts). Ровно одна строка при
+ * любом исходе: LATERAL отдаёт state первого аккаунта, как прежний
+ * `SELECT state … LIMIT 1`, и один проход по user_id вместо двух.
+ */
+const PHONE_STATE_SQL = `
+  SELECT u.state,
+         (u.internal_id IS NOT NULL OR EXISTS (
+            SELECT 1 FROM user_identities i WHERE i.provider = 'phone' AND i.provider_sub = $1
+         )) AS known
+    FROM (SELECT 1) AS one
+    LEFT JOIN LATERAL (
+      SELECT state, internal_id FROM user_id WHERE primary_phone = $1 LIMIT 1
+    ) u ON true`;
+
+/** Что означает для людей закрытый общий счётчик — строка алерта владельцу. */
+const SHARED_LIMIT_EFFECT: Partial<Record<SmsLimitScope, string>> = {
+  global_hour: 'Новым номерам SMS не уходят, клиенту отвечаем как при успехе.',
+  global_day: 'Новым номерам SMS не уходят, клиенту отвечаем как при успехе.',
+  intl_hour: 'Новым номерам не на +7 SMS не уходят, клиенту отвечаем как при успехе.',
+  intl_day: 'Новым номерам не на +7 SMS не уходят, клиенту отвечаем как при успехе.',
+  known_hour: 'Зарегистрированным номерам — отказ 429 «слишком часто».',
+  known_day: 'Зарегистрированным номерам — отказ 429 «слишком часто».',
+};
+
 export type SmsRequestResult =
-  | { status: 'sent' | 'exists' | 'blocked' | 'invalid_phone' }
+  /** suppressed — новому номеру закрыт общий потолок: клиенту отвечаем как при sent. */
+  | { status: 'sent' | 'exists' | 'blocked' | 'invalid_phone' | 'suppressed' }
   | { status: 'rate_limited'; scope: SmsLimitScope; retryAfterSec: number };
 
 export type CheckCodeResult =
@@ -66,15 +98,13 @@ export class AuthService {
       return { status: 'exists' };
     }
 
-    // Check user state in DB
-    const userRes = await this.pg.query(
-      'SELECT state FROM user_id WHERE primary_phone = $1 LIMIT 1',
-      [phone],
-    );
-
-    if (userRes.rows.length > 0 && userRes.rows[0].state === 'blocked') {
+    // Состояние аккаунта и «известен ли номер» — одним запросом.
+    const userRes = await this.pg.query(PHONE_STATE_SQL, [phone]);
+    const account = userRes.rows[0] || {};
+    if (account.state === 'blocked') {
       return { status: 'blocked' };
     }
+    const known = account.known === true;
 
     // Решаем, глушить ли реальную SMS. Только при DEBUG_SMS_CODES=true:
     //  • чисто служебные номера — всегда глушим (код в Redis);
@@ -89,9 +119,16 @@ export class AuthService {
     // смоук запрашивает по 4–6 раз за выкат, их лимит не касается. Квоту
     // берём до записи кода: при отказе нет ни кода, ни SMS.
     if (!skipSms && !aeroSkipList().includes(phone)) {
-      const verdict = await takeSmsQuota(this.redis, phone, this.smsLimits());
-      // Именно `=== false`: без strictNullChecks `!verdict.ok` союз не сужает.
-      if (verdict.ok === false) return this.refuseOverLimit(phone, verdict);
+      const verdict = await takeSmsQuota(this.redis, phone, known, this.smsLimits());
+      if (verdict.kind !== 'ok') await this.reportSharedLimits(verdict.shared);
+      if (verdict.kind === 'limited') {
+        return this.refuseOverLimit(phone, verdict.scope, verdict.retryAfterSec);
+      }
+      if (verdict.kind === 'suppressed') {
+        // Новому номеру закрыт общий потолок. Ответ — как при успехе: 429
+        // здесь выдал бы, что номер не зарегистрирован. Ни кода, ни SMS.
+        return { status: 'suppressed' };
+      }
     }
 
     // Шестизначный код из криптостойкого генератора: Math.random для кода
@@ -106,8 +143,12 @@ export class AuthService {
     if (skipSms) {
       this.logger.log(`Phone ${phone}: SMSAERO skipped (${isPureTest ? 'pure-test' : 'dev-dual+nosms'}), code in Redis`);
     } else {
-      // Send SMS via SMS Aero
-      await this.sendSms(phone, code, opts?.lang);
+      // SMS Aero — без ожидания. Ответ клиенту от него и раньше не зависел
+      // (sendSms сам ловит и логирует свои ошибки), а ожидание в сотни мс
+      // отличало бы настоящую отправку от подавленной по времени ответа.
+      void this.sendSms(phone, code, opts?.lang).catch((e) =>
+        this.logger.error(`SMS send failed: ${(e as Error)?.message}`),
+      );
     }
     const isTest = skipSms; // for the otp_request event's `sent` flag below
 
@@ -131,17 +172,50 @@ export class AuthService {
   }
 
   /**
-   * Отказ по лимиту: в лог (номер — последние четыре цифры) и в события.
-   * Общий лимит (все номера или все номера не на 7) — error: живые люди до
-   * него не доходят, это признак накрутки.
+   * Отказ 429. Лимит самого номера — warn (номер — последние четыре цифры) и
+   * событие на каждый отказ. `known` — общий счётчик: о нём уже сообщено раз
+   * за окно в reportSharedLimits, повторять на каждом отказе незачем.
    */
-  private refuseOverLimit(phone: string, verdict: Extract<SmsQuotaVerdict, { ok: false }>): SmsRequestResult {
-    const { scope, retryAfterSec } = verdict;
-    const line = `SMS limit ${scope} hit for ${maskPhone(phone)}, retry in ${retryAfterSec}s`;
-    if (isSharedScope(scope)) this.logger.error(`${line} — общий потолок SMS исчерпан, похоже на накрутку`);
-    else this.logger.warn(line);
-    this.events?.track('sms_limit_hit', { userId: phone, props: { scope } });
+  private refuseOverLimit(phone: string, scope: SmsLimitScope, retryAfterSec: number): SmsRequestResult {
+    if (scope.startsWith('phone_')) {
+      this.logger.warn(`SMS limit ${scope} hit for ${maskPhone(phone)}, retry in ${retryAfterSec}s`);
+      this.events?.track('sms_limit_hit', { userId: phone, props: { scope } });
+    }
     return { status: 'rate_limited', scope, retryAfterSec };
+  }
+
+  /**
+   * Заполненные общие счётчики (global, intl, known): error в лог, событие и
+   * Telegram владельцу — раз за окно на счётчик, а не на каждый отказ (при
+   * накрутке отказов сотни в минуту). Номеров в сигнале нет: он про счётчик,
+   * а не про того, кто первым в него упёрся.
+   */
+  private async reportSharedLimits(hits: SharedLimitHit[]): Promise<void> {
+    for (const hit of hits) {
+      let first: boolean;
+      try {
+        first = await firstInWindow(this.redis, hit.alertKey, hit.windowLeftMs);
+      } catch (e) {
+        // Сигнал — не повод сорвать ответ: отказ или «успех» клиенту уже решены.
+        this.logger.warn(`SMS limit ${hit.scope}: отметка алерта не записана: ${(e as Error)?.message}`);
+        continue;
+      }
+      if (!first) continue;
+      const window = hit.scope.endsWith('_hour') ? 'час' : 'сутки';
+      const left = humanLeft(hit.windowLeftMs);
+      const until = opensAtMsk(hit.windowLeftMs);
+      this.logger.error(
+        `SMS limit ${hit.scope} reached (${hit.max} в ${window}) — закрыт ещё ${left}, до ${until}; похоже на накрутку`,
+      );
+      this.events?.track('sms_limit_hit', { props: { scope: hit.scope } });
+      void sendTelegramAlert(
+        `<b>Linkeon: исчерпан общий лимит SMS</b>\n` +
+          `Счётчик: <b>${hit.scope}</b> — ${hit.max} в ${window}\n` +
+          `${SHARED_LIMIT_EFFECT[hit.scope] ?? ''}\n` +
+          `Откроется через ${left}, в ${until}.\n` +
+          `Похоже на накрутку. Снять вручную — CLAUDE.md бэкенда, «Auth».`,
+      ).catch(() => undefined);
+    }
   }
 
   /**

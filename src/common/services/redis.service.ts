@@ -43,17 +43,22 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     return this.client.incr(key);
   }
 
-  async decr(key: string): Promise<number> {
-    return this.client.decr(key);
-  }
-
   async expire(key: string, ttlSeconds: number): Promise<void> {
     await this.client.expire(key, ttlSeconds);
   }
 
-  /** Остаток жизни ключа в секундах, как в Redis: -1 — без срока, -2 — ключа нет. */
-  async ttl(key: string): Promise<number> {
-    return this.client.ttl(key);
+  /**
+   * Lua-скрипт на стороне Redis (EVAL): выполняется атомарно, никакая другая
+   * команда не вклинится между его шагами. Нужен там, где проверка и запись
+   * должны быть одним действием — см. src/auth/quota.ts.
+   */
+  async eval(script: string, keys: string[], args: Array<string | number>): Promise<unknown> {
+    return this.client.eval(script, keys.length, ...keys, ...args);
+  }
+
+  /** SET NX PX: записать, только если ключа нет; true — записали мы. */
+  async setNx(key: string, value: string, ttlMs: number): Promise<boolean> {
+    return (await this.client.set(key, value, 'PX', ttlMs, 'NX')) === 'OK';
   }
 
   async keys(pattern: string): Promise<string[]> {
