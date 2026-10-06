@@ -43,8 +43,17 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     return this.client.incr(key);
   }
 
+  async decr(key: string): Promise<number> {
+    return this.client.decr(key);
+  }
+
   async expire(key: string, ttlSeconds: number): Promise<void> {
     await this.client.expire(key, ttlSeconds);
+  }
+
+  /** Остаток жизни ключа в секундах, как в Redis: -1 — без срока, -2 — ключа нет. */
+  async ttl(key: string): Promise<number> {
+    return this.client.ttl(key);
   }
 
   async keys(pattern: string): Promise<string[]> {

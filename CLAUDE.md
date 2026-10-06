@@ -349,7 +349,7 @@ cd ~/Downloads/spirits_back/tests && node runner.js  # api (32) + e2e (18) = 50
 ## API Endpoints
 
 ### Auth (публичные)
-- `GET /webhook/{uuid}/sms/:phone` — запрос SMS кода
+- `GET /webhook/{uuid}/sms/:phone` — запрос SMS кода (им же — код для привязки телефона). `:phone` — только цифры с кодом страны, иначе 400 `invalid_phone`. Лимиты настоящих отправок (на номер 60 с / 3 в час / 5 в сутки; все номера 30/100; не на 7 — 5/15) → 429 `too_many_requests` + `retryAfterSec`; тестовые номера не считаются. Пороги и `SMS_LIMIT_*` — `src/auth/sms-limits.ts`
 - `GET /webhook/{uuid}/check-code/:phone/:code` — проверка кода, возврат JWT
 - `POST /webhook/auth/refresh` — обновление JWT
 - `GET /webhook/debug/sms-code/:phone` — debug: получить код из Redis (только с заголовком `X-Debug-Secret`, см. «Тестовые аккаунты»)

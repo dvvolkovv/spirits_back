@@ -69,6 +69,15 @@ export class AuthController implements OnModuleInit {
       suppressSms: nosms === '1' || nosms === 'true',
       lang,
     });
+    if (result.status === 'invalid_phone') {
+      return res.set(CORS).status(400).json({ error: 'invalid_phone' });
+    }
+    if (result.status === 'rate_limited') {
+      // Срок — и заголовком, и в теле: клиенты читают тело, а заголовок —
+      // стандартный способ сказать то же самое всем остальным.
+      return res.set(CORS).set('Retry-After', String(result.retryAfterSec)).status(429)
+        .json({ error: 'too_many_requests', retryAfterSec: result.retryAfterSec });
+    }
     if (result.status === 'blocked') {
       return res.set(CORS).status(403).send('User blocked');
     }

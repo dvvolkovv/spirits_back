@@ -7,6 +7,7 @@ import { EventsService } from '../events/events.service';
 import axios from 'axios';
 import { randomInt } from 'crypto';
 import { SMS_CODE_TTL_SECONDS, smsAttemptsKey, smsCodeKey, verifySmsCode, SmsCodeCheck } from './sms-code';
+import { isSharedScope, isSmsPhone, maskPhone, smsLimitsFromEnv, SmsLimits, SmsLimitScope, SmsQuotaVerdict, takeSmsQuota } from './sms-limits';
 
 // Чисто служебные номера: при DEBUG_SMS_CODES=true НИКОГДА не шлём реальную SMS
 // (код доступен через /webhook/debug/sms-code). Это smoke/мониторинг/playwright
@@ -22,6 +23,19 @@ const PURE_TEST_PATTERN = /^790300\d{5}$/;
 // (инцидент 2026-07-10). Код всё равно кладётся в Redis для debug-эндпоинта.
 const DEV_DUAL_PHONES = ['79656445804'];
 
+/**
+ * Номера из SMS_AERO_SKIP_PHONES: код кладётся в Redis, SMS Aero не зовётся.
+ * Это тестовые номера смоука и playwright (см. sendSms), настоящей отправки
+ * по ним нет — и лимиты отправки на них не распространяются.
+ */
+function aeroSkipList(): string[] {
+  return (process.env.SMS_AERO_SKIP_PHONES || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
+export type SmsRequestResult =
+  | { status: 'sent' | 'exists' | 'blocked' | 'invalid_phone' }
+  | { status: 'rate_limited'; scope: SmsLimitScope; retryAfterSec: number };
+
 export type CheckCodeResult =
   | { status: 'ok'; tokens: { 'access-token': string; 'refresh-token': string; 'is-new-user': boolean } }
   | { status: 'invalid' | 'too_many_attempts' };
@@ -29,6 +43,8 @@ export type CheckCodeResult =
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
+  /** Неверные SMS_LIMIT_* уже названы в логе — не повторять на каждой SMS. */
+  private readonly reportedLimitEnv = new Set<string>();
 
   constructor(
     private readonly pg: PgService,
@@ -38,7 +54,11 @@ export class AuthService {
     @Optional() private readonly events?: EventsService,
   ) {}
 
-  async requestSmsCode(phone: string, sid?: string | null, src?: string | null, opts?: { suppressSms?: boolean; lang?: string | null }): Promise<{ status: string }> {
+  async requestSmsCode(phone: string, sid?: string | null, src?: string | null, opts?: { suppressSms?: boolean; lang?: string | null }): Promise<SmsRequestResult> {
+    // Номер из адреса запроса — что угодно. Мусор не доходит ни до Redis,
+    // ни до SMS Aero.
+    if (!isSmsPhone(phone)) return { status: 'invalid_phone' };
+
     // Check if code already exists in Redis
     const existing = await this.redis.get(smsCodeKey(phone));
     if (existing) {
@@ -56,6 +76,24 @@ export class AuthService {
       return { status: 'blocked' };
     }
 
+    // Решаем, глушить ли реальную SMS. Только при DEBUG_SMS_CODES=true:
+    //  • чисто служебные номера — всегда глушим (код в Redis);
+    //  • «двойной» номер владельца (79656445804) — глушим ТОЛЬКО если вызов
+    //    помечен автоматическим (suppressSms=?nosms=1); обычный вход шлёт SMS.
+    const debug = process.env.DEBUG_SMS_CODES === 'true';
+    const isPureTest = PURE_TEST_PHONES.includes(phone) || PURE_TEST_PATTERN.test(phone);
+    const isDevDual = DEV_DUAL_PHONES.includes(phone);
+    const skipSms = debug && (isPureTest || (isDevDual && !!opts?.suppressSms));
+
+    // Лимиты — только на настоящие отправки (sms-limits.ts). Тестовые номера
+    // смоук запрашивает по 4–6 раз за выкат, их лимит не касается. Квоту
+    // берём до записи кода: при отказе нет ни кода, ни SMS.
+    if (!skipSms && !aeroSkipList().includes(phone)) {
+      const verdict = await takeSmsQuota(this.redis, phone, this.smsLimits());
+      // Именно `=== false`: без strictNullChecks `!verdict.ok` союз не сужает.
+      if (verdict.ok === false) return this.refuseOverLimit(phone, verdict);
+    }
+
     // Шестизначный код из криптостойкого генератора: Math.random для кода
     // входа не годится.
     const code = String(randomInt(100000, 1000000));
@@ -65,14 +103,6 @@ export class AuthService {
     await this.redis.del(smsAttemptsKey(phone));
     await this.redis.set(smsCodeKey(phone), code, SMS_CODE_TTL_SECONDS);
 
-    // Решаем, глушить ли реальную SMS. Только при DEBUG_SMS_CODES=true:
-    //  • чисто служебные номера — всегда глушим (код в Redis);
-    //  • «двойной» номер владельца (79656445804) — глушим ТОЛЬКО если вызов
-    //    помечен автоматическим (suppressSms=?nosms=1); обычный вход шлёт SMS.
-    const debug = process.env.DEBUG_SMS_CODES === 'true';
-    const isPureTest = PURE_TEST_PHONES.includes(phone) || PURE_TEST_PATTERN.test(phone);
-    const isDevDual = DEV_DUAL_PHONES.includes(phone);
-    const skipSms = debug && (isPureTest || (isDevDual && !!opts?.suppressSms));
     if (skipSms) {
       this.logger.log(`Phone ${phone}: SMSAERO skipped (${isPureTest ? 'pure-test' : 'dev-dual+nosms'}), code in Redis`);
     } else {
@@ -87,6 +117,31 @@ export class AuthService {
     this.events?.track('otp_request', { userId: phone, sessionId: sid || null, source: src || null, props: { channel: 'sms', sent: !isTest } });
 
     return { status: 'sent' };
+  }
+
+  /** Пороги лимитов SMS: умолчания из sms-limits.ts, поверх них — env. */
+  private smsLimits(): SmsLimits {
+    const { limits, ignored } = smsLimitsFromEnv();
+    for (const bad of ignored) {
+      if (this.reportedLimitEnv.has(bad)) continue;
+      this.reportedLimitEnv.add(bad);
+      this.logger.warn(`${bad}: нужно целое больше нуля — действует значение по умолчанию`);
+    }
+    return limits;
+  }
+
+  /**
+   * Отказ по лимиту: в лог (номер — последние четыре цифры) и в события.
+   * Общий лимит (все номера или все номера не на 7) — error: живые люди до
+   * него не доходят, это признак накрутки.
+   */
+  private refuseOverLimit(phone: string, verdict: Extract<SmsQuotaVerdict, { ok: false }>): SmsRequestResult {
+    const { scope, retryAfterSec } = verdict;
+    const line = `SMS limit ${scope} hit for ${maskPhone(phone)}, retry in ${retryAfterSec}s`;
+    if (isSharedScope(scope)) this.logger.error(`${line} — общий потолок SMS исчерпан, похоже на накрутку`);
+    else this.logger.warn(line);
+    this.events?.track('sms_limit_hit', { userId: phone, props: { scope } });
+    return { status: 'rate_limited', scope, retryAfterSec };
   }
 
   /**
@@ -119,9 +174,7 @@ export class AuthService {
     // деплой дёргают /sms/:phone 4-6 раз, SMS Aero отбивает 400 (blacklist) — забивает
     // логи и расходует rate-limit. Код всё равно лежит в Redis (sendCode), так что
     // /webhook/debug/sms-code/:phone и smoke-чек работают как раньше.
-    const skipList = (process.env.SMS_AERO_SKIP_PHONES || '')
-      .split(',').map(s => s.trim()).filter(Boolean);
-    if (skipList.includes(phone)) {
+    if (aeroSkipList().includes(phone)) {
       this.logger.log(`SMS Aero skipped for ${phone} (in SMS_AERO_SKIP_PHONES). Code in Redis.`);
       return;
     }
