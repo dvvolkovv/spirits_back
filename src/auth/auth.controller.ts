@@ -195,7 +195,7 @@ export class AuthController implements OnModuleInit {
   }
 
   @Post('auth/email/request')
-  async emailRequest(@Body() body: { email?: string }, @Req() req: Request, @Res() res: Response) {
+  async emailRequest(@Body() body: { email?: string }, @Res() res: Response) {
     const rawEmail = (body?.email || '').trim().toLowerCase();
     if (!rawEmail || !rawEmail.includes('@')) {
       return res.set(CORS).status(400).json({ error: 'invalid email' });
@@ -203,10 +203,16 @@ export class AuthController implements OnModuleInit {
     if (this.email.isTempmail(rawEmail)) {
       return res.set(CORS).status(400).json({ error: 'tempmail_blocked', message: 'Используйте постоянную почту' });
     }
-    const ip = ((req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown') as string).split(',')[0].trim();
-    const rl = await this.email.checkRateLimit(rawEmail, ip);
-    if (!rl.ok) {
-      return res.set(CORS).status(429).json({ error: 'rate_limit', reason: (rl as { ok: false; reason: string }).reason });
+    const quota = await this.email.takeSendQuota(rawEmail);
+    if (quota.kind === 'limited') {
+      // error и reason — прежние: веб разбирает error === 'rate_limit',
+      // мобилка — статус 429. Срок — дополнительно.
+      return res.set(CORS).set('Retry-After', String(quota.retryAfterSec)).status(429)
+        .json({ error: 'rate_limit', reason: 'per_email', retryAfterSec: quota.retryAfterSec });
+    }
+    if (quota.kind === 'suppressed') {
+      // Общий потолок писем закрыт: ответ как при успехе, письма нет (email.service.ts).
+      return res.set(CORS).status(200).json({ sent: true });
     }
     const token = await this.email.generateMagicToken(rawEmail);
     try {

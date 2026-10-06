@@ -6,6 +6,60 @@ import * as bcrypt from 'bcryptjs';
 import * as nodemailer from 'nodemailer';
 import { RedisService } from '../common/services/redis.service';
 import { PgService } from '../common/services/pg.service';
+import { sendTelegramAlert } from '../common/telegram-alert';
+import { limitsFromEnv, QuotaRule, takeQuota } from './quota';
+import { firstInWindow, humanLeft, opensAtMsk } from './limit-alert';
+
+/** Лимиты писем со ссылкой входа, окно — 10 минут. Плюс минута между письмами на ящик. */
+export interface MagicLinkLimits {
+  /** Писем на один ящик (mailboxKey) за 10 минут. */
+  perAddress: number;
+  /** Писем на все адреса за 10 минут. */
+  global: number;
+}
+
+/**
+ * Пороги по умолчанию. Живой человек запрашивает ссылку раз-два; три за
+ * 10 минут на ящик — с запасом. Общий потолок — 60 за 10 минут: в разы выше
+ * живого потока и в шесть раз выше прежнего «10 на всех», который на проде
+ * был общим из-за прокси. Поднять — EMAIL_LIMIT_* в .env и перезапуск.
+ */
+export const MAGIC_LINK_LIMIT_DEFAULTS: Readonly<MagicLinkLimits> = Object.freeze({ perAddress: 3, global: 60 });
+
+export const MAGIC_LINK_LIMIT_ENV: Readonly<Record<keyof MagicLinkLimits, string>> = Object.freeze({
+  perAddress: 'EMAIL_LIMIT_PER_ADDRESS_10MIN',
+  global: 'EMAIL_LIMIT_GLOBAL_10MIN',
+});
+
+export type MagicLinkQuota =
+  | { kind: 'ok' }
+  | { kind: 'limited'; retryAfterSec: number }
+  | { kind: 'suppressed' };
+
+const YANDEX_DOMAINS = new Set(['yandex.ru', 'ya.ru', 'yandex.com', 'yandex.by', 'yandex.kz', 'yandex.ua']);
+
+/**
+ * Ящик, в который на самом деле придёт письмо, — ключ счёта писем.
+ *
+ * Иначе один ящик забрасывается письмами через синонимы адреса: метка после
+ * «+» (почти все почтовые службы доставляют её в тот же ящик), точки в
+ * логине Gmail и googlemail.com, домены-синонимы Яндекса, где точка и дефис
+ * в логине равнозначны. Только для счёта: адрес входа не меняется.
+ */
+export function mailboxKey(email: string): string {
+  const e = email.trim().toLowerCase();
+  const at = e.lastIndexOf('@');
+  if (at < 1) return e;
+  let local = e.slice(0, at).split('+')[0];
+  let domain = e.slice(at + 1);
+  if (domain === 'googlemail.com') domain = 'gmail.com';
+  if (domain === 'gmail.com') local = local.replace(/\./g, '');
+  if (YANDEX_DOMAINS.has(domain)) {
+    domain = 'yandex.ru';
+    local = local.replace(/\./g, '-');
+  }
+  return `${local}@${domain}`;
+}
 
 /**
  * Верхняя граница ожидания отправки письма на уровне сервиса.
@@ -20,6 +74,8 @@ export class EmailService {
   private tempmailDomains: Set<string>;
   private transporter: nodemailer.Transporter | null = null;
   private readonly fromAddress = process.env.EMAIL_FROM || 'noreply@linkeon.io';
+  /** Неверные EMAIL_LIMIT_* уже названы в логе — не повторять на каждом письме. */
+  private readonly reportedLimitEnv = new Set<string>();
 
   constructor(
     @Optional() private readonly redis?: RedisService,
@@ -200,15 +256,64 @@ export class EmailService {
     this.logger.log(`magic-link sent to ${email}`);
   }
 
-  async checkRateLimit(email: string, ip: string): Promise<{ ok: true } | { ok: false; reason: 'per_email' | 'per_ip' }> {
-    if (!this.redis) return { ok: true };
-    const perEmail = await this.redis.get(`ml-rate-${email}`);
-    if (perEmail) return { ok: false, reason: 'per_email' };
-    await this.redis.set(`ml-rate-${email}`, '1', 60);
-    const ipCount = parseInt((await this.redis.get(`ml-rate-ip-${ip}`)) || '0', 10);
-    if (ipCount >= 10) return { ok: false, reason: 'per_ip' };
-    await this.redis.set(`ml-rate-ip-${ip}`, String(ipCount + 1), 600);
-    return { ok: true };
+  /**
+   * Квота на письмо со ссылкой входа. Проверка и учёт — один Lua-скрипт
+   * (quota.ts): отказ ничего не считает.
+   *
+   * Раньше второй счётчик шёл по первому адресу из X-Forwarded-For, а на проде
+   * за прокси Selectel там у всех 127.0.0.1 — «10 писем за 10 минут» было
+   * общим потолком на весь вход по почте. Теперь счёт по ящику (mailboxKey):
+   * не чаще раза в минуту и не больше трёх за 10 минут — против забрасывания
+   * одного ящика. Плюс общий потолок повыше — против рассылки по чужим
+   * адресам.
+   *
+   * `limited` — 429 (своя квота ящика). `suppressed` — общий потолок: ответ как
+   * при успехе, но письма нет; о закрытом потолке — раз за окно в лог и
+   * Telegram владельцу.
+   */
+  async takeSendQuota(email: string): Promise<MagicLinkQuota> {
+    if (!this.redis) return { kind: 'ok' };
+    const { limits, ignored } = limitsFromEnv(MAGIC_LINK_LIMIT_DEFAULTS, MAGIC_LINK_LIMIT_ENV);
+    for (const bad of ignored) {
+      if (this.reportedLimitEnv.has(bad)) continue;
+      this.reportedLimitEnv.add(bad);
+      this.logger.warn(`${bad}: нужно целое больше нуля — действует значение по умолчанию`);
+    }
+    const box = mailboxKey(email);
+    const rules: QuotaRule[] = [
+      { key: `ml-rate-addr:${box}:gap`, max: 1, windowSec: 60 },
+      { key: `ml-rate-addr:${box}:10m`, max: limits.perAddress, windowSec: 600 },
+      { key: 'ml-rate-global:10m', max: limits.global, windowSec: 600 },
+    ];
+    const reply = await takeQuota(this.redis, rules);
+    if (reply.counted) return { kind: 'ok' };
+
+    const [gapLeft, boxLeft, globalLeft] = reply.leftMs;
+    if (globalLeft >= 0) await this.reportGlobalLimit(globalLeft, limits.global);
+    // Своя квота ящика старше общей — как у SMS: сначала то, что зависит от
+    // самого адреса.
+    const ownLeft = Math.max(gapLeft, boxLeft);
+    if (ownLeft >= 0) return { kind: 'limited', retryAfterSec: Math.max(1, Math.ceil(ownLeft / 1000)) };
+    return { kind: 'suppressed' };
+  }
+
+  /** Общий потолок писем закрыт: error и Telegram — раз за окно, без адресов. */
+  private async reportGlobalLimit(windowLeftMs: number, max: number): Promise<void> {
+    try {
+      if (!(await firstInWindow(this.redis!, 'ml-rate-alerted:global:10m', windowLeftMs))) return;
+    } catch (e) {
+      this.logger.warn(`magic-link limit: отметка алерта не записана: ${(e as Error)?.message}`);
+      return;
+    }
+    const left = humanLeft(windowLeftMs);
+    const until = opensAtMsk(windowLeftMs);
+    this.logger.error(`magic-link limit global reached (${max} за 10 мин) — закрыт ещё ${left}, до ${until}; похоже на накрутку`);
+    void sendTelegramAlert(
+      `<b>Linkeon: исчерпан общий лимит писем входа</b>\n` +
+        `${max} писем за 10 минут. Письма со ссылкой входа не уходят, клиенту отвечаем как при успехе.\n` +
+        `Откроется через ${left}, в ${until}.\n` +
+        `Похоже на накрутку. Снять вручную — CLAUDE.md бэкенда, «Auth».`,
+    ).catch(() => undefined);
   }
 
   async hashPassword(plain: string): Promise<string> {
