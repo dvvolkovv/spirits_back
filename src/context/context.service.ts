@@ -73,6 +73,30 @@ export class ContextService {
     return { text: kept.join('\n\n'), sections: stats };
   }
 
+  /**
+   * Свежее «сейчас и сегодня» — для запроса посреди разговора.
+   *
+   * Системный промпт Realtime ставится один раз на старте и дальше не
+   * меняется, поэтому длинный звонок живёт с замороженным снимком: начатый
+   * в 13:55 разговор через сорок минут всё ещё считает встречу в 14:00
+   * предстоящей. Досылать это в контекст НЕЛЬЗЯ — `updateChatCtx` в SDK
+   * замещает контекст целиком и может откатить живой разговор (живая встреча
+   * 11.09.2026, разбор в voice-host/src/agent.ts:244). Поэтому модель берёт
+   * свежее сама, инструментом, — тем же способом, которым уже зовёт коллег.
+   */
+  async scheduleText(userId: string, clientTz?: string): Promise<string> {
+    const parts: string[] = [];
+    for (const name of ['now', 'today'] as SectionName[]) {
+      try {
+        const t = (await this.renderSection(name, userId, { clientTz })) || '';
+        if (t.trim()) parts.push(t.trim());
+      } catch (e: any) {
+        this.logger.warn(`секция ${name} для ${userId} не собралась: ${e?.message}`);
+      }
+    }
+    return parts.join('\n\n');
+  }
+
   private renderSection(
     name: SectionName,
     userId: string,

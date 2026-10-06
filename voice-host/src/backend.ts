@@ -32,6 +32,10 @@ const TIMEOUT_MS: Record<string, number> = {
   // можно ровно столько, сколько терпимо молчание в живой встрече. Ручка
   // только просит мост создать запрос на отправку.
   'meeting-chat': 3_000,
+  // Расписание. Тул синхронный, разговор ждёт его возврата, поэтому ждать
+  // можно ровно столько, сколько терпимо молчание в трубке. Ручка читает
+  // календарь и дела пользователя — это БД, а не поход в LLM.
+  schedule: 3_000,
 };
 
 async function post<T>(path: string, body: unknown): Promise<T> {
@@ -44,6 +48,18 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   });
   if (!res.ok) throw new Error(`${path} → ${res.status}`);
   return res.json() as Promise<T>;
+}
+
+/**
+ * Свежее «сейчас и сегодня» посреди звонка.
+ *
+ * Системный промпт Realtime ставится один раз на старте, поэтому длинный
+ * разговор живёт с замороженным снимком дня. Досылать обновление в контекст
+ * нельзя — updateChatCtx замещает его целиком (см. agent.ts:244), — поэтому
+ * модель берёт свежее сама, когда оно ей понадобилось.
+ */
+export async function schedule(callId: string): Promise<{ text: string }> {
+  return post<{ text: string }>('schedule', { callId });
 }
 
 export type AskResult =

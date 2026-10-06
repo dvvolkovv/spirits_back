@@ -603,3 +603,38 @@ describe('VoiceCallService + ContextService', () => {
     expect(ins[1]).toContain('web');
   });
 });
+
+describe('VoiceCallService.scheduleFor', () => {
+  const { ContextService } = require('../context/context.service');
+
+  it('отдаёт свежее расписание по идущему звонку', async () => {
+    const d = makeDeps([]);
+    const trip = {
+      getState: jest.fn().mockResolvedValue({
+        headline: '', contextLines: [],
+        events: [{ at: '2026-10-06T16:00:00+05:00', title: 'Эпиляция', conflict: false }],
+        tasks: [],
+      }),
+    };
+    const ctx = new ContextService(d.pg as any, trip as any);
+    const svc = new VoiceCallService(
+      d.pg as any, d.chat as any, d.livekit as any,
+      undefined, undefined, undefined, ctx as any,
+    );
+
+    const text = await svc.scheduleFor('call-1');
+
+    expect(text).toContain('16:00 — Эпиляция');
+  });
+
+  it('пустая строка вместо исключения: тул синхронный, разговор ждёт', async () => {
+    const d = makeDeps([]);
+    const ctx = { scheduleText: jest.fn().mockRejectedValue(new Error('бум')) };
+    const svc = new VoiceCallService(
+      d.pg as any, d.chat as any, d.livekit as any,
+      undefined, undefined, undefined, ctx as any,
+    );
+
+    await expect(svc.scheduleFor('call-1')).resolves.toBe('');
+  });
+});

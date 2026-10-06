@@ -144,6 +144,23 @@ export class VoiceCallService implements OnModuleInit {
   }
 
   /**
+   * Свежее расписание по идущему звонку — для инструмента воркера.
+   *
+   * Пустая строка вместо ошибки: инструмент синхронный, разговор ждёт его
+   * возврата, и падение здесь означало бы тишину в трубке.
+   */
+  async scheduleFor(callId: string): Promise<string> {
+    if (!this.context) return '';
+    const call = await this.load(callId);
+    try {
+      return await this.context.scheduleText(String(call.user_id));
+    } catch (e: any) {
+      this.logger.warn(`[schedule] call=${callId}: ${e?.message}`);
+      return '';
+    }
+  }
+
+  /**
    * Старая сборка — только на случай, когда ContextService не поднят
    * (стенды без модуля, юнит-тесты смежных сервисов). Удалить, когда на
    * ContextService переедут чат и Telegram.

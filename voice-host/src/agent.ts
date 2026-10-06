@@ -803,6 +803,27 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
           }
         },
       }),
+      check_schedule: llm.tool({
+        description:
+          'Узнать СВЕЖЕЕ текущее время пользователя и его сегодняшние события и дела. ' +
+          'Зови это всегда, когда речь заходит о времени, «сегодня», «сейчас», «дальше», ' +
+          'о встречах или делах: то, что дано тебе в инструкции, — снимок на момент начала ' +
+          'разговора и к середине звонка успевает устареть.',
+        execute: async () => {
+          try {
+            const r = await backend.schedule(meta.callId);
+            return r.text
+              ? { schedule: r.text }
+              // Пустой ответ — не ошибка: у человека может не быть ничего на сегодня.
+              : { schedule: 'на сегодня ничего не запланировано' };
+          } catch (e) {
+            // Внятный ответ вместо исключения: иначе модель замолчит или
+            // начнёт извиняться непонятно за что (как в ask_specialist).
+            console.error('check_schedule failed', e);
+            return { schedule: 'не удалось проверить — скажи об этом вслух и не придумывай' };
+          }
+        },
+      }),
       list_specialists: llm.tool({
         description: 'Список доступных специалистов.',
         execute: async () => ({ specialists: meta.specialists }),
@@ -932,7 +953,8 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
           }
         : {}),
     };
-    // Базовых тула три, write_to_chat — четвёртый, условный. create_document
+    // Базовых тула четыре (ask_specialist, check_schedule, list_specialists,
+    // create_document), write_to_chat — пятый, условный. create_document
     // был в первой редакции спеки как save_note, я его снял, решив, что он
     // дублирует резюме звонка, — и на живом звонке 26.08.2026 владелец
     // попросил документ, а Роману оказалось некуда его положить. Резюме это

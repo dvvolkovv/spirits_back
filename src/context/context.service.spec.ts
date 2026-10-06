@@ -82,3 +82,34 @@ describe('ContextService', () => {
     expect(text).toContain('данные на');
   });
 });
+
+describe('ContextService.scheduleText', () => {
+  it('отдаёт только «сейчас» и «сегодня» — для запроса посреди разговора', async () => {
+    const trip = {
+      getState: jest.fn().mockResolvedValue({
+        headline: '', contextLines: [],
+        events: [{ at: '2026-10-06T16:00:00+05:00', title: 'Эпиляция', conflict: false }],
+        tasks: [],
+      }),
+    } as any;
+    const svc = new ContextService(pgEmpty(), trip);
+    jest.spyOn(svc as any, 'sectionCloudProfile').mockResolvedValue('ОБЛАЧНЫЙ-ПРОФИЛЬ');
+
+    const text = await svc.scheduleText('u1');
+
+    expect(text).toContain('--- Сейчас ---');
+    expect(text).toContain('16:00 — Эпиляция');
+    // В расписание не должно утекать ничего лишнего: это ответ на вопрос
+    // «сколько времени и что у меня дальше», а не второй полный контекст.
+    expect(text).not.toContain('ОБЛАЧНЫЙ-ПРОФИЛЬ');
+  });
+
+  it('упавший календарь не роняет инструмент — разговор ждёт ответа', async () => {
+    const trip = { getState: jest.fn().mockRejectedValue(new Error('календарь прилёг')) } as any;
+    const svc = new ContextService(pgEmpty(), trip);
+
+    const text = await svc.scheduleText('u1');
+
+    expect(text).toContain('--- Сейчас ---');
+  });
+});

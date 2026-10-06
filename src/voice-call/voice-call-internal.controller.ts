@@ -66,6 +66,22 @@ export class VoiceCallInternalController {
     return this.jobs.ask(body.callId, call.room_name, call.user_id, body.specialist, body.question);
   }
 
+  /**
+   * Свежее «сейчас и сегодня» посреди звонка.
+   *
+   * Возвращаем текст даже по неактивному звонку — в отличие от `ask`, здесь
+   * нет ни оплаты, ни отправки в комнату, а гонка «тул вызван, пока статус
+   * переключался» привела бы к беспричинному «не знаю».
+   */
+  @Post('schedule')
+  async schedule(
+    @Headers('x-voice-signature') signature: string,
+    @Req() req: Request,
+  ): Promise<{ text: string }> {
+    const body = this.parseSigned<{ callId: string }>(req, signature);
+    return { text: await this.calls.scheduleFor(body.callId) };
+  }
+
   @Post('document')
   async document(
     @Headers('x-voice-signature') signature: string,
