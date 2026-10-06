@@ -228,16 +228,41 @@ describe('check-code: ответ клиенту', () => {
   });
 });
 
+/**
+ * Как привязку зовут клиенты: веб (apiClient) и мобилка (ApiClient) на 401
+ * обновляют access-токен и повторяют тот же запрос с тем же кодом.
+ */
+async function linkPhoneAsClient(c: AuthController, code: string) {
+  let res = fakeRes();
+  await linkPhone(c, code, res);
+  if (res.out.code === 401) {
+    res = fakeRes();
+    await linkPhone(c, code, res);
+  }
+  return res;
+}
+
 describe('привязка телефона: тот же лимит', () => {
+  it('неверный код — 400, и попытка тратится одна, а не две', async () => {
+    // На 401 клиент принял бы отказ за протухший токен и повторил запрос:
+    // каждый неверный ввод съедал бы две попытки из пяти.
+    const { controller, redis } = makeController();
+    await redis.set(smsCodeKey(PHONE), CODE, SMS_CODE_TTL_SECONDS);
+
+    const res = await linkPhoneAsClient(controller, WRONG);
+
+    expect(redis.data.get(smsAttemptsKey(PHONE))).toBe('1');
+    expect(res.out).toEqual({ code: 400, body: { error: 'invalid code' } });
+  });
+
   it('5 неверных — код погашен, 6-я с верным кодом не привязывает', async () => {
     const { controller, redis, links } = makeController();
     await redis.set(smsCodeKey(PHONE), CODE, SMS_CODE_TTL_SECONDS);
 
     const bodies: any[] = [];
     for (let i = 0; i < SMS_CODE_MAX_ATTEMPTS; i++) {
-      const res = fakeRes();
-      await linkPhone(controller, WRONG, res);
-      expect(res.out.code).toBe(401);
+      const res = await linkPhoneAsClient(controller, WRONG);
+      expect(res.out.code).toBe(400);
       bodies.push(res.out.body.error);
     }
     expect(bodies).toEqual(['invalid code', 'invalid code', 'invalid code', 'invalid code', 'too many attempts']);
@@ -245,7 +270,7 @@ describe('привязка телефона: тот же лимит', () => {
 
     const sixth = fakeRes();
     await linkPhone(controller, CODE, sixth);
-    expect(sixth.out.code).toBe(401);
+    expect(sixth.out.code).toBe(400);
     expect(links).toEqual([]);
   });
 
@@ -255,7 +280,7 @@ describe('привязка телефона: тот же лимит', () => {
     for (let i = 0; i < SMS_CODE_MAX_ATTEMPTS; i++) await checkCode(controller, WRONG, fakeRes());
     const res = fakeRes();
     await linkPhone(controller, CODE, res);
-    expect(res.out.code).toBe(401);
+    expect(res.out.code).toBe(400);
     expect(links).toEqual([]);
   });
 

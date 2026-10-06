@@ -693,9 +693,16 @@ location.replace('/chat');
     if (!phone || !code) return res.set(CORS).status(400).json({ error: 'missing phone/code' });
 
     // Та же проверка, что при входе, с тем же лимитом попыток (sms-code.ts).
+    //
+    // Ошибка КОДА — 400, не 401. Веб (apiClient) и мобилка (ApiClient) на
+    // любой 401 считают, что протух access-токен: обновляют его и повторяют
+    // запрос с тем же кодом. С 401 каждый неверный ввод съедал две попытки из
+    // пяти. Оба клиента разбирают отказ по полю error, не по статусу. 401 здесь
+    // — только настоящая проблема авторизации (JwtGuard и строка выше).
+    // Вход (check-code) остаётся на 401: его мобилка ждёт по статусу.
     const check = await this.authService.verifySmsCode(phone, code);
-    if (check === 'too_many_attempts') return res.set(CORS).status(401).json({ error: 'too many attempts' });
-    if (check !== 'ok') return res.set(CORS).status(401).json({ error: 'invalid code' });
+    if (check === 'too_many_attempts') return res.set(CORS).status(400).json({ error: 'too many attempts' });
+    if (check !== 'ok') return res.set(CORS).status(400).json({ error: 'invalid code' });
 
     const r = await this.identity.linkMethod(userId, 'phone', { phone });
     if (!r.ok) return res.set(CORS).status(409).json({ error: (r as any).reason });
