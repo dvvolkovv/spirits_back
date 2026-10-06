@@ -6,6 +6,9 @@
 # Env: BASE_URL (default https://my.linkeon.io), TEST_PHONE (default 70000000000)
 #      BASIC_AUTH (optional, user:pass for Basic Auth on test server)
 #      SSH_TARGET (optional, override SSH host for DB-check, default dvolkov@212.113.106.202)
+#      BACK_PATH (optional, каталог бэкенда на SSH_TARGET: DB-чек берёт DATABASE_URL
+#      из его .env, см. smoke/db-psql.js; default ~/spirits_back, deploy.sh задаёт сам)
+#      PG_DSN (optional, своя строка подключения вместо .env сервера)
 #      DEBUG_SECRET (обязателен для слоёв api/browser: заголовок X-Debug-Secret для
 #      /webhook/debug/*; лежит в .env бэкенда на сервере, deploy.sh передаёт его сам)
 
@@ -20,6 +23,7 @@ BASE_URL="${BASE_URL:-https://my.linkeon.io}"
 TEST_PHONE="${TEST_PHONE:-70000000000}"
 BASIC_AUTH="${BASIC_AUTH:-}"
 SSH_TARGET="${SSH_TARGET:-dvolkov@212.113.106.202}"
+BACK_PATH="${BACK_PATH:-}"
 PG_DSN="${PG_DSN:-}"
 
 # Где гонять jest. ВСЕГДА тестовая нода, а не $SSH_TARGET: во второй фазе тот
@@ -98,7 +102,7 @@ fi
 if [[ "$LAYER" == "api" || "$LAYER" == "all" ]]; then
   print_header "LAYER 2/3 — API + DB smoke (Node)"
   if ! BASE_URL="$BASE_URL" TEST_PHONE="$TEST_PHONE" \
-       BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" PG_DSN="$PG_DSN" \
+       BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" BACK_PATH="$BACK_PATH" PG_DSN="$PG_DSN" \
        node smoke/smoke.js; then
     echo "  ✗ api/db failed"
     FAILED=1

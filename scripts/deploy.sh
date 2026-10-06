@@ -1221,7 +1221,11 @@ run_phase() {
       BASE_URL="$TEST_BASE_URL"
       BASIC_AUTH="${TEST_BASIC_AUTH:-}"
       SSH_TARGET="$TEST_HOST"
-      PG_DSN="${TEST_PG_DSN:-}"
+      # Пусто намеренно: DB-чек смоука берёт DATABASE_URL на сервере, из
+      # $BACK_PATH/.env (tests/smoke/db-psql.js). TEST_PG_DSN из env.local больше
+      # не передаём — эта копия строки разошлась бы с .env стенда при смене
+      # пароля, а в аргументах ssh пароль был виден в ps.
+      PG_DSN=
       # sites-enabled/test.linkeon.io — симлинк НА этот файл (см. ensure_tma_nginx_block).
       NGINX_CONF_PATH="${TEST_NGINX_CONF:-/etc/nginx/sites-available/test.linkeon.io}"
       ;;
@@ -1235,7 +1239,7 @@ run_phase() {
       BASE_URL="${PROD_BASE_URL:-https://my.linkeon.io}"
       BASIC_AUTH=
       SSH_TARGET="$PROD_HOST"
-      PG_DSN=  # smoke.js имеет default для прода
+      PG_DSN=  # DB-чек смоука берёт DATABASE_URL из $BACK_PATH/.env на сервере
       # На проде sites-enabled/spirits — САМ живой файл, а не симлинк на
       # sites-available (та копия устарела и не действует). См. шапку
       # ensure_tma_nginx_block — почему это важно для бэкапов.
@@ -1303,7 +1307,7 @@ run_phase() {
         # inside the same blip and false-fails. SMOKE_RETRY_GAP overrides.
         sleep "${SMOKE_RETRY_GAP:-20}"
       fi
-      if BASE_URL="$BASE_URL" BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" PG_DSN="$PG_DSN" \
+      if BASE_URL="$BASE_URL" BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" BACK_PATH="$BACK_PATH" PG_DSN="$PG_DSN" \
          DEBUG_SECRET="${DEBUG_SECRET:-}" bash smoke/run.sh; then
         smoke_ok=1; break
       fi

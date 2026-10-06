@@ -7,6 +7,12 @@
  * команду локальным bash. psql тоже поддельный: сохраняет полученную строку
  * подключения и SQL. Так проверяется ровно то, что исполнит удалённый шелл,
  * вместе с кавычками и спецсимволами в пароле.
+ *
+ * ЦЕЛИ ssh — ТОЛЬКО *.invalid. Внутри jest `process.env` — копия: подмена PATH
+ * в тесте до child_process не доходит, и первая редакция этого файла ушла
+ * НАСТОЯЩИМ ssh на тест-стенд. Поэтому окружение передаётся в sshPsql явно,
+ * каждый вызов сверяет, что сработал поддельный ssh, а зона .invalid не
+ * резолвится никогда — промах подмены упадёт на DNS, не дойдя ни до одной машины.
  */
 const fs = require('fs');
 const os = require('os');
@@ -14,75 +20,82 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const { sshPsql, sshArgs, remotePsqlCommand, backEnvFile } = require('../smoke/db-psql');
 
-// Всё, что ломает наивную подстановку в шелл: $, кавычки, пробел, \, ;
+// Всё, что ломает наивную подстановку в шелл: $, кавычки, пробел, \, ;, `
 const NASTY = "postgresql://linkeon:p$a'ss\" w\\d;x`y@localhost:5433/linkeon";
 const PLAIN = 'postgresql://linkeon:s3cret@localhost:5433/linkeon';
+const TARGET = 'smoke@unit-test.invalid';
 
 let dir;
-let saved;
+let env;
 
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke-db-psql-'));
-  fs.mkdirSync(path.join(dir, 'bin'));
-  fs.mkdirSync(path.join(dir, 'home', 'spirits_back'), { recursive: true });
+  const bin = path.join(dir, 'bin');
+  const home = path.join(dir, 'home');
+  fs.mkdirSync(bin);
+  fs.mkdirSync(path.join(home, 'spirits_back'), { recursive: true });
+  // Пути зашиты в сами скрипты: они не зависят от того, какое окружение дойдёт.
   fs.writeFileSync(
-    path.join(dir, 'bin', 'psql'),
-    '#!/bin/sh\nprintf %s "$1" > "$OUT/dsn"\ncat > "$OUT/sql"\necho 42\n',
+    path.join(bin, 'psql'),
+    `#!/bin/sh\nprintf %s "$1" > '${dir}/dsn'\ncat > '${dir}/sql'\necho 42\n`,
     { mode: 0o755 },
   );
+  // «Сервер»: HOME — временный каталог, в PATH первым — поддельный psql.
   fs.writeFileSync(
-    path.join(dir, 'bin', 'ssh'),
-    '#!/bin/sh\nprintf "%s\\n" "$@" > "$OUT/ssh-args"\nfor last; do :; done\nexec bash -c "$last"\n',
+    path.join(bin, 'ssh'),
+    `#!/bin/sh\nprintf '%s\\n' "$@" > '${dir}/ssh-args'\nfor last; do :; done\n` +
+      `export PATH='${bin}':"$PATH" HOME='${home}'\nexec bash -c "$last"\n`,
     { mode: 0o755 },
   );
-  saved = { PATH: process.env.PATH, OUT: process.env.OUT };
-  process.env.PATH = `${path.join(dir, 'bin')}:${saved.PATH}`;
-  process.env.OUT = dir;
+  env = { ...process.env, PATH: `${bin}:${process.env.PATH}` };
 });
 
-afterEach(() => {
-  process.env.PATH = saved.PATH;
-  if (saved.OUT === undefined) delete process.env.OUT;
-  else process.env.OUT = saved.OUT;
-  fs.rmSync(dir, { recursive: true, force: true });
-});
+afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
 const backPath = () => path.join(dir, 'home', 'spirits_back');
 const writeEnv = (text) => fs.writeFileSync(path.join(backPath(), '.env'), text);
 const got = (name) => fs.readFileSync(path.join(dir, name), 'utf8');
 const psqlCalled = () => fs.existsSync(path.join(dir, 'dsn'));
 
+/** sshPsql через поддельный ssh; заодно сверяет, что настоящий не запускался. */
+function viaFakeSsh(sql, opts = {}) {
+  try {
+    return sshPsql(sql, { target: TARGET, pgDsn: '', env, ...opts });
+  } finally {
+    expect(fs.existsSync(path.join(dir, 'ssh-args'))).toBe(true);
+  }
+}
+
 /** Удалённая команда как её исполнит шелл сервера, с HOME = временный каталог. */
 function runRemote(cmd, input) {
   return spawnSync('bash', ['-c', cmd], {
     input,
     encoding: 'utf8',
-    env: { PATH: process.env.PATH, OUT: dir, HOME: path.join(dir, 'home') },
+    env: { PATH: env.PATH, HOME: path.join(dir, 'home') },
   });
 }
 
 describe('sshPsql: строка подключения из .env сервера', () => {
   test('DATABASE_URL доходит до psql байт в байт, SQL — через stdin', () => {
     writeEnv(`PORT=3001\nDATABASE_URL=${NASTY}\nREDIS_URL=redis://localhost:6379\n`);
-    const out = sshPsql('SELECT 1;', { target: 'dv@85.192.61.231', backPath: backPath(), pgDsn: '' });
-    expect(out).toBe('42');
+    expect(viaFakeSsh('SELECT 1;', { backPath: backPath() })).toBe('42');
     expect(got('dsn')).toBe(NASTY);
     expect(got('sql')).toBe('SELECT 1;');
   });
 
+  test('без BACK_PATH читает ~/spirits_back/.env на сервере', () => {
+    writeEnv(`DATABASE_URL=${PLAIN}\n`);
+    // '' а не undefined: undefined подхватил бы BACK_PATH из окружения прогона.
+    expect(viaFakeSsh('SELECT 1;', { backPath: '' })).toBe('42');
+    expect(got('dsn')).toBe(PLAIN);
+  });
+
   test('строки подключения нет в аргументах ssh', () => {
     writeEnv(`DATABASE_URL=${PLAIN}\n`);
-    sshPsql('SELECT 1;', { target: 'dv@85.192.61.231', backPath: backPath(), pgDsn: '' });
+    viaFakeSsh('SELECT 1;', { backPath: backPath() });
     const args = got('ssh-args');
     expect(args).not.toContain('s3cret');
     expect(args).not.toContain('postgresql://');
-  });
-
-  test('по умолчанию читает ~/spirits_back/.env на сервере', () => {
-    writeEnv(`DATABASE_URL=${PLAIN}\n`);
-    const r = runRemote(remotePsqlCommand({ envFile: backEnvFile(undefined), withDsn: false }), 'SELECT 1;');
-    expect(r.status).toBe(0);
-    expect(got('dsn')).toBe(PLAIN);
   });
 
   test('форма строки — как её понимает dotenv, которым .env читает API', () => {
@@ -102,7 +115,10 @@ describe('sshPsql: строка подключения из .env сервера'
   test('из нескольких DATABASE_URL берётся последняя, закомментированная не в счёт — как у dotenv', () => {
     // Сценарий смены пароля: новую строку дописали в конец, старую не стёрли.
     // API (dotenv) возьмёт последнюю — смоук обязан взять её же.
-    writeEnv(`DATABASE_URL=postgresql://linkeon:old@localhost:5433/linkeon\nDATABASE_URL=${PLAIN}\n# DATABASE_URL=postgresql://x:y@z/w\n`);
+    writeEnv(
+      'DATABASE_URL=postgresql://linkeon:old@localhost:5433/linkeon\n' +
+        `DATABASE_URL=${PLAIN}\n# DATABASE_URL=postgresql://x:y@z/w\nDATABASE_URL_RO=postgresql://r:o@z/w\n`,
+    );
     const r = runRemote(remotePsqlCommand({ envFile: backEnvFile(backPath()), withDsn: false }), 'SELECT 1;');
     expect(r.status).toBe(0);
     expect(got('dsn')).toBe(PLAIN);
@@ -127,21 +143,20 @@ describe('sshPsql: строка подключения из .env сервера'
     writeEnv(`PORT=3001\n# DATABASE_URL=${PLAIN}\n`);
     let err;
     try {
-      sshPsql('SELECT 1;', { target: 'dv@85.192.61.231', backPath: backPath(), pgDsn: '' });
+      viaFakeSsh('SELECT 1;', { backPath: backPath() });
     } catch (e) {
       err = e;
     }
     expect(err).toBeDefined();
     expect(err.message).toContain('нет DATABASE_URL');
-    expect(err.message).toContain('dv@85.192.61.231');
+    expect(err.message).toContain(TARGET);
     expect(err.message).not.toContain('s3cret');
   });
 });
 
 describe('sshPsql: ручное переопределение PG_DSN', () => {
   test('PG_DSN едет первой строкой stdin, а не аргументом ssh', () => {
-    const out = sshPsql('SELECT 2;', { target: 'dv@85.192.61.231', backPath: backPath(), pgDsn: NASTY });
-    expect(out).toBe('42');
+    expect(viaFakeSsh('SELECT 2;', { backPath: backPath(), pgDsn: NASTY })).toBe('42');
     expect(got('dsn')).toBe(NASTY);
     expect(got('sql')).toBe('SELECT 2;');
     expect(got('ssh-args')).not.toContain('linkeon:p');

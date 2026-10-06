@@ -28,33 +28,24 @@
  *   TEST_PHONE     default 70000000000
  *   DEBUG_SECRET   обязателен: заголовок X-Debug-Secret для /webhook/debug/*
  *                  (лежит в .env бэкенда на сервере; deploy.sh передаёт сам)
- *   PG_HOST/PORT/etc — optional, only needed if running DB checks
- *                     directly. If not set, SSH-via-helper is used.
+ *   SSH_TARGET     сервер для DB-чека (ssh + psql там же), default прод
+ *   BACK_PATH      каталог бэкенда на SSH_TARGET: строка подключения для
+ *                  DB-чека — DATABASE_URL из его .env (default ~/spirits_back;
+ *                  deploy.sh задаёт сам). Пароля базы в репозитории нет.
+ *   PG_DSN         необязательно: своя строка подключения вместо .env сервера
  */
 const axios = require('axios');
 const { debugHeaders, DEBUG_SECRET_HINT } = require('../debug-secret');
 const { probeDebugLock } = require('./debug-lock');
-const { execSync } = require('child_process');
+const { sshPsql } = require('./db-psql');
 
 const BASE_URL = process.env.BASE_URL || 'https://my.linkeon.io';
 const TEST_PHONE = process.env.TEST_PHONE || '70000000000';
 
-// DB check runs via SSH+psql on the prod server (PG listens on loopback only).
-// Override SSH_TARGET if running from another host or in CI.
-const SSH_TARGET = process.env.SSH_TARGET || 'dvolkov@212.113.106.202';
-const PG_DSN = process.env.PG_DSN
-  || "postgresql://linkeon:linkeon_pass_2026@localhost:5433/linkeon";
-
-function sshPsql(sql) {
-  // SQL goes via stdin to dodge nested-quote hell with single/double quotes
-  // inside the SSH wrapper.
-  const cmd = `ssh -o ConnectTimeout=10 -o BatchMode=yes ${SSH_TARGET} 'psql "${PG_DSN}" -tA'`;
-  return execSync(cmd, {
-    input: sql,
-    timeout: 20000,
-    encoding: 'utf8',
-  }).trim();
-}
+// DB-чек (шаг 9) идёт через ssh + psql на самом сервере, куда смотрит
+// SSH_TARGET (база слушает только loopback) — см. ./db-psql.js. Строку
+// подключения он берёт там же, из DATABASE_URL в .env бэкенда: пароля базы нет
+// ни в этом публичном репозитории, ни в аргументах ssh, ни в логе.
 
 // Redis can also be checked via prod ssh — for smoke we'll rely on
 // the SMS-send → debug-code → check-code chain which proves WebOTP
