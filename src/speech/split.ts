@@ -37,8 +37,9 @@ function findCut(text: string, maxChars: number): number {
   if (para >= minUseful) return para + 1;
 
   // Конец предложения: знаки препинания, за ними могут стоять закрывающие
-  // кавычки и скобки, дальше обязателен пробельный символ.
-  const sentenceEnd = /[.!?…]+["»”’')\]]*(?=\s)/g;
+  // кавычки и скобки, дальше обязателен пробельный символ. У китайских 。！？
+  // пробела после знака не бывает — для них он не требуется.
+  const sentenceEnd = /[.!?…]+["»”’')\]]*(?=\s)|[。！？]+[」』”’)\]]*/g;
   let sentence = -1;
   let m: RegExpExecArray | null;
   while ((m = sentenceEnd.exec(window)) !== null) {

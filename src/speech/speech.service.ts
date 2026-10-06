@@ -1,8 +1,9 @@
 // src/speech/speech.service.ts
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import type { PoolClient } from 'pg';
 import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { LanguageService } from '../common/services/language.service';
@@ -147,12 +148,16 @@ export class SpeechService implements OnModuleInit {
   ) {}
 
   /**
-   * Таблицы модуля создаются при старте API, как в routine-push: `npm run
-   * migrate` на проде застревает на base/001 и до speech/ не доходит. Все
-   * файлы идемпотентны (IF NOT EXISTS). Каждый — своей транзакцией на
-   * выделенном соединении с lock_timeout: ALTER из 001 берёт эксклюзивную
-   * блокировку speech_clips даже вхолостую, и чужой долгий запрос не должен
-   * подвесить старт. Ошибка пишется в лог и старт API не роняет.
+   * Таблицы модуля создаются при старте API: `npm run migrate` на проде
+   * застревает на base/001 и до speech/ не доходит. Учёт — в той же
+   * schema_migrations и под теми же именами (`speech/<файл>`), что ведёт
+   * scripts/migrate.ts; на test и проде speech/001 там уже записан ручным
+   * накатом (проверено 06.10.2026). Записанное не катается повторно: ALTER из
+   * 001 брал бы эксклюзивную блокировку speech_clips на каждом старте.
+   *
+   * Каждый файл — своей транзакцией на выделенном соединении с lock_timeout,
+   * запись о нём — в той же транзакции. Ошибка пишется в лог и старт API не
+   * роняет: файл просто попробуется снова при следующем старте.
    *
    * В dist .sql не копируются (nest-cli без assets), поэтому второй путь —
    * исходники рядом со сборкой.
@@ -166,14 +171,32 @@ export class SpeechService implements OnModuleInit {
       this.logger.warn('speech migrations dir not found');
       return;
     }
+    try {
+      await this.pg.query(
+        `CREATE TABLE IF NOT EXISTS schema_migrations (
+           filename text PRIMARY KEY,
+           applied_at timestamptz NOT NULL DEFAULT now()
+         )`,
+      );
+    } catch (e: any) {
+      this.logger.error(`speech migrations skipped, schema_migrations unavailable: ${e?.message}`);
+      return;
+    }
     const files = fs.readdirSync(dir).filter((f) => f.endsWith('.sql')).sort();
     for (const f of files) {
+      const name = `speech/${f}`;
       let client: any = null;
       try {
         client = await this.pg.getClient();
         await client.query('BEGIN');
         await client.query("SET LOCAL lock_timeout = '3s'");
+        const done = await client.query('SELECT 1 FROM schema_migrations WHERE filename = $1', [name]);
+        if (done.rows.length > 0) {
+          await client.query('COMMIT');
+          continue;
+        }
         await client.query(fs.readFileSync(path.join(dir, f), 'utf8'));
+        await client.query('INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING', [name]);
         await client.query('COMMIT');
         this.logger.log(`speech migration applied: ${f}`);
       } catch (e: any) {
@@ -343,19 +366,17 @@ export class SpeechService implements OnModuleInit {
    * каждом куске переплачивало бы до 1000 токенов за кусок.
    *
    * Кэш — своя таблица speech_listens, не speech_clips (почему — в шапке
-   * migrations/002_speech_listens.sql). Порядок тот же, что у synthesize:
-   * синтез и заливка, потом вставка строки, потом условное списание; не хватило
-   * денег — строка снимается компенсацией, и повтор не достаётся бесплатно.
+   * migrations/002_speech_listens.sql). Строка кэша и списание — одной
+   * транзакцией: «строка есть ⇔ оплачено». Параллельный запрос того же ответа
+   * ждёт на уникальном индексе исхода этой транзакции и видит строку только
+   * оплаченной, а сбой или отказ списания откатывает и её — бесплатного
+   * неоплаченного кэша не бывает.
    */
   async listen(userId: string, input: ListenInput): Promise<ListenResult> {
     const text = String(input?.text ?? '').trim();
     if (!text) return { ok: false, error: 'empty_text' };
     if (text.length > LISTEN_MAX_CHARS) {
       return { ok: false, error: 'text_too_long', maxChars: LISTEN_MAX_CHARS };
-    }
-
-    if (await this.hitRateLimit(userId)) {
-      return { ok: false, error: 'rate_limited', retryAfterSec: 60 };
     }
 
     const lang = await this.language.resolveUserLanguage(userId);
@@ -366,6 +387,8 @@ export class SpeechService implements OnModuleInit {
     const { voice, provider } = resolved;
     const cacheKey = cacheKeyFor(text, voice, lang);
 
+    // Готовое прослушивание отдаём раньше лимита частоты: провайдера повтор не
+    // трогает, а бюджет 20 в минуту общий с инструментом generate_speech.
     const hit = await this.findListen(userId, cacheKey);
     if (hit) {
       try {
@@ -374,6 +397,10 @@ export class SpeechService implements OnModuleInit {
         this.logger.warn(`failed to bump last_used_at for listen ${hit.id}: ${e.message}`);
       }
       return { ok: true, parts: hit.parts, chars: text.length, tokensSpent: 0, cached: true, voice, provider };
+    }
+
+    if (await this.hitRateLimit(userId)) {
+      return { ok: false, error: 'rate_limited', retryAfterSec: 60 };
     }
 
     const required = tokenCostFor(text.length);
@@ -393,10 +420,15 @@ export class SpeechService implements OnModuleInit {
       return { ok: false, error: 'tts_failed' };
     }
 
+    // Случайная часть в имени файла: без неё адрес куска вычислялся бы из
+    // текста (sha256), и звук, за который списание не прошло, доставался бы
+    // даром. Заодно параллельные запросы одного ответа не перезаписывают
+    // файлы друг друга (OpenAI синтезирует недетерминированно).
+    const nonce = randomBytes(8).toString('hex');
     let parts: string[];
     try {
       parts = await Promise.all(audio.map((body, i) => this.storage.upload({
-        bucket: SPEECH_BUCKET, key: `audio/listen/${cacheKey}-${i}.mp3`, body,
+        bucket: SPEECH_BUCKET, key: `audio/listen/${cacheKey}-${nonce}-${i}.mp3`, body,
         contentType: 'audio/mpeg', cacheControl: 'public, max-age=31536000, immutable',
       })));
     } catch (e: any) {
@@ -404,40 +436,51 @@ export class SpeechService implements OnModuleInit {
       return { ok: false, error: 'tts_failed' };
     }
 
-    const ins = await this.pg.query(
-      `INSERT INTO speech_listens (user_id, assistant, cache_key, parts, chars, provider, voice, lang, tokens_spent)
-       VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9)
-       ON CONFLICT (user_id, cache_key) DO NOTHING
-       RETURNING id`,
-      [userId, assistantName, cacheKey, JSON.stringify(parts), text.length, provider, voice, lang, required],
-    );
-    if (ins.rows.length === 0) {
-      // Гонку выиграл параллельный запрос того же ответа — он и платит.
+    const client = await this.pg.getClient();
+    let outcome: 'paid' | 'lost_race' | 'insufficient';
+    try {
+      await client.query('BEGIN');
+      const ins = await client.query(
+        `INSERT INTO speech_listens (user_id, assistant, cache_key, parts, chars, provider, voice, lang, tokens_spent)
+         VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9)
+         ON CONFLICT (user_id, cache_key) DO NOTHING
+         RETURNING id`,
+        [userId, assistantName, cacheKey, JSON.stringify(parts), text.length, provider, voice, lang, required],
+      );
+      if (ins.rows.length === 0) {
+        outcome = 'lost_race';
+        await client.query('ROLLBACK');
+      } else {
+        const paid = await this.debit(userId, required, 'Озвучка ответа', {
+          listen_id: String(ins.rows[0].id), chars: text.length, parts: parts.length, voice, provider,
+        }, client);
+        outcome = paid === null ? 'insufficient' : 'paid';
+        await client.query(outcome === 'paid' ? 'COMMIT' : 'ROLLBACK');
+      }
+    } catch (e: any) {
+      try { await client.query('ROLLBACK'); } catch { /* соединение уже мёртвое */ }
+      this.logger.error(`listen payment failed: user=${userId} ${e.message}`);
+      throw e;
+    } finally {
+      client.release();
+    }
+
+    if (outcome === 'lost_race') {
+      // Гонку выиграл параллельный запрос того же ответа, и его транзакция уже
+      // закоммичена — значит, оплачена. Отдаём его куски, второй раз не берём.
       const winner = await this.findListen(userId, cacheKey);
       if (winner) {
         return { ok: true, parts: winner.parts, chars: text.length, tokensSpent: 0, cached: true, voice, provider };
       }
-      // Победитель успел проиграть списание и снять строку — честный отказ.
       return { ok: false, error: 'tts_failed' };
     }
-
-    const listenId = String(ins.rows[0].id);
-    const paid = await this.debit(userId, required, 'Озвучка ответа', {
-      listen_id: listenId, chars: text.length, parts: parts.length, voice, provider,
-    });
-    if (paid === null) {
-      try {
-        await this.pg.query('DELETE FROM speech_listens WHERE id = $1 AND user_id = $2', [listenId, userId]);
-      } catch (e: any) {
-        this.logger.error(`failed to roll back unpaid listen ${listenId}: ${e.message}`);
-      }
+    if (outcome === 'insufficient') {
       const cur = await this.pg.query(
         'SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1',
         [userId],
       );
       return { ok: false, error: 'insufficient_tokens', balance: Number(cur.rows[0]?.tokens ?? 0), required };
     }
-
     return { ok: true, parts, chars: text.length, tokensSpent: required, cached: false, voice, provider };
   }
 
@@ -516,23 +559,18 @@ export class SpeechService implements OnModuleInit {
     amount: number,
     description: string,
     metadata: Record<string, unknown>,
+    // Чужая открытая транзакция: тогда здесь только списание и строка реестра,
+    // а BEGIN/COMMIT/ROLLBACK — забота вызывающего (listen держит в той же
+    // транзакции строку кэша). Без неё debit открывает свою.
+    outer?: PoolClient,
   ): Promise<number | null> {
+    if (outer) return this.debitWith(outer, userId, amount, description, metadata);
     const payClient = await this.pg.getClient();
-    let paid: { rows: any[] };
     try {
       await payClient.query('BEGIN');
-      paid = await payClient.query(
-        'UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2 AND tokens >= $1 RETURNING tokens',
-        [amount, userId],
-      );
-      if (paid.rows.length > 0) {
-        await payClient.query(
-          `INSERT INTO token_transactions (user_id, transaction_type, amount, balance_after, description, metadata)
-           VALUES ($1, 'consumed', $2, $3, $4, $5::jsonb)`,
-          [userId, -amount, Number(paid.rows[0].tokens), description, JSON.stringify(metadata)],
-        );
-      }
+      const after = await this.debitWith(payClient, userId, amount, description, metadata);
       await payClient.query('COMMIT');
+      return after;
     } catch (e: any) {
       try { await payClient.query('ROLLBACK'); } catch {}
       this.logger.error(`speech deduct failed: ${e.message}`);
@@ -540,7 +578,26 @@ export class SpeechService implements OnModuleInit {
     } finally {
       payClient.release();
     }
-    return paid.rows.length > 0 ? Number(paid.rows[0].tokens) : null;
+  }
+
+  private async debitWith(
+    client: PoolClient,
+    userId: string,
+    amount: number,
+    description: string,
+    metadata: Record<string, unknown>,
+  ): Promise<number | null> {
+    const paid = await client.query(
+      'UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2 AND tokens >= $1 RETURNING tokens',
+      [amount, userId],
+    );
+    if (paid.rows.length === 0) return null;
+    await client.query(
+      `INSERT INTO token_transactions (user_id, transaction_type, amount, balance_after, description, metadata)
+       VALUES ($1, 'consumed', $2, $3, $4, $5::jsonb)`,
+      [userId, -amount, Number(paid.rows[0].tokens), description, JSON.stringify(metadata)],
+    );
+    return Number(paid.rows[0].tokens);
   }
 
   /** Один ретрай при ошибке провайдера. Фолбэка на другого провайдера нет:
