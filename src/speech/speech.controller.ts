@@ -1,10 +1,11 @@
 // src/speech/speech.controller.ts
-import { Controller, Get, Param, UseGuards, NotFoundException } from '@nestjs/common';
+import { Body, Controller, Get, NotFoundException, Param, Post, Res, UseGuards } from '@nestjs/common';
+import { Response } from 'express';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { StorageService } from '../common/services/storage.service';
 import { LanguageService } from '../common/services/language.service';
-import { SpeechService } from './speech.service';
+import { ListenResult, SpeechService } from './speech.service';
 import { VOICE_CATALOG, providerForLang } from './voices';
 
 const SPEECH_BUCKET = process.env.SPEECH_BUCKET || 'linkeon-assets';
@@ -12,6 +13,23 @@ const SPEECH_BUCKET = process.env.SPEECH_BUCKET || 'linkeon-assets';
 /** id клипа — uuid-колонка в БД: мусорная строка в WHERE id = $1 даёт 22P02
  *  и 500-ку вместо честной 404, поэтому отсекаем её до запроса. */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Код ответа кнопки «Прослушать»: фронт различает нехватку денег, частоту и сбой. */
+export function listenStatus(r: ListenResult): number {
+  if (r.ok) return 200;
+  // strictNullChecks выключен: сужение по ok не убирает ok:true из union.
+  switch ((r as { error?: string }).error) {
+    case 'empty_text':
+    case 'text_too_long':
+      return 400;
+    case 'insufficient_tokens':
+      return 402;
+    case 'rate_limited':
+      return 429;
+    default:
+      return 502;
+  }
+}
 
 // Глобальный префикс приложения — 'webhook' (main.ts:16), поэтому в декораторе
 // его писать не надо: маршруты и так лягут на /webhook/speech/*.
@@ -49,6 +67,20 @@ export class SpeechController {
         sampleUrl: this.storage.publicUrl(SPEECH_BUCKET, `speech-samples/${v.id}.mp3`),
       })),
     };
+  }
+
+  /**
+   * Кнопка «Прослушать» под ответом ассистента. Текст фронт готовит сам
+   * (без разметки и служебных тегов) — цена считается по длине именно его.
+   */
+  @Post('listen')
+  @UseGuards(JwtGuard)
+  async listen(@CurrentUser() user: any, @Body() body: any, @Res() res: Response) {
+    const r = await this.speech.listen(user.userId, {
+      text: typeof body?.text === 'string' ? body.text : '',
+      assistant: typeof body?.assistant === 'string' ? body.assistant : undefined,
+    });
+    return res.status(listenStatus(r)).json(r);
   }
 
   @Get(':id')
