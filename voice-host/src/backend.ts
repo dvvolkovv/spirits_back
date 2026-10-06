@@ -50,18 +50,6 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-/**
- * Свежее «сейчас и сегодня» посреди звонка.
- *
- * Системный промпт Realtime ставится один раз на старте, поэтому длинный
- * разговор живёт с замороженным снимком дня. Досылать обновление в контекст
- * нельзя — updateChatCtx замещает его целиком (см. agent.ts:244), — поэтому
- * модель берёт свежее сама, когда оно ей понадобилось.
- */
-export async function schedule(callId: string): Promise<{ text: string }> {
-  return post<{ text: string }>('schedule', { callId });
-}
-
 export type AskResult =
   | { status: 'asked'; jobId: string; specialist: string }
   | { status: 'rejected'; reason: 'unknown_specialist' };
@@ -127,6 +115,15 @@ export const backend = {
    */
   meetingChat: (callId: string, text: string) =>
     post<{ sent: boolean }>('meeting-chat', { callId, text }),
+  /**
+   * Свежее «сейчас и сегодня» посреди звонка.
+   *
+   * Системный промпт Realtime ставится один раз на старте, поэтому длинный
+   * разговор живёт с замороженным снимком дня. Досылать обновление в контекст
+   * нельзя — updateChatCtx замещает его целиком (см. agent.ts:244), — поэтому
+   * модель берёт свежее сама, когда оно ей понадобилось.
+   */
+  schedule: (callId: string) => post<{ text: string }>('schedule', { callId }),
   meetBot: (callId: string, wsUrl: string) =>
     post<{ status: 'ok' | 'failed' }>('meet-bot', { callId, wsUrl }).then((r) => r.status === 'ok'),
 };
