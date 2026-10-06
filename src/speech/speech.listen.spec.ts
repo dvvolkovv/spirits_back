@@ -388,11 +388,15 @@ describe('mapLimit', () => {
 
   it('после первой ошибки новые вызовы не начинаются', async () => {
     const started: number[] = [];
-    await expect(mapLimit([0, 1, 2, 3, 4], 1, async (x) => {
+    await expect(mapLimit([0, 1, 2, 3, 4], 2, async (x) => {
       started.push(x);
+      if (x === 0) await new Promise((res) => setTimeout(res, 20));
       if (x === 1) throw new Error('boom');
       return x;
     })).rejects.toThrow('boom');
+    // Даём долгому вызову доработать: без флага его исполнитель, освободившись,
+    // взял бы следующие куски и сходил бы за них к провайдеру.
+    await new Promise((res) => setTimeout(res, 50));
     expect(started).toEqual([0, 1]);
   });
 
