@@ -5,7 +5,11 @@
  */
 module.exports = {
   BASE_URL: process.env.BASE_URL || 'https://b.linkeon.io',
-  PG_URL: process.env.PG_URL || 'postgresql://linkeon:linkeon_pass_2026@82.202.197.230:5432/linkeon',
+  // Только для `node runner.js --suite db`. Умолчания нет намеренно: пароль
+  // боевой базы в публичный репозиторий не кладём. Строка — DATABASE_URL из
+  // .env бэкенда на сервере; база слушает только loopback, снаружи — через
+  // ssh-туннель (ssh -L). Без PG_URL набор db падает одной понятной ошибкой.
+  PG_URL: process.env.PG_URL || '',
   TEST_PHONE: process.env.TEST_PHONE || '70000000000',
   TEST_JWT: process.env.TEST_JWT || '',
   REQUIRED_TABLES: [
