@@ -1,6 +1,8 @@
 // src/speech/speech.service.ts
 import { createHash } from 'crypto';
-import { Injectable, Logger } from '@nestjs/common';
+import * as fs from 'fs';
+import * as path from 'path';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { LanguageService } from '../common/services/language.service';
@@ -72,7 +74,7 @@ export type SynthesizeResult =
   | { ok: false; error: string };
 
 @Injectable()
-export class SpeechService {
+export class SpeechService implements OnModuleInit {
   private readonly logger = new Logger(SpeechService.name);
 
   constructor(
@@ -81,6 +83,47 @@ export class SpeechService {
     private readonly language: LanguageService,
     private readonly redis: RedisService,
   ) {}
+
+  /**
+   * Таблицы модуля создаются при старте API, как в routine-push: `npm run
+   * migrate` на проде застревает на base/001 и до speech/ не доходит. Все
+   * файлы идемпотентны (IF NOT EXISTS). Каждый — своей транзакцией на
+   * выделенном соединении с lock_timeout: ALTER из 001 берёт эксклюзивную
+   * блокировку speech_clips даже вхолостую, и чужой долгий запрос не должен
+   * подвесить старт. Ошибка пишется в лог и старт API не роняет.
+   *
+   * В dist .sql не копируются (nest-cli без assets), поэтому второй путь —
+   * исходники рядом со сборкой.
+   */
+  async onModuleInit(): Promise<void> {
+    const dir = [
+      path.join(__dirname, 'migrations'),
+      path.join(__dirname, '..', '..', 'src', 'speech', 'migrations'),
+    ].find((d) => fs.existsSync(d));
+    if (!dir) {
+      this.logger.warn('speech migrations dir not found');
+      return;
+    }
+    const files = fs.readdirSync(dir).filter((f) => f.endsWith('.sql')).sort();
+    for (const f of files) {
+      let client: any = null;
+      try {
+        client = await this.pg.getClient();
+        await client.query('BEGIN');
+        await client.query("SET LOCAL lock_timeout = '3s'");
+        await client.query(fs.readFileSync(path.join(dir, f), 'utf8'));
+        await client.query('COMMIT');
+        this.logger.log(`speech migration applied: ${f}`);
+      } catch (e: any) {
+        if (client) {
+          try { await client.query('ROLLBACK'); } catch { /* соединение уже мёртвое */ }
+        }
+        this.logger.error(`speech migration failed (${f}): ${e?.message}`);
+      } finally {
+        client?.release();
+      }
+    }
+  }
 
   async synthesize(userId: string, input: SynthesizeInput): Promise<SynthesizeResult> {
     const text = String(input.text ?? '').trim();
