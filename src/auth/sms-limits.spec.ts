@@ -289,6 +289,26 @@ describe('общий лимит', () => {
     expect(s.logs.error).toEqual([]); // это не общий лимит
   });
 
+  it('одновременная долбёжка одного номера не отнимает общий лимит у других', async () => {
+    // Номер проверяется раньше общих счётчиков: запросы, отбитые по номеру,
+    // общих не касаются даже на мгновение, пока не откатились.
+    process.env.SMS_LIMIT_GLOBAL_PER_HOUR = '5';
+    const s = makeService();
+    await requestAndBurn(s, RU(8));
+    const flood = Array.from({ length: 30 }, () => s.service.requestSmsCode(RU(8)));
+    const others = [1, 2, 3, 4].map((i) => s.service.requestSmsCode(RU(600 + i)));
+    const [floodResults, otherResults] = await Promise.all([Promise.all(flood), Promise.all(others)]);
+    expect(floodResults.every((r) => r.status === 'rate_limited')).toBe(true);
+    expect(otherResults.map((r) => r.status)).toEqual(['sent', 'sent', 'sent', 'sent']);
+  });
+
+  it('номера не на 7 входят и в общий лимит', async () => {
+    process.env.SMS_LIMIT_GLOBAL_PER_HOUR = '3';
+    const s = makeService();
+    for (let i = 0; i < 3; i++) expect(await requestAndBurn(s, DE(i))).toEqual({ status: 'sent' });
+    expect(await requestAndBurn(s, RU(9))).toMatchObject({ status: 'rate_limited', scope: 'global_hour' });
+  });
+
   it('отказ по общему лимиту не тратит квоту номера', async () => {
     const s = makeService();
     for (let i = 0; i < 30; i++) await requestAndBurn(s, RU(300 + i));
@@ -342,9 +362,14 @@ describe('что лимит не считает', () => {
   });
 
   it('путь «код уже выслан» не считается', async () => {
+    // Повторы — с шагом больше минутного зазора, но пока код жив (5 минут):
+    // иначе отказ по зазору с откатом скрыл бы лишний счёт.
     const s = makeService();
     expect(await s.service.requestSmsCode(RU(10))).toEqual({ status: 'sent' });
-    for (let i = 0; i < 5; i++) expect(await s.service.requestSmsCode(RU(10))).toEqual({ status: 'exists' });
+    for (let i = 0; i < 4; i++) {
+      s.redis.advance(70);
+      expect(await s.service.requestSmsCode(RU(10))).toEqual({ status: 'exists' });
+    }
     expect(s.redis.peek(`sms-lim:phone:${RU(10)}:h`)).toBe('1');
     expect(s.redis.peek('sms-lim:global:h')).toBe('1');
     expect(s.sent).toEqual([RU(10)]);
