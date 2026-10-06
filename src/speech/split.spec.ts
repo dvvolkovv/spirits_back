@@ -21,14 +21,19 @@ describe('splitForSpeech', () => {
     expect(squash(chunks.join(' '))).toBe(squash(text));
   });
 
-  it('режет по концу предложения, а не посреди слова', () => {
-    const chunks = splitForSpeech('Первое предложение. '.repeat(150), 2000);
-    expect(chunks[0].endsWith('.')).toBe(true);
-    expect(chunks[1].startsWith('Первое')).toBe(true);
+  it('режет по концу предложения, а не по последнему пробелу', () => {
+    // За точкой идёт длинный хвост без знаков: последний пробел окна стоит
+    // посреди фразы, и резка по нему оборвала бы её на полуслове.
+    const unit = 'Это первое предложение. А это второе без точки и довольно длинное ';
+    const chunks = splitForSpeech(unit.repeat(40), 2000);
+    expect(chunks[0].endsWith('предложение.')).toBe(true);
+    expect(chunks[1].startsWith('А это второе')).toBe(true);
   });
 
   it('предпочитает границу абзаца', () => {
-    const p1 = 'а'.repeat(1200) + '.';
+    // Без точки в конце: иначе граница предложения совпала бы с абзацем, и тест
+    // не отличил бы одну от другой.
+    const p1 = 'а'.repeat(1200);
     const p2 = 'Второй абзац. '.repeat(100);
     expect(splitForSpeech(`${p1}\n\n${p2}`, 2000)[0]).toBe(p1);
   });
@@ -41,7 +46,9 @@ describe('splitForSpeech', () => {
   });
 
   it('конец предложения с закрывающей кавычкой — граница после кавычки', () => {
-    const text = 'Он сказал: «Готово.» '.repeat(120);
+    // После кавычки — хвост без знаков, чтобы последний пробел окна не
+    // совпадал с концом предложения.
+    const text = 'Он сказал: «Готово.» И пошёл дальше по своим делам '.repeat(50);
     const chunks = splitForSpeech(text, 2000);
     expect(chunks[0].endsWith('»')).toBe(true);
   });
