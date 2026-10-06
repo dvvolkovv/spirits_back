@@ -7,7 +7,7 @@ import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { LanguageService } from '../common/services/language.service';
 import { RedisService } from '../common/services/redis.service';
-import { resolveVoice, TtsProvider } from './voices';
+import { resolveVoice, ResolvedVoice, TtsProvider } from './voices';
 import { synthesizeYandex } from './providers/yandex';
 import { synthesizeOpenai } from './providers/openai';
 
@@ -131,13 +131,7 @@ export class SpeechService implements OnModuleInit {
 
     // Потолок 20/мин, а не 10: сценка по ролям — это десяток синтезов подряд
     // в одном ответе ассистента, она не должна упираться в лимит.
-    // expire ставим только на первом попадании в окно, иначе TTL продлевается
-    // каждым вызовом и окно никогда не закрывается.
-    const rlKey = `speech:rl:${userId}`;
-    const hits = await this.redis.incr(rlKey);
-    if (hits === 1) await this.redis.expire(rlKey, 60);
-    if (hits > RATE_LIMIT_PER_MIN) {
-      this.logger.warn(`rate limited: user=${userId} hits=${hits}`);
+    if (await this.hitRateLimit(userId)) {
       return { ok: false, error: 'rate_limited', retryAfterSec: 60 };
     }
 
@@ -145,18 +139,7 @@ export class SpeechService implements OnModuleInit {
 
     // Ассистент берётся из БД, а не из аргументов инструмента: по MCP модель
     // сама подставляет аргументы и может назвать чужого ассистента.
-    const profRes = await this.pg.query(
-      'SELECT preferred_agent, profile_data FROM ai_profiles_consolidated WHERE user_id = $1',
-      [userId],
-    );
-    const assistantName: string = profRes.rows[0]?.preferred_agent || DEFAULT_ASSISTANT;
-    const userChoice: string | undefined =
-      profRes.rows[0]?.profile_data?.assistant_voices?.[assistantName];
-
-    const resolved = resolveVoice({ lang, assistantName, userChoice, requested: input.voice });
-    for (const r of resolved.rejected) {
-      this.logger.warn(`voice rejected: source=${r.source} voice=${r.voice} lang=${lang}`);
-    }
+    const { assistantName, resolved } = await this.voiceFor(userId, lang, { requested: input.voice });
 
     // Потолок длины проверяем только здесь: он зависит от провайдера, а провайдер
     // известен лишь после разрешения языка и голоса.
@@ -248,20 +231,10 @@ export class SpeechService implements OnModuleInit {
       };
     }
 
-    // Списываем только после успешного синтеза и заливки — и УСЛОВНЫМ UPDATE,
-    // а не общим MiscService.deductTokens.
+    // Списываем только после успешного синтеза и заливки (debit — условным
+    // UPDATE со строкой в реестре).
     //
-    // deductTokens делает безусловный `tokens = tokens - $1`, а проверка баланса
-    // выше — отдельный запрос. Описание инструмента прямо поощряет пачку вызовов
-    // подряд («сценка по ролям»), и параллельные вызовы все читают один и тот же
-    // достаточный баланс, после чего каждый списывает: баланс 1000 и пять
-    // параллельных синтезов дают −4000. Условие `tokens >= $1` делает
-    // проверку и списание одной атомарной операцией.
-    //
-    // Общий deductTokens намеренно НЕ трогаем: им пользуются другие фичи, и
-    // менять его поведение за их спиной опасно.
-    //
-    // Ноль строк = денег не хватило. Синтез к этому моменту уже выполнен и файл
+    // null = денег не хватило. Синтез к этому моменту уже выполнен и файл
     // залит — это осознанная плата за то, что списание идёт последним: лучше
     // один раз впустую сходить к провайдеру, чем увести баланс в минус.
     //
@@ -274,38 +247,12 @@ export class SpeechService implements OnModuleInit {
     // Объект в MinIO остаётся сиротой — он недостижим без строки (getClip ходит
     // по id + user_id), а ключ детерминирован (audio/<cache_key>.mp3), так что
     // оплаченный повтор просто перезапишет его тем же содержимым.
-    // Строку в token_transactions пишем сами и в одной транзакции со
-    // списанием: consume_user_tokens при нехватке забирает остаток, а здесь
-    // нужен отказ целиком (см. выше). Без этой записи расход на синтез не
-    // виден в общей истории — ровно та дыра, которую 20.08.2026 нашла сверка
-    // баланса с реестром.
     const clipId = String(ins.rows[0].id);
-    const payClient = await this.pg.getClient();
-    let paid: { rows: any[] };
-    try {
-      await payClient.query('BEGIN');
-      paid = await payClient.query(
-        'UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2 AND tokens >= $1 RETURNING tokens',
-        [required, userId],
-      );
-      if (paid.rows.length > 0) {
-        await payClient.query(
-          `INSERT INTO token_transactions (user_id, transaction_type, amount, balance_after, description, metadata)
-           VALUES ($1, 'consumed', $2, $3, $4, $5::jsonb)`,
-          [userId, -required, Number(paid.rows[0].tokens), 'Синтез речи',
-           JSON.stringify({ clip_id: clipId, chars: text.length, voice: resolved.voice, provider: resolved.provider })],
-        );
-      }
-      await payClient.query('COMMIT');
-    } catch (e: any) {
-      try { await payClient.query('ROLLBACK'); } catch {}
-      this.logger.error(`speech deduct failed: ${e.message}`);
-      throw e;
-    } finally {
-      payClient.release();
-    }
+    const paid = await this.debit(userId, required, 'Синтез речи', {
+      clip_id: clipId, chars: text.length, voice: resolved.voice, provider: resolved.provider,
+    });
 
-    if (paid.rows.length === 0) {
+    if (paid === null) {
       try {
         await this.pg.query('DELETE FROM speech_clips WHERE id = $1 AND user_id = $2', [clipId, userId]);
       } catch (e: any) {
@@ -325,6 +272,98 @@ export class SpeechService implements OnModuleInit {
       chars: text.length, voice: resolved.voice, provider: resolved.provider,
       tokensSpent: required, cached: false,
     };
+  }
+
+  /**
+   * Лимит частоты: один бюджет на инструмент generate_speech и кнопку
+   * «Прослушать». expire ставим только на первом попадании в окно, иначе TTL
+   * продлевается каждым вызовом и окно никогда не закрывается.
+   */
+  private async hitRateLimit(userId: string): Promise<boolean> {
+    const rlKey = `speech:rl:${userId}`;
+    const hits = await this.redis.incr(rlKey);
+    if (hits === 1) await this.redis.expire(rlKey, 60);
+    if (hits > RATE_LIMIT_PER_MIN) {
+      this.logger.warn(`rate limited: user=${userId} hits=${hits}`);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Голос: выбор в настройках (profile_data.assistant_voices) → дефолт
+   * ассистента → дефолт по полу. Ассистент — переданный явно (кнопка
+   * «Прослушать» знает, чья лента), иначе preferred_agent из БД, иначе Роман.
+   */
+  private async voiceFor(
+    userId: string,
+    lang: string,
+    opts: { assistant?: string; requested?: string } = {},
+  ): Promise<{ assistantName: string; resolved: ResolvedVoice }> {
+    const profRes = await this.pg.query(
+      'SELECT preferred_agent, profile_data FROM ai_profiles_consolidated WHERE user_id = $1',
+      [userId],
+    );
+    const assistantName: string = opts.assistant || profRes.rows[0]?.preferred_agent || DEFAULT_ASSISTANT;
+    const userChoice: string | undefined =
+      profRes.rows[0]?.profile_data?.assistant_voices?.[assistantName];
+
+    const resolved = resolveVoice({ lang, assistantName, userChoice, requested: opts.requested });
+    for (const r of resolved.rejected) {
+      this.logger.warn(`voice rejected: source=${r.source} voice=${r.voice} lang=${lang}`);
+    }
+    return { assistantName, resolved };
+  }
+
+  /**
+   * Списание со строкой в реестре. Остаток после списания или null, если
+   * денег не хватило.
+   *
+   * УСЛОВНЫЙ UPDATE, а не общий MiscService.deductTokens. deductTokens делает
+   * безусловный `tokens = tokens - $1`, а проверка баланса у вызывающих —
+   * отдельный запрос. Описание инструмента прямо поощряет пачку вызовов подряд
+   * («сценка по ролям»), и параллельные вызовы все читают один и тот же
+   * достаточный баланс, после чего каждый списывает: баланс 1000 и пять
+   * параллельных синтезов дают −4000. Условие `tokens >= $1` делает проверку
+   * и списание одной атомарной операцией. Общий deductTokens намеренно НЕ
+   * трогаем: им пользуются другие фичи, и менять его поведение за их спиной
+   * опасно.
+   *
+   * Строку в token_transactions пишем сами и в одной транзакции со списанием:
+   * consume_user_tokens при нехватке забирает остаток, а здесь нужен отказ
+   * целиком. Без этой записи расход на синтез не виден в общей истории —
+   * ровно та дыра, которую 20.08.2026 нашла сверка баланса с реестром.
+   */
+  private async debit(
+    userId: string,
+    amount: number,
+    description: string,
+    metadata: Record<string, unknown>,
+  ): Promise<number | null> {
+    const payClient = await this.pg.getClient();
+    let paid: { rows: any[] };
+    try {
+      await payClient.query('BEGIN');
+      paid = await payClient.query(
+        'UPDATE ai_profiles_consolidated SET tokens = tokens - $1, updated_at = now() WHERE user_id = $2 AND tokens >= $1 RETURNING tokens',
+        [amount, userId],
+      );
+      if (paid.rows.length > 0) {
+        await payClient.query(
+          `INSERT INTO token_transactions (user_id, transaction_type, amount, balance_after, description, metadata)
+           VALUES ($1, 'consumed', $2, $3, $4, $5::jsonb)`,
+          [userId, -amount, Number(paid.rows[0].tokens), description, JSON.stringify(metadata)],
+        );
+      }
+      await payClient.query('COMMIT');
+    } catch (e: any) {
+      try { await payClient.query('ROLLBACK'); } catch {}
+      this.logger.error(`speech deduct failed: ${e.message}`);
+      throw e;
+    } finally {
+      payClient.release();
+    }
+    return paid.rows.length > 0 ? Number(paid.rows[0].tokens) : null;
   }
 
   /** Один ретрай при ошибке провайдера. Фолбэка на другого провайдера нет:
