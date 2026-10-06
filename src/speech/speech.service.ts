@@ -10,6 +10,7 @@ import { RedisService } from '../common/services/redis.service';
 import { resolveVoice, ResolvedVoice, TtsProvider } from './voices';
 import { synthesizeYandex } from './providers/yandex';
 import { synthesizeOpenai } from './providers/openai';
+import { splitForSpeech } from './split';
 
 const SPEECH_BUCKET = process.env.SPEECH_BUCKET || 'linkeon-assets';
 const DEFAULT_ASSISTANT = 'Роман';
@@ -37,7 +38,11 @@ export function maxCharsFor(provider: TtsProvider): number {
   return MAX_CHARS_BY_PROVIDER[provider];
 }
 
-/** 1000 токенов за каждую начатую 1000 символов. */
+/**
+ * 1000 токенов за каждую начатую 1000 символов. Фронт показывает цену кнопки
+ * «Прослушать» по той же формуле — listenPrice в
+ * spirits_front/src/components/chat/listen/speechText.ts.
+ */
 export function tokenCostFor(chars: number): number {
   return Math.ceil(chars / 1000) * 1000;
 }
@@ -56,6 +61,46 @@ export function estimateDurationSec(chars: number): number {
   return Math.round((chars / 15) * 100) / 100;
 }
 
+/**
+ * Потолок длины ответа для кнопки «Прослушать»: около 11 минут речи и пять
+ * запросов к Yandex. Зеркало на фронте — LISTEN_MAX_CHARS в
+ * spirits_front/src/components/chat/listen/speechText.ts (там им гасят
+ * кнопку до нажатия; источник истины — здесь).
+ */
+export const LISTEN_MAX_CHARS = 10_000;
+
+/** Сколько кусков одного ответа синтезируются одновременно. */
+const LISTEN_CONCURRENCY = 3;
+
+/**
+ * Promise.all с потолком одновременных вызовов. Порядок результатов — порядок
+ * входа, а не порядок завершения. После первой ошибки новые вызовы не
+ * начинаются: у провайдера платим за каждый.
+ */
+export async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  let failed = false;
+  const worker = async (): Promise<void> => {
+    while (!failed && next < items.length) {
+      const i = next++;
+      try {
+        out[i] = await fn(items[i], i);
+      } catch (e) {
+        failed = true;
+        throw e;
+      }
+    }
+  };
+  const workers = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workers }, worker));
+  return out;
+}
+
 export interface SynthesizeInput {
   text: string;
   /** Любой id из каталога. Невалидный молча откатывается на следующий уровень. */
@@ -72,6 +117,23 @@ export type SynthesizeResult =
   | { ok: false; error: 'text_too_long'; maxChars: number; provider: TtsProvider }
   | { ok: false; error: 'rate_limited'; retryAfterSec: number }
   | { ok: false; error: string };
+
+export interface ListenInput {
+  text: string;
+  /** Внутреннее имя ассистента ленты (agents.name). Выбирает только голос. */
+  assistant?: string;
+}
+
+export type ListenResult =
+  | {
+      ok: true; parts: string[]; chars: number; tokensSpent: number;
+      cached: boolean; voice: string; provider: TtsProvider;
+    }
+  | { ok: false; error: 'empty_text' }
+  | { ok: false; error: 'text_too_long'; maxChars: number }
+  | { ok: false; error: 'insufficient_tokens'; balance: number; required: number }
+  | { ok: false; error: 'rate_limited'; retryAfterSec: number }
+  | { ok: false; error: 'tts_failed' };
 
 @Injectable()
 export class SpeechService implements OnModuleInit {
@@ -272,6 +334,121 @@ export class SpeechService implements OnModuleInit {
       chars: text.length, voice: resolved.voice, provider: resolved.provider,
       tokensSpent: required, cached: false,
     };
+  }
+
+  /**
+   * Кнопка «Прослушать» под ответом ассистента: весь ответ голосом ассистента
+   * ленты. Длинный текст синтезируется кусками под лимит провайдера, а платит
+   * пользователь один раз за всю длину по тарифу озвучки — округление вверх на
+   * каждом куске переплачивало бы до 1000 токенов за кусок.
+   *
+   * Кэш — своя таблица speech_listens, не speech_clips (почему — в шапке
+   * migrations/002_speech_listens.sql). Порядок тот же, что у synthesize:
+   * синтез и заливка, потом вставка строки, потом условное списание; не хватило
+   * денег — строка снимается компенсацией, и повтор не достаётся бесплатно.
+   */
+  async listen(userId: string, input: ListenInput): Promise<ListenResult> {
+    const text = String(input?.text ?? '').trim();
+    if (!text) return { ok: false, error: 'empty_text' };
+    if (text.length > LISTEN_MAX_CHARS) {
+      return { ok: false, error: 'text_too_long', maxChars: LISTEN_MAX_CHARS };
+    }
+
+    if (await this.hitRateLimit(userId)) {
+      return { ok: false, error: 'rate_limited', retryAfterSec: 60 };
+    }
+
+    const lang = await this.language.resolveUserLanguage(userId);
+    // Имя ассистента приходит с фронта, но подделка ничего не даёт: оно
+    // выбирает голос только из собственной карты пользователя и дефолтов.
+    const assistant = typeof input?.assistant === 'string' ? input.assistant.trim().slice(0, 64) : '';
+    const { assistantName, resolved } = await this.voiceFor(userId, lang, { assistant: assistant || undefined });
+    const { voice, provider } = resolved;
+    const cacheKey = cacheKeyFor(text, voice, lang);
+
+    const hit = await this.findListen(userId, cacheKey);
+    if (hit) {
+      try {
+        await this.pg.query('UPDATE speech_listens SET last_used_at = now() WHERE id = $1', [hit.id]);
+      } catch (e: any) {
+        this.logger.warn(`failed to bump last_used_at for listen ${hit.id}: ${e.message}`);
+      }
+      return { ok: true, parts: hit.parts, chars: text.length, tokensSpent: 0, cached: true, voice, provider };
+    }
+
+    const required = tokenCostFor(text.length);
+    const balRes = await this.pg.query(
+      'SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1',
+      [userId],
+    );
+    const balance = Number(balRes.rows[0]?.tokens ?? 0);
+    if (balance < required) return { ok: false, error: 'insufficient_tokens', balance, required };
+
+    const chunks = splitForSpeech(text, maxCharsFor(provider));
+    let audio: Buffer[];
+    try {
+      audio = await mapLimit(chunks, LISTEN_CONCURRENCY, (chunk) => this.synthesizeWith(provider, chunk, voice));
+    } catch (e: any) {
+      this.logger.warn(`listen synthesize failed (${provider}/${voice}): ${e.message}`);
+      return { ok: false, error: 'tts_failed' };
+    }
+
+    let parts: string[];
+    try {
+      parts = await Promise.all(audio.map((body, i) => this.storage.upload({
+        bucket: SPEECH_BUCKET, key: `audio/listen/${cacheKey}-${i}.mp3`, body,
+        contentType: 'audio/mpeg', cacheControl: 'public, max-age=31536000, immutable',
+      })));
+    } catch (e: any) {
+      this.logger.warn(`listen upload failed: ${e.message}`);
+      return { ok: false, error: 'tts_failed' };
+    }
+
+    const ins = await this.pg.query(
+      `INSERT INTO speech_listens (user_id, assistant, cache_key, parts, chars, provider, voice, lang, tokens_spent)
+       VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9)
+       ON CONFLICT (user_id, cache_key) DO NOTHING
+       RETURNING id`,
+      [userId, assistantName, cacheKey, JSON.stringify(parts), text.length, provider, voice, lang, required],
+    );
+    if (ins.rows.length === 0) {
+      // Гонку выиграл параллельный запрос того же ответа — он и платит.
+      const winner = await this.findListen(userId, cacheKey);
+      if (winner) {
+        return { ok: true, parts: winner.parts, chars: text.length, tokensSpent: 0, cached: true, voice, provider };
+      }
+      // Победитель успел проиграть списание и снять строку — честный отказ.
+      return { ok: false, error: 'tts_failed' };
+    }
+
+    const listenId = String(ins.rows[0].id);
+    const paid = await this.debit(userId, required, 'Озвучка ответа', {
+      listen_id: listenId, chars: text.length, parts: parts.length, voice, provider,
+    });
+    if (paid === null) {
+      try {
+        await this.pg.query('DELETE FROM speech_listens WHERE id = $1 AND user_id = $2', [listenId, userId]);
+      } catch (e: any) {
+        this.logger.error(`failed to roll back unpaid listen ${listenId}: ${e.message}`);
+      }
+      const cur = await this.pg.query(
+        'SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1',
+        [userId],
+      );
+      return { ok: false, error: 'insufficient_tokens', balance: Number(cur.rows[0]?.tokens ?? 0), required };
+    }
+
+    return { ok: true, parts, chars: text.length, tokensSpent: required, cached: false, voice, provider };
+  }
+
+  private async findListen(userId: string, cacheKey: string): Promise<{ id: string; parts: string[] } | null> {
+    const r = await this.pg.query(
+      'SELECT id, parts FROM speech_listens WHERE user_id = $1 AND cache_key = $2',
+      [userId, cacheKey],
+    );
+    const row = r.rows[0];
+    if (!row) return null;
+    return { id: String(row.id), parts: Array.isArray(row.parts) ? row.parts.map(String) : [] };
   }
 
   /**
