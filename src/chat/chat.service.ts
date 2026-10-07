@@ -16,6 +16,7 @@ import { IntegrationFlagsService } from '../integrations/integration-flags.servi
 import { TalerIdRoomClient } from '../meeting/talerid-room.client';
 import { RESPONSE_STYLE_RULE } from './response-style';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
+import { loadCoworkers } from './coworkers';
 import { ClientUi, NO_CLIENT_UI } from './client-ui';
 import { toActivity } from './activity-map';
 import { ASK_RULE } from './ask-rule';
@@ -500,6 +501,10 @@ export class ChatService {
       `Не добавляй P.S. о собственной идентичности. ` +
       LanguageService.buildDirective(userLanguage) + `\n`;
 
+    // Пользовательский ассистент (custom:<uuid>, см. resolveAgent): промпт ему
+    // написал сам пользователь.
+    const isCustom = agentId.startsWith('custom:');
+
     // Inject persona-specific system prompt from DB so каждый ассистент (Оля, Михаил, ...)
     // сохраняет свой характер, методики и стиль при работе через r.linkeon.io.
     if (agentSystemPrompt && agentSystemPrompt.trim()) {
@@ -508,31 +513,27 @@ export class ChatService {
 
     // Coworker awareness — каждый ассистент должен знать про остальных, чтобы
     // суметь представить их пользователю и не делать вид, что новых коллег нет.
-    // Берём список из БД: фильтр по is_active, поэтому выключенные
-    // ассистенты коллегами не представляются.
-    try {
-      const coworkersRes = await this.pg.query(
-        `SELECT COALESCE(t.display_name, a.display_name, a.name) AS display_name,
-                COALESCE(t.description, a.description)           AS description
-           FROM agents a
-           LEFT JOIN agent_translations t
-                  ON t.entity_type = 'agent'
-                 AND t.entity_id   = a.id::text
-                 AND t.locale      = $2
-          WHERE a.id != $1 AND a.description IS NOT NULL
-          ORDER BY a.id`,
-        [Number(agentId), userLanguage],
-      );
-      if (coworkersRes.rows.length > 0) {
-        const lines = coworkersRes.rows
-          .map((a: any) => `• ${a.display_name} — ${a.description}`)
-          .join('\n');
-        stablePrefix +=
-          `--- Коллеги-ассистенты в Linkeon ---\n` +
-          `${lines}\n\n` +
-          `Если пользователь спрашивает про кого-то из них или просит сделать что-то по их специализации — расскажи про коллегу честно, без выдумок, и предложи переключиться на него.\n\n`;
-      }
-    } catch { /* non-fatal — продолжаем без блока коллег */ }
+    // В список — только те, кого пользователь может выбрать: активные и не
+    // служебные (см. coworkers.ts). Иначе ассистент предлагает переключиться
+    // на того, кого на экране выбора нет.
+    //
+    // Пользовательскому ассистенту блок не добавляется. Так было и раньше, но
+    // нечаянно: Number('custom:…') даёт NaN, запрос падал на сравнении с
+    // integer, и ошибку молча глушил catch.
+    if (!isCustom) {
+      try {
+        const coworkers = await loadCoworkers(this.pg, Number(agentId), userLanguage);
+        if (coworkers.length > 0) {
+          const lines = coworkers
+            .map((a) => `• ${a.display_name} — ${a.description}`)
+            .join('\n');
+          stablePrefix +=
+            `--- Коллеги-ассистенты в Linkeon ---\n` +
+            `${lines}\n\n` +
+            `Если пользователь спрашивает про кого-то из них или просит сделать что-то по их специализации — расскажи про коллегу честно, без выдумок, и предложи переключиться на него.\n\n`;
+        }
+      } catch { /* non-fatal — продолжаем без блока коллег */ }
+    }
 
     // Профиль и бизнес-карточка — в СТАБИЛЬНУЮ часть, к персоне.
     //
