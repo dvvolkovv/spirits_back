@@ -41,7 +41,7 @@ export const CHAT_TOOLS = [
   {
     name: 'generate_image',
     description:
-      'Generate a single image from a text prompt using Google Imagen 4.0 Ultra (primary) with Nano Banana 2 / Nano Banana Pro (Gemini 3.1 Flash Image / Gemini 3 Pro Image) as fallback. Use whenever the user asks for an image, picture, or illustration (Russian "нарисуй", "сгенерируй картинку", "изображение"). Cost: 5000 tokens (std → Nano Banana 2) or 10000 tokens (hd → Nano Banana Pro, 4K, лучше рендерит текст/кириллицу).',
+      'Generate a single image from a text prompt using Nano Banana 2 (Gemini 3.1 Flash Image, std) or Nano Banana Pro (Gemini 3 Pro Image, hd). Use whenever the user asks for an image, picture, or illustration (Russian "нарисуй", "сгенерируй картинку", "изображение"). Cost: 5000 tokens (std → Nano Banana 2) or 10000 tokens (hd → Nano Banana Pro, 4K, лучше рендерит текст/кириллицу).',
     input_schema: {
       type: 'object',
       properties: {
@@ -524,8 +524,8 @@ export class ChatToolsService {
         if (!prompt) return { ok: false, error: 'empty prompt' };
         const quality = input?.quality === 'hd' ? 'hd' : 'std';
 
-        // Delegate to MiscService.generateImage — it runs Imagen 4.0 Ultra (primary) with
-        // Nano Banana 2 (std) / Nano Banana Pro (hd) as fallback, handles balance/deduction
+        // Delegate to MiscService.generateImage — it runs Nano Banana 2 (std) /
+        // Nano Banana Pro (hd) (Imagen снят Google 17.08.2026), handles balance/deduction
         // and history. Throws on insufficient funds or model failure.
         try {
           const result = await this.misc.generateImage(userId, { prompt, quality });
