@@ -63,8 +63,27 @@ async function debugCode() {
   return r.data.code;
 }
 
+/**
+ * Сторонние счётчики (Яндекс.Метрика, пиксель VK) пишут в localStorage сами и
+ * в любой момент. На test.linkeon.io запросы Метрики не проходят, и её очередь
+ * повторов `_ym_retryReqs` (~1 КБ) переписывается асинхронно — прямо между
+ * забивкой хранилища и проверкой «забито ли». Освободившиеся байты пропускали
+ * пробную запись, и тест «вход при забитом localStorage» краснел без всякой
+ * регрессии: 07.10.2026 — шесть падений подряд в smoke test-фазы, при этом
+ * на проде (очередь пустая) остаток после забивки стабилен. Экрану входа
+ * счётчики не нужны, а без них хранилище остаётся забитым до самого входа —
+ * ровно тот сценарий, который тест проверяет.
+ *
+ * Регистрируется ПОСЛЕ applyBasicAuth: у Playwright позже заведённый маршрут
+ * срабатывает первым, а регулярка забирает только адреса счётчиков.
+ */
+async function blockThirdPartyCounters(page) {
+  await page.route(/^https?:\/\/([a-z0-9-]+\.)*(yandex\.ru|mail\.ru)\//, (route) => route.abort());
+}
+
 async function openLogin(page) {
   await applyBasicAuth(page);
+  await blockThirdPartyCounters(page);
   await page.addInitScript(() => {
     localStorage.clear();
     sessionStorage.clear();
