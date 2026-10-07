@@ -107,4 +107,13 @@ describe('TgRouterService.generateReply: системный промпт без 
     expect(system).toContain('{{video:');
     expect(system).toContain('{{file:');
   });
+
+  it('маркер картинки не называет снятую модель Imagen', async () => {
+    // Google снял Imagen 4.0 Ultra 17.08.2026; {{image:}} идёт через
+    // misc.generateImage, а там теперь Nano Banana — название из промпта
+    // модель пересказала бы пользователю.
+    const { svc, claudeCli } = makeRouter();
+    await svc.generateReply(cfg, 'Дмитрий');
+    expect(systemFrom(claudeCli)).not.toMatch(/Imagen/i);
+  });
 });
