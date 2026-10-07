@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { SpeechService, LISTEN_MAX_CHARS, mapLimit, cacheKeyFor } from './speech.service';
+import { SpeechService, LISTEN_MAX_CHARS, mapLimit, cacheKeyFor, listenChunkFor, maxCharsFor } from './speech.service';
 
 /**
  * Таблицы модуля создаются при старте API: `npm run migrate` на проде
@@ -241,14 +241,14 @@ describe('SpeechService.listen — свежий синтез', () => {
     expect(deduct).toHaveBeenCalledWith('u1', 1000);
   });
 
-  it('длинный русский ответ режется по 2000, а списание одно — за всю длину', async () => {
+  it('русский ответ режется на куски до 400 знаков, а списание одно — за всю длину', async () => {
     const { svc, synth, deduct, ledger, state } = makeService({ balance: 10000 });
     const text = 'Это предложение для проверки. '.repeat(150).trim(); // 4499 знаков
     const r: any = await svc.listen('u1', { text });
     expect(r.ok).toBe(true);
-    expect(synth.mock.calls.length).toBe(3);
-    for (const [, chunk] of synth.mock.calls) expect(chunk.length).toBeLessThanOrEqual(2000);
-    expect(r.parts).toHaveLength(3);
+    expect(synth.mock.calls.length).toBe(12);
+    for (const [, chunk] of synth.mock.calls) expect(chunk.length).toBeLessThanOrEqual(400);
+    expect(r.parts).toHaveLength(12);
     expect(deduct).toHaveBeenCalledTimes(1);
     expect(deduct).toHaveBeenCalledWith('u1', 5000);
     expect(ledger).toHaveLength(1);
@@ -265,7 +265,7 @@ describe('SpeechService.listen — свежий синтез', () => {
     const text = ['Раз. '.repeat(390), 'Два. '.repeat(390), 'Три. '.repeat(390)].join('\n').trim();
     const r: any = await svc.listen('u1', { text });
     const bodies = storage.upload.mock.calls.map((c: any[]) => String(c[0].body));
-    expect(bodies).toHaveLength(3);
+    expect(bodies.length).toBeGreaterThan(10);
     expect(squash(bodies.join(' '))).toBe(squash(text));
     const keys = storage.upload.mock.calls.map((c: any[]) => c[0].key);
     keys.forEach((k: string, i: number) => expect(k).toMatch(KEY_RE(i)));
@@ -283,7 +283,7 @@ describe('SpeechService.listen — свежий синтез', () => {
     expect(a).not.toBe(`audio/listen/${cacheKeyFor('Привет', 'zahar', 'ru')}-0.mp3`);
   });
 
-  it('не больше трёх запросов к провайдеру одновременно', async () => {
+  it('не больше восьми запросов к провайдеру одновременно', async () => {
     const { svc, synth } = makeService();
     let inFlight = 0;
     let peak = 0;
@@ -295,8 +295,8 @@ describe('SpeechService.listen — свежий синтез', () => {
       return Buffer.from(chunk);
     });
     await svc.listen('u1', { text: 'Предложение номер один. '.repeat(400).trim() }); // 9599 знаков
-    expect(synth.mock.calls.length).toBe(5);
-    expect(peak).toBe(3);
+    expect(synth.mock.calls.length).toBe(25);
+    expect(peak).toBe(8);
   });
 
   it('пишет в реестр «Озвучка ответа» с остатком и подробностями', async () => {
@@ -318,6 +318,38 @@ describe('SpeechService.listen — свежий синтез', () => {
     await svc.listen('u1', { text: 'Привет' });
     expect(sqlLog.length).toBeGreaterThan(0);
     expect(sqlLog.some((s) => /speech_clips/.test(s))).toBe(false);
+  });
+});
+
+/**
+ * Кнопка «Прослушать» начинает звучать, когда готовы ВСЕ куски, поэтому размер
+ * куска и есть задержка до первого звука. Замер 07.10.2026 с тест-ноды:
+ * Yandex — 300 знаков 0,5 с, 600 — 2,5 с, 1000 — 5,1 с, 2000 — 11,5 с, а 8
+ * кусков по 400 параллельно — 0,85 с; OpenAI — 1000 знаков 3,5 с, 2000 — 4,1 с,
+ * 4000 — 9,1 с, и разброс между запросами до 12 с.
+ */
+describe('SpeechService.listen — размер куска под скорость первого звука', () => {
+  it('у Yandex куски короткие, у OpenAI крупнее — и оба в пределах лимита провайдера', () => {
+    expect(listenChunkFor('yandex')).toBe(400);
+    expect(listenChunkFor('openai')).toBe(1500);
+    expect(listenChunkFor('yandex')).toBeLessThanOrEqual(maxCharsFor('yandex'));
+    expect(listenChunkFor('openai')).toBeLessThanOrEqual(maxCharsFor('openai'));
+  });
+
+  it('медианный ответ (~1400 знаков) синтезируется одной волной параллельных запросов', async () => {
+    const { svc, synth } = makeService();
+    let inFlight = 0;
+    let peak = 0;
+    synth.mockImplementation(async (_p: string, chunk: string) => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise((res) => setTimeout(res, 5));
+      inFlight--;
+      return Buffer.from(chunk);
+    });
+    await svc.listen('u1', { text: 'Это предложение для проверки. '.repeat(47).trim() }); // 1409 знаков
+    expect(synth.mock.calls.length).toBe(4);
+    expect(peak).toBe(4); // все куски сразу — без второй волны
   });
 });
 
@@ -413,12 +445,12 @@ describe('SpeechService.listen — голос', () => {
     expect(r.voice).toBe('marina');
   });
 
-  it('английский — OpenAI-голос ассистента и куски до 4000', async () => {
+  it('английский — OpenAI-голос ассистента и куски до 1500', async () => {
     const { svc, synth } = makeService({ lang: 'en' });
     const r: any = await svc.listen('u1', { text: 'This is a sentence for the test. '.repeat(150).trim(), assistant: 'Маша' });
     expect(r).toMatchObject({ ok: true, provider: 'openai', voice: 'shimmer' });
-    expect(synth.mock.calls.length).toBe(2);
-    for (const [, chunk] of synth.mock.calls) expect(chunk.length).toBeLessThanOrEqual(4000);
+    expect(synth.mock.calls.length).toBe(4);
+    for (const [, chunk] of synth.mock.calls) expect(chunk.length).toBeLessThanOrEqual(1500);
   });
 });
 

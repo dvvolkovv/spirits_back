@@ -63,15 +63,46 @@ export function estimateDurationSec(chars: number): number {
 }
 
 /**
- * Потолок длины ответа для кнопки «Прослушать»: около 11 минут речи и пять
- * запросов к Yandex. Зеркало на фронте — LISTEN_MAX_CHARS в
+ * Потолок длины ответа для кнопки «Прослушать»: около 11 минут речи. Зеркало
+ * на фронте — LISTEN_MAX_CHARS в
  * spirits_front/src/components/chat/listen/speechText.ts (там им гасят
  * кнопку до нажатия; источник истины — здесь).
  */
 export const LISTEN_MAX_CHARS = 10_000;
 
-/** Сколько кусков одного ответа синтезируются одновременно. */
-const LISTEN_CONCURRENCY = 3;
+/**
+ * Длина куска для кнопки «Прослушать» — короче лимита провайдера НАМЕРЕННО.
+ * Звук начинается, когда готовы все куски, так что размер куска и есть
+ * задержка до первого звука.
+ *
+ * Yandex синтезирует длинный кусок круто дольше короткого (замер 07.10.2026 с
+ * тест-ноды: 300 знаков — 0,5 с, 600 — 2,5 с, 1000 — 5,1 с, 2000 — 11,5 с), а
+ * 8 кусков по 400 параллельно готовы за 0,85 с — как один. Медианный ответ
+ * (1400 знаков) с куском 2000 ждал ~8 с, с куском 400 — меньше секунды.
+ *
+ * У OpenAI время почти не зависит от длины до ~2000 знаков (1000 — 3,5 с,
+ * 2000 — 4,1 с, 4000 — 9,1 с) и гуляет между запросами (400 знаков: от 1,9
+ * до 12 с). Мелкие куски там не ускоряют, а только чаще ловят медленный
+ * запрос, поэтому кусок крупнее.
+ *
+ * Платит пользователь по-прежнему один раз за весь текст — размер куска на
+ * цену не влияет.
+ */
+const LISTEN_CHUNK_BY_PROVIDER: Record<TtsProvider, number> = {
+  yandex: 400,
+  openai: 1500,
+};
+
+export function listenChunkFor(provider: TtsProvider): number {
+  return Math.min(LISTEN_CHUNK_BY_PROVIDER[provider], maxCharsFor(provider));
+}
+
+/**
+ * Сколько кусков одного ответа синтезируются одновременно. 8 — по замеру:
+ * восемь параллельных запросов к Yandex отвечают так же быстро, как один,
+ * а медианный ответ укладывается в одну волну.
+ */
+const LISTEN_CONCURRENCY = 8;
 
 /**
  * Promise.all с потолком одновременных вызовов. Порядок результатов — порядок
@@ -361,7 +392,7 @@ export class SpeechService implements OnModuleInit {
 
   /**
    * Кнопка «Прослушать» под ответом ассистента: весь ответ голосом ассистента
-   * ленты. Длинный текст синтезируется кусками под лимит провайдера, а платит
+   * ленты. Текст синтезируется параллельно короткими кусками (listenChunkFor), а платит
    * пользователь один раз за всю длину по тарифу озвучки — округление вверх на
    * каждом куске переплачивало бы до 1000 токенов за кусок.
    *
@@ -411,7 +442,7 @@ export class SpeechService implements OnModuleInit {
     const balance = Number(balRes.rows[0]?.tokens ?? 0);
     if (balance < required) return { ok: false, error: 'insufficient_tokens', balance, required };
 
-    const chunks = splitForSpeech(text, maxCharsFor(provider));
+    const chunks = splitForSpeech(text, listenChunkFor(provider));
     let audio: Buffer[];
     try {
       audio = await mapLimit(chunks, LISTEN_CONCURRENCY, (chunk) => this.synthesizeWith(provider, chunk, voice));
