@@ -40,7 +40,9 @@ BACK_KEYS=(
   KLING_SECRET_KEY
   YOOKASSA_SHOP_ID
   YOOKASSA_SECRET_KEY
-  MCP_SECRET
+  # MCP_SECRET не копируется: у test свой с 07.10.2026. Общий секрет
+  # превращал утечку .env стенда в ключ от /mcp прода (календари, рутины,
+  # генерация за чужие токены).
   TELEGRAM_BOT_TOKEN
   TELEGRAM_WEBHOOK_SECRET
   META_APP_ID
