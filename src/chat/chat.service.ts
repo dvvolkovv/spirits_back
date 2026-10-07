@@ -16,6 +16,7 @@ import { IntegrationFlagsService } from '../integrations/integration-flags.servi
 import { TalerIdRoomClient } from '../meeting/talerid-room.client';
 import { RESPONSE_STYLE_RULE } from './response-style';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
+import { CRISIS_RULE } from './crisis-rule';
 import { loadCoworkers } from './coworkers';
 import { ClientUi, NO_CLIENT_UI } from './client-ui';
 import { toActivity } from './activity-map';
@@ -510,6 +511,10 @@ export class ChatService {
     if (agentSystemPrompt && agentSystemPrompt.trim()) {
       stablePrefix += `--- Персона и инструкции ассистента ${agentName} ---\n${agentSystemPrompt.trim()}\n\n`;
     }
+    // Кризисное правило — сразу за персоной, там же, где оно стоит у штатных
+    // ассистентов в конце их промпта из БД. Только пользовательским: у штатных
+    // оно уже есть, второй экземпляр не нужен (см. crisis-rule.ts).
+    if (isCustom) stablePrefix += `${CRISIS_RULE}\n\n`;
 
     // Coworker awareness — каждый ассистент должен знать про остальных, чтобы
     // суметь представить их пользователю и не делать вид, что новых коллег нет.

@@ -10,6 +10,7 @@ import { TgGrammyClient } from './tg-grammy.client';
 import { TgConfigService, TgBotConfigRow } from './tg-config.service';
 import { isPrivateConfig } from './tg-chat-kind';
 import { productsCliMcp } from '../products/products-cli-tool';
+import { withCrisisRule } from '../chat/crisis-rule';
 
 /**
  * Дефолтный ассистент для лички, когда preferred_agent пуст или указывает на
@@ -260,7 +261,10 @@ ${recent}
         `SELECT name, system_prompt FROM custom_agents WHERE id = $1 LIMIT 1`,
         [cfg.custom_agent_id],
       );
-      if (r.rows[0]) return { name: r.rows[0].name, systemPrompt: r.rows[0].system_prompt };
+      // Промпт пользовательского ассистента пишет сам пользователь, и
+      // кризисного правила в нём нет — дописываем в конец, как у штатных
+      // (см. chat/crisis-rule.ts). Штатным не дописываем: у них оно уже в БД.
+      if (r.rows[0]) return { name: r.rows[0].name, systemPrompt: withCrisisRule(r.rows[0].system_prompt) };
     }
 
     if (isPrivateConfig(cfg)) {
