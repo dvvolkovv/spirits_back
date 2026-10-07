@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   answerTo,
   answerToChat,
+  CALL_CRISIS_RULE,
   callInstructions,
   meetingInstructions,
   transcriptionPrompt,
@@ -49,6 +50,49 @@ describe('доступ к интернету', () => {
       name: 'Роман', persona: 'ведущий', preamble: '', specialists: SPECIALISTS,
     }));
     assert.match(s, /не можешь посмотреть в интернете/i);
+  });
+});
+
+/**
+ * Кризисное правило в звонке. Промпт Романа из БД звонок не читает, поэтому
+ * правило, которое штатные ассистенты несут в своём промпте, живёт здесь
+ * отдельно — и держится только этим текстом. Номера сверяет с бэкендом
+ * src/chat/crisis-rule.spec.ts.
+ */
+describe('кризисная ситуация в звонке', () => {
+  test('правило в инструкциях звонка, с номерами помощи', () => {
+    const s = flat(callInstructions('', SPECIALISTS));
+    assert.match(s, /КРИЗИСНАЯ СИТУАЦИЯ — ЭТО ПРАВИЛО ВАЖНЕЕ ВСЕХ ОСТАЛЬНЫХ/);
+    for (const phone of ['112', '+7 (495) 989-50-50', '8-800-2000-122']) {
+      assert.ok(s.includes(phone), `нет номера ${phone}`);
+    }
+    assert.match(s, /не в России — пусть звонит в местную экстренную службу/);
+  });
+
+  test('к каждому номеру приписано, как его произносить', () => {
+    const s = flat(CALL_CRISIS_RULE);
+    assert.match(s, /112, «сто двенадцать»/);
+    assert.match(s, /\+7 \(495\) 989-50-50: «плюс семь, четыреста девяносто пять, девятьсот восемьдесят девять, пятьдесят, пятьдесят»/);
+    assert.match(s, /8-800-2000-122: «восемь, восемьсот, две тысячи, сто двадцать два»/);
+  });
+
+  test('спрашивать прямо и не передавать кризис коллегам', () => {
+    const s = flat(CALL_CRISIS_RULE);
+    assert.match(s, /прямо спроси, думает ли он о самоубийстве/);
+    assert.match(s, /Не ставь это вопросом коллегам через ask_specialist/);
+    assert.match(s, /Не давай сведений о способах навредить/);
+  });
+
+  test('без markdown-списков: ни одна строка не начинается с маркера', () => {
+    for (const line of CALL_CRISIS_RULE.split('\n')) {
+      assert.doesNotMatch(line, /^\s*([-*•—]|\d+[.)])\s/, line);
+    }
+  });
+
+  test('среди правил, до контекста переписки', () => {
+    const s = callInstructions('Пользователь: привет', SPECIALISTS);
+    assert.ok(s.includes(CALL_CRISIS_RULE));
+    assert.ok(s.indexOf('КРИЗИСНАЯ СИТУАЦИЯ') < s.indexOf('Контекст прошлой переписки'));
   });
 });
 

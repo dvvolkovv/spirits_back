@@ -1,3 +1,5 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import { ChatService } from './chat.service';
 import { TgRouterService } from '../tg-bot/tg-router.service';
 import { CRISIS_RULE, withCrisisRule } from './crisis-rule';
@@ -9,6 +11,9 @@ import { CRISIS_RULE, withCrisisRule } from './crisis-rule';
  * У пользовательских (custom_agents) промпт пишет сам пользователь, и правила
  * там нет — его дописывает код. Ровно один раз и только им: второй экземпляр
  * у штатного означал бы, что правило дублируется в каждом ходе.
+ *
+ * В конце — сверка номеров с голосовой редакцией правила (voice-host): звонок
+ * Роману промпт из БД не читает, и правило там своё.
  */
 
 const flat = (s: string) => s.replace(/\s+/g, ' ');
@@ -95,5 +100,35 @@ describe('Telegram: промпт ассистента бота', () => {
     const r = await resolve({ tg_chat_id: '-5218835753', preset_agent_id: '12', owner_user_id: 'u-1' });
 
     expect(r).toEqual({ name: 'Роман', systemPrompt: 'промпт Романа' });
+  });
+});
+
+describe('голосовой звонок: те же номера, что в CRISIS_RULE', () => {
+  // voice-host — отдельный подпроект со своим tsconfig и ESM, импортировать
+  // его отсюда нельзя (см. tsconfig.build.json и testPathIgnorePatterns).
+  // Читаем исходник текстом: номер в кавычках строки там виден целиком.
+  const voice = fs.readFileSync(path.join(__dirname, '../../voice-host/src/prompts.ts'), 'utf8');
+  const PHONES = ['112', '+7 (495) 989-50-50', '8-800-2000-122'];
+
+  it('в CRISIS_RULE ровно эти номера — новый придётся добавить и в звонок', () => {
+    for (const phone of PHONES) expect(CRISIS_RULE).toContain(phone);
+    let rest = CRISIS_RULE;
+    for (const phone of PHONES) rest = rest.split(phone).join('');
+    expect(rest).not.toMatch(/\d/);
+  });
+
+  it('голосовое правило называет те же номера', () => {
+    // Только тело CALL_CRISIS_RULE: номер, оставшийся в комментарии, не в счёт.
+    const start = voice.indexOf('export const CALL_CRISIS_RULE = [');
+    const end = voice.indexOf("].join('\\n');", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const rule = voice.slice(start, end);
+    for (const phone of PHONES) expect(rule).toContain(phone);
+  });
+
+  it('и звонок его действительно включает', () => {
+    const fn = voice.slice(voice.indexOf('export function callInstructions('));
+    expect(fn.slice(0, fn.indexOf('\n}\n'))).toMatch(/^\s*CALL_CRISIS_RULE,$/m);
   });
 });
