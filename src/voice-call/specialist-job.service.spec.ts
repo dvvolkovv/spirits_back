@@ -76,6 +76,24 @@ describe('состав списка специалистов', () => {
   it('технический директор на месте', () => {
     expect(findSpecialist('Дмитрий')).toBe(19);
   });
+
+  it('выключенных ассистентов в списке нет', () => {
+    // Выборка специалиста по id флаг is_active не проверяет намеренно: имя в
+    // этом списке — единственная преграда. Юлия (15) выключена 06.09.2026,
+    // Герман (8) — раньше; вопрос им ушёл бы в устаревший промпт.
+    expect(Object.values(SPECIALISTS)).not.toContain(15);
+    expect(Object.values(SPECIALISTS)).not.toContain(8);
+    expect(findSpecialist('Юлия')).toBeUndefined();
+  });
+
+  it('роли не обещают того, чего ассистент не делает', () => {
+    // Ведущий выбирает коллегу по роли. «Психолог» уводил к Оле людей в
+    // тяжёлом состоянии, «HR» — к Ирине вопросы найма.
+    expect(SPECIALIST_ROLES['Оля']).toMatch(/^исследование ценностей/);
+    expect(SPECIALIST_ROLES['Оля']).toMatch(/не психолог и не кризисная помощь/);
+    expect(SPECIALIST_ROLES['Ирина']).toMatch(/^карьерный консультант/);
+    expect(SPECIALIST_ROLES['Ирина']).not.toMatch(/HR|найм/);
+  });
 });
 
 describe('SpecialistJobService', () => {
