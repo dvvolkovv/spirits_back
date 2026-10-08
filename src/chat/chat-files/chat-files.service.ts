@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { PgService } from '../../common/services/pg.service';
 import { ChatFileKind, ExtractEnv, ExtractedFile, extractChatFiles } from './extract';
+import { FindFilesInput, assistantPart, normalizeForSearch, plainNote, queryWords, scoreFile } from './find-files';
 
 /**
  * Что отдаёт эндпоинт панели (GET /webhook/chat/files). У stored=false адреса
@@ -25,6 +26,8 @@ export interface FoundFile {
   messageId: number;
   /** Текст ответа целиком — по нему ищет инструмент find_files. */
   text: string;
+  /** session_id строки истории — по нему поиск узнаёт ассистента. */
+  sessionId?: string;
 }
 
 /**
@@ -38,6 +41,33 @@ export const SESSION_FILES_SQL = `SELECT id, content, created_at FROM custom_cha
    AND content ~ '(https?://|\\[VIDEO_JOB:|\\{\\{audio:id=)'
  ORDER BY created_at DESC
  LIMIT ${PANEL_ROWS_LIMIT}`;
+
+/** Сколько ответов читает один поиск по всем перепискам пользователя. */
+export const SEARCH_ROWS_LIMIT = 5000;
+
+/**
+ * Все переписки пользователя, включая «Чистый лист». `_` в LIKE экранирован:
+ * без этого `7903016918_%` захватил бы и переписку номера 79030169187.
+ */
+export const USER_FILES_SQL = `SELECT id, session_id, content, created_at FROM custom_chat_history
+ WHERE session_id LIKE $1 || '\\_%' ESCAPE '\\' AND sender_type = 'ai'
+   AND content ~ '(https?://|\\[VIDEO_JOB:|\\{\\{audio:id=)'
+   AND ($2::int IS NULL OR created_at >= now() - make_interval(days => $2::int))
+ ORDER BY created_at DESC
+ LIMIT ${SEARCH_ROWS_LIMIT}`;
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Что отдаёт find_files модели. Адреса у stored=false нет. */
+export interface FoundForTool {
+  name: string;
+  kind: ChatFileKind;
+  date: string;
+  assistant: string;
+  url?: string;
+  stored: boolean;
+  note: string;
+}
 
 export function extractEnv(): ExtractEnv {
   const trim = (s: string) => s.replace(/\/$/, '');
@@ -59,7 +89,13 @@ export function collectFiles(rows: any[], env: ExtractEnv): FoundFile[] {
       const key = file.url ?? `${file.source}:${file.refId}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      out.push({ file, createdAt, messageId: Number(r.id), text });
+      out.push({
+        file,
+        createdAt,
+        messageId: Number(r.id),
+        text,
+        ...(r.session_id ? { sessionId: String(r.session_id) } : {}),
+      });
     }
   }
   return out;
@@ -124,5 +160,79 @@ export class ChatFilesService {
       }
     }
     return out;
+  }
+
+  /**
+   * Имена ассистентов по частям session_id. Для сравнения с запросом модели
+   * берутся все имена: служебное, отображаемое и переводы. Кастомные — только свои.
+   */
+  async assistantNames(userId: string, parts: string[]): Promise<Map<string, { display: string; aliases: string[] }>> {
+    const out = new Map<string, { display: string; aliases: string[] }>();
+    const ids = [...new Set(parts.filter((p) => /^\d+$/.test(p)).map(Number))];
+    const customs = [...new Set(parts.filter((p) => p.startsWith('custom:') && UUID_RE.test(p.slice(7))).map((p) => p.slice(7)))];
+    if (ids.length > 0) {
+      const { rows } = await this.pg.query(
+        `SELECT a.id, COALESCE(a.display_name, a.name) AS display, a.name,
+                ARRAY(SELECT t.display_name FROM agent_translations t
+                       WHERE t.entity_type = 'agent' AND t.entity_id = a.id::text AND t.display_name IS NOT NULL) AS aliases
+           FROM agents a WHERE a.id = ANY($1::int[])`,
+        [ids],
+      );
+      for (const r of rows) {
+        out.set(String(r.id), { display: String(r.display), aliases: [r.name, ...(r.aliases || [])].filter(Boolean).map(String) });
+      }
+    }
+    if (customs.length > 0) {
+      const { rows } = await this.pg.query(
+        `SELECT id, name FROM custom_agents WHERE id = ANY($1::uuid[]) AND owner_user_id = $2`,
+        [customs, userId],
+      );
+      for (const r of rows) out.set(`custom:${r.id}`, { display: String(r.name), aliases: [] });
+    }
+    return out;
+  }
+
+  /**
+   * Инструмент find_files: файлы всех переписок пользователя с ассистентами.
+   * Сначала фильтры (вид, ассистент), потом очки по словам запроса; при равных
+   * очках — свежие выше (сортировка устойчива, строки уже от новых к старым).
+   */
+  async searchForUser(
+    userId: string,
+    input: FindFilesInput,
+  ): Promise<{ ok: true; total: number; files: FoundForTool[] }> {
+    const { rows } = await this.pg.query(USER_FILES_SQL, [userId, input.days]);
+    const found = collectFiles(rows, extractEnv());
+    const partOf = (f: FoundFile) => assistantPart(f.sessionId ?? '', userId);
+    const names = await this.assistantNames(userId, found.map(partOf));
+
+    const want = normalizeForSearch(input.assistant);
+    const words = queryWords(input.query);
+    const candidates = found
+      .filter((f) => input.kind === 'any' || f.file.kind === input.kind)
+      .filter((f) => {
+        if (!want) return true;
+        const n = names.get(partOf(f));
+        return !!n && [n.display, ...n.aliases].some((a) => normalizeForSearch(a).includes(want));
+      })
+      .map((f) => ({ f, score: words.length > 0 ? scoreFile(words, f.file.name, f.text) : 0 }))
+      .filter((x) => words.length === 0 || x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .map((x) => x.f);
+
+    const resolved = await this.resolve(userId, candidates);
+    return {
+      ok: true,
+      total: resolved.length,
+      files: resolved.slice(0, input.limit).map(({ item, found: f }) => ({
+        name: item.name,
+        kind: item.kind,
+        date: item.createdAt.slice(0, 10),
+        assistant: names.get(partOf(f))?.display ?? '',
+        ...(item.url ? { url: item.url } : {}),
+        stored: item.stored,
+        note: plainNote(f.text),
+      })),
+    };
   }
 }
