@@ -45,6 +45,19 @@ export interface PersistOneOptions {
   signal?: AbortSignal;
 }
 
+/** Дольше таймер Node не умеет: задержку больше он молча меняет на 1 мс. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/**
+ * Задержка для setTimeout, AbortSignal.timeout и срока safeGet: целая, от 0 до
+ * MAX_TIMER_MS. AbortSignal.timeout бросает на Infinity и дробном, а срок
+ * больше MAX_TIMER_MS сработал бы через 1 мс. Infinity — MAX_TIMER_MS, NaN — 0.
+ */
+function timerDelay(ms: number): number {
+  if (!(ms > 0)) return 0;
+  return Math.min(MAX_TIMER_MS, Math.ceil(ms));
+}
+
 export function chatFilesBucket(): string {
   return process.env.MINIO_BUCKET_CHAT_FILES || 'linkeon-chat-files';
 }
@@ -62,8 +75,11 @@ function assertRelayFileUrl(url: string): void {
   if (!url.startsWith(prefix)) throw new Error('не файл релея');
   const path = url.slice(prefix.length);
   if (path === '' || path.endsWith('/')) throw new Error('адрес папки, а не файла');
-  if (path.split('/').some((seg) => ['.', '..'].includes(safeDecode(seg)))) {
-    throw new Error('сегмент «.» или «..» в пути');
+  for (const seg of path.split('/')) {
+    const name = safeDecode(seg);
+    if (name === '.' || name === '..') throw new Error('сегмент «.» или «..» в пути');
+    // `..%2F..%2Fsecret`: раскодированный сегмент — уже путь, а не имя.
+    if (name.includes('/') || name.includes('\\')) throw new Error('разделитель пути внутри сегмента');
   }
 }
 
@@ -107,10 +123,16 @@ export class ChatFileStore {
     // бюджета в бакет не кладём и в карту не пишем.
     const budgetOver = new Promise<void>((resolve) => {
       if (!Number.isFinite(budgetMs)) return;
-      timer = setTimeout(() => {
+      const over = () => {
         turn.abort(new Error(`бюджет хода ${budgetMs} мс исчерпан`));
         resolve();
-      }, Math.max(0, budgetMs));
+      };
+      // Бюджет длиннее предела таймера Node взводится заново, пока не истечёт.
+      const arm = () => {
+        const left = deadline - Date.now();
+        timer = setTimeout(left > MAX_TIMER_MS ? arm : over, timerDelay(left));
+      };
+      arm();
     });
     let next = 0;
     const worker = async () => {
@@ -147,7 +169,7 @@ export class ChatFileStore {
     if (!(timeoutMs > 0)) throw new Error('бюджет хода исчерпан');
     const res = await safeGet(relayRequestUrl(relayUrl), {
       responseType: 'arraybuffer',
-      timeoutMs,
+      timeoutMs: timerDelay(timeoutMs),
       maxBytes: PERSIST_MAX_FILE_BYTES,
       maxRedirects: 0,
       validateStatus: (s: number) => s === 200,
@@ -157,7 +179,7 @@ export class ChatFileStore {
     }
     const bucket = chatFilesBucket();
     const id = randomUUID();
-    const fileSignal = AbortSignal.timeout(fileTimeoutMs);
+    const fileSignal = AbortSignal.timeout(timerDelay(fileTimeoutMs));
     await this.storage.upload({
       bucket,
       key: `${id}/${name}`,
