@@ -106,9 +106,14 @@ export function contentTypeFor(name: string): string {
   return TYPES[ext] || 'application/octet-stream';
 }
 
-/** RFC 5987: encodeURIComponent плюс символы, которые он оставляет как есть. */
-function encodeRfc5987(s: string): string {
-  return encodeURIComponent(s).replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+/**
+ * encodeURIComponent плюс символы, которые он оставляет как есть: ' ( ) * !
+ * Для имени в нашем адресе: сырая скобка рвёт markdown-ссылку
+ * `[Скачать 1) План.docx](…/1) План.docx)` на первой же «)». Годится и для
+ * filename* (RFC 5987): закодированный символ там допустим всегда.
+ */
+export function encodeStrict(s: string): string {
+  return encodeURIComponent(s).replace(/['()*!]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
 }
 
 /**
@@ -120,7 +125,7 @@ export function contentDispositionFor(name: string): string {
   const ascii = Array.from(name)
     .map((ch) => (ch >= ' ' && ch <= '~' && ch !== '"' && ch !== '\\' ? ch : '_'))
     .join('');
-  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeRfc5987(name)}`;
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeStrict(name)}`;
 }
 
 /**

@@ -3,7 +3,14 @@ import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
 import { randomUUID } from 'crypto';
 import { StorageService } from '../../common/services/storage.service';
-import { contentDispositionFor, contentTypeFor, lastPathSegment, relayRequestUrl, safeFileName } from './file-meta';
+import {
+  contentDispositionFor,
+  contentTypeFor,
+  encodeStrict,
+  lastPathSegment,
+  relayRequestUrl,
+  safeFileName,
+} from './file-meta';
 
 /** Не больше стольких скачиваний с релея одновременно. */
 export const PERSIST_CONCURRENCY = 3;
@@ -81,6 +88,7 @@ export class ChatFileStore {
     });
     // Ключ в MinIO — сырое имя в UTF-8, а в адресе имя закодировано: пробел или
     // скобка в имени иначе сломали бы markdown-ссылку `[Скачать …](…)`.
-    return this.storage.publicUrl(bucket, `${id}/${encodeURIComponent(name)}`);
+    // encodeURIComponent скобки не кодирует — поэтому encodeStrict.
+    return this.storage.publicUrl(bucket, `${id}/${encodeStrict(name)}`);
   }
 }
