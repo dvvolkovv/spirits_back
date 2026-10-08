@@ -1,6 +1,6 @@
 import { ChatService } from './chat.service';
 import { verifyProductToolToken } from '../products/product-tool.token';
-import { PRODUCTS_CLI_PROMPT } from '../products/products-cli-tool';
+import { FIND_FILES_CLI_PROMPT, PRODUCTS_CLI_PROMPT } from '../products/products-cli-tool';
 import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
 import { LANGUAGE_REPLY_LINE } from '../common/services/language.service';
 
@@ -105,9 +105,9 @@ describe('Маша в вебе: инструмент продуктов', () => 
     expect(verifyProductToolToken(bearer.replace(/^Bearer /, ''))).toEqual({ userId: USER, channel: 'web' });
   });
 
-  it('автоодобрен ровно инструмент продуктов, встроенные тулы не включаются', async () => {
+  it('автоодобрены ровно продукты и поиск файлов, встроенные тулы не включаются', async () => {
     const { opts } = await runMasha();
-    expect(opts.allowedTools).toBe('mcp__products__manage_product');
+    expect(opts.allowedTools).toBe('mcp__products__manage_product,mcp__products__find_files');
     // tools не задан — сервис оставит `--tools ""`: у Маши нет ни Read, ни Bash.
     expect(opts.tools === undefined || opts.tools === '').toBe(true);
   });
@@ -116,6 +116,7 @@ describe('Маша в вебе: инструмент продуктов', () => 
     const { opts } = await runMasha();
     const system = String(opts.system);
     expect(system).toContain(PRODUCTS_CLI_PROMPT);
+    expect(system).toContain(FIND_FILES_CLI_PROMPT);
     // Язык ответа — самой последней строкой: блок продуктов написан по-русски и
     // не должен встать за ней (модель берёт язык последних строк как образец).
     const lastLine = system.trim().split('\n').pop();
