@@ -7,7 +7,7 @@ import {
   contentDispositionFor,
   contentTypeFor,
   encodeStrict,
-  lastPathSegment,
+  relayFileName,
   relayRequestUrl,
   safeDecode,
   safeFileName,
@@ -139,7 +139,7 @@ export class ChatFileStore {
     assertRelayFileUrl(relayUrl);
     const fileTimeoutMs = opts.fileTimeoutMs ?? PERSIST_FILE_TIMEOUT_MS;
     const deadline = opts.deadline ?? Infinity;
-    const name = safeFileName(lastPathSegment(relayUrl));
+    const name = safeFileName(relayFileName(relayUrl));
     // Срок у safeGet общий — на всё скачивание вместе с телом. axios.timeout в
     // Node считает простой, и медленно капающий ответ не обрывался никогда.
     const timeoutMs = Math.min(fileTimeoutMs, deadline - Date.now());
