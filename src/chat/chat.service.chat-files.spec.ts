@@ -250,8 +250,11 @@ describe('streamUniversalAgent — файлы хода в нашем храни�
     await h.run();
 
     expect(store.persist).toHaveBeenCalledTimes(1);
-    const links = items(h.written).filter((c) => c.includes('Скачать report.pdf'));
-    expect(links).toHaveLength(1);
+    // Делим по готовой ссылке `(${STORED})`, а не по подстроке «Скачать
+    // report.pdf»: та же подстрока есть и в исходном тексте модели с
+    // пустыми скобками, который сам по себе ссылкой не является.
+    const resolvedLinks = items(h.written).filter((c) => c.includes(`(${STORED})`));
+    expect(resolvedLinks).toHaveLength(1);
   });
 
   // Пункт 8 из обзора: обрыв клиента ДО done не должен стоить истории ссылки.
