@@ -1,5 +1,5 @@
 // src/chat/chat-files/relay-links.ts
-import { ChatFileStore } from './chat-file-store';
+import type { ChatFileStore } from './chat-file-store';
 
 /** Файл хода из события релея `done.outputFiles`: `url` — относительный, `/files/<ключ>/<имя>`. */
 export interface RelayOutputFile {
@@ -7,8 +7,16 @@ export interface RelayOutputFile {
   url: string;
 }
 
-/** Строка ссылки, которую дописывает бэк. Только наш собственный формат. */
-const LINK_LINE_RE = /^\[Скачать (.+)\]\((\S.*)\)$/;
+/**
+ * Строка ссылки, которую дописывает бэк. Только наш собственный формат.
+ *
+ * Строки узнаются по русской метке «Скачать». Это не текст интерфейса, а
+ * фиксированный формат самого бэка (outputFileLines; так же пишут
+ * chat.service.ts и chat.controller.ts). Сменить метку там — значит сменить и
+ * LINK_LINE_RE: по нему же collectRelayUrls ищет строки в старой истории.
+ * Имя бывает пустым: collectOutputFiles подставляет '' вместо отсутствующего.
+ */
+const LINK_LINE_RE = /^\[Скачать (.*)\]\((\S.*)\)$/;
 
 export function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -29,7 +37,8 @@ export function collectOutputFiles(into: RelayOutputFile[], list: unknown): void
 
 /** Прежний формат ссылок на файлы хода — тот же, что бэк писал до переноса в MinIO. */
 export function outputFileLines(files: RelayOutputFile[], agentUrl: string): string[] {
-  return files.map((f) => `[Скачать ${f.name}](${agentUrl}${f.url})`);
+  const base = agentUrl.replace(/\/$/, '');
+  return files.map((f) => `[Скачать ${f.name}](${base}${f.url})`);
 }
 
 /**
