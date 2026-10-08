@@ -40,6 +40,17 @@ describe('safeFileName', () => {
     const lf = String.fromCharCode(10);
     expect(safeFileName(`re${nul}port${lf}.pdf`)).toBe('report.pdf');
   });
+  it('невидимые символы формата и разделители строк — прочь: RLO, zero-width, BOM, LS, PS', () => {
+    const rlo = String.fromCharCode(0x202e);
+    const zwsp = String.fromCharCode(0x200b);
+    const ls = String.fromCharCode(0x2028);
+    const ps = String.fromCharCode(0x2029);
+    const bom = String.fromCharCode(0xfeff);
+    // RLO разворачивает хвост: имя выглядело бы как «invoiceexe.pdf».
+    expect(safeFileName(`invoice${rlo}fdp.exe`)).toBe('invoicefdp.exe');
+    expect(safeFileName(`a${zwsp}b${ls}c${ps}d${bom}.pdf`)).toBe('abcd.pdf');
+    expect(safeFileName(`${zwsp}${bom}`)).toBe('file');
+  });
   it('пустое и точки → file', () => {
     expect(safeFileName('')).toBe('file');
     expect(safeFileName('   ')).toBe('file');
