@@ -339,3 +339,46 @@ describe('ChatFileStore: копируем только /files/ нашего ре
     expect(get).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('ChatFileStore: «#», «?» и уже закодированное в имени', () => {
+  it('«Задача #3.docx»: # — часть имени, в запросе и в нашем адресе — %23', async () => {
+    get.mockResolvedValue(ok('x'));
+    const { store, uploads } = makeStore();
+    const relayUrl = `${RELAY}/Задача #3.docx`;
+
+    const map = await store.persist([relayUrl]);
+
+    expect(get.mock.calls[0][0]).toBe(`${RELAY}/%D0%97%D0%B0%D0%B4%D0%B0%D1%87%D0%B0%20%233.docx`);
+    expect(uploads[0].key.endsWith('/Задача #3.docx')).toBe(true);
+    expect(map.get(relayUrl)).toMatch(/\/%D0%97%D0%B0%D0%B4%D0%B0%D1%87%D0%B0%20%233\.docx$/);
+  });
+
+  it('«a?b.pdf»: ? — часть имени, а не начало запроса', async () => {
+    get.mockResolvedValue(ok('x'));
+    const { store, uploads } = makeStore();
+
+    await store.persist([`${RELAY}/a?b.pdf`]);
+
+    expect(get.mock.calls[0][0]).toBe(`${RELAY}/a%3Fb.pdf`);
+    expect(uploads[0].key.endsWith('/a?b.pdf')).toBe(true);
+  });
+
+  it('закодированное %2C в запросе не становится %252C', async () => {
+    get.mockResolvedValue(ok('x'));
+    const { store } = makeStore();
+
+    await store.persist([`${RELAY}/a%2Cb.pdf`]);
+
+    expect(get.mock.calls[0][0]).toBe(`${RELAY}/a%2Cb.pdf`);
+  });
+
+  it('подпапка: путь в запросе сохраняется, имя — последний сегмент', async () => {
+    get.mockResolvedValue(ok('x'));
+    const { store, uploads } = makeStore();
+
+    await store.persist([`${RELAY}/sub/x.pdf`]);
+
+    expect(get.mock.calls[0][0]).toBe(`${RELAY}/sub/x.pdf`);
+    expect(uploads[0].key).toMatch(/^[0-9a-f-]{36}\/x\.pdf$/);
+  });
+});

@@ -6,6 +6,7 @@ import {
   encodeStrict,
   fileExt,
   lastPathSegment,
+  relayFileName,
   relayRequestUrl,
   safeFileName,
 } from './file-meta';
@@ -111,5 +112,29 @@ describe('relayRequestUrl', () => {
   });
   it('одинокий % кодирует как символ', () => {
     expect(relayRequestUrl('https://r.linkeon.io/files/k/100%.txt')).toBe('https://r.linkeon.io/files/k/100%25.txt');
+  });
+  it('# и ? в имени — часть имени, а не якорь и запрос', () => {
+    expect(relayRequestUrl('https://r.linkeon.io/files/k/Задача #3.docx')).toBe(
+      'https://r.linkeon.io/files/k/%D0%97%D0%B0%D0%B4%D0%B0%D1%87%D0%B0%20%233.docx',
+    );
+    expect(relayRequestUrl('https://r.linkeon.io/files/k/a?b.pdf')).toBe('https://r.linkeon.io/files/k/a%3Fb.pdf');
+  });
+  it('закодированное моделью %2C второй раз не кодирует', () => {
+    expect(relayRequestUrl('https://r.linkeon.io/files/k/a%2Cb.pdf')).toBe('https://r.linkeon.io/files/k/a%2Cb.pdf');
+  });
+  it('подпапки сохраняются', () => {
+    expect(relayRequestUrl('https://r.linkeon.io/files/k/sub/x.pdf')).toBe('https://r.linkeon.io/files/k/sub/x.pdf');
+  });
+});
+
+describe('relayFileName', () => {
+  it('последний сегмент целиком: # и ? — часть имени', () => {
+    expect(relayFileName('https://r.linkeon.io/files/k/Задача #3.docx')).toBe('Задача #3.docx');
+    expect(relayFileName('https://r.linkeon.io/files/k/a?b.pdf')).toBe('a?b.pdf');
+  });
+  it('раскодирует %XX, не падает на одиноком %, подпапку в имя не берёт', () => {
+    expect(relayFileName('https://r.linkeon.io/files/k/a%2Cb.pdf')).toBe('a,b.pdf');
+    expect(relayFileName('https://r.linkeon.io/files/k/100%.txt')).toBe('100%.txt');
+    expect(relayFileName('https://r.linkeon.io/files/k/sub/x.pdf')).toBe('x.pdf');
   });
 });
