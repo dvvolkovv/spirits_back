@@ -58,6 +58,12 @@ export async function storeRelayLinks(
   agentUrl: string,
   store: Pick<ChatFileStore, 'persist'> | undefined,
   warn: (msg: string) => void = () => {},
+  // budgetMs — остаток бюджета ХОДА (а не файла): в текстовом ходе
+  // storeRelayLinks может вызываться несколько раз подряд (outputFiles, затем
+  // резолв пустых скобок), и без общего бюджета каждый вызов получал бы свой
+  // полный PERSIST_TURN_BUDGET_MS поверх уже потраченного предыдущим. Без
+  // opts — поведение как раньше, store.persist сам возьмёт свой дефолт.
+  opts?: { budgetMs?: number },
 ): Promise<string[]> {
   const prefix = relayFilesPrefix(agentUrl);
   const parsed = lines.map((line) => {
@@ -72,7 +78,7 @@ export async function storeRelayLinks(
   }
   let stored: Map<string, string>;
   try {
-    stored = await store.persist(urls);
+    stored = opts ? await store.persist(urls, opts) : await store.persist(urls);
   } catch (e: any) {
     warn(`chat-files: копия не удалась — ссылки остаются на релее: ${e?.message || e}`);
     return lines;

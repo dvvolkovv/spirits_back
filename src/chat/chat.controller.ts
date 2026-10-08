@@ -349,6 +349,11 @@ export class ChatController {
       try { res.write(JSON.stringify(payload) + '\n'); } catch {}
     };
 
+    // Открываем ход для activeStreams ДО запроса к релею: deploy.sh ждёт
+    // /chat/active-streams === 0 перед рестартом, а копия файлов после потока
+    // (chat-files, ниже) занимает до ~60с — без этого ход с вложениями не
+    // был виден вовсе, и рестарт мог оборвать именно её.
+    this.chatService.beginStream();
     try {
       const agentRes = await axios.default.post(`${AGENT_URL}/chat`, fd, {
         headers: fd.getHeaders(),
@@ -410,12 +415,30 @@ export class ChatController {
       // Ссылки на файлы хода — уже на наше хранилище, до `end` и до истории:
       // одна строка в обоих местах (historyMerge.ts сверяет посимвольно).
       // Здесь, в отличие от текстового хода, они дописываются всегда — так было
-      // и до переноса. storeRelayLinks не бросает.
+      // и до переноса.
       if (pendingFiles.length > 0) {
-        const lines = await this.chatService.storeRelayLinks(outputFileLines(pendingFiles, AGENT_URL), AGENT_URL);
-        const tail = '\n\n' + lines.join('\n');
-        chunks.push(tail);
-        safeWrite({ type: 'item', content: tail });
+        // Копия может занять до ~60с (chat-files, PERSIST_TURN_BUDGET_MS) —
+        // всё это время от релея клиенту уже ничего не приходит, а мобильный
+        // клиент (Flutter) рвёт стрим после 60с тишины. Пинг гасится в любом
+        // случае, что бы ни случилось с самой копией.
+        const pingTimer = setInterval(() => safeWrite({ type: 'ping' }), 20_000);
+        try {
+          // storeRelayLinks сама не бросает (relay-links.ts), но это гарантия
+          // чужого модуля — страхуемся локально: без неё сбой внутри уронил
+          // бы весь finally, и клиент не получил бы ни `end`, ни res.end().
+          const lines = await this.chatService.storeRelayLinks(outputFileLines(pendingFiles, AGENT_URL), AGENT_URL);
+          const tail = '\n\n' + lines.join('\n');
+          chunks.push(tail);
+          safeWrite({ type: 'item', content: tail });
+        } catch (e: any) {
+          // eslint-disable-next-line no-console
+          console.warn(`[upload-and-chat] storeRelayLinks упала, ссылка остаётся на релей: ${e?.message}`);
+          const tail = '\n\n' + outputFileLines(pendingFiles, AGENT_URL).join('\n');
+          chunks.push(tail);
+          safeWrite({ type: 'item', content: tail });
+        } finally {
+          clearInterval(pingTimer);
+        }
       }
       const fullText = chunks.join('');
 
@@ -466,8 +489,16 @@ export class ChatController {
           } catch (e: any) {
             // eslint-disable-next-line no-console
             console.warn(`[upload-and-chat] persist failed for ${userId}_${assistantId}: ${e?.message}`);
+          } finally {
+            // Ход занят до сохранения истории, а не до res.end(): deploy.sh
+            // не должен рестартовать между концом ответа и записью в БД.
+            this.chatService.endStream();
           }
         });
+      } else {
+        // Нечего сохранять (пустой ответ без текста и без файлов) — ход
+        // закрывается сразу, без setImmediate-ветки выше.
+        this.chatService.endStream();
       }
     }
   }
