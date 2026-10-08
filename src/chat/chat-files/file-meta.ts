@@ -36,15 +36,22 @@ export function lastPathSegment(url: string): string {
 }
 
 /**
- * Имя для ключа в бакете и для Content-Disposition: без разделителей пути и
- * управляющих символов, не длиннее MAX_NAME_CHARS. Пустое — `file`.
+ * Невидимые символы: формата Unicode (Cf — RLO и прочие bidi-переключатели,
+ * zero-width, BOM) и разделители строк и абзацев (Zl, Zp). RLO разворачивает
+ * хвост имени и подменяет видимое расширение.
+ */
+const INVISIBLE_RE = /[\p{Cf}\p{Zl}\p{Zp}]/u;
+
+/**
+ * Имя для ключа в бакете и для Content-Disposition: без разделителей пути,
+ * управляющих и невидимых символов, не длиннее MAX_NAME_CHARS. Пустое — `file`.
  */
 export function safeFileName(raw: string): string {
   const cleaned = Array.from(String(raw ?? '').normalize('NFC'))
     .map((ch) => (ch === '/' || ch === '\\' ? '_' : ch))
     .filter((ch) => {
       const c = ch.codePointAt(0) ?? 0;
-      return c >= 32 && !(c >= 127 && c < 160);
+      return c >= 32 && !(c >= 127 && c < 160) && !INVISIBLE_RE.test(ch);
     })
     .join('')
     .trim();
