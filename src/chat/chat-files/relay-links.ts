@@ -73,32 +73,67 @@ export async function storeRelayLinks(
   });
 }
 
+/** Цель markdown-ссылки с одним уровнем парных скобок: `](…/Договор (1).docx)`. */
+const MD_TARGET_RE = /\]\(((?:[^()\n]|\([^()\n]*\))+)\)/g;
+/** Заголовок ссылки `(адрес "заголовок")` — не часть адреса. */
+const MD_TITLE_RE = /\s+(?:"[^"]*"|'[^']*')$/;
+/** Пунктуация конца фразы после голого адреса — не часть адреса (класс для RegExp). */
+const TRAILING_PUNCT = '[.,;:!?»…]';
+
 /**
- * Все адреса файлов релея в тексте ответа: цели markdown-ссылок (там бывают
- * пробелы — релей имена не кодирует) и голые адреса.
+ * Все адреса файлов релея в тексте ответа — для разового бэкфилла истории.
+ * Ошибка здесь стоит файла: обрезанный адрес даёт 404, а релей тем временем
+ * чистит /tmp. Поэтому три прохода, от надёжного к общему:
+ *
+ *  1. Целые строки нашего формата `[Скачать имя](адрес)` (LINK_LINE_RE) — бэк
+ *     всегда писал их по одной в строке. Жадно до последней «)» строки: имя
+ *     бывает и с парными скобками (`Договор (1).docx`), и с непарной
+ *     (`1) План.docx`), и с пробелами — релей имена не кодирует.
+ *  2. Цели markdown-ссылок посреди прочего текста: один уровень парных скобок,
+ *     без заголовка ссылки.
+ *  3. Голые адреса, без пунктуации конца фразы в хвосте.
+ *
+ * Обрезок — адрес, который лишь начало другого, найденного С ТОГО ЖЕ МЕСТА
+ * текста (имя с пробелом или скобкой), — отдельно не добавляется. Начало
+ * адреса в другом месте текста (`…/a.pdf` рядом с `…/a.pdf.zip`) — свой файл.
  */
 export function collectRelayUrls(content: string, agentUrl: string): string[] {
-  const prefix = escapeRe(`${agentUrl.replace(/\/$/, '')}/files/`);
+  const prefix = `${agentUrl.replace(/\/$/, '')}/files/`;
   const found = new Set<string>();
-  for (const m of content.matchAll(new RegExp(`\\]\\((${prefix}[^)\\n]+)\\)`, 'g'))) {
-    found.add(m[1].trim());
+  const startsAt = new Map<number, string[]>();
+  const add = (url: string, at: number) => {
+    if (!url.startsWith(prefix) || url.length === prefix.length) return;
+    const here = startsAt.get(at) || [];
+    if (here.some((f) => f.length > url.length && f.startsWith(url))) return;
+    found.add(url);
+    startsAt.set(at, [...here, url]);
+  };
+  for (const m of content.matchAll(new RegExp(LINK_LINE_RE.source, 'gm'))) {
+    // Адрес стоит в самом конце строки, перед закрывающей «)».
+    add(m[2].trim(), m.index + m[0].length - 1 - m[2].length);
   }
-  for (const m of content.matchAll(new RegExp(`${prefix}[^\\s\`'"<>)\\]]+`, 'g'))) {
-    const url = m[0];
-    // Начало цели ссылки с пробелом в имени — она уже учтена целиком.
-    if (![...found].some((f) => f !== url && f.startsWith(url))) found.add(url);
+  for (const m of content.matchAll(MD_TARGET_RE)) {
+    const lead = m[1].length - m[1].trimStart().length;
+    add(m[1].trim().replace(MD_TITLE_RE, ''), m.index + 2 + lead);
+  }
+  const bare = new RegExp(`${escapeRe(prefix)}[^\\s\`'"<>)\\]]+`, 'g');
+  const tail = new RegExp(`${TRAILING_PUNCT}+$`);
+  for (const m of content.matchAll(bare)) {
+    add(m[0].replace(tail, ''), m.index);
   }
   return [...found];
 }
 
 /**
  * Точная подстановка адресов. Вхождение считается, только если за ним идёт
- * конец адреса: иначе замена `…/a.pdf` задела бы `…/a.pdf.zip`.
+ * конец адреса — граница или пунктуация конца фразы перед ней: иначе замена
+ * `…/a.pdf` задела бы `…/a.pdf.zip`.
  */
 export function replaceUrls(content: string, map: Map<string, string>): string {
+  const end = `(?=${TRAILING_PUNCT}*(?:[\\s)\\]'"<>\`]|$))`;
   let out = content;
   for (const [from, to] of [...map.entries()].sort((a, b) => b[0].length - a[0].length)) {
-    out = out.replace(new RegExp(`${escapeRe(from)}(?=[\\s)\\]'"<>\`]|$)`, 'g'), () => to);
+    out = out.replace(new RegExp(`${escapeRe(from)}${end}`, 'g'), () => to);
   }
   return out;
 }
