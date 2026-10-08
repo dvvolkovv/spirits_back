@@ -15,6 +15,11 @@ export interface UploadInput {
   body: Buffer | Readable;
   contentType?: string;
   cacheControl?: string;
+  /**
+   * `attachment; filename=…` — файл по прямому переходу скачивается, а не
+   * открывается страницей на нашем домене (файлы переписки, chat-files).
+   */
+  contentDisposition?: string;
 }
 
 export interface DownloadInput {
@@ -69,6 +74,7 @@ export class StorageService implements OnModuleInit {
         Body: input.body,
         ContentType: input.contentType,
         CacheControl: input.cacheControl,
+        ContentDisposition: input.contentDisposition,
       }),
     );
     return `${this.publicBaseUrl}/${input.bucket}/${input.key}`;
