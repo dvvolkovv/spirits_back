@@ -17,7 +17,10 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { PRODUCT_TOOLS, ProductToolService } from '../products/product-tool.service';
-import { ProductToolClaims, verifyProductToolToken } from '../products/product-tool.token';
+import { ProductToolChannel, ProductToolClaims, verifyProductToolToken } from '../products/product-tool.token';
+import { ChatFilesService } from '../chat/chat-files/chat-files.service';
+import { FIND_FILES_TOOL, FIND_FILES_TOOL_NAME } from '../chat/chat-files/find-files.tool';
+import { parseFindFilesInput } from '../chat/chat-files/find-files';
 
 /**
  * Отдельная точка, а не ветка в /mcp, СОЗНАТЕЛЬНО.
@@ -43,7 +46,10 @@ import { ProductToolClaims, verifyProductToolToken } from '../products/product-t
 export class ProductsMcpController {
   private readonly logger = new Logger(ProductsMcpController.name);
 
-  constructor(private readonly tool: ProductToolService) {}
+  constructor(
+    private readonly tool: ProductToolService,
+    private readonly files: ChatFilesService,
+  ) {}
 
   /** Владелец и канал из Bearer. Бросает — значит звать инструмент нечем. */
   private owner(authHeader?: string): ProductToolClaims {
@@ -56,9 +62,14 @@ export class ProductsMcpController {
     }
   }
 
+  /** Инструменты по каналу токена: поиск файлов — только в вебе (TG-бот в эту фичу не входит). */
+  private toolsFor(channel: ProductToolChannel) {
+    return channel === 'telegram' ? PRODUCT_TOOLS : [...PRODUCT_TOOLS, FIND_FILES_TOOL];
+  }
+
   /** Вынесено из makeServer ради проверяемости: контракт схемы — часть защиты. */
-  listTools() {
-    return PRODUCT_TOOLS.map((t) => ({
+  listTools(channel: ProductToolChannel = 'web') {
+    return this.toolsFor(channel).map((t) => ({
       name: t.name,
       description: t.description,
       inputSchema: t.input_schema,
@@ -66,33 +77,30 @@ export class ProductsMcpController {
   }
 
   /** Вынесено из makeServer по той же причине: здесь живёт разбор владельца. */
-  async callTool(authHeader: string | undefined, args: any) {
+  async callTool(authHeader: string | undefined, args: any, name: string = PRODUCT_TOOLS[0].name) {
     const { userId, channel } = this.owner(authHeader);
     // userId из запроса выбрасывается ЯВНО, а не игнорируется по невнимательности:
     // поле могло бы приехать и перекрыть владельца при любой будущей правке
     // execute(), которая начнёт заглядывать в input. channel — туда же: канал
     // хода (web/telegram) несёт подпись токена, а не поле, которое пишет модель.
     const { userId: _drop, channel: _dropChannel, ...input } = args ?? {};
+    if (!this.toolsFor(channel).some((t) => t.name === name)) {
+      return { ok: false, error: `Неизвестный инструмент: ${name}` };
+    }
+    if (name === FIND_FILES_TOOL_NAME) return this.files.searchForUser(userId, parseFindFilesInput(input));
     return this.tool.execute(userId, input, channel);
   }
 
   private makeServer(authHeader?: string): Server {
+    const { channel } = this.owner(authHeader);
     const server = new Server(
       { name: 'linkeon-products', version: '1.0.0' },
       { capabilities: { tools: {} } },
     );
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: this.listTools() }));
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: this.listTools(channel) }));
     server.setRequestHandler(CallToolRequestSchema, async (req: any) => {
       const { name, arguments: args } = req.params ?? {};
-      if (name !== PRODUCT_TOOLS[0].name) {
-        return {
-          content: [
-            { type: 'text', text: JSON.stringify({ ok: false, error: `Неизвестный инструмент: ${name}` }) },
-          ],
-          isError: true,
-        };
-      }
-      const result: any = await this.callTool(authHeader, args);
+      const result: any = await this.callTool(authHeader, args, name);
       return { content: [{ type: 'text', text: JSON.stringify(result) }], isError: !result.ok };
     });
     return server;
