@@ -13,7 +13,7 @@ auto-promote / patroni) — this runbook is the manual procedure.
 |-------|-----------|-----|------------------|-------|
 | PostgreSQL (`linkeon`) | streaming replication, slot `node3_dr` | seconds | `/admin/monitoring/tech/replication` | hourly TG if lag > 60s / not streaming / slot lost |
 | Neo4j | nightly `neo4j.dump.gz` rsync (in `backup.sh` step 4.5) | ≤24h | `/admin/monitoring/tech/neo4j-dr` | hourly TG if md5 mismatch / >48h / unreachable |
-| MinIO (SMM media) | hourly `mc mirror` (`minio-mirror.sh`, cron `20 * * * *`) | ≤1h | `/admin/monitoring/tech/minio-dr` | hourly TG if stale / bucket behind / mc errors |
+| MinIO (SMM media, assets, chat files) | hourly `mc mirror` (`minio-mirror.sh`, cron `20 * * * *`) | ≤1h | `/admin/monitoring/tech/minio-dr` | hourly TG if stale / bucket behind / mc errors |
 
 All three are surfaced together in the admin UI under **Инфра** (MonitoringInfraView).
 
@@ -75,10 +75,12 @@ docker exec neo4j cypher-shell -u neo4j -p <password> "MATCH (n) RETURN count(n)
 Then point the api's `NEO4J_URI` / `NEO4J_PASSWORD` at it. RPO is up to 24h — the
 graph is rebuilt continuously from chat, so a day's gap self-heals over time.
 
-## 3. MinIO (SMM media) — restore objects from node-3
+## 3. MinIO — restore objects from node-3
 
 node-3 runs a MinIO mirror (`10.10.0.3:9000`, data `/var/lib/linkeon-dr/minio`)
-holding buckets `linkeon-smm-videos` + `linkeon-smm-music`. The mirror is
+holding buckets `linkeon-smm-videos`, `linkeon-smm-music`, `linkeon-assets`
+(images, speech, call documents, avatars) and `linkeon-chat-files` (files the
+assistants created in chats; added 2026-10). The mirror is
 `--overwrite` **without `--remove`**, so node-3 holds ≥ everything prod had
 (a prod-side wipe does NOT cascade to DR).
 
@@ -89,6 +91,14 @@ mc alias set newprod    http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PA
 # mirror back into the rebuilt prod MinIO:
 mc mirror --overwrite node3minio/linkeon-smm-videos newprod/linkeon-smm-videos
 mc mirror --overwrite node3minio/linkeon-smm-music  newprod/linkeon-smm-music
+mc mirror --overwrite node3minio/linkeon-assets     newprod/linkeon-assets
+mc mirror --overwrite node3minio/linkeon-chat-files newprod/linkeon-chat-files
+# Anonymous access: GetObject ONLY. Never `mc anonymous set download` —
+# that canned policy also allows anonymous s3:ListBucket (full key listing).
+for b in linkeon-smm-videos linkeon-smm-music linkeon-assets linkeon-chat-files; do
+  printf '%s' "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::$b/*\"]}]}" > /tmp/p.json
+  mc anonymous set-json /tmp/p.json newprod/$b
+done
 ```
 
 If node-3's MinIO is serving directly during an outage, point `MINIO_ENDPOINT`
