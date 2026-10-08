@@ -8,6 +8,7 @@ import {
   contentTypeFor,
   encodeStrict,
   relayFileName,
+  relayFilesPrefix,
   relayRequestUrl,
   safeDecode,
   safeFileName,
@@ -49,7 +50,7 @@ export function chatFilesBucket(): string {
 }
 
 /**
- * Копируем только файлы нашего релея: origin как у AGENT_URL, путь /files/…,
+ * Копируем только файлы нашего релея: начало — relayFilesPrefix(AGENT_URL),
  * не папка, без сегментов «.» и «..» (и закодированных тоже). Адреса приходят
  * и из текста модели (бэкфилл истории), а копия ляжет в публичный бакет —
  * без этой проверки ссылка в тексте увела бы скачивание на другой путь релея
@@ -57,10 +58,10 @@ export function chatFilesBucket(): string {
  * часть имени.
  */
 function assertRelayFileUrl(url: string): void {
-  const origin = new URL(process.env.AGENT_URL || 'https://r.linkeon.io').origin;
-  if (!url.startsWith(`${origin}/files/`)) throw new Error('не файл релея');
-  const path = url.slice(origin.length);
-  if (path.endsWith('/')) throw new Error('адрес папки, а не файла');
+  const prefix = relayFilesPrefix(process.env.AGENT_URL || 'https://r.linkeon.io');
+  if (!url.startsWith(prefix)) throw new Error('не файл релея');
+  const path = url.slice(prefix.length);
+  if (path === '' || path.endsWith('/')) throw new Error('адрес папки, а не файла');
   if (path.split('/').some((seg) => ['.', '..'].includes(safeDecode(seg)))) {
     throw new Error('сегмент «.» или «..» в пути');
   }

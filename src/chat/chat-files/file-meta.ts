@@ -150,6 +150,25 @@ export function relayRequestUrl(url: string): string {
 }
 
 /**
+ * Начало адреса файла релея: `<origin AGENT_URL>/files/`. Через URL, а не
+ * строкой: регистр хоста и порт по умолчанию (`https://R.LINKEON.IO:443/`) дают
+ * тот же префикс. Он один на всех: по нему бэк пишет строки ссылок, узнаёт
+ * их и проверяет, что копирует файл именно нашего релея. Не бросает: не
+ * адрес — берётся строкой без слэша на конце, как раньше.
+ */
+export function relayFilesPrefix(agentUrl: string): string {
+  let origin = '';
+  try {
+    origin = new URL(agentUrl).origin;
+  } catch {
+    // не адрес — ниже строкой
+  }
+  // У адреса не http(s) origin — строка 'null'.
+  if (!origin || origin === 'null') origin = String(agentUrl ?? '').replace(/\/$/, '');
+  return `${origin}/files/`;
+}
+
+/**
  * Имя файла из адреса релея: последний сегмент пути целиком, раскодированный.
  * Путь у релея сырой, поэтому «?» и «#» здесь — часть имени (`Задача #3.docx`),
  * а не начало запроса или якоря. Для обычных адресов — lastPathSegment.

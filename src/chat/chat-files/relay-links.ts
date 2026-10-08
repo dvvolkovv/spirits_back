@@ -1,6 +1,6 @@
 // src/chat/chat-files/relay-links.ts
 import type { ChatFileStore } from './chat-file-store';
-import { relayFileName } from './file-meta';
+import { relayFileName, relayFilesPrefix } from './file-meta';
 
 /** Файл хода из события релея `done.outputFiles`: `url` — относительный, `/files/<ключ>/<имя>`. */
 export interface RelayOutputFile {
@@ -38,7 +38,8 @@ export function collectOutputFiles(into: RelayOutputFile[], list: unknown): void
 
 /** Прежний формат ссылок на файлы хода — тот же, что бэк писал до переноса в MinIO. */
 export function outputFileLines(files: RelayOutputFile[], agentUrl: string): string[] {
-  const base = agentUrl.replace(/\/$/, '');
+  // Тот же origin, что в relayFilesPrefix: по нему строки потом узнаёт storeRelayLinks.
+  const base = relayFilesPrefix(agentUrl).slice(0, -'/files/'.length);
   return files.map((f) => `[Скачать ${f.name}](${base}${f.url})`);
 }
 
@@ -58,7 +59,7 @@ export async function storeRelayLinks(
   store: Pick<ChatFileStore, 'persist'> | undefined,
   warn: (msg: string) => void = () => {},
 ): Promise<string[]> {
-  const prefix = `${agentUrl.replace(/\/$/, '')}/files/`;
+  const prefix = relayFilesPrefix(agentUrl);
   const parsed = lines.map((line) => {
     const m = line.match(LINK_LINE_RE);
     return m && m[2].startsWith(prefix) ? { name: m[1], url: m[2] } : null;
@@ -166,7 +167,7 @@ function trimTrailingPunct(s: string): string {
  * тысяч пробелов или точек не должна вешать перенос.
  */
 export function collectRelayUrls(content: string, agentUrl: string): string[] {
-  const prefix = `${agentUrl.replace(/\/$/, '')}/files/`;
+  const prefix = relayFilesPrefix(agentUrl);
   const found = new Set<string>();
   const startsAt = new Map<number, string[]>();
   const add = (url: string, at: number) => {
