@@ -17,6 +17,7 @@ import { decodeMultipartFilename } from '../common/utils/multipart-filename';
 import { TEST_USERS } from '../common/test-users';
 import { parseClientUi } from './client-ui';
 import { toActivity } from './activity-map';
+import { RelayOutputFile, collectOutputFiles, outputFileLines } from './chat-files/relay-links';
 
 /**
  * Потолок загрузки, ОДИН на всю цепочку. Раньше каждое звено держало свой, и
@@ -328,6 +329,8 @@ export class ChatController {
     res.write(JSON.stringify({ type: 'begin' }) + '\n');
 
     const chunks: string[] = [];
+    // Файлы хода — копируются к нам после потока (chat-files), см. finally.
+    const pendingFiles: RelayOutputFile[] = [];
     let upstreamError: Error | null = null;
     // Расход хода. Релей присылает его в событии `done` с 07.08.2026 — до
     // 06.09.2026 обработчик загрузки эти поля молча выбрасывал, и ход с
@@ -393,15 +396,7 @@ export class ChatController {
                     if (typeof v === 'number' && v > 0) agentUsage[k] += v;
                   }
                 }
-                if (ev.outputFiles?.length > 0) {
-                  const fileLinks = ev.outputFiles
-                    .map((f: any) => `[Скачать ${f.name}](${AGENT_URL}${f.url})`)
-                    .join('\n');
-                  if (fileLinks) {
-                    chunks.push('\n\n' + fileLinks);
-                    safeWrite({ type: 'item', content: '\n\n' + fileLinks });
-                  }
-                }
+                collectOutputFiles(pendingFiles, ev.outputFiles);
               }
             } catch {}
           }
@@ -412,6 +407,16 @@ export class ChatController {
     } catch (err: any) {
       upstreamError = err;
     } finally {
+      // Ссылки на файлы хода — уже на наше хранилище, до `end` и до истории:
+      // одна строка в обоих местах (historyMerge.ts сверяет посимвольно).
+      // Здесь, в отличие от текстового хода, они дописываются всегда — так было
+      // и до переноса. storeRelayLinks не бросает.
+      if (pendingFiles.length > 0) {
+        const lines = await this.chatService.storeRelayLinks(outputFileLines(pendingFiles, AGENT_URL), AGENT_URL);
+        const tail = '\n\n' + lines.join('\n');
+        chunks.push(tail);
+        safeWrite({ type: 'item', content: tail });
+      }
       const fullText = chunks.join('');
 
       if (fullText.length > 0) {
