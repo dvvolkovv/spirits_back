@@ -305,3 +305,37 @@ describe('ChatFileStore: жёсткие сроки', () => {
     expect(map.size).toBe(0);
   });
 });
+
+describe('ChatFileStore: копируем только /files/ нашего релея', () => {
+  it.each([
+    ['чужой хост', 'https://evil.example/files/k/a.pdf'],
+    ['хост-двойник', 'https://r.linkeon.io.evil.example/files/k/a.pdf'],
+    ['другая схема', 'http://r.linkeon.io/files/k/a.pdf'],
+    ['не /files/', 'https://r.linkeon.io/session/k/files'],
+    ['адрес папки', 'https://r.linkeon.io/files/k/'],
+    ['«..» в пути', 'https://r.linkeon.io/files/k/../../etc/passwd'],
+    ['закодированные «..»', 'https://r.linkeon.io/files/k/%2e%2e/%2E%2E/secret'],
+    ['«.» в пути', 'https://r.linkeon.io/files/./k/a.pdf'],
+  ])('%s — отказ без скачивания: %s', async (_why, url) => {
+    get.mockResolvedValue(ok('x'));
+    const { store, uploads } = makeStore();
+
+    await expect(store.persistOne(url)).rejects.toThrow();
+    const map = await store.persist([url]);
+
+    expect(map.size).toBe(0);
+    expect(get).not.toHaveBeenCalled();
+    expect(uploads).toHaveLength(0);
+  });
+
+  it('релей — из AGENT_URL, а не зашитый r.linkeon.io', async () => {
+    process.env.AGENT_URL = 'https://relay.example/';
+    get.mockResolvedValue(ok('x'));
+    const { store } = makeStore();
+
+    const map = await store.persist(['https://relay.example/files/k/a.pdf', `${RELAY}/b.pdf`]);
+
+    expect([...map.keys()]).toEqual(['https://relay.example/files/k/a.pdf']);
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+});
