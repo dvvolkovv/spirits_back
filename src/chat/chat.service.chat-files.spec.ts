@@ -311,4 +311,25 @@ describe('streamUniversalAgent — файлы хода в нашем храни�
 
     expect(endContent(h.written)).toContain(`[Скачать report.pdf](${STORED})`);
   });
+
+  // Fix 5 ловит дедуп только по URL без скобок: `\]\(([^)]+)\)$` не находит
+  // адрес, если имя файла (а значит и хвост адреса) содержит «)» — как в
+  // «Отчёт(1).pdf». Разбор ломается на первой же «)» внутри адреса, строка не
+  // узнаётся как уже присланная, и файл копируется в MinIO второй раз
+  // отдельным объектом с задвоенной строкой ссылки в ответе.
+  it('пустые скобки на файл с «)» в имени — не задваивают копию и строку', async () => {
+    const store = storeOk();
+    const PAREN_OUTPUT = [{ name: 'Отчёт(1).pdf', url: '/files/u1_7_ru/Отчёт(1).pdf', size: 10 }];
+    const h = makeHarness({
+      deltas: ['Готово: [Скачать Отчёт(1).pdf]()'],
+      outputFiles: PAREN_OUTPUT,
+      store,
+      sessionFiles: [{ name: 'Отчёт(1).pdf', url: '/files/u1_7_ru/Отчёт(1).pdf' }],
+    });
+    await h.run();
+
+    expect(store.persist).toHaveBeenCalledTimes(1);
+    const resolvedLinks = items(h.written).filter((c) => c.includes(`(${STORED})`));
+    expect(resolvedLinks).toHaveLength(1);
+  });
 });

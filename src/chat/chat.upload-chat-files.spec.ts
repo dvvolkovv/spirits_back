@@ -213,4 +213,41 @@ describe('uploadAndChat — activeStreams (beginStream/endStream)', () => {
     for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
     expect(svc.getActiveStreamCount()).toBe(0);
   });
+
+  // beginStream/endStream раньше были завязаны на то, какая из веток finally
+  // выполнится дальше (есть текст / есть что персистить / нет). Бросок
+  // где-то посреди finally, ДО ветки с setImmediate, уводил activeStreams в
+  // вечный плюс — deploy.sh ждал бы несуществующий ход до своего таймаута.
+  it('бросок внутри finally (computeUploadCharge) — activeStreams всё равно возвращается в 0', async () => {
+    const pg = makePg();
+    const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
+    const store = { persist: jest.fn(async (urls: string[]) => new Map(urls.map((u) => [u, STORED]))) };
+    const svc = new ChatService(
+      pg as any, null as any, null as any, null as any, null as any, language as any,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      store as any,
+    );
+    jest.spyOn(svc, 'computeUploadCharge').mockImplementation(() => { throw new Error('computeUploadCharge boom'); });
+    const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+    const ctrl = new ChatController(svc, jwtSvc as any, null as any, undefined);
+    const post = jest.fn(async () => ({
+      data: sseStream([
+        { type: 'delta', text: 'Перевёл.' },
+        { type: 'done', outputFiles: [{ name: 'scan.docx', url: '/files/u1_12_ru/scan.docx' }] },
+      ]),
+    }));
+    (axios as any).default = { post };
+    (axios as any).post = post;
+    const req = {
+      headers: { authorization: 'Bearer token' },
+      files: [{ originalname: 'scan.jpg', buffer: Buffer.from('x'), mimetype: 'image/jpeg', size: 1 }],
+      body: { message: 'переведи', assistantId: '12' },
+    } as any;
+    const res = makeRes();
+
+    await ctrl.uploadAndChat(req, res).catch(() => {});
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+
+    expect(svc.getActiveStreamCount()).toBe(0);
+  });
 });
