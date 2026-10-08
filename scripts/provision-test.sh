@@ -522,8 +522,12 @@ seed_minio_assets() {
   ssh_test 'command -v mc >/dev/null || (sudo wget -qO /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc && sudo chmod +x /usr/local/bin/mc); mc --version | head -1 >/dev/null'
   ssh_test "mc alias set local http://127.0.0.1:9000 '$MINIO_ACCESS_KEY' '$MINIO_SECRET_KEY' 2>&1 | tail -1"
 
-  # Создать bucket + public-read (idempotent)
-  ssh_test 'mc mb local/linkeon-assets 2>&1 | tail -1 | grep -vqE "already (exists|owned)" && echo created || echo "(bucket exists)"; mc anonymous set download local/linkeon-assets 2>&1 | tail -1'
+  # Создать bucket + анонимное скачивание по точному адресу (idempotent).
+  # Не `mc anonymous set download`: эта заготовка MinIO заодно разрешает
+  # анонимный s3:ListBucket, то есть перечень всех ключей бакета любому
+  # желающему. Политика — только s3:GetObject (прод и test приведены к ней
+  # 08.10.2026).
+  ssh_test 'mc mb local/linkeon-assets 2>&1 | tail -1 | grep -vqE "already (exists|owned)" && echo created || echo "(bucket exists)"; p=$(mktemp); printf "%s" "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::linkeon-assets/*\"]}]}" > "$p"; mc anonymous set-json "$p" local/linkeon-assets 2>&1 | tail -1; rm -f "$p"'
 
   # Залить аватарки агентов из прода (через публичный URL, без прямого MinIO-доступа на проде)
   local n_uploaded=0
