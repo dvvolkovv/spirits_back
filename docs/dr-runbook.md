@@ -94,6 +94,15 @@ mc mirror --overwrite node3minio/linkeon-smm-music  newprod/linkeon-smm-music
 If node-3's MinIO is serving directly during an outage, point `MINIO_ENDPOINT`
 at `http://10.10.0.3:9000` and restart the api/worker.
 
+The public nginx route to MinIO (prod `location /smm-media/`, test
+`location /minio/`) must keep two lines, including on a rebuilt server:
+`set $args "";` and `add_header Content-Security-Policy "sandbox" always;`.
+MinIO honours `?response-content-type=` / `?response-content-disposition=`
+even on anonymous GETs, so without them any object opens as an HTML page on
+my.linkeon.io, next to the login tokens in localStorage (closed 2026-10-08).
+Check: a GET with `?response-content-type=text/html` must still return the
+stored type plus the `Content-Security-Policy: sandbox` header.
+
 ---
 
 ## Out of scope (known gaps)

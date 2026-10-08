@@ -464,8 +464,14 @@ server {
   # т.е. браузер не подмешает там Basic. Так же как на проде из MinIO напрямую.
   location /minio/ {
     auth_basic off;
+    # Параметры запроса MinIO не нужны и опасны: response-content-type и
+    # response-content-disposition меняют тип файла даже в анонимном запросе.
+    set \\\$args "";
+    # Файл, открытый страницей, — в песочнице: без скриптов и без доступа к localStorage.
+    add_header Content-Security-Policy "sandbox" always;
     proxy_pass http://127.0.0.1:9000/;
     proxy_set_header Host \\\$host;
+    proxy_set_header Authorization "";
   }
 }
 EOF
