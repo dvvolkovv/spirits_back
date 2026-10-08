@@ -103,12 +103,45 @@ function isOwnLinkLine(name: string, url: string): boolean {
   return !/\s/.test(head);
 }
 
+/**
+ * Длиннее — не строка бэка: у него строки короткие. Жадный LINK_LINE_RE на
+ * длинной строке перебирает её квадратично, а строки в истории бывают и
+ * враждебные: их текст пишет модель.
+ */
+const MAX_LINK_LINE_CHARS = 2000;
+/** Концы строк — те же, что у флага m в RegExp (на них же кончается «.»). */
+const LINE_BREAK_RE = /[\n\r\p{Zl}\p{Zp}]/u;
+
 /** Цель markdown-ссылки с одним уровнем парных скобок: `](…/Договор (1).docx)`. */
 const MD_TARGET_RE = /\]\(((?:[^()\n]|\([^()\n]*\))+)\)/g;
-/** Заголовок ссылки `(адрес "заголовок")` — не часть адреса. */
-const MD_TITLE_RE = /\s+(?:"[^"]*"|'[^']*')$/;
-/** Пунктуация конца фразы после голого адреса — не часть адреса (класс для RegExp). */
-const TRAILING_PUNCT = '[.,;:!?»…]';
+
+/** Пунктуация конца фразы после голого адреса — не часть адреса. */
+const TRAILING_PUNCT_CHARS = '.,;:!?»…';
+/** Она же — класс для RegExp. */
+const TRAILING_PUNCT = `[${TRAILING_PUNCT_CHARS}]`;
+
+/**
+ * Без заголовка ссылки — `(адрес "заголовок")` или `(адрес 'заголовок')`: он не
+ * часть адреса. С конца строки, без регулярки: `\s+"…"$` на тысячах пробелов
+ * подряд перебирал бы их квадратично. Режет ровно то же, что режет она:
+ * пробелы и заголовок без кавычек того же вида внутри.
+ */
+function stripMdTitle(s: string): string {
+  const q = s[s.length - 1];
+  if (q !== '"' && q !== "'") return s;
+  const open = s.lastIndexOf(q, s.length - 2);
+  if (open < 1 || !/\s/.test(s[open - 1])) return s;
+  let end = open - 1;
+  while (end > 0 && /\s/.test(s[end - 1])) end--;
+  return s.slice(0, end);
+}
+
+/** Без пунктуации конца фразы в хвосте — циклом с конца, а не регуляркой `[…]+$` (она квадратична на тысячах точек). */
+function trimTrailingPunct(s: string): string {
+  let end = s.length;
+  while (end > 0 && TRAILING_PUNCT_CHARS.includes(s[end - 1])) end--;
+  return s.slice(0, end);
+}
 
 /**
  * Все адреса файлов релея в тексте ответа — для разового бэкфилла истории.
@@ -120,7 +153,7 @@ const TRAILING_PUNCT = '[.,;:!?»…]';
  *     бывает и с парными скобками (`Договор (1).docx`), и с непарной
  *     (`1) План.docx`), и с пробелами — релей имена не кодирует. Только если
  *     имя — хвост адреса (isOwnLinkLine); строку того же вида от модели
- *     разбирают проходы 2 и 3.
+ *     разбирают проходы 2 и 3. Строки от MAX_LINK_LINE_CHARS — тоже им.
  *  2. Цели markdown-ссылок посреди прочего текста: один уровень парных скобок,
  *     без заголовка ссылки.
  *  3. Голые адреса, без пунктуации конца фразы в хвосте.
@@ -128,6 +161,9 @@ const TRAILING_PUNCT = '[.,;:!?»…]';
  * Обрезок — адрес, который лишь начало другого, найденного С ТОГО ЖЕ МЕСТА
  * текста (имя с пробелом или скобкой), — отдельно не добавляется. Начало
  * адреса в другом месте текста (`…/a.pdf` рядом с `…/a.pdf.zip`) — свой файл.
+ *
+ * Время — линейное от длины текста: текст пишет модель, и строка в десятки
+ * тысяч пробелов или точек не должна вешать перенос.
  */
 export function collectRelayUrls(content: string, agentUrl: string): string[] {
   const prefix = `${agentUrl.replace(/\/$/, '')}/files/`;
@@ -140,20 +176,25 @@ export function collectRelayUrls(content: string, agentUrl: string): string[] {
     found.add(url);
     startsAt.set(at, [...here, url]);
   };
-  for (const m of content.matchAll(new RegExp(LINK_LINE_RE.source, 'gm'))) {
-    const url = m[2].trim();
-    if (!isOwnLinkLine(m[1], url)) continue;
-    // Адрес стоит в самом конце строки, перед закрывающей «)».
-    add(url, m.index + m[0].length - 1 - m[2].length);
+  let lineAt = 0;
+  for (const line of content.split(LINE_BREAK_RE)) {
+    const m = line.length < MAX_LINK_LINE_CHARS ? LINK_LINE_RE.exec(line) : null;
+    if (m) {
+      const url = m[2].trim();
+      // Адрес стоит в самом конце строки, перед закрывающей «)».
+      if (isOwnLinkLine(m[1], url)) add(url, lineAt + line.length - 1 - m[2].length);
+    }
+    lineAt += line.length + 1;
   }
   for (const m of content.matchAll(MD_TARGET_RE)) {
     const lead = m[1].length - m[1].trimStart().length;
-    add(m[1].trim().replace(MD_TITLE_RE, ''), m.index + 2 + lead);
+    const target = m[1].trim();
+    // Сначала префикс: заголовок ищется только у адресов релея.
+    if (target.startsWith(prefix)) add(stripMdTitle(target), m.index + 2 + lead);
   }
   const bare = new RegExp(`${escapeRe(prefix)}[^\\s\`'"<>)\\]]+`, 'g');
-  const tail = new RegExp(`${TRAILING_PUNCT}+$`);
   for (const m of content.matchAll(bare)) {
-    add(m[0].replace(tail, ''), m.index);
+    add(trimTrailingPunct(m[0]), m.index);
   }
   return [...found];
 }
