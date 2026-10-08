@@ -7,6 +7,7 @@ import {
   fileExt,
   lastPathSegment,
   relayFileName,
+  relayFilesPrefix,
   relayRequestUrl,
   safeFileName,
 } from './file-meta';
@@ -135,6 +136,18 @@ describe('relayRequestUrl', () => {
   });
   it('подпапки сохраняются', () => {
     expect(relayRequestUrl('https://r.linkeon.io/files/k/sub/x.pdf')).toBe('https://r.linkeon.io/files/k/sub/x.pdf');
+  });
+});
+
+describe('relayFilesPrefix', () => {
+  it('origin AGENT_URL и /files/: регистр хоста, порт по умолчанию и слэш на конце не важны', () => {
+    for (const u of ['https://r.linkeon.io', 'https://r.linkeon.io/', 'https://R.LINKEON.IO:443/', 'HTTPS://r.linkeon.io:443']) {
+      expect(relayFilesPrefix(u)).toBe('https://r.linkeon.io/files/');
+    }
+    expect(relayFilesPrefix('http://relay.example:8080/')).toBe('http://relay.example:8080/files/');
+  });
+  it('не адрес — не бросает: строка как есть, без слэша на конце', () => {
+    expect(relayFilesPrefix('не адрес/')).toBe('не адрес/files/');
   });
 });
 

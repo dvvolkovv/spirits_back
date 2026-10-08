@@ -75,6 +75,17 @@ describe('storeRelayLinks', () => {
     ]);
   });
 
+  it('AGENT_URL с заглавными буквами и портом 443 — те же строки, тот же префикс', async () => {
+    const odd = 'https://R.LINKEON.IO:443/';
+    const files = [{ name: 'a.pdf', url: '/files/u1_12_ru/a.pdf' }];
+    expect(outputFileLines(files, odd)).toEqual(outputFileLines(files, AGENT));
+    const store = okStore();
+    expect(await storeRelayLinks(outputFileLines(files, odd), odd, store)).toEqual([
+      '[Скачать a.pdf](https://pub/linkeon-chat-files/id/a.pdf)',
+    ]);
+    expect(collectRelayUrls(`[Скачать a.pdf](${R}/a.pdf) и ${R}/b.pdf`, odd).sort()).toEqual([`${R}/a.pdf`, `${R}/b.pdf`]);
+  });
+
   it('строки без адреса релея не трогает и хранилище не зовёт', async () => {
     const store = okStore();
     const lines = ['[Скачать x.pdf](https://example.com/x.pdf)', 'просто текст'];

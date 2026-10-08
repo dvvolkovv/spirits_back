@@ -338,6 +338,16 @@ describe('ChatFileStore: копируем только /files/ нашего ре
     expect([...map.keys()]).toEqual(['https://relay.example/files/k/a.pdf']);
     expect(get).toHaveBeenCalledTimes(1);
   });
+
+  it('AGENT_URL с заглавными буквами и портом 443 — тот же релей', async () => {
+    process.env.AGENT_URL = 'https://R.LINKEON.IO:443/';
+    get.mockResolvedValue(ok('x'));
+    const { store } = makeStore();
+
+    const map = await store.persist([`${RELAY}/a.pdf`, 'https://evil.example/files/k/b.pdf']);
+
+    expect([...map.keys()]).toEqual([`${RELAY}/a.pdf`]);
+  });
 });
 
 describe('ChatFileStore: «#», «?» и уже закодированное в имени', () => {
