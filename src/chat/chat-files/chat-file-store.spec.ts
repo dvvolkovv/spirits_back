@@ -306,6 +306,50 @@ describe('ChatFileStore: жёсткие сроки', () => {
   });
 });
 
+describe('ChatFileStore: бюджет и сроки больше предела таймера Node', () => {
+  /** Скачивание идёт ~30 мс: досрочный обрыв по таймеру будет виден. */
+  const slowGet = async () => {
+    await new Promise((r) => setTimeout(r, 30));
+    return ok('x');
+  };
+
+  it('бюджет Infinity (так зовёт перенос): копирует всё, срок скачивания — срок на файл', async () => {
+    get.mockImplementation(slowGet);
+    const { store } = makeStore();
+
+    const map = await within(store.persist([`${RELAY}/a.pdf`, `${RELAY}/b.pdf`], { budgetMs: Infinity }), 2000);
+
+    expect(map.size).toBe(2);
+    expect(get.mock.calls[0][1].timeoutMs).toBe(PERSIST_FILE_TIMEOUT_MS);
+  });
+
+  it('бюджет и срок на файл больше 2^31-1 мс — таймеры не срабатывают через 1 мс', async () => {
+    get.mockImplementation(slowGet);
+    const { store, uploads } = makeStore(async (input) => {
+      await new Promise((r) => setTimeout(r, 30));
+      if (input.abortSignal.aborted) throw new Error('загрузку оборвали');
+      return 'ok';
+    });
+
+    const map = await within(store.persist([`${RELAY}/a.pdf`], { budgetMs: 2 ** 31, fileTimeoutMs: 2 ** 31 }), 2000);
+
+    expect(map.size).toBe(1);
+    expect(uploads).toHaveLength(1);
+    expect(get.mock.calls[0][1].timeoutMs).toBeLessThanOrEqual(2 ** 31 - 1);
+  });
+
+  it('срок на файл Infinity или дробный — загрузка в бакет не падает', async () => {
+    get.mockResolvedValue(ok('x'));
+    const { store } = makeStore();
+
+    const map = await store.persist([`${RELAY}/a.pdf`, `${RELAY}/b.pdf`], { fileTimeoutMs: Infinity });
+    const map2 = await store.persist([`${RELAY}/c.pdf`], { fileTimeoutMs: 1234.5 });
+
+    expect(map.size).toBe(2);
+    expect(map2.size).toBe(1);
+  });
+});
+
 describe('ChatFileStore: копируем только /files/ нашего релея', () => {
   it.each([
     ['чужой хост', 'https://evil.example/files/k/a.pdf'],
@@ -316,6 +360,9 @@ describe('ChatFileStore: копируем только /files/ нашего ре
     ['«..» в пути', 'https://r.linkeon.io/files/k/../../etc/passwd'],
     ['закодированные «..»', 'https://r.linkeon.io/files/k/%2e%2e/%2E%2E/secret'],
     ['«.» в пути', 'https://r.linkeon.io/files/./k/a.pdf'],
+    ['закодированный «/» внутри сегмента', 'https://r.linkeon.io/files/k/..%2F..%2Fsecret'],
+    ['закодированный «\\» внутри сегмента', 'https://r.linkeon.io/files/k/..%5C..%5Csecret'],
+    ['«\\» внутри сегмента', 'https://r.linkeon.io/files/k/..\\..\\secret'],
   ])('%s — отказ без скачивания: %s', async (_why, url) => {
     get.mockResolvedValue(ok('x'));
     const { store, uploads } = makeStore();
