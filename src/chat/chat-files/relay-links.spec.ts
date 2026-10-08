@@ -77,6 +77,62 @@ describe('collectRelayUrls', () => {
     ].join('\n');
     expect(collectRelayUrls(text, AGENT).sort()).toEqual([`${R}/a b.pdf`, `${R}/c.docx`, `${R}/d.txt`].sort());
   });
+
+  it('строки бэка со скобками в имени — адрес целиком, а не до первой «)»', () => {
+    const text = [
+      'Готово.',
+      '',
+      `[Скачать Договор (1).docx](${R}/Договор (1).docx)`,
+      `[Скачать 1) План.docx](${R}/1) План.docx)`,
+    ].join('\n');
+    expect(collectRelayUrls(text, AGENT).sort()).toEqual([`${R}/1) План.docx`, `${R}/Договор (1).docx`].sort());
+  });
+
+  it('ссылка внутри текста: парные скобки в адресе, заголовок ссылки — не часть адреса', () => {
+    const text = `Вот договор: [скачать](${R}/Договор (2).docx), а вот [отчёт](${R}/a.pdf "Отчёт за май").`;
+    expect(collectRelayUrls(text, AGENT).sort()).toEqual([`${R}/a.pdf`, `${R}/Договор (2).docx`].sort());
+  });
+
+  it('голый адрес: точка, «ёлочка», многоточие после него — не часть адреса', () => {
+    const text = `Файл: ${R}/c.docx. И ещё «${R}/d.pdf»; и ${R}/e.txt…`;
+    expect(collectRelayUrls(text, AGENT).sort()).toEqual([`${R}/c.docx`, `${R}/d.pdf`, `${R}/e.txt`].sort());
+  });
+
+  it('адрес, который лишь начало другого, но стоит в другом месте текста, — отдельный файл', () => {
+    const text = `[архив](${R}/a.pdf.zip) и [файл](${R}/a.pdf)\nголые: ${R}/b.pdf.zip и ${R}/b.pdf`;
+    expect(collectRelayUrls(text, AGENT).sort()).toEqual(
+      [`${R}/a.pdf`, `${R}/a.pdf.zip`, `${R}/b.pdf`, `${R}/b.pdf.zip`].sort(),
+    );
+  });
+});
+
+describe('бэкфилл: collectRelayUrls → replaceUrls', () => {
+  it('скобки, заголовок ссылки и пунктуация: каждый адрес находится и подставляется на своё место', () => {
+    const text = [
+      `[Скачать 1) План.docx](${R}/1) План.docx)`,
+      `[Скачать Договор (1).docx](${R}/Договор (1).docx)`,
+      `Ещё [отчёт](${R}/a.pdf "Отчёт") и ${R}/c.docx.`,
+    ].join('\n');
+    // Копируются только настоящие файлы: обрезок адреса на релее — это 404.
+    const onRelay = new Map([
+      [`${R}/1) План.docx`, 'https://pub/b/plan'],
+      [`${R}/Договор (1).docx`, 'https://pub/b/dogovor'],
+      [`${R}/a.pdf`, 'https://pub/b/a'],
+      [`${R}/c.docx`, 'https://pub/b/c'],
+    ]);
+    const stored = new Map(
+      collectRelayUrls(text, AGENT)
+        .filter((u) => onRelay.has(u))
+        .map((u) => [u, onRelay.get(u)] as [string, string]),
+    );
+    expect(replaceUrls(text, stored)).toBe(
+      [
+        '[Скачать 1) План.docx](https://pub/b/plan)',
+        '[Скачать Договор (1).docx](https://pub/b/dogovor)',
+        'Ещё [отчёт](https://pub/b/a "Отчёт") и https://pub/b/c.',
+      ].join('\n'),
+    );
+  });
 });
 
 describe('replaceUrls', () => {
@@ -84,6 +140,12 @@ describe('replaceUrls', () => {
     const text = `[1](${R}/a.pdf) и [2](${R}/a.pdf.zip) и ${R}/a.pdf`;
     const out = replaceUrls(text, new Map([[`${R}/a.pdf`, 'https://pub/x/a.pdf']]));
     expect(out).toBe(`[1](https://pub/x/a.pdf) и [2](${R}/a.pdf.zip) и https://pub/x/a.pdf`);
+  });
+
+  it('адрес с точкой или «ёлочкой» после него меняется, более длинный — нет', () => {
+    const text = `Файл: ${R}/c.docx. И «${R}/c.docx»; и ${R}/c.docx.zip`;
+    const out = replaceUrls(text, new Map([[`${R}/c.docx`, 'https://pub/x/c.docx']]));
+    expect(out).toBe(`Файл: https://pub/x/c.docx. И «https://pub/x/c.docx»; и ${R}/c.docx.zip`);
   });
 
   it('знак $ в новом адресе не портит подстановку', () => {
