@@ -1,5 +1,6 @@
 // src/chat/chat-files/relay-links.ts
 import type { ChatFileStore } from './chat-file-store';
+import { relayFileName } from './file-meta';
 
 /** Файл хода из события релея `done.outputFiles`: `url` — относительный, `/files/<ключ>/<имя>`. */
 export interface RelayOutputFile {
@@ -82,6 +83,26 @@ export async function storeRelayLinks(
   });
 }
 
+/**
+ * Строка вида LINK_LINE_RE — собственная строка бэка, а не текст модели того
+ * же вида: имя в ней — хвост адреса. Так пишут все источники. outputFiles и
+ * форма 1 resolveEmptyFileLinks: имя — путь файла от папки хода, адрес —
+ * `/files/<ключ>/<путь>`. Форма 2: имя — последний сегмент адреса,
+ * раскодированный. До имени пробелов в адресе нет: ключ релея — [a-zA-Z0-9._-].
+ *
+ * Модель же дописывает после ссылки своё: «(PDF, 2 стр.)», «:)», заголовок
+ * ссылки, вторую ссылку. Жадный LINK_LINE_RE взял бы это в адрес, а настоящий
+ * адрес с того же места отбросился бы потом как обрезок — и файл потерялся бы.
+ */
+function isOwnLinkLine(name: string, url: string): boolean {
+  if (name === '') return true;
+  let head: string;
+  if (url.endsWith('/' + name)) head = url.slice(0, url.length - name.length - 1);
+  else if (relayFileName(url).trim() === name) head = url.slice(0, url.lastIndexOf('/'));
+  else return false;
+  return !/\s/.test(head);
+}
+
 /** Цель markdown-ссылки с одним уровнем парных скобок: `](…/Договор (1).docx)`. */
 const MD_TARGET_RE = /\]\(((?:[^()\n]|\([^()\n]*\))+)\)/g;
 /** Заголовок ссылки `(адрес "заголовок")` — не часть адреса. */
@@ -97,7 +118,9 @@ const TRAILING_PUNCT = '[.,;:!?»…]';
  *  1. Целые строки нашего формата `[Скачать имя](адрес)` (LINK_LINE_RE) — бэк
  *     всегда писал их по одной в строке. Жадно до последней «)» строки: имя
  *     бывает и с парными скобками (`Договор (1).docx`), и с непарной
- *     (`1) План.docx`), и с пробелами — релей имена не кодирует.
+ *     (`1) План.docx`), и с пробелами — релей имена не кодирует. Только если
+ *     имя — хвост адреса (isOwnLinkLine); строку того же вида от модели
+ *     разбирают проходы 2 и 3.
  *  2. Цели markdown-ссылок посреди прочего текста: один уровень парных скобок,
  *     без заголовка ссылки.
  *  3. Голые адреса, без пунктуации конца фразы в хвосте.
@@ -118,8 +141,10 @@ export function collectRelayUrls(content: string, agentUrl: string): string[] {
     startsAt.set(at, [...here, url]);
   };
   for (const m of content.matchAll(new RegExp(LINK_LINE_RE.source, 'gm'))) {
+    const url = m[2].trim();
+    if (!isOwnLinkLine(m[1], url)) continue;
     // Адрес стоит в самом конце строки, перед закрывающей «)».
-    add(m[2].trim(), m.index + m[0].length - 1 - m[2].length);
+    add(url, m.index + m[0].length - 1 - m[2].length);
   }
   for (const m of content.matchAll(MD_TARGET_RE)) {
     const lead = m[1].length - m[1].trimStart().length;
