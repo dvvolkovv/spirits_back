@@ -1611,6 +1611,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // 'item' клиенту. Вынесено в замыкание ради self-heal ретрая пустого потока.
       // Ключ сессии релея: и в запросе, и для шагов работы — релей кладёт
       // загрузки под именем «<ключ>_<файл>», и префикс надо срезать.
+      // Файлы хода из done.outputFiles. Обработчик done синхронный, а файлы
+      // сначала надо скопировать в наше хранилище (chat-files), поэтому ссылки
+      // уходят после потока. Список общий для обоих прогонов, включая повтор
+      // при пустом потоке.
+      const pendingFiles: RelayOutputFile[] = [];
       const relaySid = relaySessionKey(userId, assistantId, userLanguage, fresh ? freshSessionId : undefined);
       const callUpstreamOnce = async (): Promise<void> => {
         const FormData = require('form-data');
@@ -1734,16 +1739,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
                         if (typeof v === 'number' && v > 0) agentUsage[k] += v;
                       }
                     }
-                    // Collect output files info if any
-                    if (ev.outputFiles && ev.outputFiles.length > 0) {
-                      const fileLinks = ev.outputFiles
-                        .map((f: any) => `[Скачать ${f.name}](${AGENT_URL}${f.url})`)
-                        .join('\n');
-                      if (fileLinks && !chunks.join('').includes(AGENT_URL)) {
-                        chunks.push('\n\n' + fileLinks);
-                        safeWrite({ type: 'item', content: '\n\n' + fileLinks });
-                      }
-                    }
+                    // Файлы хода — не отсюда: их сначала надо скопировать к
+                    // нам, а этот обработчик синхронный. Ссылки уходят после потока.
+                    collectOutputFiles(pendingFiles, ev.outputFiles);
                   }
                 } catch {}
               }
@@ -1768,7 +1766,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // прогон мог успеть прислать свои шаги ДО того, как понял, что поток
       // пуст, а повтор пришлёт свои — итог видимый, но не ломающий: веб
       // покажет повтор счётчиком («×2») или второй строкой, ответ не страдает.
-      if (chunks.length === 0 && !clientDisconnected) {
+      // Ход из одних файлов — не пустой: раньше их ссылки уже лежали в chunks к
+      // этому месту, и повтора не было. Без этой проверки релей гонялся бы
+      // второй раз — двойная оплата и дубли файлов.
+      if (chunks.length === 0 && pendingFiles.length === 0 && !clientDisconnected) {
         this.logger.warn(`empty stream from r.linkeon for ${userId}_${assistantId} — self-heal retry`);
         this.events?.track('chat_quality', {
           userId, sessionId: `${userId}_${assistantId}`,
@@ -1776,6 +1777,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
         });
         await new Promise((r) => setTimeout(r, 800));
         try { await callUpstreamOnce(); } catch (e: any) { this.logger.warn(`self-heal retry failed: ${e.message}`); }
+      }
+
+      // Ссылки на файлы хода — уже на наше хранилище. Один и тот же текст уходит
+      // и клиенту, и в историю: фронт сверяет ленту с историей посимвольно
+      // (historyMerge.ts), и разные адреса в двух местах задвоили бы ответ.
+      // Условие «в ответе ещё нет адреса релея» — прежнее, из обработчика done.
+      if (pendingFiles.length > 0 && !chunks.join('').includes(AGENT_URL)) {
+        const lines = await this.storeRelayLinks(outputFileLines(pendingFiles, AGENT_URL), AGENT_URL);
+        const tail = '\n\n' + lines.join('\n');
+        chunks.push(tail);
+        safeWrite({ type: 'item', content: tail });
       }
 
       // Ссылки на файлы, которые ассистент оформить не смог — см.
@@ -1800,7 +1812,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           const resolved = resolveEmptyFileLinks(full, listed, AGENT_URL);
 
           if (resolved.length > 0) {
-            const tail = '\n\n' + resolved.join('\n');
+            const tail = '\n\n' + (await this.storeRelayLinks(resolved, AGENT_URL)).join('\n');
             chunks.push(tail);
             safeWrite({ type: 'item', content: tail });
             this.logger.log(`filled ${resolved.length} file link(s) for ${sid}`);
