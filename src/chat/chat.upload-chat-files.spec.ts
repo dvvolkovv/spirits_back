@@ -101,4 +101,116 @@ describe('uploadAndChat — файлы хода в нашем хранилище
     expect(items).toContain(`\n\n[Скачать scan.docx](${RELAY_FILE})`);
     expect(saved).toContain(RELAY_FILE);
   });
+
+  // Fix 6: relay-links.storeRelayLinks сама не бросает (ловит сбой persist
+  // внутри и возвращает исходные строки), поэтому единственный способ
+  // проверить страховку КОНТРОЛЛЕРА — заставить бросить саму обёртку
+  // ChatService.storeRelayLinks (например, будущий баг выше по цепочке).
+  // Без local try/catch (chat.controller.ts, finally) это уронило бы finally
+  // целиком — клиент не получил бы ни `end`, ни res.end(), ни историю.
+  it('ChatService.storeRelayLinks бросила — ответ и история всё равно уходят, со ссылкой на релей', async () => {
+    const pg = makePg();
+    const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
+    const svc = new ChatService(
+      pg as any, null as any, null as any, null as any, null as any, language as any,
+      undefined, undefined, undefined, undefined,
+    );
+    jest.spyOn(svc, 'storeRelayLinks').mockRejectedValue(new Error('boom'));
+    const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+    const ctrl = new ChatController(svc, jwtSvc as any, null as any, undefined);
+    const post = jest.fn(async () => ({
+      data: sseStream([
+        { type: 'delta', text: 'Перевёл.' },
+        { type: 'done', outputFiles: [{ name: 'scan.docx', url: '/files/u1_12_ru/scan.docx' }] },
+      ]),
+    }));
+    (axios as any).default = { post };
+    (axios as any).post = post;
+    const req = {
+      headers: { authorization: 'Bearer token' },
+      files: [{ originalname: 'scan.jpg', buffer: Buffer.from('x'), mimetype: 'image/jpeg', size: 1 }],
+      body: { message: 'переведи', assistantId: '12' },
+    } as any;
+    const res = makeRes();
+
+    await ctrl.uploadAndChat(req, res);
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+
+    const items = res.written.filter((w: any) => w.type === 'item').map((w: any) => w.content);
+    expect(items).toContain(`\n\n[Скачать scan.docx](${RELAY_FILE})`);
+    expect(res.written.find((w: any) => w.type === 'end')).toBeDefined();
+    expect(res.end).toHaveBeenCalled();
+    const saved = pg.calls.find((c) => /INSERT INTO custom_chat_history/.test(c.sql) && /'ai'/.test(c.sql))?.params[2];
+    expect(saved).toContain(RELAY_FILE);
+  });
+});
+
+describe('uploadAndChat — activeStreams (beginStream/endStream)', () => {
+  beforeEach(() => { jest.clearAllMocks(); delete process.env.AGENT_URL; });
+
+  it('ход занят в activeStreams пока идёт копия файлов, свободен после сохранения истории', async () => {
+    const pg = makePg();
+    const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
+    let resolvePersist!: (v: Map<string, string>) => void;
+    const store = {
+      persist: jest.fn(() => new Promise<Map<string, string>>((resolve) => { resolvePersist = resolve; })),
+    };
+    const svc = new ChatService(
+      pg as any, null as any, null as any, null as any, null as any, language as any,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      store as any,
+    );
+    const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+    const ctrl = new ChatController(svc, jwtSvc as any, null as any, undefined);
+    const post = jest.fn(async () => ({
+      data: sseStream([
+        { type: 'delta', text: 'Перевёл.' },
+        { type: 'done', outputFiles: [{ name: 'scan.docx', url: '/files/u1_12_ru/scan.docx' }] },
+      ]),
+    }));
+    (axios as any).default = { post };
+    (axios as any).post = post;
+    const req = {
+      headers: { authorization: 'Bearer token' },
+      files: [{ originalname: 'scan.jpg', buffer: Buffer.from('x'), mimetype: 'image/jpeg', size: 1 }],
+      body: { message: 'переведи', assistantId: '12' },
+    } as any;
+    const res = makeRes();
+
+    const done = ctrl.uploadAndChat(req, res);
+    // Копия «висит» на persist (promise не резолвится) — ход обязан быть
+    // виден в activeStreams: иначе deploy.sh счёл бы его свободным и мог
+    // рестартовать процесс посреди ~60-секундной копии в MinIO.
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+    expect(svc.getActiveStreamCount()).toBe(1);
+
+    resolvePersist(new Map([[RELAY_FILE, STORED]]));
+    await done;
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+    expect(svc.getActiveStreamCount()).toBe(0);
+  });
+
+  it('апстрим упал без единого байта текста — activeStreams возвращается в 0', async () => {
+    const pg = makePg();
+    const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
+    const svc = new ChatService(
+      pg as any, null as any, null as any, null as any, null as any, language as any,
+      undefined, undefined, undefined, undefined,
+    );
+    const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+    const ctrl = new ChatController(svc, jwtSvc as any, null as any, undefined);
+    const post = jest.fn(async () => { throw new Error('connect refused'); });
+    (axios as any).default = { post };
+    (axios as any).post = post;
+    const req = {
+      headers: { authorization: 'Bearer token' },
+      files: [{ originalname: 'scan.jpg', buffer: Buffer.from('x'), mimetype: 'image/jpeg', size: 1 }],
+      body: { message: 'переведи', assistantId: '12' },
+    } as any;
+    const res = makeRes();
+
+    await ctrl.uploadAndChat(req, res);
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+    expect(svc.getActiveStreamCount()).toBe(0);
+  });
 });

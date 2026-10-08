@@ -92,6 +92,20 @@ describe('storeRelayLinks', () => {
     expect(await storeRelayLinks(lines, AGENT, store)).toEqual(lines);
     expect(store.persist).not.toHaveBeenCalled();
   });
+
+  it('budgetMs из opts передаётся в persist', async () => {
+    const store = okStore();
+    const lines = [`[Скачать a.pdf](${R}/a.pdf)`];
+    await storeRelayLinks(lines, AGENT, store, undefined, { budgetMs: 5000 });
+    expect(store.persist).toHaveBeenCalledWith([`${R}/a.pdf`], { budgetMs: 5000 });
+  });
+
+  it('без opts — persist зовётся без второго аргумента, как раньше', async () => {
+    const store = okStore();
+    const lines = [`[Скачать a.pdf](${R}/a.pdf)`];
+    await storeRelayLinks(lines, AGENT, store);
+    expect(store.persist).toHaveBeenCalledWith([`${R}/a.pdf`]);
+  });
 });
 
 describe('collectRelayUrls', () => {
