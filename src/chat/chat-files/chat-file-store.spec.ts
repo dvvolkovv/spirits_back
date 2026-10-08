@@ -6,12 +6,6 @@ jest.mock('../../common/net/safe-fetch', () => ({
   ...jest.requireActual('../../common/net/safe-fetch'),
   safeGet: jest.fn(),
 }));
-// Красная фаза: код ещё качает через axios — направляем его в тот же фейк,
-// чтобы тест не ходил в сеть. Уходит вместе с axios из chat-file-store.ts.
-jest.mock('axios', () => ({
-  __esModule: true,
-  default: { get: (...args: any[]) => jest.requireMock('../../common/net/safe-fetch').safeGet(...args) },
-}));
 
 const get = safeGet as unknown as jest.Mock;
 
