@@ -15,6 +15,16 @@ export interface UploadInput {
   body: Buffer | Readable;
   contentType?: string;
   cacheControl?: string;
+  /**
+   * `attachment; filename=…` — файл по прямому переходу скачивается, а не
+   * открывается страницей на нашем домене (файлы переписки, chat-files).
+   */
+  contentDisposition?: string;
+  /**
+   * Обрывает загрузку: срок на файл, бюджет хода (chat-files). Без него send
+   * зовётся как раньше, одним аргументом.
+   */
+  abortSignal?: AbortSignal;
 }
 
 export interface DownloadInput {
@@ -62,15 +72,16 @@ export class StorageService implements OnModuleInit {
   }
 
   async upload(input: UploadInput): Promise<string> {
-    await this.s3.send(
-      new PutObjectCommand({
-        Bucket: input.bucket,
-        Key: input.key,
-        Body: input.body,
-        ContentType: input.contentType,
-        CacheControl: input.cacheControl,
-      }),
-    );
+    const cmd = new PutObjectCommand({
+      Bucket: input.bucket,
+      Key: input.key,
+      Body: input.body,
+      ContentType: input.contentType,
+      CacheControl: input.cacheControl,
+      ContentDisposition: input.contentDisposition,
+    });
+    if (input.abortSignal) await this.s3.send(cmd, { abortSignal: input.abortSignal });
+    else await this.s3.send(cmd);
     return `${this.publicBaseUrl}/${input.bucket}/${input.key}`;
   }
 

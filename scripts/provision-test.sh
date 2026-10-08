@@ -535,6 +535,9 @@ seed_minio_assets() {
   # 08.10.2026).
   ssh_test 'mc mb local/linkeon-assets 2>&1 | tail -1 | grep -vqE "already (exists|owned)" && echo created || echo "(bucket exists)"; p=$(mktemp); printf "%s" "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::linkeon-assets/*\"]}]}" > "$p"; mc anonymous set-json "$p" local/linkeon-assets 2>&1 | tail -1; rm -f "$p"'
 
+  # Файлы переписки (chat-files): то же — только s3:GetObject, без перечня ключей.
+  ssh_test 'mc mb --ignore-existing local/linkeon-chat-files 2>&1 | tail -1; p=$(mktemp); printf "%s" "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::linkeon-chat-files/*\"]}]}" > "$p"; mc anonymous set-json "$p" local/linkeon-chat-files 2>&1 | tail -1; rm -f "$p"'
+
   # Залить аватарки агентов из прода (через публичный URL, без прямого MinIO-доступа на проде)
   local n_uploaded=0
   local tmpdir

@@ -24,6 +24,8 @@ import { ASK_RULE } from './ask-rule';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
 import { productsCliMcp } from '../products/products-cli-tool';
+import { ChatFileStore, PERSIST_TURN_BUDGET_MS } from './chat-files/chat-file-store';
+import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks } from './chat-files/relay-links';
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import axios from 'axios';
@@ -260,6 +262,27 @@ export class ChatService {
   }
 
   /**
+   * Открывает ход для счётчика activeStreams. Публичные, в отличие от
+   * внутреннего инкремента streamUniversalAgent: ход с вложениями
+   * (ChatController.uploadAndChat) — отдельная реализация стрима, которая
+   * раньше в счётчик не попадала вовсе, хотя копия файлов после потока
+   * (chat-files) держит его открытым до ~60 с — ровно то время, которого
+   * deploy.sh не ждёт перед рестартом, если ход не виден в активных.
+   */
+  beginStream(): void {
+    this.activeStreams++;
+  }
+
+  /**
+   * Закрывает ход. Никогда не уходит в минус: пропущенный (или задвоенный
+   * по ошибке) beginStream иначе навсегда сдвинул бы счётчик, и deploy.sh
+   * ждал бы несуществующий активный ход до собственного таймаута.
+   */
+  endStream(): void {
+    if (this.activeStreams > 0) this.activeStreams--;
+  }
+
+  /**
    * Идёт ли прямо сейчас ход по этой паре пользователь+ассистент, и сколько он
    * уже длится. Для индикатора «ассистент работает» после перезагрузки.
    */
@@ -293,7 +316,24 @@ export class ChatService {
     // сборки) отсутствие выключателей не должно ронять чат. Трактуется как
     // «ограничений нет» — иначе тесты чата молча потеряли бы карточку.
     @Optional() private readonly integrations?: IntegrationFlagsService,
+    // Копия файлов ассистента в MinIO (chat-files). Последним и @Optional:
+    // спеки собирают ChatService позиционно. Без него ссылки остаются на
+    // релее, как до фичи, и в лог уходит предупреждение. Что он реально
+    // подключён, сторожит chat.module.chat-files.spec.ts.
+    @Optional() private readonly chatFiles?: ChatFileStore,
   ) {}
+
+  /**
+   * Ссылки `[Скачать имя](адрес релея)` → на наше хранилище (chat-files/relay-links.ts).
+   * Публичный: им же пользуется ход с вложениями в ChatController.
+   *
+   * opts.budgetMs — остаток бюджета хода на копирование (см.
+   * streamUniversalAgent: несколько вызовов за один ход делят один дедлайн).
+   * Без него — полный PERSIST_TURN_BUDGET_MS, как раньше.
+   */
+  storeRelayLinks(lines: string[], agentUrl: string, opts?: { budgetMs?: number }): Promise<string[]> {
+    return storeRelayLinks(lines, agentUrl, this.chatFiles, (m) => this.logger.warn(m), opts);
+  }
 
   /**
    * Agent-direct: the TalerID fields to hand the file-agent for a connected user,
@@ -1451,6 +1491,55 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
     const streamStartTime = Date.now();
     const chunks: string[] = []; // hoisted so catch block can access partial response
+
+    // Файлы хода из done.outputFiles. Обработчик done синхронный, а файлы
+    // сначала надо скопировать в наше хранилище (chat-files), поэтому ссылки
+    // уходят после потока. Список общий для обоих прогонов, включая повтор
+    // при пустом потоке.
+    //
+    // Хоist до try (а не внутри, как раньше): catch-путь (апстрим упал ПОСЛЕ
+    // done, но до конца потока) тоже должен видеть эти файлы и дописать на
+    // них ссылку — иначе ход со сбоем после done сохранялся бы в историю БЕЗ
+    // ссылки на файл, который ассистент реально создал (а токены за ход всё
+    // равно списались бы).
+    const pendingFiles: RelayOutputFile[] = [];
+    // Бюджет на копирование файлов за ВЕСЬ ход, а не по разу на каждый вызов
+    // flushFileLinks (их может быть несколько — outputFiles и резолв пустых
+    // скобок ниже): без общего дедлайна второй вызов получал бы свой полный
+    // PERSIST_TURN_BUDGET_MS поверх уже потраченного первым.
+    let filesDeadline: number | null = null;
+    const budgetForFilesCall = (): number => {
+      if (filesDeadline === null) filesDeadline = Date.now() + PERSIST_TURN_BUDGET_MS;
+      return Math.max(0, filesDeadline - Date.now());
+    };
+    // Отправляет ссылку(и) на файлы хода клиенту и дописывает их в chunks —
+    // РОВНО ОДИН раз на ход: вызывается и из обычного пути после потока, и
+    // из catch (апстрим упал после done, но до конца чтения потока). Без
+    // флага «once» оба пути подряд задвоили бы строку и скопировали файл
+    // дважды.
+    //
+    // Дописываем ВСЕГДА, даже если модель уже вставила в текст свою ссылку на
+    // релей — дубль ссылки в ответе лучше файла, который умрёт вместе с /tmp
+    // релея (решение владельца).
+    let filesFlushed = false;
+    const flushFileLinks = async (): Promise<void> => {
+      if (filesFlushed) return;
+      filesFlushed = true;
+      if (pendingFiles.length === 0) return;
+      // Ссылки на файлы хода — уже на наше хранилище. Один и тот же текст
+      // уходит и клиенту, и в историю: фронт сверяет ленту с историей
+      // посимвольно (historyMerge.ts), и разные адреса в двух местах
+      // задвоили бы ответ.
+      const lines = await this.storeRelayLinks(
+        outputFileLines(pendingFiles, AGENT_URL),
+        AGENT_URL,
+        { budgetMs: budgetForFilesCall() },
+      );
+      const tail = '\n\n' + lines.join('\n');
+      chunks.push(tail);
+      safeWrite({ type: 'item', content: tail });
+    };
+
     // Реальная стоимость хода в USD — приходит от file-agent в событии `done`
     // (сумма total_cost_usd по всем result-событиям Claude CLI, включая
     // субагентов и внутренние ретраи). Объявлено здесь, а не внутри
@@ -1719,16 +1808,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
                         if (typeof v === 'number' && v > 0) agentUsage[k] += v;
                       }
                     }
-                    // Collect output files info if any
-                    if (ev.outputFiles && ev.outputFiles.length > 0) {
-                      const fileLinks = ev.outputFiles
-                        .map((f: any) => `[Скачать ${f.name}](${AGENT_URL}${f.url})`)
-                        .join('\n');
-                      if (fileLinks && !chunks.join('').includes(AGENT_URL)) {
-                        chunks.push('\n\n' + fileLinks);
-                        safeWrite({ type: 'item', content: '\n\n' + fileLinks });
-                      }
-                    }
+                    // Файлы хода — не отсюда: их сначала надо скопировать к
+                    // нам, а этот обработчик синхронный. Ссылки уходят после потока.
+                    collectOutputFiles(pendingFiles, ev.outputFiles);
                   }
                 } catch {}
               }
@@ -1753,7 +1835,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // прогон мог успеть прислать свои шаги ДО того, как понял, что поток
       // пуст, а повтор пришлёт свои — итог видимый, но не ломающий: веб
       // покажет повтор счётчиком («×2») или второй строкой, ответ не страдает.
-      if (chunks.length === 0 && !clientDisconnected) {
+      // Ход из одних файлов — не пустой: раньше их ссылки уже лежали в chunks к
+      // этому месту, и повтора не было. Без этой проверки релей гонялся бы
+      // второй раз — двойная оплата и дубли файлов.
+      if (chunks.length === 0 && pendingFiles.length === 0 && !clientDisconnected) {
         this.logger.warn(`empty stream from r.linkeon for ${userId}_${assistantId} — self-heal retry`);
         this.events?.track('chat_quality', {
           userId, sessionId: `${userId}_${assistantId}`,
@@ -1762,6 +1847,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
         await new Promise((r) => setTimeout(r, 800));
         try { await callUpstreamOnce(); } catch (e: any) { this.logger.warn(`self-heal retry failed: ${e.message}`); }
       }
+
+      // Ссылки на файлы хода из done.outputFiles — см. flushFileLinks выше.
+      // Условие «в ответе ещё нет адреса релея» СНЯТО (решение владельца):
+      // если модель сама напечатала ссылку на релей, файл всё равно нужно
+      // скопировать и дописать свою ссылку — дубль лучше мёртвого /tmp.
+      await flushFileLinks();
 
       // Ссылки на файлы, которые ассистент оформить не смог — см.
       // resolveEmptyFileLinks. Две формы: пустые скобки `[Скачать x.pdf]()`
@@ -1782,10 +1873,33 @@ ${LanguageService.buildDirective(userLanguage)}`;
                 .catch(() => [] as any[])
             : [];
 
-          const resolved = resolveEmptyFileLinks(full, listed, AGENT_URL);
+          let resolved = resolveEmptyFileLinks(full, listed, AGENT_URL);
+
+          // Файл уже ушёл выше через flushFileLinks (done.outputFiles) — та
+          // же пустая строка `[Скачать x.pdf]()` часто ссылается на ТОТ ЖЕ
+          // файл, resolveEmptyFileLinks нашёл бы для него второй адрес, и
+          // ниже он скопировался бы в MinIO второй раз отдельным объектом, а
+          // в ответе получилась бы задвоенная строка на один и тот же файл.
+          if (resolved.length > 0 && pendingFiles.length > 0) {
+            // Через outputFileLines, а не свой разбор адреса: та же функция
+            // уже пишет итоговые строки для pendingFiles (flushFileLinks
+            // выше), и префикс (relayFilesPrefix) у них гарантированно один
+            // и тот же. Сравниваем по хвосту строки `](<адрес>)`, не парсим
+            // адрес регуляркой — она ломается на «)» внутри имени файла
+            // («Отчёт(1).pdf»): адрес незаконно считался бы обрезком, файл
+            // уходил бы в MinIO второй раз отдельным объектом.
+            const pendingUrls = outputFileLines(pendingFiles, AGENT_URL).map(
+              (l) => l.slice(l.indexOf('](') + 2, -1),
+            );
+            resolved = resolved.filter(
+              (line) => !pendingUrls.some((u) => line.endsWith(`](${u})`)),
+            );
+          }
 
           if (resolved.length > 0) {
-            const tail = '\n\n' + resolved.join('\n');
+            const tail = '\n\n' + (await this.storeRelayLinks(
+              resolved, AGENT_URL, { budgetMs: budgetForFilesCall() },
+            )).join('\n');
             chunks.push(tail);
             safeWrite({ type: 'item', content: tail });
             this.logger.log(`filled ${resolved.length} file link(s) for ${sid}`);
@@ -1960,6 +2074,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
       setImmediate(() => { void persistResponse(true); });
     } catch (err) {
       this.logger.error(`Universal agent proxy error: ${err.message}`);
+      // Апстрим мог упасть ПОСЛЕ done (ev.outputFiles уже разобран синхронно
+      // обработчиком `data`, ошибка пришла дальше по тому же потоку) — файлы
+      // хода всё равно надо скопировать и дописать ссылкой, иначе их потерял
+      // бы именно тот случай, ради которого pendingFiles вынесены перед try.
+      try { await flushFileLinks(); } catch (e: any) { this.logger.warn(`flushFileLinks in catch failed: ${e.message}`); }
       // Try to write error to response; safeWrite is a no-op if client gone.
       const errText = 'Ошибка запуска агента. Попробуйте ещё раз.';
       safeWrite({ type: 'item', content: errText });

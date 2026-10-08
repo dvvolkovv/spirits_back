@@ -17,6 +17,7 @@ import { decodeMultipartFilename } from '../common/utils/multipart-filename';
 import { TEST_USERS } from '../common/test-users';
 import { parseClientUi } from './client-ui';
 import { toActivity } from './activity-map';
+import { RelayOutputFile, collectOutputFiles, outputFileLines } from './chat-files/relay-links';
 
 /**
  * Потолок загрузки, ОДИН на всю цепочку. Раньше каждое звено держало свой, и
@@ -328,6 +329,8 @@ export class ChatController {
     res.write(JSON.stringify({ type: 'begin' }) + '\n');
 
     const chunks: string[] = [];
+    // Файлы хода — копируются к нам после потока (chat-files), см. finally.
+    const pendingFiles: RelayOutputFile[] = [];
     let upstreamError: Error | null = null;
     // Расход хода. Релей присылает его в событии `done` с 07.08.2026 — до
     // 06.09.2026 обработчик загрузки эти поля молча выбрасывал, и ход с
@@ -346,6 +349,29 @@ export class ChatController {
       try { res.write(JSON.stringify(payload) + '\n'); } catch {}
     };
 
+    // Открываем ход для activeStreams ДО запроса к релею: deploy.sh ждёт
+    // /chat/active-streams === 0 перед рестартом, а копия файлов после потока
+    // (chat-files, ниже) занимает до ~60с — без этого ход с вложениями не
+    // был виден вовсе, и рестарт мог оборвать именно её.
+    this.chatService.beginStream();
+    // Закрывает ход ровно один раз. beginStream/endStream раньше были
+    // завязаны на то, какая ветка кода ниже доберётся до конца — бросок
+    // где-то посреди finally (например, в computeUploadCharge) обходил обе
+    // ветки endStream() и навсегда уводил activeStreams в плюс: deploy.sh
+    // ждал бы несуществующий ход до собственного таймаута. closeStream
+    // вызывается и из setImmediate-колбэка персиста (нормальный путь —
+    // после сохранения истории), и из внешнего finally — для любого другого
+    // выхода, включая непредвиденный throw. persistDispatched бережёт
+    // нормальный путь: внешний finally не должен закрывать ход синхронно,
+    // раньше, чем успеет отработать уже запущенный персист.
+    let streamClosed = false;
+    const closeStream = () => {
+      if (streamClosed) return;
+      streamClosed = true;
+      this.chatService.endStream();
+    };
+    let persistDispatched = false;
+    try {
     try {
       const agentRes = await axios.default.post(`${AGENT_URL}/chat`, fd, {
         headers: fd.getHeaders(),
@@ -393,15 +419,7 @@ export class ChatController {
                     if (typeof v === 'number' && v > 0) agentUsage[k] += v;
                   }
                 }
-                if (ev.outputFiles?.length > 0) {
-                  const fileLinks = ev.outputFiles
-                    .map((f: any) => `[Скачать ${f.name}](${AGENT_URL}${f.url})`)
-                    .join('\n');
-                  if (fileLinks) {
-                    chunks.push('\n\n' + fileLinks);
-                    safeWrite({ type: 'item', content: '\n\n' + fileLinks });
-                  }
-                }
+                collectOutputFiles(pendingFiles, ev.outputFiles);
               }
             } catch {}
           }
@@ -412,6 +430,34 @@ export class ChatController {
     } catch (err: any) {
       upstreamError = err;
     } finally {
+      // Ссылки на файлы хода — уже на наше хранилище, до `end` и до истории:
+      // одна строка в обоих местах (historyMerge.ts сверяет посимвольно).
+      // Здесь, в отличие от текстового хода, они дописываются всегда — так было
+      // и до переноса.
+      if (pendingFiles.length > 0) {
+        // Копия может занять до ~60с (chat-files, PERSIST_TURN_BUDGET_MS) —
+        // всё это время от релея клиенту уже ничего не приходит, а мобильный
+        // клиент (Flutter) рвёт стрим после 60с тишины. Пинг гасится в любом
+        // случае, что бы ни случилось с самой копией.
+        const pingTimer = setInterval(() => safeWrite({ type: 'ping' }), 20_000);
+        try {
+          // storeRelayLinks сама не бросает (relay-links.ts), но это гарантия
+          // чужого модуля — страхуемся локально: без неё сбой внутри уронил
+          // бы весь finally, и клиент не получил бы ни `end`, ни res.end().
+          const lines = await this.chatService.storeRelayLinks(outputFileLines(pendingFiles, AGENT_URL), AGENT_URL);
+          const tail = '\n\n' + lines.join('\n');
+          chunks.push(tail);
+          safeWrite({ type: 'item', content: tail });
+        } catch (e: any) {
+          // eslint-disable-next-line no-console
+          console.warn(`[upload-and-chat] storeRelayLinks упала, ссылка остаётся на релей: ${e?.message}`);
+          const tail = '\n\n' + outputFileLines(pendingFiles, AGENT_URL).join('\n');
+          chunks.push(tail);
+          safeWrite({ type: 'item', content: tail });
+        } finally {
+          clearInterval(pingTimer);
+        }
+      }
       const fullText = chunks.join('');
 
       if (fullText.length > 0) {
@@ -436,6 +482,7 @@ export class ChatController {
         // видно, что именно присылали, а не только первый из них.
         const names = files.map((f: any) => f.originalname).join(', ');
         const userMsgForHistory = `📎 ${names}\n${message}`;
+        persistDispatched = true;
         setImmediate(async () => {
           try {
             await this.chatService.persistUploadTurn({
@@ -461,9 +508,25 @@ export class ChatController {
           } catch (e: any) {
             // eslint-disable-next-line no-console
             console.warn(`[upload-and-chat] persist failed for ${userId}_${assistantId}: ${e?.message}`);
+          } finally {
+            // Ход занят до сохранения истории, а не до res.end(): deploy.sh
+            // не должен рестартовать между концом ответа и записью в БД.
+            closeStream();
           }
         });
+      } else {
+        // Нечего сохранять (пустой ответ без текста и без файлов) — ход
+        // закрывается сразу, без setImmediate-ветки выше.
+        closeStream();
       }
+    }
+    } finally {
+      // Безопасная сеть: срабатывает для любого выхода, который не успел
+      // поставить persistDispatched (в т.ч. throw выше) — сам ход к этому
+      // моменту уже не персистится, держать activeStreams незачем. Для
+      // нормального пути с персистом ничего не делает: closeStream там
+      // вызовется позже, из setImmediate, когда история и правда сохранится.
+      if (!persistDispatched) closeStream();
     }
   }
 

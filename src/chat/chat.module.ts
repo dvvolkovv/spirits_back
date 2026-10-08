@@ -10,11 +10,12 @@ import { CalendarModule } from '../calendar/calendar.module';
 import { TalerIdModule } from '../talerid/talerid.module';
 import { SpeechModule } from '../speech/speech.module';
 import { TokensModule } from '../tokens/tokens.module';
+import { ChatFileStore } from './chat-files/chat-file-store';
 
 @Module({
   imports: [MiscModule, CommonModule, RoomModule, VideoModule, CalendarModule, TalerIdModule, SpeechModule, TokensModule],
   controllers: [ChatController],
-  providers: [ChatService, ChatToolsService],
+  providers: [ChatService, ChatToolsService, ChatFileStore],
   exports: [ChatToolsService, ChatService],
 })
 export class ChatModule {}
