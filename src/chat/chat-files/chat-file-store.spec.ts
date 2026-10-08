@@ -1,6 +1,6 @@
 // src/chat/chat-files/chat-file-store.spec.ts
 import { safeGet } from '../../common/net/safe-fetch';
-import { ChatFileStore, PERSIST_FILE_TIMEOUT_MS, PERSIST_MAX_FILE_BYTES } from './chat-file-store';
+import { ChatFileStore, PERSIST_CONCURRENCY, PERSIST_FILE_TIMEOUT_MS, PERSIST_MAX_FILE_BYTES } from './chat-file-store';
 
 jest.mock('../../common/net/safe-fetch', () => ({
   ...jest.requireActual('../../common/net/safe-fetch'),
@@ -42,6 +42,8 @@ async function within<T>(p: Promise<T>, ms: number): Promise<T> {
     clearTimeout(timer);
   }
 }
+
+const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Загрузка в бакет, которая висит, пока её не оборвут сигналом. */
 function hangUntilAborted(input: any): Promise<string> {
@@ -287,6 +289,33 @@ describe('ChatFileStore: жёсткие сроки', () => {
     expect(uploads).toHaveLength(0);
   });
 
+  it('первые файлы повисли дольше бюджета — после срока новые скачивания не начинаются', async () => {
+    const finish: Array<() => void> = [];
+    get.mockImplementation(() => new Promise((resolve) => finish.push(() => resolve(ok('late')))));
+    const { store, uploads } = makeStore();
+    const urls = Array.from({ length: 6 }, (_, i) => `${RELAY}/f${i}.txt`);
+
+    const map = await within(store.persist(urls, { budgetMs: 100 }), 2000);
+    expect(get).toHaveBeenCalledTimes(PERSIST_CONCURRENCY);
+    finish.forEach((f) => f());
+    await tick(50);
+
+    expect(map.size).toBe(0);
+    expect(get).toHaveBeenCalledTimes(PERSIST_CONCURRENCY);
+    expect(uploads).toHaveLength(0);
+  });
+
+  it('safeGet принимает только 200: 204, 206 и перенаправления — не файл', async () => {
+    get.mockResolvedValue(ok('x'));
+    const { store } = makeStore();
+
+    await store.persist([`${RELAY}/a.pdf`]);
+
+    const { validateStatus } = get.mock.calls[0][1];
+    expect(validateStatus(200)).toBe(true);
+    for (const s of [201, 204, 206, 301, 302, 304, 404, 500]) expect(validateStatus(s)).toBe(false);
+  });
+
   it('скачивание закончилось после бюджета — в бакет не кладём, в карту не добавляем', async () => {
     let release: (v: unknown) => void = () => {};
     get.mockImplementation(
@@ -303,6 +332,65 @@ describe('ChatFileStore: жёсткие сроки', () => {
 
     expect(uploads).toHaveLength(0);
     expect(map.size).toBe(0);
+  });
+});
+
+describe('ChatFileStore: общий потолок копий на процесс', () => {
+  it('два хода по 6 файлов разом — одновременно не больше трёх копий, скопированы все 12', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    get.mockImplementation(async () => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await tick(5);
+      return ok('x');
+    });
+    // Копия — это и скачивание, и загрузка в бакет: место занято до конца загрузки.
+    const { store } = makeStore(async () => {
+      await tick(5);
+      inFlight--;
+      return 'ok';
+    });
+    const urls = (p: string) => Array.from({ length: 6 }, (_, i) => `${RELAY}/${p}${i}.txt`);
+
+    const [a, b] = await within(Promise.all([store.persist(urls('a')), store.persist(urls('b'))]), 3000);
+
+    expect(a.size + b.size).toBe(12);
+    expect(peak).toBe(PERSIST_CONCURRENCY);
+  });
+
+  it('файл ждал места дольше бюджета своего хода — пропускается, не начав скачивания', async () => {
+    let open: () => void = () => {};
+    const gate = new Promise<void>((r) => (open = r));
+    get.mockImplementation(async (url: string) => {
+      if (url.includes('/busy')) await gate;
+      return ok('x');
+    });
+    const { store } = makeStore();
+    // Первый ход занимает все места.
+    const first = store.persist([1, 2, 3].map((i) => `${RELAY}/busy${i}.txt`), { budgetMs: 5000 });
+    await tick(10);
+    const t0 = Date.now();
+
+    const second = await within(store.persist([`${RELAY}/late.txt`], { budgetMs: 100 }), 2000);
+
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(second.size).toBe(0);
+    expect(get.mock.calls.some(([u]) => String(u).endsWith('/late.txt'))).toBe(false);
+    open();
+    expect((await first).size).toBe(3);
+    // Очередь после этого чистая: следующий ход копирует сразу.
+    expect((await store.persist([`${RELAY}/next.txt`])).size).toBe(1);
+  });
+
+  it('копия повисла вопреки своим срокам — место освобождается, следующие ходы не стоят', async () => {
+    get.mockImplementation((url: string) => (url.includes('/hang') ? new Promise(() => {}) : Promise.resolve(ok('x'))));
+    const { store } = makeStore();
+    await within(store.persist([1, 2, 3].map((i) => `${RELAY}/hang${i}.txt`), { budgetMs: 100, fileTimeoutMs: 50 }), 2000);
+
+    const map = await within(store.persist([`${RELAY}/ok.txt`], { budgetMs: 5000, fileTimeoutMs: 50 }), 4000);
+
+    expect(map.size).toBe(1);
   });
 });
 
