@@ -24,6 +24,8 @@ import { ASK_RULE } from './ask-rule';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
 import { productsCliMcp } from '../products/products-cli-tool';
+import { ChatFileStore } from './chat-files/chat-file-store';
+import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks } from './chat-files/relay-links';
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import axios from 'axios';
@@ -293,7 +295,20 @@ export class ChatService {
     // сборки) отсутствие выключателей не должно ронять чат. Трактуется как
     // «ограничений нет» — иначе тесты чата молча потеряли бы карточку.
     @Optional() private readonly integrations?: IntegrationFlagsService,
+    // Копия файлов ассистента в MinIO (chat-files). Последним и @Optional:
+    // спеки собирают ChatService позиционно. Без него ссылки остаются на
+    // релее, как до фичи, и в лог уходит предупреждение. Что он реально
+    // подключён, сторожит chat.module.chat-files.spec.ts.
+    @Optional() private readonly chatFiles?: ChatFileStore,
   ) {}
+
+  /**
+   * Ссылки `[Скачать имя](адрес релея)` → на наше хранилище (chat-files/relay-links.ts).
+   * Публичный: им же пользуется ход с вложениями в ChatController.
+   */
+  storeRelayLinks(lines: string[], agentUrl: string): Promise<string[]> {
+    return storeRelayLinks(lines, agentUrl, this.chatFiles, (m) => this.logger.warn(m));
+  }
 
   /**
    * Agent-direct: the TalerID fields to hand the file-agent for a connected user,
