@@ -69,6 +69,30 @@ describe('ChatFileStore.persist', () => {
     );
   });
 
+  it('скобки в имени кодируются в адресе: markdown-ссылка на него не рвётся', async () => {
+    get.mockResolvedValue({ data: Buffer.from('x') });
+    const { store, uploads } = makeStore();
+    const relayUrl = `${RELAY}/Договор (1).docx`;
+
+    const map = await store.persist([relayUrl]);
+
+    // Ключ в MinIO — по-прежнему сырое имя.
+    expect(uploads[0].key.endsWith('/Договор (1).docx')).toBe(true);
+    expect(map.get(relayUrl)).toMatch(/\/%D0%94%D0%BE%D0%B3%D0%BE%D0%B2%D0%BE%D1%80%20%281%29\.docx$/);
+  });
+
+  it('непарная скобка «1) План.docx» — в адресе ни одной сырой скобки', async () => {
+    get.mockResolvedValue({ data: Buffer.from('x') });
+    const { store, uploads } = makeStore();
+    const relayUrl = `${RELAY}/1) План.docx`;
+
+    const map = await store.persist([relayUrl]);
+
+    expect(uploads[0].key.endsWith('/1) План.docx')).toBe(true);
+    expect(map.get(relayUrl)).toMatch(/^https:\/\/pub\/linkeon-chat-files\//);
+    expect(map.get(relayUrl)).not.toMatch(/[()]/);
+  });
+
   it('html уходит октет-потоком, svg — картинкой', async () => {
     get.mockResolvedValue({ data: Buffer.from('x') });
     const { store, uploads } = makeStore();

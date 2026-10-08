@@ -3,6 +3,7 @@ import {
   MAX_NAME_CHARS,
   contentDispositionFor,
   contentTypeFor,
+  encodeStrict,
   fileExt,
   lastPathSegment,
   relayRequestUrl,
@@ -72,6 +73,15 @@ describe('contentTypeFor', () => {
     '%s браузер исполнил бы — отдаём октет-потоком',
     (name) => expect(contentTypeFor(name)).toBe('application/octet-stream'),
   );
+});
+
+describe('encodeStrict', () => {
+  it(`кодирует и то, что encodeURIComponent оставляет как есть: ' ( ) * !`, () => {
+    expect(encodeStrict(`a'b(c)*!.txt`)).toBe('a%27b%28c%29%2A%21.txt');
+  });
+  it('кириллица и пробел — как у encodeURIComponent', () => {
+    expect(encodeStrict('Договор 1.docx')).toBe('%D0%94%D0%BE%D0%B3%D0%BE%D0%B2%D0%BE%D1%80%201.docx');
+  });
 });
 
 describe('contentDispositionFor', () => {
