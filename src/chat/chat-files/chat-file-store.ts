@@ -14,7 +14,10 @@ import {
   safeFileName,
 } from './file-meta';
 
-/** Не больше стольких скачиваний с релея одновременно. */
+/**
+ * Не больше стольких копий (скачивание с релея и загрузка в бакет) разом — на
+ * весь процесс, на все ходы сразу (CopySlots).
+ */
 export const PERSIST_CONCURRENCY = 3;
 /**
  * Срок на один файл: на скачивание целиком (DNS, заголовки, тело) и
@@ -56,6 +59,77 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
 function timerDelay(ms: number): number {
   if (!(ms > 0)) return 0;
   return Math.min(MAX_TIMER_MS, Math.ceil(ms));
+}
+
+/**
+ * Сколько ждать сверх сроков самой копии (скачивание и загрузка — каждое не
+ * дольше срока на файл), прежде чем отдать её место другим. Копия, повисшая
+ * вопреки своим срокам, иначе держала бы место до перезапуска API.
+ */
+const SLOT_GRACE_MS = 1_000;
+
+/**
+ * Места под копии на весь процесс. ChatFileStore — синглтон Nest, а тело
+ * файла до 100 МБ лежит в памяти целиком: без общего потолка несколько ходов
+ * разом держали бы по PERSIST_CONCURRENCY таких тел каждый, а pm2
+ * перезапускает API на 1 ГБ — вместе с живыми потоками чата.
+ */
+class CopySlots {
+  private busy = 0;
+  private readonly waiting: Array<() => void> = [];
+
+  constructor(private readonly limit: number) {}
+
+  /**
+   * Занять место. В очереди ждёт не дольше срока хода: после deadline или
+   * сигнала — отказ, и файл пропускается. Отдаёт «освободить»; повторный вызов
+   * ничего не делает.
+   */
+  acquire(deadline: number, signal?: AbortSignal): Promise<() => void> {
+    if (signal?.aborted || !(Date.now() < deadline)) {
+      return Promise.reject(new Error('бюджет хода исчерпан'));
+    }
+    if (this.busy < this.limit) {
+      this.busy++;
+      return Promise.resolve(this.releaser());
+    }
+    return new Promise((resolve, reject) => {
+      let timer: NodeJS.Timeout | undefined;
+      const stop = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', giveUp);
+      };
+      const grant = () => {
+        stop();
+        resolve(this.releaser());
+      };
+      const giveUp = () => {
+        const i = this.waiting.indexOf(grant);
+        if (i >= 0) this.waiting.splice(i, 1);
+        stop();
+        reject(new Error('бюджет хода исчерпан в очереди за местом'));
+      };
+      const watch = () => {
+        const left = deadline - Date.now();
+        timer = setTimeout(left > MAX_TIMER_MS ? watch : giveUp, timerDelay(left));
+      };
+      signal?.addEventListener('abort', giveUp, { once: true });
+      if (Number.isFinite(deadline)) watch();
+      this.waiting.push(grant);
+    });
+  }
+
+  private releaser(): () => void {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = this.waiting.shift();
+      // Место переходит следующему в очереди как есть: busy не меняется.
+      if (next) next();
+      else this.busy--;
+    };
+  }
 }
 
 export function chatFilesBucket(): string {
@@ -101,6 +175,7 @@ function assertRelayFileUrl(url: string): void {
 @Injectable()
 export class ChatFileStore {
   private readonly logger = new Logger(ChatFileStore.name);
+  private readonly slots = new CopySlots(PERSIST_CONCURRENCY);
 
   constructor(private readonly storage: StorageService) {}
 
@@ -157,11 +232,34 @@ export class ChatFileStore {
     return out;
   }
 
-  /** Один файл: скачать с релея и положить в бакет. Бросает при любой неудаче. */
+  /**
+   * Один файл: скачать с релея и положить в бакет. Бросает при любой неудаче.
+   * Ждёт общего места (CopySlots), но не дольше срока хода.
+   */
   async persistOne(relayUrl: string, opts: PersistOneOptions = {}): Promise<string> {
     assertRelayFileUrl(relayUrl);
     const fileTimeoutMs = opts.fileTimeoutMs ?? PERSIST_FILE_TIMEOUT_MS;
     const deadline = opts.deadline ?? Infinity;
+    const release = await this.slots.acquire(deadline, opts.signal);
+    let capTimer: NodeJS.Timeout | undefined;
+    const cap = new Promise<never>((_, reject) => {
+      capTimer = setTimeout(
+        () => reject(new Error('копия не уложилась в свои сроки — место отдано другим')),
+        timerDelay(2 * fileTimeoutMs + SLOT_GRACE_MS),
+      );
+      // Таймер-страховка не держит процесс: CLI переноса должен завершиться сам.
+      capTimer.unref?.();
+    });
+    try {
+      return await Promise.race([this.copy(relayUrl, fileTimeoutMs, deadline, opts.signal), cap]);
+    } finally {
+      clearTimeout(capTimer);
+      release();
+    }
+  }
+
+  /** Скачать с релея и положить в бакет — на уже занятом месте. */
+  private async copy(relayUrl: string, fileTimeoutMs: number, deadline: number, signal?: AbortSignal): Promise<string> {
     const name = safeFileName(relayFileName(relayUrl));
     // Срок у safeGet общий — на всё скачивание вместе с телом. axios.timeout в
     // Node считает простой, и медленно капающий ответ не обрывался никогда.
@@ -174,7 +272,7 @@ export class ChatFileStore {
       maxRedirects: 0,
       validateStatus: (s: number) => s === 200,
     });
-    if (opts.signal?.aborted || Date.now() >= deadline) {
+    if (signal?.aborted || Date.now() >= deadline) {
       throw new Error('бюджет хода исчерпан — в бакет не кладём');
     }
     const bucket = chatFilesBucket();
@@ -187,7 +285,7 @@ export class ChatFileStore {
       contentType: contentTypeFor(name),
       contentDisposition: contentDispositionFor(name),
       cacheControl: 'public, max-age=31536000, immutable',
-      abortSignal: opts.signal ? AbortSignal.any([opts.signal, fileSignal]) : fileSignal,
+      abortSignal: signal ? AbortSignal.any([signal, fileSignal]) : fileSignal,
     });
     // Ключ в MinIO — сырое имя в UTF-8, а в адресе имя закодировано: пробел или
     // скобка в имени иначе сломали бы markdown-ссылку `[Скачать …](…)`.
