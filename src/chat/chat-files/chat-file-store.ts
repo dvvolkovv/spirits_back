@@ -9,6 +9,7 @@ import {
   encodeStrict,
   lastPathSegment,
   relayRequestUrl,
+  safeDecode,
   safeFileName,
 } from './file-meta';
 
@@ -45,6 +46,24 @@ export interface PersistOneOptions {
 
 export function chatFilesBucket(): string {
   return process.env.MINIO_BUCKET_CHAT_FILES || 'linkeon-chat-files';
+}
+
+/**
+ * Копируем только файлы нашего релея: origin как у AGENT_URL, путь /files/…,
+ * не папка, без сегментов «.» и «..» (и закодированных тоже). Адреса приходят
+ * и из текста модели (бэкфилл истории), а копия ляжет в публичный бакет —
+ * без этой проверки ссылка в тексте увела бы скачивание на другой путь релея
+ * или на чужой хост. Сравнение строкой, без разбора URL: «?» и «#» в имени —
+ * часть имени.
+ */
+function assertRelayFileUrl(url: string): void {
+  const origin = new URL(process.env.AGENT_URL || 'https://r.linkeon.io').origin;
+  if (!url.startsWith(`${origin}/files/`)) throw new Error('не файл релея');
+  const path = url.slice(origin.length);
+  if (path.endsWith('/')) throw new Error('адрес папки, а не файла');
+  if (path.split('/').some((seg) => ['.', '..'].includes(safeDecode(seg)))) {
+    throw new Error('сегмент «.» или «..» в пути');
+  }
 }
 
 /**
@@ -117,6 +136,7 @@ export class ChatFileStore {
 
   /** Один файл: скачать с релея и положить в бакет. Бросает при любой неудаче. */
   async persistOne(relayUrl: string, opts: PersistOneOptions = {}): Promise<string> {
+    assertRelayFileUrl(relayUrl);
     const fileTimeoutMs = opts.fileTimeoutMs ?? PERSIST_FILE_TIMEOUT_MS;
     const deadline = opts.deadline ?? Infinity;
     const name = safeFileName(lastPathSegment(relayUrl));
