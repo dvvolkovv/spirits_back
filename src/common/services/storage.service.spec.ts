@@ -44,6 +44,19 @@ describe('StorageService.upload', () => {
     expect((send.mock.calls[0][0] as PutObjectCommand).input.ContentDisposition).toBeUndefined();
   });
 
+  it('abortSignal уходит в send — загрузку можно оборвать', async () => {
+    const { svc, send } = make();
+    const ctl = new AbortController();
+    await svc.upload({ bucket: 'b', key: 'k', body: Buffer.from('x'), abortSignal: ctl.signal });
+    expect(send.mock.calls[0][1]?.abortSignal).toBe(ctl.signal);
+  });
+
+  it('без abortSignal send зовётся как раньше — одним аргументом', async () => {
+    const { svc, send } = make();
+    await svc.upload({ bucket: 'b', key: 'k', body: Buffer.from('x') });
+    expect(send.mock.calls[0]).toHaveLength(1);
+  });
+
   it('publicUrl склеивает базу без двойного слэша', () => {
     const { svc } = make();
     expect(svc.publicUrl('b', 'id/a%20b.pdf')).toBe('https://pub/b/id/a%20b.pdf');

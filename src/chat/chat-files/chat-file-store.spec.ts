@@ -1,11 +1,26 @@
 // src/chat/chat-files/chat-file-store.spec.ts
-import axios from 'axios';
+import { safeGet } from '../../common/net/safe-fetch';
 import { ChatFileStore, PERSIST_FILE_TIMEOUT_MS, PERSIST_MAX_FILE_BYTES } from './chat-file-store';
 
-jest.mock('axios');
-const get = axios.get as jest.Mock;
+jest.mock('../../common/net/safe-fetch', () => ({
+  ...jest.requireActual('../../common/net/safe-fetch'),
+  safeGet: jest.fn(),
+}));
+// Красная фаза: код ещё качает через axios — направляем его в тот же фейк,
+// чтобы тест не ходил в сеть. Уходит вместе с axios из chat-file-store.ts.
+jest.mock('axios', () => ({
+  __esModule: true,
+  default: { get: (...args: any[]) => jest.requireMock('../../common/net/safe-fetch').safeGet(...args) },
+}));
+
+const get = safeGet as unknown as jest.Mock;
 
 const RELAY = 'https://r.linkeon.io/files/u1_12_ru';
+
+/** Ответ safeGet: тело — Buffer, как при responseType 'arraybuffer'. */
+function ok(body: string | Buffer) {
+  return { status: 200, headers: {}, data: typeof body === 'string' ? Buffer.from(body) : body, finalUrl: '' };
+}
 
 function makeStore(upload?: (input: any) => Promise<string>) {
   const uploads: any[] = [];
@@ -19,14 +34,46 @@ function makeStore(upload?: (input: any) => Promise<string>) {
   return { store: new ChatFileStore(storage as any), uploads };
 }
 
+/** Внешний срок для обещания: тест падает внятно, а не по таймауту jest. */
+async function within<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`persist не вернулся за ${ms} мс`)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Загрузка в бакет, которая висит, пока её не оборвут сигналом. */
+function hangUntilAborted(input: any): Promise<string> {
+  return new Promise((_, reject) => {
+    const signal: AbortSignal | undefined = input.abortSignal;
+    signal?.addEventListener('abort', () => reject(signal.reason ?? new Error('aborted')), { once: true });
+  });
+}
+
+const savedAgentUrl = process.env.AGENT_URL;
+
 beforeEach(() => {
   jest.clearAllMocks();
+  get.mockReset();
   delete process.env.MINIO_BUCKET_CHAT_FILES;
+  delete process.env.AGENT_URL;
+});
+
+afterAll(() => {
+  if (savedAgentUrl === undefined) delete process.env.AGENT_URL;
+  else process.env.AGENT_URL = savedAgentUrl;
 });
 
 describe('ChatFileStore.persist', () => {
   it('копирует файл релея в бакет и отдаёт наш адрес', async () => {
-    get.mockResolvedValue({ data: Buffer.from('%PDF') });
+    get.mockResolvedValue(ok('%PDF'));
     const { store, uploads } = makeStore();
 
     const map = await store.persist([`${RELAY}/report.pdf`]);
@@ -43,18 +90,11 @@ describe('ChatFileStore.persist', () => {
 
     const id = u.key.split('/')[0];
     expect(map.get(`${RELAY}/report.pdf`)).toBe(`https://pub/linkeon-chat-files/${id}/report.pdf`);
-    expect(get).toHaveBeenCalledWith(
-      `${RELAY}/report.pdf`,
-      expect.objectContaining({
-        responseType: 'arraybuffer',
-        timeout: PERSIST_FILE_TIMEOUT_MS,
-        maxContentLength: PERSIST_MAX_FILE_BYTES,
-      }),
-    );
+    expect(get.mock.calls[0][0]).toBe(`${RELAY}/report.pdf`);
   });
 
   it('кириллица с пробелом: ключ сырой, адрес и запрос к релею закодированы', async () => {
-    get.mockResolvedValue({ data: Buffer.from('x') });
+    get.mockResolvedValue(ok('x'));
     const { store, uploads } = makeStore();
     const relayUrl = `${RELAY}/Договор аренды.docx`;
 
@@ -70,7 +110,7 @@ describe('ChatFileStore.persist', () => {
   });
 
   it('скобки в имени кодируются в адресе: markdown-ссылка на него не рвётся', async () => {
-    get.mockResolvedValue({ data: Buffer.from('x') });
+    get.mockResolvedValue(ok('x'));
     const { store, uploads } = makeStore();
     const relayUrl = `${RELAY}/Договор (1).docx`;
 
@@ -82,7 +122,7 @@ describe('ChatFileStore.persist', () => {
   });
 
   it('непарная скобка «1) План.docx» — в адресе ни одной сырой скобки', async () => {
-    get.mockResolvedValue({ data: Buffer.from('x') });
+    get.mockResolvedValue(ok('x'));
     const { store, uploads } = makeStore();
     const relayUrl = `${RELAY}/1) План.docx`;
 
@@ -94,7 +134,7 @@ describe('ChatFileStore.persist', () => {
   });
 
   it('html уходит октет-потоком, svg — картинкой', async () => {
-    get.mockResolvedValue({ data: Buffer.from('x') });
+    get.mockResolvedValue(ok('x'));
     const { store, uploads } = makeStore();
 
     await store.persist([`${RELAY}/page.html`, `${RELAY}/logo.svg`]);
@@ -107,9 +147,9 @@ describe('ChatFileStore.persist', () => {
 
   it('404 и сетевой сбой — файла нет в карте, остальные скопированы', async () => {
     get.mockImplementation(async (url: string) => {
-      if (url.endsWith('/gone.pdf')) throw Object.assign(new Error('Request failed with status code 404'), { response: { status: 404 } });
+      if (url.endsWith('/gone.pdf')) throw Object.assign(new Error('сервер ответил кодом 404'), { response: { status: 404 } });
       if (url.endsWith('/net.pdf')) throw new Error('socket hang up');
-      return { data: Buffer.from('ok') };
+      return ok('ok');
     });
     const { store } = makeStore();
 
@@ -119,7 +159,7 @@ describe('ChatFileStore.persist', () => {
   });
 
   it('сбой MinIO — файла нет в карте', async () => {
-    get.mockResolvedValue({ data: Buffer.from('x') });
+    get.mockResolvedValue(ok('x'));
     const { store } = makeStore(async () => {
       throw new Error('S3 down');
     });
@@ -130,7 +170,7 @@ describe('ChatFileStore.persist', () => {
   });
 
   it('один адрес дважды — одна загрузка', async () => {
-    get.mockResolvedValue({ data: Buffer.from('x') });
+    get.mockResolvedValue(ok('x'));
     const { store, uploads } = makeStore();
 
     const map = await store.persist([`${RELAY}/a.pdf`, `${RELAY}/a.pdf`]);
@@ -147,7 +187,7 @@ describe('ChatFileStore.persist', () => {
       peak = Math.max(peak, inFlight);
       await new Promise((r) => setImmediate(r));
       inFlight--;
-      return { data: Buffer.from('x') };
+      return ok('x');
     });
     const { store } = makeStore();
 
@@ -158,7 +198,7 @@ describe('ChatFileStore.persist', () => {
   });
 
   it('бюджет вышел — новые скачивания не начинаются', async () => {
-    get.mockResolvedValue({ data: Buffer.from('x') });
+    get.mockResolvedValue(ok('x'));
     const { store } = makeStore();
 
     const map = await store.persist([`${RELAY}/a.txt`], { budgetMs: 0 });
@@ -169,11 +209,105 @@ describe('ChatFileStore.persist', () => {
 
   it('бакет берётся из MINIO_BUCKET_CHAT_FILES', async () => {
     process.env.MINIO_BUCKET_CHAT_FILES = 'other-bucket';
-    get.mockResolvedValue({ data: Buffer.from('x') });
+    get.mockResolvedValue(ok('x'));
     const { store, uploads } = makeStore();
 
     await store.persist([`${RELAY}/a.txt`]);
 
     expect(uploads[0].bucket).toBe('other-bucket');
+  });
+});
+
+describe('ChatFileStore: жёсткие сроки', () => {
+  it('качает через safeGet: без редиректов, с потолком размера, срок не больше срока на файл', async () => {
+    get.mockResolvedValue(ok('x'));
+    const { store } = makeStore();
+
+    await store.persist([`${RELAY}/a.pdf`]);
+    await store.persist([`${RELAY}/b.pdf`], { fileTimeoutMs: 1234 });
+
+    const opts = get.mock.calls[0][1];
+    expect(opts).toEqual(
+      expect.objectContaining({ responseType: 'arraybuffer', maxRedirects: 0, maxBytes: PERSIST_MAX_FILE_BYTES }),
+    );
+    expect(opts.timeoutMs).toBeGreaterThan(0);
+    expect(opts.timeoutMs).toBeLessThanOrEqual(PERSIST_FILE_TIMEOUT_MS);
+    expect(get.mock.calls[1][1].timeoutMs).toBeGreaterThan(0);
+    expect(get.mock.calls[1][1].timeoutMs).toBeLessThanOrEqual(1234);
+  });
+
+  it('срок скачивания не больше остатка бюджета хода', async () => {
+    get.mockResolvedValue(ok('x'));
+    const { store } = makeStore();
+
+    await store.persist([`${RELAY}/a.pdf`], { budgetMs: 500 });
+
+    const { timeoutMs } = get.mock.calls[0][1];
+    expect(timeoutMs).toBeGreaterThan(0);
+    expect(timeoutMs).toBeLessThanOrEqual(500);
+  });
+
+  it('тело уходит в бакет как есть, без копии', async () => {
+    const body = Buffer.from('%PDF');
+    get.mockResolvedValue(ok(body));
+    const { store, uploads } = makeStore();
+
+    await store.persist([`${RELAY}/a.pdf`]);
+
+    expect(uploads[0].body).toBe(body);
+  });
+
+  it('загрузка в бакет повисла — persist возвращается по бюджету, файла в карте нет', async () => {
+    get.mockResolvedValue(ok('x'));
+    const { store, uploads } = makeStore(hangUntilAborted);
+    const t0 = Date.now();
+
+    const map = await within(store.persist([`${RELAY}/a.pdf`], { budgetMs: 200 }), 2000);
+
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(map.size).toBe(0);
+    expect(uploads).toHaveLength(1);
+    expect(uploads[0].abortSignal.aborted).toBe(true);
+  });
+
+  it('загрузка в бакет не дольше срока на файл, даже при длинном бюджете', async () => {
+    get.mockResolvedValue(ok('x'));
+    const { store } = makeStore(hangUntilAborted);
+    const t0 = Date.now();
+
+    const map = await within(store.persist([`${RELAY}/a.pdf`], { budgetMs: 10_000, fileTimeoutMs: 150 }), 2000);
+
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(map.size).toBe(0);
+  });
+
+  it('скачивание повисло вопреки своему сроку — persist всё равно возвращается по бюджету', async () => {
+    get.mockImplementation(() => new Promise(() => {}));
+    const { store, uploads } = makeStore();
+    const t0 = Date.now();
+
+    const map = await within(store.persist([`${RELAY}/a.pdf`], { budgetMs: 200 }), 2000);
+
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(map.size).toBe(0);
+    expect(uploads).toHaveLength(0);
+  });
+
+  it('скачивание закончилось после бюджета — в бакет не кладём, в карту не добавляем', async () => {
+    let release: (v: unknown) => void = () => {};
+    get.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    const { store, uploads } = makeStore();
+
+    const map = await within(store.persist([`${RELAY}/a.pdf`], { budgetMs: 100 }), 2000);
+    release(ok('late'));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(uploads).toHaveLength(0);
+    expect(map.size).toBe(0);
   });
 });
