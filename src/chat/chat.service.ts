@@ -1881,11 +1881,19 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // ниже он скопировался бы в MinIO второй раз отдельным объектом, а
           // в ответе получилась бы задвоенная строка на один и тот же файл.
           if (resolved.length > 0 && pendingFiles.length > 0) {
-            const pendingUrls = new Set(pendingFiles.map((f) => `${AGENT_URL}${f.url}`));
-            resolved = resolved.filter((line) => {
-              const m = line.match(/\]\(([^)]+)\)$/);
-              return !(m && pendingUrls.has(m[1]));
-            });
+            // Через outputFileLines, а не свой разбор адреса: та же функция
+            // уже пишет итоговые строки для pendingFiles (flushFileLinks
+            // выше), и префикс (relayFilesPrefix) у них гарантированно один
+            // и тот же. Сравниваем по хвосту строки `](<адрес>)`, не парсим
+            // адрес регуляркой — она ломается на «)» внутри имени файла
+            // («Отчёт(1).pdf»): адрес незаконно считался бы обрезком, файл
+            // уходил бы в MinIO второй раз отдельным объектом.
+            const pendingUrls = outputFileLines(pendingFiles, AGENT_URL).map(
+              (l) => l.slice(l.indexOf('](') + 2, -1),
+            );
+            resolved = resolved.filter(
+              (line) => !pendingUrls.some((u) => line.endsWith(`](${u})`)),
+            );
           }
 
           if (resolved.length > 0) {

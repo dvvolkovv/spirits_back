@@ -354,6 +354,24 @@ export class ChatController {
     // (chat-files, ниже) занимает до ~60с — без этого ход с вложениями не
     // был виден вовсе, и рестарт мог оборвать именно её.
     this.chatService.beginStream();
+    // Закрывает ход ровно один раз. beginStream/endStream раньше были
+    // завязаны на то, какая ветка кода ниже доберётся до конца — бросок
+    // где-то посреди finally (например, в computeUploadCharge) обходил обе
+    // ветки endStream() и навсегда уводил activeStreams в плюс: deploy.sh
+    // ждал бы несуществующий ход до собственного таймаута. closeStream
+    // вызывается и из setImmediate-колбэка персиста (нормальный путь —
+    // после сохранения истории), и из внешнего finally — для любого другого
+    // выхода, включая непредвиденный throw. persistDispatched бережёт
+    // нормальный путь: внешний finally не должен закрывать ход синхронно,
+    // раньше, чем успеет отработать уже запущенный персист.
+    let streamClosed = false;
+    const closeStream = () => {
+      if (streamClosed) return;
+      streamClosed = true;
+      this.chatService.endStream();
+    };
+    let persistDispatched = false;
+    try {
     try {
       const agentRes = await axios.default.post(`${AGENT_URL}/chat`, fd, {
         headers: fd.getHeaders(),
@@ -464,6 +482,7 @@ export class ChatController {
         // видно, что именно присылали, а не только первый из них.
         const names = files.map((f: any) => f.originalname).join(', ');
         const userMsgForHistory = `📎 ${names}\n${message}`;
+        persistDispatched = true;
         setImmediate(async () => {
           try {
             await this.chatService.persistUploadTurn({
@@ -492,14 +511,22 @@ export class ChatController {
           } finally {
             // Ход занят до сохранения истории, а не до res.end(): deploy.sh
             // не должен рестартовать между концом ответа и записью в БД.
-            this.chatService.endStream();
+            closeStream();
           }
         });
       } else {
         // Нечего сохранять (пустой ответ без текста и без файлов) — ход
         // закрывается сразу, без setImmediate-ветки выше.
-        this.chatService.endStream();
+        closeStream();
       }
+    }
+    } finally {
+      // Безопасная сеть: срабатывает для любого выхода, который не успел
+      // поставить persistDispatched (в т.ч. throw выше) — сам ход к этому
+      // моменту уже не персистится, держать activeStreams незачем. Для
+      // нормального пути с персистом ничего не делает: closeStream там
+      // вызовется позже, из setImmediate, когда история и правда сохранится.
+      if (!persistDispatched) closeStream();
     }
   }
 
