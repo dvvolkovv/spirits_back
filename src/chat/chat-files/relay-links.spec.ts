@@ -59,6 +59,22 @@ describe('storeRelayLinks', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('boom'));
   });
 
+  it('файл без имени тоже переносится', async () => {
+    const store = okStore();
+    const out = await storeRelayLinks([`[Скачать ](${R}/x)`], AGENT, store);
+    expect(store.persist).toHaveBeenCalledWith([`${R}/x`]);
+    expect(out).toEqual(['[Скачать ](https://pub/linkeon-chat-files/id/x)']);
+  });
+
+  it('agentUrl со слэшем на конце: строки без двойного слэша, ссылки переносятся', async () => {
+    const lines = outputFileLines([{ name: 'a.pdf', url: '/files/u1_12_ru/a.pdf' }], `${AGENT}/`);
+    expect(lines).toEqual([`[Скачать a.pdf](${R}/a.pdf)`]);
+    const store = okStore();
+    expect(await storeRelayLinks(lines, `${AGENT}/`, store)).toEqual([
+      '[Скачать a.pdf](https://pub/linkeon-chat-files/id/a.pdf)',
+    ]);
+  });
+
   it('строки без адреса релея не трогает и хранилище не зовёт', async () => {
     const store = okStore();
     const lines = ['[Скачать x.pdf](https://example.com/x.pdf)', 'просто текст'];
