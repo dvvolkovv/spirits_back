@@ -25,6 +25,15 @@ const SERVER_KEY = 'products';
 /** Имя инструмента для allowedTools. Сверено тестом с PRODUCT_TOOL_NAME. */
 export const PRODUCTS_CLI_TOOL_NAME = `mcp__${SERVER_KEY}__manage_product`;
 
+/** Поиск файлов прошлых разговоров — тот же сервер `products` (find-files.tool.ts). Только Маше: у TG-бота его нет. */
+export const FIND_FILES_CLI_TOOL_NAME = `mcp__${SERVER_KEY}__find_files`;
+
+/** Блок системного промпта Маши про поиск файлов. */
+export const FIND_FILES_CLI_PROMPT = `ФАЙЛЫ ИЗ ПРОШЛЫХ РАЗГОВОРОВ.
+Тебе доступен инструмент ${FIND_FILES_CLI_TOOL_NAME}: он находит файлы, которые ассистенты уже создавали этому пользователю (документы, картинки, видео, озвучку), во всех его разговорах.
+Зови его, когда пользователь ищет или просит снова прислать такой файл. Найденное отдавай markdown-ссылкой [имя](url).
+Если у файла stored=false — честно скажи, что он не сохранился. НЕ передавай в инструмент userId/телефон.`;
+
 /**
  * Потолок одного вызова инструмента для CLI — поле `timeout` http-сервера
  * (схема CLI 2.1.280: мс, перекрывает MCP_TOOL_TIMEOUT, меньше 1000

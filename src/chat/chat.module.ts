@@ -18,6 +18,6 @@ import { ChatFilesService } from './chat-files/chat-files.service';
   imports: [MiscModule, CommonModule, RoomModule, VideoModule, CalendarModule, TalerIdModule, SpeechModule, TokensModule],
   controllers: [ChatController, ChatFilesController],
   providers: [ChatService, ChatToolsService, ChatFileStore, ChatFilesService],
-  exports: [ChatToolsService, ChatService],
+  exports: [ChatToolsService, ChatService, ChatFilesService],
 })
 export class ChatModule {}

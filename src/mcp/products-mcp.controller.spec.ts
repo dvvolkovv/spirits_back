@@ -20,7 +20,8 @@ describe('точка /mcp/products', () => {
         return { ok: true };
       }),
     };
-    return { ctrl: new ProductsMcpController(tool as any), calls, tool };
+    const files = { searchForUser: jest.fn(async () => ({ ok: true, total: 0, files: [] })) };
+    return { ctrl: new ProductsMcpController(tool as any, files as any), calls, tool, files };
   };
 
   it('владелец берётся ИЗ ТОКЕНА', async () => {
@@ -105,11 +106,39 @@ describe('точка /mcp/products', () => {
     expect(tool.execute).not.toHaveBeenCalled();
   });
 
-  it('список инструментов отдаётся без аргумента userId', () => {
+  it('веб: продукты и поиск файлов, у обоих нет аргумента userId', () => {
     const { ctrl } = make();
-    const tools = ctrl.listTools();
-    expect(tools).toHaveLength(1);
-    expect(Object.keys((tools[0] as any).inputSchema.properties)).not.toContain('userId');
+    const tools = ctrl.listTools('web');
+    expect(tools.map((t: any) => t.name)).toEqual(['manage_product', 'find_files']);
+    for (const t of tools as any[]) expect(Object.keys(t.inputSchema.properties)).not.toContain('userId');
+  });
+
+  it('Telegram: только продукты — поиск файлов в боте не включён', () => {
+    const { ctrl } = make();
+    expect(ctrl.listTools('telegram').map((t: any) => t.name)).toEqual(['manage_product']);
+  });
+
+  it('find_files: владелец из токена, userId из запроса выбрасывается', async () => {
+    const { ctrl, files, tool } = make();
+    await ctrl.callTool(`Bearer ${signProductToolToken('79030169187')}`, { query: 'договор', userId: '70000000000' }, 'find_files');
+    expect(files.searchForUser).toHaveBeenCalledWith('79030169187', expect.objectContaining({ query: 'договор' }));
+    expect(tool.execute).not.toHaveBeenCalled();
+  });
+
+  it('find_files с токеном Telegram — отказ, поиск не зовётся', async () => {
+    const { ctrl, files, tool } = make();
+    const r: any = await ctrl.callTool(`Bearer ${signProductToolToken('79030169187', 'telegram')}`, { query: 'x' }, 'find_files');
+    expect(r.ok).toBe(false);
+    expect(files.searchForUser).not.toHaveBeenCalled();
+    expect(tool.execute).not.toHaveBeenCalled();
+  });
+
+  it('незнакомое имя — отказ, ничего не зовётся', async () => {
+    const { ctrl, files, tool } = make();
+    const r: any = await ctrl.callTool(`Bearer ${signProductToolToken('79030169187')}`, {}, 'rm_rf');
+    expect(r.ok).toBe(false);
+    expect(files.searchForUser).not.toHaveBeenCalled();
+    expect(tool.execute).not.toHaveBeenCalled();
   });
 });
 

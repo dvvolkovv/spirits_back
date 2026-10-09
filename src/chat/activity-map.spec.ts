@@ -128,6 +128,7 @@ describe('toActivity — что видит человек вместо трёх 
     ['mcp__talerid__send_message', 'message_send'], ['mcp__talerid__check_mail', 'mail_read'],
     ['mcp__talerid__read_mail', 'mail_read'], ['mcp__talerid__send_mail', 'mail_send'],
     ['mcp__products__manage_product', 'product'],
+    ['mcp__products__find_files', 'find_files'],
     ['mcp__linkeon__something_new', 'other'], ['TodoWrite', 'other'],
   ])('%s → %s', (tool, kind) => {
     expect(toActivity(tool, '{}', WHO)).toEqual({ type: 'activity', kind });
