@@ -1,6 +1,6 @@
 import { Controller, Get, Post, Put, Param, Req, Res, UseGuards } from '@nestjs/common';
 import { Request, Response } from 'express';
-import { AvatarService } from './avatar.service';
+import { AvatarService, UnsupportedAvatarError } from './avatar.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import * as multer from 'multer';
@@ -108,10 +108,10 @@ export class AvatarController {
     // If raw binary (not multipart) — body is already Buffer from body-parser raw
     if (contentType.startsWith('image/') && Buffer.isBuffer(req.body) && req.body.length > 0) {
       try {
-        const result = await this.avatarService.uploadAvatar(user.userId, req.body, contentType);
+        const result = await this.avatarService.uploadAvatar(user.userId, req.body);
         return res.status(200).json(result);
       } catch (e) {
-        return res.status(500).json({ error: e.message });
+        return res.status(e instanceof UnsupportedAvatarError ? 400 : 500).json({ error: e.message });
       }
     }
 
@@ -122,10 +122,10 @@ export class AvatarController {
         const file = (req as any).file;
         if (!file) return res.status(400).json({ error: 'No file uploaded' });
         try {
-          const result = await this.avatarService.uploadAvatar(user.userId, file.buffer, file.mimetype);
+          const result = await this.avatarService.uploadAvatar(user.userId, file.buffer);
           resolve(res.status(200).json(result));
         } catch (e) {
-          resolve(res.status(500).json({ error: e.message }));
+          resolve(res.status(e instanceof UnsupportedAvatarError ? 400 : 500).json({ error: e.message }));
         }
       });
     });
