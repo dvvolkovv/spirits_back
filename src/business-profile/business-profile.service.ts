@@ -123,9 +123,9 @@ export class BusinessProfileService {
       `SELECT 1
          FROM custom_chat_history h
          JOIN agents a ON a.id = h.agent
-        WHERE h.session_id LIKE $1 AND a.category = 'business'
+        WHERE h.session_id LIKE $1 || '\\_%' ESCAPE '\\' AND a.category = 'business'
         LIMIT 1`,
-      [`${userId}_%`],
+      [userId],
     );
     return res.rows.length > 0;
   }

@@ -176,13 +176,14 @@ export class ProfileCompactionService {
     }
     const termList = Array.from(terms).slice(0, 30);
 
-    const sessionLike = `${userId}_%`;
+    // Переписка пользователя — session_id `{userId}_…`; `_` экранирован, иначе
+    // в проверку попали бы реплики номера, который начинается так же.
     const placeholders = termList.map((_, i) => `content ILIKE $${i + 2}`).join(' OR ');
-    const params = [sessionLike, ...termList.map(t => `%${t}%`)];
+    const params = [userId, ...termList.map(t => `%${t}%`)];
     try {
       const res = await this.pg.query(
         `SELECT content FROM custom_chat_history
-           WHERE session_id LIKE $1 AND sender_type = 'human'
+           WHERE session_id LIKE $1 || '\\_%' ESCAPE '\\' AND sender_type = 'human'
              AND (${placeholders})
            ORDER BY created_at DESC
            LIMIT 8`,
