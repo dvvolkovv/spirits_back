@@ -175,7 +175,12 @@ export class ProfileService implements OnModuleInit {
     // человек попросил удалить аккаунт, и внешний сбой не повод ему отказать.
     await this.revokeAppleAccess(userId);
 
-    await this.pg.query('DELETE FROM custom_chat_history WHERE session_id LIKE $1', [`${userId}_%`]);
+    // `_` в LIKE экранирован: иначе удаление номера 7903016918 стёрло бы и
+    // переписку 79030169187 — `_` в шаблоне совпадает с любым символом.
+    await this.pg.query(
+      `DELETE FROM custom_chat_history WHERE session_id LIKE $1 || '\\_%' ESCAPE '\\'`,
+      [userId],
+    );
     await this.pg.query(
       `UPDATE ai_profiles_consolidated
        SET profile_data = '{}', email = NULL, preferred_agent = NULL, isadmin = false,
