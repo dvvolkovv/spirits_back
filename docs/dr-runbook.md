@@ -101,6 +101,16 @@ for b in linkeon-smm-videos linkeon-smm-music linkeon-assets linkeon-chat-files;
 done
 ```
 
+The app does not use the root key. `MINIO_ACCESS_KEY` in `.env` is a separate
+MinIO user with the policy `smm-rw`, and that policy lists the buckets by name.
+On a rebuilt MinIO recreate that user and give `smm-rw` all four buckets
+(`arn:aws:s3:::<bucket>` and `arn:aws:s3:::<bucket>/*` for each):
+`mc admin policy create newprod smm-rw <json>`, then attach it to the user.
+A bucket missing from `smm-rw` fails quietly: PutObject returns `Access Denied.`,
+chat files fall back to relay links, and nothing errors in the UI (this is how
+the first chat-files backfill copied 0 of 522 on 2026-10-08). After the policy
+is in place, write one test object with the app key to confirm.
+
 If node-3's MinIO is serving directly during an outage, point `MINIO_ENDPOINT`
 at `http://10.10.0.3:9000` and restart the api/worker.
 
