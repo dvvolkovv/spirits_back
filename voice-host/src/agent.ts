@@ -881,7 +881,9 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
         }),
         execute: async ({ title, instructions, specialist }) => {
           try {
-            const r = await backend.document(meta.callId, title, instructions, specialist);
+            // null от Realtime приводим к «не указан»: контракт бэкенда — отсутствие,
+            // а не пустое значение.
+            const r = await backend.document(meta.callId, title, instructions, specialist ?? undefined);
             return r.status === 'accepted'
               ? { status: 'accepted', title, author: r.specialist || 'ты сам' }
               : { status: 'rejected', reason: r.reason };
