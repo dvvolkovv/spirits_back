@@ -36,6 +36,8 @@ const TIMEOUT_MS: Record<string, number> = {
   // можно ровно столько, сколько терпимо молчание в трубке. Ручка читает
   // календарь и дела пользователя — это БД, а не поход в LLM.
   schedule: 3_000,
+  // Заметка, как и документ: ручка только ставит сочинение в очередь.
+  note: 2_000,
 };
 
 async function post<T>(path: string, body: unknown): Promise<T> {
@@ -124,6 +126,10 @@ export const backend = {
    * модель берёт свежее сама, когда оно ей понадобилось.
    */
   schedule: (callId: string) => post<{ text: string }>('schedule', { callId }),
+  /** Заметка в «Заметки» пользователя. Возвращается сразу, текст сочиняется фоном. */
+  note: (callId: string, title: string, instructions: string) =>
+    post<{ status: 'accepted'; title: string } | { status: 'rejected'; reason: string }>(
+      'note', { callId, title, instructions }),
   meetBot: (callId: string, wsUrl: string) =>
     post<{ status: 'ok' | 'failed' }>('meet-bot', { callId, wsUrl }).then((r) => r.status === 'ok'),
 };

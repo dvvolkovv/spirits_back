@@ -1,13 +1,15 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
+import { TalerIdNotesConnector } from '../talerid/talerid-notes.connector';
 import { ChatService } from '../chat/chat.service';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 import { LiveKitClient } from './livekit.client';
 import {
   AUTHOR_GUESS_WINDOW_MIN, CONSULT_CHARS_IN_DOC, DOC_GIST_CHARS, DOC_LEAD_CHARS, DOC_TIMEOUT_MS,
   DOCS_BUCKET, DOC_TARGET_CHARS, DocumentResult, findSpecialist, HOST_AGENT_ID, MAX_CONSULT_IN_DOC,
+  NoteResult, NOTE_TARGET_CHARS,
   specialistName, VOICE_ASK_NOTE,
 } from './voice-call.types';
 
@@ -34,6 +36,10 @@ export class VoiceDocumentService {
     private readonly livekit: LiveKitClient,
     private readonly storage: StorageService,
     private readonly language: LanguageService,
+    // Заметки живут в TalerID — там же, откуда их читает панель лаунчера.
+    // Необязательный: не подключён TalerID → заметку сохранить некуда, но
+    // разговор из-за этого ронять нельзя.
+    @Optional() private readonly notes?: TalerIdNotesConnector,
   ) {}
 
   /**
@@ -155,6 +161,78 @@ export class VoiceDocumentService {
     this.inflight.add(task);
 
     return { status: 'accepted', docId, title: clean, specialist: author };
+  }
+
+  /**
+   * Заметка в «Заметки» пользователя.
+   *
+   * Отдельно от {@link create}, потому что это разные вещи и разные места:
+   * документ — произведённая бумага, её кладут в чат и отправляют адресату;
+   * заметка — то, что человек сохраняет себе и ищет потом там, где держит
+   * заметки. Живой звонок 10.10.2026: владелец попросил «сформулировать
+   * тезисы в виде заметки», получил документ в чат, пошёл в «Заметки», не
+   * нашёл ничего и решил, что Роман этого не умеет.
+   *
+   * Возвращается сразу: сочинение текста идёт фоном, как у документа, иначе
+   * инструмент держал бы разговор минутами.
+   */
+  async createNote(
+    callId: string, roomName: string, userId: string, title: string, instructions: string,
+  ): Promise<NoteResult> {
+    const clean = (title || '').trim();
+    if (!clean) return { status: 'rejected', reason: 'no_title' };
+
+    const task = this.runNote(callId, roomName, userId, clean, instructions)
+      .catch((e) => this.logger.error(`заметка «${clean}» упала: ${e?.message}`))
+      .finally(() => this.inflight.delete(task));
+    this.inflight.add(task);
+
+    return { status: 'accepted', title: clean };
+  }
+
+  private async runNote(
+    callId: string, roomName: string, userId: string, title: string, instructions: string,
+  ): Promise<void> {
+    if (!this.notes) {
+      await this.safeSend(roomName, { v: 1, type: 'note_failed', title, reason: 'not_connected' });
+      return;
+    }
+    try {
+      const consult = await this.specialistContext(callId);
+      const prompt =
+        `Составь заметку по тому, о чём шла речь в голосовом разговоре.\n\n` +
+        `Заголовок: ${title}\n` +
+        `Что должно быть в заметке: ${instructions || 'без дополнительных указаний'}\n\n` +
+        (consult ? `Разбор специалистов из этого разговора — опирайся на него:\n${consult}\n\n` : '') +
+        `Это заметка ДЛЯ СЕБЯ, а не письмо кому-то: пиши от лица человека, который её себе ` +
+        `оставляет, без обращений и без вступлений вроде «вот ваша заметка». Заголовок первой ` +
+        `строкой не дублируй. Выдай только текст заметки.\n\n` +
+        `Уложись примерно в ${NOTE_TARGET_CHARS} знаков: заметку перечитывают, а не изучают.`;
+
+      const reply = await this.withTimeout(
+        this.chat.generateAgentReplyWithCharge(userId, String(HOST_AGENT_ID), prompt, `voice_note_${callId}`),
+        DOC_TIMEOUT_MS,
+      );
+      const body = (reply.text || '').trim();
+      if (!body) throw new Error('пустая заметка');
+
+      const saved = await this.notes.createNote(userId, title, body);
+      if (!saved.ok) {
+        this.logger.warn(`заметка «${title}» не сохранилась: ${saved.error}`);
+        await this.safeSend(roomName, { v: 1, type: 'note_failed', title, reason: 'error' });
+        return;
+      }
+
+      await this.charge(userId, HOST_AGENT_ID, title, reply.tokens);
+      await this.safeSend(roomName, {
+        v: 1, type: 'note_ready', title, tokens: reply.tokens, text: body.slice(0, DOC_GIST_CHARS),
+      });
+      this.logger.log(`заметка «${title}» сохранена в Заметки, ${body.length} знаков, ${reply.tokens} токенов`);
+    } catch (e: any) {
+      const timeout = /timeout|время/i.test(String(e?.message || ''));
+      this.logger.error(`заметка «${title}» не получилась: ${e?.message}`);
+      await this.safeSend(roomName, { v: 1, type: 'note_failed', title, reason: timeout ? 'timeout' : 'error' });
+    }
   }
 
   /**

@@ -5,7 +5,7 @@ import { VoiceCallService } from './voice-call.service';
 import { VoiceDocumentService } from './voice-document.service';
 import { verifyBody } from './hmac';
 import { MeetingService } from '../meeting/meeting.service';
-import { AskResult, CompletePayload, DocumentResult } from './voice-call.types';
+import { AskResult, CompletePayload, DocumentResult, NoteResult } from './voice-call.types';
 
 /**
  * Ручки, которые зовёт воркер linkeon-voice-host. Закрыты HMAC-подписью тела.
@@ -101,6 +101,25 @@ export class VoiceCallInternalController {
    * транскрипт раз в ~15с, чтобы сбой Realtime API / пересоздание сессии не потеряли уже
    * сказанное. Не финализирует и не тарифицирует — только стейджит (keep-longest).
    */
+  /**
+   * Заметка в «Заметки» пользователя. Отдельно от /document: документ ложится
+   * в чат, заметка — туда, где человек держит заметки (спека §8.1, живой
+   * звонок 10.10.2026).
+   */
+  @Post('note')
+  async note(
+    @Headers('x-voice-signature') signature: string,
+    @Req() req: Request,
+  ): Promise<NoteResult> {
+    const body = this.parseSigned<{ callId: string; title: string; instructions: string }>(req, signature);
+    const call = await this.calls.load(body.callId);
+    if (!this.calls.isActive(call)) {
+      this.logger.warn(`[note] call=${body.callId} не активен (${call.status})`);
+      return { status: 'rejected', reason: 'no_title' };
+    }
+    return this.docs.createNote(body.callId, call.room_name, call.user_id, body.title, body.instructions);
+  }
+
   @Post('progress')
   async progress(
     @Headers('x-voice-signature') signature: string,

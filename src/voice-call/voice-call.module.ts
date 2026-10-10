@@ -10,6 +10,7 @@ import { VoiceDocumentService } from './voice-document.service';
 import { VoiceCallReaperService } from './voice-call-reaper.service';
 import { MeetingModule } from '../meeting/meeting.module';
 import { ContextModule } from '../context/context.module';
+import { TalerIdModule } from '../talerid/talerid.module';
 
 /**
  * VOICE_CALLBACK_SECRET читается ТОЛЬКО во время запроса, в контроллере.
@@ -27,7 +28,7 @@ import { ContextModule } from '../context/context.module';
  * диагностика в лог, она отрабатывает уже после ConfigModule.
  */
 @Module({
-  imports: [CommonModule, ChatModule, ContextModule, forwardRef(() => MeetingModule)],
+  imports: [CommonModule, ChatModule, ContextModule, TalerIdModule, forwardRef(() => MeetingModule)],
   controllers: [VoiceCallController, VoiceCallInternalController, VoiceCallStatusController],
   providers: [VoiceCallService, SpecialistJobService, VoiceDocumentService, VoiceCallReaperService],
   exports: [VoiceCallService],

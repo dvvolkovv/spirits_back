@@ -20,6 +20,18 @@ export type VoiceDataMessage =
   | { v: 1; type: 'document_ready'; docId: string; title: string; tokens: number; specialist?: string; text?: string; url?: string }
   | { v: 1; type: 'document_failed'; docId: string; title: string; reason: 'timeout' | 'error'; specialist?: string }
   /**
+   * Заметка — в «Заметки» пользователя, а НЕ в ленту чата.
+   *
+   * Разные вещи и разные места: документ это произведённая бумага (письмо,
+   * план), её читают и отправляют; заметка — то, что человек хочет сохранить
+   * себе и потом найти там, где он их держит. Живой звонок 10.10.2026:
+   * владелец попросил «сформулировать тезисы в виде заметки», Роман сделал
+   * документ в чат, владелец пошёл в «Заметки», не нашёл ничего и решил, что
+   * Роман не умеет.
+   */
+  | { v: 1; type: 'note_ready'; title: string; tokens: number; text?: string }
+  | { v: 1; type: 'note_failed'; title: string; reason: 'timeout' | 'error' | 'not_connected' }
+  /**
    * Состав участников встречи на площадке без LiveKit (Meet через Attendee).
    *
    * В нашей комнате при такой встрече участников нет вовсе, поэтому occupancy
@@ -59,6 +71,13 @@ export type VoiceDataMessage =
 export type DocumentResult =
   | { status: 'accepted'; docId: string; title: string; specialist?: string }
   | { status: 'rejected'; reason: 'no_title' };
+
+export type NoteResult =
+  | { status: 'accepted'; title: string }
+  | { status: 'rejected'; reason: 'no_title' };
+
+/** Заметка короче документа: это памятка себе, а не бумага для отправки. */
+export const NOTE_TARGET_CHARS = 1200;
 
 /** Сколько консультаций звонка подмешиваем в промпт документа. */
 export const MAX_CONSULT_IN_DOC = 5;

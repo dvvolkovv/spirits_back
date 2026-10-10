@@ -828,6 +828,32 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
         description: 'Список доступных специалистов.',
         execute: async () => ({ specialists: meta.specialists }),
       }),
+      save_note: llm.tool({
+        description:
+          'Сохранить заметку в «Заметки» пользователя — туда, где он их держит и потом ищет. ' +
+          'Возвращается сразу, БЕЗ текста: он появится в заметках сам. Используй, когда просят ' +
+          '«запиши заметку», «сохрани тезисы», «зафиксируй выводы», «запомни это». ' +
+          'Это НЕ то же, что create_document: документ — бумага для отправки, он ложится в чат; ' +
+          'заметка — памятка себе и ложится в Заметки.',
+        parameters: z.object({
+          title: z.string().describe('Короткий заголовок заметки'),
+          instructions: z.string().describe(
+            'Что должно быть в заметке: все выводы и детали из разговора. Пиши подробно — ' +
+            'тот, кто будет писать текст, разговора не слышал.',
+          ),
+        }),
+        execute: async ({ title, instructions }) => {
+          try {
+            const r = await backend.note(meta.callId, title, instructions);
+            return r.status === 'accepted'
+              ? { status: 'accepted', title }
+              : { status: 'rejected', reason: (r as any).reason };
+          } catch (e) {
+            console.error('save_note failed', e);
+            return { status: 'rejected', reason: 'backend_unavailable', title };
+          }
+        },
+      }),
       create_document: llm.tool({
         description:
           'Составить документ и положить его в чат с пользователем. Возвращается сразу, ' +
@@ -842,7 +868,13 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
             'Что должно быть в документе: суть, для кого, все обсуждённые детали. ' +
             'Пиши подробно — тот, кто будет писать текст, разговора не слышал.',
           ),
-          specialist: z.string().optional().describe(
+          // .nullish(), а НЕ .optional(): Realtime штатно присылает null для
+          // необязательного параметра, а optional разрешает только ОТСУТСТВИЕ
+          // поля. Живой звонок 10.10.2026: вызов отбросила схема
+          // («Expected string, received null»), владелец попросил заметку и
+          // решил, что Роман не умеет. Модель повторила через 5 секунд с
+          // пустой строкой — но на это нельзя рассчитывать.
+          specialist: z.string().nullish().describe(
             'Имя специалиста, если документ по его части — он его и напишет, и ' +
             'документ ляжет в чат с ним. Не указывай, если пишешь сам.',
           ),
@@ -953,12 +985,17 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
           }
         : {}),
     };
-    // Базовых тула четыре (ask_specialist, check_schedule, list_specialists,
-    // create_document), write_to_chat — пятый, условный. create_document
-    // был в первой редакции спеки как save_note, я его снял, решив, что он
-    // дублирует резюме звонка, — и на живом звонке 26.08.2026 владелец
-    // попросил документ, а Роману оказалось некуда его положить. Резюме это
-    // про что говорили; документ — результат работы.
+    // Базовых тула пять (ask_specialist, check_schedule, list_specialists,
+    // create_document, save_note), write_to_chat — шестой, условный.
+    //
+    // История этих двух стоит того, чтобы её помнить. save_note был в первой
+    // редакции спеки, я его снял, решив, что он дублирует резюме звонка, — и
+    // на живом звонке 26.08.2026 владелец попросил документ, а Роману
+    // оказалось некуда его положить: так появился create_document в чат.
+    // 10.10.2026 владелец попросил «тезисы в виде заметки», получил документ
+    // в чат, пошёл в «Заметки», не нашёл ничего и решил, что Роман не умеет.
+    // Вывод: это РАЗНЫЕ вещи. Резюме — про что говорили; документ — результат
+    // работы, его отправляют; заметка — памятка себе, её ищут в Заметках.
 
     // Ответы специалистов приходят из бэкенда через data-канал комнаты.
     ctx.room.on(RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
@@ -1006,6 +1043,23 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
             else console.error(`[чат] ссылка на документ «${msg.title}» не ушла (${r})`);
           });
         }
+        return;
+      }
+      if (msg.type === 'note_ready') {
+        pushLine(
+          `${INTERNAL_PREFIX}: заметка «${msg.title}» сохранена в Заметки пользователя. ` +
+          `Скажи вслух, что записал, и коротко назови, что именно. Начало текста: ${msg.text || ''}]`,
+        );
+        return;
+      }
+      if (msg.type === 'note_failed') {
+        const why = msg.reason === 'not_connected'
+          ? 'заметки не подключены'
+          : msg.reason === 'timeout' ? 'не успело' : 'сбой';
+        pushLine(
+          `${INTERNAL_PREFIX}: заметку «${msg.title}» сохранить не удалось (${why}). ` +
+          `Скажи об этом прямо и предложи записать её в чат документом.]`,
+        );
         return;
       }
       if (msg.type === 'document_failed') {
