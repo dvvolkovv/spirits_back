@@ -35,7 +35,7 @@ function makeStorage(fail = false) {
   };
 }
 
-function makePg(jobRows: any[] = []) {
+function makePg(jobRows: any[] = [], transcriptRows: any[] = []) {
   const history: any[] = [];
   const charges: any[] = [];
   return {
@@ -55,6 +55,9 @@ function makePg(jobRows: any[] = []) {
       if (/INSERT INTO token_consumption_tasks/i.test(sql)) {
         charges.push({ agent_id: params[2], output_tokens: params[3] });
         return { rows: [], rowCount: 1 };
+      }
+      if (/FROM voice_calls\b/i.test(sql)) {
+        return { rows: transcriptRows, rowCount: transcriptRows.length };
       }
       if (/FROM voice_call_jobs/i.test(sql)) {
         // Догадка об авторе спрашивает только СВЕЖИЕ консультации, и фейк обязан
@@ -512,5 +515,115 @@ describe('видно, что специалист работает', () => {
     resolveDoc({ text: 'тело', tokens: 5, costUsd: 0 });
     await svc.drainForTests();
     expect(pg.history).toHaveLength(2); // и готовый документ следом
+  });
+});
+
+
+describe('заметка по итогам звонка (дефекты владельца 11.10.2026)', () => {
+  const CALL = '22222222-2222-2222-2222-222222222222';
+  const ROOM = 'voice_room';
+
+  function makeNotes() {
+    const created: any[] = [];
+    const updated: any[] = [];
+    return {
+      created,
+      updated,
+      createNote: jest.fn(async (_u: string, title: string, content: string) => {
+        created.push({ title, content });
+        return { ok: true, id: 'note-1', title };
+      }),
+      updateNote: jest.fn(async (_u: string, id: string, title: string, content: string) => {
+        updated.push({ id, title, content });
+        return { ok: true, id, title };
+      }),
+    };
+  }
+
+  const TALK = [
+    { role: 'user', text: 'У меня четверо детей, и младшему предстоит операция на сердце.', ts: 1 },
+    { role: 'assistant', text: 'Расскажи, как ты это переживаешь.', ts: 2 },
+    { role: 'user', text: 'Тяжело. Плюс идёт развод, скоро заседание.', ts: 3 },
+  ];
+
+  function makeSvc(notes: any, transcript: any[] = TALK) {
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'тело заметки', tokens: 10, costUsd: 0 })) };
+    const pg = makePg([], transcript.length ? [{ transcript }] : []);
+    const svc = new VoiceDocumentService(
+      pg as any, chat as any, { send: jest.fn(async () => {}) } as any,
+      makeStorage() as any, makeLang() as any, notes as any,
+    );
+    return { svc, chat, pg };
+  }
+
+  it('⚠️ ГЛАВНОЕ: в промпт заметки попадает САМ РАЗГОВОР', async () => {
+    // До 11.10.2026 не попадал: сессия изолированная, модель писала из заголовка и одной
+    // строки указаний. Короткая общая заметка была неизбежна при любом промпте.
+    const notes = makeNotes();
+    const { svc, chat } = makeSvc(notes);
+
+    await svc.createNote(CALL, ROOM, 'user-1', 'Мой разговор', 'запиши детали моей истории');
+    await svc.drainForTests();
+
+    const prompt = chat.generateAgentReplyWithCharge.mock.calls[0][2] as string;
+    expect(prompt).toContain('операция на сердце');
+    expect(prompt).toContain('скоро заседание');
+    expect(prompt).toContain('Разговор целиком');
+  });
+
+  it('промпт не велит экономить на деталях', async () => {
+    const notes = makeNotes();
+    const { svc, chat } = makeSvc(notes);
+    await svc.createNote(CALL, ROOM, 'user-1', 'Мой разговор', 'подробно');
+    await svc.drainForTests();
+    const prompt = chat.generateAgentReplyWithCharge.mock.calls[0][2] as string;
+    expect(prompt).toMatch(/ПОТОЛОК, а не цель/);
+    expect(prompt).toMatch(/не экономь/i);
+  });
+
+  it('⚠️ «дополни заметку» ОБНОВЛЯЕТ ту же, а не создаёт вторую', async () => {
+    const notes = makeNotes();
+    const { svc } = makeSvc(notes);
+
+    await svc.createNote(CALL, ROOM, 'user-1', 'Мой разговор', 'первая версия');
+    await svc.drainForTests();
+    await svc.createNote(CALL, ROOM, 'user-1', 'Мой разговор', 'добавь про детей', true);
+    await svc.drainForTests();
+
+    expect(notes.created).toHaveLength(1);
+    expect(notes.updated).toHaveLength(1);
+    expect(notes.updated[0].id).toBe('note-1');
+  });
+
+  it('при дополнении модель видит прежний текст и не должна его выбрасывать', async () => {
+    const notes = makeNotes();
+    const { svc, chat } = makeSvc(notes);
+
+    await svc.createNote(CALL, ROOM, 'user-1', 'Мой разговор', 'первая версия');
+    await svc.drainForTests();
+    await svc.createNote(CALL, ROOM, 'user-1', 'Мой разговор', 'добавь про детей', true);
+    await svc.drainForTests();
+
+    const second = chat.generateAgentReplyWithCharge.mock.calls[1][2] as string;
+    expect(second).toContain('Текущая заметка:');
+    expect(second).toContain('тело заметки');
+    expect(second).toMatch(/дополняй, а не заменяй/);
+  });
+
+  it('append без прежней заметки — создаёт новую, а не падает', async () => {
+    const notes = makeNotes();
+    const { svc } = makeSvc(notes);
+    await svc.createNote(CALL, ROOM, 'user-1', 'Мой разговор', 'что-то', true);
+    await svc.drainForTests();
+    expect(notes.created).toHaveLength(1);
+    expect(notes.updated).toHaveLength(0);
+  });
+
+  it('нет транскрипта — заметка всё равно пишется (без него хуже, но не провал)', async () => {
+    const notes = makeNotes();
+    const { svc } = makeSvc(notes, []);
+    await svc.createNote(CALL, ROOM, 'user-1', 'Мой разговор', 'что-то');
+    await svc.drainForTests();
+    expect(notes.created).toHaveLength(1);
   });
 });

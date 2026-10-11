@@ -127,9 +127,9 @@ export const backend = {
    */
   schedule: (callId: string) => post<{ text: string }>('schedule', { callId }),
   /** Заметка в «Заметки» пользователя. Возвращается сразу, текст сочиняется фоном. */
-  note: (callId: string, title: string, instructions: string) =>
+  note: (callId: string, title: string, instructions: string, append?: boolean) =>
     post<{ status: 'accepted'; title: string } | { status: 'rejected'; reason: string }>(
-      'note', { callId, title, instructions }),
+      'note', { callId, title, instructions, append }),
   meetBot: (callId: string, wsUrl: string) =>
     post<{ status: 'ok' | 'failed' }>('meet-bot', { callId, wsUrl }).then((r) => r.status === 'ok'),
 };

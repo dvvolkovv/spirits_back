@@ -34,6 +34,9 @@ export type QuickAddResponse = {
 };
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+/** Длительность события по умолчанию, когда человек её не назвал (owner 11.10.2026). */
+const DEFAULT_EVENT_MIN = 60;
+
 /** Append the product TZ offset when the ISO string carries none (no trailing Z / ±hh:mm). */
 function withOffset(s: string): string {
   return /[zZ]$|[+-]\d{2}:?\d{2}$/.test(s) ? s : `${s}${OFFSET}`;
@@ -653,13 +656,17 @@ export class CalendarService {
     // Какие обязательные слоты отсутствуют?
     const missing: ('date' | 'time' | 'duration')[] = [];
     if (!date) missing.push('date');
-    if (itemKind === 'event') {
-      if (!time) missing.push('time');
-      if (!durationMin) missing.push('duration');
-    }
+    if (itemKind === 'event' && !time) missing.push('time');
     if (missing.length) return { kind: 'clarify', question: CalendarService.clarifyQuestion(missing) };
 
-    return { kind: 'create', itemKind, title, date, time, durationMin, recurrence, deadline };
+    // ⚠️ Длительность БОЛЬШЕ НЕ ОБЯЗАТЕЛЬНА (owner 11.10.2026, отменяет правило 21.08).
+    // Повод — живой отказ: «завтра в 15:25 флюорография у Савы» не создавалось, а
+    // переспрос звучал «На сколько по времени?» и читался как «требует указать время»,
+    // хотя время было названо. Люди так не говорят: длительность называют редко, а
+    // отказывать из-за неё — значит не выполнить ясную команду. Час по умолчанию
+    // ошибается максимум в конце слота; переспрос ошибался в самом факте добавления.
+    const duration = itemKind === 'event' ? durationMin || DEFAULT_EVENT_MIN : durationMin;
+    return { kind: 'create', itemKind, title, date, time, durationMin: duration, recurrence, deadline };
   }
 
   /** Один совмещённый вопрос по недостающим слотам («Во сколько и на сколько по времени?»). */

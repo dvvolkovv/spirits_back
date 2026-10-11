@@ -839,12 +839,18 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
           title: z.string().describe('Короткий заголовок заметки'),
           instructions: z.string().describe(
             'Что должно быть в заметке: все выводы и детали из разговора. Пиши подробно — ' +
-            'тот, кто будет писать текст, разговора не слышал.',
+            'но текст будет писать тот, у кого есть ВЕСЬ разговор, так что пересказывать ' +
+            'его целиком не нужно: скажи, на чём сделать упор.',
+          ),
+          append: z.boolean().nullish().describe(
+            'true — если человек просит ДОПОЛНИТЬ или переписать заметку, которую ты уже ' +
+            'сохранил в этом разговоре («добавь туда…», «допиши», «ещё добавь»). Тогда ' +
+            'обновится та же заметка, а не появится вторая. false или не указывай — новая.',
           ),
         }),
-        execute: async ({ title, instructions }) => {
+        execute: async ({ title, instructions, append }) => {
           try {
-            const r = await backend.note(meta.callId, title, instructions);
+            const r = await backend.note(meta.callId, title, instructions, append ?? undefined);
             return r.status === 'accepted'
               ? { status: 'accepted', title }
               : { status: 'rejected', reason: (r as any).reason };

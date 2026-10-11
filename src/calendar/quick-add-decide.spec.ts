@@ -1,8 +1,11 @@
 import { CalendarService } from './calendar.service';
 
 // Чистая логика решения quick-add (без сети/БД/LLM): что делать по разобранным слотам —
-// болтовня / переспрос недостающего / создание. Обязательные слоты (owner 2026-08-21):
-// событие = день+время+длительность; дело = как минимум день; рутина = день не нужен.
+// болтовня / переспрос недостающего / создание. Обязательные слоты:
+// событие = день+время; дело = как минимум день; рутина = день не нужен.
+// ⚠️ Длительность была обязательной с 21.08.2026 и перестала быть 11.10.2026 (owner):
+// «завтра в 15:25 флюорография у Савы» не создавалось, а переспрос «На сколько по
+// времени?» читался как требование указать время, которое было названо.
 describe('CalendarService.decideQuickAdd', () => {
   const decide = (p: any) => CalendarService.decideQuickAdd(p);
 
@@ -19,19 +22,23 @@ describe('CalendarService.decideQuickAdd', () => {
     expect(d).toMatchObject({ kind: 'create', itemKind: 'event', title: 'встреча', date: '2026-08-23', time: '15:00', durationMin: 60 });
   });
 
-  it('событие без времени и длительности (только день) → переспрос обоих', () => {
+  it('событие без времени (только день) → переспрос времени', () => {
     const d = decide({ intent: 'add', kind: 'event', title: 'рыбалка', date: '2026-08-23' });
     expect(d.kind).toBe('clarify');
-    expect((d as any).question).toBe('Во сколько и на сколько по времени?');
+    expect((d as any).question).toBe('Во сколько?');
   });
 
-  it('событие без длительности (день+время есть) → переспрос только длительности', () => {
-    const d = decide({ intent: 'add', kind: 'event', title: 'встреча', date: '2026-08-23', time: '15:00' });
-    expect(d.kind).toBe('clarify');
-    expect((d as any).question).toBe('На сколько по времени?');
+  it('КЕЙС ВЛАДЕЛЬЦА 11.10.2026: день+время без длительности → СОЗДАЁМ (час по умолчанию)', () => {
+    const d = decide({ intent: 'add', kind: 'event', title: 'флюорография у Савы', date: '2026-10-12', time: '15:25' });
+    expect(d).toMatchObject({ kind: 'create', itemKind: 'event', date: '2026-10-12', time: '15:25', durationMin: 60 });
   });
 
-  it('событие без дня (время+длит. есть) → переспрос дня', () => {
+  it('названную длительность уважаем, а не затираем умолчанием', () => {
+    const d = decide({ intent: 'add', kind: 'event', title: 'созвон', date: '2026-10-12', time: '15:00', durationMin: 15 });
+    expect((d as any).durationMin).toBe(15);
+  });
+
+  it('событие без дня (время есть) → переспрос дня', () => {
     const d = decide({ intent: 'add', kind: 'event', title: 'встреча', time: '15:00', durationMin: 30 });
     expect(d.kind).toBe('clarify');
     expect((d as any).question).toBe('На какой день?');
@@ -61,16 +68,16 @@ describe('CalendarService.decideQuickAdd', () => {
     expect((d as any).recurrence).toEqual({ freq: 'daily', byDay: undefined, interval: undefined });
   });
 
-  it('«поехать на рыбалку в воскресенье» как событие с днём → переспрос времени+длит. (кейс владельца)', () => {
+  it('«поехать на рыбалку в воскресенье» как событие с днём → переспрос времени (кейс владельца 21.08)', () => {
     const d = decide({ intent: 'add', kind: 'event', title: 'рыбалка с ребятами', date: '2026-08-23' });
     expect(d.kind).toBe('clarify');
-    expect((d as any).question).toBe('Во сколько и на сколько по времени?');
+    expect((d as any).question).toBe('Во сколько?');
   });
 
   it('невалидные форматы date/time игнорируются (как отсутствующие)', () => {
     const d = decide({ intent: 'add', kind: 'event', title: 'x', date: 'завтра', time: '3 часа', durationMin: 0 });
     expect(d.kind).toBe('clarify');
-    expect((d as any).question).toBe('На какой день и во сколько и на сколько по времени?');
+    expect((d as any).question).toBe('На какой день и во сколько?');
   });
 });
 

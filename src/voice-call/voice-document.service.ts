@@ -9,7 +9,7 @@ import { LiveKitClient } from './livekit.client';
 import {
   AUTHOR_GUESS_WINDOW_MIN, CONSULT_CHARS_IN_DOC, DOC_GIST_CHARS, DOC_LEAD_CHARS, DOC_TIMEOUT_MS,
   DOCS_BUCKET, DOC_TARGET_CHARS, DocumentResult, findSpecialist, HOST_AGENT_ID, MAX_CONSULT_IN_DOC,
-  NoteResult, NOTE_TARGET_CHARS,
+  NoteResult, NOTE_TARGET_CHARS, NOTE_TRANSCRIPT_CHARS,
   specialistName, VOICE_ASK_NOTE,
 } from './voice-call.types';
 
@@ -178,11 +178,12 @@ export class VoiceDocumentService {
    */
   async createNote(
     callId: string, roomName: string, userId: string, title: string, instructions: string,
+    append?: boolean,
   ): Promise<NoteResult> {
     const clean = (title || '').trim();
     if (!clean) return { status: 'rejected', reason: 'no_title' };
 
-    const task = this.runNote(callId, roomName, userId, clean, instructions)
+    const task = this.runNote(callId, roomName, userId, clean, instructions, append === true)
       .catch((e) => this.logger.error(`заметка «${clean}» упала: ${e?.message}`))
       .finally(() => this.inflight.delete(task));
     this.inflight.add(task);
@@ -190,8 +191,17 @@ export class VoiceDocumentService {
     return { status: 'accepted', title: clean };
   }
 
+  /**
+   * Заметка, уже созданная в этом звонке: id и текст.
+   *
+   * <p>В памяти, а не в базе: звонок живёт минуты, и переживать рестарт этой связке не
+   * нужно — после рестарта звонка уже нет. Чистится вместе со звонком.
+   */
+  private readonly notesByCall = new Map<string, { id: string; title: string; body: string }>();
+
   private async runNote(
     callId: string, roomName: string, userId: string, title: string, instructions: string,
+    append: boolean,
   ): Promise<void> {
     if (!this.notes) {
       await this.safeSend(roomName, { v: 1, type: 'note_failed', title, reason: 'not_connected' });
@@ -199,15 +209,28 @@ export class VoiceDocumentService {
     }
     try {
       const consult = await this.specialistContext(callId);
+      // ⚠️ САМ РАЗГОВОР. До 11.10.2026 его здесь не было: сессия изолированная
+      // (voice_note_<callId>), истории у модели нет, и заметка сочинялась из заголовка и
+      // одной строки указаний. Никакой промпт не сделал бы её подробной — материала не было.
+      const talk = await this.callTranscript(callId);
+      const prev = append ? this.notesByCall.get(callId) : undefined;
       const prompt =
-        `Составь заметку по тому, о чём шла речь в голосовом разговоре.\n\n` +
+        (prev
+          ? `Перепиши заметку целиком, дополнив её тем, о чём попросил человек.\n\n` +
+            `Текущая заметка:\n${prev.body}\n\n`
+          : `Составь заметку по тому, о чём шла речь в голосовом разговоре.\n\n`) +
         `Заголовок: ${title}\n` +
         `Что должно быть в заметке: ${instructions || 'без дополнительных указаний'}\n\n` +
+        (talk ? `Разговор целиком — бери подробности ОТСЮДА:\n${talk}\n\n` : '') +
         (consult ? `Разбор специалистов из этого разговора — опирайся на него:\n${consult}\n\n` : '') +
         `Это заметка ДЛЯ СЕБЯ, а не письмо кому-то: пиши от лица человека, который её себе ` +
         `оставляет, без обращений и без вступлений вроде «вот ваша заметка». Заголовок первой ` +
         `строкой не дублируй. Выдай только текст заметки.\n\n` +
-        `Уложись примерно в ${NOTE_TARGET_CHARS} знаков: заметку перечитывают, а не изучают.`;
+        `До ${NOTE_TARGET_CHARS} знаков — это ПОТОЛОК, а не цель. Если человек просил ` +
+        `сохранить детали, не экономь на них: лучше полнее, чем короче. Конкретику из ` +
+        `разговора — имена, числа, обстоятельства, его собственные формулировки — ` +
+        `сохраняй, а не пересказывай общими словами.` +
+        (prev ? `\nСтарое содержание не выбрасывай: дополняй, а не заменяй.` : '');
 
       const reply = await this.withTimeout(
         this.chat.generateAgentReplyWithCharge(userId, String(HOST_AGENT_ID), prompt, `voice_note_${callId}`),
@@ -216,18 +239,26 @@ export class VoiceDocumentService {
       const body = (reply.text || '').trim();
       if (!body) throw new Error('пустая заметка');
 
-      const saved = await this.notes.createNote(userId, title, body);
+      // Дополнение ОБНОВЛЯЕТ ту же заметку, а не плодит вторую (дефект владельца 11.10.2026).
+      const saved = prev
+        ? await this.notes.updateNote(userId, prev.id, title, body)
+        : await this.notes.createNote(userId, title, body);
       if (!saved.ok) {
         this.logger.warn(`заметка «${title}» не сохранилась: ${saved.error}`);
         await this.safeSend(roomName, { v: 1, type: 'note_failed', title, reason: 'error' });
         return;
+      }
+      const noteId = saved.id || prev?.id;
+      if (noteId) {
+        this.notesByCall.set(callId, { id: noteId, title, body });
       }
 
       await this.charge(userId, HOST_AGENT_ID, title, reply.tokens);
       await this.safeSend(roomName, {
         v: 1, type: 'note_ready', title, tokens: reply.tokens, text: body.slice(0, DOC_GIST_CHARS),
       });
-      this.logger.log(`заметка «${title}» сохранена в Заметки, ${body.length} знаков, ${reply.tokens} токенов`);
+      this.logger.log(`заметка «${title}» ${prev ? 'обновлена' : 'сохранена'} в Заметки, `
+        + `${body.length} знаков, ${reply.tokens} токенов`);
     } catch (e: any) {
       const timeout = /timeout|время/i.test(String(e?.message || ''));
       this.logger.error(`заметка «${title}» не получилась: ${e?.message}`);
@@ -281,6 +312,41 @@ export class VoiceDocumentService {
    * Обрезаем каждый: специалист мог проигнорировать просьбу о краткости и
    * написать трактат, а промпт документа не резиновый.
    */
+  /**
+   * Транскрипт звонка как текст для промпта.
+   *
+   * <p>Берётся из {@code voice_calls.transcript}: он пишется ПО ХОДУ разговора
+   * ({@code VoiceCallService.progress}), поэтому доступен и до завершения звонка — а
+   * заметку как раз просят посреди разговора.
+   *
+   * <p>Если разговор длиннее бюджета, берём ХВОСТ: просьба «запиши это» почти всегда
+   * относится к тому, о чём только что говорили. ⚠️ Для очень длинных разговоров это
+   * означает, что начало в заметку не попадёт — предел известен и назван, а не скрыт.
+   */
+  private async callTranscript(callId: string): Promise<string> {
+    try {
+      const res = await this.pg.query(
+        // ⚠️ Ключ звонка в voice_calls — id, а НЕ call_id (call_id есть у voice_call_jobs,
+        // соседнего запроса в этом же файле). Ошибка здесь не падает заметку: она уходит
+        // в catch ниже и даёт пустой транскрипт — то есть чинит ровно ничего, молча.
+        `SELECT transcript FROM voice_calls WHERE id = $1 LIMIT 1`, [callId],
+      );
+      const arr = res.rows?.[0]?.transcript;
+      if (!Array.isArray(arr) || arr.length === 0) return '';
+      const lines = arr
+        .filter((t: any) => t && typeof t.text === 'string' && t.text.trim())
+        .map((t: any) => `${t.role === 'assistant' ? 'Роман' : 'Человек'}: ${t.text.trim()}`);
+      const joined = lines.join('\n');
+      return joined.length <= NOTE_TRANSCRIPT_CHARS
+        ? joined
+        : joined.slice(joined.length - NOTE_TRANSCRIPT_CHARS);
+    } catch (e: any) {
+      // Заметка без транскрипта хуже, но лучше, чем провалившаяся заметка.
+      this.logger.warn(`транскрипт звонка ${callId} не прочитан: ${e?.message}`);
+      return '';
+    }
+  }
+
   private async specialistContext(callId: string): Promise<string> {
     try {
       const res = await this.pg.query(
