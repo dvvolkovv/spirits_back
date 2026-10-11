@@ -28,6 +28,12 @@ describe('CalendarService.decideQuickAdd', () => {
     expect((d as any).question).toBe('Во сколько?');
   });
 
+  it('КЕЙС ВЛАДЕЛЬЦА 11.10.2026 (вечер): «занятие Савы в 8:15» → СОЗДАЁМ, а не переспрос', () => {
+    const d = decide({ intent: 'add', kind: 'event', title: 'занятие Савы с Вероникой',
+                       date: '2026-10-12', time: '8:15' });
+    expect(d).toMatchObject({ kind: 'create', itemKind: 'event', time: '08:15', durationMin: 60 });
+  });
+
   it('КЕЙС ВЛАДЕЛЬЦА 11.10.2026: день+время без длительности → СОЗДАЁМ (час по умолчанию)', () => {
     const d = decide({ intent: 'add', kind: 'event', title: 'флюорография у Савы', date: '2026-10-12', time: '15:25' });
     expect(d).toMatchObject({ kind: 'create', itemKind: 'event', date: '2026-10-12', time: '15:25', durationMin: 60 });
@@ -91,6 +97,43 @@ describe('CalendarService.dateReference', () => {
     expect(ref).toContain('2026-08-23 — воскресенье');       // БАГ был: «воскресенье» уезжало на 24
     expect(ref).toContain('2026-08-24 — понедельник');
     expect(ref.split('\n')).toHaveLength(8);
+  });
+});
+
+describe('CalendarService.normalizeTime', () => {
+  // ⚠️ Баг владельца 11.10.2026: «занятие Савы с Вероникой в 8:15» не добавлялось, помощник
+  // переспрашивал время, которое уже названо. Проверка требовала ДВУХ цифр в часах, а люди
+  // говорят «в 8:15» и «в 9:00» — и модель возвращает ровно сказанное. Теряло все утренние
+  // события, то есть почти все детские занятия.
+  const t = (x: unknown) => CalendarService.normalizeTime(x);
+
+  it('одна цифра в часах принимается и дополняется нулём', () => {
+    expect(t('8:15')).toBe('08:15');
+    expect(t('9:00')).toBe('09:00');
+    expect(t('0:05')).toBe('00:05');
+  });
+
+  it('две цифры работают как раньше', () => {
+    expect(t('15:25')).toBe('15:25');
+    expect(t('08:15')).toBe('08:15');
+    expect(t('23:59')).toBe('23:59');
+  });
+
+  it('пробелы по краям не мешают', () => {
+    expect(t(' 8:15 ')).toBe('08:15');
+  });
+
+  it('не время — undefined', () => {
+    expect(t('3 часа')).toBeUndefined();
+    expect(t('утром')).toBeUndefined();
+    expect(t(null)).toBeUndefined();
+    expect(t(undefined)).toBeUndefined();
+    expect(t('815')).toBeUndefined();
+  });
+
+  it('формат соблюдён, а времени не существует — undefined', () => {
+    expect(t('25:00')).toBeUndefined();
+    expect(t('12:70')).toBeUndefined();
   });
 });
 

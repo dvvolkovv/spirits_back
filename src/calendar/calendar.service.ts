@@ -646,7 +646,7 @@ export class CalendarService {
         : undefined;
     const itemKind: 'event' | 'task' = parsed?.kind === 'task' || recurrence ? 'task' : 'event';
     const date = /^\d{4}-\d{2}-\d{2}$/.test(String(parsed?.date)) ? String(parsed.date) : undefined;
-    const time = /^\d{2}:\d{2}$/.test(String(parsed?.time)) ? String(parsed.time) : undefined;
+    const time = CalendarService.normalizeTime(parsed?.time);
     const durationMin = Number.isFinite(parsed?.durationMin) && Number(parsed.durationMin) > 0 ? Number(parsed.durationMin) : undefined;
     const deadline = typeof parsed?.deadline === 'string' && parsed.deadline ? `${parsed.deadline}${OFFSET}` : undefined;
 
@@ -667,6 +667,27 @@ export class CalendarService {
     // ошибается максимум в конце слота; переспрос ошибался в самом факте добавления.
     const duration = itemKind === 'event' ? durationMin || DEFAULT_EVENT_MIN : durationMin;
     return { kind: 'create', itemKind, title, date, time, durationMin: duration, recurrence, deadline };
+  }
+
+  /**
+   * Время к виду HH:MM — или undefined, если это не время.
+   *
+   * ⚠️ Раньше здесь стояла проверка `/^\d{2}:\d{2}$/`, и она молча теряла «8:15».
+   * Люди говорят «в 8:15», «в 9:00» — одна цифра в часах, — и модель возвращает ровно то,
+   * что сказано. Слот отбрасывался как невалидный, дальше шёл переспрос «Во сколько?» на
+   * фразу, где время названо. Для владельца это выглядело как заблокированное добавление:
+   * утренние занятия детей — как раз однозначные часы (owner 11.10.2026, «занятие Савы с
+   * Вероникой в 8:15»).
+   *
+   * Диапазон проверяем сами: «25:70» формату соответствует, временем не является.
+   */
+  static normalizeTime(raw: unknown): string | undefined {
+    const m = /^(\d{1,2}):(\d{2})$/.exec(String(raw ?? '').trim());
+    if (!m) return undefined;
+    const h = Number(m[1]);
+    const min = Number(m[2]);
+    if (!Number.isInteger(h) || !Number.isInteger(min) || h > 23 || min > 59) return undefined;
+    return `${String(h).padStart(2, '0')}:${m[2]}`;
   }
 
   /** Один совмещённый вопрос по недостающим слотам («Во сколько и на сколько по времени?»). */
