@@ -17,7 +17,11 @@ describe('VoiceCallInternalController: доступ', () => {
       fail: jest.fn(),
     };
     const docs = { create: jest.fn(() => ({ status: 'accepted', docId: 'd1', title: 'Письмо' })) };
-    return { ctl: new VoiceCallInternalController(jobs as any, calls as any, docs as any), jobs, calls, docs };
+    const calendar = { quickAddFromText: jest.fn(async () => ({ status: 'created', title: 'занятие Савы с Вероникой', whenText: 'завтра 08:15', kind: 'event' })) };
+    return {
+      ctl: new VoiceCallInternalController(jobs as any, calls as any, docs as any, null as any, calendar as any),
+      jobs, calls, docs, calendar,
+    };
   }
 
   beforeEach(() => { process.env.VOICE_CALLBACK_SECRET = SECRET; });
@@ -124,7 +128,7 @@ describe('VoiceCallInternalController: доступ', () => {
         sendChatMessage: jest.fn(async () => true),
       };
       return {
-        ctl: new VoiceCallInternalController(jobs as any, calls as any, docs as any, meetings as any),
+        ctl: new VoiceCallInternalController(jobs as any, calls as any, docs as any, meetings as any, null as any),
         meetings,
       };
     }
@@ -170,6 +174,28 @@ describe('VoiceCallInternalController: доступ', () => {
       meetings.attachBot.mockResolvedValue({ status: 'failed' });
       const res = await ctl.meetBot(signBody(SECRET, botRaw), req(botRaw));
       expect(res).toEqual({ status: 'failed' });
+    });
+  });
+
+  // ⚠️ Дефект владельца 11.10.2026: он попросил Романа в звонке добавить занятие — Роман
+  // не смог, и в логах нет даже ПОПЫТКИ. Причина: у него было пять инструментов
+  // (спросить специалиста, посмотреть расписание, список, заметка, документ) и ни одного
+  // на добавление. Ручки для голоса тоже не существовало.
+  describe('calendar-add: голосом можно ДОБАВИТЬ, а не только посмотреть', () => {
+    it('фраза целиком уходит в тот же разбор, что и у виджета', async () => {
+      const { ctl, calendar } = makeCtl();
+      const body = { callId: 'call-1', text: 'занятие Савы с Вероникой завтра в 8:15' };
+      const raw2 = JSON.stringify(body);
+      const res: any = await ctl.calendarAdd(signBody(SECRET, raw2), req(raw2));
+      expect(calendar.quickAddFromText).toHaveBeenCalledWith('u1', body.text);
+      expect(res.status).toBe('created');
+    });
+
+    it('без подписи — 401', async () => {
+      const { ctl, calendar } = makeCtl();
+      const raw2 = JSON.stringify({ callId: 'call-1', text: 'что-то' });
+      await expect(ctl.calendarAdd('нет', req(raw2))).rejects.toThrow();
+      expect(calendar.quickAddFromText).not.toHaveBeenCalled();
     });
   });
 });

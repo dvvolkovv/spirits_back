@@ -38,6 +38,7 @@ const TIMEOUT_MS: Record<string, number> = {
   schedule: 3_000,
   // Заметка, как и документ: ручка только ставит сочинение в очередь.
   note: 2_000,
+  'calendar-add': 30_000,
 };
 
 async function post<T>(path: string, body: unknown): Promise<T> {
@@ -130,6 +131,10 @@ export const backend = {
   note: (callId: string, title: string, instructions: string, append?: boolean) =>
     post<{ status: 'accepted'; title: string } | { status: 'rejected'; reason: string }>(
       'note', { callId, title, instructions, append }),
+  calendarAdd: (callId: string, text: string) =>
+    post<{ status: 'created' | 'clarify' | 'chat' | 'error'; question?: string; title?: string;
+           whenText?: string; kind?: string; error?: string }>(
+      'calendar-add', { callId, text }),
   meetBot: (callId: string, wsUrl: string) =>
     post<{ status: 'ok' | 'failed' }>('meet-bot', { callId, wsUrl }).then((r) => r.status === 'ok'),
 };

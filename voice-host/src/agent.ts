@@ -860,6 +860,34 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
           }
         },
       }),
+      add_to_calendar: llm.tool({
+        description:
+          'Добавить событие или дело в календарь пользователя. Используй, когда просят ' +
+          '«добавь», «запиши в календарь», «поставь встречу», «напомни такого-то числа». ' +
+          'Передавай фразу ЦЕЛИКОМ, как человек её сказал, вместе со временем и днём — ' +
+          'разбирает её та же машинка, что и в приложении. Если в ответе status=clarify, ' +
+          'в поле question лежит ровно один недостающий кусок: спроси его вслух и вызови ' +
+          'инструмент ещё раз, дописав ответ человека в фразу.',
+        parameters: z.object({
+          text: z.string().describe(
+            'Фраза целиком: что добавить, в какой день и во сколько. ' +
+            'Например «занятие Савы с Вероникой завтра в 8:15».',
+          ),
+        }),
+        execute: async ({ text }) => {
+          try {
+            const r = await backend.calendarAdd(meta.callId, text);
+            if (r.status === 'created') {
+              return { status: 'created', title: r.title, when: r.whenText, kind: r.kind };
+            }
+            if (r.status === 'clarify') return { status: 'clarify', question: r.question };
+            return { status: r.status, error: r.error };
+          } catch (e) {
+            console.error('add_to_calendar failed', e);
+            return { status: 'error', error: 'backend_unavailable' };
+          }
+        },
+      }),
       create_document: llm.tool({
         description:
           'Составить документ и положить его в чат с пользователем. Возвращается сразу, ' +

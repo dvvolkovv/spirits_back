@@ -5,6 +5,7 @@ import { VoiceCallService } from './voice-call.service';
 import { VoiceDocumentService } from './voice-document.service';
 import { verifyBody } from './hmac';
 import { MeetingService } from '../meeting/meeting.service';
+import { CalendarService } from '../calendar/calendar.service';
 import { AskResult, CompletePayload, DocumentResult, NoteResult } from './voice-call.types';
 
 /**
@@ -23,6 +24,7 @@ export class VoiceCallInternalController {
     private readonly calls: VoiceCallService,
     private readonly docs: VoiceDocumentService,
     private readonly meetings: MeetingService,
+    private readonly calendar: CalendarService,
   ) {}
 
   /**
@@ -122,6 +124,33 @@ export class VoiceCallInternalController {
     return this.docs.createNote(
       body.callId, call.room_name, call.user_id, body.title, body.instructions, body.append,
     );
+  }
+
+  /**
+   * Добавить событие/дело по фразе, сказанной ВСЛУХ.
+   *
+   * ⚠️ До 11.10.2026 этой ручки не было, и у Романа не было инструмента добавления
+   * вообще: он умел посмотреть расписание, но не записать в него. Владелец попросил его
+   * в звонке добавить занятие — Роман не смог, и в логах нет даже попытки, потому что
+   * вызывать было нечего.
+   *
+   * Разбор тот же самый, что у виджета лаунчера ({@code quickAddFromText}) — один разбор
+   * на все входы: что починено для виджета, автоматически работает и голосом.
+   */
+  @Post('calendar-add')
+  async calendarAdd(
+    @Headers('x-voice-signature') signature: string,
+    @Req() req: Request,
+  ) {
+    const body = this.parseSigned<{ callId: string; text: string }>(req, signature);
+    const call = await this.calls.load(body.callId);
+    if (!this.calls.isActive(call)) {
+      this.logger.warn(`[calendar-add] call=${body.callId} не активен (${call.status})`);
+      return { status: 'error', error: 'звонок не активен' };
+    }
+    const res = await this.calendar.quickAddFromText(String(call.user_id), body.text || '');
+    this.logger.log(`[calendar-add] call=${body.callId} «${body.text}» → ${res.status}`);
+    return res;
   }
 
   @Post('progress')
