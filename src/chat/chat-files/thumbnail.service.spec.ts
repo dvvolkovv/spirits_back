@@ -8,7 +8,16 @@ beforeAll(async () => {
   PNG = await sharp({ create: { width: 800, height: 600, channels: 3, background: '#3366ff' } }).png().toBuffer();
 });
 
-function fakeStorage(opts: { thumbExists?: boolean; sourceSize?: number; sourceMissing?: boolean; downloadDelayMs?: number } = {}) {
+function fakeStorage(
+  opts: {
+    thumbExists?: boolean;
+    sourceSize?: number;
+    sourceMissing?: boolean;
+    downloadDelayMs?: number;
+    /** Ключи, у которых download никогда не разрешается — имитация зависшего MinIO. */
+    hangKeys?: Set<string>;
+  } = {},
+) {
   const uploads: any[] = [];
   let downloading = 0;
   let maxDownloading = 0;
@@ -18,7 +27,8 @@ function fakeStorage(opts: { thumbExists?: boolean; sourceSize?: number; sourceM
       if (b === THUMB_BUCKET && k.startsWith('thumbs/')) return opts.thumbExists ? { size: 10 } : null;
       return opts.sourceMissing ? null : { size: opts.sourceSize ?? PNG.length };
     }),
-    download: jest.fn(async () => {
+    download: jest.fn(async (input: { key: string }) => {
+      if (opts.hangKeys?.has(input.key)) return new Promise<Buffer>(() => {});
       downloading++;
       maxDownloading = Math.max(maxDownloading, downloading);
       if (opts.downloadDelayMs) await new Promise((r) => setTimeout(r, opts.downloadDelayMs));
@@ -92,4 +102,28 @@ describe('ThumbnailService.resolve', () => {
     const results = await Promise.allSettled(runs);
     expect(results.filter((r) => r.status === 'rejected')).toHaveLength(1);
   });
+
+  it(
+    'работа зависла после слота — отказ по сроку, слот освобождается для других',
+    async () => {
+      const hangKeys = new Set(['u/hang1.png', 'u/hang2.png']);
+      const { storage } = fakeStorage({ hangKeys });
+      const svc = new ThumbnailService(storage as any);
+
+      // Два зависших download'а занимают оба места (THUMB_CONCURRENCY = 2).
+      const hangs = ['u/hang1.png', 'u/hang2.png'].map((key) =>
+        svc.resolve({ bucket: 'linkeon-chat-files', key }, 1000, 50),
+      );
+      const hangResults = await Promise.allSettled(hangs);
+      expect(hangResults.every((r) => r.status === 'rejected')).toBe(true);
+      for (const r of hangResults) {
+        expect((r as PromiseRejectedResult).reason.message).toMatch(/не уложилась/);
+      }
+
+      // Места освободились — обычный запрос проходит, а не ждёт зависших навечно.
+      const normalSrc = { bucket: 'linkeon-chat-files', key: 'u/normal.png' };
+      expect(await svc.resolve(normalSrc, 1000, 50)).toBe(thumbUrl(normalSrc));
+    },
+    2000,
+  );
 });

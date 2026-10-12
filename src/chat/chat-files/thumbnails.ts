@@ -11,6 +11,8 @@ import { encodeStrict, safeDecode } from './file-meta';
  * штатно. Типы берём из старой lib/index.d.ts пакета (callable + namespace,
  * как в более ранних версиях sharp) — путь используется только как
  * type-запрос `typeof import(...)`, компилятор его в рантайм не эмитит.
+ * При обновлении sharp проверить, что lib/index.d.ts ещё есть: иначе
+ * упадёт только tsc, рантайм не затронут.
  */
 const sharp = require('sharp') as unknown as typeof import('sharp/lib/index');
 
@@ -30,6 +32,8 @@ export const THUMB_MAX_SOURCE_BYTES = 25 * 1024 * 1024;
 export const THUMB_CONCURRENCY = 2;
 /** Дольше ждать очереди не стоит: отдаём оригинал. */
 export const THUMB_QUEUE_WAIT_MS = 10_000;
+/** Срок на одну миниатюру после того, как она получила место: зависший MinIO или sharp не держат место вечно. */
+export const THUMB_WORK_TIMEOUT_MS = 20_000;
 
 const MAX_SRC_LENGTH = 300;
 const IMAGE_EXT_RE = /\.(jpe?g|png|webp|gif)$/i;

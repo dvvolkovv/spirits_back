@@ -21,6 +21,20 @@ describe('StorageService.head', () => {
     const err = Object.assign(new Error('Access Denied.'), { name: 'AccessDenied', $metadata: { httpStatusCode: 403 } });
     await expect(svcWith(jest.fn().mockRejectedValue(err)).head('b', 'k')).rejects.toThrow('Access Denied.');
   });
+
+  it('abortSignal уходит в send — проверку можно оборвать', async () => {
+    const send = jest.fn().mockResolvedValue({ ContentLength: 1 });
+    const s = svcWith(send);
+    const ctl = new AbortController();
+    await s.head('b', 'k', ctl.signal);
+    expect(send.mock.calls[0][1]?.abortSignal).toBe(ctl.signal);
+  });
+
+  it('без abortSignal send зовётся как раньше — одним аргументом', async () => {
+    const send = jest.fn().mockResolvedValue({ ContentLength: 1 });
+    await svcWith(send).head('b', 'k');
+    expect(send.mock.calls[0]).toHaveLength(1);
+  });
 });
 
 describe('StorageService.bucketStats', () => {
