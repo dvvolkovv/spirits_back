@@ -41,10 +41,14 @@ export interface SelectedProfile {
   found: FoundProfile;
 }
 
-/** Совпавшие узлы профиля для промпта: топ-5 с персональным gloss. */
-function topHits(p: FoundProfile, indent: string): string {
+/**
+ * Совпавшие узлы профиля для промпта: топ-5 с персональным gloss. Оценки
+ * совпадения — только для выбора: в прозе модель пересказывала их
+ * пользователю («cos=0.62»).
+ */
+function topHits(p: FoundProfile, indent: string, withScore: boolean): string {
   return p.matches.slice(0, 5)
-    .map((h) => `${indent}• [${h.category}] "${h.name}" (cos=${h.score.toFixed(2)}): ${h.gloss}`)
+    .map((h) => `${indent}• [${h.category}] "${h.name}"${withScore ? ` (cos=${h.score.toFixed(2)})` : ''}: ${h.gloss}`)
     .join('\n');
 }
 
@@ -52,7 +56,7 @@ function topHits(p: FoundProfile, indent: string): string {
 export function buildSelectionPrompt(found: FoundProfile[], language: string): string {
   const block = found.map((p, i) => {
     const nameLabel = p.name ? ` (${p.name})` : '';
-    return `#${i + 1}${nameLabel}, totalScore=${p.totalScore.toFixed(2)}\n${topHits(p, '    ')}`;
+    return `#${i + 1}${nameLabel}, totalScore=${p.totalScore.toFixed(2)}\n${topHits(p, '    ', true)}`;
   }).join('\n\n');
 
   return `Ты — помощник по поиску единомышленников на платформе my.linkeon.io.
@@ -62,12 +66,12 @@ export function buildSelectionPrompt(found: FoundProfile[], language: string): s
 Найденные профили:
 ${block}
 
-Твоя задача — выбрать, кого показать пользователю. Семантический поиск грубый: часть профилей попала сюда по случайным совпадениям. Оставь тех, кто действительно отвечает на запрос, — судя по matched gloss, а не по общим словам. Порядок — от самого подходящего.
+Твоя задача — выбрать, кого показать пользователю. Семантический поиск грубый: часть профилей попала сюда по случайным совпадениям слов — таких не показывай. Оставь тех, кто отвечает на запрос, судя по matched gloss, а не по общим словам. Если прямых совпадений нет — оставь близких по смыслу и в matchReason честно скажи, чем именно близок. Порядок — от самого подходящего.
 
 Ответь ТОЛЬКО JSON-массивом, без пояснений и без markdown:
 [{"ref":<номер профиля из списка выше>,"name":"<имя или короткое описание роли>","values":["val1"],"intents":[],"interests":[],"skills":[],"matchReason":"<1 предложение: почему подошёл, по matched gloss>"}]
 
-Поля values/interests/intents/skills заполни ТЕМИ canonical-именами узлов, которые совпали. Если по-честному не подходит никто — ответь [].
+Поля values/interests/intents/skills заполни ТЕМИ canonical-именами узлов, которые совпали. Пустой массив [] — только если с запросом не связан никто, даже косвенно.
 В name и matchReason КАТЕГОРИЧЕСКИ НЕЛЬЗЯ упоминать телефонные номера, phone, userId, цифровые идентификаторы.
 name и matchReason пиши на языке пользователя (см. ниже). Имена полей JSON — служебные, их НЕ переводи.
 ${LanguageService.buildDirective(language)}`;
@@ -126,7 +130,7 @@ export function selectSearchProfiles(found: FoundProfile[], selection: unknown[]
 export function buildProsePrompt(selected: SelectedProfile[], language: string): string {
   const block = selected.map(({ card, found }, i) => {
     const reason = card.matchReason ? ` — ${card.matchReason}` : '';
-    return `${i + 1}. «${card.name}»${reason}\n${topHits(found, '   ')}`;
+    return `${i + 1}. «${card.name}»${reason}\n${topHits(found, '   ', false)}`;
   }).join('\n\n');
 
   return `Ты — помощник по поиску единомышленников на платформе my.linkeon.io.
@@ -137,6 +141,7 @@ ${block}
 
 Напиши 2-3 предложения — краткий и конкретный комментарий, ПОЧЕМУ эти люди подошли. Ссылайся на matched gloss, а не на общие слова.
 Называй людей так, как они подписаны на карточках, или по месту в этом списке («первый», «второй»). Других людей и других номеров нет: пользователь видит только эти карточки.
+О самом пользователе ты знаешь только его запрос — не приписывай ему ценностей и интересов.
 КАТЕГОРИЧЕСКИ НЕЛЬЗЯ упоминать телефонные номера, phone, userId, цифровые идентификаторы — ни в скобках, ни в кавычках, ни в виде списка. Никогда.
 Пиши только комментарий: без JSON и без перечня карточек — их пользователь уже видит.
 ${LanguageService.buildDirective(language)}`;
