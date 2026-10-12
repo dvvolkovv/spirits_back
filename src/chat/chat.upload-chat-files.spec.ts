@@ -85,7 +85,7 @@ describe('uploadAndChat — файлы хода в нашем хранилище
     const store = { persist: jest.fn(async (urls: string[]) => new Map(urls.map((u) => [u, STORED]))) };
     const { res, saved } = await run(store);
 
-    expect(store.persist).toHaveBeenCalledWith([RELAY_FILE]);
+    expect(store.persist).toHaveBeenCalledWith([RELAY_FILE], { userId: 'u1' });
     const items = res.written.filter((w: any) => w.type === 'item').map((w: any) => w.content);
     expect(items).toContain(`\n\n[Скачать scan.docx](${STORED})`);
     expect(res.written.find((w: any) => w.type === 'end').content).toContain(STORED);

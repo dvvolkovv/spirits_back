@@ -152,7 +152,7 @@ describe('streamUniversalAgent — файлы хода в нашем храни�
     // Второй аргумент — остаток бюджета хода на копирование (fix 4): один
     // дедлайн на все вызовы storeRelayLinks за ход, а не свой полный
     // PERSIST_TURN_BUDGET_MS на каждый.
-    expect(store.persist).toHaveBeenCalledWith([RELAY_FILE], { budgetMs: expect.any(Number) });
+    expect(store.persist).toHaveBeenCalledWith([RELAY_FILE], { budgetMs: expect.any(Number), userId: 'u1' });
     const link = items(h.written).find((c) => c.includes('Скачать report.pdf'));
     expect(link).toBe(`\n\n[Скачать report.pdf](${STORED})`);
     const saved = persistedAiText(h.pgCalls);
