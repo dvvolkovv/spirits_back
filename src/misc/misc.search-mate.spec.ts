@@ -201,6 +201,29 @@ describe('MiscService.searchMate: проза и карточки об одних
     expect(view.cards).toEqual([]);
   });
 
+  it('карточки уходят мелкими строками с паузой, как раньше дельты модели', async () => {
+    // Веб и приложение на Capacitor режут поток по '\n' в пределах одного
+    // чтения и теряют строку, разрезанную границей чтения. nginx перед API
+    // читает из сокета буфером в страницу (proxy_buffering off), и строка
+    // с десятью карточками (~6 КБ) этой границы не миновала бы.
+    modelAnswers(JSON.stringify([COACH, CONSULTANT, TRAINER]), PROSE);
+    const svc = makeService();
+    const stamps: Array<{ at: number; content: string }> = [];
+    const { res } = makeRes();
+    res.write.mockImplementation((s: string) => {
+      const ev = JSON.parse(s);
+      stamps.push({ at: Date.now(), content: ev.content });
+      return true;
+    });
+    await svc.searchMate('u1', 'коуч', res);
+
+    const from = stamps.findIndex((w) => w.content.includes('search_result:'));
+    const pieces = stamps.slice(from);
+    expect(pieces.length).toBeGreaterThan(1);
+    for (const p of pieces) expect(Array.from(p.content).length).toBeLessThanOrEqual(200);
+    for (let i = 1; i < pieces.length; i++) expect(pieces[i].at - pieces[i - 1].at).toBeGreaterThanOrEqual(5);
+  });
+
   it('проза не удалась — карточки всё равно приходят', async () => {
     const view = await search(JSON.stringify([COACH, TRAINER]), new Error('relay down'));
     expect(view.cards.map((c) => c.userId)).toEqual([idOf(4), idOf(8)]);
