@@ -11,6 +11,7 @@ import { CalEvent } from '../calendar/calendar.types';
 import { Recurrence, expandOccurrences } from '../calendar/recurrence';
 import { SpeechService } from '../speech/speech.service';
 import { TOP_UP_URL } from '../tokens/balance-context.service';
+import { HumanDesignToolService, type HdToolResult } from '../human-design/hd-tool.service';
 
 /**
  * Единый ответ инструмента на нехватку токенов.
@@ -320,9 +321,40 @@ export const CHAT_TOOLS = [
       required: ['text'],
     },
   },
+  {
+    name: 'calculate_human_design',
+    description:
+      'Рассчитать карту Human Design (дизайн человека) и нарисовать бодиграф — тем же модулем, что калькулятор ' +
+      'на linkeon.io/calculators/human-design/: карта в чате и на сайте совпадает. Вход: дата, местное время и ' +
+      'город рождения. Ответ kind="chart" — тип, стратегия, авторитет, профиль, определённость, определённые и ' +
+      'открытые центры, каналы, 26 активаций (ворота и линия) и imageUrl картинки бодиграфа: вставь её в ответ ' +
+      'отдельной строкой ![](imageUrl). kind="choose_city" — подходящих городов несколько: спроси человека, какой ' +
+      '(регион, страна), и вызови снова с cityId выбранного варианта. kind="choose_dst" — время попало в час ' +
+      'перевода стрелок: спроси, по часам до перевода или после, и вызови снова с dst. Ошибка «город не найден» — ' +
+      'спроси ближайший крупный город в том же часовом поясе. Бесплатно.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        date: { type: 'string', description: 'Дата рождения, YYYY-MM-DD.' },
+        time: { type: 'string', description: 'Местное время рождения, HH:MM (24 часа).' },
+        city: {
+          type: 'string',
+          description: 'Город рождения, как назвал человек; можно с регионом через запятую: «Кировск, Мурманская область».',
+        },
+        cityId: { type: 'integer', description: 'Номер города из вариантов прошлого ответа choose_city.' },
+        dst: {
+          type: 'string',
+          enum: ['before', 'after'],
+          description: 'Ответ на вопрос о переводе стрелок: по часам до перевода или после.',
+        },
+      },
+      required: ['date', 'time', 'city'],
+    },
+  },
 ];
 
 export type ToolResult =
+  | HdToolResult
   | { ok: true; kind: 'image'; imageUrl: string; tokensSpent: number }
   | {
       ok: true;
@@ -437,10 +469,16 @@ export class ChatToolsService {
     private readonly routines: RoutineStore,
     private readonly calendar: CalendarService,
     private readonly speech: SpeechService,
+    private readonly humanDesign: HumanDesignToolService,
   ) {}
 
   async executeTool(userId: string, name: string, input: any): Promise<ToolResult> {
     try {
+      if (name === 'calculate_human_design') {
+        // Бесплатный расчёт: токены не списываются, userId нужен только
+        // контроллеру /mcp для журнала вызовов.
+        return await this.humanDesign.calculate(input);
+      }
       if (name === 'manage_routine') {
         const action = ['disable', 'list'].includes(input?.action) ? input.action : 'enable';
 

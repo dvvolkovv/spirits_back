@@ -15,9 +15,10 @@ import { ChatFilesController } from './chat-files/chat-files.controller';
 import { ChatFilesService } from './chat-files/chat-files.service';
 import { ChatThumbController } from './chat-files/chat-thumb.controller';
 import { ThumbnailService } from './chat-files/thumbnail.service';
+import { HumanDesignModule } from '../human-design/human-design.module';
 
 @Module({
-  imports: [MiscModule, CommonModule, RoomModule, VideoModule, CalendarModule, TalerIdModule, SpeechModule, TokensModule],
+  imports: [MiscModule, CommonModule, RoomModule, VideoModule, CalendarModule, TalerIdModule, SpeechModule, TokensModule, HumanDesignModule],
   controllers: [ChatController, ChatFilesController, ChatThumbController],
   providers: [ChatService, ChatToolsService, ChatFileStore, ChatFilesService, ThumbnailService],
   exports: [ChatToolsService, ChatService, ChatFilesService],
