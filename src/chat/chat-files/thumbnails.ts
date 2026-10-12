@@ -1,8 +1,18 @@
 import { createHash } from 'crypto';
-// export = sharp: без esModuleInterop только так (default-импорт дал бы undefined).
-import sharp = require('sharp');
 import { chatFilesBucket } from './chat-file-store';
 import { encodeStrict, safeDecode } from './file-meta';
+
+/**
+ * export = sharp: без esModuleInterop только так (default-импорт дал бы
+ * undefined). У sharp 0.35 package.json "types" указывает на ESM-декларацию
+ * (dist/index.d.mts), которая под classic/node10-резолвом TypeScript даёт
+ * неразыменовываемый namespace («This expression is not callable»); реальный
+ * require уходит через "exports"."require" на dist/index.cjs и работает
+ * штатно. Типы берём из старой lib/index.d.ts пакета (callable + namespace,
+ * как в более ранних версиях sharp) — путь используется только как
+ * type-запрос `typeof import(...)`, компилятор его в рантайм не эмитит.
+ */
+const sharp = require('sharp') as unknown as typeof import('sharp/lib/index');
 
 /**
  * Миниатюры картинок для панели «Медиа и файлы»
