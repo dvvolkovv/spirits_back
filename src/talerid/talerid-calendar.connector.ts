@@ -54,6 +54,28 @@ function endOffsetIso(startOffsetIso: string, durationMin: number): string {
  * never breaks because TalerID is unavailable.
  */
 @Injectable()
+/**
+ * TalerID не подключён у этого пользователя.
+ *
+ * ⚠️ Это НЕ сбой, а законное «источника нет»: пустой календарь тут — правда. Отличать от
+ * сбоя обязательно, потому что реакция разная: про неподключённый источник человеку
+ * говорить нечего, а про недозвон — обязательно (иначе он видит пустоту и думает, что
+ * события пропали; ровно это и случилось у владельца 11.10.2026 при 429 от TalerID).
+ */
+export class NotConnected extends Error {
+  constructor() {
+    super('talerid: not connected (no access token)');
+    this.name = 'NotConnected';
+  }
+}
+
+/** Источник не ответил: таймаут, 429, транспортная ошибка. Человеку это показываем. */
+export class SourceUnavailable extends Error {
+  constructor(readonly source: string, cause: unknown) {
+    super(`${source}: ${(cause as any)?.message || cause}`);
+    this.name = 'SourceUnavailable';
+  }
+}
 export class TalerIdCalendarConnector {
   private readonly logger = new Logger(TalerIdCalendarConnector.name);
 
@@ -67,7 +89,7 @@ export class TalerIdCalendarConnector {
    */
   protected async callTool(userId: string, name: string, args: Record<string, any>): Promise<any> {
     const token = await this.oauth.getBackendAccessToken(userId);
-    if (!token) throw new Error('talerid: not connected (no access token)');
+    if (!token) throw new NotConnected();
 
     const transport = new StreamableHTTPClientTransport(new URL(mcpBaseUrl()), {
       requestInit: { headers: { Authorization: `Bearer ${token}` } },
@@ -130,8 +152,14 @@ export class TalerIdCalendarConnector {
       }
       return out;
     } catch (e: any) {
-      this.logger.debug(`talerid listEvents degraded to [] for user ${userId}: ${e?.message}`);
-      return [];
+      if (e instanceof NotConnected) {
+        this.logger.debug(`talerid listEvents: не подключён у ${userId} — пустой календарь это правда`);
+        return [];
+      }
+      // ⚠️ Раньше здесь был `return []`, и человек видел пустой календарь вместо ошибки.
+      // Владелец 11.10.2026: «в десктопе есть, телефон не видит» — это был 429 от TalerID.
+      this.logger.warn(`talerid listEvents НЕДОСТУПЕН для ${userId}: ${e?.message}`);
+      throw new SourceUnavailable('TalerID', e);
     }
   }
 
@@ -247,6 +275,8 @@ export class TalerIdCalendarConnector {
   }
 
   async listTasks(userId: string, start: Date, end: Date, now: Date): Promise<Task[]> {
+    let schedErr: any = null;
+    let flatErr: any = null;
     try {
       const from = start.toISOString().slice(0, 10);
       let to = end.toISOString().slice(0, 10);
@@ -259,13 +289,16 @@ export class TalerIdCalendarConnector {
       const [sched, flat] = await Promise.all([
         this.callTool(userId, 'list_schedule', { from, to }).catch((e: any) => {
           this.logger.debug(`talerid list_schedule degraded for user ${userId}: ${e?.message}`);
-          return null;
+          return e instanceof NotConnected ? null : (schedErr = e, null);
         }),
         this.callTool(userId, 'list_tasks', { from, to, includeDone: true }).catch((e: any) => {
           this.logger.debug(`talerid list_tasks degraded for user ${userId}: ${e?.message}`);
-          return null;
+          return e instanceof NotConnected ? null : (flatErr = e, null);
         }),
       ]);
+      // ⚠️ Обе половины недоступны — это сбой источника, а не «дел нет». Одна из двух —
+      // ещё терпимо: вторая принесёт свою часть, и список будет неполным, но не пустым.
+      if (schedErr && flatErr) throw new SourceUnavailable('TalerID', schedErr);
       const schedTasks = Array.isArray(sched?.tasks) ? sched.tasks : [];
       const flatRows = Array.isArray(flat) ? flat : Array.isArray(flat?.tasks) ? flat.tasks : [];
       // Рутины — из schedule (в нём recurrence+occurrences). ⚠️ list_schedule отдаёт НЕ ТОЛЬКО
@@ -331,8 +364,12 @@ export class TalerIdCalendarConnector {
       }
       return out;
     } catch (e: any) {
-      this.logger.debug(`talerid listTasks degraded to [] for user ${userId}: ${e?.message}`);
-      return [];
+      if (e instanceof NotConnected) {
+        this.logger.debug(`talerid listTasks: не подключён у ${userId}`);
+        return [];
+      }
+      this.logger.warn(`talerid listTasks НЕДОСТУПЕН для ${userId}: ${e?.message}`);
+      throw new SourceUnavailable('TalerID', e);
     }
   }
 

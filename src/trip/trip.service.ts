@@ -249,23 +249,43 @@ export class TripService implements OnModuleInit {
     const now = new Date();
     const start = now;
     const end = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-    const [vtodoTasks, linkeonTasks, icsEvents, taleridEvents, taleridTasks] = await Promise.all([
+    // ⚠️ allSettled, а НЕ all: источник, который не ответил, обязан быть НАЗВАН, а не
+    // превратиться в пустоту. Владелец 11.10.2026: «в десктопе есть, телефон не видит» —
+    // это TalerID отвечал 429, коннектор возвращал [], и человек видел пустой день вместо
+    // ошибки. Пустой календарь и недоступный календарь выглядели одинаково.
+    const settled = await Promise.allSettled([
       this.calendar.listTasks(userId, start, end),
       // Дела/рутины Линкеона [«дом дел», 2026-08-01] — облачная правда, наш стор.
       this.linkeonTasks.list(userId, start, end, now),
       this.calendar.listEvents(userId, start, end),
-      // TalerID-календарь — ещё один источник событий [6ad042df]. Коннектор best-effort:
-      // при не-подключённом TalerID / ошибке MCP вернёт [], со-пилот не ломается.
+      // TalerID-календарь — ещё один источник событий [6ad042df].
       this.taleridCalendar.listEvents(userId, start, end),
-      // Дела/рутины TalerID [Фаза 2 спеки live 2026-08-02] — ещё один источник дел, best-effort.
+      // Дела/рутины TalerID [Фаза 2 спеки live 2026-08-02].
       this.taleridCalendar.listTasks(userId, start, end, now),
     ]);
+    const SOURCE_NAMES = ['Календарь', 'Дела Линкеона', 'Календарь', 'TalerID', 'TalerID'];
+    const degraded: string[] = [];
+    const pick = <T>(i: number): T[] => {
+      const r = settled[i];
+      if (r.status === 'fulfilled') return r.value as T[];
+      const name = SOURCE_NAMES[i];
+      if (!degraded.includes(name)) degraded.push(name);
+      this.logger.warn(`[trip] источник «${name}» недоступен: ${(r.reason as any)?.message}`);
+      return [];
+    };
+    const vtodoTasks = pick<any>(0);
+    const linkeonTasks = pick<any>(1);
+    const icsEvents = pick<any>(2);
+    const taleridEvents = pick<any>(3);
+    const taleridTasks = pick<any>(4);
     // Дела: линкеоновские (наш стор) + внешние VTODO (Яндекс) + TalerID — источник несёт t.source.
     const tasks = [...linkeonTasks, ...vtodoTasks, ...taleridTasks];
     const events = mergeEvents(icsEvents, taleridEvents);
     const state = computeCopilotState({ tasks, events, now: new Date() });
     // Pending-предложения агента [a5131311] — докладываем в стейт (чистая computeCopilotState их не
     // знает, это async из БД). Absent-safe: пустой список → лаунчер ничего не показывает.
+    // Названный источник доезжает до экрана: лаунчер показывает «часть данных не получена».
+    if (degraded.length) state.degraded = degraded;
     const pending = await this.calendar.listPendingProposals(userId);
     // Контентный дедуп [фикс дублей 2026-07-29]: не предлагаем добавить то, что УЖЕ есть в календаре.
     // Кроет кросс-поверхностный вектор: событие создали в чате (POST /calendar/events, статус
