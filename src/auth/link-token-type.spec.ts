@@ -51,7 +51,8 @@ describe('JwtService.verifyAccess', () => {
   });
 
   it.each(notAccess)('отвергает токен %s', (_name, make) => {
-    expect(() => jwt.verifyAccess(make())).toThrow();
+    // Именно наш отказ: «метода нет» тоже бросает, и тест прошёл бы впустую.
+    expect(() => jwt.verifyAccess(make())).toThrow('not an access token');
   });
 });
 
