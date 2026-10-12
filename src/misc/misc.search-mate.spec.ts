@@ -142,6 +142,9 @@ describe('MiscService.searchMate: проза и карточки об одних
     expect(prosePrompt).toMatch(/^3\. «Тренер»/m);
     expect(prosePrompt).not.toMatch(/^4\. /m);
     expect(prosePrompt).not.toMatch(/#\d/);
+    // Служебные оценки поиска в промпте прозы модель цитирует пользователю
+    // («совпадение cos=0.62») — поймано прогоном на живых данных.
+    expect(prosePrompt).not.toMatch(/cos=|totalScore/);
     expect(prosePrompt.indexOf(GLOSS[3])).toBeLessThan(prosePrompt.indexOf(GLOSS[5]));
     expect(prosePrompt.indexOf(GLOSS[5])).toBeLessThan(prosePrompt.indexOf(GLOSS[7]));
 
