@@ -8,6 +8,7 @@ import {
   Headers,
   UnauthorizedException,
   Logger,
+  Optional,
 } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -21,6 +22,7 @@ import { ProductToolChannel, ProductToolClaims, verifyProductToolToken } from '.
 import { ChatFilesService } from '../chat/chat-files/chat-files.service';
 import { FIND_FILES_TOOL, FIND_FILES_TOOL_NAME } from '../chat/chat-files/find-files.tool';
 import { parseFindFilesInput } from '../chat/chat-files/find-files';
+import { EventsService } from '../events/events.service';
 
 /**
  * Отдельная точка, а не ветка в /mcp, СОЗНАТЕЛЬНО.
@@ -49,6 +51,7 @@ export class ProductsMcpController {
   constructor(
     private readonly tool: ProductToolService,
     private readonly files: ChatFilesService,
+    @Optional() private readonly events?: EventsService,
   ) {}
 
   /** Владелец и канал из Bearer. Бросает — значит звать инструмент нечем. */
@@ -87,7 +90,15 @@ export class ProductsMcpController {
     if (!this.toolsFor(channel).some((t) => t.name === name)) {
       return { ok: false, error: `Неизвестный инструмент: ${name}` };
     }
-    if (name === FIND_FILES_TOOL_NAME) return this.files.searchForUser(userId, parseFindFilesInput(input));
+    if (name === FIND_FILES_TOOL_NAME) {
+      const result = await this.files.searchForUser(userId, parseFindFilesInput(input));
+      // Статистика админки: сколько отдали модели и сколько из этого можно скачать.
+      this.events?.track('find_files_call', {
+        userId,
+        props: { channel, found: result.files.length, stored: result.files.filter((f) => f.stored).length },
+      });
+      return result;
+    }
     return this.tool.execute(userId, input, channel);
   }
 
