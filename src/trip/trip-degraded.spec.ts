@@ -13,9 +13,12 @@ describe('TripService: недоступный источник называет�
   const ok = <T>(v: T) => jest.fn(async () => v);
 
   function makeSvc(taleridEvents: () => Promise<any[]>) {
+    // Время — от «сейчас»: событие без end считается закончившимся через час,
+    // и зашитая дата (было 2026-10-12T08:15+05:00) роняла тест в тот же день.
+    const soon = new Date(Date.now() + 2 * 3_600_000).toISOString();
     const calendar = {
       listTasks: ok([]),
-      listEvents: ok([{ at: '2026-10-12T08:15:00+05:00', title: 'занятие Савы', conflict: false }]),
+      listEvents: ok([{ at: soon, title: 'занятие Савы', conflict: false }]),
       listPendingProposals: ok([]),
     };
     // Порядок зависимостей: pg, calendar, taleridCalendar, linkeonTasks.

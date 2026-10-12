@@ -1,4 +1,4 @@
-import { TalerIdCalendarConnector } from './talerid-calendar.connector';
+import { TalerIdCalendarConnector, SourceUnavailable } from './talerid-calendar.connector';
 
 describe('TalerIdCalendarConnector', () => {
   function makeOauth(overrides: Partial<Record<string, jest.Mock>> = {}) {
@@ -192,14 +192,14 @@ describe('TalerIdCalendarConnector', () => {
       expect(result).toEqual([]);
     });
 
-    it('MCP error thrown -> []', async () => {
+    // С fd40f2a сбой — не пустой календарь: коннектор поднимает SourceUnavailable,
+    // и TripService называет источник (trip-degraded.spec.ts).
+    it('MCP error thrown -> SourceUnavailable', async () => {
       const oauth = makeOauth();
       const connector = new TalerIdCalendarConnector(oauth);
       jest.spyOn(connector as any, 'callTool').mockRejectedValue(new Error('mcp down'));
 
-      const result = await connector.listEvents('user-1', new Date(), new Date());
-
-      expect(result).toEqual([]);
+      await expect(connector.listEvents('user-1', new Date(), new Date())).rejects.toBeInstanceOf(SourceUnavailable);
     });
 
     it('parse/shape error (unexpected payload) -> []', async () => {
