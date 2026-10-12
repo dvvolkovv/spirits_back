@@ -174,6 +174,8 @@ maybe('инструмент продуктов против живого Postgre
       expect(out.ok).toBe(true);
       expect(out.products).toEqual([]);
       expect(out.say).toMatch(/нет|ни одного/i);
+      // Отдельного пункта «Продукты» в меню нет — это вкладка Студии.
+      expect(out.say).toMatch(/в Студии, вкладка «Продукты»/);
     });
 
     it('архивированные не показываются', async () => {

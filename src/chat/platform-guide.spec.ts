@@ -1,5 +1,5 @@
 import { ChatService } from './chat.service';
-import { platformGuide, TOOLS_LIST_NOTE } from './platform-guide';
+import { platformGuide, platformSections, TOOLS_LIST_NOTE } from './platform-guide';
 import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
 
 /**
@@ -38,6 +38,14 @@ describe('текст блока', () => {
 
     expect(platformGuide('zh')).toContain('«工作室»');
     expect(platformGuide('pt')).toContain('«Estúdio»');
+  });
+
+  it('перечень разделов — отдельно от вступления: его берёт и ИИ-поддержка', () => {
+    const s = platformSections('ru');
+    expect(platformGuide('ru')).toContain(s);
+    expect(s).toMatch(/^• «Чат с ассистентом»/);
+    expect(s).not.toContain('ЧТО ЕСТЬ В LINKEON');
+    expect(s).not.toMatch(/предложи «Связаться с поддержкой»/);
   });
 
   it('незнакомый язык — русские подписи', () => {

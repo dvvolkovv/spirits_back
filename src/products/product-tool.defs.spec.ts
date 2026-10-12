@@ -19,6 +19,11 @@ describe('определение инструмента продуктов', () 
     expect(p.check.type).toBe('boolean');
   });
 
+  it('новый продукт — кнопкой в Студии: отдельного пункта «Продукты» в меню нет', () => {
+    expect(tool().description).toMatch(/в Студии, вкладка «Продукты»/);
+    expect(tool().description).not.toMatch(/в кабинете, вкладка «Продукты»/);
+  });
+
   it('описание domain: записи дословно, AAAA, без обещания, бесплатно', () => {
     const d = tool().description;
     expect(d).toMatch(/action="domain"/);
