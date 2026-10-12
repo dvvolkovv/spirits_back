@@ -444,7 +444,7 @@ export class ChatController {
           // storeRelayLinks сама не бросает (relay-links.ts), но это гарантия
           // чужого модуля — страхуемся локально: без неё сбой внутри уронил
           // бы весь finally, и клиент не получил бы ни `end`, ни res.end().
-          const lines = await this.chatService.storeRelayLinks(outputFileLines(pendingFiles, AGENT_URL), AGENT_URL);
+          const lines = await this.chatService.storeRelayLinks(outputFileLines(pendingFiles, AGENT_URL), AGENT_URL, { userId });
           const tail = '\n\n' + lines.join('\n');
           chunks.push(tail);
           safeWrite({ type: 'item', content: tail });

@@ -1,8 +1,9 @@
 // src/chat/chat-files/chat-file-store.ts
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { safeGet } from '../../common/net/safe-fetch';
 import { StorageService } from '../../common/services/storage.service';
+import { EventsService } from '../../events/events.service';
 import {
   contentDispositionFor,
   contentTypeFor,
@@ -37,6 +38,11 @@ export interface PersistOptions {
   budgetMs?: number;
   /** Срок на файл, мс. По умолчанию PERSIST_FILE_TIMEOUT_MS. */
   fileTimeoutMs?: number;
+  /**
+   * Владелец хода. С ним пишутся события chat_file_stored / chat_file_copy_failed
+   * (статистика админки). Перенос старых файлов его не передаёт и цифры не трогает.
+   */
+  userId?: string;
 }
 
 export interface PersistOneOptions {
@@ -136,6 +142,18 @@ export function chatFilesBucket(): string {
   return process.env.MINIO_BUCKET_CHAT_FILES || 'linkeon-chat-files';
 }
 
+export type CopyFailReason = 'timeout' | 'access_denied' | 'too_large' | 'not_found' | 'other';
+
+/** Причина сбоя копии для статистики — по тексту ошибки (safe-fetch, MinIO, наши сроки). */
+export function copyFailReason(e: unknown): CopyFailReason {
+  const msg = String((e as any)?.message ?? e ?? '');
+  if (/Access Denied/i.test(msg)) return 'access_denied';
+  if (/ответ больше допустимого/.test(msg)) return 'too_large';
+  if (/кодом 404/.test(msg)) return 'not_found';
+  if (/превышено время|бюджет хода|не уложилась в свои сроки|aborted|timeout/i.test(msg)) return 'timeout';
+  return 'other';
+}
+
 /**
  * Копируем только файлы нашего релея: начало — relayFilesPrefix(AGENT_URL),
  * не папка, без сегментов «.» и «..» (и закодированных тоже). Адреса приходят
@@ -177,7 +195,10 @@ export class ChatFileStore {
   private readonly logger = new Logger(ChatFileStore.name);
   private readonly slots = new CopySlots(PERSIST_CONCURRENCY);
 
-  constructor(private readonly storage: StorageService) {}
+  constructor(
+    private readonly storage: StorageService,
+    @Optional() private readonly events?: EventsService,
+  ) {}
 
   /**
    * Адрес релея → наш адрес. Повторы склеиваются. Возвращается не позже
@@ -215,9 +236,15 @@ export class ChatFileStore {
         const url = unique[next++];
         try {
           const stored = await this.persistOne(url, { fileTimeoutMs, deadline, signal: turn.signal });
-          if (!turn.signal.aborted) out.set(url, stored);
+          if (!turn.signal.aborted) {
+            out.set(url, stored);
+            if (opts.userId) this.events?.track('chat_file_stored', { userId: opts.userId });
+          }
         } catch (e: any) {
           this.logger.warn(`chat-files: не скопирован ${url}: ${e?.message || e}`);
+          if (opts.userId) {
+            this.events?.track('chat_file_copy_failed', { userId: opts.userId, props: { reason: copyFailReason(e) } });
+          }
         }
       }
     };
