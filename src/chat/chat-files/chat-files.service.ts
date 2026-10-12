@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { PgService } from '../../common/services/pg.service';
 import { ChatFileKind, ExtractEnv, ExtractedFile, extractChatFiles } from './extract';
 import { FindFilesInput, assistantPart, normalizeForSearch, plainNote, queryWords, scoreFile } from './find-files';
+import { thumbPathFor } from './thumbnails';
 
 /**
  * Что отдаёт эндпоинт панели (GET /webhook/chat/files). У stored=false адреса
@@ -12,6 +13,8 @@ export interface ChatFileItem {
   kind: ChatFileKind;
   url?: string;
   thumbUrl?: string;
+  /** Только у картинок из наших бакетов: путь ручки миниатюры (thumbnails.ts), фронт достраивает его от своего бэкенда. */
+  thumbPath?: string;
   name: string;
   ext: string;
   createdAt: string;
@@ -101,15 +104,23 @@ export function collectFiles(rows: any[], env: ExtractEnv): FoundFile[] {
   return out;
 }
 
+/** Миниатюра — только картинкам из наших разрешённых бакетов. */
+function withThumb(item: ChatFileItem, publicBaseUrl: string): ChatFileItem {
+  if (item.kind !== 'image') return item;
+  const thumbPath = thumbPathFor(item.url, publicBaseUrl);
+  return thumbPath ? { ...item, thumbPath } : item;
+}
+
 @Injectable()
 export class ChatFilesService {
   constructor(private readonly pg: PgService) {}
 
   /** Файлы одной переписки, от новых к старым. */
   async listForSession(userId: string, sessionId: string): Promise<ChatFileItem[]> {
+    const env = extractEnv();
     const { rows } = await this.pg.query(SESSION_FILES_SQL, [sessionId]);
-    const items = await this.resolve(userId, collectFiles(rows, extractEnv()));
-    return items.map(({ item }) => item);
+    const items = await this.resolve(userId, collectFiles(rows, env));
+    return items.map(({ item }) => withThumb(item, env.publicBaseUrl));
   }
 
   /**
