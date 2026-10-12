@@ -11,6 +11,9 @@ describe('инструмент calculate_human_design в чате', () => {
     expect(tool!.description).toContain('![](imageUrl)');
     expect(tool!.description).toMatch(/choose_city/);
     expect(tool!.description).toMatch(/choose_dst/);
+    expect(tool!.description).toContain('нынешнее официальное название');
+    expect(tool!.description).toContain('по-русски');
+    expect(tool!.description).toMatch(/imageUrl.*null/);
   });
 
   it('executeTool отдаёт вызов сервису как есть — без списания токенов', async () => {

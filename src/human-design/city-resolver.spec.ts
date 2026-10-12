@@ -1,5 +1,5 @@
 import { indexCities, type CityDb } from './cities';
-import { MAX_CANDIDATES, resolveCity } from './city-resolver';
+import { DOMINANT_RATIO, MAX_CANDIDATES, resolveCity } from './city-resolver';
 
 const DB: CityDb = {
   v: 1,
@@ -17,6 +17,7 @@ const DB: CityDb = {
   ],
 };
 const index = indexCities(DB);
+const populations = DB.cities.map((c) => c[4]);
 
 describe('город для инструмента Райи', () => {
   it('точное совпадение названия — берём, без регистра и латиницей', () => {
@@ -37,11 +38,34 @@ describe('город для инструмента Райи', () => {
       [5, 'Мурманская область'],
       [6, 'Ленинградская область'],
     ]);
+    expect(r.total).toBe(2);
   });
 
-  it('регион или страна после запятой сужают', () => {
+  it('регион сужает точно', () => {
     expect(resolveCity(index, 'Кировск, Ленинградская')).toMatchObject({ kind: 'found', cityId: 6 });
-    expect(resolveCity(index, 'Казань, Германия')).toEqual({ kind: 'not_found' });
+  });
+
+  it('подсказка отфильтровала все совпадения — варианты без нее, но никогда found: пояс угадывать нельзя', () => {
+    // У Москвы регион в базе — null (совпадает с названием города), поэтому
+    // «Москва, Московская область» подсказкой не находится никогда — без
+    // отката такой запрос вернул бы not_found для существующего города.
+    expect(resolveCity(index, 'Москва, Московская область')).toEqual({
+      kind: 'choose',
+      candidates: [{ name: 'Москва', region: null, country: 'Россия', zone: 'Europe/Moscow', cityId: 0 }],
+      total: 1,
+    });
+    // «Казань, Германия» — подсказка не подходит ни одному городу с таким
+    // названием; откат без подсказки находит Казань, но вариантом, не found.
+    expect(resolveCity(index, 'Казань, Германия')).toEqual({
+      kind: 'choose',
+      candidates: [{ name: 'Казань', region: 'Татарстан', country: 'Россия', zone: 'Europe/Moscow', cityId: 2 }],
+      total: 1,
+    });
+  });
+
+  it('не больше трёх подсказок после названия — хвост игнорируется, не ломает поиск', () => {
+    const r = resolveCity(index, 'Казань, Татарстан, Россия, Татарстан, ерунда полная');
+    expect(r).toMatchObject({ kind: 'found', cityId: 2 });
   });
 
   it('без точного совпадения — только варианты, даже если вариант один: пояс угадывать нельзя', () => {
@@ -63,12 +87,35 @@ describe('город для инструмента Райи', () => {
     for (const id of [999, -1, 1.5]) expect(resolveCity(index, 'Казань', id)).toEqual({ kind: 'not_found' });
   });
 
-  it(`вариантов не больше ${MAX_CANDIDATES}`, () => {
+  it(`вариантов не больше ${MAX_CANDIDATES}, total — сколько было до обрезки`, () => {
     const many: CityDb = {
       ...DB,
       cities: Array.from({ length: 8 }, (_, i) => ['Кировск', 'Kirovsk', 'RU', 0, 100 - i, -1] as CityDb['cities'][number]),
     };
     const r = resolveCity(indexCities(many), 'Кировск');
     expect(r.kind === 'choose' && r.candidates).toHaveLength(MAX_CANDIDATES);
+    expect(r.kind === 'choose' && r.total).toBe(8);
+  });
+
+  it(`явный перевес населения (×${DOMINANT_RATIO}+) среди одноимённых — берём крупный без уточнения`, () => {
+    expect(DOMINANT_RATIO).toBe(20);
+    // Два «Кировска» (27 и 26 тыс.) — перевес слишком мал, уточнение нужно всё равно.
+    expect(resolveCity(index, 'Кировск', undefined, populations).kind).toBe('choose');
+
+    const moscowDb: CityDb = {
+      v: 1,
+      zones: ['Europe/Moscow'],
+      countries: { RU: 'Россия' },
+      regions: ['Москва'],
+      cities: [
+        ['Москва', 'Moscow', 'RU', 0, 10381, 0],
+        ['Москва', 'Moscow', 'RU', 0, 25, -1],
+      ],
+    };
+    const moscowIndex = indexCities(moscowDb);
+    const moscowPopulations = moscowDb.cities.map((c) => c[4]);
+    expect(resolveCity(moscowIndex, 'Москва', undefined, moscowPopulations)).toMatchObject({ kind: 'found', cityId: 0 });
+    // Без populations — прежнее поведение, уточнение.
+    expect(resolveCity(moscowIndex, 'Москва').kind).toBe('choose');
   });
 });
