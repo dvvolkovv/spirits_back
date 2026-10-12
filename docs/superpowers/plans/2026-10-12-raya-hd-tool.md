@@ -20,7 +20,7 @@
 4. **sharp** в бэкенде подключают через `require` (`src/chat/chat-files/thumbnails.ts:17`: `const sharp = require('sharp') as unknown as typeof import('sharp/lib/index');`) — `esModuleInterop` нет.
 5. **Бэкенд — CommonJS**, `isolatedModules`, `strictNullChecks: false`, target ES2021; jest гоняет `**/src/**/*.spec.ts` через ts-jest **без проверки типов** (типы — отдельным `npx tsc -p tsconfig.build.json --noEmit`). `testPathIgnorePatterns` содержит `/.worktrees/` — в маковском воркдереве jest «не видит» тесты, гонять только на ноде (путь `~/ci/wt/...`).
 6. **JSON в сборку не попадает:** `resolveJsonModule` нет, у `nest-cli.json` нет `assets`. База городов читается с диска (`__dirname/data/cities.ru.json`) и копируется в `dist` правилом `assets` в `nest-cli.json`.
-7. **Модуль калькулятора** — чистый TS без браузерных API; тесты на vitest: импорт `from 'vitest'` и в `reference.test.ts` — `new URL('./__fixtures__/reference.json', import.meta.url)`. В бэкенде (jest, CommonJS) скрипт переноса убирает импорт vitest, меняет путь к эталону на `join(__dirname, …)` и переименовывает `*.test.ts` → `*.spec.ts`. `boundary.test.ts` (сторож границы лендинга, `import.meta` + `typescript`) не переносится. `expect(x, 'сообщение')` vitest'а jest во время выполнения просто игнорирует вторым аргументом — переносится как есть.
+7. **Модуль калькулятора** — чистый TS без браузерных API; тесты на vitest: импорт `from 'vitest'` и в `reference.test.ts` — `new URL('./__fixtures__/reference.json', import.meta.url)`. В бэкенде (jest, CommonJS) скрипт переноса убирает импорт vitest, меняет путь к эталону на `join(__dirname, …)` и переименовывает `*.test.ts` → `*.spec.ts`. `boundary.test.ts` (сторож границы лендинга, `import.meta` + `typescript`) не переносится. `expect(x, 'сообщение')` vitest'а jest 29 не принимает («Expect takes at most one argument» — выяснилось на первом прогоне 12.10): скрипт вставляет в начало каждого перенесённого теста обёртку `expect`, отбрасывающую сообщение.
 8. **astronomy-engine 2.1.19:** `exports['.'].require = ./astronomy.js` — CommonJS-сборка есть; типы `astronomy.d.ts`.
 9. **Схема** 360×548 (`layout.ts`, `VIEWBOX`), шрифт `Inter, system-ui, sans-serif` → на сервере падёт на системный sans-serif (librsvg/fontconfig). PNG рисуем с плотностью 144 → 720×1096. Читаются ли цифры ворот — проверяется глазами (Task 4) и на проде до включения Райи (Task 8).
 10. **Telegram-бот** — отдельный конвейер с маркерами (`src/tg-bot/tg-bot.service.ts`, `OutgoingMarker`), инструментов MCP там нет. Райя в Telegram продолжит считать по-старому — это закрывает пункт инструкции «инструмент недоступен — прежний способ». Мобильное приложение ходит тем же `/webhook/soulmate/chat` → релей → MCP.
@@ -150,22 +150,51 @@ Expected: числа тестов `src/chat src/mcp`, `TSC_OK` (или числ�
 # Модуль правится ТОЛЬКО в land_linkeon (там его проверяет эталон Swiss
 # Ephemeris на 300 рождений и 10 карт ручной сверки); сюда — этим скриптом.
 # Тесты едут вместе: vitest → jest (импорт vitest убирается, *.test.ts →
-# *.spec.ts, путь к эталону — через __dirname). Сторож границы лендинга
+# *.spec.ts, путь к эталону — через __dirname, expect с сообщением — обёрткой;
+# см. to_spec ниже). Сторож границы лендинга
 # (boundary.test.ts) не нужен бэкенду и не переносится.
 #
 # Запуск из корня spirits_back:
 #   bash scripts/sync-human-design.sh [путь к land_linkeon]
 set -euo pipefail
-LAND="${1:-$HOME/Downloads/land_linkeon}"
+LAND="$(cd "${1:-$HOME/Downloads/land_linkeon}" && pwd)"
+# Всегда из корня spirits_back — где бы ни запускали: ниже стирается src/human-design/lib.
+cd "$(dirname "$0")/.."
 SRC="$LAND/src/lib/human-design"
 DST="src/human-design/lib"
 [ -f "$SRC/index.ts" ] || { echo "нет $SRC/index.ts — укажите путь к land_linkeon" >&2; exit 1; }
-[ -f package.json ] && grep -q '"name"' package.json || { echo "запускать из корня spirits_back" >&2; exit 1; }
+grep -q '"name": "spirits-back"' package.json || { echo "скрипт лежит не в spirits_back" >&2; exit 1; }
 if [ -n "$(git -C "$LAND" status --porcelain -- src/lib/human-design src/lib/cities.ts src/lib/cities.test.ts src/content/hd/cities.ru.json)" ]; then
   echo "в land_linkeon незакоммиченные правки модуля или базы городов — сначала коммит там" >&2
   exit 1
 fi
-SHA=$(git -C "$LAND" rev-parse --short HEAD)
+# Коммит, который последним трогал копируемое, — а не HEAD лендинга: иначе
+# любой посторонний коммит там переписывал бы README здесь.
+SHA=$(git -C "$LAND" log -1 --format=%h -- src/lib/human-design src/lib/cities.ts src/lib/cities.test.ts src/content/hd/cities.ru.json)
+
+# Копия верна только на той же версии библиотеки эфемерид, что у калькулятора.
+ver() { sed -n 's/.*"astronomy-engine": *"[^0-9]*\([0-9][0-9.]*\)".*/\1/p' "$1" | head -1; }
+if [ "$(ver "$LAND/package.json")" != "$(ver package.json)" ]; then
+  echo "astronomy-engine: в land_linkeon $(ver "$LAND/package.json"), здесь $(ver package.json) — сначала выровнять версии" >&2
+  exit 1
+fi
+
+# Тест vitest → спека jest: без импорта vitest, путь к эталону через __dirname,
+# expect с сообщением — обёрткой (jest 29 на втором аргументе бросает
+# «Expect takes at most one argument»; обёртка отбрасывает сообщение, статические
+# expect.any / expect.arrayContaining остаются).
+to_spec() {
+  local src="$1" out="$2"
+  sed -e "/^import .* from 'vitest';$/d" \
+      -e "s#new URL('./__fixtures__/\([^']*\)', import.meta.url)#join(__dirname, '__fixtures__', '\1')#" \
+      "$src" > "$out"
+  {
+    echo "const jestExpect = (globalThis as unknown as { expect: jest.Expect }).expect;"
+    echo "const expect = Object.assign(<T>(actual: T, _message?: string) => jestExpect(actual), jestExpect);"
+    if grep -q "join(__dirname" "$out"; then echo "import { join } from 'node:path';"; fi
+    cat "$out"
+  } > "$out.tmp" && mv "$out.tmp" "$out"
+}
 
 rm -rf "$DST"
 mkdir -p "$DST/__fixtures__" src/human-design/data
@@ -174,22 +203,14 @@ for f in "$SRC"/*.ts; do
   base=$(basename "$f")
   case "$base" in
     boundary.test.ts) continue ;;
-    *.test.ts)
-      out="$DST/${base%.test.ts}.spec.ts"
-      sed -e "/^import .* from 'vitest';$/d" \
-          -e "s#new URL('./__fixtures__/reference.json', import.meta.url)#join(__dirname, '__fixtures__', 'reference.json')#" \
-          "$f" > "$out"
-      if grep -q "join(__dirname" "$out"; then
-        { echo "import { join } from 'node:path';"; cat "$out"; } > "$out.tmp" && mv "$out.tmp" "$out"
-      fi
-      ;;
+    *.test.ts) to_spec "$f" "$DST/${base%.test.ts}.spec.ts" ;;
     *) cp "$f" "$DST/$base" ;;
   esac
 done
-cp "$SRC/__fixtures__/reference.json" "$DST/__fixtures__/reference.json"
+cp -R "$SRC/__fixtures__/." "$DST/__fixtures__/"
 
 cp "$LAND/src/lib/cities.ts" src/human-design/cities.ts
-sed -e "/^import .* from 'vitest';$/d" "$LAND/src/lib/cities.test.ts" > src/human-design/cities.spec.ts
+to_spec "$LAND/src/lib/cities.test.ts" src/human-design/cities.spec.ts
 cp "$LAND/src/content/hd/cities.ru.json" src/human-design/data/cities.ru.json
 
 cat > "$DST/README.md" <<EOF
