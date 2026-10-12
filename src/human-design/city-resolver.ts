@@ -12,6 +12,18 @@ export const DOMINANT_RATIO = 20;
 /** Не больше трёх подсказок после названия (регион, страна — дальше явно мусор в запросе). */
 const MAX_HINTS = 3;
 
+/**
+ * То же правило, что строит exact/partial в resolveCity: название целиком
+ * или начало слова в нём совпадает с q (уже нормализованным запросом).
+ * Экспортирован, чтобы сервис инструмента сверял cityId из прошлого ответа
+ * choose_city с тем же критерием — иначе cityId варианта, найденного по
+ * началу слова («Новгород» → Великий Новгород), сервис отвергал бы как
+ * «чужой», хотя он ровно из только что предложенных вариантов.
+ */
+export function cityNameMatches(keys: string[], q: string): boolean {
+  return keys.includes(q) || keys.some((k) => k.startsWith(q) || k.includes(` ${q}`));
+}
+
 /** Вариант для уточнения: cityId — номер записи в базе, им Райя отвечает при повторном вызове. */
 export interface CityCandidate extends City {
   cityId: number;
@@ -61,11 +73,18 @@ export function resolveCity(
     index.forEach(({ city, keys }, id) => {
       if (!fits(city)) return;
       if (keys.includes(q)) exact.push({ ...city, cityId: id });
-      else if (partial.length < MAX_CANDIDATES && keys.some((k) => k.startsWith(q) || k.includes(` ${q}`))) {
+      else if (partial.length < MAX_CANDIDATES && cityNameMatches(keys, q)) {
         partial.push({ ...city, cityId: id });
       }
     });
     return { exact, partial };
+  };
+
+  const isDominant = (list: CityCandidate[]) => {
+    if (list.length < 2 || !populations) return false;
+    const p0 = populations[list[0].cityId] ?? 0;
+    const p1 = populations[list[1].cityId] ?? 0;
+    return p1 > 0 && p0 >= DOMINANT_RATIO * p1;
   };
 
   let { exact, partial } = search(hints);
@@ -73,15 +92,15 @@ export function resolveCity(
   if (hints.length > 0 && exact.length === 0 && partial.length === 0) {
     ({ exact, partial } = search([]));
     dominantAllowed = false;
+    // Подсказка была нужна человеку — доминирующего тёзку всё равно не
+    // отдаём напрямую found, но и не заставляем выбирать среди явно
+    // нерелевантных: сокращаем список до одного (самого крупного).
+    if (isDominant(exact)) exact = [exact[0]];
   }
 
-  if (dominantAllowed && exact.length >= 2 && populations) {
-    const p0 = populations[exact[0].cityId] ?? 0;
-    const p1 = populations[exact[1].cityId] ?? 0;
-    if (p1 > 0 && p0 >= DOMINANT_RATIO * p1) {
-      const { cityId: id, ...city } = exact[0];
-      return { kind: 'found', cityId: id, city };
-    }
+  if (dominantAllowed && isDominant(exact)) {
+    const { cityId: id, ...city } = exact[0];
+    return { kind: 'found', cityId: id, city };
   }
 
   if (dominantAllowed && exact.length === 1) {

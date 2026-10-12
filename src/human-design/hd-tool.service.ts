@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { MiscService } from '../misc/misc.service';
 import { indexCities, normalize, type City, type CityDb, type CityIndex } from './cities';
-import { resolveCity, type CityCandidate } from './city-resolver';
+import { cityNameMatches, resolveCity, type CityCandidate } from './city-resolver';
 import { bodygraphPng } from './bodygraph-png';
 import { calculateChart, formatOffset, renderBodygraphSvg, type Activation, type HdChart } from './lib';
 
@@ -113,8 +113,12 @@ export class HumanDesignToolService {
     if (!isValidCalendarDate(dateRaw)) {
       return { ok: false, error: 'Проверьте дату рождения: формат ГГГГ-ММ-ДД, существующий день.' };
     }
-    const today = new Date().toISOString().slice(0, 10);
-    if (dateRaw > today) return { ok: false, error: 'Дата рождения в будущем — проверьте год.' };
+    // Запас в сутки: в восточных поясах (Владивосток, UTC+10) местная дата
+    // «сегодня» может быть на день больше даты UTC ещё до полуночи по UTC —
+    // сравнение строго с датой UTC принимало бы законное «сегодня» за
+    // будущее. Точная проверка после расчёта (ниже, по birthUtc) остаётся.
+    const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    if (dateRaw > tomorrow) return { ok: false, error: 'Дата рождения в будущем — проверьте год.' };
     const time = normalizeTime(timeRaw);
     if (time === null) return { ok: false, error: 'Проверьте время рождения: формат ЧЧ:ММ.' };
 
@@ -130,7 +134,11 @@ export class HumanDesignToolService {
     if (cityId !== undefined && city) {
       const entry = index[cityId];
       const q = normalize(city.split(',')[0]);
-      if (!entry || !entry.keys.includes(q)) return { ok: false, error: CITY_ID_ERROR };
+      // Тем же правилом, что строит варианты choose_city (не только точным
+      // совпадением): иначе cityId варианта, предложенного по началу слова
+      // («Новгород» → Великий Новгород), повторный вызов с тем же city
+      // отвергал бы как «чужой».
+      if (!entry || !cityNameMatches(entry.keys, q)) return { ok: false, error: CITY_ID_ERROR };
     }
 
     const place = resolveCity(index, city, cityId, populations);
