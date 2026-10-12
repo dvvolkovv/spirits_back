@@ -1,5 +1,6 @@
 import { ChatService } from './chat.service';
 import { AgentsService } from '../agents/agents.service';
+import { platformGuide, TOOLS_LIST_NOTE } from './platform-guide';
 
 /**
  * Системный промпт Маши (agent.id === 3, локальный claude CLI, не релей).
@@ -153,5 +154,19 @@ describe('системный промпт Маши', () => {
     const header = system.split('\n').find((l) => l.includes('ПРАВИЛО ОТВЕТА'));
 
     expect(header).toMatch(/кроме правила о кризисной ситуации/);
+  });
+
+  describe('«Что есть в Linkeon»', () => {
+    it('тот же блок о платформе, что у ассистентов релея', async () => {
+      const { system } = await mashaSystemPrompt();
+
+      expect(system).toContain(platformGuide('ru'));
+    });
+
+    it('без пометки про инструменты релея: их у Маши нет', async () => {
+      const { system } = await mashaSystemPrompt();
+
+      expect(system).not.toContain(TOOLS_LIST_NOTE);
+    });
   });
 });
