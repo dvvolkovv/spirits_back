@@ -386,7 +386,9 @@ location.replace('/chat');
         return res.set(CORS).status(401).json({ error: 'auth required for link' });
       }
       try {
-        const payload = this.jwt.verify(authHeader.substring(7));
+        // Только токен доступа: иначе к чужому аккаунту можно было бы
+        // привязать свой Google токеном продуктов с релея.
+        const payload = this.jwt.verifyAccess(authHeader.substring(7));
         userId = payload.userId;
       } catch {
         return res.set(CORS).status(401).json({ error: 'invalid token' });
@@ -544,7 +546,7 @@ location.replace('/chat');
     if (authHeader?.startsWith('Bearer ')) {
       let userId: string | undefined;
       try {
-        userId = this.jwt.verify(authHeader.substring(7)).userId;
+        userId = this.jwt.verifyAccess(authHeader.substring(7)).userId;
       } catch {
         return res.set(CORS).status(401).json({ error: 'invalid token' });
       }
