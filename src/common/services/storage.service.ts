@@ -5,6 +5,7 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   DeleteObjectCommand,
+  HeadObjectCommand,
   ListObjectsV2Command,
 } from '@aws-sdk/client-s3';
 import { Readable } from 'stream';
@@ -112,6 +113,33 @@ export class StorageService implements OnModuleInit {
       }),
     );
     return (res.Contents ?? []).map((o) => o.Key as string);
+  }
+
+  /** Размер и тип объекта; null — объекта нет. Прочие ошибки MinIO бросает. */
+  async head(bucket: string, key: string): Promise<{ size: number; contentType?: string } | null> {
+    try {
+      const res = await this.s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+      return { size: Number(res.ContentLength ?? 0), contentType: res.ContentType };
+    } catch (e: any) {
+      if (e?.name === 'NotFound' || e?.$metadata?.httpStatusCode === 404) return null;
+      throw e;
+    }
+  }
+
+  /** Сколько объектов и байт в бакете — постранично, весь бакет. */
+  async bucketStats(bucket: string): Promise<{ objects: number; bytes: number }> {
+    let objects = 0;
+    let bytes = 0;
+    let token: string | undefined;
+    do {
+      const res: any = await this.s3.send(new ListObjectsV2Command({ Bucket: bucket, ContinuationToken: token }));
+      for (const o of res.Contents ?? []) {
+        objects += 1;
+        bytes += Number(o.Size ?? 0);
+      }
+      token = res.IsTruncated ? res.NextContinuationToken : undefined;
+    } while (token);
+    return { objects, bytes };
   }
 
   publicUrl(bucket: string, key: string): string {
