@@ -12,6 +12,13 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { neutralizeAtMentions, stripWordJoiner } from '../common/agent-guards';
 import { renderBannerOverlay, BannerPosition, BannerTheme } from './banner-overlay';
 import { fetchMediaBytes } from '../common/net/own-media';
+import {
+  SelectedProfile,
+  buildProsePrompt,
+  buildSelectionPrompt,
+  parseSearchSelection,
+  selectSearchProfiles,
+} from './search-cards';
 
 const ASSETS_BUCKET = 'linkeon-assets';
 
@@ -104,13 +111,13 @@ export class MiscService {
 
     const userLanguage = await this.language.resolveUserLanguage(userId);
     const matches = await this.searchProfiles(query, userId);
-
-    if (matches.length === 0) {
-      const noResults = `${searchMsg(userLanguage).noResults}\n\nsearch_result:[]`;
-      res.write(JSON.stringify({ type: 'item', content: noResults }) + '\n');
+    const noResults = () => {
+      const content = `${searchMsg(userLanguage).noResults}\n\nsearch_result:[]`;
+      res.write(JSON.stringify({ type: 'item', content }) + '\n');
       res.end();
-      return;
-    }
+    };
+
+    if (matches.length === 0) return noResults();
 
     // Обогащаем matches surrogate ID из PG (ai_profiles_consolidated.id).
     // Phone в JSON выдачу НЕ попадает — только userId (integer).
@@ -125,39 +132,32 @@ export class MiscService {
     }
     for (const m of matches) m.userId = idMap.get(m.phone) ?? null;
 
-    // В промпте адресуем профили как #1, #2, … Ни phone, ни userId не передаём LLM для prose —
-    // карта index→userId только для JSON-блока на выходе.
-    const idMapStr = matches.map((m, i) => `#${i + 1} = ${m.userId ?? 'null'}`).join(', ');
-    const matchesBlock = matches.map((m, i) => {
-      const topHits = m.matches.slice(0, 5).map((h: any) =>
-        `    • [${h.category}] "${h.name}" (cos=${h.score.toFixed(2)}): ${h.gloss}`,
-      ).join('\n');
-      const nameLabel = m.name ? ` (${m.name})` : '';
-      return `#${i + 1}${nameLabel}, totalScore=${m.totalScore.toFixed(2)}
-${topHits}`;
-    }).join('\n\n');
-
-    const systemPrompt = `Ты — помощник по поиску единомышленников на платформе my.linkeon.io.
-
-Пользователь задал запрос, и по семантическому (embedding-based) поиску найдены профили — для каждого показаны конкретные узлы профиля, которые совпали, с их персональным gloss-описанием (что ИМЕННО этот человек понимает под данной ценностью/интересом).
-
-Найденные профили:
-${matchesBlock}
-
-Карта индекс → userId (integer, для JSON): ${idMapStr}
-
-Твоя задача:
-1. Напиши 2-3 предложения — краткий и конкретный комментарий, ПОЧЕМУ именно эти люди подошли. Ссылайся на matched gloss, а не на общие слова. В комментарии ОБРАЩАЙСЯ к профилям по имени (если задано) или порядком ("Первый", "Второй"), либо через обобщения ("первые два профиля"). КАТЕГОРИЧЕСКИ НЕЛЬЗЯ упоминать телефонные номера, phone, userId, цифровые идентификаторы — ни в скобках, ни в кавычках, ни в виде списка. Никогда.
-2. На отдельной строке напиши search_result: и JSON-массив в формате:
-[{"userId":<integer>,"name":"<имя или короткое описание роли>","values":["val1"],"intents":[],"interests":[],"skills":[],"corellation":0.85,"matchReason":"<1 предложение объяснение по matched gloss>"}]
-
-Поле userId — integer из карты выше (используй именно userId, не id и не phone). Поля values/interests/intents/skills заполни ТЕМИ canonical-именами узлов, которые matched. corellation — totalScore / max(totalScore). Не добавляй phone в JSON никогда.
-
-Заголовки и прозаический комментарий пиши на языке пользователя (см. ниже). Ключ search_result: и имена полей JSON — служебные, их НЕ переводи.
-${LanguageService.buildDirective(userLanguage)}`;
-
+    // Два вызова, а не один: кого показать — отдельно, проза — по уже собранным
+    // карточкам. Почему так — в шапке search-cards.ts.
     const userMessage = `Запрос поиска: "${query}"`;
-    await this.streamLLM(systemPrompt, userMessage, res);
+    let selected: SelectedProfile[];
+    try {
+      const answer = await this.completeLLM(buildSelectionPrompt(matches, userLanguage), userMessage);
+      const selection = parseSearchSelection(answer);
+      if (!selection) throw new Error(`selection is not a JSON array (${answer.length} chars)`);
+      selected = selectSearchProfiles(matches, selection);
+    } catch (e: any) {
+      this.logger.error(`search selection error: ${e.message}`);
+      res.write(JSON.stringify({ type: 'item', content: 'Ошибка при обработке запроса.' }) + '\n');
+      res.end();
+      return;
+    }
+    if (!selected.length) return noResults();
+
+    try {
+      await this.pipeLLM(buildProsePrompt(selected, userLanguage), userMessage, res);
+    } catch (e: any) {
+      // Карточки уже собраны — отдаём их и без комментария.
+      this.logger.error(`search prose error: ${e.message}`);
+    }
+    const cards = selected.map((s) => s.card);
+    res.write(JSON.stringify({ type: 'item', content: `\n\nsearch_result:${JSON.stringify(cards)}` }) + '\n');
+    res.end();
   }
 
   async analyzeCompatibility(userId: string, targetUsers: string[], res: Response): Promise<void> {
@@ -963,58 +963,68 @@ ${LanguageService.buildDirective(userLanguage)}`;
     }
   }
 
-  private async streamLLM(systemPrompt: string, userMessage: string, res: Response): Promise<void> {
-    try {
-      const chunks: string[] = [];
-      for await (const event of query({
-        // Безопасность: (1) обезвреживаем @-упоминания в НЕДОВЕРЕННОМ тексте
-        // (поисковый запрос/данные профилей) — иначе `@/…/.env` инлайнится в
-        // промпт мимо tools; (2) промпт НЕ должен начинаться с пользовательского
-        // текста — ведущий `/` мог бы уйти как slash-команда, поэтому первой
-        // строкой ставим фиксированную метку.
-        prompt: `Запрос пользователя:\n${neutralizeAtMentions(userMessage)}`,
-        options: {
-          model: 'claude-haiku-4-5',
-          systemPrompt: neutralizeAtMentions(systemPrompt),
-          // Безопасность (25.09.2026): здесь нужен чистый текстовый вывод, тулы
-          // не используются вовсе. Раньше стоял bypassPermissions без указания
-          // tools — при таком сочетании SDK отдаёт модели ПОЛНЫЙ набор Claude
-          // Code (Bash, Read, Write, WebFetch…), и userMessage (поисковый
-          // запрос/данные для сравнения профилей) мог заставить её прочитать
-          // ~/spirits_back/.env: процесс API идёт под пользователем, владеющим
-          // этим файлом. `tools: []` убирает встроенные тулы целиком (проверено
-          // пробой: INIT_TOOLS []), после чего bypassPermissions разрешать
-          // нечего. cwd тоже уводим в нейтральный tmp — не в каталог бэкенда с
-          // .env и его 40KB CLAUDE.md.
-          tools: [],
-          cwd: os.tmpdir(),
-          permissionMode: 'bypassPermissions',
-          settingSources: [],
-          includePartialMessages: true,
-        } as any,
-      })) {
-        // Извлекаем только text-delta — сохраняем wire format вызывающих
-        // (searchProfiles / analyzeCompatibility): они шлют только "item" + опц. "replace".
-        if (event.type === 'stream_event') {
-          const inner = (event as any).event;
-          if (inner?.type === 'content_block_delta' && inner.delta?.type === 'text_delta'
-              && typeof inner.delta.text === 'string') {
-            // Снимаем U+2060 на выходе: joiner из входной нейтрализации не должен
-            // доехать до пользователя (одиночный кодепоинт не рвётся на границе
-            // дельт — SDK отдаёт уже декодированные строки).
-            const text = stripWordJoiner(inner.delta.text);
-            chunks.push(text);
-            res.write(JSON.stringify({ type: 'item', content: text }) + '\n');
-          }
+  /**
+   * Ответ модели по кусочкам (text_delta). Единственный вызов SDK в сервисе:
+   * его делят поиск (выбор карточек и проза) и совместимость.
+   */
+  private async *llmText(systemPrompt: string, userMessage: string): AsyncGenerator<string> {
+    for await (const event of query({
+      // Безопасность: (1) обезвреживаем @-упоминания в НЕДОВЕРЕННОМ тексте
+      // (поисковый запрос/данные профилей) — иначе `@/…/.env` инлайнится в
+      // промпт мимо tools; (2) промпт НЕ должен начинаться с пользовательского
+      // текста — ведущий `/` мог бы уйти как slash-команда, поэтому первой
+      // строкой ставим фиксированную метку.
+      prompt: `Запрос пользователя:\n${neutralizeAtMentions(userMessage)}`,
+      options: {
+        model: 'claude-haiku-4-5',
+        systemPrompt: neutralizeAtMentions(systemPrompt),
+        // Безопасность (25.09.2026): здесь нужен чистый текстовый вывод, тулы
+        // не используются вовсе. Раньше стоял bypassPermissions без указания
+        // tools — при таком сочетании SDK отдаёт модели ПОЛНЫЙ набор Claude
+        // Code (Bash, Read, Write, WebFetch…), и userMessage (поисковый
+        // запрос/данные для сравнения профилей) мог заставить её прочитать
+        // ~/spirits_back/.env: процесс API идёт под пользователем, владеющим
+        // этим файлом. `tools: []` убирает встроенные тулы целиком (проверено
+        // пробой: INIT_TOOLS []), после чего bypassPermissions разрешать
+        // нечего. cwd тоже уводим в нейтральный tmp — не в каталог бэкенда с
+        // .env и его 40KB CLAUDE.md.
+        tools: [],
+        cwd: os.tmpdir(),
+        permissionMode: 'bypassPermissions',
+        settingSources: [],
+        includePartialMessages: true,
+      } as any,
+    })) {
+      if (event.type === 'stream_event') {
+        const inner = (event as any).event;
+        if (inner?.type === 'content_block_delta' && inner.delta?.type === 'text_delta'
+            && typeof inner.delta.text === 'string') {
+          // Снимаем U+2060 на выходе: joiner из входной нейтрализации не должен
+          // доехать до пользователя (одиночный кодепоинт не рвётся на границе
+          // дельт — SDK отдаёт уже декодированные строки).
+          yield stripWordJoiner(inner.delta.text);
         }
       }
-      // Post-process: вычистить code-блоки из search_result JSON
-      const full = chunks.join('');
-      if (full.includes('search_result:') && full.includes('```')) {
-        let cleaned = full.replace(/search_result:\s*```(?:json)?\s*\n?/g, 'search_result:');
-        cleaned = cleaned.replace(/\n?```\s*$/g, '');
-        res.write(JSON.stringify({ type: 'replace', content: cleaned }) + '\n');
-      }
+    }
+  }
+
+  /** Ответ модели целиком — для выбора карточек поиска, пользователю он не показывается. */
+  private async completeLLM(systemPrompt: string, userMessage: string): Promise<string> {
+    let answer = '';
+    for await (const text of this.llmText(systemPrompt, userMessage)) answer += text;
+    return answer;
+  }
+
+  /** Ответ модели в поток по мере генерации, item-событиями. Поток не закрывает, ошибку пробрасывает. */
+  private async pipeLLM(systemPrompt: string, userMessage: string, res: Response): Promise<void> {
+    for await (const text of this.llmText(systemPrompt, userMessage)) {
+      res.write(JSON.stringify({ type: 'item', content: text }) + '\n');
+    }
+  }
+
+  private async streamLLM(systemPrompt: string, userMessage: string, res: Response): Promise<void> {
+    try {
+      await this.pipeLLM(systemPrompt, userMessage, res);
     } catch (e: any) {
       this.logger.error(`LLM error: ${e.message}`);
       res.write(JSON.stringify({ type: 'item', content: 'Ошибка при обработке запроса.' }) + '\n');
