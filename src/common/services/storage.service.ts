@@ -31,6 +31,8 @@ export interface UploadInput {
 export interface DownloadInput {
   bucket: string;
   key: string;
+  /** Обрывает скачивание: срок на одну миниатюру (thumbnail.service.ts). */
+  abortSignal?: AbortSignal;
 }
 
 export interface DeleteInput {
@@ -87,9 +89,10 @@ export class StorageService implements OnModuleInit {
   }
 
   async download(input: DownloadInput): Promise<Buffer> {
-    const res = await this.s3.send(
-      new GetObjectCommand({ Bucket: input.bucket, Key: input.key }),
-    );
+    const cmd = new GetObjectCommand({ Bucket: input.bucket, Key: input.key });
+    const res = input.abortSignal
+      ? await this.s3.send(cmd, { abortSignal: input.abortSignal })
+      : await this.s3.send(cmd);
     const stream = res.Body as Readable;
     const chunks: Buffer[] = [];
     for await (const chunk of stream) {
@@ -116,9 +119,14 @@ export class StorageService implements OnModuleInit {
   }
 
   /** Размер и тип объекта; null — объекта нет. Прочие ошибки MinIO бросает. */
-  async head(bucket: string, key: string): Promise<{ size: number; contentType?: string } | null> {
+  async head(
+    bucket: string,
+    key: string,
+    abortSignal?: AbortSignal,
+  ): Promise<{ size: number; contentType?: string } | null> {
     try {
-      const res = await this.s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+      const cmd = new HeadObjectCommand({ Bucket: bucket, Key: key });
+      const res = abortSignal ? await this.s3.send(cmd, { abortSignal }) : await this.s3.send(cmd);
       return { size: Number(res.ContentLength ?? 0), contentType: res.ContentType };
     } catch (e: any) {
       if (e?.name === 'NotFound' || e?.$metadata?.httpStatusCode === 404) return null;

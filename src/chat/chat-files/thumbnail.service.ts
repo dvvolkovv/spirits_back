@@ -5,6 +5,7 @@ import {
   THUMB_CONCURRENCY,
   THUMB_MAX_SOURCE_BYTES,
   THUMB_QUEUE_WAIT_MS,
+  THUMB_WORK_TIMEOUT_MS,
   ThumbSource,
   renderThumb,
   thumbKeyFor,
@@ -64,41 +65,60 @@ export class ThumbnailService {
 
   constructor(private readonly storage: StorageService) {}
 
-  async resolve(src: ThumbSource, waitMs: number = THUMB_QUEUE_WAIT_MS): Promise<string> {
+  async resolve(
+    src: ThumbSource,
+    waitMs: number = THUMB_QUEUE_WAIT_MS,
+    workMs: number = THUMB_WORK_TIMEOUT_MS,
+  ): Promise<string> {
     const key = thumbKeyFor(src);
     const url = this.storage.publicUrl(THUMB_BUCKET, key);
     if (this.known.has(key)) return url;
     const pending = this.inFlight.get(key);
     if (pending) return pending;
-    const work = this.make(src, key, url, waitMs).finally(() => this.inFlight.delete(key));
+    const work = this.make(src, key, url, waitMs, workMs).finally(() => this.inFlight.delete(key));
     this.inFlight.set(key, work);
     return work;
   }
 
-  private async make(src: ThumbSource, key: string, url: string, waitMs: number): Promise<string> {
+  private async make(src: ThumbSource, key: string, url: string, waitMs: number, workMs: number): Promise<string> {
     if (await this.storage.head(THUMB_BUCKET, key)) {
       this.remember(key);
       return url;
     }
     const release = await this.slots.acquire(waitMs);
+    // Место держим не дольше workMs: renderThumb оборвать нельзя, поэтому
+    // гоним работу на обгон с таймером и освобождаем слот по таймеру, а не
+    // по завершению работы — иначе зависший MinIO или sharp держат оба
+    // места до перезапуска.
+    let timer!: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`миниатюра не уложилась в ${workMs} мс`)), workMs);
+    });
     try {
-      const meta = await this.storage.head(src.bucket, src.key);
-      if (!meta) throw new Error('исходника нет');
-      if (meta.size > THUMB_MAX_SOURCE_BYTES) throw new Error(`исходник больше ${THUMB_MAX_SOURCE_BYTES} байт`);
-      const body = await this.storage.download({ bucket: src.bucket, key: src.key });
-      const thumb = await renderThumb(body);
-      await this.storage.upload({
-        bucket: THUMB_BUCKET,
-        key,
-        body: thumb,
-        contentType: 'image/webp',
-        cacheControl: 'public, max-age=31536000, immutable',
-      });
-      this.remember(key);
-      return url;
+      return await Promise.race([this.render(src, key, url, workMs), timeout]);
     } finally {
+      clearTimeout(timer);
       release();
     }
+  }
+
+  private async render(src: ThumbSource, key: string, url: string, workMs: number): Promise<string> {
+    const signal = AbortSignal.timeout(workMs);
+    const meta = await this.storage.head(src.bucket, src.key, signal);
+    if (!meta) throw new Error('исходника нет');
+    if (meta.size > THUMB_MAX_SOURCE_BYTES) throw new Error(`исходник больше ${THUMB_MAX_SOURCE_BYTES} байт`);
+    const body = await this.storage.download({ bucket: src.bucket, key: src.key, abortSignal: signal });
+    const thumb = await renderThumb(body);
+    await this.storage.upload({
+      bucket: THUMB_BUCKET,
+      key,
+      body: thumb,
+      contentType: 'image/webp',
+      cacheControl: 'public, max-age=31536000, immutable',
+      abortSignal: signal,
+    });
+    this.remember(key);
+    return url;
   }
 
   private remember(key: string): void {
