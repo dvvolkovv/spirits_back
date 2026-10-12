@@ -1,5 +1,7 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../../common/services/pg.service';
+import { StorageService } from '../../common/services/storage.service';
+import { ChatFilesStats, loadChatFilesStats } from './chat-files-stats';
 
 /**
  * Content generation metrics — see monitoring.functions.md §3.7.
@@ -51,12 +53,18 @@ export interface ContentOverview {
     completionRatePct: number | null;
     avgDurationSec: number | null;
   };
+
+  /** «Медиа и файлы»; null — события не прочитались. */
+  files: ChatFilesStats | null;
 }
 
 @Injectable()
 export class ContentService {
   private readonly log = new Logger(ContentService.name);
-  constructor(private readonly pg: PgService) {}
+  constructor(
+    private readonly pg: PgService,
+    @Optional() private readonly storage?: StorageService,
+  ) {}
 
   private async one<T = any>(sql: string, params: any[] = []): Promise<T | null> {
     try {
@@ -125,6 +133,8 @@ export class ContentService {
     const dozvonCompleted = parseInt(dozvon?.completed || '0', 10);
     const videosFinished = videosCompleted + videosFailed;
 
+    const files = await loadChatFilesStats(this.pg, this.storage, window, interval);
+
     return {
       window,
       generatedAt: new Date().toISOString(),
@@ -153,6 +163,7 @@ export class ContentService {
         avgDurationSec: dozvon?.avg_duration_sec !== null && dozvon?.avg_duration_sec !== undefined
           ? Number(dozvon.avg_duration_sec) : null,
       },
+      files,
     };
   }
 }
