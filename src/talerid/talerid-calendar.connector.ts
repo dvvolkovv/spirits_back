@@ -40,21 +40,6 @@ function endOffsetIso(startOffsetIso: string, durationMin: number): string {
 }
 
 /**
- * Task 4 — TalerID calendar connector, implemented over the TalerID MCP server (`mcp:calendar`
- * scope). TalerID's MCP is stateless Streamable HTTP (POST-only, no session) — every call opens
- * a fresh transport+client, authenticated with a per-user Bearer access token from
- * TalerIdOauthService, and closes the transport afterwards.
- *
- * Only implements the event subset of CalendarConnector (list/create) — TalerID has no tasks
- * concept and no RRULE, so a recurring/multi-date ProposedEvent is expanded into N individual
- * create_calendar_event calls via expandOccurrences (reused from src/calendar/recurrence.ts).
- *
- * Best-effort like the Yandex connector: any failure (not connected, MCP error, unexpected
- * payload shape) degrades listEvents to `[]` rather than throwing, so co-pilot aggregation
- * never breaks because TalerID is unavailable.
- */
-@Injectable()
-/**
  * TalerID не подключён у этого пользователя.
  *
  * ⚠️ Это НЕ сбой, а законное «источника нет»: пустой календарь тут — правда. Отличать от
@@ -76,6 +61,21 @@ export class SourceUnavailable extends Error {
     this.name = 'SourceUnavailable';
   }
 }
+/**
+ * Task 4 — TalerID calendar connector, implemented over the TalerID MCP server (`mcp:calendar`
+ * scope). TalerID's MCP is stateless Streamable HTTP (POST-only, no session) — every call opens
+ * a fresh transport+client, authenticated with a per-user Bearer access token from
+ * TalerIdOauthService, and closes the transport afterwards.
+ *
+ * Only implements the event subset of CalendarConnector (list/create) — TalerID has no tasks
+ * concept and no RRULE, so a recurring/multi-date ProposedEvent is expanded into N individual
+ * create_calendar_event calls via expandOccurrences (reused from src/calendar/recurrence.ts).
+ *
+ * Best-effort like the Yandex connector: any failure (not connected, MCP error, unexpected
+ * payload shape) degrades listEvents to `[]` rather than throwing, so co-pilot aggregation
+ * never breaks because TalerID is unavailable.
+ */
+@Injectable()
 export class TalerIdCalendarConnector {
   private readonly logger = new Logger(TalerIdCalendarConnector.name);
 
