@@ -44,7 +44,11 @@ describe('ChatFilesService.listForSession', () => {
     ]);
     const items = await new ChatFilesService(pg as any).listForSession('u1', 'u1_12');
     expect(items).toEqual([
-      { key: url, kind: 'image', url, name: '1.png', ext: 'png', createdAt: '2026-10-05T10:00:00.000Z', messageId: 20, stored: true },
+      {
+        key: url, kind: 'image', url, name: '1.png', ext: 'png', createdAt: '2026-10-05T10:00:00.000Z', messageId: 20, stored: true,
+        // Картинка из нашего бакета — ручка миниатюры (chat-files-thumbs.spec.ts).
+        thumbPath: `/webhook/chat/thumb?src=${encodeURIComponent('linkeon-assets/images/1.png')}`,
+      },
     ]);
   });
 
