@@ -1,3 +1,4 @@
+const expect = Object.assign((actual: unknown, _message?: string) => globalThis.expect(actual), globalThis.expect) as typeof globalThis.expect;
 import type { Channel } from './bodygraph';
 import { HD_STRATEGIES, HD_TYPES, STRATEGY_OF, definedCenters, definedChannels, hdAuthority, hdDefinition, hdType } from './rules';
 

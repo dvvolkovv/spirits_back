@@ -1,3 +1,4 @@
+const expect = Object.assign((actual: unknown, _message?: string) => globalThis.expect(actual), globalThis.expect) as typeof globalThis.expect;
 import { formatOffset, localToUtc, wallFromParts, type Conversion } from './time';
 
 /**

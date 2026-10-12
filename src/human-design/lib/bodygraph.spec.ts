@@ -1,3 +1,4 @@
+const expect = Object.assign((actual: unknown, _message?: string) => globalThis.expect(actual), globalThis.expect) as typeof globalThis.expect;
 import { CENTER_GATES, CENTER_IDS, CHANNELS, GATE_CENTER, MOTORS, channelKey, type Channel } from './bodygraph';
 
 describe('устройство бодиграфа', () => {

@@ -5,7 +5,7 @@
 # Модуль правится ТОЛЬКО в land_linkeon (там его проверяет эталон Swiss
 # Ephemeris на 300 рождений и 10 карт ручной сверки); сюда — этим скриптом.
 # Тесты едут вместе: vitest → jest (импорт vitest убирается, *.test.ts →
-# *.spec.ts, путь к эталону — через __dirname). Сторож границы лендинга
+# *.spec.ts, путь к эталону — через __dirname, expect с сообщением — обёрткой). Сторож границы лендинга
 # (boundary.test.ts) не нужен бэкенду и не переносится.
 #
 # Запуск из корня spirits_back:
@@ -37,6 +37,10 @@ for f in "$SRC"/*.ts; do
       if grep -q "join(__dirname" "$out"; then
         { echo "import { join } from 'node:path';"; cat "$out"; } > "$out.tmp" && mv "$out.tmp" "$out"
       fi
+      # vitest принимает expect(значение, сообщение), jest 29 на втором аргументе
+      # бросает «Expect takes at most one argument». Обёртка отбрасывает сообщение,
+      # статические expect.any / expect.arrayContaining остаются на месте.
+      { echo "const expect = Object.assign((actual: unknown, _message?: string) => globalThis.expect(actual), globalThis.expect) as typeof globalThis.expect;"; cat "$out"; } > "$out.tmp" && mv "$out.tmp" "$out"
       ;;
     *) cp "$f" "$DST/$base" ;;
   esac

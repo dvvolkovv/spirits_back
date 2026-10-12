@@ -1,3 +1,4 @@
+const expect = Object.assign((actual: unknown, _message?: string) => globalThis.expect(actual), globalThis.expect) as typeof globalThis.expect;
 import { calculateChart } from './chart';
 import { HD_AUTHORITIES, HD_TYPES, type HdAuthority, type HdDefinition, type HdType } from './rules';
 

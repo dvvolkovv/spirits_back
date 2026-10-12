@@ -1,3 +1,4 @@
+const expect = Object.assign((actual: unknown, _message?: string) => globalThis.expect(actual), globalThis.expect) as typeof globalThis.expect;
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
 import { BODIES, designDate, longitudes } from './ephemeris';

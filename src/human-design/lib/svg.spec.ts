@@ -1,3 +1,4 @@
+const expect = Object.assign((actual: unknown, _message?: string) => globalThis.expect(actual), globalThis.expect) as typeof globalThis.expect;
 // @vitest-environment node
 import { DEFAULT_COLORS, gateSources, renderBodygraphSvg } from './svg';
 import { chartFromUtc } from './chart';
