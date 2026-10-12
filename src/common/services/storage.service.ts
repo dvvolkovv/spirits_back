@@ -134,13 +134,20 @@ export class StorageService implements OnModuleInit {
     }
   }
 
-  /** Сколько объектов и байт в бакете — постранично, весь бакет. */
-  async bucketStats(bucket: string): Promise<{ objects: number; bytes: number }> {
+  /**
+   * Сколько объектов и байт в бакете — постранично, весь бакет.
+   *
+   * abortSignal — на каждую страницу: без него список большого бакета, повисший
+   * на одной из страниц, ничем не ограничен (ручка статистики админки ждала бы
+   * MinIO вечно).
+   */
+  async bucketStats(bucket: string, abortSignal?: AbortSignal): Promise<{ objects: number; bytes: number }> {
     let objects = 0;
     let bytes = 0;
     let token: string | undefined;
     do {
-      const res: any = await this.s3.send(new ListObjectsV2Command({ Bucket: bucket, ContinuationToken: token }));
+      const cmd = new ListObjectsV2Command({ Bucket: bucket, ContinuationToken: token });
+      const res: any = abortSignal ? await this.s3.send(cmd, { abortSignal }) : await this.s3.send(cmd);
       for (const o of res.Contents ?? []) {
         objects += 1;
         bytes += Number(o.Size ?? 0);

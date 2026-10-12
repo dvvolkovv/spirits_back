@@ -26,6 +26,8 @@ export const CHAT_FILES_EVENTS = [
 ];
 
 const BUCKET_TTL_MS = 5 * 60_000;
+/** MinIO не ответил за это время — отдаём null, страница админки не зависает. */
+export const BUCKET_TIMEOUT_MS = 5_000;
 let bucketCache: { at: number; value: { objects: number; bytes: number } | null } | null = null;
 
 /** Только для тестов. */
@@ -33,13 +35,16 @@ export function __resetBucketCacheForTests(): void {
   bucketCache = null;
 }
 
-async function cachedBucketStats(storage?: Pick<StorageService, 'bucketStats'>) {
+async function cachedBucketStats(storage: Pick<StorageService, 'bucketStats'> | undefined, bucketTimeoutMs: number) {
   if (!storage) return null;
   if (bucketCache && Date.now() - bucketCache.at < BUCKET_TTL_MS) return bucketCache.value;
   let value: { objects: number; bytes: number } | null = null;
   try {
-    value = await storage.bucketStats(chatFilesBucket());
+    value = await storage.bucketStats(chatFilesBucket(), AbortSignal.timeout(bucketTimeoutMs));
   } catch {
+    // Сбой или таймаут MinIO кешируется как null на те же 5 минут — для
+    // админской страницы это ок: следующий заход переспросит сам, никто не
+    // ждёт ответа прямо сейчас.
     value = null;
   }
   bucketCache = { at: Date.now(), value };
@@ -58,6 +63,7 @@ export async function loadChatFilesStats(
   storage: Pick<StorageService, 'bucketStats'> | undefined,
   window: string,
   interval: string,
+  bucketTimeoutMs: number = BUCKET_TIMEOUT_MS,
 ): Promise<ChatFilesStats | null> {
   const params = [window, interval, excludedUsers(), TEST_USER_PATTERN, CHAT_FILES_EVENTS];
   const where = `name = ANY($5::text[])
@@ -67,36 +73,40 @@ export async function loadChatFilesStats(
   let c: any;
   let topFailReason: string | null = null;
   try {
-    c = (await pg.query(
-      `SELECT
-         COUNT(*) FILTER (WHERE name = 'chat_files_panel_open')::int                          AS opens,
-         COUNT(DISTINCT user_id) FILTER (WHERE name = 'chat_files_panel_open')::int           AS users,
-         COUNT(*) FILTER (WHERE name = 'chat_files_download')::int                            AS downloads,
-         COUNT(*) FILTER (WHERE name = 'chat_files_download' AND props->>'kind' = 'image')::int    AS dl_image,
-         COUNT(*) FILTER (WHERE name = 'chat_files_download' AND props->>'kind' = 'document')::int AS dl_document,
-         COUNT(*) FILTER (WHERE name = 'chat_files_download' AND props->>'kind' = 'video')::int    AS dl_video,
-         COUNT(*) FILTER (WHERE name = 'chat_files_download' AND props->>'kind' = 'audio')::int    AS dl_audio,
-         COUNT(*) FILTER (WHERE name = 'find_files_call')::int                                AS ff_calls,
-         COUNT(*) FILTER (WHERE name = 'find_files_call' AND props->>'found' ~ ${POSITIVE})::int   AS ff_found,
-         COUNT(*) FILTER (WHERE name = 'find_files_call' AND props->>'stored' ~ ${POSITIVE})::int  AS ff_stored,
-         COUNT(*) FILTER (WHERE name = 'chat_file_stored')::int                               AS stored,
-         COUNT(*) FILTER (WHERE name = 'chat_file_copy_failed')::int                          AS failed
-       FROM events
-       WHERE ${where}`,
-      params,
-    )).rows[0] ?? {};
-    const top = (await pg.query(
-      `SELECT props->>'reason' AS reason, COUNT(*)::int AS n
+    // Два запроса независимы — тянем разом, а не друг за другом.
+    const [counts, top] = await Promise.all([
+      pg.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE name = 'chat_files_panel_open')::int                          AS opens,
+           COUNT(DISTINCT user_id) FILTER (WHERE name = 'chat_files_panel_open')::int           AS users,
+           COUNT(*) FILTER (WHERE name = 'chat_files_download')::int                            AS downloads,
+           COUNT(*) FILTER (WHERE name = 'chat_files_download' AND props->>'kind' = 'image')::int    AS dl_image,
+           COUNT(*) FILTER (WHERE name = 'chat_files_download' AND props->>'kind' = 'document')::int AS dl_document,
+           COUNT(*) FILTER (WHERE name = 'chat_files_download' AND props->>'kind' = 'video')::int    AS dl_video,
+           COUNT(*) FILTER (WHERE name = 'chat_files_download' AND props->>'kind' = 'audio')::int    AS dl_audio,
+           COUNT(*) FILTER (WHERE name = 'find_files_call')::int                                AS ff_calls,
+           COUNT(*) FILTER (WHERE name = 'find_files_call' AND props->>'found' ~ ${POSITIVE})::int   AS ff_found,
+           COUNT(*) FILTER (WHERE name = 'find_files_call' AND props->>'stored' ~ ${POSITIVE})::int  AS ff_stored,
+           COUNT(*) FILTER (WHERE name = 'chat_file_stored')::int                               AS stored,
+           COUNT(*) FILTER (WHERE name = 'chat_file_copy_failed')::int                          AS failed
          FROM events
-        WHERE ${where} AND name = 'chat_file_copy_failed'
-        GROUP BY 1 ORDER BY 2 DESC LIMIT 1`,
-      params,
-    )).rows[0];
-    topFailReason = top?.reason ?? null;
+         WHERE ${where}`,
+        params,
+      ),
+      pg.query(
+        `SELECT props->>'reason' AS reason, COUNT(*)::int AS n
+           FROM events
+          WHERE ${where} AND name = 'chat_file_copy_failed'
+          GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 1`,
+        params,
+      ),
+    ]);
+    c = counts.rows[0] ?? {};
+    topFailReason = top.rows[0]?.reason ?? null;
   } catch {
     return null;
   }
-  const bucket = await cachedBucketStats(storage);
+  const bucket = await cachedBucketStats(storage, bucketTimeoutMs);
   const n = (v: unknown) => Number(v ?? 0) || 0;
   return {
     panel: { opens: n(c.opens), users: n(c.users) },
