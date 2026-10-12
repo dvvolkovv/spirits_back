@@ -61,6 +61,10 @@ const SEARCH_MESSAGES: Record<string, { noResults: string; noTargets: string; no
 
 const searchMsg = (lang: string) => SEARCH_MESSAGES[lang] || SEARCH_MESSAGES.ru;
 
+/** Карточки поиска уходят в поток кусками — см. writePaced. */
+const STREAM_PIECE_CHARS = 200;
+const STREAM_PIECE_GAP_MS = 10;
+
 @Injectable()
 export class MiscService {
   private readonly logger = new Logger(MiscService.name);
@@ -156,8 +160,24 @@ export class MiscService {
       this.logger.error(`search prose error: ${e.message}`);
     }
     const cards = selected.map((s) => s.card);
-    res.write(JSON.stringify({ type: 'item', content: `\n\nsearch_result:${JSON.stringify(cards)}` }) + '\n');
+    await this.writePaced(res, `\n\nsearch_result:${JSON.stringify(cards)}`);
     res.end();
+  }
+
+  /**
+   * Пишет текст item-событиями по STREAM_PIECE_CHARS символов с паузой — так,
+   * как раньше шли дельты модели. Веб и приложение на Capacitor режут поток по
+   * '\n' в пределах одного чтения, без хвоста между чтениями, и теряют строку,
+   * разрезанную границей чтения. nginx перед API (proxy_buffering off) читает
+   * из сокета буфером в страницу, поэтому строка на несколько килобайт пришла
+   * бы к ним разрезанной — и вместе с ней пропали бы все карточки.
+   */
+  private async writePaced(res: Response, content: string): Promise<void> {
+    const chars = Array.from(content);
+    for (let i = 0; i < chars.length; i += STREAM_PIECE_CHARS) {
+      if (i > 0) await new Promise((resolve) => setTimeout(resolve, STREAM_PIECE_GAP_MS));
+      res.write(JSON.stringify({ type: 'item', content: chars.slice(i, i + STREAM_PIECE_CHARS).join('') }) + '\n');
+    }
   }
 
   async analyzeCompatibility(userId: string, targetUsers: string[], res: Response): Promise<void> {
