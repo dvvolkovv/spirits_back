@@ -11,6 +11,8 @@ import { TgConfigService, TgBotConfigRow } from './tg-config.service';
 import { isPrivateConfig } from './tg-chat-kind';
 import { productsCliMcp } from '../products/products-cli-tool';
 import { withCrisisRule } from '../chat/crisis-rule';
+import { telegramPlatformGuide } from '../chat/platform-guide';
+import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 
 /**
  * Дефолтный ассистент для лички, когда preferred_agent пуст или указывает на
@@ -120,6 +122,22 @@ export class TgRouterService {
     } catch (e: any) {
       this.logger.warn(`profile for tg bot ${cfg.id} not loaded: ${e?.message}`);
       return '';
+    }
+  }
+
+  /**
+   * Язык интерфейса владельца — для подписей разделов кабинета в блоке
+   * «Linkeon»: кабинет владелец видит на нём. Сбой чтения не должен ронять ход.
+   */
+  private async ownerLanguage(cfg: TgBotConfigRow): Promise<string> {
+    try {
+      const r = await this.pg.query(
+        `SELECT profile_data->>'language' AS language FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
+        [cfg.owner_user_id],
+      );
+      return LanguageService.normalize(r.rows[0]?.language);
+    } catch {
+      return DEFAULT_LANGUAGE;
     }
   }
 
@@ -493,8 +511,13 @@ ${ownerProfile}
     // инструмент реально выдан: обещать его без инструмента нельзя.
     const productsBlock = products ? `\n\n${products.promptBlock}` : '';
 
+    // Что есть в Linkeon и чего нет в этом чате (chat/platform-guide.ts) — только
+    // штатным ассистентам, как в вебе: у бота с ассистентом пользователя может
+    // быть свой бренд, и рассказывать в его группе про Linkeon незачем.
+    const platformBlock = cfg.custom_agent_id ? '' : `\n\n${telegramPlatformGuide(await this.ownerLanguage(cfg))}`;
+
     const systemWithCtx = `Ты в Telegram-группе. Владелец бота, который платит за твою работу: ${ownerFirstName}. Текущая дата/время: ${new Date().toISOString()}.
-${ioInstructions}${productsBlock}${profileBlock}
+${ioInstructions}${productsBlock}${platformBlock}${profileBlock}
 
 ${systemPrompt}`;
 
