@@ -18,6 +18,7 @@ import { CreateVideoJobDto } from '../video/video.dto';
 import { MailService } from '../common/services/mail.service';
 import { LanguageService } from '../common/services/language.service';
 import { buildOwnerReplyEmail } from './support-mail';
+import { platformSections } from '../chat/platform-guide';
 
 @Injectable()
 export class SupportService implements OnModuleInit {
@@ -444,7 +445,8 @@ export class SupportService implements OnModuleInit {
     return `Ты — ИИ-поддержка платформы LINKEON.IO. Отвечай кратко и по делу.
 ${LanguageService.buildDirective(lang)}
 
-ПЛАТФОРМА. LINKEON.IO — AI-ассистенты для бизнеса и личного роста, нетворкинг (поиск людей + совместимость + запросы на общение + чаты между пользователями), генерация изображений и видео (Kling), реферальная программа.
+ПЛАТФОРМА. LINKEON.IO — AI-ассистенты для бизнеса и личного роста. Разделы и кнопки (называй их так, как они подписаны у пользователя, — в кавычках):
+${platformSections(lang)}
 
 ТВОЯ РОЛЬ.
 - Помогай юзеру решать вопросы по использованию платформы.

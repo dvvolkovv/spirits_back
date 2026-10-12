@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { HttpException } from '@nestjs/common';
-import { PRODUCT_TOOLS, PRODUCT_TOOL_NAME, ProductToolService, domainForAssistant, domainSay, DOMAIN_FAILED_SAY, DOMAIN_REFUSAL_SAY } from './product-tool.service';
+import { PRODUCT_TOOLS, PRODUCT_TOOL_NAME, NO_PRODUCTS_SAY, ProductToolService, domainForAssistant, domainSay, DOMAIN_FAILED_SAY, DOMAIN_REFUSAL_SAY } from './product-tool.service';
 import { DOMAIN_ERROR_REASONS, DomainView } from './domains.service';
 
 describe('определение инструмента продуктов', () => {
@@ -22,6 +22,9 @@ describe('определение инструмента продуктов', () 
   it('новый продукт — кнопкой в Студии: отдельного пункта «Продукты» в меню нет', () => {
     expect(tool().description).toMatch(/в Студии, вкладка «Продукты»/);
     expect(tool().description).not.toMatch(/в кабинете, вкладка «Продукты»/);
+    // Ответ на пустой list — тоже: интеграционный тест в product-tool.spec без
+    // базы пропускается, поэтому текст проверяется здесь.
+    expect(NO_PRODUCTS_SAY).toMatch(/в Студии, вкладка «Продукты»/);
   });
 
   it('описание domain: записи дословно, AAAA, без обещания, бесплатно', () => {

@@ -121,14 +121,28 @@ const LABELS: Record<Lang, Labels> = {
   },
 };
 
-/** Блок для системного промпта; незнакомый язык — русские подписи. */
+/** Незнакомый язык — русские подписи. */
+const labelsFor = (lang: string): Labels => (LABELS as Record<string, Labels>)[lang] ?? LABELS.ru;
+
+/** Блок для системного промпта ассистента. */
 export function platformGuide(lang: string): string {
-  const l = (LABELS as Record<string, Labels>)[lang] ?? LABELS.ru;
+  const l = labelsFor(lang);
   return [
     '--- ЧТО ЕСТЬ В LINKEON ---',
     'Если спрашивают, что ещё есть на платформе, где что найти или как сделать то, что делается не в разговоре, — ' +
       'отвечай по этому списку. Разделы и кнопки называй так, как они подписаны у пользователя: в кавычках ниже. ' +
       `Чего в списке нет, не выдумывай: скажи, что не знаешь, и предложи «${l.support}» в разделе «${l.help}».`,
+    platformSections(lang),
+  ].join('\n');
+}
+
+/**
+ * Перечень разделов без вступления. Его же берёт ИИ-поддержка
+ * (support.service.ts): совет «предложи связаться с поддержкой» ей ни к чему.
+ */
+export function platformSections(lang: string): string {
+  const l = labelsFor(lang);
+  return [
     `• «${l.chat}» — разговоры с ассистентами. Под ответом ассистента — «${l.listen}»: ответ голосом. ` +
       `«${l.fresh}» — разговор без прошлой истории. «${l.files}» — картинки, видео и файлы этого разговора. ` +
       'Файл к сообщению прикладывается кнопкой «+».',
