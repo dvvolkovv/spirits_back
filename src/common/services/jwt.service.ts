@@ -27,6 +27,17 @@ export class JwtService {
     return jwt.verify(token, this.secret);
   }
 
+  /**
+   * Только токен доступа. Тем же секретом подписаны токены обновления и
+   * токены инструмента продуктов — последние живут на релее, где их видят и
+   * чужие сессии. Где решается «чей это аккаунт», нужен именно этот метод.
+   */
+  verifyAccess(token: string): any {
+    const payload: any = this.verify(token);
+    if (payload?.type !== 'access') throw new Error('not an access token');
+    return payload;
+  }
+
   decode(token: string): any {
     return jwt.decode(token);
   }

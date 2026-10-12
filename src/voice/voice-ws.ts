@@ -29,7 +29,7 @@ export function attachVoiceWs(app: INestApplication): void {
     let userId: string | null = null;
     try {
       const token = new URL(req.url || '', 'http://localhost').searchParams.get('token') || '';
-      const payload: any = jwt.verify(token);
+      const payload: any = jwt.verifyAccess(token);
       userId = payload?.userId || payload?.sub || null;
     } catch { userId = null; }
 
