@@ -1,4 +1,5 @@
-const expect = Object.assign((actual: unknown, _message?: string) => globalThis.expect(actual), globalThis.expect) as typeof globalThis.expect;
+const jestExpect = (globalThis as unknown as { expect: jest.Expect }).expect;
+const expect = Object.assign(<T>(actual: T, _message?: string) => jestExpect(actual), jestExpect);
 import { BODIES, designDate, longitudes } from './ephemeris';
 
 /**

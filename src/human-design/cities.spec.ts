@@ -1,3 +1,5 @@
+const jestExpect = (globalThis as unknown as { expect: jest.Expect }).expect;
+const expect = Object.assign(<T>(actual: T, _message?: string) => jestExpect(actual), jestExpect);
 import { cityPlace, indexCities, normalize, searchCities, type CityDb } from './cities';
 
 const DB: CityDb = {
