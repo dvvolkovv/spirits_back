@@ -4,6 +4,10 @@ import * as jwt from 'jsonwebtoken';
 @Injectable()
 export class JwtService {
   private readonly secret = process.env.JWT_SECRET || 'default_secret_change_me';
+  // На время смены JWT_SECRET: проверяем и прежним, подписываем только новым.
+  // Открытые сессии доживают до ближайшего обновления токена и получают уже
+  // новые; потом переменную убирают (jwt-rotation.spec.ts).
+  private readonly previousSecret = process.env.JWT_SECRET_PREVIOUS || null;
   private readonly accessExpires = parseInt(process.env.JWT_ACCESS_EXPIRES || '7200');
   private readonly refreshExpires = parseInt(process.env.JWT_REFRESH_EXPIRES || '2592000');
 
@@ -24,7 +28,13 @@ export class JwtService {
   }
 
   verify(token: string): any {
-    return jwt.verify(token, this.secret);
+    try {
+      return jwt.verify(token, this.secret);
+    } catch (e) {
+      // Просроченный токен прежний секрет не оживляет.
+      if (!this.previousSecret || e instanceof jwt.TokenExpiredError) throw e;
+      return jwt.verify(token, this.previousSecret);
+    }
   }
 
   /**
