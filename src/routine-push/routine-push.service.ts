@@ -10,6 +10,31 @@ import { sendTelegramAlert } from '../common/telegram-alert';
 
 const RAYA_ID = '14';
 
+/**
+ * Похоже ли это на сбой инструмента, а не на ответ ассистента.
+ *
+ * Признаки взяты из того, что реально приходило: Claude CLI на неудачной аутентификации
+ * возвращает «Failed to authenticate…» обычным текстом и кодом успеха. Ответ ассистента
+ * такого не начинает — он на русском и от первого лица.
+ *
+ * ⚠️ Это пол, а не потолок: ловит известные формы. Поэтому проверка стоит в проактивном
+ * канале, где цена ошибки выше (человек не просил сообщения), и НЕ подменяет собой
+ * честную обработку ошибок в самом ChatService.
+ */
+export function looksLikeFailure(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  if (t.length > 400) return false;   // длинный связный текст — это ответ, а не ошибка
+  return [
+    'failed to authenticate',
+    'oauth session expired',
+    'authentication_error',
+    'api error:',
+    'invalid authentication credentials',
+    'rate limit',
+    'internal server error',
+  ].some((marker) => t.includes(marker));
+}
+
 @Injectable()
 export class RoutinePushService implements OnModuleInit {
   private readonly logger = new Logger(RoutinePushService.name);
@@ -59,6 +84,19 @@ export class RoutinePushService implements OnModuleInit {
     const text = await this.chat.generateAgentReply(userId, assistantId, prompt);
     if (!text || !text.trim()) {
       this.logger.warn(`routine deliver: empty text for ${userId} / assistant ${assistantId}`);
+      return 0;
+    }
+    // ⚠️ Сбой генерации НЕ отправляем человеку как сообщение ассистента.
+    //
+    // 12.10.2026 в 02:00 сессия Claude CLI не обновилась, ошибка вернулась ТЕКСТОМ (не
+    // исключением), и владелец получил пуш от Райи с содержимым «Failed to authenticate:
+    // OAuth session expired and could not be refreshed». Проверка на пустоту такое не
+    // ловит: текст есть. Рутина — сообщение, которого человек не просил; промолчать
+    // лучше, чем прислать мусор от его имени. Следующий запуск по расписанию попробует
+    // снова, а строка в логе показывает, что проход был и почему не дошёл.
+    if (looksLikeFailure(text)) {
+      this.logger.error(`routine deliver: ОТМЕНЕНО, генерация вернула ошибку текстом `
+        + `для ${userId} / assistant ${assistantId}: ${text.slice(0, 160)}`);
       return 0;
     }
     const agentNum = /^\d+$/.test(assistantId) ? parseInt(assistantId, 10) : null;
