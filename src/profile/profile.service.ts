@@ -3,32 +3,13 @@ import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { IdentityService } from '../identity/identity.service';
 import { OAuthAppleService } from '../auth/oauth-apple.service';
-import { VOICE_CATALOG } from '../speech/voices';
+import { PUBLIC_PROFILE_KEYS, sanitizeAssistantVoices, sanitizeProfilePatch } from './profile-patch';
 import * as fs from 'fs';
 import * as path from 'path';
 
-/** Ассистентов в каталоге полтора десятка; 50 — запас, за которым уже мусор. */
-const MAX_VOICE_OVERRIDES = 50;
-
-/**
- * Пользовательский выбор голосов (`profile_data.assistant_voices`) приходит из
- * браузера, поэтому проверяем всё: ключ — имя ассистента (оно же
- * `preferred_agent`), значение — id голоса из каталога. Несуществующие id
- * выбрасываем, `null` трактуем как «сбросить на дефолт» (resolveVoice сам
- * подставит голос ассистента, когда переопределения нет).
- */
-export function sanitizeAssistantVoices(raw: any): Record<string, string> {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
-  const valid = new Set(VOICE_CATALOG.map((v) => v.id));
-  const out: Record<string, string> = {};
-  for (const [assistant, voice] of Object.entries(raw)) {
-    if (Object.keys(out).length >= MAX_VOICE_OVERRIDES) break;
-    if (typeof voice !== 'string') continue;
-    if (!valid.has(voice)) continue;
-    out[assistant] = voice;
-  }
-  return out;
-}
+// Чистка голосов живёт рядом с белым списком profile-update; реэкспорт —
+// для тех, кто импортирует её отсюда.
+export { sanitizeAssistantVoices };
 
 @Injectable()
 export class ProfileService implements OnModuleInit {
@@ -98,6 +79,9 @@ export class ProfileService implements OnModuleInit {
 
     return [{
       profileJson: {
+        // Сначала profile_data, потом вычисленные поля: иначе ключ из
+        // profile_data перекрыл бы isadmin, tokens, email и прочее.
+        ...pdNonEntities,
         id: row.id,
         user_id: row.user_id,
         preferred_agent: row.preferred_agent,
@@ -110,7 +94,6 @@ export class ProfileService implements OnModuleInit {
         profile_data: pd, // raw column для обратной совместимости со старым фронтом
         created_at: row.created_at,
         updated_at: row.updated_at,
-        ...pdNonEntities,
         // Свежие entities из Neo4j (если есть). Имя/фамилия — из profile_data
         // (туда их пишет ProfileService.updateProfile + KYC), Neo4j редко
         // имеет name заполненным.
@@ -133,15 +116,12 @@ export class ProfileService implements OnModuleInit {
   }
 
   async updateProfile(userId: string, data: Record<string, any>) {
-    // Entities (values, beliefs, etc.) are stored in Neo4j only — strip them here
-    const { values, desires, intents, intentions, beliefs, interests, skills, ...rest } = data;
-    const patch: Record<string, any> = { ...rest };
-
-    // Только если поле реально пришло: безусловная санитизация подставила бы
-    // assistant_voices: {} в каждый апдейт профиля и стирала бы выбор голосов
-    // при любом сохранении имени.
-    if ('assistant_voices' in patch) {
-      patch.assistant_voices = sanitizeAssistantVoices(patch.assistant_voices);
+    // Только известные поля (profile-patch.ts). Раньше сюда вливался любой
+    // ключ, и в ответе профиля им перекрывались isadmin, tokens, email.
+    // Портрет (values и т.д.) пишет в Neo4j контроллер.
+    const { patch, dropped } = sanitizeProfilePatch(data);
+    if (dropped.length > 0) {
+      this.logger.warn(`profile-update: отброшены поля ${dropped.join(', ')}`);
     }
 
     if (Object.keys(patch).length > 0) {
@@ -264,9 +244,14 @@ export class ProfileService implements OnModuleInit {
       skills: (neo?.skills?.length ? neo.skills : pd.skills) || [],
     };
 
+    const publicPd: Record<string, any> = {};
+    for (const k of PUBLIC_PROFILE_KEYS) {
+      if (pd[k] !== undefined) publicPd[k] = pd[k];
+    }
+
     return {
       user_id: row.user_id,
-      profile_data: { ...pd, ...merged },
+      profile_data: { ...publicPd, ...merged },
       ...merged,
     };
   }

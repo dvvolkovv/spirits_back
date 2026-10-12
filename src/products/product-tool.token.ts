@@ -38,6 +38,11 @@ function secret(): string {
   return process.env.JWT_SECRET || 'default_secret_change_me';
 }
 
+/** Прежний секрет на время его смены — как в JwtService. */
+function previousSecret(): string | null {
+  return process.env.JWT_SECRET_PREVIOUS || null;
+}
+
 /**
  * Чистые функции, а не сервис Nest, сознательно. Чеканит их chat.service, у
  * которого конструктор уже на 26 зависимостей и с десятком @Optional: ещё один
@@ -64,7 +69,15 @@ export function signProductToolToken(userId: string, channel: ProductToolChannel
  * истории правок, поэтому — отказ.
  */
 export function verifyProductToolToken(token: string): ProductToolClaims {
-  const payload: any = jwt.verify(token, secret());
+  let payload: any;
+  try {
+    payload = jwt.verify(token, secret());
+  } catch (e) {
+    // Токен, выпущенный до смены секрета, доживает свой срок; просроченный — нет.
+    const prev = previousSecret();
+    if (!prev || e instanceof jwt.TokenExpiredError) throw e;
+    payload = jwt.verify(token, prev);
+  }
   if (payload?.type !== PRODUCT_TOOL_TOKEN_TYPE) {
     throw new Error(`Неверный тип токена: ${payload?.type}`);
   }
