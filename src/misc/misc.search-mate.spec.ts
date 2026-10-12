@@ -145,6 +145,8 @@ describe('MiscService.searchMate: проза и карточки об одних
     // Служебные оценки поиска в промпте прозы модель цитирует пользователю
     // («совпадение cos=0.62») — поймано прогоном на живых данных.
     expect(prosePrompt).not.toMatch(/cos=|totalScore/);
+    // То же с ярлыками категорий: в прозе всплывало «обладает [Skill] в…».
+    expect(prosePrompt).not.toMatch(/\[(Value|Desire|Interest|Intent|Belief|Skill)\]/);
     expect(prosePrompt.indexOf(GLOSS[3])).toBeLessThan(prosePrompt.indexOf(GLOSS[5]));
     expect(prosePrompt.indexOf(GLOSS[5])).toBeLessThan(prosePrompt.indexOf(GLOSS[7]));
 
