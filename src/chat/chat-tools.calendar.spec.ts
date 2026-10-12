@@ -1,4 +1,4 @@
-import { validateProposedEvent } from './chat-tools';
+import { CHAT_TOOLS, validateProposedEvent } from './chat-tools';
 
 describe('validateProposedEvent', () => {
   it('kind=task: always ok, even with nothing set', () => {
@@ -113,5 +113,27 @@ describe('validateProposedEvent', () => {
   it('kind=event: rejects empty dates array', () => {
     const r = validateProposedEvent({ kind: 'event', dates: [] });
     expect(r.ok).toBe(false);
+  });
+});
+
+/**
+ * Куда попадает принятое «дело» (kind="task").
+ *
+ * Описание обещало «Мои дела» — это список задач Яндекс.Календаря, а дела туда
+ * не пишутся: с bd12e15 они уходят в задачи Taler ID, без него — во внутренний
+ * список Linkeon, которого в веб-кабинете нет. Ассистент называл человеку
+ * раздел, где дело не найти.
+ */
+describe('propose_calendar_event: куда попадает дело', () => {
+  const description = () => CHAT_TOOLS.find((t) => t.name === 'propose_calendar_event')!.description;
+
+  it('не обещает «Мои дела»', () => {
+    expect(description()).not.toContain('Мои дела');
+  });
+
+  it('называет, куда уходит дело, и что в веб-кабинете его не видно', () => {
+    const d = description().replace(/\s+/g, ' ');
+    expect(d).toMatch(/задачи Taler ID/);
+    expect(d).toMatch(/в веб-кабинете этого списка нет/);
   });
 });
