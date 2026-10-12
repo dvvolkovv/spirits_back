@@ -83,6 +83,17 @@ describe('инструмент calculate_human_design', () => {
     expect(mismatch).toEqual({ ok: false, error: 'cityId не из вариантов прошлого ответа — вызовите без cityId.' });
   });
 
+  it('cityId из подсказки (не только точного совпадения) — реальная база: «Новгород» → Великий Новгород', async () => {
+    const { svc } = service();
+    const first = await svc.calculate({ date: '1990-03-12', time: '14:25', city: 'Новгород' });
+    expect(first.ok && first.kind).toBe('choose_city');
+    if (!(first.ok && first.kind === 'choose_city')) throw new Error('ожидались варианты');
+    const veliky = first.candidates.find((c) => c.name === 'Великий Новгород');
+    expect(veliky).toBeDefined();
+    const r = await svc.calculate({ date: '1990-03-12', time: '14:25', city: 'Новгород', cityId: veliky!.cityId });
+    expect(r).toMatchObject({ ok: true, kind: 'chart', city: { name: 'Великий Новгород' } });
+  });
+
   it('час перевода стрелок — вопрос «до или после»; с ответом — карта', async () => {
     const { svc } = service();
     const r = await svc.calculate({ date: '2014-10-26', time: '01:30', city: 'Москва, Россия' });
@@ -113,6 +124,23 @@ describe('инструмент calculate_human_design', () => {
     const r = await svc.calculate({ date: '1990-02-30', time: '14:25', city: 'Кировск' });
     expect(r.ok).toBe(false);
     expect(!r.ok && r.error).toMatch(/дат/);
+  });
+
+  it('ранняя проверка будущего — запас в сутки для восточных поясов (Владивосток), но не в двое суток', async () => {
+    const { svc } = service();
+    // Фиксируем «сейчас»: вечер по UTC — так дата «на сутки вперёд» по UTC
+    // гарантированно даёт момент рождения в прошлом (Владивосток на 10 часов
+    // впереди UTC: местная полночь — ещё день по UTC не кончился).
+    jest.useFakeTimers().setSystemTime(new Date('2026-06-15T20:00:00Z'));
+    try {
+      const tomorrow = await svc.calculate({ date: '2026-06-16', time: '00:30', city: 'Владивосток' });
+      expect(tomorrow).toMatchObject({ ok: true, kind: 'chart' });
+
+      const dayAfter = await svc.calculate({ date: '2026-06-17', time: '00:30', city: 'Владивосток' });
+      expect(dayAfter).toEqual({ ok: false, error: 'Дата рождения в будущем — проверьте год.' });
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('город длиннее 100 символов — обрезается, не падает', async () => {

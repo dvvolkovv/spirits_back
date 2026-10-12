@@ -118,4 +118,28 @@ describe('город для инструмента Райи', () => {
     // Без populations — прежнее поведение, уточнение.
     expect(resolveCity(moscowIndex, 'Москва').kind).toBe('choose');
   });
+
+  it('подсказка отфильтровала всё, а среди тёзков — явный перевес населения: вариант один (не found, тёзку не подсовываем)', () => {
+    const moscowDb: CityDb = {
+      v: 1,
+      zones: ['Europe/Moscow'],
+      countries: { RU: 'Россия' },
+      regions: ['Москва'],
+      cities: [
+        ['Москва', 'Moscow', 'RU', 0, 10381, 0],
+        ['Москва', 'Moscow', 'RU', 0, 25, -1], // тёзка за рубежом — регион не 'Москва', не отфильтруется им самим
+      ],
+    };
+    const moscowIndex = indexCities(moscowDb);
+    const moscowPopulations = moscowDb.cities.map((c) => c[4]);
+    // Подсказка «Московская область» отфильтровывает обе записи (у первой
+    // регион — null, у второй region=-1 тоже null): откат без подсказки
+    // находит обе, но доминирующую (в 20+ раз крупнее) отдаём одной —
+    // списком из одного кандидата, а не found.
+    const r = resolveCity(moscowIndex, 'Москва, Московская область', undefined, moscowPopulations);
+    expect(r.kind).toBe('choose');
+    if (r.kind !== 'choose') return;
+    expect(r.candidates).toHaveLength(1);
+    expect(r.candidates[0].cityId).toBe(0);
+  });
 });
