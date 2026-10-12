@@ -332,7 +332,7 @@ export class ChatService {
    * streamUniversalAgent: несколько вызовов за один ход делят один дедлайн).
    * Без него — полный PERSIST_TURN_BUDGET_MS, как раньше.
    */
-  storeRelayLinks(lines: string[], agentUrl: string, opts?: { budgetMs?: number }): Promise<string[]> {
+  storeRelayLinks(lines: string[], agentUrl: string, opts?: { budgetMs?: number; userId?: string }): Promise<string[]> {
     return storeRelayLinks(lines, agentUrl, this.chatFiles, (m) => this.logger.warn(m), opts);
   }
 
@@ -1541,7 +1541,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       const lines = await this.storeRelayLinks(
         outputFileLines(pendingFiles, AGENT_URL),
         AGENT_URL,
-        { budgetMs: budgetForFilesCall() },
+        { budgetMs: budgetForFilesCall(), userId },
       );
       const tail = '\n\n' + lines.join('\n');
       chunks.push(tail);
@@ -1906,7 +1906,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
           if (resolved.length > 0) {
             const tail = '\n\n' + (await this.storeRelayLinks(
-              resolved, AGENT_URL, { budgetMs: budgetForFilesCall() },
+              resolved, AGENT_URL, { budgetMs: budgetForFilesCall(), userId },
             )).join('\n');
             chunks.push(tail);
             safeWrite({ type: 'item', content: tail });

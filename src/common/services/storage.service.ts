@@ -5,6 +5,7 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   DeleteObjectCommand,
+  HeadObjectCommand,
   ListObjectsV2Command,
 } from '@aws-sdk/client-s3';
 import { Readable } from 'stream';
@@ -30,6 +31,8 @@ export interface UploadInput {
 export interface DownloadInput {
   bucket: string;
   key: string;
+  /** Обрывает скачивание: срок на одну миниатюру (thumbnail.service.ts). */
+  abortSignal?: AbortSignal;
 }
 
 export interface DeleteInput {
@@ -86,9 +89,10 @@ export class StorageService implements OnModuleInit {
   }
 
   async download(input: DownloadInput): Promise<Buffer> {
-    const res = await this.s3.send(
-      new GetObjectCommand({ Bucket: input.bucket, Key: input.key }),
-    );
+    const cmd = new GetObjectCommand({ Bucket: input.bucket, Key: input.key });
+    const res = input.abortSignal
+      ? await this.s3.send(cmd, { abortSignal: input.abortSignal })
+      : await this.s3.send(cmd);
     const stream = res.Body as Readable;
     const chunks: Buffer[] = [];
     for await (const chunk of stream) {
@@ -112,6 +116,45 @@ export class StorageService implements OnModuleInit {
       }),
     );
     return (res.Contents ?? []).map((o) => o.Key as string);
+  }
+
+  /** Размер и тип объекта; null — объекта нет. Прочие ошибки MinIO бросает. */
+  async head(
+    bucket: string,
+    key: string,
+    abortSignal?: AbortSignal,
+  ): Promise<{ size: number; contentType?: string } | null> {
+    try {
+      const cmd = new HeadObjectCommand({ Bucket: bucket, Key: key });
+      const res = abortSignal ? await this.s3.send(cmd, { abortSignal }) : await this.s3.send(cmd);
+      return { size: Number(res.ContentLength ?? 0), contentType: res.ContentType };
+    } catch (e: any) {
+      if (e?.name === 'NotFound' || e?.$metadata?.httpStatusCode === 404) return null;
+      throw e;
+    }
+  }
+
+  /**
+   * Сколько объектов и байт в бакете — постранично, весь бакет.
+   *
+   * abortSignal — на каждую страницу: без него список большого бакета, повисший
+   * на одной из страниц, ничем не ограничен (ручка статистики админки ждала бы
+   * MinIO вечно).
+   */
+  async bucketStats(bucket: string, abortSignal?: AbortSignal): Promise<{ objects: number; bytes: number }> {
+    let objects = 0;
+    let bytes = 0;
+    let token: string | undefined;
+    do {
+      const cmd = new ListObjectsV2Command({ Bucket: bucket, ContinuationToken: token });
+      const res: any = abortSignal ? await this.s3.send(cmd, { abortSignal }) : await this.s3.send(cmd);
+      for (const o of res.Contents ?? []) {
+        objects += 1;
+        bytes += Number(o.Size ?? 0);
+      }
+      token = res.IsTruncated ? res.NextContinuationToken : undefined;
+    } while (token);
+    return { objects, bytes };
   }
 
   publicUrl(bucket: string, key: string): string {

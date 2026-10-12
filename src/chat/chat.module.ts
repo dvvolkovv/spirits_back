@@ -13,11 +13,13 @@ import { TokensModule } from '../tokens/tokens.module';
 import { ChatFileStore } from './chat-files/chat-file-store';
 import { ChatFilesController } from './chat-files/chat-files.controller';
 import { ChatFilesService } from './chat-files/chat-files.service';
+import { ChatThumbController } from './chat-files/chat-thumb.controller';
+import { ThumbnailService } from './chat-files/thumbnail.service';
 
 @Module({
   imports: [MiscModule, CommonModule, RoomModule, VideoModule, CalendarModule, TalerIdModule, SpeechModule, TokensModule],
-  controllers: [ChatController, ChatFilesController],
-  providers: [ChatService, ChatToolsService, ChatFileStore, ChatFilesService],
+  controllers: [ChatController, ChatFilesController, ChatThumbController],
+  providers: [ChatService, ChatToolsService, ChatFileStore, ChatFilesService, ThumbnailService],
   exports: [ChatToolsService, ChatService, ChatFilesService],
 })
 export class ChatModule {}

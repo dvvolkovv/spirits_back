@@ -63,7 +63,8 @@ export async function storeRelayLinks(
   // резолв пустых скобок), и без общего бюджета каждый вызов получал бы свой
   // полный PERSIST_TURN_BUDGET_MS поверх уже потраченного предыдущим. Без
   // opts — поведение как раньше, store.persist сам возьмёт свой дефолт.
-  opts?: { budgetMs?: number },
+  // userId — владелец хода, для статистики сохранения файлов.
+  opts?: { budgetMs?: number; userId?: string },
 ): Promise<string[]> {
   const prefix = relayFilesPrefix(agentUrl);
   const parsed = lines.map((line) => {
