@@ -1561,6 +1561,9 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
         ? meetingInstructions({
             name: agentName,
             persona: meta.agentPersona || '',
+            // Для ответа на прямой вопрос «кто ты». Во вступлении имени
+            // владельца больше нет — см. meetingIntro().
+            ownerName: meta.ownerName,
             preamble: meta.preamble,
             specialists: meta.specialists,
             // Ровно то же условие, что и у тулов: промпт и набор инструментов
@@ -1691,7 +1694,7 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
       // to meet you», и только на русский вопрос модель переключилась сама.
       replySafe({
         instructions: isMeeting
-          ? meetingIntro(agentName, meta.ownerName || 'пользователя')
+          ? meetingIntro(agentName)
           : callIntro(),
       });
     } catch (e: any) {
