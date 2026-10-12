@@ -49,4 +49,22 @@ describe('StorageService.bucketStats', () => {
   it('пустой бакет — нули', async () => {
     expect(await svcWith(jest.fn().mockResolvedValue({ IsTruncated: false })).bucketStats('b')).toEqual({ objects: 0, bytes: 0 });
   });
+
+  it('abortSignal уходит в send на каждой странице — список можно оборвать', async () => {
+    const send = jest.fn()
+      .mockResolvedValueOnce({ Contents: [{ Size: 1 }], IsTruncated: true, NextContinuationToken: 't2' })
+      .mockResolvedValueOnce({ Contents: [{ Size: 2 }], IsTruncated: false });
+    const s = svcWith(send);
+    const ctl = new AbortController();
+    await s.bucketStats('b', ctl.signal);
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[0][1]?.abortSignal).toBe(ctl.signal);
+    expect(send.mock.calls[1][1]?.abortSignal).toBe(ctl.signal);
+  });
+
+  it('без abortSignal send зовётся как раньше — одним аргументом', async () => {
+    const send = jest.fn().mockResolvedValue({ IsTruncated: false });
+    await svcWith(send).bucketStats('b');
+    expect(send.mock.calls[0]).toHaveLength(1);
+  });
 });

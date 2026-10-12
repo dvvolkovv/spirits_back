@@ -66,4 +66,16 @@ describe('loadChatFilesStats', () => {
     // Сравнение текстом, без ::int: props->>'found' = 'abc' не должен ломать запрос.
     expect(pg.calls[0].sql).not.toMatch(/props->>'(found|stored)'\)::int/);
   });
+
+  it('MinIO завис — таймаут бакета, а не бесконечное ожидание ответа', async () => {
+    const pg = pgWith([[ROW], []]);
+    // Никогда не резолвится сама — только когда сигнал оборвали.
+    const storage = {
+      bucketStats: jest.fn((_bucket: string, signal?: AbortSignal) => new Promise<never>((_, reject) => {
+        signal?.addEventListener('abort', () => reject(new Error('aborted')));
+      })),
+    };
+    const s = await loadChatFilesStats(pg as any, storage as any, '30d', '30 days', 20);
+    expect(s?.storage).toMatchObject({ bucketObjects: null, bucketBytes: null });
+  }, 1000);
 });
