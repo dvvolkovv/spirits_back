@@ -123,7 +123,7 @@ export class MeetingBot {
     const ws = new WebSocket(this.wsUrl);
     this.ws = ws;
     ws.on('open', () => this.log.info?.(`[${this.id}] звук: подключились к воркеру`));
-    ws.on('message', (raw) => this.playFromWorker(raw));
+    ws.on('message', (raw) => this.onWorkerMessage(raw));
     ws.on('error', (e) => this.log.warn?.(`[${this.id}] звук: ${e?.message}`));
     ws.on('close', () => {
       if (this.closed) return;
@@ -158,19 +158,60 @@ export class MeetingBot {
     return this.page?.mainFrame();
   }
 
-  /** Кусок голоса ассистента — в страницу. */
-  async playFromWorker(raw) {
+  /**
+   * Сообщение от воркера.
+   *
+   * Триггеров два, и разбор у них общий. Чужие молча пропускаем: сокет тот же
+   * самый, что и у голоса, и падать из-за незнакомого сообщения нельзя.
+   */
+  async onWorkerMessage(raw) {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
-    if (msg.trigger !== 'realtime_audio.bot_output' || !msg.data?.chunk) return;
-    // Строку отдаём страницу как есть: разбор PCM дешевле сделать там, чем
+    if (msg.trigger === 'realtime_audio.bot_output' && msg.data?.chunk) {
+      return this.playChunk(msg.data.chunk);
+    }
+    if (msg.trigger === 'bot_mute') {
+      return this.setMicMuted(!!msg.data?.on);
+    }
+  }
+
+  /** Кусок голоса ассистента — в страницу. */
+  async playChunk(chunk) {
+    // Строку отдаём странице как есть: разбор PCM дешевле сделать там, чем
     // гнать через мост CDP массив чисел.
     try {
       const frame = await this.micFrame();
-      await frame?.evaluate((chunk) => window.__botPlayPcm?.(chunk), msg.data.chunk);
+      await frame?.evaluate((c) => window.__botPlayPcm?.(c), chunk);
     } catch (e) {
       // Страница могла уйти — это не повод рушить встречу.
       this.log.warn?.(`[${this.id}] голос не доиграл: ${e?.message}`);
+    }
+  }
+
+  /**
+   * Микрофон бота на площадке — выключить или включить.
+   *
+   * Жмём настоящую кнопку встречи: наш аудиограф площадка не видит, а значок
+   * нужен участникам. Кадр берём тот же, в котором живёт микрофон, — на новом
+   * Телемосте встреча сидит в дочернем кадре, и панель управления там же.
+   *
+   * Не вышло — не беда: ассистент в режиме слушателя и так молчит, теряется
+   * только индикация. Поэтому вместо ошибки пишем разметку панели в лог и
+   * чиним зацепку по факту. Тот же приём, что и с лентой чата (chat_probe).
+   */
+  async setMicMuted(on) {
+    try {
+      const frame = await this.micFrame();
+      const res = await frame?.evaluate((want) => window.__botSetMicMuted?.(want), on);
+      if (res?.ok) {
+        this.log.info?.(`[${this.id}] микрофон ${on ? 'выключен' : 'включён'} (${res.how})`);
+        return;
+      }
+      this.log.warn?.(`[${this.id}] микрофон не переключился: ${res?.reason || 'сценарий не ответил'}`);
+      const html = await frame?.evaluate(() => window.__botMicSample?.() || '').catch(() => '');
+      if (html) this.log.warn?.(`[${this.id}] разметка панели: ${String(html).slice(0, 1200)}`);
+    } catch (e) {
+      this.log.warn?.(`[${this.id}] микрофон не переключился: ${e?.message}`);
     }
   }
 
