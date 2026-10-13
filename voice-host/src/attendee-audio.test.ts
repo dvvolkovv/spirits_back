@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { AudioFrame } from '@livekit/rtc-node';
 import WebSocket from 'ws';
 import { initializeLogger, loggerOptions } from '@livekit/agents';
-import { AttendeeAudioHub, AttendeeAudioOutput, SAMPLE_RATE, SAMPLES_PER_TICK } from './attendee-audio.js';
+import { AttendeeAudioHub, AttendeeAudioOutput, SAMPLE_RATE, SAMPLES_PER_TICK, muteCommand } from './attendee-audio.js';
 
 /**
  * Логгер SDK — установка теста, а не продового кода.
@@ -385,5 +385,29 @@ describe('освобождение порта', () => {
         assert.equal(await next.listen('c2'), port, 'порт не освободился');
       } finally { next.close(); }
     } finally { hub.close(); }
+  });
+});
+
+/**
+ * Команда микрофона.
+ *
+ * Триггер НЕ из контракта Attendee — он там и не нужен: по исходникам
+ * (спайк 09.09.2026) Attendee принимает ровно realtime_audio.bot_output, а
+ * всё прочее пишет в лог как неизвестное сообщение. То есть на площадках,
+ * которые ходят через него, команда безвредно потеряется, а свой бот её
+ * поймёт. Расхождение с контрактом одностороннее и сознательное.
+ */
+describe('команда микрофона', () => {
+  test('уход в режим слушателя — микрофон выключить', () => {
+    assert.deepEqual(muteCommand(true), { trigger: 'bot_mute', data: { on: true } });
+  });
+
+  test('возврат в разговор — включить', () => {
+    assert.deepEqual(muteCommand(false), { trigger: 'bot_mute', data: { on: false } });
+  });
+
+  test('не путается с голосом ассистента', () => {
+    // Оба сообщения идут одним сокетом, и бот различает их только триггером.
+    assert.notEqual(muteCommand(true).trigger, 'realtime_audio.bot_output');
   });
 });
