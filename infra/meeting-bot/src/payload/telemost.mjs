@@ -139,6 +139,43 @@ export const TELEMOST_PAYLOAD = `
     return el ? el.outerHTML.slice(0, 4000) : '';
   };
 
+  // ── Микрофон площадки ────────────────────────────────────────────────────
+  //
+  // Жмём настоящую кнопку встречи, а не глушим свой аудиограф: граф площадка
+  // не видит вовсе, а участникам нужен привычный значок.
+  //
+  // Зацепка — догадка по образцу cameraOff из TELEMOST_JOIN: панель
+  // управления живьём никто не разбирал. Не сработает — __botMicSample отдаст
+  // разметку в лог, и вторая редакция будет написана по факту.
+  const MIC_BTN = '[role="button"][aria-label*="микрофон" i], button[aria-label*="микрофон" i]';
+
+  window.__botSetMicMuted = (want) => {
+    try {
+      const btn = document.querySelector(MIC_BTN);
+      if (!btn) return { ok: false, reason: 'кнопка микрофона не найдена' };
+      // Подпись описывает ДЕЙСТВИЕ кнопки, а не состояние: «Выключить
+      // микрофон» висит на включённом микрофоне. Поэтому «включить» без
+      // «выключить» означает, что микрофон сейчас выключен.
+      const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+      const muted = label.indexOf('включить') >= 0 && label.indexOf('выключить') < 0;
+      if (muted === !!want) return { ok: true, how: 'уже в нужном состоянии' };
+      btn.click();
+      return { ok: true, how: 'кнопкой' };
+    } catch (e) {
+      return { ok: false, reason: String(e && e.message) };
+    }
+  };
+
+  /** Кусок панели управления — для разбора зацепок по факту, а не по догадке. */
+  window.__botMicSample = () => {
+    try {
+      const el = document.querySelector(
+        '[class*="control"], [class*="toolbar"], [data-testid*="control"], [data-testid*="toolbar"]',
+      ) || document.body;
+      return el ? el.outerHTML.slice(0, 4000) : '';
+    } catch (e) { return ''; }
+  };
+
   send('ready', { url: location.host + location.pathname });
 })();
 `;

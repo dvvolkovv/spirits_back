@@ -25,7 +25,7 @@ import { MixedRoomAudioInput } from './mixed-audio-input.js';
 import { meetingInputOptions } from './session-options.js';
 import { ExternalRoomAudioOutput } from './external-room-output.js';
 import { ExternalRoomChat, type IncomingChat, type SendResult } from './external-chat.js';
-import { AttendeeAudioHub, AttendeeAudioInput, AttendeeAudioOutput } from './attendee-audio.js';
+import { AttendeeAudioHub, AttendeeAudioInput, AttendeeAudioOutput, muteCommand } from './attendee-audio.js';
 import { botFailureReason } from './attendee-reason.js';
 import { OwnChatEcho } from './chat-echo.js';
 import { Room as ExternalRoom } from '@livekit/rtc-node';
@@ -220,6 +220,10 @@ export default defineAgent({
           ? '[гейт] режим слушателя включён'
           : '[гейт] режим слушателя снят — отвечаю, когда зовут по имени',
       );
+      // Микрофон бота — следом за режимом, и только на мосту. Своя комната и
+      // чужая комната Taler ID идут другим путём (см. спеку, пункт 4): там
+      // вебсокета к боту нет вовсе.
+      if (isBridged) attendeeHub?.send(muteCommand(wasListening));
     }
 
     await ctx.connect();
