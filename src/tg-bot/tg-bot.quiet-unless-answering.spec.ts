@@ -65,6 +65,11 @@ describe('TgRouterService.isExplicitlyAddressed', () => {
     expect(router.isExplicitlyAddressed(cfg({ status: 'silent' }), said('Финансист, ты тут?'))).toBe(false);
     expect(router.isExplicitlyAddressed(cfg({ status: 'silent', addressing_mode: 'always' }), said('привет'))).toBe(false);
   });
+
+  it('команда владельца — обращение в любом статусе: /resume пишут как раз замолчанному', () => {
+    expect(router.isExplicitlyAddressed(cfg({ status: 'silent' }), said('/resume'))).toBe(true);
+    expect(router.isExplicitlyAddressed(cfg({ status: 'silent' }), said('/balance@LinkeonAgentBot'))).toBe(true);
+  });
 });
 
 // ─── проводка через handleChatMessage ────────────────────────────────────────
@@ -202,6 +207,14 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
     const { svc, sent } = makeTurnBot({ balance: 0 });
     await (svc as any).handleChatMessage(groupMsg({ text: 'Финансист, ты тут?' }), { ...CFG, status: 'silent' });
     expect(zeroNotices(sent())).toEqual([]);
+  });
+
+  it('нулевой баланс, замолчанному боту пришла команда — объясняет, как и раньше', async () => {
+    // Команды при нулевом балансе не исполняются (проверка баланса стоит до
+    // них) — так было и до этой правки. Но и молчать на /resume нельзя.
+    const { svc, sent } = makeTurnBot({ balance: 0 });
+    await (svc as any).handleChatMessage(groupMsg({ text: '/resume' }), { ...CFG, status: 'silent' });
+    expect(zeroNotices(sent())).toHaveLength(1);
   });
 
   it('нулевой баланс, «на каждое сообщение» — объясняет на любую реплику (контроль)', async () => {
