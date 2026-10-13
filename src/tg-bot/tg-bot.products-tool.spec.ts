@@ -324,6 +324,9 @@ describe('TgBotService.handleChatMessage: гейт и вложения', () => {
     const router = {
       persistUserMessage: jest.fn(async () => { order.push('persist'); }),
       shouldRespond: jest.fn(async () => true),
+      // CFG ниже — «на каждое сообщение»: обращено всё (решение проверяет
+      // tg-bot.quiet-unless-answering.spec.ts).
+      isExplicitlyAddressed: jest.fn(() => true),
       markAnswerExpected: jest.fn(async () => {}),
       onlySpeakerIs: jest.fn(async () => { order.push('onlySpeakerIs'); return o.solo; }),
       generateReply: jest.fn(async (..._a: any[]) => { order.push('generateReply'); return { text: 'готово', costUsd: 0.01 }; }),
