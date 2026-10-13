@@ -21,6 +21,9 @@ import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.s
  */
 const DEFAULT_AGENT_ID = '12';
 
+/** Команды бота в группе (tg-commands.service.ts). Обращение к боту в любом режиме. */
+const BOT_COMMAND = /^\/(help|balance|silent|resume)(\s|@|$)/;
+
 export interface IncomingMessageContext {
   chatId: number;
   msgId: number;
@@ -176,7 +179,7 @@ export class TgRouterService {
     if (lo.includes(`@${botUsername.toLowerCase()}`)) return true;
     if (replyToFromBot) return true;
     if (displayName && lo.includes(displayName.toLowerCase())) return true;
-    if (/^\/(help|balance|silent|resume)(\s|@|$)/.test(lo)) return true;
+    if (BOT_COMMAND.test(lo)) return true;
     return false;
   }
 
@@ -184,12 +187,14 @@ export class TgRouterService {
    * Обратились ли к боту ЯВНО — без гейта модели «умного» режима и без
    * rate-limit'ов shouldRespond. Нужен там, где бот не ответит в любом случае
    * (нулевой баланс), но должен объяснить почему — тому, кто его позвал, а не
-   * каждому, кто пишет в группу. Замолчанного /silent бота не зовёт никто.
+   * каждому, кто пишет в группу. Замолчанного /silent бота не зовёт никто,
+   * кроме команд: /resume пишут как раз ему.
    */
   isExplicitlyAddressed(
     cfg: TgBotConfigRow,
     said: { text: string; replyToFromBot?: boolean },
   ): boolean {
+    if (BOT_COMMAND.test(said.text.toLowerCase())) return true;
     if (cfg.status === 'silent') return false;
     if (cfg.addressing_mode === 'always') return true;
     const botUsername = process.env.TG_BOT_USERNAME || 'LinkeonAgentBot';
