@@ -114,25 +114,6 @@
 
 set -uo pipefail
 
-# Git Bash под Windows переписывает POSIX-пути — выключаем.
-#
-# MSYS подменяет всё, что похоже на абсолютный путь, когда передаёт это
-# НЕ-MSYS программе: и аргументы, и переменные окружения. `/home/dvolkov` при
-# этом превращается в `C:/Program Files/Git/home/dvolkov` — путь внутри
-# установки Git. Для скрипта, который почти целиком состоит из ssh на Linux,
-# такая подмена не помогает никогда, а ломает молча.
-#
-# Поймано 13.10.2026: прод-выкатка дважды откатилась по красному смоку, и
-# причина была в одной проверке — `BACK_PATH=/home/dvolkov/spirits_back`
-# доезжал до неё перевранным, смоук не находил DATABASE_URL и валил всю фазу.
-# Деплой при этом отрабатывал полностью и откатывался уже на проверке.
-#
-# Условие по uname обязательно: на Linux и macOS переменная не нужна, а
-# менять там поведение рабочего скрипта ради чужой платформы незачем.
-case "$(uname -s)" in
-  MINGW*|MSYS*|CYGWIN*) export MSYS_NO_PATHCONV=1 ;;
-esac
-
 # Local creds for test phase (gitignored)
 TEST_ENV_FILE="$(dirname "${BASH_SOURCE[0]}")/test-server.env.local"
 if [[ -f "$TEST_ENV_FILE" ]]; then
@@ -1326,7 +1307,24 @@ run_phase() {
         # inside the same blip and false-fails. SMOKE_RETRY_GAP overrides.
         sleep "${SMOKE_RETRY_GAP:-20}"
       fi
-      if BASE_URL="$BASE_URL" BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" BACK_PATH="$BACK_PATH" PG_DSN="$PG_DSN" \
+      # MSYS_NO_PATHCONV — только здесь, и только ради BACK_PATH.
+      #
+      # Git Bash под Windows подменяет всё похожее на абсолютный путь, когда
+      # передаёт это не-MSYS программе: `/home/dvolkov/spirits_back` доезжает
+      # до node как `C:/Program Files/Git/home/dvolkov/spirits_back`. Смоук
+      # читает по нему DATABASE_URL с сервера (tests/smoke/db-psql.js), не
+      # находит файл и валит всю фазу — а деплой к этому моменту уже прошёл, и
+      # красный смоук откатывает его назад. Так 13.10.2026 молча уехали
+      # обратно две прод-выкатки подряд.
+      #
+      # Глобально эту подмену выключать НЕЛЬЗЯ: PHASE 4 зовёт `git -C
+      # "$LOCAL_BACK_DIR"`, и там путь локальный — без преобразования git.exe
+      # не понимает `/d/Project/...` и фаза падает. Проверено 13.10.2026,
+      # ровно этим способом и сломалось.
+      #
+      # На Linux и macOS переменная не значит ничего.
+      if MSYS_NO_PATHCONV=1 \
+         BASE_URL="$BASE_URL" BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" BACK_PATH="$BACK_PATH" PG_DSN="$PG_DSN" \
          DEBUG_SECRET="${DEBUG_SECRET:-}" bash smoke/run.sh; then
         smoke_ok=1; break
       fi
