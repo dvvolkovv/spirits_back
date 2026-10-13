@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { AudioFrame } from '@livekit/rtc-node';
 import WebSocket from 'ws';
 import { initializeLogger, loggerOptions } from '@livekit/agents';
-import { AttendeeAudioHub, AttendeeAudioOutput, SAMPLE_RATE, SAMPLES_PER_TICK, muteCommand } from './attendee-audio.js';
+import { AttendeeAudioHub, AttendeeAudioOutput, PORT_MAX, PORT_MIN, SAMPLE_RATE, SAMPLES_PER_TICK, muteCommand } from './attendee-audio.js';
 
 /**
  * Логгер SDK — установка теста, а не продового кода.
@@ -157,9 +157,13 @@ describe('AttendeeAudioHub', () => {
     const hub = new AttendeeAudioHub();
     try {
       const port = await hub.listen('c1');
-      // Диапазон по умолчанию — один порт: он же потолок одновременных
-      // встреч Meet (см. комментарий у PORT_MIN/PORT_MAX в attendee-audio.ts).
-      assert.equal(port, 8140, `порт вне диапазона: ${port}`);
+      // Диапазон по умолчанию — 8140-8145, он же потолок одновременных встреч
+      // (решение владельца 13.10.2026, см. комментарий у PORT_MIN/PORT_MAX).
+      //
+      // Проверяем попадание В ДИАПАЗОН, а не конкретный номер: порт берётся
+      // первый свободный, и на машине с занятым 8140 тест иначе краснел бы на
+      // ровном месте.
+      assert.ok(port >= 8140 && port <= 8145, `порт вне диапазона: ${port}`);
       const url = hub.publicUrl('c1');
       // Порт в пути, а не в host:port — TLS терминирует nginx.
       assert.match(url, new RegExp(`/attendee/${port}\\?callId=c1$`));
@@ -182,24 +186,26 @@ describe('AttendeeAudioHub', () => {
     }
   });
 
-  test('второй хаб на ту же встречу честно отказывает, а не падает молча', async () => {
-    // Потолок в одну одновременную встречу держится ровно этим: диапазон
-    // сужен до одного порта, и второму хабу занять нечего. При потолке в
-    // одну встречу это НОРМА для второго пользователя, а не редкость — и
-    // ошибка обязана быть внятной, а не EADDRINUSE без объяснения или,
-    // того хуже, повисшим промисом.
-    const a = new AttendeeAudioHub();
-    const b = new AttendeeAudioHub();
+  test('весь диапазон занят — следующий хаб честно отказывает, а не падает молча', async () => {
+    // Потолок одновременных встреч держится ровно этим: портов конечное
+    // число, и когда они заняты, занять нечего. Для пользователя, попавшего в
+    // потолок, это НОРМА, а не редкость — и ошибка обязана быть внятной, а не
+    // EADDRINUSE без объяснения или, того хуже, повисшим промисом.
+    //
+    // Занимаем ВЕСЬ диапазон. До 13.10.2026 он состоял из одного порта, и
+    // тесту хватало одного лишнего хаба; теперь их шесть.
+    const hubs = Array.from({ length: PORT_MAX - PORT_MIN + 1 }, () => new AttendeeAudioHub());
+    const extra = new AttendeeAudioHub();
     try {
-      await a.listen('c1');
+      for (let i = 0; i < hubs.length; i++) await hubs[i].listen(`c${i}`);
       await assert.rejects(
-        () => b.listen('c2'),
+        () => extra.listen('лишний'),
         (e: any) => {
-          assert.match(e.message, /занят|нет свободного порта/, `ошибка не внятная: ${e.message}`);
+          assert.match(e.message, /идёт|потолок/, `ошибка не внятная: ${e.message}`);
           return true;
         },
       );
-    } finally { a.close(); b.close(); }
+    } finally { for (const h of hubs) h.close(); extra.close(); }
   });
 
   test('соединение с чужим callId отвергается', async () => {
@@ -409,5 +415,56 @@ describe('команда микрофона', () => {
   test('не путается с голосом ассистента', () => {
     // Оба сообщения идут одним сокетом, и бот различает их только триггером.
     assert.notEqual(muteCommand(true).trigger, 'realtime_audio.bot_output');
+  });
+});
+
+/**
+ * Диапазон портов и регулярка nginx обязаны совпадать.
+ *
+ * Это не вопрос аккуратности, а граница безопасности, и так написано в самом
+ * конфиге: `proxy_pass` идёт на `$1`, то есть на номер порта из адреса. Лишний
+ * порт в регулярке — это доступ СНАРУЖИ к любому локальному сервису, включая
+ * Postgres, Redis и админку LiveKit. Узкая регулярка, наоборот, тихо ломает
+ * вход: звук встречи просто не поднимется.
+ *
+ * До 13.10.2026 совпадение держалось на комментарии «диапазон обязан
+ * совпадать» и на внимательности правящего. Теперь — на тесте: расширение
+ * потолка требует правки в трёх файлах, и забыть один из них слишком легко.
+ */
+describe('диапазон портов и nginx', () => {
+  const CONFIGS = ['nginx-attendee.conf', 'nginx-attendee-prod.conf'];
+
+  /** Регулярка из `location ~ ^/attendee/(...)$` конкретного конфига. */
+  const portMatcher = async (name: string): Promise<RegExp> => {
+    const { readFile } = await import('node:fs/promises');
+    const path = new URL(`../../infra/attendee/${name}`, import.meta.url);
+    const conf = await readFile(path, 'utf8');
+    const m = conf.match(/location\s+~\s+\^\/attendee\/\((.+?)\)\$/);
+    assert.ok(m, `в ${name} не нашёлся location с диапазоном портов`);
+    return new RegExp(`^(?:${m![1]})$`);
+  };
+
+  for (const name of CONFIGS) {
+    test(`${name}: пропускает весь диапазон и ничего сверх него`, async () => {
+      const re = await portMatcher(name);
+      for (let p = PORT_MIN; p <= PORT_MAX; p++) {
+        assert.ok(re.test(String(p)), `${name} не пропускает порт ${p} из диапазона`);
+      }
+      // Соседи за границей: именно на них видно и слишком широкую регулярку
+      // (например 814[0-9] при диапазоне 8140-8145), и съехавшую.
+      for (const p of [PORT_MIN - 1, PORT_MAX + 1]) {
+        assert.ok(!re.test(String(p)), `${name} пропускает ЛИШНИЙ порт ${p}`);
+      }
+      // Чужие локальные сервисы — то, ради чего регулярка вообще есть.
+      for (const p of [5432, 6379, 7880, 8137]) {
+        assert.ok(!re.test(String(p)), `${name} пропускает посторонний порт ${p}`);
+      }
+    });
+  }
+
+  test('потолок — шесть встреч', () => {
+    // Решение владельца 13.10.2026. Число живёт в коде, а не только в
+    // окружении: прод берёт умолчание, переменных ATTENDEE_WS_PORT_* там нет.
+    assert.equal(PORT_MAX - PORT_MIN + 1, 6);
   });
 });

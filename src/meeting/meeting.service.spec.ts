@@ -571,13 +571,14 @@ describe('MeetingService', () => {
     });
 
     it('делит общий потолок моста с Meet и Zoom', async () => {
-      // Потолок держится одним портом на задание и общими аудиоустройствами
-      // в контейнере — площадка тут ни при чём.
+      // Потолок общий на весь мост: счёт идёт по всем его площадкам сразу, и
+      // Teams упирается в него наравне с остальными. Шесть — это потолок
+      // целиком (решение владельца 13.10.2026).
       withAgent();
       pg.query.mockImplementation(async (sql: string) => {
         if (/FROM agents/.test(sql)) return { rows: [{ id: 7, display_name: 'Роман', system_prompt: '', realtime_voice: 'alloy' }] };
         if (sql.includes('SELECT tokens FROM ai_profiles_consolidated')) return { rows: [{ tokens: 50_000 }] };
-        if (/count\(\*\)/.test(sql) && /provider = ANY/.test(sql)) return { rows: [{ n: 1 }] };
+        if (/count\(\*\)/.test(sql) && /provider = ANY/.test(sql)) return { rows: [{ n: 6 }] };
         if (sql.includes('ai_profiles_consolidated')) return { rows: [{ name: 'Дмитрий' }] };
         return { rows: [], rowCount: 0 };
       });
@@ -652,15 +653,16 @@ describe('MeetingService', () => {
 
   describe('потолок моста общий для всех его площадок', () => {
     it('встреча Zoom не пускается, пока мост занят встречей Meet', async () => {
-      // Потолок физический, а не продуктовый: порт под звук один, и вторая
-      // встреча — всё равно какой площадки — не найдёт свободного. Причина
-      // остаётся meet_busy: ключ уже переведён во всех локалях фронта, а
-      // человеку важно, что мост занят, а не кем именно.
+      // Потолок физический, а не продуктовый: портов под звук конечное число
+      // (PORT_MIN/PORT_MAX в voice-host), и встреча сверх потолка — всё равно
+      // какой площадки — свободного не найдёт. Причина остаётся meet_busy:
+      // ключ уже переведён во всех локалях фронта, а человеку важно, что мост
+      // занят, а не кем именно.
       withAgent();
       pg.query.mockImplementation(async (sql: string) => {
         if (sql.includes('FROM agents')) return { rows: [agentRow] };
         if (sql.includes('SELECT tokens FROM ai_profiles_consolidated')) return { rows: [{ tokens: balance }] };
-        if (/count\(\*\)/.test(sql) && /provider = ANY/.test(sql)) return { rows: [{ n: 1 }] };
+        if (/count\(\*\)/.test(sql) && /provider = ANY/.test(sql)) return { rows: [{ n: 6 }] };
         if (sql.includes('ai_profiles_consolidated')) return { rows: [{ name: 'Дмитрий' }] };
         return { rows: [], rowCount: 0 };
       });
@@ -680,19 +682,22 @@ describe('MeetingService', () => {
     });
   });
 
-  describe('потолок одновременных встреч Meet', () => {
+  describe('потолок одновременных встреч через мост', () => {
     // Держится здесь, а не надеждой на то, что воркер не найдёт свободного
-    // порта: диапазон сужен до одного порта (см. attendee-audio.ts), и без
-    // этой проверки второй пользователь упирался бы в отказ через несколько
-    // секунд и без внятной причины — при потолке в одну встречу это норма,
-    // а не редкость.
-    it('вторая одновременная встреча Meet отклоняется внятно', async () => {
+    // порта (диапазон см. в attendee-audio.ts). Без этой проверки попавший в
+    // потолок упирался бы в отказ через несколько секунд, без внятной причины
+    // и уже после создания записи звонка.
+    //
+    // MEET_CONCURRENCY_LIMIT читается при загрузке модуля, подменить его
+    // переменной окружения из теста нельзя — поэтому в счётчике стоит само
+    // число потолка, шесть.
+    it('встреча сверх потолка отклоняется внятно', async () => {
       withAgent();
       // Одна встреча Meet уже идёт.
       pg.query.mockImplementation(async (sql: string) => {
         if (sql.includes('FROM agents')) return { rows: [agentRow] };
         if (sql.includes('SELECT tokens FROM ai_profiles_consolidated')) return { rows: [{ tokens: balance }] };
-        if (/count\(\*\)/.test(sql) && /provider/.test(sql)) return { rows: [{ n: 1 }] };
+        if (/count\(\*\)/.test(sql) && /provider/.test(sql)) return { rows: [{ n: 6 }] };
         if (sql.includes('ai_profiles_consolidated')) return { rows: [{ name: 'Дмитрий' }] };
         return { rows: [], rowCount: 0 };
       });
@@ -708,7 +713,7 @@ describe('MeetingService', () => {
       pg.query.mockImplementation(async (sql: string) => {
         if (sql.includes('FROM agents')) return { rows: [agentRow] };
         if (sql.includes('SELECT tokens FROM ai_profiles_consolidated')) return { rows: [{ tokens: balance }] };
-        if (/count\(\*\)/.test(sql) && /provider/.test(sql)) return { rows: [{ n: 1 }] };
+        if (/count\(\*\)/.test(sql) && /provider/.test(sql)) return { rows: [{ n: 6 }] };
         if (sql.includes('ai_profiles_consolidated')) return { rows: [{ name: 'Дмитрий' }] };
         return { rows: [], rowCount: 0 };
       });
@@ -728,7 +733,7 @@ describe('MeetingService', () => {
       pg.query.mockImplementation(async (sql: string) => {
         if (sql.includes('FROM agents')) return { rows: [agentRow] };
         if (sql.includes('SELECT tokens FROM ai_profiles_consolidated')) return { rows: [{ tokens: balance }] };
-        if (/count\(\*\)/.test(sql) && /provider/.test(sql)) return { rows: [{ n: 5 }] };
+        if (/count\(\*\)/.test(sql) && /provider/.test(sql)) return { rows: [{ n: 9 }] };
         if (sql.includes('ai_profiles_consolidated')) return { rows: [{ name: 'Дмитрий' }] };
         return { rows: [], rowCount: 0 };
       });
