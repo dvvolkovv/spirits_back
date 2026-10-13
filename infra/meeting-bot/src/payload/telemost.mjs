@@ -96,12 +96,28 @@ export const TELEMOST_PAYLOAD = `
   //
   // Шлём КАЖДЫЙ раз, а не только при изменении: что из этого новость, решает
   // сервис — он один знает, что бэкенд подтвердил.
+  //
+  // Отказ в чтении состава был молчаливым, и встреча 13.10.2026 кончилась
+  // выходом ассистента через пятнадцать минут: людей для правил выхода не
+  // существовало. Отдаём разметку в лог — один раз за встречу, как chat_probe.
+  let participantsProbed = false;
+
   setInterval(() => {
     try {
       const btn = document.querySelector('[data-testid="participants-button"]');
-      if (!btn) return;
-      const m = (btn.innerText || '').match(/\\d+/);
-      if (!m) return;
+      const m = btn && (btn.innerText || '').match(/\\d+/);
+      if (!m) {
+        if (participantsProbed) return;
+        participantsProbed = true;
+        const panel = document.querySelector(
+          '[class*="control"], [class*="toolbar"], [data-testid*="control"], [data-testid*="toolbar"]',
+        );
+        send('participants_probe', {
+          found: !!btn,
+          html: String((btn && btn.outerHTML) || (panel && panel.outerHTML) || '').slice(0, 4000),
+        });
+        return;
+      }
       // Минус мы сами: площадка считает и бота.
       send('participants', { humans: Math.max(0, Number(m[0]) - 1) });
     } catch (e) { console.error('[бот] состав не прочитался', e); }
