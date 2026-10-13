@@ -638,6 +638,11 @@ export class TgBotService implements OnModuleInit {
     }
     if (!workingText) return;
 
+    // Ответ на сообщение бота — явное обращение. Нужен и проверке нулевого
+    // баланса, и контексту хода (getBotUserId кэширует getMe).
+    const botUserId = await this.grammy.getBotUserId();
+    const replyToFromBot = msg.reply_to_message?.from?.id === botUserId;
+
     // Pre-flight: balance check. При ≤ 0 — повторяемое уведомление каждые
     // 10 минут, чтобы юзеры с пустым балансом не думали, что бот молча умер.
     const preBalance = await this.billing.getBalance(cfg.owner_user_id);
@@ -648,11 +653,7 @@ export class TgBotService implements OnModuleInit {
       // Объяснять, почему бот молчит, — только тому, кто его позвал. Раньше
       // предупреждение уходило на любое сообщение группы, в том числе в режиме
       // «по обращению» и у замолчанного /silent бота.
-      const botUserIdForZero = await this.grammy.getBotUserId();
-      const addressed = this.router.isExplicitlyAddressed(cfg, {
-        text: workingText,
-        replyToFromBot: msg.reply_to_message?.from?.id === botUserIdForZero,
-      });
+      const addressed = this.router.isExplicitlyAddressed(cfg, { text: workingText, replyToFromBot });
       if (!addressed) return;
       const ZERO_BALANCE_COOLDOWN_MS = 10 * 60 * 1000;
       const recent = await this.billing.recentlyNotifiedZeroBalance(cfg.id, ZERO_BALANCE_COOLDOWN_MS);
@@ -691,7 +692,6 @@ export class TgBotService implements OnModuleInit {
       }
     }
 
-    const botUserId = await this.grammy.getBotUserId();
     const ctx = {
       chatId: msg.chat.id,
       msgId: msg.message_id,
@@ -699,7 +699,7 @@ export class TgBotService implements OnModuleInit {
       fromTgUserName: msg.from.first_name ?? msg.from.username ?? null,
       text: workingText,
       replyToBotMessageId: msg.reply_to_message?.message_id,
-      replyToFromBot: msg.reply_to_message?.from?.id === botUserId,
+      replyToFromBot,
       isVoice: actualIsVoice,
       voiceFileId,
       attachmentPaths: attachments.length ? attachments : undefined,
@@ -712,17 +712,23 @@ export class TgBotService implements OnModuleInit {
     const lock = await this.pg.tryAdvisoryLock(lockId);
     if (!lock) {
       this.logger.debug(`chat ${msg.chat.id} busy, skipping`);
-      // Раньше дропали тихо (только typing-action). Теперь:
-      // 1) Сохраняем сообщение юзера в БД — чтобы в истории не было дыр
-      // 2) Раз в 60с шлём явное "минутку" в чат
+      // Сообщение сохраняем всегда — чтобы в истории не было дыр. «Минутку» и
+      // отметка «ждём ответа» — только тому, кто обратился к боту: раньше они
+      // уходили на любую реплику группы, а отметка без ответа поднимала потом в
+      // мониторинге ложное «бот молчит».
       try {
         await this.router.persistUserMessage(cfg, ctx);
-        // Юзеру ниже уходит «минутку» — значит ответа он ждёт. Если лок залип и
-        // не отпустится, ответа не будет никогда: без этой отметки такой чат
-        // молчит бесконечно и никто об этом не узнает.
-        await this.router.markAnswerExpected(ctx.chatId, ctx.msgId);
       } catch (e: any) {
         this.logger.warn(`busy-skip persistUserMessage failed in chat ${msg.chat.id}: ${e.message}`);
+      }
+      if (!this.router.isExplicitlyAddressed(cfg, ctx)) return;
+      // Юзеру ниже уходит «минутку» — значит ответа он ждёт. Если лок залип и
+      // не отпустится, ответа не будет никогда: без этой отметки такой чат
+      // молчит бесконечно и никто об этом не узнает.
+      try {
+        await this.router.markAnswerExpected(ctx.chatId, ctx.msgId);
+      } catch (e: any) {
+        this.logger.warn(`busy-skip markAnswerExpected failed in chat ${msg.chat.id}: ${e.message}`);
       }
       const lastNotice = this.lastBusyNoticeAt.get(msg.chat.id) ?? 0;
       if (Date.now() - lastNotice > 60_000) {
@@ -769,13 +775,15 @@ export class TgBotService implements OnModuleInit {
       // Эхо расшифровки — чтобы юзер видел, что бот услышал, и мог поправить.
       // Только когда бот отвечает: раньше эхо уходило на каждое голосовое группы,
       // в том числе в режиме «по обращению» и у замолчанного /silent бота.
-      // Fire-and-forget: ошибка отправки не блокирует ход.
+      // Ждём доставки: иначе эхо обгоняет статус «Думаю…» и встаёт под ним.
       if (actualIsVoice && workingText) {
-        this.grammy.sendMessage(
-          msg.chat.id,
-          `🎙️ _«${workingText.slice(0, 1024)}»_`,
-          { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' },
-        ).catch(() => {});
+        try {
+          await this.grammy.sendMessage(
+            msg.chat.id,
+            `🎙️ _«${workingText.slice(0, 1024)}»_`,
+            { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' },
+          );
+        } catch { /* эхо — подсказка, не повод ронять ход */ }
       }
 
       // Решение принято — дальше молчание означает сбой, а не режим адресации.
