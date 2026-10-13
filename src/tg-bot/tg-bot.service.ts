@@ -607,15 +607,8 @@ export class TgBotService implements OnModuleInit {
         workingText = await this.voice.transcribe(voiceFileId);
         actualIsVoice = true;
         this.logger.log(`voice transcribed in chat ${msg.chat.id}: "${workingText.substring(0, 50)}..."`);
-        // Echo расшифровки — чтобы юзер видел что бот услышал и мог поправить
-        // если что-то не так. Fire-and-forget: ошибка отправки не блокирует флоу.
-        if (workingText) {
-          this.grammy.sendMessage(
-            msg.chat.id,
-            `🎙️ _«${workingText.slice(0, 1024)}»_`,
-            { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' },
-          ).catch(() => {});
-        }
+        // Эхо расшифровки уходит позже — только если бот решит отвечать
+        // (см. после shouldRespond).
       } catch (e: any) {
         this.logger.warn(`STT failed for chat ${msg.chat.id}: ${e.message}`);
         return;
@@ -652,6 +645,15 @@ export class TgBotService implements OnModuleInit {
       // Ход не состоится, и сообщение в историю не попадёт — файл тоже не
       // должен остаться в папке чата (см. discardAttachments).
       this.discardAttachments(attachments);
+      // Объяснять, почему бот молчит, — только тому, кто его позвал. Раньше
+      // предупреждение уходило на любое сообщение группы, в том числе в режиме
+      // «по обращению» и у замолчанного /silent бота.
+      const botUserIdForZero = await this.grammy.getBotUserId();
+      const addressed = this.router.isExplicitlyAddressed(cfg, {
+        text: workingText,
+        replyToFromBot: msg.reply_to_message?.from?.id === botUserIdForZero,
+      });
+      if (!addressed) return;
       const ZERO_BALANCE_COOLDOWN_MS = 10 * 60 * 1000;
       const recent = await this.billing.recentlyNotifiedZeroBalance(cfg.id, ZERO_BALANCE_COOLDOWN_MS);
       if (!recent) {
@@ -763,6 +765,18 @@ export class TgBotService implements OnModuleInit {
 
       const should = await this.router.shouldRespond(cfg, ctx);
       if (!should) return;
+
+      // Эхо расшифровки — чтобы юзер видел, что бот услышал, и мог поправить.
+      // Только когда бот отвечает: раньше эхо уходило на каждое голосовое группы,
+      // в том числе в режиме «по обращению» и у замолчанного /silent бота.
+      // Fire-and-forget: ошибка отправки не блокирует ход.
+      if (actualIsVoice && workingText) {
+        this.grammy.sendMessage(
+          msg.chat.id,
+          `🎙️ _«${workingText.slice(0, 1024)}»_`,
+          { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' },
+        ).catch(() => {});
+      }
 
       // Решение принято — дальше молчание означает сбой, а не режим адресации.
       // Мониторинг вторичен: не смогли отметить — работаем дальше без надзора,

@@ -181,6 +181,22 @@ export class TgRouterService {
   }
 
   /**
+   * Обратились ли к боту ЯВНО — без гейта модели «умного» режима и без
+   * rate-limit'ов shouldRespond. Нужен там, где бот не ответит в любом случае
+   * (нулевой баланс), но должен объяснить почему — тому, кто его позвал, а не
+   * каждому, кто пишет в группу. Замолчанного /silent бота не зовёт никто.
+   */
+  isExplicitlyAddressed(
+    cfg: TgBotConfigRow,
+    said: { text: string; replyToFromBot?: boolean },
+  ): boolean {
+    if (cfg.status === 'silent') return false;
+    if (cfg.addressing_mode === 'always') return true;
+    const botUsername = process.env.TG_BOT_USERNAME || 'LinkeonAgentBot';
+    return this.shouldRespondStrict(said.text, botUsername, cfg.display_name, !!said.replyToFromBot);
+  }
+
+  /**
    * Main entry point. Возвращает true если бот должен ответить на это сообщение.
    * Mode A (strict) — детектор триггеров.
    * Mode B (always) — отвечает на каждое (rate-limit 3 сек).
