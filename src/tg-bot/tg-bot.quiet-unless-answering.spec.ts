@@ -13,10 +13,13 @@ import { TgRouterService } from './tg-router.service';
  * обращению», и у замолчанного бота (getActiveByTgChatId берёт и 'silent'):
  *   - эхо расшифровки «🎙️ «…»» на КАЖДОЕ голосовое группы;
  *   - «⚠️ У владельца закончились токены» на любое сообщение группы, раз в
- *     10 минут.
+ *     10 минут;
+ *   - «⏳ Минутку — заканчиваю предыдущий запрос» на любое сообщение, пока идёт
+ *     чужой ход, — вместе с отметкой «ждём ответа», из-за которой мониторинг
+ *     потом ложно кричал «бот молчит».
  * Эхо нужно, чтобы видеть, что бот услышал, — только когда он отвечает.
- * Предупреждение о нуле объясняет, почему бот не ответил, — только тому, кто
- * его позвал.
+ * Предупреждение о нуле и «Минутку» объясняют, почему бот не ответил, — только
+ * тому, кто его позвал.
  */
 
 const quiet = { error: () => {}, warn: () => {}, log: () => {}, debug: () => {} };
@@ -57,8 +60,21 @@ describe('TgRouterService.isExplicitlyAddressed', () => {
   });
 
   it('«умно» без явного обращения — не обращено: гейт модели здесь не зовётся', () => {
+    const gate = jest.spyOn(TgRouterService.prototype as any, 'smartGate');
     expect(router.isExplicitlyAddressed(cfg({ addressing_mode: 'smart' }), said('встречаемся в восемь'))).toBe(false);
     expect(router.isExplicitlyAddressed(cfg({ addressing_mode: 'smart' }), said('Финансист, глянь'))).toBe(true);
+    expect(gate).not.toHaveBeenCalled();
+    gate.mockRestore();
+  });
+
+  it('регистр не важен: упоминание, имя и команда', () => {
+    expect(router.isExplicitlyAddressed(cfg(), said('@linkeonagentbot глянь'))).toBe(true);
+    expect(router.isExplicitlyAddressed(cfg(), said('ФИНАНСИСТ, сколько?'))).toBe(true);
+    expect(router.isExplicitlyAddressed(cfg(), said('/HELP'))).toBe(true);
+  });
+
+  it('пустое имя бота не делает обращением каждую реплику', () => {
+    expect(router.isExplicitlyAddressed(cfg({ display_name: '' }), said('встречаемся в восемь'))).toBe(false);
   });
 
   it('замолчанный /silent — не обращено ни в каком режиме', () => {
@@ -93,10 +109,11 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
    * проверяется поведение бота, а не то, что заглушка вернула нужное.
    * Остальное — заглушки, как в tg-bot.products-tool.spec.ts.
    */
-  function makeTurnBot(o: { balance?: number; transcript?: string; alreadyNotified?: boolean } = {}) {
+  function makeTurnBot(o: { balance?: number; transcript?: string; alreadyNotified?: boolean; busy?: boolean } = {}) {
     const real = makeRouter();
     const pg = {
-      tryAdvisoryLock: jest.fn(async () => ({ release: jest.fn(async () => {}) })),
+      // busy — в чате уже идёт другой ход: замок не берётся.
+      tryAdvisoryLock: jest.fn(async () => (o.busy ? null : { release: jest.fn(async () => {}) })),
       query: jest.fn(async () => ({ rows: [] })),
     };
     const identity = {
@@ -141,7 +158,7 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
     );
     (svc as any).logger = quiet;
     const sent = () => grammy.sendMessage.mock.calls.map((c: any[]) => String(c[1]));
-    return { svc, router, billing, sent };
+    return { svc, router, billing, grammy, sent };
   }
 
   const CFG: any = {
@@ -157,6 +174,8 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
   });
   const echoes = (sent: string[]) => sent.filter((t) => t.startsWith('\u{1F399}'));
   const zeroNotices = (sent: string[]) => sent.filter((t) => t.includes('закончились токены'));
+  const busyNotices = (sent: string[]) => sent.filter((t) => t.includes('Минутку'));
+  const THINKING = '🤔 Думаю...';
 
   it('голосовое в режиме «по обращению» без обращения — ни эха, ни ответа', async () => {
     const { svc, router, sent } = makeTurnBot({ transcript: 'встречаемся в восемь у входа' });
@@ -168,11 +187,65 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
   });
 
   it('голосовое с обращением — эхо расшифровки и ответ (контроль)', async () => {
-    const { svc, router, sent } = makeTurnBot({ transcript: 'Финансист, сколько у нас осталось?' });
+    const { svc, router, grammy, sent } = makeTurnBot({ transcript: 'Финансист, сколько у нас осталось?' });
     await (svc as any).handleChatMessage(groupMsg({ voice: true }), CFG);
     expect(echoes(sent())).toHaveLength(1);
-    expect(echoes(sent())[0]).toContain('Финансист, сколько у нас осталось?');
+    // Формат целиком: эмодзи с вариационным селектором, курсив, Markdown.
+    expect(grammy.sendMessage).toHaveBeenCalledWith(
+      -100123,
+      '\u{1F399}\u{FE0F} _«Финансист, сколько у нас осталось?»_',
+      { reply_to_message_id: 10, parse_mode: 'Markdown' },
+    );
     expect(router.generateReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('эхо доходит раньше «Думаю…»: сначала что бот услышал, потом что он думает', async () => {
+    const { svc, grammy, sent } = makeTurnBot({ transcript: 'Финансист, сколько у нас осталось?' });
+    let deliverEcho!: () => void;
+    grammy.sendMessage.mockImplementation(async (_chat: number, text: string) => {
+      if (String(text).startsWith('\u{1F399}')) await new Promise<void>((r) => { deliverEcho = r; });
+      return { message_id: 55 };
+    });
+
+    const turn = (svc as any).handleChatMessage(groupMsg({ voice: true }), CFG);
+    for (let i = 0; i < 20 && !deliverEcho; i++) await new Promise((r) => setImmediate(r));
+    expect(deliverEcho).toBeDefined();
+    // Telegram ещё не подтвердил эхо — статус не уходит.
+    expect(sent()).not.toContain(THINKING);
+
+    deliverEcho();
+    await turn;
+    expect(sent().indexOf(THINKING)).toBeGreaterThan(sent().findIndex((t) => t.startsWith('\u{1F399}')));
+  });
+
+  it('чат занят другим ходом, голосовое с обращением — эха нет: бот сейчас не отвечает', async () => {
+    const { svc, sent } = makeTurnBot({ busy: true, transcript: 'Финансист, сколько у нас осталось?' });
+    await (svc as any).handleChatMessage(groupMsg({ voice: true }), CFG);
+    expect(echoes(sent())).toEqual([]);
+  });
+
+  it('чат занят, обычная реплика группы — ни «Минутку», ни отметки «ждём ответа»', async () => {
+    // Отметка без ответа бота позже — ложная тревога «бот молчит» в мониторинге.
+    const { svc, router, sent } = makeTurnBot({ busy: true });
+    await (svc as any).handleChatMessage(groupMsg({ text: 'встречаемся в восемь' }), CFG);
+    expect(busyNotices(sent())).toEqual([]);
+    expect(router.markAnswerExpected).not.toHaveBeenCalled();
+    // В историю реплика ложится: дыр в контексте группы нет.
+    expect(router.persistUserMessage).toHaveBeenCalled();
+  });
+
+  it('чат занят, к боту обратились — «Минутку» и отметка, как раньше', async () => {
+    const { svc, router, sent } = makeTurnBot({ busy: true });
+    await (svc as any).handleChatMessage(groupMsg({ text: 'Финансист, а дальше?' }), CFG);
+    expect(busyNotices(sent())).toHaveLength(1);
+    expect(router.markAnswerExpected).toHaveBeenCalled();
+  });
+
+  it('чат занят, замолчанный /silent бот — молчит и на обращение', async () => {
+    const { svc, router, sent } = makeTurnBot({ busy: true });
+    await (svc as any).handleChatMessage(groupMsg({ text: 'Финансист, ты тут?' }), { ...CFG, status: 'silent' });
+    expect(busyNotices(sent())).toEqual([]);
+    expect(router.markAnswerExpected).not.toHaveBeenCalled();
   });
 
   it('замолчанный /silent бот на голосовое с обращением — ни эха, ни ответа', async () => {
