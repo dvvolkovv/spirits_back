@@ -6,6 +6,7 @@ import fs from "fs";
 import path from "path";
 import { spawn, execSync } from "child_process";
 import { sessionFsKey, uploadFileName, fallbackFileName } from "./paths.mjs";
+import { eventCallContext, tailDialogue } from "./session-tail.mjs";
 
 const app = express();
 const PORT = 3033;
@@ -228,29 +229,7 @@ const rotateDue = new Set();
 // дешевле, чем за отказ ротировать. Ранняя ротация перестаёт быть жертвой.
 function extractTailDialogue(claudeSid, maxMsgs = 60, maxCharsPerMsg = 2000) {
   try {
-    const lines = fs.readFileSync(sessionJsonlPath(claudeSid), "utf8").split("\n");
-    const msgs = [];
-    for (let i = lines.length - 1; i >= 0 && msgs.length < maxMsgs; i--) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      let ev;
-      try { ev = JSON.parse(line); } catch { continue; }
-      if (ev.type !== "user" && ev.type !== "assistant") continue;
-      const m = ev.message;
-      if (!m) continue;
-      let text = "";
-      if (typeof m.content === "string") text = m.content;
-      else if (Array.isArray(m.content)) {
-        text = m.content
-          .filter((b) => b && b.type === "text" && typeof b.text === "string")
-          .map((b) => b.text)
-          .join(" ");
-      }
-      text = (text || "").trim();
-      if (!text) continue; // tool_result / tool_use-only строки
-      msgs.push((ev.type === "user" ? "Пользователь: " : "Ассистент: ") + text.slice(0, maxCharsPerMsg));
-    }
-    return msgs.reverse().join("\n");
+    return tailDialogue(fs.readFileSync(sessionJsonlPath(claudeSid), "utf8"), maxMsgs, maxCharsPerMsg);
   } catch {
     return "";
   }
@@ -683,6 +662,13 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
 
       const handleEvent = (ev) => {
         if (ev.session_id) rememberSession(sessionId, ev.session_id);
+        // Размер контекста ОДНОГО запроса: сколько токенов ушло в промпт.
+        // Именно эта величина определяет цену хода, и именно её мы ограничиваем.
+        // Берём максимум по событиям assistant, а не usage из result: там сумма
+        // по всем запросам хода, и ход с инструментом поворачивал сессию каждый
+        // раз. См. session-tail.mjs.
+        const callCtx = eventCallContext(ev);
+        if (callCtx !== null && callCtx > maxTurnContext) maxTurnContext = callCtx;
         if (ev.type === "result") {
           // Потолок шагов. Проверяем ЗДЕСЬ, а не в ветке `result && ev.result`
           // ниже: при error_max_turns CLI не кладёт в result никакого текста,
@@ -711,15 +697,6 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
           }
           usageTotals.webSearch += n(st.web_search_requests);
           usageTotals.webFetch += n(st.web_fetch_requests);
-          // Размер контекста ОДНОГО запроса: сколько токенов ушло в промпт.
-          // Именно эта величина определяет цену хода, и именно её мы ограничиваем.
-          // Берём максимум, а не сумму: за ход бывает несколько запросов к модели
-          // (шаги с инструментами, продолжения после max-turns), и сумма показала
-          // бы «сколько всего обработано», а нам нужен размер самой сессии.
-          const ctx =
-            n(u.input_tokens) + n(u.cache_read_input_tokens) +
-            (w5 || w1 ? w5 + w1 : n(u.cache_creation_input_tokens));
-          if (ctx > maxTurnContext) maxTurnContext = ctx;
         }
         if (ev.type === "stream_event" && ev.event) {
           const se = ev.event;
