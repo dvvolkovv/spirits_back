@@ -474,7 +474,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   // пользователя). Временный файл убирается по завершении запроса (см. finally
   // ниже). Любая осечка — безопасный откат к базовому конфигу.
   let mcpConfigPath = BASE_MCP_PATH;
-  let allowedTools = "Bash(*),Read(*),Write(*),Edit(*),Glob(*),Grep(*),WebSearch(*),WebFetch(*),mcp__linkeon__generate_image,mcp__linkeon__edit_image,mcp__linkeon__compose_image,mcp__linkeon__upscale_image,mcp__linkeon__generate_video,mcp__linkeon__generate_banner,mcp__linkeon__manage_routine,mcp__linkeon__propose_calendar_event,mcp__linkeon__generate_speech,mcp__linkeon__read_calendar";
+  let allowedTools = "Bash(*),Read(*),Write(*),Edit(*),Glob(*),Grep(*),WebSearch(*),WebFetch(*),mcp__linkeon__generate_image,mcp__linkeon__edit_image,mcp__linkeon__compose_image,mcp__linkeon__upscale_image,mcp__linkeon__generate_video,mcp__linkeon__generate_banner,mcp__linkeon__manage_routine,mcp__linkeon__propose_calendar_event,mcp__linkeon__generate_speech,mcp__linkeon__read_calendar,mcp__linkeon__calculate_human_design";
   let systemPrompt = SYSTEM_PROMPT;
   let sessionMcpPath = null;
   // Set when the agent uses a TalerID *write* tool this request. The transient
