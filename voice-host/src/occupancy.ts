@@ -36,6 +36,20 @@ export const HARD_CAP_MS = 2 * 60 * 60 * 1000;
  */
 export const MEET_EMPTY_GRACE_MS = 90_000;
 
+/**
+ * Сколько речь человека считается доказательством его присутствия.
+ *
+ * Нужна там, где состав приходит из вёрстки и может молчать (свой бот), а не
+ * из LiveKit. Десять минут: в живом разговоре люди говорят куда чаще, а цена
+ * ошибки в большую сторону — лишние минуты Realtime после конца встречи,
+ * тогда как цена ошибки в меньшую — выход из живых переговоров при клиенте.
+ *
+ * Перебор здесь дёшев ещё и потому, что это не основной путь выхода: когда
+ * встреча кончается, бот закрывает вебсокет, и воркер уходит по потере звука
+ * (onLost → abortMeet) примерно за полторы минуты.
+ */
+export const SPEECH_PRESENCE_TTL_MS = 10 * 60_000;
+
 export type Verdict =
   /** остаёмся в комнате */
   | 'stay'
@@ -62,14 +76,19 @@ export class Occupancy {
   private everHadHuman = false;
   /** С какого момента состав пуст. `null` — кто-то есть. */
   private emptyAt: number | null = null;
+  /** Когда человек говорил в последний раз. `null` — не говорил вовсе. */
+  private lastSpeechAt: number | null = null;
 
   /**
    * `emptyGraceMs` — выдержка перед вердиктом «опустела». Ноль для своих
    * комнат, MEET_EMPTY_GRACE_MS для Meet: там источник состава врёт.
+   * `speechTtlMs` — сколько речь считается присутствием. Параметр ради
+   * тестов: десять минут в юнит-тесте не подождёшь.
    */
   constructor(
     private readonly startedAt: number,
     private readonly emptyGraceMs = 0,
+    private readonly speechTtlMs = SPEECH_PRESENCE_TTL_MS,
   ) {}
 
   joined(identity: string): void {
@@ -79,6 +98,25 @@ export class Occupancy {
 
   left(identity: string): void {
     this.humans.delete(identity);
+  }
+
+  /**
+   * Человек говорил — значит он здесь.
+   *
+   * Источник, не зависящий от вёрстки: состав у своего бота читается зацепкой
+   * на странице, а расшифровка речи приходит из звука встречи. Когда зацепка
+   * молчит, это единственное свидетельство, что встреча живая.
+   *
+   * everHadHuman поднимаем здесь же: разговор был, и вердикт «во встречу так
+   * никто и не пришёл» после него — неправда, за которую звонок пометят
+   * failed.
+   *
+   * Личности у говорящего нет и не нужно: в Телемосте имён в разметке нет
+   * вовсе, а для правил выхода важно лишь, что живой человек тут есть.
+   */
+  speechHeard(now: number): void {
+    this.lastSpeechAt = now;
+    this.everHadHuman = true;
   }
 
   get liveCount(): number {
@@ -93,7 +131,11 @@ export class Occupancy {
     if (!this.everHadHuman) {
       return now - this.startedAt >= LOBBY_MS ? 'never_started' : 'stay';
     }
-    if (this.humans.size > 0) {
+    // Недавняя речь равносильна непустому составу. Проверяется ВМЕСТЕ с
+    // размером, а не вместо: при живом составе уходить не за чем и без речи,
+    // а при сломанном счётчике речь — единственное, что остаётся.
+    const speaking = this.lastSpeechAt !== null && now - this.lastSpeechAt < this.speechTtlMs;
+    if (this.humans.size > 0 || speaking) {
       this.emptyAt = null;
       return 'stay';
     }
