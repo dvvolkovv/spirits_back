@@ -345,6 +345,35 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
     expect(meetings.tryHandleLink).toHaveBeenCalledTimes(1);
   });
 
+  it('успешный ход: отметка о нуле снимается ПОСЛЕ записи ответа — и её сбой ход не роняет', async () => {
+    const { svc, router, billing } = makeTurnBot({ transcript: '' });
+    billing.clearOwnerZeroBalanceDm.mockRejectedValue(new Error('Connection is closed'));
+    await (svc as any).handleChatMessage(groupMsg({ text: 'Финансист, привет' }), CFG);
+    expect(router.persistAssistantReply).toHaveBeenCalled();
+    expect(router.consolidateAfterReply).toHaveBeenCalled();
+    expect(billing.clearOwnerZeroBalanceDm.mock.invocationCallOrder[0])
+      .toBeGreaterThan(router.persistAssistantReply.mock.invocationCallOrder[0]);
+  });
+
+  it('нулевой баланс: сбой оповещения владельца не мешает объяснить позвавшему', async () => {
+    const { svc, billing, sent } = makeTurnBot({ balance: 0 });
+    billing.notifyOwnerZeroBalance.mockRejectedValue(new Error('Connection is closed'));
+    await (svc as any).handleChatMessage(groupMsg({ text: 'Финансист, сколько осталось?' }), CFG);
+    expect(zeroNotices(sent())).toHaveLength(1);
+  });
+
+  it('эхо длинной расшифровки режется по символам и с «…», а не посреди эмодзи', async () => {
+    const { svc, sent } = makeTurnBot({ transcript: 'Финансист ' + 'я'.repeat(1100) });
+    await (svc as any).handleChatMessage(groupMsg({ voice: true }), CFG);
+    const echo = echoes(sent())[0];
+    expect(echo).toContain('…»');
+    const long = makeTurnBot({ transcript: 'Финансист ' + '\u{1F600}'.repeat(600) });
+    await (long.svc as any).handleChatMessage(groupMsg({ voice: true }), CFG);
+    const echo2 = echoes(long.sent())[0];
+    expect(echo2).not.toContain('…');
+    expect(Array.from(echo2).filter((c) => c === '\u{1F600}')).toHaveLength(600);
+  });
+
   it('нулевой баланс в группе — владелец узнаёт сам, личкой (даже если к боту не обращались)', async () => {
     const { svc, billing } = makeTurnBot({ balance: 0 });
     await (svc as any).handleChatMessage(groupMsg({ text: 'встречаемся в восемь' }), CFG);
