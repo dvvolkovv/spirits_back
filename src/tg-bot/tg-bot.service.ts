@@ -676,7 +676,14 @@ export class TgBotService implements OnModuleInit {
     // модель не идём. Иначе за каждую вставленную ссылку платим ход LLM и
     // получаем два ответа — приглашение и рассуждение ассистента о нём.
     // Тот же приём, что в вебе (chat.service.ts).
-    if (cfg.owner_user_id && typeof workingText === 'string') {
+    // Приглашаем, только если к боту обратились (решение владельца 14.10.2026):
+    // раньше карточка уходила на любую ссылку в группе — и в режиме «по
+    // обращению», и у замолчанного /silent бота.
+    if (
+      cfg.owner_user_id &&
+      typeof workingText === 'string' &&
+      this.router.isExplicitlyAddressed(cfg, { text: workingText, replyToFromBot })
+    ) {
       try {
         const handled = await this.meetings.tryHandleLink(
           msg.chat.id, workingText, cfg.owner_user_id,
