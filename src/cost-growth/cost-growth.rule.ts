@@ -7,6 +7,13 @@
  * за ход), ни «всплеск возвратов» этого не видели. Правило ловит и такую
  * поломку, и честно дорожающую длинную сессию: различить их помогают цифры
  * в алерте.
+ *
+ * Пороги по умолчанию (5 ходов, ×1,2, 8 000 токенов) — решение владельца
+ * 14.10.2026 по итогам прогона правила на 30 днях реальных ходов: сама
+ * жалоба 14.10 росла лишь ×1,34 на пятом ходе и на высоком уровне (11867 →
+ * 12221 → 15478 → 15724 → 15924 токена, позже — до 27940 ≈ $6.21); порог
+ * ×3 её не ловил вовсе, а ×1,2 от 8 000 ловит на пятом ходе и даёт на
+ * реальных пользователях порядка 12 алертов в месяц.
  */
 
 /** Один ход пары: списано токенов, стоимость в $, расклад расчёта. */
@@ -26,6 +33,9 @@ export interface CostGrowthConfig {
   /** Последний ход не дешевле — иначе это дешёвая болтовня. */
   minTokens: number;
 }
+
+/** Сколько последних ходов пары хранит CostGrowthService — верхняя граница `turns`. */
+export const KEEP_TURNS = 10;
 
 /**
  * Серия, на которую сработало правило (последние `turns` ходов), или null.
@@ -53,9 +63,9 @@ const num = (raw: string | undefined, fallback: number, ok: (n: number) => boole
 /** Пороги из .env (COST_GROWTH_*); бессмысленные значения — по умолчанию. */
 export function costGrowthConfig(env: Record<string, string | undefined> = process.env): CostGrowthConfig & { cooldownH: number } {
   return {
-    turns: num(env.COST_GROWTH_TURNS, 5, (n) => Number.isInteger(n) && n >= 2),
-    factor: num(env.COST_GROWTH_FACTOR, 3, (n) => n > 1),
-    minTokens: num(env.COST_GROWTH_MIN_TOKENS, 1000, (n) => n > 0),
+    turns: num(env.COST_GROWTH_TURNS, 5, (n) => Number.isInteger(n) && n >= 2 && n <= KEEP_TURNS),
+    factor: num(env.COST_GROWTH_FACTOR, 1.2, (n) => n > 1),
+    minTokens: num(env.COST_GROWTH_MIN_TOKENS, 8000, (n) => n > 0),
     cooldownH: num(env.COST_GROWTH_COOLDOWN_H, 24, (n) => n > 0),
   };
 }

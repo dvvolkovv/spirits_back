@@ -1,18 +1,17 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { RedisService } from '../common/services/redis.service';
 import { sendTelegramAlert } from '../common/telegram-alert';
-import { costGrowthConfig, detectCostGrowth, type TurnCost } from './cost-growth.rule';
+import { costGrowthConfig, detectCostGrowth, KEEP_TURNS, type TurnCost } from './cost-growth.rule';
 
 /** Чей это разговор: веб-чат — человек и ассистент; TG-бот — бот и чат, платит владелец бота. */
 export type CostPair =
-  | { kind: 'chat'; userId: string; assistantId: string }
+  | { kind: 'chat'; userId: string; assistantId: string; assistantName?: string }
   | { kind: 'tg'; configId: string; chatId: string; payerUserId: string; botName?: string };
 
 export const pairKey = (p: CostPair): string =>
   p.kind === 'chat' ? `chat:${p.userId}:${p.assistantId}` : `tg:${p.configId}:${p.chatId}`;
 
-/** Сколько последних ходов пары хранить и сколько (сек) — с последнего хода. */
-const KEEP_TURNS = 10;
+/** Сколько (сек) хранить историю ходов пары — с последнего хода. KEEP_TURNS — из правила: он же верхняя граница для COST_GROWTH_TURNS. */
 const HISTORY_TTL_S = 24 * 3600;
 
 /**
@@ -35,15 +34,17 @@ export function formatCostGrowthAlert(pair: CostPair, run: TurnCost[], balance?:
   const last = run[run.length - 1];
   const who =
     pair.kind === 'chat'
-      ? `Юзер: <code>${esc(pair.userId)}</code>, ассистент ${esc(pair.assistantId)}`
+      ? `Юзер: <code>${esc(pair.userId)}</code>, ассистент ${esc(pair.assistantId)}` +
+        (pair.assistantName ? ` (${esc(pair.assistantName)})` : '')
       : `TG-бот <code>${esc(pair.configId)}</code>${pair.botName ? ` («${esc(pair.botName)}»)` : ''}, ` +
         `чат <code>${esc(pair.chatId)}</code>, платит <code>${esc(pair.payerUserId)}</code>`;
   const factor = (last.tokens / first.tokens).toFixed(1).replace('.', ',');
+  const usd = (t: TurnCost) => (Number.isFinite(t.usd) ? `$${t.usd.toFixed(2)}` : '$?');
   return (
     `📈 <b>Стоимость растёт с каждым ответом</b>\n` +
     `${who}\n` +
     `Ходы: ${run.map((t) => fmt(t.tokens)).join(' → ')} токенов ` +
-    `(${run.map((t) => `$${t.usd.toFixed(2)}`).join(' → ')}), ×${factor}\n` +
+    `(${run.map(usd).join(' → ')}), ×${factor}\n` +
     (balance !== undefined && balance >= 0 ? `Остаток: ${fmt(balance)}\n` : '') +
     (last.note ? `Последний ход: <code>${esc(last.note)}</code>` : '')
   ).trimEnd();
@@ -63,7 +64,7 @@ export class CostGrowthService {
   constructor(private readonly redis: RedisService) {}
 
   async recordTurn(pair: CostPair, turn: TurnCost, ctx?: { balance?: () => Promise<number> }): Promise<void> {
-    if (!(turn.tokens > 0)) return;
+    if (!(turn?.tokens > 0)) return;
     try {
       const cfg = costGrowthConfig();
       const key = pairKey(pair);
@@ -75,10 +76,13 @@ export class CostGrowthService {
       const history: TurnCost[] = raw.map((s) => JSON.parse(s));
       const run = detectCostGrowth(history, cfg);
       if (!run) return;
-      const first = await this.redis.setNx(`cost-growth:alerted:${key}`, String(Date.now()), cfg.cooldownH * 3600_000);
-      if (!first) return;
+      // Текст — до паузы: даже если это первый за сутки алерт, не хотим
+      // держать cooldown-ключ выставленным, а текст — не собранным.
       const balance = ctx?.balance ? await ctx.balance().catch(() => -1) : undefined;
-      await sendTelegramAlert(formatCostGrowthAlert(pair, run, balance));
+      const text = formatCostGrowthAlert(pair, run, balance);
+      const first = await this.redis.setNx(`cost-growth:alerted:${key}`, String(Date.now()), Math.round(cfg.cooldownH * 3600_000));
+      if (!first) return;
+      await sendTelegramAlert(text);
     } catch (e: any) {
       this.logger.warn(`cost-growth: ход не учтён (${pairKey(pair)}): ${e?.message ?? e}`);
     }
