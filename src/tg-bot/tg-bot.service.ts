@@ -604,7 +604,7 @@ export class TgBotService implements OnModuleInit {
       voiceFileId = msg.voice?.file_id ?? msg.audio?.file_id;
       if (!voiceFileId) return;
       try {
-        workingText = await this.voice.transcribe(voiceFileId);
+        workingText = await this.voice.transcribe(voiceFileId, await this.router.ownerLanguage(cfg));
         actualIsVoice = true;
         this.logger.log(`voice transcribed in chat ${msg.chat.id}: "${workingText.substring(0, 50)}..."`);
         // Эхо расшифровки уходит позже — только если бот решит отвечать

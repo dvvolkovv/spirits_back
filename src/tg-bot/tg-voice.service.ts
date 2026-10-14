@@ -26,8 +26,12 @@ export class TgVoiceService {
   /**
    * Whisper STT. На нас (Linkeon) — не списываем с пользователя.
    * Возвращает только текст (cost не отдаём наружу, потому что не биллится).
+   *
+   * language — подсказка (ISO 639-1), обычно язык владельца бота. Раньше стоял
+   * жёсткий 'ru', и немецкое голосовое становилось кривой русской
+   * транслитерацией. Без подсказки Whisper определяет язык сам.
    */
-  async transcribe(fileId: string): Promise<string> {
+  async transcribe(fileId: string, language?: string): Promise<string> {
     const file = await this.grammy.getFile(fileId);
     if (!file.file_path) throw new Error('no file_path in Telegram getFile response');
     const buf = await this.grammy.downloadFile(file.file_path);
@@ -35,7 +39,7 @@ export class TgVoiceService {
     const resp = await this.openai.audio.transcriptions.create({
       model: 'whisper-1',
       file: await toFile(buf, 'voice.oga', { type: 'audio/ogg' }),
-      language: 'ru',
+      ...(language ? { language } : {}),
     });
     return resp.text.trim();
   }
