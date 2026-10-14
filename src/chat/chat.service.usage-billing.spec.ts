@@ -255,31 +255,59 @@ describe('курс сиденья', () => {
   });
 });
 
-describe('расход субагентов не теряется', () => {
+/**
+ * costUsd от релея — не стоимость хода.
+ *
+ * С Claude CLI 2.1.280 (на релее с 23.09.2026) total_cost_usd у возобновлённой
+ * (--resume) сессии — накопленная стоимость ВСЕЙ сессии: CLI пишет в транскрипт
+ * записи cost-state и при resume продолжает счёт с них. Списание по максимуму из
+ * usage и costUsd брало эту сумму за каждый ход, и чем дольше жила сессия, тем
+ * дороже становился каждый следующий ответ. Жалоба 14.10.2026: ход за $0.16
+ * списан как $6.21 — 27 940 токенов вместо 734.
+ */
+describe('SDK-биллинг: накопленный costUsd релея не тарифицируется', () => {
   afterEach(() => jest.clearAllMocks());
 
-  // Верхний usage в result-событии НЕ содержит токенов субагентов (проверено
-  // 2026-08-08: 42 319 против 62 650 в modelUsage). costUsd полон всегда,
-  // поэтому списываем по максимуму из двух.
-  const USAGE_BEZ_SUBAGENTOV = {
+  const USAGE = {
     input: 1000, output: 1000, cacheRead: 100_000,
     cacheWrite5m: 10_000, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
   }; // = $0.1425 по весам
 
-  it('берёт costUsd, когда он больше взвешенного (был фан-аут)', async () => {
-    const h = makeHarness({ answer: ANSWER, costUsd: 0.5, usage: USAGE_BEZ_SUBAGENTOV });
+  it('ход из жалобы: списано по usage хода, а не по сумме всей сессии', async () => {
+    // Настоящий ход 14.10.2026: 217 796 прочитано из кэша, 4 144 записано на
+    // час, 506 сгенерировано → 32 601.6 единицы × $5/MTok = $0.163008.
+    // Релей прислал costUsd = 6.2087 — сумму всех ходов сессии с 07.10.
+    const h = makeHarness({
+      answer: ANSWER, costUsd: 6.2087,
+      usage: { input: 4, output: 506, cacheRead: 217_796, cacheWrite5m: 0, cacheWrite1h: 4_144, webSearch: 0, webFetch: 0 },
+    });
     await h.run();
 
-    // Взвешенное дало бы $0.1425 и потеряло бы расход субагентов.
-    expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.5));
-    expect(chargedTokens(h.pgCalls)).not.toBe(forUsd(0.1425));
+    expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.163008));
+    expect(chargedTokens(h.pgCalls)).not.toBe(forUsd(6.2087));
   });
 
-  it('берёт взвешенное, когда оно больше (costUsd занижен или частичен)', async () => {
-    const h = makeHarness({ answer: ANSWER, costUsd: 0.01, usage: USAGE_BEZ_SUBAGENTOV });
+  it('costUsd больше взвешенного — всё равно взвешенное', async () => {
+    const h = makeHarness({ answer: ANSWER, costUsd: 0.5, usage: USAGE });
     await h.run();
 
     expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.1425));
+  });
+
+  it('costUsd меньше взвешенного — взвешенное, как и раньше', async () => {
+    const h = makeHarness({ answer: ANSWER, costUsd: 0.01, usage: USAGE });
+    await h.run();
+
+    expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.1425));
+  });
+
+  it('веб-поиск в токенах не виден — $10 за тысячу запросов сверху', async () => {
+    // Раньше эту плату приносил costUsd через максимум. Без него поиски
+    // стали бы бесплатными.
+    const h = makeHarness({ answer: ANSWER, costUsd: 0, usage: { ...USAGE, webSearch: 3 } });
+    await h.run();
+
+    expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.1425 + 0.03));
   });
 });
 
