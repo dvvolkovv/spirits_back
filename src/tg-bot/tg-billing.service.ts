@@ -6,6 +6,16 @@ import { escapeHtml } from './tg-html';
 import { CASH_TOKENS_PER_USD, SEAT_TOKENS_PER_USD } from '../common/billing-rates';
 import * as telegramAlert from '../common/telegram-alert';
 
+/**
+ * Отказ Telegram: 4xx, кроме 429, — «бот заблокирован», «не начинал диалог»,
+ * «чат не найден». За сутки он не пройдёт, повторять бессмысленно. Сеть и 429 —
+ * временно.
+ */
+function isTelegramRefusal(e: any): boolean {
+  const code = e?.error_code;
+  return typeof code === 'number' && code >= 400 && code < 500 && code !== 429;
+}
+
 @Injectable()
 export class TgBillingService {
   private readonly logger = new Logger(TgBillingService.name);
@@ -150,24 +160,30 @@ export class TgBillingService {
       return;
     }
     if (balance < threshold && balance > 0) {
-      const r = await this.pg.query(
-        `SELECT last_low_balance_dm_at FROM tg_bot_configs WHERE id = $1`,
+      // Слот на сутки занимаем одним UPDATE до отправки: проверка идёт в фоне,
+      // уже после замка чата (inBackground в tg-bot.service), и два хода подряд
+      // иначе прочли бы пустую отметку оба — владелец получил бы двойник.
+      const slot = await this.pg.query(
+        `UPDATE tg_bot_configs SET last_low_balance_dm_at = now()
+          WHERE id = $1
+            AND (last_low_balance_dm_at IS NULL OR last_low_balance_dm_at < now() - interval '24 hours')
+          RETURNING id`,
         [configId],
       );
-      const last = r.rows[0]?.last_low_balance_dm_at;
-      const dayMs = 24 * 60 * 60 * 1000;
-      if (!last || Date.now() - new Date(last).getTime() > dayMs) {
-        try {
-          await this.grammy.sendMessage(
-            ownerTgUserId,
-            `⚠️ На твоём боте осталось меньше ${threshold} токенов (баланс: ${balance}). Пополни: https://my.linkeon.io/tokens`,
-          );
-          await this.pg.query(
-            `UPDATE tg_bot_configs SET last_low_balance_dm_at = now() WHERE id = $1`,
-            [configId],
-          );
-        } catch (e: any) {
-          this.logger.warn(`low-balance DM failed: ${e.message}`);
+      if (!slot.rows[0]) return;
+      try {
+        await this.grammy.sendMessage(
+          ownerTgUserId,
+          `⚠️ На твоём боте осталось меньше ${threshold} токенов (баланс: ${balance}). Пополни: https://my.linkeon.io/tokens`,
+        );
+      } catch (e: any) {
+        this.logger.warn(`low-balance DM failed: ${e?.message}`);
+        // Отказ Telegram — слот держим до завтра; временный сбой — возвращаем,
+        // чтобы повторить на следующем ходе.
+        if (!isTelegramRefusal(e)) {
+          await this.pg
+            .query(`UPDATE tg_bot_configs SET last_low_balance_dm_at = NULL WHERE id = $1`, [configId])
+            .catch((e2: any) => this.logger.warn(`low-balance DM slot not released: ${e2?.message}`));
         }
       }
     }
@@ -200,12 +216,9 @@ export class TgBillingService {
       );
     } catch (e: any) {
       this.logger.warn(`zero-balance owner DM failed: ${e?.message}`);
-      // Отказ Telegram (403 «бот заблокирован», «не начинал диалог», 400) за
-      // сутки не пройдёт — отметку держим, иначе попытка на каждое сообщение
-      // группы. Сеть и 429 — временно: снимаем, чтобы повторить.
-      const code = e?.error_code;
-      const refused = typeof code === 'number' && code >= 400 && code < 500 && code !== 429;
-      if (!refused) {
+      // Отказ Telegram — отметку держим, иначе попытка на каждое сообщение
+      // группы. Временный сбой — снимаем, чтобы повторить.
+      if (!isTelegramRefusal(e)) {
         try {
           await this.redis.del(key);
         } catch (e2: any) {

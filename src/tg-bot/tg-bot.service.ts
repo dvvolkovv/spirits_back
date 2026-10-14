@@ -273,7 +273,11 @@ export class TgBotService implements OnModuleInit {
       // находил его и выходил из группы, бросая рабочий конфиг. А `/help@ДругойБот`
       // в режиме «на каждое сообщение» уходил в платный ход модели. В историю
       // чата такие строки тоже не пишем: чужие коды и команды модели ни к чему.
-      const said = typeof msg.text === 'string' ? msg.text : typeof msg.caption === 'string' ? msg.caption : '';
+      // Подпись альбома не смотрим: она у одной части из нескольких, и выброс
+      // её одной отдал бы модели альбом без фотографии.
+      const said = typeof msg.text === 'string'
+        ? msg.text
+        : !msg.media_group_id && typeof msg.caption === 'string' ? msg.caption : '';
       if (isForeignBotCommand(said, botUsername)) {
         this.logger.debug(`chat ${msg.chat.id}: command for another bot, skipping`);
         return;
@@ -356,8 +360,9 @@ export class TgBotService implements OnModuleInit {
     }
   }
 
-  // Команды в личке с ботом: /help, /assistants, /language, /balance, а
-  // /silent и /resume — для групп владельца: личку /silent не глушит.
+  // Команды в личке с ботом: /help, /assistants, /language, /balance; /silent
+  // глушит группы владельца (личку — нет), /resume будит всё, в том числе
+  // лички, заглушённые прежним /silent.
   private async handleDmCommand(msg: any): Promise<void> {
     // `/case <история>` — реальный кейс в блог, команда владельца блога. Стоит
     // первой: разбор ниже переводит текст в нижний регистр и режет по пробелу,
@@ -1680,7 +1685,7 @@ export class TgBotService implements OnModuleInit {
   private inBackground(what: string, job: () => Promise<unknown>): void {
     Promise.resolve()
       .then(job)
-      .catch((e: any) => this.logger.warn(`${what} failed: ${e?.message}`));
+      .catch((e: any) => this.logger.error(`${what} failed: ${e?.message}`, e?.stack));
   }
 
   // hashtext-эквивалент: 32-битный знаковый int для pg_advisory_lock

@@ -50,9 +50,7 @@ export function isForeignBotCommand(text: string, botUsername: string): boolean 
  * Script_Extensions, а не Script: у «ー» и «々» письменность общая (Common).
  */
 const NO_SPACES_SCRIPT = /[\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}\p{Script_Extensions=Thai}\p{Script_Extensions=Lao}\p{Script_Extensions=Khmer}\p{Script_Extensions=Myanmar}]/u;
-// Огласовки и надстрочные знаки (\p{M}) — часть слова: «राम» внутри «विराम»,
-// «й», набранное двумя символами.
-const WORD_CHAR = /[\p{L}\p{N}\p{M}]/u;
+const WORD_CHAR = /[\p{L}\p{N}]/u;
 
 /**
  * Имя бота встречается в тексте с начала слова. Конец слова не проверяем —
@@ -64,8 +62,12 @@ export function mentionsName(lo: string, name: string): boolean {
   if (!name) return false;
   const nameFree = NO_SPACES_SCRIPT.test(Array.from(name)[0]);
   for (let i = lo.indexOf(name); i !== -1; i = lo.indexOf(name, i + 1)) {
-    // Символ перед вхождением — целиком, а не половинка суррогатной пары.
-    const before = Array.from(lo.slice(Math.max(0, i - 2), i)).pop();
+    // Символ перед вхождением — целиком (не половинка суррогатной пары) и по
+    // основе, без знаков на хвосте (\p{M}): в «विराम» перед «राम» огласовка,
+    // её основа «व» — буква; у «❤️» хвост — вариационный селектор, основа «❤» —
+    // не буква; «й», набранное двумя символами, — буква «и».
+    const head = lo.slice(Math.max(0, i - 32), i).replace(/\p{M}+$/u, '');
+    const before = Array.from(head).pop();
     if (!before || nameFree || !WORD_CHAR.test(before) || NO_SPACES_SCRIPT.test(before)) return true;
   }
   return false;
