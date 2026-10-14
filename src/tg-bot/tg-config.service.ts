@@ -102,23 +102,23 @@ export class TgConfigService {
       );
     }
 
+    // Статус — в самом UPDATE: проверка выше читала его без блокировки, и
+    // привязка, успевшая между ними, иначе была бы стёрта (бот поздоровался
+    // в группе, а конфиг снова pending без чата). Прежние ссылки НЕ гасим:
+    // бота по второй ссылке и так не перенести (привязка — только из pending
+    // и только владельцем), а честно открытая минуту назад ссылка стала бы
+    // «просроченной».
     const updRes = await this.pg.query(
       `UPDATE tg_bot_configs
           SET status = 'pending', tg_chat_id = NULL, tg_chat_title = NULL, archived_at = NULL
-        WHERE id = $1
+        WHERE id = $1 AND status IN ('pending', 'archived')
         RETURNING *`,
       [id],
     );
+    if (updRes.rows.length === 0) {
+      throw new BadRequestException('reissue доступен только для pending/archived конфигов');
+    }
     const config: TgBotConfigRow = updRes.rows[0];
-
-    // Новая ссылка гасит прежние: иначе вторая живая ссылка, открытая в
-    // другой группе, переносила бы бота туда (мастер теперь выдаёт новую
-    // ссылку по кнопке, и таких «вторых» стало бы много).
-    await this.pg.query(
-      `UPDATE tg_claim_tokens SET consumed_at = now()
-        WHERE config_id = $1 AND kind = 'claim' AND consumed_at IS NULL`,
-      [id],
-    );
 
     const expires = new Date(Date.now() + this.CLAIM_TTL_MS);
     const tokRes = await this.pg.query(
@@ -227,7 +227,8 @@ export class TgConfigService {
       // здесь кто-то, кроме владельца» (isSoloChat, onlySpeakerIs) смотрит на
       // tg_chat_id, и реплики прежних ботов, оставшись на старом id, дали бы
       // в новой супергруппе ложное «пишет один владелец». Ждущие видео — туда
-      // же, иначе доставка уйдёт в мёртвый чат.
+      // же, иначе доставка уйдёт в мёртвый чат; ответ на сообщение старой
+      // группы сбрасываем — в супергруппе своя нумерация сообщений.
       const moved = await this.pg.query(
         `WITH moved AS (
            UPDATE tg_bot_configs SET tg_chat_id = $2
@@ -237,7 +238,7 @@ export class TgConfigService {
            UPDATE tg_bot_messages SET tg_chat_id = $2
             WHERE tg_chat_id = $1 AND EXISTS (SELECT 1 FROM moved)
          ), vids AS (
-           UPDATE tg_bot_video_jobs SET tg_chat_id = $2
+           UPDATE tg_bot_video_jobs SET tg_chat_id = $2, tg_reply_to_message_id = NULL
             WHERE tg_chat_id = $1 AND delivery_status = 'pending' AND EXISTS (SELECT 1 FROM moved)
          )
          SELECT id FROM moved`,

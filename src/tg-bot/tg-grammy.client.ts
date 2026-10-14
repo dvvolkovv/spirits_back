@@ -45,7 +45,7 @@ export class TgGrammyClient implements OnModuleInit {
       // Не ждём: 17 вызовов подряд держали бы старт всего API (Nest не
       // начинает слушать порт до конца onModuleInit), а при подвисшем
       // api.telegram.org — надолго. Метод сам не бросает.
-      void this.registerCommandMenus();
+      this.registerCommandMenus().catch(() => {});
     } catch (e: any) {
       this.logger.error(`setWebhook failed: ${e.message}`);
     }

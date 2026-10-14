@@ -9,7 +9,7 @@ import { TgConfigService, TgBotConfigRow } from './tg-config.service';
 import { TgRouterService, isForeignBotCommand } from './tg-router.service';
 import { isPrivateConfig } from './tg-chat-kind';
 import { escapeHtml } from './tg-html';
-import { tgText, formatTgNumber, ownerTgLanguage, pickTgLanguage, TgLang, TgTextKey } from './tg-i18n';
+import { tgText, formatTgNumber, ownerTgLanguage, linkedTgLanguage, pickTgLanguage, TgLang, TgTextKey } from './tg-i18n';
 import { TgClaimFailure } from './tg-claim.service';
 import { TgMeetingService } from './tg-meeting.service';
 import { TgVoiceService } from './tg-voice.service';
@@ -91,6 +91,7 @@ const CLAIM_FAILURE_TEXT: Record<TgClaimFailure, TgTextKey> = {
   wrong_account: 'claim_wrong_account',
   group_taken: 'claim_group_taken',
   already_connected: 'claim_already_connected',
+  own_bot_here: 'claim_own_bot_here',
 };
 
 /** Эхо расшифровки голосового — подсказка «что я услышал», не стенограмма. */
@@ -240,7 +241,7 @@ export class TgBotService implements OnModuleInit {
         [ownerId],
       );
       const current = prof.rows[0]?.preferred_agent;
-      const lang = pickTgLanguage(prof.rows[0]?.language, null);
+      const lang = await linkedTgLanguage(this.pg, ownerId, prof.rows[0]?.language, msg.from?.language_code);
       await this.grammy.sendMessage(
         msg.chat.id,
         (current ? tgText(lang, 'start_hello_agent', { agent: escapeHtml(current) }) : tgText(lang, 'start_hello')) +
@@ -299,6 +300,10 @@ export class TgBotService implements OnModuleInit {
         this.logger.debug(`chat ${msg.chat.id}: command for another bot, skipping`);
         return;
       }
+      // Голый /start без кода в группе чаще всего пишут другому боту. Молчим
+      // ДО всего остального: дальше, в «на каждое сообщение», он дошёл бы до
+      // «токены кончились» или «Минутку». Наш /start@бот — справка (tryHandle).
+      if (!startToken && /^\/start\s*$/i.test(said.trim())) return;
       if (startToken) {
         await this.handleGroupClaim(msg, startToken);
         return;
@@ -374,7 +379,7 @@ export class TgBotService implements OnModuleInit {
       const page = Number(data.split(':')[1]) || 0;
       // Ответ на нажатие гасит «часики» на кнопке — иначе они крутятся до
       // таймаута Telegram.
-      await this.grammy.answerCallbackQuery(cb.id, {});
+      await this.grammy.answerCallbackQuery(cb.id, {}).catch(() => {});
       await this.commands.handleAssistants(cb.message, ownerId, page);
       return;
     }
@@ -505,7 +510,7 @@ export class TgBotService implements OnModuleInit {
       );
       await this.grammy.sendMessage(
         msg.chat.id,
-        TgBotService.bindFailureMessage(e, msg.from, pickTgLanguage(null, msg.from?.language_code)),
+        TgBotService.bindFailureMessage(e, msg.from, await this.langOfTgUser(msg.from)),
       );
     }
   }
@@ -629,10 +634,11 @@ export class TgBotService implements OnModuleInit {
     const cfg = cfgIn ?? (await this.configs.getActiveByTgChatId(msg.chat.id));
     if (!cfg) return;
 
-    // Язык служебных сообщений хода — язык владельца (его профиля). В базу —
+    // Язык служебных сообщений хода — язык владельца (его профиля; в личке,
+    // где пишет сам владелец, пустой профиль заполнит язык клиента). В базу —
     // один раз и только когда бот действительно что-то скажет.
     let langOnce: Promise<TgLang> | null = null;
-    const lang = () => (langOnce ??= this.langFor(cfg.owner_user_id));
+    const lang = () => (langOnce ??= this.langFor(cfg.owner_user_id, isPrivateConfig(cfg) ? msg.from : undefined));
 
     // Часть альбома — не самостоятельный ход: копим и обрабатываем всё вместе.
     // albumParts значит «это уже склейка», её пропускаем дальше.
@@ -1518,18 +1524,22 @@ export class TgBotService implements OnModuleInit {
    * Отправляем каждый attachment-маркер отдельным сообщением. Ошибка по
    * конкретному файлу не валит остальные и не роняет ход — логируем, коротко
    * пишем в чат и продолжаем. Сюда же приходит отказ по ссылке во внутреннюю
-   * сеть (UnsafeUrlError): его сообщение рассчитано на человека.
+   * сеть (UnsafeUrlError, код UNSAFE_URL) — человеку о нём своими словами.
    */
   private async deliverOutgoingMarkers(cfg: TgBotConfigRow, msg: any, markers: OutgoingMarker[], lang: TgLang): Promise<void> {
     for (const m of markers.slice(0, 3)) {
       try {
         await this.dispatchOutgoingMarker(cfg, msg, m, lang);
       } catch (e: any) {
-        // Причина — только в лог: её текст бывает русским («Недостаточно
-        // токенов») или внутренним посреди переведённого сообщения.
+        // Сырой текст причины — только в лог: он бывает русским или
+        // внутренним. Человеку — известные причины своими словами (по коду
+        // ошибки, не по тексту), остальные — общей фразой.
         this.logger.warn(`outgoing marker (${m.kind}) failed in chat ${msg.chat.id}: ${e.message}`);
+        const key: TgTextKey = e?.code === 'INSUFFICIENT_TOKENS'
+          ? 'attach_no_tokens'
+          : e?.code === 'UNSAFE_URL' ? 'attach_bad_link' : 'attach_failed';
         try {
-          await this.grammy.sendMessage(msg.chat.id, tgText(lang, 'attach_failed'));
+          await this.grammy.sendMessage(msg.chat.id, tgText(lang, key));
         } catch { /* ignore */ }
       }
     }

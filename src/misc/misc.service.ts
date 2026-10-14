@@ -65,6 +65,15 @@ const searchMsg = (lang: string) => SEARCH_MESSAGES[lang] || SEARCH_MESSAGES.ru;
 const STREAM_PIECE_CHARS = 200;
 const STREAM_PIECE_GAP_MS = 10;
 
+/**
+ * «Мало токенов» — с кодом: тексту ошибки нельзя доверять как признаку
+ * (локализация меняет текст), а боту нужно сказать человеку причину на его
+ * языке. Сам текст прежний — по нему сравнивают в products/product-tool.
+ */
+function insufficientTokens(): Error {
+  return Object.assign(new Error('Недостаточно токенов'), { code: 'INSUFFICIENT_TOKENS' });
+}
+
 @Injectable()
 export class MiscService {
   private readonly logger = new Logger(MiscService.name);
@@ -548,7 +557,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     );
     const currentTokens = Number(balanceRes.rows[0]?.tokens || 0);
     if (currentTokens < tokenCost) {
-      throw new Error('Недостаточно токенов');
+      throw insufficientTokens();
     }
 
     try {
@@ -668,7 +677,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       [userId],
     );
     const currentTokens = Number(balanceRes.rows[0]?.tokens || 0);
-    if (currentTokens < tokenCost) throw new Error('Недостаточно токенов');
+    if (currentTokens < tokenCost) throw insufficientTokens();
 
     // Фон БЕЗ текста — критично, иначе модель «подмешает» кривые буквы.
     const where =
@@ -742,7 +751,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       [userId],
     );
     const currentTokens = Number(balanceRes.rows[0]?.tokens || 0);
-    if (currentTokens < tokenCost) throw new Error('Недостаточно токенов');
+    if (currentTokens < tokenCost) throw insufficientTokens();
 
     const fs = require('fs');
     const path = require('path');
@@ -830,7 +839,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       [userId],
     );
     const currentTokens = Number(balanceRes.rows[0]?.tokens || 0);
-    if (currentTokens < tokenCost) throw new Error('Недостаточно токенов');
+    if (currentTokens < tokenCost) throw insufficientTokens();
 
     const fs = require('fs');
     const path = require('path');

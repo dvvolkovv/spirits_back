@@ -9,7 +9,7 @@ import { TgConfigService } from './tg-config.service';
 import { buildAssistantsKeyboard } from './tg-assistants-keyboard';
 import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
 import { escapeHtml } from './tg-html';
-import { tgText, formatTgNumber, ownerTgLanguage, pickTgLanguage, TgLang, TgTextKey } from './tg-i18n';
+import { tgText, formatTgNumber, ownerTgLanguage, linkedTgLanguage, TgLang, TgTextKey } from './tg-i18n';
 
 /**
  * Родные названия языков — те же, что показывает сайт и мини-апп
@@ -53,7 +53,7 @@ export class TgCommandsService {
       [ownerId],
     );
     const current = prof.rows[0]?.language ?? null;
-    const lang = pickTgLanguage(current, null);
+    const lang = await linkedTgLanguage(this.pg, ownerId, current, msg.from?.language_code);
     await this.grammy.sendMessage(msg.chat.id, tgText(lang, 'language_prompt'), {
       reply_markup: {
         inline_keyboard: SUPPORTED_LANGUAGES.map((code) => [
@@ -107,7 +107,7 @@ export class TgCommandsService {
       [ownerId],
     );
     const current = prof.rows[0]?.preferred_agent ?? null;
-    const lang = pickTgLanguage(prof.rows[0]?.language, null);
+    const lang = await linkedTgLanguage(this.pg, ownerId, prof.rows[0]?.language, msg.from?.language_code);
     await this.grammy.sendMessage(
       msg.chat.id,
       current ? tgText(lang, 'assistants_current', { agent: escapeHtml(current) }) : tgText(lang, 'assistants_prompt'),

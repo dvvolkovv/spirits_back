@@ -69,12 +69,15 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
     // Язык — владельца бота (язык его профиля).
     const lang = await ownerTgLanguage(this.pg, row.owner_user_id);
     const replyTo = row.tg_reply_to_message_id ?? undefined;
+    // Сообщение, на которое отвечаем, могли удалить за 1–3 минуты генерации —
+    // тогда видео всё равно уходит, просто без ответа.
+    const replyOpts = replyTo ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {};
     try {
       if (row.status === 'failed' || !row.video_url) {
         await this.grammy.sendMessage(
           chatId,
           tgText(lang, 'video_failed'),
-          replyTo ? { reply_to_message_id: replyTo } : {},
+          replyOpts,
         );
       } else {
         await this.grammy.sendChatAction(chatId, 'upload_video').catch(() => {});
@@ -84,7 +87,7 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
           maxContentLength: MAX_VIDEO_BYTES,
         });
         const buf = Buffer.from(resp.data);
-        await this.grammy.sendVideo(chatId, buf, replyTo ? { reply_to_message_id: replyTo } : {});
+        await this.grammy.sendVideo(chatId, buf, replyOpts);
       }
       await this.pg.query(
         `UPDATE tg_bot_video_jobs SET delivery_status='sent', delivered_at=now() WHERE job_id=$1`,
@@ -104,7 +107,7 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
         await this.grammy.sendMessage(
           chatId,
           tgText(lang, 'video_expired'),
-          replyTo ? { reply_to_message_id: replyTo } : {},
+          replyOpts,
         );
       } catch { /* ignore */ }
     }
