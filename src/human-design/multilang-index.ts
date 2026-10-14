@@ -43,9 +43,34 @@ type Row = CityDb['cities'][number];
 /** Латиница GeoNames (или само название, если оно и есть латиница) — общая для всех языков. */
 const latinOf = (row: Row) => (row[1] || row[0]).toLowerCase();
 
-/** «Регион страна» строки на языке базы — как подпись indexCities (регион, равный названию, опускается). */
-const placeText = (db: CityDb, [name, , cc, , , region]: Row) =>
-  `${region >= 0 && db.regions[region] !== name ? db.regions[region] : ''} ${db.countries[cc] ?? cc}`;
+/** Места одной базы: разные «регион страна» (нормализованные) и номер места у каждой записи. */
+interface PlaceParts {
+  texts: string[];
+  ids: Uint32Array;
+}
+
+/**
+ * «Регион страна» на языке базы — как подпись indexCities (регион, равный
+ * названию города, опускается). Разных мест — тысячи на десятки тысяч
+ * городов: каждое нормализуется и хранится один раз.
+ */
+function placeParts(db: CityDb): PlaceParts {
+  const byKey = new Map<string, number>();
+  const texts: string[] = [];
+  const ids = new Uint32Array(db.cities.length);
+  db.cities.forEach(([name, , cc, , , region], i) => {
+    const r = region >= 0 && db.regions[region] !== name ? region : -1;
+    const key = `${r}|${cc}`;
+    let id = byKey.get(key);
+    if (id === undefined) {
+      id = texts.length;
+      texts.push(normalize(`${r >= 0 ? db.regions[r] : ''} ${db.countries[cc] ?? cc}`));
+      byKey.set(key, id);
+    }
+    ids[i] = id;
+  });
+  return { texts, ids };
+}
 
 const HAN = /\p{Script=Han}/u;
 
@@ -90,8 +115,8 @@ interface Building {
   index: CityIndex;
   ownKeys: Uint8Array;
   rows: RuRow[];
-  /** «Регион страна» на уже пройденных языках — сырой текст, нормализуется в конце. */
-  parts: string[];
+  /** Места на уже пройденных языках — складываются в places в конце. */
+  places: PlaceParts[];
 }
 
 /** Отдельной функцией — чтобы разобранная русская база не жила до конца сборки. */
@@ -101,7 +126,7 @@ function fromRu(ru: CityDb): Building {
     index,
     ownKeys: Uint8Array.from(index, ({ keys }) => keys.length),
     rows: ru.cities.map((row) => ({ cc: row[2], zone: ru.zones[row[3]], population: row[4], latin: latinOf(row) })),
-    parts: ru.cities.map((row) => placeText(ru, row)),
+    places: [placeParts(ru)],
   };
 }
 
@@ -121,8 +146,8 @@ function merge(b: Building, code: SiteLanguage, db: CityDb) {
     const name = normalize(row[0]);
     addKey(keys, name);
     if (code === 'zh') for (const k of zhVariants(name)) addKey(keys, k);
-    b.parts[i] += ` ${placeText(db, row)}`;
   });
+  b.places.push(placeParts(db));
 }
 
 /**
@@ -142,15 +167,15 @@ export function multilingualCities(load: (code: SiteLanguage) => CityDb): Multil
   const b = fromRu(load('ru'));
   for (const code of SITE_LANGUAGES) if (code !== 'ru') merge(b, code, load(code));
 
-  // Одинаковые места (город того же региона) — одна строка на всех.
+  // Одинаковые места (города того же региона) — одна строка на всех.
   const interned = new Map<string, string>();
-  const places = b.parts.map((text, i) => {
-    const cc = b.rows[i].cc;
-    const raw = `${text} ${cc} ${(COUNTRY_ALIASES[cc] ?? []).join(' ')}`;
-    let place = interned.get(raw);
+  const places = b.rows.map(({ cc }, i) => {
+    let key = '';
+    for (const p of b.places) key += `${p.ids[i]},`;
+    let place = interned.get(key);
     if (place === undefined) {
-      place = normalize(raw);
-      interned.set(raw, place);
+      place = [...b.places.map((p) => p.texts[p.ids[i]]), normalize(cc), ...(COUNTRY_ALIASES[cc] ?? [])].join(' ');
+      interned.set(key, place);
     }
     return place;
   });
