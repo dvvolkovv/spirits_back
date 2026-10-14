@@ -1,3 +1,6 @@
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { TgRouterService } from './tg-router.service';
 import { TgBotService } from './tg-bot.service';
 import { TgMeetingService } from './tg-meeting.service';
@@ -102,6 +105,88 @@ describe('ответ пришёлся на переезд группы в суп
     grammy.sendMessage.mockRejectedValueOnce(new Error('boom')).mockResolvedValueOnce({ message_id: 1 });
     await expect(svc.deliverReplyText(-4001, 10, 'ответ', 'ru')).rejects.toThrow('boom');
     expect(configs.moveToChat).not.toHaveBeenCalled();
+  });
+
+  // Ход целиком: за ответом идут картинки и файлы — им тоже в новый чат.
+  function makeTurn() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tg-final-tails-'));
+    const file = path.join(dir, 'report.pdf');
+    fs.writeFileSync(file, 'pdf');
+    const grammy = {
+      getBotUserId: jest.fn(async () => 999),
+      sendChatAction: jest.fn(async () => {}),
+      sendMessage: jest.fn(async (chatId: number, text: string, _o?: any) => {
+        if (chatId === -4001 && text === 'ответ') throw upgraded();
+        return { message_id: 55 };
+      }),
+      editMessageText: jest.fn(async () => {}),
+      deleteMessage: jest.fn(async () => {}),
+      sendDocument: jest.fn(async (..._a: any[]) => ({})),
+    };
+    const pg = {
+      query: jest.fn(async () => ({ rows: [] })),
+      tryAdvisoryLock: jest.fn(async () => ({ release: jest.fn(async () => {}) })),
+    };
+    const router = {
+      shouldRespond: jest.fn(async () => true),
+      isExplicitlyAddressed: jest.fn(() => true),
+      persistUserMessage: jest.fn(async () => {}),
+      markAnswerExpected: jest.fn(async () => {}),
+      onlySpeakerIs: jest.fn(async () => false),
+      generateReply: jest.fn(async (..._a: any[]) => ({ text: 'ответ', costUsd: 0.01 })),
+      persistAssistantReply: jest.fn(async (..._a: any[]) => {}),
+      consolidateAfterReply: jest.fn(async () => {}),
+      persistTurnFailure: jest.fn(async () => {}),
+      ownerLanguage: jest.fn(async () => 'ru'),
+    };
+    const billing = {
+      getBalance: jest.fn(async () => 100000),
+      tokensForTurn: jest.fn(() => 36),
+      deduct: jest.fn(async () => 99964),
+      alertIfExpensiveTurn: jest.fn(async () => {}),
+      clearZeroBalanceFlag: jest.fn(async () => {}),
+      checkBalanceAlerts: jest.fn(async () => {}),
+      clearOwnerZeroBalanceDm: jest.fn(async () => {}),
+    };
+    const configs = { moveToChat: jest.fn(async () => {}) };
+    const svc = new TgBotService(
+      pg as any, { getLinkeonIdByTgUserId: jest.fn(async () => null) } as any, null as any, configs as any,
+      router as any, { transcribe: jest.fn() } as any, billing as any, { tryHandle: jest.fn(async () => false) } as any,
+      { tryHandleLink: jest.fn(async () => false) } as any, grammy as any, null as any, null as any,
+      { handleCaseCommand: jest.fn(async () => false), handleReplyEdit: jest.fn(async () => false) } as any,
+    );
+    (svc as any).logger = quiet;
+    jest.spyOn(svc as any, 'chatWorkspace').mockReturnValue(dir);
+    jest.spyOn(svc as any, 'scanSandboxOutputs').mockReturnValue([file]);
+    const markers = jest.spyOn(svc as any, 'deliverOutgoingMarkers').mockResolvedValue(undefined);
+    const cfg: any = {
+      id: 'cfg-g', owner_user_id: 'u-owner', tg_chat_id: '-4001', display_name: 'Финансист',
+      voice_reply_mode: 'never', addressing_mode: 'strict', status: 'active', last_reply_at: null,
+    };
+    const msg = { chat: { id: -4001, type: 'group' }, from: { id: 7 }, message_id: 1, text: 'Финансист, привет' };
+    return { svc, grammy, router, configs, markers, cfg, msg };
+  }
+
+  it('картинки и файлы этого хода — в новый чат, без ответа на сообщение старой группы', async () => {
+    const { svc, grammy, configs, markers, cfg, msg } = makeTurn();
+    await (svc as any).handleChatMessage(msg, cfg);
+    expect(configs.moveToChat).toHaveBeenCalledWith(-4001, -1004001);
+    const [outMsg] = (markers.mock.calls[0] as any[]).slice(1);
+    expect(outMsg.chat.id).toBe(-1004001);
+    expect(outMsg.message_id).toBeUndefined();
+    expect(grammy.sendDocument).toHaveBeenCalledTimes(1);
+    const [chatId, , name, opts] = grammy.sendDocument.mock.calls[0] as any[];
+    expect([chatId, name, opts?.reply_to_message_id]).toEqual([-1004001, 'report.pdf', undefined]);
+  });
+
+  it('без переезда — файлы, как раньше, ответом на сообщение в этом же чате (контроль)', async () => {
+    const t = makeTurn();
+    t.grammy.sendMessage.mockImplementation(async () => ({ message_id: 55 }));
+    await (t.svc as any).handleChatMessage(t.msg, t.cfg);
+    expect(t.configs.moveToChat).not.toHaveBeenCalled();
+    expect((t.markers.mock.calls[0] as any[])[1]).toBe(t.msg);
+    const [chatId, , , opts] = t.grammy.sendDocument.mock.calls[0] as any[];
+    expect([chatId, opts?.reply_to_message_id]).toEqual([-4001, 1]);
   });
 });
 
