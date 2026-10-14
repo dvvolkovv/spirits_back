@@ -79,7 +79,7 @@ describe('маркер {{file:…}} — ссылка от модели', () => {
 
     const notices = grammy.sendMessage.mock.calls.map((c) => c[1] as string);
     expect(notices).toHaveLength(1);
-    expect(notices[0]).toMatch(/^\(не удалось приложить file: ссылка не принята: адрес ведёт во внутреннюю сеть\)$/);
+    expect(notices[0]).toMatch(/^\(не удалось приложить файл: ссылка не принята: адрес ведёт во внутреннюю сеть\)$/);
     // Ни IP, ни ответа внутреннего сервиса в сообщении нет.
     expect(notices[0]).not.toMatch(/169\.254/);
 

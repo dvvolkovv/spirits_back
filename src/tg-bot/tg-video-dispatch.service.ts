@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/commo
 import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from './tg-grammy.client';
+import { tgText, ownerTgLanguage } from './tg-i18n';
 
 // Видео из Kling/Veo доступно по временной ссылке; качаем сразу как только
 // статус ready. Telegram Bot API лимитит загрузку 50МБ — для коротких клипов
@@ -40,9 +41,10 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
   private async tick(): Promise<void> {
     const r = await this.pg.query(
       `SELECT tg.job_id, tg.tg_chat_id, tg.tg_reply_to_message_id,
-              vj.status, vj.video_url
+              vj.status, vj.video_url, c.owner_user_id
          FROM tg_bot_video_jobs tg
          JOIN video_jobs vj ON vj.id = tg.job_id
+         LEFT JOIN tg_bot_configs c ON c.id = tg.config_id
         WHERE tg.delivery_status = 'pending'
           AND vj.status IN ('ready', 'failed')
         ORDER BY tg.created_at
@@ -61,14 +63,17 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
     tg_reply_to_message_id: number | null;
     status: string;
     video_url: string | null;
+    owner_user_id?: string | null;
   }): Promise<void> {
     const chatId = Number(row.tg_chat_id);
+    // Язык — владельца бота: на нём же отвечает ассистент.
+    const lang = await ownerTgLanguage(this.pg, row.owner_user_id);
     const replyTo = row.tg_reply_to_message_id ?? undefined;
     try {
       if (row.status === 'failed' || !row.video_url) {
         await this.grammy.sendMessage(
           chatId,
-          '⚠️ Не получилось сгенерировать видео.',
+          tgText(lang, 'video_failed'),
           replyTo ? { reply_to_message_id: replyTo } : {},
         );
       } else {
@@ -98,7 +103,7 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
       try {
         await this.grammy.sendMessage(
           chatId,
-          '⚠️ Видео сгенерировалось, но не получилось доставить — ссылка истекла.',
+          tgText(lang, 'video_expired'),
           replyTo ? { reply_to_message_id: replyTo } : {},
         );
       } catch { /* ignore */ }

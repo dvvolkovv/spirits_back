@@ -204,6 +204,34 @@ export class TgConfigService {
     );
   }
 
+  /**
+   * Группа стала супергруппой (migrate_to_chat_id): у неё новый id. Конфиг и
+   * его история переезжают — иначе бот в новой супергруппе молчит, а
+   * мониторинг молчания ищет ответ не в том чате. Идемпотентно: второе
+   * служебное сообщение (migrate_from_chat_id) старого id уже не найдёт.
+   */
+  async moveToChat(fromChatId: number, toChatId: number): Promise<void> {
+    try {
+      const moved = await this.pg.query(
+        `UPDATE tg_bot_configs SET tg_chat_id = $2
+          WHERE tg_chat_id = $1 AND status IN ('active','silent')
+          RETURNING id`,
+        [fromChatId, toChatId],
+      );
+      const id = moved.rows[0]?.id;
+      if (!id) return;
+      await this.pg.query(
+        `UPDATE tg_bot_messages SET tg_chat_id = $2 WHERE config_id = $3 AND tg_chat_id = $1`,
+        [fromChatId, toChatId, id],
+      );
+      this.logger.log(`config ${id}: группа ${fromChatId} стала супергруппой ${toChatId}`);
+    } catch (e: any) {
+      // На новом id уже стоит свой бот (уникальный индекс по активным
+      // чатам) — переезжать некуда. Остальную обработку апдейта не роняем.
+      this.logger.warn(`moveToChat ${fromChatId} → ${toChatId} failed: ${e?.message}`);
+    }
+  }
+
   async getActiveByTgChatId(tgChatId: number): Promise<TgBotConfigRow | null> {
     const r = await this.pg.query(
       `SELECT * FROM tg_bot_configs WHERE tg_chat_id = $1 AND status IN ('active','silent') LIMIT 1`,

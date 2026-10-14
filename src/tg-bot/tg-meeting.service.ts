@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from './tg-grammy.client';
 import { escapeHtml } from './tg-html';
+import { tgText, ownerTgLanguage, TgLang } from './tg-i18n';
 import { MeetingService } from '../meeting/meeting.service';
 import { RoomService } from '../meeting/room.service';
 import { TalerIdRoomClient } from '../meeting/talerid-room.client';
@@ -120,21 +121,23 @@ export class TgMeetingService {
     const link = parseMeetingLink(text);
     if (!link) return false;
 
-    const found = await this.lookup(link.provider, link.code);
+    // Язык приглашения — язык владельца: на нём же отвечает ассистент.
+    const lang = await ownerTgLanguage(this.pg, ownerId);
+    const found = await this.lookup(link.provider, link.code, lang);
     // Комнаты нет, она закрыта или под паролем — значит это была обычная
     // ссылка в разговоре, а не приглашение. Молчим и пропускаем ход в модель:
     // пусть ассистент ответит как обычно.
     if (!found) return false;
 
     const agent = await this.currentAgent(ownerId);
-    const who = agent ? `${escapeHtml(agent.name)} зайдёт во встречу` : 'Ассистент зайдёт во встречу';
+    const who = agent ? tgText(lang, 'meeting_who_agent', { agent: escapeHtml(agent.name) }) : tgText(lang, 'meeting_who');
 
     await this.grammy.sendMessage(chatId, `🎤 <b>${escapeHtml(found.title)}</b>\n${who}.`, {
       parse_mode: 'HTML',
       reply_markup: {
         inline_keyboard: [[
           {
-            text: 'Зайти во встречу',
+            text: tgText(lang, 'meeting_join'),
             // У Zoom в кнопку уходит токен, а не код: по коду вход не собрать,
             // а полная ссылка не влезает в лимит callback_data.
             callback_data: link.provider === 'zoom' && link.url
@@ -150,6 +153,7 @@ export class TgMeetingService {
   private async lookup(
     provider: MeetingProvider,
     code: string,
+    lang: TgLang = 'ru',
   ): Promise<{ title: string } | null> {
     try {
       // Выключенная интеграция не показывает кнопку вовсе.
@@ -162,15 +166,15 @@ export class TgMeetingService {
       }
       // Мост: проверить существование встречи нечем — публичной ручки нет ни
       // у Meet, ни у Zoom. Показываем приглашение сразу, как и в вебе.
-      if (provider === 'meet') return { title: 'Встреча Google Meet' };
-      if (provider === 'zoom') return { title: 'Встреча Zoom' };
+      if (provider === 'meet') return { title: tgText(lang, 'meeting_title_meet') };
+      if (provider === 'zoom') return { title: tgText(lang, 'meeting_title_zoom') };
       if (provider === 'talerid') {
         const r = await this.talerIdRooms.info(code);
         if (!r || !r.isActive || r.requiresPassword) return null;
-        return { title: r.title || r.creatorName || 'Встреча' };
+        return { title: r.title || r.creatorName || tgText(lang, 'meeting_title') };
       }
       const r = await this.rooms.info(code);
-      return r?.active ? { title: r.title || 'Встреча' } : null;
+      return r?.active ? { title: r.title || tgText(lang, 'meeting_title') } : null;
     } catch (e: any) {
       this.logger.warn(`комната ${provider}/${code} не проверена: ${e?.message}`);
       return null;
@@ -179,6 +183,7 @@ export class TgMeetingService {
 
   /** Нажали «Зайти во встречу». */
   async handleJoinCallback(cb: any, ownerId: string): Promise<void> {
+    const lang = await ownerTgLanguage(this.pg, ownerId, cb.from?.language_code);
     const rest = String(cb.data || '').slice(JOIN_PREFIX.length);
     const sep = rest.indexOf(':');
     const provider = (sep > 0 ? rest.slice(0, sep) : 'linkeon') as MeetingProvider;
@@ -192,7 +197,7 @@ export class TgMeetingService {
       url = this.takeZoomUrl(code);
       if (!url) {
         await this.grammy.answerCallbackQuery(cb.id, {
-          text: 'Ссылка устарела — пришли её ещё раз.',
+          text: tgText(lang, 'meeting_link_expired'),
         });
         return;
       }
@@ -201,7 +206,7 @@ export class TgMeetingService {
 
     const agent = await this.currentAgent(ownerId);
     if (!agent) {
-      await this.grammy.answerCallbackQuery(cb.id, { text: 'Сначала выбери ассистента: /assistants' });
+      await this.grammy.answerCallbackQuery(cb.id, { text: tgText(lang, 'meeting_pick_assistant') });
       return;
     }
 
@@ -210,13 +215,13 @@ export class TgMeetingService {
       // Отвечаем на callback ДО отправки сообщения: Telegram гасит «часики» на
       // кнопке только по нему, а вход занимает несколько секунд.
       await this.grammy.answerCallbackQuery(cb.id, {});
-      await this.grammy.sendMessage(cb.message.chat.id, `${agent.name} во встрече.`);
+      await this.grammy.sendMessage(cb.message.chat.id, tgText(lang, 'meeting_joined', { agent: agent.name }));
     } catch (e: any) {
       // Причины ожидаемые и разные: комната закрылась, уже идёт разговор,
       // комната под паролем. Человеку нужен текст, а не молчащая кнопка.
       const msg = e?.status === 409 || /already in progress/i.test(e?.message || '')
-        ? 'Разговор уже идёт — заверши его и попробуй снова.'
-        : 'Не получилось зайти: комната недоступна.';
+        ? tgText(lang, 'meeting_busy')
+        : tgText(lang, 'meeting_unavailable');
       await this.grammy.answerCallbackQuery(cb.id, { text: msg });
       this.logger.warn(`[tg] вход во встречу ${provider}/${code} не удался: ${e?.message}`);
     }

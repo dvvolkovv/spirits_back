@@ -3,6 +3,7 @@ import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from './tg-grammy.client';
 import { RedisService } from '../common/services/redis.service';
 import { escapeHtml } from './tg-html';
+import { tgText, formatTgNumber, ownerTgLanguage } from './tg-i18n';
 import { CASH_TOKENS_PER_USD, SEAT_TOKENS_PER_USD } from '../common/billing-rates';
 import * as telegramAlert from '../common/telegram-alert';
 
@@ -172,9 +173,10 @@ export class TgBillingService {
       );
       if (!slot.rows[0]) return;
       try {
+        const lang = await ownerTgLanguage(this.pg, ownerUserId);
         await this.grammy.sendMessage(
           ownerTgUserId,
-          `⚠️ На твоём боте осталось меньше ${threshold} токенов (баланс: ${balance}). Пополни: https://my.linkeon.io/tokens`,
+          tgText(lang, 'low_balance', { balance: formatTgNumber(lang, balance) }),
         );
       } catch (e: any) {
         this.logger.warn(`low-balance DM failed: ${e?.message}`);
@@ -210,10 +212,8 @@ export class TgBillingService {
     }
     if (!first) return;
     try {
-      await this.grammy.sendMessage(
-        ownerTgUserId,
-        '⛔ Токены закончились — твои боты не отвечают, пока не пополнишь баланс: https://my.linkeon.io/tokens',
-      );
+      const lang = await ownerTgLanguage(this.pg, ownerUserId);
+      await this.grammy.sendMessage(ownerTgUserId, tgText(lang, 'zero_balance_owner'));
     } catch (e: any) {
       this.logger.warn(`zero-balance owner DM failed: ${e?.message}`);
       // Отказ Telegram — отметку держим, иначе попытка на каждое сообщение
