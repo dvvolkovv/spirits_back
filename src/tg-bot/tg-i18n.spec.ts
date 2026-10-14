@@ -115,9 +115,9 @@ describe('язык для человека', () => {
     expect(pg.query).not.toHaveBeenCalled();
   });
 
-  it('ownerTgLanguage: сбой базы — не повод ронять ответ', async () => {
+  it('ownerTgLanguage: сбой базы — не повод ронять ответ (привязанному — язык по умолчанию)', async () => {
     const pg = { query: jest.fn(async () => { throw new Error('Connection terminated'); }) };
-    expect(await ownerTgLanguage(pg as any, 'u-1', 'fr')).toBe('fr');
+    expect(await ownerTgLanguage(pg as any, 'u-1', 'fr')).toBe('ru');
     expect(await ownerTgLanguage(null as any, 'u-1')).toBe('ru');
   });
 });

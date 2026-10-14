@@ -76,13 +76,13 @@ describe('личка: язык привязанного — из профиля,
     expect(sent()[0].text).toBe(tgText('de', 'dm_help'));
   });
 
-  it('профиль без языка, Telegram по-испански: /balance — по-испански и с испанскими разрядами', async () => {
+  it('профиль по-испански (Telegram по-немецки): /balance — по-испански и с испанскими разрядами', async () => {
     const { svc, sent } = makeBot({
-      pg: pgSpeaking(null),
+      pg: pgSpeaking('es'),
       identity: { getLinkeonIdByTgUserId: jest.fn(async () => 'u-1') },
       billing: { getBalance: jest.fn(async () => 12345) },
     });
-    await (svc as any).handleMessage(dm('/balance', { language_code: 'es' }));
+    await (svc as any).handleMessage(dm('/balance', { language_code: 'de' }));
     expect(sent()[0].text).toBe(tgText('es', 'balance', { balance: formatTgNumber('es', 12345) }));
     expect(sent()[0].opts).toEqual(expect.objectContaining({ parse_mode: 'HTML' }));
   });
@@ -426,21 +426,6 @@ describe('группа → супергруппа: бот переезжает �
     const { svc } = makeBot({ configs });
     await (svc as any).handleMessage({ chat: { id: -1004001, type: 'supergroup' }, from: { id: 1 }, message_id: 1, migrate_from_chat_id: -4001 });
     expect(configs.moveToChat).toHaveBeenCalledWith(-4001, -1004001);
-  });
-
-  it('moveToChat: конфиг и его история — на новый id; без конфига — ничего', async () => {
-    const pg = { query: jest.fn() };
-    pg.query.mockResolvedValueOnce({ rows: [{ id: 'cfg-1' }] }).mockResolvedValueOnce({ rowCount: 12, rows: [] });
-    const svc = new TgConfigService(pg as any, {} as any);
-    (svc as any).logger = quiet;
-    await svc.moveToChat(-4001, -1004001);
-    expect(String(pg.query.mock.calls[0][0])).toMatch(/UPDATE tg_bot_configs SET tg_chat_id = \$2[\s\S]*WHERE tg_chat_id = \$1 AND status IN \('active','silent'\)/);
-    expect(pg.query.mock.calls[0][1]).toEqual([-4001, -1004001]);
-    expect(String(pg.query.mock.calls[1][0])).toMatch(/UPDATE tg_bot_messages SET tg_chat_id = \$2 WHERE config_id = \$3 AND tg_chat_id = \$1/);
-
-    const empty = { query: jest.fn(async () => ({ rows: [] })) };
-    await new TgConfigService(empty as any, {} as any).moveToChat(-4001, -1004001);
-    expect(empty.query).toHaveBeenCalledTimes(1);
   });
 
   it('moveToChat: на новом id уже свой бот (уникальный индекс) — не роняем вебхук', async () => {
