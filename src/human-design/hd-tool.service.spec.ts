@@ -94,6 +94,30 @@ describe('инструмент calculate_human_design', () => {
     expect(r).toMatchObject({ ok: true, kind: 'chart', city: { name: 'Великий Новгород' } });
   });
 
+  it('город на любом языке сайта — карта с русскими подписями', async () => {
+    const { svc } = service();
+    for (const city of ['München, Bayern', 'Munich', '慕尼黑']) {
+      const r = await svc.calculate({ date: '1990-03-12', time: '14:25', city });
+      expect(r).toMatchObject({
+        ok: true,
+        kind: 'chart',
+        city: { name: 'Мюнхен', region: 'Бавария', country: 'Германия', zone: 'Europe/Berlin' },
+        offset: 'UTC+1',
+      });
+    }
+  });
+
+  it('варианты по названию не по-русски — с русскими подписями; cityId из них принимается с тем же названием', async () => {
+    const { svc } = service();
+    const first = await svc.calculate({ date: '1990-03-12', time: '14:25', city: 'Sevilla' });
+    if (!(first.ok && first.kind === 'choose_city')) throw new Error('ожидались варианты');
+    expect(first.candidates.map((c) => c.country)).toEqual(['Испания', 'Колумбия']);
+    const spain = first.candidates[0];
+    expect(spain.name).toBe('Севилья');
+    const r = await svc.calculate({ date: '1990-03-12', time: '14:25', city: 'Sevilla', cityId: spain.cityId });
+    expect(r).toMatchObject({ ok: true, kind: 'chart', city: { name: 'Севилья', zone: 'Europe/Madrid' } });
+  });
+
   it('час перевода стрелок — вопрос «до или после»; с ответом — карта', async () => {
     const { svc } = service();
     const r = await svc.calculate({ date: '2014-10-26', time: '01:30', city: 'Москва, Россия' });
@@ -154,7 +178,7 @@ describe('инструмент calculate_human_design', () => {
 
   it('база городов недоступна — понятная ошибка, без падения', async () => {
     const { svc } = service();
-    (svc as any).citiesPath = '/no/such/path/cities.ru.json';
+    (svc as any).citiesDir = '/no/such/dir';
     const r = await svc.calculate({ date: '1990-03-12', time: '14:25', city: 'Казань' });
     expect(r).toEqual({ ok: false, error: 'Инструмент расчёта временно недоступен — посчитайте прежним способом.' });
   });

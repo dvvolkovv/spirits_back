@@ -13,6 +13,11 @@ describe('инструмент calculate_human_design в чате', () => {
     expect(tool!.description).toMatch(/choose_dst/);
     expect(tool!.description).toContain('нынешнее официальное название');
     expect(tool!.description).toContain('по-русски');
+    expect(tool!.description).toMatch(/на любом языке сайта/);
+    expect(tool!.description).toContain('慕尼黑');
+    expect(tool!.description).toMatch(/русскими названиями/);
+    expect(schema.properties.city.description).toMatch(/на любом языке сайта/);
+    expect(schema.properties.city.description).toContain('нынешнее официальное название по-русски');
     expect(tool!.description).toMatch(/imageUrl.*null/);
   });
 
