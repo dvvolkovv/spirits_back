@@ -75,7 +75,7 @@ maybe('переезд группы в супергруппу против жив
     await client.query(`INSERT INTO tg_bot_messages (config_id, tg_chat_id) VALUES ('cur', $1), ('old', $1), ('old', $1), ('other', $2)`, [OLD, ELSEWHERE]);
     await client.query(`INSERT INTO tg_bot_video_jobs VALUES ('v-wait', $1, 77, 'pending'), ('v-sent', $1, 78, 'sent')`, [OLD]);
 
-    await svc().moveToChat(OLD, NEW);
+    expect(await svc().moveToChat(OLD, NEW)).toBe(true);
 
     expect(await chatOf('tg_bot_configs', `id = 'cur'`)).toEqual([NEW]);
     expect(await chatOf('tg_bot_messages', `config_id IN ('cur','old')`)).toEqual([NEW, NEW, NEW]);
@@ -92,8 +92,8 @@ maybe('переезд группы в супергруппу против жив
     await client.query(`INSERT INTO tg_bot_configs VALUES ('cur', $1, 'active')`, [OLD]);
     await client.query(`INSERT INTO tg_bot_messages (config_id, tg_chat_id) VALUES ('cur', $1)`, [OLD]);
 
-    await svc().moveToChat(OLD, NEW);
-    await svc().moveToChat(OLD, NEW);
+    expect(await svc().moveToChat(OLD, NEW)).toBe(true);
+    expect(await svc().moveToChat(OLD, NEW)).toBe(true);
 
     expect(await chatOf('tg_bot_configs', `id = 'cur'`)).toEqual([NEW]);
     expect(await chatOf('tg_bot_messages', `true`)).toEqual([NEW]);
@@ -103,7 +103,7 @@ maybe('переезд группы в супергруппу против жив
     await client.query(`INSERT INTO tg_bot_configs VALUES ('cur', $1, 'active'), ('there', $2, 'active')`, [OLD, NEW]);
     await client.query(`INSERT INTO tg_bot_messages (config_id, tg_chat_id) VALUES ('cur', $1)`, [OLD]);
 
-    await expect(svc().moveToChat(OLD, NEW)).resolves.toBeUndefined();
+    await expect(svc().moveToChat(OLD, NEW)).resolves.toBe(false);
 
     expect(await chatOf('tg_bot_configs', `id = 'cur'`)).toEqual([OLD]);
     expect(await chatOf('tg_bot_messages', `true`)).toEqual([OLD]);
@@ -113,8 +113,21 @@ maybe('переезд группы в супергруппу против жив
     await client.query(`INSERT INTO tg_bot_configs VALUES ('old', $1, 'archived')`, [OLD]);
     await client.query(`INSERT INTO tg_bot_messages (config_id, tg_chat_id) VALUES ('old', $1)`, [OLD]);
 
-    await svc().moveToChat(OLD, NEW);
+    expect(await svc().moveToChat(OLD, NEW)).toBe(false);
 
     expect(await chatOf('tg_bot_messages', `true`)).toEqual([OLD]);
+  });
+
+  it('служебное сообщение обогнало ход: конфиг уже на новом id — реплика, записанная ходом под старым, догоняет его', async () => {
+    // Ход нашёл конфиг по старому id, служебное migrate_to_chat_id перевезло
+    // его, а ход уже после этого записал реплику человека под старым id.
+    await client.query(`INSERT INTO tg_bot_configs VALUES ('cur', $1, 'active')`, [NEW]);
+    await client.query(`INSERT INTO tg_bot_messages (config_id, tg_chat_id) VALUES ('cur', $1)`, [OLD]);
+    await client.query(`INSERT INTO tg_bot_video_jobs VALUES ('v-wait', $1, 77, 'pending')`, [OLD]);
+
+    expect(await svc().moveToChat(OLD, NEW)).toBe(true);
+
+    expect(await chatOf('tg_bot_messages', `true`)).toEqual([NEW]);
+    expect(await chatOf('tg_bot_video_jobs', `job_id = 'v-wait'`)).toEqual([NEW]);
   });
 });

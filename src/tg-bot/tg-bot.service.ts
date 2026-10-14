@@ -377,7 +377,16 @@ export class TgBotService implements OnModuleInit {
       return;
     }
     if (TgMeetingService.isJoin(data)) {
-      await this.meetings.handleJoinCallback(cb, ownerId);
+      // «… на встрече» уходит в группу — на языке владельца бота этой группы;
+      // ответ на нажатие видит нажавший — на своём.
+      let groupLang: TgLang | undefined;
+      try {
+        const groupCfg = await this.configs.getActiveByTgChatId(cb.message.chat.id);
+        if (groupCfg && !isPrivateConfig(groupCfg)) groupLang = await this.langFor(groupCfg.owner_user_id);
+      } catch {
+        // Язык группы — не повод не пустить во встречу.
+      }
+      await this.meetings.handleJoinCallback(cb, ownerId, groupLang);
       return;
     }
     if (data.startsWith('agents_page:')) {
@@ -693,10 +702,14 @@ export class TgBotService implements OnModuleInit {
     }
 
     // Если есть файлы но текста нет — даём LLM плейсхолдер, иначе будет early return.
+    // Пометка становится последним «сообщением» человека, а директива языка
+    // велит отвечать на языке последнего сообщения: без оговорки владелец с
+    // English на фото без подписи получал бы ответ по-русски.
     if (!workingText && attachments.length > 0) {
+      const languageNote = 'язык ответа — по блоку «ЯЗЫК ОБЩЕНИЯ», а не по этой пометке';
       workingText = attachments.length > 1
-        ? `(юзер прислал ${attachments.length} файлов без подписи — разбери ВСЕ и прокомментируй)`
-        : '(юзер прислал файл без подписи — разбери и прокомментируй)';
+        ? `(служебная пометка: прислали ${attachments.length} файлов без подписи — разбери ВСЕ и прокомментируй; ${languageNote})`
+        : `(служебная пометка: прислали файл без подписи — разбери и прокомментируй; ${languageNote})`;
     }
     if (!workingText) return;
 
@@ -992,6 +1005,8 @@ export class TgBotService implements OnModuleInit {
       let voiceTtsCostUsd = 0;
 
       const textToSend = cleanText || (markers.length > 0 ? '' : '...');
+      // Куда ушёл ответ: группа могла стать супергруппой посреди хода.
+      let replyChatId: number = msg.chat.id;
 
       if (wantsVoice && textToSend) {
         try {
@@ -1004,30 +1019,38 @@ export class TgBotService implements OnModuleInit {
             ...(plan.caption !== undefined ? { caption: plan.caption } : {}),
           });
           if (plan.needsSeparateText) {
-            await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang);
+            replyChatId = await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang, cfg);
           }
           contentType = 'voice_reply';
         } catch (e: any) {
           this.logger.warn(`TTS failed for chat ${msg.chat.id}, fallback to text: ${e.message}`);
-          await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang);
+          replyChatId = await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang, cfg);
         }
       } else if (textToSend) {
-        await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang);
+        replyChatId = await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang, cfg);
       }
 
-      await this.deliverOutgoingMarkers(cfg, msg, markers, turnLang);
+      // Группа стала супергруппой посреди хода (см. deliverReplyText):
+      // картинки и файлы — туда же, куда ответ, без ответа на сообщение старой
+      // группы: в супергруппе своя нумерация. Ход только с картинками, без
+      // текста, переезда не заметит — ему нечем.
+      const outMsg = replyChatId === msg.chat.id
+        ? msg
+        : { ...msg, chat: { ...msg.chat, id: replyChatId }, message_id: undefined };
+
+      await this.deliverOutgoingMarkers(cfg, outMsg, markers, turnLang);
 
       // Артефакты из песочницы Claude (PDF/DOCX/XLSX/etc.) — каждый отдельным
       // документом. Лимит уже наложен в scanSandboxOutputs (5 файлов max).
       for (const f of sandboxOutputs) {
         try {
-          this.grammy.sendChatAction(msg.chat.id, 'upload_document').catch(() => {});
+          this.grammy.sendChatAction(outMsg.chat.id, 'upload_document').catch(() => {});
           const buf = fs.readFileSync(f);
-          await this.grammy.sendDocument(msg.chat.id, buf, path.basename(f), {
-            reply_to_message_id: msg.message_id,
+          await this.grammy.sendDocument(outMsg.chat.id, buf, path.basename(f), {
+            reply_to_message_id: outMsg.message_id,
           });
         } catch (e: any) {
-          this.logger.warn(`sandbox file ${path.basename(f)} send failed in chat ${msg.chat.id}: ${e.message}`);
+          this.logger.warn(`sandbox file ${path.basename(f)} send failed in chat ${outMsg.chat.id}: ${e.message}`);
         }
       }
 
@@ -1051,7 +1074,7 @@ export class TgBotService implements OnModuleInit {
       // ход). Не ждём: ответ от него не зависит.
       void this.costGrowth?.recordTurn(
         {
-          kind: 'tg', configId: String(cfg.id), chatId: String(msg.chat.id),
+          kind: 'tg', configId: String(cfg.id), chatId: String(replyChatId),
           payerUserId: cfg.owner_user_id, botName: cfg.display_name || undefined,
         },
         { tokens: tokensCharged, usd: totalCostUsd, note: `cost=$${reply.costUsd.toFixed(4)} tts=$${voiceTtsCostUsd.toFixed(4)}` },
@@ -1252,26 +1275,54 @@ export class TgBotService implements OnModuleInit {
    * Ошибку пробрасываем дальше намеренно: списание и persistAssistantReply
    * идут после доставки, и ход, которого юзер не видел, не должен ни попасть в
    * историю как отвеченный, ни быть оплачен.
+   *
+   * Группа могла стать супергруппой, пока шёл ход: Telegram отвечает «group
+   * chat was upgraded» и даёт новый id. Тогда бот переезжает (moveToChat) и
+   * шлёт ответ туда. Возвращает id чата, куда ушёл ответ, — туда же пойдут
+   * картинки и файлы хода. cfg.tg_chat_id меняется, только если конфиг и
+   * правда теперь на новом id: по нему пишется история хода.
    */
   async deliverReplyText(
     chatId: number,
     replyToMessageId: number,
     text: string,
     lang: string,
-  ): Promise<void> {
+    cfg?: TgBotConfigRow,
+  ): Promise<number> {
     try {
       await this.grammy.sendMessage(chatId, text, { reply_to_message_id: replyToMessageId });
-    } catch (e: any) {
+      return chatId;
+    } catch (first: any) {
+      let e = first;
+      let target = chatId;
+      let replyTo: number | undefined = replyToMessageId;
+      const migratedTo = Number(e?.parameters?.migrate_to_chat_id);
+      if (migratedTo) {
+        if (await this.configs.moveToChat(chatId, migratedTo) && cfg) cfg.tg_chat_id = String(migratedTo);
+        // Без ответа на сообщение: в супергруппе своя нумерация. Если переезд
+        // пришёлся между кусками длинного ответа, первые куски уже в старой
+        // группе, и ответ уйдёт ещё раз целиком — повтор лучше потери.
+        target = migratedTo;
+        replyTo = undefined;
+        try {
+          await this.grammy.sendMessage(target, text, {});
+          return target;
+        } catch (again: any) {
+          // Не прошло и туда (права, 429, закрытая тема) — дальше общий путь:
+          // текст в лог, уведомление — уже в новый чат.
+          e = again;
+        }
+      }
       // Полный текст — в лог: это единственная копия ответа, за который уже
       // заплачено ёмкостью подписки.
       this.logger.error(
-        `доставка ответа в чат ${chatId} провалилась: ${e?.message || e}. Текст ответа (${text.length} симв.) ниже:\n${text}`,
+        `доставка ответа в чат ${target} провалилась: ${e?.message || e}. Текст ответа (${text.length} симв.) ниже:\n${text}`,
       );
       try {
         await this.grammy.sendMessage(
-          chatId,
+          target,
           tgText(lang, 'delivery_failed'),
-          { reply_to_message_id: replyToMessageId },
+          replyTo ? { reply_to_message_id: replyTo } : {},
         );
       } catch {
         // Канал до чата мёртв целиком — сказать юзеру нечем, ошибка ниже.

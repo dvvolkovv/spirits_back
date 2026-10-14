@@ -598,12 +598,20 @@ ${ownerProfile}
     // Что есть в Linkeon и чего нет в этом чате (chat/platform-guide.ts) — только
     // штатным ассистентам, как в вебе: у бота с ассистентом пользователя может
     // быть свой бренд, и рассказывать в его группе про Linkeon незачем.
-    const platformBlock = cfg.custom_agent_id ? '' : `\n\n${telegramPlatformGuide(await this.ownerLanguage(cfg))}`;
+    // Язык владельца — один раз на ход: и для подписей блока «Linkeon», и для
+    // языковой директивы в конце промпта.
+    const replyLang = await this.ownerLanguage(cfg);
+    const platformBlock = cfg.custom_agent_id ? '' : `\n\n${telegramPlatformGuide(replyLang)}`;
 
+    // Языковая директива — последней, как в вебе (chat.service): по умолчанию
+    // отвечать на языке владельца, а если человек написал на другом — на его.
+    // До 14.10.2026 её здесь не было вовсе, и /language в боте менял служебные
+    // тексты и веб, но не язык ассистента в Telegram.
     const systemWithCtx = `Ты в Telegram-группе. Владелец бота, который платит за твою работу: ${ownerFirstName}. Текущая дата/время: ${new Date().toISOString()}.
 ${ioInstructions}${productsBlock}${platformBlock}${profileBlock}
 
-${systemPrompt}`;
+${systemPrompt}
+${LanguageService.buildDirective(replyLang)}`;
 
     const userPrompt = history.length > 0
       ? history.map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n\n')

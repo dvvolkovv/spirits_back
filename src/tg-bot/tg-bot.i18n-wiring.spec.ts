@@ -434,6 +434,6 @@ describe('группа → супергруппа: бот переезжает �
     const pg = { query: jest.fn(async () => { throw Object.assign(new Error('duplicate key value'), { code: '23505' }); }) };
     const svc = new TgConfigService(pg as any, {} as any);
     (svc as any).logger = quiet;
-    await expect(svc.moveToChat(-4001, -1004001)).resolves.toBeUndefined();
+    await expect(svc.moveToChat(-4001, -1004001)).resolves.toBe(false);
   });
 });
