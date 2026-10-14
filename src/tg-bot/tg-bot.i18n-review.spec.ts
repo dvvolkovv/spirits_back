@@ -387,7 +387,7 @@ describe('группа: голый /start, меню, переезд', () => {
   });
 
   it('moveToChat — одним запросом: конфиг, вся история чата (и прежних ботов) и ждущие видео', async () => {
-    const pg = { query: jest.fn(async () => ({ rows: [{ id: 'cfg-1' }] })) };
+    const pg = { query: jest.fn(async () => ({ rows: [{ moved_id: 'cfg-1', settled: true }] })) };
     const svc = new TgConfigService(pg as any, {} as any);
     (svc as any).logger = quiet;
     await svc.moveToChat(-4001, -1004001);

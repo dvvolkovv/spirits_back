@@ -244,12 +244,30 @@ describe('moveToChat говорит, где теперь работающий к
     const pg = { query: jest.fn(async () => { if (rows instanceof Error) throw rows; return { rows }; }) };
     const svc = new TgConfigService(pg as any, {} as any);
     (svc as any).logger = quiet;
-    return svc;
+    return Object.assign(svc, { pg });
   };
 
   it('конфиг на новом id — переехал сейчас или раньше — true', async () => {
     expect(await make([{ moved_id: 'cfg', settled: true }]).moveToChat(-4001, -1004001)).toBe(true);
     expect(await make([{ moved_id: null, settled: true }]).moveToChat(-4001, -1004001)).toBe(true);
+  });
+
+  it('переезжают одновременно (служебное сообщение и ход): ждавший блокировку не видит конфиг по своему снимку — повтор видит', async () => {
+    const pg = {
+      query: jest.fn()
+        .mockResolvedValueOnce({ rows: [{ moved_id: null, settled: false }] })
+        .mockResolvedValueOnce({ rows: [{ moved_id: null, settled: true }] }),
+    };
+    const svc = new TgConfigService(pg as any, {} as any);
+    (svc as any).logger = quiet;
+    expect(await svc.moveToChat(-4001, -1004001)).toBe(true);
+    expect(pg.query).toHaveBeenCalledTimes(2);
+  });
+
+  it('переехал с первого раза — второй запрос не нужен (контроль)', async () => {
+    const svc = make([{ moved_id: 'cfg', settled: true }]);
+    expect(await svc.moveToChat(-4001, -1004001)).toBe(true);
+    expect(svc.pg.query).toHaveBeenCalledTimes(1);
   });
 
   it('работающего конфига нет ни там, ни там, или запрос упал — false', async () => {
@@ -373,7 +391,8 @@ describe('французская типографика — неразрывны
   });
 
   it('и знак не прилип к слову вовсе без пробела («jetons: 5», «{group}»)', () => {
-    const GLUED = /[^\s\u00a0\u202f][;!?»]|«[^\s\u00a0\u202f]|[^\s\u00a0\u202f]:(?!\/\/)/;
+    // \s в JS включает и U+00A0, и U+202F — «не пробел» это просто \S.
+    const GLUED = /\S[;!?»]|«\S|\S:(?!\/\/)/;
     expect(fr.filter(([, v]) => GLUED.test(v)).map(([k]) => k)).toEqual([]);
     expect(GLUED.test('Solde de jetons: 5')).toBe(true);
     expect(GLUED.test('«{group}»')).toBe(true);
