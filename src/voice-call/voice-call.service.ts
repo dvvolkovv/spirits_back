@@ -332,6 +332,9 @@ export class VoiceCallService implements OnModuleInit {
    * подтягивает их и кормит on-device каскад (owner 2026-09-01). Только role=user — слова человека,
    * не ассистента. Возвращаем и новый курсор (max ts) для инкрементальной дотяжки.
    */
+  /** Сколько реплик отдаём за одну подтяжку. Остаток догоняется следующими — см. курсор. */
+  private static readonly PROFILE_TURNS_PAGE = 100;
+
   async profileTurns(
     userId: string,
     sinceTs: number,
@@ -343,19 +346,30 @@ export class VoiceCallService implements OnModuleInit {
       [userId],
     );
     const turns: { callId: string; index: number; text: string; ts: number }[] = [];
-    let cursor = sinceTs;
     for (const row of res.rows) {
       const arr = Array.isArray(row.transcript) ? row.transcript : [];
       arr.forEach((e: any, i: number) => {
         const ts = typeof e?.ts === 'number' ? e.ts : 0;
         if (e?.role === 'user' && ts > sinceTs && typeof e.text === 'string' && e.text.trim()) {
           turns.push({ callId: String(row.id), index: i, text: e.text, ts });
-          if (ts > cursor) cursor = ts;
         }
       });
     }
     turns.sort((a, b) => a.ts - b.ts);
-    return { turns: turns.slice(0, 100), cursor };
+    // ⚠️ Курсор — по ОТДАННОЙ странице, а не по всему накопленному.
+    //
+    // Раньше он считался по всем подходящим репликам, а возвращались первые PAGE. Если
+    // накопилось больше, устройство получало страницу, двигало курсор за ПОСЛЕДНЮЮ из
+    // всех — и остаток пропадал навсегда, молча.
+    //
+    // Цена (владелец, 11.10.2026): в тот день было два разговора, 207 реплик. Телефон
+    // получил 100, курсор ушёл на конец, 107 реплик не пришли НИКОГДА. Первый разговор
+    // оборвался на середине, второй — где владелец рассказывал про подачу на развод,
+    // запрет на вывоз детей, заявление в опеку и дату заседания — не пришёл вовсе.
+    // Профиль эти факты не терял: он их не получал.
+    const page = turns.slice(0, VoiceCallService.PROFILE_TURNS_PAGE);
+    const cursor = page.length ? page[page.length - 1].ts : sinceTs;
+    return { turns: page, cursor };
   }
 
   async complete(callId: string, payload: CompletePayload): Promise<void> {
