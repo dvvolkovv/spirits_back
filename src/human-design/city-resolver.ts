@@ -37,13 +37,16 @@ export type CityResolution =
 /**
  * Город по словам человека — для часового пояса рождения.
  *
- * Совпадение названия целиком (без регистра, ё/й, латиницей тоже): одно —
+ * Совпадение названия целиком (без регистра, ё/й, латиницей тоже; с общим
+ * указателем multilang-index — и на любом языке сайта): одно —
  * берём, несколько — варианты для уточнения (или, при явном перевесе
  * населения — DOMINANT_RATIO и больше раз — крупный город берём сразу).
  * Без точного совпадения — города, чьё название или слово в нём начинается с
  * запроса, как подсказки калькулятора, но только вариантами, даже если он
  * один: от города зависит пояс, угадывать нельзя. «Кировск, Мурманская» —
- * до трёх частей после запятой сужают по региону и стране; у городов вроде
+ * до трёх частей после запятой (и китайской «，») сужают по региону и
+ * стране: по places — «регион страна» на всех языках сайта («München,
+ * Bayern», «慕尼黑，德国»), без places — по русским подписям; у городов вроде
  * Москвы или Санкт-Петербурга регион в базе — null (совпадает с названием
  * города), так что подсказка, совпадающая с названием региона, отфильтровала
  * бы их совсем — в этом случае ищем заново без подсказки, но результат всё
@@ -56,22 +59,27 @@ export function resolveCity(
   query: string,
   cityId?: number,
   populations?: number[],
+  places?: string[],
 ): CityResolution {
   if (cityId !== undefined && cityId !== null) {
     const entry = Number.isInteger(cityId) ? index[cityId] : undefined;
     return entry ? { kind: 'found', cityId, city: entry.city } : { kind: 'not_found' };
   }
-  const [namePart, ...rest] = String(query ?? '').split(',');
+  const [namePart, ...rest] = String(query ?? '').split(/[,，]/);
   const q = normalize(namePart);
   if (q.length < 2) return { kind: 'not_found' };
   const hints = rest.slice(0, MAX_HINTS).map(normalize).filter(Boolean);
 
   const search = (hintList: string[]) => {
-    const fits = (c: City) => hintList.every((h) => normalize(`${c.region ?? ''} ${c.country}`).includes(h));
+    const fits = (c: City, id: number) => {
+      if (hintList.length === 0) return true;
+      const place = places ? (places[id] ?? '') : normalize(`${c.region ?? ''} ${c.country}`);
+      return hintList.every((h) => place.includes(h));
+    };
     const exact: CityCandidate[] = [];
     const partial: CityCandidate[] = [];
     index.forEach(({ city, keys }, id) => {
-      if (!fits(city)) return;
+      if (!fits(city, id)) return;
       if (keys.includes(q)) exact.push({ ...city, cityId: id });
       else if (partial.length < MAX_CANDIDATES && cityNameMatches(keys, q)) {
         partial.push({ ...city, cityId: id });

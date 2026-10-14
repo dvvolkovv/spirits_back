@@ -2,13 +2,17 @@ import { Injectable, Logger } from '@nestjs/common';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { MiscService } from '../misc/misc.service';
-import { indexCities, normalize, type City, type CityDb, type CityIndex } from './cities';
+import { normalize, type City, type CityDb, type CityIndex } from './cities';
 import { cityNameMatches, resolveCity, type CityCandidate } from './city-resolver';
+import { multilingualCities, SITE_LANGUAGES } from './multilang-index';
 import { bodygraphPng } from './bodygraph-png';
 import { calculateChart, formatOffset, renderBodygraphSvg, type Activation, type HdChart } from './lib';
 
-/** Рядом с собранным файлом: nest-cli.json копирует data/*.json в dist (assets). */
-export const CITIES_PATH = join(__dirname, 'data', 'cities.ru.json');
+/**
+ * Базы городов cities.<код>.json — рядом с собранным файлом: nest-cli.json
+ * копирует data/*.json в dist (assets).
+ */
+export const CITIES_DIR = join(__dirname, 'data');
 
 /** Город дольше — явно не город, а мусор во входе; не раздувать ошибку. */
 const MAX_CITY_LEN = 100;
@@ -80,22 +84,32 @@ function normalizeTime(raw: string): string | null {
 @Injectable()
 export class HumanDesignToolService {
   private readonly logger = new Logger(HumanDesignToolService.name);
-  /** protected, а не private — ради подмены на несуществующий файл в тесте недоступности базы. */
-  protected citiesPath: string = CITIES_PATH;
+  /** protected, а не private — ради подмены на несуществующий каталог в тесте недоступности базы. */
+  protected citiesDir: string = CITIES_DIR;
 
   private index: CityIndex | null = null;
   private populations: number[] | undefined;
+  private places: string[] | undefined;
 
   constructor(private readonly misc: MiscService) {}
 
-  /** База городов (1,5 МБ) читается один раз — при первом вызове, не при старте API. */
-  private cityData(): { index: CityIndex; populations: number[] | undefined } {
+  /**
+   * Базы городов на семи языках сайта (по 1,3–1,6 МБ) читаются один раз — при
+   * первом вызове, не при старте API — и склеиваются в общий указатель:
+   * город ищется по названию на любом языке, подписи русские.
+   */
+  private cityData(): { index: CityIndex; populations: number[] | undefined; places: string[] | undefined } {
     if (!this.index) {
-      const db = JSON.parse(readFileSync(this.citiesPath, 'utf8')) as CityDb;
-      this.index = indexCities(db);
-      this.populations = db.cities.map((c) => c[4]);
+      const dbs: Record<string, CityDb> = {};
+      for (const code of SITE_LANGUAGES) {
+        dbs[code] = JSON.parse(readFileSync(join(this.citiesDir, `cities.${code}.json`), 'utf8')) as CityDb;
+      }
+      const { index, places, populations } = multilingualCities(dbs);
+      this.places = places;
+      this.populations = populations;
+      this.index = index;
     }
-    return { index: this.index, populations: this.populations };
+    return { index: this.index, populations: this.populations, places: this.places };
   }
 
   async calculate(input: any): Promise<HdToolResult> {
@@ -124,8 +138,9 @@ export class HumanDesignToolService {
 
     let index: CityIndex;
     let populations: number[] | undefined;
+    let places: string[] | undefined;
     try {
-      ({ index, populations } = this.cityData());
+      ({ index, populations, places } = this.cityData());
     } catch (e: any) {
       this.logger.error(`база городов недоступна: ${e?.message ?? e}`);
       return { ok: false, error: 'Инструмент расчёта временно недоступен — посчитайте прежним способом.' };
@@ -133,7 +148,7 @@ export class HumanDesignToolService {
 
     if (cityId !== undefined && city) {
       const entry = index[cityId];
-      const q = normalize(city.split(',')[0]);
+      const q = normalize(city.split(/[,，]/)[0]);
       // Тем же правилом, что строит варианты choose_city (не только точным
       // совпадением): иначе cityId варианта, предложенного по началу слова
       // («Новгород» → Великий Новгород), повторный вызов с тем же city
@@ -141,13 +156,13 @@ export class HumanDesignToolService {
       if (!entry || !cityNameMatches(entry.keys, q)) return { ok: false, error: CITY_ID_ERROR };
     }
 
-    const place = resolveCity(index, city, cityId, populations);
+    const place = resolveCity(index, city, cityId, populations, places);
     if (place.kind === 'not_found') {
       return {
         ok: false,
         error:
-          `Город «${city}» не найден в базе. Передайте нынешнее официальное название по-русски ` +
-          '(например, Самара, а не Куйбышев) или ближайший крупный город в том же часовом поясе.',
+          `Город «${city}» не найден в базе. Передайте нынешнее официальное название — по-русски или на ` +
+          'языке человека (например, Самара, а не Куйбышев) — или ближайший крупный город в том же часовом поясе.',
       };
     }
     if (place.kind === 'choose') {
