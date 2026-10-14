@@ -250,12 +250,21 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
     expect(router.markAnswerExpected).not.toHaveBeenCalled();
   });
 
-  it('голосовое распознаётся на языке владельца бота', async () => {
-    // Раньше Whisper всегда слушал по-русски: немецкое голосовое становилось
-    // кривой русской транслитерацией.
+  // Whisper с language не подсказывает, а ЗАСТАВЛЯЕТ: на чужой речи он
+  // переводит или транслитерирует. Раньше всегда стоял 'ru' — немецкое
+  // голосовое становилось кривой русской транслитерацией. Язык профиля — это
+  // язык интерфейса и ответов, а не речи (браузер с uk/kk/be даёт профилю en),
+  // поэтому заставляем только русский, а остальным Whisper определяет язык сам.
+  it('владелец не на русском — язык голосового Whisper определяет сам', async () => {
     const { svc, voice } = makeTurnBot({ transcript: 'Finanzberater, wie viel?', ownerLanguage: 'de' });
     await (svc as any).handleChatMessage(groupMsg({ voice: true }), CFG);
-    expect(voice.transcribe).toHaveBeenCalledWith('VOICE-1', 'de');
+    expect(voice.transcribe).toHaveBeenCalledWith('VOICE-1', undefined);
+  });
+
+  it('владелец на русском — как раньше, русский', async () => {
+    const { svc, voice } = makeTurnBot({ transcript: 'Финансист, сколько?', ownerLanguage: 'ru' });
+    await (svc as any).handleChatMessage(groupMsg({ voice: true }), CFG);
+    expect(voice.transcribe).toHaveBeenCalledWith('VOICE-1', 'ru');
   });
 
   it('замолчанный /silent бот на голосовое с обращением — ни эха, ни ответа', async () => {
@@ -291,6 +300,28 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
   it('замолчанный /silent бот — не приглашает и на обращение', async () => {
     const { svc, meetings } = makeTurnBot({ meetingHandled: true });
     await (svc as any).handleChatMessage(groupMsg({ text: `Финансист, зайди ${ZOOM}` }), { ...CFG, status: 'silent' });
+    expect(meetings.tryHandleLink).not.toHaveBeenCalled();
+  });
+
+  it('замолчанный бот: команда со ссылкой — не приглашение', async () => {
+    // Команда — обращение к боту в любом статусе, но /silent значит «молчи»:
+    // «/resume <ссылка>» не должен превращаться в карточку встречи.
+    const { svc, meetings } = makeTurnBot({ meetingHandled: true });
+    await (svc as any).handleChatMessage(groupMsg({ text: `/resume ${ZOOM}` }), { ...CFG, status: 'silent' });
+    expect(meetings.tryHandleLink).not.toHaveBeenCalled();
+  });
+
+  it('команда со ссылкой исполняется как команда, а не приглашение', async () => {
+    const { svc, meetings } = makeTurnBot({ meetingHandled: true });
+    await (svc as any).handleChatMessage(groupMsg({ text: `/balance ${ZOOM}` }), CFG);
+    expect(meetings.tryHandleLink).not.toHaveBeenCalled();
+  });
+
+  it('«умно» без обращения — приглашения нет (контроль): решает обращение, а не гейт', async () => {
+    const { svc, meetings } = makeTurnBot({ meetingHandled: true });
+    // Гейт «умного» режима здесь не дойдёт до модели: замок есть, но smartGate
+    // упирается в resolveSystemPrompt без базы и отвечает «нет».
+    await (svc as any).handleChatMessage(groupMsg({ text: `созвон тут ${ZOOM}` }), { ...CFG, addressing_mode: 'smart' });
     expect(meetings.tryHandleLink).not.toHaveBeenCalled();
   });
 
