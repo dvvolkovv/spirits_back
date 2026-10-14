@@ -21,8 +21,57 @@ import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.s
  */
 const DEFAULT_AGENT_ID = '12';
 
-/** Команды бота в группе (tg-commands.service.ts). Обращение к боту в любом режиме. */
-const BOT_COMMAND = /^\/(help|balance|silent|resume)(\s|@|$)/;
+/**
+ * Команды бота в группе (tg-commands.service.ts). Обращение к боту в любом
+ * режиме — но только к НАШЕМУ: «/help@ДругойБот» в группе с несколькими ботами
+ * адресован не нам (Telegram сам дописывает @имя, когда ботов в чате несколько).
+ */
+const BOT_COMMAND = /^\/(help|balance|silent|resume)(?:@(\w+))?(?:\s|$)/i;
+
+export function isOwnBotCommand(text: string, botUsername: string): boolean {
+  const m = BOT_COMMAND.exec(text.trim());
+  if (!m) return false;
+  return !m[2] || m[2].toLowerCase() === botUsername.toLowerCase();
+}
+
+/**
+ * Любая команда с чужим @именем: «/start@ДругойБот <код>», «/help@ДругойБот».
+ * В группе, где ботов несколько, она адресована не нам — ни привязки по ней,
+ * ни хода модели.
+ */
+export function isForeignBotCommand(text: string, botUsername: string): boolean {
+  const m = /^\/\w+@(\w+)/.exec(text.trim());
+  return !!m && m[1].toLowerCase() !== botUsername.toLowerCase();
+}
+
+/**
+ * Письменности без пробелов между словами: «请小助手帮忙» — имя стоит вплотную
+ * к соседнему иероглифу, и граница слова там ничего не значит. По
+ * Script_Extensions, а не Script: у «ー» и «々» письменность общая (Common).
+ */
+const NO_SPACES_SCRIPT = /[\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}\p{Script_Extensions=Thai}\p{Script_Extensions=Lao}\p{Script_Extensions=Khmer}\p{Script_Extensions=Myanmar}]/u;
+const WORD_CHAR = /[\p{L}\p{N}]/u;
+
+/**
+ * Имя бота встречается в тексте с начала слова. Конец слова не проверяем —
+ * иначе пропали бы склонения («спроси Финансиста»). Раньше хватало вхождения
+ * где угодно, и бот по имени «Рома» откликался на «аромат», а «Ли» — на «или».
+ * Оба аргумента — уже в нижнем регистре.
+ */
+export function mentionsName(lo: string, name: string): boolean {
+  if (!name) return false;
+  const nameFree = NO_SPACES_SCRIPT.test(Array.from(name)[0]);
+  for (let i = lo.indexOf(name); i !== -1; i = lo.indexOf(name, i + 1)) {
+    // Символ перед вхождением — целиком (не половинка суррогатной пары) и по
+    // основе, без знаков на хвосте (\p{M}): в «विराम» перед «राम» огласовка,
+    // её основа «व» — буква; у «❤️» хвост — вариационный селектор, основа «❤» —
+    // не буква; «й», набранное двумя символами, — буква «и».
+    const head = lo.slice(Math.max(0, i - 32), i).replace(/\p{M}+$/u, '');
+    const before = Array.from(head).pop();
+    if (!before || nameFree || !WORD_CHAR.test(before) || NO_SPACES_SCRIPT.test(before)) return true;
+  }
+  return false;
+}
 
 export interface IncomingMessageContext {
   chatId: number;
@@ -166,7 +215,8 @@ export class TgRouterService {
    * Triggers ответа в режиме A (strict):
    * - @-mention бота
    * - reply на сообщение бота
-   * - display_name конфига встречается в тексте (case-insensitive substring)
+   * - display_name конфига встречается в тексте с начала слова, без учёта
+   *   регистра (mentionsName)
    * - команда из набора /help|balance|silent|resume
    */
   private shouldRespondStrict(
@@ -179,8 +229,8 @@ export class TgRouterService {
     if (!lo) return false;
     if (lo.includes(`@${botUsername.toLowerCase()}`)) return true;
     if (replyToFromBot) return true;
-    if (displayName && lo.includes(displayName.toLowerCase())) return true;
-    if (BOT_COMMAND.test(lo)) return true;
+    if (displayName && mentionsName(lo, displayName.trim().toLowerCase())) return true;
+    if (isOwnBotCommand(lo, botUsername)) return true;
     return false;
   }
 
@@ -195,18 +245,20 @@ export class TgRouterService {
     cfg: TgBotConfigRow,
     said: { text: string; replyToFromBot?: boolean },
   ): boolean {
-    if (BOT_COMMAND.test(said.text.toLowerCase())) return true;
+    const botUsername = process.env.TG_BOT_USERNAME || 'LinkeonAgentBot';
+    if (isOwnBotCommand(said.text, botUsername)) return true;
     if (cfg.status === 'silent') return false;
     if (cfg.addressing_mode === 'always') return true;
-    const botUsername = process.env.TG_BOT_USERNAME || 'LinkeonAgentBot';
     return this.shouldRespondStrict(said.text, botUsername, cfg.display_name, !!said.replyToFromBot);
   }
 
   /**
    * Main entry point. Возвращает true если бот должен ответить на это сообщение.
-   * Mode A (strict) — детектор триггеров.
-   * Mode B (always) — отвечает на каждое (rate-limit 3 сек).
-   * Mode C (smart) — Phase 5 добавит Haiku-гейт. Пока fallback на strict.
+   * Явное обращение (триггеры strict) во всех режимах — сразу, без лимитов.
+   * Mode A (strict) — только явное обращение.
+   * Mode B (always) — на каждое; в группе не чаще раза в 3 сек, в личке без лимита.
+   * Mode C (smart) — сам вмешивается не чаще раза в минуту и по решению
+   *   Haiku-гейта (smartGate).
    */
   async shouldRespond(
     cfg: TgBotConfigRow,
@@ -220,6 +272,13 @@ export class TgRouterService {
     }
 
     if (cfg.addressing_mode === 'always') {
+      // Личка — разговор один на один: каждое сообщение — боту. Лимит против
+      // потока реплик в группе здесь только терял быстрые уточнения.
+      if (isPrivateConfig(cfg)) return true;
+      // Прямое обращение — сразу; лимит — только против потока реплик.
+      if (this.shouldRespondStrict(ctx.text, botUsername, cfg.display_name, !!ctx.replyToFromBot)) {
+        return true;
+      }
       if (cfg.last_reply_at) {
         const elapsed = Date.now() - new Date(cfg.last_reply_at).getTime();
         if (elapsed < 3000) return false;
@@ -228,15 +287,18 @@ export class TgRouterService {
     }
 
     if (cfg.addressing_mode === 'smart') {
+      // 1. Явное обращение (как в strict) — отвечаем сразу: ни лимита, ни гейта.
+      //    Раньше минутный лимит стоял первым и глушил «Финансист, а
+      //    подробнее?» сразу после ответа.
+      if (this.shouldRespondStrict(ctx.text, botUsername, cfg.display_name, !!ctx.replyToFromBot)) {
+        return true;
+      }
+      // 2. Сам вмешивается не чаще раза в минуту.
       if (cfg.last_reply_at) {
         const elapsed = Date.now() - new Date(cfg.last_reply_at).getTime();
         if (elapsed < 60_000) return false;
       }
-      // 1. Если триггер сработал явно (как в strict) — пускаем сразу, без гейта
-      if (this.shouldRespondStrict(ctx.text, botUsername, cfg.display_name, !!ctx.replyToFromBot)) {
-        return true;
-      }
-      // 2. Иначе — гейт через Haiku
+      // 3. Иначе — гейт через Haiku
       return await this.smartGate(cfg, ctx);
     }
 

@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from './tg-grammy.client';
+import { escapeHtml } from './tg-html';
 import { MeetingService } from '../meeting/meeting.service';
 import { RoomService } from '../meeting/room.service';
 import { TalerIdRoomClient } from '../meeting/talerid-room.client';
@@ -126,7 +127,7 @@ export class TgMeetingService {
     if (!found) return false;
 
     const agent = await this.currentAgent(ownerId);
-    const who = agent ? `${agent.name} зайдёт во встречу` : 'Ассистент зайдёт во встречу';
+    const who = agent ? `${escapeHtml(agent.name)} зайдёт во встречу` : 'Ассистент зайдёт во встречу';
 
     await this.grammy.sendMessage(chatId, `🎤 <b>${escapeHtml(found.title)}</b>\n${who}.`, {
       parse_mode: 'HTML',
@@ -225,9 +226,4 @@ export class TgMeetingService {
   static isJoin(data: string): boolean {
     return data.startsWith(JOIN_PREFIX);
   }
-}
-
-/** Название комнаты приходит от людей и уезжает в HTML-разметку Telegram. */
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }

@@ -1,8 +1,20 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from './tg-grammy.client';
+import { RedisService } from '../common/services/redis.service';
+import { escapeHtml } from './tg-html';
 import { CASH_TOKENS_PER_USD, SEAT_TOKENS_PER_USD } from '../common/billing-rates';
 import * as telegramAlert from '../common/telegram-alert';
+
+/**
+ * Отказ Telegram: 4xx, кроме 429, — «бот заблокирован», «не начинал диалог»,
+ * «чат не найден». За сутки он не пройдёт, повторять бессмысленно. Сеть и 429 —
+ * временно.
+ */
+function isTelegramRefusal(e: any): boolean {
+  const code = e?.error_code;
+  return typeof code === 'number' && code >= 400 && code < 500 && code !== 429;
+}
 
 @Injectable()
 export class TgBillingService {
@@ -24,6 +36,7 @@ export class TgBillingService {
   constructor(
     private readonly pg: PgService,
     private readonly grammy: TgGrammyClient,
+    @Optional() private readonly redis?: RedisService,
   ) {}
 
   /**
@@ -125,7 +138,7 @@ export class TgBillingService {
     try {
       await telegramAlert.sendTelegramAlert(
         `💸 <b>Дорогой ход TG-бота</b>\n` +
-        `Бот: <b>${cfg.display_name}</b> (<code>${cfg.id}</code>)\n` +
+        `Бот: <b>${escapeHtml(cfg.display_name)}</b> (<code>${cfg.id}</code>)\n` +
         `Владелец: <code>${cfg.owner_user_id}</code>\n` +
         `Стоимость: <b>$${costUsd.toFixed(2)}</b> → списано ${tokensCharged.toLocaleString('ru')} токенов\n` +
         `Остаток: ${balanceLeft.toLocaleString('ru')}`,
@@ -142,28 +155,92 @@ export class TgBillingService {
     if (!ownerTgUserId) return;
     const threshold = Number(process.env.TG_BOT_LOW_BALANCE_THRESHOLD ?? '1000');
     const balance = await this.getBalance(ownerUserId);
+    if (balance <= 0) {
+      await this.notifyOwnerZeroBalance(ownerUserId, ownerTgUserId);
+      return;
+    }
     if (balance < threshold && balance > 0) {
-      const r = await this.pg.query(
-        `SELECT last_low_balance_dm_at FROM tg_bot_configs WHERE id = $1`,
+      // Слот на сутки занимаем одним UPDATE до отправки: проверка идёт в фоне,
+      // уже после замка чата (inBackground в tg-bot.service), и два хода подряд
+      // иначе прочли бы пустую отметку оба — владелец получил бы двойник.
+      const slot = await this.pg.query(
+        `UPDATE tg_bot_configs SET last_low_balance_dm_at = now()
+          WHERE id = $1
+            AND (last_low_balance_dm_at IS NULL OR last_low_balance_dm_at < now() - interval '24 hours')
+          RETURNING id`,
         [configId],
       );
-      const last = r.rows[0]?.last_low_balance_dm_at;
-      const dayMs = 24 * 60 * 60 * 1000;
-      if (!last || Date.now() - new Date(last).getTime() > dayMs) {
-        try {
-          await this.grammy.sendMessage(
-            ownerTgUserId,
-            `⚠️ На твоём боте осталось меньше ${threshold} токенов (баланс: ${balance}). Пополни: https://my.linkeon.io/tokens`,
-          );
-          await this.pg.query(
-            `UPDATE tg_bot_configs SET last_low_balance_dm_at = now() WHERE id = $1`,
-            [configId],
-          );
-        } catch (e: any) {
-          this.logger.warn(`low-balance DM failed: ${e.message}`);
+      if (!slot.rows[0]) return;
+      try {
+        await this.grammy.sendMessage(
+          ownerTgUserId,
+          `⚠️ На твоём боте осталось меньше ${threshold} токенов (баланс: ${balance}). Пополни: https://my.linkeon.io/tokens`,
+        );
+      } catch (e: any) {
+        this.logger.warn(`low-balance DM failed: ${e?.message}`);
+        // Отказ Telegram — слот держим до завтра; временный сбой — возвращаем,
+        // чтобы повторить на следующем ходе.
+        if (!isTelegramRefusal(e)) {
+          await this.pg
+            .query(`UPDATE tg_bot_configs SET last_low_balance_dm_at = NULL WHERE id = $1`, [configId])
+            .catch((e2: any) => this.logger.warn(`low-balance DM slot not released: ${e2?.message}`));
         }
       }
     }
+  }
+
+  /**
+   * Владельцу — один раз в сутки: токены закончились, боты молчат. Раньше при
+   * нуле владелец не узнавал ничего: алерт выше шлётся только при 0 < баланс <
+   * порога, а списание, упёршееся в ноль, его проскакивало. В группах «по
+   * обращению» бот о нуле говорит лишь тому, кто его позвал. Отметка — на
+   * владельца, а не на бота: у кого ботов несколько, получит одно сообщение.
+   */
+  async notifyOwnerZeroBalance(ownerUserId: string, ownerTgUserId: number | null): Promise<void> {
+    if (!ownerTgUserId || !this.redis) return;
+    const key = TgBillingService.zeroBalanceDmKey(ownerUserId);
+    // Зовётся из хода бота: сбой Redis не должен его ронять. Без отметки не
+    // шлём вовсе — иначе владелец получал бы сообщение на каждую реплику группы.
+    let first: boolean;
+    try {
+      first = await this.redis.setNx(key, '1', 24 * 60 * 60 * 1000);
+    } catch (e: any) {
+      this.logger.warn(`zero-balance owner DM skipped, redis: ${e?.message}`);
+      return;
+    }
+    if (!first) return;
+    try {
+      await this.grammy.sendMessage(
+        ownerTgUserId,
+        '⛔ Токены закончились — твои боты не отвечают, пока не пополнишь баланс: https://my.linkeon.io/tokens',
+      );
+    } catch (e: any) {
+      this.logger.warn(`zero-balance owner DM failed: ${e?.message}`);
+      // Отказ Telegram — отметку держим, иначе попытка на каждое сообщение
+      // группы. Временный сбой — снимаем, чтобы повторить.
+      if (!isTelegramRefusal(e)) {
+        try {
+          await this.redis.del(key);
+        } catch (e2: any) {
+          this.logger.warn(`zero-balance owner DM mark not cleared: ${e2?.message}`);
+        }
+      }
+    }
+  }
+
+  /** Баланс снова есть — следующий ноль опять сообщит владельцу. */
+  async clearOwnerZeroBalanceDm(ownerUserId: string): Promise<void> {
+    if (!this.redis) return;
+    try {
+      await this.redis.del(TgBillingService.zeroBalanceDmKey(ownerUserId));
+    } catch (e: any) {
+      // Не снялась — следующий ноль просто не сообщит (до суток). Ход важнее.
+      this.logger.warn(`zero-balance owner DM mark not cleared: ${e?.message}`);
+    }
+  }
+
+  private static zeroBalanceDmKey(ownerUserId: string): string {
+    return `tg:zero-balance-dm:${ownerUserId}`;
   }
 
   /**

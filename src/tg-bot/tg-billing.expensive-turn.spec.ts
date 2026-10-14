@@ -32,6 +32,13 @@ describe('TgBillingService.alertIfExpensiveTurn', () => {
 
   const svc = () => new TgBillingService({} as any, {} as any);
 
+  it('имя бота от владельца экранировано: «R&D <x>» не ломает HTML алерта', async () => {
+    await svc().alertIfExpensiveTurn({ ...cfg, display_name: 'R&D <x>' }, 9.5, 40_000, 10_000);
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('<b>R&amp;D &lt;x&gt;</b>');
+  });
+
   it('молчит на обычном ходе', async () => {
     await svc().alertIfExpensiveTurn(cfg, 0.12, 432, 50_000);
 
