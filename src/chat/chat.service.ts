@@ -213,6 +213,10 @@ export class ChatService {
   // токены по единому курсу TOKENS_PER_USD.
   private readonly SDK_INPUT_USD_PER_MTOK = Number(process.env.SDK_INPUT_USD_PER_MTOK || 5);
 
+  // Серверный веб-поиск Anthropic — $10 за 1000 запросов. В токенах usage его
+  // нет, поэтому к взвешенному он прибавляется отдельно по счётчику запросов.
+  private readonly WEB_SEARCH_USD = 0.01;
+
   // Порог алерта на дорогой ход, в СПИСАННЫХ с юзера токенах.
   //
   // Раньше считался в долларах нашей себестоимости ($5 → $1.5 с 30.08.2026).
@@ -1645,7 +1649,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       //
       // Сравниваем charge.tokens, а не textCost: у оборванного хода textCost=0,
       // и дорогой сбой иначе прошёл бы молча — а он-то как раз и интересен.
-      await this.alertExpensiveTurn(userId, assistantId, charge, agentCostUsd, textCost);
+      await this.alertExpensiveTurn(userId, assistantId, charge, textCost);
       try {
         const sessOverride = fresh ? freshSessionId : undefined;
         if (userMsgPersisted) {
@@ -2370,21 +2374,18 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * Сколько Linkeon-токенов списать за ход SDK-пути.
    *
    * Три источника по убыванию точности:
-   *   1. сырой usage от file-agent → взвешенные токены (основной путь);
+   *   1. сырой usage от file-agent → взвешенные токены плюс веб-поиски (основной путь);
    *   2. total_cost_usd, если usage не пришёл;
    *   3. длина ответа × множитель — последний рубеж, чтобы ход не стал бесплатным.
    *
-   * Возвращает и диагностику: она уходит в лог, чтобы видеть, насколько
-   * взвешенная формула расходится с costUsd. Расхождение = то, чего в четырёх
-   * полях нет (серверные инструменты вроде веб-поиска, разнотипные модели у
-   * субагентов). Пока оно логируется, а не домножается: подгонять коэффициент
-   * имеет смысл по накопленным данным, а не наугад.
+   * При пришедшем usage costUsd в сумму не входит, только в лог — почему,
+   * сказано внутри. `usd` — сколько долларов легло в основу списания.
    */
   private computeSdkCharge(
     usage: SdkUsageTotals | null,
     costUsd: number,
     text: string,
-  ): { tokens: number; source: 'usage' | 'cost' | 'length'; note: string } {
+  ): { tokens: number; usd: number; source: 'usage' | 'cost' | 'length'; note: string } {
     const textLength = text.length;
     if (usage && (usage.input || usage.output || usage.cacheRead || usage.cacheWrite5m || usage.cacheWrite1h)) {
       const weighted =
@@ -2394,32 +2395,35 @@ ${LanguageService.buildDirective(userLanguage)}`;
         usage.cacheWrite1h * this.W_CACHE_WRITE_1H +
         usage.output * this.W_OUTPUT;
       const impliedUsd = (weighted * this.SDK_INPUT_USD_PER_MTOK) / 1e6;
+      const searchUsd = (usage.webSearch || 0) * this.WEB_SEARCH_USD;
 
-      // Списываем по МАКСИМУМУ из взвешенного и заявленного, и вот почему.
-      // Верхний `usage` в result-событии НЕ включает расход субагентов — проверено
-      // 2026-08-08: у хода с одним субагентом cache_creation в usage был 42 319,
-      // а в modelUsage (он сходится с total_cost_usd) — 62 650. Разница в 20 331
-      // токен это ровно субагент. Считай мы только по usage, фан-аут снова стал бы
-      // частично бесплатным — ровно та дыра, из-за которой всё и затевалось.
+      // costUsd в сумму НЕ входит. До 14.10.2026 списывали по максимуму из него
+      // и взвешенного: верхний usage не содержит расхода субагентов (проверено
+      // 2026-08-08), а total_cost_usd содержал, и максимум его подбирал.
       //
-      // total_cost_usd полон всегда. Без субагентов обе величины совпадают
-      // (покрытие 100% на живых ходах прода), так что максимум ничего не меняет;
-      // с субагентами побеждает costUsd и расход учитывается целиком.
-      const billableUsd = Math.max(impliedUsd, costUsd);
+      // С Claude CLI 2.1.280 (на релее с 23.09.2026) total_cost_usd у сессии,
+      // поднятой через --resume, — стоимость ВСЕЙ сессии: CLI пишет в транскрипт
+      // записи cost-state и при resume продолжает счёт с них. Максимум стал брать
+      // эту сумму за каждый ход, и каждый следующий ответ длинной сессии стоил
+      // дороже предыдущего: ход за $0.16 списан как $6.21 (жалоба 14.10.2026).
+      //
+      // Цена размена: субагентный фан-аут снова оплачивается только верхним
+      // usage. Вернуть его в счёт можно, только если релей начнёт присылать
+      // стоимость этого хода, а не сессии.
+      const billableUsd = impliedUsd + searchUsd;
       const tokens = Math.max(1, Math.ceil(billableUsd * this.TOKENS_PER_USD));
-      const drift = costUsd > 0 ? impliedUsd / costUsd : NaN;
       const note =
         `weighted=${Math.round(weighted)} implied=$${impliedUsd.toFixed(4)} ` +
-        `reported=$${costUsd.toFixed(4)} ` +
-        (Number.isFinite(drift) ? `покрытие=${(drift * 100).toFixed(0)}%` : 'costUsd нет') +
-        (costUsd > impliedUsd ? ' взято=reported' : ' взято=implied') +
+        (searchUsd ? `поиски=$${searchUsd.toFixed(4)} ` : '') +
+        `reported=$${costUsd.toFixed(4)} (не тарифицируется)` +
         (usage.webSearch ? ` поисков=${usage.webSearch}` : '') +
         (usage.webFetch ? ` fetch=${usage.webFetch}` : '');
-      return { tokens, source: 'usage', note };
+      return { tokens, usd: billableUsd, source: 'usage', note };
     }
     if (costUsd > 0) {
       return {
         tokens: Math.ceil(costUsd * this.TOKENS_PER_USD),
+        usd: costUsd,
         source: 'cost',
         note: `usage не пришёл, считаю по costUsd=$${costUsd.toFixed(4)}`,
       };
@@ -2431,12 +2435,14 @@ ${LanguageService.buildDirective(userLanguage)}`;
     if (isUpstreamErrorReply(text)) {
       return {
         tokens: 0,
+        usd: 0,
         source: 'length',
         note: 'ответ — проброс ошибки апстрима, не списываю',
       };
     }
     return {
       tokens: textLength * this.SDK_TEXT_MULTIPLIER,
+      usd: 0,
       source: 'length',
       note: 'ни usage, ни costUsd — откат на длину текста',
     };
@@ -2478,8 +2484,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
   private async alertExpensiveTurn(
     userId: string,
     assistantId: string,
-    charge: { tokens: number; note: string },
-    costUsd: number,
+    charge: { tokens: number; usd: number; note: string },
     chargedTokens: number,
   ) {
     if (charge.tokens < this.EXPENSIVE_TURN_ALERT_TOKENS) return;
@@ -2490,7 +2495,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     void sendTelegramAlert(
       `💸 <b>Дорогой ход</b>\n` +
       `Юзер: <code>${userId}</code>, ассистент ${assistantId}\n` +
-      `Стоимость: <b>$${costUsd.toFixed(2)}</b> → списано ${chargedTokens.toLocaleString('ru')} токенов\n` +
+      `Стоимость: <b>$${charge.usd.toFixed(2)}</b> → списано ${chargedTokens.toLocaleString('ru')} токенов\n` +
       `Остаток: ${balLeft < 0 ? 'н/д' : balLeft.toLocaleString('ru')}\n` +
       `<code>${charge.note}</code>`,
     ).catch(() => {});
@@ -2569,7 +2574,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     if (turnFailed || charge.source === 'length') this.logger.warn(logLine);
     else this.logger.log(logLine);
 
-    await this.alertExpensiveTurn(p.userId, p.assistantId, charge, p.costUsd, textCost);
+    await this.alertExpensiveTurn(p.userId, p.assistantId, charge, textCost);
 
     await this.saveChatHistory(p.userId, p.assistantId, p.userMsg, text, textCost, p.sessionIdOverride);
     if (!turnFailed) {
