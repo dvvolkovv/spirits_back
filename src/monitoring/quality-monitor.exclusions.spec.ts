@@ -64,3 +64,31 @@ describe('запрос chat_quality', () => {
     expect(excluded).toContain('70000000000');
   });
 });
+
+/**
+ * Всплеск возвратов = всплеск сбоев доставки, и только. 14.10.2026 возврат
+ * переплаты 25 пользователям (ручная компенсация, 1 762 707 токенов) поднял
+ * тревогу «всплеск возвратов» дважды. Ручные компенсации помечаются
+ * metadata.compensation = true и в метрику не идут; возвраты за видео и от
+ * поддержки считаются, как раньше.
+ */
+const refundQuery = (q: Array<{ sql: string; params: any[] }>) =>
+  q.find((c) => /transaction_type = 'refund'/.test(c.sql));
+
+describe('всплеск возвратов', () => {
+  it('ручные компенсации (metadata.compensation) не считает — это не сбой доставки', async () => {
+    const { svc, queries } = makeService();
+    await svc.getOverview();
+
+    expect(refundQuery(queries)!.sql).toMatch(/metadata->>'compensation'/);
+  });
+
+  it('прочие возвраты не отсекает ни по описанию, ни по типу задачи', async () => {
+    const { svc, queries } = makeService();
+    await svc.getOverview();
+
+    const sql = refundQuery(queries)!.sql;
+    expect(sql).not.toMatch(/description/);
+    expect(sql).not.toMatch(/job_id|ticket_id/);
+  });
+});
