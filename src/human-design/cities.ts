@@ -76,7 +76,21 @@ export function searchCities(index: CityIndex, query: string, limit = 8): City[]
   return [...starts, ...words].slice(0, limit);
 }
 
-/** «Татарстан, Россия» — для подсказки под названием. */
-export function cityPlace(city: City): string {
-  return city.region ? `${city.region}, ${city.country}` : city.country;
+/**
+ * «Татарстан, Россия» — для подсказки под названием. В zh — своя пунктуация:
+ * полноширинная запятая «，» без пробела, латинская «, » читалась бы как
+ * ошибка набора.
+ */
+export function cityPlace(city: City, language = 'ru'): string {
+  if (!city.region) return city.country;
+  return language === 'zh' ? `${city.region}，${city.country}` : `${city.region}, ${city.country}`;
+}
+
+/**
+ * «Казань (Татарстан, Россия)» — для строки часового пояса. В zh — без
+ * пробела перед скобкой и полноширинные скобки «（…）»: «北京（北京市，中国）».
+ */
+export function cityWithPlace(city: City, language = 'ru'): string {
+  const place = cityPlace(city, language);
+  return language === 'zh' ? `${city.name}（${place}）` : `${city.name} (${place})`;
 }

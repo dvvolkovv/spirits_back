@@ -20,16 +20,18 @@ DST="src/human-design/lib"
 [ -f "$SRC/index.ts" ] || { echo "нет $SRC/index.ts — укажите путь к land_linkeon" >&2; exit 1; }
 grep -q '"name": "spirits-back"' package.json || { echo "скрипт лежит не в spirits_back" >&2; exit 1; }
 [ -f "$LAND/src/content/hd/cities.ru.json" ] || { echo "нет $LAND/src/content/hd/cities.ru.json" >&2; exit 1; }
+[ -f "$LAND/public/licenses.txt" ] || { echo "нет $LAND/public/licenses.txt" >&2; exit 1; }
 # Базы городов — на каждый язык сайта (cities.<код>.json); pathspec с * git
-# раскрывает сам, поэтому в кавычках.
+# раскрывает сам, поэтому в кавычках. public/licenses.txt — тексты лицензий
+# данных (GeoNames, Unicode CLDR и Unihan), едут рядом с базами.
 CITY_DBS='src/content/hd/cities.*.json'
-if [ -n "$(git -C "$LAND" status --porcelain -- src/lib/human-design src/lib/cities.ts src/lib/cities.test.ts "$CITY_DBS")" ]; then
+if [ -n "$(git -C "$LAND" status --porcelain -- src/lib/human-design src/lib/cities.ts src/lib/cities.test.ts "$CITY_DBS" public/licenses.txt)" ]; then
   echo "в land_linkeon незакоммиченные правки модуля или базы городов — сначала коммит там" >&2
   exit 1
 fi
 # Коммит, который последним трогал копируемое, — а не HEAD лендинга: иначе
 # любой посторонний коммит там переписывал бы README здесь.
-SHA=$(git -C "$LAND" log -1 --format=%h -- src/lib/human-design src/lib/cities.ts src/lib/cities.test.ts "$CITY_DBS")
+SHA=$(git -C "$LAND" log -1 --format=%h -- src/lib/human-design src/lib/cities.ts src/lib/cities.test.ts "$CITY_DBS" public/licenses.txt)
 
 # Копия верна только на той же версии библиотеки эфемерид, что у калькулятора.
 ver() { sed -n 's/.*"astronomy-engine": *"[^0-9]*\([0-9][0-9.]*\)".*/\1/p' "$1" | head -1; }
@@ -73,6 +75,7 @@ to_spec "$LAND/src/lib/cities.test.ts" src/human-design/cities.spec.ts
 # Все базы; прежние стираются — иначе язык, убранный в land_linkeon, остался бы здесь.
 rm -f src/human-design/data/cities.*.json
 for f in "$LAND"/src/content/hd/cities.*.json; do cp "$f" src/human-design/data/; done
+cp "$LAND/public/licenses.txt" src/human-design/data/LICENSES.txt
 
 cat > "$DST/README.md" <<EOF
 # Копия модуля Human Design
@@ -94,7 +97,8 @@ cat > src/human-design/data/README.md <<EOF
 \`land_linkeon/scripts/build-hd-cities.py\` за один прогон, сюда —
 \`scripts/sync-human-design.sh\` (land_linkeon @ \`$SHA\`).
 Данные GeoNames (https://www.geonames.org/) — по лицензии CC BY 4.0.
-Данные Unicode CLDR и Unihan — по лицензии Unicode License v3 (полный текст —
+Данные Unicode CLDR и Unihan — по лицензии Unicode License v3. Полные тексты
+лицензий и описание изменений — в \`LICENSES.txt\` рядом (копия
 land_linkeon/public/licenses.txt).
 EOF
 

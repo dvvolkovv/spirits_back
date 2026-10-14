@@ -1,6 +1,6 @@
 const jestExpect = (globalThis as unknown as { expect: jest.Expect }).expect;
 const expect = Object.assign(<T>(actual: T, _message?: string) => jestExpect(actual), jestExpect);
-import { cityPlace, indexCities, normalize, searchCities, type CityDb } from './cities';
+import { cityPlace, cityWithPlace, indexCities, normalize, searchCities, type City, type CityDb } from './cities';
 
 const DB: CityDb = {
   v: 1,
@@ -58,5 +58,40 @@ describe('поиск города', () => {
 
   it('не больше limit подсказок', () => {
     expect(searchCities(index, 'нов', 1)).toHaveLength(1);
+  });
+});
+
+describe('место города на разных языках', () => {
+  const beijing: City = { name: '北京', region: '北京市', country: '中国', zone: 'Asia/Shanghai' };
+  const noRegion: City = { name: 'X', region: null, country: '中国', zone: 'Asia/Shanghai' };
+
+  it('ru (и по умолчанию) — через запятую с пробелом', () => {
+    const [kazan] = searchCities(index, 'казань');
+    expect(cityPlace(kazan, 'ru')).toBe('Татарстан, Россия');
+    expect(cityPlace(kazan)).toBe('Татарстан, Россия');
+    expect(cityWithPlace(kazan, 'ru')).toBe('Казань (Татарстан, Россия)');
+    expect(cityWithPlace(kazan)).toBe('Казань (Татарстан, Россия)');
+  });
+
+  it('ru без региона — только страна, латинские скобки с пробелом', () => {
+    const [moscow] = searchCities(index, 'москва');
+    expect(cityPlace(moscow, 'ru')).toBe('Россия');
+    expect(cityWithPlace(moscow, 'ru')).toBe('Москва (Россия)');
+  });
+
+  it('zh — полноширинная запятая без пробела', () => {
+    expect(cityPlace(beijing, 'zh')).toBe('北京市，中国');
+  });
+
+  it('zh без региона — только страна', () => {
+    expect(cityPlace(noRegion, 'zh')).toBe('中国');
+  });
+
+  it('zh — полноширинные скобки без пробела перед ними', () => {
+    expect(cityWithPlace(beijing, 'zh')).toBe('北京（北京市，中国）');
+  });
+
+  it('zh без региона — скобки вокруг одной страны', () => {
+    expect(cityWithPlace(noRegion, 'zh')).toBe('X（中国）');
   });
 });
