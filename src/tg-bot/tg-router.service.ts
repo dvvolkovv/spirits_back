@@ -34,6 +34,40 @@ export function isOwnBotCommand(text: string, botUsername: string): boolean {
   return !m[2] || m[2].toLowerCase() === botUsername.toLowerCase();
 }
 
+/**
+ * Любая команда с чужим @именем: «/start@ДругойБот <код>», «/help@ДругойБот».
+ * В группе, где ботов несколько, она адресована не нам — ни привязки по ней,
+ * ни хода модели.
+ */
+export function isForeignBotCommand(text: string, botUsername: string): boolean {
+  const m = /^\/\w+@(\w+)/.exec(text.trim());
+  return !!m && m[1].toLowerCase() !== botUsername.toLowerCase();
+}
+
+/**
+ * Письменности без пробелов между словами: «请小助手帮忙» — имя стоит вплотную
+ * к соседнему иероглифу, и граница слова там ничего не значит.
+ */
+const NO_SPACES_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
+const WORD_CHAR = /[\p{L}\p{N}]/u;
+
+/**
+ * Имя бота встречается в тексте с начала слова. Конец слова не проверяем —
+ * иначе пропали бы склонения («спроси Финансиста»). Раньше хватало вхождения
+ * где угодно, и бот по имени «Рома» откликался на «аромат», а «Ли» — на «или».
+ * Оба аргумента — уже в нижнем регистре.
+ */
+export function mentionsName(lo: string, name: string): boolean {
+  if (!name) return false;
+  const nameFree = NO_SPACES_SCRIPT.test(Array.from(name)[0]);
+  for (let i = lo.indexOf(name); i !== -1; i = lo.indexOf(name, i + 1)) {
+    // Символ перед вхождением — целиком, а не половинка суррогатной пары.
+    const before = Array.from(lo.slice(Math.max(0, i - 2), i)).pop();
+    if (!before || nameFree || !WORD_CHAR.test(before) || NO_SPACES_SCRIPT.test(before)) return true;
+  }
+  return false;
+}
+
 export interface IncomingMessageContext {
   chatId: number;
   msgId: number;
@@ -176,7 +210,8 @@ export class TgRouterService {
    * Triggers ответа в режиме A (strict):
    * - @-mention бота
    * - reply на сообщение бота
-   * - display_name конфига встречается в тексте (case-insensitive substring)
+   * - display_name конфига встречается в тексте с начала слова, без учёта
+   *   регистра (mentionsName)
    * - команда из набора /help|balance|silent|resume
    */
   private shouldRespondStrict(
@@ -189,7 +224,7 @@ export class TgRouterService {
     if (!lo) return false;
     if (lo.includes(`@${botUsername.toLowerCase()}`)) return true;
     if (replyToFromBot) return true;
-    if (displayName && lo.includes(displayName.toLowerCase())) return true;
+    if (displayName && mentionsName(lo, displayName.trim().toLowerCase())) return true;
     if (isOwnBotCommand(lo, botUsername)) return true;
     return false;
   }
@@ -214,9 +249,11 @@ export class TgRouterService {
 
   /**
    * Main entry point. Возвращает true если бот должен ответить на это сообщение.
-   * Mode A (strict) — детектор триггеров.
-   * Mode B (always) — отвечает на каждое (rate-limit 3 сек).
-   * Mode C (smart) — Phase 5 добавит Haiku-гейт. Пока fallback на strict.
+   * Явное обращение (триггеры strict) во всех режимах — сразу, без лимитов.
+   * Mode A (strict) — только явное обращение.
+   * Mode B (always) — на каждое; в группе не чаще раза в 3 сек, в личке без лимита.
+   * Mode C (smart) — сам вмешивается не чаще раза в минуту и по решению
+   *   Haiku-гейта (smartGate).
    */
   async shouldRespond(
     cfg: TgBotConfigRow,

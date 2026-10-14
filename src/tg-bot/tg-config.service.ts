@@ -231,7 +231,18 @@ export class TgConfigService {
         LIMIT 1`,
       [tgChatId],
     );
-    if (existing.rows[0]) return existing.rows[0];
+    const found = existing.rows[0];
+    if (found?.status === 'silent') {
+      // Личку глушил только прежний /silent в личке (до 14.10.2026): веб такого
+      // статуса не ставит, групповой /silent до лички не доходит. Не будить —
+      // значит молчать человеку один на один, пока он не догадается про /resume.
+      const woke = await this.pg.query(
+        `UPDATE tg_bot_configs SET status = 'active' WHERE id = $1 RETURNING *`,
+        [found.id],
+      );
+      return woke.rows[0] ?? { ...found, status: 'active' };
+    }
+    if (found) return found;
 
     const prof = await this.pg.query(
       `SELECT preferred_agent FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,

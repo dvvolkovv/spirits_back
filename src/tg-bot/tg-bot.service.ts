@@ -6,7 +6,7 @@ import { PgService } from '../common/services/pg.service';
 import { TgIdentityService, TgIdentityConflictError } from './tg-identity.service';
 import { TgClaimService } from './tg-claim.service';
 import { TgConfigService, TgBotConfigRow } from './tg-config.service';
-import { TgRouterService } from './tg-router.service';
+import { TgRouterService, isForeignBotCommand } from './tg-router.service';
 import { isPrivateConfig } from './tg-chat-kind';
 import { escapeHtml } from './tg-html';
 import { TgMeetingService } from './tg-meeting.service';
@@ -82,6 +82,9 @@ const ALBUM_DEBOUNCE_MS = Number(process.env.TG_ALBUM_DEBOUNCE_MS || 2500);
 
 /** Потолок альбома в Telegram. Набрали столько — ждать больше нечего. */
 const ALBUM_MAX_PARTS = 10;
+
+/** Эхо расшифровки голосового — подсказка «что я услышал», не стенограмма. */
+const ECHO_MAX_CHARS = 1024;
 
 /**
  * Кнопки блога приходят тем же вебхуком, что и кнопки ассистентов.
@@ -193,7 +196,8 @@ export class TgBotService implements OnModuleInit {
 
     // В группах Telegram добавляет к командам @<botname>: `/start@LinkeonTestBot <token>`.
     // В личке — без суффикса. Парсим оба формата.
-    const startToken = typeof msg.text === 'string' ? this.parseStartToken(msg.text) : null;
+    const botUsername = process.env.TG_BOT_USERNAME || 'LinkeonAgentBot';
+    const startToken = typeof msg.text === 'string' ? this.parseStartToken(msg.text, botUsername) : null;
 
     if (chatType === 'private' && startToken) {
       await this.handleDmStart(msg, startToken);
@@ -220,9 +224,9 @@ export class TgBotService implements OnModuleInit {
       const current = prof.rows[0]?.preferred_agent;
       await this.grammy.sendMessage(
         msg.chat.id,
-        (current ? `Привет! Сейчас отвечает *${current}*.` : 'Привет!') +
+        (current ? `Привет! Сейчас отвечает <b>${escapeHtml(current)}</b>.` : 'Привет!') +
           '\n\nПиши сюда — ассистент ответит. /assistants — сменить ассистента, /balance — баланс.',
-        { parse_mode: 'Markdown' },
+        { parse_mode: 'HTML' },
       );
       return;
     }
@@ -264,6 +268,11 @@ export class TgBotService implements OnModuleInit {
     }
 
     if (chatType === 'group' || chatType === 'supergroup') {
+      // Команда другому боту — не нам. `/start@ДругойБот <код>` приходит, когда в
+      // группу добавляют чужого бота: раньше наш принимал чужой код за свой, не
+      // находил его и выходил из группы, бросая рабочий конфиг. А `/help@ДругойБот`
+      // в режиме «на каждое сообщение» уходил в платный ход модели.
+      if (typeof msg.text === 'string' && isForeignBotCommand(msg.text, botUsername)) return;
       if (startToken) {
         await this.handleGroupClaim(msg, startToken);
         return;
@@ -274,9 +283,12 @@ export class TgBotService implements OnModuleInit {
   }
 
   // Парсит `/start <token>` и `/start@<botname> <token>`. Возвращает токен или null.
-  private parseStartToken(text: string): string | null {
-    const m = text.match(/^\/start(?:@\S+)?\s+(\S+)/);
-    return m ? m[1] : null;
+  // Токен с чужим @именем — не наш: это привязка другого бота.
+  private parseStartToken(text: string, botUsername: string): string | null {
+    const m = text.match(/^\/start(?:@(\w+))?\s+(\S+)/);
+    if (!m) return null;
+    if (m[1] && m[1].toLowerCase() !== botUsername.toLowerCase()) return null;
+    return m[2];
   }
 
   // Команды в личке с ботом: /help (всем) и /balance (привязанному юзеру).
@@ -448,13 +460,17 @@ export class TgBotService implements OnModuleInit {
         return;
       }
       const list = r.rows
-        .map(b => isPrivateConfig(b) ? `• *${b.display_name}* в личке` : `• *${b.display_name}* в «${b.tg_chat_title ?? 'группе'}»`)
+        .map(b => isPrivateConfig(b)
+          ? `• <b>${escapeHtml(b.display_name)}</b> в личке`
+          : `• <b>${escapeHtml(b.display_name)}</b> в «${escapeHtml(b.tg_chat_title ?? 'группе')}»`)
         .join('\n');
       const verb = cmd === '/silent' ? '🤫 Замолкли' : '✅ Снова на связи';
+      // HTML: имена ботов и названия групп задают люди, и «Team_A» в
+      // legacy-Markdown ронял всё сообщение.
       await this.grammy.sendMessage(
         msg.chat.id,
         `${verb}:\n${list}`,
-        { parse_mode: 'Markdown' },
+        { parse_mode: 'HTML' },
       );
       return;
     }
@@ -666,9 +682,14 @@ export class TgBotService implements OnModuleInit {
       // Владелец узнаёт о нуле сам — личкой, раз в сутки: в группах «по
       // обращению» объяснение ниже получает лишь тот, кто позвал бота. В личке
       // предупреждение и так придёт прямо здесь.
+      // Сбой оповещения не мешает объяснить позвавшему — ниже.
       if (!isPrivateConfig(cfg)) {
-        const ownerTg = await this.identity.getIdentityByLinkeonId(cfg.owner_user_id);
-        await this.billing.notifyOwnerZeroBalance(cfg.owner_user_id, ownerTg?.tgUserId ?? null);
+        try {
+          const ownerTg = await this.identity.getIdentityByLinkeonId(cfg.owner_user_id);
+          await this.billing.notifyOwnerZeroBalance(cfg.owner_user_id, ownerTg?.tgUserId ?? null);
+        } catch (e: any) {
+          this.logger.warn(`zero-balance owner notify failed for ${cfg.id}: ${e?.message}`);
+        }
       }
       // Объяснять, почему бот молчит, — только тому, кто его позвал. Раньше
       // предупреждение уходило на любое сообщение группы, в том числе в режиме
@@ -812,9 +833,13 @@ export class TgBotService implements OnModuleInit {
         try {
           // HTML с экранированием: в legacy-Markdown любой из _ * [ ` в
           // расшифровке ронял сообщение, и эха просто не было.
+          // Режем по символам, а не по UTF-16: slice посреди эмодзи оставлял
+          // половинку суррогатной пары.
+          const chars = Array.from(workingText);
+          const heard = chars.length > ECHO_MAX_CHARS ? chars.slice(0, ECHO_MAX_CHARS).join('') + '…' : workingText;
           await this.grammy.sendMessage(
             msg.chat.id,
-            `🎙️ <i>«${escapeHtml(workingText.slice(0, 1024))}»</i>`,
+            `🎙️ <i>«${escapeHtml(heard)}»</i>`,
             { reply_to_message_id: msg.message_id, parse_mode: 'HTML' },
           );
         } catch { /* эхо — подсказка, не повод ронять ход */ }
@@ -989,9 +1014,17 @@ export class TgBotService implements OnModuleInit {
       // При успешном списании > 0 — сбрасываем flag, чтобы при следующем падении в 0 снова срабатывало однократное сообщение
       if (newBalance > 0) {
         await this.billing.clearZeroBalanceFlag(cfg.id);
-        await this.billing.clearOwnerZeroBalanceDm(cfg.owner_user_id);
       }
       await this.router.persistAssistantReply(cfg, reply.text, contentType, tokensCharged);
+      // Отметка «владельцу сообщили о нуле» — после записи ответа: это Redis, и
+      // его сбой не должен стоить хода, за который уже списали.
+      if (newBalance > 0) {
+        try {
+          await this.billing.clearOwnerZeroBalanceDm(cfg.owner_user_id);
+        } catch (e: any) {
+          this.logger.warn(`zero-balance owner mark not cleared for ${cfg.id}: ${e?.message}`);
+        }
+      }
       // Пишем разговор в тот же граф Neo4j, из которого читает веб-чат: без
       // этого бот ничего не запоминает и переспрашивает уже рассказанное.
       await this.router.consolidateAfterReply(cfg, workingText, reply.text);

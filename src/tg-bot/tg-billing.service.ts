@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from './tg-grammy.client';
 import { RedisService } from '../common/services/redis.service';
@@ -25,7 +25,7 @@ export class TgBillingService {
   constructor(
     private readonly pg: PgService,
     private readonly grammy: TgGrammyClient,
-    private readonly redis?: RedisService,
+    @Optional() private readonly redis?: RedisService,
   ) {}
 
   /**
@@ -182,23 +182,47 @@ export class TgBillingService {
   async notifyOwnerZeroBalance(ownerUserId: string, ownerTgUserId: number | null): Promise<void> {
     if (!ownerTgUserId || !this.redis) return;
     const key = TgBillingService.zeroBalanceDmKey(ownerUserId);
-    if (!(await this.redis.setNx(key, '1', 24 * 60 * 60 * 1000))) return;
+    // Зовётся из хода бота: сбой Redis не должен его ронять. Без отметки не
+    // шлём вовсе — иначе владелец получал бы сообщение на каждую реплику группы.
+    let first: boolean;
+    try {
+      first = await this.redis.setNx(key, '1', 24 * 60 * 60 * 1000);
+    } catch (e: any) {
+      this.logger.warn(`zero-balance owner DM skipped, redis: ${e?.message}`);
+      return;
+    }
+    if (!first) return;
     try {
       await this.grammy.sendMessage(
         ownerTgUserId,
         '⛔ Токены закончились — твои боты не отвечают, пока не пополнишь баланс: https://my.linkeon.io/tokens',
       );
     } catch (e: any) {
-      // Не ушло — снимаем отметку, чтобы попробовать в следующий раз.
-      await this.redis.del(key);
-      this.logger.warn(`zero-balance owner DM failed: ${e.message}`);
+      this.logger.warn(`zero-balance owner DM failed: ${e?.message}`);
+      // Отказ Telegram (403 «бот заблокирован», «не начинал диалог», 400) за
+      // сутки не пройдёт — отметку держим, иначе попытка на каждое сообщение
+      // группы. Сеть и 429 — временно: снимаем, чтобы повторить.
+      const code = e?.error_code;
+      const refused = typeof code === 'number' && code >= 400 && code < 500 && code !== 429;
+      if (!refused) {
+        try {
+          await this.redis.del(key);
+        } catch (e2: any) {
+          this.logger.warn(`zero-balance owner DM mark not cleared: ${e2?.message}`);
+        }
+      }
     }
   }
 
   /** Баланс снова есть — следующий ноль опять сообщит владельцу. */
   async clearOwnerZeroBalanceDm(ownerUserId: string): Promise<void> {
     if (!this.redis) return;
-    await this.redis.del(TgBillingService.zeroBalanceDmKey(ownerUserId));
+    try {
+      await this.redis.del(TgBillingService.zeroBalanceDmKey(ownerUserId));
+    } catch (e: any) {
+      // Не снялась — следующий ноль просто не сообщит (до суток). Ход важнее.
+      this.logger.warn(`zero-balance owner DM mark not cleared: ${e?.message}`);
+    }
   }
 
   private static zeroBalanceDmKey(ownerUserId: string): string {

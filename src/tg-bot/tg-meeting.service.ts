@@ -227,5 +227,3 @@ export class TgMeetingService {
     return data.startsWith(JOIN_PREFIX);
   }
 }
-
-/** Название комнаты приходит от людей и уезжает в HTML-разметку Telegram. */

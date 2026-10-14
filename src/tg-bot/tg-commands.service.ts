@@ -8,6 +8,7 @@ import { AgentsService } from '../agents/agents.service';
 import { TgConfigService } from './tg-config.service';
 import { buildAssistantsKeyboard } from './tg-assistants-keyboard';
 import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
+import { escapeHtml } from './tg-html';
 
 /**
  * Родные названия языков — те же, что показывает сайт и мини-апп
@@ -77,8 +78,8 @@ export class TgCommandsService {
       [JSON.stringify({ language: code }), ownerId],
     );
     await this.grammy.answerCallbackQuery(cb.id, {});
-    await this.grammy.sendMessage(cb.message.chat.id, `Готово, отвечаю на: *${LANGUAGE_LABELS[code]}*.`, {
-      parse_mode: 'Markdown',
+    await this.grammy.sendMessage(cb.message.chat.id, `Готово, отвечаю на: <b>${escapeHtml(LANGUAGE_LABELS[code])}</b>.`, {
+      parse_mode: 'HTML',
     });
   }
 
@@ -97,8 +98,8 @@ export class TgCommandsService {
     const current = prof.rows[0]?.preferred_agent ?? null;
     await this.grammy.sendMessage(
       msg.chat.id,
-      current ? `Сейчас отвечает *${current}*. Кого позвать?` : 'Кого позвать?',
-      { parse_mode: 'Markdown', reply_markup: buildAssistantsKeyboard(agents, page, current) },
+      current ? `Сейчас отвечает <b>${escapeHtml(current)}</b>. Кого позвать?` : 'Кого позвать?',
+      { parse_mode: 'HTML', reply_markup: buildAssistantsKeyboard(agents, page, current) },
     );
   }
 
@@ -120,8 +121,8 @@ export class TgCommandsService {
 
     await this.agents.changeAgent(ownerId, name);
     await this.grammy.answerCallbackQuery(cb.id, {});
-    await this.grammy.sendMessage(cb.message.chat.id, `Теперь отвечает *${name}*.`, {
-      parse_mode: 'Markdown',
+    await this.grammy.sendMessage(cb.message.chat.id, `Теперь отвечает <b>${escapeHtml(name)}</b>.`, {
+      parse_mode: 'HTML',
     });
 
     // Отметка в ленте: история в личке одна на всех ассистентов, и без неё
@@ -173,7 +174,9 @@ export class TgCommandsService {
       always: 'отвечает на каждое сообщение',
       smart:  'отвечает когда видит, что стоит вмешаться',
     };
-    const text = `Я *${cfg.display_name}* — ${modeMap[cfg.addressing_mode]}.
+    // Имя задаёт владелец: «Fin_Bot» в legacy-Markdown открывал курсив без
+    // пары, и Telegram отклонял всё сообщение — справки не было вовсе.
+    const text = `Я <b>${escapeHtml(cfg.display_name)}</b> — ${modeMap[cfg.addressing_mode]}.
 
 Команды:
 /help — это сообщение
@@ -183,7 +186,7 @@ export class TgCommandsService {
 
 Веб-кабинет: https://my.linkeon.io/telegram-bots`;
     await this.grammy.sendMessage(msg.chat.id, text, {
-      parse_mode: 'Markdown',
+      parse_mode: 'HTML',
       reply_to_message_id: msg.message_id,
     });
   }
