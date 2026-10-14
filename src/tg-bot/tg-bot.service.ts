@@ -271,8 +271,13 @@ export class TgBotService implements OnModuleInit {
       // Команда другому боту — не нам. `/start@ДругойБот <код>` приходит, когда в
       // группу добавляют чужого бота: раньше наш принимал чужой код за свой, не
       // находил его и выходил из группы, бросая рабочий конфиг. А `/help@ДругойБот`
-      // в режиме «на каждое сообщение» уходил в платный ход модели.
-      if (typeof msg.text === 'string' && isForeignBotCommand(msg.text, botUsername)) return;
+      // в режиме «на каждое сообщение» уходил в платный ход модели. В историю
+      // чата такие строки тоже не пишем: чужие коды и команды модели ни к чему.
+      const said = typeof msg.text === 'string' ? msg.text : typeof msg.caption === 'string' ? msg.caption : '';
+      if (isForeignBotCommand(said, botUsername)) {
+        this.logger.debug(`chat ${msg.chat.id}: command for another bot, skipping`);
+        return;
+      }
       if (startToken) {
         await this.handleGroupClaim(msg, startToken);
         return;
@@ -291,14 +296,6 @@ export class TgBotService implements OnModuleInit {
     return m[2];
   }
 
-  // Команды в личке с ботом: /help (всем) и /balance (привязанному юзеру).
-  // /silent /resume — групповые, в DM не имеют смысла.
-  /**
-   * Нажатия инлайн-кнопок. Пока единственные — выбор ассистента и листание
-   * его списка. Непривязанный пользователь молча игнорируется: кнопку он
-   * может получить только из сообщения, которое бот прислал ему же, так что
-   * это либо чужой forward, либо отвязка аккаунта между показом и нажатием.
-   */
   /**
    * Ответ человеку, чей Telegram не привязан к Linkeon.
    *
@@ -320,6 +317,12 @@ export class TgBotService implements OnModuleInit {
     });
   }
 
+  /**
+   * Нажатия инлайн-кнопок. Пока единственные — выбор ассистента и листание
+   * его списка. Непривязанный пользователь молча игнорируется: кнопку он
+   * может получить только из сообщения, которое бот прислал ему же, так что
+   * это либо чужой forward, либо отвязка аккаунта между показом и нажатием.
+   */
   private async handleCallbackQuery(cb: any): Promise<void> {
     const data = String(cb.data || '');
 
@@ -353,6 +356,8 @@ export class TgBotService implements OnModuleInit {
     }
   }
 
+  // Команды в личке с ботом: /help, /assistants, /language, /balance, а
+  // /silent и /resume — для групп владельца: личку /silent не глушит.
   private async handleDmCommand(msg: any): Promise<void> {
     // `/case <история>` — реальный кейс в блог, команда владельца блога. Стоит
     // первой: разбор ниже переводит текст в нижний регистр и режет по пробелу,
@@ -543,7 +548,15 @@ export class TgBotService implements OnModuleInit {
         await this.grammy.sendMessage(ownerTgId, `Не получилось привязать бота: ${e.message}`);
       } catch { /* ignore */ }
       this.logger.warn(`claim failed for chat ${msg.chat.id}: ${e.message}`);
-      try { await this.grammy.leaveChat(msg.chat.id); } catch { /* ignore */ }
+      // Уходим, только если в группе точно нет работающего бота: выход
+      // архивирует его конфиг (handleMyChatMember). Раньше уходили всегда — и
+      // старая ссылка, нажатая владельцем в группе, где бот уже отвечает,
+      // или чужая привязка к занятой группе выключали рабочего бота.
+      let live: TgBotConfigRow | null | undefined;
+      try { live = await this.configs.getActiveByTgChatId(msg.chat.id); } catch { live = undefined; }
+      if (live === null) {
+        try { await this.grammy.leaveChat(msg.chat.id); } catch { /* ignore */ }
+      }
     }
   }
 
@@ -682,14 +695,13 @@ export class TgBotService implements OnModuleInit {
       // Владелец узнаёт о нуле сам — личкой, раз в сутки: в группах «по
       // обращению» объяснение ниже получает лишь тот, кто позвал бота. В личке
       // предупреждение и так придёт прямо здесь.
-      // Сбой оповещения не мешает объяснить позвавшему — ниже.
+      // В фоне: объяснение позвавшему (ниже) не ждёт ни Redis, ни Telegram
+      // владельца.
       if (!isPrivateConfig(cfg)) {
-        try {
+        this.inBackground(`zero-balance owner notify for ${cfg.id}`, async () => {
           const ownerTg = await this.identity.getIdentityByLinkeonId(cfg.owner_user_id);
           await this.billing.notifyOwnerZeroBalance(cfg.owner_user_id, ownerTg?.tgUserId ?? null);
-        } catch (e: any) {
-          this.logger.warn(`zero-balance owner notify failed for ${cfg.id}: ${e?.message}`);
-        }
+        });
       }
       // Объяснять, почему бот молчит, — только тому, кто его позвал. Раньше
       // предупреждение уходило на любое сообщение группы, в том числе в режиме
@@ -702,7 +714,7 @@ export class TgBotService implements OnModuleInit {
         try {
           await this.grammy.sendMessage(
             msg.chat.id,
-            `⚠️ У владельца закончились токены (баланс: ${preBalance}). Бот не отвечает пока баланс не пополнят: https://my.linkeon.io/tokens`,
+            `⚠️ У владельца закончились токены (баланс: ${preBalance}). Бот не отвечает, пока баланс не пополнят: https://my.linkeon.io/tokens`,
             { reply_to_message_id: msg.message_id },
           );
           await this.billing.markZeroBalanceNotified(cfg.id);
@@ -1011,27 +1023,30 @@ export class TgBotService implements OnModuleInit {
       // 65k токенов ещё на Sonnet и проходили молча — теперь модель как в вебе,
       // и такие выбросы должны быть видны нам сразу, а не из жалобы владельца.
       await this.billing.alertIfExpensiveTurn(cfg, totalCostUsd, tokensCharged, newBalance);
-      // При успешном списании > 0 — сбрасываем flag, чтобы при следующем падении в 0 снова срабатывало однократное сообщение
-      if (newBalance > 0) {
-        await this.billing.clearZeroBalanceFlag(cfg.id);
-      }
       await this.router.persistAssistantReply(cfg, reply.text, contentType, tokensCharged);
-      // Отметка «владельцу сообщили о нуле» — после записи ответа: это Redis, и
-      // его сбой не должен стоить хода, за который уже списали.
+      // Отметки о нуле снимаем после записи ответа: их сбой не должен стоить
+      // хода, за который уже списали. Флаг группы — чтобы при следующем нуле
+      // снова сработало однократное сообщение; отметка владельца — Redis, её
+      // снимаем в фоне (см. inBackground).
       if (newBalance > 0) {
         try {
-          await this.billing.clearOwnerZeroBalanceDm(cfg.owner_user_id);
+          await this.billing.clearZeroBalanceFlag(cfg.id);
         } catch (e: any) {
-          this.logger.warn(`zero-balance owner mark not cleared for ${cfg.id}: ${e?.message}`);
+          this.logger.warn(`zero-balance flag not cleared for ${cfg.id}: ${e?.message}`);
         }
+        this.inBackground(`zero-balance owner mark clear for ${cfg.id}`, () =>
+          this.billing.clearOwnerZeroBalanceDm(cfg.owner_user_id),
+        );
       }
       // Пишем разговор в тот же граф Neo4j, из которого читает веб-чат: без
       // этого бот ничего не запоминает и переспрашивает уже рассказанное.
       await this.router.consolidateAfterReply(cfg, workingText, reply.text);
 
-      // DM-alert при низком балансе (post-deduct)
-      const ownerTg = await this.identity.getIdentityByLinkeonId(cfg.owner_user_id);
-      await this.billing.checkBalanceAlerts(cfg.id, cfg.owner_user_id, ownerTg?.tgUserId ?? null);
+      // DM-alert при низком балансе (post-deduct) — в фоне: при нуле это Redis.
+      this.inBackground(`balance alerts for ${cfg.id}`, async () => {
+        const ownerTg = await this.identity.getIdentityByLinkeonId(cfg.owner_user_id);
+        await this.billing.checkBalanceAlerts(cfg.id, cfg.owner_user_id, ownerTg?.tgUserId ?? null);
+      });
     } finally {
       if (typingTimer) clearInterval(typingTimer);
       if (statusPendingTimer) clearTimeout(statusPendingTimer);
@@ -1047,20 +1062,6 @@ export class TgBotService implements OnModuleInit {
     }
   }
 
-  /**
-   * Доставка текстовой части ответа. Единственное место, где ответ уходит
-   * юзеру, — поэтому здесь же ловится провал доставки.
-   *
-   * Раньше падение sendMessage (19.08.2026 — ответ длиннее 4096 символов)
-   * улетало наверх до handleUpdate, который только пишет строку в лог: юзер не
-   * получал ни ответа, ни ошибки, а текст не сохранялся нигде — доставать
-   * пришлось из сессии Claude CLI на проде. Нарезка в TgGrammyClient закрыла
-   * конкретную причину; здесь закрывается сам класс отказа.
-   *
-   * Ошибку пробрасываем дальше намеренно: списание и persistAssistantReply
-   * идут после доставки, и ход, которого юзер не видел, не должен ни попасть в
-   * историю как отвеченный, ни быть оплачен.
-   */
   /**
    * Лимит подписи к медиа в Telegram — 1024 символа, а не 4096 как у текстового
    * сообщения. Здесь стоял substring(0, 1024): TTS озвучивал ответ целиком, а
@@ -1200,6 +1201,20 @@ export class TgBotService implements OnModuleInit {
     }
   }
 
+  /**
+   * Доставка текстовой части ответа. Единственное место, где ответ уходит
+   * юзеру, — поэтому здесь же ловится провал доставки.
+   *
+   * Раньше падение sendMessage (19.08.2026 — ответ длиннее 4096 символов)
+   * улетало наверх до handleUpdate, который только пишет строку в лог: юзер не
+   * получал ни ответа, ни ошибки, а текст не сохранялся нигде — доставать
+   * пришлось из сессии Claude CLI на проде. Нарезка в TgGrammyClient закрыла
+   * конкретную причину; здесь закрывается сам класс отказа.
+   *
+   * Ошибку пробрасываем дальше намеренно: списание и persistAssistantReply
+   * идут после доставки, и ход, которого юзер не видел, не должен ни попасть в
+   * историю как отвеченный, ни быть оплачен.
+   */
   async deliverReplyText(chatId: number, replyToMessageId: number, text: string): Promise<void> {
     try {
       await this.grammy.sendMessage(chatId, text, { reply_to_message_id: replyToMessageId });
@@ -1653,6 +1668,19 @@ export class TgBotService implements OnModuleInit {
         );
       } catch { /* ignore */ }
     }
+  }
+
+  /**
+   * Побочная работа хода — без ожидания: оповещения владельца о балансе и
+   * отметки о них. При нуле это Redis, а ioredis при обрыве не падает сразу,
+   * а держит команду в очереди 23–63 с — под замком чата, пока следующая
+   * реплика человека получает «Минутку» без ответа. Ошибки — только в лог;
+   * через Promise.resolve синхронный throw задачи тоже не уходит наверх.
+   */
+  private inBackground(what: string, job: () => Promise<unknown>): void {
+    Promise.resolve()
+      .then(job)
+      .catch((e: any) => this.logger.warn(`${what} failed: ${e?.message}`));
   }
 
   // hashtext-эквивалент: 32-битный знаковый int для pg_advisory_lock

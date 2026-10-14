@@ -127,7 +127,7 @@ export class TgMeetingService {
     if (!found) return false;
 
     const agent = await this.currentAgent(ownerId);
-    const who = agent ? `${agent.name} зайдёт во встречу` : 'Ассистент зайдёт во встречу';
+    const who = agent ? `${escapeHtml(agent.name)} зайдёт во встречу` : 'Ассистент зайдёт во встречу';
 
     await this.grammy.sendMessage(chatId, `🎤 <b>${escapeHtml(found.title)}</b>\n${who}.`, {
       parse_mode: 'HTML',

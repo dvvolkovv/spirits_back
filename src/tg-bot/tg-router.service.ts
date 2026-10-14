@@ -46,10 +46,13 @@ export function isForeignBotCommand(text: string, botUsername: string): boolean 
 
 /**
  * Письменности без пробелов между словами: «请小助手帮忙» — имя стоит вплотную
- * к соседнему иероглифу, и граница слова там ничего не значит.
+ * к соседнему иероглифу, и граница слова там ничего не значит. По
+ * Script_Extensions, а не Script: у «ー» и «々» письменность общая (Common).
  */
-const NO_SPACES_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
-const WORD_CHAR = /[\p{L}\p{N}]/u;
+const NO_SPACES_SCRIPT = /[\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}\p{Script_Extensions=Thai}\p{Script_Extensions=Lao}\p{Script_Extensions=Khmer}\p{Script_Extensions=Myanmar}]/u;
+// Огласовки и надстрочные знаки (\p{M}) — часть слова: «राम» внутри «विराम»,
+// «й», набранное двумя символами.
+const WORD_CHAR = /[\p{L}\p{N}\p{M}]/u;
 
 /**
  * Имя бота встречается в тексте с начала слова. Конец слова не проверяем —

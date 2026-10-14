@@ -237,7 +237,7 @@ export class TgConfigService {
       // статуса не ставит, групповой /silent до лички не доходит. Не будить —
       // значит молчать человеку один на один, пока он не догадается про /resume.
       const woke = await this.pg.query(
-        `UPDATE tg_bot_configs SET status = 'active' WHERE id = $1 RETURNING *`,
+        `UPDATE tg_bot_configs SET status = 'active' WHERE id = $1 AND status = 'silent' RETURNING *`,
         [found.id],
       );
       return woke.rows[0] ?? { ...found, status: 'active' };

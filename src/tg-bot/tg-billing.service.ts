@@ -2,6 +2,7 @@ import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from './tg-grammy.client';
 import { RedisService } from '../common/services/redis.service';
+import { escapeHtml } from './tg-html';
 import { CASH_TOKENS_PER_USD, SEAT_TOKENS_PER_USD } from '../common/billing-rates';
 import * as telegramAlert from '../common/telegram-alert';
 
@@ -127,7 +128,7 @@ export class TgBillingService {
     try {
       await telegramAlert.sendTelegramAlert(
         `💸 <b>Дорогой ход TG-бота</b>\n` +
-        `Бот: <b>${cfg.display_name}</b> (<code>${cfg.id}</code>)\n` +
+        `Бот: <b>${escapeHtml(cfg.display_name)}</b> (<code>${cfg.id}</code>)\n` +
         `Владелец: <code>${cfg.owner_user_id}</code>\n` +
         `Стоимость: <b>$${costUsd.toFixed(2)}</b> → списано ${tokensCharged.toLocaleString('ru')} токенов\n` +
         `Остаток: ${balanceLeft.toLocaleString('ru')}`,
