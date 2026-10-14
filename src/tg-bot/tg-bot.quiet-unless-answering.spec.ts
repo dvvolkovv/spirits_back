@@ -118,7 +118,7 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
     };
     const identity = {
       getLinkeonIdByTgUserId: jest.fn(async () => null),
-      getIdentityByLinkeonId: jest.fn(async () => null),
+      getIdentityByLinkeonId: jest.fn(async () => ({ tgUserId: 111 })),
     };
     const router = {
       shouldRespond: jest.fn((cfg: any, ctx: any) => real.shouldRespond(cfg, ctx)),
@@ -142,6 +142,8 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
       alertIfExpensiveTurn: jest.fn(async () => {}),
       clearZeroBalanceFlag: jest.fn(async () => {}),
       checkBalanceAlerts: jest.fn(async () => {}),
+      notifyOwnerZeroBalance: jest.fn(async () => {}),
+      clearOwnerZeroBalanceDm: jest.fn(async () => {}),
     };
     const commands = { tryHandle: jest.fn(async () => false) };
     // meetingHandled — ссылка оказалась встречей, и сервис показал приглашение.
@@ -192,13 +194,25 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
     const { svc, router, grammy, sent } = makeTurnBot({ transcript: 'Финансист, сколько у нас осталось?' });
     await (svc as any).handleChatMessage(groupMsg({ voice: true }), CFG);
     expect(echoes(sent())).toHaveLength(1);
-    // Формат целиком: эмодзи с вариационным селектором, курсив, Markdown.
+    // Формат целиком: эмодзи с вариационным селектором, курсив, HTML.
     expect(grammy.sendMessage).toHaveBeenCalledWith(
       -100123,
-      '\u{1F399}\u{FE0F} _«Финансист, сколько у нас осталось?»_',
-      { reply_to_message_id: 10, parse_mode: 'Markdown' },
+      '\u{1F399}\u{FE0F} <i>«Финансист, сколько у нас осталось?»</i>',
+      { reply_to_message_id: 10, parse_mode: 'HTML' },
     );
     expect(router.generateReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('эхо не ломается на _ * [ ` и угловых скобках: HTML с экранированием', async () => {
+    // В legacy-Markdown любой из этих знаков ронял сообщение («can't parse
+    // entities»), а .catch молча глотал — эха просто не было.
+    const { svc, grammy } = makeTurnBot({ transcript: 'Финансист, итог_2 *важно* [см] `код` 5 < 7 & 8 > 3' });
+    await (svc as any).handleChatMessage(groupMsg({ voice: true }), CFG);
+    expect(grammy.sendMessage).toHaveBeenCalledWith(
+      -100123,
+      '\u{1F399}\u{FE0F} <i>«Финансист, итог_2 *важно* [см] `код` 5 &lt; 7 &amp; 8 &gt; 3»</i>',
+      { reply_to_message_id: 10, parse_mode: 'HTML' },
+    );
   });
 
   it('эхо доходит раньше «Думаю…»: сначала что бот услышал, потом что он думает', async () => {
@@ -329,6 +343,21 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
     const { svc, meetings } = makeTurnBot({ meetingHandled: true });
     await (svc as any).handleChatMessage(groupMsg({ text: `созвон тут ${ZOOM}` }), { ...CFG, addressing_mode: 'always' });
     expect(meetings.tryHandleLink).toHaveBeenCalledTimes(1);
+  });
+
+  it('нулевой баланс в группе — владелец узнаёт сам, личкой (даже если к боту не обращались)', async () => {
+    const { svc, billing } = makeTurnBot({ balance: 0 });
+    await (svc as any).handleChatMessage(groupMsg({ text: 'встречаемся в восемь' }), CFG);
+    expect(billing.notifyOwnerZeroBalance).toHaveBeenCalledWith('u-owner', 111);
+  });
+
+  it('нулевой баланс в личке — отдельного сообщения владельцу нет: предупреждение и так здесь', async () => {
+    const { svc, billing } = makeTurnBot({ balance: 0 });
+    await (svc as any).handleChatMessage(
+      { ...groupMsg({ text: 'привет' }), chat: { id: 42, type: 'private' } },
+      { ...CFG, tg_chat_id: '42', addressing_mode: 'always' },
+    );
+    expect(billing.notifyOwnerZeroBalance).not.toHaveBeenCalled();
   });
 
   it('нулевой баланс, обычная реплика группы — бот молчит', async () => {

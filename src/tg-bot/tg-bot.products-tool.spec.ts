@@ -343,6 +343,8 @@ describe('TgBotService.handleChatMessage: гейт и вложения', () => {
       alertIfExpensiveTurn: jest.fn(async () => {}),
       clearZeroBalanceFlag: jest.fn(async () => {}),
       checkBalanceAlerts: jest.fn(async () => {}),
+      notifyOwnerZeroBalance: jest.fn(async () => {}),
+      clearOwnerZeroBalanceDm: jest.fn(async () => {}),
     };
     const commands = { tryHandle: jest.fn(async () => false) };
     const meetings = { tryHandleLink: jest.fn(async () => !!o.meetingHandled) };
