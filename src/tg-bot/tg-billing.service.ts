@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from './tg-grammy.client';
+import { RedisService } from '../common/services/redis.service';
 import { CASH_TOKENS_PER_USD, SEAT_TOKENS_PER_USD } from '../common/billing-rates';
 import * as telegramAlert from '../common/telegram-alert';
 
@@ -24,6 +25,7 @@ export class TgBillingService {
   constructor(
     private readonly pg: PgService,
     private readonly grammy: TgGrammyClient,
+    private readonly redis?: RedisService,
   ) {}
 
   /**
@@ -142,6 +144,10 @@ export class TgBillingService {
     if (!ownerTgUserId) return;
     const threshold = Number(process.env.TG_BOT_LOW_BALANCE_THRESHOLD ?? '1000');
     const balance = await this.getBalance(ownerUserId);
+    if (balance <= 0) {
+      await this.notifyOwnerZeroBalance(ownerUserId, ownerTgUserId);
+      return;
+    }
     if (balance < threshold && balance > 0) {
       const r = await this.pg.query(
         `SELECT last_low_balance_dm_at FROM tg_bot_configs WHERE id = $1`,
@@ -164,6 +170,39 @@ export class TgBillingService {
         }
       }
     }
+  }
+
+  /**
+   * Владельцу — один раз в сутки: токены закончились, боты молчат. Раньше при
+   * нуле владелец не узнавал ничего: алерт выше шлётся только при 0 < баланс <
+   * порога, а списание, упёршееся в ноль, его проскакивало. В группах «по
+   * обращению» бот о нуле говорит лишь тому, кто его позвал. Отметка — на
+   * владельца, а не на бота: у кого ботов несколько, получит одно сообщение.
+   */
+  async notifyOwnerZeroBalance(ownerUserId: string, ownerTgUserId: number | null): Promise<void> {
+    if (!ownerTgUserId || !this.redis) return;
+    const key = TgBillingService.zeroBalanceDmKey(ownerUserId);
+    if (!(await this.redis.setNx(key, '1', 24 * 60 * 60 * 1000))) return;
+    try {
+      await this.grammy.sendMessage(
+        ownerTgUserId,
+        '⛔ Токены закончились — твои боты не отвечают, пока не пополнишь баланс: https://my.linkeon.io/tokens',
+      );
+    } catch (e: any) {
+      // Не ушло — снимаем отметку, чтобы попробовать в следующий раз.
+      await this.redis.del(key);
+      this.logger.warn(`zero-balance owner DM failed: ${e.message}`);
+    }
+  }
+
+  /** Баланс снова есть — следующий ноль опять сообщит владельцу. */
+  async clearOwnerZeroBalanceDm(ownerUserId: string): Promise<void> {
+    if (!this.redis) return;
+    await this.redis.del(TgBillingService.zeroBalanceDmKey(ownerUserId));
+  }
+
+  private static zeroBalanceDmKey(ownerUserId: string): string {
+    return `tg:zero-balance-dm:${ownerUserId}`;
   }
 
   /**

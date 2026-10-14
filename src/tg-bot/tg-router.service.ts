@@ -21,8 +21,18 @@ import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.s
  */
 const DEFAULT_AGENT_ID = '12';
 
-/** Команды бота в группе (tg-commands.service.ts). Обращение к боту в любом режиме. */
-const BOT_COMMAND = /^\/(help|balance|silent|resume)(\s|@|$)/;
+/**
+ * Команды бота в группе (tg-commands.service.ts). Обращение к боту в любом
+ * режиме — но только к НАШЕМУ: «/help@ДругойБот» в группе с несколькими ботами
+ * адресован не нам (Telegram сам дописывает @имя, когда ботов в чате несколько).
+ */
+const BOT_COMMAND = /^\/(help|balance|silent|resume)(?:@(\w+))?(?:\s|$)/i;
+
+export function isOwnBotCommand(text: string, botUsername: string): boolean {
+  const m = BOT_COMMAND.exec(text.trim());
+  if (!m) return false;
+  return !m[2] || m[2].toLowerCase() === botUsername.toLowerCase();
+}
 
 export interface IncomingMessageContext {
   chatId: number;
@@ -180,7 +190,7 @@ export class TgRouterService {
     if (lo.includes(`@${botUsername.toLowerCase()}`)) return true;
     if (replyToFromBot) return true;
     if (displayName && lo.includes(displayName.toLowerCase())) return true;
-    if (BOT_COMMAND.test(lo)) return true;
+    if (isOwnBotCommand(lo, botUsername)) return true;
     return false;
   }
 
@@ -195,10 +205,10 @@ export class TgRouterService {
     cfg: TgBotConfigRow,
     said: { text: string; replyToFromBot?: boolean },
   ): boolean {
-    if (BOT_COMMAND.test(said.text.toLowerCase())) return true;
+    const botUsername = process.env.TG_BOT_USERNAME || 'LinkeonAgentBot';
+    if (isOwnBotCommand(said.text, botUsername)) return true;
     if (cfg.status === 'silent') return false;
     if (cfg.addressing_mode === 'always') return true;
-    const botUsername = process.env.TG_BOT_USERNAME || 'LinkeonAgentBot';
     return this.shouldRespondStrict(said.text, botUsername, cfg.display_name, !!said.replyToFromBot);
   }
 
@@ -220,6 +230,13 @@ export class TgRouterService {
     }
 
     if (cfg.addressing_mode === 'always') {
+      // Личка — разговор один на один: каждое сообщение — боту. Лимит против
+      // потока реплик в группе здесь только терял быстрые уточнения.
+      if (isPrivateConfig(cfg)) return true;
+      // Прямое обращение — сразу; лимит — только против потока реплик.
+      if (this.shouldRespondStrict(ctx.text, botUsername, cfg.display_name, !!ctx.replyToFromBot)) {
+        return true;
+      }
       if (cfg.last_reply_at) {
         const elapsed = Date.now() - new Date(cfg.last_reply_at).getTime();
         if (elapsed < 3000) return false;
@@ -228,15 +245,18 @@ export class TgRouterService {
     }
 
     if (cfg.addressing_mode === 'smart') {
+      // 1. Явное обращение (как в strict) — отвечаем сразу: ни лимита, ни гейта.
+      //    Раньше минутный лимит стоял первым и глушил «Финансист, а
+      //    подробнее?» сразу после ответа.
+      if (this.shouldRespondStrict(ctx.text, botUsername, cfg.display_name, !!ctx.replyToFromBot)) {
+        return true;
+      }
+      // 2. Сам вмешивается не чаще раза в минуту.
       if (cfg.last_reply_at) {
         const elapsed = Date.now() - new Date(cfg.last_reply_at).getTime();
         if (elapsed < 60_000) return false;
       }
-      // 1. Если триггер сработал явно (как в strict) — пускаем сразу, без гейта
-      if (this.shouldRespondStrict(ctx.text, botUsername, cfg.display_name, !!ctx.replyToFromBot)) {
-        return true;
-      }
-      // 2. Иначе — гейт через Haiku
+      // 3. Иначе — гейт через Haiku
       return await this.smartGate(cfg, ctx);
     }
 

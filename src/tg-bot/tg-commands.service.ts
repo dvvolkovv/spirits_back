@@ -145,8 +145,12 @@ export class TgCommandsService {
     const text = (msg.text || '').toLowerCase().trim();
     if (!text.startsWith('/')) return false;
 
-    // Strip @-suffix и аргументы: "/balance@LinkeonAgentBot arg" → "/balance"
-    const cmd = text.split('@')[0].split(' ')[0];
+    // Strip @-suffix и аргументы: "/balance@LinkeonAgentBot arg" → "/balance".
+    // Команда другому боту («/help@ДругойБот») — не наша: раньше на неё
+    // приходила наша справка.
+    const [cmd, addressee] = text.split(/\s/)[0].split('@');
+    const own = (process.env.TG_BOT_USERNAME || 'LinkeonAgentBot').toLowerCase();
+    if (addressee && addressee !== own) return false;
     const isOwner = await this.isOwner(cfg, msg.from.id);
 
     switch (cmd) {

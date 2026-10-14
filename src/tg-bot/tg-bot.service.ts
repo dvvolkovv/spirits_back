@@ -7,6 +7,8 @@ import { TgIdentityService, TgIdentityConflictError } from './tg-identity.servic
 import { TgClaimService } from './tg-claim.service';
 import { TgConfigService, TgBotConfigRow } from './tg-config.service';
 import { TgRouterService } from './tg-router.service';
+import { isPrivateConfig } from './tg-chat-kind';
+import { escapeHtml } from './tg-html';
 import { TgMeetingService } from './tg-meeting.service';
 import { TgVoiceService } from './tg-voice.service';
 import { TgBillingService } from './tg-billing.service';
@@ -426,10 +428,14 @@ export class TgBotService implements OnModuleInit {
       }
       const targetStatus = cmd === '/silent' ? 'silent' : 'active';
       const fromStatuses = cmd === '/silent' ? ['active'] : ['silent'];
+      // /silent — только группы: личка с ботом — разговор один на один, глушить
+      // её нечего (раньше замолкала и она, и бот переставал отвечать владельцу).
+      // /resume будит всё — в том числе лички, заглушённые той ошибкой.
+      const groupsOnly = cmd === '/silent' ? ' AND tg_chat_id < 0' : '';
       const r = await this.pg.query(
         `UPDATE tg_bot_configs SET status = $1
-          WHERE owner_user_id = $2 AND status = ANY($3::text[])
-          RETURNING id, display_name, tg_chat_title`,
+          WHERE owner_user_id = $2 AND status = ANY($3::text[])${groupsOnly}
+          RETURNING id, display_name, tg_chat_title, tg_chat_id`,
         [targetStatus, ownerId, fromStatuses],
       );
       if (r.rowCount === 0) {
@@ -441,7 +447,9 @@ export class TgBotService implements OnModuleInit {
         );
         return;
       }
-      const list = r.rows.map(b => `• *${b.display_name}* в «${b.tg_chat_title ?? 'группе'}»`).join('\n');
+      const list = r.rows
+        .map(b => isPrivateConfig(b) ? `• *${b.display_name}* в личке` : `• *${b.display_name}* в «${b.tg_chat_title ?? 'группе'}»`)
+        .join('\n');
       const verb = cmd === '/silent' ? '🤫 Замолкли' : '✅ Снова на связи';
       await this.grammy.sendMessage(
         msg.chat.id,
@@ -655,6 +663,13 @@ export class TgBotService implements OnModuleInit {
       // Ход не состоится, и сообщение в историю не попадёт — файл тоже не
       // должен остаться в папке чата (см. discardAttachments).
       this.discardAttachments(attachments);
+      // Владелец узнаёт о нуле сам — личкой, раз в сутки: в группах «по
+      // обращению» объяснение ниже получает лишь тот, кто позвал бота. В личке
+      // предупреждение и так придёт прямо здесь.
+      if (!isPrivateConfig(cfg)) {
+        const ownerTg = await this.identity.getIdentityByLinkeonId(cfg.owner_user_id);
+        await this.billing.notifyOwnerZeroBalance(cfg.owner_user_id, ownerTg?.tgUserId ?? null);
+      }
       // Объяснять, почему бот молчит, — только тому, кто его позвал. Раньше
       // предупреждение уходило на любое сообщение группы, в том числе в режиме
       // «по обращению» и у замолчанного /silent бота.
@@ -795,10 +810,12 @@ export class TgBotService implements OnModuleInit {
       // Ждём доставки: иначе эхо обгоняет статус «Думаю…» и встаёт под ним.
       if (actualIsVoice && workingText) {
         try {
+          // HTML с экранированием: в legacy-Markdown любой из _ * [ ` в
+          // расшифровке ронял сообщение, и эха просто не было.
           await this.grammy.sendMessage(
             msg.chat.id,
-            `🎙️ _«${workingText.slice(0, 1024)}»_`,
-            { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' },
+            `🎙️ <i>«${escapeHtml(workingText.slice(0, 1024))}»</i>`,
+            { reply_to_message_id: msg.message_id, parse_mode: 'HTML' },
           );
         } catch { /* эхо — подсказка, не повод ронять ход */ }
       }
@@ -972,6 +989,7 @@ export class TgBotService implements OnModuleInit {
       // При успешном списании > 0 — сбрасываем flag, чтобы при следующем падении в 0 снова срабатывало однократное сообщение
       if (newBalance > 0) {
         await this.billing.clearZeroBalanceFlag(cfg.id);
+        await this.billing.clearOwnerZeroBalanceDm(cfg.owner_user_id);
       }
       await this.router.persistAssistantReply(cfg, reply.text, contentType, tokensCharged);
       // Пишем разговор в тот же граф Neo4j, из которого читает веб-чат: без

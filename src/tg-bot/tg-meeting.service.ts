@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from './tg-grammy.client';
+import { escapeHtml } from './tg-html';
 import { MeetingService } from '../meeting/meeting.service';
 import { RoomService } from '../meeting/room.service';
 import { TalerIdRoomClient } from '../meeting/talerid-room.client';
@@ -228,6 +229,3 @@ export class TgMeetingService {
 }
 
 /** Название комнаты приходит от людей и уезжает в HTML-разметку Telegram. */
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
