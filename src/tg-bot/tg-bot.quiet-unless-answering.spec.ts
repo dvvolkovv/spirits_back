@@ -464,4 +464,19 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
     await (svc as any).handleChatMessage(groupMsg({ text: 'Финансист, ау' }), CFG);
     expect(zeroNotices(sent())).toEqual([]);
   });
+
+  it('сторож роста стоимости: ход TG-бота — пара «бот + чат», списанное и кто платит', async () => {
+    const { svc } = makeTurnBot({ transcript: 'Финансист, сколько у нас осталось?' });
+    const costGrowth = { recordTurn: jest.fn(async () => {}) };
+    (svc as any).costGrowth = costGrowth;
+    await (svc as any).handleChatMessage(groupMsg({ voice: true }), CFG);
+    await flush();
+    expect(costGrowth.recordTurn).toHaveBeenCalledTimes(1);
+    const [pair, turn, ctx] = costGrowth.recordTurn.mock.calls[0] as any[];
+    expect(pair).toEqual({ kind: 'tg', configId: 'cfg-quiet', chatId: '-100123', payerUserId: 'u-owner', botName: 'Финансист' });
+    expect(turn.tokens).toBe(36);
+    expect(turn.usd).toBeCloseTo(0.01, 4);
+    expect(turn.note).toContain('cost=$');
+    expect(await ctx.balance()).toBe(99964);
+  });
 });
