@@ -83,6 +83,25 @@ describe('город по названию на любом языке сайта
     expect(cambridge.every((c) => c.country === 'США')).toBe(true);
   });
 
+  it('код страны — целым словом прежде начала слова («CO» — не «Comunidad», «ES» — не «Estados Unidos»)', () => {
+    expect(foundName('Madrid, CO')).toBe('Мадрид, Колумбия');
+    expect(foundName('Madrid, ES')).toBe('Мадрид, Испания');
+    expect(foundName('Las Vegas, VE')).toBe('Las Vegas, Венесуэла');
+    expect(foundName('Mwanza, MW')).toBe('Mwanza, Малави');
+    for (const q of ['San Diego, ES', 'Los Angeles, ES']) {
+      const list = cities(found(q));
+      expect([q, list.length > 0]).toEqual([q, true]);
+      expect([q, list.filter((c) => c.country === 'США')]).toEqual([q, []]);
+    }
+  });
+
+  it('целого слова нет ни у кого — подсказка по началу слова, как раньше', () => {
+    expect(foundName('Chicago, IL')).toBe('Чикаго, США');
+    expect(foundName('Portland, Oreg')).toBe('Портленд, США');
+    const kirovsk = found('Кировск, Мурманская');
+    expect(kirovsk.kind === 'found' && kirovsk.city.region).toMatch(/^Мурманская/);
+  });
+
   it('страна кодом и обиходным сокращением', () => {
     expect(foundName('Chicago, USA')).toBe('Чикаго, США');
     const portland = found('Portland, Oregon, USA');

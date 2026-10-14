@@ -199,3 +199,37 @@ describe('общий указатель: места на всех языках �
     expect(resolveCity(world(), 'Vienna', undefined, pops, { places, ownKeys })).toMatchObject({ kind: 'found', cityId: 0 });
   });
 });
+
+describe('подсказка: сначала целым словом, потом началом слова', () => {
+  /** Мадрид в Испании (Comunidad de Madrid) и в Колумбии (CO). */
+  const MADRIDS: CityDb = {
+    v: 1,
+    zones: ['Europe/Madrid', 'America/Bogota'],
+    countries: { ES: 'Испания', CO: 'Колумбия' },
+    regions: ['Область Мадрид', 'Кундинамарка'],
+    cities: [
+      ['Мадрид', 'Madrid', 'ES', 0, 3255, 0],
+      ['Мадрид', 'Madrid', 'CO', 1, 80, 1],
+    ],
+  };
+  const idx = indexCities(MADRIDS);
+  const pops = MADRIDS.cities.map((c) => c[4]);
+  const places = ['область мадрид испания comunidad de madrid spain es', 'кундинамарка колумбия cundinamarca colombia co'];
+  const r = (q: string) => resolveCity(idx, q, undefined, pops, { places });
+
+  it('код страны целым словом — не начало чужого слова', () => {
+    expect(r('Madrid, CO')).toMatchObject({ kind: 'found', cityId: 1 });
+    expect(r('Madrid, ES')).toMatchObject({ kind: 'found', cityId: 0 });
+    expect(r('Madrid, comunidad')).toMatchObject({ kind: 'found', cityId: 0 });
+  });
+
+  it('целым словом не подходит никто — по началу слова', () => {
+    expect(r('Madrid, cundi')).toMatchObject({ kind: 'found', cityId: 1 });
+    expect(r('Madrid, comun')).toMatchObject({ kind: 'found', cityId: 0 });
+  });
+
+  it('без places — так же по русским подписям', () => {
+    expect(resolveCity(index, 'Кировск, Мурманская область')).toMatchObject({ kind: 'found', cityId: 5 });
+    expect(resolveCity(index, 'Кировск, Мурм')).toMatchObject({ kind: 'found', cityId: 5 });
+  });
+});
