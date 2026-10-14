@@ -33,7 +33,9 @@ function fakeRedis() {
 
 const CHAT: CostPair = { kind: 'chat', userId: 'u1', assistantId: '14' };
 const TG: CostPair = { kind: 'tg', configId: 'cfg-1', chatId: '-100123', payerUserId: 'u-owner', botName: 'Финансист' };
-const GROWING = [420, 610, 980, 1650, 2900];
+// Реальная серия жалобы 14.10.2026: списывали total_cost_usd всей сессии,
+// рост ×1,34 на пятом ходе — порог ×3 его не ловил, ×1,2/8 000 ловит.
+const GROWING = [11867, 12221, 15478, 15724, 15924];
 
 async function feed(svc: CostGrowthService, pair: CostPair, tokens: number[], balance?: number) {
   for (const t of tokens) {
@@ -53,15 +55,38 @@ describe('CostGrowthService', () => {
     expect(text).toContain('Стоимость растёт с каждым ответом');
     expect(text).toContain('<code>u1</code>');
     expect(text).toContain('ассистент 14');
-    expect(text).toContain('×6,9');
+    expect(text).toContain('×1,3');
     expect(text).toContain('Остаток:');
   });
 
   it('пауза: продолжение роста в те же сутки не будит второй раз', async () => {
     const redis = fakeRedis();
     const svc = new CostGrowthService(redis as any);
-    await feed(svc, CHAT, [...GROWING, 4000, 6000]);
+    await feed(svc, CHAT, [...GROWING, 20000, 30000]);
     expect(mockedAlert).toHaveBeenCalledTimes(1);
+  });
+
+  it('ключ и TTL паузы — ровно 24 часа по умолчанию', async () => {
+    const redis = fakeRedis();
+    const svc = new CostGrowthService(redis as any);
+    await feed(svc, CHAT, GROWING);
+    expect(redis.setNx).toHaveBeenCalledWith('cost-growth:alerted:chat:u1:14', expect.any(String), 86_400_000);
+  });
+
+  it('COST_GROWTH_COOLDOWN_H дробный — пауза округляется до целых мс', async () => {
+    const prevEnv = process.env.COST_GROWTH_COOLDOWN_H;
+    process.env.COST_GROWTH_COOLDOWN_H = '1.1';
+    try {
+      const redis = fakeRedis();
+      const svc = new CostGrowthService(redis as any);
+      await feed(svc, CHAT, GROWING);
+      const call = redis.setNx.mock.calls[0];
+      expect(call[2]).toBe(3_960_000);
+      expect(Number.isInteger(call[2])).toBe(true);
+    } finally {
+      if (prevEnv === undefined) delete process.env.COST_GROWTH_COOLDOWN_H;
+      else process.env.COST_GROWTH_COOLDOWN_H = prevEnv;
+    }
   });
 
   it('пары не мешают друг другу: свой счёт у каждого ассистента', async () => {
@@ -88,9 +113,16 @@ describe('CostGrowthService', () => {
   it('нулевой ход не записывается и серию не рвёт', async () => {
     const redis = fakeRedis();
     const svc = new CostGrowthService(redis as any);
-    await feed(svc, CHAT, [420, 610, 0, 980, 1650, 0, 2900]);
+    await feed(svc, CHAT, [11867, 12221, 0, 15478, 15724, 0, 15924]);
     expect(redis.lists.get(`cost-growth:turns:${pairKey(CHAT)}`)).toHaveLength(5);
     expect(mockedAlert).toHaveBeenCalledTimes(1);
+  });
+
+  it('ход без данных (undefined) — тихо, Redis не трогается', async () => {
+    const redis = fakeRedis();
+    const svc = new CostGrowthService(redis as any);
+    await expect(svc.recordTurn(CHAT, undefined as any)).resolves.toBeUndefined();
+    expect(redis.eval).not.toHaveBeenCalled();
   });
 
   it('TG-пара: ключ по боту и чату, в алерте — кто платит', async () => {
@@ -102,6 +134,17 @@ describe('CostGrowthService', () => {
     expect(text).toContain('TG-бот');
     expect(text).toContain('«Финансист»');
     expect(text).toContain('платит <code>u-owner</code>');
+  });
+
+  it('отказ callback баланса — алерт уходит без строки «Остаток»', async () => {
+    const redis = fakeRedis();
+    const svc = new CostGrowthService(redis as any);
+    const rejecting = { balance: async (): Promise<number> => { throw new Error('баланс недоступен'); } };
+    for (const t of GROWING) {
+      await svc.recordTurn(CHAT, { tokens: t, usd: t / 3600 }, rejecting);
+    }
+    expect(mockedAlert).toHaveBeenCalledTimes(1);
+    expect(String(mockedAlert.mock.calls[0][0])).not.toContain('Остаток');
   });
 
   it('сбой Redis не бросает и не будит', async () => {
@@ -126,14 +169,24 @@ describe('текст алерта', () => {
     const run = GROWING.map((t) => ({ tokens: t, usd: t / 3600, note: 'reported=$6.21 <x>' }));
     const text = formatCostGrowthAlert({ kind: 'tg', configId: 'c', chatId: '1', payerUserId: 'o', botName: 'A<b>' }, run, 41300);
     expect(text).toContain('📈 <b>Стоимость растёт с каждым ответом</b>');
-    expect(text).toContain('420 → 610 → 980 → 1');
-    expect(text).toContain('$0.12 → $0.17 → $0.27 → $0.46 → $0.81');
-    expect(text).toContain('×6,9');
+    expect(text.replace(/\s/g, '')).toContain('11867→12221→15478→15724→15924');
+    expect(text).toContain('$3.30 → $3.39 → $4.30 → $4.37 → $4.42');
+    expect(text).toContain('×1,3');
     expect(text).toContain('A&lt;b&gt;');
     expect(text).toContain('reported=$6.21 &lt;x&gt;');
   });
   it('без остатка — строки «Остаток» нет', () => {
     const run = GROWING.map((t) => ({ tokens: t, usd: t / 3600 }));
     expect(formatCostGrowthAlert(CHAT, run)).not.toContain('Остаток');
+  });
+  it('не-конечный usd в раскладе хода — «$?», без падения', () => {
+    const run = [...GROWING.slice(0, -1).map((t) => ({ tokens: t, usd: t / 3600 })), { tokens: GROWING[4], usd: NaN }];
+    expect(() => formatCostGrowthAlert(CHAT, run)).not.toThrow();
+    expect(formatCostGrowthAlert(CHAT, run)).toContain('$?');
+  });
+  it('необязательное имя ассистента — «ассистент 14 (Райя)»', () => {
+    const run = GROWING.map((t) => ({ tokens: t, usd: t / 3600 }));
+    const text = formatCostGrowthAlert({ kind: 'chat', userId: 'u1', assistantId: '14', assistantName: 'Райя' }, run);
+    expect(text).toContain('ассистент 14 (Райя)');
   });
 });
