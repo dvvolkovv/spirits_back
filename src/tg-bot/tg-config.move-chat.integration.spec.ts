@@ -53,7 +53,7 @@ maybe('переезд группы в супергруппу против жив
     );
     await client.query(`CREATE TEMP TABLE tg_bot_messages (id serial PRIMARY KEY, config_id text, tg_chat_id bigint NOT NULL)`);
     await client.query(
-      `CREATE TEMP TABLE tg_bot_video_jobs (job_id text PRIMARY KEY, tg_chat_id bigint NOT NULL, delivery_status text NOT NULL)`,
+      `CREATE TEMP TABLE tg_bot_video_jobs (job_id text PRIMARY KEY, tg_chat_id bigint NOT NULL, tg_reply_to_message_id bigint, delivery_status text NOT NULL)`,
     );
   });
 
@@ -73,7 +73,7 @@ maybe('переезд группы в супергруппу против жив
   it('конфиг, вся история чата (и прежнего бота) и ждущие видео — на новый id; доставленное и чужое — на месте', async () => {
     await client.query(`INSERT INTO tg_bot_configs VALUES ('cur', $1, 'active'), ('old', $1, 'archived'), ('other', $2, 'active')`, [OLD, ELSEWHERE]);
     await client.query(`INSERT INTO tg_bot_messages (config_id, tg_chat_id) VALUES ('cur', $1), ('old', $1), ('old', $1), ('other', $2)`, [OLD, ELSEWHERE]);
-    await client.query(`INSERT INTO tg_bot_video_jobs VALUES ('v-wait', $1, 'pending'), ('v-sent', $1, 'sent')`, [OLD]);
+    await client.query(`INSERT INTO tg_bot_video_jobs VALUES ('v-wait', $1, 77, 'pending'), ('v-sent', $1, 78, 'sent')`, [OLD]);
 
     await svc().moveToChat(OLD, NEW);
 
@@ -82,6 +82,10 @@ maybe('переезд группы в супергруппу против жив
     expect(await chatOf('tg_bot_messages', `config_id = 'other'`)).toEqual([ELSEWHERE]);
     expect(await chatOf('tg_bot_video_jobs', `job_id = 'v-wait'`)).toEqual([NEW]);
     expect(await chatOf('tg_bot_video_jobs', `job_id = 'v-sent'`)).toEqual([OLD]);
+    // В супергруппе нумерация сообщений своя: ответ на сообщение старой группы
+    // не найдётся (или прицепится к чужому) — видео уходит без ответа.
+    const reply = (await client.query(`SELECT tg_reply_to_message_id AS r FROM tg_bot_video_jobs WHERE job_id = 'v-wait'`)).rows[0].r;
+    expect(reply).toBeNull();
   });
 
   it('второе служебное сообщение (migrate_from после migrate_to) ничего не меняет', async () => {

@@ -99,32 +99,73 @@ const DM_CFG: any = { ...GROUP_CFG, id: 'cfg-dm', tg_chat_id: '42', addressing_m
 // ─── Язык ─────────────────────────────────────────────────────────────────────
 
 describe('язык: привязанному — профиль, клиент Telegram — только без аккаунта', () => {
-  it('ownerTgLanguage: есть аккаунт — язык клиента не смотрим (профиль пуст → русский)', async () => {
+  const PROFILE_WRITE = /UPDATE ai_profiles_consolidated[\s\S]*'language'[\s\S]*COALESCE\(profile_data->>'language', ''\) = ''/;
+  const profileWrites = (pg: { query: jest.Mock }) => pg.query.mock.calls.filter((c: any[]) => PROFILE_WRITE.test(String(c[0])));
+
+  it('профиль привязанного пуст (аккаунт из мини-аппа): язык клиента записывается в профиль один раз — как кабинет пишет язык браузера', async () => {
     const pg = pgSpeaking(null);
-    expect(await ownerTgLanguage(pg as any, 'u-1', 'es')).toBe('ru');
+    expect(await ownerTgLanguage(pg as any, 'u-1', 'es')).toBe('es');
+    expect(profileWrites(pg)).toHaveLength(1);
+    expect((profileWrites(pg)[0] as any[])[1]).toEqual(['u-1', 'es']);
   });
 
-  it('привязанный без языка в профиле, Telegram по-испански: /balance — по-русски, как и фоновые сообщения', async () => {
+  it('профиль задан — клиента не слушаем и в профиль ничего не пишем', async () => {
+    const pg = pgSpeaking('de');
+    expect(await ownerTgLanguage(pg as any, 'u-1', 'es')).toBe('de');
+    expect(profileWrites(pg)).toHaveLength(0);
+  });
+
+  it('клиент на языке, которого у нас нет, — в пустой профиль английский (как кабинет с uk/kk/be)', async () => {
+    const pg = pgSpeaking(null);
+    expect(await ownerTgLanguage(pg as any, 'u-1', 'it')).toBe('en');
+    expect((profileWrites(pg)[0] as any[])[1]).toEqual(['u-1', 'en']);
+  });
+
+  it('без языка клиента (фоновые сообщения, группа) — профиль не трогаем, язык по умолчанию', async () => {
+    const pg = pgSpeaking(null);
+    expect(await ownerTgLanguage(pg as any, 'u-1')).toBe('ru');
+    expect(profileWrites(pg)).toHaveLength(0);
+  });
+
+  it('привязанный без языка в профиле, Telegram по-испански: /balance — по-испански, и язык теперь в профиле', async () => {
+    const pg = pgSpeaking(null);
     const { svc, sent } = makeBot({
+      pg,
       identity: { getLinkeonIdByTgUserId: jest.fn(async () => 'u-1') },
       billing: { getBalance: jest.fn(async () => 5) },
     });
     await (svc as any).handleMessage({ chat: { id: 42, type: 'private' }, from: { id: 42, language_code: 'es' }, text: '/balance' });
-    expect(sent()[0]).toBe(tgText('ru', 'balance', { balance: '5' }));
+    expect(sent()[0]).toBe(tgText('es', 'balance', { balance: '5' }));
+    expect(profileWrites(pg)).toHaveLength(1);
   });
 
-  it('ход в личке: профиль пуст, клиент es — «Думаю…» по-русски', async () => {
+  it('ход в личке: профиль пуст, клиент es — «Думаю…» по-испански (пишет сам владелец)', async () => {
     const d = turnDeps();
-    const { svc, sent } = makeBot({ ...d });
-    await (svc as any).handleChatMessage({ chat: { id: 42, type: 'private' }, from: { id: 42, language_code: 'es' }, message_id: 1, text: 'привет' }, DM_CFG);
-    expect(sent()).toContain(tgText('ru', 'thinking'));
+    const pg = pgSpeaking(null);
+    const { svc, sent } = makeBot({ ...d, pg });
+    await (svc as any).handleChatMessage({ chat: { id: 42, type: 'private' }, from: { id: 42, language_code: 'es' }, message_id: 1, text: 'hola' }, DM_CFG);
+    expect(sent()).toContain(tgText('es', 'thinking'));
   });
 
-  it('группа: профиль пуст, участник с fr — по-русски', async () => {
+  it('группа: профиль пуст, участник с fr — по-русски, и в профиль владельца чужой язык не пишется', async () => {
     const d = turnDeps();
-    const { svc, sent } = makeBot({ ...d });
+    const pg = pgSpeaking(null);
+    const { svc, sent } = makeBot({ ...d, pg });
     await (svc as any).handleChatMessage({ chat: { id: -100123, type: 'supergroup' }, from: { id: 7, language_code: 'fr' }, message_id: 1, text: 'Финансист, привет' }, GROUP_CFG);
     expect(sent()).toContain(tgText('ru', 'thinking'));
+    expect(profileWrites(pg)).toHaveLength(0);
+  });
+
+  it('привязка по ссылке не удалась у уже привязанного — на языке его профиля, а не клиента', async () => {
+    const { svc, sent } = makeBot({
+      pg: pgSpeaking('de'),
+      identity: {
+        consumeAuthToken: jest.fn(async () => { throw new Error('invalid or expired auth token'); }),
+        getLinkeonIdByTgUserId: jest.fn(async () => 'u-1'),
+      },
+    });
+    await (svc as any).handleMessage({ chat: { id: 42, type: 'private' }, from: { id: 42, language_code: 'en' }, text: '/start tok' });
+    expect(sent()[0]).toBe(tgText('de', 'bind_failed'));
   });
 
   it('реплика группы, на которую бот не отвечает, — язык из базы не читается', async () => {
@@ -197,6 +238,16 @@ describe('причины ошибок — своими словами на яз�
     expect(sent()).toEqual([tgText('en', 'attach_failed')]);
   });
 
+  it.each([
+    ['не хватает токенов', Object.assign(new Error('Недостаточно токенов'), { code: 'INSUFFICIENT_TOKENS' }), 'attach_no_tokens'],
+    ['ссылка не принята', Object.assign(new Error('ссылка не принята: адрес ведёт во внутреннюю сеть'), { code: 'UNSAFE_URL' }), 'attach_bad_link'],
+  ] as const)('вложение: %s — своими словами на языке владельца', async (_why, err, key) => {
+    const { svc, sent } = makeBot({ pg: pgSpeaking('en') });
+    jest.spyOn(svc as any, 'dispatchOutgoingMarker').mockRejectedValue(err);
+    await (svc as any).deliverOutgoingMarkers(GROUP_CFG, { chat: { id: -100123 }, from: { id: 7 }, message_id: 1 }, [{ kind: 'image', value: 'x' }], 'en');
+    expect(sent()).toEqual([tgText('en', key)]);
+  });
+
   it('привязка Telegram не удалась — без сырой причины', () => {
     const text = TgBotService.bindFailureMessage(new Error('invalid or expired auth token'), { id: 1 }, 'de');
     expect(text).toBe(tgText('de', 'bind_failed'));
@@ -215,20 +266,21 @@ describe('причины ошибок — своими словами на яз�
 // ─── Ссылки ───────────────────────────────────────────────────────────────────
 
 describe('ссылки: новая гасит старые; к группе подключается только неподключённый бот', () => {
-  it('reissueClaim сначала гасит прежние ссылки этого бота, потом выдаёт новую', async () => {
+  // Ссылки на группу прежние не гасим (ревью 14.10): пользы нет — бота по
+  // второй ссылке и так не перенести (только pending и только владелец), а
+  // честно открытая минуту назад ссылка становилась «просроченной».
+  it('reissueClaim переводит в pending только pending/archived — атомарно, без гонки с привязкой', async () => {
     const pg = { query: jest.fn(async (sql: string) => {
       if (/SELECT \* FROM tg_bot_configs WHERE id/.test(sql)) return { rows: [{ id: 'c1', status: 'pending' }] };
-      if (/RETURNING \*/.test(sql)) return { rows: [{ id: 'c1', status: 'pending' }] };
-      if (/INSERT INTO tg_claim_tokens/.test(sql)) return { rows: [{ token: 'new-tok' }] };
-      return { rows: [], rowCount: 2 };
+      if (/RETURNING \*/.test(sql)) return { rows: [], rowCount: 0 };
+      return { rows: [{ token: 't' }] };
     }) };
     const svc = new TgConfigService(pg as any, {} as any);
-    await svc.reissueClaim('c1', 'u-1');
-    const sqls = pg.query.mock.calls.map((c: any[]) => String(c[0]));
-    const revoke = sqls.findIndex((q) => /UPDATE tg_claim_tokens SET consumed_at = now\(\)[\s\S]*config_id = \$1[\s\S]*kind = 'claim'[\s\S]*consumed_at IS NULL/.test(q));
-    const insert = sqls.findIndex((q) => /INSERT INTO tg_claim_tokens/.test(q));
-    expect(revoke).toBeGreaterThanOrEqual(0);
-    expect(revoke).toBeLessThan(insert);
+    await expect(svc.reissueClaim('c1', 'u-1')).rejects.toThrow();
+    const upd = pg.query.mock.calls.map((c: any[]) => String(c[0])).find((q) => /RETURNING \*/.test(q)) ?? '';
+    expect(upd).toMatch(/WHERE id = \$1 AND status IN \('pending', ?'archived'\)/);
+    expect(pg.query.mock.calls.some((c: any[]) => /INSERT INTO tg_claim_tokens/.test(String(c[0])))).toBe(false);
+    expect(pg.query.mock.calls.some((c: any[]) => /UPDATE tg_claim_tokens/.test(String(c[0])))).toBe(false);
   });
 
   it('createAuthToken гасит прежние ссылки привязки владельца — утёкшая старая ссылка больше не работает', async () => {
@@ -240,10 +292,12 @@ describe('ссылки: новая гасит старые; к группе по
     expect(sqls[1]).toMatch(/INSERT INTO tg_claim_tokens/);
   });
 
-  function makeClaim(o: { token?: any; owner?: number | null; conflict?: boolean }) {
+  function makeClaim(o: { token?: any; owner?: number | null; conflict?: boolean; conflictOwner?: string; tokenTaken?: boolean; configTaken?: boolean }) {
     const pg = { query: jest.fn(async (sql: string) => {
       if (/FROM tg_claim_tokens t/.test(sql)) return { rows: o.token ? [o.token] : [] };
-      if (/id != \$2/.test(sql)) return { rows: o.conflict ? [{ id: 'other' }] : [] };
+      if (/id != \$2/.test(sql)) return { rows: o.conflict ? [{ id: 'other', owner_user_id: o.conflictOwner ?? 'u-stranger' }] : [] };
+      if (/UPDATE tg_claim_tokens/.test(sql)) return o.tokenTaken ? { rows: [], rowCount: 0 } : { rows: [{ token: 'tok' }], rowCount: 1 };
+      if (/UPDATE tg_bot_configs/.test(sql)) return o.configTaken ? { rows: [], rowCount: 0 } : { rows: [{ id: 'c1' }], rowCount: 1 };
       return { rows: [] };
     }) };
     const identity = { getIdentityByLinkeonId: jest.fn(async () => (o.owner === null ? null : { tgUserId: o.owner ?? 7 })) };
@@ -256,9 +310,25 @@ describe('ссылки: новая гасит старые; к группе по
     ['wrong_account', { token: TOKEN, owner: 8 }],
     ['group_taken', { token: TOKEN, conflict: true }],
     ['already_connected', { token: { ...TOKEN, status: 'active' } }],
+    ['already_connected', { token: { ...TOKEN, status: 'silent' } }],
+    ['expired', { token: { ...TOKEN, status: 'archived' } }],
+    ['expired', { token: { ...TOKEN, status: null } }],
+    ['own_bot_here', { token: TOKEN, conflict: true, conflictOwner: 'u-1' }],
+    ['expired', { token: TOKEN, tokenTaken: true }],
+    ['already_connected', { token: TOKEN, configTaken: true }],
   ] as const)('claim: отказ «%s» несёт код причины', async (failure, o) => {
     const { svc } = makeClaim(o as any);
     await expect(svc.claim('tok', 7, -100, 'T')).rejects.toMatchObject({ claimFailure: failure });
+  });
+
+  it('claim: ссылка гасится атомарно ДО активации, конфиг — только из pending', async () => {
+    const { svc, pg } = makeClaim({ token: TOKEN });
+    await svc.claim('tok', 7, -100, 'T');
+    const sqls = pg.query.mock.calls.map((c: any[]) => String(c[0]));
+    const consume = sqls.findIndex((q) => /UPDATE tg_claim_tokens SET consumed_at = now\(\)[\s\S]*consumed_at IS NULL/.test(q));
+    const activate = sqls.findIndex((q) => /UPDATE tg_bot_configs SET tg_chat_id[\s\S]*AND status = 'pending'/.test(q));
+    expect(consume).toBeGreaterThanOrEqual(0);
+    expect(activate).toBeGreaterThan(consume);
   });
 
   it('claim: бот уже подключён к другой группе — его не переносит (раньше — молча утаскивало)', async () => {
@@ -285,6 +355,15 @@ describe('группа: голый /start, меню, переезд', () => {
     const { svc, grammy } = makeCommands();
     expect(await svc.tryHandle(CFG, groupMsg('/start'))).toBe(true);
     expect(grammy.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('голый /start в группе — молчим ещё до проверки баланса и замка: ни «токены кончились», ни «Минутку»', async () => {
+    const { svc } = makeBot();
+    const chat = jest.spyOn(svc as any, 'handleChatMessage').mockResolvedValue(undefined);
+    await (svc as any).handleMessage({ chat: { id: -100, type: 'supergroup' }, from: { id: 2 }, message_id: 3, text: '/start' });
+    expect(chat).not.toHaveBeenCalled();
+    await (svc as any).handleMessage({ chat: { id: -100, type: 'supergroup' }, from: { id: 2 }, message_id: 4, text: '/start@LinkeonAgentBot' });
+    expect(chat).toHaveBeenCalledTimes(1);
   });
 
   it('наш /start@бот без кода — справка (контроль)', async () => {
@@ -318,7 +397,7 @@ describe('группа: голый /start, меню, переезд', () => {
     expect(sql).toMatch(/UPDATE tg_bot_configs SET tg_chat_id = \$2[\s\S]*WHERE tg_chat_id = \$1 AND status IN \('active','silent'\)/);
     expect(sql).toMatch(/UPDATE tg_bot_messages SET tg_chat_id = \$2\s+WHERE tg_chat_id = \$1 AND EXISTS/);
     expect(sql).not.toMatch(/config_id = \$3/);
-    expect(sql).toMatch(/UPDATE tg_bot_video_jobs SET tg_chat_id = \$2[\s\S]*delivery_status = 'pending'/);
+    expect(sql).toMatch(/UPDATE tg_bot_video_jobs SET tg_chat_id = \$2, tg_reply_to_message_id = NULL[\s\S]*delivery_status = 'pending'/);
   });
 });
 
@@ -333,6 +412,14 @@ describe('мелочи ревью', () => {
     expect(commands.handleAssistants).toHaveBeenCalledWith(expect.anything(), 'u-1', 1);
   });
 
+  it('листание: «query is too old» на ответе нажатию не мешает показать страницу', async () => {
+    const commands = { handleAssistants: jest.fn(async () => {}) };
+    const { svc, grammy } = makeBot({ commands, identity: { getLinkeonIdByTgUserId: jest.fn(async () => 'u-1') } });
+    grammy.answerCallbackQuery.mockRejectedValueOnce(new Error('query is too old'));
+    await (svc as any).handleCallbackQuery({ id: 'cb-1', data: 'agents_page:2', from: { id: 42 }, message: { chat: { id: 42 } } });
+    expect(commands.handleAssistants).toHaveBeenCalledWith(expect.anything(), 'u-1', 2);
+  });
+
   it('приглашение на встречу: точка — из каталога, по-китайски «。»', async () => {
     const grammy = { sendMessage: jest.fn(async () => ({})) };
     const pg = pgSpeaking('zh', (sql) => (/FROM ai_profiles_consolidated p/.test(sql) ? { rows: [] } : { rows: [] }));
@@ -344,5 +431,35 @@ describe('мелочи ревью', () => {
     expect(text.endsWith(tgText('zh', 'meeting_who'))).toBe(true);
     expect(tgText('zh', 'meeting_who').endsWith('。')).toBe(true);
     expect(text).not.toMatch(/\.$/);
+  });
+});
+
+describe('картинка без токенов — ошибка с кодом, а не только с русским текстом', () => {
+  const OLD_KEY = process.env.GOOGLE_AI_API_KEY;
+  beforeAll(() => { process.env.GOOGLE_AI_API_KEY = 'test-key'; });
+  afterAll(() => {
+    if (OLD_KEY === undefined) delete process.env.GOOGLE_AI_API_KEY;
+    else process.env.GOOGLE_AI_API_KEY = OLD_KEY;
+  });
+
+  it('generateImage: на балансе мало — INSUFFICIENT_TOKENS (текст прежний: его сравнивают в продуктах)', async () => {
+    const { MiscService } = require('../misc/misc.service');
+    const pg = { query: jest.fn(async () => ({ rows: [{ tokens: 0 }] })) };
+    const svc = new MiscService({} as any, pg as any, {} as any, {} as any);
+    await expect(svc.generateImage('u-1', { prompt: 'кот' })).rejects.toMatchObject({
+      code: 'INSUFFICIENT_TOKENS',
+      message: 'Недостаточно токенов',
+    });
+  });
+});
+
+describe('видео: ответ на исчезнувшее сообщение не мешает доставке', () => {
+  it('уведомление уходит с allow_sending_without_reply — сообщение могли удалить за 1–3 минуты генерации', async () => {
+    const { TgVideoDispatchService } = require('./tg-video-dispatch.service');
+    const grammy = { sendMessage: jest.fn(async () => ({})), sendChatAction: jest.fn(async () => {}) };
+    const svc = new TgVideoDispatchService(pgSpeaking('ru') as any, grammy as any);
+    (svc as any).logger = quiet;
+    await (svc as any).deliver({ job_id: 'j', tg_chat_id: '-100', tg_reply_to_message_id: 5, status: 'failed', video_url: null, owner_user_id: 'u-1' });
+    expect((grammy.sendMessage.mock.calls[0] as any[])[2]).toEqual({ reply_parameters: { message_id: 5, allow_sending_without_reply: true } });
   });
 });
