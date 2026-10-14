@@ -4,9 +4,10 @@ import cors from "cors";
 import { randomUUID } from "crypto";
 import fs from "fs";
 import path from "path";
-import { spawn, execSync } from "child_process";
+import { spawn } from "child_process";
 import { sessionFsKey, uploadFileName, fallbackFileName } from "./paths.mjs";
 import { eventCallContext, tailDialogue } from "./session-tail.mjs";
+import { RUN_ENV, runTag, finishedRun, reap } from "./proc-reaper.mjs";
 
 const app = express();
 const PORT = 3033;
@@ -242,6 +243,28 @@ function extractTailDialogue(claudeSid, maxMsgs = 60, maxCharsPerMsg = 2000) {
 // Common case: backend hits its 15-min hard-timeout, user retries from the
 // app, backend dispatches again — without dedup we'd get N parallel claudes.
 const activeChildren = new Map();
+
+// Метки ходов, чей claude ещё жив. Всё, что несёт метку окончившегося хода,
+// гасится: сразу при выходе claude и обходом раз в 5 минут — он подбирает
+// оставшееся от прошлого экземпляра релея (pm2 restart убивает claude, но не
+// его оторванных потомков). Зачем и как — relay-agent/proc-reaper.mjs.
+const liveRuns = new Set();
+
+function logReaped(victims) {
+  if (victims.length === 0) return;
+  const byName = {};
+  for (const v of victims) byName[v.comm || "?"] = (byName[v.comm || "?"] || 0) + 1;
+  const summary = Object.entries(byName).map(([name, n]) => (n > 1 ? name + "×" + n : name)).join(", ");
+  console.log("уборка после claude: погашено " + victims.length + " (" + summary + ")");
+}
+
+function endRun(tag) {
+  if (!liveRuns.delete(tag)) return;
+  reap((t) => t === tag).then(logReaped, () => {});
+}
+
+const sweepRuns = () => reap(finishedRun(liveRuns)).then(logReaped, () => {});
+setInterval(sweepRuns, 5 * 60 * 1000).unref();
 
 // ── Agent-direct TalerID (notes + messages) ──────────────────────────────────
 // Enabled per-request only when the backend passes a per-user TalerID access
@@ -639,11 +662,23 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         try { prev.child.kill("SIGKILL"); } catch {}
       }
 
+      const tag = runTag(randomUUID());
+      liveRuns.add(tag);
       const child = spawn("claude", runArgs, {
         cwd: "/tmp",
         stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env, MCP_TIMEOUT: "120000", MCP_TOOL_TIMEOUT: "600000", PATH: process.env.PATH + ":/home/dv/agent-env/bin:/home/dv/.bun/bin" },
+        env: {
+          ...process.env, MCP_TIMEOUT: "120000", MCP_TOOL_TIMEOUT: "600000", PATH: process.env.PATH + ":/home/dv/agent-env/bin:/home/dv/.bun/bin",
+          // OpenMP по умолчанию берёт по потоку на ядро. 14.10.2026 модель
+          // пустила tesseract в 4 параллельных копии — вышло 16 потоков на 4
+          // ядрах, и страница распознавалась 3–9 минут.
+          OMP_THREAD_LIMIT: "1",
+          [RUN_ENV]: tag,
+        },
       });
+      // exit, а не close: close ждёт, пока закроются все копии stdout, и
+      // потомок, унаследовавший его, задержал бы и уборку, и ответ.
+      child.on("exit", () => endRun(tag));
       activeChildren.set(sessionId, {
         child,
         preempt: () => notice(
@@ -770,13 +805,14 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
 
       child.on("close", () => {
         if (buf.trim()) { try { handleEvent(JSON.parse(buf)); } catch {} }
-        try { execSync("pkill -f 'bun.*server.ts' --newer " + child.pid + " 2>/dev/null || true"); } catch {}
         const cur = activeChildren.get(sessionId);
         if (cur && cur.child === child) activeChildren.delete(sessionId);
         resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit });
       });
 
       child.on("error", (err) => {
+        // Если claude не запустился, exit не придёт — метку снимаем здесь.
+        endRun(tag);
         // Network/spawn errors are transient too
         if (TRANSIENT_RE.test(err.message || '')) {
           resolve({ imageLimitHit: false, transientHit: true, maxTurnsHit: false, staleResumeHit: false });
@@ -978,4 +1014,5 @@ app.get("/health", (req, res) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Agent API on http://0.0.0.0:" + PORT);
+  sweepRuns();
 });
