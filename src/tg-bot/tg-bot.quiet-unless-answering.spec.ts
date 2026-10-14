@@ -466,7 +466,7 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
   });
 
   it('сторож роста стоимости: ход TG-бота — пара «бот + чат», списанное и кто платит', async () => {
-    const { svc } = makeTurnBot({ transcript: 'Финансист, сколько у нас осталось?' });
+    const { svc, billing } = makeTurnBot({ transcript: 'Финансист, сколько у нас осталось?' });
     const costGrowth = { recordTurn: jest.fn(async () => {}) };
     (svc as any).costGrowth = costGrowth;
     await (svc as any).handleChatMessage(groupMsg({ voice: true }), CFG);
@@ -474,9 +474,23 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
     expect(costGrowth.recordTurn).toHaveBeenCalledTimes(1);
     const [pair, turn, ctx] = costGrowth.recordTurn.mock.calls[0] as any[];
     expect(pair).toEqual({ kind: 'tg', configId: 'cfg-quiet', chatId: '-100123', payerUserId: 'u-owner', botName: 'Финансист' });
+    // Ровно то, что списали у владельца, а не просто число из заглушки.
+    expect(billing.deduct).toHaveBeenCalledTimes(1);
+    expect(turn.tokens).toBe((billing.deduct.mock.calls[0] as any[])[1]);
     expect(turn.tokens).toBe(36);
     expect(turn.usd).toBeCloseTo(0.01, 4);
     expect(turn.note).toContain('cost=$');
     expect(await ctx.balance()).toBe(99964);
+  });
+
+  it('сторож роста стоимости: бот не отвечает — хода нет, списания нет, сторожа нет', async () => {
+    const { svc, router, billing } = makeTurnBot({ transcript: 'встречаемся в восемь у входа' });
+    const costGrowth = { recordTurn: jest.fn(async () => {}) };
+    (svc as any).costGrowth = costGrowth;
+    await (svc as any).handleChatMessage(groupMsg({ voice: true }), CFG);
+    await flush();
+    expect(router.generateReply).not.toHaveBeenCalled();
+    expect(billing.deduct).not.toHaveBeenCalled();
+    expect(costGrowth.recordTurn).not.toHaveBeenCalled();
   });
 });

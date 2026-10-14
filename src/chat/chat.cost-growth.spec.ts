@@ -13,8 +13,9 @@ jest.mock('../common/telegram-alert', () => ({ sendTelegramAlert: jest.fn(async 
  *
  * 14.10.2026 каждый следующий ответ длинной сессии стоил дороже предыдущего, и
  * ни один алерт этого не видел. Сторож смотрит на СПИСАННОЕ — поэтому здесь
- * проверяется, что в него уходит ровно то число, что легло в списание, а не
- * «какая-то» стоимость хода.
+ * проверяется, что в него уходит ровно то число, что легло в списание, и
+ * только когда списание действительно записано: пустой ответ, оборванный ход
+ * и сбой записи истории до строки списания не доходят — значит, и до сторожа.
  *
  * Ожидания выводятся из курса SEAT_TOKENS_PER_USD, а не зашиты числами: смена
  * курса не должна красить тест, ничего не сказав о проводке.
@@ -39,11 +40,18 @@ function sseStream(events: any[]): Readable {
   return s;
 }
 
-function makeService(costGrowth: { recordTurn: jest.Mock }) {
+/** Строка ответа ассистента в истории — у неё, в отличие от строки человека, есть tokens_used. */
+const isAiHistoryInsert = (sql: string) => /INSERT INTO custom_chat_history/.test(sql) && /tokens_used/.test(sql);
+
+function makeService(
+  costGrowth: { recordTurn: jest.Mock },
+  o: { failAiHistory?: boolean; neo4j?: any } = {},
+) {
   const calls: { sql: string; params: any[] }[] = [];
   const pg = {
     query: jest.fn(async (sql: string, params: any[] = []) => {
       calls.push({ sql, params });
+      if (o.failAiHistory && isAiHistoryInsert(sql)) throw new Error('connection terminated');
       if (/FROM speech_clips|FROM video_jobs|FROM calendar_proposals/.test(sql)) return { rows: [] };
       if (/AS spent/.test(sql)) return { rows: [{ spent: 0 }] };
       if (/SELECT tokens FROM ai_profiles_consolidated/.test(sql)) return { rows: [{ tokens: BALANCE }] };
@@ -52,7 +60,7 @@ function makeService(costGrowth: { recordTurn: jest.Mock }) {
   };
   const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
   const svc = new ChatService(
-    pg as any, null as any, null as any, null as any,
+    pg as any, (o.neo4j ?? null) as any, null as any, null as any,
     null as any, language as any, undefined, undefined, undefined, undefined,
   );
   // Сторож — последний @Optional-параметр; спеки собирают сервис позиционно,
@@ -61,9 +69,13 @@ function makeService(costGrowth: { recordTurn: jest.Mock }) {
   return { svc, calls };
 }
 
-/** Обычный ход чата целиком: релей отдаёт поток, сервис его сохраняет и списывает. */
-async function runTurn(svc: ChatService, events: any[]) {
-  (axios.post as jest.Mock).mockResolvedValueOnce({ data: sseStream(events) });
+/**
+ * Обычный ход чата целиком: релей отдаёт поток, сервис его сохраняет и списывает.
+ * Каждый массив событий — один вызов релея: пустой поток сервис повторяет
+ * один раз (self-heal), и второму вызову тоже нужен свой поток.
+ */
+async function runTurn(svc: ChatService, ...runs: any[][]) {
+  for (const events of runs) (axios.post as jest.Mock).mockResolvedValueOnce({ data: sseStream(events) });
   const res: any = { status: jest.fn(), setHeader: jest.fn(), write: jest.fn(() => true), end: jest.fn() };
   await (svc as any).streamUniversalAgent(
     'u1', 'привет', '7', '7', [], '', res, 'Роман', '', '', undefined, false, undefined,
@@ -75,10 +87,10 @@ async function runTurn(svc: ChatService, events: any[]) {
 const billingRow = (calls: { sql: string; params: any[] }[]) =>
   calls.find((c) => /INSERT INTO token_consumption_tasks/.test(c.sql));
 
-describe('сторож роста стоимости: веб-чат', () => {
+describe('сторож роста стоимости: веб-чат, обычный ход', () => {
   afterEach(() => jest.clearAllMocks());
 
-  it('обычный ход: пара «юзер + ассистент», списанные токены, стоимость и расклад', async () => {
+  it('пара «юзер + ассистент», списанные токены, стоимость и расклад', async () => {
     const costGrowth = { recordTurn: jest.fn(async () => {}) };
     const { svc, calls } = makeService(costGrowth);
 
@@ -100,12 +112,7 @@ describe('сторож роста стоимости: веб-чат', () => {
     expect(await ctx.balance()).toBe(BALANCE);
   });
 
-  it('оборванный ход: в сторож уходит с нулём — сам сторож такой ход не пишет', async () => {
-    // Точка вызова передаёт ход как есть (списано 0, стоимость 0), а отбрасывает
-    // его CostGrowthService.recordTurn: ход ≤ 0 токенов в историю не попадает
-    // (cost-growth.service.spec.ts). Если фильтр переедет в точку вызова — здесь
-    // станет not.toHaveBeenCalled(). Главное — ни при каком раскладе не
-    // charge.tokens: невыставленный ход не должен дорожать в глазах сторожа.
+  it('оборванный ход не выставлен — и в сторож не попадает', async () => {
     const costGrowth = { recordTurn: jest.fn(async () => {}) };
     const { svc, calls } = makeService(costGrowth);
 
@@ -116,28 +123,69 @@ describe('сторож роста стоимости: веб-чат', () => {
     ]);
 
     expect(billingRow(calls)).toBeUndefined();
-    expect(costGrowth.recordTurn.mock.calls.map((c: any[]) => c[1].tokens)).toEqual([0]);
-    expect(costGrowth.recordTurn.mock.calls.map((c: any[]) => c[1].usd)).toEqual([0]);
+    expect(costGrowth.recordTurn).not.toHaveBeenCalled();
   });
 
-  it('сторож завис — ход всё равно сохранён и списан: его не ждут', async () => {
-    const costGrowth = { recordTurn: jest.fn(() => new Promise<void>(() => {})) };
+  it('пустой ответ: usage пришёл, но списания нет — и сторожа тоже', async () => {
+    // Ни одного delta: в историю ляжет заглушка «Ответ не пришёл», а
+    // computeSdkCharge по usage насчитает ненулевую цену. Списания при этом
+    // нет (пустой ответ не тарифицируется) — значит, нет и хода для сторожа.
+    // Два прогона: пустой поток сервис повторяет один раз (self-heal).
+    const costGrowth = { recordTurn: jest.fn(async () => {}) };
     const { svc, calls } = makeService(costGrowth);
+
+    await runTurn(
+      svc,
+      [{ type: 'done', usage: USAGE_HALF_DOLLAR }],
+      [{ type: 'done', usage: USAGE_HALF_DOLLAR }],
+    );
+
+    expect(billingRow(calls)).toBeUndefined();
+    expect(costGrowth.recordTurn).not.toHaveBeenCalled();
+  });
+
+  it('запись ответа в историю упала — списания нет, сторожа тоже', async () => {
+    const costGrowth = { recordTurn: jest.fn(async () => {}) };
+    const { svc, calls } = makeService(costGrowth, { failAiHistory: true });
+
+    await runTurn(svc, [{ type: 'delta', text: 'ответ' }, { type: 'done', costUsd: 0.5 }]);
+
+    // Проверка ломается в обе стороны: запись ответа действительно пробовали.
+    expect(calls.some((c) => isAiHistoryInsert(c.sql))).toBe(true);
+    expect(billingRow(calls)).toBeUndefined();
+    expect(costGrowth.recordTurn).not.toHaveBeenCalled();
+  });
+
+  it('сторож завис — ход всё равно списан и доведён до конца: его не ждут', async () => {
+    // Обучение профиля идёт в персисте ПОСЛЕ сторожа: дошло до него — значит,
+    // зависший сторож ход не держит.
+    const costGrowth = { recordTurn: jest.fn(() => new Promise<void>(() => {})) };
+    const neo4j = { consolidateFromChat: jest.fn(async () => {}) };
+    const { svc, calls } = makeService(costGrowth, { neo4j });
 
     await runTurn(svc, [{ type: 'delta', text: 'ответ' }, { type: 'done', costUsd: 0.5 }]);
 
     expect(costGrowth.recordTurn).toHaveBeenCalledTimes(1);
     expect(billingRow(calls)).toBeDefined();
+    expect(neo4j.consolidateFromChat).toHaveBeenCalledTimes(1);
   });
+});
 
-  it('ход с файлами (persistUploadTurn): пара «юзер + ассистент» и списанное', async () => {
+describe('сторож роста стоимости: веб-чат, ход с файлами (persistUploadTurn)', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  const upload = (svc: ChatService, extra: Record<string, unknown> = {}) =>
+    svc.persistUploadTurn({
+      userId: 'u1', assistantId: '12', userMsg: '📎 scan.jpg\nпереведи', assistantMsg: 'Перевод готов.',
+      usage: USAGE_HALF_DOLLAR, costUsd: 0.5, durationMs: 1000,
+      ...extra,
+    });
+
+  it('пара «юзер + ассистент» и списанное', async () => {
     const costGrowth = { recordTurn: jest.fn(async () => {}) };
     const { svc, calls } = makeService(costGrowth);
 
-    const charged = await svc.persistUploadTurn({
-      userId: 'u1', assistantId: '12', userMsg: '📎 scan.jpg\nпереведи', assistantMsg: 'Перевод готов.',
-      usage: USAGE_HALF_DOLLAR, costUsd: 0.5, durationMs: 1000,
-    });
+    const charged = await upload(svc);
 
     expect(costGrowth.recordTurn).toHaveBeenCalledTimes(1);
     const [pair, turn, ctx] = costGrowth.recordTurn.mock.calls[0] as any[];
@@ -150,5 +198,25 @@ describe('сторож роста стоимости: веб-чат', () => {
     expect(turn.usd).toBeCloseTo(0.5, 6);
     expect(typeof turn.note).toBe('string');
     expect(await ctx.balance()).toBe(BALANCE);
+  });
+
+  it('прерванный ход не выставлен — и в сторож не попадает', async () => {
+    const costGrowth = { recordTurn: jest.fn(async () => {}) };
+    const { svc, calls } = makeService(costGrowth);
+
+    await upload(svc, { turnFailed: true, failReason: 'interrupted' });
+
+    expect(billingRow(calls)).toBeUndefined();
+    expect(costGrowth.recordTurn).not.toHaveBeenCalled();
+  });
+
+  it('запись истории упала — списания нет, сторожа тоже', async () => {
+    const costGrowth = { recordTurn: jest.fn(async () => {}) };
+    const { svc, calls } = makeService(costGrowth, { failAiHistory: true });
+
+    await expect(upload(svc)).rejects.toThrow('connection terminated');
+
+    expect(billingRow(calls)).toBeUndefined();
+    expect(costGrowth.recordTurn).not.toHaveBeenCalled();
   });
 });
