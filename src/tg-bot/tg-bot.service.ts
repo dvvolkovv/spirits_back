@@ -9,6 +9,8 @@ import { TgConfigService, TgBotConfigRow } from './tg-config.service';
 import { TgRouterService, isForeignBotCommand } from './tg-router.service';
 import { isPrivateConfig } from './tg-chat-kind';
 import { escapeHtml } from './tg-html';
+import { tgText, formatTgNumber, ownerTgLanguage, linkedTgLanguage, pickTgLanguage, TgLang, TgTextKey } from './tg-i18n';
+import { TgClaimFailure } from './tg-claim.service';
 import { TgMeetingService } from './tg-meeting.service';
 import { TgVoiceService } from './tg-voice.service';
 import { TgBillingService } from './tg-billing.service';
@@ -83,6 +85,15 @@ const ALBUM_DEBOUNCE_MS = Number(process.env.TG_ALBUM_DEBOUNCE_MS || 2500);
 
 /** Потолок альбома в Telegram. Набрали столько — ждать больше нечего. */
 const ALBUM_MAX_PARTS = 10;
+
+/** Почему не удалась привязка группы → что сказать человеку (tg-i18n). */
+const CLAIM_FAILURE_TEXT: Record<TgClaimFailure, TgTextKey> = {
+  expired: 'claim_expired',
+  wrong_account: 'claim_wrong_account',
+  group_taken: 'claim_group_taken',
+  already_connected: 'claim_already_connected',
+  own_bot_here: 'claim_own_bot_here',
+};
 
 /** Эхо расшифровки голосового — подсказка «что я услышал», не стенограмма. */
 const ECHO_MAX_CHARS = 1024;
@@ -194,6 +205,16 @@ export class TgBotService implements OnModuleInit {
   }
 
   private async handleMessage(msg: any): Promise<void> {
+    // Группа стала супергруппой: у неё новый id, а конфиг бота держал старый —
+    // бот в новой супергруппе молчал. Telegram шлёт два служебных сообщения:
+    // migrate_to_chat_id — в старой группе, migrate_from_chat_id — в новой;
+    // moveToChat идемпотентен, второе уже ничего не найдёт.
+    if (msg.migrate_to_chat_id || msg.migrate_from_chat_id) {
+      const fromChat = Number(msg.migrate_to_chat_id ? msg.chat.id : msg.migrate_from_chat_id);
+      const toChat = Number(msg.migrate_to_chat_id ?? msg.chat.id);
+      await this.configs.moveToChat(fromChat, toChat);
+      return;
+    }
     if (msg.from?.is_bot) return;
     if (msg.new_chat_members || msg.left_chat_member || msg.pinned_message) return;
 
@@ -216,21 +237,20 @@ export class TgBotService implements OnModuleInit {
       // (репорт владельца 28.08.2026, когда личка уже работала).
       const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
       if (!ownerId) {
-        await this.replyUnlinked(
-          msg.chat.id,
-          'Привет! Чтобы начать, открой Linkeon — там можно завести аккаунт или привязать существующий.',
-        );
+        const lang = pickTgLanguage(null, msg.from?.language_code);
+        await this.replyUnlinked(msg.chat.id, tgText(lang, 'start_unlinked'), lang);
         return;
       }
       const prof = await this.pg.query(
-        `SELECT preferred_agent FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
+        `SELECT preferred_agent, profile_data->>'language' AS language FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
         [ownerId],
       );
       const current = prof.rows[0]?.preferred_agent;
+      const lang = await linkedTgLanguage(this.pg, ownerId, prof.rows[0]?.language, msg.from?.language_code);
       await this.grammy.sendMessage(
         msg.chat.id,
-        (current ? `Привет! Сейчас отвечает <b>${escapeHtml(current)}</b>.` : 'Привет!') +
-          '\n\nПиши сюда — ассистент ответит. /assistants — сменить ассистента, /balance — баланс.',
+        (current ? tgText(lang, 'start_hello_agent', { agent: escapeHtml(current) }) : tgText(lang, 'start_hello')) +
+          '\n\n' + tgText(lang, 'start_body'),
         { parse_mode: 'HTML' },
       );
       return;
@@ -256,10 +276,8 @@ export class TgBotService implements OnModuleInit {
 
       const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
       if (!ownerId) {
-        await this.replyUnlinked(
-          msg.chat.id,
-          'Чтобы я отвечал, нужен аккаунт Linkeon — открой его кнопкой ниже.',
-        );
+        const lang = pickTgLanguage(null, msg.from?.language_code);
+        await this.replyUnlinked(msg.chat.id, tgText(lang, 'unlinked_chat'), lang);
         return;
       }
       const cfg = await this.configs.ensurePrivateConfig(ownerId, msg.chat.id);
@@ -287,6 +305,10 @@ export class TgBotService implements OnModuleInit {
         this.logger.debug(`chat ${msg.chat.id}: command for another bot, skipping`);
         return;
       }
+      // Голый /start без кода в группе чаще всего пишут другому боту. Молчим
+      // ДО всего остального: дальше, в «на каждое сообщение», он дошёл бы до
+      // «токены кончились» или «Минутку». Наш /start@бот — справка (tryHandle).
+      if (!startToken && /^\/start\s*$/i.test(said.trim())) return;
       if (startToken) {
         await this.handleGroupClaim(msg, startToken);
         return;
@@ -318,10 +340,10 @@ export class TgBotService implements OnModuleInit {
    * web_app-кнопки Telegram разрешает только в личных чатах — здесь мы
    * всегда в личке.
    */
-  private async replyUnlinked(chatId: number, intro: string): Promise<void> {
+  private async replyUnlinked(chatId: number, intro: string, lang: TgLang): Promise<void> {
     await this.grammy.sendMessage(chatId, intro, {
       reply_markup: {
-        inline_keyboard: [[{ text: 'Открыть Linkeon', web_app: { url: TMA_URL } }]],
+        inline_keyboard: [[{ text: tgText(lang, 'open_linkeon'), web_app: { url: TMA_URL } }]],
       },
     });
   }
@@ -360,6 +382,9 @@ export class TgBotService implements OnModuleInit {
     }
     if (data.startsWith('agents_page:')) {
       const page = Number(data.split(':')[1]) || 0;
+      // Ответ на нажатие гасит «часики» на кнопке — иначе они крутятся до
+      // таймаута Telegram.
+      await this.grammy.answerCallbackQuery(cb.id, {}).catch(() => {});
       await this.commands.handleAssistants(cb.message, ownerId, page);
       return;
     }
@@ -379,80 +404,53 @@ export class TgBotService implements OnModuleInit {
     const text = msg.text.toLowerCase().trim();
     const cmd = text.split('@')[0].split(' ')[0];
 
-    if (cmd === '/language') {
+    // Команда, которой нужен аккаунт, у непривязанного — кнопка в Linkeon.
+    // Раньше часть команд советовала «зайди в кабинет и нажми «Подключить
+    // Telegram»», но человеку без аккаунта в кабинет не войти (см. replyUnlinked).
+    const needsAccount = async (): Promise<string | null> => {
       const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
       if (!ownerId) {
-        await this.replyUnlinked(
-          msg.chat.id,
-          'Чтобы выбрать язык, нужен аккаунт Linkeon — открой его кнопкой ниже.',
-        );
-        return;
+        const lang = pickTgLanguage(null, msg.from?.language_code);
+        await this.replyUnlinked(msg.chat.id, tgText(lang, 'unlinked_command'), lang);
       }
+      return ownerId;
+    };
+
+    if (cmd === '/language') {
+      const ownerId = await needsAccount();
+      if (!ownerId) return;
       await this.commands.handleLanguage(msg, ownerId);
       return;
     }
 
     if (cmd === '/assistants') {
-      const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
-      if (!ownerId) {
-        await this.grammy.sendMessage(
-          msg.chat.id,
-          'Telegram не привязан к Linkeon. Нажми /start или зайди в кабинет и нажми «Подключить Telegram».',
-        );
-        return;
-      }
+      const ownerId = await needsAccount();
+      if (!ownerId) return;
       await this.commands.handleAssistants(msg, ownerId);
       return;
     }
 
     if (cmd === '/help') {
-      await this.grammy.sendMessage(
-        msg.chat.id,
-        `Я бот Linkeon — отвечаю здесь в личке и в группах, куда меня добавил владелец.
-
-Команды (работают и здесь, и в группе — где надо, привязка по твоему Telegram):
-/start — подключить Telegram к Linkeon
-/assistants — выбрать ассистента, который отвечает в личке
-/language — язык ответов
-/balance — баланс токенов твоего аккаунта
-/silent — замолчать все твои боты во всех группах
-/resume — снова включить их
-/help — это сообщение
-
-В группе /silent /resume управляют только тем ботом, в чате с которым вызваны.
-
-Веб-кабинет: https://my.linkeon.io/telegram-bots`,
-      );
+      await this.grammy.sendMessage(msg.chat.id, tgText(await this.langOfTgUser(msg.from), 'dm_help'));
       return;
     }
 
     if (cmd === '/balance') {
-      const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
-      if (!ownerId) {
-        await this.grammy.sendMessage(
-          msg.chat.id,
-          'Telegram не привязан к Linkeon. Зайди в кабинет и нажми «Подключить Telegram».',
-        );
-        return;
-      }
+      const ownerId = await needsAccount();
+      if (!ownerId) return;
       const bal = await this.billing.getBalance(ownerId);
+      const lang = await this.langFor(ownerId, msg.from);
       await this.grammy.sendMessage(
         msg.chat.id,
-        `Баланс: *${bal.toLocaleString('ru-RU')}* токенов.\nПополнить: https://my.linkeon.io/tokens`,
-        { parse_mode: 'Markdown' },
+        tgText(lang, 'balance', { balance: formatTgNumber(lang, bal) }),
+        { parse_mode: 'HTML' },
       );
       return;
     }
 
     if (cmd === '/silent' || cmd === '/resume') {
-      const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
-      if (!ownerId) {
-        await this.grammy.sendMessage(
-          msg.chat.id,
-          'Telegram не привязан к Linkeon. /start или зайди в кабинет и нажми «Подключить Telegram».',
-        );
-        return;
-      }
+      const ownerId = await needsAccount();
+      if (!ownerId) return;
       const targetStatus = cmd === '/silent' ? 'silent' : 'active';
       const fromStatuses = cmd === '/silent' ? ['active'] : ['silent'];
       // /silent — только группы: личка с ботом — разговор один на один, глушить
@@ -465,36 +463,32 @@ export class TgBotService implements OnModuleInit {
           RETURNING id, display_name, tg_chat_title, tg_chat_id`,
         [targetStatus, ownerId, fromStatuses],
       );
+      // Язык — после UPDATE: ответ нужен только тому, что изменилось.
+      const lang = await this.langFor(ownerId, msg.from);
       if (r.rowCount === 0) {
-        await this.grammy.sendMessage(
-          msg.chat.id,
-          cmd === '/silent'
-            ? 'У тебя нет активных ботов, которых можно замолчать.'
-            : 'У тебя нет молчащих ботов, которых можно возобновить.',
-        );
+        await this.grammy.sendMessage(msg.chat.id, tgText(lang, cmd === '/silent' ? 'silent_none' : 'resume_none'));
         return;
       }
       const list = r.rows
         .map(b => isPrivateConfig(b)
-          ? `• <b>${escapeHtml(b.display_name)}</b> в личке`
-          : `• <b>${escapeHtml(b.display_name)}</b> в «${escapeHtml(b.tg_chat_title ?? 'группе')}»`)
+          ? tgText(lang, 'list_private', { name: escapeHtml(b.display_name) })
+          : b.tg_chat_title
+            ? tgText(lang, 'list_group', { name: escapeHtml(b.display_name), group: escapeHtml(b.tg_chat_title) })
+            : tgText(lang, 'list_group_untitled', { name: escapeHtml(b.display_name) }))
         .join('\n');
-      const verb = cmd === '/silent' ? '🤫 Замолкли' : '✅ Снова на связи';
+      const verb = tgText(lang, cmd === '/silent' ? 'silenced' : 'resumed');
       // HTML: имена ботов и названия групп задают люди, и «Team_A» в
       // legacy-Markdown ронял всё сообщение.
       await this.grammy.sendMessage(
         msg.chat.id,
-        `${verb}:\n${list}`,
+        `${verb}\n${list}`,
         { parse_mode: 'HTML' },
       );
       return;
     }
 
     // неизвестная команда — не ругаемся, /help подскажет
-    await this.grammy.sendMessage(
-      msg.chat.id,
-      `Не знаю такой команды. /help — список доступных.`,
-    );
+    await this.grammy.sendMessage(msg.chat.id, tgText(await this.langOfTgUser(msg.from), 'unknown_command'));
   }
 
   private async handleDmStart(msg: any, token: string): Promise<void> {
@@ -505,9 +499,12 @@ export class TgBotService implements OnModuleInit {
         msg.from.username ?? null,
         msg.from.first_name ?? null,
       );
+      const lang = await this.langFor(ownerId, msg.from);
       await this.grammy.sendMessage(
         msg.chat.id,
-        `Привет, ${msg.from.first_name}! Твой Telegram привязан к Linkeon. Теперь возвращайся в кабинет и создавай ботов для групп.`,
+        msg.from.first_name
+          ? tgText(lang, 'bind_ok_named', { name: msg.from.first_name })
+          : tgText(lang, 'bind_ok'),
       );
       this.logger.log(`identity bound: linkeon=${ownerId} tg=${msg.from.id}`);
     } catch (e: any) {
@@ -516,7 +513,10 @@ export class TgBotService implements OnModuleInit {
       this.logger.warn(
         `identity bind failed: tg=${msg.from?.id} @${msg.from?.username ?? '—'}: ${e?.message}`,
       );
-      await this.grammy.sendMessage(msg.chat.id, TgBotService.bindFailureMessage(e, msg.from));
+      await this.grammy.sendMessage(
+        msg.chat.id,
+        TgBotService.bindFailureMessage(e, msg.from, await this.langOfTgUser(msg.from)),
+      );
     }
   }
 
@@ -525,17 +525,16 @@ export class TgBotService implements OnModuleInit {
    * минут». Для занятого Telegram он бесполезен: новая ссылка упрётся в то же
    * ограничение, и человек ходит по кругу.
    */
-  static bindFailureMessage(e: any, from?: { id?: number; username?: string | null }): string {
+  static bindFailureMessage(
+    e: any,
+    from: { id?: number; username?: string | null } | undefined,
+    lang: string,
+  ): string {
     if (e instanceof TgIdentityConflictError || e?.constraint === 'tg_user_identities_tg_user_id_key') {
       const who = from?.username ? `@${from.username}` : `id ${from?.id ?? '—'}`;
-      return (
-        `Этот Telegram (${who}) уже привязан к другому аккаунту Linkeon. ` +
-        `Новая ссылка не поможет — ограничение не в ней. ` +
-        `Либо откройте ссылку из того Telegram-аккаунта, который хотите привязать, ` +
-        `либо сначала отвяжите этот от старого аккаунта.`
-      );
+      return tgText(lang, 'bind_conflict', { who });
     }
-    return `Не получилось привязать: ${e?.message}. Сгенерируй новую ссылку в Linkeon (старая могла истечь — TTL 15 минут).`;
+    return tgText(lang, 'bind_failed');
   }
 
   private async handleGroupClaim(msg: any, token: string): Promise<void> {
@@ -547,15 +546,20 @@ export class TgBotService implements OnModuleInit {
         msg.chat.title ?? null,
       );
       const botUsername = process.env.TG_BOT_USERNAME || 'LinkeonAgentBot';
+      const lang = await this.langFor(result.ownerUserId, msg.from);
       await this.grammy.sendMessage(
         msg.chat.id,
-        `Я ${result.displayName}. Зови меня @${botUsername} или ответом на это сообщение.`,
+        tgText(lang, 'claim_hello', { name: result.displayName, bot: botUsername }),
       );
       this.logger.log(`config ${result.configId} activated for chat ${msg.chat.id}`);
     } catch (e: any) {
       const ownerTgId = msg.from.id;
       try {
-        await this.grammy.sendMessage(ownerTgId, `Не получилось привязать бота: ${e.message}`);
+        // Причину — своими словами: сырой текст исключения бывал русским или
+        // техническим («claim token не принадлежит…») посреди переведённого
+        // сообщения. Незнакомая — общий текст, подробности в лог ниже.
+        const key = CLAIM_FAILURE_TEXT[e?.claimFailure as TgClaimFailure] ?? 'claim_failed';
+        await this.grammy.sendMessage(ownerTgId, tgText(await this.langOfTgUser(msg.from), key));
       } catch { /* ignore */ }
       this.logger.warn(`claim failed for chat ${msg.chat.id}: ${e.message}`);
       // Уходим, только если в группе точно нет работающего бота: выход
@@ -634,6 +638,12 @@ export class TgBotService implements OnModuleInit {
   private async handleChatMessage(msg: any, cfgIn?: TgBotConfigRow): Promise<void> {
     const cfg = cfgIn ?? (await this.configs.getActiveByTgChatId(msg.chat.id));
     if (!cfg) return;
+
+    // Язык служебных сообщений хода — язык владельца (его профиля; в личке,
+    // где пишет сам владелец, пустой профиль заполнит язык клиента). В базу —
+    // один раз и только когда бот действительно что-то скажет.
+    let langOnce: Promise<TgLang> | null = null;
+    const lang = () => (langOnce ??= this.langFor(cfg.owner_user_id, isPrivateConfig(cfg) ? msg.from : undefined));
 
     // Часть альбома — не самостоятельный ход: копим и обрабатываем всё вместе.
     // albumParts значит «это уже склейка», её пропускаем дальше.
@@ -724,7 +734,8 @@ export class TgBotService implements OnModuleInit {
         try {
           await this.grammy.sendMessage(
             msg.chat.id,
-            `⚠️ У владельца закончились токены (баланс: ${preBalance}). Бот не отвечает, пока баланс не пополнят: https://my.linkeon.io/tokens`,
+            // В личке владелец и есть тот, у кого кончились токены.
+            tgText(await lang(), isPrivateConfig(cfg) ? 'zero_balance_owner' : 'zero_balance_group'),
             { reply_to_message_id: msg.message_id },
           );
           await this.billing.markZeroBalanceNotified(cfg.id);
@@ -811,7 +822,7 @@ export class TgBotService implements OnModuleInit {
         try {
           await this.grammy.sendMessage(
             msg.chat.id,
-            '⏳ Минутку — заканчиваю предыдущий запрос. Подожди или повтори через 30 секунд.',
+            tgText(await lang(), 'busy'),
             { reply_to_message_id: msg.message_id },
           );
         } catch (e: any) {
@@ -887,12 +898,13 @@ export class TgBotService implements OnModuleInit {
 
       // Стартовое status-сообщение. Если оно не отправилось (rate-limit/permission)
       // — продолжаем без статуса, не блокируем основной поток.
+      const turnLang = await lang();
       try {
-        const sent = await this.grammy.sendMessage(msg.chat.id, '🤔 Думаю...', {
+        const sent = await this.grammy.sendMessage(msg.chat.id, tgText(turnLang, 'thinking'), {
           reply_to_message_id: msg.message_id,
         });
         statusMsgId = sent.message_id;
-        statusLastLabel = '🤔 Думаю...';
+        statusLastLabel = tgText(turnLang, 'thinking');
       } catch (e: any) {
         this.logger.warn(`failed to send status msg in chat ${msg.chat.id}: ${e.message}`);
       }
@@ -927,7 +939,7 @@ export class TgBotService implements OnModuleInit {
         }
       };
 
-      const labelFor = TgBotService.toolStatusLabel;
+      const labelFor = (toolName: string) => TgBotService.toolStatusLabel(toolName, turnLang);
 
       const ownerRes = await this.pg.query(
         `SELECT profile_data->>'name' AS first_name FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
@@ -947,7 +959,7 @@ export class TgBotService implements OnModuleInit {
         }, workspace ?? undefined, { productsOwner });
       } catch (e: any) {
         // Не вылетаем тихо — пишем юзеру в статус и оставляем след в БД.
-        await this.recordTurnFailure(cfg, msg.chat.id, statusMsgId, e);
+        await this.recordTurnFailure(cfg, msg.chat.id, statusMsgId, e, turnLang);
         statusMsgId = null; // не удалять в finally — оставляем как уведомление
         throw e;
       }
@@ -992,18 +1004,18 @@ export class TgBotService implements OnModuleInit {
             ...(plan.caption !== undefined ? { caption: plan.caption } : {}),
           });
           if (plan.needsSeparateText) {
-            await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend);
+            await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang);
           }
           contentType = 'voice_reply';
         } catch (e: any) {
           this.logger.warn(`TTS failed for chat ${msg.chat.id}, fallback to text: ${e.message}`);
-          await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend);
+          await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang);
         }
       } else if (textToSend) {
-        await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend);
+        await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang);
       }
 
-      await this.deliverOutgoingMarkers(cfg, msg, markers);
+      await this.deliverOutgoingMarkers(cfg, msg, markers, turnLang);
 
       // Артефакты из песочницы Claude (PDF/DOCX/XLSX/etc.) — каждый отдельным
       // документом. Лимит уже наложен в scanSandboxOutputs (5 файлов max).
@@ -1132,19 +1144,19 @@ export class TgBotService implements OnModuleInit {
    * Подпись статус-сообщения, пока идёт вызов инструмента. Статическая и без
    * `this` — чтобы проверяться тестом, не поднимая ход целиком.
    */
-  static toolStatusLabel(toolName: string): string {
-    if (/mcp__products__/.test(toolName)) return '🛠 Работаю с продуктом...';
-    if (toolName === 'Read') return '📄 Читаю файл...';
-    if (toolName === 'Write') return '✏️ Пишу файл...';
-    if (toolName === 'Edit') return '✏️ Редактирую файл...';
-    if (toolName === 'Bash') return '⚙️ Выполняю команду...';
-    if (toolName === 'Glob') return '🔍 Ищу файлы...';
-    if (toolName === 'Grep') return '🔍 Ищу в файлах...';
-    if (toolName === 'WebSearch') return '🌐 Ищу в интернете...';
-    if (toolName === 'WebFetch') return '🌐 Открываю страницу...';
-    if (/generate_image|edit_image|compose_image/i.test(toolName)) return '🎨 Готовлю картинку...';
-    if (/upscale_image/i.test(toolName)) return '✨ Улучшаю картинку...';
-    if (/generate_video|video/i.test(toolName)) return '🎬 Запускаю генерацию видео...';
+  static toolStatusLabel(toolName: string, lang: string): string {
+    if (/mcp__products__/.test(toolName)) return tgText(lang, 'tool_products');
+    if (toolName === 'Read') return tgText(lang, 'tool_read');
+    if (toolName === 'Write') return tgText(lang, 'tool_write');
+    if (toolName === 'Edit') return tgText(lang, 'tool_edit');
+    if (toolName === 'Bash') return tgText(lang, 'tool_bash');
+    if (toolName === 'Glob') return tgText(lang, 'tool_glob');
+    if (toolName === 'Grep') return tgText(lang, 'tool_grep');
+    if (toolName === 'WebSearch') return tgText(lang, 'tool_web_search');
+    if (toolName === 'WebFetch') return tgText(lang, 'tool_web_fetch');
+    if (/generate_image|edit_image|compose_image/i.test(toolName)) return tgText(lang, 'tool_image');
+    if (/upscale_image/i.test(toolName)) return tgText(lang, 'tool_upscale');
+    if (/generate_video|video/i.test(toolName)) return tgText(lang, 'tool_video');
     return `⚙️ ${toolName}...`;
   }
 
@@ -1207,11 +1219,15 @@ export class TgBotService implements OnModuleInit {
     chatId: number,
     statusMsgId: number | null,
     err: any,
+    lang?: TgLang,
   ): Promise<void> {
     const reason = String(err?.message || 'неизвестная ошибка').slice(0, 200);
     if (statusMsgId) {
       try {
-        await this.grammy.editMessageText(chatId, statusMsgId, `⚠️ Не получилось обработать запрос: ${reason}`);
+        const l = lang ?? (await this.langFor(cfg.owner_user_id));
+        // Причина — только в историю и лог: она бывает русской или
+        // технической посреди переведённого сообщения.
+        await this.grammy.editMessageText(chatId, statusMsgId, tgText(l, 'turn_failed'));
       } catch (e: any) {
         this.logger.warn(`turn-failure notice failed in chat ${chatId}: ${e.message}`);
       }
@@ -1237,7 +1253,12 @@ export class TgBotService implements OnModuleInit {
    * идут после доставки, и ход, которого юзер не видел, не должен ни попасть в
    * историю как отвеченный, ни быть оплачен.
    */
-  async deliverReplyText(chatId: number, replyToMessageId: number, text: string): Promise<void> {
+  async deliverReplyText(
+    chatId: number,
+    replyToMessageId: number,
+    text: string,
+    lang: string,
+  ): Promise<void> {
     try {
       await this.grammy.sendMessage(chatId, text, { reply_to_message_id: replyToMessageId });
     } catch (e: any) {
@@ -1249,7 +1270,7 @@ export class TgBotService implements OnModuleInit {
       try {
         await this.grammy.sendMessage(
           chatId,
-          '⚠️ Ответ готов, но не отправился из-за технического сбоя. Мы уже видим ошибку — попробуй переспросить.',
+          tgText(lang, 'delivery_failed'),
           { reply_to_message_id: replyToMessageId },
         );
       } catch {
@@ -1520,23 +1541,29 @@ export class TgBotService implements OnModuleInit {
    * Отправляем каждый attachment-маркер отдельным сообщением. Ошибка по
    * конкретному файлу не валит остальные и не роняет ход — логируем, коротко
    * пишем в чат и продолжаем. Сюда же приходит отказ по ссылке во внутреннюю
-   * сеть (UnsafeUrlError): его сообщение рассчитано на человека.
+   * сеть (UnsafeUrlError, код UNSAFE_URL) — человеку о нём своими словами.
    */
-  private async deliverOutgoingMarkers(cfg: TgBotConfigRow, msg: any, markers: OutgoingMarker[]): Promise<void> {
+  private async deliverOutgoingMarkers(cfg: TgBotConfigRow, msg: any, markers: OutgoingMarker[], lang: TgLang): Promise<void> {
     for (const m of markers.slice(0, 3)) {
       try {
-        await this.dispatchOutgoingMarker(cfg, msg, m);
+        await this.dispatchOutgoingMarker(cfg, msg, m, lang);
       } catch (e: any) {
+        // Сырой текст причины — только в лог: он бывает русским или
+        // внутренним. Человеку — известные причины своими словами (по коду
+        // ошибки, не по тексту), остальные — общей фразой.
         this.logger.warn(`outgoing marker (${m.kind}) failed in chat ${msg.chat.id}: ${e.message}`);
+        const key: TgTextKey = e?.code === 'INSUFFICIENT_TOKENS'
+          ? 'attach_no_tokens'
+          : e?.code === 'UNSAFE_URL' ? 'attach_bad_link' : 'attach_failed';
         try {
-          await this.grammy.sendMessage(msg.chat.id, `(не удалось приложить ${m.kind}: ${e.message})`);
+          await this.grammy.sendMessage(msg.chat.id, tgText(lang, key));
         } catch { /* ignore */ }
       }
     }
   }
 
   /** Отправляет один маркер: генерим картинку или скачиваем по URL → шлём в чат. */
-  private async dispatchOutgoingMarker(cfg: TgBotConfigRow, msg: any, m: OutgoingMarker): Promise<void> {
+  private async dispatchOutgoingMarker(cfg: TgBotConfigRow, msg: any, m: OutgoingMarker, lang: TgLang): Promise<void> {
     if (m.kind === 'image') {
       this.grammy.sendChatAction(msg.chat.id, 'upload_photo').catch(() => {});
       const res = await this.misc.generateImage(cfg.owner_user_id, { prompt: m.prompt });
@@ -1600,7 +1627,7 @@ export class TgBotService implements OnModuleInit {
       );
       await this.grammy.sendMessage(
         msg.chat.id,
-        '🎬 Видео в очереди (1-3 минуты). Пришлю как только будет готово.',
+        tgText(lang, 'video_queued'),
         { reply_to_message_id: msg.message_id },
       );
       return;
@@ -1684,12 +1711,35 @@ export class TgBotService implements OnModuleInit {
     const ownerTg = await this.identity.getIdentityByLinkeonId(cfg.owner_user_id);
     if (ownerTg) {
       try {
+        const lang = await this.langFor(cfg.owner_user_id);
         await this.grammy.sendMessage(
           ownerTg.tgUserId,
-          `Бот «${cfg.display_name}» удалён из «${cfg.tg_chat_title ?? 'группы'}». Конфигурация архивирована — её можно восстановить в кабинете.`,
+          cfg.tg_chat_title
+            ? tgText(lang, 'bot_removed', { name: cfg.display_name, group: cfg.tg_chat_title })
+            : tgText(lang, 'bot_removed_untitled', { name: cfg.display_name }),
         );
       } catch { /* ignore */ }
     }
+  }
+
+  /**
+   * Язык служебных сообщений: есть аккаунт Linkeon — язык его профиля, нет —
+   * язык клиента Telegram того, кто пишет (см. ownerTgLanguage). Не бросает:
+   * язык — не повод ронять ответ.
+   */
+  private langFor(ownerUserId: string | null | undefined, from?: { language_code?: string } | null): Promise<TgLang> {
+    return ownerTgLanguage(this.pg, ownerUserId, from?.language_code);
+  }
+
+  /** Язык человека, о котором известен только его Telegram. Не бросает. */
+  private async langOfTgUser(from: any): Promise<TgLang> {
+    let ownerId: string | null = null;
+    try {
+      ownerId = await this.identity.getLinkeonIdByTgUserId(from?.id);
+    } catch {
+      // Без привязки язык возьмём из клиента Telegram.
+    }
+    return this.langFor(ownerId, from);
   }
 
   /**

@@ -70,12 +70,15 @@ describe('TgRouterService.persistTurnFailure', () => {
 });
 
 describe('TgBotService.recordTurnFailure', () => {
-  it('юзер видит ошибку, а история получает след — одно без другого не годится', async () => {
+  it('юзер видит, что ход не удался, а история получает след — одно без другого не годится', async () => {
     const { svc, grammy, router } = makeBot();
 
     await (svc as any).recordTurnFailure(CFG, -100500, 77, new Error('weekly limit'));
 
-    expect(grammy.editMessageText).toHaveBeenCalledWith(-100500, 77, expect.stringContaining('weekly limit'));
+    // Внутренняя причина в чат не уходит (14.10.2026): она бывала русской или
+    // технической посреди переведённого сообщения. Ей место в истории и логе.
+    expect(grammy.editMessageText).toHaveBeenCalledWith(-100500, 77, expect.stringContaining('Не получилось обработать запрос'));
+    expect(String((grammy.editMessageText.mock.calls[0] as any[])[2])).not.toContain('weekly limit');
     expect(router.persistTurnFailure).toHaveBeenCalledWith(CFG, expect.stringContaining('weekly limit'));
   });
 

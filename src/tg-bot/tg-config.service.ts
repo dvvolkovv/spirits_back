@@ -102,13 +102,22 @@ export class TgConfigService {
       );
     }
 
+    // Статус — в самом UPDATE: проверка выше читала его без блокировки, и
+    // привязка, успевшая между ними, иначе была бы стёрта (бот поздоровался
+    // в группе, а конфиг снова pending без чата). Прежние ссылки НЕ гасим:
+    // бота по второй ссылке и так не перенести (привязка — только из pending
+    // и только владельцем), а честно открытая минуту назад ссылка стала бы
+    // «просроченной».
     const updRes = await this.pg.query(
       `UPDATE tg_bot_configs
           SET status = 'pending', tg_chat_id = NULL, tg_chat_title = NULL, archived_at = NULL
-        WHERE id = $1
+        WHERE id = $1 AND status IN ('pending', 'archived')
         RETURNING *`,
       [id],
     );
+    if (updRes.rows.length === 0) {
+      throw new BadRequestException('reissue доступен только для pending/archived конфигов');
+    }
     const config: TgBotConfigRow = updRes.rows[0];
 
     const expires = new Date(Date.now() + this.CLAIM_TTL_MS);
@@ -202,6 +211,47 @@ export class TgConfigService {
       `UPDATE tg_bot_configs SET status = 'archived', archived_at = now() WHERE id = $1`,
       [id],
     );
+  }
+
+  /**
+   * Группа стала супергруппой (migrate_to_chat_id): у неё новый id. Конфиг и
+   * его история переезжают — иначе бот в новой супергруппе молчит, а
+   * мониторинг молчания ищет ответ не в том чате. Идемпотентно: второе
+   * служебное сообщение (migrate_from_chat_id) старого id уже не найдёт.
+   */
+  async moveToChat(fromChatId: number, toChatId: number): Promise<void> {
+    try {
+      // Одним запросом: упади между двумя UPDATE — история навсегда осталась
+      // бы на старом id (второе служебное сообщение конфиг уже не найдёт).
+      // Переезжает ВСЯ история чата, а не только этого конфига: «писал ли
+      // здесь кто-то, кроме владельца» (isSoloChat, onlySpeakerIs) смотрит на
+      // tg_chat_id, и реплики прежних ботов, оставшись на старом id, дали бы
+      // в новой супергруппе ложное «пишет один владелец». Ждущие видео — туда
+      // же, иначе доставка уйдёт в мёртвый чат; ответ на сообщение старой
+      // группы сбрасываем — в супергруппе своя нумерация сообщений.
+      const moved = await this.pg.query(
+        `WITH moved AS (
+           UPDATE tg_bot_configs SET tg_chat_id = $2
+            WHERE tg_chat_id = $1 AND status IN ('active','silent')
+            RETURNING id
+         ), msgs AS (
+           UPDATE tg_bot_messages SET tg_chat_id = $2
+            WHERE tg_chat_id = $1 AND EXISTS (SELECT 1 FROM moved)
+         ), vids AS (
+           UPDATE tg_bot_video_jobs SET tg_chat_id = $2, tg_reply_to_message_id = NULL
+            WHERE tg_chat_id = $1 AND delivery_status = 'pending' AND EXISTS (SELECT 1 FROM moved)
+         )
+         SELECT id FROM moved`,
+        [fromChatId, toChatId],
+      );
+      const id = moved.rows[0]?.id;
+      if (!id) return;
+      this.logger.log(`config ${id}: группа ${fromChatId} стала супергруппой ${toChatId}`);
+    } catch (e: any) {
+      // На новом id уже стоит свой бот (уникальный индекс по активным
+      // чатам) — переезжать некуда. Остальную обработку апдейта не роняем.
+      this.logger.warn(`moveToChat ${fromChatId} → ${toChatId} failed: ${e?.message}`);
+    }
   }
 
   async getActiveByTgChatId(tgChatId: number): Promise<TgBotConfigRow | null> {

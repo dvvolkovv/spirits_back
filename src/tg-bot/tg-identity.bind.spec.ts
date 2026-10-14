@@ -83,7 +83,7 @@ describe('TgBotService.bindFailureMessage', () => {
 
     expect(msg).toContain('@nomira_ai');
     expect(msg).toContain('уже привязан к другому аккаунту');
-    expect(msg).not.toContain('TTL 15 минут');
+    expect(msg).not.toContain('15 минут');
   });
 
   it('без username называет числовой id — чтобы было видно, какой Telegram пришёл', () => {
@@ -99,6 +99,7 @@ describe('TgBotService.bindFailureMessage', () => {
     // Проверка в обратную сторону: чиня один диагноз, нельзя потерять другой.
     const msg = TgBotService.bindFailureMessage(new Error('invalid or expired auth token'), { id: 1 });
 
-    expect(msg).toContain('TTL 15 минут');
+    expect(msg).toContain('новую ссылку');
+    expect(msg).toContain('15 минут');
   });
 });

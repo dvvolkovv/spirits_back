@@ -2,6 +2,14 @@ import { Injectable, Logger, BadRequestException, ConflictException } from '@nes
 import { PgService } from '../common/services/pg.service';
 import { TgIdentityService } from './tg-identity.service';
 
+/** Почему не удалась привязка группы — бот скажет это своими словами (tg-i18n). */
+export type TgClaimFailure = 'expired' | 'wrong_account' | 'group_taken' | 'own_bot_here' | 'already_connected';
+
+function claimError(failure: TgClaimFailure, message: string, conflict = false) {
+  const e = conflict ? new ConflictException(message) : new BadRequestException(message);
+  return Object.assign(e, { claimFailure: failure });
+}
+
 @Injectable()
 export class TgClaimService {
   private readonly logger = new Logger(TgClaimService.name);
@@ -18,7 +26,7 @@ export class TgClaimService {
     tgChatTitle: string | null,
   ): Promise<{ ownerUserId: string; configId: string; displayName: string }> {
     const tokRes = await this.pg.query(
-      `SELECT t.owner_user_id, t.config_id, c.display_name
+      `SELECT t.owner_user_id, t.config_id, c.display_name, c.status
          FROM tg_claim_tokens t
          LEFT JOIN tg_bot_configs c ON c.id = t.config_id
         WHERE t.token = $1 AND t.kind = 'claim'
@@ -27,33 +35,63 @@ export class TgClaimService {
       [token],
     );
     if (tokRes.rows.length === 0) {
-      throw new BadRequestException('invalid or expired claim token');
+      throw claimError('expired', 'invalid or expired claim token');
     }
-    const { owner_user_id: ownerId, config_id: configId, display_name: displayName } = tokRes.rows[0];
+    const { owner_user_id: ownerId, config_id: configId, display_name: displayName, status } = tokRes.rows[0];
 
     const expectedTgUserId = await this.identity.getIdentityByLinkeonId(ownerId);
     if (!expectedTgUserId || expectedTgUserId.tgUserId !== tgUserId) {
-      throw new BadRequestException('claim token не принадлежит этому Telegram-аккаунту');
+      throw claimError('wrong_account', 'claim token не принадлежит этому Telegram-аккаунту');
+    }
+
+    // Бот, уже работающий в группе, по второй живой ссылке не переносится:
+    // раньше её открытие в другой группе молча утаскивало рабочего бота, а в
+    // первой группе он оставался участником без конфига и молчал. Ссылку на
+    // подключение даёт только бот, который ещё ни к одной группе не подключён
+    // (pending; перевыпуск возвращает в pending и архивного).
+    if (status === 'active' || status === 'silent') {
+      throw claimError('already_connected', `claim по конфигу в статусе ${status}`);
+    }
+    // Архивный, удалённый или пропавший конфиг (LEFT JOIN дал NULL) — для
+    // человека это просто негодная ссылка.
+    if (status !== 'pending') {
+      throw claimError('expired', `claim по конфигу в статусе ${status ?? 'нет конфига'}`);
     }
 
     const conflictRes = await this.pg.query(
-      `SELECT id FROM tg_bot_configs
+      `SELECT id, owner_user_id FROM tg_bot_configs
         WHERE tg_chat_id = $1 AND status IN ('active','silent') AND id != $2 LIMIT 1`,
       [tgChatId, configId],
     );
     if (conflictRes.rows.length > 0) {
-      throw new ConflictException('эта группа уже привязана к другому аккаунту Linkeon');
+      // Свой же второй бот в ту же группу — это не «чужой аккаунт».
+      if (conflictRes.rows[0].owner_user_id === ownerId) {
+        throw claimError('own_bot_here', 'в этой группе уже работает другой бот этого владельца', true);
+      }
+      throw claimError('group_taken', 'эта группа уже привязана к другому аккаунту Linkeon', true);
     }
 
-    await this.pg.query(
-      `UPDATE tg_bot_configs SET tg_chat_id = $1, tg_chat_title = $2, status = 'active'
-        WHERE id = $3`,
-      [tgChatId, tgChatTitle, configId],
-    );
-    await this.pg.query(
-      `UPDATE tg_claim_tokens SET consumed_at = now() WHERE token = $1`,
+    // Ссылку гасим ДО активации и атомарно: две привязки одной ссылкой (или
+    // привязка гонкой с перевыпуском) не пройдут обе. Конфиг — только из
+    // pending: проверка выше читала статус без блокировки.
+    const spent = await this.pg.query(
+      `UPDATE tg_claim_tokens SET consumed_at = now()
+        WHERE token = $1 AND consumed_at IS NULL AND expires_at > now()
+        RETURNING token`,
       [token],
     );
+    if (spent.rows.length === 0) {
+      throw claimError('expired', 'claim token уже израсходован');
+    }
+    const activated = await this.pg.query(
+      `UPDATE tg_bot_configs SET tg_chat_id = $1, tg_chat_title = $2, status = 'active'
+        WHERE id = $3 AND status = 'pending'
+        RETURNING id`,
+      [tgChatId, tgChatTitle, configId],
+    );
+    if (activated.rows.length === 0) {
+      throw claimError('already_connected', 'конфиг перестал быть pending до активации');
+    }
 
     return { ownerUserId: ownerId, configId, displayName };
   }

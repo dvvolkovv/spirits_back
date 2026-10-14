@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Bot, InputFile } from 'grammy';
 import { splitForTelegram } from './tg-text-split';
+import { tgCommandMenus } from './tg-i18n';
 
 @Injectable()
 export class TgGrammyClient implements OnModuleInit {
@@ -40,26 +41,39 @@ export class TgGrammyClient implements OnModuleInit {
 
       // Меню команд в клиенте Telegram (кнопка «/» рядом с полем ввода).
       // Без него про /assistants узнать неоткуда, кроме /help — а про /help
-      // тоже надо сначала догадаться. Вызов идемпотентный: Telegram просто
-      // перезаписывает список целиком, поэтому гоняем на каждом старте и не
-      // держим отдельного «а зарегистрировано ли уже» состояния.
-      try {
-        await this.bot.api.setMyCommands([
-          { command: 'assistants', description: 'Выбрать ассистента' },
-          { command: 'language', description: 'Язык ответов' },
-          { command: 'balance', description: 'Баланс токенов' },
-          { command: 'silent', description: 'Замолчать во всех группах' },
-          { command: 'resume', description: 'Снова отвечать' },
-          { command: 'help', description: 'Что умеет бот' },
-        ]);
-        this.logger.log('Telegram commands menu set');
-      } catch (e: any) {
-        // Меню — украшение: бот работает и без него, валить старт незачем.
-        this.logger.warn(`setMyCommands failed: ${e.message}`);
-      }
+      // тоже надо сначала догадаться.
+      // Не ждём: 17 вызовов подряд держали бы старт всего API (Nest не
+      // начинает слушать порт до конца onModuleInit), а при подвисшем
+      // api.telegram.org — надолго. Метод сам не бросает.
+      this.registerCommandMenus().catch(() => {});
     } catch (e: any) {
       this.logger.error(`setWebhook failed: ${e.message}`);
     }
+  }
+
+  /**
+   * Меню команд — своё для личек и групп и на каждом из семи языков
+   * (tgCommandMenus). Раньше одно русское меню показывалось везде, и в
+   * группе /assistants и /language уходили в платный ход модели. Вызов
+   * идемпотентный: Telegram перезаписывает список целиком, поэтому гоняем на
+   * каждом старте. Меню — украшение: сбой одного не мешает остальным и не
+   * валит старт.
+   */
+  async registerCommandMenus(): Promise<void> {
+    const menus = tgCommandMenus();
+    let ok = 0;
+    for (const m of menus) {
+      try {
+        await this.bot.api.setMyCommands(m.commands, {
+          scope: { type: m.scope },
+          ...(m.language_code ? { language_code: m.language_code } : {}),
+        });
+        ok++;
+      } catch (e: any) {
+        this.logger.warn(`setMyCommands ${m.scope}/${m.language_code ?? 'default'} failed: ${e?.message}`);
+      }
+    }
+    this.logger.log(`Telegram commands menus set: ${ok}/${menus.length}`);
   }
 
   /**
