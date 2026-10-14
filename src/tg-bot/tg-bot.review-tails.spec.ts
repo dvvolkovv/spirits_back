@@ -256,6 +256,15 @@ describe('группа: команда другому боту — не наша
     expect(chat).not.toHaveBeenCalled();
   });
 
+  // Альбом — несколько сообщений, подпись только у одного: выбросить её одну
+  // значило бы отдать модели альбом без одной фотографии. Альбом целиком —
+  // обычным путём.
+  it('альбом с подписью «/help@ДругойБот» не режется: часть с подписью идёт вместе с остальными', async () => {
+    const { svc, chat } = makeBot();
+    await (svc as any).handleMessage({ ...photo('/help@OtherBot'), media_group_id: 'album-1' });
+    expect(chat).toHaveBeenCalled();
+  });
+
   it('наш «/start@LinkeonAgentBot <код>» — привязка, как раньше (контроль)', async () => {
     const { svc, claim } = makeBot();
     await (svc as any).handleMessage(group('/start@LinkeonAgentBot abc123'));
@@ -296,6 +305,15 @@ describe('имя бота в тексте — с начала слова', () =>
   it('огласовки и надстрочные знаки — часть слова: «राम» в «विराम» — не обращение', () => {
     expect(router.isExplicitlyAddressed(strict('राम'), said('थोड़ा विराम लो'))).toBe(false);
     expect(router.isExplicitlyAddressed(strict('राम'), said('राम, नमस्ते'))).toBe(true);
+  });
+
+  // У многих эмодзи в конце вариационный селектор U+FE0F — это «знак» (\p{M}),
+  // но буквы перед именем он не делает: смотрим на основу, на само «❤».
+  it('имя сразу после эмодзи — обращение: «❤️Рома», «⚠️Финансист»', () => {
+    const heart = String.fromCodePoint(0x2764, 0xfe0f);
+    const warn = String.fromCodePoint(0x26a0, 0xfe0f);
+    expect(router.isExplicitlyAddressed(strict('Рома'), said(`${heart}Рома, привет`))).toBe(true);
+    expect(router.isExplicitlyAddressed(strict('Финансист'), said(`${warn}Финансист, глянь счёт`))).toBe(true);
   });
 
   it('японская черта долготы «ー» — тоже письмо без пробелов', () => {
@@ -422,6 +440,19 @@ describe('привязка в группе не удалась — бот не �
     expect(grammy.sendMessage).toHaveBeenCalledWith(222, expect.stringContaining('Не получилось привязать'));
   });
 
+  it('не смогли проверить, есть ли в группе рабочий бот, — остаёмся: выход архивировал бы его', async () => {
+    const grammy = { sendMessage: jest.fn(async () => ({})), leaveChat: jest.fn(async () => true) };
+    const claim = { claim: jest.fn(async () => { throw new Error('invalid or expired claim token'); }) };
+    const configs = { getActiveByTgChatId: jest.fn(async () => { throw new Error('Connection terminated'); }) };
+    const svc = new TgBotService(
+      {} as any, {} as any, claim as any, configs as any, null as any,
+      null as any, null as any, null as any, null as any, grammy as any, null as any, null as any, null as any,
+    );
+    (svc as any).logger = quiet;
+    await (svc as any).handleMessage(stale);
+    expect(grammy.leaveChat).not.toHaveBeenCalled();
+  });
+
   it('рабочего бота в группе нет — уходим, как раньше (контроль)', async () => {
     const { svc, grammy } = makeBot(null);
     await (svc as any).handleMessage(stale);
@@ -440,5 +471,59 @@ describe('приглашение на встречу: имя ассистент�
     const [, text, opts] = grammy.sendMessage.mock.calls[0] as any[];
     expect(opts).toEqual(expect.objectContaining({ parse_mode: 'HTML' }));
     expect(text).toContain('R&amp;D зайдёт во встречу');
+  });
+});
+
+describe('баланс меньше порога: предупреждение владельцу — раз в сутки и без двойников', () => {
+  // Проверка идёт в фоне, уже после замка чата: два хода подряд прочли бы пустую
+  // отметку оба. Поэтому слот на сутки занимаем одним UPDATE до отправки.
+  function makeLow(o: { slotFree?: boolean; sendFails?: 'blocked' | 'timeout' } = {}) {
+    const sql: string[] = [];
+    const pg = {
+      query: jest.fn(async (q: string) => {
+        sql.push(q);
+        return /RETURNING/i.test(q) ? { rows: o.slotFree === false ? [] : [{ id: 'c1' }] } : { rows: [] };
+      }),
+    };
+    const grammy = {
+      sendMessage: jest.fn(async () => {
+        if (o.sendFails === 'blocked') throw Object.assign(new Error('Forbidden: bot was blocked by the user'), { error_code: 403 });
+        if (o.sendFails === 'timeout') throw new Error('ETIMEDOUT');
+        return {};
+      }),
+    };
+    const svc = new TgBillingService(pg as any, grammy as any, undefined);
+    (svc as any).logger = quiet;
+    jest.spyOn(svc, 'getBalance').mockResolvedValue(500);
+    return { svc, pg, grammy, sql };
+  }
+  const released = (sql: string[]) => sql.some((q) => /SET last_low_balance_dm_at = NULL/.test(q));
+
+  it('слот берётся одним UPDATE до отправки — и сообщение уходит', async () => {
+    const { svc, pg, grammy, sql } = makeLow();
+    await svc.checkBalanceAlerts('c1', 'u-owner', 111);
+    expect(grammy.sendMessage).toHaveBeenCalledTimes(1);
+    const claim = sql.find((q) => /RETURNING/i.test(q)) ?? '';
+    expect(claim).toMatch(/SET last_low_balance_dm_at = now\(\)/);
+    expect(claim).toMatch(/interval '24 hours'/);
+    expect(pg.query.mock.invocationCallOrder[0]).toBeLessThan(grammy.sendMessage.mock.invocationCallOrder[0]);
+  });
+
+  it('слот уже занят (сегодня писали или пишет соседний ход) — молчим', async () => {
+    const { svc, grammy } = makeLow({ slotFree: false });
+    await svc.checkBalanceAlerts('c1', 'u-owner', 111);
+    expect(grammy.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('временный сбой отправки — слот возвращаем, чтобы повторить', async () => {
+    const { svc, sql } = makeLow({ sendFails: 'timeout' });
+    await svc.checkBalanceAlerts('c1', 'u-owner', 111);
+    expect(released(sql)).toBe(true);
+  });
+
+  it('владелец заблокировал бота (403) — слот держим до завтра (контроль)', async () => {
+    const { svc, sql } = makeLow({ sendFails: 'blocked' });
+    await svc.checkBalanceAlerts('c1', 'u-owner', 111);
+    expect(released(sql)).toBe(false);
   });
 });
