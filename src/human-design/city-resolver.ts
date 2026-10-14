@@ -18,9 +18,18 @@ const MAX_HINTS = 3;
  */
 export const QUERY_SEPARATORS = /[,，、；]/;
 
-/** Подсказка подходит месту, если с неё начинается слово: «us» — не кусок «Massachusetts». */
-function placeHas(place: string, hint: string): boolean {
-  return place.startsWith(hint) || place.includes(` ${hint}`);
+/**
+ * Подсказка подходит месту целым словом (whole) или началом слова — но не
+ * куском внутри: «us» — не «Massachusetts». Целым словом сверяется сначала:
+ * иначе код «CO» совпал бы с началом «Comunidad de Madrid», а «ES» — с
+ * «Estados Unidos»; началом слова — если целым не подошёл никто
+ * («Chicago, IL» — Illinois, «Кировск, Мурм»).
+ */
+function placeHas(place: string, hint: string, whole: boolean): boolean {
+  if (!whole) return place.startsWith(hint) || place.includes(` ${hint}`);
+  return (
+    place === hint || place.startsWith(`${hint} `) || place.endsWith(` ${hint}`) || place.includes(` ${hint} `)
+  );
 }
 
 /** Сведения общего указателя (multilang-index) — без них поиск идёт по русским подписям. */
@@ -67,7 +76,8 @@ export type CityResolution =
  * запроса, как подсказки калькулятора, но только вариантами, даже если он
  * один: от города зависит пояс, угадывать нельзя. «Кировск, Мурманская» —
  * до трёх частей после запятой (QUERY_SEPARATORS) сужают по региону и
- * стране, с начала слова: по extras.places — на всех языках сайта, с кодом и
+ * стране — целым словом, а если так не подходит никто, с начала слова
+ * (placeHas): по extras.places — на всех языках сайта, с кодом и
  * сокращением страны («München, Bayern», «慕尼黑，德国», «Chicago, USA»), без
  * них — по русским подписям; у городов вроде
  * Москвы или Санкт-Петербурга регион в базе — null (совпадает с названием
@@ -99,11 +109,11 @@ export function resolveCity(
   if (q.length < 2) return { kind: 'not_found' };
   const hints = rest.slice(0, MAX_HINTS).map(normalize).filter(Boolean);
 
-  const search = (hintList: string[]) => {
+  const search = (hintList: string[], whole = true) => {
     const fits = (c: City, id: number) => {
       if (hintList.length === 0) return true;
       const place = places ? (places[id] ?? '') : normalize(`${c.region ?? ''} ${c.country}`);
-      return hintList.every((h) => placeHas(place, h));
+      return hintList.every((h) => placeHas(place, h, whole));
     };
     const exact: CityCandidate[] = [];
     const partial: CityCandidate[] = [];
@@ -132,6 +142,7 @@ export function resolveCity(
   };
 
   let { exact, partial } = search(hints);
+  if (hints.length > 0 && exact.length === 0 && partial.length === 0) ({ exact, partial } = search(hints, false));
   let dominantAllowed = true;
   if (hints.length > 0 && exact.length === 0 && partial.length === 0) {
     ({ exact, partial } = search([]));
