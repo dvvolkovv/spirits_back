@@ -194,10 +194,14 @@ export class QualityMonitorService {
     }
 
     // 4) Всплеск возвратов токенов = всплеск сбоев доставки (авто-рефанды видео и т.п.).
+    // Ручные компенсации (metadata.compensation = true) — не сбой доставки: 14.10.2026
+    // возврат переплаты 25 пользователям поднял эту тревогу дважды. Компенсацию
+    // начислять с этим флагом, иначе она снова сойдёт за поломку.
     const ref = await this.pg.query(
       `SELECT count(*)::int AS n, COALESCE(SUM(amount), 0)::bigint AS tokens
          FROM token_transactions
-        WHERE transaction_type = 'refund' AND created_at > now() - ($1 || ' minutes')::interval`,
+        WHERE transaction_type = 'refund' AND created_at > now() - ($1 || ' minutes')::interval
+          AND COALESCE(metadata->>'compensation', '') <> 'true'`,
       [REFUND_WINDOW_MIN],
     );
     const refCount = Number(ref.rows[0]?.n || 0);
