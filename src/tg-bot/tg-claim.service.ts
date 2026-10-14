@@ -2,6 +2,14 @@ import { Injectable, Logger, BadRequestException, ConflictException } from '@nes
 import { PgService } from '../common/services/pg.service';
 import { TgIdentityService } from './tg-identity.service';
 
+/** Почему не удалась привязка группы — бот скажет это своими словами (tg-i18n). */
+export type TgClaimFailure = 'expired' | 'wrong_account' | 'group_taken' | 'already_connected';
+
+function claimError(failure: TgClaimFailure, message: string, conflict = false) {
+  const e = conflict ? new ConflictException(message) : new BadRequestException(message);
+  return Object.assign(e, { claimFailure: failure });
+}
+
 @Injectable()
 export class TgClaimService {
   private readonly logger = new Logger(TgClaimService.name);
@@ -18,7 +26,7 @@ export class TgClaimService {
     tgChatTitle: string | null,
   ): Promise<{ ownerUserId: string; configId: string; displayName: string }> {
     const tokRes = await this.pg.query(
-      `SELECT t.owner_user_id, t.config_id, c.display_name
+      `SELECT t.owner_user_id, t.config_id, c.display_name, c.status
          FROM tg_claim_tokens t
          LEFT JOIN tg_bot_configs c ON c.id = t.config_id
         WHERE t.token = $1 AND t.kind = 'claim'
@@ -27,13 +35,22 @@ export class TgClaimService {
       [token],
     );
     if (tokRes.rows.length === 0) {
-      throw new BadRequestException('invalid or expired claim token');
+      throw claimError('expired', 'invalid or expired claim token');
     }
-    const { owner_user_id: ownerId, config_id: configId, display_name: displayName } = tokRes.rows[0];
+    const { owner_user_id: ownerId, config_id: configId, display_name: displayName, status } = tokRes.rows[0];
 
     const expectedTgUserId = await this.identity.getIdentityByLinkeonId(ownerId);
     if (!expectedTgUserId || expectedTgUserId.tgUserId !== tgUserId) {
-      throw new BadRequestException('claim token не принадлежит этому Telegram-аккаунту');
+      throw claimError('wrong_account', 'claim token не принадлежит этому Telegram-аккаунту');
+    }
+
+    // Бот, уже работающий в группе, по второй живой ссылке не переносится:
+    // раньше её открытие в другой группе молча утаскивало рабочего бота, а в
+    // первой группе он оставался участником без конфига и молчал. Ссылку на
+    // подключение даёт только бот, который ещё ни к одной группе не подключён
+    // (pending; перевыпуск возвращает в pending и архивного).
+    if (status !== 'pending') {
+      throw claimError('already_connected', `claim по конфигу в статусе ${status}`);
     }
 
     const conflictRes = await this.pg.query(
@@ -42,7 +59,7 @@ export class TgClaimService {
       [tgChatId, configId],
     );
     if (conflictRes.rows.length > 0) {
-      throw new ConflictException('эта группа уже привязана к другому аккаунту Linkeon');
+      throw claimError('group_taken', 'эта группа уже привязана к другому аккаунту Linkeon', true);
     }
 
     await this.pg.query(

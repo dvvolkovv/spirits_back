@@ -42,7 +42,10 @@ export class TgGrammyClient implements OnModuleInit {
       // Меню команд в клиенте Telegram (кнопка «/» рядом с полем ввода).
       // Без него про /assistants узнать неоткуда, кроме /help — а про /help
       // тоже надо сначала догадаться.
-      await this.registerCommandMenus();
+      // Не ждём: 17 вызовов подряд держали бы старт всего API (Nest не
+      // начинает слушать порт до конца onModuleInit), а при подвисшем
+      // api.telegram.org — надолго. Метод сам не бросает.
+      void this.registerCommandMenus();
     } catch (e: any) {
       this.logger.error(`setWebhook failed: ${e.message}`);
     }

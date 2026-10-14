@@ -8,10 +8,12 @@ import { DEFAULT_LANGUAGE, LanguageService, SUPPORTED_LANGUAGES } from '../commo
  * подписи кнопок и меню команд, — уходило по-русски и на «ты», хотя кабинет
  * переведён на семь языков и говорит «вы» (решение владельца 14.10.2026).
  *
- * Язык — тот же, на котором отвечает ассистент: profile_data.language
- * владельца. Для того, кто ещё не привязан к Linkeon, — язык его клиента
- * Telegram (from.language_code). Регистр — как в кабинете на этом языке:
- * ru и fr — «вы», de/es/pt — «ты», zh — 您.
+ * Язык — язык профиля Linkeon (profile_data.language): тот же, что в
+ * кабинете и мини-аппе (кабинет сам записывает его в профиль при входе).
+ * Язык клиента Telegram (from.language_code) — только тем, у кого аккаунта
+ * ещё нет: иначе в одной личке ответы шли бы на языке клиента, а фоновые
+ * сообщения (баланс, видео) — на языке профиля. Регистр — как в кабинете
+ * на этом языке: ru и fr — «вы», de/es/pt — «ты», zh — 您.
  *
  * Шаблоны с <b> уходят с parse_mode HTML: подставляемые имена экранирует
  * вызывающий (escapeHtml), в самих шаблонах — только <b>, <i>, <code>.
@@ -32,13 +34,13 @@ const ru = {
   start_hello: 'Привет!',
   start_hello_agent: 'Привет! Сейчас отвечает <b>{agent}</b>.',
   start_body: 'Пишите сюда — ассистент ответит. /assistants — сменить ассистента, /balance — баланс.',
-  unlinked_chat: 'Чтобы я отвечал, нужен аккаунт Linkeon — откройте его кнопкой ниже.',
-  unlinked_command: 'Для этой команды нужен аккаунт Linkeon — откройте его кнопкой ниже.',
+  unlinked_chat: 'Чтобы я отвечал, нужен аккаунт Linkeon — нажмите кнопку ниже, там его можно завести или привязать.',
+  unlinked_command: 'Для этой команды нужен аккаунт Linkeon — нажмите кнопку ниже, там его можно завести или привязать.',
   open_linkeon: 'Открыть Linkeon',
   bind_ok: 'Привет! Ваш Telegram привязан к Linkeon — можно возвращаться на сайт.',
   bind_ok_named: 'Привет, {name}! Ваш Telegram привязан к Linkeon — можно возвращаться на сайт.',
-  bind_conflict: 'Этот Telegram ({who}) уже привязан к другому аккаунту Linkeon. Новая ссылка не поможет — ограничение не в ней. Откройте ссылку из того Telegram-аккаунта, который хотите привязать, или сначала отвяжите этот от старого аккаунта.',
-  bind_failed: 'Не получилось привязать: {reason}. Получите в Linkeon новую ссылку — старая могла истечь (ссылка живёт 15 минут).',
+  bind_conflict: 'Этот Telegram ({who}) уже привязан к другому аккаунту Linkeon, поэтому новая ссылка не поможет. Откройте ссылку из того Telegram-аккаунта, который хотите привязать, или сначала отвяжите этот от старого аккаунта.',
+  bind_failed: 'Не получилось привязать Telegram. Получите в Linkeon новую ссылку — старая могла истечь (ссылка живёт 15 минут).',
 
   // Личка: справка и команды
   dm_help: 'Я бот Linkeon — отвечаю здесь, в личке, и в группах, куда меня добавил владелец.\n\nКоманды:\n/start — подключить Telegram к Linkeon\n/assistants — выбрать ассистента для лички\n/language — язык ответов\n/balance — баланс токенов вашего аккаунта\n/silent — замолчать во всех ваших группах\n/resume — снова отвечать в них\n/help — это сообщение\n\nВ группе /silent и /resume управляют только ботом этой группы.\n\nКабинет: https://my.linkeon.io/telegram-bots',
@@ -48,7 +50,7 @@ const ru = {
   silenced: '🤫 Замолкли:',
   resumed: '✅ Снова на связи:',
   list_private: '• <b>{name}</b> в личке',
-  list_group: '• <b>{name}</b> в «{group}»',
+  list_group: '• <b>{name}</b> в группе «{group}»',
   list_group_untitled: '• <b>{name}</b> в группе',
   unknown_command: 'Не знаю такой команды. /help — список доступных.',
 
@@ -65,9 +67,13 @@ const ru = {
   nav_next: 'Дальше →',
 
   // Группа: привязка и выход
-  claim_hello: 'Я {name}. Зовите меня @{bot} или ответом на это сообщение.',
-  claim_failed: 'Не получилось привязать бота: {reason}',
-  bot_removed: 'Бот «{name}» удалён из «{group}». Настройки сохранены в архиве — их можно восстановить в кабинете.',
+  claim_hello: 'Я {name}. Чтобы позвать меня, обратитесь ко мне по имени, упомяните @{bot} или ответьте на это сообщение.',
+  claim_failed: 'Не получилось привязать бота. Попробуйте ещё раз или получите в Linkeon новую ссылку.',
+  claim_expired: 'Ссылка для группы устарела — она действует 15 минут. Получите в Linkeon новую.',
+  claim_wrong_account: 'Эту ссылку нужно открыть из Telegram, привязанного к вашему аккаунту Linkeon.',
+  claim_group_taken: 'В этой группе уже работает бот другого аккаунта Linkeon.',
+  claim_already_connected: 'Этот бот уже подключён к группе. Для другой группы создайте в кабинете нового бота.',
+  bot_removed: 'Бот «{name}» удалён из группы «{group}». Настройки сохранены в архиве — их можно восстановить в кабинете.',
   bot_removed_untitled: 'Бот «{name}» удалён из группы. Настройки сохранены в архиве — их можно восстановить в кабинете.',
 
   // Группа: команды
@@ -96,23 +102,23 @@ const ru = {
   tool_image: '🎨 Готовлю картинку...',
   tool_upscale: '✨ Улучшаю картинку...',
   tool_video: '🎬 Запускаю генерацию видео...',
-  turn_failed: '⚠️ Не получилось обработать запрос: {reason}',
-  delivery_failed: '⚠️ Ответ готов, но не отправился из-за технического сбоя. Мы уже видим ошибку — попробуйте переспросить.',
-  attach_failed: '(не удалось приложить файл: {reason})',
+  turn_failed: '⚠️ Не получилось обработать запрос — попробуйте ещё раз чуть позже.',
+  delivery_failed: '⚠️ Ответ готов, но не отправился из-за технического сбоя. Мы уже знаем о сбое — задайте вопрос ещё раз.',
+  attach_failed: '(не удалось приложить файл)',
   video_queued: '🎬 Видео в очереди (1–3 минуты). Пришлю, как только будет готово.',
   video_failed: '⚠️ Не получилось сгенерировать видео.',
   video_expired: '⚠️ Видео сгенерировалось, но не получилось доставить — ссылка истекла.',
 
   // Встречи
-  meeting_who: 'Ассистент зайдёт во встречу',
-  meeting_who_agent: '{agent} зайдёт во встречу',
-  meeting_join: 'Зайти во встречу',
+  meeting_who: 'Ассистент подключится к встрече.',
+  meeting_who_agent: '{agent} подключится к встрече.',
+  meeting_join: 'Подключиться к встрече',
   meeting_title: 'Встреча',
   meeting_title_meet: 'Встреча Google Meet',
   meeting_title_zoom: 'Встреча Zoom',
   meeting_link_expired: 'Ссылка устарела — пришлите её ещё раз.',
   meeting_pick_assistant: 'Сначала выберите ассистента: /assistants',
-  meeting_joined: '{agent} во встрече.',
+  meeting_joined: '{agent} на встрече.',
   meeting_busy: 'Разговор уже идёт — завершите его и попробуйте снова.',
   meeting_unavailable: 'Не получилось зайти: комната недоступна.',
 
@@ -138,15 +144,15 @@ type Catalog = Record<TgTextKey, string>;
 const en: Catalog = {
   start_unlinked: "Hi! To get started, open Linkeon — you can create an account there or link an existing one.",
   start_hello: "Hi!",
-  start_hello_agent: "Hi! <b>{agent}</b> is replying right now.",
+  start_hello_agent: "Hi! You're chatting with <b>{agent}</b>.",
   start_body: "Write here and the assistant will reply. /assistants — switch assistant, /balance — balance.",
-  unlinked_chat: "To get replies from me, you need a Linkeon account — open it with the button below.",
-  unlinked_command: "This command needs a Linkeon account — open it with the button below.",
+  unlinked_chat: "To get replies from me, you need a Linkeon account — tap the button below to create or link one.",
+  unlinked_command: "This command needs a Linkeon account — tap the button below to create or link one.",
   open_linkeon: "Open Linkeon",
   bind_ok: "Hi! Your Telegram is now linked to Linkeon — you can go back to the site.",
   bind_ok_named: "Hi, {name}! Your Telegram is now linked to Linkeon — you can go back to the site.",
-  bind_conflict: "This Telegram ({who}) is already linked to another Linkeon account. A new link won't help — the restriction isn't in the link. Open the link from the Telegram account you want to link, or first unlink this one from the old account.",
-  bind_failed: "Couldn't link: {reason}. Get a new link in Linkeon — the old one may have expired (a link lasts 15 minutes).",
+  bind_conflict: "This Telegram ({who}) is already linked to another Linkeon account, so a new link won't help. Open the link from the Telegram account you want to link, or first unlink this one from the old account.",
+  bind_failed: "Couldn't link your Telegram. Get a new link in Linkeon — the old one may have expired (a link lasts 15 minutes).",
 
   dm_help: "I'm the Linkeon bot — I reply here in private chat and in groups where the owner added me.\n\nCommands:\n/start — connect Telegram to Linkeon\n/assistants — choose the assistant for this chat\n/language — reply language\n/balance — your account's token balance\n/silent — go quiet in all your groups\n/resume — reply in them again\n/help — this message\n\nIn a group, /silent and /resume control only that group's bot.\n\nYour account: https://my.linkeon.io/telegram-bots",
   balance: "Token balance: <b>{balance}</b>\nTop up: https://my.linkeon.io/tokens",
@@ -160,25 +166,29 @@ const en: Catalog = {
   unknown_command: "I don't know that command. /help — list of commands.",
 
   language_prompt: "Which language should I reply in?",
-  language_unknown: "No such language",
+  language_unknown: "This language isn't available",
   language_set: "Done — reply language: <b>{language}</b>.",
   assistants_prompt: "Who should reply?",
-  assistants_current: "<b>{agent}</b> is replying now. Who should reply?",
+  assistants_current: "You're chatting with <b>{agent}</b>. Who should reply?",
   assistant_unknown: "No such assistant",
-  assistant_set: "<b>{agent}</b> is replying now.",
+  assistant_set: "<b>{agent}</b> will reply from now on.",
   assistant_switched_note: "— {agent} takes over from here. —",
   nav_back: "← Back",
   nav_next: "Next →",
 
-  claim_hello: "I'm {name}. Call me with @{bot} or reply to this message.",
-  claim_failed: "Couldn't connect the bot: {reason}",
+  claim_hello: "I'm {name}. To call me, use my name, mention @{bot} or reply to this message.",
+  claim_failed: "Couldn't connect the bot. Try again or get a new link in Linkeon.",
+  claim_expired: "The group link has expired — links are valid for 15 minutes. Get a new one in Linkeon.",
+  claim_wrong_account: "This link has to be opened from the Telegram account linked to your Linkeon account.",
+  claim_group_taken: "A bot from another Linkeon account is already working in this group.",
+  claim_already_connected: "This bot is already connected to a group. For another group, create a new bot in your account.",
   bot_removed: "The bot “{name}” was removed from “{group}”. Its settings are archived — you can restore them in your account.",
   bot_removed_untitled: "The bot “{name}” was removed from the group. Its settings are archived — you can restore them in your account.",
 
   group_help: "I'm <b>{name}</b> — {mode}.\n\nCommands:\n/help — this message\n/balance — owner's balance (owner only)\n/silent — go quiet (owner only)\n/resume — reply again (owner only)\n\nYour account: https://my.linkeon.io/telegram-bots",
   mode_strict: "I reply only when addressed",
   mode_always: "I reply to every message",
-  mode_smart: "I join in when I see it's worth it",
+  mode_smart: "I chime in when it's relevant",
   owner_only: "Only the bot's owner can use this command.",
   group_silenced: "🤫 Going quiet until /resume.",
   group_resumed: "✅ Back online.",
@@ -199,15 +209,15 @@ const en: Catalog = {
   tool_image: "🎨 Preparing an image...",
   tool_upscale: "✨ Enhancing the image...",
   tool_video: "🎬 Starting video generation...",
-  turn_failed: "⚠️ Couldn't process the request: {reason}",
-  delivery_failed: "⚠️ The reply is ready but didn't go through because of a technical failure. We already see the error — please ask again.",
-  attach_failed: "(couldn't attach the file: {reason})",
+  turn_failed: "⚠️ Couldn't process the request — please try again a bit later.",
+  delivery_failed: "⚠️ The reply is ready but didn't go through because of a technical failure. We've been notified — please ask again.",
+  attach_failed: "(couldn't attach the file)",
   video_queued: "🎬 The video is queued (1–3 minutes). I'll send it as soon as it's ready.",
   video_failed: "⚠️ Couldn't generate the video.",
   video_expired: "⚠️ The video was generated but couldn't be delivered — the link expired.",
 
-  meeting_who: "The assistant will join the meeting",
-  meeting_who_agent: "{agent} will join the meeting",
+  meeting_who: "The assistant will join the meeting.",
+  meeting_who_agent: "{agent} will join the meeting.",
   meeting_join: "Join the meeting",
   meeting_title: "Meeting",
   meeting_title_meet: "Google Meet meeting",
@@ -233,32 +243,32 @@ const en: Catalog = {
 };
 
 const de: Catalog = {
-  start_unlinked: 'Hallo! Öffne zuerst Linkeon — dort kannst du ein Konto anlegen oder ein bestehendes verknüpfen.',
+  start_unlinked: 'Hallo! Öffne zuerst Linkeon – dort kannst du ein Konto anlegen oder ein bestehendes verknüpfen.',
   start_hello: 'Hallo!',
   start_hello_agent: 'Hallo! Gerade antwortet <b>{agent}</b>.',
-  start_body: 'Schreib hier, und der Assistent antwortet. /assistants — Assistenten wechseln, /balance — Guthaben.',
-  unlinked_chat: 'Damit ich antworte, brauchst du ein Linkeon-Konto — öffne es mit der Schaltfläche unten.',
-  unlinked_command: 'Für diesen Befehl brauchst du ein Linkeon-Konto — öffne es mit der Schaltfläche unten.',
+  start_body: 'Schreib hier, und der Assistent antwortet. /assistants – Assistenten wechseln, /balance – Guthaben.',
+  unlinked_chat: 'Damit ich antworte, brauchst du ein Linkeon-Konto – tippe unten auf die Schaltfläche, dort kannst du eins anlegen oder verknüpfen.',
+  unlinked_command: 'Für diesen Befehl brauchst du ein Linkeon-Konto – tippe unten auf die Schaltfläche, dort kannst du eins anlegen oder verknüpfen.',
   open_linkeon: 'Linkeon öffnen',
-  bind_ok: 'Hallo! Dein Telegram ist jetzt mit Linkeon verknüpft — du kannst zur Website zurückkehren.',
-  bind_ok_named: 'Hallo, {name}! Dein Telegram ist jetzt mit Linkeon verknüpft — du kannst zur Website zurückkehren.',
-  bind_conflict: 'Dieses Telegram ({who}) ist bereits mit einem anderen Linkeon-Konto verknüpft. Ein neuer Link hilft nicht — die Einschränkung liegt nicht am Link. Öffne den Link in dem Telegram-Konto, das du verknüpfen willst, oder trenne dieses zuerst vom alten Konto.',
-  bind_failed: 'Verknüpfen hat nicht geklappt: {reason}. Hol dir in Linkeon einen neuen Link — der alte ist vielleicht abgelaufen (ein Link gilt 15 Minuten).',
+  bind_ok: 'Hallo! Dein Telegram ist jetzt mit Linkeon verknüpft – du kannst zur Website zurückkehren.',
+  bind_ok_named: 'Hallo, {name}! Dein Telegram ist jetzt mit Linkeon verknüpft – du kannst zur Website zurückkehren.',
+  bind_conflict: 'Dieses Telegram ({who}) ist bereits mit einem anderen Linkeon-Konto verknüpft, deshalb hilft ein neuer Link nicht. Öffne den Link in dem Telegram-Konto, das du verknüpfen willst, oder trenne dieses zuerst vom alten Konto.',
+  bind_failed: 'Dein Telegram konnte nicht verknüpft werden. Hol dir in Linkeon einen neuen Link – der alte ist vielleicht abgelaufen (ein Link gilt 15 Minuten).',
 
-  dm_help: 'Ich bin der Linkeon-Bot — ich antworte hier im privaten Chat und in Gruppen, in die mich der Besitzer aufgenommen hat.\n\nBefehle:\n/start — Telegram mit Linkeon verbinden\n/assistants — Assistenten für diesen Chat wählen\n/language — Antwortsprache\n/balance — Token-Guthaben deines Kontos\n/silent — in allen deinen Gruppen schweigen\n/resume — dort wieder antworten\n/help — diese Nachricht\n\nIn einer Gruppe steuern /silent und /resume nur den Bot dieser Gruppe.\n\nDein Konto: https://my.linkeon.io/telegram-bots',
+  dm_help: 'Ich bin der Linkeon-Bot – ich antworte hier im privaten Chat und in Gruppen, in die mich der Besitzer hinzugefügt hat.\n\nBefehle:\n/start – Telegram mit Linkeon verbinden\n/assistants – Assistenten für diesen Chat wählen\n/language – Antwortsprache\n/balance – Token-Guthaben deines Kontos\n/silent – in allen deinen Gruppen schweigen\n/resume – dort wieder antworten\n/help – diese Nachricht\n\nIn einer Gruppe steuern /silent und /resume nur den Bot dieser Gruppe.\n\nDein Konto: https://my.linkeon.io/telegram-bots',
   balance: 'Token-Guthaben: <b>{balance}</b>\nAufladen: https://my.linkeon.io/tokens',
-  silent_none: 'Keine aktiven Bots in Gruppen — niemand zum Stummschalten.',
-  resume_none: 'Keine stummgeschalteten Bots — niemand zum Aufwecken.',
+  silent_none: 'Keine aktiven Bots in Gruppen – nichts stummzuschalten.',
+  resume_none: 'Keine stummgeschalteten Bots – nichts zu reaktivieren.',
   silenced: '🤫 Stummgeschaltet:',
-  resumed: '✅ Wieder aktiv:',
+  resumed: '✅ Wieder da:',
   list_private: '• <b>{name}</b> im privaten Chat',
   list_group: '• <b>{name}</b> in „{group}“',
   list_group_untitled: '• <b>{name}</b> in einer Gruppe',
-  unknown_command: 'Diesen Befehl kenne ich nicht. /help — Liste der Befehle.',
+  unknown_command: 'Diesen Befehl kenne ich nicht. /help – Liste der Befehle.',
 
   language_prompt: 'In welcher Sprache soll ich antworten?',
-  language_unknown: 'Diese Sprache gibt es nicht',
-  language_set: 'Erledigt — Antwortsprache: <b>{language}</b>.',
+  language_unknown: 'Diese Sprache ist nicht verfügbar',
+  language_set: 'Erledigt – Antwortsprache: <b>{language}</b>.',
   assistants_prompt: 'Wer soll antworten?',
   assistants_current: 'Gerade antwortet <b>{agent}</b>. Wer soll antworten?',
   assistant_unknown: 'Diesen Assistenten gibt es nicht',
@@ -267,12 +277,16 @@ const de: Catalog = {
   nav_back: '← Zurück',
   nav_next: 'Weiter →',
 
-  claim_hello: 'Ich bin {name}. Ruf mich mit @{bot} oder antworte auf diese Nachricht.',
-  claim_failed: 'Der Bot konnte nicht verbunden werden: {reason}',
-  bot_removed: 'Der Bot „{name}“ wurde aus „{group}“ entfernt. Seine Einstellungen sind archiviert — du kannst sie in deinem Konto wiederherstellen.',
-  bot_removed_untitled: 'Der Bot „{name}“ wurde aus der Gruppe entfernt. Seine Einstellungen sind archiviert — du kannst sie in deinem Konto wiederherstellen.',
+  claim_hello: 'Ich bin {name}. Sprich mich mit meinem Namen an, erwähne @{bot} oder antworte auf diese Nachricht.',
+  claim_failed: 'Der Bot konnte nicht verbunden werden. Versuch es noch einmal oder hol dir in Linkeon einen neuen Link.',
+  claim_expired: 'Der Gruppenlink ist abgelaufen – er gilt 15 Minuten. Hol dir in Linkeon einen neuen.',
+  claim_wrong_account: 'Diesen Link musst du in dem Telegram öffnen, das mit deinem Linkeon-Konto verknüpft ist.',
+  claim_group_taken: 'In dieser Gruppe arbeitet bereits ein Bot eines anderen Linkeon-Kontos.',
+  claim_already_connected: 'Dieser Bot ist bereits mit einer Gruppe verbunden. Für eine weitere Gruppe leg in deinem Konto einen neuen Bot an.',
+  bot_removed: 'Der Bot „{name}“ wurde aus „{group}“ entfernt. Seine Einstellungen sind archiviert – du kannst sie in deinem Konto wiederherstellen.',
+  bot_removed_untitled: 'Der Bot „{name}“ wurde aus der Gruppe entfernt. Seine Einstellungen sind archiviert – du kannst sie in deinem Konto wiederherstellen.',
 
-  group_help: 'Ich bin <b>{name}</b> — {mode}.\n\nBefehle:\n/help — diese Nachricht\n/balance — Guthaben des Besitzers (nur für den Besitzer)\n/silent — schweigen (nur für den Besitzer)\n/resume — wieder antworten (nur für den Besitzer)\n\nDein Konto: https://my.linkeon.io/telegram-bots',
+  group_help: 'Ich bin <b>{name}</b> – {mode}.\n\nBefehle:\n/help – diese Nachricht\n/balance – Guthaben des Besitzers (nur für den Besitzer)\n/silent – schweigen (nur für den Besitzer)\n/resume – wieder antworten (nur für den Besitzer)\n\nDein Konto: https://my.linkeon.io/telegram-bots',
   mode_strict: 'ich antworte nur, wenn man mich anspricht',
   mode_always: 'ich antworte auf jede Nachricht',
   mode_smart: 'ich melde mich, wenn es passt',
@@ -282,7 +296,7 @@ const de: Catalog = {
   dm_only: 'Dieser Befehl funktioniert im privaten Chat mit dem Bot: @{bot}',
 
   zero_balance_group: '⚠️ Der Besitzer hat keine Tokens mehr. Der Bot antwortet erst wieder, wenn das Guthaben aufgeladen ist: https://my.linkeon.io/tokens',
-  busy: '⏳ Einen Moment — ich beende noch die vorige Anfrage. Warte kurz oder versuch es in 30 Sekunden noch einmal.',
+  busy: '⏳ Einen Moment – ich beende noch die vorige Anfrage. Warte kurz oder versuch es in 30 Sekunden noch einmal.',
   thinking: '🤔 Ich denke nach...',
   tool_products: '🛠 Arbeite am Produkt...',
   tool_read: '📄 Lese eine Datei...',
@@ -296,27 +310,27 @@ const de: Catalog = {
   tool_image: '🎨 Erstelle ein Bild...',
   tool_upscale: '✨ Verbessere das Bild...',
   tool_video: '🎬 Starte die Videoerstellung...',
-  turn_failed: '⚠️ Die Anfrage konnte nicht bearbeitet werden: {reason}',
-  delivery_failed: '⚠️ Die Antwort ist fertig, wurde aber wegen einer technischen Störung nicht gesendet. Wir sehen den Fehler bereits — frag bitte noch einmal.',
-  attach_failed: '(die Datei konnte nicht angehängt werden: {reason})',
+  turn_failed: '⚠️ Die Anfrage konnte nicht bearbeitet werden – versuch es bitte etwas später noch einmal.',
+  delivery_failed: '⚠️ Die Antwort ist fertig, wurde aber wegen einer technischen Störung nicht gesendet. Wir wissen schon Bescheid – frag bitte noch einmal.',
+  attach_failed: '(die Datei konnte nicht angehängt werden)',
   video_queued: '🎬 Das Video ist in der Warteschlange (1–3 Minuten). Ich schicke es, sobald es fertig ist.',
   video_failed: '⚠️ Das Video konnte nicht erstellt werden.',
-  video_expired: '⚠️ Das Video wurde erstellt, konnte aber nicht zugestellt werden — der Link ist abgelaufen.',
+  video_expired: '⚠️ Das Video wurde erstellt, konnte aber nicht zugestellt werden – der Link ist abgelaufen.',
 
-  meeting_who: 'Der Assistent kommt ins Meeting',
-  meeting_who_agent: '{agent} kommt ins Meeting',
+  meeting_who: 'Der Assistent kommt ins Meeting.',
+  meeting_who_agent: '{agent} kommt ins Meeting.',
   meeting_join: 'Am Meeting teilnehmen',
   meeting_title: 'Meeting',
-  meeting_title_meet: 'Google-Meet-Meeting',
+  meeting_title_meet: 'Meeting in Google Meet',
   meeting_title_zoom: 'Zoom-Meeting',
-  meeting_link_expired: 'Der Link ist abgelaufen — schick ihn noch einmal.',
+  meeting_link_expired: 'Der Link ist abgelaufen – schick ihn noch einmal.',
   meeting_pick_assistant: 'Wähle zuerst einen Assistenten: /assistants',
   meeting_joined: '{agent} ist im Meeting.',
-  meeting_busy: 'Es läuft bereits ein Gespräch — beende es und versuch es erneut.',
+  meeting_busy: 'Es läuft bereits ein Gespräch – beende es und versuch es erneut.',
   meeting_unavailable: 'Beitritt nicht möglich: Der Raum ist nicht verfügbar.',
 
   low_balance: '⚠️ Die Tokens werden knapp: noch {balance} auf dem Guthaben. Sind sie aufgebraucht, antworten deine Bots nicht mehr. Aufladen: https://my.linkeon.io/tokens',
-  zero_balance_owner: '⛔ Deine Tokens sind aufgebraucht — deine Bots antworten erst wieder, wenn du dein Guthaben auflädst: https://my.linkeon.io/tokens',
+  zero_balance_owner: '⛔ Deine Tokens sind aufgebraucht – deine Bots antworten erst wieder, wenn du dein Guthaben auflädst: https://my.linkeon.io/tokens',
 
   cmd_assistants: 'Assistenten wählen',
   cmd_language: 'Antwortsprache',
@@ -334,27 +348,27 @@ const fr: Catalog = {
   start_hello: 'Bonjour !',
   start_hello_agent: 'Bonjour ! C’est <b>{agent}</b> qui répond en ce moment.',
   start_body: 'Écrivez ici, l’assistant vous répondra. /assistants — changer d’assistant, /balance — solde.',
-  unlinked_chat: 'Pour que je réponde, il faut un compte Linkeon — ouvrez-le avec le bouton ci-dessous.',
-  unlinked_command: 'Cette commande nécessite un compte Linkeon — ouvrez-le avec le bouton ci-dessous.',
+  unlinked_chat: 'Pour que je réponde, il faut un compte Linkeon — appuyez sur le bouton ci-dessous pour en créer un ou lier le vôtre.',
+  unlinked_command: 'Cette commande nécessite un compte Linkeon — appuyez sur le bouton ci-dessous pour en créer un ou lier le vôtre.',
   open_linkeon: 'Ouvrir Linkeon',
   bind_ok: 'Bonjour ! Votre Telegram est maintenant lié à Linkeon — vous pouvez revenir sur le site.',
   bind_ok_named: 'Bonjour, {name} ! Votre Telegram est maintenant lié à Linkeon — vous pouvez revenir sur le site.',
-  bind_conflict: 'Ce Telegram ({who}) est déjà lié à un autre compte Linkeon. Un nouveau lien n’y changera rien — la restriction ne vient pas du lien. Ouvrez le lien depuis le compte Telegram que vous voulez lier, ou déliez d’abord celui-ci de l’ancien compte.',
-  bind_failed: 'La liaison a échoué : {reason}. Obtenez un nouveau lien dans Linkeon — l’ancien a peut-être expiré (un lien est valable 15 minutes).',
+  bind_conflict: 'Ce Telegram ({who}) est déjà lié à un autre compte Linkeon, un nouveau lien n’y changera donc rien. Ouvrez le lien depuis le compte Telegram que vous voulez lier, ou déliez d’abord celui-ci de l’ancien compte.',
+  bind_failed: 'Impossible de lier votre Telegram. Obtenez un nouveau lien dans Linkeon — l’ancien a peut-être expiré (un lien est valable 15 minutes).',
 
   dm_help: 'Je suis le bot Linkeon — je réponds ici, en message privé, et dans les groupes où le propriétaire m’a ajouté.\n\nCommandes :\n/start — connecter Telegram à Linkeon\n/assistants — choisir l’assistant de cette conversation\n/language — langue des réponses\n/balance — solde de jetons de votre compte\n/silent — me taire dans tous vos groupes\n/resume — y répondre de nouveau\n/help — ce message\n\nDans un groupe, /silent et /resume ne concernent que le bot de ce groupe.\n\nVotre compte : https://my.linkeon.io/telegram-bots',
   balance: 'Solde de jetons : <b>{balance}</b>\nRecharger : https://my.linkeon.io/tokens',
   silent_none: 'Aucun bot actif dans les groupes — rien à mettre en sourdine.',
   resume_none: 'Aucun bot en sourdine — rien à réactiver.',
   silenced: '🤫 En sourdine :',
-  resumed: '✅ De nouveau actifs :',
+  resumed: '✅ De retour :',
   list_private: '• <b>{name}</b> en message privé',
   list_group: '• <b>{name}</b> dans « {group} »',
   list_group_untitled: '• <b>{name}</b> dans un groupe',
   unknown_command: 'Je ne connais pas cette commande. /help — liste des commandes.',
 
   language_prompt: 'Dans quelle langue dois-je répondre ?',
-  language_unknown: 'Cette langue n’existe pas',
+  language_unknown: 'Cette langue n’est pas disponible',
   language_set: 'C’est fait, langue des réponses : <b>{language}</b>.',
   assistants_prompt: 'Qui doit répondre ?',
   assistants_current: 'C’est <b>{agent}</b> qui répond en ce moment. Qui doit répondre ?',
@@ -364,8 +378,12 @@ const fr: Catalog = {
   nav_back: '← Retour',
   nav_next: 'Suivant →',
 
-  claim_hello: 'Je suis {name}. Appelez-moi avec @{bot} ou en répondant à ce message.',
-  claim_failed: 'Impossible de connecter le bot : {reason}',
+  claim_hello: 'Je suis {name}. Pour m’appeler, écrivez mon nom, mentionnez @{bot} ou répondez à ce message.',
+  claim_failed: 'Impossible de connecter le bot. Réessayez ou obtenez un nouveau lien dans Linkeon.',
+  claim_expired: 'Le lien du groupe a expiré — il est valable 15 minutes. Obtenez-en un nouveau dans Linkeon.',
+  claim_wrong_account: 'Ce lien doit être ouvert depuis le Telegram lié à votre compte Linkeon.',
+  claim_group_taken: 'Un bot d’un autre compte Linkeon est déjà actif dans ce groupe.',
+  claim_already_connected: 'Ce bot est déjà connecté à un groupe. Pour un autre groupe, créez un nouveau bot dans votre compte.',
   bot_removed: 'Le bot « {name} » a été retiré de « {group} ». Ses réglages sont archivés — vous pouvez les restaurer dans votre compte.',
   bot_removed_untitled: 'Le bot « {name} » a été retiré du groupe. Ses réglages sont archivés — vous pouvez les restaurer dans votre compte.',
 
@@ -393,15 +411,15 @@ const fr: Catalog = {
   tool_image: '🎨 Je prépare une image...',
   tool_upscale: '✨ J’améliore l’image...',
   tool_video: '🎬 Je lance la génération de la vidéo...',
-  turn_failed: '⚠️ Impossible de traiter la demande : {reason}',
-  delivery_failed: '⚠️ La réponse est prête, mais elle n’a pas pu être envoyée à cause d’une panne technique. Nous voyons déjà l’erreur — reposez votre question.',
-  attach_failed: '(impossible de joindre le fichier : {reason})',
+  turn_failed: '⚠️ Impossible de traiter la demande — réessayez un peu plus tard.',
+  delivery_failed: '⚠️ La réponse est prête, mais elle n’a pas pu être envoyée à cause d’une panne technique. Nous en avons été informés — reposez votre question.',
+  attach_failed: '(impossible de joindre le fichier)',
   video_queued: '🎬 La vidéo est en file d’attente (1 à 3 minutes). Je l’envoie dès qu’elle est prête.',
   video_failed: '⚠️ Impossible de générer la vidéo.',
   video_expired: '⚠️ La vidéo a été générée, mais n’a pas pu être livrée — le lien a expiré.',
 
-  meeting_who: 'L’assistant va rejoindre la réunion',
-  meeting_who_agent: '{agent} va rejoindre la réunion',
+  meeting_who: 'L’assistant va rejoindre la réunion.',
+  meeting_who_agent: '{agent} va rejoindre la réunion.',
   meeting_join: 'Rejoindre la réunion',
   meeting_title: 'Réunion',
   meeting_title_meet: 'Réunion Google Meet',
@@ -412,17 +430,17 @@ const fr: Catalog = {
   meeting_busy: 'Une conversation est déjà en cours — terminez-la et réessayez.',
   meeting_unavailable: 'Impossible de rejoindre : la salle n’est pas disponible.',
 
-  low_balance: '⚠️ Vos jetons s’épuisent : il en reste {balance}. Une fois épuisés, vos bots ne répondront plus. Recharger : https://my.linkeon.io/tokens',
+  low_balance: '⚠️ Vos jetons s’épuisent : il en reste {balance}. Une fois le solde épuisé, vos bots ne répondront plus. Recharger : https://my.linkeon.io/tokens',
   zero_balance_owner: '⛔ Vous n’avez plus de jetons — vos bots ne répondront pas tant que vous n’aurez pas rechargé votre solde : https://my.linkeon.io/tokens',
 
   cmd_assistants: 'Choisir un assistant',
   cmd_language: 'Langue des réponses',
   cmd_balance: 'Solde de jetons',
   cmd_balance_owner: 'Solde du propriétaire',
-  cmd_silent_all: 'Me taire dans tous les groupes',
-  cmd_silent_here: 'Me taire dans ce groupe',
-  cmd_resume_all: 'Répondre de nouveau dans les groupes',
-  cmd_resume_here: 'Répondre de nouveau ici',
+  cmd_silent_all: 'Mettre le bot en sourdine dans tous les groupes',
+  cmd_silent_here: 'Mettre le bot en sourdine dans ce groupe',
+  cmd_resume_all: 'Réactiver le bot dans les groupes',
+  cmd_resume_here: 'Réactiver le bot ici',
   cmd_help: 'Ce que fait le bot',
 };
 
@@ -431,27 +449,27 @@ const es: Catalog = {
   start_hello: '¡Hola!',
   start_hello_agent: '¡Hola! Ahora responde <b>{agent}</b>.',
   start_body: 'Escribe aquí y el asistente te responderá. /assistants — cambiar de asistente, /balance — saldo.',
-  unlinked_chat: 'Para que te responda, necesitas una cuenta de Linkeon: ábrela con el botón de abajo.',
-  unlinked_command: 'Para este comando necesitas una cuenta de Linkeon: ábrela con el botón de abajo.',
+  unlinked_chat: 'Para que te responda, necesitas una cuenta de Linkeon: pulsa el botón de abajo para crearla o vincular la tuya.',
+  unlinked_command: 'Para este comando necesitas una cuenta de Linkeon: pulsa el botón de abajo para crearla o vincular la tuya.',
   open_linkeon: 'Abrir Linkeon',
   bind_ok: '¡Hola! Tu Telegram ya está vinculado a Linkeon: puedes volver al sitio.',
   bind_ok_named: '¡Hola, {name}! Tu Telegram ya está vinculado a Linkeon: puedes volver al sitio.',
-  bind_conflict: 'Este Telegram ({who}) ya está vinculado a otra cuenta de Linkeon. Un enlace nuevo no servirá: la restricción no está en el enlace. Abre el enlace desde la cuenta de Telegram que quieres vincular o desvincula primero esta de la cuenta anterior.',
-  bind_failed: 'No se pudo vincular: {reason}. Consigue un enlace nuevo en Linkeon; puede que el anterior haya caducado (un enlace dura 15 minutos).',
+  bind_conflict: 'Este Telegram ({who}) ya está vinculado a otra cuenta de Linkeon, así que un enlace nuevo no servirá. Abre el enlace desde la cuenta de Telegram que quieres vincular o desvincula primero esta de la cuenta anterior.',
+  bind_failed: 'No se pudo vincular tu Telegram. Consigue un enlace nuevo en Linkeon; puede que el anterior haya caducado (un enlace dura 15 minutos).',
 
   dm_help: 'Soy el bot de Linkeon: respondo aquí, en el chat privado, y en los grupos donde me añadió el propietario.\n\nComandos:\n/start — conectar Telegram con Linkeon\n/assistants — elegir el asistente de este chat\n/language — idioma de las respuestas\n/balance — saldo de tokens de tu cuenta\n/silent — callar en todos tus grupos\n/resume — volver a responder en ellos\n/help — este mensaje\n\nEn un grupo, /silent y /resume solo controlan el bot de ese grupo.\n\nTu cuenta: https://my.linkeon.io/telegram-bots',
   balance: 'Saldo de tokens: <b>{balance}</b>\nRecargar: https://my.linkeon.io/tokens',
   silent_none: 'No hay bots activos en grupos: nada que silenciar.',
   resume_none: 'No hay bots silenciados: nada que reactivar.',
   silenced: '🤫 Silenciados:',
-  resumed: '✅ De nuevo activos:',
+  resumed: '✅ De vuelta:',
   list_private: '• <b>{name}</b> en el chat privado',
   list_group: '• <b>{name}</b> en «{group}»',
   list_group_untitled: '• <b>{name}</b> en un grupo',
   unknown_command: 'No conozco ese comando. /help — lista de comandos.',
 
   language_prompt: '¿En qué idioma respondo?',
-  language_unknown: 'Ese idioma no existe',
+  language_unknown: 'Ese idioma no está disponible',
   language_set: 'Listo, idioma de las respuestas: <b>{language}</b>.',
   assistants_prompt: '¿Quién debe responder?',
   assistants_current: 'Ahora responde <b>{agent}</b>. ¿Quién debe responder?',
@@ -461,8 +479,12 @@ const es: Catalog = {
   nav_back: '← Atrás',
   nav_next: 'Siguiente →',
 
-  claim_hello: 'Soy {name}. Llámame con @{bot} o respondiendo a este mensaje.',
-  claim_failed: 'No se pudo conectar el bot: {reason}',
+  claim_hello: 'Soy {name}. Para llamarme, escribe mi nombre, menciona @{bot} o responde a este mensaje.',
+  claim_failed: 'No se pudo conectar el bot. Inténtalo de nuevo o consigue un enlace nuevo en Linkeon.',
+  claim_expired: 'El enlace del grupo ha caducado: dura 15 minutos. Consigue uno nuevo en Linkeon.',
+  claim_wrong_account: 'Este enlace debe abrirse desde el Telegram vinculado a tu cuenta de Linkeon.',
+  claim_group_taken: 'En este grupo ya funciona un bot de otra cuenta de Linkeon.',
+  claim_already_connected: 'Este bot ya está conectado a un grupo. Para otro grupo, crea un bot nuevo en tu cuenta.',
   bot_removed: 'El bot «{name}» fue eliminado de «{group}». Su configuración está archivada: puedes restaurarla en tu cuenta.',
   bot_removed_untitled: 'El bot «{name}» fue eliminado del grupo. Su configuración está archivada: puedes restaurarla en tu cuenta.',
 
@@ -490,15 +512,15 @@ const es: Catalog = {
   tool_image: '🎨 Preparando una imagen...',
   tool_upscale: '✨ Mejorando la imagen...',
   tool_video: '🎬 Iniciando la generación del vídeo...',
-  turn_failed: '⚠️ No se pudo procesar la solicitud: {reason}',
-  delivery_failed: '⚠️ La respuesta está lista, pero no se envió por un fallo técnico. Ya vemos el error: vuelve a preguntar.',
-  attach_failed: '(no se pudo adjuntar el archivo: {reason})',
+  turn_failed: '⚠️ No se pudo procesar la solicitud: inténtalo de nuevo un poco más tarde.',
+  delivery_failed: '⚠️ La respuesta está lista, pero no se envió por un fallo técnico. Ya estamos al tanto: vuelve a preguntar.',
+  attach_failed: '(no se pudo adjuntar el archivo)',
   video_queued: '🎬 El vídeo está en cola (1–3 minutos). Te lo envío en cuanto esté listo.',
   video_failed: '⚠️ No se pudo generar el vídeo.',
   video_expired: '⚠️ El vídeo se generó, pero no se pudo entregar: el enlace caducó.',
 
-  meeting_who: 'El asistente entrará en la reunión',
-  meeting_who_agent: '{agent} entrará en la reunión',
+  meeting_who: 'El asistente entrará en la reunión.',
+  meeting_who_agent: '{agent} entrará en la reunión.',
   meeting_join: 'Entrar en la reunión',
   meeting_title: 'Reunión',
   meeting_title_meet: 'Reunión de Google Meet',
@@ -510,14 +532,14 @@ const es: Catalog = {
   meeting_unavailable: 'No se pudo entrar: la sala no está disponible.',
 
   low_balance: '⚠️ Te quedan pocos tokens: {balance} en el saldo. Cuando se acaben, tus bots dejarán de responder. Recargar: https://my.linkeon.io/tokens',
-  zero_balance_owner: '⛔ Se te han acabado los tokens: tus bots no responderán hasta que recargues el saldo: https://my.linkeon.io/tokens',
+  zero_balance_owner: '⛔ Se te han acabado los tokens. Tus bots no responderán hasta que recargues el saldo: https://my.linkeon.io/tokens',
 
   cmd_assistants: 'Elegir asistente',
   cmd_language: 'Idioma de las respuestas',
   cmd_balance: 'Saldo de tokens',
   cmd_balance_owner: 'Saldo del propietario',
-  cmd_silent_all: 'Callar en todos los grupos',
-  cmd_silent_here: 'Callar en este grupo',
+  cmd_silent_all: 'Silenciar en todos los grupos',
+  cmd_silent_here: 'Silenciar en este grupo',
   cmd_resume_all: 'Volver a responder en los grupos',
   cmd_resume_here: 'Volver a responder aquí',
   cmd_help: 'Qué sabe hacer el bot',
@@ -528,27 +550,27 @@ const pt: Catalog = {
   start_hello: 'Olá!',
   start_hello_agent: 'Olá! Neste momento responde <b>{agent}</b>.',
   start_body: 'Escreve aqui e o assistente responde. /assistants — mudar de assistente, /balance — saldo.',
-  unlinked_chat: 'Para eu responder, precisas de uma conta Linkeon — abre-a com o botão abaixo.',
-  unlinked_command: 'Este comando precisa de uma conta Linkeon — abre-a com o botão abaixo.',
+  unlinked_chat: 'Para eu responder, precisas de uma conta Linkeon — toca no botão abaixo para criares uma ou associares a tua.',
+  unlinked_command: 'Este comando precisa de uma conta Linkeon — toca no botão abaixo para criares uma ou associares a tua.',
   open_linkeon: 'Abrir o Linkeon',
   bind_ok: 'Olá! O teu Telegram está associado ao Linkeon — podes voltar ao site.',
   bind_ok_named: 'Olá, {name}! O teu Telegram está associado ao Linkeon — podes voltar ao site.',
-  bind_conflict: 'Este Telegram ({who}) já está associado a outra conta Linkeon. Um novo link não resolve — a restrição não está no link. Abre o link a partir da conta de Telegram que queres associar ou desassocia primeiro esta da conta antiga.',
-  bind_failed: 'Não foi possível associar: {reason}. Obtém um novo link no Linkeon — o anterior pode ter expirado (cada link dura 15 minutos).',
+  bind_conflict: 'Este Telegram ({who}) já está associado a outra conta Linkeon, por isso um novo link não resolve. Abre o link a partir da conta de Telegram que queres associar ou desassocia primeiro esta da conta antiga.',
+  bind_failed: 'Não foi possível associar o teu Telegram. Obtém um novo link no Linkeon — o anterior pode ter expirado (cada link dura 15 minutos).',
 
   dm_help: 'Sou o bot do Linkeon — respondo aqui, na conversa privada, e nos grupos onde o proprietário me adicionou.\n\nComandos:\n/start — ligar o Telegram ao Linkeon\n/assistants — escolher o assistente desta conversa\n/language — idioma das respostas\n/balance — saldo de tokens da tua conta\n/silent — ficar em silêncio em todos os teus grupos\n/resume — voltar a responder neles\n/help — esta mensagem\n\nNum grupo, /silent e /resume controlam apenas o bot desse grupo.\n\nA tua área pessoal: https://my.linkeon.io/telegram-bots',
   balance: 'Saldo de tokens: <b>{balance}</b>\nCarregar: https://my.linkeon.io/tokens',
   silent_none: 'Não há bots ativos em grupos — nada para silenciar.',
   resume_none: 'Não há bots silenciados — nada para reativar.',
   silenced: '🤫 Em silêncio:',
-  resumed: '✅ De novo ativos:',
+  resumed: '✅ De volta:',
   list_private: '• <b>{name}</b> na conversa privada',
   list_group: '• <b>{name}</b> em «{group}»',
   list_group_untitled: '• <b>{name}</b> num grupo',
   unknown_command: 'Não conheço esse comando. /help — lista de comandos.',
 
   language_prompt: 'Em que idioma devo responder?',
-  language_unknown: 'Esse idioma não existe',
+  language_unknown: 'Esse idioma não está disponível',
   language_set: 'Feito — idioma das respostas: <b>{language}</b>.',
   assistants_prompt: 'Quem deve responder?',
   assistants_current: 'Neste momento responde <b>{agent}</b>. Quem deve responder?',
@@ -558,8 +580,12 @@ const pt: Catalog = {
   nav_back: '← Voltar',
   nav_next: 'Seguinte →',
 
-  claim_hello: 'Sou {name}. Chama-me com @{bot} ou responde a esta mensagem.',
-  claim_failed: 'Não foi possível ligar o bot: {reason}',
+  claim_hello: 'Sou {name}. Para me chamares, escreve o meu nome, menciona @{bot} ou responde a esta mensagem.',
+  claim_failed: 'Não foi possível ligar o bot. Tenta de novo ou obtém um novo link no Linkeon.',
+  claim_expired: 'O link do grupo expirou — dura 15 minutos. Obtém um novo no Linkeon.',
+  claim_wrong_account: 'Este link tem de ser aberto a partir do Telegram associado à tua conta Linkeon.',
+  claim_group_taken: 'Neste grupo já está a funcionar um bot de outra conta Linkeon.',
+  claim_already_connected: 'Este bot já está ligado a um grupo. Para outro grupo, cria um novo bot na tua área pessoal.',
   bot_removed: 'O bot «{name}» foi removido de «{group}». As definições ficaram arquivadas — podes restaurá-las na tua área pessoal.',
   bot_removed_untitled: 'O bot «{name}» foi removido do grupo. As definições ficaram arquivadas — podes restaurá-las na tua área pessoal.',
 
@@ -587,15 +613,15 @@ const pt: Catalog = {
   tool_image: '🎨 A preparar uma imagem...',
   tool_upscale: '✨ A melhorar a imagem...',
   tool_video: '🎬 A iniciar a geração do vídeo...',
-  turn_failed: '⚠️ Não foi possível processar o pedido: {reason}',
-  delivery_failed: '⚠️ A resposta está pronta, mas não foi enviada por causa de uma falha técnica. Já estamos a ver o erro — pergunta outra vez.',
-  attach_failed: '(não foi possível anexar o ficheiro: {reason})',
+  turn_failed: '⚠️ Não foi possível processar o pedido — tenta de novo daqui a pouco.',
+  delivery_failed: '⚠️ A resposta está pronta, mas não foi enviada por causa de uma falha técnica. Já fomos alertados — pergunta outra vez.',
+  attach_failed: '(não foi possível anexar o ficheiro)',
   video_queued: '🎬 O vídeo está na fila (1–3 minutos). Envio-o assim que estiver pronto.',
   video_failed: '⚠️ Não foi possível gerar o vídeo.',
   video_expired: '⚠️ O vídeo foi gerado, mas não foi possível entregá-lo — o link expirou.',
 
-  meeting_who: 'O assistente vai entrar na reunião',
-  meeting_who_agent: '{agent} vai entrar na reunião',
+  meeting_who: 'O assistente vai entrar na reunião.',
+  meeting_who_agent: '{agent} vai entrar na reunião.',
   meeting_join: 'Entrar na reunião',
   meeting_title: 'Reunião',
   meeting_title_meet: 'Reunião do Google Meet',
@@ -606,7 +632,7 @@ const pt: Catalog = {
   meeting_busy: 'Já há uma conversa a decorrer — termina-a e tenta de novo.',
   meeting_unavailable: 'Não foi possível entrar: a sala não está disponível.',
 
-  low_balance: '⚠️ Os tokens estão a acabar: restam {balance}. Quando acabarem, os teus bots deixam de responder. Carregar: https://my.linkeon.io/tokens',
+  low_balance: '⚠️ Os tokens estão a acabar — saldo: {balance}. Quando acabarem, os teus bots deixam de responder. Carregar: https://my.linkeon.io/tokens',
   zero_balance_owner: '⛔ Ficaste sem tokens — os teus bots não respondem até carregares o saldo: https://my.linkeon.io/tokens',
 
   cmd_assistants: 'Escolher assistente',
@@ -624,39 +650,43 @@ const zh: Catalog = {
   start_unlinked: '您好！请先打开 Linkeon——在那里可以注册账号，或绑定已有账号。',
   start_hello: '您好！',
   start_hello_agent: '您好！当前由<b>{agent}</b>回复。',
-  start_body: '在这里留言，助手会回复您。/assistants — 更换助手，/balance — 余额。',
-  unlinked_chat: '需要 Linkeon 账号我才能回复——请点击下方按钮打开。',
-  unlinked_command: '此命令需要 Linkeon 账号——请点击下方按钮打开。',
+  start_body: '在这里发消息，助手会回复您。/assistants — 更换助手，/balance — 余额。',
+  unlinked_chat: '需要 Linkeon 账号我才能回复——点击下方按钮即可注册或绑定账号。',
+  unlinked_command: '此命令需要 Linkeon 账号——点击下方按钮即可注册或绑定账号。',
   open_linkeon: '打开 Linkeon',
   bind_ok: '您好！您的 Telegram 已绑定 Linkeon——可以回到网站了。',
   bind_ok_named: '{name}，您好！您的 Telegram 已绑定 Linkeon——可以回到网站了。',
-  bind_conflict: '此 Telegram（{who}）已绑定到另一个 Linkeon 账号。换新链接也没用——限制不在链接上。请用想要绑定的 Telegram 账号打开链接，或先将此账号与旧账号解绑。',
-  bind_failed: '绑定失败：{reason}。请在 Linkeon 中获取新链接——旧链接可能已过期（链接有效期 15 分钟）。',
+  bind_conflict: '此 Telegram（{who}）已绑定到另一个 Linkeon 账号，因此换新链接也没用。请用想要绑定的 Telegram 账号打开链接，或先将此账号与旧账号解绑。',
+  bind_failed: '无法绑定您的 Telegram。请在 Linkeon 中获取新链接——旧链接可能已过期（链接有效期 15 分钟）。',
 
-  dm_help: '我是 Linkeon 机器人——在这里的私聊中，以及所有者把我加入的群组中回复。\n\n命令：\n/start — 将 Telegram 连接到 Linkeon\n/assistants — 选择私聊中的助手\n/language — 回复语言\n/balance — 您账号的代币余额\n/silent — 在您的所有群组中保持安静\n/resume — 在群组中恢复回复\n/help — 本消息\n\n在群组中，/silent 和 /resume 只控制该群组的机器人。\n\n个人账户：https://my.linkeon.io/telegram-bots',
+  dm_help: '我是 Linkeon 机器人，会在这里的私聊中回复，也会在所有者把我加入的群组中回复。\n\n命令：\n/start — 将 Telegram 连接到 Linkeon\n/assistants — 选择私聊中的助手\n/language — 回复语言\n/balance — 您账号的代币余额\n/silent — 在您的所有群组中保持安静\n/resume — 在群组中恢复回复\n/help — 本消息\n\n在群组中，/silent 和 /resume 只控制该群组的机器人。\n\n个人账户：https://my.linkeon.io/telegram-bots',
   balance: '代币余额：<b>{balance}</b>\n充值：https://my.linkeon.io/tokens',
-  silent_none: '群组中没有活跃的机器人——无需静音。',
-  resume_none: '没有静音中的机器人——无需恢复。',
-  silenced: '🤫 已静音：',
+  silent_none: '群组中没有活跃的机器人——无需静默。',
+  resume_none: '没有静默中的机器人——无需恢复。',
+  silenced: '🤫 已静默：',
   resumed: '✅ 已恢复：',
   list_private: '• <b>{name}</b>（私聊）',
-  list_group: '• <b>{name}</b>（「{group}」）',
+  list_group: '• <b>{name}</b>（群组「{group}」）',
   list_group_untitled: '• <b>{name}</b>（群组）',
   unknown_command: '我不认识这个命令。/help — 命令列表。',
 
   language_prompt: '用哪种语言回复？',
-  language_unknown: '没有这种语言',
+  language_unknown: '不支持该语言',
   language_set: '好的，回复语言：<b>{language}</b>。',
-  assistants_prompt: '请谁来回复？',
-  assistants_current: '当前由<b>{agent}</b>回复。请谁来回复？',
+  assistants_prompt: '您希望由谁来回复？',
+  assistants_current: '当前由<b>{agent}</b>回复。您希望由谁来回复？',
   assistant_unknown: '没有这个助手',
   assistant_set: '现在由<b>{agent}</b>回复。',
   assistant_switched_note: '— 接下来由{agent}回复。—',
   nav_back: '← 上一页',
   nav_next: '下一页 →',
 
-  claim_hello: '我是{name}。可以用 @{bot} 叫我，或回复这条消息。',
-  claim_failed: '机器人连接失败：{reason}',
+  claim_hello: '我是{name}。想找我时，叫我的名字、@{bot} 或回复这条消息即可。',
+  claim_failed: '机器人连接失败。请重试，或在 Linkeon 中获取新链接。',
+  claim_expired: '群组链接已过期——有效期为 15 分钟。请在 Linkeon 中获取新链接。',
+  claim_wrong_account: '请用已绑定您 Linkeon 账号的 Telegram 打开此链接。',
+  claim_group_taken: '此群组中已有另一个 Linkeon 账号的机器人在工作。',
+  claim_already_connected: '此机器人已连接到一个群组。如需用于其他群组，请在个人账户中创建新机器人。',
   bot_removed: '机器人「{name}」已被移出「{group}」。设置已归档——可以在个人账户中恢复。',
   bot_removed_untitled: '机器人「{name}」已被移出群组。设置已归档——可以在个人账户中恢复。',
 
@@ -665,34 +695,34 @@ const zh: Catalog = {
   mode_always: '回复每一条消息',
   mode_smart: '觉得合适时才插话',
   owner_only: '只有机器人的所有者才能使用此命令。',
-  group_silenced: '🤫 保持安静，直到 /resume。',
+  group_silenced: '🤫 我会保持安静，直到 /resume。',
   group_resumed: '✅ 我回来了。',
   dm_only: '此命令只能在与机器人的私聊中使用：@{bot}',
 
   zero_balance_group: '⚠️ 所有者的代币已用完。充值前机器人不会回复：https://my.linkeon.io/tokens',
-  busy: '⏳ 请稍等——正在完成上一个请求。请等待，或 30 秒后重试。',
-  thinking: '🤔 思考中...',
-  tool_products: '🛠 正在处理产品...',
-  tool_read: '📄 正在读取文件...',
-  tool_write: '✏️ 正在写入文件...',
-  tool_edit: '✏️ 正在编辑文件...',
-  tool_bash: '⚙️ 正在执行命令...',
-  tool_glob: '🔍 正在查找文件...',
-  tool_grep: '🔍 正在文件中搜索...',
-  tool_web_search: '🌐 正在网上搜索...',
-  tool_web_fetch: '🌐 正在打开网页...',
-  tool_image: '🎨 正在准备图片...',
-  tool_upscale: '✨ 正在优化图片...',
-  tool_video: '🎬 正在开始生成视频...',
-  turn_failed: '⚠️ 无法处理请求：{reason}',
+  busy: '⏳ 请稍等——正在完成上一个请求。也可以 30 秒后再试。',
+  thinking: '🤔 思考中……',
+  tool_products: '🛠 正在处理产品……',
+  tool_read: '📄 正在读取文件……',
+  tool_write: '✏️ 正在写入文件……',
+  tool_edit: '✏️ 正在编辑文件……',
+  tool_bash: '⚙️ 正在执行命令……',
+  tool_glob: '🔍 正在查找文件……',
+  tool_grep: '🔍 正在文件中搜索……',
+  tool_web_search: '🌐 正在网上搜索……',
+  tool_web_fetch: '🌐 正在打开网页……',
+  tool_image: '🎨 正在准备图片……',
+  tool_upscale: '✨ 正在优化图片……',
+  tool_video: '🎬 正在启动视频生成……',
+  turn_failed: '⚠️ 无法处理请求——请稍后再试。',
   delivery_failed: '⚠️ 回复已准备好，但因技术故障未能发送。我们已发现该错误——请重新提问。',
-  attach_failed: '（无法附加文件：{reason}）',
+  attach_failed: '（无法附加文件）',
   video_queued: '🎬 视频正在排队（1–3 分钟）。完成后我会立即发送。',
   video_failed: '⚠️ 视频生成失败。',
   video_expired: '⚠️ 视频已生成，但无法送达——链接已过期。',
 
-  meeting_who: '助手将加入会议',
-  meeting_who_agent: '{agent}将加入会议',
+  meeting_who: '助手将加入会议。',
+  meeting_who_agent: '{agent}将加入会议。',
   meeting_join: '加入会议',
   meeting_title: '会议',
   meeting_title_meet: 'Google Meet 会议',
@@ -710,8 +740,8 @@ const zh: Catalog = {
   cmd_language: '回复语言',
   cmd_balance: '代币余额',
   cmd_balance_owner: '所有者的余额',
-  cmd_silent_all: '在所有群组中保持安静',
-  cmd_silent_here: '在此群组中保持安静',
+  cmd_silent_all: '在所有群组中静默',
+  cmd_silent_here: '在此群组中静默',
   cmd_resume_all: '在群组中恢复回复',
   cmd_resume_here: '在此恢复回复',
   cmd_help: '机器人能做什么',
@@ -748,14 +778,18 @@ export function pickTgLanguage(profileLang?: string | null, tgLanguageCode?: str
   return DEFAULT_LANGUAGE as TgLang;
 }
 
-/** Язык владельца (profile_data.language) с запасным — языком клиента Telegram. Не бросает. */
+/**
+ * Язык человека: есть аккаунт Linkeon — язык его профиля (не задан — язык по
+ * умолчанию), аккаунта нет — язык клиента Telegram. Не бросает.
+ */
 export async function ownerTgLanguage(
   pg: Pick<PgService, 'query'> | null | undefined,
   ownerUserId: string | null | undefined,
   tgLanguageCode?: string | null,
 ): Promise<TgLang> {
+  if (!ownerUserId) return pickTgLanguage(null, tgLanguageCode);
   let profileLang: string | null = null;
-  if (ownerUserId && pg) {
+  if (pg) {
     try {
       const r = await pg.query(
         `SELECT profile_data->>'language' AS language FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
@@ -763,20 +797,22 @@ export async function ownerTgLanguage(
       );
       profileLang = r?.rows?.[0]?.language ?? null;
     } catch {
-      // Язык — не повод ронять ответ: останемся на запасном.
+      // Язык — не повод ронять ответ: останемся на языке по умолчанию.
     }
   }
-  return pickTgLanguage(profileLang, tgLanguageCode);
+  return pickTgLanguage(profileLang, null);
 }
 
 /**
  * Меню команд (кнопка «/» в Telegram) — своё для личек и для групп и на
  * каждом языке. В группе ассистента и язык не меняют (это личка и кабинет),
  * поэтому /assistants и /language там не показываем. Без language_code —
- * английский: для клиентов на языках, которых у нас нет.
+ * английский: для клиентов на языках, которых у нас нет. Меню scope default
+ * (прежнее русское висело там) — групповое: если меню по чатам почему-то не
+ * встанет, в группах не всплывут /assistants и /language.
  */
 export function tgCommandMenus(): Array<{
-  scope: 'all_private_chats' | 'all_group_chats';
+  scope: 'default' | 'all_private_chats' | 'all_group_chats';
   language_code?: TgLang;
   commands: Array<{ command: string; description: string }>;
 }> {
@@ -795,6 +831,7 @@ export function tgCommandMenus(): Array<{
     { command: 'resume', description: TG_TEXTS[l].cmd_resume_here },
   ];
   const menus: ReturnType<typeof tgCommandMenus> = [
+    { scope: 'default', commands: groupMenu('en') },
     { scope: 'all_private_chats', commands: privateMenu('en') },
     { scope: 'all_group_chats', commands: groupMenu('en') },
   ];

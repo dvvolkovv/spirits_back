@@ -66,7 +66,7 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
     owner_user_id?: string | null;
   }): Promise<void> {
     const chatId = Number(row.tg_chat_id);
-    // Язык — владельца бота: на нём же отвечает ассистент.
+    // Язык — владельца бота (язык его профиля).
     const lang = await ownerTgLanguage(this.pg, row.owner_user_id);
     const replyTo = row.tg_reply_to_message_id ?? undefined;
     try {

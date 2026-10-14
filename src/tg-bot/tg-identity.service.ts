@@ -24,6 +24,15 @@ export class TgIdentityService {
   constructor(private readonly pg: PgService) {}
 
   async createAuthToken(ownerId: string): Promise<string> {
+    // Новая ссылка гасит прежние: старая, утёкшая или пересланная, иначе
+    // ещё 15 минут привязывала бы к аккаунту владельца ЛЮБОЙ Telegram — а с
+    // ним и инструмент продуктов в его чатах. Мастер выдаёт новую ссылку по
+    // кнопке, так что «получить новую» заодно значит «отозвать старую».
+    await this.pg.query(
+      `UPDATE tg_claim_tokens SET consumed_at = now()
+        WHERE owner_user_id = $1 AND kind = 'auth' AND consumed_at IS NULL`,
+      [ownerId],
+    );
     const expires = new Date(Date.now() + this.TOKEN_TTL_MS);
     const r = await this.pg.query(
       `INSERT INTO tg_claim_tokens (kind, owner_user_id, expires_at)

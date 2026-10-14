@@ -1,5 +1,4 @@
 import { tgText } from './tg-i18n';
-import { DEFAULT_LANGUAGE } from '../common/services/language.service';
 /**
  * Инлайн-клавиатура выбора ассистента.
  *
@@ -27,7 +26,7 @@ export function buildAssistantsKeyboard(
   agents: KeyboardAgent[],
   page: number,
   current: string | null,
-  lang: string = DEFAULT_LANGUAGE,
+  lang: string,
 ): { inline_keyboard: InlineButton[][] } {
   const start = page * PAGE_SIZE;
   const slice = agents.slice(start, start + PAGE_SIZE);

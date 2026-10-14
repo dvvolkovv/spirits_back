@@ -111,6 +111,15 @@ export class TgConfigService {
     );
     const config: TgBotConfigRow = updRes.rows[0];
 
+    // Новая ссылка гасит прежние: иначе вторая живая ссылка, открытая в
+    // другой группе, переносила бы бота туда (мастер теперь выдаёт новую
+    // ссылку по кнопке, и таких «вторых» стало бы много).
+    await this.pg.query(
+      `UPDATE tg_claim_tokens SET consumed_at = now()
+        WHERE config_id = $1 AND kind = 'claim' AND consumed_at IS NULL`,
+      [id],
+    );
+
     const expires = new Date(Date.now() + this.CLAIM_TTL_MS);
     const tokRes = await this.pg.query(
       `INSERT INTO tg_claim_tokens (kind, owner_user_id, config_id, expires_at)
@@ -212,18 +221,30 @@ export class TgConfigService {
    */
   async moveToChat(fromChatId: number, toChatId: number): Promise<void> {
     try {
+      // Одним запросом: упади между двумя UPDATE — история навсегда осталась
+      // бы на старом id (второе служебное сообщение конфиг уже не найдёт).
+      // Переезжает ВСЯ история чата, а не только этого конфига: «писал ли
+      // здесь кто-то, кроме владельца» (isSoloChat, onlySpeakerIs) смотрит на
+      // tg_chat_id, и реплики прежних ботов, оставшись на старом id, дали бы
+      // в новой супергруппе ложное «пишет один владелец». Ждущие видео — туда
+      // же, иначе доставка уйдёт в мёртвый чат.
       const moved = await this.pg.query(
-        `UPDATE tg_bot_configs SET tg_chat_id = $2
-          WHERE tg_chat_id = $1 AND status IN ('active','silent')
-          RETURNING id`,
+        `WITH moved AS (
+           UPDATE tg_bot_configs SET tg_chat_id = $2
+            WHERE tg_chat_id = $1 AND status IN ('active','silent')
+            RETURNING id
+         ), msgs AS (
+           UPDATE tg_bot_messages SET tg_chat_id = $2
+            WHERE tg_chat_id = $1 AND EXISTS (SELECT 1 FROM moved)
+         ), vids AS (
+           UPDATE tg_bot_video_jobs SET tg_chat_id = $2
+            WHERE tg_chat_id = $1 AND delivery_status = 'pending' AND EXISTS (SELECT 1 FROM moved)
+         )
+         SELECT id FROM moved`,
         [fromChatId, toChatId],
       );
       const id = moved.rows[0]?.id;
       if (!id) return;
-      await this.pg.query(
-        `UPDATE tg_bot_messages SET tg_chat_id = $2 WHERE config_id = $3 AND tg_chat_id = $1`,
-        [fromChatId, toChatId, id],
-      );
       this.logger.log(`config ${id}: группа ${fromChatId} стала супергруппой ${toChatId}`);
     } catch (e: any) {
       // На новом id уже стоит свой бот (уникальный индекс по активным

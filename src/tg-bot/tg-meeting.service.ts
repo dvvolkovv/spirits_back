@@ -121,7 +121,7 @@ export class TgMeetingService {
     const link = parseMeetingLink(text);
     if (!link) return false;
 
-    // Язык приглашения — язык владельца: на нём же отвечает ассистент.
+    // Язык приглашения — язык владельца (язык его профиля).
     const lang = await ownerTgLanguage(this.pg, ownerId);
     const found = await this.lookup(link.provider, link.code, lang);
     // Комнаты нет, она закрыта или под паролем — значит это была обычная
@@ -132,7 +132,7 @@ export class TgMeetingService {
     const agent = await this.currentAgent(ownerId);
     const who = agent ? tgText(lang, 'meeting_who_agent', { agent: escapeHtml(agent.name) }) : tgText(lang, 'meeting_who');
 
-    await this.grammy.sendMessage(chatId, `🎤 <b>${escapeHtml(found.title)}</b>\n${who}.`, {
+    await this.grammy.sendMessage(chatId, `🎤 <b>${escapeHtml(found.title)}</b>\n${who}`, {
       parse_mode: 'HTML',
       reply_markup: {
         inline_keyboard: [[
@@ -183,7 +183,7 @@ export class TgMeetingService {
 
   /** Нажали «Зайти во встречу». */
   async handleJoinCallback(cb: any, ownerId: string): Promise<void> {
-    const lang = await ownerTgLanguage(this.pg, ownerId, cb.from?.language_code);
+    const lang = await ownerTgLanguage(this.pg, ownerId);
     const rest = String(cb.data || '').slice(JOIN_PREFIX.length);
     const sep = rest.indexOf(':');
     const provider = (sep > 0 ? rest.slice(0, sep) : 'linkeon') as MeetingProvider;

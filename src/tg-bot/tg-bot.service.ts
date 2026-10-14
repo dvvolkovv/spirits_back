@@ -9,8 +9,8 @@ import { TgConfigService, TgBotConfigRow } from './tg-config.service';
 import { TgRouterService, isForeignBotCommand } from './tg-router.service';
 import { isPrivateConfig } from './tg-chat-kind';
 import { escapeHtml } from './tg-html';
-import { tgText, formatTgNumber, ownerTgLanguage, pickTgLanguage, TgLang } from './tg-i18n';
-import { DEFAULT_LANGUAGE } from '../common/services/language.service';
+import { tgText, formatTgNumber, ownerTgLanguage, pickTgLanguage, TgLang, TgTextKey } from './tg-i18n';
+import { TgClaimFailure } from './tg-claim.service';
 import { TgMeetingService } from './tg-meeting.service';
 import { TgVoiceService } from './tg-voice.service';
 import { TgBillingService } from './tg-billing.service';
@@ -84,6 +84,14 @@ const ALBUM_DEBOUNCE_MS = Number(process.env.TG_ALBUM_DEBOUNCE_MS || 2500);
 
 /** Потолок альбома в Telegram. Набрали столько — ждать больше нечего. */
 const ALBUM_MAX_PARTS = 10;
+
+/** Почему не удалась привязка группы → что сказать человеку (tg-i18n). */
+const CLAIM_FAILURE_TEXT: Record<TgClaimFailure, TgTextKey> = {
+  expired: 'claim_expired',
+  wrong_account: 'claim_wrong_account',
+  group_taken: 'claim_group_taken',
+  already_connected: 'claim_already_connected',
+};
 
 /** Эхо расшифровки голосового — подсказка «что я услышал», не стенограмма. */
 const ECHO_MAX_CHARS = 1024;
@@ -228,11 +236,11 @@ export class TgBotService implements OnModuleInit {
         return;
       }
       const prof = await this.pg.query(
-        `SELECT preferred_agent FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
+        `SELECT preferred_agent, profile_data->>'language' AS language FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
         [ownerId],
       );
       const current = prof.rows[0]?.preferred_agent;
-      const lang = await this.langFor(ownerId, msg.from);
+      const lang = pickTgLanguage(prof.rows[0]?.language, null);
       await this.grammy.sendMessage(
         msg.chat.id,
         (current ? tgText(lang, 'start_hello_agent', { agent: escapeHtml(current) }) : tgText(lang, 'start_hello')) +
@@ -364,7 +372,10 @@ export class TgBotService implements OnModuleInit {
     }
     if (data.startsWith('agents_page:')) {
       const page = Number(data.split(':')[1]) || 0;
-      await this.commands.handleAssistants(cb.message, ownerId, page, cb.from?.language_code);
+      // Ответ на нажатие гасит «часики» на кнопке — иначе они крутятся до
+      // таймаута Telegram.
+      await this.grammy.answerCallbackQuery(cb.id, {});
+      await this.commands.handleAssistants(cb.message, ownerId, page);
       return;
     }
   }
@@ -507,13 +518,13 @@ export class TgBotService implements OnModuleInit {
   static bindFailureMessage(
     e: any,
     from?: { id?: number; username?: string | null },
-    lang: string = DEFAULT_LANGUAGE,
+    lang: string,
   ): string {
     if (e instanceof TgIdentityConflictError || e?.constraint === 'tg_user_identities_tg_user_id_key') {
       const who = from?.username ? `@${from.username}` : `id ${from?.id ?? '—'}`;
       return tgText(lang, 'bind_conflict', { who });
     }
-    return tgText(lang, 'bind_failed', { reason: e?.message });
+    return tgText(lang, 'bind_failed');
   }
 
   private async handleGroupClaim(msg: any, token: string): Promise<void> {
@@ -534,7 +545,11 @@ export class TgBotService implements OnModuleInit {
     } catch (e: any) {
       const ownerTgId = msg.from.id;
       try {
-        await this.grammy.sendMessage(ownerTgId, tgText(await this.langOfTgUser(msg.from), 'claim_failed', { reason: e.message }));
+        // Причину — своими словами: сырой текст исключения бывал русским или
+        // техническим («claim token не принадлежит…») посреди переведённого
+        // сообщения. Незнакомая — общий текст, подробности в лог ниже.
+        const key = CLAIM_FAILURE_TEXT[e?.claimFailure as TgClaimFailure] ?? 'claim_failed';
+        await this.grammy.sendMessage(ownerTgId, tgText(await this.langOfTgUser(msg.from), key));
       } catch { /* ignore */ }
       this.logger.warn(`claim failed for chat ${msg.chat.id}: ${e.message}`);
       // Уходим, только если в группе точно нет работающего бота: выход
@@ -614,11 +629,10 @@ export class TgBotService implements OnModuleInit {
     const cfg = cfgIn ?? (await this.configs.getActiveByTgChatId(msg.chat.id));
     if (!cfg) return;
 
-    // Язык служебных сообщений хода — язык владельца; в личке запасной —
-    // язык клиента Telegram (пишет сам владелец). В базу — один раз и только
-    // когда бот действительно что-то скажет.
+    // Язык служебных сообщений хода — язык владельца (его профиля). В базу —
+    // один раз и только когда бот действительно что-то скажет.
     let langOnce: Promise<TgLang> | null = null;
-    const lang = () => (langOnce ??= this.langFor(cfg.owner_user_id, isPrivateConfig(cfg) ? msg.from : undefined));
+    const lang = () => (langOnce ??= this.langFor(cfg.owner_user_id));
 
     // Часть альбома — не самостоятельный ход: копим и обрабатываем всё вместе.
     // albumParts значит «это уже склейка», её пропускаем дальше.
@@ -709,7 +723,8 @@ export class TgBotService implements OnModuleInit {
         try {
           await this.grammy.sendMessage(
             msg.chat.id,
-            tgText(await lang(), 'zero_balance_group'),
+            // В личке владелец и есть тот, у кого кончились токены.
+            tgText(await lang(), isPrivateConfig(cfg) ? 'zero_balance_owner' : 'zero_balance_group'),
             { reply_to_message_id: msg.message_id },
           );
           await this.billing.markZeroBalanceNotified(cfg.id);
@@ -989,7 +1004,7 @@ export class TgBotService implements OnModuleInit {
         await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang);
       }
 
-      await this.deliverOutgoingMarkers(cfg, msg, markers);
+      await this.deliverOutgoingMarkers(cfg, msg, markers, turnLang);
 
       // Артефакты из песочницы Claude (PDF/DOCX/XLSX/etc.) — каждый отдельным
       // документом. Лимит уже наложен в scanSandboxOutputs (5 файлов max).
@@ -1106,7 +1121,7 @@ export class TgBotService implements OnModuleInit {
    * Подпись статус-сообщения, пока идёт вызов инструмента. Статическая и без
    * `this` — чтобы проверяться тестом, не поднимая ход целиком.
    */
-  static toolStatusLabel(toolName: string, lang: string = DEFAULT_LANGUAGE): string {
+  static toolStatusLabel(toolName: string, lang: string): string {
     if (/mcp__products__/.test(toolName)) return tgText(lang, 'tool_products');
     if (toolName === 'Read') return tgText(lang, 'tool_read');
     if (toolName === 'Write') return tgText(lang, 'tool_write');
@@ -1187,7 +1202,9 @@ export class TgBotService implements OnModuleInit {
     if (statusMsgId) {
       try {
         const l = lang ?? (await this.langFor(cfg.owner_user_id));
-        await this.grammy.editMessageText(chatId, statusMsgId, tgText(l, 'turn_failed', { reason }));
+        // Причина — только в историю и лог: она бывает русской или
+        // технической посреди переведённого сообщения.
+        await this.grammy.editMessageText(chatId, statusMsgId, tgText(l, 'turn_failed'));
       } catch (e: any) {
         this.logger.warn(`turn-failure notice failed in chat ${chatId}: ${e.message}`);
       }
@@ -1217,7 +1234,7 @@ export class TgBotService implements OnModuleInit {
     chatId: number,
     replyToMessageId: number,
     text: string,
-    lang: string = DEFAULT_LANGUAGE,
+    lang: string,
   ): Promise<void> {
     try {
       await this.grammy.sendMessage(chatId, text, { reply_to_message_id: replyToMessageId });
@@ -1503,22 +1520,23 @@ export class TgBotService implements OnModuleInit {
    * пишем в чат и продолжаем. Сюда же приходит отказ по ссылке во внутреннюю
    * сеть (UnsafeUrlError): его сообщение рассчитано на человека.
    */
-  private async deliverOutgoingMarkers(cfg: TgBotConfigRow, msg: any, markers: OutgoingMarker[]): Promise<void> {
+  private async deliverOutgoingMarkers(cfg: TgBotConfigRow, msg: any, markers: OutgoingMarker[], lang: TgLang): Promise<void> {
     for (const m of markers.slice(0, 3)) {
       try {
-        await this.dispatchOutgoingMarker(cfg, msg, m);
+        await this.dispatchOutgoingMarker(cfg, msg, m, lang);
       } catch (e: any) {
+        // Причина — только в лог: её текст бывает русским («Недостаточно
+        // токенов») или внутренним посреди переведённого сообщения.
         this.logger.warn(`outgoing marker (${m.kind}) failed in chat ${msg.chat.id}: ${e.message}`);
         try {
-          const lang = await this.langFor(cfg.owner_user_id, isPrivateConfig(cfg) ? msg.from : undefined);
-          await this.grammy.sendMessage(msg.chat.id, tgText(lang, 'attach_failed', { reason: e.message }));
+          await this.grammy.sendMessage(msg.chat.id, tgText(lang, 'attach_failed'));
         } catch { /* ignore */ }
       }
     }
   }
 
   /** Отправляет один маркер: генерим картинку или скачиваем по URL → шлём в чат. */
-  private async dispatchOutgoingMarker(cfg: TgBotConfigRow, msg: any, m: OutgoingMarker): Promise<void> {
+  private async dispatchOutgoingMarker(cfg: TgBotConfigRow, msg: any, m: OutgoingMarker, lang: TgLang): Promise<void> {
     if (m.kind === 'image') {
       this.grammy.sendChatAction(msg.chat.id, 'upload_photo').catch(() => {});
       const res = await this.misc.generateImage(cfg.owner_user_id, { prompt: m.prompt });
@@ -1582,7 +1600,7 @@ export class TgBotService implements OnModuleInit {
       );
       await this.grammy.sendMessage(
         msg.chat.id,
-        tgText(await this.langFor(cfg.owner_user_id, isPrivateConfig(cfg) ? msg.from : undefined), 'video_queued'),
+        tgText(lang, 'video_queued'),
         { reply_to_message_id: msg.message_id },
       );
       return;
@@ -1678,16 +1696,9 @@ export class TgBotService implements OnModuleInit {
   }
 
   /**
-   * Побочная работа хода — без ожидания: оповещения владельца о балансе и
-   * отметки о них. При нуле это Redis, а ioredis при обрыве не падает сразу,
-   * а держит команду в очереди 23–63 с — под замком чата, пока следующая
-   * реплика человека получает «Минутку» без ответа. Ошибки — только в лог;
-   * через Promise.resolve синхронный throw задачи тоже не уходит наверх.
-   */
-  /**
-   * Язык служебных сообщений: язык владельца (profile_data.language), а если
-   * он не задан — язык клиента Telegram того, кто пишет (в личке это сам
-   * владелец). Не бросает: язык — не повод ронять ответ.
+   * Язык служебных сообщений: есть аккаунт Linkeon — язык его профиля, нет —
+   * язык клиента Telegram того, кто пишет (см. ownerTgLanguage). Не бросает:
+   * язык — не повод ронять ответ.
    */
   private langFor(ownerUserId: string | null | undefined, from?: { language_code?: string } | null): Promise<TgLang> {
     return ownerTgLanguage(this.pg, ownerUserId, from?.language_code);
@@ -1704,6 +1715,13 @@ export class TgBotService implements OnModuleInit {
     return this.langFor(ownerId, from);
   }
 
+  /**
+   * Побочная работа хода — без ожидания: оповещения владельца о балансе и
+   * отметки о них. При нуле это Redis, а ioredis при обрыве не падает сразу,
+   * а держит команду в очереди 23–63 с — под замком чата, пока следующая
+   * реплика человека получает «Минутку» без ответа. Ошибки — только в лог;
+   * через Promise.resolve синхронный throw задачи тоже не уходит наверх.
+   */
   private inBackground(what: string, job: () => Promise<unknown>): void {
     Promise.resolve()
       .then(job)

@@ -53,7 +53,7 @@ export class TgCommandsService {
       [ownerId],
     );
     const current = prof.rows[0]?.language ?? null;
-    const lang = pickTgLanguage(current, msg.from?.language_code);
+    const lang = pickTgLanguage(current, null);
     await this.grammy.sendMessage(msg.chat.id, tgText(lang, 'language_prompt'), {
       reply_markup: {
         inline_keyboard: SUPPORTED_LANGUAGES.map((code) => [
@@ -75,7 +75,7 @@ export class TgCommandsService {
     const code = String(cb.data || '').slice('lang:'.length);
     if (!(SUPPORTED_LANGUAGES as readonly string[]).includes(code)) {
       this.logger.warn(`callback с неизвестным языком "${code}" от ${ownerId}`);
-      const lang = await ownerTgLanguage(this.pg, ownerId, cb.from?.language_code);
+      const lang = await ownerTgLanguage(this.pg, ownerId);
       await this.grammy.answerCallbackQuery(cb.id, { text: tgText(lang, 'language_unknown') });
       return;
     }
@@ -100,15 +100,14 @@ export class TgCommandsService {
    * Только для лички: в группе ассистент привязан к чату, и смена одним
    * участником сбивала бы разговор остальных.
    */
-  async handleAssistants(msg: any, ownerId: string, page = 0, tgLanguageCode?: string): Promise<void> {
+  async handleAssistants(msg: any, ownerId: string, page = 0): Promise<void> {
     const agents = await this.agents.getAgents();
     const prof = await this.pg.query(
-      `SELECT preferred_agent FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
+      `SELECT preferred_agent, profile_data->>'language' AS language FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
       [ownerId],
     );
     const current = prof.rows[0]?.preferred_agent ?? null;
-    // Листание приходит кнопкой под сообщением бота: язык — того, кто нажал.
-    const lang = await ownerTgLanguage(this.pg, ownerId, tgLanguageCode ?? msg.from?.language_code);
+    const lang = pickTgLanguage(prof.rows[0]?.language, null);
     await this.grammy.sendMessage(
       msg.chat.id,
       current ? tgText(lang, 'assistants_current', { agent: escapeHtml(current) }) : tgText(lang, 'assistants_prompt'),
@@ -126,7 +125,7 @@ export class TgCommandsService {
   async handleAgentCallback(cb: any, ownerId: string): Promise<void> {
     const name = String(cb.data || '').slice('agent:'.length);
     const agents = await this.agents.getAgents();
-    const lang = await ownerTgLanguage(this.pg, ownerId, cb.from?.language_code);
+    const lang = await ownerTgLanguage(this.pg, ownerId);
     if (!agents.some((a: any) => a.name === name)) {
       this.logger.warn(`callback с неизвестным ассистентом "${name}" от ${ownerId}`);
       await this.grammy.answerCallbackQuery(cb.id, { text: tgText(lang, 'assistant_unknown') });
@@ -169,9 +168,11 @@ export class TgCommandsService {
     const isOwner = await this.isOwner(cfg, msg.from.id);
 
     switch (cmd) {
-      // /start@бот без кода (с кодом его раньше разбирает привязка группы) —
-      // та же справка: раньше он уходил в платный ход модели.
-      case '/start':
+      // Голый /start в группе чаще всего пишут другому боту: молча
+      // перехватываем, чтобы не уйти в платный ход, но и справкой не
+      // отвечаем. Наш /start@бот без кода (с кодом его раньше разбирает
+      // привязка группы) — та же справка.
+      case '/start':   if (addressee) await this.handleHelp(cfg, msg);  return true;
       case '/help':    await this.handleHelp(cfg, msg);                 return true;
       case '/assistants':
       case '/language': await this.handleDmOnly(cfg, msg);             return true;
@@ -187,7 +188,7 @@ export class TgCommandsService {
     return id?.tgUserId === tgUserId;
   }
 
-  /** Язык группы — язык владельца бота: на нём же отвечает и ассистент. */
+  /** Язык группы — язык владельца бота (язык его профиля). */
   private ownerLang(cfg: TgBotConfigRow): Promise<TgLang> {
     return ownerTgLanguage(this.pg, cfg.owner_user_id);
   }
