@@ -1001,6 +1001,7 @@ export class TgBotService implements OnModuleInit {
       let voiceTtsCostUsd = 0;
 
       const textToSend = cleanText || (markers.length > 0 ? '' : '...');
+      const chatBeforeReply = cfg.tg_chat_id;
 
       if (wantsVoice && textToSend) {
         try {
@@ -1024,19 +1025,26 @@ export class TgBotService implements OnModuleInit {
         await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang, cfg);
       }
 
-      await this.deliverOutgoingMarkers(cfg, msg, markers, turnLang);
+      // Группа стала супергруппой посреди хода: deliverReplyText перевёз бота и
+      // сменил cfg.tg_chat_id. Картинки и файлы этого хода — туда же, без
+      // ответа на сообщение старой группы: в супергруппе своя нумерация.
+      const outMsg = cfg.tg_chat_id === chatBeforeReply
+        ? msg
+        : { ...msg, chat: { ...msg.chat, id: Number(cfg.tg_chat_id) }, message_id: undefined };
+
+      await this.deliverOutgoingMarkers(cfg, outMsg, markers, turnLang);
 
       // Артефакты из песочницы Claude (PDF/DOCX/XLSX/etc.) — каждый отдельным
       // документом. Лимит уже наложен в scanSandboxOutputs (5 файлов max).
       for (const f of sandboxOutputs) {
         try {
-          this.grammy.sendChatAction(msg.chat.id, 'upload_document').catch(() => {});
+          this.grammy.sendChatAction(outMsg.chat.id, 'upload_document').catch(() => {});
           const buf = fs.readFileSync(f);
-          await this.grammy.sendDocument(msg.chat.id, buf, path.basename(f), {
-            reply_to_message_id: msg.message_id,
+          await this.grammy.sendDocument(outMsg.chat.id, buf, path.basename(f), {
+            reply_to_message_id: outMsg.message_id,
           });
         } catch (e: any) {
-          this.logger.warn(`sandbox file ${path.basename(f)} send failed in chat ${msg.chat.id}: ${e.message}`);
+          this.logger.warn(`sandbox file ${path.basename(f)} send failed in chat ${outMsg.chat.id}: ${e.message}`);
         }
       }
 
