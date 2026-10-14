@@ -25,6 +25,8 @@ describe('ensurePrivateConfig', () => {
     expect(cfg.status).toBe('active');
     expect(pg.query.mock.calls[1][0]).toMatch(/UPDATE tg_bot_configs SET status = 'active'/);
     expect(pg.query.mock.calls[1][1]).toEqual(['cfg-1']);
+    // Только молчащую: архив, случившийся между SELECT и UPDATE, не оживляем.
+    expect(pg.query.mock.calls[1][0]).toMatch(/AND status = 'silent'/);
   });
 
   it('создаёт конфиг с addressing_mode=always и текущим ассистентом владельца', async () => {

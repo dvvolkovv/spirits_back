@@ -200,9 +200,10 @@ describe('нулевой баланс: владельцу — одно сооб�
     expect(redis.del).toHaveBeenCalledWith('tg:zero-balance-dm:u-owner');
   });
 
-  it('Redis лёг — ни отметка, ни снятие не роняют ход', async () => {
-    const { svc } = makeBilling({ balance: 0, redisDown: true });
+  it('Redis лёг — ни отметка, ни снятие не роняют ход; без отметки не пишем (иначе — на каждую реплику группы)', async () => {
+    const { svc, grammy } = makeBilling({ balance: 0, redisDown: true });
     await expect(svc.notifyOwnerZeroBalance('u-owner', 111)).resolves.toBeUndefined();
+    expect(grammy.sendMessage).not.toHaveBeenCalled();
     await expect(svc.clearOwnerZeroBalanceDm('u-owner')).resolves.toBeUndefined();
   });
 
@@ -234,6 +235,7 @@ describe('группа: команда другому боту — не наша
     return { svc, claim, chat };
   }
   const group = (text: string) => ({ chat: { id: -100123, type: 'supergroup' }, from: { id: 222 }, message_id: 5, text });
+  const photo = (caption: string) => ({ chat: { id: -100123, type: 'supergroup' }, from: { id: 222 }, message_id: 6, photo: [{ file_id: 'P' }], caption });
 
   it('«/start@ДругойБот <код>» (так добавляют чужого бота) — не наша привязка: бот не уходит из группы', async () => {
     const { svc, claim, chat } = makeBot();
@@ -245,6 +247,12 @@ describe('группа: команда другому боту — не наша
   it('«/help@ДругойБот» — ни нашей справки, ни платного хода модели', async () => {
     const { svc, chat } = makeBot();
     await (svc as any).handleMessage(group('/help@OtherBot'));
+    expect(chat).not.toHaveBeenCalled();
+  });
+
+  it('подпись к фото «/help@ДругойБот» — тоже не наша', async () => {
+    const { svc, chat } = makeBot();
+    await (svc as any).handleMessage(photo('/help@OtherBot'));
     expect(chat).not.toHaveBeenCalled();
   });
 
@@ -279,6 +287,24 @@ describe('имя бота в тексте — с начала слова', () =>
   it('китайский пишется без пробелов — там имя ищется где угодно, как раньше', () => {
     expect(router.isExplicitlyAddressed(strict('小助手'), said('请小助手帮忙'))).toBe(true);
     expect(router.isExplicitlyAddressed(strict('Linkeon'), said('请Linkeon帮忙'))).toBe(true);
+  });
+
+  it('первое вхождение внутри слова, второе — с начала: «какой аромат, Рома?» — обращение', () => {
+    expect(router.isExplicitlyAddressed(strict('Рома'), said('какой аромат, Рома?'))).toBe(true);
+  });
+
+  it('огласовки и надстрочные знаки — часть слова: «राम» в «विराम» — не обращение', () => {
+    expect(router.isExplicitlyAddressed(strict('राम'), said('थोड़ा विराम लो'))).toBe(false);
+    expect(router.isExplicitlyAddressed(strict('राम'), said('राम, नमस्ते'))).toBe(true);
+  });
+
+  it('японская черта долготы «ー» — тоже письмо без пробелов', () => {
+    expect(router.isExplicitlyAddressed(strict('Linkeon'), said('ラーメンーLinkeon'))).toBe(true);
+  });
+
+  it('имя из одних пробелов не срабатывает, имя с пробелами по краям — срабатывает', () => {
+    expect(router.isExplicitlyAddressed(strict('   '), said('привет  всем'))).toBe(false);
+    expect(router.isExplicitlyAddressed(strict(' Рома '), said('Рома, привет'))).toBe(true);
   });
 
   it('имя с начала строки и после знаков — обращение', () => {
@@ -358,5 +384,61 @@ describe('имена ассистентов и языков — тоже в HTML
     const [, text, opts] = grammy.sendMessage.mock.calls[0] as any[];
     expect(opts).toEqual(expect.objectContaining({ parse_mode: 'HTML' }));
     expect(text).toContain('<b>Fin_&lt;A&gt;</b>');
+  });
+});
+
+describe('личка: /start с чужим @именем — не код привязки', () => {
+  it('«/start@ДругойБот abc» в личке не уходит в привязку по коду', async () => {
+    const grammy = { sendMessage: jest.fn(async () => ({})) };
+    const svc = new TgBotService(
+      {} as any, { getLinkeonIdByTgUserId: jest.fn(async () => null) } as any, null as any, null as any, null as any,
+      null as any, null as any, null as any, null as any, grammy as any, null as any, null as any, null as any,
+    );
+    (svc as any).logger = quiet;
+    const dmStart = jest.spyOn(svc as any, 'handleDmStart').mockResolvedValue(undefined);
+    await (svc as any).handleMessage({ chat: { id: 42, type: 'private' }, from: { id: 42 }, text: '/start@OtherBot abc123' });
+    expect(dmStart).not.toHaveBeenCalled();
+  });
+});
+
+describe('привязка в группе не удалась — бот не бросает работающий чат', () => {
+  function makeBot(live: any) {
+    const grammy = { sendMessage: jest.fn(async () => ({})), leaveChat: jest.fn(async () => true) };
+    const claim = { claim: jest.fn(async () => { throw new Error('invalid or expired claim token'); }) };
+    const configs = { getActiveByTgChatId: jest.fn(async () => live) };
+    const svc = new TgBotService(
+      {} as any, {} as any, claim as any, configs as any, null as any,
+      null as any, null as any, null as any, null as any, grammy as any, null as any, null as any, null as any,
+    );
+    (svc as any).logger = quiet;
+    return { svc, grammy };
+  }
+  const stale = { chat: { id: -100123, type: 'supergroup', title: 'Семья' }, from: { id: 222 }, message_id: 5, text: '/start@LinkeonAgentBot stale' };
+
+  it('в группе уже работает бот — старая ссылка его не выгоняет: пишем в личку и остаёмся', async () => {
+    const { svc, grammy } = makeBot({ id: 'cfg-live' });
+    await (svc as any).handleMessage(stale);
+    expect(grammy.leaveChat).not.toHaveBeenCalled();
+    expect(grammy.sendMessage).toHaveBeenCalledWith(222, expect.stringContaining('Не получилось привязать'));
+  });
+
+  it('рабочего бота в группе нет — уходим, как раньше (контроль)', async () => {
+    const { svc, grammy } = makeBot(null);
+    await (svc as any).handleMessage(stale);
+    expect(grammy.leaveChat).toHaveBeenCalledWith(-100123);
+  });
+});
+
+describe('приглашение на встречу: имя ассистента — экранировано', () => {
+  it('«R&D» не ломает HTML-сообщение', async () => {
+    const { TgMeetingService } = require('./tg-meeting.service');
+    const grammy = { sendMessage: jest.fn(async () => ({})) };
+    const pg = { query: jest.fn(async () => ({ rows: [{ id: 7, name: 'R&D' }] })) };
+    const svc = new TgMeetingService(pg as any, grammy as any, {} as any, {} as any, {} as any, {} as any);
+    jest.spyOn(svc as any, 'lookup').mockResolvedValue({ title: 'Планёрка' });
+    expect(await svc.tryHandleLink(-100123, 'созвон https://zoom.us/j/123456789', 'u-1')).toBe(true);
+    const [, text, opts] = grammy.sendMessage.mock.calls[0] as any[];
+    expect(opts).toEqual(expect.objectContaining({ parse_mode: 'HTML' }));
+    expect(text).toContain('R&amp;D зайдёт во встречу');
   });
 });

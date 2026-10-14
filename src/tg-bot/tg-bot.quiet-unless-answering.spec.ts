@@ -162,8 +162,11 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
     );
     (svc as any).logger = quiet;
     const sent = () => grammy.sendMessage.mock.calls.map((c: any[]) => String(c[1]));
-    return { svc, router, billing, grammy, meetings, voice, sent };
+    return { svc, pg, router, billing, grammy, meetings, voice, sent };
   }
+
+  // Оповещения владельца о балансе уходят в фоне: ход их не ждёт.
+  const flush = () => new Promise((r) => setImmediate(r));
 
   const CFG: any = {
     id: 'cfg-quiet', owner_user_id: 'u-owner', tg_chat_id: '-100123', display_name: 'Финансист',
@@ -345,15 +348,40 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
     expect(meetings.tryHandleLink).toHaveBeenCalledTimes(1);
   });
 
-  it('успешный ход: отметка о нуле снимается ПОСЛЕ записи ответа — и её сбой ход не роняет', async () => {
+  it('успешный ход: отметки о нуле снимаются ПОСЛЕ записи ответа — и их сбой ход не роняет', async () => {
     const { svc, router, billing } = makeTurnBot({ transcript: '' });
     billing.clearOwnerZeroBalanceDm.mockRejectedValue(new Error('Connection is closed'));
+    billing.clearZeroBalanceFlag.mockRejectedValue(new Error('canceling statement due to lock timeout'));
     await (svc as any).handleChatMessage(groupMsg({ text: 'Финансист, привет' }), CFG);
+    await flush();
     expect(router.persistAssistantReply).toHaveBeenCalled();
     expect(router.consolidateAfterReply).toHaveBeenCalled();
-    expect(billing.clearOwnerZeroBalanceDm.mock.invocationCallOrder[0])
-      .toBeGreaterThan(router.persistAssistantReply.mock.invocationCallOrder[0]);
+    const persisted = router.persistAssistantReply.mock.invocationCallOrder[0];
+    expect(billing.clearOwnerZeroBalanceDm.mock.invocationCallOrder[0]).toBeGreaterThan(persisted);
+    expect(billing.clearZeroBalanceFlag.mock.invocationCallOrder[0]).toBeGreaterThan(persisted);
   });
+
+  // ioredis при обрыве не падает сразу, а держит команду в очереди 23–63 с.
+  // Ход не должен её ждать: он держит замок чата, и следующая реплика
+  // человека в это время получает «Минутку» без ответа.
+  it('Redis завис — ход не ждёт его и отпускает замок чата', async () => {
+    const { svc, pg, router, billing } = makeTurnBot({ transcript: '' });
+    const hang = () => new Promise<never>(() => {});
+    billing.clearOwnerZeroBalanceDm.mockImplementation(hang);
+    billing.checkBalanceAlerts.mockImplementation(hang);
+    await (svc as any).handleChatMessage(groupMsg({ text: 'Финансист, привет' }), CFG);
+    const lock = await (pg.tryAdvisoryLock.mock.results[0] as any).value;
+    expect(lock.release).toHaveBeenCalled();
+    expect(router.persistAssistantReply).toHaveBeenCalled();
+  }, 2000);
+
+  it('нулевой баланс и Redis завис — позвавшему объясняем сразу, не дожидаясь оповещения владельца', async () => {
+    const { svc, billing, sent } = makeTurnBot({ balance: 0 });
+    billing.notifyOwnerZeroBalance.mockImplementation(() => new Promise<never>(() => {}));
+    await (svc as any).handleChatMessage(groupMsg({ text: 'Финансист, сколько осталось?' }), CFG);
+    expect(zeroNotices(sent())).toHaveLength(1);
+    expect(zeroNotices(sent())[0]).toContain('не отвечает, пока');
+  }, 2000);
 
   it('нулевой баланс: сбой оповещения владельца не мешает объяснить позвавшему', async () => {
     const { svc, billing, sent } = makeTurnBot({ balance: 0 });
@@ -377,6 +405,7 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
   it('нулевой баланс в группе — владелец узнаёт сам, личкой (даже если к боту не обращались)', async () => {
     const { svc, billing } = makeTurnBot({ balance: 0 });
     await (svc as any).handleChatMessage(groupMsg({ text: 'встречаемся в восемь' }), CFG);
+    await flush();
     expect(billing.notifyOwnerZeroBalance).toHaveBeenCalledWith('u-owner', 111);
   });
 
