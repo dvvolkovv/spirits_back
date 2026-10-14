@@ -604,7 +604,12 @@ export class TgBotService implements OnModuleInit {
       voiceFileId = msg.voice?.file_id ?? msg.audio?.file_id;
       if (!voiceFileId) return;
       try {
-        workingText = await this.voice.transcribe(voiceFileId);
+        // Whisper с language не подсказывает, а заставляет: на чужой речи он
+        // переводит или транслитерирует. Язык профиля — язык интерфейса, а не
+        // речи (браузер с uk/kk/be даёт профилю en), поэтому заставляем только
+        // русский — как было всегда, — а остальным Whisper определяет язык сам.
+        const ownerLang = await this.router.ownerLanguage(cfg);
+        workingText = await this.voice.transcribe(voiceFileId, ownerLang === 'ru' ? 'ru' : undefined);
         actualIsVoice = true;
         this.logger.log(`voice transcribed in chat ${msg.chat.id}: "${workingText.substring(0, 50)}..."`);
         // Эхо расшифровки уходит позже — только если бот решит отвечать
@@ -676,7 +681,19 @@ export class TgBotService implements OnModuleInit {
     // модель не идём. Иначе за каждую вставленную ссылку платим ход LLM и
     // получаем два ответа — приглашение и рассуждение ассистента о нём.
     // Тот же приём, что в вебе (chat.service.ts).
-    if (cfg.owner_user_id && typeof workingText === 'string') {
+    // Приглашаем, только если к боту обратились (решение владельца 14.10.2026):
+    // раньше карточка уходила на любую ссылку в группе — и в режиме «по
+    // обращению», и у замолчанного /silent бота.
+    // Команда со ссылкой — всё равно команда: у замолчанного бота «/resume
+    // <ссылка>» не должен давать карточку, у живого «/balance <ссылка>» —
+    // исполняется как команда.
+    if (
+      cfg.owner_user_id &&
+      typeof workingText === 'string' &&
+      cfg.status !== 'silent' &&
+      !workingText.trimStart().startsWith('/') &&
+      this.router.isExplicitlyAddressed(cfg, { text: workingText, replyToFromBot })
+    ) {
       try {
         const handled = await this.meetings.tryHandleLink(
           msg.chat.id, workingText, cfg.owner_user_id,

@@ -130,9 +130,10 @@ export class TgRouterService {
 
   /**
    * Язык интерфейса владельца — для подписей разделов кабинета в блоке
-   * «Linkeon»: кабинет владелец видит на нём. Сбой чтения не должен ронять ход.
+   * «Linkeon» (кабинет владелец видит на нём) и подсказкой Whisper для
+   * голосовых. Сбой чтения не должен ронять ход.
    */
-  private async ownerLanguage(cfg: TgBotConfigRow): Promise<string> {
+  async ownerLanguage(cfg: TgBotConfigRow): Promise<string> {
     try {
       const r = await this.pg.query(
         `SELECT profile_data->>'language' AS language FROM ai_profiles_consolidated WHERE user_id = $1 LIMIT 1`,
