@@ -109,7 +109,7 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
    * проверяется поведение бота, а не то, что заглушка вернула нужное.
    * Остальное — заглушки, как в tg-bot.products-tool.spec.ts.
    */
-  function makeTurnBot(o: { balance?: number; transcript?: string; alreadyNotified?: boolean; busy?: boolean; meetingHandled?: boolean } = {}) {
+  function makeTurnBot(o: { balance?: number; transcript?: string; alreadyNotified?: boolean; busy?: boolean; meetingHandled?: boolean; ownerLanguage?: string } = {}) {
     const real = makeRouter();
     const pg = {
       // busy — в чате уже идёт другой ход: замок не берётся.
@@ -130,6 +130,7 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
       persistAssistantReply: jest.fn(async () => {}),
       consolidateAfterReply: jest.fn(async () => {}),
       persistTurnFailure: jest.fn(async () => {}),
+      ownerLanguage: jest.fn(async () => o.ownerLanguage ?? 'ru'),
     };
     const voice = { transcribe: jest.fn(async () => o.transcript ?? '') };
     const billing = {
@@ -159,7 +160,7 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
     );
     (svc as any).logger = quiet;
     const sent = () => grammy.sendMessage.mock.calls.map((c: any[]) => String(c[1]));
-    return { svc, router, billing, grammy, meetings, sent };
+    return { svc, router, billing, grammy, meetings, voice, sent };
   }
 
   const CFG: any = {
@@ -247,6 +248,14 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
     await (svc as any).handleChatMessage(groupMsg({ text: 'Финансист, ты тут?' }), { ...CFG, status: 'silent' });
     expect(busyNotices(sent())).toEqual([]);
     expect(router.markAnswerExpected).not.toHaveBeenCalled();
+  });
+
+  it('голосовое распознаётся на языке владельца бота', async () => {
+    // Раньше Whisper всегда слушал по-русски: немецкое голосовое становилось
+    // кривой русской транслитерацией.
+    const { svc, voice } = makeTurnBot({ transcript: 'Finanzberater, wie viel?', ownerLanguage: 'de' });
+    await (svc as any).handleChatMessage(groupMsg({ voice: true }), CFG);
+    expect(voice.transcribe).toHaveBeenCalledWith('VOICE-1', 'de');
   });
 
   it('замолчанный /silent бот на голосовое с обращением — ни эха, ни ответа', async () => {
