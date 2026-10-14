@@ -19,6 +19,7 @@ import { VideoModule } from '../video/video.module';
 import { MeetingModule } from '../meeting/meeting.module';
 import { RoomModule } from '../meeting/room.module';
 import { BlogModule } from '../blog/blog.module';
+import { CostGrowthService } from '../cost-growth/cost-growth.service';
 
 @Module({
   // forwardRef на BlogModule — вторая половина разрыва кольца: блог берёт
@@ -28,7 +29,7 @@ import { BlogModule } from '../blog/blog.module';
   providers: [
     TgBotService, TgGrammyClient, TgIdentityService, TgConfigService,
     TgClaimService, TgRouterService, TgVoiceService, TgBillingService, TgCommandsService,
-    TgVideoDispatchService, TgMeetingService,
+    TgVideoDispatchService, TgMeetingService, CostGrowthService,
   ],
   exports: [
     TgBotService, TgGrammyClient, TgIdentityService, TgConfigService,

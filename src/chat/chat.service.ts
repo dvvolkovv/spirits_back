@@ -29,6 +29,7 @@ import { ChatFileStore, PERSIST_TURN_BUDGET_MS } from './chat-files/chat-file-st
 import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks } from './chat-files/relay-links';
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
+import { CostGrowthService } from '../cost-growth/cost-growth.service';
 import axios from 'axios';
 import { Request, Response } from 'express';
 import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
@@ -338,6 +339,10 @@ export class ChatService {
     // релее, как до фичи, и в лог уходит предупреждение. Что он реально
     // подключён, сторожит chat.module.chat-files.spec.ts.
     @Optional() private readonly chatFiles?: ChatFileStore,
+    // Сторож «стоимость растёт с каждым ответом». Последним и @Optional по
+    // той же причине, что chatFiles; что он подключён, сторожит
+    // chat.module.chat-files.spec.ts.
+    @Optional() private readonly costGrowth?: CostGrowthService,
   ) {}
 
   /**
@@ -1665,6 +1670,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Сравниваем charge.tokens, а не textCost: у оборванного хода textCost=0,
       // и дорогой сбой иначе прошёл бы молча — а он-то как раз и интересен.
       await this.alertExpensiveTurn(userId, assistantId, charge, textCost);
+      // Сторож роста стоимости: ход за ходом дороже — алерт. Не ждём:
+      // ответ и списание от него не зависят. Невыставленный ход (0) не пишется.
+      void this.costGrowth?.recordTurn(
+        { kind: 'chat', userId, assistantId, assistantName: agentName },
+        { tokens: textCost, usd: turnFailed ? 0 : charge.usd, note: charge.note },
+        { balance: () => this.getTokenBalance(userId) },
+      );
       try {
         const sessOverride = fresh ? freshSessionId : undefined;
         if (userMsgPersisted) {
@@ -2612,6 +2624,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
     else this.logger.log(logLine);
 
     await this.alertExpensiveTurn(p.userId, p.assistantId, charge, textCost);
+    // Сторож роста стоимости — как в обычном ходе: не ждём, ноль не пишется.
+    void this.costGrowth?.recordTurn(
+      { kind: 'chat', userId: p.userId, assistantId: p.assistantId },
+      { tokens: textCost, usd: turnFailed ? 0 : charge.usd, note: charge.note },
+      { balance: () => this.getTokenBalance(p.userId) },
+    );
 
     await this.saveChatHistory(p.userId, p.assistantId, p.userMsg, text, textCost, p.sessionIdOverride);
     if (!turnFailed) {

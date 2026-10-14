@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger, OnModuleInit, forwardRef } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleInit, Optional, forwardRef } from '@nestjs/common';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -18,6 +18,7 @@ import { MiscService } from '../misc/misc.service';
 import { VideoService } from '../video/video.service';
 import { BlogApprovalService } from '../blog/blog-approval.service';
 import { fetchMediaBytes } from '../common/net/own-media';
+import { CostGrowthService } from '../cost-growth/cost-growth.service';
 
 // Лимит размера файла, который мы готовы скачать с Telegram и передать в Claude.
 // Telegram сам отдаёт через Bot API до 20 МБ; больше — нужен MTProto, не наш кейс.
@@ -132,6 +133,10 @@ export class TgBotService implements OnModuleInit {
     // с обеих сторон (вторая половина — в blog.module.ts).
     @Inject(forwardRef(() => BlogApprovalService))
     private readonly blogApproval: BlogApprovalService,
+    // Сторож «стоимость растёт с каждым ответом» — последним и @Optional:
+    // спеки собирают сервис позиционно. Что он подключён, сторожит
+    // chat.module.chat-files.spec.ts.
+    @Optional() private readonly costGrowth?: CostGrowthService,
   ) {}
 
   async onModuleInit() {
@@ -1028,6 +1033,18 @@ export class TgBotService implements OnModuleInit {
       // 65k токенов ещё на Sonnet и проходили молча — теперь модель как в вебе,
       // и такие выбросы должны быть видны нам сразу, а не из жалобы владельца.
       await this.billing.alertIfExpensiveTurn(cfg, totalCostUsd, tokensCharged, newBalance);
+      // Сторож роста стоимости: ходы бота в этом чате дорожают раз за разом
+      // (по умолчанию пять подряд) — алерт. Ход списывается по costUsd от
+      // релея — ровно там жила поломка 14.10 (стоимость всей сессии за каждый
+      // ход). Не ждём: ответ от него не зависит.
+      void this.costGrowth?.recordTurn(
+        {
+          kind: 'tg', configId: String(cfg.id), chatId: String(msg.chat.id),
+          payerUserId: cfg.owner_user_id, botName: cfg.display_name || undefined,
+        },
+        { tokens: tokensCharged, usd: totalCostUsd, note: `cost=$${reply.costUsd.toFixed(4)} tts=$${voiceTtsCostUsd.toFixed(4)}` },
+        { balance: async () => newBalance },
+      );
       await this.router.persistAssistantReply(cfg, reply.text, contentType, tokensCharged);
       // Отметки о нуле снимаем после записи ответа: их сбой не должен стоить
       // хода, за который уже списали. Флаг группы — чтобы при следующем нуле
