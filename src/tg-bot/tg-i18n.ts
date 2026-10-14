@@ -326,8 +326,8 @@ const de: Catalog = {
   video_failed: '⚠️ Das Video konnte nicht erstellt werden.',
   video_expired: '⚠️ Das Video wurde erstellt, konnte aber nicht zugestellt werden – der Link ist abgelaufen.',
 
-  meeting_who: 'Der Assistent kommt in die Besprechung.',
-  meeting_who_agent: '{agent} kommt in die Besprechung.',
+  meeting_who: 'Der Assistent tritt der Besprechung bei.',
+  meeting_who_agent: '{agent} tritt der Besprechung bei.',
   meeting_join: 'An der Besprechung teilnehmen',
   meeting_title: 'Besprechung',
   meeting_title_meet: 'Besprechung in Google Meet',

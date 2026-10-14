@@ -218,8 +218,12 @@ export class TgConfigService {
    * его история переезжают — иначе бот в новой супергруппе молчит, а
    * мониторинг молчания ищет ответ не в том чате. Идемпотентно: второе
    * служебное сообщение (migrate_from_chat_id) старого id уже не найдёт.
+   *
+   * true — работающий конфиг теперь на новом id: переехал сейчас или раньше
+   * (служебное сообщение обогнало ход). По этому ответу ход решает, под каким
+   * id писать свою историю.
    */
-  async moveToChat(fromChatId: number, toChatId: number): Promise<void> {
+  async moveToChat(fromChatId: number, toChatId: number): Promise<boolean> {
     try {
       // Одним запросом: упади между двумя UPDATE — история навсегда осталась
       // бы на старом id (второе служебное сообщение конфиг уже не найдёт).
@@ -229,28 +233,40 @@ export class TgConfigService {
       // в новой супергруппе ложное «пишет один владелец». Ждущие видео — туда
       // же, иначе доставка уйдёт в мёртвый чат; ответ на сообщение старой
       // группы сбрасываем — в супергруппе своя нумерация сообщений.
-      const moved = await this.pg.query(
+      //
+      // История догоняет конфиг и тогда, когда он уже на новом id (there):
+      // служебное сообщение может обогнать ход, который успел записать
+      // реплику человека под старым id. Без этого она осталась бы там, и
+      // мониторинг молчания сутки видел бы «бот не ответил». Подзапрос по
+      // tg_bot_configs видит базу до UPDATE из moved — то есть только тех,
+      // кто переехал раньше.
+      const r = await this.pg.query(
         `WITH moved AS (
            UPDATE tg_bot_configs SET tg_chat_id = $2
             WHERE tg_chat_id = $1 AND status IN ('active','silent')
             RETURNING id
+         ), there AS (
+           SELECT id FROM moved
+           UNION ALL
+           SELECT id FROM tg_bot_configs WHERE tg_chat_id = $2 AND status IN ('active','silent')
          ), msgs AS (
            UPDATE tg_bot_messages SET tg_chat_id = $2
-            WHERE tg_chat_id = $1 AND EXISTS (SELECT 1 FROM moved)
+            WHERE tg_chat_id = $1 AND EXISTS (SELECT 1 FROM there)
          ), vids AS (
            UPDATE tg_bot_video_jobs SET tg_chat_id = $2, tg_reply_to_message_id = NULL
-            WHERE tg_chat_id = $1 AND delivery_status = 'pending' AND EXISTS (SELECT 1 FROM moved)
+            WHERE tg_chat_id = $1 AND delivery_status = 'pending' AND EXISTS (SELECT 1 FROM there)
          )
-         SELECT id FROM moved`,
+         SELECT (SELECT id FROM moved LIMIT 1) AS moved_id, EXISTS (SELECT 1 FROM there) AS settled`,
         [fromChatId, toChatId],
       );
-      const id = moved.rows[0]?.id;
-      if (!id) return;
-      this.logger.log(`config ${id}: группа ${fromChatId} стала супергруппой ${toChatId}`);
+      const row = r.rows[0];
+      if (row?.moved_id) this.logger.log(`config ${row.moved_id}: группа ${fromChatId} стала супергруппой ${toChatId}`);
+      return !!row?.settled;
     } catch (e: any) {
       // На новом id уже стоит свой бот (уникальный индекс по активным
       // чатам) — переезжать некуда. Остальную обработку апдейта не роняем.
       this.logger.warn(`moveToChat ${fromChatId} → ${toChatId} failed: ${e?.message}`);
+      return false;
     }
   }
 
