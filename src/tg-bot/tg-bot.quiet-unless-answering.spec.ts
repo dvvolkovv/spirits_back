@@ -109,7 +109,7 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
    * проверяется поведение бота, а не то, что заглушка вернула нужное.
    * Остальное — заглушки, как в tg-bot.products-tool.spec.ts.
    */
-  function makeTurnBot(o: { balance?: number; transcript?: string; alreadyNotified?: boolean; busy?: boolean } = {}) {
+  function makeTurnBot(o: { balance?: number; transcript?: string; alreadyNotified?: boolean; busy?: boolean; meetingHandled?: boolean } = {}) {
     const real = makeRouter();
     const pg = {
       // busy — в чате уже идёт другой ход: замок не берётся.
@@ -143,7 +143,8 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
       checkBalanceAlerts: jest.fn(async () => {}),
     };
     const commands = { tryHandle: jest.fn(async () => false) };
-    const meetings = { tryHandleLink: jest.fn(async () => false) };
+    // meetingHandled — ссылка оказалась встречей, и сервис показал приглашение.
+    const meetings = { tryHandleLink: jest.fn(async () => !!o.meetingHandled) };
     const grammy = {
       getBotUserId: jest.fn(async () => 999),
       sendChatAction: jest.fn(async () => {}),
@@ -158,7 +159,7 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
     );
     (svc as any).logger = quiet;
     const sent = () => grammy.sendMessage.mock.calls.map((c: any[]) => String(c[1]));
-    return { svc, router, billing, grammy, sent };
+    return { svc, router, billing, grammy, meetings, sent };
   }
 
   const CFG: any = {
@@ -253,6 +254,41 @@ describe('TgBotService.handleChatMessage: реплики бота — тольк
     await (svc as any).handleChatMessage(groupMsg({ voice: true }), { ...CFG, status: 'silent' });
     expect(echoes(sent())).toEqual([]);
     expect(router.generateReply).not.toHaveBeenCalled();
+  });
+
+  // ─── приглашение на встречу ───────────────────────────────────────────────
+  // Решение владельца 14.10.2026: на ссылку Linkeon/Zoom/Meet бот предлагает
+  // зайти во встречу, только если к нему обратились; замолчанный — никогда.
+  // Раньше карточка «зайдёт во встречу» уходила на любую ссылку в группе.
+  const ZOOM = 'https://zoom.us/j/123456789';
+
+  it('ссылка на встречу в обычной реплике группы — приглашения нет', async () => {
+    const { svc, router, meetings } = makeTurnBot({ meetingHandled: true });
+    await (svc as any).handleChatMessage(groupMsg({ text: `созвон тут ${ZOOM}` }), CFG);
+    expect(meetings.tryHandleLink).not.toHaveBeenCalled();
+    // Ход идёт обычным путём: реплика в истории, ответа нет (не обращались).
+    expect(router.persistUserMessage).toHaveBeenCalled();
+    expect(router.generateReply).not.toHaveBeenCalled();
+  });
+
+  it('ссылка на встречу с обращением к боту — приглашение', async () => {
+    const { svc, router, meetings } = makeTurnBot({ meetingHandled: true });
+    await (svc as any).handleChatMessage(groupMsg({ text: `Финансист, зайди ${ZOOM}` }), CFG);
+    expect(meetings.tryHandleLink).toHaveBeenCalledWith(-100123, `Финансист, зайди ${ZOOM}`, 'u-owner');
+    // Приглашение замыкает ход: в модель не идём.
+    expect(router.generateReply).not.toHaveBeenCalled();
+  });
+
+  it('замолчанный /silent бот — не приглашает и на обращение', async () => {
+    const { svc, meetings } = makeTurnBot({ meetingHandled: true });
+    await (svc as any).handleChatMessage(groupMsg({ text: `Финансист, зайди ${ZOOM}` }), { ...CFG, status: 'silent' });
+    expect(meetings.tryHandleLink).not.toHaveBeenCalled();
+  });
+
+  it('«на каждое сообщение» — приглашает на любую ссылку (контроль)', async () => {
+    const { svc, meetings } = makeTurnBot({ meetingHandled: true });
+    await (svc as any).handleChatMessage(groupMsg({ text: `созвон тут ${ZOOM}` }), { ...CFG, addressing_mode: 'always' });
+    expect(meetings.tryHandleLink).toHaveBeenCalledTimes(1);
   });
 
   it('нулевой баланс, обычная реплика группы — бот молчит', async () => {
