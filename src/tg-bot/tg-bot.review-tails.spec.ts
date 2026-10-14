@@ -470,7 +470,7 @@ describe('приглашение на встречу: имя ассистент�
     expect(await svc.tryHandleLink(-100123, 'созвон https://zoom.us/j/123456789', 'u-1')).toBe(true);
     const [, text, opts] = grammy.sendMessage.mock.calls[0] as any[];
     expect(opts).toEqual(expect.objectContaining({ parse_mode: 'HTML' }));
-    expect(text).toContain('R&amp;D зайдёт во встречу');
+    expect(text).toContain('R&amp;D подключится к встрече.');
   });
 });
 

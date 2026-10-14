@@ -517,7 +517,7 @@ export class TgBotService implements OnModuleInit {
    */
   static bindFailureMessage(
     e: any,
-    from?: { id?: number; username?: string | null },
+    from: { id?: number; username?: string | null } | undefined,
     lang: string,
   ): string {
     if (e instanceof TgIdentityConflictError || e?.constraint === 'tg_user_identities_tg_user_id_key') {

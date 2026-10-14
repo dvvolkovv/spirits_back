@@ -289,7 +289,9 @@ describe('команды в группе — на языке владельца,
   });
 
   it('/assistants в личке — вопрос и кнопки листания на языке владельца', async () => {
-    const { svc, sent } = makeCommands('es', (sql) => (/preferred_agent/.test(sql) ? { rows: [{ preferred_agent: 'A1' }] } : { rows: [] }));
+    const { svc, pg, sent } = makeCommands('es');
+    // Ассистент и язык — одним запросом к профилю.
+    pg.query.mockImplementation(async () => ({ rows: [{ preferred_agent: 'A1', language: 'es' }] }));
     await svc.handleAssistants({ chat: { id: 42 }, from: { id: 42 } }, 'u-1');
     expect(sent()[0].text).toBe(tgText('es', 'assistants_current', { agent: 'A1' }));
     const nav = sent()[0].opts.reply_markup.inline_keyboard.flat().map((b: any) => b.text);
