@@ -377,7 +377,16 @@ export class TgBotService implements OnModuleInit {
       return;
     }
     if (TgMeetingService.isJoin(data)) {
-      await this.meetings.handleJoinCallback(cb, ownerId);
+      // «… на встрече» уходит в группу — на языке владельца бота этой группы;
+      // ответ на нажатие видит нажавший — на своём.
+      let groupLang: TgLang | undefined;
+      try {
+        const groupCfg = await this.configs.getActiveByTgChatId(cb.message.chat.id);
+        if (groupCfg && !isPrivateConfig(groupCfg)) groupLang = await this.langFor(groupCfg.owner_user_id);
+      } catch {
+        // Язык группы — не повод не пустить во встречу.
+      }
+      await this.meetings.handleJoinCallback(cb, ownerId, groupLang);
       return;
     }
     if (data.startsWith('agents_page:')) {
@@ -1004,15 +1013,15 @@ export class TgBotService implements OnModuleInit {
             ...(plan.caption !== undefined ? { caption: plan.caption } : {}),
           });
           if (plan.needsSeparateText) {
-            await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang);
+            await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang, cfg);
           }
           contentType = 'voice_reply';
         } catch (e: any) {
           this.logger.warn(`TTS failed for chat ${msg.chat.id}, fallback to text: ${e.message}`);
-          await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang);
+          await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang, cfg);
         }
       } else if (textToSend) {
-        await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang);
+        await this.deliverReplyText(msg.chat.id, msg.message_id, textToSend, turnLang, cfg);
       }
 
       await this.deliverOutgoingMarkers(cfg, msg, markers, turnLang);
@@ -1258,10 +1267,22 @@ export class TgBotService implements OnModuleInit {
     replyToMessageId: number,
     text: string,
     lang: string,
+    cfg?: TgBotConfigRow,
   ): Promise<void> {
     try {
       await this.grammy.sendMessage(chatId, text, { reply_to_message_id: replyToMessageId });
     } catch (e: any) {
+      // Пока шёл ход, группа стала супергруппой: Telegram отвечает «group chat
+      // was upgraded» и даёт новый id. Переезжаем (moveToChat) и шлём ответ
+      // туда — без ответа на сообщение: в супергруппе своя нумерация. cfg
+      // правим на месте, чтобы история хода записалась уже в новый чат.
+      const migratedTo = Number(e?.parameters?.migrate_to_chat_id);
+      if (migratedTo) {
+        await this.configs.moveToChat(chatId, migratedTo);
+        if (cfg) cfg.tg_chat_id = String(migratedTo);
+        await this.grammy.sendMessage(migratedTo, text, {});
+        return;
+      }
       // Полный текст — в лог: это единственная копия ответа, за который уже
       // заплачено ёмкостью подписки.
       this.logger.error(

@@ -326,15 +326,15 @@ const de: Catalog = {
   video_failed: '⚠️ Das Video konnte nicht erstellt werden.',
   video_expired: '⚠️ Das Video wurde erstellt, konnte aber nicht zugestellt werden – der Link ist abgelaufen.',
 
-  meeting_who: 'Der Assistent kommt ins Meeting.',
-  meeting_who_agent: '{agent} kommt ins Meeting.',
-  meeting_join: 'Am Meeting teilnehmen',
-  meeting_title: 'Meeting',
-  meeting_title_meet: 'Meeting in Google Meet',
-  meeting_title_zoom: 'Zoom-Meeting',
+  meeting_who: 'Der Assistent kommt in die Besprechung.',
+  meeting_who_agent: '{agent} kommt in die Besprechung.',
+  meeting_join: 'An der Besprechung teilnehmen',
+  meeting_title: 'Besprechung',
+  meeting_title_meet: 'Besprechung in Google Meet',
+  meeting_title_zoom: 'Zoom-Besprechung',
   meeting_link_expired: 'Der Link ist abgelaufen – schick ihn noch einmal.',
   meeting_pick_assistant: 'Wähle zuerst einen Assistenten: /assistants',
-  meeting_joined: '{agent} ist im Meeting.',
+  meeting_joined: '{agent} ist in der Besprechung.',
   meeting_busy: 'Es läuft bereits ein Gespräch – beende es und versuch es erneut.',
   meeting_unavailable: 'Beitritt nicht möglich: Der Raum ist nicht verfügbar.',
 
@@ -352,7 +352,24 @@ const de: Catalog = {
   cmd_help: 'Was der Bot kann',
 };
 
-const fr: Catalog = {
+/**
+ * Французская типографика: перед « ; ! ? » — узкий неразрывный пробел, перед
+ * « : » и внутри « » — неразрывный. С обычными Telegram переносил знак на
+ * новую строку («Solde de jetons» / «: 5»). В тексте каталога пробелы
+ * обычные — читать и править так проще; замена — здесь, один раз.
+ */
+function frenchTypography(c: Catalog): Catalog {
+  const NBSP = String.fromCharCode(0xa0);
+  const NNBSP = String.fromCharCode(0x202f);
+  const fix = (s: string) => s
+    .replace(/ ([;!?])/g, `${NNBSP}$1`)
+    .replace(/ :/g, `${NBSP}:`)
+    .replace(/« /g, `«${NBSP}`)
+    .replace(/ »/g, `${NBSP}»`);
+  return Object.fromEntries(Object.entries(c).map(([k, v]) => [k, fix(v)])) as Catalog;
+}
+
+const fr: Catalog = frenchTypography({
   start_unlinked: 'Bonjour ! Pour commencer, ouvrez Linkeon — vous pourrez y créer un compte ou lier un compte existant.',
   start_hello: 'Bonjour !',
   start_hello_agent: 'Bonjour ! C’est <b>{agent}</b> qui répond en ce moment.',
@@ -454,7 +471,7 @@ const fr: Catalog = {
   cmd_resume_all: 'Réactiver le bot dans les groupes',
   cmd_resume_here: 'Réactiver le bot ici',
   cmd_help: 'Ce que fait le bot',
-};
+});
 
 const es: Catalog = {
   start_unlinked: '¡Hola! Para empezar, abre Linkeon: allí puedes crear una cuenta o vincular una que ya tengas.',

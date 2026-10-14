@@ -182,8 +182,11 @@ export class TgMeetingService {
   }
 
   /** Нажали «Зайти во встречу». */
-  async handleJoinCallback(cb: any, ownerId: string): Promise<void> {
+  async handleJoinCallback(cb: any, ownerId: string, groupLang?: TgLang): Promise<void> {
+    // Ответы на нажатие — нажавшему, на его языке; сообщение в чат — на языке
+    // владельца бота этой группы (groupLang), в личке — тоже нажавшего.
     const lang = await ownerTgLanguage(this.pg, ownerId);
+    const chatLang = groupLang ?? lang;
     const rest = String(cb.data || '').slice(JOIN_PREFIX.length);
     const sep = rest.indexOf(':');
     const provider = (sep > 0 ? rest.slice(0, sep) : 'linkeon') as MeetingProvider;
@@ -215,7 +218,7 @@ export class TgMeetingService {
       // Отвечаем на callback ДО отправки сообщения: Telegram гасит «часики» на
       // кнопке только по нему, а вход занимает несколько секунд.
       await this.grammy.answerCallbackQuery(cb.id, {});
-      await this.grammy.sendMessage(cb.message.chat.id, tgText(lang, 'meeting_joined', { agent: agent.name }));
+      await this.grammy.sendMessage(cb.message.chat.id, tgText(chatLang, 'meeting_joined', { agent: agent.name }));
     } catch (e: any) {
       // Причины ожидаемые и разные: комната закрылась, уже идёт разговор,
       // комната под паролем. Человеку нужен текст, а не молчащая кнопка.
