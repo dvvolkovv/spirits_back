@@ -238,29 +238,37 @@ export class TgConfigService {
       // служебное сообщение может обогнать ход, который успел записать
       // реплику человека под старым id. Без этого она осталась бы там, и
       // мониторинг молчания сутки видел бы «бот не ответил». Подзапрос по
-      // tg_bot_configs видит базу до UPDATE из moved — то есть только тех,
-      // кто переехал раньше.
-      const r = await this.pg.query(
-        `WITH moved AS (
-           UPDATE tg_bot_configs SET tg_chat_id = $2
-            WHERE tg_chat_id = $1 AND status IN ('active','silent')
-            RETURNING id
-         ), there AS (
-           SELECT id FROM moved
-           UNION ALL
-           SELECT id FROM tg_bot_configs WHERE tg_chat_id = $2 AND status IN ('active','silent')
-         ), msgs AS (
-           UPDATE tg_bot_messages SET tg_chat_id = $2
-            WHERE tg_chat_id = $1 AND EXISTS (SELECT 1 FROM there)
-         ), vids AS (
-           UPDATE tg_bot_video_jobs SET tg_chat_id = $2, tg_reply_to_message_id = NULL
-            WHERE tg_chat_id = $1 AND delivery_status = 'pending' AND EXISTS (SELECT 1 FROM there)
-         )
-         SELECT (SELECT id FROM moved LIMIT 1) AS moved_id, EXISTS (SELECT 1 FROM there) AS settled`,
-        [fromChatId, toChatId],
-      );
-      const row = r.rows[0];
-      if (row?.moved_id) this.logger.log(`config ${row.moved_id}: группа ${fromChatId} стала супергруппой ${toChatId}`);
+      // tg_bot_configs видит снимок начала оператора, до UPDATE из moved, —
+      // то есть тех, чей переезд закоммичен раньше.
+      //
+      // Второй заход — на случай двух переездов разом (служебное сообщение и
+      // ход): оператор, ждавший блокировку строки конфига, пропускает её, а
+      // there по своему снимку не видит, что конфиг уже на новом id. Новый
+      // оператор — свежий снимок; запрос идемпотентен.
+      let row: any;
+      for (let attempt = 0; attempt < 2 && !row?.settled; attempt++) {
+        const r = await this.pg.query(
+          `WITH moved AS (
+             UPDATE tg_bot_configs SET tg_chat_id = $2
+              WHERE tg_chat_id = $1 AND status IN ('active','silent')
+              RETURNING id
+           ), there AS (
+             SELECT id FROM moved
+             UNION ALL
+             SELECT id FROM tg_bot_configs WHERE tg_chat_id = $2 AND status IN ('active','silent')
+           ), msgs AS (
+             UPDATE tg_bot_messages SET tg_chat_id = $2
+              WHERE tg_chat_id = $1 AND EXISTS (SELECT 1 FROM there)
+           ), vids AS (
+             UPDATE tg_bot_video_jobs SET tg_chat_id = $2, tg_reply_to_message_id = NULL
+              WHERE tg_chat_id = $1 AND delivery_status = 'pending' AND EXISTS (SELECT 1 FROM there)
+           )
+           SELECT (SELECT id FROM moved LIMIT 1) AS moved_id, EXISTS (SELECT 1 FROM there) AS settled`,
+          [fromChatId, toChatId],
+        );
+        row = r.rows[0];
+        if (row?.moved_id) this.logger.log(`config ${row.moved_id}: группа ${fromChatId} стала супергруппой ${toChatId}`);
+      }
       return !!row?.settled;
     } catch (e: any) {
       // На новом id уже стоит свой бот (уникальный индекс по активным
