@@ -45,6 +45,18 @@ describe('город для инструмента Райи', () => {
     expect(resolveCity(index, 'Кировск, Ленинградская')).toMatchObject({ kind: 'found', cityId: 6 });
   });
 
+  it('подсказка — после любой запятой: «,», «，», «、», «；»', () => {
+    for (const q of ['Кировск，Ленинградская', 'Кировск、Ленинградская', 'Кировск；Ленинградская']) {
+      expect([q, resolveCity(index, q)]).toMatchObject([q, { kind: 'found', cityId: 6 }]);
+    }
+  });
+
+  it('подсказка — с начала слова: кусок внутри слова не сужает', () => {
+    // «градская» — внутри «Ленинградская», но не начало слова: подсказка не
+    // подходит никому, откат без неё — оба Кировска вариантами.
+    expect(resolveCity(index, 'Кировск, градская')).toMatchObject({ kind: 'choose', total: 2 });
+  });
+
   it('подсказка отфильтровала все совпадения — варианты без нее, но никогда found: пояс угадывать нельзя', () => {
     // У Москвы регион в базе — null (совпадает с названием города), поэтому
     // «Москва, Московская область» подсказкой не находится никогда — без
@@ -141,5 +153,49 @@ describe('город для инструмента Райи', () => {
     if (r.kind !== 'choose') return;
     expect(r.candidates).toHaveLength(1);
     expect(r.candidates[0].cityId).toBe(0);
+  });
+});
+
+describe('общий указатель: места на всех языках и собственные названия', () => {
+  /** Вена по-французски — Vienne; во Франции есть свой город Вьенн (Vienne). */
+  const WORLD: CityDb = {
+    v: 1,
+    zones: ['Europe/Vienna', 'America/Chicago', 'America/New_York', 'Europe/Paris'],
+    countries: { AT: 'Австрия', US: 'США', FR: 'Франция' },
+    regions: ['Миссури', 'Массачусетс', 'Овернь — Рона — Альпы'],
+    cities: [
+      ['Вена', 'Vienna', 'AT', 0, 1691, -1],
+      ['Спрингфилд', 'Springfield', 'US', 1, 169, 0],
+      ['Спрингфилд', 'Springfield', 'US', 2, 155, 1],
+      ['Вьенн', 'Vienne', 'FR', 3, 29, 2],
+    ],
+  };
+  const world = () => {
+    const idx = indexCities(WORLD);
+    idx[0].keys.push('vienne'); // название на другом языке — после собственных
+    return idx;
+  };
+  const pops = WORLD.cities.map((c) => c[4]);
+  const places = ['vienna austria at', 'missouri united states us', 'massachusetts united states us', 'auvergne rhone alpes france fr'];
+  const ownKeys = [2, 2, 2, 2];
+
+  it('подсказка по places — с начала слова, на любом языке', () => {
+    const idx = world();
+    expect(resolveCity(idx, 'Springfield, mass', undefined, pops, { places })).toMatchObject({ kind: 'found', cityId: 2 });
+    expect(resolveCity(idx, 'Springfield，Missouri', undefined, pops, { places })).toMatchObject({ kind: 'found', cityId: 1 });
+    expect(resolveCity(idx, 'Springfield, united states', undefined, pops, { places })).toMatchObject({ kind: 'choose', total: 2 });
+    // «sett» — внутри «massachusetts», не начало слова: откат без подсказки, оба вариантами.
+    expect(resolveCity(idx, 'Springfield, sett', undefined, pops, { places })).toMatchObject({ kind: 'choose', total: 2 });
+    // Русские подписи без places подсказку по-английски не узнают.
+    expect(resolveCity(idx, 'Springfield, mass', undefined, pops)).toMatchObject({ kind: 'choose', total: 2 });
+  });
+
+  it('крупный город совпал чужим названием, малый — своим: варианты, а не крупный сразу', () => {
+    const r = resolveCity(world(), 'Vienne', undefined, pops, { places, ownKeys });
+    expect(r.kind === 'choose' && r.candidates.map((c) => c.name)).toEqual(['Вена', 'Вьенн']);
+    // Без сведений о собственных названиях — прежний перевес населения.
+    expect(resolveCity(world(), 'Vienne', undefined, pops, { places })).toMatchObject({ kind: 'found', cityId: 0 });
+    // Своим названием крупный находится сразу.
+    expect(resolveCity(world(), 'Vienna', undefined, pops, { places, ownKeys })).toMatchObject({ kind: 'found', cityId: 0 });
   });
 });

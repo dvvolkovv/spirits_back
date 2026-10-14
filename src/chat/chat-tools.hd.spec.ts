@@ -18,6 +18,12 @@ describe('инструмент calculate_human_design в чате', () => {
     expect(tool!.description).toMatch(/русскими названиями/);
     expect(schema.properties.city.description).toMatch(/на любом языке сайта/);
     expect(schema.properties.city.description).toContain('нынешнее официальное название по-русски');
+    for (const text of [tool!.description, schema.properties.city.description]) {
+      expect(text).toContain('переведи на английский или русский');
+      expect(text).toMatch(/страну по возможности указывай всегда/);
+      expect(text).toContain('St. Petersburg');
+      expect(text).not.toMatch(/на языке человека/);
+    }
     expect(tool!.description).toMatch(/imageUrl.*null/);
   });
 

@@ -1,12 +1,21 @@
-import { indexCities, type CityDb } from './cities';
-import { HumanDesignToolService } from './hd-tool.service';
+import { type CityDb } from './cities';
+import { CITIES_DIR, HumanDesignToolService } from './hd-tool.service';
+import { loadMultilingualCities, multilingualCities, type MultilingualCities } from './multilang-index';
 
 const IMAGE = 'https://media.example/linkeon-assets/images/1-abc.png';
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
 
-function service() {
+/** Настоящие базы — один раз на файл: сборка указателя семи баз — около секунды. */
+let REAL: MultilingualCities;
+beforeAll(() => {
+  REAL = loadMultilingualCities(CITIES_DIR);
+});
+
+/** cities — готовый указатель (по умолчанию настоящий); null — сервис читает базы сам. */
+function service(cities: MultilingualCities | null = REAL) {
   const upload = jest.fn(async () => IMAGE);
   const svc = new HumanDesignToolService({ uploadAssetImage: upload } as any);
+  if (cities) svc['cities'] = cities;
   return { svc, upload };
 }
 
@@ -21,6 +30,8 @@ const TWINS: CityDb = {
     ['Кировск', 'Kirovsk', 'RU', 0, 26, 1],
   ],
 };
+/** TWINS на всех языках сайта — одна и та же база, указатель тот же, что у настоящих. */
+const twins = () => multilingualCities(() => TWINS);
 
 describe('инструмент calculate_human_design', () => {
   it('Казань, 12.03.1990, 14:25 — Манифестор 5/2, эмоциональный, картинка PNG', async () => {
@@ -47,8 +58,7 @@ describe('инструмент calculate_human_design', () => {
   });
 
   it('одноимённые города — варианты, без расчёта и картинки; cityId из вариантов — карта', async () => {
-    const { svc, upload } = service();
-    svc['index'] = indexCities(TWINS);
+    const { svc, upload } = service(twins());
     const r = await svc.calculate({ date: '1990-03-12', time: '14:25', city: 'Кировск' });
     expect(r).toEqual({
       ok: true,
@@ -65,15 +75,13 @@ describe('инструмент calculate_human_design', () => {
   });
 
   it('cityId строкой — тоже принимается, если совпадает с названием города', async () => {
-    const { svc } = service();
-    svc['index'] = indexCities(TWINS);
+    const { svc } = service(twins());
     const r = await svc.calculate({ date: '1990-03-12', time: '14:25', city: 'Кировск', cityId: '1' });
     expect(r).toMatchObject({ ok: true, kind: 'chart', city: { region: 'Ленинградская область' } });
   });
 
   it('cityId не из вариантов — понятная ошибка, не падение', async () => {
-    const { svc } = service();
-    svc['index'] = indexCities(TWINS);
+    const { svc } = service(twins());
 
     const bad = await svc.calculate({ date: '1990-03-12', time: '14:25', city: 'Кировск', cityId: 'abc' });
     expect(bad).toEqual({ ok: false, error: 'cityId не из вариантов прошлого ответа — вызовите без cityId.' });
@@ -143,8 +151,7 @@ describe('инструмент calculate_human_design', () => {
   });
 
   it('дата проверяется раньше города: при плохой дате — ошибка даты, а не выбор города', async () => {
-    const { svc } = service();
-    svc['index'] = indexCities(TWINS); // «Кировск» здесь неоднозначен
+    const { svc } = service(twins()); // «Кировск» здесь неоднозначен
     const r = await svc.calculate({ date: '1990-02-30', time: '14:25', city: 'Кировск' });
     expect(r.ok).toBe(false);
     expect(!r.ok && r.error).toMatch(/дат/);
@@ -176,11 +183,49 @@ describe('инструмент calculate_human_design', () => {
     expect(!r.ok && r.error.includes('а'.repeat(101))).toBe(false);
   });
 
+  it('без подмены — базы читаются из каталога data при первом вызове', async () => {
+    const { svc } = service(null);
+    const r = await svc.calculate({ date: '1990-03-12', time: '14:25', city: 'München, Bayern' });
+    expect(r).toMatchObject({ ok: true, kind: 'chart', city: { name: 'Мюнхен' } });
+  });
+
   it('база городов недоступна — понятная ошибка, без падения', async () => {
-    const { svc } = service();
+    const { svc } = service(null);
     (svc as any).citiesDir = '/no/such/dir';
     const r = await svc.calculate({ date: '1990-03-12', time: '14:25', city: 'Казань' });
     expect(r).toEqual({ ok: false, error: 'Инструмент расчёта временно недоступен — посчитайте прежним способом.' });
+  });
+
+  it('сбой загрузки баз запоминается на минуту: семь файлов не перечитываются на каждый вызов', async () => {
+    const { svc } = service(null);
+    let now = 1_000_000;
+    (svc as any).now = () => now;
+    const loadCities = jest.fn((): MultilingualCities => {
+      throw new Error('нет файла');
+    });
+    (svc as any).loadCities = loadCities;
+    const call = () => svc.calculate({ date: '1990-03-12', time: '14:25', city: 'Кировск' });
+    const unavailable = { ok: false, error: 'Инструмент расчёта временно недоступен — посчитайте прежним способом.' };
+
+    expect(await call()).toEqual(unavailable);
+    expect(await call()).toEqual(unavailable);
+    now += 59_000;
+    expect(await call()).toEqual(unavailable);
+    expect(loadCities).toHaveBeenCalledTimes(1);
+
+    now += 2_000; // минута прошла — пробуем снова, и базы на месте
+    loadCities.mockImplementation(twins);
+    expect(await call()).toMatchObject({ ok: true, kind: 'choose_city', total: 2 });
+    expect(await call()).toMatchObject({ ok: true, kind: 'choose_city', total: 2 });
+    expect(loadCities).toHaveBeenCalledTimes(2);
+  });
+
+  it('cityId с городом, где регион после «、» или «；», — тоже принимается', async () => {
+    const { svc } = service(twins());
+    for (const city of ['Кировск、Ленинградская область', 'Кировск；Ленинградская область']) {
+      const r = await svc.calculate({ date: '1990-03-12', time: '14:25', city, cityId: 1 });
+      expect([city, r]).toMatchObject([city, { ok: true, kind: 'chart', city: { region: 'Ленинградская область' } }]);
+    }
   });
 
   it('картинка не нарисовалась или не загрузилась — карта всё равно возвращается, imageUrl null', async () => {
@@ -188,6 +233,7 @@ describe('инструмент calculate_human_design', () => {
       throw new Error('upload failed');
     });
     const svc = new HumanDesignToolService({ uploadAssetImage: upload } as any);
+    svc['cities'] = REAL;
     const r = await svc.calculate({ date: '1990-03-12', time: '14:25', city: 'Казань' });
     expect(r).toMatchObject({ ok: true, kind: 'chart', imageUrl: null });
   });
@@ -207,5 +253,16 @@ describe('инструмент calculate_human_design', () => {
       expect(!r.ok && r.error).toMatch(error);
     }
     expect(upload).not.toHaveBeenCalled();
+  });
+
+  it('«город не найден» — что передать: любой язык сайта, иначе перевод, и страну', async () => {
+    const { svc } = service();
+    const r = await svc.calculate({ date: '1990-03-12', time: '14:25', city: 'Атлантидаград' });
+    const error = r.ok ? '' : r.error;
+    expect(error).toMatch(/не найден/);
+    expect(error).toMatch(/на любом языке сайта/);
+    expect(error).toContain('переведите на английский или русский');
+    expect(error).toMatch(/страну/);
+    expect(error).not.toMatch(/на языке человека/);
   });
 });
