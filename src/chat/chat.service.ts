@@ -1670,13 +1670,6 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Сравниваем charge.tokens, а не textCost: у оборванного хода textCost=0,
       // и дорогой сбой иначе прошёл бы молча — а он-то как раз и интересен.
       await this.alertExpensiveTurn(userId, assistantId, charge, textCost);
-      // Сторож роста стоимости: ход за ходом дороже — алерт. Не ждём:
-      // ответ и списание от него не зависят. Невыставленный ход (0) не пишется.
-      void this.costGrowth?.recordTurn(
-        { kind: 'chat', userId, assistantId, assistantName: agentName },
-        { tokens: textCost, usd: turnFailed ? 0 : charge.usd, note: charge.note },
-        { balance: () => this.getTokenBalance(userId) },
-      );
       try {
         const sessOverride = fresh ? freshSessionId : undefined;
         if (userMsgPersisted) {
@@ -1696,6 +1689,15 @@ ${LanguageService.buildDirective(userLanguage)}`;
               durationMs: Date.now() - streamStartTime,
               replyChars: fullText.length,
             });
+            // Сторож роста стоимости: ход за ходом дороже — алерт. Только здесь,
+            // за записанным списанием: пустой ответ, оборванный ход и сбой
+            // записи истории до списания не доходят — значит, и до сторожа.
+            // Не ждём: ход от него не зависит.
+            void this.costGrowth?.recordTurn(
+              { kind: 'chat', userId, assistantId, assistantName: agentName },
+              { tokens: textCost, usd: charge.usd, note: charge.note },
+              { balance: () => this.getTokenBalance(userId) },
+            );
           }
           // Профиль формируется и в fresh-режиме (чистый лист скрывает контекст,
           // но не отключает обучение профиля).
@@ -2624,12 +2626,6 @@ ${LanguageService.buildDirective(userLanguage)}`;
     else this.logger.log(logLine);
 
     await this.alertExpensiveTurn(p.userId, p.assistantId, charge, textCost);
-    // Сторож роста стоимости — как в обычном ходе: не ждём, ноль не пишется.
-    void this.costGrowth?.recordTurn(
-      { kind: 'chat', userId: p.userId, assistantId: p.assistantId },
-      { tokens: textCost, usd: turnFailed ? 0 : charge.usd, note: charge.note },
-      { balance: () => this.getTokenBalance(p.userId) },
-    );
 
     await this.saveChatHistory(p.userId, p.assistantId, p.userMsg, text, textCost, p.sessionIdOverride);
     if (!turnFailed) {
@@ -2640,6 +2636,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
         durationMs: p.durationMs,
         replyChars: text.length,
       });
+      // Сторож роста стоимости — как в обычном ходе: только за записанным
+      // списанием и без ожидания.
+      void this.costGrowth?.recordTurn(
+        { kind: 'chat', userId: p.userId, assistantId: p.assistantId },
+        { tokens: textCost, usd: charge.usd, note: charge.note },
+        { balance: () => this.getTokenBalance(p.userId) },
+      );
     }
     return textCost;
   }
