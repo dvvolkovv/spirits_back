@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** если у человека (или в чате TG-бота) каждый следующий ответ дороже предыдущего — 5 подряд, последний ×3 к первому и не дешевле 1 000 токенов — владелец получает алерт в Telegram.
+**Goal:** если у человека (или в чате TG-бота) каждый следующий ответ дороже предыдущего — 5 подряд, последний ×1,2 к первому и не дешевле 8 000 токенов (пороги изменены владельцем 14.10 после прогона по истории; в коде задач ниже — первоначальные 3 и 1 000) — владелец получает алерт в Telegram.
 
 **Architecture:** чистая функция правила `detectCostGrowth`; `CostGrowthService` хранит последние ходы пары в Redis (Lua: RPUSH + LTRIM + EXPIRE + LRANGE одним вызовом) и шлёт алерт через `sendTelegramAlert` с паузой `SET NX`; вызывается без ожидания рядом с алертом «Дорогой ход» в обоих путях списания веб-чата и после списания в TG-боте.
 
