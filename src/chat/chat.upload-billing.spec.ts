@@ -120,6 +120,18 @@ describe('persistUploadTurn: ход с вложениями тарифициру
     expect(historyTokens(pg.calls)).not.toBe(ANSWER.length);
   });
 
+  it('стоимость хода от релея больше usage — берётся она (субагенты, веб-инструменты)', async () => {
+    const pg = makePg();
+    const svc = makeService(pg);
+
+    await svc.persistUploadTurn({
+      userId: 'u1', assistantId: '12', userMsg: '📎 scan.jpg', assistantMsg: ANSWER,
+      usage: USAGE_HALF_DOLLAR, costUsd: 7.5, turnCostUsd: 0.8, durationMs: 1000,
+    });
+
+    expect(chargedTokens(pg.calls)).toBe(forUsd(0.8));
+  });
+
   it('без usage откатывается на costUsd', async () => {
     const pg = makePg();
     const svc = makeService(pg);
@@ -223,6 +235,16 @@ describe('uploadAndChat: usage из события done доезжает до с
     const end = res.written.find((w: any) => w.type === 'end');
     expect(end.usage.total).toBe(forUsd(0.5));
     expect(end.usage.total).toBe(chargedTokens(pg.calls));
+  });
+
+  it('стоимость хода из done доезжает и до списания, и до показа', async () => {
+    // costUsd здесь — сумма всей сессии (CLI 2.1.280), его брать нельзя.
+    const pg = makePg();
+    const res = await run(pg, { type: 'done', costUsd: 7.5, usage: USAGE_HALF_DOLLAR, turnCostUsd: 0.8 });
+
+    expect(chargedTokens(pg.calls)).toBe(forUsd(0.8));
+    const end = res.written.find((w: any) => w.type === 'end');
+    expect(end.usage.total).toBe(forUsd(0.8));
   });
 
   it('на нулевом балансе не ходит в релей вовсе', async () => {

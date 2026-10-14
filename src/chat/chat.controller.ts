@@ -1,6 +1,6 @@
 import { Controller, Post, Get, Delete, Body, Query, Req, Res, UseGuards, Optional } from '@nestjs/common';
 import { Request, Response } from 'express';
-import { ChatService, SdkUsageTotals } from './chat.service';
+import { ChatService, SdkUsageTotals, addRelayTurnCost } from './chat.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { JwtService } from '../common/services/jwt.service';
@@ -339,6 +339,8 @@ export class ChatController {
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
     };
     let agentCostUsd = 0;
+    // Стоимость самого хода по счёту CLI; null — релей её не прислал.
+    let agentTurnCostUsd: number | null = null;
     let turnFailed = false;
     let failReason = '';
     const streamStartTime = Date.now();
@@ -413,6 +415,7 @@ export class ChatController {
                   failReason = typeof ev.failReason === 'string' ? ev.failReason : 'unknown';
                 }
                 if (typeof ev.costUsd === 'number' && ev.costUsd > 0) agentCostUsd += ev.costUsd;
+                agentTurnCostUsd = addRelayTurnCost(agentTurnCostUsd, ev);
                 if (ev.usage && typeof ev.usage === 'object') {
                   for (const k of Object.keys(agentUsage) as (keyof SdkUsageTotals)[]) {
                     const v = ev.usage[k];
@@ -466,7 +469,7 @@ export class ChatController {
         // токена» за ход, за который не списали ничего.
         const shown = turnFailed
           ? 0
-          : this.chatService.computeUploadCharge(agentUsage, agentCostUsd, fullText).tokens;
+          : this.chatService.computeUploadCharge(agentUsage, agentCostUsd, fullText, agentTurnCostUsd).tokens;
         safeWrite({ type: 'end', content: fullText, usage: { input: 0, output: shown, total: shown } });
       } else if (upstreamError) {
         const errText = 'Ошибка обработки файла. Попробуйте ещё раз.';
@@ -492,6 +495,7 @@ export class ChatController {
               assistantMsg: fullText,
               usage: agentUsage,
               costUsd: agentCostUsd,
+              turnCostUsd: agentTurnCostUsd,
               durationMs: Date.now() - streamStartTime,
               turnFailed,
               failReason,

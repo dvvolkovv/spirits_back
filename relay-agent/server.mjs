@@ -8,6 +8,7 @@ import { spawn } from "child_process";
 import { sessionFsKey, uploadFileName, fallbackFileName } from "./paths.mjs";
 import { eventCallContext, tailDialogue } from "./session-tail.mjs";
 import { RUN_ENV, runTag, finishedRun, reap } from "./proc-reaper.mjs";
+import { costBaseline, runCost } from "./turn-cost.mjs";
 
 const app = express();
 const PORT = 3033;
@@ -590,16 +591,23 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       try { res.write("data: " + JSON.stringify({ type: "notice", text }) + "\n\n"); } catch {}
     }
   };
-  // Реальный расход хода. total_cost_usd — сумма по всем result-событиям,
-  // включая повторные попытки и субагентов. Рядом собираем сырой usage:
-  // бэкенд считает по нему взвешенные токены (веса = отношения цен Anthropic
-  // к input, одинаковые для всей линейки моделей), а costUsd оставлен для
-  // сверки и как запасной путь.
+  // Расход хода. Сырой usage — только запросы основной модели: бэкенд считает
+  // по нему взвешенные токены (веса = отношения цен Anthropic к input,
+  // одинаковые для всей линейки моделей).
+  //
+  // totalCostUsd — сумма total_cost_usd по result-событиям. С CLI 2.1.280 у
+  // сессии, поднятой через --resume, это стоимость ВСЕЙ сессии: CLI продолжает
+  // счёт с записи cost-state в транскрипте. Остаётся для сверки, а стоимость
+  // самого хода — turnCostUsd: итог CLI минус та запись (turn-cost.mjs). В ней
+  // всё, чего нет в usage: субагенты, Haiku внутри WebSearch/WebFetch, плата за
+  // поиск. turnCostKnown=false — базу не прочитали, и бэкенд считает по usage.
   //
   // cache_creation разделён по TTL НАМЕРЕННО: запись на 5 минут стоит 1.25x
   // input, на час — 2x. Сложишь их в одно число — часовой кэш будет считаться
   // по цене пятиминутного, то есть на 60% дешевле реального.
   let totalCostUsd = 0;
+  let turnCostUsd = 0;
+  let turnCostKnown = true;
   // Наибольший контекст среди запросов этого хода — по нему решаем, не пора ли
   // сессии на покой. См. блок «Ограничение по измеренному контексту» ниже.
   let maxTurnContext = 0;
@@ -647,9 +655,8 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
 
   function runOnce(useResume) {
     return new Promise((resolve) => {
-      const runArgs = useResume && sessionMap.has(sessionId)
-        ? [...args, "--resume", sessionMap.get(sessionId)]
-        : args;
+      const resumeSid = useResume && sessionMap.has(sessionId) ? sessionMap.get(sessionId) : null;
+      const runArgs = resumeSid ? [...args, "--resume", resumeSid] : args;
       // Pre-empt: if a prior claude is still running for this sessionId,
       // kill it first. Two parallel `claude --resume <same>` processes race
       // on the JSONL session lock and neither makes progress.
@@ -662,6 +669,11 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         try { prev.preempt(); } catch {}
         try { prev.child.kill("SIGKILL"); } catch {}
       }
+
+      // База стоимости — после того, как прерванный запуск убит: свою запись
+      // cost-state он уже не допишет, и CLI продолжит счёт с прежней.
+      const costBase = resumeSid ? costBaseline(sessionJsonlPath(resumeSid)) : 0;
+      let runTotal = null;
 
       const tag = runTag(randomUUID());
       liveRuns.add(tag);
@@ -712,7 +724,10 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
           if (ev.subtype === "error_max_turns" || /max.?turns/i.test(String(ev.result || ""))) {
             maxTurnsHit = true;
           }
-          if (typeof ev.total_cost_usd === "number") totalCostUsd += ev.total_cost_usd;
+          if (typeof ev.total_cost_usd === "number") {
+            totalCostUsd += ev.total_cost_usd;
+            runTotal = ev.total_cost_usd;
+          }
           const u = ev.usage || {};
           const cc = u.cache_creation || {};
           const st = u.server_tool_use || {};
@@ -806,6 +821,10 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
 
       child.on("close", () => {
         if (buf.trim()) { try { handleEvent(JSON.parse(buf)); } catch {} }
+        if (runTotal !== null) {
+          if (costBase === null) turnCostKnown = false;
+          else turnCostUsd += runCost(runTotal, costBase);
+        }
         const cur = activeChildren.get(sessionId);
         if (cur && cur.child === child) activeChildren.delete(sessionId);
         resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit });
@@ -976,6 +995,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         type: "done",
         outputFiles,
         costUsd: totalCostUsd,
+        turnCostUsd: turnCostKnown ? Number(turnCostUsd.toFixed(6)) : null,
         usage: usageTotals,
         failed: turnFailed,
         failReason,

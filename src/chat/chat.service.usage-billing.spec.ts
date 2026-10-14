@@ -45,8 +45,11 @@ interface Harness {
 /**
  * `costUsd: null` — релей старой сборки, поле вообще не приходит.
  * `usage` — сырой расход; если не задан, проверяется откат на costUsd.
+ * `turnCostUsd` — стоимость ЭТОГО хода по счёту CLI; не задан — релей старой сборки.
  */
-function makeHarness(opts: { answer: string; costUsd: number | null; usage?: Record<string, number> }): Harness {
+function makeHarness(opts: {
+  answer: string; costUsd: number | null; usage?: Record<string, number>; turnCostUsd?: number | null;
+}): Harness {
   const pgCalls: { sql: string; params: any[] }[] = [];
 
   const pg = {
@@ -78,6 +81,7 @@ function makeHarness(opts: { answer: string; costUsd: number | null; usage?: Rec
   const done: any = { type: 'done' };
   if (opts.costUsd !== null) done.costUsd = opts.costUsd;
   if (opts.usage) done.usage = opts.usage;
+  if (opts.turnCostUsd !== undefined) done.turnCostUsd = opts.turnCostUsd;
 
   (axios.post as jest.Mock).mockResolvedValue({
     data: sseStream([{ type: 'delta', text: opts.answer }, done]),
@@ -308,6 +312,89 @@ describe('SDK-биллинг: накопленный costUsd релея не т�
     await h.run();
 
     expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.1425 + 0.03));
+  });
+});
+
+/**
+ * Стоимость ЭТОГО хода по счёту CLI (`turnCostUsd`).
+ *
+ * Верхний usage видит только запросы основной модели. Мимо него проходят
+ * субагенты и внутренние запросы инструментов: WebSearch и WebFetch CLI гоняет
+ * через Haiku и платит за поиск. Ход 13.10.2026 с четырьмя субагентами и 192
+ * поисками: usage — $1.57, счёт CLI за ход — $10.57. Релей вычитает из
+ * total_cost_usd запись cost-state, с которой CLI продолжил сессию, и присылает
+ * разницу. Она — нижняя граница списания, как costUsd до 23.09.2026, когда он
+ * ещё был стоимостью хода, а не сессии.
+ */
+describe('SDK-биллинг: стоимость хода от релея', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  const USAGE = {
+    input: 1000, output: 1000, cacheRead: 100_000,
+    cacheWrite5m: 10_000, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
+  }; // = $0.1425 по весам
+
+  it('больше взвешенного — берётся она: субагенты и веб-инструменты в usage не видны', async () => {
+    const h = makeHarness({ answer: ANSWER, costUsd: 11.0993, usage: USAGE, turnCostUsd: 0.5 });
+    await h.run();
+
+    expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.5));
+  });
+
+  it('ход 13.10: $1.57 по usage основной модели, $10.57 по счёту CLI — списано $10.57', async () => {
+    // 3 149 110 × 0.1 = 314 911 единиц — ровно столько показал лог прода.
+    const h = makeHarness({
+      answer: ANSWER, costUsd: 11.0993,
+      usage: { input: 0, output: 0, cacheRead: 3_149_110, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0 },
+      turnCostUsd: 10.5674,
+    });
+    await h.run();
+
+    expect(chargedTokens(h.pgCalls)).toBe(forUsd(10.5674));
+  });
+
+  it('меньше взвешенного — взвешенное', async () => {
+    const h = makeHarness({ answer: ANSWER, costUsd: 0.05, usage: USAGE, turnCostUsd: 0.05 });
+    await h.run();
+
+    expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.1425));
+  });
+
+  it('null — релей не смог прочитать стоимость: только usage, сумма сессии не берётся', async () => {
+    const h = makeHarness({ answer: ANSWER, costUsd: 6.2087, usage: USAGE, turnCostUsd: null });
+    await h.run();
+
+    expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.1425));
+  });
+
+  it('попадает в метаданные списания — по ней видно, за что взяли больше usage', async () => {
+    const h = makeHarness({ answer: ANSWER, costUsd: 11.0993, usage: USAGE, turnCostUsd: 0.5 });
+    await h.run();
+
+    const row = h.pgCalls.find((c) => /INSERT INTO token_consumption_tasks/.test(c.sql));
+    expect(JSON.parse(row!.params[5])).toMatchObject({ turnCostUsd: 0.5 });
+  });
+
+  it('путь TG-бота и голоса (generateAgentReplyWithCharge) считает так же', async () => {
+    const pg = {
+      query: jest.fn(async (sql: string) =>
+        /FROM agents/.test(sql) ? { rows: [{ id: 7, name: 'Роман', system_prompt: '' }] } : { rows: [] }),
+    };
+    const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
+    const svc = new ChatService(
+      pg as any, null as any, null as any, null as any,
+      null as any, language as any, undefined, undefined, undefined, undefined,
+    );
+    (axios.post as jest.Mock).mockResolvedValue({
+      data: sseStream([
+        { type: 'delta', text: ANSWER },
+        { type: 'done', costUsd: 11.0993, usage: USAGE, turnCostUsd: 0.5 },
+      ]),
+    });
+
+    const reply = await svc.generateAgentReplyWithCharge('u1', '7', 'привет');
+
+    expect(reply.tokens).toBe(forUsd(0.5));
   });
 });
 

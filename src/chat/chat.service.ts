@@ -66,9 +66,21 @@ export interface SdkUsageTotals {
  */
 export interface ChargeFacts {
   costUsd: number;
+  /** Стоимость ЭТОГО хода по счёту CLI; null — релей её не прислал. */
+  turnCostUsd?: number | null;
   source: 'usage' | 'cost' | 'length';
   durationMs: number;
   replyChars: number;
+}
+
+/**
+ * Прибавить стоимость хода из события `done` релея. Не число — релей её не
+ * знает (старая сборка, не прочитался транскрипт): сумма остаётся как была, и
+ * списание опирается только на usage. Ошибиться так можно лишь в пользу клиента.
+ */
+export function addRelayTurnCost(acc: number | null, ev: any): number | null {
+  const v = ev?.turnCostUsd;
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? (acc ?? 0) + v : acc;
 }
 
 /**
@@ -1552,12 +1564,15 @@ ${LanguageService.buildDirective(userLanguage)}`;
       safeWrite({ type: 'item', content: tail });
     };
 
-    // Реальная стоимость хода в USD — приходит от file-agent в событии `done`
-    // (сумма total_cost_usd по всем result-событиям Claude CLI, включая
-    // субагентов и внутренние ретраи). Объявлено здесь, а не внутри
-    // callUpstreamOnce: self-heal может дёрнуть upstream дважды, и оба прогона
-    // реально оплачены — считаем оба.
+    // total_cost_usd Claude CLI из события `done`. С CLI 2.1.280 у
+    // возобновлённой сессии это сумма ВСЕЙ сессии, а не хода, — в списание не
+    // идёт, только в лог и метаданные (см. computeSdkCharge). Объявлено здесь, а
+    // не внутри callUpstreamOnce: self-heal может дёрнуть upstream дважды, и оба
+    // прогона реально оплачены — считаем оба.
     let agentCostUsd = 0;
+    // Стоимость самого хода по счёту CLI (см. computeSdkCharge). Суммируется по
+    // обоим прогонам self-heal; null — релей её не прислал.
+    let agentTurnCostUsd: number | null = null;
     // Сырой usage оттуда же. Суммируется по обоим прогонам self-heal, как и стоимость.
     const agentUsage: SdkUsageTotals = {
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
@@ -1630,7 +1645,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       if (!aiText) return; // skip empty intermediate persists
       // ЭТО реальная точка списания (ниже addTokenTask). Логируем только здесь:
       // путь показа считает то же самое, дублировать в лог незачем.
-      const charge = this.computeSdkCharge(agentUsage, agentCostUsd, fullText);
+      const charge = this.computeSdkCharge(agentUsage, agentCostUsd, fullText, agentTurnCostUsd);
       // Ход без финального ответа пользователю не выставляется — решение владельца.
       // Расход перед Anthropic всё равно понесён, поэтому пишем его в лог явно:
       // иначе «бесплатные» ходы станут невидимой статьёй затрат.
@@ -1664,6 +1679,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           if (!turnFailed) {
             await this.addTokenTask(userId, 0, textCost, agentId, {
               costUsd: Number(agentCostUsd.toFixed(4)),
+              turnCostUsd: agentTurnCostUsd === null ? null : Number(agentTurnCostUsd.toFixed(4)),
               source: charge.source,
               durationMs: Date.now() - streamStartTime,
               replyChars: fullText.length,
@@ -1814,6 +1830,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
                     if (typeof ev.costUsd === 'number' && ev.costUsd > 0) {
                       agentCostUsd += ev.costUsd;
                     }
+                    agentTurnCostUsd = addRelayTurnCost(agentTurnCostUsd, ev);
                     if (ev.usage && typeof ev.usage === 'object') {
                       for (const k of Object.keys(agentUsage) as (keyof SdkUsageTotals)[]) {
                         const v = ev.usage[k];
@@ -2025,7 +2042,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Картинки/видео списываются MCP-сервисами отдельно (см. toolSpent ниже).
       // Число для индикатора «X токенов». Считается тем же методом, что и реальное
       // списание в persistResponse, — иначе юзер увидит одно, а спишется другое.
-      const tokensUsed = this.computeSdkCharge(agentUsage, agentCostUsd, fullText).tokens;
+      const tokensUsed = this.computeSdkCharge(agentUsage, agentCostUsd, fullText, agentTurnCostUsd).tokens;
 
       // Sum up tool-charged tokens (image, video, etc.) during this stream.
       // MCP-tools (MiscService.generateImage, VideoService.createJob,
@@ -2292,6 +2309,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
     };
     let costUsd = 0;
+    let turnCostUsd: number | null = null;
     const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
       headers: fd.getHeaders(),
       responseType: 'stream',
@@ -2312,6 +2330,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
             else if (ev.type === 'done') {
               // Стоимость и расход — здесь же, где их берёт основной путь.
               if (typeof ev.costUsd === 'number' && ev.costUsd > 0) costUsd += ev.costUsd;
+              turnCostUsd = addRelayTurnCost(turnCostUsd, ev);
               if (ev.usage && typeof ev.usage === 'object') {
                 for (const k of Object.keys(usage) as (keyof SdkUsageTotals)[]) {
                   const v = ev.usage[k];
@@ -2326,7 +2345,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       resp.data.on('error', reject);
     });
     const text = this.stripToolTags(chunks.join('')).trim();
-    const charge = this.computeSdkCharge(usage, costUsd, text);
+    const charge = this.computeSdkCharge(usage, costUsd, text, turnCostUsd);
     return { text, tokens: charge.tokens, costUsd };
   }
 
@@ -2374,17 +2393,19 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * Сколько Linkeon-токенов списать за ход SDK-пути.
    *
    * Три источника по убыванию точности:
-   *   1. сырой usage от file-agent → взвешенные токены плюс веб-поиски (основной путь);
-   *   2. total_cost_usd, если usage не пришёл;
+   *   1. сырой usage от file-agent → взвешенные токены плюс веб-поиски, но не
+   *      меньше стоимости хода по счёту CLI, если релей её прислал (основной путь);
+   *   2. стоимость хода или total_cost_usd, если usage не пришёл;
    *   3. длина ответа × множитель — последний рубеж, чтобы ход не стал бесплатным.
    *
-   * При пришедшем usage costUsd в сумму не входит, только в лог — почему,
-   * сказано внутри. `usd` — сколько долларов легло в основу списания.
+   * costUsd (total_cost_usd) при пришедшем usage в сумму не входит, только в
+   * лог — почему, сказано внутри. `usd` — сколько долларов легло в основу списания.
    */
   private computeSdkCharge(
     usage: SdkUsageTotals | null,
     costUsd: number,
     text: string,
+    turnCostUsd: number | null = null,
   ): { tokens: number; usd: number; source: 'usage' | 'cost' | 'length'; note: string } {
     const textLength = text.length;
     if (usage && (usage.input || usage.output || usage.cacheRead || usage.cacheWrite5m || usage.cacheWrite1h)) {
@@ -2396,29 +2417,43 @@ ${LanguageService.buildDirective(userLanguage)}`;
         usage.output * this.W_OUTPUT;
       const impliedUsd = (weighted * this.SDK_INPUT_USD_PER_MTOK) / 1e6;
       const searchUsd = (usage.webSearch || 0) * this.WEB_SEARCH_USD;
+      const usageUsd = impliedUsd + searchUsd;
 
-      // costUsd в сумму НЕ входит. До 14.10.2026 списывали по максимуму из него
-      // и взвешенного: верхний usage не содержит расхода субагентов (проверено
-      // 2026-08-08), а total_cost_usd содержал, и максимум его подбирал.
+      // Верхний usage видит только запросы основной модели. Мимо него проходят
+      // субагенты (проверено 2026-08-08 и снова 13.10.2026) и внутренние запросы
+      // инструментов: WebSearch и WebFetch CLI гоняет через Haiku и платит за
+      // поиск. Ход 13.10.2026 с четырьмя субагентами и 192 поисками: usage —
+      // $1.57, счёт CLI за ход — $10.57. Поэтому нижняя граница списания —
+      // стоимость хода по счёту CLI.
       //
-      // С Claude CLI 2.1.280 (на релее с 23.09.2026) total_cost_usd у сессии,
-      // поднятой через --resume, — стоимость ВСЕЙ сессии: CLI пишет в транскрипт
-      // записи cost-state и при resume продолжает счёт с них. Максимум стал брать
-      // эту сумму за каждый ход, и каждый следующий ответ длинной сессии стоил
-      // дороже предыдущего: ход за $0.16 списан как $6.21 (жалоба 14.10.2026).
-      //
-      // Цена размена: субагентный фан-аут снова оплачивается только верхним
-      // usage. Вернуть его в счёт можно, только если релей начнёт присылать
-      // стоимость этого хода, а не сессии.
-      const billableUsd = impliedUsd + searchUsd;
+      // Брать её можно только из turnCostUsd, а не из costUsd. С Claude CLI
+      // 2.1.280 (на релее с 23.09.2026) total_cost_usd у сессии, поднятой через
+      // --resume, — стоимость ВСЕЙ сессии: CLI пишет в транскрипт записи
+      // cost-state и продолжает счёт с последней. Максимум по costUsd брал эту
+      // сумму за каждый ход: ход за $0.16 списан как $6.21 (жалоба 14.10.2026).
+      // Релей вычитает из total_cost_usd запись cost-state, с которой CLI
+      // продолжил сессию, и присылает разницу как turnCostUsd. Не прислал —
+      // считаем по одному usage: так ошибиться можно только в пользу клиента.
+      const turnUsd = typeof turnCostUsd === 'number' && turnCostUsd > 0 ? turnCostUsd : 0;
+      const billableUsd = Math.max(usageUsd, turnUsd);
       const tokens = Math.max(1, Math.ceil(billableUsd * this.TOKENS_PER_USD));
       const note =
         `weighted=${Math.round(weighted)} implied=$${impliedUsd.toFixed(4)} ` +
         (searchUsd ? `поиски=$${searchUsd.toFixed(4)} ` : '') +
-        `reported=$${costUsd.toFixed(4)} (не тарифицируется)` +
+        (typeof turnCostUsd === 'number' ? `ход=$${turnCostUsd.toFixed(4)} ` : 'ход=? ') +
+        `взято=${turnUsd > usageUsd ? 'ход' : 'usage'} ` +
+        `сессия=$${costUsd.toFixed(4)}` +
         (usage.webSearch ? ` поисков=${usage.webSearch}` : '') +
         (usage.webFetch ? ` fetch=${usage.webFetch}` : '');
       return { tokens, usd: billableUsd, source: 'usage', note };
+    }
+    if (typeof turnCostUsd === 'number' && turnCostUsd > 0) {
+      return {
+        tokens: Math.ceil(turnCostUsd * this.TOKENS_PER_USD),
+        usd: turnCostUsd,
+        source: 'cost',
+        note: `usage не пришёл, считаю по стоимости хода=$${turnCostUsd.toFixed(4)}`,
+      };
     }
     if (costUsd > 0) {
       return {
@@ -2514,8 +2549,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * событии `end` ДО того, как ход сохранён. Формула одна на оба пути — иначе
    * повторяется история, из-за которой всё и затевалось.
    */
-  computeUploadCharge(usage: SdkUsageTotals | null, costUsd: number, text: string) {
-    return this.computeSdkCharge(usage, costUsd, text);
+  computeUploadCharge(usage: SdkUsageTotals | null, costUsd: number, text: string, turnCostUsd: number | null = null) {
+    return this.computeSdkCharge(usage, costUsd, text, turnCostUsd);
   }
 
   /**
@@ -2541,6 +2576,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     assistantMsg: string;
     usage: SdkUsageTotals | null;
     costUsd: number;
+    /** Стоимость хода по счёту CLI из `done`; нет — списание только по usage. */
+    turnCostUsd?: number | null;
     durationMs: number;
     turnFailed?: boolean;
     failReason?: string;
@@ -2562,7 +2599,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       text = '_Не получилось: временный сбой на стороне платформы. Токены за этот ход не списаны — попробуйте отправить сообщение ещё раз._';
     }
 
-    const charge = this.computeSdkCharge(p.usage, p.costUsd, text);
+    const charge = this.computeSdkCharge(p.usage, p.costUsd, text, p.turnCostUsd ?? null);
     // Ход без финального ответа пользователю не выставляется — решение владельца,
     // то же самое, что в основном пути. Релей дописывает в такой ход строку
     // «Токены за прерванный ход не списаны», и она должна оставаться правдой.
@@ -2580,6 +2617,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     if (!turnFailed) {
       await this.addTokenTask(p.userId, 0, textCost, p.assistantId, {
         costUsd: Number(p.costUsd.toFixed(4)),
+        turnCostUsd: typeof p.turnCostUsd === 'number' ? Number(p.turnCostUsd.toFixed(4)) : null,
         source: charge.source,
         durationMs: p.durationMs,
         replyChars: text.length,
