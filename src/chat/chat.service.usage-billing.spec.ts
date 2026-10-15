@@ -40,6 +40,8 @@ function sseStream(events: any[]): Readable {
 interface Harness {
   pgCalls: { sql: string; params: any[] }[];
   run: () => Promise<void>;
+  /** Наружу — чтобы подсмотреть строку `billing[...]` в логе: по ней разбирают списания на проде. */
+  svc: ChatService;
 }
 
 /**
@@ -103,7 +105,7 @@ function makeHarness(opts: {
     await new Promise((r) => setImmediate(r));
   };
 
-  return { pgCalls, run };
+  return { pgCalls, run, svc };
 }
 
 /**
@@ -327,7 +329,7 @@ describe('SDK-биллинг: накопленный costUsd релея не т�
  *
  * До 15.10.2026 она была нижней границей списания: max(формула, счёт CLI). С
  * 15.10 списывается она сама, формула — запасной путь, когда её нет, и
- * страховка снизу (половина формулы) от ошибки релея в вычитании. Подробно —
+ * страховка снизу (0.15 формулы) от ошибки релея в вычитании. Подробно —
  * chat.service.turn-cost-billing.spec.ts.
  */
 describe('SDK-биллинг: стоимость хода от релея', () => {
@@ -359,16 +361,24 @@ describe('SDK-биллинг: стоимость хода от релея', () =
 
   // До 15.10.2026 здесь было «меньше взвешенного — взвешенное» (max). Веб-чат
   // на claude-opus-5-5, которую CLI считает дешевле формулы по $5/MTok, и max()
-  // выставлял формулу почти всегда. Теперь берётся счёт CLI, но не меньше
-  // половины формулы.
-  it('меньше взвешенного — берётся она, но не меньше половины взвешенного', async () => {
-    const above = makeHarness({ answer: ANSWER, costUsd: 0.1, usage: USAGE, turnCostUsd: 0.1 });
-    await above.run();
-    expect(chargedTokens(above.pgCalls)).toBe(forUsd(0.1));
+  // выставлял формулу всегда: в логе прода с 14.10 нет ни одного хода дороже
+  // формулы. Теперь берётся счёт CLI, но не меньше 0.15 формулы.
+  it('меньше взвешенного — берётся она', async () => {
+    const h = makeHarness({ answer: ANSWER, costUsd: 0.05, usage: USAGE, turnCostUsd: 0.05 });
+    const log = jest.spyOn((h.svc as any).logger, 'log');
+    await h.run();
 
-    const below = makeHarness({ answer: ANSWER, costUsd: 0.05, usage: USAGE, turnCostUsd: 0.05 });
-    await below.run();
-    expect(chargedTokens(below.pgCalls)).toBe(forUsd(0.1425 / 2));
+    expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.05));
+    expect(log.mock.calls.map((c) => String(c[0])).find((l) => l.startsWith('billing['))).toContain('взято=ход');
+  });
+
+  it('ниже 0.15 взвешенного — 0.15 взвешенного: релей ошибся в вычитании, а не модель подешевела', async () => {
+    const h = makeHarness({ answer: ANSWER, costUsd: 0.01, usage: USAGE, turnCostUsd: 0.01 });
+    const log = jest.spyOn((h.svc as any).logger, 'log');
+    await h.run();
+
+    expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.15 * 0.1425));
+    expect(log.mock.calls.map((c) => String(c[0])).find((l) => l.startsWith('billing['))).toContain('взято=пол');
   });
 
   it('null — релей не смог прочитать стоимость: только usage, сумма сессии не берётся', async () => {

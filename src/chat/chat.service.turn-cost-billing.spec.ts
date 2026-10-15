@@ -16,6 +16,12 @@ jest.mock('../common/telegram-alert', () => ({ sendTelegramAlert: jest.fn(async 
  * формулу и выставлял на 10–65% больше счёта CLI. Первый алерт роста стоимости
  * 15.10: формула $2.70, CLI $1.66.
  *
+ * Страховка снизу — 0.15 формулы. Прогон по логу списаний прода (382 хода с
+ * 14.10): счёт CLI к формуле у opus-5-5 — 0.49–0.80 (медиана 0.63), у проб
+ * мониторинга на Haiku — ровно 0.20, дороже формулы — ни одного хода. 0.5
+ * резала честный счёт Haiku и части opus-5-5; 0.15 ниже цены любой модели,
+ * но ловит релей, приславший почти ноль.
+ *
  * Ожидания выводятся из курса и из правила формулы, а не зашиты числами: курс —
  * бизнес-решение и меняется через env.
  */
@@ -52,6 +58,8 @@ const SESSION_USD = 9.8731;
 
 const ANSWER = 'x'.repeat(100);
 const ENV = 'SDK_TURN_COST_FLOOR';
+/** Страховка по умолчанию — решение владельца 15.10.2026 после прогона по логу прода. */
+const DEFAULT_FLOOR = 0.15;
 
 function makeService(o: { costGrowth?: { recordTurn: jest.Mock } } = {}) {
   const calls: { sql: string; params: any[] }[] = [];
@@ -110,7 +118,7 @@ afterEach(() => {
 });
 
 describe('ход веб-чата: списан счёт CLI, формула — запасной путь и страховка', () => {
-  it('CLI дешевле формулы, но выше половины — списан счёт CLI (ход 15.10: $2.70 против $1.66)', () => {
+  it('CLI дешевле формулы — списан счёт CLI (ход 15.10: $2.70 против $1.66)', () => {
     // Проверка самой подстановки: фикстура и правда даёт формулу из алерта.
     expect(formulaUsd(USAGE_1510)).toBeCloseTo(2.7, 6);
     const { svc } = makeService();
@@ -127,16 +135,40 @@ describe('ход веб-чата: списан счёт CLI, формула — 
     expect(c.tokens).not.toBe(forUsd(formulaUsd(USAGE_1510)));
   });
 
-  it('CLI ниже половины формулы — списана половина формулы, в раскладе видно «пол»', () => {
+  it('CLI ниже страховки (0.15 формулы) — списана страховка, в раскладе видно «пол»', () => {
+    // $0.01 при формуле $0.1425 — 0.07 от неё: так выглядит релей, ошибшийся
+    // в вычитании cost-state, а не цена какой-либо модели.
     const { svc } = makeService();
 
-    const c = charge(svc, USAGE, 0.05);
+    const c = charge(svc, USAGE, 0.01);
 
-    expect(c.tokens).toBe(forUsd(0.5 * formulaUsd(USAGE)));
-    expect(c.usd).toBeCloseTo(0.5 * formulaUsd(USAGE), 10);
+    expect(c.tokens).toBe(forUsd(DEFAULT_FLOOR * formulaUsd(USAGE)));
+    expect(c.usd).toBeCloseTo(DEFAULT_FLOOR * formulaUsd(USAGE), 10);
     expect(c.note).toContain('взято=пол');
     // Счёт CLI в раскладе остаётся — по нему и видно, насколько сработала страховка.
-    expect(c.note).toContain('ход=$0.0500');
+    expect(c.note).toContain('ход=$0.0100');
+  });
+
+  it('Haiku-ход: CLI = 0.20 формулы — взят CLI, не пол', () => {
+    // Пробы мониторинга на Haiku в логе прода — ровно 0.20 формулы, все 252 хода.
+    const { svc } = makeService();
+    const haiku = 0.2 * formulaUsd(USAGE);
+
+    const c = charge(svc, USAGE, haiku);
+
+    expect(c.tokens).toBe(forUsd(haiku));
+    expect(c.note).toContain('взято=ход');
+  });
+
+  it('opus-5-5 на нижнем краю (0.49 формулы) — взят CLI, не пол', () => {
+    // Два таких хода в логе прода: при страховке 0.5 их резала бы она.
+    const { svc } = makeService();
+    const low = 0.49 * formulaUsd(USAGE_1510);
+
+    const c = charge(svc, USAGE_1510, low);
+
+    expect(c.tokens).toBe(forUsd(low));
+    expect(c.note).toContain('взято=ход');
   });
 
   it('CLI дороже формулы (субагенты, поиски) — списан счёт CLI (ход 13.10: $1.57 против $10.57)', () => {
@@ -165,14 +197,14 @@ describe('ход веб-чата: списан счёт CLI, формула — 
   });
 
   it('поиски входят в формулу — страховка считается от формулы вместе с ними', () => {
-    // 30 поисков = $0.30 сверху к $0.1425. Счёт CLI $0.10 выше половины
-    // одних токенов ($0.071), но ниже половины формулы с поисками ($0.221).
+    // 30 поисков = $0.30 сверху к $0.1425. Счёт CLI $0.03 выше 0.15 одних
+    // токенов ($0.021), но ниже 0.15 формулы с поисками ($0.066).
     const { svc } = makeService();
     const usage = { ...USAGE, webSearch: 30 };
 
-    const c = charge(svc, usage, 0.1);
+    const c = charge(svc, usage, 0.03);
 
-    expect(c.tokens).toBe(forUsd(0.5 * formulaUsd(usage)));
+    expect(c.tokens).toBe(forUsd(DEFAULT_FLOOR * formulaUsd(usage)));
     expect(c.note).toContain('взято=пол');
     expect(c.note).toContain('поиски=$0.3000');
     expect(c.note).toContain('поисков=30');
@@ -189,22 +221,24 @@ describe('ход веб-чата: списан счёт CLI, формула — 
 });
 
 describe('страховка из SDK_TURN_COST_FLOOR', () => {
-  it('0.3: ход, упиравшийся в половину, теперь выше страховки — списан счёт CLI', () => {
+  it('0.3: ход выше этой страховки — списан счёт CLI', () => {
     process.env[ENV] = '0.3';
     const { svc } = makeService();
 
-    // $0.05 ниже половины формулы ($0.071), но выше 0.3 от неё ($0.043).
+    // $0.05 — 0.35 формулы ($0.1425), выше 0.3 от неё ($0.043).
     const c = charge(svc, USAGE, 0.05);
 
     expect(c.tokens).toBe(forUsd(0.05));
     expect(c.note).toContain('взято=ход');
   });
 
-  it('0.3: ход ниже и этой страховки — списано 0.3 формулы', () => {
+  it('0.3: ход выше страховки по умолчанию, но ниже 0.3 — списано 0.3 формулы', () => {
+    // $0.03 — 0.21 формулы: при 0.15 списали бы его, при 0.3 — страховку.
+    // Так видно, что значение из окружения действительно читается.
     process.env[ENV] = '0.3';
     const { svc } = makeService();
 
-    const c = charge(svc, USAGE, 0.01);
+    const c = charge(svc, USAGE, 0.03);
 
     expect(c.tokens).toBe(forUsd(0.3 * formulaUsd(USAGE)));
     expect(c.note).toContain('взято=пол');
@@ -220,13 +254,13 @@ describe('страховка из SDK_TURN_COST_FLOOR', () => {
     expect(c.note).toContain('взято=пол');
   });
 
-  it.each(['abc', '0', '-1', '1.5', '', 'Infinity'])('бессмысленное значение «%s» — 0.5', (raw) => {
+  it.each(['abc', '0', '-1', '1.5', '', 'Infinity'])('бессмысленное значение «%s» — 0.15', (raw) => {
     process.env[ENV] = raw;
     const { svc } = makeService();
 
-    const c = charge(svc, USAGE, 0.05);
+    const c = charge(svc, USAGE, 0.01);
 
-    expect(c.tokens).toBe(forUsd(0.5 * formulaUsd(USAGE)));
+    expect(c.tokens).toBe(forUsd(DEFAULT_FLOOR * formulaUsd(USAGE)));
     expect(c.note).toContain('взято=пол');
   });
 });
