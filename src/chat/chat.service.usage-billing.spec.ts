@@ -323,8 +323,12 @@ describe('SDK-биллинг: накопленный costUsd релея не т�
  * через Haiku и платит за поиск. Ход 13.10.2026 с четырьмя субагентами и 192
  * поисками: usage — $1.57, счёт CLI за ход — $10.57. Релей вычитает из
  * total_cost_usd запись cost-state, с которой CLI продолжил сессию, и присылает
- * разницу. Она — нижняя граница списания, как costUsd до 23.09.2026, когда он
- * ещё был стоимостью хода, а не сессии.
+ * разницу.
+ *
+ * До 15.10.2026 она была нижней границей списания: max(формула, счёт CLI). С
+ * 15.10 списывается она сама, формула — запасной путь, когда её нет, и
+ * страховка снизу (половина формулы) от ошибки релея в вычитании. Подробно —
+ * chat.service.turn-cost-billing.spec.ts.
  */
 describe('SDK-биллинг: стоимость хода от релея', () => {
   afterEach(() => jest.clearAllMocks());
@@ -353,11 +357,18 @@ describe('SDK-биллинг: стоимость хода от релея', () =
     expect(chargedTokens(h.pgCalls)).toBe(forUsd(10.5674));
   });
 
-  it('меньше взвешенного — взвешенное', async () => {
-    const h = makeHarness({ answer: ANSWER, costUsd: 0.05, usage: USAGE, turnCostUsd: 0.05 });
-    await h.run();
+  // До 15.10.2026 здесь было «меньше взвешенного — взвешенное» (max). Веб-чат
+  // на claude-opus-5-5, которую CLI считает дешевле формулы по $5/MTok, и max()
+  // выставлял формулу почти всегда. Теперь берётся счёт CLI, но не меньше
+  // половины формулы.
+  it('меньше взвешенного — берётся она, но не меньше половины взвешенного', async () => {
+    const above = makeHarness({ answer: ANSWER, costUsd: 0.1, usage: USAGE, turnCostUsd: 0.1 });
+    await above.run();
+    expect(chargedTokens(above.pgCalls)).toBe(forUsd(0.1));
 
-    expect(chargedTokens(h.pgCalls)).toBe(forUsd(0.1425));
+    const below = makeHarness({ answer: ANSWER, costUsd: 0.05, usage: USAGE, turnCostUsd: 0.05 });
+    await below.run();
+    expect(chargedTokens(below.pgCalls)).toBe(forUsd(0.1425 / 2));
   });
 
   it('null — релей не смог прочитать стоимость: только usage, сумма сессии не берётся', async () => {
