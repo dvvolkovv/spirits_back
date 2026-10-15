@@ -1204,6 +1204,21 @@ ${LanguageService.buildDirective(userLanguage)}`;
             durationMs: Date.now() - turnStartedAt,
             replyChars: fullText.length,
           });
+          // «Дорогой ход» и сторож роста стоимости — как в остальных путях
+          // веб-чата (спека 2026-10-14-cost-growth-alert, дополнение 15.10).
+          // Ход без --resume: накопления стоимости сессии здесь нет, смысл —
+          // дорогие ходы и честно дорожающие длинные разговоры. Сбой CLI даёт
+          // ход с нулём — сторож отбрасывает его сам.
+          const masha = { tokens: tokensUsed, usd: costUsd, note: `cost=$${costUsd.toFixed(4)} (локальный CLI)` };
+          // Алерт сбоку от хода: весь хвост ниже — в одном try/catch, и его
+          // исключение молча пропустило бы сторож, профиль, задачи и бизнес-карточку.
+          await this.alertExpensiveTurn(userId, String(assistantId), masha, tokensUsed)
+            .catch((e: any) => this.logger.warn(`Маша: алерт «Дорогой ход» упал: ${e?.message}`));
+          void this.costGrowth?.recordTurn(
+            { kind: 'chat', userId, assistantId: String(assistantId), assistantName: agent.name },
+            masha,
+            { balance: () => this.getTokenBalance(userId) },
+          );
           // Extract profile entities from conversation — работает и в fresh-режиме:
           // «чистый лист» не тянет прошлый контекст, но профиль формирует.
           if (this.neo4j) {
