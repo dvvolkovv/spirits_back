@@ -2,6 +2,7 @@ import { Readable } from 'stream';
 import axios from 'axios';
 import { ChatService, SdkUsageTotals } from './chat.service';
 import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
+import { sendTelegramAlert } from '../common/telegram-alert';
 
 jest.mock('axios');
 jest.mock('../common/telegram-alert', () => ({ sendTelegramAlert: jest.fn(async () => {}) }));
@@ -61,11 +62,13 @@ const ENV = 'SDK_TURN_COST_FLOOR';
 /** Страховка по умолчанию — решение владельца 15.10.2026 после прогона по логу прода. */
 const DEFAULT_FLOOR = 0.15;
 
-function makeService(o: { costGrowth?: { recordTurn: jest.Mock } } = {}) {
+function makeService(o: { costGrowth?: { recordTurn: jest.Mock }; agentRow?: boolean } = {}) {
   const calls: { sql: string; params: any[] }[] = [];
   const pg = {
     query: jest.fn(async (sql: string, params: any[] = []) => {
       calls.push({ sql, params });
+      // Голосовой путь (generateAgentReplyWithCharge) сначала ищет ассистента.
+      if (o.agentRow && /FROM agents/.test(sql)) return { rows: [{ id: 7, name: 'Роман', system_prompt: '' }] };
       if (/FROM speech_clips|FROM video_jobs|FROM calendar_proposals/.test(sql)) return { rows: [] };
       if (/AS spent/.test(sql)) return { rows: [{ spent: 0 }] };
       if (/SELECT tokens FROM ai_profiles_consolidated/.test(sql)) return { rows: [{ tokens: 1_000_000 }] };
@@ -97,6 +100,12 @@ function chargedTokens(calls: { sql: string; params: any[] }[]): number | undefi
   return Number(inputTokens) + Number(outputTokens);
 }
 
+/** Метаданные строки списания — то, что доедет до token_transactions. */
+function taskMeta(calls: { sql: string; params: any[] }[]): any {
+  const row = calls.find((c) => /INSERT INTO token_consumption_tasks/.test(c.sql));
+  return row?.params[5] ? JSON.parse(row.params[5]) : undefined;
+}
+
 function sseStream(events: any[]): Readable {
   const s = new Readable({ read() {} });
   process.nextTick(() => {
@@ -105,6 +114,31 @@ function sseStream(events: any[]): Readable {
   });
   return s;
 }
+
+/**
+ * Обычный ход чата целиком. Каждый массив событий — один вызов релея: пустой
+ * поток сервис повторяет один раз (self-heal), и второму вызову нужен свой.
+ */
+async function runStream(svc: ChatService, ...runs: any[][]): Promise<any[]> {
+  for (const events of runs) (axios.post as jest.Mock).mockResolvedValueOnce({ data: sseStream(events) });
+  const written: any[] = [];
+  const res: any = {
+    status: jest.fn(), setHeader: jest.fn(), end: jest.fn(),
+    write: jest.fn((s: string) => { try { written.push(JSON.parse(s)); } catch {} return true; }),
+  };
+  await (svc as any).streamUniversalAgent(
+    'u1', 'привет', '7', '7', [], '', res, 'Роман', '', '', undefined, false, undefined,
+  );
+  for (let i = 0; i < 30; i++) await new Promise((r) => setImmediate(r));
+  return written;
+}
+
+/** Алерты «Страховка списания» среди всего, что ушло в Telegram. */
+const floorAlerts = () =>
+  (sendTelegramAlert as jest.Mock).mock.calls.map((c) => String(c[0])).filter((t) => t.includes('Страховка списания'));
+
+const sum = (a: SdkUsageTotals, b: SdkUsageTotals): SdkUsageTotals =>
+  Object.fromEntries(Object.keys(a).map((k) => [k, (a as any)[k] + (b as any)[k]])) as SdkUsageTotals;
 
 let savedEnv: string | undefined;
 beforeEach(() => {
@@ -298,6 +332,8 @@ describe('ход 15.10 сквозь точки списания', () => {
     expect(turn.tokens).toBe(forUsd(TURN_1510));
     expect(turn.usd).toBeCloseTo(TURN_1510, 10);
     expect(turn.note).toContain('взято=ход');
+    // Что легло в основу — и в метаданных списания: по ним считают без pm2-логов.
+    expect(taskMeta(calls)).toMatchObject({ source: 'usage', taken: 'turn', turnCostUsd: TURN_1510 });
   });
 
   it('ход с файлами: списание и сторож — по счёту CLI', async () => {
@@ -313,5 +349,184 @@ describe('ход 15.10 сквозь точки списания', () => {
     expect(chargedTokens(calls)).toBe(forUsd(TURN_1510));
     const [, turn] = costGrowth.recordTurn.mock.calls[0] as any[];
     expect(turn.note).toContain('взято=ход');
+    expect(taskMeta(calls)).toMatchObject({ source: 'usage', taken: 'turn' });
+  });
+
+  it('голосовой путь (generateAgentReplyWithCharge): по счёту CLI, строка billing[voice:…] в логе', async () => {
+    // Голосовые консультации списывают то, что вернул этот метод. Раньше
+    // расклад здесь нигде не печатался — сработавшую страховку не было видно.
+    const { svc } = makeService({ agentRow: true });
+    const log = jest.spyOn((svc as any).logger, 'log');
+    (axios.post as jest.Mock).mockResolvedValueOnce({
+      data: sseStream([
+        { type: 'delta', text: ANSWER },
+        { type: 'done', costUsd: SESSION_USD, usage: USAGE_1510, turnCostUsd: TURN_1510 },
+      ]),
+    });
+
+    const reply = await svc.generateAgentReplyWithCharge('u1', '7', 'привет');
+
+    expect(reply.tokens).toBe(forUsd(TURN_1510));
+    const line = log.mock.calls.map((c) => String(c[0])).find((l) => l.startsWith('billing[voice:'));
+    expect(line).toContain(`billing[voice:usage]: tokens=${forUsd(TURN_1510)} `);
+    expect(line).toContain('взято=ход');
+  });
+
+  it('generateAgentReply без списания (пробы, поездки, пуши) строку billing[…] не печатает', async () => {
+    // Его вызывающие токены не списывают: «billing» в логе соврал бы.
+    const { svc } = makeService({ agentRow: true });
+    const log = jest.spyOn((svc as any).logger, 'log');
+    (axios.post as jest.Mock).mockResolvedValueOnce({
+      data: sseStream([
+        { type: 'delta', text: ANSWER },
+        { type: 'done', costUsd: SESSION_USD, usage: USAGE_1510, turnCostUsd: TURN_1510 },
+      ]),
+    });
+
+    await svc.generateAgentReply('u1', '7', 'привет');
+
+    expect(log.mock.calls.map((c) => String(c[0])).some((l) => l.startsWith('billing['))).toBe(false);
+  });
+});
+
+/**
+ * Self-heal: пустой поток релей повторяет, и оба прогона оплачены — usage и
+ * стоимость хода складываются. Если хоть один прогон пришёл без стоимости,
+ * сумма стоимостей покрывает не весь ход, а usage — весь. Сравнивать их нельзя:
+ * стоимость хода неизвестна, списание — по формуле.
+ */
+describe('стоимость хода по двум прогонам релея', () => {
+  const empty = (done: Record<string, unknown>) => [{ type: 'done', costUsd: SESSION_USD, usage: USAGE, ...done }];
+  const full = (done: Record<string, unknown>) => [
+    { type: 'delta', text: ANSWER },
+    { type: 'done', costUsd: SESSION_USD, usage: USAGE, ...done },
+  ];
+
+  it('первый прогон без стоимости, второй с ней — неизвестна: формула по сумме usage', async () => {
+    const costGrowth = { recordTurn: jest.fn(async () => {}) };
+    const { svc, calls } = makeService({ costGrowth });
+
+    // $0.05 по счёту второго прогона выше 0.15 формулы обоих ($0.043) — без
+    // «липкого» неизвестно списали бы её, недосчитав первый прогон.
+    await runStream(svc, empty({}), full({ turnCostUsd: 0.05 }));
+
+    expect(chargedTokens(calls)).toBe(forUsd(formulaUsd(sum(USAGE, USAGE))));
+    expect(taskMeta(calls)).toMatchObject({ taken: 'usage', turnCostUsd: null });
+    const [, turn] = costGrowth.recordTurn.mock.calls[0] as any[];
+    expect(turn.note).toContain('взято=usage');
+  });
+
+  it('первый прогон со стоимостью, второй без — тоже неизвестна', async () => {
+    const { svc, calls } = makeService();
+
+    await runStream(svc, empty({ turnCostUsd: 0.05 }), full({ turnCostUsd: null }));
+
+    expect(chargedTokens(calls)).toBe(forUsd(formulaUsd(sum(USAGE, USAGE))));
+    expect(taskMeta(calls)).toMatchObject({ taken: 'usage', turnCostUsd: null });
+  });
+
+  it('оба прогона со стоимостью — сумма', async () => {
+    const { svc, calls } = makeService();
+
+    await runStream(svc, empty({ turnCostUsd: 0.02 }), full({ turnCostUsd: 0.03 }));
+
+    expect(chargedTokens(calls)).toBe(forUsd(0.02 + 0.03));
+    expect(taskMeta(calls)).toMatchObject({ taken: 'turn', turnCostUsd: 0.05 });
+  });
+});
+
+/**
+ * Сработавшая страховка — признак поломки релея (честный счёт CLI так низко не
+ * бывает), а не повод тихо списать. Алерт — раз в 6 часов на процесс: одна
+ * поломка бьёт по каждому ходу, сотня одинаковых сообщений ничего не добавит.
+ */
+describe('алерт «Страховка списания»', () => {
+  const upload = (svc: ChatService, turnCostUsd: number, extra: Record<string, unknown> = {}) =>
+    svc.persistUploadTurn({
+      userId: 'u1', assistantId: '12', userMsg: '📎 scan.jpg', assistantMsg: 'Перевод готов.',
+      usage: USAGE, costUsd: SESSION_USD, turnCostUsd, durationMs: 1000, ...extra,
+    });
+
+  it('ход по страховке — один алерт: сколько прислал релей, формула, юзер, ассистент, расклад', async () => {
+    const { svc, calls } = makeService();
+
+    await upload(svc, 0.01);
+
+    expect(taskMeta(calls)).toMatchObject({ taken: 'floor' });
+    const alerts = floorAlerts();
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toContain('$0.0100');
+    expect(alerts[0]).toContain('$0.1425');
+    expect(alerts[0]).toContain('страховка 0.15');
+    expect(alerts[0]).toContain('<code>u1</code>');
+    expect(alerts[0]).toContain('ассистент 12');
+    expect(alerts[0]).toContain('взято=пол');
+  });
+
+  it('два хода по страховке за 6 часов — один алерт', async () => {
+    const { svc } = makeService();
+
+    await upload(svc, 0.01);
+    await upload(svc, 0.01);
+
+    expect(floorAlerts()).toHaveLength(1);
+  });
+
+  it('через 6 часов — снова', async () => {
+    const { svc } = makeService();
+    const now = jest.spyOn(Date, 'now');
+    try {
+      now.mockReturnValue(1_000_000_000_000);
+      await upload(svc, 0.01);
+      now.mockReturnValue(1_000_000_000_000 + 6 * 60 * 60 * 1000 + 1);
+      await upload(svc, 0.01);
+    } finally {
+      now.mockRestore();
+    }
+
+    expect(floorAlerts()).toHaveLength(2);
+  });
+
+  it('ход по счёту CLI — алерта нет', async () => {
+    const { svc } = makeService();
+
+    await upload(svc, 0.05);
+
+    expect(floorAlerts()).toHaveLength(0);
+  });
+
+  it('прерванный ход не выставлен — и алерта о его списании нет', async () => {
+    const { svc } = makeService();
+
+    await upload(svc, 0.01, { turnFailed: true, failReason: 'interrupted' });
+
+    expect(floorAlerts()).toHaveLength(0);
+  });
+
+  it('обычный ход чата по страховке — алерт и taken=floor в метаданных', async () => {
+    const { svc, calls } = makeService();
+
+    await runStream(svc, [
+      { type: 'delta', text: ANSWER },
+      { type: 'done', costUsd: SESSION_USD, usage: USAGE, turnCostUsd: 0.01 },
+    ]);
+
+    expect(chargedTokens(calls)).toBe(forUsd(DEFAULT_FLOOR * formulaUsd(USAGE)));
+    expect(taskMeta(calls)).toMatchObject({ taken: 'floor' });
+    expect(floorAlerts()).toHaveLength(1);
+  });
+
+  it('голосовой путь по страховке — алерт', async () => {
+    const { svc } = makeService({ agentRow: true });
+    (axios.post as jest.Mock).mockResolvedValueOnce({
+      data: sseStream([
+        { type: 'delta', text: ANSWER },
+        { type: 'done', costUsd: SESSION_USD, usage: USAGE, turnCostUsd: 0.01 },
+      ]),
+    });
+
+    await svc.generateAgentReplyWithCharge('u1', '7', 'привет');
+
+    expect(floorAlerts()).toHaveLength(1);
   });
 });

@@ -237,6 +237,17 @@ describe('uploadAndChat: usage из события done доезжает до с
     expect(end.usage.total).toBe(chargedTokens(pg.calls));
   });
 
+  it('стоимость хода ниже формулы — индикатор и списание по счёту CLI, а не по формуле', async () => {
+    // До 15.10.2026 здесь брался max(формула, счёт CLI), и индикатор показывал
+    // $0.50 формулы. Теперь — счёт CLI ($0.30), он выше страховки (0.15 формулы).
+    const pg = makePg();
+    const res = await run(pg, { type: 'done', costUsd: 7.5, usage: USAGE_HALF_DOLLAR, turnCostUsd: 0.3 });
+
+    const end = res.written.find((w: any) => w.type === 'end');
+    expect(end.usage.total).toBe(forUsd(0.3));
+    expect(chargedTokens(pg.calls)).toBe(forUsd(0.3));
+  });
+
   it('стоимость хода из done доезжает и до списания, и до показа', async () => {
     // costUsd здесь — сумма всей сессии (CLI 2.1.280), его брать нельзя.
     const pg = makePg();
