@@ -70,19 +70,66 @@ export interface ChargeFacts {
   /** Стоимость ЭТОГО хода по счёту CLI; null — релей её не прислал. */
   turnCostUsd?: number | null;
   source: 'usage' | 'cost' | 'length';
+  /**
+   * При source=usage — что легло в основу: счёт CLI, страховка или формула.
+   * `floor` в истории списаний — ход, где релей прислал подозрительно мало.
+   */
+  taken?: ChargeTaken;
   durationMs: number;
   replyChars: number;
 }
 
-/**
- * Прибавить стоимость хода из события `done` релея. Не число — релей её не
- * знает (старая сборка, не прочитался транскрипт): сумма остаётся как была, и
- * списание опирается только на формулу из usage (см. computeSdkCharge).
- */
-export function addRelayTurnCost(acc: number | null, ev: any): number | null {
-  const v = ev?.turnCostUsd;
-  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? (acc ?? 0) + v : acc;
+/** turn — счёт CLI за ход, floor — страховка (доля формулы), usage — формула целиком. */
+export type ChargeTaken = 'turn' | 'floor' | 'usage';
+
+/** Расчёт списания за ход SDK-пути (см. ChatService.computeSdkCharge). */
+export interface SdkCharge {
+  tokens: number;
+  /** Сколько долларов легло в основу списания. */
+  usd: number;
+  source: 'usage' | 'cost' | 'length';
+  /** Расклад для лога и алертов: weighted=… implied=$… ход=$… взято=… */
+  note: string;
+  /** Только при source=usage. */
+  taken?: ChargeTaken;
+  /** Только при source=usage: формула (взвешенное + поиски) и счёт CLI за ход, $. */
+  formulaUsd?: number;
+  turnUsd?: number | null;
 }
+
+/**
+ * Стоимость хода по счёту CLI из событий `done` релея. Self-heal может дёрнуть
+ * релей за ход дважды, оба прогона оплачены — стоимости складываются, как и usage.
+ *
+ * Хоть один `done` пришёл без числа (релей старой сборки, не прочитался
+ * транскрипт) — стоимость неизвестна для всего хода, и это необратимо. Usage
+ * сложен по обоим прогонам, а сумма стоимостей покрывала бы только один:
+ * сравнивать её со страховкой от полной формулы нельзя, ход недосчитался бы.
+ * Списание тогда идёт по формуле из usage (см. computeSdkCharge).
+ */
+export class RelayTurnCost {
+  private sum = 0;
+  private seen = false;
+  private unknown = false;
+
+  add(ev: any): void {
+    const v = ev?.turnCostUsd;
+    if (typeof v === 'number' && Number.isFinite(v) && v >= 0) {
+      this.sum += v;
+      this.seen = true;
+    } else {
+      this.unknown = true;
+    }
+  }
+
+  /** Сумма по всем `done` хода; null — хоть один пришёл без неё или не пришло ни одного. */
+  get usd(): number | null {
+    return this.seen && !this.unknown ? this.sum : null;
+  }
+}
+
+/** Как `taken` пишется в раскладе хода: по `взято=ход|пол|usage` разбирают pm2-логи. */
+const TAKEN_NOTE: Record<ChargeTaken, string> = { turn: 'ход', floor: 'пол', usage: 'usage' };
 
 /** Страховка по умолчанию — почему 0.15, сказано в computeSdkCharge. */
 const DEFAULT_TURN_COST_FLOOR = 0.15;
@@ -261,6 +308,12 @@ export class ChatService {
   // поедет, зато он про то же число, которое видит юзер в своём балансе.
   // Прежний env SDK_ALERT_USD больше не читается.
   private readonly EXPENSIVE_TURN_ALERT_TOKENS = Number(process.env.SDK_ALERT_TOKENS || 30_000);
+
+  // Алерт «Страховка списания» — не чаще раза в 6 часов на процесс (см.
+  // alertTurnCostFloor). В памяти: ChatService — одиночка в едином PM2-процессе,
+  // после рестарта первый же такой ход алертит снова — это и нужно.
+  private readonly FLOOR_ALERT_EVERY_MS = 6 * 60 * 60 * 1000;
+  private lastFloorAlertAt = 0;
 
   // Идемпотентность отправки: гасит дубли от повторных запросов (обрыв связи,
   // таймаут стрима, двойной тап) — второй идентичный запрос НЕ запускает агента
@@ -1611,8 +1664,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // прогона реально оплачены — считаем оба.
     let agentCostUsd = 0;
     // Стоимость самого хода по счёту CLI (см. computeSdkCharge). Суммируется по
-    // обоим прогонам self-heal; null — релей её не прислал.
-    let agentTurnCostUsd: number | null = null;
+    // обоим прогонам self-heal; хоть один без неё — неизвестна (RelayTurnCost).
+    const agentTurnCost = new RelayTurnCost();
     // Сырой usage оттуда же. Суммируется по обоим прогонам self-heal, как и стоимость.
     const agentUsage: SdkUsageTotals = {
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
@@ -1685,7 +1738,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       if (!aiText) return; // skip empty intermediate persists
       // ЭТО реальная точка списания (ниже addTokenTask). Логируем только здесь:
       // путь показа считает то же самое, дублировать в лог незачем.
-      const charge = this.computeSdkCharge(agentUsage, agentCostUsd, fullText, agentTurnCostUsd);
+      const charge = this.computeSdkCharge(agentUsage, agentCostUsd, fullText, agentTurnCost.usd);
       // Ход без финального ответа пользователю не выставляется — решение владельца.
       // Расход перед Anthropic всё равно понесён, поэтому пишем его в лог явно:
       // иначе «бесплатные» ходы станут невидимой статьёй затрат.
@@ -1717,13 +1770,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // профиля и разбор задач идут в любом случае: оборванный ход всё равно
           // был настоящим разговором, и терять из него контекст незачем.
           if (!turnFailed) {
+            const turnCostUsd = agentTurnCost.usd;
             await this.addTokenTask(userId, 0, textCost, agentId, {
               costUsd: Number(agentCostUsd.toFixed(4)),
-              turnCostUsd: agentTurnCostUsd === null ? null : Number(agentTurnCostUsd.toFixed(4)),
+              turnCostUsd: turnCostUsd === null ? null : Number(turnCostUsd.toFixed(4)),
               source: charge.source,
+              taken: charge.taken,
               durationMs: Date.now() - streamStartTime,
               replyChars: fullText.length,
             });
+            // Страховка сработала на ЗАПИСАННОМ списании — релей, похоже, ошибся.
+            this.alertTurnCostFloor(userId, assistantId, charge, textCost);
             // Сторож роста стоимости: ход за ходом дороже — алерт. Только здесь,
             // за записанным списанием: пустой ответ, оборванный ход и сбой
             // записи истории до списания не доходят — значит, и до сторожа.
@@ -1879,7 +1936,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
                     if (typeof ev.costUsd === 'number' && ev.costUsd > 0) {
                       agentCostUsd += ev.costUsd;
                     }
-                    agentTurnCostUsd = addRelayTurnCost(agentTurnCostUsd, ev);
+                    agentTurnCost.add(ev);
                     if (ev.usage && typeof ev.usage === 'object') {
                       for (const k of Object.keys(agentUsage) as (keyof SdkUsageTotals)[]) {
                         const v = ev.usage[k];
@@ -2091,7 +2148,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Картинки/видео списываются MCP-сервисами отдельно (см. toolSpent ниже).
       // Число для индикатора «X токенов». Считается тем же методом, что и реальное
       // списание в persistResponse, — иначе юзер увидит одно, а спишется другое.
-      const tokensUsed = this.computeSdkCharge(agentUsage, agentCostUsd, fullText, agentTurnCostUsd).tokens;
+      const tokensUsed = this.computeSdkCharge(agentUsage, agentCostUsd, fullText, agentTurnCost.usd).tokens;
 
       // Sum up tool-charged tokens (image, video, etc.) during this stream.
       // MCP-tools (MiscService.generateImage, VideoService.createJob,
@@ -2264,12 +2321,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * ответ → пустая строка.
    */
   /**
-   * Ответ ассистента вне основного потока чата. Возвращает только текст —
-   * обёртка над generateAgentReplyWithCharge для вызывающих, которым расход
-   * не нужен (резюме звонка, синтетические пробы).
+   * Ответ ассистента вне основного потока чата. Возвращает только текст — для
+   * вызывающих, которые токены не списывают (резюме звонка, синтетические
+   * пробы, поездки, пуши). Поэтому и строки billing[…] в логе не печатает.
    */
   async generateAgentReply(userId: string, assistantId: string, message: string, sessionIdOverride?: string): Promise<string> {
-    const { text } = await this.generateAgentReplyWithCharge(userId, assistantId, message, sessionIdOverride);
+    const { text } = await this.agentReply(userId, assistantId, message, sessionIdOverride, false);
     return text;
   }
 
@@ -2285,9 +2342,19 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * звонка не тарифицировались вовсе: голос был бесплатным каналом к платным
    * ассистентам. Замечено владельцем 26.08.2026, когда он попросил показывать
    * расход на экране.
+   *
+   * Возвращённое списывают голосовые консультации (voice-call), поэтому здесь
+   * же печатается billing[voice:…] с раскладом и алертит сработавшая страховка
+   * — как в двух других путях.
    */
   async generateAgentReplyWithCharge(
     userId: string, assistantId: string, message: string, sessionIdOverride?: string,
+  ): Promise<{ text: string; tokens: number; costUsd: number }> {
+    return this.agentReply(userId, assistantId, message, sessionIdOverride, true);
+  }
+
+  private async agentReply(
+    userId: string, assistantId: string, message: string, sessionIdOverride: string | undefined, billed: boolean,
   ): Promise<{ text: string; tokens: number; costUsd: number }> {
     const isNumeric = /^\d+$/.test(assistantId);
     const agentRes = isNumeric
@@ -2358,7 +2425,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
     };
     let costUsd = 0;
-    let turnCostUsd: number | null = null;
+    const turnCost = new RelayTurnCost();
     const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
       headers: fd.getHeaders(),
       responseType: 'stream',
@@ -2379,7 +2446,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
             else if (ev.type === 'done') {
               // Стоимость и расход — здесь же, где их берёт основной путь.
               if (typeof ev.costUsd === 'number' && ev.costUsd > 0) costUsd += ev.costUsd;
-              turnCostUsd = addRelayTurnCost(turnCostUsd, ev);
+              turnCost.add(ev);
               if (ev.usage && typeof ev.usage === 'object') {
                 for (const k of Object.keys(usage) as (keyof SdkUsageTotals)[]) {
                   const v = ev.usage[k];
@@ -2394,7 +2461,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
       resp.data.on('error', reject);
     });
     const text = this.stripToolTags(chunks.join('')).trim();
-    const charge = this.computeSdkCharge(usage, costUsd, text, turnCostUsd);
+    const charge = this.computeSdkCharge(usage, costUsd, text, turnCost.usd);
+    if (billed) {
+      const logLine = `billing[voice:${charge.source}]: tokens=${charge.tokens} ${charge.note}`;
+      if (charge.source === 'length') this.logger.warn(logLine);
+      else this.logger.log(logLine);
+      this.alertTurnCostFloor(userId, assistantId, charge, charge.tokens);
+    }
     return { text, tokens: charge.tokens, costUsd };
   }
 
@@ -2457,7 +2530,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     costUsd: number,
     text: string,
     turnCostUsd: number | null = null,
-  ): { tokens: number; usd: number; source: 'usage' | 'cost' | 'length'; note: string } {
+  ): SdkCharge {
     const textLength = text.length;
     if (usage && (usage.input || usage.output || usage.cacheRead || usage.cacheWrite5m || usage.cacheWrite1h)) {
       const weighted =
@@ -2513,17 +2586,20 @@ ${LanguageService.buildDirective(userLanguage)}`;
       const turnUsd = typeof turnCostUsd === 'number' && turnCostUsd > 0 ? turnCostUsd : 0;
       const floorUsd = this.SDK_TURN_COST_FLOOR * usageUsd;
       const billableUsd = turnUsd > 0 ? Math.max(turnUsd, floorUsd) : usageUsd;
-      const taken = turnUsd <= 0 ? 'usage' : turnUsd >= floorUsd ? 'ход' : 'пол';
+      const taken: ChargeTaken = turnUsd <= 0 ? 'usage' : turnUsd >= floorUsd ? 'turn' : 'floor';
       const tokens = Math.max(1, Math.ceil(billableUsd * this.TOKENS_PER_USD));
       const note =
         `weighted=${Math.round(weighted)} implied=$${impliedUsd.toFixed(4)} ` +
         (searchUsd ? `поиски=$${searchUsd.toFixed(4)} ` : '') +
         (typeof turnCostUsd === 'number' ? `ход=$${turnCostUsd.toFixed(4)} ` : 'ход=? ') +
-        `взято=${taken} ` +
+        `взято=${TAKEN_NOTE[taken]} ` +
         `сессия=$${costUsd.toFixed(4)}` +
         (usage.webSearch ? ` поисков=${usage.webSearch}` : '') +
         (usage.webFetch ? ` fetch=${usage.webFetch}` : '');
-      return { tokens, usd: billableUsd, source: 'usage', note };
+      return {
+        tokens, usd: billableUsd, source: 'usage', note,
+        taken, formulaUsd: usageUsd, turnUsd: typeof turnCostUsd === 'number' ? turnCostUsd : null,
+      };
     }
     if (typeof turnCostUsd === 'number' && turnCostUsd > 0) {
       return {
@@ -2614,6 +2690,30 @@ ${LanguageService.buildDirective(userLanguage)}`;
     ).catch(() => {});
   }
 
+  /**
+   * Алерт: ход списан по страховке — релей прислал за ход меньше доли
+   * SDK_TURN_COST_FLOOR от формулы. Честный счёт CLI так низко не бывает (по
+   * логу прода — от 0.20 формулы у Haiku), значит релей ошибся в вычитании
+   * cost-state, и ходы, где страховка не дотянулась, списаны неверно тоже.
+   *
+   * Только за записанное списание (chargedTokens > 0) и не чаще раза в
+   * FLOOR_ALERT_EVERY_MS: одна поломка релея бьёт по каждому ходу, сотня
+   * одинаковых сообщений ничего не добавит. fire-and-forget.
+   */
+  private alertTurnCostFloor(userId: string, assistantId: string, charge: SdkCharge, chargedTokens: number): void {
+    if (charge.taken !== 'floor' || chargedTokens <= 0) return;
+    const now = Date.now();
+    if (this.lastFloorAlertAt && now - this.lastFloorAlertAt < this.FLOOR_ALERT_EVERY_MS) return;
+    this.lastFloorAlertAt = now;
+    void sendTelegramAlert(
+      `⚠️ <b>Страховка списания</b>: релей прислал за ход $${(charge.turnUsd ?? 0).toFixed(4)} ` +
+      `при формуле $${(charge.formulaUsd ?? 0).toFixed(4)} (страховка ${this.SDK_TURN_COST_FLOOR}) — проверить релей\n` +
+      `Юзер: <code>${userId}</code>, ассистент ${assistantId}\n` +
+      `Списано по страховке: ${chargedTokens.toLocaleString('ru')} токенов. Следующий такой алерт — не раньше чем через 6 ч\n` +
+      `<code>${charge.note}</code>`,
+    ).catch(() => {});
+  }
+
   /** Баланс пользователя в Linkeon-токенах. Для шлагбаумов перед дорогим ходом. */
   async getTokenBalance(userId: string): Promise<number> {
     const r = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1', [userId]);
@@ -2697,9 +2797,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
         costUsd: Number(p.costUsd.toFixed(4)),
         turnCostUsd: typeof p.turnCostUsd === 'number' ? Number(p.turnCostUsd.toFixed(4)) : null,
         source: charge.source,
+        taken: charge.taken,
         durationMs: p.durationMs,
         replyChars: text.length,
       });
+      this.alertTurnCostFloor(p.userId, p.assistantId, charge, textCost);
       // Сторож роста стоимости — как в обычном ходе: только за записанным
       // списанием и без ожидания.
       void this.costGrowth?.recordTurn(
