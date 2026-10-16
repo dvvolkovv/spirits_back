@@ -209,6 +209,13 @@ export function computeCopilotState(input: {
 export class TripService implements OnModuleInit {
   private readonly logger = new Logger(TripService.name);
 
+  /** Время данных в часовом поясе владельца — человеку, а не в UTC. */
+  private hhmm(at: Date): string {
+    return new Intl.DateTimeFormat('ru-RU', {
+      timeZone: 'Asia/Yekaterinburg', hour: '2-digit', minute: '2-digit', hour12: false,
+    }).format(at);
+  }
+
   constructor(
     private readonly pg: PgService,
     private readonly calendar: CalendarService,
@@ -269,9 +276,19 @@ export class TripService implements OnModuleInit {
       const r = settled[i];
       if (r.status === 'fulfilled') return r.value as T[];
       const name = SOURCE_NAMES[i];
-      if (!degraded.includes(name)) degraded.push(name);
-      this.logger.warn(`[trip] источник «${name}» недоступен: ${(r.reason as any)?.message}`);
-      return [];
+      // ⚠️ Источник лёг — но если он сохранил последний удачный ответ, показываем ЕГО,
+      // а не пустоту. 429 от TalerID держался у владельца часами, и всё это время день
+      // выглядел пустым, хотя утром события приходили.
+      //
+      // Источник при этом ОСТАЁТСЯ названным недоступным, и в названии стоит время
+      // данных: «TalerID (данные от 14:32)». Иначе старое выглядело бы свежим — это та
+      // же подмена, что была с пустотой, только незаметнее.
+      const kept = (r.reason as any)?.lastGood as { at: Date; items: any[] } | undefined;
+      const label = kept ? `${name} (данные от ${this.hhmm(kept.at)})` : name;
+      if (!degraded.includes(label)) degraded.push(label);
+      this.logger.warn(`[trip] источник «${name}» недоступен: ${(r.reason as any)?.message}`
+        + (kept ? ` — показываем ответ от ${kept.at.toISOString()}` : ''));
+      return (kept?.items as T[]) ?? [];
     };
     const vtodoTasks = pick<any>(0);
     const linkeonTasks = pick<any>(1);

@@ -54,11 +54,53 @@ export class NotConnected extends Error {
   }
 }
 
-/** Источник не ответил: таймаут, 429, транспортная ошибка. Человеку это показываем. */
+/**
+ * Источник не ответил: таймаут, 429, транспортная ошибка. Человеку это показываем.
+ *
+ * <p>⚠️ Ошибка НЕСЁТ последний удачный ответ, если он есть. Почему так, а не «вернуть кэш
+ * вместо ошибки»: вызывающий обязан знать, что источник лёг, — иначе он не назовёт его
+ * человеку, и устаревшие события будут выглядеть свежими. Решение «показать старое»
+ * принимает тот, кто рисует экран, а не тот, кто ходил в сеть.
+ */
 export class SourceUnavailable extends Error {
-  constructor(readonly source: string, cause: unknown) {
+  /** Последний успешный ответ этого источника и когда он был получен. */
+  lastGood?: { at: Date; items: any[] };
+
+  constructor(readonly source: string, cause: unknown, lastGood?: { at: Date; items: any[] }) {
     super(`${source}: ${(cause as any)?.message || cause}`);
     this.name = 'SourceUnavailable';
+    this.lastGood = lastGood;
+  }
+}
+
+/**
+ * Последний удачный ответ на пользователя — в памяти процесса.
+ *
+ * <p>Повод: 429 от TalerID держался у владельца часами, и всё это время календарь был
+ * пуст, хотя ещё утром данные приходили. Ретрай тут не помощник: 429 — это «слишком
+ * часто», и повтор делает ровно то, на что жалуется источник.
+ *
+ * <p>Почему в памяти, а не в БД: ценность у кэша — часы, а не дни; после рестарта
+ * процесса устаревший день не нужен никому. Это осознанный предел, а не упущение:
+ * деплой гасит кэш, и первый запрос после него при лежащем источнике снова даст пустоту.
+ */
+const LAST_GOOD_TTL_MS = 12 * 60 * 60 * 1000;
+
+class LastGood {
+  private readonly byKey = new Map<string, { at: Date; items: any[] }>();
+
+  put(key: string, items: any[]): void {
+    this.byKey.set(key, { at: new Date(), items });
+  }
+
+  get(key: string): { at: Date; items: any[] } | undefined {
+    const hit = this.byKey.get(key);
+    if (!hit) return undefined;
+    if (Date.now() - hit.at.getTime() > LAST_GOOD_TTL_MS) {
+      this.byKey.delete(key);
+      return undefined;   // вчерашний день хуже честной пустоты
+    }
+    return hit;
   }
 }
 /**
@@ -71,13 +113,15 @@ export class SourceUnavailable extends Error {
  * concept and no RRULE, so a recurring/multi-date ProposedEvent is expanded into N individual
  * create_calendar_event calls via expandOccurrences (reused from src/calendar/recurrence.ts).
  *
- * Best-effort like the Yandex connector: any failure (not connected, MCP error, unexpected
- * payload shape) degrades listEvents to `[]` rather than throwing, so co-pilot aggregation
- * never breaks because TalerID is unavailable.
+ * ⚠️ Сбой НЕ превращается в пустоту (так было до 11.10.2026, и владелец видел пустой день
+ * вместо ошибки при 429). «Не подключён» → `[]`, это правда; любой другой сбой →
+ * SourceUnavailable, с последним удачным ответом внутри, если он есть.
  */
 @Injectable()
 export class TalerIdCalendarConnector {
   private readonly logger = new Logger(TalerIdCalendarConnector.name);
+  /** Последний удачный ответ по (пользователь, метод) — подпорка на время 429. */
+  private readonly lastGood = new LastGood();
 
   constructor(private readonly oauth: TalerIdOauthService) {}
 
@@ -150,6 +194,7 @@ export class TalerIdCalendarConnector {
         if (meetingUrl) item.meetingUrl = meetingUrl;
         out.push(item);
       }
+      this.lastGood.put(`events:${userId}`, out);
       return out;
     } catch (e: any) {
       if (e instanceof NotConnected) {
@@ -158,8 +203,12 @@ export class TalerIdCalendarConnector {
       }
       // ⚠️ Раньше здесь был `return []`, и человек видел пустой календарь вместо ошибки.
       // Владелец 11.10.2026: «в десктопе есть, телефон не видит» — это был 429 от TalerID.
-      this.logger.warn(`talerid listEvents НЕДОСТУПЕН для ${userId}: ${e?.message}`);
-      throw new SourceUnavailable('TalerID', e);
+      // Последний удачный ответ отдаём вызывающему ВМЕСТЕ с ошибкой: он покажет события
+      // и назовёт источник недоступным. Молча подменить свежие данные старыми нельзя.
+      const kept = this.lastGood.get(`events:${userId}`);
+      this.logger.warn(`talerid listEvents НЕДОСТУПЕН для ${userId}: ${e?.message}`
+        + (kept ? ` — отдаём последний удачный ответ от ${kept.at.toISOString()}` : ' — подпорки нет'));
+      throw new SourceUnavailable('TalerID', e, kept);
     }
   }
 
@@ -362,14 +411,17 @@ export class TalerIdCalendarConnector {
           }
         }
       }
+      this.lastGood.put(`tasks:${userId}`, out);
       return out;
     } catch (e: any) {
       if (e instanceof NotConnected) {
         this.logger.debug(`talerid listTasks: не подключён у ${userId}`);
         return [];
       }
-      this.logger.warn(`talerid listTasks НЕДОСТУПЕН для ${userId}: ${e?.message}`);
-      throw new SourceUnavailable('TalerID', e);
+      const kept = this.lastGood.get(`tasks:${userId}`);
+      this.logger.warn(`talerid listTasks НЕДОСТУПЕН для ${userId}: ${e?.message}`
+        + (kept ? ` — отдаём последний удачный ответ от ${kept.at.toISOString()}` : ' — подпорки нет'));
+      throw new SourceUnavailable('TalerID', e, kept);
     }
   }
 

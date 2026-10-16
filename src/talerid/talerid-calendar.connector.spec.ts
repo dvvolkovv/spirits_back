@@ -292,4 +292,56 @@ describe('TalerIdCalendarConnector', () => {
       expect(args.endAt).toBe('2026-08-17T10:00:00+05:00');
     });
   });
+
+  // ⚠️ 429 от TalerID держался у владельца часами, и всё это время календарь выглядел
+  // пустым, хотя утром события приходили. Ретрай тут не лечит: 429 — это «слишком часто».
+  describe('последний удачный ответ переживает сбой источника', () => {
+    const start = new Date('2026-10-16T00:00:00+05:00');
+    const end = new Date('2026-10-23T00:00:00+05:00');
+
+    it('после удачного ответа сбой несёт его с собой, но ОСТАЁТСЯ сбоем', async () => {
+      const connector = new TalerIdCalendarConnector(makeOauth());
+      const callTool = jest.spyOn(connector as any, 'callTool');
+
+      callTool.mockResolvedValueOnce([
+        { id: 'e1', title: 'Занятие Савы', startAt: '2026-10-17T08:15:00+05:00' },
+      ]);
+      const good = await connector.listEvents('user-1', start, end);
+      expect(good).toHaveLength(1);
+
+      callTool.mockRejectedValueOnce(new Error('HTTP 429 Too Many Requests'));
+      await expect(connector.listEvents('user-1', start, end)).rejects.toMatchObject({
+        name: 'SourceUnavailable',
+      });
+
+      // Подпорка приехала вместе с ошибкой — решение «показать старое» принимает вызывающий.
+      callTool.mockRejectedValueOnce(new Error('HTTP 429 Too Many Requests'));
+      const err = await connector.listEvents('user-1', start, end).catch((e) => e);
+      expect(err).toBeInstanceOf(SourceUnavailable);
+      expect(err.lastGood.items).toHaveLength(1);
+      expect(err.lastGood.items[0].title).toBe('Занятие Савы');
+      expect(err.lastGood.at).toBeInstanceOf(Date);
+    });
+
+    it('сбой БЕЗ прошлого удачного ответа подпорки не выдумывает', async () => {
+      const connector = new TalerIdCalendarConnector(makeOauth());
+      jest.spyOn(connector as any, 'callTool').mockRejectedValue(new Error('HTTP 429'));
+      const err = await connector.listEvents('user-1', start, end).catch((e) => e);
+      expect(err).toBeInstanceOf(SourceUnavailable);
+      expect(err.lastGood).toBeUndefined();
+    });
+
+    it('подпорка на ПОЛЬЗОВАТЕЛЯ: чужой удачный ответ не подставляется', async () => {
+      const connector = new TalerIdCalendarConnector(makeOauth());
+      const callTool = jest.spyOn(connector as any, 'callTool');
+      callTool.mockResolvedValueOnce([
+        { id: 'e1', title: 'Чужое событие', startAt: '2026-10-17T08:15:00+05:00' },
+      ]);
+      await connector.listEvents('user-1', start, end);
+
+      callTool.mockRejectedValueOnce(new Error('HTTP 429'));
+      const err = await connector.listEvents('user-2', start, end).catch((e) => e);
+      expect(err.lastGood).toBeUndefined();
+    });
+  });
 });
