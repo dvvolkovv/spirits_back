@@ -8,6 +8,9 @@ describe('AttendeeClient', () => {
     process.env.ATTENDEE_BASE_URL = 'https://attendee.test';
     process.env.ATTENDEE_API_KEY = 'k1';
     process.env.ATTENDEE_WEBHOOK_URL = 'https://my.linkeon.io/webhook/meet/attendee';
+    // Секрет тоже: без него createBot отказывается заводить бота — см. тесты
+    // «без вебхуков бота не создаём» ниже.
+    process.env.ATTENDEE_WEBHOOK_SECRET = 'c2VjcmV0';
   });
   afterEach(() => { global.fetch = realFetch; });
 
@@ -30,6 +33,56 @@ describe('AttendeeClient', () => {
       // Пустая переменная в .env встречается чаще, чем отсутствующая.
       process.env.ATTENDEE_BASE_URL = '';
       expect(attendeeConfigured()).toBe(false);
+    });
+  });
+
+  /**
+   * Бота без вебхуков не создаём.
+   *
+   * Вебхуками едут состав участников, кто говорит и отказ во входе. Без них
+   * ассистент входит слепым: не видит людей, считает встречу пустой и уходит
+   * через LOBBY_MS, а не сумевший войти бот не может об этом сказать — звонок
+   * висит в `dialing`, пользователю написано «ассистент на встрече».
+   *
+   * На проде этих переменных не было с самого начала, и обе стороны молчали:
+   * бэкенд подставлял пустую строку, бот на пустом адресе возвращал «успех».
+   * Поломки выглядели необъяснимыми — выход через пятнадцать минут при живых
+   * участниках (Телемост 13.10.2026), вечный `dialing` (Meet 19.10.2026).
+   * Нашлось только 19.10.2026, по пустому логу.
+   */
+  describe('без вебхуков бота не создаём', () => {
+    const params = {
+      meetingUrl: 'https://meet.google.com/abc-defg-hij',
+      botName: 'Роман · ассистент Дмитрия',
+      callId: 'c1',
+      wsUrl: 'wss://my.linkeon.io/attendee/8141?callId=c1',
+    };
+
+    it('нет адреса — отказ, и до моста не ходим', async () => {
+      const spy = jest.fn();
+      global.fetch = spy as any;
+      delete process.env.ATTENDEE_WEBHOOK_URL;
+      expect(await new AttendeeClient().createBot(params)).toBeNull();
+      // Именно не ходим: бот, созданный вслепую, уже сидел бы во встрече.
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it('нет секрета — отказ: ручка отобьёт подписью', async () => {
+      const spy = jest.fn();
+      global.fetch = spy as any;
+      delete process.env.ATTENDEE_WEBHOOK_SECRET;
+      expect(await new AttendeeClient().createBot(params)).toBeNull();
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it('пустые строки — тоже отказ', async () => {
+      // Пустая переменная в .env встречается чаще, чем отсутствующая.
+      const spy = jest.fn();
+      global.fetch = spy as any;
+      process.env.ATTENDEE_WEBHOOK_URL = '';
+      process.env.ATTENDEE_WEBHOOK_SECRET = '';
+      expect(await new AttendeeClient().createBot(params)).toBeNull();
+      expect(spy).not.toHaveBeenCalled();
     });
   });
 
