@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import { meetingInputOptions } from './session-options.js';
+import { meetingInputOptions, realtimeTurnDetection } from './session-options.js';
 
 test('во встрече RoomIO не заводит собственный вход', () => {
   const o = meetingInputOptions();
@@ -55,4 +55,43 @@ test('SDK: предупреждение «already set, ignoring» ничего �
     /audioEnabled: false/,
     'SDK начал сам гасить вход — обоснование audioEnabled: false устарело',
   );
+});
+
+/**
+ * Разметка реплик: серверное перебивание на встрече выключено.
+ *
+ * Это разворот решения 16.09.2026, и тест держит именно его, а не пороги.
+ * Прежнее `interrupt_response: true` означало, что OpenAI снимает ответ
+ * ассистента, едва его VAD услышал чужую речь, — и наша защита
+ * `turnHandling.interruption` (800 мс, два слова) тут не помогала, она внутри
+ * SDK. На встрече 20.10.2026 (Meet, четверо, 64 минуты) он из-за этого не смог
+ * договорить ни одной фразы: обрывали на второй-третьей секунде, а один ответ
+ * умер через 160 мс. Со стороны — «позвали, а он не ответил».
+ *
+ * Если тест покраснел, потому что флаг вернули: сначала замерьте долю его
+ * речи. На той встрече было 0,3% времени, и опасение «говорит он часто», ради
+ * которого стояло `true`, ей прямо противоречит.
+ */
+test('на встрече сервер не перебивает ассистента и не отвечает за него', () => {
+  const t = realtimeTurnDetection(true);
+  assert.equal(t.interrupt_response, false);
+  assert.equal(t.create_response, false, 'ответ начинает гейт по имени, а не модель');
+});
+
+test('в звонке серверная разметка остаётся умолчанием API', () => {
+  // Звонок — разговор один на один: там перебивать ассистента нормально, и
+  // ответ модель начинает сама. Полей быть не должно вовсе, иначе мы молча
+  // навяжем звонку поведение встречи.
+  const t = realtimeTurnDetection(false);
+  assert.equal('interrupt_response' in t, false);
+  assert.equal('create_response' in t, false);
+});
+
+test('пороги подняты против дефолтов API', () => {
+  // 0.5 и 500 мс по умолчанию: короткий посторонний звук считался началом
+  // реплики, а пауза в середине фразы — её концом.
+  const t = realtimeTurnDetection(true);
+  assert.equal(t.type, 'server_vad');
+  assert.ok(t.threshold > 0.5, `порог не поднят: ${t.threshold}`);
+  assert.ok(t.silence_duration_ms > 500, `тишина не поднята: ${t.silence_duration_ms}`);
 });

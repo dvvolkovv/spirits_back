@@ -22,7 +22,7 @@ import { Occupancy, MEET_EMPTY_GRACE_MS } from './occupancy.js';
 import { SpeakerLedger } from './speaker-ledger.js';
 import { Presence } from './presence.js';
 import { MixedRoomAudioInput } from './mixed-audio-input.js';
-import { meetingInputOptions } from './session-options.js';
+import { meetingInputOptions, realtimeTurnDetection } from './session-options.js';
 import { ExternalRoomAudioOutput } from './external-room-output.js';
 import { ExternalRoomChat, type IncomingChat, type SendResult } from './external-chat.js';
 import { AttendeeAudioHub, AttendeeAudioInput, AttendeeAudioOutput, muteCommand } from './attendee-audio.js';
@@ -592,24 +592,11 @@ export default defineAgent({
               },
             }
           : {}),
-        // Порог и тишина подняты против дефолтных 0.5 и 500 мс: короткий
-        // посторонний звук не должен считаться началом реплики, а пауза в
-        // середине фразы — её концом.
-        turnDetection: {
-          type: 'server_vad',
-          threshold: 0.65,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 900,
-          // На встрече модель не начинает ответ сама — решает гейт по имени.
-          // Разметка реплик при этом сохраняется, мы её и слушаем.
-          //
-          // interrupt_response задаётся ЯВНО. Без него применяется умолчание
-          // API, и пока у ассистента открыт ответ, сервер может не размечать
-          // чужую речь вовсе — на встрече это значит «пока он говорит, никого
-          // не слышно», а говорит он часто. Стенд 16.09.2026: девять фраз в
-          // сумме на входе (проверено расшифровкой дампа), до гейта дошли две.
-          ...(isMeeting ? { create_response: false, interrupt_response: true } : {}),
-        },
+        // Пороги, create_response и interrupt_response — в session-options.ts
+        // вместе с разбором, чем оплачено каждое значение. Вынесено туда
+        // 20.10.2026: флаги меняли дважды по живым наблюдениям, и посреди
+        // большого выражения их не видно и не проверить тестом.
+        turnDetection: realtimeTurnDetection(isMeeting),
       }),
       // Перебить Романа теперь стоит дороже.
       //
