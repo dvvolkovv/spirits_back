@@ -230,6 +230,64 @@ export const meetPayload = (displayName) => `
     return panel ? panel.innerHTML.slice(0, 4000) : '';
   };
 
+  // ── Микрофон площадки ────────────────────────────────────────────────────
+  //
+  // Жмём настоящую кнопку встречи, а не глушим свой аудиограф: граф площадка
+  // не видит вовсе, а участникам нужен привычный значок у бота в списке.
+  //
+  // Появилось 21.10.2026, когда Meet уже переехал с Attendee на своего бота.
+  // Через Attendee такой ручки не было в принципе, и после переезда команда
+  // bot_mute продолжала доходить до бота только затем, чтобы тихо погаснуть в
+  // логе: на встрече 20.10.2026 участник вслух удивился, почему микрофон у
+  // ассистента горит, когда тот молчит.
+  //
+  // Язык панели зависит от настройки аккаунта, а не от нашего выбора, поэтому
+  // подписи нужны обе. Тот же приём уже применён к cameraOff в MEET_JOIN.
+  const MIC_BTN =
+    '[role="button"][aria-label*="microphone" i], button[aria-label*="microphone" i],' +
+    ' [role="button"][aria-label*="микрофон" i], button[aria-label*="микрофон" i]';
+
+  window.__botSetMicMuted = (want) => {
+    try {
+      const btn = document.querySelector(MIC_BTN);
+      if (!btn) return { ok: false, reason: 'кнопка микрофона не найдена' };
+      // У Meet состояние написано на самой кнопке и от языка не зависит — его
+      // и спрашиваем. Подпись остаётся запасным путём на случай, если атрибут
+      // переименуют.
+      //
+      // Подпись описывает ДЕЙСТВИЕ кнопки, а не состояние: «Turn off
+      // microphone» висит на ВКЛЮЧЁННОМ микрофоне. Поэтому «turn on» без
+      // «turn off» означает, что микрофон сейчас выключен.
+      const flag = btn.getAttribute('data-is-muted');
+      const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+      const muted =
+        flag === 'true' ||
+        (flag !== 'false' &&
+          (label.indexOf('turn on') >= 0 || label.indexOf('включить') >= 0) &&
+          label.indexOf('turn off') < 0 &&
+          label.indexOf('выключить') < 0);
+      if (muted === !!want) return { ok: true, how: 'уже в нужном состоянии' };
+      btn.click();
+      return { ok: true, how: 'кнопкой' };
+    } catch (e) {
+      return { ok: false, reason: String(e && e.message) };
+    }
+  };
+
+  /**
+   * Кусок панели управления — для разбора зацепок по факту, а не по догадке.
+   *
+   * data-is-muted висит и на камере, поэтому для поиска кнопки он не годится,
+   * а вот чтобы найти саму панель — в самый раз.
+   */
+  window.__botMicSample = () => {
+    try {
+      const any = document.querySelector('[data-is-muted]');
+      const el = (any && (any.closest('[role="region"]') || any.parentElement || any)) || document.body;
+      return el ? el.outerHTML.slice(0, 4000) : '';
+    } catch (e) { return ''; }
+  };
+
   send('ready', { url: location.host + location.pathname });
 })();
 `;
