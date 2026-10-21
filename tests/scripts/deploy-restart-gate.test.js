@@ -51,15 +51,23 @@ curl() {
   local url; for url; do :; done   # адрес — последний аргумент
   case "$url" in
     */webhook/chat/active-streams) local n; n=$(next_stream); echo "STREAMS: $n" >> "$LOG"; printf '{"active":%s}' "$n" ;;
-    */webhook/voice-call-status/active) printf '{"active":0}' ;;
+    */webhook/voice-call-status/active) echo "CALLS: 0" >> "$LOG"; printf '{"active":0}' ;;
     *) printf 200 ;;
   esac
 }
+# Каждая строка для ssh — ещё и в свой файл: тест прогонит её через bash -n.
+# Счётчик в файле: часть вызовов идёт из $(...), то есть из подоболочки.
 ssh_remote() {
+  local k; k=$(( $(cat "$WORK/n" 2>/dev/null || echo 0) + 1 )); echo "$k" > "$WORK/n"
+  printf '%s' "$*" > "$WORK/ssh.$k"
   printf 'SSH: %s\n' "$(echo "$*" | tr '\n' ' ')" >> "$LOG"
+  if [ "$*" = "cd $BACK_PATH && git rev-parse HEAD" ]; then
+    [ -n "$NO_SHA" ] || echo "$RUNNING_SHA"
+    return 0
+  fi
   case "$*" in
-    *"git rev-parse HEAD"*) echo "$RUNNING_SHA" ;;
     *"seq 1"*) echo "OK 1" ;;
+    *"git reset --hard origin/"*) [ -n "$BUILD_FAILS" ] && return 1 ;;
   esac
   return 0
 }
@@ -91,6 +99,8 @@ function runDeployBackend(streams, env = {}) {
       BASIC_AUTH: '',
       LOCAL_BACK_DIR: '/nonexistent',
       HEALTH_WAIT_SECONDS: '3',
+      NO_SHA: '',
+      BUILD_FAILS: '',
       ...env,
     },
   });
@@ -98,8 +108,13 @@ function runDeployBackend(streams, env = {}) {
   const log = fs.existsSync(path.join(work, 'log'))
     ? fs.readFileSync(path.join(work, 'log'), 'utf8').split('\n').filter(Boolean)
     : [];
+  // Строки для ssh — как их получил бы сервер; bash -n ловит ошибки кавычек.
+  const payloads = fs.readdirSync(work).filter((f) => /^ssh\.\d+$/.test(f)).map((f) => {
+    const n = spawnSync('bash', ['-n', path.join(work, f)], { encoding: 'utf8' });
+    return { text: fs.readFileSync(path.join(work, f), 'utf8'), syntaxOk: n.status === 0, err: n.stderr };
+  });
   fs.rmSync(work, { recursive: true, force: true });
-  return { status: res.status, stderr: res.stderr, log };
+  return { status: res.status, stderr: res.stderr, log, payloads };
 }
 
 const indexOf = (log, re, from = 0) => {
@@ -109,6 +124,8 @@ const indexOf = (log, re, from = 0) => {
 const BUILD = /^SSH: .*npm run build/;
 const RESTART = /^SSH: .*pm2 restart linkeon-api/;
 const STREAMS = /^STREAMS: /;
+const POLL = /^(STREAMS|CALLS): /;
+const REVERT = new RegExp(`^SSH: .*git reset --hard ${RUNNING_SHA}.*npm run build`);
 
 describe('deploy.sh: живые ходы проверяются прямо перед рестартом API', () => {
   it('функции скрипта подгружаются в bash без ошибок', () => {
@@ -150,7 +167,7 @@ describe('deploy.sh: живые ходы проверяются прямо пе�
     expect(status).toBe(1);
     expect(indexOf(log, RESTART)).toBe(-1);
     const build = indexOf(log, BUILD);
-    const revert = indexOf(log, new RegExp(`^SSH: .*git reset --hard ${RUNNING_SHA}.*npm run build`), build + 1);
+    const revert = indexOf(log, REVERT, build + 1);
     expect(revert).toBeGreaterThan(build);
     expect(log[revert]).not.toMatch(/pm2 (restart|startOrReload)/);
   });
@@ -160,5 +177,59 @@ describe('deploy.sh: живые ходы проверяются прямо пе�
     expect(status).toBe(0);
     expect(indexOf(log, STREAMS)).toBe(-1);
     expect(indexOf(log, RESTART)).toBeGreaterThan(indexOf(log, BUILD));
+  });
+
+  it('последний опрос перед рестартом — ходы: ожидание звонков (до 15 минут) идёт раньше', () => {
+    const { log } = runDeployBackend(['0']);
+    const restart = indexOf(log, RESTART);
+    const polls = log.slice(indexOf(log, BUILD), restart).filter((l) => POLL.test(l));
+    expect(polls[polls.length - 1]).toMatch(STREAMS);
+    expect(polls.some((l) => /^CALLS: /.test(l))).toBe(true);
+  });
+
+  it('голосовой воркер перезапускается в шаге рестарта, а не в сборке', () => {
+    const { log } = runDeployBackend(['0']);
+    expect(log[indexOf(log, RESTART)]).toMatch(/pm2 startOrReload ecosystem\.config\.cjs/);
+    expect(log[indexOf(log, BUILD)]).not.toMatch(/startOrReload/);
+  });
+
+  it('не прочитан работающий коммит — не собираем вовсе, выход 1', () => {
+    const { status, log } = runDeployBackend(['0'], { NO_SHA: '1' });
+    expect(status).toBe(1);
+    expect(indexOf(log, BUILD)).toBe(-1);
+    expect(indexOf(log, RESTART)).toBe(-1);
+  });
+
+  it('сборка упала — рестарта нет, сборка возвращается к работающему коммиту, выход 1', () => {
+    const { status, log } = runDeployBackend(['0'], { BUILD_FAILS: '1' });
+    expect(status).toBe(1);
+    expect(indexOf(log, RESTART)).toBe(-1);
+    expect(indexOf(log, REVERT)).toBeGreaterThan(indexOf(log, BUILD));
+  });
+
+  it('сборка и её возврат — с pipefail; возврат не гоняет npm ci при том же package-lock.json', () => {
+    const { log } = runDeployBackend(['0', '1'], { STREAM_DRAIN_SECONDS: '30' });
+    const build = log[indexOf(log, BUILD)];
+    const revert = log[indexOf(log, REVERT)];
+    expect(build).toMatch(/set -eo pipefail/);
+    expect(revert).toMatch(/set -eo pipefail/);
+    expect(revert).toMatch(/CI_SAME_AS=\$\(git rev-parse HEAD\)/);
+    expect(revert).toMatch(/git diff --quiet "\$CI_SAME_AS" HEAD -- package-lock\.json/);
+  });
+
+  it('все строки, уходящие в ssh, — синтаксически верный shell', () => {
+    for (const run of [runDeployBackend(['0']), runDeployBackend(['0', '1'], { STREAM_DRAIN_SECONDS: '30' })]) {
+      expect(run.payloads.length).toBeGreaterThan(3);
+      for (const p of run.payloads) expect({ ok: p.syntaxOk, err: p.err }).toEqual({ ok: true, err: '' });
+    }
+  });
+
+  it('переменная вплотную к нелатинскому символу — только в фигурных скобках (bash 3.2 на маке)', () => {
+    // Та же проверка, что в шапке deploy.sh: исправный файл даёт ноль строк.
+    const bad = fs.readFileSync(DEPLOY, 'latin1').split('\n')
+      .map((l, i) => [i + 1, l])
+      .filter(([, l]) => /\$[A-Za-z_][A-Za-z0-9_]*[\x80-\xff]/.test(l))
+      .map(([n]) => n);
+    expect(bad).toEqual([]);
   });
 });
