@@ -75,6 +75,8 @@
 #   STREAM_DRAIN_SECONDS=N — сколько ждать завершения живых чат-ходов перед
 #                        рестартом (default 1800). Рестарт посреди стрима
 #                        убивает ответ молча — см. wait_for_streams_drain.
+#                        Ждём дважды, каждый раз до N секунд: до сборки и
+#                        прямо перед pm2 restart (см. deploy_backend).
 #   FORCE_RESTART=1    — не ждать живые ходы (оборвёт чей-то ответ; только
 #                        когда прод лежит и ждать нечего).
 #
@@ -619,51 +621,141 @@ wait_for_streams_drain() {
   return 1
 }
 
-deploy_backend() {
-  bold "=== BACKEND ($ENV_NAME) ==="
-  bold "[back 1/3] pushing local commits to origin"
-  push_local_repo "$LOCAL_BACK_DIR" "spirits_back"
-
-  if [[ "${FORCE_RESTART:-0}" == "1" ]]; then
-    red "  ⚠ FORCE_RESTART=1 — рестарт без ожидания, живые ходы будут оборваны"
-  else
-    bold "[back 1.5/3] ожидание завершения живых чат-ходов ($ENV_NAME)"
-    wait_for_streams_drain || exit 1
-    wait_for_calls_drain || exit 1
-  fi
-
-  bold "[back 2/3] pulling on $ENV_NAME + building + restarting"
-  ssh_remote "
-    set -e
-    cd $BACK_PATH
-    git fetch origin
-    git reset --hard origin/$BRANCH
-    npm ci --no-audit --no-fund 2>&1 | tail -3
+# Команды сборки бэкенда на сервере — API и голосовой воркер, БЕЗ рестарта.
+# Общие для выката и для возврата сборки к работающему коммиту (revert_build).
+#
+# CI_SAME_AS=<коммит> (переменная оболочки на сервере) — не гонять npm ci, если
+# package-lock.json с того коммита не менялся. Нужно возврату: он идёт, когда
+# живые ходы точно есть, а npm ci пересоздаёт node_modules под работающим
+# процессом (Agent SDK бэкенда запускается оттуда).
+back_build_cmds() {
+  cat <<'CMDS'
+    if [ -n "${CI_SAME_AS:-}" ] && git diff --quiet "$CI_SAME_AS" HEAD -- package-lock.json; then
+      echo 'npm ci пропущен: package-lock.json тот же'
+    else
+      npm ci --no-audit --no-fund 2>&1 | tail -3
+    fi
     npm run build 2>&1 | tail -3
-    pm2 restart linkeon-api 2>&1 | tail -2
     # Голосовой воркер: свой package.json и своя сборка, отдельно от основной.
     # Без этого блока правки voice-host/* не доезжают до живого процесса.
-    # Статус проверяем явно, а не через '| tail': в этом блоке действует
-    # set -e БЕЗ pipefail, поэтому статус берётся от tail и всегда нулевой —
-    # падение сборки проглатывается молча. Первый прогон 25.08.2026 так и
-    # прошёл «зелёным» с несобравшимся воркером.
+    # Статус проверяем явно, а не через '| tail'. Блок долго шёл с set -e БЕЗ
+    # pipefail, статус брался от tail и был всегда нулевым — падение сборки
+    # проглатывалось молча: первый прогон 25.08.2026 прошёл «зелёным» с
+    # несобравшимся воркером. С 21.10.2026 вызывающие блоки ставят pipefail,
+    # но явная проверка заодно печатает хвост лога.
     # Пропускаем там, где нет LiveKit: на тест-стенде SFU не развёрнут вовсе
     # (ни контейнера, ни порта 7880, ни ключей в .env), и поднятый воркер
     # уходит в бесконечный цикл падений. Признак настроенности — свой .env
     # подпроекта: он создаётся руками вместе с ключами LiveKit.
     if [ -d voice-host ] && [ -f voice-host/.env ]; then
       cd voice-host
-      npm ci --no-audit --no-fund > /tmp/vh-install.log 2>&1 \
-        || { tail -20 /tmp/vh-install.log; echo 'voice-host: npm ci FAILED'; exit 1; }
+      if [ -n "${CI_SAME_AS:-}" ] && git diff --quiet "$CI_SAME_AS" HEAD -- package-lock.json; then
+        echo 'voice-host: npm ci пропущен: package-lock.json тот же'
+      else
+        npm ci --no-audit --no-fund > /tmp/vh-install.log 2>&1 \
+          || { tail -20 /tmp/vh-install.log; echo 'voice-host: npm ci FAILED'; exit 1; }
+      fi
       npm run build > /tmp/vh-build.log 2>&1 \
         || { tail -20 /tmp/vh-build.log; echo 'voice-host: build FAILED'; exit 1; }
-      pm2 startOrReload ecosystem.config.cjs > /tmp/vh-pm2.log 2>&1 \
-        || { tail -20 /tmp/vh-pm2.log; echo 'voice-host: pm2 startOrReload FAILED'; exit 1; }
       cd ..
     elif [ -d voice-host ]; then
       echo 'voice-host: .env отсутствует — LiveKit не настроен, воркер пропущен'
     fi
-  " || { red "  backend deploy failed ($ENV_NAME)"; exit 1; }
+CMDS
+}
+
+# Вернуть сборку на сервере к коммиту $1 — БЕЗ рестарта. Зовётся, когда новый
+# код собран (или недособран), а запускать его нельзя: без возврата dist/
+# остался бы впереди работающего процесса, и первый же перезапуск pm2 (падение,
+# max_memory_restart) поднял бы код, не прошедший smoke.
+revert_build() {
+  local sha="$1"
+  if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+    red "  ✗ работающий коммит неизвестен: dist/ впереди работающего процесса — проверь $ENV_NAME руками"
+    return 1
+  fi
+  red "  ↩ возвращаю сборку к работающему коммиту ${sha:0:8} — без рестарта"
+  ssh_remote "
+    set -eo pipefail
+    cd $BACK_PATH
+    CI_SAME_AS=\$(git rev-parse HEAD)
+    git reset --hard $sha
+    $(back_build_cmds)
+  " || { red "  ✗ возврат сборки не удался: dist/ впереди работающего процесса — проверь $ENV_NAME руками"; return 1; }
+}
+
+deploy_backend() {
+  bold "=== BACKEND ($ENV_NAME) ==="
+  bold "[back 1/3] pushing local commits to origin"
+  push_local_repo "$LOCAL_BACK_DIR" "spirits_back"
+
+  local force=0
+  [[ "${FORCE_RESTART:-0}" == "1" ]] && force=1
+  if (( force )); then
+    red "  ⚠ FORCE_RESTART=1 — рестарт без ожидания, живые ходы будут оборваны"
+  else
+    # Первая проверка — ДО сборки: npm ci пересоздаёт node_modules под
+    # работающим процессом, и живому ходу незачем попадать ещё и под это.
+    bold "[back 1.5/3] ожидание завершения живых чат-ходов ($ENV_NAME)"
+    wait_for_streams_drain || exit 1
+    wait_for_calls_drain || exit 1
+  fi
+
+  # Коммит, на котором процесс работает сейчас. Без него сборку, которую нельзя
+  # запускать, не вернуть (revert_build) — тогда и не собираем.
+  local running_sha
+  running_sha=$(ssh_remote "cd $BACK_PATH && git rev-parse HEAD" 2>/dev/null | tail -1 | tr -d '[:space:]')
+  if [[ ! "$running_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    red "  ✗ $ENV_NAME: не прочитал коммит работающего кода — без него сборку не вернуть, не собираю"
+    exit 1
+  fi
+
+  bold "[back 2/3] pulling on $ENV_NAME + building"
+  # pipefail: без него упавший `npm run build | tail` выглядел бы успехом, и
+  # следующий шаг перезапустил бы API на битом dist/.
+  if ! ssh_remote "
+    set -eo pipefail
+    cd $BACK_PATH
+    git fetch origin
+    git reset --hard origin/$BRANCH
+    $(back_build_cmds)
+  "; then
+    red "  ✗ backend build failed ($ENV_NAME) — API не перезапускаю"
+    revert_build "$running_sha" || true
+    exit 1
+  fi
+
+  # Вторая проверка — ПРЯМО ПЕРЕД рестартом [инцидент 2026-10-20]. Первая стоит
+  # до сборки, а сборка идёт минуту-две, и ход, начатый за это время, она не
+  # видит. Так и вышло: «живых ходов нет», затем fetch + npm ci + build, и
+  # рестарт через 7 секунд после просьбы пользователя. Ход оборвался молча, а
+  # файл, который ассистент для него сделал, не прикрепился.
+  #
+  # Звонки — первыми, ходы — последними: ожидание звонков длится до 15 минут,
+  # и проверка ходов перед ним снова открыла бы окно на всё это время. Остаётся
+  # окно в секунды — от проверки ходов до pm2 restart (одно ssh-подключение).
+  if (( force )); then
+    bold "[back 2.5/3] restart ($ENV_NAME, FORCE_RESTART=1 — без проверки ходов)"
+  else
+    bold "[back 2.5/3] restart — сначала ещё раз живые ходы, начатые за время сборки ($ENV_NAME)"
+    wait_for_calls_drain || exit 1
+    if ! wait_for_streams_drain; then
+      red "  ✗ $ENV_NAME: новый код собран, но НЕ запущен — рестарт оборвал бы живой ход"
+      revert_build "$running_sha" || true
+      exit 1
+    fi
+  fi
+  ssh_remote "
+    set -e
+    cd $BACK_PATH
+    pm2 restart linkeon-api 2>&1 | tail -2
+    if [ -d voice-host ] && [ -f voice-host/.env ]; then
+      cd voice-host
+      pm2 startOrReload ecosystem.config.cjs > /tmp/vh-pm2.log 2>&1 \
+        || { tail -20 /tmp/vh-pm2.log; echo 'voice-host: pm2 startOrReload FAILED'; exit 1; }
+      cd ..
+    fi
+  " || { red "  backend restart failed ($ENV_NAME)"; exit 1; }
 
   bold "[back 3/3] health-wait"
   # A healthy prod cold boot (NestJS + every module's onModuleInit SQL migrations +

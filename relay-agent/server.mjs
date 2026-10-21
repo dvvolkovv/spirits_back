@@ -9,6 +9,7 @@ import { sessionFsKey, uploadFileName, fallbackFileName } from "./paths.mjs";
 import { eventCallContext, tailDialogue } from "./session-tail.mjs";
 import { RUN_ENV, runTag, finishedRun, reap } from "./proc-reaper.mjs";
 import { costBaseline, runCost } from "./turn-cost.mjs";
+import { createUndelivered, withCarried } from "./undelivered-files.mjs";
 
 const app = express();
 const PORT = 3033;
@@ -109,6 +110,19 @@ kind: 'task' — ДЕЛО/задача, которую можно «выполн
 `;
 
 const sessionMap = new Map();
+
+// Файлы ходов, чей `done` до бэкенда не дошёл, — до следующего хода сессии.
+// См. undelivered-files.mjs.
+const undelivered = createUndelivered();
+// Перенесённый файл ещё на диске? Адрес наш же: /files/<fsKey>/<имя>.
+const statOutputFile = (url) => {
+  try {
+    const full = path.join(OUTPUT_DIR, url.slice("/files/".length));
+    if (!full.startsWith(OUTPUT_DIR + "/")) return null;
+    const st = fs.statSync(full);
+    return st.isFile() ? st : null;
+  } catch { return null; }
+};
 
 // ── Персист карты сессий ─────────────────────────────────────────────────────
 // sessionMap живёт в памяти, и до этой правки ЛЮБОЙ рестарт релея обнулял её
@@ -987,13 +1001,23 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       walk(outDir, "");
     }
 
+    // Файлы прошлых ходов этой сессии, чей `done` до бэкенда не дошёл
+    // (рестарт API, обрыв связи): отдаём их сейчас, иначе ссылки на них не
+    // будет никогда. Берём после хода, а не до: оборванный ход мог
+    // доработать уже после того, как начался этот.
+    const carried = undelivered.take(sessionId);
+    const filesOut = withCarried(outputFiles, carried, statOutputFile);
+
     stopHeartbeat();
     if (!clientDisconnected) {
+      if (filesOut.length > outputFiles.length) {
+        console.log("[undelivered] " + sessionId + ": отдаю файлы прошлого хода: " + (filesOut.length - outputFiles.length));
+      }
       // failed — «ход не выдал финального ответа». Бэкенд по нему пропускает
       // списание: платить за пустоту пользователь не должен.
       res.write("data: " + JSON.stringify({
         type: "done",
-        outputFiles,
+        outputFiles: filesOut,
         costUsd: totalCostUsd,
         turnCostUsd: turnCostKnown ? Number(turnCostUsd.toFixed(6)) : null,
         usage: usageTotals,
@@ -1001,6 +1025,9 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         failReason,
       }) + "\n\n");
       res.end();
+    } else if (filesOut.length) {
+      undelivered.stash(sessionId, filesOut);
+      console.log("[undelivered] " + sessionId + ": бэкенд ушёл до done, файлов отложено: " + filesOut.length);
     }
   })().catch(() => { stopHeartbeat(); }).finally(() => {
     // Remove the per-session MCP config (it holds the user's Bearer tokens —
