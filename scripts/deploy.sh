@@ -75,6 +75,8 @@
 #   STREAM_DRAIN_SECONDS=N — сколько ждать завершения живых чат-ходов перед
 #                        рестартом (default 1800). Рестарт посреди стрима
 #                        убивает ответ молча — см. wait_for_streams_drain.
+#                        Ждём дважды, каждый раз до N секунд: до сборки и
+#                        прямо перед pm2 restart (см. deploy_backend).
 #   FORCE_RESTART=1    — не ждать живые ходы (оборвёт чей-то ответ; только
 #                        когда прод лежит и ждать нечего).
 #
@@ -619,28 +621,12 @@ wait_for_streams_drain() {
   return 1
 }
 
-deploy_backend() {
-  bold "=== BACKEND ($ENV_NAME) ==="
-  bold "[back 1/3] pushing local commits to origin"
-  push_local_repo "$LOCAL_BACK_DIR" "spirits_back"
-
-  if [[ "${FORCE_RESTART:-0}" == "1" ]]; then
-    red "  ⚠ FORCE_RESTART=1 — рестарт без ожидания, живые ходы будут оборваны"
-  else
-    bold "[back 1.5/3] ожидание завершения живых чат-ходов ($ENV_NAME)"
-    wait_for_streams_drain || exit 1
-    wait_for_calls_drain || exit 1
-  fi
-
-  bold "[back 2/3] pulling on $ENV_NAME + building + restarting"
-  ssh_remote "
-    set -e
-    cd $BACK_PATH
-    git fetch origin
-    git reset --hard origin/$BRANCH
+# Команды сборки бэкенда на сервере — API и голосовой воркер, БЕЗ рестарта.
+# Общие для выката и для возврата сборки к работающему коммиту (deploy_backend).
+back_build_cmds() {
+  cat <<'CMDS'
     npm ci --no-audit --no-fund 2>&1 | tail -3
     npm run build 2>&1 | tail -3
-    pm2 restart linkeon-api 2>&1 | tail -2
     # Голосовой воркер: свой package.json и своя сборка, отдельно от основной.
     # Без этого блока правки voice-host/* не доезжают до живого процесса.
     # Статус проверяем явно, а не через '| tail': в этом блоке действует
@@ -657,13 +643,83 @@ deploy_backend() {
         || { tail -20 /tmp/vh-install.log; echo 'voice-host: npm ci FAILED'; exit 1; }
       npm run build > /tmp/vh-build.log 2>&1 \
         || { tail -20 /tmp/vh-build.log; echo 'voice-host: build FAILED'; exit 1; }
-      pm2 startOrReload ecosystem.config.cjs > /tmp/vh-pm2.log 2>&1 \
-        || { tail -20 /tmp/vh-pm2.log; echo 'voice-host: pm2 startOrReload FAILED'; exit 1; }
       cd ..
     elif [ -d voice-host ]; then
       echo 'voice-host: .env отсутствует — LiveKit не настроен, воркер пропущен'
     fi
+CMDS
+}
+
+deploy_backend() {
+  bold "=== BACKEND ($ENV_NAME) ==="
+  bold "[back 1/3] pushing local commits to origin"
+  push_local_repo "$LOCAL_BACK_DIR" "spirits_back"
+
+  local force=0
+  [[ "${FORCE_RESTART:-0}" == "1" ]] && force=1
+  if (( force )); then
+    red "  ⚠ FORCE_RESTART=1 — рестарт без ожидания, живые ходы будут оборваны"
+  else
+    # Первая проверка — ДО сборки: npm ci пересоздаёт node_modules под
+    # работающим процессом, и живому ходу незачем попадать ещё и под это.
+    bold "[back 1.5/3] ожидание завершения живых чат-ходов ($ENV_NAME)"
+    wait_for_streams_drain || exit 1
+    wait_for_calls_drain || exit 1
+  fi
+
+  # Коммит, на котором процесс работает сейчас. Нужен, если перед рестартом
+  # ходы так и не закончатся: тогда сборка возвращается к нему (см. ниже).
+  local running_sha
+  running_sha=$(ssh_remote "cd $BACK_PATH && git rev-parse HEAD" 2>/dev/null | tail -1 | tr -d '[:space:]')
+
+  bold "[back 2/3] pulling on $ENV_NAME + building"
+  ssh_remote "
+    set -e
+    cd $BACK_PATH
+    git fetch origin
+    git reset --hard origin/$BRANCH
+    $(back_build_cmds)
   " || { red "  backend deploy failed ($ENV_NAME)"; exit 1; }
+
+  # Вторая проверка — ПРЯМО ПЕРЕД рестартом [инцидент 2026-10-20]. Первая стоит
+  # до сборки, а сборка идёт минуту-две, и ход, начатый за это время, она не
+  # видит. Так и вышло: «живых ходов нет», затем fetch + npm ci + build, и
+  # рестарт через 7 секунд после просьбы пользователя. Ход оборвался молча, а
+  # файл, который ассистент для него сделал, не прикрепился. Остаётся окно в
+  # секунды — от этой проверки до pm2 restart (одно ssh-подключение).
+  bold "[back 2.5/3] restart — сначала ещё раз живые ходы, начатые за время сборки ($ENV_NAME)"
+  if (( ! force )); then
+    if ! wait_for_streams_drain; then
+      red "  ✗ $ENV_NAME: новый код собран, но НЕ запущен — рестарт оборвал бы живой ход"
+      if [[ "$running_sha" =~ ^[0-9a-f]{40}$ ]]; then
+        # Без возврата dist/ остался бы впереди работающего процесса, и первый
+        # же перезапуск pm2 (падение, max_memory_restart) поднял бы код, не
+        # прошедший smoke.
+        red "  ↩ возвращаю сборку к работающему коммиту ${running_sha:0:8} — без рестарта"
+        ssh_remote "
+          set -e
+          cd $BACK_PATH
+          git reset --hard $running_sha
+          $(back_build_cmds)
+        " || red "  ✗ возврат сборки не удался: dist/ впереди работающего процесса — проверь $ENV_NAME руками"
+      else
+        red "  ✗ работающий коммит неизвестен: dist/ впереди работающего процесса — проверь $ENV_NAME руками"
+      fi
+      exit 1
+    fi
+    wait_for_calls_drain || exit 1
+  fi
+  ssh_remote "
+    set -e
+    cd $BACK_PATH
+    pm2 restart linkeon-api 2>&1 | tail -2
+    if [ -d voice-host ] && [ -f voice-host/.env ]; then
+      cd voice-host
+      pm2 startOrReload ecosystem.config.cjs > /tmp/vh-pm2.log 2>&1 \
+        || { tail -20 /tmp/vh-pm2.log; echo 'voice-host: pm2 startOrReload FAILED'; exit 1; }
+      cd ..
+    fi
+  " || { red "  backend restart failed ($ENV_NAME)"; exit 1; }
 
   bold "[back 3/3] health-wait"
   # A healthy prod cold boot (NestJS + every module's onModuleInit SQL migrations +
