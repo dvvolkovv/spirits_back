@@ -69,13 +69,16 @@ ssh_remote() {
 function runDeployBackend(streams, env = {}) {
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'deploy-gate-'));
   fs.writeFileSync(path.join(work, 'streams'), streams.join('\n') + '\n');
-  const script = [
+  // Файлом, а не `bash -c`: функции скрипта больше 128 КБ — предела длины
+  // одного аргумента в Linux (spawn падал бы с E2BIG).
+  const harness = path.join(work, 'harness.sh');
+  fs.writeFileSync(harness, [
     'set -uo pipefail',
     scriptFunctions(),
     STUBS,
     'deploy_backend',
-  ].join('\n');
-  const res = spawnSync('bash', ['-c', script], {
+  ].join('\n'));
+  const res = spawnSync('bash', [harness], {
     encoding: 'utf8',
     env: {
       PATH: process.env.PATH,
@@ -91,6 +94,7 @@ function runDeployBackend(streams, env = {}) {
       ...env,
     },
   });
+  if (res.error) throw res.error;
   const log = fs.existsSync(path.join(work, 'log'))
     ? fs.readFileSync(path.join(work, 'log'), 'utf8').split('\n').filter(Boolean)
     : [];
