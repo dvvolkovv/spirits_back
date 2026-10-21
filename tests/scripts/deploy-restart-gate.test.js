@@ -219,7 +219,8 @@ describe('deploy.sh: живые ходы проверяются прямо пе�
 
   it('все строки, уходящие в ssh, — синтаксически верный shell', () => {
     for (const run of [runDeployBackend(['0']), runDeployBackend(['0', '1'], { STREAM_DRAIN_SECONDS: '30' })]) {
-      expect(run.payloads.length).toBeGreaterThan(3);
+      // обычный: коммит, сборка, рестарт, health; с возвратом: коммит, сборка, возврат
+      expect(run.payloads.length).toBeGreaterThanOrEqual(3);
       for (const p of run.payloads) expect({ ok: p.syntaxOk, err: p.err }).toEqual({ ok: true, err: '' });
     }
   });
