@@ -5,9 +5,9 @@ function svc(events: any, status: any = { connected: true }, listImpl?: jest.Moc
   const listEventsLocalRange = listImpl || jest.fn(async () => events);
   const getStatus = jest.fn(async () => status);
   const calendar = { listEventsLocalRange, getStatus } as any;
-  // constructor order: (kling, misc, pg, video, routines, calendar, speech) — only calendar matters here
+  // constructor order: (misc, pg, video, routines, calendar, speech) — only calendar matters here
   return {
-    svc: new ChatToolsService({} as any, {} as any, {} as any, {} as any, {} as any, calendar, {} as any),
+    svc: new ChatToolsService({} as any, {} as any, {} as any, {} as any, calendar, {} as any),
     listEventsLocalRange,
     getStatus,
   };

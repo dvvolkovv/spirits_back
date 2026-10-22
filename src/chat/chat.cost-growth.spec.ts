@@ -60,7 +60,7 @@ function makeService(
   };
   const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
   const svc = new ChatService(
-    pg as any, (o.neo4j ?? null) as any, null as any, null as any,
+    pg as any, (o.neo4j ?? null) as any, null as any,
     null as any, language as any, undefined, undefined, undefined, undefined,
   );
   // Сторож — последний @Optional-параметр; спеки собирают сервис позиционно,

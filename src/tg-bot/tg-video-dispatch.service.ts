@@ -4,9 +4,8 @@ import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from './tg-grammy.client';
 import { tgText, ownerTgLanguage } from './tg-i18n';
 
-// Видео из Kling/Veo доступно по временной ссылке; качаем сразу как только
-// статус ready. Telegram Bot API лимитит загрузку 50МБ — для коротких клипов
-// (5-10с) хватает с запасом.
+// Готовое видео качаем сразу, как только статус ready. Telegram Bot API
+// лимитит загрузку 50МБ — для коротких клипов (до 10с) хватает с запасом.
 const MAX_VIDEO_BYTES = 49 * 1024 * 1024;
 const POLL_INTERVAL_MS = 5_000;
 const BATCH_SIZE = 10;
@@ -97,7 +96,7 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
     } catch (e: any) {
       this.logger.warn(`failed to deliver video job ${row.job_id} → chat ${chatId}: ${e.message}`);
       // Помечаем failed чтобы не зацикливаться. Юзер не получает ничего; в идеале
-      // бы повторить с backoff, но Kling URL временный — повтор через час бесполезен.
+      // бы повторить с backoff.
       await this.pg.query(
         `UPDATE tg_bot_video_jobs SET delivery_status='failed', delivery_error=$1, delivered_at=now() WHERE job_id=$2`,
         [String(e.message ?? 'unknown').slice(0, 500), row.job_id],

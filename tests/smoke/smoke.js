@@ -532,7 +532,7 @@ async function step(name, fn) {
   // -- 11. Image generation end-to-end ----------------------------------
   // Ловит регрессии в Imagen/Gemini API ключах, MinIO permissions, S3 upload,
   // публичной отдаче через Nginx /smm-media/. Это ровно тот путь, что
-  // используется в чате (generate_image MCP) и в авто-цепочке text2video.
+  // используется в чате (generate_image MCP).
   // Стоит ~5000 токенов с тестового аккаунта на каждый прогон.
   await step('image generation end-to-end (Imagen → MinIO → public URL)', async () => {
     if (!jwt) throw new Error('no JWT from earlier step');

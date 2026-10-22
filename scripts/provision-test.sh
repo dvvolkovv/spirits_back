@@ -338,7 +338,7 @@ chmod 600 ~/spirits_back/.env
 
 # Worker .env — отдельный, т.к. worker/src/config.ts грузит ../.env
 # Required: REDIS_URL, SMM_API_URL, SMM_WORKER_SECRET, все MINIO_*.
-# Optional (TTS/Kling/Pexels/GoogleAI) — пусто на test, видео-pipeline не гоняем.
+# Optional (TTS/Pexels/GoogleAI) — пусто на test, видео-pipeline не гоняем.
 mkdir -p ~/spirits_back/worker
 cat > ~/spirits_back/worker/.env <<EOF
 LOG_LEVEL=info
@@ -363,8 +363,6 @@ ELEVENLABS_VOICE_HERO_F=
 ELEVENLABS_VOICE_PSY=
 ELEVENLABS_VOICE_LAWYER=
 ELEVENLABS_VOICE_COACH=
-KLING_ACCESS_KEY=
-KLING_SECRET_KEY=
 GOOGLE_AI_API_KEY=
 PEXELS_API_KEY=
 EOF

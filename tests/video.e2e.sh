@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/video.e2e.sh — end-to-end smoke test for Kling video generation.
+# tests/video.e2e.sh — end-to-end smoke test for video generation (Veo).
 # Prereq: BASE_URL env var (defaults to https://b.linkeon.io).
 #         Backend must have DEBUG_SMS_CODES=true for the test phone.
 set -euo pipefail

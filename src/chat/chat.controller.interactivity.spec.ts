@@ -80,7 +80,7 @@ describe('upload-and-chat: шаги работы и правило карточ�
     };
     const language = { resolveUserLanguage: jest.fn(async (_u: string, hint?: string) => hint || 'ru') };
     const svc = new ChatService(
-      pg as any, null as any, null as any, null as any, null as any,
+      pg as any, null as any, null as any, null as any,
       language as any, undefined, undefined, undefined, undefined,
     );
     const ctrl = new ChatController(svc, jwtSvc as any, undefined as any, undefined);

@@ -1,6 +1,5 @@
 import { Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import * as jwt from 'jsonwebtoken';
 import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
@@ -27,6 +26,9 @@ export class HealthProbeService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
+    // Kling снят 22.10.2026, его проба тоже. Строку статуса убираем, иначе она
+    // навсегда застынет с последним «healthy» и будет попадать в ответы поддержки.
+    this.pg.query(`DELETE FROM service_health WHERE service = 'kling'`).catch(() => {});
     // Run once on boot so the table is populated immediately.
     setTimeout(() => this.runAll().catch(() => {}), 3000);
   }
@@ -38,7 +40,6 @@ export class HealthProbeService implements OnModuleInit {
       this.probeNeo4j(),
       this.probeAnthropic(),
       this.probeOpenRouter(),
-      this.probeKling(),
     ]);
     await Promise.all(probes.map((p) => this.persist(p)));
   }
@@ -194,41 +195,6 @@ export class HealthProbeService implements OnModuleInit {
       };
     } catch (e: any) {
       return { service: 'openrouter', status: 'down', latencyMs: null, lastError: e.message };
-    }
-  }
-
-  private async probeKling(): Promise<ProbeResult> {
-    const ak = process.env.KLING_ACCESS_KEY;
-    const sk = process.env.KLING_SECRET_KEY;
-    if (!ak || !sk) {
-      return { service: 'kling', status: 'unknown', latencyMs: null, lastError: 'no Kling credentials' };
-    }
-    const t0 = Date.now();
-    try {
-      const now = Math.floor(Date.now() / 1000);
-      const token = jwt.sign(
-        { iss: ak, exp: now + 1800, nbf: now - 5 },
-        sk,
-        { algorithm: 'HS256', header: { alg: 'HS256', typ: 'JWT' } as any },
-      );
-      // List tasks endpoint — cheap and returns 200 with auth
-      const res = await axios.get('https://api.klingai.com/v1/videos/text2video?pageNum=1&pageSize=1', {
-        headers: { Authorization: `Bearer ${token}` },
-        timeout: 8000,
-      });
-      const ok = res.status >= 200 && res.status < 300;
-      const lat = Date.now() - t0;
-      return {
-        service: 'kling',
-        status: ok ? (lat > 5000 ? 'degraded' : 'healthy') : 'degraded',
-        latencyMs: lat,
-        lastError: ok ? null : `status ${res.status}`,
-      };
-    } catch (e: any) {
-      const lat = Date.now() - t0;
-      // Kling auth errors → still counts as reachable
-      const status = axios.isAxiosError(e) && e.response?.status === 401 ? 'degraded' : 'down';
-      return { service: 'kling', status, latencyMs: lat, lastError: e.message };
     }
   }
 }

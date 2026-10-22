@@ -1,6 +1,5 @@
 // src/chat/chat-tools.ts
 import { Injectable, Logger } from '@nestjs/common';
-import { KlingService } from '../misc/kling.service';
 import { MiscService } from '../misc/misc.service';
 import { PgService } from '../common/services/pg.service';
 import { VideoService, InsufficientTokensError } from '../video/video.service';
@@ -121,28 +120,23 @@ export const CHAT_TOOLS = [
   {
     name: 'generate_video',
     description:
-      'Генерация видео. ВАЖНО про взаимодействие:\n' +
-      '• Если пользователь не указал движок/тип явно — СНАЧАЛА коротко предложи выбор: «Veo 3.1 — говорящая голова/речь/из портрета, до 60с» или «Kling — сцены и анимация». Не запускай генерацию вслепую, дождись выбора (или явного «на твоё усмотрение»).\n' +
+      'Генерация видео (Veo 3.1, со звуком). ВАЖНО про взаимодействие:\n' +
       '• НИКОГДА не пиши и не придумывай ссылку на готовое видео сам — оно появляется у пользователя автоматически отдельной карточкой-плеером. Не вставляй URL вида /static/videos/... .\n' +
       '• Если инструмент вернул ошибку (например, дневной лимит Veo) — просто передай текст ошибки пользователю и НЕ давай никакой ссылки. Не выдумывай, что видео «готовится», если была ошибка.\n' +
-      'ДВА движка — выбирай по задаче через поле model:\n' +
-      '• Veo 3.1 (model="veo-3.1-fast", или "veo-3.1" для макс. качества) — БЕРИ ЕГО, когда пользователю нужна «говорящая голова» / человек, говорящий в камеру / видео из его ПОРТРЕТА / синхронная озвучка-реплика, особенно длиннее ~10с. Реплику/речь пиши ПРЯМО в prompt — Veo сам произносит её с синхронными губами (нативный звук, отдельный аудио-шаг не нужен). Одно непрерывное видео до 60с (targetDurationSec). Портрет — передай sourceImageUrl + mode="image2video" (без портрета — mode="text2video"). У Veo НЕ используются quality / cameraType / duration 5-10.\n' +
+      'Модель: model="veo-3.1-fast" (по умолчанию) или "veo-3.1" для макс. качества (дороже). Veo подходит и для «говорящей головы» / человека, говорящего в камеру / видео из ПОРТРЕТА, и для сцен без речи. Реплику/речь пиши ПРЯМО в prompt — Veo сам произносит её с синхронными губами (нативный звук, отдельный аудио-шаг не нужен). Одно непрерывное видео до 60с (targetDurationSec, по умолчанию 8). Портрет или картинка — передай sourceImageUrl + mode="image2video" (без картинки — mode="text2video").\n' +
       '  ВАЖНО про длину речи: текст реплики должен СООТВЕТСТВОВАТЬ targetDurationSec. Ориентир — ~2–3 коротких предложения речи на каждые 8 секунд (≈20–25 слов / 8с). Для 24с дай ~6–9 предложений, для 16с — ~4–6. Если реплика короткая, а видео длинное — речь прозвучит один раз, а остаток будет естественная пауза (НЕ повтор). Поэтому либо напиши достаточно текста под нужную длину, либо подбери targetDurationSec под реальную длину реплики. Не проси длинное видео под одну короткую фразу.\n' +
-      '• Kling (model="kling-v1-6", "kling-v2-master" премиум) — универсальная генерация сцен/анимации без обязательной речи. Дешевле Veo, поэтому проси его явно, когда речь не нужна и хватает 5–10с. До 10с одним вызовом; длиннее — targetDurationSec (5–60), под капотом base 10s + N×extend 5s + ffmpeg-склейка. Для mode="text2video" без sourceImageUrl сначала генерируется стилл через Nano Banana (+5000 токенов). Есть картинка — sourceImageUrl + mode="image2video".\n' +
-      'Стоимость считается автоматически по движку и длине. Long-form (targetDurationSec) — только text2video / image2video.',
+      'Продлить готовый ролик или наложить на него чужую озвучку (lipsync) нельзя — таких режимов нет. Стоимость считается автоматически по модели и длине.',
     input_schema: {
       type: 'object',
       properties: {
-        mode: { type: 'string', enum: ['text2video', 'image2video', 'extend', 'lipsync'] },
+        mode: { type: 'string', enum: ['text2video', 'image2video'] },
         prompt: { type: 'string' },
-        model: { type: 'string', enum: ['kling-v1-6', 'kling-v2-master', 'veo-3.1-fast', 'veo-3.1'], default: 'veo-3.1-fast' },
-        quality: { type: 'string', enum: ['std', 'pro'], default: 'std' },
-        duration: { type: 'number', enum: [5, 10], default: 5 },
+        model: { type: 'string', enum: ['veo-3.1-fast', 'veo-3.1'], default: 'veo-3.1-fast' },
         targetDurationSec: {
           type: 'number',
           minimum: 5,
           maximum: 60,
-          description: 'Final video length in seconds. Use when user wants > 10s; backend chains extends and concats. Only valid for text2video / image2video.',
+          description: 'Final video length in seconds (default 8). Veo renders an 8s base and extends it in 7s steps; the result is trimmed to exactly this length.',
         },
         sourceImageUrl: { type: 'string' },
         sourceImageUrls: {
@@ -160,15 +154,9 @@ export const CHAT_TOOLS = [
           enum: ['720p', '1080p'],
           description: 'Veo only. 1080p — выше детализация (кожа/поры), дефолт. 720p — быстрее/легче. Extend-сегменты всегда 720p (ограничение Veo), поэтому 1080p эффективнее на роликах ≤8с.',
         },
-        sourceVideoId: { type: 'string' },
-        cameraType: {
-          type: 'string',
-          enum: ['simple', 'down_back', 'forward_up', 'right_turn_forward', 'left_turn_forward'],
-        },
-        cameraConfig: { type: 'object' },
         negativePrompt: { type: 'string' },
       },
-      required: ['mode'],
+      required: ['mode', 'prompt'],
     },
   },
   {
@@ -481,7 +469,6 @@ export class ChatToolsService {
   private readonly logger = new Logger(ChatToolsService.name);
 
   constructor(
-    private readonly kling: KlingService,
     private readonly misc: MiscService,
     private readonly pg: PgService,
     private readonly video: VideoService,
@@ -691,8 +678,8 @@ export class ChatToolsService {
       }
 
       if (name === 'generate_video') {
-        // Auto-chain (text2video → image+image2video) теперь живёт в VideoService.createJob,
-        // чтобы и UI-форма /webhook/video/jobs, и MCP-инструмент отрабатывали одинаково.
+        // Тот же VideoService.createJob, что у формы /webhook/video/jobs, — чтобы
+        // и форма, и инструмент чата отрабатывали одинаково.
         const dto = input as CreateVideoJobDto;
         const r = await this.video.createJob(userId, dto);
         return {
@@ -701,7 +688,6 @@ export class ChatToolsService {
           jobId: r.jobId,
           status: r.status,
           tokensSpent: r.tokensSpent,
-          ...(r.stillImageUrl ? { stillImageUrl: r.stillImageUrl, imageTokensSpent: r.imageTokensSpent ?? 0 } : {}),
         };
       }
 

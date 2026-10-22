@@ -125,7 +125,6 @@ function makeHarness(opts: { deltas: string[]; clips: ClipSpec[]; userId?: strin
   const svc = new ChatService(
     pg as any,
     null as any,      // neo4j
-    null as any,      // kling
     null as any,      // tools
     null as any,      // claudeCli
     language as any,  // language

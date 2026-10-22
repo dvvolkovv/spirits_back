@@ -59,7 +59,7 @@ function makeService() {
   const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
   const balanceCtx = { buildContextForPrompt: jest.fn(async () => '') };
   const svc = new ChatService(
-    pg as any, undefined as any, undefined as any, {} as any, claudeCli as any, language as any, balanceCtx as any,
+    pg as any, undefined as any, {} as any, claudeCli as any, language as any, balanceCtx as any,
   );
   jest.spyOn(svc as any, 'resolveAgent').mockResolvedValue({
     id: 3, name: 'Маша', description: 'Игропрактик', system_prompt: 'Ты Маша.', category: 'personal',

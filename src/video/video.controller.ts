@@ -90,23 +90,4 @@ export class VideoController {
     );
     return { url };
   }
-
-  @Post('upload-audio')
-  @UseGuards(JwtGuard)
-  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 20 * 1024 * 1024 } }))
-  async uploadAudio(
-    @CurrentUser() user: any,
-    @Req() req: Request,
-    @UploadedFile() file: Express.Multer.File,
-  ) {
-    await this.limiter.check(req.ip || 'unknown', 'video-upload', 60, 60);
-    const url = await this.video.uploadUserAsset(
-      user.userId,
-      'audio',
-      file.buffer,
-      file.mimetype,
-      file.originalname,
-    );
-    return { url };
-  }
 }

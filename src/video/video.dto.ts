@@ -1,37 +1,31 @@
 // src/video/video.dto.ts
-import { IsString, IsOptional, IsNumber, IsIn, IsObject, IsArray, IsBoolean, Min, Max } from 'class-validator';
+import { IsString, IsOptional, IsNumber, IsIn, IsArray, IsBoolean, Min, Max } from 'class-validator';
 
-export type VideoMode = 'text2video' | 'image2video' | 'extend' | 'lipsync';
-export type VideoModel = 'kling-v1-6' | 'kling-v2-master' | 'veo-3.1-fast' | 'veo-3.1';
-export type VideoQuality = 'std' | 'pro';
+// Единственный движок — Veo 3.1 (Google): long-form talking-head with native
+// audio + portrait consistency, via the Gemini Developer API. backlog a0132032.
+// Kling снят 22.10.2026 вместе с режимами extend и lipsync: в старых строках
+// video_jobs они остаются как история, новых таких задач нет.
+export type VideoMode = 'text2video' | 'image2video';
+export type VideoModel = 'veo-3.1-fast' | 'veo-3.1';
 
-// Veo 3.1 (Google) — long-form talking-head with native audio + portrait
-// consistency, via the Gemini Developer API. backlog a0132032.
 export const VEO_MODELS: VideoModel[] = ['veo-3.1-fast', 'veo-3.1'];
 export function isVeoModel(model: string): boolean {
   return (VEO_MODELS as string[]).includes(model);
 }
-export function veoTier(model: VideoModel): 'fast' | 'standard' {
+export function veoTier(model: string): 'fast' | 'standard' {
   return model === 'veo-3.1' ? 'standard' : 'fast';
 }
 export type VideoStatus = 'pending' | 'processing' | 'ready' | 'failed';
 
 export class CreateVideoJobDto {
-  @IsIn(['text2video', 'image2video', 'extend', 'lipsync'])
+  @IsIn(['text2video', 'image2video'])
   mode!: VideoMode;
 
-  @IsOptional() @IsIn(['kling-v1-6', 'kling-v2-master', 'veo-3.1-fast', 'veo-3.1'])
+  @IsOptional() @IsIn(['veo-3.1-fast', 'veo-3.1'])
   model?: VideoModel;
 
-  @IsOptional() @IsIn(['std', 'pro'])
-  quality?: VideoQuality;
-
-  @IsOptional() @IsIn([5, 10])
-  duration?: 5 | 10;
-
-  // Composed long-form video. When > 10, backend plans a chain of Kling
-  // calls (base 10s + N × extend 5s) and ffmpeg-concats the result down to
-  // exactly this duration. Only valid for text2video / image2video.
+  // Длина ролика. Veo генерирует базу 8с и продлевает её по 7с (или клеит
+  // 8с-клипы для 9:16), итог режется ровно до этой длины. По умолчанию 8.
   @IsOptional() @IsNumber() @Min(5) @Max(60)
   targetDurationSec?: number;
 
@@ -53,9 +47,6 @@ export class CreateVideoJobDto {
   @IsOptional() @IsIn(['720p', '1080p'])
   resolution?: '720p' | '1080p';
 
-  @IsOptional() @IsNumber() @Min(0) @Max(1)
-  cfgScale?: number;
-
   @IsOptional() @IsString()
   sourceImageUrl?: string;
 
@@ -63,18 +54,6 @@ export class CreateVideoJobDto {
   // лица с несколькими ракурсами (фидбэк katya). Приоритетнее sourceImageUrl.
   @IsOptional() @IsArray() @IsString({ each: true })
   sourceImageUrls?: string[];
-
-  @IsOptional() @IsString()
-  sourceVideoId?: string;
-
-  @IsOptional() @IsIn(['simple','down_back','forward_up','right_turn_forward','left_turn_forward'])
-  cameraType?: string;
-
-  @IsOptional() @IsObject()
-  cameraConfig?: Record<string, number>;
-
-  @IsOptional() @IsString()
-  audioUrl?: string;
 
   // «Голосом оригинала» (96cba3f7): только Veo. После генерации финальная
   // аудиодорожка заменяется на голос пользователя (clone + speech-to-speech),
@@ -87,10 +66,10 @@ export interface ComposedPlan {
   target_duration_sec: number;
   segments_total: number;
   segments_done: number;
-  segment_kling_video_ids: string[];
+  segment_kling_video_ids: string[];   // имя историческое; у Veo — id сегментов
   segment_video_urls: string[];
   // --- Veo provider (native extend chain — one continuous video, no concat) ---
-  provider?: 'kling' | 'veo';
+  provider?: 'kling' | 'veo';   // 'kling' — только в старых строках
   veo_tier?: 'fast' | 'standard';
   veo_aspect_ratio?: '16:9' | '9:16';   // формат базы (extend наследует)
   veo_resolution?: '720p' | '1080p';    // разрешение базы (extend всегда 720p)
@@ -108,7 +87,7 @@ export interface ComposedPlan {
   veo_segment_prompts?: string[];
   // Retry counter for the segment currently in flight. Reset to 0 every
   // time a segment finishes successfully; bumped when we re-submit after
-  // a transient Kling error (e.g. "Internal error"). Capped server-side.
+  // a transient error. Capped server-side.
   current_segment_attempt?: number;
   // Retry counter for TRANSIENT Veo operation-result errors (operation accepted
   // ok, но рендеринг упал с "internal server issue" / 500 — Google просит
@@ -116,16 +95,18 @@ export interface ComposedPlan {
   // старте extend в Phase 2 и не накапливался бы. Сбрасывается при успехе сегмента.
   veo_op_retries?: number;
   // ISO timestamp set when concat starts. Used as an optimistic lock so a
-  // concurrent poller tick can't enter composeFinalVideo for the same job.
+  // concurrent poller tick can't enter composeVeoClips for the same job.
   concat_started_at?: string;
 }
 
+// Строка video_jobs. mode и model — строки, а не VideoMode/VideoModel: в
+// истории остались задачи Kling (kling-v1-6, extend, lipsync).
 export interface VideoJobRow {
   id: string;
   user_id: string;
-  mode: VideoMode;
-  model: VideoModel;
-  quality: VideoQuality;
+  mode: string;
+  model: string;
+  quality: string;
   duration_sec: number;
   prompt: string | null;
   negative_prompt: string | null;
@@ -136,7 +117,7 @@ export interface VideoJobRow {
   camera_config: Record<string, any> | null;
   audio_url: string | null;
   tokens_spent: number;
-  kling_task_id: string | null;
+  kling_task_id: string | null;   // имя историческое; у Veo — имя операции
   status: VideoStatus;
   video_url: string | null;
   thumbnail_url: string | null;
@@ -146,69 +127,6 @@ export interface VideoJobRow {
   target_duration_sec: number | null;
   composed_plan: ComposedPlan | null;
   own_voice?: boolean;
-}
-
-export const VIDEO_PRICING: Record<string, number> = {
-  'text2video.kling-v1-6.std.5':  25000,
-  'text2video.kling-v1-6.std.10': 50000,
-  'text2video.kling-v1-6.pro.5':  50000,
-  'text2video.kling-v1-6.pro.10': 100000,
-  'text2video.kling-v2-master.std.5':  150000,
-  'text2video.kling-v2-master.std.10': 300000,
-  'text2video.kling-v2-master.pro.5':  150000,
-  'text2video.kling-v2-master.pro.10': 300000,
-  'image2video.kling-v1-6.std.5':  25000,
-  'image2video.kling-v1-6.std.10': 50000,
-  'image2video.kling-v1-6.pro.5':  50000,
-  'image2video.kling-v1-6.pro.10': 100000,
-  'image2video.kling-v2-master.std.5':  150000,
-  'image2video.kling-v2-master.std.10': 300000,
-  'image2video.kling-v2-master.pro.5':  150000,
-  'image2video.kling-v2-master.pro.10': 300000,
-  'extend.kling-v1-6.std.5':  25000,
-  'extend.kling-v1-6.pro.5':  50000,
-  'extend.kling-v2-master.std.5':  150000,
-  'extend.kling-v2-master.pro.5':  150000,
-  'lipsync.kling-v1-6.std.5':  15000,
-  'lipsync.kling-v1-6.std.10': 15000,
-};
-
-export function computeTokenCost(mode: VideoMode, model: VideoModel, quality: VideoQuality, duration: 5|10): number {
-  const key = `${mode}.${model}.${quality}.${duration}`;
-  const v = VIDEO_PRICING[key];
-  if (v == null) throw new Error(`Unsupported combination: ${key}`);
-  return v;
-}
-
-// Plan a composed long-form video. Base = 10s, each extend = +5s.
-// Returns total cost and segment count. The final video gets ffmpeg-trimmed
-// to targetDurationSec on assembly, so the user-requested length is exact.
-export interface ComposedQuote {
-  segments: number;          // total Kling calls (1 base + N extends)
-  rawDurationSec: number;    // sum of generated seconds, before trim
-  totalCost: number;         // tokens
-  baseCost: number;
-  extendUnitCost: number;
-}
-
-export function computeComposedQuote(
-  mode: 'text2video' | 'image2video',
-  model: VideoModel,
-  quality: VideoQuality,
-  targetDurationSec: number,
-): ComposedQuote {
-  const baseDuration = 10;
-  const extendDuration = 5;
-  const baseCost   = computeTokenCost(mode, model, quality, baseDuration);
-  const extendUnit = computeTokenCost('extend', model, quality, extendDuration);
-  const extendCount = Math.ceil(Math.max(0, targetDurationSec - baseDuration) / extendDuration);
-  return {
-    segments: 1 + extendCount,
-    rawDurationSec: baseDuration + extendCount * extendDuration,
-    baseCost,
-    extendUnitCost: extendUnit,
-    totalCost: baseCost + extendCount * extendUnit,
-  };
 }
 
 // Veo 3.1 quote: base 8s + N×7s native extends, output trimmed to target.

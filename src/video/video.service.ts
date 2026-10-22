@@ -7,20 +7,15 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import { RedisService } from '../common/services/redis.service';
 import { sendTelegramAlert } from '../common/telegram-alert';
-import { KlingService } from '../misc/kling.service';
-import { MiscService } from '../misc/misc.service';
 import { VeoService } from '../misc/veo.service';
 import {
-  CreateVideoJobDto, VideoJobRow, ComposedPlan, computeTokenCost, computeComposedQuote,
-  VideoMode, VideoModel, VideoQuality,
+  CreateVideoJobDto, VideoJobRow, ComposedPlan, VideoModel,
   isVeoModel, veoTier, computeVeoQuote, computeVeoConcatQuote, computeOwnVoiceSurcharge,
 } from './video.dto';
 import { VoiceAvatarService } from '../voice-avatar/voice-avatar.service';
 import { assertFetchableMedia, fetchMediaBytes } from '../common/net/own-media';
 import { isUnsafeUrlError } from '../common/net/safe-fetch';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, CreateBucketCommand, PutBucketPolicyCommand } from '@aws-sdk/client-s3';
-import { Upload } from '@aws-sdk/lib-storage';
-import axios from 'axios';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -86,20 +81,17 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
 
   constructor(
     private readonly pg: PgService,
-    private readonly kling: KlingService,
-    private readonly misc: MiscService,
     private readonly veo: VeoService,
     private readonly voice: VoiceAvatarService,
     @Optional() private readonly redis?: RedisService,
   ) {}
 
   /**
-   * Отказы провайдеров, которые означают «кончились деньги», а не сбой рендера.
-   * Kling отвечает `code 1102 Account balance not enough`, Google — 429 с
-   * исчерпанной квотой.
+   * Отказы провайдера, которые означают «кончились деньги», а не сбой рендера:
+   * Google отвечает 429 с исчерпанной квотой.
    */
   private static readonly PROVIDER_OUT_OF_MONEY =
-    /balance not enough|insufficient balance|exceeded your current quota|insufficient_quota|"code"\s*:\s*1102|code 1102/i;
+    /insufficient balance|exceeded your current quota|insufficient_quota/i;
 
   /** Метка «видео сломано деньгами». Без TTL: снимается только починкой. */
   private static readonly PROVIDER_BROKEN_KEY = 'video:provider-broken-since';
@@ -147,67 +139,6 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** За сколько дней до сгорания пакета начинать предупреждать. */
-  private static readonly PACK_EXPIRY_WARN_DAYS = 3;
-
-  /**
-   * Модель, когда запрос её не назвал.
-   *
-   * Veo — основной движок: он тянет почти всю нагрузку и не зависит от
-   * сгорающих пакетов Kling. Но умеет он только text2video и image2video,
-   * поэтому lipsync и extend остаются за Kling.
-   */
-  private static defaultModelFor(mode: VideoMode): VideoModel {
-    return mode === 'lipsync' || mode === 'extend' ? 'kling-v1-6' : 'veo-3.1-fast';
-  }
-
-  /**
-   * Сторож срока пакета Kling.
-   *
-   * Пакеты у них с датой сгорания, и остаток в этот момент просто аннулируется:
-   * `Trial-Video-100Units-5Con-1Months` куплен 13.07.2026, истёк 12.08 с
-   * остатком 94 из 100 — то есть 94% денег ушло в срок годности. Отказы
-   * `1102` начались 13.08, и неделю никто не знал.
-   *
-   * Реактивная тревога ловит поломку уже случившейся; этот сторож должен
-   * успевать раньше. Отсюда два разных сообщения: «скоро сгорит» и «активного
-   * пакета нет».
-   *
-   * `now` параметром — чтобы тест не зависел от часов машины.
-   */
-  @Cron('0 20 6 * * *') // ежедневно 06:20 UTC, со смещением от других кронов
-  async checkKlingPackExpiry(now: number = Date.now()): Promise<void> {
-    try {
-      const packs = await this.kling?.getResourcePacks?.();
-      // null — спросить не удалось. Молчим: недоступность их API это не повод
-      // будить владельца сообщением про деньги.
-      if (!packs) return;
-
-      const alive = packs.filter((p) => p.status === 'online' && p.expiresAt > now);
-      if (alive.length === 0) {
-        await sendTelegramAlert(
-          `🎬📦 Kling: нет активного пакета — видео работать не будет.\n\n` +
-          `Последние пакеты: ${packs.map((p) => `${p.name} (${p.status}, остаток ${p.remaining}/${p.total})`).join('; ').slice(0, 300)}`,
-        );
-        return;
-      }
-
-      const soonest = alive.reduce((a, b) => (a.expiresAt <= b.expiresAt ? a : b));
-      const daysLeft = (soonest.expiresAt - now) / (24 * 3600 * 1000);
-      if (daysLeft > VideoService.PACK_EXPIRY_WARN_DAYS) return;
-
-      const date = new Date(soonest.expiresAt).toISOString().slice(0, 16).replace('T', ' ');
-      await sendTelegramAlert(
-        `🎬⏳ Kling: пакет сгорает ${date} UTC (через ${Math.floor(daysLeft)} д.).\n\n` +
-        `Остаток ${soonest.remaining} из ${soonest.total} юнитов — после этой даты он аннулируется, ` +
-        `и видео встанет с «Account balance not enough».\n\n` +
-        `В прошлый раз так сгорело 94 юнита из 100.`,
-      );
-    } catch (e: any) {
-      this.logger.warn(`проверка срока пакета Kling не удалась: ${e.message}`);
-    }
-  }
-
   /**
    * Пометить, что видео сломано деньгами провайдера.
    *
@@ -230,12 +161,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       if (!VideoService.PROVIDER_OUT_OF_MONEY.test(String(reason))) return;
       if (!this.redis) return;
       if (await this.redis.get(VideoService.PROVIDER_BROKEN_KEY)) return;
-      // Провайдера запоминаем: пополненный счёт Kling не должен снимать метку,
-      // поставленную исчерпанной квотой Google.
-      const provider = /kling/i.test(reason) ? 'kling' : /veo|quota/i.test(reason) ? 'veo' : 'unknown';
       await this.redis.set(
         VideoService.PROVIDER_BROKEN_KEY,
-        JSON.stringify({ since: Date.now(), provider }),
+        JSON.stringify({ since: Date.now(), provider: 'veo' }),
       );
       this.logger.warn(`видео сломано деньгами провайдера: ${String(reason).slice(0, 200)}`);
     } catch (e: any) {
@@ -270,10 +198,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
    * не вспоминал о поломке. Это напоминание висит на метке, а не на потоке
    * задач, поэтому молчать из-за отсутствия попыток не может.
    *
-   * Перед каждым повтором спрашиваем провайдера напрямую: если счёт уже
-   * пополнен, метку снимаем сами. Иначе после тихой починки (пополнили, но
-   * видео никто не заказывал — успешной задачи, которая снимает метку, просто
-   * нет) напоминание бубнило бы вечно.
+   * Снимает метку только успешная задача (checkProviderRecovered): спросить
+   * квоту Google напрямую нечем. Метки Kling — наследие снятого провайдера,
+   * их убираем молча: напоминать о нём больше незачем.
    */
   @Cron('0 40 */12 * * *') // каждые 12 часов
   async remindProviderStillBroken(now: number = Date.now()): Promise<void> {
@@ -288,18 +215,8 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
-      // null от getResourcePacks = спросить не удалось. Тогда считаем, что
-      // всё ещё сломано: молчание было бы худшей ошибкой, чем лишний повтор.
-      const packs = await this.kling?.getResourcePacks?.();
-      const klingAlive = Array.isArray(packs)
-        && packs.some((p) => p.status === 'online' && p.expiresAt > now && p.remaining > 0);
-
-      if (klingAlive && marker.provider !== 'veo') {
+      if (marker.provider === 'kling') {
         await this.redis.del(VideoService.PROVIDER_BROKEN_KEY);
-        await sendTelegramAlert(
-          `🎬✅ Kling: счёт пополнен, тревога снята.\n\n` +
-          `Видео снова должно работать — простой длился ${VideoService.humanDuration(now - marker.since)}.`,
-        );
         return;
       }
 
@@ -322,237 +239,13 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   async createJob(
     userId: string,
     dto: CreateVideoJobDto,
-  ): Promise<{ jobId: string; status: string; tokensSpent: number; stillImageUrl?: string; imageTokensSpent?: number }> {
-    // Veo 3.1 (Google) is a separate provider — long-form talking head with
-    // native audio + portrait, one continuous video (no Kling auto-still /
-    // ffmpeg concat). Route before any Kling-specific setup.
-    //
-    // Модель по умолчанию — Veo, и только для text2video / image2video.
-    // Причина: Kling за три месяца дал 8 генераций против ~56 у Veo, но стоял
-    // дефолтом, поэтому сгоревший пакет Kling ломал именно дефолтный путь —
-    // и простой 13–20.08.2026 остался незамеченным, ведь Veo всё это время
-    // работал. Режимы lipsync и extend есть только у Kling (lipsync требует
-    // kling-v1-6), им дефолт не меняем: иначе запрос без модели уходил бы в
-    // Veo и падал на «Veo supports mode text2video or image2video».
-    const requestedModel = dto.model ?? VideoService.defaultModelFor(dto.mode);
-    if (isVeoModel(requestedModel)) {
-      return this.createVeoJob(userId, { ...dto, model: requestedModel });
-    }
-
-    // Auto-chain: text2video без sourceImageUrl → сначала Nano Banana (std),
-    // потом image2video на сгенерированной картинке. Image2video у Kling даёт
-    // стабильно лучше композицию и меньше «шевелится фон», чем text2video.
-    // Цепочка живёт здесь (в сервисе), чтобы и UI-форма /webhook/video/jobs,
-    // и MCP-инструмент generate_video из чата отрабатывали одинаково.
-    let autoStillUrl: string | undefined;
-    let autoStillTokens = 0;
-    if (dto.mode === 'text2video' && !dto.sourceImageUrl) {
-      const imgPrompt = String(dto.prompt ?? '').slice(0, 2000);
-      if (!imgPrompt) throw new BadRequestException('text2video requires prompt');
-      const imgResult = await this.misc.generateImage(userId, { prompt: imgPrompt, quality: 'std' });
-      const imgUrl = imgResult?.images?.[0]?.url;
-      if (!imgUrl) throw new Error('auto image step failed (no url)');
-      autoStillUrl = imgUrl;
-      autoStillTokens = Number(imgResult.tokensSpent || 0);
-      dto = { ...dto, mode: 'image2video', sourceImageUrl: imgUrl };
-    }
-
-    const mode = dto.mode;
-    // Veo models already returned above, so this path is Kling-only.
-    const model = (dto.model ?? 'kling-v1-6') as 'kling-v1-6' | 'kling-v2-master';
-    const quality = (dto.quality ?? 'std') as VideoQuality;
-
-    // --- composed long-form video planning ---
-    // When the user asks for > 10s, we chain a base 10s + N × extend 5s and
-    // ffmpeg-concat. Only text2video and image2video are valid entry modes.
-    let composedTarget: number | null = null;
-    let composedPlan: ComposedPlan | null = null;
-    if (typeof dto.targetDurationSec === 'number' && dto.targetDurationSec > 10) {
-      if (mode !== 'text2video' && mode !== 'image2video') {
-        throw new BadRequestException('long video requires mode text2video or image2video');
-      }
-      if (dto.targetDurationSec > 60) {
-        throw new BadRequestException('long video max length is 60 seconds');
-      }
-      composedTarget = Math.round(dto.targetDurationSec);
-      const quote = computeComposedQuote(mode, model, quality, composedTarget);
-      composedPlan = {
-        target_duration_sec: composedTarget,
-        segments_total: quote.segments,
-        segments_done: 0,
-        segment_kling_video_ids: [],
-        segment_video_urls: [],
-      };
-    }
-    const duration = composedPlan ? 10 : ((dto.duration ?? 5) as 5 | 10);
-
-    // --- mode-specific validation ---
-    if (mode === 'image2video' && !dto.sourceImageUrl) {
-      throw new BadRequestException('image2video requires sourceImageUrl');
-    }
-    if ((mode === 'extend' || mode === 'lipsync') && !dto.sourceVideoId) {
-      throw new BadRequestException(`${mode} requires sourceVideoId`);
-    }
-    if (mode === 'lipsync' && model !== 'kling-v1-6') {
-      throw new BadRequestException('lip-sync is supported only on kling-v1-6');
-    }
-    if (mode === 'extend' && duration !== 5) {
-      throw new BadRequestException('extend always produces 5s');
-    }
-
-    // --- ownership check for source video ---
-    // On successful jobs we overwrite kling_task_id with the Kling-side video_id (done in pollJob, future task)
-    // so we can reuse it here as the upstream id for extend/lipsync.
-    let sourceKlingVideoId: string | null = null;
-    if (dto.sourceVideoId) {
-      const row = await this.pg.query(
-        `SELECT id, user_id, status, kling_task_id, mode FROM video_jobs WHERE id = $1`,
-        [dto.sourceVideoId],
-      );
-      const src = row.rows[0] as VideoJobRow | undefined;
-      if (!src) throw new NotFoundException('source video not found');
-      if (src.user_id !== userId) throw new ForbiddenException('not your video');
-      if (src.status !== 'ready') throw new ConflictException('source video is not ready');
-      sourceKlingVideoId = src.kling_task_id;
-      if (!sourceKlingVideoId) throw new ConflictException('source video has no Kling id');
-    }
-
-    // --- concurrent-job guard ---
-    const active = await this.pg.query(
-      `SELECT COUNT(*)::int AS n FROM video_jobs WHERE user_id=$1 AND status IN ('pending','processing')`,
-      [userId],
-    );
-    if ((active.rows[0] as any).n >= this.MAX_CONCURRENT_PER_USER) {
-      throw new ConflictException('too many concurrent jobs — wait for one to finish');
-    }
-
-    // --- cost ---
-    // For composed jobs the entire planned chain is reserved up-front so the
-    // user can't run out of tokens mid-chain. On failure we refund this full
-    // amount (existing failAndRefund handles it via tokens_spent).
-    const cost = composedPlan
-      ? computeComposedQuote(mode as 'text2video' | 'image2video', model, quality, composedPlan.target_duration_sec).totalCost
-      : computeTokenCost(mode, model, quality, duration);
-
-    // --- normalize image URL to absolute (Kling rejects relative paths) ---
-    let imgUrlAbsolute: string | null = null;
-    if (mode === 'image2video' && dto.sourceImageUrl) {
-      let imgUrl = dto.sourceImageUrl;
-      if (imgUrl.startsWith('/')) {
-        const base = (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '');
-        imgUrl = base + imgUrl;
-      }
-      imgUrlAbsolute = imgUrl;
-    }
-
-    // --- transactional deduction + insert ---
-    const client = await this.pg.getClient();
-    let jobId: string;
-    try {
-      await client.query('BEGIN');
-
-      const balRes = await client.query(
-        `SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1 FOR UPDATE`,
-        [userId],
-      );
-      const balance = Number((balRes.rows[0] as any)?.tokens ?? 0);
-      if (balance < cost) {
-        await client.query('ROLLBACK');
-        throw new InsufficientTokensError(balance, cost);
-      }
-
-      // Через процедуру, а не прямым UPDATE: она пишет строку в
-      // token_transactions. Баланс проверен и строка взята под FOR UPDATE
-      // выше, поэтому частичное списание здесь исключено.
-      await client.query(
-        `SELECT consume_user_tokens($1, $2, $3, $4::jsonb)`,
-        [userId, cost, 'Генерация видео', JSON.stringify({ mode, model })],
-      );
-
-      const ins = await client.query(
-        `INSERT INTO video_jobs
-         (user_id, mode, model, quality, duration_sec, prompt, negative_prompt, cfg_scale,
-          source_image_url, source_video_id, camera_type, camera_config, audio_url, tokens_spent, status,
-          target_duration_sec, composed_plan, image_tokens_spent)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending',$15,$16,$17)
-         RETURNING id`,
-        [
-          userId, mode, model, quality, duration,
-          dto.prompt ?? null, dto.negativePrompt ?? null, dto.cfgScale ?? null,
-          imgUrlAbsolute ?? dto.sourceImageUrl ?? null, dto.sourceVideoId ?? null,
-          dto.cameraType ?? null,
-          dto.cameraConfig ? JSON.stringify(dto.cameraConfig) : null,
-          dto.audioUrl ?? null,
-          cost,
-          composedTarget,
-          composedPlan ? JSON.stringify(composedPlan) : null,
-          // Стоимость кадра-заготовки — чтобы возврат за провал вернул и её.
-          autoStillTokens,
-        ],
-      );
-      jobId = (ins.rows[0] as any).id as string;
-
-      await client.query('COMMIT');
-    } catch (e) {
-      try { await client.query('ROLLBACK'); } catch {}
-      throw e;
-    } finally {
-      client.release();
-    }
-
-    // --- call Kling (outside txn; failure => refund + mark failed) ---
-    try {
-      const cameraControl = dto.cameraType
-        ? { type: dto.cameraType, config: dto.cameraConfig }
-        : undefined;
-      let taskId: string;
-
-      if (mode === 'text2video') {
-        ({ taskId } = await this.kling.createText2VideoTask({
-          model, prompt: dto.prompt ?? '', negativePrompt: dto.negativePrompt,
-          cfgScale: dto.cfgScale, mode: quality, duration, cameraControl,
-        }));
-      } else if (mode === 'image2video') {
-        ({ taskId } = await this.kling.createImage2VideoTask({
-          model, imageUrl: imgUrlAbsolute!, prompt: dto.prompt,
-          negativePrompt: dto.negativePrompt, cfgScale: dto.cfgScale,
-          mode: quality, duration, cameraControl,
-        }));
-      } else if (mode === 'extend') {
-        ({ taskId } = await this.kling.createVideoExtendTask({
-          videoId: sourceKlingVideoId!, prompt: dto.prompt,
-          negativePrompt: dto.negativePrompt, cfgScale: dto.cfgScale,
-        }));
-      } else {
-        ({ taskId } = await this.kling.createLipSyncTask({
-          videoId: sourceKlingVideoId!,
-          audioUrl: dto.audioUrl,
-          audioType: dto.audioUrl ? 'url' : 'text',
-          text: dto.prompt,
-        }));
-      }
-
-      await this.pg.query(
-        `UPDATE video_jobs SET kling_task_id=$1, status='processing', updated_at=now() WHERE id=$2`,
-        [taskId, jobId],
-      );
-      return {
-        jobId,
-        status: 'processing',
-        tokensSpent: cost + autoStillTokens,
-        ...(autoStillUrl ? { stillImageUrl: autoStillUrl, imageTokensSpent: autoStillTokens } : {}),
-      };
-    } catch (e: any) {
-      this.logger.error(`createJob Kling error: ${e.message}`);
-      // Тот же путь, что у поздних провалов из поллера: помечает задачу,
-      // возвращает ролик вместе с кадром-заготовкой и не даёт вернуть дважды.
-      try {
-        await this.failAndRefund(jobId, userId, cost, `kling_create: ${String(e.message).slice(0, 480)}`);
-      } catch (err: any) {
-        this.logger.error(`refund txn failed: ${err.message}`);
-      }
-      throw new BadRequestException(`Kling rejected the request: ${e.message}`);
-    }
+  ): Promise<{ jobId: string; status: string; tokensSpent: number }> {
+    // Единственный движок — Veo 3.1 (Google): text2video и image2video,
+    // длинные ролики он собирает сам. Kling снят 22.10.2026 — провайдер вывел
+    // kling-v1-6 из эксплуатации, пакет сгорел, а живых роликов на нём с июля
+    // не было. Вместе с ним ушли режимы extend и lipsync: у Veo их нет, и
+    // createVeoJob отвечает на них 400 до списания токенов.
+    return this.createVeoJob(userId, { ...dto, model: dto.model ?? 'veo-3.1-fast' });
   }
 
   async getJob(userId: string, jobId: string): Promise<VideoJobRow> {
@@ -694,10 +387,10 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async expireStaleJobs() {
-    // Composed long-form jobs legitimately take much longer than 15 min
-    // (4 segments × ~8 min each). For them we allow 8 min per segment +
-    // 5 min for concat/upload, capped at 60 min hard ceiling.
-    // For simple jobs the original 15 min still applies.
+    // Long-form Veo jobs (a chain of segments) legitimately take longer than
+    // 15 min. For them we allow 8 min per segment + 5 min for concat/upload,
+    // capped at 60 min hard ceiling. Otherwise the original 15 min applies.
+    // The same timeout closes (with a refund) any non-Veo job left in flight.
     const stale = await this.pg.query(
       `SELECT id, user_id, tokens_spent, composed_plan,
               CASE
@@ -724,279 +417,10 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async pollJob(job: VideoJobRow) {
-    // Veo first — its chain has a "between segments" state with no in-flight
-    // operation (kling_task_id=null) that must still be polled to start the
-    // next extend once the prior clip is processed.
-    if (isVeoModel(job.model)) { await this.pollVeoJob(job); return; }
-    if (!job.kling_task_id) return;
-    // For composed jobs the current Kling call is a base text2video/image2video
-    // for segment 1, then a Kling 'extend' for segments 2..N. We query the
-    // matching path based on which segment is in flight.
-    const currentMode: VideoMode = job.composed_plan && job.composed_plan.segments_done > 0
-      ? 'extend'
-      : job.mode;
-    const res = await this.kling.getVideoTaskStatus(job.kling_task_id, currentMode);
-
-    if (res.status === 'succeed' && res.videoUrl) {
-      if (job.composed_plan) {
-        await this.advanceComposedJob(job, res.videoId ?? null, res.videoUrl);
-      } else {
-        await this.finalizeSimpleJob(job, res.videoId ?? null, res.videoUrl);
-      }
-    } else if (res.status === 'failed') {
-      if (job.composed_plan && this.isTransientKlingError(res.error)) {
-        const retried = await this.retryComposedSegment(job, res.error ?? '');
-        if (retried) return;
-      }
-      await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), res.error ?? 'failed');
-    }
-    // 'submitted' / 'processing' — no-op until next tick
-  }
-
-  // Kling extends sporadically fail with "Internal error" without any
-  // structural problem (verified twice in testing). One retry recovers
-  // most of these. We never retry the base segment — those failures are
-  // typically real (bad prompt, content moderation, etc.).
-  private readonly MAX_SEGMENT_RETRIES = 1;
-  private isTransientKlingError(msg: string | undefined): boolean {
-    if (!msg) return false;
-    return /internal error|timeout|rate limit|service unavailable|temporarily/i.test(msg);
-  }
-
-  private async retryComposedSegment(job: VideoJobRow, error: string): Promise<boolean> {
-    const plan = job.composed_plan!;
-    // Only retry mid-chain (after we already have at least one segment).
-    if (plan.segments_done === 0) return false;
-    const attempt = (plan.current_segment_attempt ?? 0) + 1;
-    if (attempt > this.MAX_SEGMENT_RETRIES) {
-      this.logger.warn(`Composed job ${job.id}: segment ${plan.segments_done + 1} exhausted retries (${attempt - 1})`);
-      return false;
-    }
-    const lastVideoId = plan.segment_kling_video_ids[plan.segment_kling_video_ids.length - 1];
-    if (!lastVideoId) return false;
-    try {
-      const { taskId } = await this.kling.createVideoExtendTask({
-        videoId: lastVideoId,
-        prompt: job.prompt ?? undefined,
-        negativePrompt: job.negative_prompt ?? undefined,
-        cfgScale: job.cfg_scale ?? undefined,
-      });
-      plan.current_segment_attempt = attempt;
-      await this.pg.query(
-        `UPDATE video_jobs SET kling_task_id=$1, composed_plan=$2, updated_at=now() WHERE id=$3`,
-        [taskId, JSON.stringify(plan), job.id],
-      );
-      this.logger.warn(`Composed job ${job.id}: segment ${plan.segments_done + 1} retry ${attempt}/${this.MAX_SEGMENT_RETRIES} after Kling error: ${error.slice(0, 100)}`);
-      return true;
-    } catch (e: any) {
-      this.logger.error(`Composed job ${job.id}: retry submission failed: ${e.message}`);
-      return false;
-    }
-  }
-
-  private async finalizeSimpleJob(job: VideoJobRow, klingVideoId: string | null, klingVideoUrl: string) {
-    // Rehost Kling → MinIO. Fallback на klingVideoUrl намеренно убран
-    // (2026-07-28): Kling CDN отдаёт 403 через ~месяц, а раньше fallback тихо
-    // сохранял её и задача помечалась ready — пользователь получал битую ссылку
-    // спустя недели. Если MinIO упал — задача считается провалившейся, токены
-    // возвращаются.
-    let finalVideoUrl: string;
-    let thumbUrl: string | null = null;
-    try {
-      finalVideoUrl = await this.rehostToS3(job.id, klingVideoUrl);
-    } catch (s3err: any) {
-      this.logger.error(`Video job ${job.id}: MinIO rehost failed: ${s3err.message}`);
-      await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent),
-        `rehost to MinIO failed: ${String(s3err.message).slice(0, 200)}`);
-      return;
-    }
-    try {
-      thumbUrl = await this.extractAndUploadThumbnail(job.id, finalVideoUrl);
-    } catch { /* thumbnail is nice-to-have */ }
-    await this.pg.query(
-      `UPDATE video_jobs
-          SET status='ready', video_url=$1, thumbnail_url=$2,
-              kling_task_id = COALESCE($3, kling_task_id),
-              updated_at=now()
-        WHERE id=$4`,
-      [finalVideoUrl, thumbUrl, klingVideoId, job.id],
-    );
-    this.logger.log(`Video job ${job.id} ready: ${finalVideoUrl}`);
-  }
-
-  private async advanceComposedJob(job: VideoJobRow, klingVideoId: string | null, klingVideoUrl: string) {
-    const plan: ComposedPlan = job.composed_plan!;
-    // Record the just-finished segment. Reset retry counter — the next
-    // segment starts with a clean budget.
-    plan.segment_kling_video_ids.push(klingVideoId ?? '');
-    plan.segment_video_urls.push(klingVideoUrl);
-    plan.segments_done += 1;
-    plan.current_segment_attempt = 0;
-
-    this.logger.log(`Composed job ${job.id}: segment ${plan.segments_done}/${plan.segments_total} done`);
-
-    if (plan.segments_done < plan.segments_total) {
-      // Fire the next extend. Kling extends always take a Kling video_id of
-      // the previous segment, not a public URL.
-      if (!klingVideoId) {
-        await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent),
-          'missing Kling video_id on intermediate segment');
-        return;
-      }
-      try {
-        const { taskId } = await this.kling.createVideoExtendTask({
-          videoId: klingVideoId,
-          prompt: job.prompt ?? undefined,
-          negativePrompt: job.negative_prompt ?? undefined,
-          cfgScale: job.cfg_scale ?? undefined,
-        });
-        await this.pg.query(
-          `UPDATE video_jobs SET kling_task_id=$1, composed_plan=$2, updated_at=now() WHERE id=$3`,
-          [taskId, JSON.stringify(plan), job.id],
-        );
-      } catch (e: any) {
-        this.logger.error(`Composed job ${job.id} extend failed at segment ${plan.segments_done}: ${e.message}`);
-        await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent),
-          `extend failed: ${String(e.message).slice(0, 200)}`);
-      }
-      return;
-    }
-
-    // All segments done — concat + trim + upload as the final job's video.
-    //
-    // Concurrency: pollJob is called every 5s for every 'processing' job.
-    // composeFinalVideo takes 30-120s (download segments + ffmpeg + S3 upload),
-    // so without a lock the next tick re-enters with the same job, both pollers
-    // download into the same tmpDir, the first one's `finally rmSync` nukes
-    // files the second one is about to read → ENOENT seg_NN.mp4 spam.
-    // We take an optimistic lock via composed_plan.concat_started_at and
-    // RETURNING — only the winner runs concat.
-    const lockRes = await this.pg.query(
-      `UPDATE video_jobs
-          SET composed_plan = composed_plan || jsonb_build_object('concat_started_at', to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"')),
-              updated_at = now()
-        WHERE id = $1
-          AND status = 'processing'
-          AND (composed_plan->>'concat_started_at') IS NULL
-        RETURNING id`,
-      [job.id],
-    );
-    if (lockRes.rowCount === 0) {
-      // Another tick already took the lock. Bail out — that tick will set
-      // status to ready/failed when it finishes.
-      this.logger.debug(`Composed job ${job.id}: concat already in flight, skipping`);
-      return;
-    }
-    try {
-      const targetSec = plan.target_duration_sec;
-      const finalUrl = await this.composeFinalVideo(job.id, plan.segment_video_urls, targetSec);
-      let thumbUrl: string | null = null;
-      try {
-        thumbUrl = await this.extractAndUploadThumbnail(job.id, finalUrl);
-      } catch { /* thumbnail is nice-to-have */ }
-      await this.pg.query(
-        `UPDATE video_jobs
-            SET status='ready', video_url=$1, thumbnail_url=$2,
-                composed_plan=$3, updated_at=now()
-          WHERE id=$4`,
-        [finalUrl, thumbUrl, JSON.stringify(plan), job.id],
-      );
-      this.logger.log(`Composed job ${job.id} ready (${targetSec}s, ${plan.segments_total} segments): ${finalUrl}`);
-    } catch (e: any) {
-      this.logger.error(`Composed job ${job.id} concat failed: ${e.message}`);
-      await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent),
-        `concat: ${String(e.message).slice(0, 200)}`);
-    }
-  }
-
-  // Download all Kling segments, ffmpeg-concat with normalization (scale +
-  // setsar + concat filter — robust to codec/timing/SAR differences between
-  // Kling base 10s and extend 5s outputs, where concat demuxer was failing
-  // with "Invalid data found when processing input"), trim to the exact
-  // target duration, upload to MinIO, return the public URL.
-  private async composeFinalVideo(jobId: string, segmentUrls: string[], targetDurationSec: number): Promise<string> {
-    const tmpDir = path.join(os.tmpdir(), `composed_${jobId}`);
-    fs.mkdirSync(tmpDir, { recursive: true });
-    try {
-      // 1. Download segments
-      const localPaths: string[] = [];
-      for (let i = 0; i < segmentUrls.length; i++) {
-        const dst = path.join(tmpDir, `seg_${String(i).padStart(2, '0')}.mp4`);
-        const resp = await axios.get(segmentUrls[i], { responseType: 'arraybuffer', timeout: 120000 });
-        fs.writeFileSync(dst, Buffer.from(resp.data));
-        localPaths.push(dst);
-      }
-
-      // 2. ffmpeg concat filter (NOT demuxer) — normalizes each segment to
-      // 1280x720 / yuv420p / SAR 1 / 30fps before concat. Audio is dropped
-      // because Kling base/extend videos are silent and adding an empty
-      // track here would just bloat output without value.
-      // The 16:9 1280×720 target matches Kling's default output; segments
-      // already at this size get a no-op scale.
-      const outPath = path.join(tmpDir, 'output.mp4');
-      const n = localPaths.length;
-      const filter =
-        localPaths.map((_, i) =>
-          `[${i}:v]scale=1280:720:force_original_aspect_ratio=decrease,` +
-          `pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,` +
-          `setsar=1,fps=30,format=yuv420p[v${i}]`,
-        ).join(';') +
-        ';' +
-        localPaths.map((_, i) => `[v${i}]`).join('') +
-        `concat=n=${n}:v=1:a=0[v]`;
-
-      await new Promise<void>((resolve, reject) => {
-        const args = [
-          '-y',
-          ...localPaths.flatMap((p) => ['-i', p]),
-          '-filter_complex', filter,
-          '-map', '[v]',
-          '-t', String(targetDurationSec),
-          '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-          '-pix_fmt', 'yuv420p',
-          '-movflags', '+faststart',
-          '-an',
-          outPath,
-        ];
-        const ff = spawn('ffmpeg', args);
-        let stderr = '';
-        ff.stderr.on('data', (d) => { stderr += d.toString(); });
-        ff.on('close', (code) => {
-          if (code === 0) return resolve();
-          // libx264 emits a wall of stats lines at the end of stderr that
-          // crowd out the actual error. Pull the most diagnostic lines
-          // (anything with "Error", "Invalid", "Conversion failed", "No such",
-          // "Cannot") to surface the real cause.
-          const errLines = stderr.split('\n')
-            .filter((l) => /error|invalid|cannot|no such|failed|unable/i.test(l) && !/^\[libx264/.test(l))
-            .slice(-8)
-            .join(' | ');
-          const msg = errLines || stderr.slice(-400);
-          reject(new Error(`ffmpeg exit ${code}: ${msg.slice(0, 400)}`));
-        });
-        ff.on('error', reject);
-      });
-
-      // 3. Persist the composed mp4 в MinIO — тот же путь, что и у simple
-      // jobs. Раньше composed писались в public/videos через Nginx /static/,
-      // потому что Yandex Object Storage тихо ронял загрузки; после миграции
-      // video.service на локальный MinIO (июнь 2026) обход больше не нужен.
-      await this.ensureBucket();
-      const key = `videos/${jobId}.mp4`;
-      const body = fs.createReadStream(outPath);
-      await new Upload({
-        client: this.s3,
-        params: {
-          Bucket: this.s3Bucket,
-          Key: key,
-          Body: body,
-          ContentType: 'video/mp4',
-        },
-      }).done();
-      return this.s3PublicUrl(key);
-    } finally {
-      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-    }
+    // Задачи других движков (Kling снят) здесь не опрашиваются: если такая
+    // осталась в работе, её закроет с возвратом expireStaleJobs.
+    if (!isVeoModel(job.model)) return;
+    await this.pollVeoJob(job);
   }
 
   /**
@@ -1048,36 +472,21 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     this.logger.warn(`Video job ${jobId} failed, refunded ${tokens} tokens: ${reason}`);
   }
 
-  private async rehostToS3(jobId: string, klingUrl: string): Promise<string> {
-    const resp = await axios.get(klingUrl, { responseType: 'stream', timeout: 120000 });
-    const key = `videos/${jobId}.mp4`;
-    await new Upload({
-      client: this.s3,
-      params: {
-        Bucket: this.s3Bucket,
-        Key: key,
-        Body: resp.data,
-        ContentType: 'video/mp4',
-      },
-    }).done();
-    return this.s3PublicUrl(key);
-  }
-
   async uploadUserAsset(
     userId: string,
-    kind: 'image' | 'audio',
+    kind: 'image',
     buffer: Buffer,
     mimeType: string,
     origName: string,
   ): Promise<string> {
-    const allowed = kind === 'image' ? /^image\//.test(mimeType) : /^audio\//.test(mimeType);
-    if (!allowed) throw new BadRequestException(`bad mime type for ${kind}: ${mimeType}`);
-    const maxBytes = kind === 'image' ? 10 * 1024 * 1024 : 20 * 1024 * 1024;
+    // Аудио принимали только под lipsync Kling — он снят вместе с режимом.
+    if (!/^image\//.test(mimeType)) throw new BadRequestException(`bad mime type for ${kind}: ${mimeType}`);
+    const maxBytes = 10 * 1024 * 1024;
     if (buffer.byteLength > maxBytes) {
       throw new BadRequestException(`file too large (max ${maxBytes / 1024 / 1024} MB)`);
     }
     const extMatch = origName.match(/\.([a-z0-9]{2,5})$/i);
-    const ext = extMatch ? extMatch[1].toLowerCase() : kind === 'image' ? 'jpg' : 'mp3';
+    const ext = extMatch ? extMatch[1].toLowerCase() : 'jpg';
     const key = `video-uploads/${userId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
     await this.ensureBucket();
     await this.s3.send(new PutObjectCommand({
@@ -1293,6 +702,11 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     dto: CreateVideoJobDto,
   ): Promise<{ jobId: string; status: string; tokensSpent: number }> {
     if (!this.veo.isConfigured()) throw new BadRequestException('Veo is not configured (GOOGLE_AI_API_KEY)');
+    // Внутренние вызовы (чат, TG-бот, поддержка) идут мимо валидации DTO, а
+    // модель там пишет LLM или берётся из старой строки, — проверяем здесь.
+    if (!isVeoModel(String(dto.model))) {
+      throw new BadRequestException(`unsupported video model: ${dto.model} (only veo-3.1-fast, veo-3.1)`);
+    }
     const model = dto.model as VideoModel;
     const mode = dto.mode;
     if (mode !== 'text2video' && mode !== 'image2video') {
@@ -1325,7 +739,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       this.logger.log('Veo prompt normalized (bare speech → talking-head frame)');
     }
 
-    const target = Math.round(dto.targetDurationSec ?? dto.duration ?? 8);
+    const target = Math.round(dto.targetDurationSec ?? 8);
     if (target < 4 || target > 60) throw new BadRequestException('Veo length must be 4–60 seconds');
 
     // 9:16 длиннее 8с: Veo extend умеет только 16:9, поэтому длинную вертикаль
@@ -1641,7 +1055,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     }
 
     // Phase 2 (concat-режим, ФИНАЛИЗАЦИЯ): все клипы готовы — склеиваем. Берём
-    // оптимистичный лок concat_started_at атомарным UPDATE (как Kling-concat),
+    // оптимистичный лок concat_started_at атомарным UPDATE,
     // чтобы параллельный тик не запустил второй ffmpeg в тот же output.
     if (plan.veo_concat && plan.segments_done >= plan.segments_total) {
       const claim = await this.pg.query(
@@ -1771,8 +1185,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   }
 
   // Склейка готовых локальных клипов в один вертикальный ролик С СОХРАНЕНИЕМ
-  // ЗВУКА (в отличие от composeFinalVideo для Kling, где аудио выбрасывается —
-  // Kling немой). Каждый клип нормализуется по видео (scale+pad+fps+SAR) и аудио
+  // ЗВУКА. Каждый клип нормализуется по видео (scale+pad+fps+SAR) и аудио
   // (aresample 48k/stereo/fltp), затем concat=...:a=1. Итог режется до target.
   private async composeVeoClips(
     jobId: string,

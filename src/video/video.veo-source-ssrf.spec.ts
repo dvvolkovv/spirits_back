@@ -19,7 +19,7 @@ function makeService() {
     getClient: jest.fn(async () => ({ query: async (sql: string) => { pgCalls.push(sql); return { rows: [], rowCount: 0 }; }, release() {} })),
   };
   const veo = { isConfigured: () => true, startGenerate: jest.fn() };
-  const svc = new VideoService(pg as any, {} as any, {} as any, veo as any, {} as any);
+  const svc = new VideoService(pg as any, veo as any, {} as any);
   (svc as any).logger = { warn: jest.fn(), log: jest.fn(), error: jest.fn(), debug: jest.fn() };
   return { svc, pg, pgCalls, veo };
 }

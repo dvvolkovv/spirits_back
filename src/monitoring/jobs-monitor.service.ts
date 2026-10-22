@@ -7,7 +7,7 @@ import { PgService } from '../common/services/pg.service';
  * backed up or stuck.
  *
  * Covered surfaces (all live in PG, no external state):
- *  - video_jobs (Kling generation pipeline)
+ *  - video_jobs (Veo generation pipeline)
  *  - token_consumption_tasks (billing — should drain every 5s via cron)
  *  - vpm_runs (Virtual PM generations — small volume, last 5 shown)
  *  - profile compaction (daily cron @ 04:00 UTC — schedule status only)

@@ -79,7 +79,7 @@ function makeHarness(opts: HarnessOpts) {
   };
   const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
   const svc = new ChatService(
-    pg as any, null as any, null as any, null as any, null as any, language as any,
+    pg as any, null as any, null as any, null as any, language as any,
     undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
     opts.store,
   );

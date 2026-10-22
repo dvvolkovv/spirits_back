@@ -49,20 +49,20 @@ describe('VideoService — денежный отказ провайдера', ()
   beforeEach(() => (sendTelegramAlert as jest.Mock).mockClear());
 
   const svcWith = (redis?: any) =>
-    new (VideoService as any)(makeFakePg(), undefined, undefined, undefined, undefined, redis);
+    new (VideoService as any)(makeFakePg(), undefined, undefined, redis);
 
   it('ставит метку «сломано» — по ней потом подтвердится починка', async () => {
     const redis = makeFakeRedis();
     await svcWith(redis).failAndRefund(
-      'job-1', 'u1', 25000,
-      'kling_create: Kling image2video: Account balance not enough (body: {"code":1102})',
+      'job-1', 'u1', 90000,
+      'veo_start: 429 RESOURCE_EXHAUSTED (insufficient_quota)',
     );
 
     expect(redis.store.has(BROKEN_KEY)).toBe(true);
   });
 
   it('своего сообщения не шлёт — о провалах уже сообщает QualityMonitor', async () => {
-    await svcWith(makeFakeRedis()).failAndRefund('job-1', 'u1', 25000, 'Account balance not enough (code 1102)');
+    await svcWith(makeFakeRedis()).failAndRefund('job-1', 'u1', 90000, 'veo_start: 429 You exceeded your current quota');
 
     expect(sendTelegramAlert).not.toHaveBeenCalled();
   });
@@ -76,7 +76,7 @@ describe('VideoService — денежный отказ провайдера', ()
 
   it('обычная ошибка рендера метку не ставит', async () => {
     const redis = makeFakeRedis();
-    await svcWith(redis).failAndRefund('job-3', 'u1', 25000, 'kling: task timeout after 600s');
+    await svcWith(redis).failAndRefund('job-3', 'u1', 90000, 'veo: Video generation failed due to an internal server issue');
 
     expect(redis.store.has(BROKEN_KEY)).toBe(false);
   });
@@ -85,7 +85,7 @@ describe('VideoService — денежный отказ провайдера', ()
     const redis = makeFakeRedis();
     const svc = svcWith(redis);
     for (let i = 0; i < 5; i++) {
-      await svc.failAndRefund(`job-${i}`, 'u1', 25000, 'Account balance not enough');
+      await svc.failAndRefund(`job-${i}`, 'u1', 25000, 'You exceeded your current quota');
     }
 
     expect(redis.store.size).toBeLessThanOrEqual(2); // метка + дедуп-ключ
@@ -94,7 +94,7 @@ describe('VideoService — денежный отказ провайдера', ()
 
   it('без Redis возврат всё равно проходит', async () => {
     await expect(
-      svcWith(undefined).failAndRefund('job-4', 'u1', 25000, 'Account balance not enough'),
+      svcWith(undefined).failAndRefund('job-4', 'u1', 25000, 'You exceeded your current quota'),
     ).resolves.toBeUndefined();
   });
 
@@ -102,7 +102,7 @@ describe('VideoService — денежный отказ провайдера', ()
     const redis = { get: async () => { throw new Error('redis down'); }, set: async () => {}, del: async () => {} };
 
     await expect(
-      svcWith(redis).failAndRefund('job-5', 'u1', 25000, 'Account balance not enough'),
+      svcWith(redis).failAndRefund('job-5', 'u1', 25000, 'You exceeded your current quota'),
     ).resolves.toBeUndefined();
   });
 });

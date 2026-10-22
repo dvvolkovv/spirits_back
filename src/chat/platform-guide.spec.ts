@@ -88,7 +88,7 @@ describe('системный промпт релея', () => {
     const pg = { query: jest.fn(async () => ({ rows: [] })) };
     const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
     return new ChatService(
-      pg as any, null as any, null as any, null as any, null as any, language as any, undefined as any,
+      pg as any, null as any, null as any, null as any, language as any, undefined as any,
     );
   }
   const prefix = (agentId: string, userLanguage = 'ru'): Promise<string> =>

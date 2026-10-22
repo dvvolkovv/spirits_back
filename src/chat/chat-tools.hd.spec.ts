@@ -32,7 +32,7 @@ describe('инструмент calculate_human_design в чате', () => {
     const humanDesign = { calculate: jest.fn(async () => result) };
     const pg = { query: jest.fn() };
     const svc = new ChatToolsService(
-      {} as any, {} as any, pg as any, {} as any, {} as any, {} as any, {} as any, humanDesign as any,
+      {} as any, pg as any, {} as any, {} as any, {} as any, {} as any, humanDesign as any,
     );
     const input = { date: '1990-03-12', time: '14:25', city: 'Казань' };
     await expect(svc.executeTool('70000000000', 'calculate_human_design', input)).resolves.toBe(result);

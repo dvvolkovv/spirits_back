@@ -39,7 +39,6 @@ function makeService() {
   const svc = new ChatService(
     pg as any,
     undefined as any, // neo4j
-    undefined as any, // kling
     {} as any, // tools
     claudeCli as any,
     language as any,

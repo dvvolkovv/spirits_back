@@ -46,7 +46,7 @@ function makePg(readyAfter: number) {
 }
 
 const svcWith = (pg: any, redis: any) =>
-  new (VideoService as any)(pg, undefined, undefined, undefined, undefined, redis);
+  new (VideoService as any)(pg, undefined, undefined, redis);
 
 describe('VideoService — подтверждение, что видео снова работает', () => {
   beforeEach(() => (sendTelegramAlert as jest.Mock).mockClear());
@@ -98,7 +98,7 @@ describe('VideoService — подтверждение, что видео сно�
 
   it('денежный отказ ставит метку «сломано» — иначе восстанавливать будет нечего', async () => {
     const redis = makeRedis();
-    await svcWith(makePg(0), redis).noteProviderOutOfMoney('Account balance not enough (code 1102)');
+    await svcWith(makePg(0), redis).noteProviderOutOfMoney('veo_start: 429 You exceeded your current quota');
 
     expect(redis.store.has(BROKEN_KEY)).toBe(true);
   });

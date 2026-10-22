@@ -8,12 +8,10 @@
  * раз и больше не напоминал о себе.
  *
  * Повтор висит на метке «сломано деньгами», а не на потоке пользовательских
- * задач — именно этим он и отличается от монитора.
+ * задач — именно этим он и отличается от монитора. Снимает метку успешная
+ * задача (checkProviderRecovered): спросить квоту Google напрямую нечем.
  *
- * Вторая половина задачи: не бубнить после тихой починки. Восстановление
- * ловится успешной задачей, но если счёт пополнили, а видео никто не заказывал,
- * успешной задачи не будет — и напоминание шло бы вечно. Поэтому перед каждым
- * повтором спрашиваем провайдера напрямую.
+ * Метки Kling — наследие снятого 22.10.2026 провайдера: их убираем молча.
  */
 import { VideoService } from './video.service';
 
@@ -38,33 +36,26 @@ function makeRedis(initial: Record<string, string> = {}) {
   };
 }
 
-/** packs: null = спросить не удалось. */
-function svcWith(redis: any, packs: any[] | null) {
-  const kling = { getResourcePacks: jest.fn(async () => packs) };
+function svcWith(redis: any) {
   return new (VideoService as any)(
-    { async query() { return { rows: [] }; } }, kling, undefined, undefined, undefined, redis,
+    { async query() { return { rows: [] }; } }, undefined, undefined, redis,
   );
 }
 
-const livePack = { name: 'Trial', total: 100, remaining: 98, expiresAt: NOW + 30 * DAY, status: 'online' };
-const deadPack = { name: 'Trial', total: 100, remaining: 94, expiresAt: NOW - DAY, status: 'expired' };
-
-const marker = (over: any = {}) => JSON.stringify({ since: NOW - 2 * DAY, provider: 'kling', ...over });
+const marker = (over: any = {}) => JSON.stringify({ since: NOW - 2 * DAY, provider: 'veo', ...over });
 
 describe('VideoService.remindProviderStillBroken', () => {
   beforeEach(() => (sendTelegramAlert as jest.Mock).mockClear());
 
-  it('без метки молчит и провайдера не дёргает', async () => {
-    const svc = svcWith(makeRedis(), [livePack]);
-    await svc.remindProviderStillBroken(NOW);
+  it('без метки молчит', async () => {
+    await svcWith(makeRedis()).remindProviderStillBroken(NOW);
 
     expect(sendTelegramAlert).not.toHaveBeenCalled();
-    expect((svc as any).kling.getResourcePacks).not.toHaveBeenCalled();
   });
 
-  it('пока живого пакета нет — напоминает и называет длительность простоя', async () => {
+  it('пока метка висит — напоминает и называет длительность простоя', async () => {
     const redis = makeRedis({ [BROKEN_KEY]: marker() });
-    await svcWith(redis, [deadPack]).remindProviderStillBroken(NOW);
+    await svcWith(redis).remindProviderStillBroken(NOW);
 
     expect(sendTelegramAlert).toHaveBeenCalledTimes(1);
     const text = String((sendTelegramAlert as jest.Mock).mock.calls[0][0]);
@@ -73,41 +64,17 @@ describe('VideoService.remindProviderStillBroken', () => {
     expect(redis.store.has(BROKEN_KEY)).toBe(true);
   });
 
-  it('счёт пополнен — снимает метку сам, не дожидаясь чужой задачи', async () => {
-    const redis = makeRedis({ [BROKEN_KEY]: marker() });
-    await svcWith(redis, [livePack]).remindProviderStillBroken(NOW);
+  it('метку Kling снимает молча — провайдер снят', async () => {
+    const redis = makeRedis({ [BROKEN_KEY]: marker({ provider: 'kling' }) });
+    await svcWith(redis).remindProviderStillBroken(NOW);
 
     expect(redis.store.has(BROKEN_KEY)).toBe(false);
-    expect(String((sendTelegramAlert as jest.Mock).mock.calls[0][0])).toMatch(/пополнен|снова работает/i);
-  });
-
-  it('пакет живой, но пустой — это не починка', async () => {
-    const redis = makeRedis({ [BROKEN_KEY]: marker() });
-    await svcWith(redis, [{ ...livePack, remaining: 0 }]).remindProviderStillBroken(NOW);
-
-    expect(redis.store.has(BROKEN_KEY)).toBe(true);
-    expect(String((sendTelegramAlert as jest.Mock).mock.calls[0][0])).toMatch(/всё ещё|все ещё/i);
-  });
-
-  it('метка от Veo живым пакетом Kling не снимается — это разные провайдеры', async () => {
-    const redis = makeRedis({ [BROKEN_KEY]: marker({ provider: 'veo' }) });
-    await svcWith(redis, [livePack]).remindProviderStillBroken(NOW);
-
-    expect(redis.store.has(BROKEN_KEY)).toBe(true);
-    expect(String((sendTelegramAlert as jest.Mock).mock.calls[0][0])).toMatch(/всё ещё|все ещё/i);
-  });
-
-  it('провайдера спросить не удалось — напоминает, а не молчит', async () => {
-    const redis = makeRedis({ [BROKEN_KEY]: marker() });
-    await svcWith(redis, null).remindProviderStillBroken(NOW);
-
-    expect(sendTelegramAlert).toHaveBeenCalledTimes(1);
-    expect(redis.store.has(BROKEN_KEY)).toBe(true);
+    expect(sendTelegramAlert).not.toHaveBeenCalled();
   });
 
   it('понимает старый формат метки — голое число', async () => {
     const redis = makeRedis({ [BROKEN_KEY]: String(NOW - DAY) });
-    await svcWith(redis, [deadPack]).remindProviderStillBroken(NOW);
+    await svcWith(redis).remindProviderStillBroken(NOW);
 
     expect(sendTelegramAlert).toHaveBeenCalledTimes(1);
     expect(String((sendTelegramAlert as jest.Mock).mock.calls[0][0])).toMatch(/24 ч|1 дн/i);
@@ -117,6 +84,6 @@ describe('VideoService.remindProviderStillBroken', () => {
     (sendTelegramAlert as jest.Mock).mockImplementationOnce(async () => { throw new Error('tg down'); });
     const redis = makeRedis({ [BROKEN_KEY]: marker() });
 
-    await expect(svcWith(redis, [deadPack]).remindProviderStillBroken(NOW)).resolves.toBeUndefined();
+    await expect(svcWith(redis).remindProviderStillBroken(NOW)).resolves.toBeUndefined();
   });
 });

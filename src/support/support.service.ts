@@ -14,7 +14,7 @@ import {
 import { TelegramNotifierService } from './telegram-notifier.service';
 import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
 import { VideoService } from '../video/video.service';
-import { CreateVideoJobDto } from '../video/video.dto';
+import { CreateVideoJobDto, isVeoModel } from '../video/video.dto';
 import { MailService } from '../common/services/mail.service';
 import { LanguageService } from '../common/services/language.service';
 import { buildOwnerReplyEmail } from './support-mail';
@@ -390,7 +390,7 @@ export class SupportService implements OnModuleInit {
         ),
         tool(
           'check_service_health',
-          'Return current status of platform services (backend, database, LLM, Kling, payments). Call this when the user reports something is broken or you need to verify availability before answering.',
+          'Return current status of platform services (backend, database, LLM, video, payments). Call this when the user reports something is broken or you need to verify availability before answering.',
           {},
           async (a: any) => dispatch('check_service_health', a),
         ),
@@ -406,7 +406,7 @@ export class SupportService implements OnModuleInit {
         ),
         tool(
           'rerun_failed_job',
-          'Re-queue a failed video-generation job: refunds tokens + queues identical new job. Verify failure tied to upstream issue first. Supported modes: text2video, image2video. Not yet supported: extend, lipsync — refund and tell user to re-submit manually.',
+          'Re-queue a failed video-generation job: refunds tokens + queues identical new job. Verify failure tied to upstream issue first. Supported: Veo jobs (text2video, image2video). Old Kling jobs (model kling-*, modes extend/lipsync) cannot be rerun — Kling is retired; refund and tell the user to create the video again.',
           { job_id: z.string() },
           async (a: any) => dispatch('rerun_failed_job', a),
         ),
@@ -687,6 +687,10 @@ ${healthSummary}
     if (job.mode === 'extend' || job.mode === 'lipsync') {
       return { ok: false, error: 'mode_not_supported', mode: job.mode };
     }
+    // Kling снят 22.10.2026: его задачи повторить нечем.
+    if (!isVeoModel(job.model)) {
+      return { ok: false, error: 'engine_retired', model: job.model };
+    }
 
     // Guard against double-rerun.
     const prior = await this.pg.query(
@@ -696,20 +700,22 @@ ${healthSummary}
     );
     if (prior.rows.length > 0) return { ok: false, error: 'already_rerun' };
 
-    // Step 1: createJob — it validates params, charges current price, dispatches to Kling.
+    // Step 1: createJob — it validates params, charges current price, dispatches to Veo.
+    // Длина, формат, разрешение и референсы — из исходной задачи: duration_sec у
+    // Veo всегда 8 (длина базы), настоящая длина лежит в target_duration_sec.
+    const plan = job.composed_plan || {};
     const dto: CreateVideoJobDto = {
       mode: job.mode,
       model: job.model,
-      quality: job.quality,
-      duration: job.duration_sec as 5 | 10,
       prompt: job.prompt || undefined,
       negativePrompt: job.negative_prompt || undefined,
-      cfgScale: job.cfg_scale ? Number(job.cfg_scale) : undefined,
       sourceImageUrl: job.source_image_url || undefined,
-      sourceVideoId: job.source_video_id || undefined,
-      cameraType: job.camera_type || undefined,
-      cameraConfig: job.camera_config || undefined,
-      audioUrl: job.audio_url || undefined,
+      sourceImageUrls: Array.isArray(plan.veo_reference_images) && plan.veo_reference_images.length
+        ? plan.veo_reference_images : undefined,
+      targetDurationSec: job.target_duration_sec ?? undefined,
+      aspectRatio: plan.veo_aspect_ratio || undefined,
+      resolution: plan.veo_resolution || undefined,
+      ownVoice: job.own_voice || undefined,
     };
 
     let created: { jobId: string; status: string; tokensSpent: number };

@@ -11,7 +11,6 @@ function makeService(oauth: any): ChatService {
   return new ChatService(
     null as any, // pg
     null as any, // neo4j
-    null as any, // kling
     null as any, // tools
     null as any, // claudeCli
     null as any, // language — добавлен в конструктор позже, из-за чего все

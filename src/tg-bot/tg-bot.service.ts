@@ -1550,12 +1550,14 @@ export class TgBotService implements OnModuleInit {
       } else if (k === 'video') {
         if (kv.prompt) {
           const mode = (kv.mode === 'image2video' ? 'image2video' : 'text2video') as 'text2video' | 'image2video';
-          const duration = kv.duration ? Math.max(5, Math.min(10, parseInt(kv.duration, 10) || 5)) : 5;
+          // Veo: база 8с стоит одинаково для 4–8с, поэтому по умолчанию 8;
+          // потолок 10с — как был, чтобы бот не заказывал дорогие длинные ролики.
+          const duration = kv.duration ? Math.max(4, Math.min(10, parseInt(kv.duration, 10) || 8)) : 8;
           markers.push({
             kind: 'video',
             prompt: kv.prompt,
             source: kv.source || undefined,
-            duration: duration as 5 | 10,
+            duration,
             mode,
             model: kv.model || undefined,
           });
@@ -1659,14 +1661,14 @@ export class TgBotService implements OnModuleInit {
       return;
     }
     if (m.kind === 'video') {
-      // Видео — async (Kling/Veo: 1-3 минуты). Запускаем job, привязываем к
+      // Видео — async (Veo: 1-3 минуты). Запускаем job, привязываем к
       // чату, юзеру сразу пишем "в очереди". TgVideoDispatchService доставит
       // результат когда status=ready.
       this.grammy.sendChatAction(msg.chat.id, 'record_video').catch(() => {});
       const dto: any = {
         mode: m.mode,
         prompt: m.prompt,
-        duration: m.duration ?? 5,
+        targetDurationSec: m.duration ?? 8,
       };
       if (m.model) dto.model = m.model;
       if (m.source) dto.sourceImageUrl = m.source;
