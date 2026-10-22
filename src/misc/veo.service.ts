@@ -6,7 +6,7 @@ import { PgService } from '../common/services/pg.service';
  * Veo 3.1 (Google Gemini Developer API) video provider — DR backlog a0132032.
  *
  * Long-form talking-head with native lip-synced audio and reference-portrait
- * consistency, in one continuous video (no ffmpeg concat like Kling).
+ * consistency, in one continuous video.
  *
  * API mechanics, all validated against the live API 2026-06-03:
  *  - generate: POST models/{model}:predictLongRunning, x-goog-api-key header,

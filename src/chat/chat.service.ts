@@ -1,7 +1,6 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
-import { KlingService } from '../misc/kling.service';
 import { ChatToolsService } from './chat-tools';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { TasksService } from '../tasks/tasks.service';
@@ -390,7 +389,6 @@ export class ChatService {
   constructor(
     private readonly pg: PgService,
     @Optional() private readonly neo4j: Neo4jService,
-    @Optional() private readonly kling: KlingService,
     private readonly tools: ChatToolsService,
     private readonly claudeCli: ClaudeCliService,
     private readonly language: LanguageService,
@@ -1321,7 +1319,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
   /**
    * Быстрый heuristic: распознать явную просьбу сгенерировать картинку или видео.
-   * Используется для Романа, чтобы такие запросы шли по нашей Kling-цепочке, а не во внешний воркер.
+   * Используется для Романа, чтобы такие запросы шли по нашей медиа-цепочке, а не во внешний воркер.
    */
   private detectMediaIntent(message: string): 'image' | 'video' | 'edit' | null {
     const m = (message || '').toLowerCase();

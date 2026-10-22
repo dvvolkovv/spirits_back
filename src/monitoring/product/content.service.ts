@@ -91,7 +91,7 @@ export class ContentService {
       [window, interval, excluded],
     );
 
-    // video_jobs uses 'ready' for completed (Kling's status name); dozvon
+    // video_jobs uses 'ready' for completed; dozvon
     // uses 'done'. We accept the common variants so the same code works
     // across both tables.
     const COMPLETED = "('completed','succeeded','done','ready')";

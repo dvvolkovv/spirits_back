@@ -3,7 +3,7 @@ import { ChatToolsService } from './chat-tools';
 function makeTools(speechResult: any) {
   const speech = { synthesize: jest.fn(async () => speechResult) };
   const svc = new ChatToolsService(
-    {} as any, {} as any, { query: jest.fn(async () => ({ rows: [] })) } as any,
+    {} as any, { query: jest.fn(async () => ({ rows: [] })) } as any,
     {} as any, {} as any, {} as any, speech as any,
   );
   return { svc, speech };

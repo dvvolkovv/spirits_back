@@ -54,7 +54,7 @@ function makeHarness() {
   };
   const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
   const svc = new ChatService(
-    pg as any, null as any, null as any, null as any, null as any,
+    pg as any, null as any, null as any, null as any,
     language as any, undefined, undefined, undefined, undefined,
   );
   const post = axios.post as jest.Mock;
@@ -143,7 +143,7 @@ describe('streamUniversalAgent: шаги работы и правило карт
     };
     const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
     const svc = new ChatService(
-      pg as any, null as any, null as any, null as any, null as any,
+      pg as any, null as any, null as any, null as any,
       language as any, undefined, undefined, undefined, undefined,
     );
     const post = axios.post as jest.Mock;
@@ -198,7 +198,7 @@ describe('buildUploadHandoff: системный промпт загрузки �
     };
     const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
     const svc = new ChatService(
-      pg as any, null as any, null as any, null as any, null as any,
+      pg as any, null as any, null as any, null as any,
       language as any, undefined, undefined, undefined, undefined,
     );
     const withAsk = await svc.buildUploadHandoff({ userId: PHONE, assistantId: '12', ask: true });
@@ -223,7 +223,7 @@ describe('buildUploadHandoff: системный промпт загрузки �
     };
     const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
     const svc = new ChatService(
-      pg as any, null as any, null as any, null as any, null as any,
+      pg as any, null as any, null as any, null as any,
       language as any, undefined, undefined, undefined, undefined,
     );
     const post = axios.post as jest.Mock;

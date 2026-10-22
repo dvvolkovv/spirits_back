@@ -100,7 +100,7 @@ maybe('коллеги ассистента против живого Postgres', 
   it('блок в промпте релея: ни выключенных, ни служебного', async () => {
     const language = { resolveUserLanguage: async () => 'ru' };
     const svc = new ChatService(
-      pg as any, null as any, null as any, null as any, null as any, language as any, undefined as any,
+      pg as any, null as any, null as any, null as any, language as any, undefined as any,
     );
     const prefix: string = await (svc as any).buildRelayStablePrefix({
       agentId: '12', agentName: 'Роман', agentDescription: '', agentSystemPrompt: 'Ты Роман.',

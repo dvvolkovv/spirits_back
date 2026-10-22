@@ -11,7 +11,7 @@ import { SyntheticService } from './synthetic.service';
  * a867ef3b). Активный слой ПОВЕРХ пассивного JobsMonitorService: крон, который
  * проактивно ловит РЕГРЕССИИ КАЧЕСТВА, влияющие на конечного пользователя, и
  * шлёт Telegram-алерт с actionable-текстом. Старт — самое частое user-facing
- * зло: провалы платных провайдеров (Kling/Google) из-за нашего баланса/квоты
+ * зло: провалы платного провайдера видео (Google, Veo) из-за нашего баланса/квоты
  * (инцидент 01.07 «Account balance not enough») и всплеск падений видео.
  *
  * Расширяемо: сюда же добавлять другие quality-сигналы (пустые ответы,
@@ -233,7 +233,7 @@ export class QualityMonitorService {
         `⚠️ КАЧЕСТВО: платный провайдер отказывает пользователям.\n` +
         `${ov.providerFailures.count} видео-генераций упали за ${ov.providerFailures.window_min} мин с ошибкой баланса/квоты.\n` +
         `Пример: ${String(ov.providerFailures.sample || '').slice(0, 160)}\n` +
-        `👉 Проверить/пополнить аккаунт провайдера (Kling / Google AI). Пока не пополнен — видео падает у всех.`,
+        `👉 Проверить/пополнить аккаунт провайдера (Google AI, Veo). Пока не пополнен — видео падает у всех.`,
       );
     }
     if (ov.videoFailureRate.pct !== null && ov.videoFailureRate.total >= FAILRATE_MIN_SAMPLE && ov.videoFailureRate.pct >= FAILRATE_ALERT_PCT) {

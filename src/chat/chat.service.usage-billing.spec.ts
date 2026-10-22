@@ -70,7 +70,6 @@ function makeHarness(opts: {
   const svc = new ChatService(
     pg as any,
     null as any, // neo4j
-    null as any, // kling
     null as any, // tools
     null as any, // claudeCli
     language as any, // language
@@ -406,7 +405,7 @@ describe('SDK-биллинг: стоимость хода от релея', () =
     };
     const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
     const svc = new ChatService(
-      pg as any, null as any, null as any, null as any,
+      pg as any, null as any, null as any,
       null as any, language as any, undefined, undefined, undefined, undefined,
     );
     (axios.post as jest.Mock).mockResolvedValue({

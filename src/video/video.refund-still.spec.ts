@@ -1,16 +1,14 @@
 /**
  * Провалившееся видео возвращает и стоимость кадра-заготовки.
  *
- * text2video без картинки идёт цепочкой: сначала Nano Banana рисует кадр
- * (списание 'image'), потом Kling анимирует его. Возврат при провале Kling
- * отдавал только стоимость самого ролика — 20.08.2026 боевая проверка это и
- * показала: у Kling кончились деньги, ролика не случилось, а 5 000 токенов за
- * заготовку остались списанными. Человек просил видео, не получил ничего и
- * всё равно заплатил.
+ * До снятия Kling (22.10.2026) text2video без картинки шёл цепочкой: сначала
+ * Nano Banana рисовал кадр (списание 'image'), потом Kling его анимировал.
+ * Возврат при провале отдавал только стоимость ролика — 20.08.2026 человек
+ * не получил видео, а 5 000 токенов за заготовку остались списанными.
  *
- * Решение владельца — возвращать и заготовку. Отсюда два свойства:
- * возврат равен полной сумме (ролик + кадр), и повторный вызов ничего не
- * возвращает второй раз.
+ * Решение владельца — возвращать и заготовку. У задач Veo заготовки нет
+ * (image_tokens_spent = 0), но свойства возврата общие: он равен полной сумме
+ * (ролик + кадр), и повторный вызов ничего не возвращает второй раз.
  */
 import { VideoService } from './video.service';
 
@@ -57,14 +55,14 @@ describe('VideoService.failAndRefund', () => {
 
   it('возвращает и ролик, и кадр-заготовку одной суммой', async () => {
     const fake = makeFakePg(job);
-    await svcWith(fake.pg).failAndRefund('job-1', 'u1', 25000, 'kling: no balance');
+    await svcWith(fake.pg).failAndRefund('job-1', 'u1', 25000, 'veo: render failed');
 
     expect(refunds(fake.calls)).toEqual([30000]);
   });
 
   it('без заготовки возвращает только стоимость ролика', async () => {
     const fake = makeFakePg({ ...job, image_tokens_spent: 0 });
-    await svcWith(fake.pg).failAndRefund('job-1', 'u1', 25000, 'kling: no balance');
+    await svcWith(fake.pg).failAndRefund('job-1', 'u1', 25000, 'veo: render failed');
 
     expect(refunds(fake.calls)).toEqual([25000]);
   });
@@ -73,15 +71,15 @@ describe('VideoService.failAndRefund', () => {
     const fake = makeFakePg(job);
     const svc = svcWith(fake.pg);
 
-    await svc.failAndRefund('job-1', 'u1', 25000, 'kling: no balance');
-    await svc.failAndRefund('job-1', 'u1', 25000, 'kling: no balance');
+    await svc.failAndRefund('job-1', 'u1', 25000, 'veo: render failed');
+    await svc.failAndRefund('job-1', 'u1', 25000, 'veo: render failed');
 
     expect(refunds(fake.calls)).toEqual([30000]);
   });
 
   it('возврат идёт через процедуру, а не прямым UPDATE баланса', async () => {
     const fake = makeFakePg(job);
-    await svcWith(fake.pg).failAndRefund('job-1', 'u1', 25000, 'kling: no balance');
+    await svcWith(fake.pg).failAndRefund('job-1', 'u1', 25000, 'veo: render failed');
 
     expect(fake.calls.some((c) => /tokens\s*=\s*tokens\s*\+/i.test(c.sql))).toBe(false);
     const credit = fake.calls.find((c) => /add_user_tokens/i.test(c.sql))!;

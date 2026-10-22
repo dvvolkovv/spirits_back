@@ -52,7 +52,7 @@ async function run(store: any) {
   const pg = makePg();
   const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
   const svc = new ChatService(
-    pg as any, null as any, null as any, null as any, null as any, language as any,
+    pg as any, null as any, null as any, null as any, language as any,
     undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
     store,
   );
@@ -112,7 +112,7 @@ describe('uploadAndChat — файлы хода в нашем хранилище
     const pg = makePg();
     const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
     const svc = new ChatService(
-      pg as any, null as any, null as any, null as any, null as any, language as any,
+      pg as any, null as any, null as any, null as any, language as any,
       undefined, undefined, undefined, undefined,
     );
     jest.spyOn(svc, 'storeRelayLinks').mockRejectedValue(new Error('boom'));
@@ -156,7 +156,7 @@ describe('uploadAndChat — activeStreams (beginStream/endStream)', () => {
       persist: jest.fn(() => new Promise<Map<string, string>>((resolve) => { resolvePersist = resolve; })),
     };
     const svc = new ChatService(
-      pg as any, null as any, null as any, null as any, null as any, language as any,
+      pg as any, null as any, null as any, null as any, language as any,
       undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       store as any,
     );
@@ -194,7 +194,7 @@ describe('uploadAndChat — activeStreams (beginStream/endStream)', () => {
     const pg = makePg();
     const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
     const svc = new ChatService(
-      pg as any, null as any, null as any, null as any, null as any, language as any,
+      pg as any, null as any, null as any, null as any, language as any,
       undefined, undefined, undefined, undefined,
     );
     const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
@@ -223,7 +223,7 @@ describe('uploadAndChat — activeStreams (beginStream/endStream)', () => {
     const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
     const store = { persist: jest.fn(async (urls: string[]) => new Map(urls.map((u) => [u, STORED]))) };
     const svc = new ChatService(
-      pg as any, null as any, null as any, null as any, null as any, language as any,
+      pg as any, null as any, null as any, null as any, language as any,
       undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       store as any,
     );
