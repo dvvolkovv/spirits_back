@@ -114,8 +114,12 @@ export class AppWidgetController {
     // [fix 2026-08-23]
     const RAYA_ASSISTANT_ID = '14';
     let energyLine: string | null = null;
+    // ⚠️ И только при ВКЛЮЧЁННОЙ: гейт смотрел лишь на наличие строки, поэтому выключенная
+    // рутина оставляла на экране последнюю доставленную реплику — навсегда, без обновлений.
+    // Вылезло 22.10.2026, когда владелец перешёл на локальную установку дня (§5.7) и мы
+    // выключили ему ежедневную рассылку: строка Райи осталась бы замороженной. [fix 2026-10-22]
     const er = await this.pg.query(
-      `SELECT 1 FROM routine_pushes WHERE user_id = $1 AND kind = $2 LIMIT 1`,
+      `SELECT 1 FROM routine_pushes WHERE user_id = $1 AND kind = $2 AND enabled = true LIMIT 1`,
       [userId, `daily:${RAYA_ASSISTANT_ID}`],
     );
     if (er.rows[0]) {
