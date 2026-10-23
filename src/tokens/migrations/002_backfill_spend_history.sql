@@ -24,11 +24,17 @@
 --
 -- ИДЕМПОТЕНТНОСТЬ. Файл выполняется при КАЖДОМ старте API
 -- (TokensSchemaService). У строки metadata.source + metadata.source_id; что
--- уже перенесено, второй раз не вставляется. Весь файл — одна НЕЯВНАЯ
--- транзакция (несколько операторов в одном запросе без BEGIN/COMMIT): при
--- ошибке откатывается целиком и не оставляет соединение пула в прерванной
--- транзакции, как оставил бы явный BEGIN. Два одновременных старта
--- сериализует advisory-лок.
+-- уже перенесено, второй раз не вставляется. У видео ключ общий на обе
+-- таблицы (любой из двух видео-источников + uuid): общих id у них на проде
+-- сейчас нет, но этого ничто не гарантирует.
+--
+-- АТОМАРНОСТЬ. Весь файл — один оператор DO, то есть одна транзакция: при
+-- ошибке (в том числе по lock_timeout) откатывается целиком — ни индекса,
+-- ни части строк, — и следующий старт пробует заново.
+--
+-- ОДНОВРЕМЕННЫЕ СТАРТЫ сериализует advisory-лок. Второй видит строки
+-- первого потому, что на READ COMMITTED (по умолчанию, так и на проде)
+-- каждый INSERT после взятия лока берёт свежий снимок.
 --
 -- ЗАЩИТА ОТ ДУБЛЕЙ. Если в журнале уже есть списание того же человека на ту
 -- же сумму в пределах двух минут (и это не перенесённая строка), исходную
@@ -54,15 +60,18 @@ DECLARE
     c_tg     CONSTANT timestamptz := '2026-08-11 11:28:37+00';
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('tokens/002_backfill_spend_history'));
+    -- Замков дальше ждём не дольше 5 с (только в этой транзакции): первый CREATE INDEX
+    -- не встанет навсегда за зависшим списанием; ошибка откатит файл, следующий старт повторит.
+    PERFORM set_config('lock_timeout', '5s', true);
 
     -- Индекс — только если его ещё нет, и уже под advisory-локом. Голый
     -- CREATE INDEX IF NOT EXISTS берёт ShareLock на журнал и при существующем
     -- индексе (проверено на PG 16) и держит его до конца транзакции, то есть
     -- весь перенос: каждый старт API ждал бы открытые списания, а новые
     -- списания вставали бы в очередь за ним. Под локом же второй из двух
-    -- одновременных первых стартов видит готовый индекс, а не падает на
-    -- одноимённом. Если кеш каталога вдруг устарел, IF NOT EXISTS ниже всё
-    -- равно отработает верно, только с замком.
+    -- одновременных первых стартов видит готовый индекс, а не ловит deadlock
+    -- на одноимённом (так было с CREATE INDEX до DO). Если кеш каталога вдруг
+    -- устарел, IF NOT EXISTS ниже всё равно отработает верно, только с замком.
     IF to_regclass('public.idx_token_transactions_user_created') IS NULL THEN
         CREATE INDEX IF NOT EXISTS idx_token_transactions_user_created
             ON token_transactions (user_id, created_at);
@@ -99,7 +108,7 @@ BEGIN
            AND v.tokens_spent > 0
            AND v.created_at < c_video
            AND NOT EXISTS (SELECT 1 FROM token_transactions t
-                            WHERE t.metadata ->> 'source' = 'video_jobs'
+                            WHERE t.metadata ->> 'source' IN ('video_jobs', 'video_jobs_expired_bak_20260728')
                               AND t.metadata ->> 'source_id' = v.id::text)
            AND NOT EXISTS (SELECT 1 FROM token_transactions t
                             WHERE t.user_id = v.user_id
@@ -121,7 +130,7 @@ BEGIN
            AND v.tokens_spent > 0
            AND v.created_at < c_video
            AND NOT EXISTS (SELECT 1 FROM token_transactions t
-                            WHERE t.metadata ->> 'source' = 'video_jobs_expired_bak_20260728'
+                            WHERE t.metadata ->> 'source' IN ('video_jobs', 'video_jobs_expired_bak_20260728')
                               AND t.metadata ->> 'source_id' = v.id::text)
            AND NOT EXISTS (SELECT 1 FROM token_transactions t
                             WHERE t.user_id = v.user_id
