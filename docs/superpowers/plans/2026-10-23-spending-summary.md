@@ -1539,12 +1539,12 @@ cd ~/Downloads/spirits_front/.worktrees/spending-summary && node - <<'EOF'
 const fs = require('fs');
 const T = {
   ru: ['Расход по месяцам', { replies: 'Ответы ассистентов', calls: 'Звонки', images: 'Картинки', video: 'Видео', voice: 'Озвучка', tg_bots: 'Telegram-боты', products: 'Продукты', other: 'Прочее' }],
-  en: ['Spending by month', { replies: 'Assistant replies', calls: 'Calls', images: 'Images', video: 'Video', voice: 'Listening to replies', tg_bots: 'Telegram bots', products: 'Products', other: 'Other' }],
-  es: ['Gasto por meses', { replies: 'Respuestas de los asistentes', calls: 'Llamadas', images: 'Imágenes', video: 'Vídeo', voice: 'Escuchar respuestas', tg_bots: 'Bots de Telegram', products: 'Productos', other: 'Otros' }],
-  de: ['Verbrauch nach Monaten', { replies: 'Antworten der Assistenten', calls: 'Anrufe', images: 'Bilder', video: 'Videos', voice: 'Antworten anhören', tg_bots: 'Telegram-Bots', products: 'Produkte', other: 'Sonstiges' }],
-  fr: ['Dépenses par mois', { replies: 'Réponses des assistants', calls: 'Appels', images: 'Images', video: 'Vidéo', voice: 'Écoute des réponses', tg_bots: 'Bots Telegram', products: 'Produits', other: 'Autres' }],
-  pt: ['Gastos por mês', { replies: 'Respostas dos assistentes', calls: 'Ligações', images: 'Imagens', video: 'Vídeo', voice: 'Ouvir respostas', tg_bots: 'Bots do Telegram', products: 'Produtos', other: 'Outros' }],
-  zh: ['每月消费', { replies: '助手回复', calls: '通话', images: '图片', video: '视频', voice: '收听回复', tg_bots: 'Telegram 机器人', products: '产品', other: '其他' }],
+  en: ['Spending by month', { replies: 'Assistant replies', calls: 'Calls', images: 'Images', video: 'Videos', voice: 'Voice-overs', tg_bots: 'Telegram bots', products: 'Products', other: 'Other' }],
+  es: ['Gastos por mes', { replies: 'Respuestas de los asistentes', calls: 'Llamadas', images: 'Imágenes', video: 'Vídeo', voice: 'Locución', tg_bots: 'Bots de Telegram', products: 'Productos', other: 'Otros' }],
+  de: ['Verbrauch nach Monaten', { replies: 'Antworten der Assistenten', calls: 'Anrufe', images: 'Bilder', video: 'Videos', voice: 'Vertonung', tg_bots: 'Telegram-Bots', products: 'Produkte', other: 'Sonstiges' }],
+  fr: ['Dépenses par mois', { replies: 'Réponses des assistants', calls: 'Appels', images: 'Images', video: 'Vidéo', voice: 'Synthèse vocale', tg_bots: 'Bots Telegram', products: 'Produits', other: 'Autres' }],
+  pt: ['Gastos por mês', { replies: 'Respostas dos assistentes', calls: 'Chamadas', images: 'Imagens', video: 'Vídeo', voice: 'Locução', tg_bots: 'Bots do Telegram', products: 'Produtos', other: 'Outros' }],
+  zh: ['每月消费', { replies: '助手回复', calls: '通话', images: '图片', video: '视频', voice: '配音', tg_bots: 'Telegram 机器人', products: '产品', other: '其他' }],
 };
 for (const [lang, [title, cat]] of Object.entries(T)) {
   const file = `src/i18n/locales/${lang}.json`;
