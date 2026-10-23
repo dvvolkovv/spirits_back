@@ -4,6 +4,7 @@ import { ProfileModule } from '../profile/profile.module';
 import { CommonModule } from '../common/common.module';
 import { BalanceContextService } from './balance-context.service';
 import { TokensSchemaService } from './tokens-schema.service';
+import { SpendingService } from './spending.service';
 
 @Module({
   imports: [ProfileModule, CommonModule],
@@ -12,7 +13,7 @@ import { TokensSchemaService } from './tokens-schema.service';
   // только ради onModuleInit, который накатывает процедуры баланса. Убрать его
   // из providers — значит перестать накатывать миграцию, ничего при этом не
   // сломав ни в одном вызове; сторож на это — tokens-schema.spec.ts.
-  providers: [BalanceContextService, TokensSchemaService],
+  providers: [BalanceContextService, TokensSchemaService, SpendingService],
   exports: [BalanceContextService],
 })
 export class TokensModule {}
