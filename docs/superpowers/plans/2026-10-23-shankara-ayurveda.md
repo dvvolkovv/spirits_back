@@ -675,6 +675,8 @@ Expected: на обоих — `MERGE_SHA` и `1`; в reflog прода нет `r
 
 - [ ] **Step 1: Прогон сценария extractor на ноде против API test**
 
+Перед запуском — на ноде `ps -eo command | grep -c "^bash scripts/deploy.sh"` = 0: smoke в deploy.sh переключает язык того же аккаунта.
+
 ```bash
 ssh dv@85.192.61.231 'cd ~/ci/wt/profile-health-filter && source ~/.nvm/nvm.sh && \
   DEBUG_SECRET=$(cd ~/spirits_back && node -e "process.stdout.write(require(\"dotenv\").parse(require(\"fs\").readFileSync(\".env\")).DEBUG_SECRET)") \
@@ -821,6 +823,8 @@ Expected: три `JPEG image data`. Скопировать на мак (`scp dv@
 
 - [ ] **Step 3: Все сценарии на test**
 
+Перед запуском — на ноде `ps -eo command | grep -c "^bash scripts/deploy.sh"` = 0: smoke в deploy.sh переключает язык того же аккаунта.
+
 ```bash
 ssh dv@85.192.61.231 'cd ~/ci/wt/profile-health-filter && source ~/.nvm/nvm.sh && \
   DEBUG_SECRET=$(cd ~/spirits_back && node -e "process.stdout.write(require(\"dotenv\").parse(require(\"fs\").readFileSync(\".env\")).DEBUG_SECRET)") \
@@ -845,7 +849,7 @@ Expected: все `✓`, последняя строка `✓ все автома
 scp -r dv@85.192.61.231:~/shankara-e2e/out-test <scratchpad>/shankara-out-test
 ```
 
-Ответы прогона — в подпапке с меткой времени (её печатает последняя строка лога `ответы прогона: …`); читать только её.
+Ответы прогона — в подпапке с меткой времени (её печатает предпоследняя строка лога `ответы прогона: …`); читать только её.
 
 Чек-лист (каждый пункт — да/нет, с цитатой при «нет»):
 
@@ -927,6 +931,8 @@ Expected: семь строк, в каждой — упоминание аюрв
 - [ ] **Step 5: Живая проверка на проде**
 
 Секрет прода едет с прода на ноду трубой через мак, не печатаясь, в файл с правами 600:
+
+Перед запуском — на ноде `ps -eo command | grep -c "^bash scripts/deploy.sh"` = 0: smoke в deploy.sh переключает язык того же аккаунта.
 
 ```bash
 ssh -o BatchMode=yes dvolkov@212.113.106.202 'cd ~/spirits_back && node -e "process.stdout.write(require(\"dotenv\").parse(require(\"fs\").readFileSync(\".env\")).DEBUG_SECRET)"' \
