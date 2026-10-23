@@ -1,6 +1,8 @@
-import * as fs from 'fs';
-import * as path from 'path';
+import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { TokensController } from './tokens.controller';
+import { TokensModule } from './tokens.module';
+import { JwtGuard } from '../common/guards/jwt.guard';
+import { SpendingService } from './spending.service';
 
 function mockRes() {
   const res: any = {};
@@ -29,12 +31,11 @@ describe('GET /webhook/tokens/spending', () => {
   });
 
   it('ручка закрыта входом', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'tokens.controller.ts'), 'utf8');
-    expect(src).toMatch(/@Get\('tokens\/spending'\)\s*\n\s*@UseGuards\(JwtGuard\)/);
+    expect(Reflect.getMetadata(GUARDS_METADATA, TokensController.prototype.getSpending)).toContain(JwtGuard);
   });
 
   it('SpendingService зарегистрирован в модуле', () => {
-    const mod = fs.readFileSync(path.join(__dirname, 'tokens.module.ts'), 'utf8');
-    expect(mod).toMatch(/providers:\s*\[[^\]]*SpendingService/);
+    const providers = (Reflect.getMetadata('providers', TokensModule) ?? []) as any[];
+    expect(providers).toContain(SpendingService);
   });
 });

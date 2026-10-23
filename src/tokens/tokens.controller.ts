@@ -38,7 +38,7 @@ export class TokensController {
       const result = await this.spending.monthly(user.userId, tz, months);
       return res.status(200).json({ months: result });
     } catch (e: any) {
-      this.logger.error(`сводка расхода для ${user?.userId}: ${e?.message}`);
+      this.logger.error(`сводка расхода для ${user?.userId}: ${e?.message}`, e?.stack);
       return res.status(500).json({ error: 'spending_failed' });
     }
   }
