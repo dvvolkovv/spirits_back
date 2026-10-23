@@ -47,9 +47,6 @@
 --          'video_jobs_expired_bak_20260728', 'tg_bot_messages');
 -- Балансы при этом не меняются.
 
-CREATE INDEX IF NOT EXISTS idx_token_transactions_user_created
-    ON token_transactions (user_id, created_at);
-
 DO $backfill$
 DECLARE
     c_images CONSTANT timestamptz := '2026-08-08 09:02:12+00';
@@ -57,6 +54,19 @@ DECLARE
     c_tg     CONSTANT timestamptz := '2026-08-11 11:28:37+00';
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('tokens/002_backfill_spend_history'));
+
+    -- Индекс — только если его ещё нет, и уже под advisory-локом. Голый
+    -- CREATE INDEX IF NOT EXISTS берёт ShareLock на журнал и при существующем
+    -- индексе (проверено на PG 16) и держит его до конца транзакции, то есть
+    -- весь перенос: каждый старт API ждал бы открытые списания, а новые
+    -- списания вставали бы в очередь за ним. Под локом же второй из двух
+    -- одновременных первых стартов видит готовый индекс, а не падает на
+    -- одноимённом. Если кеш каталога вдруг устарел, IF NOT EXISTS ниже всё
+    -- равно отработает верно, только с замком.
+    IF to_regclass('public.idx_token_transactions_user_created') IS NULL THEN
+        CREATE INDEX IF NOT EXISTS idx_token_transactions_user_created
+            ON token_transactions (user_id, created_at);
+    END IF;
 
     IF to_regclass('public.generated_images') IS NOT NULL THEN
         INSERT INTO token_transactions (user_id, transaction_type, amount, balance_after, description, metadata, created_at)
