@@ -1,4 +1,4 @@
-import { classifySpend, spendCategorySql, SPEND_RULES } from './spend-category';
+import { classifySpend, spendCategorySql, buildCategorySql, SPEND_RULES, type SpendRule } from './spend-category';
 import { SPEND_SAMPLES } from './spend-category.samples';
 
 describe('classifySpend', () => {
@@ -35,5 +35,14 @@ describe('spendCategorySql', () => {
     expect(sql).toContain(`t.description = 'image'`);
     expect(sql).toContain(`starts_with(t.description, 'Ответ ассистента')`);
     expect(sql).toContain('t.description IS NULL');
+  });
+});
+
+describe('buildCategorySql', () => {
+  it('правило без единого условия — ошибка, а не тихий "WHEN THEN"', () => {
+    const broken: SpendRule[] = [{ category: 'images' }];
+    expect(() => buildCategorySql(broken, 'description', 'metadata')).toThrow(
+      /images.*не задаёт ни одного условия/,
+    );
   });
 });

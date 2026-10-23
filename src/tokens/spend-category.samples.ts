@@ -1,3 +1,5 @@
+import type { SpendCategory } from './spend-category';
+
 /**
  * Образцы consumed-строк журнала: различные подписи прода за 90 дней до
  * 23.10.2026 (цифры, имена и id заменены). Общие для юнит-теста правил и для
@@ -5,7 +7,7 @@
  *
  * Новая подпись в коде списания — новая строка здесь с ожидаемой категорией.
  */
-export type SpendSample = [description: string | null, metadata: Record<string, unknown> | null, expected: string];
+export type SpendSample = [description: string | null, metadata: Record<string, unknown> | null, expected: SpendCategory];
 
 export const SPEND_SAMPLES: SpendSample[] = [
   ['Ответ ассистента «Роман»', { source: 'usage', costUsd: 0.26 }, 'replies'],
