@@ -675,7 +675,7 @@ Expected: на обоих — `MERGE_SHA` и `1`; в reflog прода нет `r
 
 - [ ] **Step 1: Прогон сценария extractor на ноде против API test**
 
-Перед запуском — на ноде `ps -eo command | grep -c "^bash scripts/deploy.sh"` = 0: smoke в deploy.sh переключает язык того же аккаунта.
+Перед запуском — `pgrep -fa 'scripts/deploy\.sh'` пусто и на ноде, и на маке: smoke в deploy.sh переключает язык того же аккаунта. Выкаты с чужих машин так не видны — при сомнении спросить владельца.
 
 ```bash
 ssh dv@85.192.61.231 'cd ~/ci/wt/profile-health-filter && source ~/.nvm/nvm.sh && \
@@ -823,7 +823,7 @@ Expected: три `JPEG image data`. Скопировать на мак (`scp dv@
 
 - [ ] **Step 3: Все сценарии на test**
 
-Перед запуском — на ноде `ps -eo command | grep -c "^bash scripts/deploy.sh"` = 0: smoke в deploy.sh переключает язык того же аккаунта.
+Перед запуском — `pgrep -fa 'scripts/deploy\.sh'` пусто и на ноде, и на маке: smoke в deploy.sh переключает язык того же аккаунта. Выкаты с чужих машин так не видны — при сомнении спросить владельца.
 
 ```bash
 ssh dv@85.192.61.231 'cd ~/ci/wt/profile-health-filter && source ~/.nvm/nvm.sh && \
@@ -932,7 +932,7 @@ Expected: семь строк, в каждой — упоминание аюрв
 
 Секрет прода едет с прода на ноду трубой через мак, не печатаясь, в файл с правами 600:
 
-Перед запуском — на ноде `ps -eo command | grep -c "^bash scripts/deploy.sh"` = 0: smoke в deploy.sh переключает язык того же аккаунта.
+Перед запуском — `pgrep -fa 'scripts/deploy\.sh'` пусто и на ноде, и на маке: smoke в deploy.sh переключает язык того же аккаунта. Выкаты с чужих машин так не видны — при сомнении спросить владельца.
 
 ```bash
 ssh -o BatchMode=yes dvolkov@212.113.106.202 'cd ~/spirits_back && node -e "process.stdout.write(require(\"dotenv\").parse(require(\"fs\").readFileSync(\".env\")).DEBUG_SECRET)"' \
