@@ -203,6 +203,38 @@ maybe('сводка расхода и перенос старых трат — �
       expect(r.rowCount).toBe(1);
     });
 
+    it('повторный старт не запирает журнал: открытое списание его не держит', async () => {
+      // Голый CREATE INDEX IF NOT EXISTS берёт ShareLock на таблицу и при уже
+      // существующем индексе и держит его до конца транзакции файла. Тогда
+      // каждый старт API ждал бы любую открытую транзакцию со списанием, а все
+      // списания после — ждали бы его. Ожидание здесь не пауза: при запирании
+      // второй старт стоит, пока транзакция не закрыта, сколько бы ни ждали;
+      // десять секунд — только чтобы прогон не висел.
+      await migrate();
+      const writer = await pool.connect();
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await writer.query('BEGIN');
+        await writer.query(
+          `INSERT INTO token_transactions (user_id, transaction_type, amount, balance_after, description)
+           VALUES ('u-open', 'consumed', -1, 0, 'image')`,
+        );
+        const second = migrate().then(() => 'done');
+        const outcome = await Promise.race([
+          second,
+          new Promise<string>((resolve) => {
+            timer = setTimeout(() => resolve('blocked'), 10_000);
+          }),
+        ]);
+        await writer.query('ROLLBACK');
+        await second;
+        expect(outcome).toBe('done');
+      } finally {
+        clearTimeout(timer);
+        writer.release();
+      }
+    });
+
     it('нет резервной таблицы видео — остальные источники всё равно переносятся', async () => {
       await pool.query(
         `INSERT INTO generated_images (id, user_id, prompt, image_url, tokens_spent, created_at)
