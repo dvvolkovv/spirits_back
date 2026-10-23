@@ -1,4 +1,7 @@
+import { Logger } from '@nestjs/common';
 import axios from 'axios';
+
+const log = new Logger('TelegramAlert');
 
 /**
  * Единая точка отправки алертов мониторинга в Telegram.
@@ -48,7 +51,13 @@ export async function sendTelegramPayload(
         `https://api.telegram.org/bot${token}/sendMessage`,
         { chat_id, ...rest },
         { timeout: 8000 },
-      ).catch(() => { /* один чат недоступен — остальные всё равно получат */ }),
+      ).catch((e: any) => {
+        // Один чат недоступен — остальные всё равно получат. Но молчать нельзя:
+        // так с 09.08 по 23.10.2026 никто не заметил, что личка заблокировала бота.
+        // Только описание от Telegram: в e.config.url лежит токен бота.
+        const why = e?.response?.data?.description || e?.code || e?.message || 'unknown';
+        log.warn(`alert to chat …${String(chat_id).slice(-4)} not delivered: ${why}`);
+      }),
     ),
   );
 }

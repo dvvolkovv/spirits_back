@@ -51,6 +51,9 @@ export SYNTHETIC_PUSH_TOKEN='$PUSH_TOKEN'
 export SYNTHETIC_TEST_REFRESH_JWT='$REFRESH_JWT'
 export SYNTHETIC_STATE_FILE=/var/lib/synthetic/state.json
 export BASE_URL=https://my.linkeon.io
+# Отчёты — по WireGuard прямо в API прода, мимо прокси, который раннер проверяет
+# (23.10.2026 прокси лёг, и отчёты о его падении не дошли).
+export SYNTHETIC_PUSH_URL=http://10.10.0.1:3001/webhook/monitoring/synthetic/push
 cd $REMOTE_DIR
 exec /usr/bin/node synthetic-runner.js
 EOS
