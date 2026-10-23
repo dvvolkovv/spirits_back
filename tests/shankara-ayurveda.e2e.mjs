@@ -49,15 +49,19 @@ const CATEGORIES = ['interests', 'values', 'desires', 'beliefs', 'intents', 'ski
 const TEST_LANGUAGE = 'ru'; // язык тестового аккаунта, к которому прогон его возвращает
 
 // \b в JS не видит границ кириллических слов: «сон» нашёлся бы внутри «персональный».
-const SLEEP = /(^|[^а-яё])(сон|сна|сну|сном|сне|снов|снах|сплю|спит|спать)(?![а-яё])|бессон|недосып|сонлив|просыпа|ночн[а-яё]*\s+пробужд/i;
+const SLEEP = /(^|[^а-яё])(сон|сна|сну|сном|сне|снов|снах|сплю|спит|спать)(?![а-яё])|бессон|недосып|сонлив|просыпа|(ночн[а-яё]*|частые|ранние)\s+пробужд|пробужд[а-яё]*\s+(по\s+)?ноч/i;
 // Доша — именами (вата, питта, капха), не словом «доша»: «узнать свою дошу» — интерес к теме, его брать можно.
 const BODY = /диабет|сахар|глюкоз|инсулин|гастрит|гастроэнтер|желуд|жкт|пищевар|аппетит|болезн|заболев|диагноз|(^|[^а-яё])лекарств(о|а|ами|ах)?(?![а-яё])|симптом|телослож|беремен|мёрзн|мерзн|мерзл|(^|[^а-яё])вес(а|у|ом)?(?![а-яё])|(^|[^а-яё])(ват|питт|капх)[аыеуо](?![а-яё])/i;
 const HEALTH = { test: (s) => SLEEP.test(s) || BODY.test(s) };
 // Только для проб извлекателя 1–3: «лечение…», «здоровье…» там — о болезни человека.
 const PROBE_HEALTH = /лечени|здоров/i;
-const RUNNING = /(^|[^а-яё])(бег|бегом|бега|пробежк[аиу]?)(?![а-яё])/i;
-const YOGA = /(^|[^а-яё])йог(а|и|у|ой|е)?(?![а-яё])/i;
-const CONTROLS = [/шахмат/i, /программир|программист/i, /гитар/i, /аюрвед/i, YOGA, RUNNING];
+const RUNNING = /(^|[^а-яё])(бег|бегом|бега|пробежк[аиу]?|бегов[а-яё]*)(?![а-яё])/i;
+const YOGA = /(^|[^а-яё])йог(?!урт)[а-яё]*/i;
+const CHESS = /шахмат/i;
+const PROGRAMMING = /программир|программист|программн/i;
+const GUITAR = /гитар/i;
+const AYURVEDA = /аюрвед/i;
+const CONTROLS = [CHESS, PROGRAMMING, GUITAR, AYURVEDA, YOGA, RUNNING];
 // Сущности, которые прогон сам создаёт или ищет, — убираются из профиля до и после.
 const isRunArtifact = (e) => HEALTH.test(e) || CONTROLS.some((re) => re.test(e));
 
@@ -192,17 +196,18 @@ async function entities(token) {
  * POST /webhook/profile-update с этими массивами); после — сверяет: запись в
  * граф глотает ошибки Neo4j и отвечает 200, даже если ничего не удалила.
  */
-async function cleanProfile(token, label) {
+async function cleanProfile(token, label, extra = []) {
   const pj = await readProfile(token);
   if (pj.isadmin) throw new Error('TEST_PHONE указывает на админа — профиль не трогаю, прогон остановлен');
+  const isTarget = (e) => isRunArtifact(e) || extra.includes(e);
   const body = {};
   const removed = [];
   for (const c of CATEGORIES) {
     const all = names(pj[c]);
-    const keep = all.filter((e) => !isRunArtifact(e));
+    const keep = all.filter((e) => !isTarget(e));
     if (keep.length !== all.length) {
       body[c] = keep;
-      removed.push(...all.filter((e) => isRunArtifact(e)));
+      removed.push(...all.filter((e) => isTarget(e)));
     }
   }
   if (!removed.length) return removed;
@@ -292,12 +297,14 @@ const scenarios = {
   async extractor(token) {
     // У каждой пробы свой контроль: появился — значит, извлекатель по ней отработал.
     const probes = [
-      { text: 'Скажу о себе: у меня диабет второго типа, и я плохо сплю по ночам. А ещё я люблю шахматы.', controls: [/шахмат/i], none: [HEALTH, PROBE_HEALTH] },
-      { text: 'Я работаю программистом, и у меня диабет.', controls: [/программ/i], none: [HEALTH, PROBE_HEALTH] },
-      { text: 'Я интересуюсь лечением гастрита, а ещё играю на гитаре.', controls: [/гитар/i], none: [HEALTH, PROBE_HEALTH] },
-      { text: 'Я давно интересуюсь аюрведой и йогой, а ещё увлекаюсь бегом.', controls: [/аюрвед/i, YOGA, RUNNING], none: [HEALTH] },
+      { text: 'Скажу о себе: у меня диабет второго типа, и я плохо сплю по ночам. А ещё я люблю шахматы.', controls: [CHESS], none: [HEALTH, PROBE_HEALTH] },
+      { text: 'Я работаю программистом, и у меня диабет.', controls: [PROGRAMMING], none: [HEALTH, PROBE_HEALTH] },
+      { text: 'Я интересуюсь лечением гастрита, а ещё играю на гитаре.', controls: [GUITAR], none: [HEALTH, PROBE_HEALTH] },
+      { text: 'Я давно интересуюсь аюрведой и йогой, а ещё увлекаюсь бегом.', controls: [AYURVEDA, YOGA, RUNNING], none: [HEALTH] },
     ];
     let before = await entities(token);
+    const stale = before.filter((e) => PROBE_HEALTH.test(e) || HEALTH.test(e));
+    if (stale.length) console.log(`⚠ в профиле уже есть: ${JSON.stringify(stale)} — повтор такой утечки ляжет в старую связь и не будет новой сущностью`);
     for (const [i, p] of probes.entries()) {
       const ts = freshTs();
       const reply = await say(token, p.text, ts);
@@ -436,6 +443,7 @@ process.on('unhandledRejection', (e) => {
   process.exit(1);
 });
 
+let runAdded = [];
 try {
   TOKEN = await login();
   const removedBefore = await cleanProfile(TOKEN, 'before-clean');
@@ -453,7 +461,7 @@ try {
   }
 
   const runEnd = await waitForQuiet(TOKEN);
-  const runAdded = runEnd.filter((e) => !runStart.includes(e));
+  runAdded = runEnd.filter((e) => !runStart.includes(e));
   if (!runAdded.length) console.log('⚠ за прогон в профиле не появилось ни одной сущности — итоговая проверка здоровья ничего не доказывает');
   check('прогон целиком: сведения о здоровье не попали в профиль', !has(runAdded, HEALTH), `новые за прогон (${runAdded.length}): ${JSON.stringify(runAdded)}`);
 } catch (e) {
@@ -466,7 +474,7 @@ try {
       check('язык аккаунта вернулся', false, e.message);
     }
     try {
-      const removedAfter = await cleanProfile(TOKEN, 'after-clean');
+      const removedAfter = await cleanProfile(TOKEN, 'after-clean', runAdded.filter((e) => PROBE_HEALTH.test(e)));
       if (removedAfter.length) console.log(`после прогона убрано из профиля: ${JSON.stringify(removedAfter)}`);
     } catch (e) {
       check('чистка профиля после прогона', false, e.message);
