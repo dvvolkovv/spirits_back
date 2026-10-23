@@ -51,10 +51,15 @@ export class BlogNewsService {
     // sessionId один ход: второй запрос с тем же id убивает первый как «новое
     // сообщение». 18.10.2026 метки времени совпали до миллисекунды — ответ
     // достался стенду, прод получил пустой поток и остался без новостей недели.
+    //
+    // Случайный id по времени крона уже не восстановить, а релей пишет в свой
+    // лог именно его (`[notice] <sessionId> preempted`), поэтому он — в логе.
+    const sessionId = `blog-news-${weekKey}-${randomUUID()}`;
+    this.logger.log(`${weekKey}: отбор новостей, sessionId ${sessionId}`);
     const raw = await this.relay.ask(
       buildNewsSelectionPrompt(),
       buildNewsSelectionMessage(weekKey, themes),
-      `blog-news-${weekKey}-${randomUUID()}`,
+      sessionId,
     );
 
     const byTheme = new Map(themes.map((t) => [t.theme, t]));
