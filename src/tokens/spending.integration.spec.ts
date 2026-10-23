@@ -235,9 +235,38 @@ maybe('сводка расхода и перенос старых трат — �
     });
 
     it('два одновременных старта, в том числе первых (индекса ещё нет), переносят каждую запись ровно раз', async () => {
+      // Одновременность — не удача планировщика: без затвора второй старт
+      // успевал прийти, когда первый уже закончил, и тест зеленел даже на
+      // CREATE INDEX до DO, где два перекрывшихся старта ловят deadlock. Тест
+      // сам держит advisory-лок файла, ждёт, пока ОБА старта встанут в
+      // ожидание замка (наблюдаемый факт в pg_stat_activity, не пауза), и
+      // только тогда отпускает.
+      const LOCK = `hashtext('tokens/002_backfill_spend_history')`;
       await seed();
       await pool.query('DROP INDEX IF EXISTS idx_token_transactions_user_created');
-      await Promise.all([migrate002(), migrate002()]);
+      const gate = await pool.connect();
+      try {
+        await gate.query(`SELECT pg_advisory_lock(${LOCK})`);
+        const both = Promise.all([migrate002(), migrate002()]);
+        both.catch(() => undefined); // падение разберёт await ниже
+        const deadline = Date.now() + 10_000;
+        for (;;) {
+          const r = await pool.query(
+            `SELECT count(*)::int AS n FROM pg_stat_activity
+              WHERE datname = current_database() AND wait_event_type = 'Lock'
+                AND query LIKE '-- Перенос в журнал трат%'`,
+          );
+          if (r.rows[0].n >= 2) break;
+          if (Date.now() > deadline) {
+            throw new Error(`прибор: за 10 с в ожидание замка встали ${r.rows[0].n} старта из 2 — advisory-лока в файле нет?`);
+          }
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        await gate.query(`SELECT pg_advisory_unlock(${LOCK})`);
+        await both;
+      } finally {
+        gate.release(true);
+      }
       expect(await reconstructed()).toEqual(SEEDED);
       expect(await indexExists()).toBe(true);
     });
