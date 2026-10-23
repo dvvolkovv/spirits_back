@@ -51,13 +51,19 @@ export SYNTHETIC_PUSH_TOKEN='$PUSH_TOKEN'
 export SYNTHETIC_TEST_REFRESH_JWT='$REFRESH_JWT'
 export SYNTHETIC_STATE_FILE=/var/lib/synthetic/state.json
 export BASE_URL=https://my.linkeon.io
+# Отчёты — по WireGuard прямо в API прода, мимо прокси, который раннер проверяет
+# (23.10.2026 прокси лёг, и отчёты о его падении не дошли).
+export SYNTHETIC_PUSH_URL=http://10.10.0.1:3001/webhook/monitoring/synthetic/push
 cd $REMOTE_DIR
 exec /usr/bin/node synthetic-runner.js
 EOS
 sudo chmod 700 $REMOTE_DIR/synthetic-run.sh"
 
-echo "==> cron.d (*/5) + чистка .disabled-дубля"
-ssh $SSH_OPTS "$NODE3_SSH" "echo '*/5 * * * * root $REMOTE_DIR/synthetic-run.sh >> /var/log/synthetic.log 2>&1' | sudo tee /etc/cron.d/synthetic >/dev/null && sudo chmod 644 /etc/cron.d/synthetic && sudo rm -f /etc/cron.d/synthetic.disabled"
+# */15, как на node-3 по факту. Под этот шаг подогнана проверка на бэке
+# (SyntheticService.checkAndAlert — через 4 минуты после старта прогона), а
+# */5 утроил бы платные пробы chat_streaming: 96 → 288 в сутки.
+echo "==> cron.d (*/15) + чистка .disabled-дубля"
+ssh $SSH_OPTS "$NODE3_SSH" "echo '*/15 * * * * root $REMOTE_DIR/synthetic-run.sh >> /var/log/synthetic.log 2>&1' | sudo tee /etc/cron.d/synthetic >/dev/null && sudo chmod 644 /etc/cron.d/synthetic && sudo rm -f /etc/cron.d/synthetic.disabled"
 
 echo "==> Прогон для проверки"
 ssh $SSH_OPTS "$NODE3_SSH" "sudo $REMOTE_DIR/synthetic-run.sh 2>&1 | tail -8"

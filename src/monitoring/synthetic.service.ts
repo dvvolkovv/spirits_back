@@ -12,27 +12,44 @@ import { PgService } from '../common/services/pg.service';
 // Ключ авторизации — `refresh_jwt`, именно его шлёт раннер. До 2026-08-21 здесь
 // стоял `auth_refresh`, которого в synthetic_runs не существовало никогда: сбой
 // авторизации не алертился напрямую, только рикошетом через chat_streaming.
-const CRITICAL_SCENARIOS = (process.env.SYNTHETIC_CRITICAL_SCENARIOS || 'chat_streaming,refresh_jwt')
+// site_reachable — главная my.linkeon.io через прокси Selectel, то есть то, что
+// видит пользователь. 23.10.2026 прокси заблокировали за неуплату, и без этого
+// сценария падение сайта пришло бы алертом про refresh_jwt.
+const CRITICAL_SCENARIOS = (process.env.SYNTHETIC_CRITICAL_SCENARIOS || 'site_reachable,chat_streaming,refresh_jwt')
   .split(',').map((s) => s.trim()).filter(Boolean);
 // Если раннер (node-3 cron) перестал слать результаты дольше этого — мониторинг
 // «ослеп», тоже алертим.
 const STALE_MINUTES = Number(process.env.SYNTHETIC_STALE_MINUTES || 40);
 const REALERT_HOURS = Number(process.env.SYNTHETIC_REALERT_H || 3);
-// Сценарии, которые пишет САМ бэкенд через record(), а не внешний раннер с
-// node-3. Свежесть считается только по внешним: иначе in-process запись каждые
-// 5 минут держит «newest» вечно свежим, и детектор «раннер умер» больше никогда
-// не сработает — мониторинг ослепнет ровно так, как этот детектор и должен был
-// поймать. Собственные алерты у таких сценариев свои (см. TgHealthService).
-const IN_PROCESS_SCENARIOS = (process.env.SYNTHETIC_IN_PROCESS_SCENARIOS || 'tg_webhook,yookassa_shop')
-  .split(',').map((s) => s.trim()).filter(Boolean);
+// Сценарии, которые шлёт внешний раннер (scripts/synthetic-runner.js на node-3).
+// Свежесть «жив ли раннер» считается только по ним. Раньше было наоборот — «всё,
+// кроме того, что пишет сам бэкенд», — и в список исключений забыли
+// chat_quality_probe (QualityMonitorService, каждые 30 минут): с 13.08.2026
+// свежесть ни разу не превышала порог, детектор был мёртв. Положительный список
+// ломается безопасно: новый in-process сценарий ничего не маскирует, а сценарий
+// раннера, не внесённый сюда, просто не участвует в подсчёте. Совпадение с
+// раннером проверяет synthetic.stale.spec.ts.
+export const RUNNER_SCENARIOS: readonly string[] = [
+  'refresh_jwt',
+  'site_reachable',
+  'agents_endpoint',
+  'profile_with_jwt',
+  'tokens_balance',
+  'chat_streaming',
+  'agent_avatar',
+];
+
+// Алерт уходит с parse_mode HTML: незнакомый тег в тексте ошибки — 400 от
+// Telegram, и алерт пропадает до следующего кулдауна.
+const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 /**
  * Synthetic E2E results.
  *
  * Cron job on node-3 runs ./scripts/synthetic-runner.js every N minutes,
  * exercising critical paths against my.linkeon.io. Each scenario result
- * is POSTed back to /webhook/admin/monitoring/synthetic/push with the
- * shared SYNTHETIC_PUSH_TOKEN.
+ * is POSTed back to /webhook/monitoring/synthetic/push with the
+ * shared SYNTHETIC_PUSH_TOKEN — over WireGuard, not through the proxy it checks.
  *
  * Per-scenario overview takes the latest run + a 24h aggregate so the UI
  * can show: current status, last run time, last error, recent reliability.
@@ -67,7 +84,10 @@ export class SyntheticService implements OnModuleInit {
   // Проверка результатов synthetic + Telegram-алерты. Сам раннер крутится на
   // node-3 и пишет сюда; здесь — реакция на его данные (раньше её не было:
   // synthetic копил статусы, но никто не оповещал о падении).
-  @Cron('0 */15 * * * *')
+  // Раннер стартует по */15 и даже при зависшем прокси (все повторы по
+  // таймауту) укладывается примерно в 2,5 минуты. Проверка в ту же секунду
+  // читала прошлый прогон, и алерт опаздывал до 30 минут — поэтому сдвиг.
+  @Cron('0 4,19,34,49 * * * *')
   async checkAndAlert(): Promise<void> {
     if (!this.pg) return;
     let overview: SyntheticOverview;
@@ -99,7 +119,7 @@ export class SyntheticService implements OnModuleInit {
     // раннер не шлёт данные, мониторинг ослеп.
     // Внешних результатов нет вообще (свежая среда, раннер ещё не заводили) —
     // молчим, как и при полностью пустой таблице.
-    const external = overview.scenarios.filter((s) => !IN_PROCESS_SCENARIOS.includes(s.scenario));
+    const external = overview.scenarios.filter((s) => RUNNER_SCENARIOS.includes(s.scenario));
     const newest = external
       .map((s) => (s.latestTs ? new Date(s.latestTs).getTime() : 0))
       .reduce((a, b) => Math.max(a, b), 0);
@@ -123,25 +143,46 @@ export class SyntheticService implements OnModuleInit {
     const authDown = overview.scenarios.some(
       (x) => x.scenario === 'refresh_jwt' && x.latestSuccess === false,
     );
+    // Сайт не открывается — через прокси не проходит ничего, и остальные
+    // сценарии красные рикошетом. Сообщаем о первопричине, а их статус не
+    // трогаем: про их падение мы не сообщали, и «восстановлен» по ним потом
+    // был бы ответом на незаданный вопрос.
+    // Строка старше порога свежести значит, что раннер сценарий больше не шлёт
+    // (на node-3 уже бывала старая копия раннера). По такой строке нельзя ни
+    // алертить, ни глушить остальных — глушение стало бы вечным.
+    const fresh = (x: ScenarioStatus) =>
+      !!x.latestTs && now.getTime() - new Date(x.latestTs).getTime() <= STALE_MINUTES * 60_000;
+    const siteDown = overview.scenarios.some(
+      (x) => x.scenario === 'site_reachable' && x.latestSuccess === false && fresh(x),
+    );
 
     // 2. Критичные сценарии: падение → алерт, восстановление → отбой.
     for (const s of overview.scenarios) {
       if (!CRITICAL_SCENARIOS.includes(s.scenario)) continue;
+      if (s.scenario === 'site_reachable' && !fresh(s)) continue;
+      if (siteDown && s.scenario !== 'site_reachable') continue;
       const ok = s.latestSuccess === true;
       const prev = this.lastStatus.get(s.scenario);
       if (!ok && (prev !== false || cooled(s.scenario))) {
         const derived = s.scenario === 'chat_streaming' && authDown;
-        const label = s.scenario === 'chat_streaming' && !derived ? 'AI-чат (r.linkeon.io)' : s.scenario;
+        const label =
+          s.scenario === 'site_reachable' ? 'my.linkeon.io не открывается'
+            : s.scenario === 'chat_streaming' && !derived ? 'AI-чат (r.linkeon.io)'
+              : s.scenario;
         await send(
           `<b>🔴 Synthetic: критичный сценарий упал</b>\n` +
           `Сценарий: <b>${label}</b>\n` +
-          `Ошибка: ${s.latestMessage ? String(s.latestMessage).slice(0, 160) : '—'}\n` +
+          `Ошибка: ${s.latestMessage ? esc(String(s.latestMessage).slice(0, 160)) : '—'}\n` +
           (derived ? `⚠️ Причина не в AI: не прошла авторизация (<b>refresh_jwt</b>), сам чат не проверялся.\n` : '') +
+          (s.scenario === 'site_reachable'
+            ? `⚠️ Остальные сценарии красные рикошетом. Проверь прокси Selectel 92.53.64.147 (в т.ч. баланс) и прод 212.113.106.202.\n`
+            : '') +
           `Успех за 24ч: ${s.successRate24hPct != null ? s.successRate24hPct.toFixed(0) + '%' : '—'} · проверка: ${s.latestTs || '—'}`,
         );
         this.lastAlertAt.set(s.scenario, now);
       } else if (ok && prev === false) {
-        await send(`<b>🟢 Synthetic: «${s.scenario}» восстановлен</b>\nСнова отвечает (проверка: ${s.latestTs || '—'}).`);
+        const name = s.scenario === 'site_reachable' ? 'my.linkeon.io' : s.scenario;
+        await send(`<b>🟢 Synthetic: «${name}» восстановлен</b>\nСнова отвечает (проверка: ${s.latestTs || '—'}).`);
         this.lastAlertAt.delete(s.scenario);
       }
       this.lastStatus.set(s.scenario, ok);

@@ -92,7 +92,8 @@ export class MonitoringService {
 
   constructor(@Optional() private readonly neo4j?: Neo4jService) {}
 
-  private async query(promql: string): Promise<Array<{ metric: Record<string, string>; value: [number, string] }>> {
+  /** Мгновенный PromQL-запрос к Prometheus на node-3 (по WireGuard). Бросает при недоступности. */
+  async query(promql: string): Promise<Array<{ metric: Record<string, string>; value: [number, string] }>> {
     const url = `${PROM_URL}/api/v1/query?query=${encodeURIComponent(promql)}`;
     const res = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
     if (!res.ok) throw new Error(`prom ${res.status} for ${promql}`);

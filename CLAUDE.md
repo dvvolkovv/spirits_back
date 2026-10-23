@@ -432,11 +432,43 @@ assistant-строки», а это ложная тревога на каждо�
 | `TG_PENDING_UPDATES_MAX` | 20 | Порог очереди недоставленных апдейтов |
 | `TG_WEBHOOK_ERROR_FRESH_MIN` | 30 | Насколько свежей должна быть ошибка доставки, чтобы алертить |
 | `TG_HEALTH_ALERT_COOLDOWN_H` | 3 | Кулдаун повторного алерта |
-| `SYNTHETIC_IN_PROCESS_SCENARIOS` | `tg_webhook` | Сценарии, которые пишет сам бэкенд — исключены из детектора «раннер умер» |
 
-⚠️ `SYNTHETIC_IN_PROCESS_SCENARIOS` не косметика: свежесть synthetic считается по
-максимуму среди сценариев, и запись изнутри процесса каждые 5 минут держала бы
-«newest» вечно свежим — падение раннера на node-3 перестало бы детектироваться.
+⚠️ Свежесть synthetic («жив ли раннер на node-3») считается только по сценариям
+из `RUNNER_SCENARIOS` в `src/monitoring/synthetic.service.ts` — положительному
+списку того, что шлёт `scripts/synthetic-runner.js`. Сценарии, которые пишет сам
+бэкенд (`tg_webhook`, `yookassa_shop`, `chat_quality_probe`), в подсчёт не входят
+и вносить их никуда не нужно. До 23.10.2026 было наоборот — список исключений
+`SYNTHETIC_IN_PROCESS_SCENARIOS`, и забытый в нём `chat_quality_probe` с 13.08
+держал свежесть вечно в пороге: детектор не работал. Добавляя сценарий в раннер,
+добавь его и в `RUNNER_SCENARIOS` — расхождение ловит `synthetic.stale.spec.ts`.
+
+### Доставка алертов
+
+Алерты идут двумя путями через одного бота `@linkeon_alert_bot`:
+- **Prometheus/Alertmanager на node-3** (`/opt/observability`, конфиг не в git) —
+  инфраструктура: узлы, блэкбокс-пробы my.linkeon.io, TLS.
+- **Бэкенд** (`sendTelegramAlert`, чаты из `TELEGRAM_CHAT_ID`) — продуктовые сторожа.
+
+С 09.08 по 23.10.2026 Alertmanager слал в личку, где бота заблокировали, и не
+доставил ни одного алерта. Теперь `AlertDeliveryService` раз в 5 минут опрашивает
+Prometheus по WireGuard и сообщает бэкенд-путём, если порвано звено
+Prometheus → Alertmanager → Telegram (Prometheus не отвечает, Alertmanager выпал
+из скрейпа, растёт `alertmanager_notifications_failed_total`), с перечнем
+горящих page-алертов. Нужны скрейп-джобы `alertmanager` и `prometheus` (собственные
+метрики) в `prometheus.yml` на node-3. Отбой «снова доходят» после сбоя доставки в
+Telegram — только когда Alertmanager реально что-то отправил: отсутствие отказов
+может значить, что отправлять было нечего.
+Отказы доставки самого бэкенда пишутся в лог: `not delivered` в `pm2 logs linkeon-api`.
+
+| ENV | Дефолт | Что делает |
+|-----|--------|------------|
+| `ALERT_DELIVERY_ALERT_AFTER` | 2 | Сколько проверок подряд (по 5 мин) до алерта |
+| `ALERT_DELIVERY_REALERT_H` | 3 | Напоминание, пока сбой длится |
+
+Synthetic-раннер шлёт отчёты на `SYNTHETIC_PUSH_URL` — на node-3 это
+`http://10.10.0.1:3001/...` по WireGuard, мимо прокси, который он проверяет
+(сценарий `site_reachable`). 23.10.2026 прокси лёг, и отчёты о его падении
+ушли в тот же мёртвый прокси.
 
 ### Misc
 - `POST /webhook/imagegen` — генерация изображений (заглушка)
