@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { BlogNewsService, MAX_WEEKLY_PICKS } from './blog-news.service';
 import { MISC_THEME } from './blog-news.themes';
 
@@ -183,6 +184,31 @@ describe('BlogNewsService.weeklyTopics — что уходит агенту', ()
     const { relay, svc } = make(REAL_WEEK, reply());
     await svc.weeklyTopics(WEEK);
     expect(String(relay.ask.mock.calls[0][2])).toContain('2026-W38');
+  });
+
+  it('sessionId разный и при одном и том же времени — прод и стенд зовут отбор в одну миллисекунду', async () => {
+    // 18.10.2026 оба сервера пришли в релей с `blog-news-2026-W42-1792303200004`.
+    // Релей держит по sessionId один ход и убил первый запрос как «новое
+    // сообщение»: ответ достался стенду, прод остался без новостей недели.
+    const prod = make(REAL_WEEK, reply());
+    const stand = make(REAL_WEEK, reply());
+    await prod.svc.weeklyTopics(WEEK);
+    await stand.svc.weeklyTopics(WEEK);
+    expect(String(prod.relay.ask.mock.calls[0][2])).not.toBe(String(stand.relay.ask.mock.calls[0][2]));
+  });
+
+  it('sessionId, с которым ушёл отбор, виден в логе — по нему ход сверяется с логом релея', async () => {
+    // По времени крона случайный id уже не восстановить, а релей пишет в свой
+    // лог именно его: `[notice] <sessionId> preempted`.
+    const log = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    try {
+      const { relay, svc } = make(REAL_WEEK, reply());
+      await svc.weeklyTopics(WEEK);
+      const sessionId = String(relay.ask.mock.calls[0][2]);
+      expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toContain(sessionId);
+    } finally {
+      log.mockRestore();
+    }
   });
 });
 
