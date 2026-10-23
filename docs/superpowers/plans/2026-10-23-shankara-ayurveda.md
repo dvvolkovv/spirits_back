@@ -256,6 +256,8 @@ Expected: `profile-extraction-prompt.spec.ts` — 6 passed.
 
 ### Task 2: Сервис берёт промпт из функции
 
+_После ревью сторож по исходнику заменён поведенческим тестом обоих путей (CLI и OpenRouter) — см. `src/neo4j/neo4j-extraction-wiring.spec.ts`._
+
 **Files:**
 - Create: `src/neo4j/neo4j-extraction-wiring.spec.ts`
 - Modify: `src/neo4j/neo4j.service.ts:1-5`, `:523-563`
@@ -321,7 +323,7 @@ git push -q; SHA=$(git rev-parse HEAD)
 ssh dv@85.192.61.231 "cd ~/ci/wt/profile-health-filter && git fetch -q origin feat/profile-health-filter && git checkout -q --detach $SHA && source ~/.nvm/nvm.sh && npx jest src/neo4j src/tg-bot/tg-router.memory.spec.ts src/chat/chat.cost-growth.spec.ts src/chat/chat.service.masha-cost.spec.ts 2>&1 | tail -15"
 ```
 
-Expected: все наборы зелёные (8 тестов в `src/neo4j`).
+Expected: все наборы зелёные (9 тестов в `src/neo4j`: 7 + 2).
 
 ---
 
@@ -587,7 +589,7 @@ SHA=$(git -C ~/Downloads/spirits_back rev-parse feat/profile-health-filter)
 ssh dv@85.192.61.231 "cd ~/ci/wt/profile-health-filter && git fetch -q origin feat/profile-health-filter && git checkout -q --detach $SHA && source ~/.nvm/nvm.sh && npx jest src/ --silent 2>&1 | grep -E '^(FAIL|Tests:)' | sort > ~/ci/wt/phf-branch.txt; diff <(grep ^FAIL ~/ci/wt/phf-base.txt) <(grep ^FAIL ~/ci/wt/phf-branch.txt) && echo no-new-failures; grep Tests: ~/ci/wt/phf-branch.txt"
 ```
 
-Expected: `no-new-failures`; в `Tests:` прибавилось 8 passed против базы.
+Expected: `no-new-failures`; в `Tests:` прибавилось 9 passed против базы.
 
 - [ ] **Step 3: Типы сборки**
 
@@ -673,6 +675,8 @@ Expected: на обоих — `MERGE_SHA` и `1`; в reflog прода нет `r
 
 - [ ] **Step 1: Прогон сценария extractor на ноде против API test**
 
+Перед запуском — `pgrep -fa 'scripts/deploy\.sh'` пусто и на ноде, и на маке: smoke в deploy.sh переключает язык того же аккаунта. Выкаты с чужих машин так не видны — при сомнении спросить владельца.
+
 ```bash
 ssh dv@85.192.61.231 'cd ~/ci/wt/profile-health-filter && source ~/.nvm/nvm.sh && \
   DEBUG_SECRET=$(cd ~/spirits_back && node -e "process.stdout.write(require(\"dotenv\").parse(require(\"fs\").readFileSync(\".env\")).DEBUG_SECRET)") \
@@ -680,7 +684,7 @@ ssh dv@85.192.61.231 'cd ~/ci/wt/profile-health-filter && source ~/.nvm/nvm.sh &
   SCENARIOS=extractor node tests/shankara-ayurveda.e2e.mjs'
 ```
 
-Expected: `✓ извлекатель: здоровье не попало в профиль` и `✓ извлекатель: интерес к аюрведе попал в профиль`. Если второе красное — правило режет слишком широко; если первое — правило не держит: в обоих случаях вернуться к формулировке в задаче 1, не катить инструкцию Шанкары.
+Expected: у всех четырёх проб `✓ … контроль появился` и `✓ … сведения о здоровье не попали`, плюс `✓ прогон целиком: …`. Красный «контроль не появился» — извлекатель не отработал (pm2-логи), а не «правило режет»; красный «здоровье попало» — правило не держит: вернуться к формулировке в задаче 1, инструкцию Шанкары не катить.
 
 ---
 
@@ -819,6 +823,8 @@ Expected: три `JPEG image data`. Скопировать на мак (`scp dv@
 
 - [ ] **Step 3: Все сценарии на test**
 
+Перед запуском — `pgrep -fa 'scripts/deploy\.sh'` пусто и на ноде, и на маке: smoke в deploy.sh переключает язык того же аккаунта. Выкаты с чужих машин так не видны — при сомнении спросить владельца.
+
 ```bash
 ssh dv@85.192.61.231 'cd ~/ci/wt/profile-health-filter && source ~/.nvm/nvm.sh && \
   DEBUG_SECRET=$(cd ~/spirits_back && node -e "process.stdout.write(require(\"dotenv\").parse(require(\"fs\").readFileSync(\".env\")).DEBUG_SECRET)") \
@@ -829,7 +835,7 @@ ssh dv@85.192.61.231 'cd ~/ci/wt/profile-health-filter && source ~/.nvm/nvm.sh &
 
 (`setsid -f … < /dev/null` — иначе ssh держит канал до конца прогона.)
 
-Ждать до 20 минут, потом:
+Ждать финальной строки лога (`✓ все автоматические проверки зелёные` или `✗ провалено проверок: N`), а не таймера — прогон идёт 15–40 минут:
 
 ```bash
 ssh dv@85.192.61.231 'cat ~/shankara-e2e/test.log'
@@ -842,6 +848,8 @@ Expected: все `✓`, последняя строка `✓ все автома
 ```bash
 scp -r dv@85.192.61.231:~/shankara-e2e/out-test <scratchpad>/shankara-out-test
 ```
+
+Ответы прогона — в подпапке с меткой времени (её печатает предпоследняя строка лога `ответы прогона: …`); читать только её.
 
 Чек-лист (каждый пункт — да/нет, с цитатой при «нет»):
 
@@ -924,6 +932,8 @@ Expected: семь строк, в каждой — упоминание аюрв
 
 Секрет прода едет с прода на ноду трубой через мак, не печатаясь, в файл с правами 600:
 
+Перед запуском — `pgrep -fa 'scripts/deploy\.sh'` пусто и на ноде, и на маке: smoke в deploy.sh переключает язык того же аккаунта. Выкаты с чужих машин так не видны — при сомнении спросить владельца.
+
 ```bash
 ssh -o BatchMode=yes dvolkov@212.113.106.202 'cd ~/spirits_back && node -e "process.stdout.write(require(\"dotenv\").parse(require(\"fs\").readFileSync(\".env\")).DEBUG_SECRET)"' \
   | ssh dv@85.192.61.231 'umask 077; mkdir -p ~/shankara-e2e; cat > ~/shankara-e2e/.prod-debug-secret'
@@ -933,7 +943,7 @@ ssh dv@85.192.61.231 'cd ~/ci/wt/profile-health-filter && source ~/.nvm/nvm.sh &
   SCENARIOS=chart,dosha,extractor setsid -f node tests/shankara-ayurveda.e2e.mjs > ~/shankara-e2e/prod.log 2>&1 < /dev/null'
 ```
 
-Ждать до 10 минут, потом:
+Ждать финальной строки лога, как в задаче 8:
 
 ```bash
 ssh dv@85.192.61.231 'cat ~/shankara-e2e/prod.log; rm -f ~/shankara-e2e/.prod-debug-secret'
