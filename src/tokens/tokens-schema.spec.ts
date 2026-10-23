@@ -109,3 +109,73 @@ describe('провайдер зарегистрирован в модуле', ()
     expect(providers).toContain('TokensSchemaService');
   });
 });
+
+describe('миграция 002 — перенос старых трат', () => {
+  /** Текст 002 так, как его получает база, без комментариев. */
+  async function sql002(): Promise<{ text: string; order: number; order001: number }> {
+    const { svc, queries } = makeService();
+    await svc.onModuleInit();
+    const order = queries.findIndex((q) => q.includes('idx_token_transactions_user_created'));
+    const order001 = queries.findIndex((q) => q.includes('add_user_tokens'));
+    if (order < 0) throw new Error('миграция 002 не применена');
+    const text = queries[order].replace(/\/\*[\s\S]*?\*\//g, '').replace(/--[^\n]*/g, '');
+    return { text, order, order001 };
+  }
+
+  it('применяется после 001', async () => {
+    const { order, order001 } = await sql002();
+    expect(order001).toBeGreaterThanOrEqual(0);
+    expect(order).toBeGreaterThan(order001);
+  });
+
+  it('баланс не трогает: ни процедур списания и зачисления, ни UPDATE баланса', async () => {
+    const { text } = await sql002();
+    expect(text).not.toMatch(/consume_user_tokens|add_user_tokens/i);
+    expect(text).not.toMatch(/UPDATE\s+(public\.)?ai_profiles_consolidated/i);
+  });
+
+  it('четыре источника, каждый под to_regclass, каждая строка помечена', async () => {
+    const { text } = await sql002();
+    expect(text.match(/INSERT INTO token_transactions/g)).toHaveLength(4);
+    expect(text.match(/'reconstructed', true/g)).toHaveLength(4);
+    for (const src of ['generated_images', 'video_jobs', 'video_jobs_expired_bak_20260728', 'tg_bot_messages']) {
+      expect(text).toContain(`to_regclass('public.${src}')`);
+      expect(text).toContain(`'source', '${src}'`);
+    }
+  });
+
+  it('идемпотентна и сериализована: индекс IF NOT EXISTS, advisory-лок, без явного BEGIN/COMMIT', async () => {
+    const { text } = await sql002();
+    expect(text).toMatch(/CREATE INDEX IF NOT EXISTS idx_token_transactions_user_created/);
+    expect(text).toContain('pg_advisory_xact_lock');
+    // Атомарность даёт сам файл — один оператор DO. COMMIT посреди файла
+    // разрезал бы его на части, которые откатываются порознь.
+    expect(text).not.toMatch(/^\s*(BEGIN|COMMIT|ROLLBACK)\s*;/im);
+  });
+
+  it('файл — один оператор DO; индекс внутри, после advisory-лока и lock_timeout, и только если его нет', async () => {
+    const { text } = await sql002();
+    const body = text.trim();
+    // Голый CREATE INDEX IF NOT EXISTS до DO берёт ShareLock на журнал и при
+    // готовом индексе — на каждом старте, на весь перенос; два первых старта
+    // одновременно ловили на нём deadlock. Проверено на PG 16.
+    expect(body.startsWith('DO $backfill$')).toBe(true);
+    expect(body.endsWith('$backfill$;')).toBe(true);
+    expect(body.match(/CREATE INDEX/g)).toHaveLength(1);
+    const lock = body.indexOf('pg_advisory_xact_lock');
+    const timeout = body.search(/PERFORM\s+set_config\('lock_timeout',\s*'5s',\s*true\)/);
+    const index = body.search(
+      /IF\s+to_regclass\('public\.idx_token_transactions_user_created'\)\s+IS\s+NULL\s+THEN\s+CREATE INDEX IF NOT EXISTS idx_token_transactions_user_created\b/,
+    );
+    expect(lock).toBeGreaterThan(0);
+    expect(timeout).toBeGreaterThan(lock);
+    expect(index).toBeGreaterThan(timeout);
+  });
+
+  it('границы переноса — моменты, с которых такие списания пишутся в журнал', async () => {
+    const { text } = await sql002();
+    expect(text).toContain("'2026-08-08 09:02:12+00'");
+    expect(text).toContain("'2026-08-20 02:55:51+00'");
+    expect(text).toContain("'2026-08-11 11:28:37+00'");
+  });
+});

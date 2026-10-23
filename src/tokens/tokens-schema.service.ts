@@ -32,6 +32,9 @@ export class TokensSchemaService implements OnModuleInit {
 
   async onModuleInit() {
     await this.applyMigration('001_add_user_tokens_lock.sql');
+    // Индекс журнала под сводку расхода и перенос старых трат мимо журнала.
+    // Идемпотентно: выполняется при каждом старте, повторно ничего не добавляет.
+    await this.applyMigration('002_backfill_spend_history.sql');
   }
 
   /**
