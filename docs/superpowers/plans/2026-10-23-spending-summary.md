@@ -1269,13 +1269,11 @@ bash ../spending-node-run.sh back 'sudo -u postgres psql -qc "DROP DATABASE IF E
 
 - [ ] **Step 4: Сломать нарочно — убедиться, что прибор видит**
 
-Во временной правке (НЕ коммитить в итоговую историю — после проверки `git reset --hard HEAD~1`):
-в `002_backfill_spend_history.sql` убрать строку `AND v.status = 'ready'` из блока `video_jobs`, закоммитить, прогнать шаг 3.
-Ожидается: красный «переносит только своё…» (появилась строка failed-видео). Затем:
+Пробная поломка: в `002_backfill_spend_history.sql` убрать строку `AND v.status = 'ready'` из блока `video_jobs`, закоммитить (`test(tokens): проба — перенос без фильтра статуса видео, ждём красный`), прогнать шаг 3.
+Ожидается: красный «переносит только своё…» (появилась строка failed-видео). Затем откатить **revert-коммитом** — не `reset`: помощник уже отправил пробный коммит в `origin/feat/spending-summary`, и после `reset` следующий push отказал бы (историю ветки не переписываем):
 
 ```bash
-git reset -q --hard HEAD~1
-bash ../spending-node-run.sh back 'git log -1 --format=%s'
+git revert --no-edit HEAD
 ```
 и прогнать шаг 3 ещё раз — снова зелёный. Записать в отчёт оба результата.
 
