@@ -39,6 +39,10 @@ export const RUNNER_SCENARIOS: readonly string[] = [
   'agent_avatar',
 ];
 
+// Алерт уходит с parse_mode HTML: незнакомый тег в тексте ошибки — 400 от
+// Telegram, и алерт пропадает до следующего кулдауна.
+const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
 /**
  * Synthetic E2E results.
  *
@@ -80,9 +84,10 @@ export class SyntheticService implements OnModuleInit {
   // Проверка результатов synthetic + Telegram-алерты. Сам раннер крутится на
   // node-3 и пишет сюда; здесь — реакция на его данные (раньше её не было:
   // synthetic копил статусы, но никто не оповещал о падении).
-  // Раннер стартует по */15 и укладывается в пару минут. Проверка в ту же
-  // секунду читала прошлый прогон, и алерт опаздывал до 30 минут — поэтому сдвиг.
-  @Cron('0 3,18,33,48 * * * *')
+  // Раннер стартует по */15 и даже при зависшем прокси (все повторы по
+  // таймауту) укладывается примерно в 2,5 минуты. Проверка в ту же секунду
+  // читала прошлый прогон, и алерт опаздывал до 30 минут — поэтому сдвиг.
+  @Cron('0 4,19,34,49 * * * *')
   async checkAndAlert(): Promise<void> {
     if (!this.pg) return;
     let overview: SyntheticOverview;
@@ -142,13 +147,19 @@ export class SyntheticService implements OnModuleInit {
     // сценарии красные рикошетом. Сообщаем о первопричине, а их статус не
     // трогаем: про их падение мы не сообщали, и «восстановлен» по ним потом
     // был бы ответом на незаданный вопрос.
+    // Строка старше порога свежести значит, что раннер сценарий больше не шлёт
+    // (на node-3 уже бывала старая копия раннера). По такой строке нельзя ни
+    // алертить, ни глушить остальных — глушение стало бы вечным.
+    const fresh = (x: ScenarioStatus) =>
+      !!x.latestTs && now.getTime() - new Date(x.latestTs).getTime() <= STALE_MINUTES * 60_000;
     const siteDown = overview.scenarios.some(
-      (x) => x.scenario === 'site_reachable' && x.latestSuccess === false,
+      (x) => x.scenario === 'site_reachable' && x.latestSuccess === false && fresh(x),
     );
 
     // 2. Критичные сценарии: падение → алерт, восстановление → отбой.
     for (const s of overview.scenarios) {
       if (!CRITICAL_SCENARIOS.includes(s.scenario)) continue;
+      if (s.scenario === 'site_reachable' && !fresh(s)) continue;
       if (siteDown && s.scenario !== 'site_reachable') continue;
       const ok = s.latestSuccess === true;
       const prev = this.lastStatus.get(s.scenario);
@@ -161,7 +172,7 @@ export class SyntheticService implements OnModuleInit {
         await send(
           `<b>🔴 Synthetic: критичный сценарий упал</b>\n` +
           `Сценарий: <b>${label}</b>\n` +
-          `Ошибка: ${s.latestMessage ? String(s.latestMessage).slice(0, 160) : '—'}\n` +
+          `Ошибка: ${s.latestMessage ? esc(String(s.latestMessage).slice(0, 160)) : '—'}\n` +
           (derived ? `⚠️ Причина не в AI: не прошла авторизация (<b>refresh_jwt</b>), сам чат не проверялся.\n` : '') +
           (s.scenario === 'site_reachable'
             ? `⚠️ Остальные сценарии красные рикошетом. Проверь прокси Selectel 92.53.64.147 (в т.ч. баланс) и прод 212.113.106.202.\n`

@@ -454,7 +454,10 @@ assistant-строки», а это ложная тревога на каждо�
 Prometheus по WireGuard и сообщает бэкенд-путём, если порвано звено
 Prometheus → Alertmanager → Telegram (Prometheus не отвечает, Alertmanager выпал
 из скрейпа, растёт `alertmanager_notifications_failed_total`), с перечнем
-горящих page-алертов. Нужен скрейп-джоб `alertmanager` в `prometheus.yml` на node-3.
+горящих page-алертов. Нужны скрейп-джобы `alertmanager` и `prometheus` (собственные
+метрики) в `prometheus.yml` на node-3. Отбой «снова доходят» после сбоя доставки в
+Telegram — только когда Alertmanager реально что-то отправил: отсутствие отказов
+может значить, что отправлять было нечего.
 Отказы доставки самого бэкенда пишутся в лог: `not delivered` в `pm2 logs linkeon-api`.
 
 | ENV | Дефолт | Что делает |

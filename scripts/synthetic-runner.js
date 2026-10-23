@@ -31,6 +31,11 @@ const PUSH_URL = process.env.SYNTHETIC_PUSH_URL || `${BASE}/webhook/monitoring/s
 const TOKEN = process.env.SYNTHETIC_PUSH_TOKEN || '';
 const STATE_FILE = process.env.SYNTHETIC_STATE_FILE || '/var/lib/synthetic/state.json';
 const TIMEOUT_MS = 30_000;
+// Главная — статика в ~10 КБ, обычно ~0,4 с; с повторами укладываемся в минуту.
+const SITE_TIMEOUT_MS = 15_000;
+// Без таймаута зависший API держал бы каждую отправку до 300 с (встроенный
+// таймаут fetch в Node) — прогон растягивался на полчаса и наезжал на следующий.
+const PUSH_TIMEOUT_MS = 15_000;
 const AGENT_UUID = '0cdacf32-7bfd-4888-b24f-3a6af3b5f99e';
 const REFRESH_ATTEMPTS = Number(process.env.SYNTHETIC_REFRESH_ATTEMPTS || 3);
 const RETRY_BASE_MS = Number(process.env.SYNTHETIC_RETRY_BASE_MS || 1500);
@@ -109,6 +114,24 @@ async function refreshWithRetry() {
   throw new Error(`${lastErr?.message || 'refresh failed'} (попыток: ${REFRESH_ATTEMPTS})`);
 }
 
+/**
+ * Повтор для сценария, который критичен сам по себе: одиночный подвисший
+ * коннект (как у refresh 21.08) не должен будить людей алертом «сайт не
+ * открывается». Попытки и паузы — те же, что у refresh.
+ */
+async function withRetry(fn) {
+  let lastErr;
+  for (let attempt = 1; attempt <= REFRESH_ATTEMPTS; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      if (attempt < REFRESH_ATTEMPTS) await sleep(RETRY_BASE_MS * attempt);
+    }
+  }
+  throw new Error(`${lastErr?.message || 'failed'} (попыток: ${REFRESH_ATTEMPTS})`);
+}
+
 // Плейсхолдеры, которые бэк/relay отдают ЮЗЕРУ при недоступности модели.
 // Байты приходят (стрим «работает»), но это не ответ AI — сбой. Инцидент
 // 2026-07-10: OAuth-токен relay протух, все ответы = «временный сбой…»,
@@ -158,16 +181,22 @@ const scenarios = (jwtUser) => [
     // что пришёл именно наш SPA: хостер при блокировке может ответить 200
     // своей заглушкой.
     key: 'site_reachable',
-    run: async () => {
-      const ft = fetchTimeout(TIMEOUT_MS);
-      const r = await fetch(`${BASE}/`, { signal: ft.signal }); ft.done();
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const ct = r.headers.get('content-type') || '';
-      if (!ct.startsWith('text/html')) throw new Error(`bad content-type ${ct}`);
-      const html = await r.text();
-      if (!html.includes('id="root"')) throw new Error('не наша страница: нет <div id="root">');
-      return null;
-    },
+    run: () => withRetry(async () => {
+      // Таймаут снимаем после чтения тела: зависшее тело тоже должно обрываться.
+      const ft = fetchTimeout(SITE_TIMEOUT_MS);
+      try {
+        const r = await fetch(`${BASE}/`, { signal: ft.signal });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const ct = r.headers.get('content-type') || '';
+        if (!ct.startsWith('text/html')) throw new Error(`bad content-type ${ct}`);
+        const html = await r.text();
+        // Без угловых скобок: текст уходит в Telegram-алерт с parse_mode HTML.
+        if (!html.includes('id="root"')) throw new Error('не наша страница: нет id="root"');
+        return null;
+      } finally {
+        ft.done();
+      }
+    }),
   },
   {
     key: 'agents_endpoint',
@@ -234,11 +263,13 @@ const scenarios = (jwtUser) => [
 ];
 
 async function push(scenario, success, durationMs, message) {
+  const ft = fetchTimeout(PUSH_TIMEOUT_MS);
   try {
     const r = await fetch(PUSH_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-synthetic-token': TOKEN },
       body: JSON.stringify({ scenario, success, duration_ms: durationMs, message }),
+      signal: ft.signal,
     });
     // fetch НЕ бросает на 4xx/5xx — обязательно проверяем статус, иначе
     // отвергнутый пуш (напр. 401 при рассинхроне SYNTHETIC_PUSH_TOKEN) уходит
@@ -251,6 +282,8 @@ async function push(scenario, success, durationMs, message) {
   } catch (e) {
     console.error(`push failed for ${scenario}: ${e.message}`);
     process.exitCode = 1;
+  } finally {
+    ft.done();
   }
 }
 
