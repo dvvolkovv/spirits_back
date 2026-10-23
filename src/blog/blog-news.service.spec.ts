@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { BlogNewsService, MAX_WEEKLY_PICKS } from './blog-news.service';
 import { MISC_THEME } from './blog-news.themes';
 
@@ -194,6 +195,20 @@ describe('BlogNewsService.weeklyTopics — что уходит агенту', ()
     await prod.svc.weeklyTopics(WEEK);
     await stand.svc.weeklyTopics(WEEK);
     expect(String(prod.relay.ask.mock.calls[0][2])).not.toBe(String(stand.relay.ask.mock.calls[0][2]));
+  });
+
+  it('sessionId, с которым ушёл отбор, виден в логе — по нему ход сверяется с логом релея', async () => {
+    // По времени крона случайный id уже не восстановить, а релей пишет в свой
+    // лог именно его: `[notice] <sessionId> preempted`.
+    const log = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    try {
+      const { relay, svc } = make(REAL_WEEK, reply());
+      await svc.weeklyTopics(WEEK);
+      const sessionId = String(relay.ask.mock.calls[0][2]);
+      expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toContain(sessionId);
+    } finally {
+      log.mockRestore();
+    }
   });
 });
 

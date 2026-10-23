@@ -47,14 +47,19 @@ describe('BlogCron.refillTopics', () => {
   const caseCalls = (d: any) => d.topics.addTopic.mock.calls
     .map((c: any) => c[0]).filter((t: any) => t.rubric === 'case');
 
-  /** Повторы отбора ждут минутами — время в этих тестах ненастоящее. */
+  /** Повторы отбора ждут минутами — время в этих тестах ненастоящее, а логи попыток не печатаются. */
   const refill = async (d: any) => {
     jest.useFakeTimers();
+    const quiet = [
+      jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined),
+      jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined),
+    ];
     try {
       const run = make(d).refillTopics();
       await jest.runAllTimersAsync();
       await run;
     } finally {
+      quiet.forEach((s) => s.mockRestore());
       jest.useRealTimers();
     }
   };
@@ -152,6 +157,17 @@ describe('BlogCron.refillTopics', () => {
       expect(d.news.weeklyTopics).toHaveBeenCalledTimes(3);
       expect(d.approval.notify).toHaveBeenCalledTimes(1);
       expect(d.approval.notify).toHaveBeenCalledWith(77, expect.stringMatching(/новост[\s\S]*релей вернул пустой ответ/));
+    });
+
+    it('апрувер не задан — сообщения нет, и отбор не падает', async () => {
+      delete process.env.BLOG_APPROVER_TG_ID;
+      const d = deps();
+      d.news.weeklyTopics.mockRejectedValue(new Error('blog: релей вернул пустой ответ'));
+
+      await expect(refill(d)).resolves.toBeUndefined();
+
+      expect(d.news.weeklyTopics).toHaveBeenCalledTimes(3);
+      expect(d.approval.notify).not.toHaveBeenCalled();
     });
   });
 
