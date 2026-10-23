@@ -53,10 +53,12 @@ function okHtml(page) {
  * @param opts.siteDown   всё, что идёт на BASE (через прокси), падает как
  *                        «fetch failed» — так выглядел прокси, заблокированный 23.10.
  * @param opts.page       что отдаёт главная страница.
+ * @param opts.siteFailures сколько первых запросов к главной падают (подвисший коннект).
  */
-function installFetch(refreshOutcomes, { siteDown = false, page = SPA_PAGE } = {}) {
+function installFetch(refreshOutcomes, { siteDown = false, page = SPA_PAGE, siteFailures = 0 } = {}) {
   const pushes = [];
   let refreshCalls = 0;
+  let siteCalls = 0;
 
   global.fetch = jest.fn(async (url, opts = {}) => {
     if (siteDown && url.startsWith(BASE)) throw new TypeError('fetch failed');
@@ -64,7 +66,11 @@ function installFetch(refreshOutcomes, { siteDown = false, page = SPA_PAGE } = {
       pushes.push({ ...JSON.parse(opts.body), url });
       return { ok: true, status: 204, text: async () => '' };
     }
-    if (url === `${BASE}/`) return okHtml(page);
+    if (url === `${BASE}/`) {
+      siteCalls += 1;
+      if (siteCalls <= siteFailures) throw new Error('This operation was aborted');
+      return okHtml(page);
+    }
     if (url.includes('/webhook/auth/refresh')) {
       const outcome = refreshOutcomes[refreshCalls] || 'ok';
       refreshCalls += 1;
@@ -130,6 +136,41 @@ describe('synthetic-runner: доступность сайта и доставк�
     await mod.runAll();
 
     expect(byKey(pushes, 'site_reachable')[0]).toMatchObject({ success: false });
+    cleanup();
+  });
+
+  it('сообщение о чужой странице без угловых скобок (уходит в Telegram как HTML)', async () => {
+    const { pushes } = installFetch([], { page: '<html><body>Услуга приостановлена</body></html>' });
+    const { mod, cleanup } = loadRunner();
+
+    await mod.runAll();
+
+    expect(byKey(pushes, 'site_reachable')[0].message).not.toMatch(/[<>]/);
+    cleanup();
+  });
+
+  it('один подвисший коннект к главной не красит site_reachable', async () => {
+    // Как refresh 21.08: одиночный блип не должен будить людей «сайт не открывается».
+    const { pushes } = installFetch([], { siteFailures: 1 });
+    const { mod, cleanup } = loadRunner();
+
+    await mod.runAll();
+
+    expect(byKey(pushes, 'site_reachable')).toEqual([
+      expect.objectContaining({ success: true }),
+    ]);
+    cleanup();
+  });
+
+  it('сайт не открывается ни с одной попытки — красный, с числом попыток', async () => {
+    const { pushes } = installFetch([], { siteFailures: 99 });
+    const { mod, cleanup } = loadRunner();
+
+    await mod.runAll();
+
+    const site = byKey(pushes, 'site_reachable')[0];
+    expect(site.success).toBe(false);
+    expect(site.message).toContain('попыток: 3');
     cleanup();
   });
 

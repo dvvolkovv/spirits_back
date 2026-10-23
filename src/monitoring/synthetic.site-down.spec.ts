@@ -19,11 +19,11 @@ import { sendTelegramPayload } from '../common/telegram-alert';
 const mockedSend = sendTelegramPayload as jest.Mock;
 const alertTexts = () => mockedSend.mock.calls.map((c) => String(c[0].text));
 
-function row(scenario: string, success: boolean, message: string | null = null) {
+function row(scenario: string, success: boolean, message: string | null = null, ageMin = 0) {
   return {
     scenario,
     latest_success: success,
-    latest_ts: new Date(),
+    latest_ts: new Date(Date.now() - ageMin * 60_000),
     latest_duration_ms: success ? 300 : 0,
     latest_message: message,
     runs_24h: 96,
@@ -101,6 +101,34 @@ describe('SyntheticService: сайт не открывается', () => {
     expect(texts).toHaveLength(1);
     expect(texts[0]).toContain('🟢');
     expect(texts[0]).toContain('my.linkeon.io');
+  });
+
+  it('текст ошибки экранируется — иначе Telegram отклонит HTML и алерт пропадёт', async () => {
+    // Сообщение уходит с parse_mode HTML: незнакомый тег — 400 «Unsupported start
+    // tag», и алерт не доходит, а повтор будет только через кулдаун.
+    const { svc } = makeService([
+      row('site_reachable', false, 'не наша страница: нет <div id="root">'),
+    ]);
+
+    await svc.checkAndAlert();
+
+    expect(alertTexts()[0]).toContain('&lt;div');
+    expect(alertTexts()[0]).not.toContain('<div');
+  });
+
+  it('устаревшая строка site_reachable не глушит остальные и не алертит сама', async () => {
+    // Раннер перестал слать сценарий (на node-3 вернули старую копию) — его
+    // последняя красная строка не должна навсегда заглушить остальные алерты.
+    const { svc } = makeService([
+      row('site_reachable', false, 'fetch failed', 60),
+      row('refresh_jwt', false, 'refresh HTTP 401'),
+    ]);
+
+    await svc.checkAndAlert();
+
+    const all = alertTexts();
+    expect(all.some((t) => t.includes('🔴') && t.includes('refresh_jwt'))).toBe(true);
+    expect(all.some((t) => t.includes('my.linkeon.io не открывается'))).toBe(false);
   });
 
   it('сайт жив — каскадная логика авторизации работает как раньше', async () => {

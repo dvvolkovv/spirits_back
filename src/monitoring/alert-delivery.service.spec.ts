@@ -27,6 +27,7 @@ function healthy(): Record<string, Sample[] | Error> {
   return {
     'up{job="alertmanager"}': one(1, { job: 'alertmanager' }),
     alertmanager_notifications_failed_total: one(0),
+    alertmanager_notifications_total: one(0),
     prometheus_notifications_alertmanagers_discovered: one(1),
     prometheus_notifications_errors_total: one(0),
     'ALERTS{': [],
@@ -46,12 +47,13 @@ function makeMonitoring(answers: Record<string, Sample[] | Error>) {
 }
 
 /** monitor_alert_state в памяти — переживает «рестарт» (новый экземпляр сервиса). */
-function makePg(seed: Record<string, { alerted: boolean; updated_at: Date }> = {}) {
+function makePg(seed: Record<string, { alerted: boolean; updated_at: Date }> = {}, { failReads = false } = {}) {
   const table = { ...seed };
   return {
     table,
     query: jest.fn(async (sql: string, params: any[] = []) => {
       if (sql.includes('SELECT')) {
+        if (failReads) throw new Error('connection terminated');
         const r = table[params[0]];
         return { rows: r ? [r] : [] };
       }
@@ -155,20 +157,73 @@ describe('AlertDeliveryService', () => {
     expect(mockedSend).not.toHaveBeenCalled();
   });
 
-  it('после сбоя — один отбой', async () => {
+  it('после сбоя — один отбой, когда Alertmanager реально доставил сообщение', async () => {
     const answers = healthy();
     answers.alertmanager_notifications_failed_total = one(5);
+    answers.alertmanager_notifications_total = one(5);
     const { svc } = makeService(answers);
     await svc.check();
     await svc.check();
     mockedSend.mockClear();
 
     answers.alertmanager_notifications_failed_total = one(0);
+    answers.alertmanager_notifications_total = one(1); // одна отправка — и успешная
     await svc.check();
     await svc.check();
 
     expect(texts()).toHaveLength(1);
     expect(texts()[0]).toContain('🔔');
+  });
+
+  it('отказы прекратились, но и отправок не было — «снова доходят» не пишем', async () => {
+    // Алерт погас, Alertmanager перестал пытаться — отказов ноль, но получатель
+    // может быть сломан по-прежнему. Отбой без доказательства был бы ложью.
+    const answers = healthy();
+    answers.alertmanager_notifications_failed_total = one(3);
+    answers.alertmanager_notifications_total = one(3);
+    const { svc } = makeService(answers);
+    await svc.check();
+    await svc.check();
+    mockedSend.mockClear();
+
+    answers.alertmanager_notifications_failed_total = one(0);
+    answers.alertmanager_notifications_total = one(0);
+    await svc.check();
+    await svc.check();
+    expect(mockedSend).not.toHaveBeenCalled();
+
+    answers.alertmanager_notifications_total = one(1); // первая успешная отправка
+    await svc.check();
+    expect(texts()).toHaveLength(1);
+    expect(texts()[0]).toContain('🔔');
+  });
+
+  it('Prometheus снова отвечает — отбой без ожидания отправок', async () => {
+    // Доставку в Telegram никто не ломал — доказывать её не нужно.
+    const answers = healthy();
+    for (const k of Object.keys(answers)) answers[k] = new Error('fetch failed');
+    const { svc } = makeService(answers);
+    await svc.check();
+    await svc.check();
+    mockedSend.mockClear();
+
+    Object.assign(answers, healthy());
+    await svc.check();
+
+    expect(texts()).toHaveLength(1);
+    expect(texts()[0]).toContain('🔔');
+  });
+
+  it('база недоступна — тик пропускаем, а не шлём каждые 5 минут', async () => {
+    const answers = healthy();
+    answers.alertmanager_notifications_failed_total = one(5);
+    const { svc } = makeService(answers, makePg({}, { failReads: true }));
+
+    await svc.check();
+    await svc.check();
+    await svc.check();
+
+    expect(mockedSend).not.toHaveBeenCalled();
   });
 
   it('рестарт посреди сбоя не дублирует алерт', async () => {
