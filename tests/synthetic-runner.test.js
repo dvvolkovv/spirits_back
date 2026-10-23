@@ -41,18 +41,30 @@ function okImage() {
   return { ok: true, status: 200, headers: { get: () => 'image/jpeg' } };
 }
 
+const SPA_PAGE = '<!doctype html><html><head><title>Linkeon</title></head><body><div id="root"></div></body></html>';
+const WG_PUSH = 'http://10.10.0.1:3001/webhook/monitoring/synthetic/push';
+
+function okHtml(page) {
+  return { ok: true, status: 200, headers: { get: () => 'text/html; charset=utf-8' }, text: async () => page };
+}
+
 /**
  * @param refreshOutcomes массив 'fail' | 'ok' — исход по номеру попытки refresh.
+ * @param opts.siteDown   всё, что идёт на BASE (через прокси), падает как
+ *                        «fetch failed» — так выглядел прокси, заблокированный 23.10.
+ * @param opts.page       что отдаёт главная страница.
  */
-function installFetch(refreshOutcomes) {
+function installFetch(refreshOutcomes, { siteDown = false, page = SPA_PAGE } = {}) {
   const pushes = [];
   let refreshCalls = 0;
 
   global.fetch = jest.fn(async (url, opts = {}) => {
+    if (siteDown && url.startsWith(BASE)) throw new TypeError('fetch failed');
     if (url.includes('/webhook/monitoring/synthetic/push')) {
-      pushes.push(JSON.parse(opts.body));
+      pushes.push({ ...JSON.parse(opts.body), url });
       return { ok: true, status: 204, text: async () => '' };
     }
+    if (url === `${BASE}/`) return okHtml(page);
     if (url.includes('/webhook/auth/refresh')) {
       const outcome = refreshOutcomes[refreshCalls] || 'ok';
       refreshCalls += 1;
@@ -71,7 +83,7 @@ function installFetch(refreshOutcomes) {
 }
 
 /** Загружает раннер заново, с чистым env и своим state-файлом. */
-function loadRunner() {
+function loadRunner(env = {}) {
   jest.resetModules();
   const stateFile = path.join(os.tmpdir(), `synthetic-state-${process.pid}-${Math.random().toString(36).slice(2)}.json`);
   process.env.BASE_URL = BASE;
@@ -80,6 +92,7 @@ function loadRunner() {
   process.env.SYNTHETIC_STATE_FILE = stateFile;
   process.env.SYNTHETIC_RETRY_BASE_MS = '1';
   process.env.SYNTHETIC_REFRESH_ATTEMPTS = '3';
+  Object.assign(process.env, env);
   const mod = require('../scripts/synthetic-runner.js');
   return { mod, cleanup: () => fs.rmSync(stateFile, { force: true }) };
 }
@@ -88,6 +101,71 @@ const byKey = (pushes, key) => pushes.filter((p) => p.scenario === key);
 
 afterEach(() => {
   delete global.fetch;
+  delete process.env.SYNTHETIC_PUSH_URL;
+});
+
+describe('synthetic-runner: доступность сайта и доставка отчётов', () => {
+  /**
+   * Инцидент 2026-10-23: Selectel заблокировал прокси my.linkeon.io. Раннер слал
+   * отчёты на тот же my.linkeon.io — через тот же прокси, который проверял, —
+   * и отчёты о падении не дошли: на проде прогона 08:15 UTC нет вообще.
+   */
+  it('проверяет, что my.linkeon.io открывается (site_reachable)', async () => {
+    const { pushes } = installFetch([]);
+    const { mod, cleanup } = loadRunner();
+
+    await mod.runAll();
+
+    expect(byKey(pushes, 'site_reachable')).toEqual([
+      expect.objectContaining({ success: true }),
+    ]);
+    cleanup();
+  });
+
+  it('site_reachable красный, если вместо нашего SPA отдали чужую страницу', async () => {
+    // Хостер при блокировке может отвечать 200 своей заглушкой.
+    const { pushes } = installFetch([], { page: '<html><body>Услуга приостановлена</body></html>' });
+    const { mod, cleanup } = loadRunner();
+
+    await mod.runAll();
+
+    expect(byKey(pushes, 'site_reachable')[0]).toMatchObject({ success: false });
+    cleanup();
+  });
+
+  it('с SYNTHETIC_PUSH_URL отчёты идут туда, мимо проверяемого прокси', async () => {
+    const { pushes } = installFetch([]);
+    const { mod, cleanup } = loadRunner({ SYNTHETIC_PUSH_URL: WG_PUSH });
+
+    await mod.runAll();
+
+    expect(pushes.length).toBeGreaterThan(0);
+    expect(pushes.every((p) => p.url === WG_PUSH)).toBe(true);
+    cleanup();
+  });
+
+  it('прокси лёг — отчёт о падении всё равно доходит', async () => {
+    const { pushes } = installFetch(['fail', 'fail', 'fail'], { siteDown: true });
+    const { mod, cleanup } = loadRunner({ SYNTHETIC_PUSH_URL: WG_PUSH });
+
+    await mod.runAll();
+
+    expect(byKey(pushes, 'site_reachable')).toEqual([
+      expect.objectContaining({ success: false, url: WG_PUSH }),
+    ]);
+    expect(byKey(pushes, 'refresh_jwt')[0]).toMatchObject({ success: false });
+    cleanup();
+  });
+
+  it('без SYNTHETIC_PUSH_URL шлёт, как раньше, на BASE', async () => {
+    const { pushes } = installFetch([]);
+    const { mod, cleanup } = loadRunner();
+
+    await mod.runAll();
+
+    expect(pushes.every((p) => p.url === `${BASE}/webhook/monitoring/synthetic/push`)).toBe(true);
+    cleanup();
+  });
 });
 
 describe('synthetic-runner: устойчивость авторизации', () => {
