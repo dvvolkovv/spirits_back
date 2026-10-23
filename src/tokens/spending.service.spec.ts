@@ -9,6 +9,7 @@ describe('clampMonths', () => {
   it('по умолчанию 12', () => {
     expect(clampMonths(undefined)).toBe(12);
     expect(clampMonths('')).toBe(12);
+    expect(clampMonths('   ')).toBe(12);
     expect(clampMonths('abc')).toBe(12);
   });
   it('прижимается к 1–24', () => {
@@ -51,6 +52,17 @@ describe('groupMonths', () => {
     const r = groupMonths([{ month: '2026-01', category: 'other', tokens: '0', count: '3' }], 12);
     expect(r).toEqual([]);
   });
+
+  it('строка без месяца (null) пропускается', () => {
+    const r = groupMonths(
+      [
+        { month: null as any, category: 'replies', tokens: '500', count: '1' },
+        { month: '2026-07', category: 'replies', tokens: '10', count: '1' },
+      ],
+      12,
+    );
+    expect(r).toEqual([{ month: '2026-07', total: 10, categories: [{ key: 'replies', tokens: 10, count: 1 }] }]);
+  });
 });
 
 describe('SpendingService', () => {
@@ -92,14 +104,48 @@ describe('SpendingService', () => {
     expect(await new SpendingService(pg as any).resolveTz('UTC')).toBe(DEFAULT_SPENDING_TZ);
   });
 
+  it('два конкурентных вызова делят один запрос списка поясов', async () => {
+    const { pg, calls } = makePg();
+    const svc = new SpendingService(pg as any);
+    const [a, b] = await Promise.all([svc.resolveTz('UTC'), svc.resolveTz('Europe/Moscow')]);
+    expect(a).toBe('UTC');
+    expect(b).toBe('Europe/Moscow');
+    expect(calls.filter((c) => c.sql.includes('pg_timezone_names'))).toHaveLength(1);
+  });
+
+  it('пустой список поясов не кешируется — следующий вызов спрашивает снова', async () => {
+    const { pg, calls } = makePg([]);
+    const svc = new SpendingService(pg as any);
+    expect(await svc.resolveTz('UTC')).toBe(DEFAULT_SPENDING_TZ);
+    expect(await svc.resolveTz('UTC')).toBe(DEFAULT_SPENDING_TZ);
+    expect(calls.filter((c) => c.sql.includes('pg_timezone_names'))).toHaveLength(2);
+  });
+
   it('monthly: только списания этого пользователя, месяц в поясе, категории из правил', async () => {
     const { pg, calls } = makePg();
     const r = await new SpendingService(pg as any).monthly('u-1', 'UTC', '6');
     const q = calls.find((c) => c.sql.includes('token_transactions'))!;
     expect(q.params).toEqual(['u-1', 'UTC']);
     expect(q.sql).toContain("transaction_type = 'consumed'");
+    expect(q.sql).toContain('created_at IS NOT NULL');
     expect(q.sql).toContain('AT TIME ZONE $2');
     expect(q.sql).toContain("THEN 'images'");
     expect(r).toEqual([{ month: '2026-10', total: 6193, categories: [{ key: 'replies', tokens: 6193, count: 12 }] }]);
+  });
+
+  it('monthly: months ограничивает число месяцев — остаётся самый новый', async () => {
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        if (sql.includes('pg_timezone_names')) return { rows: [{ name: 'UTC' }] };
+        return {
+          rows: [
+            { month: '2026-10', category: 'replies', tokens: '100', count: '1' },
+            { month: '2026-09', category: 'replies', tokens: '200', count: '2' },
+          ],
+        };
+      }),
+    };
+    const r = await new SpendingService(pg as any).monthly('u-1', 'UTC', '1');
+    expect(r).toEqual([{ month: '2026-10', total: 100, categories: [{ key: 'replies', tokens: 100, count: 1 }] }]);
   });
 });
