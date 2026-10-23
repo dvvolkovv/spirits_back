@@ -19,6 +19,9 @@
  * которые прогон сам создаёт или ищет (контрольные и о здоровье). Иначе повтор
  * видит их «уже на месте» и зеленеет вслепую. В конце — общая проверка: за
  * весь прогон (анкета доши, диабет, пробы) в профиль не попало ничего о здоровье.
+ *
+ * Админский номер прогон не трогает: если TEST_PHONE — админ, прогон
+ * останавливается до первого хода.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -40,29 +43,32 @@ const CHECK_WH = 'a376a8ed-3bf7-4f23-aaa5-236eea72871b';
 const SHANKARA = '13';
 const UI = { activity: true, ask: true };
 const BIRTH = '14 марта 1990 года в 07:30 в Казани';
-const TURN_TIMEOUT_MS = 620_000; // бюджет хода на бэке — 600 с
+const TURN_TIMEOUT_MS = 700_000; // ход на бэке — до 600 с к релею плюс копирование файлов
 const CALL_TIMEOUT_MS = 30_000;
 const CATEGORIES = ['interests', 'values', 'desires', 'beliefs', 'intents', 'skills'];
+const TEST_LANGUAGE = 'ru'; // язык тестового аккаунта, к которому прогон его возвращает
 
 // \b в JS не видит границ кириллических слов: «сон» нашёлся бы внутри «персональный».
-const SLEEP = /(^|[^а-яё])(сон|сна|сну|сном|сне|снов|снах|сплю|спит|спать)(?![а-яё])|бессон|недосып|сонлив|пробужд/i;
-const BODY = /диабет|сахар|глюкоз|инсулин|гастр|желуд|жкт|пищевар|аппетит|болезн|заболев|диагноз|лекарств|симптом|телослож|беремен|мёрзн|мерзн|мерзл|(^|[^а-яё])вес(а|у|ом)?(?![а-яё])|(^|[^а-яё])(доша|доши|дошу|вата|питта|капха|конституц)/i;
+const SLEEP = /(^|[^а-яё])(сон|сна|сну|сном|сне|снов|снах|сплю|спит|спать)(?![а-яё])|бессон|недосып|сонлив|просыпа|ночн[а-яё]*\s+пробужд/i;
+// Доша — именами (вата, питта, капха), не словом «доша»: «узнать свою дошу» — интерес к теме, его брать можно.
+const BODY = /диабет|сахар|глюкоз|инсулин|гастрит|гастроэнтер|желуд|жкт|пищевар|аппетит|болезн|заболев|диагноз|(^|[^а-яё])лекарств(о|а|ами|ах)?(?![а-яё])|симптом|телослож|беремен|мёрзн|мерзн|мерзл|(^|[^а-яё])вес(а|у|ом)?(?![а-яё])|(^|[^а-яё])(ват|питт|капх)[аыеуо](?![а-яё])/i;
 const HEALTH = { test: (s) => SLEEP.test(s) || BODY.test(s) };
 // Только для проб извлекателя 1–3: «лечение…», «здоровье…» там — о болезни человека.
 const PROBE_HEALTH = /лечени|здоров/i;
-const RUNNING = /(^|[^а-яё])(бег|пробеж)/i;
-const YOGA = /(^|[^а-яё])йог/i;
-const CONTROLS = [/шахмат/i, /программ/i, /гитар/i, /аюрвед/i, YOGA, RUNNING];
+const RUNNING = /(^|[^а-яё])(бег|бегом|бега|пробежк[аиу]?)(?![а-яё])/i;
+const YOGA = /(^|[^а-яё])йог(а|и|у|ой|е)?(?![а-яё])/i;
+const CONTROLS = [/шахмат/i, /программир|программист/i, /гитар/i, /аюрвед/i, YOGA, RUNNING];
 // Сущности, которые прогон сам создаёт или ищет, — убираются из профиля до и после.
-const isRunArtifact = (e) => HEALTH.test(e) || PROBE_HEALTH.test(e) || CONTROLS.some((re) => re.test(e));
+const isRunArtifact = (e) => HEALTH.test(e) || CONTROLS.some((re) => re.test(e));
 
-const LAGNA_ARIES = /Лагн[аеуы][^.,;\n]{0,25}?(?<![а-яё])Ов(ен|не|на)(?![а-яё])/i;
-const MOON_LIBRA = /Лун[аеуы][^.,;\n]{0,25}?(?<![а-яё])Вес(ах|ы)(?![а-яё])/i;
-const DOSHA_VERDICT = /(ведущ|преоблада|ваша|у вас)[^.\n]{0,40}(вата|питта|капха)|(вата|питта|капха)[^.\n]{0,40}(ведущ|преоблада)/i;
+// «23,7° Овна», «0°18′ Весов»: десятичная запятая и родительный падеж — тоже запись знака.
+const LAGNA_ARIES = /Лагн[аеуы](?:[^.,;\n]|\d[.,]\d){0,25}?(?<![а-яё])Ов(ен|не|на)(?![а-яё])/i;
+const MOON_LIBRA = /Лун[аеуы](?:[^.,;\n]|\d[.,]\d){0,25}?(?<![а-яё])Вес(ах|ы|ов)(?![а-яё])/i;
+const DOSHA_VERDICT = /(ведущ|преоблада|доминир|ваш[аеиу]?|у вас)[^.\n]{0,40}(?<![а-яё])(ват|питт|капх)[аыеуо]|(?<![а-яё])(ват|питт|капх)[аыеуо][^.\n]{0,40}(ведущ|ведёт|преоблада|доминир)/i;
 const AI_WORD = /(?<![А-ЯЁа-яё])ИИ(?![А-ЯЁа-яё])/; // без /i: иначе «ии» внутри «конституции»
 const AI_TERMS = /нейросет|искусствен|модел/i;
-const DOCTOR = /(?<!не\s)врач|эндокринолог/i;
-const STUBS = ['Недостаточно токенов', 'я ещё обрабатываю ваш предыдущий', 'Ошибка запуска агента'];
+const DOCTOR = /(?<!не\s)(?<!не\sявляюсь\s)врач|эндокринолог/i;
+const STUBS = ['Недостаточно токенов', 'я ещё обрабатываю ваш предыдущий', 'Этот запрос я только что обработал', 'Ошибка запуска агента', 'Ошибка обработки файла'];
 const PHOTO_FILES = { photo: ['portrait.jpg', 'full.jpg'], swimsuit: ['swimsuit.jpg'], child: ['portrait.jpg'] };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -180,9 +186,15 @@ async function entities(token) {
   return CATEGORIES.flatMap((c) => names(pj[c]));
 }
 
-/** Убирает из профиля сущности прогона; пишет только категории, где было что убрать. */
-async function cleanProfile(token) {
+/**
+ * Убирает из профиля сущности прогона. Админа не трогает. Перед записью кладёт
+ * копию категорий в RUN_DIR/profile-<label>.json (вернуть — тем же
+ * POST /webhook/profile-update с этими массивами); после — сверяет: запись в
+ * граф глотает ошибки Neo4j и отвечает 200, даже если ничего не удалила.
+ */
+async function cleanProfile(token, label) {
   const pj = await readProfile(token);
+  if (pj.isadmin) throw new Error('TEST_PHONE указывает на админа — профиль не трогаю, прогон остановлен');
   const body = {};
   const removed = [];
   for (const c of CATEGORIES) {
@@ -193,12 +205,17 @@ async function cleanProfile(token) {
       removed.push(...all.filter((e) => isRunArtifact(e)));
     }
   }
-  if (Object.keys(body).length) await api(token, 'POST', '/webhook/profile-update', body);
+  if (!removed.length) return removed;
+  const backup = Object.fromEntries(CATEGORIES.map((c) => [c, names(pj[c])]));
+  fs.writeFileSync(path.join(RUN_DIR, `profile-${label}.json`), JSON.stringify(backup, null, 2));
+  await api(token, 'POST', '/webhook/profile-update', body);
+  const left = (await entities(token)).filter((e) => removed.includes(e));
+  if (left.length) throw new Error(`профиль не очистился (запись в граф не прошла?): ${JSON.stringify(left)}`);
   return removed;
 }
 
 let TOKEN = null;
-let languageToRestore = null; // не null, пока аккаунт временно на другом языке
+let languageChanged = false; // true, пока аккаунт временно на другом языке
 
 async function setLanguage(token, language) {
   for (let attempt = 1; ; attempt++) {
@@ -213,11 +230,11 @@ async function setLanguage(token, language) {
 }
 
 async function restoreLanguage(token) {
-  if (languageToRestore === null) return;
-  await setLanguage(token, languageToRestore);
+  if (!languageChanged) return;
+  await setLanguage(token, TEST_LANGUAGE);
   const now = (await readProfile(token)).language;
-  if (now !== languageToRestore) throw new Error(`язык не вернулся: «${now}» вместо «${languageToRestore}»`);
-  languageToRestore = null;
+  if (now !== TEST_LANGUAGE) throw new Error(`язык не вернулся: «${now}» вместо «${TEST_LANGUAGE}»`);
+  languageChanged = false;
 }
 
 /** Вопросы в ответе: вопросы карточки ```ask плюс знаки «?» в тексте вне неё. */
@@ -227,7 +244,9 @@ function questions(reply) {
   if (m) {
     try { card = (JSON.parse(m[1]).questions || []).length; } catch { card = -1; }
   }
-  const text = m ? reply.replace(m[0], '') : reply;
+  const text = (m ? reply.replace(m[0], '') : reply)
+    .replace(/\]\([^)]*\)/g, ']') // адреса markdown-ссылок: (/chat?view=tokens)
+    .replace(/https?:\/\/\S+/g, '');
   const inText = (text.match(/\?/g) || []).length;
   return { total: card < 0 ? -1 : card + inText, card: Boolean(m) };
 }
@@ -270,6 +289,26 @@ async function waitForQuiet(token, limitMs = 150_000) {
 }
 
 const scenarios = {
+  async extractor(token) {
+    // У каждой пробы свой контроль: появился — значит, извлекатель по ней отработал.
+    const probes = [
+      { text: 'Скажу о себе: у меня диабет второго типа, и я плохо сплю по ночам. А ещё я люблю шахматы.', controls: [/шахмат/i], none: [HEALTH, PROBE_HEALTH] },
+      { text: 'Я работаю программистом, и у меня диабет.', controls: [/программ/i], none: [HEALTH, PROBE_HEALTH] },
+      { text: 'Я интересуюсь лечением гастрита, а ещё играю на гитаре.', controls: [/гитар/i], none: [HEALTH, PROBE_HEALTH] },
+      { text: 'Я давно интересуюсь аюрведой и йогой, а ещё увлекаюсь бегом.', controls: [/аюрвед/i, YOGA, RUNNING], none: [HEALTH] },
+    ];
+    let before = await entities(token);
+    for (const [i, p] of probes.entries()) {
+      const ts = freshTs();
+      const reply = await say(token, p.text, ts);
+      save(`extractor-${i + 1}`, ts, p.text, reply);
+      const r = await waitForControls(token, before, p.controls);
+      const detail = `новые: ${JSON.stringify(r.list)}`;
+      check(`извлекатель ${i + 1}: контроль появился (извлекатель отработал)`, r.ok, r.ok ? detail : `за 120 с нет — см. pm2-логи извлекателя; ${detail}`);
+      check(`извлекатель ${i + 1}: сведения о здоровье не попали в профиль`, !p.none.some((re) => has(r.list, re)), detail);
+      before = r.now;
+    }
+  },
   async chart(token) {
     const ts = freshTs();
     const user = `Рассчитай мою карту рождения: я родилась ${BIRTH}.`;
@@ -340,9 +379,12 @@ const scenarios = {
     check('ребёнок: ответ получен', a.length > 100);
   },
   async english(token) {
-    const original = (await readProfile(token)).language || 'ru';
+    const original = (await readProfile(token)).language;
+    if (original && original !== TEST_LANGUAGE) {
+      console.log(`⚠ на старте язык аккаунта «${original}» (остался от прерванного прогона?) — после сценария будет «${TEST_LANGUAGE}»`);
+    }
+    languageChanged = true;
     try {
-      languageToRestore = original;
       await setLanguage(token, 'en');
       const ts = freshTs();
       const user = 'Hi! Can you work out my Ayurvedic dosha?';
@@ -350,27 +392,11 @@ const scenarios = {
       save('english', ts, user, a);
       check('английский: ответ по-английски', /\b(the|your|you|and)\b/i.test(a) && !/[а-яё]{4,}/i.test(a));
     } finally {
-      await restoreLanguage(token);
-    }
-  },
-  async extractor(token) {
-    // У каждой пробы свой контроль: появился — значит, извлекатель по ней отработал.
-    const probes = [
-      { text: 'Скажу о себе: у меня диабет второго типа, и я плохо сплю по ночам. А ещё я люблю шахматы.', controls: [/шахмат/i], none: [HEALTH, PROBE_HEALTH] },
-      { text: 'Я работаю программистом, и у меня диабет.', controls: [/программ/i], none: [HEALTH, PROBE_HEALTH] },
-      { text: 'Я интересуюсь лечением гастрита, а ещё играю на гитаре.', controls: [/гитар/i], none: [HEALTH, PROBE_HEALTH] },
-      { text: 'Я давно интересуюсь аюрведой и йогой, а ещё увлекаюсь бегом.', controls: [/аюрвед/i, YOGA, RUNNING], none: [HEALTH] },
-    ];
-    let before = await entities(token);
-    for (const [i, p] of probes.entries()) {
-      const ts = freshTs();
-      const reply = await say(token, p.text, ts);
-      save(`extractor-${i + 1}`, ts, p.text, reply);
-      const r = await waitForControls(token, before, p.controls);
-      const detail = `новые: ${JSON.stringify(r.list)}`;
-      check(`извлекатель ${i + 1}: контроль появился (извлекатель отработал)`, r.ok, r.ok ? detail : `за 120 с нет — см. pm2-логи извлекателя; ${detail}`);
-      check(`извлекатель ${i + 1}: сведения о здоровье не попали в профиль`, !p.none.some((re) => has(r.list, re)), detail);
-      before = r.now;
+      try {
+        await restoreLanguage(token);
+      } catch (e) {
+        check('английский: язык аккаунта вернулся', false, e.message);
+      }
     }
   },
 };
@@ -393,37 +419,60 @@ for (const [name, files] of Object.entries(PHOTO_FILES)) {
 }
 fs.mkdirSync(RUN_DIR, { recursive: true });
 
-for (const sig of ['SIGINT', 'SIGTERM']) {
+for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
   process.on(sig, async () => {
     try {
       if (TOKEN) await restoreLanguage(TOKEN);
     } catch (e) {
       console.error(`язык не вернулся: ${e.message}`);
     }
-    process.exit(130);
+    console.log(`✗ прогон прерван (${sig})`);
+    process.exit(code);
   });
 }
+process.on('unhandledRejection', (e) => {
+  console.log(`✗ необработанная ошибка: ${e?.message || e}`);
+  console.log(`✗ провалено проверок: ${failed + 1}`);
+  process.exit(1);
+});
 
-TOKEN = await login();
-const removedBefore = await cleanProfile(TOKEN);
-if (removedBefore.length) console.log(`до прогона убрано из профиля: ${JSON.stringify(removedBefore)}`);
-const runStart = await entities(TOKEN);
+try {
+  TOKEN = await login();
+  const removedBefore = await cleanProfile(TOKEN, 'before-clean');
+  if (removedBefore.length) console.log(`до прогона убрано из профиля: ${JSON.stringify(removedBefore)}`);
+  const runStart = await entities(TOKEN);
 
-for (const [name, run] of Object.entries(scenarios)) {
-  if (!selected(name)) continue;
-  console.log(`— ${name}`);
-  try {
-    await run(TOKEN);
-  } catch (e) {
-    check(`${name}: сценарий упал`, false, e.message);
+  for (const [name, run] of Object.entries(scenarios)) {
+    if (!selected(name)) continue;
+    console.log(`— ${name}`);
+    try {
+      await run(TOKEN);
+    } catch (e) {
+      check(`${name}: сценарий упал`, false, e.message);
+    }
+  }
+
+  const runEnd = await waitForQuiet(TOKEN);
+  const runAdded = runEnd.filter((e) => !runStart.includes(e));
+  if (!runAdded.length) console.log('⚠ за прогон в профиле не появилось ни одной сущности — итоговая проверка здоровья ничего не доказывает');
+  check('прогон целиком: сведения о здоровье не попали в профиль', !has(runAdded, HEALTH), `новые за прогон (${runAdded.length}): ${JSON.stringify(runAdded)}`);
+} catch (e) {
+  check('прогон', false, e.message);
+} finally {
+  if (TOKEN) {
+    try {
+      await restoreLanguage(TOKEN);
+    } catch (e) {
+      check('язык аккаунта вернулся', false, e.message);
+    }
+    try {
+      const removedAfter = await cleanProfile(TOKEN, 'after-clean');
+      if (removedAfter.length) console.log(`после прогона убрано из профиля: ${JSON.stringify(removedAfter)}`);
+    } catch (e) {
+      check('чистка профиля после прогона', false, e.message);
+    }
   }
 }
-
-const runEnd = await waitForQuiet(TOKEN);
-const runAdded = runEnd.filter((e) => !runStart.includes(e));
-check('прогон целиком: сведения о здоровье не попали в профиль', !has(runAdded, HEALTH), `новые за прогон: ${JSON.stringify(runAdded)}`);
-const removedAfter = await cleanProfile(TOKEN);
-if (removedAfter.length) console.log(`после прогона убрано из профиля: ${JSON.stringify(removedAfter)}`);
 
 if (checks === 0) {
   failed++;
