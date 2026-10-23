@@ -289,6 +289,72 @@ maybe('сводка расхода и перенос старых трат — �
       }
     });
 
+    it('первый старт не ждёт вечно за открытым списанием: lock_timeout, откат целиком, следующий старт доделывает', async () => {
+      // Индекса ещё нет, а открытая транзакция держит журнал. CREATE INDEX
+      // встал бы в очередь до её конца, а за ним — все новые списания. С
+      // lock_timeout файл через 5 секунд падает целиком (ни индекса, ни
+      // строк), и следующий старт пробует заново. Таймер на 20 секунд — только
+      // чтобы прогон без lock_timeout не висел.
+      await seed();
+      await pool.query('DROP INDEX IF EXISTS idx_token_transactions_user_created');
+      const writer = await pool.connect();
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await writer.query('BEGIN');
+        await writer.query(
+          `INSERT INTO token_transactions (user_id, transaction_type, amount, balance_after, description)
+           VALUES ('u-open', 'consumed', -1, 0, 'image')`,
+        );
+        const first = migrate().then(
+          () => 'applied',
+          (e: Error) => e.message,
+        );
+        const outcome = await Promise.race([
+          first,
+          new Promise<string>((resolve) => {
+            timer = setTimeout(() => resolve('blocked'), 20_000);
+          }),
+        ]);
+        await writer.query('ROLLBACK');
+        await first;
+        expect(outcome).toContain('lock timeout');
+      } finally {
+        clearTimeout(timer);
+        writer.release(true);
+      }
+      expect(await reconstructed()).toEqual([]);
+      expect(await indexExists()).toBe(false);
+
+      await migrate();
+      expect(await reconstructed()).toEqual(SEEDED);
+      expect(await indexExists()).toBe(true);
+    });
+
+    it('видео с одним id в обеих таблицах — одна строка журнала', async () => {
+      await pool.query('CREATE TABLE video_jobs_expired_bak_20260728 (LIKE video_jobs INCLUDING DEFAULTS)');
+      for (const table of ['video_jobs', 'video_jobs_expired_bak_20260728']) {
+        await pool.query(
+          `INSERT INTO ${table} (id, user_id, mode, model, quality, duration_sec, tokens_spent, status, created_at)
+           VALUES ('00000000-0000-4000-8000-000000000050', 'u-a', 'image2video', 'kling-v1-6', 'std', 5, 25000, 'ready', '2026-05-06T03:02:36Z')`,
+        );
+      }
+      await migrate();
+      expect((await reconstructed()).map((r) => r.source_id)).toEqual(['00000000-0000-4000-8000-000000000050']);
+    });
+
+    it('видео, уже перенесённое из резервной таблицы, позже найденное в video_jobs, второй раз не переносится', async () => {
+      const job = `('00000000-0000-4000-8000-000000000051', 'u-b', 'image2video', 'kling-v1-6', 'std', 5, 25000, 'ready', '2026-04-21T10:08:43Z')`;
+      const cols = '(id, user_id, mode, model, quality, duration_sec, tokens_spent, status, created_at)';
+      await pool.query('CREATE TABLE video_jobs_expired_bak_20260728 (LIKE video_jobs INCLUDING DEFAULTS)');
+      await pool.query(`INSERT INTO video_jobs_expired_bak_20260728 ${cols} VALUES ${job}`);
+      await migrate();
+      await pool.query(`INSERT INTO video_jobs ${cols} VALUES ${job}`);
+      await migrate();
+      expect((await reconstructed()).map((r) => `${r.source}:${r.source_id}`)).toEqual([
+        'video_jobs_expired_bak_20260728:00000000-0000-4000-8000-000000000051',
+      ]);
+    });
+
     it('нет резервной таблицы видео — остальные источники всё равно переносятся', async () => {
       await pool.query(
         `INSERT INTO generated_images (id, user_id, prompt, image_url, tokens_spent, created_at)

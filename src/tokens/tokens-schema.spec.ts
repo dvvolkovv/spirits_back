@@ -148,9 +148,28 @@ describe('миграция 002 — перенос старых трат', () => 
     const { text } = await sql002();
     expect(text).toMatch(/CREATE INDEX IF NOT EXISTS idx_token_transactions_user_created/);
     expect(text).toContain('pg_advisory_xact_lock');
-    // Явная транзакция в многооператорном запросе при ошибке оставила бы
-    // соединение пула в прерванной транзакции.
+    // Атомарность даёт сам файл — один оператор DO. COMMIT посреди файла
+    // разрезал бы его на части, которые откатываются порознь.
     expect(text).not.toMatch(/^\s*(BEGIN|COMMIT|ROLLBACK)\s*;/im);
+  });
+
+  it('файл — один оператор DO; индекс внутри, после advisory-лока и lock_timeout, и только если его нет', async () => {
+    const { text } = await sql002();
+    const body = text.trim();
+    // Голый CREATE INDEX IF NOT EXISTS до DO берёт ShareLock на журнал и при
+    // готовом индексе — на каждом старте, на весь перенос; два первых старта
+    // одновременно ловили на нём deadlock. Проверено на PG 16.
+    expect(body.startsWith('DO $backfill$')).toBe(true);
+    expect(body.endsWith('$backfill$;')).toBe(true);
+    expect(body.match(/CREATE INDEX/g)).toHaveLength(1);
+    const lock = body.indexOf('pg_advisory_xact_lock');
+    const timeout = body.search(/PERFORM\s+set_config\('lock_timeout',\s*'5s',\s*true\)/);
+    const index = body.search(
+      /IF\s+to_regclass\('public\.idx_token_transactions_user_created'\)\s+IS\s+NULL\s+THEN\s+CREATE INDEX IF NOT EXISTS idx_token_transactions_user_created\b/,
+    );
+    expect(lock).toBeGreaterThan(0);
+    expect(timeout).toBeGreaterThan(lock);
+    expect(index).toBeGreaterThan(timeout);
   });
 
   it('границы переноса — моменты, с которых такие списания пишутся в журнал', async () => {
