@@ -31,7 +31,39 @@ maybe('сводка расхода и перенос старых трат — �
   jest.setTimeout(120_000);
   let pool: Pool;
   const db = () => ({ query: (sql: string, params?: any[]) => pool.query(sql, params) }) as any;
-  const migrate = () => new TokensSchemaService(db()).onModuleInit();
+
+  /**
+   * Схема — тем же TokensSchemaService, что и на старте API, но падение SQL —
+   * падение теста. applyMigration ошибку глотает (пишет в лог и идёт дальше:
+   * старт API из-за миграции падать не должен), и без этой проверки
+   * сломанный файл выглядел бы здесь как «перенос ничего не нашёл».
+   *
+   * Логгер подменяется у ЭКЗЕМПЛЯРА, а не на Logger.prototype: проверки двух
+   * одновременных стартов не перемешиваются. Переименуют поле logger —
+   * присваивание упадёт TypeError, то есть громко.
+   */
+  async function strictly(run: (svc: TokensSchemaService) => Promise<void>) {
+    const svc = new TokensSchemaService(db());
+    const logger = (svc as any).logger;
+    const problems: string[] = [];
+    const logged: string[] = [];
+    logger.error = (msg: string) => problems.push(msg);
+    logger.warn = (msg: string) => problems.push(msg);
+    logger.log = (msg: string) => logged.push(msg);
+    await run(svc);
+    if (problems.length) throw new Error(`миграция токенов не применилась:\n${problems.join('\n')}`);
+    if (!logged.some((m) => m.startsWith('tokens migration 002_backfill_spend_history.sql applied'))) {
+      throw new Error(`002 не отметилась применённой; в логе: ${logged.join(' | ') || '(пусто)'}`);
+    }
+  }
+  const migrate = () => strictly((svc) => svc.onModuleInit());
+  /**
+   * Только 002, тем же applyMigration. Для одновременных стартов: 001
+   * (CREATE OR REPLACE FUNCTION) при одновременной накатке сама падает на
+   * «tuple concurrently updated» — на ноде 22 пары из 30. Это свойство 001,
+   * а здесь проверяется 002.
+   */
+  const migrate002 = () => strictly((svc) => (svc as any).applyMigration('002_backfill_spend_history.sql'));
 
   const consumed = (userId: string, amount: number, at: string, description: string | null, metadata: object | null = null) =>
     pool.query(
@@ -169,6 +201,26 @@ maybe('сводка расхода и перенос старых трат — �
       );
     }
 
+    /** Что должно перенестись из seed(). */
+    const SEEDED = [
+      { user_id: 'u-a', amount: -10000, description: 'image', source: 'generated_images', source_id: '1', balance_after: 0, at: '2026-06-27T18:17:48' },
+      { user_id: 'u-c', amount: -7000, description: 'tg-bot', source: 'tg_bot_messages', source_id: '2', balance_after: 0, at: '2026-08-01T00:00:10' },
+      { user_id: 'u-a', amount: -25000, description: 'Генерация видео', source: 'video_jobs', source_id: '00000000-0000-4000-8000-000000000001', balance_after: 0, at: '2026-05-06T03:02:36' },
+      { user_id: 'u-b', amount: -25000, description: 'Генерация видео', source: 'video_jobs_expired_bak_20260728', source_id: '00000000-0000-4000-8000-000000000004', balance_after: 0, at: '2026-04-21T10:08:43' },
+    ];
+
+    const botConfig = async (owner: string): Promise<string> =>
+      (await pool.query(
+        `INSERT INTO tg_bot_configs (owner_user_id, display_name, preset_agent_id, addressing_mode, voice_reply_mode, status)
+         VALUES ($1, 'bot', 'roman', 'smart', 'never', 'active') RETURNING id`,
+        [owner],
+      )).rows[0].id;
+
+    const indexExists = async () =>
+      (await pool.query(
+        `SELECT 1 FROM pg_indexes WHERE tablename = 'token_transactions' AND indexname = 'idx_token_transactions_user_created'`,
+      )).rowCount === 1;
+
     const balances = async () =>
       (await pool.query('SELECT user_id, tokens::int AS tokens FROM ai_profiles_consolidated ORDER BY user_id')).rows;
 
@@ -178,13 +230,16 @@ maybe('сводка расхода и перенос старых трат — �
 
       await migrate();
 
-      expect(await reconstructed()).toEqual([
-        { user_id: 'u-a', amount: -10000, description: 'image', source: 'generated_images', source_id: '1', balance_after: 0, at: '2026-06-27T18:17:48' },
-        { user_id: 'u-c', amount: -7000, description: 'tg-bot', source: 'tg_bot_messages', source_id: '2', balance_after: 0, at: '2026-08-01T00:00:10' },
-        { user_id: 'u-a', amount: -25000, description: 'Генерация видео', source: 'video_jobs', source_id: '00000000-0000-4000-8000-000000000001', balance_after: 0, at: '2026-05-06T03:02:36' },
-        { user_id: 'u-b', amount: -25000, description: 'Генерация видео', source: 'video_jobs_expired_bak_20260728', source_id: '00000000-0000-4000-8000-000000000004', balance_after: 0, at: '2026-04-21T10:08:43' },
-      ]);
+      expect(await reconstructed()).toEqual(SEEDED);
       expect(await balances()).toEqual(before);
+    });
+
+    it('два одновременных старта, в том числе первых (индекса ещё нет), переносят каждую запись ровно раз', async () => {
+      await seed();
+      await pool.query('DROP INDEX IF EXISTS idx_token_transactions_user_created');
+      await Promise.all([migrate002(), migrate002()]);
+      expect(await reconstructed()).toEqual(SEEDED);
+      expect(await indexExists()).toBe(true);
     });
 
     it('второй старт ничего не добавляет', async () => {
@@ -197,10 +252,7 @@ maybe('сводка расхода и перенос старых трат — �
 
     it('индекс журнала создан', async () => {
       await migrate();
-      const r = await pool.query(
-        `SELECT 1 FROM pg_indexes WHERE tablename = 'token_transactions' AND indexname = 'idx_token_transactions_user_created'`,
-      );
-      expect(r.rowCount).toBe(1);
+      expect(await indexExists()).toBe(true);
     });
 
     it('повторный старт не запирает журнал: открытое списание его не держит', async () => {
@@ -231,7 +283,9 @@ maybe('сводка расхода и перенос старых трат — �
         expect(outcome).toBe('done');
       } finally {
         clearTimeout(timer);
-        writer.release();
+        // Соединение уничтожается, а не возвращается в пул: если тест упал до
+        // ROLLBACK, открытая транзакция не должна достаться следующему запросу.
+        writer.release(true);
       }
     });
 
@@ -252,6 +306,54 @@ maybe('сводка расхода и перенос старых трат — �
       );
       await migrate();
       expect((await reconstructed()).map((r) => r.source_id)).toEqual(['20', '21']);
+    });
+
+    it('защита от дублей узкая: та же сумма через 3 минуты или у другого человека — переносится', async () => {
+      await pool.query(
+        `INSERT INTO generated_images (id, user_id, prompt, image_url, tokens_spent, created_at) VALUES
+           (30, 'u-a', 'p', 'https://x/30.png', 10000, '2026-06-10T10:00:00Z'),
+           (31, 'u-a', 'p', 'https://x/31.png', 10000, '2026-06-11T10:00:00Z')`,
+      );
+      // Тот же человек и та же сумма, но через три минуты после картинки 30.
+      await consumed('u-a', -10000, '2026-06-10T10:03:00Z', 'Ответ ассистента');
+      // Та же сумма в минуте до и после картинки 31, но у других людей.
+      await consumed('u-b', -10000, '2026-06-11T09:59:00Z', 'Ответ ассистента');
+      await consumed('u-c', -10000, '2026-06-11T10:01:00Z', 'Ответ ассистента');
+      await migrate();
+      expect((await reconstructed()).map((r) => r.source_id)).toEqual(['30', '31']);
+    });
+
+    it('граница строгая: запись ровно в момент границы не переносится, секундой раньше — переносится', async () => {
+      await pool.query(
+        `INSERT INTO generated_images (id, user_id, prompt, image_url, tokens_spent, created_at) VALUES
+           (40, 'u-a', 'p', 'https://x/40.png', 10000, '2026-08-08T09:02:12Z'),
+           (41, 'u-a', 'p', 'https://x/41.png', 10000, '2026-08-08T09:02:11Z')`,
+      );
+      await pool.query(
+        `INSERT INTO video_jobs (id, user_id, mode, model, quality, duration_sec, tokens_spent, status, created_at) VALUES
+           ('00000000-0000-4000-8000-000000000040', 'u-a', 'text2video', 'veo-3.1', 'std', 8, 90000, 'ready', '2026-08-20T02:55:51Z'),
+           ('00000000-0000-4000-8000-000000000041', 'u-a', 'text2video', 'veo-3.1', 'std', 8, 90000, 'ready', '2026-08-20T02:55:50Z')`,
+      );
+      await pool.query('CREATE TABLE video_jobs_expired_bak_20260728 (LIKE video_jobs INCLUDING DEFAULTS)');
+      await pool.query(
+        `INSERT INTO video_jobs_expired_bak_20260728 (id, user_id, mode, model, quality, duration_sec, tokens_spent, status, created_at) VALUES
+           ('00000000-0000-4000-8000-000000000042', 'u-b', 'text2video', 'veo-3.1', 'std', 8, 90000, 'ready', '2026-08-20T02:55:51Z'),
+           ('00000000-0000-4000-8000-000000000043', 'u-b', 'text2video', 'veo-3.1', 'std', 8, 90000, 'ready', '2026-08-20T02:55:50Z')`,
+      );
+      const configId = await botConfig('u-c');
+      await pool.query(
+        `INSERT INTO tg_bot_messages (config_id, tg_chat_id, role, content, content_type, tokens_charged, created_at) VALUES
+           ($1, 1, 'assistant', 'ответ', 'text', 7000, '2026-08-11T11:28:37Z'),
+           ($1, 1, 'assistant', 'ответ', 'text', 7000, '2026-08-11T11:28:36Z')`,
+        [configId],
+      );
+      await migrate();
+      expect((await reconstructed()).map((r) => `${r.source}:${r.source_id}`)).toEqual([
+        'generated_images:41',
+        'tg_bot_messages:2',
+        'video_jobs:00000000-0000-4000-8000-000000000041',
+        'video_jobs_expired_bak_20260728:00000000-0000-4000-8000-000000000043',
+      ]);
     });
 
     it('перенесённое попадает в свои категории сводки', async () => {
