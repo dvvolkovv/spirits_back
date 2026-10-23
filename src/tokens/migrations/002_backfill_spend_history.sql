@@ -85,7 +85,8 @@ BEGIN
                                   'mode', v.mode, 'model', v.model),
                v.created_at
           FROM video_jobs v
-         WHERE v.tokens_spent > 0
+         WHERE v.status = 'ready'
+           AND v.tokens_spent > 0
            AND v.created_at < c_video
            AND NOT EXISTS (SELECT 1 FROM token_transactions t
                             WHERE t.metadata ->> 'source' = 'video_jobs'
