@@ -256,6 +256,8 @@ Expected: `profile-extraction-prompt.spec.ts` — 6 passed.
 
 ### Task 2: Сервис берёт промпт из функции
 
+_После ревью сторож по исходнику заменён поведенческим тестом обоих путей (CLI и OpenRouter) — см. `src/neo4j/neo4j-extraction-wiring.spec.ts`._
+
 **Files:**
 - Create: `src/neo4j/neo4j-extraction-wiring.spec.ts`
 - Modify: `src/neo4j/neo4j.service.ts:1-5`, `:523-563`
@@ -321,7 +323,7 @@ git push -q; SHA=$(git rev-parse HEAD)
 ssh dv@85.192.61.231 "cd ~/ci/wt/profile-health-filter && git fetch -q origin feat/profile-health-filter && git checkout -q --detach $SHA && source ~/.nvm/nvm.sh && npx jest src/neo4j src/tg-bot/tg-router.memory.spec.ts src/chat/chat.cost-growth.spec.ts src/chat/chat.service.masha-cost.spec.ts 2>&1 | tail -15"
 ```
 
-Expected: все наборы зелёные (8 тестов в `src/neo4j`).
+Expected: все наборы зелёные (9 тестов в `src/neo4j`: 7 + 2).
 
 ---
 
@@ -587,7 +589,7 @@ SHA=$(git -C ~/Downloads/spirits_back rev-parse feat/profile-health-filter)
 ssh dv@85.192.61.231 "cd ~/ci/wt/profile-health-filter && git fetch -q origin feat/profile-health-filter && git checkout -q --detach $SHA && source ~/.nvm/nvm.sh && npx jest src/ --silent 2>&1 | grep -E '^(FAIL|Tests:)' | sort > ~/ci/wt/phf-branch.txt; diff <(grep ^FAIL ~/ci/wt/phf-base.txt) <(grep ^FAIL ~/ci/wt/phf-branch.txt) && echo no-new-failures; grep Tests: ~/ci/wt/phf-branch.txt"
 ```
 
-Expected: `no-new-failures`; в `Tests:` прибавилось 8 passed против базы.
+Expected: `no-new-failures`; в `Tests:` прибавилось 9 passed против базы.
 
 - [ ] **Step 3: Типы сборки**
 
