@@ -1,19 +1,47 @@
-import * as fs from 'fs';
-import * as path from 'path';
+import axios from 'axios';
+import { Neo4jService } from './neo4j.service';
+import { buildProfileExtractionPrompt } from './profile-extraction-prompt';
 
 /**
- * Текст промпта извлекателя живёт только в profile-extraction-prompt.ts: там
- * его проверяют тесты. Вторая копия в сервисе разошлась бы с проверенной молча.
+ * Сервис отдаёт модели ровно промпт из buildProfileExtractionPrompt — и основным
+ * путём (Claude CLI), и запасным (OpenRouter). Свой текст на любом из путей молча
+ * выключил бы правило о здоровье на этом трафике. Проверяется поведением, а не
+ * чтением исходника: закомментированный вызов или другой текст в фолбэке
+ * исходник-сторож пропускал.
  */
-describe('Neo4jService: промпт извлечения профиля', () => {
-  const src = fs.readFileSync(path.join(__dirname, 'neo4j.service.ts'), 'utf8');
+describe('Neo4jService.consolidateFromChat: промпт извлечения', () => {
+  const savedKey = process.env.OPENROUTER_API_KEY;
 
-  it('собирается функцией buildProfileExtractionPrompt', () => {
-    expect(src).toContain("from './profile-extraction-prompt'");
-    expect(src).toMatch(/buildProfileExtractionPrompt\(\s*prevAssistant,\s*userMessage,\s*assistantResponse\s*\)/);
+  afterEach(() => {
+    if (savedKey === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = savedKey;
+    jest.restoreAllMocks();
   });
 
-  it('своей копии текста в сервисе нет', () => {
-    expect(src).not.toContain('Извлеки психологический профиль');
+  /** Сервис без Neo4j: прошлая реплика ассистента — 'PREV'; getSession → null, поэтому запись в граф и эмбеддинг пропускаются. */
+  function makeService(cliAnswer: string | null) {
+    const pg = { query: jest.fn(async () => ({ rows: [{ content: 'PREV' }] })) };
+    const cli = { text: jest.fn(async () => cliAnswer) };
+    const svc = new Neo4jService(pg as any, cli as any);
+    (svc as any).driver = {};
+    (svc as any).getSession = () => null;
+    return { svc, cli };
+  }
+
+  it('основной путь (Claude CLI) получает промпт из buildProfileExtractionPrompt', async () => {
+    const { svc, cli } = makeService('{}');
+    await svc.consolidateFromChat('u', 'a', 'USER', 'CUR');
+    expect(cli.text).toHaveBeenCalledWith(buildProfileExtractionPrompt('PREV', 'USER', 'CUR'), expect.anything());
+  });
+
+  it('запасной путь (OpenRouter) получает тот же промпт', async () => {
+    process.env.OPENROUTER_API_KEY = 'test';
+    const post = jest
+      .spyOn(axios, 'post')
+      .mockResolvedValue({ data: { choices: [{ message: { content: '{}' } }] } } as any);
+    const { svc } = makeService(null);
+    await svc.consolidateFromChat('u', 'a', 'USER', 'CUR');
+    expect(post).toHaveBeenCalled();
+    expect((post.mock.calls[0][1] as any).messages[0].content).toBe(buildProfileExtractionPrompt('PREV', 'USER', 'CUR'));
   });
 });
