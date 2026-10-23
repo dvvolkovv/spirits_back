@@ -2263,6 +2263,14 @@ SQL
 ```
 Ожидается: строки и токены по источникам = предпросмотру (± записи, появившиеся в источниках между T0 и выкатом, — у старых таблиц их быть не должно); `mismatched = 0`; индекс есть.
 
+- [ ] **Step 1b: Миграция применилась на test и на проде**
+
+```bash
+ssh -S ~/.ssh/cm-lnode dv@85.192.61.231 'grep -a "tokens migration 002_backfill_spend_history.sql" ~/.pm2/logs/linkeon-api-*.log | tail -3'
+ssh -o BatchMode=yes dvolkov@212.113.106.202 'grep -a "tokens migration 002_backfill_spend_history.sql" ~/.pm2/logs/linkeon-api-*.log | tail -3'
+```
+Ожидается: свежая строка `tokens migration 002_backfill_spend_history.sql applied` после рестарта выката. Строка `failed` (например, по `lock_timeout` на первом старте) — перенос и индекс не появились; следующий рестарт повторит попытку, решать с владельцем.
+
 - [ ] **Step 2: Ручка вживую — JSON, а не SPA-заглушка**
 
 С ноды, тестовым аккаунтом «Test user» из `CLAUDE.md` фронта (номер в команду подставить из `CLAUDE.md`; в отчёт и репозиторий не писать):
