@@ -184,6 +184,17 @@ describe('BlogNewsService.weeklyTopics — что уходит агенту', ()
     await svc.weeklyTopics(WEEK);
     expect(String(relay.ask.mock.calls[0][2])).toContain('2026-W38');
   });
+
+  it('sessionId разный и при одном и том же времени — прод и стенд зовут отбор в одну миллисекунду', async () => {
+    // 18.10.2026 оба сервера пришли в релей с `blog-news-2026-W42-1792303200004`.
+    // Релей держит по sessionId один ход и убил первый запрос как «новое
+    // сообщение»: ответ достался стенду, прод остался без новостей недели.
+    const prod = make(REAL_WEEK, reply());
+    const stand = make(REAL_WEEK, reply());
+    await prod.svc.weeklyTopics(WEEK);
+    await stand.svc.weeklyTopics(WEEK);
+    expect(String(prod.relay.ask.mock.calls[0][2])).not.toBe(String(stand.relay.ask.mock.calls[0][2]));
+  });
 });
 
 describe('BlogNewsService.weeklyTopics — повторный анонс', () => {

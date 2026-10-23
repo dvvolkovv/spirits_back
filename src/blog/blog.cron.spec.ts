@@ -40,12 +40,29 @@ describe('BlogCron при выключенном флаге', () => {
 });
 
 describe('BlogCron.refillTopics', () => {
-  beforeEach(() => { process.env.BLOG_ENABLED = 'true'; });
+  beforeEach(() => { process.env.BLOG_ENABLED = 'true'; process.env.BLOG_APPROVER_TG_ID = '77'; });
 
   const newsCalls = (d: any) => d.topics.addTopic.mock.calls
     .map((c: any) => c[0]).filter((t: any) => t.rubric === 'news');
   const caseCalls = (d: any) => d.topics.addTopic.mock.calls
     .map((c: any) => c[0]).filter((t: any) => t.rubric === 'case');
+
+  /** Повторы отбора ждут минутами — время в этих тестах ненастоящее. */
+  const refill = async (d: any) => {
+    jest.useFakeTimers();
+    try {
+      const run = make(d).refillTopics();
+      await jest.runAllTimersAsync();
+      await run;
+    } finally {
+      jest.useRealTimers();
+    }
+  };
+
+  const NEWS = {
+    rubric: 'news', source: 'git', sourceRef: 'git:2026-W42:hd-tool',
+    topicKey: 'hd-tool-2026-w42', topicHint: 'Карта Human Design прямо в чате', onceBySourceRef: true,
+  };
 
   it('заводит по теме недели, а не по коммиту', async () => {
     const d = deps();
@@ -78,9 +95,64 @@ describe('BlogCron.refillTopics', () => {
     d.news.weeklyTopics.mockRejectedValue(new Error('релей молчит'));
     d.topics.topAssistants.mockResolvedValue([{ agentId: '10', agentName: 'Алексей', description: LAWYER_PROFILE, turns: 40 }]);
 
-    await make(d).refillTopics();
+    await refill(d);
 
     expect(caseCalls(d)).toHaveLength(1);
+  });
+
+  /**
+   * Отбор — раз в неделю. 18.10.2026 он сорвался с первой попытки («релей
+   * вернул пустой ответ»), ошибка легла только в error-лог, и канал неделю
+   * простоял без новостей: владелец узнал об этом по пустой очереди.
+   */
+  describe('повтор отбора', () => {
+    it('сбой — повтор после паузы, и новость заводится из повтора', async () => {
+      const d = deps();
+      d.news.weeklyTopics
+        .mockRejectedValueOnce(new Error('blog: релей вернул пустой ответ'))
+        .mockResolvedValueOnce([NEWS]);
+
+      await refill(d);
+
+      expect(d.news.weeklyTopics).toHaveBeenCalledTimes(2);
+      expect(newsCalls(d).map((t: any) => t.sourceRef)).toEqual([NEWS.sourceRef]);
+      expect(d.approval.notify).not.toHaveBeenCalled();
+    });
+
+    it('между попытками — пауза не меньше минуты, а не долбёжка сразу', async () => {
+      const d = deps();
+      const at: number[] = [];
+      d.news.weeklyTopics.mockImplementation(async () => {
+        at.push(Date.now());
+        throw new Error('blog: релей вернул пустой ответ');
+      });
+
+      await refill(d);
+
+      expect(at.length).toBeGreaterThan(1);
+      for (let i = 1; i < at.length; i++) expect(at[i] - at[i - 1]).toBeGreaterThanOrEqual(60_000);
+    });
+
+    it('неделя без новостей — это ответ, а не сбой: без повторов и без сообщений', async () => {
+      const d = deps();
+      d.news.weeklyTopics.mockResolvedValue([]);
+
+      await refill(d);
+
+      expect(d.news.weeklyTopics).toHaveBeenCalledTimes(1);
+      expect(d.approval.notify).not.toHaveBeenCalled();
+    });
+
+    it('три попытки сорвались — владельцу одно сообщение с причиной', async () => {
+      const d = deps();
+      d.news.weeklyTopics.mockRejectedValue(new Error('blog: релей вернул пустой ответ'));
+
+      await refill(d);
+
+      expect(d.news.weeklyTopics).toHaveBeenCalledTimes(3);
+      expect(d.approval.notify).toHaveBeenCalledTimes(1);
+      expect(d.approval.notify).toHaveBeenCalledWith(77, expect.stringMatching(/новост[\s\S]*релей вернул пустой ответ/));
+    });
   });
 
   /**
