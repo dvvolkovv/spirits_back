@@ -701,18 +701,27 @@ Expected: у всех четырёх проб `✓ … контроль появ
 #!/usr/bin/env bash
 # Запись инструкции Шанкары (agents.system_prompt, id 13).
 #   bash apply-prompt.sh <test|prod> <файл с текстом> <md5 текста, который сейчас в базе>
-# До записи — снимок текущего текста на сервере в ~/prompt-backups/.
-# Запись — только если md5 в базе равен ожидаемому (никто не правил в обход).
+# Прод — только с OWNER_OK=yes в окружении (запись в боевую базу — с OK владельца).
+# До записи — снимок текущего текста на сервере в ~/prompt-backups/ (права 600).
+# Запись — только если md5 в базе равен ожидаемому (никто не правил в обход);
+# если там уже новый текст — ничего не меняет и сообщает об этом.
+# Ненулевой код выхода — сначала сверить md5 только чтением (план, Task 0 Step 1),
+# потом решать, повторять ли.
 set -euo pipefail
 ENV_NAME=${1:?test|prod}; FILE=${2:?файл}; EXPECT_BEFORE=${3:?md5}
+[[ $EXPECT_BEFORE =~ ^[0-9a-f]{32}$ ]] || { echo "третий аргумент — md5 из 32 hex-символов" >&2; exit 2; }
 case "$ENV_NAME" in
   test) HOST=dv@85.192.61.231 ;;
-  prod) HOST=dvolkov@212.113.106.202 ;;
+  prod)
+    HOST=dvolkov@212.113.106.202
+    [ "${OWNER_OK:-}" = yes ] || { echo "прод — только с OWNER_OK=yes" >&2; exit 2; }
+    ;;
   *) echo "окружение: test или prod" >&2; exit 2 ;;
 esac
 NEW_MD5=$(md5 -q "$FILE")
 B64=$(node -e 'process.stdout.write(require("fs").readFileSync(process.argv[1]).toString("base64"))' "$FILE")
 TS=$(date -u +%Y%m%dT%H%M%SZ)
+SNAP="~/prompt-backups/shankara-13-before-$TS.b64"
 SQL=$(mktemp); trap 'rm -f "$SQL"' EXIT
 cat > "$SQL" <<EOF
 \\set ON_ERROR_STOP on
@@ -723,27 +732,34 @@ BEGIN
   UPDATE agents SET system_prompt = convert_from(decode('$B64', 'base64'), 'UTF8')
    WHERE id = 13 AND md5(system_prompt) = '$EXPECT_BEFORE';
   GET DIAGNOSTICS n = ROW_COUNT;
-  IF n <> 1 THEN RAISE EXCEPTION 'инструкция Шанкары не та, что ожидалась (строк: %)', n; END IF;
+  IF n <> 1 THEN
+    IF (SELECT md5(system_prompt) FROM agents WHERE id = 13) = '$NEW_MD5' THEN
+      RAISE NOTICE 'новый текст уже записан — ничего не меняю';
+    ELSE
+      RAISE EXCEPTION 'инструкция Шанкары не та, что ожидалась (строк: %)', n;
+    END IF;
+  END IF;
 END \$\$;
-SELECT md5(system_prompt) FROM agents WHERE id = 13;
 COMMIT;
+SELECT md5(system_prompt) FROM agents WHERE id = 13;
 EOF
-GOT=$(ssh -o BatchMode=yes "$HOST" "cd ~/spirits_back && url=\$(node -e 'process.stdout.write(require(\"dotenv\").parse(require(\"fs\").readFileSync(\".env\")).DATABASE_URL)') && mkdir -p ~/prompt-backups && psql \"\$url\" -At -c \"select encode(convert_to(system_prompt,'UTF8'),'base64') from agents where id=13\" < /dev/null > ~/prompt-backups/shankara-13-before-$TS.b64 && psql \"\$url\" -qAt -f -" < "$SQL" | tail -1)
-[ "$GOT" = "$NEW_MD5" ] || { echo "ОШИБКА: md5 в базе '$GOT', ожидался '$NEW_MD5'" >&2; exit 1; }
-echo "OK: $ENV_NAME, md5 $NEW_MD5, снимок ~/prompt-backups/shankara-13-before-$TS.b64"
+GOT=$(ssh -o BatchMode=yes "$HOST" "umask 077 && cd ~/spirits_back && url=\$(node -e 'process.stdout.write(require(\"dotenv\").parse(require(\"fs\").readFileSync(\".env\")).DATABASE_URL)') && mkdir -p ~/prompt-backups && psql -X \"\$url\" -At -c \"select encode(convert_to(system_prompt,'UTF8'),'base64') from agents where id=13\" < /dev/null > $SNAP && test -s $SNAP && psql -X \"\$url\" -qAt -f -" < "$SQL" | tail -1)
+[ "$GOT" = "$NEW_MD5" ] || { echo "ОШИБКА: md5 в базе '$GOT', ожидался '$NEW_MD5' — сверить чтением, прежде чем повторять" >&2; exit 1; }
+echo "OK: $ENV_NAME, md5 $NEW_MD5, снимок $SNAP"
 ```
 
 - [ ] **Step 2: `apply-descriptions.sql`** (идемпотентно: повторный запуск ничего не меняет)
 
 ```sql
 \set ON_ERROR_STOP on
+\encoding UTF8
 BEGIN;
 SELECT 'before', 'base', description FROM agents WHERE id = 13
 UNION ALL
 SELECT 'before', locale, description FROM agent_translations WHERE entity_type = 'agent' AND entity_id = '13'
 ORDER BY 2;
 UPDATE agents SET description = description || ', а также определяет конституцию по аюрведе'
- WHERE id = 13 AND description NOT LIKE '%аюрвед%';
+ WHERE id = 13 AND description NOT LIKE '%аюрвед%' AND description !~ '[.!?。!?]\s*$';
 UPDATE agent_translations t
    SET description = t.description || s.suffix, updated_at = now()
   FROM (VALUES
@@ -755,7 +771,8 @@ UPDATE agent_translations t
     ('zh', '，并判断你的阿育吠陀体质')
   ) AS s(locale, suffix)
  WHERE t.entity_type = 'agent' AND t.entity_id = '13' AND t.locale = s.locale
-   AND t.description NOT ILIKE '%ayurv%' AND t.description NOT LIKE '%阿育吠陀%';
+   AND t.description NOT ILIKE '%ayurv%' AND t.description NOT LIKE '%阿育吠陀%'
+   AND t.description !~ '[.!?。!?]\s*$';
 SELECT 'after', 'base', description FROM agents WHERE id = 13
 UNION ALL
 SELECT 'after', locale, description FROM agent_translations WHERE entity_type = 'agent' AND entity_id = '13'
@@ -767,8 +784,10 @@ COMMIT;
 
 ```sql
 \set ON_ERROR_STOP on
+\encoding UTF8
 BEGIN;
-UPDATE agents SET description = replace(description, ', а также определяет конституцию по аюрведе', '') WHERE id = 13;
+UPDATE agents SET description = replace(description, ', а также определяет конституцию по аюрведе', '')
+ WHERE id = 13 AND strpos(description, ', а также определяет конституцию по аюрведе') > 0;
 UPDATE agent_translations t
    SET description = replace(t.description, s.suffix, ''), updated_at = now()
   FROM (VALUES
@@ -779,7 +798,12 @@ UPDATE agent_translations t
     ('pt', ', e determina a sua constituição ayurvédica'),
     ('zh', '，并判断你的阿育吠陀体质')
   ) AS s(locale, suffix)
- WHERE t.entity_type = 'agent' AND t.entity_id = '13' AND t.locale = s.locale;
+ WHERE t.entity_type = 'agent' AND t.entity_id = '13' AND t.locale = s.locale
+   AND strpos(t.description, s.suffix) > 0;
+SELECT 'after', 'base', description FROM agents WHERE id = 13
+UNION ALL
+SELECT 'after', locale, description FROM agent_translations WHERE entity_type = 'agent' AND entity_id = '13'
+ORDER BY 2;
 COMMIT;
 ```
 
@@ -904,19 +928,36 @@ Expected: у сессий с картой (chart, moscow1985, dosha) — `swisse
 
 ```bash
 cd ~/Downloads/land_linkeon/.superpowers/shankara-ayurveda
-bash apply-prompt.sh prod shankara-prompt-after.txt 2df6d129b900c34ece112e0269903c46
+OWNER_OK=yes bash apply-prompt.sh prod shankara-prompt-after.txt 2df6d129b900c34ece112e0269903c46
 ```
 
 Expected: `OK: prod, md5 6ff22fc8e5ca7df443232433919be378, …` (или новый md5, если в задаче 8 правили текст — тот же, что на test).
 
 - [ ] **Step 3: Подписи на test и проде**
 
+Тест — применить и сохранить лог:
+
 ```bash
 cd ~/Downloads/land_linkeon/.superpowers/shankara-ayurveda
-for H in dv@85.192.61.231 dvolkov@212.113.106.202; do
-  ssh -o BatchMode=yes $H 'cd ~/spirits_back && url=$(node -e "process.stdout.write(require(\"dotenv\").parse(require(\"fs\").readFileSync(\".env\")).DATABASE_URL)") && psql "$url" -qAt -F " | " -f -' < apply-descriptions.sql | tee "desc-$(echo $H | cut -d@ -f1)-$(date +%m%d-%H%M).log"
-done
+set -o pipefail
+ssh -o BatchMode=yes dv@85.192.61.231 'cd ~/spirits_back && url=$(node -e "process.stdout.write(require(\"dotenv\").parse(require(\"fs\").readFileSync(\".env\")).DATABASE_URL)") && psql -X "$url" -qAt -F " | " -f -' < apply-descriptions.sql | tee desc-test-$(date +%m%d-%H%M).log
 ```
+
+Прочитать строки `after` в выводе.
+
+Прод — сначала READ-ONLY взгляд на текущие подписи, без применения:
+
+```bash
+sed -n '3,6p' apply-descriptions.sql | ssh -o BatchMode=yes dvolkov@212.113.106.202 'cd ~/spirits_back && url=$(node -e "process.stdout.write(require(\"dotenv\").parse(require(\"fs\").readFileSync(\".env\")).DATABASE_URL)") && psql -X "$url" -At -F " | " -f -'
+```
+
+Затем применение на проде, тот же файл целиком:
+
+```bash
+ssh -o BatchMode=yes dvolkov@212.113.106.202 'cd ~/spirits_back && url=$(node -e "process.stdout.write(require(\"dotenv\").parse(require(\"fs\").readFileSync(\".env\")).DATABASE_URL)") && psql -X "$url" -qAt -F " | " -f -' < apply-descriptions.sql | tee desc-prod-$(date +%m%d-%H%M).log
+```
+
+Прочитать строки `after` в выводе. Ненулевой код выхода — сначала прочитать подписи, потом решать.
 
 Expected: строки `after` с дописанным хвостом — у base и всех локалей (на test нет pt, это ожидаемо).
 
@@ -955,9 +996,11 @@ Expected: все `✓`, файл секрета удалён. Прочитать
 
 ```bash
 cd ~/Downloads/land_linkeon/.superpowers/shankara-ayurveda
-bash apply-prompt.sh prod shankara-prompt-before.txt <итоговый md5 из задачи 8; без правок текста — 6ff22fc8e5ca7df443232433919be378>
-ssh dvolkov@212.113.106.202 'cd ~/spirits_back && url=$(node -e "process.stdout.write(require(\"dotenv\").parse(require(\"fs\").readFileSync(\".env\")).DATABASE_URL)") && psql "$url" -qAt -f -' < rollback-descriptions.sql
+OWNER_OK=yes bash apply-prompt.sh prod shankara-prompt-before.txt <итоговый md5 из задачи 8; без правок текста — 6ff22fc8e5ca7df443232433919be378>
+ssh dvolkov@212.113.106.202 'cd ~/spirits_back && url=$(node -e "process.stdout.write(require(\"dotenv\").parse(require(\"fs\").readFileSync(\".env\")).DATABASE_URL)") && psql -X "$url" -qAt -f -' < rollback-descriptions.sql
 ```
+
+- [ ] **Step 7: сверить md5 инструкции на проде и test только чтением (команда Task 0 Step 1)** — админская форма ассистента сохраняет system_prompt и description целиком, и старая открытая форма может откатить правку. Шанкару в админке на время выката не править.
 
 ---
 
