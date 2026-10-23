@@ -821,6 +821,8 @@ bash ../spending-node-run.sh back 'npx jest src/tokens/tokens-schema 2>&1 | tail
 
 - [ ] **Step 3: SQL-файл**
 
+> **Поправка по ходу (23.10, коммиты `5c3c25a` + `591886b`).** Листинг ниже — первоначальный. На PG 16 верхнеуровневый `CREATE INDEX IF NOT EXISTS` берёт ShareLock на `token_transactions` даже при существующем индексе и держит его всю неявную транзакцию — при каждом старте API списания ждали бы конца переноса, а два одновременных первых старта ловили deadlock. В итоговом файле индекс создаётся ВНУТРИ блока DO, после `pg_advisory_xact_lock`, и только если `to_regclass('public.idx_token_transactions_user_created') IS NULL`. Сторожит это живой тест «повторный старт не запирает журнал». Истина — файл `src/tokens/migrations/002_backfill_spend_history.sql`.
+
 `src/tokens/migrations/002_backfill_spend_history.sql`:
 
 ```sql
@@ -1265,7 +1267,7 @@ git commit -q -m "test(tokens): сводка расхода и перенос с
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 bash ../spending-node-run.sh back 'sudo -u postgres psql -qc "DROP DATABASE IF EXISTS spend_test" && sudo -u postgres psql -qc "CREATE DATABASE spend_test OWNER spendtest" && SPENDING_PG_URL=postgresql://spendtest:spendtest@127.0.0.1:5432/spend_test npx jest src/tokens/spending.integration 2>&1 | tail -20'
 ```
-Ожидается: 9 passed. Если что-то красное — чинить код (задачи 1–4), а не тест; тест описывает спеку.
+Ожидается: 9 passed (после поправки индекса — 10). Если что-то красное — чинить код (задачи 1–4), а не тест; тест описывает спеку.
 
 - [ ] **Step 4: Сломать нарочно — убедиться, что прибор видит**
 
@@ -2110,7 +2112,7 @@ pnpm vitest run 2>&1 | grep -E "Test Files|Tests |FAIL" | tail -10
 echo "tsc app errors:"; npx tsc --noEmit -p tsconfig.app.json 2>&1 | tee /tmp/spending-tsc.txt | grep -c "error TS" || true
 echo "tsc errors in our files:"; grep -E "src/(shared|components/tokens|tma/screens|pages/TokenPurchasePage)" /tmp/spending-tsc.txt || echo none
 node scripts/check-locales.mjs && node scripts/check-keys-exist.mjs && node scripts/check-no-hardcoded.mjs && echo I18N-OK
-node scripts/check-no-hardcoded-locale.mjs > /tmp/spending-locfmt.txt 2>&1; diff /tmp/spending-locfmt-base.txt /tmp/spending-locfmt.txt && echo LOCFMT-SAME-AS-MAIN
+node scripts/check-no-hardcoded-locale.mjs > /tmp/spending-locfmt.txt 2>&1 || true; diff /tmp/spending-locfmt-base.txt /tmp/spending-locfmt.txt && echo LOCFMT-SAME-AS-MAIN
 pnpm build 2>&1 | tail -3'
 ```
 Ожидается: vitest без падений (или те же, что на `main`, — сверить отдельным прогоном на базе); число ошибок `tsc` не больше базового из задачи 0 и `none` в своих файлах; `I18N-OK`; `LOCFMT-SAME-AS-MAIN`; сборка `✓ built`.
