@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { BlogGitSource } from './blog-git.source';
 import { BlogRelayClient } from './blog-relay.client';
 import { AddTopicInput } from './blog-topic.service';
@@ -44,10 +45,16 @@ export class BlogNewsService {
 
     // Сессия одноразовая: длинные сессии релея глючат посторонним текстом, а
     // память здесь не нужна — весь контекст едет в самом сообщении.
+    //
+    // Уникальность — случайной частью, а не временем. Прод и стенд ходят в
+    // один релей и зовут отбор в одну и ту же секунду, а релей держит по
+    // sessionId один ход: второй запрос с тем же id убивает первый как «новое
+    // сообщение». 18.10.2026 метки времени совпали до миллисекунды — ответ
+    // достался стенду, прод получил пустой поток и остался без новостей недели.
     const raw = await this.relay.ask(
       buildNewsSelectionPrompt(),
       buildNewsSelectionMessage(weekKey, themes),
-      `blog-news-${weekKey}-${now.getTime()}`,
+      `blog-news-${weekKey}-${randomUUID()}`,
     );
 
     const byTheme = new Map(themes.map((t) => [t.theme, t]));

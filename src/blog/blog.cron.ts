@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import {
-  BlogTopicService, caseTopicHint, hasClearProfile, normalizeTopicKey, STALE_DRAFTING_MINUTES,
+  AddTopicInput, BlogTopicService, caseTopicHint, hasClearProfile, normalizeTopicKey, STALE_DRAFTING_MINUTES,
 } from './blog-topic.service';
 import { BlogEditorService } from './blog-editor.service';
 import { BlogImageService } from './blog-image.service';
@@ -17,6 +17,18 @@ import { QueueShift, leaveQueue, mergeShifts } from './blog-queue';
 
 /** Напоминание уходит, когда до слота осталось меньше этого. */
 const REMIND_WINDOW_MINUTES = 60;
+
+/**
+ * Паузы перед повторами отбора новостей недели.
+ *
+ * Отбор идёт раз в неделю, и без повтора одна неудача оставляла канал без
+ * новостей на семь дней: 18.10.2026 так и вышло. Релей отваливается регулярно,
+ * поэтому пауз две: короткая — на мгновенный сбой, длинная — на рестарт релея
+ * или перегруз модели.
+ */
+export const NEWS_RETRY_DELAYS_MS = [60_000, 10 * 60_000];
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /**
  * Через сколько минут пост в `publishing` считается зависшим.
@@ -88,18 +100,18 @@ export class BlogCron {
    * Новости и кейсы разведены по разным try намеренно: отбор новостей ходит
    * в релей, а тот отваливается регулярно. Общий catch унёс бы вместе с
    * новостями и кейсы, которым релей не нужен, и канал остался бы вообще без
-   * тем на неделю.
+   * тем на неделю. Сам отбор повторяется — см. `weeklyNews`.
    */
   @Cron('0 6 * * 0')
   async refillTopics(): Promise<void> {
     if (!this.enabled()) return;
 
     try {
-      for (const topic of await this.news.weeklyTopics()) {
+      for (const topic of await this.weeklyNews()) {
         await this.topics.addTopic(topic);
       }
     } catch (e: any) {
-      this.logger.error(`отбор новостей недели сорвался: ${e.message}`);
+      this.logger.error(`новости недели не заведены: ${e.message}`);
     }
 
     try {
@@ -120,6 +132,39 @@ export class BlogCron {
     } catch (e: any) {
       this.logger.error(`пополнение кейсов сорвалось: ${e.message}`);
     }
+  }
+
+  /**
+   * Отбор новостей недели с повторами. Повторяем только ошибку: пустой список
+   * значит «рассказывать нечего», это ответ, а не сбой.
+   *
+   * Если сорвались все попытки, пишем владельцу. Иначе неудачу видно только в
+   * error-логе, а снаружи она неотличима от недели без новостей: 18.10.2026 её
+   * заметили по пустой очереди, когда канал уже неделю молчал.
+   */
+  private async weeklyNews(): Promise<AddTopicInput[]> {
+    let lastError = '';
+    for (let attempt = 0; attempt <= NEWS_RETRY_DELAYS_MS.length; attempt++) {
+      if (attempt > 0) await sleep(NEWS_RETRY_DELAYS_MS[attempt - 1]);
+      try {
+        return await this.news.weeklyTopics();
+      } catch (e: any) {
+        lastError = e.message;
+        this.logger.warn(`отбор новостей недели, попытка ${attempt + 1}: ${e.message}`);
+      }
+    }
+
+    const attempts = NEWS_RETRY_DELAYS_MS.length + 1;
+    this.logger.error(`отбор новостей недели сорвался (попыток: ${attempts}): ${lastError}`);
+    const chatId = this.approverChatId();
+    if (chatId) {
+      await this.approval.notify(
+        chatId,
+        `Блог: новости недели не отобраны (попыток: ${attempts}) — ${lastError}. ` +
+          'Новость можно завести вручную: админка → «Блог» → «Новинка».',
+      );
+    }
+    return [];
   }
 
   /**
