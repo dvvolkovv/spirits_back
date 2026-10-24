@@ -4,7 +4,8 @@ import { PgService } from '../common/services/pg.service';
 import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
 import { failureSignature, isUserSideToolError } from './problem-classify';
 import {
-  clip, FALLBACK_NAME, formatToolCapNotice, formatToolFailure, head, isKnownTool, oneLine, Repeats,
+  clip, FALLBACK_NAME, formatAssistantReport, formatToolCapNotice, formatToolFailure, head, isKnownTool, oneLine,
+  ProblemChannel, ProblemKind, Repeats,
 } from './problem-format';
 
 /** Подсказка ассистенту в результате инструмента, когда команда уже знает о сбое. */
@@ -12,12 +13,30 @@ export const SUPPORT_NOTE =
   'Команда Linkeon уже получила сообщение об этом сбое. Скажи пользователю простыми словами, ' +
   'что не получилось и что команда в курсе. Срок починки не обещай.';
 
+/** Поле say в ответе report_problem — что сказать пользователю (как у инструмента продуктов). */
+export const REPORTED_SAY =
+  'Передано команде Linkeon. Скажи пользователю, что передал(а) проблему команде; срок починки не обещай.';
+export const RATE_LIMITED_SAY =
+  'Сообщений в поддержку сейчас слишком много. Предложи пользователю написать во вкладку «Поддержка».';
+export const BAD_INPUT_SAY =
+  'Опиши проблему в summary (1–3 предложения) и укажи kind: my_failure или user_report.';
+export const NOT_CONFIGURED_SAY =
+  'Передать команде сейчас нечем. Предложи пользователю написать во вкладку «Поддержка».';
+
+export type AssistantReportResult =
+  | { ok: true; reported: true; say: string }
+  | { ok: false; error: 'bad_input' | 'not_configured' | 'rate_limited'; say: string };
+
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 /** Сколько разных пользователей помнить в одном сбое: счётчику хватит, памяти — нет. */
 const MAX_USERS_PER_INCIDENT = 1000;
 const MAX_ID = 64;
 const MAX_ERROR = 300;
+/** Имя из аргумента модели — до 40 символов, как в заголовке сообщения. */
+const MAX_NAME = 40;
+/** Пересказ длиннее — отказ сразу: форматтер оставит 500, а огромный текст не должен ни обрабатываться, ни держаться в памяти. */
+const MAX_SUMMARY_INPUT = 2000;
 
 interface Incident {
   lastSentAt: number;
@@ -64,6 +83,9 @@ export class ProblemReportService {
   private readonly incidents = new Map<string, Incident>();
   /** Моменты сообщений пути А за последний час — для общего потолка. */
   private toolSent: number[] = [];
+  /** Моменты сообщений пути Б по пользователям и всего — для лимитов (скользящие окна). */
+  private readonly userReports = new Map<string, number[]>();
+  private globalReports: number[] = [];
   /** Когда ушло уведомление «слишком много сбоев» (не чаще раза в час). */
   private capNoticeAt = 0;
   /** Сколько ждать имя ассистента из базы: у пула нет таймаута запроса, а зависший Postgres не должен держать сообщение. */
@@ -90,7 +112,7 @@ export class ProblemReportService {
       const now = Date.now();
       const tool = short(p.tool, MAX_ID);
       const userId = short(p.userId, MAX_ID);
-      const error = clip(String(p.error ?? ''), MAX_ERROR);
+      const error = clip(head(String(p.error ?? ''), MAX_ERROR), MAX_ERROR);
       // Незнакомые имена инструментов — один сбой: модель зовёт только то, что
       // есть в списке /mcp, а поток случайных имён (прямые вызовы /mcp) не
       // должен занимать все слоты потолка и прятать настоящие сбои.
@@ -120,6 +142,67 @@ export class ProblemReportService {
       this.logger.warn(`problem-report: сбой не обработан: ${e?.message}`);
       return { supportNotified: false };
     }
+  }
+
+  /**
+   * Путь Б: инструмент report_problem — ассистент сообщает сам. userId и
+   * channel — из подписанного токена точки продуктов, assistantId — из хода
+   * (у TG-бота его нет), остальное пишет модель. Никогда не бросает.
+   */
+  async reportFromAssistant(p: {
+    userId: string;
+    channel: ProblemChannel;
+    assistantId: string | null;
+    assistantArg: unknown;
+    kind: unknown;
+    summary: unknown;
+  }): Promise<AssistantReportResult> {
+    try {
+      const raw = typeof p.summary === 'string' ? p.summary : '';
+      if (raw.length > MAX_SUMMARY_INPUT) return { ok: false, error: 'bad_input', say: BAD_INPUT_SAY };
+      const summary = raw.trim();
+      const kind: ProblemKind | null = p.kind === 'my_failure' || p.kind === 'user_report' ? p.kind : null;
+      if (!summary || !kind) return { ok: false, error: 'bad_input', say: BAD_INPUT_SAY };
+      if (!telegramConfigured()) return { ok: false, error: 'not_configured', say: NOT_CONFIGURED_SAY };
+      const userId = short(p.userId, MAX_ID);
+      if (!this.takeQuota(userId, Date.now())) return { ok: false, error: 'rate_limited', say: RATE_LIMITED_SAY };
+      // Короткие копии — в замыкание; до 40 символов имя обрежет и форматтер.
+      const arg = typeof p.assistantArg === 'string' ? short(p.assistantArg, MAX_NAME) : '';
+      const { assistantId, channel } = p;
+      void this.deliver('assistant_report', async () => {
+        const fromTurn = assistantId ? await this.assistantNameWithin(assistantId) : FALLBACK_NAME;
+        const assistant = fromTurn !== FALLBACK_NAME ? fromTurn : arg || FALLBACK_NAME;
+        return formatAssistantReport({ assistant, kind, summary, userId, channel });
+      });
+      return { ok: true, reported: true, say: REPORTED_SAY };
+    } catch (e: any) {
+      this.logger.warn(`problem-report: сообщение ассистента не обработано: ${e?.message}`);
+      return { ok: false, error: 'not_configured', say: NOT_CONFIGURED_SAY };
+    }
+  }
+
+  /**
+   * Скользящие окна: час и сутки на пользователя, сутки на всех. Отказ квоту не
+   * тратит. Метки «из будущего» (часы шагнули назад) считаем истёкшими.
+   */
+  private takeQuota(userId: string, now: number): boolean {
+    const fresh = (t: number, span: number) => t <= now && now - t < span;
+    this.globalReports = this.globalReports.filter((t) => fresh(t, DAY));
+    const mine = (this.userReports.get(userId) ?? []).filter((t) => fresh(t, DAY));
+    const lastHour = mine.filter((t) => fresh(t, HOUR)).length;
+    if (
+      lastHour >= envNumber('PROBLEM_REPORT_USER_HOURLY', 3) ||
+      mine.length >= envNumber('PROBLEM_REPORT_USER_DAILY', 10) ||
+      this.globalReports.length >= envNumber('PROBLEM_REPORT_GLOBAL_DAILY', 50)
+    ) {
+      if (mine.length) this.userReports.set(userId, mine);
+      else this.userReports.delete(userId);
+      return false;
+    }
+    mine.push(now);
+    this.userReports.set(userId, mine);
+    this.globalReports.push(now);
+    return true;
   }
 
   /**
@@ -197,6 +280,9 @@ export class ProblemReportService {
   private forgetOld(now: number): void {
     for (const [key, inc] of this.incidents) {
       if (now - inc.lastSeenAt > DAY) this.incidents.delete(key);
+    }
+    for (const [userId, times] of this.userReports) {
+      if (!times.some((t) => t <= now && now - t < DAY)) this.userReports.delete(userId);
     }
   }
 }
