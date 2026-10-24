@@ -5,6 +5,7 @@ import { V } from '../values';
 // источник: подарок — src/identity/identity.service.ts (WELCOME_BONUS, issueWelcomeBonus)
 // источник: экран «С чего начнём?» — spirits_front src/pages/ChatPage.tsx:36-67,108-128; components/onboarding/OnboardingMatch.tsx:17-39
 // источник: выбор ассистента — spirits_front src/components/chat/AssistantSelection.tsx:106-196; ChatLayout.tsx:226-290; ChatInterface.tsx:2641-2760
+// источник: подписи групп — только экран выбора карточками (AssistantSelection.tsx:165,179); боковой список (ChatLayout.tsx:263,269) подписан иначе
 export const start: KbArticle = {
   id: 'start',
   title: 'С чего начать',
@@ -15,7 +16,7 @@ export const start: KbArticle = {
 Linkeon — ассистенты для бизнеса и личного роста (юрист, маркетолог, коуч и другие специалисты) и персональный ассистент Роман. Ассистенты помнят человека: профиль собирается из разговоров.
 
 ## Где
-Вход — на my.linkeon.io. После входа — экран выбора ассистента; в открытом чате ассистента меняют списком по имени в шапке. Группы списка: ${q('sectionPersonal')}, ${q('sectionBusiness')}, ${q('sectionGrowth')} и ${q('sectionMine')} — свои ассистенты пользователя.
+Вход — на my.linkeon.io. После входа — экран выбора ассистента карточками по группам ${q('sectionPersonal')}, ${q('sectionBusiness')}, ${q('sectionGrowth')} и ${q('sectionMine')} — свои ассистенты пользователя. В открытом чате ассистента меняют списком по имени в шапке.
 
 ## Как
 - Войти можно по почте (ссылка в письме), по телефону с кодом из SMS, через Яндекс, Google или Taler ID. Перед входом нужно отметить согласие с условиями: сервис для совершеннолетних.
