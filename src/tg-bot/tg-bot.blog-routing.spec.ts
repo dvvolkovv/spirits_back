@@ -71,6 +71,37 @@ describe('роутинг блога в живом обработчике', () =>
     expect(blog.handleCallback).toHaveBeenCalledWith(cb);
   });
 
+  it('кнопка сводки «Затыки недели» уходит в её обработчик и у непривязанного пользователя', async () => {
+    // Владелец сводки определяется чатом сводки, а не связкой ассистентов:
+    // проверка привязки ниже молча проглотила бы нажатие.
+    const insights = { handleCallback: jest.fn() };
+    const withInsights = new TgBotService(
+      pg as any,
+      identity as any,
+      {} as any,
+      configs as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      commands as any,
+      {} as any,
+      grammy as any,
+      {} as any,
+      {} as any,
+      blog as any,
+      undefined, // costGrowth
+      insights as any,
+    );
+    identity.getLinkeonIdByTgUserId.mockResolvedValue(null);
+
+    const cb = { id: 'cb3', data: 'ins:b:11111111-2222-3333-4444-555555555555', from: { id: 42 }, message: { chat: { id: 42 } } };
+    await (withInsights as any).handleCallbackQuery(cb);
+
+    expect(insights.handleCallback).toHaveBeenCalledWith(cb);
+    expect(blog.handleCallback).not.toHaveBeenCalled();
+    expect(identity.getLinkeonIdByTgUserId).not.toHaveBeenCalled();
+  });
+
   it('кнопка ассистента в блог не уходит', async () => {
     identity.getLinkeonIdByTgUserId.mockResolvedValue('u-1');
 
