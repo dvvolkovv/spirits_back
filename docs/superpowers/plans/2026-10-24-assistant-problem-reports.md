@@ -1725,7 +1725,7 @@ import { REPORT_PROBLEM_TOOL, REPORT_PROBLEM_TOOL_NAME } from '../problem-report
       return this.problems.reportFromAssistant({
         userId,
         channel,
-        assistantId: this.chat.activeAssistantFor(userId),
+        assistantId: channel === 'web' ? this.chat.activeAssistantFor(userId) : null, // у TG хода нет; чужой веб-ход подписал бы чужим именем
         assistantArg: input.assistant,
         kind: input.kind,
         summary: input.summary,
