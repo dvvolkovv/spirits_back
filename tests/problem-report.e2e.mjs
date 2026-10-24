@@ -4,8 +4,9 @@
  *
  * Вручную, на проде, тестовым аккаунтом (не админом): один ход с просьбой
  * сообщить о выдуманной поломке. Скрипт проверяет, что ход дошёл и ответ
- * говорит о передаче команде. Что сообщение ушло в группу — строка
- * «problem-report: отправлено (assistant_report)» в логе прода.
+ * говорит о передаче команде. Дошло ли до группы — по логу прода: строка
+ * «problem-report: передано в фанаут TELEGRAM_CHAT_ID (assistant_report)» и
+ * перед ней ни одной «not delivered» для чата группы.
  *
  *   BASE_URL=https://my.linkeon.io TEST_PHONE=… DEBUG_SECRET=… node tests/problem-report.e2e.mjs
  */
@@ -89,6 +90,9 @@ const token = await login();
 if (await isAdmin(token)) throw new Error('TEST_PHONE указывает на админа — прогон остановлен');
 const reply = await say(token, MESSAGE);
 console.log(`Кира: ${reply}`);
-const ok = /команд|поддержк|передал/i.test(reply);
-console.log(`${ok ? '✓' : '✗'} ответ говорит о передаче команде`);
+// Отказы report_problem тоже говорят о команде и поддержке («Передать команде сейчас нечем…»,
+// «…во вкладку «Поддержка»»), поэтому сначала ищем отказ, потом передачу.
+const refused = /не (получил|удал|вышл|смог|могу)|нечем|слишком много/i.test(reply);
+const ok = !refused && /передал|передан/i.test(reply);
+console.log(`${ok ? '✓' : '✗'} ответ говорит о передаче команде${refused ? ' (похоже на отказ)' : ''}`);
 process.exit(ok ? 0 : 1);
