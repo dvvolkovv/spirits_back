@@ -256,7 +256,7 @@ export class SupportService implements OnModuleInit {
     await this.pg.query(
       `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
        VALUES ($1, 'system', NULL, 'user_reply_ping', $2::jsonb)`,
-      [ticketId, JSON.stringify({ preview: text.slice(0, 200) })],
+      [ticketId, JSON.stringify({ preview: clip(text, 200) })],
     );
   }
 
