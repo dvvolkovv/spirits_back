@@ -109,6 +109,31 @@ async function send(page: Page, text: string): Promise<number> {
 }
 
 /**
+ * Докручивает ленту до низа и говорит, виден ли последний пузырь пользователя
+ * целиком. Сам кабинет едет вниз, только если до низа ленты меньше 150 px
+ * (автопрокрутка ChatInterface), а пузырь длинного вопроса выше — без докрутки
+ * он остаётся под полем ввода. Верх ленты на мобильном перекрывает шапка: под
+ * неё у ленты верхний отступ, туда пузырь попадать не должен.
+ */
+async function revealLastUserMessage(page: Page): Promise<boolean> {
+  await page.evaluate(() => {
+    const list = document.querySelector('[data-testid="chat-messages-list"]') as HTMLElement | null;
+    if (list) list.scrollTop = list.scrollHeight;
+  });
+  await page.waitForTimeout(800);
+  return page.evaluate((sel) => {
+    const list = document.querySelector('[data-testid="chat-messages-list"]') as HTMLElement | null;
+    const msgs = Array.from(document.querySelectorAll(sel)) as HTMLElement[];
+    const bubble = msgs[msgs.length - 1];
+    if (!list || !bubble) return false;
+    const l = list.getBoundingClientRect();
+    const b = bubble.getBoundingClientRect();
+    const covered = parseFloat(getComputedStyle(list).paddingTop) || 0;
+    return b.top >= l.top + covered - 1 && b.bottom <= l.bottom + 1;
+  }, USER_MSG);
+}
+
+/**
  * Снимает сцену чата на демо-аккаунте: вопрос, ответ целиком высоким
  * кадром, координаты абзацев. probeOnly — только открыть чат и снять probe.png.
  */
@@ -163,7 +188,10 @@ export async function captureChat(
     }
 
     let before = await send(page, scene.question);
-    await page.waitForTimeout(800);
+    if (!(await revealLastUserMessage(page))) {
+      await page.screenshot({ path: shot('question-hidden.png') });
+      throw new Error(`capture: пузырь вопроса не виден целиком — см. ${shot('question-hidden.png')}`);
+    }
     await page.screenshot({ path: shot('question.png') });
     let answer = await waitAnswer(page, before);
     let turns = 1;
