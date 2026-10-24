@@ -150,7 +150,16 @@ export function formatAssistantReport(p: {
     : `🙋 <b>${who}: у меня не работает</b>`;
   return [
     headLine,
-    `«${escapeHtml(clip(oneLine(head(p.summary, MAX_SUMMARY)), MAX_SUMMARY))}»`,
+    // В <code>: Telegram не делает из текста ссылку и не бьёт @упоминанием — подсунутый моделью пересказ не зафишит и никого не позовёт.
+    `«<code>${escapeHtml(clip(oneLine(head(p.summary, MAX_SUMMARY)), MAX_SUMMARY))}</code>»`,
     `${userLine(p.userId)} · ${p.channel === 'telegram' ? 'Telegram' : 'веб'}`,
+  ].join('\n');
+}
+
+/** Уведомление: исчерпан общий лимит сообщений от ассистентов (путь Б) — дальше только в лог. */
+export function formatAssistantCapNotice(windowLabel: 'час' | 'сутки'): string {
+  return [
+    '🙋 <b>Слишком много сообщений от ассистентов</b>',
+    `Общий лимит за ${windowLabel} исчерпан — новые сообщения ассистентов до освобождения окна только в логе сервера (строки «problem-report:»).`,
   ].join('\n');
 }

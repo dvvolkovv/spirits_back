@@ -4,8 +4,8 @@ import { PgService } from '../common/services/pg.service';
 import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
 import { failureSignature, isUserSideToolError } from './problem-classify';
 import {
-  clip, FALLBACK_NAME, formatAssistantReport, formatToolCapNotice, formatToolFailure, head, isKnownTool, oneLine,
-  ProblemChannel, ProblemKind, Repeats,
+  clip, FALLBACK_NAME, formatAssistantCapNotice, formatAssistantReport, formatToolCapNotice, formatToolFailure, head,
+  isKnownTool, oneLine, ProblemChannel, ProblemKind, Repeats,
 } from './problem-format';
 
 /** Подсказка ассистенту в результате инструмента, когда команда уже знает о сбое. */
@@ -16,16 +16,22 @@ export const SUPPORT_NOTE =
 /** Поле say в ответе report_problem — что сказать пользователю (как у инструмента продуктов). */
 export const REPORTED_SAY =
   'Передано команде Linkeon. Скажи пользователю, что передал(а) проблему команде; срок починки не обещай.';
-export const RATE_LIMITED_SAY =
-  'Сообщений в поддержку сейчас слишком много. Предложи пользователю написать во вкладку «Поддержка».';
 export const BAD_INPUT_SAY =
   'Опиши проблему в summary (1–3 предложения) и укажи kind: my_failure или user_report.';
-export const NOT_CONFIGURED_SAY =
-  'Передать команде сейчас нечем. Предложи пользователю написать во вкладку «Поддержка».';
+export const TOO_LONG_SAY =
+  'Слишком длинно: опиши проблему в summary короче — 1–3 предложения, до 500 символов.';
+
+/** Куда направить человека, если передать не вышло: на сайте — вкладка, в Telegram её нет. */
+function supportHint(channel: ProblemChannel): string {
+  return channel === 'telegram' ? 'написать в поддержку Linkeon на support@linkeon.io' : 'написать во вкладку «Поддержка»';
+}
+export const rateLimitedSay = (c: ProblemChannel) => `Сообщений в поддержку сейчас слишком много. Предложи пользователю ${supportHint(c)}.`;
+export const notConfiguredSay = (c: ProblemChannel) => `Передать команде сейчас нечем. Предложи пользователю ${supportHint(c)}.`;
+export const failedSay = (c: ProblemChannel) => `Передать команде сейчас не получилось. Предложи пользователю ${supportHint(c)}.`;
 
 export type AssistantReportResult =
   | { ok: true; reported: true; say: string }
-  | { ok: false; error: 'bad_input' | 'not_configured' | 'rate_limited'; say: string };
+  | { ok: false; error: 'bad_input' | 'not_configured' | 'rate_limited' | 'failed'; say: string };
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
@@ -86,6 +92,8 @@ export class ProblemReportService {
   /** Моменты сообщений пути Б по пользователям и всего — для лимитов (скользящие окна). */
   private readonly userReports = new Map<string, number[]>();
   private globalReports: number[] = [];
+  /** Когда ушло уведомление о каждом общем лимите пути Б: за час — не чаще раза в час, за сутки — раза в сутки. */
+  private readonly assistantCapNoticeAt: Record<'global_hour' | 'global_day', number> = { global_hour: 0, global_day: 0 };
   /** Когда ушло уведомление «слишком много сбоев» (не чаще раза в час). */
   private capNoticeAt = 0;
   /** Сколько ждать имя ассистента из базы: у пула нет таймаута запроса, а зависший Postgres не должен держать сообщение. */
@@ -158,15 +166,23 @@ export class ProblemReportService {
     summary: unknown;
   }): Promise<AssistantReportResult> {
     try {
-      const raw = typeof p.summary === 'string' ? p.summary : '';
-      if (raw.length > MAX_SUMMARY_INPUT) return { ok: false, error: 'bad_input', say: BAD_INPUT_SAY };
-      const summary = raw.trim();
+      if (typeof p.summary === 'string' && p.summary.length > MAX_SUMMARY_INPUT) {
+        return { ok: false, error: 'bad_input', say: TOO_LONG_SAY };
+      }
+      const summary = typeof p.summary === 'string' ? p.summary.trim() : '';
       const kind: ProblemKind | null = p.kind === 'my_failure' || p.kind === 'user_report' ? p.kind : null;
       if (!summary || !kind) return { ok: false, error: 'bad_input', say: BAD_INPUT_SAY };
-      if (!telegramConfigured()) return { ok: false, error: 'not_configured', say: NOT_CONFIGURED_SAY };
       const userId = short(p.userId, MAX_ID);
-      if (!this.takeQuota(userId, Date.now())) return { ok: false, error: 'rate_limited', say: RATE_LIMITED_SAY };
-      // Короткие копии — в замыкание; до 40 символов имя обрежет и форматтер.
+      const now = Date.now();
+      this.forgetOld(now);
+      // Лимиты — и без Telegram (как на проде): тогда текст уйдёт в лог, но не больше лимита.
+      const limit = this.takeQuota(userId, now);
+      if (limit !== 'ok') {
+        this.logger.warn(`problem-report: сообщение ассистента сверх лимита (${limit}), только в лог: ${userId}: ${clip(oneLine(summary), 300)}`);
+        if (limit === 'global_hour' || limit === 'global_day') this.noteAssistantCap(now, limit);
+        return { ok: false, error: 'rate_limited', say: rateLimitedSay(p.channel) };
+      }
+      // Короткие копии — в замыкание (summary уже ограничен 2000 символами).
       const arg = typeof p.assistantArg === 'string' ? short(p.assistantArg, MAX_NAME) : '';
       const { assistantId, channel } = p;
       void this.deliver('assistant_report', async () => {
@@ -174,10 +190,13 @@ export class ProblemReportService {
         const assistant = fromTurn !== FALLBACK_NAME ? fromTurn : arg || FALLBACK_NAME;
         return formatAssistantReport({ assistant, kind, summary, userId, channel });
       });
-      return { ok: true, reported: true, say: REPORTED_SAY };
+      // Без Telegram текст ушёл в лог (так на test) — ассистент не должен сказать «передал».
+      return telegramConfigured()
+        ? { ok: true, reported: true, say: REPORTED_SAY }
+        : { ok: false, error: 'not_configured', say: notConfiguredSay(p.channel) };
     } catch (e: any) {
       this.logger.warn(`problem-report: сообщение ассистента не обработано: ${e?.message}`);
-      return { ok: false, error: 'not_configured', say: NOT_CONFIGURED_SAY };
+      return { ok: false, error: 'failed', say: failedSay(p.channel) };
     }
   }
 
@@ -185,24 +204,34 @@ export class ProblemReportService {
    * Скользящие окна: час и сутки на пользователя, сутки на всех. Отказ квоту не
    * тратит. Метки «из будущего» (часы шагнули назад) считаем истёкшими.
    */
-  private takeQuota(userId: string, now: number): boolean {
+  private takeQuota(userId: string, now: number): 'ok' | 'user_hour' | 'user_day' | 'global_hour' | 'global_day' {
     const fresh = (t: number, span: number) => t <= now && now - t < span;
     this.globalReports = this.globalReports.filter((t) => fresh(t, DAY));
     const mine = (this.userReports.get(userId) ?? []).filter((t) => fresh(t, DAY));
-    const lastHour = mine.filter((t) => fresh(t, HOUR)).length;
-    if (
-      lastHour >= envNumber('PROBLEM_REPORT_USER_HOURLY', 3) ||
-      mine.length >= envNumber('PROBLEM_REPORT_USER_DAILY', 10) ||
-      this.globalReports.length >= envNumber('PROBLEM_REPORT_GLOBAL_DAILY', 50)
-    ) {
+    const limit =
+      mine.filter((t) => fresh(t, HOUR)).length >= envNumber('PROBLEM_REPORT_USER_HOURLY', 3) ? 'user_hour'
+      : mine.length >= envNumber('PROBLEM_REPORT_USER_DAILY', 10) ? 'user_day'
+      : this.globalReports.filter((t) => fresh(t, HOUR)).length >= envNumber('PROBLEM_REPORT_GLOBAL_HOURLY', 10) ? 'global_hour'
+      : this.globalReports.length >= envNumber('PROBLEM_REPORT_GLOBAL_DAILY', 50) ? 'global_day'
+      : 'ok';
+    if (limit !== 'ok') {
       if (mine.length) this.userReports.set(userId, mine);
       else this.userReports.delete(userId);
-      return false;
+      return limit;
     }
     mine.push(now);
     this.userReports.set(userId, mine);
     this.globalReports.push(now);
-    return true;
+    return 'ok';
+  }
+
+  /** Общий лимит пути Б сработал: одно уведомление в группу — иначе исчерпание лимита неотличимо от тишины. */
+  private noteAssistantCap(now: number, limit: 'global_hour' | 'global_day'): void {
+    const every = limit === 'global_day' ? DAY : HOUR;
+    if (this.assistantCapNoticeAt[limit] > now) this.assistantCapNoticeAt[limit] = 0;
+    if (now - this.assistantCapNoticeAt[limit] < every) return;
+    this.assistantCapNoticeAt[limit] = now;
+    void this.deliver('assistant_cap', async () => formatAssistantCapNotice(limit === 'global_day' ? 'сутки' : 'час'));
   }
 
   /**
@@ -262,7 +291,7 @@ export class ProblemReportService {
   }
 
   /** Собирает текст и шлёт. Не бросает; без Telegram — пишет текст в лог (так на test). */
-  private async deliver(kind: 'tool_failure' | 'tool_cap' | 'assistant_report', build: () => Promise<string>): Promise<void> {
+  private async deliver(kind: 'tool_failure' | 'tool_cap' | 'assistant_report' | 'assistant_cap', build: () => Promise<string>): Promise<void> {
     try {
       const text = await build();
       if (!telegramConfigured()) {

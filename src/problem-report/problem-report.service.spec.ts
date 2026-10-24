@@ -6,7 +6,7 @@ jest.mock('../common/telegram-alert', () => ({
 import { Logger } from '@nestjs/common';
 import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
 import {
-  BAD_INPUT_SAY, NOT_CONFIGURED_SAY, ProblemReportService, RATE_LIMITED_SAY, REPORTED_SAY,
+  BAD_INPUT_SAY, failedSay, notConfiguredSay, ProblemReportService, rateLimitedSay, REPORTED_SAY, TOO_LONG_SAY,
 } from './problem-report.service';
 
 const sent = sendTelegramAlert as jest.Mock;
@@ -17,7 +17,7 @@ const KIRA_ERROR = 'Veo generate failed: This model models/veo-3.1-fast-generate
 const MIN = 60_000;
 const ENV = [
   'PROBLEM_REPORT_COOLDOWN_MIN', 'PROBLEM_REPORT_TOOL_HOURLY',
-  'PROBLEM_REPORT_USER_HOURLY', 'PROBLEM_REPORT_USER_DAILY', 'PROBLEM_REPORT_GLOBAL_DAILY',
+  'PROBLEM_REPORT_USER_HOURLY', 'PROBLEM_REPORT_USER_DAILY', 'PROBLEM_REPORT_GLOBAL_HOURLY', 'PROBLEM_REPORT_GLOBAL_DAILY',
 ];
 
 const pgWith = (rows: any[] = [{ display_name: 'Кира', name: 'Кира' }]) => ({ query: jest.fn(async () => ({ rows })) });
@@ -261,13 +261,21 @@ describe('reportToolFailure — путь А', () => {
     expect(String(sent.mock.calls[0][0])).toContain('🛠 <b>Ассистент: не получилось создать видео</b>');
   });
 
-  it('огромное имя инструмента — короткая копия в тексте и в ключе', async () => {
+  it('огромное имя инструмента — два разных незнакомых имени склеиваются в один сбой', async () => {
     const svc = new ProblemReportService(pgWith() as any);
     svc.reportToolFailure(failure({ tool: 'x'.repeat(1_000_000), error: 'unknown tool: xxx' }));
-    const [key] = [...((svc as any).incidents as Map<string, any>).keys()];
-    expect(key.length).toBeLessThanOrEqual(40);
+    svc.reportToolFailure(failure({ tool: 'y'.repeat(1_000_000), error: 'unknown tool: yyy' }));
+    expect((svc as any).incidents.size).toBe(1);
     await flush();
+    expect(sent).toHaveBeenCalledTimes(1);
     expect(String(sent.mock.calls[0][0])).toContain('не получилось выполнить ' + 'x'.repeat(63) + '…');
+  });
+
+  it('огромная ошибка с пробелами по краям — в сообщении короткая', async () => {
+    const svc = new ProblemReportService(pgWith() as any);
+    svc.reportToolFailure(failure({ error: ' '.repeat(3_000_000) + 'boom' + ' '.repeat(3_000_000) }));
+    await flush();
+    expect(String(sent.mock.calls[0][0])).toContain('Ошибка: <code>…</code>');
   });
 });
 
@@ -282,7 +290,7 @@ describe('reportFromAssistant — путь Б', () => {
     expect(await svc.reportFromAssistant(report())).toEqual({ ok: true, reported: true, say: REPORTED_SAY });
     await flush();
     expect(sent.mock.calls[0][0]).toBe(
-      '🙋 <b>Кира: у меня не работает</b>\n«LibreOffice падает при конвертации»\nПользователь: <code>u1</code> · веб',
+      '🙋 <b>Кира: у меня не работает</b>\n«<code>LibreOffice падает при конвертации</code>»\nПользователь: <code>u1</code> · веб',
     );
   });
 
@@ -292,7 +300,7 @@ describe('reportFromAssistant — путь Б', () => {
     await svc.reportFromAssistant(report({ channel: 'telegram', assistantId: null, assistantArg: 'Райя', kind: 'user_report', summary: 'не проходит оплата' }));
     await flush();
     expect(sent.mock.calls[0][0]).toBe(
-      '🙋 <b>Райя передаёт жалобу пользователя</b>\n«не проходит оплата»\nПользователь: <code>u1</code> · Telegram',
+      '🙋 <b>Райя передаёт жалобу пользователя</b>\n«<code>не проходит оплата</code>»\nПользователь: <code>u1</code> · Telegram',
     );
     expect(pg.query).not.toHaveBeenCalled();
   });
@@ -334,25 +342,28 @@ describe('reportFromAssistant — путь Б', () => {
   it('пересказ длиннее 2000 символов — bad_input сразу, квота не тратится', async () => {
     process.env.PROBLEM_REPORT_USER_HOURLY = '1';
     const svc = new ProblemReportService(pgWith() as any);
-    expect(await svc.reportFromAssistant(report({ summary: 'x'.repeat(2001) }))).toEqual({ ok: false, error: 'bad_input', say: BAD_INPUT_SAY });
+    expect(await svc.reportFromAssistant(report({ summary: 'x'.repeat(2001) }))).toEqual({ ok: false, error: 'bad_input', say: TOO_LONG_SAY });
     expect((await svc.reportFromAssistant(report())).ok).toBe(true);
     await flush();
     expect(sent).toHaveBeenCalledTimes(1);
   });
 
-  it('Telegram не настроен — not_configured, ассистент не скажет «передал»', async () => {
+  it('Telegram не настроен: not_configured, текст — в лог, лимиты работают как на проде', async () => {
     configured.mockReturnValue(false);
+    process.env.PROBLEM_REPORT_USER_HOURLY = '1';
     const svc = new ProblemReportService(pgWith() as any);
-    expect(await svc.reportFromAssistant(report())).toEqual({ ok: false, error: 'not_configured', say: NOT_CONFIGURED_SAY });
+    expect(await svc.reportFromAssistant(report())).toEqual({ ok: false, error: 'not_configured', say: notConfiguredSay('web') });
+    expect(await svc.reportFromAssistant(report())).toEqual({ ok: false, error: 'rate_limited', say: rateLimitedSay('web') });
     await flush();
     expect(sent).not.toHaveBeenCalled();
+    expect(logSpy.mock.calls.map((c) => String(c[0])).join('\n')).toContain('у меня не работает');
   });
 
   it('3 в час на пользователя: четвёртое — rate_limited; другой пользователь не задет; через час снова можно', async () => {
     const t0 = now;
     const svc = new ProblemReportService(pgWith() as any);
     for (let i = 0; i < 3; i++) expect((await svc.reportFromAssistant(report())).ok).toBe(true);
-    expect(await svc.reportFromAssistant(report())).toEqual({ ok: false, error: 'rate_limited', say: RATE_LIMITED_SAY });
+    expect(await svc.reportFromAssistant(report())).toEqual({ ok: false, error: 'rate_limited', say: rateLimitedSay('web') });
     expect((await svc.reportFromAssistant(report({ userId: 'u2' }))).ok).toBe(true);
     now = t0 + 61 * MIN;
     expect((await svc.reportFromAssistant(report())).ok).toBe(true);
@@ -370,6 +381,7 @@ describe('reportFromAssistant — путь Б', () => {
     expect((await svc.reportFromAssistant(report())).ok).toBe(false);
     now = t0 + 25 * 60 * MIN;
     expect((await svc.reportFromAssistant(report())).ok).toBe(true);
+    await flush();
   });
 
   it('общий лимит в сутки — из PROBLEM_REPORT_GLOBAL_DAILY', async () => {
@@ -377,6 +389,85 @@ describe('reportFromAssistant — путь Б', () => {
     const svc = new ProblemReportService(pgWith() as any);
     expect((await svc.reportFromAssistant(report({ userId: 'u1' }))).ok).toBe(true);
     expect((await svc.reportFromAssistant(report({ userId: 'u2' }))).ok).toBe(true);
-    expect(await svc.reportFromAssistant(report({ userId: 'u3' }))).toEqual({ ok: false, error: 'rate_limited', say: RATE_LIMITED_SAY });
+    expect(await svc.reportFromAssistant(report({ userId: 'u3' }))).toEqual({ ok: false, error: 'rate_limited', say: rateLimitedSay('web') });
+    await flush();
+  });
+
+  it('общий лимит: отказ пишется в лог, в группу — одно уведомление; ключ и квота не тратятся', async () => {
+    process.env.PROBLEM_REPORT_GLOBAL_DAILY = '2';
+    const svc = new ProblemReportService(pgWith() as any);
+    await svc.reportFromAssistant(report({ userId: 'u1' }));
+    await svc.reportFromAssistant(report({ userId: 'u2' }));
+    expect(await svc.reportFromAssistant(report({ userId: 'u3' }))).toEqual({ ok: false, error: 'rate_limited', say: rateLimitedSay('web') });
+    await svc.reportFromAssistant(report({ userId: 'u4' }));
+    await flush();
+    const texts = sent.mock.calls.map((c) => String(c[0]));
+    expect(texts.filter((t) => t.includes('Слишком много сообщений от ассистентов'))).toHaveLength(1);
+    expect(warnSpy.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('сверх лимита (global_day)'))).toHaveLength(2);
+    expect((svc as any).userReports.has('u3')).toBe(false);
+  });
+
+  it('всплеск: не больше PROBLEM_REPORT_GLOBAL_HOURLY в час на всех', async () => {
+    process.env.PROBLEM_REPORT_GLOBAL_HOURLY = '2';
+    const svc = new ProblemReportService(pgWith() as any);
+    await svc.reportFromAssistant(report({ userId: 'u1' }));
+    await svc.reportFromAssistant(report({ userId: 'u2' }));
+    expect((await svc.reportFromAssistant(report({ userId: 'u3' }))).error).toBe('rate_limited');
+    now += 61 * MIN;
+    expect((await svc.reportFromAssistant(report({ userId: 'u3' }))).ok).toBe(true);
+    await flush();
+  });
+
+  it('Telegram-канал: при отказе — почта поддержки, а не вкладка', async () => {
+    process.env.PROBLEM_REPORT_USER_HOURLY = '1';
+    const svc = new ProblemReportService(pgWith() as any);
+    await svc.reportFromAssistant(report({ channel: 'telegram', assistantId: null }));
+    const r = await svc.reportFromAssistant(report({ channel: 'telegram', assistantId: null }));
+    expect(r).toEqual({ ok: false, error: 'rate_limited', say: rateLimitedSay('telegram') });
+    expect(r.say).toContain('support@linkeon.io');
+    await flush();
+  });
+
+  it('внутренняя ошибка — failed, без обещания «передал»', async () => {
+    configured.mockImplementation(() => { throw new Error('boom'); });
+    const svc = new ProblemReportService(pgWith() as any);
+    expect(await svc.reportFromAssistant(report())).toEqual({ ok: false, error: 'failed', say: failedSay('web') });
+    await flush();
+  });
+
+  it('часы шагнули назад — квота не держится лишнее время', async () => {
+    process.env.PROBLEM_REPORT_USER_HOURLY = '1';
+    const t0 = now;
+    const svc = new ProblemReportService(pgWith() as any);
+    expect((await svc.reportFromAssistant(report())).ok).toBe(true);
+    now = t0 - 10 * MIN;
+    expect((await svc.reportFromAssistant(report())).ok).toBe(true);
+    await flush();
+  });
+
+  it('уборка: пользователь без свежих сообщений забывается', async () => {
+    const t0 = now;
+    const svc = new ProblemReportService(pgWith() as any);
+    await svc.reportFromAssistant(report({ userId: 'u1' }));
+    now = t0 + 25 * 60 * MIN;
+    await svc.reportFromAssistant(report({ userId: 'u2' }));
+    expect((svc as any).userReports.has('u1')).toBe(false);
+    await flush();
+  });
+
+  it('пересказ не строкой — bad_input; ровно 2000 символов — принимается', async () => {
+    const svc = new ProblemReportService(pgWith() as any);
+    expect((await svc.reportFromAssistant(report({ summary: 42 }))).error).toBe('bad_input');
+    expect((await svc.reportFromAssistant(report({ summary: 'x'.repeat(2000) }))).ok).toBe(true);
+    await flush();
+  });
+
+  it('огромное или не строковое имя от модели — короткая копия или «Ассистент»', async () => {
+    const svc = new ProblemReportService(pgWith() as any);
+    await svc.reportFromAssistant(report({ assistantId: null, assistantArg: 'Я'.repeat(1_000_000) }));
+    await svc.reportFromAssistant(report({ assistantId: null, assistantArg: { evil: true }, userId: 'u2' }));
+    await flush();
+    expect(String(sent.mock.calls[0][0])).toContain(`🙋 <b>${'Я'.repeat(39)}…: у меня не работает</b>`);
+    expect(String(sent.mock.calls[1][0])).toContain('🙋 <b>Ассистент: у меня не работает</b>');
   });
 });

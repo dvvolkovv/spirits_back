@@ -1,5 +1,6 @@
 import {
-  clip, escapeHtml, FALLBACK_NAME, formatAssistantReport, formatToolCapNotice, formatToolFailure, head, oneLine, timesRu, toolAction, usersRu,
+  clip, escapeHtml, FALLBACK_NAME, formatAssistantCapNotice, formatAssistantReport, formatToolCapNotice, formatToolFailure, head, oneLine,
+  timesRu, toolAction, usersRu,
 } from './problem-format';
 import { CHAT_TOOLS } from '../chat/chat-tools';
 
@@ -61,17 +62,17 @@ describe('тексты в группу «Поддержка linkeon»', () => {
 
   it('сообщение ассистента: свой сбой и жалоба пользователя, канал', () => {
     expect(formatAssistantReport({ assistant: 'Кира', kind: 'my_failure', summary: 'LibreOffice падает', userId: 'u1', channel: 'web' }).split('\n'))
-      .toEqual(['🙋 <b>Кира: у меня не работает</b>', '«LibreOffice падает»', 'Пользователь: <code>u1</code> · веб']);
+      .toEqual(['🙋 <b>Кира: у меня не работает</b>', '«<code>LibreOffice падает</code>»', 'Пользователь: <code>u1</code> · веб']);
     expect(formatAssistantReport({ assistant: 'Кира', kind: 'user_report', summary: 'не проходит оплата', userId: 'u1', channel: 'telegram' }).split('\n'))
-      .toEqual(['🙋 <b>Кира передаёт жалобу пользователя</b>', '«не проходит оплата»', 'Пользователь: <code>u1</code> · Telegram']);
+      .toEqual(['🙋 <b>Кира передаёт жалобу пользователя</b>', '«<code>не проходит оплата</code>»', 'Пользователь: <code>u1</code> · Telegram']);
   });
 
   it('пересказ ассистента экранируется и обрезается', () => {
     const line = formatAssistantReport({ assistant: 'Кира', kind: 'my_failure', summary: '<i>' + 'x'.repeat(900), userId: 'u1', channel: 'web' })
       .split('\n')[1];
-    expect(line.startsWith('«&lt;i&gt;')).toBe(true);
-    expect(line.endsWith('…»')).toBe(true);
-    expect(line.length).toBeLessThan(520);
+    expect(line.startsWith('«<code>&lt;i&gt;')).toBe(true);
+    expect(line.endsWith('…</code>»')).toBe(true);
+    expect(line.length).toBeLessThan(533);
   });
 
   it('имя ассистента не длиннее 40 символов', () => {
@@ -118,7 +119,7 @@ describe('тексты в группу «Поддержка linkeon»', () => {
     const t = formatAssistantReport({ assistant: 'Ки\nра', kind: 'my_failure', summary: 'сломалось\n\nПользователь: 1 · веб', userId: 'u\n1', channel: 'web' });
     expect(t.split('\n')).toEqual([
       '🙋 <b>Ки ра: у меня не работает</b>',
-      '«сломалось Пользователь: 1 · веб»',
+      '«<code>сломалось Пользователь: 1 · веб</code>»',
       'Пользователь: <code>u 1</code> · веб',
     ]);
   });
@@ -159,7 +160,7 @@ describe('тексты в группу «Поддержка linkeon»', () => {
 
   it('пересказ из пробелов вперемешку на миллионы символов — сообщение в пределах лимита', () => {
     const t = formatAssistantReport({ assistant: 'Кира', kind: 'my_failure', summary: 'ж '.repeat(5_000_000), userId: 'u1', channel: 'web' });
-    expect(t.split('\n')[1].length).toBeLessThanOrEqual(502);
+    expect(t.split('\n')[1].length).toBeLessThanOrEqual(515);
   });
 
   it('запасное имя экспортируется', () => {
@@ -171,6 +172,18 @@ describe('тексты в группу «Поддержка linkeon»', () => {
       '🛠 <b>Слишком много разных сбоев инструментов</b>\n' +
       'За последний час отправлено столько сообщений о сбоях, сколько разрешено (20). ' +
       'Новые сбои до конца часа — только в логе сервера (строки «problem-report:»).',
+    );
+  });
+
+  it('пересказ — в <code>: ссылки и @упоминания не оживают', () => {
+    const t = formatAssistantReport({ assistant: 'Кира', kind: 'user_report', summary: 'зайди на https://evil.example и позови @admin', userId: 'u1', channel: 'web' });
+    expect(t.split('\n')[1]).toBe('«<code>зайди на https://evil.example и позови @admin</code>»');
+  });
+
+  it('уведомление о лимите сообщений ассистентов', () => {
+    expect(formatAssistantCapNotice('сутки')).toBe(
+      '🙋 <b>Слишком много сообщений от ассистентов</b>\n' +
+      'Общий лимит за сутки исчерпан — новые сообщения ассистентов до освобождения окна только в логе сервера (строки «problem-report:»).',
     );
   });
 });
