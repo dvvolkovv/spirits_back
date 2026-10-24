@@ -382,6 +382,23 @@ export class ChatService {
       ? { active: true, startedMsAgo: Date.now() - startedAt }
       : { active: false, startedMsAgo: 0 };
   }
+
+  /**
+   * Ассистент самого свежего хода этого пользователя — для подписи сообщений
+   * в поддержку (src/problem-report). Ход открыт и в пути релея, и у Маши;
+   * ключ activeTurns — `${userId}_${assistantId}`, а в userId подчёркиваний не
+   * бывает (телефон или UUID). Хода нет — null.
+   */
+  activeAssistantFor(userId: string): string | null {
+    const prefix = `${userId}_`;
+    let best: { id: string; at: number } | null = null;
+    for (const [key, at] of this.activeTurns) {
+      if (!key.startsWith(prefix)) continue;
+      if (!best || at > best.at) best = { id: key.slice(prefix.length), at };
+    }
+    return best ? best.id : null;
+  }
+
   private dupKey(userId: string, assistantId: string, message: string): string {
     return `${userId}::${assistantId}::${(message || '').trim().slice(0, 300)}`;
   }
