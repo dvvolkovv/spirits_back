@@ -46,6 +46,9 @@ export async function synthesizeAll(reqs: TtsRequest[], dir: string, creds: { ap
       out.push(hit);
       continue;
     }
+    if (!creds.apiKey || !creds.folderId) {
+      throw new Error(`tts ${r.id}: реплики нет в кеше озвучки, а ключи SpeechKit не заданы`);
+    }
     const body = new URLSearchParams({
       text: r.text,
       lang: 'ru-RU',
