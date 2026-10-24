@@ -61,6 +61,8 @@ export class InsightsService {
       return;
     }
     try {
+      // Повтор той же недели заменяет её итоги — до чтения прошлых находок.
+      if (await this.store.weekHasResults(week.weekStart)) await this.store.resetWeek(week.weekStart);
       const collected = await this.collector.collect(week);
       // «Человек N» — только внутри прогона: номер нигде не сохраняется.
       const personOf = new Map<string, number>();

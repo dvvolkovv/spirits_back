@@ -4,8 +4,23 @@
  * полуцитату.
  */
 
-/** Ряды цифр, почта, кавычки (признак цитаты), метки обезличивания. */
-export const FORBIDDEN_RE = /\d{3,}|@|[«»"“”„]|\[(?:имя|телефон|почта|число|ссылка)/u;
+/** Ряды цифр, почта, метки обезличивания. */
+export const FORBIDDEN_RE = /\d{3,}|@|\[(?:имя|телефон|почта|число|ссылка)/u;
+
+const QUOTED_RE = /[«"“„]([^»"”“]*)[»"”“]/gu;
+
+/**
+ * Цитата — признак того, что модель переписала слова человека. Короткое в
+ * кавычках — обычно название раздела или кнопки («Продукты», «Студия»): без
+ * него предложение по продукту не сформулировать. Длинное — уже цитата.
+ */
+export function hasLongQuote(s: string): boolean {
+  for (const m of s.matchAll(QUOTED_RE)) {
+    const inner = m[1].trim();
+    if (Array.from(inner).length > 30 || inner.split(/\s+/).filter(Boolean).length > 3) return true;
+  }
+  return false;
+}
 
 /**
  * Цифры о людях: «4 человека», «у 3 пользователей», «2 разговора», «5 раз».
@@ -17,7 +32,7 @@ export const PEOPLE_COUNT_RE = /\d+\s*(?:чел|пользовател|разг�
 export function cleanLine(raw: unknown, max: number): string | null {
   if (typeof raw !== 'string') return null;
   const s = raw.replace(/\s+/g, ' ').trim();
-  if (!s || FORBIDDEN_RE.test(s)) return null;
+  if (!s || FORBIDDEN_RE.test(s) || hasLongQuote(s)) return null;
   const chars = Array.from(s);
   return chars.length > max ? `${chars.slice(0, max - 1).join('')}…` : s;
 }

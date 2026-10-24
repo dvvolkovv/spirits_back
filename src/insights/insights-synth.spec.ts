@@ -45,7 +45,7 @@ describe('parseFindings', () => {
 
   it.each([
     ['цифры о людях', { description: 'Так было у 4 человек' }],
-    ['цитата', { title: 'Говорят «не работает»' }],
+    ['цитата', { title: 'Говорят «у меня ничего не выходит с ботом»' }],
     ['чужой тип', { type: 'other' }],
   ])('отбрасывает: %s', (_name, over) => {
     expect(parseFindings(JSON.stringify({ findings: [finding(over)] }), labels, [])).toEqual([]);

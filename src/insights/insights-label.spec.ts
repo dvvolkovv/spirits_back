@@ -57,7 +57,7 @@ describe('parseLabels', () => {
   it('чужой тип, цитата и разговор вне пачки отбрасываются', () => {
     const out = parseLabels(
       JSON.stringify([
-        { conv: 1, items: [{ type: 'other', about: 'x', severity: 2 }, { type: 'money', about: 'сказал «дорого»', severity: 2 }] },
+        { conv: 1, items: [{ type: 'other', about: 'x', severity: 2 }, { type: 'money', about: 'пишет «за что списали столько токенов вчера вечером»', severity: 2 }] },
         { conv: 5, items: [{ type: 'money', about: 'дорого', severity: 2 }] },
       ]),
       batch,

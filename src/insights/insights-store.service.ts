@@ -122,6 +122,45 @@ export class InsightsStore implements OnModuleInit {
     return Number(r.rows[0]?.attempts ?? 0);
   }
 
+  /** Прогон, оборванный перезапуском API (выкатом), не висит «running» вечно. */
+  async reapStale(): Promise<number> {
+    const r = await this.pg.query(
+      `UPDATE insights_runs
+          SET status = 'failed', finished_at = now(), error = 'прогон оборвался: процесс API перезапустился'
+        WHERE status = 'running' AND started_at < now() - interval '3 hours'
+        RETURNING id`,
+    );
+    return r.rows.length;
+  }
+
+  /** Есть ли у недели записанные итоги — тогда новый прогон сначала их сбрасывает. */
+  async weekHasResults(weekStart: string): Promise<boolean> {
+    const r = await this.pg.query(`SELECT 1 FROM insights_finding_weeks WHERE week_start = $1::date LIMIT 1`, [weekStart]);
+    return r.rows.length > 0;
+  }
+
+  /**
+   * Повторный прогон той же недели заменяет её итоги, а не плодит находки.
+   * Недельные строки удаляются; открытые находки, впервые появившиеся на этой
+   * неделе, — тоже; у остальных last_week откатывается на последнюю оставшуюся
+   * неделю. Находки, которые владелец уже отправил в бэклог или отклонил,
+   * остаются как есть.
+   *
+   * Звать ДО priorFindings: иначе находки прошлых недель, продлённые первым
+   * прогоном этой недели, выпали бы из сравнения и задвоились.
+   */
+  async resetWeek(weekStart: string): Promise<void> {
+    await this.pg.query(`DELETE FROM insights_finding_weeks WHERE week_start = $1::date`, [weekStart]);
+    await this.pg.query(`DELETE FROM insights_findings WHERE first_week = $1::date AND status = 'open'`, [weekStart]);
+    await this.pg.query(
+      `UPDATE insights_findings f
+          SET last_week = COALESCE((SELECT max(w.week_start) FROM insights_finding_weeks w WHERE w.finding_id = f.id), f.first_week),
+              updated_at = now()
+        WHERE f.last_week = $1::date`,
+      [weekStart],
+    );
+  }
+
   async duePostponed(maxAttempts: number): Promise<RunRow[]> {
     const r = await this.pg.query(
       `SELECT id::text AS id, to_char(week_start, 'YYYY-MM-DD') AS week_start, status, attempts, manual

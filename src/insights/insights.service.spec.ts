@@ -4,7 +4,9 @@ import { emptySignals } from './insights.types';
 
 const week = weekOf('2026-10-19');
 
-function harness(over: { labelText?: string[]; synthText?: string[]; claudeError?: string; lock?: boolean; attempts?: number } = {}) {
+function harness(
+  over: { labelText?: string[]; synthText?: string[]; claudeError?: string; lock?: boolean; attempts?: number; rerun?: boolean } = {},
+) {
   const calls: Array<{ prompt: string; opts: any }> = [];
   const labelQueue = [...(over.labelText ?? ['[{"conv":1,"items":[{"type":"confused","about":"путает два вида ботов","severity":2}]}]'])];
   const synthQueue = [
@@ -24,8 +26,16 @@ function harness(over: { labelText?: string[]; synthText?: string[]; claudeError
   };
   const lock = { release: jest.fn() };
   const pg = { tryAdvisoryLock: jest.fn(async () => (over.lock === false ? null : lock)) };
+  const order: string[] = [];
   const store = {
-    priorFindings: jest.fn(async () => []),
+    weekHasResults: jest.fn(async () => over.rerun ?? false),
+    resetWeek: jest.fn(async () => {
+      order.push('reset');
+    }),
+    priorFindings: jest.fn(async () => {
+      order.push('prior');
+      return [];
+    }),
     saveFindings: jest.fn(async (_w: string, list: any[]) => list.map((f, i) => ({ ...f, id: `id-${i}`, status: 'open', weeksSeen: 1, prevPeople: null }))),
     finishRun: jest.fn(),
     failRun: jest.fn(),
@@ -52,7 +62,7 @@ function harness(over: { labelText?: string[]; synthText?: string[]; claudeError
   };
   const tg = { sendMessage: jest.fn(async () => ({ message_id: 555 })) };
   const svc = new InsightsService(store as any, collector as any, claude as any, pg as any, tg as any);
-  return { svc, calls, store, tg, lock, claude };
+  return { svc, calls, store, tg, lock, claude, order };
 }
 
 describe('InsightsService.execute', () => {
@@ -80,6 +90,19 @@ describe('InsightsService.execute', () => {
     await h.svc.execute('run-1', week);
     const all = h.calls.map((c) => c.prompt).join('\n');
     expect(all).not.toMatch(/Владимир|vova@mail\.ru|903|79990000001/);
+  });
+
+  it('повтор той же недели сначала сбрасывает её итоги, потом читает прошлые находки', async () => {
+    const h = harness({ rerun: true });
+    await h.svc.execute('run-2', week);
+    expect(h.store.resetWeek).toHaveBeenCalledWith('2026-10-19');
+    expect(h.order).toEqual(['reset', 'prior']);
+  });
+
+  it('первый прогон недели ничего не сбрасывает', async () => {
+    const h = harness();
+    await h.svc.execute('run-1', week);
+    expect(h.store.resetWeek).not.toHaveBeenCalled();
   });
 
   it('второй прогон при занятом замке не идёт', async () => {

@@ -22,9 +22,25 @@ describe('обезличивание', () => {
     expect(maskEmails('пишите на v.ivanov@yandex.ru, спасибо')).toBe('пишите на [почта], спасибо');
   });
 
-  it('ссылка — только домен', () => {
+  it('ссылка на известную площадку — только её домен, без пути', () => {
     expect(maskUrls('канал https://t.me/sportrodkom?start=abc')).toBe('канал [ссылка: t.me]');
     expect(maskUrls('см. www.ozon.ru/seller/123')).toBe('см. [ссылка: ozon.ru]');
+    expect(maskUrls('https://seller.ozon.ru/app/products')).toBe('[ссылка: ozon.ru]');
+  });
+
+  it('ссылка на свой сайт — без домена: домен называет человека или его дело', () => {
+    expect(maskUrls('мой магазин https://teselectro.ru/catalog')).toBe('мой магазин [ссылка]');
+    expect(maskUrls('портфолио www.ivanova-design.com')).toBe('портфолио [ссылка]');
+  });
+
+  it('адрес без http и www тоже ловится, а файлы и «т.е.» — нет', () => {
+    expect(maskUrls('мой сайт teselectro.ru/catalog, загляните')).toBe('мой сайт [ссылка], загляните');
+    expect(maskUrls('ищу на ozon.ru')).toBe('ищу на [ссылка: ozon.ru]');
+    expect(maskUrls('пришлю отчёт.pdf и код на Node.js, т.е. завтра')).toBe('пришлю отчёт.pdf и код на Node.js, т.е. завтра');
+  });
+
+  it('почта не распадается на имя и домен', () => {
+    expect(deidentify('пишите ivanova@mail.ru')).toBe('пишите [почта]');
   });
 
   it('имя в падежах, а похожие слова не трогаются', () => {
@@ -42,6 +58,6 @@ describe('обезличивание', () => {
 
   it('всё вместе и в правильном порядке', () => {
     const out = deidentify('Я Иванова, почта ivanova@mail.ru, тел 8 903 016 91 87, сайт https://ivanova.ru/a', ['Иванова']);
-    expect(out).toBe('Я [имя], почта [почта], тел [телефон], сайт [ссылка: ivanova.ru]');
+    expect(out).toBe('Я [имя], почта [почта], тел [телефон], сайт [ссылка]');
   });
 });

@@ -21,6 +21,7 @@ export class InsightsCron {
   @Cron('0 7 4 * * 1')
   async weekly(): Promise<void> {
     try {
+      await this.store.reapStale();
       if (!(await this.store.isEnabled())) return;
       await this.insights.runScheduled(previousWeekMsk(new Date()));
     } catch (e: any) {
@@ -32,6 +33,7 @@ export class InsightsCron {
   @Cron('0 */30 * * * *')
   async retryPostponed(): Promise<void> {
     try {
+      await this.store.reapStale();
       for (const run of await this.store.duePostponed(MAX_POSTPONES)) await this.insights.retry(run);
     } catch (e: any) {
       this.log.error(`повтор отложенного прогона: ${e?.message}`);
