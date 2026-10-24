@@ -6,6 +6,13 @@ import { ANCHOR_Y, C, H, W } from '../theme';
 
 /** Кадров на переезд к следующему абзацу. */
 const MOVE = 15;
+/** Пик приближения абзаца. */
+const ZOOM = 1.08;
+/**
+ * Отступ рамки от краёв скриншота. На пике приближения край рамки уходит
+ * наружу; чтобы он остался в кадре, нужно ≥ (W/2)·(1 − 1/ZOOM) = 40 px. Берём 60 — с запасом.
+ */
+const RING_INSET = 60;
 const clamp = { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' } as const;
 
 /**
@@ -39,7 +46,7 @@ export const Answer: React.FC<{
   const y = interpolate(t, [0, MOVE], [prev, offsetOf(seg)], { ...clamp, easing: Easing.inOut(Easing.cubic) });
   const hold = Math.max(MOVE + 1, seg.duration - 10);
   const stop = Math.max(hold + 1, seg.duration);
-  const zoom = interpolate(t, [0, MOVE, hold, stop], [1, 1.08, 1.08, 1], clamp);
+  const zoom = interpolate(t, [0, MOVE, hold, stop], [1, ZOOM, ZOOM, 1], clamp);
   const ring = interpolate(t, [MOVE, MOVE + 10], [0, 1], clamp);
   const b = boxOf(seg);
 
@@ -59,8 +66,8 @@ export const Answer: React.FC<{
           <div
             style={{
               position: 'absolute',
-              left: 24,
-              right: 24,
+              left: RING_INSET,
+              right: RING_INSET,
               top: b.top - 14,
               height: b.height + 28,
               borderRadius: 24,
