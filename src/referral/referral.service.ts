@@ -12,7 +12,7 @@ const MIGRATIONS = ['001_user_id_to_text.sql', '002_backfill_offledger_accruals.
 // Двусторонний реф-бонус: приглашённому — стартовые токены при переходе по
 // ссылке (у пригласившего «сторона» = существующая комиссия с оплат).
 // REFEREE_BONUS_TOKENS — столько же, сколько welcome на старте (подтверждено владельцем 2026-06-19).
-const REFEREE_BONUS_TOKENS = 20000;
+export const REFEREE_BONUS_TOKENS = 20000;
 
 // Курс/порог вывода реферальных комиссий токенами (подтверждено владельцем).
 //
@@ -21,8 +21,8 @@ const REFEREE_BONUS_TOKENS = 20000;
 // 750/4500 = 600/3600 — выплата токенами сохраняет прежнюю покупательную
 // способность, а не дешевеет вместе с балансом. Побочно она стала заметно
 // выгоднее покупки: 750 токенов за рубль против ~502 в пакете за 1990 ₽.
-const PAYOUT_RATE_TOKENS_PER_RUB = 750;
-const PAYOUT_MIN_RUB = 100;
+export const PAYOUT_RATE_TOKENS_PER_RUB = 750;
+export const PAYOUT_MIN_RUB = 100;
 
 // Вывод ДЕНЬГАМИ (заявка на ручную выплату командой).
 //
@@ -31,7 +31,7 @@ const PAYOUT_MIN_RUB = 100;
 // поэтому кнопка «вывести деньгами» была видна, но недостижима. 500 ₽ открывает
 // её тем, у кого накопился ощутимый остаток, и оставляет отсечку от переводов
 // на десятки рублей — каждая заявка обрабатывается руками.
-const WITHDRAW_MIN_RUB = 500;
+export const WITHDRAW_MIN_RUB = 500;
 const WITHDRAW_METHODS = ['card', 'sbp'];
 
 // ═══ УЧЁТ РЕФЕРАЛЬНЫХ НАЧИСЛЕНИЙ ═══
@@ -93,7 +93,7 @@ async function creditTokens(
 // Авто-тиры комиссии L1: % растёт по числу ОПЛАТИВШИХ рефери (подтверждено
 // владельцем 2026-06-27). 0–4 → 10%, 5–14 → 12%, 15+ → 15%. Спец-сделки админа
 // (leader.commission_pct выше тира) сохраняются — берём max. L2-parent % не трогаем.
-const COMMISSION_TIERS: Array<{ min: number; pct: number }> = [
+export const COMMISSION_TIERS: Array<{ min: number; pct: number }> = [
   { min: 15, pct: 15 },
   { min: 5, pct: 12 },
   { min: 0, pct: 10 },

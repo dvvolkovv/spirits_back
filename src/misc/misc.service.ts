@@ -19,6 +19,7 @@ import {
   parseSearchSelection,
   selectSearchProfiles,
 } from './search-cards';
+import { IMAGE_TOKENS_HD, imageTokens } from './image-pricing';
 
 const ASSETS_BUCKET = 'linkeon-assets';
 
@@ -548,7 +549,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const apiKey = process.env.GOOGLE_AI_API_KEY;
     if (!apiKey) throw new Error('Google AI API key not configured');
 
-    const tokenCost = quality === 'hd' ? 10000 : 5000;
+    const tokenCost = imageTokens(quality);
 
     // Check token balance
     const balanceRes = await this.pg.query(
@@ -671,7 +672,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const theme: BannerTheme = body?.theme === 'light' ? 'light' : 'dark';
     const accent: string | undefined = body?.accent;
 
-    const tokenCost = quality === 'hd' ? 10000 : 5000;
+    const tokenCost = imageTokens(quality);
     const balanceRes = await this.pg.query(
       'SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1',
       [userId],
@@ -744,7 +745,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const apiKey = process.env.GOOGLE_AI_API_KEY;
     if (!apiKey) throw new Error('Google AI API key not configured');
 
-    const tokenCost = quality === 'hd' ? 10000 : 5000;
+    const tokenCost = imageTokens(quality);
 
     const balanceRes = await this.pg.query(
       'SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1',
@@ -811,7 +812,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const { sourceImageUrl } = body;
     if (!sourceImageUrl) throw new Error('Missing sourceImageUrl');
 
-    const tokenCost = 10000; // upscale всегда через Pro model → hd pricing
+    const tokenCost = IMAGE_TOKENS_HD; // upscale всегда через Pro model → hd pricing
     const prompt = 'Enhance this image to 4K resolution. Sharpen fine details, improve texture clarity, reduce noise and compression artifacts. Preserve composition, colors, subject, lighting and style identically — do not add, remove, or change any content. Output only the upscaled image.';
 
     // Delegate to editImage-style call but force hd/Pro
@@ -832,7 +833,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const apiKey = process.env.GOOGLE_AI_API_KEY;
     if (!apiKey) throw new Error('Google AI API key not configured');
 
-    const tokenCost = quality === 'hd' ? 10000 : 5000;
+    const tokenCost = imageTokens(quality);
 
     const balanceRes = await this.pg.query(
       'SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1',

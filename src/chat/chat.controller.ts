@@ -35,8 +35,8 @@ import { RelayOutputFile, collectOutputFiles, outputFileLines } from './chat-fil
  * 92.53.64.147). Завысить его хуже, чем не иметь вовсе: проверка пропустит
  * пачку, а nginx отобьёт её немым 413 — тем самым, от которого мы уходили.
  */
-export const MAX_UPLOAD_TOTAL_BYTES = 100 * 1024 * 1024;
-export const MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024;
+import { MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES } from './upload-limits';
+export { MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES };
 
 @Controller('')
 export class ChatController {
