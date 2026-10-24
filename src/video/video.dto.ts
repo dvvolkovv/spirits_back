@@ -1,8 +1,12 @@
 // src/video/video.dto.ts
 import { IsString, IsOptional, IsNumber, IsIn, IsArray, IsBoolean, Min, Max } from 'class-validator';
 
-// Единственный движок — Veo 3.1 (Google): long-form talking-head with native
-// audio + portrait consistency, via the Gemini Developer API. backlog a0132032.
+// Единственный движок — Google, через Gemini Developer API: long-form
+// talking-head with native audio + portrait consistency. backlog a0132032.
+// До 22.10.2026 это был Veo 3.1, теперь Gemini Omni Flash (Veo 3.1 Google
+// закрыл, см. misc/veo.service.ts). Имена моделей 'veo-3.1-fast' и 'veo-3.1'
+// остались прежними: их шлют форма, мобилка, ассистенты и они лежат в
+// video_jobs. С 24.10.2026 обе значат одно и то же и стоят одинаково.
 // Kling снят 22.10.2026 вместе с режимами extend и lipsync: в старых строках
 // video_jobs они остаются как история, новых таких задач нет.
 export type VideoMode = 'text2video' | 'image2video';
@@ -24,8 +28,8 @@ export class CreateVideoJobDto {
   @IsOptional() @IsIn(['veo-3.1-fast', 'veo-3.1'])
   model?: VideoModel;
 
-  // Длина ролика. Veo генерирует базу 8с и продлевает её по 7с (или клеит
-  // 8с-клипы для 9:16), итог режется ровно до этой длины. По умолчанию 8.
+  // Длина ролика. База 8с продлевается по 7с (или ролик клеится из 8с-клипов —
+  // см. needsVeoConcat), итог режется ровно до этой длины. По умолчанию 8.
   @IsOptional() @IsNumber() @Min(5) @Max(60)
   targetDurationSec?: number;
 
@@ -41,9 +45,11 @@ export class CreateVideoJobDto {
   @IsOptional() @IsIn(['16:9', '9:16'])
   aspectRatio?: '16:9' | '9:16';
 
-  // Veo: разрешение базового сегмента. 1080p даёт детализацию (поры/кожа) —
-  // 720p выглядел «пластиково». Extend у Veo всегда 720p (ограничение API),
-  // поэтому 1080p эффективен на коротких (≤8с) роликах.
+  // Разрешение базового сегмента. 1080p даёт детализацию (поры/кожа) —
+  // 720p выглядел «пластиково». Цепочка продлений всегда 720p (у Veo это было
+  // ограничение API, у Omni — цена: 1080p в 1,5 раза дороже, а продление
+  // тарифицируется по 63k), поэтому 1080p эффективен на коротких (≤8с) роликах
+  // и в склейке.
   @IsOptional() @IsIn(['720p', '1080p'])
   resolution?: '720p' | '1080p';
 
@@ -68,18 +74,22 @@ export interface ComposedPlan {
   segments_done: number;
   segment_kling_video_ids: string[];   // имя историческое; у Veo — id сегментов
   segment_video_urls: string[];
-  // --- Veo provider (native extend chain — one continuous video, no concat) ---
+  // --- Veo/Omni provider (native extend chain — one continuous video, no concat) ---
   provider?: 'kling' | 'veo';   // 'kling' — только в старых строках
   veo_tier?: 'fast' | 'standard';
   veo_aspect_ratio?: '16:9' | '9:16';   // формат базы (extend наследует)
   veo_resolution?: '720p' | '1080p';    // разрешение базы (extend всегда 720p)
   veo_reference_images?: string[];       // URL референс-фото (Ingredients, B)
-  // 9:16 + >8с: вместо native extend (он только 16:9) генерим N независимых
-  // 8с-клипов и ffmpeg-concat'им их (с сохранением звука). segment_video_urls
-  // здесь не используется — клипы складываются в локальные part-файлы по
-  // соглашению об именах, см. video.service.composeVeoClips.
+  // Вместо native extend генерим N независимых 8с-клипов и ffmpeg-concat'им их
+  // (с сохранением звука) — когда цепочка продлений невозможна, см.
+  // needsVeoConcat. segment_video_urls здесь не используется — клипы
+  // складываются в локальные part-файлы по соглашению об именах, см.
+  // video.service.composeVeoClips.
   veo_concat?: boolean;
-  veo_last_uri?: string | null;   // download uri of the latest (cumulative) clip
+  // Id взаимодействия Omni, чей ролик — всё, что готово на сейчас (у продления
+  // ответ — ролик целиком). Следующее продление ссылается на него.
+  veo_last_interaction_id?: string | null;
+  veo_last_uri?: string | null;   // только старые строки Veo: download uri последнего клипа
   // Per-segment prompts. The user's script/speech is distributed across the
   // segments so Veo speaks it ONCE end-to-end instead of repeating the full
   // line in every 8s segment (a0132032 fix). Index = segment number; base uses
@@ -129,16 +139,39 @@ export interface VideoJobRow {
   own_voice?: boolean;
 }
 
-// Veo 3.1 quote: base 8s + N×7s native extends, output trimmed to target.
+// Quote: base 8s + N×7s native extends, output trimmed to target.
 // User pricing set by the owner 2026-06-03: ~2× cost ("доступная"), i.e. a 24s
 // Fast clip ≈ 700₽ ≈ 280k tokens (ref ~2.5₽/1000 tokens; our cost ~360₽/24s).
-// → Fast base(8s) 90k, +7s extend 63k. Standard ≈ 2.7× Fast (cost $0.40 vs $0.15/s).
-const VEO_BASE_SEC = 8;
-const VEO_EXTEND_SEC = 7;
+// → base(8s) 90k, +7s extend 63k.
+// 24.10.2026, решение владельца: тариф Standard (Veo 3.1, $0.40/с, 240k за 8с)
+// слит с Fast. У Gemini Omni одна модель, и за 'veo-3.1' человек получал бы
+// тот же ролик в 2,7 раза дороже. Себестоимость Omni — $0.15/с в 1080p и
+// $0.10/с в 720p, то есть как у прежнего Veo Fast или ниже.
+export const VEO_BASE_SEC = 8;
+export const VEO_EXTEND_SEC = 7;
+const VEO_PRICE = { base: 90_000, extendUnit: 63_000 };
 const VEO_PRICING: Record<'fast' | 'standard', { base: number; extendUnit: number }> = {
-  fast:     { base: 90_000,  extendUnit: 63_000 },
-  standard: { base: 240_000, extendUnit: 170_000 },
+  fast: VEO_PRICE,
+  standard: VEO_PRICE,
 };
+
+// Omni продлевает ролик максимум до 40 с суммарно (документация Google), а
+// цепочка «8с + N×7с» для target 37–60 с выходит за этот предел.
+export const OMNI_MAX_CHAIN_SEC = 40;
+
+/**
+ * Собирать ли ролик склейкой независимых 8с-клипов вместо цепочки продлений.
+ *  - 9:16 длиннее 8с: так было и при Veo (его extend умел только 16:9), путь
+ *    проверен живыми роликами, менять его ради Omni незачем.
+ *  - 16:9, чья цепочка не помещается в 40 с Omni (target > 36). Решение
+ *    владельца 24.10.2026: склейка с ценой по правилу вертикали, N × база.
+ * Фронт (VideoCreateForm) считает цену по тому же правилу — держать в паре.
+ */
+export function needsVeoConcat(aspectRatio: '16:9' | '9:16', targetDurationSec: number): boolean {
+  if (aspectRatio === '9:16') return targetDurationSec > VEO_BASE_SEC;
+  const extendCount = Math.ceil(Math.max(0, targetDurationSec - VEO_BASE_SEC) / VEO_EXTEND_SEC);
+  return VEO_BASE_SEC + extendCount * VEO_EXTEND_SEC > OMNI_MAX_CHAIN_SEC;
+}
 export interface VeoQuote {
   tier: 'fast' | 'standard';
   segments: number;        // 1 base + N extends
@@ -157,12 +190,13 @@ export function computeVeoQuote(model: VideoModel, targetDurationSec: number): V
   };
 }
 
-// Вертикальные ролики (9:16) длиннее 8с: Veo native extend работает ТОЛЬКО в
-// 16:9 (API: "Aspect ratio of the input video must be 16:9"). Поэтому длинную
-// вертикаль собираем как ffmpeg-concat независимых 8с-клипов — автоматизация
-// ручной склейки, о которой писала katya. Каждый клип = полная базовая
-// генерация (нет «дешёвого» extend), поэтому цена = N × base (решение владельца
-// 2026-06-06: «по факту N×база»). Каждый клип несёт свою порцию реплики
+// Склейка (см. needsVeoConcat): вертикаль длиннее 8с — Veo native extend
+// работал ТОЛЬКО в 16:9 (API: "Aspect ratio of the input video must be 16:9"),
+// и горизонталь длиннее 36с — Omni не продлевает дальше 40с. Такой ролик
+// собираем как ffmpeg-concat независимых 8с-клипов — автоматизация ручной
+// склейки, о которой писала katya. Каждый клип = полная базовая генерация (нет
+// «дешёвого» extend), поэтому цена = N × base (решение владельца 2026-06-06:
+// «по факту N×база»). Каждый клип несёт свою порцию реплики
 // (buildVeoSegmentPrompts) — монолог течёт сквозь стыки.
 export function computeVeoConcatQuote(model: VideoModel, targetDurationSec: number): VeoQuote {
   const tier = veoTier(model);

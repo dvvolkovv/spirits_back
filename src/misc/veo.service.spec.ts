@@ -191,13 +191,36 @@ describe('VeoService.getOperation', () => {
     expect(st.error).toContain('I cannot create videos of real public figures.');
   });
 
-  it('failed — текст ошибки Google', async () => {
+  it('failed — текст ошибки Google из массива errors', async () => {
     mockedGet.mockResolvedValue({ data: {
-      id: 'v1_x', status: 'failed', error: { message: 'Internal error encountered. Please retry.' },
+      id: 'v1_x', status: 'failed', errors: [{ message: 'Internal error encountered. Please retry.', code: 'INTERNAL' }],
     } });
     const st = await makeService().getOperation('v1_x');
 
     expect(st).toEqual({ done: true, video: null, error: 'Internal error encountered. Please retry.' });
+  });
+
+  it('отказ фильтра (INVALID_ARGUMENT) — с подсказкой, что переформулировать', async () => {
+    // Живой ответ на промпт со знаменитостью, 24.10.2026.
+    mockedGet.mockResolvedValue({ data: {
+      id: 'v1_x', status: 'failed',
+      errors: [{
+        message: 'There was a problem processing your request. You will only be charged for tokens successfully generated.',
+        code: 'INVALID_ARGUMENT',
+      }],
+    } });
+    const st = await makeService().getOperation('v1_x');
+
+    expect(st.done).toBe(true);
+    expect(st.error).toMatch(/фильтр контента/);
+    expect(st.error).toContain('There was a problem processing your request.');
+  });
+
+  it('failed с одиночным error тоже читается', async () => {
+    mockedGet.mockResolvedValue({ data: { id: 'v1_x', status: 'failed', error: { message: 'Backend error' } } });
+    const st = await makeService().getOperation('v1_x');
+
+    expect(st.error).toBe('Backend error');
   });
 
   it('неожиданный статус не висит до таймаута', async () => {
