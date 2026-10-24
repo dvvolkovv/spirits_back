@@ -58,7 +58,7 @@ const EXPECTED: ExpectedModel[] = [
   { provider: 'Google',     model: 'gemini-3-pro-image-preview',     kind: 'image', purpose: 'Higher-quality image gen (опциональный режим)', caller: 'misc.generateImage(quality=pro)', via: 'API key' },
 
   // ---- Video generation ----
-  { provider: 'Google',     model: 'veo-3.1-generate-preview', kind: 'video', purpose: 'Veo 3.1 — генерация видео (9:16/16:9, talking-head, длинные ролики concat). Стоимость — оценка (см. VEO_EST_USD_PER_CALL)', caller: 'video.createJob (model=veo-3.1) → veo.generate', via: 'API key' },
+  { provider: 'Google',     model: 'gemini-omni-1.1-flash', kind: 'video', purpose: 'Gemini Omni Flash — генерация видео (9:16/16:9, talking-head, длинные ролики concat; до 22.10.2026 — Veo 3.1). Стоимость — оценка (см. VEO_EST_USD_PER_CALL)', caller: 'video.createJob → veo.startGenerate/startExtend', via: 'API key' },
 
   // ---- TTS (audio) ----
   // Строка eleven_multilingual_v2 удалена 23.09.2026 вместе с разделом SMM: эту
@@ -70,10 +70,11 @@ const EXPECTED: ExpectedModel[] = [
   { provider: 'Yandex SpeechKit', model: 'yandexcloud-tts-v1',  kind: 'audio', purpose: 'TTS: озвучка в чате, календарные напоминания, дорожка для видео', caller: 'misc/speech.synthesize, calendar, video.createJob', via: 'API key' },
 ];
 
-// Veo не логирует стоимость в событии veo_call, поэтому оцениваем расход как
-// число вызовов × оценочную цену одного 8-сек клипа. ГРУБАЯ ОЦЕНКА — уточнить
-// по реальному биллингу Google Veo 3.1 и поправить это число.
-const VEO_EST_USD_PER_CALL = 2.0;
+// Событие veo_call не несёт стоимость, поэтому оцениваем расход как число
+// вызовов × оценочную цену одного шага. Замер Omni 24.10.2026: 5 792 видео-
+// токена за секунду 720p и 8 688 за секунду 1080p по $17.50 за 1M — база 8с
+// ≈ $0.8 (720p) … $1.2 (1080p), продление 7с в 720p ≈ $0.7.
+const VEO_EST_USD_PER_CALL = 1.0;
 
 interface DynamicCounts {
   calls_30d: number;

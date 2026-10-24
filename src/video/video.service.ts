@@ -10,7 +10,8 @@ import { sendTelegramAlert } from '../common/telegram-alert';
 import { VeoService } from '../misc/veo.service';
 import {
   CreateVideoJobDto, VideoJobRow, ComposedPlan, VideoModel,
-  isVeoModel, veoTier, computeVeoQuote, computeVeoConcatQuote, computeOwnVoiceSurcharge,
+  isVeoModel, computeVeoQuote, computeVeoConcatQuote, computeOwnVoiceSurcharge,
+  needsVeoConcat, VEO_BASE_SEC, VEO_EXTEND_SEC,
 } from './video.dto';
 import { VoiceAvatarService } from '../voice-avatar/voice-avatar.service';
 import { assertFetchableMedia, fetchMediaBytes } from '../common/net/own-media';
@@ -240,8 +241,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     userId: string,
     dto: CreateVideoJobDto,
   ): Promise<{ jobId: string; status: string; tokensSpent: number }> {
-    // Единственный движок — Veo 3.1 (Google): text2video и image2video,
-    // длинные ролики он собирает сам. Kling снят 22.10.2026 — провайдер вывел
+    // Единственный движок — Google (до 22.10.2026 Veo 3.1, теперь Gemini Omni
+    // Flash, см. misc/veo.service.ts): text2video и image2video, длинные
+    // ролики он собирает сам. Kling снят 22.10.2026 — провайдер вывел
     // kling-v1-6 из эксплуатации, пакет сгорел, а живых роликов на нём с июля
     // не было. Вместе с ним ушли режимы extend и lipsync: у Veo их нет, и
     // createVeoJob отвечает на них 400 до списания токенов.
@@ -368,16 +370,30 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     if (this.pollTimer) clearInterval(this.pollTimer);
   }
 
+  // Задачи, которые этот процесс опрашивает прямо сейчас. setInterval не ждёт
+  // предыдущий тик, а ответ Omni на готовый шаг несёт сам ролик (мегабайты
+  // base64) и потом ffmpeg — без метки следующий тик брал ту же задачу и
+  // обрабатывал готовый шаг второй раз: двойная запись клипа, двойной запуск
+  // следующего (платного) шага.
+  private readonly polling = new Set<string>();
+
   private async tick() {
     await this.expireStaleJobs();
     const res = await this.pg.query(
       `SELECT * FROM video_jobs WHERE status='processing' ORDER BY updated_at ASC LIMIT 20`,
     );
-    const jobs = res.rows as VideoJobRow[];
+    const jobs = (res.rows as VideoJobRow[]).filter((job) => !this.polling.has(job.id));
     await Promise.all(
-      jobs.map((job) =>
-        this.pollJob(job).catch((e) => this.logger.error(`pollJob ${job.id} error: ${e.message}`)),
-      ),
+      jobs.map(async (job) => {
+        this.polling.add(job.id);
+        try {
+          await this.pollJob(job);
+        } catch (e: any) {
+          this.logger.error(`pollJob ${job.id} error: ${e.message}`);
+        } finally {
+          this.polling.delete(job.id);
+        }
+      }),
     );
 
     // Замыкаем цикл: если висит метка «сломано деньгами», а задачи снова
@@ -742,11 +758,11 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     const target = Math.round(dto.targetDurationSec ?? 8);
     if (target < 4 || target > 60) throw new BadRequestException('Veo length must be 4–60 seconds');
 
-    // 9:16 длиннее 8с: Veo extend умеет только 16:9, поэтому длинную вертикаль
-    // собираем как concat независимых 8с-клипов (автоматизация ручной склейки —
-    // фидбэк katya). Каждый клип — полная база (цена N×base). 16:9 и короткая
-    // вертикаль (≤8с) идут прежним путём (база + native extend).
-    const veoConcat = aspectRatio === '9:16' && target > 8;
+    // Склейка независимых 8с-клипов вместо цепочки продлений (автоматизация
+    // ручной склейки — фидбэк katya): вертикаль длиннее 8с и горизонталь, чья
+    // цепочка не помещается в 40с Omni, см. needsVeoConcat. Каждый клип —
+    // полная база (цена N×base). Остальное идёт прежним путём (база + extend).
+    const veoConcat = needsVeoConcat(aspectRatio, target);
     const quote = veoConcat ? computeVeoConcatQuote(model, target) : computeVeoQuote(model, target);
     let cost = quote.totalCost;
 
@@ -768,10 +784,12 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       voiceDirection = vr.voice_descriptor?.veo_voice_prompt || null;
     }
 
-    // Veo extend требует вход 720p — поэтому в extend-цепочке 1080p возможен
-    // ТОЛЬКО для односегментных роликов (≤8с). В concat-режиме каждый клип —
-    // независимая база (extend нет), значит 1080p доступен на любой длине — что
-    // ещё и помогает с «пластиковой» текстурой (фидбэк katya #4).
+    // Цепочка продлений идёт в 720p (у Veo extend требовал вход 720p, у Omni
+    // держим ради цены: продление стоит 63k за 7с, а 1080p в 1,5 раза дороже) —
+    // поэтому 1080p в ней возможен ТОЛЬКО для односегментных роликов (≤8с). В
+    // concat-режиме каждый клип — независимая база (extend нет), значит 1080p
+    // доступен на любой длине — что ещё и помогает с «пластиковой» текстурой
+    // (фидбэк katya #4).
     const effectiveResolution: '720p' | '1080p' = veoConcat
       ? resolution
       : (quote.segments > 1 ? '720p' : resolution);
@@ -836,7 +854,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       veo_aspect_ratio: aspectRatio,
       veo_resolution: effectiveResolution,
       veo_reference_images: refUrls,
-      veo_last_uri: null,
+      veo_last_interaction_id: null,
       veo_segment_prompts: segmentPrompts,
       veo_concat: veoConcat,
     };
@@ -874,7 +892,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       // С чётким промптом речь сохраняется (проверено 3 фото + реплика → есть звук).
       const refImages = await this.fetchReferenceImagesB64(refUrls);
       const operation = await this.veo.startGenerate({
-        prompt: segmentPrompts[0] ?? prompt, tier: quote.tier, durationSeconds: 8,
+        prompt: segmentPrompts[0] ?? prompt, durationSeconds: VEO_BASE_SEC,
         aspectRatio, resolution: effectiveResolution,
         referenceImagesB64: refImages, negativePrompt: dto.negativePrompt ?? undefined,
       });
@@ -898,12 +916,11 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   // ("internal server issue"/5xx). Google такие просит повторить.
   private readonly MAX_VEO_OP_RETRIES = 3;
 
-  // Переотправка текущего сегмента после транзиентной ошибки операции Veo.
+  // Переотправка текущего сегмента после транзиентной ошибки операции.
   // База (segments_done=0) — заново startGenerate (фото из source_image_url +
   // prompt[0]); extend — очищаем in-flight op, Phase 2 пере-extend'ит от
-  // veo_last_uri (с проверкой ACTIVE) на следующем тике.
+  // veo_last_interaction_id на следующем тике.
   private async restartVeoSegment(job: VideoJobRow, plan: ComposedPlan): Promise<void> {
-    const tier = plan.veo_tier || veoTier(job.model);
     try {
       // Concat-режим (вертикаль): КАЖДЫЙ сегмент — независимая база, поэтому
       // транзиентный ретрай переотправляет текущий клип заново (а не сбрасывает
@@ -914,7 +931,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
           : (job.source_image_url ? [job.source_image_url] : []);
         const refImages = await this.fetchReferenceImagesB64(refUrls);
         const op = await this.veo.startGenerate({
-          prompt: plan.veo_segment_prompts?.[plan.segments_done] ?? job.prompt ?? '', tier, durationSeconds: 8,
+          prompt: plan.veo_segment_prompts?.[plan.segments_done] ?? job.prompt ?? '', durationSeconds: VEO_BASE_SEC,
           aspectRatio: plan.veo_aspect_ratio ?? '9:16', resolution: plan.veo_resolution ?? '720p',
           referenceImagesB64: refImages,
           negativePrompt: job.negative_prompt ?? undefined,
@@ -931,7 +948,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
           : (job.source_image_url ? [job.source_image_url] : []);
         const refImages = await this.fetchReferenceImagesB64(refUrls);
         const op = await this.veo.startGenerate({
-          prompt: plan.veo_segment_prompts?.[0] ?? job.prompt ?? '', tier, durationSeconds: 8,
+          prompt: plan.veo_segment_prompts?.[0] ?? job.prompt ?? '', durationSeconds: VEO_BASE_SEC,
           aspectRatio: plan.veo_aspect_ratio ?? '16:9', resolution: plan.veo_resolution ?? '720p',
           referenceImagesB64: refImages,
           negativePrompt: job.negative_prompt ?? undefined,
@@ -955,19 +972,18 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   private async pollVeoJob(job: VideoJobRow) {
     const plan = job.composed_plan;
     if (!plan) { await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), 'veo job missing plan'); return; }
-    const tier = plan.veo_tier || veoTier(job.model);
 
     // Phase 1 — an operation (base or extend) is in flight: poll it.
     if (job.kling_task_id) {
       const st = await this.veo.getOperation(job.kling_task_id);
       if (!st.done) return;
-      if (st.error || !st.videoUri) {
+      if (st.error || !st.video) {
         const err = st.error ?? 'no video';
         // Транзиентная ошибка рендеринга Google: операция принята (generate/
         // extend вернули ok), но рендер упал с "internal server issue"/5xx и
         // Google просит повторить. Переотправляем ТОТ ЖЕ сегмент, а не валим всю
         // задачу. Не-транзиентные (RAI-контент-фильтр, квота, "no video") — fail.
-        const transient = st.error && /internal server|try again|temporarily|unavailable|backend error|please retry|deadline exceeded|\b50[0-3]\b/i.test(err);
+        const transient = st.error && /internal server|internal error|try again|temporarily|unavailable|backend error|please retry|deadline exceeded|\b50[0-3]\b/i.test(err);
         const retries = (plan.veo_op_retries ?? 0) + 1;
         if (transient && retries <= this.MAX_VEO_OP_RETRIES) {
           plan.veo_op_retries = retries;
@@ -978,16 +994,15 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo: ${err}`);
         return;
       }
-      // --- Concat-режим (вертикаль): клип готов — скачиваем в part-файл,
-      // продвигаем счётчик и СНИМАЕМ in-flight op. Сама склейка (финализация)
-      // выполняется отдельным тиком под оптимистичным локом (см. ниже) — иначе
-      // два тика планировщика запускают два параллельных ffmpeg в один output.
+      // --- Concat-режим: клип готов — пишем в part-файл, продвигаем счётчик и
+      // СНИМАЕМ in-flight op. Сама склейка (финализация) выполняется отдельным
+      // тиком под оптимистичным локом (см. ниже) — иначе два тика планировщика
+      // запускают два параллельных ffmpeg в один output.
       if (plan.veo_concat) {
         try {
-          const buf = await this.veo.downloadVideo(st.videoUri);
-          fs.writeFileSync(this.veoPartPath(job.id, plan.segments_done), buf);
+          fs.writeFileSync(this.veoPartPath(job.id, plan.segments_done), st.video);
         } catch (e: any) {
-          await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo_clip_dl: ${String(e.message).slice(0, 200)}`);
+          await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo_clip_save: ${String(e.message).slice(0, 200)}`);
           return;
         }
         plan.segments_done += 1;
@@ -1000,10 +1015,10 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
-      // Segment finished. Veo's extend output is the FULL cumulative video, so
-      // the latest uri is the whole clip so far — no ffmpeg concat.
+      // Segment finished. The extend output is the FULL cumulative video, so
+      // the latest step is the whole clip so far — no ffmpeg concat.
       plan.segments_done += 1;
-      plan.veo_last_uri = st.videoUri;
+      plan.veo_last_interaction_id = job.kling_task_id;
       plan.current_segment_attempt = 0;
       plan.veo_op_retries = 0;
 
@@ -1024,10 +1039,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
           this.logger.debug(`Veo job ${job.id}: finalize already in flight, skipping`);
           return;
         }
-        // Final segment — download, trim to exact target, store, mark ready.
+        // Final segment — trim to exact target, store, mark ready.
         try {
-          const buf = await this.veo.downloadVideo(st.videoUri);
-          const url = await this.storeVeoFinal(job.id, buf, plan.target_duration_sec);
+          const url = await this.storeVeoFinal(job.id, st.video, plan.target_duration_sec);
           let thumbUrl: string | null = null;
           try { thumbUrl = await this.extractAndUploadThumbnail(job.id, url); } catch { /* nice-to-have */ }
           await this.applyOwnVoiceIfNeeded(job.id, job.user_id);
@@ -1044,9 +1058,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       }
 
       // More segments needed — clear the in-flight op and persist progress.
-      // The next extend starts on a later tick, once the source clip is ACTIVE
-      // (Veo rejects extends on a not-yet-processed video). kling_task_id=NULL
-      // marks the "between segments" state; pollJob still routes veo jobs here.
+      // The next extend starts on a later tick from veo_last_interaction_id.
+      // kling_task_id=NULL marks the "between segments" state; pollJob still
+      // routes veo jobs here.
       await this.pg.query(
         `UPDATE video_jobs SET kling_task_id=NULL, composed_plan=$1, updated_at=now() WHERE id=$2`,
         [JSON.stringify(plan), job.id],
@@ -1094,15 +1108,15 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     }
 
     // Phase 2 (concat-режим): просто запускаем следующий НЕЗАВИСИМЫЙ 8с-клип
-    // (та же тройка фото для сходства + своя порция реплики). Ждать ACTIVE не
-    // нужно — мы не extend'им предыдущий клип, а генерим новый с нуля.
+    // (та же тройка фото для сходства + своя порция реплики) — мы не extend'им
+    // предыдущий клип, а генерим новый с нуля.
     if (plan.veo_concat && plan.segments_done > 0 && plan.segments_done < plan.segments_total) {
       try {
         const refImages = await this.fetchReferenceImagesB64(
           plan.veo_reference_images?.length ? plan.veo_reference_images : (job.source_image_url ? [job.source_image_url] : []),
         );
         const op = await this.veo.startGenerate({
-          prompt: plan.veo_segment_prompts?.[plan.segments_done] ?? job.prompt ?? '', tier, durationSeconds: 8,
+          prompt: plan.veo_segment_prompts?.[plan.segments_done] ?? job.prompt ?? '', durationSeconds: VEO_BASE_SEC,
           aspectRatio: plan.veo_aspect_ratio ?? '9:16', resolution: plan.veo_resolution ?? '720p',
           referenceImagesB64: refImages, negativePrompt: job.negative_prompt ?? undefined,
         });
@@ -1126,11 +1140,10 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    // Phase 2 — between segments: start the next extend once the last clip has
-    // finished processing (state ACTIVE). Otherwise retry on a later tick.
-    if (plan.segments_done > 0 && plan.segments_done < plan.segments_total && plan.veo_last_uri) {
-      const state = await this.veo.getFileState(plan.veo_last_uri);
-      if (state !== 'ACTIVE') return; // still processing — wait for the next tick
+    // Phase 2 — between segments: extend the last finished step. Omni keeps the
+    // previous video on its side (previous_interaction_id), so unlike Veo there
+    // is no file to wait for — the extend starts on the very next tick.
+    if (plan.segments_done > 0 && plan.segments_done < plan.segments_total && plan.veo_last_interaction_id) {
       try {
         // Prompt сегмента: своя порция речи (распределена при создании). Если
         // распределения нет (старое задание) — продолжение без повтора реплики,
@@ -1138,8 +1151,10 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         const segPrompt = plan.veo_segment_prompts?.[plan.segments_done] ?? this.veoContinuationPrompt();
         const op = await this.veo.startExtend({
           prompt: segPrompt,
-          tier,
-          videoUri: plan.veo_last_uri,
+          previousInteractionId: plan.veo_last_interaction_id,
+          durationSeconds: VEO_EXTEND_SEC,
+          aspectRatio: plan.veo_aspect_ratio ?? '16:9',
+          resolution: plan.veo_resolution ?? '720p',
         });
         plan.current_segment_attempt = 0;
         await this.pg.query(

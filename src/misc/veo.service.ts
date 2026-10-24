@@ -3,42 +3,53 @@ import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
 
 /**
- * Veo 3.1 (Google Gemini Developer API) video provider — DR backlog a0132032.
+ * Видео-провайдер — Gemini Omni Flash (`gemini-omni-1.1-flash`) через
+ * Interactions API Gemini Developer API.
  *
- * Long-form talking-head with native lip-synced audio and reference-portrait
- * consistency, in one continuous video.
+ * До 22.10.2026 здесь был Veo 3.1 (predictLongRunning). Google закрыл его
+ * превью (veo-3.1-generate-preview, veo-3.1-fast-generate-preview), а GA-версий
+ * Veo по ключу Gemini API нет: veo-2.0/3.0 сняты ещё 30.06.2026. Официальная
+ * замена — Omni. Имя класса, событие veo_call и поля veo_* в плане задачи
+ * остались прежними: на них завязаны строки video_jobs, мониторинг и клиенты.
  *
- * API mechanics, all validated against the live API 2026-06-03:
- *  - generate: POST models/{model}:predictLongRunning, x-goog-api-key header,
- *    body { instances:[{ prompt, image?{inlineData}, referenceImages? }],
- *           parameters:{ aspectRatio, durationSeconds:<NUMBER>, resolution } }
- *    → { name } (operation).  durationSeconds MUST be a number (8), not "8".
- *  - poll: GET v1beta/{operation.name} → { done, response.generateVideoResponse
- *    .generatedSamples[0].video.uri, error }.
- *  - extend: same endpoint, body { instances:[{ prompt, video:{ uri:<prior
- *    download uri> } }], parameters:{ resolution:"720p" } }. The ONLY accepted
- *    video reference is `video.uri` (inlineData / fileData / fileUri are all
- *    rejected). Output is the FULL combined video (base + 7s), so chaining
- *    extends yields one continuous clip — the last operation's uri is the
- *    finished video. Files live 2 days (reset when referenced).
- *  - download: GET <uri> with x-goog-api-key header → mp4 bytes.
+ * Механика, проверенная живыми вызовами 24.10.2026:
+ *  - запуск: POST v1beta/interactions с x-goog-api-key, тело { model,
+ *    background: true, input, response_format: { type: 'video', aspect_ratio,
+ *    resolution, duration: '8s' } } → сразу { id, status: 'in_progress' }.
+ *    input — строка или массив частей { type: 'image', data, mime_type } и
+ *    { type: 'text', text }. Ролик 3–10 с, со звуком, 24 к/с.
+ *  - опрос: GET v1beta/interactions/{id} → status in_progress | completed |
+ *    failed. Готовый ролик — в шаге steps[].type='model_output', часть
+ *    content[].type='video', инлайном в data (base64): GET отдаёт инлайн даже
+ *    при delivery 'uri'.
+ *  - продление: тот же POST с previous_interaction_id прошлого шага и текстом
+ *    продолжения. Ответ — ВЕСЬ ролик (4 с + 4 с → 8,0 с), как было у Veo, а в
+ *    счёт идут только новые секунды. Предел — 40 с суммарно. Речь в продлении
+ *    работает (multi-turn), в том числе с серверов в ЕЭЗ.
+ *  - негативного промпта, temperature и system instructions у Omni нет:
+ *    запреты пишутся в сам промпт.
+ *  - цена: 5 792 видео-токена за секунду 720p и 8 688 за секунду 1080p по
+ *    $17.50 за 1M, то есть ≈ $0.10/с и ≈ $0.15/с.
  *
- * Reuses GOOGLE_AI_API_KEY (already used for Nano Banana image gen).
+ * Ключ — тот же GOOGLE_AI_API_KEY, что у генерации картинок.
  */
 
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+export const OMNI_MODEL = 'gemini-omni-1.1-flash';
 
-export type VeoTier = 'fast' | 'standard';
-const MODEL_ID: Record<VeoTier, string> = {
-  fast: 'veo-3.1-fast-generate-preview',
-  standard: 'veo-3.1-generate-preview',
-};
+/** Длина базового клипа и шага продления, секунды. */
+const BASE_SEC = 8;
+const EXTEND_SEC = 7;
 
 export interface VeoOperationStatus {
   done: boolean;
-  videoUri: string | null;
+  /** Готовый mp4 — целиком, у продления это весь ролик с начала. */
+  video: Buffer | null;
   error: string | null;
 }
+
+type Aspect = '16:9' | '9:16';
+type Resolution = '720p' | '1080p';
 
 @Injectable()
 export class VeoService {
@@ -55,8 +66,17 @@ export class VeoService {
     return { 'x-goog-api-key': this.apiKey, 'Content-Type': 'application/json' };
   }
 
+  private videoFormat(aspectRatio: Aspect | undefined, resolution: Resolution | undefined, durationSeconds: number) {
+    return {
+      type: 'video',
+      aspect_ratio: aspectRatio || '16:9',
+      resolution: resolution || '720p',
+      duration: `${durationSeconds}s`,
+    };
+  }
+
   // Map upstream errors to a job error_message. A 429/quota is an operational
-  // ceiling (Veo daily RPD on the key), not a user error — surface it plainly
+  // ceiling (дневной лимит на ключе), not a user error — surface it plainly
   // so the assistant/UI can say "try later" instead of a raw billing message.
   private describeError(e: any, label: 'generate' | 'extend'): string {
     const status = e.response?.status;
@@ -71,151 +91,138 @@ export class VeoService {
       const delayStr: string | undefined = retry?.retryDelay; // напр. "57s"
       const delaySec = delayStr ? parseInt(String(delayStr), 10) : NaN;
       if (Number.isFinite(delaySec) && delaySec > 0 && delaySec < 3600) {
-        return `Veo: временный лимит частоты запросов. Можно повторить примерно через ${delaySec < 60 ? `${delaySec} сек` : `${Math.ceil(delaySec / 60)} мин`}.`;
+        return `Видео: временный лимит частоты запросов. Можно повторить примерно через ${delaySec < 60 ? `${delaySec} сек` : `${Math.ceil(delaySec / 60)} мин`}.`;
       }
-      return 'Veo: на сегодня исчерпан дневной лимит генераций видео. Лимит обновляется раз в сутки около 10:00–11:00 МСК — попробуйте позже. (админу: повысить квоту Veo для ключа в Google AI Studio / Cloud Console.)';
+      return 'Видео: на сегодня исчерпан дневной лимит генераций видео. Лимит обновляется раз в сутки около 10:00–11:00 МСК — попробуйте позже. (админу: повысить квоту Gemini Omni для ключа в Google AI Studio / Cloud Console.)';
     }
-    return `Veo ${label} failed: ${raw}`;
+    return `Omni ${label} failed: ${raw}`;
   }
 
-  private trackCall(method: string, tier: VeoTier, ok: boolean, latencyMs: number, errorShort?: string, op?: string) {
+  private trackCall(method: string, ok: boolean, latencyMs: number, errorShort?: string, op?: string) {
     if (!this.pg) return;
     this.pg.query(
       `INSERT INTO events (name, props) VALUES ('veo_call', $1::jsonb)`,
-      [JSON.stringify({ method, model: MODEL_ID[tier], ok, latency_ms: latencyMs, error_short: errorShort?.slice(0, 200), operation: op })],
+      [JSON.stringify({ method, model: OMNI_MODEL, ok, latency_ms: latencyMs, error_short: errorShort?.slice(0, 200), operation: op })],
     ).catch((e: any) => this.logger.warn(`veo_call event insert failed: ${e.message}`));
   }
 
+  private async startInteraction(body: any, label: 'generate' | 'extend'): Promise<string> {
+    if (!this.apiKey) throw new Error('GOOGLE_AI_API_KEY not configured');
+    const t0 = Date.now();
+    try {
+      const resp = await axios.post(`${API_BASE}/interactions`, body, {
+        headers: this.headers(),
+        timeout: 60_000,
+        // До трёх портретов base64 в теле: дефолтный потолок 10 МБ им мал.
+        maxBodyLength: Infinity,
+      });
+      const id = resp.data?.id;
+      if (!id) throw new Error(`no interaction id: ${JSON.stringify(resp.data).slice(0, 200)}`);
+      this.trackCall(label, true, Date.now() - t0, undefined, id);
+      return id;
+    } catch (e: any) {
+      const msg = this.describeError(e, label);
+      this.trackCall(label, false, Date.now() - t0, msg);
+      throw new Error(msg);
+    }
+  }
+
   /**
-   * Start a base generation. Returns the long-running operation name.
-   * `image` (a portrait) is the talking-head subject; `referenceImages` keep
-   * a consistent character across the chain (Veo "Ingredients").
+   * Start a base generation. Returns the interaction id.
+   * Портреты (`referenceImagesB64`, до трёх) ведут сходство персонажа по всему
+   * ролику. Одно фото модель использует сама — проба 24.10 дала точное
+   * сходство без подсказки. Два-три фото без явной задачи Omni может принять
+   * за первый и последний кадр (интерполяцию), поэтому для них задаём
+   * reference_to_video.
    */
   async startGenerate(opts: {
     prompt: string;
-    tier: VeoTier;
-    durationSeconds?: number;      // 4 | 6 | 8 (base); default 8
-    aspectRatio?: '16:9' | '9:16';
-    resolution?: '720p' | '1080p';
-    imageB64?: string;
-    imageMime?: string;
-    // referenceImages (Veo «Ingredients») — ведут идентичность персонажа по ВСЕМУ
-    // ролику, а не только в первом кадре. Для портрета это даёт лучшее сходство
-    // (фидбэк katya: с first-frame лица «не было совсем»). ВЗАИМОисключимо с image
-    // (API даёт 400, если передать оба) — поэтому при наличии reference не шлём image.
+    durationSeconds?: number;      // 3–10; default 8
+    aspectRatio?: Aspect;
+    resolution?: Resolution;
     referenceImagesB64?: Array<{ b64: string; mime: string }>;
     negativePrompt?: string;
   }): Promise<string> {
-    if (!this.apiKey) throw new Error('GOOGLE_AI_API_KEY not configured');
-    const t0 = Date.now();
-    const instance: any = { prompt: opts.prompt };
-    if (opts.referenceImagesB64?.length) {
-      instance.referenceImages = opts.referenceImagesB64.map((r) => ({
-        image: { bytesBase64Encoded: r.b64, mimeType: r.mime || 'image/jpeg' },
-        referenceType: 'asset',
-      }));
-    } else if (opts.imageB64) {
-      // Veo image input is Imagen-style bytesBase64Encoded — NOT inlineData/uri
-      // (both rejected by the model). Validated against the live API.
-      instance.image = { bytesBase64Encoded: opts.imageB64, mimeType: opts.imageMime || 'image/jpeg' };
-    }
-    const parameters: any = {
-      aspectRatio: opts.aspectRatio || '16:9',
-      durationSeconds: opts.durationSeconds || 8,   // number, not string
-      resolution: opts.resolution || '720p',
+    const images = (opts.referenceImagesB64 || []).slice(0, 3);
+    const text = opts.negativePrompt ? `${opts.prompt}\n\nAvoid: ${opts.negativePrompt}` : opts.prompt;
+    const body: any = {
+      model: OMNI_MODEL,
+      background: true,
+      input: images.length
+        ? [
+            ...images.map((r) => ({ type: 'image', data: r.b64, mime_type: r.mime || 'image/jpeg' })),
+            { type: 'text', text },
+          ]
+        : text,
+      response_format: this.videoFormat(opts.aspectRatio, opts.resolution, opts.durationSeconds || BASE_SEC),
     };
-    if (opts.negativePrompt) parameters.negativePrompt = opts.negativePrompt;
-
-    try {
-      const resp = await axios.post(
-        `${API_BASE}/models/${MODEL_ID[opts.tier]}:predictLongRunning`,
-        { instances: [instance], parameters },
-        { headers: this.headers(), timeout: 30_000 },
-      );
-      const name = resp.data?.name;
-      if (!name) throw new Error(`no operation name: ${JSON.stringify(resp.data).slice(0, 200)}`);
-      this.trackCall('generate', opts.tier, true, Date.now() - t0, undefined, name);
-      return name;
-    } catch (e: any) {
-      const msg = this.describeError(e, 'generate');
-      this.trackCall('generate', opts.tier, false, Date.now() - t0, msg);
-      throw new Error(msg);
-    }
+    if (images.length > 1) body.generation_config = { video_config: { task: 'reference_to_video' } };
+    return this.startInteraction(body, 'generate');
   }
 
   /**
-   * Extend a prior generation (referenced by its download uri). Output is the
-   * full combined video. 720p only per the API.
+   * Extend the previous step (by its interaction id). Output is the FULL
+   * combined video, so the last step of a chain is the finished clip.
    */
-  async startExtend(opts: { prompt: string; tier: VeoTier; videoUri: string }): Promise<string> {
-    if (!this.apiKey) throw new Error('GOOGLE_AI_API_KEY not configured');
-    const t0 = Date.now();
-    try {
-      const resp = await axios.post(
-        `${API_BASE}/models/${MODEL_ID[opts.tier]}:predictLongRunning`,
-        {
-          instances: [{ prompt: opts.prompt, video: { uri: opts.videoUri } }],
-          parameters: { resolution: '720p' },
-        },
-        { headers: this.headers(), timeout: 30_000 },
-      );
-      const name = resp.data?.name;
-      if (!name) throw new Error(`no operation name: ${JSON.stringify(resp.data).slice(0, 200)}`);
-      this.trackCall('extend', opts.tier, true, Date.now() - t0, undefined, name);
-      return name;
-    } catch (e: any) {
-      const msg = this.describeError(e, 'extend');
-      this.trackCall('extend', opts.tier, false, Date.now() - t0, msg);
-      throw new Error(msg);
-    }
+  async startExtend(opts: {
+    prompt: string;
+    previousInteractionId: string;
+    durationSeconds?: number;      // default 7
+    aspectRatio?: Aspect;
+    resolution?: Resolution;
+  }): Promise<string> {
+    return this.startInteraction({
+      model: OMNI_MODEL,
+      background: true,
+      previous_interaction_id: opts.previousInteractionId,
+      input: opts.prompt,
+      response_format: this.videoFormat(opts.aspectRatio, opts.resolution, opts.durationSeconds || EXTEND_SEC),
+    }, 'extend');
   }
 
-  /** Poll a long-running operation. */
-  async getOperation(operationName: string): Promise<VeoOperationStatus> {
+  /** Poll an interaction. A finished one carries the whole mp4. */
+  async getOperation(interactionId: string): Promise<VeoOperationStatus> {
     if (!this.apiKey) throw new Error('GOOGLE_AI_API_KEY not configured');
-    const resp = await axios.get(`${API_BASE}/${operationName}`, { headers: this.headers(), timeout: 20_000 });
+    const resp = await axios.get(`${API_BASE}/interactions/${interactionId}`, {
+      headers: this.headers(),
+      timeout: 120_000,
+      maxContentLength: 300 * 1024 * 1024,
+    });
     const d = resp.data || {};
-    if (!d.done) return { done: false, videoUri: null, error: null };
-    if (d.error) {
-      return { done: true, videoUri: null, error: d.error?.message || JSON.stringify(d.error).slice(0, 200) };
+    if (d.status === 'in_progress') return { done: false, video: null, error: null };
+    if (d.status !== 'completed') {
+      // Провал приходит массивом errors: [{ message, code }] (живой ответ
+      // 24.10.2026); одиночный error — на случай другой формы.
+      const errs: any[] = Array.isArray(d.errors) ? d.errors : (d.error ? [d.error] : []);
+      const first = errs.find((x) => x?.message) ?? errs[0];
+      let reason = first?.message ? String(first.message) : `interaction ${d.status ?? 'without status'}`;
+      // Отказ фильтра (узнаваемый человек, запретная тема) Omni отдаёт как
+      // INVALID_ARGUMENT с общим текстом «There was a problem processing your
+      // request» — без подсказки человек не поймёт, что менять.
+      if (first?.code === 'INVALID_ARGUMENT') {
+        reason = `Omni отклонил запрос — чаще всего это фильтр контента (узнаваемые люди, дети на фото, запрещённые темы); переформулируйте описание. ${reason}`;
+      }
+      return { done: true, video: null, error: reason };
     }
-    const gvr = d.response?.generateVideoResponse;
-    const uri = gvr?.generatedSamples?.[0]?.video?.uri ?? null;
-    if (!uri) {
-      // Veo can finish "done" with zero samples when its safety/content filter
-      // (RAI) rejects the generation — surface that reason so the assistant can
-      // tell the user to rephrase, instead of an opaque "no video uri".
-      const rai = Array.isArray(gvr?.raiMediaFilteredReasons) && gvr.raiMediaFilteredReasons.length
-        ? String(gvr.raiMediaFilteredReasons.join(' ')).slice(0, 400)
-        : null;
-      return { done: true, videoUri: null, error: rai ? `Veo отклонил генерацию (фильтр контента): ${rai}` : 'operation done but no video uri' };
-    }
-    return { done: true, videoUri: uri, error: null };
+
+    const outputs = (Array.isArray(d.steps) ? d.steps : []).filter((s: any) => s?.type === 'model_output');
+    const parts: any[] = outputs.flatMap((s: any) => (Array.isArray(s.content) ? s.content : []));
+    const clip = parts.filter((c) => c?.type === 'video').pop();
+    if (clip?.data) return { done: true, video: Buffer.from(clip.data, 'base64'), error: null };
+    if (clip?.uri) return { done: true, video: await this.downloadVideo(clip.uri), error: null };
+
+    // Отказ фильтра или модели приходит текстом вместо ролика — отдаём его,
+    // чтобы ассистент мог сказать человеку, что переформулировать.
+    const said = parts.filter((c) => c?.type === 'text' && c.text).map((c) => c.text).join(' ').trim();
+    return {
+      done: true,
+      video: null,
+      error: said ? `Omni не вернул видео: ${said.slice(0, 400)}` : 'interaction completed without video',
+    };
   }
 
-  /**
-   * Processing state of a generated-video file (ACTIVE / PROCESSING / FAILED).
-   * A just-finished generation isn't immediately extendable — Veo rejects the
-   * extend with "Input video must be a video that was generated by VEO that has
-   * been processed" until the file reaches ACTIVE. Derive files/XXX from the
-   * download uri and query the Files API.
-   */
-  async getFileState(videoUri: string): Promise<string | null> {
-    if (!this.apiKey) return null;
-    const m = videoUri.match(/\/(files\/[^:?]+)/);
-    if (!m) return null;
-    try {
-      const resp = await axios.get(`${API_BASE}/${m[1]}`, { headers: { 'x-goog-api-key': this.apiKey }, timeout: 15_000 });
-      return resp.data?.state ?? null;
-    } catch (e: any) {
-      this.logger.warn(`veo getFileState failed: ${e.message}`);
-      return null;
-    }
-  }
-
-  /** Download the finished mp4 bytes (key required in the header). */
-  async downloadVideo(uri: string): Promise<Buffer> {
-    if (!this.apiKey) throw new Error('GOOGLE_AI_API_KEY not configured');
+  /** Download mp4 bytes by a Files API uri (key required in the header). */
+  private async downloadVideo(uri: string): Promise<Buffer> {
     const resp = await axios.get(uri, {
       headers: { 'x-goog-api-key': this.apiKey },
       responseType: 'arraybuffer',
