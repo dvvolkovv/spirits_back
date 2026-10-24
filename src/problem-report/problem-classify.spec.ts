@@ -162,4 +162,11 @@ describe('failureSignature: подпись для склейки', () => {
     expect(failureSignature('t', 'OpenAI 500 (request id req_0123456789abcdef0123456789abcdef)'))
       .toBe(failureSignature('t', 'OpenAI 500 (request id req_fedcba9876543210fedcba9876543210)'));
   });
+
+  it('огромная ошибка: смотрим только начало', () => {
+    const huge = 'x'.repeat(10_000_000);
+    expect(isUserSideToolError(huge)).toBe(false);
+    expect(isUserSideToolError('insufficient_tokens' + ' '.repeat(3000))).toBe(true);
+    expect(failureSignature('t', huge).length).toBeLessThanOrEqual('t|'.length + 160);
+  });
 });

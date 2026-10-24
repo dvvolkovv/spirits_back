@@ -101,8 +101,9 @@ const USER_SIDE_PATTERNS = [
   /^модель не вернула изображени[йея] \((?:(?:image_)?(?:safety|prohibited_content)|blocklist|spii)\)/,
 ];
 
+/** Смотрим только первые 2000 символов: дальше подпись и класс не меняются, а проход огромной строки дорог. */
 export function isUserSideToolError(error: unknown): boolean {
-  const e = String(error ?? '').trim().toLowerCase();
+  const e = String(error ?? '').slice(0, 2000).trim().toLowerCase();
   if (!e) return false;
   if (USER_SIDE_CODES.has(e)) return true;
   if (USER_SIDE_PREFIXES.some((p) => e.startsWith(p))) return true;
@@ -112,10 +113,12 @@ export function isUserSideToolError(error: unknown): boolean {
 /**
  * Подпись сбоя для склейки: инструмент плюс ошибка без того, что меняется от
  * вызова к вызову (адреса, id, числа). Ассистента в подписи нет: снятая
- * модель у Киры и у Романа — один сбой.
+ * модель у Киры и у Романа — один сбой. Смотрим только первые 2000 символов:
+ * дальше подпись и класс не меняются, а проход огромной строки дорог.
  */
 export function failureSignature(tool: string, error: unknown): string {
   const norm = String(error ?? '')
+    .slice(0, 2000)
     .toLowerCase()
     .replace(/https?:\/\/\S+/g, '<url>')
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, '<id>')

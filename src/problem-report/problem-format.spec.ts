@@ -1,5 +1,5 @@
 import {
-  clip, escapeHtml, FALLBACK_NAME, formatAssistantReport, formatToolFailure, head, oneLine, timesRu, toolAction, usersRu,
+  clip, escapeHtml, FALLBACK_NAME, formatAssistantReport, formatToolCapNotice, formatToolFailure, head, oneLine, timesRu, toolAction, usersRu,
 } from './problem-format';
 import { CHAT_TOOLS } from '../chat/chat-tools';
 
@@ -164,5 +164,13 @@ describe('тексты в группу «Поддержка linkeon»', () => {
 
   it('запасное имя экспортируется', () => {
     expect(FALLBACK_NAME).toBe('Ассистент');
+  });
+
+  it('уведомление о потолке пути А', () => {
+    expect(formatToolCapNotice(20)).toBe(
+      '🛠 <b>Слишком много разных сбоев инструментов</b>\n' +
+      'За последний час отправлено столько сообщений о сбоях, сколько разрешено (20). ' +
+      'Новые сбои до конца часа — только в логе сервера (строки «problem-report:»).',
+    );
   });
 });

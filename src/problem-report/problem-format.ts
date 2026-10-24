@@ -120,6 +120,15 @@ export function formatToolFailure(p: {
   return lines.join('\n');
 }
 
+/** Уведомление: сообщений пути А за час больше общего потолка — дальше только в лог. */
+export function formatToolCapNotice(cap: number): string {
+  return [
+    '🛠 <b>Слишком много разных сбоев инструментов</b>',
+    `За последний час отправлено столько сообщений о сбоях, сколько разрешено (${cap}). ` +
+      'Новые сбои до конца часа — только в логе сервера (строки «problem-report:»).',
+  ].join('\n');
+}
+
 export type ProblemKind = 'my_failure' | 'user_report';
 export type ProblemChannel = 'web' | 'telegram';
 
