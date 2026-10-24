@@ -1987,6 +1987,8 @@ Expected: PASS — все сюиты `src/support/`.
 
 ---
 
+> **Ревью задач 9–10 (24.10) добавило:** ход Маши с `report_problem` — без метафорической карты (`usedProductsTool`); в TG свой статус `tool_support` («📨 Сообщаю в поддержку...», семь языков) вместо «Работаю с продуктом»; поля эскалации и превью `support_events` режутся по кодовым точкам (`clip`); эскалация при не настроенном Telegram пишет в лог; точный комментарий к `reportFailure`. Поэтому в задачах 13 и 14 прогоняется весь `src/tg-bot/` (там проверки каталогов).
+
 ## Задача 11. Копия релея с правкой (ещё не выкатывать)
 
 Новая строка в `PRODUCTS_TOOLS` и явное исключение в `PRODUCTS_PROMPT`. В промпте релея действует правило «только `mcp__linkeon__*`», и для `manage_product` и `find_files` там прописано «ЯВНОЕ исключение»; без такой строки модель может счесть `report_problem` запрещённым. Файл готовим здесь (копия в репозитории = то, что поедет на релей), выкатываем в задаче 15 — после бэкенда.
@@ -2189,7 +2191,7 @@ Expected: `TSC_EXIT=0` и тот же вывод, что в базе задач�
 - [ ] **Шаг 2: затронутые каталоги**
 
 ```bash
-"$SCRATCH/ntest.sh" jest 'src/(problem-report|mcp|support)/|src/products/products-cli-tool|src/chat/chat.service.(masha-products|active-assistant)|src/tg-bot/(tg-bot.products-tool|tg-router.web-tools)|src/common/sdk-tools-lockdown'
+"$SCRATCH/ntest.sh" jest 'src/(problem-report|mcp|support|tg-bot)/|src/products/products-cli-tool|src/chat/chat.service.(masha-products|active-assistant)|src/common/sdk-tools-lockdown'
 ```
 Expected: PASS, ни одной красной сюиты.
 
@@ -2235,7 +2237,7 @@ Expected: мерж без конфликтов. Конфликт — остан�
 M=/Users/dmitry/Downloads/spirits_back/.worktrees/merge-problem-report
 MSHA=$(git -C $M rev-parse HEAD)
 git -C $M push -q origin HEAD:refs/heads/verify/problem-report
-ssh -S ~/.ssh/cm-lnode dv@85.192.61.231 "set -eo pipefail; cd ~/ci/wt/problem-report && git fetch -q origin && git checkout -q --detach $MSHA && source ~/.nvm/nvm.sh && npx jest --testPathPattern='src/(problem-report|mcp|support)/|src/products/products-cli-tool|src/chat/chat.service.(masha-products|active-assistant)|src/tg-bot/(tg-bot.products-tool|tg-router.web-tools)' --maxWorkers=2 2>&1 | tail -15 && npx tsc --noEmit -p tsconfig.build.json 2>&1 | tail -5"
+ssh -S ~/.ssh/cm-lnode dv@85.192.61.231 "set -eo pipefail; cd ~/ci/wt/problem-report && git fetch -q origin && git checkout -q --detach $MSHA && source ~/.nvm/nvm.sh && npx jest --testPathPattern='src/(problem-report|mcp|support|tg-bot)/|src/products/products-cli-tool|src/chat/chat.service.(masha-products|active-assistant)|src/common/sdk-tools-lockdown' --maxWorkers=2 2>&1 | tail -15 && npx tsc --noEmit -p tsconfig.build.json 2>&1 | tail -5"
 ```
 Expected: PASS, tsc без ошибок.
 
@@ -2293,9 +2295,9 @@ Expected: дважды `supportNotified\":true` (JSON результата вн�
 - [ ] **Шаг 6: живая проверка Б — `report_problem` на точке продуктов**
 
 ```bash
-ssh dvolkov@212.113.106.202 'cd /home/dvolkov/spirits_back && T=$(node -r dotenv/config -e "process.stdout.write(require(\"./dist/products/product-tool.token\").signProductToolToken(\"<номер Test user>\",\"web\"))") && curl -s -m 20 -X POST http://127.0.0.1:3001/webhook/mcp/products -H "Authorization: Bearer $T" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"report_problem\",\"arguments\":{\"assistant\":\"Проверка\",\"kind\":\"my_failure\",\"summary\":\"Проверка выката 24.10: сообщение ассистента о поломке. Ничего делать не нужно.\"}}}" | grep -o "reported[^,}]*"; sleep 2; grep -a "problem-report: отправлено" ~/.pm2/logs/linkeon-api-out-0.log | tail -1'
+ssh dvolkov@212.113.106.202 'cd /home/dvolkov/spirits_back && T=$(node -r dotenv/config -e "process.stdout.write(require(\"./dist/products/product-tool.token\").signProductToolToken(\"<номер Test user>\",\"web\"))") && curl -s -m 20 -X POST http://127.0.0.1:3001/webhook/mcp/products -H "Authorization: Bearer $T" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"report_problem\",\"arguments\":{\"assistant\":\"Проверка\",\"kind\":\"my_failure\",\"summary\":\"Проверка выката 24.10: сообщение ассистента о поломке. Ссылка https://linkeon.io и @problem_report_check должны остаться простым текстом. Ничего делать не нужно.\"}}}" | grep -o "reported[^,}]*"; sleep 2; grep -a "problem-report: отправлено" ~/.pm2/logs/linkeon-api-out-0.log | tail -1'
 ```
-Expected: `reported\":true`; в логе `problem-report: отправлено (assistant_report)`; в группе — «🙋 Проверка: у меня не работает», «Проверка выката 24.10…», «· веб».
+Expected: `reported\":true`; в логе `problem-report: отправлено (assistant_report)`; в группе — «🙋 Проверка: у меня не работает», «Проверка выката 24.10…», «· веб»; ссылка и @упоминание в пересказе — моноширинным текстом, не кликабельны (пересказ в `<code>`).
 
 - [ ] **Шаг 7: живая проверка эскалации** (из `dist`, тикета в базе нет — кнопка ведёт в никуда, это нормально)
 

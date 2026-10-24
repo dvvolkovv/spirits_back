@@ -183,8 +183,10 @@
 Без имени в `allowedTools` вызов в `-p` отклоняется:
 
 - релей: `mcp__products__report_problem` дописывается в строку `PRODUCTS_TOOLS` в `~/file-agent/server.mjs`, плюс две строки в конце `PRODUCTS_PROMPT`: «СООБЩИТЬ В ПОДДЕРЖКУ. Тебе доступен инструмент mcp__products__report_problem — тоже ЯВНОЕ исключение к правилу «только mcp__linkeon__*».» и «Когда звать и что писать — в его описании. Если инструмент mcp__linkeon__* вернул ошибку с supportNotified=true — команда уже знает: report_problem не зови, скажи пользователю, что команда в курсе. НЕ передавай в инструмент userId/телефон.» Зачем: системный промпт релея разрешает модели только `mcp__linkeon__*` («The ONLY MCP tools you may use are the linkeon ones… All other MCP/plugin tools are forbidden»), и без явного исключения — как у `manage_product` и `find_files` — модель сочла бы новый инструмент запрещённым. Копия файла в репозитории (`relay-agent/server.mjs`) обновляется до живой версии с этой правкой. Выкат ручной (коммит в `~/file-agent`, `node --check`, `pm2 restart file-agent` в момент без дочерних `claude`); перед правкой — сверить `git log` и `git status` в `~/file-agent`: 24.10 там же работала сессия spirits-front-4a;
-- Маша: `allowedTools` в `chat.service.ts`;
-- TG-бот: `allowedTools` в `tg-router.service.ts` — только когда инструмент продуктов выдан (владелец в чате один).
+- Маша: `allowedTools` в `chat.service.ts`. Ход, где Маша звала `report_problem`, метафорическую карту не получает — как ход с продуктами или поиском файлов: широкое `/карт/` зацепило бы жалобу «не проходит оплата картой» (уточнено ревью 24.10);
+- TG-бот: `allowedTools` в `tg-router.service.ts` — только когда инструмент продуктов выдан (владелец в чате один). Пока идёт вызов, статус — «📨 Сообщаю в поддержку...» (ключ `tool_support`, семь языков), а не общий для `mcp__products__*` «Работаю с продуктом» (уточнено ревью 24.10).
+
+В вебе шаг работы у `report_problem` — `other` («Работаю над задачей»): своего кода шага нет, и это не вводит в заблуждение.
 
 Имя — константа рядом с `PRODUCTS_CLI_TOOL_NAME` в `src/products/products-cli-tool.ts`.
 
@@ -192,7 +194,9 @@
 
 ## Эскалации ИИ-поддержки — снова в группе
 
-`TelegramNotifierService.notifyEscalation`: если `TELEGRAM_SUPPORT_CHAT_ID` пуст, тот же текст с кнопкой «Открыть тикет» уходит через `sendTelegramPayload` (фанаут по `TELEGRAM_CHAT_ID`). Так уже сделано для ответа пользователя в тикете (`SupportService.notifyOwnerOfUserReply`); там ничего не меняем, чтобы ответ не ушёл дважды.
+`TelegramNotifierService.notifyEscalation`: если `TELEGRAM_SUPPORT_CHAT_ID` пуст, тот же текст с кнопкой «Открыть тикет» уходит через `sendTelegramPayload` (фанаут по `TELEGRAM_CHAT_ID`). Так уже сделано для ответа пользователя в тикете (`SupportService.notifyOwnerOfUserReply`); маршрут там прежний (иначе ответ ушёл бы дважды), добавлено только экранирование имени и текста: `<` или `&` в ответе пользователя заставили бы Telegram отвергнуть сообщение, и оно пропало бы молча. Превью ответа в `support_events` режется по кодовым точкам: половинка эмодзи в jsonb роняла бы запись, а с ней и 30-секундную защиту от повторов.
+
+Поля эскалации тоже режутся по кодовым точкам (`clip`) — путь был мёртвым, теперь живой. Telegram не настроен вовсе (как на test) — предупреждение в лог с номером тикета; после отправки — строка в лог. Эскалация несёт имя, почту и последнее сообщение пользователя: кто в чатах `TELEGRAM_CHAT_ID`, тот их и видит.
 
 `notifyHealthAlert` не трогаем: обход дал бы около четырёх ложных сообщений в день о плановом обновлении OAuth (`anthropic healthy → degraded → healthy`). Возвращать ли `TELEGRAM_SUPPORT_CHAT_ID` в `.env` — решение владельца, не этой работы.
 
@@ -219,8 +223,9 @@
 - Формат: экранирование `<`, `>`, `&`; обрезка; имя по инструменту; незнакомый инструмент.
 - `McpController`: сбой → `supportNotified` и `supportNote` в JSON результата и вызов отправки; не-сбой и успех → без полей и без отправки; ответ не ждёт отправки (отправка висит — ответ уходит).
 - `ProductsMcpController`: `report_problem` в списке обоих каналов; `userId` из аргументов игнорируется; лимиты (четвёртое за час — `rate_limited`, в группу ничего); `bad_input`.
-- `allowedTools` Маши и TG-бота содержат имя инструмента.
-- `notifyEscalation` без `TELEGRAM_SUPPORT_CHAT_ID` → `sendTelegramPayload` с кнопкой; с ним — прежний путь.
+- `allowedTools` Маши и TG-бота содержат имя инструмента; ход Маши с `report_problem` и словом «картой» — без карты; подпись статуса в TG — своя.
+- `notifyEscalation` без `TELEGRAM_SUPPORT_CHAT_ID` → `sendTelegramPayload` с кнопкой; с ним — прежний путь; эмодзи на границе обрезки цел; Telegram не настроен — только в лог; `notifyHealthAlert` и `notifyUserReply` фанаутом не шлются.
+- Ответ пользователя в тикете без своего чата: имя и текст экранированы, обрезка по кодовым точкам, превью в `support_events` без половинки эмодзи.
 
 **После выката** — прод, тестовый аккаунт, с OK владельца:
 
@@ -235,3 +240,4 @@
 - Автосообщения о сбоях «Продуктов» и `find_files`, видео в TG-ботах (`tg-bot.service.ts` зовёт `VideoService` напрямую), сбоях самого релея (пустой поток, таймаут хода). Их частично ловят `QualityMonitorService` и synthetic.
 - Ответ пользователю прямо из Telegram: у `linkeon_alert_bot` нет вебхука, `/support/telegram-hook` не подключён.
 - Шум health-алертов, `TELEGRAM_SUPPORT_CHAT_ID` в `.env` прода, личка …1972 в `TELEGRAM_CHAT_ID`.
+- Общие `escapeHtml` и `clip` в `src/common`: сейчас копии в `problem-format.ts`, `tg-bot/tg-html.ts`, `support/support-mail.ts`, плюс `esc` в `telegram-notifier.service.ts` и `meeting-alert.ts`. Модуль support берёт их из `problem-report` — отдельная уборка.
