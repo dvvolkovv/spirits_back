@@ -39,6 +39,8 @@ describe('ответ пользователя в тикете без своег�
     const text = String((sendTelegramAlert as jest.Mock).mock.calls[0][0]);
     expect(text).toContain('Клиент: &lt;Ки&amp;ра&gt;');
     expect(text).toContain('«a &lt; b &amp; c»');
+    // Ссылка из ответа пользователя — без превью: Telegram не должен ходить по чужому адресу.
+    expect((sendTelegramAlert as jest.Mock).mock.calls[0][1]).toEqual({ disable_web_page_preview: true });
   });
 
   it('длинный ответ режется по кодовым точкам — без половинки эмодзи', async () => {

@@ -30,24 +30,32 @@ describe('эскалация ИИ-поддержки', () => {
   const saved = { ...process.env };
   beforeEach(() => {
     post.mockReset();
-    // reset снимает реализацию из фабрики (async () => {} / () => true) —
-    // здесь нужен только сброс истории вызовов между тестами.
+    // reset снимает реализацию из фабрики (async () => {}) — здесь нужен
+    // только сброс истории вызовов между тестами.
     fanout.mockClear();
-    configured.mockClear();
+    // reset (не clear) — иначе очередь mockReturnValueOnce из предыдущего
+    // теста переживёт его и подменит значение в следующем.
+    configured.mockReset().mockReturnValue(true);
     process.env.TELEGRAM_BOT_TOKEN = 'token';
   });
   afterEach(() => { process.env = { ...saved }; });
 
   it('без TELEGRAM_SUPPORT_CHAT_ID — фанаутом по TELEGRAM_CHAT_ID, с кнопкой тикета', async () => {
     delete process.env.TELEGRAM_SUPPORT_CHAT_ID;
-    await new TelegramNotifierService().notifyEscalation(ESCALATION);
-    expect(post).not.toHaveBeenCalled();
-    expect(fanout).toHaveBeenCalledTimes(1);
-    const payload = fanout.mock.calls[0][0];
-    expect(payload.parse_mode).toBe('HTML');
-    expect(payload.text).toContain('Escalation');
-    expect(payload.text).toContain('#e86dc43d');
-    expect(payload.reply_markup.inline_keyboard[0][0].url).toContain('ticket=e86dc43d-c45c-4583-9f97-1d11db821a1b');
+    const log = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    try {
+      await new TelegramNotifierService().notifyEscalation(ESCALATION);
+      expect(post).not.toHaveBeenCalled();
+      expect(fanout).toHaveBeenCalledTimes(1);
+      const payload = fanout.mock.calls[0][0];
+      expect(payload.parse_mode).toBe('HTML');
+      expect(payload.text).toContain('Escalation');
+      expect(payload.text).toContain('#e86dc43d');
+      expect(payload.reply_markup.inline_keyboard[0][0].url).toContain('ticket=e86dc43d-c45c-4583-9f97-1d11db821a1b');
+      expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toContain('handed to TELEGRAM_CHAT_ID fan-out');
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it('с TELEGRAM_SUPPORT_CHAT_ID — прежний путь в свой чат, без фанаута', async () => {
@@ -74,10 +82,13 @@ describe('эскалация ИИ-поддержки', () => {
     delete process.env.TELEGRAM_SUPPORT_CHAT_ID;
     configured.mockReturnValueOnce(false);
     const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
-    await new TelegramNotifierService().notifyEscalation(ESCALATION);
-    expect(fanout).not.toHaveBeenCalled();
-    expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).toContain('#e86dc43d');
-    warn.mockRestore();
+    try {
+      await new TelegramNotifierService().notifyEscalation(ESCALATION);
+      expect(fanout).not.toHaveBeenCalled();
+      expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).toContain('#e86dc43d');
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('эмодзи на границе обрезки не рвётся пополам', async () => {

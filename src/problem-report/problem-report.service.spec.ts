@@ -165,14 +165,44 @@ describe('reportToolFailure — путь А', () => {
     expect(pg.query).not.toHaveBeenCalled();
   });
 
-  it('кастомный ассистент — имя из custom_agents', async () => {
+  it('кастомный ассистент — имя из custom_agents, только своего пользователя', async () => {
     const pg = pgWith([{ name: 'Мой юрист' }]);
     const svc = new ProblemReportService(pg as any);
     svc.reportToolFailure(failure({ assistantId: 'custom:3f2b9c1e-1111-4a2b-9c3d-123456789abc' }));
     await flush();
     expect(pg.query.mock.calls[0][0]).toContain('custom_agents');
-    expect(pg.query.mock.calls[0][1]).toEqual(['3f2b9c1e-1111-4a2b-9c3d-123456789abc']);
+    expect(pg.query.mock.calls[0][0]).toContain('owner_user_id');
+    expect(pg.query.mock.calls[0][1]).toEqual(['3f2b9c1e-1111-4a2b-9c3d-123456789abc', 'u1']);
     expect(sent.mock.calls[0][0]).toContain('<code>Мой юрист</code>: не получилось');
+  });
+
+  it('путь Б: кастомный ассистент хода — тоже только своего пользователя', async () => {
+    const pg = pgWith([{ name: 'Мой юрист' }]);
+    const svc = new ProblemReportService(pg as any);
+    await svc.reportFromAssistant({ userId: 'u1', channel: 'web', assistantId: 'custom:3f2b9c1e-1111-4a2b-9c3d-123456789abc', assistantArg: 'Кира', kind: 'my_failure', summary: 's' });
+    await flush();
+    expect(pg.query.mock.calls[0][1]).toEqual(['3f2b9c1e-1111-4a2b-9c3d-123456789abc', 'u1']);
+    expect(sent.mock.calls[0][0]).toContain('<code>Мой юрист</code>');
+  });
+
+  it('нечисловой id ассистента — имя из agents по name', async () => {
+    const pg = pgWith([{ display_name: 'Кира', name: 'kira' }]);
+    const svc = new ProblemReportService(pg as any);
+    svc.reportToolFailure(failure({ assistantId: 'kira' }));
+    await flush();
+    expect(pg.query.mock.calls[0][0]).toContain('WHERE name = $1');
+    expect(pg.query.mock.calls[0][1]).toEqual(['kira']);
+    expect(sent.mock.calls[0][0]).toContain('<code>Кира</code>: не получилось');
+  });
+
+  // sendTelegramAlert отказ чата не бросает (пишет «not delivered») — строка не должна обещать доставку.
+  it('после отправки в лог — «передано в фанаут», а не «отправлено»', async () => {
+    const svc = new ProblemReportService(pgWith() as any);
+    svc.reportToolFailure(failure());
+    await flush();
+    const logs = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logs).toContain('problem-report: передано в фанаут TELEGRAM_CHAT_ID (tool_failure)');
+    expect(logs).not.toContain('отправлено');
   });
 
   it('база упала — «Ассистент», сообщение всё равно уходит', async () => {
@@ -192,7 +222,7 @@ describe('reportToolFailure — путь А', () => {
     expect(warnSpy).toHaveBeenCalled();
   });
 
-  it('огромные tool и userId не оседают в памяти: ключ короткий, пользователей не больше 1000', async () => {
+  it('огромные tool и userId не оседают в памяти: ключ короткий, пользователей не больше 200', async () => {
     const svc = new ProblemReportService(pgWith() as any);
     svc.reportToolFailure(failure({ userId: 'u'.repeat(1_000_000) }));
     for (let i = 0; i < 1500; i++) svc.reportToolFailure(failure({ userId: `u${i}` }));
@@ -200,7 +230,7 @@ describe('reportToolFailure — путь А', () => {
     expect(incidents.size).toBe(1);
     const [key, inc] = [...incidents.entries()][0];
     expect(key.length).toBeLessThanOrEqual(40);
-    expect(inc.users.size).toBe(1000);
+    expect(inc.users.size).toBe(200);
     await flush();
     expect(String(sent.mock.calls[0][0])).toContain('<code>' + 'u'.repeat(63) + '…</code>');
   });
