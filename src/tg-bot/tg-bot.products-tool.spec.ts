@@ -26,6 +26,7 @@ import { PRODUCTS_CLI_PROMPT } from '../products/products-cli-tool';
 
 const TOOL = 'mcp__products__manage_product';
 const WEB = ['WebSearch', 'WebFetch'];
+const REPORT = 'mcp__products__report_problem';
 
 const OLD_SECRET = process.env.JWT_SECRET;
 beforeAll(() => { process.env.JWT_SECRET = 'test-secret-for-product-tool'; });
@@ -75,12 +76,12 @@ describe('TgRouterService.generateReply: инструмент продуктов
     expect(verifyProductToolToken(bearer.replace(/^Bearer /, ''))).toEqual({ userId: 'u-owner', channel: 'telegram' });
   });
 
-  it('с productsOwner: инструмент добавлен в allowedTools, веб сохранён, встроенный набор прежний', async () => {
+  it('с productsOwner: продукты и сообщение в поддержку в allowedTools, веб сохранён, встроенный набор прежний', async () => {
     const { svc, claudeCli } = makeRouter();
     await svc.generateReply(GROUP_CFG, 'Дмитрий', undefined, undefined, '/tmp/sandbox-x', { productsOwner: OWNER });
 
     const opts = optsOf(claudeCli);
-    expect(String(opts.allowedTools).split(',').sort()).toEqual([...WEB, TOOL].sort());
+    expect(String(opts.allowedTools).split(',').sort()).toEqual([...WEB, TOOL, REPORT].sort());
     // --tools — только встроенные: MCP-инструмент доступен и без него (проба CLI 2.1.280).
     expect(opts.tools).toBe('Read,WebSearch,WebFetch');
   });

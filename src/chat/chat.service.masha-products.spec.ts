@@ -104,9 +104,9 @@ describe('Маша в вебе: инструмент продуктов', () => 
     expect(verifyProductToolToken(bearer.replace(/^Bearer /, ''))).toEqual({ userId: USER, channel: 'web' });
   });
 
-  it('автоодобрены ровно продукты и поиск файлов, встроенные тулы не включаются', async () => {
+  it('автоодобрены ровно продукты, поиск файлов и сообщение в поддержку, встроенные тулы не включаются', async () => {
     const { opts } = await runMasha();
-    expect(opts.allowedTools).toBe('mcp__products__manage_product,mcp__products__find_files');
+    expect(opts.allowedTools).toBe('mcp__products__manage_product,mcp__products__find_files,mcp__products__report_problem');
     // tools не задан — сервис оставит `--tools ""`: у Маши нет ни Read, ни Bash.
     expect(opts.tools === undefined || opts.tools === '').toBe(true);
   });

@@ -2,7 +2,8 @@ import 'reflect-metadata';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PATH_METADATA } from '@nestjs/common/constants';
-import { productsCliMcp, PRODUCTS_CLI_TOOL_NAME } from './products-cli-tool';
+import { productsCliMcp, PRODUCTS_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME } from './products-cli-tool';
+import { REPORT_PROBLEM_TOOL_NAME } from '../problem-report/report-problem.tool';
 import { verifyProductToolToken } from './product-tool.token';
 import { PRODUCT_TOOL_NAME } from './product-tool.service';
 import { ProductsMcpController } from '../mcp/products-mcp.controller';
@@ -83,6 +84,12 @@ describe('инструмент продуктов для локального CL
     expect(r.toolName).toBe(`mcp__products__${PRODUCT_TOOL_NAME}`);
     expect(r.toolName).toBe('mcp__products__manage_product');
     expect(PRODUCTS_CLI_TOOL_NAME).toBe(r.toolName);
+  });
+
+  // Разъедется с контрактом точки — allowedTools не совпадёт, и вызов молча отклонится.
+  it('имя «сообщить в поддержку» CLI сложит из того же ключа и контракта', () => {
+    expect(REPORT_PROBLEM_CLI_TOOL_NAME).toBe(`mcp__products__${REPORT_PROBLEM_TOOL_NAME}`);
+    expect(REPORT_PROBLEM_CLI_TOOL_NAME).toBe('mcp__products__report_problem');
   });
 
   // CLI 2.1.280 знает у http-сервера поле `timeout` — потолок одного вызова
