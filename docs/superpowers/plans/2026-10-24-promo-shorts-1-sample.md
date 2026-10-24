@@ -60,7 +60,7 @@
 **Files:**
 - Create: `studio/scripts/node-run.sh`
 
-- [ ] **Step 1: Написать скрипт**
+- [x] **Step 1: Написать скрипт**
 
 `studio/scripts/node-run.sh`:
 
@@ -80,7 +80,7 @@ ssh -o ConnectTimeout=15 dv@85.192.61.231 \
   "set -e; cd ~/ci/wt/promo-shorts && git fetch -q origin && git checkout -q --detach ${sha} && cd studio && source ~/.nvm/nvm.sh >/dev/null && ${cmd}"
 ```
 
-- [ ] **Step 2: Сделать исполняемым и закоммитить**
+- [x] **Step 2: Сделать исполняемым и закоммитить**
 
 ```bash
 WT=/Users/dmitry/Downloads/spirits_back/.worktrees/promo-shorts
@@ -90,7 +90,7 @@ git -C "$WT" commit -q -m "chore(studio): прогон на тестовой н�
 git -C "$WT" push -q -u origin feat/promo-shorts
 ```
 
-- [ ] **Step 3: Завести воркдерево на ноде**
+- [x] **Step 3: Завести воркдерево на ноде**
 
 ```bash
 SHA=$(git -C "$WT" rev-parse HEAD)
@@ -108,7 +108,7 @@ Expected: строка с коммитом `chore(studio): прогон на т�
 - Create: `studio/src/guard.ts`
 - Test: `studio/src/guard.test.ts`
 
-- [ ] **Step 1: Каркас пакета**
+- [x] **Step 1: Каркас пакета**
 
 `studio/package.json`:
 
@@ -190,7 +190,7 @@ YANDEX_SPEECHKIT_API_KEY=
 YANDEX_TTS_FOLDER_ID=
 ```
 
-- [ ] **Step 2: Написать падающий тест**
+- [x] **Step 2: Написать падающий тест**
 
 `studio/src/guard.test.ts`:
 
@@ -213,14 +213,14 @@ test('пустой и короткий номер отклоняются', () =>
 });
 ```
 
-- [ ] **Step 3: Закоммитить красный тест**
+- [x] **Step 3: Закоммитить красный тест**
 
 ```bash
 git -C "$WT" add studio/package.json studio/tsconfig.json studio/.gitignore studio/.env.example studio/src/guard.test.ts
 git -C "$WT" commit -q -m "test(studio): демо-номер только из тестового шаблона (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
 
-- [ ] **Step 4: Поставить зависимости на ноде и убедиться, что тест падает**
+- [x] **Step 4: Поставить зависимости на ноде и убедиться, что тест падает**
 
 ```bash
 "$WT/studio/scripts/node-run.sh" "npm install --no-audit --no-fund && npx playwright install chromium && npm test"
@@ -228,7 +228,7 @@ git -C "$WT" commit -q -m "test(studio): демо-номер только из �
 
 Expected: `npm install` проходит. `npm test` падает с ошибкой вида `Cannot find module '…/src/guard'`.
 
-- [ ] **Step 5: Забрать lock-файл с ноды**
+- [x] **Step 5: Забрать lock-файл с ноды**
 
 `npm install` создал `package-lock.json` на ноде; его коммитим, чтобы дальше ставить через `npm ci`.
 
@@ -236,7 +236,7 @@ Expected: `npm install` проходит. `npm test` падает с ошибк�
 scp dv@85.192.61.231:ci/wt/promo-shorts/studio/package-lock.json "$WT/studio/package-lock.json"
 ```
 
-- [ ] **Step 6: Реализация**
+- [x] **Step 6: Реализация**
 
 `studio/src/guard.ts`:
 
@@ -257,7 +257,7 @@ export function assertDemoPhone(phone: string): string {
 }
 ```
 
-- [ ] **Step 7: Тест проходит**
+- [x] **Step 7: Тест проходит**
 
 Неотслеживаемый lock на ноде мешает `git checkout` коммита, в котором lock уже есть, поэтому сначала его убрать:
 
@@ -279,7 +279,7 @@ Expected: `# pass 3`, `# fail 0`.
 - Test: `studio/src/timeline.test.ts`
 - Modify: `studio/package.json` (скрипт `test`)
 
-- [ ] **Step 1: Типы**
+- [x] **Step 1: Типы**
 
 `studio/src/types.ts`:
 
@@ -383,7 +383,7 @@ export type ShortProps = {
 };
 ```
 
-- [ ] **Step 2: Падающий тест**
+- [x] **Step 2: Падающий тест**
 
 `studio/src/timeline.test.ts`:
 
@@ -464,7 +464,7 @@ test('ролик короче 30 с и длиннее 60 с не собирае�
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts",
 ```
 
-- [ ] **Step 3: Красный коммит и прогон**
+- [x] **Step 3: Красный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/types.ts studio/src/timeline.test.ts studio/package.json
@@ -474,7 +474,7 @@ git -C "$WT" commit -q -m "test(studio): таймлайн ролика по дл
 
 Expected: FAIL — `Cannot find module '…/src/timeline'`.
 
-- [ ] **Step 4: Реализация**
+- [x] **Step 4: Реализация**
 
 `studio/src/timeline.ts`:
 
@@ -535,7 +535,7 @@ export function buildTimeline(lines: VoicedLine[], fps = FPS): Timeline {
 }
 ```
 
-- [ ] **Step 5: Зелёный коммит и прогон**
+- [x] **Step 5: Зелёный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/timeline.ts
@@ -554,7 +554,7 @@ Expected: `# pass 9`, `# fail 0`.
 - Test: `studio/src/captions.test.ts`
 - Modify: `studio/package.json` (скрипт `test`)
 
-- [ ] **Step 1: Падающий тест**
+- [x] **Step 1: Падающий тест**
 
 `studio/src/captions.test.ts`:
 
@@ -597,7 +597,7 @@ test('кадров меньше, чем кусков, — вся реплика 
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts",
 ```
 
-- [ ] **Step 2: Красный коммит и прогон**
+- [x] **Step 2: Красный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/captions.test.ts studio/package.json
@@ -607,7 +607,7 @@ git -C "$WT" commit -q -m "test(studio): субтитры по словам и �
 
 Expected: FAIL — `Cannot find module '…/src/captions'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `studio/src/captions.ts`:
 
@@ -666,7 +666,7 @@ export function captionCues(chunks: string[], from: number, duration: number): C
 }
 ```
 
-- [ ] **Step 4: Зелёный коммит и прогон**
+- [x] **Step 4: Зелёный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/captions.ts
@@ -685,7 +685,7 @@ Expected: `# pass 14`, `# fail 0`.
 - Test: `studio/src/pan.test.ts`
 - Modify: `studio/package.json` (скрипт `test`)
 
-- [ ] **Step 1: Падающий тест**
+- [x] **Step 1: Падающий тест**
 
 `studio/src/pan.test.ts`:
 
@@ -719,7 +719,7 @@ test('картинка ниже кадра не двигается', () => {
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts",
 ```
 
-- [ ] **Step 2: Красный коммит и прогон**
+- [x] **Step 2: Красный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/pan.test.ts studio/package.json
@@ -729,7 +729,7 @@ git -C "$WT" commit -q -m "test(studio): сдвиг высокого скрин�
 
 Expected: FAIL — `Cannot find module '…/src/pan'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `studio/src/pan.ts`:
 
@@ -752,7 +752,7 @@ export function panOffset(o: {
 }
 ```
 
-- [ ] **Step 4: Зелёный коммит и прогон**
+- [x] **Step 4: Зелёный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/pan.ts
@@ -771,7 +771,7 @@ Expected: `# pass 18`, `# fail 0`.
 - Test: `studio/src/boxes.test.ts`
 - Modify: `studio/package.json` (скрипт `test`)
 
-- [ ] **Step 1: Падающий тест**
+- [x] **Step 1: Падающий тест**
 
 `studio/src/boxes.test.ts`:
 
@@ -831,7 +831,7 @@ test('блок за низом картинки не попадает в спи�
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts",
 ```
 
-- [ ] **Step 2: Красный коммит и прогон**
+- [x] **Step 2: Красный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/boxes.test.ts studio/package.json
@@ -841,7 +841,7 @@ git -C "$WT" commit -q -m "test(studio): абзацы ответа в пиксе
 
 Expected: FAIL — `Cannot find module '…/src/boxes'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `studio/src/boxes.ts`:
 
@@ -876,7 +876,7 @@ export function toImageBoxes(rects: CssRect[], scale: number, imageHeight = Infi
 }
 ```
 
-- [ ] **Step 4: Зелёный коммит и прогон**
+- [x] **Step 4: Зелёный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/boxes.ts
@@ -895,7 +895,7 @@ Expected: `# pass 22`, `# fail 0`.
 - Test: `studio/src/plural.test.ts`
 - Modify: `studio/package.json` (скрипт `test`)
 
-- [ ] **Step 1: Падающий тест**
+- [x] **Step 1: Падающий тест**
 
 `studio/src/plural.test.ts`:
 
@@ -921,7 +921,7 @@ test('форма слова — по категориям Intl.PluralRules', () 
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts",
 ```
 
-- [ ] **Step 2: Красный коммит и прогон**
+- [x] **Step 2: Красный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/plural.test.ts studio/package.json
@@ -931,7 +931,7 @@ git -C "$WT" commit -q -m "test(studio): число ассистентов сл�
 
 Expected: FAIL — `Cannot find module '…/src/plural'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `studio/src/plural.ts`:
 
@@ -951,7 +951,7 @@ export function assistantsLabel(n: number): string {
 }
 ```
 
-- [ ] **Step 4: Зелёный коммит и прогон**
+- [x] **Step 4: Зелёный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/plural.ts
@@ -970,7 +970,7 @@ Expected: `# pass 23`, `# fail 0`.
 - Test: `studio/src/script.test.ts`
 - Modify: `studio/package.json` (скрипт `test`)
 
-- [ ] **Step 1: Падающий тест**
+- [x] **Step 1: Падающий тест**
 
 `studio/src/script.test.ts`:
 
@@ -1040,7 +1040,7 @@ test('повтор id и пустая реплика', () => {
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts",
 ```
 
-- [ ] **Step 2: Красный коммит и прогон**
+- [x] **Step 2: Красный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/script.test.ts studio/package.json
@@ -1050,7 +1050,7 @@ git -C "$WT" commit -q -m "test(studio): проверка сценария до 
 
 Expected: FAIL — `Cannot find module '…/src/script'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `studio/src/script.ts`:
 
@@ -1088,7 +1088,7 @@ export function validateScript(script: Script, capture: Pick<CaptureResult, 'box
 }
 ```
 
-- [ ] **Step 4: Зелёный коммит и прогон**
+- [x] **Step 4: Зелёный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/script.ts
@@ -1107,7 +1107,7 @@ Expected: `# pass 28`, `# fail 0`.
 - Test: `studio/src/answer.test.ts`
 - Modify: `studio/package.json` (скрипт `test`)
 
-- [ ] **Step 1: Падающий тест**
+- [x] **Step 1: Падающий тест**
 
 `studio/src/answer.test.ts`:
 
@@ -1139,7 +1139,7 @@ test('подробный ответ годится', () => {
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts src/answer.test.ts",
 ```
 
-- [ ] **Step 2: Красный коммит и прогон**
+- [x] **Step 2: Красный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/answer.test.ts studio/package.json
@@ -1149,7 +1149,7 @@ git -C "$WT" commit -q -m "test(studio): годность ответа и вст
 
 Expected: FAIL — `Cannot find module '…/src/answer'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `studio/src/answer.ts`:
 
@@ -1173,7 +1173,7 @@ export function answerProblems(answer: string, minChars: number): string[] {
 }
 ```
 
-- [ ] **Step 4: Зелёный коммит и прогон**
+- [x] **Step 4: Зелёный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/answer.ts
@@ -1192,7 +1192,7 @@ Expected: `# pass 31`, `# fail 0`.
 - Test: `studio/src/ffprobe.test.ts`
 - Modify: `studio/package.json` (скрипт `test`)
 
-- [ ] **Step 1: Падающий тест**
+- [x] **Step 1: Падающий тест**
 
 `studio/src/ffprobe.test.ts`:
 
@@ -1245,7 +1245,7 @@ test('проверка ловит длину, кадр, отсутствие з�
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts src/answer.test.ts src/ffprobe.test.ts",
 ```
 
-- [ ] **Step 2: Красный коммит и прогон**
+- [x] **Step 2: Красный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/ffprobe.test.ts studio/package.json
@@ -1255,7 +1255,7 @@ git -C "$WT" commit -q -m "test(studio): проверка ролика по ffpr
 
 Expected: FAIL — `Cannot find module '…/src/ffprobe'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `studio/src/ffprobe.ts`:
 
@@ -1362,7 +1362,7 @@ export async function audioDurationMs(file: string): Promise<number> {
 }
 ```
 
-- [ ] **Step 4: Зелёный коммит и прогон**
+- [x] **Step 4: Зелёный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/ffprobe.ts
@@ -1381,7 +1381,7 @@ Expected: `# pass 35`, `# fail 0`.
 - Test: `studio/src/config.test.ts`
 - Modify: `studio/package.json` (скрипт `test`)
 
-- [ ] **Step 1: Падающий тест**
+- [x] **Step 1: Падающий тест**
 
 `studio/src/config.test.ts`:
 
@@ -1433,7 +1433,7 @@ test('для озвучки нужны ключи SpeechKit', () => {
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts src/answer.test.ts src/ffprobe.test.ts src/config.test.ts",
 ```
 
-- [ ] **Step 2: Красный коммит и прогон**
+- [x] **Step 2: Красный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/config.test.ts studio/package.json
@@ -1443,7 +1443,7 @@ git -C "$WT" commit -q -m "test(studio): разбор окружения сту�
 
 Expected: FAIL — `Cannot find module '…/src/config'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `studio/src/config.ts`:
 
@@ -1495,7 +1495,7 @@ export function parseConfig(env: Env, needs: { capture: boolean; tts: boolean })
 }
 ```
 
-- [ ] **Step 4: Зелёный коммит и прогон**
+- [x] **Step 4: Зелёный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/config.ts
@@ -1514,7 +1514,7 @@ Expected: `# pass 40`, `# fail 0`.
 - Test: `studio/src/tts.test.ts`
 - Modify: `studio/package.json` (скрипт `test`)
 
-- [ ] **Step 1: Падающий тест**
+- [x] **Step 1: Падающий тест**
 
 `studio/src/tts.test.ts`:
 
@@ -1546,7 +1546,7 @@ test('кеш срабатывает только при совпадении к�
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts src/answer.test.ts src/ffprobe.test.ts src/config.test.ts src/tts.test.ts",
 ```
 
-- [ ] **Step 2: Красный коммит и прогон**
+- [x] **Step 2: Красный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/tts.test.ts studio/package.json
@@ -1556,7 +1556,7 @@ git -C "$WT" commit -q -m "test(studio): кеш озвучки SpeechKit (кра
 
 Expected: FAIL — `Cannot find module '…/src/tts'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `studio/src/tts.ts`:
 
@@ -1634,7 +1634,7 @@ export async function synthesizeAll(reqs: TtsRequest[], dir: string, creds: { ap
 }
 ```
 
-- [ ] **Step 4: Зелёный коммит и прогон**
+- [x] **Step 4: Зелёный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/tts.ts
@@ -1653,7 +1653,7 @@ Expected: `# pass 42`, `# fail 0`.
 - Test: `studio/src/render/props.test.ts`
 - Modify: `studio/package.json` (скрипт `test`)
 
-- [ ] **Step 1: Падающий тест**
+- [x] **Step 1: Падающий тест**
 
 `studio/src/render/props.test.ts`:
 
@@ -1716,7 +1716,7 @@ test('реплика без озвучки — ошибка', () => {
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts src/answer.test.ts src/ffprobe.test.ts src/config.test.ts src/tts.test.ts src/render/props.test.ts",
 ```
 
-- [ ] **Step 2: Красный коммит и прогон**
+- [x] **Step 2: Красный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/render/props.test.ts studio/package.json
@@ -1726,7 +1726,7 @@ git -C "$WT" commit -q -m "test(studio): пропсы композиции из 
 
 Expected: FAIL — `Cannot find module '…/src/render/props'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `studio/src/render/props.ts`:
 
@@ -1761,7 +1761,7 @@ export function buildProps(capture: CaptureResult, script: Script, voiced: TtsRe
 }
 ```
 
-- [ ] **Step 4: Зелёный коммит и прогон**
+- [x] **Step 4: Зелёный коммит и прогон**
 
 ```bash
 git -C "$WT" add studio/src/render/props.ts
@@ -1781,7 +1781,7 @@ Expected: `# pass 44`, `# fail 0`.
 - Create: `studio/public/logo.png` (копия `spirits_front/public/android-chrome-512x512.png`, 512×512, прозрачный фон)
 - Create: `studio/src/remotion/theme.ts`, `Caption.tsx`, `scenes/Hook.tsx`, `scenes/Question.tsx`, `scenes/Answer.tsx`, `scenes/Final.tsx`, `Short.tsx`, `Root.tsx`, `index.ts`
 
-- [ ] **Step 1: Логотип**
+- [x] **Step 1: Логотип**
 
 ```bash
 mkdir -p "$WT/studio/public"
@@ -1791,7 +1791,7 @@ file "$WT/studio/public/logo.png"
 
 Expected: `PNG image data, 512 x 512, 8-bit/color RGBA`.
 
-- [ ] **Step 2: Тема**
+- [x] **Step 2: Тема**
 
 `studio/src/remotion/theme.ts`:
 
@@ -1818,7 +1818,7 @@ export const C = {
 };
 ```
 
-- [ ] **Step 3: Субтитры**
+- [x] **Step 3: Субтитры**
 
 `studio/src/remotion/Caption.tsx`:
 
@@ -1862,7 +1862,7 @@ export const Captions: React.FC<{ segments: Segment[] }> = ({ segments }) => (
 );
 ```
 
-- [ ] **Step 4: Сцены**
+- [x] **Step 4: Сцены**
 
 `studio/src/remotion/scenes/Hook.tsx`:
 
@@ -2054,7 +2054,7 @@ export const Final: React.FC<{ assistantsCount: number; disclaimer?: string }> =
 };
 ```
 
-- [ ] **Step 5: Композиция, корень, точка входа**
+- [x] **Step 5: Композиция, корень, точка входа**
 
 `studio/src/remotion/Short.tsx`:
 
@@ -2162,7 +2162,7 @@ import { RemotionRoot } from './Root';
 registerRoot(RemotionRoot);
 ```
 
-- [ ] **Step 6: Проверка типов**
+- [x] **Step 6: Проверка типов**
 
 ```bash
 git -C "$WT" add studio/public/logo.png studio/src/remotion
@@ -2180,7 +2180,7 @@ Expected: `tsc` без ошибок; `# pass 44`, `# fail 0`.
 - Create: `studio/src/render/run-render.ts`
 - Create: `studio/src/render/render.fixture.ts`
 
-- [ ] **Step 1: Сквозной тест на фикстуре (красный)**
+- [x] **Step 1: Сквозной тест на фикстуре (красный)**
 
 `studio/src/render/render.fixture.ts`:
 
@@ -2265,7 +2265,7 @@ git -C "$WT" commit -q -m "test(studio): сквозной рендер фикс�
 
 Expected: FAIL — `Cannot find module '…/src/render/run-render'`.
 
-- [ ] **Step 2: Команда render**
+- [x] **Step 2: Команда render**
 
 `studio/src/render/run-render.ts`:
 
@@ -2335,7 +2335,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
 }
 ```
 
-- [ ] **Step 3: Рендер фикстуры проходит**
+- [x] **Step 3: Рендер фикстуры проходит**
 
 Первый запуск скачивает Chrome Headless Shell для Remotion (~100 МБ) и шрифт Nunito — это нормально.
 
@@ -2347,7 +2347,7 @@ git -C "$WT" commit -q -m "feat(studio): команда render — озвучк�
 
 Expected: строка `fixture: /tmp/studio-fixture-XXXXXX`, затем `# pass 1`, `# fail 0`.
 
-- [ ] **Step 4: Посмотреть кадры фикстуры**
+- [x] **Step 4: Посмотреть кадры фикстуры**
 
 Подставить путь из строки `fixture:`:
 
@@ -2373,7 +2373,7 @@ scp "dv@85.192.61.231:${FIX}/frame-*.png" /private/tmp/claude-501/-Users-dmitry-
 **Files:**
 - Create: `studio/src/capture/login.ts`, `studio/src/capture/chat-scene.ts`, `studio/src/capture/run-capture.ts`
 
-- [ ] **Step 1: Вход через API**
+- [x] **Step 1: Вход через API**
 
 `studio/src/capture/login.ts`:
 
@@ -2465,7 +2465,7 @@ export async function countAssistants(cfg: StudioConfig): Promise<number> {
 }
 ```
 
-- [ ] **Step 2: Съёмка сцены чата**
+- [x] **Step 2: Съёмка сцены чата**
 
 `studio/src/capture/chat-scene.ts`:
 
@@ -2678,7 +2678,7 @@ export async function captureChat(
 }
 ```
 
-- [ ] **Step 3: Команда capture**
+- [x] **Step 3: Команда capture**
 
 `studio/src/capture/run-capture.ts`:
 
@@ -2719,7 +2719,7 @@ if (!result) {
 }
 ```
 
-- [ ] **Step 4: Проверка типов и коммит**
+- [x] **Step 4: Проверка типов и коммит**
 
 ```bash
 git -C "$WT" add studio/src/capture
@@ -2737,7 +2737,7 @@ Expected: `tsc` без ошибок; `# pass 44`, `# fail 0`.
 - Create: `studio/scenes/sample-lawyer-lease.json`
 - На ноде (не в git): `~/ci/wt/promo-shorts/studio/.env`
 
-- [ ] **Step 1: Окружение студии на ноде**
+- [x] **Step 1: Окружение студии на ноде**
 
 Секреты не печатаются: значения идут из файлов прямо в `.env`, на экран — только имена переменных. Живой `~/spirits_back/.env` только читается.
 
@@ -2757,7 +2757,7 @@ Expected — семь имён: `CABINET_URL`, `API_URL`, `DEMO_PHONE`, `DEBUG_S
 
 Номер `79030000001` выбран намеренно: e2e-тесты генерируют номера `790300` + 10000…99999 (`generateTempReferralPhone`), с ними он не пересечётся.
 
-- [ ] **Step 2: Сцена образца**
+- [x] **Step 2: Сцена образца**
 
 `studio/scenes/sample-lawyer-lease.json` (Алексей — id 10 и на стенде, и на проде; голос `madirus` по `src/speech/voices.ts`):
 
@@ -2779,7 +2779,7 @@ git -C "$WT" add studio/scenes/sample-lawyer-lease.json
 git -C "$WT" commit -q -m "feat(studio): сцена ролика-образца — юрист и договор аренды" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
 
-- [ ] **Step 3: Проба — вход и открытие чата**
+- [x] **Step 3: Проба — вход и открытие чата**
 
 ```bash
 "$WT/studio/scripts/node-run.sh" "npm run capture -- scenes/sample-lawyer-lease.json --probe"
@@ -2810,7 +2810,7 @@ scp "dv@85.192.61.231:${RUN}/probe.png" "$SP/probe.png"
 - Create: `studio/scenes/sample-lawyer-lease.script.json` (копия сценария образца для истории)
 - На ноде: `out/sample-lawyer-lease-…/script.json`
 
-- [ ] **Step 1: Съёмка**
+- [x] **Step 1: Съёмка**
 
 ```bash
 "$WT/studio/scripts/node-run.sh" "npm run capture -- scenes/sample-lawyer-lease.json"
@@ -2818,7 +2818,7 @@ scp "dv@85.192.61.231:${RUN}/probe.png" "$SP/probe.png"
 
 Expected: `capture: готово → …/out/sample-lawyer-lease-… (ходов: 1 или 2, абзацев: N)` и список абзацев `[1] …`, `[2] …`. Ответ юриста идёт до нескольких минут — это нормально.
 
-- [ ] **Step 2: Посмотреть снятое**
+- [x] **Step 2: Посмотреть снятое**
 
 ```bash
 RUN=$(ssh dv@85.192.61.231 'ls -td ~/ci/wt/promo-shorts/studio/out/sample-lawyer-lease-* | head -1')
@@ -2829,7 +2829,7 @@ for f in question.png answer.png capture.json; do scp "dv@85.192.61.231:${RUN}/$
 
 Открыть `question.png` и `answer.png` инструментом Read, прочитать `capture.json`. Проверить: на `question.png` виден пузырь вопроса, на `answer.png` — весь ответ, без обрезки снизу; в `boxes` номера абзацев совпадают с тем, что видно на картинке сверху вниз.
 
-- [ ] **Step 3: Написать сценарий по настоящему ответу**
+- [x] **Step 3: Написать сценарий по настоящему ответу**
 
 Файл `$SP/script.json`. Правила (из спеки, раздел «Правила текста»):
 
@@ -2863,7 +2863,7 @@ for f in question.png answer.png capture.json; do scp "dv@85.192.61.231:${RUN}/$
 
 Длина ролика складывается из озвучки и обязана попасть в 30–60 с: при темпе 1.1 это примерно 70–130 слов на все реплики. Если `render` в задаче 18 скажет «короче 30 с» или «длиннее 60 с», поправить реплики `answer` и повторить рендер: неизменённые реплики не озвучиваются заново.
 
-- [ ] **Step 4: Положить сценарий в папку съёмки и сохранить копию в git**
+- [x] **Step 4: Положить сценарий в папку съёмки и сохранить копию в git**
 
 ```bash
 scp "$SP/script.json" "dv@85.192.61.231:${RUN}/script.json"
@@ -2876,7 +2876,7 @@ git -C "$WT" commit -q -m "feat(studio): сценарий ролика-обра�
 
 ### Task 18: Рендер образца и передача владельцу
 
-- [ ] **Step 1: Рендер**
+- [x] **Step 1: Рендер**
 
 `RUN` — путь папки съёмки из задачи 17. В `node-run.sh` команда выполняется в `studio/`, поэтому путь — относительно неё:
 
@@ -2887,7 +2887,7 @@ REL="out/$(basename "$RUN")"
 
 Expected: `render: готово → …/video.mp4 (обложка …/cover.jpg)`, код выхода 0. При «проверка файла не прошла» — прочитать список: «тишина N с» значит, что реплика не прозвучала (проверить `voice/manifest.json` и mp3); длина вне 30–60 с — поправить сценарий (задача 17, шаг 3).
 
-- [ ] **Step 2: Кадры для самопроверки**
+- [x] **Step 2: Кадры для самопроверки**
 
 ```bash
 ssh dv@85.192.61.231 "cd ${RUN} && D=\$(ffprobe -v error -show_entries format=duration -of csv=p=0 video.mp4) && for p in 0.03 0.12 0.35 0.6 0.85 0.97; do t=\$(awk -v d=\"\$D\" -v p=\"\$p\" 'BEGIN{print d*p}'); ffmpeg -hide_banner -loglevel error -y -ss \$t -i video.mp4 -frames:v 1 -vf scale=540:-1 frame-\$p.png; done && ls frame-*.png && echo \$D"
@@ -2902,7 +2902,7 @@ scp "dv@85.192.61.231:${RUN}/frame-*.png" "$SP/"
 
 Найденные огрехи исправить в `src/remotion/*` (`fix(studio): …`), повторить шаги 1–2.
 
-- [ ] **Step 3: Отдать ролик владельцу**
+- [x] **Step 3: Отдать ролик владельцу**
 
 ```bash
 mkdir -p /Users/dmitry/Downloads/linkeon_shorts
@@ -2920,7 +2920,7 @@ ls -la /Users/dmitry/Downloads/linkeon_shorts/
 **Files:**
 - Create: `studio/README.md`
 
-- [ ] **Step 1: README**
+- [x] **Step 1: README**
 
 `studio/README.md`:
 
@@ -2961,7 +2961,7 @@ studio/scripts/node-run.sh "npm run render -- out/<папка-съёмки>"
 (remotion.pro/license).
 ````
 
-- [ ] **Step 2: Коммит и пуш**
+- [x] **Step 2: Коммит и пуш**
 
 ```bash
 git -C "$WT" add studio/README.md
