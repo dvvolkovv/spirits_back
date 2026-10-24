@@ -56,10 +56,15 @@ const USER_SIDE_PHRASES = [
   'file too large',
   // модерация запроса
   'отклонён модерацией',
-  // лимиты самого пользователя
+  // лимиты самого пользователя — подстрока узкая: провайдеры тоже пишут
+  // "rate limit reached" в текстах своих 429 (напр. OpenAI TTS в
+  // speech.service.ts, который отдаёт текст провайдера как есть) — это сбой
+  // провайдера, а не лимит пользователя, и с голой 'limit reached' склеилось
+  // бы с ним. Наша проверка — только routine-store.service.ts: `limit
+  // reached: не больше ${MAX_ROUTINES_PER_USER} рутин`.
   'too many concurrent jobs',
   'own voice not ready',
-  'limit reached',
+  'limit reached: не больше',
   // чужое, несуществующее или не в том состоянии
   'job not found',
   'not your job',

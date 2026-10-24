@@ -24,6 +24,10 @@ describe('isUserSideToolError: виноват ли не сервис', () => {
     'не удалось прочитать календарь',
     'connect ECONNREFUSED 127.0.0.1:5433',
     'timeout of 30000ms exceeded',
+    '429 Rate limit reached for tts-1 in organization org-test on requests per min (RPM): Limit 50, Used 50, Requested 1.',
+    'Omni generate failed: Internal error encountered.',
+    'Видео: временный лимит частоты запросов. Можно повторить примерно через 57 сек.',
+    'Видео: на сегодня исчерпан дневной лимит генераций видео. Лимит обновляется раз в сутки около 10:00–11:00 МСК — попробуйте позже. (админу: повысить квоту Gemini Omni для ключа в Google AI Studio / Cloud Console.)',
   ])('сбой: %s', (error) => {
     expect(isUserSideToolError(error)).toBe(false);
   });
