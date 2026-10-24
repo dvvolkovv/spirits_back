@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseProbe, parseSilences, verifyVideo } from './ffprobe';
+import { parseProbe, parseSilences, toDurationMs, verifyVideo } from './ffprobe';
 
 const PROBE = JSON.stringify({
   format: { duration: '41.633333' },
@@ -37,4 +37,17 @@ test('проверка ловит длину, кадр, отсутствие з�
   assert.match(all, /кадр 720×1280/);
   assert.match(all, /нет звуковой дорожки/);
   assert.match(all, /тишина 3.0 с с 10.0 с/);
+});
+
+test('неопределённая длительность — проблема, а не тихий пропуск', () => {
+  const probe = parseProbe(
+    JSON.stringify({ format: { duration: 'N/A' }, streams: [{ codec_type: 'video', width: 1080, height: 1920 }, { codec_type: 'audio' }] }),
+  );
+  assert.deepEqual(verifyVideo(probe, []), ['длина не определена — ffprobe не вернул длительность']);
+});
+
+test('длительность озвучки без числа — ошибка с именем файла', () => {
+  assert.equal(toDurationMs(1.2345, 'a.mp3'), 1235);
+  assert.throws(() => toDurationMs(Number.NaN, 'voice/l1.mp3'), /voice\/l1\.mp3/);
+  assert.throws(() => toDurationMs(0, 'voice/l1.mp3'), /длительность/);
 });
