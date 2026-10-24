@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
+import { sendTelegramPayload } from '../common/telegram-alert';
 
 export interface EscalationPayload {
   ticketId: string;
@@ -114,6 +115,17 @@ export class TelegramNotifierService {
       ]],
     };
 
+    // TELEGRAM_SUPPORT_CHAT_ID пропал из .env прода 18.05.2026, и эскалации
+    // ИИ-поддержки с тех пор молча оседали в логе («telegram not configured —
+    // skipping»), в том числе 15.08 — «не может пополнить токены». Без своего
+    // чата эскалация уходит тем же путём, что и все алерты (TELEGRAM_CHAT_ID →
+    // группа «Поддержка linkeon»), — как ответ пользователя в тикете
+    // (SupportService.notifyOwnerOfUserReply). Здоровье сервисов так не шлём:
+    // там ~4 ложных сообщения в день о плановом обновлении OAuth.
+    if (!this.isConfigured()) {
+      await sendTelegramPayload({ text, parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: replyMarkup });
+      return;
+    }
     await this.send(text, replyMarkup);
   }
 

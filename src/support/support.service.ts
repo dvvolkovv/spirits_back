@@ -13,6 +13,7 @@ import {
 } from './support.dto';
 import { TelegramNotifierService } from './telegram-notifier.service';
 import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
+import { clip, escapeHtml } from '../problem-report/problem-format';
 import { VideoService } from '../video/video.service';
 import { CreateVideoJobDto, isVeoModel } from '../video/video.dto';
 import { MailService } from '../common/services/mail.service';
@@ -245,10 +246,11 @@ export class SupportService implements OnModuleInit {
     // чтобы сообщение, ждущее живого оператора, не осталось незамеченным.
     if (!process.env.TELEGRAM_SUPPORT_CHAT_ID && telegramConfigured()) {
       const link = `${process.env.ADMIN_ORIGIN || 'https://my.linkeon.io'}/admin`;
+      // Экранируем: `<` или `&` в ответе пользователя заставили бы Telegram отвергнуть сообщение.
       await sendTelegramAlert(
         `🆘 <b>Поддержка: сообщение ждёт оператора</b>\n` +
-        `Клиент: ${name}\nТикет: <code>${ticketId}</code> (${status})\n` +
-        `«${text.slice(0, 300)}»\n\nОткрыть: ${link}`,
+        `Клиент: ${escapeHtml(name)}\nТикет: <code>${ticketId}</code> (${status})\n` +
+        `«${escapeHtml(clip(text, 300))}»\n\nОткрыть: ${link}`,
       ).catch(() => {});
     }
     await this.pg.query(
