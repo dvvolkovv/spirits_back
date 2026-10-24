@@ -5,7 +5,7 @@ import { emptySignals } from './insights.types';
 const week = weekOf('2026-10-19');
 
 function harness(
-  over: { labelText?: string[]; synthText?: string[]; claudeError?: string; lock?: boolean; attempts?: number; rerun?: boolean } = {},
+  over: { labelText?: string[]; synthText?: string[]; claudeError?: string; lock?: boolean; attempts?: number; rerun?: boolean; active?: string } = {},
 ) {
   const calls: Array<{ prompt: string; opts: any }> = [];
   const labelQueue = [...(over.labelText ?? ['[{"conv":1,"items":[{"type":"confused","about":"путает два вида ботов","severity":2}]}]'])];
@@ -28,6 +28,8 @@ function harness(
   const pg = { tryAdvisoryLock: jest.fn(async () => (over.lock === false ? null : lock)) };
   const order: string[] = [];
   const store = {
+    activeRun: jest.fn(async () => (over.active ?? null) as string | null),
+    createRun: jest.fn(async () => 'run-new'),
     weekHasResults: jest.fn(async () => over.rerun ?? false),
     resetWeek: jest.fn(async () => {
       order.push('reset');
@@ -64,6 +66,14 @@ function harness(
   const svc = new InsightsService(store as any, collector as any, claude as any, pg as any, tg as any);
   return { svc, calls, store, tg, lock, claude, order };
 }
+
+describe('InsightsService.startManual', () => {
+  it('второй клик, пока прогон недели идёт, возвращает его, а не заводит новый', async () => {
+    const h = harness({ active: 'run-busy' });
+    await expect(h.svc.startManual(week)).resolves.toBe('run-busy');
+    expect(h.store.createRun).not.toHaveBeenCalled();
+  });
+});
 
 describe('InsightsService.execute', () => {
   const env = { ...process.env };

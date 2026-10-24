@@ -78,6 +78,21 @@ export class InsightsStore implements OnModuleInit {
     return r.rows.length > 0;
   }
 
+  /**
+   * Идущий или отложенный прогон недели. Строки прогонов не уникальны по неделе
+   * сознательно — ручной повтор после правки разметки законен (он заменяет
+   * итоги недели); но второй клик по уже идущему прогону его не дублирует.
+   */
+  async activeRun(weekStart: string): Promise<string | null> {
+    const r = await this.pg.query(
+      `SELECT id::text AS id FROM insights_runs
+        WHERE week_start = $1::date AND status IN ('running', 'postponed')
+        ORDER BY started_at DESC LIMIT 1`,
+      [weekStart],
+    );
+    return r.rows[0]?.id ?? null;
+  }
+
   async createRun(weekStart: string, manual: boolean): Promise<string> {
     const r = await this.pg.query(
       `INSERT INTO insights_runs (week_start, manual, status) VALUES ($1::date, $2, 'running') RETURNING id::text AS id`,
@@ -278,6 +293,18 @@ export class InsightsStore implements OnModuleInit {
       weeks: Number(x.weeks ?? 0),
       runFindingIds: x.run_finding_ids ?? null,
     };
+  }
+
+  /** Находки сводки, отправленной этим сообщением, — в порядке её кнопок. */
+  async findingIdsForMessage(chatId: number, messageId: number): Promise<string[] | null> {
+    if (!Number.isFinite(chatId) || !Number.isFinite(messageId)) return null;
+    const r = await this.pg.query(
+      `SELECT finding_ids::text[] AS ids FROM insights_runs
+        WHERE digest_chat_id = $1 AND digest_message_id = $2
+        ORDER BY started_at DESC LIMIT 1`,
+      [chatId, messageId],
+    );
+    return r.rows[0]?.ids ?? null;
   }
 
   /** open → backlog одним UPDATE: второе нажатие (или гонка) получит false. */

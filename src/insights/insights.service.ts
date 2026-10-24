@@ -42,8 +42,13 @@ export class InsightsService {
     await this.execute(id, week);
   }
 
-  /** Ручной прогон из админки: в фоне, сразу возвращает id. Сводка — только владельцу. */
+  /**
+   * Ручной прогон из админки: в фоне, сразу возвращает id. Сводка — только
+   * владельцу. Второй клик, пока прогон недели идёт или отложен, возвращает его.
+   */
   async startManual(week: Week): Promise<string> {
+    const active = await this.store.activeRun(week.weekStart);
+    if (active) return active;
     const id = await this.store.createRun(week.weekStart, true);
     void this.execute(id, week).catch((e) => this.log.error(`ручной прогон ${id}: ${e?.message}`));
     return id;

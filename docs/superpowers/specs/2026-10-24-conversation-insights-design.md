@@ -93,7 +93,7 @@
 | Telegram: остальные группы | `tg_bot_messages` | нет | сигналы |
 | Поддержка | `support_messages` | да | — |
 | Звонки ассистенту один на один (`voice_calls.provider = 'linkeon'`) | `voice_calls.transcript` | да | — |
-| Встречи (`provider` = `linkeon_room` или `zoom`) | `voice_calls` | нет | сигналы: обрыв, длительность |
+| Встречи (`provider` ≠ `linkeon`) | `voice_calls` | нет | сигналы: сколько встреч и сколько оборвалось |
 | Кризисные разговоры | любой источник | нет | только число |
 
 **Группа «только владелец»** — число различных `tg_user_id` у реплик людей по
@@ -168,7 +168,7 @@ TG-боте.
 4. **Запись** (`insights-store`) и **отправка** (`insights-digest`).
 
 **Таблицы:**
-- `insights_runs`: `id`, `week_start` (UNIQUE), `status` (`running`, `done`,
+- `insights_runs`: `id`, `week_start` (не уникален: ручной повтор недели законен и заменяет её итоги; второй клик по идущему прогону возвращает его), `status` (`running`, `done`,
   `failed`, `postponed`), `started_at`, `finished_at`, `conversations`,
   `people`, `crisis_count`, `signals` jsonb, `cost_usd`, `error`.
 - `insights_findings`: `id`, `type`, `title`, `description`, `proposal`,
@@ -256,7 +256,8 @@ TG-боте.
 > формирование ответов AI-ассистентов, генерация изображений и видео по заданию
 > пользователя, распознавание речи, определение ценностей и личностных
 > характеристик, расчет совместимости, персонализация опыта, а также анализ
-> обезличенных текстов диалогов и обращений для выявления затруднений
+> обезличенных текстов диалогов (в том числе расшифровок голосовых разговоров) и
+> обращений для выявления затруднений
 > пользователей и улучшения сервиса. Для такого анализа из текстов заранее
 > удаляются номера телефонов, адреса электронной почты, имена и иные
 > идентификаторы; результаты хранятся только в обобщённом виде, без цитат и без
@@ -265,7 +266,8 @@ TG-боте.
 Английская редакция, «Purposes of AI processing», дописывается так же:
 
 > …, personalizing the experience, and analyzing de-identified texts of
-> conversations and support requests to identify where users run into
+> conversations (including transcripts of voice conversations) and support
+> requests to identify where users run into
 > difficulties and to improve the service. Before such analysis, phone numbers,
 > email addresses, names and other identifiers are removed from the texts; the
 > results are stored only in aggregated form, without quotes and without any

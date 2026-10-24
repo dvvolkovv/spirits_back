@@ -86,6 +86,21 @@ maybe('хранилище находок', () => {
     expect(await store.isEnabled()).toBe(true);
   });
 
+  it('идущий прогон недели находится, законченный — нет', async () => {
+    const id = await store.createRun('2026-10-19', true);
+    expect(await store.activeRun('2026-10-19')).toBe(id);
+    await store.failRun(id, 'x');
+    expect(await store.activeRun('2026-10-19')).toBeNull();
+  });
+
+  it('находки сводки ищутся по её сообщению, в порядке кнопок', async () => {
+    const [a, b] = await store.saveFindings('2026-10-19', [F({ title: 'Первая' }), F({ title: 'Вторая' })], []);
+    const run = await store.createRun('2026-10-19', false);
+    await store.setDigest(run, 42, 777, [b.id, a.id]);
+    expect(await store.findingIdsForMessage(42, 777)).toEqual([b.id, a.id]);
+    expect(await store.findingIdsForMessage(42, 778)).toBeNull();
+  });
+
   it('оборванный «running» старше трёх часов закрывается', async () => {
     await pool.query(`INSERT INTO insights_runs (week_start, status, started_at) VALUES ('2026-10-19', 'running', now() - interval '4 hours')`);
     await pool.query(`INSERT INTO insights_runs (week_start, status, started_at) VALUES ('2026-10-19', 'running', now())`);

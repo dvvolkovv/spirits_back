@@ -1,6 +1,7 @@
 import { backlogAnalysis, backlogCounts, InsightsCallbackService, parseInsightsCallback, shouldRouteToInsights } from './insights-callback.service';
 
 const ID = '11111111-2222-3333-4444-555555555555';
+const OTHER = '99999999-2222-3333-4444-555555555555';
 
 const finding = {
   id: ID,
@@ -17,14 +18,17 @@ const finding = {
   runFindingIds: [ID],
 };
 
-function harness(over: { claim?: boolean; reject?: boolean; createFails?: boolean } = {}) {
+function harness(over: { claim?: boolean; reject?: boolean; createFails?: boolean; linkFails?: boolean; messageIds?: string[] | null } = {}) {
   const store = {
+    findingIdsForMessage: jest.fn(async () => over.messageIds ?? null),
     findingForCallback: jest.fn(async () => finding),
     claimBacklog: jest.fn(async () => over.claim ?? true),
-    setBacklogItem: jest.fn(),
+    setBacklogItem: jest.fn(async () => {
+      if (over.linkFails) throw new Error('db hiccup');
+    }),
     revertToOpen: jest.fn(),
     reject: jest.fn(async () => over.reject ?? true),
-    statuses: jest.fn(async () => new Map([[ID, 'backlog']])),
+    statuses: jest.fn(async () => new Map([[ID, 'backlog'], [OTHER, 'open']])),
   };
   const backlog = {
     create: jest.fn(async () => {
@@ -102,6 +106,30 @@ describe('InsightsCallbackService', () => {
     const h = harness({ createFails: true });
     await h.svc.handleCallback(cb(`ins:b:${ID}`));
     expect(h.store.revertToOpen).toHaveBeenCalledWith(ID);
+  });
+
+  it('задача создана, а привязка упала — находка не откатывается, второй задачи не будет', async () => {
+    const h = harness({ linkFails: true });
+    await h.svc.handleCallback(cb(`ins:b:${ID}`));
+    expect(h.store.revertToOpen).not.toHaveBeenCalled();
+    expect(h.tg.answerCallbackQuery).toHaveBeenLastCalledWith('cb1', { text: 'В бэклоге' });
+  });
+
+  it('клавиатура — по тому сообщению, где нажали', async () => {
+    const h = harness({ messageIds: [OTHER, ID] });
+    await h.svc.handleCallback(cb(`ins:b:${ID}`));
+    expect(h.store.findingIdsForMessage).toHaveBeenCalledWith(42, 9);
+    expect(h.editMessageReplyMarkup).toHaveBeenCalledWith(42, 9, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '1 → В бэклог', callback_data: `ins:b:${OTHER}` },
+            { text: '1 ✗ Отклонить', callback_data: `ins:r:${OTHER}` },
+          ],
+          [{ text: '2 ✓ В бэклоге', callback_data: `ins:noop:${ID}` }],
+        ],
+      },
+    });
   });
 
   it('«Отклонить» запоминает число людей', async () => {

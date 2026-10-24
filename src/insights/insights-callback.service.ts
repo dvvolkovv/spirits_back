@@ -78,21 +78,28 @@ export class InsightsCallbackService {
         await answer('Уже обработано');
         return;
       }
+      let item: { id: string };
       try {
-        const item = await this.backlog.create('insights', { title: f.title, analysis_md: backlogAnalysis(f), status: 'approved' });
-        await this.store.setBacklogItem(f.id, item.id);
-        try {
-          await this.backlog.addComment(item.id, 'insights', backlogCounts(f));
-        } catch (e: any) {
-          this.log.warn(`комментарий со счётчиками к задаче ${item.id} не записан: ${e?.message}`);
-        }
-        reply = 'В бэклоге';
+        item = await this.backlog.create('insights', { title: f.title, analysis_md: backlogAnalysis(f), status: 'approved' });
       } catch (e: any) {
         this.log.error(`задача из находки ${f.id} не заведена: ${e?.message}`);
         await this.store.revertToOpen(f.id);
         await answer('Не получилось завести задачу');
         return;
       }
+      // Задача уже есть — назад в «открыта» находку не откатываем: повторный
+      // клик завёл бы вторую. Сбой привязки и комментария — только в журнал.
+      try {
+        await this.store.setBacklogItem(f.id, item.id);
+      } catch (e: any) {
+        this.log.error(`находка ${f.id} не привязана к задаче ${item.id}: ${e?.message}`);
+      }
+      try {
+        await this.backlog.addComment(item.id, 'insights', backlogCounts(f));
+      } catch (e: any) {
+        this.log.warn(`комментарий со счётчиками к задаче ${item.id} не записан: ${e?.message}`);
+      }
+      reply = 'В бэклоге';
     } else {
       if (!(await this.store.reject(f.id, f.people))) {
         await answer('Уже обработано');
@@ -100,7 +107,10 @@ export class InsightsCallbackService {
       }
       reply = 'Отклонено';
     }
-    await this.refreshKeyboard(f.runFindingIds, cb.message);
+    // Номера кнопок — как в тексте ТОГО сообщения, где нажали: находка может
+    // держаться несколько недель и стоять в нескольких сводках.
+    const ids = (await this.store.findingIdsForMessage(Number(cb.message?.chat?.id), Number(cb.message?.message_id))) ?? f.runFindingIds;
+    await this.refreshKeyboard(ids, cb.message);
     await answer(reply);
   }
 
