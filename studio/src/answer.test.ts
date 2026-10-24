@@ -17,3 +17,11 @@ test('«Временный сбой» и короткий ответ не сни
 test('подробный ответ годится', () => {
   assert.deepEqual(answerProblems('Пункт. '.repeat(80), 400), []);
 });
+
+test('встречный вопрос узнаётся и с эмодзи, кавычкой или пробелом после «?»', () => {
+  assert.equal(isCounterQuestion('Согласны?😊', 400), true);
+  assert.equal(isCounterQuestion('Подскажите, договор уже подписан? 🙏🏻', 400), true);
+  assert.equal(isCounterQuestion('Он спросил: «Как это работает?»', 400), true);
+  assert.equal(isCounterQuestion('Уточните город? ', 400), true);
+  assert.equal(isCounterQuestion('Готово 😊', 400), false);
+});
