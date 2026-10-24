@@ -3,6 +3,7 @@ import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { AdminController } from '../../admin/admin.controller';
 import { AdminProductsController } from '../../admin/admin-products.controller';
 import { AgentsController } from '../../agents/agents.controller';
+import { TasksController } from '../../tasks/tasks.controller';
 import { AdminGuard } from './admin.guard';
 import { JwtGuard } from './jwt.guard';
 
@@ -99,5 +100,29 @@ describe('Защита админских маршрутов', () => {
       expect(guards).toContain(JwtGuard);
       expect(guards).not.toContain(AdminGuard);
     });
+  });
+
+  // Та же дыра, найдена 24.10.2026: GET admin/users/:phone/tasks и
+  // admin/tasks/:taskId стояли под одним JwtGuard. Любой залогиненный читал
+  // задачи, которые экстрактор вынимает из разговоров, — по номеру любого
+  // другого пользователя. Контроллер живёт отдельно от AdminController,
+  // поэтому тест выше его не видел.
+  describe('TasksController', () => {
+    it.each(['list', 'details'])('%s (admin/…) закрыт AdminGuard', (method) => {
+      const guards = guardsFor(TasksController, method);
+      expect(guards).toContain(JwtGuard);
+      expect(guards).toContain(AdminGuard);
+    });
+
+    // Свои задачи пользователь читает и меняет сам — админский guard на них
+    // сломал бы «Мои дела».
+    it.each(['listUser', 'detailsUser', 'setStatusUser'])(
+      '%s (user/…) остаётся доступен обычному пользователю',
+      (method) => {
+        const guards = guardsFor(TasksController, method);
+        expect(guards).toContain(JwtGuard);
+        expect(guards).not.toContain(AdminGuard);
+      },
+    );
   });
 });
