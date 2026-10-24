@@ -299,6 +299,15 @@ describe('Маша: метафорическая карта не цепляет�
     expect(item.content).not.toContain('Метафорическая карта');
   });
 
+  it('сообщила в поддержку, в ответе «картой» — карты нет, game_sessions не трогаем', async () => {
+    const { cardSpy, item } = await runWith(async (_p, opts) => {
+      opts.onProgress?.({ kind: 'tool_use', name: 'mcp__products__report_problem' });
+      return { text: 'Передала команде, что оплата картой не проходит, — разберутся.', costUsd: 0.01 };
+    });
+    expect(cardSpy).not.toHaveBeenCalled();
+    expect(item.content).not.toContain('Метафорическая карта');
+  });
+
   it('без инструмента просьба о карте работает как раньше', async () => {
     const { cardSpy, item } = await runWith(async () => ({ text: 'Вот карта для тебя. Что ты видишь?', costUsd: 0.01 }));
     expect(cardSpy).toHaveBeenCalled();

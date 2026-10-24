@@ -1,12 +1,23 @@
 jest.mock('axios', () => ({ __esModule: true, default: { post: jest.fn() } }));
-jest.mock('../common/telegram-alert', () => ({ sendTelegramPayload: jest.fn(async () => {}) }));
+jest.mock('../common/telegram-alert', () => ({
+  sendTelegramPayload: jest.fn(async () => {}),
+  telegramConfigured: jest.fn(() => true),
+}));
 
+import { Logger } from '@nestjs/common';
 import axios from 'axios';
-import { sendTelegramPayload } from '../common/telegram-alert';
+import { sendTelegramPayload, telegramConfigured } from '../common/telegram-alert';
 import { TelegramNotifierService } from './telegram-notifier.service';
 
 const post = axios.post as jest.Mock;
 const fanout = sendTelegramPayload as jest.Mock;
+const configured = telegramConfigured as jest.Mock;
+
+// Одиночная половинка суррогатной пары — то, что оставляет slice посреди эмодзи.
+const hasLoneSurrogate = (s: string) =>
+  Array.from(s).some((ch) => ch.length === 1 && ch.charCodeAt(0) >= 0xd800 && ch.charCodeAt(0) <= 0xdfff);
+const EMOJI = String.fromCodePoint(0x1f600);
+
 const ESCALATION = {
   ticketId: 'e86dc43d-c45c-4583-9f97-1d11db821a1b',
   userId: 'u1',
@@ -19,7 +30,10 @@ describe('эскалация ИИ-поддержки', () => {
   const saved = { ...process.env };
   beforeEach(() => {
     post.mockReset();
-    fanout.mockReset();
+    // reset снимает реализацию из фабрики (async () => {} / () => true) —
+    // здесь нужен только сброс истории вызовов между тестами.
+    fanout.mockClear();
+    configured.mockClear();
     process.env.TELEGRAM_BOT_TOKEN = 'token';
   });
   afterEach(() => { process.env = { ...saved }; });
@@ -52,6 +66,30 @@ describe('эскалация ИИ-поддержки', () => {
   it('здоровье сервисов без TELEGRAM_SUPPORT_CHAT_ID по-прежнему не шлётся', async () => {
     delete process.env.TELEGRAM_SUPPORT_CHAT_ID;
     await new TelegramNotifierService().notifyHealthAlert({ service: 'anthropic', prevStatus: 'healthy', newStatus: 'degraded' });
+    expect(fanout).not.toHaveBeenCalled();
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it('Telegram не настроен вовсе — не шлём, но пишем в лог с номером тикета', async () => {
+    delete process.env.TELEGRAM_SUPPORT_CHAT_ID;
+    configured.mockReturnValueOnce(false);
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    await new TelegramNotifierService().notifyEscalation(ESCALATION);
+    expect(fanout).not.toHaveBeenCalled();
+    expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).toContain('#e86dc43d');
+    warn.mockRestore();
+  });
+
+  it('эмодзи на границе обрезки не рвётся пополам', async () => {
+    delete process.env.TELEGRAM_SUPPORT_CHAT_ID;
+    await new TelegramNotifierService().notifyEscalation({ ...ESCALATION, summary: 'a'.repeat(799) + EMOJI + 'хвост' });
+    expect(hasLoneSurrogate(fanout.mock.calls[0][0].text)).toBe(false);
+  });
+
+  // Ответ пользователя в тикете дублирует в группу сам SupportService — фанаут здесь дал бы два сообщения.
+  it('ответ пользователя в тикете фанаутом не шлётся', async () => {
+    delete process.env.TELEGRAM_SUPPORT_CHAT_ID;
+    await new TelegramNotifierService().notifyUserReply({ ticketId: ESCALATION.ticketId, userName: 'Кира', userText: 'привет', ticketStatus: 'escalated' });
     expect(fanout).not.toHaveBeenCalled();
     expect(post).not.toHaveBeenCalled();
   });

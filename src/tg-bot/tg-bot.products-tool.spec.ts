@@ -436,6 +436,11 @@ describe('статус-сообщение на время инструмента
     expect(TgBotService.toolStatusLabel('mcp__products__manage_product')).toBe('🛠 Работаю с продуктом...');
   });
 
+  it('сообщение в поддержку — своя подпись, а не «Работаю с продуктом»', () => {
+    expect(TgBotService.toolStatusLabel('mcp__products__report_problem')).toBe('📨 Сообщаю в поддержку...');
+    expect(TgBotService.toolStatusLabel('mcp__products__report_problem', 'en')).toBe('📨 Notifying support...');
+  });
+
   it('прежние подписи не сдвинулись', () => {
     expect(TgBotService.toolStatusLabel('WebSearch')).toBe('🌐 Ищу в интернете...');
     expect(TgBotService.toolStatusLabel('Read')).toBe('📄 Читаю файл...');
