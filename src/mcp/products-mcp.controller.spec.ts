@@ -34,7 +34,7 @@ describe('точка /mcp/products', () => {
 
   // Главная защита этой точки. Поле userId в запросе не должно значить НИЧЕГО:
   // иначе возвращается ровно та дыра, из-за которой инструмент не отдали общей
-  // точке /mcp (там userId пишет модель — mcp.controller.ts:74).
+  // точке /mcp (там userId пишет модель — mcp.controller.ts, callTool).
   it('поле userId в запросе игнорируется полностью', async () => {
     const { ctrl, calls } = make();
     await ctrl.callTool(`Bearer ${signProductToolToken('79030169187')}`, { action: 'list', userId: '70000000000' });

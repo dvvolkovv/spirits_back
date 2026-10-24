@@ -1,3 +1,5 @@
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { McpController } from './mcp.controller';
 import { SUPPORT_NOTE } from '../problem-report/problem-report.service';
 
@@ -14,13 +16,29 @@ const payload = (r: any) => JSON.parse(r.content[0].text);
 
 describe('/mcp: сбой инструмента — в поддержку', () => {
   it('сбой: отправка с ассистентом хода; в результате supportNotified и supportNote; ошибка и isError прежние', async () => {
-    const { ctrl, problems, chat, tools } = make({ ok: false, error: KIRA_ERROR });
+    const result = { ok: false, error: KIRA_ERROR };
+    const { ctrl, problems, chat, tools } = make(result);
     const r = await ctrl.callTool('generate_video', { userId: 'u1', mode: 'text2video', prompt: 'тайный промпт' });
     expect(tools.executeTool).toHaveBeenCalledWith('u1', 'generate_video', { mode: 'text2video', prompt: 'тайный промпт' });
     expect(chat.activeAssistantFor).toHaveBeenCalledWith('u1');
     expect(problems.reportToolFailure).toHaveBeenCalledWith({ userId: 'u1', assistantId: '22', tool: 'generate_video', error: KIRA_ERROR });
     expect(r.isError).toBe(true);
     expect(payload(r)).toEqual({ ok: false, error: KIRA_ERROR, supportNotified: true, supportNote: SUPPORT_NOTE });
+    // Копия, а не правка: если ответ инструмента когда-нибудь закешируют, поля не протекут в чужой вызов.
+    expect(result).toEqual({ ok: false, error: KIRA_ERROR });
+  });
+
+  it('через настоящий MCP-сервер: tools/call доходит до callTool и несёт supportNotified', async () => {
+    const { ctrl } = make({ ok: false, error: KIRA_ERROR });
+    const server = (ctrl as any).makeServer();
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverSide);
+    const client = new Client({ name: 'spec', version: '1.0.0' });
+    await client.connect(clientSide);
+    const r: any = await client.callTool({ name: 'generate_video', arguments: { userId: 'u1' } });
+    expect(r.isError).toBe(true);
+    expect(JSON.parse(r.content[0].text)).toEqual({ ok: false, error: KIRA_ERROR, supportNotified: true, supportNote: SUPPORT_NOTE });
+    await client.close();
   });
 
   // Решение владельца 24.10: в группу — только служебное, аргументы инструмента не уходят.

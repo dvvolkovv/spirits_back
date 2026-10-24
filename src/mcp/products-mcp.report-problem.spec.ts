@@ -1,3 +1,5 @@
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { ProductsMcpController } from './products-mcp.controller';
 import { signProductToolToken } from '../products/product-tool.token';
 
@@ -54,5 +56,21 @@ describe('report_problem на точке продуктов', () => {
     await ctrl.callTool(`Bearer ${signProductToolToken('u-1')}`, { action: 'list' }, 'manage_product');
     expect(tool.execute).toHaveBeenCalled();
     expect(problems.reportFromAssistant).not.toHaveBeenCalled();
+  });
+
+  // Связка makeServer → callTool через настоящий MCP-клиент: откат делегирования
+  // в tools/call тихо убил бы путь А и путь Б, оставаясь зелёным на моках.
+  it('через настоящий MCP-сервер: report_problem виден в списке и доходит до reportFromAssistant', async () => {
+    const { ctrl } = make();
+    const server = (ctrl as any).makeServer(`Bearer ${signProductToolToken('u-1', 'web')}`);
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverSide);
+    const client = new Client({ name: 'spec', version: '1.0.0' });
+    await client.connect(clientSide);
+    const tools = await client.listTools();
+    expect(tools.tools.map((t: any) => t.name)).toContain('report_problem');
+    const r: any = await client.callTool({ name: 'report_problem', arguments: { assistant: 'Кира', kind: 'my_failure', summary: 'x' } });
+    expect(JSON.parse(r.content[0].text)).toEqual({ ok: true, reported: true, say: 'Передано' });
+    await client.close();
   });
 });

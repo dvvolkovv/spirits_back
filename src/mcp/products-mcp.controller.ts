@@ -37,7 +37,7 @@ import { REPORT_PROBLEM_TOOL, REPORT_PROBLEM_TOOL_NAME } from '../problem-report
  * Сторож адреса — в products-mcp.controller.spec.ts.
  *
  * На общей точке владелец приезжает полем запроса, которое пишет модель
- * (mcp.controller.ts:74, релей подсказывает телефон в системном промпте —
+ * (mcp.controller.ts, callTool, релей подсказывает телефон в системном промпте —
  * relay-agent/server.mjs:378). Для картинок это цена в токенах, для продуктов —
  * правка чужого сайта.
  *

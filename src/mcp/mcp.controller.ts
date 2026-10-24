@@ -101,20 +101,21 @@ export class McpController {
     const { userId: _omit, ...toolArgs } = args;
     this.logger.log(`tools/call ${name} userId=${userId}`);
     const result: any = await this.tools.executeTool(userId, name, toolArgs);
-    if (result && result.ok === false) this.reportFailure(String(userId), String(name), result);
+    const notified = !!result && result.ok === false && this.reportFailure(String(userId), String(name), result);
+    // Копия, а не правка объекта инструмента: если ответ когда-нибудь закешируют, поля не протекут в чужие вызовы.
+    const out = notified ? { ...result, supportNotified: true, supportNote: SUPPORT_NOTE } : result;
     return {
-      content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+      content: [{ type: 'text' as const, text: JSON.stringify(out) }],
       isError: !result.ok,
     };
   }
 
   /**
-   * Сбой инструмента — в «Поддержку linkeon» (src/problem-report), а
-   * ассистенту — что команда в курсе. Подсказка едет в результате, а не в
-   * промпте релея: так она не зависит от ручного выката релея. Ни ошибка, ни
-   * isError не меняются. Никогда не бросает.
+   * Сбой инструмента — в «Поддержку linkeon» (src/problem-report). Отдаёт,
+   * сказать ли ассистенту, что команда в курсе — true, если сервис отправку
+   * подтвердил. Никогда не бросает: сбой самого уведомления превращается в false.
    */
-  private reportFailure(userId: string, tool: string, result: any): void {
+  private reportFailure(userId: string, tool: string, result: any): boolean {
     try {
       const { supportNotified } = this.problems.reportToolFailure({
         userId,
@@ -122,12 +123,10 @@ export class McpController {
         tool,
         error: String(result.error ?? ''),
       });
-      if (supportNotified) {
-        result.supportNotified = true;
-        result.supportNote = SUPPORT_NOTE;
-      }
+      return supportNotified;
     } catch (e: any) {
       this.logger.warn(`сообщение о сбое ${tool} не обработано: ${e?.message}`);
+      return false;
     }
   }
 
