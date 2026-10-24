@@ -1,10 +1,12 @@
 // СГЕНЕРИРОВАНО scripts/sync-kb-labels.mjs из локалей spirits_front — руками не править.
 // Пути ключей — src/platform-kb/label-keys.json.
 
+import type { SUPPORTED_LANGUAGES } from '../common/services/language.service';
+
 export const KB_LABEL_KEYS = ["chat","listen","fresh","files","call","meetingJoin","networking","imageGen","video","studio","studioAgents","studioBots","studioProducts","profile","business","settings","calendars","push","voices","android","partners","invite","help","support"] as const;
 export type KbLabelKey = (typeof KB_LABEL_KEYS)[number];
 
-export const KB_LABELS: Record<string, Record<KbLabelKey, string>> = {
+export const KB_LABELS: Record<(typeof SUPPORTED_LANGUAGES)[number], Record<KbLabelKey, string>> = {
   ru: {
     chat: "Чат с ассистентом",
     listen: "Прослушать",
