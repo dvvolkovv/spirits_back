@@ -76,6 +76,7 @@ describe('isUserSideToolError: виноват ли не сервис', () => {
     'limit reached: не больше 10 рутин',
     'job not found',
     'not your job',
+    'cannot delete active job — wait for completion',
   ])('не сбой: %s', (error) => {
     expect(isUserSideToolError(error)).toBe(true);
   });
