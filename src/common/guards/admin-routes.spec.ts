@@ -4,6 +4,7 @@ import { AdminController } from '../../admin/admin.controller';
 import { AdminProductsController } from '../../admin/admin-products.controller';
 import { AgentsController } from '../../agents/agents.controller';
 import { TasksController } from '../../tasks/tasks.controller';
+import { InsightsController } from '../../insights/insights.controller';
 import { AdminGuard } from './admin.guard';
 import { JwtGuard } from './jwt.guard';
 
@@ -124,5 +125,20 @@ describe('Защита админских маршрутов', () => {
         expect(guards).not.toContain(AdminGuard);
       },
     );
+  });
+
+  // «Затыки недели»: ручной прогон, выключатель и статус — только админу.
+  describe('InsightsController', () => {
+    const methods = methodsOf(InsightsController);
+
+    it('имеет маршруты (иначе тест ничего не проверяет)', () => {
+      expect(methods.length).toBeGreaterThan(0);
+    });
+
+    it.each(methods)('%s закрыт JwtGuard и AdminGuard', (method) => {
+      const guards = guardsFor(InsightsController, method);
+      expect(guards).toContain(JwtGuard);
+      expect(guards).toContain(AdminGuard);
+    });
   });
 });
