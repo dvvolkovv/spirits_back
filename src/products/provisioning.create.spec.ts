@@ -619,6 +619,42 @@ describe('ProvisioningService.create', () => {
     }
   });
 
+  it('имя секрета, занятое платформой, отвергается до всякой записи', async () => {
+    // Пока проверка жила только на агенте хоста, сервер такое имя принимал,
+    // продукт записывался, а заведение падало в failed уже на машине
+    // продуктов — с текстом, которого человек на своём экране не видит.
+    for (const name of [
+      'PORT', 'path', 'LINKEON_URL', 'ANTHROPIC_BASE_URL', 'CLAUDE_CONFIG_DIR', 'https_proxy',
+      'NODE_TLS_REJECT_UNAUTHORIZED', 'LD_PRELOAD', 'GIT_SSH_COMMAND', 'npm_config_registry', 'BASH_ENV',
+    ]) {
+      const { svc, calls } = makeService();
+
+      await expect(
+        svc.create({
+          userId: 'u-1', isAdmin: false, name: 'X', slug: 'bot1', kind: 'bot',
+          secrets: { BOT_TOKEN: 't', [name]: 'v' },
+        }),
+      ).rejects.toThrow(/занято/);
+
+      expect(sqlOf(calls)).not.toContain('INSERT INTO products');
+    }
+  });
+
+  it('соседи занятых семейств проходят', async () => {
+    // Обратная сторона: семейство по префиксу, поставленное шире нужного,
+    // отрезало бы законный ключ — GITHUB_TOKEN начинается на GIT, но не на GIT_.
+    for (const name of ['NODE_ENV', 'TZ', 'OZON_API_KEY', 'MY_ANTHROPIC_KEY', 'GITHUB_TOKEN']) {
+      const { svc } = makeService();
+
+      await expect(
+        svc.create({
+          userId: 'u-1', isAdmin: false, name: 'X', slug: 'bot1', kind: 'bot',
+          secrets: { BOT_TOKEN: 't', [name]: 'v' },
+        }),
+      ).resolves.toMatchObject({ productId: expect.any(String) });
+    }
+  });
+
   it('секреты не переданы вовсе — заведение проходит, в базу идёт NULL', async () => {
     // Guard `input.secrets ?? {}` без этой проверки не сторожился ничем:
     // снятие обоих `?? {}` не роняло ни одного теста. Сервис лежит в exports

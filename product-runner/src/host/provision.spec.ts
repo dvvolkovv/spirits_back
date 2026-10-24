@@ -678,6 +678,22 @@ describe('на настоящей файловой системе', () => {
 
     expect(await readFile(join(dir, 'server.js'), 'utf8')).toBe('работа клиента');
   });
+
+  it('data/ и .env не уезжают в git даже через git add -A, как делает раннер', async () => {
+    // Раннер коммитит правку целиком (`git add -A`) и пушит её в резервную
+    // копию. Состояние бота и файл с ключами, если он появится, туда попасть
+    // не должны — их держит .gitignore каркаса.
+    await provision(job(), realDeps());
+    const dir = join(root, 'kafe-ulej');
+    await mkdir(join(dir, 'data'), { recursive: true });
+    await writeFile(join(dir, 'data', 'state.json'), '{"lastRun":"2026-10-24"}', 'utf8');
+    await writeFile(join(dir, '.env'), 'OZON_API_KEY=ключ', 'utf8');
+
+    await execFileAsync('git', ['add', '-A'], { cwd: dir });
+
+    const status = await execFileAsync('git', ['status', '--porcelain'], { cwd: dir });
+    expect(status.stdout.trim()).toBe('');
+  });
 });
 
 describe('настоящие реализации для хоста', () => {
@@ -1016,5 +1032,57 @@ describe('waitPort отличает поднявшийся продукт от d
     await new Promise((r) => server.close(r));
 
     expect(up).toBe(false);
+  });
+});
+
+describe('занятые имена секретов: процессы платформы в контейнере', () => {
+  // Окружение контейнера общее у продукта и у процессов платформы: раннера,
+  // ассистента правок (claude), pm2 и git. ANTHROPIC_BASE_URL или прокси
+  // увели бы запросы ассистента вместе с OAuth-токеном на чужой адрес.
+  it.each([
+    'ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'CLAUDE_CONFIG_DIR',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'NO_PROXY',
+    'NODE_TLS_REJECT_UNAUTHORIZED', 'NODE_EXTRA_CA_CERTS', 'npm_config_registry',
+    'LD_PRELOAD', 'GIT_SSH_COMMAND', 'PM2_HOME', 'SSL_CERT_FILE',
+    'BASH_ENV', 'ENV', 'SHELL', 'USER', 'port', 'Path',
+  ])('секрет %s отвергается до изменений на хосте', async (key) => {
+    const h = new FakeHost();
+
+    await expect(
+      provision(job({ secrets: { [key]: 'подмена' } }), deps(h)),
+    ).rejects.toThrow(/имя секрета занято/);
+    expect(h.containers.size).toBe(0);
+    expect(h.dirs.size).toBe(0);
+  });
+
+  it.each(['NODE_ENV', 'TZ', 'OZON_API_KEY', 'MY_ANTHROPIC_KEY', 'GITHUB_TOKEN', 'SSH_KEY', 'BOT_TOKEN'])(
+    'секрет %s проходит: соседство с занятым семейством — не занятость',
+    async (key) => {
+      const h = new FakeHost();
+
+      await provision(job({ secrets: { [key]: 'значение' } }), deps(h));
+
+      expect(h.containers.get('kafe-ulej')!.env[key]).toBe('значение');
+    },
+  );
+});
+
+describe('ключи владельца в каркасе', () => {
+  it('имена ключей доезжают в CLAUDE.md, а значения — ни в один файл чекаута', async () => {
+    await provision(
+      job({
+        slug: 'bot-ulej',
+        kind: 'bot',
+        secrets: { BOT_TOKEN: 'значение-токена', OZON_API_KEY: 'значение-ключа' },
+      }),
+      deps(host),
+    );
+
+    const files = host.dirs.get('/srv/products/bot-ulej')!;
+    expect(files['CLAUDE.md']).toContain('- `OZON_API_KEY`');
+    const leaked = Object.entries(files)
+      .filter(([, content]) => content.includes('значение-токена') || content.includes('значение-ключа'))
+      .map(([file]) => file);
+    expect(leaked).toEqual([]);
   });
 });
