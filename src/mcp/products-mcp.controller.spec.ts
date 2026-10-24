@@ -21,7 +21,9 @@ describe('точка /mcp/products', () => {
       }),
     };
     const files = { searchForUser: jest.fn(async () => ({ ok: true, total: 0, files: [] })) };
-    return { ctrl: new ProductsMcpController(tool as any, files as any), calls, tool, files };
+    const problems = { reportFromAssistant: jest.fn(async () => ({ ok: true, reported: true, say: 'ok' })) };
+    const chat = { activeAssistantFor: jest.fn(() => null) };
+    return { ctrl: new ProductsMcpController(tool as any, files as any, problems as any, chat as any), calls, tool, files };
   };
 
   it('владелец берётся ИЗ ТОКЕНА', async () => {
@@ -106,16 +108,16 @@ describe('точка /mcp/products', () => {
     expect(tool.execute).not.toHaveBeenCalled();
   });
 
-  it('веб: продукты и поиск файлов, у обоих нет аргумента userId', () => {
+  it('веб: продукты, поиск файлов и сообщение в поддержку, ни у одного нет аргумента userId', () => {
     const { ctrl } = make();
     const tools = ctrl.listTools('web');
-    expect(tools.map((t: any) => t.name)).toEqual(['manage_product', 'find_files']);
+    expect(tools.map((t: any) => t.name)).toEqual(['manage_product', 'find_files', 'report_problem']);
     for (const t of tools as any[]) expect(Object.keys(t.inputSchema.properties)).not.toContain('userId');
   });
 
-  it('Telegram: только продукты — поиск файлов в боте не включён', () => {
+  it('Telegram: продукты и сообщение в поддержку — поиск файлов в боте не включён', () => {
     const { ctrl } = make();
-    expect(ctrl.listTools('telegram').map((t: any) => t.name)).toEqual(['manage_product']);
+    expect(ctrl.listTools('telegram').map((t: any) => t.name)).toEqual(['manage_product', 'report_problem']);
   });
 
   it('find_files: владелец из токена, userId из запроса выбрасывается', async () => {
