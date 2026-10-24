@@ -1,4 +1,4 @@
-import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
+import { labelsFor } from '../platform-kb/labels';
 
 /**
  * Блок «Что есть в Linkeon» для системного промпта ассистента.
@@ -10,119 +10,13 @@ import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
  *
  * Разделы названы подписями, которые пользователь видит на своём языке: иначе
  * ассистент переводит «Студию» сам и называет пункт меню, которого нет.
+ * Подписи берутся из общей таблицы справки (src/platform-kb/labels.ts),
+ * которую собирает из локалей фронта scripts/sync-kb-labels.mjs.
  *
  * Пополнения и оплаты здесь нет намеренно: это дело блока баланса
  * (balance-context.service.ts), а он знает про сборки для сторов, которым
  * ссылки на оплату показывать нельзя.
  */
-
-type Lang = (typeof SUPPORTED_LANGUAGES)[number];
-
-interface Labels {
-  chat: string;
-  listen: string;
-  fresh: string;
-  files: string;
-  call: string;
-  meetingJoin: string;
-  networking: string;
-  imageGen: string;
-  video: string;
-  studio: string;
-  studioAgents: string;
-  studioBots: string;
-  studioProducts: string;
-  profile: string;
-  business: string;
-  settings: string;
-  calendars: string;
-  push: string;
-  voices: string;
-  android: string;
-  partners: string;
-  invite: string;
-  help: string;
-  support: string;
-}
-
-/**
- * Копия подписей фронта (репозиторий spirits, src/i18n/locales/<язык>.json) на
- * 12.10.2026. Ключи по порядку: chat.title, chat.listen, chat.fresh_mode_label,
- * chat.files.open, chat.voice_call.start, chat.meeting.join, nav.networking,
- * nav.image_gen, video.navTitle, studio.nav, studio.tabs.agents|bots|products,
- * profile.title, businessCard.title, settings.title, settings.calendar.title,
- * settings.push.title, settings.voices.title, settings.android.title,
- * nav.referral, profile.invite_friend_title, nav.help, help.cta.button.
- * Переименовали пункт во фронте — поправить и здесь.
- */
-const LABELS: Record<Lang, Labels> = {
-  ru: {
-    chat: 'Чат с ассистентом', listen: 'Прослушать', fresh: 'Чистый лист', files: 'Медиа и файлы',
-    call: 'Позвонить', meetingJoin: 'Зайти', networking: 'Нетворкинг', imageGen: 'Генератор изображений',
-    video: 'Видео', studio: 'Студия', studioAgents: 'Ассистенты', studioBots: 'Telegram-боты',
-    studioProducts: 'Продукты', profile: 'Мой профиль', business: 'Мой бизнес', settings: 'Настройки',
-    calendars: 'Календари', push: 'Уведомления на этом устройстве', voices: 'Голоса ассистентов',
-    android: 'Мобильное приложение', partners: 'Партнёры', invite: 'Пригласи друга', help: 'Помощь',
-    support: 'Связаться с поддержкой',
-  },
-  en: {
-    chat: 'Chat with assistant', listen: 'Listen', fresh: 'Fresh start', files: 'Media and files',
-    call: 'Call', meetingJoin: 'Join', networking: 'Networking', imageGen: 'Image generator',
-    video: 'Video', studio: 'Studio', studioAgents: 'Assistants', studioBots: 'Telegram bots',
-    studioProducts: 'Products', profile: 'My profile', business: 'My business', settings: 'Settings',
-    calendars: 'Calendars', push: 'Notifications on this device', voices: 'Assistant voices',
-    android: 'Mobile app', partners: 'Partners', invite: 'Invite a friend', help: 'Help',
-    support: 'Contact support',
-  },
-  es: {
-    chat: 'Chat con el asistente', listen: 'Escuchar', fresh: 'Hoja en blanco', files: 'Multimedia y archivos',
-    call: 'Llamar', meetingJoin: 'Entrar', networking: 'Networking', imageGen: 'Generador de imágenes',
-    video: 'Vídeo', studio: 'Estudio', studioAgents: 'Asistentes', studioBots: 'Bots de Telegram',
-    studioProducts: 'Productos', profile: 'Mi perfil', business: 'Mi negocio', settings: 'Ajustes',
-    calendars: 'Calendarios', push: 'Notificaciones en este dispositivo', voices: 'Voces de los asistentes',
-    android: 'Aplicación móvil', partners: 'Partners', invite: 'Invita a un amigo', help: 'Ayuda',
-    support: 'Contactar con soporte',
-  },
-  de: {
-    chat: 'Chat mit dem Assistenten', listen: 'Anhören', fresh: 'Neustart', files: 'Medien und Dateien',
-    call: 'Anrufen', meetingJoin: 'Beitreten', networking: 'Networking', imageGen: 'Bildgenerator',
-    video: 'Video', studio: 'Studio', studioAgents: 'Assistenten', studioBots: 'Telegram-Bots',
-    studioProducts: 'Produkte', profile: 'Mein Profil', business: 'Mein Unternehmen', settings: 'Einstellungen',
-    calendars: 'Kalender', push: 'Benachrichtigungen auf diesem Gerät', voices: 'Stimmen der Assistenten',
-    android: 'Mobile App', partners: 'Partner', invite: 'Lade einen Freund ein', help: 'Hilfe',
-    support: 'Support kontaktieren',
-  },
-  fr: {
-    chat: "Chat avec l'assistant", listen: 'Écouter', fresh: 'Page blanche', files: 'Médias et fichiers',
-    call: 'Appeler', meetingJoin: 'Rejoindre', networking: 'Réseautage', imageGen: "Générateur d'images",
-    video: 'Vidéo', studio: 'Studio', studioAgents: 'Assistants', studioBots: 'Bots Telegram',
-    studioProducts: 'Produits', profile: 'Mon profil', business: 'Mon entreprise', settings: 'Paramètres',
-    calendars: 'Calendriers', push: 'Notifications sur cet appareil', voices: 'Voix des assistants',
-    android: 'Application mobile', partners: 'Partenaires', invite: 'Invite un ami', help: 'Aide',
-    support: 'Contacter le support',
-  },
-  zh: {
-    chat: '与助手聊天', listen: '收听', fresh: '空白模式', files: '媒体和文件',
-    call: '拨打', meetingJoin: '加入', networking: '人脉拓展', imageGen: '图片生成器',
-    video: '视频', studio: '工作室', studioAgents: '助手', studioBots: 'Telegram机器人',
-    studioProducts: '产品', profile: '我的个人资料', business: '我的生意', settings: '设置',
-    calendars: '日历', push: '此设备上的通知', voices: '助手语音',
-    android: '移动应用', partners: '合伙人', invite: '邀请好友', help: '帮助',
-    support: '联系客服',
-  },
-  pt: {
-    chat: 'Chat com o assistente', listen: 'Ouvir', fresh: 'Página em branco', files: 'Multimédia e ficheiros',
-    call: 'Ligar', meetingJoin: 'Entrar', networking: 'Networking', imageGen: 'Gerador de imagens',
-    video: 'Vídeo', studio: 'Estúdio', studioAgents: 'Assistentes', studioBots: 'Bots do Telegram',
-    studioProducts: 'Produtos', profile: 'O meu perfil', business: 'Meu negócio', settings: 'Definições',
-    calendars: 'Calendários', push: 'Notificações neste dispositivo', voices: 'Vozes dos assistentes',
-    android: 'Aplicação móvel', partners: 'Parceiros', invite: 'Convida um amigo', help: 'Ajuda',
-    support: 'Contactar o apoio ao cliente',
-  },
-};
-
-/** Незнакомый язык — русские подписи. */
-const labelsFor = (lang: string): Labels => (LABELS as Record<string, Labels>)[lang] ?? LABELS.ru;
 
 /** Блок для системного промпта ассистента. */
 export function platformGuide(lang: string): string {
