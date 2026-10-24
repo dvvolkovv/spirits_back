@@ -34,8 +34,9 @@ interface AnswerState {
 
 /**
  * Последний ответ ассистента: текст его блоков (без строки с временем и
- * кнопками) и признаки, что набор ещё идёт — точка-пульс в пузыре
- * (ChatInterface, message.isStreaming), «печатает» и «работает» в ленте.
+ * кнопками) и признаки, что набор ещё идёт — точка-пульс набираемого
+ * пузыря (StreamingMessage — без data-testid, поэтому ищем по всей ленте),
+ * «печатает» и «работает» в ленте.
  */
 function answerState(page: Page): Promise<AnswerState> {
   return page.evaluate((sel) => {
@@ -47,7 +48,7 @@ function answerState(page: Page): Promise<AnswerState> {
     return {
       count: msgs.length,
       text: leaves.map((el) => el.innerText.trim()).filter(Boolean).join('\n'),
-      streaming: Boolean(last?.querySelector('.animate-pulse')),
+      streaming: Boolean(list?.querySelector('.animate-pulse')),
       busy: Boolean(list?.querySelector('.animate-bounce, .animate-spin')),
     };
   }, ASSISTANT_MSG);
@@ -55,20 +56,47 @@ function answerState(page: Page): Promise<AnswerState> {
 
 async function waitAnswer(page: Page, before: number): Promise<string> {
   const started = Date.now();
-  let last = '';
+  let last: string | null = null;
   let since = Date.now();
   while (Date.now() - started < ANSWER_TIMEOUT_MS) {
     const s = await answerState(page);
-    const text = s.count > before ? s.text : '';
+    const arrived = s.count > before;
+    const text = arrived ? s.text : null;
     if (text !== last) {
       last = text;
       since = Date.now();
-    } else if (text && !s.streaming && !s.busy && Date.now() - since >= STABLE_MS) {
-      return text;
+    } else if (arrived && !s.streaming && !s.busy && Date.now() - since >= STABLE_MS) {
+      // Даже пустой текст возвращаем: «ответ без абзацев» отловит answerProblems,
+      // а не пятиминутный таймаут.
+      return s.text;
     }
     await page.waitForTimeout(1000);
   }
   throw new Error('capture: ответ не закончился за 5 минут');
+}
+
+/**
+ * Ждёт, пока лента успокоится. В пустом «чистом листе» кабинет сам шлёт
+ * приветствие (ChatInterface.sendInitialGreeting — настоящий ход ассистента);
+ * вопрос, отправленный поверх, ушёл бы в очередь. Готово, когда есть хотя бы
+ * одно сообщение ассистента и STABLE_MS нет признаков набора.
+ */
+async function waitIdle(page: Page): Promise<void> {
+  const started = Date.now();
+  let lastCount = -1;
+  let since = Date.now();
+  while (Date.now() - started < ANSWER_TIMEOUT_MS) {
+    const s = await answerState(page);
+    const idle = s.count > 0 && !s.streaming && !s.busy;
+    if (!idle || s.count !== lastCount) {
+      lastCount = s.count;
+      since = Date.now();
+    } else if (Date.now() - since >= STABLE_MS) {
+      return;
+    }
+    await page.waitForTimeout(1000);
+  }
+  throw new Error('capture: лента не успокоилась за 5 минут — приветствие ассистента не закончилось');
 }
 
 /** Отправляет реплику и ждёт её пузырь; возвращает число ответов ассистента до отправки. */
@@ -123,7 +151,7 @@ export async function captureChat(
       await page.screenshot({ path: shot('blocked.png') });
       throw new Error(`capture: кабинет не дошёл до чата — см. ${shot('blocked.png')}`);
     }
-    await page.waitForTimeout(1500);
+    await waitIdle(page);
     const picked = (await page.locator('[data-testid="assistant-dropdown-btn"]').innerText().catch(() => '')).trim();
     if (!picked.includes(scene.assistantName)) {
       await page.screenshot({ path: shot('wrong-assistant.png') });
