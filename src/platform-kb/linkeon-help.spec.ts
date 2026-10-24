@@ -27,6 +27,17 @@ describe('parseTopics', () => {
     expect(parseTopics(undefined, IDS)).toEqual([]);
     expect(parseTopics({}, IDS)).toEqual([]);
   });
+
+  it('огромный мусорный вход не перебирается целиком', () => {
+    const junk = Array.from({ length: 200_000 }, (_, i) => `x${i}`);
+    const t0 = Date.now();
+    expect(parseTopics({ topics: [...junk, 'video'] }, IDS)).toEqual([]);
+    expect(Date.now() - t0).toBeLessThan(200);
+  });
+
+  it('длинная строка обрезается до разумной длины и всё равно разбирается', () => {
+    expect(parseTopics({ topics: ['video' + ' '.repeat(100000)] }, IDS)).toEqual(['video']);
+  });
 });
 
 describe('executeLinkeonHelp', () => {
