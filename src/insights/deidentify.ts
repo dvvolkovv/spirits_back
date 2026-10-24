@@ -7,7 +7,9 @@
  * ряды цифр, затем имена.
  */
 
-const URL_RE = /\b(?:https?:\/\/|www\.)[^\s<>()«»"]+/giu;
+// Хвост ссылки не кончается знаком препинания: «см. https://ozon.ru/x, а потом» —
+// запятая остаётся в тексте.
+const URL_RE = /\b(?:https?:\/\/|www\.)[^\s<>()«»"]*[^\s<>()«»".,;:!?]/giu;
 const EMAIL_RE = /[\p{L}\p{N}._%+-]+@[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)+/gu;
 // Ряд цифр с разделителями внутри строки. \s сюда нельзя: склеил бы цифры
 // через перевод строки («шаг 1\n2 3» превратился бы в число).
@@ -30,9 +32,10 @@ function knownHost(host: string): string | null {
 }
 
 // Адрес без http и www: «мой сайт teselectro.ru». Только с узнаваемой зоной —
-// иначе в ссылку превратились бы «отчёт.pdf» и «Node.js».
+// иначе в ссылку превратились бы «отчёт.pdf» и «Node.js». Внутрь уже
+// поставленной метки «[ссылка: t.me]» не заходит.
 const BARE_HOST_RE =
-  /(?<![\p{L}\p{N}@./-])(?:[\p{L}\p{N}][\p{L}\p{N}-]*\.)+(?:ru|рф|com|net|org|io|su|pro|shop|store|online|site|biz|info|me|app|dev|ai|by|kz|uz|am|ge|de|us|uk|eu|co|tv|space|tech|art)(?![\p{L}\p{N}])(?:\/[^\s<>()«»"]*)?/giu;
+  /(?<!ссылка: )(?<![\p{L}\p{N}@./-])(?:[\p{L}\p{N}][\p{L}\p{N}-]*\.)+(?:ru|рф|com|net|org|io|su|pro|shop|store|online|site|biz|info|me|app|dev|ai|by|kz|uz|am|ge|de|us|uk|eu|co|tv|space|tech|art)(?![\p{L}\p{N}])(?:\/(?:[^\s<>()«»"]*[^\s<>()«»".,;:!?])?)?/giu;
 
 function replaceLink(m: string): string {
   const host = m.replace(/^(?:https?:\/\/)?(?:www\.)?/i, '').split(/[/?#:]/)[0].toLowerCase();
