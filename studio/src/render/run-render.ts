@@ -37,15 +37,21 @@ export async function renderRun(runDir: string, opts: { skipTts?: boolean } = {}
 
   fs.copyFileSync(path.join(STUDIO_ROOT, 'public', 'logo.png'), path.join(runDir, 'logo.png'));
   const serveUrl = await bundle({ entryPoint: path.join(STUDIO_ROOT, 'src', 'remotion', 'index.ts'), publicDir: runDir });
-  const composition = await selectComposition({ serveUrl, id: 'Short', inputProps });
-  const video = path.join(runDir, 'video.mp4');
-  await renderMedia({ composition, serveUrl, codec: 'h264', outputLocation: video, inputProps, concurrency: 2 });
-  const cover = path.join(runDir, 'cover.jpg');
-  await renderStill({ composition, serveUrl, output: cover, frame: 20, inputProps, imageFormat: 'jpeg' });
+  try {
+    const composition = await selectComposition({ serveUrl, id: 'Short', inputProps });
+    const video = path.join(runDir, 'video.mp4');
+    await renderMedia({ composition, serveUrl, codec: 'h264', outputLocation: video, inputProps, concurrency: 2 });
+    const cover = path.join(runDir, 'cover.jpg');
+    await renderStill({ composition, serveUrl, output: cover, frame: 20, inputProps, imageFormat: 'jpeg' });
 
-  const probe = await probeFile(video);
-  const silences = await detectSilences(video, probe.durationSec);
-  return { video, cover, problems: verifyVideo(probe, silences) };
+    const probe = await probeFile(video);
+    const silences = await detectSilences(video, probe.durationSec);
+    return { video, cover, problems: verifyVideo(probe, silences) };
+  } finally {
+    // bundle() кладёт бандл и копию папки съёмки в новый каталог /tmp на каждый вызов
+    // и сам его не удаляет — без этого сотни рендеров на сервере съедают диск.
+    await fs.promises.rm(serveUrl, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
