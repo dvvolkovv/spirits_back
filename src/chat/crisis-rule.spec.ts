@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ChatService } from './chat.service';
 import { TgRouterService } from '../tg-bot/tg-router.service';
-import { CRISIS_RULE, withCrisisRule } from './crisis-rule';
+import { CRISIS_HOTLINES, CRISIS_RULE, withCrisisRule } from './crisis-rule';
 
 /**
  * Кризисное правило у пользовательских ассистентов.
@@ -34,6 +34,10 @@ describe('текст правила', () => {
     expect(f).toMatch(/прямо спроси, думает ли он о самоубийстве/);
     expect(f).toMatch(/Не отправляй к другим ассистентам платформы/);
     expect(f).toMatch(/Не давай сведений о способах навредить/);
+  });
+
+  it('номера для бота «Затыки недели» стоят в тексте правила дословно', () => {
+    for (const phone of CRISIS_HOTLINES) expect(CRISIS_RULE).toContain(phone);
   });
 
   it('withCrisisRule дописывает правило в конец и не теряет его на пустом промпте', () => {
