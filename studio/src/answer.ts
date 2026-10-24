@@ -1,10 +1,17 @@
 /** Тексты, которыми релей сообщает о сбое вместо ответа. */
 export const FAILURE_MARKERS = ['Временный сбой'];
 
-/** Встречный вопрос вместо ответа: коротко и кончается вопросительным знаком. */
+/**
+ * Хвост после вопросительного знака, который не меняет смысла: пробелы,
+ * закрывающие кавычки и скобки, эмодзи и их модификаторы (тон кожи,
+ * вариант начертания — это символы категории Mark и Extended_Pictographic).
+ */
+const QUESTION_TAIL = /[\s"'»“”„)\]\p{Extended_Pictographic}\p{M}\p{Emoji_Modifier}]+$/u;
+
+/** Встречный вопрос вместо ответа: коротко и кончается вопросительным знаком (хвост из эмодзи и кавычек не мешает). */
 export function isCounterQuestion(answer: string, minChars: number): boolean {
   const a = answer.trim();
-  return a.length < minChars && a.endsWith('?');
+  return a.length < minChars && /[?？]$/.test(a.replace(QUESTION_TAIL, ''));
 }
 
 /** Почему этот ответ нельзя снимать; пустой список — можно. */
