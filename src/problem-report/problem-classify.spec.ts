@@ -4,6 +4,13 @@ import { failureSignature, isUserSideToolError } from './problem-classify';
  * Каждая строка — настоящее сообщение инструментов Linkeon (chat-tools.ts,
  * misc.service.ts, video.service.ts, speech.service.ts, calendar.service.ts,
  * routine-store.service.ts, hd-tool.service.ts) или провайдера.
+ *
+ * Отдельная группа строк в «сбой» — гипотетические тексты провайдера вида
+ * «Omni generate failed: … supports at most …», «… Video length must be …»,
+ * «Yandex TTS 400: …»: таких сообщений на момент написания в логах не было,
+ * они здесь, чтобы застраховать от возврата к поиску подстроки где угодно
+ * (вместо только начала строки) — такой поиск склеил бы чужой текст,
+ * пришедший после своего префикса, с нашей проверкой ввода.
  */
 describe('isUserSideToolError: виноват ли не сервис', () => {
   // Сбои — о них команда должна узнать.
@@ -42,6 +49,12 @@ describe('isUserSideToolError: виноват ли не сервис', () => {
     'Google не успел обработать картинки за 5 минут. Попробуйте повторить — обычно помогает.',
     'превышено время ожидания (30 с)',
     'сервер ответил кодом 503',
+    // edit_image/compose_image/upscale_image качают исходник через safe-fetch,
+    // и это обычно наш MinIO: 403 (сбитая политика бакета после пересборки —
+    // уже был прецедент) или 404 (потерянный объект) — наш сбой, не ошибка
+    // модели, даже если текст совпадает с «модель дала мёртвую ссылку».
+    'сервер ответил кодом 403',
+    'сервер ответил кодом 404',
   ])('сбой: %s', (error) => {
     expect(isUserSideToolError(error)).toBe(false);
   });
@@ -98,9 +111,9 @@ describe('isUserSideToolError: виноват ли не сервис', () => {
     'Укажи ровно одно из recurrence.count или recurrence.until',
     'Invalid time value',
     'адрес example.invalid не найден',
-    'сервер ответил кодом 404',
     'Модель не вернула изображений (IMAGE_SAFETY). Попробуйте ещё раз или измените промпт.',
     'Модель не вернула изображений (PROHIBITED_CONTENT). Попробуйте ещё раз или измените промпт.',
+    'Модель не вернула изображений (IMAGE_PROHIBITED_CONTENT). Попробуйте ещё раз или измените промпт.',
   ])('не сбой: %s', (error) => {
     expect(isUserSideToolError(error)).toBe(true);
   });
