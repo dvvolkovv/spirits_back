@@ -275,8 +275,10 @@ describe('reportToolFailure — путь А', () => {
     const svc = new ProblemReportService(pgWith() as any);
     svc.reportToolFailure(failure({ error: ' '.repeat(3_000_000) + 'boom' + ' '.repeat(3_000_000) }));
     await flush();
-    const errorLine = String(sent.mock.calls[0][0]).split('\n')[1];
-    expect(errorLine.length).toBeLessThan(320);
+    expect(sent).toHaveBeenCalledTimes(1);
+    const m = String(sent.mock.calls[0][0]).match(/Ошибка: <code>([\s\S]*?)<\/code>/);
+    expect(m).not.toBeNull();
+    expect(Array.from(m![1]).length).toBeLessThanOrEqual(300);
   });
 });
 
@@ -416,6 +418,9 @@ describe('reportFromAssistant — путь Б', () => {
     expect((await svc.reportFromAssistant(report({ userId: 'u3' }))).error).toBe('rate_limited');
     await flush();
     expect(sent.mock.calls.map((c) => String(c[0])).filter((t) => t.includes('Общий лимит за час исчерпан'))).toHaveLength(1);
+    expect((await svc.reportFromAssistant(report({ userId: 'u4' }))).error).toBe('rate_limited');
+    await flush();
+    expect(sent.mock.calls.map((c) => String(c[0])).filter((t) => t.includes('Общий лимит за час исчерпан'))).toHaveLength(1);
     now += 61 * MIN;
     expect((await svc.reportFromAssistant(report({ userId: 'u3' }))).ok).toBe(true);
     await flush();
@@ -472,5 +477,10 @@ describe('reportFromAssistant — путь Б', () => {
     await flush();
     expect(String(sent.mock.calls[0][0])).toContain(`🙋 <b>${'Я'.repeat(39)}…: у меня не работает</b>`);
     expect(String(sent.mock.calls[1][0])).toContain('🙋 <b>Ассистент: у меня не работает</b>');
+  });
+
+  it('пустой вызов (null) — failed, а не исключение', async () => {
+    const svc = new ProblemReportService(pgWith() as any);
+    await expect(svc.reportFromAssistant(null as any)).resolves.toEqual({ ok: false, error: 'failed', say: failedSay('web') });
   });
 });

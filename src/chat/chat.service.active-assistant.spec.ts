@@ -12,6 +12,10 @@ describe('ChatService.activeAssistantFor — чей ход сейчас идёт
     expect(withTurns([['u1_12', 100], ['u1_22', 200], ['u2_13', 300]]).activeAssistantFor('u1')).toBe('22');
   });
 
+  it('обычное имя ассистента — не custom, без двоеточия', () => {
+    expect(withTurns([['u1_some_agent', 1]]).activeAssistantFor('u1')).toBe('some_agent');
+  });
+
   it('кастомный ассистент — id целиком, с двоеточием', () => {
     expect(withTurns([['u1_custom:3f2b9c1e-1111-4a2b-9c3d-123456789abc', 5]]).activeAssistantFor('u1'))
       .toBe('custom:3f2b9c1e-1111-4a2b-9c3d-123456789abc');

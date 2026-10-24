@@ -6,11 +6,12 @@ describe('инструмент report_problem', () => {
     expect(REPORT_PROBLEM_TOOL_NAME).toBe(REPORT_PROBLEM_TOOL.name);
     expect(REPORT_PROBLEM_TOOL.input_schema.required).toEqual(['assistant', 'kind', 'summary']);
     expect(REPORT_PROBLEM_TOOL.input_schema.properties.kind.enum).toEqual(['my_failure', 'user_report']);
+    expect(REPORT_PROBLEM_TOOL.input_schema.properties.summary.maxLength).toBe(500);
   });
 
   // Владелец — из подписи токена точки продуктов; поле userId значило бы, что его пишет модель.
   it('аргумента userId нет', () => {
-    expect(Object.keys(REPORT_PROBLEM_TOOL.input_schema.properties)).not.toContain('userId');
+    expect(Object.keys(REPORT_PROBLEM_TOOL.input_schema.properties).sort()).toEqual(['assistant', 'kind', 'summary']);
     expect(REPORT_PROBLEM_TOOL.input_schema.additionalProperties).toBe(false);
   });
 
@@ -21,5 +22,12 @@ describe('инструмент report_problem', () => {
     expect(d).toMatch(/Без имени, телефона/);   // приватность
     expect(d).toMatch(/поле say/);
     expect(d).toMatch(/userId и телефон не передавай/);
+    expect(d).toMatch(/безопасност/);
+    expect(d).toMatch(/reported=true/);
+    expect(d).toMatch(/без пересказа разговора/);
+    expect(d).toMatch(/содержимого его файлов/);
+    expect(d).toMatch(/Срок починки не обещай/);
+    expect(d).toMatch(/как исправить вызов/);
+    expect(d).toMatch(/твой собственный код/);
   });
 });
