@@ -1037,13 +1037,17 @@ describe('skeletonFor', () => {
 });
 
 describe('каркас под ключи, данные и расписание', () => {
-  it('.gitignore у обеих форм прячет data/, .env и node_modules', () => {
+  it('.gitignore у обеих форм прячет data/ и .env, но не прячет node_modules', () => {
     // Раннер коммитит правку целиком (`git add -A`) и пушит её в резервную
     // копию: без .gitignore туда уехали бы и состояние продукта, и файл с
-    // ключами, и зависимости.
+    // ключами. А зависимости обязаны оставаться в коммите: откат правки —
+    // `git reset --hard` без `npm ci`, и спрятанные от git node_modules
+    // остались бы от неудачной правки под старым кодом.
     for (const kind of KINDS) {
       const lines = skeletonFor(kind, 'X', SLUG)['.gitignore'].split('\n');
-      for (const want of ['data/', '.env', '.env.*', 'node_modules/']) expect(lines).toContain(want);
+      for (const want of ['data/', '.env', '.env.*', '!.env.example']) expect(lines).toContain(want);
+      const rules = lines.filter((l) => l.trim() && !l.startsWith('#'));
+      expect(rules.filter((l) => /node_modules/.test(l))).toEqual([]);
     }
   });
 
@@ -1096,6 +1100,9 @@ describe('каркас под ключи, данные и расписание',
       expect(md).toContain('## Данные между перезапусками');
       expect(md).toMatch(/`data\/`/);
       expect(md).toMatch(/\.gitignore/);
+      // Откат возвращает код, но не данные: об этом ассистент обязан знать,
+      // прежде чем менять формат файлов.
+      expect(md).toMatch(/Откат правки возвращает только код/);
     }
   });
 
@@ -1114,7 +1121,12 @@ describe('каркас под ключи, данные и расписание',
   });
 
   it('у бота — кому отвечать данными владельца; у сайта такого раздела нет', () => {
-    expect(skeletonFor('bot', 'X', SLUG)['CLAUDE.md']).toContain('## Кому бот отвечает');
+    const md = skeletonFor('bot', 'X', SLUG)['CLAUDE.md'];
+    expect(md).toContain('## Кому бот отвечает');
     expect(skeletonFor('site', 'X', SLUG)['CLAUDE.md']).not.toContain('## Кому бот отвечает');
+    // Владелец — по chat_id, который он назвал сам, а не «кто первым нажал
+    // /start»: имя бота находится поиском, и первым может оказаться чужой.
+    expect(md).toMatch(/назвал в тексте правки/);
+    expect(md).toMatch(/Не назначать владельцем того, кто первым/);
   });
 });

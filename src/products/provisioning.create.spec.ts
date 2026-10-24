@@ -619,14 +619,33 @@ describe('ProvisioningService.create', () => {
     }
   });
 
+  // ОДНА ТАБЛИЦА НА ТРИ КОПИИ ПРОВЕРКИ: дословно та же стоит в
+  // product-runner/src/host/provision.spec.ts (агент хоста) и в
+  // spirits_front/src/components/products/secretNames.test.ts (форма). Она
+  // перечисляет КАЖДОЕ точное имя и по примеру на каждое семейство — имя,
+  // выпавшее из одной копии, не пройдёт незамеченным.
+  const RESERVED_TABLE = [
+    // точные
+    'LINKEON_URL', 'RUNNER_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'PRODUCT_START_SCRIPT', 'CHECKOUT_PATH',
+    'CLAUDE_BIN', 'PORT', 'HOME', 'PATH', 'NODE_OPTIONS', 'SHELL', 'USER', 'BASH_ENV', 'ENV',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+    'POLL_INTERVAL_MS', 'TURN_TIMEOUT_MS', 'POLL_TIMEOUT_MS', 'REQUEST_TIMEOUT_MS',
+    // семейства
+    'ANTHROPIC_BASE_URL', 'CLAUDE_CONFIG_DIR', 'NODE_TLS_REJECT_UNAUTHORIZED', 'NPM_CONFIG_REGISTRY',
+    'LD_PRELOAD', 'GIT_SSH_COMMAND', 'PM2_HOME', 'SSL_CERT_FILE', 'DOTENV_CONFIG_PATH',
+    // регистр не спасает
+    'https_proxy', 'port', 'npm_config_registry', 'dotenv_key',
+  ];
+  const ALLOWED_TABLE = [
+    'NODE_ENV', 'node_env', 'TZ', 'OZON_API_KEY', 'MY_ANTHROPIC_KEY', 'GITHUB_TOKEN', 'NODEJS_VERSION',
+    'POLL_INTERVAL', 'SSH_KEY', 'BOT_TOKEN',
+  ];
+
   it('имя секрета, занятое платформой, отвергается до всякой записи', async () => {
     // Пока проверка жила только на агенте хоста, сервер такое имя принимал,
     // продукт записывался, а заведение падало в failed уже на машине
     // продуктов — с текстом, которого человек на своём экране не видит.
-    for (const name of [
-      'PORT', 'path', 'LINKEON_URL', 'ANTHROPIC_BASE_URL', 'CLAUDE_CONFIG_DIR', 'https_proxy',
-      'NODE_TLS_REJECT_UNAUTHORIZED', 'LD_PRELOAD', 'GIT_SSH_COMMAND', 'npm_config_registry', 'BASH_ENV',
-    ]) {
+    for (const name of RESERVED_TABLE) {
       const { svc, calls } = makeService();
 
       await expect(
@@ -643,7 +662,7 @@ describe('ProvisioningService.create', () => {
   it('соседи занятых семейств проходят', async () => {
     // Обратная сторона: семейство по префиксу, поставленное шире нужного,
     // отрезало бы законный ключ — GITHUB_TOKEN начинается на GIT, но не на GIT_.
-    for (const name of ['NODE_ENV', 'TZ', 'OZON_API_KEY', 'MY_ANTHROPIC_KEY', 'GITHUB_TOKEN']) {
+    for (const name of ALLOWED_TABLE) {
       const { svc } = makeService();
 
       await expect(

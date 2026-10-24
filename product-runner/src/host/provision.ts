@@ -163,6 +163,14 @@ const RESERVED_ENV = [
   'HTTPS_PROXY',
   'ALL_PROXY',
   'NO_PROXY',
+  // Настройки самого раннера (src/config.ts). `POLL_INTERVAL_MS=5m` из ключа,
+  // заведённого для кода продукта, дал бы NaN — и опрос сервера почти без
+  // паузы; TURN_TIMEOUT_MS длиннее серверных 30 минут — отчёт по ходу,
+  // который сервер уже снял. Что раннер читает из окружения, сторожит тест.
+  'POLL_INTERVAL_MS',
+  'TURN_TIMEOUT_MS',
+  'POLL_TIMEOUT_MS',
+  'REQUEST_TIMEOUT_MS',
 ];
 
 /**
@@ -170,9 +178,12 @@ const RESERVED_ENV = [
  * (ANTHROPIC_BASE_URL — тот же увод запросов с токеном, что и прокси), NODE_* —
  * node раннера и самого claude (NODE_TLS_REJECT_UNAUTHORIZED,
  * NODE_EXTRA_CA_CERTS), NPM_CONFIG_* — npm, LD_* — загрузчик, GIT_* — git
- * раннера, PM2_* — pm2, SSL_* — проверку сертификатов.
+ * раннера, PM2_* — pm2, SSL_* — проверку сертификатов. DOTENV_* читает
+ * `dotenv/config` на старте раннера: DOTENV_CONFIG_PATH на файл из чекаута
+ * подмешал бы в окружение раннера — а с ним и ассистента — что угодно, хоть
+ * ANTHROPIC_BASE_URL.
  */
-const RESERVED_ENV_PREFIXES = ['ANTHROPIC_', 'CLAUDE_', 'NODE_', 'NPM_CONFIG_', 'LD_', 'GIT_', 'PM2_', 'SSL_'];
+const RESERVED_ENV_PREFIXES = ['ANTHROPIC_', 'CLAUDE_', 'NODE_', 'NPM_CONFIG_', 'LD_', 'GIT_', 'PM2_', 'SSL_', 'DOTENV_'];
 
 /** Законное имя внутри занятого семейства: режим node для кода продукта. */
 const RESERVED_ENV_EXCEPTIONS = ['NODE_ENV'];
