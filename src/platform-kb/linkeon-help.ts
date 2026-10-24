@@ -15,6 +15,8 @@ import { renderArticle, renderIndex, topicsFor } from './render';
 export const LINKEON_HELP_TOOL_NAME = 'linkeon_help';
 
 const MAX_TOPICS = 3;
+/** Модель шлёт до трёх; больше — мусор, а без предела огромный массив блокировал бы event loop. */
+const MAX_INPUT_TOPICS = 20;
 const MAX_RELATED = 5;
 const logger = new Logger('LinkeonHelp');
 
@@ -32,15 +34,20 @@ export function parseTopics(input: unknown, known: readonly string[]): string[] 
   const list: unknown[] = Array.isArray(raw) ? raw : typeof raw === 'string' ? [raw] : [];
   const allowed = new Set(known);
   const out: string[] = [];
-  for (const t of list) {
+  for (const t of list.slice(0, MAX_INPUT_TOPICS)) {
     if (typeof t !== 'string') continue;
-    const id = t.trim().toLowerCase();
+    const id = t.slice(0, 64).trim().toLowerCase();
     if (allowed.has(id) && !out.includes(id)) out.push(id);
     if (out.length === MAX_TOPICS) break;
   }
   return out;
 }
 
+/**
+ * Статьи по темам из входа модели. Неизвестные и недоступные клиенту темы отбрасываются;
+ * статья, бросившая при сборке, пропускается; если не собралось ни одной — вместо статей
+ * перечень тем (index), а не ошибка.
+ */
 export function executeLinkeonHelp(
   input: unknown,
   o: { lang: string; client: KbClient },
@@ -54,7 +61,7 @@ export function executeLinkeonHelp(
       articles.push({ id, title: a.title, text: renderArticle(a, o.lang, o.client) });
     } catch (e: any) {
       // Ошибка в коде одной статьи не должна лишать ответа по остальным.
-      logger.warn(`статья ${id} не собралась: ${e?.message}`);
+      logger.warn(`статья ${id} не собралась: ${e?.message ?? String(e)}`);
     }
   }
   if (articles.length === 0) {
