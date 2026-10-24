@@ -4,9 +4,10 @@ export const FAILURE_MARKERS = ['Временный сбой'];
 /**
  * Хвост после вопросительного знака, который не меняет смысла: пробелы,
  * закрывающие кавычки и скобки, эмодзи и их модификаторы (тон кожи,
- * вариант начертания — это символы категории Mark и Extended_Pictographic).
+ * вариант начертания — это символы категории Mark и Extended_Pictographic),
+ * и невидимый соединитель ZWJ составных эмодзи (категория Cf).
  */
-const QUESTION_TAIL = /[\s"'»“”„)\]\p{Extended_Pictographic}\p{M}\p{Emoji_Modifier}]+$/u;
+const QUESTION_TAIL = /[\s"'»“”„)\]\p{Extended_Pictographic}\p{M}\p{Emoji_Modifier}\p{Cf}]+$/u;
 
 /** Встречный вопрос вместо ответа: коротко и кончается вопросительным знаком (хвост из эмодзи и кавычек не мешает). */
 export function isCounterQuestion(answer: string, minChars: number): boolean {
