@@ -6,6 +6,7 @@ import type { KbArticle } from '../kb.types';
 // источник: комнаты — spirits_front src/pages/RoomPage.tsx; src/meeting/room.controller.ts:36-64
 // источник: поведение на встрече — voice-host/src/prompts.ts:210-344, name-gate.ts, occupancy.ts
 // источник: баланс и отказы — src/meeting/meeting.service.ts:63,111-132,181-263
+// источник: Teams — тоже браузерный бот (мост Attendee) — src/meeting/attendee.client.ts:4-9,105-116
 export const meetings: KbArticle = {
   id: 'meetings',
   title: 'Ассистент на встрече',
@@ -40,6 +41,6 @@ ${paid('- Нужен положительный баланс; встреча с�
 - Ничего не помогло — ${q('support')} в разделе ${q('help')}.
 
 ## Как устроено
-Комнаты Linkeon и Taler ID — на LiveKit; в Google Meet, Zoom и Телемост заходит бот-браузер Linkeon, в Teams — бот-участник. Голос — модель реального времени OpenAI.
+Комнаты Linkeon и Taler ID — на LiveKit; в Google Meet, Zoom, Teams и Телемост заходит бот-браузер Linkeon. Голос — модель реального времени OpenAI.
 `,
 };
