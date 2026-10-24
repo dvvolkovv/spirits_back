@@ -34,7 +34,7 @@ export const REPORT_PROBLEM_TOOL = {
       kind: {
         type: 'string',
         enum: ['my_failure', 'user_report'],
-        description: 'my_failure — сломалось у тебя; user_report — пользователь говорит, что в Linkeon что-то не работает.',
+        description: 'my_failure — сломалось в окружении или в платформе, а не в твоём коде; user_report — пользователь говорит, что в Linkeon что-то не работает.',
       },
       summary: {
         type: 'string',

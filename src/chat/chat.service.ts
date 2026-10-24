@@ -388,8 +388,8 @@ export class ChatService {
    * в поддержку (src/problem-report). Ход открыт и в пути релея, и у Маши;
    * ключ activeTurns — `${userId}_${assistantId}`, а в userId подчёркиваний не
    * бывает (телефон или UUID). Хода нет — null. Ход с вложениями
-   * (uploadAndChat) сюда не попадает — там только счётчик activeStreams, и
-   * для него вернётся null.
+   * (uploadAndChat) сюда не попадает: для него вернётся ассистент другого
+   * идущего хода этого пользователя, если такой есть, иначе null.
    */
   activeAssistantFor(userId: string): string | null {
     const prefix = `${userId}_`;
