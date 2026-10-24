@@ -13,6 +13,7 @@ import {
 } from './support.dto';
 import { TelegramNotifierService } from './telegram-notifier.service';
 import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
+import { clip, escapeHtml } from '../problem-report/problem-format';
 import { VideoService } from '../video/video.service';
 import { CreateVideoJobDto, isVeoModel } from '../video/video.dto';
 import { MailService } from '../common/services/mail.service';
@@ -245,16 +246,19 @@ export class SupportService implements OnModuleInit {
     // чтобы сообщение, ждущее живого оператора, не осталось незамеченным.
     if (!process.env.TELEGRAM_SUPPORT_CHAT_ID && telegramConfigured()) {
       const link = `${process.env.ADMIN_ORIGIN || 'https://my.linkeon.io'}/admin`;
+      // Экранируем: `<` или `&` в ответе пользователя заставили бы Telegram отвергнуть сообщение.
+      // Без превью: Telegram не ходит по ссылке из ответа пользователя.
       await sendTelegramAlert(
         `🆘 <b>Поддержка: сообщение ждёт оператора</b>\n` +
-        `Клиент: ${name}\nТикет: <code>${ticketId}</code> (${status})\n` +
-        `«${text.slice(0, 300)}»\n\nОткрыть: ${link}`,
+        `Клиент: ${escapeHtml(name)}\nТикет: <code>${ticketId}</code> (${status})\n` +
+        `«${escapeHtml(clip(text, 300))}»\n\nОткрыть: ${link}`,
+        { disable_web_page_preview: true },
       ).catch(() => {});
     }
     await this.pg.query(
       `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
        VALUES ($1, 'system', NULL, 'user_reply_ping', $2::jsonb)`,
-      [ticketId, JSON.stringify({ preview: text.slice(0, 200) })],
+      [ticketId, JSON.stringify({ preview: clip(text, 200) })],
     );
   }
 

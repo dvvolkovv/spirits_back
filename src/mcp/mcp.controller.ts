@@ -17,12 +17,21 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { CHAT_TOOLS, ChatToolsService } from '../chat/chat-tools';
+import { ChatService } from '../chat/chat.service';
+import { ProblemReportService, SUPPORT_NOTE } from '../problem-report/problem-report.service';
 
 @Controller('/mcp')
 export class McpController {
   private readonly logger = new Logger(McpController.name);
 
-  constructor(private readonly tools: ChatToolsService) {}
+  constructor(
+    private readonly tools: ChatToolsService,
+    // Без @Optional сознательно: модуль, выпавший из McpModule, должен ронять
+    // старт, а не молча выключать сообщения о сбоях — тихий отказ и был
+    // поводом для этой работы (Кира, 24.10.2026).
+    private readonly problems: ProblemReportService,
+    private readonly chat: ChatService,
+  ) {}
 
   private auth(authHeader?: string) {
     const secret = process.env.MCP_SECRET || '';
@@ -68,28 +77,60 @@ export class McpController {
       }),
     }));
 
-    // tools/call — pop userId, delegate to ChatToolsService.executeTool
+    // tools/call — см. callTool.
     server.setRequestHandler(CallToolRequestSchema, async (req: any) => {
       const { name, arguments: args } = req.params ?? {};
-      const userId = args?.userId;
-      if (!userId) {
-        return {
-          content: [
-            { type: 'text', text: JSON.stringify({ ok: false, error: 'userId argument required' }) },
-          ],
-          isError: true,
-        };
-      }
-      const { userId: _omit, ...toolArgs } = args;
-      this.logger.log(`tools/call ${name} userId=${userId}`);
-      const result = await this.tools.executeTool(userId, name, toolArgs);
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result) }],
-        isError: !result.ok,
-      };
+      return this.callTool(name, args);
     });
 
     return server;
+  }
+
+  /**
+   * tools/call: pop userId, delegate to ChatToolsService.executeTool.
+   * Вынесено из makeServer ради проверяемости — как в products-mcp.controller.ts.
+   */
+  async callTool(name: string, args: any) {
+    const userId = args?.userId;
+    if (!userId) {
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify({ ok: false, error: 'userId argument required' }) }],
+        isError: true,
+      };
+    }
+    const { userId: _omit, ...toolArgs } = args;
+    this.logger.log(`tools/call ${name} userId=${userId}`);
+    const result: any = await this.tools.executeTool(userId, name, toolArgs);
+    const notified = !!result && result.ok === false && this.reportFailure(String(userId), String(name), result);
+    // Копия, а не правка объекта инструмента: если ответ когда-нибудь закешируют, поля не протекут в чужие вызовы.
+    const out = notified ? { ...result, supportNotified: true, supportNote: SUPPORT_NOTE } : result;
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify(out) }],
+      isError: !result.ok,
+    };
+  }
+
+  /**
+   * Сбой инструмента — в «Поддержку linkeon» (src/problem-report). Отдаёт,
+   * можно ли сказать ассистенту «команда в курсе»: true, если Telegram
+   * настроен и сбой поставлен в отправку, склеен с уже отправленным или упёрся
+   * в общий потолок. Отправка идёт без ожидания, её исход сюда не доходит:
+   * отказ Telegram true не отменит. Никогда не бросает: исключение при разборе
+   * сбоя превращается в false.
+   */
+  private reportFailure(userId: string, tool: string, result: any): boolean {
+    try {
+      const { supportNotified } = this.problems.reportToolFailure({
+        userId,
+        assistantId: this.chat.activeAssistantFor(userId),
+        tool,
+        error: String(result.error ?? ''),
+      });
+      return supportNotified;
+    } catch (e: any) {
+      this.logger.warn(`сообщение о сбое ${tool} не обработано: ${e?.message}`);
+      return false;
+    }
   }
 
   @Post()

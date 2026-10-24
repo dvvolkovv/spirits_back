@@ -1,5 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
+import { sendTelegramPayload, telegramConfigured } from '../common/telegram-alert';
+import { clip } from '../problem-report/problem-format';
 
 export interface EscalationPayload {
   ticketId: string;
@@ -92,7 +94,9 @@ export class TelegramNotifierService {
   async notifyEscalation(p: EscalationPayload): Promise<void> {
     const name = p.userName || this.maskPhone(p.userId);
     const tokens = (p.userTokens ?? 0).toLocaleString('ru-RU');
-    const short = (s: string, n = 600) => (s.length > n ? s.slice(0, n) + '…' : s);
+    // По кодовым точкам: срез посреди эмодзи оставил бы половинку суррогатной
+    // пары — такой текст Telegram может не принять, и эскалация пропадёт молча.
+    const short = (s: string, n = 600) => clip(s, n);
 
     const text = [
       `${this.urgencyEmoji(p.urgency)} <b>Escalation</b> · ${this.esc(p.urgency || 'normal')}`,
@@ -114,6 +118,20 @@ export class TelegramNotifierService {
       ]],
     };
 
+    // Своего чата нет (TELEGRAM_SUPPORT_CHAT_ID пуст на проде с 18.05.2026 —
+    // эскалации с тех пор молча оседали в логе): шлём тем же путём, что все
+    // алерты, — в чаты TELEGRAM_CHAT_ID (группа «Поддержка linkeon»). Эскалация
+    // несёт имя, почту и последнее сообщение пользователя: кто в этих чатах, тот
+    // их и видит. Здоровье сервисов так не шлём — ~4 ложных сообщения в день.
+    if (!this.isConfigured()) {
+      if (!telegramConfigured()) {
+        this.logger.warn(`telegram not configured — escalation #${p.ticketId.slice(0, 8)} skipped`);
+        return;
+      }
+      await sendTelegramPayload({ text, parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: replyMarkup });
+      this.logger.log(`escalation #${p.ticketId.slice(0, 8)} handed to TELEGRAM_CHAT_ID fan-out; per-chat failures are logged above as "not delivered"`);
+      return;
+    }
     await this.send(text, replyMarkup);
   }
 
