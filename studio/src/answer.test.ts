@@ -25,3 +25,10 @@ test('встречный вопрос узнаётся и с эмодзи, ка�
   assert.equal(isCounterQuestion('Уточните город? ', 400), true);
   assert.equal(isCounterQuestion('Готово 😊', 400), false);
 });
+
+test('встречный вопрос узнаётся и с составным эмодзи после «?»', () => {
+  const coder = String.fromCodePoint(0x1f468, 0x200d, 0x1f4bb);
+  assert.equal(isCounterQuestion(`Вопрос? ${coder}`, 400), true);
+  assert.equal(isCounterQuestion(`Уточнить?${coder}${coder}`, 400), true);
+  assert.equal(isCounterQuestion(`Готово ${coder}`, 400), false);
+});
