@@ -1,7 +1,10 @@
 /**
  * Тексты сообщений в группу «Поддержка linkeon» (parse_mode HTML).
  *
- * Чистые функции: всё, что приходит снаружи, экранируется и обрезается.
+ * Чистые функции: всё, что приходит снаружи, сводится в одну строку, обрезается
+ * и экранируется, поэтому сообщение всегда разбирается и короче лимита Telegram
+ * (4096). Это важно: об отказе Telegram отправка не узнаёт
+ * (common/telegram-alert.ts только пишет в лог), и сбой ушёл бы в тишину.
  * Аргументов инструмента (промпт видео, текст озвучки) здесь нет и быть не
  * должно — решение владельца 24.10.2026: в группу уходит только служебное.
  */
@@ -21,19 +24,42 @@ const TOOL_ACTIONS: Record<string, string> = {
   calculate_human_design: 'рассчитать бодиграф',
 };
 
-export function toolAction(tool: string): string {
-  return TOOL_ACTIONS[tool] ?? `выполнить ${tool}`;
-}
+const FALLBACK_NAME = 'Ассистент';
+/** Потолки полей: всё сообщение — около 1,3 тыс. видимых символов при лимите Telegram 4096. */
+const MAX_NAME = 40;
+const MAX_ID = 64;
+const MAX_ERROR = 300;
+const MAX_SUMMARY = 500;
 
 export function escapeHtml(s: string): string {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-/** Обрезает до max символов (кодовых точек — эмодзи не рвётся пополам) вместе с многоточием. */
+/** Одна строка: переводы строк и повторы пробелов чужого текста — в один пробел. */
+export function oneLine(s: string): string {
+  return String(s ?? '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Обрезает до max символов вместе с многоточием. Режет по кодовым точкам —
+ * суррогатную пару (эмодзи) не рвёт; составные эмодзи (ZWJ, флаги) может
+ * разделить, Telegram такое принимает. В массив разворачивает только начало
+ * строки: пересказ модели на пути Б по длине ничем больше не ограничен.
+ */
 export function clip(s: string, max: number): string {
   const t = String(s ?? '').trim();
-  const chars = Array.from(t);
-  return chars.length > max ? `${chars.slice(0, max - 1).join('')}…` : t;
+  if (t.length <= max) return t;
+  // max+1 кодовых точек всегда умещаются в 2·max+2 единицах UTF-16.
+  const chars = Array.from(t.slice(0, 2 * max + 2));
+  return chars.length > max ? `${chars.slice(0, max - 1).join('').trimEnd()}…` : t;
+}
+
+export function toolAction(tool: string): string {
+  // Своё свойство, а не через прототип: «toString» и «constructor» не должны
+  // превращаться в текст функции.
+  return Object.prototype.hasOwnProperty.call(TOOL_ACTIONS, tool)
+    ? TOOL_ACTIONS[tool]
+    : `выполнить ${clip(oneLine(tool), MAX_ID)}`;
 }
 
 const RU = new Intl.PluralRules('ru');
@@ -53,6 +79,15 @@ export interface Repeats {
   users: number;
 }
 
+/** Имя ассистента для заголовка: одна строка, не длиннее 40, пустое — «Ассистент». */
+function nameOf(assistant: string): string {
+  return escapeHtml(clip(oneLine(assistant), MAX_NAME) || FALLBACK_NAME);
+}
+
+function userLine(userId: string): string {
+  return `Пользователь: <code>${escapeHtml(clip(oneLine(userId), MAX_ID))}</code>`;
+}
+
 export function formatToolFailure(p: {
   assistant: string;
   tool: string;
@@ -61,9 +96,9 @@ export function formatToolFailure(p: {
   repeats?: Repeats | null;
 }): string {
   const lines = [
-    `🛠 <b>${escapeHtml(clip(p.assistant, 40))}: не получилось ${escapeHtml(toolAction(p.tool))}</b>`,
-    `Ошибка: <code>${escapeHtml(clip(p.error, 300))}</code>`,
-    `Пользователь: <code>${escapeHtml(p.userId)}</code>`,
+    `🛠 <b>${nameOf(p.assistant)}: не получилось ${escapeHtml(toolAction(p.tool))}</b>`,
+    `Ошибка: <code>${escapeHtml(clip(p.error, MAX_ERROR))}</code>`,
+    userLine(p.userId),
   ];
   if (p.repeats && p.repeats.count > 0) {
     lines.push(`С прошлого сообщения: ещё ${timesRu(p.repeats.count)} ${usersRu(p.repeats.users)}`);
@@ -81,13 +116,13 @@ export function formatAssistantReport(p: {
   userId: string;
   channel: ProblemChannel;
 }): string {
-  const who = escapeHtml(clip(p.assistant, 40));
+  const who = nameOf(p.assistant);
   const head = p.kind === 'user_report'
     ? `🙋 <b>${who} передаёт жалобу пользователя</b>`
     : `🙋 <b>${who}: у меня не работает</b>`;
   return [
     head,
-    `«${escapeHtml(clip(p.summary, 500))}»`,
-    `Пользователь: <code>${escapeHtml(p.userId)}</code> · ${p.channel === 'telegram' ? 'Telegram' : 'веб'}`,
+    `«${escapeHtml(clip(oneLine(p.summary), MAX_SUMMARY))}»`,
+    `${userLine(p.userId)} · ${p.channel === 'telegram' ? 'Telegram' : 'веб'}`,
   ].join('\n');
 }

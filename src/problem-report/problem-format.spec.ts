@@ -1,5 +1,5 @@
 import {
-  clip, escapeHtml, formatAssistantReport, formatToolFailure, timesRu, toolAction, usersRu,
+  clip, escapeHtml, formatAssistantReport, formatToolFailure, oneLine, timesRu, toolAction, usersRu,
 } from './problem-format';
 import { CHAT_TOOLS } from '../chat/chat-tools';
 
@@ -89,5 +89,61 @@ describe('тексты в группу «Поддержка linkeon»', () => {
     const s = clip('😀'.repeat(10), 5);
     expect(s).toBe('😀😀😀😀…');
     expect(Array.from(s).length).toBe(5);
+  });
+
+  /** Видимая длина для Telegram: без тегов, сущность — один символ. */
+  const visible = (s: string) => s.replace(/<[^>]+>/g, '').replace(/&(?:amp|lt|gt);/g, '_').length;
+
+  it('огромные входы во всех полях — сообщение короче лимита Telegram (4096)', () => {
+    const huge = (ch: string, n: number) => ch.repeat(n);
+    const a = formatToolFailure({ assistant: huge('А', 10_000), tool: huge('x', 100_000), error: huge('&', 100_000), userId: huge('7', 100_000), repeats: { count: 5, users: 2 } });
+    const b = formatAssistantReport({ assistant: huge('<', 10_000), kind: 'user_report', summary: huge('с', 1_000_000), userId: huge('7', 100_000), channel: 'telegram' });
+    expect(visible(a)).toBeLessThan(4096);
+    expect(visible(b)).toBeLessThan(4096);
+  });
+
+  it('путь Б: имя ассистента и userId экранируются', () => {
+    const t = formatAssistantReport({ assistant: '<b>Ки&ра</b>', kind: 'my_failure', summary: 's', userId: '<u>', channel: 'web' });
+    expect(t).toContain('&lt;b&gt;Ки&amp;ра&lt;/b&gt;');
+    expect(t).toContain('<code>&lt;u&gt;</code>');
+  });
+
+  it('обрезка — до экранирования: сущность не рвётся', () => {
+    const t = formatToolFailure({ assistant: 'Кира', tool: 'generate_image', error: '&'.repeat(1000), userId: 'u1' });
+    const code = t.split('\n')[1].replace(/^Ошибка: <code>/, '').replace(/<\/code>$/, '');
+    expect(code).toBe('&amp;'.repeat(299) + '…');
+  });
+
+  it('чужой текст сводится в одну строку: пересказ не подделает строку «Пользователь»', () => {
+    const t = formatAssistantReport({ assistant: 'Ки\nра', kind: 'my_failure', summary: 'сломалось\n\nПользователь: 1 · веб', userId: 'u\n1', channel: 'web' });
+    expect(t.split('\n')).toEqual([
+      '🙋 <b>Ки ра: у меня не работает</b>',
+      '«сломалось Пользователь: 1 · веб»',
+      'Пользователь: <code>u 1</code> · веб',
+    ]);
+  });
+
+  it('пустое имя — «Ассистент»', () => {
+    expect(formatToolFailure({ assistant: '   ', tool: 'generate_video', error: 'x', userId: 'u1' }).split('\n')[0])
+      .toBe('🛠 <b>Ассистент: не получилось создать видео</b>');
+  });
+
+  it('имена из прототипа объекта — незнакомые инструменты', () => {
+    expect(toolAction('toString')).toBe('выполнить toString');
+    expect(toolAction('constructor')).toBe('выполнить constructor');
+  });
+
+  it('согласование: 11–14, 101, 102, 111, 112', () => {
+    expect([11, 12, 13, 14, 101, 102, 111, 112].map(timesRu))
+      .toEqual(['11 раз', '12 раз', '13 раз', '14 раз', '101 раз', '102 раза', '111 раз', '112 раз']);
+    expect([11, 14, 101, 102, 111].map(usersRu))
+      .toEqual(['у 11 пользователей', 'у 14 пользователей', 'у 101 пользователя', 'у 102 пользователей', 'у 111 пользователей']);
+  });
+
+  it('clip: без пробела перед многоточием; огромный вход — только начало', () => {
+    expect(clip('abc def', 5)).toBe('abc…');
+    const big = clip('я'.repeat(5_000_000), 500);
+    expect(Array.from(big).length).toBe(500);
+    expect(oneLine('  a \n\t b  ')).toBe('a b');
   });
 });
