@@ -1052,11 +1052,9 @@ Expected: FAIL — `svc.reportFromAssistant is not a function` (и `REPORTED_SAY
 
 В `src/problem-report/problem-report.service.ts`:
 
-1) Импорт форматтера заменить на:
+1) В существующий импорт из `./problem-format` ДОБАВИТЬ `formatAssistantReport`, `ProblemChannel`, `ProblemKind` (не заменять: после ревью задачи 3 там уже `clip`, `FALLBACK_NAME`, `formatToolCapNotice`, `head`, `isKnownTool`, `oneLine` — без них сервис упадёт в рантайме, а jest типы не проверяет).
 
-```ts
-import { formatAssistantReport, formatToolFailure, ProblemChannel, ProblemKind, Repeats } from './problem-format';
-```
+> После ревью задач 1–3 код сервиса отличается от блоков этого плана (общий потолок пути А, копии вместо срезов, хэш-ключ склейки, таймаут имени ассистента) — источник правды: код ветки и спека, раздел «Склейка».
 
 2) После `SUPPORT_NOTE` добавить:
 
