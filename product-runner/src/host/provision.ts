@@ -150,7 +150,61 @@ const RESERVED_ENV = [
   'HOME',
   'PATH',
   'NODE_OPTIONS',
+  // Дальше — не наши переменные, а те, что меняют поведение процессов
+  // платформы в контейнере. Окружение у раннера, ассистента правок (claude),
+  // pm2 и git общее с продуктом: прокси увёл бы запросы ассистента вместе с
+  // OAuth-токеном на чужой адрес, BASH_ENV подсунул бы свой файл в каждую
+  // команду ассистента.
+  'SHELL',
+  'USER',
+  'BASH_ENV',
+  'ENV',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'ALL_PROXY',
+  'NO_PROXY',
+  // Настройки самого раннера (src/config.ts). `POLL_INTERVAL_MS=5m` из ключа,
+  // заведённого для кода продукта, дал бы NaN — и опрос сервера почти без
+  // паузы; TURN_TIMEOUT_MS длиннее серверных 30 минут — отчёт по ходу,
+  // который сервер уже снял. Что раннер читает из окружения, сторожит тест.
+  'POLL_INTERVAL_MS',
+  'TURN_TIMEOUT_MS',
+  'POLL_TIMEOUT_MS',
+  'REQUEST_TIMEOUT_MS',
 ];
+
+/**
+ * Занятые целиком семейства. ANTHROPIC_* и CLAUDE_* читает ассистент правок
+ * (ANTHROPIC_BASE_URL — тот же увод запросов с токеном, что и прокси), NODE_* —
+ * node раннера и самого claude (NODE_TLS_REJECT_UNAUTHORIZED,
+ * NODE_EXTRA_CA_CERTS), NPM_CONFIG_* — npm, LD_* — загрузчик, GIT_* — git
+ * раннера, PM2_* — pm2, SSL_* — проверку сертификатов. DOTENV_* читает
+ * `dotenv/config` на старте раннера: DOTENV_CONFIG_PATH на файл из чекаута
+ * подмешал бы в окружение раннера — а с ним и ассистента — что угодно, хоть
+ * ANTHROPIC_BASE_URL.
+ */
+const RESERVED_ENV_PREFIXES = ['ANTHROPIC_', 'CLAUDE_', 'NODE_', 'NPM_CONFIG_', 'LD_', 'GIT_', 'PM2_', 'SSL_', 'DOTENV_'];
+
+/** Законное имя внутри занятого семейства: режим node для кода продукта. */
+const RESERVED_ENV_EXCEPTIONS = ['NODE_ENV'];
+
+/**
+ * Занято ли имя. Без учёта регистра: `https_proxy` и `npm_config_registry`
+ * читают в нижнем регистре так же, как в верхнем.
+ *
+ * ТРИ КОПИИ ОДНОЙ ПРОВЕРКИ. Эта — последний рубеж перед `docker run -e`.
+ * Вторая — `isReservedSecretName` на сервере (`src/products/provisioning.service.ts`):
+ * она отвечает 400 до записи продукта. Третья — в форме кабинета
+ * (`spirits_front/src/components/products/secretNames.ts`), ради объяснения на
+ * месте. Разъехаться им нельзя: имя, которое сервер принял, а хост отверг,
+ * роняет заведение в failed уже после записи продукта — так и было, пока
+ * проверка жила только здесь.
+ */
+export function isReservedEnvName(name: string): boolean {
+  const upper = name.toUpperCase();
+  if (RESERVED_ENV_EXCEPTIONS.includes(upper)) return false;
+  return RESERVED_ENV.includes(upper) || RESERVED_ENV_PREFIXES.some((p) => upper.startsWith(p));
+}
 
 /**
  * Точка входа продукта — ПУТЬ К ФАЙЛУ, а не команда.
@@ -265,7 +319,7 @@ function validateSecrets(raw: Record<string, string> | undefined): Array<[string
       // и в журнал, а секрет клиента там оказаться не должен.
       throw new Error(`имя секрета не годится: ${JSON.stringify(key)}`);
     }
-    if (RESERVED_ENV.includes(key)) {
+    if (isReservedEnvName(key)) {
       throw new Error(`имя секрета занято переменной провижининга: ${key}`);
     }
     if (typeof value !== 'string') {
@@ -426,7 +480,10 @@ export async function provision(job: ProvisionJob, deps: ProvisionDeps): Promise
   // исправного контейнера.
   for (const name of job.customNames ?? []) assertDomainName(name);
 
-  const files = skeletonFor(job.kind, job.name, job.slug);
+  // Имена ключей — в инструкцию ассистенту, значения — только в `-e` ниже.
+  // Берутся из проверенного набора, а не из job.secrets: имя не по форме сюда
+  // не доходит вовсе (validateSecrets уже бросил бы).
+  const files = skeletonFor(job.kind, job.name, job.slug, secrets.map(([key]) => key));
   if (!(START_SCRIPT in files) || !START_SCRIPT_RE.test(START_SCRIPT)) {
     throw new Error(
       `PRODUCT_START_SCRIPT=${START_SCRIPT} — не файл каркаса: pm2 получит оболочку вместо процесса`,

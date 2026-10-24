@@ -141,6 +141,30 @@ const SECRET_NAME_MAX = 64;
 const SECRET_VALUE_MAX = 8192;
 const SECRET_COUNT_MAX = 64;
 
+// Занятые имена — копия списка агента хоста (`isReservedEnvName` в
+// product-runner/src/host/provision.ts, там же объяснение каждого имени) и
+// формы кабинета (spirits_front, src/components/products/secretNames.ts).
+// Разъехаться им нельзя. Пока проверка жила только на хосте, имя вроде PORT
+// сервер принимал, продукт записывался, а заведение падало в failed уже на
+// машине продуктов — с текстом, которого человек на своём экране не видит.
+const RESERVED_SECRET_NAMES = [
+  'LINKEON_URL', 'RUNNER_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'PRODUCT_START_SCRIPT',
+  'CHECKOUT_PATH', 'CLAUDE_BIN', 'PORT', 'HOME', 'PATH', 'NODE_OPTIONS',
+  'SHELL', 'USER', 'BASH_ENV', 'ENV', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+  'POLL_INTERVAL_MS', 'TURN_TIMEOUT_MS', 'POLL_TIMEOUT_MS', 'REQUEST_TIMEOUT_MS',
+];
+const RESERVED_SECRET_PREFIXES = [
+  'ANTHROPIC_', 'CLAUDE_', 'NODE_', 'NPM_CONFIG_', 'LD_', 'GIT_', 'PM2_', 'SSL_', 'DOTENV_',
+];
+const RESERVED_SECRET_EXCEPTIONS = ['NODE_ENV'];
+
+/** Без учёта регистра: `https_proxy` читают так же, как `HTTPS_PROXY`. */
+export function isReservedSecretName(name: string): boolean {
+  const upper = name.toUpperCase();
+  if (RESERVED_SECRET_EXCEPTIONS.includes(upper)) return false;
+  return RESERVED_SECRET_NAMES.includes(upper) || RESERVED_SECRET_PREFIXES.some((p) => upper.startsWith(p));
+}
+
 // Путь ВНУТРИ контейнера продукта, а не на хосте: раннер живёт внутри
 // контейнера (агент провижининга — снаружи), и чекаут там у всех продуктов
 // один и тот же. Хостовые пути вида /home/dv/selyanska остались от прежней
@@ -488,6 +512,9 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       }
       if (name.length > SECRET_NAME_MAX) {
         throw new BadRequestException(`имя секрета длиннее ${SECRET_NAME_MAX} символов`);
+      }
+      if (isReservedSecretName(name)) {
+        throw new BadRequestException(`имя секрета ${name} занято платформой — назовите ключ иначе`);
       }
       if (typeof value !== 'string' || value === '') {
         throw new BadRequestException(`секрет ${name}: значение должно быть непустой строкой`);

@@ -42,6 +42,12 @@ function required(env: NodeJS.ProcessEnv, key: string): string {
   return value;
 }
 
+/**
+ * Каждое имя, которое отсюда читается, обязано быть занятым для секретов
+ * клиента (`isReservedEnvName` в host/provision.ts и две его копии): иначе ключ,
+ * заведённый для кода продукта, перенастроит раннер. Сторожит provision.spec.ts
+ * — он вызывает loadConfig на подставном окружении и собирает прочитанные имена.
+ */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   return {
     // Хвостовой слеш дал бы https://host//webhook/... — nginx такие пути не

@@ -6,8 +6,9 @@ import { existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { promisify } from 'util';
-import { ProvisionDeps, ProvisionJob, hostDeps, provision } from './provision';
+import { ProvisionDeps, ProvisionJob, hostDeps, isReservedEnvName, provision } from './provision';
 import { skeletonFor } from './skeleton';
+import { loadConfig } from '../config';
 
 const execFileAsync = promisify(execFile);
 
@@ -678,6 +679,22 @@ describe('на настоящей файловой системе', () => {
 
     expect(await readFile(join(dir, 'server.js'), 'utf8')).toBe('работа клиента');
   });
+
+  it('data/ и .env не уезжают в git даже через git add -A, как делает раннер', async () => {
+    // Раннер коммитит правку целиком (`git add -A`) и пушит её в резервную
+    // копию. Состояние бота и файл с ключами, если он появится, туда попасть
+    // не должны — их держит .gitignore каркаса.
+    await provision(job(), realDeps());
+    const dir = join(root, 'kafe-ulej');
+    await mkdir(join(dir, 'data'), { recursive: true });
+    await writeFile(join(dir, 'data', 'state.json'), '{"lastRun":"2026-10-24"}', 'utf8');
+    await writeFile(join(dir, '.env'), 'OZON_API_KEY=ключ', 'utf8');
+
+    await execFileAsync('git', ['add', '-A'], { cwd: dir });
+
+    const status = await execFileAsync('git', ['status', '--porcelain'], { cwd: dir });
+    expect(status.stdout.trim()).toBe('');
+  });
 });
 
 describe('настоящие реализации для хоста', () => {
@@ -1016,5 +1033,89 @@ describe('waitPort отличает поднявшийся продукт от d
     await new Promise((r) => server.close(r));
 
     expect(up).toBe(false);
+  });
+});
+
+describe('занятые имена секретов: процессы платформы в контейнере', () => {
+  // Окружение контейнера общее у продукта и у процессов платформы: раннера,
+  // ассистента правок (claude), pm2 и git. ANTHROPIC_BASE_URL или прокси
+  // увели бы запросы ассистента вместе с OAuth-токеном на чужой адрес.
+  //
+  // ОДНА ТАБЛИЦА НА ТРИ КОПИИ ПРОВЕРКИ: дословно та же стоит в
+  // src/products/provisioning.create.spec.ts (сервер) и в
+  // spirits_front/src/components/products/secretNames.test.ts (форма). Она
+  // перечисляет КАЖДОЕ точное имя и по примеру на каждое семейство — имя,
+  // выпавшее из одной копии, не пройдёт незамеченным.
+  const RESERVED_TABLE = [
+    // точные
+    'LINKEON_URL', 'RUNNER_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'PRODUCT_START_SCRIPT', 'CHECKOUT_PATH',
+    'CLAUDE_BIN', 'PORT', 'HOME', 'PATH', 'NODE_OPTIONS', 'SHELL', 'USER', 'BASH_ENV', 'ENV',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+    'POLL_INTERVAL_MS', 'TURN_TIMEOUT_MS', 'POLL_TIMEOUT_MS', 'REQUEST_TIMEOUT_MS',
+    // семейства
+    'ANTHROPIC_BASE_URL', 'CLAUDE_CONFIG_DIR', 'NODE_TLS_REJECT_UNAUTHORIZED', 'NPM_CONFIG_REGISTRY',
+    'LD_PRELOAD', 'GIT_SSH_COMMAND', 'PM2_HOME', 'SSL_CERT_FILE', 'DOTENV_CONFIG_PATH',
+    // регистр не спасает
+    'https_proxy', 'port', 'npm_config_registry', 'dotenv_key',
+  ];
+  const ALLOWED_TABLE = [
+    'NODE_ENV', 'node_env', 'TZ', 'OZON_API_KEY', 'MY_ANTHROPIC_KEY', 'GITHUB_TOKEN', 'NODEJS_VERSION',
+    'POLL_INTERVAL', 'SSH_KEY', 'BOT_TOKEN',
+  ];
+
+  it.each(RESERVED_TABLE)('секрет %s отвергается до изменений на хосте', async (key) => {
+    const h = new FakeHost();
+
+    await expect(
+      provision(job({ secrets: { [key]: 'подмена' } }), deps(h)),
+    ).rejects.toThrow(/имя секрета занято/);
+    expect(h.containers.size).toBe(0);
+    expect(h.dirs.size).toBe(0);
+  });
+
+  it.each(ALLOWED_TABLE)('секрет %s проходит: соседство с занятым семейством — не занятость', async (key) => {
+    const h = new FakeHost();
+
+    await provision(job({ secrets: { [key]: 'значение' } }), deps(h));
+
+    expect(h.containers.get('kafe-ulej')!.env[key]).toBe('значение');
+  });
+
+  it('каждое имя, которое раннер читает из окружения, занято для секретов клиента', () => {
+    // Сторож на будущее: новая настройка раннера (src/config.ts), не внесённая
+    // в занятые, снова дала бы клиенту перенастроить раннер ключом своего
+    // продукта — как POLL_INTERVAL_MS до этой правки.
+    const read = new Set<string>();
+    const env = new Proxy({} as NodeJS.ProcessEnv, {
+      get: (_target, key) => {
+        if (typeof key === 'string') read.add(key);
+        return 'x';
+      },
+    });
+
+    loadConfig(env);
+
+    expect(read.size).toBeGreaterThan(5);
+    expect([...read].filter((key) => !isReservedEnvName(key))).toEqual([]);
+  });
+});
+
+describe('ключи владельца в каркасе', () => {
+  it('имена ключей доезжают в CLAUDE.md, а значения — ни в один файл чекаута', async () => {
+    await provision(
+      job({
+        slug: 'bot-ulej',
+        kind: 'bot',
+        secrets: { BOT_TOKEN: 'значение-токена', OZON_API_KEY: 'значение-ключа' },
+      }),
+      deps(host),
+    );
+
+    const files = host.dirs.get('/srv/products/bot-ulej')!;
+    expect(files['CLAUDE.md']).toContain('- `OZON_API_KEY`');
+    const leaked = Object.entries(files)
+      .filter(([, content]) => content.includes('значение-токена') || content.includes('значение-ключа'))
+      .map(([file]) => file);
+    expect(leaked).toEqual([]);
   });
 });
