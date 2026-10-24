@@ -1,6 +1,7 @@
 import { Body, Controller, Get, Param, Patch, Query, Req, Res, UseGuards, Optional } from '@nestjs/common';
 import { Response } from 'express';
 import { JwtGuard } from '../common/guards/jwt.guard';
+import { AdminGuard } from '../common/guards/admin.guard';
 import { TasksService } from './tasks.service';
 
 /**
@@ -10,13 +11,18 @@ import { TasksService } from './tasks.service';
  * Endpoints live in tasks module rather than admin.controller because
  * the admin module had been losing edits to drift; keeping tasks
  * routing isolated avoids that conflict.
+ *
+ * Маршруты admin/… — под JwtGuard + AdminGuard. JwtGuard проверяет только
+ * «залогинен» и проставляет isAdmin, но не отказывает: до 24.10.2026 здесь
+ * стоял один JwtGuard, и любой пользователь читал чужие задачи по номеру.
+ * Сторож — src/common/guards/admin-routes.spec.ts.
  */
 @Controller('')
 export class TasksController {
   constructor(@Optional() private readonly tasks?: TasksService) {}
 
   @Get('admin/users/:phone/tasks')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtGuard, AdminGuard)
   async list(@Param('phone') phone: string, @Res() res: Response) {
     if (!this.tasks) return res.status(503).json({ error: 'tasks service not configured' });
     const items = await this.tasks.listForAdmin(phone);
@@ -24,7 +30,7 @@ export class TasksController {
   }
 
   @Get('admin/tasks/:taskId')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtGuard, AdminGuard)
   async details(
     @Param('taskId') taskId: string,
     @Query('limit') limit: string | undefined,
