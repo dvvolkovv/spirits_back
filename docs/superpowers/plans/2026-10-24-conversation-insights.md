@@ -806,7 +806,8 @@ export function parseFindings(text: string, labels: readonly Label[], prior: rea
     const description = textField(r?.description, 300);
     const proposal = textField(r?.proposal, 300);
     if (!title || !description || !proposal) continue;
-    const people = [...new Set((Array.isArray(r?.people) ? r.people : []).map(Number))].filter((n) => persons.has(n));
+    const rawPeople: unknown[] = Array.isArray(r?.people) ? r.people : [];
+    const people = [...new Set(rawPeople.map((x) => Number(x)))].filter((n) => persons.has(n));
     if (!people.length) continue;
     const own = labels.filter((l) => people.includes(l.person) && l.type === type);
     const basis = own.length ? own : labels.filter((l) => people.includes(l.person));
