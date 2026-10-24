@@ -275,7 +275,8 @@ describe('reportToolFailure — путь А', () => {
     const svc = new ProblemReportService(pgWith() as any);
     svc.reportToolFailure(failure({ error: ' '.repeat(3_000_000) + 'boom' + ' '.repeat(3_000_000) }));
     await flush();
-    expect(String(sent.mock.calls[0][0])).toContain('Ошибка: <code>…</code>');
+    const errorLine = String(sent.mock.calls[0][0]).split('\n')[1];
+    expect(errorLine.length).toBeLessThan(320);
   });
 });
 
@@ -413,6 +414,8 @@ describe('reportFromAssistant — путь Б', () => {
     await svc.reportFromAssistant(report({ userId: 'u1' }));
     await svc.reportFromAssistant(report({ userId: 'u2' }));
     expect((await svc.reportFromAssistant(report({ userId: 'u3' }))).error).toBe('rate_limited');
+    await flush();
+    expect(sent.mock.calls.map((c) => String(c[0])).filter((t) => t.includes('Общий лимит за час исчерпан'))).toHaveLength(1);
     now += 61 * MIN;
     expect((await svc.reportFromAssistant(report({ userId: 'u3' }))).ok).toBe(true);
     await flush();

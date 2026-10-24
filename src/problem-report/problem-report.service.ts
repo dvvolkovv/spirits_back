@@ -196,12 +196,12 @@ export class ProblemReportService {
         : { ok: false, error: 'not_configured', say: notConfiguredSay(p.channel) };
     } catch (e: any) {
       this.logger.warn(`problem-report: сообщение ассистента не обработано: ${e?.message}`);
-      return { ok: false, error: 'failed', say: failedSay(p.channel) };
+      return { ok: false, error: 'failed', say: failedSay(p?.channel) };
     }
   }
 
   /**
-   * Скользящие окна: час и сутки на пользователя, сутки на всех. Отказ квоту не
+   * Скользящие окна: час и сутки на пользователя, час и сутки на всех. Отказ квоту не
    * тратит. Метки «из будущего» (часы шагнули назад) считаем истёкшими.
    */
   private takeQuota(userId: string, now: number): 'ok' | 'user_hour' | 'user_day' | 'global_hour' | 'global_day' {
