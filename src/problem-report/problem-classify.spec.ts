@@ -1,0 +1,112 @@
+import { failureSignature, isUserSideToolError } from './problem-classify';
+
+/**
+ * Каждая строка — настоящее сообщение инструментов Linkeon (chat-tools.ts,
+ * misc.service.ts, video.service.ts, speech.service.ts, calendar.service.ts,
+ * routine-store.service.ts, hd-tool.service.ts) или провайдера.
+ */
+describe('isUserSideToolError: виноват ли не сервис', () => {
+  // Сбои — о них команда должна узнать.
+  it.each([
+    'Veo generate failed: This model models/veo-3.1-fast-generate-preview is no longer available. Please update your code to use models/gemini-omni-1.1-flash for the latest features and improvements.',
+    'Модель не вернула изображений (IMAGE_RECITATION). Попробуйте ещё раз или измените промпт.',
+    'Модель не вернула изображение',
+    'Google не успел обработать картинку за 5 минут. Попробуйте повторить — обычно помогает.',
+    'tts failed',
+    'tts_failed',
+    'Инструмент расчёта временно недоступен — посчитайте прежним способом.',
+    'Veo is not configured (GOOGLE_AI_API_KEY)',
+    'Google AI API key not configured',
+    'Veo: на сегодня исчерпан дневной лимит генераций видео. Лимит обновляется раз в сутки около 10:00–11:00 МСК — попробуйте позже. (админу: повысить квоту Veo для ключа в Google AI Studio / Cloud Console.)',
+    'tool execution failed',
+    'unknown tool: generate_kling',
+    'image generation failed',
+    'не удалось прочитать календарь',
+    'connect ECONNREFUSED 127.0.0.1:5433',
+    'timeout of 30000ms exceeded',
+  ])('сбой: %s', (error) => {
+    expect(isUserSideToolError(error)).toBe(false);
+  });
+
+  // Виноват не сервис — в группу не идёт.
+  it.each([
+    'insufficient_tokens',
+    'empty prompt',
+    'empty text',
+    'empty_text',
+    'text_too_long',
+    'rate_limited',
+    'Missing prompt',
+    'Missing sourceImageUrl',
+    'sourceImageUrl required',
+    'banner requires at least title, subtitle or cta',
+    'compose_image requires at least 2 sourceImageUrls',
+    'compose_image supports at most 3 sourceImageUrls',
+    'Veo requires a prompt',
+    'image2video requires sourceImageUrl(s)',
+    'Veo supports mode text2video or image2video',
+    'Veo length must be 4–60 seconds',
+    'unsupported video model: kling-v1-6 (only veo-3.1-fast, veo-3.1)',
+    'too many concurrent jobs — wait for one to finish',
+    'own voice not ready — upload a voice sample first',
+    'title обязателен',
+    'from и to обязательны (период чтения календаря)',
+    'Укажи ровно один способ времени для события: datetime (разово), recurrence (регулярный повтор) или dates (набор дат)',
+    'Укажи assistant — своё имя ассистента (например "Райя"), чтобы привязать рутину к тебе.',
+    'recurrence требует datetime — время первого вхождения серии',
+    'recurrence.count должен быть целым числом от 1 до 100',
+    'dates не должен быть пустым',
+    'dates: максимум 100 элементов',
+    'некорректные даты периода',
+    'конец периода должен быть позже начала',
+    'период слишком большой (максимум 366 дней)',
+    'Нужен город рождения.',
+    'Нужен хотя бы заголовок, подзаголовок или CTA',
+    'Проверьте дату рождения: формат ГГГГ-ММ-ДД, существующий день.',
+    'Проверьте время рождения: формат ЧЧ:ММ.',
+    'Дата рождения в будущем — проверьте год.',
+    'cityId не из вариантов прошлого ответа — вызовите без cityId.',
+    'Город «Куйбышев» не найден в базе. Передайте нынешнее официальное название',
+    'ссылка не принята: адрес ведёт во внутреннюю сеть',
+    'Invalid data URL',
+    'URL did not return an image',
+    'bad mime type for image: text/html',
+    'file too large (max 10 MB)',
+    'Запрос отклонён модерацией — попробуйте переформулировать',
+    'limit reached: не больше 10 рутин',
+    'job not found',
+    'not your job',
+  ])('не сбой: %s', (error) => {
+    expect(isUserSideToolError(error)).toBe(true);
+  });
+
+  it('пустая или отсутствующая ошибка — сбой: неизвестное не глушим', () => {
+    expect(isUserSideToolError('')).toBe(false);
+    expect(isUserSideToolError(undefined)).toBe(false);
+  });
+});
+
+describe('failureSignature: подпись для склейки', () => {
+  it('числа, id и адреса не плодят подписей', () => {
+    const a = failureSignature('generate_video', 'job 3f2b9c1e-1111-4a2b-9c3d-123456789abc failed after 37s, see https://x.y/op/123');
+    const b = failureSignature('generate_video', 'job 9a8b7c6d-2222-4b3c-8d4e-abcdefabcdef failed after 41s, see https://x.y/op/987');
+    expect(a).toBe(b);
+  });
+
+  it('разные инструменты — разные подписи', () => {
+    expect(failureSignature('generate_video', 'boom')).not.toBe(failureSignature('generate_image', 'boom'));
+  });
+
+  it('разные ошибки — разные подписи', () => {
+    expect(failureSignature('generate_video', 'quota exceeded'))
+      .not.toBe(failureSignature('generate_video', 'model is no longer available'));
+  });
+
+  it('регистр и пробелы не важны', () => {
+    expect(failureSignature('t', 'Model  Is\nGone')).toBe(failureSignature('t', 'model is gone'));
+  });
+
+  it('длинная ошибка обрезается: подпись — инструмент и не больше 160 символов', () => {
+    expect(failureSignature('t', 'x'.repeat(1000)).length).toBeLessThanOrEqual('t|'.length + 160);
+  });
+});
