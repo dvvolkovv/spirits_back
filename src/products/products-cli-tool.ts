@@ -28,6 +28,9 @@ export const PRODUCTS_CLI_TOOL_NAME = `mcp__${SERVER_KEY}__manage_product`;
 /** Поиск файлов прошлых разговоров — тот же сервер `products` (find-files.tool.ts). Только Маше: у TG-бота его нет. */
 export const FIND_FILES_CLI_TOOL_NAME = `mcp__${SERVER_KEY}__find_files`;
 
+/** Сообщить в поддержку (problem-report/report-problem.tool.ts) — тот же сервер `products`; и Маше, и TG-боту. */
+export const REPORT_PROBLEM_CLI_TOOL_NAME = `mcp__${SERVER_KEY}__report_problem`;
+
 /** Блок системного промпта Маши про поиск файлов. */
 export const FIND_FILES_CLI_PROMPT = `ФАЙЛЫ ИЗ ПРОШЛЫХ РАЗГОВОРОВ.
 Тебе доступен инструмент ${FIND_FILES_CLI_TOOL_NAME}: он находит файлы, которые ассистенты уже создавали этому пользователю (документы, картинки, видео, озвучку), во всех его разговорах.

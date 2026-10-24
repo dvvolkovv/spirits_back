@@ -23,7 +23,7 @@ import { toActivity } from './activity-map';
 import { ASK_RULE } from './ask-rule';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
-import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
+import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
 import { ChatFileStore, PERSIST_TURN_BUDGET_MS } from './chat-files/chat-file-store';
 import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks } from './chat-files/relay-links';
 import { BalanceContextService } from '../tokens/balance-context.service';
@@ -1216,9 +1216,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
           mcpServers: products.mcpServers,
           // Автоодобрение — ровно инструмент продуктов. Встроенные тулы у Маши
           // по-прежнему выключены (tools не задан → `--tools ""`).
-          // + поиск файлов прошлых разговоров (find-files.tool.ts). У TG-бота
-          // его нет: там allowedTools собирается из одного products.toolName.
-          allowedTools: `${products.toolName},${FIND_FILES_CLI_TOOL_NAME}`,
+          // + поиск файлов прошлых разговоров (find-files.tool.ts) — у TG-бота
+          // его нет; + сообщить в поддержку (src/problem-report) — есть у обоих.
+          allowedTools: `${products.toolName},${FIND_FILES_CLI_TOOL_NAME},${REPORT_PROBLEM_CLI_TOOL_NAME}`,
           // onProgress переводит CLI в stream-json: только так видно, звали ли
           // инструмент продуктов в этом ходе (итог в формате json этого не несёт).
           onProgress: (ev) => {
