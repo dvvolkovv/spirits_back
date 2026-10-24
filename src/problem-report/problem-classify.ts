@@ -22,46 +22,59 @@ const USER_SIDE_CODES = new Set([
   'empty text',
   'empty prompt',
   'rate_limited',
+  // RangeError от new Date / Intl, когда модель передала время не в ISO
+  // (propose_calendar_event). Иначе ассистент сказал бы «команда в курсе»
+  // про собственную опечатку.
+  'invalid time value',
 ]);
 
-/** Подстроки в нижнем регистре. */
-const USER_SIDE_PHRASES = [
+/**
+ * Начала наших сообщений проверки ввода (в нижнем регистре). Сверка — только с
+ * НАЧАЛОМ строки: обёртки провайдеров («Omni generate failed: …», «Yandex TTS
+ * 400: …», текст OpenAI как есть) кладут чужой текст после своего префикса, и
+ * поиск подстроки где угодно глушил бы настоящий сбой провайдера
+ * («… supports at most 2 reference images»).
+ */
+const USER_SIDE_PREFIXES = [
   // нет обязательного аргумента
   'missing prompt',
   'missing sourceimageurl',
   'sourceimageurl required',
-  'requires at least',
-  'requires a prompt',
-  'requires sourceimageurl',
-  'обязател',
+  'banner requires at least',
+  'compose_image requires at least',
+  'veo requires a prompt',
+  'image2video requires',
+  'title обязателен',
+  'from и to обязательны',
   'укажи ',
   'нужен ',
-  'требует datetime',
+  'recurrence требует datetime',
   // значение вне правил
-  'supports at most',
-  'supports mode',
-  'length must be',
+  'compose_image supports at most',
+  'veo supports mode',
+  'veo length must be',
   'unsupported video model',
-  'должен быть',
-  'максимум',
-  'некорректные даты',
-  'проверьте ',
+  'recurrence.count должен быть',
+  'dates не должен быть пустым',
+  'dates: максимум',
+  'некорректные даты периода',
+  'конец периода должен быть позже',
+  'период слишком большой',
+  // hd-tool: только точные проверки. «Проверьте дату и время рождения: …»
+  // оборачивает любое исключение расчёта (пояс, которого нет в ICU, NaN) — это сбой.
+  'проверьте дату рождения:',
+  'проверьте время рождения:',
+  'дата рождения в будущем',
   'cityid не из вариантов',
-  'не найден в базе',
   // ссылки и файлы от модели
-  'ссылка не принята',
+  'ссылка не принята:',
   'invalid data url',
-  'did not return an image',
+  'url did not return an image',
   'bad mime type',
   'file too large',
   // модерация запроса
-  'отклонён модерацией',
-  // лимиты самого пользователя — подстрока узкая: провайдеры тоже пишут
-  // "rate limit reached" в текстах своих 429 (напр. OpenAI TTS в
-  // speech.service.ts, который отдаёт текст провайдера как есть) — это сбой
-  // провайдера, а не лимит пользователя, и с голой 'limit reached' склеилось
-  // бы с ним. Наша проверка — только routine-store.service.ts: `limit
-  // reached: не больше ${MAX_ROUTINES_PER_USER} рутин`.
+  'запрос отклонён модерацией',
+  // лимиты самого пользователя; «limit reached» без хвоста — это и 429 провайдера
   'too many concurrent jobs',
   'own voice not ready',
   'limit reached: не больше',
@@ -71,11 +84,22 @@ const USER_SIDE_PHRASES = [
   'cannot delete active job',
 ];
 
+/** Наши сообщения с переменной частью — регулярками, тоже от начала строки. */
+const USER_SIDE_PATTERNS = [
+  /^город «.*» не найден в базе/, // hd-tool: города нет в нашей базе
+  /^адрес \S+ не найден$/, // safe-fetch: модель выдумала адрес картинки
+  /^сервер ответил кодом 4\d\d$/, // safe-fetch: 4xx по ссылке модели; 5xx — сбой
+  // Gemini отказал по модерации — так ответили на запрос пользователя, а не
+  // поломка. IMAGE_RECITATION и пустой ответ без причины — сбой (флейк Google).
+  /^модель не вернула изображени[йея] \((image_safety|safety|prohibited_content|blocklist|spii)\)/,
+];
+
 export function isUserSideToolError(error: unknown): boolean {
   const e = String(error ?? '').trim().toLowerCase();
   if (!e) return false;
   if (USER_SIDE_CODES.has(e)) return true;
-  return USER_SIDE_PHRASES.some((p) => e.includes(p));
+  if (USER_SIDE_PREFIXES.some((p) => e.startsWith(p))) return true;
+  return USER_SIDE_PATTERNS.some((re) => re.test(e));
 }
 
 /**
@@ -88,7 +112,7 @@ export function failureSignature(tool: string, error: unknown): string {
     .toLowerCase()
     .replace(/https?:\/\/\S+/g, '<url>')
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, '<id>')
-    .replace(/\b[0-9a-f]{12,}\b/g, '<id>')
+    .replace(/[0-9a-f]{12,}/g, '<id>')
     .replace(/\d+/g, '#')
     .replace(/\s+/g, ' ')
     .trim()

@@ -28,6 +28,20 @@ describe('isUserSideToolError: виноват ли не сервис', () => {
     'Omni generate failed: Internal error encountered.',
     'Видео: временный лимит частоты запросов. Можно повторить примерно через 57 сек.',
     'Видео: на сегодня исчерпан дневной лимит генераций видео. Лимит обновляется раз в сутки около 10:00–11:00 МСК — попробуйте позже. (админу: повысить квоту Gemini Omni для ключа в Google AI Studio / Cloud Console.)',
+    'Omni generate failed: reference_to_video supports at most 2 reference images',
+    'Omni generate failed: Video length must be between 3s and 10s',
+    'Yandex TTS 400: {"error":"text length must be less than 5000"}',
+    'Проверьте дату и время рождения: Invalid time zone specified: Europe/Kyiv',
+    'CALENDAR_SECRET_KEY must be >= 32 chars',
+    'OPENAI_API_KEY not configured',
+    'banner generation failed',
+    'image edit failed',
+    'image compose failed',
+    'upscale failed',
+    'Veo: не удалось запустить генерацию',
+    'Google не успел обработать картинки за 5 минут. Попробуйте повторить — обычно помогает.',
+    'превышено время ожидания (30 с)',
+    'сервер ответил кодом 503',
   ])('сбой: %s', (error) => {
     expect(isUserSideToolError(error)).toBe(false);
   });
@@ -81,6 +95,12 @@ describe('isUserSideToolError: виноват ли не сервис', () => {
     'job not found',
     'not your job',
     'cannot delete active job — wait for completion',
+    'Укажи ровно одно из recurrence.count или recurrence.until',
+    'Invalid time value',
+    'адрес example.invalid не найден',
+    'сервер ответил кодом 404',
+    'Модель не вернула изображений (IMAGE_SAFETY). Попробуйте ещё раз или измените промпт.',
+    'Модель не вернула изображений (PROHIBITED_CONTENT). Попробуйте ещё раз или измените промпт.',
   ])('не сбой: %s', (error) => {
     expect(isUserSideToolError(error)).toBe(true);
   });
@@ -113,5 +133,20 @@ describe('failureSignature: подпись для склейки', () => {
 
   it('длинная ошибка обрезается: подпись — инструмент и не больше 160 символов', () => {
     expect(failureSignature('t', 'x'.repeat(1000)).length).toBeLessThanOrEqual('t|'.length + 160);
+  });
+
+  it('адреса с разными нецифровыми частями — одна подпись', () => {
+    expect(failureSignature('t', 'see https://a.example/op/abc'))
+      .toBe(failureSignature('t', 'see https://b.example/x/def'));
+  });
+
+  it('длинный hex-id без дефисов — одна подпись', () => {
+    expect(failureSignature('t', 'request 0123456789abcdef0123 failed'))
+      .toBe(failureSignature('t', 'request fedcba9876543210fedc failed'));
+  });
+
+  it('hex-id, приклеенный к префиксу (req_…), — одна подпись', () => {
+    expect(failureSignature('t', 'OpenAI 500 (request id req_0123456789abcdef0123456789abcdef)'))
+      .toBe(failureSignature('t', 'OpenAI 500 (request id req_fedcba9876543210fedcba9876543210)'));
   });
 });
