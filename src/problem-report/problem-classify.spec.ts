@@ -168,5 +168,9 @@ describe('failureSignature: подпись для склейки', () => {
     expect(isUserSideToolError(huge)).toBe(false);
     expect(isUserSideToolError('insufficient_tokens' + ' '.repeat(3000))).toBe(true);
     expect(failureSignature('t', huge).length).toBeLessThanOrEqual('t|'.length + 160);
+    // Без среза trim дошёл бы до кода в хвосте и вернул true.
+    expect(isUserSideToolError(' '.repeat(2000) + 'insufficient_tokens')).toBe(false);
+    // Без среза в подпись попал бы хвост « tail».
+    expect(failureSignature('t', 'z'.repeat(100) + ' '.repeat(1900) + 'tail')).toBe('t|' + 'z'.repeat(100));
   });
 });

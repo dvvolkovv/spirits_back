@@ -128,7 +128,8 @@ export class ProblemReportService {
         ? await this.pg.query('SELECT display_name, name FROM agents WHERE id = $1 LIMIT 1', [parseInt(assistantId, 10)])
         : await this.pg.query('SELECT display_name, name FROM agents WHERE name = $1 LIMIT 1', [assistantId]);
       return r.rows[0]?.display_name || r.rows[0]?.name || FALLBACK_NAME;
-    } catch {
+    } catch (e: any) {
+      this.logger.warn(`problem-report: имя ассистента ${assistantId} не прочитано: ${e?.message}`);
       return FALLBACK_NAME;
     }
   }
@@ -138,7 +139,7 @@ export class ProblemReportService {
     try {
       const text = await build();
       if (!telegramConfigured()) {
-        this.logger.log(`problem-report: ${text.replace(/\n/g, ' | ')}`);
+        this.logger.log(`problem-report: ${text.replace(/[\r\n]+/g, ' | ')}`);
         return;
       }
       await sendTelegramAlert(text, { disable_web_page_preview: true });

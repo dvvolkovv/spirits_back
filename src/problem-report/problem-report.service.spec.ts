@@ -117,7 +117,10 @@ describe('reportToolFailure — путь А', () => {
     const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     const t0 = now;
     const svc = new ProblemReportService(pgWith() as any);
-    for (const tool of ['generate_image', 'generate_video', 'generate_speech', 'read_calendar']) {
+    svc.reportToolFailure(failure({ tool: 'generate_image', error: 'boom' }));
+    svc.reportToolFailure(failure({ tool: 'generate_video', error: 'boom' }));
+    now = t0 + 30 * MIN;
+    for (const tool of ['generate_speech', 'read_calendar']) {
       expect(svc.reportToolFailure(failure({ tool, error: 'boom' }))).toEqual({ supportNotified: true });
     }
     await flush();
@@ -125,10 +128,13 @@ describe('reportToolFailure — путь А', () => {
     expect(texts).toHaveLength(3); // два сбоя и одно уведомление
     expect(texts.filter((t) => t.includes('Слишком много разных сбоев'))).toHaveLength(1);
     expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('сверх потолка'))).toHaveLength(2);
+    // Окно потолка уже свободно (сообщения t0 старше часа), а пауза по generate_speech,
+    // если бы подпись запомнили в t0+30, ещё шла бы (31 мин < 60) — и сбой молча склеился бы.
     now = t0 + 61 * MIN;
     svc.reportToolFailure(failure({ tool: 'generate_speech', error: 'boom' }));
     await flush();
     expect(sent).toHaveBeenCalledTimes(4);
+    expect(String(sent.mock.calls[3][0])).toContain('не получилось озвучить текст');
     expect(String(sent.mock.calls[3][0])).not.toContain('С прошлого сообщения');
     warn.mockRestore();
   });
@@ -166,9 +172,12 @@ describe('reportToolFailure — путь А', () => {
   it('база упала — «Ассистент», сообщение всё равно уходит', async () => {
     const pg = { query: jest.fn(async () => { throw new Error('db down'); }) };
     const svc = new ProblemReportService(pg as any);
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     svc.reportToolFailure(failure());
     await flush();
     expect(sent.mock.calls[0][0]).toContain('Ассистент: не получилось');
+    expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).toContain('имя ассистента 22 не прочитано');
+    warn.mockRestore();
   });
 
   it('отправка упала — вызов не бросает', async () => {
