@@ -68,10 +68,15 @@ export function clip(s: string, max: number): string {
   return chars.length > max ? `${chars.slice(0, max - 1).join('').trimEnd()}…` : t;
 }
 
+/** Есть ли у инструмента своё действие: инструмент из CHAT_TOOLS, а не случайное имя. */
+export function isKnownTool(tool: string): boolean {
+  return Object.prototype.hasOwnProperty.call(TOOL_ACTIONS, tool);
+}
+
 export function toolAction(tool: string): string {
   // Своё свойство, а не через прототип: «toString» и «constructor» не должны
   // превращаться в текст функции.
-  return Object.prototype.hasOwnProperty.call(TOOL_ACTIONS, tool)
+  return isKnownTool(tool)
     ? TOOL_ACTIONS[tool]
     : `выполнить ${clip(oneLine(head(tool, MAX_ID)), MAX_ID)}`;
 }

@@ -1,9 +1,10 @@
+import { createHash } from 'crypto';
 import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
 import { failureSignature, isUserSideToolError } from './problem-classify';
 import {
-  clip, FALLBACK_NAME, formatToolCapNotice, formatToolFailure, head, oneLine, Repeats,
+  clip, FALLBACK_NAME, formatToolCapNotice, formatToolFailure, head, isKnownTool, oneLine, Repeats,
 } from './problem-format';
 
 /** Подсказка ассистенту в результате инструмента, когда команда уже знает о сбое. */
@@ -13,6 +14,10 @@ export const SUPPORT_NOTE =
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
+/** Сколько разных пользователей помнить в одном сбое: счётчику хватит, памяти — нет. */
+const MAX_USERS_PER_INCIDENT = 1000;
+const MAX_ID = 64;
+const MAX_ERROR = 300;
 
 interface Incident {
   lastSentAt: number;
@@ -28,12 +33,27 @@ function envNumber(name: string, fallback: number): number {
 }
 
 /**
+ * Короткая КОПИЯ чужой строки: одна строка, не длиннее max. Не .slice: в V8
+ * (Node 20/22) срез держит в памяти всю исходную строку, а tool и userId на
+ * /mcp пишет вызывающий — до 50 МБ на запрос.
+ */
+function short(s: unknown, max: number): string {
+  return clip(oneLine(head(String(s ?? ''), max)), max);
+}
+
+/** Ключ склейки фиксированной длины: подпись может оказаться срезом огромной ошибки. */
+function incidentKey(tool: string, error: string): string {
+  return createHash('sha1').update(failureSignature(tool, error)).digest('base64url');
+}
+
+/**
  * Сообщения о сбоях ассистентов в группу «Поддержка linkeon».
  * Спека: docs/superpowers/specs/2026-10-24-assistant-problem-reports-design.md.
  *
  * Состояние (склейка, счётчики, лимиты) — в памяти процесса: linkeon-api —
  * один экземпляр, так же живут QualityMonitorService и activeTurns. Рестарт
  * его обнуляет; худшее последствие — одно лишнее сообщение после выката.
+ * Всё, что хранится, ограничено по числу и длине: вход /mcp пишет вызывающий.
  *
  * Отправка никогда не задерживает и не роняет ответ инструмента: решение
  * синхронное, имя ассистента и Telegram — без ожидания.
@@ -46,6 +66,8 @@ export class ProblemReportService {
   private toolSent: number[] = [];
   /** Когда ушло уведомление «слишком много сбоев» (не чаще раза в час). */
   private capNoticeAt = 0;
+  /** Сколько ждать имя ассистента из базы: у пула нет таймаута запроса, а зависший Postgres не должен держать сообщение. */
+  nameTimeoutMs = 2000;
 
   constructor(private readonly pg: PgService) {}
 
@@ -59,51 +81,56 @@ export class ProblemReportService {
    * supportNotified — сказать ли ассистенту «команда в курсе»: да для любого
    * сбоя (отправленного, склеенного с уже отправленным или упёршегося в общий
    * потолок — о потоке сбоев команда получила уведомление), но только если
-   * Telegram настроен — иначе команде сообщить нечем.
+   * Telegram настроен. Если что-то сломалось внутри — false: не обещаем того,
+   * чего не сделали.
    */
   reportToolFailure(p: { userId: string; assistantId: string | null; tool: string; error: string }): { supportNotified: boolean } {
-    if (isUserSideToolError(p.error)) return { supportNotified: false };
     try {
+      if (isUserSideToolError(p.error)) return { supportNotified: false };
       const now = Date.now();
+      const tool = short(p.tool, MAX_ID);
+      const userId = short(p.userId, MAX_ID);
+      const error = clip(String(p.error ?? ''), MAX_ERROR);
+      // Незнакомые имена инструментов — один сбой: модель зовёт только то, что
+      // есть в списке /mcp, а поток случайных имён (прямые вызовы /mcp) не
+      // должен занимать все слоты потолка и прятать настоящие сбои.
+      const key = isKnownTool(tool) ? incidentKey(tool, p.error) : incidentKey('<unknown>', 'unknown tool');
       this.forgetOld(now);
-      const sig = failureSignature(p.tool, p.error);
-      const inc = this.incidents.get(sig);
-      if (inc && now - inc.lastSentAt < this.cooldownMs()) {
+      const inc = this.incidents.get(key);
+      // now >= lastSentAt: метка «из будущего» (часы шагнули назад) паузу не продлевает.
+      if (inc && now >= inc.lastSentAt && now - inc.lastSentAt < this.cooldownMs()) {
         inc.repeats++;
-        inc.users.add(p.userId);
+        if (inc.users.size < MAX_USERS_PER_INCIDENT) inc.users.add(userId);
         inc.lastSeenAt = now;
       } else if (!this.takeToolSlot(now)) {
         // Сверх общего потолка: команда уже получила уведомление о потоке сбоев,
         // этот — только в лог. Подпись не запоминаем: такой же сбой после окна
         // уйдёт обычным сообщением, без ложного «с прошлого сообщения».
-        this.logger.warn(`problem-report: сверх потолка, только в лог: ${p.tool}: ${clip(oneLine(head(p.error, 300)), 300)}`);
+        this.logger.warn(`problem-report: сверх потолка, только в лог: ${tool}: ${oneLine(error)}`);
       } else {
         const repeats: Repeats | null = inc && inc.repeats > 0 ? { count: inc.repeats, users: inc.users.size } : null;
-        this.incidents.set(sig, { lastSentAt: now, lastSeenAt: now, repeats: 0, users: new Set() });
+        this.incidents.set(key, { lastSentAt: now, lastSeenAt: now, repeats: 0, users: new Set() });
+        const assistantId = p.assistantId;
         void this.deliver('tool_failure', async () =>
-          formatToolFailure({
-            assistant: await this.assistantName(p.assistantId),
-            tool: p.tool,
-            error: p.error,
-            userId: p.userId,
-            repeats,
-          }),
+          formatToolFailure({ assistant: await this.assistantNameWithin(assistantId), tool, error, userId, repeats }),
         );
       }
+      return { supportNotified: telegramConfigured() };
     } catch (e: any) {
-      this.logger.warn(`problem-report: сбой ${p.tool} не обработан: ${e?.message}`);
+      this.logger.warn(`problem-report: сбой не обработан: ${e?.message}`);
+      return { supportNotified: false };
     }
-    return { supportNotified: telegramConfigured() };
   }
 
   /**
    * Общий потолок сообщений пути А в час (PROBLEM_REPORT_TOOL_HOURLY, по
-   * умолчанию 20) на все подписи: разные подписи — в том числе намеренно
-   * разные, если кто-то зовёт /mcp напрямую, — не засыплют группу. Сверх
-   * потолка — одно уведомление в час.
+   * умолчанию 20) на все подписи: разные подписи не засыплют группу. Сверх
+   * потолка — одно уведомление в час. Метки «из будущего» (часы шагнули
+   * назад) считаем истёкшими, иначе потолок держался бы лишнее время.
    */
   private takeToolSlot(now: number): boolean {
-    this.toolSent = this.toolSent.filter((t) => now - t < HOUR);
+    this.toolSent = this.toolSent.filter((t) => t <= now && now - t < HOUR);
+    if (this.capNoticeAt > now) this.capNoticeAt = 0;
     const cap = envNumber('PROBLEM_REPORT_TOOL_HOURLY', 20);
     if (this.toolSent.length < cap) {
       this.toolSent.push(now);
@@ -111,9 +138,26 @@ export class ProblemReportService {
     }
     if (now - this.capNoticeAt >= HOUR) {
       this.capNoticeAt = now;
-      void this.deliver('tool_failure', async () => formatToolCapNotice(cap));
+      void this.deliver('tool_cap', async () => formatToolCapNotice(cap));
     }
     return false;
+  }
+
+  /** Имя ассистента, но не дольше nameTimeoutMs — потом «Ассистент». */
+  private async assistantNameWithin(assistantId: string | null): Promise<string> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<string>((resolve) => {
+      timer = setTimeout(() => {
+        this.logger.warn(`problem-report: имя ассистента ${assistantId} не прочитано за ${this.nameTimeoutMs} мс`);
+        resolve(FALLBACK_NAME);
+      }, this.nameTimeoutMs);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([this.assistantName(assistantId), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /** Имя ассистента: agents по числовому id или по имени, custom_agents — по custom:<uuid>. */
@@ -135,7 +179,7 @@ export class ProblemReportService {
   }
 
   /** Собирает текст и шлёт. Не бросает; без Telegram — пишет текст в лог (так на test). */
-  private async deliver(kind: 'tool_failure' | 'assistant_report', build: () => Promise<string>): Promise<void> {
+  private async deliver(kind: 'tool_failure' | 'tool_cap' | 'assistant_report', build: () => Promise<string>): Promise<void> {
     try {
       const text = await build();
       if (!telegramConfigured()) {
@@ -151,8 +195,8 @@ export class ProblemReportService {
 
   /** Подписи, по которым ничего не было больше суток, — из памяти. */
   private forgetOld(now: number): void {
-    for (const [sig, inc] of this.incidents) {
-      if (now - inc.lastSeenAt > DAY) this.incidents.delete(sig);
+    for (const [key, inc] of this.incidents) {
+      if (now - inc.lastSeenAt > DAY) this.incidents.delete(key);
     }
   }
 }

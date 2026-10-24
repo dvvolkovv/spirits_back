@@ -22,6 +22,8 @@ const pgWith = (rows: any[] = [{ display_name: 'Кира', name: 'Кира' }]) 
 
 let now = 0;
 let clock: jest.SpyInstance;
+let warnSpy: jest.SpyInstance;
+let logSpy: jest.SpyInstance;
 beforeEach(() => {
   sent.mockReset();
   sent.mockImplementation(async () => {});
@@ -30,8 +32,14 @@ beforeEach(() => {
   for (const k of ENV) delete process.env[k];
   now = Date.UTC(2026, 9, 24, 11, 12);
   clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
+  warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+  logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
 });
-afterEach(() => clock.mockRestore());
+afterEach(() => {
+  clock.mockRestore();
+  warnSpy.mockRestore();
+  logSpy.mockRestore();
+});
 
 const failure = (over: Partial<{ userId: string; assistantId: string | null; tool: string; error: string }> = {}) => ({
   userId: 'u1', assistantId: '22', tool: 'generate_video', error: KIRA_ERROR, ...over,
@@ -114,7 +122,6 @@ describe('reportToolFailure — путь А', () => {
 
   it('общий потолок: сверх PROBLEM_REPORT_TOOL_HOURLY — одно уведомление и только лог; через час снова', async () => {
     process.env.PROBLEM_REPORT_TOOL_HOURLY = '2';
-    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     const t0 = now;
     const svc = new ProblemReportService(pgWith() as any);
     svc.reportToolFailure(failure({ tool: 'generate_image', error: 'boom' }));
@@ -127,7 +134,7 @@ describe('reportToolFailure — путь А', () => {
     const texts = sent.mock.calls.map((c) => String(c[0]));
     expect(texts).toHaveLength(3); // два сбоя и одно уведомление
     expect(texts.filter((t) => t.includes('Слишком много разных сбоев'))).toHaveLength(1);
-    expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('сверх потолка'))).toHaveLength(2);
+    expect(warnSpy.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('сверх потолка'))).toHaveLength(2);
     // Окно потолка уже свободно (сообщения t0 старше часа), а пауза по generate_speech,
     // если бы подпись запомнили в t0+30, ещё шла бы (31 мин < 60) — и сбой молча склеился бы.
     now = t0 + 61 * MIN;
@@ -136,18 +143,15 @@ describe('reportToolFailure — путь А', () => {
     expect(sent).toHaveBeenCalledTimes(4);
     expect(String(sent.mock.calls[3][0])).toContain('не получилось озвучить текст');
     expect(String(sent.mock.calls[3][0])).not.toContain('С прошлого сообщения');
-    warn.mockRestore();
   });
 
   it('Telegram не настроен: supportNotified=false, в группу ничего, текст — в лог', async () => {
     configured.mockReturnValue(false);
-    const log = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
     const svc = new ProblemReportService(pgWith() as any);
     expect(svc.reportToolFailure(failure())).toEqual({ supportNotified: false });
     await flush();
     expect(sent).not.toHaveBeenCalled();
-    expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toContain('не получилось создать видео');
-    log.mockRestore();
+    expect(logSpy.mock.calls.map((c) => String(c[0])).join('\n')).toContain('не получилось создать видео');
   });
 
   it('хода нет — «Ассистент», в базу не ходим', async () => {
@@ -172,21 +176,86 @@ describe('reportToolFailure — путь А', () => {
   it('база упала — «Ассистент», сообщение всё равно уходит', async () => {
     const pg = { query: jest.fn(async () => { throw new Error('db down'); }) };
     const svc = new ProblemReportService(pg as any);
-    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     svc.reportToolFailure(failure());
     await flush();
     expect(sent.mock.calls[0][0]).toContain('Ассистент: не получилось');
-    expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).toContain('имя ассистента 22 не прочитано');
-    warn.mockRestore();
+    expect(warnSpy.mock.calls.map((c) => String(c[0])).join('\n')).toContain('имя ассистента 22 не прочитано');
   });
 
   it('отправка упала — вызов не бросает', async () => {
     sent.mockRejectedValueOnce(new Error('telegram down'));
-    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     const svc = new ProblemReportService(pgWith() as any);
     expect(() => svc.reportToolFailure(failure())).not.toThrow();
     await flush();
-    expect(warn).toHaveBeenCalled();
-    warn.mockRestore();
+    expect(warnSpy).toHaveBeenCalled();
+  });
+
+  it('огромные tool и userId не оседают в памяти: ключ короткий, пользователей не больше 1000', async () => {
+    const svc = new ProblemReportService(pgWith() as any);
+    svc.reportToolFailure(failure({ userId: 'u'.repeat(1_000_000) }));
+    for (let i = 0; i < 1500; i++) svc.reportToolFailure(failure({ userId: `u${i}` }));
+    const incidents: Map<string, any> = (svc as any).incidents;
+    expect(incidents.size).toBe(1);
+    const [key, inc] = [...incidents.entries()][0];
+    expect(key.length).toBeLessThanOrEqual(40);
+    expect(inc.users.size).toBe(1000);
+    await flush();
+    expect(String(sent.mock.calls[0][0])).toContain('<code>' + 'u'.repeat(63) + '…</code>');
+  });
+
+  it('незнакомые имена инструментов склеиваются в один сбой', async () => {
+    const svc = new ProblemReportService(pgWith() as any);
+    for (let i = 0; i < 30; i++) svc.reportToolFailure(failure({ tool: `x${i}`, error: `unknown tool: x${i}` }));
+    await flush();
+    expect(sent).toHaveBeenCalledTimes(1);
+    expect((svc as any).incidents.size).toBe(1);
+  });
+
+  it('повтор известной подписи в паузе склеивается и при полном потолке — без уведомления', async () => {
+    process.env.PROBLEM_REPORT_TOOL_HOURLY = '1';
+    const svc = new ProblemReportService(pgWith() as any);
+    svc.reportToolFailure(failure());
+    now += MIN;
+    expect(svc.reportToolFailure(failure())).toEqual({ supportNotified: true });
+    await flush();
+    expect(sent).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('сверх потолка'))).toHaveLength(0);
+  });
+
+  it('забывание — по последнему повтору, а не по последнему сообщению', async () => {
+    const t0 = now;
+    const svc = new ProblemReportService(pgWith() as any);
+    svc.reportToolFailure(failure());
+    now = t0 + 59 * MIN;
+    svc.reportToolFailure(failure());
+    now = t0 + 24 * 60 * MIN + 30 * MIN;
+    svc.reportToolFailure(failure());
+    await flush();
+    expect(sent).toHaveBeenCalledTimes(2);
+    expect(String(sent.mock.calls[1][0])).toContain('ещё 1 раз у 1 пользователя');
+  });
+
+  it('часы шагнули назад — потолок не держится лишний час', async () => {
+    process.env.PROBLEM_REPORT_TOOL_HOURLY = '1';
+    const t0 = now;
+    const svc = new ProblemReportService(pgWith() as any);
+    svc.reportToolFailure(failure({ tool: 'generate_image', error: 'boom' }));
+    now = t0 - 10 * MIN;
+    svc.reportToolFailure(failure({ tool: 'generate_video', error: 'boom' }));
+    await flush();
+    expect(sent.mock.calls.map((c) => String(c[0])).some((t) => t.includes('не получилось создать видео'))).toBe(true);
+  });
+
+  it('Postgres завис — вызов возвращается сразу, сообщение уходит с «Ассистент» после таймаута', async () => {
+    const pg = { query: jest.fn(() => new Promise(() => {})) };
+    const svc = new ProblemReportService(pg as any);
+    svc.nameTimeoutMs = 20;
+    expect(svc.reportToolFailure(failure())).toEqual({ supportNotified: true });
+    await flush();
+    expect(sent).not.toHaveBeenCalled();
+    await new Promise((r) => setTimeout(r, 80));
+    await flush();
+    expect(sent).toHaveBeenCalledTimes(1);
+    expect(String(sent.mock.calls[0][0])).toContain('🛠 <b>Ассистент: не получилось создать видео</b>');
   });
 });
