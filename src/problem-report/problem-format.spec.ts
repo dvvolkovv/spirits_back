@@ -1,5 +1,5 @@
 import {
-  clip, escapeHtml, formatAssistantReport, formatToolFailure, oneLine, timesRu, toolAction, usersRu,
+  clip, escapeHtml, FALLBACK_NAME, formatAssistantReport, formatToolFailure, head, oneLine, timesRu, toolAction, usersRu,
 } from './problem-format';
 import { CHAT_TOOLS } from '../chat/chat-tools';
 
@@ -145,5 +145,24 @@ describe('тексты в группу «Поддержка linkeon»', () => {
     const big = clip('я'.repeat(5_000_000), 500);
     expect(Array.from(big).length).toBe(500);
     expect(oneLine('  a \n\t b  ')).toBe('a b');
+  });
+
+  it('head: огромный чужой текст — только начало, без одиночного суррогата на срезе', () => {
+    const h = head('ж '.repeat(5_000_000), 40);
+    expect(h.length).toBeLessThanOrEqual(16 * 40 + 1);
+    expect(h.endsWith('…')).toBe(true);
+    const tricky = head(' '.repeat(16 * 40 - 1) + '😀' + 'x'.repeat(100), 40);
+    expect(tricky.endsWith('…')).toBe(true);
+    expect(/[\uD800-\uDBFF]…$/.test(tricky)).toBe(false);
+    expect(head('коротко', 40)).toBe('коротко');
+  });
+
+  it('пересказ из пробелов вперемешку на миллионы символов — сообщение в пределах лимита', () => {
+    const t = formatAssistantReport({ assistant: 'Кира', kind: 'my_failure', summary: 'ж '.repeat(5_000_000), userId: 'u1', channel: 'web' });
+    expect(t.split('\n')[1].length).toBeLessThanOrEqual(502);
+  });
+
+  it('запасное имя экспортируется', () => {
+    expect(FALLBACK_NAME).toBe('Ассистент');
   });
 });

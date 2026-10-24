@@ -1,8 +1,9 @@
 /**
  * Тексты сообщений в группу «Поддержка linkeon» (parse_mode HTML).
  *
- * Чистые функции: всё, что приходит снаружи, сводится в одну строку, обрезается
- * и экранируется, поэтому сообщение всегда разбирается и короче лимита Telegram
+ * Чистые функции: всё, что приходит снаружи, сводится в одну строку (кроме
+ * текста ошибки — он многострочный внутри `<code>`), обрезается и
+ * экранируется, поэтому сообщение всегда разбирается и короче лимита Telegram
  * (4096). Это важно: об отказе Telegram отправка не узнаёт
  * (common/telegram-alert.ts только пишет в лог), и сбой ушёл бы в тишину.
  * Аргументов инструмента (промпт видео, текст озвучки) здесь нет и быть не
@@ -24,7 +25,7 @@ const TOOL_ACTIONS: Record<string, string> = {
   calculate_human_design: 'рассчитать бодиграф',
 };
 
-const FALLBACK_NAME = 'Ассистент';
+export const FALLBACK_NAME = 'Ассистент';
 /** Потолки полей: всё сообщение — около 1,3 тыс. видимых символов при лимите Telegram 4096. */
 const MAX_NAME = 40;
 const MAX_ID = 64;
@@ -38,6 +39,19 @@ export function escapeHtml(s: string): string {
 /** Одна строка: переводы строк и повторы пробелов чужого текста — в один пробел. */
 export function oneLine(s: string): string {
   return String(s ?? '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Начало чужого текста: дальше 16·max единиц UTF-16 не смотрим, срез — по
+ * границе кодовой точки, отрезанное помечаем «…». Нужен ДО oneLine: та
+ * проходит всю строку, а пересказ модели по длине ничем больше не ограничен.
+ */
+export function head(s: string, max: number): string {
+  const t = String(s ?? '');
+  const bound = 16 * max;
+  if (t.length <= bound) return t;
+  const end = /[\uD800-\uDBFF]/.test(t[bound - 1]) ? bound - 1 : bound;
+  return `${t.slice(0, end)}…`;
 }
 
 /**
@@ -59,7 +73,7 @@ export function toolAction(tool: string): string {
   // превращаться в текст функции.
   return Object.prototype.hasOwnProperty.call(TOOL_ACTIONS, tool)
     ? TOOL_ACTIONS[tool]
-    : `выполнить ${clip(oneLine(tool), MAX_ID)}`;
+    : `выполнить ${clip(oneLine(head(tool, MAX_ID)), MAX_ID)}`;
 }
 
 const RU = new Intl.PluralRules('ru');
@@ -81,11 +95,11 @@ export interface Repeats {
 
 /** Имя ассистента для заголовка: одна строка, не длиннее 40, пустое — «Ассистент». */
 function nameOf(assistant: string): string {
-  return escapeHtml(clip(oneLine(assistant), MAX_NAME) || FALLBACK_NAME);
+  return escapeHtml(clip(oneLine(head(assistant, MAX_NAME)), MAX_NAME) || FALLBACK_NAME);
 }
 
 function userLine(userId: string): string {
-  return `Пользователь: <code>${escapeHtml(clip(oneLine(userId), MAX_ID))}</code>`;
+  return `Пользователь: <code>${escapeHtml(clip(oneLine(head(userId, MAX_ID)), MAX_ID))}</code>`;
 }
 
 export function formatToolFailure(p: {
@@ -117,12 +131,12 @@ export function formatAssistantReport(p: {
   channel: ProblemChannel;
 }): string {
   const who = nameOf(p.assistant);
-  const head = p.kind === 'user_report'
+  const headLine = p.kind === 'user_report'
     ? `🙋 <b>${who} передаёт жалобу пользователя</b>`
     : `🙋 <b>${who}: у меня не работает</b>`;
   return [
-    head,
-    `«${escapeHtml(clip(oneLine(p.summary), MAX_SUMMARY))}»`,
+    headLine,
+    `«${escapeHtml(clip(oneLine(head(p.summary, MAX_SUMMARY)), MAX_SUMMARY))}»`,
     `${userLine(p.userId)} · ${p.channel === 'telegram' ? 'Telegram' : 'веб'}`,
   ].join('\n');
 }
