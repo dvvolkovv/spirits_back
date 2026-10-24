@@ -878,8 +878,12 @@ const http = require('http');
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   if (req.url === '/health') { res.writeHead(200, {'content-type':'application/json'}); return res.end('{"ok":true,"sha":"rehearsal"}'); }
-  res.writeHead(200, {'content-type':'text/plain; charset=utf-8'});
-  res.end('linkeon rehearsal container');
+  // Корень отвечает редиректом НАРОЧНО: так делают живые сайты (sportrokom
+  // уводит на свой Telegram-канал), и проверка «сайт вернулся» обязана смотреть
+  // на /health, а не на корень. Вернётся проверка «/ = 200» — репетиция
+  // покраснеет здесь, а не на машине клиента.
+  res.writeHead(302, {'location':'https://linkeon.io/'});
+  res.end();
 }).listen(PORT);
 SRV
 # entrypoint.sh отказывается стартовать без .git в /product — репетиция обязана
@@ -1332,25 +1336,44 @@ EOS
   return 0
 }
 
+# Сайт вернулся — значит, на опубликованный порт хоста отвечает /health
+# продукта: 200 и {"ok":true,…}. Именно /health, а не корень. Корень —
+# собственность продукта и законно отвечает редиректом: sportrokom отдаёт на «/»
+# 302 на свой Telegram-канал, и проверка «/ = 200» 24.10.2026 объявила живой
+# сайт мёртвым, вернула его на старый образ и остановила выкат на машине
+# клиентов. /health — контракт каждого продукта (CLAUDE.md каркаса, проверка
+# хода в раннере) и доказывает то же: порт восстановлен, процесс продукта жив.
+#
+# 200 без "ok":true — не успех: так отвечает чужая страница-заглушка на любой
+# путь, и это ровно тот случай, когда порт держит не продукт.
 verify_http() { # verify_http <имя> <порт-хоста>
   local out code
   out=$(remote "$(rs "SUDO=$(shq "$SUDO"); PORT=$(shq "$2"); MAX=$(shq "$HTTP_WAIT_SECONDS")" <<'EOS'
 set -u
 w=0
+c=000
+okv=no
 while [ "$w" -lt "$MAX" ]; do
-  c=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "http://127.0.0.1:$PORT/" 2>/dev/null || echo 000)
-  if [ "$c" = "200" ]; then echo "HTTP=200 after=${w}s"; exit 0; fi
+  b=$(curl -s -m 10 -w '\n%{http_code}' "http://127.0.0.1:$PORT/health" 2>/dev/null || printf '\n000')
+  c=$(printf '%s\n' "$b" | tail -n 1)
+  okv=no
+  if printf '%s' "$b" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'; then okv=yes; fi
+  if [ "$c" = "200" ] && [ "$okv" = "yes" ]; then echo "RESULT=ok after=${w}s"; exit 0; fi
   sleep 5; w=$((w+5))
 done
-echo "HTTP=$c after=${w}s"
+echo "RESULT=fail code=$c ok=$okv after=${w}s"
 EOS
 )") || { red "не смог проверить сайт $1"; return 1; }
-  code=$(sed -n 's/^HTTP=\([0-9]*\).*/\1/p' <<<"$out" | tail -1)
-  if [[ "$code" != "200" ]]; then
-    red "сайт $1 на порту $2 отвечает «${code:-нет ответа}», а не 200 (ждал ${HTTP_WAIT_SECONDS}s)"
+  if ! grep -q '^RESULT=ok' <<<"$out"; then
+    code=$(sed -n 's/^RESULT=fail code=\([0-9]*\).*/\1/p' <<<"$out" | tail -1)
+    if [[ "$code" == "200" ]]; then
+      red "сайт $1: /health на порту $2 отвечает 200, но без \"ok\":true — порт держит не продукт (ждал ${HTTP_WAIT_SECONDS}s)"
+    else
+      red "сайт $1: /health на порту $2 отвечает «${code:-нет ответа}», а не 200 (ждал ${HTTP_WAIT_SECONDS}s)"
+    fi
     return 1
   fi
-  ok "сайт $1 отвечает 200 ($(sed -n 's/.*after=//p' <<<"$out" | tail -1))"
+  ok "сайт $1: /health отвечает 200 ($(sed -n 's/.*after=//p' <<<"$out" | tail -1))"
   return 0
 }
 
