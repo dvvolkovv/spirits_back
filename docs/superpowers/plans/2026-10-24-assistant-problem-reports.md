@@ -2059,6 +2059,8 @@ git -C $WT commit -q -m "relay-agent: копия server.mjs = релей $RELAY_
 
 ## Задача 12. Скрипт живой проверки через ассистента
 
+> Файл в ветке новее текста ниже (ревью 24.10): дата пометки — на момент прогона; отказ `report_problem` («нечем», «не получилось», «слишком много») не принимается за передачу; доставку смотреть по строке `problem-report: передано в фанаут …` и отсутствию `not delivered` для чата группы.
+
 **Files:**
 - Create: `tests/problem-report.e2e.mjs`
 
@@ -2288,16 +2290,18 @@ Expected: обе фазы зелёные, `✗`/`ROLLBACK` нет; на прод
 - [ ] **Шаг 5: живая проверка А — полная цепочка через `/mcp`** (незнакомый инструмент: ничего не списывает, классификатор считает сбоем)
 
 ```bash
-ssh dvolkov@212.113.106.202 'cd /home/dvolkov/spirits_back && S=$(grep -E "^MCP_SECRET=" .env | cut -d= -f2- | tr -d "\"'"'"'"); for i in 1 2; do curl -s -m 20 -X POST http://127.0.0.1:3001/mcp -H "Authorization: Bearer $S" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d "{\"jsonrpc\":\"2.0\",\"id\":$i,\"method\":\"tools/call\",\"params\":{\"name\":\"problem_report_probe_check\",\"arguments\":{\"userId\":\"<номер Test user>\"}}}" | grep -o "supportNotified[^,}]*"; done; sleep 2; grep -a "problem-report: отправлено" ~/.pm2/logs/linkeon-api-out-0.log | tail -2'
+ssh dvolkov@212.113.106.202 'cd /home/dvolkov/spirits_back && S=$(grep -E "^MCP_SECRET=" .env | cut -d= -f2- | tr -d "\"'"'"'"); for i in 1 2; do curl -s -m 20 -X POST http://127.0.0.1:3001/mcp -H "Authorization: Bearer $S" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d "{\"jsonrpc\":\"2.0\",\"id\":$i,\"method\":\"tools/call\",\"params\":{\"name\":\"problem_report_probe_check\",\"arguments\":{\"userId\":\"<номер Test user>\"}}}" | grep -o "supportNotified[^,}]*"; done; sleep 2; L=$(ls -t ~/.pm2/logs/linkeon-api-out*.log | head -1); grep -a "problem-report: передано в фанаут" "$L" | tail -2; grep -a "not delivered" "$L" | tail -3'
 ```
-Expected: дважды `supportNotified\":true` (JSON результата внутри SSE экранирован); в логе ровно одна новая строка `problem-report: отправлено (tool_failure)` — второй вызов склеен; в группе — «🛠 Ассистент: не получилось выполнить problem_report_probe_check», ошибка `unknown tool: problem_report_probe_check`.
+Expected: дважды `supportNotified\":true` (JSON результата внутри SSE экранирован); в логе ровно одна новая строка `problem-report: передано в фанаут TELEGRAM_CHAT_ID (tool_failure)` — второй вызов склеен; новых `not delivered` для чата группы (…2318) нет (для лички …1972 — ожидаемо есть); в группе — «🛠 Ассистент: не получилось выполнить problem_report_probe_check», ошибка `unknown tool: problem_report_probe_check`.
+
+Пробу делать сразу после выката: сбои живут в памяти процесса, рестарт их стёр. Все незнакомые имена инструментов — один сбой, поэтому если после рестарта кто-то уже звал незнакомый инструмент, первая проба склеится и строки не будет. Тогда сначала посмотреть `grep -a "tools/call" "$L" | tail` — это склейка, а не поломка.
 
 - [ ] **Шаг 6: живая проверка Б — `report_problem` на точке продуктов**
 
 ```bash
-ssh dvolkov@212.113.106.202 'cd /home/dvolkov/spirits_back && T=$(node -r dotenv/config -e "process.stdout.write(require(\"./dist/products/product-tool.token\").signProductToolToken(\"<номер Test user>\",\"web\"))") && curl -s -m 20 -X POST http://127.0.0.1:3001/webhook/mcp/products -H "Authorization: Bearer $T" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"report_problem\",\"arguments\":{\"assistant\":\"Проверка\",\"kind\":\"my_failure\",\"summary\":\"Проверка выката 24.10: сообщение ассистента о поломке. Ссылка https://linkeon.io и @problem_report_check должны остаться простым текстом. Ничего делать не нужно.\"}}}" | grep -o "reported[^,}]*"; sleep 2; grep -a "problem-report: отправлено" ~/.pm2/logs/linkeon-api-out-0.log | tail -1'
+ssh dvolkov@212.113.106.202 'cd /home/dvolkov/spirits_back && T=$(node -r dotenv/config -e "process.stdout.write(require(\"./dist/products/product-tool.token\").signProductToolToken(\"<номер Test user>\",\"web\"))") && curl -s -m 20 -X POST http://127.0.0.1:3001/webhook/mcp/products -H "Authorization: Bearer $T" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"report_problem\",\"arguments\":{\"assistant\":\"Проверка\",\"kind\":\"my_failure\",\"summary\":\"Проверка выката 24.10: сообщение ассистента о поломке. Ссылка https://linkeon.io и @problem_report_check должны остаться простым текстом. Ничего делать не нужно.\"}}}" | grep -o "reported[^,}]*"; sleep 2; L=$(ls -t ~/.pm2/logs/linkeon-api-out*.log | head -1); grep -a "problem-report: передано в фанаут" "$L" | tail -1; grep -a "not delivered" "$L" | tail -3'
 ```
-Expected: `reported\":true`; в логе `problem-report: отправлено (assistant_report)`; в группе — «🙋 Проверка: у меня не работает», «Проверка выката 24.10…», «· веб»; ссылка и @упоминание в пересказе — моноширинным текстом, не кликабельны (пересказ в `<code>`).
+Expected: `reported\":true`; в логе `problem-report: передано в фанаут TELEGRAM_CHAT_ID (assistant_report)`, новых `not delivered` для чата группы нет; в группе — «🙋 Проверка: у меня не работает», «Проверка выката 24.10…», «· веб»; ссылка и @упоминание в пересказе — моноширинным текстом, не кликабельны (пересказ в `<code>`).
 
 - [ ] **Шаг 7: живая проверка эскалации** (из `dist`, тикета в базе нет — кнопка ведёт в никуда, это нормально)
 
@@ -2307,7 +2311,7 @@ const { TelegramNotifierService } = require(\"./dist/support/telegram-notifier.s
 new TelegramNotifierService().notifyEscalation({ ticketId: \"00000000-0000-0000-0000-000000000000\", userId: \"<номер Test user>\", urgency: \"low\", reason: \"Проверка выката 24.10: эскалации снова доходят до группы\", summary: \"Ничего делать не нужно.\" }).then(() => console.log(\"sent\"));
 "'
 ```
-Expected: `sent`; в группе — «ℹ️ Escalation · low» с кнопкой «Открыть тикет».
+Expected: `sent`; в выводе — `handed to TELEGRAM_CHAT_ID fan-out` и ни одной `not delivered` для чата группы (…2318); в группе — «ℹ️ Escalation · low» с кнопкой «Открыть тикет».
 
 - [ ] **Шаг 8: релей — живой файл не менялся с задачи 11**
 
@@ -2323,10 +2327,10 @@ Expected: коммит релея и первые 12 знаков суммы с�
 ```bash
 SCRATCH=<папка scratchpad сессии>
 git -C /Users/dmitry/Downloads/spirits_back show origin/main:relay-agent/server.mjs > "$SCRATCH/relay-server.new.mjs"
-scp -q "$SCRATCH/relay-server.new.mjs" dv@5.101.115.184:file-agent/server.mjs.new
-ssh dv@5.101.115.184 'cd ~/file-agent && node --check server.mjs.new && diff <(git show HEAD:server.mjs) server.mjs.new; mv server.mjs.new server.mjs && git add server.mjs && git commit -q -m "промпт и PRODUCTS_TOOLS: report_problem — сообщить в поддержку (spirits_back feat/problem-report)" && git log --oneline -1'
+scp -q "$SCRATCH/relay-server.new.mjs" dv@5.101.115.184:file-agent/server.new.mjs
+ssh dv@5.101.115.184 'set -e; cd ~/file-agent; node --check server.new.mjs; mv server.new.mjs server.mjs; git --no-pager diff -- server.mjs; git add server.mjs; git commit -q -m "промпт и PRODUCTS_TOOLS: report_problem — сообщить в поддержку (spirits_back feat/problem-report)"; git log --oneline -1'
 ```
-Expected: `diff` — те же строки, что в задаче 11; новый коммит на релее.
+Expected: `diff` — те же строки, что в задаче 11; новый коммит на релее. Имя — `server.new.mjs`, не `server.mjs.new`: `node --check` по расширению решает, ESM ли файл, и на `.new` падает даже на верном коде. `set -e` останавливает шаг на первой ошибке — битый файл не встанет на место `server.mjs`; тогда шаг 10 не делать, `server.new.mjs` убрать руками (ревью 24.10).
 
 - [ ] **Шаг 10: рестарт релея в момент без активных ходов**
 
@@ -2348,9 +2352,9 @@ Expected: `200`.
 
 ```bash
 ssh dv@85.192.61.231 'cd ~/deploy-clones/problem-report/spirits_back && source ~/.nvm/nvm.sh && DEBUG_SECRET=$(ssh -o BatchMode=yes dvolkov@212.113.106.202 "sed -n s/^DEBUG_SECRET=//p /home/dvolkov/spirits_back/.env") BASE_URL=https://my.linkeon.io TEST_PHONE=<номер Test user> node tests/problem-report.e2e.mjs'
-ssh dvolkov@212.113.106.202 'grep -a "problem-report: отправлено" ~/.pm2/logs/linkeon-api-out-0.log | tail -2'
+ssh dvolkov@212.113.106.202 'L=$(ls -t ~/.pm2/logs/linkeon-api-out*.log | head -1); grep -a "problem-report: передано в фанаут" "$L" | tail -2; grep -a "not delivered" "$L" | tail -3'
 ```
-Expected: `✓ ответ говорит о передаче команде`; в логе прода новая строка `problem-report: отправлено (assistant_report)`; в группе — «🙋 Кира: у меня не работает», «Проверка выката 24.10…», «· веб».
+Expected: `✓ ответ говорит о передаче команде`; в логе прода новая строка `problem-report: передано в фанаут TELEGRAM_CHAT_ID (assistant_report)`, новых `not delivered` для чата группы нет; в группе — «🙋 Кира: у меня не работает», «Проверка выката 24.10…», «· веб».
 
 - [ ] **Шаг 2: попросить владельца подтвердить**, что в группе видны четыре проверочных сообщения (А, Б, эскалация, Кира).
 
@@ -2359,5 +2363,5 @@ Expected: `✓ ответ говорит о передаче команде`; в
 ## Задача 17. Итоги
 
 - [ ] **Шаг 1:** в конец спеки — раздел «Итоги выката»: коммиты (мерж бэка, релей), что проверено живьём, что осталось вне рамок. Коммит и слияние в main тем же порядком, что задача 14.
-- [ ] **Шаг 2:** память — обновить `project_assistant_problem_reports.md`: статус «на проде», коммиты, как проверять (строки `problem-report: отправлено` в логе прода).
+- [ ] **Шаг 2:** память — обновить `project_assistant_problem_reports.md`: статус «на проде», коммиты, как проверять (строка `problem-report: передано в фанаут` в логе прода и ни одной `not delivered` для чата группы).
 - [ ] **Шаг 3:** убрать за собой: `git -C /Users/dmitry/Downloads/spirits_back worktree remove /Users/dmitry/Downloads/spirits_back/.worktrees/problem-report`; на ноде `git -C ~/ci/spirits_back worktree remove ~/ci/wt/problem-report` и `rm -rf ~/deploy-clones/problem-report`. Ветку `feat/problem-report` удалять — только с OK владельца.
