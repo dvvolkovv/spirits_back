@@ -114,8 +114,15 @@ export function formatToolFailure(p: {
   userId: string;
   repeats?: Repeats | null;
 }): string {
+  // Имя ассистента и (для незнакомого инструмента) его имя — чужой текст:
+  // custom_agents.name пишет пользователь, а незнакомый tool на /mcp — тот,
+  // кто зовёт точку. В <b> Telegram оживляет ссылки и @упоминания, в <code> —
+  // нет, поэтому оба идут туда, а не в <b>.
+  const action = isKnownTool(p.tool)
+    ? escapeHtml(toolAction(p.tool))
+    : `выполнить <code>${escapeHtml(clip(oneLine(head(p.tool, MAX_ID)), MAX_ID))}</code>`;
   const lines = [
-    `🛠 <b>${nameOf(p.assistant)}: не получилось ${escapeHtml(toolAction(p.tool))}</b>`,
+    `🛠 <code>${nameOf(p.assistant)}</code>: не получилось ${action}`,
     `Ошибка: <code>${escapeHtml(clip(p.error, MAX_ERROR))}</code>`,
     userLine(p.userId),
   ];
@@ -144,10 +151,11 @@ export function formatAssistantReport(p: {
   userId: string;
   channel: ProblemChannel;
 }): string {
+  // who — тоже чужой текст (имя пишет модель через assistantArg или custom_agents.name) — тот же приём, что выше.
   const who = nameOf(p.assistant);
   const headLine = p.kind === 'user_report'
-    ? `🙋 <b>${who} передаёт жалобу пользователя</b>`
-    : `🙋 <b>${who}: у меня не работает</b>`;
+    ? `🙋 <code>${who}</code> передаёт жалобу пользователя`
+    : `🙋 <code>${who}</code>: у меня не работает`;
   return [
     headLine,
     // В <code>: Telegram не делает из текста ссылку и не бьёт @упоминанием — подсунутый моделью пересказ не зафишит и никого не позовёт.

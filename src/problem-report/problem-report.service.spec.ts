@@ -54,7 +54,7 @@ describe('reportToolFailure — путь А', () => {
     await flush();
     expect(sent).toHaveBeenCalledTimes(1);
     const [text, extra] = sent.mock.calls[0];
-    expect(text).toContain('🛠 <b>Кира: не получилось создать видео</b>');
+    expect(text).toContain('🛠 <code>Кира</code>: не получилось создать видео');
     expect(text).toContain('no longer available');
     expect(text).toContain('<code>u1</code>');
     expect(extra).toEqual({ disable_web_page_preview: true });
@@ -161,7 +161,7 @@ describe('reportToolFailure — путь А', () => {
     const svc = new ProblemReportService(pg as any);
     svc.reportToolFailure(failure({ assistantId: null }));
     await flush();
-    expect(sent.mock.calls[0][0]).toContain('🛠 <b>Ассистент: не получилось создать видео</b>');
+    expect(sent.mock.calls[0][0]).toContain('🛠 <code>Ассистент</code>: не получилось создать видео');
     expect(pg.query).not.toHaveBeenCalled();
   });
 
@@ -172,7 +172,7 @@ describe('reportToolFailure — путь А', () => {
     await flush();
     expect(pg.query.mock.calls[0][0]).toContain('custom_agents');
     expect(pg.query.mock.calls[0][1]).toEqual(['3f2b9c1e-1111-4a2b-9c3d-123456789abc']);
-    expect(sent.mock.calls[0][0]).toContain('Мой юрист: не получилось');
+    expect(sent.mock.calls[0][0]).toContain('<code>Мой юрист</code>: не получилось');
   });
 
   it('база упала — «Ассистент», сообщение всё равно уходит', async () => {
@@ -180,7 +180,7 @@ describe('reportToolFailure — путь А', () => {
     const svc = new ProblemReportService(pg as any);
     svc.reportToolFailure(failure());
     await flush();
-    expect(sent.mock.calls[0][0]).toContain('Ассистент: не получилось');
+    expect(sent.mock.calls[0][0]).toContain('<code>Ассистент</code>: не получилось');
     expect(warnSpy.mock.calls.map((c) => String(c[0])).join('\n')).toContain('имя ассистента 22 не прочитано');
   });
 
@@ -258,7 +258,7 @@ describe('reportToolFailure — путь А', () => {
     await new Promise((r) => setTimeout(r, 80));
     await flush();
     expect(sent).toHaveBeenCalledTimes(1);
-    expect(String(sent.mock.calls[0][0])).toContain('🛠 <b>Ассистент: не получилось создать видео</b>');
+    expect(String(sent.mock.calls[0][0])).toContain('🛠 <code>Ассистент</code>: не получилось создать видео');
   });
 
   it('огромное имя инструмента — два разных незнакомых имени склеиваются в один сбой', async () => {
@@ -268,7 +268,7 @@ describe('reportToolFailure — путь А', () => {
     expect((svc as any).incidents.size).toBe(1);
     await flush();
     expect(sent).toHaveBeenCalledTimes(1);
-    expect(String(sent.mock.calls[0][0])).toContain('не получилось выполнить ' + 'x'.repeat(63) + '…');
+    expect(String(sent.mock.calls[0][0])).toContain('не получилось выполнить <code>' + 'x'.repeat(63) + '…</code>');
   });
 
   it('огромная ошибка с пробелами по краям — в сообщении короткая', async () => {
@@ -293,7 +293,7 @@ describe('reportFromAssistant — путь Б', () => {
     expect(await svc.reportFromAssistant(report())).toEqual({ ok: true, reported: true, say: REPORTED_SAY });
     await flush();
     expect(sent.mock.calls[0][0]).toBe(
-      '🙋 <b>Кира: у меня не работает</b>\n«<code>LibreOffice падает при конвертации</code>»\nПользователь: <code>u1</code> · веб',
+      '🙋 <code>Кира</code>: у меня не работает\n«<code>LibreOffice падает при конвертации</code>»\nПользователь: <code>u1</code> · веб',
     );
   });
 
@@ -303,7 +303,7 @@ describe('reportFromAssistant — путь Б', () => {
     await svc.reportFromAssistant(report({ channel: 'telegram', assistantId: null, assistantArg: 'Райя', kind: 'user_report', summary: 'не проходит оплата' }));
     await flush();
     expect(sent.mock.calls[0][0]).toBe(
-      '🙋 <b>Райя передаёт жалобу пользователя</b>\n«<code>не проходит оплата</code>»\nПользователь: <code>u1</code> · Telegram',
+      '🙋 <code>Райя</code> передаёт жалобу пользователя\n«<code>не проходит оплата</code>»\nПользователь: <code>u1</code> · Telegram',
     );
     expect(pg.query).not.toHaveBeenCalled();
   });
@@ -312,7 +312,7 @@ describe('reportFromAssistant — путь Б', () => {
     const svc = new ProblemReportService(pgWith() as any);
     await svc.reportFromAssistant(report({ assistantArg: 'Самозванец' }));
     await flush();
-    expect(sent.mock.calls[0][0]).toContain('Кира: у меня не работает');
+    expect(sent.mock.calls[0][0]).toContain('<code>Кира</code>: у меня не работает');
   });
 
   it('аргумент имени обрезается до 40, пустой — «Ассистент»', async () => {
@@ -320,8 +320,8 @@ describe('reportFromAssistant — путь Б', () => {
     await svc.reportFromAssistant(report({ assistantId: null, assistantArg: 'Б'.repeat(60) }));
     await svc.reportFromAssistant(report({ assistantId: null, assistantArg: '   ', userId: 'u2' }));
     await flush();
-    expect(sent.mock.calls[0][0]).toContain(`🙋 <b>${'Б'.repeat(39)}…: у меня не работает</b>`);
-    expect(sent.mock.calls[1][0]).toContain('🙋 <b>Ассистент: у меня не работает</b>');
+    expect(sent.mock.calls[0][0]).toContain(`🙋 <code>${'Б'.repeat(39)}…</code>: у меня не работает`);
+    expect(sent.mock.calls[1][0]).toContain('🙋 <code>Ассистент</code>: у меня не работает');
   });
 
   it('имя из хода — не дольше таймаута, потом имя из аргумента', async () => {
@@ -331,7 +331,7 @@ describe('reportFromAssistant — путь Б', () => {
     expect((await svc.reportFromAssistant(report())).ok).toBe(true);
     await new Promise((r) => setTimeout(r, 80));
     await flush();
-    expect(sent.mock.calls[0][0]).toContain('🙋 <b>Кира: у меня не работает</b>');
+    expect(sent.mock.calls[0][0]).toContain('🙋 <code>Кира</code>: у меня не работает');
   });
 
   it('bad_input: пустой summary или неизвестный kind — в группу ничего', async () => {
@@ -475,8 +475,8 @@ describe('reportFromAssistant — путь Б', () => {
     await svc.reportFromAssistant(report({ assistantId: null, assistantArg: 'Я'.repeat(1_000_000) }));
     await svc.reportFromAssistant(report({ assistantId: null, assistantArg: { evil: true }, userId: 'u2' }));
     await flush();
-    expect(String(sent.mock.calls[0][0])).toContain(`🙋 <b>${'Я'.repeat(39)}…: у меня не работает</b>`);
-    expect(String(sent.mock.calls[1][0])).toContain('🙋 <b>Ассистент: у меня не работает</b>');
+    expect(String(sent.mock.calls[0][0])).toContain(`🙋 <code>${'Я'.repeat(39)}…</code>: у меня не работает`);
+    expect(String(sent.mock.calls[1][0])).toContain('🙋 <code>Ассистент</code>: у меня не работает');
   });
 
   it('пустой вызов (null) — failed, а не исключение', async () => {

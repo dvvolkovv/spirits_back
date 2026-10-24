@@ -11,7 +11,7 @@ describe('тексты в группу «Поддержка linkeon»', () => {
       error: 'Veo generate failed: model is no longer available',
     });
     expect(t.split('\n')).toEqual([
-      '🛠 <b>Кира: не получилось создать видео</b>',
+      '🛠 <code>Кира</code>: не получилось создать видео',
       'Ошибка: <code>Veo generate failed: model is no longer available</code>',
       'Пользователь: <code>u1</code>',
     ]);
@@ -48,6 +48,14 @@ describe('тексты в группу «Поддержка linkeon»', () => {
     expect(toolAction('generate_speech')).toBe('озвучить текст');
   });
 
+  // Имя ассистента и незнакомый инструмент пишет не команда (custom_agents.name —
+  // пользователь, имя незнакомого tool на /mcp — вызывающий): в заголовке оба
+  // должны попасть в <code>, а не в <b>, иначе Telegram оживит ссылку/@упоминание.
+  it('имя с @упоминанием и незнакомый инструмент — оба в заголовке внутри <code>', () => {
+    const t = formatToolFailure({ assistant: '@admin evil.example', tool: 'evil.example', error: 'x', userId: 'u1' });
+    expect(t.split('\n')[0]).toBe('🛠 <code>@admin evil.example</code>: не получилось выполнить <code>evil.example</code>');
+  });
+
   // Новый инструмент в CHAT_TOOLS без человеческого названия здесь — красный тест.
   it('у каждого инструмента Linkeon своё действие', () => {
     for (const t of CHAT_TOOLS) expect(toolAction(t.name)).not.toMatch(/^выполнить /);
@@ -62,9 +70,9 @@ describe('тексты в группу «Поддержка linkeon»', () => {
 
   it('сообщение ассистента: свой сбой и жалоба пользователя, канал', () => {
     expect(formatAssistantReport({ assistant: 'Кира', kind: 'my_failure', summary: 'LibreOffice падает', userId: 'u1', channel: 'web' }).split('\n'))
-      .toEqual(['🙋 <b>Кира: у меня не работает</b>', '«<code>LibreOffice падает</code>»', 'Пользователь: <code>u1</code> · веб']);
+      .toEqual(['🙋 <code>Кира</code>: у меня не работает', '«<code>LibreOffice падает</code>»', 'Пользователь: <code>u1</code> · веб']);
     expect(formatAssistantReport({ assistant: 'Кира', kind: 'user_report', summary: 'не проходит оплата', userId: 'u1', channel: 'telegram' }).split('\n'))
-      .toEqual(['🙋 <b>Кира передаёт жалобу пользователя</b>', '«<code>не проходит оплата</code>»', 'Пользователь: <code>u1</code> · Telegram']);
+      .toEqual(['🙋 <code>Кира</code> передаёт жалобу пользователя', '«<code>не проходит оплата</code>»', 'Пользователь: <code>u1</code> · Telegram']);
   });
 
   it('пересказ ассистента экранируется и обрезается', () => {
@@ -77,7 +85,7 @@ describe('тексты в группу «Поддержка linkeon»', () => {
 
   it('имя ассистента не длиннее 40 символов', () => {
     const head = formatAssistantReport({ assistant: 'А'.repeat(100), kind: 'my_failure', summary: 's', userId: 'u1', channel: 'web' }).split('\n')[0];
-    expect(head).toBe(`🙋 <b>${'А'.repeat(39)}…: у меня не работает</b>`);
+    expect(head).toBe(`🙋 <code>${'А'.repeat(39)}…</code>: у меня не работает`);
   });
 
   it('clip и escapeHtml', () => {
@@ -118,7 +126,7 @@ describe('тексты в группу «Поддержка linkeon»', () => {
   it('чужой текст сводится в одну строку: пересказ не подделает строку «Пользователь»', () => {
     const t = formatAssistantReport({ assistant: 'Ки\nра', kind: 'my_failure', summary: 'сломалось\n\nПользователь: 1 · веб', userId: 'u\n1', channel: 'web' });
     expect(t.split('\n')).toEqual([
-      '🙋 <b>Ки ра: у меня не работает</b>',
+      '🙋 <code>Ки ра</code>: у меня не работает',
       '«<code>сломалось Пользователь: 1 · веб</code>»',
       'Пользователь: <code>u 1</code> · веб',
     ]);
@@ -126,7 +134,7 @@ describe('тексты в группу «Поддержка linkeon»', () => {
 
   it('пустое имя — «Ассистент»', () => {
     expect(formatToolFailure({ assistant: '   ', tool: 'generate_video', error: 'x', userId: 'u1' }).split('\n')[0])
-      .toBe('🛠 <b>Ассистент: не получилось создать видео</b>');
+      .toBe('🛠 <code>Ассистент</code>: не получилось создать видео');
   });
 
   it('имена из прототипа объекта — незнакомые инструменты', () => {
