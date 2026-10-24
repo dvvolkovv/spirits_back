@@ -35,8 +35,8 @@ export type AssistantReportResult =
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
-/** Сколько разных пользователей помнить в одном сбое: счётчику хватит, памяти — нет. */
-const MAX_USERS_PER_INCIDENT = 1000;
+/** Сколько разных пользователей помнить в одном сбое: M в «у M пользователей» и так нижняя оценка, а живых сбоев бывает до ~500 (сутки × потолок) — по 1000 на каждый держали бы десятки МБ. */
+const MAX_USERS_PER_INCIDENT = 200;
 const MAX_ID = 64;
 const MAX_ERROR = 300;
 /** Имя из аргумента модели — до 40 символов, как в заголовке сообщения. */
@@ -142,7 +142,7 @@ export class ProblemReportService {
         this.incidents.set(key, { lastSentAt: now, lastSeenAt: now, repeats: 0, users: new Set() });
         const assistantId = p.assistantId;
         void this.deliver('tool_failure', async () =>
-          formatToolFailure({ assistant: await this.assistantNameWithin(assistantId), tool, error, userId, repeats }),
+          formatToolFailure({ assistant: await this.assistantNameWithin(assistantId, userId), tool, error, userId, repeats }),
         );
       }
       return { supportNotified: telegramConfigured() };
@@ -186,7 +186,7 @@ export class ProblemReportService {
       const arg = typeof p.assistantArg === 'string' ? short(p.assistantArg, MAX_NAME) : '';
       const { assistantId, channel } = p;
       void this.deliver('assistant_report', async () => {
-        const fromTurn = assistantId ? await this.assistantNameWithin(assistantId) : FALLBACK_NAME;
+        const fromTurn = assistantId ? await this.assistantNameWithin(assistantId, userId) : FALLBACK_NAME;
         const assistant = fromTurn !== FALLBACK_NAME ? fromTurn : arg || FALLBACK_NAME;
         return formatAssistantReport({ assistant, kind, summary, userId, channel });
       });
@@ -256,7 +256,7 @@ export class ProblemReportService {
   }
 
   /** Имя ассистента, но не дольше nameTimeoutMs — потом «Ассистент». */
-  private async assistantNameWithin(assistantId: string | null): Promise<string> {
+  private async assistantNameWithin(assistantId: string | null, userId: string): Promise<string> {
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<string>((resolve) => {
       timer = setTimeout(() => {
@@ -266,18 +266,24 @@ export class ProblemReportService {
       timer.unref?.();
     });
     try {
-      return await Promise.race([this.assistantName(assistantId), timeout]);
+      return await Promise.race([this.assistantName(assistantId, userId), timeout]);
     } finally {
       clearTimeout(timer);
     }
   }
 
-  /** Имя ассистента: agents по числовому id или по имени, custom_agents — по custom:<uuid>. */
-  async assistantName(assistantId: string | null): Promise<string> {
+  /** Имя ассистента: agents по числовому id или по имени, custom_agents — по custom:<uuid> этого пользователя. */
+  async assistantName(assistantId: string | null, userId: string): Promise<string> {
     if (!assistantId || !this.pg) return FALLBACK_NAME;
     try {
       if (assistantId.startsWith('custom:')) {
-        const r = await this.pg.query('SELECT name FROM custom_agents WHERE id = $1 LIMIT 1', [assistantId.slice('custom:'.length)]);
+        // Только своего пользователя — как resolveAgent в chat.service.ts: чужим
+        // кастомным ход не отвечает (там отвечает ассистент по умолчанию), и
+        // чужое имя в группе ввело бы в заблуждение.
+        const r = await this.pg.query(
+          'SELECT name FROM custom_agents WHERE id = $1 AND owner_user_id = $2 LIMIT 1',
+          [assistantId.slice('custom:'.length), userId],
+        );
         return r.rows[0]?.name || FALLBACK_NAME;
       }
       const r = /^\d+$/.test(assistantId)
@@ -299,7 +305,9 @@ export class ProblemReportService {
         return;
       }
       await sendTelegramAlert(text, { disable_web_page_preview: true });
-      this.logger.log(`problem-report: отправлено (${kind})`);
+      // sendTelegramAlert отказ чата не бросает, а пишет «alert to chat …XXXX not delivered»:
+      // доставку видно по отсутствию такой строки для чата группы, а не по этой.
+      this.logger.log(`problem-report: передано в фанаут TELEGRAM_CHAT_ID (${kind}); отказы чатов — выше строками «not delivered»`);
     } catch (e: any) {
       this.logger.warn(`problem-report: не отправлено (${kind}): ${e?.message}`);
     }

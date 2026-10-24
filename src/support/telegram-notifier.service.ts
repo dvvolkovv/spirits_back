@@ -129,7 +129,7 @@ export class TelegramNotifierService {
         return;
       }
       await sendTelegramPayload({ text, parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: replyMarkup });
-      this.logger.log(`escalation #${p.ticketId.slice(0, 8)} → чаты TELEGRAM_CHAT_ID`);
+      this.logger.log(`escalation #${p.ticketId.slice(0, 8)} handed to TELEGRAM_CHAT_ID fan-out; per-chat failures are logged above as "not delivered"`);
       return;
     }
     await this.send(text, replyMarkup);

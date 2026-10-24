@@ -247,10 +247,12 @@ export class SupportService implements OnModuleInit {
     if (!process.env.TELEGRAM_SUPPORT_CHAT_ID && telegramConfigured()) {
       const link = `${process.env.ADMIN_ORIGIN || 'https://my.linkeon.io'}/admin`;
       // Экранируем: `<` или `&` в ответе пользователя заставили бы Telegram отвергнуть сообщение.
+      // Без превью: Telegram не ходит по ссылке из ответа пользователя.
       await sendTelegramAlert(
         `🆘 <b>Поддержка: сообщение ждёт оператора</b>\n` +
         `Клиент: ${escapeHtml(name)}\nТикет: <code>${ticketId}</code> (${status})\n` +
         `«${escapeHtml(clip(text, 300))}»\n\nОткрыть: ${link}`,
+        { disable_web_page_preview: true },
       ).catch(() => {});
     }
     await this.pg.query(
