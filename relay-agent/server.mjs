@@ -573,6 +573,14 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
     "--disallowedTools", "mcp__plugin_telegram_telegram__reply,mcp__plugin_telegram_telegram__react,mcp__plugin_telegram_telegram__edit_message,mcp__plugin_telegram_telegram__download_attachment,ToolSearch",
     "--mcp-config", mcpConfigPath,
     "--strict-mcp-config",
+    // Снимок промпта выключен. CLI 2.1.280 в режиме --print пишет в транскрипт
+    // prompt_snapshot и на --resume шлёт модели ЕГО вместо переданного
+    // --system-prompt, вместе со старыми описаниями инструментов. Так 24.10.2026
+    // Кира со снимком от 19.10 предложила «Veo или Kling», хотя Kling сняли 22.10:
+    // правки персон, коллег и правил релея не доходили до продолжаемых сессий.
+    // Проверено опытом: без флага resume отвечает по старому промпту, с off — по
+    // новому. Цена — холодный кэш на ходе, где поменялся промпт (так и было до 23.09).
+    "--system-prompt-snapshot", "off",
     "--system-prompt", systemPrompt,
   ];
 
