@@ -1214,7 +1214,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // поэтому разъехаться они не могут.
           timeoutMs: RELAY_TURN_BUDGET_MS,
           mcpServers: products.mcpServers,
-          // Автоодобрение — ровно инструмент продуктов. Встроенные тулы у Маши
+          // Автоодобрение — ровно инструменты точки продуктов. Встроенные тулы у Маши
           // по-прежнему выключены (tools не задан → `--tools ""`).
           // + поиск файлов прошлых разговоров (find-files.tool.ts) — у TG-бота
           // его нет; + сообщить в поддержку (src/problem-report) — есть у обоих.
@@ -1222,11 +1222,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // onProgress переводит CLI в stream-json: только так видно, звали ли
           // инструмент продуктов в этом ходе (итог в формате json этого не несёт).
           onProgress: (ev) => {
-            // Карта не подмешивается и к ходу с поиском файлов: «карточка», «картинка»
-            // в разговоре о найденных файлах — не повод вешать метафорическую карту.
-            if (ev.kind === 'tool_use' && (ev.name === products.toolName || ev.name === FIND_FILES_CLI_TOOL_NAME)) usedProductsTool = true;
+            // Карта не подмешивается и к ходу с поиском файлов или с сообщением в
+            // поддержку: «карточка», «картинка» о найденных файлах, «не проходит
+            // оплата картой» в жалобе — не повод вешать метафорическую карту.
+            if (ev.kind === 'tool_use' && (ev.name === products.toolName || ev.name === FIND_FILES_CLI_TOOL_NAME || ev.name === REPORT_PROBLEM_CLI_TOOL_NAME)) usedProductsTool = true;
             // Шаг работы для клиента, который его рисует. Аргументов onProgress
-            // не отдаёт — хватает имени: у Маши из инструментов только продукты.
+            // не отдаёт — хватает имени: у Маши только инструменты точки продуктов.
             // Для новых инструментов понадобится input — onProgress его не отдаёт.
             //
             // writableEnded: claude CLI при таймауте убивает процесс SIGTERM'ом,
