@@ -67,7 +67,9 @@ export const SHORT_LIMITS: VerifyLimits = { minSec: 30, maxSec: 60, width: 1080,
  */
 export function verifyVideo(probe: ProbeInfo, silences: Silence[], limits: VerifyLimits = SHORT_LIMITS): string[] {
   const problems: string[] = [];
-  if (probe.durationSec < limits.minSec || probe.durationSec > limits.maxSec) {
+  if (!Number.isFinite(probe.durationSec)) {
+    problems.push('длина не определена — ffprobe не вернул длительность');
+  } else if (probe.durationSec < limits.minSec || probe.durationSec > limits.maxSec) {
     problems.push(`длина ${probe.durationSec.toFixed(1)} с вне ${limits.minSec}–${limits.maxSec} с`);
   }
   if (probe.width !== limits.width || probe.height !== limits.height) {
@@ -95,6 +97,12 @@ export async function detectSilences(file: string, totalSec: number): Promise<Si
   return parseSilences(stderr, totalSec);
 }
 
+/** Длительность в мс. Без неё таймлайн получил бы NaN-кадры — лучше упасть сразу и назвать файл. */
+export function toDurationMs(sec: number, file: string): number {
+  if (!Number.isFinite(sec) || sec <= 0) throw new Error(`ffprobe: не удалось определить длительность ${file}`);
+  return Math.round(sec * 1000);
+}
+
 export async function audioDurationMs(file: string): Promise<number> {
-  return Math.round((await probeFile(file)).durationSec * 1000);
+  return toDurationMs((await probeFile(file)).durationSec, file);
 }
