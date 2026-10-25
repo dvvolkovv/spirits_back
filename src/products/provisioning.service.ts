@@ -800,7 +800,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
            WHERE j.status = 'queued'
              AND EXISTS (SELECT 1 FROM products p
                           WHERE p.id = j.product_id
-                            AND p.archived_at IS NULL
+                            AND (p.archived_at IS NULL OR (j.kind = 'sleep' AND p.purged_at IS NULL))
                             -- Метка машины. Условие внутри EXISTS, то есть
                             -- ВНУТРИ отбора, а не поверх него: наложенное
                             -- снаружи (на claimed или на итоговый SELECT), оно
@@ -834,7 +834,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                             --     поднимет контейнер обратно через секунды.
                             AND CASE j.kind
                                   WHEN 'provision' THEN p.status = 'provisioning'
-                                  WHEN 'sleep' THEN p.status IN ('sleeping','blocked')
+                                  WHEN 'sleep' THEN p.status IN ('sleeping','blocked','archived')
                                   -- Своя ветка ОБЯЗАТЕЛЬНА: без неё 'domain'
                                   -- попал бы в ELSE и выдавался бы только
                                   -- спящим — у работающего висел бы вечно.
@@ -888,7 +888,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                                      END
                                    ELSE false
                                  END), '{}') AS custom_names
-              , CASE WHEN p.status = 'blocked' THEN 'asleep'
+              , CASE WHEN p.status IN ('blocked','archived') THEN 'asleep'
                      WHEN p.status = 'sleeping' AND NOT ${wokenSql('p.id')} THEN 'asleep'
                      ELSE 'proxy' END AS vhost_mode
          FROM claimed c
@@ -1060,12 +1060,12 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
           SET status = CASE closed.kind
                          WHEN 'provision' THEN 'failed'
                          WHEN 'sleep' THEN
-                           CASE WHEN products.status = 'blocked' THEN 'blocked' ELSE 'degraded' END
+                           CASE WHEN products.status IN ('blocked','archived') THEN products.status ELSE 'degraded' END
                          ELSE products.status
                        END,
               sleep_reason = CASE closed.kind
                                WHEN 'sleep' THEN
-                                 CASE WHEN products.status = 'blocked'
+                                 CASE WHEN products.status IN ('blocked','archived')
                                       THEN products.sleep_reason ELSE NULL END
                                ELSE products.sleep_reason
                              END,
