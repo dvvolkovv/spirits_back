@@ -20,6 +20,7 @@ import { MiscService } from '../misc/misc.service';
 import { VideoService } from '../video/video.service';
 import { BlogApprovalService } from '../blog/blog-approval.service';
 import { ShortsApprovalService } from '../shorts/shorts-approval.service';
+import { shortsEnabled } from '../shorts/short-env';
 import { fetchMediaBytes } from '../common/net/own-media';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
 
@@ -166,6 +167,13 @@ export class TgBotService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
+    // Порванная связка с роликами не должна молчать — но только там, где
+    // ролики вообще включены: на средах без SHORTS_ENABLED отсутствие сервиса
+    // — норма, а не поломка, и предупреждение было бы шумом.
+    if (!this.shortsApproval && shortsEnabled()) {
+      this.logger.warn('ролики: ShortsApprovalService не подставлен — кнопки и /short роликов не работают');
+    }
+
     await this.applyMigration('001_tg_bot_schema.sql');
     await this.applyMigration('002_tg_bot_custom_agent_fk.sql');
     await this.applyMigration('003_tg_bot_video_delivery.sql');
@@ -381,8 +389,21 @@ export class TgBotService implements OnModuleInit {
       return;
     }
     if (shouldRouteToShorts(data)) {
-      if (this.shortsApproval) await this.shortsApproval.handleCallback(cb);
-      else await this.grammy.answerCallbackQuery(cb.id, {}).catch(() => {});
+      if (!this.shortsApproval) {
+        await this.grammy.answerCallbackQuery(cb.id, {}).catch(() => {});
+        return;
+      }
+      // Нажатие не должно остаться без ответа: сервис отвечает сам, когда
+      // обработал (true) — но при false (кнопка не наша) или упавшем
+      // исключении «часики» на кнопке иначе крутились бы до таймаута
+      // Telegram (репорт владельца — ~15 с без ответа).
+      let handled = false;
+      try {
+        handled = await this.shortsApproval.handleCallback(cb);
+      } catch (e: any) {
+        this.logger.warn(`ролик: handleCallback упал: ${e?.message}`);
+      }
+      if (!handled) await this.grammy.answerCallbackQuery(cb.id, {}).catch(() => {});
       return;
     }
 
