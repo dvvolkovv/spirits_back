@@ -14,6 +14,7 @@ import {
   needsVeoConcat, VEO_BASE_SEC, VEO_EXTEND_SEC,
 } from './video.dto';
 import { VoiceAvatarService } from '../voice-avatar/voice-avatar.service';
+import { jobCostRefunded } from './job-refund';
 import { assertFetchableMedia, fetchMediaBytes } from '../common/net/own-media';
 import { isUnsafeUrlError } from '../common/net/safe-fetch';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, CreateBucketCommand, PutBucketPolicyCommand } from '@aws-sdk/client-s3';
@@ -449,9 +450,14 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
    * Возвращаем и стоимость кадра-заготовки: text2video без картинки сначала
    * рисует кадр (отдельное списание 'image'), и при провале анимации человек
    * остаётся без ролика, но с оплаченной заготовкой.
+   *
+   * Стоимость ролика не возвращаем, если её уже вернули (jobCostRefunded):
+   * перезапуск из поддержки возвращает списание новой задачи сразу, и её
+   * провал иначе вернул бы его второй раз. Статус 'failed' ставится всё равно.
    */
   private async failAndRefund(jobId: string, userId: string, tokens: number, reason: string) {
     const client = await this.pg.getClient();
+    let refunded = 0;
     try {
       await client.query('BEGIN');
       const marked = await client.query(
@@ -466,15 +472,25 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         return;
       }
       const stillTokens = Number(marked.rows[0]?.image_tokens_spent ?? 0);
-      const total = Number(tokens) + stillTokens;
-      await client.query(
-        `SELECT add_user_tokens($1, $2, 'refund', $3, $4::jsonb)`,
-        [userId, total, 'Возврат за видео',
-         JSON.stringify({
-           job_id: jobId, reason: String(reason).slice(0, 200),
-           video_tokens: Number(tokens), still_tokens: stillTokens,
-         })],
-      );
+      // Строка задачи уже под блокировкой (UPDATE выше): перезапуск, который
+      // её тоже блокирует, либо уже закоммитил свой возврат, либо дождётся нас.
+      const videoTokens = (await jobCostRefunded(client, userId, jobId)) ? 0 : Number(tokens);
+      if (videoTokens === 0 && Number(tokens) > 0) {
+        this.logger.warn(
+          `failAndRefund: задача ${jobId} — перезапуск, её стоимость (${tokens}) уже вернул перезапуск; повторно не возвращаем`,
+        );
+      }
+      refunded = videoTokens + stillTokens;
+      if (refunded > 0) {
+        await client.query(
+          `SELECT add_user_tokens($1, $2, 'refund', $3, $4::jsonb)`,
+          [userId, refunded, 'Возврат за видео',
+           JSON.stringify({
+             job_id: jobId, reason: String(reason).slice(0, 200),
+             video_tokens: videoTokens, still_tokens: stillTokens,
+           })],
+        );
+      }
       await client.query('COMMIT');
       // Метка «сломано деньгами» — по ней потом подтвердится починка.
       // Сообщение о самом провале шлёт QualityMonitorService, здесь молчим.
@@ -485,7 +501,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     } finally {
       client.release();
     }
-    this.logger.warn(`Video job ${jobId} failed, refunded ${tokens} tokens: ${reason}`);
+    this.logger.warn(`Video job ${jobId} failed, refunded ${refunded} tokens: ${reason}`);
   }
 
   async uploadUserAsset(

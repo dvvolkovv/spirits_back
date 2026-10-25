@@ -1081,7 +1081,6 @@ ${LanguageService.buildDirective(userLanguage)}`;
       volatileSystemPrompt += `\n\n${balanceBlock}`;
     }
 
-    // Плоская строка для путей, не поддерживающих структурный system (DeepSeek greeting, OpenRouter fallback)
     // Требование ответить на нужном языке — САМОЙ последней строкой, после
     // всего волатильного блока.
     //
@@ -1092,7 +1091,6 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // короткую строку в самый конец: она короткая и кэш префикса не ломает.
     const replyLanguageTail =
       `\n\n${LANGUAGE_REPLY_LINE[userLanguage] || LANGUAGE_REPLY_LINE[DEFAULT_LANGUAGE]}\n`;
-    const systemPrompt = stableSystemPrompt + volatileSystemPrompt + replyLanguageTail;
 
     // Build messages array
     const llmMessages: { role: 'user' | 'assistant'; content: string }[] = [];
@@ -1109,37 +1107,6 @@ ${LanguageService.buildDirective(userLanguage)}`;
     res.setHeader('X-Accel-Buffering', 'no');
     res.setHeader('Access-Control-Allow-Origin', '*');
 
-    // Detect initial greeting — use DeepSeek (free, no token deduction)
-    const isGreeting = recentHistory.length === 0 && /привет|расскажи про себя|hello|hi$/i.test(message.trim());
-    if (isGreeting && process.env.DEEPSEEK_API_KEY) {
-      res.write(JSON.stringify({ type: 'begin' }) + '\n');
-      try {
-        const dsResp = await axios.post('https://api.deepseek.com/chat/completions', {
-          model: 'deepseek-chat',
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: message },
-          ],
-          max_tokens: 2048,
-        }, {
-          headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`, 'Content-Type': 'application/json' },
-          timeout: 30000,
-        });
-        const greetText = this.stripToolTags(dsResp.data?.choices?.[0]?.message?.content || 'Привет! Чем могу помочь?');
-        res.write(JSON.stringify({ type: 'item', content: greetText }) + '\n');
-        res.write(JSON.stringify({ type: 'end', content: greetText, usage: { input: 0, output: 0, total: 0 } }) + '\n');
-        res.end();
-        setImmediate(async () => {
-          try { await this.saveChatHistory(userId, String(assistantId), message, greetText, 0, fresh ? chatSessionId : undefined); } catch {}
-          // No token deduction for greeting
-        });
-        return;
-      } catch (e) {
-        this.logger.error(`DeepSeek greeting error: ${e.message}`);
-        // Fall through to Anthropic
-      }
-    }
-
     // Маша-only путь (agent.id === 3): остальные агенты выше уже ушли в streamUniversalAgent.
     // Один вызов ClaudeCli (OAuth), потом post-processing для инжекта метафорической карты,
     // потом single 'item' + 'end' событие. Без streaming и без CHAT_TOOLS; из инструментов —
@@ -1152,8 +1119,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     let costUsd = 0;
     const turnStartedAt = Date.now();
 
-    // Собираем prompt: история + текущая реплика. systemPrompt уже включает
-    // platformContext + agent.system_prompt + правило ответа + profileText + tasks ctx.
+    // Собираем prompt: история + текущая реплика. System-промпт (в вызове CLI
+    // ниже) уже включает platformContext + agent.system_prompt + правило
+    // ответа + profileText + tasks ctx.
     const priorTurns = llmMessages
       .slice(0, -1) // last is current message — добавляем отдельно как USER
       .map(m => `${m.role.toUpperCase()}: ${m.content}`)
@@ -1195,11 +1163,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
       try {
         const r = await this.claudeCli.textWithCost(fullPrompt, {
-          // Блок про продукты — только в этом вызове, не в systemPrompt: тот же
-          // systemPrompt уходит в приветствие DeepSeek, которое инструмент позвать
-          // не может. Встаёт ДО волатильной части и хвоста языка: требование языка
-          // обязано остаться последней строкой (см. replyLanguageTail выше), а
-          // блок написан по-русски.
+          // Блок про продукты встаёт ДО волатильной части и хвоста языка:
+          // требование языка обязано остаться последней строкой (см.
+          // replyLanguageTail выше), а блок написан по-русски.
           // Правило карточек — только клиенту, который их рисует; до хвоста
           // языка, который обязан остаться последним.
           system: stableSystemPrompt + `\n\n${products.promptBlock}\n\n${FIND_FILES_CLI_PROMPT}` +

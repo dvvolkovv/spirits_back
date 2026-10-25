@@ -59,14 +59,11 @@ async function runMasha(ui?: { activity: boolean; ask: boolean }, resOverrides?:
 
 describe('Маша: шаги работы и карточки', () => {
   const OLD_SECRET = process.env.JWT_SECRET;
-  const OLD_DS = process.env.DEEPSEEK_API_KEY;
   beforeAll(() => {
     process.env.JWT_SECRET = 'test-secret-masha-interactivity';
-    delete process.env.DEEPSEEK_API_KEY;
   });
   afterAll(() => {
     process.env.JWT_SECRET = OLD_SECRET;
-    if (OLD_DS === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = OLD_DS;
   });
 
   it('вызов инструмента продуктов — шаг для клиента, который умеет', async () => {
