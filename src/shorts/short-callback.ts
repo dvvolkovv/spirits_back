@@ -45,15 +45,23 @@ export function shortCommandText(text: unknown): string | null {
 }
 
 const YOUTUBE: RegExp[] = [
-  /^https?:\/\/(?:www\.|m\.)?youtube\.com\/shorts\/([A-Za-z0-9_-]{11})(?:[?#/].*)?$/,
-  /^https?:\/\/youtu\.be\/([A-Za-z0-9_-]{11})(?:[?#/].*)?$/,
-  /^https?:\/\/(?:www\.|m\.)?youtube\.com\/watch\?(?:.*&)?v=([A-Za-z0-9_-]{11})(?:[&#].*)?$/,
+  /^https?:\/\/(?:www\.|m\.)?youtube\.com\/shorts\/([A-Za-z0-9_-]{11})(?:[?#/].*)?$/i,
+  /^https?:\/\/youtu\.be\/([A-Za-z0-9_-]{11})(?:[?#/].*)?$/i,
+  /^https?:\/\/(?:www\.|m\.)?youtube\.com\/watch\?(?:.*&)?v=([A-Za-z0-9_-]{11})(?:[&#].*)?$/i,
 ];
 
-/** Ссылка на ролик в YouTube из ответа владельца — в каноническом виде shorts/<id>. */
+/** Пунктуация, которая в тексте владельца прилипает к ссылке без пробела. */
+const TRAILING_PUNCTUATION = /[.,!?:;)\]}>»”'"]+$/;
+
+/**
+ * Ссылка на ролик в YouTube из ответа владельца — в каноническом виде
+ * shorts/<id>. Домен распознаётся без учёта регистра, id — с учётом; хвостовая
+ * пунктуация, прилипшая к ссылке без пробела, обрезается перед проверкой.
+ */
 export function parseYoutubeUrl(text: unknown): { videoId: string; url: string } | null {
-  const url = String(text ?? '').match(/https?:\/\/\S+/)?.[0];
-  if (!url) return null;
+  const match = String(text ?? '').match(/https?:\/\/\S+/)?.[0];
+  if (!match) return null;
+  const url = match.replace(TRAILING_PUNCTUATION, '');
   for (const re of YOUTUBE) {
     const m = url.match(re);
     if (m) return { videoId: m[1], url: `https://youtube.com/shorts/${m[1]}` };

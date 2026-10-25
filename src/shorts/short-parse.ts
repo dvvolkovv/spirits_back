@@ -33,21 +33,38 @@ function sliceOuterObject(text: string): string | null {
   return start < 0 || end <= start ? null : text.slice(start, end + 1);
 }
 
-/** Объект JSON из ответа релея: в заборе с json или между первой { и последней }. */
+const FENCE_RE = /`{3}(?:json)?\s*([\s\S]*?)`{3}/gi;
+
+/** Разбирает текст как JSON-объект; массив, не-объект и невалидный JSON — null. */
+function parseIfObject(candidate: string): Record<string, any> | null {
+  try {
+    const parsed = JSON.parse(candidate);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Объект JSON из ответа релея: в заборах с json (берём последний, который
+ * разбирается в объект — модель иногда сначала даёт пример, потом ответ) или
+ * между первой { и последней } без забора. Ответ-массив — с забором или без —
+ * всегда отвергается, даже если внутри один объект.
+ */
 export function extractJsonObject(raw: string, who: string): Record<string, any> {
   const text = String(raw ?? '').trim();
   if (!text) throw new Error(`${who}: пустой ответ`);
-  const fenced = text.match(/`{3}(?:json)?\s*([\s\S]*?)`{3}/i);
-  const candidate = fenced ? fenced[1].trim() : sliceOuterObject(text);
-  let parsed: any = null;
-  if (candidate) {
-    try {
-      parsed = JSON.parse(candidate);
-    } catch {
-      parsed = null;
+  const fences = Array.from(text.matchAll(FENCE_RE));
+  let parsed: Record<string, any> | null = null;
+  if (fences.length) {
+    for (let i = fences.length - 1; i >= 0 && !parsed; i--) {
+      parsed = parseIfObject(fences[i][1].trim());
     }
+  } else if (!/^\s*\[/.test(text)) {
+    const candidate = sliceOuterObject(text);
+    if (candidate) parsed = parseIfObject(candidate);
   }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+  if (!parsed) {
     throw new Error(`${who}: не нашёл JSON в ответе; начало ответа: «${rawSnippet(text)}»`);
   }
   return parsed;
