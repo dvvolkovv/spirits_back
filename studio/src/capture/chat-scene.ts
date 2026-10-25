@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { chromium, type Page } from 'playwright';
 import { answerProblems, isCounterQuestion } from '../answer';
-import { toImageBoxes, type CssRect } from '../boxes';
+import { toAnswerLayout, type CssRect } from '../boxes';
 import type { StudioConfig } from '../config';
 import { StudioError } from '../errors';
 import { probeFile } from '../ffprobe';
@@ -23,7 +23,6 @@ const USER_MSG = '[data-testid="chat-message"].justify-end';
 
 export interface CaptureOptions {
   minAnswerChars: number;
-  assistantsCount: number;
   probeOnly?: boolean;
 }
 
@@ -240,7 +239,7 @@ export async function captureChat(
     await page.screenshot({ path: shot('answer.png'), fullPage: true });
 
     const img = await probeFile(shot('answer.png'));
-    const boxes = toImageBoxes(rects, SCALE, img.height);
+    const { boxes, paragraphs } = toAnswerLayout(rects, SCALE, img.height);
     if (boxes.length === 0) throw new StudioError('no_paragraphs', 'capture: в ответе не нашлось ни одного абзаца', true);
     for (const f of ['question.png', 'answer.png']) {
       if (fs.statSync(shot(f)).size < 20_000) throw new StudioError('empty_frame', `capture: ${f} меньше 20 КБ — похоже на пустой кадр`, true);
@@ -256,7 +255,7 @@ export async function captureChat(
       answerText: answer,
       turns,
       boxes,
-      assistantsCount: opts.assistantsCount,
+      paragraphs,
     };
   } finally {
     await browser.close();

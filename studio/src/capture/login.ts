@@ -75,12 +75,3 @@ export async function loginDemoCached(cfg: StudioConfig, cacheFile: string): Pro
   fs.writeFileSync(cacheFile, JSON.stringify({ ...s, phone: cfg.demoPhone, apiUrl: cfg.apiUrl }), { mode: 0o600 });
   return s;
 }
-
-/** Число ассистентов — тем же публичным запросом, что список в кабинете. */
-export async function countAssistants(cfg: StudioConfig): Promise<number> {
-  const r = await fetch(`${cfg.apiUrl}/webhook/agents?lang=ru`);
-  if (!r.ok) throw new Error(`agents — ${r.status}`);
-  const list = (await r.json()) as unknown;
-  if (!Array.isArray(list)) throw new Error('agents: ответ не список');
-  return list.length;
-}

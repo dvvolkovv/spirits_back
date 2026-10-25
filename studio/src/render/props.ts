@@ -32,6 +32,6 @@ export function buildProps(capture: CaptureResult, script: Script, voiced: TtsRe
     answerShotHeight: capture.answerShotHeight,
     boxes: capture.boxes,
     timeline: buildTimeline(lines, FPS),
-    final: { assistantsCount: capture.assistantsCount, disclaimer: script.final.disclaimer },
+    final: { assistantsCount: script.final.assistantsCount, disclaimer: script.final.disclaimer },
   };
 }

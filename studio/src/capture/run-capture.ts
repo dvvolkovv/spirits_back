@@ -4,7 +4,7 @@ import path from 'node:path';
 import { parseConfig } from '../config';
 import type { Scene } from '../types';
 import { captureChat } from './chat-scene';
-import { countAssistants, loginDemoCached } from './login';
+import { loginDemoCached } from './login';
 
 /** Порог длины ответа по спеке (short_settings.min_answer_chars во втором плане). */
 const MIN_ANSWER_CHARS = 400;
@@ -19,10 +19,8 @@ const cfg = parseConfig(process.env, { capture: true, tts: false });
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
 const runDir = path.resolve('out', `${path.basename(sceneFile, '.json')}-${stamp}`);
 const session = await loginDemoCached(cfg, path.resolve('out', '.session.json'));
-const assistantsCount = await countAssistants(cfg);
 const result = await captureChat(scene, cfg, session, runDir, {
   minAnswerChars: MIN_ANSWER_CHARS,
-  assistantsCount,
   probeOnly: flags.includes('--probe'),
 });
 if (!result) {

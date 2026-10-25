@@ -19,6 +19,12 @@ export interface ImageBox {
   text: string;
 }
 
+/** Абзац ответа целиком — его пересказывает реплика сценария (сценарист бэкенда читает этот текст). */
+export interface Paragraph {
+  n: number;
+  text: string;
+}
+
 export interface CaptureResult {
   scene: Scene;
   cabinetUrl: string;
@@ -31,7 +37,8 @@ export interface CaptureResult {
   /** Сколько ходов ушло: 1 + ответы на встречные вопросы. */
   turns: number;
   boxes: ImageBox[];
-  assistantsCount: number;
+  /** Полный текст абзацев; номера — как у boxes. */
+  paragraphs: Paragraph[];
 }
 
 export type LineScene = 'hook' | 'question' | 'answer' | 'final';
@@ -52,7 +59,8 @@ export interface Script {
   voice: string;
   speed?: number;
   lines: ScriptLine[];
-  final: { disclaimer?: string };
+  /** Число ассистентов — из базы; его же словами произносит финальная реплика (сценарий пишет бэкенд). */
+  final: { assistantsCount: number; disclaimer?: string };
 }
 
 export interface VoicedLine extends ScriptLine {

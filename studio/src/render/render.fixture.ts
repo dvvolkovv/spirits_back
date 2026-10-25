@@ -45,12 +45,12 @@ test('рендер фикстуры: 1080×1920, 30–60 с, звук по вс�
       answerShotHeight: 5400,
       answerText: 'x'.repeat(500),
       turns: 1,
-      assistantsCount: 18,
       boxes: [
         { n: 1, top: 900, height: 300, text: 'a' },
         { n: 2, top: 2400, height: 300, text: 'b' },
         { n: 3, top: 4200, height: 300, text: 'c' },
       ],
+      paragraphs: [{ n: 1, text: 'a' }, { n: 2, text: 'b' }, { n: 3, text: 'c' }],
     }),
   );
   fs.writeFileSync(
@@ -60,7 +60,7 @@ test('рендер фикстуры: 1080×1920, 30–60 с, звук по вс�
       voice: 'madirus',
       speed: 1,
       lines: lines.map((l) => ({ id: l.id, scene: l.scene, text: l.text, ...('box' in l ? { box: l.box } : {}) })),
-      final: { disclaimer: 'Ответ ИИ, не заменяет специалиста' },
+      final: { assistantsCount: 18, disclaimer: 'Ответ ИИ, не заменяет специалиста' },
     }),
   );
 
