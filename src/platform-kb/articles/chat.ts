@@ -7,6 +7,7 @@ import { V } from '../values';
 // источник: «Медиа и файлы» — spirits_front src/components/chat/files/chatFiles.ts:39-48; src/chat/chat-files/chat-files.service.ts
 // источник: карточки вопросов — src/chat/ask-rule.ts; spirits_front src/components/chat/AskCard.tsx
 // источник: что умеют ассистенты — relay-agent/server.mjs (SYSTEM_PROMPT); src/chat/chat.service.ts (YouTube)
+// источник: find_files у Маши — src/chat/chat.service.ts (allowedTools: FIND_FILES_CLI_TOOL_NAME)
 // источник: оборванный ответ — spirits_front src/components/chat/streamFailure.ts, remoteTurn.ts:66; relay-agent/server.mjs (тексты сбоя)
 export const chat: KbArticle = {
   id: 'chat',
@@ -27,7 +28,7 @@ ${q('chat')}: список ассистентов (на телефоне — о�
 - ${q('fresh')} — разговор без прошлой истории и задач; профиль и ${q('business')} ассистент видит. Режим живёт в этой вкладке браузера.
 - ${q('files')} — всё, что ассистент создал в этом чате: ${q('filesMedia')} (картинки, видео) и ${q('filesDocs')} (документы, озвучка). Загруженное человеком туда не попадает.
 - Уточнение ассистент иногда задаёт карточкой с вариантами: выбрать вариант или ${q('askCustom')} и ${q('askSubmit')}.
-- Ассистенты, кроме Маши, создают документы, презентации и PDF файлами (ссылки — после ответа), ищут в интернете, берут расшифровку видео YouTube по ссылке и находят файлы из прошлых разговоров с любым ассистентом.
+- Ассистенты, кроме Маши, создают документы, презентации и PDF файлами (ссылки — после ответа), ищут в интернете и берут расшифровку видео YouTube по ссылке. Находят файлы из прошлых разговоров с любым ассистентом — это умеет и Маша.
 
 ## Чего нельзя
 - Приложить файл, пока ассистент отвечает.
