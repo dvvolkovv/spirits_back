@@ -62,10 +62,30 @@ describe('создание сайта', () => {
     expect((await h.svc.createSite({ userId: 'u1', name: '  ', channel: 'web' })).ok).toBe(false);
     expect(h.provisioning.create).not.toHaveBeenCalled();
   });
+
+  it('имя длиннее 80 знаков — без заведения', async () => {
+    const h = harness();
+    const r = await h.svc.createSite({ userId: 'u1', name: 'а'.repeat(81), channel: 'web' });
+    expect(r).toMatchObject({ ok: false, reason: 'bad_name' });
+    expect(h.provisioning.create).not.toHaveBeenCalled();
+  });
+
+  it('внутренняя ошибка create (не HttpException) — общий текст, сырая ошибка не наружу', async () => {
+    const h = harness({ createErrors: [new Error('connection reset by peer')] });
+    const r = await h.svc.createSite({ userId: 'u1', name: 'Магазин', channel: 'web' });
+    expect(r).toEqual({ ok: false, reason: 'failed', message: 'Не получилось — попробуйте ещё раз позже' });
+  });
 });
 
 describe('создание бота', () => {
   const claimed = { id: ACT, kind: 'create_bot', product_id: null, channel: 'web', payload: { name: 'Бот магазина', prompt: 'Отчёт в 8:00' }, result: null };
+
+  it('имя длиннее 80 знаков — карточка не открывается', async () => {
+    const h = harness();
+    const r = await h.svc.openCreateBot({ userId: 'u1', name: 'б'.repeat(81), channel: 'web', turn: null });
+    expect(r).toMatchObject({ ok: false, reason: 'bad_name' });
+    expect(h.actions.open).not.toHaveBeenCalled();
+  });
 
   it('Telegram не принял токен — карточка снова ждёт, с ошибкой; заведения нет', async () => {
     const h = harness();
@@ -85,16 +105,31 @@ describe('создание бота', () => {
     expect(h.provisioning.create).not.toHaveBeenCalled();
   });
 
-  it('успех: бот с ключами, id бота, первая правка, итог done', async () => {
+  it('успех: бот с ключами, id бота через create (не отдельным UPDATE), первая правка, итог done', async () => {
     const h = harness();
     h.actions.claim.mockResolvedValue(claimed);
     const r = await h.svc.completeCreateBot({ userId: 'u1', actionId: ACT, set: { BOT_TOKEN: ` ${TOKEN} `, OZON_KEY: 'k' }, via: 'tma' });
     expect(r).toEqual({ ok: true, productId: 'p-new' });
     expect(h.provisioning.create).toHaveBeenCalledWith(expect.objectContaining({
-      kind: 'bot', name: 'Бот магазина', slug: 'bot-magazina-zzzzzz', secrets: { BOT_TOKEN: TOKEN, OZON_KEY: 'k' },
+      kind: 'bot', name: 'Бот магазина', slug: 'bot-magazina-zzzzzz', secrets: { BOT_TOKEN: TOKEN, OZON_KEY: 'k' }, tgBotId: 1234567890,
     }));
-    expect(h.calls.some((c) => c.sql.includes('SET tg_bot_id') && c.params[1] === 1234567890)).toBe(true);
+    // id бота уходит в тот же INSERT, что заводит продукт (через create) —
+    // отдельного UPDATE products SET tg_bot_id больше нет: партиционный
+    // UNIQUE products_tg_bot_live ловит гонку только на INSERT.
+    expect(h.calls.some((c) => c.sql.includes('SET tg_bot_id'))).toBe(false);
     expect(h.actions.finish).toHaveBeenCalledWith(ACT, 'done', { productId: 'p-new', botUsername: 'shop_bot' }, 'p-new');
+  });
+
+  it('гонка: вторая карточка с тем же ботом успела пройти раннюю проверку, но проиграла create — тот же текст bot_in_use', async () => {
+    const h = harness({ createErrors: [new ConflictException('бот уже работает в другом продукте')] });
+    h.actions.claim.mockResolvedValue(claimed);
+    const r = await h.svc.completeCreateBot({ userId: 'u1', actionId: ACT, set: { BOT_TOKEN: TOKEN }, via: 'chat' });
+    expect(r).toEqual({
+      ok: false, reason: 'bot_in_use',
+      message: 'Этот бот уже работает в другом продукте — создайте в @BotFather нового бота',
+    });
+    expect(h.actions.release).toHaveBeenCalledWith(ACT, expect.objectContaining({ field: 'BOT_TOKEN' }));
+    expect(h.actions.finish).not.toHaveBeenCalled();
   });
 
   it('карточка уже закрыта — not_pending', async () => {
@@ -122,6 +157,14 @@ describe('удаление', () => {
     expect(h.calls.some((c) => c.sql.includes("'sleep', 'queued'") && c.params[0] === 'p1')).toBe(true);
     expect(h.actions.finish).toHaveBeenCalledWith(ACT, 'done', { restoreUntil: until.toISOString() });
   });
+
+  it('карточка другого вида — освобождена, not_pending', async () => {
+    const h = harness();
+    h.actions.claim.mockResolvedValue({ id: ACT, kind: 'create_bot', product_id: null, channel: 'web', payload: {}, result: null });
+    const r = await h.svc.completeDelete({ userId: 'u1', actionId: ACT, via: 'chat' });
+    expect(r).toMatchObject({ ok: false, reason: 'not_pending' });
+    expect(h.actions.release).toHaveBeenCalledWith(ACT, {});
+  });
 });
 
 describe('возврат', () => {
@@ -144,6 +187,20 @@ describe('возврат', () => {
         if (sql.includes('AS busy')) return { rows: [deleted()] };
         if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'sleeping', paid: true }] };
         if (sql.includes("'wake', 'queued'")) return { rows: [{ product_id: 'p1' }] };
+        return null;
+      },
+    });
+    expect(await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' })).toEqual({ ok: true, status: 'sleeping', waking: true });
+  });
+
+  it('wake уже стоял в очереди (RentService успел раньше) — waking всё равно true', async () => {
+    const h = harness({
+      pg: (sql) => {
+        if (sql.includes('AS busy')) return { rows: [deleted()] };
+        if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'sleeping', paid: true }] };
+        // ON CONFLICT молчит — чужой wake уже есть; мы проверяем это отдельным SELECT.
+        if (sql.includes("'wake', 'queued'")) return { rows: [] };
+        if (sql.includes("kind = 'wake' AND status IN")) return { rows: [{ '?column?': 1 }] };
         return null;
       },
     });
@@ -178,5 +235,16 @@ describe('откат и первая правка', () => {
     h.turns.enqueue.mockRejectedValueOnce(new Error('Недостаточно токенов'));
     expect(await h.svc.firstPromptTick()).toBe(2);
     expect(h.turns.enqueue.mock.calls.map((c: any) => [c[0].productId, c[0].channel, c[0].prompt])).toEqual([['p1', 'telegram', 'А'], ['p2', 'web', 'Б']]);
+  });
+
+  it('мьютекс хода занят — первая правка возвращается на следующий тик, а не теряется', async () => {
+    const h = harness({ pg: (sql) => (sql.includes('WITH picked AS') ? { rows: [
+      { id: 'p1', user_id: 'u1', first_prompt: 'А', first_prompt_channel: 'telegram' },
+    ] } : null) });
+    const busy = new ConflictException('Агент уже работает над предыдущим запросом');
+    h.turns.enqueue.mockRejectedValueOnce(busy);
+    expect(await h.svc.firstPromptTick()).toBe(1);
+    const restore = h.calls.find((c) => c.sql.includes('SET first_prompt') && c.sql.includes('first_prompt IS NULL'))!;
+    expect(restore.params).toEqual(['p1', 'А', 'telegram']);
   });
 });

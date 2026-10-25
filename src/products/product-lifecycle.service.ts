@@ -20,10 +20,24 @@ function cleanName(raw: unknown): string | null {
   return n && n.length <= NAME_MAX ? n : null;
 }
 
-/** Отказ заведения и прочих сервисов — человеческим текстом и кодом причины. */
-function failOf(e: any, fallback: string): LifecycleFail {
-  const status = e instanceof HttpException ? e.getStatus() : 0;
-  const body: any = e instanceof HttpException ? e.getResponse() : null;
+/**
+ * Отказ заведения и прочих сервисов — человеческим текстом и кодом причины.
+ *
+ * Текст из тела берётся ТОЛЬКО у HttpException — у исключения любой другой
+ * природы (обрыв соединения с базой, таймаут пула, необработанный throw
+ * внутри зависимости) `e.message` — это текст драйвера pg или Node на
+ * английском, с именами колонок и constraint'ов, который ассистент прочитал
+ * бы пользователю как собственный отказ продукта. Наружу в этом случае —
+ * фиксированная фраза, а сырая ошибка — логгеру (если передан), а не в
+ * пустоту: без него диагностировать такой отказ было бы нечем.
+ */
+function failOf(e: any, fallback: string, logger?: Logger): LifecycleFail {
+  if (!(e instanceof HttpException)) {
+    logger?.warn(`${fallback}: ${e?.stack ?? e?.message ?? e}`);
+    return { ok: false, reason: 'failed', message: 'Не получилось — попробуйте ещё раз позже' };
+  }
+  const status = e.getStatus();
+  const body: any = e.getResponse();
   const raw = typeof body === 'object' && body ? body.message : body;
   const message = String((Array.isArray(raw) ? raw.join('; ') : raw) ?? e?.message ?? fallback);
   const reason = status === 422 ? 'limit' : status === 409 ? 'conflict' : status === 400 ? 'bad_input' : 'failed';
@@ -105,7 +119,7 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
         break;
       }
     }
-    const f = failOf(lastError, 'Сайт не создан');
+    const f = failOf(lastError, 'Сайт не создан', this.logger);
     await this.actions.record({ userId: i.userId, productId: null, kind: 'create_site', channel: i.channel, status: 'failed', payload: { name }, result: { reason: f.reason, error: f.message } });
     return f;
   }
@@ -159,15 +173,29 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     }
     const name = String(row.payload?.name ?? '').trim();
     try {
+      // Второй, окончательный барьер против одного бота в двух продуктах —
+      // tgBotId уходит в тот же INSERT, что заводит продукт (а не отдельным
+      // UPDATE после): ранняя проверка выше читает только уже живые
+      // продукты и не ловит вторую карточку, чей getMe завершился раньше,
+      // чем первая успела записать строку. Гонку между ними закрывает
+      // партиционный UNIQUE products_tg_bot_live (009_product_actions.sql),
+      // а не порядок операторов здесь.
       const { productId } = await this.provisioning.create({
-        userId: i.userId, name, slug: slugWithSuffix(name, this.suffix(), 'bot'), kind: 'bot', secrets, isAdmin: await this.isAdmin(i.userId),
+        userId: i.userId, name, slug: slugWithSuffix(name, this.suffix(), 'bot'), kind: 'bot', secrets,
+        isAdmin: await this.isAdmin(i.userId), tgBotId: check.id,
       });
-      await this.pg.query(`UPDATE products SET tg_bot_id = $2 WHERE id = $1`, [productId, check.id]);
       await this.setFirstPrompt(productId, row.payload?.prompt, row.channel);
       await this.actions.finish(row.id, 'done', { productId, botUsername: check.username }, productId);
       return { ok: true, productId };
     } catch (e: any) {
-      const f = failOf(e, 'Бот не создан');
+      const f = failOf(e, 'Бот не создан', this.logger);
+      if (f.reason === 'conflict' && f.message === 'бот уже работает в другом продукте') {
+        // Тот же пользовательский текст, что у ранней SELECT-проверки выше —
+        // карточке незачем объяснять, на каком именно шаге поймана гонка.
+        const message = 'Этот бот уже работает в другом продукте — создайте в @BotFather нового бота';
+        await this.actions.release(row.id, { error: message, field: 'BOT_TOKEN' });
+        return { ok: false, reason: 'bot_in_use', message };
+      }
       if (f.reason === 'bad_input' || f.reason === 'conflict') await this.actions.release(row.id, { error: f.message });
       else await this.actions.finish(row.id, 'failed', { error: f.message, reason: f.reason });
       return f;
@@ -269,7 +297,7 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     try {
       await this.limits.assertCanCreate(i.userId, await this.isAdmin(i.userId));
     } catch (e: any) {
-      const f = failOf(e, 'Нет места в пределе');
+      const f = failOf(e, 'Нет места в пределе', this.logger);
       await this.actions.record({ userId: i.userId, productId: p.id, kind: 'restore', channel: i.channel, status: 'failed', payload: { name: p.name }, result: { reason: f.reason, error: f.message } });
       return f;
     }
@@ -299,13 +327,36 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
          ON CONFLICT DO NOTHING RETURNING product_id`,
         [p.id],
       );
-      waking = w.rows.length > 0;
+      if (w.rows.length > 0) {
+        waking = true;
+      } else {
+        // ON CONFLICT молчит не только на повторный клик здесь: RentService
+        // (wakeTick) мог поставить 'wake' на этот же продукт между нашим
+        // UPDATE products выше и этим INSERT, пока мы не держали продукт
+        // архивным ни секунды лишней. `waking = false` в таком случае было
+        // бы неправдой — задание уже в очереди, просто не нашим INSERT.
+        const existing = await this.pg.query(
+          `SELECT 1 FROM product_provision_jobs WHERE product_id = $1 AND kind = 'wake' AND status IN ('queued','running')`,
+          [p.id],
+        );
+        waking = existing.rows.length > 0;
+      }
     }
     await this.actions.record({ userId: i.userId, productId: p.id, kind: 'restore', channel: i.channel, status: 'done', payload: { name: p.name }, result: { status: row.status, waking } });
     return { ok: true, status: row.status, waking };
   }
 
-  /** Откат правки. Отказы очереди правок (сон, блок, баланс) — броском, как у enqueue. */
+  /**
+   * Откат правки. Отказы очереди правок (сон, блок, баланс) — броском, как у
+   * enqueue: `this.turns.revert` внутри зовёт `enqueue`, и его отказы
+   * (SLEEPING_REFUSAL → 402, BLOCKED_REFUSAL → 409, «Агент уже работает над
+   * предыдущим запросом» → 409, «Недостаточно токенов» → 402, «Product not
+   * found» → 404) здесь НЕ перехватываются и НЕ превращаются в LifecycleFail —
+   * этот метод их прокидывает наверх как есть. Разбирает их вызывающий слой
+   * инструмента (product-tool.service.ts, `refusal()`), который сопоставляет
+   * текст с причиной для ассистента; здесь никакого try/catch нет намеренно,
+   * а не по недосмотру.
+   */
   async revert(i: { userId: string; productId: string; turnId?: string | null; channel: ActionChannel }):
     Promise<{ ok: true; turnId: string } | LifecycleFail> {
     let target = String(i.turnId ?? '').trim();
@@ -345,6 +396,27 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
           channel: row.first_prompt_channel === 'telegram' ? 'telegram' : 'web',
         });
       } catch (e: any) {
+        // Та же форма извлечения текста, что в product-tool.service
+        // (refusal): у HttpException это публичное поле `response`, а не
+        // getResponse() — здесь нужен только текст для сравнения, не статус.
+        const msg = typeof e?.response === 'string' ? e.response : (e?.response?.message ?? e?.message ?? '');
+        if (msg === 'Агент уже работает над предыдущим запросом') {
+          // Мьютекс хода занят кем-то другим (например, владелец поставил
+          // правку руками до того, как первая правка добралась до своего
+          // тика) — первая правка не потеряна, а отложена: CTE выше уже
+          // обнулил first_prompt этой строки, и без возврата продукт навсегда
+          // остался бы без своей первой правки. `first_prompt IS NULL` —
+          // чтобы не затереть первую правку, которую между CTE и этим UPDATE
+          // поставил кто-то ещё (повторное создание тем же именем).
+          await this.pg.query(
+            `UPDATE products SET first_prompt = $2, first_prompt_channel = $3 WHERE id = $1 AND first_prompt IS NULL`,
+            [row.id, row.first_prompt, row.first_prompt_channel],
+          );
+          continue;
+        }
+        // Прочие отказы (сон, блок, нет токенов, продукт исчез) не лечатся
+        // повтором на следующем тике — повтор занял бы его местом в LIMIT 20
+        // бесконечно. Разбор причины — дело владельца или подписки, не тика.
         this.logger.warn(`первая правка продукта ${row.id} не поставлена: ${e?.message}`);
       }
     }
