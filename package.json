@@ -27,6 +27,7 @@
       "/.worktrees/",
       "<rootDir>/product-runner/",
       "<rootDir>/voice-host/",
+      "<rootDir>/studio/",
       "<rootDir>/worker/",
       "<rootDir>/relay-agent/"
     ],
