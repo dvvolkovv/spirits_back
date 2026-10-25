@@ -19,6 +19,7 @@ import { TgGrammyClient } from './tg-grammy.client';
 import { MiscService } from '../misc/misc.service';
 import { VideoService } from '../video/video.service';
 import { BlogApprovalService } from '../blog/blog-approval.service';
+import { ShortsApprovalService } from '../shorts/shorts-approval.service';
 import { fetchMediaBytes } from '../common/net/own-media';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
 
@@ -110,6 +111,15 @@ export function shouldRouteToBlog(data?: string): boolean {
   return String(data || '').startsWith('blog:');
 }
 
+/**
+ * Кнопки роликов (`short:…`) — тем же вебхуком и с тем же порядком, что у
+ * блога: до проверки привязки, иначе нажатие «Одобрить» у владельца, не
+ * привязанного как пользователь ассистентов, ушло бы в пустоту.
+ */
+export function shouldRouteToShorts(data?: string): boolean {
+  return String(data || '').startsWith('short:');
+}
+
 @Injectable()
 export class TgBotService implements OnModuleInit {
   private readonly logger = new Logger(TgBotService.name);
@@ -148,6 +158,11 @@ export class TgBotService implements OnModuleInit {
     // спеки собирают сервис позиционно. Что он подключён, сторожит
     // chat.module.chat-files.spec.ts.
     @Optional() private readonly costGrowth?: CostGrowthService,
+    // Ролики (src/shorts) — то же кольцо модулей, что у блога. Последним и
+    // @Optional: спеки собирают сервис позиционно. Что Nest его подставляет,
+    // сторожит shorts.module.spec.ts.
+    @Optional() @Inject(forwardRef(() => ShortsApprovalService))
+    private readonly shortsApproval?: ShortsApprovalService,
   ) {}
 
   async onModuleInit() {
@@ -273,6 +288,7 @@ export class TgBotService implements OnModuleInit {
       // handleReplyEdit возвращает false на всё чужое, и тогда текст идёт
       // обычным путём — перехватить лишнее значит сломать людям чат.
       if (await this.blogApproval.handleReplyEdit(msg)) return;
+      if (await this.shortsApproval?.handleReplyEdit(msg)) return;
 
       const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
       if (!ownerId) {
@@ -364,6 +380,11 @@ export class TgBotService implements OnModuleInit {
       await this.blogApproval.handleCallback(cb);
       return;
     }
+    if (shouldRouteToShorts(data)) {
+      if (this.shortsApproval) await this.shortsApproval.handleCallback(cb);
+      else await this.grammy.answerCallbackQuery(cb.id, {}).catch(() => {});
+      return;
+    }
 
     const ownerId = await this.identity.getLinkeonIdByTgUserId(cb.from.id);
     if (!ownerId) return;
@@ -409,6 +430,8 @@ export class TgBotService implements OnModuleInit {
     // (false) — он доходит до ответа про неизвестную команду, как и до
     // появления этой. В /help и в меню команд её нет намеренно.
     if (await this.blogApproval.handleCaseCommand(msg)) return;
+    // `/short <тема>` — заказ ролика владельцем; как и /case, до разбора команд.
+    if (await this.shortsApproval?.handleShortCommand(msg)) return;
 
     const text = msg.text.toLowerCase().trim();
     const cmd = text.split('@')[0].split(' ')[0];
