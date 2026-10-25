@@ -511,7 +511,7 @@ export class TurnsService implements OnModuleInit, OnModuleDestroy {
    * product_turns_one_active работает и здесь — откатить посреди живого хода
    * нельзя.
    */
-  async revert(input: { productId: string; turnId: string; userId: string }) {
+  async revert(input: { productId: string; turnId: string; userId: string; channel?: 'web' | 'telegram' }) {
     const r = await this.pg.query(
       `SELECT id, sha_before FROM product_turns
         WHERE id = $1 AND product_id = $2`,
@@ -524,7 +524,7 @@ export class TurnsService implements OnModuleInit, OnModuleDestroy {
     return this.enqueue({
       productId: input.productId,
       userId: input.userId,
-      channel: 'web',
+      channel: input.channel ?? 'web',
       // prompt человекочитаемый и годится для показа в истории как есть.
       // Признак отката несёт отдельная колонка: строковый префикс внутри
       // prompt подделывался бы обычным запросом в чат — тот передаёт тело
