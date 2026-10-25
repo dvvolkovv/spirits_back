@@ -61,8 +61,9 @@ export const MAX_IN_WORK = 2;
  *
  * Возвраты на ту же стадию (`capturing → capture_queued`,
  * `rendering → render_queued`) — повтор задания студии после сбоя.
- * `rendering → writing` — озвучка вышла за 30–60 с, сценарий уходит на
- * переписку с пояснением. `writing → directing` — сценарист просит другую сцену.
+ * `rendering → writing` — озвучка вышла за 30–60 с или реплика ответа короче
+ * 1,5 с: сценарий уходит на переписку с пояснением. `writing → directing` —
+ * сценарист просит другую сцену.
  */
 export const ALLOWED_TRANSITIONS: Record<ShortStatus, ShortStatus[]> = {
   idea:           ['directing', 'rejected'],
@@ -109,13 +110,19 @@ export const MAX_NOTE_PROMPTS = 20;
 export const MAX_OWNER_NOTE_CHARS = 2000;
 
 /**
- * Замечание в конец накопленных. Второе замечание не отменяет первое — как у
- * блога (`appendEditorNote`). Сверх предела уходит самое старое.
+ * Замечание в конец накопленных, отдельной строкой. Второе замечание не
+ * отменяет первое — как у блога (`appendEditorNote`). Сверх предела целиком
+ * уходит самая старая строка, а не середина текста: иначе режиссёр и
+ * сценарист получают обрывок чужой фразы вместо всей своей.
  */
 export function appendOwnerNote(prev: string | null, note: string): string {
-  const joined = [String(prev ?? '').trim(), String(note ?? '').trim()].filter(Boolean).join('\n');
-  const chars = Array.from(joined);
-  return chars.length > MAX_OWNER_NOTE_CHARS ? chars.slice(-MAX_OWNER_NOTE_CHARS).join('') : joined;
+  const fresh = Array.from(String(note ?? '').trim()).slice(0, MAX_OWNER_NOTE_CHARS).join('');
+  const prevLines = String(prev ?? '').split('\n').map((line) => line.trim()).filter(Boolean);
+  const lines = fresh ? [...prevLines, fresh] : prevLines;
+  while (lines.length > 1 && Array.from(lines.join('\n')).length > MAX_OWNER_NOTE_CHARS) {
+    lines.shift();
+  }
+  return lines.join('\n');
 }
 
 /** Общий бакет видео (спека, «Что переиспользуем»); ролики — с префиксом shorts/. */

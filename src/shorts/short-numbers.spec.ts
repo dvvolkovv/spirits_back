@@ -24,6 +24,17 @@ describe('assistantsInWords', () => {
     expect(assistantsInWords(22)).toBe('двадцать два ассистента');
     expect(assistantsInWords(11)).toBe('одиннадцать ассистентов');
   });
+
+  it('сотни, круглые и ноль — падеж не сбивается', () => {
+    expect(assistantsInWords(0)).toBe('ноль ассистентов');
+    expect(assistantsInWords(100)).toBe('сто ассистентов');
+    expect(assistantsInWords(101)).toBe('сто один ассистент');
+    expect(assistantsInWords(104)).toBe('сто четыре ассистента');
+    expect(assistantsInWords(111)).toBe('сто одиннадцать ассистентов');
+    expect(assistantsInWords(114)).toBe('сто четырнадцать ассистентов');
+    expect(assistantsInWords(120)).toBe('сто двадцать ассистентов');
+    expect(assistantsInWords(200)).toBe('двести ассистентов');
+  });
 });
 
 describe('finalLine', () => {

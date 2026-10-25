@@ -53,6 +53,15 @@ describe('retryTarget', () => {
     expect(retryTarget({ status: 'pending_review', failedFrom: null, approvedAt: null })).toBeNull();
     expect(retryTarget(failed(null))).toBeNull();
   });
+
+  it('повтор всегда ведёт по разрешённому переходу', () => {
+    const failedFroms: ShortStatus[] = ['directing', 'capturing', 'writing', 'rendering', 'publishing'];
+    for (const failedFrom of failedFroms) {
+      const target = retryTarget(failed(failedFrom, new Date()));
+      expect(target).not.toBeNull();
+      expect(canTransition('failed', target as ShortStatus)).toBe(true);
+    }
+  });
 });
 
 describe('rowToShort', () => {
@@ -85,9 +94,15 @@ describe('appendOwnerNote', () => {
   });
 
   it('сверх предела отрезает самое старое', () => {
-    const out = appendOwnerNote('я'.repeat(MAX_OWNER_NOTE_CHARS), 'свежее');
-    expect(Array.from(out).length).toBe(MAX_OWNER_NOTE_CHARS);
-    expect(out.endsWith('\nсвежее')).toBe(true);
+    expect(appendOwnerNote('я'.repeat(MAX_OWNER_NOTE_CHARS), 'свежее')).toBe('свежее');
+
+    const long = appendOwnerNote(null, 'суть' + 'я'.repeat(MAX_OWNER_NOTE_CHARS));
+    expect(long.startsWith('суть')).toBe(true);
+    expect(Array.from(long).length).toBe(MAX_OWNER_NOTE_CHARS);
+
+    const prev = 'а'.repeat(1500) + '\n' + 'б'.repeat(400);
+    expect(appendOwnerNote(prev, 'в'.repeat(200))).toBe('б'.repeat(400) + '\n' + 'в'.repeat(200));
+    expect(appendOwnerNote(prev, 'свежее')).toBe('а'.repeat(1500) + '\n' + 'б'.repeat(400) + '\nсвежее');
   });
 });
 
