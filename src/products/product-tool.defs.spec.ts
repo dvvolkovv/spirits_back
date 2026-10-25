@@ -7,24 +7,22 @@ import { DOMAIN_ERROR_REASONS, DomainView } from './domains.service';
 describe('определение инструмента продуктов', () => {
   const tool = () => PRODUCT_TOOLS.find((t) => t.name === PRODUCT_TOOL_NAME)!;
 
-  it('инструмент ровно один, с четырьмя действиями', () => {
+  it('инструмент ровно один, с восемью действиями', () => {
     expect(PRODUCT_TOOLS).toHaveLength(1);
-    expect((tool().input_schema as any).properties.action.enum.slice().sort()).toEqual(['domain', 'edit', 'list', 'status']);
-  });
-
-  it('у domain — поля domain, remove и check', () => {
+    expect((tool().input_schema as any).properties.action.enum.slice().sort())
+      .toEqual(['create', 'delete', 'domain', 'edit', 'list', 'restore', 'revert', 'status']);
     const p = (tool().input_schema as any).properties;
-    expect(p.domain.type).toBe('string');
-    expect(p.remove.type).toBe('boolean');
-    expect(p.check.type).toBe('boolean');
+    expect(p.kind.enum).toEqual(['site', 'bot']);
+    expect(p.name.type).toBe('string');
+    expect(p.actionId.type).toBe('string');
   });
 
-  it('новый продукт — кнопкой в Студии: отдельного пункта «Продукты» в меню нет', () => {
-    expect(tool().description).toMatch(/в Студии, вкладка «Продукты»/);
-    expect(tool().description).not.toMatch(/в кабинете, вкладка «Продукты»/);
-    // Ответ на пустой list — тоже: интеграционный тест в product-tool.spec без
-    // базы пропускается, поэтому текст проверяется здесь.
-    expect(NO_PRODUCTS_SAY).toMatch(/в Студии, вкладка «Продукты»/);
+  it('создание — действием create, с ценой и пределом до вызова', () => {
+    expect(tool().description).toMatch(/action="create"/);
+    expect(tool().description).toMatch(/первый месяц бесплатно/);
+    expect(tool().description).toMatch(/50[\s ]?000 токенов в месяц/);
+    expect(tool().description).toMatch(/не больше двух продуктов/);
+    expect(NO_PRODUCTS_SAY).toMatch(/action="create"/);
   });
 
   it('описание domain: записи дословно, AAAA, без обещания, бесплатно', () => {
@@ -59,21 +57,22 @@ describe('определение инструмента продуктов', () 
     expect(tool().description).toMatch(/не говори|пока не вызвал/i);
   });
 
-  it('ключи в текст правки не уезжают: описание запрещает и говорит, где их задают', () => {
-    // Текст правки хранится в product_turns.prompt, первыми 60 символами
-    // уходит в сообщение коммита, а раннер коммитит и пушит в резервную копию.
+  it('ключи в текст правки не уезжают и в разговоре не просятся', () => {
     const d = tool().description;
     expect(d).toMatch(/КЛЮЧИ, ТОКЕНЫ И ПАРОЛИ в prompt не вписывай/);
-    expect(d).toMatch(/«Дополнительные ключи»/);
-    expect(d).toMatch(/сменить их после создания пока нельзя/);
+    expect(d).toMatch(/Ключи в разговоре не проси/);
+    expect(d).toMatch(/защищённую карточку/);
+    expect(d).toMatch(/Сменить ключи после создания пока нельзя/);
+  });
+
+  it('удаление — только по кнопке пользователя, с возвратом', () => {
+    expect(tool().description).toMatch(/только когда пользователь нажмёт/);
+    expect(tool().description).toMatch(/вернуть 30 дней/);
+    expect(tool().description).toMatch(/Не говори «удалил»/);
   });
 
   it('описание требует уточнять при неоднозначности', () => {
     expect(tool().description).toMatch(/уточн|спрос/i);
-  });
-
-  it('описание говорит, что завести продукт нельзя', () => {
-    expect(tool().description).toMatch(/не можешь/i);
   });
 
   it('описание различает спящего и погашенного', () => {
@@ -82,8 +81,8 @@ describe('определение инструмента продуктов', () 
   });
 
   it('каждое действие названо в описании', () => {
-    for (const a of ['list', 'edit', 'status', 'domain']) {
-      expect(tool().description).toContain(a);
+    for (const a of ['list', 'edit', 'status', 'domain', 'create', 'delete', 'restore', 'revert']) {
+      expect(tool().description).toContain(`action="${a}"`);
     }
   });
 
