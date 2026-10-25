@@ -7,6 +7,7 @@ import type { KbArticle } from '../kb.types';
 // источник: звонок — voice-host/src/agent.ts:15,133-135; поиск — src/misc/misc.service.ts:893-1038
 // источник: данные — src/neo4j/neo4j.service.ts:97-215; src/business-profile/business-profile.types.ts; src/calendar/crypto.ts
 // источник: третьи лица — spirits_front src/components/onboarding/LegalModal.tsx:580-771 (политика конфиденциальности)
+// источник: вспомогательные тексты OpenAI — src/voice/voice-improve.service.ts; src/calendar/calendar.service.ts:~724; src/app-widget/energy-focus.service.ts
 // источник: голос в Telegram — src/tg-bot/tg-voice.service.ts:34-58; расшифровки — voice_calls.transcript, src/admin/admin.service.ts:1866-1877; ключи Zoom/Taler ID — src/calendar/crypto.ts
 export const howItWorks: KbArticle = {
   id: 'how-it-works',
@@ -21,6 +22,7 @@ export const howItWorks: KbArticle = {
 - Голосовые сообщения в Telegram распознаёт и озвучивает OpenAI.
 - Голосовой звонок и встречи — голосовая модель реального времени OpenAI.
 - Поиск людей по смыслу — эмбеддинги OpenAI и графовая база с векторным поиском.
+- Вспомогательные тексты — улучшение надиктованного, разбор событий календаря, подсказки виджета — модели OpenAI.
 - Ассистент называет себя своим именем: модель — двигатель платформы, а не имя ассистента.
 
 ## Какие данные хранятся и зачем
