@@ -60,6 +60,14 @@ describe('перечень статей', () => {
     const bad = KB_ARTICLES.filter((a) => /\n/.test(a.summary) || a.summary.length > 120 || a.title.length > 40).map((a) => a.id);
     expect(bad).toEqual([]);
   });
+
+  it('перечень полный: все темы спеки, без лишних', () => {
+    expect(KB_ARTICLES.map((a) => a.id).sort()).toEqual([...SPEC_TOPICS].sort());
+  });
+
+  it('темы о деньгах — ровно tokens, payments, partners', () => {
+    expect(KB_ARTICLES.filter((a) => a.paidOnly).map((a) => a.id).sort()).toEqual(['partners', 'payments', 'tokens']);
+  });
 });
 
 describe('статьи во всех вариантах', () => {
