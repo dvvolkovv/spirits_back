@@ -1,0 +1,114 @@
+import { ShortsWriterService } from './shorts-writer.service';
+import { StageFatalError } from './short-jobs';
+import { WRITER_SYSTEM } from './short-prompts';
+import { rowToShort } from './shorts.types';
+
+const PARAGRAPHS = [
+  { n: 1, text: 'Залог возвращается в течение 7 дней после выезда.' },
+  { n: 2, text: 'Опасная фраза: «залог не возвращается при досрочном выезде».' },
+  { n: 3, text: 'Нормальный износ не является повреждением — впишите это в договор.' },
+];
+const GOOD = {
+  hook: 'Хозяин может оставить залог себе?',
+  hookBox: 2,
+  question: 'Я Алексей, юрист. Меня спросили, как снять квартиру и не потерять залог при выезде.',
+  lines: [
+    { box: 2, text: 'Ищите в договоре опасную фразу: «залог не возвращается при досрочном выезде». Увидели — просите переписать этот пункт.' },
+    { box: 3, text: 'Впишите прямо: нормальный износ не является повреждением. Тогда за потёртый пол и выцветшие обои удержать деньги не получится.' },
+    { box: 1, text: 'И договоритесь о сроке: залог возвращается в течение 7 дней после выезда — так и запишите в договоре аренды.' },
+  ],
+  captions: {
+    telegram: 'Юрист разобрал, как не потерять залог при аренде.',
+    vk: '',
+    youtube: { title: 'Как не потерять залог при аренде', description: 'Три пункта договора, которые сберегут залог.', tags: ['аренда', 'залог'] },
+  },
+};
+// 18 активных ассистентов: число в финале — из этого списка.
+const AGENTS = [{ id: 10, name: 'Алексей', description: 'Юрист' }, ...Array.from({ length: 17 }, (_, i) => ({ id: 100 + i, name: `А${i}`, description: '' }))];
+
+function video(over: Record<string, any> = {}) {
+  return rowToShort({
+    id: 'ab12cd34-0000-4000-8000-000000000000', rubric: 'assistant', angle: 'uncomfortable', source: 'catalog',
+    topic_key: 'assistant-10', title: 'Залог при аренде', slug: 'zalog_ab12', assistant_id: 10, status: 'writing', attempts: 1,
+    scene: { kind: 'chat', assistantId: 10, assistantName: 'Алексей', question: 'Как не потерять залог?', followups: [] },
+    capture: { paragraphs: PARAGRAPHS, answerText: PARAGRAPHS.map((p) => p.text).join('\n'), boxes: [] },
+    ...over,
+  });
+}
+
+function setup(replies: any[]) {
+  const queue = [...replies];
+  const pg = { query: jest.fn(async () => ({ rows: [], rowCount: 1 })) };
+  const relay = { ask: jest.fn(async () => JSON.stringify(queue.shift())) };
+  const agents = { getAgents: jest.fn(async () => AGENTS) };
+  const settings = { get: jest.fn(async () => ({ narratorVoice: 'alena' })) };
+  return { svc: new ShortsWriterService(pg as any, relay as any, agents as any, settings as any), pg, relay };
+}
+
+describe('ShortsWriterService.write', () => {
+  const OLD = process.env.SHORTS_LINK_BASE;
+  afterEach(() => {
+    if (OLD === undefined) delete process.env.SHORTS_LINK_BASE;
+    else process.env.SHORTS_LINK_BASE = OLD;
+  });
+
+  it('честный ответ — сценарий и подписи, ролик в очередь сборки', async () => {
+    process.env.SHORTS_LINK_BASE = 'https://test.linkeon.io';
+    const { svc, pg, relay } = setup([GOOD]);
+    await svc.write(video());
+
+    const [system, message, sessionId] = relay.ask.mock.calls[0] as any[];
+    expect(system).toBe(WRITER_SYSTEM);
+    expect(message).toContain('[2] Опасная фраза');
+    expect(sessionId).toMatch(/^short-write-ab12cd34-0000-4000-8000-000000000000-[0-9a-f-]{36}$/);
+
+    const [sql, params] = pg.query.mock.calls[0] as any[];
+    expect(sql).toMatch(/SET status = 'render_queued'/);
+    expect(sql).toMatch(/writer_rounds = writer_rounds \+ 1/);
+    const script = JSON.parse(params[1]);
+    expect(script.voice).toBe('madirus');
+    expect(script.lines[script.lines.length - 1]).toEqual({ id: 'f', scene: 'final', voice: 'alena', text: 'Линкеон — восемнадцать ассистентов. Ссылка — в описании и в профиле.' });
+    expect(script.final).toEqual({ assistantsCount: 18, disclaimer: 'Ответ ИИ, не заменяет юриста' });
+    const captions = JSON.parse(params[2]);
+    expect(captions.telegram).toContain('https://test.linkeon.io/chat?assistant=10&utm_source=telegram&utm_medium=short&utm_campaign=sh_zalog_ab12');
+    expect(captions.youtube.description).toContain('utm_source=youtube');
+  });
+
+  it('нарушение правил — переписка с перечнем, второй вариант проходит', async () => {
+    const bad = { ...GOOD, captions: { ...GOOD.captions, telegram: 'Попробуйте бесплатно!' } };
+    const { svc, pg, relay } = setup([bad, GOOD]);
+    await svc.write(video());
+    expect(relay.ask).toHaveBeenCalledTimes(2);
+    expect((relay.ask.mock.calls[1] as any[])[1]).toMatch(/нарушил правила — исправь:\n- правило 6/);
+    // Отвергнутый вариант — перед сценаристом: в первом запросе прошлого нет, во втором он есть.
+    expect((relay.ask.mock.calls[0] as any[])[1]).not.toContain('Прошлый вариант:');
+    expect((relay.ask.mock.calls[1] as any[])[1]).toContain('Прошлый вариант:');
+    expect((pg.query.mock.calls[0] as any[])[0]).toMatch(/render_queued/);
+  });
+
+  it('три варианта подряд с нарушениями — фатально, без записи', async () => {
+    const bad = { ...GOOD, captions: { ...GOOD.captions, telegram: 'Попробуйте бесплатно!' } };
+    const { svc, pg } = setup([bad, bad, bad]);
+    await expect(svc.write(video())).rejects.toBeInstanceOf(StageFatalError);
+    expect(pg.query).not.toHaveBeenCalled();
+  });
+
+  it('просит переснять — ролик к режиссёру с причиной в замечаниях', async () => {
+    const { svc, pg } = setup([{ needsRecapture: true, reason: 'нужен вопрос про субаренду' }]);
+    await svc.write(video({ owner_note: 'про субаренду' }));
+    const [sql, params] = pg.query.mock.calls[0] as any[];
+    expect(sql).toMatch(/SET status = 'directing'/);
+    expect(params[1]).toBe('про субаренду\nСценарист: нужен вопрос про субаренду');
+  });
+
+  it('реальный кейс — с подписью в кадре вопроса', async () => {
+    const { svc, pg } = setup([GOOD]);
+    await svc.write(video({ rubric: 'case' }));
+    expect(JSON.parse((pg.query.mock.calls[0] as any[])[1][1]).badge).toBe('Реальная история, разговор повторён на демо-аккаунте');
+  });
+
+  it('нет съёмки — фатально', async () => {
+    const { svc } = setup([GOOD]);
+    await expect(svc.write(video({ capture: null }))).rejects.toBeInstanceOf(StageFatalError);
+  });
+});
