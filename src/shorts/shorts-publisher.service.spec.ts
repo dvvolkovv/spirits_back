@@ -329,6 +329,6 @@ describe('ShortsPublisherService.rearmStuck', () => {
   it('зависли прочие площадки — ролик в approved, а после предела попыток — failed с понятной причиной', async () => {
     const { s, params } = await run();
     expect(params[2]).toMatch(/отправка оборвалась/);
-    expect(s).toContain("WHEN v.attempts >= $4 THEN 'публикация обрывалась ' || v.attempts || ' раз — процесс перезапускался посреди отправки'");
+    expect(s).toContain("WHEN v.attempts >= $4 THEN 'публикация оборвалась, попыток было ' || v.attempts || ' — процесс перезапускался посреди отправки'");
   });
 });
