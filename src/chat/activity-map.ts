@@ -19,7 +19,7 @@ export type ActivityKind =
   | 'web_search' | 'web_fetch' | 'read_upload' | 'read_file' | 'write_file' | 'search_files'
   | 'compute' | 'image_generate' | 'image_edit' | 'video' | 'speech' | 'calendar_read'
   | 'calendar_propose' | 'routine' | 'notes' | 'messages_read' | 'message_send'
-  | 'mail_read' | 'mail_send' | 'product' | 'find_files' | 'other';
+  | 'mail_read' | 'mail_send' | 'product' | 'find_files' | 'help' | 'other';
 
 export interface ActivityEvent {
   type: 'activity';
@@ -60,6 +60,7 @@ const BY_NAME: Record<string, ActivityKind> = {
   mcp__talerid__send_mail: 'mail_send',
   mcp__products__manage_product: 'product',
   mcp__products__find_files: 'find_files',
+  mcp__products__linkeon_help: 'help',
 };
 
 const DETAIL_MAX = 80;
