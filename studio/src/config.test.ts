@@ -37,3 +37,16 @@ test('для озвучки нужны ключи SpeechKit', () => {
   assert.equal(c.speechkitKey, 'k');
   assert.equal(c.speechkitFolder, 'f');
 });
+
+test('рабочему процессу нужны база и MinIO; бакет по умолчанию — общий бакет видео', () => {
+  const worker = { capture: false, tts: false, worker: true };
+  assert.throws(() => parseConfig({}, worker), /DATABASE_URL/);
+  assert.throws(() => parseConfig({ DATABASE_URL: 'postgres://x' }, worker), /MINIO_ENDPOINT/);
+  const c = parseConfig(
+    { DATABASE_URL: 'postgres://x', MINIO_ENDPOINT: 'http://127.0.0.1:9000', MINIO_ACCESS_KEY: 'a', MINIO_SECRET_KEY: 's' },
+    worker,
+  );
+  assert.equal(c.databaseUrl, 'postgres://x');
+  assert.deepEqual(c.minio, { endpoint: 'http://127.0.0.1:9000', accessKey: 'a', secretKey: 's', bucket: 'linkeon-smm-videos' });
+  assert.equal(parseConfig({}, none).minio, null);
+});
