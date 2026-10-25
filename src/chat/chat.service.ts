@@ -17,13 +17,14 @@ import { RESPONSE_STYLE_RULE } from './response-style';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
 import { CRISIS_RULE } from './crisis-rule';
 import { loadCoworkers } from './coworkers';
-import { platformGuide, TOOLS_LIST_NOTE } from './platform-guide';
+import { customAssistantHelpLine, linkeonHelpPrompt, platformGuide, TOOLS_LIST_NOTE } from './platform-guide';
+import { clientKind } from './client-kind';
 import { ClientUi, NO_CLIENT_UI } from './client-ui';
 import { toActivity } from './activity-map';
 import { ASK_RULE } from './ask-rule';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
-import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
+import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, LINKEON_HELP_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
 import { ChatFileStore, PERSIST_TURN_BUDGET_MS } from './chat-files/chat-file-store';
 import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks } from './chat-files/relay-links';
 import { BalanceContextService } from '../tokens/balance-context.service';
@@ -640,6 +641,8 @@ export class ChatService {
     profileText?: string;
     /** Клиент рисует карточки вопросов (см. client-ui.ts, ask-rule.ts). */
     ask?: boolean;
+    /** Сборка из стора: карта без партнёрской программы (см. platform-guide.ts). */
+    storeBuild?: boolean;
   }): Promise<string> {
     const { agentId, agentName, userId, userLanguage } = opts;
     const agentDescription = opts.agentDescription || '';
@@ -649,7 +652,8 @@ export class ChatService {
     let stablePrefix =
       `СИСТЕМНАЯ ИНСТРУКЦИЯ (имеет приоритет над всеми остальными). ` +
       `Ты ассистент по имени **${agentName}**${agentDescription ? ` — ${agentDescription}` : ''} на платформе LINKEON.IO. ` +
-      `Всегда представляйся именно как ${agentName}. Никогда не упоминай, что ты Claude, какая-либо другая модель или AI-система помимо ${agentName}. ` +
+      `Всегда представляйся именно как ${agentName}. Себя называй только этим именем: не говори, что ты Claude или другая модель. ` +
+      `На вопрос, на каких нейросетях работает Linkeon, отвечай по справке Linkeon (тема how-it-works) — это рассказ о платформе, а не смена твоего имени. ` +
       `Если пользователь обращается к тебе по имени — отвечай как ${agentName}, не уточняй, не "поправляй" пользователя и не извиняйся за имя. ` +
       `Не добавляй P.S. о собственной идентичности. ` +
       LanguageService.buildDirective(userLanguage) + `\n`;
@@ -666,7 +670,9 @@ export class ChatService {
     // Кризисное правило — сразу за персоной, там же, где оно стоит у штатных
     // ассистентов в конце их промпта из БД. Только пользовательским: у штатных
     // оно уже есть, второй экземпляр не нужен (см. crisis-rule.ts).
-    if (isCustom) stablePrefix += `${CRISIS_RULE}\n\n`;
+    // И одна строка про справку: карты и инициативы своему ассистенту не даём
+    // — его персону написал пользователь.
+    if (isCustom) stablePrefix += `${CRISIS_RULE}\n\n${customAssistantHelpLine(LINKEON_HELP_CLI_TOOL_NAME)}\n\n`;
 
     // Coworker awareness — каждый ассистент должен знать про остальных, чтобы
     // суметь представить их пользователю и не делать вид, что новых коллег нет.
@@ -692,9 +698,10 @@ export class ChatService {
       } catch { /* non-fatal — продолжаем без блока коллег */ }
 
       // Платформа и пометка про раздел «ИНСТРУМЕНТЫ» — тем же штатным, что и
-      // коллеги (см. platform-guide.ts). Текст зависит только от языка, так
-      // что кэш префикса он не ломает.
-      stablePrefix += `${platformGuide(userLanguage)}\n\n${TOOLS_LIST_NOTE}\n\n`;
+      // коллеги (см. platform-guide.ts). Текст зависит от языка и признака
+      // стора; переключение одного пользователя между стором и вебом стоит
+      // одного хода по холодному кэшу, как у правила карточек.
+      stablePrefix += `${platformGuide(userLanguage, { helpTool: LINKEON_HELP_CLI_TOOL_NAME, store: opts.storeBuild, initiative: true })}\n\n${TOOLS_LIST_NOTE}\n\n`;
     }
 
     // Профиль и бизнес-карточка — в СТАБИЛЬНУЮ часть, к персоне.
@@ -1011,7 +1018,7 @@ export class ChatService {
         recentHistory, profileText, res,
         agent.name, agent.description || '', agent.system_prompt || '',
         req, fresh, chatSessionId, requestLang, clientTz, balanceBlock,
-        agent.category, probe, ui,
+        agent.category, probe, ui, storeBuild,
       );
     }
 
@@ -1427,6 +1434,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     probe: boolean = false,
     // Шаги работы и карточки вопросов — см. streamChat.
     ui: ClientUi = NO_CLIENT_UI,
+    // Сборка из стора — для справки и карты (см. streamChat, client-kind.ts).
+    storeBuild: boolean = false,
   ): Promise<void> {
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
@@ -1522,7 +1531,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // ходом, в котором пришли вложения: сессия на релее у них одна.
     let stablePrefix = await this.buildRelayStablePrefix({
       agentId, agentName, agentDescription, agentSystemPrompt, agentCategory,
-      userId, userLanguage, profileText, ask: ui.ask,
+      userId, userLanguage, profileText, ask: ui.ask, storeBuild,
     });
 
     // Пер-ходовая часть. Пустая строка, а не identity-блок: тот уехал в stablePrefix.
@@ -1900,7 +1909,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // Инструмент продуктов. В отличие от MCP-инструментов на общей точке,
         // владелец едет ПОДПИСЬЮ в заголовке, а не подсказкой в промпте:
         // телефоном в аргументе правились бы чужие сайты.
-        const pf = productsRelayFields(userId);
+        // Тот же токен открывает справку: язык, клиент и вид ассистента едут в подписи.
+        const pf = productsRelayFields(userId, {
+          lang: userLanguage,
+          client: clientKind(storeBuild, ui),
+          agent: agentId.startsWith('custom:') ? 'custom' : 'staff',
+        });
         fd.append('products_token', pf.products_token);
         fd.append('products_mcp_url', pf.products_mcp_url);
 
