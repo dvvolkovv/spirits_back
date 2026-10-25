@@ -23,6 +23,7 @@ import { buildOwnerReplyEmail } from './support-mail';
 import { platformSections } from '../chat/platform-guide';
 import { executeLinkeonHelp, linkeonHelpTool, LINKEON_HELP_TOOL_NAME } from '../platform-kb/linkeon-help';
 import type { KbClient } from '../platform-kb/kb.types';
+import { EventsService } from '../events/events.service';
 
 @Injectable()
 export class SupportService implements OnModuleInit {
@@ -33,6 +34,10 @@ export class SupportService implements OnModuleInit {
     @Optional() private readonly telegram?: TelegramNotifierService,
     @Optional() private readonly video?: VideoService,
     @Optional() private readonly mail?: MailService,
+    // Статистика вызовов справки (как у products-mcp.controller.ts) — не
+    // критична для работы поддержки, поэтому @Optional, а не жёсткая
+    // зависимость.
+    @Optional() private readonly events?: EventsService,
   ) {}
 
   async onModuleInit() {
@@ -441,7 +446,24 @@ export class SupportService implements OnModuleInit {
         LINKEON_HELP_TOOL_NAME,
         linkeonHelpTool(help.client).description,
         { topics: z.array(z.string()).min(1).max(3) },
-        async (a: any) => ({ content: [{ type: 'text' as const, text: JSON.stringify(executeLinkeonHelp(a, help)) }] }),
+        async (a: any) => {
+          const result = executeLinkeonHelp(a, help);
+          // Та же статистика, что у точки продуктов (mcp/products-mcp.controller.ts):
+          // о чём спрашивают через справку, независимо от канала её вызова.
+          this.events?.track('linkeon_help_call', {
+            userId,
+            props: {
+              channel: 'support',
+              client: help.client,
+              lang: help.lang,
+              scope: 'full',
+              agent: 'support',
+              topics: result.articles.map((x: any) => x.id),
+              index: !!result.index,
+            },
+          });
+          return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+        },
       ),
     ];
   }
