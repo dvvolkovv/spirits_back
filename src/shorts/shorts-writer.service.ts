@@ -9,7 +9,7 @@ import { StageFatalError } from './short-jobs';
 import { linkBase, shortLinks, shortTarget } from './short-links';
 import { parseWriterReply } from './short-parse';
 import { WRITER_SYSTEM, buildWriterMessage, toAgents } from './short-prompts';
-import { checkScriptRules } from './short-rules';
+import { WriterCaptions, checkScriptRules } from './short-rules';
 import { CASE_BADGE, buildScript } from './short-script';
 import { shortSlug } from './short-slug';
 import { ShortsSettingsService } from './shorts-settings.service';
@@ -17,6 +17,22 @@ import { ShortScript, ShortVideo, appendOwnerNote } from './shorts.types';
 
 /** Сколько раз сценарий переписывается по нарушениям правил (спека, «Обработка отказов»). */
 export const MAX_REWRITES = 2;
+
+/**
+ * Сколько раз подряд сценарист может вернуть ролик режиссёру за новой сценой.
+ * Дальше круги не помогут — нужен взгляд владельца. Счёт — с последнего
+ * замечания владельца: его новое замечание — новый круг.
+ */
+export const MAX_RECAPTURES = 2;
+const RECAPTURE_NOTE = 'Сценарист:';
+
+/** Просьбы «Сценарист: …» в хвосте замечаний — после последнего замечания владельца. */
+function recapturesInRow(ownerNote: string | null): number {
+  const lines = String(ownerNote ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
+  let n = 0;
+  while (n < lines.length && lines[lines.length - 1 - n].startsWith(RECAPTURE_NOTE)) n++;
+  return n;
+}
 
 @Injectable()
 export class ShortsWriterService {
@@ -55,6 +71,8 @@ export class ShortsWriterService {
     // Со второго круга сценарист видит отвергнутый вариант, а не прежний
     // сценарий из базы: иначе нарушение названо, а текста, где оно, перед ним нет.
     let previous: ShortScript | null = v.script;
+    // Подписи — только отвергнутого круга: у сценария из базы они уже с хвостом ссылок.
+    let previousCaptions: WriterCaptions | null = null;
     for (let round = 0; round <= MAX_REWRITES; round++) {
       const message = buildWriterMessage({
         rubric: v.rubric,
@@ -66,11 +84,15 @@ export class ShortsWriterService {
         ownerNote: v.ownerNote,
         writerFeedback: v.writerFeedback,
         previousScript: previous,
+        previousCaptions,
         violations,
       });
       const raw = await this.relay.ask(WRITER_SYSTEM, message, `short-write-${v.id}-${randomUUID()}`);
       const reply = parseWriterReply(raw);
       if (reply.needsRecapture) {
+        if (recapturesInRow(v.ownerNote) >= MAX_RECAPTURES) {
+          throw new StageFatalError(`сценарист: уже дважды просил другую сцену — нужен взгляд владельца; последняя причина: ${reply.reason}`);
+        }
         await this.backToDirector(v, reply.reason);
         return;
       }
@@ -88,6 +110,7 @@ export class ShortsWriterService {
       if (violations.length) {
         this.logger.warn(`ролик ${v.id}: сценарий не прошёл правила (круг ${round + 1}): ${violations.join('; ')}`);
         previous = script;
+        previousCaptions = reply.captions;
         continue;
       }
       const r = await this.pg.query(
@@ -105,13 +128,18 @@ export class ShortsWriterService {
     throw new StageFatalError(`сценарист: правила текста не прошли и после ${MAX_REWRITES} переписок — ${violations.join('; ')}`);
   }
 
-  /** Нужна другая сцена: причина ложится к замечаниям — их прочтёт режиссёр. */
+  /**
+   * Нужна другая сцена: причина ложится к замечаниям — их прочтёт режиссёр.
+   * Новая съёмка — новый круг: отзыв студии о прошлой озвучке и счёт её
+   * переписок обнуляются, как при замечании владельца и повторе из failed.
+   */
   private async backToDirector(v: ShortVideo, reason: string): Promise<void> {
     const r = await this.pg.query(
       `UPDATE short_video
-          SET status = 'directing', owner_note = $2, attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
+          SET status = 'directing', owner_note = $2, writer_feedback = NULL, writer_rounds = 0,
+              attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
         WHERE id = $1 AND status = 'writing' AND attempts = $3`,
-      [v.id, appendOwnerNote(v.ownerNote, `Сценарист: ${reason}`), v.attempts],
+      [v.id, appendOwnerNote(v.ownerNote, `${RECAPTURE_NOTE} ${reason}`), v.attempts],
     );
     if (r.rowCount === 0) this.logger.warn(`ролик ${v.id} ушёл из writing или его забрал другой процесс — к режиссёру не вернул`);
     else this.logger.log(`ролик ${v.id}: сценарист просит новую сцену — ${reason}`);

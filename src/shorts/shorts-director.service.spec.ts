@@ -70,7 +70,7 @@ describe('ShortsDirectorService.direct', () => {
       owner_note: 'Сценарист: нужен вопрос про субаренду',
     }));
     const message = (relay.ask.mock.calls[0] as any[])[1];
-    expect(message).toContain('придумай другую:\nСтарый вопрос');
+    expect(message).toContain('придумай другую:\n<<<ВОПРОС\nСтарый вопрос\nВОПРОС>>>');
     expect(message).toContain('нужен вопрос про субаренду');
   });
 
