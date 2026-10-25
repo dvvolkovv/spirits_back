@@ -164,7 +164,10 @@ async function main() {
   const me = (await api(token, 'GET', '/webhook/profile'))?.[0]?.profileJson;
   if (me?.isadmin) throw new Error('TEST_PHONE указывает на админа — прогон остановлен');
   const agents = await api(token, 'GET', '/webhook/agents?lang=ru');
-  let langNow = me?.language || TEST_LANGUAGE;
+  // Запоминаем исходный язык аккаунта, а не TEST_LANGUAGE: иначе finally внизу
+  // переключал бы аккаунт на 'ru' даже если до прогона он был на другом языке.
+  const originalLanguage = me?.language || TEST_LANGUAGE;
+  let langNow = originalLanguage;
   let custom = null;
   try {
     for (const c of CASES.filter((x) => !ONLY.length || ONLY.includes(x.id))) {
@@ -210,7 +213,7 @@ async function main() {
       check(`${c.id}: без внутренностей`, leak.length === 0, leak.join(', '));
     }
   } finally {
-    if (langNow !== TEST_LANGUAGE) await setLanguage(token, TEST_LANGUAGE);
+    if (langNow !== originalLanguage) await setLanguage(token, originalLanguage);
     if (custom) await api(token, 'DELETE', `/webhook/custom-agents/${custom.id}`);
   }
   console.log(`\n${checks - failed}/${checks} проверок; ответы — ${RUN_DIR}`);
