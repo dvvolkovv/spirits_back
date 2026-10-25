@@ -2,7 +2,6 @@ import { ChatService } from './chat.service';
 import {
   customAssistantHelpLine,
   INITIATIVE_RULE,
-  linkeonHelpPrompt,
   platformGuide,
   platformSections,
   telegramPlatformGuide,
@@ -137,9 +136,8 @@ describe('справка и инициатива', () => {
     expect(line).not.toContain('ЧТО ЕСТЬ В LINKEON');
   });
 
-  it('блок для CLI Маши: правило справки и инициатива', () => {
-    const p = linkeonHelpPrompt('ru', HELP);
-    expect(p).toMatch(/^СПРАВКА О LINKEON/);
+  it('Маше (CLI): карта несёт и правило справки, и инициативу напрямую', () => {
+    const p = platformGuide('ru', { helpTool: HELP, initiative: true });
     expect(p).toContain(HELP);
     expect(p).toContain(INITIATIVE_RULE);
   });
@@ -157,7 +155,6 @@ describe('справка и инициатива', () => {
         platformGuide(lang, { helpTool: HELP, initiative: true }),
         platformGuide(lang, { store: true }),
         telegramPlatformGuide(lang, { helpTool: HELP, initiative: true }),
-        linkeonHelpPrompt(lang, HELP),
       ]) {
         expect(g).not.toContain('view=tokens');
         expect(g).not.toMatch(/пополн|оплат|YooKassa|₽/i);

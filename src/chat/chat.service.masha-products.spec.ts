@@ -3,7 +3,7 @@ import { verifyProductToolToken } from '../products/product-tool.token';
 import { FIND_FILES_CLI_PROMPT, LINKEON_HELP_CLI_TOOL_NAME, PRODUCTS_CLI_PROMPT } from '../products/products-cli-tool';
 import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
 import { LANGUAGE_REPLY_LINE } from '../common/services/language.service';
-import { linkeonHelpPrompt } from './platform-guide';
+import { platformGuide } from './platform-guide';
 
 /**
  * Маша (agent.id === 3) идёт не через релей, а локальным claude CLI — и до
@@ -115,7 +115,9 @@ describe('Маша в вебе: инструмент продуктов', () => 
     const system = String(opts.system);
     expect(system).toContain(PRODUCTS_CLI_PROMPT);
     expect(system).toContain(FIND_FILES_CLI_PROMPT);
-    expect(system).toContain(linkeonHelpPrompt('ru', LINKEON_HELP_CLI_TOOL_NAME));
+    // Правило справки и инициатива — теперь часть самой карты (platformGuide),
+    // переданной Маше напрямую с helpTool+initiative, без отдельного блока.
+    expect(system).toContain(platformGuide('ru', { store: false, helpTool: LINKEON_HELP_CLI_TOOL_NAME, initiative: true }));
     // Язык ответа — самой последней строкой: блок продуктов написан по-русски и
     // не должен встать за ней (модель берёт язык последних строк как образец).
     const lastLine = system.trim().split('\n').pop();

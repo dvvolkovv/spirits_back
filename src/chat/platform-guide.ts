@@ -112,15 +112,6 @@ export function customAssistantHelpLine(tool: string): string {
 }
 
 /**
- * Для CLI Маши: в её стабильной части карта идёт без инструмента — та же часть
- * уходит в приветствие, где инструментов нет. Правило справки и инициатива
- * добавляются только в вызов CLI, где инструмент выдан.
- */
-export function linkeonHelpPrompt(lang: string, tool: string): string {
-  return ['СПРАВКА О LINKEON.', helpRule(labelsFor(lang), tool), INITIATIVE_RULE].join('\n');
-}
-
-/**
  * Блок для Telegram-бота со штатным ассистентом (tg-bot/tg-router.service.ts).
  * Кабинет назван адресом: в группе бывают люди, которые Linkeon не видели.
  * В Telegram нет файлов на выдачу, кода, календаря, рутин и звонка — в веб-чате

@@ -17,7 +17,7 @@ import { RESPONSE_STYLE_RULE } from './response-style';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
 import { CRISIS_RULE } from './crisis-rule';
 import { loadCoworkers } from './coworkers';
-import { customAssistantHelpLine, linkeonHelpPrompt, platformGuide, TOOLS_LIST_NOTE } from './platform-guide';
+import { customAssistantHelpLine, platformGuide, TOOLS_LIST_NOTE } from './platform-guide';
 import { clientKind } from './client-kind';
 import { ClientUi, NO_CLIENT_UI } from './client-ui';
 import { toActivity } from './activity-map';
@@ -1060,7 +1060,7 @@ export class ChatService {
 При первом приветствии кратко представься и упомяни других ассистентов. Используй только текст без таблиц.
 Картинки и видео ты в этом чате не генерируешь: таких инструментов у тебя нет (метафорические карты — другое дело, их показывает платформа). Если просят нарисовать или сгенерировать картинку, сделать видео или ролик — честно скажи, что сама этого не сделаешь, и предложи раздел «Генератор изображений» или «Видео» в меню либо переключиться на другого ассистента: у них такие инструменты есть. Никогда не пиши, что картинка или видео готовы или вот-вот будут.
 
-${platformGuide(userLanguage, { store: storeBuild })}`;
+${platformGuide(userLanguage, { store: storeBuild, helpTool: LINKEON_HELP_CLI_TOOL_NAME, initiative: true })}`;
 
     // Стабильная часть (одинаковая между вызовами для одного агента) — кэшируется.
     // Волатильную (profileText) кладём ПОСЛЕ кэша, иначе изменение профиля юзера ломает префикс.
@@ -1189,7 +1189,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // replyLanguageTail выше), а блок написан по-русски.
           // Правило карточек — только клиенту, который их рисует; до хвоста
           // языка, который обязан остаться последним.
-          system: stableSystemPrompt + `\n\n${products.promptBlock}\n\n${FIND_FILES_CLI_PROMPT}\n\n${linkeonHelpPrompt(userLanguage, LINKEON_HELP_CLI_TOOL_NAME)}` +
+          system: stableSystemPrompt + `\n\n${products.promptBlock}\n\n${FIND_FILES_CLI_PROMPT}` +
             (ui.ask ? `\n\n${ASK_RULE}` : '') + volatileSystemPrompt + replyLanguageTail,
           // Модель Маши — общая с остальным чатом, см. common/chat-model.ts
           // (там же цена решения: пин не даунгрейдится при исчерпании лимита, и
