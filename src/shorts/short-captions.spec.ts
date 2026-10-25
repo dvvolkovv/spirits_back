@@ -1,4 +1,18 @@
-import { SYNTH_NOTE, TG_CAPTION_MAX, YT_TITLE_MAX, buildCaptions, buildReviewCaption, clip, tidyTags } from './short-captions';
+import {
+  SYNTH_NOTE,
+  TG_CAPTION_MAX,
+  VK_TEXT_MAX,
+  YT_TAGS_TOTAL_MAX,
+  YT_TITLE_MAX,
+  buildCaptions,
+  buildReviewCaption,
+  clip,
+  tidyTags,
+} from './short-captions';
+
+/** Одиночный суррогат без пары — признак того, что эмодзи разрезали пополам. */
+const hasLoneSurrogate = (s: string): boolean =>
+  Array.from(s).some((ch) => ch.length === 1 && ch.charCodeAt(0) >= 0xd800 && ch.charCodeAt(0) <= 0xdfff);
 
 const links = {
   telegram: 'https://my.linkeon.io/chat?assistant=10&utm_source=telegram&utm_medium=short&utm_campaign=sh_x_0000',
@@ -15,7 +29,12 @@ describe('clip', () => {
   it('режет по символам и ставит многоточие', () => {
     expect(clip('короткий', 20)).toBe('короткий');
     expect(clip('абвгдеёжзи', 5)).toBe('абвг…');
-    expect(Array.from(clip('😀'.repeat(10), 5))).toHaveLength(5);
+    // Предел — в единицах UTF-16 (.length), не в символах: 😀 весит 2 единицы,
+    // поэтому в clip(…, 5) входят только 2 эмодзи-символа (4 единицы) + «…» (1 единица) = 5.
+    // Раньше тест мерил длину через Array.from (символы) и ждал 5 символов — это считало
+    // эмодзи за 1 единицу, что и была ошибка из Правки 1.
+    expect(clip('😀'.repeat(10), 5).length).toBe(5);
+    expect(hasLoneSurrogate(clip('😀'.repeat(10), 5))).toBe(false);
   });
 });
 
@@ -39,12 +58,37 @@ describe('buildCaptions', () => {
     const c = buildCaptions({ ...w, youtube: { ...w.youtube, title: 'я'.repeat(300) } }, links);
     expect(Array.from(c.youtube.title).length).toBeLessThanOrEqual(YT_TITLE_MAX);
   });
+
+  it('подпись Telegram из 900 эмодзи укладывается в предел по единицам UTF-16, хвост цел', () => {
+    const c = buildCaptions({ ...w, telegram: '😀'.repeat(900) }, links);
+    expect(c.telegram.length).toBeLessThanOrEqual(TG_CAPTION_MAX);
+    expect(c.telegram.endsWith(`${links.telegram}\n\n${SYNTH_NOTE}`)).toBe(true);
+    expect(hasLoneSurrogate(c.telegram)).toBe(false);
+  });
+
+  it('подпись VK из 1500 эмодзи укладывается в предел по единицам UTF-16, хвост цел', () => {
+    const c = buildCaptions({ ...w, vk: '😀'.repeat(1500) }, links);
+    expect(c.vk.length).toBeLessThanOrEqual(VK_TEXT_MAX);
+    expect(c.vk.endsWith(`${links.vk}\n\n${SYNTH_NOTE}`)).toBe(true);
+    expect(hasLoneSurrogate(c.vk)).toBe(false);
+  });
 });
 
 describe('tidyTags', () => {
   it('без решёток, повторов и сверх общего предела', () => {
     expect(tidyTags(['#a', 'a', ' b  c '])).toEqual(['a', 'b c']);
     expect(tidyTags(Array.from({ length: 100 }, (_, i) => `тег${i}`)).join(',').length).toBeLessThanOrEqual(450);
+  });
+
+  it('дедуп без учёта регистра — остаётся первый вариант написания', () => {
+    expect(tidyTags(['Залог', 'залог', 'аренда'])).toEqual(['Залог', 'аренда']);
+  });
+
+  it('теги с пробелом считаются с кавычками — сумма не выходит за общий предел', () => {
+    const tags = Array.from({ length: 40 }, (_, i) => `семейное право${i}`);
+    const result = tidyTags(tags);
+    const total = result.reduce((sum, t) => sum + (t.includes(' ') ? t.length + 2 : t.length) + 1, 0);
+    expect(total).toBeLessThanOrEqual(YT_TAGS_TOTAL_MAX);
   });
 });
 
@@ -75,5 +119,11 @@ describe('buildReviewCaption', () => {
 
   it('стенд помечен', () => {
     expect(buildReviewCaption({ ...base, stand: true }).caption.startsWith('[СТЕНД]')).toBe(true);
+  });
+
+  it('вопрос из эмодзи — подпись укладывается в предел по единицам UTF-16', () => {
+    const r = buildReviewCaption({ ...base, question: '😀'.repeat(2000) });
+    expect(r.caption.length).toBeLessThanOrEqual(TG_CAPTION_MAX);
+    expect(hasLoneSurrogate(r.caption)).toBe(false);
   });
 });
