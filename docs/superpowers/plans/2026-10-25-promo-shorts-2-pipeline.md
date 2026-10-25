@@ -5962,6 +5962,7 @@ import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { AdminGuard } from '../common/guards/admin.guard';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { SHORT_SLOT_INDEX } from './short-slot-claim';
+import { ShortOrderError } from './shorts-topic.service';
 import { ShortsController } from './shorts.controller';
 
 const ID = '6f1c2a9e-0d4b-4c3e-9a51-3b2f7c8d9e10';
@@ -6020,8 +6021,10 @@ describe('POST admin/shorts', () => {
     const { ctl, topics } = setup();
     await ctl.action({ action: 'order', topic: 'Разнос плохого договора', rubric: 'assistant', angle: 'roast', assistantId: 10 }, res());
     expect(topics.addManual).toHaveBeenCalledWith({ topic: 'Разнос плохого договора', rubric: 'assistant', angle: 'roast', assistantId: 10 });
-    topics.addManual.mockRejectedValueOnce(new Error('тема — от 10 до 4000 знаков, сейчас 3'));
+    topics.addManual.mockRejectedValueOnce(new ShortOrderError('тема — от 10 до 4000 знаков, сейчас 3'));
     await expect(ctl.action({ action: 'order', topic: 'abc' }, res())).rejects.toBeInstanceOf(BadRequestException);
+    topics.addManual.mockRejectedValueOnce(new Error('connection terminated'));
+    await expect(ctl.action({ action: 'order', topic: 'Разнос плохого договора' }, res())).rejects.not.toBeInstanceOf(BadRequestException);
   });
 
   it('start_now — запуск в обход ограничений; нечего запускать — 409', async () => {
@@ -6103,7 +6106,7 @@ import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { isShortSlotConflict } from './short-slot-claim';
 import { ShortSettingsPatch, ShortsSettingsService, validateSettingsPatch } from './shorts-settings.service';
-import { ShortsTopicService } from './shorts-topic.service';
+import { ShortOrderError, ShortsTopicService } from './shorts-topic.service';
 import { ShortPublication, ShortVideo, retryTarget, rowToPublication, rowToShort, shortsBucket } from './shorts.types';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -6144,11 +6147,14 @@ export class ShortsController {
             assistantId: data.assistantId ?? null,
           });
         } catch (e: any) {
-          throw new BadRequestException(e.message);
+          // 400 — только на ошибку проверки заказа; сбой базы остаётся 500, а не «плохим запросом».
+          if (e instanceof ShortOrderError) throw new BadRequestException(e.message);
+          throw e;
         }
         return res.status(200).json(v);
       }
       case 'start_now': {
+        if (data.id && !UUID.test(String(data.id))) throw new BadRequestException('id ролика — uuid');
         const v = await this.topics.start({ id: data.id || undefined, force: true });
         if (!v) {
           throw new ConflictException(
