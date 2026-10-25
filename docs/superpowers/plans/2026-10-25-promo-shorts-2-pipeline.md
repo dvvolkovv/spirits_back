@@ -37,7 +37,7 @@
 - **Живой чекаут `~/spirits_back` на ноде не трогать:** из него работает test.linkeon.io. Из его `.env` можно только читать.
 - **Ничего не выкатывать и не вливать в main** до задачи 36. Там и слияние, и выкат — только с явного OK владельца.
 - **Ревьюерам-субагентам:** никаких `git checkout` и `git switch` в общем воркдереве. «Красное» состояние смотреть через `git show <sha>:<путь>`.
-- **SSH к ноде — через одно мастер-соединение.** sshd ноды рвёт новые подключения по `MaxStartups 10:30:100` (`Connection closed by 85.192.61.231 port 22`): её постоянно перебирают боты. Поэтому все `ssh` и `scp` в плане идут с `-o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m`: первое подключение становится мастером, остальные идут через него. Если сбрасывает и первое, повторить через 1–2 минуты, а не петлёй каждые несколько секунд — петля только добавляет подключений к потолку. После задачи 0 `node-run.sh` сам ждёт соседний прогон на flock.
+- **SSH к ноде — через одно мастер-соединение.** sshd ноды рвёт новые подключения по `MaxStartups 10:30:100` (`Connection closed by 85.192.61.231 port 22`): её постоянно перебирают боты. Поэтому все `ssh` и `scp` в плане идут с `-o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m`: первое подключение становится мастером, остальные идут через него. Если сбрасывает и первое, повторить через 1–2 минуты, а не петлёй каждые несколько секунд — петля только добавляет подключений к потолку. После задачи 0 `node-run.sh` сам ждёт соседний прогон на flock (до 5 минут, потом выходит с кодом 75 и показывает, чей прогон держит лок — тогда повторить позже). Команда на ноде ограничена 30 минутами. Bash-вызов агента живёт до 10 минут, поэтому долгие прогоны (`npm ci` с jest, сквозной рендер, рабочий процесс студии) запускать с `run_in_background` или `timeout: 600000`.
 - **Коммиты** — по-русски, с префиксом (`feat(shorts):`, `test(shorts):`, `feat(studio):`, `fix(...)`). Последняя строка каждого сообщения — `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`.
 - **Кириллица и эмодзи пишутся в файлы как есть.** Escape-последовательностей вида `\uXXXX` в коде нет и не вводить: инструмент записи их портит.
 
@@ -132,13 +132,17 @@ Expected: число больше нуля (файлы `studio/src/**` в спи
 #   studio/scripts/node-run.sh "npm test"                           — в studio/
 #   NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts" — в корне бэкенда
 # Два прогона сразу (параллельные сессии, субагенты) воркдерево не делят: второй ждёт
-# первого на flock до 15 минут, а не переключает коммит у него из-под ног.
+# первого на flock до 5 минут, а не переключает коммит у него из-под ног. Команда
+# ограничена 30 минутами: зависший прогон не держит лок вечно.
+# Коды выхода: 75 — воркдерево занято (повторить позже), 2 — неверный вызов,
+# 1 — воркдерево ноды не встало на коммит, иначе — код самой команды.
 set -euo pipefail
-cmd="${1:?usage: studio/scripts/node-run.sh \"<команда>\"}"
+[ $# -eq 1 ] || { echo 'usage: studio/scripts/node-run.sh "<команда>" — команда одной строкой в кавычках' >&2; exit 2; }
+cmd="$1"
 dir="${NODE_RUN_DIR:-studio}"
 case "$dir" in
   studio|.) ;;
-  *) echo "node-run.sh: NODE_RUN_DIR — studio или . (корень бэкенда), получено «${dir}»" >&2; exit 1 ;;
+  *) echo "node-run.sh: NODE_RUN_DIR — studio или . (корень бэкенда), получено «${dir}»" >&2; exit 2 ;;
 esac
 repo="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 sha="$(git -C "$repo" rev-parse HEAD)"
@@ -147,14 +151,31 @@ branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD)"
 # а она при fetch затирает refs/remotes/origin/main у всех клонов (было 24.10.2026).
 # Из main не гоняем: скрипт только для ветки задачи.
 case "$branch" in
-  HEAD) echo "node-run.sh: HEAD отсоединён — встань на ветку задачи (git switch feat/promo-shorts)" >&2; exit 1 ;;
-  main|master) echo "node-run.sh: из ${branch} не запускать — только из ветки задачи" >&2; exit 1 ;;
+  HEAD) echo "node-run.sh: HEAD отсоединён — встань на ветку задачи (git switch feat/promo-shorts)" >&2; exit 2 ;;
+  main|master) echo "node-run.sh: из ${branch} не запускать — только из ветки задачи" >&2; exit 2 ;;
 esac
+# Незакоммиченное на ноду не уезжает: прогон проверит прежний код.
+if [ -n "$(git -C "$repo" status --porcelain --untracked-files=no)" ]; then
+  echo "node-run.sh: есть незакоммиченные правки — на ноду уедет только ${sha:0:7}" >&2
+fi
+echo "node-run.sh: ${sha:0:7} → ${dir}" >&2
 git -C "$repo" push -q origin "HEAD:refs/heads/${branch}"
+# Команда уезжает одним словом: на ноде её разбирает bash -ec, а не цепочка подготовки.
+q="$(printf '%q' "$cmd")"
 # Одно мастер-соединение на все прогоны (ControlPersist): sshd ноды рвёт новые
-# подключения по MaxStartups 10:30:100 — её постоянно перебирают боты.
-ssh -o ConnectTimeout=15 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 \
-  "set -e; exec 9>~/ci/wt/.promo-shorts.lock; flock -w 900 9 || { echo 'node-run.sh: воркдерево занято другим прогоном дольше 15 минут' >&2; exit 1; }; cd ~/ci/wt/promo-shorts && git fetch -q origin && git checkout -q --detach ${sha} && cd ${dir} && source ~/.nvm/nvm.sh >/dev/null && ${cmd}"
+# подключения по MaxStartups 10:30:100 — её постоянно перебирают боты. Keepalive —
+# чтобы прогон не висел на мёртвом соединении мастера (сон мака, смена сети).
+# На одно соединение sshd пускает до 10 сессий (MaxSessions) — с запасом.
+# Подготовка воркдерева — одной группой: любой её сбой фатален. Под set -e упавшее
+# звено списка && шелл не останавливает, и команда выполнилась бы на чужом коммите.
+ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+    -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 \
+  "set -e
+exec 9>~/ci/wt/.promo-shorts.lock
+if ! flock -w 300 9; then echo 'node-run.sh: воркдерево занято другим прогоном дольше 5 минут, его владелец:' >&2; cat ~/ci/wt/.promo-shorts.owner >&2 2>/dev/null || true; exit 75; fi
+echo \"\$(date -Is) ${sha:0:7} ${dir}\" > ~/ci/wt/.promo-shorts.owner
+{ cd ~/ci/wt/promo-shorts && timeout 120 git fetch -q origin 'refs/heads/${branch}' && test -z \"\$(git status --porcelain --untracked-files=no)\" && git checkout -q --detach ${sha} && cd ${dir} && source ~/.nvm/nvm.sh >/dev/null; } || { echo 'node-run.sh: воркдерево ноды не встало на ${sha:0:7} (fetch, незакоммиченное в дереве ноды или checkout)' >&2; git -C ~/ci/wt/promo-shorts status --short >&2 || true; exit 1; }
+exec timeout -k 30 1800 bash -ec ${q}"
 ```
 
 - [ ] **Step 3: Исключить студию из сборки и тестов API**
@@ -203,13 +224,16 @@ Expected: `# pass 49`, `# fail 0`.
 
 На `c787327` сюиты `src/tg-bot` и `src/blog` зелёные (25.10.2026: 57 passed, 3 skipped — интеграционные без своих баз). ESM-пакет агента `@anthropic-ai/claude-agent-sdk`, который тянет `misc.service.ts`, гасит ручной мок `__mocks__/@anthropic-ai/claude-agent-sdk.js` в корне репозитория. Копия репозитория для проверок без каталога `__mocks__` даёт ложные красные (`SyntaxError: Cannot use import statement outside a module`). База всё равно записывается: если `main` принесёт свою красную сюиту, дальше будет видно только новое:
 
-Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/tg-bot src/blog > /tmp/promo-jest-base.log 2>&1 || true; grep -E '^FAIL' /tmp/promo-jest-base.log | sort -u > ~/ci/promo-shorts-jest-fail-base.txt; cat ~/ci/promo-shorts-jest-fail-base.txt"`
-Expected: пустой вывод — на `c787327` красных сюит нет. Файл базы лежит на ноде вне воркдеревьев.
+Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "rm -f /tmp/promo-jest-base.log; npx jest src/tg-bot src/blog > /tmp/promo-jest-base.log 2>&1 || true; grep -q '^Tests: ' /tmp/promo-jest-base.log || { tail -30 /tmp/promo-jest-base.log; echo JEST_DID_NOT_RUN; exit 1; }; grep -oE '^FAIL [^ ]+' /tmp/promo-jest-base.log | sort -u > ~/ci/promo-shorts-jest-fail-base.txt; grep -E '^(Tests|Test Suites):' /tmp/promo-jest-base.log; cat ~/ci/promo-shorts-jest-fail-base.txt"`
+Expected: строки `Test Suites:` и `Tests:` без `failed`, список красных — пустой (на `c787327` красных сюит нет). Файл базы лежит на ноде вне воркдеревьев. `grep -q '^Tests: '` страхует от пустого прогона: jest, который не стартовал (ошибка конфига, сломанный `npm ci`), строк `FAIL` тоже не печатает.
 
-Новые красные сюиты относительно этой базы показывает команда, которой пользуются задачи 22, 35 и 36. `|| true` после jest обязателен: `node-run.sh` выполняет команду под `set -e`, и упавший jest оборвал бы её до сравнения.
+Новые красные сюиты относительно этой базы показывает команда, которой пользуются задачи 22, 35 и 36:
+- `|| true` после jest обязателен: команда выполняется под `bash -e`, и упавший jest оборвал бы её до сравнения;
+- `grep -q '^Tests: '` — jest действительно отработал;
+- `grep -oE '^FAIL [^ ]+'` берёт только путь: к медленной сюите jest дописывает время, и старая красная сюита с другим временем иначе показалась бы новой.
 
 ```bash
-npx jest src/shorts src/tg-bot src/blog > /tmp/promo-jest.log 2>&1 || true; grep -E '^FAIL' /tmp/promo-jest.log | sort -u > /tmp/promo-fail-now.txt; comm -13 ~/ci/promo-shorts-jest-fail-base.txt /tmp/promo-fail-now.txt > /tmp/promo-fail-new.txt; cat /tmp/promo-fail-new.txt; test ! -s /tmp/promo-fail-new.txt && echo NO_NEW_FAILS
+rm -f /tmp/promo-jest.log; npx jest src/shorts src/tg-bot src/blog > /tmp/promo-jest.log 2>&1 || true; grep -q '^Tests: ' /tmp/promo-jest.log || { tail -30 /tmp/promo-jest.log; echo JEST_DID_NOT_RUN; exit 1; }; grep -oE '^FAIL [^ ]+' /tmp/promo-jest.log | sort -u > /tmp/promo-fail-now.txt; comm -13 ~/ci/promo-shorts-jest-fail-base.txt /tmp/promo-fail-now.txt > /tmp/promo-fail-new.txt; cat /tmp/promo-fail-new.txt; test ! -s /tmp/promo-fail-new.txt && echo NO_NEW_FAILS
 ```
 
 ---
@@ -6565,7 +6589,7 @@ export function shouldRouteToShorts(data?: string): boolean {
 
 - [ ] **Step 7: Тесты проходят — новые и прежние спеки бота и блога**
 
-Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts src/tg-bot src/blog > /tmp/promo-jest.log 2>&1 || true; grep -E '^FAIL' /tmp/promo-jest.log | sort -u > /tmp/promo-fail-now.txt; comm -13 ~/ci/promo-shorts-jest-fail-base.txt /tmp/promo-fail-now.txt > /tmp/promo-fail-new.txt; cat /tmp/promo-fail-new.txt; test ! -s /tmp/promo-fail-new.txt && echo NO_NEW_FAILS && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
+Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "rm -f /tmp/promo-jest.log; npx jest src/shorts src/tg-bot src/blog > /tmp/promo-jest.log 2>&1 || true; grep -q '^Tests: ' /tmp/promo-jest.log || { tail -30 /tmp/promo-jest.log; echo JEST_DID_NOT_RUN; exit 1; }; grep -oE '^FAIL [^ ]+' /tmp/promo-jest.log | sort -u > /tmp/promo-fail-now.txt; comm -13 ~/ci/promo-shorts-jest-fail-base.txt /tmp/promo-fail-now.txt > /tmp/promo-fail-new.txt; cat /tmp/promo-fail-new.txt; test ! -s /tmp/promo-fail-new.txt && echo NO_NEW_FAILS && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: `NO_NEW_FAILS` и `TSC_OK`. Сюиты задачи (`src/shorts/*`, `tg-bot.shorts-routing.spec.ts`) — PASS. Интеграционные `shorts.integration.spec.ts` и `blog-approval.integration.spec.ts` без своих переменных — skipped. Если база задачи 0 не пустая, её сюиты красными и остаются — это не от этой работы.
 
 Прежние спеки `src/tg-bot` собирают `TgBotService` из 13–14 аргументов. Новый параметр стоит последним и `@Optional`, поэтому они не меняются. Если среди новых красных — прежняя спека бота, сначала проверить её позиционные аргументы и не трогать порядок параметров.
@@ -6598,7 +6622,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - [ ] **Step 1: Одноразовая база на ноде (один раз)**
 
 ```bash
-ssh -o ConnectTimeout=15 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 "sudo -u postgres psql -qc \"CREATE ROLE shortsit LOGIN PASSWORD 'shortsit'\" 2>/dev/null; sudo -u postgres psql -qc 'DROP DATABASE IF EXISTS shorts_it' && sudo -u postgres psql -qc 'CREATE DATABASE shorts_it OWNER shortsit' && echo DB_OK"
+ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 "sudo -u postgres psql -qc \"CREATE ROLE shortsit LOGIN PASSWORD 'shortsit'\" 2>/dev/null; sudo -u postgres psql -qc 'DROP DATABASE IF EXISTS shorts_it' && sudo -u postgres psql -qc 'CREATE DATABASE shorts_it OWNER shortsit' && echo DB_OK"
 ```
 
 Expected: `DB_OK`. Роль с паролем — как у `blog_notes`: node-pg ходит по TCP, peer-аутентификации у него нет.
@@ -7960,24 +7984,23 @@ git -C "$WT" commit -m "feat(studio): окружение и зависимост
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
 
-Run: `studio/scripts/node-run.sh "npm install --no-audit --no-fund && npx tsc --noEmit && npm test"`
-Expected: `npm install` проходит; `tsc` без вывода; `# fail 0`.
+- [ ] **Step 5: Поставить зависимости на ноде и забрать lock-файл**
 
-- [ ] **Step 5: Забрать обновлённый lock-файл с ноды**
-
-`npm install` переписал `package-lock.json` в воркдереве ноды. Его забираем, а на ноде откатываем: иначе следующий `git checkout` упрётся в изменённый файл.
+`npm install` перепишет `package-lock.json` в воркдереве ноды. Новый lock-файл забираем тем же прогоном и там же откатываем, под тем же локом: иначе следующий прогон упрётся в изменённый файл в дереве ноды. Весь вывод `npm install` — в stderr, в stdout — только lock-файл:
 
 ```bash
-scp -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231:ci/wt/promo-shorts/studio/package-lock.json "$WT/studio/package-lock.json"
-ssh -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 'git -C ~/ci/wt/promo-shorts checkout -- studio/package-lock.json'
+"$WT/studio/scripts/node-run.sh" "npm install --no-audit --no-fund >&2 && cat package-lock.json && git checkout -- package-lock.json" > "$WT/studio/package-lock.json.new"
+python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('pg' in d['packages']['']['dependencies'], '@aws-sdk/client-s3' in d['packages']['']['dependencies'])" "$WT/studio/package-lock.json.new" && mv "$WT/studio/package-lock.json.new" "$WT/studio/package-lock.json"
 git -C "$WT" add studio/package-lock.json
 git -C "$WT" commit -m "build(studio): lock-файл с pg и @aws-sdk/client-s3
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
 
-Run: `studio/scripts/node-run.sh "npm ci --no-audit --no-fund && npm test"`
-Expected: `npm ci` проходит по lock-файлу; `# fail 0`.
+Expected: `True True` — lock-файл валиден и знает новые зависимости. Lock-файл сначала ложится во временный `package-lock.json.new`: сорвавшийся прогон не испортит настоящий. Если упал сам `npm install`, lock-файл в дереве ноды мог остаться изменённым, и следующий прогон откажет с «незакоммиченное в дереве ноды». Тогда вернуть его: `ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 'git -C ~/ci/wt/promo-shorts checkout -- studio/package-lock.json'`.
+
+Run: `studio/scripts/node-run.sh "npm ci --no-audit --no-fund && npx tsc --noEmit && npm test"`
+Expected: `npm ci` проходит по lock-файлу; `tsc` без вывода; `# fail 0`.
 
 ---
 
@@ -7992,7 +8015,7 @@ Expected: `npm ci` проходит по lock-файлу; `# fail 0`.
 - [ ] **Step 1: Одноразовая база на ноде (один раз)**
 
 ```bash
-ssh -o ConnectTimeout=15 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 "sudo -u postgres psql -qc \"CREATE ROLE studioit LOGIN PASSWORD 'studioit'\" 2>/dev/null; sudo -u postgres psql -qc 'DROP DATABASE IF EXISTS studio_it' && sudo -u postgres psql -qc 'CREATE DATABASE studio_it OWNER studioit' && echo DB_OK"
+ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 "sudo -u postgres psql -qc \"CREATE ROLE studioit LOGIN PASSWORD 'studioit'\" 2>/dev/null; sudo -u postgres psql -qc 'DROP DATABASE IF EXISTS studio_it' && sudo -u postgres psql -qc 'CREATE DATABASE studio_it OWNER studioit' && echo DB_OK"
 ```
 
 Expected: `DB_OK`. База своя, не `shorts_it`: прогоны бэкенда и студии не стирают строки друг друга.
@@ -9112,7 +9135,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 1: Бэкенд — затронутые каталоги, живой Postgres, гейт типов**
 
-Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts src/tg-bot src/blog > /tmp/promo-jest.log 2>&1 || true; grep -E '^FAIL' /tmp/promo-jest.log | sort -u > /tmp/promo-fail-now.txt; comm -13 ~/ci/promo-shorts-jest-fail-base.txt /tmp/promo-fail-now.txt > /tmp/promo-fail-new.txt; cat /tmp/promo-fail-new.txt; test ! -s /tmp/promo-fail-new.txt && echo NO_NEW_FAILS && SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
+Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "rm -f /tmp/promo-jest.log; npx jest src/shorts src/tg-bot src/blog > /tmp/promo-jest.log 2>&1 || true; grep -q '^Tests: ' /tmp/promo-jest.log || { tail -30 /tmp/promo-jest.log; echo JEST_DID_NOT_RUN; exit 1; }; grep -oE '^FAIL [^ ]+' /tmp/promo-jest.log | sort -u > /tmp/promo-fail-now.txt; comm -13 ~/ci/promo-shorts-jest-fail-base.txt /tmp/promo-fail-now.txt > /tmp/promo-fail-new.txt; cat /tmp/promo-fail-new.txt; test ! -s /tmp/promo-fail-new.txt && echo NO_NEW_FAILS && SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: `NO_NEW_FAILS`; интеграционный — `5 passed`; `TSC_OK`.
 
 - [ ] **Step 2: Сборка API не изменила раскладку `dist/`**
@@ -9166,7 +9189,7 @@ git -C "$SCRATCH/shorts-merge" merge --no-ff origin/feat/promo-shorts \
 
 `node-run.sh` клона пушит ветку `merge/promo-shorts-2` (не `main`) и гоняет её точный коммит:
 
-Run: `NODE_RUN_DIR=. "$SCRATCH/shorts-merge/studio/scripts/node-run.sh" "npm ci --no-audit --no-fund >/dev/null; npx jest src/shorts src/tg-bot src/blog > /tmp/promo-jest.log 2>&1 || true; grep -E '^FAIL' /tmp/promo-jest.log | sort -u > /tmp/promo-fail-now.txt; comm -13 ~/ci/promo-shorts-jest-fail-base.txt /tmp/promo-fail-now.txt > /tmp/promo-fail-new.txt; cat /tmp/promo-fail-new.txt; test ! -s /tmp/promo-fail-new.txt && npx tsc --noEmit -p tsconfig.build.json && rm -rf dist && npm run build >/dev/null && test -f dist/main.js && echo MERGE_OK"`
+Run: `NODE_RUN_DIR=. "$SCRATCH/shorts-merge/studio/scripts/node-run.sh" "npm ci --no-audit --no-fund >/dev/null; rm -f /tmp/promo-jest.log; npx jest src/shorts src/tg-bot src/blog > /tmp/promo-jest.log 2>&1 || true; grep -q '^Tests: ' /tmp/promo-jest.log || { tail -30 /tmp/promo-jest.log; echo JEST_DID_NOT_RUN; exit 1; }; grep -oE '^FAIL [^ ]+' /tmp/promo-jest.log | sort -u > /tmp/promo-fail-now.txt; comm -13 ~/ci/promo-shorts-jest-fail-base.txt /tmp/promo-fail-now.txt > /tmp/promo-fail-new.txt; cat /tmp/promo-fail-new.txt; test ! -s /tmp/promo-fail-new.txt && npx tsc --noEmit -p tsconfig.build.json && rm -rf dist && npm run build >/dev/null && test -f dist/main.js && echo MERGE_OK"`
 Expected: `MERGE_OK`. Если `main` за это время принёс свои красные сюиты, их видно в выводе списком — разобрать, чьи они, прежде чем вливать.
 
 - [ ] **Step 4: В main — только перемоткой, затем убрать временную ветку**
@@ -9186,7 +9209,7 @@ git -C "$SCRATCH/shorts-merge" push -q origin --delete merge/promo-shorts-2
 Копия `.env` кладётся вне каталога приложения. Строки дописываются, только если их ещё нет. Значения секретов не печатаются.
 
 ```bash
-ssh -o ConnectTimeout=15 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 'set -e; cp ~/spirits_back/.env ~/env-spirits_back.bak-$(date +%Y%m%d%H%M); if ! grep -q "^SHORTS_ENABLED=" ~/spirits_back/.env; then printf "\nSHORTS_ENABLED=true\nSHORTS_AUTO_TOPICS=false\nSHORTS_STAND=true\nSHORTS_LINK_BASE=https://test.linkeon.io\n" >> ~/spirits_back/.env; fi; grep -E "^SHORTS_" ~/spirits_back/.env'
+ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 'set -e; cp ~/spirits_back/.env ~/env-spirits_back.bak-$(date +%Y%m%d%H%M); if ! grep -q "^SHORTS_ENABLED=" ~/spirits_back/.env; then printf "\nSHORTS_ENABLED=true\nSHORTS_AUTO_TOPICS=false\nSHORTS_STAND=true\nSHORTS_LINK_BASE=https://test.linkeon.io\n" >> ~/spirits_back/.env; fi; grep -E "^SHORTS_" ~/spirits_back/.env'
 ```
 
 Expected: четыре строки `SHORTS_…`. API прочтёт их при рестарте, который сделает `deploy.sh`.
@@ -9207,7 +9230,7 @@ ln -s ~/Downloads/spirits_back/tests/node_modules "$SCRATCH/deploy/spirits_back/
 - [ ] **Step 7: Убедиться, что приехал наш код и таблицы созданы**
 
 ```bash
-ssh -o ConnectTimeout=15 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 'git -C ~/spirits_back log -1 --format=%H; grep -c "shorts migration 001_shorts.sql applied" ~/.pm2/logs/linkeon-api-out*.log | tail -1; set -a; . ~/spirits_back/.env >/dev/null 2>&1; set +a; psql "$DATABASE_URL" -Atc "SELECT to_regclass('"'"'public.short_video'"'"'), (SELECT count(*) FROM short_settings)"'
+ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 'git -C ~/spirits_back log -1 --format=%H; grep -c "shorts migration 001_shorts.sql applied" ~/.pm2/logs/linkeon-api-out*.log | tail -1; set -a; . ~/spirits_back/.env >/dev/null 2>&1; set +a; psql "$DATABASE_URL" -Atc "SELECT to_regclass('"'"'public.short_video'"'"'), (SELECT count(*) FROM short_settings)"'
 ```
 
 Expected:
@@ -9237,7 +9260,7 @@ Expected:
 База и MinIO — того же стенда, что API. Номер админа стенда — из таблицы «Тестовые аккаунты» в `CLAUDE.md` (роль Admin). Ниже он подставлен как `<номер-админа>`. В репозиторий номер не попадает.
 
 ```bash
-ssh -o ConnectTimeout=15 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 'set -e; f=~/ci/wt/promo-shorts/studio/.env; grep -q "^DATABASE_URL=" $f || grep -E "^(DATABASE_URL|MINIO_ENDPOINT|MINIO_ACCESS_KEY|MINIO_SECRET_KEY|MINIO_BUCKET_VIDEOS)=" ~/spirits_back/.env >> $f; grep -q "^ADMIN_PHONE=" $f || echo "ADMIN_PHONE=<номер-админа>" >> $f; chmod 600 $f; grep -oE "^[A-Z_]+=" $f | sort | tr "\n" " "'
+ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 'set -e; f=~/ci/wt/promo-shorts/studio/.env; grep -q "^DATABASE_URL=" $f || grep -E "^(DATABASE_URL|MINIO_ENDPOINT|MINIO_ACCESS_KEY|MINIO_SECRET_KEY|MINIO_BUCKET_VIDEOS)=" ~/spirits_back/.env >> $f; grep -q "^ADMIN_PHONE=" $f || echo "ADMIN_PHONE=<номер-админа>" >> $f; chmod 600 $f; grep -oE "^[A-Z_]+=" $f | sort | tr "\n" " "'
 ```
 
 Expected — только имена переменных: `ADMIN_PHONE= API_URL= CABINET_BASIC_AUTH= CABINET_URL= DATABASE_URL= DEBUG_SECRET= DEMO_PHONE= MINIO_ACCESS_KEY= MINIO_BUCKET_VIDEOS= MINIO_ENDPOINT= MINIO_SECRET_KEY= YANDEX_SPEECHKIT_API_KEY= YANDEX_TTS_FOLDER_ID=`.
@@ -9245,7 +9268,7 @@ Expected — только имена переменных: `ADMIN_PHONE= API_URL
 - [ ] **Step 2: Канал стенда и баланс демо-аккаунта**
 
 ```bash
-ssh -o ConnectTimeout=15 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 'set -a; . ~/spirits_back/.env >/dev/null 2>&1; set +a; psql "$DATABASE_URL" -Atc "SELECT channel_chat_id FROM blog_settings WHERE id = 1"; psql "$DATABASE_URL" -Atc "SELECT tokens FROM ai_profiles_consolidated WHERE user_id = '"'"'79030000001'"'"'"'
+ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 'set -a; . ~/spirits_back/.env >/dev/null 2>&1; set +a; psql "$DATABASE_URL" -Atc "SELECT channel_chat_id FROM blog_settings WHERE id = 1"; psql "$DATABASE_URL" -Atc "SELECT tokens FROM ai_profiles_consolidated WHERE user_id = '"'"'79030000001'"'"'"'
 ```
 
 Expected:
