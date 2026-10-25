@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildProps } from './props';
 import type { CaptureResult, Script } from '../types';
+import { StudioError } from '../errors';
 
 const capture: CaptureResult = {
   scene: { kind: 'chat', assistantId: 10, assistantName: 'Алексей', question: 'Проверьте договор', followups: [] },
@@ -47,4 +48,12 @@ test('пропсы: пути озвучки относительно папки 
 test('реплика без озвучки — ошибка', () => {
   const voiced = script.lines.slice(1).map((l) => ({ id: l.id, file: `/run/voice/${l.id}.mp3`, durationMs: ms[l.id] }));
   assert.throws(() => buildProps(capture, script, voiced, '/run'), /нет озвучки реплики h/);
+});
+
+test('снимок ответа не той ширины — frame_size без повтора', () => {
+  const voiced = script.lines.map((l) => ({ id: l.id, file: `/run/voice/${l.id}.mp3`, durationMs: ms[l.id] }));
+  assert.throws(
+    () => buildProps({ ...capture, answerShotWidth: 720 }, script, voiced, '/run'),
+    (e: unknown) => e instanceof StudioError && e.code === 'frame_size' && !e.retryable,
+  );
 });
