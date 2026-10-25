@@ -800,6 +800,17 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
            WHERE j.status = 'queued'
              AND EXISTS (SELECT 1 FROM products p
                           WHERE p.id = j.product_id
+                            -- Удалённый (архивный, но ещё не стёртый) продукт
+                            -- получает от агента ТОЛЬКО сон: контейнер
+                            -- гасится, домен уходит на заглушку. Пробуждение,
+                            -- домен и заведение архивному не выдаются —
+                            -- вторая ветка OR истинна исключительно для
+                            -- 'sleep'. Стёртому (purged_at не NULL) — ничего,
+                            -- даже сон: восстанавливать уже нечего. OR стоит
+                            -- ВНУТРИ EXISTS и j.status не трогает, поэтому
+                            -- SKIP LOCKED и отбор строго по 'queued' ниже не
+                            -- меняются (сторож — «очередь читается ТОЛЬКО по
+                            -- queued», provisioning.job.spec.ts).
                             AND (p.archived_at IS NULL OR (j.kind = 'sleep' AND p.purged_at IS NULL))
                             -- Метка машины. Условие внутри EXISTS, то есть
                             -- ВНУТРИ отбора, а не поверх него: наложенное
@@ -876,8 +887,11 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
               -- бы первый блок с этим server_name.
               , COALESCE((SELECT d.names FROM product_domains d
                            WHERE d.product_id = p.id
-                             -- CASE, а не дизъюнкция: её в этом запросе нет
-                             -- нигде (сторож — «очередь читается ТОЛЬКО по queued»).
+                             -- CASE, а не дизъюнкция на j.status: такой в этом
+                             -- запросе нет нигде (сторож — «очередь читается
+                             -- ТОЛЬКО по queued», provisioning.job.spec.ts —
+                             -- OR на p.archived_at/p.purged_at выше j.status
+                             -- не касается).
                              AND CASE d.status
                                    WHEN 'active' THEN true
                                    WHEN 'issuing' THEN
