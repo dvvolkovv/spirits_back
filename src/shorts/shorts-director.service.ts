@@ -7,7 +7,8 @@ import { StageFatalError } from './short-jobs';
 import { parseDirectorReply } from './short-parse';
 import { DIRECTOR_SYSTEM, buildDirectorMessage, toAgents } from './short-prompts';
 import { shortSlug } from './short-slug';
-import { ShortScene, ShortVideo } from './shorts.types';
+import { isHealthAssistant } from './short-assistants';
+import { PROVOCATIVE_ANGLES, ShortScene, ShortVideo } from './shorts.types';
 
 /** Сколько прошлых вопросов показываем режиссёру, чтобы он не повторялся (спека, «Правила очереди»). */
 const RECENT_QUESTIONS = 20;
@@ -61,6 +62,13 @@ export class ShortsDirectorService {
     });
 
     const assistant = assistants.find((a) => a.id === reply.assistantId);
+    // Правило 12: здоровье — только в calm. buildDirectorMessage уже не
+    // показывает ассистентов здоровья режиссёру при провокационной подаче,
+    // но это не страхует разбор ответа — повтор даст другой выбор, поэтому
+    // обычная Error, а не StageFatalError.
+    if (!v.assistantId && PROVOCATIVE_ANGLES.includes(v.angle) && isHealthAssistant(assistant.name)) {
+      throw new Error(`режиссёр: выбрал ассистента здоровья «${assistant.name}» для провокационной подачи — здоровье только в calm`);
+    }
     const scene: ShortScene = {
       kind: 'chat',
       assistantId: reply.assistantId,
