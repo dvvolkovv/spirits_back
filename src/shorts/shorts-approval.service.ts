@@ -20,8 +20,26 @@ import {
 const NOTE_PLACEHOLDER = 'Что поправить?';
 const LINK_PLACEHOLDER = 'https://youtube.com/shorts/…';
 
-/** Ролик не ушёл владельцу (Telegram, MinIO) — следующая попытка через столько минут. */
-export const REVIEW_LEASE_MINUTES = 5;
+/**
+ * Аренда отправки владельцу. Дольше, чем grammy ждёт ответа на загрузку
+ * (timeoutSeconds по умолчанию 500 с ≈ 8,3 мин), с запасом на скачивание из
+ * MinIO: пока первый процесс ещё заливает видео, второй не заберёт ролик и не
+ * пришлёт его вторым сообщением. Сорвавшаяся отправка повторится, когда аренда
+ * истечёт.
+ */
+export const REVIEW_LEASE_MINUTES = 15;
+/** После стольких неудач подряд — одно сообщение владельцу и дальше повторы раз в REVIEW_SEND_PAUSE_MINUTES. */
+export const REVIEW_SEND_ALERT_AFTER = 3;
+export const REVIEW_SEND_PAUSE_MINUTES = 60;
+/** Bot API принимает от бота файлы до 50 МБ; больше — 413 на каждой попытке. */
+export const TG_UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
+
+/**
+ * Ролик уже вышел хоть на одной площадке: пост в канале есть или набор YouTube
+ * ушёл владельцу. Между попытками публикации такой ролик лежит в approved.
+ */
+const RELEASED_SQL =
+  `EXISTS (SELECT 1 FROM short_publication p WHERE p.short_id = short_video.id AND p.status IN ('published', 'manual_pending', 'manual_done'))`;
 
 const RESHOOT = 'Ролик сейчас переснимается — замечание напишите к новому варианту.';
 const REBUILD = 'Ролик сейчас пересобирается — замечание напишите к новому варианту.';
@@ -42,7 +60,31 @@ const NOTE_REFUSALS: Partial<Record<ShortStatus, string>> = {
 };
 
 const noteRefusal = (s: ShortStatus): string => NOTE_REFUSALS[s] ?? `Замечание не принял: ролик в статусе ${s}.`;
+
+const REWORKING = 'Ролик переделывается — пришлю новый вариант';
+
+/** Почему кнопка под сообщением уже не действует — по статусу, без внутренних имён (всплывашка, до 200 знаков). */
+const BUTTON_REFUSALS: Partial<Record<ShortStatus, string>> = {
+  directing: REWORKING,
+  capture_queued: REWORKING,
+  capturing: REWORKING,
+  writing: REWORKING,
+  render_queued: REWORKING,
+  rendering: REWORKING,
+  approved: 'Ролик уже одобрен',
+  publishing: 'Ролик уже уходит на площадки',
+  published: 'Ролик уже опубликован',
+  rejected: 'Ролик отклонён',
+  failed: 'Ролик упал — см. админку',
+};
+
+const buttonRefusal = (s: ShortStatus | undefined): string => (s && BUTTON_REFUSALS[s]) || 'Ролик уже обработан';
 const quoted = (v: ShortVideo): string => (v.title?.trim() ? ` «${v.title.trim()}»` : '');
+
+/** Размер файла для владельца: «51 МБ», «50,1 МБ». Вверх: 50,04 МБ не должен назваться «50 МБ — больше 50 МБ». */
+function megabytes(bytes: number): string {
+  return String(Math.ceil((bytes / (1024 * 1024)) * 10) / 10).replace('.', ',');
+}
 
 /** Последние слова заказа — чтобы владелец видел, дошёл ли текст до конца (как caseAccepted блога). */
 function ending(text: string): string {
@@ -69,21 +111,33 @@ export class ShortsApprovalService {
       this.logger.warn(`BLOG_APPROVER_TG_ID не задан — сообщить некому: ${text}`);
       return;
     }
+    await this.deliver(chatId, text);
+  }
+
+  /** То же без исключений, но с итогом: false — Telegram сообщение не принял (причина — в лог). */
+  private async deliver(chatId: number, text: string): Promise<boolean> {
     try {
       await this.tg.sendMessage(chatId, text);
+      return true;
     } catch (e: any) {
       this.logger.warn(`не смог написать ${chatId}: ${e.message}`);
+      return false;
     }
   }
 
   /**
    * Собранный ролик без сообщения — владельцу, по одному на вызов. Захват с
    * арендой: два процесса API не пришлют один ролик дважды, а сорвавшаяся
-   * отправка повторится через REVIEW_LEASE_MINUTES.
+   * отправка повторится, когда аренда истечёт. Попытки считает захват
+   * (в pending_review счётчик больше никто не ведёт; новая версия от студии,
+   * замечание, «Переснять» и удачная отправка его обнуляют).
+   *
+   * Токен захвата — lease_until текстом: Date потерял бы микросекунды, и
+   * сравнение в записи не сошлось бы никогда.
    */
   async sendPendingReviews(): Promise<void> {
     const r = await this.pg.query(
-      `UPDATE short_video SET lease_until = now() + make_interval(mins => $1), updated_at = now()
+      `UPDATE short_video SET lease_until = now() + make_interval(mins => $1), attempts = attempts + 1, updated_at = now()
         WHERE id = (
           SELECT id FROM short_video
            WHERE status = 'pending_review' AND review_message_id IS NULL
@@ -91,25 +145,65 @@ export class ShortsApprovalService {
            ORDER BY created_at
            LIMIT 1
            FOR UPDATE SKIP LOCKED)
-        RETURNING *`,
+        RETURNING *, lease_until::text AS lease_token`,
       [REVIEW_LEASE_MINUTES],
     );
     if (!r.rows.length) return;
     const v = rowToShort(r.rows[0]);
+    const leaseToken: string | null = r.rows[0].lease_token ?? null;
     try {
-      await this.sendForReview(v);
+      await this.sendForReview(v, leaseToken);
     } catch (e: any) {
-      this.logger.error(`ролик ${v.id} владельцу не ушёл: ${e.message} — повторю через ${REVIEW_LEASE_MINUTES} мин`);
+      await this.reviewSendFailed(v, leaseToken, e);
     }
   }
 
-  /** Видео байтами с обложкой и кнопками; подписи, не влезшие в 1000 знаков, — вторым сообщением. */
-  async sendForReview(v: ShortVideo): Promise<void> {
-    const chatId = approverChatId();
-    if (!chatId) {
-      this.logger.warn(`ролик ${v.id} готов, но BLOG_APPROVER_TG_ID не задан — показать некому`);
+  /**
+   * Сбой отправки. До REVIEW_SEND_ALERT_AFTER — тихий повтор по истечении
+   * аренды. На попытке ровно REVIEW_SEND_ALERT_AFTER — одно сообщение
+   * владельцу (иначе он не узнал бы, что ролик собран, а слот проходит), с неё
+   * и дальше — пауза в час: файл больше 50 МБ или пропавший в MinIO повтором
+   * каждые четверть часа не лечится, а качать и заливать видео заново дорого.
+   *
+   * Пауза пишется по токену захвата. Не записалась — ролик изменился (новая
+   * версия, замечание) или его забрал другой процесс: о старой попытке
+   * владельцу не пишем.
+   */
+  private async reviewSendFailed(v: ShortVideo, leaseToken: string | null, e: any): Promise<void> {
+    const reason = String(e?.message ?? e).trim().replace(/[.\s]+$/, '') || 'причина не записана';
+    if (v.attempts < REVIEW_SEND_ALERT_AFTER) {
+      this.logger.error(`ролик ${v.id} владельцу не ушёл (попытка ${v.attempts}): ${reason} — повторю через ${REVIEW_LEASE_MINUTES} мин`);
       return;
     }
+    const r = await this.pg.query(
+      `UPDATE short_video SET lease_until = now() + make_interval(mins => $3), last_error = $4, updated_at = now()
+        WHERE id = $1 AND status = 'pending_review' AND review_message_id IS NULL AND lease_until = $2::timestamptz`,
+      [v.id, leaseToken, REVIEW_SEND_PAUSE_MINUTES, clip(`отправка владельцу: ${reason}`, 1000)],
+    );
+    if (r.rowCount === 0) {
+      this.logger.warn(`ролик ${v.id}: отправка не удалась (${reason}), но ролик уже изменился или его забрал другой процесс — паузу не записал`);
+      return;
+    }
+    this.logger.error(`ролик ${v.id} владельцу не ушёл (попытка ${v.attempts}): ${reason} — повторю через ${REVIEW_SEND_PAUSE_MINUTES} мин`);
+    if (v.attempts === REVIEW_SEND_ALERT_AFTER) {
+      await this.notify(
+        approverChatId(),
+        `${isStand() ? STAND_MARK : ''}Ролик${quoted(v)} готов, но прислать его на проверку не смог: ${clip(reason, 600)}. Повторяю раз в час.`,
+      );
+    }
+  }
+
+  /**
+   * Видео байтами с обложкой и кнопками; подписи, не влезшие в 1000 знаков, —
+   * вторым сообщением. Сообщение записывается в ролик по токену захвата и
+   * только поверх пустого review_message_id: опоздавший процесс (видео v1)
+   * иначе записал бы своё сообщение поверх сообщения соседа или поверх новой
+   * версии v2 — и «Одобрить» под видео v1 отправило бы в канал v2, которую
+   * владелец не видел, а сама v2 владельцу не ушла бы никогда.
+   */
+  async sendForReview(v: ShortVideo, leaseToken: string | null): Promise<void> {
+    const chatId = approverChatId();
+    if (!chatId) throw new Error('BLOG_APPROVER_TG_ID не задан — показать ролик некому');
     if (!v.videoKey || !v.coverKey || !v.captions || !v.scene) {
       throw new Error('у ролика нет файла, обложки, подписей или сцены');
     }
@@ -118,6 +212,9 @@ export class ShortsApprovalService {
       this.storage.download({ bucket, key: v.videoKey }),
       this.storage.download({ bucket, key: v.coverKey }),
     ]);
+    if (video.length > TG_UPLOAD_MAX_BYTES) {
+      throw new Error(`файл ролика ${megabytes(video.length)} МБ — больше 50 МБ, Telegram его не примет`);
+    }
     const now = new Date();
     const when = v.slotAt && v.slotAt.getTime() > now.getTime()
       ? formatSlotWhen(v.slotAt, now)
@@ -134,18 +231,44 @@ export class ShortsApprovalService {
     const msg: any = await this.tg.sendVideo(chatId, video, {
       caption,
       reply_markup: buildReviewKeyboard(v.id),
-      thumbnail: new InputFile(cover, 'cover.jpg'),
+      // Обложка — cover (Bot API 8.3): thumbnail Telegram берёт только JPEG ≤ 200 КБ
+      // и ≤ 320 px, кадр 1080×1920 он молча проигнорировал бы.
+      cover: new InputFile(cover, 'cover.jpg'),
       supports_streaming: true,
       width: 1080,
       height: 1920,
       ...(v.durationMs ? { duration: Math.round(v.durationMs / 1000) } : {}),
     });
-    if (extra) await this.tg.sendMessage(chatId, extra);
-    await this.pg.query(
-      `UPDATE short_video SET review_chat_id = $2, review_message_id = $3, lease_until = NULL, updated_at = now()
-        WHERE id = $1 AND status = 'pending_review'`,
-      [v.id, chatId, Number(msg.message_id)],
+    const messageId = Number(msg.message_id);
+    // Сразу после видео: упади что-то дальше, повтор прислал бы видео второй раз.
+    // attempts = 0 — счётчик отправки не уходит в публикацию (одобрение его не трогает).
+    const w = await this.pg.query(
+      `UPDATE short_video SET review_chat_id = $2, review_message_id = $3, lease_until = NULL, attempts = 0, last_error = NULL, updated_at = now()
+        WHERE id = $1 AND status = 'pending_review' AND review_message_id IS NULL AND lease_until = $4::timestamptz`,
+      [v.id, chatId, messageId, leaseToken],
     );
+    if (w.rowCount === 0) {
+      // Видео уже у владельца, но его кнопки устарели: решение — под сообщением, что записано в ролике.
+      this.logger.warn(`ролик ${v.id}: отправку перехватили / ролик изменился — сообщение ${messageId} не записал`);
+      return;
+    }
+    if (extra) await this.sendExtraCaptions(v, chatId, extra);
+  }
+
+  /**
+   * Подписи вторым сообщением — уже после записи ролика, и их сбой отправку не
+   * роняет: видео у владельца, повторять его незачем. Ответ на «Подписи к
+   * ролику» — самое естественное место для замечания к подписям, поэтому id —
+   * в приглашения к замечанию. Длинные подписи клиент режет на куски и отдаёт
+   * последний — его id и запоминаем.
+   */
+  private async sendExtraCaptions(v: ShortVideo, chatId: number, extra: string): Promise<void> {
+    try {
+      const sent: any = await this.tg.sendMessage(chatId, extra);
+      await this.rememberPrompt(v.id, 'note_prompt_ids', Number(sent.message_id));
+    } catch (e: any) {
+      this.logger.warn(`ролик ${v.id}: подписи вторым сообщением не ушли: ${e.message}`);
+    }
   }
 
   /** @returns true, если кнопка наша и обработана */
@@ -167,9 +290,12 @@ export class ShortsApprovalService {
     // Кнопки проверки действуют только под тем сообщением, что сейчас на проверке.
     // После «Переснять» и замечания кнопки старого сообщения остаются, а студия,
     // собрав новую версию, обнуляет review_message_id: «Одобрить» под старым
-    // отправил бы в канал версию, которую владелец не видел.
-    if (parsed.action !== 'yt' && Number(cb?.message?.message_id) !== v.reviewMessageId) {
-      await this.answer(cb, 'Это сообщение устарело: ролик переделан, решение — под свежим сообщением');
+    // отправил бы в канал версию, которую владелец не видел. Сверяется и чат:
+    // номера сообщений уникальны только внутри чата, а ответ на приглашение к
+    // замечанию узнаётся по паре «чат проверки + id».
+    const stale = Number(cb?.message?.message_id) !== v.reviewMessageId || Number(cb?.message?.chat?.id) !== v.reviewChatId;
+    if (parsed.action !== 'yt' && stale) {
+      await this.answer(cb, 'Это сообщение устарело — решение под последним сообщением с роликом');
       return true;
     }
     switch (parsed.action) {
@@ -194,7 +320,7 @@ export class ShortsApprovalService {
 
   private async approve(v: ShortVideo, cb: any, chatId: number): Promise<void> {
     if (v.status !== 'pending_review') {
-      await this.answer(cb, `Ролик уже обработан: ${v.status}`);
+      await this.answer(cb, buttonRefusal(v.status));
       return;
     }
     let approved: { slot: Date; now: Date } | null;
@@ -222,20 +348,30 @@ export class ShortsApprovalService {
    * из approved: одобренный ролик освобождает слот и теряет одобрение
    * (`approved_at = NULL`) — новую версию человек ещё не видел. Запись — с
    * условием на статус: пока сообщение висело, ролик мог уйти в публикацию.
+   *
+   * И с условием, что ролик ещё нигде не вышел: между попытками публикации он
+   * лежит в approved, а пост в канале уже есть. «Переснять» тогда отправил бы
+   * новую версию только в YouTube (в канале осталась бы старая), а «Отклонить»
+   * сделал бы rejected ролик с живым постом. Условие — в самом UPDATE, а не
+   * чтением перед ним: публикация могла выйти между чтением и записью.
    */
   private async leave(v: ShortVideo, cb: any, chatId: number, target: 'directing' | 'rejected'): Promise<void> {
     const from: ShortStatus[] = ['pending_review', 'approved'];
     if (!from.includes(v.status) || !canTransition(v.status, target)) {
-      await this.answer(cb, `Ролик уже обработан: ${v.status}`);
+      await this.answer(cb, buttonRefusal(v.status));
       return;
     }
     const r = await this.pg.query(
       `UPDATE short_video SET status = $2, approved_at = NULL, attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
-        WHERE id = $1 AND status = ANY($3::text[])`,
+        WHERE id = $1 AND status = ANY($3::text[])
+          AND NOT ${RELEASED_SQL}`,
       [v.id, target, from],
     );
     if (r.rowCount === 0) {
-      await this.answer(cb, 'Ролик уже обработан');
+      // Отличаем «уже вышел» от «уже обработан» чтением после неудачной записи.
+      const after = await this.pg.query(`SELECT status, ${RELEASED_SQL} AS released FROM short_video WHERE id = $1`, [v.id]);
+      const row = after.rows[0];
+      await this.answer(cb, row?.released ? 'Ролик уже вышел на площадке — переснять или отклонить нельзя' : buttonRefusal(row?.status));
       return;
     }
     if (target === 'directing') {
@@ -249,14 +385,10 @@ export class ShortsApprovalService {
 
   private async promptForNote(v: ShortVideo, cb: any, chatId: number): Promise<void> {
     if (v.status !== 'pending_review') {
-      await this.answer(cb, `Ролик уже обработан: ${v.status}`);
+      await this.answer(cb, noteRefusal(v.status));
       return;
     }
-    // Ответ узнаётся по паре «чат проверки + id приглашения»; приглашение в чужом чате узнать не по чему.
-    if (chatId !== v.reviewChatId) {
-      await this.answer(cb, 'Этот ролик на проверке в другом чате');
-      return;
-    }
+    // Чат уже сверен в handleCallback: приглашение уходит в чат проверки, и ответ на него узнаётся.
     await this.sendPrompt(v, 'note_prompt_ids', chatId, `Что поправить в ролике${quoted(v)}? Напишите ответом на это сообщение.`, v.reviewMessageId, NOTE_PLACEHOLDER);
     await this.answer(cb);
   }
@@ -289,11 +421,16 @@ export class ShortsApprovalService {
       ...(replyTo ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {}),
       reply_markup: { force_reply: true, input_field_placeholder: placeholder },
     });
+    await this.rememberPrompt(v.id, column, Number(prompt.message_id));
+  }
+
+  /** id сообщения — в конец списка ролика, не больше MAX_NOTE_PROMPTS последних. */
+  private async rememberPrompt(id: string, column: 'note_prompt_ids' | 'yt_prompt_ids', messageId: number): Promise<void> {
     await this.pg.query(
       `UPDATE short_video
           SET ${column} = (${column} || $2::bigint)[greatest(cardinality(${column}) + 2 - $3, 1):]
         WHERE id = $1`,
-      [v.id, Number(prompt.message_id), MAX_NOTE_PROMPTS],
+      [id, messageId, MAX_NOTE_PROMPTS],
     );
   }
 
@@ -407,7 +544,12 @@ export class ShortsApprovalService {
     return true;
   }
 
-  /** Упавшие ролики — владельцу, каждый один раз (захват по failure_notified). */
+  /**
+   * Упавшие ролики — владельцу, каждый один раз (захват по failure_notified).
+   * Telegram сообщение не принял — флаг назад, и из цикла вон: иначе тот же
+   * ролик забрался бы снова в этом же вызове. Повторит следующий тик.
+   * BLOG_APPROVER_TG_ID не задан — флаг остаётся: писать некому.
+   */
   async notifyFailures(limit = 5): Promise<void> {
     for (let i = 0; i < limit; i++) {
       const r = await this.pg.query(
@@ -423,10 +565,16 @@ export class ShortsApprovalService {
       if (!r.rows.length) return;
       const v = rowToShort(r.rows[0]);
       const what = v.failedFrom === 'publishing' ? 'не вышел на площадки' : 'не собрался';
-      await this.notify(
-        approverChatId(),
-        `${isStand() ? STAND_MARK : ''}Ролик${quoted(v)} ${what}: ${clip(v.lastError || 'причина не записана', 600)}\nПовторить можно из админки: retry.`,
-      );
+      const text = `${isStand() ? STAND_MARK : ''}Ролик${quoted(v)} ${what}: ${clip(v.lastError || 'причина не записана', 600)}\n`
+        + 'Повторить можно кнопкой «Повторить» в админке, раздел «Ролики».';
+      const owner = approverChatId();
+      if (!owner) {
+        await this.notify(null, text);
+        continue;
+      }
+      if (await this.deliver(owner, text)) continue;
+      await this.pg.query(`UPDATE short_video SET failure_notified = false WHERE id = $1 AND status = 'failed'`, [v.id]);
+      return;
     }
   }
 
