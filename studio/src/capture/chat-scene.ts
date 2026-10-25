@@ -6,12 +6,13 @@ import { toImageBoxes, type CssRect } from '../boxes';
 import type { StudioConfig } from '../config';
 import { StudioError } from '../errors';
 import { probeFile } from '../ffprobe';
+import { CAPTURE_SCALE, CAPTURE_VIEWPORT } from '../frame';
 import type { CaptureResult, Scene } from '../types';
 import type { Session } from './login';
 
-/** 360×640 при плотности 3 — ровно кадр 1080×1920. */
-export const VIEWPORT = { width: 360, height: 640 };
-export const SCALE = 3;
+/** Окно съёмки и плотность — из frame.ts: 360×640 при плотности 3 — ровно кадр 1080×1920. */
+export const VIEWPORT = CAPTURE_VIEWPORT;
+export const SCALE = CAPTURE_SCALE;
 /** Ответ готов, если он не меняется столько и в ленте нет признаков набора. */
 const STABLE_MS = 3000;
 const ANSWER_TIMEOUT_MS = 5 * 60_000;

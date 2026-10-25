@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { FRAME } from './frame';
 
 const run = promisify(execFile);
 
@@ -58,7 +59,7 @@ export interface VerifyLimits {
   maxSilenceSec: number;
 }
 
-export const SHORT_LIMITS: VerifyLimits = { minSec: 30, maxSec: 60, width: 1080, height: 1920, maxSilenceSec: 2 };
+export const SHORT_LIMITS: VerifyLimits = { minSec: 30, maxSec: 60, width: FRAME.width, height: FRAME.height, maxSilenceSec: 2 };
 
 /**
  * Проверка готового ролика. Тишина длиннее предела — значит, реплика не

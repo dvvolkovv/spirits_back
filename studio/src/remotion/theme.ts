@@ -1,10 +1,11 @@
 import { loadFont } from '@remotion/google-fonts/Nunito';
+import { FRAME } from '../frame';
 
 // Nunito — как в мультфильме Linkeon. Кириллица обязательна.
 export const { fontFamily } = loadFont('normal', { weights: ['700', '800', '900'], subsets: ['cyrillic', 'latin'] });
 
-export const W = 1080;
-export const H = 1920;
+export const W = FRAME.width;
+export const H = FRAME.height;
 /** Линия, на которую встаёт середина абзаца: выше субтитров и нижних кнопок площадок. */
 export const ANCHOR_Y = 760;
 

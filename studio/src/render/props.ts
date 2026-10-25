@@ -1,4 +1,6 @@
 import path from 'node:path';
+import { StudioError } from '../errors';
+import { FRAME } from '../frame';
 import { buildTimeline, FPS } from '../timeline';
 import type { TtsResult } from '../tts';
 import type { CaptureResult, Script, ShortProps, VoicedLine } from '../types';
@@ -9,6 +11,13 @@ import type { CaptureResult, Script, ShortProps, VoicedLine } from '../types';
  * ищет файлы в ней.
  */
 export function buildProps(capture: CaptureResult, script: Script, voiced: TtsResult[], runDir: string): ShortProps {
+  if (capture.answerShotWidth !== FRAME.width) {
+    throw new StudioError(
+      'frame_size',
+      `props: снимок ответа шириной ${capture.answerShotWidth} px, нужен ${FRAME.width} — съёмка шла не в кадре ${FRAME.width}×${FRAME.height}`,
+      false,
+    );
+  }
   const byId = new Map(voiced.map((v) => [v.id, v]));
   const lines: VoicedLine[] = script.lines.map((l) => {
     const v = byId.get(l.id);
