@@ -8,6 +8,11 @@ export const GAP_MS = 250;
 export const MIN_HOOK_MS = 2000;
 export const MIN_TOTAL_MS = 30_000;
 export const MAX_TOTAL_MS = 60_000;
+/**
+ * Реплика ответа короче — сцена не успевает: переезд к абзацу (MOVE, 15 кадров),
+ * появление рамки (10) и удержание приближения перед отпуском (10).
+ */
+export const MIN_ANSWER_LINE_MS = 1500;
 
 const ORDER: LineScene[] = ['hook', 'question', 'answer', 'final'];
 
@@ -32,6 +37,15 @@ export function buildTimeline(lines: VoicedLine[], fps = FPS): Timeline {
   }
   for (const s of ORDER) {
     if (!lines.some((l) => l.scene === s)) throw new StudioError('script_invalid', `timeline: в сцене ${s} нет реплик`, false);
+  }
+  for (const l of lines) {
+    if (l.scene === 'answer' && l.durationMs < MIN_ANSWER_LINE_MS) {
+      throw new StudioError(
+        'line_too_short',
+        `timeline: реплика ${l.id} звучит ${(l.durationMs / 1000).toFixed(1)} с — короче ${MIN_ANSWER_LINE_MS / 1000} с: приближение к абзацу не успеет`,
+        false,
+      );
+    }
   }
 
   const gap = msToFrames(GAP_MS, fps);

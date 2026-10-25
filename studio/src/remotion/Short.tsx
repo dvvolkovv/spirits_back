@@ -15,7 +15,7 @@ export const Short: React.FC<ShortProps> = (p) => {
         <Hook hook={p.hook} questionShot={p.questionShot} />
       </Sequence>
       <Sequence from={scenes.question.from} durationInFrames={scenes.question.duration}>
-        <Question questionShot={p.questionShot} durationInFrames={scenes.question.duration} />
+        <Question questionShot={p.questionShot} durationInFrames={scenes.question.duration} badge={p.badge} />
       </Sequence>
       <Sequence from={scenes.answer.from} durationInFrames={scenes.answer.duration}>
         <Answer

@@ -27,6 +27,7 @@ export function buildProps(capture: CaptureResult, script: Script, voiced: TtsRe
   return {
     fps: FPS,
     hook: script.hook,
+    badge: script.badge,
     questionShot: capture.questionShot,
     answerShot: capture.answerShot,
     answerShotHeight: capture.answerShotHeight,

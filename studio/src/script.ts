@@ -25,6 +25,11 @@ export function validateScript(script: Script, capture: Pick<CaptureResult, 'box
       problems.push(`реплика ${l.id} сцены ${l.scene} не должна ссылаться на абзац`);
     }
   }
+  if (script.hookBox != null && !known.has(script.hookBox)) {
+    problems.push(`зацепка опирается на абзац ${script.hookBox}, а снято абзацев: ${capture.boxes.length}`);
+  }
+  const count = script.final?.assistantsCount;
+  if (!Number.isInteger(count) || count <= 0) problems.push('в финале нет числа ассистентов (final.assistantsCount)');
   const hookLine = script.lines.find((l) => l.scene === 'hook');
   if (hookLine && hookLine.text.trim() !== hook) problems.push('текст реплики hook должен совпадать с зацепкой');
   return problems;

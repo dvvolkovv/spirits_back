@@ -55,6 +55,10 @@ export interface ScriptLine {
 
 export interface Script {
   hook: string;
+  /** Абзац, на котором держится смелая фраза зацепки (правило текста 10). */
+  hookBox?: number;
+  /** Подпись в кадре вопроса — у реального кейса. */
+  badge?: string;
   /** Голос ассистента — из src/speech/voices.ts бэкенда. */
   voice: string;
   speed?: number;
@@ -96,6 +100,7 @@ export interface Timeline {
 export type ShortProps = {
   fps: number;
   hook: string;
+  badge?: string;
   questionShot: string;
   answerShot: string;
   answerShotHeight: number;
