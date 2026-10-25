@@ -1,5 +1,13 @@
 import { ChatService } from './chat.service';
-import { platformGuide, platformSections, TOOLS_LIST_NOTE } from './platform-guide';
+import {
+  customAssistantHelpLine,
+  INITIATIVE_RULE,
+  linkeonHelpPrompt,
+  platformGuide,
+  platformSections,
+  telegramPlatformGuide,
+  TOOLS_LIST_NOTE,
+} from './platform-guide';
 import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
 
 /**
@@ -24,6 +32,7 @@ describe('текст блока', () => {
       '«Telegram-боты»', '«Продукты»', '«Мой профиль»', '«Мой бизнес»', '«Настройки»',
       '«Календари»', '«Уведомления на этом устройстве»', '«Голоса ассистентов»',
       '«Партнёры»', '«Помощь»', '«Связаться с поддержкой»',
+      '«Zoom»', '«Мои напоминания»', '«Способы входа»',
     ]) {
       expect(g).toContain(label);
     }
@@ -79,6 +88,81 @@ describe('текст блока', () => {
       const g = platformGuide(lang);
       expect(g).not.toContain('view=tokens');
       expect(g).not.toMatch(/пополн|оплат|YooKassa|₽/i);
+    }
+  });
+});
+
+const HELP = 'mcp__products__linkeon_help';
+
+describe('справка и инициатива', () => {
+  it('с инструментом: подробности — из справки, не по памяти; справка главнее персоны', () => {
+    const g = flat(platformGuide('ru', { helpTool: HELP }));
+    expect(g).toContain(HELP);
+    expect(g).toMatch(/не по памяти/);
+    expect(g).toMatch(/справка главнее того, что о платформе сказано в твоей персоне/);
+    expect(g).toContain('«Связаться с поддержкой»');
+    expect(g).not.toMatch(/Чего в списке нет, не выдумывай/);
+  });
+
+  it('без инструмента — прежнее вступление (приветствие Маши, где инструмента нет)', () => {
+    expect(platformGuide('ru')).not.toContain(HELP);
+    expect(flat(platformGuide('ru'))).toMatch(/Чего в списке нет, не выдумывай/);
+  });
+
+  it('правило инициативы — только по запросу', () => {
+    expect(platformGuide('ru', { initiative: true })).toContain(INITIATIVE_RULE);
+    expect(platformGuide('ru')).not.toContain(INITIATIVE_RULE);
+    expect(flat(INITIATIVE_RULE)).toMatch(/одной фразой/);
+    expect(flat(INITIATIVE_RULE)).toMatch(/не повторяй/);
+    expect(flat(INITIATIVE_RULE)).toMatch(/кризисной ситуации/);
+  });
+
+  it('стор: без партнёрской программы — она про деньги', () => {
+    expect(platformSections('ru', { store: true })).not.toMatch(/«Партнёры»|«Пригласи друга»/);
+    expect(platformSections('ru')).toContain('«Партнёры»');
+  });
+
+  it('новые строки карты: Zoom, напоминания, способы входа, мини-приложение', () => {
+    const s = flat(platformSections('ru'));
+    expect(s).toContain('«Zoom»');
+    expect(s).toContain('«Мои напоминания»');
+    expect(s).toContain('«Способы входа»');
+    expect(s).toMatch(/внутри Telegram/);
+  });
+
+  it('свой ассистент — одна строка про справку, без карты', () => {
+    const line = customAssistantHelpLine(HELP);
+    expect(line).toContain(HELP);
+    expect(line).toMatch(/не по памяти/);
+    expect(line).not.toContain('ЧТО ЕСТЬ В LINKEON');
+  });
+
+  it('блок для CLI Маши: правило справки и инициатива', () => {
+    const p = linkeonHelpPrompt('ru', HELP);
+    expect(p).toMatch(/^СПРАВКА О LINKEON/);
+    expect(p).toContain(HELP);
+    expect(p).toContain(INITIATIVE_RULE);
+  });
+
+  it('Telegram: справка и инициатива — по запросу', () => {
+    expect(telegramPlatformGuide('ru', { helpTool: HELP, initiative: true })).toContain(INITIATIVE_RULE);
+    expect(telegramPlatformGuide('ru', { helpTool: HELP })).toContain(HELP);
+    expect(telegramPlatformGuide('ru', { helpTool: HELP })).not.toContain(INITIATIVE_RULE);
+    expect(telegramPlatformGuide('ru')).not.toContain(HELP);
+  });
+
+  it('ни в одном варианте — ни пополнения, ни оплаты', () => {
+    for (const lang of SUPPORTED_LANGUAGES) {
+      for (const g of [
+        platformGuide(lang, { helpTool: HELP, initiative: true }),
+        platformGuide(lang, { store: true }),
+        telegramPlatformGuide(lang, { helpTool: HELP, initiative: true }),
+        linkeonHelpPrompt(lang, HELP),
+      ]) {
+        expect(g).not.toContain('view=tokens');
+        expect(g).not.toMatch(/пополн|оплат|YooKassa|₽/i);
+        expect(g).not.toMatch(/undefined|«»/);
+      }
     }
   });
 });
