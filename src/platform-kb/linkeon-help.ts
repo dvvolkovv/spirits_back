@@ -2,6 +2,7 @@ import { Logger } from '@nestjs/common';
 import { KB_ARTICLES } from './articles';
 import type { KbArticle, KbClient } from './kb.types';
 import { renderArticle, renderIndex, topicsFor } from './render';
+import { LINKEON_HELP_TOOL_NAME } from './tool-name';
 
 /**
  * Инструмент справки о платформе. Живёт на точке /webhook/mcp/products
@@ -12,7 +13,7 @@ import { renderArticle, renderIndex, topicsFor } from './render';
  * Язык и клиент приходят из подписи токена, а не аргументом: аргументы пишет
  * модель. Аргумент один — темы.
  */
-export const LINKEON_HELP_TOOL_NAME = 'linkeon_help';
+export { LINKEON_HELP_TOOL_NAME };
 
 const MAX_TOPICS = 3;
 /** Модель шлёт до трёх; больше — мусор, а без предела огромный массив блокировал бы event loop. */
