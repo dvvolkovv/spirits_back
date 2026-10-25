@@ -1060,7 +1060,7 @@ export class ChatService {
 При первом приветствии кратко представься и упомяни других ассистентов. Используй только текст без таблиц.
 Картинки и видео ты в этом чате не генерируешь: таких инструментов у тебя нет (метафорические карты — другое дело, их показывает платформа). Если просят нарисовать или сгенерировать картинку, сделать видео или ролик — честно скажи, что сама этого не сделаешь, и предложи раздел «Генератор изображений» или «Видео» в меню либо переключиться на другого ассистента: у них такие инструменты есть. Никогда не пиши, что картинка или видео готовы или вот-вот будут.
 
-${platformGuide(userLanguage)}`;
+${platformGuide(userLanguage, { store: storeBuild })}`;
 
     // Стабильная часть (одинаковая между вызовами для одного агента) — кэшируется.
     // Волатильную (profileText) кладём ПОСЛЕ кэша, иначе изменение профиля юзера ломает префикс.
@@ -1187,7 +1187,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // (productsRelayFields), Маша — локальным CLI: тот же /webhook/mcp/products
     // по loopback, токен этого пользователя с каналом web — правки ложатся в
     // product_turns с channel='web'. Токен уходит в файл конфига 0600, не в argv.
-    const products = productsCliMcp(userId, 'web');
+    const products = productsCliMcp(userId, 'web', { lang: userLanguage, client: clientKind(storeBuild, ui), agent: 'staff' });
     // Звали ли в этом ходе инструмент продуктов — от этого зависит карта ниже.
     let usedProductsTool = false;
 
@@ -1223,7 +1223,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // блок написан по-русски.
           // Правило карточек — только клиенту, который их рисует; до хвоста
           // языка, который обязан остаться последним.
-          system: stableSystemPrompt + `\n\n${products.promptBlock}\n\n${FIND_FILES_CLI_PROMPT}` +
+          system: stableSystemPrompt + `\n\n${products.promptBlock}\n\n${FIND_FILES_CLI_PROMPT}\n\n${linkeonHelpPrompt(userLanguage, LINKEON_HELP_CLI_TOOL_NAME)}` +
             (ui.ask ? `\n\n${ASK_RULE}` : '') + volatileSystemPrompt + replyLanguageTail,
           // Модель Маши — общая с остальным чатом, см. common/chat-model.ts
           // (там же цена решения: пин не даунгрейдится при исчерпании лимита, и
@@ -1242,15 +1242,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // Автоодобрение — ровно инструменты точки продуктов. Встроенные тулы у Маши
           // по-прежнему выключены (tools не задан → `--tools ""`).
           // + поиск файлов прошлых разговоров (find-files.tool.ts) — у TG-бота
-          // его нет; + сообщить в поддержку (src/problem-report) — есть у обоих.
-          allowedTools: `${products.toolName},${FIND_FILES_CLI_TOOL_NAME},${REPORT_PROBLEM_CLI_TOOL_NAME}`,
+          // его нет; + сообщить в поддержку (src/problem-report) — есть у обоих;
+          // + справка о Linkeon (platform-kb).
+          allowedTools: `${products.toolName},${FIND_FILES_CLI_TOOL_NAME},${REPORT_PROBLEM_CLI_TOOL_NAME},${LINKEON_HELP_CLI_TOOL_NAME}`,
           // onProgress переводит CLI в stream-json: только так видно, звали ли
           // инструмент продуктов в этом ходе (итог в формате json этого не несёт).
           onProgress: (ev) => {
             // Карта не подмешивается и к ходу с поиском файлов или с сообщением в
             // поддержку: «карточка», «картинка» о найденных файлах, «не проходит
-            // оплата картой» в жалобе — не повод вешать метафорическую карту.
-            if (ev.kind === 'tool_use' && (ev.name === products.toolName || ev.name === FIND_FILES_CLI_TOOL_NAME || ev.name === REPORT_PROBLEM_CLI_TOOL_NAME)) usedProductsTool = true;
+            // оплата картой» в жалобе — не повод вешать метафорическую карту;
+            // и к ходу со справкой: вопрос о платформе — не повод для метафорической карты.
+            if (ev.kind === 'tool_use' && (ev.name === products.toolName || ev.name === FIND_FILES_CLI_TOOL_NAME || ev.name === REPORT_PROBLEM_CLI_TOOL_NAME || ev.name === LINKEON_HELP_CLI_TOOL_NAME)) usedProductsTool = true;
             // Шаг работы для клиента, который его рисует. Аргументов onProgress
             // не отдаёт — хватает имени: у Маши только инструменты точки продуктов.
             // Для новых инструментов понадобится input — onProgress его не отдаёт.
