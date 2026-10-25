@@ -73,7 +73,7 @@ describe('TgRouterService.generateReply: инструмент продуктов
     const opts = optsOf(claudeCli);
     expect(opts.mcpServers?.products?.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/webhook\/mcp\/products$/);
     const bearer = String(opts.mcpServers.products.headers?.Authorization ?? '');
-    expect(verifyProductToolToken(bearer.replace(/^Bearer /, ''))).toEqual({ userId: 'u-owner', channel: 'telegram' });
+    expect(verifyProductToolToken(bearer.replace(/^Bearer /, ''))).toEqual({ userId: 'u-owner', channel: 'telegram', turn: null });
   });
 
   it('с productsOwner: продукты и сообщение в поддержку в allowedTools, веб сохранён, встроенный набор прежний', async () => {

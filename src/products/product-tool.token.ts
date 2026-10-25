@@ -19,7 +19,15 @@ export type ProductToolChannel = 'web' | 'telegram';
 export interface ProductToolClaims {
   userId: string;
   channel: ProductToolChannel;
+  /**
+   * Метка хода чата, в котором выпущен токен. По ней чат-сервис в конце хода
+   * находит карточки, заведённые этим ходом. null — у старых токенов и у
+   * вызовов вне хода.
+   */
+  turn: string | null;
 }
+
+const TURN_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Сколько живёт токен — по каналу.
@@ -52,11 +60,16 @@ function previousSecret(): string | null {
  * Канал по умолчанию — web: так чеканит релей (веб-ассистенты), и так же
  * разбираются токены, выпущенные до появления канала.
  */
-export function signProductToolToken(userId: string, channel: ProductToolChannel = 'web'): string {
+export function signProductToolToken(userId: string, channel: ProductToolChannel = 'web', turn?: string): string {
   // Незнакомый канал — отказ: без срока jwt.sign выпустил бы вечный токен.
   const ttl = TTL_SECONDS[channel];
   if (!ttl) throw new Error(`Неизвестный канал: ${channel}`);
-  return jwt.sign({ userId, type: PRODUCT_TOOL_TOKEN_TYPE, channel }, secret(), { expiresIn: ttl });
+  if (turn !== undefined && !TURN_RE.test(turn)) throw new Error('Метка хода — не uuid');
+  return jwt.sign(
+    { userId, type: PRODUCT_TOOL_TOKEN_TYPE, channel, ...(turn ? { turn } : {}) },
+    secret(),
+    { expiresIn: ttl },
+  );
 }
 
 /**
@@ -85,10 +98,11 @@ export function verifyProductToolToken(token: string): ProductToolClaims {
   if (!userId || typeof userId !== 'string') {
     throw new Error('В токене нет владельца');
   }
+  const turn = typeof payload?.turn === 'string' && TURN_RE.test(payload.turn) ? payload.turn : null;
   const raw = payload?.channel;
-  if (raw === undefined || raw === null) return { userId, channel: 'web' };
+  if (raw === undefined || raw === null) return { userId, channel: 'web', turn };
   if (raw !== 'web' && raw !== 'telegram') {
     throw new Error(`Неизвестный канал в токене: ${raw}`);
   }
-  return { userId, channel: raw };
+  return { userId, channel: raw, turn };
 }

@@ -98,7 +98,7 @@ describe('Маша в вебе: инструмент продуктов', () => 
     const { opts } = await runMasha();
     const bearer = String(opts.mcpServers.products.headers?.Authorization ?? '');
     expect(bearer).toMatch(/^Bearer /);
-    expect(verifyProductToolToken(bearer.replace(/^Bearer /, ''))).toEqual({ userId: USER, channel: 'web' });
+    expect(verifyProductToolToken(bearer.replace(/^Bearer /, ''))).toEqual({ userId: USER, channel: 'web', turn: null });
   });
 
   it('автоодобрены ровно продукты, поиск файлов и сообщение в поддержку, встроенные тулы не включаются', async () => {

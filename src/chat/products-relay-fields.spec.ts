@@ -19,7 +19,7 @@ describe('поля инструмента продуктов для релея',
 
   it('токен разбирается обратно в того же пользователя', () => {
     const f = productsRelayFields('79030169187');
-    expect(verifyProductToolToken(f.products_token)).toEqual({ userId: '79030169187', channel: 'web' });
+    expect(verifyProductToolToken(f.products_token)).toEqual({ userId: '79030169187', channel: 'web', turn: null });
   });
 
   it('адрес точки — https и ведёт на /webhook/mcp/products', () => {

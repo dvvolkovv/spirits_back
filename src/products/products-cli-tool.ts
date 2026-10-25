@@ -87,14 +87,14 @@ export interface ProductsCliMcp {
  * (main.ts); путь — /webhook/mcp/products: исключение глобального префикса
  * покрывает только точный путь `mcp` (см. products-mcp.controller.ts).
  */
-export function productsCliMcp(userId: string, channel: ProductToolChannel): ProductsCliMcp {
+export function productsCliMcp(userId: string, channel: ProductToolChannel, turn?: string): ProductsCliMcp {
   const port = process.env.PORT || 3001;
   return {
     mcpServers: {
       [SERVER_KEY]: {
         type: 'http',
         url: `http://127.0.0.1:${port}/webhook/mcp/products`,
-        headers: { Authorization: `Bearer ${signProductToolToken(userId, channel)}` },
+        headers: { Authorization: `Bearer ${signProductToolToken(userId, channel, turn)}` },
         timeout: PRODUCTS_CLI_TOOL_TIMEOUT_MS,
       },
     },

@@ -16,6 +16,7 @@ describe('токен инструмента продуктов', () => {
     expect(verifyProductToolToken(signProductToolToken('79030169187'))).toEqual({
       userId: '79030169187',
       channel: 'web',
+      turn: null,
     });
   });
 
@@ -23,6 +24,7 @@ describe('токен инструмента продуктов', () => {
     expect(verifyProductToolToken(signProductToolToken('79030169187', 'telegram'))).toEqual({
       userId: '79030169187',
       channel: 'telegram',
+      turn: null,
     });
   });
 
@@ -30,7 +32,7 @@ describe('токен инструмента продуктов', () => {
   // релее до 30 минут после выката), обязаны работать дальше — это веб.
   it('токен без канала (выпущенный до правки) разбирается как web', () => {
     const legacy = jwt.sign({ userId: '79030169187', type: PRODUCT_TOOL_TOKEN_TYPE }, process.env.JWT_SECRET!);
-    expect(verifyProductToolToken(legacy)).toEqual({ userId: '79030169187', channel: 'web' });
+    expect(verifyProductToolToken(legacy)).toEqual({ userId: '79030169187', channel: 'web', turn: null });
   });
 
   // Незнакомый канал подписать можем только мы сами, то есть это ошибка в коде.

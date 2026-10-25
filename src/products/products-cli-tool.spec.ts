@@ -64,7 +64,7 @@ describe('инструмент продуктов для локального CL
     const r = productsCliMcp('79030169187', 'web');
     const bearer = bearerOf(r);
     expect(bearer).toMatch(/^Bearer \S+$/);
-    expect(verifyProductToolToken(bearer.replace(/^Bearer /, ''))).toEqual({ userId: '79030169187', channel: 'web' });
+    expect(verifyProductToolToken(bearer.replace(/^Bearer /, ''))).toEqual({ userId: '79030169187', channel: 'web', turn: null });
   });
 
   it('для Telegram токен несёт канал telegram', () => {
@@ -72,6 +72,7 @@ describe('инструмент продуктов для локального CL
     expect(verifyProductToolToken(bearerOf(r).replace(/^Bearer /, ''))).toEqual({
       userId: '70000000000',
       channel: 'telegram',
+      turn: null,
     });
   });
 

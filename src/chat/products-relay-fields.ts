@@ -16,10 +16,10 @@ import { signProductToolToken } from '../products/product-tool.token';
  * честно ответит «нет ни одного» — это дешевле, чем запрос в базу на каждом
  * ходе ради того, чтобы иногда не показать инструмент.
  */
-export function productsRelayFields(userId: string): { products_token: string; products_mcp_url: string } {
+export function productsRelayFields(userId: string, turn?: string): { products_token: string; products_mcp_url: string } {
   const base = (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '');
   return {
-    products_token: signProductToolToken(userId),
+    products_token: signProductToolToken(userId, 'web', turn),
     products_mcp_url: `${base}/webhook/mcp/products`,
   };
 }
