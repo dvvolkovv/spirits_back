@@ -19,7 +19,7 @@ const good = (): Script => ({
     { id: 'a1', scene: 'answer', text: 'Первая ловушка.', box: 1 },
     { id: 'f', scene: 'final', text: 'Ссылка в описании.', voice: 'alena' },
   ],
-  final: {},
+  final: { assistantsCount: 18 },
 });
 
 test('корректный сценарий проходит без замечаний', () => {
