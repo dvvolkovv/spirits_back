@@ -731,8 +731,12 @@ ${healthSummary}
     const client = await this.pg.getClient();
     try {
       await client.query('BEGIN');
+      // NO KEY UPDATE, а не UPDATE: перезапуски между собой он так же ставит в
+      // очередь, но не держит проверку внешних ключей на строку (video_jobs.
+      // source_video_id, tg_bot_video_jobs.job_id) — иначе вставка со ссылкой
+      // на эту задачу ждала бы нас, а мы её, и Postgres этого кольца не видит.
       const locked = await client.query(
-        `SELECT id, status FROM video_jobs WHERE id = $1 FOR UPDATE`,
+        `SELECT id, status FROM video_jobs WHERE id = $1 FOR NO KEY UPDATE`,
         [jobId],
       );
       if (locked.rows[0]?.status !== 'failed') {
@@ -761,8 +765,9 @@ ${healthSummary}
 
       // Строку новой задачи — тоже под блокировку: её провал (failAndRefund)
       // либо уже вернул списание, и тогда мы его не повторяем, либо дождётся
-      // нашего COMMIT и увидит наш возврат.
-      await client.query(`SELECT id FROM video_jobs WHERE id = $1 FOR UPDATE`, [created.jobId]);
+      // нашего COMMIT и увидит наш возврат. NO KEY UPDATE — по той же причине,
+      // что выше; с UPDATE в failAndRefund он конфликтует.
+      await client.query(`SELECT id FROM video_jobs WHERE id = $1 FOR NO KEY UPDATE`, [created.jobId]);
       const newCredit = (await jobCostRefunded(client, userId, created.jobId)) ? 0 : Number(created.tokensSpent);
       const originalCredit = (await jobCostRefunded(client, userId, jobId)) ? 0 : Number(job.tokens_spent);
       const totalCredit = newCredit + originalCredit;
@@ -805,11 +810,18 @@ ${healthSummary}
       );
       await client.query('COMMIT');
 
-      await this.insertMessage(
-        ticketId, 'system', null,
-        `🔁 Видео перезапущено. Новый job id: ${created.jobId.slice(0, 8)}. Следите за статусом в разделе «Видео». Токены не списаны (возврат ${totalCredit.toLocaleString('ru-RU')}).`,
-        { rerun: true, originalJobId: jobId, newJobId: created.jobId, credited: totalCredit }, true,
-      );
+      // После COMMIT перезапуск состоялся и деньги начислены — ответ только ok.
+      // Сбой сообщения в тикет не должен превратиться в credit_failed: по нему
+      // ИИ поддержки мог бы «добрать» возврат через refund_tokens.
+      try {
+        await this.insertMessage(
+          ticketId, 'system', null,
+          `🔁 Видео перезапущено. Новый job id: ${created.jobId.slice(0, 8)}. Следите за статусом в разделе «Видео». Токены не списаны (возврат ${totalCredit.toLocaleString('ru-RU')}).`,
+          { rerun: true, originalJobId: jobId, newJobId: created.jobId, credited: totalCredit }, true,
+        );
+      } catch (e: any) {
+        this.logger.warn(`rerun ${jobId} → ${created.jobId}: начислено, но сообщение в тикет ${ticketId} не записалось: ${e.message}`);
+      }
       return { ok: true, new_job_id: created.jobId, status: created.status, credited: totalCredit, new_balance: newBalance };
     } catch (e: any) {
       try { await client.query('ROLLBACK'); } catch {}
