@@ -18,7 +18,7 @@ const capture: CaptureResult = {
     { n: 1, top: 900, height: 300, text: 'a' },
     { n: 2, top: 2400, height: 300, text: 'b' },
   ],
-  assistantsCount: 18,
+  paragraphs: [{ n: 1, text: 'a' }, { n: 2, text: 'b' }],
 };
 
 const script: Script = {
@@ -31,12 +31,12 @@ const script: Script = {
     { id: 'a2', scene: 'answer', text: 'Вторая.', box: 2 },
     { id: 'f', scene: 'final', text: 'Ссылка в описании.', voice: 'alena' },
   ],
-  final: { disclaimer: 'Ответ ИИ, не заменяет специалиста' },
+  final: { assistantsCount: 18, disclaimer: 'Ответ ИИ, не заменяет специалиста' },
 };
 
 const ms: Record<string, number> = { h: 1500, q: 4000, a1: 12000, a2: 12000, f: 4000 };
 
-test('пропсы: пути озвучки относительно папки съёмки, финал из съёмки и сценария', () => {
+test('пропсы: пути озвучки относительно папки съёмки, финал — из сценария', () => {
   const voiced = script.lines.map((l) => ({ id: l.id, file: `/run/voice/${l.id}.mp3`, durationMs: ms[l.id] }));
   const p = buildProps(capture, script, voiced, '/run');
   assert.equal(p.timeline.segments[0].audio, 'voice/h.mp3');

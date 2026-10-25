@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { toImageBoxes } from './boxes';
+import { toAnswerLayout, toImageBoxes } from './boxes';
 
 test('переводит в пиксели картинки и нумерует сверху вниз', () => {
   const boxes = toImageBoxes(
@@ -44,4 +44,20 @@ test('блок за низом картинки не попадает в спи�
     1000,
   );
   assert.deepEqual(boxes.map((b) => b.text), ['есть']);
+});
+
+test('полный текст абзацев — с теми же номерами, без обрезки до 120', () => {
+  const long = `начало ${'x'.repeat(300)}`;
+  const { boxes, paragraphs } = toAnswerLayout(
+    [
+      { top: 300, height: 40, text: 'второй' },
+      { top: 100, height: 40, text: long },
+    ],
+    1,
+  );
+  assert.deepEqual(boxes.map((b) => b.n), [1, 2]);
+  assert.deepEqual(paragraphs.map((p) => p.n), [1, 2]);
+  assert.equal(paragraphs[0].text, long);
+  assert.equal(boxes[0].text.length, 120);
+  assert.equal(paragraphs[1].text, 'второй');
 });
