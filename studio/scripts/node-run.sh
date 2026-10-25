@@ -8,7 +8,9 @@
 # первого на flock до 5 минут, а не переключает коммит у него из-под ног. Команда
 # ограничена 30 минутами: зависший прогон не держит лок вечно.
 # Коды выхода: 75 — воркдерево занято (повторить позже), 2 — неверный вызов,
-# 1 — воркдерево ноды не встало на коммит, иначе — код самой команды.
+# 3 — воркдерево ноды не встало на коммит (команда не запускалась), 124 или 137 —
+# команда не уложилась в 30 минут, 255 — ssh (сброс по MaxStartups: повторить через
+# 1–2 минуты), иначе — код самой команды.
 set -euo pipefail
 [ $# -eq 1 ] || { echo 'usage: studio/scripts/node-run.sh "<команда>" — команда одной строкой в кавычках' >&2; exit 2; }
 cmd="$1"
@@ -27,9 +29,10 @@ case "$branch" in
   HEAD) echo "node-run.sh: HEAD отсоединён — встань на ветку задачи (git switch feat/promo-shorts)" >&2; exit 2 ;;
   main|master) echo "node-run.sh: из ${branch} не запускать — только из ветки задачи" >&2; exit 2 ;;
 esac
-# Незакоммиченное на ноду не уезжает: прогон проверит прежний код.
-if [ -n "$(git -C "$repo" status --porcelain --untracked-files=no)" ]; then
-  echo "node-run.sh: есть незакоммиченные правки — на ноду уедет только ${sha:0:7}" >&2
+# Незакоммиченное на ноду не уезжает: прогон проверит прежний код. Новые файлы тоже
+# считаются — забытый git add молча оставил бы новую сюиту вне прогона.
+if [ -n "$(git -C "$repo" status --porcelain)" ]; then
+  echo "node-run.sh: есть незакоммиченные правки или новые файлы — на ноду уедет только ${sha:0:7}" >&2
 fi
 echo "node-run.sh: ${sha:0:7} → ${dir}" >&2
 git -C "$repo" push -q origin "HEAD:refs/heads/${branch}"
@@ -46,6 +49,6 @@ ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
   "set -e
 exec 9>~/ci/wt/.promo-shorts.lock
 if ! flock -w 300 9; then echo 'node-run.sh: воркдерево занято другим прогоном дольше 5 минут, его владелец:' >&2; cat ~/ci/wt/.promo-shorts.owner >&2 2>/dev/null || true; exit 75; fi
-echo \"\$(date -Is) ${sha:0:7} ${dir}\" > ~/ci/wt/.promo-shorts.owner
-{ cd ~/ci/wt/promo-shorts && timeout 120 git fetch -q origin 'refs/heads/${branch}' && test -z \"\$(git status --porcelain --untracked-files=no)\" && git checkout -q --detach ${sha} && cd ${dir} && source ~/.nvm/nvm.sh >/dev/null; } || { echo 'node-run.sh: воркдерево ноды не встало на ${sha:0:7} (fetch, незакоммиченное в дереве ноды или checkout)' >&2; git -C ~/ci/wt/promo-shorts status --short >&2 || true; exit 1; }
+echo \"\$(date -Is) ${sha:0:7} ${dir} pid \$\$\" > ~/ci/wt/.promo-shorts.owner
+{ cd ~/ci/wt/promo-shorts && timeout 120 git fetch -q origin 'refs/heads/${branch}' && test -z \"\$(git status --porcelain --untracked-files=no)\" && git checkout -q --detach ${sha} && cd ${dir} && source ~/.nvm/nvm.sh >/dev/null; } || { echo 'node-run.sh: воркдерево ноды не встало на ${sha:0:7} (fetch, незакоммиченное в дереве ноды или checkout)' >&2; git -C ~/ci/wt/promo-shorts status --short >&2 || true; exit 3; }
 exec timeout -k 30 1800 bash -ec ${q}"

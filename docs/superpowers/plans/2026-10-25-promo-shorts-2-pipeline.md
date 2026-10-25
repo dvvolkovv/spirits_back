@@ -37,7 +37,7 @@
 - **Живой чекаут `~/spirits_back` на ноде не трогать:** из него работает test.linkeon.io. Из его `.env` можно только читать.
 - **Ничего не выкатывать и не вливать в main** до задачи 36. Там и слияние, и выкат — только с явного OK владельца.
 - **Ревьюерам-субагентам:** никаких `git checkout` и `git switch` в общем воркдереве. «Красное» состояние смотреть через `git show <sha>:<путь>`.
-- **SSH к ноде — через одно мастер-соединение.** sshd ноды рвёт новые подключения по `MaxStartups 10:30:100` (`Connection closed by 85.192.61.231 port 22`): её постоянно перебирают боты. Поэтому все `ssh` и `scp` в плане идут с `-o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m`: первое подключение становится мастером, остальные идут через него. Если сбрасывает и первое, повторить через 1–2 минуты, а не петлёй каждые несколько секунд — петля только добавляет подключений к потолку. После задачи 0 `node-run.sh` сам ждёт соседний прогон на flock (до 5 минут, потом выходит с кодом 75 и показывает, чей прогон держит лок — тогда повторить позже). Команда на ноде ограничена 30 минутами. Bash-вызов агента живёт до 10 минут, поэтому долгие прогоны (`npm ci` с jest, сквозной рендер, рабочий процесс студии) запускать с `run_in_background` или `timeout: 600000`.
+- **SSH к ноде — через одно мастер-соединение.** sshd ноды рвёт новые подключения по `MaxStartups 10:30:100` (`Connection closed by 85.192.61.231 port 22`): её постоянно перебирают боты. Поэтому все `ssh` и `scp` в плане идут с `-o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m`: первое подключение становится мастером, остальные идут через него. Если сбрасывает и первое, повторить через 1–2 минуты, а не петлёй каждые несколько секунд — петля только добавляет подключений к потолку. После задачи 0 `node-run.sh` сам ждёт соседний прогон на flock (до 5 минут, потом выходит с кодом 75 и показывает, чей прогон держит лок — тогда повторить позже). Команда на ноде ограничена 30 минутами. Bash-вызов агента по умолчанию живёт 2 минуты (10 минут — потолок и только с явным `timeout`), а одно ожидание лока — до 5 минут. Поэтому любой вызов `node-run.sh` — с `timeout: 600000`, долгие прогоны (`npm ci` с jest, сквозной рендер, рабочий процесс студии) — с `run_in_background`. Код 3 — воркдерево ноды не встало на коммит и команда не запускалась: это не «ожидаемый красный» шага TDD. В файле владельца лока записан `pid` — зависший прогон снимается `kill <pid>` на ноде.
 - **Коммиты** — по-русски, с префиксом (`feat(shorts):`, `test(shorts):`, `feat(studio):`, `fix(...)`). Последняя строка каждого сообщения — `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`.
 - **Кириллица и эмодзи пишутся в файлы как есть.** Escape-последовательностей вида `\uXXXX` в коде нет и не вводить: инструмент записи их портит.
 
@@ -135,7 +135,9 @@ Expected: число больше нуля (файлы `studio/src/**` в спи
 # первого на flock до 5 минут, а не переключает коммит у него из-под ног. Команда
 # ограничена 30 минутами: зависший прогон не держит лок вечно.
 # Коды выхода: 75 — воркдерево занято (повторить позже), 2 — неверный вызов,
-# 1 — воркдерево ноды не встало на коммит, иначе — код самой команды.
+# 3 — воркдерево ноды не встало на коммит (команда не запускалась), 124 или 137 —
+# команда не уложилась в 30 минут, 255 — ssh (сброс по MaxStartups: повторить через
+# 1–2 минуты), иначе — код самой команды.
 set -euo pipefail
 [ $# -eq 1 ] || { echo 'usage: studio/scripts/node-run.sh "<команда>" — команда одной строкой в кавычках' >&2; exit 2; }
 cmd="$1"
@@ -154,9 +156,10 @@ case "$branch" in
   HEAD) echo "node-run.sh: HEAD отсоединён — встань на ветку задачи (git switch feat/promo-shorts)" >&2; exit 2 ;;
   main|master) echo "node-run.sh: из ${branch} не запускать — только из ветки задачи" >&2; exit 2 ;;
 esac
-# Незакоммиченное на ноду не уезжает: прогон проверит прежний код.
-if [ -n "$(git -C "$repo" status --porcelain --untracked-files=no)" ]; then
-  echo "node-run.sh: есть незакоммиченные правки — на ноду уедет только ${sha:0:7}" >&2
+# Незакоммиченное на ноду не уезжает: прогон проверит прежний код. Новые файлы тоже
+# считаются — забытый git add молча оставил бы новую сюиту вне прогона.
+if [ -n "$(git -C "$repo" status --porcelain)" ]; then
+  echo "node-run.sh: есть незакоммиченные правки или новые файлы — на ноду уедет только ${sha:0:7}" >&2
 fi
 echo "node-run.sh: ${sha:0:7} → ${dir}" >&2
 git -C "$repo" push -q origin "HEAD:refs/heads/${branch}"
@@ -173,8 +176,8 @@ ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
   "set -e
 exec 9>~/ci/wt/.promo-shorts.lock
 if ! flock -w 300 9; then echo 'node-run.sh: воркдерево занято другим прогоном дольше 5 минут, его владелец:' >&2; cat ~/ci/wt/.promo-shorts.owner >&2 2>/dev/null || true; exit 75; fi
-echo \"\$(date -Is) ${sha:0:7} ${dir}\" > ~/ci/wt/.promo-shorts.owner
-{ cd ~/ci/wt/promo-shorts && timeout 120 git fetch -q origin 'refs/heads/${branch}' && test -z \"\$(git status --porcelain --untracked-files=no)\" && git checkout -q --detach ${sha} && cd ${dir} && source ~/.nvm/nvm.sh >/dev/null; } || { echo 'node-run.sh: воркдерево ноды не встало на ${sha:0:7} (fetch, незакоммиченное в дереве ноды или checkout)' >&2; git -C ~/ci/wt/promo-shorts status --short >&2 || true; exit 1; }
+echo \"\$(date -Is) ${sha:0:7} ${dir} pid \$\$\" > ~/ci/wt/.promo-shorts.owner
+{ cd ~/ci/wt/promo-shorts && timeout 120 git fetch -q origin 'refs/heads/${branch}' && test -z \"\$(git status --porcelain --untracked-files=no)\" && git checkout -q --detach ${sha} && cd ${dir} && source ~/.nvm/nvm.sh >/dev/null; } || { echo 'node-run.sh: воркдерево ноды не встало на ${sha:0:7} (fetch, незакоммиченное в дереве ноды или checkout)' >&2; git -C ~/ci/wt/promo-shorts status --short >&2 || true; exit 3; }
 exec timeout -k 30 1800 bash -ec ${q}"
 ```
 
@@ -7990,7 +7993,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 ```bash
 "$WT/studio/scripts/node-run.sh" "npm install --no-audit --no-fund >&2 && cat package-lock.json && git checkout -- package-lock.json" > "$WT/studio/package-lock.json.new"
-python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('pg' in d['packages']['']['dependencies'], '@aws-sdk/client-s3' in d['packages']['']['dependencies'])" "$WT/studio/package-lock.json.new" && mv "$WT/studio/package-lock.json.new" "$WT/studio/package-lock.json"
+python3 -c "import json,sys; d=json.load(open(sys.argv[1])); ok=('pg' in d['packages']['']['dependencies'], '@aws-sdk/client-s3' in d['packages']['']['dependencies']); print(*ok); sys.exit(0 if all(ok) else 1)" "$WT/studio/package-lock.json.new" && mv "$WT/studio/package-lock.json.new" "$WT/studio/package-lock.json"
 git -C "$WT" add studio/package-lock.json
 git -C "$WT" commit -m "build(studio): lock-файл с pg и @aws-sdk/client-s3
 
@@ -9085,7 +9088,8 @@ ADMIN_API_URL=http://127.0.0.1:3001
 
 ```bash
 studio/scripts/node-run.sh "npm run worker -- --once"   # одно задание и выход
-studio/scripts/node-run.sh "npm run worker"             # цикл (на проде — PM2, план 3)
+# Цикл (npm run worker) — не через node-run: он держал бы лок воркдерева 30 минут.
+# Цикл живёт под PM2 (план 3).
 ```
 
 - Захват — `FOR UPDATE SKIP LOCKED` с арендой 30 минут: задание упавшего
@@ -9111,7 +9115,7 @@ studio/scripts/node-run.sh "npx tsx scripts/stand-admin.ts start_now id=<uuid>"
 Run: `studio/scripts/node-run.sh "npx tsc --noEmit && npm test && npx tsc --noEmit --module ES2022 --moduleResolution bundler --target ES2022 --strict --skipLibCheck --types node scripts/stand-admin.ts"`
 Expected: без вывода ошибок; `# fail 0`. `tsconfig.json` студии включает только `src/`, поэтому скрипт проверяется отдельной командой.
 
-Run: `studio/scripts/node-run.sh "DOTENV_CONFIG_PATH=/dev/null DEMO_PHONE=79030000001 DEBUG_SECRET=x YANDEX_SPEECHKIT_API_KEY=x YANDEX_TTS_FOLDER_ID=x npm run worker -- --once; echo EXIT=\$?"`
+Run: `studio/scripts/node-run.sh "DOTENV_CONFIG_PATH=/dev/null DEMO_PHONE=79030000001 DEBUG_SECRET=x YANDEX_SPEECHKIT_API_KEY=x YANDEX_TTS_FOLDER_ID=x npm run worker -- --once || echo EXIT=\$?"`
 Expected: падение с `studio: не задана переменная DATABASE_URL` и `EXIT=1` — без базы процесс не стартует молча. `DOTENV_CONFIG_PATH=/dev/null` не даёт `dotenv` подставить базу из `studio/.env`: иначе проверка забрала бы настоящее задание стенда.
 
 - [ ] **Step 6: Коммит**
