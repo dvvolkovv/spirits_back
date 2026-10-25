@@ -269,12 +269,14 @@ describe('ProvisioningService.create', () => {
       '139.59.210.42',
       'http://127.0.0.1:3000/health',
       'own',
+      null,
     ]);
     expect(params(client).slice(9)).toEqual([
       's2.c.linkeon.io',
       '10.1.2.3',
       'http://127.0.0.1:3000/health',
       'clients',
+      null,
     ]);
   });
 
