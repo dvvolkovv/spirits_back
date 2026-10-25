@@ -59,7 +59,7 @@ const TRAILING_PUNCTUATION = /[.,!?:;)\]}>»”'"]+$/;
  * пунктуация, прилипшая к ссылке без пробела, обрезается перед проверкой.
  */
 export function parseYoutubeUrl(text: unknown): { videoId: string; url: string } | null {
-  const match = String(text ?? '').match(/https?:\/\/\S+/)?.[0];
+  const match = String(text ?? '').match(/https?:\/\/\S+/i)?.[0];
   if (!match) return null;
   const url = match.replace(TRAILING_PUNCTUATION, '');
   for (const re of YOUTUBE) {
