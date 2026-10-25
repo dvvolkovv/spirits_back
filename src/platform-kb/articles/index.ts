@@ -13,10 +13,13 @@ import { products } from './products';
 import { profile } from './profile';
 import { calendars } from './calendars';
 import { routines } from './routines';
+import { tokens } from './tokens';
+import { payments } from './payments';
+import { partners } from './partners';
 import { apps } from './apps';
 
 /** Все статьи справки. Порядок — порядок перечня в описании инструмента. */
 export const KB_ARTICLES: readonly KbArticle[] = [
   start, chat, call, meetings, networking, images, video, speech, studioAssistants, studioBots, products, profile,
-  calendars, routines, apps,
+  calendars, routines, tokens, payments, partners, apps,
 ];
