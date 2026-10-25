@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { StudioError } from './errors';
 import { audioDurationMs } from './ffprobe';
 
 export interface TtsRequest {
@@ -47,7 +48,7 @@ export async function synthesizeAll(reqs: TtsRequest[], dir: string, creds: { ap
       continue;
     }
     if (!creds.apiKey || !creds.folderId) {
-      throw new Error(`tts ${r.id}: реплики нет в кеше озвучки, а ключи SpeechKit не заданы`);
+      throw new StudioError('tts', `tts ${r.id}: реплики нет в кеше озвучки, а ключи SpeechKit не заданы`, false);
     }
     const body = new URLSearchParams({
       text: r.text,
@@ -62,7 +63,7 @@ export async function synthesizeAll(reqs: TtsRequest[], dir: string, creds: { ap
       headers: { Authorization: `Api-Key ${creds.apiKey}`, 'Content-Type': 'application/x-www-form-urlencoded' },
       body: body.toString(),
     });
-    if (!resp.ok) throw new Error(`tts ${r.id}: SpeechKit ${resp.status} ${(await resp.text()).slice(0, 200)}`);
+    if (!resp.ok) throw new StudioError('tts', `tts ${r.id}: SpeechKit ${resp.status} ${(await resp.text()).slice(0, 200)}`, true);
     const file = path.join(dir, `${r.id}.mp3`);
     fs.writeFileSync(file, Buffer.from(await resp.arrayBuffer()));
     const durationMs = await audioDurationMs(file);

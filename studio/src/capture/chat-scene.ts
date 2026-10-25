@@ -4,6 +4,7 @@ import { chromium, type Page } from 'playwright';
 import { answerProblems, isCounterQuestion } from '../answer';
 import { toImageBoxes, type CssRect } from '../boxes';
 import type { StudioConfig } from '../config';
+import { StudioError } from '../errors';
 import { probeFile } from '../ffprobe';
 import type { CaptureResult, Scene } from '../types';
 import type { Session } from './login';
@@ -72,7 +73,7 @@ async function waitAnswer(page: Page, before: number): Promise<string> {
     }
     await page.waitForTimeout(1000);
   }
-  throw new Error('capture: ответ не закончился за 5 минут');
+  throw new StudioError('answer_timeout', 'capture: ответ не закончился за 5 минут', true);
 }
 
 /**
@@ -96,7 +97,7 @@ async function waitIdle(page: Page): Promise<void> {
     }
     await page.waitForTimeout(1000);
   }
-  throw new Error('capture: лента не успокоилась за 5 минут — приветствие ассистента не закончилось');
+  throw new StudioError('idle_timeout', 'capture: лента не успокоилась за 5 минут — приветствие ассистента не закончилось', true);
 }
 
 /** Отправляет реплику и ждёт её пузырь; возвращает число ответов ассистента до отправки. */
@@ -174,13 +175,13 @@ export async function captureChat(
       await page.locator('[data-testid="chat-input"]').waitFor({ timeout: 30_000 });
     } catch {
       await page.screenshot({ path: shot('blocked.png') });
-      throw new Error(`capture: кабинет не дошёл до чата — см. ${shot('blocked.png')}`);
+      throw new StudioError('blocked', `capture: кабинет не дошёл до чата — см. ${shot('blocked.png')}`, true);
     }
     await waitIdle(page);
     const picked = (await page.locator('[data-testid="assistant-dropdown-btn"]').innerText().catch(() => '')).trim();
     if (!picked.includes(scene.assistantName)) {
       await page.screenshot({ path: shot('wrong-assistant.png') });
-      throw new Error(`capture: открыт не тот ассистент: «${picked}» вместо «${scene.assistantName}»`);
+      throw new StudioError('wrong_assistant', `capture: открыт не тот ассистент: «${picked}» вместо «${scene.assistantName}»`, false);
     }
     if (opts.probeOnly) {
       await page.screenshot({ path: shot('probe.png') });
@@ -190,7 +191,7 @@ export async function captureChat(
     let before = await send(page, scene.question);
     if (!(await revealLastUserMessage(page))) {
       await page.screenshot({ path: shot('question-hidden.png') });
-      throw new Error(`capture: пузырь вопроса не виден целиком — см. ${shot('question-hidden.png')}`);
+      throw new StudioError('question_hidden', `capture: пузырь вопроса не виден целиком — см. ${shot('question-hidden.png')}`, true);
     }
     await page.screenshot({ path: shot('question.png') });
     let answer = await waitAnswer(page, before);
@@ -204,7 +205,7 @@ export async function captureChat(
     const problems = answerProblems(answer, opts.minAnswerChars);
     if (problems.length) {
       await page.screenshot({ path: shot('rejected.png') });
-      throw new Error(`capture: ответ не годится — ${problems.join('; ')}`);
+      throw new StudioError('answer_rejected', `capture: ответ не годится — ${problems.join('; ')}`, true);
     }
 
     // Высокий кадр: окно раскрывается на всю ленту, и ответ виден целиком без прокрутки.
@@ -239,9 +240,9 @@ export async function captureChat(
 
     const img = await probeFile(shot('answer.png'));
     const boxes = toImageBoxes(rects, SCALE, img.height);
-    if (boxes.length === 0) throw new Error('capture: в ответе не нашлось ни одного абзаца');
+    if (boxes.length === 0) throw new StudioError('no_paragraphs', 'capture: в ответе не нашлось ни одного абзаца', true);
     for (const f of ['question.png', 'answer.png']) {
-      if (fs.statSync(shot(f)).size < 20_000) throw new Error(`capture: ${f} меньше 20 КБ — похоже на пустой кадр`);
+      if (fs.statSync(shot(f)).size < 20_000) throw new StudioError('empty_frame', `capture: ${f} меньше 20 КБ — похоже на пустой кадр`, true);
     }
     return {
       scene,

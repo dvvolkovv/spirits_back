@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { bundle } from '@remotion/bundler';
 import { renderMedia, renderStill, selectComposition } from '@remotion/renderer';
 import { parseConfig } from '../config';
+import { StudioError } from '../errors';
 import { detectSilences, probeFile, verifyVideo } from '../ffprobe';
 import { validateScript } from '../script';
 import { synthesizeAll } from '../tts';
@@ -28,7 +29,7 @@ export async function renderRun(runDir: string, opts: { skipTts?: boolean } = {}
   const capture = JSON.parse(fs.readFileSync(path.join(runDir, 'capture.json'), 'utf8')) as CaptureResult;
   const script = JSON.parse(fs.readFileSync(path.join(runDir, 'script.json'), 'utf8')) as Script;
   const scriptProblems = validateScript(script, capture);
-  if (scriptProblems.length) throw new Error(`render: сценарий не прошёл проверку:\n- ${scriptProblems.join('\n- ')}`);
+  if (scriptProblems.length) throw new StudioError('script_invalid', `render: сценарий не прошёл проверку:\n- ${scriptProblems.join('\n- ')}`, false);
 
   const cfg = parseConfig(process.env, { capture: false, tts: !opts.skipTts });
   const reqs = script.lines.map((l) => ({ id: l.id, text: l.text, voice: l.voice ?? script.voice, speed: script.speed ?? 1 }));
