@@ -4671,6 +4671,18 @@ describe('ShortsApprovalService', () => {
       expect((tg.sendMessage.mock.calls[0] as any[])[1]).toMatch(/не одобрен — все 60 ближайших слотов/);
     });
 
+    it('кнопка под устаревшим сообщением — отказ, ролик не трогается', async () => {
+      // Новая версия ещё не отправлена (review_message_id обнулён студией) или уже ушла другим сообщением.
+      for (const fresh of [null, 13]) {
+        (approveShortIntoSlot as jest.Mock).mockClear();
+        const { svc, tg, pg } = setup(row({ review_message_id: fresh }));
+        expect(await svc.handleCallback(cb('ok'))).toBe(true);
+        expect(approveShortIntoSlot).not.toHaveBeenCalled();
+        expect(tg.answerCallbackQuery).toHaveBeenCalledWith('cb', { text: 'Это сообщение устарело: ролик переделан, решение — под свежим сообщением' });
+        expect(pg.query.mock.calls.some((c: any[]) => String(c[0]).startsWith('UPDATE'))).toBe(false);
+      }
+    });
+
     it('«Одобрить» у уже обработанного — без записи', async () => {
       const { svc, tg } = setup(row({ status: 'published' }));
       await svc.handleCallback(cb('ok'));
@@ -5012,6 +5024,14 @@ export class ShortsApprovalService {
       return true;
     }
     const chatId = Number(cb?.message?.chat?.id) || owner;
+    // Кнопки проверки действуют только под тем сообщением, что сейчас на проверке.
+    // После «Переснять» и замечания кнопки старого сообщения остаются, а студия,
+    // собрав новую версию, обнуляет review_message_id: «Одобрить» под старым
+    // отправил бы в канал версию, которую владелец не видел.
+    if (parsed.action !== 'yt' && Number(cb?.message?.message_id) !== v.reviewMessageId) {
+      await this.answer(cb, 'Это сообщение устарело: ролик переделан, решение — под свежим сообщением');
+      return true;
+    }
     switch (parsed.action) {
       case 'ok':
         await this.approve(v, cb, chatId);
@@ -6815,7 +6835,7 @@ Expected: `Tests: 5 skipped`.
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts"`
 Expected: `Tests: 5 passed`.
 
-Красный тест здесь — дефект SQL, а не теста. Например, гонка одобрений даёт два одинаковых слота: значит, `takenSlots` читает не под блокировкой или индекс создан не тем предикатом.
+Красный тест здесь — дефект SQL, а не теста. Гонка одобрений: два одинаковых слота — индекса `uq_short_video_slot` нет или он создан не тем предикатом (блокировка свободный слот не держит, его держит индекс); отказ с сырым 23505 — имя индекса в миграции разошлось с `SHORT_SLOT_INDEX`.
 
 - [ ] **Step 4: Коммит**
 
