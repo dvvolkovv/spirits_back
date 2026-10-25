@@ -54,6 +54,21 @@ describe('parseDirectorReply', () => {
     expect(() => parseDirectorReply(JSON.stringify({ ...ok, question: `${ok.question} Пишите на ivan@example.com` }), free)).toThrow(/персональные данные/);
   });
 
+  it('телефоны РФ и СНГ в вопросе и уточнении — персональные данные', () => {
+    for (const phone of ['+7 (999) 123-45-67', '8 800 555 35 35', '89991234567', '+375 29 123 45 67', '+380 67 123 45 67', '8(912)345-67-89']) {
+      expect(() => parseDirectorReply(JSON.stringify({ ...ok, question: `${ok.question} Звоните: ${phone}` }), free)).toThrow(/персональные данные/);
+      expect(() => parseDirectorReply(JSON.stringify({ ...ok, followups: [`Мой номер ${phone}`] }), free)).toThrow(/персональными данными/);
+    }
+  });
+
+  it('крупные суммы и диапазоны — не телефон', () => {
+    for (const sum of ['120 000 000', '1 200 000 - 1 500 000', '7 500 000 рублей', '800 000 000', '7 300 000-7 500 000', '8 000 000 000']) {
+      const question = `Бюджет на квартиру ${sum} — хватит на двушку?`;
+      const r = parseDirectorReply(JSON.stringify({ ...ok, question, followups: [`Готов потратить ${sum}`] }), free);
+      expect(r.question).toBe(question);
+    }
+  });
+
   it('без уточнения на встречный вопрос и без названия — ошибка', () => {
     expect(() => parseDirectorReply(JSON.stringify({ ...ok, followups: [] }), free)).toThrow(/уточнения/);
     expect(() => parseDirectorReply(JSON.stringify({ ...ok, title: '' }), free)).toThrow(/названия/);

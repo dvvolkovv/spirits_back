@@ -1,4 +1,4 @@
-import { ShortsWriterService } from './shorts-writer.service';
+import { MAX_RECAPTURES, ShortsWriterService } from './shorts-writer.service';
 import { StageFatalError } from './short-jobs';
 import { WRITER_SYSTEM } from './short-prompts';
 import { rowToShort } from './shorts.types';
@@ -80,10 +80,24 @@ describe('ShortsWriterService.write', () => {
     await svc.write(video());
     expect(relay.ask).toHaveBeenCalledTimes(2);
     expect((relay.ask.mock.calls[1] as any[])[1]).toMatch(/нарушил правила — исправь:\n- правило 6/);
-    // Отвергнутый вариант — перед сценаристом: в первом запросе прошлого нет, во втором он есть.
+    // Отвергнутый вариант — перед сценаристом: в первом запросе прошлого нет, во втором он есть,
+    // целиком — с метками реплик и подписями, на которые ссылаются нарушения.
     expect((relay.ask.mock.calls[0] as any[])[1]).not.toContain('Прошлый вариант:');
-    expect((relay.ask.mock.calls[1] as any[])[1]).toContain('Прошлый вариант:');
+    const second = (relay.ask.mock.calls[1] as any[])[1];
+    expect(second).toContain('Прошлый вариант:');
+    expect(second).toContain('a1 [');
+    expect(second).toContain('подпись telegram: Попробуйте бесплатно!');
     expect((pg.query.mock.calls[0] as any[])[0]).toMatch(/render_queued/);
+  });
+
+  it('первый круг после отзыва студии — прошлый сценарий из базы, без его подписей (они уже с хвостом)', async () => {
+    const { svc, relay } = setup([GOOD]);
+    const script = { hook: 'Старая зацепка', voice: 'madirus', speed: 1.1, lines: [{ id: 'a1', scene: 'answer', box: 1, text: 'Старая реплика' }], final: { assistantsCount: 18 } };
+    await svc.write(video({ script, captions: { telegram: 'Старая подпись\n\nhttps://ссылка', vk: '', youtube: { title: 'T', description: '', tags: [] } }, writer_feedback: 'Озвучка заняла 63 с' }));
+    const first = (relay.ask.mock.calls[0] as any[])[1];
+    expect(first).toContain('a1 [1]: Старая реплика');
+    expect(first).toContain('Студия: Озвучка заняла 63 с');
+    expect(first).not.toContain('подпись telegram:');
   });
 
   it('три варианта подряд с нарушениями — фатально, без записи', async () => {
@@ -98,7 +112,27 @@ describe('ShortsWriterService.write', () => {
     await svc.write(video({ owner_note: 'про субаренду' }));
     const [sql, params] = pg.query.mock.calls[0] as any[];
     expect(sql).toMatch(/SET status = 'directing'/);
+    // Новая сцена — новый круг: отзыв студии о прошлой озвучке и счёт её переписок — заново.
+    expect(sql).toMatch(/writer_feedback = NULL/);
+    expect(sql).toMatch(/writer_rounds = 0/);
     expect(params[1]).toBe('про субаренду\nСценарист: нужен вопрос про субаренду');
+  });
+
+  it('уже дважды просил другую сцену — третий раз фатально, без записи', async () => {
+    expect(MAX_RECAPTURES).toBe(2);
+    const { svc, pg } = setup([{ needsRecapture: true, reason: 'нужен вопрос про субаренду' }]);
+    const note = 'про субаренду\nСценарист: нужен вопрос про субаренду\nСценарист: всё ещё не про субаренду';
+    const err = await svc.write(video({ owner_note: note })).catch((e) => e);
+    expect(err).toBeInstanceOf(StageFatalError);
+    expect(err.message).toBe('сценарист: уже дважды просил другую сцену — нужен взгляд владельца; последняя причина: нужен вопрос про субаренду');
+    expect(pg.query).not.toHaveBeenCalled();
+  });
+
+  it('новое замечание владельца после просьб сценариста — счёт просьб заново', async () => {
+    const { svc, pg } = setup([{ needsRecapture: true, reason: 'нужен вопрос про субаренду' }]);
+    const note = 'Сценарист: нужен вопрос про субаренду\nСценарист: всё ещё не про субаренду\nсделайте про субаренду с животными';
+    await svc.write(video({ owner_note: note }));
+    expect((pg.query.mock.calls[0] as any[])[0]).toMatch(/SET status = 'directing'/);
   });
 
   it('реальный кейс — с подписью в кадре вопроса', async () => {
