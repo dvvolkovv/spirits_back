@@ -22,6 +22,11 @@ describe('кнопки ролика', () => {
     for (const b of kb.flat()) expect(Buffer.byteLength(b.callback_data)).toBeLessThanOrEqual(64);
     expect(buildYoutubeKeyboard(ID).inline_keyboard[0][0].callback_data).toBe(`short:yt:${ID}`);
   });
+
+  it('кнопка YouTube: callback_data не длиннее 64 байт', () => {
+    const kb = buildYoutubeKeyboard(ID).inline_keyboard;
+    for (const row of kb) for (const b of row) expect(Buffer.byteLength(b.callback_data)).toBeLessThanOrEqual(64);
+  });
 });
 
 describe('/short', () => {
@@ -52,5 +57,27 @@ describe('ссылка YouTube', () => {
   it('не YouTube — null', () => {
     expect(parseYoutubeUrl('https://vk.com/clip-1_2')).toBeNull();
     expect(parseYoutubeUrl('ссылки нет')).toBeNull();
+  });
+
+  it('чужой домен, похожий на youtube — null', () => {
+    expect(parseYoutubeUrl('https://notyoutube.com/shorts/AbCdEfGhIjK')).toBeNull();
+    expect(parseYoutubeUrl('https://youtube.com.evil.ru/shorts/AbCdEfGhIjK')).toBeNull();
+  });
+
+  it.each([
+    ['https://youtube.com/shorts/AbCdEfGhIjK.', 'AbCdEfGhIjK'],
+    ['(https://youtube.com/shorts/AbCdEfGhIjK)', 'AbCdEfGhIjK'],
+    ['смотри: https://youtube.com/shorts/AbCdEfGhIjK!', 'AbCdEfGhIjK'],
+    ['https://youtube.com/shorts/AbCdEfGhIjK, готово', 'AbCdEfGhIjK'],
+    ['Залил: https://youtu.be/AbCdEfGhIjK.', 'AbCdEfGhIjK'],
+  ])('хвостовая пунктуация без пробела: %s', (text, id) => {
+    expect(parseYoutubeUrl(text)).toEqual({ videoId: id, url: `https://youtube.com/shorts/${id}` });
+  });
+
+  it('домен без учёта регистра, id регистр сохраняет', () => {
+    expect(parseYoutubeUrl('HTTPS://YOUTUBE.COM/SHORTS/AbCdEfGhIjK')).toEqual({
+      videoId: 'AbCdEfGhIjK',
+      url: 'https://youtube.com/shorts/AbCdEfGhIjK',
+    });
   });
 });

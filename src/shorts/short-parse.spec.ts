@@ -1,4 +1,4 @@
-import { extractJsonObject, parseDirectorReply, parseWriterReply } from './short-parse';
+import { MAX_QUESTION_CHARS, MIN_QUESTION_CHARS, extractJsonObject, parseDirectorReply, parseWriterReply } from './short-parse';
 
 describe('extractJsonObject', () => {
   it('берёт объект из забора и из обвязки', () => {
@@ -10,6 +10,21 @@ describe('extractJsonObject', () => {
     expect(() => extractJsonObject('Извините, не могу', 'режиссёр')).toThrow(/режиссёр: не нашёл JSON.*Извините, не могу/);
     expect(() => extractJsonObject('[1,2]', 'x')).toThrow(/не нашёл JSON/);
     expect(() => extractJsonObject('', 'x')).toThrow(/пустой ответ/);
+  });
+
+  it('ответ-массив без забора — та же ошибка, что с забором', () => {
+    expect(() => extractJsonObject('[{"assistantId":10,"question":"x"}]', 'x')).toThrow(/не нашёл JSON/);
+    expect(() => extractJsonObject('[{"a":1},{"b":2}]', 'x')).toThrow(/не нашёл JSON/);
+  });
+
+  it('несколько заборов — берётся последний, который разбирается в объект', () => {
+    const raw = 'Пример: ```json\n{"not":"this"}\n``` Мой ответ: ```json\n{"a":42}\n```';
+    expect(extractJsonObject(raw, 'x')).toEqual({ a: 42 });
+  });
+
+  it('несколько заборов — если последний не объект, берётся предыдущий разбирающийся', () => {
+    const raw = 'Так: ```json\n{"a":1}\n``` А если так: ```json\n[1,2]\n```';
+    expect(extractJsonObject(raw, 'x')).toEqual({ a: 1 });
   });
 });
 
@@ -42,6 +57,17 @@ describe('parseDirectorReply', () => {
   it('без уточнения на встречный вопрос и без названия — ошибка', () => {
     expect(() => parseDirectorReply(JSON.stringify({ ...ok, followups: [] }), free)).toThrow(/уточнения/);
     expect(() => parseDirectorReply(JSON.stringify({ ...ok, title: '' }), free)).toThrow(/названия/);
+  });
+
+  it('границы длины вопроса: ровно MIN/MAX проходят, на единицу меньше/больше — ошибка', () => {
+    const minOk = 'а'.repeat(MIN_QUESTION_CHARS);
+    const minShort = 'а'.repeat(MIN_QUESTION_CHARS - 1);
+    const maxOk = 'а'.repeat(MAX_QUESTION_CHARS);
+    const maxLong = 'а'.repeat(MAX_QUESTION_CHARS + 1);
+    expect(parseDirectorReply(JSON.stringify({ ...ok, question: minOk }), free).question).toBe(minOk);
+    expect(() => parseDirectorReply(JSON.stringify({ ...ok, question: minShort }), free)).toThrow(/длина вопроса/);
+    expect(parseDirectorReply(JSON.stringify({ ...ok, question: maxOk }), free).question).toBe(maxOk);
+    expect(() => parseDirectorReply(JSON.stringify({ ...ok, question: maxLong }), free)).toThrow(/длина вопроса/);
   });
 });
 
