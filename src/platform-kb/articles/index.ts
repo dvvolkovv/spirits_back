@@ -7,7 +7,12 @@ import { networking } from './networking';
 import { images } from './images';
 import { video } from './video';
 import { speech } from './speech';
+import { studioAssistants } from './studio-assistants';
+import { studioBots } from './studio-bots';
+import { products } from './products';
 import { profile } from './profile';
 
 /** Все статьи справки. Порядок — порядок перечня в описании инструмента. */
-export const KB_ARTICLES: readonly KbArticle[] = [start, chat, call, meetings, networking, images, video, speech, profile];
+export const KB_ARTICLES: readonly KbArticle[] = [
+  start, chat, call, meetings, networking, images, video, speech, studioAssistants, studioBots, products, profile,
+];
