@@ -22,7 +22,12 @@ describe('точка /mcp/products', () => {
     };
     const files = { searchForUser: jest.fn(async () => ({ ok: true, total: 0, files: [] })) };
     const events = { track: jest.fn() };
-    return { ctrl: new ProductsMcpController(tool as any, files as any, events as any, language), calls, tool, files, events };
+    const problems = { reportFromAssistant: jest.fn(async () => ({ ok: true, reported: true, say: 'ok' })) };
+    const chat = { activeAssistantFor: jest.fn(() => null) };
+    return {
+      ctrl: new ProductsMcpController(tool as any, files as any, problems as any, chat as any, events as any, language),
+      calls, tool, files, events, problems, chat,
+    };
   };
 
   it('владелец берётся ИЗ ТОКЕНА', async () => {
@@ -33,7 +38,7 @@ describe('точка /mcp/products', () => {
 
   // Главная защита этой точки. Поле userId в запросе не должно значить НИЧЕГО:
   // иначе возвращается ровно та дыра, из-за которой инструмент не отдали общей
-  // точке /mcp (там userId пишет модель — mcp.controller.ts:74).
+  // точке /mcp (там userId пишет модель — mcp.controller.ts, callTool).
   it('поле userId в запросе игнорируется полностью', async () => {
     const { ctrl, calls } = make();
     await ctrl.callTool(`Bearer ${signProductToolToken('79030169187')}`, { action: 'list', userId: '70000000000' });
@@ -107,16 +112,16 @@ describe('точка /mcp/products', () => {
     expect(tool.execute).not.toHaveBeenCalled();
   });
 
-  it('веб: продукты, поиск файлов и справка; ни у кого нет аргумента userId', () => {
+  it('веб: продукты, поиск файлов, сообщение в поддержку и справка; ни у одного нет аргумента userId', () => {
     const { ctrl } = make();
     const tools = ctrl.listTools('web');
-    expect(tools.map((t: any) => t.name)).toEqual(['manage_product', 'find_files', 'linkeon_help']);
+    expect(tools.map((t: any) => t.name)).toEqual(['manage_product', 'find_files', 'report_problem', 'linkeon_help']);
     for (const t of tools as any[]) expect(Object.keys(t.inputSchema.properties)).not.toContain('userId');
   });
 
-  it('Telegram: продукты и справка — поиск файлов в боте не включён', () => {
+  it('Telegram: продукты, сообщение в поддержку и справка — поиск файлов в боте не включён', () => {
     const { ctrl } = make();
-    expect(ctrl.listTools('telegram').map((t: any) => t.name)).toEqual(['manage_product', 'linkeon_help']);
+    expect(ctrl.listTools('telegram').map((t: any) => t.name)).toEqual(['manage_product', 'report_problem', 'linkeon_help']);
   });
 
   it('find_files: владелец из токена, userId из запроса выбрасывается', async () => {

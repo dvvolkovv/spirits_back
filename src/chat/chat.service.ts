@@ -23,7 +23,7 @@ import { toActivity } from './activity-map';
 import { ASK_RULE } from './ask-rule';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
-import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
+import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
 import { ChatFileStore, PERSIST_TURN_BUDGET_MS } from './chat-files/chat-file-store';
 import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks } from './chat-files/relay-links';
 import { BalanceContextService } from '../tokens/balance-context.service';
@@ -382,6 +382,25 @@ export class ChatService {
       ? { active: true, startedMsAgo: Date.now() - startedAt }
       : { active: false, startedMsAgo: 0 };
   }
+
+  /**
+   * Ассистент самого свежего хода этого пользователя — для подписи сообщений
+   * в поддержку (src/problem-report). Ход открыт и в пути релея, и у Маши;
+   * ключ activeTurns — `${userId}_${assistantId}`, а в userId подчёркиваний не
+   * бывает (телефон или UUID). Хода нет — null. Ход с вложениями
+   * (uploadAndChat) сюда не попадает: для него вернётся ассистент другого
+   * идущего хода этого пользователя, если такой есть, иначе null.
+   */
+  activeAssistantFor(userId: string): string | null {
+    const prefix = `${userId}_`;
+    let best: { id: string; at: number } | null = null;
+    for (const [key, at] of this.activeTurns) {
+      if (!key.startsWith(prefix)) continue;
+      if (!best || at > best.at) best = { id: key.slice(prefix.length), at };
+    }
+    return best ? best.id : null;
+  }
+
   private dupKey(userId: string, assistantId: string, message: string): string {
     return `${userId}::${assistantId}::${(message || '').trim().slice(0, 300)}`;
   }
@@ -1199,19 +1218,20 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // поэтому разъехаться они не могут.
           timeoutMs: RELAY_TURN_BUDGET_MS,
           mcpServers: products.mcpServers,
-          // Автоодобрение — ровно инструмент продуктов. Встроенные тулы у Маши
+          // Автоодобрение — ровно инструменты точки продуктов. Встроенные тулы у Маши
           // по-прежнему выключены (tools не задан → `--tools ""`).
-          // + поиск файлов прошлых разговоров (find-files.tool.ts). У TG-бота
-          // его нет: там allowedTools собирается из одного products.toolName.
-          allowedTools: `${products.toolName},${FIND_FILES_CLI_TOOL_NAME}`,
+          // + поиск файлов прошлых разговоров (find-files.tool.ts) — у TG-бота
+          // его нет; + сообщить в поддержку (src/problem-report) — есть у обоих.
+          allowedTools: `${products.toolName},${FIND_FILES_CLI_TOOL_NAME},${REPORT_PROBLEM_CLI_TOOL_NAME}`,
           // onProgress переводит CLI в stream-json: только так видно, звали ли
           // инструмент продуктов в этом ходе (итог в формате json этого не несёт).
           onProgress: (ev) => {
-            // Карта не подмешивается и к ходу с поиском файлов: «карточка», «картинка»
-            // в разговоре о найденных файлах — не повод вешать метафорическую карту.
-            if (ev.kind === 'tool_use' && (ev.name === products.toolName || ev.name === FIND_FILES_CLI_TOOL_NAME)) usedProductsTool = true;
+            // Карта не подмешивается и к ходу с поиском файлов или с сообщением в
+            // поддержку: «карточка», «картинка» о найденных файлах, «не проходит
+            // оплата картой» в жалобе — не повод вешать метафорическую карту.
+            if (ev.kind === 'tool_use' && (ev.name === products.toolName || ev.name === FIND_FILES_CLI_TOOL_NAME || ev.name === REPORT_PROBLEM_CLI_TOOL_NAME)) usedProductsTool = true;
             // Шаг работы для клиента, который его рисует. Аргументов onProgress
-            // не отдаёт — хватает имени: у Маши из инструментов только продукты.
+            // не отдаёт — хватает имени: у Маши только инструменты точки продуктов.
             // Для новых инструментов понадобится input — onProgress его не отдаёт.
             //
             // writableEnded: claude CLI при таймауте убивает процесс SIGTERM'ом,

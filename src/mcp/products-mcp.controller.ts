@@ -31,6 +31,9 @@ import { parseFindFilesInput } from '../chat/chat-files/find-files';
 import { EventsService } from '../events/events.service';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 import { LINKEON_HELP_TOOL_NAME, executeLinkeonHelp, linkeonHelpTool } from '../platform-kb/linkeon-help';
+import { ChatService } from '../chat/chat.service';
+import { ProblemReportService } from '../problem-report/problem-report.service';
+import { REPORT_PROBLEM_TOOL, REPORT_PROBLEM_TOOL_NAME } from '../problem-report/report-problem.tool';
 
 /**
  * Отдельная точка, а не ветка в /mcp, СОЗНАТЕЛЬНО.
@@ -42,7 +45,7 @@ import { LINKEON_HELP_TOOL_NAME, executeLinkeonHelp, linkeonHelpTool } from '../
  * Сторож адреса — в products-mcp.controller.spec.ts.
  *
  * На общей точке владелец приезжает полем запроса, которое пишет модель
- * (mcp.controller.ts:74, релей подсказывает телефон в системном промпте —
+ * (mcp.controller.ts, callTool, релей подсказывает телефон в системном промпте —
  * relay-agent/server.mjs:378). Для картинок это цена в токенах, для продуктов —
  * правка чужого сайта.
  *
@@ -59,6 +62,10 @@ export class ProductsMcpController {
   constructor(
     private readonly tool: ProductToolService,
     private readonly files: ChatFilesService,
+    // Без @Optional — по той же причине, что в mcp.controller.ts: выпавший
+    // модуль должен ронять старт, а не молча выключать инструмент.
+    private readonly problems: ProblemReportService,
+    private readonly chat: ChatService,
     @Optional() private readonly events?: EventsService,
     @Optional() private readonly language?: LanguageService,
   ) {}
@@ -82,13 +89,16 @@ export class ProductsMcpController {
   /**
    * Инструменты по токену. Справка — всем; по токену с областью help — только
    * она: такой получают ходы Telegram-группы с посторонними, где продукты и
-   * файлы владельца трогать нельзя. Поиск файлов — только в вебе (TG-бот в эту
-   * фичу не входит).
+   * файлы владельца трогать нельзя, а сообщать в поддержку от их имени — тоже.
+   * Поиск файлов — только в вебе (TG-бот в эту фичу не входит); сообщить в
+   * поддержку — в обоих каналах.
    */
   private toolsFor(c: Pick<ProductToolClaims, 'channel' | 'client' | 'scope'>) {
     const help = linkeonHelpTool(this.clientOf(c));
     if (c.scope === 'help') return [help];
-    return c.channel === 'telegram' ? [...PRODUCT_TOOLS, help] : [...PRODUCT_TOOLS, FIND_FILES_TOOL, help];
+    return c.channel === 'telegram'
+      ? [...PRODUCT_TOOLS, REPORT_PROBLEM_TOOL, help]
+      : [...PRODUCT_TOOLS, FIND_FILES_TOOL, REPORT_PROBLEM_TOOL, help];
   }
 
   /** Вынесено из makeServer ради проверяемости: контракт схемы — часть защиты. */
@@ -140,6 +150,19 @@ export class ProductsMcpController {
         props: { channel, found: result.files.length, stored: result.files.filter((f) => f.stored).length },
       });
       return result;
+    }
+    if (name === REPORT_PROBLEM_TOOL_NAME) {
+      // Пользователь и канал — из подписи, как у остальных инструментов точки.
+      // Ассистент хода — только в вебе: у TG-бота хода в ChatService нет, а
+      // параллельный веб-ход того же человека подписал бы сообщение чужим именем.
+      return this.problems.reportFromAssistant({
+        userId,
+        channel,
+        assistantId: channel === 'web' ? this.chat.activeAssistantFor(userId) : null,
+        assistantArg: input.assistant,
+        kind: input.kind,
+        summary: input.summary,
+      });
     }
     return this.tool.execute(userId, input, channel);
   }

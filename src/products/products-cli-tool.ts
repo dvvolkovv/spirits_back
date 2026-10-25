@@ -32,6 +32,9 @@ export const FIND_FILES_CLI_TOOL_NAME = `mcp__${SERVER_KEY}__find_files`;
 /** Справка о Linkeon — тот же сервер `products` (platform-kb/linkeon-help.ts). Это же имя стоит в PRODUCTS_TOOLS релея. */
 export const LINKEON_HELP_CLI_TOOL_NAME = `mcp__${SERVER_KEY}__${LINKEON_HELP_TOOL_NAME}`;
 
+/** Сообщить в поддержку (problem-report/report-problem.tool.ts) — тот же сервер `products`; и Маше, и TG-боту. */
+export const REPORT_PROBLEM_CLI_TOOL_NAME = `mcp__${SERVER_KEY}__report_problem`;
+
 /** Блок системного промпта Маши про поиск файлов. */
 export const FIND_FILES_CLI_PROMPT = `ФАЙЛЫ ИЗ ПРОШЛЫХ РАЗГОВОРОВ.
 Тебе доступен инструмент ${FIND_FILES_CLI_TOOL_NAME}: он находит файлы, которые ассистенты уже создавали этому пользователю (документы, картинки, видео, озвучку), во всех его разговорах.

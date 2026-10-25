@@ -30,6 +30,7 @@ import { EventsModule } from './events/events.module';
 import { BacklogModule } from './backlog/backlog.module';
 import { BlogModule } from './blog/blog.module';
 import { VpmModule } from './vpm/vpm.module';
+import { InsightsModule } from './insights/insights.module';
 import { VmmModule } from './vmm/vmm.module';
 import { VkAdsModule } from './vk-ads/vk-ads.module';
 import { OfferModule } from './offer/offer.module';
@@ -86,6 +87,7 @@ import { IntegrationsModule } from './integrations/integrations.module';
     BacklogModule,
     BlogModule,
     VpmModule,
+    InsightsModule,
     VmmModule,
     VkAdsModule,
     OfferModule,

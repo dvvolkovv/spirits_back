@@ -9,7 +9,7 @@ describe('find_files: событие для статистики', () => {
       searchForUser: jest.fn(async () => ({ ok: true, total: 3, files: [{ stored: true }, { stored: false }, { stored: true }] })),
     };
     const events = { track: jest.fn() };
-    const ctrl = new ProductsMcpController({} as any, files as any, events as any);
+    const ctrl = new ProductsMcpController({} as any, files as any, {} as any, {} as any, events as any);
     await ctrl.callTool(`Bearer ${signProductToolToken('u-1')}`, { query: 'кот', userId: 'чужой' }, 'find_files');
     expect(events.track).toHaveBeenCalledWith('find_files_call', {
       userId: 'u-1',
@@ -20,7 +20,7 @@ describe('find_files: событие для статистики', () => {
   it('другие инструменты события не пишут', async () => {
     const tool = { execute: jest.fn(async () => ({ ok: true })) };
     const events = { track: jest.fn() };
-    const ctrl = new ProductsMcpController(tool as any, {} as any, events as any);
+    const ctrl = new ProductsMcpController(tool as any, {} as any, {} as any, {} as any, events as any);
     await ctrl.callTool(`Bearer ${signProductToolToken('u-1')}`, { action: 'list' }, 'manage_product');
     expect(events.track).not.toHaveBeenCalled();
   });

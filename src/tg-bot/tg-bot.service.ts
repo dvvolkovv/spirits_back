@@ -16,11 +16,13 @@ import { TgVoiceService } from './tg-voice.service';
 import { TgBillingService } from './tg-billing.service';
 import { TgCommandsService } from './tg-commands.service';
 import { TgGrammyClient } from './tg-grammy.client';
+import { REPORT_PROBLEM_CLI_TOOL_NAME } from '../products/products-cli-tool';
 import { MiscService } from '../misc/misc.service';
 import { VideoService } from '../video/video.service';
 import { BlogApprovalService } from '../blog/blog-approval.service';
 import { fetchMediaBytes } from '../common/net/own-media';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
+import { InsightsCallbackService, shouldRouteToInsights } from '../insights/insights-callback.service';
 
 // Лимит размера файла, который мы готовы скачать с Telegram и передать в Claude.
 // Telegram сам отдаёт через Bot API до 20 МБ; больше — нужен MTProto, не наш кейс.
@@ -148,6 +150,10 @@ export class TgBotService implements OnModuleInit {
     // спеки собирают сервис позиционно. Что он подключён, сторожит
     // chat.module.chat-files.spec.ts.
     @Optional() private readonly costGrowth?: CostGrowthService,
+    // Кнопки сводки «Затыки недели» — @Optional и последним: спеки собирают
+    // сервис позиционно; кольцо модулей рвётся forwardRef, как у блога.
+    @Optional() @Inject(forwardRef(() => InsightsCallbackService))
+    private readonly insights?: InsightsCallbackService,
   ) {}
 
   async onModuleInit() {
@@ -362,6 +368,13 @@ export class TgBotService implements OnModuleInit {
     // ниже молча проглотил бы нажатие «Опубликовать».
     if (shouldRouteToBlog(data)) {
       await this.blogApproval.handleCallback(cb);
+      return;
+    }
+
+    // Кнопки сводки — тоже до проверки привязки: владелец сводки определяется
+    // чатом сводки, а не связкой ассистентов.
+    if (shouldRouteToInsights(data)) {
+      await this.insights?.handleCallback(cb);
       return;
     }
 
@@ -1168,6 +1181,8 @@ export class TgBotService implements OnModuleInit {
    * `this` — чтобы проверяться тестом, не поднимая ход целиком.
    */
   static toolStatusLabel(toolName: string, lang: string): string {
+    // Раньше общей регулярки продуктов: сообщение в поддержку — не работа с продуктом.
+    if (toolName === REPORT_PROBLEM_CLI_TOOL_NAME) return tgText(lang, 'tool_support');
     if (/mcp__products__/.test(toolName)) return tgText(lang, 'tool_products');
     if (toolName === 'Read') return tgText(lang, 'tool_read');
     if (toolName === 'Write') return tgText(lang, 'tool_write');

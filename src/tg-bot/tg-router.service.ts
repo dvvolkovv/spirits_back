@@ -9,7 +9,7 @@ import { AgentsService } from '../agents/agents.service';
 import { TgGrammyClient } from './tg-grammy.client';
 import { TgConfigService, TgBotConfigRow } from './tg-config.service';
 import { isPrivateConfig } from './tg-chat-kind';
-import { productsCliMcp } from '../products/products-cli-tool';
+import { productsCliMcp, REPORT_PROBLEM_CLI_TOOL_NAME } from '../products/products-cli-tool';
 import { withCrisisRule } from '../chat/crisis-rule';
 import { telegramPlatformGuide } from '../chat/platform-guide';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
@@ -650,8 +650,9 @@ ${LanguageService.buildDirective(replyLang)}`;
     const tools = needsRead ? `Read,${WEB_TOOLS}` : WEB_TOOLS;
     // Инструмент продуктов — только автоодобрением: `--tools` задаёт встроенный
     // набор и MCP не режет (проба CLI 2.1.280), а без имени в allowedTools вызов
-    // в -p отклоняется.
-    const allowedTools = products ? `${WEB_TOOLS},${products.toolName}` : WEB_TOOLS;
+    // в -p отклоняется. С ним же — «сообщить в поддержку» (src/problem-report):
+    // тот же сервер products, выдаётся вместе с ним.
+    const allowedTools = products ? `${WEB_TOOLS},${products.toolName},${REPORT_PROBLEM_CLI_TOOL_NAME}` : WEB_TOOLS;
 
     // Та же модель, что и в вебе. Веб уводит всех ассистентов кроме Маши на
     // relay r.linkeon.io; здесь путь локальный, и Sonnet стоял просто потому,
