@@ -3961,6 +3961,9 @@ describe('ShortsWriterService.write', () => {
     await svc.write(video());
     expect(relay.ask).toHaveBeenCalledTimes(2);
     expect((relay.ask.mock.calls[1] as any[])[1]).toMatch(/нарушил правила — исправь:\n- правило 6/);
+    // Отвергнутый вариант — перед сценаристом: в первом запросе прошлого нет, во втором он есть.
+    expect((relay.ask.mock.calls[0] as any[])[1]).not.toContain('Прошлый вариант:');
+    expect((relay.ask.mock.calls[1] as any[])[1]).toContain('Прошлый вариант:');
     expect((pg.query.mock.calls[0] as any[])[0]).toMatch(/render_queued/);
   });
 
@@ -4024,7 +4027,7 @@ import { checkScriptRules } from './short-rules';
 import { CASE_BADGE, buildScript } from './short-script';
 import { shortSlug } from './short-slug';
 import { ShortsSettingsService } from './shorts-settings.service';
-import { ShortVideo, appendOwnerNote } from './shorts.types';
+import { ShortScript, ShortVideo, appendOwnerNote } from './shorts.types';
 
 /** Сколько раз сценарий переписывается по нарушениям правил (спека, «Обработка отказов»). */
 export const MAX_REWRITES = 2;
@@ -4063,6 +4066,9 @@ export class ShortsWriterService {
     };
 
     let violations: string[] = [];
+    // Со второго круга сценарист видит отвергнутый вариант, а не прежний
+    // сценарий из базы: иначе нарушение названо, а текста, где оно, перед ним нет.
+    let previous: ShortScript | null = v.script;
     for (let round = 0; round <= MAX_REWRITES; round++) {
       const message = buildWriterMessage({
         rubric: v.rubric,
@@ -4073,7 +4079,7 @@ export class ShortsWriterService {
         paragraphs: v.capture.paragraphs ?? [],
         ownerNote: v.ownerNote,
         writerFeedback: v.writerFeedback,
-        previousScript: v.script,
+        previousScript: previous,
         violations,
       });
       const raw = await this.relay.ask(WRITER_SYSTEM, message, `short-write-${v.id}-${randomUUID()}`);
@@ -4094,6 +4100,7 @@ export class ShortsWriterService {
       });
       if (violations.length) {
         this.logger.warn(`ролик ${v.id}: сценарий не прошёл правила (круг ${round + 1}): ${violations.join('; ')}`);
+        previous = script;
         continue;
       }
       const r = await this.pg.query(
