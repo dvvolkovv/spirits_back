@@ -23,6 +23,7 @@ DELETE FROM referral_leaders WHERE slug IN ('leader-alpha', 'leader-beta');
 DELETE FROM payments WHERE user_id LIKE '7900000%';
 DELETE FROM ai_profiles_consolidated WHERE user_id LIKE '7900000%';
 DELETE FROM user_id WHERE primary_phone LIKE '7900000%' OR internal_id LIKE '7900000%';
+DELETE FROM user_identities WHERE provider='phone' AND provider_sub LIKE '7900000%';
 SQL
 \"" 2>/dev/null
 
@@ -252,6 +253,7 @@ DELETE FROM referral_leaders WHERE slug IN ('leader-alpha', 'leader-beta');
 DELETE FROM payments WHERE user_id LIKE '7900000%';
 DELETE FROM ai_profiles_consolidated WHERE user_id LIKE '7900000%';
 DELETE FROM user_id WHERE primary_phone LIKE '7900000%' OR internal_id LIKE '7900000%';
+DELETE FROM user_identities WHERE provider='phone' AND provider_sub LIKE '7900000%';
 SQL
 \"" 2>/dev/null
 echo "  Cleanup done"
