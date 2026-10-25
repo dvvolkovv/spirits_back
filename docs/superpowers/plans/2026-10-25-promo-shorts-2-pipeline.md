@@ -4096,6 +4096,7 @@ export class ShortsWriterService {
         captions: reply.captions,
         paragraphs: v.capture.paragraphs ?? [],
         answerText: v.capture.answerText ?? '',
+        sceneQuestion: v.scene.question,
         assistantsCount,
       });
       if (violations.length) {
