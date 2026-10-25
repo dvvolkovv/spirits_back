@@ -12,7 +12,7 @@ describe('точка /mcp/products', () => {
   beforeAll(() => { process.env.JWT_SECRET = 'test-secret-for-product-tool'; });
   afterAll(() => { process.env.JWT_SECRET = OLD; });
 
-  const make = () => {
+  const make = (language?: any) => {
     const calls: any[] = [];
     const tool = {
       execute: jest.fn(async (userId: string, input: any, channel?: string) => {
@@ -21,7 +21,8 @@ describe('точка /mcp/products', () => {
       }),
     };
     const files = { searchForUser: jest.fn(async () => ({ ok: true, total: 0, files: [] })) };
-    return { ctrl: new ProductsMcpController(tool as any, files as any), calls, tool, files };
+    const events = { track: jest.fn() };
+    return { ctrl: new ProductsMcpController(tool as any, files as any, events as any, language), calls, tool, files, events };
   };
 
   it('владелец берётся ИЗ ТОКЕНА', async () => {
@@ -106,16 +107,16 @@ describe('точка /mcp/products', () => {
     expect(tool.execute).not.toHaveBeenCalled();
   });
 
-  it('веб: продукты и поиск файлов, у обоих нет аргумента userId', () => {
+  it('веб: продукты, поиск файлов и справка; ни у кого нет аргумента userId', () => {
     const { ctrl } = make();
     const tools = ctrl.listTools('web');
-    expect(tools.map((t: any) => t.name)).toEqual(['manage_product', 'find_files']);
+    expect(tools.map((t: any) => t.name)).toEqual(['manage_product', 'find_files', 'linkeon_help']);
     for (const t of tools as any[]) expect(Object.keys(t.inputSchema.properties)).not.toContain('userId');
   });
 
-  it('Telegram: только продукты — поиск файлов в боте не включён', () => {
+  it('Telegram: продукты и справка — поиск файлов в боте не включён', () => {
     const { ctrl } = make();
-    expect(ctrl.listTools('telegram').map((t: any) => t.name)).toEqual(['manage_product']);
+    expect(ctrl.listTools('telegram').map((t: any) => t.name)).toEqual(['manage_product', 'linkeon_help']);
   });
 
   it('find_files: владелец из токена, userId из запроса выбрасывается', async () => {
@@ -139,6 +140,66 @@ describe('точка /mcp/products', () => {
     expect(r.ok).toBe(false);
     expect(files.searchForUser).not.toHaveBeenCalled();
     expect(tool.execute).not.toHaveBeenCalled();
+  });
+
+  // Область help выдаётся ходам Telegram-группы с посторонними: справка ничего
+  // личного не раскрывает, а продукты и файлы владельца там трогать нельзя.
+  describe('справка linkeon_help', () => {
+    const helpBearer = (opts: any = {}) => `Bearer ${signProductToolToken('u-owner', 'telegram', { scope: 'help', ...opts })}`;
+
+    it('по токену help показывается только справка', () => {
+      const { ctrl } = make();
+      expect(ctrl.listTools('telegram', { scope: 'help' }).map((t: any) => t.name)).toEqual(['linkeon_help']);
+    });
+
+    it('по токену help продукты и поиск файлов — отказ, ничего не зовётся', async () => {
+      const { ctrl, tool, files } = make();
+      const a: any = await ctrl.callTool(helpBearer(), { action: 'list' }, 'manage_product');
+      const b: any = await ctrl.callTool(helpBearer(), { query: 'x' }, 'find_files');
+      expect(a.ok).toBe(false);
+      expect(b.ok).toBe(false);
+      expect(tool.execute).not.toHaveBeenCalled();
+      expect(files.searchForUser).not.toHaveBeenCalled();
+    });
+
+    it('статья — на языке из подписи токена', async () => {
+      const { ctrl } = make();
+      const en: any = await ctrl.callTool(`Bearer ${signProductToolToken('u-test', 'web', { lang: 'en', client: 'web' })}`, { topics: ['products'] }, 'linkeon_help');
+      const ru: any = await ctrl.callTool(`Bearer ${signProductToolToken('u-test', 'web', { lang: 'ru', client: 'web' })}`, { topics: ['products'] }, 'linkeon_help');
+      expect(en.ok).toBe(true);
+      expect(en.articles[0].text).toContain('«Studio»');
+      expect(ru.articles[0].text).toContain('«Студия»');
+    });
+
+    it('токен без языка (выпущен до справки) — язык из профиля', async () => {
+      const language = { resolveUserLanguage: jest.fn(async () => 'en') };
+      const { ctrl } = make(language);
+      const r: any = await ctrl.callTool(`Bearer ${signProductToolToken('u-test')}`, { topics: ['products'] }, 'linkeon_help');
+      expect(language.resolveUserLanguage).toHaveBeenCalledWith('u-test');
+      expect(r.articles[0].text).toContain('«Studio»');
+    });
+
+    it('стор: темы о деньгах в схеме не предлагаются', () => {
+      const { ctrl } = make();
+      const help: any = ctrl.listTools('web', { client: 'store' }).find((t: any) => t.name === 'linkeon_help');
+      expect(help.inputSchema.properties.topics.items.enum).not.toContain('payments');
+      expect(help.inputSchema.properties.topics.items.enum).toContain('products');
+    });
+
+    it('вызов пишется в статистику — темы, канал, клиент, без текста разговора', async () => {
+      const { ctrl, events } = make();
+      await ctrl.callTool(helpBearer({ lang: 'ru', client: 'telegram', agent: 'staff' }), { topics: ['studio-bots'] }, 'linkeon_help');
+      expect(events.track).toHaveBeenCalledWith('linkeon_help_call', {
+        userId: 'u-owner',
+        props: { channel: 'telegram', client: 'telegram', lang: 'ru', scope: 'help', agent: 'staff', topics: ['studio-bots'], index: false },
+      });
+    });
+
+    it('userId в аргументах справки ни на что не влияет', async () => {
+      const { ctrl, events } = make();
+      await ctrl.callTool(`Bearer ${signProductToolToken('u-test', 'web', { lang: 'ru' })}`, { topics: ['chat'], userId: 'u-other' }, 'linkeon_help');
+      expect(events.track.mock.calls[0][1].userId).toBe('u-test');
+    });
   });
 });
 
