@@ -42,6 +42,8 @@ function makeWorld(opts: {
   /** Что сделать внутри createJob: например, «новая задача тут же упала». */
   duringCreate?: (ledger: LedgerRow[]) => void;
   createFails?: boolean;
+  /** Сообщение в тикет не записывается (уже после COMMIT). */
+  messageFails?: boolean;
 } = {}) {
   const ledger = opts.ledger ?? [];
   const priorReruns = [...(opts.priorReruns ?? [])];
@@ -50,6 +52,7 @@ function makeWorld(opts: {
   const log: string[] = [];
   const tokenQueries: Array<{ sql: string; params: any[] }> = [];
   const statuses = new Map<string, string>([[OLD_JOB, 'failed']]);
+  const lockModes: Array<{ id: string; mode: string }> = [];
 
   // Блокировки строк: id → освобождение. Держатся до COMMIT/ROLLBACK.
   const held = new Map<string, Promise<void>>();
@@ -65,8 +68,12 @@ function makeWorld(opts: {
         const s = sql.replace(/\s+/g, ' ').trim();
         if (s === 'BEGIN') { log.push(`${name}:BEGIN`); return { rows: [] }; }
         if (s === 'COMMIT' || s === 'ROLLBACK') { log.push(`${name}:${s}`); unlockAll(); return { rows: [] }; }
-        if (/FROM video_jobs WHERE id = \$1 FOR UPDATE/.test(s)) {
+        const lockMode = /FROM video_jobs WHERE id = \$1 FOR (NO KEY UPDATE|UPDATE)\b/.exec(s)?.[1];
+        if (lockMode) {
+          // FOR UPDATE и FOR NO KEY UPDATE конфликтуют и сами с собой, и друг
+          // с другом — для перезапусков это одна и та же очередь.
           const id = params[0];
+          lockModes.push({ id, mode: lockMode });
           while (held.has(id)) await held.get(id);
           let release!: () => void;
           held.set(id, new Promise<void>((r) => { release = r; }));
@@ -103,6 +110,7 @@ function makeWorld(opts: {
 
   const pg = {
     query: jest.fn(async (sql: string, params: any[] = []) => {
+      if (opts.messageFails && /INSERT INTO support_messages/.test(sql)) throw new Error('support_messages: connection reset');
       // uuid в Postgres сравнивается без учёта регистра и отдаётся строчными.
       if (/FROM video_jobs WHERE id = \$1 AND user_id = \$2/.test(sql)) {
         if (String(params[0]).toLowerCase() !== OLD_JOB || params[1] !== USER) return { rows: [] };
@@ -134,7 +142,7 @@ function makeWorld(opts: {
 
   const svc = new SupportService(pg as any, undefined, video as any);
   const rerun = (jobId = OLD_JOB) => (svc as any).performRerun(TICKET, USER, { job_id: jobId });
-  return { rerun, credits, events, log, tokenQueries, video, ledger };
+  return { rerun, svc, credits, events, log, tokenQueries, lockModes, video, ledger };
 }
 
 const failureRefund = (jobId: string): LedgerRow => ({
@@ -233,6 +241,15 @@ describe('перезапуск упавшего видео — возврат', 
       expect(w.log.indexOf('createJob')).toBeGreaterThan(w.log.indexOf('c1:prior'));
     });
 
+    it('блокировки — FOR NO KEY UPDATE: проверке внешних ключей на строку они не мешают', async () => {
+      const w = makeWorld({ ledger: [failureRefund(OLD_JOB)] });
+      await w.rerun();
+      expect(w.lockModes).toEqual([
+        { id: OLD_JOB, mode: 'NO KEY UPDATE' },
+        { id: NEW_JOB, mode: 'NO KEY UPDATE' },
+      ]);
+    });
+
     it('два одновременных перезапуска: задача создаётся и оплачивается один раз', async () => {
       const w = makeWorld({ ledger: [failureRefund(OLD_JOB)] });
 
@@ -260,6 +277,21 @@ describe('перезапуск упавшего видео — возврат', 
       expect(w.events).toEqual([]);
       expect(w.log).toContain('c1:ROLLBACK');
     });
+  });
+
+  it('сообщение в тикет упало уже после COMMIT — ответ ok, возврат один', async () => {
+    // credit_failed здесь соврал бы: деньги начислены, и ИИ поддержки мог бы
+    // «добрать» их через refund_tokens.
+    const w = makeWorld({ ledger: [failureRefund(OLD_JOB)], messageFails: true });
+    const warn = jest.spyOn((w.svc as any).logger, 'warn').mockImplementation(() => undefined);
+
+    const res = await w.rerun();
+
+    expect(res).toMatchObject({ ok: true, new_job_id: NEW_JOB, credited: NEW_COST });
+    expect(w.credits).toHaveLength(1);
+    expect(w.log).toContain('c1:COMMIT');
+    expect(w.log).not.toContain('c1:ROLLBACK');
+    expect(warn).toHaveBeenCalled();
   });
 
   it('новая задача упала раньше, чем перезапуск успел вернуть её списание, — второй раз не возвращаем', async () => {
