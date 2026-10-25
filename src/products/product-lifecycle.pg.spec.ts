@@ -266,6 +266,32 @@ maybe('жизненный цикл продукта против живого Po
       const wake = await pool.query(`SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND kind = 'wake'`, [productId]);
       expect(Number(wake.rows[0].count)).toBe(0);
     });
+
+    it('токен бота архивного продукта тем временем занял другой живой продукт — bot_in_use, архив не снят', async () => {
+      const botId = 777777;
+      const userId = 'u-restore3';
+      // Удалённый бот — completeDelete tg_bot_id не трогает (009), поэтому
+      // строка архивного продукта держит его до сих пор. Частичный индекс
+      // products_tg_bot_live смотрит только на archived_at IS NULL, так что
+      // ВТОРОЙ, живой продукт с тем же tg_bot_id — это разрешённое состояние
+      // базы, а не испорченная фикстура.
+      const archived = await insertProduct({
+        userId, status: 'archived', slug: 'restore-bot-1',
+        archivedAt: new Date(), purgeAfter: new Date(Date.now() + 10 * 86_400_000),
+        tgBotId: botId,
+      });
+      await insertProduct({ userId, status: 'running', slug: 'restore-bot-2', tgBotId: botId });
+
+      const r = await svc.restore({ userId, productId: archived, channel: 'web' });
+      expect(r).toEqual({
+        ok: false, reason: 'bot_in_use',
+        message: 'Этот бот уже работает в другом продукте — удалённого не вернуть, пока его токен занят',
+      });
+
+      const row = (await pool.query('SELECT status, archived_at FROM products WHERE id = $1', [archived])).rows[0];
+      expect(row.status).toBe('archived');
+      expect(row.archived_at).not.toBeNull();
+    });
   });
 
   describe('первая правка', () => {

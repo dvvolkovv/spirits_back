@@ -218,6 +218,27 @@ describe('возврат', () => {
     expect(await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' })).toEqual({ ok: true, status: 'blocked', waking: false });
     expect(h.calls.some((c) => c.sql.includes("'wake', 'queued'"))).toBe(false);
   });
+
+  it('токен бота за время архива достался другому живому продукту — bot_in_use, не 500', async () => {
+    const h = harness({
+      pg: (sql) => {
+        if (sql.includes('AS busy')) return { rows: [deleted()] };
+        if (sql.includes('SET archived_at = NULL')) {
+          const e: any = new Error('duplicate key value violates unique constraint "products_tg_bot_live"');
+          e.code = '23505';
+          e.constraint = 'products_tg_bot_live';
+          throw e;
+        }
+        return null;
+      },
+    });
+    const r = await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' });
+    expect(r).toEqual({
+      ok: false, reason: 'bot_in_use',
+      message: 'Этот бот уже работает в другом продукте — удалённого не вернуть, пока его токен занят',
+    });
+    expect(h.actions.record).toHaveBeenCalledWith(expect.objectContaining({ kind: 'restore', status: 'failed', result: expect.objectContaining({ reason: 'bot_in_use' }) }));
+  });
 });
 
 describe('откат и первая правка', () => {

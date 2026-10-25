@@ -307,15 +307,32 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
         WHERE product_id = $1 AND status = 'queued'`,
       [p.id],
     );
-    const r = await this.pg.query(
-      `UPDATE products
-          SET archived_at = NULL, purge_after = NULL,
-              status = CASE WHEN block_reason IS NOT NULL THEN 'blocked' ELSE 'sleeping' END,
-              sleep_reason = CASE WHEN block_reason IS NULL AND paid_until <= now() THEN $3 ELSE sleep_reason END
-        WHERE id = $1 AND user_id = $2 AND archived_at IS NOT NULL AND purged_at IS NULL AND purge_after > now()
-        RETURNING status, paid_until > now() AS paid`,
-      [p.id, i.userId, SLEEP_REASON_NO_TOKENS],
-    );
+    let r: any;
+    try {
+      r = await this.pg.query(
+        `UPDATE products
+            SET archived_at = NULL, purge_after = NULL,
+                status = CASE WHEN block_reason IS NOT NULL THEN 'blocked' ELSE 'sleeping' END,
+                sleep_reason = CASE WHEN block_reason IS NULL AND paid_until <= now() THEN $3 ELSE sleep_reason END
+          WHERE id = $1 AND user_id = $2 AND archived_at IS NOT NULL AND purged_at IS NULL AND purge_after > now()
+          RETURNING status, paid_until > now() AS paid`,
+        [p.id, i.userId, SLEEP_REASON_NO_TOKENS],
+      );
+    } catch (e: any) {
+      // Токен бота этого (ещё архивного) продукта мог за время архива
+      // перейти живому продукту: частичный UNIQUE products_tg_bot_live
+      // смотрит только на archived_at IS NULL, и снятие архива здесь делает
+      // строку живой — то есть второй живой строкой с тем же tg_bot_id.
+      // completeDelete tg_bot_id с архивного продукта не снимает (он не
+      // участвует в индексе, пока продукт архивный), поэтому гонка возможна
+      // не на удалении, а именно здесь, на возврате.
+      if (e?.code === '23505' && e?.constraint === 'products_tg_bot_live') {
+        const message = 'Этот бот уже работает в другом продукте — удалённого не вернуть, пока его токен занят';
+        await this.actions.record({ userId: i.userId, productId: p.id, kind: 'restore', channel: i.channel, status: 'failed', payload: { name: p.name }, result: { reason: 'bot_in_use', error: message } });
+        return { ok: false, reason: 'bot_in_use', message };
+      }
+      throw e;
+    }
     const row = r.rows[0];
     if (!row) return { ok: false, reason: 'not_found', message: 'Удалённого продукта с таким именем нет' };
     let waking = false;
