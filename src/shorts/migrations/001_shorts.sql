@@ -20,6 +20,11 @@
 -- ОТКАТ (ролики пропадут): убрать ShortsSchemaService из shorts.module.ts —
 -- иначе следующий старт создаст таблицы заново, — затем
 --   DROP TABLE short_publication; DROP TABLE short_video; DROP TABLE short_settings;
+--
+-- НОВЫЕ КОЛОНКИ В СЛЕДУЮЩИХ МИГРАЦИЯХ ЭТОГО МОДУЛЯ: не через ALTER TABLE …
+-- ADD COLUMN IF NOT EXISTS — он берёт ACCESS EXCLUSIVE на каждом старте, даже
+-- если колонка уже есть, и блокирует чтения. Добавлять только под проверкой
+-- information_schema.columns (или pg_attribute), как индексы — под to_regclass.
 
 DO $shorts$
 BEGIN

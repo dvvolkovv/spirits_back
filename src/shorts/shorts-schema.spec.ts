@@ -5,7 +5,7 @@
  * форма не берёт лишних замков и не расходится с типами.
  */
 import { ShortsSchemaService } from './shorts-schema.service';
-import { ALLOWED_TRANSITIONS, SLOT_HOLDING_STATUSES } from './shorts.types';
+import { ALLOWED_TRANSITIONS, SLOT_HOLDING_STATUSES, RUBRICS, ANGLES } from './shorts.types';
 
 async function appliedSql(): Promise<string> {
   const queries: string[] = [];
@@ -58,5 +58,33 @@ describe('текст 001_shorts.sql', () => {
 
   it('строка настроек — под IF NOT EXISTS: обычный SELECT не ждёт чужую правку', async () => {
     expect(await appliedSql()).toMatch(/IF NOT EXISTS \(SELECT 1 FROM short_settings WHERE id = 1\) THEN\s+INSERT INTO short_settings/);
+  });
+
+  it('у каждой пары to_regclass/CREATE имя внутри to_regclass совпадает с именем создаваемого объекта, и незащищённых объектов нет', async () => {
+    const sql = await appliedSql();
+    const pairRe = /IF to_regclass\('public\.([a-zA-Z0-9_]+)'\) IS NULL THEN\s+CREATE (?:UNIQUE )?(?:TABLE|INDEX)\s+([a-zA-Z0-9_]+)/g;
+    const pairs = [...sql.matchAll(pairRe)].map((m) => [m[1], m[2]]);
+    for (const [guarded, created] of pairs) {
+      expect(created).toBe(guarded);
+    }
+    // Таблицы в этом файле защищены тем же to_regclass, что и индексы (другого
+    // способа защиты в файле нет) — поэтому пары считаем по обоим видам
+    // объектов и сверяем с общим числом CREATE TABLE/INDEX в файле.
+    const totalCreated = (sql.match(/CREATE (?:UNIQUE )?(?:TABLE|INDEX)\s+[a-zA-Z0-9_]+/g) ?? []).length;
+    expect(pairs.length).toBe(totalCreated);
+  });
+
+  it('CHECK у rubric перечисляет ровно RUBRICS', async () => {
+    const sql = await appliedSql();
+    const m = sql.match(/rubric\s+text NOT NULL CHECK \(rubric IN \(([^)]*)\)\)/);
+    const listed = (m?.[1].match(/'([a-z]+)'/g) ?? []).map((s) => s.slice(1, -1));
+    expect(listed.sort()).toEqual([...RUBRICS].sort());
+  });
+
+  it('CHECK у angle перечисляет ровно ANGLES', async () => {
+    const sql = await appliedSql();
+    const m = sql.match(/CHECK \(angle IN \(([^)]*)\)\)/);
+    const listed = (m?.[1].match(/'([a-z]+)'/g) ?? []).map((s) => s.slice(1, -1));
+    expect(listed.sort()).toEqual([...ANGLES].sort());
   });
 });
