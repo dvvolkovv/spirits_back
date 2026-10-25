@@ -11,8 +11,12 @@ import { studioAssistants } from './studio-assistants';
 import { studioBots } from './studio-bots';
 import { products } from './products';
 import { profile } from './profile';
+import { calendars } from './calendars';
+import { routines } from './routines';
+import { apps } from './apps';
 
 /** Все статьи справки. Порядок — порядок перечня в описании инструмента. */
 export const KB_ARTICLES: readonly KbArticle[] = [
   start, chat, call, meetings, networking, images, video, speech, studioAssistants, studioBots, products, profile,
+  calendars, routines, apps,
 ];

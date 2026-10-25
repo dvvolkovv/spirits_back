@@ -19,7 +19,8 @@ const SPEC_TOPICS = [
 ];
 const MAX_BYTES = 5 * 1024;
 const FREE_FORM = new Set(['how-it-works']);
-const HOST_ALLOW = new Set(['my.linkeon.io', 'linkeon.io', 't.me']);
+// yandex.calendar — не хост, а бренд «Yandex.Calendar» в подписи calYandex (es/fr/pt).
+const HOST_ALLOW = new Set(['my.linkeon.io', 'linkeon.io', 't.me', 'yandex.calendar']);
 const FORMAT_TOKENS = /\b(?:9:16|16:9|1:1|720p|1080p|4K)\b/g;
 
 interface Variant { id: string; lang: string; client: KbClient; text: string }
