@@ -13,27 +13,36 @@ export const YT_TAG_MAX = 30;
 export const SYNTH_NOTE = 'Озвучено синтезированным голосом.';
 export const STAND_MARK = '[СТЕНД] ';
 
-/** По символам, а не по UTF-16: эмодзи на границе не распадается пополам. */
+/** Предел — в единицах UTF-16 (`.length`), резка — по целым символам: эмодзи на границе не распадается. */
 export function clip(text: string, max: number): string {
-  const chars = Array.from(String(text ?? '').trim());
-  if (chars.length <= max) return chars.join('');
-  return `${chars.slice(0, Math.max(0, max - 1)).join('').trimEnd()}…`;
+  const str = String(text ?? '').trim();
+  if (str.length <= max) return str;
+  let out = '';
+  for (const ch of str) {
+    if (out.length + ch.length > max - 1) break;
+    out += ch;
+  }
+  return `${out.trimEnd()}…`;
 }
 
 /** Текст сценариста + хвост (ссылка, пометка) не длиннее max: режется текст, хвост цел. */
 function withTail(body: string, tail: string, max: number): string {
-  return `${clip(body, max - Array.from(tail).length)}${tail}`;
+  return `${clip(body, max - tail.length)}${tail}`;
 }
 
 export function tidyTags(tags: string[]): string[] {
   const out: string[] = [];
+  const seen = new Set<string>();
   let total = 0;
   for (const raw of tags ?? []) {
     const tag = clip(String(raw ?? '').replace(/^#+/, '').replace(/[<>,]/g, ' ').replace(/\s+/g, ' ').trim(), YT_TAG_MAX);
-    if (!tag || out.includes(tag)) continue;
-    const cost = Array.from(tag).length + 1;
+    const key = tag.toLowerCase();
+    if (!tag || seen.has(key)) continue;
+    // YouTube оборачивает тег с пробелом в кавычки — они тоже входят в предел 500.
+    const cost = tag.length + (tag.includes(' ') ? 2 : 0) + 1;
     if (total + cost > YT_TAGS_TOTAL_MAX) break;
     out.push(tag);
+    seen.add(key);
     total += cost;
   }
   return out;
