@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildTimeline } from './timeline';
+import { buildTimeline, MIN_ANSWER_LINE_MS } from './timeline';
+import { StudioError } from './errors';
 import type { LineScene, VoicedLine } from './types';
 
 const line = (id: string, scene: LineScene, durationMs: number, box?: number): VoicedLine => ({
@@ -65,4 +66,13 @@ test('ролик короче 30 с и длиннее 60 с не собирае�
     line('f', 'final', 2000),
   ];
   assert.throws(() => buildTimeline(long), /длиннее 60 с/);
+});
+
+test('реплика ответа короче 1,5 с — line_too_short: приближение не успеет', () => {
+  const s = sample();
+  s[2] = line('a1', 'answer', MIN_ANSWER_LINE_MS - 100, 1);
+  assert.throws(
+    () => buildTimeline(s),
+    (e: unknown) => e instanceof StudioError && e.code === 'line_too_short' && /реплика a1/.test(e.message),
+  );
 });

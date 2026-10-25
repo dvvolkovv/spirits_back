@@ -55,3 +55,12 @@ test('повтор id и пустая реплика', () => {
   assert.match(p, /повтор id реплики f/);
   assert.match(p, /реплика f пустая/);
 });
+
+test('зацепка опирается на снятый абзац', () => {
+  assert.deepEqual(validateScript({ ...good(), hookBox: 2 }, capture), []);
+  assert.match(validateScript({ ...good(), hookBox: 7 }, capture).join(';'), /зацепка опирается на абзац 7/);
+});
+
+test('в финале нужно число ассистентов', () => {
+  assert.match(validateScript({ ...good(), final: { assistantsCount: 0 } }, capture).join(';'), /числа ассистентов/);
+});

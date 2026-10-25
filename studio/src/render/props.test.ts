@@ -57,3 +57,8 @@ test('снимок ответа не той ширины — frame_size без �
     (e: unknown) => e instanceof StudioError && e.code === 'frame_size' && !e.retryable,
   );
 });
+
+test('подпись реального кейса доходит до композиции', () => {
+  const voiced = script.lines.map((l) => ({ id: l.id, file: `/run/voice/${l.id}.mp3`, durationMs: ms[l.id] }));
+  assert.equal(buildProps(capture, { ...script, badge: 'Реальная история' }, voiced, '/run').badge, 'Реальная история');
+});
