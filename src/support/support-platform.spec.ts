@@ -31,3 +31,34 @@ describe('ИИ-поддержка знает разделы платформы',
     expect(prompt({ language: 'ru' })).not.toMatch(/предложи «Связаться с поддержкой»/);
   });
 });
+
+describe('ИИ-поддержка и справка', () => {
+  const service = () => new SupportService({ query: async () => ({ rows: [] }) } as any);
+
+  it('на вопрос о платформе — сначала статья справки', () => {
+    expect(prompt({ language: 'ru' })).toMatch(/сначала возьми статью инструментом linkeon_help/);
+  });
+
+  it('сборка из стора: перечень разделов без партнёрской программы', () => {
+    const p = (service() as any).buildSystemPrompt({ language: 'ru' }, undefined, { storeBuild: true });
+    expect(p).toContain(platformSections('ru', { store: true }));
+    expect(p).not.toContain('«Партнёры»');
+  });
+
+  it('у поддержки есть инструмент linkeon_help, и он отвечает на языке пользователя', async () => {
+    const defs = (service() as any).supportToolDefs('t-1', 'u-test', { lang: 'en', client: 'web' });
+    const help = defs.find((d: any) => d.name === 'linkeon_help');
+    expect(help).toBeDefined();
+    const out = await help.handler({ topics: ['products'] }, {});
+    const result = JSON.parse(out.content[0].text);
+    expect(result.ok).toBe(true);
+    expect(result.articles[0].text).toContain('«Studio»');
+  });
+
+  it('прежние инструменты на месте', () => {
+    const names = (service() as any).supportToolDefs('t-1', 'u-test').map((d: any) => d.name);
+    for (const n of ['get_user_context', 'get_recent_jobs', 'check_service_health', 'refund_tokens', 'rerun_failed_job', 'escalate_to_owner']) {
+      expect(names).toContain(n);
+    }
+  });
+});
