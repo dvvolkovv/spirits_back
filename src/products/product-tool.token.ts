@@ -1,4 +1,5 @@
 import * as jwt from 'jsonwebtoken';
+import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
 
 /**
  * Отдельный тип, а не 'access'. Токен уезжает на релей и живёт там в файле
@@ -15,10 +16,54 @@ export const PRODUCT_TOOL_TOKEN_TYPE = 'product-tool';
  */
 export type ProductToolChannel = 'web' | 'telegram';
 
+/**
+ * Для справки (platform-kb): на каком клиенте ход и на каком языке подписи.
+ * Едут в подписи по той же причине, что владелец и канал: поле запроса пишет
+ * модель.
+ *   client — web | app (Flutter) | store (сборки из сторов) | telegram;
+ *   scope  — full (по умолчанию) или help: только справка, без продуктов и
+ *            файлов, — для ходов Telegram-группы с посторонними;
+ *   agent  — staff | custom, только для учёта вызовов справки.
+ * Все поля необязательны: токен без них (выпущенный до 24.10.2026) — прежний.
+ */
+export type ProductToolClient = 'web' | 'app' | 'store' | 'telegram';
+export type ProductToolScope = 'full' | 'help';
+export type ProductToolAgent = 'staff' | 'custom';
+
+const CLIENTS: readonly string[] = ['web', 'app', 'store', 'telegram'];
+const SCOPES: readonly string[] = ['full', 'help'];
+const AGENTS: readonly string[] = ['staff', 'custom'];
+
+export interface ProductToolTokenOpts {
+  lang?: string;
+  client?: ProductToolClient;
+  scope?: ProductToolScope;
+  agent?: ProductToolAgent;
+}
+
 /** Что несёт проверенный токен. */
-export interface ProductToolClaims {
+export interface ProductToolClaims extends ProductToolTokenOpts {
   userId: string;
   channel: ProductToolChannel;
+}
+
+/**
+ * Необязательные поля — одна проверка на выпуск и на разбор. Незнакомое
+ * значение подписать могли только мы сами, то есть это ошибка в коде: отказ,
+ * как у незнакомого канала. scope=full не пишется вовсе — его отсутствие и есть full.
+ */
+function extraClaims(src: any): ProductToolTokenOpts {
+  const out: ProductToolTokenOpts = {};
+  const check = (field: string, value: unknown, allowed: readonly string[]) => {
+    if (typeof value !== 'string' || !allowed.includes(value)) {
+      throw new Error(`Неизвестное значение ${field} в токене: ${value}`);
+    }
+  };
+  if (src?.lang != null) { check('lang', src.lang, SUPPORTED_LANGUAGES); out.lang = src.lang; }
+  if (src?.client != null) { check('client', src.client, CLIENTS); out.client = src.client; }
+  if (src?.scope != null) { check('scope', src.scope, SCOPES); if (src.scope === 'help') out.scope = 'help'; }
+  if (src?.agent != null) { check('agent', src.agent, AGENTS); out.agent = src.agent; }
+  return out;
 }
 
 /**
@@ -52,11 +97,15 @@ function previousSecret(): string | null {
  * Канал по умолчанию — web: так чеканит релей (веб-ассистенты), и так же
  * разбираются токены, выпущенные до появления канала.
  */
-export function signProductToolToken(userId: string, channel: ProductToolChannel = 'web'): string {
+export function signProductToolToken(
+  userId: string,
+  channel: ProductToolChannel = 'web',
+  opts: ProductToolTokenOpts = {},
+): string {
   // Незнакомый канал — отказ: без срока jwt.sign выпустил бы вечный токен.
   const ttl = TTL_SECONDS[channel];
   if (!ttl) throw new Error(`Неизвестный канал: ${channel}`);
-  return jwt.sign({ userId, type: PRODUCT_TOOL_TOKEN_TYPE, channel }, secret(), { expiresIn: ttl });
+  return jwt.sign({ userId, type: PRODUCT_TOOL_TOKEN_TYPE, channel, ...extraClaims(opts) }, secret(), { expiresIn: ttl });
 }
 
 /**
@@ -86,9 +135,9 @@ export function verifyProductToolToken(token: string): ProductToolClaims {
     throw new Error('В токене нет владельца');
   }
   const raw = payload?.channel;
-  if (raw === undefined || raw === null) return { userId, channel: 'web' };
-  if (raw !== 'web' && raw !== 'telegram') {
+  const channel = raw === undefined || raw === null ? 'web' : raw;
+  if (channel !== 'web' && channel !== 'telegram') {
     throw new Error(`Неизвестный канал в токене: ${raw}`);
   }
-  return { userId, channel: raw };
+  return { userId, channel, ...extraClaims(payload) };
 }
