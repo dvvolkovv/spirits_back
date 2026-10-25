@@ -89,4 +89,76 @@ describe('роутинг роликов в живом обработчике', (
     await (bare as any).handleCallbackQuery({ id: 'cb', data: 'short:ok:x', from: { id: 42 }, message: { chat: { id: 777 } } });
     expect(grammy.answerCallbackQuery).toHaveBeenCalledWith('cb', {});
   });
+
+  /**
+   * Кнопка ролика не остаётся без ответа: handleCallback сервиса либо отвечает
+   * сам (true — часики гасит он), либо нет (false/исключение) — и тогда часики
+   * гасит бот, тем же способом, что и при отсутствующем сервисе выше.
+   */
+  describe('кнопка ролика не остаётся без ответа', () => {
+    const cb = { id: 'cb', data: 'short:ok:x', from: { id: 42 }, message: { chat: { id: 777 } } };
+
+    it('handleCallback бросил исключение — часики гасит бот, исключение не выходит наружу', async () => {
+      shorts.handleCallback.mockRejectedValue(new Error('боль'));
+      await expect((svc as any).handleCallbackQuery(cb)).resolves.toBeUndefined();
+      expect(grammy.answerCallbackQuery).toHaveBeenCalledWith('cb', {});
+    });
+
+    it('handleCallback вернул false — часики гасит бот', async () => {
+      shorts.handleCallback.mockResolvedValue(false);
+      await (svc as any).handleCallbackQuery(cb);
+      expect(grammy.answerCallbackQuery).toHaveBeenCalledWith('cb', {});
+    });
+
+    it('handleCallback вернул true — бот повторно часики не гасит (сервис отвечает сам)', async () => {
+      shorts.handleCallback.mockResolvedValue(true);
+      await (svc as any).handleCallbackQuery(cb);
+      expect(grammy.answerCallbackQuery).not.toHaveBeenCalled();
+    });
+  });
+});
+
+/**
+ * Порванная связка: сервис не подставлен, но ролики включены флагом — тишина
+ * здесь означала бы, что никто не узнает, почему кнопки и /short молчат.
+ */
+describe('TgBotService.onModuleInit — порванная связка с роликами', () => {
+  const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+  const prevEnabled = process.env.SHORTS_ENABLED;
+
+  afterEach(() => {
+    if (prevEnabled === undefined) delete process.env.SHORTS_ENABLED;
+    else process.env.SHORTS_ENABLED = prevEnabled;
+  });
+
+  const buildBare = () =>
+    new TgBotService(
+      pg as any, {} as any, {} as any, {} as any, {} as any, {} as any, {} as any,
+      {} as any, {} as any, {} as any, {} as any, {} as any, {} as any,
+      undefined, undefined,
+    );
+
+  it('SHORTS_ENABLED=true и сервис не подставлен — предупреждение в лог', async () => {
+    process.env.SHORTS_ENABLED = 'true';
+    const svc = buildBare();
+    jest.spyOn(svc as any, 'applyMigration').mockResolvedValue(undefined);
+    jest.spyOn(svc as any, 'pruneWorkspaces').mockResolvedValue(undefined);
+    const warn = jest.spyOn((svc as any).logger, 'warn');
+    await svc.onModuleInit();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('ShortsApprovalService не подставлен'),
+    );
+  });
+
+  it('SHORTS_ENABLED не true — предупреждения нет', async () => {
+    delete process.env.SHORTS_ENABLED;
+    const svc = buildBare();
+    jest.spyOn(svc as any, 'applyMigration').mockResolvedValue(undefined);
+    jest.spyOn(svc as any, 'pruneWorkspaces').mockResolvedValue(undefined);
+    const warn = jest.spyOn((svc as any).logger, 'warn');
+    await svc.onModuleInit();
+    expect(warn).not.toHaveBeenCalledWith(
+      expect.stringContaining('ShortsApprovalService не подставлен'),
+    );
+  });
 });
