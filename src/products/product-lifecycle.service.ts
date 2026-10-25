@@ -140,7 +140,11 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       }
     }
     const check = await this.checkBot(secrets.BOT_TOKEN ?? '');
-    if (!check.ok) {
+    // `check.ok === false`, а не `!check.ok`: с выключенным strictNullChecks
+    // (tsconfig этого репо) негативная форма не сужает дискриминированное
+    // объединение до ветки с `reason` — компилятор держит обе ветки, и
+    // `check.reason` ниже не собирается. Равенство литералу сужает верно.
+    if (check.ok === false) {
       const message = check.reason === 'unreachable'
         ? 'Не удалось проверить токен в Telegram — попробуйте ещё раз через минуту'
         : 'Telegram не принял токен бота — скопируйте его целиком из @BotFather';
