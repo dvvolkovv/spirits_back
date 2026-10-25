@@ -16,6 +16,7 @@ import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert'
 import { clip, escapeHtml } from '../problem-report/problem-format';
 import { VideoService } from '../video/video.service';
 import { CreateVideoJobDto, isVeoModel } from '../video/video.dto';
+import { jobCostRefunded } from '../video/job-refund';
 import { MailService } from '../common/services/mail.service';
 import { LanguageService } from '../common/services/language.service';
 import { buildOwnerReplyEmail } from './support-mail';
@@ -678,15 +679,19 @@ ${healthSummary}
     ticketId: string, userId: string, input: any,
   ): Promise<{ ok: boolean; [k: string]: any }> {
     if (!this.video) return { ok: false, error: 'video_service_unavailable' };
-    const jobId = String(input?.job_id || '').trim();
-    if (!/^[0-9a-f-]{36}$/i.test(jobId)) return { ok: false, error: 'invalid_job_id' };
+    const inputJobId = String(input?.job_id || '').trim();
+    if (!/^[0-9a-f-]{36}$/i.test(inputJobId)) return { ok: false, error: 'invalid_job_id' };
 
     const r = await this.pg.query(
       `SELECT * FROM video_jobs WHERE id = $1 AND user_id = $2`,
-      [jobId, userId],
+      [inputJobId, userId],
     );
     const job = r.rows[0];
     if (!job) return { ok: false, error: 'job_not_found' };
+    // Дальше — только канонический id из базы. uuid Postgres сравнивает без
+    // учёта регистра, а payload и metadata — текст: номер в верхнем регистре
+    // прошёл бы мимо и защиты от повтора, и проверки возврата.
+    const jobId = String(job.id);
     if (job.status !== 'failed') return { ok: false, error: 'job_not_failed', status: job.status };
     if (job.mode === 'extend' || job.mode === 'lipsync') {
       return { ok: false, error: 'mode_not_supported', mode: job.mode };
@@ -696,15 +701,6 @@ ${healthSummary}
       return { ok: false, error: 'engine_retired', model: job.model };
     }
 
-    // Guard against double-rerun.
-    const prior = await this.pg.query(
-      `SELECT 1 FROM support_events
-       WHERE action = 'rerun_job' AND payload->>'original_job_id' = $1 LIMIT 1`,
-      [jobId],
-    );
-    if (prior.rows.length > 0) return { ok: false, error: 'already_rerun' };
-
-    // Step 1: createJob — it validates params, charges current price, dispatches to Veo.
     // Длина, формат, разрешение и референсы — из исходной задачи: duration_sec у
     // Veo всегда 8 (длина базы), настоящая длина лежит в target_duration_sec.
     const plan = job.composed_plan || {};
@@ -722,75 +718,92 @@ ${healthSummary}
       ownVoice: job.own_voice || undefined,
     };
 
-    let created: { jobId: string; status: string; tokensSpent: number };
-    try {
-      created = await this.video.createJob(userId, dto);
-    } catch (e: any) {
-      this.logger.error(`rerun createJob failed: ${e.message}`);
-      return { ok: false, error: 'create_failed', details: e.message };
-    }
-
-    // Шаг 2, одной транзакцией: перезапуск бесплатен — возвращаем ровно то,
-    // что сейчас списал createJob. Стоимость ИСХОДНОЙ задачи возвращаем,
-    // только если её ещё не вернули.
+    // Всё — одной транзакцией, и createJob внутри неё, под блокировкой строки
+    // исходной задачи. Так перезапуск одной задачи ровно один: второй вызов
+    // ждёт блокировку и видит запись первого. Проверить «уже перезапускали»
+    // после createJob было бы поздно — вторая задача уже создана и оплачена.
+    // createJob ходит своими соединениями и строку исходной задачи не трогает.
     //
-    // Раньше здесь всегда начислялось «новое списание + исходная стоимость».
-    // Но упавшая задача уже получает возврат в момент провала:
-    // VideoService.failAndRefund ставит status='failed' и начисляет 'refund'
-    // с metadata.job_id одной транзакцией, и это единственное место, где
-    // video_jobs становится 'failed'. Значит, исходная стоимость уходила
-    // человеку второй раз — и мимо лимитов refund_tokens, которые этот путь
-    // обходит намеренно (провал у провайдера подтверждён, на задачу — один раз).
-    //
-    // Признак «уже вернули» — строка 'refund' в token_transactions с
-    // metadata.job_id исходной задачи; её пишет failAndRefund. Через реестр он
-    // возвращает с 20.08.2026, а упавшие задачи старше 30 дней сносит
-    // cleanupOldFailedJobs, так что у любой задачи, которую можно
-    // перезапустить, такая строка есть. Проверка — на случай провала мимо
-    // failAndRefund: тогда исходную стоимость вернём здесь, как раньше.
-    // Статус 'failed' и возврат failAndRefund коммитит вместе, поэтому раз
-    // задача уже 'failed', её возврат виден и этому запросу.
+    // Возврат: перезапуск бесплатен — возвращаем списание новой задачи, а
+    // стоимость исходной — только если её ещё не вернули (jobCostRefunded):
+    // при провале её почти всегда уже вернул failAndRefund. Этот путь обходит
+    // лимиты refund_tokens намеренно, поэтому вернуть одно дважды здесь нельзя.
     const client = await this.pg.getClient();
-    let totalCredit = Number(created.tokensSpent);
-    let originalCredit = 0;
     try {
       await client.query('BEGIN');
-      const refunded = await client.query(
-        `SELECT 1 FROM token_transactions
-          WHERE user_id = $1 AND transaction_type = 'refund' AND metadata->>'job_id' = $2
-          LIMIT 1`,
-        [userId, jobId],
+      const locked = await client.query(
+        `SELECT id, status FROM video_jobs WHERE id = $1 FOR UPDATE`,
+        [jobId],
       );
-      if (refunded.rows.length === 0) {
-        originalCredit = Number(job.tokens_spent);
-        totalCredit += originalCredit;
+      if (locked.rows[0]?.status !== 'failed') {
+        await client.query('ROLLBACK');
+        return { ok: false, error: 'job_not_failed', status: locked.rows[0]?.status };
       }
-      // Через процедуру — возврат за перезапуск обязан быть в истории.
-      const upd = await client.query(
-        `SELECT add_user_tokens($1, $2, 'refund', $3, $4::jsonb) AS res`,
-        [userId, totalCredit, 'Возврат за перезапуск видео',
-         JSON.stringify({ ticket_id: ticketId, original_job_id: jobId, new_job_id: created.jobId })],
+      const prior = await client.query(
+        `SELECT 1 FROM support_events
+         WHERE action = 'rerun_job' AND payload->>'original_job_id' = $1 LIMIT 1`,
+        [jobId],
       );
-      await client.query(
-        `UPDATE ai_profiles_consolidated SET updated_at = now() WHERE user_id = $1`,
-        [userId],
-      );
+      if (prior.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return { ok: false, error: 'already_rerun' };
+      }
+
+      // createJob проверяет параметры, списывает текущую цену и запускает Veo.
+      let created: { jobId: string; status: string; tokensSpent: number };
+      try {
+        created = await this.video.createJob(userId, dto);
+      } catch (e: any) {
+        await client.query('ROLLBACK');
+        this.logger.error(`rerun createJob failed: ${e.message}`);
+        return { ok: false, error: 'create_failed', details: e.message };
+      }
+
+      // Строку новой задачи — тоже под блокировку: её провал (failAndRefund)
+      // либо уже вернул списание, и тогда мы его не повторяем, либо дождётся
+      // нашего COMMIT и увидит наш возврат.
+      await client.query(`SELECT id FROM video_jobs WHERE id = $1 FOR UPDATE`, [created.jobId]);
+      const newCredit = (await jobCostRefunded(client, userId, created.jobId)) ? 0 : Number(created.tokensSpent);
+      const originalCredit = (await jobCostRefunded(client, userId, jobId)) ? 0 : Number(job.tokens_spent);
+      const totalCredit = newCredit + originalCredit;
+
+      let newBalance: number;
+      if (totalCredit > 0) {
+        // Через процедуру — возврат за перезапуск обязан быть в истории.
+        // new_job_id читает jobCostRefunded: по нему провал новой задачи
+        // узнаёт, что её списание уже вернули.
+        const upd = await client.query(
+          `SELECT add_user_tokens($1, $2, 'refund', $3, $4::jsonb) AS res`,
+          [userId, totalCredit, 'Возврат за перезапуск видео',
+           JSON.stringify({ ticket_id: ticketId, original_job_id: jobId, new_job_id: created.jobId })],
+        );
+        await client.query(
+          `UPDATE ai_profiles_consolidated SET updated_at = now() WHERE user_id = $1`,
+          [userId],
+        );
+        const rawRes = upd.rows[0]?.res;
+        const parsedRes = typeof rawRes === 'string' ? JSON.parse(rawRes) : rawRes;
+        newBalance = Number(parsedRes?.new_balance ?? 0);
+      } else {
+        const bal = await client.query(
+          `SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1`,
+          [userId],
+        );
+        newBalance = Number(bal.rows[0]?.tokens ?? 0);
+      }
       await client.query(
         `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
          VALUES ($1, 'ai', NULL, 'rerun_job', $2::jsonb)`,
         [ticketId, JSON.stringify({
           original_job_id: jobId, original_cost: Number(job.tokens_spent),
-          // Сколько из исходной стоимости вернули здесь: 0, если её уже
-          // вернул failAndRefund в момент провала.
+          // 0, если стоимость исходной задачи уже вернули при провале.
           original_credited: originalCredit,
           new_job_id: created.jobId, new_cost: Number(created.tokensSpent),
+          new_credited: newCredit,
           total_credited: totalCredit,
         })],
       );
       await client.query('COMMIT');
-      const rawRes = upd.rows[0]?.res;
-      const parsedRes = typeof rawRes === 'string' ? JSON.parse(rawRes) : rawRes;
-      const newBalance = Number(parsedRes?.new_balance ?? 0);
 
       await this.insertMessage(
         ticketId, 'system', null,
