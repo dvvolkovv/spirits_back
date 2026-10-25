@@ -3,6 +3,7 @@ import type { KbArticle } from '../kb.types';
 // источник: Android — spirits_front src/components/settings/SettingsView.tsx:384-405; src/androidApp.ts:11; src/main.tsx:28-41 (обновления по воздуху)
 // источник: мини-приложение — spirits_front src/tma/App.tsx:16, choiceFlow.ts:20-67, screens/WalletScreen.tsx:11-16; src/tg-bot/tg-bot.service.ts:342-348
 // источник: виджет — spirits_front src/services/widgetClient.ts:63-92; src/app-widget/app-widget.controller.ts:7-18,110-141
+// источник: кнопка web_app — только непривязанному (tg-bot.service.ts:233-239,340-348); кнопка меню бота настраивается в BotFather, в коде её нет
 export const apps: KbArticle = {
   id: 'apps',
   title: 'Приложения',
@@ -13,7 +14,7 @@ export const apps: KbArticle = {
 Где ещё работает Linkeon, кроме сайта: Android-приложение, мини-приложение в Telegram, виджет на экране телефона.
 
 ## Где
-Android — ${q('settings')} → ${q('android')} → ${q('apkDownload')}. Мини-приложение — кнопка «Открыть Linkeon» в боте Linkeon в Telegram.
+Android — ${q('settings')} → ${q('android')} → ${q('apkDownload')}. Мини-приложение — кнопка «Открыть Linkeon», которую бот Linkeon присылает в личке, пока Telegram не привязан к аккаунту; если у бота есть кнопка меню рядом с полем ввода — через неё.
 
 ## Как
 - Android-приложение ставится файлом, не через Google Play; обновления приходят сами.

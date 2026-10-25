@@ -5,6 +5,7 @@ import type { KbArticle } from '../kb.types';
 // источник: карточки — src/chat/chat-tools.ts:188-256,421-464; spirits_front src/components/calendar/CalendarProposalCard.tsx:233-431 (подписи карточки не локализованы)
 // источник: куда записывается — src/calendar/calendar.service.ts:472-505,812-886
 // источник: Taler ID — spirits_front TalerIdEcosystemCard.tsx:30-56; relay-agent/server.mjs:297-333
+// источник: «Добавить» на карточке — только при подключённом Яндексе (chat-tools.ts:712 → calendar.service.ts:239-258 getStatus смотрит yandex; Taler ID не учитывается)
 export const calendars: KbArticle = {
   id: 'calendars',
   title: 'Календари',
@@ -33,7 +34,7 @@ ${q('profile')} → ${q('settings')} → ${q('calendars')}; рядом — ка�
 - Яндекс не подключается — нужен пароль приложения, а не обычный пароль.
 - Outlook — проверить домен, логин и пароль.
 - Ссылку не принимает — по ней в браузере должен скачиваться календарь.
-- На карточке ${q('connect')} вместо «Добавить» — для записи нужен Яндекс или Taler ID.
+- На карточке ${q('connect')} вместо «Добавить» — карточка сейчас даёт добавить, только когда подключён ${q('calYandex')}; с одним Taler ID она тоже просит подключить календарь — это известная неполадка, сообщить в поддержку.
 - Время событий съехало — сообщить в поддержку.
 - Ничего не помогло — ${q('support')} в разделе ${q('help')}.
 
