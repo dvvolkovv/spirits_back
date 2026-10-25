@@ -1,5 +1,6 @@
 import { BadRequestException, Body, ConflictException, Controller, NotFoundException, Post, Res, UseGuards } from '@nestjs/common';
 import { Response } from 'express';
+import { inTransaction } from '../blog/blog-slot-claim';
 import { AdminGuard } from '../common/guards/admin.guard';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { PgService } from '../common/services/pg.service';
@@ -10,6 +11,19 @@ import { ShortOrderError, ShortsTopicService } from './shorts-topic.service';
 import { ShortPublication, ShortVideo, retryTarget, rowToPublication, rowToShort, shortsBucket } from './shorts.types';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Пост в Telegram-канале, как его строит ShortsPublisherService.toTelegram
+ * (через buildPostUrl блога): публичный канал — `t.me/<username>/<n>`,
+ * приватный — `t.me/c/<id>/<n>`. Номер поста — последний сегмент, он же
+ * `external_id` площадки.
+ */
+const TG_POST_URL = /^https:\/\/t\.me\/(?:c\/\d+|[A-Za-z0-9_]{3,32})\/(\d+)$/;
+
+function parseTelegramPostUrl(url: string): string | null {
+  const m = TG_POST_URL.exec(String(url ?? '').trim());
+  return m ? m[1] : null;
+}
 
 /**
  * Админка роликов: действия в одном POST, как admin/blog. Вкладка кабинета
@@ -67,6 +81,8 @@ export class ShortsController {
       }
       case 'publish_now':
         return res.status(200).json(await this.publishNow(String(data.id ?? '')));
+      case 'mark_published':
+        return res.status(200).json(await this.markPublished(String(data.id ?? ''), String(data.url ?? '')));
       case 'retry':
         return res.status(200).json(await this.retry(String(data.id ?? '')));
       case 'get_settings':
@@ -123,6 +139,61 @@ export class ShortsController {
     }
     if (!r.rows.length) throw new ConflictException('опубликовать сейчас можно только одобренный ролик');
     return rowToShort(r.rows[0]);
+  }
+
+  /**
+   * Исход отправки в Telegram неизвестен (обрыв, таймаут, 5xx, рестарт
+   * посреди отправки — ShortsPublisherService.toTelegram) — ролик и строка
+   * telegram уже в `failed`/`failed_from = 'publishing'`, «Повторить» продублирует
+   * пост. Если владелец увидел пост в канале сам — отмечаем строку telegram
+   * `published` и возвращаем ролик в `approved` со слотом «сейчас», условием
+   * на `failed`/`failed_from = 'publishing'`, как у `retry`.
+   *
+   * Дальше решает публикатор сам: на ближайшем тике `publish()` захватит
+   * approved-ролик, у площадки telegram статус уже `published` —
+   * `platform()` её не заберёт (захват только pending/failed), telegramDone
+   * увидит вышедший пост и продолжит набором YouTube, если он в настройках;
+   * когда все площадки отработали — `settle()` ставит `published`.
+   *
+   * Одна транзакция: строка площадки и статус ролика не разойдутся, если
+   * один из двух запросов упадёт.
+   */
+  private async markPublished(id: string, url: string): Promise<any> {
+    const v = await this.load(id);
+    const externalId = parseTelegramPostUrl(url);
+    if (!externalId) {
+      throw new BadRequestException(
+        'url — ссылка на пост вида https://t.me/<канал>/<номер> (приватный канал — https://t.me/c/<id>/<номер>)',
+      );
+    }
+    if (v.status !== 'failed' || v.failedFrom !== 'publishing' || !v.approvedAt) {
+      throw new ConflictException('пометить вышедшим можно только ролик, упавший на публикации');
+    }
+    try {
+      await inTransaction(this.pg, async (tx) => {
+        await tx.query(
+          `INSERT INTO short_publication (short_id, platform, status, url, external_id, published_at, last_error, updated_at)
+                VALUES ($1, 'telegram', 'published', $2, $3, now(), NULL, now())
+              ON CONFLICT (short_id, platform) DO UPDATE
+                SET status = 'published', url = $2, external_id = $3,
+                    published_at = COALESCE(short_publication.published_at, now()),
+                    last_error = NULL, updated_at = now()`,
+          [id, url, externalId],
+        );
+        const r = await tx.query(
+          `UPDATE short_video
+              SET status = 'approved', failed_from = NULL, last_error = NULL, failure_notified = false,
+                  attempts = 0, slot_at = now(), updated_at = now()
+            WHERE id = $1 AND status = 'failed' AND failed_from = 'publishing'`,
+          [id],
+        );
+        if (!r.rowCount) throw new ConflictException('ролик успел уйти из failed — обновите список');
+      });
+    } catch (e: any) {
+      if (isShortSlotConflict(e)) throw new ConflictException('slot_taken');
+      throw e;
+    }
+    return this.getOne(id);
   }
 
   /**
