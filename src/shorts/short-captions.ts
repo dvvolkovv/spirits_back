@@ -95,6 +95,6 @@ export function buildReviewCaption(i: ReviewCaptionInput): { caption: string; ex
     `YouTube — описание:\n${i.captions.youtube.description}`,
   ].join('\n\n');
   const full = `${head}\n\n${texts}`;
-  if (Array.from(full).length <= TG_CAPTION_MAX) return { caption: full, extra: null };
+  if (full.length <= TG_CAPTION_MAX) return { caption: full, extra: null };
   return { caption: head, extra: `Подписи к ролику\n\n${texts}` };
 }
