@@ -3708,7 +3708,8 @@ describe('ShortsDirectorService.direct', () => {
 
     const [sql, params] = pg.query.mock.calls[1] as any[];
     expect(sql).toMatch(/SET status = 'capture_queued'/);
-    expect(sql).toMatch(/WHERE id = \$1 AND status = 'directing'/);
+    expect(sql).toMatch(/WHERE id = \$1 AND status = 'directing' AND attempts = \$6/);
+    expect(params[5]).toBe(1);
     expect(JSON.parse(params[1])).toEqual({
       kind: 'chat', assistantId: 10, assistantName: 'Алексей', question: REPLY.question, followups: REPLY.followups,
     });
@@ -3842,10 +3843,11 @@ export class ShortsDirectorService {
       `UPDATE short_video
           SET status = 'capture_queued', scene = $2::jsonb, assistant_id = $3, slug = $4, title = $5,
               attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
-        WHERE id = $1 AND status = 'directing'`,
-      [v.id, JSON.stringify(scene), reply.assistantId, v.slug ?? shortSlug(reply.title, v.id), reply.title],
+        WHERE id = $1 AND status = 'directing' AND attempts = $6`,
+      [v.id, JSON.stringify(scene), reply.assistantId, v.slug ?? shortSlug(reply.title, v.id), reply.title, v.attempts],
     );
-    if (r.rowCount === 0) this.logger.warn(`ролик ${v.id} ушёл из directing, пока работал режиссёр — сцену не записал`);
+    // attempts = номер захвата: опоздавший процесс не пишет поверх того, кто забрал этап после него.
+    if (r.rowCount === 0) this.logger.warn(`ролик ${v.id} ушёл из directing или его забрал другой процесс — сцену не записал`);
   }
 }
 ```
@@ -4109,10 +4111,11 @@ export class ShortsWriterService {
             SET status = 'render_queued', script = $2::jsonb, captions = $3::jsonb, slug = $4,
                 writer_feedback = NULL, writer_rounds = writer_rounds + 1,
                 attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
-          WHERE id = $1 AND status = 'writing'`,
-        [v.id, JSON.stringify(script), JSON.stringify(buildCaptions(reply.captions, links)), slug],
+          WHERE id = $1 AND status = 'writing' AND attempts = $5`,
+        [v.id, JSON.stringify(script), JSON.stringify(buildCaptions(reply.captions, links)), slug, v.attempts],
       );
-      if (r.rowCount === 0) this.logger.warn(`ролик ${v.id} ушёл из writing, пока работал сценарист — сценарий не записал`);
+      // attempts = номер захвата: опоздавший процесс не пишет поверх того, кто забрал этап после него.
+      if (r.rowCount === 0) this.logger.warn(`ролик ${v.id} ушёл из writing или его забрал другой процесс — сценарий не записал`);
       return;
     }
     throw new StageFatalError(`сценарист: правила текста не прошли и после ${MAX_REWRITES} переписок — ${violations.join('; ')}`);
@@ -4123,10 +4126,10 @@ export class ShortsWriterService {
     const r = await this.pg.query(
       `UPDATE short_video
           SET status = 'directing', owner_note = $2, attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
-        WHERE id = $1 AND status = 'writing'`,
-      [v.id, appendOwnerNote(v.ownerNote, `Сценарист: ${reason}`)],
+        WHERE id = $1 AND status = 'writing' AND attempts = $3`,
+      [v.id, appendOwnerNote(v.ownerNote, `Сценарист: ${reason}`), v.attempts],
     );
-    if (r.rowCount === 0) this.logger.warn(`ролик ${v.id} ушёл из writing — к режиссёру не вернул`);
+    if (r.rowCount === 0) this.logger.warn(`ролик ${v.id} ушёл из writing или его забрал другой процесс — к режиссёру не вернул`);
     else this.logger.log(`ролик ${v.id}: сценарист просит новую сцену — ${reason}`);
   }
 }
@@ -5841,7 +5844,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import { autoTopicsEnabled, shortsEnabled } from './short-env';
-import { ApiStage, claimStage, stageFailed } from './short-jobs';
+import { ApiStage, claimStage, stageFailed, withStageDeadline } from './short-jobs';
 import { ShortsApprovalService } from './shorts-approval.service';
 import { ShortsDirectorService } from './shorts-director.service';
 import { ShortsPublisherService } from './shorts-publisher.service';
@@ -5905,10 +5908,13 @@ export class ShortsCron {
     const v = await claimStage(this.pg, status);
     if (!v) return;
     try {
-      await run(v);
+      // Срок этапа короче аренды: таймаут axios не действует после заголовков
+      // ответа, и зависший релей иначе держал бы этап, пока его не заберёт второй процесс.
+      await withStageDeadline(() => run(v));
     } catch (e: any) {
       const outcome = await stageFailed(this.pg, v, label, e);
-      this.logger.warn(`ролик ${v.id}: ${label} — ${e?.message ?? e} (${outcome === 'retry' ? `повтор, попытка ${v.attempts}` : 'failed'})`);
+      const what = outcome === 'retry' ? `повтор, попытка ${v.attempts}` : outcome === 'gone' ? 'ролик уже не на этапе' : 'failed';
+      this.logger.warn(`ролик ${v.id}: ${label} — ${e?.message ?? e} (${what})`);
     }
   }
 
@@ -6796,6 +6802,22 @@ maybe('ролики против живого Postgres', () => {
     expect(await stageFailed(pool, third, 'режиссёр', new Error('релей молчит'))).toBe('failed');
     const row = (await pool.query(`SELECT * FROM short_video WHERE id = $1`, [v.id])).rows[0];
     expect([row.status, row.failed_from, row.failure_notified, row.last_error]).toEqual(['failed', 'directing', false, 'режиссёр: релей молчит']);
+  });
+
+  it('аренда истекла посреди работы: опоздавший процесс не трогает чужой захват; зависшая последняя попытка — failed', async () => {
+    const v = await insert({ status: 'directing' });
+    const a = await claimStage(pool, 'directing');
+    await pool.query(`UPDATE short_video SET lease_until = now() - interval '1 second' WHERE id = $1`, [v.id]);
+    const b = await claimStage(pool, 'directing');
+    expect(b.attempts).toBe(2);
+    expect(await stageFailed(pool, a, 'режиссёр', new Error('поздно'))).toBe('gone');
+    const kept = (await pool.query(`SELECT attempts, last_error, lease_until > now() + interval '15 minutes' AS long FROM short_video WHERE id = $1`, [v.id])).rows[0];
+    expect(kept).toEqual({ attempts: 2, last_error: null, long: true });
+
+    await pool.query(`UPDATE short_video SET attempts = 3, lease_until = now() - interval '1 second' WHERE id = $1`, [v.id]);
+    expect(await claimStage(pool, 'directing')).toBeNull();
+    const row = (await pool.query(`SELECT status, failed_from, failure_notified FROM short_video WHERE id = $1`, [v.id])).rows[0];
+    expect(row).toEqual({ status: 'failed', failed_from: 'directing', failure_notified: false });
   });
 
   it('ответ на приглашение узнаётся по большому id сообщения, замечание уводит ролик на переписку', async () => {
