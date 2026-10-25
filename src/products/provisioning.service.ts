@@ -31,6 +31,18 @@ export interface CreateInput {
    * машине — то есть тихую ошибку маршрутизации вместо ошибки типов.
    */
   isAdmin: boolean;
+  /**
+   * Идентификатор бота Telegram (из getMe), уже проверенный вызывающим.
+   *
+   * Заполняется ТОЛЬКО путём ассистента (product-lifecycle.service), после
+   * успешного getMe и до создания продукта — так гонка «второй токен успел
+   * пройти раннюю проверку, пока первый ждал ответ Telegram» ловится не
+   * кодом между SELECT и UPDATE, а партиционным UNIQUE-индексом
+   * `products_tg_bot_live` (009): столкновение приходит сюда как 23505, а не
+   * как молчаливый дубль. Студия продукт без бота заводит и это поле не
+   * передаёт вовсе.
+   */
+  tgBotId?: number;
 }
 
 /**
@@ -594,8 +606,8 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     try {
       await this.pg.query(
         `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash,
-                               secrets_encrypted, domain, host_ip, health_url, host_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+                               secrets_encrypted, domain, host_ip, health_url, host_id, tg_bot_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
         [
           productId,
           input.userId,
@@ -621,6 +633,12 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
           // агенту достанется работа, и по ней же кабинет судит о жизни
           // агента (hostAgentsLiveForUser).
           host.id,
+          // Пишется ТЕМ ЖЕ оператором, что заводит продукт — не отдельным
+          // UPDATE после. Между «создали» и «пометили бот занятым» отдельный
+          // UPDATE оставлял бы окно, где два INSERT с одним tg_bot_id оба
+          // проходят (ни у одного ещё нет метки), а партиционный индекс
+          // ниже стоит именно на products, а не на промежуточном шаге.
+          input.tgBotId ?? null,
         ],
       );
     } catch (e: any) {
@@ -637,6 +655,15 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       // 500. Имена ограничений сняты с живой базы.
       if (e?.code === '23505' && e?.constraint === 'products_slug_key') {
         throw new ConflictException('слаг уже занят');
+      }
+      // Та же гонка, но за токен бота: два ожидающих подтверждения с одним
+      // getMe прошли раннюю проверку оба (она читает только живые продукты,
+      // а на этот момент ни у одного ещё нет строки), и вторым INSERT сюда
+      // бьёт products_tg_bot_live (009_product_actions.sql). Сообщение то же,
+      // что у ранней проверки в completeCreateBot — карточка вернётся в
+      // ожидание с одинаковым текстом независимо от того, где гонка поймана.
+      if (e?.code === '23505' && e?.constraint === 'products_tg_bot_live') {
+        throw new ConflictException('бот уже работает в другом продукте');
       }
       throw e;
     }

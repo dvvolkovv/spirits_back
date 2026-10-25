@@ -70,4 +70,14 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_products_purge_after') THEN
     CREATE INDEX idx_products_purge_after ON products (purge_after) WHERE archived_at IS NOT NULL AND purged_at IS NULL;
   END IF;
+  -- Один живой бот Telegram — один живой продукт. Без этого индекса два
+  -- ожидающих подтверждения создания бота с ОДНИМ токеном проходят раннюю
+  -- SELECT-проверку оба (её нет, или оба успевают пройти её до INSERT),
+  -- заводят два продукта на один getMe, и Telegram отдаёт обновления только
+  -- одному — второй выглядит мёртвым без единой ошибки. UNIQUE, а не
+  -- проверка в коде между SELECT и UPDATE: гонку ловит только база. Частичный
+  -- и по archived_at — удалённый продукт отдаёт свой tg_bot_id следующему.
+  IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'products_tg_bot_live') THEN
+    CREATE UNIQUE INDEX products_tg_bot_live ON products (tg_bot_id) WHERE archived_at IS NULL AND tg_bot_id IS NOT NULL;
+  END IF;
 END $$;

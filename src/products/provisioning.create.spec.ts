@@ -210,9 +210,9 @@ describe('ProvisioningService.create', () => {
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
     expect(insert.sql).toContain(
       '(id, user_id, name, slug, kind, status, checkout_path, runner_token_hash,\n' +
-        '                               secrets_encrypted, domain, host_ip, health_url, host_id)',
+        '                               secrets_encrypted, domain, host_ip, health_url, host_id, tg_bot_id)',
     );
-    expect(insert.sql).toContain('VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)');
+    expect(insert.sql).toContain('VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)');
     expect(insert.params).toEqual([
       res.productId,
       'u-1',
@@ -244,6 +244,10 @@ describe('ProvisioningService.create', () => {
       // очереди, через десять минут его хоронит сборщик зависших, и владелец
       // читает про истёкший срок.
       'clients',
+      // tg_bot_id, четырнадцатой колонкой. Студия сайт/бота без токена
+      // заводит и это поле не передаёт вовсе — null, а не колонка по
+      // умолчанию в DDL: заведение задаёт его явно, как и прочие поля.
+      null,
     ]);
   });
 
