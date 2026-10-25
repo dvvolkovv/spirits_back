@@ -60,11 +60,20 @@ maybe('жизненный цикл продукта против живого Po
     // isAdmin() (а он — на каждом createSite/completeCreateBot/restore) падает
     // "relation does not exist" прежде, чем до продуктовой логики дойдёт
     // вообще что-то.
+    //
+    // CREATE + отдельный ALTER ADD COLUMN IF NOT EXISTS, а не только CREATE:
+    // одноразовая база pl_test разделена со всеми остальными pg-спеками этого
+    // каталога (provisioning.integration.spec.ts заводит ту же таблицу своим
+    // ensureBillingTables() для аренды — БЕЗ isadmin), и CREATE TABLE IF NOT
+    // EXISTS на уже существующей таблице не добавляет недостающую колонку.
+    // Измерено: прогон этого файла после provisioning.integration.spec.ts в
+    // той же базе падал на "column isadmin does not exist".
     await pool.query(`CREATE TABLE IF NOT EXISTS ai_profiles_consolidated (
       id serial PRIMARY KEY,
       user_id text NOT NULL UNIQUE,
       isadmin boolean DEFAULT false,
       tokens bigint DEFAULT 0 NOT NULL)`);
+    await pool.query(`ALTER TABLE ai_profiles_consolidated ADD COLUMN IF NOT EXISTS isadmin boolean DEFAULT false`);
 
     // ГАРД НА ЧУЖУЮ БАЗУ — та же причина, что в provisioning.integration.spec.ts.
     const n = await pool.query('SELECT count(*) FROM products');
