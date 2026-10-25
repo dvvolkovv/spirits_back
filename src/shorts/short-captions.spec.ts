@@ -113,7 +113,13 @@ describe('buildReviewCaption', () => {
 
   it('не влезает — подписи вторым сообщением', () => {
     const r = buildReviewCaption({ ...base, captions: buildCaptions({ ...w, telegram: 'я'.repeat(900) }, links) });
-    expect(Array.from(r.caption).length).toBeLessThanOrEqual(TG_CAPTION_MAX);
+    expect(r.caption.length).toBeLessThanOrEqual(TG_CAPTION_MAX);
+    expect(r.extra).toContain('Telegram:');
+  });
+
+  it('подпись Telegram из эмодзи: символов меньше 1000, единиц UTF-16 больше — подписи вторым сообщением', () => {
+    const r = buildReviewCaption({ ...base, captions: buildCaptions({ ...w, telegram: '😀'.repeat(380) }, links) });
+    expect(r.caption.length).toBeLessThanOrEqual(TG_CAPTION_MAX);
     expect(r.extra).toContain('Telegram:');
   });
 
