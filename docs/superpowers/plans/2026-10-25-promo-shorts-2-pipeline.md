@@ -5793,7 +5793,7 @@ describe('ShortsCron', () => {
     await d.cron.work();
     expect(d.director.direct).toHaveBeenCalledTimes(1);
     const retry = d.pg.query.mock.calls.find((c: any[]) => String(c[0]).includes('make_interval(secs => $3)')) as any[];
-    expect(retry[1]).toEqual(['v1', 'directing', 60, 'режиссёр: релей молчит']);
+    expect(retry[1]).toEqual(['v1', 'directing', 60, 'режиссёр: релей молчит', 1]);
     expect(d.writer.write).not.toHaveBeenCalled();
     expect(d.approval.sendPendingReviews).toHaveBeenCalled();
     expect(d.approval.notifyFailures).toHaveBeenCalled();
@@ -6852,10 +6852,10 @@ maybe('ролики против живого Postgres', () => {
 - [ ] **Step 3: Убедиться, что без базы файл пропускается, а с базой — зелёный**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.integration.spec.ts"`
-Expected: `Tests: 5 skipped`.
+Expected: `Tests: 6 skipped`.
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts"`
-Expected: `Tests: 5 passed`.
+Expected: `Tests: 6 passed`.
 
 Красный тест здесь — дефект SQL, а не теста. Гонка одобрений: два одинаковых слота — индекса `uq_short_video_slot` нет или он создан не тем предикатом (блокировка свободный слот не держит, его держит индекс); отказ с сырым 23505 — имя индекса в миграции разошлось с `SHORT_SLOT_INDEX`.
 
@@ -9204,7 +9204,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - [ ] **Step 1: Бэкенд — затронутые каталоги, живой Postgres, гейт типов**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "rm -f /tmp/promo-jest.log; npx jest src/shorts src/tg-bot src/blog > /tmp/promo-jest.log 2>&1 || true; grep -q '^Tests: ' /tmp/promo-jest.log || { tail -30 /tmp/promo-jest.log; echo JEST_DID_NOT_RUN; exit 1; }; grep -oE '^FAIL [^ ]+' /tmp/promo-jest.log | sort -u > /tmp/promo-fail-now.txt; comm -13 ~/ci/promo-shorts-jest-fail-base.txt /tmp/promo-fail-now.txt > /tmp/promo-fail-new.txt; cat /tmp/promo-fail-new.txt; test ! -s /tmp/promo-fail-new.txt && echo NO_NEW_FAILS && SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
-Expected: `NO_NEW_FAILS`; интеграционный — `5 passed`; `TSC_OK`.
+Expected: `NO_NEW_FAILS`; интеграционный — `6 passed`; `TSC_OK`.
 
 - [ ] **Step 2: Сборка API не изменила раскладку `dist/`**
 
