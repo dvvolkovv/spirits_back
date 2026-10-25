@@ -16,15 +16,22 @@ echo "║   REFERRAL SYSTEM E2E TEST                              ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 
 # Clean previous test data
-sudo bash -c "su - postgres -c \"psql -d linkeon << 'SQL'
+# Сначала — аккаунты, к которым ведут связки тестовых номеров: у аккаунта,
+# заведённого не по номеру, internal_id не похож на номер, и прежние условия
+# его не находили. user_identities ссылается на user_id с ON DELETE CASCADE.
+# Ошибки очистки не прячем: все таблицы здесь есть на любом стенде, а молча
+# недочищенные данные ломают сценарии дальше так, что не понять почему.
+sudo bash -c "su - postgres -c \"psql -v ON_ERROR_STOP=1 -d linkeon << 'SQL'
+DELETE FROM user_id WHERE internal_id IN (SELECT user_id FROM user_identities WHERE provider='phone' AND provider_sub LIKE '7900000%');
 DELETE FROM referral_commissions WHERE referee_phone LIKE '7900000%';
 DELETE FROM referral_referees WHERE referee_phone LIKE '7900000%';
 DELETE FROM referral_leaders WHERE slug IN ('leader-alpha', 'leader-beta');
 DELETE FROM payments WHERE user_id LIKE '7900000%';
 DELETE FROM ai_profiles_consolidated WHERE user_id LIKE '7900000%';
 DELETE FROM user_id WHERE primary_phone LIKE '7900000%' OR internal_id LIKE '7900000%';
+DELETE FROM user_identities WHERE provider='phone' AND provider_sub LIKE '7900000%';
 SQL
-\"" 2>/dev/null
+\"" || { echo "  ✗ очистка прежних тестовых данных упала — прогон недостоверен" >&2; exit 1; }
 
 echo ""
 echo "━━━ 1. Создание лидера уровня 1 (Admin) ━━━"
@@ -245,13 +252,14 @@ echo "  TEST COMPLETE"
 echo "═══════════════════════════════════════"
 
 # Cleanup test data
-sudo bash -c "su - postgres -c \"psql -d linkeon << 'SQL'
+sudo bash -c "su - postgres -c \"psql -v ON_ERROR_STOP=1 -d linkeon << 'SQL'
+DELETE FROM user_id WHERE internal_id IN (SELECT user_id FROM user_identities WHERE provider='phone' AND provider_sub LIKE '7900000%');
 DELETE FROM referral_commissions WHERE referee_phone LIKE '7900000%';
 DELETE FROM referral_referees WHERE referee_phone LIKE '7900000%';
 DELETE FROM referral_leaders WHERE slug IN ('leader-alpha', 'leader-beta');
 DELETE FROM payments WHERE user_id LIKE '7900000%';
 DELETE FROM ai_profiles_consolidated WHERE user_id LIKE '7900000%';
 DELETE FROM user_id WHERE primary_phone LIKE '7900000%' OR internal_id LIKE '7900000%';
+DELETE FROM user_identities WHERE provider='phone' AND provider_sub LIKE '7900000%';
 SQL
-\"" 2>/dev/null
-echo "  Cleanup done"
+\"" && echo "  Cleanup done" || echo "  ✗ очистка тестовых данных упала — следующий прогон начнёт с её повтора" >&2

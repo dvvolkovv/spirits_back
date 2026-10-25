@@ -184,6 +184,15 @@ export class ProfileService implements OnModuleInit {
     // для нового аккаунта с тем же адресом, а primary_email — единственная
     // оставшаяся копия адреса.
     await this.pg.query('DELETE FROM user_identities WHERE user_id = $1', [userId]);
+    // Связка Telegram-бота — тоже связка входа: по ней мини-приложение узнаёт
+    // «старожилов бота», выдаёт им токены и заново заводит строку в
+    // user_identities. Пока она переживала удаление, Telegram удалённого
+    // аккаунта входил в него обратно. Бот и биллинг ботов отсутствие строки
+    // уже понимают — так выглядит любой, кто Telegram не привязывал: личка
+    // предложит подключиться, у групповых конфигов просто некому писать о
+    // балансе. Сама строка 1:1, так что освобождается и сам Telegram — его
+    // можно привязать к другому аккаунту без упора в UNIQUE (tg_user_id).
+    await this.pg.query('DELETE FROM tg_user_identities WHERE linkeon_user_id = $1', [userId]);
     await this.pg.query(
       `UPDATE user_id
        SET state = 'deleted', password_hash = NULL, primary_email = NULL,

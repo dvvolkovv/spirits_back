@@ -65,7 +65,7 @@ const PG = process.env.REFERRAL_PG_URL;
 const maybe = PG ? describe : describe.skip;
 
 const TRUNCATE_ALL =
-  'TRUNCATE ai_profiles_consolidated, token_transactions, balance_audit, ' +
+  'TRUNCATE ai_profiles_consolidated, user_id, token_transactions, balance_audit, ' +
   'referral_leaders, referral_referees, referral_commissions, ' +
   'referral_token_payouts, referral_withdrawals RESTART IDENTITY CASCADE';
 
@@ -115,6 +115,11 @@ maybe('Реферальные начисления против живого Pos
         );
       }
     }
+
+    // Колонку дня рождения аккаунта заводит identity/migrations/001 (на проде
+    // она есть), в снимке base/001 её нет. register без неё не отличит новый
+    // аккаунт от давнего.
+    await pool.query('ALTER TABLE user_id ADD COLUMN IF NOT EXISTS welcome_bonus_at timestamptz');
 
     // Починка гонки в add_user_tokens (tokens/migrations/001) здесь не нужна:
     // проверяется учёт, а не блокировка. База получает то же определение, что
@@ -189,6 +194,21 @@ maybe('Реферальные начисления против живого Pos
     await pool.query('INSERT INTO ai_profiles_consolidated (user_id, tokens) VALUES ($1, $2)', [userId, tokens]);
     return userId;
   }
+
+  /**
+   * Строка аккаунта с датой рождения: register привязывает только аккаунт,
+   * заведённый в пределах окна новизны (по умолчанию — только что).
+   */
+  async function seedAccount(userId: string, bornAgo = '0 seconds'): Promise<string> {
+    await pool.query(
+      `INSERT INTO user_id (internal_id, state, welcome_bonus_at) VALUES ($1, 'active', now() - $2::interval)`,
+      [userId, bornAgo],
+    );
+    return userId;
+  }
+
+  /** Только что заведённый аккаунт с профилем — тот, кого можно пригласить. */
+  const seedReferee = async (tokens: number) => seedAccount(await seedUser(tokens));
 
   async function seedLeader(userId: string, slug: string): Promise<string> {
     // Три параметра, а не `$1` дважды: колонки name/slug/user_phone объявлены
@@ -384,7 +404,7 @@ maybe('Реферальные начисления против живого Pos
 
     it('начисляет бонус на баланс', async () => {
       const { slug } = await seedInviter();
-      const referee = await seedUser(5_000);
+      const referee = await seedReferee(5_000);
 
       const res = await service.register(referee, slug);
 
@@ -394,7 +414,7 @@ maybe('Реферальные начисления против живого Pos
 
     it('оставляет в реестре строку с пометкой реферального бонуса', async () => {
       const { slug } = await seedInviter();
-      const referee = await seedUser(5_000);
+      const referee = await seedReferee(5_000);
 
       await service.register(referee, slug);
 
@@ -409,7 +429,7 @@ maybe('Реферальные начисления против живого Pos
 
     it('профиля нет — бонуса нет, и в реестре ничего: отметка не расходится с балансом', async () => {
       const { slug } = await seedInviter();
-      const referee = newPhone(); // профиля нет
+      const referee = await seedAccount(newPhone()); // профиля нет
 
       const res = await service.register(referee, slug);
 
@@ -421,7 +441,7 @@ maybe('Реферальные начисления против живого Pos
 
     it('повторная регистрация не начисляет второй раз', async () => {
       const { slug } = await seedInviter();
-      const referee = await seedUser(5_000);
+      const referee = await seedReferee(5_000);
       await service.register(referee, slug);
 
       const again = await service.register(referee, slug);
@@ -449,7 +469,7 @@ maybe('Реферальные начисления против живого Pos
       // токенами — повторить выдачу нельзя («Already registered»), проверить
       // по журналу тоже.
       const { slug } = await seedInviter();
-      const referee = await seedUser(5_000);
+      const referee = await seedReferee(5_000);
       await armCommitFailure();
       try {
         await expect(service.register(referee, slug)).rejects.toThrow('boom at commit');
@@ -463,12 +483,27 @@ maybe('Реферальные начисления против живого Pos
       expect(Number(rr.rows[0].n)).toBe(0);
     });
 
+    it('давний аккаунт не привязывается — ни рефери, ни токенов', async () => {
+      // Веб зовёт register при ЛЮБОМ входе, если в браузере лежит slug. Без
+      // проверки новизны давний аккаунт получал бонус приглашённого.
+      const { slug } = await seedInviter();
+      const referee = await seedAccount(await seedUser(5_000), '30 days');
+
+      const res = await service.register(referee, slug);
+
+      expect(res.success).toBe(false);
+      expect(await balanceOf(referee)).toBe(5_000);
+      expect(await ledgerOf(referee)).toHaveLength(0);
+      const rr = await pool.query('SELECT count(*) AS n FROM referral_referees WHERE referee_phone = $1', [referee]);
+      expect(Number(rr.rows[0].n)).toBe(0);
+    });
+
     it('чужой баланс не трогает', async () => {
       // Посторонний нужен физически: без него `WHERE user_id = $1 OR TRUE`
       // пережил бы весь файл зелёным — в каждом сценарии ровно один
       // пользователь, и «начислили всем» от «начислили нужному» неотличимо.
       const { slug } = await seedInviter();
-      const referee = await seedUser(5_000);
+      const referee = await seedReferee(5_000);
       const bystander = await seedUser(777);
 
       await service.register(referee, slug);
@@ -553,7 +588,7 @@ maybe('Реферальные начисления против живого Pos
       // этом падал честно, но по другой причине, чем проверяет.
       const slug = `fresh-${++seq}`;
       await seedLeader(leaderUser, slug);
-      const referee = await seedUser(5_000);
+      const referee = await seedReferee(5_000);
       const reg = await service.register(referee, slug);
       expect(reg).toMatchObject({ success: true, bonus_tokens: 20_000 });
 

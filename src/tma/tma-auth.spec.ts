@@ -30,7 +30,7 @@ describe('POST /webhook/tma/auth', () => {
   beforeEach(() => {
     process.env.TG_BOT_TOKEN = BOT_TOKEN;
     pg = { query: jest.fn().mockResolvedValue({ rows: [] }), getClient: jest.fn() };
-    identity = { resolveOrCreate: jest.fn(), touchIdentity: jest.fn() };
+    identity = { resolveOrCreate: jest.fn(), touchIdentity: jest.fn(), isDeleted: jest.fn().mockResolvedValue(false) };
     jwt = { signAccess: jest.fn(() => 'ACC'), signRefresh: jest.fn(() => 'REF') };
     ctrl = new TmaController(pg, identity, jwt);
   });
@@ -81,6 +81,102 @@ describe('POST /webhook/tma/auth', () => {
     const backfill = pg.query.mock.calls[2][0];
     expect(backfill).toContain('INSERT INTO user_identities');
     expect(identity.touchIdentity).toHaveBeenCalledWith('telegram', '42');
+  });
+
+  /// Удалённый аккаунт не входит через мини-приложение ни по одной ветке.
+  ///
+  /// Связки, указывающие на удалённый аккаунт, — мусор: Telegram вёл себя как
+  /// незнакомый (ветка 3), а получал токены удалённого аккаунта, и ветка
+  /// «старожилов» вдобавок заново заводила ему связку входа.
+  describe('удалённый аккаунт', () => {
+    /** pg, отвечающий по тексту запроса: какие связки есть и что удалено. */
+    function routedPg(opts: { known?: string; fromBot?: string }) {
+      const calls: Array<{ sql: string; params: any[] }> = [];
+      pg.query.mockImplementation(async (sql: string, params: any[] = []) => {
+        const s = sql.replace(/\s+/g, ' ').trim();
+        calls.push({ sql: s, params });
+        if (s.startsWith('SELECT user_id FROM user_identities')) {
+          return { rows: opts.known ? [{ user_id: opts.known }] : [] };
+        }
+        if (s.startsWith('SELECT linkeon_user_id FROM tg_user_identities')) {
+          return { rows: opts.fromBot ? [{ linkeon_user_id: opts.fromBot }] : [] };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+      return calls;
+    }
+
+    beforeEach(() => {
+      identity.isDeleted.mockImplementation(async (id: string) => id === 'u-deleted');
+    });
+
+    it('связка входа ведёт в удалённый аккаунт — токенов нет, 404 needsChoice', async () => {
+      const calls = routedPg({ known: 'u-deleted' });
+      const res = mockRes();
+      await ctrl.auth({ initData: freshInitData() }, res);
+      expect(jwt.signAccess).not.toHaveBeenCalled();
+      expect(res._status).toBe(404);
+      expect(res._body).toEqual({ needsChoice: true });
+      // Связку удалённого аккаунта снимаем — ровно ту, что нашли.
+      const release = calls.find((c) => c.sql.startsWith('DELETE FROM user_identities'));
+      expect(release?.params).toEqual(['42', 'u-deleted']);
+    });
+
+    it('старожил бота с удалённым аккаунтом — токенов нет, связку входа заново не заводим', async () => {
+      const calls = routedPg({ fromBot: 'u-deleted' });
+      const res = mockRes();
+      await ctrl.auth({ initData: freshInitData() }, res);
+      expect(jwt.signAccess).not.toHaveBeenCalled();
+      expect(res._status).toBe(404);
+      expect(res._body).toEqual({ needsChoice: true });
+      expect(calls.some((c) => c.sql.startsWith('INSERT INTO user_identities'))).toBe(false);
+      const release = calls.find((c) => c.sql.startsWith('DELETE FROM tg_user_identities'));
+      expect(release?.params).toEqual([42, 'u-deleted']);
+    });
+
+    it('с intent=signup заводит НОВЫЙ аккаунт и выдаёт токены ему, а не удалённому', async () => {
+      const calls = routedPg({ known: 'u-deleted', fromBot: 'u-deleted' });
+      identity.resolveOrCreate.mockResolvedValue({ status: 'ok', userId: 'u-new', isNew: true, mergedExisting: false });
+      const res = mockRes();
+      await ctrl.auth({ initData: freshInitData(), intent: 'signup' }, res);
+      expect(res._status).toBe(200);
+      expect(jwt.signAccess).toHaveBeenCalledWith('u-new');
+      expect(jwt.signAccess).not.toHaveBeenCalledWith('u-deleted');
+      // Обе связки удалённого аккаунта сняты ДО регистрации: иначе
+      // resolveOrCreate нашёл бы старую связку входа, а вставка в
+      // tg_user_identities упёрлась бы в UNIQUE на tg_user_id.
+      const signupAt = identity.resolveOrCreate.mock.invocationCallOrder[0];
+      const releases = calls
+        .map((c, i) => ({ c, order: pg.query.mock.invocationCallOrder[i] }))
+        .filter(({ c }) => c.sql.startsWith('DELETE FROM'));
+      expect(releases).toHaveLength(2);
+      for (const r of releases) expect(r.order).toBeLessThan(signupAt);
+    });
+
+    it('связка входа — в удалённый аккаунт, связка бота — в живой: токены живому, связка входа дописана ему', async () => {
+      const calls = routedPg({ known: 'u-deleted', fromBot: 'u-bot' });
+      const res = mockRes();
+      await ctrl.auth({ initData: freshInitData() }, res);
+      expect(res._status).toBe(200);
+      expect(jwt.signAccess).toHaveBeenCalledWith('u-bot');
+      expect(jwt.signAccess).not.toHaveBeenCalledWith('u-deleted');
+      // Мёртвая связка снята ДО дозаписи: иначе ON CONFLICT DO NOTHING молча
+      // оставил бы её, и следующий вход снова начинался бы с удалённого.
+      const releaseAt = calls.findIndex((c) => c.sql.startsWith('DELETE FROM user_identities'));
+      const backfillAt = calls.findIndex((c) => c.sql.startsWith('INSERT INTO user_identities'));
+      expect(releaseAt).toBeGreaterThanOrEqual(0);
+      expect(backfillAt).toBeGreaterThan(releaseAt);
+      expect(calls[backfillAt].params).toEqual(['u-bot', '42']);
+      expect(identity.touchIdentity).toHaveBeenCalledWith('telegram', '42');
+    });
+
+    it('живой аккаунт по-прежнему входит', async () => {
+      routedPg({ known: 'u-known' });
+      const res = mockRes();
+      await ctrl.auth({ initData: freshInitData() }, res);
+      expect(res._status).toBe(200);
+      expect(jwt.signAccess).toHaveBeenCalledWith('u-known');
+    });
   });
 
   describe('stage в логе называет упавшую операцию, а не предыдущую успешную', () => {

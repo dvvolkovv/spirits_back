@@ -19,6 +19,8 @@ class FakeDb {
   identities: any[] = [];
   /** user_id → profile_data. Моделирует ai_profiles_consolidated. */
   profiles = new Map<string, any>();
+  /** Связки бота: linkeon_user_id ↔ tg_user_id (1:1). Моделирует tg_user_identities. */
+  tgIdentities: Array<{ linkeon_user_id: string; tg_user_id: number }> = [];
 
   async query(sql: string, params: any[] = []) {
     const s = sql.replace(/\s+/g, ' ').trim();
@@ -44,6 +46,10 @@ class FakeDb {
       // чтобы понять, задел ли UPDATE существующую строку. Без него merge
       // решает, что строки нет, и молча не сохраняет карточку.
       return { rows: [], rowCount: has ? 1 : 0 };
+    }
+    if (s.startsWith('DELETE FROM tg_user_identities WHERE linkeon_user_id')) {
+      this.tgIdentities = this.tgIdentities.filter((i) => i.linkeon_user_id !== params[0]);
+      return { rows: [] };
     }
     if (s.startsWith('DELETE FROM user_identities WHERE user_id')) {
       this.identities = this.identities.filter((i) => i.user_id !== params[0]);
@@ -202,6 +208,21 @@ function ok<T extends { status: string }>(r: T): Extract<T, { status: 'ok' }> {
     // Бонус выдаётся заново: баланс удаление обнулило, и аккаунт должен
     // выглядеть новым, а не пустым.
     expect(db.users.get(first.userId).welcome_bonus_at).toBe('now');
+  });
+
+  it('рвёт и связку Telegram-бота — иначе мини-приложение снова впускает в удалённый аккаунт', async () => {
+    // Мини-приложение ищет «старожилов бота» в tg_user_identities и по найденной
+    // строке выдаёт токены. Пока строка переживала удаление, Telegram удалённого
+    // аккаунта входил в него обратно — и заодно заново заводил связку входа.
+    const { userId } = ok(await identity.resolveOrCreate('phone', { phone: '79990000002' }));
+    db.tgIdentities.push({ linkeon_user_id: userId, tg_user_id: 4242 });
+    db.tgIdentities.push({ linkeon_user_id: 'someone-else', tg_user_id: 4343 });
+
+    await profile.deleteProfile(userId);
+
+    expect(db.tgIdentities.find((i) => i.linkeon_user_id === userId)).toBeUndefined();
+    // Чужая связка на месте: удаление не должно задевать соседей.
+    expect(db.tgIdentities).toEqual([{ linkeon_user_id: 'someone-else', tg_user_id: 4343 }]);
   });
 
   it('уносит бизнес-карточку — она персональные данные о юрлице', async () => {

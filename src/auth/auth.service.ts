@@ -372,21 +372,10 @@ export class AuthService {
     return { phone, balance_before: balanceBefore, balance_after: balanceAfter };
   }
 
-  /// Помечен ли аккаунт удалённым.
-  ///
-  /// Ошибку базы трактуем как «не удалён»: недоступный Postgres не должен
-  /// разлогинивать всех живых пользователей разом.
-  private async isDeleted(userId: string): Promise<boolean> {
-    if (!this.pg) return false;
-    try {
-      const r = await this.pg.query(
-        `SELECT state FROM user_id WHERE internal_id = $1`,
-        [userId],
-      );
-      return r.rows[0]?.state === 'deleted';
-    } catch {
-      return false;
-    }
+  /// Помечен ли аккаунт удалённым. Сама проверка — в IdentityService.isDeleted:
+  /// её же спрашивает вход через мини-приложение Telegram.
+  private isDeleted(userId: string): Promise<boolean> {
+    return this.identity.isDeleted(userId);
   }
 
   async refreshTokens(
