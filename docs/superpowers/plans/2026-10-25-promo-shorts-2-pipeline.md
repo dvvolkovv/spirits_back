@@ -4710,6 +4710,12 @@ describe('ShortsApprovalService', () => {
       expect(await svc.handleReplyEdit(reply())).toBe(false);
     });
 
+    it('реплай не из чата апрувера — не наш, база не трогается', async () => {
+      const { svc, pg } = setup();
+      expect(await svc.handleReplyEdit(reply({ chat: { id: 555, type: 'private' }, from: { id: 555 } }))).toBe(false);
+      expect(pg.query).not.toHaveBeenCalled();
+    });
+
     it('замечание — ролик на переписку', async () => {
       const { svc, pg, tg } = setup();
       expect(await svc.handleReplyEdit(reply())).toBe(true);
@@ -5132,6 +5138,10 @@ export class ShortsApprovalService {
     const chatId = Number(msg?.chat?.id);
     const replyTo = Number(msg?.reply_to_message?.message_id);
     if (!chatId || !replyTo) return false;
+    // Ролик на проверку уходит только апруверу. Реплай из другого чата — не наш, и
+    // базу он не трогает: иначе каждый реплай пользователя ассистенту шёл бы через
+    // short_video, а без таблицы (сорвался первый накат) падал бы и не доходил.
+    if (chatId !== approverChatId()) return false;
     const r = await this.pg.query(
       `SELECT * FROM short_video
         WHERE review_chat_id = $1
@@ -6763,6 +6773,7 @@ maybe('ролики против живого Postgres', () => {
   it('ответ на приглашение узнаётся по большому id сообщения, замечание уводит ролик на переписку', async () => {
     const v = await insert({ status: 'pending_review', review_chat_id: 77, review_message_id: 12, note_prompt_ids: [9007199254740] });
     const tg = { sendMessage: jest.fn(async () => ({ message_id: 1 })) };
+    process.env.BLOG_APPROVER_TG_ID = '77';
     const svc = new ShortsApprovalService(pgLike() as any, tg as any, {} as any, {} as any, {} as any);
     expect(await svc.handleReplyEdit({ chat: { id: 77 }, reply_to_message: { message_id: 9007199254740 }, message_id: 50, text: 'короче' })).toBe(true);
     const row = (await pool.query(`SELECT status, owner_note FROM short_video WHERE id = $1`, [v.id])).rows[0];
