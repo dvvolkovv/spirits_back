@@ -147,4 +147,12 @@ describe('toActivity — что видит человек вместо трёх 
     expect(toActivity(undefined, '{}', WHO)).toBeNull();
     expect(toActivity('', '{}', WHO)).toBeNull();
   });
+
+  // Свой код шага: по нему живая проверка видит, звал ли ассистент справку.
+  // Фронт пока не знает 'help' и показывает такой шаг как other — подпись
+  // добавится отдельной правкой фронта, чат от этого не ломается.
+  it('справка Linkeon — свой код шага, без уточнения', () => {
+    expect(toActivity('mcp__products__linkeon_help', '{"topics":["video"]}', { userId: 'u-test' }))
+      .toEqual({ type: 'activity', kind: 'help' });
+  });
 });
