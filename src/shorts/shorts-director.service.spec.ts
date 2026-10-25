@@ -6,6 +6,7 @@ import { rowToShort } from './shorts.types';
 const AGENTS = [
   { id: 10, name: 'Алексей', description: 'Юрист — помогает разобраться в правовых вопросах' },
   { id: 22, name: 'Кира', description: 'Дизайнер' },
+  { id: 30, name: 'Полина', description: 'Врач — консультирует по вопросам здоровья' },
 ];
 const REPLY = {
   assistantId: 10,
@@ -87,5 +88,20 @@ describe('ShortsDirectorService.direct', () => {
   it('ролик ушёл из directing, пока думал режиссёр — без ошибки', async () => {
     const { svc } = setup(REPLY, 0);
     await expect(svc.direct(video())).resolves.toBeUndefined();
+  });
+
+  it('провокационная подача, ассистент не задан, режиссёр выбрал ассистента здоровья — отклоняем', async () => {
+    const health = { ...REPLY, assistantId: 30 };
+    const { svc, pg } = setup(health);
+    await expect(svc.direct(video({ angle: 'roast', assistant_id: null }))).rejects.toThrow(
+      'режиссёр: выбрал ассистента здоровья «Полина» для провокационной подачи — здоровье только в calm',
+    );
+    expect(pg.query.mock.calls.some((call: any[]) => String(call[0]).includes('capture_queued'))).toBe(false);
+  });
+
+  it('та же ситуация в спокойной подаче — проходит', async () => {
+    const health = { ...REPLY, assistantId: 30 };
+    const { svc } = setup(health);
+    await expect(svc.direct(video({ angle: 'calm', assistant_id: null }))).resolves.toBeUndefined();
   });
 });
