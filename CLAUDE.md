@@ -357,6 +357,18 @@ bash ~/Downloads/spirits_back/tests/chat-tools.e2e.sh
 cd ~/Downloads/spirits_back/tests && node runner.js  # api (32) + e2e (18) = 50
 ```
 
+## Справка о Linkeon для ассистентов (platform-kb)
+
+Ассистенты отвечают на вопросы о платформе по справке — инструменту `linkeon_help` на точке `/webhook/mcp/products` (спека `docs/superpowers/specs/2026-10-24-platform-help-design.md`). Статьи — `src/platform-kb/articles/<тема>.ts`, текст на русском; подписи кнопок — из локалей фронта (`src/platform-kb/labels.generated.ts`), числа — из констант списания (`src/platform-kb/values.ts`).
+
+**Правило сопровождения.** Новая функция или раздел кабинета, изменённая цена или лимит, переименованный пункт меню — в том же изменении:
+1. статья в `src/platform-kb/articles/` (новая тема — ещё и в `articles/index.ts` и в `SPEC_TOPICS` в `kb.spec.ts`);
+2. подписи — `node scripts/sync-kb-labels.mjs <путь к spirits_front>` и дифф `labels.generated.ts`;
+3. новое число — константой, которую берут и списание, и `values.ts`; цифру в тексте статьи сторож не пропустит;
+4. «Помощь» фронта (`help.guides`, `help.faq` в локалях) — если её это касается.
+
+Все статьи одним файлом для глаз: `npx ts-node scripts/render-kb.ts ru web` (на ноде). Живая проверка после выката — `tests/platform-help.e2e.mjs` (на проде, тестовым аккаунтом).
+
 ## API Endpoints
 
 ### Auth (публичные)
