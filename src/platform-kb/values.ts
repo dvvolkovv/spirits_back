@@ -20,6 +20,7 @@ import { SMS_CODE_MAX_ATTEMPTS, SMS_CODE_TTL_SECONDS } from '../auth/sms-code';
 import { SMS_LIMIT_DEFAULTS } from '../auth/sms-limits';
 import { MAX_UPLOAD_TOTAL_BYTES } from '../chat/upload-limits';
 import { LOW_BALANCE_THRESHOLD, WARN_COOLDOWN_MS } from '../tokens/consumption-rate';
+import { MAGIC_LINK_TTL_SECONDS } from '../auth/email.service';
 
 /**
  * Числа для статей справки. Каждое — импорт той константы, по которой идёт
@@ -94,7 +95,7 @@ export const V = {
   withdrawMinRub: fmt(WITHDRAW_MIN_RUB),
   smsCodeMinutes: String(Math.round(SMS_CODE_TTL_SECONDS / 60)),
   smsAttempts: String(SMS_CODE_MAX_ATTEMPTS),
-  smsIntervalSec: String(SMS_LIMIT_DEFAULTS.phoneIntervalSec),
   smsPerHour: String(SMS_LIMIT_DEFAULTS.phonePerHour),
   smsPerDay: String(SMS_LIMIT_DEFAULTS.phonePerDay),
+  magicLinkMinutes: String(Math.round(MAGIC_LINK_TTL_SECONDS / 60)),
 };
