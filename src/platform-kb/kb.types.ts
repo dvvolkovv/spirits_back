@@ -15,7 +15,9 @@ export const KB_CLIENTS = ['web', 'app', 'store', 'telegram'] as const;
 export type KbClient = (typeof KB_CLIENTS)[number];
 
 /** Части статьи — в этом порядке. Тема how-it-works устроена по-своему. */
-export const KB_PARTS = ['Что это', 'Где', 'Как', 'Лимиты и цены', 'Чего нельзя', 'Если не получается', 'Как устроено'] as const;
+// «Лимиты» — тот же раздел «Лимиты и цены», но заголовок без цен: так он
+// выходит в сборке для стора (client 'store'), см. render.ts.
+export const KB_PARTS = ['Что это', 'Где', 'Как', 'Лимиты и цены', 'Лимиты', 'Чего нельзя', 'Если не получается', 'Как устроено'] as const;
 
 /** Что получает render статьи. Имена q и paid — договорённость: на них опирается тест исходников. */
 export interface KbContext {

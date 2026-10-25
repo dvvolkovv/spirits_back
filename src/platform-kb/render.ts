@@ -15,7 +15,7 @@ export const CLIENT_NOTES: Record<KbClient, string> = {
     'Раздела, которого в приложении нет, ищи в веб-кабинете my.linkeon.io.',
   store:
     'Пользователь в мобильном приложении Linkeon: меню там своё, и пункты могут называться иначе. ' +
-    'Раздела, которого в приложении нет, ищи в веб-кабинете my.linkeon.io. ' +
+    'Раздела, которого в приложении нет, ищи в веб-кабинете my.linkeon.io, кроме оплаты и покупок. ' +
     'О балансе, покупках и оплате в этой версии приложения не говори совсем.',
   telegram:
     'Разговор идёт в Telegram. Всё, что ниже, делается в веб-кабинете Linkeon — my.linkeon.io; ' +
@@ -41,7 +41,9 @@ export function dropEmptySections(md: string): string {
 }
 
 export function renderArticle(a: KbArticle, lang: string, client: KbClient): string {
-  const body = dropEmptySections(a.render(kbContext(lang, client)).trim());
+  let body = dropEmptySections(a.render(kbContext(lang, client)).trim());
+  // В сборке для стора цен нет (paid() вырезан) — заголовок без «и цены».
+  if (client === 'store') body = body.replace(/^## Лимиты и цены$/m, '## Лимиты');
   return [`# ${a.title}`, CLIENT_NOTES[client], body]
     .filter(Boolean)
     .join('\n\n')

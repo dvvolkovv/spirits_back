@@ -124,13 +124,14 @@ describe('статьи во всех вариантах', () => {
   });
 
   // Подпись поля «Токен бота» (продукты) — не о деньгах: её вырезаем перед проверкой.
-  it('сборка из стора: ни слова о токенах, кроме подписи поля «Токен бота»', () => {
+  it('сборка из стора: ни слова о деньгах, кроме подписи поля «Токен бота»', () => {
+    const MONEY = /токен|оплат|списан|баланс|пополн|₽|\$\d|бесплат/i;
     const bad = all
       .filter((v) => v.client === 'store')
       .filter((v) => {
         const botToken = (labelsFor(v.lang) as Record<string, string>).prodToken;
         const text = botToken ? v.text.split(`«${botToken}»`).join('') : v.text;
-        return /токен/i.test(text);
+        return MONEY.test(text);
       })
       .map(where);
     expect(bad).toEqual([]);
