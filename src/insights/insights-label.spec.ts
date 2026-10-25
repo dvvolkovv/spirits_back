@@ -1,5 +1,14 @@
-import { buildLabelPrompt, MAX_CONVERSATION_CHARS, parseLabels, renderConversation, type LabelInput } from './insights-label';
+import {
+  LABEL_BATCH,
+  LABEL_SYSTEM,
+  labelBatches,
+  MAX_CONVERSATION_CHARS,
+  parseLabels,
+  renderConversation,
+  type LabelInput,
+} from './insights-label';
 import type { Conversation } from './insights.types';
+import { MAX_PROMPT_BYTES, promptBytes } from './prompt-size';
 
 const conv = (over: Partial<Conversation> = {}): Conversation => ({
   key: 'web:1',
@@ -36,13 +45,45 @@ describe('renderConversation', () => {
   });
 });
 
-describe('buildLabelPrompt', () => {
-  it('нумерует разговоры и называет ассистента', () => {
+describe('labelBatches', () => {
+  const noNames = () => [] as string[];
+  const input = (n: number, text: string): LabelInput => ({
+    person: n,
+    conversation: conv({ key: `web:${n}`, userId: `u${n}`, turns: [{ role: 'user', text }] }),
+  });
+  const fullBytes = (prompt: string) => promptBytes(LABEL_SYSTEM) + promptBytes(prompt);
+
+  it('нумерует разговоры внутри пачки и называет ассистента', () => {
     const batch: LabelInput[] = [{ person: 1, conversation: conv() }, { person: 2, conversation: conv({ assistant: 'Кира' }) }];
-    const out = buildLabelPrompt(batch, () => ['Владимир']);
-    expect(out).toContain('Разговор 1 (ассистент «Роман»)');
-    expect(out).toContain('Разговор 2 (ассистент «Кира»)');
-    expect(out).not.toContain('u1');
+    const [only] = labelBatches(batch, () => ['Владимир']);
+    expect(only.prompt).toContain('Разговор 1 (ассистент «Роман»)');
+    expect(only.prompt).toContain('Разговор 2 (ассистент «Кира»)');
+    expect(only.prompt).not.toMatch(/u1|Владимир|903/);
+  });
+
+  it('короткие разговоры — по восемь в пачке, по порядку, нумерация с единицы в каждой', () => {
+    const inputs = Array.from({ length: 20 }, (_, i) => input(i + 1, 'вопрос'));
+    const batches = labelBatches(inputs, noNames);
+    expect(batches.map((b) => b.inputs.length)).toEqual([LABEL_BATCH, LABEL_BATCH, 4]);
+    expect(batches.flatMap((b) => b.inputs)).toEqual(inputs);
+    expect(batches[1].prompt.startsWith('Разговор 1 ')).toBe(true);
+    expect(batches[1].prompt).not.toContain(`Разговор ${LABEL_BATCH + 1} `);
+  });
+
+  it('длинные разговоры кириллицей — пачка вместе с инструкцией не длиннее предела', () => {
+    const inputs = Array.from({ length: LABEL_BATCH }, (_, i) => input(i + 1, 'ж'.repeat(MAX_CONVERSATION_CHARS - 50)));
+    // Одной пачкой такие восемь переходят предел аргумента Linux — так и было до разбиения по байтам.
+    const together = inputs.reduce((sum, b) => sum + promptBytes(renderConversation(b.conversation, [])), 0);
+    expect(promptBytes(LABEL_SYSTEM) + together).toBeGreaterThan(128 * 1024);
+    const batches = labelBatches(inputs, noNames);
+    expect(batches.length).toBeGreaterThan(1);
+    expect(batches.flatMap((b) => b.inputs)).toEqual(inputs);
+    for (const b of batches) expect(fullBytes(b.prompt)).toBeLessThanOrEqual(MAX_PROMPT_BYTES);
+  });
+
+  it('@ в тексте считается с обезвреживанием: пачка всё равно под пределом', () => {
+    const inputs = Array.from({ length: LABEL_BATCH }, (_, i) => input(i + 1, '@'.repeat(MAX_CONVERSATION_CHARS - 50)));
+    for (const b of labelBatches(inputs, noNames)) expect(fullBytes(b.prompt)).toBeLessThanOrEqual(MAX_PROMPT_BYTES);
   });
 });
 

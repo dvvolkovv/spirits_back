@@ -1,5 +1,6 @@
-import { buildSynthPrompt, MAX_FINDINGS, parseFindings } from './insights-synth';
+import { buildSynthPrompt, fitSynthPrompt, MAX_FINDINGS, parseFindings, SYNTH_SYSTEM } from './insights-synth';
 import { emptySignals, type Label, type PriorFinding } from './insights.types';
+import { MAX_PROMPT_BYTES, promptBytes } from './prompt-size';
 
 const L = (person: number, assistant: string, type: Label['type'] = 'confused'): Label => ({
   person,
@@ -29,6 +30,43 @@ describe('buildSynthPrompt', () => {
     const j = JSON.parse(s);
     expect(j.labels[0]).toEqual({ person: 1, assistant: 'Роман', type: 'confused', about: 'путает два вида ботов', severity: 2 });
     expect(j.prior[0]).toMatchObject({ id: 'p1', last_people: 3 });
+  });
+});
+
+describe('fitSynthPrompt', () => {
+  const week = { weekLabel: '19–25 окт', signals: emptySignals(), prior: [] as PriorFinding[] };
+  const about = 'ж'.repeat(140);
+  const heavy = (person: number): Label => ({ person, assistant: 'Роман', type: 'money', about, severity: 3 });
+  const light = (person: number): Label => ({ person, assistant: 'Роман', type: 'confused', about, severity: 1 });
+
+  it('влезает — тот же запрос и вся разметка', () => {
+    const fit = fitSynthPrompt({ ...week, labels });
+    expect(fit.prompt).toBe(buildSynthPrompt({ ...week, labels }));
+    expect(fit.labels).toEqual(labels);
+  });
+
+  it('не влезает — под пределом, сначала тяжёлые, порядок сохранён', () => {
+    // Каждый четвёртый — тяжёлый: 100 тяжёлых и 300 лёгких, вместе — больше предела.
+    const many = Array.from({ length: 400 }, (_, i) => (i % 4 === 0 ? heavy(i + 1) : light(i + 1)));
+    expect(promptBytes(SYNTH_SYSTEM) + promptBytes(buildSynthPrompt({ ...week, labels: many }))).toBeGreaterThan(MAX_PROMPT_BYTES);
+
+    const fit = fitSynthPrompt({ ...week, labels: many });
+    expect(promptBytes(SYNTH_SYSTEM) + promptBytes(fit.prompt)).toBeLessThanOrEqual(MAX_PROMPT_BYTES);
+    expect(fit.labels.length).toBeLessThan(many.length);
+    expect(fit.labels.filter((l) => l.severity === 3)).toHaveLength(100);
+    const lightKept = fit.labels.filter((l) => l.severity === 1);
+    expect(lightKept).toEqual(many.filter((l) => l.severity === 1).slice(0, lightKept.length));
+    expect(fit.labels).toEqual(many.filter((l) => fit.labels.includes(l)));
+    expect(JSON.parse(fit.prompt).labels).toHaveLength(fit.labels.length);
+  });
+
+  it('человек, не вошедший в запрос, в находке не считается', () => {
+    const many = Array.from({ length: 400 }, (_, i) => (i % 4 === 0 ? heavy(i + 1) : light(i + 1)));
+    const fit = fitSynthPrompt({ ...week, labels: many });
+    const cutPerson = many.find((l) => !fit.labels.includes(l))!.person;
+    const keptPerson = fit.labels[0].person;
+    const out = parseFindings(JSON.stringify({ findings: [finding({ people: [keptPerson, cutPerson] })] }), fit.labels, [])!;
+    expect(out[0].people).toBe(1);
   });
 });
 

@@ -53,6 +53,34 @@ describe('buildDigest', () => {
     expect(out.text).toContain('Затыков на этой неделе не нашлось.');
     expect(out.shown).toEqual([]);
   });
+
+  it('неразобранные пачки и урезанная разметка — строками в шапке', () => {
+    const { text } = buildDigest({
+      ...base,
+      findings: [F()],
+      failedBatches: { failed: 1, total: 6 },
+      labelsInSynth: { used: 290, total: 400 },
+    });
+    expect(text).toContain('Не разобрано пачек разговоров: 1 из 6');
+    expect(text).toContain('В сводку вошло пунктов разметки: 290 из 400');
+  });
+
+  it('без пропусков этих строк нет', () => {
+    const { text } = buildDigest({
+      ...base,
+      findings: [F()],
+      failedBatches: { failed: 0, total: 6 },
+      labelsInSynth: { used: 12, total: 12 },
+    });
+    expect(text).not.toContain('Не разобрано');
+    expect(text).not.toContain('В сводку вошло');
+  });
+
+  it('пропуск виден и когда затыков не нашлось', () => {
+    const { text } = buildDigest({ ...base, findings: [], failedBatches: { failed: 2, total: 6 } });
+    expect(text).toContain('Не разобрано пачек разговоров: 2 из 6');
+    expect(text).toContain('Затыков на этой неделе не нашлось.');
+  });
 });
 
 describe('buildKeyboard', () => {

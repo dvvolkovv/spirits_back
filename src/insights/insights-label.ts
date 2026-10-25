@@ -1,6 +1,7 @@
 import { deidentify } from './deidentify';
 import { cleanLine, parseModelJson } from './insights-text';
 import { FRICTION_TYPES, type Conversation, type FrictionType, type Label } from './insights.types';
+import { MAX_PROMPT_BYTES, promptBytes } from './prompt-size';
 
 export const LABEL_MODEL = 'claude-haiku-4-5';
 export const LABEL_BATCH = 8;
@@ -54,13 +55,41 @@ export function renderConversation(c: Conversation, names: readonly string[]): s
   return lines.join('\n');
 }
 
-export function buildLabelPrompt(batch: readonly LabelInput[], namesOf: (userId: string) => readonly string[]): string {
-  return batch
-    .map(
-      (b, i) =>
-        `Разговор ${i + 1} (ассистент «${b.conversation.assistant}»):\n${renderConversation(b.conversation, namesOf(b.conversation.userId))}`,
-    )
-    .join('\n\n');
+export interface LabelBatch {
+  inputs: LabelInput[];
+  /** Ровно то, что уйдёт модели: по нему и мерили предел. */
+  prompt: string;
+}
+
+function block(n: number, b: LabelInput, body: string): string {
+  return `Разговор ${n} (ассистент «${b.conversation.assistant}»):\n${body}`;
+}
+
+/**
+ * Пачки разметки по порядку: до LABEL_BATCH разговоров и не больше
+ * MAX_PROMPT_BYTES вместе с инструкцией (см. prompt-size.ts). Один разговор
+ * не длиннее MAX_CONVERSATION_CHARS и в предел влезает всегда.
+ */
+export function labelBatches(inputs: readonly LabelInput[], namesOf: (userId: string) => readonly string[]): LabelBatch[] {
+  const budget = MAX_PROMPT_BYTES - promptBytes(LABEL_SYSTEM);
+  const out: LabelBatch[] = [];
+  let cur: Array<{ input: LabelInput; body: string }> = [];
+  let used = 0;
+  const flush = () => {
+    out.push({ inputs: cur.map((c) => c.input), prompt: cur.map((c, i) => block(i + 1, c.input, c.body)).join('\n\n') });
+    cur = [];
+    used = 0;
+  };
+  for (const input of inputs) {
+    const body = renderConversation(input.conversation, namesOf(input.conversation.userId));
+    // Номер — с запасом по разрядам (в пачке он не больше LABEL_BATCH), +2 — разделитель блоков.
+    const size = promptBytes(block(LABEL_BATCH, input, body)) + 2;
+    if (cur.length && (cur.length === LABEL_BATCH || used + size > budget)) flush();
+    cur.push({ input, body });
+    used += size;
+  }
+  if (cur.length) flush();
+  return out;
 }
 
 /**

@@ -7,6 +7,7 @@ import {
   type Signals,
   type SynthFinding,
 } from './insights.types';
+import { MAX_PROMPT_BYTES, promptBytes } from './prompt-size';
 
 export const MAX_FINDINGS = 10;
 
@@ -27,15 +28,19 @@ export const SYNTH_SYSTEM = `Ты — продуктовый аналитик Li
 
 Ответь ТОЛЬКО JSON: {"findings": [{"prior_id": null, "type": "...", "title": "...", "description": "...", "proposal": "...", "people": [1, 2], "severity": 2}]}`;
 
-export function buildSynthPrompt(input: {
+export interface SynthInput {
   weekLabel: string;
   labels: readonly Label[];
   signals: Signals;
   prior: readonly PriorFinding[];
-}): string {
+}
+
+const labelJson = (l: Label) => ({ person: l.person, assistant: l.assistant, type: l.type, about: l.about, severity: l.severity });
+
+export function buildSynthPrompt(input: SynthInput): string {
   return JSON.stringify({
     week: input.weekLabel,
-    labels: input.labels.map((l) => ({ person: l.person, assistant: l.assistant, type: l.type, about: l.about, severity: l.severity })),
+    labels: input.labels.map(labelJson),
     signals: input.signals,
     prior: input.prior.map((p) => ({
       id: p.id,
@@ -47,6 +52,31 @@ export function buildSynthPrompt(input: {
       rejected_people: p.rejectedPeople,
     })),
   });
+}
+
+/**
+ * Запрос сводки в пределе MAX_PROMPT_BYTES вместе с инструкцией (см.
+ * prompt-size.ts). Не влезает — в сводку идут сначала тяжёлые пункты, в
+ * пределах тяжести — по порядку. labels — то, что вошло: по ним же
+ * parseFindings считает людей, иначе в находку попали бы люди, которых
+ * модель не видела.
+ */
+export function fitSynthPrompt(input: SynthInput): { prompt: string; labels: Label[] } {
+  const budget = MAX_PROMPT_BYTES - promptBytes(SYNTH_SYSTEM);
+  const full = buildSynthPrompt(input);
+  if (promptBytes(full) <= budget) return { prompt: full, labels: [...input.labels] };
+  let used = promptBytes(buildSynthPrompt({ ...input, labels: [] }));
+  const order = input.labels.map((l, i) => ({ l, i })).sort((a, b) => b.l.severity - a.l.severity || a.i - b.i);
+  const keep = new Set<number>();
+  for (const { l, i } of order) {
+    // +1 — запятая между пунктами массива.
+    const size = promptBytes(JSON.stringify(labelJson(l))) + 1;
+    if (used + size > budget) break;
+    keep.add(i);
+    used += size;
+  }
+  const labels = input.labels.filter((_, i) => keep.has(i));
+  return { prompt: buildSynthPrompt({ ...input, labels }), labels };
 }
 
 function textField(raw: unknown, max: number): string | null {

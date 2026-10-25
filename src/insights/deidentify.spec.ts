@@ -22,6 +22,17 @@ describe('обезличивание', () => {
     expect(maskEmails('пишите на v.ivanov@yandex.ru, спасибо')).toBe('пишите на [почта], спасибо');
   });
 
+  it('у локальной части длиннее 64 знаков (RFC 5321) метка закрывает последние 64 и домен', () => {
+    expect(maskEmails(`${'a'.repeat(70)}@mail.ru`)).toBe('aaaaaa[почта]');
+  });
+
+  it('длинное слово без пробелов — за линейное время, а не за квадрат', () => {
+    const t = Date.now();
+    deidentify(['ж'.repeat(12_000), 'a.'.repeat(6_000), '1-'.repeat(6_000), 'x@'.repeat(6_000)].join(' '), ['Владимир']);
+    // Квадратичная регулярка тратила на 12 000 знаков около двух секунд.
+    expect(Date.now() - t).toBeLessThan(500);
+  });
+
   it('ссылка на известную площадку — только её домен, без пути', () => {
     expect(maskUrls('канал https://t.me/sportrodkom?start=abc')).toBe('канал [ссылка: t.me]');
     expect(maskUrls('см. www.ozon.ru/seller/123')).toBe('см. [ссылка: ozon.ru]');
