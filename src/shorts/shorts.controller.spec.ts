@@ -23,12 +23,22 @@ function res() {
 }
 
 function setup(answer: (sql: string, params: any[]) => any = () => ({ rows: [], rowCount: 0 })) {
-  const pg = { query: jest.fn(async (sql: string, params: any[] = []) => answer(sql, params)) };
+  // Транзакция-заглушка (как fakeTx в shorts-topic.service.spec.ts): BEGIN/COMMIT/ROLLBACK —
+  // своим ответом, остальное — тем же `answer`, что и у пула.
+  const client = {
+    query: jest.fn(async (sql: string, params: any[] = []) =>
+      sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK' ? { rows: [], rowCount: 0 } : answer(sql, params)),
+    release: jest.fn(),
+  };
+  const pg = {
+    query: jest.fn(async (sql: string, params: any[] = []) => answer(sql, params)),
+    getClient: jest.fn(async () => client),
+  };
   const settings = { get: jest.fn(async () => ({ slotDays: [2, 4, 6] })), update: jest.fn(async (p: any) => p) };
   const topics = { addManual: jest.fn(async () => ({ id: 'new' })), start: jest.fn(async (): Promise<any> => ({ id: ID, status: 'directing' })) };
   const storage = { publicUrl: jest.fn((b: string, k: string) => `https://minio.test/${b}/${k}`) };
   const ctl = new ShortsController(pg as any, settings as any, topics as any, storage as any);
-  return { ctl, pg, settings, topics, storage };
+  return { ctl, pg, client, settings, topics, storage };
 }
 
 describe('POST admin/shorts', () => {
@@ -104,6 +114,64 @@ describe('POST admin/shorts', () => {
 
     const never = setup(() => ({ rows: [video({ failed_from: 'publishing', approved_at: null })] }));
     await expect(never.ctl.action({ action: 'retry', id: ID }, res())).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('mark_published — отмечает telegram вышедшим и возвращает ролик в approved', async () => {
+    const v = video({ failed_from: 'publishing', approved_at: '2026-10-20T00:00:00Z' });
+    const { ctl, client } = setup((sql) => (sql.includes('FROM short_video') && !sql.includes('UPDATE') ? { rows: [v] } : { rows: [], rowCount: 1 }));
+    const r = res();
+    await ctl.action({ action: 'mark_published', id: ID, url: 'https://t.me/ainomira/777' }, r);
+
+    const upsert = client.query.mock.calls.find((c: any[]) => String(c[0]).includes('INSERT INTO short_publication')) as any[];
+    expect(upsert[1]).toEqual([ID, 'https://t.me/ainomira/777', '777']);
+
+    const upd = client.query.mock.calls.find((c: any[]) => String(c[0]).includes("SET status = 'approved'")) as any[];
+    expect(String(upd[0])).toContain("WHERE id = $1 AND status = 'failed' AND failed_from = 'publishing'");
+    expect(upd[1]).toEqual([ID]);
+
+    expect(r.body.videoUrl).toBe('https://minio.test/linkeon-smm-videos/shorts/v/video.mp4');
+  });
+
+  it('mark_published — приватный канал t.me/c/<id>/<номер> — тоже принимается', async () => {
+    const v = video({ failed_from: 'publishing', approved_at: '2026-10-20T00:00:00Z' });
+    const { ctl, client } = setup((sql) => (sql.includes('FROM short_video') && !sql.includes('UPDATE') ? { rows: [v] } : { rows: [], rowCount: 1 }));
+    await ctl.action({ action: 'mark_published', id: ID, url: 'https://t.me/c/1234567890/42' }, res());
+    const upsert = client.query.mock.calls.find((c: any[]) => String(c[0]).includes('INSERT INTO short_publication')) as any[];
+    expect(upsert[1]).toEqual([ID, 'https://t.me/c/1234567890/42', '42']);
+  });
+
+  it('mark_published — ссылка не похожа на пост Telegram — 400', async () => {
+    const v = video({ failed_from: 'publishing', approved_at: '2026-10-20T00:00:00Z' });
+    const bad = (url: string) => setup(() => ({ rows: [v] })).ctl.action({ action: 'mark_published', id: ID, url }, res());
+    await expect(bad('https://vk.com/wall1_2')).rejects.toBeInstanceOf(BadRequestException);
+    await expect(bad('https://t.me/ainomira')).rejects.toBeInstanceOf(BadRequestException);
+    await expect(bad('не ссылка')).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('mark_published — ролик не упавший на публикации (или не одобрялся) — 409', async () => {
+    const approved = video({ status: 'approved', failed_from: null, approved_at: '2026-10-20T00:00:00Z' });
+    await expect(setup(() => ({ rows: [approved] })).ctl.action({ action: 'mark_published', id: ID, url: 'https://t.me/ainomira/777' }, res()))
+      .rejects.toBeInstanceOf(ConflictException);
+
+    const neverApproved = video({ failed_from: 'publishing', approved_at: null });
+    await expect(setup(() => ({ rows: [neverApproved] })).ctl.action({ action: 'mark_published', id: ID, url: 'https://t.me/ainomira/777' }, res()))
+      .rejects.toBeInstanceOf(ConflictException);
+
+    const otherStage = video({ failed_from: 'capturing', approved_at: '2026-10-20T00:00:00Z' });
+    await expect(setup(() => ({ rows: [otherStage] })).ctl.action({ action: 'mark_published', id: ID, url: 'https://t.me/ainomira/777' }, res()))
+      .rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('mark_published — слот «сейчас» занят — 409 slot_taken', async () => {
+    const v = video({ failed_from: 'publishing', approved_at: '2026-10-20T00:00:00Z' });
+    const { ctl } = setup((sql) => {
+      if (sql.includes('FROM short_video') && !sql.includes('UPDATE')) return { rows: [v] };
+      if (sql.includes('UPDATE short_video') && sql.includes("SET status = 'approved'")) {
+        throw Object.assign(new Error('dup'), { code: '23505', constraint: SHORT_SLOT_INDEX });
+      }
+      return { rows: [], rowCount: 1 };
+    });
+    await expect(ctl.action({ action: 'mark_published', id: ID, url: 'https://t.me/ainomira/777' }, res())).rejects.toThrow('slot_taken');
   });
 
   it('настройки: чтение, правка с проверкой', async () => {
