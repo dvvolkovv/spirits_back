@@ -100,16 +100,12 @@ const expensiveAlerts = () => mockedAlert.mock.calls.filter((c) => String(c[0]).
 
 describe('Маша (локальный CLI): «Дорогой ход» и сторож роста стоимости', () => {
   const OLD_SECRET = process.env.JWT_SECRET;
-  const OLD_DS = process.env.DEEPSEEK_API_KEY;
   beforeAll(() => {
     // Токен инструмента продуктов подписывается этим секретом.
     process.env.JWT_SECRET = 'test-secret-for-product-tool';
-    // Иначе первый ход мог бы уйти приветствием в DeepSeek, мимо CLI.
-    delete process.env.DEEPSEEK_API_KEY;
   });
   afterAll(() => {
     process.env.JWT_SECRET = OLD_SECRET;
-    if (OLD_DS === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = OLD_DS;
   });
   afterEach(() => {
     jest.clearAllMocks();

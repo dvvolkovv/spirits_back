@@ -79,16 +79,13 @@ async function runMasha(message = 'Покажи мои продукты') {
 describe('Маша в вебе: инструмент продуктов', () => {
   const OLD_SECRET = process.env.JWT_SECRET;
   const OLD_PORT = process.env.PORT;
-  const OLD_DS = process.env.DEEPSEEK_API_KEY;
   beforeAll(() => {
     process.env.JWT_SECRET = 'test-secret-for-product-tool';
     delete process.env.PORT;
-    delete process.env.DEEPSEEK_API_KEY;
   });
   afterAll(() => {
     process.env.JWT_SECRET = OLD_SECRET;
     if (OLD_PORT === undefined) delete process.env.PORT; else process.env.PORT = OLD_PORT;
-    if (OLD_DS === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = OLD_DS;
   });
 
   it('CLI Маши получает MCP-сервер продуктов по loopback', async () => {
@@ -163,14 +160,11 @@ async function until(cond: () => boolean) {
  */
 describe('Маша: ход в полёте', () => {
   const OLD_SECRET = process.env.JWT_SECRET;
-  const OLD_DS = process.env.DEEPSEEK_API_KEY;
   beforeAll(() => {
     process.env.JWT_SECRET = 'test-secret-for-product-tool';
-    delete process.env.DEEPSEEK_API_KEY;
   });
   afterAll(() => {
     process.env.JWT_SECRET = OLD_SECRET;
-    if (OLD_DS === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = OLD_DS;
   });
   afterEach(() => jest.useRealTimers());
 
@@ -262,14 +256,11 @@ describe('Маша: ход в полёте', () => {
  */
 describe('Маша: метафорическая карта не цепляется к ходу с продуктом', () => {
   const OLD_SECRET = process.env.JWT_SECRET;
-  const OLD_DS = process.env.DEEPSEEK_API_KEY;
   beforeAll(() => {
     process.env.JWT_SECRET = 'test-secret-for-product-tool';
-    delete process.env.DEEPSEEK_API_KEY;
   });
   afterAll(() => {
     process.env.JWT_SECRET = OLD_SECRET;
-    if (OLD_DS === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = OLD_DS;
   });
 
   const CARD_URL = 'https://images.linkeon.io/cards/card-7.jpg';

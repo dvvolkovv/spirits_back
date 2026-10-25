@@ -96,12 +96,6 @@ function othersLine(system: string): string {
 }
 
 describe('системный промпт Маши', () => {
-  const OLD_DS = process.env.DEEPSEEK_API_KEY;
-  beforeAll(() => { delete process.env.DEEPSEEK_API_KEY; });
-  afterAll(() => {
-    if (OLD_DS === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = OLD_DS;
-  });
-
   describe('«Другие ассистенты»', () => {
     it('без выключенных и без служебного «Линкеона»', async () => {
       const line = othersLine((await mashaSystemPrompt()).system);
