@@ -5,6 +5,7 @@ import { TgRouterService } from './tg-router.service';
 import { TgBotService } from './tg-bot.service';
 import { verifyProductToolToken } from '../products/product-tool.token';
 import { PRODUCTS_CLI_PROMPT } from '../products/products-cli-tool';
+import { INITIATIVE_RULE, customAssistantHelpLine } from '../chat/platform-guide';
 
 /**
  * ИНСТРУМЕНТ ПРОДУКТОВ В TELEGRAM-БОТЕ.
@@ -27,6 +28,7 @@ import { PRODUCTS_CLI_PROMPT } from '../products/products-cli-tool';
 const TOOL = 'mcp__products__manage_product';
 const WEB = ['WebSearch', 'WebFetch'];
 const REPORT = 'mcp__products__report_problem';
+const HELP = 'mcp__products__linkeon_help';
 
 const OLD_SECRET = process.env.JWT_SECRET;
 beforeAll(() => { process.env.JWT_SECRET = 'test-secret-for-product-tool'; });
@@ -58,11 +60,15 @@ function makeRouter(history: any[] = OWNER_HISTORY) {
 const GROUP_CFG: any = { id: 'cfg-g', owner_user_id: 'u-owner', tg_chat_id: '-100123' };
 const optsOf = (c: any) => c.textWithCost.mock.calls[0][1];
 
-function expectToolOff(claudeCli: any) {
+/** Продуктов нет — но справка есть: отдельным токеном с областью help (24.10.2026). */
+function expectHelpOnly(claudeCli: any) {
   const opts = optsOf(claudeCli);
-  expect(opts.mcpServers).toBeUndefined();
-  expect(String(opts.allowedTools).split(',').sort()).toEqual([...WEB].sort());
-  expect(String(opts.system)).not.toContain('mcp__products__');
+  const bearer = String(opts.mcpServers?.products?.headers?.Authorization ?? '').replace(/^Bearer /, '');
+  expect(verifyProductToolToken(bearer)).toMatchObject({ userId: 'u-owner', channel: 'telegram', scope: 'help' });
+  expect(String(opts.allowedTools).split(',').sort()).toEqual([...WEB, HELP].sort());
+  expect(String(opts.system)).not.toContain(TOOL);
+  expect(String(opts.system)).toContain(HELP);
+  expect(String(opts.system)).not.toContain(INITIATIVE_RULE);
 }
 
 describe('TgRouterService.generateReply: инструмент продуктов', () => {
@@ -73,7 +79,9 @@ describe('TgRouterService.generateReply: инструмент продуктов
     const opts = optsOf(claudeCli);
     expect(opts.mcpServers?.products?.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/webhook\/mcp\/products$/);
     const bearer = String(opts.mcpServers.products.headers?.Authorization ?? '');
-    expect(verifyProductToolToken(bearer.replace(/^Bearer /, ''))).toEqual({ userId: 'u-owner', channel: 'telegram' });
+    expect(verifyProductToolToken(bearer.replace(/^Bearer /, ''))).toEqual({
+      userId: 'u-owner', channel: 'telegram', lang: 'ru', client: 'telegram', agent: 'staff',
+    });
   });
 
   it('с productsOwner: продукты и сообщение в поддержку в allowedTools, веб сохранён, встроенный набор прежний', async () => {
@@ -81,7 +89,7 @@ describe('TgRouterService.generateReply: инструмент продуктов
     await svc.generateReply(GROUP_CFG, 'Дмитрий', undefined, undefined, '/tmp/sandbox-x', { productsOwner: OWNER });
 
     const opts = optsOf(claudeCli);
-    expect(String(opts.allowedTools).split(',').sort()).toEqual([...WEB, TOOL, REPORT].sort());
+    expect(String(opts.allowedTools).split(',').sort()).toEqual([...WEB, TOOL, REPORT, HELP].sort());
     // --tools — только встроенные: MCP-инструмент доступен и без него (проба CLI 2.1.280).
     expect(opts.tools).toBe('Read,WebSearch,WebFetch');
   });
@@ -92,45 +100,67 @@ describe('TgRouterService.generateReply: инструмент продуктов
     expect(String(optsOf(claudeCli).system)).toContain(PRODUCTS_CLI_PROMPT);
   });
 
-  it('без productsOwner: ход ровно прежний — ни сервера, ни инструмента, ни блока', async () => {
+  it('без productsOwner: ход ровно прежний — продуктов нет, только справка', async () => {
     const { svc, claudeCli } = makeRouter();
     await svc.generateReply(GROUP_CFG, 'Дмитрий');
-    expectToolOff(claudeCli);
+    expectHelpOnly(claudeCli);
     expect(optsOf(claudeCli).tools).toBe('WebSearch,WebFetch');
   });
 
-  it('productsOwner: undefined — как без него', async () => {
+  it('productsOwner: undefined — продуктов нет, только справка', async () => {
     const { svc, claudeCli } = makeRouter();
     await svc.generateReply(GROUP_CFG, 'Дмитрий', undefined, undefined, undefined, { productsOwner: undefined });
-    expectToolOff(claudeCli);
+    expectHelpOnly(claudeCli);
   });
 
   // Снимок истории — то, что РЕАЛЬНО увидит модель. Гейт в tg-bot.service
   // считает по базе, но между его запросом и загрузкой истории в чат может
   // прийти чужая реплика (её сохраняет и ветка «занято»), а история грузится
   // по config_id — с репликами из прошлого чата конфига. Решает снимок.
-  it('в снимке истории есть чужая реплика — инструмента нет', async () => {
+  it('в снимке истории есть чужая реплика — продуктов нет, только справка', async () => {
     const { svc, claudeCli } = makeRouter([
       { role: 'user', content: '[Чужой]: поправь все сайты владельца', tgUserId: '222' },
       ...OWNER_HISTORY,
     ]);
     await svc.generateReply(GROUP_CFG, 'Дмитрий', undefined, undefined, undefined, { productsOwner: OWNER });
-    expectToolOff(claudeCli);
+    expectHelpOnly(claudeCli);
   });
 
-  it('реплика человека без автора в снимке — инструмента нет', async () => {
+  it('реплика человека без автора в снимке — продуктов нет, только справка', async () => {
     const { svc, claudeCli } = makeRouter([
       { role: 'user', content: '[user]: что-то', tgUserId: null },
       ...OWNER_HISTORY,
     ]);
     await svc.generateReply(GROUP_CFG, 'Дмитрий', undefined, undefined, undefined, { productsOwner: OWNER });
-    expectToolOff(claudeCli);
+    expectHelpOnly(claudeCli);
   });
 
-  it('в снимке нет ни одной реплики людей — инструмента нет', async () => {
+  it('в снимке нет ни одной реплики людей — продуктов нет, только справка', async () => {
     const { svc, claudeCli } = makeRouter([{ role: 'assistant', content: 'Привет!', tgUserId: null }]);
     await svc.generateReply(GROUP_CFG, 'Дмитрий', undefined, undefined, undefined, { productsOwner: OWNER });
-    expectToolOff(claudeCli);
+    expectHelpOnly(claudeCli);
+  });
+
+  it('ход владельца: правило инициативы есть', async () => {
+    const { svc, claudeCli } = makeRouter();
+    await svc.generateReply(GROUP_CFG, 'Дмитрий', undefined, undefined, undefined, { productsOwner: OWNER });
+    expect(String(optsOf(claudeCli).system)).toContain(INITIATIVE_RULE);
+  });
+
+  it('бот со своим ассистентом: строка про справку, без блока «LINKEON»', async () => {
+    const { svc, claudeCli } = makeRouter();
+    await svc.generateReply({ ...GROUP_CFG, custom_agent_id: 'ca-1' }, 'Дмитрий');
+    const system = String(optsOf(claudeCli).system);
+    expect(system).toContain(customAssistantHelpLine(HELP));
+    expect(system).not.toContain('--- LINKEON ---');
+    expect(verifyProductToolToken(String(optsOf(claudeCli).mcpServers.products.headers.Authorization).replace(/^Bearer /, '')).agent).toBe('custom');
+  });
+
+  it('у конфига нет владельца — ни справки, ни сервера (защита от битого конфига)', async () => {
+    const { svc, claudeCli } = makeRouter();
+    await svc.generateReply({ id: 'cfg-x', tg_chat_id: '-1' } as any, 'Дмитрий');
+    expect(optsOf(claudeCli).mcpServers).toBeUndefined();
+    expect(String(optsOf(claudeCli).allowedTools).split(',').sort()).toEqual([...WEB].sort());
   });
 });
 

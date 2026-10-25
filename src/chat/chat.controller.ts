@@ -16,27 +16,14 @@ import { makeReadWithinDirGuard, neutralizeAtMentions, stripWordJoiner } from '.
 import { decodeMultipartFilename } from '../common/utils/multipart-filename';
 import { TEST_USERS } from '../common/test-users';
 import { parseClientUi } from './client-ui';
+import { isStoreBuild } from './client-kind';
 import { toActivity } from './activity-map';
 import { RelayOutputFile, collectOutputFiles, outputFileLines } from './chat-files/relay-links';
 
-/**
- * Потолок загрузки, ОДИН на всю цепочку. Раньше каждое звено держало свой, и
- * пользователь получал голый 413 с надписью «не удалось обработать файл»:
- * 11.08 она трижды пыталась отправить 56–61 МБ сканов и трижды упиралась в
- * стену без объяснения.
- *
- * Узким местом был НЕ наш nginx, а Selectel-прокси 92.53.64.147, через который
- * обязан ходить весь трафик РФ: у него стоял свой `client_max_body_size 50m`.
- * 11.08 подняты оба слоя до 120m и замерено через прокси: 55 и 100 МБ проходят,
- * 130 МБ → 413. 100 МБ здесь — это 120m минус запас на служебные поля multipart.
- *
- * Менять это число можно только вместе с ОБОИМИ nginx: origin
- * (/etc/nginx/conf.d/upload.conf) и edge (sites-enabled/my.linkeon.io на
- * 92.53.64.147). Завысить его хуже, чем не иметь вовсе: проверка пропустит
- * пачку, а nginx отобьёт её немым 413 — тем самым, от которого мы уходили.
- */
-export const MAX_UPLOAD_TOTAL_BYTES = 100 * 1024 * 1024;
-export const MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024;
+// Потолок загрузки и зачем он именно такой — в upload-limits.ts, вместе с
+// самой константой (менять его можно только вместе с ОБОИМИ nginx).
+import { MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES } from './upload-limits';
+export { MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES };
 
 @Controller('')
 export class ChatController {
@@ -114,8 +101,7 @@ export class ChatController {
     // Неизвестное или отсутствующее значение — НЕ магазин: так ведут себя веб
     // и старые сборки, где оплата разрешена. Ошибиться в эту сторону дешевле,
     // чем молча выключить пополнение всему вебу.
-    const distribution = String(req.headers['x-linkeon-distribution'] || '').toLowerCase();
-    const storeBuild = distribution === 'appstore' || distribution === 'play';
+    const storeBuild = isStoreBuild(req.headers['x-linkeon-distribution']);
     if (!message || !assistantId) {
       return res.status(400).json({ error: 'Missing message or assistantId' });
     }
@@ -292,6 +278,8 @@ export class ChatController {
       freshSessionId,
       requestLang: typeof body.lang === 'string' ? body.lang : undefined,
       ask: ui.ask,
+      storeBuild: isStoreBuild(req.headers['x-linkeon-distribution']),
+      ui,
     });
 
     // Профиль уехал в systemPrompt вместе с персоной — в тело реплики его
@@ -317,6 +305,9 @@ export class ChatController {
     if (handoff.systemPrompt) fd.append('systemPrompt', handoff.systemPrompt);
     // Вставится только при холодном старте сессии — в resumed история уже есть.
     if (handoff.history) fd.append('history', handoff.history);
+    // Продукты, поиск файлов и справка — те же поля, что у текстового хода.
+    fd.append('products_token', handoff.products.products_token);
+    fd.append('products_mcp_url', handoff.products.products_mcp_url);
 
     // Set streaming headers
     res.status(200);

@@ -2,7 +2,7 @@ import 'reflect-metadata';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PATH_METADATA } from '@nestjs/common/constants';
-import { productsCliMcp, PRODUCTS_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME } from './products-cli-tool';
+import { helpCliMcp, LINKEON_HELP_CLI_TOOL_NAME, productsCliMcp, PRODUCTS_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME } from './products-cli-tool';
 import { REPORT_PROBLEM_TOOL_NAME } from '../problem-report/report-problem.tool';
 import { verifyProductToolToken } from './product-tool.token';
 import { PRODUCT_TOOL_NAME } from './product-tool.service';
@@ -154,6 +154,28 @@ describe('инструмент продуктов для локального CL
       const b = block();
       expect(b).not.toContain('Bash');
       expect(b).not.toContain('Write');
+    });
+  });
+
+  describe('справка', () => {
+    it('имя справки складывается из того же ключа сервера', () => {
+      expect(LINKEON_HELP_CLI_TOOL_NAME).toBe('mcp__products__linkeon_help');
+    });
+
+    it('поля справки едут в токен инструмента продуктов', () => {
+      const r = productsCliMcp('u-test', 'telegram', { lang: 'de', client: 'telegram', agent: 'staff' });
+      expect(verifyProductToolToken(bearerOf(r).replace(/^Bearer /, ''))).toEqual({
+        userId: 'u-test', channel: 'telegram', lang: 'de', client: 'telegram', agent: 'staff',
+      });
+    });
+
+    // Ход Telegram-группы с посторонними: продуктов нет, справка — есть.
+    it('helpCliMcp: тот же сервер, токен с областью help, в allowedTools — одна справка', () => {
+      const r = helpCliMcp('u-owner', 'telegram', { lang: 'ru', client: 'telegram', agent: 'custom' });
+      expect(r.mcpServers.products.url).toBe(productsCliMcp('u-owner', 'telegram').mcpServers.products.url);
+      expect(r.toolName).toBe(LINKEON_HELP_CLI_TOOL_NAME);
+      const claims = verifyProductToolToken(String(r.mcpServers.products.headers?.Authorization).replace(/^Bearer /, ''));
+      expect(claims).toEqual({ userId: 'u-owner', channel: 'telegram', lang: 'ru', client: 'telegram', scope: 'help', agent: 'custom' });
     });
   });
 });

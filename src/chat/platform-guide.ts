@@ -1,4 +1,5 @@
-import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
+import { labelsFor } from '../platform-kb/labels';
+import type { KbLabels } from '../platform-kb/labels';
 
 /**
  * Блок «Что есть в Linkeon» для системного промпта ассистента.
@@ -10,145 +11,78 @@ import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
  *
  * Разделы названы подписями, которые пользователь видит на своём языке: иначе
  * ассистент переводит «Студию» сам и называет пункт меню, которого нет.
+ * Подписи берутся из общей таблицы справки (src/platform-kb/labels.ts),
+ * которую собирает из локалей фронта scripts/sync-kb-labels.mjs.
  *
  * Пополнения и оплаты здесь нет намеренно: это дело блока баланса
  * (balance-context.service.ts), а он знает про сборки для сторов, которым
  * ссылки на оплату показывать нельзя.
  */
 
-type Lang = (typeof SUPPORTED_LANGUAGES)[number];
-
-interface Labels {
-  chat: string;
-  listen: string;
-  fresh: string;
-  files: string;
-  call: string;
-  meetingJoin: string;
-  networking: string;
-  imageGen: string;
-  video: string;
-  studio: string;
-  studioAgents: string;
-  studioBots: string;
-  studioProducts: string;
-  profile: string;
-  business: string;
-  settings: string;
-  calendars: string;
-  push: string;
-  voices: string;
-  android: string;
-  partners: string;
-  invite: string;
-  help: string;
-  support: string;
+export interface PlatformGuideOpts {
+  /** Полное имя инструмента справки. Без него — прежнее вступление: там, где инструмента нет. */
+  helpTool?: string;
+  /** Сборка из стора: без партнёрской программы. */
+  store?: boolean;
+  /** Правило инициативы — штатным ассистентам и боту в ходе владельца. */
+  initiative?: boolean;
 }
 
 /**
- * Копия подписей фронта (репозиторий spirits, src/i18n/locales/<язык>.json) на
- * 12.10.2026. Ключи по порядку: chat.title, chat.listen, chat.fresh_mode_label,
- * chat.files.open, chat.voice_call.start, chat.meeting.join, nav.networking,
- * nav.image_gen, video.navTitle, studio.nav, studio.tabs.agents|bots|products,
- * profile.title, businessCard.title, settings.title, settings.calendar.title,
- * settings.push.title, settings.voices.title, settings.android.title,
- * nav.referral, profile.invite_friend_title, nav.help, help.cta.button.
- * Переименовали пункт во фронте — поправить и здесь.
+ * Правило инициативы. Решение владельца 24.10.2026: ассистент сам предлагает
+ * функцию, когда она прямо решает текущую задачу, — одной фразой и без повтора
+ * отклонённого. Своим ассистентам пользователей и группам Telegram с
+ * посторонними его не даём: там подсказка читалась бы чужой рекламой.
  */
-const LABELS: Record<Lang, Labels> = {
-  ru: {
-    chat: 'Чат с ассистентом', listen: 'Прослушать', fresh: 'Чистый лист', files: 'Медиа и файлы',
-    call: 'Позвонить', meetingJoin: 'Зайти', networking: 'Нетворкинг', imageGen: 'Генератор изображений',
-    video: 'Видео', studio: 'Студия', studioAgents: 'Ассистенты', studioBots: 'Telegram-боты',
-    studioProducts: 'Продукты', profile: 'Мой профиль', business: 'Мой бизнес', settings: 'Настройки',
-    calendars: 'Календари', push: 'Уведомления на этом устройстве', voices: 'Голоса ассистентов',
-    android: 'Мобильное приложение', partners: 'Партнёры', invite: 'Пригласи друга', help: 'Помощь',
-    support: 'Связаться с поддержкой',
-  },
-  en: {
-    chat: 'Chat with assistant', listen: 'Listen', fresh: 'Fresh start', files: 'Media and files',
-    call: 'Call', meetingJoin: 'Join', networking: 'Networking', imageGen: 'Image generator',
-    video: 'Video', studio: 'Studio', studioAgents: 'Assistants', studioBots: 'Telegram bots',
-    studioProducts: 'Products', profile: 'My profile', business: 'My business', settings: 'Settings',
-    calendars: 'Calendars', push: 'Notifications on this device', voices: 'Assistant voices',
-    android: 'Mobile app', partners: 'Partners', invite: 'Invite a friend', help: 'Help',
-    support: 'Contact support',
-  },
-  es: {
-    chat: 'Chat con el asistente', listen: 'Escuchar', fresh: 'Hoja en blanco', files: 'Multimedia y archivos',
-    call: 'Llamar', meetingJoin: 'Entrar', networking: 'Networking', imageGen: 'Generador de imágenes',
-    video: 'Vídeo', studio: 'Estudio', studioAgents: 'Asistentes', studioBots: 'Bots de Telegram',
-    studioProducts: 'Productos', profile: 'Mi perfil', business: 'Mi negocio', settings: 'Ajustes',
-    calendars: 'Calendarios', push: 'Notificaciones en este dispositivo', voices: 'Voces de los asistentes',
-    android: 'Aplicación móvil', partners: 'Partners', invite: 'Invita a un amigo', help: 'Ayuda',
-    support: 'Contactar con soporte',
-  },
-  de: {
-    chat: 'Chat mit dem Assistenten', listen: 'Anhören', fresh: 'Neustart', files: 'Medien und Dateien',
-    call: 'Anrufen', meetingJoin: 'Beitreten', networking: 'Networking', imageGen: 'Bildgenerator',
-    video: 'Video', studio: 'Studio', studioAgents: 'Assistenten', studioBots: 'Telegram-Bots',
-    studioProducts: 'Produkte', profile: 'Mein Profil', business: 'Mein Unternehmen', settings: 'Einstellungen',
-    calendars: 'Kalender', push: 'Benachrichtigungen auf diesem Gerät', voices: 'Stimmen der Assistenten',
-    android: 'Mobile App', partners: 'Partner', invite: 'Lade einen Freund ein', help: 'Hilfe',
-    support: 'Support kontaktieren',
-  },
-  fr: {
-    chat: "Chat avec l'assistant", listen: 'Écouter', fresh: 'Page blanche', files: 'Médias et fichiers',
-    call: 'Appeler', meetingJoin: 'Rejoindre', networking: 'Réseautage', imageGen: "Générateur d'images",
-    video: 'Vidéo', studio: 'Studio', studioAgents: 'Assistants', studioBots: 'Bots Telegram',
-    studioProducts: 'Produits', profile: 'Mon profil', business: 'Mon entreprise', settings: 'Paramètres',
-    calendars: 'Calendriers', push: 'Notifications sur cet appareil', voices: 'Voix des assistants',
-    android: 'Application mobile', partners: 'Partenaires', invite: 'Invite un ami', help: 'Aide',
-    support: 'Contacter le support',
-  },
-  zh: {
-    chat: '与助手聊天', listen: '收听', fresh: '空白模式', files: '媒体和文件',
-    call: '拨打', meetingJoin: '加入', networking: '人脉拓展', imageGen: '图片生成器',
-    video: '视频', studio: '工作室', studioAgents: '助手', studioBots: 'Telegram机器人',
-    studioProducts: '产品', profile: '我的个人资料', business: '我的生意', settings: '设置',
-    calendars: '日历', push: '此设备上的通知', voices: '助手语音',
-    android: '移动应用', partners: '合伙人', invite: '邀请好友', help: '帮助',
-    support: '联系客服',
-  },
-  pt: {
-    chat: 'Chat com o assistente', listen: 'Ouvir', fresh: 'Página em branco', files: 'Multimédia e ficheiros',
-    call: 'Ligar', meetingJoin: 'Entrar', networking: 'Networking', imageGen: 'Gerador de imagens',
-    video: 'Vídeo', studio: 'Estúdio', studioAgents: 'Assistentes', studioBots: 'Bots do Telegram',
-    studioProducts: 'Produtos', profile: 'O meu perfil', business: 'Meu negócio', settings: 'Definições',
-    calendars: 'Calendários', push: 'Notificações neste dispositivo', voices: 'Vozes dos assistentes',
-    android: 'Aplicação móvel', partners: 'Parceiros', invite: 'Convida um amigo', help: 'Ajuda',
-    support: 'Contactar o apoio ao cliente',
-  },
-};
+export const INITIATIVE_RULE =
+  'ПОДСКАЗКИ ПО LINKEON. Если функция Linkeon прямо решает задачу, над которой вы сейчас работаете, — ' +
+  'предложи её одной фразой с точным путём по меню, после ответа по сути, а не вместо него. ' +
+  'Не чаще одного раза за тему. Отказался или уже пользуется — не повторяй. ' +
+  'В кризисной ситуации не предлагай ничего.';
 
-/** Незнакомый язык — русские подписи. */
-const labelsFor = (lang: string): Labels => (LABELS as Record<string, Labels>)[lang] ?? LABELS.ru;
+/** Как пользоваться справкой: подробности — только из неё, она главнее персоны, нет ответа — поддержка. */
+function helpRule(l: KbLabels, tool: string): string {
+  return (
+    `Подробности — как сделать, лимиты, цены, что делать, если не работает, как устроено, — бери из инструмента ${tool}, ` +
+    'а не по памяти: функции и цены меняются. По фактам о платформе справка главнее того, что о платформе сказано ' +
+    `в твоей персоне. Справка не дала ответа — скажи, что не знаешь, и предложи «${l.support}» в разделе «${l.help}».`
+  );
+}
 
 /** Блок для системного промпта ассистента. */
-export function platformGuide(lang: string): string {
+export function platformGuide(lang: string, opts: PlatformGuideOpts = {}): string {
   const l = labelsFor(lang);
+  const intro =
+    'Если спрашивают, что ещё есть на платформе, где что найти или как сделать то, что делается не в разговоре, — ' +
+    'отвечай по этому списку. Разделы и кнопки называй так, как они подписаны у пользователя: в кавычках ниже. ' +
+    (opts.helpTool
+      ? helpRule(l, opts.helpTool)
+      : `Чего в списке нет, не выдумывай: скажи, что не знаешь, и предложи «${l.support}» в разделе «${l.help}».`);
   return [
     '--- ЧТО ЕСТЬ В LINKEON ---',
-    'Если спрашивают, что ещё есть на платформе, где что найти или как сделать то, что делается не в разговоре, — ' +
-      'отвечай по этому списку. Разделы и кнопки называй так, как они подписаны у пользователя: в кавычках ниже. ' +
-      `Чего в списке нет, не выдумывай: скажи, что не знаешь, и предложи «${l.support}» в разделе «${l.help}».`,
-    platformSections(lang),
+    intro,
+    platformSections(lang, { store: opts.store }),
+    ...(opts.initiative ? [INITIATIVE_RULE] : []),
   ].join('\n');
 }
 
 /**
  * Перечень разделов без вступления. Его же берёт ИИ-поддержка
  * (support.service.ts): совет «предложи связаться с поддержкой» ей ни к чему.
+ * store — без партнёрской программы: она про деньги, а в сборке из стора о
+ * деньгах молчим (справка там не отдаёт тему partners).
  */
-export function platformSections(lang: string): string {
+export function platformSections(lang: string, opts: { store?: boolean } = {}): string {
   const l = labelsFor(lang);
+  const partners = opts.store ? '' : ` — и «${l.partners}» с «${l.invite}»`;
   return [
     `• «${l.chat}» — разговоры с ассистентами. Под ответом ассистента — «${l.listen}»: ответ голосом. ` +
       `«${l.fresh}» — разговор без прошлой истории. «${l.files}» — картинки, видео и файлы этого разговора. ` +
       'Файл к сообщению прикладывается кнопкой «+».',
     `• «${l.call}» (кнопка со значком телефона) — голосовой звонок. В звонке отвечает только Роман.`,
     '• Ссылку на онлайн-встречу можно прислать в чат: если площадка поддерживается, появится карточка ' +
-      `с кнопкой «${l.meetingJoin}», и по ней ассистент придёт на встречу.`,
+      `с кнопкой «${l.meetingJoin}», и по ней ассистент придёт на встречу. Чтобы ассистент заходил и на чужие ` +
+      `встречи в Zoom, в «${l.settings}» подключается «${l.zoom}».`,
     `• «${l.networking}» — поиск людей по ценностям и навыкам, проверка совместимости, запросы на общение ` +
       'и чаты с другими пользователями.',
     `• «${l.imageGen}» и «${l.video}» — отдельные разделы для картинок и роликов.`,
@@ -158,10 +92,25 @@ export function platformSections(lang: string): string {
       'по просьбам обычными словами. Новый продукт создаётся только там.',
     `• «${l.profile}» — ценности, интересы и навыки (собираются сами из разговоров) и «${l.business}» — ` +
       `что ассистенты знают о деле пользователя. Там же «${l.settings}» — «${l.calendars}» (Яндекс, рабочий ` +
-      `Outlook, Google и iCloud по ссылке), «${l.push}», «${l.voices}», язык, приватность, «${l.android}» ` +
-      `(Android, установка файлом) — и «${l.partners}» с «${l.invite}».`,
+      `Outlook, Google и iCloud по ссылке), «${l.push}», «${l.routines}», «${l.voices}», «${l.loginMethods}», ` +
+      // Сборки из App Store/Google Play (store) ставятся самим стором — решение
+      // владельца 25.10.2026: установку файлом (APK) им не упоминаем вовсе.
+      `язык, приватность, «${l.android}»${opts.store ? '' : ' (Android, установка файлом)'}${partners}.`,
+    '• Linkeon открывается и внутри Telegram — как мини-приложение.',
     `• «${l.help}» — краткая инструкция, частые вопросы и «${l.support}».`,
   ].join('\n');
+}
+
+/**
+ * Свой ассистент пользователя: ни карты, ни инициативы — персону написал
+ * пользователь, и вставки о платформе были бы в ней чужими. Только справка,
+ * когда спросили о самой платформе.
+ */
+export function customAssistantHelpLine(tool: string): string {
+  return (
+    'Ты работаешь на платформе Linkeon. Если спрашивают о самой платформе — как что сделать, сколько стоит, ' +
+    `что делать, если не работает, — отвечай по инструменту ${tool}, не по памяти.`
+  );
 }
 
 /**
@@ -169,8 +118,9 @@ export function platformSections(lang: string): string {
  * Кабинет назван адресом: в группе бывают люди, которые Linkeon не видели.
  * В Telegram нет файлов на выдачу, кода, календаря, рутин и звонка — в веб-чате
  * они есть. Озвучка есть и там (голосовые ответы бота), её в список не ставим.
+ * helpTool — справка есть в ходе; initiative — только в ходе владельца.
  */
-export function telegramPlatformGuide(lang: string): string {
+export function telegramPlatformGuide(lang: string, opts: { helpTool?: string; initiative?: boolean } = {}): string {
   const l = labelsFor(lang);
   return [
     '--- LINKEON ---',
@@ -182,6 +132,8 @@ export function telegramPlatformGuide(lang: string): string {
       'календарь, регулярные сообщения и голосовой звонок. Просят то, чего в этом чате нет, — так и скажи и предложи ' +
       'сделать это в веб-чате.',
     `Такой же бот для своей Telegram-группы заводится в «${l.studio}» → «${l.studioBots}».`,
+    ...(opts.helpTool ? [helpRule(l, opts.helpTool)] : []),
+    ...(opts.initiative ? [INITIATIVE_RULE] : []),
   ].join('\n');
 }
 

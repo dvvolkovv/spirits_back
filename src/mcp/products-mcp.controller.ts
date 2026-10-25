@@ -18,11 +18,19 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { PRODUCT_TOOLS, ProductToolService } from '../products/product-tool.service';
-import { ProductToolChannel, ProductToolClaims, verifyProductToolToken } from '../products/product-tool.token';
+import {
+  ProductToolChannel,
+  ProductToolClaims,
+  ProductToolClient,
+  ProductToolScope,
+  verifyProductToolToken,
+} from '../products/product-tool.token';
 import { ChatFilesService } from '../chat/chat-files/chat-files.service';
 import { FIND_FILES_TOOL, FIND_FILES_TOOL_NAME } from '../chat/chat-files/find-files.tool';
 import { parseFindFilesInput } from '../chat/chat-files/find-files';
 import { EventsService } from '../events/events.service';
+import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
+import { LINKEON_HELP_TOOL_NAME, executeLinkeonHelp, linkeonHelpTool } from '../platform-kb/linkeon-help';
 import { ChatService } from '../chat/chat.service';
 import { ProblemReportService } from '../problem-report/problem-report.service';
 import { REPORT_PROBLEM_TOOL, REPORT_PROBLEM_TOOL_NAME } from '../problem-report/report-problem.tool';
@@ -59,6 +67,7 @@ export class ProductsMcpController {
     private readonly problems: ProblemReportService,
     private readonly chat: ChatService,
     @Optional() private readonly events?: EventsService,
+    @Optional() private readonly language?: LanguageService,
   ) {}
 
   /** Владелец и канал из Bearer. Бросает — значит звать инструмент нечем. */
@@ -72,19 +81,29 @@ export class ProductsMcpController {
     }
   }
 
+  /** Клиент для справки: из подписи, а у токена без поля — по каналу. */
+  private clientOf(c: Pick<ProductToolClaims, 'channel' | 'client'>): ProductToolClient {
+    return c.client ?? (c.channel === 'telegram' ? 'telegram' : 'web');
+  }
+
   /**
-   * Инструменты по каналу токена: поиск файлов — только в вебе (TG-бот в эту
-   * фичу не входит); сообщить в поддержку — в обоих каналах.
+   * Инструменты по токену. Справка — всем; по токену с областью help — только
+   * она: такой получают ходы Telegram-группы с посторонними, где продукты и
+   * файлы владельца трогать нельзя, а сообщать в поддержку от их имени — тоже.
+   * Поиск файлов — только в вебе (TG-бот в эту фичу не входит); сообщить в
+   * поддержку — в обоих каналах.
    */
-  private toolsFor(channel: ProductToolChannel) {
-    return channel === 'telegram'
-      ? [...PRODUCT_TOOLS, REPORT_PROBLEM_TOOL]
-      : [...PRODUCT_TOOLS, FIND_FILES_TOOL, REPORT_PROBLEM_TOOL];
+  private toolsFor(c: Pick<ProductToolClaims, 'channel' | 'client' | 'scope'>) {
+    const help = linkeonHelpTool(this.clientOf(c));
+    if (c.scope === 'help') return [help];
+    return c.channel === 'telegram'
+      ? [...PRODUCT_TOOLS, REPORT_PROBLEM_TOOL, help]
+      : [...PRODUCT_TOOLS, FIND_FILES_TOOL, REPORT_PROBLEM_TOOL, help];
   }
 
   /** Вынесено из makeServer ради проверяемости: контракт схемы — часть защиты. */
-  listTools(channel: ProductToolChannel = 'web') {
-    return this.toolsFor(channel).map((t) => ({
+  listTools(channel: ProductToolChannel = 'web', opts: { client?: ProductToolClient; scope?: ProductToolScope } = {}) {
+    return this.toolsFor({ channel, ...opts }).map((t) => ({
       name: t.name,
       description: t.description,
       inputSchema: t.input_schema,
@@ -93,14 +112,35 @@ export class ProductsMcpController {
 
   /** Вынесено из makeServer по той же причине: здесь живёт разбор владельца. */
   async callTool(authHeader: string | undefined, args: any, name: string = PRODUCT_TOOLS[0].name) {
-    const { userId, channel } = this.owner(authHeader);
+    const claims = this.owner(authHeader);
+    const { userId, channel } = claims;
     // userId из запроса выбрасывается ЯВНО, а не игнорируется по невнимательности:
     // поле могло бы приехать и перекрыть владельца при любой будущей правке
     // execute(), которая начнёт заглядывать в input. channel — туда же: канал
     // хода (web/telegram) несёт подпись токена, а не поле, которое пишет модель.
     const { userId: _drop, channel: _dropChannel, ...input } = args ?? {};
-    if (!this.toolsFor(channel).some((t) => t.name === name)) {
+    if (!this.toolsFor(claims).some((t) => t.name === name)) {
       return { ok: false, error: `Неизвестный инструмент: ${name}` };
+    }
+    if (name === LINKEON_HELP_TOOL_NAME) {
+      // Язык — из подписи; у токена, выпущенного до справки, — из профиля.
+      const lang = claims.lang ?? (await this.language?.resolveUserLanguage(userId)) ?? DEFAULT_LANGUAGE;
+      const client = this.clientOf(claims);
+      const result = executeLinkeonHelp(input, { lang, client });
+      // Статистика: о чём спрашивают и каких тем не хватает. Текста разговора нет.
+      this.events?.track('linkeon_help_call', {
+        userId,
+        props: {
+          channel,
+          client,
+          lang,
+          scope: claims.scope ?? 'full',
+          agent: claims.agent ?? null,
+          topics: result.articles.map((a) => a.id),
+          index: !!result.index,
+        },
+      });
+      return result;
     }
     if (name === FIND_FILES_TOOL_NAME) {
       const result = await this.files.searchForUser(userId, parseFindFilesInput(input));
@@ -128,12 +168,14 @@ export class ProductsMcpController {
   }
 
   private makeServer(authHeader?: string): Server {
-    const { channel } = this.owner(authHeader);
+    const claims = this.owner(authHeader);
     const server = new Server(
       { name: 'linkeon-products', version: '1.0.0' },
       { capabilities: { tools: {} } },
     );
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: this.listTools(channel) }));
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: this.listTools(claims.channel, { client: claims.client, scope: claims.scope }),
+    }));
     server.setRequestHandler(CallToolRequestSchema, async (req: any) => {
       const { name, arguments: args } = req.params ?? {};
       const result: any = await this.callTool(authHeader, args, name);

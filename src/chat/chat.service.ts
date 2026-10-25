@@ -17,13 +17,14 @@ import { RESPONSE_STYLE_RULE } from './response-style';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
 import { CRISIS_RULE } from './crisis-rule';
 import { loadCoworkers } from './coworkers';
-import { platformGuide, TOOLS_LIST_NOTE } from './platform-guide';
+import { customAssistantHelpLine, platformGuide, TOOLS_LIST_NOTE } from './platform-guide';
+import { clientKind } from './client-kind';
 import { ClientUi, NO_CLIENT_UI } from './client-ui';
 import { toActivity } from './activity-map';
 import { ASK_RULE } from './ask-rule';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
-import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
+import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, LINKEON_HELP_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
 import { ChatFileStore, PERSIST_TURN_BUDGET_MS } from './chat-files/chat-file-store';
 import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks } from './chat-files/relay-links';
 import { BalanceContextService } from '../tokens/balance-context.service';
@@ -640,6 +641,8 @@ export class ChatService {
     profileText?: string;
     /** Клиент рисует карточки вопросов (см. client-ui.ts, ask-rule.ts). */
     ask?: boolean;
+    /** Сборка из стора: карта без партнёрской программы (см. platform-guide.ts). */
+    storeBuild?: boolean;
   }): Promise<string> {
     const { agentId, agentName, userId, userLanguage } = opts;
     const agentDescription = opts.agentDescription || '';
@@ -649,7 +652,8 @@ export class ChatService {
     let stablePrefix =
       `СИСТЕМНАЯ ИНСТРУКЦИЯ (имеет приоритет над всеми остальными). ` +
       `Ты ассистент по имени **${agentName}**${agentDescription ? ` — ${agentDescription}` : ''} на платформе LINKEON.IO. ` +
-      `Всегда представляйся именно как ${agentName}. Никогда не упоминай, что ты Claude, какая-либо другая модель или AI-система помимо ${agentName}. ` +
+      `Всегда представляйся именно как ${agentName}. Себя называй только этим именем: не говори, что ты Claude или другая модель. ` +
+      `На вопрос, на каких нейросетях работает Linkeon, отвечай по справке Linkeon (тема how-it-works) — это рассказ о платформе, а не смена твоего имени. ` +
       `Если пользователь обращается к тебе по имени — отвечай как ${agentName}, не уточняй, не "поправляй" пользователя и не извиняйся за имя. ` +
       `Не добавляй P.S. о собственной идентичности. ` +
       LanguageService.buildDirective(userLanguage) + `\n`;
@@ -666,7 +670,9 @@ export class ChatService {
     // Кризисное правило — сразу за персоной, там же, где оно стоит у штатных
     // ассистентов в конце их промпта из БД. Только пользовательским: у штатных
     // оно уже есть, второй экземпляр не нужен (см. crisis-rule.ts).
-    if (isCustom) stablePrefix += `${CRISIS_RULE}\n\n`;
+    // И одна строка про справку: карты и инициативы своему ассистенту не даём
+    // — его персону написал пользователь.
+    if (isCustom) stablePrefix += `${CRISIS_RULE}\n\n${customAssistantHelpLine(LINKEON_HELP_CLI_TOOL_NAME)}\n\n`;
 
     // Coworker awareness — каждый ассистент должен знать про остальных, чтобы
     // суметь представить их пользователю и не делать вид, что новых коллег нет.
@@ -692,9 +698,10 @@ export class ChatService {
       } catch { /* non-fatal — продолжаем без блока коллег */ }
 
       // Платформа и пометка про раздел «ИНСТРУМЕНТЫ» — тем же штатным, что и
-      // коллеги (см. platform-guide.ts). Текст зависит только от языка, так
-      // что кэш префикса он не ломает.
-      stablePrefix += `${platformGuide(userLanguage)}\n\n${TOOLS_LIST_NOTE}\n\n`;
+      // коллеги (см. platform-guide.ts). Текст зависит от языка и признака
+      // стора; переключение одного пользователя между стором и вебом стоит
+      // одного хода по холодному кэшу, как у правила карточек.
+      stablePrefix += `${platformGuide(userLanguage, { helpTool: LINKEON_HELP_CLI_TOOL_NAME, store: opts.storeBuild, initiative: true })}\n\n${TOOLS_LIST_NOTE}\n\n`;
     }
 
     // Профиль и бизнес-карточка — в СТАБИЛЬНУЮ часть, к персоне.
@@ -778,7 +785,10 @@ export class ChatService {
     // Клиент рисует карточки вопросов. Сессия у загрузки и текста одна, и
     // системный промпт обязан совпадать — иначе правило то есть, то нет.
     ask?: boolean;
-  }): Promise<{ sessionId: string; systemPrompt: string; history: string }> {
+    /** Сборка из стора и что умеет клиент — для справки (client-kind.ts). */
+    storeBuild?: boolean;
+    ui?: ClientUi;
+  }): Promise<{ sessionId: string; systemPrompt: string; history: string; products: { products_token: string; products_mcp_url: string } }> {
     const { userId, assistantId, freshSessionId } = p;
     const profileText = p.profileText || '';
     const userLanguage = await this.language.resolveUserLanguage(userId, p.requestLang);
@@ -788,9 +798,11 @@ export class ChatService {
     // всё равно должен состояться. Ключ сессии при этом уже правильный, то есть
     // главное (файл виден дальше в разговоре) не зависит от этой ветки.
     let systemPrompt = '';
+    let isCustom = assistantId.startsWith('custom:');
     try {
       const agent = await this.resolveAgent(userId, assistantId);
       if (agent) {
+        isCustom = String(agent.id).startsWith('custom:');
         systemPrompt = await this.buildRelayStablePrefix({
           agentId: String(agent.id),
           agentName: agent.name,
@@ -801,6 +813,7 @@ export class ChatService {
           userLanguage,
           profileText,
           ask: p.ask,
+          storeBuild: p.storeBuild,
         });
       }
     } catch (e: any) {
@@ -825,7 +838,15 @@ export class ChatService {
       this.logger.warn(`upload handoff: history build failed for ${userId}_${assistantId}: ${e?.message}`);
     }
 
-    return { sessionId, systemPrompt, history };
+    // Инструменты точки продуктов — те же, что у текстового хода: сессия на
+    // релее одна, и её системный промпт обещает справку.
+    const products = productsRelayFields(userId, {
+      lang: userLanguage,
+      client: clientKind(!!p.storeBuild, p.ui ?? NO_CLIENT_UI),
+      agent: isCustom ? 'custom' : 'staff',
+    });
+
+    return { sessionId, systemPrompt, history, products };
   }
 
   async streamChat(
@@ -1011,7 +1032,7 @@ export class ChatService {
         recentHistory, profileText, res,
         agent.name, agent.description || '', agent.system_prompt || '',
         req, fresh, chatSessionId, requestLang, clientTz, balanceBlock,
-        agent.category, probe, ui,
+        agent.category, probe, ui, storeBuild,
       );
     }
 
@@ -1039,7 +1060,7 @@ export class ChatService {
 При первом приветствии кратко представься и упомяни других ассистентов. Используй только текст без таблиц.
 Картинки и видео ты в этом чате не генерируешь: таких инструментов у тебя нет (метафорические карты — другое дело, их показывает платформа). Если просят нарисовать или сгенерировать картинку, сделать видео или ролик — честно скажи, что сама этого не сделаешь, и предложи раздел «Генератор изображений» или «Видео» в меню либо переключиться на другого ассистента: у них такие инструменты есть. Никогда не пиши, что картинка или видео готовы или вот-вот будут.
 
-${platformGuide(userLanguage)}`;
+${platformGuide(userLanguage, { store: storeBuild, helpTool: LINKEON_HELP_CLI_TOOL_NAME, initiative: true })}`;
 
     // Стабильная часть (одинаковая между вызовами для одного агента) — кэшируется.
     // Волатильную (profileText) кладём ПОСЛЕ кэша, иначе изменение профиля юзера ломает префикс.
@@ -1134,7 +1155,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // (productsRelayFields), Маша — локальным CLI: тот же /webhook/mcp/products
     // по loopback, токен этого пользователя с каналом web — правки ложатся в
     // product_turns с channel='web'. Токен уходит в файл конфига 0600, не в argv.
-    const products = productsCliMcp(userId, 'web');
+    const products = productsCliMcp(userId, 'web', { lang: userLanguage, client: clientKind(storeBuild, ui), agent: 'staff' });
     // Звали ли в этом ходе инструмент продуктов — от этого зависит карта ниже.
     let usedProductsTool = false;
 
@@ -1187,15 +1208,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // Автоодобрение — ровно инструменты точки продуктов. Встроенные тулы у Маши
           // по-прежнему выключены (tools не задан → `--tools ""`).
           // + поиск файлов прошлых разговоров (find-files.tool.ts) — у TG-бота
-          // его нет; + сообщить в поддержку (src/problem-report) — есть у обоих.
-          allowedTools: `${products.toolName},${FIND_FILES_CLI_TOOL_NAME},${REPORT_PROBLEM_CLI_TOOL_NAME}`,
+          // его нет; + сообщить в поддержку (src/problem-report) — есть у обоих;
+          // + справка о Linkeon (platform-kb).
+          allowedTools: `${products.toolName},${FIND_FILES_CLI_TOOL_NAME},${REPORT_PROBLEM_CLI_TOOL_NAME},${LINKEON_HELP_CLI_TOOL_NAME}`,
           // onProgress переводит CLI в stream-json: только так видно, звали ли
           // инструмент продуктов в этом ходе (итог в формате json этого не несёт).
           onProgress: (ev) => {
             // Карта не подмешивается и к ходу с поиском файлов или с сообщением в
             // поддержку: «карточка», «картинка» о найденных файлах, «не проходит
-            // оплата картой» в жалобе — не повод вешать метафорическую карту.
-            if (ev.kind === 'tool_use' && (ev.name === products.toolName || ev.name === FIND_FILES_CLI_TOOL_NAME || ev.name === REPORT_PROBLEM_CLI_TOOL_NAME)) usedProductsTool = true;
+            // оплата картой» в жалобе — не повод вешать метафорическую карту;
+            // и к ходу со справкой: вопрос о платформе — не повод для метафорической карты.
+            if (ev.kind === 'tool_use' && (ev.name === products.toolName || ev.name === FIND_FILES_CLI_TOOL_NAME || ev.name === REPORT_PROBLEM_CLI_TOOL_NAME || ev.name === LINKEON_HELP_CLI_TOOL_NAME)) usedProductsTool = true;
             // Шаг работы для клиента, который его рисует. Аргументов onProgress
             // не отдаёт — хватает имени: у Маши только инструменты точки продуктов.
             // Для новых инструментов понадобится input — onProgress его не отдаёт.
@@ -1393,6 +1416,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     probe: boolean = false,
     // Шаги работы и карточки вопросов — см. streamChat.
     ui: ClientUi = NO_CLIENT_UI,
+    // Сборка из стора — для справки и карты (см. streamChat, client-kind.ts).
+    storeBuild: boolean = false,
   ): Promise<void> {
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
@@ -1488,7 +1513,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // ходом, в котором пришли вложения: сессия на релее у них одна.
     let stablePrefix = await this.buildRelayStablePrefix({
       agentId, agentName, agentDescription, agentSystemPrompt, agentCategory,
-      userId, userLanguage, profileText, ask: ui.ask,
+      userId, userLanguage, profileText, ask: ui.ask, storeBuild,
     });
 
     // Пер-ходовая часть. Пустая строка, а не identity-блок: тот уехал в stablePrefix.
@@ -1866,7 +1891,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // Инструмент продуктов. В отличие от MCP-инструментов на общей точке,
         // владелец едет ПОДПИСЬЮ в заголовке, а не подсказкой в промпте:
         // телефоном в аргументе правились бы чужие сайты.
-        const pf = productsRelayFields(userId);
+        // Тот же токен открывает справку: язык, клиент и вид ассистента едут в подписи.
+        const pf = productsRelayFields(userId, {
+          lang: userLanguage,
+          client: clientKind(storeBuild, ui),
+          agent: agentId.startsWith('custom:') ? 'custom' : 'staff',
+        });
         fd.append('products_token', pf.products_token);
         fd.append('products_mcp_url', pf.products_mcp_url);
 

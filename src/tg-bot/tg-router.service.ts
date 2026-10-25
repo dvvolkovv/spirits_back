@@ -9,9 +9,9 @@ import { AgentsService } from '../agents/agents.service';
 import { TgGrammyClient } from './tg-grammy.client';
 import { TgConfigService, TgBotConfigRow } from './tg-config.service';
 import { isPrivateConfig } from './tg-chat-kind';
-import { productsCliMcp, REPORT_PROBLEM_CLI_TOOL_NAME } from '../products/products-cli-tool';
+import { helpCliMcp, LINKEON_HELP_CLI_TOOL_NAME, productsCliMcp, REPORT_PROBLEM_CLI_TOOL_NAME } from '../products/products-cli-tool';
 import { withCrisisRule } from '../chat/crisis-rule';
-import { telegramPlatformGuide } from '../chat/platform-guide';
+import { customAssistantHelpLine, telegramPlatformGuide } from '../chat/platform-guide';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 
 /**
@@ -530,15 +530,27 @@ ${recent}
     // правка ляжет в product_turns с channel='telegram'. Вторая линия после
     // гейта: снимок истории, который увидит модель, обязан быть только
     // владельца — иначе инструмента нет.
+    // Язык владельца — один раз на ход: для подписей справки и блока «Linkeon»
+    // и для языковой директивы в конце промпта.
+    const replyLang = await this.ownerLanguage(cfg);
+    const agentKind = cfg.custom_agent_id ? 'custom' : 'staff';
     const owner = opts.productsOwner;
     let products: ReturnType<typeof productsCliMcp> | null = null;
     if (owner) {
       if (this.historyIsOwnersOnly(history, owner.tgUserId)) {
-        products = productsCliMcp(owner.linkeonId, 'telegram');
+        products = productsCliMcp(owner.linkeonId, 'telegram', { lang: replyLang, client: 'telegram', agent: agentKind });
       } else {
         this.logger.warn(`products tool withheld in config ${cfg.id}: history snapshot has a non-owner line`);
       }
     }
+    // Справка о Linkeon — в КАЖДОМ ходе. Где продуктов нет (группа с
+    // посторонними), она едет отдельным токеном с областью help: точка покажет
+    // по нему один linkeon_help. Ничего личного справка не раскрывает. Конфиг
+    // без владельца — битый: тогда и справки нет, ход прежний.
+    const help = products || !cfg.owner_user_id
+      ? null
+      : helpCliMcp(cfg.owner_user_id, 'telegram', { lang: replyLang, client: 'telegram', agent: agentKind });
+    const hasHelp = !!(products || help);
     const ownerProfile = await this.loadOwnerProfile(cfg);
 
     // Что уже лежит в рабочей папке чата. Без этого списка модель не знает, что
@@ -595,13 +607,13 @@ ${ownerProfile}
     // инструмент реально выдан: обещать его без инструмента нельзя.
     const productsBlock = products ? `\n\n${products.promptBlock}` : '';
 
-    // Что есть в Linkeon и чего нет в этом чате (chat/platform-guide.ts) — только
-    // штатным ассистентам, как в вебе: у бота с ассистентом пользователя может
-    // быть свой бренд, и рассказывать в его группе про Linkeon незачем.
-    // Язык владельца — один раз на ход: и для подписей блока «Linkeon», и для
-    // языковой директивы в конце промпта.
-    const replyLang = await this.ownerLanguage(cfg);
-    const platformBlock = cfg.custom_agent_id ? '' : `\n\n${telegramPlatformGuide(replyLang)}`;
+    // Что есть в Linkeon и чего нет в этом чате (chat/platform-guide.ts) — штатным
+    // ассистентам; инициатива — только в ходе владельца: в группе с посторонними
+    // подсказка читалась бы рекламой. Своему ассистенту пользователя — одна
+    // строка про справку: у такого бота может быть свой бренд.
+    const platformBlock = cfg.custom_agent_id
+      ? (hasHelp ? `\n\n${customAssistantHelpLine(LINKEON_HELP_CLI_TOOL_NAME)}` : '')
+      : `\n\n${telegramPlatformGuide(replyLang, { helpTool: hasHelp ? LINKEON_HELP_CLI_TOOL_NAME : undefined, initiative: !!products })}`;
 
     // Языковая директива — последней, как в вебе (chat.service): по умолчанию
     // отвечать на языке владельца, а если человек написал на другом — на его.
@@ -648,11 +660,18 @@ ${LanguageService.buildDirective(replyLang)}`;
     // sandboxDir claude-cli.service сам изолирует вложения в одноразовый cwd).
     const needsRead = !!sandboxDir || !!attachmentPaths?.length;
     const tools = needsRead ? `Read,${WEB_TOOLS}` : WEB_TOOLS;
-    // Инструмент продуктов — только автоодобрением: `--tools` задаёт встроенный
+    // Продукты и справка — только автоодобрением: `--tools` задаёт встроенный
     // набор и MCP не режет (проба CLI 2.1.280), а без имени в allowedTools вызов
-    // в -p отклоняется. С ним же — «сообщить в поддержку» (src/problem-report):
-    // тот же сервер products, выдаётся вместе с ним.
-    const allowedTools = products ? `${WEB_TOOLS},${products.toolName},${REPORT_PROBLEM_CLI_TOOL_NAME}` : WEB_TOOLS;
+    // в -p отклоняется. «Сообщить в поддержку» (src/problem-report) — тот же
+    // сервер products, выдаётся вместе с продуктами.
+    const allowedTools = [
+      WEB_TOOLS,
+      products?.toolName,
+      products ? REPORT_PROBLEM_CLI_TOOL_NAME : null,
+      hasHelp ? LINKEON_HELP_CLI_TOOL_NAME : null,
+    ]
+      .filter(Boolean)
+      .join(',');
 
     // Та же модель, что и в вебе. Веб уводит всех ассистентов кроме Маши на
     // relay r.linkeon.io; здесь путь локальный, и Sonnet стоял просто потому,
@@ -678,7 +697,7 @@ ${LanguageService.buildDirective(replyLang)}`;
       allowedTools,
       // Токен владельца — в файл конфига 0600 вне рабочей папки чата: Read этой
       // папки до него не дотянется (claude-cli.service, writeMcpConfig).
-      ...(products ? { mcpServers: products.mcpServers } : {}),
+      ...(products ? { mcpServers: products.mcpServers } : help ? { mcpServers: help.mcpServers } : {}),
     });
 
     return { text: text.trim() || '...', costUsd };

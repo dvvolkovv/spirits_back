@@ -1,6 +1,7 @@
 import type { ClaudeCliMcpHttpServer } from '../common/services/claude-cli.service';
-import { ProductToolChannel, signProductToolToken } from './product-tool.token';
+import { ProductToolChannel, ProductToolTokenOpts, signProductToolToken } from './product-tool.token';
 import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
+import { LINKEON_HELP_TOOL_NAME } from '../platform-kb/tool-name';
 
 /**
  * Инструмент продуктов для ЛОКАЛЬНОГО claude CLI — Маши в вебе и
@@ -27,6 +28,9 @@ export const PRODUCTS_CLI_TOOL_NAME = `mcp__${SERVER_KEY}__manage_product`;
 
 /** Поиск файлов прошлых разговоров — тот же сервер `products` (find-files.tool.ts). Только Маше: у TG-бота его нет. */
 export const FIND_FILES_CLI_TOOL_NAME = `mcp__${SERVER_KEY}__find_files`;
+
+/** Справка о Linkeon — тот же сервер `products` (platform-kb/linkeon-help.ts). Это же имя стоит в PRODUCTS_TOOLS релея. */
+export const LINKEON_HELP_CLI_TOOL_NAME = `mcp__${SERVER_KEY}__${LINKEON_HELP_TOOL_NAME}`;
 
 /** Сообщить в поддержку (problem-report/report-problem.tool.ts) — тот же сервер `products`; и Маше, и TG-боту. */
 export const REPORT_PROBLEM_CLI_TOOL_NAME = `mcp__${SERVER_KEY}__report_problem`;
@@ -77,28 +81,53 @@ export interface ProductsCliMcp {
   promptBlock: string;
 }
 
+/** Конфиг MCP-сервера `products` с данным токеном — общий для продуктов и справки. */
+function serverConfig(token: string): Record<string, ClaudeCliMcpHttpServer> {
+  const port = process.env.PORT || 3001;
+  return {
+    [SERVER_KEY]: {
+      type: 'http',
+      url: `http://127.0.0.1:${port}/webhook/mcp/products`,
+      headers: { Authorization: `Bearer ${token}` },
+      timeout: PRODUCTS_CLI_TOOL_TIMEOUT_MS,
+    },
+  };
+}
+
 /**
  * Всё, что нужно одному вызову CLI, чтобы у ассистента был инструмент
  * продуктов пользователя `userId`. Токен чеканится на каждый вызов (живёт 30
  * минут — дольше любого хода) и несёт канал: правка из Telegram ляжет в
- * product_turns с channel='telegram'.
+ * product_turns с channel='telegram'. opts — язык, клиент и вид ассистента
+ * для справки, которую точка отдаёт по этому же токену.
  *
  * Порт — тот же `process.env.PORT || 3001`, на котором слушает приложение
  * (main.ts); путь — /webhook/mcp/products: исключение глобального префикса
  * покрывает только точный путь `mcp` (см. products-mcp.controller.ts).
  */
-export function productsCliMcp(userId: string, channel: ProductToolChannel): ProductsCliMcp {
-  const port = process.env.PORT || 3001;
+export function productsCliMcp(userId: string, channel: ProductToolChannel, opts: ProductToolTokenOpts = {}): ProductsCliMcp {
   return {
-    mcpServers: {
-      [SERVER_KEY]: {
-        type: 'http',
-        url: `http://127.0.0.1:${port}/webhook/mcp/products`,
-        headers: { Authorization: `Bearer ${signProductToolToken(userId, channel)}` },
-        timeout: PRODUCTS_CLI_TOOL_TIMEOUT_MS,
-      },
-    },
+    mcpServers: serverConfig(signProductToolToken(userId, channel, opts)),
     toolName: PRODUCTS_CLI_TOOL_NAME,
     promptBlock: PRODUCTS_CLI_PROMPT,
+  };
+}
+
+export interface HelpCliMcp {
+  mcpServers: Record<string, ClaudeCliMcpHttpServer>;
+  /** Для allowedTools. */
+  toolName: string;
+}
+
+/**
+ * Только справка — для хода, где продуктов владельца быть не должно
+ * (Telegram-группа с посторонними). Тот же сервер, токен с областью help:
+ * точка покажет по нему один linkeon_help и откажет в остальных. Справка
+ * ничего личного не раскрывает, поэтому она есть и там, где продуктов нет.
+ */
+export function helpCliMcp(userId: string, channel: ProductToolChannel, opts: Omit<ProductToolTokenOpts, 'scope'> = {}): HelpCliMcp {
+  return {
+    mcpServers: serverConfig(signProductToolToken(userId, channel, { ...opts, scope: 'help' })),
+    toolName: LINKEON_HELP_CLI_TOOL_NAME,
   };
 }

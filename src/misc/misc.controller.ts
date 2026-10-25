@@ -5,6 +5,7 @@ import { CurrentUser } from '../common/decorators/user.decorator';
 import { JwtService } from '../common/services/jwt.service';
 import { MiscService } from './misc.service';
 import * as multer from 'multer';
+import { IMAGE_TOKENS_HD, imageTokens } from './image-pricing';
 
 @Controller('')
 export class MiscController {
@@ -50,7 +51,7 @@ export class MiscController {
       const { prompt, quality, aspect_ratio } = req.body;
       if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
 
-      const tokenCost = quality === 'hd' ? 10000 : 5000;
+      const tokenCost = imageTokens(quality);
       // Check balance
       const balRes = await this.miscService.checkTokenBalance(user.userId, tokenCost);
       if (!balRes.ok) return res.status(400).json({ error: 'Недостаточно токенов' });
@@ -73,7 +74,7 @@ export class MiscController {
       if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
       if (!title && !subtitle && !cta) return res.status(400).json({ error: 'Нужен хотя бы заголовок, подзаголовок или CTA' });
 
-      const tokenCost = quality === 'hd' ? 10000 : 5000;
+      const tokenCost = imageTokens(quality);
       const balRes = await this.miscService.checkTokenBalance(user.userId, tokenCost);
       if (!balRes.ok) return res.status(400).json({ error: 'Недостаточно токенов' });
 
@@ -94,7 +95,7 @@ export class MiscController {
       if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
       if (!sourceImageUrl) return res.status(400).json({ error: 'Missing sourceImageUrl' });
 
-      const tokenCost = quality === 'hd' ? 10000 : 5000;
+      const tokenCost = imageTokens(quality);
       const balRes = await this.miscService.checkTokenBalance(user.userId, tokenCost);
       if (!balRes.ok) return res.status(400).json({ error: 'Недостаточно токенов' });
 
@@ -145,7 +146,7 @@ export class MiscController {
       const { sourceImageUrl } = req.body;
       if (!sourceImageUrl) return res.status(400).json({ error: 'Missing sourceImageUrl' });
 
-      const balRes = await this.miscService.checkTokenBalance(user.userId, 10000);
+      const balRes = await this.miscService.checkTokenBalance(user.userId, IMAGE_TOKENS_HD);
       if (!balRes.ok) return res.status(400).json({ error: 'Недостаточно токенов' });
 
       const result = await this.miscService.upscaleImage(user.userId, { sourceImageUrl });
@@ -165,7 +166,7 @@ export class MiscController {
         return res.status(400).json({ error: 'sourceImageUrls must be an array of at least 2 URLs' });
       }
 
-      const tokenCost = quality === 'hd' ? 10000 : 5000;
+      const tokenCost = imageTokens(quality);
       const balRes = await this.miscService.checkTokenBalance(user.userId, tokenCost);
       if (!balRes.ok) return res.status(400).json({ error: 'Недостаточно токенов' });
 

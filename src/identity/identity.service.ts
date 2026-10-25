@@ -26,10 +26,12 @@ export const IDENTITY_MIGRATIONS = [
   '003_telegram_provider.sql',
 ];
 
+/** Приветственный бонус нового аккаунта. Его же называет справка (platform-kb/values.ts). */
+export const WELCOME_BONUS = 25_000;
+
 @Injectable()
 export class IdentityService implements OnModuleInit {
   private readonly logger = new Logger(IdentityService.name);
-  private readonly WELCOME_BONUS = 25000;
 
   constructor(
     @Optional() private readonly pg?: PgService,
@@ -298,9 +300,9 @@ export class IdentityService implements OnModuleInit {
     // быть видно, иначе у нового юзера баланс возникает из ниоткуда.
     await this.pg.query(
       `SELECT add_user_tokens($1, $2, 'bonus', $3, NULL)`,
-      [userId, this.WELCOME_BONUS, 'Приветственный бонус'],
+      [userId, WELCOME_BONUS, 'Приветственный бонус'],
     );
-    this.logger.log(`welcome bonus ${this.WELCOME_BONUS} → ${userId}`);
+    this.logger.log(`welcome bonus ${WELCOME_BONUS} → ${userId}`);
   }
 
   async linkMethod<P extends Provider>(userId: string, provider: P, data: ProviderData<P>): Promise<{ ok: true } | { ok: false; reason: 'conflict' | 'invalid'; conflictUserId?: string }> {

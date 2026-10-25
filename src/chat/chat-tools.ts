@@ -11,6 +11,7 @@ import { Recurrence, expandOccurrences } from '../calendar/recurrence';
 import { SpeechService } from '../speech/speech.service';
 import { TOP_UP_URL } from '../tokens/balance-context.service';
 import { HumanDesignToolService, type HdToolResult } from '../human-design/hd-tool.service';
+import { IMAGE_TOKENS_HD, imageTokens } from '../misc/image-pricing';
 
 /**
  * Единый ответ инструмента на нехватку токенов.
@@ -579,7 +580,7 @@ export class ChatToolsService {
         } catch (e: any) {
           if (/недостаточно|insufficient/i.test(e?.message || '')) {
             const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
-            return insufficientTokens(Number(bal.rows[0]?.tokens || 0), quality === 'hd' ? 10000 : 5000);
+            return insufficientTokens(Number(bal.rows[0]?.tokens || 0), imageTokens(quality));
           }
           return { ok: false, error: e?.message || 'image generation failed' };
         }
@@ -608,7 +609,7 @@ export class ChatToolsService {
         } catch (e: any) {
           if (/недостаточно|insufficient/i.test(e?.message || '')) {
             const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
-            return insufficientTokens(Number(bal.rows[0]?.tokens || 0), quality === 'hd' ? 10000 : 5000);
+            return insufficientTokens(Number(bal.rows[0]?.tokens || 0), imageTokens(quality));
           }
           return { ok: false, error: e?.message || 'banner generation failed' };
         }
@@ -629,7 +630,7 @@ export class ChatToolsService {
         } catch (e: any) {
           if (/недостаточно|insufficient/i.test(e?.message || '')) {
             const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
-            return insufficientTokens(Number(bal.rows[0]?.tokens || 0), quality === 'hd' ? 10000 : 5000);
+            return insufficientTokens(Number(bal.rows[0]?.tokens || 0), imageTokens(quality));
           }
           return { ok: false, error: e?.message || 'image edit failed' };
         }
@@ -653,7 +654,7 @@ export class ChatToolsService {
         } catch (e: any) {
           if (/недостаточно|insufficient/i.test(e?.message || '')) {
             const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
-            return insufficientTokens(Number(bal.rows[0]?.tokens || 0), quality === 'hd' ? 10000 : 5000);
+            return insufficientTokens(Number(bal.rows[0]?.tokens || 0), imageTokens(quality));
           }
           return { ok: false, error: e?.message || 'image compose failed' };
         }
@@ -671,7 +672,7 @@ export class ChatToolsService {
         } catch (e: any) {
           if (/недостаточно|insufficient/i.test(e?.message || '')) {
             const bal = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1', [userId]);
-            return insufficientTokens(Number(bal.rows[0]?.tokens || 0), 10000);
+            return insufficientTokens(Number(bal.rows[0]?.tokens || 0), IMAGE_TOKENS_HD);
           }
           return { ok: false, error: e?.message || 'upscale failed' };
         }

@@ -1,5 +1,6 @@
 import { Client } from 'pg';
 import { TgRouterService } from './tg-router.service';
+import { verifyProductToolToken } from '../products/product-tool.token';
 
 /**
  * Гейт инструмента продуктов в Telegram — против живого Postgres.
@@ -169,7 +170,11 @@ maybe('гейт инструмента продуктов против живо�
       await say(CFG_A, G2, OWNER_TG, 'user', 'привет');
       const { svc, claudeCli } = routerWithCli();
       await svc.generateReply(cfg(CFG_A, G2), 'Дмитрий', undefined, undefined, undefined, { productsOwner: OWNER });
-      expect(claudeCli.textWithCost.mock.calls[0][1].mcpServers).toBeUndefined();
+      // Продуктов нет — есть только справка с областью help (platform-kb, 24.10.2026).
+      const opts = claudeCli.textWithCost.mock.calls[0][1];
+      expect(String(opts.allowedTools)).not.toContain('mcp__products__manage_product');
+      const bearer = String(opts.mcpServers?.products?.headers?.Authorization ?? '').replace(/^Bearer /, '');
+      expect(verifyProductToolToken(bearer).scope).toBe('help');
     });
 
     it('в истории только владелец: инструмент есть (tg_user_id из базы сравнивается верно)', async () => {
