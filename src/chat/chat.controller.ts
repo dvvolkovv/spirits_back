@@ -292,6 +292,8 @@ export class ChatController {
       freshSessionId,
       requestLang: typeof body.lang === 'string' ? body.lang : undefined,
       ask: ui.ask,
+      storeBuild: isStoreBuild(req.headers['x-linkeon-distribution']),
+      ui,
     });
 
     // Профиль уехал в systemPrompt вместе с персоной — в тело реплики его
@@ -317,6 +319,9 @@ export class ChatController {
     if (handoff.systemPrompt) fd.append('systemPrompt', handoff.systemPrompt);
     // Вставится только при холодном старте сессии — в resumed история уже есть.
     if (handoff.history) fd.append('history', handoff.history);
+    // Продукты, поиск файлов и справка — те же поля, что у текстового хода.
+    fd.append('products_token', handoff.products.products_token);
+    fd.append('products_mcp_url', handoff.products.products_mcp_url);
 
     // Set streaming headers
     res.status(200);

@@ -785,7 +785,10 @@ export class ChatService {
     // Клиент рисует карточки вопросов. Сессия у загрузки и текста одна, и
     // системный промпт обязан совпадать — иначе правило то есть, то нет.
     ask?: boolean;
-  }): Promise<{ sessionId: string; systemPrompt: string; history: string }> {
+    /** Сборка из стора и что умеет клиент — для справки (client-kind.ts). */
+    storeBuild?: boolean;
+    ui?: ClientUi;
+  }): Promise<{ sessionId: string; systemPrompt: string; history: string; products: { products_token: string; products_mcp_url: string } }> {
     const { userId, assistantId, freshSessionId } = p;
     const profileText = p.profileText || '';
     const userLanguage = await this.language.resolveUserLanguage(userId, p.requestLang);
@@ -795,9 +798,11 @@ export class ChatService {
     // всё равно должен состояться. Ключ сессии при этом уже правильный, то есть
     // главное (файл виден дальше в разговоре) не зависит от этой ветки.
     let systemPrompt = '';
+    let isCustom = assistantId.startsWith('custom:');
     try {
       const agent = await this.resolveAgent(userId, assistantId);
       if (agent) {
+        isCustom = String(agent.id).startsWith('custom:');
         systemPrompt = await this.buildRelayStablePrefix({
           agentId: String(agent.id),
           agentName: agent.name,
@@ -808,6 +813,7 @@ export class ChatService {
           userLanguage,
           profileText,
           ask: p.ask,
+          storeBuild: p.storeBuild,
         });
       }
     } catch (e: any) {
@@ -832,7 +838,15 @@ export class ChatService {
       this.logger.warn(`upload handoff: history build failed for ${userId}_${assistantId}: ${e?.message}`);
     }
 
-    return { sessionId, systemPrompt, history };
+    // Инструменты точки продуктов — те же, что у текстового хода: сессия на
+    // релее одна, и её системный промпт обещает справку.
+    const products = productsRelayFields(userId, {
+      lang: userLanguage,
+      client: clientKind(!!p.storeBuild, p.ui ?? NO_CLIENT_UI),
+      agent: isCustom ? 'custom' : 'staff',
+    });
+
+    return { sessionId, systemPrompt, history, products };
   }
 
   async streamChat(
