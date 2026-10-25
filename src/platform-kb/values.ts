@@ -6,7 +6,7 @@ import { RENT_TOKENS } from '../products/rent.service';
 import { DEFAULT_MAX_PRODUCTS } from '../products/limits.service';
 import { MAX_ROUTINES_PER_USER } from '../routine-push/routine-store.service';
 import { PACKAGES } from '../payments/packages';
-import { CARD_MINIMUM_USD, PRIEM_PACKAGES } from '../payments/priem.service';
+import { PRIEM_PACKAGES } from '../payments/priem.service';
 import { OFFER_BONUS_PCT, OFFER_MSG_THRESHOLD } from '../offer/offer-bonus';
 import { WELCOME_BONUS } from '../identity/identity.service';
 import {
@@ -19,15 +19,15 @@ import {
 import { SMS_CODE_MAX_ATTEMPTS, SMS_CODE_TTL_SECONDS } from '../auth/sms-code';
 import { SMS_LIMIT_DEFAULTS } from '../auth/sms-limits';
 import { MAX_UPLOAD_TOTAL_BYTES } from '../chat/upload-limits';
-import { LOW_BALANCE_THRESHOLD } from '../tokens/consumption-rate';
+import { LOW_BALANCE_THRESHOLD, WARN_COOLDOWN_MS } from '../tokens/consumption-rate';
 
 /**
  * Числа для статей справки. Каждое — импорт той константы, по которой идёт
  * списание или проверка, а не копия: поменяли цену в коде — справка назовёт
  * новую со следующего вызова. Сюда — только то, что статьи реально называют.
  *
- * Два исключения держит клиент, и константы бэка для них нет: длины роликов на
- * выбор и число файлов за раз. Рядом с ними — где оригинал.
+ * Три исключения держит клиент, и константы бэка для них нет: длины роликов на
+ * выбор, число файлов за раз и срок реферальной ссылки. Рядом с ними — где оригинал.
  */
 
 /** «25 000» — пробел между тысячами, как в русском тексте статей. */
@@ -37,6 +37,8 @@ export const fmt = (n: number): string => String(Math.round(n)).replace(/\B(?=(\
 const VIDEO_UI_LENGTHS = [8, 12, 16, 24, 32, 48, 60];
 /** Файлов за раз — зеркало MAX_ATTACHMENTS фронта (ChatInterface.tsx) и upload.array('files', 10) релея. */
 const UPLOAD_MAX_FILES = 10;
+/** Сколько дней помнится реферальная ссылка — зеркало REFERRAL_TTL_MS фронта (pages/OnboardingPage.tsx). */
+const REFERRAL_LINK_DAYS = 7;
 
 function videoTokens(sec: number, aspect: '9:16' | '16:9'): number {
   const q = needsVeoConcat(aspect, sec) ? computeVeoConcatQuote('veo-3.1-fast', sec) : computeVeoQuote('veo-3.1-fast', sec);
@@ -79,12 +81,13 @@ export const V = {
   maxProducts: String(DEFAULT_MAX_PRODUCTS),
   maxRoutines: String(MAX_ROUTINES_PER_USER),
   lowBalance: fmt(LOW_BALANCE_THRESHOLD),
+  lowBalanceEveryHours: String(Math.round(WARN_COOLDOWN_MS / 3_600_000)),
   rubPackages: PACKAGES.map((p) => `  - ${fmt(p.tokens)} токенов — ${fmt(p.priceRub)} ₽`).join('\n'),
   usdPackages: PRIEM_PACKAGES.map((p) => `  - ${fmt(p.tokens)} токенов — $${p.usd}`).join('\n'),
-  cardMinUsd: String(CARD_MINIMUM_USD),
   offerPct: String(OFFER_BONUS_PCT),
   offerMessages: String(OFFER_MSG_THRESHOLD),
   refereeBonus: fmt(REFEREE_BONUS_TOKENS),
+  refLinkDays: String(REFERRAL_LINK_DAYS),
   commissionTiers: commissionLine(),
   payoutRate: fmt(PAYOUT_RATE_TOKENS_PER_RUB),
   payoutMinRub: fmt(PAYOUT_MIN_RUB),
