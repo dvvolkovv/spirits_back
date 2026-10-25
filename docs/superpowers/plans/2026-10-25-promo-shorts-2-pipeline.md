@@ -6852,16 +6852,58 @@ maybe('ролики против живого Postgres', () => {
     const pub = (await pool.query(`SELECT status, external_id, url FROM short_publication WHERE short_id = $1`, [v.id])).rows[0];
     expect(pub).toEqual({ status: 'published', external_id: '501', url: 'https://t.me/linkeontest/501' });
   });
+
+  it('сторож: зависшая отправка в канал — failed без повтора; прочие — в очередь или failed по попыткам; свежие не трогает', async () => {
+    // Слоты разные: одобренные и публикуемые держат уникальный индекс слота.
+    const base = Date.now() - 3600_000;
+    const mk = (attempts: number, shiftMin: number) =>
+      insert({ status: 'publishing', attempts, approved_at: new Date(), slot_at: new Date(base + shiftMin * 60_000) });
+    const tgStuck = await mk(1, 0);
+    const ytStuck = await mk(1, 1);
+    const ytLast = await mk(3, 2);
+    const fresh = await mk(1, 3);
+    const pub = (id: string, platform: string, status: string) =>
+      pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, $2, $3)`, [id, platform, status]);
+    await pub(tgStuck.id, 'telegram', 'publishing');
+    await pub(ytStuck.id, 'telegram', 'published');
+    await pub(ytStuck.id, 'youtube', 'publishing');
+    await pub(ytLast.id, 'youtube', 'publishing');
+    await pub(fresh.id, 'telegram', 'publishing');
+    await pool.query(`UPDATE short_video SET updated_at = now() - interval '11 minutes' WHERE id = ANY($1::uuid[])`, [[tgStuck.id, ytStuck.id, ytLast.id]]);
+
+    const publisher = new ShortsPublisherService(pgLike() as any, {} as any, {} as any, {} as any);
+    await publisher.rearmStuck();
+    await publisher.rearmStuck(); // повторный проход ничего не меняет
+
+    const video = async (id: string) =>
+      (await pool.query(`SELECT status, failed_from, failure_notified FROM short_video WHERE id = $1`, [id])).rows[0];
+    const rows = async (id: string) =>
+      (await pool.query(`SELECT platform, status, last_error FROM short_publication WHERE short_id = $1 ORDER BY platform`, [id])).rows;
+
+    // Исход отправки в канал неизвестен — без автоповтора: владелец проверит канал.
+    expect(await video(tgStuck.id)).toEqual({ status: 'failed', failed_from: 'publishing', failure_notified: false });
+    const [tgRow] = await rows(tgStuck.id);
+    expect([tgRow.platform, tgRow.status]).toEqual(['telegram', 'failed']);
+    expect(tgRow.last_error).toMatch(/^пост мог выйти — проверьте канал/);
+
+    expect((await video(ytStuck.id)).status).toBe('approved');
+    expect((await rows(ytStuck.id)).map((r) => [r.platform, r.status])).toEqual([['telegram', 'published'], ['youtube', 'failed']]);
+
+    expect(await video(ytLast.id)).toEqual({ status: 'failed', failed_from: 'publishing', failure_notified: false });
+
+    expect((await video(fresh.id)).status).toBe('publishing');
+    expect((await rows(fresh.id))[0].status).toBe('publishing');
+  });
 });
 ```
 
 - [ ] **Step 3: Убедиться, что без базы файл пропускается, а с базой — зелёный**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.integration.spec.ts"`
-Expected: `Tests: 6 skipped`.
+Expected: `Tests: 7 skipped`.
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts"`
-Expected: `Tests: 6 passed`.
+Expected: `Tests: 7 passed`.
 
 Красный тест здесь — дефект SQL, а не теста. Гонка одобрений: два одинаковых слота — индекса `uq_short_video_slot` нет или он создан не тем предикатом (блокировка свободный слот не держит, его держит индекс); отказ с сырым 23505 — имя индекса в миграции разошлось с `SHORT_SLOT_INDEX`.
 
@@ -9210,7 +9252,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - [ ] **Step 1: Бэкенд — затронутые каталоги, живой Postgres, гейт типов**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "rm -f /tmp/promo-jest.log; npx jest src/shorts src/tg-bot src/blog > /tmp/promo-jest.log 2>&1 || true; grep -q '^Tests: ' /tmp/promo-jest.log || { tail -30 /tmp/promo-jest.log; echo JEST_DID_NOT_RUN; exit 1; }; grep -oE '^FAIL [^ ]+' /tmp/promo-jest.log | sort -u > /tmp/promo-fail-now.txt; comm -13 ~/ci/promo-shorts-jest-fail-base.txt /tmp/promo-fail-now.txt > /tmp/promo-fail-new.txt; cat /tmp/promo-fail-new.txt; test ! -s /tmp/promo-fail-new.txt && echo NO_NEW_FAILS && SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
-Expected: `NO_NEW_FAILS`; интеграционный — `6 passed`; `TSC_OK`.
+Expected: `NO_NEW_FAILS`; интеграционный — `7 passed`; `TSC_OK`.
 
 - [ ] **Step 2: Сборка API не изменила раскладку `dist/`**
 
