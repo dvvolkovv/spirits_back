@@ -175,17 +175,18 @@ describe('системный промпт релея', () => {
       pg as any, null as any, null as any, null as any, language as any, undefined as any,
     );
   }
-  const prefix = (agentId: string, userLanguage = 'ru'): Promise<string> =>
+  const prefix = (agentId: string, userLanguage = 'ru', storeBuild = false): Promise<string> =>
     (makeService() as any).buildRelayStablePrefix({
       agentId, agentName: 'Роман', agentDescription: '', agentSystemPrompt: 'Ты Роман. ИНСТРУМЕНТЫ: веб-поиск.',
-      userId: 'u1', userLanguage,
+      userId: 'u1', userLanguage, storeBuild,
     });
+  const STAFF = { helpTool: HELP, initiative: true };
 
   it('штатный ассистент получает блок один раз, после своей персоны', async () => {
     const p = await prefix('12');
 
-    expect(count(p, platformGuide('ru'))).toBe(1);
-    expect(p.indexOf(platformGuide('ru'))).toBeGreaterThan(p.indexOf('ИНСТРУМЕНТЫ: веб-поиск.'));
+    expect(count(p, platformGuide('ru', STAFF))).toBe(1);
+    expect(p.indexOf(platformGuide('ru', STAFF))).toBeGreaterThan(p.indexOf('ИНСТРУМЕНТЫ: веб-поиск.'));
   });
 
   it('и пометку, что раздел «ИНСТРУМЕНТЫ» персоны — не полный список', async () => {
@@ -198,7 +199,7 @@ describe('системный промпт релея', () => {
   it('подписи — на языке пользователя', async () => {
     const p = await prefix('12', 'en');
 
-    expect(p).toContain(platformGuide('en'));
+    expect(p).toContain(platformGuide('en', STAFF));
     expect(p).not.toContain('«Студия»');
   });
 
@@ -207,5 +208,30 @@ describe('системный промпт релея', () => {
 
     expect(p).not.toContain('ЧТО ЕСТЬ В LINKEON');
     expect(p).not.toContain(TOOLS_LIST_NOTE);
+  });
+
+  it('штатному — правило инициативы', async () => {
+    expect(await prefix('12')).toContain(INITIATIVE_RULE);
+  });
+
+  it('стор: карта без партнёрской программы', async () => {
+    const p = await prefix('12', 'ru', true);
+    expect(p).toContain(platformGuide('ru', { ...STAFF, store: true }));
+    expect(p).not.toContain('«Партнёры»');
+  });
+
+  it('своему ассистенту — строка про справку, без карты и инициативы', async () => {
+    const p = await prefix('custom:6f1c2b9e-0000-4000-8000-000000000000');
+    expect(p).toContain(customAssistantHelpLine(HELP));
+    expect(p).not.toContain(INITIATIVE_RULE);
+  });
+
+  // «Как устроено» на публичном уровне (решение владельца 24.10.2026): называть
+  // нейросети платформы можно, называть себя моделью — нельзя.
+  it('личность: себя — только своим именем; о нейросетях платформы — по справке', async () => {
+    const p = flat(await prefix('12'));
+    expect(p).not.toMatch(/Никогда не упоминай, что ты Claude/);
+    expect(p).toMatch(/не говори, что ты Claude или другая модель/);
+    expect(p).toMatch(/how-it-works/);
   });
 });
