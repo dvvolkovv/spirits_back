@@ -525,15 +525,17 @@ export class IdentityService implements OnModuleInit {
     await this.pg.query(`UPDATE user_id SET password_hash = $1 WHERE internal_id = $2`, [hash, userId]);
   }
 
-  /// Помечен ли аккаунт удалённым.
-  ///
-  /// Одна проверка на всех, кто выдаёт токены по уже известному userId:
-  /// продление сессии (AuthService.refreshTokens) и вход через мини-приложение
-  /// Telegram (TmaController). До 25.10.2026 жила приватной в AuthService, и
-  /// мини-приложение состояние аккаунта не проверяло вовсе.
-  ///
-  /// Ошибку базы трактуем как «не удалён»: недоступный Postgres не должен
-  /// разлогинивать всех живых пользователей разом.
+  /**
+   * Помечен ли аккаунт удалённым.
+   *
+   * Одна проверка на всех, кто выдаёт токены по уже известному userId:
+   * продление сессии (AuthService.refreshTokens) и вход через мини-приложение
+   * Telegram (TmaController). До 25.10.2026 жила приватной в AuthService, и
+   * мини-приложение состояние аккаунта не проверяло вовсе.
+   *
+   * Ошибку базы трактуем как «не удалён»: недоступный Postgres не должен
+   * разлогинивать всех живых пользователей разом.
+   */
   async isDeleted(userId: string): Promise<boolean> {
     if (!this.pg) return false;
     try {
