@@ -16,6 +16,7 @@ import { makeReadWithinDirGuard, neutralizeAtMentions, stripWordJoiner } from '.
 import { decodeMultipartFilename } from '../common/utils/multipart-filename';
 import { TEST_USERS } from '../common/test-users';
 import { parseClientUi } from './client-ui';
+import { isStoreBuild } from './client-kind';
 import { toActivity } from './activity-map';
 import { RelayOutputFile, collectOutputFiles, outputFileLines } from './chat-files/relay-links';
 
@@ -114,8 +115,7 @@ export class ChatController {
     // Неизвестное или отсутствующее значение — НЕ магазин: так ведут себя веб
     // и старые сборки, где оплата разрешена. Ошибиться в эту сторону дешевле,
     // чем молча выключить пополнение всему вебу.
-    const distribution = String(req.headers['x-linkeon-distribution'] || '').toLowerCase();
-    const storeBuild = distribution === 'appstore' || distribution === 'play';
+    const storeBuild = isStoreBuild(req.headers['x-linkeon-distribution']);
     if (!message || !assistantId) {
       return res.status(400).json({ error: 'Missing message or assistantId' });
     }
