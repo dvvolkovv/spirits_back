@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { KB_ARTICLES } from './articles';
 import { KB_CLIENTS, KB_PARTS, KbClient } from './kb.types';
-import { renderArticle } from './render';
+import { CLIENT_NOTES, renderArticle } from './render';
 import { labelsFor } from './labels';
 import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
 
@@ -123,14 +123,17 @@ describe('статьи во всех вариантах', () => {
     expect(problems).toEqual([]);
   });
 
-  // Подпись поля «Токен бота» (продукты) — не о деньгах: её вырезаем перед проверкой.
+  // Подпись поля «Токен бота» (продукты) и сама пометка клиента (она и
+  // существует, чтобы сказать «о деньгах не говори») — не в счёт, вырезаем
+  // перед проверкой.
   it('сборка из стора: ни слова о деньгах, кроме подписи поля «Токен бота»', () => {
     const MONEY = /токен|оплат|списан|баланс|пополн|₽|\$\d|бесплат/i;
     const bad = all
       .filter((v) => v.client === 'store')
       .filter((v) => {
         const botToken = (labelsFor(v.lang) as Record<string, string>).prodToken;
-        const text = botToken ? v.text.split(`«${botToken}»`).join('') : v.text;
+        let text = botToken ? v.text.split(`«${botToken}»`).join('') : v.text;
+        text = text.split(CLIENT_NOTES.store).join('');
         return MONEY.test(text);
       })
       .map(where);
