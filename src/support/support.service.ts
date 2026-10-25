@@ -730,14 +730,41 @@ ${healthSummary}
       return { ok: false, error: 'create_failed', details: e.message };
     }
 
-    // Step 2: in one transaction, credit back exactly what createJob charged AND the original
-    // failed job's cost (user gets a free retry — the original charge stays covered by the
-    // refund, new charge is zeroed out). Bypasses refund_tokens safe-limits by design: this is
-    // a verified upstream-failure workflow, idempotent per job.
-    const totalCredit = Number(created.tokensSpent) + Number(job.tokens_spent);
+    // Шаг 2, одной транзакцией: перезапуск бесплатен — возвращаем ровно то,
+    // что сейчас списал createJob. Стоимость ИСХОДНОЙ задачи возвращаем,
+    // только если её ещё не вернули.
+    //
+    // Раньше здесь всегда начислялось «новое списание + исходная стоимость».
+    // Но упавшая задача уже получает возврат в момент провала:
+    // VideoService.failAndRefund ставит status='failed' и начисляет 'refund'
+    // с metadata.job_id одной транзакцией, и это единственное место, где
+    // video_jobs становится 'failed'. Значит, исходная стоимость уходила
+    // человеку второй раз — и мимо лимитов refund_tokens, которые этот путь
+    // обходит намеренно (провал у провайдера подтверждён, на задачу — один раз).
+    //
+    // Признак «уже вернули» — строка 'refund' в token_transactions с
+    // metadata.job_id исходной задачи; её пишет failAndRefund. Через реестр он
+    // возвращает с 20.08.2026, а упавшие задачи старше 30 дней сносит
+    // cleanupOldFailedJobs, так что у любой задачи, которую можно
+    // перезапустить, такая строка есть. Проверка — на случай провала мимо
+    // failAndRefund: тогда исходную стоимость вернём здесь, как раньше.
+    // Статус 'failed' и возврат failAndRefund коммитит вместе, поэтому раз
+    // задача уже 'failed', её возврат виден и этому запросу.
     const client = await this.pg.getClient();
+    let totalCredit = Number(created.tokensSpent);
+    let originalCredit = 0;
     try {
       await client.query('BEGIN');
+      const refunded = await client.query(
+        `SELECT 1 FROM token_transactions
+          WHERE user_id = $1 AND transaction_type = 'refund' AND metadata->>'job_id' = $2
+          LIMIT 1`,
+        [userId, jobId],
+      );
+      if (refunded.rows.length === 0) {
+        originalCredit = Number(job.tokens_spent);
+        totalCredit += originalCredit;
+      }
       // Через процедуру — возврат за перезапуск обязан быть в истории.
       const upd = await client.query(
         `SELECT add_user_tokens($1, $2, 'refund', $3, $4::jsonb) AS res`,
@@ -753,6 +780,9 @@ ${healthSummary}
          VALUES ($1, 'ai', NULL, 'rerun_job', $2::jsonb)`,
         [ticketId, JSON.stringify({
           original_job_id: jobId, original_cost: Number(job.tokens_spent),
+          // Сколько из исходной стоимости вернули здесь: 0, если её уже
+          // вернул failAndRefund в момент провала.
+          original_credited: originalCredit,
           new_job_id: created.jobId, new_cost: Number(created.tokensSpent),
           total_credited: totalCredit,
         })],
