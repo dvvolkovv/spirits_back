@@ -37,7 +37,14 @@ describe('вид действия', () => {
 describe('ProductActionsService', () => {
   it('open — ожидающее с меткой хода и сроком', async () => {
     const h = make();
-    h.pg.query.mockResolvedValueOnce({ rows: [{ id: ID, expires_at: new Date('2026-10-25T10:30:00Z') }], rowCount: 1 } as any);
+    // mockResolvedValueOnce тут не годится: он подменяет саму реализацию мока,
+    // поэтому пуш в h.calls (часть базовой реализации) для этого вызова не
+    // происходит — calls[0] остаётся undefined. mockImplementationOnce делает
+    // то же самое (отдаёт нужную строку из RETURNING), но не глушит запись вызова.
+    h.pg.query.mockImplementationOnce(async (sql: string, params: any[] = []) => {
+      h.calls.push({ sql, params });
+      return { rows: [{ id: ID, expires_at: new Date('2026-10-25T10:30:00Z') }], rowCount: 1 } as any;
+    });
     const r = await h.svc.open({ userId: 'u1', productId: null, kind: 'create_bot', channel: 'web', turn: 't-1', payload: { name: 'Бот' } });
     expect(r).toEqual({ id: ID, expiresAt: '2026-10-25T10:30:00.000Z' });
     expect(h.calls[0].sql).toMatch(/'pending'/);
@@ -62,12 +69,17 @@ describe('ProductActionsService', () => {
 
   it('takeForTurn — по метке ИЛИ по окну хода, по порядку заведения', async () => {
     const h = make();
-    h.pg.query.mockResolvedValueOnce({
-      rows: [
-        { id: 'b', kind: 'delete', payload: {}, created_at: new Date('2026-10-25T10:02:00Z') },
-        { id: 'a', kind: 'create_bot', payload: {}, created_at: new Date('2026-10-25T10:01:00Z') },
-      ], rowCount: 2,
-    } as any);
+    // См. комментарий у теста open(): mockImplementationOnce вместо
+    // mockResolvedValueOnce, иначе пуш в h.calls для этого вызова не произойдёт.
+    h.pg.query.mockImplementationOnce(async (sql: string, params: any[] = []) => {
+      h.calls.push({ sql, params });
+      return {
+        rows: [
+          { id: 'b', kind: 'delete', payload: {}, created_at: new Date('2026-10-25T10:02:00Z') },
+          { id: 'a', kind: 'create_bot', payload: {}, created_at: new Date('2026-10-25T10:01:00Z') },
+        ], rowCount: 2,
+      } as any;
+    });
     const since = new Date('2026-10-25T10:00:00Z');
     const r = await h.svc.takeForTurn('u1', 't-1', since);
     expect(r.map((x) => x.id)).toEqual(['a', 'b']);
