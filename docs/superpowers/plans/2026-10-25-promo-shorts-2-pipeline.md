@@ -201,10 +201,10 @@ Expected: `# pass 49`, `# fail 0`.
 
 - [ ] **Step 7: База уже красных сюит бота и блога**
 
-Часть сюит `src/tg-bot` и `src/blog` красна ещё до этой работы. `misc.service.ts` в цепочке их импортов тянет ESM-пакет `@anthropic-ai/claude-agent-sdk`, и jest падает до первого теста (`SyntaxError: Cannot use import statement outside a module`). Проверено 25.10.2026 на `9d7c7a3`: так красны `tg-bot.blog-routing.spec.ts` и `blog.module.spec.ts`. Чтобы дальше мерить дельтой, а не нулём, список красных сюит записывается:
+На `c787327` сюиты `src/tg-bot` и `src/blog` зелёные (25.10.2026: 57 passed, 3 skipped — интеграционные без своих баз). ESM-пакет агента `@anthropic-ai/claude-agent-sdk`, который тянет `misc.service.ts`, гасит ручной мок `__mocks__/@anthropic-ai/claude-agent-sdk.js` в корне репозитория. Копия репозитория для проверок без каталога `__mocks__` даёт ложные красные (`SyntaxError: Cannot use import statement outside a module`). База всё равно записывается: если `main` принесёт свою красную сюиту, дальше будет видно только новое:
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/tg-bot src/blog > /tmp/promo-jest-base.log 2>&1 || true; grep -E '^FAIL' /tmp/promo-jest-base.log | sort -u > ~/ci/promo-shorts-jest-fail-base.txt; cat ~/ci/promo-shorts-jest-fail-base.txt"`
-Expected: список строк `FAIL src/…` — среди них `src/tg-bot/tg-bot.blog-routing.spec.ts` и `src/blog/blog.module.spec.ts`. Файл базы лежит на ноде вне воркдеревьев.
+Expected: пустой вывод — на `c787327` красных сюит нет. Файл базы лежит на ноде вне воркдеревьев.
 
 Новые красные сюиты относительно этой базы показывает команда, которой пользуются задачи 22, 35 и 36. `|| true` после jest обязателен: `node-run.sh` выполняет команду под `set -e`, и упавший jest оборвал бы её до сравнения.
 
@@ -6217,12 +6217,6 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 `src/tg-bot/tg-bot.shorts-routing.spec.ts`:
 
 ```ts
-// misc.service.ts (в цепочке импортов tg-bot.service) тянет ESM-пакет агента, а
-// jest его не разбирает: без мока сюита падает до первого теста — так уже
-// красны tg-bot.blog-routing.spec.ts и blog.module.spec.ts. Мок — как в
-// misc.search-mate.spec.ts.
-jest.mock('@anthropic-ai/claude-agent-sdk', () => ({ query: jest.fn() }));
-
 import { TgBotService, shouldRouteToShorts } from './tg-bot.service';
 
 describe('shouldRouteToShorts', () => {
@@ -6325,12 +6319,7 @@ describe('роутинг роликов в живом обработчике', (
  * blog.module.spec.ts: scan + instance loader, без onModuleInit (ни базы, ни
  * Telegram, ни .env). Отдельно — что бот получает сервис роликов: он стоит в
  * TgBotService как @Optional, и разрыв графа там прошёл бы молча.
- *
- * Мок пакета агента — до импортов: misc.service.ts в графе тянет ESM-пакет,
- * который jest не разбирает (по той же причине красен blog.module.spec.ts).
  */
-jest.mock('@anthropic-ai/claude-agent-sdk', () => ({ query: jest.fn() }));
-
 import { NestContainer } from '@nestjs/core/injector/container';
 import { InstanceLoader } from '@nestjs/core/injector/instance-loader';
 import { Injector } from '@nestjs/core/injector/injector';
@@ -6577,7 +6566,7 @@ export function shouldRouteToShorts(data?: string): boolean {
 - [ ] **Step 7: Тесты проходят — новые и прежние спеки бота и блога**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts src/tg-bot src/blog > /tmp/promo-jest.log 2>&1 || true; grep -E '^FAIL' /tmp/promo-jest.log | sort -u > /tmp/promo-fail-now.txt; comm -13 ~/ci/promo-shorts-jest-fail-base.txt /tmp/promo-fail-now.txt > /tmp/promo-fail-new.txt; cat /tmp/promo-fail-new.txt; test ! -s /tmp/promo-fail-new.txt && echo NO_NEW_FAILS && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
-Expected: `NO_NEW_FAILS` и `TSC_OK`. Сюиты задачи (`src/shorts/*`, `tg-bot.shorts-routing.spec.ts`) — PASS. Интеграционные `shorts.integration.spec.ts` и `blog-approval.integration.spec.ts` без своих переменных — skipped. Красные сюиты из базы задачи 0 красными и остаются: это не от этой работы.
+Expected: `NO_NEW_FAILS` и `TSC_OK`. Сюиты задачи (`src/shorts/*`, `tg-bot.shorts-routing.spec.ts`) — PASS. Интеграционные `shorts.integration.spec.ts` и `blog-approval.integration.spec.ts` без своих переменных — skipped. Если база задачи 0 не пустая, её сюиты красными и остаются — это не от этой работы.
 
 Прежние спеки `src/tg-bot` собирают `TgBotService` из 13–14 аргументов. Новый параметр стоит последним и `@Optional`, поэтому они не меняются. Если среди новых красных — прежняя спека бота, сначала проверить её позиционные аргументы и не трогать порядок параметров.
 
