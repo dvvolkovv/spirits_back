@@ -17,6 +17,13 @@ describe('определение инструмента продуктов', () 
     expect(p.actionId.type).toBe('string');
   });
 
+  it('у domain — поля domain, remove и check', () => {
+    const p = (tool().input_schema as any).properties;
+    expect(p.domain.type).toBe('string');
+    expect(p.remove.type).toBe('boolean');
+    expect(p.check.type).toBe('boolean');
+  });
+
   it('создание — действием create, с ценой и пределом до вызова', () => {
     expect(tool().description).toMatch(/action="create"/);
     expect(tool().description).toMatch(/первый месяц бесплатно/);
