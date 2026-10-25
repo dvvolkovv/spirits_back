@@ -20,22 +20,8 @@ import { isStoreBuild } from './client-kind';
 import { toActivity } from './activity-map';
 import { RelayOutputFile, collectOutputFiles, outputFileLines } from './chat-files/relay-links';
 
-/**
- * Потолок загрузки, ОДИН на всю цепочку. Раньше каждое звено держало свой, и
- * пользователь получал голый 413 с надписью «не удалось обработать файл»:
- * 11.08 она трижды пыталась отправить 56–61 МБ сканов и трижды упиралась в
- * стену без объяснения.
- *
- * Узким местом был НЕ наш nginx, а Selectel-прокси 92.53.64.147, через который
- * обязан ходить весь трафик РФ: у него стоял свой `client_max_body_size 50m`.
- * 11.08 подняты оба слоя до 120m и замерено через прокси: 55 и 100 МБ проходят,
- * 130 МБ → 413. 100 МБ здесь — это 120m минус запас на служебные поля multipart.
- *
- * Менять это число можно только вместе с ОБОИМИ nginx: origin
- * (/etc/nginx/conf.d/upload.conf) и edge (sites-enabled/my.linkeon.io на
- * 92.53.64.147). Завысить его хуже, чем не иметь вовсе: проверка пропустит
- * пачку, а nginx отобьёт её немым 413 — тем самым, от которого мы уходили.
- */
+// Потолок загрузки и зачем он именно такой — в upload-limits.ts, вместе с
+// самой константой (менять его можно только вместе с ОБОИМИ nginx).
 import { MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES } from './upload-limits';
 export { MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES };
 
