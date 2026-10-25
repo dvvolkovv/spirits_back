@@ -35,8 +35,16 @@ describe('ИИ-поддержка знает разделы платформы',
 describe('ИИ-поддержка и справка', () => {
   const service = () => new SupportService({ query: async () => ({ rows: [] }) } as any);
 
-  it('на вопрос о платформе — сначала статья справки', () => {
-    expect(prompt({ language: 'ru' })).toMatch(/сначала возьми статью инструментом linkeon_help/);
+  it('на вопрос «как сделать/сколько стоит/как устроено» — сначала статья справки', () => {
+    const p = prompt({ language: 'ru' });
+    expect(p).toMatch(/как сделать.*сколько стоит.*как устроено.*сначала возьми статью инструментом linkeon_help/);
+  });
+
+  it('на сбой — сначала get_recent_jobs и check_service_health, не справка', () => {
+    const p = prompt({ language: 'ru' });
+    expect(p).toMatch(/при сбое или упавшей генерации.*сначала.*get_recent_jobs.*check_service_health/i);
+    // старая формулировка звала linkeon_help первым даже на «не работает» — сужено
+    expect(p).not.toMatch(/что делать, если не работает.*сначала возьми статью инструментом linkeon_help/);
   });
 
   it('сборка из стора: перечень разделов без партнёрской программы', () => {
