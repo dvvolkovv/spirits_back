@@ -59,6 +59,17 @@ describe('planNext', () => {
   it('другой темы нет — здоровье выходит спокойным', () => {
     expect(planNext([idea({ id: 'h', assistantName: 'Шанкара' })], [])).toEqual({ ideaId: 'h', angle: 'calm' });
   });
+
+  it('ради провокационного слота берётся безопасная тема даже той же рубрики', () => {
+    const p = planNext(
+      [
+        idea({ id: 'h', rubric: 'feature', assistantName: 'Полина' }),
+        idea({ id: 'k', rubric: 'assistant', assistantName: 'Кира', createdAt: new Date('2026-10-21T00:00:00Z') }),
+      ],
+      [{ rubric: 'assistant', angle: 'calm' }],
+    );
+    expect(p).toEqual({ ideaId: 'k', angle: 'uncomfortable' });
+  });
 });
 
 describe('pickAssistants', () => {
