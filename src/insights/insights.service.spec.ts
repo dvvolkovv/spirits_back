@@ -4,9 +4,30 @@ import { emptySignals } from './insights.types';
 
 const week = weekOf('2026-10-19');
 
+const conversationOf = (userId: string) => ({
+  key: `web:${userId}_12`,
+  source: 'web',
+  userId,
+  assistant: 'Роман',
+  turns: [
+    { role: 'user', text: 'Я Владимир, почта vova@mail.ru, телефон 8 903 016 91 87' },
+    { role: 'assistant', text: 'ответ' },
+  ],
+});
+
 function harness(
-  over: { labelText?: string[]; synthText?: string[]; claudeError?: string; lock?: boolean; attempts?: number; rerun?: boolean; active?: string } = {},
+  over: {
+    labelText?: string[];
+    synthText?: string[];
+    claudeError?: string;
+    lock?: boolean;
+    attempts?: number;
+    rerun?: boolean;
+    active?: string;
+    conversations?: number;
+  } = {},
 ) {
+  const userIds = Array.from({ length: over.conversations ?? 1 }, (_, i) => `799900000${String(i + 1).padStart(2, '0')}`);
   const calls: Array<{ prompt: string; opts: any }> = [];
   const labelQueue = [...(over.labelText ?? ['[{"conv":1,"items":[{"type":"confused","about":"путает два вида ботов","severity":2}]}]'])];
   const synthQueue = [
@@ -46,20 +67,9 @@ function harness(
   };
   const collector = {
     collect: jest.fn(async () => ({
-      conversations: [
-        {
-          key: 'web:79990000001_12',
-          source: 'web',
-          userId: '79990000001',
-          assistant: 'Роман',
-          turns: [
-            { role: 'user', text: 'Я Владимир, почта vova@mail.ru, телефон 8 903 016 91 87' },
-            { role: 'assistant', text: 'ответ' },
-          ],
-        },
-      ],
+      conversations: userIds.map(conversationOf),
       signals: emptySignals(),
-      names: new Map([['79990000001', ['Владимир']]]),
+      names: new Map(userIds.map((u) => [u, ['Владимир']])),
     })),
   };
   const tg = { sendMessage: jest.fn(async () => ({ message_id: 555 })) };
@@ -129,11 +139,23 @@ describe('InsightsService.execute', () => {
     expect(h.tg.sendMessage).toHaveBeenCalledWith(42, expect.stringContaining('сводка не собралась'));
   });
 
-  it('разметка дважды не по форме — пачка пропущена, прогон доходит до конца', async () => {
+  it('разметка не удалась ни для одной пачки — прогон failed, а не «затыков нет»', async () => {
     const h = harness({ labelText: ['мусор'] });
     await h.svc.execute('run-1', week);
-    expect(h.store.finishRun).toHaveBeenCalled();
-    expect(h.tg.sendMessage).toHaveBeenCalledWith(42, expect.stringContaining('Затыков на этой неделе не нашлось.'), {});
+    expect(h.store.failRun).toHaveBeenCalledWith('run-1', expect.stringContaining('разметка не удалась ни для одной'));
+    expect(h.store.finishRun).not.toHaveBeenCalled();
+    expect(h.tg.sendMessage).toHaveBeenCalledWith(42, expect.stringContaining('сводка не собралась'));
+    // Только сообщение о сбое — пустой сводки нет.
+    expect(h.tg.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('одна пачка из двух не разметилась — прогон доходит до конца, а сводка говорит о пропуске', async () => {
+    const ok = '[{"conv":1,"items":[{"type":"confused","about":"путает два вида ботов","severity":2}]}]';
+    // Девять разговоров — две пачки: первая дважды отвечает мусором, вторая — по форме.
+    const h = harness({ conversations: 9, labelText: ['мусор', 'мусор', ok] });
+    await h.svc.execute('run-1', week);
+    expect(h.store.finishRun).toHaveBeenCalledWith('run-1', expect.objectContaining({ conversations: 9, people: 9 }));
+    expect(h.tg.sendMessage).toHaveBeenCalledWith(42, expect.stringContaining('Не разобрано пачек разговоров: 1 из 2'), expect.anything());
   });
 
   it('недельный лимит — отложить без сообщения, а на третий раз — failed и сообщение', async () => {

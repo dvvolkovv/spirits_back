@@ -1,6 +1,7 @@
 import { deidentify } from './deidentify';
 import { cleanLine, parseModelJson } from './insights-text';
 import { FRICTION_TYPES, type Conversation, type FrictionType, type Label } from './insights.types';
+import { MAX_PROMPT_BYTES, promptBytes } from './prompt-size';
 
 export const LABEL_MODEL = 'claude-haiku-4-5';
 export const LABEL_BATCH = 8;
@@ -54,13 +55,39 @@ export function renderConversation(c: Conversation, names: readonly string[]): s
   return lines.join('\n');
 }
 
-export function buildLabelPrompt(batch: readonly LabelInput[], namesOf: (userId: string) => readonly string[]): string {
-  return batch
-    .map(
-      (b, i) =>
-        `Разговор ${i + 1} (ассистент «${b.conversation.assistant}»):\n${renderConversation(b.conversation, namesOf(b.conversation.userId))}`,
-    )
-    .join('\n\n');
+type NamesOf = (userId: string) => readonly string[];
+
+function block(n: number, b: LabelInput, namesOf: NamesOf): string {
+  return `Разговор ${n} (ассистент «${b.conversation.assistant}»):\n${renderConversation(b.conversation, namesOf(b.conversation.userId))}`;
+}
+
+export function buildLabelPrompt(batch: readonly LabelInput[], namesOf: NamesOf): string {
+  return batch.map((b, i) => block(i + 1, b, namesOf)).join('\n\n');
+}
+
+/**
+ * Пачки разметки по порядку: до LABEL_BATCH разговоров и не больше
+ * MAX_PROMPT_BYTES вместе с инструкцией (см. prompt-size.ts). Один разговор
+ * не длиннее MAX_CONVERSATION_CHARS и в предел влезает всегда.
+ */
+export function labelBatches(inputs: readonly LabelInput[], namesOf: NamesOf): LabelInput[][] {
+  const budget = MAX_PROMPT_BYTES - promptBytes(LABEL_SYSTEM);
+  const out: LabelInput[][] = [];
+  let batch: LabelInput[] = [];
+  let used = 0;
+  for (const input of inputs) {
+    // Номер — с запасом по разрядам (в пачке он не больше LABEL_BATCH), +2 — разделитель блоков.
+    const size = promptBytes(block(LABEL_BATCH, input, namesOf)) + 2;
+    if (batch.length && (batch.length === LABEL_BATCH || used + size > budget)) {
+      out.push(batch);
+      batch = [];
+      used = 0;
+    }
+    batch.push(input);
+    used += size;
+  }
+  if (batch.length) out.push(batch);
+  return out;
 }
 
 /**

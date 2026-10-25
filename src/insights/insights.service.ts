@@ -5,9 +5,9 @@ import { classifyLlmError } from '../monitoring/claude-health.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { InsightsCollectService } from './insights-collect.service';
 import { buildDigest, buildKeyboard, insightsChatId, type DigestInput } from './insights-digest';
-import { buildLabelPrompt, LABEL_BATCH, LABEL_MODEL, LABEL_SYSTEM, parseLabels, type LabelInput } from './insights-label';
+import { buildLabelPrompt, LABEL_MODEL, LABEL_SYSTEM, labelBatches, parseLabels, type LabelInput } from './insights-label';
 import { InsightsStore, type RunRow } from './insights-store.service';
-import { buildSynthPrompt, parseFindings, SYNTH_SYSTEM, synthModel } from './insights-synth';
+import { fitSynthPrompt, parseFindings, SYNTH_SYSTEM, synthModel } from './insights-synth';
 import { weekLabel, weekOf, type Week } from './insights-week';
 import type { Label, SynthFinding } from './insights.types';
 
@@ -77,22 +77,37 @@ export class InsightsService {
       });
       let cost = 0;
       const labels: Label[] = [];
-      for (let i = 0; i < inputs.length; i += LABEL_BATCH) {
-        const batch = inputs.slice(i, i + LABEL_BATCH);
-        const prompt = buildLabelPrompt(batch, (u) => collected.names.get(u) ?? []);
+      const namesOf = (u: string) => collected.names.get(u) ?? [];
+      const batches = labelBatches(inputs, namesOf);
+      let failed = 0;
+      for (const [i, batch] of batches.entries()) {
+        const prompt = buildLabelPrompt(batch, namesOf);
         const r = await this.callModel(prompt, LABEL_SYSTEM, LABEL_MODEL, 120_000, (t) => parseLabels(t, batch));
         cost += r.cost;
         if (r.value) labels.push(...r.value);
-        else this.log.warn(`пачка разговоров ${i / LABEL_BATCH + 1} пропущена: разметка не разобралась дважды`);
+        else {
+          failed++;
+          this.log.warn(`пачка разговоров ${i + 1} из ${batches.length} пропущена: разметка не разобралась дважды`);
+        }
+      }
+      // Без разметки пустая сводка читалась бы как «затыков нет».
+      if (batches.length && failed === batches.length) {
+        throw new Error(`разметка не удалась ни для одной из ${batches.length} пачек разговоров`);
       }
       const prior = await this.store.priorFindings(week.weekStart);
       let findings: SynthFinding[] = [];
+      let inSynth = 0;
       if (labels.length) {
-        const prompt = buildSynthPrompt({ weekLabel: weekLabel(week.weekStart), labels, signals: collected.signals, prior });
-        const r = await this.callModel(prompt, SYNTH_SYSTEM, synthModel(), 300_000, (t) => parseFindings(t, labels, prior));
+        const fit = fitSynthPrompt({ weekLabel: weekLabel(week.weekStart), labels, signals: collected.signals, prior });
+        if (!fit.labels.length) throw new Error('разметка не влезает в запрос сводки');
+        if (fit.labels.length < labels.length) {
+          this.log.warn(`в сводку вошло пунктов разметки ${fit.labels.length} из ${labels.length}: предел длины запроса`);
+        }
+        const r = await this.callModel(fit.prompt, SYNTH_SYSTEM, synthModel(), 300_000, (t) => parseFindings(t, fit.labels, prior));
         cost += r.cost;
         if (!r.value) throw new Error('сводка не разобралась дважды');
         findings = r.value;
+        inSynth = fit.labels.length;
       }
       const saved = await this.store.saveFindings(week.weekStart, findings, prior);
       const totals = {
@@ -102,7 +117,13 @@ export class InsightsService {
         signals: collected.signals,
       };
       await this.store.finishRun(runId, { ...totals, costUsd: cost });
-      await this.sendDigest(runId, { weekStart: week.weekStart, ...totals, findings: saved });
+      await this.sendDigest(runId, {
+        weekStart: week.weekStart,
+        ...totals,
+        findings: saved,
+        failedBatches: { failed, total: batches.length },
+        labelsInSynth: { used: inSynth, total: labels.length },
+      });
     } catch (e: any) {
       await this.handleFailure(runId, week, e);
     } finally {

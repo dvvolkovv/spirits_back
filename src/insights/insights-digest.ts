@@ -19,6 +19,10 @@ export interface DigestInput {
   crisis: number;
   signals: Signals;
   findings: readonly DigestFinding[];
+  /** Пачки разговоров, которые модель не разметила: без этой строки сводка выглядела бы полной. */
+  failedBatches?: { failed: number; total: number };
+  /** Пункты разметки, вошедшие в запрос сводки (см. fitSynthPrompt). */
+  labelsInSynth?: { used: number; total: number };
 }
 
 export interface InlineKeyboard {
@@ -43,6 +47,16 @@ function block(n: number, f: DigestFinding): string {
   return `${head}\n${f.title}. ${f.description}\n→ ${f.proposal}`;
 }
 
+/** Что из недели до сводки не дошло. */
+function gapLines(input: DigestInput): string[] {
+  const out: string[] = [];
+  const fb = input.failedBatches;
+  if (fb && fb.failed > 0) out.push(`Не разобрано пачек разговоров: ${fb.failed} из ${fb.total} — модель не разметила их и со второй попытки.`);
+  const ls = input.labelsInSynth;
+  if (ls && ls.used < ls.total) out.push(`В сводку вошло пунктов разметки: ${ls.used} из ${ls.total}, сначала тяжёлые — запрос не вместил все.`);
+  return out;
+}
+
 /** Сначала находки нескольких людей по важности, потом «1 человек». */
 export function orderFindings(list: readonly DigestFinding[]): DigestFinding[] {
   const score = (f: DigestFinding) => f.people * f.severity;
@@ -58,6 +72,7 @@ export function buildDigest(input: DigestInput): { text: string; shown: DigestFi
     `Разговоров: ${input.conversations} · людей: ${input.people} · кризисных: ${input.crisis}`,
     `Без ответа: ${s.unansweredRuns} · «?» в тишину: ${s.silentQuestionMarks} · пустых и упавших ответов: ${s.emptyOrFailedTurns}` +
       (s.meetingsTotal ? ` · встреч: ${s.meetingsTotal}, оборвалось: ${s.meetingsFailed}` : ''),
+    ...gapLines(input),
   ].join('\n');
   const ordered = orderFindings(input.findings);
   if (!ordered.length) return { text: `${header}\n\nЗатыков на этой неделе не нашлось.`, shown: [] };
