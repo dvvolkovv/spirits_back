@@ -5,7 +5,7 @@ import { classifyLlmError } from '../monitoring/claude-health.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { InsightsCollectService } from './insights-collect.service';
 import { buildDigest, buildKeyboard, insightsChatId, type DigestInput } from './insights-digest';
-import { buildLabelPrompt, LABEL_MODEL, LABEL_SYSTEM, labelBatches, parseLabels, type LabelInput } from './insights-label';
+import { LABEL_MODEL, LABEL_SYSTEM, labelBatches, parseLabels, type LabelInput } from './insights-label';
 import { InsightsStore, type RunRow } from './insights-store.service';
 import { fitSynthPrompt, parseFindings, SYNTH_SYSTEM, synthModel } from './insights-synth';
 import { weekLabel, weekOf, type Week } from './insights-week';
@@ -77,12 +77,10 @@ export class InsightsService {
       });
       let cost = 0;
       const labels: Label[] = [];
-      const namesOf = (u: string) => collected.names.get(u) ?? [];
-      const batches = labelBatches(inputs, namesOf);
+      const batches = labelBatches(inputs, (u) => collected.names.get(u) ?? []);
       let failed = 0;
       for (const [i, batch] of batches.entries()) {
-        const prompt = buildLabelPrompt(batch, namesOf);
-        const r = await this.callModel(prompt, LABEL_SYSTEM, LABEL_MODEL, 120_000, (t) => parseLabels(t, batch));
+        const r = await this.callModel(batch.prompt, LABEL_SYSTEM, LABEL_MODEL, 120_000, (t) => parseLabels(t, batch.inputs));
         cost += r.cost;
         if (r.value) labels.push(...r.value);
         else {

@@ -55,14 +55,14 @@ export function renderConversation(c: Conversation, names: readonly string[]): s
   return lines.join('\n');
 }
 
-type NamesOf = (userId: string) => readonly string[];
-
-function block(n: number, b: LabelInput, namesOf: NamesOf): string {
-  return `Разговор ${n} (ассистент «${b.conversation.assistant}»):\n${renderConversation(b.conversation, namesOf(b.conversation.userId))}`;
+export interface LabelBatch {
+  inputs: LabelInput[];
+  /** Ровно то, что уйдёт модели: по нему и мерили предел. */
+  prompt: string;
 }
 
-export function buildLabelPrompt(batch: readonly LabelInput[], namesOf: NamesOf): string {
-  return batch.map((b, i) => block(i + 1, b, namesOf)).join('\n\n');
+function block(n: number, b: LabelInput, body: string): string {
+  return `Разговор ${n} (ассистент «${b.conversation.assistant}»):\n${body}`;
 }
 
 /**
@@ -70,23 +70,25 @@ export function buildLabelPrompt(batch: readonly LabelInput[], namesOf: NamesOf)
  * MAX_PROMPT_BYTES вместе с инструкцией (см. prompt-size.ts). Один разговор
  * не длиннее MAX_CONVERSATION_CHARS и в предел влезает всегда.
  */
-export function labelBatches(inputs: readonly LabelInput[], namesOf: NamesOf): LabelInput[][] {
+export function labelBatches(inputs: readonly LabelInput[], namesOf: (userId: string) => readonly string[]): LabelBatch[] {
   const budget = MAX_PROMPT_BYTES - promptBytes(LABEL_SYSTEM);
-  const out: LabelInput[][] = [];
-  let batch: LabelInput[] = [];
+  const out: LabelBatch[] = [];
+  let cur: Array<{ input: LabelInput; body: string }> = [];
   let used = 0;
+  const flush = () => {
+    out.push({ inputs: cur.map((c) => c.input), prompt: cur.map((c, i) => block(i + 1, c.input, c.body)).join('\n\n') });
+    cur = [];
+    used = 0;
+  };
   for (const input of inputs) {
+    const body = renderConversation(input.conversation, namesOf(input.conversation.userId));
     // Номер — с запасом по разрядам (в пачке он не больше LABEL_BATCH), +2 — разделитель блоков.
-    const size = promptBytes(block(LABEL_BATCH, input, namesOf)) + 2;
-    if (batch.length && (batch.length === LABEL_BATCH || used + size > budget)) {
-      out.push(batch);
-      batch = [];
-      used = 0;
-    }
-    batch.push(input);
+    const size = promptBytes(block(LABEL_BATCH, input, body)) + 2;
+    if (cur.length && (cur.length === LABEL_BATCH || used + size > budget)) flush();
+    cur.push({ input, body });
     used += size;
   }
-  if (batch.length) out.push(batch);
+  if (cur.length) flush();
   return out;
 }
 
