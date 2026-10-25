@@ -5045,8 +5045,9 @@ export class ShortsApprovalService {
 
   /**
    * «Переснять» (новая сцена на ту же тему) и «Отклонить». Из pending_review и
-   * из approved: одобренный ролик освобождает слот. Запись — с условием на
-   * статус: пока сообщение висело, ролик мог уйти в публикацию.
+   * из approved: одобренный ролик освобождает слот и теряет одобрение
+   * (`approved_at = NULL`) — новую версию человек ещё не видел. Запись — с
+   * условием на статус: пока сообщение висело, ролик мог уйти в публикацию.
    */
   private async leave(v: ShortVideo, cb: any, chatId: number, target: 'directing' | 'rejected'): Promise<void> {
     const from: ShortStatus[] = ['pending_review', 'approved'];
@@ -5055,7 +5056,7 @@ export class ShortsApprovalService {
       return;
     }
     const r = await this.pg.query(
-      `UPDATE short_video SET status = $2, attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
+      `UPDATE short_video SET status = $2, approved_at = NULL, attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
         WHERE id = $1 AND status = ANY($3::text[])`,
       [v.id, target, from],
     );
@@ -6007,7 +6008,7 @@ describe('POST admin/shorts', () => {
     const capture = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'capture_queued' })] } : { rows: [video()] }));
     await capture.ctl.action({ action: 'retry', id: ID }, res());
     const upd = capture.pg.query.mock.calls.find((c: any[]) => String(c[0]).includes("WHERE id = $1 AND status = 'failed'")) as any[];
-    expect(upd[1]).toEqual([ID, 'capture_queued']);
+    expect(upd[1]).toEqual([ID, 'capture_queued', 'capturing']);
 
     const pub = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'approved' })] } : { rows: [video({ failed_from: 'publishing', approved_at: '2026-10-25T00:00:00Z' })] }));
     await pub.ctl.action({ action: 'retry', id: ID }, res());
@@ -6177,7 +6178,9 @@ export class ShortsController {
   /**
    * «Повторить» упавший ролик — с этапа, на котором он упал (`retryTarget`).
    * Повтор публикации — только у ролика, который владелец одобрял, сразу (слот —
-   * «сейчас») и только по упавшим площадкам: вышедшие не трогаются.
+   * «сейчас») и только по упавшим площадкам: вышедшие не трогаются. Запись — с
+   * условием на `failed_from`: цель выбрана по прочитанной неудаче, и путь
+   * «failed → approved» не должен открыться ролику, упавшему на другом этапе.
    */
   private async retry(id: string): Promise<ShortVideo> {
     const v = await this.load(id);
@@ -6197,9 +6200,9 @@ export class ShortsController {
           SET status = $2, attempts = 0, lease_until = NULL, last_error = NULL, failed_from = NULL,
               failure_notified = false, writer_rounds = 0,
               slot_at = CASE WHEN $2 = 'approved' THEN now() ELSE slot_at END, updated_at = now()
-        WHERE id = $1 AND status = 'failed'
+        WHERE id = $1 AND status = 'failed' AND failed_from = $3
         RETURNING *`,
-      [id, target],
+      [id, target, v.failedFrom],
     );
     if (!r.rows.length) throw new ConflictException('ролик успел уйти из failed — обновите список');
     return rowToShort(r.rows[0]);
