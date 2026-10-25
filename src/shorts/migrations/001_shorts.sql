@@ -93,7 +93,7 @@ BEGIN
         CREATE UNIQUE INDEX uq_short_video_source_ref ON short_video (source_ref)
             WHERE source_ref IS NOT NULL;
     END IF;
-    IF to_regclass('public.idx_short_video_status') IS NULL THEN
+    IF to_regclass('public.idx_short_video_state') IS NULL THEN
         CREATE INDEX idx_short_video_status ON short_video (status, lease_until);
     END IF;
 
