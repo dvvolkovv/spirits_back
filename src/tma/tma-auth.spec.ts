@@ -153,6 +153,23 @@ describe('POST /webhook/tma/auth', () => {
       for (const r of releases) expect(r.order).toBeLessThan(signupAt);
     });
 
+    it('связка входа — в удалённый аккаунт, связка бота — в живой: токены живому, связка входа дописана ему', async () => {
+      const calls = routedPg({ known: 'u-deleted', fromBot: 'u-bot' });
+      const res = mockRes();
+      await ctrl.auth({ initData: freshInitData() }, res);
+      expect(res._status).toBe(200);
+      expect(jwt.signAccess).toHaveBeenCalledWith('u-bot');
+      expect(jwt.signAccess).not.toHaveBeenCalledWith('u-deleted');
+      // Мёртвая связка снята ДО дозаписи: иначе ON CONFLICT DO NOTHING молча
+      // оставил бы её, и следующий вход снова начинался бы с удалённого.
+      const releaseAt = calls.findIndex((c) => c.sql.startsWith('DELETE FROM user_identities'));
+      const backfillAt = calls.findIndex((c) => c.sql.startsWith('INSERT INTO user_identities'));
+      expect(releaseAt).toBeGreaterThanOrEqual(0);
+      expect(backfillAt).toBeGreaterThan(releaseAt);
+      expect(calls[backfillAt].params).toEqual(['u-bot', '42']);
+      expect(identity.touchIdentity).toHaveBeenCalledWith('telegram', '42');
+    });
+
     it('живой аккаунт по-прежнему входит', async () => {
       routedPg({ known: 'u-known' });
       const res = mockRes();
