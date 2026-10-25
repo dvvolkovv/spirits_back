@@ -4,6 +4,8 @@ import * as path from 'path';
 import { UnauthorizedException, RequestMethod } from '@nestjs/common';
 import { METHOD_METADATA, PATH_METADATA } from '@nestjs/common/constants';
 import * as jwt from 'jsonwebtoken';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { ProductsMcpController } from './products-mcp.controller';
 import { signProductToolToken } from '../products/product-tool.token';
 
@@ -167,6 +169,17 @@ describe('точка /mcp/products', () => {
       expect(files.searchForUser).not.toHaveBeenCalled();
     });
 
+    // report_problem — тоже не входит в область help (toolsFor возвращает для
+    // неё ровно [help]): посторонний в группе Telegram не должен слать
+    // обращения в поддержку от имени владельца бота.
+    it('по токену help report_problem — отказ «Неизвестный инструмент», reportFromAssistant не зовётся', async () => {
+      const { ctrl, problems } = make();
+      const r: any = await ctrl.callTool(helpBearer(), { assistant: 'Кира', kind: 'my_failure', summary: 'x' }, 'report_problem');
+      expect(r.ok).toBe(false);
+      expect(r.error).toMatch(/Неизвестный инструмент/);
+      expect(problems.reportFromAssistant).not.toHaveBeenCalled();
+    });
+
     it('статья — на языке из подписи токена', async () => {
       const { ctrl } = make();
       const en: any = await ctrl.callTool(`Bearer ${signProductToolToken('u-test', 'web', { lang: 'en', client: 'web' })}`, { topics: ['products'] }, 'linkeon_help');
@@ -204,6 +217,53 @@ describe('точка /mcp/products', () => {
       const { ctrl, events } = make();
       await ctrl.callTool(`Bearer ${signProductToolToken('u-test', 'web', { lang: 'ru' })}`, { topics: ['chat'], userId: 'u-other' }, 'linkeon_help');
       expect(events.track.mock.calls[0][1].userId).toBe('u-test');
+    });
+  });
+
+  // makeServer собирает tools/list из claims токена (channel, client, scope),
+  // а не из аргументов запроса — через настоящий MCP-клиент, как и в
+  // products-mcp.report-problem.spec.ts: на одних моках откат к ctrl.listTools()
+  // с другими параметрами остался бы зелёным.
+  describe('makeServer: область и клиент из токена идут в tools/list', () => {
+    async function listViaRealServer(bearer: string) {
+      const { ctrl } = make();
+      const server = (ctrl as any).makeServer(bearer);
+      const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverSide);
+      const client = new Client({ name: 'spec', version: '1.0.0' });
+      await client.connect(clientSide);
+      const tools = await client.listTools();
+      await client.close();
+      return tools.tools.map((t: any) => t.name);
+    }
+
+    it('токен с областью help — сервер отдаёт только linkeon_help', async () => {
+      const bearer = `Bearer ${signProductToolToken('u-owner', 'telegram', { scope: 'help' })}`;
+      const names = await listViaRealServer(bearer);
+      const { ctrl } = make();
+      expect(names).toEqual(ctrl.listTools('telegram', { scope: 'help' }).map((t: any) => t.name));
+      expect(names).toEqual(['linkeon_help']);
+    });
+
+    it('токен без области, канал web — полный набор, как у ctrl.listTools(\'web\')', async () => {
+      const bearer = `Bearer ${signProductToolToken('u-owner', 'web')}`;
+      const names = await listViaRealServer(bearer);
+      const { ctrl } = make();
+      expect(names).toEqual(ctrl.listTools('web').map((t: any) => t.name));
+    });
+
+    it('клиент store из токена — в схеме справки нет тем о деньгах', async () => {
+      const bearer = `Bearer ${signProductToolToken('u-owner', 'web', { client: 'store' })}`;
+      const { ctrl } = make();
+      const server = (ctrl as any).makeServer(bearer);
+      const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverSide);
+      const client = new Client({ name: 'spec', version: '1.0.0' });
+      await client.connect(clientSide);
+      const tools = await client.listTools();
+      await client.close();
+      const help: any = tools.tools.find((t: any) => t.name === 'linkeon_help');
+      expect(help.inputSchema.properties.topics.items.enum).not.toContain('payments');
     });
   });
 });
