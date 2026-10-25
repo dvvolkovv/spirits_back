@@ -2,6 +2,19 @@
 -- Ассистент ведёт продукт целиком. Спека:
 -- docs/superpowers/specs/2026-10-25-product-full-lifecycle-design.md.
 -- Катится на каждом старте вместе со всем списком MIGRATIONS, идемпотентно.
+--
+-- ПРАВКА ТЕЛА CREATE TABLE НИЖЕ (колонки, словари CHECK) ПОСЛЕ ПЕРВОГО
+-- ВЫКАТА НИ ДО ОДНОЙ БАЗЫ НЕ ДОЕДЕТ: IF NOT EXISTS проверяет только имя
+-- таблицы, а не её форму. Новое значение словаря (kind/status/channel/
+-- confirmed_via), новая колонка или новое ограничение — это отдельная
+-- следующая миграция (ALTER TABLE ... DROP/ADD CONSTRAINT или ADD COLUMN),
+-- а не правка этого файла задним числом.
+--
+-- Лок ниже — только вокруг ЭТОЙ миграции: защищает её CREATE TABLE от гонки
+-- двух параллельных первых стартов PM2-кластера (та же гонка, что у 005/006/
+-- 008 на первом выкате — см. FATAL_MIGRATIONS в products.service.ts).
+-- Системный лок вокруг ВСЕЙ накатки миграций — отдельная задача, как и
+-- отмечено там же, а не точечная правка этой строки.
 SELECT pg_advisory_xact_lock(hashtext('products/009_product_actions'));
 
 -- Мягкое удаление. archived_at уже есть — по нему считают место в пределе и
@@ -23,6 +36,13 @@ ALTER TABLE products ADD COLUMN IF NOT EXISTS first_prompt_channel text;
 CREATE TABLE IF NOT EXISTS product_actions (
   id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id       text NOT NULL,
+  -- SET NULL, а не CASCADE, как у других дочерних таблиц продукта
+  -- (product_turns, product_domains): это журнал, который обязан пережить
+  -- запись products, а не исчезнуть вместе с ней. Продукт обычно НЕ удаляют
+  -- физически — только архивируют (archived_at) и, в очереди 2, помечают на
+  -- стирание (purge_after/purged_at), так что на практике строка products
+  -- никуда не девается; но если она всё же пропадёт, действие должно
+  -- остаться с отвязанным product_id, а не пропасть из журнала молча.
   product_id    uuid REFERENCES products(id) ON DELETE SET NULL,
   kind          text NOT NULL CHECK (kind IN ('create_site','create_bot','keys','delete','restore','revert','purge')),
   status        text NOT NULL CHECK (status IN ('pending','working','done','failed','expired','cancelled')),
