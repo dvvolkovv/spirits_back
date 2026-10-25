@@ -53,15 +53,38 @@ export class TmaController implements OnModuleInit {
     // catch-блок обслуживает три разные ветки ниже.
     let stage = 'lookup:user_identities';
     try {
+      // Удалённый аккаунт не входит ни по одной из двух веток ниже: связка,
+      // ведущая в него, — мусор, и Telegram для нас незнакомый (ветка 3).
+      // Раньше ветка «старожилов» по уцелевшей строке tg_user_identities
+      // выдавала токены удалённому аккаунту и вдобавок заново заводила ему
+      // связку входа — после чего его находила уже первая ветка.
+      //
+      // Найденную мёртвую связку снимаем сразу, а не только при регистрации:
+      // иначе resolveOrCreate в ветке 3 нашёл бы старую связку входа, вставка
+      // в tg_user_identities упёрлась бы в UNIQUE (tg_user_id), а привязка
+      // этого Telegram к другому аккаунту из кабинета — в конфликт. Снимаем
+      // ровно ту строку, что ведёт в проверенный удалённый аккаунт; удаление
+      // аккаунта (ProfileService.deleteProfile) рвёт их так же.
+
       // 1) Основная система идентичностей
       const known = await this.pg.query(
         `SELECT user_id FROM user_identities WHERE provider = 'telegram' AND provider_sub = $1 LIMIT 1`,
         [sub],
       );
-      if (known.rows.length) {
-        stage = 'touch:user_identities';
-        await this.identity.touchIdentity('telegram', sub);
-        return this.issue(res, known.rows[0].user_id);
+      const knownId: string | undefined = known.rows[0]?.user_id;
+      if (knownId) {
+        stage = 'check:user_identities';
+        if (!(await this.identity.isDeleted(knownId))) {
+          stage = 'touch:user_identities';
+          await this.identity.touchIdentity('telegram', sub);
+          return this.issue(res, knownId);
+        }
+        stage = 'release:user_identities';
+        await this.pg.query(
+          `DELETE FROM user_identities WHERE provider = 'telegram' AND provider_sub = $1 AND user_id = $2`,
+          [sub, knownId],
+        );
+        this.logger.warn(`tma: связка telegram вела в удалённый аккаунт ${knownId} — снята`);
       }
 
       // 2) Старожилы бота: связка живёт только в tg_user_identities.
@@ -71,21 +94,30 @@ export class TmaController implements OnModuleInit {
         `SELECT linkeon_user_id FROM tg_user_identities WHERE tg_user_id = $1 LIMIT 1`,
         [verified.tgUserId],
       );
-      if (fromBot.rows.length) {
-        const userId = fromBot.rows[0].linkeon_user_id;
-        stage = 'backfill:user_identities';
+      const botId: string | undefined = fromBot.rows[0]?.linkeon_user_id;
+      if (botId) {
+        stage = 'check:tg_user_identities';
+        if (!(await this.identity.isDeleted(botId))) {
+          stage = 'backfill:user_identities';
+          await this.pg.query(
+            `INSERT INTO user_identities (user_id, provider, provider_sub, email_verified, last_used_at)
+             VALUES ($1, 'telegram', $2, false, now())
+             ON CONFLICT (provider, provider_sub) DO NOTHING`,
+            [botId, sub],
+          );
+          // Бэкфилл выше пишет last_used_at только при первой вставке — при
+          // повторном визите сработает ON CONFLICT DO NOTHING и дата замрёт
+          // навсегда. touchIdentity обновляет её на каждый вход.
+          stage = 'touch:tg_user_identities';
+          await this.identity.touchIdentity('telegram', sub);
+          return this.issue(res, botId);
+        }
+        stage = 'release:tg_user_identities';
         await this.pg.query(
-          `INSERT INTO user_identities (user_id, provider, provider_sub, email_verified, last_used_at)
-           VALUES ($1, 'telegram', $2, false, now())
-           ON CONFLICT (provider, provider_sub) DO NOTHING`,
-          [userId, sub],
+          `DELETE FROM tg_user_identities WHERE tg_user_id = $1 AND linkeon_user_id = $2`,
+          [verified.tgUserId, botId],
         );
-        // Бэкфилл выше пишет last_used_at только при первой вставке — при
-        // повторном визите сработает ON CONFLICT DO NOTHING и дата замрёт
-        // навсегда. touchIdentity обновляет её на каждый вход.
-        stage = 'touch:tg_user_identities';
-        await this.identity.touchIdentity('telegram', sub);
-        return this.issue(res, userId);
+        this.logger.warn(`tma: связка бота вела в удалённый аккаунт ${botId} — снята`);
       }
 
       // 3) Незнакомый Telegram. Аккаунт заводим ТОЛЬКО по явному выбору:
