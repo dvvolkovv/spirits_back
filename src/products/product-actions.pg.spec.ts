@@ -46,6 +46,14 @@ maybe('журнал действий против живого Postgres', () => 
     expect(await svc.takeForTurn('u1', '11111111-2222-4333-8444-555555555555', since)).toEqual([]);
   });
 
+  it('фильтр канала: веб-ход не хватает карточку telegram, свой канал — хватает', async () => {
+    const since = new Date(Date.now() - 1000);
+    const { id } = await svc.open({ userId: 'u1', productId: null, kind: 'delete', channel: 'telegram', turn: null, payload: {} });
+    expect(await svc.takeForTurn('u1', 'nonce-x', since, 'web')).toEqual([]);
+    const got = await svc.takeForTurn('u1', 'nonce-x', since, 'telegram');
+    expect(got.map((x) => x.id)).toEqual([id]);
+  });
+
   it('release возвращает в ожидание с ошибкой, finish закрывает', async () => {
     const { id } = await svc.open({ userId: 'u1', productId: null, kind: 'create_bot', channel: 'web', turn: null, payload: {} });
     await svc.claim('u1', id, 'chat');

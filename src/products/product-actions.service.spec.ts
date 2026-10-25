@@ -58,12 +58,21 @@ describe('ProductActionsService', () => {
     expect(h.pg.query).not.toHaveBeenCalled();
   });
 
-  it('claim — один оператор: только pending, только до срока, только свой', async () => {
+  it('release и finish с не-uuid id не ходят в базу', async () => {
+    const h = make();
+    await h.svc.release('nope', { error: 'x' });
+    await h.svc.finish('nope', 'done', {});
+    expect(h.pg.query).not.toHaveBeenCalled();
+  });
+
+  it('claim — один оператор: только pending, только до срока, только свой, без шифротекста', async () => {
     const h = make();
     await h.svc.claim('u1', ID, 'cabinet');
     expect(h.calls[0].sql).toMatch(/status = 'working'/);
     expect(h.calls[0].sql).toMatch(/status = 'pending'/);
     expect(h.calls[0].sql).toMatch(/expires_at > now\(\)/);
+    expect(h.calls[0].sql).not.toMatch(/RETURNING \*/);
+    expect(h.calls[0].sql).not.toMatch(/secrets_box/);
     expect(h.calls[0].params).toEqual([ID, 'u1', 'cabinet']);
   });
 
@@ -85,6 +94,7 @@ describe('ProductActionsService', () => {
     expect(r.map((x) => x.id)).toEqual(['a', 'b']);
     expect(h.calls[0].sql).toMatch(/attached_at IS NULL/);
     expect(h.calls[0].sql).toMatch(/turn_nonce = \$2 OR created_at >= \$3/);
-    expect(h.calls[0].params).toEqual(['u1', 't-1', since]);
+    expect(h.calls[0].sql).toMatch(/channel = \$4/);
+    expect(h.calls[0].params).toEqual(['u1', 't-1', since, null]);
   });
 });

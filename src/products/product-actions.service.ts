@@ -9,7 +9,11 @@ export type ConfirmedVia = 'chat' | 'telegram' | 'tma' | 'cabinet';
 export type CardKind = 'create_bot' | 'delete' | 'keys';
 
 export const ACTION_TTL_MINUTES = 30;
-const GRACE_DAYS_FOR_VIEW = 30;
+/**
+ * Срок возврата удалённого продукта. Единственный источник: сервис
+ * жизненного цикла берёт его отсюда (обратный импорт дал бы кольцо).
+ */
+export const DELETE_GRACE_DAYS = 30;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface ActionRow {
@@ -57,7 +61,7 @@ export function toView(row: ActionRow, now: Date = new Date()): ActionView {
   if (row.kind === 'delete') {
     restoreUntil = row.status === 'done'
       ? (typeof row.result?.restoreUntil === 'string' ? row.result.restoreUntil : null)
-      : new Date(now.getTime() + GRACE_DAYS_FOR_VIEW * 86_400_000).toISOString();
+      : new Date(now.getTime() + DELETE_GRACE_DAYS * 86_400_000).toISOString();
   }
   return {
     id: row.id,
@@ -121,14 +125,27 @@ export class ProductActionsService {
    * Карточки, заведённые ходом: по метке из токена ИЛИ (запасной путь —
    * релей принёс токен прошлого хода) заведённые за время хода. Каждая
    * отдаётся один раз: attached_at ставится тем же оператором.
+   *
+   * channel, если задан, сужает запасной путь по окну хода до своего канала:
+   * без него веб-ход мог бы прихватить карточку, заведённую в это же время
+   * ботом Telegram, и наоборот. Две параллельные хода ОДНОГО пользователя в
+   * ОДНОМ и том же канале всё ещё могут перехватить карточку друг друга —
+   * это принято: список «ждёт подтверждения» в кабинете — страховка на
+   * этот случай, карточка оттуда никуда не пропадает.
    */
-  async takeForTurn(userId: string, turn: string | null, since: Date): Promise<Array<{ id: string; kind: CardKind; payload: any }>> {
+  async takeForTurn(
+    userId: string,
+    turn: string | null,
+    since: Date,
+    channel?: ActionChannel,
+  ): Promise<Array<{ id: string; kind: CardKind; payload: any }>> {
     const r = await this.pg.query(
       `UPDATE product_actions SET attached_at = now()
         WHERE user_id = $1 AND status = 'pending' AND attached_at IS NULL
           AND (turn_nonce = $2 OR created_at >= $3)
+          AND ($4::text IS NULL OR channel = $4)
        RETURNING id, kind, payload, created_at`,
-      [userId, turn, since],
+      [userId, turn, since, channel ?? null],
     );
     return [...r.rows]
       .sort((a: any, b: any) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
@@ -168,17 +185,26 @@ export class ProductActionsService {
   /** Взять в работу. Повторное нажатие, чужой и просроченный получают null. */
   async claim(userId: string, id: string, via: ConfirmedVia): Promise<ActionRow | null> {
     if (!UUID_RE.test(String(id))) return null;
+    // Явный список своих колонок, а не RETURNING * и не join: secrets_box —
+    // шифротекст ключей (очередь 2), ему сюда попадать нельзя ни при каких
+    // раскладах, а join с products тут и не нужен — имя продукта в payload.
     const r = await this.pg.query(
       `UPDATE product_actions SET status = 'working', confirmed_via = $3
         WHERE id = $1 AND user_id = $2 AND status = 'pending' AND expires_at > now()
-       RETURNING *`,
+       RETURNING id, user_id, product_id, kind, status, channel, confirmed_via, payload, result,
+                 created_at, expires_at, resolved_at, tg_chat_id, tg_message_id`,
       [id, userId, via],
     );
     return r.rows[0] ?? null;
   }
 
-  /** Вернуть в ожидание с ошибкой — то, что человек поправит в той же карточке. */
+  /**
+   * Вернуть в ожидание с ошибкой — то, что человек поправит в той же карточке.
+   * Без владельца: сюда доходят только после claim() — он уже проверил, что
+   * действие принадлежит вызывающему.
+   */
   async release(id: string, result: Record<string, unknown>): Promise<void> {
+    if (!UUID_RE.test(String(id))) return;
     await this.pg.query(
       `UPDATE product_actions SET status = 'pending', confirmed_via = NULL, result = $2::jsonb
         WHERE id = $1 AND status = 'working'`,
@@ -186,12 +212,17 @@ export class ProductActionsService {
     );
   }
 
+  /**
+   * Без владельца: сюда доходят только после claim() — он уже проверил, что
+   * действие принадлежит вызывающему.
+   */
   async finish(id: string, status: 'done' | 'failed', result: Record<string, unknown>, productId?: string): Promise<void> {
+    if (!UUID_RE.test(String(id))) return;
     await this.pg.query(
       `UPDATE product_actions
           SET status = $2, result = $3::jsonb, resolved_at = now(), product_id = COALESCE($4::uuid, product_id)
         WHERE id = $1 AND status = 'working'`,
-      [id, status, JSON.stringify(result), productId ?? null],
+      [id, status, JSON.stringify(result), productId || null],
     );
   }
 
@@ -206,7 +237,12 @@ export class ProductActionsService {
     return r.rows.length > 0;
   }
 
+  /**
+   * Без владельца: сюда доходят только после claim() — он уже проверил, что
+   * действие принадлежит вызывающему.
+   */
   async setTelegramMessage(id: string, chatId: number, messageId: number): Promise<void> {
+    if (!UUID_RE.test(String(id))) return;
     await this.pg.query(
       `UPDATE product_actions SET tg_chat_id = $2, tg_message_id = $3 WHERE id = $1`,
       [id, chatId, messageId],
