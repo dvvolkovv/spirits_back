@@ -19,7 +19,7 @@ export type KbClient = (typeof KB_CLIENTS)[number];
 // выходит в сборке для стора (client 'store'), см. render.ts.
 export const KB_PARTS = ['Что это', 'Где', 'Как', 'Лимиты и цены', 'Лимиты', 'Чего нельзя', 'Если не получается', 'Как устроено'] as const;
 
-/** Что получает render статьи. Имена q и paid — договорённость: на них опирается тест исходников. */
+/** Что получает render статьи. Имена q, paid и nonStore — договорённость: на них опирается тест исходников. */
 export interface KbContext {
   lang: KbLang;
   client: KbClient;
@@ -27,6 +27,12 @@ export interface KbContext {
   q: (key: KbLabelKey) => string;
   /** Строка о токенах и деньгах — цены, стартовый подарок, расход, баланс. В сборке из стора — пустая. */
   paid: (text: string) => string;
+  /**
+   * Строка про установку приложения файлом (APK) — решение владельца 25.10.2026:
+   * сборки из App Store/Google Play ставятся самим стором, упоминать обход
+   * через файл им нельзя. В сборке из стора — пустая.
+   */
+  nonStore: (text: string) => string;
 }
 
 export interface KbArticle {

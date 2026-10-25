@@ -29,6 +29,7 @@ export function kbContext(lang: string, client: KbClient): KbContext {
     client,
     q: (key: KbLabelKey) => `«${l[key]}»`,
     paid: (text: string) => (client === 'store' ? '' : text),
+    nonStore: (text: string) => (client === 'store' ? '' : text),
   };
 }
 

@@ -142,6 +142,16 @@ describe('статьи во всех вариантах', () => {
       .map(where);
     expect(bad).toEqual([]);
   });
+
+  // Решение владельца 25.10.2026: сборки из App Store/Google Play ставятся
+  // самим стором — упоминать обход установкой файла (APK) им нельзя.
+  it('сборка из стора: про установку Android файлом (APK) ни слова; в вебе — есть', () => {
+    const apk = /\bAPK\b|файлом/i;
+    const bad = all.filter((v) => v.id === 'apps' && v.client === 'store' && apk.test(v.text)).map(where);
+    expect(bad).toEqual([]);
+    const missingInWeb = all.filter((v) => v.id === 'apps' && v.client === 'web' && !apk.test(v.text)).map(where);
+    expect(missingInWeb).toEqual([]);
+  });
 });
 
 describe('исходники статей', () => {
@@ -163,8 +173,10 @@ describe('исходники статей', () => {
         .replace(/\$\{q\('[A-Za-z]+'\)\}/g, '')
         .replace(/\$\{V\.[A-Za-z0-9_]+\}/g, '')
         .replace(/\$\{paid\(`/g, '')
+        .replace(/\$\{nonStore\(`/g, '')
         .replace(/`\)\}/g, '')
         .replace(/\$\{paid\('/g, '')
+        .replace(/\$\{nonStore\('/g, '')
         .replace(/'\)\}/g, '')
         .replace(FORMAT_TOKENS, '');
       const other = src.match(/\$\{[^}]*\}/g);

@@ -121,6 +121,13 @@ describe('справка и инициатива', () => {
     expect(platformSections('ru')).toContain('«Партнёры»');
   });
 
+  // Решение владельца 25.10.2026: сборки из App Store/Google Play ставятся
+  // самим стором — установку файлом (APK) им не упоминаем.
+  it('стор: без установки Android файлом (APK) — в остальных клиентах есть', () => {
+    expect(platformSections('ru', { store: true })).not.toMatch(/\bAPK\b|файлом/i);
+    expect(platformSections('ru')).toMatch(/установка файлом/);
+  });
+
   it('новые строки карты: Zoom, напоминания, способы входа, мини-приложение', () => {
     const s = flat(platformSections('ru'));
     expect(s).toContain('«Zoom»');

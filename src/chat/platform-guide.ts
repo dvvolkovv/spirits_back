@@ -93,7 +93,9 @@ export function platformSections(lang: string, opts: { store?: boolean } = {}): 
     `• «${l.profile}» — ценности, интересы и навыки (собираются сами из разговоров) и «${l.business}» — ` +
       `что ассистенты знают о деле пользователя. Там же «${l.settings}» — «${l.calendars}» (Яндекс, рабочий ` +
       `Outlook, Google и iCloud по ссылке), «${l.push}», «${l.routines}», «${l.voices}», «${l.loginMethods}», ` +
-      `язык, приватность, «${l.android}» (Android, установка файлом)${partners}.`,
+      // Сборки из App Store/Google Play (store) ставятся самим стором — решение
+      // владельца 25.10.2026: установку файлом (APK) им не упоминаем вовсе.
+      `язык, приватность, «${l.android}»${opts.store ? '' : ' (Android, установка файлом)'}${partners}.`,
     '• Linkeon открывается и внутри Telegram — как мини-приложение.',
     `• «${l.help}» — краткая инструкция, частые вопросы и «${l.support}».`,
   ].join('\n');
