@@ -396,7 +396,7 @@ export class TgBotService implements OnModuleInit {
       // Нажатие не должно остаться без ответа: сервис отвечает сам, когда
       // обработал (true) — но при false (кнопка не наша) или упавшем
       // исключении «часики» на кнопке иначе крутились бы до таймаута
-      // Telegram (репорт владельца — ~15 с без ответа).
+      // Telegram (~15 с без ответа).
       let handled = false;
       try {
         handled = await this.shortsApproval.handleCallback(cb);
