@@ -5,13 +5,17 @@
 #   studio/scripts/node-run.sh "npm test"                           — в studio/
 #   NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts" — в корне бэкенда
 # Два прогона сразу (параллельные сессии, субагенты) воркдерево не делят: второй ждёт
-# первого на flock до 15 минут, а не переключает коммит у него из-под ног.
+# первого на flock до 5 минут, а не переключает коммит у него из-под ног. Команда
+# ограничена 30 минутами: зависший прогон не держит лок вечно.
+# Коды выхода: 75 — воркдерево занято (повторить позже), 2 — неверный вызов,
+# 1 — воркдерево ноды не встало на коммит, иначе — код самой команды.
 set -euo pipefail
-cmd="${1:?usage: studio/scripts/node-run.sh \"<команда>\"}"
+[ $# -eq 1 ] || { echo 'usage: studio/scripts/node-run.sh "<команда>" — команда одной строкой в кавычках' >&2; exit 2; }
+cmd="$1"
 dir="${NODE_RUN_DIR:-studio}"
 case "$dir" in
   studio|.) ;;
-  *) echo "node-run.sh: NODE_RUN_DIR — studio или . (корень бэкенда), получено «${dir}»" >&2; exit 1 ;;
+  *) echo "node-run.sh: NODE_RUN_DIR — studio или . (корень бэкенда), получено «${dir}»" >&2; exit 2 ;;
 esac
 repo="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 sha="$(git -C "$repo" rev-parse HEAD)"
@@ -20,11 +24,28 @@ branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD)"
 # а она при fetch затирает refs/remotes/origin/main у всех клонов (было 24.10.2026).
 # Из main не гоняем: скрипт только для ветки задачи.
 case "$branch" in
-  HEAD) echo "node-run.sh: HEAD отсоединён — встань на ветку задачи (git switch feat/promo-shorts)" >&2; exit 1 ;;
-  main|master) echo "node-run.sh: из ${branch} не запускать — только из ветки задачи" >&2; exit 1 ;;
+  HEAD) echo "node-run.sh: HEAD отсоединён — встань на ветку задачи (git switch feat/promo-shorts)" >&2; exit 2 ;;
+  main|master) echo "node-run.sh: из ${branch} не запускать — только из ветки задачи" >&2; exit 2 ;;
 esac
+# Незакоммиченное на ноду не уезжает: прогон проверит прежний код.
+if [ -n "$(git -C "$repo" status --porcelain --untracked-files=no)" ]; then
+  echo "node-run.sh: есть незакоммиченные правки — на ноду уедет только ${sha:0:7}" >&2
+fi
+echo "node-run.sh: ${sha:0:7} → ${dir}" >&2
 git -C "$repo" push -q origin "HEAD:refs/heads/${branch}"
+# Команда уезжает одним словом: на ноде её разбирает bash -ec, а не цепочка подготовки.
+q="$(printf '%q' "$cmd")"
 # Одно мастер-соединение на все прогоны (ControlPersist): sshd ноды рвёт новые
-# подключения по MaxStartups 10:30:100 — её постоянно перебирают боты.
-ssh -o ConnectTimeout=15 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 \
-  "set -e; exec 9>~/ci/wt/.promo-shorts.lock; flock -w 900 9 || { echo 'node-run.sh: воркдерево занято другим прогоном дольше 15 минут' >&2; exit 1; }; cd ~/ci/wt/promo-shorts && git fetch -q origin && git checkout -q --detach ${sha} && cd ${dir} && source ~/.nvm/nvm.sh >/dev/null && ${cmd}"
+# подключения по MaxStartups 10:30:100 — её постоянно перебирают боты. Keepalive —
+# чтобы прогон не висел на мёртвом соединении мастера (сон мака, смена сети).
+# На одно соединение sshd пускает до 10 сессий (MaxSessions) — с запасом.
+# Подготовка воркдерева — одной группой: любой её сбой фатален. Под set -e упавшее
+# звено списка && шелл не останавливает, и команда выполнилась бы на чужом коммите.
+ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+    -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 \
+  "set -e
+exec 9>~/ci/wt/.promo-shorts.lock
+if ! flock -w 300 9; then echo 'node-run.sh: воркдерево занято другим прогоном дольше 5 минут, его владелец:' >&2; cat ~/ci/wt/.promo-shorts.owner >&2 2>/dev/null || true; exit 75; fi
+echo \"\$(date -Is) ${sha:0:7} ${dir}\" > ~/ci/wt/.promo-shorts.owner
+{ cd ~/ci/wt/promo-shorts && timeout 120 git fetch -q origin 'refs/heads/${branch}' && test -z \"\$(git status --porcelain --untracked-files=no)\" && git checkout -q --detach ${sha} && cd ${dir} && source ~/.nvm/nvm.sh >/dev/null; } || { echo 'node-run.sh: воркдерево ноды не встало на ${sha:0:7} (fetch, незакоммиченное в дереве ноды или checkout)' >&2; git -C ~/ci/wt/promo-shorts status --short >&2 || true; exit 1; }
+exec timeout -k 30 1800 bash -ec ${q}"
