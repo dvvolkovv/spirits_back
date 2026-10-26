@@ -5215,14 +5215,12 @@ Run (нода, фронт): `pnpm check-locales && pnpm check-keys && pnpm check
 
 ---
 
-### Task 20: Фронт — форма ключей в карточке, Вебвизор, мини-приложение
+### Task 20a: Фронт — форма ключей в карточке, перевод причин отказа
 
 **Files (фронт):**
 - Modify: `src/components/products/ProductActionCard.tsx`
 - Modify: `src/components/products/ProductActionCard.test.tsx` (тест «виды действия без формы» ~300–314 и новый `describe`)
-- Modify: `src/components/webvisorPrivacy.test.ts` (~262–265)
-- Modify: `src/i18n/locales/*.json` (удалить `products.action.keys.unsupported`)
-- Create: `src/tma/App.test.tsx`
+- Modify: `src/services/productActionsApi.ts` (тип `result.field`)
 
 - [ ] **Step 1: Тесты**
 
@@ -5308,67 +5306,47 @@ describe('карточка ключей', () => {
     expect(api.get.mock.calls.length).toBeGreaterThan(21);
     expect(byButton(container, new RegExp(tRu('products.action.checkAgain')))).toBeNull();
   });
+
+  // Сервер кладёт в result причину (reason) любого исхода — по ней текст
+  // показывается на языке человека; русский error — только запасной.
+  it('поправимый отказ — текстом причины, а не русским error сервера', async () => {
+    api.get.mockResolvedValue(keysView({ result: { error: 'Telegram не принял токен бота (сырой текст)', reason: 'bad_token', field: 'BOT_TOKEN' } as any }));
+    const { container } = mount(<ProductActionCard actionId="a1" via="chat" />);
+    await flush();
+    expect(visibleText(container)).toContain(tRu('products.action.keys.errors.bad_token'));
+    expect(visibleText(container)).not.toContain('(сырой текст)');
+  });
+
+  it('bad_input называет ключ', async () => {
+    api.get.mockResolvedValue(keysView({ result: { error: 'имя секрета PORT занято платформой', reason: 'bad_input', field: 'PORT' } as any }));
+    const { container } = mount(<ProductActionCard actionId="a1" via="chat" />);
+    await flush();
+    expect(visibleText(container)).toContain(tRu('products.action.keys.errors.bad_input', { field: 'PORT' }));
+  });
+
+  it('исход смены неизвестен — свой текст в failed', async () => {
+    api.get.mockResolvedValue(keysView({ status: 'failed', result: { error: 'сырой', reason: 'rekey_unknown' } as any }));
+    const { container } = mount(<ProductActionCard actionId="a1" via="chat" />);
+    await flush();
+    expect(visibleText(container)).toContain(tRu('products.action.failed', { reason: tRu('products.action.keys.errors.rekey_unknown') }));
+  });
+
+  it('причина без перевода — показывается error сервера как есть', async () => {
+    api.get.mockResolvedValue(keysView({ result: { error: 'Особая причина сервера', reason: 'zzz_new' } as any }));
+    const { container } = mount(<ProductActionCard actionId="a1" via="chat" />);
+    await flush();
+    expect(visibleText(container)).toContain('Особая причина сервера');
+  });
 });
 ```
 (Импорт `click` из `../../test/dom` в шапке файла уже есть.)
 
-`src/components/webvisorPrivacy.test.ts`, в тесте «токен бота и значения ключей — ym-disable-keys»:
-
-```ts
-    expect(classesOf(ProductActionCardSrc, 'product-action-key-replace', 'input')).toContain('ym-disable-keys');
-```
-
-`src/tma/App.test.tsx`:
-
-```tsx
-// @vitest-environment jsdom
-import React from 'react';
-import { describe, it, expect, vi } from 'vitest';
-import { mount, flush, visibleText, tRu } from '../test/dom';
-
-vi.mock('react-i18next', async () => {
-  const { tRu: t } = await import('../test/dom');
-  return { useTranslation: () => ({ t, i18n: { language: 'ru' } }) };
-});
-vi.mock('../services/productActionsApi', () => ({
-  productActionsApi: {
-    get: vi.fn(async () => ({
-      id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', kind: 'keys', status: 'pending', productId: 'p1', productName: 'Бот',
-      productKind: 'bot', keyNames: ['BOT_TOKEN'], expiresAt: null, restoreUntil: null, result: null,
-    })),
-    submit: vi.fn(),
-    cancel: vi.fn(),
-  },
-  isProblem: (x: any) => x?.ok === false,
-}));
-// Вкладки мини-приложения при ?pa= не рисуются — подменяем, чтобы их модули
-// не тянули в тест свои запросы и хранилища.
-vi.mock('./screens/DayScreen', () => ({ DayScreen: () => null }));
-vi.mock('./screens/AssistantsScreen', () => ({ AssistantsScreen: () => null }));
-vi.mock('./screens/SearchScreen', () => ({ SearchScreen: () => null }));
-vi.mock('./screens/WalletScreen', () => ({ WalletScreen: () => null }));
-vi.mock('./screens/ProfileScreen', () => ({ ProfileScreen: () => null }));
-vi.mock('./telegram', () => ({ closeApp: vi.fn() }));
-
-import { App } from './App';
-
-describe('мини-приложение: карточка ключей по кнопке из Telegram', () => {
-  it('?pa=<id> открывает карточку ключей вместо вкладок', async () => {
-    window.history.replaceState({}, '', '/tma/?pa=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee');
-    const { container } = mount(<App />);
-    await flush();
-    expect(visibleText(container)).toContain(tRu('products.action.keys.title', { name: 'Бот' }));
-    expect(container.querySelector('[data-testid="product-action-key-replace"]')).not.toBeNull();
-  });
-});
-```
-
 - [ ] **Step 2: Коммит, прогон — FAIL**
 
 ```bash
-git -C $F add src/components/products/ProductActionCard.test.tsx src/components/webvisorPrivacy.test.ts src/tma/App.test.tsx && git -C $F commit -q -m "test(products): форма ключей в карточке, Вебвизор, мини-приложение (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git -C $F add src/components/products/ProductActionCard.test.tsx && git -C $F commit -q -m "test(products): форма ключей в карточке, перевод причин отказа (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
-Run (нода, фронт): `src/components/products/ProductActionCard.test.tsx src/components/webvisorPrivacy.test.ts src/tma/App.test.tsx`.
+Run (нода, фронт): `src/components/products/ProductActionCard.test.tsx`.
 
 - [ ] **Step 3: Реализация** — `src/components/products/ProductActionCard.tsx`
 
@@ -5510,6 +5488,100 @@ const WORKING_POLL_MAX_ATTEMPTS_KEYS = 60;
     );
 ```
 10. Шапку компонента дополнить: «Смена ключей: имена текущих ключей — с сервера, значения не приходят никогда; поле замены пустое, пустое при отправке — ключ остаётся прежним. Поля значений — `ym-disable-keys` (сторож — webvisorPrivacy.test.ts)».
+11. Перевод причин отказа. Сразу после объявления `statusRef` (до `load`):
+
+```tsx
+  /**
+   * Текст отказа на языке человека. Сервер кладёт в result причину (reason)
+   * любого исхода карточки ключей; перевод — products.action.keys.errors.<reason>.
+   * Русский error сервера — запасной показ: причина новее фронта или карточка
+   * другого вида (бот, удаление) — там всё как было.
+   */
+  const keysErrorText = (v: ProductActionView): string | null => {
+    const raw = typeof v.result?.error === 'string' ? v.result.error : null;
+    const reason = typeof v.result?.reason === 'string' ? v.result.reason : null;
+    if (v.kind !== 'keys' || !reason) return raw;
+    const key = `products.action.keys.errors.${reason}`;
+    const text = t(key, { field: typeof v.result?.field === 'string' ? v.result.field : '' });
+    return text && text !== key ? text : raw;
+  };
+```
+Три места `setError(r.status === 'pending' && typeof r.result?.error === 'string' ? r.result.error : null);` (в `load`, в тике опроса, в `apply`) заменить на `setError(r.status === 'pending' ? keysErrorText(r) : null);`; в ветке `view.status === 'failed'` строку `const reason = view.result?.error;` — на `const reason = keysErrorText(view);`.
+
+12. `src/services/productActionsApi.ts`: в тип `result` добавить `field?: string;` (имя ключа, к которому относится поправимый отказ).
+
+- [ ] **Step 4: Коммит, прогон — PASS**
+
+```bash
+git -C $F add src && git -C $F commit -q -m "products: форма ключей в карточке — имена, замена, удаление, добавление; причины отказа на языке человека" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, фронт): `src/components/products src/components/chat src/services`, затем tsc фронта (не выше базовой линии). Expected: PASS.
+
+---
+
+### Task 20b: Фронт — сторож Вебвизора, мини-приложение, уборка `keys.unsupported`
+
+**Files (фронт):**
+- Modify: `src/components/webvisorPrivacy.test.ts` (~262–265)
+- Create: `src/tma/App.test.tsx`
+- Modify: `src/i18n/locales/*.json` (удалить `products.action.keys.unsupported`)
+
+Оба теста — сторожа уже сделанного в 20a: краснеть им нечему (поле замены уже под `ym-disable-keys`, мини-приложение рисует любую карточку по `?pa=`). То, что сторож Вебвизора правда ловит снятый класс, проверяет поломка № 14 задачи 21.
+
+- [ ] **Step 1: Сторожа**
+
+`src/components/webvisorPrivacy.test.ts`, в тесте «токен бота и значения ключей — ym-disable-keys»:
+
+```ts
+    expect(classesOf(ProductActionCardSrc, 'product-action-key-replace', 'input')).toContain('ym-disable-keys');
+```
+
+`src/tma/App.test.tsx`:
+
+```tsx
+// @vitest-environment jsdom
+import React from 'react';
+import { describe, it, expect, vi } from 'vitest';
+import { mount, flush, visibleText, tRu } from '../test/dom';
+
+vi.mock('react-i18next', async () => {
+  const { tRu: t } = await import('../test/dom');
+  return { useTranslation: () => ({ t, i18n: { language: 'ru' } }) };
+});
+vi.mock('../services/productActionsApi', () => ({
+  productActionsApi: {
+    get: vi.fn(async () => ({
+      id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', kind: 'keys', status: 'pending', productId: 'p1', productName: 'Бот',
+      productKind: 'bot', keyNames: ['BOT_TOKEN'], expiresAt: null, restoreUntil: null, result: null,
+    })),
+    submit: vi.fn(),
+    cancel: vi.fn(),
+  },
+  isProblem: (x: any) => x?.ok === false,
+}));
+// Вкладки мини-приложения при ?pa= не рисуются — подменяем, чтобы их модули
+// не тянули в тест свои запросы и хранилища.
+vi.mock('./screens/DayScreen', () => ({ DayScreen: () => null }));
+vi.mock('./screens/AssistantsScreen', () => ({ AssistantsScreen: () => null }));
+vi.mock('./screens/SearchScreen', () => ({ SearchScreen: () => null }));
+vi.mock('./screens/WalletScreen', () => ({ WalletScreen: () => null }));
+vi.mock('./screens/ProfileScreen', () => ({ ProfileScreen: () => null }));
+vi.mock('./telegram', () => ({ closeApp: vi.fn() }));
+
+import { App } from './App';
+
+describe('мини-приложение: карточка ключей по кнопке из Telegram', () => {
+  it('?pa=<id> открывает карточку ключей вместо вкладок', async () => {
+    window.history.replaceState({}, '', '/tma/?pa=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee');
+    const { container } = mount(<App />);
+    await flush();
+    expect(visibleText(container)).toContain(tRu('products.action.keys.title', { name: 'Бот' }));
+    expect(container.querySelector('[data-testid="product-action-key-replace"]')).not.toBeNull();
+  });
+});
+```
+
+- [ ] **Step 2: Уборка ключа, который больше не читается**
 
 `products.action.keys.unsupported` больше не читается — удалить из всех семи локалей:
 
@@ -5523,12 +5595,13 @@ for (const l of ['ru','en','de','fr','es','pt','zh']) {
 console.log('ok')"
 ```
 
-- [ ] **Step 4: Коммит, прогон — PASS**
+- [ ] **Step 3: Коммит, прогон — PASS**
 
 ```bash
-git -C $F add src && git -C $F commit -q -m "products: форма ключей в карточке — имена, замена, удаление, добавление; мини-приложение" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git -C $F add src && git -C $F commit -q -m "products: сторож Вебвизора для полей ключей; мини-приложение открывает карточку ключей; уборка keys.unsupported" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git -C $F push -q origin HEAD:refs/heads/feat/product-lifecycle-2
 ```
-Run (нода, фронт): `src/components/products src/components/chat src/tma src/components/webvisorPrivacy.test.ts src/services`, затем `pnpm check-locales && pnpm check-keys && pnpm check-hardcoded` и tsc фронта (не выше базовой линии). Expected: PASS.
+Run (нода, фронт): `src/components/webvisorPrivacy.test.ts src/tma src/components/products`, затем `pnpm check-locales && pnpm check-keys && pnpm check-hardcoded` и tsc фронта. Expected: PASS.
 
 ---
 
