@@ -47,9 +47,11 @@
 | `src/support/support.service.ts`, `support-user-context.spec.ts` (новый) | `get_user_context` без `user_id` |
 | `src/chat/relay-linkeon-guard.spec.ts` (новый) | сторож текста `server.mjs`, `linkeon-mcp.mjs`, `paths.mjs` |
 | `src/mcp/relay-mcp-template.spec.ts` | шаблон `empty-mcp.json` — без серверов |
-| `relay-agent/paths.mjs`, `paths.test.mjs` | `turnFsKey` (fs_key `[0-9a-f]{32}` или прежний ключ) |
-| `relay-agent/linkeon-mcp.mjs`, `linkeon-mcp.test.mjs` (новые) | `LINKEON_TOOLS`, `linkeonServer(body)` |
-| `relay-agent/server.mjs` | без строки с телефоном, без `userId` в правилах, `linkeon` из токена, `BASE_TOOLS`, папки по `fs_key` |
+| `relay-agent/paths.mjs`, `paths.test.mjs` | `turnFsKey` (fs_key `[0-9a-f]{32}` или прежний ключ), `legacyTurnFsKey` |
+| `relay-agent/linkeon-mcp.mjs`, `linkeon-mcp.test.mjs` (новые) | `LINKEON_TOOLS`, `linkeonServer(body)`, `isHttpsUrl` |
+| `relay-agent/session-mcp-config.mjs`, `session-mcp-config.test.mjs` (новые) | имя конфига хода на ХОД (не на сессию), уборка осиротевших вне живых |
+| `relay-agent/turn-files.mjs`, `turn-files.test.mjs` (новые) | снимок/дифф папки хода, включая прежнюю (до `fs_key`) |
+| `relay-agent/server.mjs` | без строки с телефоном, без `userId` в правилах, `linkeon` из токена, `BASE_TOOLS`, папки по `fs_key`, конфиги хода в `agent-uploads/mcp/`, `Set` живых конфигов |
 | `relay-agent/empty-mcp.json`, `relay-agent/README.md` | пустой базовый конфиг; описание папок и секретов |
 | `CLAUDE.md` (бэка) | `RELAY_FS_SALT`, точка `/webhook/mcp/linkeon`, ручная проверка |
 | позже, задачи 20–21: `src/mcp/*`, `src/main.ts` (комментарий), `src/platform-kb/articles/how-it-works.ts`, `src/platform-kb/how-it-works.spec.ts` (новый), `scripts/sync-api-keys-to-test.sh` (комментарий) | снятие переходного пути, справка |
@@ -2853,25 +2855,49 @@ ssh dv@85.192.61.231 'curl -s http://127.0.0.1:3001/webhook/chat/active-streams'
 ```bash
 SHA=<SHA слияния из задачи 15>
 WT=~/Downloads/spirits_back/.worktrees/mcp-turn-token
-git -C "$WT" archive "${SHA}" relay-agent | ssh dv@5.101.115.184 "ST=~/file-agent-stage-${SHA:0:7}; rm -rf \$ST && mkdir \$ST && tar -x -C \$ST --strip-components=1 && cd \$ST && ln -s ~/file-agent/node_modules node_modules && node --check server.mjs && node --check paths.mjs && node --check linkeon-mcp.mjs && echo syntax-ok && node --test 2>&1 | grep -E '^# (tests|pass|fail)'"
+git -C "$WT" archive "${SHA}" relay-agent | ssh dv@5.101.115.184 "ST=~/file-agent-stage-${SHA:0:7}; rm -rf \$ST && mkdir \$ST && tar -x -C \$ST --strip-components=1 && cd \$ST && ln -s ~/file-agent/node_modules node_modules && for f in *.mjs; do node --check \"\$f\" || exit 1; done && echo syntax-ok && node --test 2>&1 | grep -E '^# (tests|pass|fail)'"
 ```
 
-Ожидается: `syntax-ok`; `# fail 0`. Красное — не катить.
+Ожидается: `syntax-ok`; `# fail 0`. Красное — не катить. `for f in *.mjs` — НЕ фиксированный список: задача 18 (ревью 26.10.2026) уже один раз отстала от кода с таким списком (см. шаг 4).
 
 - [ ] **Шаг 4: замена и рестарт одной командой**
 
+⚠️ **Не фиксированный список файлов.** 26.10.2026 повторное ревью нашло: список `server.mjs paths.mjs paths.test.mjs linkeon-mcp.mjs linkeon-mcp.test.mjs` в этом шаге не включал `session-mcp-config.mjs`/`session-mcp-config.test.mjs` и `turn-files.mjs`/`turn-files.test.mjs`, добавленные позже той же задачей 18 — `server.mjs` их импортирует, и релей после замены и рестарта не поднялся бы. Список ниже собирается диффом, а не пишется руками.
+
 ```bash
 SHA=<SHA слияния из задачи 15>
-ssh dv@5.101.115.184 "ST=file-agent-stage-${SHA:0:7} SHORT=${SHA:0:7} bash -s" <<'EOF'
+WT=~/Downloads/spirits_back/.worktrees/mcp-turn-token
+BASE="${SHA}^1"
+# Все файлы relay-agent/, изменившиеся в этом слиянии — не фиксированный
+# список (см. предупреждение выше). name-status — чтобы отдельно обработать
+# удалённые (D), если такие будут.
+CHANGED=$(git -C "$WT" diff --name-status "$BASE" "$SHA" -- relay-agent/)
+echo "$CHANGED"
+PUT=$(echo "$CHANGED" | awk '$1 != "D" {sub(/^relay-agent\//, "", $2); print $2}' | paste -sd, -)
+DEL=$(echo "$CHANGED" | awk '$1 == "D" {sub(/^relay-agent\//, "", $2); print $2}' | paste -sd, -)
+echo "копируем: $PUT"; echo "удаляем: ${DEL:-нет}"
+ssh dv@5.101.115.184 "ST=file-agent-stage-${SHA:0:7} SHORT=${SHA:0:7} PUT=$PUT DEL=$DEL bash -s" <<'EOF'
 set -euo pipefail
 cd ~/file-agent
 n=$(ps --ppid "$(pm2 pid file-agent)" --no-headers | wc -l)
 [ "$n" = 0 ] || { echo "живых ходов: $n — не катим"; exit 1; }
-for f in server.mjs paths.mjs paths.test.mjs linkeon-mcp.mjs linkeon-mcp.test.mjs; do
+IFS=',' read -ra PUTARR <<< "$PUT"
+for f in "${PUTARR[@]}"; do
+  [ -n "$f" ] || continue
   cp ~/"$ST"/"$f" ".$f.tmp" && mv ".$f.tmp" "$f"
 done
+if [ -n "${DEL:-}" ]; then
+  IFS=',' read -ra DELARR <<< "$DEL"
+  for f in "${DELARR[@]}"; do [ -n "$f" ] && rm -f -- "$f"; done
+fi
 ( umask 077; printf '{\n  "mcpServers": {}\n}\n' > .empty-mcp.json.tmp && mv .empty-mcp.json.tmp empty-mcp.json )
-git add server.mjs paths.mjs paths.test.mjs linkeon-mcp.mjs linkeon-mcp.test.mjs
+# Целостность ДО коммита и ДО рестарта: все локальные импорты server.mjs и
+# его модулей обязаны существовать файлом рядом — ровно так уже ломалось
+# (см. предупреждение выше). Неудача — exit 1 из-под set -e останавливает
+# скрипт: ни commit, ни restart не происходят.
+grep -ohE 'from "\./[^"]+"' *.mjs | cut -d'"' -f2 | sort -u | while read m; do test -f "$m" || { echo "нет $m"; exit 1; }; done
+echo "импорты на месте"
+git add -A .
 git commit -q -m "инструменты linkeon по токену хода, папки по fs_key (spirits_back $SHORT)"
 git log --oneline -1
 git status --short | head -5
@@ -2883,7 +2909,7 @@ date -u
 EOF
 ```
 
-Ожидается: коммит в git релея; в `git status` нет `empty-mcp.json` (он вне git) и нет `.tmp`; `status │ online`; `/health` — `{"status":"ok",…}`; время рестарта (`date -u`) — записать в отчёт, оно нужно задаче 19. «живых ходов: N» — подождать и повторить шаг 4 целиком.
+Ожидается: коммит в git релея; в `git status` нет `empty-mcp.json` (он вне git) и нет `.tmp`; `status │ online`; `/health` — `{"status":"ok",…}`; время рестарта (`date -u`) — записать в отчёт, оно нужно задаче 19. «живых ходов: N» — подождать и повторить шаг 4 целиком. «нет $m» / «импорты не сходятся» — стоп, разобраться, какого файла не хватает в `$PUT` (скорее всего `$CHANGED` неполный — проверить вручную `git diff --name-status` на всю историю задачи 18, а не только с `${SHA}^1`, если в это слияние попали промежуточные коммиты с других веток).
 
 Почему так: живые ходы проверяются числом детей `file-agent` в той же команде, непосредственно перед заменой — ход мог начаться после шага 2. Рестарт БЕЗ `--update-env`: релею нечего брать из окружения, а перечитанное окружение pm2 — лишний риск. Старый `empty-mcp.json` (с общим секретом) копией НЕ держим — секрет в `~/file-agent-backups/` лежал бы бессрочно открытым текстом на диске релея, который держит и чужие транскрипты. Нужен откат — собрать его заново (см. ниже), значение берётся из `.env` прода трубой, а не копией файла.
 
