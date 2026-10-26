@@ -202,6 +202,95 @@ describe('RentService.chargeRent — форма запроса', () => {
 
     await expect(svc.chargeRent('p-1')).rejects.toThrow('база моргнула');
   });
+
+  // I2: по умолчанию (суточный tick) якорь — занятый срок, а не «сегодня».
+  it('по умолчанию якорь — занятый срок (anchorNow не передан)', async () => {
+    const { svc, calls } = makeService();
+
+    await svc.chargeRent('p-1');
+
+    expect(calls[0].params[2]).toBe(false);
+  });
+
+  // I2: старт (chargeOnStart) просит якорь «сегодня» третьим параметром —
+  // без этого продукт, проспавший меньше месяца (сон/удаление/неудачное
+  // заведение), платил бы за остаток СТАРОГО месяца, а не за полный новый.
+  it('anchorNow=true уходит третьим параметром и упоминается в CASE', async () => {
+    const { svc, calls } = makeService();
+
+    await svc.chargeRent('p-1', true);
+
+    expect(calls[0].params[2]).toBe(true);
+    expect(calls[0].sql).toContain('WHEN $3 THEN now()');
+  });
+});
+
+/**
+ * I2/M3: `chargeOnStart` на заглушках методов самого сервиса — поведение
+ * запросов (форма SQL, якорь даты) уже проверено выше и в
+ * provisioning.integration.spec.ts; здесь только то, что нельзя увидеть на
+ * SQL — какие из трёх исходов chargeRent/requestSleep приводят к какому
+ * логу и не бросают наружу (упавшее здесь не должно откатывать уже
+ * случившийся перевод в running, см. докблок chargeOnStart).
+ */
+describe('RentService.chargeOnStart — три исхода, не бросает', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  function makeSvcWithStubs() {
+    const svc = new RentService({ query: jest.fn() } as any);
+    const log = {
+      error: jest.spyOn((svc as any).logger, 'error').mockImplementation(() => undefined),
+      warn: jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined),
+    };
+    const chargeRent = jest.spyOn(svc, 'chargeRent');
+    const requestSleep = jest.spyOn(svc, 'requestSleep');
+    return { svc, log, chargeRent, requestSleep };
+  }
+
+  it('списалось (chargeRent true) — requestSleep не зовётся, лога нет', async () => {
+    const { svc, chargeRent, requestSleep, log } = makeSvcWithStubs();
+    chargeRent.mockResolvedValue(true);
+
+    await svc.chargeOnStart('p-1');
+
+    expect(chargeRent).toHaveBeenCalledWith('p-1', true);
+    expect(requestSleep).not.toHaveBeenCalled();
+    expect(log.warn).not.toHaveBeenCalled();
+    expect(log.error).not.toHaveBeenCalled();
+  });
+
+  it('не списалось, но усыплён (chargeRent false, requestSleep true) — предупреждение в лог', async () => {
+    const { svc, chargeRent, requestSleep, log } = makeSvcWithStubs();
+    chargeRent.mockResolvedValue(false);
+    requestSleep.mockResolvedValue(true);
+
+    await svc.chargeOnStart('p-1');
+
+    expect(requestSleep).toHaveBeenCalledWith('p-1');
+    expect(log.warn).toHaveBeenCalledWith(expect.stringMatching(/поставлен сон/));
+  });
+
+  // M3: ни списалось, ни уснуло (живой ход держит running без денег) —
+  // продукт тихо остался бы бесплатным до суточного tick, если не сказать
+  // об этом вслух.
+  it('M3: не списалось и не уснуло — отдельное предупреждение в лог, не тишина', async () => {
+    const { svc, chargeRent, requestSleep, log } = makeSvcWithStubs();
+    chargeRent.mockResolvedValue(false);
+    requestSleep.mockResolvedValue(false);
+
+    await svc.chargeOnStart('p-1');
+
+    expect(log.warn).toHaveBeenCalledWith(expect.stringMatching(/не списалось и не ушло в сон/));
+  });
+
+  it('база упала — исключение проглочено (не откатывает уже случившийся перевод в running)', async () => {
+    const { svc, chargeRent, log } = makeSvcWithStubs();
+    chargeRent.mockRejectedValue(new Error('база моргнула'));
+
+    await expect(svc.chargeOnStart('p-1')).resolves.toBeUndefined();
+
+    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/сорвалась/));
+  });
 });
 
 /**

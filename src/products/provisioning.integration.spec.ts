@@ -3730,6 +3730,33 @@ maybe('провижининг против живого Postgres', () => {
       expect((await getProduct(p.id)).status).toBe('running');
     });
 
+    // I2 (ревью): просрочка МЕНЬШЕ месяца на старте — продукт полежал спящим
+    // (сон/удаление/неудачное заведение) 5 дней, не 40, как в тесте выше.
+    // Суточный tick() в этом случае законно анкерит период от СТАРОГО
+    // paid_until (владелец ничего не доплачивает за задержку сборщика), но
+    // на СТАРТЕ такой якорь был бы неправ: пользователь получил бы на 5 дней
+    // короче оплаченного месяца. chargeOnStart анкерит именно `now()`.
+    it('просрочка меньше месяца на старте — период от сегодня, а не от старого paid_until (на 5 дней короче)', async () => {
+      const p = await product({ slug: 'rent-on-start-short-overdue', status: 'sleeping', seenAgo: '10 seconds' });
+      await pool.query(`UPDATE products SET paid_until = now() - interval '5 days', sleep_reason = $2 WHERE id = $1`, [
+        p.id,
+        SLEEP_REASON_NO_TOKENS,
+      ]);
+      await job(p.id, { kind: 'wake', status: 'done', finishedAgo: '1 second' });
+      await setBalance('u-1', 120_000);
+
+      expect(await makeSvc().promoteReady()).toBe(1);
+
+      const row = await getProduct(p.id);
+      expect([row.status, row.sleep_reason]).toEqual(['running', null]);
+      // Старый (неверный для старта) якорь дал бы old_paid_until + 1 месяц =
+      // сегодня + 25 дней — заметно МЕНЬШЕ 29 дней вперёд.
+      const monthAhead = Date.now() + 29 * 24 * 3600 * 1000;
+      expect(new Date(row.paid_until).getTime()).toBeGreaterThan(monthAhead);
+      expect(await balanceOf('u-1')).toBe(120_000 - RENT_TOKENS);
+      expect(await ledgerOf('u-1')).toHaveLength(1);
+    });
+
     it('разбуженный продукт с истёкшим периодом платит аренду при переводе в running', async () => {
       // Тот же путь, что сценарий 76 выше, но изолированно и прицельно на сам
       // факт списания при ПРОБУЖДЕНИИ, а не только при первом заведении:
