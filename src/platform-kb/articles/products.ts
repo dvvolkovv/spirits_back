@@ -4,7 +4,7 @@ import { V } from '../values';
 // источник: создание — spirits_front src/components/products/ProductsListView.tsx:404-481, NewProductForm.tsx:296-488; src/products/products.dto.ts:93-123; src/products/provisioning.service.ts:271
 // источник: правки — src/products/product-tool.service.ts:64-86,285-433; src/products/turns.service.ts:309-561; product-runner/src/config.ts:62
 // источник: откат — spirits_front src/components/products/TurnHistory.tsx:20-84; src/products/turns.service.ts:514-537
-// источник: аренда и сон — src/products/rent.service.ts (RENT_TOKENS), migrations/004_rent.sql:8-30
+// источник: аренда и сон — src/products/rent.service.ts (RENT_TOKENS, FREE_MONTH_PRODUCTS), migrations/004_rent.sql:8-30; бесплатный месяц — provisioning.service.ts (create, решение владельца 26.10.2026)
 // источник: домен — src/products/domains.service.ts:112-151,359-381,593-668; domain-name.ts:199-207
 // источник: ключи — src/products/secrets.service.ts:12; spirits_front NewProductForm.tsx:376-460
 // источник: лимит — src/products/limits.service.ts (DEFAULT_MAX_PRODUCTS)
@@ -32,7 +32,7 @@ ${q('studio')} → ${q('studioProducts')}. Завести продукт мож�
 - ${q('prodDomain')} (только у сайта, один${paid(', бесплатно')}): домен → ${q('prodAttach')} → записи DNS дословно из таблицы; у этих имён удалить прочие A и все AAAA.
 
 ## Лимиты и цены
-${paid(`- Первый месяц бесплатно, дальше — ${V.rentTokens} токенов в месяц.\n- Правка оплачивается по расходу, только если она применена; откат и неудача бесплатны.`)}
+${paid(`- Первый месяц бесплатно — первым ${V.freeMonthProducts} продуктам аккаунта, удалённые тоже считаются; дальше — ${V.rentTokens} токенов в месяц.\n- Правка оплачивается по расходу, только если она применена; откат и неудача бесплатны.`)}
 - До ${V.maxProducts} продуктов на аккаунт (кроме архивных); больше — по просьбе в поддержку.
 
 ## Чего нельзя

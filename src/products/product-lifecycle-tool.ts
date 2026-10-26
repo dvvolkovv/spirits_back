@@ -4,6 +4,10 @@ import { DELETE_GRACE_DAYS, ProductLifecycleService } from './product-lifecycle.
 import { ActionStatus, ProductActionsService, toView } from './product-actions.service';
 import type { ProductMatch } from './product-tool.service';
 import type { ProductToolChannel } from './product-tool.token';
+import { RENT_TOKENS } from './rent.service';
+
+/** «50 000» — как в остальных текстах для людей. */
+const RENT_TOKEN_TEXT = String(RENT_TOKENS).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
 
 export interface DeletedProduct {
   id: string;
@@ -77,8 +81,14 @@ export class ProductLifecycleTool {
       if (r.ok === false) return { ok: false, reason: r.reason, say: r.message };
       return {
         ok: true,
-        created: { kind: 'site', productId: r.productId, slug: r.slug, domain: r.domain },
+        created: { kind: 'site', productId: r.productId, slug: r.slug, domain: r.domain, freeMonth: r.freeMonth },
         say: `Сайт создан и заводится: через минуту-две откроется по адресу https://${r.domain}.` +
+          // `=== true`, а не приведение к истинности — та же осторожность, что
+          // в ProvisioningService.create: сломанная выдача не должна молча
+          // читаться как «бесплатно».
+          (r.freeMonth === true
+            ? ' Первый месяц аренды бесплатный.'
+            : ` Аренда ${RENT_TOKEN_TEXT} токенов спишется при первом обороте сборщика; не хватит баланса — продукт уснёт до пополнения.`) +
           (String(input?.prompt ?? '').trim()
             ? ' Первая правка по описанию поставлена и начнётся, когда сайт поднимется; её исход — действием status по имени продукта.'
             : ' Дальше — правки действием edit.'),
@@ -160,6 +170,10 @@ export class ProductLifecycleTool {
     const action = toView(row);
     const fixable = action.status === 'pending' && typeof action.result?.error === 'string';
     const deleteDone = action.kind === 'delete' && action.status === 'done' && action.restoreUntil;
+    // freeMonth узнаётся только здесь: при открытии карточки (openCreateBot)
+    // продукта ещё нет, и до завершения (completeCreateBot) никто не знает,
+    // попал ли он в бесплатный месяц — см. комментарий в completeCreateBot.
+    const botDone = action.kind === 'create_bot' && action.status === 'done';
     return {
       ok: !ACTION_NOT_OK.has(action.status),
       action,
@@ -167,7 +181,12 @@ export class ProductLifecycleTool {
         ? `Пользователь отправил карточку, но её не приняли: ${action.result!.error}. Карточка ждёт исправления.`
         : deleteDone
           ? `Готово: продукт удалён, вернуть его можно до ${restoreDate(action.restoreUntil!)} — действием restore.`
-          : ACTION_SAY[action.status],
+          : botDone
+            ? `Готово: бот создан.` +
+              (action.result?.freeMonth === true
+                ? ' Первый месяц аренды бесплатный.'
+                : ` Аренда ${RENT_TOKEN_TEXT} токенов спишется при первом обороте сборщика; не хватит баланса — продукт уснёт до пополнения.`)
+            : ACTION_SAY[action.status],
     };
   }
 }

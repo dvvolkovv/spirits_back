@@ -36,7 +36,7 @@ function harness(o: { pg?: (sql: string, params: any[]) => any; createErrors?: a
     create: jest.fn(async () => {
       const e = createErrors.shift();
       if (e) throw e;
-      return { productId: 'p-new' };
+      return { productId: 'p-new', freeMonth: true };
     }),
   };
   const limits = { assertCanCreate: jest.fn(async () => undefined) };
@@ -59,7 +59,7 @@ describe('создание сайта', () => {
   it('занят чистый слаг — берётся с хвостом; первая правка запоминается; журнал', async () => {
     const h = harness({ createErrors: [new ConflictException('слаг уже занят')] });
     const r = await h.svc.createSite({ userId: 'u1', name: 'Магазин', prompt: 'Лендинг с ценами', channel: 'web' });
-    expect(r).toEqual({ ok: true, productId: 'p-new', slug: 'magazin-zzzzzz', domain: 'magazin.c.linkeon.io' });
+    expect(r).toEqual({ ok: true, productId: 'p-new', slug: 'magazin-zzzzzz', domain: 'magazin.c.linkeon.io', freeMonth: true });
     expect(h.provisioning.create.mock.calls.map((c: any) => c[0].slug)).toEqual(['magazin', 'magazin-zzzzzz']);
     expect(h.provisioning.create.mock.calls[1][0]).toMatchObject({ kind: 'site', secrets: {}, isAdmin: false });
     expect(h.calls.some((c) => c.sql.includes('SET first_prompt') && c.params[1] === 'Лендинг с ценами' && c.params[2] === 'web')).toBe(true);
@@ -96,7 +96,7 @@ describe('создание сайта', () => {
     const h = harness({ pg: (sql) => (sql.includes('SET first_prompt') ? Promise.reject(new Error('connection reset by peer')) : undefined) });
     const warn = jest.spyOn((h.svc as any).logger, 'warn').mockImplementation(() => undefined);
     const r = await h.svc.createSite({ userId: 'u1', name: 'Магазин', prompt: 'Лендинг', channel: 'web' });
-    expect(r).toEqual({ ok: true, productId: 'p-new', slug: 'magazin', domain: null });
+    expect(r).toEqual({ ok: true, productId: 'p-new', slug: 'magazin', domain: null, freeMonth: true });
     // Один вызов create — отказ ПОСЛЕ заведения не должен выглядеть как
     // занятый слаг и запускать повторную попытку со следующим кандидатом.
     expect(h.provisioning.create).toHaveBeenCalledTimes(1);
@@ -144,7 +144,7 @@ describe('создание бота', () => {
     const h = harness();
     h.actions.claim.mockResolvedValue(claimed);
     const r = await h.svc.completeCreateBot({ userId: 'u1', actionId: ACT, set: { BOT_TOKEN: ` ${TOKEN} `, OZON_KEY: 'k' }, via: 'tma' });
-    expect(r).toEqual({ ok: true, productId: 'p-new' });
+    expect(r).toEqual({ ok: true, productId: 'p-new', freeMonth: true });
     expect(h.provisioning.create).toHaveBeenCalledWith(expect.objectContaining({
       kind: 'bot', name: 'Бот магазина', slug: 'bot-magazina-zzzzzz', secrets: { BOT_TOKEN: TOKEN, OZON_KEY: 'k' }, tgBotId: 1234567890,
     }));
@@ -152,7 +152,7 @@ describe('создание бота', () => {
     // отдельного UPDATE products SET tg_bot_id больше нет: партиционный
     // UNIQUE products_tg_bot_live ловит гонку только на INSERT.
     expect(h.calls.some((c) => c.sql.includes('SET tg_bot_id'))).toBe(false);
-    expect(h.actions.finish).toHaveBeenCalledWith(ACT, 'done', { productId: 'p-new', botUsername: 'shop_bot' }, 'p-new');
+    expect(h.actions.finish).toHaveBeenCalledWith(ACT, 'done', { productId: 'p-new', botUsername: 'shop_bot', freeMonth: true }, 'p-new');
   });
 
   it('гонка: вторая карточка с тем же ботом успела пройти раннюю проверку, но проиграла create — тот же текст bot_in_use', async () => {
@@ -187,8 +187,8 @@ describe('создание бота', () => {
     h.actions.claim.mockResolvedValue(claimed);
     const warn = jest.spyOn((h.svc as any).logger, 'warn').mockImplementation(() => undefined);
     const r = await h.svc.completeCreateBot({ userId: 'u1', actionId: ACT, set: { BOT_TOKEN: TOKEN }, via: 'tma' });
-    expect(r).toEqual({ ok: true, productId: 'p-new' });
-    expect(h.actions.finish).toHaveBeenCalledWith(ACT, 'done', { productId: 'p-new', botUsername: 'shop_bot' }, 'p-new');
+    expect(r).toEqual({ ok: true, productId: 'p-new', freeMonth: true });
+    expect(h.actions.finish).toHaveBeenCalledWith(ACT, 'done', { productId: 'p-new', botUsername: 'shop_bot', freeMonth: true }, 'p-new');
     expect(h.actions.release).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalled();
   });

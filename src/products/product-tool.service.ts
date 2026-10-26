@@ -6,6 +6,10 @@ import { DomainErrorReason, DomainRecordToSet, DomainRefusalCode, DomainStatus, 
 import { normalizeDomain, readableDomain } from './domain-name';
 import { ProductToolChannel } from './product-tool.token';
 import { ProductLifecycleTool } from './product-lifecycle-tool';
+import { FREE_MONTH_PRODUCTS, RENT_TOKENS } from './rent.service';
+
+/** «50 000» — как в остальных текстах для людей (products-cli-tool.ts, platform-kb/values.ts). */
+const RENT_TOKEN_TEXT = String(RENT_TOKENS).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
 
 /** Продукт глазами ассистента: без внутренностей, только то, что можно назвать вслух. */
 export interface ProductMatch {
@@ -123,10 +127,19 @@ export function domainForAssistant(v: DomainView): DomainForAssistant {
 
 const NOT_WORKING = ' Не говори, что домен работает.';
 
-/** Ответ на list у пользователя без продуктов. С задачи 8 завести продукт может сам ассистент. */
+/**
+ * Ответ на list у пользователя без продуктов. С задачи 8 завести продукт может сам ассистент.
+ *
+ * Решение владельца 26.10.2026: бесплатный месяц — только первым
+ * FREE_MONTH_PRODUCTS продуктам человека за всё время (считаются и удалённые),
+ * дальше аренда сразу платная. Числа — из констант, а не литералами: разъедется
+ * цена или число бесплатных месяцев с кодом — этот текст соврёт молча.
+ */
 export const NO_PRODUCTS_SAY =
   'У пользователя пока нет продуктов. Создать можешь ты — action="create" (kind "site" или "bot"). ' +
-  'До вызова назови условия: первый месяц бесплатно, дальше 50 000 токенов в месяц, не больше двух продуктов на аккаунт.';
+  `До вызова назови условия: первый месяц бесплатно — для первых ${FREE_MONTH_PRODUCTS} продуктов человека ` +
+  `за всё время (удалённые тоже считаются), дальше сразу ${RENT_TOKEN_TEXT} токенов в месяц, ` +
+  'не больше двух продуктов на аккаунт.';
 
 /**
  * Что сказать про отказавшую заявку — по коду причины, а не по `error`
@@ -360,11 +373,22 @@ export class ProductToolService {
 
     const deleted = this.lifecycleTool ? await this.lifecycleTool.listDeleted(userId) : [];
 
+    // СКОЛЬКО БЕСПЛАТНЫХ МЕСЯЦЕВ ЕЩЁ ОСТАЛОСЬ (решение владельца 26.10.2026).
+    // Отдельным запросом, а не фильтром по products выше: тот отбирает
+    // ТОЛЬКО живые (archived_at IS NULL) и пуст у пользователя без единого
+    // живого продукта — а бесплатные месяцы считают ВСЕ строки за всё время,
+    // включая удалённые и стёртые (см. комментарий у ProvisioningService.create
+    // и у FREE_MONTH_PRODUCTS). Фильтром из `products` этот счёт не получить
+    // никак, он обязан быть отдельным.
+    const everCount = await this.pg.query(`SELECT count(*) FROM products WHERE user_id = $1`, [userId]);
+    const freeMonthsLeft = Math.max(0, FREE_MONTH_PRODUCTS - Number(everCount.rows[0]?.count ?? 0));
+
     if (!products.length) {
       return {
         ok: true,
         products,
         deleted,
+        freeMonthsLeft,
         say: NO_PRODUCTS_SAY,
       };
     }
@@ -373,10 +397,15 @@ export class ProductToolService {
       ok: true,
       products,
       deleted,
+      freeMonthsLeft,
       say:
         'Продукты пользователя. Правку ставь действием edit, назвав продукт именем.' +
         (hasBot ? ' У бота домена нет вовсе — это нормально, а не поломка: адрес есть только у сайтов.' : '') +
-        (deleted.length ? ' Удалённые (deleted) можно вернуть действием restore до purge_after.' : ''),
+        (deleted.length ? ' Удалённые (deleted) можно вернуть действием restore до purge_after.' : '') +
+        // Коротко и ДО create: модель называет условие верно, не дожидаясь отказа аренды.
+        (freeMonthsLeft > 0
+          ? ` Следующий новый продукт ещё в счёт бесплатного месяца (осталось ${freeMonthsLeft} из ${FREE_MONTH_PRODUCTS}).`
+          : ` Следующий новый продукт — сразу платный: ${RENT_TOKEN_TEXT} токенов в месяц.`),
     };
   }
 
@@ -647,8 +676,8 @@ export const PRODUCT_TOOLS = [
       'Посмотреть, СОЗДАТЬ, ПРАВИТЬ, удалить и вернуть продукты пользователя (сайты и телеграм-боты, которые он разместил в Линкеоне). ' +
       'Ты видишь только продукты этого пользователя — чужих тебе не покажут ни по имени, ни по идентификатору.\n' +
       '• action="list" — его продукты: имя, адрес, состояние; удалённые, которые ещё можно вернуть, — в deleted с датой purge_after. У ботов адреса нет вовсе — это норма.\n' +
-      '• action="create" — создать: { kind: "site" | "bot", name, prompt? }. ДО вызова назови условия: первый месяц бесплатно, дальше 50 000 токенов в месяц, ' +
-      'не больше двух продуктов на аккаунт, — и получи согласие. Сайт создаётся сразу. Для бота сервер сам прикрепит к ответу защищённую карточку: ' +
+      `• action="create" — создать: { kind: "site" | "bot", name, prompt? }. ДО вызова назови условия: первый месяц бесплатно — для первых ${FREE_MONTH_PRODUCTS} продуктов человека за всё время (удалённые тоже считаются), дальше сразу ${RENT_TOKEN_TEXT} токенов в месяц, ` +
+      'не больше двух продуктов на аккаунт, — и получи согласие (freeMonthsLeft в list подскажет, какое условие сейчас верно). Сайт создаётся сразу. Для бота сервер сам прикрепит к ответу защищённую карточку: ' +
       'пользователь введёт в неё токен от @BotFather и ключи сервисов, и бот создастся, когда он её отправит. ' +
       'prompt — что продукт должен делать: эта правка поставится сама, как только продукт поднимется.\n' +
       '• action="edit" — поставить правку: product (как пользователь назвал продукт) + prompt (что именно сделать, ' +

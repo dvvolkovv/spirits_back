@@ -35,7 +35,11 @@ function makeService(over: any = {}) {
   const pg = {
     query: jest.fn(async (sql: string, params: any[] = []) => {
       calls.push({ sql, params });
-      if (sql.includes('SELECT count(*)')) return { rows: [{ count: over.slugTaken ? '1' : '0' }] };
+      // `startsWith`, а не `includes`: с бесплатным месяцем (26.10.2026)
+      // сам INSERT INTO products несёт внутри CASE подзапрос
+      // `(SELECT count(*) FROM products WHERE user_id = $2)` — `includes`
+      // перехватывал бы и его, подменяя ответ INSERT ответом проверки слага.
+      if (sql.startsWith('SELECT count(*)')) return { rows: [{ count: over.slugTaken ? '1' : '0' }] };
       if (sql.includes('SELECT 1 FROM products WHERE tg_bot_id')) {
         return { rows: over.botBusy ? [{ x: 1 }] : [] };
       }
@@ -235,10 +239,10 @@ describe('ProvisioningService.create', () => {
     // назван здесь не для красоты: это и есть «кому принадлежит счёт».
     expect(insert.sql).toContain(
       'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,\n' +
-        "               CASE WHEN (SELECT count(*) FROM products WHERE user_id = $2) < $15\n" +
-        "                      THEN now() + interval '1 month'\n" +
-        '                      ELSE now()\n' +
-        '                    END)',
+        '                 CASE WHEN (SELECT count(*) FROM products WHERE user_id = $2) < $15\n' +
+        "                        THEN now() + interval '1 month'\n" +
+        '                        ELSE now()\n' +
+        '                      END)',
     );
     expect(insert.params).toEqual([
       res.productId,
@@ -299,6 +303,7 @@ describe('ProvisioningService.create', () => {
       'http://127.0.0.1:3000/health',
       'own',
       null,
+      FREE_MONTH_PRODUCTS,
     ]);
     expect(params(client).slice(9)).toEqual([
       's2.c.linkeon.io',
@@ -306,6 +311,7 @@ describe('ProvisioningService.create', () => {
       'http://127.0.0.1:3000/health',
       'clients',
       null,
+      FREE_MONTH_PRODUCTS,
     ]);
   });
 
@@ -876,7 +882,9 @@ describe('ProvisioningService.create', () => {
 
     expect(res.productId).toEqual(expect.any(String));
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
-    expect(insert.params[insert.params.length - 1]).toBeNull();
+    // tgBotId — предпоследним параметром: последний теперь FREE_MONTH_PRODUCTS
+    // (порог CASE paid_until, решение владельца 26.10.2026).
+    expect(insert.params[insert.params.length - 2]).toBeNull();
   });
 
   it('I2: токен живой — tg_bot_id от getMe уходит в INSERT', async () => {
@@ -889,7 +897,7 @@ describe('ProvisioningService.create', () => {
 
     expect(res.productId).toEqual(expect.any(String));
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
-    expect(insert.params[insert.params.length - 1]).toBe(555);
+    expect(insert.params[insert.params.length - 2]).toBe(555);
   });
 
   it('I2: тот же бот уже работает в другом продукте — 409 до записи', async () => {
@@ -915,7 +923,7 @@ describe('ProvisioningService.create', () => {
 
     expect(checkBot).not.toHaveBeenCalled();
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
-    expect(insert.params[insert.params.length - 1]).toBe(777);
+    expect(insert.params[insert.params.length - 2]).toBe(777);
   });
 
   it('I2: бот без секрета BOT_TOKEN вовсе — getMe не зовётся, tg_bot_id — NULL', async () => {
@@ -925,7 +933,7 @@ describe('ProvisioningService.create', () => {
 
     expect(checkBot).not.toHaveBeenCalled();
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
-    expect(insert.params[insert.params.length - 1]).toBeNull();
+    expect(insert.params[insert.params.length - 2]).toBeNull();
     expect(res.productId).toEqual(expect.any(String));
   });
 });

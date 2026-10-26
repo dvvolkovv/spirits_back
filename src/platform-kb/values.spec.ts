@@ -1,6 +1,6 @@
 import { fmt, V } from './values';
 import { IMAGE_TOKENS_HD, IMAGE_TOKENS_STD } from '../misc/image-pricing';
-import { RENT_TOKENS } from '../products/rent.service';
+import { FREE_MONTH_PRODUCTS, RENT_TOKENS } from '../products/rent.service';
 import { WELCOME_BONUS } from '../identity/identity.service';
 import { REFEREE_BONUS_TOKENS } from '../referral/referral.service';
 import { computeVeoQuote } from '../video/video.dto';
@@ -17,6 +17,7 @@ describe('числа справки — из констант', () => {
     expect(V.imageStd).toBe(fmt(IMAGE_TOKENS_STD));
     expect(V.imageHd).toBe(fmt(IMAGE_TOKENS_HD));
     expect(V.rentTokens).toBe(fmt(RENT_TOKENS));
+    expect(V.freeMonthProducts).toBe(String(FREE_MONTH_PRODUCTS));
     expect(V.welcomeBonus).toBe(fmt(WELCOME_BONUS));
     expect(V.refereeBonus).toBe(fmt(REFEREE_BONUS_TOKENS));
     expect(V.introMax).toBe(fmt(LIMITS.INTRO_MAX));

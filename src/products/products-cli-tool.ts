@@ -2,7 +2,7 @@ import type { ClaudeCliMcpHttpServer } from '../common/services/claude-cli.servi
 import { ProductToolChannel, ProductToolTokenOpts, signProductToolToken } from './product-tool.token';
 import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
 import { LINKEON_HELP_TOOL_NAME } from '../platform-kb/tool-name';
-import { RENT_TOKENS } from './rent.service';
+import { FREE_MONTH_PRODUCTS, RENT_TOKENS } from './rent.service';
 import { DEFAULT_MAX_PRODUCTS } from './limits.service';
 import { DELETE_GRACE_DAYS } from './product-actions.service';
 
@@ -72,7 +72,7 @@ export const PRODUCTS_CLI_PROMPT = `ПРОДУКТЫ ПОЛЬЗОВАТЕЛЯ (�
 - { action: "status", product или turnId } — узнать, чем кончилась правка.
 - { action: "domain", product, domain: "<домен пользователя>" } — привязать свой домен к сайту; { action: "domain", product } — узнать, как дела; { action: "domain", product, check: true } — проверить DNS сейчас; { action: "domain", product, remove: true } — отвязать.
   Записи DNS из ответа называй ДОСЛОВНО и обязательно скажи удалить у этих имён остальные A-записи и ВСЕ AAAA. Не говори «домен работает», пока domain.status не "active". Свой домен бесплатный. Свой домен бывает только у сайта, один на продукт.
-- { action: "create", kind: "site"|"bot", name, prompt? } — создать продукт. ДО вызова назови условия: первый месяц бесплатно, дальше ${RENT_TOKEN_TEXT} токенов в месяц, не больше ${DEFAULT_MAX_PRODUCTS} продуктов. Для бота сервер сам пришлёт защищённую карточку ключей — ключи в переписке не проси.
+- { action: "create", kind: "site"|"bot", name, prompt? } — создать продукт. ДО вызова назови условия: первый месяц бесплатно — для первых ${FREE_MONTH_PRODUCTS} продуктов человека за всё время (удалённые тоже считаются), дальше сразу ${RENT_TOKEN_TEXT} токенов в месяц; не больше ${DEFAULT_MAX_PRODUCTS} продуктов одновременно. Для бота сервер сам пришлёт защищённую карточку ключей — ключи в переписке не проси.
 - { action: "delete", product } — удалить: сервер пришлёт карточку с кнопкой, удаление только по её нажатию; вернуть можно ${DELETE_GRACE_DAYS} дней. { action: "restore", product } — вернуть удалённый. { action: "revert", product, turnId? } — откатить правку.
 - { action: "status", actionId } — чем кончилась карточка. Не говори «создал» или «удалил», пока status не вернёт done.
 Каждый ответ инструмента несёт поле say — что сказать пользователю. Следуй ему: пересказывай его, не выдумывай своё.

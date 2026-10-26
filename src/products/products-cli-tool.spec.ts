@@ -185,7 +185,7 @@ describe('инструмент продуктов для локального CL
 // действия manage_product обязаны быть в обоих, с числами из констант.
 describe('промпт CLI знает весь жизненный цикл продукта', () => {
   const { PRODUCTS_CLI_PROMPT } = require('./products-cli-tool');
-  const { RENT_TOKENS } = require('./rent.service');
+  const { RENT_TOKENS, FREE_MONTH_PRODUCTS } = require('./rent.service');
   const { DEFAULT_MAX_PRODUCTS } = require('./limits.service');
   const { DELETE_GRACE_DAYS } = require('./product-actions.service');
 
@@ -199,5 +199,12 @@ describe('промпт CLI знает весь жизненный цикл пр�
     expect(PRODUCTS_CLI_PROMPT).toContain(String(RENT_TOKENS).replace(/\B(?=(\d{3})+(?!\d))/g, ' '));
     expect(PRODUCTS_CLI_PROMPT).toContain(`не больше ${DEFAULT_MAX_PRODUCTS} продуктов`);
     expect(PRODUCTS_CLI_PROMPT).toContain(`вернуть можно ${DELETE_GRACE_DAYS} дней`);
+  });
+
+  // Решение владельца 26.10.2026: бесплатный месяц — не каждому продукту, а
+  // только первым FREE_MONTH_PRODUCTS за всю историю аккаунта.
+  it('бесплатный месяц — из константы FREE_MONTH_PRODUCTS, не литералом', () => {
+    expect(PRODUCTS_CLI_PROMPT).toContain(`первых ${FREE_MONTH_PRODUCTS} продуктов`);
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/удалённые тоже считаются/);
   });
 });

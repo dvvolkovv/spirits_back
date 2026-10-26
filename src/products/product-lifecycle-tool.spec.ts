@@ -17,7 +17,7 @@ function harness() {
     }),
   };
   const lifecycle = {
-    createSite: jest.fn(async () => ({ ok: true, productId: 'p-new', slug: 'magazin', domain: 'magazin.c.linkeon.io' })),
+    createSite: jest.fn(async () => ({ ok: true, productId: 'p-new', slug: 'magazin', domain: 'magazin.c.linkeon.io', freeMonth: true })),
     openCreateBot: jest.fn(async () => ({ ok: true, actionId: 'a1', expiresAt: '2026-10-25T10:30:00.000Z' })),
     openDelete: jest.fn(async () => ({ ok: true, actionId: 'a2', expiresAt: '2026-10-25T10:30:00.000Z' })),
     restore: jest.fn(async () => ({ ok: true, status: 'sleeping', waking: true })),
@@ -36,6 +36,28 @@ describe('новые действия инструмента', () => {
     const r = await h.svc.execute('u1', { action: 'create', kind: 'site', name: 'Магазин', prompt: 'лендинг' }, 'web', 'turn-1');
     expect(r).toMatchObject({ ok: true, created: { kind: 'site', productId: 'p-new' } });
     expect(h.lifecycle.createSite).toHaveBeenCalledWith({ userId: 'u1', name: 'Магазин', prompt: 'лендинг', channel: 'web' });
+  });
+
+  // Решение владельца 26.10.2026: say обязан назвать, попал ли ИМЕННО ЭТОТ
+  // продукт в бесплатный месяц — ассистент узнаёт это только из ответа
+  // инструмента, не от себя.
+  it('create site — бесплатный первый месяц назван прямо', async () => {
+    const h = harness();
+    h.lifecycle.createSite.mockResolvedValue({ ok: true, productId: 'p-new', slug: 'magazin', domain: 'magazin.c.linkeon.io', freeMonth: true } as any);
+    const r: any = await h.svc.execute('u1', { action: 'create', kind: 'site', name: 'Магазин' }, 'web', 'turn-1');
+    expect(r.created.freeMonth).toBe(true);
+    expect(r.say).toMatch(/первый месяц аренды бесплатный/i);
+    expect(r.say).not.toMatch(/спишется при первом обороте/);
+  });
+
+  it('create site — не первый бесплатный месяц: аренда и сон за нехватку токенов названы сразу', async () => {
+    const h = harness();
+    h.lifecycle.createSite.mockResolvedValue({ ok: true, productId: 'p-new', slug: 'magazin', domain: 'magazin.c.linkeon.io', freeMonth: false } as any);
+    const r: any = await h.svc.execute('u1', { action: 'create', kind: 'site', name: 'Магазин' }, 'web', 'turn-1');
+    expect(r.created.freeMonth).toBe(false);
+    expect(r.say).toMatch(/50 000 токенов спишется при первом обороте/);
+    expect(r.say).toMatch(/не хватит баланса — продукт уснёт до пополнения/);
+    expect(r.say).not.toMatch(/первый месяц аренды бесплатный/i);
   });
 
   it('create bot — карточка с меткой хода, ключи не просить', async () => {
@@ -167,6 +189,20 @@ describe('новые действия инструмента', () => {
     h.actions.get.mockResolvedValue({ id: 'a2', user_id: 'u1', product_id: 'p1', kind: 'delete', status: 'done', channel: 'web', confirmed_via: 'chat', payload: {}, result: { restoreUntil: '2026-11-24T10:00:00.000Z' }, created_at: new Date(), expires_at: new Date(Date.now() + 60_000), resolved_at: new Date(), tg_chat_id: null, tg_message_id: null, product_name: 'Магазин', purge_after: null } as any);
     const r = await h.svc.execute('u1', { action: 'status', actionId: 'a2' });
     expect(r).toMatchObject({ ok: true, action: { status: 'done', restoreUntil: '2026-11-24T10:00:00.000Z' } });
+  });
+
+  it('status — бот создан, достался бесплатный месяц', async () => {
+    const h = harness();
+    h.actions.get.mockResolvedValue({ id: 'a6', user_id: 'u1', product_id: 'p-new', kind: 'create_bot', status: 'done', channel: 'web', confirmed_via: 'chat', payload: {}, result: { productId: 'p-new', botUsername: 'shop_bot', freeMonth: true }, created_at: new Date(), expires_at: new Date(Date.now() + 60_000), resolved_at: new Date(), tg_chat_id: null, tg_message_id: null, product_name: 'Бот', purge_after: null } as any);
+    const r: any = await h.svc.execute('u1', { action: 'status', actionId: 'a6' });
+    expect(r.say).toMatch(/первый месяц аренды бесплатный/i);
+  });
+
+  it('status — бот создан, аренда сразу платная', async () => {
+    const h = harness();
+    h.actions.get.mockResolvedValue({ id: 'a7', user_id: 'u1', product_id: 'p-new', kind: 'create_bot', status: 'done', channel: 'web', confirmed_via: 'chat', payload: {}, result: { productId: 'p-new', botUsername: 'shop_bot', freeMonth: false }, created_at: new Date(), expires_at: new Date(Date.now() + 60_000), resolved_at: new Date(), tg_chat_id: null, tg_message_id: null, product_name: 'Бот', purge_after: null } as any);
+    const r: any = await h.svc.execute('u1', { action: 'status', actionId: 'a7' });
+    expect(r.say).toMatch(/50 000 токенов спишется при первом обороте/);
   });
 
   it('status — pending/working тоже ok:true: карточка только что заведена, это не отказ', async () => {

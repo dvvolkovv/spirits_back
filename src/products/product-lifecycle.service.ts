@@ -148,16 +148,16 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
   }
 
   async createSite(i: { userId: string; name: unknown; prompt?: unknown; channel: ActionChannel }):
-    Promise<{ ok: true; productId: string; slug: string; domain: string | null } | LifecycleFail> {
+    Promise<{ ok: true; productId: string; slug: string; domain: string | null; freeMonth: boolean } | LifecycleFail> {
     const name = cleanName(i.name);
     if (!name) return { ok: false, reason: 'bad_name', message: `Имя продукта — от 1 до ${NAME_MAX} знаков` };
     const isAdmin = await this.isAdmin(i.userId);
     let lastError: any = null;
-    let created: { productId: string; slug: string } | null = null;
+    let created: { productId: string; slug: string; freeMonth: boolean } | null = null;
     for (const slug of siteSlugCandidates(name, this.suffix)) {
       try {
-        const { productId } = await this.provisioning.create({ userId: i.userId, name, slug, kind: 'site', secrets: {}, isAdmin });
-        created = { productId, slug };
+        const { productId, freeMonth } = await this.provisioning.create({ userId: i.userId, name, slug, kind: 'site', secrets: {}, isAdmin });
+        created = { productId, slug, freeMonth };
         break;
       } catch (e: any) {
         lastError = e;
@@ -186,7 +186,7 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     } catch (e: any) {
       this.logger.warn(`сайт ${created.productId} создан, но первая правка/домен/журнал не доделаны: ${e?.stack ?? e?.message ?? e}`);
     }
-    return { ok: true, productId: created.productId, slug: created.slug, domain };
+    return { ok: true, productId: created.productId, slug: created.slug, domain, freeMonth: created.freeMonth };
   }
 
   async openCreateBot(i: { userId: string; name: unknown; prompt?: unknown; channel: ActionChannel; turn: string | null }):
@@ -216,7 +216,7 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
    * (токен, занятый бот, имя ключа), возвращает её в ожидание с ошибкой.
    */
   async completeCreateBot(i: { userId: string; actionId: string; set: unknown; via: ConfirmedVia }):
-    Promise<{ ok: true; productId: string } | LifecycleFail> {
+    Promise<{ ok: true; productId: string; freeMonth: boolean } | LifecycleFail> {
     const row = await this.actions.claim(i.userId, i.actionId, i.via);
     if (!row || row.kind !== 'create_bot') {
       if (row) await this.actions.release(row.id, row.result ?? {});
@@ -260,7 +260,7 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       // чем первая успела записать строку. Гонку между ними закрывает
       // партиционный UNIQUE products_tg_bot_live (009_product_actions.sql),
       // а не порядок операторов здесь.
-      const { productId } = await this.provisioning.create({
+      const { productId, freeMonth } = await this.provisioning.create({
         userId: i.userId, name, slug: slugWithSuffix(name, this.suffix(), 'bot'), kind: 'bot', secrets,
         isAdmin: await this.isAdmin(i.userId), tgBotId: check.id,
       });
@@ -274,8 +274,15 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       } catch (e: any) {
         this.logger.warn(`первая правка бота ${productId} не поставлена: ${e?.message}`);
       }
-      await this.actions.finish(row.id, 'done', { productId, botUsername: check.username }, productId);
-      return { ok: true, productId };
+      // freeMonth — только теперь, по итогу create(): до завершения
+      // карточки (M8, открытие action заранее) этого не знал никто. Кладём
+      // его в result карточки, а не только в возврат этого метода: вызывающий
+      // контроллер (product-actions.controller.ts) результат completeCreateBot
+      // не читает вовсе — исход человек узнаёт отдельным запросом
+      // (action="status" / GET product-actions/:id), и без этого поля там
+      // ассистент не смог бы сказать, попал ли бот в бесплатный месяц.
+      await this.actions.finish(row.id, 'done', { productId, botUsername: check.username, freeMonth }, productId);
+      return { ok: true, productId, freeMonth };
     } catch (e: any) {
       if (!(e instanceof HttpException)) {
         // Непонятная ошибка (обрыв с базой, таймаут пула) между claim и
