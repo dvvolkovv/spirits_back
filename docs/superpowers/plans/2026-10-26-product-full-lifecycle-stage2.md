@@ -3661,3 +3661,649 @@ git -C $B add src/products/product-keys.service.ts && git -C $B commit -q -m "pr
 Run (нода, бэк): `src/products/product-keys.service.spec.ts src/products/product-keys.pg.spec.ts src/products/provisioning.rekey-purge.spec.ts`. Expected: PASS. Затем tsc бэка.
 
 ---
+
+### Task 14: Сервер — обход стирания и резервные копии
+
+**Files:**
+- Create: `src/products/product-purge.service.ts`
+- Modify: `src/products/product-lifecycle.service.ts` (`sleepDeletedTick` ~215–228: не снимать `purge`)
+- Test: `src/products/product-purge.service.spec.ts` (новый: чистые функции пути), `src/products/product-purge.pg.spec.ts` (новый: обход и копии против живой базы и временного каталога)
+
+- [ ] **Step 1: Тесты**
+
+`src/products/product-purge.service.spec.ts`:
+
+```ts
+import { backupPathFor, reposRoot } from './product-purge.service';
+
+const ROOT = '/home/owner/product-repos';
+
+describe('путь резервной копии — только ровно <корень>/<слаг>.git', () => {
+  it('repo_url скрипта product-backup-setup.sh — годится', () => {
+    expect(backupPathFor(`backup@10.0.0.1:${ROOT}/shop.git`, 'shop', ROOT)).toBe(`${ROOT}/shop.git`);
+    expect(backupPathFor(`${ROOT}/shop.git`, 'shop', ROOT)).toBe(`${ROOT}/shop.git`);
+  });
+
+  it.each([
+    [`backup@10.0.0.1:${ROOT}/other.git`, 'shop'],
+    [`backup@10.0.0.1:${ROOT}/../product-repos/shop.git/..`, 'shop'],
+    [`backup@10.0.0.1:/home/owner/elsewhere/shop.git`, 'shop'],
+    [`backup@10.0.0.1:${ROOT}/shop.git`, '..'],
+    [`backup@10.0.0.1:${ROOT}/shop.git`, ''],
+    [`backup@10.0.0.1:${ROOT}`, 'shop'],
+    ['https://github.com/x/shop.git', 'shop'],
+    ['', 'shop'],
+  ])('%j при слаге %j — не наша копия, null', (url, slug) => {
+    expect(backupPathFor(url, slug, ROOT)).toBeNull();
+  });
+
+  it('корень — абсолютный и не у самого корня ФС', () => {
+    expect(reposRoot({ PRODUCT_REPOS_DIR: '/srv/backups/product-repos' } as any)).toBe('/srv/backups/product-repos');
+    expect(() => reposRoot({ PRODUCT_REPOS_DIR: 'relative/dir' } as any)).toThrow(/абсолютн/);
+    expect(() => reposRoot({ PRODUCT_REPOS_DIR: '/' } as any)).toThrow(/корн/);
+    expect(reposRoot({} as any)).toMatch(/\/product-repos$/);
+  });
+});
+```
+
+`src/products/product-purge.pg.spec.ts`:
+
+```ts
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { Pool } from 'pg';
+import { MIGRATIONS } from './products.service';
+import { ProductPurgeService } from './product-purge.service';
+import { ProductLifecycleService } from './product-lifecycle.service';
+
+const PG = process.env.PROVISIONING_PG_URL;
+const maybe = PG ? describe : describe.skip;
+
+maybe('обход стирания и резервные копии против живого Postgres', () => {
+  let pool: Pool;
+  let svc: ProductPurgeService;
+  let tmp: string;
+
+  async function deleted(o: { purgeAfterMs: number; purged?: boolean; repoUrl?: string | null; slug?: string }) {
+    const id = crypto.randomUUID();
+    const slug = o.slug ?? `d-${id.slice(0, 8)}`;
+    await pool.query(
+      `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash,
+                             archived_at, purge_after, purged_at, repo_url)
+       VALUES ($1, 'u1', 'П', $2, 'site', 'archived', '/product', $3, now() - interval '31 days',
+               now() + make_interval(secs => $4::double precision / 1000), CASE WHEN $5 THEN now() END, $6)`,
+      [id, slug, `h-${id}`, o.purgeAfterMs, !!o.purged, o.repoUrl ?? null],
+    );
+    return { id, slug };
+  }
+  const jobsOf = async (id: string) =>
+    (await pool.query(`SELECT kind, status FROM product_provision_jobs WHERE product_id = $1 ORDER BY created_at`, [id])).rows;
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: PG, max: 4 });
+    for (const f of MIGRATIONS) await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', f), 'utf8'));
+    svc = new ProductPurgeService({ query: (s: string, p?: any[]) => pool.query(s, p) } as any);
+  });
+  beforeEach(async () => {
+    await pool.query('TRUNCATE products, product_provision_jobs, product_actions RESTART IDENTITY CASCADE');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pl2-purge-'));
+    process.env.PRODUCT_REPOS_DIR = path.join(tmp, 'product-repos');
+    fs.mkdirSync(process.env.PRODUCT_REPOS_DIR);
+  });
+  afterEach(() => {
+    delete process.env.PRODUCT_REPOS_DIR;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+  afterAll(async () => {
+    await pool.query('TRUNCATE products, product_provision_jobs, product_actions RESTART IDENTITY CASCADE');
+    await pool.end();
+  });
+
+  it('стирание ставится только удалённому после срока, не стёртому и без активного задания', async () => {
+    const due = await deleted({ purgeAfterMs: -60_000 });
+    const early = await deleted({ purgeAfterMs: 86_400_000 });
+    const gone = await deleted({ purgeAfterMs: -60_000, purged: true });
+    const busy = await deleted({ purgeAfterMs: -60_000 });
+    await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'sleep', 'queued')`, [busy.id]);
+
+    expect(await svc.queuePurges()).toBe(1);
+    expect(await jobsOf(due.id)).toEqual([{ kind: 'purge', status: 'queued' }]);
+    expect(await jobsOf(early.id)).toEqual([]);
+    expect(await jobsOf(gone.id)).toEqual([]);
+    expect(await svc.queuePurges()).toBe(0);
+  });
+
+  it('после трёх провалов подряд стирание не ставится', async () => {
+    const p = await deleted({ purgeAfterMs: -60_000 });
+    for (let i = 0; i < 3; i++) {
+      await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'purge', 'failed')`, [p.id]);
+    }
+    expect(await svc.queuePurges()).toBe(0);
+  });
+
+  it('сон удалённых не снимает стоящее в очереди стирание', async () => {
+    const p = await deleted({ purgeAfterMs: -60_000 });
+    await svc.queuePurges();
+    const pg = { query: (s: string, q?: any[]) => pool.query(s, q) };
+    const lifecycle = new ProductLifecycleService(pg as any, {} as any, {} as any, {} as any, {} as any, {} as any);
+    await lifecycle.sleepDeletedTick();
+    expect(await jobsOf(p.id)).toEqual([{ kind: 'purge', status: 'queued' }]);
+  });
+
+  it('копия стёртого продукта удаляется, repo_url обнуляется; чужие и неподходящие — не трогаются', async () => {
+    const root = process.env.PRODUCT_REPOS_DIR!;
+    const mine = await deleted({ purgeAfterMs: -60_000, purged: true, slug: 'gone-shop', repoUrl: `backup@10.0.0.1:${root}/gone-shop.git` });
+    fs.mkdirSync(path.join(root, 'gone-shop.git'));
+    fs.writeFileSync(path.join(root, 'gone-shop.git', 'HEAD'), 'ref: refs/heads/master\n');
+    const neighbour = path.join(root, 'live-shop.git');
+    fs.mkdirSync(neighbour);
+    const foreign = await deleted({ purgeAfterMs: -60_000, purged: true, slug: 'far-shop', repoUrl: 'backup@10.0.0.1:/somewhere/else/far-shop.git' });
+    const alive = await deleted({ purgeAfterMs: 86_400_000, slug: 'kept-shop', repoUrl: `backup@10.0.0.1:${root}/kept-shop.git` });
+    fs.mkdirSync(path.join(root, 'kept-shop.git'));
+
+    expect(await svc.removeBackups()).toBe(1);
+
+    expect(fs.existsSync(path.join(root, 'gone-shop.git'))).toBe(false);
+    expect(fs.existsSync(neighbour)).toBe(true);
+    expect(fs.existsSync(path.join(root, 'kept-shop.git'))).toBe(true);
+    const urls = await pool.query(`SELECT id, repo_url FROM products WHERE id = ANY($1::uuid[])`, [[mine.id, foreign.id, alive.id]]);
+    const byId = Object.fromEntries(urls.rows.map((r: any) => [r.id, r.repo_url]));
+    expect(byId[mine.id]).toBeNull();
+    expect(byId[foreign.id]).toBe('backup@10.0.0.1:/somewhere/else/far-shop.git');
+    expect(byId[alive.id]).not.toBeNull();
+  });
+
+  it('символическая ссылка на месте копии не разыменовывается и не удаляется', async () => {
+    const root = process.env.PRODUCT_REPOS_DIR!;
+    const target = path.join(tmp, 'precious');
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, 'keep'), '1');
+    fs.symlinkSync(target, path.join(root, 'link-shop.git'));
+    await deleted({ purgeAfterMs: -60_000, purged: true, slug: 'link-shop', repoUrl: `backup@10.0.0.1:${root}/link-shop.git` });
+
+    expect(await svc.removeBackups()).toBe(0);
+    expect(fs.existsSync(path.join(target, 'keep'))).toBe(true);
+  });
+
+  it('копии уже нет — repo_url всё равно обнуляется', async () => {
+    const root = process.env.PRODUCT_REPOS_DIR!;
+    const p = await deleted({ purgeAfterMs: -60_000, purged: true, slug: 'no-copy', repoUrl: `backup@10.0.0.1:${root}/no-copy.git` });
+    expect(await svc.removeBackups()).toBe(1);
+    expect((await pool.query(`SELECT repo_url FROM products WHERE id = $1`, [p.id])).rows[0].repo_url).toBeNull();
+  });
+});
+```
+
+- [ ] **Step 2: Коммит, прогон — FAIL** (`Cannot find module './product-purge.service'`)
+
+```bash
+git -C $B add src/products/product-purge.service.spec.ts src/products/product-purge.pg.spec.ts && git -C $B commit -q -m "test(products): обход стирания и резервные копии (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/product-purge.service.spec.ts src/products/product-purge.pg.spec.ts`.
+
+- [ ] **Step 3: Реализация**
+
+`src/products/product-purge.service.ts`:
+
+```ts
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { PgService } from '../common/services/pg.service';
+import { SLUG_RE } from './provisioning.service';
+
+/**
+ * Раз в час, а не раз в сутки: API перезапускается выкатами несколько раз в
+ * день, и суточный таймер не доживал бы до первого срабатывания никогда.
+ * Условие стирания — purge_after <= now(), так что продукт стирается в первый
+ * час после срока. Первый обход — через час после старта, а не на старте:
+ * выкат сервера идёт раньше выката агента машины (deploy.sh, PHASE 2 и 4), и
+ * обход на старте отдал бы purge агенту, который его ещё не знает.
+ */
+export const PURGE_TICK_MS = 60 * 60 * 1000;
+/** Тот же потолок, что у сна удалённого (queueSleepForDeleted). */
+const PURGE_FAIL_CAP = 3;
+
+/**
+ * Корень резервных копий: PRODUCT_REPOS_DIR или ~/product-repos пользователя
+ * процесса API — туда их кладёт scripts/product-backup-setup.sh
+ * (REPO_ROOT=/home/dvolkov/product-repos, API на проде работает от dvolkov).
+ * Абсолютный и не ближе двух уровней к корню ФС — иначе стирать из него нельзя.
+ */
+export function reposRoot(env: NodeJS.ProcessEnv = process.env): string {
+  const raw = env.PRODUCT_REPOS_DIR;
+  const root = raw ? raw : path.join(os.homedir(), 'product-repos');
+  if (!path.isAbsolute(root)) throw new Error(`PRODUCT_REPOS_DIR не абсолютный: ${JSON.stringify(raw)}`);
+  const resolved = path.resolve(root);
+  if (resolved.split('/').filter(Boolean).length < 2) throw new Error(`каталог копий ${resolved} слишком близко к корню ФС`);
+  return resolved;
+}
+
+/**
+ * Путь копии ЭТОГО продукта на ЭТОЙ машине — или null.
+ *
+ * Стираем только то, на что указывает repo_url продукта, и только если это
+ * ровно `<корень>/<слаг>.git`: слаг сверяется SLUG_RE, путь нормализуется, и
+ * результат обязан лежать прямо в корне. Копия другой машины (repo_url с
+ * чужим путём), чужой формы (https) или с `..` — не наша.
+ */
+export function backupPathFor(repoUrl: string, slug: string, root: string): string | null {
+  if (typeof slug !== 'string' || !SLUG_RE.test(slug)) return null;
+  const m = /^(?:(?:[^@/:\s]+@)?[^/:\s]+:)?(\/\S+)$/.exec(String(repoUrl ?? ''));
+  if (!m) return null;
+  const want = path.join(root, `${slug}.git`);
+  if (path.dirname(want) !== root) return null;
+  return path.resolve(m[1]) === want ? want : null;
+}
+
+/**
+ * Стирание удалённых продуктов (очередь 2): ставит задание purge агенту машины
+ * тем, у кого вышел срок возврата, и стирает резервные копии уже стёртых.
+ * Пометку «стёрт» ставит отчёт агента (ProvisioningService.completePurgeJob).
+ */
+@Injectable()
+export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(ProductPurgeService.name);
+  private timer?: NodeJS.Timeout;
+  /** Разовые предупреждения на процесс — тот же приём, что warnedSleepCap. */
+  private warned = new Set<string>();
+
+  constructor(private readonly pg: PgService) {}
+
+  onModuleInit() {
+    this.timer = setInterval(() => void this.tick(), PURGE_TICK_MS);
+    // unref, иначе таймер держит процесс и jest не завершается.
+    this.timer.unref?.();
+  }
+
+  onModuleDestroy() {
+    if (this.timer) clearInterval(this.timer);
+  }
+
+  async tick(): Promise<void> {
+    try {
+      await this.queuePurges();
+    } catch (e: any) {
+      this.logger.error(`обход стирания: ${e?.message}`);
+    }
+    try {
+      await this.removeBackups();
+    } catch (e: any) {
+      this.logger.error(`стирание резервных копий: ${e?.message}`);
+    }
+  }
+
+  async queuePurges(): Promise<number> {
+    const capped = await this.pg.query(
+      `SELECT p.id, p.slug FROM products p
+        WHERE p.archived_at IS NOT NULL AND p.purged_at IS NULL AND p.purge_after <= now()
+          AND (SELECT count(*) FROM product_provision_jobs j
+                WHERE j.product_id = p.id AND j.kind = 'purge' AND j.status = 'failed') >= $1`,
+      [PURGE_FAIL_CAP],
+    );
+    for (const row of capped.rows) {
+      if (this.warned.has(`cap:${row.id}`)) continue;
+      this.warned.add(`cap:${row.id}`);
+      this.logger.error(`стирание продукта ${row.id} (${row.slug}) не ставится: ${PURGE_FAIL_CAP} провала подряд — нужен ручной разбор`);
+    }
+    // FOR UPDATE OF p — тот же замок, что у сна удалённых: возврат (restore)
+    // держит строку продукта до COMMIT, и стирание, прочитавшее снимок до
+    // возврата, иначе встало бы вернувшемуся продукту.
+    const r = await this.pg.query(
+      `INSERT INTO product_provision_jobs (product_id, kind, status)
+       SELECT p.id, 'purge', 'queued' FROM products p
+        WHERE p.archived_at IS NOT NULL AND p.purged_at IS NULL AND p.status = 'archived'
+          AND p.purge_after IS NOT NULL AND p.purge_after <= now()
+          AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
+                           WHERE j.product_id = p.id AND j.status IN ('queued','running'))
+          AND (SELECT count(*) FROM product_provision_jobs j
+                WHERE j.product_id = p.id AND j.kind = 'purge' AND j.status = 'failed') < $1
+          FOR UPDATE OF p
+       ON CONFLICT DO NOTHING
+       RETURNING product_id`,
+      [PURGE_FAIL_CAP],
+    );
+    return r.rows.length;
+  }
+
+  async removeBackups(): Promise<number> {
+    const root = reposRoot();
+    const r = await this.pg.query(
+      `SELECT id, slug, repo_url FROM products
+        WHERE purged_at IS NOT NULL AND repo_url IS NOT NULL
+        ORDER BY purged_at LIMIT 20`,
+    );
+    let removed = 0;
+    for (const p of r.rows) {
+      const where = backupPathFor(p.repo_url, p.slug, root);
+      if (!where) {
+        this.warnOnce(`foreign:${p.id}`, `резервная копия стёртого продукта ${p.slug} не на этой машине или не по форме (${p.repo_url}) — стереть руками`);
+        continue;
+      }
+      try {
+        let st: fs.Stats | null = null;
+        try {
+          st = await fs.promises.lstat(where);
+        } catch (e: any) {
+          if (e?.code !== 'ENOENT') throw e;
+        }
+        // lstat, а не stat: символическую ссылку не разыменовываем — она
+        // могла бы увести удаление куда угодно.
+        if (st && (st.isSymbolicLink() || !st.isDirectory())) {
+          this.warnOnce(`odd:${p.id}`, `на месте копии ${where} не каталог — не трогаю, стереть руками`);
+          continue;
+        }
+        if (st) await fs.promises.rm(where, { recursive: true, force: true });
+        await this.pg.query(`UPDATE products SET repo_url = NULL WHERE id = $1 AND purged_at IS NOT NULL`, [p.id]);
+        removed += 1;
+      } catch (e: any) {
+        this.logger.error(`резервная копия ${p.slug} не стёрта: ${e?.message}`);
+      }
+    }
+    return removed;
+  }
+
+  private warnOnce(key: string, message: string): void {
+    if (this.warned.has(key)) return;
+    this.warned.add(key);
+    this.logger.warn(message);
+  }
+}
+```
+
+В `src/products/product-lifecycle.service.ts`, в `sleepDeletedTick`, строку
+
+```sql
+          AND j.status = 'queued' AND j.kind <> 'sleep'`,
+```
+заменить на
+
+```sql
+          AND j.status = 'queued' AND j.kind NOT IN ('sleep','purge')`,
+```
+и дописать в комментарий над запросом: «Стирание (purge, очередь 2) — тоже задание архивного продукта, его не снимаем».
+
+- [ ] **Step 4: Коммит, прогон — PASS**
+
+```bash
+git -C $B add src/products && git -C $B commit -q -m "products: почасовой обход стирания удалённых; стирание резервных копий по строгому пути" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/product-purge.service.spec.ts src/products/product-purge.pg.spec.ts src/products/product-lifecycle.pg.spec.ts src/products/product-lifecycle.service.spec.ts`. Expected: PASS. Затем tsc бэка.
+
+---
+
+### Task 15: Сервер — действие `keys` инструмента, отправка карточки, «уже стёрт», регистрация
+
+**Files:**
+- Modify: `src/products/product-lifecycle-tool.ts` (конструктор, новые `keys` и `resolveGone`, `restore`, `actionStatus`)
+- Modify: `src/products/product-tool.service.ts` (`execute` ~315–352, `PRODUCT_TOOLS` ~702–790)
+- Modify: `src/products/product-actions.controller.ts` (DTO, конструктор, ветка `keys`)
+- Modify: `src/products/products.module.ts` (`ProductKeysService`, `ProductPurgeService`)
+- Modify: `src/products/product-tool.defs.spec.ts` (~10–18, ~73–79, ~104–108)
+- Test: `src/products/product-lifecycle-tool.keys.spec.ts` (новый), `src/products/product-actions.controller.keys.spec.ts` (новый)
+
+- [ ] **Step 1: Тесты**
+
+`src/products/product-lifecycle-tool.keys.spec.ts`:
+
+```ts
+import { ProductToolService } from './product-tool.service';
+import { ProductLifecycleTool } from './product-lifecycle-tool';
+
+const PRODUCT = { id: 'p1', name: 'Бот отчётов', slug: 'bot-otchet', domain: null, kind: 'bot', status: 'running' };
+
+function harness(o: { gone?: boolean } = {}) {
+  const pg = {
+    query: jest.fn(async (sql: string) => {
+      if (sql.includes('purged_at IS NOT NULL OR purge_after <= now()')) {
+        return { rows: o.gone ? [{ id: 'p0', name: 'Старый сайт', slug: 'old', kind: 'site', purge_after: '2026-09-01T00:00:00.000Z' }] : [] };
+      }
+      if (sql.includes('archived_at IS NOT NULL')) return { rows: [] };
+      if (sql.includes('FROM products')) return { rows: [PRODUCT] };
+      return { rows: [] };
+    }),
+  };
+  const keysSvc = {
+    open: jest.fn(async () => ({ ok: true, actionId: 'a-keys', expiresAt: '2026-10-26T10:30:00.000Z', keyNames: ['BOT_TOKEN', 'OZON_API_KEY'] })),
+  };
+  const actions = { get: jest.fn(async () => null) };
+  const tool = new ProductLifecycleTool(pg as any, {} as any, actions as any, keysSvc as any);
+  const svc = new ProductToolService(pg as any, { enqueue: jest.fn() } as any, {} as any, tool);
+  return { svc, keysSvc, actions };
+}
+
+describe('действие keys', () => {
+  it('открывает карточку: в ответе имена ключей, значений нет, ключи в переписке не просить', async () => {
+    const h = harness();
+    const r: any = await h.svc.execute('u1', { action: 'keys', product: 'бот отчётов' }, 'web', '11111111-2222-4333-8444-555555555555');
+    expect(h.keysSvc.open).toHaveBeenCalledWith({ userId: 'u1', productId: 'p1', channel: 'web', turn: '11111111-2222-4333-8444-555555555555' });
+    expect(r).toMatchObject({ ok: true, pending: { actionId: 'a-keys', kind: 'keys' }, keyNames: ['BOT_TOKEN', 'OZON_API_KEY'] });
+    expect(r.say).toMatch(/Под твоим ответом появится защищённая карточка/);
+    expect(r.say).toMatch(/в переписке ключи не проси/);
+    expect(r.say).toMatch(/не говори «ключи обновлены»/);
+  });
+
+  it('в Telegram — «ниже сообщение с кнопкой»; без метки хода — кабинет', async () => {
+    const h = harness();
+    const tg: any = await h.svc.execute('u1', { action: 'keys', product: 'бот' }, 'telegram', '11111111-2222-4333-8444-555555555555');
+    expect(tg.say).toMatch(/Ниже придёт сообщение с кнопкой/);
+    const cab: any = await h.svc.execute('u1', { action: 'keys', product: 'бот' }, 'web', null);
+    expect(cab.say).toMatch(/в кабинете/);
+  });
+
+  it('отказ сервиса (спит) — пересказ без карточки', async () => {
+    const h = harness();
+    h.keysSvc.open.mockResolvedValueOnce({ ok: false, reason: 'sleeping', message: 'Продукт спит: …' } as any);
+    const r: any = await h.svc.execute('u1', { action: 'keys', product: 'бот' }, 'web', null);
+    expect(r).toMatchObject({ ok: false, reason: 'sleeping' });
+  });
+
+  it('статус карточки ключей: done — «ключи обновлены», working — «перезапускается»', async () => {
+    const h = harness();
+    const base = { id: 'a-keys', user_id: 'u1', product_id: 'p1', kind: 'keys', channel: 'web', confirmed_via: 'chat', payload: { keyNames: [] },
+      created_at: new Date(), expires_at: new Date(Date.now() + 60_000), resolved_at: null, tg_chat_id: null, tg_message_id: null, product_name: 'Бот' };
+    h.actions.get.mockResolvedValueOnce({ ...base, status: 'done', result: { keyNames: ['BOT_TOKEN'] } } as any);
+    expect(((await h.svc.execute('u1', { action: 'status', actionId: 'a-keys' })) as any).say).toMatch(/ключи обновлены/i);
+    h.actions.get.mockResolvedValueOnce({ ...base, status: 'working', result: null } as any);
+    expect(((await h.svc.execute('u1', { action: 'status', actionId: 'a-keys' })) as any).say).toMatch(/перезапускается/);
+  });
+});
+
+describe('restore стёртого', () => {
+  it('«уже стёрт» вместо «такого нет»', async () => {
+    const h = harness({ gone: true });
+    const r: any = await h.svc.execute('u1', { action: 'restore', product: 'старый сайт' });
+    expect(r).toMatchObject({ ok: false, reason: 'purged' });
+    expect(r.say).toMatch(/уже стёрт/);
+  });
+});
+```
+
+`src/products/product-actions.controller.keys.spec.ts`:
+
+```ts
+import { ProductActionsController } from './product-actions.controller';
+
+const ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+
+describe('отправка карточки ключей', () => {
+  it('set и remove уходят в сервис ключей; ответ — вид без значений', async () => {
+    const row = { id: ID, user_id: 'u1', product_id: 'p1', kind: 'keys', status: 'pending', channel: 'web', confirmed_via: null,
+      payload: { keyNames: ['A'] }, result: null, created_at: new Date(), expires_at: new Date(Date.now() + 60_000),
+      resolved_at: null, tg_chat_id: null, tg_message_id: null, product_name: 'Бот' };
+    const actions = { get: jest.fn(async () => row) };
+    const keys = { complete: jest.fn(async () => ({ ok: true, queued: true })) };
+    const limiter = { check: jest.fn(async () => undefined) };
+    const ctrl = new ProductActionsController(actions as any, {} as any, limiter as any, keys as any);
+    const out = await ctrl.submit({ userId: 'u1' }, ID, { set: { B: 'секрет-значение' }, remove: ['A'], via: 'chat' } as any);
+    expect(keys.complete).toHaveBeenCalledWith({ userId: 'u1', actionId: ID, set: { B: 'секрет-значение' }, remove: ['A'], via: 'chat' });
+    expect(JSON.stringify(out)).not.toContain('секрет-значение');
+  });
+});
+```
+
+В `src/products/product-tool.defs.spec.ts`:
+- тест «инструмент ровно один, с восемью действиями» → «…с девятью действиями», ожидаемый список: `['create', 'delete', 'domain', 'edit', 'keys', 'list', 'restore', 'revert', 'status']`;
+- в тесте «ключи в текст правки не уезжают…» строку `expect(d).toMatch(/Сменить ключи после создания пока нельзя/);` заменить на:
+
+```ts
+    expect(d).not.toMatch(/пока нельзя/);
+    expect(d).toMatch(/action="keys"/);
+    expect(d).toMatch(/предложи карточку keys/);
+```
+- в «каждое действие названо в описании» в список добавить `'keys'`.
+
+- [ ] **Step 2: Коммит, прогон — FAIL**
+
+```bash
+git -C $B add src/products/product-lifecycle-tool.keys.spec.ts src/products/product-actions.controller.keys.spec.ts src/products/product-tool.defs.spec.ts && git -C $B commit -q -m "test(products): действие keys, отправка карточки ключей, возврат стёртого (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/product-lifecycle-tool.keys.spec.ts src/products/product-actions.controller.keys.spec.ts src/products/product-tool.defs.spec.ts`.
+
+- [ ] **Step 3: Инструмент** — `src/products/product-lifecycle-tool.ts`
+
+1. Импорты: `Optional` из `@nestjs/common` (рядом с `Injectable`), `import { ProductKeysService } from './product-keys.service';`.
+2. Конструктор — четвёртый параметр (последним и необязательным: спеки собирают инструмент позиционно с тремя):
+
+```ts
+    // Смена ключей (очередь 2). @Optional и последним — по той же причине,
+    // что lifecycleTool в ProductToolService.
+    @Optional() private readonly keysSvc?: ProductKeysService,
+```
+3. Метод после `delete`:
+
+```ts
+  async keys(userId: string, product: ProductMatch, channel: ProductToolChannel, turn: string | null) {
+    if (!this.keysSvc) return { ok: false, reason: 'unavailable', product, say: 'Смена ключей сейчас недоступна.' };
+    const r = await this.keysSvc.open({ userId, productId: product.id, channel, turn });
+    if (r.ok === false) return { ok: false, reason: r.reason, product, say: r.message };
+    return {
+      ok: true,
+      pending: { actionId: r.actionId, kind: 'keys', expiresAt: r.expiresAt },
+      product,
+      keyNames: r.keyNames,
+      say: (!turn
+        ? 'Защищённая карточка ключей ждёт пользователя в кабинете (Студия → Продукты).'
+        : channel === 'telegram'
+          ? 'Ниже придёт сообщение с кнопкой: пользователь откроет защищённую форму ключей.'
+          : 'Под твоим ответом появится защищённая карточка ключей.') +
+        ` В ней имена текущих ключей (${r.keyNames.length ? r.keyNames.join(', ') : 'ключей пока нет'}): их можно заменить, убрать или добавить новые. ` +
+        'Значения вводит только пользователь — в переписке ключи не проси. Продукт перезапустится с новыми ключами; ' +
+        'не говори «ключи обновлены», пока status с этим actionId не вернёт done.',
+    };
+  }
+```
+4. После `resolveDeleted`:
+
+```ts
+  /** Удалённые, которые уже не вернуть: стёрты или срок возврата вышел. */
+  private async resolveGone(userId: string, query: string): Promise<DeletedProduct[]> {
+    const raw = String(query ?? '').trim().toLowerCase();
+    if (!raw) return [];
+    const like = `%${raw.replace(/([\\%_])/g, '\\$1')}%`;
+    const r = await this.pg.query(
+      `SELECT id, name, slug, kind, purge_after FROM products
+        WHERE user_id = $1 AND archived_at IS NOT NULL AND (purged_at IS NOT NULL OR purge_after <= now())
+          AND (id::text = $2 OR lower(slug) = $2 OR lower(name) LIKE $3)
+        ORDER BY archived_at DESC LIMIT 1`,
+      [userId, raw, like],
+    );
+    return r.rows.map((x: any) => ({ ...x, purge_after: x.purge_after ? new Date(x.purge_after).toISOString() : null }));
+  }
+```
+5. В `restore` первой строкой ветки `if (!matches.length) {`:
+
+```ts
+      const gone = await this.resolveGone(userId, String(input?.product ?? ''));
+      if (gone.length) {
+        return {
+          ok: false, reason: 'purged', product: gone[0],
+          say: `«${gone[0].name}» уже стёрт: срок возврата (${DELETE_GRACE_DAYS} дней) вышел, вернуть его нельзя. Можно завести новый продукт.`,
+        };
+      }
+```
+6. В `actionStatus` после `const botDone = …;`:
+
+```ts
+    const keysDone = action.kind === 'keys' && action.status === 'done';
+    const keysWorking = action.kind === 'keys' && action.status === 'working';
+```
+и в цепочку `say` перед финальным `: ACTION_SAY[action.status]`:
+
+```ts
+            : keysDone
+              ? 'Готово: ключи обновлены, продукт перезапущен с ними.'
+              : keysWorking
+                ? 'Ключи применяются: продукт перезапускается — посмотри через минуту.'
+```
+(скобки и отступы — по месту, тернарная цепочка продолжается).
+
+- [ ] **Step 4: Разводка и описание** — `src/products/product-tool.service.ts`
+
+1. В `execute` условие `if (action === 'delete' || action === 'revert') {` → `if (action === 'delete' || action === 'revert' || action === 'keys') {`, и после строки `if (action === 'delete') return this.lifecycleTool.delete(userId, product, channel, turn);`:
+
+```ts
+        if (action === 'keys') return this.lifecycleTool.keys(userId, product, channel, turn);
+```
+Текст `bad_action`: `'Неизвестное действие. Доступны: list, create, edit, status, revert, delete, restore, keys, domain.'`.
+
+2. В `PRODUCT_TOOLS[0].description` после строки про `action="restore"` (`'• action="restore" — вернуть удалённый: product. Нужно свободное место в пределе аккаунта.\n' +`) вставить:
+
+```ts
+      '• action="keys" — сменить, убрать или добавить ключи продукта (токен бота, ключи сервисов): product. Сервер прикрепит к ответу защищённую карточку с ИМЕНАМИ текущих ключей; значения вводит только пользователь, продукт перезапустится с новыми ключами. ' +
+      'Спящему и остановленному продукту ключи не меняются. Не говори «ключи обновлены», пока status с actionId не вернёт done.\n' +
+```
+и в `restore` дописать: `После стирания (через 30 дней) вернуть нельзя — ответ reason="purged".`
+
+3. Абзац «КЛЮЧИ, ТОКЕНЫ И ПАРОЛИ…» целиком:
+
+```ts
+      'КЛЮЧИ, ТОКЕНЫ И ПАРОЛИ в prompt не вписывай никогда: текст правки хранится в истории и попадает в git продукта. ' +
+      'Ключи в разговоре не проси никогда — их вводят только в защищённую карточку (при создании бота и действием keys). ' +
+      'Прислал пользователь ключ в чат — никуда его не передавай, не вписывай в prompt и предложи карточку keys.\n' +
+```
+4. В схеме: `action.enum` — добавить `'keys'`; описание `product` — `'… Для edit, delete, restore, revert, keys обязательно.'`.
+
+- [ ] **Step 5: Ручка отправки** — `src/products/product-actions.controller.ts`
+
+1. Импорты: `IsArray, IsString` из `class-validator`; `Optional` из `@nestjs/common`; `import { ProductKeysService } from './product-keys.service';`.
+2. В `SubmitActionDto`:
+
+```ts
+  @IsOptional() @IsArray() @IsString({ each: true }) remove?: string[];
+```
+3. Конструктор — четвёртым параметром `@Optional() private readonly keys?: ProductKeysService,` (спеки собирают контроллер с тремя).
+4. Ветку `else if (row.kind === 'keys') { throw new NotImplementedException(…); }` заменить на:
+
+```ts
+    } else if (row.kind === 'keys') {
+      if (!this.keys) throw new NotImplementedException('Смена ключей сейчас недоступна');
+      await this.keys.complete({ userId: user.userId, actionId: id, set: body?.set ?? {}, remove: body?.remove ?? [], via });
+```
+В докблок класса: «Ключи (`keys`) — `{set, remove}`: значения уходят в ProductKeysService и дальше только в коробку карточки; ответ — `toView`, в котором значений нет по построению».
+
+- [ ] **Step 6: Регистрация** — `src/products/products.module.ts`
+
+Импорты `ProductKeysService`, `ProductPurgeService`; в `providers` после `ProductLifecycleTool,`:
+
+```ts
+    // Очередь 2: карточка ключей (её зовут инструмент и ручка отправки) и
+    // почасовой обход стирания. Без регистрации здесь @Optional-зависимости
+    // инструмента и контроллера молча остались бы пустыми — ассистент
+    // отвечал бы «смена ключей недоступна» при полностью выкаченном коде.
+    ProductKeysService,
+    ProductPurgeService,
+```
+Сторож регистрации — в `src/products/products.routes.spec.ts` рядом с проверками провайдеров добавить (по образцу соседних): `expect(providers).toContain(ProductKeysService)` и `expect(providers).toContain(ProductPurgeService)` (имя переменной списка провайдеров — как в файле; если такой проверки в файле нет — добавить тест `Reflect.getMetadata('providers', ProductsModule)` содержит оба класса).
+
+- [ ] **Step 7: Коммит, прогон — PASS**
+
+```bash
+git -C $B add src/products && git -C $B commit -q -m "products: действие keys инструмента и отправка карточки ключей; «продукт уже стёрт»; регистрация" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/product-lifecycle-tool.keys.spec.ts src/products/product-actions.controller.keys.spec.ts src/products/product-tool.defs.spec.ts src/products/product-lifecycle-tool.spec.ts src/products/product-tool.spec.ts src/products/product-actions.controller.spec.ts src/products/products.routes.spec.ts src/mcp`. Expected: PASS. Затем tsc бэка.
+
+---
