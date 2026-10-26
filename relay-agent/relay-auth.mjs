@@ -32,7 +32,7 @@ export function isAuthorized(header, secrets) {
   return ok;
 }
 
-// Пути без проверки: живость и статика файлов (файлы — отдельная задача).
+// Пути без проверки: живость и статика.
 const FREE = (req) =>
   req.method === "OPTIONS" || req.path === "/health" || req.path === "/files" || req.path.startsWith("/files/");
 
