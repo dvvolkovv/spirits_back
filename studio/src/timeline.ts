@@ -1,5 +1,5 @@
 import { StudioError } from './errors';
-import type { LineScene, Segment, SkitKind, SkitTimeline, Timeline, VoicedLine } from './types';
+import { SKIT_KINDS, type LineScene, type SceneSpan, type Segment, type SkitKind, type SkitTimeline, type Timeline, type VoicedLine } from './types';
 
 export const FPS = 30;
 /** Пауза после каждой реплики. */
@@ -49,6 +49,24 @@ function assertAnswerLines(lines: VoicedLine[]): void {
   }
 }
 
+/** Кладёт реплики сцены подряд, с паузой после каждой; возвращает кадр после последней паузы. */
+function placeLines(lines: VoicedLine[], scene: LineScene, cursor: number, gap: number, fps: number, segments: Segment[]): number {
+  for (const l of lines.filter((x) => x.scene === scene)) {
+    const duration = Math.max(1, msToFrames(l.durationMs, fps));
+    segments.push({ lineId: l.id, scene, text: l.text, box: l.box, audio: l.audio, from: cursor, duration });
+    cursor += duration + gap;
+  }
+  return cursor;
+}
+
+/** Длина ролика в пределах. Секунды — с двумя знаками: с одним 749 кадров выходили «25.0 с — короче 25 с». */
+function assertTotal(frames: number, fps: number, minMs: number, maxMs: number, detail = ''): void {
+  const ms = (frames / fps) * 1000;
+  const sec = `${(frames / fps).toFixed(2)} с`;
+  if (ms < minMs) throw new StudioError('too_short', `timeline: ролик ${sec} — короче ${minMs / 1000} с${detail}`, false);
+  if (ms > maxMs) throw new StudioError('too_long', `timeline: ролик ${sec} — длиннее ${maxMs / 1000} с${detail}`, false);
+}
+
 /**
  * Раскладывает озвученные реплики по кадрам. Длину ролика задаёт озвучка:
  * сцена идёт, пока звучат её реплики, плюс паузы. Порядок сцен —
@@ -69,57 +87,61 @@ export function buildTimeline(lines: VoicedLine[], fps = FPS): Timeline {
   let cursor = 0;
   for (const scene of ORDER) {
     const from = cursor;
-    for (const l of lines.filter((x) => x.scene === scene)) {
-      const duration = Math.max(1, msToFrames(l.durationMs, fps));
-      segments.push({ lineId: l.id, scene, text: l.text, box: l.box, audio: l.audio, from: cursor, duration });
-      cursor += duration + gap;
-    }
+    cursor = placeLines(lines, scene, cursor, gap, fps, segments);
     if (scene === 'hook') cursor = Math.max(cursor, from + msToFrames(MIN_HOOK_MS, fps));
     scenes[scene] = { from, duration: cursor - from };
   }
-  const sec = cursor / fps;
-  if (sec * 1000 < MIN_TOTAL_MS) throw new StudioError('too_short', `timeline: ролик ${sec.toFixed(1)} с — короче 30 с`, false);
-  if (sec * 1000 > MAX_TOTAL_MS) throw new StudioError('too_long', `timeline: ролик ${sec.toFixed(1)} с — длиннее 60 с`, false);
+  assertTotal(cursor, fps, MIN_TOTAL_MS, MAX_TOTAL_MS);
   return { segments, scenes, totalFrames: cursor };
 }
 
 /**
  * Таймлайн ролика со сценками: конфликт (клип) → вопрос → ответ → развязка
  * (клип) → финал. Длину сценок задают клипы, длину остального — озвучка.
+ * Реплики hook нет: зацепка — немая надпись поверх первых SKIT_HOOK_MS
+ * конфликта. В каждой озвученной сцене хотя бы одна реплика; ролик обязан
+ * уложиться в 25–45 с. Пауза GAP_MS — только после реплик: на стыке с клипом
+ * паузой служит тишина на краю самого клипа (до 2,4 с, CLIP_LIMITS в
+ * animate/clip-check.ts).
  */
 export function buildSkitTimeline(lines: VoicedLine[], clips: Record<SkitKind, number>, fps = FPS): SkitTimeline {
   if (lines.some((l) => l.scene === 'hook')) {
-    throw new StudioError('script_invalid', 'timeline: у ролика со сценками зацепка — надпись поверх сценки, реплики hook нет', false);
+    throw new StudioError('script_invalid', 'timeline: у ролика со сценками зацепка — надпись поверх сценки, реплики hook быть не должно', false);
+  }
+  // Длины клипов приходят из animation.json: NaN молча отключил бы проверку 25–45 с,
+  // а клип короче зацепки обрезал бы надпись. CLIP_LIMITS сюда не импортируется:
+  // timeline.ts входит в бандл Remotion, а clip-check.ts тянет node:child_process.
+  for (const kind of SKIT_KINDS) {
+    const ms = clips[kind];
+    if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < SKIT_HOOK_MS) {
+      throw new StudioError('no_input', `timeline: клип сценки ${kind} — ${ms} мс, нужен не короче ${SKIT_HOOK_MS / 1000} с: переснимите (npm run animate)`, false);
+    }
   }
   assertOrder(lines, SKIT_LINE_ORDER);
   assertAnswerLines(lines);
 
   const gap = msToFrames(GAP_MS, fps);
   const segments: Segment[] = [];
-  const scenes = {} as SkitTimeline['scenes'];
   let cursor = 0;
-  const clip = (kind: SkitKind) => {
-    const duration = Math.max(1, msToFrames(clips[kind], fps));
-    scenes[kind] = { from: cursor, duration };
-    cursor += duration;
+  const clip = (kind: SkitKind): SceneSpan => {
+    const span = { from: cursor, duration: msToFrames(clips[kind], fps) };
+    cursor += span.duration;
+    return span;
   };
-  const voiced = (scene: 'question' | 'answer' | 'final') => {
+  const voiced = (scene: LineScene): SceneSpan => {
     const from = cursor;
-    for (const l of lines.filter((x) => x.scene === scene)) {
-      const duration = Math.max(1, msToFrames(l.durationMs, fps));
-      segments.push({ lineId: l.id, scene, text: l.text, box: l.box, audio: l.audio, from: cursor, duration });
-      cursor += duration + gap;
-    }
-    scenes[scene] = { from, duration: cursor - from };
+    cursor = placeLines(lines, scene, cursor, gap, fps, segments);
+    return { from, duration: cursor - from };
   };
-  clip('conflict');
-  voiced('question');
-  voiced('answer');
-  clip('punchline');
-  voiced('final');
-
-  const sec = cursor / fps;
-  if (sec * 1000 < SKIT_MIN_TOTAL_MS) throw new StudioError('too_short', `timeline: ролик ${sec.toFixed(1)} с — короче 25 с`, false);
-  if (sec * 1000 > SKIT_MAX_TOTAL_MS) throw new StudioError('too_long', `timeline: ролик ${sec.toFixed(1)} с — длиннее 45 с`, false);
+  // Порядок вызовов — порядок сцен в ролике. Объект собирается целиком: пропущенную сцену заметит tsc.
+  const conflict = clip('conflict');
+  const question = voiced('question');
+  const answer = voiced('answer');
+  const punchline = clip('punchline');
+  const final = voiced('final');
+  const scenes: SkitTimeline['scenes'] = { conflict, question, answer, punchline, final };
+  // Сценаристу важна разбивка: сократить или удлинить он может только озвучку.
+  const clipFrames = conflict.duration + punchline.duration;
+  assertTotal(cursor, fps, SKIT_MIN_TOTAL_MS, SKIT_MAX_TOTAL_MS, ` (сценки ${(clipFrames / fps).toFixed(2)} с, озвучка ${((cursor - clipFrames) / fps).toFixed(2)} с)`);
   return { segments, scenes, totalFrames: cursor };
 }

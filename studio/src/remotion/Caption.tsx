@@ -28,7 +28,7 @@ const CaptionBox: React.FC<{ text: string }> = ({ text }) => (
   </AbsoluteFill>
 );
 
-/** Субтитры с готовыми кадрами — у реплик сценок. */
+/** Субтитры с готовыми кадрами: реплики сценок и, через Captions, озвученные реплики. */
 export const CueCaptions: React.FC<{ cues: ClipCue[] }> = ({ cues }) => (
   <>
     {cues.map((c) => (

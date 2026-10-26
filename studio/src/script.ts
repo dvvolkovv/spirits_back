@@ -1,4 +1,4 @@
-import type { CaptureResult, Script } from './types';
+import { SKIT_KINDS, type CaptureResult, type Script } from './types';
 
 /**
  * То, что студия может проверить сама до озвучки: у каждой реплики ответа
@@ -35,7 +35,7 @@ export function validateScript(script: Script, capture: Pick<CaptureResult, 'box
     if (script.lines.some((l) => l.scene === 'hook')) {
       problems.push('у ролика со сценками зацепка — надпись поверх сценки, реплики hook быть не должно');
     }
-    for (const kind of ['conflict', 'punchline'] as const) {
+    for (const kind of SKIT_KINDS) {
       const p = script.skits[kind];
       if (!p) {
         problems.push(`нет сценки ${kind}`);
@@ -53,6 +53,7 @@ export function validateScript(script: Script, capture: Pick<CaptureResult, 'box
   const count = script.final?.assistantsCount;
   if (!Number.isInteger(count) || count <= 0) problems.push('в финале нет числа ассистентов (final.assistantsCount)');
   const hookLine = script.lines.find((l) => l.scene === 'hook');
-  if (hookLine && hookLine.text.trim() !== hook) problems.push('текст реплики hook должен совпадать с зацепкой');
+  // У ролика со сценками реплика hook уже названа лишней — вторая проблема о том же сбила бы сценариста.
+  if (hookLine && !script.skits && hookLine.text.trim() !== hook) problems.push('текст реплики hook должен совпадать с зацепкой');
   return problems;
 }

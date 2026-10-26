@@ -37,7 +37,9 @@ export const SkitShort: React.FC<SkitShortProps> = (p) => {
       <Sequence from={scenes.final.from} durationInFrames={scenes.final.duration}>
         <Final assistantsCount={p.final.assistantsCount} disclaimer={p.final.disclaimer} />
       </Sequence>
+      {/* Финал дублирует крупный текст сцены — у озвученных реплик субтитры только у вопроса и ответа. */}
       <Captions segments={segments.filter((s) => s.scene === 'question' || s.scene === 'answer')} />
+      {/* Реплики сценок — всегда с субтитрами: большинство смотрит без звука. */}
       <CueCaptions cues={[...p.clips.conflict.cues, ...p.clips.punchline.cues]} />
       {segments.map((s) => (
         // У каждой реплики своя длина: отыгравший звук размонтируется (урок веб-плеера мультфильма).

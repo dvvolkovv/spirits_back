@@ -1,16 +1,12 @@
 import React from 'react';
-import { Composition, type CalculateMetadataFunction } from 'remotion';
+import { Composition } from 'remotion';
 import type { ShortProps, SkitShortProps } from '../types';
 import { Short } from './Short';
 import { SkitShort } from './SkitShort';
 import { H, W } from './theme';
 
-/** Длина ролика — из таймлайна в пропсах: её задаёт озвучка (и клипы сценок). */
-const calculateMetadata: CalculateMetadataFunction<ShortProps> = ({ props }) => ({
-  durationInFrames: props.timeline.totalFrames,
-  fps: props.fps,
-});
-const calculateSkitMetadata: CalculateMetadataFunction<SkitShortProps> = ({ props }) => ({
+/** Длина ролика — из таймлайна в пропсах: её задаёт озвучка (и клипы сценок). Одна на обе композиции. */
+const fromTimeline = ({ props }: { props: { fps: number; timeline: { totalFrames: number } } }) => ({
   durationInFrames: props.timeline.totalFrames,
   fps: props.fps,
 });
@@ -68,7 +64,7 @@ export const RemotionRoot: React.FC = () => (
       fps={30}
       durationInFrames={PLACEHOLDER.timeline.totalFrames}
       defaultProps={PLACEHOLDER}
-      calculateMetadata={calculateMetadata}
+      calculateMetadata={fromTimeline}
     />
     <Composition
       id="SkitShort"
@@ -78,7 +74,7 @@ export const RemotionRoot: React.FC = () => (
       fps={30}
       durationInFrames={SKIT_PLACEHOLDER.timeline.totalFrames}
       defaultProps={SKIT_PLACEHOLDER}
-      calculateMetadata={calculateSkitMetadata}
+      calculateMetadata={fromTimeline}
     />
   </>
 );

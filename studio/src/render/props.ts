@@ -50,26 +50,35 @@ export function buildSkitProps(capture: CaptureResult, script: Script, voiced: T
   assertFrame(capture);
   const skits = script.skits;
   if (!skits) throw new StudioError('script_invalid', 'props: в сценарии нет сценок', false);
-  const clips = {} as Record<SkitKind, SkitClip>;
-  for (const kind of ['conflict', 'punchline'] as const) {
-    const c = animation.skits[kind];
+  const clipOf = (kind: SkitKind): SkitClip => {
+    const c = animation.skits?.[kind];
     if (!c || c.fingerprint !== skits[kind].fingerprint) {
       throw new StudioError('no_input', `props: клип сценки ${kind} не снят под этот сценарий — сначала npm run animate`, false);
     }
-    clips[kind] = c;
-  }
+    return c;
+  };
+  const clips: Record<SkitKind, SkitClip> = { conflict: clipOf('conflict'), punchline: clipOf('punchline') };
   const timeline = buildSkitTimeline(voicedLines(script, voiced, runDir), { conflict: clips.conflict.durationMs, punchline: clips.punchline.durationMs }, FPS);
-  // Начало и конец реплики переводятся в кадры по отдельности: округление
-  // длины давало кадр с двумя субтитрами. Конец не выходит за сценку.
-  const cues = (kind: SkitKind): ClipCue[] =>
-    clips[kind].cues.flatMap((c) => {
-      const scene = timeline.scenes[kind];
-      const a = msToFrames(c.startMs, FPS);
-      const b = Math.min(msToFrames(c.endMs, FPS), scene.duration);
+  const cues = (kind: SkitKind): ClipCue[] => {
+    const { from, duration } = timeline.scenes[kind];
+    const lines = skits[kind].skit.lines;
+    const got = Array.isArray(clips[kind].cues) ? clips[kind].cues : [];
+    // Субтитры сценок обязательны: большинство смотрит без звука. animate пишет по записи
+    // на реплику, по порядку; другое — ошибка, а не ролик с пропавшими субтитрами.
+    if (got.length !== lines.length || got.some((c, n) => c.line !== n || !Number.isFinite(c.startMs) || !Number.isFinite(c.endMs))) {
+      throw new StudioError('no_input', `props: время реплик сценки ${kind} не сходится со сценарием (реплик ${lines.length}, записей ${got.length}) — перезапустите npm run animate`, false);
+    }
+    // Начало и конец переводятся в кадры по отдельности: округление длины давало кадр
+    // с двумя субтитрами. Субтитр не начинается раньше конца предыдущего и не выходит за сценку.
+    let prevEnd = 0;
+    return got.flatMap((c, n) => {
+      const a = Math.max(prevEnd, msToFrames(c.startMs, FPS));
+      const b = Math.min(msToFrames(c.endMs, FPS), duration);
       if (a >= b) return [];
-      const text = skits[kind].skit.lines[c.line]?.text ?? '';
-      return captionCues(splitCaption(text), scene.from + a, b - a).map((q, i) => ({ key: `${kind}-${c.line}-${i}`, ...q }));
+      prevEnd = b;
+      return captionCues(splitCaption(lines[n].text), from + a, b - a).map((q, i) => ({ key: `${kind}-${n}-${i}`, ...q }));
     });
+  };
   return {
     fps: FPS,
     hook: script.hook,
