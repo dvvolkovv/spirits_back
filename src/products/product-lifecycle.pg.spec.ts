@@ -472,6 +472,41 @@ maybe('жизненный цикл продукта против живого Po
       const live = await pool.query(`SELECT count(*) FROM products WHERE tg_bot_id = $1 AND archived_at IS NULL`, [botId]);
       expect(Number(live.rows[0].count)).toBe(1);
     });
+
+    it('канарейка: токен бота и ключ сервиса не всплывают в журнале и в логе (M11)', async () => {
+      const BOT_TOKEN_CANARY = '123456:FAKE_CANARY_VALUE_xxxxxxxxxxxxxxxxxxx';
+      const KEY_CANARY = 'CANARY_KEY_VALUE';
+      const warnSpy = jest.spyOn((svc as any).logger, 'warn');
+      const errorSpy = jest.spyOn((svc as any).logger, 'error');
+
+      // Раунд 1 — Telegram отклоняет токен (bad_token, карточка в release()).
+      const userId1 = 'u-canary-1';
+      (svc as any).checkBot = async () => ({ ok: false, reason: 'rejected' });
+      const open1 = await svc.openCreateBot({ userId: userId1, name: 'Канарейка 1', channel: 'web', turn: null });
+      const r1 = await svc.completeCreateBot({ userId: userId1, actionId: (open1 as any).actionId, set: { BOT_TOKEN: BOT_TOKEN_CANARY, OZON_KEY: KEY_CANARY }, via: 'chat' });
+      expect(r1.ok).toBe(false);
+
+      // Раунд 2 — Telegram принимает токен, продукт заводится (finish(done)).
+      const userId2 = 'u-canary-2';
+      (svc as any).checkBot = async () => ({ ok: true, id: 991199, username: 'canary_bot' });
+      const open2 = await svc.openCreateBot({ userId: userId2, name: 'Канарейка 2', channel: 'web', turn: null });
+      const r2 = await svc.completeCreateBot({ userId: userId2, actionId: (open2 as any).actionId, set: { BOT_TOKEN: BOT_TOKEN_CANARY, OZON_KEY: KEY_CANARY }, via: 'chat' });
+      expect(r2.ok).toBe(true);
+
+      // products.secrets_encrypted — шифротекст, на него намеренно не
+      // смотрим; журнал (product_actions) — открытый текст, должен быть пуст
+      // от канареек в обоих полях.
+      const leaked = await pool.query(
+        `SELECT id FROM product_actions
+          WHERE payload::text LIKE '%' || $1 || '%' OR payload::text LIKE '%' || $2 || '%'
+             OR result::text LIKE '%' || $1 || '%' OR result::text LIKE '%' || $2 || '%'`,
+        [BOT_TOKEN_CANARY, KEY_CANARY],
+      );
+      expect(leaked.rows).toEqual([]);
+
+      const allLogs = [...warnSpy.mock.calls, ...errorSpy.mock.calls].map((c) => String(c[0]));
+      expect(allLogs.some((s) => s.includes(BOT_TOKEN_CANARY) || s.includes(KEY_CANARY))).toBe(false);
+    });
   });
 
   describe('подметальщик зависших карточек (ревью задачи 10, пункт E)', () => {
