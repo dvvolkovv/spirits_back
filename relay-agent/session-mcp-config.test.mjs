@@ -31,7 +31,7 @@ test("sweepStaleSessionMcpConfigs: старый файл хода удаляет
     fs.writeFileSync(fresh, "{}");
     const oldSec = (Date.now() - 60 * 60 * 1000) / 1000;
     fs.utimesSync(stale, oldSec, oldSec);
-    const removed = sweepStaleSessionMcpConfigs(DIR, 30 * 60 * 1000);
+    const removed = sweepStaleSessionMcpConfigs(DIR, 30 * 60 * 1000, new Set());
     assert.deepEqual(removed, [path.basename(stale)]);
     assert.equal(fs.existsSync(stale), false);
     assert.equal(fs.existsSync(fresh), true);
@@ -40,14 +40,37 @@ test("sweepStaleSessionMcpConfigs: старый файл хода удаляет
   }
 });
 
-test("sweepStaleSessionMcpConfigs: чужие файлы (не конфиг хода) не трогает", () => {
+// Ревью 26.10.2026: уборка не должна трогать конфиг идущего хода — возраст
+// сам по себе НЕ доказывает, что ход завершился (консультация, self-heal
+// ретрай могут занять дольше порога). Полный путь — в Set живых конфигов,
+// который держит server.mjs (добавляет при записи, убирает в finally).
+test("sweepStaleSessionMcpConfigs: живой файл старше порога не удаляется, старый не-живой — удаляется", () => {
+  const DIR = fs.mkdtempSync(path.join(os.tmpdir(), "session-mcp-sweep-"));
+  try {
+    const live = path.join(DIR, sessionMcpConfigName(FS_KEY, randomUUID()));
+    const stale = path.join(DIR, sessionMcpConfigName(FS_KEY, randomUUID()));
+    fs.writeFileSync(live, "{}");
+    fs.writeFileSync(stale, "{}");
+    const oldSec = (Date.now() - 60 * 60 * 1000) / 1000;
+    fs.utimesSync(live, oldSec, oldSec);
+    fs.utimesSync(stale, oldSec, oldSec);
+    const removed = sweepStaleSessionMcpConfigs(DIR, 30 * 60 * 1000, new Set([live]));
+    assert.deepEqual(removed, [path.basename(stale)]);
+    assert.equal(fs.existsSync(live), true, "живой конфиг удалён — это и есть баг");
+    assert.equal(fs.existsSync(stale), false);
+  } finally {
+    fs.rmSync(DIR, { recursive: true, force: true });
+  }
+});
+
+test("sweepStaleSessionMcpConfigs: чужие файлы (не конфиг хода) в каталоге загрузок не трогает", () => {
   const DIR = fs.mkdtempSync(path.join(os.tmpdir(), "session-mcp-sweep-"));
   try {
     const other = path.join(DIR, FS_KEY + "_report.pdf");
     fs.writeFileSync(other, "x");
     const oldSec = (Date.now() - 60 * 60 * 1000) / 1000;
     fs.utimesSync(other, oldSec, oldSec);
-    const removed = sweepStaleSessionMcpConfigs(DIR, 30 * 60 * 1000);
+    const removed = sweepStaleSessionMcpConfigs(DIR, 30 * 60 * 1000, new Set());
     assert.deepEqual(removed, []);
     assert.equal(fs.existsSync(other), true);
   } finally {
@@ -56,5 +79,5 @@ test("sweepStaleSessionMcpConfigs: чужие файлы (не конфиг хо
 });
 
 test("sweepStaleSessionMcpConfigs: несуществующая папка — пустой список, не бросает", () => {
-  assert.deepEqual(sweepStaleSessionMcpConfigs("/tmp/does-not-exist-" + randomUUID(), 1000), []);
+  assert.deepEqual(sweepStaleSessionMcpConfigs("/tmp/does-not-exist-" + randomUUID(), 1000, new Set()), []);
 });
