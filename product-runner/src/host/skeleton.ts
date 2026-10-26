@@ -430,8 +430,8 @@ function keysSection(kind: ProductKind, secretNames: readonly unknown[]): string
     `  в истории и попадает в git. ${where}`,
     '- Список выше — на момент заведения: ключи могли смениться. Какие имена есть',
     '  сейчас — `Object.keys(process.env)` (только имена, без значений). Там же',
-    '  видны и системные переменные, и переменные платформы (`PATH`,',
-    '  `NODE_VERSION`, `RUNNER_TOKEN`, `OWNER_TG_ID`…) — это не ключи владельца.',
+    `  видны и системные переменные, и переменные платформы (\`PATH\`,` +
+      ` \`NODE_VERSION\`, \`RUNNER_TOKEN\`${kind === 'bot' ? ', `OWNER_TG_ID`' : ''}…) — это не ключи владельца.`,
   ].join('\n');
 }
 
