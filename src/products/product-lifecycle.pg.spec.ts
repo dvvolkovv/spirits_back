@@ -346,6 +346,25 @@ maybe('жизненный цикл продукта против живого Po
       expect(Number(wake.rows[0].count)).toBe(0);
     });
 
+    it('продукт был сломан (failed) до удаления — возврат отдаёт его обратно failed, без сна и аренды', async () => {
+      const userId = 'u-restore-failed';
+      const productId = await insertProduct({ userId, status: 'failed', slug: 'restore-failed-1' });
+
+      const open = await svc.openDelete({ userId, productId, channel: 'web', turn: null });
+      expect(open.ok).toBe(true);
+      const complete = await svc.completeDelete({ userId, actionId: (open as any).actionId, via: 'chat' });
+      expect(complete.ok).toBe(true);
+
+      const r = await svc.restore({ userId, productId, channel: 'web' });
+      expect(r).toMatchObject({ ok: true, status: 'failed', waking: false });
+
+      const row = (await pool.query('SELECT status, archived_at FROM products WHERE id = $1', [productId])).rows[0];
+      expect(row.status).toBe('failed');
+      expect(row.archived_at).toBeNull();
+      const wake = await pool.query(`SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND kind = 'wake'`, [productId]);
+      expect(Number(wake.rows[0].count)).toBe(0);
+    });
+
     it('токен бота архивного продукта тем временем занял другой живой продукт — bot_in_use, архив не снят', async () => {
       const botId = 777777;
       const userId = 'u-restore3';

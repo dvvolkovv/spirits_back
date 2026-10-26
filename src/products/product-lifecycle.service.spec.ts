@@ -177,9 +177,9 @@ describe('удаление', () => {
     expect(h.actions.open).not.toHaveBeenCalled();
   });
 
-  it('по нажатию: архив на 30 дней, чужие задания сняты, сон поставлен, итог с датой', async () => {
+  it('по нажатию: архив на 30 дней, чужие задания сняты, сон поставлен, итог с датой и прежним статусом', async () => {
     const until = new Date('2026-11-24T10:00:00Z');
-    const h = harness({ pg: (sql) => (sql.includes("SET archived_at = now()") ? { rows: [{ purge_after: until }] } : null) });
+    const h = harness({ pg: (sql) => (sql.includes("SET archived_at = now()") ? { rows: [{ purge_after: until, prev_status: 'running' }] } : null) });
     h.actions.claim.mockResolvedValue({ id: ACT, kind: 'delete', product_id: 'p1', channel: 'web', payload: {} });
     const r = await h.svc.completeDelete({ userId: 'u1', actionId: ACT, via: 'chat' });
     expect(r).toEqual({ ok: true, restoreUntil: until.toISOString() });
@@ -187,7 +187,10 @@ describe('удаление', () => {
     expect(archive.params).toEqual(['p1', 'u1', DELETE_GRACE_DAYS]);
     expect(h.calls.some((c) => c.sql.includes("error = 'снято удалением'"))).toBe(true);
     expect(h.calls.some((c) => c.sql.includes("'sleep', 'queued'") && c.params[0] === 'p1')).toBe(true);
-    expect(h.actions.finish).toHaveBeenCalledWith(ACT, 'done', { restoreUntil: until.toISOString() });
+    // prevStatus — чтобы возврат мог отличить «спал за неуплату» от «вернуть
+    // туда, где и был сломан»: продукту, удалённому в failed, пополнение не
+    // поможет, и сон за неуплату был бы неправдой.
+    expect(h.actions.finish).toHaveBeenCalledWith(ACT, 'done', { restoreUntil: until.toISOString(), prevStatus: 'running' });
   });
 
   it('queued/running правки продукта снимаются вместе с заданиями — иначе держат замок и выполнятся после возврата', async () => {
@@ -285,6 +288,22 @@ describe('возврат', () => {
       },
     });
     expect(await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' })).toEqual({ ok: true, status: 'blocked', waking: false });
+    expect(h.calls.some((c) => c.sql.includes("'wake', 'queued'"))).toBe(false);
+  });
+
+  it('продукт был сломан (failed) до удаления — возвращается failed, не спит и не будится', async () => {
+    const h = harness({
+      pg: (sql) => {
+        if (sql.includes('AS busy')) return { rows: [deleted()] };
+        if (sql.includes("kind = 'delete' AND status = 'done'")) return { rows: [{ prev_status: 'failed' }] };
+        if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'failed', paid: true }] };
+        return null;
+      },
+    });
+    const r = await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' });
+    expect(r).toEqual({ ok: true, status: 'failed', waking: false });
+    const upd = h.calls.find((c) => c.sql.includes('SET archived_at = NULL'))!;
+    expect(upd.params[3]).toBe('failed');
     expect(h.calls.some((c) => c.sql.includes("'wake', 'queued'"))).toBe(false);
   });
 
