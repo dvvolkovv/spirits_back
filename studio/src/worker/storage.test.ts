@@ -36,3 +36,18 @@ test('файл уходит в бакет под ключом, с типом; с
   assert.equal(fs.readFileSync(path.join(dir, 'got.mp4'), 'utf8'), 'видео');
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('файла может не быть: нет ключа — false и файла нет; сетевой сбой — ошибка, а не «нет»', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-storage-'));
+  const missing = s3Storage(cfg, { send: async () => { throw Object.assign(new Error('The specified key does not exist.'), { name: 'NoSuchKey', $metadata: { httpStatusCode: 404 } }); } });
+  assert.equal(await missing.getIfExists('shorts/x/skits/f/raw.mp4', path.join(dir, 'raw.mp4')), false);
+  assert.equal(fs.existsSync(path.join(dir, 'raw.mp4')), false);
+
+  const present = s3Storage(cfg, { send: async () => ({ Body: Readable.from([Buffer.from('клип')]) }) });
+  assert.equal(await present.getIfExists('shorts/x/skits/f/raw.mp4', path.join(dir, 'raw.mp4')), true);
+  assert.equal(fs.readFileSync(path.join(dir, 'raw.mp4'), 'utf8'), 'клип');
+
+  const down = s3Storage(cfg, { send: async () => { throw Object.assign(new Error('socket hang up'), { name: 'TimeoutError' }); } });
+  await assert.rejects(down.getIfExists('shorts/x/skits/f/raw.mp4', path.join(dir, 'other.mp4')), /socket hang up/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});

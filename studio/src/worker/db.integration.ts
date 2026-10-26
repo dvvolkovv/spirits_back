@@ -17,11 +17,12 @@ import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { StudioError } from '../errors';
 import {
-  LEASE_MINUTES, MAX_JOB_ATTEMPTS, claimJob, completeCapture, completeRender, failJob, minAnswerChars, type StoredCapture,
+  LEASE_MINUTES, MAX_JOB_ATTEMPTS, claimJob, completeAnimate, completeCapture, completeRender, failJob, maxOmniSeconds, minAnswerChars,
+  saveAnimation, type StoredCapture,
 } from './db';
 
 const DB_URL = process.env.STUDIO_PG_URL;
-const MIGRATION = fileURLToPath(new URL('../../../src/shorts/migrations/001_shorts.sql', import.meta.url));
+const MIGRATIONS = ['001_shorts.sql', '002_skits.sql'].map((f) => fileURLToPath(new URL(`../../../src/shorts/migrations/${f}`, import.meta.url)));
 const skip = DB_URL ? false : 'нет STUDIO_PG_URL — нужна одноразовая база (рецепт в шапке файла)';
 
 describe('очередь студии против живого Postgres', { skip }, () => {
@@ -38,7 +39,7 @@ describe('очередь студии против живого Postgres', { ski
       const n = await pool.query('SELECT count(*)::int AS n FROM short_video');
       if (n.rows[0].n > 0) throw new Error('в short_video уже есть строки — нужна одноразовая база');
     }
-    await pool.query(fs.readFileSync(MIGRATION, 'utf8'));
+    for (const f of MIGRATIONS) await pool.query(fs.readFileSync(f, 'utf8'));
     ours = true;
   });
 
@@ -110,6 +111,50 @@ describe('очередь студии против живого Postgres', { ski
       [c.status, c.failed_from, c.failure_notified, c.last_error],
       ['failed', 'capturing', false, `съёмка: задание не завершилось за ${LEASE_MINUTES} мин — рабочий процесс студии упал или завис`],
     );
+  });
+
+  it('оживление: захват отдаёт итог прошлых попыток; по ходу и итог — только своим захватом; готово — render_queued', async () => {
+    const before = { omniSeconds: 8, keyframes: 1, skits: {}, pending: { conflict: { id: 'gen-1', fingerprint: 'fp' } } };
+    const id = await insert('animate_queued', { animation: JSON.stringify(before) });
+    const job = await claimJob(pool, 'animate');
+    assert.deepEqual([job?.id, job?.attempts, (await row(id)).status], [id, 1, 'animating']);
+    assert.deepEqual(job?.animation, before);
+
+    const mid = { ...before, omniSeconds: 16 };
+    assert.equal(await saveAnimation(pool, job!, mid), true);
+    assert.deepEqual((await row(id)).animation, mid);
+    assert.equal(await saveAnimation(pool, { ...job!, attempts: 2 }, before), false, 'чужой захват не пишет');
+
+    const done = { omniSeconds: 16, keyframes: 2, skits: {}, pending: {} };
+    assert.equal(await completeAnimate(pool, job!, done), true);
+    const r = await row(id);
+    assert.deepEqual([r.status, r.attempts, r.lease_until, r.animation], ['render_queued', 0, null, done]);
+    assert.equal(await saveAnimation(pool, job!, before), false, 'после итога задание уже не на оживлении');
+  });
+
+  it('оживление упало без повтора — failed с этапа animating; с повтором — назад в очередь с паузой', async () => {
+    const a = await insert('animate_queued');
+    const ja = await claimJob(pool, 'animate');
+    assert.equal(await failJob(pool, ja!, new StudioError('omni_budget', 'лимит пересъёмок сценок', false)), 'failed');
+    const ra = await row(a);
+    assert.deepEqual([ra.status, ra.failed_from, ra.last_error], ['failed', 'animating', 'оживление: лимит пересъёмок сценок']);
+
+    const b = await insert('animate_queued');
+    const jb = await claimJob(pool, 'animate');
+    assert.equal(await failJob(pool, jb!, new StudioError('unknown', 'ECONNRESET', true)), 'retry');
+    const rb = await row(b);
+    assert.equal(rb.status, 'animate_queued');
+    assert.ok(new Date(rb.lease_until).getTime() > Date.now());
+  });
+
+  it('предел секунд Omni — из настроек', async () => {
+    assert.equal(await maxOmniSeconds(pool), 48);
+    await pool.query('UPDATE short_settings SET max_omni_seconds = 96 WHERE id = 1');
+    try {
+      assert.equal(await maxOmniSeconds(pool), 96);
+    } finally {
+      await pool.query('UPDATE short_settings SET max_omni_seconds = 48 WHERE id = 1');
+    }
   });
 
   it('съёмка готова — writing и съёмка в базе', async () => {
