@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import { meetingInputOptions, realtimeTurnDetection } from './session-options.js';
+import { CALL_SILENCE_MS, meetingInputOptions, realtimeTurnDetection } from './session-options.js';
 
 test('во встрече RoomIO не заводит собственный вход', () => {
   const o = meetingInputOptions();
@@ -94,4 +94,24 @@ test('пороги подняты против дефолтов API', () => {
   assert.equal(t.type, 'server_vad');
   assert.ok(t.threshold > 0.5, `порог не поднят: ${t.threshold}`);
   assert.ok(t.silence_duration_ms > 500, `тишина не поднята: ${t.silence_duration_ms}`);
+});
+
+/**
+ * Регрессия на дословные повторы (24.10.2026).
+ *
+ * При одинаковой тишине 900 мс сервер открывал ответ на первом огрызке
+ * мысли, ответ строился на устаревшем снимке контекста, и модель повторяла
+ * свою прошлую реплику слово в слово. Если тест покраснел, потому что
+ * значения снова сравнялись, — сначала перечитайте разбор в докстринге
+ * realtimeTurnDetection, там замер по живому разговору.
+ */
+test('в звонке ждём дольше, чем на встрече: человек думает вслух', () => {
+  const call = realtimeTurnDetection(false);
+  const meeting = realtimeTurnDetection(true);
+  assert.equal(call.silence_duration_ms, CALL_SILENCE_MS);
+  assert.ok(
+    call.silence_duration_ms > meeting.silence_duration_ms,
+    `звонок не терпеливее встречи: ${call.silence_duration_ms} vs ${meeting.silence_duration_ms}`,
+  );
+  assert.ok(call.silence_duration_ms >= 1500, 'паузы в полторы секунды — ещё середина мысли');
 });
