@@ -145,6 +145,22 @@ test('время реплик сценки не сходится со сцена
   }
 });
 
+test('реплика сценки без единого кадра — no_input, а не тихо пропавший субтитр', () => {
+  for (const second of [
+    { line: 1, startMs: 8100, endMs: 9000 },
+    { line: 1, startMs: 1000, endMs: 3000 },
+    { line: 1, startMs: 6000, endMs: 5000 },
+    { line: 1, startMs: 6000, endMs: 6010 },
+  ]) {
+    const conflict = { ...animation.skits.conflict!, cues: [{ line: 0, startMs: 500, endMs: 3500 }, second] };
+    assert.throws(
+      () => buildSkitProps(capture, skitScript, skitVoiced, { ...animation, skits: { ...animation.skits, conflict } }, '/run'),
+      (e: unknown) => e instanceof StudioError && e.code === 'no_input' && /реплике 2 сценки conflict не осталось ни кадра/.test(e.message),
+      JSON.stringify(second),
+    );
+  }
+});
+
 test('клипы не по 8 с: сцены и субтитры идут за настоящей длиной клипа', () => {
   const skits = { conflict: { ...animation.skits.conflict!, durationMs: 7000 }, punchline: { ...animation.skits.punchline!, durationMs: 9400 } };
   const p = buildSkitProps(capture, skitScript, skitVoiced, { ...animation, skits }, '/run');

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSkitTimeline, buildTimeline, MIN_ANSWER_LINE_MS } from './timeline';
+import { buildSkitTimeline, buildTimeline, MIN_ANSWER_LINE_MS, SKIT_CLIP_MAX_MS } from './timeline';
+import { CLIP_LIMITS } from './animate/clip-check';
 import { StudioError } from './errors';
 import type { LineScene, VoicedLine } from './types';
 
@@ -100,13 +101,18 @@ test('сценки: реплики hook нет — зацепка идёт на�
 });
 
 test('сценки: длина клипа из animation.json проверяется — NaN, 0 и клип короче зацепки', () => {
-  for (const bad of [Number.NaN, 0, -5000, 1000, null as unknown as number, undefined as unknown as number]) {
+  for (const bad of [Number.NaN, 0, -5000, 1000, 60_000, '8000' as unknown as number, null as unknown as number, undefined as unknown as number]) {
     assert.throws(
       () => buildSkitTimeline(skitLines(), { ...clips, punchline: bad }, 30),
       (e: unknown) => e instanceof StudioError && e.code === 'no_input' && !e.retryable && /клип сценки punchline/.test(e.message),
       `длина ${bad}`,
     );
   }
+});
+
+test('сценки: верхний предел клипа в таймлайне не уже пределов проверки клипа', () => {
+  assert.ok(CLIP_LIMITS.maxSec * 1000 <= SKIT_CLIP_MAX_MS, `${CLIP_LIMITS.maxSec} с > ${SKIT_CLIP_MAX_MS} мс`);
+  assert.doesNotThrow(() => buildSkitTimeline(skitLines(), { conflict: CLIP_LIMITS.maxSec * 1000, punchline: CLIP_LIMITS.minSec * 1000 }, 30));
 });
 
 test('сценки: на границе 25 с сообщение не противоречит себе и разбивает длину', () => {

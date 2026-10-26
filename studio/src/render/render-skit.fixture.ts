@@ -95,7 +95,8 @@ test('рендер фикстуры со сценками: 1080×1920, 25–45 �
   assert.deepEqual(r.problems, []);
   assert.ok(r.durationSec >= 25 && r.durationSec <= 45, `длина ${r.durationSec}`);
   assert.ok(fs.statSync(r.cover).size > 10_000, 'обложка подозрительно мала');
-  // Обложка — сценка 1 с надписью-зацепкой, без субтитров: на месте плашки субтитра — сам клип (оранжевый).
-  const px = execFileSync('ffmpeg', ['-v', 'error', '-i', r.cover, '-vf', 'format=rgb24,crop=1:1:120:1270', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-']);
+  // Обложка — сценка 1 с надписью-зацепкой, без субтитров: в центре места плашки субтитра
+  // (она центрирована на x=500 при любой длине текста) — сам клип, оранжевый.
+  const px = execFileSync('ffmpeg', ['-v', 'error', '-i', r.cover, '-vf', 'format=rgb24,crop=1:1:500:1300', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-']);
   assert.ok(px[0] > 200 && px[2] < 80, `на обложке субтитр реплики: пиксель ${[...px].join(',')}`);
 });

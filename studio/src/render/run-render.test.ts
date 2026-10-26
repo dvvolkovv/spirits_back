@@ -57,6 +57,8 @@ test('сборка со сценками без готовых клипов ос
     ['{ не json', /animation\.json не читается/],
     [JSON.stringify({ omniSeconds: 16 }), /в animation\.json нет сценок/],
     [JSON.stringify({ omniSeconds: 16, skits: { conflict: clip('conflict'), punchline: clip('punchline') } }), /нет файла клипа сценки conflict \(skits\/fp-conflict\/clip\.mp4\)/],
+    // Пустой путь — это сама папка ролика: существует, но не файл.
+    [JSON.stringify({ omniSeconds: 16, skits: { conflict: { ...clip('conflict'), clip: '' }, punchline: clip('punchline') } }), /нет файла клипа сценки conflict/],
   ];
   for (const [animation, re] of cases) {
     await assert.rejects(
