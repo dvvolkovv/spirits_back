@@ -387,7 +387,15 @@ export class TgBotService implements OnModuleInit {
     // Кнопки карточки продукта — до проверки привязки: владельца действия
     // сверяет обработчик по привязанному Telegram, а не по связке ассистентов.
     if (shouldRouteToProductActions(data)) {
-      await this.productActionsTg?.handleCallback(cb);
+      if (this.productActionsTg) {
+        await this.productActionsTg.handleCallback(cb);
+      } else {
+        // Сервиса нет (например, модуль собран без ProductsModule) — кнопка
+        // всё равно должна погасить спиннер у нажавшего, иначе он крутится
+        // бесконечно. См. tg-bot.product-actions-wiring.spec.ts — она и
+        // проверяет, что в проде сервис подключён и сюда не попадаем.
+        await this.grammy.answerCallbackQuery(cb.id, {}).catch(() => undefined);
+      }
       return;
     }
 
@@ -993,6 +1001,22 @@ export class TgBotService implements OnModuleInit {
       const productsTurn = randomUUID();
       const productsSince = new Date();
 
+      // Карточка (удаление, ключи бота) могла открыться внутри manage_product
+      // ДО того, как ход упал — generateReply мог дойти до инструмента и
+      // свалиться позже (сеть, лимит), и тогда обычная отправка карточек
+      // ниже просто не выполнится. closure и флаг — чтобы послать карточки
+      // ровно один раз, откуда бы их ни позвали: takeForTurn сам не отдаст
+      // вторую порцию (attached_at), но без флага код читался бы так, будто
+      // вызов может повториться по смыслу.
+      let cardsSent = false;
+      const sendProductCards = async (chatId: number): Promise<void> => {
+        if (cardsSent || !productsOwner || !this.productActionsTg) return;
+        cardsSent = true;
+        await this.productActionsTg
+          .sendForTurn({ userId: productsOwner.linkeonId, turn: productsTurn, since: productsSince, chatId, isPrivate: msg.chat?.type === 'private', lang: turnLang })
+          .catch((e: any) => this.logger.warn(`карточки продуктов не отправлены в чат ${chatId}: ${e?.message}`));
+      };
+
       let reply: { text: string; costUsd: number };
       try {
         reply = await this.router.generateReply(cfg, ownerFirstName, attachments, (ev) => {
@@ -1002,6 +1026,10 @@ export class TgBotService implements OnModuleInit {
         // Не вылетаем тихо — пишем юзеру в статус и оставляем след в БД.
         await this.recordTurnFailure(cfg, msg.chat.id, statusMsgId, e, turnLang);
         statusMsgId = null; // не удалять в finally — оставляем как уведомление
+        // Ход упал уже ПОСЛЕ того, как manage_product открыл карточку —
+        // без этого вызова она осталась бы висеть в БД навсегда: следующий
+        // ход того же пользователя заберёт её по своему turn, не по этому.
+        await sendProductCards(msg.chat.id);
         throw e;
       }
 
@@ -1088,11 +1116,7 @@ export class TgBotService implements OnModuleInit {
         }
       }
 
-      if (productsOwner && this.productActionsTg) {
-        await this.productActionsTg
-          .sendForTurn({ userId: productsOwner.linkeonId, turn: productsTurn, since: productsSince, chatId: outMsg.chat.id, isPrivate: msg.chat?.type === 'private', lang: turnLang })
-          .catch((e: any) => this.logger.warn(`карточки продуктов не отправлены в чат ${outMsg.chat.id}: ${e?.message}`));
-      }
+      await sendProductCards(outMsg.chat.id);
 
       const totalCostUsd = reply.costUsd + voiceTtsCostUsd;
       // Два курса, а не один на сумму: ход Claude — по курсу подписки, озвучка
