@@ -3436,15 +3436,17 @@ describe('карточка ключей: отправить', () => {
     [{ OWNER_TG_ID: '1' }, [], 'bad_input'],
     [{ 'A B': '1' }, [], 'bad_input'],
     [{ A: '' }, [], 'bad_input'],
-    [{}, ['BOT_TOKEN'], 'bad_input'],
+    [{}, ['BOT_TOKEN'], 'bot_token'],
     [{}, ['NO_SUCH'], 'bad_input'],
-    ['не объект', [], 'bad_input'],
-    [{}, 'не список', 'bad_input'],
+    ['не объект', [], 'bad_shape'],
+    [{}, 'не список', 'bad_shape'],
+    [Object.fromEntries(Array.from({ length: 64 }, (_, i) => [`K${i}`, 'v'])), [], 'too_many'],
   ])('set %j, remove %j — поправимо (%s): карточка снова ждёт, задания нет', async (set, remove, reason) => {
     const h = harness();
     const r = await send(h, set, remove);
     expect(r).toMatchObject({ ok: false, reason });
-    expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ error: expect.any(String) }));
+    // reason — в result карточки: по нему фронт переводит текст.
+    expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ error: expect.any(String), reason }));
     expect(h.calls.some((c) => c.sql.includes('INSERT INTO product_provision_jobs'))).toBe(false);
   });
 
@@ -3460,7 +3462,20 @@ describe('карточка ключей: отправить', () => {
     (h.svc as any).checkBot = jest.fn(async () => ({ ok: false, reason: 'rejected' }));
     const r = await send(h, { BOT_TOKEN: '222222:TEST-new' });
     expect(r).toMatchObject({ ok: false, reason: 'bad_token' });
-    expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ field: 'BOT_TOKEN' }));
+    expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ field: 'BOT_TOKEN', reason: 'bad_token' }));
+  });
+
+  it('Telegram не ответил — своя причина token_unchecked: «попробуйте через минуту», а не «не принял»', async () => {
+    const h = harness();
+    (h.svc as any).checkBot = jest.fn(async () => ({ ok: false, reason: 'unreachable' }));
+    expect(await send(h, { BOT_TOKEN: '222222:TEST-new' })).toMatchObject({ ok: false, reason: 'token_unchecked' });
+  });
+
+  it('запись задания не встаёт поверх живой правки — условие в самом INSERT', async () => {
+    const h = harness();
+    await send(h, { NEW_KEY: 'n' });
+    const ins = h.calls.find((c) => c.sql.includes('INSERT INTO product_provision_jobs'))!;
+    expect(ins.sql).toMatch(/NOT EXISTS \(SELECT 1 FROM product_turns t/);
   });
 
   it('новый BOT_TOKEN другого бота, который уже в живом продукте, — поправимо', async () => {
@@ -3720,8 +3735,11 @@ export class ProductKeysService {
   }
 
   private async submit(row: ActionRow, i: { userId: string; set: unknown; remove: unknown }): Promise<{ ok: true; queued: true } | KeysFail> {
+    // reason — в result ВСЕГДА: по нему кабинет и мини-приложение переводят
+    // текст на язык человека (products.action.keys.errors.<reason>); русский
+    // error — запасной показ.
     const fix = async (message: string, reason: string, field?: string): Promise<KeysFail> => {
-      await this.actions.release(row.id, field ? { error: message, field } : { error: message });
+      await this.actions.release(row.id, field ? { error: message, reason, field } : { error: message, reason });
       return { ok: false, reason, message };
     };
     const fail = async (message: string, reason: string): Promise<KeysFail> => {
@@ -3735,27 +3753,27 @@ export class ProductKeysService {
       [row.product_id, i.userId],
     );
     const p = r.rows[0];
-    if (!p) return fail('Продукт удалён — ключи менять не у чего', 'not_found');
+    if (!p) return fail('Продукт удалён — ключи не менялись', 'gone');
     const refusal = statusRefusal(p);
     if (refusal) return fail(refusal.message, refusal.reason);
 
     // --- Форма тела. Значения — только в set, и только строками. ---
     const set: Record<string, string> = {};
     if (i.set !== undefined && i.set !== null) {
-      if (typeof i.set !== 'object' || Array.isArray(i.set)) return fix('Ключи пришли не в той форме — обновите карточку', 'bad_input');
+      if (typeof i.set !== 'object' || Array.isArray(i.set)) return fix('Ключи пришли не в той форме — обновите карточку', 'bad_shape');
       for (const [k, v] of Object.entries(i.set as Record<string, unknown>)) {
         if (typeof v !== 'string') return fix(`секрет ${k}: значение должно быть непустой строкой`, 'bad_input', k);
         set[k] = k === 'BOT_TOKEN' ? v.trim() : v;
       }
     }
     if (i.remove !== undefined && i.remove !== null && (!Array.isArray(i.remove) || i.remove.some((n) => typeof n !== 'string'))) {
-      return fix('Список удаляемых ключей не в той форме — обновите карточку', 'bad_input');
+      return fix('Список удаляемых ключей не в той форме — обновите карточку', 'bad_shape');
     }
     const remove = [...new Set((i.remove as string[] | undefined) ?? [])];
     if (!Object.keys(set).length && !remove.length) return fix('Ничего не изменено: замените, уберите или добавьте ключ', 'nothing');
     const both = remove.find((n) => Object.prototype.hasOwnProperty.call(set, n));
     if (both) return fix(`Ключ ${both} и заменён, и убран — оставьте что-то одно`, 'bad_input', both);
-    if (p.kind === 'bot' && remove.includes('BOT_TOKEN')) return fix('Токен бота убрать нельзя — его можно только заменить', 'bad_input', 'BOT_TOKEN');
+    if (p.kind === 'bot' && remove.includes('BOT_TOKEN')) return fix('Токен бота убрать нельзя — его можно только заменить', 'bot_token', 'BOT_TOKEN');
 
     // --- Занятость: правка и задание машины. ---
     const busy = await this.pg.query(
@@ -3777,8 +3795,8 @@ export class ProductKeysService {
       ...Object.entries(set),
     ]);
     const problem = secretsProblem(merged);
-    if (problem) return fix(problem.message, 'bad_input', problem.field);
-    if (p.kind === 'bot' && !merged.BOT_TOKEN) return fix('У бота должен быть BOT_TOKEN', 'bad_input', 'BOT_TOKEN');
+    if (problem) return fix(problem.message, problem.field ? 'bad_input' : 'too_many', problem.field);
+    if (p.kind === 'bot' && !merged.BOT_TOKEN) return fix('У бота должен быть BOT_TOKEN', 'bot_token', 'BOT_TOKEN');
 
     // --- Новый токен бота — в Telegram, до записи чего-либо. ---
     let tgBotId: number | undefined;
@@ -3786,12 +3804,9 @@ export class ProductKeysService {
       const check = await this.checkBot(set.BOT_TOKEN);
       // `=== false`, а не `!check.ok`: strictNullChecks выключен (см. «Общее»).
       if (check.ok === false) {
-        return fix(
-          check.reason === 'unreachable'
-            ? 'Не удалось проверить токен в Telegram — попробуйте ещё раз через минуту'
-            : 'Telegram не принял токен бота — скопируйте его целиком из @BotFather',
-          'bad_token', 'BOT_TOKEN',
-        );
+        return check.reason === 'unreachable'
+          ? fix('Не удалось проверить токен в Telegram — попробуйте ещё раз через минуту', 'token_unchecked', 'BOT_TOKEN')
+          : fix('Telegram не принял токен бота — скопируйте его целиком из @BotFather', 'bad_token', 'BOT_TOKEN');
       }
       if (Number(p.tg_bot_id) !== check.id) {
         const taken = await this.pg.query(
@@ -3820,6 +3835,11 @@ export class ProductKeysService {
               FROM product_actions a JOIN products pr ON pr.id = a.product_id
              WHERE a.id = $1 AND a.status = 'working'
                AND pr.archived_at IS NULL AND pr.status IN ('running','degraded') AND pr.block_reason IS NULL
+               -- Правка могла встать между проверкой занятости и этой записью:
+               -- выдача rekey её всё равно дождалась бы, но ставить смену
+               -- поверх живой правки незачем — то же «занято», что выше.
+               AND NOT EXISTS (SELECT 1 FROM product_turns t
+                                WHERE t.product_id = pr.id AND t.status IN ('queued','running'))
             RETURNING action_id
          ), upd AS (
             UPDATE product_actions a SET secrets_box = $2, payload = a.payload || $3::jsonb
