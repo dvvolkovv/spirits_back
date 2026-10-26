@@ -15,8 +15,9 @@ const SUFFIX = "-session-mcp.json";
 // тот получал на старте CLI либо ENOENT, либо (хуже) уже переписанный чужим
 // ходом конфиг. turnId — randomUUID() вызывающего, свой на каждый вызов.
 //
-// Длина: fsKey (32 hex) + "-" + turnId (36, канонический UUID) + suffix (17)
-// = 86 байт — заведомо меньше NAME_MAX (255).
+// Длина: fsKey (32 hex от бэка или прежний ключ — до 48 символов, paths.mjs)
+// + "-" + turnId (36, канонический UUID) + suffix (17) — не больше 102 байт,
+// заведомо меньше NAME_MAX (255).
 export function sessionMcpConfigName(fsKey, turnId) {
   return fsKey + "-" + turnId + SUFFIX;
 }

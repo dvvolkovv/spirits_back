@@ -10,7 +10,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { randomUUID } from "crypto";
-import { sessionFsKey, turnFsKey, uploadFileName, fallbackFileName, sessionOutputDir } from "./paths.mjs";
+import { sessionFsKey, turnFsKey, legacyTurnFsKey, uploadFileName, fallbackFileName, sessionOutputDir } from "./paths.mjs";
 
 const DIR = fs.mkdtempSync(path.join(os.tmpdir(), "paths-test-"));
 process.on("exit", () => fs.rmSync(DIR, { recursive: true, force: true }));
@@ -151,4 +151,21 @@ test("с fs_key в путях нет номера: загрузка, папка 
   assert.ok(legacyUpload.includes(phone), "подготовка теста: без fs_key номер должен быть в пути");
   assert.notEqual(upload, legacyUpload);
   for (const p of [upload, out]) assert.ok(!p.includes(phone), p);
+});
+
+// Прежняя папка хода — та, что была у сессии до перехода на fs_key: в неё
+// модель может писать по памяти (путь из истории разговора).
+test("legacyTurnFsKey: есть fs_key — прежний ключ = санитизированный sessionId", () => {
+  assert.equal(legacyTurnFsKey(FS_KEY, SID), sessionFsKey(SID, "x"));
+  assert.equal(legacyTurnFsKey(FS_KEY, "a/b"), "a_b");
+});
+
+test("legacyTurnFsKey: нет или кривой fs_key — отдельной прежней папки нет", () => {
+  for (const k of [undefined, "", FS_KEY.toUpperCase(), ["a"], 123]) {
+    assert.equal(legacyTurnFsKey(k, SID), null, "ключ " + JSON.stringify(k));
+  }
+});
+
+test("legacyTurnFsKey: sessionId без пригодного ключа ('.', '..', пустой) — null", () => {
+  for (const sid of [".", "..", ""]) assert.equal(legacyTurnFsKey(FS_KEY, sid), null, sid);
 });

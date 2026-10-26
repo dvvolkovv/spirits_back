@@ -1,7 +1,7 @@
 // node --test relay-agent/linkeon-mcp.test.mjs
 import test from "node:test";
 import assert from "node:assert/strict";
-import { LINKEON_TOOLS, linkeonServer, isHttpsUrl } from "./linkeon-mcp.mjs";
+import { LINKEON_TOOLS, linkeonServer, bearerServer, isHttpsUrl } from "./linkeon-mcp.mjs";
 
 const URL_OK = "https://my.linkeon.io/webhook/mcp/linkeon";
 
@@ -52,4 +52,17 @@ test("LINKEON_TOOLS — 11 имён mcp__linkeon__* через запятую", 
   const names = LINKEON_TOOLS.split(",");
   assert.equal(names.length, 11);
   for (const n of names) assert.match(n, /^mcp__linkeon__[a-z_]+$/);
+});
+
+// Та же проверка для talerid и products (server.mjs): токен и адрес из
+// multipart как есть.
+test("bearerServer: токен — непустая строка без перевода строки, адрес — https", () => {
+  const ok = { type: "http", url: URL_OK, headers: { Authorization: "Bearer t" } };
+  assert.deepEqual(bearerServer("t", URL_OK), ok);
+  for (const t of [undefined, "", ["a", "b"], 5, "t\r\nX: 1", "t\nX"]) {
+    assert.equal(bearerServer(t, URL_OK), null, "токен " + JSON.stringify(t));
+  }
+  for (const u of [undefined, "http://x", [URL_OK, URL_OK]]) {
+    assert.equal(bearerServer("t", u), null, "адрес " + JSON.stringify(u));
+  }
 });

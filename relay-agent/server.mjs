@@ -6,13 +6,13 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import { turnFsKey, sessionFsKey, uploadFileName, fallbackFileName, sessionOutputDir } from "./paths.mjs";
+import { turnFsKey, legacyTurnFsKey, uploadFileName, fallbackFileName, sessionOutputDir } from "./paths.mjs";
 import { eventCallContext, tailDialogue } from "./session-tail.mjs";
 import { RUN_ENV, runTag, finishedRun, reap } from "./proc-reaper.mjs";
 import { costBaseline, runCost } from "./turn-cost.mjs";
 import { createUndelivered, withCarried } from "./undelivered-files.mjs";
 import { createRelayAuth } from "./relay-auth.mjs";
-import { LINKEON_TOOLS, linkeonServer, isHttpsUrl } from "./linkeon-mcp.mjs";
+import { LINKEON_TOOLS, linkeonServer, bearerServer } from "./linkeon-mcp.mjs";
 import { sessionMcpConfigName, sweepStaleSessionMcpConfigs } from "./session-mcp-config.mjs";
 import { snapshotDir, changedFiles } from "./turn-files.mjs";
 
@@ -243,7 +243,7 @@ loadSessionMap();
 //
 // Цену хода задаёт РАЗМЕР КОНТЕКСТА, а не размер файла на диске. Раньше
 // ограничивали байты (4 МиБ) — косвенную величину через прикинутый коэффициент
-// «150k токенов на МБ». Итог 30.08.2026: сессия 79030169187_12_ru доросла до
+// «150k токенов на МБ». Итог 30.08.2026: сессия одного пользователя (<телефон>_12_ru) доросла до
 // 534k токенов, и каждое сообщение в ней стоило $5.34 — 24 022 списанных
 // токена за ответ «Понял. Пиши, если что понадобится». Ответ бесплатный,
 // платили за подъём полумиллиона токенов истории.
@@ -437,7 +437,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   // коллег) — постоянна для всей сессии: ключ сессии это "<телефон>_<агент>_<язык>",
   // при смене ассистента заводится другая сессия. Раньше бэкенд клеил её к КАЖДОЙ
   // реплике, и она оседала в истории отдельной копией на каждый ход: в сессии
-  // 79030169187_12_ru на 44 реплики пришлось 813k символов, из них 808k (99.3%) —
+  // одного пользователя (<телефон>_12_ru) на 44 реплики пришлось 813k символов, из них 808k (99.3%) —
   // этот повтор, ~252k токенов. Отсюда --system-prompt: отправляется один раз и
   // кэшируется, а не переписывается на каждом холодном старте.
   const reqSystemPrompt = String(req.body.systemPrompt || "");
@@ -460,12 +460,12 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
 
   // Папка хода ДО перехода на fs_key (26.10.2026). Модель может помнить путь
   // к файлу оттуда из истории разговора (ссылка, которую она сама когда-то
-  // напечатала) и править именно его, а не файл в новой папке — снимок и
-  // диффы собираются по ОБЕИМ папкам, см. ниже и у done. Если fs_key не
-  // прислан (старый бэк, анонимный/служебный ход) — legacyFsKey === fsKey,
-  // и прежней папки отдельно нет.
-  const legacyFsKey = sessionFsKey(sessionId, fsKey);
-  const legacyOutDir = legacyFsKey !== fsKey ? path.join(OUTPUT_DIR, legacyFsKey) : null;
+  // напечатала) и править именно его — или положить туда по памяти новый
+  // файл, а не в новую папку. Снимок и диффы собираются по ОБЕИМ папкам, см.
+  // ниже и у done. Если fs_key не прислан (старый бэк, анонимный/служебный
+  // ход) — legacyTurnFsKey даёт null: ход и так пишет в прежнюю папку.
+  const legacyFsKey = legacyTurnFsKey(req.body.fs_key, sessionId);
+  const legacyOutDir = legacyFsKey ? path.join(OUTPUT_DIR, legacyFsKey) : null;
   const hasLegacyDir = !!legacyOutDir && fs.existsSync(legacyOutDir);
 
   const renamedFiles = [];
@@ -568,17 +568,14 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   // ОДИН раз. Два блока, каждый со своим файлом и своим переприсваиванием
   // mcpConfigPath, оставили бы в живых только последний — молча: конфиг
   // валиден, инструментов половина.
+  // bearerServer (linkeon-mcp.mjs) — одна проверка токена и адреса на всех
+  // троих: токен — строка без перевода строки, адрес — https.
   const linkeonSrv = linkeonServer(req.body);
+  const taleridSrv = bearerServer(req.body.talerid_token, req.body.talerid_mcp_url);
+  const productsSrv = bearerServer(req.body.products_token, req.body.products_mcp_url);
   const wantLinkeon = !!linkeonSrv;
-  const _taleridToken = req.body.talerid_token;
-  const _taleridMcpUrl = req.body.talerid_mcp_url;
-  const _productsToken = req.body.products_token;
-  const _productsMcpUrl = req.body.products_mcp_url;
-  // isHttpsUrl (linkeon-mcp.mjs) — та же проверка, что у linkeonServer: отбивает
-  // повторённое multipart-поле (массив), которое regex.test() иначе пропустил бы
-  // через неявный Array.prototype.toString().
-  const wantTalerid = !!(_taleridToken && isHttpsUrl(_taleridMcpUrl));
-  const wantProducts = !!(_productsToken && isHttpsUrl(_productsMcpUrl));
+  const wantTalerid = !!taleridSrv;
+  const wantProducts = !!productsSrv;
 
   if (wantLinkeon || wantTalerid || wantProducts) {
     try {
@@ -588,12 +585,8 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       // если он ещё остался в базовом конфиге, в конфиг хода не идёт.
       delete base.mcpServers.linkeon;
       if (wantLinkeon) base.mcpServers.linkeon = linkeonSrv;
-      if (wantTalerid) {
-        base.mcpServers.talerid = { type: "http", url: _taleridMcpUrl, headers: { Authorization: "Bearer " + _taleridToken } };
-      }
-      if (wantProducts) {
-        base.mcpServers.products = { type: "http", url: _productsMcpUrl, headers: { Authorization: "Bearer " + _productsToken } };
-      }
+      if (wantTalerid) base.mcpServers.talerid = taleridSrv;
+      if (wantProducts) base.mcpServers.products = productsSrv;
       // Имя — на ХОД, не на сессию (sessionMcpConfigName, session-mcp-config.mjs):
       // общее имя на сессию было гонкой — finally чужого хода той же сессии
       // мог удалить файл этого, ещё живого. Каталог — MCP_CONFIG_DIR, свой,
@@ -609,10 +602,8 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       if (wantTalerid) { allowedTools += "," + TALERID_TOOLS; systemPrompt += TALERID_PROMPT; }
       if (wantProducts) { allowedTools += "," + PRODUCTS_TOOLS; systemPrompt += PRODUCTS_PROMPT; }
     } catch (e) {
-      // Код/имя ошибки, НЕ e.message: JSON.parse цитирует вход целиком (в
-      // BASE_MCP_PATH мог оказаться обрывок или мусор), а в собранном base
-      // к этому моменту уже могли лечь чужие Bearer-токены — message мог их
-      // процитировать в лог.
+      // Код/имя ошибки, НЕ e.message: JSON.parse цитирует в message кусок
+      // входа, а в старом базовом конфиге лежал общий секрет.
       console.log("конфиг хода не записан: " + ((e && (e.code || e.name)) || "?"));
       // Любая осечка — назад к базовому конфигу целиком. Половина конфига
       // хуже, чем его отсутствие: инструмент в белом списке при отсутствующем
@@ -672,7 +663,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   //      `ev.type === "result" && ev.result` не отправляла клиенту НИЧЕГО);
   //   2. ход убит пре-эмптом, потому что пользователь прислал новое сообщение;
   //   3. transient-сбой после того, как часть текста уже ушла.
-  // Разбор истории 79088644408 за 11.08: 19 сообщений «?» за неделю — это и есть
+  // Разбор истории одного пользователя за 11.08: 19 сообщений «?» за неделю — это и есть
   // тычки в молчащий чат.
   let turnFailed = false;
   let failReason = "";
@@ -729,7 +720,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   // баланс. Ретраем не лечатся, и — главное — их текст английский и служебный.
   // Ни один из них не попадал ни в IMG_LIMIT_RE, ни в TRANSIENT_RE, поэтому
   // уходил пользователю ДОСЛОВНО как ответ ассистента, да ещё и тарифицировался:
-  // в истории 79088644408 лежат «You've hit your session limit · resets 11:50am
+  // в истории того же пользователя лежат «You've hit your session limit · resets 11:50am
   // (UTC)» ×4 (03.08) и «Not logged in · Please run /login» (07.08) — она даже
   // переспросила «что это?».
   const FATAL_RE = /Not logged in|Please run \/login|hit your (session|usage|weekly) limit|Invalid API key|Credit balance is too low|OAuth token (has )?expired/i;
@@ -946,7 +937,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
 
     // Хвост переписки от бэкенда вставляем ТОЛЬКО когда стартуем без --resume.
     // При resume Claude-сессия уже содержит всю историю, и второй её экземпляр
-    // в теле реплики — дословный дубликат: в сессии 79030169187_12_ru на него
+    // в теле реплики — дословный дубликат: в сессии одного пользователя на него
     // пришлось 309k символов из 813k. Флаг защищает от повторной вставки при
     // переигрышах ниже (протухший resume, перегруз картинками).
     let historyInjected = false;
@@ -1043,7 +1034,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
 
     // Ход закончился — смотрим, во что обошёлся его контекст, и решаем судьбу
     // сессии СЕЙЧАС, а не при следующем сообщении. Проверка только «до»
-    // пропускала взрывной рост внутри одного хода: 79851805798_12_ru
+    // пропускала взрывной рост внутри одного хода: <телефон>_12_ru
     // перевалила из-под потолка сразу на 16.71 МБ (~2.5 M токенов) и осталась
     // в таком виде — человек просто не написал снова.
     //

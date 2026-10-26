@@ -10,8 +10,16 @@
 import fs from "fs";
 import path from "path";
 
+// Нечитаемая папка (не каталог, нет прав) — как пустая: прежнюю папку хода
+// релей не создаёт и не контролирует, и сбой её чтения не должен ронять done.
 function walkDir(dir, visit, prefix = "") {
-  for (const item of fs.readdirSync(dir)) {
+  let items;
+  try {
+    items = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const item of items) {
     const full = path.join(dir, item);
     const rel = prefix ? prefix + "/" + item : item;
     try {
