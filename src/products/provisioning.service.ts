@@ -16,6 +16,7 @@ import { LimitsService } from './limits.service';
 import { SecretsService } from './secrets.service';
 import { secretsProblem } from './secret-rules';
 import { FREE_MONTH_PRODUCTS, freeMonthCountedJobSql, RentService } from './rent.service';
+import { PURGE_FAILED_SAY, REKEY_FAILED_SAY, REKEY_UNKNOWN_SAY } from './product-actions.service';
 
 export type ProductKind = 'site' | 'bot';
 
@@ -254,6 +255,23 @@ const HEARTBEAT_FRESH_MS = 2 * 60 * 1000;
  * ложится в карточку продукта со своими ожиданиями длины.
  */
 export const DOMAIN_ERROR_MAX = 1000;
+
+/**
+ * Признаки отказа смены ключей, после которого состояние машины неизвестно:
+ * describeFailure агента ставит «НА ХОСТЕ ОСТАЛОСЬ:» перед остатками, срок
+ * агента (overdue) и очередь по слагу (notStarted — эта смена хост не
+ * трогала, но прежняя, брошенная по сроку, ещё идёт) пишут «НЕИЗВЕСТНО»,
+ * откат rekey.ts — «откат не удался». Регистр важен: «неизвестный вид
+ * задания» старого агента (хост не тронут) сюда попадать не должен.
+ */
+const REKEY_UNKNOWN_RE = /НА ХОСТЕ ОСТАЛОСЬ|НЕИЗВЕСТНО|откат не удался/;
+
+/**
+ * Причина отказа задания rekey, когда коробку ключей карточки не удалось
+ * расшифровать при выдаче. Без значений и без текста исключения: машину
+ * никто не трогал, и человеку важно ровно это.
+ */
+const REKEY_BOX_UNREADABLE = 'коробка ключей не читается — ключи не менялись';
 
 /**
  * Подрезка до DOMAIN_ERROR_MAX по КОДОВЫМ ТОЧКАМ, а не по UTF-16: `slice`
@@ -1095,7 +1113,27 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     // продукта). Прочим видам ключи не нужны и не расшифровываются вовсе.
     let secrets: Record<string, string> = {};
     if (jobKind === 'provision' && row.box) secrets = this.secrets.decrypt(row.box, row.product_id);
-    if (jobKind === 'rekey' && row.rekey_box) secrets = this.secrets.decrypt(row.rekey_box, row.product_id);
+    if (jobKind === 'rekey' && row.rekey_box) {
+      try {
+        secrets = this.secrets.decrypt(row.rekey_box, row.product_id);
+      } catch (e: any) {
+        // Испорченная коробка или сменённый ключ шифрования. Задание уже
+        // 'running': брось мы здесь, агент получил бы 500, через десять минут
+        // сборщик снял бы задание, а подметальщик журнала записал бы
+        // rekey_unknown («продукт может не отвечать») — ложная тревога, машину
+        // никто не трогал, и все десять минут правки получали бы 409. Поэтому
+        // задание закрывается отказом тем же путём, что отчёт агента
+        // (карточка — rekey_failed, коробка стёрта), а агенту — «заданий нет».
+        //
+        // Текст исключения — только в лог и только не SyntaxError: сообщение
+        // JSON.parse в новых Node цитирует кусок разбираемого текста, то есть
+        // расшифрованные значения.
+        const why = e instanceof SyntaxError ? 'тело коробки не JSON' : String(e?.message ?? e).slice(0, 200);
+        this.logger.error(`смена ключей ${row.slug}: коробка ключей карточки не расшифровывается (${why}) — задание ${row.job_id} закрыто отказом, ключи не менялись`);
+        await this.completeRekeyJob(row.job_id, { ok: false, error: REKEY_BOX_UNREADABLE });
+        return null;
+      }
+    }
     const dropNames = jobKind === 'rekey'
       ? (Array.isArray(row.rekey_payload?.removedNames) ? row.rekey_payload.removedNames.filter((n: unknown) => typeof n === 'string') : [])
       : undefined;
@@ -1200,7 +1238,13 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     // выглядел бы в карточке как «ошибка заведения». Вид задания неизменен,
     // так что отдельное чтение гонки не открывает.
     const kindRow = await this.pg.query(`SELECT kind FROM product_provision_jobs WHERE id = $1`, [jobId]);
-    if (kindRow.rows[0]?.kind === 'domain') return this.completeDomainJob(jobId, result);
+    const jobKind = kindRow.rows[0]?.kind;
+    if (jobKind === 'domain') return this.completeDomainJob(jobId, result);
+    // Смена ключей и стирание продукт по общему пути НЕ трогают: отказ
+    // смены ключей — не поломка заведения (продукт работает со старыми
+    // ключами), отказ стирания — не повод выводить удалённый из архива.
+    if (jobKind === 'rekey') return this.completeRekeyJob(jobId, result);
+    if (jobKind === 'purge') return this.completePurgeJob(jobId, result);
 
     if (result.ok) {
       // Статус продукта здесь НЕ меняется. Перевод в running делает
@@ -1397,6 +1441,183 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       [jobId, result.ok, error, outdated, detachError],
     );
     if (!r.rows[0].closed) this.logger.warn(`отчёт по незапущенному заданию domain ${jobId} — домен не тронут`);
+  }
+
+  /**
+   * Отчёт по смене ключей. ОДИН оператор, замок тот же (`status = 'running'`):
+   * закрыть задание, при успехе перенести коробку карточки в продукт, закрыть
+   * карточку и стереть коробку в любом исходе. Двумя операторами смерть
+   * процесса между ними оставила бы ключи в базе одними, а в контейнере —
+   * другими. Порядок блокировок — задание, потом продукт, как у completeJob.
+   *
+   * Коробка переносится КАК ЕСТЬ: она зашифрована тем же SecretsService с тем
+   * же AAD (id продукта), что и products.secrets_encrypted. Явно пустой новый
+   * набор (newKeyNames = []) — NULL, как у заведения без ключей: decrypt на
+   * коробке от {} никто не зовёт, признак «ключей нет» — NULL (см. create()).
+   * Сравнение с '[]', а не длина списка с подстановкой пустого: карточка без
+   * newKeyNames (форма payload разошлась) иначе стёрла бы ключи продукта в
+   * базе при новых в контейнере, а jsonb_array_length на не-списке уронил бы
+   * весь оператор — и задание висело бы до сборщика.
+   *
+   * CTE act читает карточку из снимка ДО этого же оператора, поэтому коробка в
+   * swapped — ещё не стёртая finished. Порядок CTE тут не защита — защита в
+   * снимке, одном на весь оператор.
+   */
+  private async completeRekeyJob(jobId: string, result: { ok: boolean; error?: string }) {
+    const unknown = !result.ok && REKEY_UNKNOWN_RE.test(result.error ?? '');
+    const r = await this.pg.query(
+      `WITH closed AS (
+          UPDATE product_provision_jobs
+             SET status = CASE WHEN $2::boolean THEN 'done' ELSE 'failed' END,
+                 error = CASE WHEN $2::boolean THEN NULL ELSE $3::text END,
+                 finished_at = now()
+           WHERE id = $1 AND status = 'running' AND kind = 'rekey'
+          RETURNING product_id, action_id
+       ), act AS (
+          SELECT a.id, a.secrets_box, a.payload FROM product_actions a JOIN closed c ON a.id = c.action_id
+       ), swapped AS (
+          UPDATE products p
+             SET secrets_encrypted = CASE
+                   WHEN act.payload->'newKeyNames' = '[]'::jsonb THEN NULL
+                   ELSE act.secrets_box END
+            FROM closed, act
+           WHERE $2::boolean AND p.id = closed.product_id AND act.secrets_box IS NOT NULL
+          RETURNING p.id
+       ), finished AS (
+          UPDATE product_actions a
+             SET status = CASE WHEN $2::boolean THEN 'done' ELSE 'failed' END,
+                 secrets_box = NULL,
+                 result = CASE WHEN $2::boolean
+                               THEN jsonb_build_object('keyNames', COALESCE(a.payload->'newKeyNames', '[]'::jsonb))
+                               ELSE jsonb_build_object('error', $4::text, 'reason', $5::text) END,
+                 resolved_at = now()
+            FROM closed WHERE a.id = closed.action_id AND a.status = 'working'
+          RETURNING a.payload->>'tgBotId' AS tg_bot_id
+       )
+       SELECT (SELECT count(*) FROM closed)::int AS closed,
+              (SELECT count(*) FROM swapped)::int AS swapped,
+              (SELECT product_id FROM closed) AS product_id,
+              (SELECT slug FROM products WHERE id = (SELECT product_id FROM closed)) AS slug,
+              (SELECT tg_bot_id FROM finished) AS tg_bot_id`,
+      [jobId, result.ok, result.error ?? 'без причины', unknown ? REKEY_UNKNOWN_SAY : REKEY_FAILED_SAY, unknown ? 'rekey_unknown' : 'rekey_failed'],
+    );
+    const row = r.rows[0];
+    if (!row?.closed) {
+      // Задание уже не 'running'. Кто его закрыл — решает, тревога это или
+      // рутина: сам этот путь (повтор POST-а после обрыва связи — 'done' при
+      // успехе) или кто-то снаружи (блокировка, сборщик по сроку, удаление).
+      const was = await this.pg
+        .query(
+          `SELECT j.status, p.slug FROM product_provision_jobs j JOIN products p ON p.id = j.product_id WHERE j.id = $1`,
+          [jobId],
+        )
+        .then((q: any) => q.rows[0])
+        .catch(() => undefined);
+      const who = was?.slug ?? '?';
+      if (result.ok) {
+        if (was?.status === 'done') {
+          this.logger.warn(`повторный отчёт об успехе по заданию rekey ${jobId} (${who}) — уже закрыто, ключи не тронуты`);
+        } else {
+          // ПОЗДНИЙ УСПЕХ: задание сняли раньше (блокировка, сборщик по
+          // сроку), а агент дошёл до конца. База не меняется (замок
+          // status='running'), но правда расходится: в контейнере НОВЫЕ ключи,
+          // в базе — прежние. Громко: это разбор руками, а не рутина.
+          this.logger.error(
+            `смена ключей ${who}: агент применил новые ключи после того, как задание ${jobId} сняли — ` +
+              'в контейнере новые ключи, в базе прежние, сверить руками',
+          );
+        }
+      } else if (unknown) {
+        // Поздний отказ с неизвестным исходом: карточку уже закрыли снаружи,
+        // но продукт после такого отказа может не отвечать — громко.
+        this.logger.error(
+          `смена ключей ${who}: поздний отчёт по снятому заданию ${jobId} — исход на машине неизвестен, ` +
+            `продукт может не отвечать — ${String(result.error ?? '').slice(0, 300)}`,
+        );
+      } else {
+        this.logger.warn(`отчёт по незапущенному заданию rekey ${jobId} — ключи не тронуты`);
+      }
+      return;
+    }
+    if (unknown) {
+      this.logger.error(`смена ключей ${row.slug}: исход на машине неизвестен, продукт может не отвечать — ${String(result.error ?? '').slice(0, 300)}`);
+    }
+    if (result.ok && !row.swapped) {
+      // Задание закрыто успехом, а коробки нет (карточку удалили — FK
+      // SET NULL — или её коробку стёрли раньше срока): переносить нечего.
+      // Тот же разлад, что у позднего успеха, — громко.
+      this.logger.error(
+        `смена ключей ${row.slug}: агент применил новые ключи, а коробки карточки задания ${jobId} уже нет — ` +
+          'в контейнере новые ключи, в базе прежние, сверить руками',
+      );
+    }
+    // Метка бота — отдельным оператором и лучшим усилием: частичный UNIQUE
+    // products_tg_bot_live мог занять другой живой продукт между проверкой в
+    // карточке и этим отчётом. Отказ уронил бы оператор выше целиком — и с
+    // ним перенос уже применённых в контейнере ключей.
+    if (result.ok && typeof row.tg_bot_id === 'string' && /^\d{1,20}$/.test(row.tg_bot_id)) {
+      try {
+        await this.pg.query(
+          `UPDATE products SET tg_bot_id = $2, tg_bot_checked_at = now() WHERE id = $1 AND archived_at IS NULL`,
+          [row.product_id, row.tg_bot_id],
+        );
+      } catch (e: any) {
+        if (e?.code === '23505' && e?.constraint === 'products_tg_bot_live') {
+          this.logger.warn(`смена ключей продукта ${row.product_id}: новый бот уже числится за другим живым продуктом — tg_bot_id не обновлён`);
+        } else {
+          this.logger.error(`смена ключей продукта ${row.product_id}: tg_bot_id не записан (${e?.message})`);
+        }
+      }
+    }
+  }
+
+  /**
+   * Отчёт по стиранию. Строка продукта НЕ удаляется (спека, «Открыто на
+   * очередь 2»): задания продукта удалились бы каскадом, и счёт бесплатных
+   * месяцев (freeMonthCountedJobSql) сбросился бы — «удалить, дождаться
+   * стирания, завести снова» снова давало бы бесплатный месяц. Стираются
+   * ключи и первая правка, снимается строка своего домена (освобождает
+   * домен для других: индекс занятости product_domains_occupied), пишется
+   * строка журнала. Резервную копию стирает обход (product-purge.service).
+   * tg_bot_id и port не трогаются: не секрет, нужны журналу; частичный
+   * индекс products_tg_bot_live архивных и так не видит.
+   *
+   * Один оператор и тот же замок `status = 'running'`; порядок блокировок —
+   * задание, потом продукт. Журнал в исходе отказа — без сырой причины агента
+   * (она в задании).
+   */
+  private async completePurgeJob(jobId: string, result: { ok: boolean; error?: string }) {
+    const r = await this.pg.query(
+      `WITH closed AS (
+          UPDATE product_provision_jobs
+             SET status = CASE WHEN $2::boolean THEN 'done' ELSE 'failed' END,
+                 error = CASE WHEN $2::boolean THEN NULL ELSE $3::text END,
+                 finished_at = now()
+           WHERE id = $1 AND status = 'running' AND kind = 'purge'
+          RETURNING product_id
+       ), purged AS (
+          UPDATE products p
+             SET purged_at = now(), secrets_encrypted = NULL, first_prompt = NULL, first_prompt_channel = NULL
+            FROM closed
+           WHERE $2::boolean AND p.id = closed.product_id AND p.purged_at IS NULL
+          RETURNING p.id
+       ), domains AS (
+          DELETE FROM product_domains d USING purged WHERE d.product_id = purged.id
+          RETURNING d.product_id
+       ), logged AS (
+          INSERT INTO product_actions (user_id, product_id, kind, status, channel, payload, result, attached_at, resolved_at)
+          SELECT p.user_id, p.id, 'purge',
+                 CASE WHEN $2::boolean THEN 'done' ELSE 'failed' END, 'system',
+                 jsonb_build_object('name', p.name, 'slug', p.slug),
+                 CASE WHEN $2::boolean THEN '{}'::jsonb ELSE jsonb_build_object('error', $4::text) END,
+                 now(), now()
+            FROM products p JOIN closed c ON c.product_id = p.id
+          RETURNING id
+       )
+       SELECT (SELECT count(*) FROM closed)::int AS closed`,
+      [jobId, result.ok, result.error ?? 'без причины', PURGE_FAILED_SAY],
+    );
+    if (!r.rows[0]?.closed) this.logger.warn(`отчёт по незапущенному заданию purge ${jobId} — продукт не тронут`);
   }
 
   /**
@@ -1832,6 +2053,12 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                 -- сохраняют прежний текст.
                 error = CASE kind
                           WHEN 'domain' THEN 'срок задания своего домена истёк (${PROVISION_DEADLINE_MIN} мин)'
+                          -- Карточку зависшей смены ключей закрывает
+                          -- подметальщик журнала: задание failed, исход не
+                          -- записан. Продукт ниже не трогается — он не в
+                          -- provisioning (работающий или удалённый).
+                          WHEN 'rekey' THEN 'срок смены ключей истёк (${PROVISION_DEADLINE_MIN} мин)'
+                          WHEN 'purge' THEN 'срок стирания истёк (${PROVISION_DEADLINE_MIN} мин)'
                           ELSE 'срок заведения истёк (${PROVISION_DEADLINE_MIN} мин)'
                         END,
                 finished_at = now()
