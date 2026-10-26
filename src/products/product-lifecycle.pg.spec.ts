@@ -673,6 +673,54 @@ maybe('жизненный цикл продукта против живого Po
     });
   });
 
+  describe('claimNext и смена ключей (ревью задачи 11)', () => {
+    it('rekey running — claimNext не выдаёт ход; после завершения rekey — выдаёт', async () => {
+      const userId = 'u-claim-rekey';
+      const productId = await insertProduct({ userId, status: 'running', slug: 'claim-rekey-1' });
+      const turnRow = await pool.query(
+        `INSERT INTO product_turns (product_id, user_id, channel, prompt, status) VALUES ($1, $2, 'web', 'правка', 'queued') RETURNING id`,
+        [productId, userId],
+      );
+      const job = await pool.query(
+        `INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'rekey', 'running') RETURNING id`,
+        [productId],
+      );
+      const turnsLocal = new TurnsService(pg as any, { checkTokenBalance: async () => ({ ok: true }), deductTokens: async () => 0 } as any);
+
+      // Против НАСТОЯЩЕГО Postgres: мок исполнил бы любой SQL одинаково, а
+      // здесь проверяется сам предикат NOT EXISTS из claimNext — ровно та
+      // страховка, которой не было до ревью задачи 11.
+      await expect(turnsLocal.claimNext(productId)).resolves.toBeNull();
+      const stillQueued = (await pool.query('SELECT status FROM product_turns WHERE id = $1', [turnRow.rows[0].id])).rows[0];
+      expect(stillQueued.status).toBe('queued');
+
+      await pool.query(`UPDATE product_provision_jobs SET status = 'done' WHERE id = $1`, [job.rows[0].id]);
+
+      const claimed = await turnsLocal.claimNext(productId);
+      expect(claimed).toMatchObject({ id: turnRow.rows[0].id });
+      const runningNow = (await pool.query('SELECT status FROM product_turns WHERE id = $1', [turnRow.rows[0].id])).rows[0];
+      expect(runningNow.status).toBe('running');
+    });
+
+    it('rekey queued (ещё не running) — claimNext выдаёт ход как обычно', async () => {
+      // Только 'running' в WHERE claimNext: пока rekey сам ещё не выдан
+      // агенту, ход и rekey не должны ждать друг друга (см. докблок
+      // REKEY_REFUSAL) — на практике REKEY_REFUSAL отобьёт постановку ТАКОГО
+      // хода при enqueue, но claimNext проверяется отдельно, своим SQL.
+      const userId = 'u-claim-rekey-queued';
+      const productId = await insertProduct({ userId, status: 'running', slug: 'claim-rekey-2' });
+      const turnRow = await pool.query(
+        `INSERT INTO product_turns (product_id, user_id, channel, prompt, status) VALUES ($1, $2, 'web', 'правка', 'queued') RETURNING id`,
+        [productId, userId],
+      );
+      await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'rekey', 'queued')`, [productId]);
+      const turnsLocal = new TurnsService(pg as any, { checkTokenBalance: async () => ({ ok: true }), deductTokens: async () => 0 } as any);
+
+      const claimed = await turnsLocal.claimNext(productId);
+      expect(claimed).toMatchObject({ id: turnRow.rows[0].id });
+    });
+  });
+
   describe('создание бота', () => {
     it('два ожидающих с одним токеном: второй — bot_in_use, живой продукт с этим id — ровно один', async () => {
       const userId = 'u-bot';

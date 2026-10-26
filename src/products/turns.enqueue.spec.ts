@@ -367,4 +367,13 @@ describe('правка во время смены ключей', () => {
     const { svc } = makeService({ rekeying: true, productStatus: 'sleeping' });
     await expect(svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'п' })).rejects.toThrow(SLEEPING_REFUSAL);
   });
+
+  it('пустой баланс не меняет исход — проверка ключей стоит ДО баланса', async () => {
+    // Пополнение смену ключей не ускорит (докблок REKEY_REFUSAL), поэтому
+    // владельцу без денег всё равно нужен именно этот текст, а не
+    // «Недостаточно токенов»: тот подсказал бы пополнить баланс впустую.
+    const { svc, misc } = makeService({ rekeying: true, balanceOk: false });
+    await expect(svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'п' })).rejects.toThrow(REKEY_REFUSAL);
+    expect(misc.checkTokenBalance).not.toHaveBeenCalled();
+  });
 });

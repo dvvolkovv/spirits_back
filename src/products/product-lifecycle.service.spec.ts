@@ -1,6 +1,7 @@
 import { ConflictException, UnprocessableEntityException } from '@nestjs/common';
 import { ProductLifecycleService, DELETE_GRACE_DAYS } from './product-lifecycle.service';
 import { RENT_TOKENS } from './rent.service';
+import { REKEY_REFUSAL } from './turns.service';
 
 const ACT = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const TOKEN = '1234567890:AAH9sdfjKJHkjh34kjh5kjh6KJHkjhKJHkj';
@@ -615,6 +616,16 @@ describe('откат и первая правка', () => {
     ] } : null) });
     const busy = new ConflictException('Агент уже работает над предыдущим запросом');
     h.turns.enqueue.mockRejectedValueOnce(busy);
+    expect(await h.svc.firstPromptTick()).toBe(1);
+    const restore = h.calls.find((c) => c.sql.includes('SET first_prompt') && c.sql.includes('first_prompt IS NULL'))!;
+    expect(restore.params).toEqual(['p1', 'А', 'telegram']);
+  });
+
+  it('меняются ключи — первая правка тоже возвращается на следующий тик, а не теряется', async () => {
+    const h = harness({ pg: (sql) => (sql.includes('WITH picked AS') ? { rows: [
+      { id: 'p1', user_id: 'u1', first_prompt: 'А', first_prompt_channel: 'telegram' },
+    ] } : null) });
+    h.turns.enqueue.mockRejectedValueOnce(new ConflictException(REKEY_REFUSAL));
     expect(await h.svc.firstPromptTick()).toBe(1);
     const restore = h.calls.find((c) => c.sql.includes('SET first_prompt') && c.sql.includes('first_prompt IS NULL'))!;
     expect(restore.params).toEqual(['p1', 'А', 'telegram']);

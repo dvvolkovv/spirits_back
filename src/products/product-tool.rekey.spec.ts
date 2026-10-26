@@ -12,5 +12,9 @@ describe('отказ правке во время смены ключей — а
     const r: any = await svc.execute('u1', { action: 'edit', product: 'Магазин', prompt: 'поменяй приветствие' });
     expect(r).toMatchObject({ ok: false, reason: 'rekeying', canTopUp: false });
     expect(r.say).toMatch(/через пару минут/);
+    // Приписка к константе не повторяет её же «через пару минут» — у неё
+    // своё продолжение: что делать (status) и что не поможет (пополнение).
+    expect(r.say).toMatch(/действие status/);
+    expect(r.say).toMatch(/пополнение не поможет/);
   });
 });
