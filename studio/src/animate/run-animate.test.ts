@@ -302,6 +302,23 @@ test('обрыв посреди ожидания — новый запуск д�
   assert.deepEqual(anim.pending, {});
 });
 
+test('готовую генерацию не забрать (omni_unreadable) — id сохранён, запуск после правки забирает её без оплаты', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const first = fakes(env, {
+    wait: (kind) => {
+      if (kind === 'punchline') throw new StudioError('omni_unreadable', 'omni: генерацию не забрать — незнакомая форма', false);
+      return env.clip;
+    },
+  });
+  await assert.rejects(animateRun(env.runDir, first.deps), (e: unknown) => isErr('omni_unreadable', false)(e) && /сценка 2 \(развязка\)/.test((e as Error).message));
+  assert.equal(readAnim(env.runDir).pending?.punchline?.id, 'id-punchline-1');
+  const second = fakes(env);
+  const anim = await animateRun(env.runDir, second.deps);
+  assert.deepEqual(second.calls.start, []);
+  assert.deepEqual(second.calls.wait, ['id-punchline-1']);
+  assert.equal(anim.omniSeconds, 16);
+});
+
 test('битый файл от Omni — пересъёмка', { timeout: 120_000 }, async () => {
   const env = setup();
   const { deps } = fakes(env, { wait: (kind, n) => (kind === 'conflict' && n === 1 ? Buffer.from('not a video') : env.clip) });
@@ -427,4 +444,81 @@ test('новая громкость — принятые сценки перео
   assert.match(anim.skits.punchline!.post, /;lufs=-23;/);
   assert.equal(anim.skits.conflict!.heard, first.skits.conflict!.heard);
   assert.equal(anim.omniSeconds, 16);
+});
+
+test('переобработка принятого клипа не прошла — запись и clip.mp4 прежние, повтор ничего не тратит', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const first = await animateRun(env.runDir, fakes(env).deps);
+  const clipFile = path.join(env.runDir, first.skits.conflict!.clip);
+  const before = fs.readFileSync(clipFile);
+  // −70 LUFS — клип становится тишиной, и проверка его бракует.
+  for (let run = 0; run < 2; run++) {
+    const f = fakes(env);
+    await assert.rejects(
+      animateRun(env.runDir, { ...f.deps, lufs: -70 }),
+      (e: unknown) => isErr('clip_invalid', false)(e) && /принятый клип при новых настройках \(v\d+;lufs=-19;.*→ v\d+;lufs=-70;/.test((e as Error).message),
+    );
+    assert.deepEqual([f.calls.start.length, f.calls.keyframe.length, f.calls.recognize], [0, 0, 0]);
+    const anim = readAnim(env.runDir);
+    assert.equal(anim.skits.conflict!.post, first.skits.conflict!.post);
+    assert.equal(anim.omniSeconds, 16);
+    assert.ok(fs.existsSync(path.join(env.runDir, 'skits', 'fp-conflict', 'raw.mp4')));
+    assert.deepEqual(fs.readFileSync(clipFile), before);
+  }
+  const back = fakes(env);
+  await animateRun(env.runDir, back.deps);
+  assert.deepEqual([back.calls.start.length, back.calls.recognize], [0, 0]);
+});
+
+test('кадр конфликта пропал посреди пересъёмки, а развязка уже нарисована по нему — ошибка, а не тихая перерисовка', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const first = fakes(env, {
+    heard: (kind) => {
+      if (kind === 'conflict') throw new StudioError('stt', 'stt: распознать речь не удалось', false);
+      return LINES[kind].join(' ');
+    },
+  });
+  await assert.rejects(animateRun(env.runDir, first.deps), (e: unknown) => e instanceof StudioError && e.code === 'stt');
+  fs.rmSync(path.join(env.runDir, 'keyframes', 'kf-conflict.png'));
+  const second = fakes(env, { heard: (kind) => (kind === 'conflict' ? 'совсем другое' : LINES[kind].join(' ')) });
+  await assert.rejects(
+    animateRun(env.runDir, second.deps),
+    (e: unknown) => isErr('no_input', false)(e) && /кадра конфликта .* нет, а по нему уже нарисована развязка/.test((e as Error).message),
+  );
+  assert.deepEqual([second.calls.keyframe.length, second.calls.start.length], [0, 0]);
+});
+
+test('принятый клип без raw.mp4 при новых настройках — ошибка, а не тихая пересъёмка', { timeout: 120_000 }, async () => {
+  const env = setup();
+  await animateRun(env.runDir, fakes(env).deps);
+  fs.rmSync(path.join(env.runDir, 'skits', 'fp-conflict', 'raw.mp4'));
+  const second = fakes(env);
+  await assert.rejects(
+    animateRun(env.runDir, { ...second.deps, lufs: -23 }),
+    (e: unknown) => isErr('no_input', false)(e) && /сценка 1 \(конфликт\): .*raw\.mp4 нет/.test((e as Error).message),
+  );
+  assert.deepEqual(second.calls.start, []);
+  assert.equal(readAnim(env.runDir).omniSeconds, 16);
+});
+
+test('предел секунд выбран — кадры не рисуются: они тоже стоят денег', { timeout: 120_000 }, async () => {
+  const env = setup();
+  fs.writeFileSync(path.join(env.runDir, 'animation.json'), JSON.stringify({ omniSeconds: 48, keyframes: 0, skits: {} }));
+  const { deps, calls } = fakes(env);
+  await assert.rejects(animateRun(env.runDir, deps), (e: unknown) => isErr('omni_budget', false)(e) && /MAX_OMNI_SECONDS/.test((e as Error).message));
+  assert.equal(calls.keyframe.length, 0);
+});
+
+test('упали обе сценки — названы обе, код у ошибки без повтора', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const { deps } = fakes(env, {
+    start: () => {
+      throw new StudioError('google_auth', 'omni: ключ', false);
+    },
+  });
+  await assert.rejects(
+    animateRun(env.runDir, deps),
+    (e: unknown) => isErr('google_auth', false)(e) && /сценка 1 \(конфликт\): omni: ключ; сценка 2 \(развязка\): omni: ключ/.test((e as Error).message),
+  );
+  assert.equal(readAnim(env.runDir).omniSeconds, 0);
 });
