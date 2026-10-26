@@ -411,7 +411,11 @@ describe('настоящая ФС: ссылки не уводят стирани
     await rm(base, { recursive: true, force: true });
   });
 
-  /** Настоящие exists/realpath/pathKind/removeDir, симулятор — только для docker, nginx, certbot. */
+  /**
+   * Настоящие realpath/pathKind/removeDir, симулятор — только для docker,
+   * nginx, certbot. Каталог конфигов nginx — свой временный: иначе проверка
+   * «нет ли конфига у бота» читала бы /etc машины, где идёт прогон.
+   */
   const realFs = (productsDir = root) => {
     const real = hostDeps();
     return deps(host, {
@@ -420,6 +424,7 @@ describe('настоящая ФС: ссылки не уводят стирани
       pathKind: real.pathKind,
       removeDir: real.removeDir,
       productsDir,
+      nginxConfDir: join(base, 'nginx'),
     });
   };
 

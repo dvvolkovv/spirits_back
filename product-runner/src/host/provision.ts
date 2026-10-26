@@ -109,7 +109,7 @@
  * Ровно этот случай и разбирает подчистка.
  */
 import { execFile } from 'child_process';
-import { mkdir, readFile, realpath, rm, stat, writeFile } from 'fs/promises';
+import { lstat, mkdir, readFile, realpath, rm, stat, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { promisify } from 'util';
 import { ProductKind, skeletonFor } from './skeleton';
@@ -293,6 +293,9 @@ export interface ProvisionJob {
   ownerTgId?: string;
 }
 
+/** Что лежит по пути без перехода по ссылке (ProvisionDeps.pathKind). */
+export type PathKind = 'absent' | 'dir' | 'symlink' | 'other';
+
 /** Запуск программы БЕЗ шелла. Возвращает stdout. */
 export type Run = (argv: string[], opts?: { cwd?: string }) => Promise<string>;
 
@@ -311,6 +314,14 @@ export interface ProvisionDeps {
    * по настоящей ФС — и из тестов на симуляторе тоже.
    */
   realpath: (path: string) => Promise<string>;
+  /**
+   * Что лежит по пути, как `lstat`, — БЕЗ перехода по ссылке: битая ссылка —
+   * это 'symlink', а не «ничего нет». Нет пути — 'absent'; любой другой отказ
+   * (ENOTDIR, EACCES) — исключение. Нужен стиранию (purge.ts): «каталога уже
+   * нет» и «на месте каталога ссылка» обязаны различаться. Обязательное — по
+   * той же причине, что realpath.
+   */
+  pathKind: (path: string) => Promise<PathKind>;
   readHostSecret: (path: string) => Promise<string>;
   /** Отвечает ли порт. Ожидание по факту вместо `sleep 12`. */
   waitPort: (port: number, timeoutMs: number) => Promise<boolean>;
@@ -686,6 +697,16 @@ export function hostDeps(overrides: Partial<ProvisionDeps> = {}): ProvisionDeps 
     },
 
     realpath: (path: string) => realpath(path),
+
+    pathKind: async (path: string) => {
+      try {
+        const st = await lstat(path);
+        return st.isSymbolicLink() ? 'symlink' : st.isDirectory() ? 'dir' : 'other';
+      } catch (e: any) {
+        if (e?.code === 'ENOENT') return 'absent';
+        throw e;
+      }
+    },
 
     readHostSecret: async (path: string) => readFile(path, 'utf8'),
 

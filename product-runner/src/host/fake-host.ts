@@ -17,9 +17,10 @@
  * Собственные свойства симулятора сторожит fake-host.spec.ts: он общий, и
  * незамеченная правка ослабила бы сразу обе батареи.
  */
+import { createHash } from 'crypto';
 import { posix } from 'path';
 import { Script } from 'vm';
-import { DEFAULTS, ProvisionDeps } from './provision';
+import { DEFAULTS, PathKind, ProvisionDeps } from './provision';
 
 export class FakeHost {
   /** Каталоги чекаутов: путь → файлы. */
@@ -41,6 +42,13 @@ export class FakeHost {
        */
       imageId?: string;
       cmd: string[];
+      /**
+       * Полный идентификатор (64 hex), как `.ID` у `docker ps --no-trunc`.
+       * Необязательный по той же причине, что imageId: контейнеры, положенные
+       * в карту руками, получают его при первом спросе (idOf). Тест может
+       * задать его сам — так строится сосед, чей id начинается со слага.
+       */
+      id?: string;
       restart?: string;
       /** Байты — уже проверенные и переведённые из `--memory=` в `dockerRun` (см. `parseMemory`). */
       memory?: number;
@@ -169,6 +177,18 @@ export class FakeHost {
   /** Сертификаты certbot по имени (`--cert-name`). */
   certs = new Set<string>();
   /**
+   * Имена в сертификате (строка Domains у `certbot certificates`). Пишет их
+   * certonly (из `-d`) или issueCert; сертификат, положенный в `certs` руками,
+   * имён не имеет — и `certificates` на нём отказывает, а не выдумывает их.
+   */
+  certDomains = new Map<string, string[]>();
+
+  /** Завести сертификат с именами — как после выпуска, но без задания domain. */
+  issueCert(name: string, domains: string[]): void {
+    this.certs.add(name);
+    this.certDomains.set(name, [...domains]);
+  }
+  /**
    * Текст отказа `certbot certonly`, заданный тестом, или null — выпуск проходит.
    * Отказ бросается ДО выпуска: сертификата после него нет, как у живого certbot.
    */
@@ -270,9 +290,17 @@ export class FakeHost {
     if (sub === 'run') return this.dockerRun(args);
     if (sub === 'ps') return this.dockerPs(args);
     if (sub === 'rm') {
-      if (args[0] !== '-f') throw new Error(`docker rm без -f: ${args.join(' ')}`);
-      const name = args[1];
-      if (!this.containers.delete(name)) throw new Error(`No such container: ${name}`);
+      // `-f` обязателен (так зовут все хостовые шаги), `-v` — по желанию
+      // (стирание снимает и анонимные тома). Ссылка — одна.
+      const flags: string[] = [];
+      let i = 0;
+      while (i < args.length && args[i].startsWith('-')) flags.push(args[i++]);
+      for (const f of flags) if (f !== '-f' && f !== '-v') throw new Error(`docker rm: неизвестный флаг ${f}`);
+      if (!flags.includes('-f')) throw new Error(`docker rm без -f: ${args.join(' ')}`);
+      const refs = args.slice(i);
+      if (refs.length !== 1) throw new Error(`docker rm: симулятор снимает по одной ссылке: ${args.join(' ')}`);
+      const name = this.resolveRef(refs[0]);
+      if (!name || !this.containers.delete(name)) throw new Error(`No such container: ${refs[0]}`);
       this.stopped.delete(name);
       return '';
     }
@@ -498,15 +526,64 @@ export class FakeHost {
     if (!name) throw new Error(`certbot ${sub}: без --cert-name`);
     if (sub === 'certonly') {
       if (this.certbotFails !== null) throw new Error(this.certbotFails);
-      this.certs.add(name);
+      // --expand с новым набором `-d`: в сертификате ровно эти имена.
+      const domains = args.flatMap((a, i) => (a === '-d' && args[i + 1] ? [args[i + 1]] : []));
+      this.issueCert(name, domains);
       return '';
     }
     if (sub === 'delete') {
       if (!this.certs.has(name)) throw new Error(`No certificate found with name ${name}`);
       this.certs.delete(name);
+      this.certDomains.delete(name);
       return '';
     }
-    throw new Error(`certbot ${sub}: симулятор знает только certonly и delete`);
+    if (sub === 'certificates') {
+      // Форма certbot 2.x (cert_manager._describe_certs / _report_human_readable):
+      // нет ни одного сертификата — «No certificates found.»; с --cert-name —
+      // заголовок «matching» и только блок с ТОЧНО этим именем; rc=0 в обоих
+      // случаях. Пустой ответ на машине с сертификатами замерен на certbot
+      // 2.9.0 в отдельном каталоге конфигов.
+      const dashes = '- '.repeat(39) + '-';
+      if (this.certs.size === 0) return `\n${dashes}\nNo certificates found.\n${dashes}\n`;
+      let block = '';
+      if (this.certs.has(name)) {
+        const domains = this.certDomains.get(name);
+        if (!domains) throw new Error(`симулятор: у сертификата ${name} нет имён — заведите его через issueCert или certonly`);
+        block =
+          `  Certificate Name: ${name}\n    Serial Number: 3fa1\n    Key Type: ECDSA\n    Domains: ${domains.join(' ')}\n` +
+          `    Expiry Date: 2027-01-20 10:00:00+00:00 (VALID: 85 days)\n` +
+          `    Certificate Path: /etc/letsencrypt/live/${name}/fullchain.pem\n` +
+          `    Private Key Path: /etc/letsencrypt/live/${name}/privkey.pem\n`;
+      }
+      return `\n${dashes}\nFound the following matching certs:\n${block}${dashes}\n`;
+    }
+    throw new Error(`certbot ${sub}: симулятор знает только certonly, delete и certificates`);
+  }
+
+  private idSeq = 0;
+
+  /** Полный id контейнера (`.ID` у `docker ps --no-trunc`); выдаётся при первом спросе и переживает rename. */
+  idOf(name: string): string {
+    const c = this.containers.get(name);
+    if (!c) throw new Error(`idOf: контейнера ${name} нет`);
+    if (!c.id) c.id = createHash('sha256').update(`${name}#${++this.idSeq}`).digest('hex');
+    return c.id;
+  }
+
+  /**
+   * Ссылка на контейнер так, как её ищет docker (daemon.GetContainer):
+   * полный id → точное имя → НАЧАЛО id (однозначное; иначе отказ). Последний
+   * шаг и есть опасность снятия по имени: исчезнувшее имя из одних
+   * шестнадцатеричных знаков находит соседа, чей id с него начинается.
+   */
+  private resolveRef(ref: string): string | undefined {
+    const names = [...this.containers.keys()];
+    const byId = names.find((n) => this.idOf(n) === ref);
+    if (byId) return byId;
+    if (this.containers.has(ref)) return ref;
+    const byPrefix = names.filter((n) => this.idOf(n).startsWith(ref));
+    if (byPrefix.length > 1) throw new Error(`Error response from daemon: multiple IDs found with provided prefix: ${ref}`);
+    return byPrefix[0];
   }
 
   /** Есть ли контейнер и запущен ли он. */
@@ -590,25 +667,55 @@ export class FakeHost {
     return name;
   }
 
+  /**
+   * `docker ps` в тех формах, что зовут хостовые шаги:
+   *   - `--filter name=^<имя>$` — занято ли имя (containerTaken);
+   *   - `--filter volume=<путь>` — кто смонтировал ровно этот путь. Как у
+   *     docker (daemon/list.go): совпадение с источником bind-монтирования
+   *     или с назначением, точное — замерено на docker 29.8.0: ни хвостовой
+   *     слэш, ни родительский каталог не подходят;
+   *   - без фильтра — перечень всех.
+   * Шаблоны — `{{.Names}}` и `{{.ID}} {{.Names}}` (`--no-trunc` — полный id,
+   * без него — 12 знаков). `-a` показывает и остановленные, без него —
+   * только запущенные: разница существует со сна, и `containerTaken`
+   * спрашивает с `-a` намеренно — имя занимает и погашенный контейнер.
+   */
   private dockerPs(args: string[]): string {
-    if (!args.includes('--filter')) {
-      // Перечень имён целиком — так стирание (purge.ts) ищет страховки
-      // обновления образа `<слаг>__pre_<хеш>`: хеша оно не знает и сверяет
-      // имена само, по точной форме. Другие шаблоны (`{{.Ports}}` боевого
-      // freePort) симулятор не изображает: у него свой freePort.
-      const format = args.includes('--format') ? args[args.indexOf('--format') + 1] : '';
-      if (format !== '{{.Names}}') throw new Error(`docker ps без фильтра: симулятор знает только --format {{.Names}}, а не ${format}`);
-      const names = [...this.containers.keys()].filter((n) => args.includes('-a') || this.isRunning(n));
-      return names.length ? `${names.join('\n')}\n` : '';
+    let all = false;
+    let noTrunc = false;
+    let filter = '';
+    let format = '';
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === '-a') all = true;
+      else if (args[i] === '--no-trunc') noTrunc = true;
+      else if (args[i] === '--filter') filter = args[++i];
+      else if (args[i] === '--format') format = args[++i];
+      else throw new Error(`docker ps: неизвестный аргумент ${args[i]}`);
     }
-    const filter = args[args.indexOf('--filter') + 1];
-    const m = /^name=\^(.+)\$$/.exec(filter);
-    if (!m) throw new Error(`docker ps: неожиданный фильтр ${filter}`);
-    // `-a` показывает и остановленные, без него — только запущенные. Разница
-    // существует ровно со сна: `containerTaken` спрашивает с `-a` намеренно,
-    // потому что имя занимает и погашенный контейнер.
-    const visible = args.includes('-a') ? this.containers.has(m[1]) : this.isRunning(m[1]);
-    return visible ? `${m[1]}\n` : '\n';
+    if (format !== '{{.Names}}' && format !== '{{.ID}} {{.Names}}') {
+      throw new Error(`docker ps: симулятор знает только --format {{.Names}} и {{.ID}} {{.Names}}, а не ${format}`);
+    }
+    const visible = (n: string) => this.containers.has(n) && (all || this.isRunning(n));
+    const line = (n: string) => (format === '{{.Names}}' ? n : `${noTrunc ? this.idOf(n) : this.idOf(n).slice(0, 12)} ${n}`);
+
+    if (filter.startsWith('name=')) {
+      const m = /^name=\^(.+)\$$/.exec(filter);
+      if (!m) throw new Error(`docker ps: неожиданный фильтр ${filter}`);
+      // Пустой ответ здесь — '\n', как было всегда: containerTaken читает оба.
+      return visible(m[1]) ? `${line(m[1])}\n` : '\n';
+    }
+    let names: string[];
+    if (!filter) {
+      names = [...this.containers.keys()].filter(visible);
+    } else if (filter.startsWith('volume=')) {
+      const path = filter.slice('volume='.length);
+      names = [...this.containers.entries()]
+        .filter(([n, c]) => visible(n) && !!c.mount && c.mount.split(':').slice(0, 2).includes(path))
+        .map(([n]) => n);
+    } else {
+      throw new Error(`docker ps: неожиданный фильтр ${filter}`);
+    }
+    return names.length ? `${names.map(line).join('\n')}\n` : '';
   }
 
   // --- файловая часть ---
@@ -636,10 +743,26 @@ export class FakeHost {
    */
   realpath = async (path: string): Promise<string> => {
     const p = posix.resolve(path);
-    if (!this.dirs.has(p)) {
+    if (!this.dirs.has(p) && !this.baseDirs.has(p)) {
       throw Object.assign(new Error(`ENOENT: no such file or directory, realpath '${path}'`), { code: 'ENOENT' });
     }
     return p;
+  };
+
+  /**
+   * Каталоги, которые есть на хосте всегда, даже пустом: каталог продуктов
+   * (`realpath` его стирание сверяет первым делом) и конфигов nginx. Тест
+   * убирает отсюда, чтобы изобразить хост без каталога продуктов.
+   */
+  baseDirs = new Set<string>(['/', '/srv', DEFAULTS.productsDir, '/etc', '/etc/nginx', DEFAULTS.nginxConfDir]);
+
+  /** `lstat` в мире без ссылок: каталог чекаута, файл конфига vhost или ничего. */
+  pathKind = async (path: string): Promise<PathKind> => {
+    const p = posix.resolve(path);
+    if (this.dirs.has(p) || this.baseDirs.has(p)) return 'dir';
+    const conf = new RegExp(`^${DEFAULTS.nginxConfDir}/([^/]+)\\.conf$`).exec(p);
+    if (conf && this.confFiles.has(conf[1])) return 'other';
+    return 'absent';
   };
 
   /**
@@ -742,6 +865,7 @@ export function deps(host: FakeHost, over: Partial<ProvisionDeps> = {}): Provisi
     exists: host.exists,
     removeDir: host.removeDir,
     realpath: host.realpath,
+    pathKind: host.pathKind,
     freePort: host.freePort,
     readHostSecret: async () => `${OAUTH}\n`,
     waitPort: async () => true,
