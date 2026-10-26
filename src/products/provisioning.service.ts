@@ -257,14 +257,24 @@ const HEARTBEAT_FRESH_MS = 2 * 60 * 1000;
 export const DOMAIN_ERROR_MAX = 1000;
 
 /**
- * Признаки отказа смены ключей, после которого состояние машины неизвестно:
- * describeFailure агента ставит «НА ХОСТЕ ОСТАЛОСЬ:» перед остатками, срок
- * агента (overdue) и очередь по слагу (notStarted — эта смена хост не
- * трогала, но прежняя, брошенная по сроку, ещё идёт) пишут «НЕИЗВЕСТНО»,
- * откат rekey.ts — «откат не удался». Регистр важен: «неизвестный вид
- * задания» старого агента (хост не тронут) сюда попадать не должен.
+ * Признаки отказа смены ключей, после которого продукт может не отвечать и
+ * повтор не поможет (rekey_unknown — «напишите в поддержку», logger.error):
+ *   - «НА ХОСТЕ ОСТАЛОСЬ:» — describeFailure агента перед остатками;
+ *   - «НЕИЗВЕСТНО» — срок агента (overdue) и очередь по слагу (notStarted:
+ *     эта смена хост не трогала, но прежняя, брошенная по сроку, ещё идёт);
+ *   - «откат не удался» — откат rekey.ts;
+ *   - «от прерванной смены ключей» — на хосте остался <слаг>__rekey: эта смена
+ *     ничего не тронула, но какой контейнер несёт подтверждённые ключи, по
+ *     хосту не понять, и каждый повтор откажет так же — разбор руками;
+ *   - «не запущен (спит или прервана» — контейнер продукта стоит, хотя база
+ *     считает его работающим: продукт и так не отвечает.
+ * Тексты — дословно из product-runner/src/host/rekey.ts и index.ts; их сверяет
+ * с ЭТОЙ строкой (читая файл) product-runner/src/host/rekey-report-markers.spec.ts,
+ * поэтому форма строки — одна строка «const REKEY_UNKNOWN_RE = /…/;».
+ * Регистр важен и флага i нет: «неизвестный вид задания» старого агента (хост
+ * не тронут, продукт на старых ключах) сюда попадать не должен.
  */
-const REKEY_UNKNOWN_RE = /НА ХОСТЕ ОСТАЛОСЬ|НЕИЗВЕСТНО|откат не удался/;
+const REKEY_UNKNOWN_RE = /НА ХОСТЕ ОСТАЛОСЬ|НЕИЗВЕСТНО|откат не удался|от прерванной смены ключей|не запущен \(спит или прервана/;
 
 /**
  * Причина отказа задания rekey, когда коробку ключей карточки не удалось
@@ -272,6 +282,14 @@ const REKEY_UNKNOWN_RE = /НА ХОСТЕ ОСТАЛОСЬ|НЕИЗВЕСТНО|
  * никто не трогал, и человеку важно ровно это.
  */
 const REKEY_BOX_UNREADABLE = 'коробка ключей не читается — ключи не менялись';
+
+/**
+ * Чем стирание заменяет свободный текст продукта, который нельзя обнулить
+ * (product_turns.prompt — NOT NULL) или чьё «было/не было» значимо для
+ * истории (result, error). Числа, статусы и время остаются: по ним считаются
+ * деньги и история машины.
+ */
+export const PURGED_TEXT = '[стёрто]';
 
 /**
  * Подрезка до DOMAIN_ERROR_MAX по КОДОВЫМ ТОЧКАМ, а не по UTF-16: `slice`
@@ -1129,8 +1147,18 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
         // JSON.parse в новых Node цитирует кусок разбираемого текста, то есть
         // расшифрованные значения.
         const why = e instanceof SyntaxError ? 'тело коробки не JSON' : String(e?.message ?? e).slice(0, 200);
-        this.logger.error(`смена ключей ${row.slug}: коробка ключей карточки не расшифровывается (${why}) — задание ${row.job_id} закрыто отказом, ключи не менялись`);
-        await this.completeRekeyJob(row.job_id, { ok: false, error: REKEY_BOX_UNREADABLE });
+        // Закрытие — лучшим усилием: его отказ (обрыв с базой) не повод
+        // отдавать агенту 500 — задание всё равно не выдаётся, его снимет
+        // сборщик. «Закрыто отказом» — только после того, как закрылось.
+        try {
+          await this.completeRekeyJob(row.job_id, { ok: false, error: REKEY_BOX_UNREADABLE });
+          this.logger.error(`смена ключей ${row.slug}: коробка ключей карточки не расшифровывается (${why}) — задание ${row.job_id} закрыто отказом, ключи не менялись`);
+        } catch (e2: any) {
+          this.logger.error(
+            `смена ключей ${row.slug}: коробка ключей карточки не расшифровывается (${why}), и задание ${row.job_id} ` +
+              `закрыть не удалось (${String(e2?.message ?? e2).slice(0, 200)}) — его снимет сборщик; ключи не менялись`,
+          );
+        }
         return null;
       }
     }
@@ -1508,12 +1536,15 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       // успехе) или кто-то снаружи (блокировка, сборщик по сроку, удаление).
       const was = await this.pg
         .query(
-          `SELECT j.status, p.slug FROM product_provision_jobs j JOIN products p ON p.id = j.product_id WHERE j.id = $1`,
+          `SELECT j.status, j.error, p.slug FROM product_provision_jobs j JOIN products p ON p.id = j.product_id WHERE j.id = $1`,
           [jobId],
         )
         .then((q: any) => q.rows[0])
         .catch(() => undefined);
       const who = was?.slug ?? '?';
+      // Тот же отказ, которым этот же путь задание и закрыл, — повтор POST-а,
+      // а не новость: тревога о нём уже прозвучала при первом отчёте.
+      const sameFailure = !result.ok && was?.status === 'failed' && was?.error === (result.error ?? 'без причины');
       if (result.ok) {
         if (was?.status === 'done') {
           this.logger.warn(`повторный отчёт об успехе по заданию rekey ${jobId} (${who}) — уже закрыто, ключи не тронуты`);
@@ -1527,9 +1558,12 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
               'в контейнере новые ключи, в базе прежние, сверить руками',
           );
         }
+      } else if (sameFailure) {
+        this.logger.warn(`повторный отчёт об отказе по заданию rekey ${jobId} (${who}) — уже закрыто им же`);
       } else if (unknown) {
-        // Поздний отказ с неизвестным исходом: карточку уже закрыли снаружи,
-        // но продукт после такого отказа может не отвечать — громко.
+        // Поздний отказ с неизвестным исходом: задание сняли снаружи
+        // (сборщик, блокировка, удаление), но продукт после такого отказа
+        // может не отвечать — громко.
         this.logger.error(
           `смена ключей ${who}: поздний отчёт по снятому заданию ${jobId} — исход на машине неизвестен, ` +
             `продукт может не отвечать — ${String(result.error ?? '').slice(0, 300)}`,
@@ -1558,7 +1592,12 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     if (result.ok && typeof row.tg_bot_id === 'string' && /^\d{1,20}$/.test(row.tg_bot_id)) {
       try {
         await this.pg.query(
-          `UPDATE products SET tg_bot_id = $2, tg_bot_checked_at = now() WHERE id = $1 AND archived_at IS NULL`,
+          // Без archived_at IS NULL: у удалённого tg_bot_id обязан быть
+          // правдой (в контейнере уже новый токен), иначе возврат продукта
+          // сверял бы занятость бота по прежнему номеру. Частичный UNIQUE
+          // products_tg_bot_live архивных строк не видит — столкнуться тут
+          // может только живой продукт.
+          `UPDATE products SET tg_bot_id = $2, tg_bot_checked_at = now() WHERE id = $1`,
           [row.product_id, row.tg_bot_id],
         );
       } catch (e: any) {
@@ -1579,6 +1618,17 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    * ключи и первая правка, снимается строка своего домена (освобождает
    * домен для других: индекс занятости product_domains_occupied), пишется
    * строка журнала. Резервную копию стирает обход (product-purge.service).
+   *
+   * Свободный текст продукта стирается тем же оператором (решение контролёра
+   * по ревью задачи 10 — «стирается насовсем»): prompt, result и error правок
+   * (product_turns) заменяются меткой PURGED_TEXT, первая правка из payload
+   * карточек продукта (product_actions.payload->'prompt') удаляется. Числа
+   * (tokens_spent), статусы, sha и время остаются: по ним — деньги и история.
+   *
+   * Помечается «стёртым» только удалённый (archived_at не NULL): выдача purge
+   * другим невозможна (claimJob), но отчёт об успехе по живому продукту не
+   * должен стирать его — это тревога, а не стирание, и журнал «стёрт» тогда не
+   * пишется.
    * tg_bot_id и port не трогаются: не секрет, нужны журналу; частичный
    * индекс products_tg_bot_live архивных и так не видит.
    *
@@ -1599,11 +1649,23 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
           UPDATE products p
              SET purged_at = now(), secrets_encrypted = NULL, first_prompt = NULL, first_prompt_channel = NULL
             FROM closed
-           WHERE $2::boolean AND p.id = closed.product_id AND p.purged_at IS NULL
+           WHERE $2::boolean AND p.id = closed.product_id AND p.archived_at IS NOT NULL AND p.purged_at IS NULL
           RETURNING p.id
        ), domains AS (
           DELETE FROM product_domains d USING purged WHERE d.product_id = purged.id
           RETURNING d.product_id
+       ), turns AS (
+          UPDATE product_turns t
+             SET prompt = $5::text,
+                 result = CASE WHEN t.result IS NULL THEN NULL ELSE $5::text END,
+                 error = CASE WHEN t.error IS NULL THEN NULL ELSE $5::text END
+            FROM purged WHERE t.product_id = purged.id
+          RETURNING t.id
+       ), prompts AS (
+          UPDATE product_actions a
+             SET payload = a.payload - 'prompt'
+            FROM purged WHERE a.product_id = purged.id AND a.payload ? 'prompt'
+          RETURNING a.id
        ), logged AS (
           INSERT INTO product_actions (user_id, product_id, kind, status, channel, payload, result, attached_at, resolved_at)
           SELECT p.user_id, p.id, 'purge',
@@ -1612,12 +1674,26 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                  CASE WHEN $2::boolean THEN '{}'::jsonb ELSE jsonb_build_object('error', $4::text) END,
                  now(), now()
             FROM products p JOIN closed c ON c.product_id = p.id
+           -- Успех пишется в журнал, только если продукт правда помечен
+           -- стёртым; отказ — всегда.
+           WHERE NOT $2::boolean OR EXISTS (SELECT 1 FROM purged)
           RETURNING id
        )
-       SELECT (SELECT count(*) FROM closed)::int AS closed`,
-      [jobId, result.ok, result.error ?? 'без причины', PURGE_FAILED_SAY],
+       SELECT (SELECT count(*) FROM closed)::int AS closed,
+              (SELECT count(*) FROM purged)::int AS purged,
+              (SELECT slug FROM products WHERE id = (SELECT product_id FROM closed)) AS slug`,
+      [jobId, result.ok, result.error ?? 'без причины', PURGE_FAILED_SAY, PURGED_TEXT],
     );
-    if (!r.rows[0]?.closed) this.logger.warn(`отчёт по незапущенному заданию purge ${jobId} — продукт не тронут`);
+    const row = r.rows[0];
+    if (!row?.closed) {
+      this.logger.warn(`отчёт по незапущенному заданию purge ${jobId} — продукт не тронут`);
+      return;
+    }
+    if (result.ok && !row.purged) {
+      // Агент стёр продукт на машине, а в базе он не удалён (или уже стёрт):
+      // строка не тронута, но машина и база расходятся — разбор руками.
+      this.logger.error(`стирание ${row.slug}: агент отчитался об успехе, но продукт не удалён или уже стёрт — в базе ничего не стёрто, сверить руками`);
+    }
   }
 
   /**
