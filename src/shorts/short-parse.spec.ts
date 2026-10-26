@@ -1,4 +1,4 @@
-import { MAX_QUESTION_CHARS, MIN_QUESTION_CHARS, extractJsonObject, parseDirectorReply, parseWriterReply } from './short-parse';
+import { MAX_QUESTION_CHARS, MIN_QUESTION_CHARS, extractJsonObject, parseDirectorReply, parseSkit, parseWriterReply } from './short-parse';
 
 describe('extractJsonObject', () => {
   it('берёт объект из забора и из обвязки', () => {
@@ -39,7 +39,17 @@ describe('parseDirectorReply', () => {
   };
 
   it('нормальный ответ', () => {
-    expect(parseDirectorReply(JSON.stringify(ok), free)).toEqual(ok);
+    expect(parseDirectorReply(JSON.stringify(ok), free)).toEqual({ ...ok, skit: null });
+  });
+
+  it('ролик со сценками — сценка 1 полями; без неё ответ не годится', () => {
+    const skit = {
+      cast: [{ hero: 'galina', role: 'хозяйка квартиры' }, { hero: 'kesha', role: 'жилец' }],
+      setting: 'a hallway', opening: 'The goose blocks the door.', action: 'The goose hisses.',
+      lines: [{ hero: 'galina', text: 'Залог мой!' }],
+    };
+    expect(parseDirectorReply(JSON.stringify({ ...ok, skit }), { ...free, skit: true }).skit).toEqual(skit);
+    expect(() => parseDirectorReply(JSON.stringify(ok), { ...free, skit: true })).toThrow(/режиссёр: skit — объект/);
   });
 
   it('ассистент не из списка и не тот, что задан темой', () => {
@@ -119,8 +129,46 @@ describe('parseWriterReply', () => {
     expect(() => parseWriterReply(JSON.stringify({ ...w, lines: [{ text: 'без номера' }] }))).toThrow(/box/);
   });
 
+  it('ролик со сценками: развязка обязательна, конфликт — только если переписан', () => {
+    const punchline = {
+      cast: [{ hero: 'kesha', role: 'жилец' }, { hero: 'galina', role: 'хозяйка квартиры' }],
+      setting: 'the same hallway', opening: 'The capybara holds up the phone.', action: 'The goose drops the keys.',
+      lines: [{ hero: 'kesha', text: 'Это износ.', box: '3' }, { hero: 'galina', text: 'Га-га… ладно.' }],
+    };
+    const r = parseWriterReply(JSON.stringify({ ...w, punchline }), { skit: true });
+    expect(r.skits.conflict).toBeNull();
+    expect(r.skits.punchline?.lines).toEqual([{ hero: 'kesha', text: 'Это износ.', box: 3 }, { hero: 'galina', text: 'Га-га… ладно.' }]);
+    const conflict = { ...punchline, lines: [{ hero: 'galina', text: 'Залог мой!' }] };
+    expect(parseWriterReply(JSON.stringify({ ...w, punchline, conflict }), { skit: true }).skits.conflict?.lines).toEqual([{ hero: 'galina', text: 'Залог мой!' }]);
+    expect(() => parseWriterReply(JSON.stringify(w), { skit: true })).toThrow(/сценарист: punchline — объект/);
+    // Без формата skit сценки не разбираются вовсе.
+    expect(parseWriterReply(JSON.stringify({ ...w, punchline })).skits).toEqual({ conflict: null, punchline: null });
+  });
+
   it('нет зацепки или заголовка YouTube — ошибка', () => {
     expect(() => parseWriterReply(JSON.stringify({ ...w, hook: '' }))).toThrow(/зацепк/);
     expect(() => parseWriterReply(JSON.stringify({ ...w, captions: { ...w.captions, youtube: { ...w.captions.youtube, title: '' } } }))).toThrow(/YouTube/);
+  });
+});
+
+describe('parseSkit', () => {
+  it('поля — строками без пробелов по краям; пустой box — нет box; кривой box — ошибка с местом', () => {
+    const s = parseSkit({
+      cast: [{ hero: ' kesha ', role: ' жилец ' }],
+      setting: ' a hallway ', opening: 'o', action: 'a',
+      lines: [{ hero: 'kesha', text: ' Спокойно. ', box: '' }, { hero: 'kesha', text: 'Да', box: null }],
+    }, 'режиссёр', 'skit');
+    expect(s).toEqual({
+      cast: [{ hero: 'kesha', role: 'жилец' }],
+      setting: 'a hallway', opening: 'o', action: 'a',
+      lines: [{ hero: 'kesha', text: 'Спокойно.' }, { hero: 'kesha', text: 'Да' }],
+    });
+    expect(() => parseSkit({ lines: [{ hero: 'kesha', text: 'x', box: 'три' }] }, 'сценарист', 'punchline'))
+      .toThrow('сценарист: punchline, реплика 1 — box должен быть номером абзаца');
+    expect(() => parseSkit([], 'режиссёр', 'skit')).toThrow(/объект/);
+  });
+
+  it('нехватку полей не прячет: пустые строки и массивы уходят на проверку правил', () => {
+    expect(parseSkit({}, 'режиссёр', 'skit')).toEqual({ cast: [], setting: '', opening: '', action: '', lines: [] });
   });
 });
