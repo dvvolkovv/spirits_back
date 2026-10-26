@@ -9,7 +9,9 @@ export function validateScript(script: Script, capture: Pick<CaptureResult, 'box
   const problems: string[] = [];
   const hook = script.hook?.trim() ?? '';
   if (!hook) problems.push('нет зацепки');
-  if (hook.split(/\s+/).filter(Boolean).length > 8) problems.push('зацепка длиннее 8 слов');
+  // Словом считаем токен с буквой или цифрой — тем же фильтром, что API (short-rules.ts):
+  // тире и прочие знаки между репликами не слова.
+  if (hook.split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length > 8) problems.push('зацепка длиннее 8 слов');
   if (!script.voice?.trim()) problems.push('не задан голос');
 
   const ids = new Set<string>();

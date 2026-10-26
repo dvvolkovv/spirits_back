@@ -1,4 +1,4 @@
-import { WRITER_FEEDBACK_CODES, type StudioError } from '../errors';
+import { WRITER_FEEDBACK_CODES, type StudioError, type StudioErrorCode } from '../errors';
 import type { CaptureResult, Scene, Script } from '../types';
 
 /** То, что нужно от pg.Pool, — чтобы в тестах рабочего процесса его можно было заменить. */
@@ -161,6 +161,19 @@ export async function completeRender(db: Queryable, job: Job, out: RenderOutput)
   return (r.rowCount ?? 0) > 0;
 }
 
+/**
+ * Слово-вводка перед сообщением сценаристу в writer_feedback: для кодов по длине
+ * озвучки сообщение само по себе («timeline: ролик 63.2 с — длиннее 60 с») не
+ * называет этап, вводка нужна. У script_invalid сообщение уже называет его
+ * само («render: сценарий не прошёл проверку: …») — вводка задвоила бы слово
+ * «сценарий».
+ */
+const WRITER_FEEDBACK_LABEL: Partial<Record<StudioErrorCode, string>> = {
+  too_long: 'озвучка',
+  too_short: 'озвучка',
+  line_too_short: 'озвучка',
+};
+
 /** Предел last_error — по символам: .slice по UTF-16 рвал бы суррогатную пару эмодзи. */
 const MAX_ERROR_CHARS = 1000;
 
@@ -172,8 +185,9 @@ function errorText(label: string, err: StudioError): string {
 
 /**
  * Сбой задания:
- * - озвучка вышла за 30–60 с или реплика короче 1,5 с — сценарий назад
- *   сценаристу с пояснением, пока кругов меньше MAX_WRITER_ROUNDS; круги
+ * - озвучка вышла за 30–60 с, реплика короче 1,5 с или студия отвергла сам
+ *   сценарий (script_invalid) — сценарий назад сценаристу с пояснением, пока
+ *   кругов меньше MAX_WRITER_ROUNDS; круги
  *   кончились — failed с failed_from = 'writing' и тем же пояснением: «Повторить»
  *   вернёт ролик сценаристу с отзывом студии, а не пересоберёт заведомо
  *   неподходящий сценарий;
@@ -189,7 +203,8 @@ export async function failJob(db: Queryable, job: Job, err: StudioError): Promis
     return (r.rowCount ?? 0) > 0 ? outcome : 'gone';
   };
   if (job.kind === 'render' && WRITER_FEEDBACK_CODES.has(err.code)) {
-    const feedback = `озвучка: ${err.message}`;
+    const label = WRITER_FEEDBACK_LABEL[err.code];
+    const feedback = label ? `${label}: ${err.message}` : err.message;
     if (job.writerRounds < MAX_WRITER_ROUNDS) {
       return write(
         `UPDATE short_video

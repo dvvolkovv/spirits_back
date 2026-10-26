@@ -24,8 +24,12 @@ export type StudioErrorCode =
   | 'no_input'
   | 'unknown';
 
-/** Озвучка вышла за 30–60 с или реплика слишком короткая — править сценаристу, а не повторять сборку. */
-export const WRITER_FEEDBACK_CODES: ReadonlySet<StudioErrorCode> = new Set<StudioErrorCode>(['too_short', 'too_long', 'line_too_short']);
+/**
+ * Озвучка вышла за 30–60 с, реплика слишком короткая или студия отвергла сам
+ * сценарий (script_invalid) — править сценаристу, а не повторять сборку:
+ * сборка с тем же сценарием провалится снова.
+ */
+export const WRITER_FEEDBACK_CODES: ReadonlySet<StudioErrorCode> = new Set<StudioErrorCode>(['too_short', 'too_long', 'line_too_short', 'script_invalid']);
 
 export class StudioError extends Error {
   readonly code: StudioErrorCode;
