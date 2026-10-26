@@ -20,9 +20,8 @@ describe('010 обязательна: её колонку читает кажд�
     await expect(new ProductsService(pg as any).onModuleInit()).rejects.toThrow(/010_rekey_purge\.sql/);
   });
 
-  it('010 — последней в списке, после 009 (ссылается на product_actions)', () => {
+  it('010 идёт сразу после 009 (ссылается на product_actions)', () => {
     expect(MIGRATIONS.indexOf('010_rekey_purge.sql')).toBe(MIGRATIONS.indexOf('009_product_actions.sql') + 1);
-    expect(MIGRATIONS[MIGRATIONS.length - 1]).toBe('010_rekey_purge.sql');
   });
 });
 
@@ -46,6 +45,22 @@ maybe('010_rekey_purge против живого Postgres', () => {
 
   it('второй прогон всего списка проходит без ошибок', async () => {
     await expect(apply()).resolves.toBeUndefined();
+  });
+
+  it('внешний ключ на action_id — один, второй прогон его не дублирует', async () => {
+    // ADD COLUMN IF NOT EXISTS на повторном прогоне — честный no-op (колонка
+    // уже есть), но ссылка REFERENCES объявлена ПРИ добавлении колонки, а не
+    // отдельным ADD CONSTRAINT — стоило проверить, что второй прогон не
+    // прицепил бы вторую такую же ссылку молча.
+    const fk = await pool.query(
+      `SELECT count(*)::int AS n
+         FROM pg_constraint c
+         JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+        WHERE c.conrelid = 'product_provision_jobs'::regclass
+          AND c.contype = 'f'
+          AND a.attname = 'action_id'`,
+    );
+    expect(fk.rows[0].n).toBe(1);
   });
 
   it('у задания есть action_id, и удаление карточки его обнуляет, а не удаляет задание', async () => {

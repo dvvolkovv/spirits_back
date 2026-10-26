@@ -65,8 +65,9 @@ ALTER TABLE products DROP CONSTRAINT IF EXISTS products_status_check;
 ALTER TABLE products ADD CONSTRAINT products_status_check
   CHECK (status IN ('provisioning','running','degraded','stopped','archived','failed','sleeping','blocked'));
 
--- ВИД ЗАДАНИЯ. Сегодня вид один и подразумевается; со сном их три, а со
--- своим доменом (008_domains.sql) — четыре.
+-- ВИД ЗАДАНИЯ. Сегодня вид один и подразумевается; со сном их три, со своим
+-- доменом (008_domains.sql) — четыре, а со сменой ключей и стиранием
+-- (010_rekey_purge.sql, очередь 2) — шесть.
 --
 -- DEFAULT здесь ОСТАЁТСЯ — в отличие от products.kind, у которого 002 его
 -- снимает следующей же строкой. Разница не в стиле: у продукта забытый kind
