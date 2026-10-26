@@ -335,4 +335,37 @@ maybe('жизненный цикл продукта против живого Po
       expect(Number(live.rows[0].count)).toBe(1);
     });
   });
+
+  describe('подметальщик зависших карточек (ревью задачи 10, пункт E)', () => {
+    it('working, просроченный больше 10 минут — failed; working с будущим сроком и pending не трогает', async () => {
+      const actions = new ProductActionsService(pg as any);
+      const userId = 'u-stuck';
+
+      const stale = await actions.open({ userId, productId: null, kind: 'delete', channel: 'web', turn: null, payload: {} });
+      await pool.query(
+        `UPDATE product_actions SET status = 'working', expires_at = now() - interval '11 minutes' WHERE id = $1`,
+        [stale.id],
+      );
+
+      const fresh = await actions.open({ userId, productId: null, kind: 'delete', channel: 'web', turn: null, payload: {} });
+      await pool.query(
+        `UPDATE product_actions SET status = 'working', expires_at = now() + interval '5 minutes' WHERE id = $1`,
+        [fresh.id],
+      );
+
+      const pending = await actions.open({ userId, productId: null, kind: 'delete', channel: 'web', turn: null, payload: {} });
+
+      expect(await actions.sweepStuck()).toBe(1);
+
+      const staleRow = (await pool.query('SELECT status, result FROM product_actions WHERE id = $1', [stale.id])).rows[0];
+      expect(staleRow.status).toBe('failed');
+      expect(staleRow.result).toMatchObject({ error: 'Действие прервалось — попросите ассистента повторить' });
+
+      const freshRow = (await pool.query('SELECT status FROM product_actions WHERE id = $1', [fresh.id])).rows[0];
+      expect(freshRow.status).toBe('working');
+
+      const pendingRow = (await pool.query('SELECT status FROM product_actions WHERE id = $1', [pending.id])).rows[0];
+      expect(pendingRow.status).toBe('pending');
+    });
+  });
 });

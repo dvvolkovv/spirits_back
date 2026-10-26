@@ -226,6 +226,32 @@ export class ProductActionsService {
     );
   }
 
+  /**
+   * working-карточки, чей процесс умер между claim и finish/release (обрыв
+   * с базой, падение процесса) — то, что completeDelete/completeCreateBot
+   * сами чинят release-ом на известных отказах не ловит: их catch просто не
+   * выполнился. claim и cancel требуют status='pending', поэтому без этой
+   * подметки такая карточка осталась бы в working навечно.
+   *
+   * expires_at у working НЕ продлевается claim-ом (он остаётся таким же,
+   * каким был у pending) — поэтому срок в прошлом у working-строки надёжно
+   * отличает мертвеца от долгой, но живой операции: сама работа (проверка
+   * токена, один SQL) занимает секунды, а не минуты. Запас 10 минут — чтобы
+   * не подмести карточку, которую в эту секунду как раз обрабатывает живой
+   * процесс на грани истечения срока.
+   */
+  async sweepStuck(): Promise<number> {
+    const r = await this.pg.query(
+      `UPDATE product_actions
+          SET status = 'failed',
+              result = jsonb_build_object('error', 'Действие прервалось — попросите ассистента повторить'),
+              resolved_at = now()
+        WHERE status = 'working' AND expires_at < now() - interval '10 minutes'
+       RETURNING id`,
+    );
+    return r.rows.length;
+  }
+
   async cancel(userId: string, id: string): Promise<boolean> {
     if (!UUID_RE.test(String(id))) return false;
     const r = await this.pg.query(

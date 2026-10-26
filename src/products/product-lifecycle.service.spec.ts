@@ -136,6 +136,27 @@ describe('создание бота', () => {
     const h = harness();
     expect(await h.svc.completeCreateBot({ userId: 'u1', actionId: ACT, set: {}, via: 'chat' })).toMatchObject({ reason: 'not_pending' });
   });
+
+  it('обрыв с базой на проверке занятости бота — карточка возвращается в pending, не умирает навсегда', async () => {
+    const h = harness({ pg: (sql) => (sql.includes('WHERE tg_bot_id = $1') ? Promise.reject(new Error('connection reset by peer')) : undefined) });
+    h.actions.claim.mockResolvedValue(claimed);
+    const r = await h.svc.completeCreateBot({ userId: 'u1', actionId: ACT, set: { BOT_TOKEN: TOKEN }, via: 'chat' });
+    expect(r).toEqual({ ok: false, reason: 'failed', message: 'Не получилось — попробуйте ещё раз позже' });
+    expect(h.actions.release).toHaveBeenCalledWith(ACT, expect.objectContaining({ error: expect.any(String) }));
+    expect(h.actions.finish).not.toHaveBeenCalled();
+    expect(h.provisioning.create).not.toHaveBeenCalled();
+  });
+
+  it('бот создан, но первая правка не поставилась — карточка всё равно закрывается done, а не failed', async () => {
+    const h = harness({ pg: (sql) => (sql.includes('SET first_prompt') ? Promise.reject(new Error('connection reset by peer')) : undefined) });
+    h.actions.claim.mockResolvedValue(claimed);
+    const warn = jest.spyOn((h.svc as any).logger, 'warn').mockImplementation(() => undefined);
+    const r = await h.svc.completeCreateBot({ userId: 'u1', actionId: ACT, set: { BOT_TOKEN: TOKEN }, via: 'tma' });
+    expect(r).toEqual({ ok: true, productId: 'p-new' });
+    expect(h.actions.finish).toHaveBeenCalledWith(ACT, 'done', { productId: 'p-new', botUsername: 'shop_bot' }, 'p-new');
+    expect(h.actions.release).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
+  });
 });
 
 describe('удаление', () => {
@@ -164,6 +185,32 @@ describe('удаление', () => {
     const r = await h.svc.completeDelete({ userId: 'u1', actionId: ACT, via: 'chat' });
     expect(r).toMatchObject({ ok: false, reason: 'not_pending' });
     expect(h.actions.release).toHaveBeenCalledWith(ACT, {});
+  });
+
+  it('обрыв с базой на архивации — карточка возвращается в pending, не умирает навсегда', async () => {
+    const h = harness({ pg: (sql) => (sql.includes('SET archived_at = now()') ? Promise.reject(new Error('connection reset by peer')) : undefined) });
+    h.actions.claim.mockResolvedValue({ id: ACT, kind: 'delete', product_id: 'p1', channel: 'web', payload: {} });
+    const r = await h.svc.completeDelete({ userId: 'u1', actionId: ACT, via: 'chat' });
+    expect(r).toEqual({ ok: false, reason: 'failed', message: 'Не получилось — попробуйте ещё раз позже' });
+    expect(h.actions.release).toHaveBeenCalledWith(ACT, expect.objectContaining({ error: expect.any(String) }));
+    expect(h.actions.finish).not.toHaveBeenCalled();
+  });
+
+  it('продукт архивирован, но снятие заданий и постановка сна упали — карточка всё равно закрывается done', async () => {
+    const until = new Date('2026-11-24T10:00:00Z');
+    const h = harness({
+      pg: (sql) => {
+        if (sql.includes('SET archived_at = now()')) return { rows: [{ purge_after: until }] };
+        if (sql.includes("status = 'queued' AND kind <> 'sleep'")) return Promise.reject(new Error('timeout'));
+        return undefined;
+      },
+    });
+    h.actions.claim.mockResolvedValue({ id: ACT, kind: 'delete', product_id: 'p1', channel: 'web', payload: {} });
+    const warn = jest.spyOn((h.svc as any).logger, 'warn').mockImplementation(() => undefined);
+    const r = await h.svc.completeDelete({ userId: 'u1', actionId: ACT, via: 'chat' });
+    expect(r).toEqual({ ok: true, restoreUntil: until.toISOString() });
+    expect(h.actions.finish).toHaveBeenCalledWith(ACT, 'done', { restoreUntil: until.toISOString() });
+    expect(warn).toHaveBeenCalled();
   });
 });
 

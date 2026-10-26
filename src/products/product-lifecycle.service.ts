@@ -69,8 +69,22 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   onModuleInit() {
-    this.timers.push(setInterval(() => void this.safe('первая правка', () => this.firstPromptTick()), 30_000));
-    this.timers.push(setInterval(() => void this.safe('сон удалённых', () => this.sleepDeletedTick()), 60_000));
+    const firstPrompt = setInterval(() => void this.safe('первая правка', () => this.firstPromptTick()), 30_000);
+    // unref, иначе таймер держит процесс и jest не завершается (тот же приём —
+    // rent.service.ts, provisioning.service.ts).
+    firstPrompt.unref?.();
+    this.timers.push(firstPrompt);
+
+    const sleepDeleted = setInterval(() => void this.safe('сон удалённых', () => this.sleepDeletedTick()), 60_000);
+    sleepDeleted.unref?.();
+    this.timers.push(sleepDeleted);
+
+    // Отдельный оборот, не довесок к соседнему: подметает working-карточки,
+    // чей процесс умер между claim и finish/release, не затрагивая pending —
+    // смысл другой, и смешивать его с сном удалённых незачем.
+    const stuckActions = setInterval(() => void this.safe('зависшие действия', () => this.actions.sweepStuck()), 60_000);
+    stuckActions.unref?.();
+    this.timers.push(stuckActions);
   }
 
   onModuleDestroy() {
@@ -165,14 +179,19 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       await this.actions.release(row.id, { error: message, field: 'BOT_TOKEN' });
       return { ok: false, reason: 'bad_token', message };
     }
-    const busy = await this.pg.query(`SELECT 1 FROM products WHERE tg_bot_id = $1 AND archived_at IS NULL LIMIT 1`, [check.id]);
-    if (busy.rows.length) {
-      const message = 'Этот бот уже работает в другом продукте — создайте в @BotFather нового бота';
-      await this.actions.release(row.id, { error: message, field: 'BOT_TOKEN' });
-      return { ok: false, reason: 'bot_in_use', message };
-    }
     const name = String(row.payload?.name ?? '').trim();
     try {
+      // Проверка занятости — ТЕПЕРЬ внутри protected-региона: раньше обрыв
+      // с базой прямо на этом SELECT проваливался наружу необработанным, и
+      // карточка оставалась в working навсегда — ни claim (ждёт pending),
+      // ни cancel (тоже) её оттуда не вытаскивают. Единый catch ниже чинит
+      // это для любой неожиданной ошибки между claim и finish/release.
+      const busy = await this.pg.query(`SELECT 1 FROM products WHERE tg_bot_id = $1 AND archived_at IS NULL LIMIT 1`, [check.id]);
+      if (busy.rows.length) {
+        const message = 'Этот бот уже работает в другом продукте — создайте в @BotFather нового бота';
+        await this.actions.release(row.id, { error: message, field: 'BOT_TOKEN' });
+        return { ok: false, reason: 'bot_in_use', message };
+      }
       // Второй, окончательный барьер против одного бота в двух продуктах —
       // tgBotId уходит в тот же INSERT, что заводит продукт (а не отдельным
       // UPDATE после): ранняя проверка выше читает только уже живые
@@ -184,10 +203,30 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
         userId: i.userId, name, slug: slugWithSuffix(name, this.suffix(), 'bot'), kind: 'bot', secrets,
         isAdmin: await this.isAdmin(i.userId), tgBotId: check.id,
       });
-      await this.setFirstPrompt(productId, row.payload?.prompt, row.channel);
+      try {
+        // Бот уже создан — отказ первой правки не должен откатывать карточку
+        // в failed: это сказало бы человеку «бот не создан», когда он уже
+        // есть и работает. Лог без секретов (prompt не секрет, но и не
+        // причина тащить его в сообщение сверх необходимого) — и всё равно
+        // закрываем карточку как done.
+        await this.setFirstPrompt(productId, row.payload?.prompt, row.channel);
+      } catch (e: any) {
+        this.logger.warn(`первая правка бота ${productId} не поставлена: ${e?.message}`);
+      }
       await this.actions.finish(row.id, 'done', { productId, botUsername: check.username }, productId);
       return { ok: true, productId };
     } catch (e: any) {
+      if (!(e instanceof HttpException)) {
+        // Непонятная ошибка (обрыв с базой, таймаут пула) между claim и
+        // finish/release — без release карточка умерла бы в working
+        // навсегда: claim и cancel требуют status='pending', а working в
+        // него без этой строки не возвращается ничем. Текст — общий, сырая
+        // ошибка (с именами колонок, текстом драйвера) — в лог, не человеку.
+        this.logger.warn(`createBot ${row.id} упал между claim и finish: ${e?.stack ?? e?.message ?? e}`);
+        const message = 'Не получилось — попробуйте ещё раз позже';
+        await this.actions.release(row.id, { error: message });
+        return { ok: false, reason: 'failed', message };
+      }
       const f = failOf(e, 'Бот не создан', this.logger);
       if (f.reason === 'conflict' && f.message === 'бот уже работает в другом продукте') {
         // Тот же пользовательский текст, что у ранней SELECT-проверки выше —
@@ -227,26 +266,47 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       if (row) await this.actions.release(row.id, row.result ?? {});
       return { ok: false, reason: 'not_pending', message: 'Карточка уже закрыта или срок вышел' };
     }
-    const r = await this.pg.query(
-      `UPDATE products
-          SET archived_at = now(), purge_after = now() + make_interval(days => $3),
-              status = 'archived', first_prompt = NULL, first_prompt_channel = NULL
-        WHERE id = $1 AND user_id = $2 AND archived_at IS NULL AND status <> 'provisioning'
-        RETURNING purge_after`,
-      [row.product_id, i.userId, DELETE_GRACE_DAYS],
-    );
+    let r: any;
+    try {
+      r = await this.pg.query(
+        `UPDATE products
+            SET archived_at = now(), purge_after = now() + make_interval(days => $3),
+                status = 'archived', first_prompt = NULL, first_prompt_channel = NULL
+          WHERE id = $1 AND user_id = $2 AND archived_at IS NULL AND status <> 'provisioning'
+          RETURNING purge_after`,
+        [row.product_id, i.userId, DELETE_GRACE_DAYS],
+      );
+    } catch (e: any) {
+      // Обрыв прямо на архивации (не «0 строк» — это не исключение, оно
+      // ниже) — без release карточка умерла бы в working навсегда: claim и
+      // cancel требуют status='pending'. Текст — общий, сырая ошибка в лог.
+      this.logger.warn(`completeDelete ${row.id} упал на архивации: ${e?.stack ?? e?.message ?? e}`);
+      const message = 'Не получилось — попробуйте ещё раз позже';
+      await this.actions.release(row.id, { error: message });
+      return { ok: false, reason: 'failed', message };
+    }
     if (!r.rows[0]) {
       await this.actions.finish(row.id, 'failed', { error: 'Продукт уже удалён или ещё заводится' });
       return { ok: false, reason: 'gone', message: 'Продукт уже удалён или ещё заводится' };
     }
-    // Пробуждение и прочее в очереди архивному не выдаются и заняли бы место
-    // единственного активного задания — снимаем.
-    await this.pg.query(
-      `UPDATE product_provision_jobs SET status = 'failed', error = 'снято удалением', finished_at = now()
-        WHERE product_id = $1 AND status = 'queued' AND kind <> 'sleep'`,
-      [row.product_id],
-    );
-    await this.queueSleepForDeleted(row.product_id);
+    try {
+      // Продукт уже архивирован — отказ здесь не должен выглядеть отказом
+      // удаления (оно случилось) и не должен оставить карточку в working:
+      // sleepDeletedTick (60 с) всё равно переставит сон архивному продукту
+      // без сна, так что неудавшийся INSERT не теряет его навсегда — только
+      // лог и переход к finish(done).
+      //
+      // Пробуждение и прочее в очереди архивному не выдаются и заняли бы
+      // место единственного активного задания — снимаем.
+      await this.pg.query(
+        `UPDATE product_provision_jobs SET status = 'failed', error = 'снято удалением', finished_at = now()
+          WHERE product_id = $1 AND status = 'queued' AND kind <> 'sleep'`,
+        [row.product_id],
+      );
+      await this.queueSleepForDeleted(row.product_id);
+    } catch (e: any) {
+      this.logger.warn(`completeDelete ${row.id}: снятие заданий или постановка сна не прошли — доделает тик: ${e?.stack ?? e?.message ?? e}`);
+    }
     const restoreUntil = new Date(r.rows[0].purge_after).toISOString();
     await this.actions.finish(row.id, 'done', { restoreUntil });
     return { ok: true, restoreUntil };

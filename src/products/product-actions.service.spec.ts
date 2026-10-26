@@ -97,4 +97,15 @@ describe('ProductActionsService', () => {
     expect(h.calls[0].sql).toMatch(/channel = \$4/);
     expect(h.calls[0].params).toEqual(['u1', 't-1', since, null]);
   });
+
+  it('sweepStuck — только working старше 10 минут по сроку, общий текст без секретов', async () => {
+    const h = make();
+    const n = await h.svc.sweepStuck();
+    expect(n).toBe(0); // мок отдаёт пустой RETURNING — считаем ровно по длине rows
+    expect(h.calls[0].sql).toMatch(/status = 'working'/);
+    expect(h.calls[0].sql).toMatch(/expires_at < now\(\) - interval '10 minutes'/);
+    expect(h.calls[0].sql).toMatch(/status = 'failed'/);
+    expect(h.calls[0].sql).toMatch(/Действие прервалось/);
+    expect(h.calls[0].sql).not.toMatch(/BOT_TOKEN|pending/);
+  });
 });
