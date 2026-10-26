@@ -147,10 +147,10 @@ tsc фронта: `npx tsc -p tsconfig.app.json --noEmit 2>&1 | grep -c 'error T
 |---|---|---|
 | `src/components/products/secretNames.ts`, `secretNames.test.ts` | третья копия занятых имён + `OWNER_TG_ID` | 18 |
 | `src/services/productActionsApi.ts` | `remove`, `productKind`, `result.keyNames` | 18 |
-| `src/components/products/ProductActionCard.tsx`, `ProductActionCard.test.tsx` | форма ключей | 18 |
-| `src/components/webvisorPrivacy.test.ts` | сторож Вебвизора для новых полей | 18 |
-| `src/i18n/locales/*.json` | `products.action.keys.*`, подсказка формы Студии, 7 языков | 19 |
-| `src/tma/App.test.tsx` (новый) | мини-приложение открывает карточку ключей | 19 |
+| `src/components/products/ProductActionCard.tsx`, `ProductActionCard.test.tsx` | форма ключей | 20 |
+| `src/components/webvisorPrivacy.test.ts` | сторож Вебвизора для новых полей | 20 |
+| `src/i18n/locales/*.json` | `products.action.keys.*`, подсказка формы Студии, 7 языков; удаление `keys.unsupported` | 19, 20 |
+| `src/tma/App.test.tsx` (новый) | мини-приложение открывает карточку ключей | 20 |
 
 ---
 
@@ -955,7 +955,7 @@ function memoryBytes(raw: string | undefined): number {
 ```bash
 git -C $B add product-runner/src/host/fake-host.ts && git -C $B commit -q -m "runner: симулятор хоста — контейнер целиком, образы и метки, rename, exec" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
-Run (нода, агент): без списка файлов (`npx jest`). Expected: все наборы PASS, число тестов = базовая линия + 6 (задача 3 добавила свои). Затем tsc агента.
+Run (нода, агент): без списка файлов (`npx jest`). Expected: все наборы PASS (число тестов выросло на добавленные задачами 3–4, падений нет). Затем tsc агента.
 
 ---
 
@@ -1758,8 +1758,16 @@ Run (нода, агент): `src/host/purge.spec.ts src/host/rekey.spec.ts`. Exp
 - Modify: `product-runner/src/host/api.ts:16-58` (`HostJob`: `dropNames`, докблок `jobKind`)
 - Modify: `product-runner/src/host/index.ts` (`HostDeps` ~15–48, `KNOWN_KINDS` ~164, `workFor` ~207–251, `overdue` ~261–286, `RealDepsParts`/`realDeps` ~578–617)
 - Test: `product-runner/src/host/index.spec.ts` (`makeDeps` ~41–65 и новый `describe`)
+- Modify: `product-runner/src/host/review10.defects.spec.ts:109-118`, `product-runner/src/host/domain.spec.ts:236-245` — там тоже собираются объекты `HostDeps`; ts-jest агента проверяет типы, и без новых полей оба набора не скомпилируются
 
 - [ ] **Step 1: Тесты**
+
+В `product-runner/src/host/review10.defects.spec.ts` (объект `const deps: HostDeps = {…}`, после `domain: async () => undefined,`) и в `product-runner/src/host/domain.spec.ts` (`hostDepsWithRealDomain`, после строки `domain: (j) => applyDomain(j, deps(host)),`) добавить по две строки:
+
+```ts
+        rekey: async () => undefined,
+        purge: async () => undefined,
+```
 
 В `product-runner/src/host/index.spec.ts`:
 
@@ -1855,9 +1863,9 @@ describe('смена ключей и стирание (очередь 2)', () =>
 - [ ] **Step 2: Коммит, прогон — FAIL** (у `HostDeps` нет `rekey`/`purge`, у `HostJob` нет `dropNames`)
 
 ```bash
-git -C $B add product-runner/src/host/index.spec.ts && git -C $B commit -q -m "test(runner): виды rekey и purge в цикле агента (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git -C $B add product-runner/src/host/index.spec.ts product-runner/src/host/review10.defects.spec.ts product-runner/src/host/domain.spec.ts && git -C $B commit -q -m "test(runner): виды rekey и purge в цикле агента (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
-Run (нода, агент): `src/host/index.spec.ts`.
+Run (нода, агент): `src/host/index.spec.ts src/host/review10.defects.spec.ts src/host/domain.spec.ts`.
 
 - [ ] **Step 3: Реализация**
 
