@@ -1,7 +1,7 @@
 // node --test relay-agent/linkeon-mcp.test.mjs
 import test from "node:test";
 import assert from "node:assert/strict";
-import { LINKEON_TOOLS, linkeonServer } from "./linkeon-mcp.mjs";
+import { LINKEON_TOOLS, linkeonServer, isHttpsUrl } from "./linkeon-mcp.mjs";
 
 const URL_OK = "https://my.linkeon.io/webhook/mcp/linkeon";
 
@@ -31,6 +31,21 @@ test("с токеном — http-сервер с Bearer токена хода", 
     url: URL_OK,
     headers: { Authorization: "Bearer tkn" },
   });
+});
+
+// Ревью 26.10.2026: та же проверка годится для talerid/products в server.mjs —
+// повторённое multipart-поле (массив) не должно пройти как валидный URL.
+test("isHttpsUrl: массив (повторённое multipart-поле) — не URL, даже если toString() похож на https", () => {
+  assert.equal(isHttpsUrl(["https://a", "https://b"]), false);
+  assert.equal(isHttpsUrl([]), false);
+});
+
+test("isHttpsUrl: строка https — да; http и не-строка — нет", () => {
+  assert.equal(isHttpsUrl(URL_OK), true);
+  assert.equal(isHttpsUrl("http://x"), false);
+  assert.equal(isHttpsUrl(undefined), false);
+  assert.equal(isHttpsUrl(123), false);
+  assert.equal(isHttpsUrl(null), false);
 });
 
 test("LINKEON_TOOLS — 11 имён mcp__linkeon__* через запятую", () => {
