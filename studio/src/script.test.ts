@@ -135,3 +135,11 @@ test('ролик со сценками: без отпечатков студия
   s.skits = { ...s.skits!, conflict: { ...s.skits!.conflict, fingerprint: 'f', keyframeFingerprint: '' } };
   assert.ok(validateScript(s, capture).includes('у сценки conflict нет отпечатка'));
 });
+
+test('ролик со сценками: зацепка — надпись до 6 слов, как в API (MAX_SKIT_HOOK_WORDS)', () => {
+  const s = skitScript();
+  s.hook = 'раз два три четыре пять шесть';
+  assert.deepEqual(validateScript(s, capture), []);
+  s.hook = 'раз два три четыре пять шесть семь';
+  assert.deepEqual(validateScript(s, capture), ['зацепка длиннее 6 слов']);
+});
