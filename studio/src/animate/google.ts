@@ -21,7 +21,7 @@ const KEYFRAME_TIMEOUT_MS = 180_000;
 const START_TIMEOUT_MS = 120_000;
 const POLL_TIMEOUT_MS = 120_000;
 const DOWNLOAD_TIMEOUT_MS = 120_000;
-/** Поминутный лимит пережидается на месте, не сжигая попытку: до двух раз, не дольше полутора минут. */
+/** Поминутный лимит пережидается на месте, не сжигая попытку: до двух раз, каждый — не дольше полутора минут. */
 const RATE_RETRIES = 2;
 const MAX_RATE_WAIT_MS = 90_000;
 const MAX_VIDEO_BYTES = 200 * 1024 * 1024;
@@ -52,11 +52,14 @@ const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const headers = (d: GoogleDeps) => ({ 'x-goog-api-key': d.apiKey, 'Content-Type': 'application/json' });
 /**
  * Ключи Google начинаются с «AIza»; Google повторяет ключ, например, в 403
- * «Consumer … suspended». Вырезать — до обрезки текста: обрезанный ключ
- * шаблон уже не узнает.
+ * «Consumer … suspended». Свой ключ вырезается ещё и буквально — формат
+ * может смениться. Вырезать — до обрезки текста: обрезанный ключ уже не узнать.
  */
-const redact = (s: string): string => s.replace(/AIza[0-9A-Za-z_-]{20,}/g, '<ключ>');
-const errText = (e: unknown): string => redact(e instanceof Error ? e.message : String(e));
+const redact = (s: string, key = ''): string => {
+  const out = s.replace(/AIza[0-9A-Za-z_-]{20,}/g, '<ключ>');
+  return key.length >= 8 ? out.split(key).join('<ключ>') : out;
+};
+const errText = (e: unknown, key = ''): string => redact(e instanceof Error ? e.message : String(e), key);
 /** Массив или пусто: форма ответа Google может смениться, и TypeError на готовом клипе обернулся бы пересъёмкой. */
 const arr = <T>(x: unknown): T[] => (Array.isArray(x) ? (x as T[]) : []);
 
@@ -110,9 +113,9 @@ export function rateLimitDelayMs(body: string): number | null {
  * HTTP-ошибка Google → StudioError. Квота, ключ и снятая модель повтором не
  * лечатся: каждая лишняя попытка Omni стоит денег.
  */
-export function googleHttpError(what: 'keyframe' | 'omni', status: number, body: string): StudioError {
+export function googleHttpError(what: 'keyframe' | 'omni', status: number, body: string, key = ''): StudioError {
   const err = parseError(body);
-  const said = redact(errMessage(err) || body).slice(0, 300);
+  const said = redact(errMessage(err) || body, key).slice(0, 300);
   const reasons = arr<ErrorDetail>(err?.details)
     .map((x) => x?.reason)
     .filter(Boolean)
@@ -122,7 +125,9 @@ export function googleHttpError(what: 'keyframe' | 'omni', status: number, body:
       ? 'квота ключа нулевая — проверить биллинг в Google AI Studio'
       : rateLimitDelayMs(body) != null
         ? 'поминутный лимит — повторить через пару минут'
-        : 'суточная квота — обновляется ≈ в 11:00 МСК';
+        : quotaForTheDay(err)
+          ? 'суточная квота — обновляется ≈ в 11:00 МСК'
+          : 'вид лимита Google не указал — повторить через несколько минут; не пройдёт — суточная квота, ≈ в 11:00 МСК';
     return new StudioError('google_quota', `${what}: лимит Google исчерпан (HTTP ${status}), ${why}: ${said}`, false);
   }
   if (status === 401 || status === 403 || reasons.includes('API_KEY_INVALID') || /API key not valid/i.test(body)) {
@@ -181,14 +186,14 @@ export async function generateKeyframe(d: GoogleDeps, prompt: string, refs: Imag
   try {
     r = await request(d, `${API}/models/${KEYFRAME_MODEL}:generateContent`, { method: 'POST', headers: headers(d), body: JSON.stringify(body) }, KEYFRAME_TIMEOUT_MS);
   } catch (e) {
-    throw new StudioError('keyframe', `keyframe: запрос не прошёл — ${errText(e)}`, true);
+    throw new StudioError('keyframe', `keyframe: запрос не прошёл — ${errText(e, d.apiKey)}`, true);
   }
-  if (!r.ok) throw googleHttpError('keyframe', r.status, r.raw);
+  if (!r.ok) throw googleHttpError('keyframe', r.status, r.raw, d.apiKey);
   let reply: KeyframeReply;
   try {
     reply = (JSON.parse(r.raw) ?? {}) as KeyframeReply;
   } catch {
-    throw new StudioError('keyframe', `keyframe: ответ не JSON: ${redact(r.raw).slice(0, 200)}`, true);
+    throw new StudioError('keyframe', `keyframe: ответ не JSON: ${redact(r.raw, d.apiKey).slice(0, 200)}`, true);
   }
   // Заблокированный промпт не пройдёт и со второго раза — не тратим попытки.
   const blocked = reply.promptFeedback?.blockReason;
@@ -215,10 +220,10 @@ export async function startClip(d: GoogleDeps, prompt: string, image: ImageInput
   try {
     r = await request(d, `${API}/interactions`, { method: 'POST', headers: headers(d), body: JSON.stringify(body) }, START_TIMEOUT_MS);
   } catch (e) {
-    throw new StudioError('omni_failed', `omni: запуск — ответ потерян, генерация могла начаться: ${errText(e)}`, true);
+    throw new StudioError('omni_failed', `omni: запуск — ответ потерян, генерация могла начаться: ${errText(e, d.apiKey)}`, true);
   }
   if (!r.ok) {
-    const err = googleHttpError('omni', r.status, r.raw);
+    const err = googleHttpError('omni', r.status, r.raw, d.apiKey);
     // Прочие 4xx при запуске (413, 400 не про фильтр) — тоже явный отказ: генерация не начиналась, секунды вернутся.
     if (err.code === 'omni_failed' && r.status >= 400 && r.status < 500 && r.status !== 408) throw new StudioError('omni_rejected', err.message, true);
     throw err;
@@ -230,7 +235,7 @@ export async function startClip(d: GoogleDeps, prompt: string, image: ImageInput
     id = undefined;
   }
   if (typeof id !== 'string' || !id) {
-    throw new StudioError('omni_failed', `omni: запуск — в ответе нет id, генерация могла начаться: ${redact(r.raw).slice(0, 200)}`, true);
+    throw new StudioError('omni_failed', `omni: запуск — в ответе нет id, генерация могла начаться: ${redact(r.raw, d.apiKey).slice(0, 200)}`, true);
   }
   return id;
 }
@@ -242,11 +247,11 @@ interface Interaction {
   steps?: Array<{ type?: string; content?: Array<{ type?: string; data?: string; uri?: string; text?: string }> }>;
 }
 
-function interactionFailure(st: Interaction): StudioError {
+function interactionFailure(st: Interaction, key: string): StudioError {
   // Провал приходит массивом errors: [{ code, message }] (живой ответ 24.10.2026).
   const errs = Array.isArray(st.errors) ? st.errors : st.error && typeof st.error === 'object' ? [st.error] : [];
   const first = errs.find((e) => e?.message) ?? errs[0];
-  const msg = redact(String(first?.message ?? `взаимодействие ${st.status}`)).slice(0, 300);
+  const msg = redact(String(first?.message ?? `взаимодействие ${st.status}`), key).slice(0, 300);
   const code = String(first?.code ?? '');
   if (code === 'INVALID_ARGUMENT' || code === '3' || first?.status === 'INVALID_ARGUMENT') {
     return new StudioError('omni_rejected', `omni: отказ фильтра — ${msg}`, true);
@@ -255,35 +260,46 @@ function interactionFailure(st: Interaction): StudioError {
 }
 
 /**
+ * Генерация оплачена, но студия не может её забрать: ответ незнакомой формы,
+ * опрос отвергнут, ссылка не отдаёт файл. Без повтора — нужна правка студии; id
+ * остаётся в animation.json, и запуск после правки заберёт клип, а не заплатит снова.
+ */
+const unreadable = (id: string, why: string): StudioError =>
+  new StudioError('omni_unreadable', `omni: генерацию ${id} не забрать — ${why}; id сохранён, запуск после правки студии заберёт её без новой оплаты`, false);
+
+/**
  * Готовый клип ссылкой (Files API), одна попытка. null — временный сбой
  * (сеть, 5xx, 408, 429): опрос продолжится в своём сроке, и следующий виток
- * скачает снова, а не запустит новую генерацию. Ключ — только хосту Google:
+ * скачает снова, а не запустит новую генерацию. 404 и 410 — файла больше нет,
+ * новая генерация оправданна. Ключ — только хосту Google и только по https:
  * адрес пришёл в ответе.
  */
-async function downloadOnce(d: GoogleDeps, uri: string): Promise<Buffer | null> {
+async function downloadOnce(d: GoogleDeps, id: string, uri: string, timeoutMs: number): Promise<Buffer | null> {
   const f = d.fetch ?? fetch;
-  let host = '';
+  let url: URL;
   try {
-    host = new URL(uri).hostname;
+    url = new URL(uri);
   } catch {
-    throw new StudioError('omni_failed', `omni: клип готов, но ссылка на него неверна: ${redact(uri).slice(0, 200)}`, false);
+    throw unreadable(id, `ссылка на клип неверна: ${redact(uri, d.apiKey).slice(0, 200)}`);
   }
-  const google = host === 'googleapis.com' || host.endsWith('.googleapis.com');
+  const host = url.hostname;
+  const google = url.protocol === 'https:' && (host === 'googleapis.com' || host.endsWith('.googleapis.com'));
   let resp: Response;
   try {
-    resp = await f(uri, { headers: google ? { 'x-goog-api-key': d.apiKey } : {}, signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+    resp = await f(uri, { headers: google ? { 'x-goog-api-key': d.apiKey } : {}, signal: AbortSignal.timeout(timeoutMs) });
   } catch {
     return null;
   }
   if (resp.status >= 500 || resp.status === 408 || resp.status === 429) return null;
-  if (!resp.ok) throw new StudioError('omni_failed', `omni: клип готов, но по ссылке не отдаётся: HTTP ${resp.status}`, false);
+  if (resp.status === 404 || resp.status === 410) throw new StudioError('omni_failed', `omni: клип готов, но файла по ссылке уже нет (HTTP ${resp.status})`, false);
+  if (!resp.ok) throw unreadable(id, `клип по ссылке не отдаётся: HTTP ${resp.status}`);
   let buf: Buffer;
   try {
     buf = Buffer.from(await resp.arrayBuffer());
   } catch {
     return null;
   }
-  if (buf.length > MAX_VIDEO_BYTES) throw new StudioError('omni_failed', `omni: клип ссылкой больше ${MAX_VIDEO_BYTES >> 20} МБ`, false);
+  if (buf.length > MAX_VIDEO_BYTES) throw unreadable(id, `клип ссылкой больше ${MAX_VIDEO_BYTES >> 20} МБ`);
   return buf;
 }
 
@@ -300,11 +316,13 @@ export async function waitClip(d: GoogleDeps, id: string): Promise<Buffer> {
   const every = d.pollEveryMs ?? 10_000;
   const limit = d.pollTimeoutMs ?? 6 * 60_000;
   const deadline = now() + limit;
+  // Сон и таймауты запросов обрезаются остатком срока: иначе опрос выходил за срок на минуты.
+  const left = (): number => Math.max(1000, deadline - now());
   while (now() < deadline) {
-    await sleep(every);
+    await sleep(Math.min(every, Math.max(0, deadline - now())));
     let st: Interaction;
     try {
-      const r = await request(d, `${API}/interactions/${id}`, { headers: { 'x-goog-api-key': d.apiKey } }, POLL_TIMEOUT_MS, 0);
+      const r = await request(d, `${API}/interactions/${id}`, { headers: { 'x-goog-api-key': d.apiKey } }, Math.min(POLL_TIMEOUT_MS, left()), 0);
       if (!r.ok) {
         if (r.status === 429) {
           await sleep(Math.min(rateLimitDelayMs(r.raw) ?? 0, Math.max(0, deadline - now())));
@@ -312,7 +330,9 @@ export async function waitClip(d: GoogleDeps, id: string): Promise<Buffer> {
         }
         if (r.status >= 500 || r.status === 408) continue;
         if (r.status === 404) throw new StudioError('omni_failed', `omni: взаимодействие ${id} не найдено (HTTP 404)`, true);
-        throw googleHttpError('omni', r.status, r.raw);
+        const err = googleHttpError('omni', r.status, r.raw, d.apiKey);
+        // Отказ на опросе своей генерации — не фильтр, а сбой API или студии: генерация может быть оплачена.
+        throw err.code === 'google_auth' || err.code === 'google_quota' ? err : unreadable(id, `опрос отвергнут — ${err.message}`);
       }
       st = (JSON.parse(r.raw) ?? {}) as Interaction;
     } catch (e) {
@@ -326,18 +346,21 @@ export async function waitClip(d: GoogleDeps, id: string): Promise<Buffer> {
       const video = parts.filter((c) => c?.type === 'video').pop();
       if (typeof video?.data === 'string' && video.data) return Buffer.from(video.data, 'base64');
       if (typeof video?.uri === 'string' && video.uri) {
-        const got = await downloadOnce(d, video.uri);
+        const got = await downloadOnce(d, id, video.uri, Math.min(DOWNLOAD_TIMEOUT_MS, left()));
         if (got) return got;
         continue;
       }
+      if (video) throw unreadable(id, `у видео в ответе нет data и uri (поля: ${Object.keys(video).join(', ')})`);
       const said = parts
         .filter((c) => c?.type === 'text' && c.text)
         .map((c) => c.text)
         .join(' ')
         .trim();
-      throw new StudioError('omni_rejected', `omni: видео нет${said ? ` — модель ответила: ${redact(said).slice(0, 300)}` : ''}`, true);
+      // Отказ модели — это текст без видео; ответ без того и другого — незнакомая форма, а не отказ.
+      if (!said) throw unreadable(id, 'в готовом ответе нет ни видео, ни текста модели');
+      throw new StudioError('omni_rejected', `omni: видео нет — модель ответила: ${redact(said, d.apiKey).slice(0, 300)}`, true);
     }
-    if (st.status === 'failed' || st.status === 'cancelled') throw interactionFailure(st);
+    if (st.status === 'failed' || st.status === 'cancelled') throw interactionFailure(st, d.apiKey);
     // in_progress, queued, пустой или незнакомый статус — ждём дальше.
   }
   throw new StudioError('omni_timeout', `omni: не дождались клипа за ${Math.round(limit / 60_000)} мин — генерация может ещё закончиться`, true);

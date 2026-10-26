@@ -27,6 +27,7 @@ export type StudioErrorCode =
   | 'omni_failed'
   | 'omni_budget'
   | 'omni_timeout'
+  | 'omni_unreadable'
   | 'google_quota'
   | 'google_auth'
   | 'model_gone'

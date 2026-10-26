@@ -7,6 +7,10 @@
 export const MATCH_THRESHOLD = 0.6;
 /** Слово короче — междометие или предлог: по нему не судят, прозвучала ли реплика. */
 const MIN_LINE_WORD = 3;
+/** Последнее предложение судится по словам от четырёх букв: «Ага!», «Ого!», «Кря!» в конце реплики SpeechKit пишет как попало. */
+const MIN_LAST_WORD = 4;
+/** «Ааа», «Оооо» — крик, а не слово. */
+const shout = (w: string): boolean => /^(\p{L})\1+$/u.test(w);
 
 /**
  * Слова текста: NFC без знаков ударения, нижний регистр, «ё» → «е», без знаков
@@ -31,8 +35,11 @@ export function speechWords(s: string): string[] {
  * попало; пересъёмка этого не лечит.
  */
 const checkable = (w: string): boolean => /\p{Script=Cyrillic}/u.test(w) && /[аеиоуыэюя]/u.test(w);
-/** «А-а-а», «Га-га» — одно ожидаемое слово: SpeechKit пишет такие повторы как попало или не пишет вовсе. */
-const collapse = (l: string): string => l.replace(/(\p{L}+)(?:-\1)+/giu, '$1');
+/**
+ * «А-а-а», «Га-га» — одно ожидаемое слово: SpeechKit пишет такие повторы как
+ * попало или не пишет вовсе. Через дефис, тире или неразрывный дефис (\p{Pd}).
+ */
+const collapse = (l: string): string => l.replace(/(\p{L}+)(?:\p{Pd}\1)+/giu, '$1');
 /** Предложения реплики: обрыв в конце клипа съедает именно последнее. */
 const sentences = (l: string): string[] => l.split(/(?<=[.!?…])\s+/u);
 
@@ -72,9 +79,14 @@ export function speechCheck(lines: string[], heard: string): SpeechCheck {
     }
   }
   const share = expected.length ? hit / expected.length : 1;
-  const long = (s: string): string[] => words(s).filter((w) => w.length >= MIN_LINE_WORD);
+  const long = (s: string, min = MIN_LINE_WORD): string[] => words(s).filter((w) => w.length >= min && !shout(w));
+  // Реплика проглочена, если от неё не услышано ни одного слова; при нескольких
+  // предложениях — и если не услышано ни одного слова последнего (обрыв клипа).
   const silentLines = lines
-    .map((l, i) => ({ i, parts: [long(l), long(sentences(l).at(-1) ?? '')] }))
+    .map((l, i) => {
+      const s = sentences(l);
+      return { i, parts: s.length > 1 ? [long(l), long(s.at(-1) ?? '', MIN_LAST_WORD)] : [long(l)] };
+    })
     .filter(({ parts }) => parts.some((p) => p.length > 0 && !p.some((w) => heardWords.has(w))))
     .map(({ i }) => i);
   return { ok: share >= MATCH_THRESHOLD && silentLines.length === 0, share, silentLines };

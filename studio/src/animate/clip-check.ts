@@ -52,12 +52,13 @@ export function checkClip(probe: ProbeInfo, silences: Silence[]): string[] {
  * (apad) уводит выдачу буфера loudnorm за конец клипа: без неё метки времени
  * звука в последних секундах сдвигаются, и Remotion срезает конец. Добивка без
  * предела, а -shortest обрезает звук по видео: короткий звук не укоротит клип,
- * а хвост тишины поймает проверка края.
+ * а хвост тишины поймает проверка края. Вход — с видеодорожкой (её проверяет
+ * checkClip до вызова): без неё бесконечная добивка не кончится, отсюда таймаут.
  */
 export async function normalizeLoudness(input: string, output: string, lufs = CLIP_LUFS): Promise<void> {
   await run('ffmpeg', [
     '-hide_banner', '-loglevel', 'error', '-y', '-i', input,
     '-c:v', 'copy', '-af', `apad,loudnorm=I=${lufs}:TP=-1.5:LRA=11`, '-ar', '48000', '-c:a', 'aac', '-b:a', '192k',
     '-shortest', output,
-  ]);
+  ], { timeout: 120_000 });
 }
