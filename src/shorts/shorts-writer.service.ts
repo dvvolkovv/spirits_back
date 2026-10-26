@@ -68,6 +68,11 @@ export class ShortsWriterService {
     // при каждом «Замечании» или отзыве студии о длине озвучки.
     const acceptedPunchline: Skit | null = skitFormat ? v.script?.skits?.punchline?.skit ?? null : null;
     let rejectedPunchline: Skit | null = null;
+    // Круг по отзыву студии — о длине озвучки: принятые сценки остаются, даже если
+    // модель их вернула, — эхо с правкой одной буквы сменило бы отпечаток и стоило
+    // бы клипа Omni. writer_feedback пишет только студия; новое замечание владельца
+    // начинает круг без него (ответ сценариста, «Повторить» с замечанием).
+    const keepSkits = skitFormat && !!v.writerFeedback && !!v.script?.skits?.conflict && !!acceptedPunchline;
     const [rows, settings] = await Promise.all([this.agents.getAgents('ru'), this.settings.get()]);
     const assistants = toAgents(rows);
     const name = v.scene.assistantName;
@@ -114,7 +119,11 @@ export class ShortsWriterService {
         return;
       }
       const paragraphs = v.capture.paragraphs ?? [];
-      const skits = skitFormat ? { conflict: reply.skits.conflict ?? conflict, punchline: reply.skits.punchline ?? acceptedPunchline } : null;
+      const skits = !skitFormat
+        ? null
+        : keepSkits
+          ? { conflict, punchline: acceptedPunchline }
+          : { conflict: reply.skits.conflict ?? conflict, punchline: reply.skits.punchline ?? acceptedPunchline };
       // Промпты сценок — только из сценок без нарушений: planSkits на кривой
       // сценке бросает первую же ошибку, а правила называют все разом.
       let planned: Record<SkitKind, SkitPlan> | undefined;
