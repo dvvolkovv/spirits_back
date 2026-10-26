@@ -299,18 +299,20 @@ export class ProductToolService {
       if (action === 'create') return this.lifecycleTool.create(userId, input, channel, turn);
       if (action === 'restore') return this.lifecycleTool.restore(userId, input, channel);
       if (action === 'delete' || action === 'revert') {
-        const matches = await this.resolve(userId, String(input?.product ?? ''));
-        if (matches.length > 1) {
-          return { ok: false, reason: 'ambiguous', matches,
-            say: 'Под это описание подходит несколько продуктов. СПРОСИ у пользователя, какой именно, и повтори вызов. Не выбирай сам.' };
-        }
-        if (!matches.length) return { ok: false, reason: 'not_found', products: (await this.list(userId)).products, say: 'Такого продукта у пользователя нет.' };
-        const product = matches[0];
+        const resolved = await this.resolveOne(userId, input);
+        if (resolved.ok === false) return resolved;
+        const { product } = resolved;
         if (action === 'delete') return this.lifecycleTool.delete(userId, product, channel, turn);
         try {
           const r = await this.lifecycleTool.revert(userId, product, input?.turnId, channel);
           if (r.ok === false) return { ok: false, reason: r.reason, product, say: r.message };
-          return { ...(await this.waitForOutcome(r.turnId)), product };
+          const outcome = await this.waitForOutcome(r.turnId);
+          // Только у revert: edit не трогаем — «откат» там был бы неправдой,
+          // а здесь исход — именно откат предыдущей правки.
+          const say = outcome.outcome === 'done'
+            ? `${outcome.say} Это был откат: продукт вернулся к версии до выбранной правки.`
+            : outcome.say;
+          return { ...outcome, product, say };
         } catch (e: any) {
           return this.refusal(e, product);
         }
@@ -321,6 +323,20 @@ export class ProductToolService {
       reason: 'bad_action',
       say: 'Неизвестное действие. Доступны: list, create, edit, status, revert, delete, restore, domain.',
     };
+  }
+
+  /**
+   * Продукт по описанию из поля `product` — общий путь delete/revert.
+   * Та же неоднозначность и «не найдено», что раньше были инлайн в execute().
+   */
+  private async resolveOne(userId: string, input: any): Promise<{ ok: true; product: ProductMatch } | { ok: false; reason: string; [k: string]: any }> {
+    const matches = await this.resolve(userId, String(input?.product ?? ''));
+    if (matches.length > 1) {
+      return { ok: false, reason: 'ambiguous', matches,
+        say: 'Под это описание подходит несколько продуктов. СПРОСИ у пользователя, какой именно, и повтори вызов. Не выбирай сам.' };
+    }
+    if (!matches.length) return { ok: false, reason: 'not_found', products: (await this.list(userId)).products, say: 'Такого продукта у пользователя нет.' };
+    return { ok: true, product: matches[0] };
   }
 
   private async list(userId: string) {

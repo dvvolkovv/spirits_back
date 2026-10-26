@@ -22,6 +22,14 @@ const ACTION_SAY: Record<ActionStatus, string> = {
   cancelled: 'Пользователь отменил действие.',
 };
 
+/** Статусы, которые для ассистента НЕ успех — остальные (включая pending/working) ok:true,
+ * как и у describeTurn с queued/running: карточка только что заведена, и это не отказ. */
+const ACTION_NOT_OK: ReadonlySet<ActionStatus> = new Set(['failed', 'expired', 'cancelled']);
+
+function restoreDate(iso: string): string {
+  return new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'long' }).format(new Date(iso));
+}
+
 /**
  * Новые действия manage_product: create, delete, restore, revert и статус
  * карточки. Отдельным классом: product-tool.service.ts и так за 650 строк.
@@ -139,12 +147,15 @@ export class ProductLifecycleTool {
     if (!row) return { ok: false, reason: 'not_found', say: 'Такого действия у пользователя нет.' };
     const action = toView(row);
     const fixable = action.status === 'pending' && typeof action.result?.error === 'string';
+    const deleteDone = action.kind === 'delete' && action.status === 'done' && action.restoreUntil;
     return {
-      ok: action.status === 'done',
+      ok: !ACTION_NOT_OK.has(action.status),
       action,
       say: fixable
         ? `Пользователь отправил карточку, но её не приняли: ${action.result!.error}. Карточка ждёт исправления.`
-        : ACTION_SAY[action.status],
+        : deleteDone
+          ? `Готово: продукт удалён, вернуть его можно до ${restoreDate(action.restoreUntil!)} — действием restore.`
+          : ACTION_SAY[action.status],
     };
   }
 }
