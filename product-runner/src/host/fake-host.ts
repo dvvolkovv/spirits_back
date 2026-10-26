@@ -25,7 +25,24 @@ export class FakeHost {
   /** Живые контейнеры: имя → что с ним сделали. */
   containers = new Map<
     string,
-    { mount: string; publish?: string; env: Record<string, string>; image: string; cmd: string[] }
+    {
+      mount: string;
+      publish?: string;
+      env: Record<string, string>;
+      /** Чем контейнер запущен — метка или идентификатор, как было в argv (`.Config.Image`). */
+      image: string;
+      /**
+       * Идентификатор образа, на который метка указывала В МОМЕНТ запуска
+       * (`.Image`). Необязательные (и restart тоже): спеки заведения кладут
+       * контейнер в карту руками (`provision.spec.ts` ~323, ~336) без этих
+       * полей; inspectWhole подставляет умолчания.
+       */
+      imageId?: string;
+      cmd: string[];
+      restart?: string;
+      memory?: string;
+      cpus?: string;
+    }
   >();
   /**
    * Контейнеры, которые СУЩЕСТВУЮТ, но остановлены.
@@ -36,6 +53,47 @@ export class FakeHost {
    * не начать заново.
    */
   stopped = new Set<string>();
+  /**
+   * Образы: идентификатор → окружение образа. Метки — отдельно: метка, как у
+   * docker, ПЕРЕДВИГАЕТСЯ на новый образ (`base` после обновления образа), а
+   * уже запущенный контейнер остаётся на старом идентификаторе. Ровно на этой
+   * разнице стоит выбор образа при смене ключей (rekey.ts).
+   */
+  images = new Map<string, { env: string[] }>();
+  tags = new Map<string, string>();
+
+  /**
+   * Здоров ли контейнер для `/health` — общий для `docker exec` (бот) и
+   * `probePort` (сайт). По умолчанию здоров любой запущенный; тест подменяет
+   * правило, чтобы «нездоровым» был именно контейнер с плохими ключами.
+   */
+  healthy: (name: string, c: { env: Record<string, string> }) => boolean = () => true;
+
+  /** Завести образ под меткой (или передвинуть метку на другой образ). */
+  tagImage(tag: string, id: string, env: string[] = []): void {
+    this.images.set(id, { env });
+    this.tags.set(tag, id);
+  }
+
+  /** Идентификатор по метке или идентификатору; незнакомая метка заводит пустой образ. */
+  private resolveImage(ref: string): string {
+    if (this.images.has(ref)) return ref;
+    const id = this.tags.get(ref);
+    if (id) return id;
+    const fresh = `sha256:fake-${ref}`;
+    this.tagImage(ref, fresh, []);
+    return fresh;
+  }
+
+  /** Сайт отвечает на порту: запущенный контейнер с этой публикацией и здоровый. */
+  probePort(port: number): boolean {
+    for (const [name, c] of this.containers) {
+      if (this.stopped.has(name) || !c.publish) continue;
+      if (Number(c.publish.split(':')[1]) === port) return this.healthy(name, c);
+    }
+    return false;
+  }
+
   /** Файлы vhost в /etc/nginx/sites-products. Значение — порт proxy_pass. */
   confFiles = new Map<string, number>();
   /** Домены, которые nginx реально обслуживает (конфиг, перечитанный reload'ом). */
@@ -167,6 +225,36 @@ export class FakeHost {
     }
     if (sub === 'stop' || sub === 'start') return this.dockerStopStart(sub, args);
     if (sub === 'inspect') return this.dockerInspect(args);
+    if (sub === 'rename') {
+      const [from, to, ...extra] = args;
+      if (!from || !to || extra.length) throw new Error(`docker rename: ${args.join(' ')}`);
+      if (!this.containers.has(from)) throw new Error(`No such container: ${from}`);
+      if (this.containers.has(to)) throw new Error(`Conflict. The container name "/${to}" is already in use`);
+      this.containers.set(to, this.containers.get(from)!);
+      this.containers.delete(from);
+      if (this.stopped.delete(from)) this.stopped.add(to);
+      return '';
+    }
+    if (sub === 'exec') {
+      // Ровно та форма, которой смена ключей спрашивает /health бота:
+      // `docker exec <имя> node -e <скрипт>`. Прочее — отказ.
+      const [name, bin, flag] = args;
+      if (bin !== 'node' || flag !== '-e' || args.length !== 4) throw new Error(`docker exec: симулятор знает только node -e: ${args.join(' ')}`);
+      if (!this.containers.has(name)) throw new Error(`No such container: ${name}`);
+      if (this.stopped.has(name)) throw new Error(`Error response from daemon: container ${name} is not running`);
+      if (!this.healthy(name, this.containers.get(name)!)) throw new Error('Command failed: exit status 1');
+      return '';
+    }
+    if (sub === 'image') {
+      const [verb, flag, format, ref, ...extra] = args;
+      if (verb !== 'inspect' || flag !== '--format' || format !== '{{json .}}' || !ref || extra.length) {
+        throw new Error(`docker image: симулятор знает только inspect --format {{json .}} <образ>: ${args.join(' ')}`);
+      }
+      const id = this.images.has(ref) ? ref : this.tags.get(ref);
+      if (!id) throw new Error(`Error: No such image: ${ref}`);
+      const repoTags = [...this.tags.entries()].filter(([, v]) => v === id).map(([t]) => t);
+      return `${JSON.stringify({ Id: id, RepoTags: repoTags, Config: { Env: this.images.get(id)!.env } })}\n`;
+    }
     throw new Error(`docker ${sub}: неизвестная подкоманда`);
   }
 
@@ -200,6 +288,10 @@ export class FakeHost {
     // Живой docker на несуществующем объекте отвечает именно так и rc=1.
     if (!this.containers.has(name)) throw new Error(`Error: No such object: ${name}`);
 
+    if (format === '{{json .}}') {
+      return `${JSON.stringify(this.inspectWhole(name))}\n`;
+    }
+
     const fromBindings = format.includes('.HostConfig.PortBindings');
     const fromNetwork = format.includes('.NetworkSettings.Ports');
     if (!fromBindings && !fromNetwork) {
@@ -218,6 +310,34 @@ export class FakeHost {
       );
     }
     return '\n';
+  }
+
+  /**
+   * Контейнер целиком — в форме `docker inspect --format '{{json .}}'`.
+   * Config.Env, как у docker: переменные образа, затем свои; своя с тем же
+   * именем заменяет переменную образа (одна строка, новое значение).
+   */
+  private inspectWhole(name: string): any {
+    const c = this.containers.get(name)!;
+    const own = new Set(Object.keys(c.env));
+    const imageEnv = (this.images.get(c.imageId ?? this.resolveImage(c.image))?.env ?? []).filter((e) => !own.has(e.slice(0, e.indexOf('='))));
+    const [hostIp, hostPort, containerPort] = c.publish ? c.publish.split(':') : [];
+    const [source, destination] = c.mount ? c.mount.split(':') : [];
+    return {
+      Name: `/${name}`,
+      Image: c.imageId ?? this.resolveImage(c.image),
+      Config: { Image: c.image, Env: [...imageEnv, ...Object.entries(c.env).map(([k, v]) => `${k}=${v}`)] },
+      State: { Running: !this.stopped.has(name), Status: this.stopped.has(name) ? 'exited' : 'running' },
+      HostConfig: {
+        PortBindings: c.publish ? { [`${containerPort}/tcp`]: [{ HostIp: hostIp, HostPort: hostPort }] } : {},
+        Memory: memoryBytes(c.memory),
+        NanoCpus: c.cpus ? Math.round(Number(c.cpus) * 1e9) : 0,
+        RestartPolicy: { Name: c.restart ?? '' },
+        NetworkMode: 'bridge',
+        Privileged: false,
+      },
+      Mounts: c.mount ? [{ Type: 'bind', Source: source, Destination: destination, RW: true }] : [],
+    };
   }
 
   /**
@@ -303,6 +423,8 @@ export class FakeHost {
     let image = '';
     let publish: string | undefined;
     let restart = '';
+    let memory: string | undefined;
+    let cpus: string | undefined;
     const env: Record<string, string> = {};
     const cmd: string[] = [];
 
@@ -327,7 +449,8 @@ export class FakeHost {
         env[pair.slice(0, eq)] = pair.slice(eq + 1);
         continue;
       }
-      if (a.startsWith('--memory=') || a.startsWith('--cpus=')) continue;
+      if (a.startsWith('--memory=')) { memory = a.slice('--memory='.length); continue; }
+      if (a.startsWith('--cpus=')) { cpus = a.slice('--cpus='.length); continue; }
       if (a.startsWith('-')) throw new Error(`docker run: неизвестный флаг ${a}`);
       image = a;
     }
@@ -345,7 +468,7 @@ export class FakeHost {
       const busy = this.publishTakenByRunning(publish);
       if (busy) throw new Error(`Bind for ${publish} failed: port is already allocated`);
     }
-    this.containers.set(name, { mount, publish, env, image, cmd });
+    this.containers.set(name, { mount, publish, env, image, imageId: this.resolveImage(image), cmd, restart, memory, cpus });
     return name;
   }
 
@@ -412,6 +535,15 @@ export class FakeHost {
   ran(bin: string): string[][] {
     return this.calls.filter((c) => c[0] === bin);
   }
+}
+
+/** `--memory=1g` / `--memory=1073741824` → байты, как в HostConfig.Memory. */
+function memoryBytes(raw: string | undefined): number {
+  if (!raw) return 0;
+  const m = /^(\d+(?:\.\d+)?)([kmg]?)$/i.exec(raw);
+  if (!m) throw new Error(`--memory: непонятное значение ${raw}`);
+  const mul = { '': 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[m[2].toLowerCase() as '' | 'k' | 'm' | 'g'];
+  return Math.round(Number(m[1]) * mul);
 }
 
 export const OAUTH = 'оаут-токен-хоста';
