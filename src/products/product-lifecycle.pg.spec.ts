@@ -111,7 +111,7 @@ maybe('жизненный цикл продукта против живого Po
     const limits = new LimitsService(pg as any);
     const turns = new TurnsService(pg as any, { checkTokenBalance: async () => ({ ok: true }), deductTokens: async () => 0 } as any);
     const actions = new ProductActionsService(pg as any);
-    svc = new ProductLifecycleService(pg as any, provisioning, limits, turns, actions);
+    svc = new ProductLifecycleService(pg as any, provisioning, limits, turns, actions, secrets);
     (svc as any).checkBot = async () => ({ ok: true, id: 1234567890, username: 'shop_bot' });
   });
 
@@ -539,6 +539,72 @@ maybe('жизненный цикл продукта против живого Po
 
       const pendingRow = (await pool.query('SELECT status FROM product_actions WHERE id = $1', [pending.id])).rows[0];
       expect(pendingRow.status).toBe('pending');
+    });
+  });
+
+  describe('бэкафилл tg_bot_id (I2, часть 2)', () => {
+    /** Бот Студии: secrets_encrypted реально зашифрован тем же SecretsService, что и свод. */
+    async function insertBot(o: { userId: string; slug: string; token: string; tgBotCheckedAt?: Date | null }) {
+      const id = crypto.randomUUID();
+      const box = secrets.encrypt({ BOT_TOKEN: o.token }, id);
+      await pool.query(
+        `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash, secrets_encrypted, tg_bot_checked_at)
+         VALUES ($1,$2,$3,$4,'bot','running','/product',$5,$6,$7)`,
+        [id, o.userId, `Бот ${o.slug}`, o.slug, sha(`токен ${id}`), box, o.tgBotCheckedAt ?? null],
+      );
+      return id as string;
+    }
+
+    it('два живых бота с одним токеном: первый получает tg_bot_id, второй — только checked_at и warning', async () => {
+      const TOKEN = '424242:одинТокенНаДвоих';
+      const warnSpy = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+      const a = await insertBot({ userId: 'u-bf-1', slug: 'bf-dup-a', token: TOKEN });
+      const b = await insertBot({ userId: 'u-bf-2', slug: 'bf-dup-b', token: TOKEN });
+      (svc as any).checkBot = async () => ({ ok: true, id: 424242, username: 'shared_bot' });
+
+      expect(await svc.backfillBotIdsTick()).toBe(2);
+
+      // Порядок, в котором тик разбирает ДВЕ строки с одинаковым created_at,
+      // не гарантирован — важен исход, а не то, КАКОЙ из двух продуктов
+      // победил: ровно один получил tg_bot_id, у обоих стоит checked_at.
+      const rowA = (await pool.query('SELECT tg_bot_id, tg_bot_checked_at FROM products WHERE id = $1', [a])).rows[0];
+      const rowB = (await pool.query('SELECT tg_bot_id, tg_bot_checked_at FROM products WHERE id = $1', [b])).rows[0];
+      const ids = [rowA.tg_bot_id, rowB.tg_bot_id];
+      expect(ids.filter((x) => x === '424242')).toHaveLength(1);
+      expect(ids.filter((x) => x === null)).toHaveLength(1);
+      expect(rowA.tg_bot_checked_at).not.toBeNull();
+      expect(rowB.tg_bot_checked_at).not.toBeNull();
+
+      const msg = warnSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(msg).toContain(a);
+      expect(msg).toContain(b);
+      expect(msg).not.toContain(TOKEN);
+    });
+
+    it('Telegram отверг токен — tg_bot_checked_at ставится, tg_bot_id остаётся NULL', async () => {
+      const p = await insertBot({ userId: 'u-bf-3', slug: 'bf-rejected', token: '424243:чтоУгодно' });
+      (svc as any).checkBot = async () => ({ ok: false, reason: 'rejected' });
+
+      expect(await svc.backfillBotIdsTick()).toBe(1);
+
+      const row = (await pool.query('SELECT tg_bot_id, tg_bot_checked_at FROM products WHERE id = $1', [p])).rows[0];
+      expect(row.tg_bot_id).toBeNull();
+      expect(row.tg_bot_checked_at).not.toBeNull();
+    });
+
+    it('строка, проверенная меньше суток назад, тиком не подхватывается повторно', async () => {
+      const p = await insertBot({
+        userId: 'u-bf-4', slug: 'bf-fresh', token: '424244:чтоУгодно',
+        tgBotCheckedAt: new Date(Date.now() - 60 * 60 * 1000), // час назад
+      });
+      const checkBot = jest.fn(async () => ({ ok: true, id: 424244, username: 'x' }));
+      (svc as any).checkBot = checkBot;
+
+      expect(await svc.backfillBotIdsTick()).toBe(0);
+
+      expect(checkBot).not.toHaveBeenCalled();
+      const row = (await pool.query('SELECT tg_bot_id FROM products WHERE id = $1', [p])).rows[0];
+      expect(row.tg_bot_id).toBeNull();
     });
   });
 });

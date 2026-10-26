@@ -4,7 +4,7 @@ import { ProductLifecycleService, DELETE_GRACE_DAYS } from './product-lifecycle.
 const ACT = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const TOKEN = '1234567890:AAH9sdfjKJHkjh34kjh5kjh6KJHkjhKJHkj';
 
-function harness(o: { pg?: (sql: string, params: any[]) => any; createErrors?: any[] } = {}) {
+function harness(o: { pg?: (sql: string, params: any[]) => any; createErrors?: any[]; secrets?: any } = {}) {
   const calls: Array<{ sql: string; params: any[] }> = [];
   const dispatch = async (sql: string, params: any[] = []) => {
     calls.push({ sql, params });
@@ -48,10 +48,11 @@ function harness(o: { pg?: (sql: string, params: any[]) => any; createErrors?: a
     release: jest.fn(async () => undefined),
     finish: jest.fn(async () => undefined),
   };
-  const svc = new ProductLifecycleService(pg as any, provisioning as any, limits as any, turns as any, actions as any);
+  const secretsMock = o.secrets ?? { decrypt: jest.fn(() => ({ BOT_TOKEN: '1234567890:AAH9sdfjKJHkjh34kjh5kjh6KJHkjhKJHkj' })) };
+  const svc = new ProductLifecycleService(pg as any, provisioning as any, limits as any, turns as any, actions as any, secretsMock as any);
   (svc as any).suffix = () => 'zzzzzz';
   (svc as any).checkBot = jest.fn(async () => ({ ok: true, id: 1234567890, username: 'shop_bot' }));
-  return { svc, pg, calls, provisioning, limits, turns, actions };
+  return { svc, pg, calls, provisioning, limits, turns, actions, secrets: secretsMock };
 }
 
 describe('создание сайта', () => {
@@ -420,5 +421,96 @@ describe('откат и первая правка', () => {
     expect(await h.svc.firstPromptTick()).toBe(1);
     const restore = h.calls.find((c) => c.sql.includes('SET first_prompt') && c.sql.includes('first_prompt IS NULL'))!;
     expect(restore.params).toEqual(['p1', 'А', 'telegram']);
+  });
+});
+
+describe('бэкафилл tg_bot_id (I2, часть 2)', () => {
+  const BOX = Buffer.from('коробка');
+
+  it('живой токен — tg_bot_id проставлен, токен не уходит ни в один вызов логгера', async () => {
+    const h = harness({
+      pg: (sql) => (sql.includes('SELECT id, secrets_encrypted FROM products')
+        ? { rows: [{ id: 'bot-1', secrets_encrypted: BOX }] }
+        : null),
+      secrets: { decrypt: jest.fn(() => ({ BOT_TOKEN: TOKEN })) },
+    });
+    const warn = jest.spyOn((h.svc as any).logger, 'warn').mockImplementation(() => undefined);
+    const error = jest.spyOn((h.svc as any).logger, 'error').mockImplementation(() => undefined);
+
+    expect(await h.svc.backfillBotIdsTick()).toBe(1);
+
+    expect((h.svc as any).checkBot).toHaveBeenCalledWith(TOKEN);
+    const upd = h.calls.find((c) => c.sql.includes('SET tg_bot_id'))!;
+    expect(upd.sql).toContain('tg_bot_id IS NULL');
+    expect(upd.params).toEqual(['bot-1', 1234567890]);
+    // Канарейка M11: токен не попадает ни в один аргумент warn/error.
+    for (const call of [...warn.mock.calls, ...error.mock.calls]) {
+      expect(JSON.stringify(call)).not.toContain(TOKEN);
+    }
+  });
+
+  it('Telegram отверг токен — только tg_bot_checked_at, tg_bot_id не трогается', async () => {
+    const h = harness({
+      pg: (sql) => (sql.includes('SELECT id, secrets_encrypted FROM products')
+        ? { rows: [{ id: 'bot-2', secrets_encrypted: BOX }] }
+        : null),
+      secrets: { decrypt: jest.fn(() => ({ BOT_TOKEN: TOKEN })) },
+    });
+    (h.svc as any).checkBot = jest.fn(async () => ({ ok: false, reason: 'rejected' }));
+
+    expect(await h.svc.backfillBotIdsTick()).toBe(1);
+
+    expect(h.calls.some((c) => c.sql.includes('SET tg_bot_id'))).toBe(false);
+    const upd = h.calls.find((c) => c.sql.includes('SET tg_bot_checked_at') && !c.sql.includes('tg_bot_id ='))!;
+    expect(upd.params).toEqual(['bot-2']);
+  });
+
+  it('гонка на UPDATE: tg_bot_id занят другим живым продуктом — warn именами продуктов, без токена, checked_at всё равно ставится', async () => {
+    const h = harness({
+      pg: (sql, params) => {
+        if (sql.includes('SELECT id, secrets_encrypted FROM products')) return { rows: [{ id: 'bot-3', secrets_encrypted: BOX }] };
+        if (sql.includes('SET tg_bot_id')) {
+          throw Object.assign(new Error('duplicate key value violates unique constraint'), {
+            code: '23505', constraint: 'products_tg_bot_live',
+          });
+        }
+        if (sql.includes('SELECT id FROM products WHERE tg_bot_id')) return { rows: [{ id: 'bot-other' }] };
+        return null;
+      },
+      secrets: { decrypt: jest.fn(() => ({ BOT_TOKEN: TOKEN })) },
+    });
+    const warn = jest.spyOn((h.svc as any).logger, 'warn').mockImplementation(() => undefined);
+
+    expect(await h.svc.backfillBotIdsTick()).toBe(1);
+
+    const msg = warn.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(msg).toContain('bot-3');
+    expect(msg).toContain('bot-other');
+    expect(msg).not.toContain(TOKEN);
+    const checkedAt = h.calls.find((c) => c.sql.includes('SET tg_bot_checked_at') && !c.sql.includes('tg_bot_id ='))!;
+    expect(checkedAt.params).toEqual(['bot-3']);
+  });
+
+  it('секреты не расшифровались — не падает, checked_at ставится, getMe не зовётся', async () => {
+    const h = harness({
+      pg: (sql) => (sql.includes('SELECT id, secrets_encrypted FROM products')
+        ? { rows: [{ id: 'bot-4', secrets_encrypted: BOX }] }
+        : null),
+      secrets: { decrypt: jest.fn(() => { throw new Error('коробка повреждена'); }) },
+    });
+    const warn = jest.spyOn((h.svc as any).logger, 'warn').mockImplementation(() => undefined);
+
+    expect(await h.svc.backfillBotIdsTick()).toBe(1);
+
+    expect((h.svc as any).checkBot).not.toHaveBeenCalled();
+    const upd = h.calls.find((c) => c.sql.includes('SET tg_bot_checked_at'))!;
+    expect(upd.params).toEqual(['bot-4']);
+    expect(warn).toHaveBeenCalled();
+  });
+
+  it('кандидатов нет — 0, запросов на обновление не уходит', async () => {
+    const h = harness();
+    expect(await h.svc.backfillBotIdsTick()).toBe(0);
+    expect(h.calls.some((c) => c.sql.includes('SET tg_bot_id') || c.sql.includes('SET tg_bot_checked_at'))).toBe(false);
   });
 });

@@ -25,6 +25,12 @@ ALTER TABLE products ADD COLUMN IF NOT EXISTS purged_at timestamptz;
 -- Идентификатор бота Telegram — не секрет. Два живых продукта на одном токене
 -- отнимают друг у друга обновления.
 ALTER TABLE products ADD COLUMN IF NOT EXISTS tg_bot_id bigint;
+-- Когда backfillBotIdsTick (product-lifecycle.service.ts, I2 часть 2) в
+-- последний раз звал getMe для бота без tg_bot_id — не «когда проставлен», а
+-- «когда проверен»: NULL у нетронутого бота и у бота, которому только что
+-- отказал Telegram, выглядели бы одинаково, и тик продолбил бы один и тот же
+-- мёртвый токен каждые 10 минут вместо раза в сутки.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS tg_bot_checked_at timestamptz;
 -- Первая правка, переданная при создании: ставится, как только продукт поднялся.
 ALTER TABLE products ADD COLUMN IF NOT EXISTS first_prompt text;
 ALTER TABLE products ADD COLUMN IF NOT EXISTS first_prompt_channel text;

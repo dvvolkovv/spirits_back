@@ -7,6 +7,7 @@ import { SLEEP_REASON_NO_TOKENS } from './rent.service';
 import { ActionChannel, ConfirmedVia, DELETE_GRACE_DAYS, ProductActionsService } from './product-actions.service';
 import { BotTokenCheck, checkBotToken } from './bot-token-check';
 import { randomSuffix, siteSlugCandidates, slugWithSuffix } from './product-slug';
+import { SecretsService } from './secrets.service';
 
 // Срок возврата живёт в журнале (product-actions.service.ts) — одно число на
 // оба места; отсюда реэкспорт для инструмента, Telegram и спек.
@@ -83,6 +84,12 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     private readonly limits: LimitsService,
     private readonly turns: TurnsService,
     private readonly actions: ProductActionsService,
+    // I2, часть 2: бэкафилл tg_bot_id. SecretsService — чтобы расшифровать
+    // BOT_TOKEN боту, которому ProvisioningService.create не смог дозвониться
+    // до Telegram при заведении (reason 'unreachable') и оставил tg_bot_id
+    // пустым. Без неё backfillBotIdsTick не собирается вовсе — токен лежит
+    // только в зашифрованном виде.
+    private readonly secrets: SecretsService,
   ) {}
 
   onModuleInit() {
@@ -102,6 +109,15 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     const stuckActions = setInterval(() => void this.safe('зависшие действия', () => this.actions.sweepStuck()), 60_000);
     stuckActions.unref?.();
     this.timers.push(stuckActions);
+
+    // I2, часть 2: раз в 10 минут — донести tg_bot_id ботам Студии, которым
+    // ProvisioningService.create не дозвонился до Telegram при заведении.
+    // Сам тик бьёт по строке не чаще раза в сутки (tg_bot_checked_at) — 10
+    // минут здесь только про то, как часто процесс оглядывается на очередь,
+    // а не про то, как часто один бот получает повторный getMe.
+    const backfillBotIds = setInterval(() => void this.safe('бэкафилл tg_bot_id', () => this.backfillBotIdsTick()), 600_000);
+    backfillBotIds.unref?.();
+    this.timers.push(backfillBotIds);
   }
 
   onModuleDestroy() {
@@ -704,6 +720,83 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
         // повтором на следующем тике — повтор занял бы его местом в LIMIT 20
         // бесконечно. Разбор причины — дело владельца или подписки, не тика.
         this.logger.warn(`первая правка продукта ${row.id} не поставлена: ${e?.message}`);
+      }
+    }
+    return r.rows.length;
+  }
+
+  /**
+   * I2, часть 2: доносит tg_bot_id ботам Студии, которым
+   * ProvisioningService.create не дозвонился до Telegram при заведении
+   * (`reason: 'unreachable'`) — без этого тика такой бот остаётся без
+   * tg_bot_id навсегда, и партиционный UNIQUE products_tg_bot_live его не
+   * видит вовсе: второй бот с тем же токеном заводится как ни в чём не
+   * бывало и отнимает у первого обновления Telegram молча.
+   *
+   * `tg_bot_checked_at < now() - interval '1 day'` — раз в сутки на строку, а
+   * не на каждый тик: getMe — внешняя сеть, а подавляющее большинство строк
+   * здесь — боты, которым Telegram ответил `rejected`/`bad_form` при
+   * заведении и ответит так же сейчас; долбить его каждые 10 минут ради них
+   * незачем.
+   *
+   * Расшифрованный токен живёт ТОЛЬКО в локальной переменной `token` — в лог
+   * и в параметры SQL он не попадает ни при успехе, ни при отказе: имя
+   * колонки tg_bot_checked_at само по себе не секрет, а токен в логе был бы
+   * готовым доступом к боту для каждого, кто читает лог процесса (канарейка —
+   * provisioning.integration.spec.ts M11, зеркало здесь — спек этого файла).
+   */
+  async backfillBotIdsTick(): Promise<number> {
+    const r = await this.pg.query(
+      `SELECT id, secrets_encrypted FROM products
+        WHERE kind = 'bot' AND archived_at IS NULL AND tg_bot_id IS NULL
+          AND secrets_encrypted IS NOT NULL
+          AND (tg_bot_checked_at IS NULL OR tg_bot_checked_at < now() - interval '1 day')
+        ORDER BY created_at LIMIT 20`,
+    );
+    for (const row of r.rows) {
+      let token = '';
+      try {
+        const box = this.secrets.decrypt(row.secrets_encrypted, row.id);
+        token = String(box.BOT_TOKEN ?? '').trim();
+      } catch (e: any) {
+        this.logger.warn(`бэкафилл tg_bot_id ${row.id}: секреты не расшифровались (${e?.message})`);
+      }
+      if (!token) {
+        await this.pg.query(`UPDATE products SET tg_bot_checked_at = now() WHERE id = $1`, [row.id]);
+        continue;
+      }
+      const check = await this.checkBot(token);
+      // `check.ok === false`, а не `!check.ok` — та же ловушка strictNullChecks,
+      // что в completeCreateBot выше и в provisioning.service.ts (I2 часть 1).
+      if (check.ok === false) {
+        // bad_form/rejected — токен сам живым не станет; unreachable —
+        // Telegram снова не ответил. Разница не меняет действие тика: обе
+        // ветки просто сдвигают tg_bot_checked_at на сутки вперёд.
+        await this.pg.query(`UPDATE products SET tg_bot_checked_at = now() WHERE id = $1`, [row.id]);
+        continue;
+      }
+      try {
+        await this.pg.query(
+          `UPDATE products SET tg_bot_id = $2, tg_bot_checked_at = now() WHERE id = $1 AND tg_bot_id IS NULL`,
+          [row.id, check.id],
+        );
+      } catch (e: any) {
+        if (e?.code === '23505' && e?.constraint === 'products_tg_bot_live') {
+          // Пока этот бот ждал бэкафилла, его токен занял ДРУГОЙ живой
+          // продукт (обычным заведением или более ранней строкой этого же
+          // тика) — именами продуктов, а не токеном: лог читает человек, а
+          // не Telegram.
+          const other = await this.pg.query(
+            `SELECT id FROM products WHERE tg_bot_id = $1 AND archived_at IS NULL AND id <> $2 LIMIT 1`,
+            [check.id, row.id],
+          );
+          this.logger.warn(
+            `бэкафилл tg_bot_id: продукт ${row.id} и продукт ${other.rows[0]?.id ?? '?'} делят один токен бота — второму tg_bot_id не проставлен`,
+          );
+          await this.pg.query(`UPDATE products SET tg_bot_checked_at = now() WHERE id = $1`, [row.id]);
+          continue;
+        }
+        throw e;
       }
     }
     return r.rows.length;

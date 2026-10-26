@@ -40,10 +40,10 @@ maybe('009_product_actions против живого Postgres', () => {
   it('у продуктов есть колонки удаления, бота и первой правки', async () => {
     const r = await pool.query(
       `SELECT column_name FROM information_schema.columns WHERE table_name = 'products'
-         AND column_name IN ('purge_after','purged_at','tg_bot_id','first_prompt','first_prompt_channel')`,
+         AND column_name IN ('purge_after','purged_at','tg_bot_id','tg_bot_checked_at','first_prompt','first_prompt_channel')`,
     );
     expect(r.rows.map((x: any) => x.column_name).sort()).toEqual(
-      ['first_prompt', 'first_prompt_channel', 'purge_after', 'purged_at', 'tg_bot_id'],
+      ['first_prompt', 'first_prompt_channel', 'purge_after', 'purged_at', 'tg_bot_checked_at', 'tg_bot_id'],
     );
   });
 
