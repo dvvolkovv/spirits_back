@@ -4297,7 +4297,17 @@ Run (нода, бэк): `src/products/product-lifecycle-tool.keys.spec.ts src/pr
     ProductKeysService,
     ProductPurgeService,
 ```
-Сторож регистрации — в `src/products/products.routes.spec.ts` рядом с проверками провайдеров добавить (по образцу соседних): `expect(providers).toContain(ProductKeysService)` и `expect(providers).toContain(ProductPurgeService)` (имя переменной списка провайдеров — как в файле; если такой проверки в файле нет — добавить тест `Reflect.getMetadata('providers', ProductsModule)` содержит оба класса).
+Сторож регистрации — в `src/products/products.routes.spec.ts` (там уже импортированы `MODULE_METADATA` и `ProductsModule`, см. тест «все три контроллера объявлены в ProductsModule» ~194): импорты `import { ProductKeysService } from './product-keys.service';` и `import { ProductPurgeService } from './product-purge.service';`, и тест рядом:
+
+```ts
+  it('смена ключей и обход стирания зарегистрированы в ProductsModule', () => {
+    // @Optional-зависимость инструмента и контроллера без регистрации молча
+    // пуста: тесты зелёные, а ассистент отвечает «смена ключей недоступна».
+    const providers = Reflect.getMetadata(MODULE_METADATA.PROVIDERS, ProductsModule) ?? [];
+    expect(providers).toEqual(expect.arrayContaining([ProductKeysService, ProductPurgeService]));
+  });
+```
+Этот тест краснеет до правки модуля — прогнать его вместе с остальными на шаге 7.
 
 - [ ] **Step 7: Коммит, прогон — PASS**
 
@@ -4305,5 +4315,196 @@ Run (нода, бэк): `src/products/product-lifecycle-tool.keys.spec.ts src/pr
 git -C $B add src/products && git -C $B commit -q -m "products: действие keys инструмента и отправка карточки ключей; «продукт уже стёрт»; регистрация" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
 Run (нода, бэк): `src/products/product-lifecycle-tool.keys.spec.ts src/products/product-actions.controller.keys.spec.ts src/products/product-tool.defs.spec.ts src/products/product-lifecycle-tool.spec.ts src/products/product-tool.spec.ts src/products/product-actions.controller.spec.ts src/products/products.routes.spec.ts src/mcp`. Expected: PASS. Затем tsc бэка.
+
+---
+
+### Task 16: Тексты ассистентам и справка — ключи меняются, удалённое стирается
+
+**Files:**
+- Modify: `src/products/products-cli-tool.ts:67-82` (`PRODUCTS_CLI_PROMPT`)
+- Modify: `relay-agent/server.mjs` (`PRODUCTS_PROMPT`, ~356–372) — только репозиторий; выкат релея — другая сессия
+- Modify: `src/platform-kb/articles/products.ts` (строки «Как» и «Чего нельзя», комментарий-источник)
+- Test: `src/products/products-cli-tool.spec.ts` (~192), `src/chat/relay-products-keys-guard.spec.ts` (новый), `src/platform-kb/products-lifecycle.spec.ts`
+
+- [ ] **Step 1: Тесты**
+
+В `src/products/products-cli-tool.spec.ts` после теста «create, delete, restore, revert и status по actionId» (~192):
+
+```ts
+  it('keys — карточкой; ключи в переписке не просить; удалённое стирается', () => {
+    expect(PRODUCTS_CLI_PROMPT).toContain('action: "keys"');
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/Ключи в переписке не проси никогда/);
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/предложи карточку keys/);
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/Не говори «ключи обновлены», пока status не вернёт done/);
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/стирается насовсем/);
+  });
+```
+
+`src/chat/relay-products-keys-guard.spec.ts`:
+
+```ts
+import * as fs from 'fs';
+import * as path from 'path';
+
+/**
+ * Копия текста продуктов в промпте релея (relay-agent/server.mjs) катится
+ * отдельно от бэкенда и отстаёт молча: ассистенты релея продолжали бы
+ * отвечать «сменить ключи нельзя», когда сервер уже умеет.
+ */
+const src = fs.readFileSync(path.join(__dirname, '../../relay-agent/server.mjs'), 'utf8');
+const block = src.slice(src.indexOf('const PRODUCTS_PROMPT'), src.indexOf('ФАЙЛЫ ИЗ ПРОШЛЫХ РАЗГОВОРОВ'));
+
+describe('релей: продукты — ключи карточкой', () => {
+  it('блок найден', () => {
+    expect(block.length).toBeGreaterThan(500);
+  });
+
+  it('знает action keys и не просит ключи в переписке', () => {
+    expect(block).toContain('action: "keys"');
+    expect(block).toMatch(/Ключи в переписке не проси никогда/);
+    expect(block).toMatch(/предложи карточку keys/);
+    expect(block).toMatch(/стирается насовсем/);
+  });
+});
+```
+
+В `src/platform-kb/products-lifecycle.spec.ts` в конец `describe`:
+
+```ts
+  // Очередь 2: ключи меняются карточкой, удалённое через срок стирается.
+  // Прежняя строка «Чего нельзя: сменить токен или ключ после создания»
+  // врала бы человеку так же, как прежнее «удалить — только через поддержку».
+  it('ключи можно сменить, попросив ассистента; «нельзя сменить» больше не говорится', () => {
+    expect(web).not.toMatch(/после создания не меняются/);
+    expect(web).not.toMatch(/сменить[^.\n]*после создания/);
+    expect(web).toMatch(/Сменить, убрать или добавить ключ/);
+  });
+
+  it('после срока возврата продукт стирается насовсем', () => {
+    expect(web).toMatch(/стирается насовсем/);
+  });
+```
+
+- [ ] **Step 2: Коммит, прогон — FAIL**
+
+```bash
+git -C $B add src/products/products-cli-tool.spec.ts src/chat/relay-products-keys-guard.spec.ts src/platform-kb/products-lifecycle.spec.ts && git -C $B commit -q -m "test: тексты продуктов — keys карточкой, стирание удалённых (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/products-cli-tool.spec.ts src/chat/relay-products-keys-guard.spec.ts src/platform-kb/products-lifecycle.spec.ts`.
+
+- [ ] **Step 3: Реализация**
+
+`src/products/products-cli-tool.ts`, в `PRODUCTS_CLI_PROMPT`:
+- строку `- { action: "delete", product } — удалить: … вернуть можно ${DELETE_GRACE_DAYS} дней. { action: "restore", product } — вернуть удалённый. { action: "revert", product, turnId? } — откатить правку.` заменить на ту же строку, где после `вернуть можно ${DELETE_GRACE_DAYS} дней` стоит `, потом он стирается насовсем`;
+- после неё добавить строку:
+
+```
+- { action: "keys", product } — сменить, убрать или добавить ключи продукта (токен бота, ключи сервисов): сервер пришлёт защищённую карточку с именами текущих ключей, значения вводит только пользователь. Ключи в переписке не проси никогда; прислал ключ в чат — никуда его не передавай и предложи карточку keys. Не говори «ключи обновлены», пока status не вернёт done.
+```
+
+`relay-agent/server.mjs`, в `PRODUCTS_PROMPT` — те же две правки, числа буквами, как в соседних строках: в строке `- { action: "delete", product } — удалить: … вернуть можно 30 дней.` после `вернуть можно 30 дней` — `, потом он стирается насовсем`, и после неё — та же строка `- { action: "keys", product } — …` дословно. Релей не выкатывать (см. «Чего план сознательно НЕ делает»).
+
+`src/platform-kb/articles/products.ts`:
+- строку «Удалить: …» (`- Удалить: попросить ассистента — …${paid(' Оплаченный период не возвращается.')}`) дополнить перед `${paid(`: ` Потом он стирается насовсем.`;
+- строку `- ${q('prodSecrets')} — пары «имя — значение» для сторонних сервисов; хранятся зашифрованными, после создания не меняются. Значения в чат не присылать.` заменить на:
+
+```ts
+- ${q('prodSecrets')} — пары «имя — значение» для сторонних сервисов; хранятся зашифрованными. Сменить, убрать или добавить ключ (и ${q('prodToken')}) — попросить ассистента: он пришлёт защищённую карточку, продукт перезапустится с новыми ключами. Значения в чат не присылать.
+```
+- в «Чего нельзя» строку `- Свой домен у бота; сменить ${q('prodToken')} или ключ после создания.` заменить на `- Свой домен у бота.`;
+- комментарий-источник `// источник: ключи — …` дополнить: `; смена — src/products/product-keys.service.ts, product-runner/src/host/rekey.ts; стирание — src/products/product-purge.service.ts`.
+
+Справка ограничена 5 КиБ (`kb.spec.ts`, `MAX_BYTES`): прогон ниже это проверяет. Не влезло — сократить фразу «продукт перезапустится с новыми ключами» до «продукт перезапустится».
+
+- [ ] **Step 4: Коммит, прогон — PASS**
+
+```bash
+git -C $B add src/products/products-cli-tool.ts relay-agent/server.mjs src/platform-kb/articles/products.ts && git -C $B commit -q -m "тексты: ключи меняются карточкой, удалённое стирается — CLI, релей (репозиторий), справка" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/products-cli-tool.spec.ts src/chat/relay-products-keys-guard.spec.ts src/chat/relay-help-guard.spec.ts src/chat/relay-order-guard.spec.ts src/platform-kb`. Expected: PASS.
+
+---
+
+### Task 17: Telegram — карточка ключей кнопкой мини-приложения, 7 языков
+
+**Files:**
+- Modify: `src/tg-bot/tg-i18n.ts` (каталоги `ru` ~145–163, `en` ~273–284, `de` ~391–402, `fr` ~526–537, `es` ~644–655, `pt` ~762–773, `zh` ~880–891)
+- Modify: `src/tg-bot/tg-product-actions.service.ts:57-77` (ветка `keys`)
+- Test: `src/tg-bot/tg-product-actions.service.spec.ts` (~57–63)
+
+- [ ] **Step 1: Тесты**
+
+В `src/tg-bot/tg-product-actions.service.spec.ts` тест «карточка неизвестного вида (keys — очередь 2) — пропускается…» заменить двумя:
+
+```ts
+  it('ключи: в личке — кнопка мини-приложения, в группе — ссылка на кабинет; ключи в переписку не просим', async () => {
+    const h = harness();
+    h.actions.takeForTurn.mockResolvedValue([{ id: ID, kind: 'keys', payload: { name: 'Магазин' } }] as any);
+    await h.svc.sendForTurn({ userId: 'u1', turn: 't', since: new Date(), chatId: 100, isPrivate: true, lang: 'ru' });
+    const [, text, opts] = h.grammy.sendMessage.mock.calls[0] as any[];
+    expect(text).toMatch(/Ключи «Магазин»/);
+    expect(text).toMatch(/В переписку ключи не присылайте/);
+    expect(opts.reply_markup.inline_keyboard[0][0].web_app.url).toMatch(new RegExp(`/tma/\\?pa=${ID}$`));
+    await h.svc.sendForTurn({ userId: 'u1', turn: 't', since: new Date(), chatId: -100, isPrivate: false, lang: 'ru' });
+    expect((h.grammy.sendMessage.mock.calls[1] as any[])[2].reply_markup.inline_keyboard[0][0].url)
+      .toMatch(new RegExp(`/studio\\?tab=products&action=${ID}$`));
+  });
+
+  it('карточка неизвестного вида — пропускается, сообщение не шлётся', async () => {
+    const h = harness();
+    h.actions.takeForTurn.mockResolvedValue([{ id: ID, kind: 'zzz', payload: { name: 'Магазин' } }] as any);
+    await h.svc.sendForTurn({ userId: 'u1', turn: 't', since: new Date(), chatId: 100, isPrivate: true, lang: 'ru' });
+    expect(h.grammy.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('текст ключей есть на всех семи языках и называет продукт', async () => {
+    for (const lang of ['ru', 'en', 'de', 'fr', 'es', 'pt', 'zh']) {
+      const h = harness();
+      h.actions.takeForTurn.mockResolvedValue([{ id: ID, kind: 'keys', payload: { name: 'Shop' } }] as any);
+      await h.svc.sendForTurn({ userId: 'u1', turn: 't', since: new Date(), chatId: 100, isPrivate: true, lang });
+      const [, text, opts] = h.grammy.sendMessage.mock.calls[0] as any[];
+      expect(text).toContain('Shop');
+      expect(text).not.toMatch(/\{name\}/);
+      expect(opts.reply_markup.inline_keyboard[0][0].text.length).toBeGreaterThan(0);
+    }
+  });
+```
+
+- [ ] **Step 2: Коммит, прогон — FAIL**
+
+```bash
+git -C $B add src/tg-bot/tg-product-actions.service.spec.ts && git -C $B commit -q -m "test(tg-bot): карточка ключей в Telegram (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/tg-bot/tg-product-actions.service.spec.ts`.
+
+- [ ] **Step 3: Тексты** — в `src/tg-bot/tg-i18n.ts` после `pa_open_cabinet_btn` в КАЖДОМ из семи каталогов (тип `Catalog` = ключи `ru`: пропуск в любом языке — ошибка компиляции):
+
+| каталог | `pa_keys_prompt` | `pa_keys_btn` |
+|---|---|---|
+| `ru` | `'Ключи «{name}»: замените, уберите или добавьте их в защищённой форме — продукт перезапустится с новыми ключами. В переписку ключи не присылайте.'` | `'Открыть ключи'` |
+| `en` | `"Keys for “{name}”: replace, remove or add them in the secure form — the product will restart with the new keys. Please don't send keys in the chat."` | `"Open keys"` |
+| `de` | `'Schlüssel für „{name}“: Ersetze, entferne oder ergänze sie im geschützten Formular – das Produkt startet dann mit den neuen Schlüsseln neu. Schick Schlüssel bitte nicht in den Chat.'` | `'Schlüssel öffnen'` |
+| `fr` | `'Clés de « {name} » : remplacez, supprimez ou ajoutez-les dans le formulaire sécurisé — le produit redémarrera avec les nouvelles clés. Ne les envoyez pas dans la discussion.'` | `'Ouvrir les clés'` |
+| `es` | `'Claves de «{name}»: sustitúyelas, quítalas o añade otras en el formulario seguro; el producto se reiniciará con las claves nuevas. No las envíes por el chat.'` | `'Abrir claves'` |
+| `pt` | `'Chaves de «{name}»: substitui, remove ou acrescenta chaves no formulário seguro — o produto reinicia com as chaves novas. Não as envies pela conversa.'` | `'Abrir chaves'` |
+| `zh` | `'「{name}」的密钥：请在安全表单中替换、删除或添加——产品将使用新密钥重新启动。请不要在聊天中发送密钥。'` | `'打开密钥'` |
+
+Французский каталог обёрнут в `frenchTypography({...})` — неразрывные пробелы у «», `:` и `?` она ставит сама; писать обычные пробелы, как в соседних строках. Немецкий — на «du», португальский — европейский (`tu`), как весь каталог.
+
+- [ ] **Step 4: Ветка `keys`** — в `src/tg-bot/tg-product-actions.service.ts` условие `} else if (a.kind === 'create_bot') {` заменить на `} else if (a.kind === 'create_bot' || a.kind === 'keys') {`, а внутри — текст и подпись кнопки по виду:
+
+```ts
+          text = a.kind === 'keys'
+            ? tgText(i.lang, 'pa_keys_prompt', { name })
+            : tgText(i.lang, 'pa_create_bot_prompt', { name });
+```
+и в кнопке мини-приложения `text: tgText(i.lang, 'pa_create_bot_btn')` → `text: tgText(i.lang, a.kind === 'keys' ? 'pa_keys_btn' : 'pa_create_bot_btn')`. Комментарий в `else` («keys (очередь 2) и прочие…») заменить на «прочие виды карточек (на будущее) — карточка уже attached_at, молча теряться ей нельзя, но слать по ней нечего». В докблок класса: «Ключи бота и смена ключей — только формой мини-приложения».
+
+- [ ] **Step 5: Коммит, прогон — PASS**
+
+```bash
+git -C $B add src/tg-bot && git -C $B commit -q -m "tg-bot: карточка ключей — кнопка мини-приложения в личке, кабинет в группе; 7 языков" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/tg-bot`. Expected: PASS (включая сторожа каталогов `tg-i18n`). Затем tsc бэка.
 
 ---
