@@ -190,6 +190,17 @@ describe('удаление', () => {
     expect(h.actions.finish).toHaveBeenCalledWith(ACT, 'done', { restoreUntil: until.toISOString() });
   });
 
+  it('queued/running правки продукта снимаются вместе с заданиями — иначе держат замок и выполнятся после возврата', async () => {
+    const until = new Date('2026-11-24T10:00:00Z');
+    const h = harness({ pg: (sql) => (sql.includes("SET archived_at = now()") ? { rows: [{ purge_after: until }] } : null) });
+    h.actions.claim.mockResolvedValue({ id: ACT, kind: 'delete', product_id: 'p1', channel: 'web', payload: {} });
+    const r = await h.svc.completeDelete({ userId: 'u1', actionId: ACT, via: 'chat' });
+    expect(r).toEqual({ ok: true, restoreUntil: until.toISOString() });
+    const turnsCancel = h.calls.find((c) => c.sql.includes('UPDATE product_turns') && c.sql.includes("status IN ('queued','running')"));
+    expect(turnsCancel).toBeTruthy();
+    expect(turnsCancel!.params[0]).toBe('p1');
+  });
+
   it('карточка другого вида — освобождена, not_pending', async () => {
     const h = harness();
     h.actions.claim.mockResolvedValue({ id: ACT, kind: 'create_bot', product_id: null, channel: 'web', payload: {}, result: null });

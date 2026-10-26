@@ -194,6 +194,28 @@ maybe('жизненный цикл продукта против живого Po
       const sleep = await pool.query(`SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND kind = 'sleep' AND status = 'queued'`, [productId]);
       expect(Number(sleep.rows[0].count)).toBe(1);
     });
+
+    it('queued и running правки продукта снимаются — не держат product_turns_one_active, сон ставится немедленно', async () => {
+      const userId = 'u-del-turns';
+      const productId = await insertProduct({ userId, status: 'running', slug: 'del-turns-1' });
+      const queuedTurn = await pool.query(
+        `INSERT INTO product_turns (product_id, user_id, channel, prompt, status) VALUES ($1, $2, 'web', 'ход в очереди', 'queued') RETURNING id`,
+        [productId, userId],
+      );
+
+      const open = await svc.openDelete({ userId, productId, channel: 'web', turn: null });
+      const complete = await svc.completeDelete({ userId, actionId: (open as any).actionId, via: 'chat' });
+      expect(complete.ok).toBe(true);
+
+      const turnRow = (await pool.query('SELECT status, error FROM product_turns WHERE id = $1', [queuedTurn.rows[0].id])).rows[0];
+      expect(turnRow.status).toBe('failed');
+      expect(turnRow.error).toBeTruthy();
+
+      // Правка снята СРАЗУ: queueSleepForDeleted больше не ждёт её тишины
+      // (TURN_SILENCE_SQL) — иначе сон отложился бы на те же 30 минут.
+      const sleep = await pool.query(`SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND kind = 'sleep' AND status = 'queued'`, [productId]);
+      expect(Number(sleep.rows[0].count)).toBe(1);
+    });
   });
 
   describe('сон удалённых', () => {
