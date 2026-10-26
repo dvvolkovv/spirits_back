@@ -243,3 +243,72 @@ describe('certbot', () => {
     await expect(host.run(['certbot', 'renew'])).rejects.toThrow(/certbot/);
   });
 });
+
+describe('контейнер целиком и образы — для смены ключей', () => {
+  it('inspect {{json .}}: образ, метка, окружение, порт, каталог, лимиты', async () => {
+    host.tagImage('linkeon-product:base', 'sha256:aaa', ['PATH=/usr/bin', 'CHECKOUT_PATH=/product']);
+    await host.run([
+      'docker', 'run', '-d', '--name', 'shop', '--restart', 'unless-stopped', '-v', '/srv/products/shop:/product',
+      '-p', '127.0.0.1:8001:3000', '-e', 'RUNNER_TOKEN=ткн', '-e', 'API_KEY=k', '--memory=1g', '--cpus=1', 'linkeon-product:base',
+    ]);
+    const j = JSON.parse(await host.run(['docker', 'inspect', '--format', '{{json .}}', 'shop']));
+    expect(j.Image).toBe('sha256:aaa');
+    expect(j.Config.Image).toBe('linkeon-product:base');
+    expect(j.Config.Env).toEqual(['PATH=/usr/bin', 'CHECKOUT_PATH=/product', 'RUNNER_TOKEN=ткн', 'API_KEY=k']);
+    expect(j.HostConfig.PortBindings).toEqual({ '3000/tcp': [{ HostIp: '127.0.0.1', HostPort: '8001' }] });
+    expect(j.HostConfig.Memory).toBe(1073741824);
+    expect(j.HostConfig.NanoCpus).toBe(1e9);
+    expect(j.HostConfig.RestartPolicy).toEqual({ Name: 'unless-stopped' });
+    expect(j.Mounts).toEqual([{ Type: 'bind', Source: '/srv/products/shop', Destination: '/product', RW: true }]);
+    expect(j.State.Running).toBe(true);
+  });
+
+  it('-e поверх переменной образа — одна строка с новым значением, как у docker', async () => {
+    host.tagImage('linkeon-product:base', 'sha256:aaa', ['TZ=UTC']);
+    await host.run(['docker', 'run', '-d', '--name', 'b', '--restart', 'unless-stopped', '-e', 'TZ=Europe/Moscow', 'linkeon-product:base']);
+    const j = JSON.parse(await host.run(['docker', 'inspect', '--format', '{{json .}}', 'b']));
+    expect(j.Config.Env).toEqual(['TZ=Europe/Moscow']);
+  });
+
+  it('image inspect: метки и окружение образа; передвинутая метка смотрит на новый образ', async () => {
+    host.tagImage('linkeon-product:base', 'sha256:old', []);
+    host.tagImage('linkeon-product:src-111111111111', 'sha256:old', []);
+    host.tagImage('linkeon-product:base', 'sha256:new', ['A=1']);
+    const old = JSON.parse(await host.run(['docker', 'image', 'inspect', '--format', '{{json .}}', 'sha256:old']));
+    expect(old.RepoTags).toEqual(['linkeon-product:src-111111111111']);
+    const base = JSON.parse(await host.run(['docker', 'image', 'inspect', '--format', '{{json .}}', 'linkeon-product:base']));
+    expect(base.Id).toBe('sha256:new');
+    expect(base.Config.Env).toEqual(['A=1']);
+    await expect(host.run(['docker', 'image', 'inspect', '--format', '{{json .}}', 'nope:1'])).rejects.toThrow(/No such image/);
+  });
+
+  it('rename переносит контейнер вместе с остановленностью; занятое имя — отказ', async () => {
+    await run('shop', 8001);
+    await host.run(['docker', 'stop', 'shop']);
+    await host.run(['docker', 'rename', 'shop', 'shop__rekey']);
+    expect(host.containers.has('shop')).toBe(false);
+    expect(host.containers.has('shop__rekey')).toBe(true);
+    expect(host.isRunning('shop__rekey')).toBe(false);
+    await run('shop', 8001);
+    await expect(host.run(['docker', 'rename', 'shop__rekey', 'shop'])).rejects.toThrow(/Conflict/);
+  });
+
+  it('exec node: здоров по правилу теста; остановленный — отказ', async () => {
+    await run('bot');
+    await expect(host.run(['docker', 'exec', 'bot', 'node', '-e', 'x'])).resolves.toBe('');
+    host.healthy = () => false;
+    await expect(host.run(['docker', 'exec', 'bot', 'node', '-e', 'x'])).rejects.toThrow(/exit/);
+    host.healthy = () => true;
+    await host.run(['docker', 'stop', 'bot']);
+    await expect(host.run(['docker', 'exec', 'bot', 'node', '-e', 'x'])).rejects.toThrow(/not running/);
+  });
+
+  it('probePort отвечает за запущенный контейнер на порту и по тому же правилу здоровья', async () => {
+    await run('shop', 8001);
+    expect(host.probePort(8001)).toBe(true);
+    expect(host.probePort(8002)).toBe(false);
+    host.healthy = (_name, c) => c.env.API_KEY !== 'плохой';
+    host.containers.get('shop')!.env.API_KEY = 'плохой';
+    expect(host.probePort(8001)).toBe(false);
+  });
+});
