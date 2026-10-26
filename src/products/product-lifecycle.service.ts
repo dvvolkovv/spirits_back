@@ -59,6 +59,13 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
   private checkBot: (token: string) => Promise<BotTokenCheck> = (t) => checkBotToken(t);
   private suffix: () => string = randomSuffix;
   private timers: NodeJS.Timeout[] = [];
+  /**
+   * Продукты, о чьём потолке провалов сна уже предупредили. Не колонка и не
+   * строка в журнале: предупреждение — разовая подсказка живому человеку в
+   * логе, переживать перезапуск процесса ему незачем, а на поведение тика
+   * (queueSleepForDeleted) множество не влияет вовсе.
+   */
+  private warnedSleepCap = new Set<string>();
 
   constructor(
     private readonly pg: PgService,
@@ -317,6 +324,32 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
    * сон за неуплату: погашенный посреди правки контейнер убивает её молча.
    */
   async queueSleepForDeleted(productId?: string): Promise<number> {
+    // Потолок — 3 провала сна подряд ПОСЛЕ этой архивации (старые провалы
+    // прошлого цикла архив/возврат не считаются — j.created_at >= p.archived_at,
+    // тот же приём, что у соседней проверки «сон уже стоял»). Без потолка
+    // тик каждую минуту заново ставит сон, который стабильно не выполняется
+    // (например, машина продукта недостижима), и так все 30 дней возврата —
+    // тупик только для глаз: ни кабинет, ни «Сайты и боты» не показывают
+    // product_provision_jobs вовсе, только лог.
+    const capped = await this.pg.query(
+      `SELECT p.id FROM products p
+        WHERE p.archived_at IS NOT NULL AND p.purged_at IS NULL AND p.status = 'archived'
+          AND ($1::uuid IS NULL OR p.id = $1::uuid)
+          AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
+                           WHERE j.product_id = p.id AND j.status IN ('queued','running'))
+          AND (SELECT count(*) FROM product_provision_jobs j
+                WHERE j.product_id = p.id AND j.kind = 'sleep' AND j.status = 'failed'
+                  AND j.created_at >= p.archived_at) >= 3`,
+      [productId ?? null],
+    );
+    for (const row of capped.rows) {
+      // Один раз на процесс, а не на каждый тик: иначе лог заполняется той же
+      // строкой каждую минуту все оставшиеся дни возврата.
+      if (this.warnedSleepCap.has(row.id)) continue;
+      this.warnedSleepCap.add(row.id);
+      this.logger.warn(`сон удалённого продукта ${row.id} не ставится: 3 провала подряд, нужен ручной разбор`);
+    }
+
     const r = await this.pg.query(
       `INSERT INTO product_provision_jobs (product_id, kind, status)
        SELECT p.id, 'sleep', 'queued' FROM products p
@@ -330,6 +363,9 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
           AND NOT EXISTS (SELECT 1 FROM product_turns t
                            WHERE t.product_id = p.id AND t.status IN ('queued','running')
                              AND COALESCE(t.last_progress_at, t.started_at, t.created_at) > now() - ${TURN_SILENCE_SQL})
+          AND (SELECT count(*) FROM product_provision_jobs j
+                WHERE j.product_id = p.id AND j.kind = 'sleep' AND j.status = 'failed'
+                  AND j.created_at >= p.archived_at) < 3
        ON CONFLICT DO NOTHING
        RETURNING product_id`,
       [productId ?? null],
