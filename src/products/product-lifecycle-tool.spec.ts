@@ -22,7 +22,11 @@ function harness() {
     // paidUntil по умолчанию в будущем: у большинства тестов делетится продукт
     // с ещё идущим периодом, и фраза «оставшийся срок не возвращается» в силе.
     openDelete: jest.fn(async () => ({ ok: true, actionId: 'a2', expiresAt: '2026-10-25T10:30:00.000Z', paidUntil: '2026-11-24T10:00:00.000Z' })),
-    restore: jest.fn(async () => ({ ok: true, status: 'sleeping', waking: true, balance: 70_000 })),
+    // По умолчанию — оплаченный период ещё идёт (I1, ревью): самый частый
+    // исход возврата на практике — продукт с остатком (бесплатный месяц или
+    // уже оплаченный), а не истёкший-но-по-деньгам-хватает. Тесты на другие
+    // ветки (unpaid+affordable, unpaid+not affordable) переопределяют мок явно.
+    restore: jest.fn(async () => ({ ok: true, status: 'sleeping', waking: true, paid: true, paidUntil: '2026-11-24T10:00:00.000Z', balance: 70_000 })),
     revert: jest.fn(async () => ({ ok: true, turnId: 't-rev' })),
   };
   const actions = { get: jest.fn(async () => null) };
@@ -122,13 +126,28 @@ describe('новые действия инструмента', () => {
     expect(r.say).toMatch(/Не говори «удалил»/);
   });
 
-  it('restore — по удалённым', async () => {
+  // I1 (ревью): «общий» случай — оплаченный период ещё идёт (бесплатный
+  // месяц или уже оплаченный): аренда УЖЕ оплачена, chargeOnStart её не
+  // спишет (его предусловие `paid_until <= now()` не совпадёт), и старый
+  // текст «аренда спишется при запуске» был бы неправдой. Этот тест раньше
+  // пиннил именно её — заглушка harness() по умолчанию возвращала
+  // waking:true без paid, и текст всегда говорил «спишется», даже когда
+  // (как в большинстве возвратов) период ещё не кончился.
+  it('restore — по удалённым, оплаченный период ещё идёт: аренда не спишется, срок продолжается', async () => {
     const h = harness();
     const r = await h.svc.execute('u1', { action: 'restore', product: 'старый' });
     expect(r).toMatchObject({ ok: true, restored: { status: 'sleeping', waking: true } });
     expect(h.lifecycle.restore).toHaveBeenCalledWith({ userId: 'u1', productId: 'p9', channel: 'web' });
-    // Задача «Отступления очереди 1», п.2: аренду при пробуждении теперь
-    // платит сам старт, а не возврат — текст говорит «спишется при запуске».
+    expect(r.say).toBe('Вернул. Просыпается — через минуту-две заработает; оплаченный срок до 24 ноября продолжается.');
+    expect(r.say).not.toMatch(/спишется/);
+  });
+
+  // I1: период истёк (paid:false), но на аренду хватает — chargeOnStart
+  // спишет её при самом старте, текст обязан это сказать прямо.
+  it('restore — период истёк, но баланс хватает: будим, аренда спишется при запуске', async () => {
+    const h = harness();
+    h.lifecycle.restore.mockResolvedValue({ ok: true, status: 'sleeping', waking: true, paid: false, paidUntil: '2020-01-01T00:00:00.000Z', balance: 70_000 } as any);
+    const r: any = await h.svc.execute('u1', { action: 'restore', product: 'старый' });
     expect(r.say).toBe('Вернул. Просыпается — через минуту-две заработает; аренда 50 000 токенов спишется при запуске.');
   });
 
@@ -137,9 +156,22 @@ describe('новые действия инструмента', () => {
   // сколько нужно и сколько есть, без слова «нет токенов».
   it('restore — баланса не хватает: назвать оба числа, не обещать пополнение автоматом', async () => {
     const h = harness();
-    h.lifecycle.restore.mockResolvedValue({ ok: true, status: 'sleeping', waking: false, balance: 12_345 } as any);
+    h.lifecycle.restore.mockResolvedValue({ ok: true, status: 'sleeping', waking: false, paid: false, paidUntil: '2020-01-01T00:00:00.000Z', balance: 12_345 } as any);
     const r: any = await h.svc.execute('u1', { action: 'restore', product: 'старый' });
     expect(r.say).toBe('Вернул, но он спит: на аренду нужно 50 000 токенов, на балансе 12 345 — после пополнения проснётся сам.');
+  });
+
+  // M7 (ревью): «не хватает» различается по AFFORDABLE, а не по waking —
+  // этот сценарий защитный (restore() всегда ставит wake, когда денег
+  // хватает, см. комментарий там) и на практике почти не достижим, но текст
+  // обязан быть честным и в нём: деньги есть, значит «не хватило токенов»
+  // здесь — неправда, даже если пробуждение почему-то не встало.
+  it('M7: денег хватает, но waking почему-то не встал — не «не хватило токенов», а «проснётся сам»', async () => {
+    const h = harness();
+    h.lifecycle.restore.mockResolvedValue({ ok: true, status: 'sleeping', waking: false, paid: false, paidUntil: '2020-01-01T00:00:00.000Z', balance: 70_000 } as any);
+    const r: any = await h.svc.execute('u1', { action: 'restore', product: 'старый' });
+    expect(r.say).toBe('Вернул; проснётся в течение нескольких минут, аренда 50 000 токенов спишется при запуске.');
+    expect(r.say).not.toMatch(/не хватило/);
   });
 
   it('delete — продукт остановлен администратором: карточка не открывается, отказ доходит до ассистента', async () => {
