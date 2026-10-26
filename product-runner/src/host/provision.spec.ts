@@ -1152,5 +1152,25 @@ describe('владелец бота — OWNER_TG_ID (очередь 2)', () => {
     ).rejects.toThrow(/OWNER_TG_ID/);
     expect(host.containers.size).toBe(0);
     expect(host.dirs.size).toBe(0);
+    // Без этой строки отказ после сдвига проверки за git init/commit тоже
+    // остался бы зелёным: containers.size и dirs.size нулевые до самого
+    // writeFiles, а не только до docker run.
+    expect(host.ran('git')).toHaveLength(0);
+  });
+
+  it.each<[string, unknown]>([
+    ['отрицательный — так выглядят id групп Telegram, а не владельца', '-1001234567890'],
+    ['пробел спереди', ' 123'],
+    ['число, а не строка', 123],
+  ])('не число (%s): отказ до первого изменения на хосте', async (_label, ownerTgId) => {
+    await expect(
+      provision(
+        job({ slug: 'bot-ulej', kind: 'bot', secrets: { BOT_TOKEN: 'т' }, ownerTgId: ownerTgId as unknown as string }),
+        deps(host),
+      ),
+    ).rejects.toThrow(/OWNER_TG_ID/);
+    expect(host.containers.size).toBe(0);
+    expect(host.dirs.size).toBe(0);
+    expect(host.ran('git')).toHaveLength(0);
   });
 });
