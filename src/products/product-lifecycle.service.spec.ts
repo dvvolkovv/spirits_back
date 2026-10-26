@@ -369,7 +369,15 @@ describe('возврат', () => {
     expect(await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' })).toEqual({ ok: true, status: 'sleeping', waking: true });
   });
 
-  it('wake уже стоял в очереди (RentService успел раньше) — waking всё равно true', async () => {
+  // Ревью, круг 2, пункт 11: старое имя теста («RentService успел раньше»)
+  // называло чужим гонку, которой в этой форме уже нет и, строго говоря, не
+  // было с тех пор, как снятие архива переехало в транзакцию restore() —
+  // products заперт FOR UPDATE с самого начала, и wakeTick видит только
+  // ЗАКОММИЧЕННОЕ состояние (см. докблок у ON CONFLICT в самом коде). Чужой
+  // 'wake' здесь на практике — повторный клик по той же карточке, не
+  // RentService; название теста это и проверяет — поведение (waking: true)
+  // при уже стоящем задании, а не конкретную причину.
+  it('wake уже стоял в очереди (повторный клик по карточке, не гонка с RentService.wakeTick) — waking всё равно true', async () => {
     const h = harness({
       pg: (sql) => {
         if (sql.includes('p.purge_after, p.block_reason')) return { rows: [deleted()] };
@@ -430,6 +438,55 @@ describe('возврат', () => {
       message: 'Этот бот уже работает в другом продукте — удалённого не вернуть, пока его токен занят',
     });
     expect(h.actions.record).toHaveBeenCalledWith(expect.objectContaining({ kind: 'restore', status: 'failed', result: expect.objectContaining({ reason: 'bot_in_use' }) }));
+  });
+
+  // Ревью, круг 2, пункт 5: журнал — ПОСЛЕ release клиента, не до. Раньше
+  // actions.record звалась внутри catch, ДО finally { client.release() } —
+  // держала клиент пула занятым дольше, чем нужно для его собственной
+  // работы. Порядок вызовов mock-функций — единственный способ это увидеть
+  // в юнит-тесте без реального пула.
+  it('bot_in_use: журнал пишется ПОСЛЕ release клиента, а не до', async () => {
+    const h = harness({
+      pg: (sql) => {
+        if (sql.includes('p.purge_after, p.block_reason')) return { rows: [deleted()] };
+        if (sql.includes('SET archived_at = NULL')) {
+          const e: any = new Error('duplicate key value violates unique constraint "products_tg_bot_live"');
+          e.code = '23505';
+          e.constraint = 'products_tg_bot_live';
+          throw e;
+        }
+        return null;
+      },
+    });
+    const r = await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' });
+    expect(r).toMatchObject({ ok: false, reason: 'bot_in_use' });
+    const client = await h.pg.getClient.mock.results[0].value;
+    const releaseOrder = client.release.mock.invocationCallOrder[0];
+    const recordOrder = h.actions.record.mock.invocationCallOrder[0];
+    expect(releaseOrder).toBeLessThan(recordOrder);
+  });
+
+  // Ревью, круг 2, пункты 1 и 9: NOWAIT на FOR UPDATE заданий (restore()) —
+  // 55P03 (lock_not_available) ловится и отдаётся как тот же busy, что и
+  // «задание running» без лока; без NOWAIT тот же конфликт с completeJob
+  // (обратный порядок замков — см. комментарий в коде) ждал бы
+  // deadlock_timeout и падал бы 40P01, а не аккуратным busy.
+  it('NOWAIT на заданиях занят прямо сейчас (55P03, как при живом completeJob) — busy, не 40P01 наружу', async () => {
+    const h = harness({
+      pg: (sql) => {
+        if (sql.includes('p.purge_after, p.block_reason')) return { rows: [deleted()] };
+        if (sql.includes("status IN ('queued','running') FOR UPDATE NOWAIT")) {
+          const e: any = new Error('could not obtain lock on row in relation "product_provision_jobs"');
+          e.code = '55P03';
+          throw e;
+        }
+        return null;
+      },
+    });
+    const r = await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' });
+    expect(r).toEqual({ ok: false, reason: 'busy', message: 'Машина продукта сейчас занята — попробуйте через минуту' });
+    expect(h.calls.some((c) => c.sql === 'ROLLBACK')).toBe(true);
+    expect(h.actions.record).not.toHaveBeenCalled();
   });
 });
 

@@ -349,6 +349,52 @@ maybe('жизненный цикл продукта против живого Po
       expect(row.archived_at).not.toBeNull();
     });
 
+    /**
+     * Ревью, круг 2, пункты 1 и 9. completeJob (provisioning.service.ts)
+     * запирает задание ПЕРВЫМ, продукт — ВТОРЫМ; restore() запирает продукт
+     * ПЕРВЫМ (строка выше в транзакции), задания — ВТОРЫМ: обратный порядок,
+     * который без NOWAIT давал бы настоящий deadlock (40P01), решаемый
+     * PostgreSQL только через deadlock_timeout. Клиент B здесь держит явный
+     * FOR UPDATE на самой строке задания — не на статусе 'running' (это
+     * проверяет тест выше без лока вовсе), а на ЛОКЕ, то есть ровно то, что
+     * держал бы completeJob в середине своей работы. restore() обязан
+     * ответить busy СРАЗУ, не дождавшись ни освобождения чужого лока, ни
+     * дедлока.
+     */
+    it('клиент держит FOR UPDATE на задании (как completeJob в середине работы) — restore отвечает busy немедленно, без ожидания', async () => {
+      const userId = 'u-restore-nowait';
+      const productId = await insertProduct({
+        userId, status: 'archived', slug: 'restore-nowait-1',
+        archivedAt: new Date(), purgeAfter: new Date(Date.now() + 10 * 86_400_000),
+      });
+      const job = await pool.query(
+        `INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'sleep', 'queued') RETURNING id`,
+        [productId],
+      );
+
+      const clientB = await pool.connect();
+      try {
+        await clientB.query('BEGIN');
+        await clientB.query('SELECT 1 FROM product_provision_jobs WHERE id = $1 FOR UPDATE', [job.rows[0].id]);
+
+        const startedAt = Date.now();
+        const r = await svc.restore({ userId, productId, channel: 'web' });
+        const elapsedMs = Date.now() - startedAt;
+
+        expect(r).toEqual({ ok: false, reason: 'busy', message: 'Машина продукта сейчас занята — попробуйте через минуту' });
+        // NOWAIT — не ждёт ни освобождения чужого лока, ни deadlock_timeout
+        // (у Postgres он обычно 1с, но мог быть поднят администратором).
+        expect(elapsedMs).toBeLessThan(2_000);
+
+        const row = (await pool.query('SELECT status, archived_at FROM products WHERE id = $1', [productId])).rows[0];
+        expect(row.status).toBe('archived');
+        expect(row.archived_at).not.toBeNull();
+      } finally {
+        await clientB.query('ROLLBACK').catch(() => undefined);
+        clientB.release();
+      }
+    });
+
     it('в пределах срока: снимает архив, чужой сон отменяет, будит при оплаченном периоде', async () => {
       const userId = 'u-restore';
       const productId = await insertProduct({
@@ -397,13 +443,26 @@ maybe('жизненный цикл продукта против живого Po
      * waitForLockWaiters в provisioning.integration.spec.ts: ждём, пока
      * запрос РЕАЛЬНО встанет в очередь на блокировку, а не гадаем со сколько
      * миллисекунд ему на это хватит.
+     *
+     * Ревью, круг 2, пункт 8: сузил условие — `excludePid` (pid держателя
+     * лока, он сам никогда не 'active'/'Lock', но исключение дёшево и прямо
+     * отвечает на замечание) и `queryLike` (кусок текста именно ОЖИДАЕМОГО
+     * запроса). Раньше условие ловило ЛЮБОГО ждущего лока в базе —
+     * `pl_test` одна на все тесты этого файла (и, в худшем случае, на
+     * параллельный прогон другого файла против той же базы), и чужой
+     * waiter совсем другого теста давал бы ложное «дождались» раньше, чем
+     * реально встал в очередь тик, который проверяет именно этот тест.
+     * Подстрока — из начала текста запроса (трек track_activity_query_size
+     * по умолчанию 1024 байта, с конца могло бы обрезать).
      */
-    async function waitForLockWaiter() {
+    async function waitForLockWaiter(excludePid: number, queryLike: string) {
       const until = Date.now() + 10_000;
       for (;;) {
         const r = await pool.query(
           `SELECT count(*)::int AS n FROM pg_stat_activity
-            WHERE datname = current_database() AND state = 'active' AND wait_event_type = 'Lock'`,
+            WHERE datname = current_database() AND state = 'active' AND wait_event_type = 'Lock'
+              AND pid <> $1 AND query ILIKE $2`,
+          [excludePid, queryLike],
         );
         if (r.rows[0].n >= 1) return;
         if (Date.now() > until) throw new Error('на замок никто не встал — сценарий не воспроизвёлся');
@@ -436,7 +495,7 @@ maybe('жизненный цикл продукта против живого Po
         // FOR UPDATE OF p внутри своего INSERT…SELECT (queueSleepForDeleted),
         // пока A держит строку.
         tick = svc.queueSleepForDeleted(productId);
-        await waitForLockWaiter();
+        await waitForLockWaiter((clientA as any).processID, '%FROM products p%');
 
         // A «возвращает» продукт и коммитит — строка освобождается, тик
         // перечитывает её уже с archived_at = NULL.
@@ -445,6 +504,15 @@ maybe('жизненный цикл продукта против живого Po
           [productId],
         );
         await clientA.query('COMMIT');
+      } catch (e) {
+        // Ревью, круг 2, пункт 8: сбой ДО COMMIT (например, waitForLockWaiter
+        // не дождался) раньше оставлял транзакцию A открытой — release() без
+        // ROLLBACK возвращает соединение в пул с чужим незакоммиченным BEGIN
+        // и чужим локом на строке продукта, и следующий тест, получив то же
+        // соединение из пула, вставал бы на этот лок навсегда. ROLLBACK здесь
+        // — гигиена пула, не часть проверяемого сценария.
+        await clientA.query('ROLLBACK').catch(() => undefined);
+        throw e;
       } finally {
         clientA.release();
       }

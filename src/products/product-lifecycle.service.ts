@@ -400,7 +400,20 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       // этого человек услышал бы «уже удалён», хотя продукт жив и просто
       // остановлен администратором — для него пополнение/повтор не лечат
       // ничего, нужна поддержка.
-      const cur = await this.pg.query(`SELECT block_reason FROM products WHERE id = $1 AND user_id = $2`, [row.product_id, i.userId]);
+      // Ревью, круг 2, пункт 6: этот SELECT раньше шёл СНАРУЖИ try/catch —
+      // обрыв базы прямо здесь (не на архивации выше, а именно на этом
+      // перечитывании) оставлял бы карточку в working навсегда, тем же
+      // способом, что описан в комментарии у catch архивации выше: claim и
+      // cancel требуют status='pending'.
+      let cur: any;
+      try {
+        cur = await this.pg.query(`SELECT block_reason FROM products WHERE id = $1 AND user_id = $2`, [row.product_id, i.userId]);
+      } catch (e: any) {
+        this.logger.warn(`completeDelete ${row.id} упал на перечитывании block_reason: ${e?.stack ?? e?.message ?? e}`);
+        const message = 'Не получилось — попробуйте ещё раз позже';
+        await this.actions.release(row.id, { error: message });
+        return { ok: false, reason: 'failed', message };
+      }
       if (cur.rows[0]?.block_reason != null) {
         const message = 'Продукт остановлен администратором — удалить его можно через поддержку';
         await this.actions.finish(row.id, 'failed', { reason: 'blocked', error: message });
@@ -547,7 +560,14 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       await this.limits.assertCanCreate(i.userId, await this.isAdmin(i.userId));
     } catch (e: any) {
       const f = failOf(e, 'Нет места в пределе', this.logger);
-      await this.actions.record({ userId: i.userId, productId: p.id, kind: 'restore', channel: i.channel, status: 'failed', payload: { name: p.name }, result: { reason: f.reason, error: f.message } });
+      // Ревью, круг 2, пункт 5: запись в журнал — лучшим усилием, как и у
+      // остальных отказов этого метода (bot_in_use, recordRevertRefusal) —
+      // сбой самой записи не должен топить уже случившийся отказ предела.
+      try {
+        await this.actions.record({ userId: i.userId, productId: p.id, kind: 'restore', channel: i.channel, status: 'failed', payload: { name: p.name }, result: { reason: f.reason, error: f.message } });
+      } catch (e2: any) {
+        this.logger.warn(`restore ${p.id}: отказ предела (${f.reason}) не записан в журнал: ${e2?.message}`);
+      }
       return f;
     }
     // M2: снятие очереди и снятие архива — в ОДНОЙ транзакции, с FOR UPDATE
@@ -562,6 +582,13 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     // Заполняется ТОЛЬКО по пути успеха, ПОСЛЕ COMMIT (ниже) — запись в
     // журнал делается уже снаружи try/finally, см. комментарий там.
     let committed: { status: string; waking: boolean } | null = null;
+    // Заполняется на пути отказа «бот занят» — тем же приёмом, что у
+    // committed (ревью, круг 2, пункт 5): запись в журнал и возврат — уже
+    // ПОСЛЕ release, см. код после finally внизу. Сам catch ниже только
+    // ставит эту переменную и ROLLBACK, саму запись в журнал не делает —
+    // раньше она шла здесь же, ДО release, и журнал держал клиента из пула
+    // занятым дольше, чем нужно для его собственной работы.
+    let botInUse: { message: string } | null = null;
     try {
       await client.query('BEGIN');
       const locked = await client.query(
@@ -584,10 +611,31 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       // LOCKED` (см. docblock claimJob), и, пока мы держим эту блокировку, он
       // просто пропускает запертые строки — выдать их в running до нашего
       // COMMIT/ROLLBACK ему нечем.
-      const jobs = await client.query(
-        `SELECT id, status FROM product_provision_jobs WHERE product_id = $1 AND status IN ('queued','running') FOR UPDATE`,
-        [p.id],
-      );
+      //
+      // NOWAIT, а не просто FOR UPDATE (ревью, круг 2, пункт 1). completeJob
+      // (provisioning.service.ts) запирает ЭТО ЖЕ задание ПЕРВЫМ, а продукт —
+      // ВТОРЫМ: порядок замков строго обратный тому, что здесь (мы уже
+      // заперли products строкой выше). Если completeJob в этот момент
+      // держит лок на задании (агент хоста прямо сейчас отчитывается) и ждёт
+      // products, а мы без NOWAIT стали бы ждать его лок на задании — замкнутый
+      // цикл, который PostgreSQL решает только через deadlock_timeout
+      // (40P01), роняя одну из двух транзакций наугад и с задержкой. NOWAIT
+      // превращает ту же коллизию в немедленный и предсказуемый отказ именно
+      // здесь: лучше явное «занято» сейчас, чем секунда ожидания и то же
+      // «занято» через брошенное исключение сервера.
+      let jobs: any;
+      try {
+        jobs = await client.query(
+          `SELECT id, status FROM product_provision_jobs WHERE product_id = $1 AND status IN ('queued','running') FOR UPDATE NOWAIT`,
+          [p.id],
+        );
+      } catch (e: any) {
+        if (e?.code === '55P03') {
+          await client.query('ROLLBACK');
+          return { ok: false, reason: 'busy', message: 'Машина продукта сейчас занята — попробуйте через минуту' };
+        }
+        throw e;
+      }
       if (jobs.rows.some((j: any) => j.status === 'running')) {
         await client.query('ROLLBACK');
         return { ok: false, reason: 'busy', message: 'Машина продукта сейчас занята — попробуйте через минуту' };
@@ -609,10 +657,17 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       // Карточка может висеть pending минутами, и вторая, более РАННЕ
       // открытая, но ПОЗЖЕ подтверждённая попытка удаления обязана считаться
       // последней — по created_at порядок вышел бы обратным.
+      // NULLS LAST, а не голый DESC — NULL в resolved_at (не должен бывать у
+      // status='done', но защита дешевле веры) иначе встал бы ПЕРВЫМ при
+      // убывающей сортировке, и ORDER BY отдал бы НЕ самую последнюю строку.
+      // created_at DESC — ровно для разрешения ничьей по resolved_at (ревью,
+      // круг 2, пункт 10): две записи, закрытые в одну секунду, упорядочены
+      // по тому, какая была ОТКРЫТА позже — тем же приёмом, что описан в
+      // комментарии выше про «более рано открытую, но позже подтверждённую».
       const prevR = await client.query(
         `SELECT result->>'prevStatus' AS prev_status FROM product_actions
           WHERE product_id = $1 AND kind = 'delete' AND status = 'done'
-          ORDER BY resolved_at DESC LIMIT 1`,
+          ORDER BY resolved_at DESC NULLS LAST, created_at DESC LIMIT 1`,
         [p.id],
       );
       const prevStatus: string | null = prevR.rows[0]?.prev_status ?? null;
@@ -639,58 +694,72 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
         // возврате.
         if (e?.code === '23505' && e?.constraint === 'products_tg_bot_live') {
           await client.query('ROLLBACK');
-          const message = 'Этот бот уже работает в другом продукте — удалённого не вернуть, пока его токен занят';
-          await this.actions.record({ userId: i.userId, productId: p.id, kind: 'restore', channel: i.channel, status: 'failed', payload: { name: p.name }, result: { reason: 'bot_in_use', error: message } });
-          return { ok: false, reason: 'bot_in_use', message };
-        }
-        throw e;
-      }
-      const row = r.rows[0];
-      if (!row) {
-        await client.query('ROLLBACK');
-        return { ok: false, reason: 'not_found', message: 'Удалённого продукта с таким именем нет' };
-      }
-      let waking = false;
-      if (row.status === 'sleeping' && row.paid) {
-        // Оплаченный период ещё идёт — будим сами: подметальщик аренды будит
-        // только тех, на кого хватает баланса на новый месяц.
-        const w = await client.query(
-          `INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'wake', 'queued')
-           ON CONFLICT DO NOTHING RETURNING product_id`,
-          [p.id],
-        );
-        if (w.rows.length > 0) {
-          waking = true;
+          // Запись в журнал — НЕ здесь, см. комментарий у объявления
+          // botInUse выше: держать клиент пула занятым этой записью не нужно.
+          botInUse = { message: 'Этот бот уже работает в другом продукте — удалённого не вернуть, пока его токен занят' };
         } else {
-          // ON CONFLICT молчит НЕ на гонку с RentService.wakeTick — такой
-          // гонки здесь больше нет (и, строго говоря, не было с тех пор, как
-          // снятие архива переехало в эту же транзакцию): products заперт
-          // FOR UPDATE с самого начала транзакции, а wakeTick видит только
-          // ЗАКОММИЧЕННОЕ состояние — пока мы не дошли до COMMIT, он читает
-          // archived_at НЕ NULL и этот продукт как кандидата на пробуждение
-          // не видит вовсе, поставить сюда 'wake' параллельно ему нечем.
-          // Единственная причина, по которой здесь всё-таки может лежать
-          // чужое задание 'wake' — повторный клик по той же карточке; но и
-          // его исключает FOR UPDATE на products выше (вторая, параллельная
-          // restore() на тот же id ждёт эту транзакцию и после неё видит
-          // продукт уже не архивным). ON CONFLICT и этот SELECT остаются
-          // защитой на случай, если какая-то из этих гарантий когда-нибудь
-          // сломается молча — `waking = false` в таком случае была бы
-          // неправдой, если задание всё-таки оказалось в очереди.
-          const existing = await client.query(
-            `SELECT 1 FROM product_provision_jobs WHERE product_id = $1 AND kind = 'wake' AND status IN ('queued','running')`,
+          throw e;
+        }
+      }
+      if (!botInUse) {
+        const row = r.rows[0];
+        if (!row) {
+          await client.query('ROLLBACK');
+          return { ok: false, reason: 'not_found', message: 'Удалённого продукта с таким именем нет' };
+        }
+        let waking = false;
+        if (row.status === 'sleeping' && row.paid) {
+          // Оплаченный период ещё идёт — будим сами: подметальщик аренды будит
+          // только тех, на кого хватает баланса на новый месяц.
+          const w = await client.query(
+            `INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'wake', 'queued')
+             ON CONFLICT DO NOTHING RETURNING product_id`,
             [p.id],
           );
-          waking = existing.rows.length > 0;
+          if (w.rows.length > 0) {
+            waking = true;
+          } else {
+            // ON CONFLICT молчит НЕ на гонку с RentService.wakeTick — такой
+            // гонки здесь больше нет (и, строго говоря, не было с тех пор, как
+            // снятие архива переехало в эту же транзакцию): products заперт
+            // FOR UPDATE с самого начала транзакции, а wakeTick видит только
+            // ЗАКОММИЧЕННОЕ состояние — пока мы не дошли до COMMIT, он читает
+            // archived_at НЕ NULL и этот продукт как кандидата на пробуждение
+            // не видит вовсе, поставить сюда 'wake' параллельно ему нечем.
+            // Единственная причина, по которой здесь всё-таки может лежать
+            // чужое задание 'wake' — повторный клик по той же карточке; но и
+            // его исключает FOR UPDATE на products выше (вторая, параллельная
+            // restore() на тот же id ждёт эту транзакцию и после неё видит
+            // продукт уже не архивным). ON CONFLICT и этот SELECT остаются
+            // защитой на случай, если какая-то из этих гарантий когда-нибудь
+            // сломается молча — `waking = false` в таком случае была бы
+            // неправдой, если задание всё-таки оказалось в очереди.
+            const existing = await client.query(
+              `SELECT 1 FROM product_provision_jobs WHERE product_id = $1 AND kind = 'wake' AND status IN ('queued','running')`,
+              [p.id],
+            );
+            waking = existing.rows.length > 0;
+          }
         }
+        await client.query('COMMIT');
+        committed = { status: row.status, waking };
       }
-      await client.query('COMMIT');
-      committed = { status: row.status, waking };
     } catch (e: any) {
       await client.query('ROLLBACK').catch(() => undefined);
       throw e;
     } finally {
       client.release();
+    }
+    if (botInUse) {
+      // Журнал — ПОСЛЕ release (ревью, круг 2, пункт 5): лучшее усилие, сбой
+      // записи не должен топить уже случившийся (и уже закоммиченный ROLLBACK)
+      // отказ.
+      try {
+        await this.actions.record({ userId: i.userId, productId: p.id, kind: 'restore', channel: i.channel, status: 'failed', payload: { name: p.name }, result: { reason: 'bot_in_use', error: botInUse.message } });
+      } catch (e: any) {
+        this.logger.warn(`restore ${p.id}: отказ bot_in_use не записан в журнал: ${e?.message}`);
+      }
+      return { ok: false, reason: 'bot_in_use', message: botInUse.message };
     }
     // Журнал — ПОСЛЕ COMMIT и release, не внутри try/finally выше: запиши
     // его там, и сбой записи (поймав собственный же catch) звал бы ROLLBACK
@@ -698,8 +767,9 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     // зафиксирована), а для вызывающего — брошенное исключение поверх
     // продукта, который на самом деле уже успешно вернулся. Лучшее усилие:
     // сбой журнала не должен портить случившийся успех. Достичь этой строки,
-    // не вернувшись и не бросив раньше, можно только пройдя путь успеха
-    // внутри try — то есть `committed` здесь всегда заполнен.
+    // не вернувшись раньше (not_found/busy/bot_in_use) и не бросив, можно
+    // только пройдя путь успеха внутри try — то есть `committed` здесь всегда
+    // заполнен.
     try {
       await this.actions.record({ userId: i.userId, productId: p.id, kind: 'restore', channel: i.channel, status: 'done', payload: { name: p.name }, result: committed });
     } catch (e: any) {
