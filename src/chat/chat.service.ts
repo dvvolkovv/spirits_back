@@ -26,7 +26,7 @@ import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
 import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
 import { ProductActionsService } from '../products/product-actions.service';
-import { productActionTail } from '../products/product-action-tail';
+import { productActionTail, stripProductActionBlocks } from '../products/product-action-tail';
 import { ChatFileStore, PERSIST_TURN_BUDGET_MS } from './chat-files/chat-file-store';
 import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks } from './chat-files/relay-links';
 import { BalanceContextService } from '../tokens/balance-context.service';
@@ -1257,6 +1257,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
         }
       }
 
+      // Модели нельзя доверять печатать блок product-action самой: она видит
+      // старые блоки в истории и знает actionId из результата инструмента —
+      // могла бы скопировать чужой/просроченный блок или повторить свежий
+      // второй раз. Чистим ответ ПЕРЕД тем, как сервер допишет свой (или не
+      // допишет вовсе, если действий за этот ход нет).
+      fullText = stripProductActionBlocks(fullText);
       try {
         const taken = (await this.productActions?.takeForTurn(userId, productsTurn, new Date(turnStartedAt), 'web')) ?? [];
         fullText += productActionTail(taken, ui.cards, userLanguage);
@@ -1812,6 +1818,15 @@ ${LanguageService.buildDirective(userLanguage)}`;
       }
     };
 
+    // Метка хода — одна на оба вызова upstream (самолечение пустого потока
+    // зовёт его второй раз) И на catch ниже: если апстрим рвётся ПОСЛЕ того,
+    // как модель уже открыла карточку (инструмент продуктов отработал до
+    // обрыва), её нельзя терять — catch забирает её тем же nonce, а не
+    // заводит новый (под новым nonce карточка осталась бы висеть «ничьей» до
+    // следующего хода). Вынесено ДО try, поэтому и объявлено здесь, а не
+    // внутри.
+    const productsTurn = randomUUID();
+
     try {
       // Ход пошёл в upstream — с этого места и до finally его нельзя рвать
       // рестартом. Инкремент внутри try, чтобы декремент в finally был парным
@@ -1823,9 +1838,6 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Ключ сессии релея: и в запросе, и для шагов работы — релей кладёт
       // загрузки под именем «<ключ>_<файл>», и префикс надо срезать.
       const relaySid = relaySessionKey(userId, assistantId, userLanguage, fresh ? freshSessionId : undefined);
-      // Метка хода — одна на оба вызова upstream (самолечение пустого потока
-      // зовёт его второй раз): карточка не должна потеряться между ними.
-      const productsTurn = randomUUID();
       const callUpstreamOnce = async (): Promise<void> => {
         const FormData = require('form-data');
         const fd = new FormData();
@@ -2143,6 +2155,22 @@ ${LanguageService.buildDirective(userLanguage)}`;
         this.logger.warn(`speech marker injection failed: ${e.message}`);
       }
 
+      // Модели нельзя доверять печатать блок product-action самой: она видит
+      // старые блоки в истории и знает actionId из результата инструмента —
+      // могла бы скопировать чужой/просроченный блок или повторить свежий
+      // второй раз. Чистим ОБЪЕДИНЁННЫЙ текст, а не каждый chunk по отдельности
+      // (как [VIDEO_JOB:...] выше): поток режет ответ на чанки произвольно, и
+      // блок на границе двух чанков построчная чистка просто не увидит.
+      // Правим сам chunks (а не локальную переменную) — из него ниже собирают
+      // и fullText для end.content, и persistResponse отдельно пересобирает
+      // тот же chunks.join('') для истории; поправить только одну копию
+      // значило бы разойтись между потоком и тем, что ляжет в БД.
+      {
+        const joined = chunks.join('');
+        const cleaned = stripProductActionBlocks(joined);
+        if (cleaned !== joined) chunks.splice(0, chunks.length, cleaned);
+      }
+
       // Карточки продуктов, заведённые этим ходом: блок для клиента с
       // карточками, ссылка на кабинет — для остальных.
       try {
@@ -2233,6 +2261,30 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // хода всё равно надо скопировать и дописать ссылкой, иначе их потерял
       // бы именно тот случай, ради которого pendingFiles вынесены перед try.
       try { await flushFileLinks(); } catch (e: any) { this.logger.warn(`flushFileLinks in catch failed: ${e.message}`); }
+      // Карточки продуктов — та же история, что с файлами выше: апстрим мог
+      // упасть ПОСЛЕ того, как модель успела дёрнуть инструмент продуктов
+      // (правка уже встала в product_actions), но до конца потока. Без этого
+      // карточка осталась бы «ничьей»: тот же productsTurn её больше не
+      // подхватит (следующий ход заведёт новый nonce), а старый поиск по
+      // created_at её бы нашёл, но только если бы такой поиск тут был.
+      // takeForTurn безопасно вызывать даже если обычная ветка уже успела
+      // забрать карточки этим же productsTurn — UPDATE ... WHERE attached_at
+      // IS NULL во второй раз просто не находит строк и вернёт [] (см.
+      // ProductActionsService.takeForTurn), так что задвоения нет ни здесь
+      // само по себе, ни на стыке с успешной веткой.
+      try {
+        const joined = chunks.join('');
+        const cleaned = stripProductActionBlocks(joined);
+        if (cleaned !== joined) chunks.splice(0, chunks.length, cleaned);
+        const taken = (await this.productActions?.takeForTurn(userId, productsTurn, new Date(streamStartTime), 'web')) ?? [];
+        const tail = productActionTail(taken, ui.cards, userLanguage);
+        if (tail) {
+          chunks.push(tail);
+          safeWrite({ type: 'item', content: tail });
+        }
+      } catch (e: any) {
+        this.logger.warn(`product action attach failed in catch: ${e.message}`);
+      }
       // Try to write error to response; safeWrite is a no-op if client gone.
       const errText = 'Ошибка запуска агента. Попробуйте ещё раз.';
       safeWrite({ type: 'item', content: errText });

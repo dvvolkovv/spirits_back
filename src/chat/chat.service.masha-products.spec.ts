@@ -310,3 +310,72 @@ describe('Маша: метафорическая карта не цепляет�
     expect(item.content).toContain(`![Метафорическая карта](${CARD_URL})`);
   });
 });
+
+// ─── карточка к ответу (задача 11): приписывает только сервер ──────────────
+
+/**
+ * Блок ```product-action``` в ответ Маши вставляет ТОЛЬКО сервер, через
+ * takeForTurn() ПОСЛЕ ответа CLI — модели это делать нельзя: она видит старые
+ * блоки в истории разговора и знает actionId из результата своего же
+ * инструмента (manage_product), и может скопировать чужой/просроченный блок
+ * или прислать его сама. stripProductActionBlocks в chat.service вырезает
+ * такой самодельный блок перед тем, как сервер допишет свой.
+ */
+describe('Маша: карточка продукта приписывается сервером, не моделью', () => {
+  const OLD_SECRET = process.env.JWT_SECRET;
+  beforeAll(() => { process.env.JWT_SECRET = 'test-secret-for-product-tool'; });
+  afterAll(() => { process.env.JWT_SECRET = OLD_SECRET; });
+
+  const ACTION_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  // "Модель" в этом тесте сама пишет блок с ДРУГИМ id — ход проверяет, что
+  // именно этот, самодельный, блок исчезает, а появляется только серверный.
+  const FAKE_ID = 'ffffffff-1111-4ccc-8ddd-eeeeeeeeeeee';
+  const SERVER_BLOCK = '```product-action\n{"id":"' + ACTION_ID + '"}\n```';
+
+  it('nonce у takeForTurn — тот же, что ушёл в токен инструмента; канал web; блок в потоке и в истории; модель-написанный блок вырезан', async () => {
+    const { svc, claudeCli } = makeService();
+    const takeForTurn = jest.fn(async () => [{ id: ACTION_ID }]);
+    // Подмена позиционного @Optional-поля напрямую — как советует памятка
+    // исполнителя: проще, чем тащить через конструктор все 15 параметров,
+    // что идут перед productActions.
+    (svc as any).productActions = { takeForTurn };
+    claudeCli.textWithCost.mockImplementation(async () => ({
+      text: `Готово, сайт создан.\n\n${SERVER_BLOCK.replace(ACTION_ID, FAKE_ID)}`,
+      costUsd: 0.01,
+    }));
+    const { res, writes } = makeRes();
+
+    await svc.streamChat(
+      USER, 'Создай сайт цветов', '3', `${USER}_3`, 'Имя: Дмитрий', res,
+      undefined, false, undefined, undefined, false, false,
+      { activity: false, ask: false, cards: true },
+    );
+    await new Promise((r) => setImmediate(r));
+
+    // Метка хода у takeForTurn — РОВНО та, что уехала в токен products MCP:
+    // не null и не своя, случайно сгенерированная внутри теста.
+    const bearer = String(claudeCli.textWithCost.mock.calls[0][1].mcpServers.products.headers.Authorization)
+      .replace(/^Bearer /, '');
+    const claims = verifyProductToolToken(bearer);
+    expect(claims.channel).toBe('web');
+    expect(takeForTurn).toHaveBeenCalledWith(USER, claims.turn, expect.any(Date), 'web');
+
+    const events = writes.map((w) => JSON.parse(w));
+    const item = events.find((e) => e.type === 'item');
+    const end = events.find((e) => e.type === 'end');
+
+    // Серверный блок — в потоке и в end.content, фейковый (от "модели") — нет.
+    expect(item.content).toContain(SERVER_BLOCK);
+    expect(end.content).toContain(SERVER_BLOCK);
+    expect(end.content).not.toContain(FAKE_ID);
+    // Ровно один блок на выходе, а не два (серверный + недовырезанный модельный).
+    expect((end.content.match(/```product-action/g) ?? []).length).toBe(1);
+
+    // И то же самое — в истории, которую увидит пользователь после F5.
+    const savedCalls = (svc as any).saveChatHistory.mock.calls;
+    expect(savedCalls.length).toBeGreaterThan(0);
+    const savedText = savedCalls[0][3];
+    expect(savedText).toContain(SERVER_BLOCK);
+    expect(savedText).not.toContain(FAKE_ID);
+  });
+});
