@@ -2082,7 +2082,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
         const hasEmpty = /\[[^\]]+\]\(\s*\)/.test(full);
         const hasBareUrl = full.includes(`${AGENT_URL}/files/`);
         if ((hasEmpty || hasBareUrl) && !clientDisconnected) {
-          const listSession = (sid: string) =>
+          // null — запрос упал (ошибка, не честное «пусто»); на нём запасной
+          // запрос не делаем (ревью 26.10.2026): тот же релей тем же секретом
+          // откажет и там, а повтор только тратит время самого хода.
+          const listSession = (sid: string): Promise<any[] | null> =>
             axios
               .get(`${AGENT_URL}/session/${encodeURIComponent(sid)}/files`, {
                 timeout: 10_000,
@@ -2092,18 +2095,27 @@ ${LanguageService.buildDirective(userLanguage)}`;
               .then((r) => (Array.isArray(r.data) ? r.data : []))
               .catch((e) => {
                 if (e?.response?.status === 401) this.logger.warn('релей отклонил секрет (401)');
-                return [] as any[];
+                return null;
               });
           // Список нужен только чтобы сопоставить ИМЯ из пустых скобок с
           // адресом. Готовый адрес самодостаточен — ради него relay не дёргаем.
-          // Папка хода — fs_key (linkeon-relay-fields.ts); пусто — папка по
+          // Папка хода — fs_key (linkeon-relay-fields.ts); пусто или нет fs_key
+          // (нет секретов для него — см. linkeon-relay-fields.ts) — папка по
           // ключу сессии хода: релей ещё без fs_key или файл из хода до
           // выката. До 26.10.2026 здесь стоял ключ без языка
           // (`<userId>_<assistantId>`), и обычный ход смотрел не в свою папку.
+          // Второй запрос — только когда первый честно ответил «пусто», а не
+          // когда упал.
           let listed: any[] = [];
           if (hasEmpty) {
-            listed = await listSession(linkeonFields.fs_key);
-            if (listed.length === 0) listed = await listSession(relaySid);
+            const byFsKey = linkeonFields.fs_key ? await listSession(linkeonFields.fs_key) : [];
+            if (byFsKey === null) {
+              listed = [];
+            } else if (byFsKey.length > 0) {
+              listed = byFsKey;
+            } else {
+              listed = (await listSession(relaySid)) ?? [];
+            }
           }
 
           let resolved = resolveEmptyFileLinks(full, listed, AGENT_URL);
