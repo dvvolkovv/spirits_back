@@ -6,7 +6,19 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
+import { KEYFRAME_USD, OMNI_USD_PER_SEC } from './short-captions';
+import { MAX_HOOK_WORDS, MAX_SKIT_HOOK_WORDS } from './short-rules';
 import { planSkits } from './short-skit-prompts';
+
+// Поле ищется внутри своего типа: skits и fingerprint есть и в соседних типах.
+const block = (src: string, file: string, name: string): string => {
+  const m = src.match(new RegExp(`(?:interface ${name}(?: extends [^{]+)? |type ${name} = )\\{([\\s\\S]*?)\\n\\}`));
+  if (!m) throw new Error(`${file}: нет типа ${name}`);
+  return m[1];
+};
+// Поля верхнего уровня — «имя:» или «имя?:» в начале строки; JSDoc и { … } в одну строку не мешают.
+const fields = (src: string, file: string, name: string): string[] =>
+  [...block(src, file, name).matchAll(/^\s*(\w+)(\?)?:/gm)].map((m) => m[1] + (m[2] ?? '')).sort();
 
 const studio = (p: string): string => fs.readFileSync(path.join(__dirname, '..', '..', 'studio', 'src', p), 'utf8');
 
@@ -15,7 +27,7 @@ describe('контракт API и студии', () => {
     const types = studio('types.ts');
     for (const field of [
       'assistantId', 'assistantName', 'followups', 'answerShotWidth', 'answerShotHeight', 'answerText', 'turns',
-      'paragraphs', 'hookBox', 'badge', 'assistantsCount', 'disclaimer',
+      'paragraphs', 'hookBox', 'badge', 'assistantsCount', 'disclaimer', 'skit',
     ]) {
       expect(types).toMatch(new RegExp(`\\b${field}\\??:`));
     }
@@ -26,6 +38,7 @@ describe('контракт API и студии', () => {
     for (const s of [
       "'capture_queued'", "'capturing'", "'render_queued'", "'rendering'", "status = 'writing'", "status = 'pending_review'",
       'writer_feedback', 'failed_from', 'failure_notified = false', 'questionShotKey', 'answerShotKey', 'review_message_id = NULL',
+      "'animate_queued'", "'animating'", "status = 'render_queued'", 'animation', 'max_omni_seconds',
     ]) {
       expect(db).toContain(s);
     }
@@ -40,15 +53,6 @@ describe('контракт API и студии', () => {
   it('сценки: студия и бэкенд объявляют одни и те же поля, план сценок пишет ровно их', () => {
     const types = studio('types.ts');
     const back = fs.readFileSync(path.join(__dirname, 'short-skit-prompts.ts'), 'utf8');
-    // Поле ищется внутри своего типа: skits и fingerprint есть и в соседних типах.
-    const block = (src: string, file: string, name: string): string => {
-      const m = src.match(new RegExp(`(?:interface ${name}(?: extends [^{]+)? |type ${name} = )\\{([\\s\\S]*?)\\n\\}`));
-      if (!m) throw new Error(`${file}: нет типа ${name}`);
-      return m[1];
-    };
-    // Поля верхнего уровня — «имя:» или «имя?:» в начале строки; JSDoc и { … } в одну строку не мешают.
-    const fields = (src: string, file: string, name: string): string[] =>
-      [...block(src, file, name).matchAll(/^\s*(\w+)(\?)?:/gm)].map((m) => m[1] + (m[2] ?? '')).sort();
     for (const t of ['SkitLine', 'Skit', 'SkitPlan']) {
       expect({ [t]: fields(types, 'studio/src/types.ts', t) }).toEqual({ [t]: fields(back, 'short-skit-prompts.ts', t) });
     }
@@ -65,5 +69,31 @@ describe('контракт API и студии', () => {
     const kind = /export type SkitKind = ([^;]+);/;
     expect(types.match(kind)?.[1]).toBeDefined();
     expect(types.match(kind)?.[1]).toBe(back.match(kind)?.[1]);
+  });
+});
+
+describe('контракт API и студии — оживление', () => {
+  const types = studio('types.ts');
+  const back = fs.readFileSync(path.join(__dirname, 'shorts.types.ts'), 'utf8');
+
+  it('animation: студия пишет те же поля, что читает API (подпись владельцу, сборка)', () => {
+    expect(fields(types, 'studio/src/types.ts', 'ShortAnimation')).toEqual(fields(back, 'shorts.types.ts', 'ShortAnimation'));
+    expect(fields(types, 'studio/src/types.ts', 'SkitClip')).toEqual(fields(back, 'shorts.types.ts', 'ShortSkitClip'));
+  });
+
+  it('кадры и клипы в MinIO — под shorts/<id>/ путями папки оживления', () => {
+    expect(studio('worker/jobs.ts')).toContain('shorts/${id}/${rel}');
+  });
+
+  it('цены в подписи владельцу и в выводе студии — одни и те же', () => {
+    const google = studio('animate/google.ts');
+    expect(google).toContain(`export const OMNI_USD_PER_SEC = ${OMNI_USD_PER_SEC};`);
+    expect(google).toContain(`export const KEYFRAME_USD = ${KEYFRAME_USD};`);
+  });
+
+  it('предел слов зацепки — один у API и у студии', () => {
+    const script = studio('script.ts');
+    expect(script).toContain(`export const HOOK_MAX_WORDS = ${MAX_HOOK_WORDS};`);
+    expect(script).toContain(`export const SKIT_HOOK_MAX_WORDS = ${MAX_SKIT_HOOK_WORDS};`);
   });
 });
