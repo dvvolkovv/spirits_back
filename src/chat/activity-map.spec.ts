@@ -156,3 +156,25 @@ describe('toActivity — что видит человек вместо трёх 
       .toEqual({ type: 'activity', kind: 'help' });
   });
 });
+
+// fs_key (linkeon-relay-fields.ts): релей с 26.10.2026 называет загрузки
+// `<fs_key>_<имя>` — без номера телефона в имени.
+describe('toActivity — загрузки с префиксом fs_key', () => {
+  const FS_KEY = '0123456789abcdef0123456789abcdef';
+  const WHO_FS = { userId: PHONE, relaySessionId: `${PHONE}_12_ru`, fsKey: FS_KEY };
+
+  it('префикс fs_key срезан, имя видно', () => {
+    expect(toActivity('Read', json({ file_path: `/tmp/agent-uploads/${FS_KEY}_egrul.pdf` }), WHO_FS))
+      .toEqual({ type: 'activity', kind: 'read_upload', detail: 'egrul.pdf' });
+  });
+
+  it('загрузка до выката (префикс — ключ сессии) при известном fs_key — тоже срезана', () => {
+    expect(toActivity('Read', json({ file_path: `/tmp/agent-uploads/${PHONE}_12_ru_egrul.pdf` }), WHO_FS))
+      .toEqual({ type: 'activity', kind: 'read_upload', detail: 'egrul.pdf' });
+  });
+
+  it('результат в папке fs_key — имя видно', () => {
+    expect(toActivity('Write', json({ file_path: `/tmp/agent-output/${FS_KEY}/report.docx` }), WHO_FS))
+      .toEqual({ type: 'activity', kind: 'write_file', detail: 'report.docx' });
+  });
+});
