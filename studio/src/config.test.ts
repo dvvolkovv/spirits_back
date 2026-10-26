@@ -51,9 +51,13 @@ test('рабочему процессу нужны база и MinIO; бакет
   assert.equal(parseConfig({}, none).minio, null);
 });
 
-test('оживлению сценок нужен ключ Google', () => {
+test('оживлению сценок нужны ключи Google и SpeechKit; без оживления ключ Google не читается', () => {
   const animate = { capture: false, tts: false, animate: true };
-  assert.throws(() => parseConfig({}, animate), /GOOGLE_AI_API_KEY/);
-  assert.equal(parseConfig({ GOOGLE_AI_API_KEY: 'g' }, animate).googleKey, 'g');
-  assert.equal(parseConfig({}, none).googleKey, '');
+  const speech = { YANDEX_SPEECHKIT_API_KEY: 'k', YANDEX_TTS_FOLDER_ID: 'f' };
+  assert.throws(() => parseConfig(speech, animate), /GOOGLE_AI_API_KEY/);
+  assert.throws(() => parseConfig({ GOOGLE_AI_API_KEY: 'g' }, animate), /YANDEX_SPEECHKIT_API_KEY/);
+  const c = parseConfig({ GOOGLE_AI_API_KEY: 'g', ...speech }, animate);
+  assert.equal(c.googleKey, 'g');
+  assert.equal(c.speechkitKey, 'k');
+  assert.equal(parseConfig({ GOOGLE_AI_API_KEY: 'g' }, none).googleKey, '');
 });
