@@ -6,13 +6,15 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import { turnFsKey, uploadFileName, fallbackFileName, sessionOutputDir } from "./paths.mjs";
+import { turnFsKey, sessionFsKey, uploadFileName, fallbackFileName, sessionOutputDir } from "./paths.mjs";
 import { eventCallContext, tailDialogue } from "./session-tail.mjs";
 import { RUN_ENV, runTag, finishedRun, reap } from "./proc-reaper.mjs";
 import { costBaseline, runCost } from "./turn-cost.mjs";
 import { createUndelivered, withCarried } from "./undelivered-files.mjs";
 import { createRelayAuth } from "./relay-auth.mjs";
 import { LINKEON_TOOLS, linkeonServer } from "./linkeon-mcp.mjs";
+import { sessionMcpConfigName, sweepStaleSessionMcpConfigs } from "./session-mcp-config.mjs";
+import { snapshotDir, changedFiles } from "./turn-files.mjs";
 
 const app = express();
 const PORT = 3033;
@@ -295,6 +297,17 @@ function endRun(tag) {
 const sweepRuns = () => reap(finishedRun(liveRuns)).then(logReaped, () => {});
 setInterval(sweepRuns, 5 * 60 * 1000).unref();
 
+// Осиротевшие конфиги хода (session-mcp-config.mjs): `finally` в /chat не
+// отработал (SIGKILL, падение процесса релея) — файл с чужими Bearer-токенами
+// остался на диске. Возраст, не список активных сессий: так же безопасно, как
+// sweepRuns выше. Ходы столько не живут — час с большим запасом.
+const SESSION_MCP_MAX_AGE_MS = 60 * 60 * 1000;
+const sweepStaleMcpConfigs = () => {
+  const removed = sweepStaleSessionMcpConfigs(UPLOAD_DIR, SESSION_MCP_MAX_AGE_MS);
+  if (removed.length) console.log("осиротевших конфигов хода удалено: " + removed.length);
+};
+setInterval(sweepStaleMcpConfigs, 5 * 60 * 1000).unref();
+
 // ── Agent-direct TalerID (notes + messages) ──────────────────────────────────
 // Enabled per-request only when the backend passes a per-user TalerID access
 // token (the user connected the ecosystem). Calendar is intentionally EXCLUDED
@@ -434,6 +447,16 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   const outDir = path.join(OUTPUT_DIR, fsKey);
   fs.mkdirSync(outDir, { recursive: true });
 
+  // Папка хода ДО перехода на fs_key (26.10.2026). Модель может помнить путь
+  // к файлу оттуда из истории разговора (ссылка, которую она сама когда-то
+  // напечатала) и править именно его, а не файл в новой папке — снимок и
+  // диффы собираются по ОБЕИМ папкам, см. ниже и у done. Если fs_key не
+  // прислан (старый бэк, анонимный/служебный ход) — legacyFsKey === fsKey,
+  // и прежней папки отдельно нет.
+  const legacyFsKey = sessionFsKey(sessionId, fsKey);
+  const legacyOutDir = legacyFsKey !== fsKey ? path.join(OUTPUT_DIR, legacyFsKey) : null;
+  const hasLegacyDir = !!legacyOutDir && fs.existsSync(legacyOutDir);
+
   const renamedFiles = [];
   if (req.files && req.files.length > 0) {
     for (const f of req.files) {
@@ -507,21 +530,9 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   res.on("close", stopHeartbeat);
 
   // Track file mtimes before processing to detect new/changed files
-  const filesBefore = new Map();
-  if (fs.existsSync(outDir)) {
-    const walkBefore = (dir, prefix) => {
-      for (const item of fs.readdirSync(dir)) {
-        const full = path.join(dir, item);
-        const rel = prefix ? prefix + "/" + item : item;
-        try {
-          const stat = fs.statSync(full);
-          if (stat.isDirectory()) walkBefore(full, rel);
-          else filesBefore.set(rel, stat.mtimeMs);
-        } catch {}
-      }
-    };
-    walkBefore(outDir, "");
-  }
+  // (turn-files.mjs — снимок бьёт по реальной fs, тесты — turn-files.test.mjs).
+  const filesBefore = snapshotDir(outDir);
+  const legacyFilesBefore = hasLegacyDir ? snapshotDir(legacyOutDir) : null;
 
   // Per-request injection MCP-серверов. Базовый конфиг (empty-mcp.json) пуст;
   // если бэкенд передал пер-юзерный токен + MCP url, пишем пер-сессионный
@@ -552,8 +563,12 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   const _taleridMcpUrl = req.body.talerid_mcp_url;
   const _productsToken = req.body.products_token;
   const _productsMcpUrl = req.body.products_mcp_url;
-  const wantTalerid = !!(_taleridToken && _taleridMcpUrl && /^https:\/\//.test(_taleridMcpUrl));
-  const wantProducts = !!(_productsToken && _productsMcpUrl && /^https:\/\//.test(_productsMcpUrl));
+  // typeof === "string" ОБЯЗАТЕЛЕН, не только /^https:\/\//.test(...): повторённое
+  // multipart-поле — массив, а regex.test() на массиве молча вызывает его
+  // Array.prototype.toString() ("https://a,https://b"), который той же регуляркой
+  // проходит как валидный URL. Как в linkeonServer (linkeon-mcp.mjs).
+  const wantTalerid = !!(_taleridToken && typeof _taleridMcpUrl === "string" && /^https:\/\//.test(_taleridMcpUrl));
+  const wantProducts = !!(_productsToken && typeof _productsMcpUrl === "string" && /^https:\/\//.test(_productsMcpUrl));
 
   if (wantLinkeon || wantTalerid || wantProducts) {
     try {
@@ -569,17 +584,28 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       if (wantProducts) {
         base.mcpServers.products = { type: "http", url: _productsMcpUrl, headers: { Authorization: "Bearer " + _productsToken } };
       }
-      sessionMcpPath = path.join(UPLOAD_DIR, fsKey + "-session-mcp.json");
+      // Имя — на ХОД, не на сессию (sessionMcpConfigName, session-mcp-config.mjs):
+      // общее имя на сессию было гонкой — finally чужого хода той же сессии
+      // мог удалить файл этого, ещё живого.
+      sessionMcpPath = path.join(UPLOAD_DIR, sessionMcpConfigName(fsKey, randomUUID()));
       fs.writeFileSync(sessionMcpPath, JSON.stringify(base), { mode: 0o600 });
       mcpConfigPath = sessionMcpPath;
       if (wantLinkeon) allowedTools += "," + LINKEON_TOOLS;
       if (wantTalerid) { allowedTools += "," + TALERID_TOOLS; systemPrompt += TALERID_PROMPT; }
       if (wantProducts) { allowedTools += "," + PRODUCTS_TOOLS; systemPrompt += PRODUCTS_PROMPT; }
     } catch (e) {
+      // Код/имя ошибки, НЕ e.message: JSON.parse цитирует вход целиком (в
+      // BASE_MCP_PATH мог оказаться обрывок или мусор), а в собранном base
+      // к этому моменту уже могли лечь чужие Bearer-токены — message мог их
+      // процитировать в лог.
+      console.log("конфиг хода не записан: " + ((e && (e.code || e.name)) || "?"));
       // Любая осечка — назад к базовому конфигу целиком. Половина конфига
       // хуже, чем его отсутствие: инструмент в белом списке при отсутствующем
       // сервере даёт ассистенту «инструмент не отвечает» вместо честного «не
-      // умею».
+      // умею». Файл мог успеть частично записаться (fs.writeFileSync упал на
+      // полпути, например ENOSPC) — недописанный конфиг с чужими токенами на
+      // диске оставлять нельзя.
+      if (sessionMcpPath) { try { fs.unlinkSync(sessionMcpPath); } catch {} }
       sessionMcpPath = null;
       mcpConfigPath = BASE_MCP_PATH;
       allowedTools = BASE_TOOLS;
@@ -1021,23 +1047,15 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       );
     }
 
-    // Collect output files
-    const outputFiles = [];
-    if (fs.existsSync(outDir)) {
-      const walk = (dir, prefix) => {
-        for (const item of fs.readdirSync(dir)) {
-          const full = path.join(dir, item);
-          const rel = prefix ? prefix + "/" + item : item;
-          try {
-            const stat = fs.statSync(full);
-            if (stat.isDirectory()) walk(full, rel);
-            // Ссылка обязана указывать на ту же папку, которую обошёл walk:
-            // файлы лежат в OUTPUT_DIR/<fsKey>, а не в OUTPUT_DIR/<sessionId>.
-            else if (!filesBefore.has(rel) || stat.mtimeMs > filesBefore.get(rel)) outputFiles.push({ name: rel, size: stat.size, url: "/files/" + fsKey + "/" + rel });
-          } catch {}
-        }
-      };
-      walk(outDir, "");
+    // Collect output files. Ссылка обязана указывать на ту же папку, которую
+    // обошли (turn-files.mjs): файлы лежат в OUTPUT_DIR/<fsKey>, а не в
+    // OUTPUT_DIR/<sessionId>.
+    const outputFiles = changedFiles(outDir, filesBefore, "/files/" + fsKey);
+    // Правка файла, созданного ДО перехода на fs_key: та же проверка — по
+    // прежней папке, со ссылкой на НЕЁ (легитимный путь уже отдавался
+    // пользователю раньше, менять его нельзя). См. снимок выше.
+    if (hasLegacyDir) {
+      outputFiles.push(...changedFiles(legacyOutDir, legacyFilesBefore, "/files/" + legacyFsKey));
     }
 
     // Файлы прошлых ходов этой сессии, чей `done` до бэкенда не дошёл
@@ -1102,4 +1120,5 @@ app.get("/health", (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Agent API on http://0.0.0.0:" + PORT);
   sweepRuns();
+  sweepStaleMcpConfigs();
 });
