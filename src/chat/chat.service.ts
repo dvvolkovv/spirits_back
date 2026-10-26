@@ -258,6 +258,18 @@ export function resolveEmptyFileLinks(
   return out;
 }
 
+/** Что ещё уходит релею в ответе ассистента вне чата (agentReply). */
+export interface AgentReplyOpts {
+  /**
+   * Инструменты Linkeon (mcp__linkeon__*) от имени userId — токен хода и
+   * папка по fs_key (linkeon-relay-fields.ts). По умолчанию — да: у рутин,
+   * «Пути», голосовых документов, итогов и консультаций звонка пользователь
+   * настоящий. Нет — у пробы качества (quality-monitor): служебный ход
+   * тестового аккаунта.
+   */
+  linkeonTools?: boolean;
+}
+
 @Injectable()
 export class ChatService {
   private readonly logger = new Logger(ChatService.name);
@@ -2485,8 +2497,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * вызывающих, которые токены не списывают (резюме звонка, синтетические
    * пробы, поездки, пуши). Поэтому и строки billing[…] в логе не печатает.
    */
-  async generateAgentReply(userId: string, assistantId: string, message: string, sessionIdOverride?: string): Promise<string> {
-    const { text } = await this.agentReply(userId, assistantId, message, sessionIdOverride, false);
+  async generateAgentReply(
+    userId: string, assistantId: string, message: string, sessionIdOverride?: string, opts: AgentReplyOpts = {},
+  ): Promise<string> {
+    const { text } = await this.agentReply(userId, assistantId, message, sessionIdOverride, false, opts);
     return text;
   }
 
@@ -2508,13 +2522,14 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * — как в двух других путях.
    */
   async generateAgentReplyWithCharge(
-    userId: string, assistantId: string, message: string, sessionIdOverride?: string,
+    userId: string, assistantId: string, message: string, sessionIdOverride?: string, opts: AgentReplyOpts = {},
   ): Promise<{ text: string; tokens: number; costUsd: number }> {
-    return this.agentReply(userId, assistantId, message, sessionIdOverride, true);
+    return this.agentReply(userId, assistantId, message, sessionIdOverride, true, opts);
   }
 
   private async agentReply(
     userId: string, assistantId: string, message: string, sessionIdOverride: string | undefined, billed: boolean,
+    opts: AgentReplyOpts = {},
   ): Promise<{ text: string; tokens: number; costUsd: number }> {
     const isNumeric = /^\d+$/.test(assistantId);
     const agentRes = isNumeric
@@ -2575,11 +2590,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // поток при конкурентном обращении к ЗАНЯТОЙ сессии — инцидент 2026-07-12).
     // Язык в ключе сессии — по той же причине, что в основном пути: релей
     // резюмит прежний разговор, и накопленный русский перевешивает промпт.
-    fd.append(
-      'sessionId',
-      sessionIdOverride ||
-        relaySessionKey(userId, assistantId, await this.language.resolveUserLanguage(userId)),
-    );
+    const relaySid = sessionIdOverride ||
+      relaySessionKey(userId, assistantId, await this.language.resolveUserLanguage(userId));
+    fd.append('sessionId', relaySid);
+    // Инструменты Linkeon — от имени userId по токену хода (см. AgentReplyOpts).
+    if (opts.linkeonTools !== false) appendLinkeonFields(fd, linkeonRelayFields(userId, relaySid));
     const chunks: string[] = [];
     const usage: SdkUsageTotals = {
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
