@@ -6,23 +6,30 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import { turnFsKey, sessionFsKey, uploadFileName, fallbackFileName, sessionOutputDir } from "./paths.mjs";
+import { turnFsKey, legacyTurnFsKey, uploadFileName, fallbackFileName, sessionOutputDir } from "./paths.mjs";
 import { eventCallContext, tailDialogue } from "./session-tail.mjs";
 import { RUN_ENV, runTag, finishedRun, reap } from "./proc-reaper.mjs";
 import { costBaseline, runCost } from "./turn-cost.mjs";
 import { createUndelivered, withCarried } from "./undelivered-files.mjs";
 import { createRelayAuth } from "./relay-auth.mjs";
-import { LINKEON_TOOLS, linkeonServer, isHttpsUrl } from "./linkeon-mcp.mjs";
-import { sessionMcpConfigName, sweepStaleSessionMcpConfigs } from "./session-mcp-config.mjs";
+import { LINKEON_TOOLS, linkeonServer, bearerServer } from "./linkeon-mcp.mjs";
+import { sessionMcpConfigName, sweepStaleSessionMcpConfigs, ensureMcpConfigDir, removeLiveConfigs } from "./session-mcp-config.mjs";
 import { snapshotDir, changedFiles } from "./turn-files.mjs";
 
 const app = express();
 const PORT = 3033;
 const UPLOAD_DIR = "/tmp/agent-uploads";
 const OUTPUT_DIR = "/tmp/agent-output";
+// Конфиги хода (session-mcp-config.mjs) — в СВОЁМ подкаталоге, не вперемешку
+// с загрузками пользователя: уборка осиротевших (sweepStaleMcpConfigs ниже)
+// иначе сканировала бы ТУ ЖЕ папку, что и настоящие файлы пользователя, и
+// совпадение суффикса имени с чьей-то загрузкой было бы потенциальной
+// опечаткой с чужими данными. 0700 — файлы внутри несут чужие Bearer-токены.
+const MCP_CONFIG_DIR = path.join(UPLOAD_DIR, "mcp");
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+ensureMcpConfigDir(MCP_CONFIG_DIR);
 
 app.use(cors());
 // Ходы принимаются только от бэков с секретом (relay-auth.mjs). Файлы —
@@ -216,8 +223,11 @@ function persistNow() {
     fs.writeFileSync(SESSION_STORE_PATH, JSON.stringify(Object.fromEntries(sessionMap)));
   } catch { /* остановке помешать не можем */ }
 }
+// Конфиги идущих ходов несут чужие токены, а process.exit до finally ходов
+// не доходит — убираются здесь (liveMcpConfigPaths объявлен ниже, сигнал
+// приходит уже после инициализации модуля).
 for (const sig of ["SIGTERM", "SIGINT"]) {
-  process.on(sig, () => { persistNow(); process.exit(0); });
+  process.on(sig, () => { persistNow(); removeLiveConfigs(liveMcpConfigPaths); process.exit(0); });
 }
 
 // Ротация раздутых сессий: бесконечный --resume копит мегабайты английского
@@ -236,7 +246,7 @@ loadSessionMap();
 //
 // Цену хода задаёт РАЗМЕР КОНТЕКСТА, а не размер файла на диске. Раньше
 // ограничивали байты (4 МиБ) — косвенную величину через прикинутый коэффициент
-// «150k токенов на МБ». Итог 30.08.2026: сессия 79030169187_12_ru доросла до
+// «150k токенов на МБ». Итог 30.08.2026: сессия одного пользователя (<телефон>_12_ru) доросла до
 // 534k токенов, и каждое сообщение в ней стоило $5.34 — 24 022 списанных
 // токена за ответ «Понял. Пиши, если что понадобится». Ответ бесплатный,
 // платили за подъём полумиллиона токенов истории.
@@ -297,13 +307,17 @@ function endRun(tag) {
 const sweepRuns = () => reap(finishedRun(liveRuns)).then(logReaped, () => {});
 setInterval(sweepRuns, 5 * 60 * 1000).unref();
 
-// Осиротевшие конфиги хода (session-mcp-config.mjs): `finally` в /chat не
-// отработал (SIGKILL, падение процесса релея) — файл с чужими Bearer-токенами
-// остался на диске. Возраст, не список активных сессий: так же безопасно, как
-// sweepRuns выше. Ходы столько не живут — час с большим запасом.
+// Полные пути конфигов ИДУЩИХ ходов этого процесса — /chat добавляет при
+// записи, убирает в finally. Уборка ниже обязана их пропускать: консультация
+// или self-heal ретрай могут идти дольше SESSION_MCP_MAX_AGE_MS, а конфиг
+// при этом валиден. Для осиротевших — finally ПРЕЖНЕГО процесса не
+// отработал (SIGKILL, падение релея) — такой файл не попал в liveSet этого
+// процесса (своего не было), и единственный сигнал — возраст: файл несёт
+// чужие Bearer-токены, оставлять его нельзя.
+const liveMcpConfigPaths = new Set();
 const SESSION_MCP_MAX_AGE_MS = 60 * 60 * 1000;
 const sweepStaleMcpConfigs = () => {
-  const removed = sweepStaleSessionMcpConfigs(UPLOAD_DIR, SESSION_MCP_MAX_AGE_MS);
+  const removed = sweepStaleSessionMcpConfigs(MCP_CONFIG_DIR, SESSION_MCP_MAX_AGE_MS, liveMcpConfigPaths);
   if (removed.length) console.log("осиротевших конфигов хода удалено: " + removed.length);
 };
 setInterval(sweepStaleMcpConfigs, 5 * 60 * 1000).unref();
@@ -426,7 +440,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   // коллег) — постоянна для всей сессии: ключ сессии это "<телефон>_<агент>_<язык>",
   // при смене ассистента заводится другая сессия. Раньше бэкенд клеил её к КАЖДОЙ
   // реплике, и она оседала в истории отдельной копией на каждый ход: в сессии
-  // 79030169187_12_ru на 44 реплики пришлось 813k символов, из них 808k (99.3%) —
+  // одного пользователя (<телефон>_12_ru) на 44 реплики пришлось 813k символов, из них 808k (99.3%) —
   // этот повтор, ~252k токенов. Отсюда --system-prompt: отправляется один раз и
   // кэшируется, а не переписывается на каждом холодном старте.
   const reqSystemPrompt = String(req.body.systemPrompt || "");
@@ -449,12 +463,12 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
 
   // Папка хода ДО перехода на fs_key (26.10.2026). Модель может помнить путь
   // к файлу оттуда из истории разговора (ссылка, которую она сама когда-то
-  // напечатала) и править именно его, а не файл в новой папке — снимок и
-  // диффы собираются по ОБЕИМ папкам, см. ниже и у done. Если fs_key не
-  // прислан (старый бэк, анонимный/служебный ход) — legacyFsKey === fsKey,
-  // и прежней папки отдельно нет.
-  const legacyFsKey = sessionFsKey(sessionId, fsKey);
-  const legacyOutDir = legacyFsKey !== fsKey ? path.join(OUTPUT_DIR, legacyFsKey) : null;
+  // напечатала) и править именно его — или положить туда по памяти новый
+  // файл, а не в новую папку. Снимок и диффы собираются по ОБЕИМ папкам, см.
+  // ниже и у done. Если fs_key не прислан (старый бэк, анонимный/служебный
+  // ход) — legacyTurnFsKey даёт null: ход и так пишет в прежнюю папку.
+  const legacyFsKey = legacyTurnFsKey(req.body.fs_key, sessionId);
+  const legacyOutDir = legacyFsKey ? path.join(OUTPUT_DIR, legacyFsKey) : null;
   const hasLegacyDir = !!legacyOutDir && fs.existsSync(legacyOutDir);
 
   const renamedFiles = [];
@@ -557,17 +571,18 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   // ОДИН раз. Два блока, каждый со своим файлом и своим переприсваиванием
   // mcpConfigPath, оставили бы в живых только последний — молча: конфиг
   // валиден, инструментов половина.
+  // bearerServer (linkeon-mcp.mjs) — одна проверка токена и адреса на всех
+  // троих: токен — строка без перевода строки, адрес — https.
   const linkeonSrv = linkeonServer(req.body);
+  const taleridSrv = bearerServer(req.body.talerid_token, req.body.talerid_mcp_url);
+  const productsSrv = bearerServer(req.body.products_token, req.body.products_mcp_url);
   const wantLinkeon = !!linkeonSrv;
-  const _taleridToken = req.body.talerid_token;
-  const _taleridMcpUrl = req.body.talerid_mcp_url;
-  const _productsToken = req.body.products_token;
-  const _productsMcpUrl = req.body.products_mcp_url;
-  // isHttpsUrl (linkeon-mcp.mjs) — та же проверка, что у linkeonServer: отбивает
-  // повторённое multipart-поле (массив), которое regex.test() иначе пропустил бы
-  // через неявный Array.prototype.toString().
-  const wantTalerid = !!(_taleridToken && isHttpsUrl(_taleridMcpUrl));
-  const wantProducts = !!(_productsToken && isHttpsUrl(_productsMcpUrl));
+  const wantTalerid = !!taleridSrv;
+  const wantProducts = !!productsSrv;
+  // Поле пришло, но отбито — без этой строки инструменты пропадали бы молча.
+  for (const [name, srv] of [["linkeon", linkeonSrv], ["talerid", taleridSrv], ["products", productsSrv]]) {
+    if (req.body[name + "_token"] && !srv) console.log("сервер " + name + " не подключён: токен или адрес отбиты");
+  }
 
   if (wantLinkeon || wantTalerid || wantProducts) {
     try {
@@ -577,26 +592,26 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       // если он ещё остался в базовом конфиге, в конфиг хода не идёт.
       delete base.mcpServers.linkeon;
       if (wantLinkeon) base.mcpServers.linkeon = linkeonSrv;
-      if (wantTalerid) {
-        base.mcpServers.talerid = { type: "http", url: _taleridMcpUrl, headers: { Authorization: "Bearer " + _taleridToken } };
-      }
-      if (wantProducts) {
-        base.mcpServers.products = { type: "http", url: _productsMcpUrl, headers: { Authorization: "Bearer " + _productsToken } };
-      }
+      if (wantTalerid) base.mcpServers.talerid = taleridSrv;
+      if (wantProducts) base.mcpServers.products = productsSrv;
       // Имя — на ХОД, не на сессию (sessionMcpConfigName, session-mcp-config.mjs):
       // общее имя на сессию было гонкой — finally чужого хода той же сессии
-      // мог удалить файл этого, ещё живого.
-      sessionMcpPath = path.join(UPLOAD_DIR, sessionMcpConfigName(fsKey, randomUUID()));
+      // мог удалить файл этого, ещё живого. Каталог — MCP_CONFIG_DIR, свой,
+      // не вперемешку с загрузками пользователя.
+      sessionMcpPath = path.join(MCP_CONFIG_DIR, sessionMcpConfigName(fsKey, randomUUID()));
+      ensureMcpConfigDir(MCP_CONFIG_DIR);
       fs.writeFileSync(sessionMcpPath, JSON.stringify(base), { mode: 0o600 });
+      // В Set — сразу после успешной записи: с этого момента уборка
+      // (sweepStaleMcpConfigs) обязана пропускать этот файл, что бы ни
+      // показал возраст. Убирается в finally ниже, вместе с самим файлом.
+      liveMcpConfigPaths.add(sessionMcpPath);
       mcpConfigPath = sessionMcpPath;
       if (wantLinkeon) allowedTools += "," + LINKEON_TOOLS;
       if (wantTalerid) { allowedTools += "," + TALERID_TOOLS; systemPrompt += TALERID_PROMPT; }
       if (wantProducts) { allowedTools += "," + PRODUCTS_TOOLS; systemPrompt += PRODUCTS_PROMPT; }
     } catch (e) {
-      // Код/имя ошибки, НЕ e.message: JSON.parse цитирует вход целиком (в
-      // BASE_MCP_PATH мог оказаться обрывок или мусор), а в собранном base
-      // к этому моменту уже могли лечь чужие Bearer-токены — message мог их
-      // процитировать в лог.
+      // Код/имя ошибки, НЕ e.message: JSON.parse цитирует в message кусок
+      // входа, а в старом базовом конфиге лежал общий секрет.
       console.log("конфиг хода не записан: " + ((e && (e.code || e.name)) || "?"));
       // Любая осечка — назад к базовому конфигу целиком. Половина конфига
       // хуже, чем его отсутствие: инструмент в белом списке при отсутствующем
@@ -604,7 +619,10 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       // умею». Файл мог успеть частично записаться (fs.writeFileSync упал на
       // полпути, например ENOSPC) — недописанный конфиг с чужими токенами на
       // диске оставлять нельзя.
-      if (sessionMcpPath) { try { fs.unlinkSync(sessionMcpPath); } catch {} }
+      if (sessionMcpPath) {
+        liveMcpConfigPaths.delete(sessionMcpPath);
+        try { fs.unlinkSync(sessionMcpPath); } catch {}
+      }
       sessionMcpPath = null;
       mcpConfigPath = BASE_MCP_PATH;
       allowedTools = BASE_TOOLS;
@@ -653,7 +671,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   //      `ev.type === "result" && ev.result` не отправляла клиенту НИЧЕГО);
   //   2. ход убит пре-эмптом, потому что пользователь прислал новое сообщение;
   //   3. transient-сбой после того, как часть текста уже ушла.
-  // Разбор истории 79088644408 за 11.08: 19 сообщений «?» за неделю — это и есть
+  // Разбор истории одного пользователя за 11.08: 19 сообщений «?» за неделю — это и есть
   // тычки в молчащий чат.
   let turnFailed = false;
   let failReason = "";
@@ -710,7 +728,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   // баланс. Ретраем не лечатся, и — главное — их текст английский и служебный.
   // Ни один из них не попадал ни в IMG_LIMIT_RE, ни в TRANSIENT_RE, поэтому
   // уходил пользователю ДОСЛОВНО как ответ ассистента, да ещё и тарифицировался:
-  // в истории 79088644408 лежат «You've hit your session limit · resets 11:50am
+  // в истории того же пользователя лежат «You've hit your session limit · resets 11:50am
   // (UTC)» ×4 (03.08) и «Not logged in · Please run /login» (07.08) — она даже
   // переспросила «что это?».
   const FATAL_RE = /Not logged in|Please run \/login|hit your (session|usage|weekly) limit|Invalid API key|Credit balance is too low|OAuth token (has )?expired/i;
@@ -927,7 +945,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
 
     // Хвост переписки от бэкенда вставляем ТОЛЬКО когда стартуем без --resume.
     // При resume Claude-сессия уже содержит всю историю, и второй её экземпляр
-    // в теле реплики — дословный дубликат: в сессии 79030169187_12_ru на него
+    // в теле реплики — дословный дубликат: в сессии одного пользователя на него
     // пришлось 309k символов из 813k. Флаг защищает от повторной вставки при
     // переигрышах ниже (протухший resume, перегруз картинками).
     let historyInjected = false;
@@ -1024,7 +1042,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
 
     // Ход закончился — смотрим, во что обошёлся его контекст, и решаем судьбу
     // сессии СЕЙЧАС, а не при следующем сообщении. Проверка только «до»
-    // пропускала взрывной рост внутри одного хода: 79851805798_12_ru
+    // пропускала взрывной рост внутри одного хода: <телефон>_12_ru
     // перевалила из-под потолка сразу на 16.71 МБ (~2.5 M токенов) и осталась
     // в таком виде — человек просто не написал снова.
     //
@@ -1089,7 +1107,12 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
     // Remove the per-session MCP config (it holds the user's Bearer tokens —
     // linkeon, talerid, products). Файл ОДИН на всех постояльцев: уборка по старому
     // talerid-специфичному имени оставляла бы токены на диске в открытом виде.
-    if (sessionMcpPath) { try { fs.unlinkSync(sessionMcpPath); } catch {} }
+    // Из liveMcpConfigPaths и с диска — синхронно, в одном тике: уборка между
+    // ними вклиниться не может.
+    if (sessionMcpPath) {
+      liveMcpConfigPaths.delete(sessionMcpPath);
+      try { fs.unlinkSync(sessionMcpPath); } catch {}
+    }
   });
 });
 

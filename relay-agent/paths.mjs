@@ -48,6 +48,16 @@ export function turnFsKey(fsKeyFromBackend, sessionId, fallback) {
   return sessionFsKey(sessionId, fallback);
 }
 
+// Ключ ПРЕЖНЕЙ папки хода — той, что была у сессии до перехода на fs_key
+// (26.10.2026), или null, если отдельной прежней папки нет (fs_key не
+// прислан — ход и так пишет в прежнюю). Модель может помнить путь к файлу
+// оттуда из истории разговора, поэтому server.mjs снимает и диффит обе папки.
+export function legacyTurnFsKey(fsKeyFromBackend, sessionId) {
+  if (typeof fsKeyFromBackend !== "string" || !FS_KEY_RE.test(fsKeyFromBackend)) return null;
+  const legacy = sessionFsKey(sessionId, null);
+  return legacy && legacy !== fsKeyFromBackend ? legacy : null;
+}
+
 // Имя для загруженного файла: <ключ сессии>_<база><расширение>.
 //
 // Расширение тоже режется. path.extname() отдаёт всё после последней точки,

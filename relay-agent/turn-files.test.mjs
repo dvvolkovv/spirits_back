@@ -85,3 +85,13 @@ test("changedFiles: url — из urlPrefix (папка хода может бы�
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// Прежнюю папку хода (до fs_key) релей не создаёт и не контролирует: на её
+// месте может оказаться что угодно. Сбой чтения не должен ронять done.
+test("snapshotDir/changedFiles: путь — файл, а не папка — пусто, не бросает", () => {
+  const d = mkdir();
+  const f = path.join(d, "not-a-dir");
+  fs.writeFileSync(f, "x");
+  assert.equal(snapshotDir(f).size, 0);
+  assert.deepEqual(changedFiles(f, new Map(), "/files/k"), []);
+});
