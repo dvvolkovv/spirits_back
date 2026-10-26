@@ -17,6 +17,21 @@ describe('правила ключей владельца — одно место
     expect(secretsProblem(many)).toEqual({ message: 'секретов больше 64' });
   });
 
+  it('порядок проверок: число раньше имён, имя раньше значения', () => {
+    // Вызывающие (create, карточка ключей) различают отказ набора и отказ
+    // ключа по наличию field — порядок здесь решает, что увидит человек.
+    expect(secretsProblem({ 'A B': '' })).toEqual({ message: 'имя секрета "A B" не переменная окружения', field: 'A B' });
+    const many = Object.fromEntries([
+      ...Array.from({ length: SECRET_COUNT_MAX }, (_, i) => [`K${i}`, 'v']),
+      ['A B', 'v'],
+    ]);
+    expect(secretsProblem(many)).toEqual({ message: 'секретов больше 64' });
+  });
+
+  it('пустое имя — отказ формы имени с field: "" (вызывающий проверяет field !== undefined, а не истинность)', () => {
+    expect(secretsProblem({ '': 'x' })).toEqual({ message: 'имя секрета "" не переменная окружения', field: '' });
+  });
+
   it('не-строка вместо значения — отказ, а не String()', () => {
     expect(secretsProblem({ A: 42 as unknown as string })?.message).toMatch(/непустой строкой/);
   });
