@@ -28,7 +28,7 @@ function tryCreate(name) {
   }
 }
 
-const SID = "79093464922_12"; // как их шлёт бэкенд: <телефон>_<n>
+const SID = "70000000000_12"; // как их шлёт бэкенд: <телефон>_<n>; номер — тестовый (CLAUDE.md)
 
 test("кириллическая выписка на ~280 символов укладывается в NAME_MAX", () => {
   const name = "Выписка по счёту дебетовой карты за период с 29.01.2026, " +
@@ -142,5 +142,13 @@ test("с fs_key в путях нет номера: загрузка, папка 
   assert.equal(tryCreate(upload), null);
   const out = sessionOutputDir("/tmp/agent-output", key);
   assert.equal(out, path.join("/tmp/agent-output", FS_KEY));
-  for (const p of [upload, out]) assert.ok(!p.includes("79093464922"), p);
+  const phone = SID.split("_")[0];
+  // Контроль: та же пара функций на ПРЕЖНЕМ ключе (без fs_key) номер
+  // содержит — иначе проверка ниже была бы тавтологией (true по построению
+  // FS_KEY, что бы ни стояло в SID) и не смогла бы упасть на реальном баге.
+  const legacyKey = sessionFsKey(SID, "x");
+  const legacyUpload = uploadFileName("egrul.pdf", legacyKey);
+  assert.ok(legacyUpload.includes(phone), "подготовка теста: без fs_key номер должен быть в пути");
+  assert.notEqual(upload, legacyUpload);
+  for (const p of [upload, out]) assert.ok(!p.includes(phone), p);
 });

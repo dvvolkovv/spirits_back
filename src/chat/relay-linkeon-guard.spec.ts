@@ -63,7 +63,7 @@ describe('релей: инструменты Linkeon по токену хода'
     process.env.RELAY_FS_SALT = 'relay-linkeon-guard-spec';
     try {
       expect(/const FS_KEY_RE = \/(.+)\/;/.exec(paths)?.[1]).toBe('^[0-9a-f]{32}$');
-      expect(relayFsKey('79030169187_12_ru')).toMatch(/^[0-9a-f]{32}$/);
+      expect(relayFsKey('70000000000_12_ru')).toMatch(/^[0-9a-f]{32}$/);
     } finally {
       if (OLD_SALT === undefined) delete process.env.RELAY_FS_SALT; else process.env.RELAY_FS_SALT = OLD_SALT;
     }
