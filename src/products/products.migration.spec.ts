@@ -131,6 +131,23 @@ describe('ProductsService.onModuleInit', () => {
     await expect(new ProductsService(pg as any).onModuleInit()).rejects.toThrow(/008_domains\.sql/);
   });
 
+  it('отказ 009 РОНЯЕТ старт, а не уходит в лог', async () => {
+    // Ревью задачи 1: 009 заявлена «намеренно НЕ в FATAL_MIGRATIONS», но с
+    // появлением 010 (ссылается на product_actions внешним ключом) это уже
+    // неверно — без таблицы 009 010 всё равно упала бы следующей же, а отказ,
+    // уходящий строкой в лог, назвал бы виновником 010, а не настоящую
+    // причину. Этот тест красный до правки FATAL_MIGRATIONS.
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        if (String(sql).includes("hashtext('products/009_product_actions')")) throw new Error('не взлетело');
+        return { rows: [] };
+      }),
+      getClient: jest.fn(async () => ({ query: jest.fn(async () => ({ rows: [] })), release: jest.fn() })),
+    };
+
+    await expect(new ProductsService(pg as any).onModuleInit()).rejects.toThrow(/009_product_actions\.sql/);
+  });
+
   it('006 едет ПОСЛЕ 003 и 005 — она перестраивает их обеих', async () => {
     // Список — это и есть описание схемы: 006 меняет ключ таблицы, которую
     // заводит 003, и вешает внешний ключ на реестр, который заводит 005.
