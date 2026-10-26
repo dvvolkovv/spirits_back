@@ -1,3 +1,4 @@
+import { labelsFor } from '../platform-kb/labels';
 import { SupportService } from './support.service';
 
 /// Язык ответа ИИ-поддержки.
@@ -39,5 +40,25 @@ describe('ИИ-поддержка отвечает на языке пользо�
     const p = prompt(service, { language: 'fr' });
     expect(p).toContain('--- ЯЗЫК ОБЩЕНИЯ ---');
     expect(p).toContain('Réponds en français.');
+  });
+});
+
+/// Запрет «не отсылай в поддержку» был написан русской подписью, а статья
+/// справки для англичанина называет кнопку «Contact support». Подписи в
+/// запрете — те же labelsFor(lang), что у статей.
+describe('ИИ-поддержка не отсылает «в поддержку» — подписями на языке пользователя', () => {
+  const service = new SupportService({ query: async () => ({ rows: [] }) } as any);
+  const line = (lang: string) =>
+    prompt(service, { language: lang }).split('\n').find((l) => l.startsWith('- Ты и есть поддержка Linkeon')) || '';
+
+  it.each(['ru', 'en', 'es', 'de', 'fr', 'zh', 'pt'])('%s — подписи кнопок из labelsFor', (lang) => {
+    const L = labelsFor(lang);
+    expect(line(lang)).toContain(`«${L.support}»`);
+    expect(line(lang)).toContain(`«${L.writeSupport}»`);
+  });
+
+  it('английский — без русской подписи', () => {
+    expect(line('en')).not.toContain('Связаться с поддержкой');
+    expect(line('en')).toContain('escalate_to_owner');
   });
 });

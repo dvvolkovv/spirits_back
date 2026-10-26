@@ -3,13 +3,14 @@
 
 import type { SUPPORTED_LANGUAGES } from '../common/services/language.service';
 
-export const KB_LABEL_KEYS = ["chat","listen","fresh","files","call","meetingJoin","networking","imageGen","video","studio","studioAgents","studioBots","studioProducts","profile","business","settings","calendars","push","voices","android","partners","invite","help","support","zoom","routines","loginMethods","sectionPersonal","sectionBusiness","sectionGrowth","sectionMine","onboardingStart","uploadTitle","filesMedia","filesDocs","askCustom","askSubmit","sendAnyway","hangUp","callCard","meetingLeave","meetingOn","zoomConnect","searchPeople","compat","requests","peerChats","requestChat","requestContact","accept","decline","report","block","contactVisibility","visPublic","visMatch","visPrivate","contactRequests","modeImage","modeBanner","imgFormat","makeVideo","upload","videoCreate","myVideos","ownVoice","videoFormat","videoRes","videoLength","portraitPhotos","fromMyImages","uploadVoice","voicePreview","voiceDefault","tgGenLink","tgOpen","tgCheckBind","tgWhen","tgStrict","tgSmart","tgAlways","tgVoice","tgSubmit","tgReconnect","tgPrivate","prodNew","prodSite","prodBot","prodToken","prodSecrets","prodAsk","prodHistory","prodRevert","prodDomain","prodAttach","prodCheck","prodDetach","prodSleeping","prodFailed","prodRetry","prodWhy","writeSupport","edit","save","bizAddMore","calYandex","calOutlook","calIcs","talerid","taleridConnect","connect","routineEnergy","routineTest","pushTest","tokensNav","spending","topup","coupon","couponActivate","buy","receiptEmail","payCard","payCrypto","topupHistory","payoutTokens","withdrawMoney","link","unlink","mergeAccounts","language","logout","deleteAccount","deleteForever","account","loginPhone","apkDownload","tmaDay","tmaWallet","helpGuide","helpFaq","newTicket"] as const;
+export const KB_LABEL_KEYS = ["chat","listen","voiceInput","fresh","files","call","meetingJoin","networking","imageGen","video","studio","studioAgents","studioBots","studioProducts","profile","business","settings","calendars","push","voices","android","partners","invite","help","support","zoom","routines","loginMethods","sectionPersonal","sectionBusiness","sectionGrowth","sectionMine","onboardingStart","uploadTitle","filesMedia","filesDocs","askCustom","askSubmit","sendAnyway","hangUp","callCard","meetingLeave","meetingOn","zoomConnect","searchPeople","compat","requests","peerChats","requestChat","requestContact","accept","decline","report","block","contactVisibility","visPublic","visMatch","visPrivate","contactRequests","modeImage","modeBanner","imgFormat","makeVideo","upload","videoCreate","myVideos","ownVoice","videoFormat","videoRes","videoLength","portraitPhotos","fromMyImages","uploadVoice","voicePreview","voiceDefault","tgGenLink","tgOpen","tgCheckBind","tgWhen","tgStrict","tgSmart","tgAlways","tgVoice","tgSubmit","tgReconnect","tgPrivate","prodNew","prodSite","prodBot","prodToken","prodSecrets","prodAsk","prodHistory","prodRevert","prodDomain","prodAttach","prodCheck","prodDetach","prodSleeping","prodFailed","prodRetry","prodWhy","writeSupport","edit","save","bizAddMore","calYandex","calOutlook","calIcs","talerid","taleridConnect","connect","routineEnergy","routineTest","pushTest","tokensNav","spending","topup","coupon","couponActivate","buy","receiptEmail","payCard","payCrypto","topupHistory","payoutTokens","withdrawMoney","link","unlink","mergeAccounts","language","logout","deleteAccount","deleteForever","account","loginPhone","apkDownload","tmaDay","tmaWallet","helpGuide","helpFaq","newTicket"] as const;
 export type KbLabelKey = (typeof KB_LABEL_KEYS)[number];
 
 export const KB_LABELS: Record<(typeof SUPPORTED_LANGUAGES)[number], Record<KbLabelKey, string>> = {
   ru: {
     chat: "Чат с ассистентом",
     listen: "Прослушать",
+    voiceInput: "Начать голосовой ввод",
     fresh: "Чистый лист",
     files: "Медиа и файлы",
     call: "Позвонить",
@@ -153,6 +154,7 @@ export const KB_LABELS: Record<(typeof SUPPORTED_LANGUAGES)[number], Record<KbLa
   en: {
     chat: "Chat with assistant",
     listen: "Listen",
+    voiceInput: "Start voice input",
     fresh: "Fresh start",
     files: "Media and files",
     call: "Call",
@@ -296,6 +298,7 @@ export const KB_LABELS: Record<(typeof SUPPORTED_LANGUAGES)[number], Record<KbLa
   es: {
     chat: "Chat con el asistente",
     listen: "Escuchar",
+    voiceInput: "Iniciar entrada de voz",
     fresh: "Hoja en blanco",
     files: "Multimedia y archivos",
     call: "Llamar",
@@ -439,6 +442,7 @@ export const KB_LABELS: Record<(typeof SUPPORTED_LANGUAGES)[number], Record<KbLa
   de: {
     chat: "Chat mit dem Assistenten",
     listen: "Anhören",
+    voiceInput: "Spracheingabe starten",
     fresh: "Neustart",
     files: "Medien und Dateien",
     call: "Anrufen",
@@ -582,6 +586,7 @@ export const KB_LABELS: Record<(typeof SUPPORTED_LANGUAGES)[number], Record<KbLa
   fr: {
     chat: "Chat avec l'assistant",
     listen: "Écouter",
+    voiceInput: "Démarrer la saisie vocale",
     fresh: "Page blanche",
     files: "Médias et fichiers",
     call: "Appeler",
@@ -725,6 +730,7 @@ export const KB_LABELS: Record<(typeof SUPPORTED_LANGUAGES)[number], Record<KbLa
   zh: {
     chat: "与助手聊天",
     listen: "收听",
+    voiceInput: "开始语音输入",
     fresh: "空白模式",
     files: "媒体和文件",
     call: "拨打",
@@ -868,6 +874,7 @@ export const KB_LABELS: Record<(typeof SUPPORTED_LANGUAGES)[number], Record<KbLa
   pt: {
     chat: "Chat com o assistente",
     listen: "Ouvir",
+    voiceInput: "Iniciar a introdução por voz",
     fresh: "Página em branco",
     files: "Multimédia e ficheiros",
     call: "Ligar",
