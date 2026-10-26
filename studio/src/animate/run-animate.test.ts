@@ -522,3 +522,69 @@ test('упали обе сценки — названы обе, код у оши
   );
   assert.equal(readAnim(env.runDir).omniSeconds, 0);
 });
+
+test('наружу: резерв секунд — до запуска Omni, id генерации — до ожидания, файлы — по мере появления', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const saved: ShortAnimation[] = [];
+  const files: string[] = [];
+  const { deps, calls } = fakes(env);
+  const startClip = deps.startClip;
+  const waitClip = deps.waitClip;
+  deps.startClip = async (prompt, image) => {
+    // К запуску резерв этой сценки уже снаружи.
+    const kind = kindOf(prompt);
+    const before = calls.start.filter((k) => k === kind).length;
+    assert.ok(saved.at(-1)!.omniSeconds >= 8 * (before + 1), 'резерв не сохранён до запуска');
+    return startClip(prompt, image);
+  };
+  deps.waitClip = async (id) => {
+    assert.ok(saved.some((a) => Object.values(a.pending ?? {}).some((p) => p?.id === id)), `id ${id} не сохранён до ожидания`);
+    return waitClip(id);
+  };
+  const anim = await animateRun(env.runDir, {
+    ...deps,
+    onSave: async (a) => {
+      saved.push(a);
+    },
+    onFile: async (rel) => {
+      files.push(rel);
+    },
+  });
+  assert.deepEqual(saved.at(-1), anim);
+  assert.deepEqual([...files].sort(), [
+    'keyframes/kf-conflict.png', 'keyframes/kf-punchline.png',
+    'skits/fp-conflict/clip.mp4', 'skits/fp-conflict/raw.mp4', 'skits/fp-punchline/clip.mp4', 'skits/fp-punchline/raw.mp4',
+  ]);
+  // Снимки идут по порядку: секунды Omni снаружи не убывают.
+  for (let i = 1; i < saved.length; i++) assert.ok(saved[i].omniSeconds >= saved[i - 1].omniSeconds);
+});
+
+test('наружу не сохранилось (задание уже не наше) — ни кадра, ни клипа', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const { deps, calls } = fakes(env);
+  await assert.rejects(
+    animateRun(env.runDir, { ...deps, onSave: async () => { throw new StudioError('unknown', 'задание забрал другой процесс', false); } }),
+    (e: unknown) => isErr('unknown', false)(e) && /другой процесс/.test((e as Error).message),
+  );
+  assert.deepEqual([calls.keyframe.length, calls.start.length], [0, 0]);
+});
+
+test('файл не выгрузился — повторяемая ошибка; оплаченный клип при повторе берётся из папки', { timeout: 120_000 }, async () => {
+  const env = setup();
+  let failRaw = true;
+  const first = fakes(env);
+  await assert.rejects(
+    animateRun(env.runDir, {
+      ...first.deps,
+      onFile: async (rel) => {
+        if (rel.endsWith('raw.mp4') && failRaw) throw new Error('MinIO: 503');
+      },
+    }),
+    (e: unknown) => e instanceof StudioError && /не выгрузился в хранилище/.test((e as Error).message),
+  );
+  failRaw = false;
+  const second = fakes(env);
+  const anim = await animateRun(env.runDir, { ...second.deps, onFile: async () => {} });
+  assert.deepEqual(second.calls.start, []);
+  assert.equal(anim.omniSeconds, 16);
+});
