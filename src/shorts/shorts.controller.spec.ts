@@ -34,7 +34,7 @@ function setup(answer: (sql: string, params: any[]) => any = () => ({ rows: [], 
     query: jest.fn(async (sql: string, params: any[] = []) => answer(sql, params)),
     getClient: jest.fn(async () => client),
   };
-  const settings = { get: jest.fn(async () => ({ slotDays: [2, 4, 6] })), update: jest.fn(async (p: any) => p) };
+  const settings = { get: jest.fn(async () => ({ slotDays: [2, 4, 6], format: 'chat' })), update: jest.fn(async (p: any) => p) };
   const topics = { addManual: jest.fn(async () => ({ id: 'new' })), start: jest.fn(async (): Promise<any> => ({ id: ID, status: 'directing' })) };
   const storage = { publicUrl: jest.fn((b: string, k: string) => `https://minio.test/${b}/${k}`) };
   const ctl = new ShortsController(pg as any, settings as any, topics as any, storage as any);
@@ -106,8 +106,8 @@ describe('POST admin/shorts', () => {
     const capture = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'capture_queued' })] } : { rows: [video()] }));
     await capture.ctl.action({ action: 'retry', id: ID }, res());
     const upd = capture.pg.query.mock.calls.find((c: any[]) => String(c[0]).includes("WHERE id = $1 AND status = 'failed'")) as any[];
-    // Без замечания owner_note не трогается (COALESCE с NULL).
-    expect(upd[1]).toEqual([ID, 'capture_queued', 'capturing', null]);
+    // Без замечания owner_note не трогается (COALESCE с NULL); без from — и формат.
+    expect(upd[1]).toEqual([ID, 'capture_queued', 'capturing', null, null]);
 
     const pub = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'approved' })] } : { rows: [video({ failed_from: 'publishing', approved_at: '2026-10-25T00:00:00Z' })] }));
     await pub.ctl.action({ action: 'retry', id: ID }, res());
@@ -128,9 +128,11 @@ describe('POST admin/shorts', () => {
     const upd = retryWrite(pg);
     expect(String(upd[0])).toContain('owner_note = COALESCE($4::text, owner_note)');
     expect(String(upd[0])).toContain('writer_rounds = 0');
+    expect(String(upd[0])).toContain('format = COALESCE($5::text, format)');
     expect(upd[1]).toEqual([
       ID, 'directing', 'writing',
       'Сценарист: нужен вопрос про субаренду\nСценарист: ответ слишком общий\nВозьми вопрос про возврат залога',
+      'chat',
     ]);
   });
 
@@ -138,7 +140,8 @@ describe('POST admin/shorts', () => {
     const failed = video({ failed_from: 'rendering', capture: { answerText: 'ответ', paragraphs: [] } });
     const { ctl, pg } = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'writing', failed_from: null })] } : { rows: [failed] }));
     await ctl.action({ action: 'retry', id: ID, from: 'writing' }, res());
-    expect(retryWrite(pg)[1]).toEqual([ID, 'writing', 'rendering', null]);
+    // С from — формат из настроек: «Только чат» после снятой модели Omni.
+    expect(retryWrite(pg)[1]).toEqual([ID, 'writing', 'rendering', null, 'chat']);
   });
 
   it('retry { from } у упавшей публикации — 409: её повторяют только своим путём', async () => {
@@ -249,7 +252,7 @@ describe('POST admin/shorts', () => {
     const { ctl, settings } = setup();
     const r = res();
     await ctl.action({ action: 'get_settings' }, r);
-    expect(r.body).toEqual({ slotDays: [2, 4, 6] });
+    expect(r.body).toEqual({ slotDays: [2, 4, 6], format: 'chat' });
     await ctl.action({ action: 'update_settings', settings: { slotHourMsk: 19 } }, res());
     expect(settings.update).toHaveBeenCalledWith({ slotHourMsk: 19 });
     await expect(ctl.action({ action: 'update_settings', settings: { slotHourMsk: 99 } }, res())).rejects.toBeInstanceOf(BadRequestException);

@@ -118,23 +118,26 @@ describe('текст 002_skits.sql', () => {
   it('каждый ALTER TABLE — под проверкой каталога, без ADD COLUMN IF NOT EXISTS', async () => {
     const sql = await appliedSkitsSql();
     expect(sql).not.toMatch(/ADD COLUMN IF NOT EXISTS/);
-    const adds = sql.match(/ADD COLUMN ([a-z_]+)/g) ?? [];
+    const adds = [...sql.matchAll(/ALTER TABLE ([a-z_]+) ADD COLUMN ([a-z_]+)/g)];
     expect(adds.length).toBe(4);
-    for (const [, column] of sql.matchAll(/ADD COLUMN ([a-z_]+)/g)) {
-      expect(sql).toMatch(new RegExp(`column_name = '${column}'\\) THEN\\s+ALTER TABLE \\w+ ADD COLUMN ${column}`));
+    // Проверка каталога — той же таблицы и той же колонки, что добавляет ALTER под ней.
+    for (const [, table, column] of adds) {
+      expect(sql).toMatch(new RegExp(`table_name = '${table}' AND column_name = '${column}'\\) THEN\\s+ALTER TABLE ${table} ADD COLUMN ${column}`));
     }
-    expect(sql).toMatch(/IF NOT EXISTS \(SELECT 1 FROM pg_constraint[\s\S]*?LIKE '%''animating''%'\) THEN/);
+    // CHECK статуса — по имени: определение читается под замком на таблицу.
+    expect(sql).toMatch(/IF NOT EXISTS \(SELECT 1 FROM pg_constraint\s+WHERE conrelid = 'public\.short_video'::regclass AND conname = 'short_video_status_002'\) THEN/);
   });
 
   it('новый CHECK статуса перечисляет ровно машину состояний', async () => {
-    const m = (await appliedSkitsSql()).match(/ADD CONSTRAINT short_video_status_check CHECK \(status IN \(([\s\S]*?)\)\)/);
+    const m = (await appliedSkitsSql()).match(/ADD CONSTRAINT short_video_status_002 CHECK \(status IN \(([\s\S]*?)\)\)/);
     const listed = (m?.[1].match(/'([a-z_]+)'/g) ?? []).map((s) => s.slice(1, -1));
     expect(listed.sort()).toEqual(Object.keys(ALLOWED_TRANSITIONS).sort());
   });
 
-  it('формат ролика и настройки — только skit и chat; старые ролики — chat, новые — skit', async () => {
+  it('формат ролика и настройки — только skit и chat; у ролика умолчание chat (формат пишет запуск), у настроек — skit', async () => {
     const sql = await appliedSkitsSql();
-    expect(sql).toMatch(/ADD COLUMN format text NOT NULL DEFAULT 'chat' CHECK \(format IN \('skit', 'chat'\)\);\s+ALTER TABLE short_video ALTER COLUMN format SET DEFAULT 'skit'/);
+    expect(sql).toContain("ALTER TABLE short_video ADD COLUMN format text NOT NULL DEFAULT 'chat' CHECK (format IN ('skit', 'chat'));");
+    expect(sql).not.toContain("SET DEFAULT 'skit'");
     expect(sql).toContain("ALTER TABLE short_settings ADD COLUMN format text NOT NULL DEFAULT 'skit'");
     expect(sql).toContain('ADD COLUMN max_omni_seconds int NOT NULL DEFAULT 48');
   });

@@ -86,22 +86,28 @@ maybe('ролики против живого Postgres', () => {
     }
   });
 
-  it('002 поверх роликов без формата: старые — chat, новые — skit; статусы оживления проходят CHECK', async () => {
-    await pool.query('ALTER TABLE short_video DROP COLUMN format');
-    const old = await insert({});
+  it('002 поверх базы после 001: CHECK статуса пересоздаётся один раз и без потерь, ролики целы и chat', async () => {
+    // С чистого листа: на постоянной базе 002 уже накачена, и ветка пересоздания иначе не проверялась бы.
+    await pool.query('DROP TABLE short_publication, short_video, short_settings');
+    await pool.query(fs.readFileSync(MIGRATIONS[0], 'utf8'));
+    const OLD = ['idea', 'directing', 'capture_queued', 'capturing', 'writing', 'render_queued', 'rendering', 'pending_review',
+      'approved', 'publishing', 'published', 'rejected', 'failed'];
+    for (const status of OLD) await insert({ status });
     await migrate(pool);
-    const fresh = await insert({ status: 'animating' });
-    const rows = await pool.query('SELECT id, format FROM short_video');
-    const format = new Map(rows.rows.map((r) => [r.id, r.format]));
-    expect([format.get(old.id), format.get(fresh.id)]).toEqual(['chat', 'skit']);
-    await insert({ status: 'animate_queued' });
-    await expect(insert({ status: 'dancing' })).rejects.toThrow(/short_video_status_check/);
+    const statusChecks = `SELECT conname, oid FROM pg_constraint
+      WHERE conrelid = 'public.short_video'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%''render_queued''%'`;
+    const first = (await pool.query(statusChecks)).rows;
+    expect(first.map((r) => r.conname)).toEqual(['short_video_status_002']);
+    await migrate(pool);
+    expect((await pool.query(statusChecks)).rows).toEqual(first);
+    // Сортировка — в JS: порядок Postgres зависит от правил сравнения базы.
+    const rows = await pool.query('SELECT status, format FROM short_video');
+    expect(rows.rows.map((r) => r.status).sort()).toEqual([...OLD].sort());
+    expect(new Set(rows.rows.map((r) => r.format))).toEqual(new Set(['chat']));
+    expect((await insert({ status: 'animating' })).format).toBe('chat');
+    await insert({ status: 'animate_queued', format: 'skit' });
+    await expect(insert({ status: 'dancing' })).rejects.toThrow(/short_video_status_002/);
     await expect(insert({ format: 'cartoon' })).rejects.toThrow(/check/);
-    const checks = await pool.query(
-      `SELECT count(*)::int AS n FROM pg_constraint
-        WHERE conrelid = 'public.short_video'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%''render_queued''%'`,
-    );
-    expect(checks.rows[0].n).toBe(1);
     const s = await pool.query('SELECT format, max_omni_seconds FROM short_settings WHERE id = 1');
     expect(s.rows[0]).toEqual({ format: 'skit', max_omni_seconds: 48 });
   });
