@@ -32,6 +32,12 @@ describe('вид действия', () => {
     const v = toView(row({ kind: 'create_bot', product_id: null, product_name: null, payload: { name: 'Бот', keyNames: ['A'] } }), now);
     expect(v).toMatchObject({ productName: 'Бот', keyNames: ['A'], productId: null });
   });
+
+  it('вид продукта — из payload; у карточки бота — всегда bot', () => {
+    expect(toView(row({ payload: { productKind: 'site' } }), now).productKind).toBe('site');
+    expect(toView(row({ kind: 'create_bot', payload: {} }), now).productKind).toBe('bot');
+    expect(toView(row({ payload: {} }), now).productKind).toBeNull();
+  });
 });
 
 describe('ProductActionsService', () => {
