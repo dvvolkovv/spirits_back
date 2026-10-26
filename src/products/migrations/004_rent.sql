@@ -82,12 +82,13 @@ ALTER TABLE products ADD CONSTRAINT products_status_check
 -- `kind` в таком запросе — ошибка неоднозначности в рантайме. Существующий
 -- claimJob уточняет везде (проверено), новые — обязаны тоже.
 ALTER TABLE product_provision_jobs ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'provision';
--- 'domain' — вид из 008_domains.sql (свой домен). Словарь объявлен ТОЛЬКО
+-- 'domain' — вид из 008_domains.sql (свой домен), 'rekey' и 'purge' — смена
+-- ключей и стирание удалённых (010_rekey_purge.sql). Словарь объявлен ТОЛЬКО
 -- здесь: 004 исполняется при каждом старте раньше 008, а обязательная 008
 -- перевешиваемых словарей не содержит (см. её шапку).
 ALTER TABLE product_provision_jobs DROP CONSTRAINT IF EXISTS product_provision_jobs_kind_check;
 ALTER TABLE product_provision_jobs ADD CONSTRAINT product_provision_jobs_kind_check
-  CHECK (kind IN ('provision','sleep','wake','domain'));
+  CHECK (kind IN ('provision','sleep','wake','domain','rekey','purge'));
 
 -- ОТБОР ПО СРОКУ ОПЛАТЫ: сборщику — «кому пора платить», пробуждению — «кого
 -- будить первым» (спящие в порядке засыпания).

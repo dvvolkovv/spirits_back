@@ -71,6 +71,13 @@ export interface ProductRow {
  * FATAL_MIGRATIONS: без неё продукт работает как раньше (заведение, оплата,
  * чат), падают только НОВЫЕ действия (удаление, возврат, откат, ключи),
  * которых до неё не существовало вовсе.
+ *
+ * 010 зависит от 009 (ссылается на product_actions) и от 004 (виды задания
+ * rekey/purge объявлены в её словаре). Она ОБЯЗАТЕЛЬНАЯ: колонку action_id
+ * читает claimJob при выдаче задания любого вида, и молча не применившаяся
+ * 010 означала бы отказ на каждом опросе агента. Цена обязательности та же,
+ * что у 008: запланированных отказов в файле нет. Как следствие, 009 тоже
+ * становится обязательной де-факто — без её таблицы 010 не применится.
  */
 export const MIGRATIONS = [
   '001_products.sql',
@@ -82,6 +89,7 @@ export const MIGRATIONS = [
   '007_selfservice.sql',
   '008_domains.sql',
   '009_product_actions.sql',
+  '010_rekey_purge.sql',
 ] as const;
 
 /**
@@ -148,6 +156,7 @@ const FATAL_MIGRATIONS: ReadonlySet<string> = new Set<string>([
   '005_hosts.sql',
   '006_host_agent_per_host.sql',
   '008_domains.sql',
+  '010_rekey_purge.sql',
 ]);
 
 /**
