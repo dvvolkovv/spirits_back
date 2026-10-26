@@ -264,6 +264,42 @@ describe('контейнер целиком и образы — для смен�
     expect(j.HostConfig.RestartPolicy).toEqual({ Name: 'unless-stopped', MaximumRetryCount: 0 });
     expect(j.Mounts).toEqual([{ Type: 'bind', Source: '/srv/products/shop', Destination: '/product', RW: true }]);
     expect(j.State.Running).toBe(true);
+    expect(j.State.Restarting).toBe(false);
+  });
+
+  it('inspect --type container: тот же JSON; не контейнер — «No such container»; иной тип — отказ', async () => {
+    // Смена ключей спрашивает именно контейнер: без --type живой docker отдал
+    // бы и образ с тем же именем, если контейнера нет.
+    await run('shop', 8001);
+    const plain = JSON.parse(await host.run(['docker', 'inspect', '--format', '{{json .}}', 'shop']));
+    const typed = JSON.parse(await host.run(['docker', 'inspect', '--type', 'container', '--format', '{{json .}}', 'shop']));
+    expect(typed).toEqual(plain);
+    await expect(
+      host.run(['docker', 'inspect', '--type', 'container', '--format', '{{json .}}', 'nope']),
+    ).rejects.toThrow(/No such container: nope/);
+    await expect(host.run(['docker', 'inspect', '--type', 'volume', '--format', '{{json .}}', 'shop'])).rejects.toThrow(/--type/);
+  });
+
+  it('падает сразу после старта: start отвечает успехом, inspect — restarting, exec и порт молчат', async () => {
+    // Так живой docker показывает петлю перезапусков при --restart
+    // unless-stopped: Running=true вместе с Restarting=true (StateString →
+    // "restarting"). `docker start` при этом возвращает 0 — он отвечает за
+    // запуск процесса, а не за то, что процесс удержался.
+    await run('shop', 8001);
+    await host.run(['docker', 'stop', 'shop']);
+    host.crashing = (name) => name === 'shop';
+    await expect(host.run(['docker', 'start', 'shop'])).resolves.toBe('shop');
+    const j = JSON.parse(await host.run(['docker', 'inspect', '--type', 'container', '--format', '{{json .}}', 'shop']));
+    expect(j.State).toEqual({ Running: true, Restarting: true, Status: 'restarting' });
+    await expect(host.run(['docker', 'exec', 'shop', 'node', '-e', 'x'])).rejects.toThrow(/is restarting/);
+    expect(host.probePort(8001)).toBe(false);
+  });
+
+  it('падает без политики перезапуска — exited, как у docker', async () => {
+    host.containers.set('legacy', { mount: '', env: {}, image: 'linkeon-product:base', cmd: [] });
+    host.crashing = () => true;
+    const j = JSON.parse(await host.run(['docker', 'inspect', '--format', '{{json .}}', 'legacy']));
+    expect(j.State).toEqual({ Running: false, Restarting: false, Status: 'exited' });
   });
 
   it('-e поверх переменной образа — одна строка с новым значением, как у docker', async () => {

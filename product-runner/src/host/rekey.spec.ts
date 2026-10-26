@@ -5,7 +5,7 @@
  */
 import { FakeHost, OAUTH, deps } from './fake-host';
 import { ProvisionDeps, provision } from './provision';
-import { HEALTH_INSIDE, REKEY_BACKUP_SUFFIX, rekeyProduct, RekeyJob } from './rekey';
+import { HEALTH_INSIDE, REKEY_BACKUP_SUFFIX, capture, rekeyProduct, RekeyJob, runArgv } from './rekey';
 
 let host: FakeHost;
 beforeEach(() => {
@@ -21,14 +21,15 @@ async function seedSite(slug = 'shop', secrets: Record<string, string> = { API_K
 const botJob = (over: Partial<RekeyJob> = {}): RekeyJob => ({
   slug: 'bot1', kind: 'bot', secrets: { BOT_TOKEN: 'new', NEW_KEY: 'n' }, dropNames: ['API_KEY'], ...over,
 });
-/** Сайт «отвечает» ровно тогда, когда симулятор считает его здоровым; срок — ноль, чтобы отказ не ждал минуту. */
-const siteDeps = (over: Partial<ProvisionDeps> = {}) =>
-  deps(host, { waitPort: async (p) => host.probePort(p), waitPortTimeoutMs: 0, ...over });
+/** Сроки и паузы — ноль: отказ не ждёт минуту, повторная проверка — три секунды. */
+const fast = (over: Partial<ProvisionDeps> = {}) => deps(host, { waitPortTimeoutMs: 0, settleMs: 0, ...over });
+/** Сайт «отвечает» ровно тогда, когда симулятор считает его здоровым. */
+const siteDeps = (over: Partial<ProvisionDeps> = {}) => fast({ waitPort: async (p) => host.probePort(p), ...over });
 
 describe('смена ключей: успех', () => {
   it('бот: новые ключи в окружении, снятые ушли, переменные платформы на месте', async () => {
     await seedBot();
-    await rekeyProduct(botJob(), deps(host, { waitPortTimeoutMs: 0 }));
+    await rekeyProduct(botJob(), fast());
 
     const c = host.containers.get('bot1')!;
     expect(c.env.BOT_TOKEN).toBe('new');
@@ -48,7 +49,7 @@ describe('смена ключей: успех', () => {
     // потерянный --restart — лежащим после первой же перезагрузки машины.
     await seedBot();
     const before = { ...host.containers.get('bot1')! };
-    await rekeyProduct(botJob(), deps(host, { waitPortTimeoutMs: 0 }));
+    await rekeyProduct(botJob(), fast());
 
     const c = host.containers.get('bot1')!;
     expect(c.memory).toBe(1024 ** 3);
@@ -76,13 +77,13 @@ describe('смена ключей: успех', () => {
     // знает и вернуть не сможет.
     await seedBot();
     host.containers.get('bot1')!.env.HAND_MADE = '1';
-    await rekeyProduct(botJob(), deps(host, { waitPortTimeoutMs: 0 }));
+    await rekeyProduct(botJob(), fast());
     expect(host.containers.get('bot1')!.env.HAND_MADE).toBe('1');
   });
 
   it('OWNER_TG_ID из задания ставится боту рядом с ключами', async () => {
     await seedBot();
-    await rekeyProduct(botJob({ ownerTgId: '42' }), deps(host, { waitPortTimeoutMs: 0 }));
+    await rekeyProduct(botJob({ ownerTgId: '42' }), fast());
     expect(host.containers.get('bot1')!.env.OWNER_TG_ID).toBe('42');
   });
 
@@ -95,7 +96,7 @@ describe('смена ключей: успех', () => {
   it('метка образа на месте — запуск по ней же: контейнер остаётся в отборе обновления образа', async () => {
     host.tagImage('linkeon-product:base', 'sha256:v1', []);
     await seedBot();
-    await rekeyProduct(botJob(), deps(host, { waitPortTimeoutMs: 0 }));
+    await rekeyProduct(botJob(), fast());
     expect(host.containers.get('bot1')!.image).toBe('linkeon-product:base');
     expect(host.containers.get('bot1')!.imageId).toBe('sha256:v1');
   });
@@ -105,7 +106,7 @@ describe('смена ключей: успех', () => {
     host.tagImage('linkeon-product:src-aaaaaaaaaaaa', 'sha256:v1', []);
     await seedBot();
     host.tagImage('linkeon-product:base', 'sha256:v2', []);
-    await rekeyProduct(botJob(), deps(host, { waitPortTimeoutMs: 0 }));
+    await rekeyProduct(botJob(), fast());
     expect(host.containers.get('bot1')!.imageId).toBe('sha256:v1');
     expect(host.containers.get('bot1')!.image).toBe('linkeon-product:src-aaaaaaaaaaaa');
   });
@@ -115,7 +116,7 @@ describe('смена ключей: откат и отказы', () => {
   it('нездоровый бот — откат: старый контейнер со старыми ключами в работе', async () => {
     await seedBot();
     host.healthy = (_name, c) => c.env.BOT_TOKEN !== 'плохой';
-    await expect(rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'плохой' } }), deps(host, { waitPortTimeoutMs: 0 })))
+    await expect(rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'плохой' } }), fast()))
       .rejects.toThrow(/ключи не применены.*старыми ключами/);
     const c = host.containers.get('bot1')!;
     expect(c.env.BOT_TOKEN).toBe('old');
@@ -156,7 +157,7 @@ describe('смена ключей: откат и отказы', () => {
         throw new Error(`Command failed: ${argv.join(' ')}\ndocker: Error response from daemon: boom`);
       }
     };
-    const err = await rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'секрет-новый' } }), deps(host, { waitPortTimeoutMs: 0 }))
+    const err = await rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'секрет-новый' } }), fast())
       .catch((e) => e);
     expect(String(err.message)).toMatch(/boom/);
     expect(String(err.message)).not.toContain('секрет-новый');
@@ -174,7 +175,7 @@ describe('смена ключей: откат и отказы', () => {
         throw new Error(`Command failed: ${argv.join(' ')}\ndocker: Error response from daemon: driver failed`);
       }
     };
-    await expect(rekeyProduct(botJob(), deps(host, { waitPortTimeoutMs: 0 }))).rejects.toThrow(/старыми ключами/);
+    await expect(rekeyProduct(botJob(), fast())).rejects.toThrow(/старыми ключами/);
     expect(host.containers.get('bot1')!.env.BOT_TOKEN).toBe('old');
     expect(host.containers.get('bot1')!.env.RUNNER_TOKEN).toBe('ткн-раннера');
     expect(host.isRunning('bot1')).toBe(true);
@@ -192,7 +193,7 @@ describe('смена ключей: откат и отказы', () => {
         throw new Error(`Command failed: ${argv.join(' ')}\ndocker: Error response from daemon: boom`);
       }
     };
-    const err = await rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'секрет-новый' } }), deps(host, { waitPortTimeoutMs: 0 }))
+    const err = await rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'секрет-новый' } }), fast())
       .catch((e) => e);
     expect(String(err.message)).toMatch(/boom/);
     expect(String(err.message)).not.toContain('хвост-ключа');
@@ -206,7 +207,7 @@ describe('смена ключей: откат и отказы', () => {
     host.before = (argv) => {
       if (argv[1] === 'rename' && argv[2] === 'bot1') throw new Error('Command failed: docker rename bot1 bot1__rekey\nboom-rename');
     };
-    await expect(rekeyProduct(botJob(), deps(host, { waitPortTimeoutMs: 0 }))).rejects.toThrow(/ключи не применены.*старыми ключами/);
+    await expect(rekeyProduct(botJob(), fast())).rejects.toThrow(/ключи не применены.*старыми ключами/);
     expect(host.isRunning('bot1')).toBe(true);
     expect(host.containers.get('bot1')!.env.BOT_TOKEN).toBe('old');
     expect(host.containers.has(`bot1${REKEY_BACKUP_SUFFIX}`)).toBe(false);
@@ -219,7 +220,7 @@ describe('смена ключей: откат и отказы', () => {
     host.after = (argv) => {
       if (argv[1] === 'rename' && argv[2] === 'bot1') throw new Error('docker не уложился в 300 с и снят по сроку: Command failed: docker rename bot1 bot1__rekey\n');
     };
-    await expect(rekeyProduct(botJob(), deps(host, { waitPortTimeoutMs: 0 }))).rejects.toThrow(/старыми ключами/);
+    await expect(rekeyProduct(botJob(), fast())).rejects.toThrow(/старыми ключами/);
     expect(host.isRunning('bot1')).toBe(true);
     expect(host.containers.get('bot1')!.env.BOT_TOKEN).toBe('old');
     expect(host.containers.has(`bot1${REKEY_BACKUP_SUFFIX}`)).toBe(false);
@@ -231,7 +232,7 @@ describe('смена ключей: откат и отказы', () => {
     host.before = (argv) => {
       if (argv[1] === 'rename' && argv[2] === `bot1${REKEY_BACKUP_SUFFIX}`) throw new Error('Command failed: docker rename\nboom');
     };
-    const err = await rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'плохой' } }), deps(host, { waitPortTimeoutMs: 0 }))
+    const err = await rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'плохой' } }), fast())
       .catch((e) => e);
     expect(String(err.message)).toMatch(/ключи не применены.*откат не удался/);
     expect(err.leftovers.join(' ')).toContain(`bot1${REKEY_BACKUP_SUFFIX}`);
@@ -250,7 +251,7 @@ describe('смена ключей: откат и отказы', () => {
   it('спящему продукту ключи не меняются', async () => {
     await seedBot();
     await host.run(['docker', 'stop', 'bot1']);
-    await expect(rekeyProduct(botJob(), deps(host))).rejects.toThrow(/не запущен/);
+    await expect(rekeyProduct(botJob(), deps(host))).rejects.toThrow(/не запущен \(спит или прервана прошлая смена ключей\)/);
     expect(host.containers.get('bot1')!.env.BOT_TOKEN).toBe('old');
   });
 
@@ -289,14 +290,14 @@ describe('смена ключей: откат и отказы', () => {
   it('OWNER_TG_ID пустой строкой — владелец отвязал Telegram: переменная снимается', async () => {
     await seedBot();
     host.containers.get('bot1')!.env.OWNER_TG_ID = '42';
-    await rekeyProduct(botJob({ ownerTgId: '' }), deps(host, { waitPortTimeoutMs: 0 }));
+    await rekeyProduct(botJob({ ownerTgId: '' }), fast());
     expect('OWNER_TG_ID' in host.containers.get('bot1')!.env).toBe(false);
   });
 
   it('OWNER_TG_ID не пришёл вовсе — переменная остаётся как была', async () => {
     await seedBot();
     host.containers.get('bot1')!.env.OWNER_TG_ID = '42';
-    await rekeyProduct(botJob(), deps(host, { waitPortTimeoutMs: 0 }));
+    await rekeyProduct(botJob(), fast());
     expect(host.containers.get('bot1')!.env.OWNER_TG_ID).toBe('42');
   });
 
@@ -313,10 +314,260 @@ describe('смена ключей: откат и отказы', () => {
         throw new Error(`docker не уложился в 300 с и снят по сроку: Command failed: ${argv.join(' ')}\n`);
       }
     };
-    const err = await rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'секрет-срок' } }), deps(host, { waitPortTimeoutMs: 0 })).catch((e) => e);
+    const err = await rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'секрет-срок' } }), fast()).catch((e) => e);
     expect(String(err.message)).toMatch(/снят по сроку/);
     expect(String(err.message)).not.toContain('секрет-срок');
     expect(String(err.message)).not.toContain('ткн-раннера');
+  });
+});
+
+describe('смена ключей: образ и окружение образа', () => {
+  it('переменные образа не уходят флагом -e: новый берёт их из образа, своё поверх образа сохраняется', async () => {
+    host.tagImage('linkeon-product:base', 'sha256:v1', ['CHECKOUT_PATH=/product', 'TZ=UTC']);
+    await seedBot();
+    host.containers.get('bot1')!.env.TZ = 'Europe/Moscow';
+    await rekeyProduct(botJob(), fast());
+
+    const c = host.containers.get('bot1')!;
+    expect('CHECKOUT_PATH' in c.env).toBe(false);
+    expect(c.env.TZ).toBe('Europe/Moscow');
+    const j = JSON.parse(await host.run(['docker', 'inspect', '--format', '{{json .}}', 'bot1']));
+    expect(j.Config.Env).toContain('CHECKOUT_PATH=/product');
+    expect(j.Config.Env).not.toContain('TZ=UTC');
+  });
+
+  it('запущен не по метке linkeon-product (чужая метка того же образа) — по стабильной: продукт возвращается в отбор обновления образа', async () => {
+    host.tagImage('linkeon-product:base', 'sha256:v1', []);
+    host.tagImage('linkeon-product:src-bbbbbbbbbbbb', 'sha256:v1', []);
+    host.tagImage('mirror/linkeon:1', 'sha256:v1', []);
+    await seedBot();
+    host.containers.get('bot1')!.image = 'mirror/linkeon:1';
+    await rekeyProduct(botJob(), fast());
+    expect(host.containers.get('bot1')!.image).toBe('linkeon-product:src-bbbbbbbbbbbb');
+    expect(host.containers.get('bot1')!.imageId).toBe('sha256:v1');
+  });
+
+  it('запущен по идентификатору, стабильной метки нет — отказ до изменений', async () => {
+    host.tagImage('linkeon-product:base', 'sha256:v1', []);
+    await seedBot();
+    host.containers.get('bot1')!.image = 'sha256:v1';
+    host.calls.length = 0;
+    await expect(rekeyProduct(botJob(), fast())).rejects.toThrow(/не помечен/);
+    expect(host.calls.some((c) => ['stop', 'rename', 'run', 'rm'].includes(c[1]))).toBe(false);
+  });
+
+  it('метку передвинули между снятием настроек и запуском — новый на чужом образе снят, старый в работе', async () => {
+    // Как verify_image в product-image-roll.sh: метка — не идентификатор, и
+    // обновление образа может передвинуть её в любой момент.
+    host.tagImage('linkeon-product:base', 'sha256:v1', []);
+    await seedBot();
+    host.before = (argv) => {
+      if (argv[1] === 'run' && argv.includes('BOT_TOKEN=new')) host.tagImage('linkeon-product:base', 'sha256:v2', []);
+    };
+    await expect(rekeyProduct(botJob(), fast())).rejects.toThrow(/ключи не применены.*образ/);
+    const c = host.containers.get('bot1')!;
+    expect(c.imageId).toBe('sha256:v1');
+    expect(c.env.BOT_TOKEN).toBe('old');
+    expect(host.isRunning('bot1')).toBe(true);
+    expect(host.containers.has(`bot1${REKEY_BACKUP_SUFFIX}`)).toBe(false);
+  });
+
+  it('контейнер спрашивается как контейнер: каждый inspect смены ключей — с --type container', async () => {
+    // Без --type живой docker при отсутствии контейнера отдал бы образ с тем
+    // же именем — и разбор пошёл бы по чужому объекту.
+    await seedBot();
+    host.calls.length = 0;
+    await rekeyProduct(botJob(), fast());
+    const inspects = host.calls.filter((c) => c[0] === 'docker' && c[1] === 'inspect');
+    expect(inspects.length).toBeGreaterThan(0);
+    expect(inspects.every((c) => c[2] === '--type' && c[3] === 'container')).toBe(true);
+  });
+});
+
+describe('смена ключей: здоровье — два ответа через паузу', () => {
+  it('ответил один раз и упал — откат', async () => {
+    // Ключ, который код владельца читает лениво (на первом запросе к его
+    // API), валит процесс уже ПОСЛЕ первого ответа /health.
+    await seedBot();
+    let answers = 0;
+    host.healthy = (_name, c) => c.env.BOT_TOKEN !== 'new' || answers++ === 0;
+    await expect(rekeyProduct(botJob(), fast())).rejects.toThrow(/ключи не применены.*старыми ключами/);
+    expect(host.containers.get('bot1')!.env.BOT_TOKEN).toBe('old');
+    expect(host.isRunning('bot1')).toBe(true);
+    expect(host.containers.has(`bot1${REKEY_BACKUP_SUFFIX}`)).toBe(false);
+  });
+});
+
+describe('смена ключей: откат — каждая ветка', () => {
+  it('старый поднялся после отката и тут же упал — «откат не удался», остаток назван', async () => {
+    // `docker start` отвечает 0, как только процесс запущен; упавший через
+    // секунду — тоже. Как do_restore product-image-roll.sh: пауза и состояние.
+    await seedBot();
+    host.healthy = (_name, c) => c.env.BOT_TOKEN !== 'плохой';
+    host.after = (argv) => {
+      if (argv[1] === 'start' && argv[2] === 'bot1') host.crashing = (name) => name === 'bot1';
+    };
+    const err = await rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'плохой' } }), fast()).catch((e) => e);
+    expect(String(err.message)).toMatch(/ключи не применены.*откат не удался/);
+    expect(err.leftovers.join(' ')).toMatch(/старый контейнер не поднялся после отката/);
+    expect(host.containers.get('bot1')!.env.BOT_TOKEN).toBe('old');
+  });
+
+  it('docker stop отказал, уже остановив, — продукт снова в работе со старыми ключами', async () => {
+    await seedBot();
+    host.after = (argv) => {
+      if (argv[1] === 'stop' && argv[2] === 'bot1') {
+        throw new Error('docker не уложился в 300 с и снят по сроку: Command failed: docker stop bot1\n');
+      }
+    };
+    await expect(rekeyProduct(botJob(), fast())).rejects.toThrow(/ключи не применены.*старыми ключами/);
+    expect(host.isRunning('bot1')).toBe(true);
+    expect(host.containers.get('bot1')!.env.BOT_TOKEN).toBe('old');
+    expect(host.containers.has(`bot1${REKEY_BACKUP_SUFFIX}`)).toBe(false);
+  });
+
+  it('в откате не снялся новый контейнер — остаток назван, старый цел под резервным именем', async () => {
+    await seedBot();
+    host.healthy = (_name, c) => c.env.BOT_TOKEN !== 'плохой';
+    host.before = (argv) => {
+      if (argv[1] === 'rm' && argv[3] === 'bot1') throw new Error('Command failed: docker rm -f bot1\nError: device or resource busy');
+    };
+    const err = await rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'плохой' } }), fast()).catch((e) => e);
+    expect(String(err.message)).toMatch(/откат не удался/);
+    expect(err.leftovers.join(' ')).toMatch(/новый контейнер bot1 не снят \(Error: device or resource busy\).*bot1__rekey/);
+    expect(host.containers.get(`bot1${REKEY_BACKUP_SUFFIX}`)!.env.RUNNER_TOKEN).toBe('ткн-раннера');
+  });
+
+  it('в откате старый не стартовал — остаток назван', async () => {
+    await seedBot();
+    host.healthy = (_name, c) => c.env.BOT_TOKEN !== 'плохой';
+    host.before = (argv) => {
+      if (argv[1] === 'start' && argv[2] === 'bot1') throw new Error('Command failed: docker start bot1\nError: port is already allocated');
+    };
+    const err = await rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'плохой' } }), fast()).catch((e) => e);
+    expect(String(err.message)).toMatch(/откат не удался/);
+    expect(err.leftovers.join(' ')).toMatch(/старый контейнер bot1 не поднялся \(Error: port is already allocated\)/);
+    expect(host.containers.get('bot1')!.env.BOT_TOKEN).toBe('old');
+  });
+});
+
+describe('смена ключей: старый контейнер после успеха', () => {
+  const rmBackup = (c: string[]) => c[1] === 'rm' && c[3] === `bot1${REKEY_BACKUP_SUFFIX}`;
+
+  it('не убрался с первого раза — убирается второй попыткой', async () => {
+    await seedBot();
+    let fails = 1;
+    host.before = (argv) => {
+      if (rmBackup(argv) && fails-- > 0) throw new Error('Command failed: docker rm -f bot1__rekey\nError: removal in progress');
+    };
+    await rekeyProduct(botJob(), fast());
+    expect(host.containers.get('bot1')!.env.BOT_TOKEN).toBe('new');
+    expect(host.containers.has(`bot1${REKEY_BACKUP_SUFFIX}`)).toBe(false);
+  });
+
+  it('не убрался и со второго — смена удалась, а фаза громко называет остаток', async () => {
+    await seedBot();
+    host.before = (argv) => {
+      if (rmBackup(argv)) throw new Error('Command failed: docker rm -f bot1__rekey\nError: removal in progress');
+    };
+    const phases: string[] = [];
+    await rekeyProduct(botJob(), fast({ onPhase: (m) => phases.push(m) }));
+    expect(host.containers.get('bot1')!.env.BOT_TOKEN).toBe('new');
+    expect(host.containers.has(`bot1${REKEY_BACKUP_SUFFIX}`)).toBe(true);
+    expect(host.calls.filter(rmBackup)).toHaveLength(2);
+    expect(phases.join('\n')).toMatch(/ВНИМАНИЕ.*bot1__rekey.*не убран.*removal in progress/);
+  });
+});
+
+describe('снятие настроек и сборка docker run — по рукописному inspect', () => {
+  const IMG = 'sha256:img';
+  const image = { Id: IMG, RepoTags: ['linkeon-product:base'], Config: { Env: ['PATH=/usr/bin'] } };
+  const siteJob: RekeyJob = { slug: 'shop', kind: 'site', secrets: { API_KEY: 'k2' }, dropNames: [] };
+
+  function container(): any {
+    return {
+      Image: IMG,
+      Config: {
+        Image: 'linkeon-product:base',
+        Env: ['API_KEY=k1', 'LINKEON_URL=https://my.linkeon.io', 'RUNNER_TOKEN=т', 'PATH=/usr/bin'],
+      },
+      State: { Running: true, Restarting: false, Status: 'running' },
+      HostConfig: {
+        PortBindings: { '3000/tcp': [{ HostIp: '127.0.0.1', HostPort: '8005' }] },
+        Memory: 1024 ** 3,
+        NanoCpus: 1e9,
+        RestartPolicy: { Name: 'unless-stopped', MaximumRetryCount: 0 },
+        NetworkMode: 'bridge',
+        Privileged: false,
+      },
+      Mounts: [{ Type: 'bind', Source: '/srv/products/shop', Destination: '/product', RW: true }],
+    };
+  }
+
+  /** run, который отвечает только на чтение; любое изменение хоста — отказ (и след в calls). */
+  function stub(c: any) {
+    const calls: string[][] = [];
+    const run = async (argv: string[]) => {
+      calls.push(argv);
+      if (argv[1] === 'ps') return '\n';
+      if (argv[1] === 'inspect') return `${JSON.stringify(c)}\n`;
+      if (argv[1] === 'image') {
+        const ref = argv[argv.length - 1];
+        if (ref !== IMG && ref !== 'linkeon-product:base') throw new Error(`Error: No such image: ${ref}`);
+        return `${JSON.stringify(image)}\n`;
+      }
+      throw new Error(`заглушка: изменение хоста ${argv.slice(0, 2).join(' ')}`);
+    };
+    return { calls, d: deps(host, { run, waitPortTimeoutMs: 0, settleMs: 0 }) };
+  }
+  const onlyReads = (calls: string[][]) => calls.every((c) => ['ps', 'inspect', 'image'].includes(c[1]));
+  const after = (argv: string[], flag: string) => argv[argv.indexOf(flag) + 1];
+
+  it('форма заведения: --restart, -v, -p IP:ПОРТ:ПОРТ, -e, --memory=1g, --cpus=1, метка последней', async () => {
+    expect(runArgv('shop', await capture(siteJob, stub(container()).d), ['A=1'])).toEqual([
+      'docker', 'run', '-d', '--name', 'shop', '--restart', 'unless-stopped', '-v', '/srv/products/shop:/product',
+      '-p', '127.0.0.1:8005:3000', '-e', 'A=1', '--memory=1g', '--cpus=1', 'linkeon-product:base',
+    ]);
+  });
+
+  it('свои переменные — без переменных образа', async () => {
+    expect((await capture(siteJob, stub(container()).d)).ownEnv).toEqual([
+      'API_KEY=k1', 'LINKEON_URL=https://my.linkeon.io', 'RUNNER_TOKEN=т',
+    ]);
+  });
+
+  it('on-failure:N, память не кратная гигабайту, дробные CPU, монтирование только для чтения', async () => {
+    const c = container();
+    c.HostConfig.RestartPolicy = { Name: 'on-failure', MaximumRetryCount: 5 };
+    c.HostConfig.Memory = 1536 * 1024 ** 2;
+    c.HostConfig.NanoCpus = 1.5e9;
+    c.Mounts[0].RW = false;
+    const argv = runArgv('shop', await capture(siteJob, stub(c).d), []);
+    expect(after(argv, '--restart')).toBe('on-failure:5');
+    expect(argv).toContain('--memory=1536m');
+    expect(argv).toContain('--cpus=1.5');
+    expect(after(argv, '-v')).toBe('/srv/products/shop:/product:ro');
+
+    // Ни на одну единицу нацело не делится — байтами, без округления.
+    c.HostConfig.Memory = 1_000_000_000;
+    expect(runArgv('shop', await capture(siteJob, stub(c).d), [])).toContain('--memory=1000000000');
+  });
+
+  it.each<[string, (c: any) => void, RegExp]>([
+    ['IPv6 в адресе публикации', (c) => { c.HostConfig.PortBindings['3000/tcp'][0].HostIp = '::1'; }, /публикацию/],
+    ['запись окружения без «=»', (c) => { c.Config.Env.push('LONELY'); }, /переменную окружения/],
+    ['дробный лимит памяти', (c) => { c.HostConfig.Memory = 1.5; }, /лимит памяти/],
+    ['отрицательный лимит памяти', (c) => { c.HostConfig.Memory = -1; }, /лимит памяти/],
+    ['лимит CPU не число', (c) => { c.HostConfig.NanoCpus = 'много'; }, /лимит CPU/],
+    ['двоеточие в пути каталога на хосте', (c) => { c.Mounts[0].Source = '/srv/products/a:b'; }, /монтирование/],
+    ['двоеточие в пути внутри контейнера', (c) => { c.Mounts[0].Destination = '/product:x'; }, /монтирование/],
+    ['том вместо привязки каталога', (c) => { c.Mounts.push({ Type: 'volume', Name: 'x', Destination: '/data' }); }, /монтирование/],
+  ])('%s — отказ до любого изменения', async (_label, spoil, re) => {
+    const c = container();
+    spoil(c);
+    const { d, calls } = stub(c);
+    await expect(rekeyProduct(siteJob, d)).rejects.toThrow(re);
+    expect(onlyReads(calls)).toBe(true);
   });
 });
 
