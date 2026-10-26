@@ -150,6 +150,14 @@ describe('карточка ключей: отправить', () => {
     expect(h.calls.some((c) => c.sql.includes('INSERT INTO product_provision_jobs'))).toBe(false);
   });
 
+  it('ключ с именем __proto__ из тела запроса не теряется молча — как у заведения, он в наборе', async () => {
+    const h = harness();
+    expect(await send(h, JSON.parse('{"__proto__":"p"}'))).toEqual({ ok: true, queued: true });
+    const ins = h.calls.find((c) => c.sql.includes('INSERT INTO product_provision_jobs'))!;
+    expect(Object.keys(secrets.decrypt(ins.params[1], PID))).toEqual(['BOT_TOKEN', 'OLD_KEY', '__proto__']);
+    expect(JSON.parse(ins.params[2]).changedNames).toEqual(['__proto__']);
+  });
+
   it('пустое имя ключа — field: "" доезжает до карточки', async () => {
     const h = harness();
     await send(h, { '': 'x' });
