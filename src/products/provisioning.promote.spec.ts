@@ -56,9 +56,15 @@ function makeService(
       throw new Error('предел аккаунта здесь не спрашивают: он живёт только в create()');
     }),
   };
-  const svc = new ProvisioningService(pg as any, {} as any, hosts as any, limits as any);
+  // Первая аренда при переходе в running — ЗДЕСЬ зовётся по-настоящему, в
+  // отличие от hosts/limits выше: это ровно то, что проверяет эта задача.
+  // Безобидная заглушка, а не реальный RentService — сам запрос к балансу
+  // измеряется на живой базе (provisioning.integration.spec.ts, сценарий 76),
+  // здесь сторожится только ФАКТ и АДРЕСАТ вызова.
+  const rent = { chargeOnStart: jest.fn(async () => undefined) };
+  const svc = new ProvisioningService(pg as any, {} as any, hosts as any, limits as any, rent as any);
   (svc as any).fetchFn = fetchImpl ?? (async () => ({ status: 200 }));
-  return { svc, calls, pg };
+  return { svc, calls, pg, rent };
 }
 
 /**
@@ -184,6 +190,28 @@ describe('ProvisioningService.promoteReady', () => {
     const { svc } = makeService([site()], undefined, { updateRowCount: 0 });
 
     await expect(svc.promoteReady()).resolves.toBe(0);
+  });
+
+  it('реальный перевод зовёт первую аренду по этому продукту', async () => {
+    // Задача «Отступления очереди 1», п.1: без этого вызова платный с первого
+    // дня продукт бесплатен до завтрашнего суточного тика RentService.
+    const { svc, rent } = makeService([site()]);
+
+    await svc.promoteReady();
+
+    expect(rent.chargeOnStart).toHaveBeenCalledTimes(1);
+    expect(rent.chargeOnStart).toHaveBeenCalledWith('p-1');
+  });
+
+  it('незасчитанный перевод (rowCount 0) аренду не зовёт', async () => {
+    // Защита в записи сработала — состояние успело измениться (гонка с
+    // повтором/архивацией/соседом кластера), и звать аренду по продукту, в
+    // который мы на самом деле не попали, здесь нечем и незачем.
+    const { svc, rent } = makeService([site()], undefined, { updateRowCount: 0 });
+
+    await svc.promoteReady();
+
+    expect(rent.chargeOnStart).not.toHaveBeenCalled();
   });
 
   it('перевод снимает причину прошлого отказа', async () => {

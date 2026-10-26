@@ -14,7 +14,7 @@ import { AGENT_OUTDATED_MARKER } from './domain-name';
 import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
 import { SecretsService } from './secrets.service';
-import { FREE_MONTH_PRODUCTS, freeMonthCountedJobSql } from './rent.service';
+import { FREE_MONTH_PRODUCTS, freeMonthCountedJobSql, RentService } from './rent.service';
 
 export type ProductKind = 'site' | 'bot';
 
@@ -460,6 +460,18 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     // молчаливую отмену всей задачи. Здесь же Nest не поднимет модуль, а
     // каждая заглушка в спеках обязана назвать себя вслух.
     private readonly limits: LimitsService,
+    // Первая аренда СРАЗУ при переходе в running (задача «Отступления
+    // очереди 1», пункт 1) — зовётся только отсюда, из promoteReady, см.
+    // комментарий у RentService.chargeOnStart. Отдельным сервисом по той же
+    // причине, что реестр машин и предел аккаунта: своя ответственность,
+    // свой срок жизни, и цикла DI тут нет — RentService зависит только от
+    // PgService, в обратную сторону ничего не зовёт.
+    //
+    // Зависимость ОБЯЗАТЕЛЬНАЯ по тому же правилу, что у `limits` выше:
+    // необязательную забывают передать, а забытая здесь означала бы «платный
+    // с первого дня продукт снова бесплатен до суточного тика» — ровно та
+    // дыра, из-за которой эта задача и завелась.
+    private readonly rent: RentService,
   ) {}
 
   /**
@@ -1540,6 +1552,20 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
         // переводах, которых не было, и первый же признак того, что защита
         // сработала, теряется.
         promoted += w.rowCount ?? 0;
+        // Первая аренда СРАЗУ здесь, а не на ближайшем суточном tick (задача
+        // «Отступления очереди 1», п.1): без неё платный с первого дня
+        // продукт работает бесплатно до завтрашнего оборота RentService —
+        // прод, 26.10.2026. Только при РЕАЛЬНОМ переводе (rowCount>0) и
+        // только здесь, а не на каждый обход сборщика: продукт, который уже
+        // running, второй раз в эту запись не попадёт, и продление для него
+        // так и остаётся делом суточного тика.
+        //
+        // Без проверки `paid_until <= now()` перед вызовом — она лежит
+        // внутри самого chargeOnStart (те же предусловия, что у tick()), и
+        // звать его безусловно безопасно даже для бесплатного месяца и для
+        // ещё не кончившегося оплаченного периода: см. docblock
+        // RentService.chargeOnStart.
+        if (w.rowCount) await this.rent.chargeOnStart(p.id);
       } catch (e: any) {
         // Именно по продукту, а не на весь оборот: один битый продукт иначе
         // запирает в provisioning всю очередь — та самая форма молчаливого

@@ -3,7 +3,7 @@ import { PgService } from '../common/services/pg.service';
 import { ProvisioningService } from './provisioning.service';
 import { LimitsService } from './limits.service';
 import { TurnsService, TURN_SILENCE_SQL } from './turns.service';
-import { SLEEP_REASON_NO_TOKENS } from './rent.service';
+import { RENT_TOKENS, SLEEP_REASON_NO_TOKENS } from './rent.service';
 import { ActionChannel, ConfirmedVia, DELETE_GRACE_DAYS, ProductActionsService } from './product-actions.service';
 import { BotTokenCheck, checkBotToken } from './bot-token-check';
 import { randomSuffix, siteSlugCandidates, slugWithSuffix } from './product-slug';
@@ -322,9 +322,9 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
   }
 
   async openDelete(i: { userId: string; productId: string; channel: ActionChannel; turn: string | null }):
-    Promise<{ ok: true; actionId: string; expiresAt: string } | LifecycleFail> {
+    Promise<{ ok: true; actionId: string; expiresAt: string; paidUntil: string } | LifecycleFail> {
     const r = await this.pg.query(
-      `SELECT id, name, slug, kind, status, block_reason FROM products WHERE id = $1 AND user_id = $2 AND archived_at IS NULL`,
+      `SELECT id, name, slug, kind, status, block_reason, paid_until FROM products WHERE id = $1 AND user_id = $2 AND archived_at IS NULL`,
       [i.productId, i.userId],
     );
     const p = r.rows[0];
@@ -343,7 +343,11 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       userId: i.userId, productId: p.id, kind: 'delete', channel: i.channel, turn: i.turn,
       payload: { name: p.name, slug: p.slug, productKind: p.kind },
     });
-    return { ok: true, actionId: id, expiresAt };
+    // paidUntil — ISO-строка, а не Date: тул (product-lifecycle-tool.ts,
+    // задача «Отступления очереди 1», п.3) сам решает, остался ли срок
+    // (`paid_until > now()`), и сам форматирует дату для человека — здесь
+    // достаточно сырого значения колонки.
+    return { ok: true, actionId: id, expiresAt, paidUntil: new Date(p.paid_until).toISOString() };
   }
 
   async completeDelete(i: { userId: string; actionId: string; via: ConfirmedVia }):
@@ -542,7 +546,7 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
   }
 
   async restore(i: { userId: string; productId: string; channel: ActionChannel }):
-    Promise<{ ok: true; status: 'sleeping' | 'blocked' | 'failed'; waking: boolean } | LifecycleFail> {
+    Promise<{ ok: true; status: 'sleeping' | 'blocked' | 'failed'; waking: boolean; balance: number } | LifecycleFail> {
     const cur = await this.pg.query(
       `SELECT p.id, p.name, p.purge_after, p.block_reason
          FROM products p
@@ -581,7 +585,7 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     const client = await this.pg.getClient();
     // Заполняется ТОЛЬКО по пути успеха, ПОСЛЕ COMMIT (ниже) — запись в
     // журнал делается уже снаружи try/finally, см. комментарий там.
-    let committed: { status: string; waking: boolean } | null = null;
+    let committed: { status: string; waking: boolean; balance: number } | null = null;
     // Заполняется на пути отказа «бот занят» — тем же приёмом, что у
     // committed (ревью, круг 2, пункт 5): запись в журнал и возврат — уже
     // ПОСЛЕ release, см. код после finally внизу. Сам catch ниже только
@@ -672,16 +676,41 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       );
       const prevStatus: string | null = prevR.rows[0]?.prev_status ?? null;
 
+      // ЧЕСТНЫЙ ВОЗВРАТ (задача «Отступления очереди 1», п.2). Раньше
+      // истёкший период безусловно писал в карточку «не хватило токенов на
+      // аренду», даже если баланс владельца её с запасом покрывает — тул
+      // предлагал пополнить то, что и так уже хватает. Баланс читается ТЕМ
+      // ЖЕ способом, что у RentService.wakeAffordable (`tokens >= RENT_TOKENS`,
+      // без FOR UPDATE — аренда здесь не списывается, списывает её
+      // chargeOnStart при самом старте, см. комментарий в
+      // provisioning.service.ts), и той же строкой читается точный баланс —
+      // он нужен тулу для текста, если денег всё-таки не хватит.
+      //
+      // Гонка с ПОПОЛНЕНИЕМ между этим чтением и возвратом не страшна: при
+      // недооценке (прочитали старый баланс, пополнение подоспело мгновение
+      // позже) продукт просто уснёт на SLEEP_REASON_NO_TOKENS и разбудится
+      // ближайшим оборотом wakeTick — тем же путём, что и любое другое
+      // пополнение спящего. Переоценка здесь невозможна: баланс читается
+      // ПОСЛЕ FOR UPDATE на products, а списывать его может только продукт,
+      // уже бывший running (chargeRent/consume_user_tokens), а запертая
+      // строка archived_at IS NOT NULL под этим замком такой не является.
+      const balRow = await client.query(
+        `SELECT COALESCE(tokens, 0) AS tokens FROM ai_profiles_consolidated WHERE user_id = $1`,
+        [i.userId],
+      );
+      const balance = Number(balRow.rows[0]?.tokens ?? 0);
+      const affordable = balance >= RENT_TOKENS;
+
       let r: any;
       try {
         r = await client.query(
           `UPDATE products
               SET archived_at = NULL, purge_after = NULL,
                   status = CASE WHEN block_reason IS NOT NULL THEN 'blocked' WHEN $4 = 'failed' THEN 'failed' ELSE 'sleeping' END,
-                  sleep_reason = CASE WHEN block_reason IS NULL AND $4 IS DISTINCT FROM 'failed' AND paid_until <= now() THEN $3 ELSE sleep_reason END
+                  sleep_reason = CASE WHEN block_reason IS NULL AND $4 IS DISTINCT FROM 'failed' AND paid_until <= now() AND NOT $5 THEN $3 ELSE sleep_reason END
             WHERE id = $1 AND user_id = $2 AND archived_at IS NOT NULL AND purged_at IS NULL AND purge_after > now()
             RETURNING status, paid_until > now() AS paid`,
-          [p.id, i.userId, SLEEP_REASON_NO_TOKENS, prevStatus],
+          [p.id, i.userId, SLEEP_REASON_NO_TOKENS, prevStatus, affordable],
         );
       } catch (e: any) {
         // Токен бота этого (ещё архивного) продукта мог за время архива
@@ -708,9 +737,14 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
           return { ok: false, reason: 'not_found', message: 'Удалённого продукта с таким именем нет' };
         }
         let waking = false;
-        if (row.status === 'sleeping' && row.paid) {
-          // Оплаченный период ещё идёт — будим сами: подметальщик аренды будит
-          // только тех, на кого хватает баланса на новый месяц.
+        if (row.status === 'sleeping' && (row.paid || affordable)) {
+          // Оплаченный период ещё идёт ИЛИ его уже нет, но на аренду
+          // хватает, — в обоих случаях будим сами, не дожидаясь подметальщика
+          // (п.2): он проходит раз в минуту, и без этой ветки владелец
+          // наблюдал бы «вернул, но спит» секунды или минуту там, где деньги
+          // на балансе уже есть. Саму аренду при истёкшем периоде спишет
+          // chargeOnStart в момент перевода в running (п.1) — здесь только
+          // постановка задания, как и раньше для оплаченного периода.
           const w = await client.query(
             `INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'wake', 'queued')
              ON CONFLICT DO NOTHING RETURNING product_id`,
@@ -742,7 +776,7 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
           }
         }
         await client.query('COMMIT');
-        committed = { status: row.status, waking };
+        committed = { status: row.status, waking, balance };
       }
     } catch (e: any) {
       await client.query('ROLLBACK').catch(() => undefined);
@@ -775,7 +809,7 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     } catch (e: any) {
       this.logger.warn(`restore ${p.id}: успешный возврат не записан в журнал: ${e?.message}`);
     }
-    return { ok: true, status: committed!.status as 'sleeping' | 'blocked' | 'failed', waking: committed!.waking };
+    return { ok: true, status: committed!.status as 'sleeping' | 'blocked' | 'failed', waking: committed!.waking, balance: committed!.balance };
   }
 
   /** Отказ отката — в журнал как failed. Лучшее усилие: сбой записи самого журнала не должен топить отказ, который он описывает. */

@@ -8,7 +8,7 @@ import { ProductActionsService } from './product-actions.service';
 import { ProductLifecycleService } from './product-lifecycle.service';
 import { MIGRATIONS } from './products.service';
 import { ProvisioningService } from './provisioning.service';
-import { SLEEP_REASON_NO_TOKENS } from './rent.service';
+import { RENT_TOKENS, RentService, SLEEP_REASON_NO_TOKENS } from './rent.service';
 import { SecretsService } from './secrets.service';
 import { TurnsService } from './turns.service';
 
@@ -106,7 +106,7 @@ maybe('жизненный цикл продукта против живого Po
       [sha('токен clients')],
     );
 
-    const provisioning = new ProvisioningService(pg as any, secrets, new HostsService(pg as any), new LimitsService(pg as any));
+    const provisioning = new ProvisioningService(pg as any, secrets, new HostsService(pg as any), new LimitsService(pg as any), new RentService(pg as any));
     (provisioning as any).fetchFn = async () => ({ status: 200 });
     const limits = new LimitsService(pg as any);
     const turns = new TurnsService(pg as any, { checkTokenBalance: async () => ({ ok: true }), deductTokens: async () => 0 } as any);
@@ -180,6 +180,10 @@ maybe('жизненный цикл продукта против живого Po
 
       const open = await svc.openDelete({ userId, productId, channel: 'web', turn: null });
       expect(open.ok).toBe(true);
+      // paidUntil — для тула (задача «Отступления очереди 1», п.3): он решает
+      // по ней, говорить ли про невозвратный остаток срока. По умолчанию
+      // insertProduct даёт +30 дней, то есть период ещё идёт.
+      expect(new Date((open as any).paidUntil).getTime()).toBeGreaterThan(Date.now());
       const complete = await svc.completeDelete({ userId, actionId: (open as any).actionId, via: 'chat' });
       expect(complete.ok).toBe(true);
 
@@ -436,6 +440,54 @@ maybe('жизненный цикл продукта против живого Po
       expect(row.sleep_reason).toBe(SLEEP_REASON_NO_TOKENS);
       const wake = await pool.query(`SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND kind = 'wake'`, [productId]);
       expect(Number(wake.rows[0].count)).toBe(0);
+    });
+
+    // Задача «Отступления очереди 1», п.2: честный возврат. Период истёк
+    // (как в тесте выше), но баланс владельца покрывает аренду — раньше это
+    // всё равно писало «не хватило токенов» и предлагало пополнить то, что
+    // и так уже хватает. Теперь restore() сам ставит пробуждение, не
+    // дожидаясь RentService.wakeTick (до минуты задержки), а саму аренду
+    // списывает старт (chargeOnStart, п.1), когда продукт дойдёт до running.
+    it('период истёк, но баланс покрывает аренду — будим сами, причина сна не пишется', async () => {
+      const userId = 'u-restore2b';
+      const productId = await insertProduct({
+        userId, status: 'archived', slug: 'restore-2b',
+        archivedAt: new Date(), purgeAfter: new Date(Date.now() + 10 * 86_400_000),
+        paidUntil: new Date(Date.now() - 86_400_000),
+      });
+      await pool.query(
+        `INSERT INTO ai_profiles_consolidated (user_id, tokens) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET tokens = EXCLUDED.tokens`,
+        [userId, RENT_TOKENS],
+      );
+
+      const r = await svc.restore({ userId, productId, channel: 'web' });
+      expect(r).toMatchObject({ ok: true, status: 'sleeping', waking: true, balance: RENT_TOKENS });
+
+      const row = (await pool.query('SELECT sleep_reason FROM products WHERE id = $1', [productId])).rows[0];
+      expect(row.sleep_reason).toBeNull();
+      const wake = await pool.query(`SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND kind = 'wake' AND status = 'queued'`, [productId]);
+      expect(Number(wake.rows[0].count)).toBe(1);
+    });
+
+    it('баланс точно на границе (= RENT_TOKENS) — тоже считается хватающим', async () => {
+      // `>=`, а не `>`: тот же порог, что у RentService.wakeAffordable
+      // (`tokens / RENT_TOKENS >= 1`), иначе владелец с ровно одной арендой
+      // на счету получал бы «не хватает» вопреки факту.
+      const userId = 'u-restore2c';
+      const productId = await insertProduct({
+        userId, status: 'archived', slug: 'restore-2c',
+        archivedAt: new Date(), purgeAfter: new Date(Date.now() + 10 * 86_400_000),
+        paidUntil: new Date(Date.now() - 86_400_000),
+      });
+      await pool.query(
+        `INSERT INTO ai_profiles_consolidated (user_id, tokens) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET tokens = EXCLUDED.tokens`,
+        [userId, RENT_TOKENS],
+      );
+
+      const r = await svc.restore({ userId, productId, channel: 'web' });
+      expect(r).toMatchObject({ ok: true, status: 'sleeping', waking: true });
     });
 
     /**

@@ -11,6 +11,18 @@ import { DomainsService } from './domains.service';
 import { ProductsController } from './products.controller';
 import { FREE_MONTH_PRODUCTS } from './rent.service';
 
+// Первая аренда при переходе в running — дело одного только promoteReady
+// (этот файл целиком про create(), promoteReady здесь не зовётся). БРОСАЕТ
+// по тому же правилу, что заглушки реестра машин и предела аккаунта в
+// соседних спеках: правдоподобная заглушка молча приняла бы вызов оттуда,
+// где его не должно быть.
+const noRent = () =>
+  ({
+    chargeOnStart: jest.fn(() => {
+      throw new Error('первая аренда здесь не зовётся: она живёт только в promoteReady()');
+    }),
+  }) as any;
+
 /**
  * Реестр машин. Отдаёт РАЗНЫЕ машины разным аудиториям и разные значения в
  * каждом поле: заглушка с одной машиной на всех зеленела бы и на реализации,
@@ -73,7 +85,7 @@ function makeService(over: any = {}) {
       if (over.overLimit) throw new UnprocessableEntityException('предел аккаунта');
     }),
   };
-  const svc = new ProvisioningService(pg as any, secrets as any, hosts as any, limits as any);
+  const svc = new ProvisioningService(pg as any, secrets as any, hosts as any, limits as any, noRent());
   // I2: без этой заглушки каждый тест ниже с kind:'bot' и секретом BOT_TOKEN
   // бил бы по настоящему Telegram (новая проверка в create()) — токены во
   // всех этих тестах фиктивные и заведомо не прошли бы getMe. По умолчанию —
@@ -547,7 +559,7 @@ describe('ProvisioningService.create', () => {
     const hosts = { pickForNewProduct: jest.fn(async () => ({ id: 'clients', publicIp: '10.1.2.3', domainSuffix: 'c.linkeon.io' })) };
     const limits = { assertCanCreate: jest.fn(async () => undefined) };
     const secrets = { encrypt: jest.fn(() => Buffer.from('шифр')) };
-    const broken = new ProvisioningService(pg as any, secrets as any, hosts as any, limits as any);
+    const broken = new ProvisioningService(pg as any, secrets as any, hosts as any, limits as any, noRent());
 
     const res = await broken.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site3', kind: 'site', secrets: {} });
 

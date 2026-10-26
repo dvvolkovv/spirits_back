@@ -6,8 +6,10 @@ import type { ProductMatch } from './product-tool.service';
 import type { ProductToolChannel } from './product-tool.token';
 import { RENT_TOKENS } from './rent.service';
 
-/** «50 000» — как в остальных текстах для людей. */
-const RENT_TOKEN_TEXT = String(RENT_TOKENS).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+/** «50 000» — как в остальных текстах для людей. Та же форма — для любого
+ *  числа токенов (баланс в тексте «не хватает», п.2), не только для RENT_TOKENS. */
+const tokenText = (n: number) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+const RENT_TOKEN_TEXT = tokenText(RENT_TOKENS);
 
 export interface DeletedProduct {
   id: string;
@@ -94,7 +96,7 @@ export class ProductLifecycleTool {
           // читаться как «бесплатно».
           (r.freeMonth === true
             ? ' Первый месяц аренды бесплатный.'
-            : ` Аренда ${RENT_TOKEN_TEXT} токенов спишется в течение суток после запуска; не хватит баланса — продукт уснёт до пополнения.`) +
+            : ` Аренда ${RENT_TOKEN_TEXT} токенов спишется при запуске; не хватит баланса — продукт уснёт до пополнения.`) +
           // «Поставлена» — только если setFirstPrompt РЕАЛЬНО сработал
           // (createSite вернул firstPromptSet): prompt мог быть дан, но его
           // постановка упасть — ассистент не должен обещать то, чего не было.
@@ -124,6 +126,13 @@ export class ProductLifecycleTool {
   async delete(userId: string, product: ProductMatch, channel: ProductToolChannel, turn: string | null) {
     const r = await this.lifecycle.openDelete({ userId, productId: product.id, channel, turn });
     if (r.ok === false) return { ok: false, reason: r.reason, product, say: r.message };
+    // Условно (задача «Отступления очереди 1», п.3): фраза про невозвратный
+    // срок — только если он ещё реально идёт (бесплатный месяц или уже
+    // оплаченный). У продукта, которому и так уже пора платить (paid_until
+    // в прошлом — ровно случай из п.1, платный с первого дня до перевода в
+    // running), эта фраза была бы пустой угрозой про несуществующий остаток.
+    const paidUntil = new Date(r.paidUntil);
+    const periodLeft = paidUntil.getTime() > Date.now();
     return {
       ok: true,
       pending: { actionId: r.actionId, kind: 'delete', expiresAt: r.expiresAt },
@@ -131,7 +140,8 @@ export class ProductLifecycleTool {
       say: (!turn
         ? 'Карточка с кнопкой «Удалить» ждёт пользователя в кабинете (Студия → Продукты).'
         : channel === 'telegram' ? 'Ниже придёт сообщение с кнопкой «Удалить».' : 'Под твоим ответом появится карточка с кнопкой «Удалить».') +
-        ` Продукт удалится, только когда пользователь нажмёт её. Вернуть его можно будет ${DELETE_GRACE_DAYS} дней, оплаченный период не возвращается. ` +
+        ` Продукт удалится, только когда пользователь нажмёт её. Вернуть его можно будет ${DELETE_GRACE_DAYS} дней` +
+        (periodLeft ? `, оставшийся срок до ${restoreDate(r.paidUntil)} не возвращается. ` : '. ') +
         'Не говори «удалил», пока status не вернёт done.',
     };
   }
@@ -153,18 +163,25 @@ export class ProductLifecycleTool {
     if (r.ok === false) return { ok: false, reason: r.reason, product, say: r.message };
     return {
       ok: true,
-      restored: { productId: product.id, status: r.status, waking: r.waking },
+      restored: { productId: product.id, status: r.status, waking: r.waking, balance: r.balance },
       product,
       // 'failed' — продукт вернулся таким же сломанным, каким был до
       // удаления (M3): это не вопрос денег, пополнение баланса тут не
       // поможет и предлагать его не нужно — нужен разбор причины поломки.
+      //
+      // ВЕТКА waking ТЕПЕРЬ ПОКРЫВАЕТ ДВА СЛУЧАЯ (п.2 «Отступления очереди
+      // 1»): оплаченный период ещё идёт ИЛИ его нет, но баланс покрывает
+      // аренду — ProductLifecycleService.restore будит сам в обоих, и
+      // пользователю не нужно знать, какой именно. Аренду при этом списывает
+      // не возврат, а сам старт (chargeOnStart, п.1) — отсюда «спишется при
+      // запуске», а не «спишется сейчас».
       say: r.status === 'blocked'
         ? 'Продукт возвращён, но он остановлен администратором: правки не принимаются, пополнение не поможет.'
         : r.status === 'failed'
           ? 'Продукт возвращён, но он не работал ещё до удаления (поломка) — пополнение баланса тут не поможет, нужно разобраться в причине.'
           : r.waking
-            ? 'Продукт возвращён и просыпается — через минуту-две снова заработает.'
-            : 'Продукт возвращён, но оплаченный период кончился: он проснётся, когда на балансе хватит токенов на месяц аренды. Предложи пополнить баланс.',
+            ? `Вернул. Просыпается — через минуту-две заработает; аренда ${RENT_TOKEN_TEXT} токенов спишется при запуске.`
+            : `Вернул, но он спит: на аренду нужно ${RENT_TOKEN_TEXT} токенов, на балансе ${tokenText(r.balance)} — после пополнения проснётся сам.`,
     };
   }
 
@@ -194,7 +211,7 @@ export class ProductLifecycleTool {
             ? `Готово: бот создан.` +
               (action.result?.freeMonth === true
                 ? ' Первый месяц аренды бесплатный.'
-                : ` Аренда ${RENT_TOKEN_TEXT} токенов спишется в течение суток после запуска; не хватит баланса — продукт уснёт до пополнения.`)
+                : ` Аренда ${RENT_TOKEN_TEXT} токенов спишется при запуске; не хватит баланса — продукт уснёт до пополнения.`)
             : ACTION_SAY[action.status],
     };
   }

@@ -19,8 +19,10 @@ function harness() {
   const lifecycle = {
     createSite: jest.fn(async () => ({ ok: true, productId: 'p-new', slug: 'magazin', domain: 'magazin.c.linkeon.io', freeMonth: true, firstPromptSet: true })),
     openCreateBot: jest.fn(async () => ({ ok: true, actionId: 'a1', expiresAt: '2026-10-25T10:30:00.000Z' })),
-    openDelete: jest.fn(async () => ({ ok: true, actionId: 'a2', expiresAt: '2026-10-25T10:30:00.000Z' })),
-    restore: jest.fn(async () => ({ ok: true, status: 'sleeping', waking: true })),
+    // paidUntil по умолчанию в будущем: у большинства тестов делетится продукт
+    // с ещё идущим периодом, и фраза «оставшийся срок не возвращается» в силе.
+    openDelete: jest.fn(async () => ({ ok: true, actionId: 'a2', expiresAt: '2026-10-25T10:30:00.000Z', paidUntil: '2026-11-24T10:00:00.000Z' })),
+    restore: jest.fn(async () => ({ ok: true, status: 'sleeping', waking: true, balance: 70_000 })),
     revert: jest.fn(async () => ({ ok: true, turnId: 't-rev' })),
   };
   const actions = { get: jest.fn(async () => null) };
@@ -47,7 +49,7 @@ describe('новые действия инструмента', () => {
     const r: any = await h.svc.execute('u1', { action: 'create', kind: 'site', name: 'Магазин' }, 'web', 'turn-1');
     expect(r.created.freeMonth).toBe(true);
     expect(r.say).toMatch(/первый месяц аренды бесплатный/i);
-    expect(r.say).not.toMatch(/спишется в течение суток после запуска/);
+    expect(r.say).not.toMatch(/спишется при запуске/);
   });
 
   it('create site — не первый бесплатный месяц: аренда и сон за нехватку токенов названы сразу', async () => {
@@ -55,7 +57,11 @@ describe('новые действия инструмента', () => {
     h.lifecycle.createSite.mockResolvedValue({ ok: true, productId: 'p-new', slug: 'magazin', domain: 'magazin.c.linkeon.io', freeMonth: false } as any);
     const r: any = await h.svc.execute('u1', { action: 'create', kind: 'site', name: 'Магазин' }, 'web', 'turn-1');
     expect(r.created.freeMonth).toBe(false);
-    expect(r.say).toMatch(/50 000 токенов спишется в течение суток после запуска/);
+    // Задача «Отступления очереди 1», п.1: аренда списывается при самом
+    // старте, а не ждёт суточного тика — текст не обязан обещать задержку,
+    // которой больше нет.
+    expect(r.say).toMatch(/50 000 токенов спишется при запуске/);
+    expect(r.say).not.toMatch(/в течение суток/);
     expect(r.say).toMatch(/не хватит баланса — продукт уснёт до пополнения/);
     expect(r.say).not.toMatch(/первый месяц аренды бесплатный/i);
   });
@@ -100,6 +106,20 @@ describe('новые действия инструмента', () => {
     expect(h.lifecycle.openDelete).toHaveBeenCalledWith({ userId: 'u1', productId: 'p1', channel: 'telegram', turn: 't' });
     expect(r.say).toMatch(/ниже придёт сообщение/i);
     expect(r.say).toMatch(/Не говори «удалил»/);
+    // Период (бесплатный месяц или уже оплаченный) ещё идёт — paidUntil
+    // заглушки harness() в будущем (задача «Отступления очереди 1», п.3).
+    expect(r.say).toMatch(/оставшийся срок до \d+ \S+ не возвращается/);
+  });
+
+  // Платный с первого дня продукт до собственного первого старта (п.1):
+  // paid_until уже в прошлом, остатка нет — фраза про невозвратный срок
+  // была бы пустой угрозой про несуществующий остаток.
+  it('delete — у продукта уже пора платить (paid_until в прошлом) — фраза про срок не говорится', async () => {
+    const h = harness();
+    h.lifecycle.openDelete.mockResolvedValue({ ok: true, actionId: 'a2', expiresAt: '2026-10-25T10:30:00.000Z', paidUntil: '2020-01-01T00:00:00.000Z' } as any);
+    const r: any = await h.svc.execute('u1', { action: 'delete', product: 'магазин' }, 'telegram', 't');
+    expect(r.say).not.toMatch(/не возвращается/);
+    expect(r.say).toMatch(/Не говори «удалил»/);
   });
 
   it('restore — по удалённым', async () => {
@@ -107,6 +127,19 @@ describe('новые действия инструмента', () => {
     const r = await h.svc.execute('u1', { action: 'restore', product: 'старый' });
     expect(r).toMatchObject({ ok: true, restored: { status: 'sleeping', waking: true } });
     expect(h.lifecycle.restore).toHaveBeenCalledWith({ userId: 'u1', productId: 'p9', channel: 'web' });
+    // Задача «Отступления очереди 1», п.2: аренду при пробуждении теперь
+    // платит сам старт, а не возврат — текст говорит «спишется при запуске».
+    expect(r.say).toBe('Вернул. Просыпается — через минуту-две заработает; аренда 50 000 токенов спишется при запуске.');
+  });
+
+  // Баланса не хватает даже на одну аренду — restore() сам не ставит
+  // пробуждение (ProductLifecycleService), и текст называет оба числа:
+  // сколько нужно и сколько есть, без слова «нет токенов».
+  it('restore — баланса не хватает: назвать оба числа, не обещать пополнение автоматом', async () => {
+    const h = harness();
+    h.lifecycle.restore.mockResolvedValue({ ok: true, status: 'sleeping', waking: false, balance: 12_345 } as any);
+    const r: any = await h.svc.execute('u1', { action: 'restore', product: 'старый' });
+    expect(r.say).toBe('Вернул, но он спит: на аренду нужно 50 000 токенов, на балансе 12 345 — после пополнения проснётся сам.');
   });
 
   it('delete — продукт остановлен администратором: карточка не открывается, отказ доходит до ассистента', async () => {
@@ -223,7 +256,7 @@ describe('новые действия инструмента', () => {
     const h = harness();
     h.actions.get.mockResolvedValue({ id: 'a7', user_id: 'u1', product_id: 'p-new', kind: 'create_bot', status: 'done', channel: 'web', confirmed_via: 'chat', payload: {}, result: { productId: 'p-new', botUsername: 'shop_bot', freeMonth: false }, created_at: new Date(), expires_at: new Date(Date.now() + 60_000), resolved_at: new Date(), tg_chat_id: null, tg_message_id: null, product_name: 'Бот', purge_after: null } as any);
     const r: any = await h.svc.execute('u1', { action: 'status', actionId: 'a7' });
-    expect(r.say).toMatch(/50 000 токенов спишется в течение суток после запуска/);
+    expect(r.say).toMatch(/50 000 токенов спишется при запуске/);
   });
 
   it('status — pending/working тоже ok:true: карточка только что заведена, это не отказ', async () => {

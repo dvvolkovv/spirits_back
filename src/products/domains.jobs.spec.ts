@@ -6,6 +6,7 @@ import { ProvisioningService } from './provisioning.service';
 import { SecretsService } from './secrets.service';
 import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
+import { RentService } from './rent.service';
 import { DomainsService } from './domains.service';
 
 const PG = process.env.PROVISIONING_PG_URL;
@@ -67,7 +68,12 @@ maybe('задание domain: выдача агенту и приём отчёт
     const n = await pool.query('SELECT count(*) FROM products');
     if (Number(n.rows[0].count) > 0) throw new Error('PROVISIONING_PG_URL указывает на НЕпустую базу');
     const secrets = new SecretsService({ get: (k: string) => (k === 'PRODUCT_SECRETS_KEY' ? KEY : undefined) } as any);
-    prov = new ProvisioningService(pg as any, secrets, new HostsService(pg as any), new LimitsService(pg as any));
+    // Задание domain после пробуждения доходит до promoteReady (сценарий
+    // ниже) — настоящий RentService на том же пуле, а не заглушка: продукт
+    // там без явного paid_until (DEFAULT — месяц вперёд), так что первая
+    // аренда молча не находит, что списывать, и это стоит проверять реальным
+    // поведением, а не угадывать его в моке.
+    prov = new ProvisioningService(pg as any, secrets, new HostsService(pg as any), new LimitsService(pg as any), new RentService(pg as any));
     (prov as any).fetchFn = async () => ({ status: 200 });
     domains = new DomainsService(pg as any);
   });
