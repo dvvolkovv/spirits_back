@@ -3106,7 +3106,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
 import { MIGRATIONS } from './products.service';
-import { ProductActionsService, REKEY_FAILED_SAY } from './product-actions.service';
+import { ProductActionsService, REKEY_BLOCKED_SAY, REKEY_FAILED_SAY, REKEY_GONE_SAY, REKEY_UNKNOWN_SAY } from './product-actions.service';
+import { JOB_KILLED_BY_BLOCK } from './block.service';
 
 const PG = process.env.PROVISIONING_PG_URL;
 const maybe = PG ? describe : describe.skip;
@@ -3124,7 +3125,7 @@ maybe('подметальщик журнала и коробки ключей п
     );
     return id;
   }
-  async function keysCard(productId: string, o: { expired: boolean; job?: 'queued' | 'running' | 'failed' }) {
+  async function keysCard(productId: string, o: { expired: boolean; job?: 'queued' | 'running' | 'failed'; started?: boolean; error?: string }) {
     const a = await pool.query(
       `INSERT INTO product_actions (user_id, product_id, kind, status, channel, secrets_box, expires_at)
        VALUES ('u1', $1, 'keys', 'working', 'web', '\\x01020304'::bytea,
@@ -3134,8 +3135,9 @@ maybe('подметальщик журнала и коробки ключей п
     );
     if (o.job) {
       await pool.query(
-        `INSERT INTO product_provision_jobs (product_id, kind, status, action_id) VALUES ($1, 'rekey', $2, $3)`,
-        [productId, o.job, a.rows[0].id],
+        `INSERT INTO product_provision_jobs (product_id, kind, status, action_id, started_at, error)
+         VALUES ($1, 'rekey', $2, $3, CASE WHEN $4 THEN now() END, $5)`,
+        [productId, o.job, a.rows[0].id, !!o.started, o.error ?? null],
       );
     }
     return a.rows[0].id as string;
@@ -3160,14 +3162,35 @@ maybe('подметальщик журнала и коробки ключей п
     expect((await card(id)).status).toBe('working');
   });
 
-  it('задание сняли снаружи — карточка failed с текстом смены ключей, коробка стёрта', async () => {
+  it('задание сняли до выдачи агенту (сборщик) — failed, «старые ключи», коробка стёрта', async () => {
     const p = await product();
-    const id = await keysCard(p, { expired: false, job: 'failed' });
+    const id = await keysCard(p, { expired: false, job: 'failed', error: 'срок смены ключей истёк (10 мин)' });
     await svc.sweepStuck();
     const c = await card(id);
     expect(c.status).toBe('failed');
     expect(c.secrets_box).toBeNull();
     expect(c.result).toEqual({ error: REKEY_FAILED_SAY, reason: 'rekey_failed' });
+  });
+
+  it('задание сняли у агента в руках (started_at есть) — исход неизвестен: rekey_unknown', async () => {
+    const p = await product();
+    const id = await keysCard(p, { expired: false, job: 'failed', started: true, error: JOB_KILLED_BY_BLOCK });
+    await svc.sweepStuck();
+    expect((await card(id)).result).toEqual({ error: REKEY_UNKNOWN_SAY, reason: 'rekey_unknown' });
+  });
+
+  it('снято удалением до выдачи — «продукт удалён», без слов о старых ключах', async () => {
+    const p = await product();
+    const id = await keysCard(p, { expired: false, job: 'failed', error: 'снято удалением' });
+    await svc.sweepStuck();
+    expect((await card(id)).result).toEqual({ error: REKEY_GONE_SAY, reason: 'gone' });
+  });
+
+  it('снято блокировкой до выдачи — «остановлен администратором»', async () => {
+    const p = await product();
+    const id = await keysCard(p, { expired: false, job: 'failed', error: JOB_KILLED_BY_BLOCK });
+    await svc.sweepStuck();
+    expect((await card(id)).result).toEqual({ error: REKEY_BLOCKED_SAY, reason: 'blocked' });
   });
 
   it('прежнее поведение: working без задания после срока + 10 минут — failed с общим текстом', async () => {
@@ -3233,8 +3256,9 @@ Run (нода, бэк): `src/products/product-actions.service.spec.ts src/produc
    *     у карточки нет задания, и срок в прошлом больше чем на 10 минут
    *     отличает мертвеца от живой операции (сама работа — секунды);
    *   - смена ключей: задание rekey сняли снаружи (сборщик зависших,
-   *     удаление продукта, возврат) — исход в карточку не записан. Такая
-   *     карточка закрывается с текстом смены ключей, без ожидания срока.
+   *     удаление продукта, блокировка) — исход в карточку не записан. Такая
+   *     карточка закрывается без ожидания срока, с причиной по тому, успел
+   *     ли агент забрать задание (см. CASE ниже).
    * Карточку с ЖИВЫМ заданием (queued/running) не трогаем ни при каком сроке:
    * отправленная на 29-й минуте, она иначе умерла бы при работающем агенте.
    *
@@ -3246,10 +3270,20 @@ Run (нода, бэк): `src/products/product-actions.service.spec.ts src/produc
       `UPDATE product_actions a
           SET status = 'failed',
               secrets_box = NULL,
+              -- Причина — по тому, ДОШЛО ли задание до агента: забранное
+              -- (started_at есть) и снятое снаружи — исход на машине
+              -- неизвестен; не забранное — ключи точно не менялись, и текст
+              -- называет, кто снял (удаление, блокировка, сборщик).
               result = CASE
-                WHEN EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id)
-                  THEN jsonb_build_object('error', $1::text, 'reason', 'rekey_failed')
-                ELSE jsonb_build_object('error', 'Действие прервалось — попросите ассистента повторить')
+                WHEN NOT EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id)
+                  THEN jsonb_build_object('error', 'Действие прервалось — попросите ассистента повторить')
+                WHEN EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id AND j.started_at IS NOT NULL)
+                  THEN jsonb_build_object('error', $2::text, 'reason', 'rekey_unknown')
+                WHEN EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id AND j.error = 'снято удалением')
+                  THEN jsonb_build_object('error', $3::text, 'reason', 'gone')
+                WHEN EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id AND j.error = $5::text)
+                  THEN jsonb_build_object('error', $4::text, 'reason', 'blocked')
+                ELSE jsonb_build_object('error', $1::text, 'reason', 'rekey_failed')
               END,
               resolved_at = now()
         WHERE a.status = 'working'
@@ -3258,7 +3292,10 @@ Run (нода, бэк): `src/products/product-actions.service.spec.ts src/produc
           AND (EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id AND j.status = 'failed')
                OR a.expires_at < now() - interval '10 minutes')
        RETURNING a.id`,
-      [REKEY_FAILED_SAY],
+      // Текст блокировки — литералом, а не импортом из block.service: тот
+      // тянет за собой весь модуль. Совпадение с JOB_KILLED_BY_BLOCK
+      // сторожит product-actions.sweep.pg.spec.ts.
+      [REKEY_FAILED_SAY, REKEY_UNKNOWN_SAY, REKEY_GONE_SAY, REKEY_BLOCKED_SAY, 'снято блокировкой администратора'],
     );
     await this.pg.query(
       `UPDATE product_actions SET secrets_box = NULL
@@ -3267,7 +3304,7 @@ Run (нода, бэк): `src/products/product-actions.service.spec.ts src/produc
     return r.rows.length;
   }
 ```
-`REKEY_FAILED_SAY` объявлен в этом же файле (задача 10) — объявление стоит выше класса.
+`REKEY_FAILED_SAY`, `REKEY_UNKNOWN_SAY`, `REKEY_GONE_SAY`, `REKEY_BLOCKED_SAY` объявлены в этом же файле (задача 10) — выше класса.
 
 Юнит-сторож `sweepStuck` в `product-actions.service.spec.ts` (~101–110) проверяет `calls[0]`: `status = 'working'`, `expires_at < now() - interval '10 minutes'`, `status = 'failed'`, `Действие прервалось`, отсутствие `BOT_TOKEN|pending` — новая форма всё это сохраняет.
 
