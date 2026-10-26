@@ -244,12 +244,13 @@ export class ShortsTopicService {
       if (!plan) return null;
 
       const r = await tx.query(
+        // Формат — из настроек в момент запуска: переключение посреди работы ролик не ломает.
         `UPDATE short_video
-            SET status = 'directing', slot_at = $2, angle = $3, attempts = 0, lease_until = NULL,
+            SET status = 'directing', slot_at = $2, angle = $3, format = $4, attempts = 0, lease_until = NULL,
                 last_error = NULL, updated_at = now()
           WHERE id = $1 AND status = 'idea'
           RETURNING *`,
-        [plan.ideaId, slot.toISOString(), plan.angle],
+        [plan.ideaId, slot.toISOString(), plan.angle, settings.format],
       );
       return r.rows[0] ? rowToShort(r.rows[0]) : null;
     });
