@@ -180,3 +180,24 @@ describe('инструмент продуктов для локального CL
     });
   });
 });
+
+// Маша и TG-бот берут промпт отсюда, веб-ассистенты — из промпта релея; новые
+// действия manage_product обязаны быть в обоих, с числами из констант.
+describe('промпт CLI знает весь жизненный цикл продукта', () => {
+  const { PRODUCTS_CLI_PROMPT } = require('./products-cli-tool');
+  const { RENT_TOKENS } = require('./rent.service');
+  const { DEFAULT_MAX_PRODUCTS } = require('./limits.service');
+  const { DELETE_GRACE_DAYS } = require('./product-actions.service');
+
+  it('create, delete, restore, revert и status по actionId', () => {
+    for (const a of ['create', 'delete', 'restore', 'revert']) expect(PRODUCTS_CLI_PROMPT).toContain(`action: "${a}"`);
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/action: "status", actionId/);
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/Не говори «создал» или «удалил», пока status не вернёт done/);
+  });
+
+  it('условия — из констант аренды, предела и срока возврата', () => {
+    expect(PRODUCTS_CLI_PROMPT).toContain(String(RENT_TOKENS).replace(/\B(?=(\d{3})+(?!\d))/g, ' '));
+    expect(PRODUCTS_CLI_PROMPT).toContain(`не больше ${DEFAULT_MAX_PRODUCTS} продуктов`);
+    expect(PRODUCTS_CLI_PROMPT).toContain(`вернуть можно ${DELETE_GRACE_DAYS} дней`);
+  });
+});
