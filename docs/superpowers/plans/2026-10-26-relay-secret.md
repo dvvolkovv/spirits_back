@@ -547,12 +547,18 @@ bash .superpowers/node-run.sh 'npx jest src/mcp/relay-mcp-template.spec.ts src/m
 
 - [ ] **Шаг 1: прод и стенд — `RELAY_SECRET` в `.env`**
 
+Перед дописыванием — проверить перевод строки в конце `.env` (иначе `RELAY_SECRET=...` прилипнет к последней существующей строке):
+
 ```bash
-ssh dvolkov@212.113.106.202 'cd ~/spirits_back && (grep -q "^RELAY_SECRET=" .env || printf "RELAY_SECRET=%s\n" "$(openssl rand -hex 32)" >> .env) && grep -c "^RELAY_SECRET=" .env && stat -c %a .env'
-ssh dv@85.192.61.231 'cd ~/spirits_back && (grep -q "^RELAY_SECRET=" .env || printf "RELAY_SECRET=%s\n" "$(openssl rand -hex 32)" >> .env) && grep -c "^RELAY_SECRET=" .env && stat -c %a .env'
+ssh dvolkov@212.113.106.202 'cd ~/spirits_back && [ -z "$(tail -c1 .env)" ] || echo >> .env; (grep -q "^RELAY_SECRET=" .env || printf "RELAY_SECRET=%s\n" "$(openssl rand -hex 32)" >> .env) && grep -c "^RELAY_SECRET=" .env && stat -c %a .env'
+ssh dv@85.192.61.231 'cd ~/spirits_back && [ -z "$(tail -c1 .env)" ] || echo >> .env; (grep -q "^RELAY_SECRET=" .env || printf "RELAY_SECRET=%s\n" "$(openssl rand -hex 32)" >> .env) && grep -c "^RELAY_SECRET=" .env && stat -c %a .env'
 ```
 
 Ожидается: `1` и права файла (`600` или прежние) в обоих.
+
+- [ ] **Шаг 1а: другие бэки на ноде `85.192.61.231`, ходящие в релей**
+
+На ноде, кроме живого `~/spirits_back`, есть `~/dev/spirits_back` и CI-клоны (`~/ci/spirits_back`, `~/ci/wt/*`) — проверить, у каких из них `AGENT_URL`/`agentUrl` реально указывает на `r.linkeon.io` (а не на локальный стенд/тест-дабл) и которые могут дёрнуть релей живым трафиком. Каждому такому — свой `RELAY_SECRET` в `.env` до включения `enforce` (Задача 9), либо явно отметить в этом плане, что конкретный клон в релей не ходит (CI-прогоны — не ходят, см. память «test без BACKEND_URL»).
 
 - [ ] **Шаг 2: релей — файл секретов (две строки) и режим `log`**
 
@@ -564,7 +570,13 @@ ssh dv@85.192.61.231 'sed -n "s/^RELAY_SECRET=//p" ~/spirits_back/.env' | ssh dv
 ssh dv@5.101.115.184 'cd ~/file-agent && stat -c "%a %n" relay-secrets relay-auth-mode && grep -vc "^#" relay-secrets && cat relay-auth-mode'
 ```
 
-Ожидается: `600 relay-secrets`, `600 relay-auth-mode`, `2` (две строки-секрета), `log`.
+Ожидается: `600 relay-secrets`, `600 relay-auth-mode`, `2` (две строки-секрета), `log`. Формат строк — без печати значений:
+
+```bash
+ssh dv@5.101.115.184 "awk '!/^#/ && NF && length(\$0)!=64' ~/file-agent/relay-secrets | wc -l"
+```
+
+Ожидается: `0` (каждая незакомментированная непустая строка — ровно 64 символа, `openssl rand -hex 32`).
 
 ---
 
@@ -580,27 +592,47 @@ ssh dv@5.101.115.184 'cd ~/file-agent && stat -c "%a %n" relay-secrets relay-aut
 
 - [ ] **Шаг 1:** живой `server.mjs` совпадает с копией main до правки (`diff` с `git show <база>:relay-agent/server.mjs`); иначе — переносить правку руками, не перезаписывать.
 - [ ] **Шаг 2:** живых ходов нет: `curl -s https://my.linkeon.io/webhook/chat/active-streams` с ноды и то же для стенда (Basic Auth из `test-server.env.local`) — оба `{"active":0}`.
-- [ ] **Шаг 3:** выкатить (имя временного файла — с расширением `.mjs`, иначе `node --check` не проверит):
+- [ ] **Шаг 3:** выкатить (файлы — с конкретного SHA слияния в main, не с движущегося `origin/main`: взять его командой из Задачи 5, шаг 3, `${SHA}`; имя временного файла — с расширением `.mjs`, иначе `node --check` не проверит):
 
 ```bash
-git -C ~/Downloads/spirits_back show origin/main:relay-agent/server.mjs > /tmp/server.new.mjs
-git -C ~/Downloads/spirits_back show origin/main:relay-agent/relay-auth.mjs > /tmp/relay-auth.mjs
-git -C ~/Downloads/spirits_back show origin/main:relay-agent/keep-warm.sh > /tmp/keep-warm.sh
+git -C ~/Downloads/spirits_back show ${SHA}:relay-agent/server.mjs > /tmp/server.new.mjs
+git -C ~/Downloads/spirits_back show ${SHA}:relay-agent/relay-auth.mjs > /tmp/relay-auth.mjs
+git -C ~/Downloads/spirits_back show ${SHA}:relay-agent/keep-warm.sh > /tmp/keep-warm.sh
 scp -q /tmp/server.new.mjs /tmp/relay-auth.mjs /tmp/keep-warm.sh dv@5.101.115.184:file-agent/
-ssh dv@5.101.115.184 'cd ~/file-agent && node --check server.new.mjs && node --check relay-auth.mjs && mv server.new.mjs server.mjs && { grep -qx "relay-secrets" .gitignore || printf "# Секреты бэков и режим проверки — только на сервере\nrelay-secrets\nrelay-auth-mode\n" >> .gitignore; } && chmod 755 keep-warm.sh && git add server.mjs relay-auth.mjs keep-warm.sh .gitignore && git commit -q -m "секрет бэка на входе (режим log)" && git log --oneline -1 && git status --short | head -3 && pm2 restart file-agent --update-env >/dev/null && pm2 describe file-agent | grep -E "status|restarts" | head -2'
+ssh dv@5.101.115.184 'cd ~/file-agent && node --check server.new.mjs && node --check relay-auth.mjs \
+  && node --test *.test.mjs 2>&1 | tail -6 \
+  && [ "$(ps --ppid "$(pm2 pid file-agent)" | wc -l)" = "1" ] \
+  && mv server.new.mjs server.mjs \
+  && { grep -qx "relay-secrets*" .gitignore || printf "# Секреты бэков и режим проверки — только на сервере\nrelay-secrets*\nrelay-auth-mode*\n" >> .gitignore; } \
+  && chmod 755 keep-warm.sh && git add server.mjs relay-auth.mjs keep-warm.sh .gitignore \
+  && git commit -q -m "секрет бэка на входе (режим log)" && git log --oneline -1 && git status --short | head -3 \
+  && pm2 restart file-agent >/dev/null && pm2 describe file-agent | grep -E "status|restarts" | head -2'
 ```
 
-Ожидается: коммит в git релея; в `git status` нет `relay-secrets` и `relay-auth-mode` (их скрывает `.gitignore`); `status │ online`.
+Прогон тестов релея — ПЕРЕД `mv`: битый `server.mjs` не должен попасть на диск. «Живых ходов нет» (Шаг 2 проверял это через `/webhook/chat/active-streams` на бэках) здесь проверяется ЕЩЁ РАЗ, но уже со стороны релея и в той же SSH-команде — числом процессов-потомков `file-agent` (`ps --ppid`), непосредственно перед `mv`, не раньше: ход может начаться в промежутке между Шагом 2 и этим SSH-вызовом. Рестарт — БЕЗ `--update-env`: релей не берёт секрет/режим из переменных окружения процесса (только из файлов `relay-secrets`/`relay-auth-mode`, см. `RELAY_SECRETS_FILE`/`RELAY_AUTH_MODE_FILE` в README), а `--update-env` на этой машине заодно перечитывает окружение pm2 целиком — лишний риск без пользы здесь.
+
+Ожидается: тесты релея — `# fail 0`; коммит в git релея; в `git status` нет `relay-secrets`/`relay-auth-mode` (их скрывает `.gitignore`); `status │ online`.
 
 - [ ] **Шаг 4:** первые ходы прода и стенда после рестарта — в журнале nginx `POST /chat 200`, в `pm2 logs file-agent --lines 200 --nostream` ни одной строки `relay-auth: отказ был бы` с адресов бэков.
+
+  Положительный контроль (что лог вообще способен поймать СВОЙ бэк без заголовка): с прода, без заголовка и без тела —
+  ```bash
+  ssh dvolkov@212.113.106.202 'curl -s -o /dev/null -w "%{http_code}\n" -X POST https://r.linkeon.io/chat'
+  ```
+  Ожидается `400` (режим ещё `log` — relay-auth пропускает запрос дальше, но у `/chat`-обработчика нет ни `sessionId`, ни тела — он сам отвечает 400) и следом в `pm2 logs file-agent --lines 20 --nostream` — строка `relay-auth: отказ был бы (нет секрета), ip=<IP прода>, ...`. Если строки нет или IP не прода — проверку ломать нарочно не нужно, но разобраться, почему лог не увидел вызов, нужно до Задачи 9.
 
 ---
 
 ### Задача 9: сутки наблюдения и включение отказа — с OK владельца
 
-- [ ] **Шаг 1:** через сутки: `ssh dv@5.101.115.184 'pm2 logs file-agent --lines 20000 --nostream 2>/dev/null | grep -c "relay-auth: отказ был бы"'` → `0` (любая строка — пропущенный вызов; найти и починить до шага 2).
+- [ ] **Шаг 1:** через сутки — грепать файлы логов ЦЕЛИКОМ, а не последние N строк из `pm2 logs` (ротация `pm2-logrotate` может унести интересующий кусок за пределы `--lines`):
+  ```bash
+  ssh dv@5.101.115.184 "grep -c 'relay-auth: отказ был бы' ~/.pm2/logs/file-agent-out.log* 2>/dev/null | awk -F: '{s+=\$2} END{print s+0}'"
+  ```
+  → `0` (любая строка — пропущенный вызов; найти и починить до шага 2). Перед этим убедиться, что за окно наблюдения действительно прошли все виды вызовов релея, а не только обычный веб-чат: ход с прикреплённым файлом, автоблог (`blog-relay.client.ts`), проба качества (`agentReply`) и `clean-ask` (эфемерный вопрос). Если какого-то из них за сутки не было — вызвать вручную, иначе его путь к `relayAuthHeaders()` останется непроверенным.
 - [ ] **Шаг 2:** включить: `ssh dv@5.101.115.184 'printf "enforce\n" > ~/file-agent/relay-auth-mode'` (без рестарта; вступает в силу за ≤ 30 с).
 - [ ] **Шаг 3:** проверка через минуту: с прода без заголовка `ssh dvolkov@212.113.106.202 'curl -s -o /dev/null -w %{http_code} -X POST https://r.linkeon.io/chat'` → `401`; обычные ходы — в журнале nginx `POST /chat 200` с адресов прода и стенда; ход с файлом, автоблог, проба качества — без 401 в `pm2 logs`.
+- [ ] **Шаг 4 (постоянный мониторинг):** после включения `enforce` завести отдельную задачу — добавить проверку 401 от `r.linkeon.io/chat` (без заголовка, с адреса одного из бэков, как в Шаге 3) в постоянный мониторинг (synthetic-раннер/Prometheus — см. памяти `project_synthetic_runner_node3_manual`, `project_prometheus_alerts_undelivered`), чтобы тихий откат секрета на стороне релея или бэка не остался незамеченным между ручными проверками.
 - [ ] **Откат:** `printf "log\n" > ~/file-agent/relay-auth-mode` — мгновенно.
 
 ---
