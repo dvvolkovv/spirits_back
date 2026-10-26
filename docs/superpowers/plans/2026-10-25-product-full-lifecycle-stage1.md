@@ -8,7 +8,7 @@
 
 **Tech Stack:** NestJS 10 + PostgreSQL (бэк `spirits_back`), React 18 + Vite + vitest (фронт `spirits_front`), Telegram (grammy).
 
-**Спека:** `docs/superpowers/specs/2026-10-25-product-full-lifecycle-design.md`. Очередь 2 (смена ключей `rekey`, стирание `purge`, `OWNER_TG_ID`, каркас) — отдельным планом после этой.
+**Спека:** `docs/superpowers/specs/2026-10-25-product-full-lifecycle-design.md`. **Исполнено 25–26.10.2026 с отступлениями** — список в конце спеки, раздел «Отступления очереди 1»; где код задач ниже расходится с веткой, источник правды — код (в частности, кнопка мини-приложения ведёт на `/tma/?pa=<id>`, а не `#pa=`). Очередь 2 (смена ключей `rekey`, стирание `purge`, `OWNER_TG_ID`, каркас) — отдельным планом после этой.
 
 ---
 
