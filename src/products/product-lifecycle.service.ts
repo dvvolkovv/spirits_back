@@ -127,22 +127,40 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     if (!name) return { ok: false, reason: 'bad_name', message: `Имя продукта — от 1 до ${NAME_MAX} знаков` };
     const isAdmin = await this.isAdmin(i.userId);
     let lastError: any = null;
+    let created: { productId: string; slug: string } | null = null;
     for (const slug of siteSlugCandidates(name, this.suffix)) {
       try {
         const { productId } = await this.provisioning.create({ userId: i.userId, name, slug, kind: 'site', secrets: {}, isAdmin });
-        await this.setFirstPrompt(productId, i.prompt, i.channel);
-        const d = await this.pg.query(`SELECT domain FROM products WHERE id = $1`, [productId]);
-        await this.actions.record({ userId: i.userId, productId, kind: 'create_site', channel: i.channel, status: 'done', payload: { name, slug } });
-        return { ok: true, productId, slug, domain: d.rows[0]?.domain ?? null };
+        created = { productId, slug };
+        break;
       } catch (e: any) {
         lastError = e;
         if (e instanceof HttpException && e.getStatus() === 409) continue; // слаг занят — следующий кандидат
         break;
       }
     }
-    const f = failOf(lastError, 'Сайт не создан', this.logger);
-    await this.actions.record({ userId: i.userId, productId: null, kind: 'create_site', channel: i.channel, status: 'failed', payload: { name }, result: { reason: f.reason, error: f.message } });
-    return f;
+    if (!created) {
+      const f = failOf(lastError, 'Сайт не создан', this.logger);
+      await this.actions.record({ userId: i.userId, productId: null, kind: 'create_site', channel: i.channel, status: 'failed', payload: { name }, result: { reason: f.reason, error: f.message } });
+      return f;
+    }
+    // Сайт уже создан — он СУЩЕСТВУЕТ и работает, что бы ни случилось дальше.
+    // Раньше первая правка, чтение домена и запись в журнал жили внутри
+    // того же try, что и create(): обрыв любого из них ловился тем же catch,
+    // что занятый слаг, и превращал успех в failed. Человек видел отказ,
+    // пробовал тем же именем снова и заводил ВТОРОЙ сайт поверх первого.
+    // Приём тот же, что у completeCreateBot: продукт важнее хвостов, лог
+    // без секретов, итог всё равно ok (domain может остаться null).
+    let domain: string | null = null;
+    try {
+      await this.setFirstPrompt(created.productId, i.prompt, i.channel);
+      const d = await this.pg.query(`SELECT domain FROM products WHERE id = $1`, [created.productId]);
+      domain = d.rows[0]?.domain ?? null;
+      await this.actions.record({ userId: i.userId, productId: created.productId, kind: 'create_site', channel: i.channel, status: 'done', payload: { name, slug: created.slug } });
+    } catch (e: any) {
+      this.logger.warn(`сайт ${created.productId} создан, но первая правка/домен/журнал не доделаны: ${e?.stack ?? e?.message ?? e}`);
+    }
+    return { ok: true, productId: created.productId, slug: created.slug, domain };
   }
 
   async openCreateBot(i: { userId: string; name: unknown; prompt?: unknown; channel: ActionChannel; turn: string | null }):
