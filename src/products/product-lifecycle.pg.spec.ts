@@ -490,6 +490,32 @@ maybe('жизненный цикл продукта против живого Po
       expect(r).toMatchObject({ ok: true, status: 'sleeping', waking: true });
     });
 
+    // M1 (ревью): продукт удалили, когда он УЖЕ спал за неуплату —
+    // sleep_reason лежит с прошлого раза. Баланс на возврате хватает, и
+    // CASE (ветка «THEN NULL») обязан снять старую причину, а не оставить
+    // её лежать до фактического пробуждения — иначе владелец видел бы
+    // «Не хватило токенов» на продукте, которому хватает.
+    it('был спящим за неуплату до удаления, баланс хватает на возврате — старая sleep_reason снимается', async () => {
+      const userId = 'u-restore2d';
+      const productId = await insertProduct({
+        userId, status: 'archived', slug: 'restore-2d',
+        archivedAt: new Date(), purgeAfter: new Date(Date.now() + 10 * 86_400_000),
+        paidUntil: new Date(Date.now() - 86_400_000),
+        sleepReason: SLEEP_REASON_NO_TOKENS,
+      });
+      await pool.query(
+        `INSERT INTO ai_profiles_consolidated (user_id, tokens) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET tokens = EXCLUDED.tokens`,
+        [userId, RENT_TOKENS],
+      );
+
+      const r = await svc.restore({ userId, productId, channel: 'web' });
+      expect(r).toMatchObject({ ok: true, status: 'sleeping', waking: true });
+
+      const row = (await pool.query('SELECT sleep_reason FROM products WHERE id = $1', [productId])).rows[0];
+      expect(row.sleep_reason).toBeNull();
+    });
+
     /**
      * Опрос pg_stat_activity вместо фиксированного sleep — тот же приём, что
      * waitForLockWaiters в provisioning.integration.spec.ts: ждём, пока
