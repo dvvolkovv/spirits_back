@@ -3985,12 +3985,29 @@ maybe('обход стирания и резервные копии против
     expect(await svc.queuePurges()).toBe(0);
   });
 
-  it('после трёх провалов подряд стирание не ставится', async () => {
+  it('после трёх провалов подряд стирание не ставится; снятые до выдачи провалом не считаются', async () => {
     const p = await deleted({ purgeAfterMs: -60_000 });
     for (let i = 0; i < 3; i++) {
       await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'purge', 'failed')`, [p.id]);
     }
+    expect(await svc.queuePurges()).toBe(1);
+    await pool.query(`UPDATE product_provision_jobs SET status = 'failed', started_at = now() WHERE product_id = $1`, [p.id]);
     expect(await svc.queuePurges()).toBe(0);
+  });
+
+  it('после срока возврата ключи и первая правка стираются на сервере сразу — до машины', async () => {
+    const due = await deleted({ purgeAfterMs: -60_000 });
+    const early = await deleted({ purgeAfterMs: 86_400_000 });
+    await pool.query(
+      `UPDATE products SET secrets_encrypted = '\\x01'::bytea, first_prompt = 'п', first_prompt_channel = 'web' WHERE id = ANY($1::uuid[])`,
+      [[due.id, early.id]],
+    );
+    expect(await svc.wipeExpired()).toBe(1);
+    const rows = await pool.query(`SELECT id, secrets_encrypted, first_prompt, purged_at FROM products WHERE id = ANY($1::uuid[])`, [[due.id, early.id]]);
+    const byId = Object.fromEntries(rows.rows.map((r: any) => [r.id, r]));
+    expect(byId[due.id]).toMatchObject({ secrets_encrypted: null, first_prompt: null, purged_at: null });
+    expect(byId[early.id].secrets_encrypted).not.toBeNull();
+    expect(byId[early.id].first_prompt).toBe('п');
   });
 
   it('сон удалённых не снимает стоящее в очереди стирание', async () => {
@@ -4135,6 +4152,11 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
 
   async tick(): Promise<void> {
     try {
+      await this.wipeExpired();
+    } catch (e: any) {
+      this.logger.error(`стирание ключей после срока: ${e?.message}`);
+    }
+    try {
       await this.queuePurges();
     } catch (e: any) {
       this.logger.error(`обход стирания: ${e?.message}`);
@@ -4146,12 +4168,30 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * Ключи и первая правка удалённого не переживают срок возврата — даже
+   * если стирание на машине упрётся в потолок провалов или машина лежит
+   * (отступление 16 плана). Вернуть такой продукт уже нельзя (restore требует
+   * purge_after > now()), так что ключи больше не нужны никому. Пометку
+   * «стёрт» по-прежнему ставит только отчёт агента.
+   */
+  async wipeExpired(): Promise<number> {
+    const r = await this.pg.query(
+      `UPDATE products SET secrets_encrypted = NULL, first_prompt = NULL, first_prompt_channel = NULL
+        WHERE archived_at IS NOT NULL AND purge_after IS NOT NULL AND purge_after <= now()
+          AND (secrets_encrypted IS NOT NULL OR first_prompt IS NOT NULL)
+       RETURNING id`,
+    );
+    return r.rows.length;
+  }
+
   async queuePurges(): Promise<number> {
     const capped = await this.pg.query(
       `SELECT p.id, p.slug FROM products p
         WHERE p.archived_at IS NOT NULL AND p.purged_at IS NULL AND p.purge_after <= now()
           AND (SELECT count(*) FROM product_provision_jobs j
-                WHERE j.product_id = p.id AND j.kind = 'purge' AND j.status = 'failed') >= $1`,
+                WHERE j.product_id = p.id AND j.kind = 'purge' AND j.status = 'failed'
+                  AND j.started_at IS NOT NULL) >= $1`,
       [PURGE_FAIL_CAP],
     );
     for (const row of capped.rows) {
@@ -4170,7 +4210,11 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
           AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
                            WHERE j.product_id = p.id AND j.status IN ('queued','running'))
           AND (SELECT count(*) FROM product_provision_jobs j
-                WHERE j.product_id = p.id AND j.kind = 'purge' AND j.status = 'failed') < $1
+                WHERE j.product_id = p.id AND j.kind = 'purge' AND j.status = 'failed'
+                  -- Считаются только задания, которые агент забрал: снятые
+                  -- до выдачи (возврат, сборщик при лежащем агенте) — не
+                  -- провал стирания.
+                  AND j.started_at IS NOT NULL) < $1
           FOR UPDATE OF p
        ON CONFLICT DO NOTHING
        RETURNING product_id`,
@@ -4242,6 +4286,57 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
 git -C $B add src/products && git -C $B commit -q -m "products: почасовой обход стирания удалённых; стирание резервных копий по строгому пути" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
 Run (нода, бэк): `src/products/product-purge.service.spec.ts src/products/product-purge.pg.spec.ts src/products/product-lifecycle.pg.spec.ts src/products/product-lifecycle.service.spec.ts`. Expected: PASS. Затем tsc бэка.
+
+---
+
+### Task 14b: Обновление образа не трогает продукт с активным заданием машины
+
+**Files:**
+- Modify: `scripts/product-image-roll.sh:550-554` (запрос `CATALOG`, поле 5 «занят»), `:565-571` (`active_turns`)
+
+Обновление образа (PHASE 4 deploy.sh) переименовывает контейнер в `<имя>__pre_…`, `rekey` — в `<имя>__rekey`; оба берут настройки с живого контейнера. Пересекись они на одном продукте — один из двух пересоздал бы контейнер из-под другого, и откат вернул бы не тот. Скрипт уже пропускает продукт с живой правкой («занят» = ходы `queued/running`); правка добавляет к счётчику задания машины в `queued/running` — `rekey` среди них. Отдельных тестов у скрипта нет (он проверяется подставной машиной и сухим прогоном), поэтому проверка — синтаксис и сам запрос против одноразовой базы.
+
+- [ ] **Step 1: Правка**
+
+В `scripts/product-image-roll.sh`, в запросе `CATALOG` (~550):
+
+```bash
+       (SELECT count(*) FROM product_turns t
+         WHERE t.product_id = p.id AND t.status IN ('queued','running'))
+  FROM products p
+```
+заменить на
+
+```bash
+       (SELECT count(*) FROM product_turns t
+         WHERE t.product_id = p.id AND t.status IN ('queued','running'))
+       + (SELECT count(*) FROM product_provision_jobs j
+           WHERE j.product_id = p.id AND j.status IN ('queued','running'))
+  FROM products p
+```
+и в `active_turns` (~567) так же: после строки `WHERE t.product_id = p.id AND t.status IN ('queued','running'))` — строку `+ (SELECT count(*) FROM product_provision_jobs j WHERE j.product_id = p.id AND j.status IN ('queued','running'))` (внутри того же `SELECT (…)`, перед `FROM products p WHERE p.slug = …`). Над `CATALOG` в комментарий дописать: «"занят" — правка ИЛИ задание машины (rekey, сон, домен): пересоздание контейнера из-под задания агента — та же гонка, что из-под правки (очередь 2, смена ключей)». Сообщения «активных ходов N» не меняются — в них теперь сумма, и это сказано в комментарии.
+
+- [ ] **Step 2: Проверка синтаксиса и запроса** — коммит, пуш, затем на ноде:
+
+```bash
+git -C $B add scripts/product-image-roll.sh && git -C $B commit -q -m "product-image-roll: продукт с активным заданием машины (rekey) не пересоздаётся" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git -C $B push -q origin HEAD:refs/heads/feat/product-lifecycle-2
+SHA=$(git -C $B rev-parse HEAD)
+ssh dv@85.192.61.231 "cd ~/ci/wt/pl2-back && git fetch -q origin && git checkout -q --detach $SHA && bash -n scripts/product-image-roll.sh && echo syntax-ok && psql -h /var/run/postgresql -d pl2_test -v ON_ERROR_STOP=1 -tA <<'SQL'
+BEGIN;
+INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash)
+VALUES ('00000000-0000-4000-8000-0000000014b0', 'u-roll', 'R', 'roll-busy', 'bot', 'running', '/product', 'h-roll-busy');
+INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ('00000000-0000-4000-8000-0000000014b0', 'rekey', 'queued');
+SELECT p.slug,
+       (SELECT count(*) FROM product_turns t
+         WHERE t.product_id = p.id AND t.status IN ('queued','running'))
+       + (SELECT count(*) FROM product_provision_jobs j
+           WHERE j.product_id = p.id AND j.status IN ('queued','running'))
+  FROM products p WHERE p.slug = 'roll-busy';
+ROLLBACK;
+SQL"
+```
+Expected: `syntax-ok` и строка `roll-busy|1` (без правки было бы `0` — продукт пересоздался бы под стоящим `rekey`). Запрос в heredoc — дословно выражение из правки; разошлись — сверить.
 
 ---
 
