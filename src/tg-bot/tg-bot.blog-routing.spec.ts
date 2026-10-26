@@ -55,6 +55,7 @@ describe('роутинг блога в живом обработчике', () =>
   beforeEach(() => {
     jest.resetAllMocks();
     pg.query.mockResolvedValue({ rows: [] });
+    grammy.answerCallbackQuery.mockResolvedValue({});
     (svc as any).handleChatMessage = jest.fn();
     // «команда реплаем остаётся командой» подменяет handleDmCommand на
     // экземпляре — снимаем подмену, каждый тест видит метод с прототипа.
