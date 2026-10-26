@@ -4,10 +4,16 @@ import { pipeline } from 'node:stream/promises';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import type { MinioConfig } from '../config';
 
-/** Файлы заданий: снимки съёмки, видео и обложка (ключи — в jobs.ts). */
+/** Файлы заданий: снимки съёмки, кадры и клипы сценок, видео и обложка (ключи — в jobs.ts). */
 export interface Storage {
   put(key: string, file: string, contentType: string): Promise<void>;
   get(key: string, dest: string): Promise<void>;
+  /**
+   * Файл, которого может и не быть (кадр, клип прошлых попыток). false — ключа
+   * нет; сетевой сбой — ошибка: принять его за «нет» значило бы заплатить за
+   * клип второй раз.
+   */
+  getIfExists(key: string, dest: string): Promise<boolean>;
 }
 
 /**
@@ -31,6 +37,17 @@ export function s3Storage(cfg: MinioConfig, client?: { send(cmd: any): Promise<a
     async get(key, dest) {
       const res = await s3.send(new GetObjectCommand({ Bucket: cfg.bucket, Key: key }));
       await pipeline(res.Body as Readable, fs.createWriteStream(dest));
+    },
+    async getIfExists(key, dest) {
+      let res: any;
+      try {
+        res = await s3.send(new GetObjectCommand({ Bucket: cfg.bucket, Key: key }));
+      } catch (e: any) {
+        if (e?.name === 'NoSuchKey' || e?.$metadata?.httpStatusCode === 404) return false;
+        throw e;
+      }
+      await pipeline(res.Body as Readable, fs.createWriteStream(dest));
+      return true;
     },
   };
 }

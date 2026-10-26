@@ -11,6 +11,7 @@ studio/scripts/node-run.sh "npm test"            # юнит-тесты
 studio/scripts/node-run.sh "npm run test:render" # сквозной рендер фикстуры, без сети
 studio/scripts/node-run.sh "npm run capture -- scenes/<сцена>.json [--probe]"
 studio/scripts/node-run.sh "npm run render -- out/<папка-съёмки>"
+studio/scripts/node-run.sh "MAX_OMNI_SECONDS=16 npm run animate -- out/<папка-ролика>"  # сценки, платно
 ```
 
 `node-run.sh` пушит ветку и ставит `~/ci/wt/promo-shorts` на точный коммит.
@@ -30,6 +31,13 @@ studio/scripts/node-run.sh "npm run render -- out/<папка-съёмки>"
    озвучки (30–60 с), Remotion → `video.mp4` и `cover.jpg`, затем проверка
    длины, кадра и тишины по всей длине.
 
+Ролик со сценками (`docs/superpowers/specs/2026-10-26-shorts-skits-design.md`)
+между сценарием и сборкой проходит `animate`: кадр-эталон каждой сценки (Nano
+Banana Pro), клип Omni на 8 с, сверка речи SpeechKit, громкость и время реплик →
+`animation.json`, `keyframes/`, `skits/`. Сборка — композиция `SkitShort`,
+ролик 25–45 с. Это деньги Google: клип ≈ $0,8, кадр ≈ $0,13, предел — секунд
+Omni на ролик (`MAX_OMNI_SECONDS`, в конвейере — настройка админки).
+
 Лицензия Remotion — бесплатная, пока в компании не больше трёх человек
 (remotion.pro/license).
 
@@ -37,7 +45,8 @@ studio/scripts/node-run.sh "npm run render -- out/<папка-съёмки>"
 
 Ролики заказывает и ведёт API (`src/shorts/`): режиссёр пишет сцену, сценарист —
 сценарий, бот присылает готовый ролик владельцу. Студия — рабочий процесс,
-который забирает из `short_video` задания `capture` и `render`:
+который забирает из `short_video` задания `capture`, `animate` (ролики со
+сценками) и `render`:
 
 ```bash
 studio/scripts/node-run.sh "npm run worker -- --once"   # одно задание и выход
@@ -51,7 +60,12 @@ studio/scripts/node-run.sh "npm run worker -- --once"   # одно задани�
   озвучка вне 30–60 с — сценарий назад сценаристу; остальное — `failed`, и API
   пишет владельцу.
 - Файлы — в MinIO, бакет `MINIO_BUCKET_VIDEOS`:
-  `shorts/<id>/capture-<попытка>/{question,answer}.png`, `shorts/<id>/{video.mp4,cover.jpg}`.
+  `shorts/<id>/capture-<попытка>/{question,answer}.png`, `shorts/<id>/{video.mp4,cover.jpg}`,
+  у сценок — `shorts/<id>/keyframes/<отпечаток кадра>.jpg` и `shorts/<id>/skits/<отпечаток клипа>/{raw,clip}.mp4`.
+- Оживление по ходу пишет в базу `animation` (резерв секунд Omni, id запущенной
+  генерации) и кладёт кадры и клипы в MinIO: упавший процесс не стоит новой
+  оплаты, следующий захват дождётся запущенной генерации. Рабочему процессу
+  нужен `GOOGLE_AI_API_KEY` — без него он не стартует.
 - Рабочие папки — `out/jobs/<id>/`, старше недели удаляются при старте.
 
 Окружение рабочего процесса — `DATABASE_URL` и `MINIO_*` той же среды, что API

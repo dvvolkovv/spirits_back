@@ -1,12 +1,12 @@
 import { WRITER_FEEDBACK_CODES, type StudioError, type StudioErrorCode } from '../errors';
-import type { CaptureResult, Scene, Script } from '../types';
+import type { CaptureResult, Scene, Script, ShortAnimation } from '../types';
 
 /** То, что нужно от pg.Pool, — чтобы в тестах рабочего процесса его можно было заменить. */
 export interface Queryable {
   query(sql: string, params?: unknown[]): Promise<{ rows: any[]; rowCount: number | null }>;
 }
 
-export type JobKind = 'capture' | 'render';
+export type JobKind = 'capture' | 'animate' | 'render';
 
 interface QueueSpec {
   queued: string;
@@ -18,6 +18,7 @@ interface QueueSpec {
 /** Очереди студии в short_video. Статусы и колонки — контракт с src/shorts/shorts.types.ts бэкенда. */
 export const QUEUES: Record<JobKind, QueueSpec> = {
   capture: { queued: 'capture_queued', running: 'capturing', label: 'съёмка' },
+  animate: { queued: 'animate_queued', running: 'animating', label: 'оживление' },
   render: { queued: 'render_queued', running: 'rendering', label: 'сборка' },
 };
 
@@ -52,6 +53,8 @@ export interface Job {
   scene: Scene | null;
   capture: StoredCapture | null;
   script: Script | null;
+  /** Итог оживления: счёт секунд Omni, кадры, сценки, запущенные генерации. Пути — относительно shorts/<id>/ в MinIO. */
+  animation: ShortAnimation | null;
 }
 
 export interface RenderOutput {
@@ -77,8 +80,13 @@ export interface Queue {
   completeCapture(job: Job, capture: StoredCapture): Promise<boolean>;
   /** @returns false — итог не записан: задание уже не за этим захватом */
   completeRender(job: Job, out: RenderOutput): Promise<boolean>;
+  /** @returns false — итог не записан: задание уже не за этим захватом */
+  completeAnimate(job: Job, animation: ShortAnimation): Promise<boolean>;
+  /** Промежуточное сохранение оживления. @returns false — задание уже не за этим захватом */
+  saveAnimation(job: Job, animation: ShortAnimation): Promise<boolean>;
   fail(job: Job, err: StudioError): Promise<FailOutcome>;
   minAnswerChars(): Promise<number>;
+  maxOmniSeconds(): Promise<number>;
 }
 
 /**
@@ -112,7 +120,7 @@ export async function claimJob(db: Queryable, kind: JobKind): Promise<Job | null
          ORDER BY slot_at NULLS LAST, created_at
          LIMIT 1
          FOR UPDATE SKIP LOCKED)
-      RETURNING id, attempts, writer_rounds, scene, capture, script`,
+      RETURNING id, attempts, writer_rounds, scene, capture, script, animation`,
     [q.queued, q.running, LEASE_MINUTES, MAX_JOB_ATTEMPTS],
   );
   const row = r.rows[0];
@@ -125,6 +133,7 @@ export async function claimJob(db: Queryable, kind: JobKind): Promise<Job | null
     scene: row.scene ?? null,
     capture: row.capture ?? null,
     script: row.script ?? null,
+    animation: row.animation ?? null,
   };
 }
 
@@ -157,6 +166,35 @@ export async function completeRender(db: Queryable, job: Job, out: RenderOutput)
             review_message_id = NULL, attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
       WHERE id = $1 AND status = 'rendering' AND attempts = $5`,
     [job.id, out.videoKey, out.coverKey, out.durationMs, job.attempts],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/**
+ * Сценки ожили — render_queued: сборка возьмёт клипы по animation.
+ * @returns false — итог не записан: задание уже не за этим захватом
+ */
+export async function completeAnimate(db: Queryable, job: Job, animation: ShortAnimation): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE short_video
+        SET status = 'render_queued', animation = $2::jsonb, attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
+      WHERE id = $1 AND status = 'animating' AND attempts = $3`,
+    [job.id, JSON.stringify(animation), job.attempts],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/**
+ * Оживление по ходу: резерв секунд Omni, id запущенной генерации, готовые сценки.
+ * Падение процесса посреди задания иначе стоило бы новой оплаты: следующий захват
+ * не знал бы, что генерация уже запущена. Пишется тем же захватом, что и итог.
+ * @returns false — задание уже не за этим захватом: продолжать нельзя
+ */
+export async function saveAnimation(db: Queryable, job: Job, animation: ShortAnimation): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE short_video SET animation = $2::jsonb, updated_at = now()
+      WHERE id = $1 AND status = 'animating' AND attempts = $3`,
+    [job.id, JSON.stringify(animation), job.attempts],
   );
   return (r.rowCount ?? 0) > 0;
 }
@@ -246,12 +284,21 @@ export async function minAnswerChars(db: Queryable): Promise<number> {
   return Number(r.rows[0]?.min_answer_chars ?? 400);
 }
 
+/** Предел секунд Omni на ролик — из настроек админки (спека сценок, «Отказы»). */
+export async function maxOmniSeconds(db: Queryable): Promise<number> {
+  const r = await db.query('SELECT max_omni_seconds FROM short_settings WHERE id = 1');
+  return Number(r.rows[0]?.max_omni_seconds ?? 48);
+}
+
 export function pgQueue(db: Queryable): Queue {
   return {
     claim: (kind) => claimJob(db, kind),
     completeCapture: (job, capture) => completeCapture(db, job, capture),
     completeRender: (job, out) => completeRender(db, job, out),
+    completeAnimate: (job, animation) => completeAnimate(db, job, animation),
+    saveAnimation: (job, animation) => saveAnimation(db, job, animation),
     fail: (job, err) => failJob(db, job, err),
     minAnswerChars: () => minAnswerChars(db),
+    maxOmniSeconds: () => maxOmniSeconds(db),
   };
 }
