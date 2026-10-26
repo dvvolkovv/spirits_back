@@ -5501,6 +5501,9 @@ const WORKING_POLL_MAX_ATTEMPTS_KEYS = 60;
     const raw = typeof v.result?.error === 'string' ? v.result.error : null;
     const reason = typeof v.result?.reason === 'string' ? v.result.reason : null;
     if (v.kind !== 'keys' || !reason) return raw;
+    // 'failed' — общий отказ сервера (обрыв между claim и исходом): свой
+    // общий текст уже есть.
+    if (reason === 'failed') return t('products.action.failedGeneric');
     const key = `products.action.keys.errors.${reason}`;
     const text = t(key, { field: typeof v.result?.field === 'string' ? v.result.field : '' });
     return text && text !== key ? text : raw;
