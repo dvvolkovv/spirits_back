@@ -31,6 +31,33 @@ describe('OWNER_TG_ID — лучшим усилием', () => {
     // СПРОСИТЬ — и пережить отказ.
     expect(pg.query.mock.calls.some(([sql]) => String(sql).includes('tg_user_identities'))).toBe(true);
   });
+
+  it('rekey: отказ чтения привязки — поля нет вовсе, не пустая строка', async () => {
+    // Решение контроллера по ревью задачи 9: пустую строку (снять переменную)
+    // сервер не шлёт ни при отказе чтения, ни при «привязки нет» — отвязка в
+    // кабинете строку tg_user_identities не удаляет, и пустая строка почти
+    // всегда означала бы «владелец её вовсе не заводил», рискуя снести
+    // OWNER_TG_ID, поставленный руками у продукта до очереди 2.
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        if (sql.includes("SET status = 'running'")) {
+          return {
+            rows: [{
+              job_id: 'j', job_kind: 'rekey', product_id: 'p', user_id: 'u', slug: 's', name: 'Б',
+              kind: 'bot', port: null, box: null, rekey_box: null, rekey_payload: {}, token_issued: false,
+              custom_names: [], vhost_mode: 'proxy',
+            }],
+          };
+        }
+        if (sql.includes('tg_user_identities')) throw new Error('relation "tg_user_identities" does not exist');
+        return { rows: [] };
+      }),
+    };
+    const svc = new ProvisioningService(pg as any, secretsOf(), {} as any, {} as any, {} as any);
+    const job = await svc.claimJob('clients');
+    expect(job).toMatchObject({ jobId: 'j', jobKind: 'rekey' });
+    expect(job).not.toHaveProperty('ownerTgId');
+  });
 });
 
 const PG = process.env.PROVISIONING_PG_URL;
@@ -53,11 +80,16 @@ maybe('выдача rekey и purge против живого Postgres', () => {
     return id;
   }
 
-  async function rekeyJob(productId: string, set: Record<string, string> | null, payload: any = {}) {
+  async function rekeyJob(
+    productId: string,
+    set: Record<string, string> | null,
+    payload: any = {},
+    actionStatus: string = 'working',
+  ) {
     const a = await pool.query(
       `INSERT INTO product_actions (user_id, product_id, kind, status, channel, payload, secrets_box)
-       VALUES ('u1', $1, 'keys', 'working', 'web', $2::jsonb, $3) RETURNING id`,
-      [productId, JSON.stringify(payload), set ? secrets.encrypt(set, productId) : null],
+       VALUES ('u1', $1, 'keys', $4, 'web', $2::jsonb, $3) RETURNING id`,
+      [productId, JSON.stringify(payload), set ? secrets.encrypt(set, productId) : null, actionStatus],
     );
     await pool.query(
       `INSERT INTO product_provision_jobs (product_id, kind, status, action_id) VALUES ($1, 'rekey', 'queued', $2)`,
@@ -87,6 +119,11 @@ maybe('выдача rekey и purge против живого Postgres', () => {
   });
   afterAll(async () => {
     await pool.query('TRUNCATE products, product_provision_jobs, product_turns, product_actions, product_host_agent, product_hosts RESTART IDENTITY CASCADE');
+    // Своя таблица (чужого модуля, см. beforeAll) — чистим и её, а не только
+    // то, что завела 001_products.sql: иначе сюда утекают строки, оставленные
+    // этим файлом, на следующий прогон или на соседний спек-файл, который
+    // тоже создаёт tg_user_identities IF NOT EXISTS и доверяет ей пустоту.
+    await pool.query('TRUNCATE tg_user_identities CASCADE');
     await pool.end();
   });
 
@@ -104,10 +141,10 @@ maybe('выдача rekey и purge против живого Postgres', () => {
     expect(await svc.claimJob('clients')).toBeNull();
   });
 
-  it('rekey ждёт конца правки', async () => {
+  it.each(['queued', 'running'])('rekey ждёт конца правки (ход в %s)', async (turnStatus) => {
     const p = await product({ status: 'running' });
     await rekeyJob(p, { BOT_TOKEN: '123456:TEST-new' });
-    await pool.query(`INSERT INTO product_turns (product_id, user_id, channel, prompt, status) VALUES ($1, 'u1', 'web', 'п', 'running')`, [p]);
+    await pool.query(`INSERT INTO product_turns (product_id, user_id, channel, prompt, status) VALUES ($1, 'u1', 'web', 'п', $2)`, [p, turnStatus]);
     expect(await svc.claimJob('clients')).toBeNull();
     await pool.query(`UPDATE product_turns SET status = 'done' WHERE product_id = $1`, [p]);
     expect(await svc.claimJob('clients')).toMatchObject({ jobKind: 'rekey' });
@@ -116,6 +153,18 @@ maybe('выдача rekey и purge против живого Postgres', () => {
   it.each(['sleeping', 'blocked', 'provisioning', 'failed'])('rekey продукту в %s не выдаётся', async (status) => {
     const p = await product({ status });
     await rekeyJob(p, { BOT_TOKEN: '123456:TEST-new' });
+    expect(await svc.claimJob('clients')).toBeNull();
+  });
+
+  it('rekey работающему в degraded выдаётся — та же ветка, что у running', async () => {
+    const p = await product({ status: 'degraded' });
+    await rekeyJob(p, { BOT_TOKEN: '123456:TEST-new' });
+    expect(await svc.claimJob('clients')).toMatchObject({ productId: p, jobKind: 'rekey' });
+  });
+
+  it.each(['pending', 'done', 'expired', 'cancelled'])('карточка не working (%s) — rekey не выдаётся', async (actionStatus) => {
+    const p = await product({ status: 'running' });
+    await rekeyJob(p, { BOT_TOKEN: '123456:TEST-new' }, {}, actionStatus);
     expect(await svc.claimJob('clients')).toBeNull();
   });
 
@@ -142,11 +191,20 @@ maybe('выдача rekey и purge против живого Postgres', () => {
     await pool.query(`INSERT INTO product_provision_jobs (product_id, status) VALUES ($1, 'queued')`, [site]);
     expect(await svc.claimJob('clients')).not.toHaveProperty('ownerTgId');
 
-    // Смена ключей у владельца без привязки — ПУСТАЯ строка: агент снимет
-    // устаревший OWNER_TG_ID (владелец отвязал Telegram), а не оставит его.
+    // Заведение бота БЕЗ привязки — поля нет вовсе (не пустая строка): у
+    // заведения OWNER_TG_ID и так не бывает установлен, снимать нечего.
+    const botNoLink = await product({ status: 'provisioning', userId: 'u2' });
+    await pool.query(`INSERT INTO product_provision_jobs (product_id, status) VALUES ($1, 'queued')`, [botNoLink]);
+    expect(await svc.claimJob('clients')).not.toHaveProperty('ownerTgId');
+
+    // Смена ключей у владельца без привязки — поля ТОЖЕ нет вовсе (решение
+    // контроллера по ревью задачи 9, не пустая строка): отвязка в кабинете не
+    // чистит tg_user_identities, и «привязки нет» почти всегда значит
+    // «владелец её вовсе не заводил» — пустая строка рисковала бы снести
+    // OWNER_TG_ID, поставленный руками у продукта до очереди 2.
     const other = await product({ status: 'running', userId: 'u2' });
     await rekeyJob(other, { BOT_TOKEN: '123456:TEST-new' });
-    expect(await svc.claimJob('clients')).toMatchObject({ jobKind: 'rekey', ownerTgId: '' });
+    expect(await svc.claimJob('clients')).not.toHaveProperty('ownerTgId');
 
     const mine = await product({ status: 'running' });
     await rekeyJob(mine, { BOT_TOKEN: '123456:TEST-new' });
