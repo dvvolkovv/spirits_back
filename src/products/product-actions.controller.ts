@@ -1,7 +1,8 @@
-import { BadRequestException, Body, Controller, Get, HttpCode, NotFoundException, NotImplementedException, Param, Post, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, Get, HttpCode, NotFoundException, NotImplementedException, Param, Post, UseGuards } from '@nestjs/common';
 import { IsBoolean, IsIn, IsObject, IsOptional } from 'class-validator';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
+import { IpRateLimiter } from '../common/guards/ip-rate-limit';
 import { ProductActionsService, toView } from './product-actions.service';
 import { ProductLifecycleService } from './product-lifecycle.service';
 
@@ -24,6 +25,7 @@ export class ProductActionsController {
   constructor(
     private readonly actions: ProductActionsService,
     private readonly lifecycle: ProductLifecycleService,
+    private readonly limiter: IpRateLimiter,
   ) {}
 
   @Get('product-actions')
@@ -41,6 +43,13 @@ export class ProductActionsController {
   @Post('product-actions/:id')
   @HttpCode(200)
   async submit(@CurrentUser() user: any, @Param('id') id: string, @Body() body: SubmitActionDto) {
+    // Первым делом, раньше похода в базу за карточкой: каждое нажатие бота
+    // создания зовёт getMe в Telegram с нашего IP, а неверный токен
+    // возвращает карточку в pending — без лимита цикл «нажал — ошибка —
+    // нажал снова» неограничен. Ключ — userId, а не IP запроса: карточка
+    // принадлежит человеку, а не адресу (мобильный интернет и NAT отдают
+    // один IP тысячам людей — лимит по IP наказал бы соседей по сети).
+    await this.limiter.check(user.userId, 'product-action-submit', 20, 600);
     const row = await this.actions.get(user.userId, id);
     if (!row) throw new NotFoundException('Action not found');
     const via = body?.via ?? 'cabinet';
@@ -49,8 +58,14 @@ export class ProductActionsController {
       await this.lifecycle.completeDelete({ userId: user.userId, actionId: id, via });
     } else if (row.kind === 'create_bot') {
       await this.lifecycle.completeCreateBot({ userId: user.userId, actionId: id, set: body?.set ?? {}, via });
-    } else {
+    } else if (row.kind === 'keys') {
       throw new NotImplementedException('Это действие появится позже');
+    } else {
+      // create_site, restore, revert, purge — журнальные записи итога, не
+      // ожидающие карточки (см. CardKind в product-actions.service):
+      // actions.get их отдаёт (чужого от своего не отличить иначе),
+      // подтверждать в них нечего — заведение/возврат/откат уже случились.
+      throw new ConflictException('Это не карточка — подтверждать нечего');
     }
     return toView((await this.actions.get(user.userId, id))!);
   }

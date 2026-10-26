@@ -13,6 +13,7 @@ import { RouteParamtypes } from '@nestjs/common/enums/route-paramtypes.enum';
 import { ProductsController } from './products.controller';
 import { RunnerController } from './runner.controller';
 import { HostController } from './host.controller';
+import { ProductActionsController, SubmitActionDto } from './product-actions.controller';
 import { ProductsModule } from './products.module';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
@@ -285,6 +286,25 @@ describe('адреса маршрутов', () => {
     expect(endpointOf(RunnerController, 'poll')).toBe('POST /webhook/products/runner/poll');
     expect(endpointOf(ProductsController, 'chat')).toBe('POST /webhook/products/:id/chat');
     expect(endpointOf(ProductsController, 'list')).toBe('GET /webhook/products');
+  });
+
+  it('ручки карточки стоят по своим адресам (задача 10)', () => {
+    // Карточка — отдельный контроллер со своим пустым @Controller(''), а не
+    // метод ProductsController: адрес сторожится литералом по той же причине,
+    // что у соседей выше — его зовут кабинет, чат и мини-приложение.
+    expect(endpointOf(ProductActionsController, 'pending')).toBe('GET /webhook/product-actions');
+    expect(endpointOf(ProductActionsController, 'get')).toBe('GET /webhook/product-actions/:id');
+    expect(endpointOf(ProductActionsController, 'submit')).toBe('POST /webhook/product-actions/:id');
+    expect(endpointOf(ProductActionsController, 'cancel')).toBe('POST /webhook/product-actions/:id/cancel');
+  });
+
+  it('submit карточки проверяется ValidationPipe: тело — SubmitActionDto, а не голый Object', () => {
+    // SubmitActionDto несёт set — объект с секретами (токен бота и т. п.).
+    // Снятый @Body() body: SubmitActionDto даёт здесь Object, труба на нём
+    // не проверяет ничего (см. toValidate внутри ValidationPipe), и тело
+    // уезжает в completeCreateBot как пришло — мимо @IsIn/@IsObject выше.
+    const types = Reflect.getMetadata('design:paramtypes', ProductActionsController.prototype, 'submit') ?? [];
+    expect(types).toContain(SubmitActionDto);
   });
 
   it('каждый :плейсхолдер пути спрашивается @Param-ом с тем же именем', () => {
