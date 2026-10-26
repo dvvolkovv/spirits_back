@@ -418,6 +418,14 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
           AND (SELECT count(*) FROM product_provision_jobs j
                 WHERE j.product_id = p.id AND j.kind = 'sleep' AND j.status = 'failed'
                   AND j.created_at >= p.archived_at) < 3
+          -- FOR UPDATE OF p — М2: восстанавливающая транзакция (restore())
+          -- держит эту же строку заблокированной с SELECT … FOR UPDATE до
+          -- своего COMMIT. Без локатора здесь этот SELECT читал бы снимок
+          -- ДО возврата (archived_at ещё не NULL) и всё равно вставил бы
+          -- сон — лок дожидается конца чужой транзакции и ПЕРЕЧИТЫВАЕТ
+          -- строку (EvalPlanQual), так что к этому моменту archived_at уже
+          -- NULL, и WHERE выше её не пропускает.
+          FOR UPDATE OF p
        ON CONFLICT DO NOTHING
        RETURNING product_id`,
       [productId ?? null],
