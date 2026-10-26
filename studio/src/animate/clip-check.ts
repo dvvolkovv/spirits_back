@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { ProbeInfo, Silence } from '../ffprobe';
+import { SKIT_MAX_SILENCE_SEC, type ProbeInfo, type Silence } from '../ffprobe';
 import { CLIP_SEC } from './google';
 
 /**
@@ -15,7 +15,7 @@ const run = promisify(execFile);
  * перед голосом ассистента, и её поймала бы уже проверка готового ролика.
  * Стартовые значения; сверяются на ролике-образце.
  */
-export const CLIP_LIMITS = { minSec: CLIP_SEC - 1.5, maxSec: CLIP_SEC + 1.5, maxSilenceSec: 3, maxEdgeSilenceSec: 2.4 };
+export const CLIP_LIMITS = { minSec: CLIP_SEC - 1.5, maxSec: CLIP_SEC + 1.5, maxSilenceSec: SKIT_MAX_SILENCE_SEC, maxEdgeSilenceSec: 2.4 };
 
 /**
  * Громкость клипов, LUFS: голос SpeechKit в роликах плана 2 звучит на −19,5
@@ -25,8 +25,9 @@ export const CLIP_LIMITS = { minSec: CLIP_SEC - 1.5, maxSec: CLIP_SEC + 1.5, max
 export const CLIP_LUFS = -19;
 
 /**
- * Проблемы клипа; пустой список — клип годен. Тишина — из detectSilences с
- * порогами по умолчанию (−45 дБ, от 0,5 с), по уже выровненному клипу.
+ * Проблемы клипа; пустой список — клип годен. Длительность и тишина — из одного
+ * файла, уже выровненного по громкости (clip.mp4); тишина — detectSilences с
+ * порогами по умолчанию (−45 дБ, от 0,5 с).
  */
 export function checkClip(probe: ProbeInfo, silences: Silence[]): string[] {
   const problems: string[] = [];
@@ -47,15 +48,16 @@ export function checkClip(probe: ProbeInfo, silences: Silence[]): string[] {
 }
 
 /**
- * Громкость клипа — к CLIP_LUFS, видео не перекодируется. Запас тишины (apad)
- * уводит выдачу буфера loudnorm за конец клипа: без него метки времени звука
- * в последних секундах сдвигаются, и Remotion срезает конец. -shortest
- * обрезает звук по видео.
+ * Громкость клипа — к CLIP_LUFS, видео не перекодируется. Добивка тишиной
+ * (apad) уводит выдачу буфера loudnorm за конец клипа: без неё метки времени
+ * звука в последних секундах сдвигаются, и Remotion срезает конец. Добивка без
+ * предела, а -shortest обрезает звук по видео: короткий звук не укоротит клип,
+ * а хвост тишины поймает проверка края.
  */
 export async function normalizeLoudness(input: string, output: string, lufs = CLIP_LUFS): Promise<void> {
   await run('ffmpeg', [
     '-hide_banner', '-loglevel', 'error', '-y', '-i', input,
-    '-c:v', 'copy', '-af', `apad=pad_dur=3,loudnorm=I=${lufs}:TP=-1.5:LRA=11`, '-ar', '48000', '-c:a', 'aac', '-b:a', '192k',
+    '-c:v', 'copy', '-af', `apad,loudnorm=I=${lufs}:TP=-1.5:LRA=11`, '-ar', '48000', '-c:a', 'aac', '-b:a', '192k',
     '-shortest', output,
   ]);
 }

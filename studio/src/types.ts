@@ -115,6 +115,9 @@ export type ShortProps = {
 
 export type SkitKind = 'conflict' | 'punchline';
 
+/** Сценки по порядку в ролике: конфликт открывает ролик, развязка идёт после ответа. */
+export const SKIT_KINDS: readonly SkitKind[] = ['conflict', 'punchline'];
+
 export interface SkitLine {
   /** id героя труппы (src/shorts/short-troupe.ts бэкенда). */
   hero: string;
@@ -142,7 +145,7 @@ export interface SkitPlan {
   heroes: string[];
   keyframePrompt: string;
   videoPrompt: string;
-  /** Отпечаток кадра-эталона: кадр лежит в keyframes/<отпечаток>.png и с тем же отпечатком не перерисовывается. */
+  /** Отпечаток кадра-эталона: кадр лежит в keyframes/<отпечаток>.<jpg|png|webp> (расширение — по типу картинки) и с тем же отпечатком не перерисовывается. */
   keyframeFingerprint: string;
   /** Отпечаток клипа (включает отпечаток кадра): клип с тем же отпечатком не переснимается. */
   fingerprint: string;
@@ -158,7 +161,7 @@ export interface SkitCue {
 /** Готовая сценка. Пути — относительно папки ролика. */
 export interface SkitClip {
   fingerprint: string;
-  /** keyframes/<отпечаток кадра>.png */
+  /** keyframes/<отпечаток кадра>.<jpg|png|webp> — расширение по типу картинки. */
   keyframe: string;
   /** skits/<отпечаток клипа>/clip.mp4 — громкость уже выровнена. */
   clip: string;
@@ -166,7 +169,7 @@ export interface SkitClip {
   /** Что распознал SpeechKit в клипе. */
   heard: string;
   cues: SkitCue[];
-  /** Номер удачной попытки в последнем запуске animate; оплаченные клипы считает omniSeconds. */
+  /** Номер попытки, с которой принят клип, в запуске, где его сняли; переобработка из raw.mp4 его не меняет. Оплаченные клипы считает omniSeconds. */
   attempts: number;
   /** Настройки бесплатной обработки (громкость, пороги пауз): при их смене клип переобрабатывается из raw.mp4, без Omni. */
   post: string;
@@ -180,7 +183,11 @@ export interface SkitClip {
 export interface ShortAnimation {
   /** Секунды Omni, потраченные на ролик, со всеми попытками. */
   omniSeconds: number;
+  /** Нарисовано кадров-эталонов, со всеми попытками (≈ $0,13 за кадр). */
+  keyframes?: number;
   skits: Partial<Record<SkitKind, SkitClip>>;
+  /** Запущенные, но ещё не скачанные генерации Omni: следующий запуск дождётся их, а не заплатит снова. */
+  pending?: Partial<Record<SkitKind, { id: string; fingerprint: string }>>;
 }
 
 export interface SkitTimeline {

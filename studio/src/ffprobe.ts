@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { CLIP_LIMITS } from './animate/clip-check';
 import { FRAME } from './frame';
+import { SKIT_MAX_TOTAL_MS, SKIT_MIN_TOTAL_MS } from './timeline';
 
 const run = promisify(execFile);
 
@@ -10,6 +10,8 @@ export interface ProbeInfo {
   width: number;
   height: number;
   hasAudio: boolean;
+  /** Длина видеодорожки, если ffprobe её знает: звук AAC выходит длиннее видео на десятки мс. */
+  videoSec?: number;
 }
 
 export interface Silence {
@@ -21,14 +23,16 @@ export interface Silence {
 export function parseProbe(json: string): ProbeInfo {
   const data = JSON.parse(json) as {
     format?: { duration?: string };
-    streams?: Array<{ codec_type?: string; width?: number; height?: number }>;
+    streams?: Array<{ codec_type?: string; width?: number; height?: number; duration?: string }>;
   };
   const video = data.streams?.find((s) => s.codec_type === 'video');
+  const videoSec = Number(video?.duration);
   return {
     durationSec: Number(data.format?.duration ?? 0),
     width: video?.width ?? 0,
     height: video?.height ?? 0,
     hasAudio: Boolean(data.streams?.some((s) => s.codec_type === 'audio')),
+    ...(Number.isFinite(videoSec) && videoSec > 0 ? { videoSec } : {}),
   };
 }
 
@@ -63,10 +67,19 @@ export interface VerifyLimits {
 export const SHORT_LIMITS: VerifyLimits = { minSec: 30, maxSec: 60, width: FRAME.width, height: FRAME.height, maxSilenceSec: 2 };
 
 /**
- * Ролик со сценками: 25–45 с; паузы — те же, что внутри клипа сценки
+ * Самая долгая тишина у ролика со сценками и внутри клипа сценки
  * (CLIP_LIMITS, animate/clip-check.ts): между репликами сценок бывают паузы.
+ * Стартовое значение; сверяется на ролике-образце.
  */
-export const SKIT_LIMITS: VerifyLimits = { ...SHORT_LIMITS, minSec: 25, maxSec: 45, maxSilenceSec: CLIP_LIMITS.maxSilenceSec };
+export const SKIT_MAX_SILENCE_SEC = 3;
+
+/** Ролик со сценками: 25–45 с (пределы таймлайна), паузы — до SKIT_MAX_SILENCE_SEC. */
+export const SKIT_LIMITS: VerifyLimits = {
+  ...SHORT_LIMITS,
+  minSec: SKIT_MIN_TOTAL_MS / 1000,
+  maxSec: SKIT_MAX_TOTAL_MS / 1000,
+  maxSilenceSec: SKIT_MAX_SILENCE_SEC,
+};
 
 /**
  * Проверка готового ролика. Тишина длиннее предела — значит, реплика не
@@ -75,10 +88,13 @@ export const SKIT_LIMITS: VerifyLimits = { ...SHORT_LIMITS, minSec: 25, maxSec: 
  */
 export function verifyVideo(probe: ProbeInfo, silences: Silence[], limits: VerifyLimits = SHORT_LIMITS): string[] {
   const problems: string[] = [];
-  if (!Number.isFinite(probe.durationSec)) {
+  // Длина — по видеодорожке, если она известна: её задал таймлайн, а звук AAC длиннее
+  // на десятки мс, и ролик ровно на пределе, пропущенный таймлайном, падал бы здесь.
+  const len = probe.videoSec ?? probe.durationSec;
+  if (!Number.isFinite(len)) {
     problems.push('длина не определена — ffprobe не вернул длительность');
-  } else if (probe.durationSec < limits.minSec || probe.durationSec > limits.maxSec) {
-    problems.push(`длина ${probe.durationSec.toFixed(1)} с вне ${limits.minSec}–${limits.maxSec} с`);
+  } else if (len < limits.minSec || len > limits.maxSec) {
+    problems.push(`длина ${len.toFixed(1)} с вне ${limits.minSec}–${limits.maxSec} с`);
   }
   if (probe.width !== limits.width || probe.height !== limits.height) {
     problems.push(`кадр ${probe.width}×${probe.height}, нужен ${limits.width}×${limits.height}`);

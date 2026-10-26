@@ -49,7 +49,7 @@ function netError(e: unknown): string {
 /**
  * Распознавание SpeechKit v1 (те же ключи, что у синтеза). Числа — словами
  * (`rawResults=true`): реплики сценок пишутся словами. Сбой сети, таймаут,
- * обрыв или не-JSON тела, 5xx и 429 повторяются здесь же: клип Omni уже
+ * обрыв или не-JSON тела, ответ без текста, 5xx и 429 повторяются здесь же: клип Omni уже
  * оплачен, и пересъёмка из-за моргнувшего SpeechKit стоила бы денег. Поэтому
  * наружу ошибка выходит только `stt` и без повтора. Ключ из текста ответа
  * вырезается.
@@ -74,7 +74,7 @@ export async function recognize(ogg: Buffer, creds: SttCreds, o: SttOptions = {}
       status = resp.status;
       raw = await resp.text();
     } catch (e) {
-      last = netError(e);
+      last = hide(netError(e));
       continue;
     }
     if (status >= 200 && status < 300) {
@@ -84,12 +84,12 @@ export async function recognize(ogg: Buffer, creds: SttCreds, o: SttOptions = {}
       } catch {
         reply = null;
       }
+      // На тишину SpeechKit отвечает {"result": ""}; ответ без result — сбой, его дешевле повторить, чем переснимать клип.
       if (reply && typeof reply.result === 'string') return reply.result;
-      if (reply && reply.result === undefined && reply.error_code === undefined) return '';
-      last = `SpeechKit ${status}: в ответе нет распознанного текста — ${hide(raw.slice(0, 200))}`;
+      last = `SpeechKit ${status}: в ответе нет распознанного текста — ${hide(raw).slice(0, 200)}`;
       continue;
     }
-    last = `SpeechKit ${status} ${hide(raw.slice(0, 200))}`;
+    last = `SpeechKit ${status} ${hide(raw).slice(0, 200)}`;
     if (status < 500 && status !== 429) break;
   }
   throw new StudioError('stt', `stt: распознать речь не удалось — ${last}`, false);
