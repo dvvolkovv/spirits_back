@@ -8,9 +8,10 @@ import { buildCaptions } from './short-captions';
 import { StageFatalError } from './short-jobs';
 import { linkBase, shortLinks, shortTarget } from './short-links';
 import { parseWriterReply } from './short-parse';
-import { WRITER_SYSTEM, buildWriterMessage, toAgents } from './short-prompts';
-import { WriterCaptions, checkScriptRules } from './short-rules';
+import { WRITER_SKIT_SYSTEM, WRITER_SYSTEM, buildWriterMessage, toAgents } from './short-prompts';
+import { WriterCaptions, checkScriptRules, checkSkitRules } from './short-rules';
 import { CASE_BADGE, buildScript } from './short-script';
+import { Skit, SkitKind, SkitPlan, planSkits } from './short-skit-prompts';
 import { shortSlug } from './short-slug';
 import { ShortsSettingsService } from './shorts-settings.service';
 import { ShortScript, ShortVideo, appendOwnerNote } from './shorts.types';
@@ -49,9 +50,20 @@ export class ShortsWriterService {
    * Снятый ответ → сценарий студии и подписи площадок, затем проверка правил.
    * Не прошёл — переписка с перечнем нарушений, до MAX_REWRITES раз; не
    * помогло — StageFatalError (повтор тем же ответом бессмыслен).
+   *
+   * Ролик со сценками: сценарист пишет ещё развязку и, по замечанию, переписывает
+   * конфликт; код собирает промпты обеих сценок (planSkits) и отдаёт ролик на
+   * оживление, а не на сборку. Сценка с прежним отпечатком не переснимется.
    */
   async write(v: ShortVideo): Promise<void> {
     if (!v.scene || !v.capture) throw new StageFatalError('сценарист: у ролика нет сцены или съёмки');
+    const skitFormat = v.format === 'skit';
+    // Конфликт — последний принятый: переписанный по замечанию лежит в сценарии, исходный — в сцене режиссёра.
+    let conflict: Skit | null = skitFormat ? v.script?.skits?.conflict?.skit ?? v.scene.skit ?? null : null;
+    if (skitFormat && !conflict) {
+      throw new StageFatalError('сценарист: у ролика со сценками нет сценки 1 — повторите с этапа режиссёра');
+    }
+    let previousPunchline: Skit | null = skitFormat ? v.script?.skits?.punchline?.skit ?? null : null;
     const [rows, settings] = await Promise.all([this.agents.getAgents('ru'), this.settings.get()]);
     const assistants = toAgents(rows);
     const name = v.scene.assistantName;
@@ -86,9 +98,10 @@ export class ShortsWriterService {
         previousScript: previous,
         previousCaptions,
         violations,
+        ...(skitFormat ? { skit: { conflict, previousPunchline } } : {}),
       });
-      const raw = await this.relay.ask(WRITER_SYSTEM, message, `short-write-${v.id}-${randomUUID()}`);
-      const reply = parseWriterReply(raw);
+      const raw = await this.relay.ask(skitFormat ? WRITER_SKIT_SYSTEM : WRITER_SYSTEM, message, `short-write-${v.id}-${randomUUID()}`);
+      const reply = parseWriterReply(raw, { skit: skitFormat });
       if (reply.needsRecapture) {
         if (recapturesInRow(v.ownerNote) >= MAX_RECAPTURES) {
           throw new StageFatalError(`сценарист: уже дважды просил другую сцену — нужен взгляд владельца; последняя причина: ${reply.reason}`);
@@ -96,30 +109,50 @@ export class ShortsWriterService {
         await this.backToDirector(v, reply.reason);
         return;
       }
-      const script = buildScript(reply, options);
+      const paragraphs = v.capture.paragraphs ?? [];
+      const skits = skitFormat ? { conflict: reply.skits.conflict ?? conflict, punchline: reply.skits.punchline } : null;
+      // Промпты сценок — только из сценок без нарушений: planSkits на кривой
+      // сценке бросает первую же ошибку, а правила называют все разом.
+      let planned: Record<SkitKind, SkitPlan> | undefined;
+      let planError: string | null = null;
+      if (skits && !checkSkitRules(skits.conflict, 'conflict', paragraphs).length && !checkSkitRules(skits.punchline, 'punchline', paragraphs).length) {
+        try {
+          planned = planSkits(skits);
+        } catch (e: any) {
+          planError = String(e?.message ?? e);
+        }
+      }
+      const script = buildScript(reply, { ...options, skits: planned });
       violations = checkScriptRules({
         angle: v.angle,
         assistantName: name,
         script,
         captions: reply.captions,
-        paragraphs: v.capture.paragraphs ?? [],
+        paragraphs,
         answerText: v.capture.answerText ?? '',
         sceneQuestion: v.scene.question,
         assistantsCount,
+        format: v.format,
+        ...(skits ? { skits } : {}),
       });
+      if (planError) violations.push(planError);
       if (violations.length) {
         this.logger.warn(`ролик ${v.id}: сценарий не прошёл правила (круг ${round + 1}): ${violations.join('; ')}`);
         previous = script;
         previousCaptions = reply.captions;
+        if (skits) {
+          conflict = skits.conflict;
+          previousPunchline = skits.punchline;
+        }
         continue;
       }
       const r = await this.pg.query(
         `UPDATE short_video
-            SET status = 'render_queued', script = $2::jsonb, captions = $3::jsonb, slug = $4,
+            SET status = $6, script = $2::jsonb, captions = $3::jsonb, slug = $4,
                 writer_feedback = NULL, writer_rounds = writer_rounds + 1,
                 attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
           WHERE id = $1 AND status = 'writing' AND attempts = $5`,
-        [v.id, JSON.stringify(script), JSON.stringify(buildCaptions(reply.captions, links)), slug, v.attempts],
+        [v.id, JSON.stringify(script), JSON.stringify(buildCaptions(reply.captions, links)), slug, v.attempts, skitFormat ? 'animate_queued' : 'render_queued'],
       );
       // attempts = номер захвата: опоздавший процесс не пишет поверх того, кто забрал этап после него.
       if (r.rowCount === 0) this.logger.warn(`ролик ${v.id} ушёл из writing или его забрал другой процесс — сценарий не записал`);
