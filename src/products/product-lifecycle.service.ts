@@ -15,6 +15,14 @@ const NAME_MAX = 80;
 
 export type LifecycleFail = { ok: false; reason: string; message: string };
 
+/**
+ * Что записывается в снятую правку при удалении продукта. Видит ВЛАДЕЛЕЦ — в
+ * истории правок, на месте результата (тот же приём, что у
+ * block.service.TURN_KILLED_BY_BLOCK): без слова «удалён» он читал бы обычный
+ * отказ раннера и искал поломку у себя.
+ */
+export const TURN_KILLED_BY_DELETE = 'Продукт удалён — правка не применена';
+
 function cleanName(raw: unknown): string | null {
   const n = String(raw ?? '').trim();
   return n && n.length <= NAME_MAX ? n : null;
@@ -327,6 +335,19 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
         `UPDATE product_provision_jobs SET status = 'failed', error = 'снято удалением', finished_at = now()
           WHERE product_id = $1 AND status = 'queued' AND kind <> 'sleep'`,
         [row.product_id],
+      );
+      // Правка продукта — туда же, тем же приёмом, что у блокировки
+      // администратора (block.service.ts, killed_turns): 'queued' наравне с
+      // 'running', без оглядки на признаки жизни. Без этого queued-правка
+      // держит product_turns_one_active (delete её не трогал), а
+      // queueSleepForDeleted ждёт её тишины (TURN_SILENCE_SQL) вместо
+      // немедленного сна; running-правка молча доедет после возврата, когда
+      // продукт снова живой, — владелец получит правку, которую не просил
+      // применять именно сейчас.
+      await this.pg.query(
+        `UPDATE product_turns SET status = 'failed', error = $2, finished_at = now()
+          WHERE product_id = $1 AND status IN ('queued','running')`,
+        [row.product_id, TURN_KILLED_BY_DELETE],
       );
       await this.queueSleepForDeleted(row.product_id);
     } catch (e: any) {
