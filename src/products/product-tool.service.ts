@@ -507,7 +507,7 @@ export class ProductToolService {
     }
     if (msg === REKEY_REFUSAL) {
       return { ok: false, reason: 'rekeying', canTopUp: false, product,
-        say: `${REKEY_REFUSAL} Повтори правку через пару минут — продукт перезапускается с новыми ключами.` };
+        say: `${REKEY_REFUSAL} Повтори правку позже (действие status покажет, когда закончится); пополнение не поможет.` };
     }
     if (msg === 'Недостаточно токенов') {
       return { ok: false, reason: 'no_tokens', canTopUp: true, product,
