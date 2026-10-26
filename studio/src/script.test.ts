@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { validateScript } from './script';
-import type { Script } from './types';
+import type { Script, SkitPlan } from './types';
 
 const capture = {
   boxes: [
@@ -74,4 +74,49 @@ test('зацепка опирается на снятый абзац', () => {
 
 test('в финале нужно число ассистентов', () => {
   assert.match(validateScript({ ...good(), final: { assistantsCount: 0 } }, capture).join(';'), /числа ассистентов/);
+});
+
+const skitPlan = (lines: Array<{ hero: string; text: string; box?: number }>): SkitPlan => ({
+  skit: { cast: [{ hero: 'galina', role: 'хозяйка квартиры' }, { hero: 'kesha', role: 'жилец' }], setting: 's', opening: 'o', action: 'a', lines },
+  troupeVersion: 'v1',
+  heroes: ['galina', 'kesha'],
+  keyframePrompt: 'k',
+  videoPrompt: 'v',
+  keyframeFingerprint: 'kf',
+  fingerprint: 'f',
+});
+
+const skitScript = (): Script => {
+  const s = good();
+  return {
+    ...s,
+    lines: s.lines.filter((l) => l.scene !== 'hook'),
+    skits: { conflict: skitPlan([{ hero: 'galina', text: 'Залог мой!' }]), punchline: skitPlan([{ hero: 'kesha', text: 'Это износ.', box: 1 }]) },
+  };
+};
+
+test('ролик со сценками: корректный проходит', () => {
+  assert.deepEqual(validateScript(skitScript(), capture), []);
+});
+
+test('ролик со сценками: реплика hook лишняя', () => {
+  const s = skitScript();
+  s.lines.unshift({ id: 'h', scene: 'hook', text: s.hook });
+  assert.ok(validateScript(s, capture).some((p) => /реплики hook быть не должно/.test(p)));
+});
+
+test('ролик со сценками: сценка без реплик и реплика с несуществующим абзацем', () => {
+  const s = skitScript();
+  s.skits = { conflict: skitPlan([]), punchline: skitPlan([{ hero: 'kesha', text: 'Износ.', box: 7 }]) };
+  const problems = validateScript(s, capture);
+  assert.ok(problems.includes('в сценке conflict нет реплик'));
+  assert.ok(problems.some((p) => /сценки punchline ссылается на абзац 7/.test(p)));
+});
+
+test('ролик со сценками: без отпечатков студия не поймёт, что переснимать', () => {
+  const s = skitScript();
+  s.skits = { ...s.skits!, conflict: { ...s.skits!.conflict, fingerprint: '' } };
+  assert.ok(validateScript(s, capture).includes('у сценки conflict нет отпечатка'));
+  s.skits = { ...s.skits!, conflict: { ...s.skits!.conflict, fingerprint: 'f', keyframeFingerprint: '' } };
+  assert.ok(validateScript(s, capture).includes('у сценки conflict нет отпечатка'));
 });

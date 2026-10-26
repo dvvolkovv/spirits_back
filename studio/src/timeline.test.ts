@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildTimeline, MIN_ANSWER_LINE_MS } from './timeline';
+import { buildSkitTimeline, buildTimeline, MIN_ANSWER_LINE_MS } from './timeline';
 import { StudioError } from './errors';
 import type { LineScene, VoicedLine } from './types';
 
@@ -75,4 +75,39 @@ test('реплика ответа короче 1,5 с — line_too_short: при
     () => buildTimeline(s),
     (e: unknown) => e instanceof StudioError && e.code === 'line_too_short' && /реплика a1/.test(e.message),
   );
+});
+
+const skitLines = (): VoicedLine[] => [line('q', 'question', 4000), line('a1', 'answer', 8000, 1), line('a2', 'answer', 8000, 2), line('f', 'final', 4000)];
+const clips = { conflict: 8000, punchline: 8000 };
+
+test('сценки: конфликт → вопрос → ответ → развязка → финал', () => {
+  const t = buildSkitTimeline(skitLines(), clips, 30);
+  assert.deepEqual(t.scenes.conflict, { from: 0, duration: 240 });
+  assert.deepEqual(t.scenes.question, { from: 240, duration: 128 });
+  assert.deepEqual(t.scenes.answer, { from: 368, duration: 496 });
+  assert.deepEqual(t.scenes.punchline, { from: 864, duration: 240 });
+  assert.deepEqual(t.scenes.final, { from: 1104, duration: 128 });
+  assert.equal(t.totalFrames, 1232);
+  assert.deepEqual(t.segments.map((s) => [s.lineId, s.from]), [['q', 240], ['a1', 368], ['a2', 616], ['f', 1104]]);
+});
+
+test('сценки: реплики hook нет — зацепка идёт надписью поверх сценки', () => {
+  assert.throws(
+    () => buildSkitTimeline([line('h', 'hook', 1500), ...skitLines()], clips, 30),
+    (e: unknown) => e instanceof StudioError && e.code === 'script_invalid',
+  );
+});
+
+test('сценки: ролик 25–45 с', () => {
+  const ls = skitLines();
+  const long = [...ls.slice(0, 3), line('a3', 'answer', 8000, 3), ls[3]];
+  assert.throws(() => buildSkitTimeline(long, clips, 30), (e: unknown) => e instanceof StudioError && e.code === 'too_long');
+  const short = [line('q', 'question', 2000), line('a1', 'answer', 2000, 1), line('f', 'final', 2000)];
+  assert.throws(() => buildSkitTimeline(short, { conflict: 6000, punchline: 6000 }, 30), (e: unknown) => e instanceof StudioError && e.code === 'too_short');
+});
+
+test('сценки: короткая реплика ответа — line_too_short, как у обычного ролика', () => {
+  const ls = skitLines();
+  ls[1] = line('a1', 'answer', 1000, 1);
+  assert.throws(() => buildSkitTimeline(ls, clips, 30), (e: unknown) => e instanceof StudioError && e.code === 'line_too_short');
 });
