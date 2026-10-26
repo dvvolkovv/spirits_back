@@ -574,3 +574,387 @@ git -C $B add src/products && git -C $B commit -q -m "products: правила �
 Run (нода, бэк): `src/products/secret-rules.spec.ts src/products/provisioning.create.spec.ts src/products/provisioning.integration.spec.ts src/products/products.controller.spec.ts`. Expected: PASS, число тестов интеграционного набора — как в базовой линии. Затем tsc бэка.
 
 ---
+
+### Task 3: Агент — `OWNER_TG_ID` занят и уезжает в контейнер бота
+
+**Files:**
+- Modify: `product-runner/src/host/provision.ts` (`RESERVED_ENV` ~142–174, `ProvisionJob` ~270–282, `dockerRunArgv` ~337–368, `provision` ~459–561)
+- Test: `product-runner/src/host/provision.spec.ts` (общая таблица ~1049 и новый `describe`)
+
+- [ ] **Step 1: Тесты**
+
+В `product-runner/src/host/provision.spec.ts` в `RESERVED_TABLE` после строки `'POLL_INTERVAL_MS', 'TURN_TIMEOUT_MS', 'POLL_TIMEOUT_MS', 'REQUEST_TIMEOUT_MS',` добавить `'OWNER_TG_ID',` (дословно как в задаче 2). В конец файла:
+
+```ts
+describe('владелец бота — OWNER_TG_ID (очередь 2)', () => {
+  // Платформенная переменная рядом с RUNNER_TOKEN: по ней бот узнаёт, кому
+  // отвечать данными владельца. Её кладёт сервер из привязанного Telegram
+  // владельца — не владелец полем ключей (имя занято, см. таблицу выше).
+  it('бот получает OWNER_TG_ID переменной окружения', async () => {
+    await provision(
+      job({ slug: 'bot-ulej', kind: 'bot', secrets: { BOT_TOKEN: 'т' }, ownerTgId: '123456789' }),
+      deps(host),
+    );
+    expect(host.containers.get('bot-ulej')!.env.OWNER_TG_ID).toBe('123456789');
+  });
+
+  it('без привязки переменной нет вовсе — не пустая строка', async () => {
+    await provision(job({ slug: 'bot-ulej', kind: 'bot', secrets: { BOT_TOKEN: 'т' } }), deps(host));
+    expect('OWNER_TG_ID' in host.containers.get('bot-ulej')!.env).toBe(false);
+  });
+
+  it('сайт OWNER_TG_ID не получает, даже если он пришёл в задании', async () => {
+    await provision(job({ ownerTgId: '123456789' }), deps(host));
+    expect('OWNER_TG_ID' in host.containers.get('kafe-ulej')!.env).toBe(false);
+  });
+
+  it('не число — отказ до первого изменения на хосте', async () => {
+    // Значение приезжает по сети. argv без шелла пробел в флаг не превратит,
+    // но идентификатор Telegram — всегда число, и всё прочее — признак
+    // поломки на сервере, а не повод заводить бота с мусором.
+    await expect(
+      provision(job({ slug: 'bot-ulej', kind: 'bot', secrets: { BOT_TOKEN: 'т' }, ownerTgId: '12 -e X=1' }), deps(host)),
+    ).rejects.toThrow(/OWNER_TG_ID/);
+    expect(host.containers.size).toBe(0);
+    expect(host.dirs.size).toBe(0);
+  });
+});
+```
+
+- [ ] **Step 2: Коммит, прогон — FAIL** (`ownerTgId` не существует в `ProvisionJob` — ts-jest агента проверяет типы)
+
+```bash
+git -C $B add product-runner/src/host/provision.spec.ts && git -C $B commit -q -m "test(runner): OWNER_TG_ID — занятое имя и переменная бота (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, агент): `src/host/provision.spec.ts`.
+
+- [ ] **Step 3: Реализация** в `product-runner/src/host/provision.ts`
+
+1. В `RESERVED_ENV` после `'REQUEST_TIMEOUT_MS',` (перед `];`):
+
+```ts
+  // Владелец бота (очередь 2): Telegram-идентификатор, который кладёт сама
+  // платформа из привязки владельца. Ключ клиента с этим именем подменил бы,
+  // кому бот отвечает данными владельца. Третья копия — secret-rules.ts на
+  // сервере и secretNames.ts в кабинете.
+  'OWNER_TG_ID',
+```
+
+2. В `interface ProvisionJob` после поля `customNames?`:
+
+```ts
+  /**
+   * Telegram-идентификатор владельца — только у бота и только при привязанном
+   * Telegram (очередь 2). Уходит в окружение `OWNER_TG_ID`, чтобы бот узнавал
+   * владельца сам, без chat_id в тексте правки. Необязательное: сервер старше
+   * агента поля не шлёт, а у владельца без привязки его нет.
+   */
+  ownerTgId?: string;
+```
+
+3. Перед `function dockerRunArgv`:
+
+```ts
+/** Идентификатор Telegram — целое число; 20 знаков с запасом над bigint. */
+const OWNER_TG_ID_RE = /^\d{1,20}$/;
+
+/**
+ * OWNER_TG_ID для этого задания или undefined. Только боту: сайту владелец
+ * в Telegram ни к чему, а лишняя переменная в общем окружении — лишнее, что
+ * может прочитать код продукта. Не число — отказ: зовётся до первого
+ * изменения на хосте. Экспорт — ради смены ключей (rekey.ts).
+ */
+export function ownerTgIdFor(job: { kind: ProductKind; ownerTgId?: string | null }): string | undefined {
+  if (job.kind !== 'bot' || job.ownerTgId === undefined || job.ownerTgId === null) return undefined;
+  if (typeof job.ownerTgId !== 'string' || !OWNER_TG_ID_RE.test(job.ownerTgId)) {
+    throw new Error(`OWNER_TG_ID не число: ${JSON.stringify(job.ownerTgId)}`);
+  }
+  return job.ownerTgId;
+}
+```
+
+4. Сигнатура `dockerRunArgv` — добавить последний параметр `ownerTgId?: string`; после строки `argv.push('-e', \`PORT=${CONTAINER_PORT}\`);`:
+
+```ts
+  if (ownerTgId !== undefined) argv.push('-e', `OWNER_TG_ID=${ownerTgId}`);
+```
+
+5. В `provision()` сразу после `const secrets = validateSecrets(job.secrets);`:
+
+```ts
+  const ownerTgId = ownerTgIdFor(job);
+```
+и вызов `deps.run(dockerRunArgv(job, dir, port, oauthToken, secrets, cfg))` заменить на `deps.run(dockerRunArgv(job, dir, port, oauthToken, secrets, cfg, ownerTgId))`.
+
+- [ ] **Step 4: Коммит, прогон — PASS**
+
+```bash
+git -C $B add product-runner/src/host/provision.ts && git -C $B commit -q -m "runner: OWNER_TG_ID — переменная платформы у бота, имя занято для ключей" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, агент): `src/host/provision.spec.ts src/host/index.spec.ts src/config.spec.ts`. Expected: PASS. Затем tsc агента.
+
+---
+
+### Task 4: Агент — симулятор хоста для пересоздания контейнера
+
+**Files:**
+- Modify: `product-runner/src/host/fake-host.ts`
+- Test: `product-runner/src/host/fake-host.spec.ts`
+
+Смене ключей нужно то, чего симулятор не умеет: прочитать контейнер целиком (`docker inspect --format '{{json .}}'`), спросить образ (`docker image inspect`), переименовать контейнер, спросить `/health` изнутри (`docker exec`). Без этого `rekey` пришлось бы проверять записью команд строками — то есть формой, а не состоянием хоста (см. шапку `sleep.spec.ts`).
+
+- [ ] **Step 1: Тесты** — дописать в конец `product-runner/src/host/fake-host.spec.ts`:
+
+```ts
+describe('контейнер целиком и образы — для смены ключей', () => {
+  it('inspect {{json .}}: образ, метка, окружение, порт, каталог, лимиты', async () => {
+    host.tagImage('linkeon-product:base', 'sha256:aaa', ['PATH=/usr/bin', 'CHECKOUT_PATH=/product']);
+    await host.run([
+      'docker', 'run', '-d', '--name', 'shop', '--restart', 'unless-stopped', '-v', '/srv/products/shop:/product',
+      '-p', '127.0.0.1:8001:3000', '-e', 'RUNNER_TOKEN=ткн', '-e', 'API_KEY=k', '--memory=1g', '--cpus=1', 'linkeon-product:base',
+    ]);
+    const j = JSON.parse(await host.run(['docker', 'inspect', '--format', '{{json .}}', 'shop']));
+    expect(j.Image).toBe('sha256:aaa');
+    expect(j.Config.Image).toBe('linkeon-product:base');
+    expect(j.Config.Env).toEqual(['PATH=/usr/bin', 'CHECKOUT_PATH=/product', 'RUNNER_TOKEN=ткн', 'API_KEY=k']);
+    expect(j.HostConfig.PortBindings).toEqual({ '3000/tcp': [{ HostIp: '127.0.0.1', HostPort: '8001' }] });
+    expect(j.HostConfig.Memory).toBe(1073741824);
+    expect(j.HostConfig.NanoCpus).toBe(1e9);
+    expect(j.HostConfig.RestartPolicy).toEqual({ Name: 'unless-stopped' });
+    expect(j.Mounts).toEqual([{ Type: 'bind', Source: '/srv/products/shop', Destination: '/product', RW: true }]);
+    expect(j.State.Running).toBe(true);
+  });
+
+  it('-e поверх переменной образа — одна строка с новым значением, как у docker', async () => {
+    host.tagImage('linkeon-product:base', 'sha256:aaa', ['TZ=UTC']);
+    await host.run(['docker', 'run', '-d', '--name', 'b', '--restart', 'unless-stopped', '-e', 'TZ=Europe/Moscow', 'linkeon-product:base']);
+    const j = JSON.parse(await host.run(['docker', 'inspect', '--format', '{{json .}}', 'b']));
+    expect(j.Config.Env).toEqual(['TZ=Europe/Moscow']);
+  });
+
+  it('image inspect: метки и окружение образа; передвинутая метка смотрит на новый образ', async () => {
+    host.tagImage('linkeon-product:base', 'sha256:old', []);
+    host.tagImage('linkeon-product:src-111111111111', 'sha256:old', []);
+    host.tagImage('linkeon-product:base', 'sha256:new', ['A=1']);
+    const old = JSON.parse(await host.run(['docker', 'image', 'inspect', '--format', '{{json .}}', 'sha256:old']));
+    expect(old.RepoTags).toEqual(['linkeon-product:src-111111111111']);
+    const base = JSON.parse(await host.run(['docker', 'image', 'inspect', '--format', '{{json .}}', 'linkeon-product:base']));
+    expect(base.Id).toBe('sha256:new');
+    expect(base.Config.Env).toEqual(['A=1']);
+    await expect(host.run(['docker', 'image', 'inspect', '--format', '{{json .}}', 'nope:1'])).rejects.toThrow(/No such image/);
+  });
+
+  it('rename переносит контейнер вместе с остановленностью; занятое имя — отказ', async () => {
+    await run('shop', 8001);
+    await host.run(['docker', 'stop', 'shop']);
+    await host.run(['docker', 'rename', 'shop', 'shop__rekey']);
+    expect(host.containers.has('shop')).toBe(false);
+    expect(host.containers.has('shop__rekey')).toBe(true);
+    expect(host.isRunning('shop__rekey')).toBe(false);
+    await run('shop', 8001);
+    await expect(host.run(['docker', 'rename', 'shop__rekey', 'shop'])).rejects.toThrow(/Conflict/);
+  });
+
+  it('exec node: здоров по правилу теста; остановленный — отказ', async () => {
+    await run('bot');
+    await expect(host.run(['docker', 'exec', 'bot', 'node', '-e', 'x'])).resolves.toBe('');
+    host.healthy = () => false;
+    await expect(host.run(['docker', 'exec', 'bot', 'node', '-e', 'x'])).rejects.toThrow(/exit/);
+    host.healthy = () => true;
+    await host.run(['docker', 'stop', 'bot']);
+    await expect(host.run(['docker', 'exec', 'bot', 'node', '-e', 'x'])).rejects.toThrow(/not running/);
+  });
+
+  it('probePort отвечает за запущенный контейнер на порту и по тому же правилу здоровья', async () => {
+    await run('shop', 8001);
+    expect(host.probePort(8001)).toBe(true);
+    expect(host.probePort(8002)).toBe(false);
+    host.healthy = (_name, c) => c.env.API_KEY !== 'плохой';
+    host.containers.get('shop')!.env.API_KEY = 'плохой';
+    expect(host.probePort(8001)).toBe(false);
+  });
+});
+```
+
+- [ ] **Step 2: Коммит, прогон — FAIL** (`tagImage`, `healthy`, `probePort` не существуют)
+
+```bash
+git -C $B add product-runner/src/host/fake-host.spec.ts && git -C $B commit -q -m "test(runner): симулятор хоста — inspect целиком, образы, rename, exec (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, агент): `src/host/fake-host.spec.ts`.
+
+- [ ] **Step 3: Реализация** в `product-runner/src/host/fake-host.ts`
+
+1. Тип записи контейнера в поле `containers` расширить:
+
+```ts
+  containers = new Map<
+    string,
+    {
+      mount: string;
+      publish?: string;
+      env: Record<string, string>;
+      /** Чем контейнер запущен — метка или идентификатор, как было в argv (`.Config.Image`). */
+      image: string;
+      /** Идентификатор образа, на который метка указывала В МОМЕНТ запуска (`.Image`). */
+      imageId: string;
+      cmd: string[];
+      restart: string;
+      memory?: string;
+      cpus?: string;
+    }
+  >();
+```
+
+2. После поля `stopped` добавить образы, метки и правило здоровья:
+
+```ts
+  /**
+   * Образы: идентификатор → окружение образа. Метки — отдельно: метка, как у
+   * docker, ПЕРЕДВИГАЕТСЯ на новый образ (`base` после обновления образа), а
+   * уже запущенный контейнер остаётся на старом идентификаторе. Ровно на этой
+   * разнице стоит выбор образа при смене ключей (rekey.ts).
+   */
+  images = new Map<string, { env: string[] }>();
+  tags = new Map<string, string>();
+
+  /**
+   * Здоров ли контейнер для `/health` — общий для `docker exec` (бот) и
+   * `probePort` (сайт). По умолчанию здоров любой запущенный; тест подменяет
+   * правило, чтобы «нездоровым» был именно контейнер с плохими ключами.
+   */
+  healthy: (name: string, c: { env: Record<string, string> }) => boolean = () => true;
+
+  /** Завести образ под меткой (или передвинуть метку на другой образ). */
+  tagImage(tag: string, id: string, env: string[] = []): void {
+    this.images.set(id, { env });
+    this.tags.set(tag, id);
+  }
+
+  /** Идентификатор по метке или идентификатору; незнакомая метка заводит пустой образ. */
+  private resolveImage(ref: string): string {
+    if (this.images.has(ref)) return ref;
+    const id = this.tags.get(ref);
+    if (id) return id;
+    const fresh = `sha256:fake-${ref}`;
+    this.tagImage(ref, fresh, []);
+    return fresh;
+  }
+
+  /** Сайт отвечает на порту: запущенный контейнер с этой публикацией и здоровый. */
+  probePort(port: number): boolean {
+    for (const [name, c] of this.containers) {
+      if (this.stopped.has(name) || !c.publish) continue;
+      if (Number(c.publish.split(':')[1]) === port) return this.healthy(name, c);
+    }
+    return false;
+  }
+```
+
+3. В `docker(rest)` перед строкой `throw new Error(\`docker ${sub}: неизвестная подкоманда\`);`:
+
+```ts
+    if (sub === 'rename') {
+      const [from, to, ...extra] = args;
+      if (!from || !to || extra.length) throw new Error(`docker rename: ${args.join(' ')}`);
+      if (!this.containers.has(from)) throw new Error(`No such container: ${from}`);
+      if (this.containers.has(to)) throw new Error(`Conflict. The container name "/${to}" is already in use`);
+      this.containers.set(to, this.containers.get(from)!);
+      this.containers.delete(from);
+      if (this.stopped.delete(from)) this.stopped.add(to);
+      return '';
+    }
+    if (sub === 'exec') {
+      // Ровно та форма, которой смена ключей спрашивает /health бота:
+      // `docker exec <имя> node -e <скрипт>`. Прочее — отказ.
+      const [name, bin, flag] = args;
+      if (bin !== 'node' || flag !== '-e' || args.length !== 4) throw new Error(`docker exec: симулятор знает только node -e: ${args.join(' ')}`);
+      if (!this.containers.has(name)) throw new Error(`No such container: ${name}`);
+      if (this.stopped.has(name)) throw new Error(`Error response from daemon: container ${name} is not running`);
+      if (!this.healthy(name, this.containers.get(name)!)) throw new Error('Command failed: exit status 1');
+      return '';
+    }
+    if (sub === 'image') {
+      const [verb, flag, format, ref, ...extra] = args;
+      if (verb !== 'inspect' || flag !== '--format' || format !== '{{json .}}' || !ref || extra.length) {
+        throw new Error(`docker image: симулятор знает только inspect --format {{json .}} <образ>: ${args.join(' ')}`);
+      }
+      const id = this.images.has(ref) ? ref : this.tags.get(ref);
+      if (!id) throw new Error(`Error: No such image: ${ref}`);
+      const repoTags = [...this.tags.entries()].filter(([, v]) => v === id).map(([t]) => t);
+      return `${JSON.stringify({ Id: id, RepoTags: repoTags, Config: { Env: this.images.get(id)!.env } })}\n`;
+    }
+```
+
+4. В начале `dockerInspect` (сразу после разбора `[flag, format, name, ...extra]` и проверки формы) — ветка целого контейнера:
+
+```ts
+    if (format === '{{json .}}') {
+      if (!this.containers.has(name)) throw new Error(`Error: No such object: ${name}`);
+      return `${JSON.stringify(this.inspectWhole(name))}\n`;
+    }
+```
+и метод рядом с `dockerInspect`:
+
+```ts
+  /**
+   * Контейнер целиком — в форме `docker inspect --format '{{json .}}'`.
+   * Config.Env, как у docker: переменные образа, затем свои; своя с тем же
+   * именем заменяет переменную образа (одна строка, новое значение).
+   */
+  private inspectWhole(name: string): any {
+    const c = this.containers.get(name)!;
+    const own = new Set(Object.keys(c.env));
+    const imageEnv = (this.images.get(c.imageId)?.env ?? []).filter((e) => !own.has(e.slice(0, e.indexOf('='))));
+    const [hostIp, hostPort, containerPort] = c.publish ? c.publish.split(':') : [];
+    const [source, destination] = c.mount ? c.mount.split(':') : [];
+    return {
+      Name: `/${name}`,
+      Image: c.imageId,
+      Config: { Image: c.image, Env: [...imageEnv, ...Object.entries(c.env).map(([k, v]) => `${k}=${v}`)] },
+      State: { Running: !this.stopped.has(name), Status: this.stopped.has(name) ? 'exited' : 'running' },
+      HostConfig: {
+        PortBindings: c.publish ? { [`${containerPort}/tcp`]: [{ HostIp: hostIp, HostPort: hostPort }] } : {},
+        Memory: memoryBytes(c.memory),
+        NanoCpus: c.cpus ? Math.round(Number(c.cpus) * 1e9) : 0,
+        RestartPolicy: { Name: c.restart },
+        NetworkMode: 'bridge',
+        Privileged: false,
+      },
+      Mounts: c.mount ? [{ Type: 'bind', Source: source, Destination: destination, RW: true }] : [],
+    };
+  }
+```
+и функцию на уровне модуля (над `export const OAUTH`):
+
+```ts
+/** `--memory=1g` / `--memory=1073741824` → байты, как в HostConfig.Memory. */
+function memoryBytes(raw: string | undefined): number {
+  if (!raw) return 0;
+  const m = /^(\d+(?:\.\d+)?)([kmg]?)$/i.exec(raw);
+  if (!m) throw new Error(`--memory: непонятное значение ${raw}`);
+  const mul = { '': 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[m[2].toLowerCase() as '' | 'k' | 'm' | 'g'];
+  return Math.round(Number(m[1]) * mul);
+}
+```
+
+5. В `dockerRun`: объявить `let memory: string | undefined; let cpus: string | undefined;`, строку `if (a.startsWith('--memory=') || a.startsWith('--cpus=')) continue;` заменить на
+
+```ts
+      if (a.startsWith('--memory=')) { memory = a.slice('--memory='.length); continue; }
+      if (a.startsWith('--cpus=')) { cpus = a.slice('--cpus='.length); continue; }
+```
+и запись `this.containers.set(name, { mount, publish, env, image, cmd });` — на
+
+```ts
+    this.containers.set(name, { mount, publish, env, image, imageId: this.resolveImage(image), cmd, restart, memory, cpus });
+```
+
+- [ ] **Step 4: Коммит, прогон — PASS** (весь пакет: симулятор общий для всех батарей)
+
+```bash
+git -C $B add product-runner/src/host/fake-host.ts && git -C $B commit -q -m "runner: симулятор хоста — контейнер целиком, образы и метки, rename, exec" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, агент): без списка файлов (`npx jest`). Expected: все наборы PASS, число тестов = базовая линия + 6 (задача 3 добавила свои). Затем tsc агента.
+
+---
