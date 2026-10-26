@@ -185,8 +185,24 @@ describe('отпечатки', () => {
     expect(() => planSkits({ conflict: ru, punchline: punchline() })).toThrow(/сценка conflict: поле opening — по-английски/);
     const obj = conflict();
     (obj as any).setting = { en: 'hallway' };
-    expect(() => planSkits({ conflict: obj, punchline: punchline() })).toThrow(/пустое поле setting/);
+    expect(() => planSkits({ conflict: obj, punchline: punchline() })).toThrow(/поле setting — не строка/);
     expect(() => buildKeyframePrompt(ru, { continuity: false })).toThrow(/по-английски/);
+    const sign = conflict();
+    sign.setting = 'a hallway with a sign "FOR RENT"';
+    expect(() => planSkits({ conflict: sign, punchline: punchline() })).toThrow(/поле setting — по-английски и без кавычек/);
+  });
+
+  it('правило 17: реплика до 12 слов, сценка до 25 — длиннее Omni не уложит в 8 с', () => {
+    const long = conflict();
+    long.lines[0].text = 'Раз два три четыре пять шесть семь восемь девять десять одиннадцать двенадцать тринадцать.';
+    expect(() => planSkits({ conflict: long, punchline: punchline() })).toThrow(/сценка conflict: реплика 1 длиннее 12 слов/);
+    const many = conflict();
+    const nine = 'Раз два три четыре пять шесть семь восемь девять.';
+    many.lines = [{ hero: 'galina', text: nine }, { hero: 'kesha', text: nine }, { hero: 'galina', text: nine }];
+    expect(() => planSkits({ conflict: many, punchline: punchline() })).toThrow(/в репликах 27 слов, больше 25/);
+    const dash = conflict();
+    dash.lines[0].text = 'Раз — два — три — четыре — пять — шесть — семь — восемь — девять — десять — одиннадцать — двенадцать.';
+    expect(() => planSkits({ conflict: dash, punchline: punchline() })).not.toThrow();
   });
 
   it('отпечаток кадра конфликта передаётся только развязке', () => {
