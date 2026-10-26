@@ -20,6 +20,8 @@ import { REPORT_PROBLEM_CLI_TOOL_NAME } from '../products/products-cli-tool';
 import { MiscService } from '../misc/misc.service';
 import { VideoService } from '../video/video.service';
 import { BlogApprovalService } from '../blog/blog-approval.service';
+import { ShortsApprovalService } from '../shorts/shorts-approval.service';
+import { shortsEnabled } from '../shorts/short-env';
 import { fetchMediaBytes } from '../common/net/own-media';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
 import { InsightsCallbackService, shouldRouteToInsights } from '../insights/insights-callback.service';
@@ -112,6 +114,15 @@ export function shouldRouteToBlog(data?: string): boolean {
   return String(data || '').startsWith('blog:');
 }
 
+/**
+ * Кнопки роликов (`short:…`) — тем же вебхуком и с тем же порядком, что у
+ * блога: до проверки привязки, иначе нажатие «Одобрить» у владельца, не
+ * привязанного как пользователь ассистентов, ушло бы в пустоту.
+ */
+export function shouldRouteToShorts(data?: string): boolean {
+  return String(data || '').startsWith('short:');
+}
+
 @Injectable()
 export class TgBotService implements OnModuleInit {
   private readonly logger = new Logger(TgBotService.name);
@@ -154,9 +165,21 @@ export class TgBotService implements OnModuleInit {
     // сервис позиционно; кольцо модулей рвётся forwardRef, как у блога.
     @Optional() @Inject(forwardRef(() => InsightsCallbackService))
     private readonly insights?: InsightsCallbackService,
+    // Ролики (src/shorts) — то же кольцо модулей, что у блога. После сводки,
+    // последним и @Optional: спеки собирают сервис позиционно. Что Nest его подставляет,
+    // сторожит shorts.module.spec.ts.
+    @Optional() @Inject(forwardRef(() => ShortsApprovalService))
+    private readonly shortsApproval?: ShortsApprovalService,
   ) {}
 
   async onModuleInit() {
+    // Порванная связка с роликами не должна молчать — но только там, где
+    // ролики вообще включены: на средах без SHORTS_ENABLED отсутствие сервиса
+    // — норма, а не поломка, и предупреждение было бы шумом.
+    if (!this.shortsApproval && shortsEnabled()) {
+      this.logger.warn('ролики: ShortsApprovalService не подставлен — кнопки и /short роликов не работают');
+    }
+
     await this.applyMigration('001_tg_bot_schema.sql');
     await this.applyMigration('002_tg_bot_custom_agent_fk.sql');
     await this.applyMigration('003_tg_bot_video_delivery.sql');
@@ -279,6 +302,15 @@ export class TgBotService implements OnModuleInit {
       // handleReplyEdit возвращает false на всё чужое, и тогда текст идёт
       // обычным путём — перехватить лишнее значит сломать людям чат.
       if (await this.blogApproval.handleReplyEdit(msg)) return;
+      // Сбой роликов (база моргнула) не должен съесть реплай — в том числе
+      // реплай ассистенту: считаем сообщение не нашим, и оно идёт дальше.
+      let shortsReply = false;
+      try {
+        shortsReply = !!(await this.shortsApproval?.handleReplyEdit(msg));
+      } catch (e: any) {
+        this.logger.warn(`ролик: handleReplyEdit упал, реплай идёт обычным путём: ${e?.message}`);
+      }
+      if (shortsReply) return;
 
       const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
       if (!ownerId) {
@@ -370,6 +402,24 @@ export class TgBotService implements OnModuleInit {
       await this.blogApproval.handleCallback(cb);
       return;
     }
+    if (shouldRouteToShorts(data)) {
+      if (!this.shortsApproval) {
+        await this.grammy.answerCallbackQuery(cb.id, {}).catch(() => {});
+        return;
+      }
+      // Нажатие не должно остаться без ответа: сервис отвечает сам, когда
+      // обработал (true) — но при false (кнопка не наша) или упавшем
+      // исключении «часики» на кнопке иначе крутились бы до таймаута
+      // Telegram (~15 с без ответа).
+      let handled = false;
+      try {
+        handled = await this.shortsApproval.handleCallback(cb);
+      } catch (e: any) {
+        this.logger.warn(`ролик: handleCallback упал: ${e?.message}`);
+      }
+      if (!handled) await this.grammy.answerCallbackQuery(cb.id, {}).catch(() => {});
+      return;
+    }
 
     // Кнопки сводки — тоже до проверки привязки: владелец сводки определяется
     // чатом сводки, а не связкой ассистентов.
@@ -422,6 +472,8 @@ export class TgBotService implements OnModuleInit {
     // (false) — он доходит до ответа про неизвестную команду, как и до
     // появления этой. В /help и в меню команд её нет намеренно.
     if (await this.blogApproval.handleCaseCommand(msg)) return;
+    // `/short <тема>` — заказ ролика владельцем; как и /case, до разбора команд.
+    if (await this.shortsApproval?.handleShortCommand(msg)) return;
 
     const text = msg.text.toLowerCase().trim();
     const cmd = text.split('@')[0].split(' ')[0];

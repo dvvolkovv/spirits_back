@@ -1,0 +1,36 @@
+import fs from 'node:fs';
+import type { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import type { MinioConfig } from '../config';
+
+/** Файлы заданий: снимки съёмки, видео и обложка (ключи — в jobs.ts). */
+export interface Storage {
+  put(key: string, file: string, contentType: string): Promise<void>;
+  get(key: string, dest: string): Promise<void>;
+}
+
+/**
+ * MinIO по протоколу S3 — как StorageService бэкенда: path-style, регион
+ * любой. Файл целиком в памяти: ролик — около 13 МБ, снимки — единицы МБ.
+ * client — для тестов.
+ */
+export function s3Storage(cfg: MinioConfig, client?: { send(cmd: any): Promise<any> }): Storage {
+  const s3 =
+    client ??
+    new S3Client({
+      endpoint: cfg.endpoint,
+      region: 'us-east-1',
+      credentials: { accessKeyId: cfg.accessKey, secretAccessKey: cfg.secretKey },
+      forcePathStyle: true,
+    });
+  return {
+    async put(key, file, contentType) {
+      await s3.send(new PutObjectCommand({ Bucket: cfg.bucket, Key: key, Body: fs.readFileSync(file), ContentType: contentType }));
+    },
+    async get(key, dest) {
+      const res = await s3.send(new GetObjectCommand({ Bucket: cfg.bucket, Key: key }));
+      await pipeline(res.Body as Readable, fs.createWriteStream(dest));
+    },
+  };
+}

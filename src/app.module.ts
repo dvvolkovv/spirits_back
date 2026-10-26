@@ -29,6 +29,7 @@ import { MonitoringModule } from './monitoring/monitoring.module';
 import { EventsModule } from './events/events.module';
 import { BacklogModule } from './backlog/backlog.module';
 import { BlogModule } from './blog/blog.module';
+import { ShortsModule } from './shorts/shorts.module';
 import { VpmModule } from './vpm/vpm.module';
 import { InsightsModule } from './insights/insights.module';
 import { VmmModule } from './vmm/vmm.module';
@@ -86,6 +87,7 @@ import { IntegrationsModule } from './integrations/integrations.module';
     MonitoringModule,
     BacklogModule,
     BlogModule,
+    ShortsModule,
     VpmModule,
     InsightsModule,
     VmmModule,

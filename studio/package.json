@@ -1,0 +1,35 @@
+{
+  "name": "linkeon-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Студия коротких роликов Linkeon: съёмка кабинета, озвучка SpeechKit, сборка в Remotion",
+  "scripts": {
+    "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts src/answer.test.ts src/ffprobe.test.ts src/config.test.ts src/tts.test.ts src/render/props.test.ts src/errors.test.ts src/frame.test.ts src/answer-motion.test.ts src/capture/run-capture.test.ts src/worker/storage.test.ts src/worker/jobs.test.ts",
+    "test:render": "tsx --test src/render/render.fixture.ts",
+    "test:db": "tsx --test src/worker/db.integration.ts",
+    "typecheck": "tsc --noEmit",
+    "capture": "tsx src/capture/run-capture.ts",
+    "render": "tsx src/render/run-render.ts",
+    "worker": "tsx src/worker/worker.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1025.0",
+    "@remotion/bundler": "4.0.530",
+    "@remotion/google-fonts": "4.0.530",
+    "@remotion/renderer": "4.0.530",
+    "dotenv": "^17.4.2",
+    "pg": "^8.11.0",
+    "playwright": "1.59.1",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "remotion": "4.0.530",
+    "tsx": "^4.23.12"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.10.0",
+    "@types/react": "^19.1.0",
+    "typescript": "^5.9.3"
+  }
+}
