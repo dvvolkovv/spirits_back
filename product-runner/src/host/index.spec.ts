@@ -11,12 +11,15 @@ import {
   provisionOverrides,
   realDeps,
   redact,
+  runJob,
   tick,
 } from './index';
 import { FakeHost, deps as fakeDeps } from './fake-host';
 import { ProvisionDeps, hostDeps, provision as provisionReal } from './provision';
 import { SleepJob } from './sleep';
 import { DomainJob } from './domain';
+import { RekeyJob } from './rekey';
+import { PurgeJob } from './purge';
 
 const JOB: HostJob = {
   jobId: 'j-1',
@@ -47,6 +50,8 @@ function makeDeps(config: Partial<HostConfig> = {}) {
   // пришлось узнать у контейнера, и `{}` — это «узнавать не пришлось».
   const wakeProduct = jest.fn(async (_job: SleepJob): Promise<{ port?: number }> => ({}));
   const domain = jest.fn(async (_job: DomainJob): Promise<void> => undefined);
+  const rekey = jest.fn(async (_job: RekeyJob): Promise<void> => undefined);
+  const purge = jest.fn(async (_job: PurgeJob): Promise<void> => undefined);
   const sleepFn = jest.fn(async (_ms: number): Promise<unknown> => undefined);
   const logs: string[] = [];
 
@@ -57,12 +62,14 @@ function makeDeps(config: Partial<HostConfig> = {}) {
     sleepProduct,
     wakeProduct,
     domain,
+    rekey,
+    purge,
     sleep: sleepFn,
     log: (message: string) => {
       logs.push(message);
     },
   };
-  return { deps, poll, complete, provision, sleepProduct, wakeProduct, domain, sleep: sleepFn, logs };
+  return { deps, poll, complete, provision, sleepProduct, wakeProduct, domain, rekey, purge, sleep: sleepFn, logs };
 }
 
 /** Последний отчёт, доехавший до `complete`. */
@@ -1309,4 +1316,153 @@ describe('сроки развёртывания', () => {
 
     await expect(deps.run(['sleep', '10'])).rejects.toThrow(/сроку/);
   }, 5000);
+});
+
+// ---------------------------------------------------------------------------
+// Виды rekey и purge (очередь 2).
+// ---------------------------------------------------------------------------
+
+const REKEY_JOB: HostJob = {
+  ...JOB, kind: 'bot', jobKind: 'rekey', runnerToken: '', port: null,
+  secrets: { BOT_TOKEN: 'новый-секрет-бота' }, dropNames: ['OLD_KEY'], ownerTgId: '42',
+};
+const PURGE_JOB: HostJob = { ...JOB, jobKind: 'purge', runnerToken: '', secrets: {}, port: 8003 };
+
+describe('смена ключей и стирание (очередь 2)', () => {
+  it('оба вида агенту знакомы', () => {
+    expect(KNOWN_KINDS).toEqual(expect.arrayContaining(['rekey', 'purge']));
+  });
+
+  it('rekey: шагу уезжает выжимка — ключи, снимаемые имена, владелец; порта в отчёте нет', async () => {
+    const { deps, poll, provision, rekey, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: REKEY_JOB });
+
+    await tick(deps);
+
+    expect(provision).not.toHaveBeenCalled();
+    expect(rekey).toHaveBeenCalledWith({
+      slug: 'shop', kind: 'bot', secrets: { BOT_TOKEN: 'новый-секрет-бота' }, dropNames: ['OLD_KEY'], ownerTgId: '42',
+    });
+    expect(complete).toHaveBeenCalledWith('j-1', { ok: true });
+  });
+
+  it('purge: шагу — только слаг и форма', async () => {
+    const { deps, poll, purge, sleepProduct, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: PURGE_JOB });
+
+    await tick(deps);
+
+    expect(sleepProduct).not.toHaveBeenCalled();
+    expect(purge).toHaveBeenCalledWith({ slug: 'shop', kind: 'site' });
+    expect(complete).toHaveBeenCalledWith('j-1', { ok: true });
+  });
+
+  it('отказ смены ключей уходит на сервер без значений ключей', async () => {
+    const { deps, poll, rekey, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: REKEY_JOB });
+    rekey.mockRejectedValue(new Error('ключи не применены: эхо новый-секрет-бота из docker'));
+
+    await tick(deps);
+
+    const report = lastReport(complete);
+    expect(report.ok).toBe(false);
+    expect(JSON.stringify(report)).not.toContain('новый-секрет-бота');
+    expect(JSON.stringify(report)).toMatch(/ключи не применены/);
+  });
+
+  it('срок смены ключей назван своими словами, а не «провижининг»', async () => {
+    const { deps, poll, rekey, complete } = makeDeps({ provisionTimeoutMs: 5 });
+    poll.mockResolvedValue({ ok: true, job: REKEY_JOB });
+    rekey.mockImplementation(() => new Promise<void>(() => {}));
+
+    await tick(deps);
+
+    const report = lastReport(complete) as { ok: false; error: string };
+    expect(report.error).toMatch(/смена ключей не уложилась/);
+    expect(report.error).toMatch(/__rekey/);
+  });
+
+  it('боевая сборка: фазы смены ключей маскируют её новые значения', async () => {
+    const logs: string[] = [];
+    let captured: ProvisionDeps | undefined;
+    const deps = realDeps(CONFIG, {
+      log: (m) => logs.push(m),
+      buildDeps: (overrides) => overrides as ProvisionDeps,
+      rekey: async (_job, d) => {
+        captured = d;
+      },
+    });
+    await deps.rekey({ slug: 'shop', kind: 'bot', secrets: { BOT_TOKEN: 'новый-секрет-бота' }, dropNames: [] });
+    captured!.onPhase!('docker сказал: новый-секрет-бота');
+    expect(logs.join('\n')).not.toContain('новый-секрет-бота');
+    expect(logs.join('\n')).toContain('***');
+  });
+
+  it('боевая сборка стирания получает настоящий realpath и pathKind, а не заглушку', async () => {
+    // Задача 6: purgeProduct отказывает без ProvisionDeps.realpath/pathKind.
+    // realDeps собирает их через build(provisionOverrides(...)) — по
+    // умолчанию это hostDeps(), где обе функции настоящие (fs/promises). Без
+    // этого стирание на машине отказывало бы на КАЖДОМ задании сразу после
+    // первой проверки пути — живым дефектом, который ничем не красится на
+    // моках, если их подменить заглушкой.
+    let captured: ProvisionDeps | undefined;
+    // buildDeps не переопределён: боевая сборка собирает их через hostDeps() —
+    // именно это и проверяется.
+    const deps = realDeps(CONFIG, {
+      log: () => {},
+      purge: async (_job, d) => {
+        captured = d;
+      },
+    });
+
+    await deps.purge({ slug: 'shop', kind: 'site' });
+
+    expect(captured!.realpath).toBeInstanceOf(Function);
+    expect(captured!.pathKind).toBeInstanceOf(Function);
+    // Настоящая ФС, а не заглушка: свой исходник у себя есть всегда.
+    await expect(captured!.realpath(__filename)).resolves.toBe(__filename);
+    await expect(captured!.pathKind(__filename)).resolves.toBe('other');
+  });
+
+  it('работа на том же слаге ждёт брошенную по сроку предыдущую, а не пересекается с ней', async () => {
+    // Добавлено по ревью задачи 5: смена ключей, брошенная агентом по общему
+    // сроку задания, продолжается в том же процессе в фоне (hostDeps.run не
+    // отменяет уже запущенные шаги). Следующая работа агента над тем же
+    // слагом обязана ждать её окончания, а не исполняться поверх неё.
+    const { deps, poll, rekey, complete } = makeDeps({ provisionTimeoutMs: 10 });
+    let firstSettled = false;
+    rekey.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(() => {
+            firstSettled = true;
+            resolve();
+          }, 60);
+        }),
+    );
+    rekey.mockImplementationOnce(async () => {
+      expect(firstSettled).toBe(true);
+    });
+    poll.mockResolvedValueOnce({ ok: true, job: REKEY_JOB });
+    poll.mockResolvedValueOnce({ ok: true, job: { ...REKEY_JOB, jobId: 'j-2' } });
+
+    await tick(deps); // снято по сроку: report об отказе, первая работа ещё жива в фоне
+    await tick(deps); // обязана подождать первую, прежде чем позвать rekey второй раз
+
+    expect(rekey).toHaveBeenCalledTimes(2);
+    expect(complete).toHaveBeenNthCalledWith(1, 'j-1', expect.objectContaining({ ok: false }));
+    expect(complete).toHaveBeenNthCalledWith(2, 'j-2', { ok: true });
+  });
+
+  it('работа на РАЗНЫХ слагах не ждёт друг друга', async () => {
+    const { deps, rekey } = makeDeps({ provisionTimeoutMs: 10 });
+    rekey.mockImplementationOnce(() => new Promise<void>(() => {})); // брошена по сроку, не отвечает вовсе
+    rekey.mockImplementationOnce(async () => undefined);
+
+    await runJob(REKEY_JOB, deps);
+    const second = await runJob({ ...REKEY_JOB, jobId: 'j-2', slug: 'other' }, deps);
+
+    expect(second.ok).toBe(true);
+    expect(rekey).toHaveBeenCalledTimes(2);
+  });
 });
