@@ -4,9 +4,20 @@ import assert from "node:assert/strict";
 import express from "express";
 import { parseSecrets, parseMode, isAuthorized, createRelayAuth } from "./relay-auth.mjs";
 
+// Реальные секреты — 64-символьный hex (32 случайных байта); в тестах
+// достаточно двух разных строк такой же длины.
+const LONG_A = "a".repeat(40);
+const LONG_B = "b".repeat(40);
+
 test("parseSecrets: строки без пустых и комментариев", () => {
-  assert.deepEqual(parseSecrets("# прод\naaa\n\n  bbb  \n#x\n"), ["aaa", "bbb"]);
+  assert.deepEqual(parseSecrets(`# прод\n${LONG_A}\n\n  ${LONG_B}  \n#x\n`), [LONG_A, LONG_B]);
   assert.deepEqual(parseSecrets(""), []);
+});
+
+test("parseSecrets: короче 32 символов — отбрасываем (защита от перепутанных файлов)", () => {
+  const short = "c".repeat(31);
+  const ok = "d".repeat(32);
+  assert.deepEqual(parseSecrets(`${short}\n${ok}\n`), [ok]);
 });
 
 test("parseMode: только enforce включает отказ, остальное — log", () => {
@@ -57,11 +68,11 @@ test("log: без секрета проходит и пишет строку б�
 
 test("enforce: без секрета 401, с верным — проходит; /health и /files без проверки", async () => {
   const t = { t: 0 };
-  const s = await serve({ S: "good\nother\n", M: "enforce" }, t);
+  const s = await serve({ S: `${LONG_A}\n${LONG_B}\n`, M: "enforce" }, t);
   try {
     assert.equal((await fetch(`${s.base}/chat`, { method: "POST" })).status, 401);
     assert.equal((await fetch(`${s.base}/session/abc/files`)).status, 401);
-    assert.equal((await fetch(`${s.base}/chat`, { method: "POST", headers: { "X-Agent-Secret": "other" } })).status, 200);
+    assert.equal((await fetch(`${s.base}/chat`, { method: "POST", headers: { "X-Agent-Secret": LONG_B } })).status, 200);
     assert.equal((await fetch(`${s.base}/health`)).status, 200);
     assert.equal((await fetch(`${s.base}/files/x.txt`)).status, 200);
   } finally { await s.close(); }
@@ -91,9 +102,6 @@ test("enforce без единого секрета — отказ всем (бе
 // Прямые вызовы middleware (без сети) — для проверки тихого отчёта о
 // переменах конфигурации: изолируют лог перечитывания от логов самой
 // авторизации (их отключаем, всегда посылая верный секрет).
-const LONG_A = "a".repeat(40);
-const LONG_B = "b".repeat(40);
-
 function fakeCall(mw, { headers = {} } = {}) {
   let status = null;
   let nextCalled = false;
