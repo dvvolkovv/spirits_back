@@ -4,8 +4,9 @@
       { "hero": "galina", "role": "хозяйка квартиры" },
       { "hero": "kesha", "role": "жилец" }
     ],
-    "setting": "shabby hallway of a rented flat, an open door, a suitcase by the wall",
-    "action": "The capybara with a suitcase holds out a paw for the deposit. The goose blocks the doorway, jabs a wing at a tiny scuff on the wallpaper, hisses and flaps her wings. At the end the capybara calmly takes out a phone.",
+    "setting": "a tidy but slightly worn hallway of a rented flat, the front door open",
+    "opening": "The capybara stands next to his suitcase and holds out an open paw; the goose blocks the doorway with her wings spread wide.",
+    "action": "The goose points a wing at a tiny scuff on the wallpaper, hisses and flaps her wings. The capybara listens calmly. At the end he takes a phone out of his sweater pocket, its back to the camera.",
     "lines": [
       { "hero": "galina", "text": "Обои потёрли! Залог мой, весь до копейки!" },
       { "hero": "kesha", "text": "Спокойно. Спрошу у юриста." }
@@ -16,10 +17,11 @@
       { "hero": "kesha", "role": "жилец" },
       { "hero": "galina", "role": "хозяйка квартиры" }
     ],
-    "setting": "shabby hallway of a rented flat, an open door, a suitcase by the wall",
-    "action": "The capybara calmly holds the phone up towards the goose like a document. The goose freezes, her feathers stand on end, the bunch of keys drops from her wing, then she slowly lowers her wings.",
+    "setting": "a tidy but slightly worn hallway of a rented flat, the front door open",
+    "opening": "The goose stands in the doorway with her wings raised, clutching her bunch of keys; the capybara calmly holds up his phone towards her like an official document, its back to the camera.",
+    "action": "The capybara speaks calmly, still holding up the phone. Then the goose freezes, her feathers stand on end, the keys clatter to the floor, and she slowly lowers her wings.",
     "lines": [
-      { "hero": "kesha", "text": "Три года — это нормальный износ. Залог верните.", "box": 1 },
+      { "hero": "kesha", "text": "За три года это нормальный износ. Залог верните.", "box": 1 },
       { "hero": "galina", "text": "Га-га… ладно." }
     ]
   }
