@@ -57,7 +57,15 @@ describe('релей: инструменты Linkeon по токену хода'
   });
 
   it('формат fs_key у бэка и проверка релея совпадают: 32 hex', () => {
-    expect(/const FS_KEY_RE = \/(.+)\/;/.exec(paths)?.[1]).toBe('^[0-9a-f]{32}$');
-    expect(relayFsKey('79030169187_12_ru')).toMatch(/^[0-9a-f]{32}$/);
+    // relayFsKey без секретов (ревью 26.10.2026) ничего не выдаёт — для
+    // проверки формата нужен хоть один.
+    const OLD_SALT = process.env.RELAY_FS_SALT;
+    process.env.RELAY_FS_SALT = 'relay-linkeon-guard-spec';
+    try {
+      expect(/const FS_KEY_RE = \/(.+)\/;/.exec(paths)?.[1]).toBe('^[0-9a-f]{32}$');
+      expect(relayFsKey('79030169187_12_ru')).toMatch(/^[0-9a-f]{32}$/);
+    } finally {
+      if (OLD_SALT === undefined) delete process.env.RELAY_FS_SALT; else process.env.RELAY_FS_SALT = OLD_SALT;
+    }
   });
 });

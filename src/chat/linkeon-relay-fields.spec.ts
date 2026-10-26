@@ -64,4 +64,47 @@ describe('поля инструментов Linkeon для релея', () => {
     appendLinkeonFields({ append: (n: string, v: string) => { got[n] = v; } }, f);
     expect(got).toEqual({ linkeon_token: f.linkeon_token, linkeon_mcp_url: f.linkeon_mcp_url, fs_key: f.fs_key });
   });
+
+  // Ревью 26.10.2026: публичная константа в HMAC не защищает ничего (она в
+  // открытом репозитории) — честное отсутствие fs_key лучше фиктивной защиты.
+  describe('без секретов для fs_key', () => {
+    it('ни RELAY_FS_SALT, ни JWT_SECRET — fs_key не выдан, одно предупреждение в лог', () => {
+      put('RELAY_FS_SALT', undefined);
+      put('JWT_SECRET', undefined);
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        expect(relayFsKey('79030169187_12_ru')).toBeUndefined();
+        expect(linkeonRelayFields('79030169187', '79030169187_12_ru').fs_key).toBeUndefined();
+        expect(warn).toHaveBeenCalledTimes(1);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('только RELAY_FS_SALT отсутствует — fs_key на JWT_SECRET, одно предупреждение в лог', () => {
+      put('RELAY_FS_SALT', undefined);
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        expect(relayFsKey('79030169187_12_ru')).toMatch(/^[0-9a-f]{32}$/);
+        expect(warn).toHaveBeenCalledTimes(1);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('appendLinkeonFields без fs_key — поле не уходит вовсе', () => {
+      put('RELAY_FS_SALT', undefined);
+      put('JWT_SECRET', undefined);
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        const got: Record<string, string> = {};
+        const f = linkeonRelayFields('u-1', 'k');
+        appendLinkeonFields({ append: (n: string, v: string) => { got[n] = v; } }, f);
+        expect(got).toEqual({ linkeon_token: f.linkeon_token, linkeon_mcp_url: f.linkeon_mcp_url });
+        expect(got).not.toHaveProperty('fs_key');
+      } finally {
+        warn.mockRestore();
+      }
+    });
+  });
 });

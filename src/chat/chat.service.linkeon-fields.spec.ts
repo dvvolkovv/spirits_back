@@ -125,6 +125,17 @@ describe('streamUniversalAgent: поля инструментов Linkeon', () =
     expect(h.get).toHaveBeenCalledTimes(1);
     expect(h.get.mock.calls[0][0]).toContain(`/session/${fsKey}/files`);
   });
+
+  // Ревью 26.10.2026: ошибка запроса — не то же самое, что честное «файлов
+  // нет». На ошибке запасной запрос по ключу сессии хода не делаем: тот же
+  // релей тем же секретом откажет и там, а лишний запрос только тратит время.
+  it('первый запрос упал (не 401) — запасной список не спрашивают', async () => {
+    const h = streamHarness([{ type: 'delta', text: 'Готово: [Скачать report.pdf]()' }, { type: 'done' }]);
+    h.get.mockRejectedValue(new Error('релей недоступен'));
+    await h.run();
+    expect(h.get).toHaveBeenCalledTimes(1);
+    expect(h.get.mock.calls[0][0]).toContain(`/session/${relayFsKey(SID)}/files`);
+  });
 });
 
 describe('agentReply: поля инструментов Linkeon', () => {
