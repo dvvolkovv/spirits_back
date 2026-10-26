@@ -4927,14 +4927,40 @@ const WORKING_POLL_MAX_ATTEMPTS_KEYS = 60;
 6. Блок новых строк вынести во вспомогательную функцию над `let body` (форма бота и форма ключей рисуют одно и то же):
 
 ```tsx
+  // Новые строки «имя — значение»: одни и те же у формы бота и у формы ключей.
   const extraRows = (titleId: string, title: string) => (
     <div role="group" aria-labelledby={titleId} className="space-y-2">
       <p id={titleId} className="text-xs font-medium">{title}</p>
-      {/* строки — дословно прежний map(rows) из формы бота */}
+      {rows.map((row, i) => (
+        <div key={row.id} className="flex gap-2">
+          <input type="text" maxLength={SECRET_NAME_MAX} aria-label={t('products.action.createBot.keyName')}
+            placeholder="API_KEY" value={row.name} disabled={busy}
+            aria-invalid={Boolean(rowErrors[i]?.name)}
+            onChange={(e) => updateRow(row.id, { name: e.target.value })}
+            className="w-2/5 rounded-lg border border-gray-300 px-2 py-1.5 text-xs" />
+          <input data-testid="product-action-secret-value" type="password" autoComplete="off" spellCheck={false}
+            aria-label={t('products.action.createBot.keyValue')} value={row.value} disabled={busy}
+            aria-invalid={Boolean(rowErrors[i]?.value)}
+            onChange={(e) => updateRow(row.id, { value: e.target.value })}
+            className="ym-disable-keys flex-1 rounded-lg border border-gray-300 px-2 py-1.5 text-xs" />
+          <button type="button" disabled={busy} onClick={() => removeRow(row.id)} className="text-xs text-gray-500">
+            {t('products.action.createBot.removeKey')}
+          </button>
+          {(rowErrors[i]?.name || rowErrors[i]?.value) && (
+            <span role="alert" className="text-xs text-red-700">{t((rowErrors[i].name ?? rowErrors[i].value)!)}</span>
+          )}
+        </div>
+      ))}
+      {rows.length < EXTRA_SECRETS_MAX && (
+        <button type="button" disabled={busy} onClick={() => setRows([...rows, { id: nextId.current++, name: '', value: '' }])}
+          className="text-xs text-forest-700">
+          {t('products.action.createBot.addKey')}
+        </button>
+      )}
     </div>
   );
 ```
-Внутрь — без изменений прежний `{rows.map((row, i) => (…))}` и кнопка «Добавить ключ» из формы бота; в форме бота прежний `<div role="group" aria-labelledby="product-action-extra-title" …>…</div>` заменить на `{extraRows('product-action-extra-title', t('products.action.createBot.extraTitle'))}`.
+Это дословно прежний блок формы бота (`<div role="group" aria-labelledby="product-action-extra-title" …>…</div>`, ~364–392 на `a369a67`), только с параметрами заголовка; в форме бота сам блок заменить на `{extraRows('product-action-extra-title', t('products.action.createBot.extraTitle'))}`. Сторож Вебвизора по `data-testid="product-action-secret-value"` продолжает находить тот же тег.
 7. В ветке `view.status === 'working'` первую строку `<p>{t('products.action.working')}</p>` заменить на `<p>{view.kind === 'keys' ? t('products.action.keys.working') : t('products.action.working')}</p>`.
 8. В ветке `view.status === 'done'` перед последней альтернативой (`doneGeneric`) добавить `view.kind === 'keys' ? (<p>{t('products.action.keys.done', { name })}</p>) :`.
 9. Ветку `} else if (view.kind === 'keys') { body = <p>{t('products.action.keys.unsupported')}</p>; }` заменить на:
@@ -5006,3 +5032,95 @@ git -C $F add src && git -C $F commit -q -m "products: форма ключей �
 Run (нода, фронт): `src/components/products src/components/chat src/tma src/components/webvisorPrivacy.test.ts src/services`, затем `pnpm check-locales && pnpm check-keys && pnpm check-hardcoded` и tsc фронта (не выше базовой линии). Expected: PASS.
 
 ---
+
+### Task 21: Полная проверка — оба репозитория, поломки нарочно, ревью
+
+**Files:** без изменений (кроме правок по итогам ревью — отдельными коммитами с тестом).
+
+- [ ] **Step 1: Бэк** (нода, `~/ci/wt/pl2-back` на последнем sha ветки):
+
+```bash
+source ~/.nvm/nvm.sh && npx tsc -p tsconfig.build.json --noEmit && echo tsc-ok
+PROVISIONING_PG_URL='postgres:///pl2_test?host=/var/run/postgresql' npx jest --runInBand src/products src/mcp src/chat src/tg-bot src/platform-kb 2>&1 | grep -E '^Tests:|^Test Suites:|^FAIL'
+PROVISIONING_PG_URL='postgres:///pl2_test?host=/var/run/postgresql' npx jest --runInBand src 2>&1 | grep -E '^Tests:|^Test Suites:|^FAIL'
+npm run build >/dev/null && ls dist/main.js && echo build-ok
+```
+Expected: `tsc-ok`; узкий прогон — без FAIL; полный — FAIL не больше базовой линии задачи 0 (заметка «npm test бэка красный by design»); `build-ok` (заметка «deploy.sh глотает падение сборки» — `ls dist/main.js` обязателен).
+
+- [ ] **Step 2: Агент** (там же, `cd product-runner`):
+
+```bash
+source ~/.nvm/nvm.sh && npx tsc -p tsconfig.json --noEmit && npx jest 2>&1 | grep -E '^Tests:|^Test Suites:|^FAIL'; npm run build >/dev/null && ls dist/host/rekey.js dist/host/purge.js dist/host/index.js && test ! -e dist/host/fake-host.js && echo runner-ok
+```
+Expected: без FAIL; `runner-ok` (симулятор в боевую сборку не попал — tsconfig его исключает).
+
+- [ ] **Step 3: Фронт** (нода, `~/ci/wt/pl2-front`):
+
+```bash
+source ~/.nvm/nvm.sh && npx vitest run 2>&1 | tail -5 && pnpm check-locales && pnpm check-keys && pnpm check-hardcoded && npx tsc -p tsconfig.app.json --noEmit 2>&1 | grep -c 'error TS'; pnpm build >/dev/null && echo build-ok
+```
+Expected: падений не больше базовой линии; число `error TS` не выше базовой; `build-ok`.
+
+- [ ] **Step 4: Поломки нарочно** — каждая обязана покраснеть хотя бы одним названным тестом. Ломать в CI-клоне ноды, после проверки — `git checkout -- <файл>`:
+
+| # | Поломка | Должен покраснеть |
+|---|---|---|
+| 1 | `product-runner/src/host/purge.ts`: в `purgeProduct` строку `const dir = productDirFor(…)` заменить на ``const dir = `${deps.productsDir ?? DEFAULTS.productsDir}/${job.slug}`;`` | `purge.spec.ts` — «слаг %j — отказ до ЛЮБОГО вызова», «каталог продуктов %j …» |
+| 2 | `purge.ts`: в `productDirFor` удалить проверку `root.split('/')…length < 2` | `purge.spec.ts` — «каталог продуктов "/srv" …» |
+| 3 | `product-runner/src/host/rekey.ts`: `const left = await rollback(job.slug, backup, deps);` → `const left: string[] = [];` | `rekey.spec.ts` — «нездоровый бот — откат…», «нездоровый сайт — откат…», «docker run отказал — откат…» |
+| 4 | `rekey.ts`: в `capture` убрать ветку `if (!imageRef) { … STABLE_TAG_RE … }` (запуск по идентификатору) | `rekey.spec.ts` — «метку передвинули — тот же образ по его стабильной метке…» |
+| 5 | `src/products/secret-rules.ts`: убрать `'OWNER_TG_ID'` | `secret-rules.spec.ts`, `provisioning.create.spec.ts` (общая таблица) |
+| 6 | `product-runner/src/host/provision.ts`: убрать `'OWNER_TG_ID'` из `RESERVED_ENV` | `provision.spec.ts` (общая таблица) |
+| 7 | фронт `secretNames.ts`: убрать `'OWNER_TG_ID'` | `secretNames.test.ts` |
+| 8 | `src/products/product-keys.service.ts`: в `patch` добавить `values: set` | `product-keys.service.spec.ts` (payload только имена), `product-keys.pg.spec.ts` (нет TEST-значений в строке карточки) |
+| 9 | `src/products/provisioning.service.ts`: в ветке `WHEN 'rekey'` убрать `AND NOT EXISTS (… product_turns …)` | `provisioning.rekey-purge.spec.ts` — «rekey ждёт конца правки» |
+| 10 | `provisioning.service.ts`: в `completePurgeJob` убрать `$2::boolean AND` из `purged` | `provisioning.complete-rekey-purge.spec.ts` — «отказ purge: продукт не помечен…» |
+| 11 | `src/products/product-actions.service.ts`: в `sweepStuck` убрать `AND NOT EXISTS (… 'queued','running','done' …)` | `product-actions.sweep.pg.spec.ts` — «карточка с живым заданием rekey не подметается…» |
+| 12 | `src/products/turns.service.ts`: убрать проверку `REKEY_REFUSAL` | `turns.enqueue.spec.ts` — «пока rekey в очереди или идёт…» |
+| 13 | `src/products/product-purge.service.ts`: в `backupPathFor` убрать сравнение `path.resolve(m[1]) === want` (вернуть `want`) | `product-purge.service.spec.ts`, `product-purge.pg.spec.ts` — чужая копия не тронута |
+| 14 | фронт `ProductActionCard.tsx`: у `product-action-key-replace` убрать `ym-disable-keys` | `webvisorPrivacy.test.ts` |
+
+Итог — таблицей в отчёт: поломка → какой тест покраснел. Не покраснело ничего — дописать тест, который ловит, и прогнать заново.
+
+- [ ] **Step 5: Ревью** — субагент `superpowers:code-reviewer` по диффам `origin/main..origin/feat/product-lifecycle-2` обоих репозиториев против спеки и этого плана, с вопросами: значения ключей нигде, кроме коробки и `secrets_encrypted`; откат `rekey` возвращает ровно старый контейнер; `purge` не может тронуть путь вне `/srv/products/<слаг>`; строка `products` при стирании не удаляется; одно действие — один оператор там, где это обещано. Найденное — правками с тестом и прогоном шагов 1–3.
+
+---
+
+### Task 22: Спека — отступления очереди 2
+
+**Files:** Modify: `docs/superpowers/specs/2026-10-25-product-full-lifecycle-design.md`
+
+- [ ] **Step 1:** В конец спеки — раздел `## Отступления очереди 2 (по ходу исполнения, <дата>)`: пункты 1–15 из «Общее → Отступления от спеки» этого плана (кратко, по одному абзацу), плюс фактические расхождения, найденные исполнителями и ревью. В разделе «Открыто на очередь 2» отметить закрытое: «стирание только помечает `purged_at`» — сделано (задача 10); «удалённый продукт, у которого сон трижды не прошёл, может работать до стирания» — стирание снимает и работающий контейнер (задача 6), то есть «работает» теперь ограничено сроком возврата. Остальные пункты того раздела — перенести в новый подраздел «Открыто после очереди 2» как есть (тексты о деньгах в сборке из магазина, Flutter и блок карточки в истории, `end.content` на фронте, тексты `result.error` по-русски, Telegram-группа → кабинет, вторая карточка от самолечения).
+
+- [ ] **Step 2: Коммит**
+
+```bash
+git -C $B add docs/superpowers/specs/2026-10-25-product-full-lifecycle-design.md && git -C $B commit -q -m "docs(spec): отступления очереди 2" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git -C $B push -q origin HEAD:refs/heads/feat/product-lifecycle-2
+```
+
+---
+
+### Task 23: Слияние и выкат — ТОЛЬКО С OK ВЛАДЕЛЬЦА
+
+Каждый шаг ниже начинается с явного OK владельца в этой сессии. Без него — остановиться и доложить готовность.
+
+- [ ] **Step 1: Слияние** (OK владельца) — `feat/product-lifecycle-2` в `main` обоих репозиториев, как в очереди 1: `checkout --detach origin/main`, `merge --no-ff`, пуш `${SHA}:refs/heads/main` (в zsh — с фигурными скобками, заметка «zsh: «$VAR:r» в refspec»), сверка merge-base (заметка «push origin main ≠ HEAD»). В `origin/main` за это время приехали чужие коммиты — прогнать на мерже шаги 1–3 задачи 21.
+
+- [ ] **Step 2: Выкат** (отдельный OK владельца) — ОДИН раз, в тихое время, `deploy.sh` с ноды со свежих клонов, отвязанно, наблюдатель по логу (заметка «Выкат: правила»; флаги — как в очереди 1, `SKIP_BOTS=1`, пока у PHASE 5 нет ключа). Что знать заранее:
+  - **Образ продуктов пересобирается и пересоздаёт ВСЕ работающие контейнеры продуктов.** Метка образа — хеш содержимого `product-runner/` (`product-image-roll.sh`), а очередь 2 его меняет (rekey, purge, каркас). Пересоздание — секунды на продукт, живые правки скрипт пропускает сам (стоп-сигнал «активный ход»). Поэтому тихое время и ОДИН выкат, а не по частям.
+  - **Спящие (остановленные) контейнеры пропускаются — это ожидаемо**: скрипт называет их в итоге и возвращает код 3. PHASE 4 считается зелёной, если в «не сделано» — только остановленные контейнеры (известные спящие и удалённые продукты); любая другая строка — разбор до следующего шага.
+  - **Окно «сервер новее агента».** Бэк катится в PHASE 2, агент — в PHASE 4. Карточку ключей, отправленную в этом окне, старый агент честно отвергнет («неизвестный вид задания») — карточка станет `failed` с текстом «Ключи не применены…», ключи не тронуты. Первый обход стирания — через час после старта API (отступление 2), и удалённых со сроком в прошлом сейчас нет (первые удаления — 25–26.10, срок — с 25.11), так что `purge` в это окно не уходит.
+  - **Релей не трогать.** Его копия `PRODUCTS_PROMPT` обновлена только в репозитории; описание действия `keys` ассистенты релея всё равно получают из схемы инструмента (`/webhook/mcp/products`). Выкат релея — другая сессия, по раннбуку релея.
+  - После выката — заметка «Проверка выката»: хеш своего бандла фронта, PHASE 4 по всем машинам реестра, `journalctl -u linkeon-host-agent` на машине продуктов чист.
+
+- [ ] **Step 3: Живая проверка на проде тестовым аккаунтом** (OK владельца; `70000000000`, вход через debug-OTP с секретом прода на localhost прода; на test нет машины продуктов, а релейные инструменты там не работают — заметка «test без BACKEND_URL»). Значения ключей — заведомо фиктивные (`LIVE_CHECK=1`), в отчёт — только имена:
+  1. тестовым аккаунтом завести сайт «Проверка ключей» (Маше или кнопкой Студии), дождаться `running`;
+  2. «смени ключи у Проверки ключей» → карточка; отправить из кабинета `POST /webhook/product-actions/<id> {set:{LIVE_CHECK:"1"}, remove:[], via:"cabinet"}` → через 1–2 минуты действие `done`, в `product_provision_jobs` задание `rekey` `done`; на машине продуктов (только чтение) `docker inspect --format '{{json .Config.Env}}' <слаг> | grep -c LIVE_CHECK` = 1, сайт отвечает;
+  3. правка во время смены ключей: сразу после отправки второй карточки поставить правку — 409 «Сейчас меняются ключи продукта…»;
+  4. убрать `LIVE_CHECK` карточкой → `done`, переменной в контейнере нет;
+  5. если владелец даст токен тестового бота — то же для бота: смена `BOT_TOKEN` на токен другого тестового бота (getMe, `tg_bot_id` обновился), бот отвечает на `/start`; без привязки Telegram — с chat_id в ответе (только у ботов, заведённых после выката);
+  6. удалить «Проверку ключей» карточкой; с OK владельца — `UPDATE products SET purge_after = now() WHERE slug = '<слаг>'` и `INSERT INTO product_provision_jobs (product_id, kind, status) SELECT id, 'purge', 'queued' FROM products WHERE slug = '<слаг>'`; через минуту: `purged_at` проставлен, `secrets_encrypted` NULL, строка продукта и его задания на месте, в `product_actions` строка `purge`/`done`/`system`; на машине нет ни контейнера, ни `/srv/products/<слаг>`, ни конфига nginx;
+  7. «верни Проверку ключей» → «уже стёрт».
+
+- [ ] **Step 4: Заметки памяти** — обновить `project_product_lifecycle_stage1.md` (или завести `…_stage2.md`): что выкачено (sha обоих репозиториев), что смена ключей и стирание живы, что релей ещё на старом тексте продуктов, что первые сроки стирания — с 25.11.
