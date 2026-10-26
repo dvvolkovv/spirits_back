@@ -1,5 +1,6 @@
 import { finalLine } from './short-numbers';
 import { WriterReply } from './short-parse';
+import { SkitKind, SkitPlan } from './short-skit-prompts';
 import { ShortScript, ShortScriptLine } from './shorts.types';
 
 /** Темп принятого образца (владелец, 25.10.2026). */
@@ -16,12 +17,17 @@ export interface ScriptOptions {
   assistantsCount: number;
   disclaimer?: string;
   badge?: string;
+  /**
+   * Сценки с готовыми промптами (planSkits) — ролик формата skit. Зацепка у него —
+   * немая надпись поверх конфликта: реплики hook нет, студия рисует hook текстом.
+   */
+  skits?: Record<SkitKind, SkitPlan>;
 }
 
-/** Ответ сценариста → `Script` студии: id реплик h, q, a1…, f — как у образца. */
+/** Ответ сценариста → `Script` студии: id реплик h, q, a1…, f — как у образца; у сценок — без h. */
 export function buildScript(reply: Pick<WriterReply, 'hook' | 'hookBox' | 'question' | 'lines'>, o: ScriptOptions): ShortScript {
   const lines: ShortScriptLine[] = [
-    { id: 'h', scene: 'hook', text: reply.hook },
+    ...(o.skits ? [] : [{ id: 'h', scene: 'hook' as const, text: reply.hook }]),
     { id: 'q', scene: 'question', text: reply.question },
     ...reply.lines.map((l, i): ShortScriptLine => ({ id: `a${i + 1}`, scene: 'answer', box: l.box, text: l.text })),
     { id: 'f', scene: 'final', voice: o.narratorVoice, text: finalLine(o.assistantsCount) },
@@ -34,5 +40,6 @@ export function buildScript(reply: Pick<WriterReply, 'hook' | 'hookBox' | 'quest
     speed: SPEECH_SPEED,
     lines,
     final: { assistantsCount: o.assistantsCount, ...(o.disclaimer ? { disclaimer: o.disclaimer } : {}) },
+    ...(o.skits ? { skits: o.skits } : {}),
   };
 }
