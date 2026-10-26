@@ -1,23 +1,38 @@
 import 'dotenv/config';
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { parseConfig } from '../config';
-import { StudioError, toStudioError } from '../errors';
-import { detectSilences, probeFile } from '../ffprobe';
-import type { Script, ShortAnimation, SkitClip, SkitKind, SkitPlan } from '../types';
+import { StudioError, toStudioError, type StudioErrorCode } from '../errors';
+import { detectSilences, probeFile, type ProbeInfo } from '../ffprobe';
+import { SKIT_KINDS, type Script, type ShortAnimation, type SkitClip, type SkitKind, type SkitPlan } from '../types';
 import { checkClip, CLIP_LUFS, normalizeLoudness } from './clip-check';
 import { lineCues, PAUSE_DETECT, voicedSpans } from './cues';
-import { CLEAR_REFUSALS, CLIP_SEC, generateKeyframe, imageMime, startClip, waitClip, type GoogleDeps, type ImageInput } from './google';
+import {
+  CLEAR_REFUSALS,
+  CLIP_SEC,
+  generateKeyframe,
+  imageMime,
+  KEYFRAME_USD,
+  OMNI_USD_PER_SEC,
+  startClip,
+  waitClip,
+  type GoogleDeps,
+  type ImageInput,
+} from './google';
 import { speechCheck } from './match';
 import { recognize, speechAudio } from './stt';
 
+const run = promisify(execFile);
 const STUDIO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
-export const SKIT_KINDS: readonly SkitKind[] = ['conflict', 'punchline'];
 /** Клипов Omni на сценку — не больше (спека, «Отказы»). */
 export const MAX_SKIT_ATTEMPTS = 3;
 /** Предел секунд Omni на ролик: шесть клипов, ≈ $4,8 (спека, «Отказы»). */
 export const DEFAULT_MAX_OMNI_SECONDS = 48;
+/** Версия бесплатной обработки клипа (громкость, субтитры): поднять, когда меняется их логика, — готовые сценки переобработаются без Omni. */
+export const PROCESSING_VERSION = 2;
 
 export interface AnimateDeps {
   keyframe(prompt: string, refs: ImageInput[]): Promise<ImageInput>;
@@ -34,21 +49,70 @@ export interface AnimateDeps {
 
 /** Расширение кадра по его типу: Nano Banana Pro отдаёт JPEG. */
 const KEYFRAME_EXT: Record<string, string> = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' };
+/** Как сценка называется в сообщениях владельцу. */
+const SCENE: Record<SkitKind, string> = { conflict: 'сценка 1 (конфликт)', punchline: 'сценка 2 (развязка)' };
+/**
+ * Ошибки ожидания, после которых запущенная генерация жива: id остаётся в
+ * animation.json, и следующая попытка или запуск дождётся её, а не заплатит снова.
+ */
+const KEEP_PENDING: ReadonlySet<StudioErrorCode> = new Set<StudioErrorCode>(['omni_timeout', 'google_auth', 'google_quota']);
+const FINGERPRINT = /^[0-9a-z-]+$/;
+
+/** Последняя строка stderr ffmpeg — причина; первая строка сообщения execFile — сама команда. */
+const failText = (e: unknown): string => {
+  const stderr = String((e as { stderr?: unknown })?.stderr ?? '').trim().split('\n').pop();
+  return stderr || (e instanceof Error ? e.message.split('\n')[0] : String(e));
+};
+
+/** Запись через временный файл: обрыв посреди записи не оставит обрезанный клип, кадр или счёт секунд. */
+function writeAtomic(file: string, data: string | Buffer): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, file);
+}
+
+/** animation.json — счёт денег: испорченный файл не повод начинать счёт с нуля. */
+function loadAnimation(file: string): ShortAnimation {
+  if (!fs.existsSync(file)) return { omniSeconds: 0, keyframes: 0, skits: {}, pending: {} };
+  let a: Partial<ShortAnimation> | null;
+  try {
+    a = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<ShortAnimation> | null;
+  } catch (e) {
+    throw new StudioError('no_input', `animate: ${file} не читается (${failText(e)}) — счёт секунд Omni неизвестен, восстановите файл`, false);
+  }
+  if (!a || typeof a !== 'object' || typeof a.omniSeconds !== 'number' || !Number.isFinite(a.omniSeconds) || a.omniSeconds < 0 || !a.skits || typeof a.skits !== 'object') {
+    throw new StudioError('no_input', `animate: ${file} испорчен — счёт секунд Omni неизвестен, восстановите файл`, false);
+  }
+  return {
+    omniSeconds: a.omniSeconds,
+    keyframes: typeof a.keyframes === 'number' && Number.isFinite(a.keyframes) ? a.keyframes : 0,
+    skits: a.skits,
+    pending: a.pending && typeof a.pending === 'object' ? a.pending : {},
+  };
+}
 
 /**
  * Оживление сценок папки ролика: script.json (со сценками) → animation.json,
- * keyframes/<отпечаток кадра>.<jpg|png> и skits/<отпечаток клипа>/{raw.mp4, speech.ogg, clip.mp4}.
+ * keyframes/<отпечаток кадра>.<jpg|png|webp> и skits/<отпечаток клипа>/{raw.mp4, speech.ogg, clip.mp4}.
  *
  * Кадр развязки рисуется по кадру конфликта (то же место и костюмы), поэтому
- * сначала кадр конфликта, потом обе сценки параллельно. Готовое не
+ * кадр конфликта — первым, потом обе сценки параллельно. Готовое не
  * переделывается: кадр с тем же отпечатком кадра не перерисовывается, клип с
- * тем же отпечатком клипа не переснимается. Новая реплика переснимает только
- * клип своей сценки, новое место конфликта перерисовывает и развязку — это
- * решают отпечатки (src/shorts/short-skit-prompts.ts бэкенда). Оплаченный клип
- * (raw.mp4) лежит, пока его не забраковали: если задание упало уже после
- * клипа (распознавание, ffmpeg), перезапуск возьмёт его, а не снимет новый.
- * Так же, без Omni, клип переобрабатывается, когда меняются громкость или
- * пороги пауз (поле post у готовой сценки).
+ * тем же отпечатком клипа и теми же настройками обработки (post) не
+ * переснимается; кадр рисуется, только когда снимается новый клип. Новая
+ * реплика переснимает только клип своей сценки, новое место конфликта
+ * перерисовывает и развязку — это решают отпечатки (src/shorts/short-skit-prompts.ts
+ * бэкенда).
+ *
+ * Деньги: секунды Omni резервируются до запуска и возвращаются только при
+ * явном отказе Google; id запущенной генерации хранится в animation.json, и
+ * следующая попытка или запуск дождётся её, а не заплатит снова. Оплаченный
+ * клип (raw.mp4) лежит, пока его не забраковали: сбой распознавания или ffmpeg
+ * не стоит пересъёмки. Принятый клип при смене громкости или порогов пауз
+ * переобрабатывается без Omni и без распознавания. Забракованный клип не
+ * удаляется, а откладывается в skits/<отпечаток>/rejected-*.mp4 — его можно
+ * разобрать и перепроверить.
  */
 export async function animateRun(runDir: string, deps: AnimateDeps): Promise<ShortAnimation> {
   const script = JSON.parse(fs.readFileSync(path.join(runDir, 'script.json'), 'utf8')) as Script;
@@ -56,22 +120,46 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
   if (!plans?.conflict || !plans?.punchline) {
     throw new StudioError('script_invalid', 'animate: в сценарии нет сценок (skits.conflict и skits.punchline)', false);
   }
-  const animPath = path.join(runDir, 'animation.json');
-  const anim: ShortAnimation = fs.existsSync(animPath) ? JSON.parse(fs.readFileSync(animPath, 'utf8')) : { omniSeconds: 0, skits: {} };
-  const save = () => fs.writeFileSync(animPath, JSON.stringify(anim, null, 2));
+  for (const kind of SKIT_KINDS) {
+    const p = plans[kind];
+    if (!FINGERPRINT.test(p.fingerprint ?? '') || !FINGERPRINT.test(p.keyframeFingerprint ?? '') || !Array.isArray(p.skit?.lines) || !Array.isArray(p.heroes)) {
+      throw new StudioError('script_invalid', `${SCENE[kind]}: план сценки неполон — соберите сценарий заново (scripts/shorts-skit-plan.ts)`, false);
+    }
+  }
+  if (plans.conflict.fingerprint === plans.punchline.fingerprint) {
+    throw new StudioError('script_invalid', 'animate: у двух сценок один отпечаток клипа — соберите сценарий заново', false);
+  }
   const budget = deps.maxOmniSeconds ?? DEFAULT_MAX_OMNI_SECONDS;
+  if (typeof budget !== 'number' || !Number.isFinite(budget) || budget < 0) {
+    throw new StudioError('no_input', `animate: предел секунд Omni — «${budget}», нужно неотрицательное число`, false);
+  }
+  try {
+    await run('ffmpeg', ['-version']);
+    await run('ffprobe', ['-version']);
+  } catch (e) {
+    throw new StudioError('unknown', `animate: ffmpeg или ffprobe не запускается (${failText(e)}) — оживление не начато`, false);
+  }
+
+  const animPath = path.join(runDir, 'animation.json');
+  const anim = loadAnimation(animPath);
+  const save = (): void => {
+    try {
+      writeAtomic(animPath, JSON.stringify(anim, null, 2));
+    } catch (e) {
+      throw new StudioError('unknown', `animate: animation.json не записался — ${failText(e)}`, false);
+    }
+  };
   const lufs = deps.lufs ?? CLIP_LUFS;
-  // Настройки бесплатной части обработки: при их смене готовая сценка переобрабатывается из raw.mp4.
-  const post = `lufs=${lufs};pause=${PAUSE_DETECT.noiseDb}dB/${PAUSE_DETECT.minSec}s`;
+  const post = `v${PROCESSING_VERSION};lufs=${lufs};pause=${PAUSE_DETECT.noiseDb}dB/${PAUSE_DETECT.minSec}s`;
   const troupeDir = deps.troupeDir ?? path.join(STUDIO_ROOT, 'assets', 'troupe');
   const log = deps.log ?? (() => {});
-  const abs = (rel: string) => path.join(runDir, rel);
-  const rel = (kind: SkitKind, name: string) => path.posix.join('skits', plans[kind].fingerprint, name);
+  const abs = (file: string) => path.join(runDir, file);
+  const skitFile = (kind: SkitKind, name: string) => path.posix.join('skits', plans[kind].fingerprint, name);
   const keyframeBase = (kind: SkitKind) => path.posix.join('keyframes', plans[kind].keyframeFingerprint);
   const findKeyframe = (kind: SkitKind): string | null => {
     for (const ext of Object.values(KEYFRAME_EXT)) {
-      const rel = `${keyframeBase(kind)}.${ext}`;
-      if (fs.existsSync(abs(rel))) return rel;
+      const file = `${keyframeBase(kind)}.${ext}`;
+      if (fs.existsSync(abs(file))) return file;
     }
     return null;
   };
@@ -79,23 +167,29 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     const data = fs.readFileSync(file);
     return { data, mime: imageMime(data) };
   };
-  const giveUp = (e: StudioError) => new StudioError(e.code, `${e.message} — после ${MAX_SKIT_ATTEMPTS} попыток`, false);
+  const hasRaw = (kind: SkitKind) => fs.existsSync(abs(skitFile(kind, 'raw.mp4')));
+  const hasPending = (kind: SkitKind) => anim.pending?.[kind]?.fingerprint === plans[kind].fingerprint;
+  /** Сбой локального шага (ffmpeg, диск) — не повод платить за новый клип: без повтора. */
+  const local = async <T>(what: string, fn: () => T | Promise<T>): Promise<T> => {
+    try {
+      return await fn();
+    } catch (e) {
+      if (e instanceof StudioError) throw e;
+      throw new StudioError('unknown', `${what} — ${failText(e)}`, false);
+    }
+  };
 
   const reusable = (kind: SkitKind): boolean => {
     const prev = anim.skits[kind];
-    return (
-      !!prev &&
-      prev.fingerprint === plans[kind].fingerprint &&
-      prev.post === post &&
-      fs.existsSync(abs(prev.clip)) &&
-      fs.existsSync(abs(prev.keyframe))
-    );
+    return !!prev && prev.fingerprint === plans[kind].fingerprint && prev.post === post && fs.existsSync(abs(prev.clip));
   };
+  /** Сценке нужен новый клип Omni: готового нет, оплаченного raw.mp4 нет, запущенной генерации нет. */
+  const needsOmni = (kind: SkitKind) => !reusable(kind) && !hasRaw(kind) && !hasPending(kind);
 
   const portraits = (plan: SkitPlan): ImageInput[] =>
     plan.heroes.map((h) => {
       const f = path.join(troupeDir, plan.troupeVersion, `${h}.png`);
-      if (!fs.existsSync(f)) throw new StudioError('script_invalid', `animate: нет портрета героя ${h} (труппа ${plan.troupeVersion})`, false);
+      if (!fs.existsSync(f)) throw new StudioError('no_input', `нет портрета героя ${h} (труппа ${plan.troupeVersion})`, false);
       return readImage(f);
     });
 
@@ -106,127 +200,206 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     const refs = portraits(plans[kind]);
     if (kind === 'punchline') {
       const conflictKeyframe = findKeyframe('conflict');
-      if (!conflictKeyframe) throw new StudioError('unknown', 'animate: развязку не нарисовать — нет кадра конфликта', false);
+      if (!conflictKeyframe) throw new StudioError('unknown', 'развязку не нарисовать — нет кадра конфликта', false);
       refs.push(readImage(abs(conflictKeyframe)));
     }
     let last: StudioError | null = null;
     for (let attempt = 1; attempt <= MAX_SKIT_ATTEMPTS; attempt++) {
+      let img: ImageInput;
       try {
-        const img = await deps.keyframe(plans[kind].keyframePrompt, refs);
-        const kf = `${keyframeBase(kind)}.${KEYFRAME_EXT[img.mime] ?? 'png'}`;
-        fs.mkdirSync(path.dirname(abs(kf)), { recursive: true });
-        fs.writeFileSync(abs(kf), img.data);
-        return kf;
+        img = await deps.keyframe(plans[kind].keyframePrompt, refs);
       } catch (e) {
         last = toStudioError(e);
         if (!last.retryable) throw last;
         log(`animate ${kind}: кадр, попытка ${attempt} — ${last.message}`);
+        continue;
       }
+      const kf = `${keyframeBase(kind)}.${KEYFRAME_EXT[img.mime] ?? 'png'}`;
+      await local('кадр не записался', () => writeAtomic(abs(kf), img.data));
+      anim.keyframes = (anim.keyframes ?? 0) + 1;
+      save();
+      return kf;
     }
-    throw giveUp(last!);
+    throw new StudioError(last!.code, `${last!.message} — кадр не нарисован за ${MAX_SKIT_ATTEMPTS} попытки`, false);
   };
 
-  /** Сбой ffmpeg на уже проверенном файле — не повод платить за новый клип. */
-  const local = async <T>(kind: SkitKind, what: string, fn: () => Promise<T>): Promise<T> => {
-    try {
-      return await fn();
-    } catch (e) {
-      if (e instanceof StudioError) throw e;
-      throw new StudioError('unknown', `animate ${kind}: ${what} — ${e instanceof Error ? e.message : String(e)}`, false);
+  /** Готовый клип: громкость, проверка, речь, время реплик. Брак — повторяемая ошибка (новая попытка), если клип не принятый. */
+  const finish = async (kind: SkitKind, attempt: number, accepted: SkitClip | null): Promise<SkitClip> => {
+    const plan = plans[kind];
+    const texts = plan.skit.lines.map((l) => l.text);
+    const raw = abs(skitFile(kind, 'raw.mp4'));
+    const clip = skitFile(kind, 'clip.mp4');
+    const reject = (code: 'clip_invalid' | 'speech_mismatch', msg: string): never => {
+      if (accepted) {
+        // Принятый клип не бракуется молча: владелец его уже видел, а пересъёмка стоит денег.
+        throw new StudioError(code, `принятый клип при новых настройках не проходит проверку (${msg}); ${skitFile(kind, 'raw.mp4')} сохранён — верните прежние настройки или удалите его, чтобы переснять`, false);
+      }
+      // Брак откладывается, а не удаляется: после подстройки порогов его можно перепроверить.
+      fs.renameSync(raw, abs(skitFile(kind, `rejected-${new Date().toISOString().replace(/[:.]/g, '-')}.mp4`)));
+      fs.rmSync(abs(clip), { force: true });
+      throw new StudioError(code, msg, true);
+    };
+    const rawProbe: ProbeInfo = await probeFile(raw).catch((e: unknown) => reject('clip_invalid', `файл от Omni не читается — ${failText(e)}`));
+    const early = checkClip(rawProbe, []);
+    if (early.length) reject('clip_invalid', `клип не прошёл проверку — ${early.join('; ')}`);
+    // Громкость — до проверки тишины: её проверяет и готовый ролик, уже по выровненному звуку.
+    await local('громкость', () => normalizeLoudness(raw, abs(clip), lufs));
+    const probe = await local('проверка выровненного клипа', () => probeFile(abs(clip)));
+    const problems = checkClip(probe, await local('поиск тишины', () => detectSilences(abs(clip), probe.durationSec)));
+    if (problems.length) reject('clip_invalid', `клип не прошёл проверку — ${problems.join('; ')}`);
+
+    let heard: string;
+    let share: number;
+    if (accepted) {
+      // Речь принятого клипа от громкости не меняется — распознавать заново незачем.
+      heard = accepted.heard;
+      share = speechCheck(texts, heard).share;
+    } else {
+      const ogg = await local('звук для распознавания', () => speechAudio(abs(clip), abs(skitFile(kind, 'speech.ogg'))));
+      heard = await deps.recognize(fs.readFileSync(ogg), { kind, attempt });
+      // Пустой ответ — дешевле спросить SpeechKit ещё раз, чем переснимать клип.
+      if (!heard.trim()) heard = await deps.recognize(fs.readFileSync(ogg), { kind, attempt });
+      const check = speechCheck(texts, heard);
+      if (!check.ok) {
+        const why = check.silentLines.length
+          ? `не услышаны реплики ${check.silentLines.map((i) => i + 1).join(', ')}`
+          : `речь не сошлась с репликами (${Math.round(check.share * 100)}%)`;
+        reject('speech_mismatch', `${why}, услышано: «${heard.slice(0, 200)}»`);
+      }
+      share = check.share;
     }
+
+    // Длина сцены — по видеодорожке: звук AAC длиннее на десятки мс, и последние кадры сцены просили бы кадр за концом видео.
+    const totalMs = Math.round((probe.videoSec ?? probe.durationSec) * 1000);
+    const pauses = await local('поиск пауз', () => detectSilences(abs(clip), probe.durationSec, PAUSE_DETECT));
+    log(`animate ${kind}: готово${accepted ? ' (переобработка без Omni)' : ` с попытки ${attempt}`}, речь ${Math.round(share * 100)}%`);
+    return {
+      fingerprint: plan.fingerprint,
+      keyframe: findKeyframe(kind) ?? accepted?.keyframe ?? '',
+      clip,
+      durationMs: totalMs,
+      heard,
+      cues: lineCues(texts, voicedSpans(pauses, totalMs), totalMs),
+      attempts: accepted?.attempts ?? attempt,
+      post,
+    };
   };
 
   const animateSkit = async (kind: SkitKind): Promise<SkitClip> => {
     const plan = plans[kind];
-    const texts = plan.skit.lines.map((l) => l.text);
-    const raw = abs(rel(kind, 'raw.mp4'));
-    const clip = rel(kind, 'clip.mp4');
+    const raw = abs(skitFile(kind, 'raw.mp4'));
+    const prev = anim.skits[kind];
+    const accepted = prev && prev.fingerprint === plan.fingerprint && hasRaw(kind) ? prev : null;
+    // Прежняя запись больше не годится (другой отпечаток или настройки): без неё сборка
+    // не возьмёт клип, который эта попытка, может быть, уже перезаписала.
+    delete anim.skits[kind];
+    save();
+    if (accepted) return finish(kind, accepted.attempts, accepted);
+
     let last: StudioError | null = null;
+    const codes: string[] = [];
     for (let attempt = 1; attempt <= MAX_SKIT_ATTEMPTS; attempt++) {
       let reserved = false;
       let started = false;
       try {
-        const kf = await ensureKeyframe(kind);
         if (!fs.existsSync(raw)) {
-          if (anim.omniSeconds + CLIP_SEC > budget) {
-            throw new StudioError('omni_budget', `animate: на ролик ушло ${anim.omniSeconds} с Omni, предел — ${budget} с: лимит пересъёмок сценок`, false);
+          let id: string;
+          if (hasPending(kind)) {
+            id = anim.pending![kind]!.id;
+            log(`animate ${kind}: дожидаюсь уже запущенного клипа ${id}`);
+          } else {
+            const image = readImage(abs(await ensureKeyframe(kind)));
+            if (anim.omniSeconds + CLIP_SEC > budget) {
+              throw new StudioError('omni_budget', `на ролик ушло ${anim.omniSeconds} с Omni (с резервом соседней сценки), предел — ${budget} с: лимит пересъёмок сценок`, false);
+            }
+            // Секунды резервируются до запуска: сценки идут параллельно, и обе не
+            // должны пройти предел, когда места осталось на одну.
+            anim.omniSeconds += CLIP_SEC;
+            reserved = true;
+            save();
+            id = await deps.startClip(plan.videoPrompt, image);
+            started = true;
+            anim.pending = { ...anim.pending, [kind]: { id, fingerprint: plan.fingerprint } };
+            save();
           }
-          // Секунды резервируются до запуска: сценки идут параллельно, и обе не
-          // должны пройти предел, когда места осталось на одну.
-          anim.omniSeconds += CLIP_SEC;
-          reserved = true;
-          const id = await deps.startClip(plan.videoPrompt, readImage(abs(kf)));
-          started = true;
+          let mp4: Buffer;
+          try {
+            mp4 = await deps.waitClip(id);
+          } catch (e) {
+            const err = toStudioError(e);
+            if (!KEEP_PENDING.has(err.code)) {
+              delete anim.pending![kind];
+              save();
+            }
+            throw err;
+          }
+          await local('клип не записался', () => writeAtomic(raw, mp4));
+          delete anim.pending![kind];
           save();
-          fs.mkdirSync(path.dirname(raw), { recursive: true });
-          fs.writeFileSync(raw, await deps.waitClip(id));
         }
-
-        // Нечитаемый файл — вина клипа, а не студии: такой клип переснимается.
-        // Забракованный клип удаляется: следующая попытка снимет новый.
-        const reject = (code: 'clip_invalid' | 'speech_mismatch', msg: string): never => {
-          fs.rmSync(raw, { force: true });
-          fs.rmSync(abs(clip), { force: true });
-          throw new StudioError(code, msg, true);
-        };
-        const probe = await probeFile(raw).catch((e: unknown) =>
-          reject('clip_invalid', `animate ${kind}: файл от Omni не читается — ${e instanceof Error ? e.message : String(e)}`),
-        );
-        // Сначала громкость: тишину проверяет и готовый ролик — уже по выровненному звуку.
-        await local(kind, 'громкость', () => normalizeLoudness(raw, abs(clip), lufs));
-        const problems = checkClip(probe, await local(kind, 'поиск тишины', () => detectSilences(abs(clip), probe.durationSec)));
-        if (problems.length) reject('clip_invalid', `animate ${kind}: клип не прошёл проверку — ${problems.join('; ')}`);
-
-        const ogg = await local(kind, 'звук для распознавания', () => speechAudio(abs(clip), abs(rel(kind, 'speech.ogg'))));
-        const heard = await deps.recognize(fs.readFileSync(ogg), { kind, attempt });
-        const check = speechCheck(texts, heard);
-        if (!check.ok) {
-          const why = check.silentLines.length
-            ? `не услышаны реплики ${check.silentLines.map((i) => i + 1).join(', ')}`
-            : `речь не сошлась с репликами (${Math.round(check.share * 100)}%)`;
-          reject('speech_mismatch', `animate ${kind}: ${why}, услышано: «${heard.slice(0, 200)}»`);
-        }
-
-        const totalMs = Math.round(probe.durationSec * 1000);
-        const pauses = await local(kind, 'поиск пауз', () => detectSilences(abs(clip), probe.durationSec, PAUSE_DETECT));
-        log(`animate ${kind}: готово с попытки ${attempt}, речь ${Math.round(check.share * 100)}%`);
-        return {
-          fingerprint: plan.fingerprint,
-          keyframe: kf,
-          clip,
-          durationMs: totalMs,
-          heard,
-          cues: lineCues(texts, voicedSpans(pauses, totalMs), totalMs),
-          attempts: attempt,
-          post,
-        };
+        return await finish(kind, attempt, null);
       } catch (e) {
         const err = toStudioError(e);
         // Секунды возвращаются, только если Google явно отказал в запуске: при
         // потерянном ответе генерация могла начаться и будет оплачена.
-        if (reserved && !started && CLEAR_REFUSALS.has(err.code)) anim.omniSeconds -= CLIP_SEC;
-        save();
+        if (reserved && !started && CLEAR_REFUSALS.has(err.code)) {
+          anim.omniSeconds -= CLIP_SEC;
+          save();
+        }
         last = err;
-        if (!last.retryable) throw last;
+        codes.push(err.code);
+        if (!err.retryable) throw err;
         // Кадр не перерисовывается и после отказа фильтра: по кадру конфликта уже
         // могла быть нарисована развязка, и новый кадр развёл бы место и костюмы сценок.
-        log(`animate ${kind}: попытка ${attempt} — ${last.message}`);
+        log(`animate ${kind}: попытка ${attempt} — ${err.message}`);
       }
     }
-    throw giveUp(last!);
+    throw new StudioError(last!.code, `${last!.message} — после ${MAX_SKIT_ATTEMPTS} попыток (${codes.join(', ')})`, false);
   };
 
   const todo = SKIT_KINDS.filter((k) => !reusable(k));
   if (todo.length) {
-    await ensureKeyframe('conflict');
+    // Кадр конфликта нужен первым: по нему рисуется развязка. Если его нет, а по
+    // нему уже есть клипы или кадр развязки, новый кадр развёл бы место и костюмы
+    // сценок — молча не перерисовываем.
+    const conflictNeedsKeyframe = needsOmni('conflict') || (needsOmni('punchline') && !findKeyframe('punchline'));
+    if (conflictNeedsKeyframe && !findKeyframe('conflict')) {
+      const derived =
+        hasRaw('conflict') || reusable('conflict') || hasPending('conflict') ||
+        !!findKeyframe('punchline') || hasRaw('punchline') || reusable('punchline') || hasPending('punchline');
+      if (derived) {
+        throw new StudioError(
+          'no_input',
+          `animate: кадра конфликта ${keyframeBase('conflict')} нет, а по нему уже сняты клипы или нарисована развязка — верните кадр или удалите keyframes/ и skits/ ролика, чтобы начать пару заново`,
+          false,
+        );
+      }
+      try {
+        await ensureKeyframe('conflict');
+      } catch (e) {
+        const err = toStudioError(e);
+        throw new StudioError(err.code, `${SCENE.conflict}: ${err.message}`, err.retryable);
+      }
+    }
     const results = await Promise.allSettled(
       todo.map(async (kind) => {
         anim.skits[kind] = await animateSkit(kind);
         save();
       }),
     );
-    const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
-    if (failed) throw toStudioError(failed.reason);
+    const failures = results
+      .map((r, i) => ({ r, kind: todo[i] }))
+      .filter((x): x is { r: PromiseRejectedResult; kind: SkitKind } => x.r.status === 'rejected')
+      .map(({ r, kind }) => {
+        const err = toStudioError(r.reason);
+        log(`animate ${kind}: ${err.code} — ${err.message}`);
+        return { kind, err };
+      });
+    if (failures.length) {
+      // Если упали обе сценки, код и признак повтора — у той, что без повтора.
+      const main = failures.find((f) => !f.err.retryable) ?? failures[0];
+      throw new StudioError(main.err.code, failures.map((f) => `${SCENE[f.kind]}: ${f.err.message}`).join('; '), main.err.retryable);
+    }
   }
   save();
   return anim;
@@ -235,26 +408,32 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const runDir = process.argv[2];
   if (!runDir) {
-    console.error('usage: npm run animate -- <out/папка-ролика>   (MAX_OMNI_SECONDS — предел секунд Omni, по умолчанию 48)');
+    console.error('usage: npm run animate -- <out/папка-ролика>   (MAX_OMNI_SECONDS — предел секунд Omni, целое число, по умолчанию 48)');
     process.exit(2);
   }
-  const cfg = parseConfig(process.env, { capture: false, tts: true, animate: true });
-  const g: GoogleDeps = { apiKey: cfg.googleKey };
-  const stt = { apiKey: cfg.speechkitKey, folderId: cfg.speechkitFolder };
+  const maxRaw = process.env.MAX_OMNI_SECONDS?.trim();
+  if (maxRaw && !/^\d+$/.test(maxRaw)) {
+    console.error(`animate: MAX_OMNI_SECONDS — целое число секунд, например 96; получено «${maxRaw}»`);
+    process.exit(2);
+  }
   try {
+    const cfg = parseConfig(process.env, { capture: false, tts: false, animate: true });
+    const g: GoogleDeps = { apiKey: cfg.googleKey };
+    const stt = { apiKey: cfg.speechkitKey, folderId: cfg.speechkitFolder };
     const anim = await animateRun(path.resolve(runDir), {
       keyframe: (prompt, refs) => generateKeyframe(g, prompt, refs),
       startClip: (prompt, image) => startClip(g, prompt, image),
       waitClip: (id) => waitClip(g, id),
       recognize: (ogg) => recognize(ogg, stt),
-      maxOmniSeconds: Number(process.env.MAX_OMNI_SECONDS || DEFAULT_MAX_OMNI_SECONDS),
+      maxOmniSeconds: maxRaw ? Number(maxRaw) : DEFAULT_MAX_OMNI_SECONDS,
       log: (m) => console.log(m),
     });
     for (const k of SKIT_KINDS) {
       const s = anim.skits[k];
       console.log(`animate ${k}: попыток ${s?.attempts}, услышано «${s?.heard}»`);
     }
-    console.log(`animate: готово — Omni ${anim.omniSeconds} с (≈ $${(anim.omniSeconds * 0.1).toFixed(2)})`);
+    const usd = anim.omniSeconds * OMNI_USD_PER_SEC + (anim.keyframes ?? 0) * KEYFRAME_USD;
+    console.log(`animate: готово — Omni ${anim.omniSeconds} с, кадров ${anim.keyframes ?? 0} (≈ $${usd.toFixed(2)})`);
   } catch (e) {
     const err = toStudioError(e);
     console.error(`animate: ${err.code} — ${err.message}`);
