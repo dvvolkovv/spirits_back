@@ -296,7 +296,15 @@ export class TgBotService implements OnModuleInit {
       // handleReplyEdit возвращает false на всё чужое, и тогда текст идёт
       // обычным путём — перехватить лишнее значит сломать людям чат.
       if (await this.blogApproval.handleReplyEdit(msg)) return;
-      if (await this.shortsApproval?.handleReplyEdit(msg)) return;
+      // Сбой роликов (база моргнула) не должен съесть реплай — в том числе
+      // реплай ассистенту: считаем сообщение не нашим, и оно идёт дальше.
+      let shortsReply = false;
+      try {
+        shortsReply = !!(await this.shortsApproval?.handleReplyEdit(msg));
+      } catch (e: any) {
+        this.logger.warn(`ролик: handleReplyEdit упал, реплай идёт обычным путём: ${e?.message}`);
+      }
+      if (shortsReply) return;
 
       const ownerId = await this.identity.getLinkeonIdByTgUserId(msg.from.id);
       if (!ownerId) {

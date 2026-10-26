@@ -37,12 +37,19 @@ export const TG_UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
 /**
  * Ролик уже вышел хоть на одной площадке: пост в канале есть или набор YouTube
  * ушёл владельцу. Между попытками публикации такой ролик лежит в approved.
+ * Им же сторожит `reject` админки (shorts.controller.ts).
  */
-const RELEASED_SQL =
+export const RELEASED_SQL =
   `EXISTS (SELECT 1 FROM short_publication p WHERE p.short_id = short_video.id AND p.status IN ('published', 'manual_pending', 'manual_done'))`;
 
 const RESHOOT = 'Ролик сейчас переснимается — замечание напишите к новому варианту.';
 const REBUILD = 'Ролик сейчас пересобирается — замечание напишите к новому варианту.';
+
+/**
+ * Что делать с упавшим роликом. Вкладки «Ролики» в кабинете пока нет (план 3) —
+ * есть действия API admin/shorts, их и называем.
+ */
+const RETRY_HINT = 'из админки роликов: retry (можно с from=directing|writing и замечанием) или reject';
 
 /** Почему замечание не принять — по статусу. Отказ лучше молчания: ответ наш, и владелец должен знать, куда он делся. */
 const NOTE_REFUSALS: Partial<Record<ShortStatus, string>> = {
@@ -56,7 +63,7 @@ const NOTE_REFUSALS: Partial<Record<ShortStatus, string>> = {
   publishing: 'Ролик прямо сейчас уходит на площадки — замечание не принял.',
   published: 'Ролик уже опубликован — замечание не принял.',
   rejected: 'Ролик отклонён — замечание не принял.',
-  failed: 'Ролик не собрался — замечание не принял. Повторить его можно из админки.',
+  failed: `Ролик упал — замечание не принял. Повторить можно ${RETRY_HINT}.`,
 };
 
 const noteRefusal = (s: ShortStatus): string => NOTE_REFUSALS[s] ?? `Замечание не принял: ролик в статусе ${s}.`;
@@ -75,7 +82,8 @@ const BUTTON_REFUSALS: Partial<Record<ShortStatus, string>> = {
   publishing: 'Ролик уже уходит на площадки',
   published: 'Ролик уже опубликован',
   rejected: 'Ролик отклонён',
-  failed: 'Ролик упал — см. админку',
+  // Всплывашка — без имён действий API (сторожит спека): их владелец получил в сообщении о сбое.
+  failed: 'Ролик упал — повторить или отклонить его можно из админки роликов',
 };
 
 const buttonRefusal = (s: ShortStatus | undefined): string => (s && BUTTON_REFUSALS[s]) || 'Ролик уже обработан';
@@ -536,7 +544,7 @@ export class ShortsApprovalService {
       }
       const next = autoTopicsEnabled()
         ? 'Пришлю ролик на проверку, когда до него дойдёт очередь.'
-        : 'Автозапуск выключен — запустите ролик из админки.';
+        : 'Автозапуск выключен — запустите ролик из админки роликов: start_now.';
       await this.notify(chatId, `Принял заказ ролика: ${Array.from(text).length} знаков, кончается на «${ending(text)}». ${next}`);
     } catch (e: any) {
       await this.notify(chatId, `Не завёл ролик: ${e.message}`);
@@ -565,8 +573,11 @@ export class ShortsApprovalService {
       if (!r.rows.length) return;
       const v = rowToShort(r.rows[0]);
       const what = v.failedFrom === 'publishing' ? 'не вышел на площадки' : 'не собрался';
-      const text = `${isStand() ? STAND_MARK : ''}Ролик${quoted(v)} ${what}: ${clip(v.lastError || 'причина не записана', 600)}\n`
-        + 'Повторить можно кнопкой «Повторить» в админке, раздел «Ролики».';
+      // Упавшую публикацию с этапа не переснять (from — только до одобрения), поэтому подсказка своя.
+      const next = v.failedFrom === 'publishing'
+        ? 'В админке роликов: retry — повторить публикацию, reject — отклонить.'
+        : `Повторить можно ${RETRY_HINT}.`;
+      const text = `${isStand() ? STAND_MARK : ''}Ролик${quoted(v)} ${what}: ${clip(v.lastError || 'причина не записана', 600)}\n${next}`;
       const owner = approverChatId();
       if (!owner) {
         await this.notify(null, text);

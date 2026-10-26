@@ -76,9 +76,14 @@ export class ShortsDirectorService {
       question: reply.question,
       followups: reply.followups,
     };
+    // Новая сцена — новый круг с нуля («Переснять», просьба сценариста, повтор с
+    // этапа режиссёра): съёмка, сценарий и подписи — от прошлой сцены, и
+    // сценарист не должен получить их «прошлым вариантом» с номерами абзацев
+    // чужого ответа; отзыв студии о прошлой озвучке и счёт её переписок — тоже.
     const r = await this.pg.query(
       `UPDATE short_video
           SET status = 'capture_queued', scene = $2::jsonb, assistant_id = $3, slug = $4, title = $5,
+              capture = NULL, script = NULL, captions = NULL, writer_feedback = NULL, writer_rounds = 0,
               attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
         WHERE id = $1 AND status = 'directing' AND attempts = $6`,
       [v.id, JSON.stringify(scene), reply.assistantId, v.slug ?? shortSlug(reply.title, v.id), reply.title, v.attempts],

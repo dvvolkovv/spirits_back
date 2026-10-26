@@ -25,10 +25,11 @@ export const STUCK_PUBLISHING_MINUTES = 10;
  * Причина для владельца, когда исход отправки в канал неизвестен. У Telegram
  * нет ключа идемпотентности, номер поста приходит только в ответе: повтор
  * вслепую может дать второй такой же пост в публичном канале. Поэтому решает
- * человек, а «Повторить» — только если поста в канале нет: вышедший пост
- * повтор продублирует.
+ * человек: вышедший пост отмечается `mark_published` (дальше публикация идёт
+ * сама), а `retry` — только если поста в канале нет, иначе он его продублирует.
+ * Действия названы по API admin/shorts: вкладки «Ролики» в кабинете пока нет.
  */
-export const POST_MAY_BE_OUT = 'пост мог выйти — проверьте канал; «Повторить» в админке — только если поста там нет';
+export const POST_MAY_BE_OUT = 'пост мог выйти — проверьте канал; если пост вышел — mark_published со ссылкой на пост, иначе retry';
 const STUCK_TELEGRAM = `${POST_MAY_BE_OUT} (отправка оборвалась — процесс перезапущен посреди публикации)`;
 const STUCK_OTHER = 'отправка оборвалась — процесс перезапущен посреди публикации';
 
@@ -300,9 +301,18 @@ export class ShortsPublisherService {
     return false;
   }
 
-  /** Telegram-канал: тот же бот, что у блога, видео байтами с обложкой и подписью до 1000 знаков. */
+  /**
+   * Telegram-канал: тот же бот, что у блога, видео байтами с обложкой и подписью до 1000 знаков.
+   *
+   * Готовность бота — до отправки. Без TG_BOT_TOKEN TgGrammyClient бота не
+   * создаёт (onModuleInit), и sendVideo упал бы уже внутри — сбой ушёл бы в
+   * «исход неизвестен», хотя поста точно нет. Обычная ошибка здесь — отказ:
+   * повтор и предел попыток. `typeof` — getBot есть у клиента всегда; его нет
+   * только у заглушек клиента в тестах, где бот считается поднятым.
+   */
   private async toTelegram(v: ShortVideo, s: ShortSettings): Promise<PlatformResult> {
     if (!s.tgChannelChatId) throw new Error('канал Telegram не настроен (short_settings.tg_channel_chat_id)');
+    if (typeof this.tg.getBot === 'function' && !this.tg.getBot()) throw new Error('бот Telegram не настроен — TG_BOT_TOKEN');
     if (!v.videoKey || !v.coverKey || !v.captions) throw new Error('у ролика нет файла, обложки или подписей');
     const bucket = shortsBucket();
     const [video, cover] = await Promise.all([

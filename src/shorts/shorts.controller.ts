@@ -6,9 +6,12 @@ import { JwtGuard } from '../common/guards/jwt.guard';
 import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { isShortSlotConflict } from './short-slot-claim';
+import { RELEASED_SQL } from './shorts-approval.service';
 import { ShortSettingsPatch, ShortsSettingsService, validateSettingsPatch } from './shorts-settings.service';
 import { ShortOrderError, ShortsTopicService } from './shorts-topic.service';
-import { ShortPublication, ShortVideo, retryTarget, rowToPublication, rowToShort, shortsBucket } from './shorts.types';
+import {
+  ShortPublication, ShortStatus, ShortVideo, appendOwnerNote, canTransition, retryTarget, rowToPublication, rowToShort, shortsBucket,
+} from './shorts.types';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -24,6 +27,10 @@ function parseTelegramPostUrl(url: string): string | null {
   const m = TG_POST_URL.exec(String(url ?? '').trim());
   return m ? m[1] : null;
 }
+
+/** С каких этапов владелец может повторить упавший ролик вместо этапа падения. */
+const RETRY_FROM = ['directing', 'writing'] as const;
+type RetryFrom = (typeof RETRY_FROM)[number];
 
 /**
  * Админка роликов: действия в одном POST, как admin/blog. Вкладка кабинета
@@ -84,7 +91,9 @@ export class ShortsController {
       case 'mark_published':
         return res.status(200).json(await this.markPublished(String(data.id ?? ''), String(data.url ?? '')));
       case 'retry':
-        return res.status(200).json(await this.retry(String(data.id ?? '')));
+        return res.status(200).json(await this.retry(String(data.id ?? ''), data.from, data.note));
+      case 'reject':
+        return res.status(200).json(await this.reject(String(data.id ?? '')));
       case 'get_settings':
         return res.status(200).json(await this.settings.get());
       case 'update_settings': {
@@ -197,18 +206,35 @@ export class ShortsController {
   }
 
   /**
-   * «Повторить» упавший ролик — с этапа, на котором он упал (`retryTarget`).
+   * «Повторить» упавший ролик. Без `from` — с этапа, на котором он упал
+   * (`retryTarget`). `from` — с режиссёра (новая сцена) или со сценариста
+   * (новый текст по той же съёмке): детерминированный сбой — сценарист уже
+   * дважды просил другую сцену, открыт не тот ассистент, кадр не того
+   * размера — повтором с того же этапа не лечится. Упавшую публикацию так не
+   * повторить: ролик одобрен, а пост мог выйти — только своим путём
+   * (`retryTarget` или `mark_published`).
+   *
+   * `note` дописывается к замечаниям владельца (`appendOwnerNote`) — их читают
+   * режиссёр и сценарист. Заодно оно обнуляет счёт просьб сценариста о новой
+   * сцене: тот считает только хвост «Сценарист: …» после последнего замечания
+   * владельца (shorts-writer.service.ts).
+   *
    * Повтор публикации — только у ролика, который владелец одобрял, сразу (слот —
    * «сейчас») и только по упавшим площадкам: вышедшие не трогаются. Запись — с
    * условием на `failed_from`: цель выбрана по прочитанной неудаче, и путь
    * «failed → approved» не должен открыться ролику, упавшему на другом этапе.
    */
-  private async retry(id: string): Promise<ShortVideo> {
+  private async retry(id: string, from: unknown, note: unknown): Promise<ShortVideo> {
+    if (from != null && !RETRY_FROM.includes(from as RetryFrom)) {
+      throw new BadRequestException(`from — ${RETRY_FROM.join(' или ')}`);
+    }
+    if (note != null && typeof note !== 'string') throw new BadRequestException('note — строка');
     const v = await this.load(id);
-    const target = retryTarget(v);
+    const target = from != null ? this.retryFrom(v, from as RetryFrom) : retryTarget(v);
     if (!target) {
       throw new ConflictException(`повторять нечего: ролик в статусе ${v.status}${v.failedFrom ? `, упал на этапе ${v.failedFrom}` : ''}`);
     }
+    const ownerNote = typeof note === 'string' && note.trim() ? appendOwnerNote(v.ownerNote, note) : null;
     if (target === 'approved') {
       await this.pg.query(
         `UPDATE short_publication SET status = 'pending', attempts = 0, last_error = NULL, updated_at = now()
@@ -219,14 +245,53 @@ export class ShortsController {
     const r = await this.pg.query(
       `UPDATE short_video
           SET status = $2, attempts = 0, lease_until = NULL, last_error = NULL, failed_from = NULL,
-              failure_notified = false, writer_rounds = 0,
+              failure_notified = false, writer_rounds = 0, owner_note = COALESCE($4::text, owner_note),
               slot_at = CASE WHEN $2 = 'approved' THEN now() ELSE slot_at END, updated_at = now()
         WHERE id = $1 AND status = 'failed' AND failed_from = $3
         RETURNING *`,
-      [id, target, v.failedFrom],
+      [id, target, v.failedFrom, ownerNote],
     );
     if (!r.rows.length) throw new ConflictException('ролик успел уйти из failed — обновите список');
     return rowToShort(r.rows[0]);
+  }
+
+  /** Цель повтора, выбранная владельцем. null — повторять нечего (ролик не упал). */
+  private retryFrom(v: ShortVideo, from: RetryFrom): ShortStatus | null {
+    if (v.status !== 'failed' || !v.failedFrom || !canTransition(v.status, from)) return null;
+    if (v.failedFrom === 'publishing') {
+      throw new ConflictException(
+        'упавшую публикацию с этапа не переснять: retry без from повторит отправку, mark_published отметит вышедший пост',
+      );
+    }
+    if (from === 'writing' && !v.capture) throw new ConflictException('нечего писать — нет съёмки');
+    return from;
+  }
+
+  /**
+   * «Отклонить» упавший ролик: повтор не поможет или ролик больше не нужен.
+   * Нельзя, если он уже вышел хоть на одной площадке (пост в канале, набор
+   * YouTube у владельца) — как у «Отклонить» в личке, иначе rejected оказался бы
+   * ролик с живым постом. Условие — в самом UPDATE, а не чтением перед ним.
+   */
+  private async reject(id: string): Promise<ShortVideo> {
+    const v = await this.load(id);
+    if (v.status !== 'failed' || !canTransition(v.status, 'rejected')) {
+      throw new ConflictException(`отклонить здесь можно только упавший ролик, а он в статусе ${v.status}`);
+    }
+    const r = await this.pg.query(
+      `UPDATE short_video SET status = 'rejected', approved_at = NULL, lease_until = NULL, updated_at = now()
+        WHERE id = $1 AND status = 'failed'
+          AND NOT ${RELEASED_SQL}
+        RETURNING *`,
+      [id],
+    );
+    if (r.rows.length) return rowToShort(r.rows[0]);
+    // Отличаем «уже вышел» от «уже не failed» чтением после неудачной записи.
+    const after = await this.pg.query(`SELECT status, ${RELEASED_SQL} AS released FROM short_video WHERE id = $1`, [id]);
+    if (after.rows[0]?.released) {
+      throw new ConflictException('ролик уже вышел на площадке — отклонить нельзя; оставшиеся площадки повторит retry');
+    }
+    throw new ConflictException('ролик успел уйти из failed — обновите список');
   }
 
   private async load(id: string): Promise<ShortVideo> {
