@@ -87,3 +87,95 @@ test("enforce без единого секрета — отказ всем (бе
     assert.equal((await fetch(`${s.base}/chat`, { method: "POST", headers: { "X-Agent-Secret": "x" } })).status, 401);
   } finally { await s.close(); }
 });
+
+// Прямые вызовы middleware (без сети) — для проверки тихого отчёта о
+// переменах конфигурации: изолируют лог перечитывания от логов самой
+// авторизации (их отключаем, всегда посылая верный секрет).
+const LONG_A = "a".repeat(40);
+const LONG_B = "b".repeat(40);
+
+function fakeCall(mw, { headers = {} } = {}) {
+  let status = null;
+  let nextCalled = false;
+  const req = {
+    method: "POST",
+    path: "/chat",
+    get: (name) => headers[name.toLowerCase()],
+    socket: { remoteAddress: "9.9.9.9" },
+  };
+  const res = { status: (c) => { status = c; return { json: () => {} }; } };
+  mw(req, res, () => { nextCalled = true; });
+  return { status, nextCalled };
+}
+
+test("тихий отчёт о переменах: молчит на первой загрузке и без изменений", () => {
+  const logs = [];
+  const files = { S: `${LONG_A}\n`, M: "log\n" };
+  const t = { t: 0 };
+  const mw = createRelayAuth({
+    secretsPath: "S", modePath: "M",
+    readFile: (p) => { if (!(p in files)) { const e = new Error("ENOENT"); e.code = "ENOENT"; throw e; } return files[p]; },
+    now: () => t.t, log: (l) => logs.push(l),
+  });
+  const call = () => fakeCall(mw, { headers: { "x-agent-secret": LONG_A } });
+
+  assert.equal(call().nextCalled, true);     // первая загрузка — молча
+  assert.deepEqual(logs, []);
+  t.t = 31_000;
+  assert.equal(call().nextCalled, true);     // перечитали — без изменений
+  assert.deepEqual(logs, []);
+});
+
+test("тихий отчёт о переменах: лог при смене режима и числа секретов", () => {
+  const logs = [];
+  const files = { S: `${LONG_A}\n`, M: "log\n" };
+  const t = { t: 0 };
+  const mw = createRelayAuth({
+    secretsPath: "S", modePath: "M",
+    readFile: (p) => files[p],
+    now: () => t.t, log: (l) => logs.push(l),
+  });
+  const call = () => fakeCall(mw, { headers: { "x-agent-secret": LONG_A } });
+
+  call();                                    // первая загрузка — молча
+  assert.deepEqual(logs, []);
+
+  files.M = "enforce\n";
+  t.t = 31_000;
+  call();                                    // режим поменялся
+  assert.deepEqual(logs, ["relay-auth: режим enforce, секретов 1"]);
+
+  files.S = `${LONG_A}\n${LONG_B}\n`;
+  t.t = 62_000;
+  call();                                    // секретов стало больше
+  assert.deepEqual(logs, [
+    "relay-auth: режим enforce, секретов 1",
+    "relay-auth: режим enforce, секретов 2",
+  ]);
+});
+
+test("тихий отчёт о переменах: ошибка чтения — код один раз, без повтора", () => {
+  const logs = [];
+  const t = { t: 0 };
+  let secretsBroken = false;
+  const mw = createRelayAuth({
+    secretsPath: "S", modePath: "M",
+    readFile: (p) => {
+      if (p === "M") return "enforce\n";
+      if (secretsBroken) { const e = new Error("permission denied"); e.code = "EACCES"; throw e; }
+      return `${LONG_A}\n`;
+    },
+    now: () => t.t, log: (l) => logs.push(l),
+  });
+  const call = () => fakeCall(mw, { headers: {} });
+
+  call();                                    // первая загрузка — молча
+  secretsBroken = true;
+  t.t = 31_000;
+  call();                                    // ошибка появилась
+  assert.deepEqual(logs.filter((l) => l.includes("relay-secrets")), ["relay-auth: relay-secrets: EACCES"]);
+
+  t.t = 62_000;
+  call();                                    // та же ошибка снова — не повторяем
+  assert.equal(logs.filter((l) => l.includes("relay-secrets")).length, 1);
+});
