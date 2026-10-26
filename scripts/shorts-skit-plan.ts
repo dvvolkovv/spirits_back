@@ -34,7 +34,8 @@ if (!skitsPath || !basePath || !outPath) {
 }
 const skits = readJson(skitsPath) as { conflict?: Skit; punchline?: Skit };
 if (!skits?.conflict || !skits?.punchline) fail(skitsPath, 'нужны обе сценки: conflict и punchline');
-const base = readJson(basePath);
+const base = readJson(basePath) as { hook?: unknown; lines?: unknown } | null;
+if (!base || typeof base.hook !== 'string' || !Array.isArray(base.lines)) fail(basePath, 'это не сценарий студии: нужны строка hook и массив lines');
 let plans: ReturnType<typeof planSkits>;
 try {
   plans = planSkits({ conflict: skits.conflict, punchline: skits.punchline });
@@ -44,4 +45,5 @@ try {
 const script = { ...base, skits: plans };
 fs.mkdirSync(path.dirname(outPath), { recursive: true });
 fs.writeFileSync(outPath, JSON.stringify(script, null, 2));
-console.log(`skit-plan: ${outPath} — conflict ${plans.conflict.fingerprint}, punchline ${plans.punchline.fingerprint}`);
+const fp = (k: 'conflict' | 'punchline') => `${k} ${plans[k].fingerprint} (кадр ${plans[k].keyframeFingerprint})`;
+console.log(`skit-plan: ${outPath} — ${fp('conflict')}, ${fp('punchline')}`);

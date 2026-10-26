@@ -74,6 +74,26 @@ const sentence = (s: string): string => {
   return /[.!?…]$/.test(t) ? t : `${t}.`;
 };
 
+/**
+ * Поля сценки проверяются до промптов: опечатка в имени поля дала бы «undefined»
+ * в платном промпте, а сценарий проверяется только на сборке — после трат.
+ * Место, первый кадр и действие — английские строки: русский текст генератор
+ * картинок охотно рисует надписью.
+ */
+function assertSkit(skit: Skit): void {
+  if (!skit || typeof skit !== 'object') throw new Error('нет сценки');
+  for (const f of ['setting', 'opening', 'action'] as const) {
+    if (typeof skit[f] !== 'string' || !clean(skit[f])) throw new Error(`пустое поле ${f}`);
+    if (/[а-яё«»]/i.test(skit[f])) throw new Error(`поле ${f} — по-английски: оно идёт прямо в промпт генератора`);
+  }
+  if (!Array.isArray(skit.cast) || skit.cast.length < 2 || skit.cast.length > 3) throw new Error('в составе нужно 2–3 героя');
+  for (const c of skit.cast) if (typeof c?.role !== 'string' || !clean(c.role)) throw new Error(`у героя ${c?.hero} нет роли`);
+  if (!Array.isArray(skit.lines) || skit.lines.length < 1 || skit.lines.length > 3) throw new Error('нужно 1–3 реплики');
+  skit.lines.forEach((l, i) => {
+    if (typeof l?.text !== 'string' || !clean(l.text)) throw new Error(`пустая реплика ${i + 1} (${l?.hero})`);
+  });
+}
+
 function castHeroes(skit: Skit): Hero[] {
   if (!skit.cast?.length) throw new Error('в сценке нет героев');
   const seen = new Set<string>();
@@ -91,6 +111,7 @@ function castHeroes(skit: Skit): Hero[] {
  * героев в порядке состава, у развязки последней — кадр конфликта.
  */
 export function buildKeyframePrompt(skit: Skit, o: { continuity: boolean }): string {
+  assertSkit(skit);
   const heroes = castHeroes(skit);
   const cast = heroes.map((h, i) => `${i + 1}) ${h.look}`).join('; ');
   return [
@@ -99,7 +120,7 @@ export function buildKeyframePrompt(skit: Skit, o: { continuity: boolean }): str
     o.continuity
       ? 'The last image is the previous scene: keep the same costumes and lighting, and the same place unless the setting below says otherwise.'
       : '',
-    `Exactly ${heroes.length} characters, each appears once.`,
+    `Exactly ${heroes.length} characters — ${heroes.map((h) => h.who).join(' and ')} — each appears once.`,
     sentence(`Setting: ${skit.setting}`),
     sentence(`The picture: ${skit.opening}`),
     SKIT_FRAMING,
@@ -111,8 +132,8 @@ export function buildKeyframePrompt(skit: Skit, o: { continuity: boolean }): str
 
 /** Клип: действие и реплики по порядку, у каждой — кто говорит и каким голосом (из паспорта). */
 export function buildVideoPrompt(skit: Skit): string {
+  assertSkit(skit);
   const cast = new Set(castHeroes(skit).map((h) => h.id));
-  if (!skit.lines?.length) throw new Error('в сценке нет реплик');
   const said = skit.lines
     .map((l, i) => {
       const h = heroById(l.hero);
@@ -129,21 +150,6 @@ export function buildVideoPrompt(skit: Skit): string {
     'Slightly jerky stop-motion movement, small comic gestures, no camera cuts, no music.',
     SKIT_FORBIDDEN,
   ].join(' ');
-}
-
-/**
- * Поля сценки проверяются до промптов: опечатка в имени поля дала бы «undefined»
- * в платном промпте, а сценарий проверяется только на сборке — после трат.
- */
-function assertSkit(skit: Skit): void {
-  if (!skit || typeof skit !== 'object') throw new Error('нет сценки');
-  for (const f of ['setting', 'opening', 'action'] as const) {
-    if (!clean(skit[f])) throw new Error(`пустое поле ${f}`);
-  }
-  if (!Array.isArray(skit.cast) || skit.cast.length < 2 || skit.cast.length > 3) throw new Error('в составе нужно 2–3 героя');
-  for (const c of skit.cast) if (!clean(c?.role)) throw new Error(`у героя ${c?.hero} нет роли`);
-  if (!Array.isArray(skit.lines) || skit.lines.length < 1 || skit.lines.length > 3) throw new Error('нужно 1–3 реплики');
-  for (const l of skit.lines) if (!clean(l?.text)) throw new Error(`пустая реплика героя ${l?.hero}`);
 }
 
 const hash16 = (parts: string[]): string => createHash('sha256').update(JSON.stringify(parts)).digest('hex').slice(0, 16);
@@ -165,8 +171,8 @@ export function planSkit(skit: Skit, kind: SkitKind, conflictKeyframe?: string):
   if (kind === 'punchline' && !conflictKeyframe) {
     throw new Error('сценка punchline: развязка рисуется по кадру конфликта — планируйте пару через planSkits');
   }
+  if (kind === 'conflict' && conflictKeyframe) throw new Error('сценка conflict: отпечаток кадра конфликта передаётся только развязке');
   try {
-    assertSkit(skit);
     const keyframePrompt = buildKeyframePrompt(skit, { continuity: kind === 'punchline' });
     const videoPrompt = buildVideoPrompt(skit);
     return {
