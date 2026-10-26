@@ -101,4 +101,30 @@ describe('stripProductActionBlocks', () => {
   it('пустая строка — пустая строка', () => {
     expect(stripProductActionBlocks('')).toBe('');
   });
+
+  // Баг: модель иногда закрывает блок без переноса строки перед `` ``` `` —
+  // сразу за JSON («}```»). Ленивое тело regexp-а, которое искало ПЕРВУЮ
+  // закрывающую строку именно в виде "\n```", в этом случае не находило её
+  // вовсе и съедало весь остаток ответа до конца текста. Тело блока — JSON,
+  // в нём бэктиков не бывает, поэтому границей блока обязана быть ЛЮБАЯ
+  // первая встреченная `` ``` ``.
+  it('закрывающая fence сразу за JSON без переноса строки ("}```") — хвост после блока цел', () => {
+    const text = 'Т\n\n```product-action\n{"id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}```\nпосле';
+    expect(stripProductActionBlocks(text)).toBe('Т\nпосле');
+  });
+
+  it('закрывающая fence с отступом — вырезается вместе с блоком', () => {
+    const text = 'До.\n\n```product-action\n{"id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}\n  ```\nПосле.';
+    expect(stripProductActionBlocks(text)).toBe('До.\nПосле.');
+  });
+
+  it('открывающая fence с пробелом перед именем ("``` product-action") — тоже блок, вырезается', () => {
+    const text = 'До.\n\n``` product-action\n{"id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}\n```\nПосле.';
+    expect(stripProductActionBlocks(text)).toBe('До.\nПосле.');
+  });
+
+  it('имя блока в другом регистре ("PRODUCT-ACTION") — тоже блок, вырезается', () => {
+    const text = 'До.\n\n```PRODUCT-ACTION\n{"id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}\n```\nПосле.';
+    expect(stripProductActionBlocks(text)).toBe('До.\nПосле.');
+  });
 });
