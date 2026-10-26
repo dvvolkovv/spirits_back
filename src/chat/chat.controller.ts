@@ -1,6 +1,7 @@
 import { Controller, Post, Get, Delete, Body, Query, Req, Res, UseGuards, Optional } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { ChatService, SdkUsageTotals, RelayTurnCost } from './chat.service';
+import { relayAuthHeaders } from './relay-auth';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { JwtService } from '../common/services/jwt.service';
@@ -367,7 +368,7 @@ export class ChatController {
     try {
     try {
       const agentRes = await axios.default.post(`${AGENT_URL}/chat`, fd, {
-        headers: fd.getHeaders(),
+        headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
         responseType: 'stream',
         timeout: 600000,
       });
