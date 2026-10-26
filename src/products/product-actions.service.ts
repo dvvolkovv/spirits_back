@@ -76,6 +76,8 @@ export interface ActionView {
   status: ActionStatus;
   productId: string | null;
   productName: string | null;
+  /** Форма продукта: карточка ключей не предлагает убрать BOT_TOKEN у бота. */
+  productKind: 'site' | 'bot' | null;
   keyNames: string[];
   expiresAt: string | null;
   restoreUntil: string | null;
@@ -104,6 +106,9 @@ export function toView(row: ActionRow, now: Date = new Date()): ActionView {
     status: expired ? 'expired' : row.status,
     productId: row.product_id,
     productName: row.product_name ?? (typeof row.payload?.name === 'string' ? row.payload.name : null),
+    productKind: row.kind === 'create_bot'
+      ? 'bot'
+      : (row.payload?.productKind === 'site' || row.payload?.productKind === 'bot' ? row.payload.productKind : null),
     keyNames: Array.isArray(row.payload?.keyNames) ? row.payload.keyNames : [],
     expiresAt: row.expires_at ? new Date(row.expires_at).toISOString() : null,
     restoreUntil,
@@ -236,12 +241,14 @@ export class ProductActionsService {
   /**
    * Вернуть в ожидание с ошибкой — то, что человек поправит в той же карточке.
    * Без владельца: сюда доходят только после claim() — он уже проверил, что
-   * действие принадлежит вызывающему.
+   * действие принадлежит вызывающему. Коробка ключей стирается и здесь:
+   * pending-карточка шифротекста не держит никогда — новый набор пишется
+   * только вместе с заданием (ProductKeysService).
    */
   async release(id: string, result: Record<string, unknown>): Promise<void> {
     if (!UUID_RE.test(String(id))) return;
     await this.pg.query(
-      `UPDATE product_actions SET status = 'pending', confirmed_via = NULL, result = $2::jsonb
+      `UPDATE product_actions SET status = 'pending', confirmed_via = NULL, result = $2::jsonb, secrets_box = NULL
         WHERE id = $1 AND status = 'working'`,
       [id, JSON.stringify(result)],
     );
@@ -249,24 +256,31 @@ export class ProductActionsService {
 
   /**
    * Без владельца: сюда доходят только после claim() — он уже проверил, что
-   * действие принадлежит вызывающему.
+   * действие принадлежит вызывающему. Любое закрытие стирает коробку ключей:
+   * шифротекст живёт не дольше задания.
    */
   async finish(id: string, status: 'done' | 'failed', result: Record<string, unknown>, productId?: string): Promise<void> {
     if (!UUID_RE.test(String(id))) return;
     await this.pg.query(
       `UPDATE product_actions
-          SET status = $2, result = $3::jsonb, resolved_at = now(), product_id = COALESCE($4::uuid, product_id)
+          SET status = $2, result = $3::jsonb, resolved_at = now(), secrets_box = NULL,
+              product_id = COALESCE($4::uuid, product_id)
         WHERE id = $1 AND status = 'working'`,
       [id, status, JSON.stringify(result), productId || null],
     );
   }
 
   /**
-   * working-карточки, чей процесс умер между claim и finish/release (обрыв
-   * с базой, падение процесса) — то, что completeDelete/completeCreateBot
-   * сами чинят release-ом на известных отказах не ловит: их catch просто не
-   * выполнился. claim и cancel требуют status='pending', поэтому без этой
-   * подметки такая карточка осталась бы в working навечно.
+   * working-карточки без исхода. Два случая:
+   *   - процесс умер между claim и finish/release (обрыв с базой, падение) —
+   *     у карточки нет задания, и срок в прошлом больше чем на 10 минут
+   *     отличает мертвеца от живой операции (сама работа — секунды);
+   *   - смена ключей: задание rekey сняли снаружи (сборщик зависших,
+   *     удаление продукта, блокировка) — исход в карточку не записан. Такая
+   *     карточка закрывается без ожидания срока, с причиной по тому, успел
+   *     ли агент забрать задание (см. CASE ниже).
+   * Карточку с ЖИВЫМ заданием (queued/running) не трогаем ни при каком сроке:
+   * отправленная на 29-й минуте, она иначе умерла бы при работающем агенте.
    *
    * expires_at у working НЕ продлевается claim-ом (он остаётся таким же,
    * каким был у pending) — поэтому срок в прошлом у working-строки надёжно
@@ -274,15 +288,45 @@ export class ProductActionsService {
    * токена, один SQL) занимает секунды, а не минуты. Запас 10 минут — чтобы
    * не подмести карточку, которую в эту секунду как раз обрабатывает живой
    * процесс на грани истечения срока.
+   *
+   * Вторым оператором — стирание коробок у закрытых карточек: страховка на
+   * случай закрытия мимо finish/release (ручная правка, будущий код).
    */
   async sweepStuck(): Promise<number> {
     const r = await this.pg.query(
-      `UPDATE product_actions
+      `UPDATE product_actions a
           SET status = 'failed',
-              result = jsonb_build_object('error', 'Действие прервалось — попросите ассистента повторить'),
+              secrets_box = NULL,
+              -- Причина — по тому, ДОШЛО ли задание до агента: забранное
+              -- (started_at есть) и снятое снаружи — исход на машине
+              -- неизвестен; не забранное — ключи точно не менялись, и текст
+              -- называет, кто снял (удаление, блокировка, сборщик).
+              result = CASE
+                WHEN NOT EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id)
+                  THEN jsonb_build_object('error', 'Действие прервалось — попросите ассистента повторить')
+                WHEN EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id AND j.started_at IS NOT NULL)
+                  THEN jsonb_build_object('error', $2::text, 'reason', 'rekey_unknown')
+                WHEN EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id AND j.error = 'снято удалением')
+                  THEN jsonb_build_object('error', $3::text, 'reason', 'gone')
+                WHEN EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id AND j.error = $5::text)
+                  THEN jsonb_build_object('error', $4::text, 'reason', 'blocked')
+                ELSE jsonb_build_object('error', $1::text, 'reason', 'rekey_failed')
+              END,
               resolved_at = now()
-        WHERE status = 'working' AND expires_at < now() - interval '10 minutes'
-       RETURNING id`,
+        WHERE a.status = 'working'
+          AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
+                           WHERE j.action_id = a.id AND j.status IN ('queued','running','done'))
+          AND (EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id AND j.status = 'failed')
+               OR a.expires_at < now() - interval '10 minutes')
+       RETURNING a.id`,
+      // Текст блокировки — литералом, а не импортом из block.service: тот
+      // тянет за собой весь модуль. Совпадение с JOB_KILLED_BY_BLOCK
+      // сторожит product-actions.sweep.pg.spec.ts.
+      [REKEY_FAILED_SAY, REKEY_UNKNOWN_SAY, REKEY_GONE_SAY, REKEY_BLOCKED_SAY, 'снято блокировкой администратора'],
+    );
+    await this.pg.query(
+      `UPDATE product_actions SET secrets_box = NULL
+        WHERE secrets_box IS NOT NULL AND status IN ('done','failed','expired','cancelled')`,
     );
     return r.rows.length;
   }
