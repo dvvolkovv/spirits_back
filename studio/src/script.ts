@@ -4,6 +4,7 @@ import type { CaptureResult, Script } from './types';
  * То, что студия может проверить сама до озвучки: у каждой реплики ответа
  * есть абзац, и такой абзац снят. Правила текста (цифры, конкуренты,
  * «анонимно»…) проверяет бэкенд во втором плане.
+ * У ролика со сценками — ещё сценки: реплики есть, абзацы существуют, отпечаток задан.
  */
 export function validateScript(script: Script, capture: Pick<CaptureResult, 'boxes'>): string[] {
   const problems: string[] = [];
@@ -29,6 +30,25 @@ export function validateScript(script: Script, capture: Pick<CaptureResult, 'box
   }
   if (script.hookBox != null && !known.has(script.hookBox)) {
     problems.push(`зацепка опирается на абзац ${script.hookBox}, а снято абзацев: ${capture.boxes.length}`);
+  }
+  if (script.skits) {
+    if (script.lines.some((l) => l.scene === 'hook')) {
+      problems.push('у ролика со сценками зацепка — надпись поверх сценки, реплики hook быть не должно');
+    }
+    for (const kind of ['conflict', 'punchline'] as const) {
+      const p = script.skits[kind];
+      if (!p) {
+        problems.push(`нет сценки ${kind}`);
+        continue;
+      }
+      if (!p.fingerprint || !p.keyframeFingerprint) problems.push(`у сценки ${kind} нет отпечатка`);
+      if (!p.skit?.lines?.length) problems.push(`в сценке ${kind} нет реплик`);
+      for (const l of p.skit?.lines ?? []) {
+        if (l.box != null && !known.has(l.box)) {
+          problems.push(`реплика сценки ${kind} ссылается на абзац ${l.box}, а снято абзацев: ${capture.boxes.length}`);
+        }
+      }
+    }
   }
   const count = script.final?.assistantsCount;
   if (!Number.isInteger(count) || count <= 0) problems.push('в финале нет числа ассистентов (final.assistantsCount)');
