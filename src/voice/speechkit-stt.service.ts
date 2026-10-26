@@ -51,6 +51,20 @@ export function isSttLanguageSupported(lang: string | null | undefined): boolean
   return !!lang && Object.prototype.hasOwnProperty.call(SPEECHKIT_LANGUAGE_CODES, lang);
 }
 
+/**
+ * Список для language_restriction (WHITELIST). К нерусскому языку добавлен
+ * ru-RU: язык профиля у новорега пишется сам, по языку браузера (AuthContext
+ * фронта), и русскоязычный с английским браузером получает английский
+ * профиль. Слушать его только на en-US — снова каша, теперь из русской речи.
+ * SpeechKit определяет язык по каждой фразе в пределах списка.
+ * Языка без поддержки — null.
+ */
+export function speechkitLanguageCodes(lang: string | null | undefined): string[] | null {
+  if (!isSttLanguageSupported(lang)) return null;
+  const own = SPEECHKIT_LANGUAGE_CODES[lang as string];
+  return own === SPEECHKIT_LANGUAGE_CODES.ru ? [own] : [own, SPEECHKIT_LANGUAGE_CODES.ru];
+}
+
 @Injectable()
 export class SpeechkitSttService implements OnModuleInit {
   private readonly logger = new Logger(SpeechkitSttService.name);
@@ -87,11 +101,11 @@ export class SpeechkitSttService implements OnModuleInit {
       cb.onError(new Error('SpeechKit STT не сконфигурирован'));
       return { push: () => {}, end: () => {} };
     }
-    if (!isSttLanguageSupported(language)) {
+    const languageCodes = speechkitLanguageCodes(language);
+    if (!languageCodes) {
       cb.onError(new Error(`SpeechKit STT: язык «${language}» не поддерживается`));
       return { push: () => {}, end: () => {} };
     }
-    const languageCode = SPEECHKIT_LANGUAGE_CODES[language];
 
     const client = new this.RecognizerCtor(SK_ENDPOINT, grpc.credentials.createSsl());
     const md = new grpc.Metadata();
@@ -121,7 +135,7 @@ export class SpeechkitSttService implements OnModuleInit {
       call.write({ session_options: { recognition_model: {
         audio_format: { raw_audio: { audio_encoding: 'LINEAR16_PCM', sample_rate_hertz: 16000, audio_channel_count: 1 } },
         text_normalization: { text_normalization: 'TEXT_NORMALIZATION_ENABLED' },
-        language_restriction: { restriction_type: 'WHITELIST', language_code: [languageCode] },
+        language_restriction: { restriction_type: 'WHITELIST', language_code: languageCodes },
         audio_processing_type: 'REAL_TIME',
       } } });
     } catch (e: any) {

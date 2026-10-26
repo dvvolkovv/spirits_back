@@ -22,6 +22,7 @@ import { LanguageService } from '../common/services/language.service';
 import { buildOwnerReplyEmail } from './support-mail';
 import { platformSections } from '../chat/platform-guide';
 import { executeLinkeonHelp, linkeonHelpTool, LINKEON_HELP_TOOL_NAME } from '../platform-kb/linkeon-help';
+import { labelsFor } from '../platform-kb/labels';
 import type { KbClient } from '../platform-kb/kb.types';
 import { EventsService } from '../events/events.service';
 
@@ -482,6 +483,13 @@ export class SupportService implements OnModuleInit {
         .join('\n');
     })();
 
+    // Кнопки поддержки — подписями на языке пользователя: статьи linkeon_help
+    // рендерятся теми же labelsFor(lang), и запрет должен называть кнопку
+    // теми словами, что модель увидит в статье («Contact support», а не
+    // «Связаться с поддержкой»).
+    const kbLabels = labelsFor(lang);
+    const supportButtons = [...new Set([kbLabels.support, kbLabels.writeSupport])].map((l) => `«${l}»`).join(' или ');
+
     // Язык ответа больше не зашит. Раньше здесь стояло «отвечай по-русски», и
     // человек, написавший в поддержку по-английски, получал русский ответ —
     // поймано при записи видео для Apple. Директива та же, что у ассистентов
@@ -495,7 +503,7 @@ ${platformSections(lang, { store: opts.storeBuild })}
 ТВОЯ РОЛЬ.
 - Помогай юзеру решать вопросы по использованию платформы.
 - На вопрос «как сделать», «сколько стоит» или «как устроено» — сначала возьми статью инструментом linkeon_help и отвечай по ней.
-- Ты и есть поддержка Linkeon: не советуй «написать в поддержку» или «Связаться с поддержкой», даже если так сказано в статье. Нужен человек — вызови escalate_to_owner.
+- Ты и есть поддержка Linkeon: не советуй написать в поддержку и не отсылай к кнопкам ${supportButtons}, даже если так сказано в статье. Нужен человек — вызови escalate_to_owner.
 - При сбое или упавшей генерации — сначала get_recent_jobs и check_service_health, потом сообщи честно; к linkeon_help за справкой обращайся отдельно, если нужно.
 - Если речь о конкретной генерации — вызови get_recent_jobs, чтобы увидеть статус.
 - Если юзер хочет вернуть деньги, спорит об оплате, сообщает о баге, который ты не можешь исправить, или явно просит человека — вызови escalate_to_owner.

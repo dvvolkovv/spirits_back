@@ -1,6 +1,11 @@
 import { EventEmitter } from 'events';
 import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
-import { SpeechkitSttService, SPEECHKIT_LANGUAGE_CODES, isSttLanguageSupported } from './speechkit-stt.service';
+import {
+  SpeechkitSttService,
+  SPEECHKIT_LANGUAGE_CODES,
+  isSttLanguageSupported,
+  speechkitLanguageCodes,
+} from './speechkit-stt.service';
 
 /// Диктовка слушала только ru-RU: человек с английским, испанским или
 /// немецким профилем получал вместо своих слов русскую кашу. Теперь язык
@@ -22,6 +27,17 @@ describe('SpeechKit: язык распознавания', () => {
     // Новый язык в SUPPORTED_LANGUAGES уронит этот тест — решать про
     // диктовку для него надо осознанно, а не молчаливым ru-RU.
     expect(SUPPORTED_LANGUAGES.filter((l) => !isSttLanguageSupported(l))).toEqual(['zh']);
+  });
+
+  // Язык профиля у новорега пишется сам — по языку браузера (AuthContext
+  // фронта). Русскоязычный с английским браузером получает английский
+  // профиль, и диктовка «только en-US» снова выдавала бы ему кашу — уже
+  // из его русской речи. Поэтому к нерусскому языку добавлен ru-RU.
+  it('нерусский язык — свой код и русский; русский — только русский', () => {
+    expect(speechkitLanguageCodes('ru')).toEqual(['ru-RU']);
+    expect(speechkitLanguageCodes('en')).toEqual(['en-US', 'ru-RU']);
+    expect(speechkitLanguageCodes('pt')).toEqual(['pt-PT', 'ru-RU']);
+    expect(speechkitLanguageCodes('zh')).toBeNull();
   });
 
   it('незнакомый, пустой и полный тег — не поддерживаются: на вход ждём корень языка', () => {
@@ -63,20 +79,20 @@ describe('SpeechKit: опции сессии', () => {
   const callbacks = () => ({ onPartial: jest.fn(), onFinal: jest.fn(), onError: jest.fn(), onEnd: jest.fn() });
 
   it.each([
-    ['en', 'en-US'],
-    ['de', 'de-DE'],
-    ['es', 'es-ES'],
-    ['fr', 'fr-FR'],
-    ['pt', 'pt-PT'],
-    ['ru', 'ru-RU'],
-  ])('язык %s → language_code %s в первом сообщении стрима', (lang, code) => {
+    ['en', ['en-US', 'ru-RU']],
+    ['de', ['de-DE', 'ru-RU']],
+    ['es', ['es-ES', 'ru-RU']],
+    ['fr', ['fr-FR', 'ru-RU']],
+    ['pt', ['pt-PT', 'ru-RU']],
+    ['ru', ['ru-RU']],
+  ])('язык %s → language_code %j в первом сообщении стрима', (lang, codes) => {
     const { service, writes } = makeService();
     const cb = callbacks();
     service.openStream(cb, lang);
     expect(cb.onError).not.toHaveBeenCalled();
     expect(writes[0].session_options.recognition_model.language_restriction).toEqual({
       restriction_type: 'WHITELIST',
-      language_code: [code],
+      language_code: codes,
     });
   });
 

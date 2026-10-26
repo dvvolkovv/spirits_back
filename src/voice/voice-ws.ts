@@ -10,7 +10,20 @@ const WS_PATH = '/voice/stream';
 const logger = new Logger('VoiceWs');
 
 /** Сколько ждать язык из профиля, прежде чем слушать на языке по умолчанию. */
-export const LANGUAGE_RESOLVE_TIMEOUT_MS = 3000;
+export const LANGUAGE_RESOLVE_TIMEOUT_MS = 2000;
+
+/**
+ * Потолок одного фрейма. Ворклет шлёт 100 мс PCM16/16 кГц — 3200 байт;
+ * 64 КБ — запас в двадцать раз. Без потолка ws принимал фрейм до 100 МБ.
+ */
+export const VOICE_WS_MAX_PAYLOAD = 64 * 1024;
+
+/**
+ * Потолок аудио, накопленного до открытия стрима (пока читается язык).
+ * За LANGUAGE_RESOLVE_TIMEOUT_MS честный клиент шлёт около 64 КБ; больше
+ * мегабайта — не речь, сокет закрывается.
+ */
+export const VOICE_WS_MAX_PENDING_BYTES = 1024 * 1024;
 
 type LanguageResolver = Pick<LanguageService, 'resolveUserLanguage'>;
 
@@ -30,7 +43,7 @@ export function attachVoiceWs(app: INestApplication): void {
   }
   const server = app.getHttpServer();
 
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: VOICE_WS_MAX_PAYLOAD });
 
   server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) => {
     let pathname = '';
@@ -66,12 +79,18 @@ export function attachVoiceWs(app: INestApplication): void {
 /** Язык профиля; при ошибке, пустом ответе или молчании базы — язык по умолчанию. */
 async function resolveDictationLanguage(userId: string, languages?: LanguageResolver | null): Promise<string> {
   if (!languages) return DEFAULT_LANGUAGE;
+  const TIMEOUT = Symbol('timeout');
   let timer: NodeJS.Timeout | undefined;
   try {
-    const timeout = new Promise<string>((resolve) => {
-      timer = setTimeout(() => resolve(DEFAULT_LANGUAGE), LANGUAGE_RESOLVE_TIMEOUT_MS);
+    const timeout = new Promise<typeof TIMEOUT>((resolve) => {
+      timer = setTimeout(() => resolve(TIMEOUT), LANGUAGE_RESOLVE_TIMEOUT_MS);
     });
-    return (await Promise.race([languages.resolveUserLanguage(userId), timeout])) || DEFAULT_LANGUAGE;
+    const lang = await Promise.race([languages.resolveUserLanguage(userId), timeout]);
+    if (lang === TIMEOUT) {
+      logger.warn(`dictation: язык профиля не прочитан за ${LANGUAGE_RESOLVE_TIMEOUT_MS} мс u=${userId} — слушаю на «${DEFAULT_LANGUAGE}»`);
+      return DEFAULT_LANGUAGE;
+    }
+    return lang || DEFAULT_LANGUAGE;
   } catch {
     return DEFAULT_LANGUAGE;
   } finally {
@@ -98,12 +117,23 @@ export async function handleConnection(
   // и stop копим до открытия стрима — иначе пропадёт начало фразы.
   let handle: SttStreamHandle | null = null;
   const pending: Buffer[] = [];
+  let pendingBytes = 0;
   let stopRequested = false;
   let gone = false;
 
   ws.on('message', (data: Buffer, isBinary: boolean) => {
+    if (gone) return;
     if (isBinary) {
-      if (handle) handle.push(data); else pending.push(data);
+      if (handle) { handle.push(data); return; }
+      pendingBytes += data.length;
+      if (pendingBytes > VOICE_WS_MAX_PENDING_BYTES) {
+        logger.warn(`dictation: до открытия стрима пришло больше ${VOICE_WS_MAX_PENDING_BYTES} байт u=${userId} — закрываю`);
+        gone = true;
+        pending.length = 0;
+        try { ws.close(1009); } catch {}
+        return;
+      }
+      pending.push(data);
       return;
     }
     // текстовый фрейм — управляющее сообщение
@@ -118,7 +148,8 @@ export async function handleConnection(
   ws.on('error', onGone);
 
   const language = await resolveDictationLanguage(userId, languages);
-  if (gone) return; // клиент ушёл, пока читался язык, — стрим не нужен
+  // Клиент ушёл или сокет уже закрывается, пока читался язык, — стрим не нужен.
+  if (gone || ws.readyState !== WebSocket.OPEN) return;
 
   if (!isSttLanguageSupported(language)) {
     logger.log(`dictation: язык «${language}» без распознавания u=${userId}`);

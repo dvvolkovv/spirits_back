@@ -3,7 +3,7 @@ import { V } from '../values';
 
 // источник: файлы — spirits_front src/components/chat/ChatInterface.tsx:2171-2337; src/chat/upload-limits.ts; src/chat/chat.controller.ts (upload, 413)
 // источник: Маша и PDF — src/chat/chat.controller.ts:555-633
-// источник: голосовой ввод — spirits_front src/services/voiceDictation.ts; src/voice/voice-ws.ts (язык профиля, lang_unsupported); src/voice/speechkit-stt.service.ts (SPEECHKIT_LANGUAGE_CODES: без zh)
+// источник: голосовой ввод — spirits_front src/services/voiceDictation.ts; src/voice/voice-ws.ts (язык профиля, lang_unsupported); src/voice/speechkit-stt.service.ts (SPEECHKIT_LANGUAGE_CODES: без zh; speechkitLanguageCodes: к нерусскому — ru-RU)
 // источник: «Чистый лист» — src/chat/chat.controller.ts:131-136; src/chat/chat.service.ts (fresh)
 // источник: «Медиа и файлы» — spirits_front src/components/chat/files/chatFiles.ts:39-48; src/chat/chat-files/chat-files.service.ts
 // источник: карточки вопросов — src/chat/ask-rule.ts; spirits_front src/components/chat/AskCard.tsx
@@ -25,7 +25,7 @@ ${q('chat')}: список ассистентов (на телефоне — о�
 ## Как
 - Файлы — кнопкой «+», окно ${q('uploadTitle')}: до ${V.uploadMaxFiles} файлов за раз, вместе до ${V.uploadMaxMb} МБ, формат любой. Отправляются вместе с текстом задания.
 - Маше — только PDF, один файл: из него она берёт сведения о человеке. Разобрать документ по существу — к другому ассистенту.
-- ${q('voiceInput')} — микрофон в поле сообщения: речь превращается в текст. Распознаёт речь на языке профиля (${q('language')}); китайский пока не поддерживается — тогда сообщение набирают текстом.
+- ${q('voiceInput')} — микрофон в поле сообщения: речь превращается в текст. Распознаёт речь на языке профиля (${q('language')}) и русскую; при китайском языке профиля голосовой ввод пока не работает — сообщение набирают текстом.
 - ${q('listen')} под ответом — ответ голосом (тема speech).
 - ${q('fresh')} — разговор без прошлой истории и задач; профиль и ${q('business')} ассистент видит. Режим живёт в этой вкладке браузера.
 - ${q('files')} — всё, что ассистент создал в этом чате: ${q('filesMedia')} (картинки, видео) и ${q('filesDocs')} (документы, озвучка). Загруженное человеком туда не попадает.
